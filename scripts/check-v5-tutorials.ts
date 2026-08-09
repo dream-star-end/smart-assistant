@@ -1018,6 +1018,16 @@ function validateCaseCatalog(): void {
   }
 
   const registeredIds = new Set<string>(TUTORIAL_CASE_IDS);
+  const expectedFieldReportIds = new Set([
+    "research-bike-demand",
+    "coding-swe-bench-fix",
+  ]);
+  const actualFieldReportIds = new Set(
+    TUTORIAL_CASES.filter((item) => item.fieldReport).map((item) => item.id),
+  );
+  if (stable([...actualFieldReportIds].sort()) !== stable([...expectedFieldReportIds].sort()))
+    fail("观察记录当前只能绑定两次已有证据的真实实跑");
+
   const seenIds = new Set<string>();
   for (const item of TUTORIAL_CASES) {
     if (!registeredIds.has(item.id) || seenIds.has(item.id))
@@ -1158,6 +1168,77 @@ function validateCaseCatalog(): void {
         )
       )
         fail(`${item.id}: 输入 ${inputIndex + 1} 仍要求运行时再选择，未冻结`);
+    }
+
+    if (item.fieldReport) {
+      const report = record(item.fieldReport, `${item.id}: field report`);
+      exactKeys(
+        report,
+        [
+          "status",
+          "sourceLabel",
+          "sourceUrl",
+          "userScene",
+          "obstacle",
+          "input",
+          "duration",
+          "journey",
+          "metrics",
+          "result",
+          "limitations",
+          "visual",
+        ],
+        `${item.id}: field report`,
+      );
+      if (report.status !== "observed_not_verified")
+        fail(`${item.id}: 真实实跑观察记录不得伪装成公开验证结果`);
+      const sourceUrl = new URL(
+        stringField(report, "sourceUrl", `${item.id}: field report`),
+      );
+      if (sourceUrl.protocol !== "https:" || !sourceUrl.hostname)
+        fail(`${item.id}: field report 来源必须使用 HTTPS`);
+      for (const field of [
+        "sourceLabel",
+        "userScene",
+        "obstacle",
+        "input",
+        "duration",
+        "result",
+      ]) {
+        stringField(report, field, `${item.id}: field report`);
+      }
+      if (
+        report.visual !== "bike-model-comparison" &&
+        report.visual !== "astropy-patch"
+      ) {
+        fail(`${item.id}: field report 使用未知结果可视化`);
+      }
+      if (!Array.isArray(report.journey) || report.journey.length < 4)
+        fail(`${item.id}: field report 必须展示至少四段可见过程`);
+      report.journey.forEach((rawStep, index) => {
+        const step = record(rawStep, `${item.id}: field report journey ${index}`);
+        exactKeys(step, ["title", "evidence"], `${item.id}: field report journey ${index}`);
+        stringField(step, "title", `${item.id}: field report journey ${index}`);
+        stringField(step, "evidence", `${item.id}: field report journey ${index}`);
+      });
+      if (!Array.isArray(report.metrics) || report.metrics.length < 3)
+        fail(`${item.id}: field report 必须展示至少三项真实结果`);
+      report.metrics.forEach((rawMetric, index) => {
+        const metric = record(rawMetric, `${item.id}: field report metric ${index}`);
+        exactKeys(metric, ["label", "value", "detail"], `${item.id}: field report metric ${index}`);
+        stringField(metric, "label", `${item.id}: field report metric ${index}`);
+        stringField(metric, "value", `${item.id}: field report metric ${index}`);
+        stringField(metric, "detail", `${item.id}: field report metric ${index}`);
+      });
+      if (!Array.isArray(report.limitations) || report.limitations.length < 2)
+        fail(`${item.id}: field report 必须公开至少两项限制`);
+      report.limitations.forEach((limitation, index) => {
+        if (typeof limitation !== "string" || !limitation.trim())
+          fail(`${item.id}: field report limitation ${index} 必须是非空字符串`);
+      });
+      assertPublicValue(report, `${item.id}: field report`);
+      if (item.replay.status !== "pending_capture")
+        fail(`${item.id}: 观察记录不得替代公开 replay 验证状态`);
     }
 
     if (item.replay.status === "pending_capture") {

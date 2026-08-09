@@ -63,6 +63,29 @@ export type TutorialCaseCheck = {
   passCriterion: string
 }
 
+export type TutorialCaseFieldReport = {
+  /** A real product run was observed, but it has not passed the public replay gate. */
+  status: 'observed_not_verified'
+  sourceLabel: string
+  sourceUrl: string
+  userScene: string
+  obstacle: string
+  input: string
+  duration: string
+  journey: readonly {
+    title: string
+    evidence: string
+  }[]
+  metrics: readonly {
+    label: string
+    value: string
+    detail: string
+  }[]
+  result: string
+  limitations: readonly string[]
+  visual: 'bike-model-comparison' | 'astropy-patch'
+}
+
 export type TutorialCaseSuggestion = {
   agentId: 'research-assistant' | 'coding-assistant' | 'office-assistant'
   agentName: '科研助手' | '编程助手' | '办公助手'
@@ -148,6 +171,7 @@ export type TutorialCase = {
   artifacts: readonly TutorialCaseArtifact[]
   checks: readonly TutorialCaseCheck[]
   suggestion: TutorialCaseSuggestion
+  fieldReport?: TutorialCaseFieldReport
   replay: TutorialCaseReplay
 }
 
@@ -302,7 +326,7 @@ export const TUTORIAL_CASES = [
   },
   {
     id: 'research-bike-demand',
-    contentVersion: 2,
+    contentVersion: 3,
     category: 'research',
     title: '公开数据到可复现的单车需求分析',
     summary:
@@ -418,6 +442,34 @@ export const TUTORIAL_CASES = [
       modelId: 'deepseek-v4-pro',
       modelGuidance: '用高推理模型制定计划与审查泄漏；机械绘图和测试可交给更快模型。',
       why: '需要代码、统计解释与可复现性三条链同时闭合。',
+    },
+    fieldReport: {
+      status: 'observed_not_verified',
+      sourceLabel: 'UCI Bike Sharing 公开数据集',
+      sourceUrl: 'https://archive.ics.uci.edu/dataset/275/bike+sharing+dataset',
+      userScene:
+        '数据分析者拿到一份真实出行数据，不只想要“天气有关”的摘要，而是需要一套同事能够重新运行、逐项核对的分析工程。',
+      obstacle:
+        '17,379 条小时记录里既有时间顺序，也有会直接泄漏目标的 casual / registered 两列；随机切分或照单全收都会让结果看起来比实际更好。',
+      input: 'UCI 原始 ZIP、数据字典，以及在看结果前冻结的分析问题和时间切分规则。',
+      duration: '2 小时 35 分',
+      journey: [
+        { title: '锁定原始数据', evidence: '17,379 条小时记录、0 个缺失值，输入哈希固定。' },
+        { title: '先拦住数据泄漏', evidence: '排除 casual / registered，并按时间顺序划分训练集和测试集。' },
+        { title: '让两个模型正面对照', evidence: '同时训练可解释线性基线和非线性 GBM，不只挑最好看的结果。' },
+        { title: '在干净环境重跑', evidence: '34 项测试通过；两次主要结果与报告哈希一致。' },
+      ],
+      metrics: [
+        { label: 'GBM 测试集 R²', value: '0.904', detail: '线性基线为 0.714' },
+        { label: 'GBM 测试集 RMSE', value: '68.36', detail: '线性基线为 117.81' },
+        { label: '自动化验证', value: '34 项', detail: '数据、泄漏、切分与复现测试全部通过' },
+      ],
+      result: 'V5 交付了可复跑项目、分析报告、诊断图和机器可读指标，而不是一段无法复核的结论。',
+      limitations: [
+        '这次任务真实完成，但长连接采集先于任务结束，因此还没有可公开的完整逐帧回放。',
+        '非负 IAD 指标的普通 bootstrap 区间只能说明重采样稳定性，不能当作零假设显著性检验。',
+      ],
+      visual: 'bike-model-comparison',
     },
     replay: PENDING_REPLAY,
   },
@@ -816,7 +868,7 @@ export const TUTORIAL_CASES = [
   },
   {
     id: 'coding-swe-bench-fix',
-    contentVersion: 1,
+    contentVersion: 2,
     category: 'coding',
     title: '像真实维护者一样修一个 SWE-bench Bug',
     summary:
@@ -849,6 +901,13 @@ export const TUTORIAL_CASES = [
         role: 'input',
         license: '数据集卡及每个来源仓库的许可分别适用',
         usageNote: '固定 instance_id/base_commit；仅处理来源仓库许可允许的代码与 issue 文本。',
+      },
+      {
+        title: 'Astropy #12906 原始问题',
+        url: 'https://github.com/astropy/astropy/issues/12906',
+        role: 'need-evidence',
+        license: 'Astropy 仓库采用 BSD-3-Clause；GitHub 页面内容按平台条款使用',
+        usageNote: '只使用公开问题描述和最小复现；运行期间不向 Agent 暴露后续修复 PR。',
       },
       {
         title: 'Stack Overflow 2025 Developer Survey：AI',
@@ -950,6 +1009,34 @@ export const TUTORIAL_CASES = [
       modelId: 'glm-5.2',
       modelGuidance: '高推理编码模型负责复现与根因；审查者只报告正确性、安全和数据 blocker。',
       why: '真实修复需要可失败测试和独立 harness，不应由生成补丁的模型自行宣布成功。',
+    },
+    fieldReport: {
+      status: 'observed_not_verified',
+      sourceLabel: 'Astropy #12906 真实开源问题',
+      sourceUrl: 'https://github.com/astropy/astropy/issues/12906',
+      userScene:
+        '维护者发现嵌套 CompoundModel 会返回错误的可分离矩阵，需要的不只是“看起来合理”的代码，而是先红后绿、正常路径不回归的补丁。',
+      obstacle:
+        '平铺表达式工作正常，只有右侧模型嵌套时才出错；如果没有固定基线和回归测试，很容易把症状绕过去而不是修到根因。',
+      input: 'SWE-bench Verified 实例 astropy__astropy-12907、固定 base commit，以及隔离的 Astropy 仓库。',
+      duration: '15 分 49 秒',
+      journey: [
+        { title: '先让问题稳定变红', evidence: '新增的两个回归检查在基线代码上稳定失败。' },
+        { title: '沿递归路径找根因', evidence: '_cstack 把右侧已有矩阵整块覆盖成 1，嵌套结构因此丢失。' },
+        { title: '只改根因的一行', evidence: '把常量 1 改为 right，保留右侧子矩阵的真实结构。' },
+        { title: '问题与邻近路径一起验证', evidence: '新增回归与原有邻近测试合计 13 项通过。' },
+      ],
+      metrics: [
+        { label: '回归证据', value: '2 → 13', detail: '修复前 2 项失败，修复后 13 项通过' },
+        { label: '产品代码修改', value: '1 行', detail: '没有顺手重构或批量格式化' },
+        { label: '完整实跑耗时', value: '15:49', detail: '从复现、定位到外部复跑' },
+      ],
+      result: 'V5 找到一处一行根因修改，补了独立回归测试，并交付根因报告和测试证据。',
+      limitations: [
+        '这次没有运行官方 SWE-bench FAIL_TO_PASS / PASS_TO_PASS harness，因此不能宣称官方评测通过。',
+        '当次产品展示的“完整 diff”漏掉了未跟踪的回归测试文件，所以仍不能作为完整可下载 patch。',
+      ],
+      visual: 'astropy-patch',
     },
     replay: PENDING_REPLAY,
   },

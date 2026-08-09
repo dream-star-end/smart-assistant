@@ -1,5 +1,6 @@
-import type { TutorialCaseId } from "../../lib/tutorialCaseCatalog";
+import type { TutorialCaseFieldReport, TutorialCaseId } from "../../lib/tutorialCaseCatalog";
 import { cn } from "../../lib/utils";
+import { CaseFieldReportVisual } from "./CaseFieldReportVisual";
 
 type ArtworkKind =
   | "network"
@@ -112,11 +113,16 @@ export const CASE_PRESENTATION: Record<TutorialCaseId, CasePresentation> = {
 
 export function CaseArtwork({
   caseId,
+  fieldReport,
   className,
 }: {
   caseId: TutorialCaseId;
+  fieldReport?: TutorialCaseFieldReport;
   className?: string;
 }) {
+  if (fieldReport) {
+    return <CaseFieldReportVisual report={fieldReport} className={className} />;
+  }
   const presentation = CASE_PRESENTATION[caseId];
   return (
     <div

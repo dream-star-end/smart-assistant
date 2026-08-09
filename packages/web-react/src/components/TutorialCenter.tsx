@@ -55,6 +55,7 @@ import {
   TUTORIAL_CASE_BY_ID,
   type TutorialCase,
   type TutorialCaseCategory,
+  type TutorialCaseFieldReport,
   type TutorialCaseId,
 } from "../lib/tutorialCaseCatalog";
 import {
@@ -156,6 +157,19 @@ export function tutorialCaseMatches(item: TutorialCase, query: string): boolean 
       ]),
       ...item.artifacts.flatMap((artifact) => [artifact.title, artifact.description, artifact.format]),
       ...item.checks.flatMap((check) => [check.title, check.method, check.passCriterion]),
+      ...(item.fieldReport
+        ? [
+            item.fieldReport.sourceLabel,
+            item.fieldReport.userScene,
+            item.fieldReport.obstacle,
+            item.fieldReport.input,
+            item.fieldReport.duration,
+            item.fieldReport.result,
+            ...item.fieldReport.journey.flatMap((step) => [step.title, step.evidence]),
+            ...item.fieldReport.metrics.flatMap((metric) => [metric.label, metric.value, metric.detail]),
+            ...item.fieldReport.limitations,
+          ]
+        : []),
     ].join(" "),
   );
   return q.split(" ").every((term) => haystack.includes(term));
@@ -327,7 +341,7 @@ export function TutorialCenter({
             </ViewTab>
             {mode === "cases" && (
               <span className="ml-auto hidden text-[11.5px] text-faint sm:block">
-                {TUTORIAL_CASES.length} 个公开、可复查的任务场景
+                2 份实跑观察记录（尚未公开验证）· 10 个可复用模板
               </span>
             )}
           </div>
@@ -547,15 +561,17 @@ function CaseSidebar({
 }
 
 function CaseGallery({ items, onSelect }: { items: readonly TutorialCase[]; onSelect: (id: TutorialCaseId) => void }) {
+  const fieldItems = items.filter((item) => item.fieldReport);
+  const templateItems = items.filter((item) => !item.fieldReport);
   return (
     <section className="mx-auto max-w-5xl px-3 pb-12 pt-4 sm:px-7 sm:pt-7">
       <div className="flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between sm:gap-6">
         <div>
           <h1 className="text-balance text-[22px] font-bold leading-tight tracking-tight text-fg sm:text-[28px]">
-            你今天想完成什么？
+            看看 V5 真正做完过什么
           </h1>
           <p className="mt-1.5 text-[13px] leading-5 text-muted sm:text-[14px]">
-            选一个和你当前难题最像的，先看成果，再跟着做。
+            从真实材料到最终结果，连没通过的地方也如实保留。
           </p>
         </div>
         <p className="hidden shrink-0 text-[11.5px] text-faint sm:block">科研 · 编码 · 日常工作</p>
@@ -565,43 +581,96 @@ function CaseGallery({ items, onSelect }: { items: readonly TutorialCase[]; onSe
           没有匹配案例，试试“文献”“引用”“回归测试”或清空筛选。
         </div>
       ) : (
-        <div className="mt-5 grid gap-4 md:grid-cols-2 sm:mt-6">
-          {items.map((item) => {
-            const presentation = CASE_PRESENTATION[item.id];
-            return (
-              <button
-                key={item.id}
-                type="button"
-                onClick={() => onSelect(item.id)}
-                aria-label={`${presentation.pain} ${item.title}，完成后得到${presentation.result}，查看完整过程`}
-                className="group overflow-hidden rounded-2xl border border-border bg-surface text-left shadow-sm outline-none transition-[border-color,box-shadow,transform] hover:-translate-y-1 hover:border-accent/40 hover:shadow-float focus-visible:ring-2 focus-visible:ring-ring"
-              >
-                <CaseArtwork caseId={item.id} />
-                <div className="p-4 sm:p-5">
-                  <div className="flex items-center gap-2">
-                    <span className="rounded-full bg-accent-soft px-2.5 py-1 text-[10.5px] font-semibold text-accent">
-                      {caseCategoryLabel(item.category)} · {item.difficulty}
-                    </span>
-                    {item.artifacts.slice(0, 2).map((artifact) => (
-                      <span key={artifact.title} className="rounded-full bg-hover px-2 py-1 text-[10px] text-faint">
-                        {artifact.format}
-                      </span>
-                    ))}
-                  </div>
-                  <p className="mt-3 text-[13px] font-medium leading-5 text-accent">{presentation.pain}</p>
-                  <h2 className="mt-1 text-[17px] font-semibold leading-6 text-fg">{item.title}</h2>
-                  <p className="mt-1.5 line-clamp-2 text-[12.5px] leading-5 text-muted">{presentation.result}</p>
-                  <span className="mt-4 inline-flex items-center gap-1.5 text-[12px] font-semibold text-fg transition-colors group-hover:text-accent">
-                    查看完整过程
-                    <ArrowRight size={14} className="transition-transform group-hover:translate-x-1" />
-                  </span>
+        <div className="mt-6 space-y-9">
+          {fieldItems.length > 0 && (
+            <section aria-labelledby="field-report-title">
+              <div className="mb-3 flex items-end justify-between gap-4">
+                <div>
+                  <p className="text-[10.5px] font-semibold uppercase tracking-[0.14em] text-success">V5 真实实跑</p>
+                  <h2 id="field-report-title" className="mt-0.5 text-[17px] font-semibold text-fg sm:text-[19px]">从原始难题到可核对结果</h2>
                 </div>
-              </button>
-            );
-          })}
+                <span className="hidden text-[10.5px] text-faint sm:block">观察记录 · 尚未通过公开回放门禁</span>
+              </div>
+              <div className="grid gap-4 md:grid-cols-2">
+                {fieldItems.map((item) => <CaseGalleryCard key={item.id} item={item} onSelect={onSelect} featured />)}
+              </div>
+            </section>
+          )}
+
+          {templateItems.length > 0 && (
+            <section aria-labelledby="case-template-title">
+              <div className="mb-3">
+                <p className="text-[10.5px] font-semibold uppercase tracking-[0.14em] text-accent">带入你的材料</p>
+                <h2 id="case-template-title" className="mt-0.5 text-[17px] font-semibold text-fg sm:text-[19px]">更多可直接复用的任务模板</h2>
+              </div>
+              <div className="grid gap-4 md:grid-cols-2">
+                {templateItems.map((item) => <CaseGalleryCard key={item.id} item={item} onSelect={onSelect} />)}
+              </div>
+            </section>
+          )}
         </div>
       )}
     </section>
+  );
+}
+
+function CaseGalleryCard({
+  item,
+  onSelect,
+  featured = false,
+}: {
+  item: TutorialCase;
+  onSelect: (id: TutorialCaseId) => void;
+  featured?: boolean;
+}) {
+  const presentation = CASE_PRESENTATION[item.id];
+  const report = item.fieldReport;
+  return (
+    <button
+      type="button"
+      onClick={() => onSelect(item.id)}
+      aria-label={report
+        ? `${report.userScene} ${item.title}，真实实跑观察记录，尚未公开验证；关键结果：${report.metrics.map((metric) => `${metric.label} ${metric.value}`).join("、")}；${report.result}，查看这次实跑`
+        : `${presentation.pain} ${item.title}，完成后得到${presentation.result}，查看完整过程`}
+      className={cn(
+        "group overflow-hidden rounded-2xl border bg-surface text-left shadow-sm outline-none transition-[border-color,box-shadow,transform] hover:-translate-y-1 hover:shadow-float focus-visible:ring-2 focus-visible:ring-ring",
+        featured ? "border-success/30 hover:border-success/55" : "border-border hover:border-accent/40",
+      )}
+    >
+      <CaseArtwork caseId={item.id} fieldReport={report} />
+      <div className="p-4 sm:p-5">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className={cn("rounded-full px-2.5 py-1 text-[10.5px] font-semibold", report ? "bg-success-soft text-success" : "bg-accent-soft text-accent")}>
+            {report ? "实跑观察" : `${caseCategoryLabel(item.category)} · ${item.difficulty}`}
+          </span>
+          {report ? (
+            <span className="text-[10.5px] text-faint">{report.sourceLabel} · {report.duration}</span>
+          ) : item.artifacts.slice(0, 2).map((artifact) => (
+            <span key={artifact.title} className="rounded-full bg-hover px-2 py-1 text-[10px] text-faint">{artifact.format}</span>
+          ))}
+        </div>
+        <p className={cn("mt-3 line-clamp-2 text-[13px] font-medium leading-5", report ? "text-fg" : "text-accent")}>
+          {report ? report.userScene : presentation.pain}
+        </p>
+        <h3 className="mt-1 text-[17px] font-semibold leading-6 text-fg">{item.title}</h3>
+        {report ? (
+          <div className="mt-3 grid grid-cols-3 gap-2">
+            {report.metrics.map((metric) => (
+              <span key={metric.label} className="rounded-xl bg-sidebar px-2 py-2 text-center">
+                <strong className="block text-[13px] font-bold text-fg">{metric.value}</strong>
+                <span className="mt-0.5 block truncate text-[9px] text-faint">{metric.label}</span>
+              </span>
+            ))}
+          </div>
+        ) : (
+          <p className="mt-1.5 line-clamp-2 text-[12.5px] leading-5 text-muted">{presentation.result}</p>
+        )}
+        <span className="mt-4 inline-flex items-center gap-1.5 text-[12px] font-semibold text-fg transition-colors group-hover:text-accent">
+          {report ? "看这次实跑" : "查看完整过程"}
+          <ArrowRight size={14} className="transition-transform group-hover:translate-x-1" />
+        </span>
+      </div>
+    </button>
   );
 }
 
@@ -627,19 +696,28 @@ function CaseDetail({
         <ArrowLeft size={14} /> 返回全部案例
       </button>
       <section className="mt-4 overflow-hidden rounded-3xl border border-border bg-surface shadow-sm md:grid md:grid-cols-[1.05fr_.95fr]">
-        <CaseArtwork caseId={item.id} className="md:h-full md:min-h-[320px] md:aspect-auto" />
+        <CaseArtwork caseId={item.id} fieldReport={item.fieldReport} className="md:h-full md:min-h-[320px] md:aspect-auto" />
         <div className="flex flex-col p-5 sm:p-7">
           <div className="flex flex-wrap items-center gap-2">
-            <Badge tone="accent">{caseCategoryLabel(item.category)}</Badge>
+            {item.fieldReport ? (
+              <span className="rounded-full bg-success-soft px-2.5 py-1 text-[11px] font-semibold text-success">实跑观察 · 尚未公开验证</span>
+            ) : (
+              <Badge tone="accent">{caseCategoryLabel(item.category)}</Badge>
+            )}
             <span className="rounded-full bg-hover px-2.5 py-1 text-[11px] text-muted">{item.difficulty}</span>
+            {item.fieldReport && <span className="rounded-full bg-hover px-2.5 py-1 text-[11px] text-muted">{item.fieldReport.duration}</span>}
             <span className="text-[10.5px] text-faint">内容版本 {item.contentVersion}</span>
           </div>
-          <p className="mt-4 text-[13px] font-semibold leading-5 text-accent">{presentation.pain}</p>
+          <p className={cn("mt-4 text-[13px] font-semibold leading-5", item.fieldReport ? "text-success" : "text-accent")}>
+            {item.fieldReport ? item.fieldReport.userScene : presentation.pain}
+          </p>
           <h1 className="mt-1.5 text-balance text-[24px] font-bold leading-tight tracking-tight text-fg sm:text-[30px]">{item.title}</h1>
           <p className="mt-3 text-[13px] leading-6 text-muted">{item.summary}</p>
-          <div className="mt-4 rounded-2xl bg-accent-soft p-3.5">
-            <p className="text-[10.5px] font-semibold uppercase tracking-[0.12em] text-accent">最终成果</p>
-            <p className="mt-1 text-[13px] font-medium leading-5 text-fg">{presentation.result}</p>
+          <div className={cn("mt-4 rounded-2xl p-3.5", item.fieldReport ? "bg-success-soft" : "bg-accent-soft")}>
+            <p className={cn("text-[10.5px] font-semibold uppercase tracking-[0.12em]", item.fieldReport ? "text-success" : "text-accent")}>
+              {item.fieldReport ? "这次实际交付" : "最终成果"}
+            </p>
+            <p className="mt-1 text-[13px] font-medium leading-5 text-fg">{item.fieldReport?.result ?? presentation.result}</p>
           </div>
           {actionLabel && onRun && (
             <Button variant="primary" onClick={() => onRun(item)} className="mt-5 self-start">
@@ -649,11 +727,15 @@ function CaseDetail({
         </div>
       </section>
 
+      {item.fieldReport && <FieldReportStory report={item.fieldReport} />}
+
       <section className="mt-8">
         <div className="flex items-center justify-between gap-3">
           <div>
             <p className="text-[11px] font-semibold text-accent">先看结果</p>
-            <h2 className="mt-0.5 text-[19px] font-semibold tracking-tight text-fg">你会拿到这些成果</h2>
+            <h2 className="mt-0.5 text-[19px] font-semibold tracking-tight text-fg">
+              {item.fieldReport ? "复刻这次案例会得到" : "你会拿到这些成果"}
+            </h2>
           </div>
           <span className="rounded-full bg-hover px-2.5 py-1 text-[10.5px] text-faint">{item.artifacts.length} 份可交付文件</span>
         </div>
@@ -859,6 +941,80 @@ function CaseDetail({
         </div>
       </section>
     </article>
+  );
+}
+
+function FieldReportStory({ report }: { report: TutorialCaseFieldReport }) {
+  return (
+    <section className="mt-8 overflow-hidden rounded-3xl border border-success/25 bg-surface shadow-sm" aria-labelledby="field-report-story-title">
+      <div className="border-b border-border bg-gradient-to-r from-success-soft via-surface to-surface px-4 py-4 sm:px-6 sm:py-5">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <div className="flex flex-wrap items-center gap-2">
+              <p className="text-[10.5px] font-semibold uppercase tracking-[0.14em] text-success">V5 真实实跑</p>
+              <span className="rounded-full border border-warning/30 bg-warning-soft px-2 py-0.5 text-[9.5px] font-medium text-warning">
+                观察记录 · 尚未公开验证
+              </span>
+            </div>
+            <h2 id="field-report-story-title" className="mt-1 text-[20px] font-bold tracking-tight text-fg sm:text-[24px]">这次真实实跑</h2>
+          </div>
+          <a href={report.sourceUrl} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 rounded-full bg-sidebar px-3 py-1.5 text-[10.5px] font-medium text-muted hover:text-accent hover:underline">
+            {report.sourceLabel} <ExternalLink size={11} />
+          </a>
+        </div>
+      </div>
+
+      <div className="p-4 sm:p-6">
+        <div className="grid gap-3 sm:grid-cols-2">
+          <div className="rounded-2xl bg-[#07111f] p-4 text-white">
+            <p className="text-[10px] font-semibold uppercase tracking-[0.12em] text-emerald-200">用户卡在哪里</p>
+            <p className="mt-2 text-[13px] font-medium leading-5 text-white/95">{report.obstacle}</p>
+          </div>
+          <div className="rounded-2xl border border-border bg-sidebar p-4">
+            <p className="text-[10px] font-semibold uppercase tracking-[0.12em] text-accent">交给 V5 的真实材料</p>
+            <p className="mt-2 text-[13px] font-medium leading-5 text-fg">{report.input}</p>
+            <span className="mt-3 inline-flex rounded-full bg-surface px-2.5 py-1 text-[10.5px] font-semibold text-muted shadow-sm">完整实跑 {report.duration}</span>
+          </div>
+        </div>
+
+        <div className="mt-5">
+          <p className="text-[10.5px] font-semibold uppercase tracking-[0.12em] text-faint">看得见的处理过程</p>
+          <ol className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
+            {report.journey.map((step, index) => (
+              <li key={step.title} className="relative rounded-2xl border border-border bg-bg p-3 sm:p-3.5">
+                <span className="flex size-7 items-center justify-center rounded-full bg-grad-cta text-[11px] font-bold text-white">{index + 1}</span>
+                <h3 className="mt-3 text-[12.5px] font-semibold leading-5 text-fg">{step.title}</h3>
+                <p className="mt-1 text-[10.5px] leading-[18px] text-muted">{step.evidence}</p>
+              </li>
+            ))}
+          </ol>
+        </div>
+
+        <div className="mt-5 grid grid-cols-3 gap-2 sm:gap-3" aria-label="真实实跑关键结果">
+          {report.metrics.map((metric) => (
+            <div key={metric.label} className="rounded-2xl border border-success/20 bg-success-soft p-3 text-center sm:p-4">
+              <strong className="block text-[18px] font-bold tracking-tight text-fg sm:text-[24px]">{metric.value}</strong>
+              <span className="mt-0.5 block text-[9.5px] font-semibold text-success sm:text-[10.5px]">{metric.label}</span>
+              <span className="mt-1 hidden text-[10px] leading-4 text-muted sm:block">{metric.detail}</span>
+            </div>
+          ))}
+        </div>
+
+        <div className="mt-4 rounded-2xl border border-border bg-sidebar p-4">
+          <p className="flex items-center gap-2 text-[11px] font-semibold text-success"><Check size={14} /> 实际交付</p>
+          <p className="mt-1.5 text-[13px] font-medium leading-5 text-fg">{report.result}</p>
+        </div>
+
+        <div className="mt-3 rounded-2xl border border-warning/25 bg-warning-soft p-4">
+          <p className="flex items-center gap-2 text-[11px] font-semibold text-warning"><TriangleAlert size={14} /> 这次没有装作完美</p>
+          <ul className="mt-2 grid gap-1.5 sm:grid-cols-2">
+            {report.limitations.map((limitation) => (
+              <li key={limitation} className="flex gap-2 text-[10.5px] leading-[18px] text-muted"><span aria-hidden className="mt-2 size-1 shrink-0 rounded-full bg-warning" />{limitation}</li>
+            ))}
+          </ul>
+        </div>
+      </div>
+    </section>
   );
 }
 
