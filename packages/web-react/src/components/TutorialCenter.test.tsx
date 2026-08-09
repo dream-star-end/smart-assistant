@@ -82,6 +82,7 @@ describe("TutorialCenter", () => {
     ).toBeInTheDocument();
     expect(screen.queryByText(/从公开需求和可授权材料出发/)).not.toBeInTheDocument();
     expect(screen.getByText("2 份实跑观察记录（尚未公开验证）· 10 个可复用模板")).toBeInTheDocument();
+    expect(screen.getAllByText("实跑观察 · 尚未公开验证")).toHaveLength(2);
     expect(screen.getByRole("heading", { name: "从原始难题到可核对结果" })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "更多可直接复用的任务模板" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /论文越读越多.*从 30 篇论文到可追溯证据图谱.*每个结论都能点回原文/ })).toBeInTheDocument();
