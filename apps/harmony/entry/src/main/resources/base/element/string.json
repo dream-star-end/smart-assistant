@@ -17,6 +17,90 @@
       "value": "正在连接 Aurora"
     },
     {
+      "name": "connected",
+      "value": "网络可用"
+    },
+    {
+      "name": "offline",
+      "value": "网络已断开"
+    },
+    {
+      "name": "offline_hint",
+      "value": "恢复网络后，对话会自动重新连接"
+    },
+    {
+      "name": "model_and_agent",
+      "value": "模型与智能体"
+    },
+    {
+      "name": "open_sessions",
+      "value": "打开会话"
+    },
+    {
+      "name": "open_more",
+      "value": "更多与设置"
+    },
+    {
+      "name": "app_controls",
+      "value": "Aurora 应用控制"
+    },
+    {
+      "name": "quick_actions",
+      "value": "快捷入口"
+    },
+    {
+      "name": "reload_chat",
+      "value": "重新加载对话"
+    },
+    {
+      "name": "open_in_browser",
+      "value": "在系统浏览器打开"
+    },
+    {
+      "name": "media_tasks",
+      "value": "视频任务"
+    },
+    {
+      "name": "tutorial",
+      "value": "使用教程"
+    },
+    {
+      "name": "inbox",
+      "value": "站内信"
+    },
+    {
+      "name": "billing",
+      "value": "账户与计费"
+    },
+    {
+      "name": "service_and_privacy",
+      "value": "服务与隐私"
+    },
+    {
+      "name": "service_domain",
+      "value": "服务域名"
+    },
+    {
+      "name": "session_storage_hint",
+      "value": "登录与会话仍由受限 ArkWeb 单一管理，原生层不保存令牌或聊天内容。"
+    },
+    {
+      "name": "about_app",
+      "value": "关于 Aurora"
+    },
+    {
+      "name": "app_version",
+      "value": "HarmonyOS 客户端 · 1.0.0"
+    },
+    {
+      "name": "compatibility_mode",
+      "value": "原生客户端 · Web 会话兼容层"
+    },
+    {
+      "name": "web_action_unavailable",
+      "value": "当前页面暂不支持此操作"
+    },
+    {
       "name": "load_failed",
       "value": "暂时无法连接"
     },

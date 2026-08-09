@@ -5,6 +5,7 @@ import {
   Permissions
 } from '@kit.AbilityKit';
 import { webview } from '@kit.ArkWeb';
+import { BusinessError } from '@kit.BasicServicesKit';
 import { fileIo, picker } from '@kit.CoreFileKit';
 import {
   APP_HOME_URL,
@@ -16,6 +17,15 @@ import {
   NavigationDecision,
   safeHttpsHostname
 } from '../common/NavigationPolicy';
+import {
+  buildShellActivationScript,
+  buildShellRollbackScript,
+  buildWebActionScript,
+  NativeWebAction,
+  shouldAcceptShellActivation,
+  shouldAcceptWebAction
+} from '../common/NativeShellPolicy';
+import { NetworkMonitor } from '../services/NetworkMonitor';
 
 const MICROPHONE_PERMISSION: Permissions = 'ohos.permission.MICROPHONE';
 const MAX_SELECTABLE_FILES: number = 8;
@@ -39,20 +49,38 @@ struct Index {
   private downloadDelegate: webview.WebDownloadDelegate = new webview.WebDownloadDelegate();
   private downloadDelegateConfigured: boolean = false;
   private downloadTargets: Map<string, DownloadTarget> = new Map<string, DownloadTarget>();
+  private navigationGeneration: number = 0;
+  private networkMonitor: NetworkMonitor | undefined = undefined;
 
   @State private loading: boolean = true;
   @State private progress: number = 0;
   @State private loadFailed: boolean = false;
+  @State private hasLoadedOnce: boolean = false;
+  @State private nativeShellReady: boolean = false;
+  @State private online: boolean = true;
+  @State private settingsVisible: boolean = false;
   @State private oauthNavigationActive: boolean = false;
   @State private externalAuthHost: string = '';
   @State private pendingOauthUrl: string = '';
   @State private pendingOauthHost: string = '';
 
   aboutToAppear(): void {
+    if (this.networkMonitor === undefined) {
+      this.networkMonitor = new NetworkMonitor((online: boolean) => {
+        this.online = online;
+      });
+    }
+    this.networkMonitor.start();
     if (!this.destinationOpened) {
       this.clearStaleDownloadCache();
       this.destinationOpened = true;
       this.pathStack.pushPath({ name: 'aurora-web' }, false);
+    }
+  }
+
+  aboutToDisappear(): void {
+    if (this.networkMonitor !== undefined) {
+      this.networkMonitor.stop();
     }
   }
 
@@ -74,6 +102,104 @@ struct Index {
     } catch (_) {
       return false;
     }
+  }
+
+  private currentPageUrl(): string {
+    try {
+      return this.controller.getUrl();
+    } catch (_) {
+      return '';
+    }
+  }
+
+  private activateNativeShell(startedGeneration: number): void {
+    const currentUrl: string = this.currentPageUrl();
+    if (!isPrimaryAppOrigin(currentUrl)) {
+      return;
+    }
+
+    try {
+      this.controller.runJavaScript(
+        buildShellActivationScript(startedGeneration),
+        (error: BusinessError, result: string) => {
+          if (error) {
+            this.rollbackNativeShell(startedGeneration);
+            return;
+          }
+          const latestUrl: string = this.currentPageUrl();
+          if (shouldAcceptShellActivation(
+            startedGeneration,
+            this.navigationGeneration,
+            latestUrl,
+            result
+          )) {
+            this.nativeShellReady = true;
+            return;
+          }
+          this.rollbackNativeShell(startedGeneration);
+        }
+      );
+    } catch (_) {
+      this.rollbackNativeShell(startedGeneration);
+    }
+  }
+
+  private rollbackNativeShell(startedGeneration: number): void {
+    const isCurrentGeneration: boolean = startedGeneration === this.navigationGeneration;
+    if (isCurrentGeneration) {
+      this.nativeShellReady = false;
+    }
+    if (!this.isPrimaryPage()) {
+      return;
+    }
+    try {
+      this.controller.runJavaScript(
+        buildShellRollbackScript(startedGeneration),
+        (_error: BusinessError, _result: string) => {}
+      );
+    } catch (_) {
+      // A navigation can detach ArkWeb while the fallback cleanup is running.
+    }
+  }
+
+  private runWebAction(action: NativeWebAction): void {
+    this.settingsVisible = false;
+    if (!this.nativeShellReady || !this.isPrimaryPage()) {
+      this.showToast($r('app.string.web_action_unavailable'));
+      return;
+    }
+
+    const startedGeneration: number = this.navigationGeneration;
+    try {
+      this.controller.runJavaScript(
+        buildWebActionScript(action, startedGeneration),
+        (error: BusinessError, result: string) => {
+          if (startedGeneration !== this.navigationGeneration || !this.isPrimaryPage()) {
+            return;
+          }
+          if (error || !shouldAcceptWebAction(
+            startedGeneration,
+            this.navigationGeneration,
+            this.currentPageUrl(),
+            result
+          )) {
+            this.showToast($r('app.string.web_action_unavailable'));
+          }
+        }
+      );
+    } catch (_) {
+      this.showToast($r('app.string.web_action_unavailable'));
+    }
+  }
+
+  private reloadConversation(): void {
+    this.settingsVisible = false;
+    this.retry();
+  }
+
+  private openInSystemBrowser(): void {
+    this.settingsVisible = false;
+    this.openExternalUrl(APP_HOME_URL);
   }
 
   private openExternalUrl(targetUrl: string): void {
@@ -400,6 +526,11 @@ struct Index {
   }
 
   private handleBackPress(): boolean {
+    if (this.settingsVisible) {
+      this.settingsVisible = false;
+      return true;
+    }
+
     if (this.pendingOauthUrl.length > 0) {
       this.dismissOauthCandidate();
       return true;
@@ -432,9 +563,288 @@ struct Index {
   }
 
   @Builder
+  private shellIconButton(symbol: Resource, label: Resource, action: NativeWebAction): void {
+    Button() {
+      SymbolGlyph(symbol)
+        .fontSize(22)
+        .fontColor([$r('app.color.primary_text')])
+    }
+    .type(ButtonType.Normal)
+    .width(48)
+    .height(48)
+    .padding(0)
+    .borderRadius(12)
+    .backgroundColor(Color.Transparent)
+    .accessibilityText(label)
+    .onClick(() => this.runWebAction(action))
+  }
+
+  @Builder
+  private nativeAppBar(): void {
+    Row({ space: 4 }) {
+      this.shellIconButton(
+        $r('sys.symbol.open_sidebar'),
+        $r('app.string.open_sessions'),
+        NativeWebAction.OPEN_SESSIONS
+      )
+
+      Row() {
+        Row({ space: 10 }) {
+          Image($r('app.media.aurora_icon'))
+            .width(32)
+            .height(32)
+            .borderRadius(9)
+
+          Column({ space: 2 }) {
+            Text('Aurora')
+              .fontSize(15)
+              .fontWeight(FontWeight.Medium)
+              .fontColor($r('app.color.primary_text'))
+              .maxLines(1)
+
+            Row({ space: 5 }) {
+              Circle()
+                .width(6)
+                .height(6)
+                .fill(this.online ? $r('app.color.connected') : $r('app.color.offline_text'))
+              if (this.online) {
+                Text($r('app.string.connected'))
+                  .fontSize(12)
+                  .fontColor($r('app.color.secondary_text'))
+              } else {
+                Text($r('app.string.offline'))
+                  .fontSize(12)
+                  .fontColor($r('app.color.offline_text'))
+              }
+              Text('·')
+                .fontSize(12)
+                .fontColor($r('app.color.faint_text'))
+              Text($r('app.string.model_and_agent'))
+                .fontSize(12)
+                .fontColor($r('app.color.secondary_text'))
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+            }
+            .width('100%')
+          }
+          .alignItems(HorizontalAlign.Start)
+          .layoutWeight(1)
+        }
+        .width('100%')
+        .height('100%')
+      }
+      .layoutWeight(1)
+      .height(48)
+      .padding({ left: 4, right: 8 })
+      .borderRadius(12)
+      .backgroundColor(Color.Transparent)
+
+      Button() {
+        SymbolGlyph($r('sys.symbol.more'))
+          .fontSize(22)
+          .fontColor([$r('app.color.primary_text')])
+      }
+      .type(ButtonType.Normal)
+      .width(48)
+      .height(48)
+      .padding(0)
+      .borderRadius(12)
+      .backgroundColor(Color.Transparent)
+      .accessibilityText($r('app.string.open_more'))
+      .onClick(() => {
+        this.settingsVisible = true;
+      })
+    }
+    .width('100%')
+    .height(56)
+    .padding({ left: 4, right: 4 })
+    .backgroundColor($r('app.color.surface_background'))
+    .border({
+      width: { bottom: 1 },
+      color: $r('app.color.divider')
+    })
+  }
+
+  @Builder
+  private offlineBanner(): void {
+    Row({ space: 10 }) {
+      SymbolGlyph($r('sys.symbol.wifi'))
+        .fontSize(20)
+        .fontColor([$r('app.color.offline_text')])
+
+      Column({ space: 1 }) {
+        Text($r('app.string.offline'))
+          .fontSize(13)
+          .fontWeight(FontWeight.Medium)
+          .fontColor($r('app.color.offline_text'))
+        Text($r('app.string.offline_hint'))
+          .fontSize(11)
+          .fontColor($r('app.color.offline_text'))
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+      }
+      .alignItems(HorizontalAlign.Start)
+      .layoutWeight(1)
+    }
+    .width('100%')
+    .constraintSize({ minHeight: 48 })
+    .padding({ left: 16, right: 16, top: 6, bottom: 6 })
+    .backgroundColor($r('app.color.offline_background'))
+  }
+
+  @Builder
+  private webActionButton(label: Resource, action: NativeWebAction): void {
+    Button(label)
+      .type(ButtonType.Normal)
+      .layoutWeight(1)
+      .height(44)
+      .fontSize(13)
+      .fontColor($r('app.color.primary_text'))
+      .backgroundColor($r('app.color.auth_bar_background'))
+      .borderRadius(12)
+      .onClick(() => this.runWebAction(action))
+  }
+
+  @Builder
+  private appSettingsSheet(): void {
+    Scroll() {
+      Column({ space: 16 }) {
+        Column({ space: 4 }) {
+          Text($r('app.string.app_controls'))
+            .fontSize(20)
+            .fontWeight(FontWeight.Bold)
+            .fontColor($r('app.color.primary_text'))
+          Text($r('app.string.compatibility_mode'))
+            .fontSize(12)
+            .fontColor($r('app.color.secondary_text'))
+        }
+        .alignItems(HorizontalAlign.Start)
+        .width('100%')
+
+        Row({ space: 12 }) {
+          Image($r('app.media.aurora_icon'))
+            .width(40)
+            .height(40)
+            .borderRadius(12)
+          Column({ space: 3 }) {
+            Text(this.online ? $r('app.string.connected') : $r('app.string.offline'))
+              .fontSize(15)
+              .fontWeight(FontWeight.Medium)
+              .fontColor(this.online ? $r('app.color.connected') : $r('app.color.offline_text'))
+            Text('claudeai.chat')
+              .fontSize(12)
+              .fontColor($r('app.color.secondary_text'))
+          }
+          .alignItems(HorizontalAlign.Start)
+          .layoutWeight(1)
+        }
+        .width('100%')
+        .padding(14)
+        .backgroundColor($r('app.color.auth_bar_background'))
+        .borderRadius(16)
+
+        Column({ space: 8 }) {
+          Text($r('app.string.quick_actions'))
+            .fontSize(12)
+            .fontWeight(FontWeight.Medium)
+            .fontColor($r('app.color.secondary_text'))
+            .width('100%')
+
+          Row({ space: 8 }) {
+            Button($r('app.string.reload_chat'))
+              .type(ButtonType.Normal)
+              .layoutWeight(1)
+              .height(44)
+              .fontSize(13)
+              .fontColor(Color.White)
+              .backgroundColor($r('app.color.brand_primary'))
+              .borderRadius(12)
+              .onClick(() => this.reloadConversation())
+            Button($r('app.string.open_in_browser'))
+              .type(ButtonType.Normal)
+              .layoutWeight(1)
+              .height(44)
+              .fontSize(13)
+              .fontColor($r('app.color.primary_text'))
+              .backgroundColor($r('app.color.auth_bar_background'))
+              .borderRadius(12)
+              .onClick(() => this.openInSystemBrowser())
+          }
+          .width('100%')
+
+          Row({ space: 8 }) {
+            this.webActionButton($r('app.string.media_tasks'), NativeWebAction.OPEN_MEDIA)
+            this.webActionButton($r('app.string.tutorial'), NativeWebAction.OPEN_TUTORIAL)
+          }
+          .width('100%')
+
+          Row({ space: 8 }) {
+            this.webActionButton($r('app.string.inbox'), NativeWebAction.OPEN_INBOX)
+            this.webActionButton($r('app.string.billing'), NativeWebAction.OPEN_BILLING)
+          }
+          .width('100%')
+        }
+        .alignItems(HorizontalAlign.Start)
+        .width('100%')
+
+        Column({ space: 8 }) {
+          Text($r('app.string.service_and_privacy'))
+            .fontSize(12)
+            .fontWeight(FontWeight.Medium)
+            .fontColor($r('app.color.secondary_text'))
+            .width('100%')
+          Row() {
+            Text($r('app.string.service_domain'))
+              .fontSize(14)
+              .fontColor($r('app.color.primary_text'))
+            Blank()
+            Text('claudeai.chat')
+              .fontSize(13)
+              .fontColor($r('app.color.secondary_text'))
+          }
+          .width('100%')
+          .padding({ top: 4, bottom: 4 })
+          Text($r('app.string.session_storage_hint'))
+            .fontSize(12)
+            .lineHeight(18)
+            .fontColor($r('app.color.secondary_text'))
+            .width('100%')
+        }
+        .alignItems(HorizontalAlign.Start)
+        .width('100%')
+        .padding(14)
+        .backgroundColor($r('app.color.auth_bar_background'))
+        .borderRadius(16)
+
+        Column({ space: 4 }) {
+          Text($r('app.string.about_app'))
+            .fontSize(14)
+            .fontWeight(FontWeight.Medium)
+            .fontColor($r('app.color.primary_text'))
+          Text($r('app.string.app_version'))
+            .fontSize(12)
+            .fontColor($r('app.color.secondary_text'))
+        }
+        .alignItems(HorizontalAlign.Start)
+        .width('100%')
+      }
+      .width('100%')
+      .padding({ left: 20, right: 20, top: 8, bottom: 24 })
+    }
+    .width('100%')
+    .height('100%')
+    .scrollBar(BarState.Auto)
+    .backgroundColor($r('app.color.surface_background'))
+  }
+
+  @Builder
   private webContent(): void {
     Stack({ alignContent: Alignment.TopStart }) {
       Column() {
+        if (this.nativeShellReady && this.externalAuthHost.length === 0) {
+          this.nativeAppBar()
+        }
+
         if (this.externalAuthHost.length > 0) {
           Row({ space: 10 }) {
             Column({ space: 2 }) {
@@ -467,6 +877,18 @@ struct Index {
           })
         }
 
+        if (this.nativeShellReady && !this.online && this.externalAuthHost.length === 0) {
+          this.offlineBanner()
+        }
+
+        if (this.loading && this.hasLoadedOnce && this.nativeShellReady) {
+          Progress({ value: this.progress, total: 100, type: ProgressType.Linear })
+            .width('100%')
+            .height(2)
+            .color($r('app.color.brand_primary'))
+            .backgroundColor(Color.Transparent)
+        }
+
         Web({ src: APP_HOME_URL, controller: this.controller })
         .width('100%')
         .layoutWeight(1)
@@ -495,6 +917,8 @@ struct Index {
           return true;
         })
         .onPageBegin(() => {
+          this.navigationGeneration += 1;
+          this.nativeShellReady = false;
           this.loading = !this.oauthNavigationActive;
           this.loadFailed = false;
           this.progress = 0;
@@ -505,6 +929,11 @@ struct Index {
         .onPageEnd(() => {
           this.loading = false;
           this.progress = 100;
+          this.hasLoadedOnce = true;
+          const completedGeneration: number = this.navigationGeneration;
+          if (!this.oauthNavigationActive && this.isPrimaryPage()) {
+            this.activateNativeShell(completedGeneration);
+          }
         })
         .onErrorReceive((event) => {
           if (event.request.isMainFrame()) {
@@ -516,7 +945,7 @@ struct Index {
       .width('100%')
       .height('100%')
 
-      if (this.loading && !this.loadFailed) {
+      if (this.loading && !this.loadFailed && !this.hasLoadedOnce) {
         Column({ space: 18 }) {
           Image($r('app.media.aurora_icon'))
             .width(72)
@@ -620,6 +1049,12 @@ struct Index {
     .width('100%')
     .height('100%')
     .backgroundColor($r('app.color.page_background'))
+    .bindSheet($$this.settingsVisible, this.appSettingsSheet(), {
+      height: 600,
+      dragBar: true,
+      showClose: true,
+      backgroundColor: $r('app.color.surface_background')
+    })
   }
 
   build() {

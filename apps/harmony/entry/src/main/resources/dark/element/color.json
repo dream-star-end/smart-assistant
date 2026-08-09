@@ -9,16 +9,44 @@
       "value": "#0C0C11"
     },
     {
+      "name": "surface_background",
+      "value": "#15151C"
+    },
+    {
       "name": "primary_text",
-      "value": "#F5F3FF"
+      "value": "#F2F2F6"
     },
     {
       "name": "secondary_text",
-      "value": "#A5A2B3"
+      "value": "#BCBCC7"
+    },
+    {
+      "name": "faint_text",
+      "value": "#92929E"
     },
     {
       "name": "brand_primary",
-      "value": "#8B72F5"
+      "value": "#9A8AFF"
+    },
+    {
+      "name": "focus_color",
+      "value": "#9A8AFF"
+    },
+    {
+      "name": "divider",
+      "value": "#27272F"
+    },
+    {
+      "name": "connected",
+      "value": "#55C58A"
+    },
+    {
+      "name": "offline_background",
+      "value": "#2B2211"
+    },
+    {
+      "name": "offline_text",
+      "value": "#F8C66B"
     },
     {
       "name": "progress_track",
@@ -26,11 +54,11 @@
     },
     {
       "name": "auth_bar_background",
-      "value": "#17151F"
+      "value": "#15151C"
     },
     {
       "name": "auth_bar_border",
-      "value": "#312D42"
+      "value": "#27272F"
     }
   ]
 }
