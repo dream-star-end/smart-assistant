@@ -597,6 +597,85 @@ describe('V5 durable development release queue', () => {
     assert.equal(jobs.find((job) => job.id === cancelled)?.status, 'cancelled')
   })
 
+  test('heartbeat refreshes only the exact active owner and records a durable event', async () => {
+    const fixture = await queueFixture()
+    const active = outputId(
+      fixture.invoke([
+        'submit',
+        '--task',
+        'long-eval',
+        '--branch',
+        'chore/long-eval',
+        '--sha',
+        fixture.candidate,
+        '--actor',
+        'test',
+      ]),
+    )
+    const queued = outputId(
+      fixture.invoke([
+        'submit',
+        '--task',
+        'waiting',
+        '--branch',
+        'chore/waiting',
+        '--sha',
+        fixture.base,
+        '--actor',
+        'test',
+      ]),
+    )
+    assert.equal(fixture.invoke(['acquire', '--id', active, '--owner', 'eval-owner']).status, 0)
+    const before = JSON.parse(fixture.invoke(['status', '--json']).stdout) as Array<{
+      id: string
+      updated_at: string
+    }>
+    const beforeUpdatedAt = before.find((job) => job.id === active)?.updated_at
+    assert.ok(beforeUpdatedAt)
+
+    await new Promise((resolve) => setTimeout(resolve, 1_100))
+    const heartbeat = fixture.invoke(['heartbeat', '--id', active, '--owner', 'eval-owner'])
+    assert.equal(heartbeat.status, 0, heartbeat.stderr || heartbeat.stdout)
+    assert.equal(heartbeat.stdout.trim(), active)
+    const after = JSON.parse(fixture.invoke(['status', '--json']).stdout) as Array<{
+      id: string
+      updated_at: string
+    }>
+    const afterUpdatedAt = after.find((job) => job.id === active)?.updated_at
+    assert.ok(afterUpdatedAt && afterUpdatedAt > beforeUpdatedAt)
+    const heartbeatEvents = spawnSync(
+      'sqlite3',
+      [
+        fixture.env.OC_V5_RELEASE_QUEUE_DB,
+        `SELECT count(*) FROM release_queue_events WHERE job_id='${active}' AND event='heartbeat' AND actor='eval-owner';`,
+      ],
+      { encoding: 'utf8' },
+    )
+    assert.equal(heartbeatEvents.status, 0, heartbeatEvents.stderr || heartbeatEvents.stdout)
+    assert.equal(heartbeatEvents.stdout.trim(), '1')
+
+    assert.notEqual(
+      fixture.invoke(['heartbeat', '--id', active, '--owner', 'another-owner']).status,
+      0,
+      'another owner must not keep an active job alive',
+    )
+    assert.notEqual(
+      fixture.invoke(['heartbeat', '--id', queued, '--owner', 'eval-owner']).status,
+      0,
+      'a queued job must not accept heartbeats',
+    )
+    const unchangedEvents = spawnSync(
+      'sqlite3',
+      [
+        fixture.env.OC_V5_RELEASE_QUEUE_DB,
+        `SELECT count(*) FROM release_queue_events WHERE event='heartbeat';`,
+      ],
+      { encoding: 'utf8' },
+    )
+    assert.equal(unchangedEvents.status, 0, unchangedEvents.stderr || unchangedEvents.stdout)
+    assert.equal(unchangedEvents.stdout.trim(), '1')
+  })
+
   test('abandon-active holds local deploy lock and official lease through the audited transition', async () => {
     const fixture = await queueFixture()
     const id = outputId(
