@@ -1189,9 +1189,31 @@ export function assertStandardScratchRestored(before, after) {
     after.persistentScratch,
     "standard container scratch after restoration",
   );
+  const normalizeOptionalMountpoints = (scratch) =>
+    Object.fromEntries(Object.entries(scratch).map(([name, identity]) => {
+      if (!OPTIONAL_STANDARD_SKILL_STATE_NAMES.includes(name)) {
+        return [name, identity];
+      }
+      const keys = Object.keys(identity).sort();
+      const exactAbsent = identity.state === "absent"
+        && JSON.stringify(keys) === JSON.stringify(["state"]);
+      const exactEmptyTree = identity.state === "tree"
+        && JSON.stringify(keys) === JSON.stringify([
+          "directories",
+          "files",
+          "sha256",
+          "state",
+        ])
+        && identity.files === 0
+        && identity.directories === 0
+        && identity.sha256 === EMPTY_TREE_SHA256;
+      return exactAbsent || exactEmptyTree
+        ? [name, { state: "empty-mountpoint" }]
+        : [name, identity];
+    }));
   if (
-    JSON.stringify(before.persistentScratch)
-    !== JSON.stringify(after.persistentScratch)
+    JSON.stringify(normalizeOptionalMountpoints(before.persistentScratch))
+    !== JSON.stringify(normalizeOptionalMountpoints(after.persistentScratch))
   ) {
     fail("persistent scratch changed across exact arm restoration");
   }

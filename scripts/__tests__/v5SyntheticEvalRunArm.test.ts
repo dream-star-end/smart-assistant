@@ -1029,6 +1029,43 @@ describe("V5 synthetic exact-eval run-arm", () => {
     assert.doesNotThrow(() =>
       assertStandardScratchRestored(persistent, structuredClone(persistent))
     );
+    const optionalMountpointsCreated = structuredClone(persistent);
+    optionalMountpointsCreated.persistentScratch.skillDrafts = {
+      state: "tree",
+      files: 0,
+      directories: 0,
+      sha256: emptyScratch.sha256,
+    };
+    optionalMountpointsCreated.persistentScratch.agentSkills = {
+      state: "tree",
+      files: 0,
+      directories: 0,
+      sha256: emptyScratch.sha256,
+    };
+    assert.doesNotThrow(() =>
+      assertStandardScratchRestored(persistent, optionalMountpointsCreated)
+    );
+    assert.doesNotThrow(() =>
+      assertStandardScratchRestored(optionalMountpointsCreated, persistent)
+    );
+
+    const nonemptyOptionalMountpoint = structuredClone(
+      optionalMountpointsCreated,
+    );
+    nonemptyOptionalMountpoint.persistentScratch.skillDrafts.files = 1;
+    assert.throws(
+      () => assertStandardScratchRestored(
+        persistent,
+        nonemptyOptionalMountpoint,
+      ),
+      /persistent scratch changed/,
+    );
+    const invalidEmptyMountpoint = structuredClone(optionalMountpointsCreated);
+    invalidEmptyMountpoint.persistentScratch.agentSkills.sha256 = "9".repeat(64);
+    assert.throws(
+      () => assertStandardScratchRestored(persistent, invalidEmptyMountpoint),
+      /persistent scratch changed/,
+    );
     const changed = structuredClone(persistent);
     changed.persistentScratch.workspace.sha256 = "3".repeat(64);
     assert.throws(
