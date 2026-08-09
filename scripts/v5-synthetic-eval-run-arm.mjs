@@ -785,10 +785,28 @@ export function parseTurnResult(stdout, resultPath, framesPath, identity) {
     (frame) => frame?.payload?.type === "outbound.cost_charged",
   );
   const errorFrames = received.filter(
-    (frame) =>
-      ["outbound.error", "outbound.turn_error", "error"].includes(
-        frame?.payload?.type,
-      ),
+    (frame) => {
+      if (
+        !["outbound.error", "outbound.turn_error", "error"].includes(
+          frame?.payload?.type,
+        )
+      ) {
+        return false;
+      }
+      const errorPeerId = frame.payload?.peer?.id;
+      const errorClientMessageId = frame.payload?.clientMessageId;
+      const hasPeerId = typeof errorPeerId === "string";
+      const hasClientMessageId = typeof errorClientMessageId === "string";
+      if (!hasPeerId && !hasClientMessageId) return true;
+      if (hasPeerId && errorPeerId !== value.peer_id) return false;
+      if (
+        hasClientMessageId
+        && errorClientMessageId !== value.client_message_id
+      ) {
+        return false;
+      }
+      return true;
+    },
   );
   if (finalFrames.length !== 1 || costFrames.length < 1 || errorFrames.length) {
     fail("raw turn frames do not prove a clean final plus authoritative cost");

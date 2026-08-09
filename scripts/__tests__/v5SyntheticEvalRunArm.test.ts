@@ -422,6 +422,74 @@ describe("V5 synthetic exact-eval run-arm", () => {
     assert.equal(turnHelperTimeoutMs(900), 1_110_000);
 
     const storedTurn = JSON.parse(readFileSync(resultPath, "utf8"));
+    const parseWithErrorFrame = (
+      name: string,
+      errorFrame: Record<string, unknown>,
+    ) => {
+      const variantFramesPath = join(directory, `${name}-frames.json`);
+      const variantTurnPath = join(directory, `${name}-turn.json`);
+      const variantFrames = {
+        ...frames,
+        frames: [
+          {
+            seq: 0,
+            at: "2026-07-31T09:59:59.000Z",
+            direction: "received",
+            bytes: 0,
+            text: JSON.stringify(errorFrame),
+          },
+          ...frames.frames.map((frame, index) => ({
+            ...frame,
+            seq: index + 1,
+          })),
+        ],
+      };
+      for (const frame of variantFrames.frames) {
+        frame.bytes = Buffer.byteLength(frame.text);
+      }
+      const variantFramesBytes = Buffer.from(`${JSON.stringify(variantFrames)}\n`);
+      writeFileSync(variantFramesPath, variantFramesBytes, { mode: 0o600 });
+      writeFileSync(variantTurnPath, JSON.stringify({
+        ...storedTurn,
+        frames_path: variantFramesPath,
+        frames_sha256: createHash("sha256")
+          .update(variantFramesBytes)
+          .digest("hex"),
+        frames_bytes: variantFramesBytes.length,
+        frame_count: variantFrames.frames.length,
+      }), { mode: 0o600 });
+      chmodSync(variantFramesPath, 0o600);
+      chmodSync(variantTurnPath, 0o600);
+      return () => parseTurnResult(
+        `${variantTurnPath}\n`,
+        variantTurnPath,
+        variantFramesPath,
+        identity,
+      );
+    };
+    const staleReplay = parseWithErrorFrame("stale-replay-error", {
+      type: "error",
+      code: "UNAUTHORIZED_MODEL",
+      peer: { id: "peer_other_0123456789", kind: "dm" },
+      clientMessageId: "message_other_0123456789",
+    })();
+    assert.equal(staleReplay.peerId, "peer_0123456789");
+    assert.throws(
+      parseWithErrorFrame("current-turn-error", {
+        type: "error",
+        code: "UNAUTHORIZED_MODEL",
+        peer: { id: "peer_0123456789", kind: "dm" },
+        clientMessageId,
+      }),
+      /clean final plus authoritative cost/,
+    );
+    assert.throws(
+      parseWithErrorFrame("connection-error", {
+        type: "error",
+        code: "RELAY_CONNECTION_FAILED",
+      }),
+      /clean final plus authoritative cost/,
+    );
     const writeRuntimeVariant = (
       name: string,
       runtime: Record<string, number>,
