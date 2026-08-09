@@ -75,6 +75,43 @@ git worktree add ../openclaude-v5-<slug> -b feat/v5-<slug> feat/v5-aurora-rewrit
   `mkdir -p packages/<pkg>/node_modules/@openclaude && ln -sfn ../../../protocol packages/<pkg>/node_modules/@openclaude/protocol`
 - 先充分调研(git log 相关文件、找既有抽象),方案过 Codex,再写码。
 
+### 2.1a HarmonyOS 独立产品线例外
+
+`apps/harmony/**` 不按普通 v5 feature branch 生命周期处理。长期 canonical 是
+`feat/v5-harmony-app`,该分支独立保留、持续发版,不合回 `feat/v5-aurora-rewrite` 后删除。
+Harmony app 需要共享 server/protocol/web 变更时,共享改动仍从 `feat/v5-aurora-rewrite`
+另开标准 worktree、走受保护 PR;验证兼容后再把所需提交有意同步到 app 分支。禁止反过来从
+app 分支部署 v5 server。
+
+产品架构是 **native-first ArkUI + 受限 ArkWeb compat**,不是给网页版套壳。导航、会话入口、
+设置、loading/error/offline、键盘与安全区、上传下载/分享/麦克风/通知等系统能力优先做原生适配;
+登录、会话、计费、连接器与 WebSocket 继续复用 server 权威,禁止复制第二套业务状态机或在原生层
+持久化 access/refresh credential。
+
+**compat-v1 安全边界必须同时满足**:
+
+1. 只对 exact origin `https://claudeai.chat`(HTTPS + 精确 host + 默认端口)启用;外观相似域名、
+   URL credentials、非默认端口与其它 scheme 一律不进入 compat。
+2. 每次 main-frame navigation 递增 generation;异步结果/脚本结果携带捕获的 generation,
+   非当前代立即丢弃,防导航后旧结果污染新页面。
+3. 每段注入脚本内部在 DOM 读写前再次断言
+   `location.origin === 'https://claudeai.chat'`;原生侧预检不能替代 script 内检查。
+4. selector 是带版本的 compat-v1 契约。当前对话页要求 ChatHeader、Agent、Model 各唯一命中,
+   且两个控件都是 Header 的直接子元素;缺失、重复、歧义或结构漂移时 fail safe:停止增强并
+   回退到未修改的 Web 流程,禁止临时扩大 selector 或继续操作未知 DOM。
+5. compat 不读取/回传 cookie、bearer token、localStorage 或任意页面内容,不提供通用 JS bridge。
+
+当前不引入 `WebMessagePort`。只有一方 web 首先提供经审查的版本化 handshake,且确有持续双向
+事件流需求时才迁移;届时必须把 exact origin、navigation generation、schema version、
+per-navigation nonce 与窄 command/event allowlist 绑定在协议中,任一不匹配 fail closed,
+并禁止承载认证秘密。
+
+验收分两层:模拟器实跑冷/热启动、原生导航/返回、offline/retry、键盘/窗口、selector-missing
+fallback、旧 generation 丢弃、外链/OAuth 域名确认、上传下载;签名真机再跑麦克风权限、系统文档
+选择/保存、外部浏览器往返、前后台恢复、网络切换、通知/分享(若涉及)、性能/功耗与 crash/hilog。
+构建成功或只编出 ohosTest HAP 不等于真机验收完成。所有构建、运行、设备与日志动作统一走
+`devecocli`。
+
 ### 2.2 v5 设计原则(与 v3 的关键差异)
 - **v5 未全量上线 → 放开走最优解**:发现次优结构就大胆重构(换抽象/删旧机制/改数据模型),不为"改动小"迁就。架构妥协零容忍;v3 仍守现网约束。
 - 判断标准:worktree 基于 feat/v5-aurora-rewrite → 最优解;基于 v3 → 现网纪律。
@@ -299,6 +336,17 @@ usage_records + journal 双查;零输出免单/turn 级 idle 免单已内建;cod
 - `packages/commercial/src/http/admin/selfheal.ts` — RFC §3 manual:自愈审批链 TCB(admin 放行 HTTP 入口,§P1)
 - `packages/commercial/src/admin/audit*.ts` — RFC §3 manual:自愈审批链 TCB(永久 admin audit:audit.ts/auditActions.ts/auditRedact.ts/auditRetention.ts)
 <!-- selfheal-deploy-surfaces:end -->
+
+### 4.1a HarmonyOS app-release 手工面
+
+`apps/harmony/**` 是独立 `app-release` manual 面,不属于 master/dist/runtime source/platform
+bundle/runtime image 任一服务器生效面。app-only diff 被分类器判为 `manual_required` 是预期的
+fail-closed 结果:不进入 v5 server release queue,不运行 `scripts/deploy-v5.sh`,也**无需 runtime
+image rebuild**。交付走 release HAP/App 构建、仓外授权签名、签名真机验收和 AppGallery 审核。
+
+若一批同时修改 app 与 server/protocol/web,拆成独立提交/分支:仅 server 侧改动按上方机器矩阵
+从 `feat/v5-aurora-rewrite` 的 canonical 部署;app 产物继续从 `feat/v5-harmony-app` 单独发布。
+禁止把 app 分支 rsync 到服务器或为了 app-only 改动调用任何 deploy-v5 模式。
 
 ### 4.2 标准部署
 

@@ -17,9 +17,14 @@ claude-code-best/dist/
 # 通配也覆盖临时编译产物(如 node-agent.new)
 packages/commercial/node-agent/node-agent*
 
-# .claude/ 仅跟踪 CLAUDE.md,本地工作笔记/计划草稿一律忽略
+# .claude/ 默认只跟踪 CLAUDE.md；经审查的项目技能必须逐个显式放行，
+# 本地工作笔记/计划草稿仍一律忽略。
 .claude/*
 !.claude/CLAUDE.md
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/v5-harmony-app/
+!.claude/skills/v5-harmony-app/**
 
 # S12a — TypeScript composite emit (only .d.ts since emitDeclarationOnly:true)
 # Use ** so 嵌套 workspace 包(如 packages/channels/wechat/)也覆盖

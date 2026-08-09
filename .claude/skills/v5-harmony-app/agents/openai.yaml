@@ -1,0 +1,4 @@
+interface:
+  display_name: "V5 Harmony App"
+  short_description: "开发和演进 Aurora 商业版 HarmonyOS 原生应用"
+  default_prompt: "Use $v5-harmony-app to implement and verify a native-first HarmonyOS feature for Aurora."
