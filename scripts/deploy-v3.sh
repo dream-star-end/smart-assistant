@@ -267,6 +267,8 @@ if [[ $ROLLBACK_REQUESTED -eq 1 ]]; then
   ssh kl-mirror "rsync -a --delete \
     --exclude=/data \
     --exclude=/node_modules \
+    --exclude=/apps/windows \
+    --exclude=/packages/desktop \
     --exclude=.env \
     '${PREV_DIR}/' /opt/openclaude/openclaude/" || {
     echo "FATAL: rollback rsync failed" >&2
@@ -462,6 +464,8 @@ mkdir -p "$NEW"
 rsync -a --delete --delete-excluded \
   --exclude=/data \
   --exclude=/node_modules \
+  --exclude=/apps/windows \
+  --exclude=/packages/desktop \
   --exclude=.env \
   "${LIVE}/" "${NEW}/"
 
@@ -499,9 +503,9 @@ RSYNC_OPTS=(
   --exclude=/.claude
   --exclude=/.codex
   --exclude=/claude-code-best
-  # /packages/desktop 是 Electron 桌面端构建工件(本地 7G+,prod 历史已存在 409M
-  # dist/dist-ccb/dist-installer)。明确双向 exclude:既跳过源也避免 --delete-after
-  # 把 prod 现存版删掉。
+  # Windows app 是独立 installer release lane，不进入 server rsync。保留旧路径 exclude，
+  # 防 --delete-after 误删 prod 历史 packages/desktop 工件。
+  --exclude=/apps/windows
   --exclude=/packages/desktop
   # S12a — TS composite emit (rsync doesn't read .gitignore; explicit exclude)
   --exclude='dist-types/'

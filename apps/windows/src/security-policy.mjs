@@ -14,8 +14,10 @@ const MAX_EXTERNAL_URL_LENGTH = 8192
 const MAX_WINDOWS_FILENAME_LENGTH = 240
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1'])
 
+// biome-ignore lint/suspicious/noControlCharactersInRegex: URL validation intentionally rejects ASCII controls.
 const URL_CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/
 const ENCODED_LINE_BREAK = /%0a|%0d/i
+// biome-ignore lint/suspicious/noControlCharactersInRegex: Windows filename sanitization intentionally removes control ranges.
 const WINDOWS_INVALID_CHARACTERS = /[\u0000-\u001f\u007f-\u009f<>:"/\\|?*]/g
 const INVISIBLE_DIRECTIONAL_CHARACTERS = /[\u200b-\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]/g
 const WINDOWS_RESERVED_BASENAME =
@@ -29,8 +31,13 @@ const DANGEROUS_WINDOWS_EXTENSIONS = new Set([
   '.appref-ms',
   '.appx',
   '.appxbundle',
+  '.ahk',
+  '.au3',
+  '.bash',
   '.bat',
+  '.cdxml',
   '.chm',
+  '.cjs',
   '.cmd',
   '.com',
   '.cpl',
@@ -45,6 +52,7 @@ const DANGEROUS_WINDOWS_EXTENSIONS = new Set([
   '.iso',
   '.isp',
   '.jar',
+  '.jnlp',
   '.js',
   '.jse',
   '.lnk',
@@ -55,7 +63,9 @@ const DANGEROUS_WINDOWS_EXTENSIONS = new Set([
   '.mst',
   '.msix',
   '.msixbundle',
+  '.mjs',
   '.pif',
+  '.pl',
   '.potm',
   '.ppam',
   '.pptm',
@@ -64,10 +74,19 @@ const DANGEROUS_WINDOWS_EXTENSIONS = new Set([
   '.psc1',
   '.psd1',
   '.psm1',
+  '.pssc',
+  '.py',
+  '.pyc',
+  '.pyo',
+  '.pyw',
+  '.pyz',
+  '.pyzw',
   '.reg',
+  '.rb',
   '.scf',
   '.scr',
   '.sct',
+  '.sh',
   '.shb',
   '.sldm',
   '.sys',
@@ -83,8 +102,10 @@ const DANGEROUS_WINDOWS_EXTENSIONS = new Set([
   '.xbap',
   '.xlam',
   '.xll',
+  '.xlsb',
   '.xlsm',
   '.xltm',
+  '.zsh',
 ])
 
 function parseUrl(value) {
@@ -147,7 +168,11 @@ function isSafeExternalUrl(value) {
     return !hasCredentials(url)
   }
   if (url.protocol === 'mailto:') {
-    return url.pathname.length > 0 && !URL_CONTROL_CHARACTERS.test(value) && !ENCODED_LINE_BREAK.test(value)
+    return (
+      url.pathname.length > 0 &&
+      !URL_CONTROL_CHARACTERS.test(value) &&
+      !ENCODED_LINE_BREAK.test(value)
+    )
   }
   return false
 }
@@ -155,7 +180,12 @@ function isSafeExternalUrl(value) {
 function isPinnedBlobUrl(value, appOrigin = PINNED_APP_ORIGIN) {
   const trustedOrigin = normalizeAppOrigin(appOrigin)
   const blobUrl = parseUrl(value)
-  if (!trustedOrigin || !blobUrl || blobUrl.protocol !== 'blob:' || blobUrl.origin !== trustedOrigin)
+  if (
+    !trustedOrigin ||
+    !blobUrl ||
+    blobUrl.protocol !== 'blob:' ||
+    blobUrl.origin !== trustedOrigin
+  )
     return false
 
   const serialized = blobUrl.href.slice('blob:'.length)
@@ -197,7 +227,10 @@ function hasExactOAuthRedirect(url, appOrigin) {
 
 function hasSupportedResponseType(url) {
   const responseTypes = url.searchParams.getAll('response_type')
-  return responseTypes.length <= 1 && (responseTypes.length === 0 || ['', 'code'].includes(responseTypes[0]))
+  return (
+    responseTypes.length <= 1 &&
+    (responseTypes.length === 0 || ['', 'code'].includes(responseTypes[0]))
+  )
 }
 
 function isOAuthStart(currentUrl, targetUrl, appOrigin) {
@@ -411,6 +444,6 @@ export function downloadRisk(filename) {
   }
   canonical = sanitizeWindowsFilename(canonical).toLowerCase()
   const finalDot = canonical.lastIndexOf('.')
-  const extension = finalDot > 0 ? canonical.slice(finalDot) : ''
+  const extension = finalDot >= 0 ? canonical.slice(finalDot) : ''
   return DANGEROUS_WINDOWS_EXTENSIONS.has(extension) ? 'dangerous' : 'safe'
 }

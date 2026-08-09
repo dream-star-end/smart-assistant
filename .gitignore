@@ -27,6 +27,9 @@ packages/**/dist-types/
 packages/**/*.tsbuildinfo
 commercial-unit.tap
 
-# Windows desktop local dependencies and installers
+# Windows app local dependencies and installers
+apps/windows/node_modules/
+apps/windows/release/
+# Preserve ignore coverage for checkouts that built the pre-migration package.
 packages/desktop/node_modules/
 packages/desktop/release/

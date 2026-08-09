@@ -1,13 +1,18 @@
 # Aurora V5 Windows Desktop
 
 本文是 Aurora Windows PC 客户端的架构、开发、CI、安全与发布验收说明。桌面端是
-V5 Web 产品的受限原生外壳，不建立第二套聊天、认证、会话或计费实现。
+“本地 Fluent Windows shell + 隔离远端 V5 产品区”的混合应用，不建立第二套聊天、认证、
+会话或计费实现，也不再是单个 `BrowserWindow` 直接包装线上站点。
 
 > 分支权威：`feat/v5-windows-app` 是 Windows 应用长期 canonical。app-only 任务从该分支
 > 创建 worktree，分支命名为 `<type>/v5-windows-<slug>`，PR 也回该分支；它只走 installer
 > release lane，不进入 V5 server release queue，也不得运行 `scripts/deploy-v5.sh`。共享
 > server/protocol/web 改动先进入
 > `feat/v5-aurora-rewrite`，再通过显式 upstream-sync PR 同步到 Windows canonical。
+
+Windows canonical 必须保持 `strict=true`、`enforce_admins=true`、PR-only、conversation
+resolution、禁止 force/delete，并 require GitHub Actions 的 `Windows app gate`。任务开工与合并
+后都要通过 GitHub API 回读；保护缺失时 fail-closed，不得先开实现 PR 再补门禁。
 
 ## 1. 目标与非目标
 
@@ -17,22 +22,26 @@ V5 Web 产品的受限原生外壳，不建立第二套聊天、认证、会话�
 - 完整复用 `https://claudeai.chat/` 的登录、会话、WebSocket、附件、语音和更新握手。
 - 保留 Electron 的持久 cookie、IndexedDB、localStorage 与 Service Worker，使登录恢复、
   会话续接和 Web 前端 cache-bust 语义与普通 Chromium 一致。
-- 用很小的桌面代码面提供窗口生命周期、外链、权限和下载安全边界。
+- 安装包内提供 Fluent 命令栏、导航/连接状态、下载面板、窗口恢复、系统主题/高对比度、
+  Windows 11 22H2+ Mica 安全降级、快捷键、鼠标导航和固定 Jump List。
+- 用较小且可审的桌面代码面提供窗口生命周期、外链、权限、下载和 IPC 安全边界。
 
 非目标：
 
 - 不把 gateway、PostgreSQL/Redis、用户容器、CCB/Codex runtime 或模型凭据装进 PC。
-- 不复制或 fork `packages/web-react`，不维护桌面专属业务 UI。
-- 首版不提供自动更新、自定义协议、托盘常驻或离线聊天。
+- 不复制或 fork `packages/web-react`，不在 Electron 中重写核心聊天状态机。
+- 本阶段不提供自动更新、自定义协议、托盘常驻、自动启动或离线聊天。
 - 首版不复活历史 V3 Desktop 的本地 PTY/CCB enrollment 与 `:18792` ingress 协议。
 
 ## 2. 架构与权威源
 
 ```text
 Windows NSIS
-  └─ Aurora.exe (Electron main，仅原生边界)
-       └─ sandboxed BrowserWindow
-            └─ https://claudeai.chat/ (V5 React SPA)
+  └─ Aurora.exe (Electron main，窗口/权限/下载/IPC 权威)
+       └─ BaseWindow
+            ├─ app://aurora-shell
+            │    └─ 本地 Fluent shell WebContentsView + 窄 preload bridge
+            └─ https://claudeai.chat/ (独立 sandboxed product WebContentsView)
                  ├─ 同源 REST / Cookie refresh
                  ├─ wss://claudeai.chat/... / bearer subprotocol
                  ├─ IndexedDB / localStorage / Service Worker
@@ -40,12 +49,13 @@ Windows NSIS
 ```
 
 业务单一权威仍在 V5 服务端与 `packages/web-react`。桌面主进程不得解释聊天帧、保存
-access token、代扣积分或代理模型请求。网页更新随 V5 dist 发布生效，不需要重新出安装包；
-只有 Electron 壳、原生权限或安装器变化才发布新的 Desktop 版本。
+access token、代扣积分或代理模型请求。shell 与 product renderer 不直接通信：main 观察净化后的
+加载、导航、主题和下载状态发给 shell，shell 只回传封闭命令。Web 产品更新随 V5 dist 发布生效；
+本地 shell、Electron 边界、Windows 集成或安装器变化才发布新的 Windows app 版本。
 
 ### 2.1 独立依赖与锁文件
 
-`packages/desktop` 使用独立 `package.json` 与 `package-lock.json`，不加入根
+`apps/windows` 使用独立 `package.json` 与 `package-lock.json`，不加入根
 `package.json#workspaces`。原因：V5 主 CI 固定 Node 20，并在多个 Linux job 中重复执行根
 `npm ci`；Electron 当前工具链要求 Node 22.12。把桌面依赖加入根 lock 会让所有服务端 job
 下载 Electron，并无谓扩大生产安装和供应链审计面。
@@ -53,26 +63,35 @@ access token、代扣积分或代理模型请求。网页更新随 V5 dist 发�
 桌面命令统一使用：
 
 ```bash
-npm --prefix packages/desktop ci
-npm --prefix packages/desktop run check
-npm --prefix packages/desktop run dist:win
+npm --prefix apps/windows ci
+npm --prefix apps/windows run check
+npm --prefix apps/windows run dist:win
 ```
 
-V5 的 release/rollback rsync 已排除 `packages/desktop`，因此本包变化不要求 runtime image、
-master、dist 或 egress 部署。安装包通过 GitHub Actions artifact；正式发布渠道另行受控。
+V3/V5 的 release/rollback rsync 均排除 `apps/windows`（并保留旧 `packages/desktop` 防删除
+历史工件），因此 app-only 变化不要求 runtime image、master、dist 或 egress 部署。安装包通过
+GitHub Actions artifact；正式发布渠道另行受控。
 
 ## 3. Electron 安全模型
 
-### 3.1 主窗口
+### 3.1 shell 与产品 view
 
-主窗口必须同时满足：
+产品 view 必须同时满足：
 
 - packaged app 固定加载 `https://claudeai.chat/`，不接受环境变量、argv 或配置文件改写。
 - `contextIsolation: true`、`sandbox: true`、`nodeIntegration: false`、
   `webSecurity: true`、`allowRunningInsecureContent: false`。
-- 不注入通用 preload，不把文件系统、shell、进程或任意 IPC 暴露给远端 renderer。
+- 完全不设置 preload，不把文件系统、shell、进程或任何 IPC 暴露给远端 renderer。
 - 不覆盖 `certificate-error`，TLS 验证失败即失败。
 - 拒绝 `<webview>` attach；普通 renderer 新窗口默认拒绝。
+
+本地 shell 使用 `app://aurora-shell` 精确 host/path 白名单、非持久 session 与严格 CSP。shell 的
+preload 只能暴露冻结的 `send/subscribe` 窄接口；main 同时校验 sender、senderFrame、精确 origin、
+main frame 和 payload schema。禁止任意 URL/path、原始 `ipcRenderer`、文件系统或进程能力。
+
+`BaseWindow` 关闭时必须显式关闭 shell/product 两个 child `webContents` 并清监听；resize、maximize、
+display/DPI 改变统一经过一个 layout 函数。窗口状态恢复必须按当前 display workArea 裁剪，防止
+拔掉副屏后窗口落在屏外。
 
 开发环境可允许显式 URL 覆盖，但必须由 `app.isPackaged === false` 硬门控制，并只接受明确的
 `http://127.0.0.1`/`http://localhost` 开发地址。测试开关不得改变 packaged app 的生产 URL。
@@ -96,13 +115,15 @@ master、dist 或 egress 部署。安装包通过 GitHub Actions artifact；正�
   任意通知等未登记能力全部拒绝。
 - 下载只接受来自 V5 origin/受信响应的用户发起请求；清洗 Windows 保留名、路径分隔符和控制
   字符。可执行/脚本类扩展名要显式告警，下载后绝不自动打开或运行。
+- shell 下载面板只接收 main 生成的 opaque ID。只有“下载已完成 + 文件路径仍在内存登记表”同时
+  满足时，main 才能执行 show-in-folder；renderer 永远不能提交任意本地路径。
 
 ### 3.4 持久化与更新
 
 不能每次启动清空 cookie、IndexedDB、localStorage 或 Service Worker；这样会破坏登录恢复、
 长会话镜像和 V5 自带前端更新握手。桌面壳升级与 Web dist 更新是两条独立版本轴。
 
-首版不接 `electron-updater`。正式接入时必须要求 HTTPS、签名校验、不可变版本产物和受保护发布
+本阶段不接 `electron-updater`。正式接入时必须要求 HTTPS、签名校验、不可变版本产物和受保护发布
 权限，且更新失败不能删除用户 profile。
 
 ## 4. 本地开发与 macOS 验证
@@ -110,25 +131,26 @@ master、dist 或 egress 部署。安装包通过 GitHub Actions artifact；正�
 要求 Node.js `22.12.0` 或更高兼容版本：
 
 ```bash
-npm --prefix packages/desktop ci
-npm --prefix packages/desktop run check
-npm --prefix packages/desktop start
+npm --prefix apps/windows ci
+npm --prefix apps/windows run check
+npm --prefix apps/windows start
 ```
 
 离线主进程 smoke：
 
 ```bash
-npm --prefix packages/desktop start -- --smoke-test
+npm --prefix apps/windows run smoke
 ```
 
-`--smoke-test` 的契约是 Electron `app.whenReady()` 后创建一个隐藏的沙箱窗口，只加载本地
-`about:blank`，收到 `did-finish-load` 后退出 0。因此它不依赖公网、DNS 或生产服务可用性；
-应用内另有 10 秒兜底，CI 再施加 30 秒硬超时。
+`--smoke-test` 使用独立非持久 partition 与安装包内 fixture，真实创建 shell/product 两个
+`WebContentsView`，断言 shell bridge 存在且窄、product 没有 `process/require/auroraDesktop`、
+导航命令和 resize 布局生效、关闭后两个 webContents 均销毁，再退出 0。它不访问公网、DNS 或
+生产服务；应用内有硬超时，CI 再施加 30 秒外层超时。
 
 macOS 还可验证当前平台 unpacked 打包结构：
 
 ```bash
-npm --prefix packages/desktop run pack
+npm --prefix apps/windows run pack
 ```
 
 macOS 能证明纯策略单测、主进程语法、Electron 生命周期与 asar/files 配置；不能证明 NSIS、
@@ -148,12 +170,13 @@ Workflow：`.github/workflows/v5-windows-desktop.yml`。
 
 需要构建时，流水线在 `windows-latest`、Node `22.12.0` 上执行：
 
-1. 用桌面独立 lockfile 执行 `npm ci`。
-2. 执行纯策略/语法检查 `npm run check`。
+1. 用 `apps/windows` 独立 lockfile 执行 `npm ci`。
+2. 执行策略、合同、窗口/IPC/下载和语法检查 `npm run check`。
 3. 以 electron-builder 构建 Windows x64 NSIS。
-4. 启动 `release/win-unpacked/Aurora.exe --smoke-test`，30 秒未退出即强杀并判红。
-5. 对唯一的 `Aurora-Setup-*.exe` 生成 `SHA256SUMS.txt`。
-6. 上传 installer、blockmap/metadata（若生成）和 SHA-256，保留 14 天。
+4. 启动 `release/win-unpacked/Aurora.exe --smoke-test` 跑 packaged 双-view 行为合同，30 秒未退出即强杀并判红。
+5. 静默安装到 runner 临时目录，再跑一次 installed smoke，最后静默卸载并确认 exe 消失。
+6. 对唯一的 `Aurora-Setup-*.exe` 生成 `SHA256SUMS.txt`。
+7. 上传 installer、blockmap/metadata（若生成）和 SHA-256，保留 14 天。
 
 该 workflow 当前在所有触发方式下都设置 `CSC_IDENTITY_AUTO_DISCOVERY=false`，产物名含
 `unsigned`，只用于内测。它不读取任何签名 secret，也不会发布 GitHub Release。
@@ -162,10 +185,11 @@ Workflow：`.github/workflows/v5-windows-desktop.yml`。
 
 | 层级 | 必验项目 | 通过标准 |
 | --- | --- | --- |
-| 纯策略 | URL、外链、OAuth、权限、下载文件名 | 正反例单测均通过，未知输入 fail-closed |
-| macOS 本地 | `check`、离线 `--smoke-test`、当前平台 `pack` | 零公网依赖，进程退出 0，包结构完整 |
-| Windows CI | 独立 `npm ci`、check、NSIS、unpacked smoke、SHA-256 | 30 分钟 job 内全部通过，installer 恰好一个 |
+| 纯策略 | URL/OAuth/权限、IPC、argv、窗口裁剪、布局、主题、下载 ID | 正反例单测均通过，未知输入 fail-closed |
+| macOS 本地 | `check`、双-view 离线 smoke、当前平台 `pack` | 产品无 bridge，布局/销毁合同成立，包结构完整 |
+| Windows CI | 独立 `npm ci`、check、NSIS、unpacked/installed smoke、silent uninstall、SHA-256 | 35 分钟 job 内全部通过，installer 恰好一个 |
 | Windows 10/11 真机 | 安装、启动、快捷方式、卸载 | 普通用户可安装；卸载不误删浏览器/其他应用数据 |
+| Windows UI | 1366×768/1080p、多屏拔插、100–200% 缩放、浅/深/高对比、键盘/Narrator | shell 不遮挡产品区，焦点和 IME 正常，窗口始终可恢复 |
 | 登录 | 密码登录、刷新恢复、退出、LinuxDo OAuth | callback 回到同一 Electron session，重启仍保持预期登录态 |
 | 连接器 | GitHub 与至少一个动态 OAuth connector | 隔离授权窗完成往返，主窗口不获得跨源桌面能力 |
 | 核心聊天 | 新建会话、流式回复、停止、重连、长会话恢复 | REST/WS 正常，无空白回复或重复 turn |

@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light" data-aurora-fixture="smoke-product">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Aurora 产品视图隔离检查</title>
+    <link rel="stylesheet" href="app://aurora-shell/shell.css" />
+    <script type="module" src="app://aurora-shell/shell.mjs"></script>
+  </head>
+  <body class="smoke-product">
+    <main class="smoke-card">
+      <p class="eyebrow">Packaged smoke fixture</p>
+      <h1>产品视图隔离检查</h1>
+      <p class="smoke-lead">这个页面只用于验证产品视图没有 Node 或桌面桥接能力。</p>
+
+      <dl class="probe-grid">
+        <div class="probe">
+          <dt>process</dt>
+          <dd><output id="probe-process">检测中</output></dd>
+        </div>
+        <div class="probe">
+          <dt>require</dt>
+          <dd><output id="probe-require">检测中</output></dd>
+        </div>
+        <div class="probe">
+          <dt>auroraDesktop</dt>
+          <dd><output id="probe-bridge">检测中</output></dd>
+        </div>
+      </dl>
+
+      <div class="fixture-controls">
+        <button id="fixture-push-route" type="button">写入历史记录</button>
+        <span>当前路由：<output id="fixture-route">0</output></span>
+        <span>载入次数：<output id="fixture-reload-count">0</output></span>
+      </div>
+    </main>
+  </body>
+</html>
