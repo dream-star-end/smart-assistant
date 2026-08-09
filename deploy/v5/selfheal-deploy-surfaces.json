@@ -55,6 +55,7 @@
     { "glob": "docs/**", "surface": "master", "note": "playbook §4.1 docs-only 亦走普通 deploy(重启 master,MINOR:deployed≠resolved)→ master 进程" }
   ],
   "manual": [
+    { "glob": "apps/windows/**", "note": "Windows app 独立 installer release lane；禁止进入 V5 server deploy/release queue" },
     { "glob": "**/migrations/**", "note": "RFC §3 manual:DB migrations 人工受控 apply(§4.5)" },
     { "glob": "deploy/**", "note": "RFC §3 manual:deploy/**(含 env overrides / systemd 单元 / release metadata)" },
     { "glob": "scripts/**", "note": "RFC §3 manual:scripts/**(部署/告警/运维脚本随 rsync 生效,非自愈可安全自动)" },

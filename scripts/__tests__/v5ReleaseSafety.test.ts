@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url'
 const here = path.dirname(fileURLToPath(import.meta.url))
 const root = path.resolve(here, '../..')
 const deploy = path.join(root, 'scripts/deploy-v5.sh')
+const branchPolicy = path.join(root, 'scripts/v5-branch-policy.sh')
 const deploySurfaceCheck = path.join(root, 'scripts/v5-deploy-surface-check.mjs')
 const e2eJourney = path.join(root, 'scripts/v5-e2e-journey-canary.mjs')
 const turnCanary = path.join(root, 'scripts/v5-smoke-turn-canary.mjs')
@@ -51,6 +52,34 @@ const v5BaselinePortGuardService = path.join(root, 'deploy/v5/openclaude-v5-base
 const dirs: string[] = []
 const require_ = createRequire(path.join(root, 'package.json'))
 const { WebSocketServer } = require_('ws')
+
+describe('V5 branch deployment policy', () => {
+  const assertBranch = (branch: string, allowAny = '0') =>
+    spawnSync(
+      'bash',
+      ['-c', `source "$1"; assert_v5_deploy_branch_allowed "$2" "$3"`, 'branch-policy', branchPolicy, branch, allowAny],
+      { cwd: root, encoding: 'utf8' },
+    )
+
+  test('Windows app branches fail closed even when ALLOW_ANY_BRANCH would bypass the generic guard', () => {
+    for (const branch of [
+      'feat/v5-windows-app',
+      'feat/v5-windows-native-shell',
+      'fix/v5-windows-downloads',
+      'chore/v5-windows-upstream-sync',
+    ]) {
+      const result = assertBranch(branch, '1')
+      assert.notEqual(result.status, 0, branch)
+      assert.match(result.stderr, /Windows installer release lane/)
+    }
+  })
+
+  test('server V5 and explicitly allowed test branches preserve the existing contract', () => {
+    assert.equal(assertBranch('feat/v5-aurora-rewrite').status, 0)
+    assert.notEqual(assertBranch('v3').status, 0)
+    assert.equal(assertBranch('test-fixture', '1').status, 0)
+  })
+})
 
 async function runTurnCanaryFixture(
   mode: 'foreign-then-success' | 'foreign-only' | 'own-error',

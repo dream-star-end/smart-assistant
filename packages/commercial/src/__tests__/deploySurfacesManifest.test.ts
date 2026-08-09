@@ -201,6 +201,7 @@ describe("selfheal deploy-surfaces manifest", () => {
 
     // RFC §3 manual-only 逐类 → 代表路径(本仓真实布局)。
     const categories: Record<string, string> = {
+      "Windows app installer lane": "apps/windows/src/main.mjs",
       "DB migrations": "packages/commercial/src/db/migrations/0161_selfheal_release_requests.sql",
       "env overrides": "deploy/v5/commercial-v5.env.overrides",
       "scripts/**": "scripts/deploy-v5.sh",

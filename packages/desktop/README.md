@@ -1,5 +1,9 @@
 # Aurora Windows Desktop
 
+> 当前目录是 Windows 独立产品线的迁移基线。长期 canonical 为
+> `feat/v5-windows-app`；app-only 改动从该分支创建并 PR 回该分支，不运行
+> `scripts/deploy-v5.sh`。0.2.0 原生壳批次会把权威目录迁到 `apps/windows`。
+
 Aurora Windows Desktop 是 OpenClaude V5 的轻量 Electron 客户端。它只承载
 `https://claudeai.chat/` 的现有 V5 Web 产品，不在用户电脑上复制 gateway、商业控制面、
 CCB/Codex runtime 或计费逻辑。服务端和 `packages/web-react` 继续是业务与界面的单一权威。

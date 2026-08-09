@@ -3,6 +3,12 @@
 本文是 Aurora Windows PC 客户端的架构、开发、CI、安全与发布验收说明。桌面端是
 V5 Web 产品的受限原生外壳，不建立第二套聊天、认证、会话或计费实现。
 
+> 分支权威：`feat/v5-windows-app` 是 Windows 应用长期 canonical。app-only 任务从该分支
+> 创建 worktree，分支命名为 `<type>/v5-windows-<slug>`，PR 也回该分支；它只走 installer
+> release lane，不进入 V5 server release queue，也不得运行 `scripts/deploy-v5.sh`。共享
+> server/protocol/web 改动先进入
+> `feat/v5-aurora-rewrite`，再通过显式 upstream-sync PR 同步到 Windows canonical。
+
 ## 1. 目标与非目标
 
 目标：
@@ -132,13 +138,15 @@ Windows 快捷方式、安装目录权限、卸载、代码签名或 SmartScreen
 
 Workflow：`.github/workflows/v5-windows-desktop.yml`。
 
-触发范围：
+触发与门禁：
 
-- PR 的 base 为 `feat/v5-aurora-rewrite`，且改动命中桌面包、本文或 workflow。
-- canonical `feat/v5-aurora-rewrite` push，且命中同样 paths。
-- 人工 `workflow_dispatch`。
+- PR/push 目标为 V5 server canonical 或 Windows app canonical 时，稳定产出唯一的
+  `Windows app gate` context，避免 branch/path filter 让 required check 永久 pending。
+- Windows app canonical 的每个 PR/push 都构建 installer；V5 server canonical 只有命中桌面包、
+  本文或 workflow 时才构建，其余改动由 scope job 明确跳过 installer 后让 gate 通过。
+- workflow 不声明 `workflow_dispatch`：它不在仓库默认分支，不能把不可用的手动入口写成承诺。
 
-流水线在 `windows-latest`、Node `22.12.0` 上执行：
+需要构建时，流水线在 `windows-latest`、Node `22.12.0` 上执行：
 
 1. 用桌面独立 lockfile 执行 `npm ci`。
 2. 执行纯策略/语法检查 `npm run check`。
