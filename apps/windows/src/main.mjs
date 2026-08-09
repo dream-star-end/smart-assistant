@@ -1021,28 +1021,55 @@ async function runSmokeContract() {
 
   await shellContents.executeJavaScript(`(() => {
     window.__auroraReducedTransparencyProbe = new Promise((resolve, reject) => {
+      const surface = document.querySelector('.command-surface')
+      let firstFrame
+      let secondFrame
+      let scheduled = false
       let timer
-      const observer = new MutationObserver(() => capture())
-      const capture = () => {
-        if (document.documentElement.dataset.reduceTransparency !== 'true') return
-        const style = getComputedStyle(document.querySelector('.command-surface'))
+      let observer
+      const cleanup = () => {
         observer.disconnect()
+        cancelAnimationFrame(firstFrame)
+        cancelAnimationFrame(secondFrame)
         clearTimeout(timer)
+      }
+      const finishCapture = () => {
+        scheduled = false
+        if (
+          document.documentElement.dataset.reduceTransparency !== 'true' ||
+          !surface.classList.contains('reduce-transparency')
+        ) {
+          return
+        }
+        const style = getComputedStyle(surface)
+        cleanup()
         resolve({
           attribute: document.documentElement.dataset.reduceTransparency,
-          modifierClass: document
-            .querySelector('.command-surface')
-            .classList.contains('reduce-transparency'),
+          modifierClass: surface.classList.contains('reduce-transparency'),
           backdropFilter: style.backdropFilter,
           backgroundColor: style.backgroundColor,
         })
       }
+      const capture = () => {
+        if (
+          scheduled ||
+          document.documentElement.dataset.reduceTransparency !== 'true' ||
+          !surface.classList.contains('reduce-transparency')
+        ) {
+          return
+        }
+        scheduled = true
+        firstFrame = requestAnimationFrame(() => {
+          secondFrame = requestAnimationFrame(finishCapture)
+        })
+      }
+      observer = new MutationObserver(capture)
       observer.observe(document.documentElement, {
         attributes: true,
         attributeFilter: ['data-reduce-transparency'],
       })
       timer = setTimeout(() => {
-        observer.disconnect()
+        cleanup()
         reject(new Error('reduced-transparency state was not observed'))
       }, 2000)
       capture()
