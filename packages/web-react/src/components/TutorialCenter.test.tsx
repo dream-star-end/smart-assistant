@@ -78,12 +78,18 @@ describe("TutorialCenter", () => {
     render(<CaseHarness />);
 
     expect(
-      screen.getByRole("heading", { name: "你今天想完成什么？" }),
+      screen.getByRole("heading", { name: "看看 V5 真正做完过什么" }),
     ).toBeInTheDocument();
     expect(screen.queryByText(/从公开需求和可授权材料出发/)).not.toBeInTheDocument();
-    expect(screen.getByText("12 个公开、可复查的任务场景")).toBeInTheDocument();
+    expect(screen.getByText("2 份实跑观察记录（尚未公开验证）· 10 个可复用模板")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "从原始难题到可核对结果" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "更多可直接复用的任务模板" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /论文越读越多.*从 30 篇论文到可追溯证据图谱.*每个结论都能点回原文/ })).toBeInTheDocument();
-    expect(screen.getAllByRole("img", { name: /成果示意/ })).toHaveLength(12);
+    expect(screen.getAllByRole("img", { name: /真实实跑结果，观察记录尚未通过公开验证/ })).toHaveLength(2);
+    expect(screen.getAllByRole("img", { name: /成果示意/ })).toHaveLength(10);
+    expect(screen.getByRole("button", {
+      name: /公开数据到可复现的单车需求分析，真实实跑观察记录，尚未公开验证；关键结果：GBM 测试集 R² 0\.904、GBM 测试集 RMSE 68\.36、自动化验证 34 项/,
+    })).toBeInTheDocument();
     expect(new Set(Array.from(document.querySelectorAll("[data-artwork-kind]"), (node) => node.getAttribute("data-artwork-kind"))).size).toBe(12);
     expect(screen.queryByText(/个阶段 · .*项产物/)).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "功能索引" })).toBeInTheDocument();
@@ -100,7 +106,14 @@ describe("TutorialCenter", () => {
     expect(
       screen.getByRole("heading", { name: "公开数据到可复现的单车需求分析" }),
     ).toBeInTheDocument();
-    expect(screen.getByRole("img", { name: "成果示意：可一键重跑的单车需求分析工程" })).toBeInTheDocument();
+    expect(screen.getByRole("img", { name: /真实实跑结果，观察记录尚未通过公开验证/ })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "这次真实实跑" })).toBeInTheDocument();
+    expect(screen.getByText("用户卡在哪里")).toBeInTheDocument();
+    expect(screen.getByText("交给 V5 的真实材料")).toBeInTheDocument();
+    expect(screen.getByText("这次没有装作完美")).toBeInTheDocument();
+    expect(screen.getAllByText("0.904").length).toBeGreaterThanOrEqual(2);
+    expect(screen.getAllByText("68.36").length).toBeGreaterThanOrEqual(2);
+    expect(screen.getByText(/非负 IAD 指标/)).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "准备材料" })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "4 步完成" })).toBeInTheDocument();
     expect(screen.getAllByText("展开输入、操作与验收标准")).toHaveLength(4);
@@ -111,6 +124,34 @@ describe("TutorialCenter", () => {
       "href",
       "https://archive.ics.uci.edu/dataset/275/bike+sharing+dataset",
     );
+  });
+
+  it("编码真实实跑展示精确补丁、先红后绿证据和未完成验证", () => {
+    render(<CaseHarness initial="coding-swe-bench-fix" />);
+
+    expect(screen.getByRole("img", { name: /真实实跑结果，观察记录尚未通过公开验证/ })).toBeInTheDocument();
+    expect(screen.getAllByText("2 → 13").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText("− = 1")).toBeInTheDocument();
+    expect(screen.getByText("+ = right")).toBeInTheDocument();
+    expect(screen.getByText(/没有运行官方 SWE-bench/)).toBeInTheDocument();
+    expect(screen.getByText(/完整 diff.*漏掉了未跟踪的回归测试文件/)).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /Astropy #12906 真实开源问题/ })).toHaveAttribute(
+      "href",
+      "https://github.com/astropy/astropy/issues/12906",
+    );
+    expect(screen.getByText(/待真实运行采集/)).toBeInTheDocument();
+  });
+
+  it("可以用真实实跑的指标和处理证据搜索案例", () => {
+    render(<CaseHarness />);
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "搜索教程" }), {
+      target: { value: "15:49 right" },
+    });
+
+    expect(screen.getByRole("heading", { name: "像真实维护者一样修一个 SWE-bench Bug" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "公开数据到可复现的单车需求分析" })).not.toBeInTheDocument();
+    expect(screen.getAllByRole("img", { name: /真实实跑结果，观察记录尚未通过公开验证/ })).toHaveLength(1);
   });
 
   it("展示详细步骤、本地演示媒体、风险提示与真实功能 CTA", () => {
