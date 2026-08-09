@@ -3,7 +3,10 @@ import {
   buildShellActivationScript,
   buildShellRollbackScript,
   buildWebActionScript,
+  isShellUnsupportedResult,
   NativeWebAction,
+  SHELL_LIFECYCLE_BRIDGE_METHOD,
+  SHELL_LIFECYCLE_BRIDGE_NAME,
   SHELL_READY_RESULT,
   shouldAcceptShellActivation,
   shouldAcceptWebAction
@@ -38,6 +41,9 @@ function assertFixedAction(action: NativeWebAction, ariaLabel: string): void {
   expect(script.indexOf('target.click();') >= 0).assertTrue();
   expect(script.indexOf('targets.length !== 1') >= 0).assertTrue();
   expect(occurrenceCount(script, 'document.querySelectorAll')).assertEqual(1);
+  expect(script.indexOf('const contractSupported = headerNodes.length === 1') >= 0).assertTrue();
+  expect(script.indexOf('agent.parentElement === header && model.parentElement === header') >= 0)
+    .assertTrue();
   expect(script.indexOf('eval(') < 0).assertTrue();
   expect(script.indexOf('new Function') < 0).assertTrue();
 }
@@ -48,12 +54,13 @@ export default function nativeShellPolicyTest(): void {
       const script: string = buildShellActivationScript(21);
       expect(script.indexOf(ORIGIN_GUARD) >= 0).assertTrue();
       expect(script.indexOf(ORIGIN_GUARD) < script.indexOf('document.querySelector')).assertTrue();
+      expect(script.indexOf(ORIGIN_GUARD) < script.indexOf('new MutationObserver')).assertTrue();
       expect(script.indexOf('location.hostname') < 0).assertTrue();
     });
 
     it('removes only its own shell state when the versioned DOM contract is unavailable', 0, () => {
       const script: string = buildShellActivationScript(21);
-      expect(script.indexOf(`document.querySelectorAll('${HEADER_SELECTOR}')`) >= 0).assertTrue();
+      expect(script.indexOf(`root.querySelectorAll('${HEADER_SELECTOR}')`) >= 0).assertTrue();
       expect(script.indexOf('staleStyle.remove();') >= 0).assertTrue();
       expect(script.indexOf('document.documentElement.removeAttribute(marker);') >= 0).assertTrue();
       expect(script.indexOf('aurora-native-shell-unsupported-v1') >= 0).assertTrue();
@@ -64,11 +71,12 @@ export default function nativeShellPolicyTest(): void {
 
     it('falls back when either retained control is missing or duplicated', 0, () => {
       const script: string = buildShellActivationScript(21);
-      const headerLookup: number = script.indexOf(`document.querySelectorAll('${HEADER_SELECTOR}')`);
-      const agentLookup: number = script.indexOf(`document.querySelectorAll('${AGENT_SELECTOR}')`);
-      const modelLookup: number = script.indexOf(`document.querySelectorAll('${MODEL_SELECTOR}')`);
+      const headerLookup: number = script.indexOf(`root.querySelectorAll('${HEADER_SELECTOR}')`);
+      const agentLookup: number = script.indexOf(`root.querySelectorAll('${AGENT_SELECTOR}')`);
+      const modelLookup: number = script.indexOf(`root.querySelectorAll('${MODEL_SELECTOR}')`);
       const exactCountGuard: number = script.indexOf(
-        'headerNodes.length !== 1 || agentNodes.length !== 1 ||\n    modelNodes.length !== 1'
+        'contractSupported = headerNodes.length === 1 && agentNodes.length === 1 &&\n' +
+        '      modelNodes.length === 1'
       );
       const styleCreation: number = script.indexOf("document.createElement('style')");
       expect(headerLookup >= 0).assertTrue();
@@ -81,9 +89,9 @@ export default function nativeShellPolicyTest(): void {
     it('falls back when retained controls are no longer direct header children', 0, () => {
       const script: string = buildShellActivationScript(21);
       const directChildGuard: number = script.indexOf(
-        'agent.parentElement !== header || model.parentElement !== header'
+        'agent.parentElement === header && model.parentElement === header'
       );
-      const fallback: number = script.indexOf('if (contractUnsupported || document.head === null)');
+      const fallback: number = script.indexOf('if (!contract.contractSupported)');
       const styleCreation: number = script.indexOf("document.createElement('style')");
       expect(directChildGuard >= 0).assertTrue();
       expect(fallback > directChildGuard).assertTrue();
@@ -100,6 +108,40 @@ export default function nativeShellPolicyTest(): void {
       expect(occurrenceCount(first, "document.createElement('style')")).assertEqual(1);
     });
 
+    it('installs one generation-bound observer and coalesces contract checks by frame', 0, () => {
+      const script: string = buildShellActivationScript(21);
+      expect(occurrenceCount(script, 'new MutationObserver')).assertEqual(1);
+      expect(script.indexOf("const observerKey = '__auroraNativeShellObserverV1';") >= 0)
+        .assertTrue();
+      expect(script.indexOf('Number(existingObserver.generation) > expectedGeneration') >= 0)
+        .assertTrue();
+      expect(script.indexOf('requestAnimationFrame(flushContractChange)') >= 0).assertTrue();
+      expect(script.indexOf('characterData') < 0).assertTrue();
+      expect(script.indexOf("attributeFilter: ['data-product-entry-scope', 'data-product-feature', 'aria-label']") >= 0)
+        .assertTrue();
+    });
+
+    it('notifies only a fingerprint transition and clears an exact ready generation first', 0, () => {
+      const script: string = buildShellActivationScript(21);
+      const changedGuard: number = script.indexOf(
+        'if (nextContract.fingerprint === lastFingerprint)'
+      );
+      const exactCleanup: number = script.indexOf(
+        'if (wasSupported && !nextContract.contractSupported)'
+      );
+      const notification: number = script.indexOf('notifyNative();', exactCleanup);
+      expect(script.indexOf(`window['${SHELL_LIFECYCLE_BRIDGE_NAME}']`) >= 0).assertTrue();
+      expect(script.indexOf(
+        `bridge.${SHELL_LIFECYCLE_BRIDGE_METHOD}(expectedGeneration);`
+      ) >= 0).assertTrue();
+      expect(changedGuard >= 0).assertTrue();
+      expect(exactCleanup > changedGuard).assertTrue();
+      expect(notification > exactCleanup).assertTrue();
+      expect(script.indexOf('document.cookie') < 0).assertTrue();
+      expect(script.indexOf('localStorage') < 0).assertTrue();
+      expect(script.indexOf('innerText') < 0).assertTrue();
+    });
+
     it('rolls back only the versioned native shell state on activation failure', 0, () => {
       const script: string = buildShellRollbackScript(21);
       expect(script.indexOf(ORIGIN_GUARD) >= 0).assertTrue();
@@ -114,8 +156,8 @@ export default function nativeShellPolicyTest(): void {
       const actionMarkerCheck: number = action.indexOf(
         "getAttribute('data-aurora-native-shell-v1') !== '21'"
       );
-      expect(activation.indexOf("const expectedGeneration = '21';") >= 0).assertTrue();
-      expect(activation.indexOf('setAttribute(marker, expectedGeneration)') >= 0).assertTrue();
+      expect(activation.indexOf('const expectedGeneration = 21;') >= 0).assertTrue();
+      expect(activation.indexOf('setAttribute(marker, expectedGenerationText)') >= 0).assertTrue();
       expect(rollback.indexOf("getAttribute('data-aurora-native-shell-v1') !== '21'") >= 0)
         .assertTrue();
       expect(actionMarkerCheck >= 0).assertTrue();
@@ -150,6 +192,9 @@ export default function nativeShellPolicyTest(): void {
         'https://claudeai.chat/chat/session-1',
         `"${SHELL_READY_RESULT}"`
       )).assertTrue();
+      expect(isShellUnsupportedResult('aurora-native-shell-unsupported-v1')).assertTrue();
+      expect(isShellUnsupportedResult('"aurora-native-shell-unsupported-v1"')).assertTrue();
+      expect(isShellUnsupportedResult('unexpected')).assertFalse();
     });
 
     it('accepts primary app routes but rejects OAuth and lookalike origins', 0, () => {

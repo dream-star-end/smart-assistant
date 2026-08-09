@@ -12,15 +12,20 @@ compat**，不是把完整移动网页直接套进 WebView：
 当前 `compat-v1` 只在精确 origin `https://claudeai.chat` 生效。每次主导航都携带
 generation；注入脚本会再次校验 origin，并要求 ChatHeader、智能体按钮和模型按钮均唯一且
 保持约定的直接父子结构。任一 selector 缺失、重复或层级漂移都会移除原生增强并完整回退 Web
-流程，不会读取 Cookie、token、localStorage 或页面内容。等 Web 侧先提供经审查的版本化
-handshake 后，再迁移到带 schema/nonce/allowlist 的 `WebMessagePort`。
+流程。为覆盖 Landing/AuthGate/Workspace 在同一 document 内切换，脚本只在唯一 `#root` 上
+观察这三个固定 selector 的结构指纹；指纹变化后通过一个无返回值的同步生命周期 Proxy 上报
+navigation generation，原生层再独立重跑完整契约。该信号不会读取或传递 Cookie、token、
+localStorage、页面文字或其它业务数据。等 Web 侧先提供经审查的版本化 handshake 后，再迁移到
+带 schema/nonce/allowlist 的 `WebMessagePort`。
 
 ## 安全边界
 
 - 普通外链交给系统浏览器；具有 OAuth 参数形状的链接也不被直接信任，原生层会拦截并展示完整域名，只有用户明确确认后才在同一 ArkWeb 内完成授权，避免 HttpOnly state cookie 跨浏览器丢失。
 - OAuth 期间显示不可被网页覆盖的当前 HTTPS 主机栏，明确提示核对域名并允许用户随时取消；回到 `claudeai.chat` 后自动退出授权模式。
 - 其他 HTTPS 主导航交给系统浏览器；HTTP、脚本协议、带凭据 URL 和非默认端口会被拦截。
-- 不注册 JavaScript bridge，不开放本地文件访问；禁用 ArkWeb 多窗口，并禁止无用户操作触发的 `window.open`，不会创建新的 WebView 页面。
+- 只注册 `auroraNativeShellLifecycleV1.contractChanged(number)` 这一项无返回生命周期信号，不提供通用 JavaScript bridge、导航或脚本执行能力。ArkWeb permission 在 object/method 两级限制 HTTPS + `claudeai.chat`；其中空 port/path 表示“不检查”，所以方法内仍同步使用调用 frame URL 强制默认端口、无 URL credentials 的 exact-origin 校验。
+- 生命周期信号按 navigation generation 与组件 epoch 丢弃迟到调用；探测和 rollback 串行，繁忙期间最多合并一次 pending retry。注销先立即停用 epoch，再调用下次 reload 才生效的 `deleteJavaScriptRegister`。
+- 不开放本地文件访问；禁用 ArkWeb 多窗口，并禁止无用户操作触发的 `window.open`，不会创建新的 WebView 页面。
 - 仅 `claudeai.chat` 可申请音频采集，并且仍需通过 HarmonyOS 运行时麦克风授权。
 - 文件上传使用系统文档选择器，只选择已有文件，不提供相机直拍入口。
 - HTTPS 与 Blob 下载都由 ArkWeb 下载委托接管，先写入应用缓存，再复制到用户在系统文档选择器中确认的目标位置。
@@ -49,6 +54,7 @@ unsigned HAP 用于本地检查，但不能代替授权签名、真机验收与 
 
 - 密码登录、LinuxDo OAuth、GitHub OAuth 及回跳。
 - 新建会话、流式回复、切后台后恢复、断网重连和系统返回键。
+- 不刷新页面完成登录后原生栏出现、SPA 登出后消失，并验证快速登录态切换不会留下双顶栏。
 - 图片/文件选择、带签名 URL 的下载跳转。
 - 麦克风首次授权、拒绝授权和再次发起语音输入。
 - 支付跳转、返回应用和订单状态刷新。

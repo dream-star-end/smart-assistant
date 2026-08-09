@@ -99,7 +99,15 @@ app 分支部署 v5 server。
 4. selector 是带版本的 compat-v1 契约。当前对话页要求 ChatHeader、Agent、Model 各唯一命中,
    且两个控件都是 Header 的直接子元素;缺失、重复、歧义或结构漂移时 fail safe:停止增强并
    回退到未修改的 Web 流程,禁止临时扩大 selector 或继续操作未知 DOM。
-5. compat 不读取/回传 cookie、bearer token、localStorage 或任意页面内容,不提供通用 JS bridge。
+5. React 同 document 生命周期只允许一个同步、无返回的
+   `auroraNativeShellLifecycleV1.contractChanged(number)` Proxy:脚本只观察唯一 `#root` 内上述
+   selector 的结构指纹,变化时仅上报 generation,原生再独立重跑完整契约。ArkWeb permission 在
+   object/method 两级限制 HTTPS + exact host;`port:""`/`path:""` 是“不检查”而非精确空值,
+   因此 Proxy 方法内必须立即用 `getLastJavascriptProxyCallingFrameUrl()` 再做默认端口、无
+   credentials 的 exact-origin 校验。Proxy 禁止 loadUrl/runJavaScript、业务参数和返回数据。
+6. compat 不读取/回传 cookie、bearer token、localStorage 或任意页面内容,不提供通用 JS bridge。
+   evaluation 与 rollback 必须按 generation/组件 epoch 串行;繁忙信号只合并一次 pending retry,
+   注销先同步停用 epoch,再调用下次 reload 才生效的 `deleteJavaScriptRegister`。
 
 当前不引入 `WebMessagePort`。只有一方 web 首先提供经审查的版本化 handshake,且确有持续双向
 事件流需求时才迁移;届时必须把 exact origin、navigation generation、schema version、
@@ -108,7 +116,8 @@ per-navigation nonce 与窄 command/event allowlist 绑定在协议中,任一不
 
 验收分两层:模拟器实跑冷/热启动、原生导航/返回、offline/retry、键盘/窗口、selector-missing
 fallback、旧 generation 丢弃、外链/OAuth 域名确认、上传下载;签名真机再跑麦克风权限、系统文档
-选择/保存、外部浏览器往返、前后台恢复、网络切换、通知/分享(若涉及)、性能/功耗与 crash/hilog。
+选择/保存、无刷新登录→原生栏出现、SPA 登出→原生栏消失、外部浏览器往返、前后台恢复、网络
+切换、通知/分享(若涉及)、性能/功耗与 crash/hilog。
 构建成功或只编出 ohosTest HAP 不等于真机验收完成。所有构建、运行、设备与日志动作统一走
 `devecocli`。
 

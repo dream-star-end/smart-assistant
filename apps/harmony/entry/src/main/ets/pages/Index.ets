@@ -21,11 +21,24 @@ import {
   buildShellActivationScript,
   buildShellRollbackScript,
   buildWebActionScript,
+  isShellUnsupportedResult,
   NativeWebAction,
+  SHELL_LIFECYCLE_BRIDGE_METHOD,
+  SHELL_LIFECYCLE_BRIDGE_NAME,
   shouldAcceptShellActivation,
   shouldAcceptWebAction
 } from '../common/NativeShellPolicy';
+import {
+  ShellEvaluationClock,
+  ShellEvaluationDecision,
+  ShellEvaluationRequest,
+  ShellRollbackDecision
+} from '../common/ShellEvaluationClock';
 import { NetworkMonitor } from '../services/NetworkMonitor';
+import {
+  SHELL_LIFECYCLE_PERMISSION,
+  ShellLifecycleBridge
+} from '../services/ShellLifecycleBridge';
 
 const MICROPHONE_PERMISSION: Permissions = 'ohos.permission.MICROPHONE';
 const MAX_SELECTABLE_FILES: number = 8;
@@ -50,6 +63,12 @@ struct Index {
   private downloadDelegateConfigured: boolean = false;
   private downloadTargets: Map<string, DownloadTarget> = new Map<string, DownloadTarget>();
   private navigationGeneration: number = 0;
+  private readonly shellEvaluationClock: ShellEvaluationClock = new ShellEvaluationClock();
+  private readonly shellLifecycleBridge: ShellLifecycleBridge =
+    new ShellLifecycleBridge(this.controller);
+  private shellLifecycleActive: boolean = false;
+  private shellLifecycleEpoch: number = 0;
+  private shellEvaluationTimerId: number = -1;
   private networkMonitor: NetworkMonitor | undefined = undefined;
 
   @State private loading: boolean = true;
@@ -65,6 +84,14 @@ struct Index {
   @State private pendingOauthHost: string = '';
 
   aboutToAppear(): void {
+    if (!this.shellLifecycleActive) {
+      this.shellLifecycleActive = true;
+      this.shellLifecycleEpoch += 1;
+      this.shellEvaluationClock.beginGeneration(this.navigationGeneration);
+      this.shellLifecycleBridge.attach((generation: number) => {
+        this.handleShellLifecycleSignal(generation);
+      });
+    }
     if (this.networkMonitor === undefined) {
       this.networkMonitor = new NetworkMonitor((online: boolean) => {
         this.online = online;
@@ -79,6 +106,19 @@ struct Index {
   }
 
   aboutToDisappear(): void {
+    this.shellLifecycleActive = false;
+    this.shellLifecycleEpoch += 1;
+    this.shellLifecycleBridge.detach();
+    this.clearDeferredShellEvaluation();
+    this.shellEvaluationClock.invalidate();
+    this.nativeShellReady = false;
+    try {
+      // Deletion applies on the next reload, so the inactive epoch above is
+      // the immediate guard for any late call from the current document.
+      this.controller.deleteJavaScriptRegister(SHELL_LIFECYCLE_BRIDGE_NAME);
+    } catch (_) {
+      // ArkWeb may already be detached while the component is disappearing.
+    }
     if (this.networkMonitor !== undefined) {
       this.networkMonitor.stop();
     }
@@ -112,9 +152,76 @@ struct Index {
     }
   }
 
-  private activateNativeShell(startedGeneration: number): void {
-    const currentUrl: string = this.currentPageUrl();
-    if (!isPrimaryAppOrigin(currentUrl)) {
+  private clearDeferredShellEvaluation(): void {
+    if (this.shellEvaluationTimerId < 0) {
+      return;
+    }
+    clearTimeout(this.shellEvaluationTimerId);
+    this.shellEvaluationTimerId = -1;
+  }
+
+  private canEvaluateNativeShell(startedGeneration: number, startedEpoch: number): boolean {
+    return this.shellLifecycleActive &&
+      startedEpoch === this.shellLifecycleEpoch &&
+      startedGeneration === this.navigationGeneration &&
+      !this.oauthNavigationActive &&
+      this.isPrimaryPage();
+  }
+
+  private requestNativeShellEvaluation(startedGeneration: number): void {
+    const startedEpoch: number = this.shellLifecycleEpoch;
+    if (!this.canEvaluateNativeShell(startedGeneration, startedEpoch)) {
+      return;
+    }
+    const request: ShellEvaluationRequest = this.shellEvaluationClock.request(startedGeneration);
+    if (request === ShellEvaluationRequest.REJECTED) {
+      return;
+    }
+
+    this.nativeShellReady = false;
+    if (request === ShellEvaluationRequest.STARTED) {
+      this.runNativeShellEvaluation(startedGeneration, startedEpoch);
+    }
+  }
+
+  private handleShellLifecycleSignal(startedGeneration: number): void {
+    const startedEpoch: number = this.shellLifecycleEpoch;
+    if (!this.canEvaluateNativeShell(startedGeneration, startedEpoch)) {
+      return;
+    }
+    const request: ShellEvaluationRequest = this.shellEvaluationClock.request(startedGeneration);
+    if (request === ShellEvaluationRequest.REJECTED) {
+      return;
+    }
+
+    this.nativeShellReady = false;
+    if (request === ShellEvaluationRequest.QUEUED) {
+      return;
+    }
+
+    // The proxy method authenticates its calling frame synchronously. Defer
+    // ArkWeb script execution until after that JavaScript-to-native call exits.
+    try {
+      this.shellEvaluationTimerId = setTimeout(() => {
+        this.shellEvaluationTimerId = -1;
+        if (!this.canEvaluateNativeShell(startedGeneration, startedEpoch)) {
+          if (startedEpoch === this.shellLifecycleEpoch) {
+            this.shellEvaluationClock.cancel(startedGeneration);
+          }
+          return;
+        }
+        this.runNativeShellEvaluation(startedGeneration, startedEpoch);
+      }, 0);
+    } catch (_) {
+      this.shellEvaluationClock.cancel(startedGeneration);
+    }
+  }
+
+  private runNativeShellEvaluation(startedGeneration: number, startedEpoch: number): void {
+    if (!this.canEvaluateNativeShell(startedGeneration, startedEpoch)) {
+      if (startedEpoch === this.shellLifecycleEpoch) {
+        this.shellEvaluationClock.cancel(startedGeneration);
+      }
       return;
     }
 
@@ -122,43 +229,90 @@ struct Index {
       this.controller.runJavaScript(
         buildShellActivationScript(startedGeneration),
         (error: BusinessError, result: string) => {
-          if (error) {
-            this.rollbackNativeShell(startedGeneration);
-            return;
-          }
-          const latestUrl: string = this.currentPageUrl();
-          if (shouldAcceptShellActivation(
+          this.completeNativeShellEvaluation(
             startedGeneration,
-            this.navigationGeneration,
-            latestUrl,
+            startedEpoch,
+            Boolean(error),
             result
-          )) {
-            this.nativeShellReady = true;
-            return;
-          }
-          this.rollbackNativeShell(startedGeneration);
+          );
         }
       );
     } catch (_) {
-      this.rollbackNativeShell(startedGeneration);
+      this.completeNativeShellEvaluation(startedGeneration, startedEpoch, true, '');
     }
   }
 
-  private rollbackNativeShell(startedGeneration: number): void {
-    const isCurrentGeneration: boolean = startedGeneration === this.navigationGeneration;
-    if (isCurrentGeneration) {
-      this.nativeShellReady = false;
-    }
-    if (!this.isPrimaryPage()) {
+  private completeNativeShellEvaluation(
+    startedGeneration: number,
+    startedEpoch: number,
+    executionFailed: boolean,
+    result: string
+  ): void {
+    if (!this.shellLifecycleActive || startedEpoch !== this.shellLifecycleEpoch ||
+      startedGeneration !== this.navigationGeneration) {
       return;
     }
+
+    const latestUrl: string = this.currentPageUrl();
+    const ready: boolean = !executionFailed && shouldAcceptShellActivation(
+      startedGeneration,
+      this.navigationGeneration,
+      latestUrl,
+      result
+    );
+    const unsupported: boolean = !executionFailed &&
+      isPrimaryAppOrigin(latestUrl) &&
+      isShellUnsupportedResult(result);
+    const decision: ShellEvaluationDecision = this.shellEvaluationClock.completeEvaluation(
+      startedGeneration,
+      !ready && !unsupported
+    );
+
+    if (decision === ShellEvaluationDecision.STALE) {
+      return;
+    }
+    if (decision === ShellEvaluationDecision.RETRY) {
+      this.runNativeShellEvaluation(startedGeneration, startedEpoch);
+      return;
+    }
+    if (decision === ShellEvaluationDecision.COMMIT) {
+      this.nativeShellReady = ready;
+      return;
+    }
+
+    this.nativeShellReady = false;
+    this.runNativeShellRollback(startedGeneration, startedEpoch);
+  }
+
+  private runNativeShellRollback(startedGeneration: number, startedEpoch: number): void {
+    if (!this.canEvaluateNativeShell(startedGeneration, startedEpoch)) {
+      if (startedEpoch === this.shellLifecycleEpoch) {
+        this.finishNativeShellRollback(startedGeneration, startedEpoch);
+      }
+      return;
+    }
+
     try {
       this.controller.runJavaScript(
         buildShellRollbackScript(startedGeneration),
-        (_error: BusinessError, _result: string) => {}
+        (_error: BusinessError, _result: string) => {
+          this.finishNativeShellRollback(startedGeneration, startedEpoch);
+        }
       );
     } catch (_) {
-      // A navigation can detach ArkWeb while the fallback cleanup is running.
+      this.finishNativeShellRollback(startedGeneration, startedEpoch);
+    }
+  }
+
+  private finishNativeShellRollback(startedGeneration: number, startedEpoch: number): void {
+    if (!this.shellLifecycleActive || startedEpoch !== this.shellLifecycleEpoch ||
+      startedGeneration !== this.navigationGeneration) {
+      return;
+    }
+    const decision: ShellRollbackDecision =
+      this.shellEvaluationClock.completeRollback(startedGeneration);
+    if (decision === ShellRollbackDecision.RETRY) {
+      this.runNativeShellEvaluation(startedGeneration, startedEpoch);
     }
   }
 
@@ -893,6 +1047,14 @@ struct Index {
         .width('100%')
         .layoutWeight(1)
         .javaScriptAccess(true)
+        .javaScriptProxy({
+          object: this.shellLifecycleBridge,
+          name: SHELL_LIFECYCLE_BRIDGE_NAME,
+          methodList: [SHELL_LIFECYCLE_BRIDGE_METHOD],
+          asyncMethodList: [],
+          controller: this.controller,
+          permission: SHELL_LIFECYCLE_PERMISSION
+        })
         .domStorageAccess(true)
         .databaseAccess(true)
         .fileAccess(false)
@@ -917,7 +1079,9 @@ struct Index {
           return true;
         })
         .onPageBegin(() => {
+          this.clearDeferredShellEvaluation();
           this.navigationGeneration += 1;
+          this.shellEvaluationClock.beginGeneration(this.navigationGeneration);
           this.nativeShellReady = false;
           this.loading = !this.oauthNavigationActive;
           this.loadFailed = false;
@@ -932,7 +1096,7 @@ struct Index {
           this.hasLoadedOnce = true;
           const completedGeneration: number = this.navigationGeneration;
           if (!this.oauthNavigationActive && this.isPrimaryPage()) {
-            this.activateNativeShell(completedGeneration);
+            this.requestNativeShellEvaluation(completedGeneration);
           }
         })
         .onErrorReceive((event) => {
