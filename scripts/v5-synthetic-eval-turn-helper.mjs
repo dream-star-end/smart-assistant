@@ -1075,6 +1075,16 @@ async function remoteTurn(encodedConfig, issueSyntheticUserAccessToken) {
         ["outbound.error", "outbound.turn_error", "error"].includes(frame?.type)
         || frame?.error
       ) {
+        const errorPeerId = frame?.peer?.id;
+        const errorClientMessageId = frame?.clientMessageId;
+        const hasPeerId = typeof errorPeerId === "string";
+        const hasClientMessageId = typeof errorClientMessageId === "string";
+        if (
+          (hasPeerId && errorPeerId !== peerId)
+          || (hasClientMessageId && errorClientMessageId !== clientMessageId)
+        ) {
+          return;
+        }
         fail(new Error(`turn returned an error: ${JSON.stringify(frame).slice(0, 500)}`));
         return;
       }
