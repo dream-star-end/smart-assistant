@@ -1768,6 +1768,105 @@ describe('runTurn re-attach after respawn (Codex review #019dde20 BLOCKER 1)', (
     assert.equal((h.runner as any).stdoutBuf, '', 'shutdown must clear partial-line buffer')
     await h.cleanup()
   })
+
+  it('interrupts a resumed in-progress orphan and waits for terminal completion before turn/start', async () => {
+    const h = await makeHarness({ withFakeProc: true, resumeSessionId: 'thr-resume-orphan' })
+    const runner = h.runner as any
+    const turnPromise = runner.runTurn('retry after auth refresh')
+
+    await waitFor(() => h.written.length >= 1)
+    const resumeReq = JSON.parse(h.written[0])
+    assert.equal(resumeReq.method, 'thread/resume')
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      id: resumeReq.id,
+      result: {
+        thread: {
+          id: 'thr-resume-orphan',
+          turns: [
+            { id: 't-completed', status: 'completed' },
+            { id: 't-orphan', status: 'inProgress' },
+          ],
+        },
+      },
+    })
+
+    await waitFor(() => h.written.length === 2)
+    const interruptReq = JSON.parse(h.written[1])
+    assert.equal(interruptReq.method, 'turn/interrupt')
+    assert.equal(interruptReq.params.turnId, 't-orphan')
+    feed(h.runner, { jsonrpc: '2.0', id: interruptReq.id, result: {} })
+    await new Promise((r) => setImmediate(r))
+    assert.equal(h.written.length, 2, 'interrupt RPC ack alone must not start the retry turn')
+
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'turn/completed',
+      params: {
+        threadId: 'thr-resume-orphan',
+        turn: { id: 't-orphan', status: 'interrupted', durationMs: 5 },
+      },
+    })
+
+    await waitFor(() => h.written.length === 3)
+    const turnReq = JSON.parse(h.written[2])
+    assert.equal(turnReq.method, 'turn/start')
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      id: turnReq.id,
+      result: { turn: { id: 't-retry' } },
+    })
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'turn/completed',
+      params: {
+        threadId: 'thr-resume-orphan',
+        turn: { id: 't-retry', status: 'completed', durationMs: 5 },
+      },
+    })
+    await turnPromise
+    assert.equal(runner.currentTurnCompleter, null)
+    assert.equal(runner.pendingInterrupt, null)
+    await h.cleanup()
+  })
+
+  it('resumed thread without an in-progress turn proceeds directly to turn/start', async () => {
+    const h = await makeHarness({ withFakeProc: true, resumeSessionId: 'thr-resume-idle' })
+    const runner = h.runner as any
+    const turnPromise = runner.runTurn('normal continuation')
+    await waitFor(() => h.written.length >= 1)
+    const resumeReq = JSON.parse(h.written[0])
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      id: resumeReq.id,
+      result: {
+        thread: {
+          id: 'thr-resume-idle',
+          turns: [{ id: 't-done', status: 'completed' }],
+        },
+      },
+    })
+
+    await waitFor(() => h.written.length === 2)
+    const turnReq = JSON.parse(h.written[1])
+    assert.equal(turnReq.method, 'turn/start')
+    assert.equal(h.written.map((line) => JSON.parse(line).method).includes('turn/interrupt'), false)
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      id: turnReq.id,
+      result: { turn: { id: 't-next' } },
+    })
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'turn/completed',
+      params: {
+        threadId: 'thr-resume-idle',
+        turn: { id: 't-next', status: 'completed', durationMs: 5 },
+      },
+    })
+    await turnPromise
+    await h.cleanup()
+  })
 })
 
 describe('thread/resume missing-rollout self-heal (Codex review #019e0b72 BLOCKER 1)', () => {
@@ -1990,6 +2089,97 @@ describe('interrupt', () => {
     assert.equal(sent.method, 'turn/interrupt')
     assert.equal(sent.params.threadId, 'thr-int')
     assert.equal(sent.params.turnId, 't-int')
+    await h.cleanup()
+  })
+
+  it('same-chunk mismatch + actual terminal replays exactly once and settles runTurn', async () => {
+    const h = await makeHarness({ withFakeProc: true, resumeSessionId: 'thr-int-race' })
+    const runner = h.runner as any
+    runner.attached = true
+    const turnPromise = runner.runTurn('hello')
+    await waitFor(() => h.written.length >= 1)
+    const turnReq = JSON.parse(h.written[0])
+    assert.equal(turnReq.method, 'turn/start')
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      id: turnReq.id,
+      result: { turn: { id: 't-requested' } },
+    })
+    await waitFor(() => runner.activeTurnId === 't-requested')
+
+    assert.equal(h.runner.interrupt(), true)
+    const interruptReq = JSON.parse(h.written[1])
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      id: interruptReq.id,
+      error: {
+        code: -32600,
+        message: 'expected active turn id t-requested but found t-actual',
+      },
+    })
+    // Deliberately feed the terminal synchronously before the rejected
+    // request Promise resumes in its catch microtask.
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'turn/completed',
+      params: {
+        threadId: 'thr-int-race',
+        turn: { id: 't-actual', status: 'interrupted', durationMs: 5 },
+      },
+    })
+
+    await turnPromise
+    assert.equal(runner.currentTurnCompleter, null)
+    assert.equal(runner.pendingInterrupt, null)
+    assert.equal(h.written.length, 2, 'already-terminal actual turn must not be interrupted again')
+    await h.cleanup()
+  })
+
+  it('mismatch without an early terminal retries the actual active turn exactly once', async () => {
+    const h = await makeHarness({ withFakeProc: true, resumeSessionId: 'thr-int-retry' })
+    const runner = h.runner as any
+    runner.attached = true
+    const turnPromise = runner.runTurn('hello')
+    await waitFor(() => h.written.length >= 1)
+    const turnReq = JSON.parse(h.written[0])
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      id: turnReq.id,
+      result: { turn: { id: 't-requested' } },
+    })
+    await waitFor(() => runner.activeTurnId === 't-requested')
+
+    assert.equal(h.runner.interrupt(), true)
+    const firstInterrupt = JSON.parse(h.written[1])
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      id: firstInterrupt.id,
+      error: {
+        code: -32600,
+        message: 'expected active turn id `t-requested` but found `t-actual`',
+      },
+    })
+
+    await waitFor(() => h.written.length === 3)
+    const retryInterrupt = JSON.parse(h.written[2])
+    assert.equal(retryInterrupt.method, 'turn/interrupt')
+    assert.equal(retryInterrupt.params.turnId, 't-actual')
+    feed(h.runner, { jsonrpc: '2.0', id: retryInterrupt.id, result: {} })
+    await new Promise((r) => setImmediate(r))
+    assert.notEqual(runner.currentTurnCompleter, null, 'RPC ack must still await terminal')
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'turn/completed',
+      params: {
+        threadId: 'thr-int-retry',
+        turn: { id: 't-actual', status: 'interrupted', durationMs: 5 },
+      },
+    })
+
+    await turnPromise
+    assert.equal(runner.currentTurnCompleter, null)
+    assert.equal(runner.pendingInterrupt, null)
+    assert.equal(h.written.length, 3, 'interrupt mismatch recovery must retry only once')
     await h.cleanup()
   })
 })
