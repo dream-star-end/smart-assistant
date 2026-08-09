@@ -641,7 +641,7 @@ function CaseGalleryCard({
       <div className="p-4 sm:p-5">
         <div className="flex flex-wrap items-center gap-2">
           <span className={cn("rounded-full px-2.5 py-1 text-[10.5px] font-semibold", report ? "bg-success-soft text-success" : "bg-accent-soft text-accent")}>
-            {report ? "实跑观察" : `${caseCategoryLabel(item.category)} · ${item.difficulty}`}
+            {report ? "实跑观察 · 尚未公开验证" : `${caseCategoryLabel(item.category)} · ${item.difficulty}`}
           </span>
           {report ? (
             <span className="text-[10.5px] text-faint">{report.sourceLabel} · {report.duration}</span>
