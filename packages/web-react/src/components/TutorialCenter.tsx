@@ -68,6 +68,7 @@ import {
 } from "../lib/tutorialProgress";
 import { cn } from "../lib/utils";
 import { CASE_PRESENTATION, CaseArtwork } from "./tutorials/CaseArtwork";
+import { MissionReplay } from "./tutorials/MissionReplay";
 import { TutorialReplay } from "./tutorials/TutorialReplay";
 import { Badge, Button, IconButton } from "./ui";
 
@@ -202,17 +203,19 @@ export function TutorialCenter({
   const selectedTopicId = topicId ?? PRODUCT_CAPABILITIES.chatBasics.id;
   const [query, setQuery] = useState("");
   const [featureCategory, setFeatureCategory] = useState<ProductFeatureCategory | "all">("all");
-  const [caseCategory, setCaseCategory] = useState<TutorialCaseCategory | "all">("all");
   const [progress, setProgress] = useState(() => readTutorialProgress());
   const [videoFailed, setVideoFailed] = useState<Record<string, boolean>>({});
   const [copied, setCopied] = useState(false);
   const copyTimer = useRef<number | null>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
 
   const feature = capabilityById(selectedTopicId);
   const topic = tutorialById(selectedTopicId);
   const media = TUTORIAL_MEDIA[topic.media];
   const cta = actionState(feature);
   const selectedCase = caseId ? TUTORIAL_CASE_BY_ID[caseId] : null;
+  const showMissionReplay =
+    !caseId || caseId === "research-bike-demand" || caseId === "coding-swe-bench-fix";
 
   const filteredFeatures = useMemo(
     () =>
@@ -222,15 +225,6 @@ export function TutorialCenter({
           tutorialMatches(item, query),
       ),
     [featureCategory, query],
-  );
-  const filteredCases = useMemo(
-    () =>
-      TUTORIAL_CASES.filter(
-        (item) =>
-          (caseCategory === "all" || item.category === caseCategory) &&
-          tutorialCaseMatches(item, query),
-      ),
-    [caseCategory, query],
   );
   const mobileFeatureOptions = filteredFeatures.some((item) => item.id === selectedTopicId)
     ? filteredFeatures
@@ -243,7 +237,6 @@ export function TutorialCenter({
     if (!open) {
       setQuery("");
       setFeatureCategory("all");
-      setCaseCategory("all");
       return;
     }
     if (!topicId) return;
@@ -284,44 +277,55 @@ export function TutorialCenter({
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 z-50 bg-black/45 backdrop-blur-sm data-[state=open]:animate-fade" />
         <Dialog.Content
+          ref={dialogRef}
           aria-describedby={undefined}
+          onOpenAutoFocus={(event) => {
+            event.preventDefault();
+            dialogRef.current?.focus();
+          }}
           className="tutorial-shell fixed inset-x-2 bottom-2 top-2 z-50 flex min-h-0 flex-col overflow-hidden rounded-2xl border border-border bg-bg shadow-float focus:outline-none data-[state=open]:animate-in sm:inset-x-4 sm:bottom-4 sm:top-4 lg:left-1/2 lg:w-[min(1180px,calc(100vw-2rem))] lg:-translate-x-1/2"
         >
           <header className="flex shrink-0 items-center gap-3 border-b border-border bg-surface/90 px-3 py-3 backdrop-blur-xl sm:px-5">
             <div className="flex min-w-0 items-center gap-3">
-              <span className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-grad-cta text-white shadow-sm">
+              <span className={cn("flex size-9 shrink-0 items-center justify-center rounded-xl text-white shadow-sm", mode === "cases" ? "bg-accent" : "bg-grad-cta")}>
                 <Lightbulb size={18} />
               </span>
               <div className="min-w-0">
                 <Dialog.Title className="truncate text-[15px] font-semibold text-fg sm:text-[17px]">
-                  案例与教程
+                  {mode === "cases" ? "V5 实战拆解" : "功能教程"}
                 </Dialog.Title>
                 <p className="hidden text-[11.5px] text-faint sm:block">
-                  真实问题 · 完整过程 · 可验收产物
+                  {mode === "cases" ? "一个真实任务，从材料到成果" : "按功能快速找到使用方法"}
                 </p>
               </div>
             </div>
-            <label className="ml-auto flex h-9 min-w-0 max-w-md flex-1 items-center gap-2 rounded-xl bg-hover px-3 focus-within:ring-2 focus-within:ring-ring">
-              <Search size={15} className="shrink-0 text-faint" />
-              <span className="sr-only">搜索教程</span>
-              <input
-                type="search"
-                value={query}
-                onChange={(event) => setQuery(event.target.value)}
-                placeholder={mode === "cases" ? "搜索任务、材料或产物" : "搜索功能、场景或关键词"}
-                className="min-w-0 flex-1 bg-transparent text-[13px] text-fg outline-none placeholder:text-faint"
-              />
-            </label>
-            {mode === "features" && (
-              <div className="hidden shrink-0 items-center gap-2 text-[11.5px] text-faint md:flex">
-                <span>{readCount}/{TUTORIAL_TOPIC_LIST.length} 已读</span>
-                <span className="h-1.5 w-16 overflow-hidden rounded-full bg-hover" aria-hidden>
-                  <span
-                    className="block h-full rounded-full bg-accent transition-[width]"
-                    style={{ width: `${(readCount / TUTORIAL_TOPIC_LIST.length) * 100}%` }}
+            {mode === "features" ? (
+              <>
+                <label className="ml-auto flex h-9 min-w-0 max-w-md flex-1 items-center gap-2 rounded-xl bg-hover px-3 focus-within:ring-2 focus-within:ring-ring">
+                  <Search size={15} className="shrink-0 text-faint" />
+                  <span className="sr-only">搜索教程</span>
+                  <input
+                    type="search"
+                    value={query}
+                    onChange={(event) => setQuery(event.target.value)}
+                    placeholder="搜索功能、场景或关键词"
+                    className="min-w-0 flex-1 bg-transparent text-[13px] text-fg outline-none placeholder:text-faint"
                   />
-                </span>
-              </div>
+                </label>
+                <div className="hidden shrink-0 items-center gap-2 text-[11.5px] text-faint md:flex">
+                  <span>{readCount}/{TUTORIAL_TOPIC_LIST.length} 已读</span>
+                  <span className="h-1.5 w-16 overflow-hidden rounded-full bg-hover" aria-hidden>
+                    <span
+                      className="block h-full rounded-full bg-accent transition-[width]"
+                      style={{ width: `${(readCount / TUTORIAL_TOPIC_LIST.length) * 100}%` }}
+                    />
+                  </span>
+                </div>
+              </>
+            ) : (
+              <Button variant="ghost" size="sm" onClick={showFeatures} className="ml-auto">
+                <Sparkles size={14} /> 功能索引
+              </Button>
             )}
             <Dialog.Close asChild>
               <IconButton aria-label="关闭教程" variant="muted" shape="square">
@@ -330,65 +334,36 @@ export function TutorialCenter({
             </Dialog.Close>
           </header>
 
-          <div className="flex shrink-0 items-center gap-1 border-b border-border bg-surface px-3 py-2 sm:px-5">
-            <ViewTab active={mode === "cases"} onClick={showCases} icon={TestTube2}>
-              实战案例
-            </ViewTab>
-            <ViewTab active={mode === "features"} onClick={showFeatures} icon={Sparkles}>
-              功能索引
-            </ViewTab>
-            {mode === "cases" && (
-              <span className="ml-auto hidden text-[11.5px] text-faint sm:block">
-                科研 · 编码 · 日常工作，带着你的材料直接开始
-              </span>
-            )}
-          </div>
+          {mode === "features" && (
+            <div className="flex shrink-0 items-center gap-1 border-b border-border bg-surface px-3 py-2 sm:px-5">
+              <ViewTab active={false} onClick={showCases} icon={TestTube2}>
+                实战回放
+              </ViewTab>
+              <ViewTab active onClick={showFeatures} icon={Sparkles}>
+                功能索引
+              </ViewTab>
+            </div>
+          )}
 
-          <div className="no-scrollbar flex shrink-0 gap-2 overflow-x-auto border-b border-border bg-surface px-3 py-2 lg:hidden">
-            {mode === "cases" ? (
-              <>
-                <CategoryChip active={caseCategory === "all"} onClick={() => setCaseCategory("all")}>
-                  全部
+          {mode === "features" && (
+            <div className="no-scrollbar flex shrink-0 gap-2 overflow-x-auto border-b border-border bg-surface px-3 py-2 lg:hidden">
+              <CategoryChip active={featureCategory === "all"} onClick={() => setFeatureCategory("all")}>
+                全部
+              </CategoryChip>
+              {PRODUCT_FEATURE_CATEGORIES.map((item) => (
+                <CategoryChip
+                  key={item.id}
+                  active={featureCategory === item.id}
+                  onClick={() => setFeatureCategory(item.id)}
+                >
+                  {item.label}
                 </CategoryChip>
-                {CASE_CATEGORIES.map((item) => (
-                  <CategoryChip
-                    key={item.id}
-                    active={caseCategory === item.id}
-                    onClick={() => setCaseCategory(item.id)}
-                  >
-                    {item.label}
-                  </CategoryChip>
-                ))}
-              </>
-            ) : (
-              <>
-                <CategoryChip active={featureCategory === "all"} onClick={() => setFeatureCategory("all")}>
-                  全部
-                </CategoryChip>
-                {PRODUCT_FEATURE_CATEGORIES.map((item) => (
-                  <CategoryChip
-                    key={item.id}
-                    active={featureCategory === item.id}
-                    onClick={() => setFeatureCategory(item.id)}
-                  >
-                    {item.label}
-                  </CategoryChip>
-                ))}
-              </>
-            )}
-          </div>
+              ))}
+            </div>
+          )}
 
           <div className="flex min-h-0 flex-1">
-            {mode === "cases" ? (
-              <CaseSidebar
-                items={filteredCases}
-                activeId={caseId}
-                category={caseCategory}
-                onCategoryChange={setCaseCategory}
-                onSelect={onCaseChange}
-                onShowAll={onShowCaseGallery}
-              />
-            ) : (
+            {mode === "features" && (
               <FeatureSidebar
                 items={filteredFeatures}
                 activeId={selectedTopicId}
@@ -421,7 +396,14 @@ export function TutorialCenter({
 
               <main className="tutorial-detail min-h-0 flex-1 overflow-y-auto">
                 {mode === "cases" ? (
-                  selectedCase ? (
+                  showMissionReplay ? (
+                    <MissionReplay
+                      caseId={caseId}
+                      actionLabel={caseActionLabel}
+                      onCaseChange={onCaseChange}
+                      onRunCase={onRunCase}
+                    />
+                  ) : selectedCase ? (
                     <CaseDetail
                       item={selectedCase}
                       copied={copied}
@@ -430,9 +412,7 @@ export function TutorialCenter({
                       actionLabel={caseActionLabel}
                       onRun={onRunCase}
                     />
-                  ) : (
-                    <CaseGallery items={filteredCases} onSelect={onCaseChange} />
-                  )
+                  ) : null
                 ) : (
                   <FeatureDetail
                     feature={feature}
@@ -768,7 +748,7 @@ function CaseDetail({
         onClick={onBack}
         className="inline-flex items-center gap-1.5 rounded-md text-[12.5px] text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
       >
-        <ArrowLeft size={14} /> 返回全部案例
+        <ArrowLeft size={14} /> 返回实战拆解
       </button>
 
       <section className="mt-3 overflow-hidden rounded-3xl border border-border bg-surface shadow-sm md:grid md:grid-cols-[1.02fr_.98fr]">

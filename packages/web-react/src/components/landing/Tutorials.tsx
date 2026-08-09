@@ -16,7 +16,7 @@ import {
 import { useEffect, useRef, useState } from "react";
 import { tutorialHref } from "../../hooks/useAppRoute";
 import {
-  TUTORIAL_CASES,
+  TUTORIAL_CASE_BY_ID,
   type TutorialCaseCategory,
 } from "../../lib/tutorialCaseCatalog";
 
@@ -80,8 +80,8 @@ const STARTERS: Starter[] = [
 ];
 
 const FEATURED_CASES = [
-  ...TUTORIAL_CASES.filter((item) => item.category === "research").slice(0, 3),
-  ...TUTORIAL_CASES.filter((item) => item.category === "coding").slice(0, 3),
+  TUTORIAL_CASE_BY_ID["research-bike-demand"],
+  TUTORIAL_CASE_BY_ID["coding-swe-bench-fix"],
 ];
 
 function caseCategoryLabel(category: TutorialCaseCategory): string {
@@ -165,11 +165,11 @@ export function Tutorials() {
         ))}
       </div>
 
-      {/* 真实案例：教程中心的主入口，不再只列功能名。 */}
+      {/* 两条任务回放入口：让新用户先看完整故事，不再铺案例目录。 */}
       <div className="mb-6 text-center">
-        <h3 className="text-[22px] font-bold tracking-tight">从一个真实任务，看到完整交付</h3>
+        <h3 className="text-[22px] font-bold tracking-tight">先看一件难事，V5 是怎么做完的</h3>
         <p className="mx-auto mt-2 max-w-xl text-[14.5px] text-muted">
-          每个案例都公开输入材料、Agent 与模型选择、执行过程、产物和验收方法，重点覆盖科研与编码。
+          不列功能清单。直接进入科研或编码任务，看材料怎样变成可检查、可继续的成果。
         </p>
       </div>
       <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
@@ -187,7 +187,7 @@ export function Tutorials() {
             </div>
             <h4 className="mt-3 text-[16px] font-semibold text-fg">{item.title}</h4>
             <p className="mt-1.5 line-clamp-2 text-[13.5px] leading-6 text-muted">{item.summary}</p>
-            <p className="mt-3 text-[12px] font-medium text-accent">查看输入 → 过程 → 产物 → 验收</p>
+            <p className="mt-3 text-[12px] font-medium text-accent">打开任务全流程</p>
           </a>
         ))}
       </div>
