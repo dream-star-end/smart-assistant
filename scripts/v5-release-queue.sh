@@ -178,6 +178,28 @@ SQL
   printf '%s\n' "$id"
 }
 
+heartbeat_locked() {
+  local id="$1" actor="$2" status owner created
+  status="$(job_field_locked "$id" status)"
+  [[ "$status" == active ]] || die "只有 active 队列项可 heartbeat:$id status=${status:-missing}"
+  owner="$(job_field_locked "$id" owner)"
+  [[ "$owner" == "$actor" ]] || die "heartbeat owner 不匹配:$id owner=${owner:-missing} actor=$actor"
+  created="$(now_iso)"
+  sqlite3 "$QUEUE_DB" <<SQL
+BEGIN IMMEDIATE;
+UPDATE release_queue_jobs
+   SET updated_at='$(sql_quote "$created")'
+ WHERE id='$(sql_quote "$id")'
+   AND status='active'
+   AND owner='$(sql_quote "$actor")';
+INSERT INTO release_queue_events(job_id,event,actor,detail,created_at)
+VALUES
+  ('$(sql_quote "$id")','heartbeat','$(sql_quote "$actor")',NULL,'$(sql_quote "$created")');
+COMMIT;
+SQL
+  printf '%s\n' "$id"
+}
+
 pin_locked() {
   local id="$1" canonical_sha="$2" actor="$3" status requested created
   status="$(job_field_locked "$id" status)"
@@ -364,6 +386,7 @@ usage() {
 Usage:
   v5-release-queue.sh submit --task T --branch B --sha SHA [--actor A]
   v5-release-queue.sh acquire --id ID --owner O
+  v5-release-queue.sh heartbeat --id ID --owner O
   v5-release-queue.sh wait --id ID --owner O [--timeout SECONDS]
   v5-release-queue.sh pin --id ID --sha CANONICAL_SHA --actor A
   v5-release-queue.sh assert [--id ID]
@@ -412,6 +435,19 @@ case "$command_name" in
     valid_id "$id" || die "非法 id:$id"
     valid_label "$owner" || die "非法 owner:$owner"
     with_queue_lock acquire_locked "$id" "$owner"
+    ;;
+  heartbeat)
+    id=""; owner=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --id) id="${2:-}"; shift 2 ;;
+        --owner) owner="${2:-}"; shift 2 ;;
+        *) die "heartbeat 未知参数:$1" ;;
+      esac
+    done
+    valid_id "$id" || die "非法 id:$id"
+    valid_label "$owner" || die "非法 owner:$owner"
+    with_queue_lock heartbeat_locked "$id" "$owner"
     ;;
   wait)
     id=""; owner=""; timeout=0
