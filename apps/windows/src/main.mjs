@@ -1014,6 +1014,13 @@ async function runSmokeContract() {
   assert.deepEqual(bridgeShape.keys, ['send', 'subscribe'])
   assert.equal(bridgeShape.send, 'function')
   assert.equal(bridgeShape.subscribe, 'function')
+  assert.equal(
+    await shellContents.executeJavaScript(
+      'document.documentElement.dataset.initialTransparencyAllowed',
+    ),
+    'false',
+    'shell enabled transparency before receiving an authoritative native theme',
+  )
   await waitForCondition(
     () => shellContents.executeJavaScript('window.__auroraSmokeStates.length > 0'),
     'trusted shell did not receive an initial state snapshot',
@@ -1045,6 +1052,7 @@ async function runSmokeContract() {
         cleanup()
         resolve({
           attribute: document.documentElement.dataset.reduceTransparency,
+          allowTransparencyClass: surface.classList.contains('allow-transparency'),
           modifierClass: surface.classList.contains('reduce-transparency'),
           backdropFilter: style.backdropFilter,
           backgroundColor: style.backgroundColor,
@@ -1083,6 +1091,7 @@ async function runSmokeContract() {
     'window.__auroraReducedTransparencyProbe',
   )
   assert.equal(reducedTransparencyStyle.attribute, 'true')
+  assert.equal(reducedTransparencyStyle.allowTransparencyClass, false)
   assert.equal(reducedTransparencyStyle.modifierClass, true)
   assert.equal(reducedTransparencyStyle.backdropFilter, 'none')
   assert.notEqual(reducedTransparencyStyle.backgroundColor, 'rgba(0, 0, 0, 0)')

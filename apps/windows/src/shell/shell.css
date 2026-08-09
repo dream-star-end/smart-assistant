@@ -103,7 +103,14 @@ svg {
   gap: 6px;
   padding: 0 10px;
   border-bottom: 1px solid var(--border);
+  background: var(--surface-solid);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+
+.command-surface.allow-transparency {
   background: var(--surface);
+  -webkit-backdrop-filter: blur(22px) saturate(125%);
   backdrop-filter: blur(22px) saturate(125%);
 }
 

@@ -76,7 +76,7 @@ function initializeShell() {
     navigation: { canGoBack: false, canGoForward: false },
     loading: { active: true },
     network: navigator.onLine ? 'unknown' : 'offline',
-    theme: { mode: 'light', forcedColors: false, reduceTransparency: false },
+    theme: { mode: 'light', forcedColors: false, reduceTransparency: true },
     downloads: [],
     error: null,
     shellMode: 'toolbar',
@@ -285,7 +285,9 @@ function initializeShell() {
     document.documentElement.dataset.theme = state.theme.mode
     document.documentElement.dataset.forcedColors = String(state.theme.forcedColors)
     document.documentElement.dataset.reduceTransparency = String(state.theme.reduceTransparency)
-    elements.commandSurface.classList.toggle('reduce-transparency', state.theme.reduceTransparency)
+    const transparencyAllowed = !state.theme.forcedColors && !state.theme.reduceTransparency
+    elements.commandSurface.classList.toggle('allow-transparency', transparencyAllowed)
+    elements.commandSurface.classList.toggle('reduce-transparency', !transparencyAllowed)
     elements.back.disabled = !state.navigation.canGoBack
     elements.forward.disabled = !state.navigation.canGoForward
     renderConnection()
@@ -335,6 +337,9 @@ function initializeShell() {
   window.addEventListener('online', () => render({ ...state, network: 'online' }))
 
   render(initialState)
+  document.documentElement.dataset.initialTransparencyAllowed = String(
+    elements.commandSurface.classList.contains('allow-transparency'),
+  )
   if (!bridge || typeof bridge.send !== 'function' || typeof bridge.subscribe !== 'function') {
     renderBridgeFailure()
     return
