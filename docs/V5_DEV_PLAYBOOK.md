@@ -88,6 +88,14 @@ app 分支部署 v5 server。
 登录、会话、计费、连接器与 WebSocket 继续复用 server 权威,禁止复制第二套业务状态机或在原生层
 持久化 access/refresh credential。
 
+冷启动根页面必须是有实际用途的 ArkUI 工作台,Web 只在用户点击“进入对话”后创建。设置使用
+独立全屏路由,禁止回退为悬浮“应用控制”面板;设置覆盖 Web 时保留 controller,Web pop 回工作台
+前先使生命周期 epoch/异步回调失效,下次 CTA 才创建新 controller。ArkWeb active 状态必须由
+destination active 与 controller attached 双闸经单一幂等 reconcile 收口。设置发出的 reload 等
+pending action 只在双闸就绪后消费一次。系统分享只发固定公开首页 URL,不得从 Web 读取页面文字、
+会话 URL、storage、cookie 或 token。下载必须绑定 Web 实例 epoch;Web pop/组件销毁前取消 active
+`WebDownloadItem` 并清目标缓存,旧 delegate finish/fail 只允许清理,不得再弹保存器或 Toast。
+
 **compat-v1 安全边界必须同时满足**:
 
 1. 只对 exact origin `https://claudeai.chat`(HTTPS + 精确 host + 默认端口)启用;外观相似域名、
@@ -119,7 +127,9 @@ fallback、旧 generation 丢弃、外链/OAuth 域名确认、上传下载;签�
 选择/保存、无刷新登录→原生栏出现、SPA 登出→原生栏消失、外部浏览器往返、前后台恢复、网络
 切换、通知/分享(若涉及)、性能/功耗与 crash/hilog。
 构建成功或只编出 ohosTest HAP 不等于真机验收完成。所有构建、运行、设备与日志动作统一走
-`devecocli`。
+`devecocli`;仪器化旅程必须先用 `devecocli run --module entry` 安装本轮主 HAP,再安装测试 HAP并通过
+`aa test ... OpenHarmonyTestRunner` 启动。直接启动 `TestAbility` 时 AbilityDelegator 不可用,
+不能作为 UI 测试通过证据。
 
 ### 2.2 v5 设计原则(与 v3 的关键差异)
 - **v5 未全量上线 → 放开走最优解**:发现次优结构就大胆重构(换抽象/删旧机制/改数据模型),不为"改动小"迁就。架构妥协零容忍;v3 仍守现网约束。

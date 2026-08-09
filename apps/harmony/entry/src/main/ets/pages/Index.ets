@@ -8,6 +8,12 @@ import { webview } from '@kit.ArkWeb';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { fileIo, picker } from '@kit.CoreFileKit';
 import {
+  SettingsDetailPage,
+  SettingsDetailPageKind
+} from '../components/SettingsDetailPage';
+import { SettingsPage } from '../components/SettingsPage';
+import { WorkbenchHome } from '../components/WorkbenchHome';
+import {
   APP_HOME_URL,
   classifyNavigationUrl,
   isOauthCandidateUrl,
@@ -34,11 +40,26 @@ import {
   ShellEvaluationRequest,
   ShellRollbackDecision
 } from '../common/ShellEvaluationClock';
+import {
+  AURORA_ABOUT_ROUTE,
+  AURORA_PRIVACY_ROUTE,
+  AURORA_SETTINGS_ROUTE,
+  AURORA_WEB_ROUTE,
+  decideWebBack,
+  hasRoute,
+  PendingWebAction,
+  shouldCreateFreshWebController,
+  shouldPushRoute,
+  WebBackAction
+} from '../common/WorkspaceNavigationPolicy';
+import { isCurrentDownloadCallback } from '../common/DownloadLifecyclePolicy';
 import { NetworkMonitor } from '../services/NetworkMonitor';
+import { HapticFeedbackService } from '../services/HapticFeedbackService';
 import {
   SHELL_LIFECYCLE_PERMISSION,
   ShellLifecycleBridge
 } from '../services/ShellLifecycleBridge';
+import { SystemShareService } from '../services/SystemShareService';
 
 const MICROPHONE_PERMISSION: Permissions = 'ohos.permission.MICROPHONE';
 const MAX_SELECTABLE_FILES: number = 8;
@@ -46,10 +67,19 @@ const MAX_SELECTABLE_FILES: number = 8;
 class DownloadTarget {
   cachePath: string;
   fileName: string;
+  item: webview.WebDownloadItem;
+  webInstanceEpoch: number;
 
-  constructor(cachePath: string, fileName: string) {
+  constructor(
+    cachePath: string,
+    fileName: string,
+    item: webview.WebDownloadItem,
+    webInstanceEpoch: number
+  ) {
     this.cachePath = cachePath;
     this.fileName = fileName;
+    this.item = item;
+    this.webInstanceEpoch = webInstanceEpoch;
   }
 }
 
@@ -58,60 +88,54 @@ class DownloadTarget {
 struct Index {
   private controller: webview.WebviewController = new webview.WebviewController();
   private pathStack: NavPathStack = new NavPathStack();
-  private destinationOpened: boolean = false;
   private downloadDelegate: webview.WebDownloadDelegate = new webview.WebDownloadDelegate();
   private downloadDelegateConfigured: boolean = false;
   private downloadTargets: Map<string, DownloadTarget> = new Map<string, DownloadTarget>();
+  private webInstanceEpoch: number = 0;
+  private webControllerEpoch: number = 0;
   private navigationGeneration: number = 0;
-  private readonly shellEvaluationClock: ShellEvaluationClock = new ShellEvaluationClock();
-  private readonly shellLifecycleBridge: ShellLifecycleBridge =
+  private shellEvaluationClock: ShellEvaluationClock = new ShellEvaluationClock();
+  private shellLifecycleBridge: ShellLifecycleBridge =
     new ShellLifecycleBridge(this.controller);
   private shellLifecycleActive: boolean = false;
+  private shellLifecycleReconciledActive: boolean = false;
   private shellLifecycleEpoch: number = 0;
   private shellEvaluationTimerId: number = -1;
+  private webControllerAttached: boolean = false;
+  private webDestinationActive: boolean = false;
+  private webInstanceNeedsReset: boolean = true;
+  private pendingWebAction: PendingWebAction = PendingWebAction.NONE;
+  private downloadCacheCleared: boolean = false;
   private networkMonitor: NetworkMonitor | undefined = undefined;
 
-  @State private loading: boolean = true;
+  @State private loading: boolean = false;
   @State private progress: number = 0;
   @State private loadFailed: boolean = false;
   @State private hasLoadedOnce: boolean = false;
   @State private nativeShellReady: boolean = false;
   @State private online: boolean = true;
-  @State private settingsVisible: boolean = false;
   @State private oauthNavigationActive: boolean = false;
   @State private externalAuthHost: string = '';
   @State private pendingOauthUrl: string = '';
   @State private pendingOauthHost: string = '';
 
   aboutToAppear(): void {
-    if (!this.shellLifecycleActive) {
-      this.shellLifecycleActive = true;
-      this.shellLifecycleEpoch += 1;
-      this.shellEvaluationClock.beginGeneration(this.navigationGeneration);
-      this.shellLifecycleBridge.attach((generation: number) => {
-        this.handleShellLifecycleSignal(generation);
-      });
-    }
     if (this.networkMonitor === undefined) {
       this.networkMonitor = new NetworkMonitor((online: boolean) => {
         this.online = online;
       });
     }
     this.networkMonitor.start();
-    if (!this.destinationOpened) {
+    if (!this.downloadCacheCleared) {
       this.clearStaleDownloadCache();
-      this.destinationOpened = true;
-      this.pathStack.pushPath({ name: 'aurora-web' }, false);
+      this.downloadCacheCleared = true;
     }
   }
 
   aboutToDisappear(): void {
-    this.shellLifecycleActive = false;
-    this.shellLifecycleEpoch += 1;
-    this.shellLifecycleBridge.detach();
-    this.clearDeferredShellEvaluation();
-    this.shellEvaluationClock.invalidate();
-    this.nativeShellReady = false;
+    this.webDestinationActive = false;
+    this.reconcileWebLifecycle();
+    this.invalidateActiveDownloads();
     try {
       // Deletion applies on the next reload, so the inactive epoch above is
       // the immediate guard for any late call from the current document.
@@ -121,6 +145,198 @@ struct Index {
     }
     if (this.networkMonitor !== undefined) {
       this.networkMonitor.stop();
+    }
+  }
+
+  private reconcileWebLifecycle(): void {
+    const shouldBeActive: boolean = this.webDestinationActive && this.webControllerAttached;
+    if (!shouldBeActive) {
+      if (!this.shellLifecycleReconciledActive) {
+        return;
+      }
+
+      this.shellLifecycleReconciledActive = false;
+      this.shellLifecycleActive = false;
+      this.shellLifecycleEpoch += 1;
+      this.shellLifecycleBridge.detach();
+      this.clearDeferredShellEvaluation();
+      this.shellEvaluationClock.invalidate();
+      this.nativeShellReady = false;
+      try {
+        this.controller.onInactive();
+      } catch (_) {
+        // ArkWeb may already be detached while the destination is changing.
+      }
+      return;
+    }
+
+    if (!this.shellLifecycleReconciledActive) {
+      this.shellLifecycleReconciledActive = true;
+      this.shellLifecycleActive = true;
+      this.shellLifecycleEpoch += 1;
+      this.shellEvaluationClock.beginGeneration(this.navigationGeneration);
+      this.shellLifecycleBridge.attach((generation: number) => {
+        this.handleShellLifecycleSignal(generation);
+      });
+      try {
+        this.controller.onActive();
+      } catch (_) {
+        // ArkWeb can attach between lifecycle frames; the next reconcile retries.
+        this.shellLifecycleReconciledActive = false;
+        this.shellLifecycleActive = false;
+        this.shellLifecycleBridge.detach();
+        this.shellEvaluationClock.invalidate();
+        return;
+      }
+      if (this.hasLoadedOnce && !this.oauthNavigationActive && this.isPrimaryPage()) {
+        this.requestNativeShellEvaluation(this.navigationGeneration);
+      }
+    }
+
+    this.consumePendingWebAction();
+  }
+
+  private consumePendingWebAction(): void {
+    if (this.pendingWebAction !== PendingWebAction.RELOAD ||
+      !this.webDestinationActive || !this.webControllerAttached) {
+      return;
+    }
+
+    try {
+      this.controller.refresh();
+      this.pendingWebAction = PendingWebAction.NONE;
+    } catch (_) {
+      // Keep the action pending until a later active-and-attached reconcile.
+    }
+  }
+
+  private triggerTouchFeedback(): void {
+    HapticFeedbackService.touch().catch(() => {});
+  }
+
+  private prepareFreshWebInstance(): void {
+    this.clearDeferredShellEvaluation();
+    this.shellLifecycleBridge.detach();
+    this.invalidateActiveDownloads();
+    this.controller = new webview.WebviewController();
+    this.downloadDelegate = new webview.WebDownloadDelegate();
+    this.downloadDelegateConfigured = false;
+    this.webControllerEpoch = this.webInstanceEpoch;
+    this.navigationGeneration = 0;
+    this.shellEvaluationClock = new ShellEvaluationClock();
+    this.shellLifecycleBridge = new ShellLifecycleBridge(this.controller);
+    this.shellLifecycleActive = false;
+    this.shellLifecycleReconciledActive = false;
+    this.shellLifecycleEpoch += 1;
+    this.webControllerAttached = false;
+    this.webDestinationActive = false;
+    this.webInstanceNeedsReset = false;
+    this.pendingWebAction = PendingWebAction.NONE;
+    this.loading = true;
+    this.progress = 0;
+    this.loadFailed = false;
+    this.hasLoadedOnce = false;
+    this.nativeShellReady = false;
+    this.oauthNavigationActive = false;
+    this.externalAuthHost = '';
+    this.pendingOauthUrl = '';
+    this.pendingOauthHost = '';
+  }
+
+  private currentPathNames(): string[] {
+    try {
+      return this.pathStack.getAllPathName();
+    } catch (_) {
+      return [];
+    }
+  }
+
+  private openConversation(withFeedback: boolean = true): void {
+    const pathNames: string[] = this.currentPathNames();
+    const webAlreadyOpen: boolean = hasRoute(pathNames, AURORA_WEB_ROUTE);
+    if (!shouldPushRoute(pathNames, AURORA_WEB_ROUTE)) {
+      return;
+    }
+    if (shouldCreateFreshWebController(webAlreadyOpen) || this.webInstanceNeedsReset) {
+      this.prepareFreshWebInstance();
+    }
+    if (withFeedback) {
+      this.triggerTouchFeedback();
+    }
+    this.pathStack.pushPath({ name: AURORA_WEB_ROUTE });
+  }
+
+  private openSettings(): void {
+    const pathNames: string[] = this.currentPathNames();
+    if (!shouldPushRoute(pathNames, AURORA_SETTINGS_ROUTE)) {
+      return;
+    }
+    this.triggerTouchFeedback();
+    this.pathStack.pushPath({ name: AURORA_SETTINGS_ROUTE });
+  }
+
+  private openPrivacyDetails(): void {
+    const pathNames: string[] = this.currentPathNames();
+    if (!shouldPushRoute(pathNames, AURORA_PRIVACY_ROUTE)) {
+      return;
+    }
+    this.triggerTouchFeedback();
+    this.pathStack.pushPath({ name: AURORA_PRIVACY_ROUTE });
+  }
+
+  private openAboutDetails(): void {
+    const pathNames: string[] = this.currentPathNames();
+    if (!shouldPushRoute(pathNames, AURORA_ABOUT_ROUTE)) {
+      return;
+    }
+    this.triggerTouchFeedback();
+    this.pathStack.pushPath({ name: AURORA_ABOUT_ROUTE });
+  }
+
+  private popNativeDestination(): void {
+    this.triggerTouchFeedback();
+    try {
+      this.pathStack.pop();
+    } catch (_) {
+      // The system back gesture may have completed the same transition.
+    }
+  }
+
+  private reloadFromSettings(): void {
+    const hasWebDestination: boolean = hasRoute(this.currentPathNames(), AURORA_WEB_ROUTE);
+    this.triggerTouchFeedback();
+    try {
+      this.pathStack.pop();
+    } catch (_) {
+      return;
+    }
+    if (hasWebDestination) {
+      this.pendingWebAction = PendingWebAction.RELOAD;
+      this.reconcileWebLifecycle();
+      return;
+    }
+    this.openConversation(false);
+  }
+
+  private openInSystemBrowser(): void {
+    this.triggerTouchFeedback();
+    this.openExternalUrl(APP_HOME_URL);
+  }
+
+  private openSystemShare(): void {
+    this.triggerTouchFeedback();
+    try {
+      SystemShareService.showAurora(this.getAbilityContext())
+        .then((shown: boolean) => {
+          if (!shown) {
+            this.showToast($r('app.string.share_failed'));
+          }
+        })
+        .catch(() => {
+          this.showToast($r('app.string.share_failed'));
+        });
+    } catch (_) {
+      this.showToast($r('app.string.share_failed'));
     }
   }
 
@@ -317,7 +533,6 @@ struct Index {
   }
 
   private runWebAction(action: NativeWebAction): void {
-    this.settingsVisible = false;
     if (!this.nativeShellReady || !this.isPrimaryPage()) {
       this.showToast($r('app.string.web_action_unavailable'));
       return;
@@ -344,16 +559,6 @@ struct Index {
     } catch (_) {
       this.showToast($r('app.string.web_action_unavailable'));
     }
-  }
-
-  private reloadConversation(): void {
-    this.settingsVisible = false;
-    this.retry();
-  }
-
-  private openInSystemBrowser(): void {
-    this.settingsVisible = false;
-    this.openExternalUrl(APP_HOME_URL);
   }
 
   private openExternalUrl(targetUrl: string): void {
@@ -518,12 +723,20 @@ struct Index {
     }
   }
 
-  private clearDownloadTarget(guid: string): void {
+  private clearDownloadTarget(
+    guid: string,
+    expectedEpoch?: number,
+    expectedItem?: webview.WebDownloadItem
+  ): void {
     const target: DownloadTarget | undefined = this.downloadTargets.get(guid);
-    this.downloadTargets.delete(guid);
     if (target === undefined) {
       return;
     }
+    if ((expectedEpoch !== undefined && target.webInstanceEpoch !== expectedEpoch) ||
+      (expectedItem !== undefined && target.item !== expectedItem)) {
+      return;
+    }
+    this.downloadTargets.delete(guid);
     try {
       fileIo.unlinkSync(target.cachePath);
     } catch (_) {
@@ -531,9 +744,30 @@ struct Index {
     }
   }
 
-  private startDownload(item: webview.WebDownloadItem): void {
+  private invalidateActiveDownloads(): void {
+    // Invalidate first so a synchronous cancel callback is already stale.
+    this.webInstanceEpoch += 1;
+    const guids: string[] = [];
+    this.downloadTargets.forEach((_target: DownloadTarget, guid: string) => {
+      guids.push(guid);
+    });
+    for (let index: number = 0; index < guids.length; index++) {
+      const guid: string = guids[index];
+      const target: DownloadTarget | undefined = this.downloadTargets.get(guid);
+      if (target !== undefined) {
+        this.cancelDownload(target.item);
+        this.clearDownloadTarget(guid, target.webInstanceEpoch, target.item);
+      }
+    }
+  }
+
+  private startDownload(item: webview.WebDownloadItem, delegateEpoch: number): void {
     let guid: string = '';
     try {
+      if (delegateEpoch !== this.webInstanceEpoch) {
+        this.cancelDownload(item);
+        return;
+      }
       if (!this.isPrimaryPage()) {
         this.cancelDownload(item);
         this.showToast($r('app.string.blocked_link'));
@@ -549,24 +783,34 @@ struct Index {
       const cacheDirectory: string = this.getDownloadCacheDirectory();
       fileIo.mkdirSync(cacheDirectory, true);
       const cachePath: string = cacheDirectory + '/' + this.sanitizeFileName(guid) + '-' + fileName;
-      this.downloadTargets.set(guid, new DownloadTarget(cachePath, fileName));
+      this.downloadTargets.set(
+        guid,
+        new DownloadTarget(cachePath, fileName, item, delegateEpoch)
+      );
       item.start(cachePath);
     } catch (_) {
       if (guid.length > 0) {
-        this.clearDownloadTarget(guid);
+        this.clearDownloadTarget(guid, delegateEpoch, item);
       }
       this.cancelDownload(item);
       this.showToast($r('app.string.download_failed'));
     }
   }
 
-  private async persistCompletedDownload(item: webview.WebDownloadItem): Promise<void> {
+  private async persistCompletedDownload(
+    item: webview.WebDownloadItem,
+    delegateEpoch: number
+  ): Promise<void> {
     let guid: string = '';
     let destination: fileIo.File | undefined = undefined;
     try {
       guid = item.getGuid();
       const target: DownloadTarget | undefined = this.downloadTargets.get(guid);
-      if (target === undefined) {
+      if (target === undefined || !isCurrentDownloadCallback(
+        delegateEpoch,
+        target.webInstanceEpoch,
+        this.webInstanceEpoch
+      )) {
         return;
       }
       const documentPicker: picker.DocumentViewPicker =
@@ -577,14 +821,29 @@ struct Index {
       if (destinations.length !== 1) {
         return;
       }
+      if (!isCurrentDownloadCallback(
+        delegateEpoch,
+        target.webInstanceEpoch,
+        this.webInstanceEpoch
+      )) {
+        return;
+      }
       destination = await fileIo.open(
         destinations[0],
         fileIo.OpenMode.READ_WRITE | fileIo.OpenMode.TRUNC
       );
       await fileIo.copyFile(target.cachePath, destination.fd);
-      this.showToast($r('app.string.download_saved'));
+      if (isCurrentDownloadCallback(
+        delegateEpoch,
+        target.webInstanceEpoch,
+        this.webInstanceEpoch
+      )) {
+        this.showToast($r('app.string.download_saved'));
+      }
     } catch (_) {
-      this.showToast($r('app.string.download_failed'));
+      if (delegateEpoch === this.webInstanceEpoch) {
+        this.showToast($r('app.string.download_failed'));
+      }
     } finally {
       if (destination !== undefined) {
         try {
@@ -594,7 +853,7 @@ struct Index {
         }
       }
       if (guid.length > 0) {
-        this.clearDownloadTarget(guid);
+        this.clearDownloadTarget(guid, delegateEpoch, item);
       }
     }
   }
@@ -604,26 +863,33 @@ struct Index {
       return;
     }
     try {
+      const delegateEpoch: number = this.webControllerEpoch;
       this.downloadDelegate.onBeforeDownload((item: webview.WebDownloadItem) => {
-        this.startDownload(item);
+        this.startDownload(item, delegateEpoch);
       });
       this.downloadDelegate.onDownloadFinish((item: webview.WebDownloadItem) => {
-        this.persistCompletedDownload(item).catch(() => {
-          this.showToast($r('app.string.download_failed'));
+        this.persistCompletedDownload(item, delegateEpoch).catch(() => {
+          if (delegateEpoch === this.webInstanceEpoch) {
+            this.showToast($r('app.string.download_failed'));
+          }
         });
       });
       this.downloadDelegate.onDownloadFailed((item: webview.WebDownloadItem) => {
         try {
-          this.clearDownloadTarget(item.getGuid());
+          this.clearDownloadTarget(item.getGuid(), delegateEpoch, item);
         } catch (_) {
           // The failed item may not expose a GUID after renderer shutdown.
         }
-        this.showToast($r('app.string.download_failed'));
+        if (delegateEpoch === this.webInstanceEpoch) {
+          this.showToast($r('app.string.download_failed'));
+        }
       });
       this.controller.setDownloadDelegate(this.downloadDelegate);
       this.downloadDelegateConfigured = true;
     } catch (_) {
-      this.showToast($r('app.string.download_failed'));
+      if (this.webControllerEpoch === this.webInstanceEpoch) {
+        this.showToast($r('app.string.download_failed'));
+      }
     }
   }
 
@@ -679,45 +945,138 @@ struct Index {
     }
   }
 
-  private handleBackPress(): boolean {
-    if (this.settingsVisible) {
-      this.settingsVisible = false;
-      return true;
+  private canNavigateWebBackward(): boolean {
+    try {
+      return this.controller.accessBackward();
+    } catch (_) {
+      return false;
     }
+  }
 
-    if (this.pendingOauthUrl.length > 0) {
+  private disposeWebDestination(): void {
+    this.webDestinationActive = false;
+    this.reconcileWebLifecycle();
+    this.invalidateActiveDownloads();
+    this.webControllerAttached = false;
+    this.pendingWebAction = PendingWebAction.NONE;
+    this.oauthNavigationActive = false;
+    this.externalAuthHost = '';
+    this.pendingOauthUrl = '';
+    this.pendingOauthHost = '';
+    this.loading = false;
+    this.progress = 0;
+    this.loadFailed = false;
+    this.hasLoadedOnce = false;
+    this.nativeShellReady = false;
+    this.webInstanceNeedsReset = true;
+    try {
+      this.controller.deleteJavaScriptRegister(SHELL_LIFECYCLE_BRIDGE_NAME);
+    } catch (_) {
+      // The old Web instance is already detached or being destroyed.
+    }
+    try {
+      this.pathStack.pop();
+    } catch (_) {
+      // The system back gesture may have completed the same transition.
+    }
+  }
+
+  private handleWebBackPress(): boolean {
+    const action: WebBackAction = decideWebBack(
+      this.pendingOauthUrl.length > 0,
+      this.oauthNavigationActive,
+      this.canNavigateWebBackward()
+    );
+
+    if (action === WebBackAction.DISMISS_PENDING_OAUTH) {
       this.dismissOauthCandidate();
       return true;
     }
-
-    try {
-      if (this.controller.accessBackward()) {
+    if (action === WebBackAction.WEB_BACKWARD) {
+      try {
         this.controller.backward();
-        return true;
+      } catch (_) {
+        // A subsequent back press can safely re-evaluate controller state.
       }
-    } catch (_) {
-      // The controller can briefly be unavailable while ArkWeb is attaching.
+      return true;
+    }
+    if (action === WebBackAction.CANCEL_ACTIVE_OAUTH) {
+      this.cancelOauthNavigation();
+      return true;
     }
 
-    try {
-      this.getAbilityContext().terminateSelf().catch(() => {});
-    } catch (_) {
-      // The system will close the destination if the ability is already stopping.
-    }
+    this.triggerTouchFeedback();
+    this.disposeWebDestination();
     return true;
   }
 
   @Builder
-  private auroraDestination(_name: string): void {
-    NavDestination() {
-      this.webContent()
+  private auroraDestination(name: string): void {
+    if (name === AURORA_WEB_ROUTE) {
+      NavDestination() {
+        this.webContent()
+      }
+      .hideTitleBar(true)
+      .onActive(() => {
+        this.webDestinationActive = true;
+        this.reconcileWebLifecycle();
+      })
+      .onInactive(() => {
+        this.webDestinationActive = false;
+        this.reconcileWebLifecycle();
+      })
+      .onBackPressed(() => this.handleWebBackPress())
+    } else if (name === AURORA_SETTINGS_ROUTE) {
+      NavDestination() {
+        SettingsPage({
+          online: this.online,
+          onBack: () => this.popNativeDestination(),
+          onReload: () => this.reloadFromSettings(),
+          onOpenBrowser: () => this.openInSystemBrowser(),
+          onSystemShare: () => this.openSystemShare(),
+          onOpenPrivacy: () => this.openPrivacyDetails(),
+          onOpenAbout: () => this.openAboutDetails()
+        })
+      }
+      .hideTitleBar(true)
+      .onBackPressed(() => {
+        this.popNativeDestination();
+        return true;
+      })
+    } else if (name === AURORA_PRIVACY_ROUTE) {
+      NavDestination() {
+        SettingsDetailPage({
+          pageKind: SettingsDetailPageKind.PRIVACY,
+          onBack: () => this.popNativeDestination()
+        })
+      }
+      .hideTitleBar(true)
+      .onBackPressed(() => {
+        this.popNativeDestination();
+        return true;
+      })
+    } else if (name === AURORA_ABOUT_ROUTE) {
+      NavDestination() {
+        SettingsDetailPage({
+          pageKind: SettingsDetailPageKind.ABOUT,
+          onBack: () => this.popNativeDestination()
+        })
+      }
+      .hideTitleBar(true)
+      .onBackPressed(() => {
+        this.popNativeDestination();
+        return true;
+      })
     }
-    .hideTitleBar(true)
-    .onBackPressed(() => this.handleBackPress())
   }
 
   @Builder
-  private shellIconButton(symbol: Resource, label: Resource, action: NativeWebAction): void {
+  private shellIconButton(
+    symbol: Resource,
+    label: Resource,
+    stableId: string,
+    action: NativeWebAction
+  ): void {
     Button() {
       SymbolGlyph(symbol)
         .fontSize(22)
@@ -729,6 +1088,7 @@ struct Index {
     .padding(0)
     .borderRadius(12)
     .backgroundColor(Color.Transparent)
+    .id(stableId)
     .accessibilityText(label)
     .onClick(() => this.runWebAction(action))
   }
@@ -739,6 +1099,7 @@ struct Index {
       this.shellIconButton(
         $r('sys.symbol.open_sidebar'),
         $r('app.string.open_sessions'),
+        'aurora-web-open-sessions',
         NativeWebAction.OPEN_SESSIONS
       )
 
@@ -804,10 +1165,9 @@ struct Index {
       .padding(0)
       .borderRadius(12)
       .backgroundColor(Color.Transparent)
+      .id('aurora-web-open-settings')
       .accessibilityText($r('app.string.open_more'))
-      .onClick(() => {
-        this.settingsVisible = true;
-      })
+      .onClick(() => this.openSettings())
     }
     .width('100%')
     .height(56)
@@ -847,151 +1207,6 @@ struct Index {
   }
 
   @Builder
-  private webActionButton(label: Resource, action: NativeWebAction): void {
-    Button(label)
-      .type(ButtonType.Normal)
-      .layoutWeight(1)
-      .height(44)
-      .fontSize(13)
-      .fontColor($r('app.color.primary_text'))
-      .backgroundColor($r('app.color.auth_bar_background'))
-      .borderRadius(12)
-      .onClick(() => this.runWebAction(action))
-  }
-
-  @Builder
-  private appSettingsSheet(): void {
-    Scroll() {
-      Column({ space: 16 }) {
-        Column({ space: 4 }) {
-          Text($r('app.string.app_controls'))
-            .fontSize(20)
-            .fontWeight(FontWeight.Bold)
-            .fontColor($r('app.color.primary_text'))
-          Text($r('app.string.compatibility_mode'))
-            .fontSize(12)
-            .fontColor($r('app.color.secondary_text'))
-        }
-        .alignItems(HorizontalAlign.Start)
-        .width('100%')
-
-        Row({ space: 12 }) {
-          Image($r('app.media.aurora_icon'))
-            .width(40)
-            .height(40)
-            .borderRadius(12)
-          Column({ space: 3 }) {
-            Text(this.online ? $r('app.string.connected') : $r('app.string.offline'))
-              .fontSize(15)
-              .fontWeight(FontWeight.Medium)
-              .fontColor(this.online ? $r('app.color.connected') : $r('app.color.offline_text'))
-            Text('claudeai.chat')
-              .fontSize(12)
-              .fontColor($r('app.color.secondary_text'))
-          }
-          .alignItems(HorizontalAlign.Start)
-          .layoutWeight(1)
-        }
-        .width('100%')
-        .padding(14)
-        .backgroundColor($r('app.color.auth_bar_background'))
-        .borderRadius(16)
-
-        Column({ space: 8 }) {
-          Text($r('app.string.quick_actions'))
-            .fontSize(12)
-            .fontWeight(FontWeight.Medium)
-            .fontColor($r('app.color.secondary_text'))
-            .width('100%')
-
-          Row({ space: 8 }) {
-            Button($r('app.string.reload_chat'))
-              .type(ButtonType.Normal)
-              .layoutWeight(1)
-              .height(44)
-              .fontSize(13)
-              .fontColor(Color.White)
-              .backgroundColor($r('app.color.brand_primary'))
-              .borderRadius(12)
-              .onClick(() => this.reloadConversation())
-            Button($r('app.string.open_in_browser'))
-              .type(ButtonType.Normal)
-              .layoutWeight(1)
-              .height(44)
-              .fontSize(13)
-              .fontColor($r('app.color.primary_text'))
-              .backgroundColor($r('app.color.auth_bar_background'))
-              .borderRadius(12)
-              .onClick(() => this.openInSystemBrowser())
-          }
-          .width('100%')
-
-          Row({ space: 8 }) {
-            this.webActionButton($r('app.string.media_tasks'), NativeWebAction.OPEN_MEDIA)
-            this.webActionButton($r('app.string.tutorial'), NativeWebAction.OPEN_TUTORIAL)
-          }
-          .width('100%')
-
-          Row({ space: 8 }) {
-            this.webActionButton($r('app.string.inbox'), NativeWebAction.OPEN_INBOX)
-            this.webActionButton($r('app.string.billing'), NativeWebAction.OPEN_BILLING)
-          }
-          .width('100%')
-        }
-        .alignItems(HorizontalAlign.Start)
-        .width('100%')
-
-        Column({ space: 8 }) {
-          Text($r('app.string.service_and_privacy'))
-            .fontSize(12)
-            .fontWeight(FontWeight.Medium)
-            .fontColor($r('app.color.secondary_text'))
-            .width('100%')
-          Row() {
-            Text($r('app.string.service_domain'))
-              .fontSize(14)
-              .fontColor($r('app.color.primary_text'))
-            Blank()
-            Text('claudeai.chat')
-              .fontSize(13)
-              .fontColor($r('app.color.secondary_text'))
-          }
-          .width('100%')
-          .padding({ top: 4, bottom: 4 })
-          Text($r('app.string.session_storage_hint'))
-            .fontSize(12)
-            .lineHeight(18)
-            .fontColor($r('app.color.secondary_text'))
-            .width('100%')
-        }
-        .alignItems(HorizontalAlign.Start)
-        .width('100%')
-        .padding(14)
-        .backgroundColor($r('app.color.auth_bar_background'))
-        .borderRadius(16)
-
-        Column({ space: 4 }) {
-          Text($r('app.string.about_app'))
-            .fontSize(14)
-            .fontWeight(FontWeight.Medium)
-            .fontColor($r('app.color.primary_text'))
-          Text($r('app.string.app_version'))
-            .fontSize(12)
-            .fontColor($r('app.color.secondary_text'))
-        }
-        .alignItems(HorizontalAlign.Start)
-        .width('100%')
-      }
-      .width('100%')
-      .padding({ left: 20, right: 20, top: 8, bottom: 24 })
-    }
-    .width('100%')
-    .height('100%')
-    .scrollBar(BarState.Auto)
-    .backgroundColor($r('app.color.surface_background'))
-  }
-
-  @Builder
   private webContent(): void {
     Stack({ alignContent: Alignment.TopStart }) {
       Column() {
@@ -1019,6 +1234,7 @@ struct Index {
               .fontSize(12)
               .fontColor($r('app.color.brand_primary'))
               .backgroundColor(Color.Transparent)
+              .id('aurora-oauth-cancel-active')
               .onClick(() => this.cancelOauthNavigation())
           }
           .width('100%')
@@ -1063,7 +1279,9 @@ struct Index {
         .multiWindowAccess(false)
         .allowWindowOpenMethod(false)
         .onControllerAttached(() => {
+          this.webControllerAttached = true;
           this.configureDownloadDelegate();
+          this.reconcileWebLifecycle();
         })
         .onLoadIntercept((event) => {
           if (!event.data.isMainFrame()) {
@@ -1155,6 +1373,7 @@ struct Index {
             .fontColor(Color.White)
             .backgroundColor($r('app.color.brand_primary'))
             .borderRadius(20)
+            .id('aurora-web-retry')
             .onClick(() => this.retry())
         }
         .justifyContent(FlexAlign.Center)
@@ -1191,6 +1410,7 @@ struct Index {
               .fontColor($r('app.color.primary_text'))
               .backgroundColor($r('app.color.auth_bar_background'))
               .borderRadius(20)
+              .id('aurora-oauth-cancel-pending')
               .onClick(() => this.dismissOauthCandidate())
 
             Button($r('app.string.continue_authorization'))
@@ -1198,6 +1418,7 @@ struct Index {
               .fontColor(Color.White)
               .backgroundColor($r('app.color.brand_primary'))
               .borderRadius(20)
+              .id('aurora-oauth-continue')
               .onClick(() => this.continueOauthNavigation())
           }
           .width('100%')
@@ -1212,23 +1433,20 @@ struct Index {
     }
     .width('100%')
     .height('100%')
+    .id('aurora-web-screen')
     .backgroundColor($r('app.color.page_background'))
-    .bindSheet($$this.settingsVisible, this.appSettingsSheet(), {
-      height: 600,
-      dragBar: true,
-      showClose: true,
-      backgroundColor: $r('app.color.surface_background')
-    })
   }
 
   build() {
     Navigation(this.pathStack) {
-      Column() {
-        Blank()
-      }
+      WorkbenchHome({
+        online: this.online,
+        onEnterConversation: () => this.openConversation(),
+        onOpenSettings: () => this.openSettings(),
+        onSystemShare: () => this.openSystemShare()
+      })
     }
     .navDestination(this.auroraDestination)
-    .hideNavBar(true)
     .hideTitleBar(true)
     .width('100%')
     .height('100%')

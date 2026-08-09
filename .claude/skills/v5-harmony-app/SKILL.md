@@ -23,6 +23,20 @@ Treat the HarmonyOS client as an independently evolving native product. Keep the
 - Keep ArkWeb as a compatibility surface for web-only flows. Make the native shell useful even when a web selector changes or the network is unavailable.
 - Support phone, tablet, and 2-in-1 layouts. Test resizing, landscape, font scaling, keyboard overlap, status/navigation avoid areas, pointer/keyboard input where applicable, and back-navigation semantics.
 
+## Keep the native workspace lifecycle
+
+- Start on a useful ArkUI workbench. Do not auto-push ArkWeb at launch or present settings as an “app control” sheet. Use full-screen native settings with grouped list rows and native back behavior.
+- Keep the workbench truthful: show only device/network state, an explicit conversation CTA, real HarmonyOS capabilities, and privacy guidance. Do not synthesize recent sessions, account state, model state, or chat content in native code.
+- Keep Web, settings, privacy, and about as explicit routes. Opening settings above Web must retain that Web instance; returning home from Web must invalidate its lifecycle epoch before pop and create a fresh controller only on the next conversation CTA.
+- Reconcile ArkWeb lifecycle through one idempotent function gated by both destination-active and controller-attached state. Pair exactly one native activation/deactivation with proxy attach/detach, and reject stale async callbacks with the lifecycle epoch.
+- Queue native requests such as reload while Web is covered. Consume a queued request exactly once only after Web is active and attached; retain it if the controller is not ready.
+- Bind downloads to a Web-instance epoch. Before Web pop or component destruction, invalidate the epoch, cancel every active `WebDownloadItem`, and clear its target cache. A stale delegate finish/fail callback may clean up only its matching epoch/item; it must never delete a newer same-GUID target, open the save picker, or show a toast after the user has left that Web instance.
+- Make Web back behavior a pure ordered policy: dismiss pending OAuth confirmation, navigate OAuth/Web history, cancel an active OAuth without history, then pop to the workbench.
+- Use ShareKit for the action named “系统分享” with the system share symbol. Share only the fixed public URL `https://claudeai.chat/`; never derive a session URL or read page text, storage, cookies, or tokens.
+- Treat touch haptics as optional enhancement: use a supported soft preset, keep intensity restrained, and never block or fail an action when vibration is unavailable.
+- Give primary native screens and controls stable component IDs. Drive instrumented tests by ID rather than coordinates or visible localized text.
+
+
 ## Preserve the compat-v1 security contract
 
 Apply all of these checks together; none is a substitute for another:
@@ -54,8 +68,10 @@ devecocli build clean
 devecocli build
 devecocli build --modules entry@ohosTest
 devecocli device list
+devecocli run --module entry --device <serial> --skip-build
 devecocli run --module entry@ohosTest --ability TestAbility --device <serial> --skip-build
-devecocli log --keyword "total cases" --from 30s --tail 20 --bundle-name chat.claudeai.aurora --device <serial>
+HDC_BIN="/Applications/DevEco-Studio.app/Contents/sdk/default/openharmony/toolchains/hdc"
+"$HDC_BIN" -t <serial> shell "aa test -b chat.claudeai.aurora -m entry_test -s timeout 30000 -s unittest OpenHarmonyTestRunner -w 60000"
 devecocli run --module entry --device <serial>
 devecocli log --crash --bundle-name chat.claudeai.aurora --device <serial>
 devecocli log --level E --from 5m --tail 200 --bundle-name chat.claudeai.aurora --device <serial>
@@ -64,7 +80,7 @@ devecocli log --level E --from 5m --tail 200 --bundle-name chat.claudeai.aurora 
 - The user must personally accept emulator licenses in an interactive terminal. Do not accept them, delete a partial image, or retry a failed image download on the user's behalf.
 - On an emulator, verify cold/warm launch, native navigation, back behavior, loading/offline/retry states, keyboard and layout resizing, selector-missing fallback, generation-stale result rejection, constrained lifecycle-proxy transitions, external-link/OAuth confirmation, and upload/download journeys.
 - On a signed real device, verify no-refresh login activates the native bar, SPA logout removes it, rapid auth-state transitions do not leave a double header, microphone permission, document picker/save flows, system-browser round trips, background/foreground recovery, network switching, notifications/sharing if touched, crash logs, responsiveness, and power/memory behavior.
-- Add pure ArkTS tests for navigation/origin/generation policy and an instrumented journey for each user-visible native interaction. Launch the generated `TestAbility` and verify Hypium reports zero failures; a compiled `ohosTest` HAP without execution is only partial evidence.
+- Add pure ArkTS tests for navigation/origin/generation policy and an instrumented journey for each user-visible native interaction. Install the freshly built app under test with `devecocli run --module entry` before installing `entry@ohosTest`; the test HAP alone does not refresh the main HAP. Then execute the generated `OpenHarmonyTestRunner` through `aa test`; directly starting `TestAbility` leaves `AbilityDelegator` unavailable and is not valid UI-test evidence. Require `Failure: 0, Error: 0`; a compiled `ohosTest` HAP without execution is only partial evidence.
 - Obtain an independent full-diff review to PASS for architecture and security before release.
 
 ## Release the app separately
