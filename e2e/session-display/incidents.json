@@ -1104,6 +1104,35 @@
           "assertion": "T33 当前微博账号重新扫码登录不会先解绑旧连接"
         }
       ]
+    },
+    {
+      "id": "INC-20260809-CCB-CONTEXT-OVERFLOW",
+      "occurredAt": "2026-08-09",
+      "severity": "P1",
+      "symptom": "CCB 长会话把完整 Base64 工具结果按字符数低估后重新注入上游，触发上下文 400；同一轮自动重试又持久化多条原始 API Error，导致会话无法继续且 UI 同时展示重复原始错误。",
+      "rootFixCommit": "1b7c4c07",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/sessionManagerEngineTurn.test.ts",
+          "assertion": "CCB PROMPT_TOO_LONG diagnostic clears native resume and safely rebuilds the same turn"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/anthropicProxy.test.ts",
+          "assertion": "requires an invalid_request_error with an explicit overflow predicate"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
+          "assertion": "unified timeline hides only a recovered API Error attempt and preserves its immutable audit rows"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T29 自动重试统一显示模型繁忙与共享 n/10 进度；重试成功保持实时可见"
+        }
+      ]
     }
   ]
 }
