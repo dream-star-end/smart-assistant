@@ -4,7 +4,7 @@ asar: true
 
 directories:
   output: release
-  buildResources: ../web-react/public/icons
+  buildResources: ../../packages/web-react/public/icons
 
 files:
   - src/**/*

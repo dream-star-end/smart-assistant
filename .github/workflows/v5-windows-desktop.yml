@@ -1,4 +1,4 @@
-name: Aurora v5 Windows Desktop
+name: Aurora v5 Windows App
 
 on:
   pull_request:
@@ -80,13 +80,13 @@ jobs:
         with:
           node-version: "22.12.0"
           cache: npm
-          cache-dependency-path: packages/desktop/package-lock.json
+          cache-dependency-path: apps/windows/package-lock.json
 
       - name: Install desktop dependencies
-        run: npm --prefix packages/desktop ci
+        run: npm --prefix apps/windows ci
 
       - name: Check desktop package
-        run: npm --prefix packages/desktop run check
+        run: npm --prefix apps/windows run check
 
       - name: Build unsigned Windows NSIS package
         # PR jobs must never receive signing credentials. This workflow deliberately
@@ -94,20 +94,22 @@ jobs:
         # lane is documented in docs/V5_WINDOWS_DESKTOP.md and is not enabled yet.
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
-        run: npm --prefix packages/desktop run dist:win
+        run: npm --prefix apps/windows run dist:win
 
       - name: Smoke packaged executable without public network
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $exe = Join-Path $PWD 'packages/desktop/release/win-unpacked/Aurora.exe'
+          $exe = Join-Path $PWD 'apps/windows/release/win-unpacked/Aurora.exe'
           if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
             throw "packaged executable missing: $exe"
           }
+          $smokeReport = Join-Path $env:RUNNER_TEMP 'aurora-unpacked-smoke.txt'
+          $env:OPENCLAUDE_SMOKE_REPORT_PATH = $smokeReport
 
-          # --smoke-test is an offline lifecycle contract: the application must
-          # create a hidden sandboxed window, load only about:blank, then exit.
-          # This step intentionally starts no local server and probes no public URL.
+          # --smoke-test is an offline desktop contract: it creates the trusted shell
+          # and isolated product WebContentsViews, validates bridge/layout/navigation
+          # boundaries against packaged local fixtures, closes both views, then exits.
           $process = Start-Process -FilePath $exe -ArgumentList '--smoke-test' -PassThru
           try {
             if (-not $process.WaitForExit(30000)) {
@@ -115,8 +117,13 @@ jobs:
               throw 'Aurora.exe --smoke-test exceeded the hard 30 second timeout'
             }
             $process.Refresh()
-            if ($process.ExitCode -ne 0) {
-              throw "Aurora.exe --smoke-test exited with code $($process.ExitCode)"
+          if ($process.ExitCode -ne 0) {
+            $detail = if (Test-Path -LiteralPath $smokeReport -PathType Leaf) {
+              Get-Content -LiteralPath $smokeReport -Raw
+            } else {
+              'No application smoke report was produced.'
+            }
+            throw "Aurora.exe --smoke-test exited with code $($process.ExitCode)`n$detail"
             }
           }
           finally {
@@ -125,11 +132,74 @@ jobs:
             }
           }
 
+      - name: Smoke silent install and uninstall
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $releaseDir = Join-Path $PWD 'apps/windows/release'
+          $installers = @(Get-ChildItem -LiteralPath $releaseDir -Filter 'Aurora-Setup-*.exe' -File)
+          if ($installers.Count -ne 1) {
+            throw "expected exactly one Aurora NSIS installer, found $($installers.Count)"
+          }
+
+          $installDir = Join-Path $env:RUNNER_TEMP 'aurora-installed-smoke'
+          $install = Start-Process -FilePath $installers[0].FullName -ArgumentList @('/S', "/D=$installDir") -PassThru
+          if (-not $install.WaitForExit(60000)) {
+            Stop-Process -Id $install.Id -Force -ErrorAction SilentlyContinue
+            throw 'silent installer exceeded 60 seconds'
+          }
+          $install.Refresh()
+          if ($install.ExitCode -ne 0) {
+            throw "silent installer exited with code $($install.ExitCode)"
+          }
+
+          $installedExe = Join-Path $installDir 'Aurora.exe'
+          if (-not (Test-Path -LiteralPath $installedExe -PathType Leaf)) {
+            throw "installed executable missing: $installedExe"
+          }
+          $installedSmokeReport = Join-Path $env:RUNNER_TEMP 'aurora-installed-smoke.txt'
+          $env:OPENCLAUDE_SMOKE_REPORT_PATH = $installedSmokeReport
+          $smoke = Start-Process -FilePath $installedExe -ArgumentList '--smoke-test' -PassThru
+          if (-not $smoke.WaitForExit(30000)) {
+            Stop-Process -Id $smoke.Id -Force -ErrorAction SilentlyContinue
+            throw 'installed Aurora.exe --smoke-test exceeded 30 seconds'
+          }
+          $smoke.Refresh()
+          if ($smoke.ExitCode -ne 0) {
+            $detail = if (Test-Path -LiteralPath $installedSmokeReport -PathType Leaf) {
+              Get-Content -LiteralPath $installedSmokeReport -Raw
+            } else {
+              'No installed application smoke report was produced.'
+            }
+            throw "installed Aurora.exe --smoke-test exited with code $($smoke.ExitCode)`n$detail"
+          }
+
+          $uninstallers = @(Get-ChildItem -LiteralPath $installDir -Filter 'Uninstall*.exe' -File)
+          if ($uninstallers.Count -ne 1) {
+            throw "expected exactly one Aurora uninstaller, found $($uninstallers.Count)"
+          }
+          $uninstall = Start-Process -FilePath $uninstallers[0].FullName -ArgumentList '/S' -PassThru
+          if (-not $uninstall.WaitForExit(60000)) {
+            Stop-Process -Id $uninstall.Id -Force -ErrorAction SilentlyContinue
+            throw 'silent uninstaller exceeded 60 seconds'
+          }
+          $uninstall.Refresh()
+          if ($uninstall.ExitCode -ne 0) {
+            throw "silent uninstaller exited with code $($uninstall.ExitCode)"
+          }
+          $uninstallDeadline = [DateTime]::UtcNow.AddSeconds(20)
+          while ((Test-Path -LiteralPath $installedExe) -and [DateTime]::UtcNow -lt $uninstallDeadline) {
+            Start-Sleep -Milliseconds 500
+          }
+          if (Test-Path -LiteralPath $installedExe) {
+            throw 'Aurora.exe remains after silent uninstall'
+          }
+
       - name: Generate installer SHA-256
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $releaseDir = Join-Path $PWD 'packages/desktop/release'
+          $releaseDir = Join-Path $PWD 'apps/windows/release'
           $installers = @(Get-ChildItem -LiteralPath $releaseDir -Filter 'Aurora-Setup-*.exe' -File)
           if ($installers.Count -ne 1) {
             throw "expected exactly one Aurora NSIS installer, found $($installers.Count)"
@@ -148,10 +218,10 @@ jobs:
         with:
           name: aurora-windows-x64-unsigned-${{ github.sha }}
           path: |
-            packages/desktop/release/Aurora-Setup-*.exe
-            packages/desktop/release/Aurora-Setup-*.exe.blockmap
-            packages/desktop/release/latest*.yml
-            packages/desktop/release/SHA256SUMS.txt
+            apps/windows/release/Aurora-Setup-*.exe
+            apps/windows/release/Aurora-Setup-*.exe.blockmap
+            apps/windows/release/latest*.yml
+            apps/windows/release/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 14
 

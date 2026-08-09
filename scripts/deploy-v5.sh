@@ -1753,7 +1753,7 @@ final="$root/$nonce"; tmp="$root/.tmp-$nonce"
 mkdir -m 700 "$tmp" "$tmp/source"
 rsync -a --delete \
   --exclude '.git' --exclude 'node_modules' --exclude 'data' --exclude '*.log' \
-  --exclude '.codex' --exclude 'packages/desktop' \
+  --exclude '.codex' --exclude 'apps/windows' --exclude 'packages/desktop' \
   "$remote_src/" "$tmp/source/"
 install -m 600 "$env_file" "$tmp/commercial-v5.env"
 for f in "/etc/systemd/system/$unit" "/etc/systemd/system/$unit.d/override.conf"; do
@@ -1904,7 +1904,7 @@ if [[ "$secure" == 1 ]]; then
   cp -al "$remote_src/." "$restore_dir/"
   rsync -a --delete \
     --exclude '.git' --exclude 'node_modules' --exclude 'data' --exclude '*.log' \
-    --exclude '.codex' --exclude 'packages/desktop' \
+    --exclude '.codex' --exclude 'apps/windows' --exclude 'packages/desktop' \
     "$bundle/source/" "$restore_dir/"
   install -m 600 "$bundle/commercial-v5.env" "$txn/old.env"
 
@@ -2113,7 +2113,8 @@ assert_gpt56_migration_ready() {
 }
 
 RSYNC_EXCLUDES=(--exclude '.git' --exclude 'node_modules' --exclude 'data'
-  --exclude '*.log' --exclude 'dist' --exclude '.codex' --exclude 'packages/desktop'
+  --exclude '*.log' --exclude 'dist' --exclude '.codex' --exclude 'apps/windows'
+  --exclude 'packages/desktop'
   --exclude 'VERSION.json')
 
 # 写 VERSION.json(gateway /version 读 cwd/VERSION.json)—— 灰度归属:channel + commit + builtAt。

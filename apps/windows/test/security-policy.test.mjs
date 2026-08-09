@@ -89,7 +89,10 @@ test('classifyTopLevelNavigation distinguishes same-origin, OAuth, external, and
   )
   assert.equal(classifyTopLevelNavigation({ ...base, targetUrl: oauthUrl() }), 'oauth')
   assert.equal(
-    classifyTopLevelNavigation({ ...base, targetUrl: oauthUrl('https://linear.app', connectorCallback) }),
+    classifyTopLevelNavigation({
+      ...base,
+      targetUrl: oauthUrl('https://linear.app', connectorCallback),
+    }),
     'oauth',
   )
   assert.equal(
@@ -99,8 +102,14 @@ test('classifyTopLevelNavigation distinguishes same-origin, OAuth, external, and
     }),
     'oauth',
   )
-  assert.equal(classifyTopLevelNavigation({ ...base, targetUrl: 'https://example.com/docs' }), 'external')
-  assert.equal(classifyTopLevelNavigation({ ...base, targetUrl: 'mailto:help@example.com' }), 'external')
+  assert.equal(
+    classifyTopLevelNavigation({ ...base, targetUrl: 'https://example.com/docs' }),
+    'external',
+  )
+  assert.equal(
+    classifyTopLevelNavigation({ ...base, targetUrl: 'mailto:help@example.com' }),
+    'external',
+  )
 
   for (const targetUrl of [
     'http://example.com/docs',
@@ -218,13 +227,19 @@ test('runtime appOrigin permits only explicit loopback origins in development po
 
 test('auth top-level navigation allows HTTPS redirects and separates callback from final landing', () => {
   const base = { windowKind: 'auth', currentUrl: 'https://github.com/login' }
-  assert.equal(classifyTopLevelNavigation({ ...base, targetUrl: 'https://github.com/session' }), 'allow')
+  assert.equal(
+    classifyTopLevelNavigation({ ...base, targetUrl: 'https://github.com/session' }),
+    'allow',
+  )
   assert.equal(
     classifyTopLevelNavigation({ ...base, targetUrl: `${githubCallback}?code=ok&state=state` }),
     'oauth-return',
   )
   assert.equal(
-    classifyTopLevelNavigation({ ...base, targetUrl: `${connectorCallback}?error=denied&state=state` }),
+    classifyTopLevelNavigation({
+      ...base,
+      targetUrl: `${connectorCallback}?error=denied&state=state`,
+    }),
     'oauth-return',
   )
   assert.equal(
@@ -268,11 +283,17 @@ test('OAuth return and final landing helpers enforce pinned origin and callback 
 test('classifyWindowOpen sends ordinary links external and only pinned blobs to a restricted viewer', () => {
   const base = { windowKind: 'main', currentUrl: `${PINNED_APP_ORIGIN}/chat` }
   assert.equal(
-    classifyWindowOpen({ ...base, targetUrl: 'blob:https://claudeai.chat/6e2c86ce-0c71-4f68-a529' }),
+    classifyWindowOpen({
+      ...base,
+      targetUrl: 'blob:https://claudeai.chat/6e2c86ce-0c71-4f68-a529',
+    }),
     'blob-view',
   )
   assert.equal(
-    classifyWindowOpen({ ...base, targetUrl: `${PINNED_APP_ORIGIN}/api/media-signed/file?sig=short` }),
+    classifyWindowOpen({
+      ...base,
+      targetUrl: `${PINNED_APP_ORIGIN}/api/media-signed/file?sig=short`,
+    }),
     'external',
   )
   assert.equal(classifyWindowOpen({ ...base, targetUrl: 'https://example.com/' }), 'external')
@@ -308,10 +329,7 @@ test('classifyPermission only grants exact-origin main-frame audio and sanitized
     isMainFrame: true,
   }
   assert.equal(classifyPermission({ ...base, permission: 'media', mediaTypes: ['audio'] }), 'allow')
-  assert.equal(
-    classifyPermission({ ...base, permission: 'clipboard-sanitized-write' }),
-    'allow',
-  )
+  assert.equal(classifyPermission({ ...base, permission: 'clipboard-sanitized-write' }), 'allow')
 
   for (const candidate of [
     { ...base, permission: 'media', mediaTypes: [] },
@@ -321,10 +339,30 @@ test('classifyPermission only grants exact-origin main-frame audio and sanitized
     { ...base, permission: 'fullscreen' },
     { ...base, permission: 'media', mediaTypes: ['audio'], isMainWindow: false },
     { ...base, permission: 'media', mediaTypes: ['audio'], isMainFrame: false },
-    { ...base, permission: 'media', mediaTypes: ['audio'], requestingOrigin: 'https://claudeai.chat:444' },
-    { ...base, permission: 'media', mediaTypes: ['audio'], requestingOrigin: 'https://claudeai.chat/path' },
-    { ...base, permission: 'media', mediaTypes: ['audio'], embeddingOrigin: 'https://claudeai.chat.evil.test' },
-    { ...base, permission: 'media', mediaTypes: ['audio'], embeddingOrigin: 'https://сlaudeai.chat' },
+    {
+      ...base,
+      permission: 'media',
+      mediaTypes: ['audio'],
+      requestingOrigin: 'https://claudeai.chat:444',
+    },
+    {
+      ...base,
+      permission: 'media',
+      mediaTypes: ['audio'],
+      requestingOrigin: 'https://claudeai.chat/path',
+    },
+    {
+      ...base,
+      permission: 'media',
+      mediaTypes: ['audio'],
+      embeddingOrigin: 'https://claudeai.chat.evil.test',
+    },
+    {
+      ...base,
+      permission: 'media',
+      mediaTypes: ['audio'],
+      embeddingOrigin: 'https://сlaudeai.chat',
+    },
   ]) {
     assert.equal(classifyPermission(candidate), 'deny', JSON.stringify(candidate))
   }
@@ -377,12 +415,28 @@ test('downloadRisk catches executable and script extensions after Windows normal
     'shortcut.lnk',
     'screensaver.scr',
     'macro.docm',
+    '.exe',
+    '.ps1',
+    'module.cjs',
+    'module.mjs',
+    'script.py',
+    'script.pyw',
+    'profile.pssc',
+    'types.cdxml',
+    'macro.xlsb',
     'fullwidth．ｅｘｅ',
     'photo\u202Egnp.exe',
   ]) {
     assert.equal(downloadRisk(filename), 'dangerous', filename)
   }
-  for (const filename of ['report.pdf', 'photo.png', 'archive.zip', 'notes.txt', 'COM10.log']) {
+  for (const filename of [
+    'report.pdf',
+    'photo.png',
+    'archive.zip',
+    'notes.txt',
+    '.txt',
+    'COM10.log',
+  ]) {
     assert.equal(downloadRisk(filename), 'safe', filename)
   }
 })

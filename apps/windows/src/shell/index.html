@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>OpenClaude Aurora</title>
+    <link rel="stylesheet" href="app://aurora-shell/shell.css" />
+    <script type="module" src="app://aurora-shell/shell.mjs"></script>
+  </head>
+  <body data-shell-mode="toolbar">
+    <header class="command-surface" aria-label="OpenClaude 桌面命令栏">
+      <div class="brand" aria-label="OpenClaude Aurora">
+        <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M12 2.5c2.2 0 3.9 2 3.5 4.2l-.4 2.1 2.1-.4c2.2-.4 4.2 1.3 4.2 3.5s-2 3.9-4.2 3.5l-2.1-.4.4 2.1c.4 2.2-1.3 4.2-3.5 4.2s-3.9-2-3.5-4.2l.4-2.1-2.1.4c-2.2.4-4.2-1.3-4.2-3.5s2-3.9 4.2-3.5l2.1.4-.4-2.1C8.1 4.5 9.8 2.5 12 2.5Z" />
+          <circle cx="12" cy="12" r="2.2" />
+        </svg>
+        <span class="brand-name">Aurora</span>
+        <span class="desktop-label">Windows</span>
+      </div>
+
+      <nav class="command-group" aria-label="浏览导航">
+        <button id="back-button" class="icon-button" type="button" aria-label="后退" title="后退 (Alt+左箭头)" disabled>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m14.8 5.8-6.2 6.2 6.2 6.2" /></svg>
+        </button>
+        <button id="forward-button" class="icon-button" type="button" aria-label="前进" title="前进 (Alt+右箭头)" disabled>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9.2 5.8 6.2 6.2-6.2 6.2" /></svg>
+        </button>
+        <button id="reload-button" class="icon-button" type="button" aria-label="刷新" title="刷新 (Ctrl+R)">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 8.5V4m0 0h-4.5M19 4l-3.2 3.2A7 7 0 1 0 19 15" /></svg>
+        </button>
+        <button id="home-button" class="icon-button" type="button" aria-label="主页" title="返回 Aurora 主页">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 10 8-6.5 8 6.5v9.5h-5v-6h-6v6H4Z" /></svg>
+        </button>
+      </nav>
+
+      <div class="command-spacer" aria-hidden="true"></div>
+
+      <div id="connection-status" class="connection-status" role="status" aria-live="polite" aria-atomic="true">
+        <span class="status-dot" aria-hidden="true"></span>
+        <span id="connection-label">正在连接</span>
+      </div>
+
+      <button
+        id="downloads-button"
+        class="downloads-button"
+        type="button"
+        aria-label="下载"
+        aria-expanded="false"
+        aria-controls="downloads-dialog"
+        title="查看下载"
+      >
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M12 3v11m0 0 4-4m-4 4-4-4M5 19h14" />
+        </svg>
+        <span class="downloads-text">下载</span>
+        <span id="downloads-badge" class="badge" aria-hidden="true" hidden>0</span>
+      </button>
+
+      <div id="loading-track" class="loading-track" aria-hidden="true" hidden>
+        <span></span>
+      </div>
+    </header>
+
+    <div id="downloads-layer" class="downloads-layer" hidden>
+      <button id="downloads-scrim" class="downloads-scrim" type="button" tabindex="-1" aria-label="关闭下载面板"></button>
+      <section
+        id="downloads-dialog"
+        class="downloads-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="downloads-heading"
+        tabindex="-1"
+      >
+        <header class="drawer-header">
+          <div>
+            <p class="eyebrow">本机文件</p>
+            <h1 id="downloads-heading">下载</h1>
+          </div>
+          <div class="drawer-actions">
+            <button id="open-downloads-folder" class="text-button" type="button">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 7.5h6l2-2h9v13h-17Z" /></svg>
+              打开文件夹
+            </button>
+            <button id="downloads-close" class="icon-button" type="button" aria-label="关闭下载面板" title="关闭 (Esc)">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" /></svg>
+            </button>
+          </div>
+        </header>
+        <div id="downloads-empty" class="empty-state">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v10m0 0 3.5-3.5M12 13 8.5 9.5M5 18.5h14" /></svg>
+          <p>下载的文件会显示在这里。</p>
+        </div>
+        <ol id="downloads-list" class="downloads-list" aria-label="下载记录"></ol>
+      </section>
+    </div>
+
+    <main id="offline-workspace" class="offline-workspace" hidden>
+      <section class="offline-card" aria-labelledby="offline-title">
+        <div class="offline-symbol" aria-hidden="true">
+          <svg viewBox="0 0 32 32"><path d="M5 11.5A14 14 0 0 1 27 10m-18 6a9.5 9.5 0 0 1 13.7-.2M13 21a4.7 4.7 0 0 1 5.8-.1M4 4l24 24" /></svg>
+        </div>
+        <p class="eyebrow">Aurora Windows</p>
+        <h1 id="offline-title">暂时无法连接</h1>
+        <p id="offline-message" class="offline-message">请检查网络连接，然后重试。</p>
+        <button id="offline-retry" class="primary-button" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 8.5V4m0 0h-4.5M19 4l-3.2 3.2A7 7 0 1 0 19 15" /></svg>
+          重新连接
+        </button>
+        <p id="offline-network" class="offline-network" role="status" aria-live="polite">正在检查网络状态</p>
+      </section>
+    </main>
+  </body>
+</html>
