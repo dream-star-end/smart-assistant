@@ -298,6 +298,22 @@ export interface JsonRpcCallError extends Error {
   rpcMethod: string
 }
 
+type TurnCompletion = {
+  id?: string
+  status?: string
+  durationMs?: number
+  error?: { message?: string }
+}
+
+type PendingInterrupt = {
+  targetTurnId: string
+  terminal: Promise<TurnCompletion>
+  resolveTerminal: (turn: TurnCompletion) => void
+  rejectTerminal: (err: Error) => void
+  terminalSettled: boolean
+  bufferedTerminalById: Map<string, TurnCompletion>
+}
+
 /** Detect codex's "thread/resume against a thread whose rollout is no longer
  *  on disk" failure mode. Triggered when v3 commercial containers idle-rebuild
  *  and their `~/.codex/sessions/...` JSONL is wiped while master gateway still
@@ -322,6 +338,22 @@ export function isMissingRolloutError(err: unknown): err is JsonRpcCallError {
     typeof e.rpcMessage === 'string' &&
     /no rollout found/i.test(e.rpcMessage)
   )
+}
+
+function activeTurnIdFromInterruptMismatch(err: unknown): string | null {
+  if (!(err instanceof Error)) return null
+  const e = err as Partial<JsonRpcCallError>
+  if (
+    e.rpcMethod !== 'turn/interrupt' ||
+    e.rpcCode !== -32600 ||
+    typeof e.rpcMessage !== 'string'
+  ) {
+    return null
+  }
+  const match = /^expected active turn id `?([^`\s]+)`? but found `?([^`\s]+)`?$/i.exec(
+    e.rpcMessage,
+  )
+  return match?.[2] ?? null
 }
 
 /** Runner message shape used by sessionManager.ts (subset of SdkMessage). */
@@ -527,6 +559,12 @@ export class CodexAppServerRunner extends EventEmitter {
     resolve: (turn: { status?: string; durationMs?: number; error?: { message?: string } }) => void
     reject: (err: Error) => void
   } | null = null
+  /** Coordinates one bounded interrupt reconciliation at a time. Codex can
+   *  report a different active turn after a resumed goal turn races an
+   *  explicit turn/start. Terminal notifications are buffered only for the
+   *  lifetime of this reconciliation so a response+notification delivered in
+   *  one stdout chunk cannot strand either waiter. */
+  private pendingInterrupt: PendingInterrupt | null = null
   private stdoutBuf = ''
   /** Accumulated assistant text for the current turn — used to dedupe
    *  imageGeneration savedPath emissions against text the model already
@@ -603,10 +641,8 @@ export class CodexAppServerRunner extends EventEmitter {
   interrupt(): boolean {
     if (!this.proc || this.proc.killed) return false
     if (!this.threadId || !this.activeTurnId) return false
-    void this.sendRequest('turn/interrupt', {
-      threadId: this.threadId,
-      turnId: this.activeTurnId,
-    }).catch((err) => {
+    if (this.pendingInterrupt) return true
+    void this.interruptAndWaitForTerminal(this.activeTurnId, 'public').catch((err) => {
       // Common case: the turn already completed between us deciding to
       // interrupt and the request landing. Codex returns -32602/etc — we
       // log at warn and move on; runTurn will settle via turn/completed
@@ -822,6 +858,7 @@ export class CodexAppServerRunner extends EventEmitter {
       this.currentTurnCompleter.reject(new Error('CodexAppServerRunner shutdown'))
       this.currentTurnCompleter = null
     }
+    this.rejectPendingInterrupt(new Error('CodexAppServerRunner shutdown'))
     this.activeTurnId = null
     this.initialized = false
     this.attached = false
@@ -1085,6 +1122,105 @@ export class CodexAppServerRunner extends EventEmitter {
       this.currentTurnCompleter.reject(new Error(reason))
       this.currentTurnCompleter = null
     }
+    this.rejectPendingInterrupt(new Error(reason))
+  }
+
+  private rejectPendingInterrupt(err: Error): void {
+    const pending = this.pendingInterrupt
+    if (!pending) return
+    this.pendingInterrupt = null
+    if (!pending.terminalSettled) {
+      pending.terminalSettled = true
+      pending.rejectTerminal(err)
+    }
+    pending.bufferedTerminalById.clear()
+  }
+
+  private dispatchTurnCompleted(turn: TurnCompletion): void {
+    const tid = typeof turn.id === 'string' ? turn.id : undefined
+    const pendingInterrupt = this.pendingInterrupt
+    if (pendingInterrupt && tid) {
+      if (tid !== pendingInterrupt.targetTurnId) {
+        pendingInterrupt.bufferedTerminalById.set(tid, turn)
+        return
+      }
+      if (!pendingInterrupt.terminalSettled) {
+        pendingInterrupt.terminalSettled = true
+        pendingInterrupt.resolveTerminal(turn)
+      }
+    }
+
+    if (tid && this.activeTurnId && tid !== this.activeTurnId) return
+    if (this.currentTurnCompleter) {
+      this.currentTurnCompleter.resolve(turn)
+      this.currentTurnCompleter = null
+    }
+  }
+
+  private async interruptAndWaitForTerminal(
+    initialTurnId: string,
+    mode: 'public' | 'orphan',
+  ): Promise<void> {
+    if (!this.threadId) throw new Error('cannot interrupt without thread id')
+    if (this.pendingInterrupt) {
+      await this.pendingInterrupt.terminal
+      return
+    }
+
+    let resolveTerminal!: (turn: TurnCompletion) => void
+    let rejectTerminal!: (err: Error) => void
+    const terminal = new Promise<TurnCompletion>((resolve, reject) => {
+      resolveTerminal = resolve
+      rejectTerminal = reject
+    })
+    // A request failure can occur before this method reaches `await terminal`.
+    // Attach a rejection observer now so shutdown/proc-close cleanup never
+    // creates an unhandled rejection.
+    void terminal.catch(() => {})
+    const pending: PendingInterrupt = {
+      targetTurnId: initialTurnId,
+      terminal,
+      resolveTerminal,
+      rejectTerminal,
+      terminalSettled: false,
+      bufferedTerminalById: new Map(),
+    }
+    this.pendingInterrupt = pending
+
+    try {
+      try {
+        await this.sendRequest('turn/interrupt', {
+          threadId: this.threadId,
+          turnId: initialTurnId,
+        })
+      } catch (err) {
+        const actualTurnId = activeTurnIdFromInterruptMismatch(err)
+        if (!actualTurnId || actualTurnId === initialTurnId) throw err
+
+        pending.targetTurnId = actualTurnId
+        if (mode === 'public') this.activeTurnId = actualTurnId
+        const buffered = pending.bufferedTerminalById.get(actualTurnId)
+        if (buffered) {
+          pending.bufferedTerminalById.delete(actualTurnId)
+          this.dispatchTurnCompleted(buffered)
+        } else {
+          await this.sendRequest('turn/interrupt', {
+            threadId: this.threadId,
+            turnId: actualTurnId,
+          })
+        }
+      }
+      await terminal
+    } catch (err) {
+      if (!pending.terminalSettled) {
+        pending.terminalSettled = true
+        pending.rejectTerminal(err as Error)
+      }
+      throw err
+    } finally {
+      if (this.pendingInterrupt === pending) this.pendingInterrupt = null
+      pending.bufferedTerminalById.clear()
+    }
   }
 
   private writeRaw(line: string): void {
@@ -1266,6 +1402,13 @@ export class CodexAppServerRunner extends EventEmitter {
     const p = params as Record<string, unknown>
     const turnId = typeof p.turnId === 'string' ? p.turnId : undefined
 
+    if (method === 'turn/completed') {
+      const turn = p.turn as TurnCompletion | undefined
+      if (!turn) return
+      this.dispatchTurnCompleted(turn)
+      return
+    }
+
     // Filter turn-scoped notifications. codex may emit notifications for
     // system-internal turns (compaction, hooks) that the client should ignore.
     //
@@ -1387,23 +1530,6 @@ export class CodexAppServerRunner extends EventEmitter {
           this.inflightItemHandlers.delete(p$)
         })
       this.inflightItemHandlers.add(p$)
-      return
-    }
-    if (method === 'turn/completed') {
-      // Per schema: { threadId, turn: { id, status, durationMs, error? } }
-      const turn = p.turn as Record<string, unknown> | undefined
-      if (!turn) return
-      // Defensive: even though we already filtered turnId above (via top-level
-      // p.turnId), turn.id is the authoritative id on this notification —
-      // re-check.
-      const tid = typeof turn.id === 'string' ? turn.id : undefined
-      if (tid && this.activeTurnId && tid !== this.activeTurnId) return
-      if (this.currentTurnCompleter) {
-        this.currentTurnCompleter.resolve(
-          turn as Parameters<typeof this.currentTurnCompleter.resolve>[0],
-        )
-        this.currentTurnCompleter = null
-      }
       return
     }
     // Other notifications (turn/started, config-warning, etc.)
@@ -1742,13 +1868,24 @@ export class CodexAppServerRunner extends EventEmitter {
       await this._startNewThread()
     } else {
       try {
-        await this.sendRequest('thread/resume', {
+        const resumed = (await this.sendRequest('thread/resume', {
           threadId: this.threadId,
           approvalPolicy: 'never',
           sandbox: 'danger-full-access',
           cwd: this.opts.cwd,
           ...(this.opts.model ? { model: this.opts.model } : {}),
-        })
+        })) as { thread?: { turns?: Array<{ id?: string; status?: string }> } } | undefined
+        const turns = Array.isArray(resumed?.thread?.turns) ? resumed.thread.turns : []
+        const orphan = [...turns]
+          .reverse()
+          .find((turn) => turn?.status === 'inProgress' && typeof turn.id === 'string')
+        if (orphan?.id) {
+          log.warn('codex thread/resume found orphan active turn — interrupting before retry', {
+            sessionKey: this.opts.sessionKey,
+            turnId: orphan.id,
+          })
+          await this.interruptAndWaitForTerminal(orphan.id, 'orphan')
+        }
       } catch (err) {
         // Self-heal "no rollout found for thread id" (-32600). Caused by
         // master sessionManager persisting `thread_id` across container
