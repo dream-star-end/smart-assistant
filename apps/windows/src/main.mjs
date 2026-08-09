@@ -1019,23 +1019,43 @@ async function runSmokeContract() {
     'trusted shell did not receive an initial state snapshot',
   )
 
+  await shellContents.executeJavaScript(`(() => {
+    window.__auroraReducedTransparencyProbe = new Promise((resolve, reject) => {
+      let timer
+      const observer = new MutationObserver(() => capture())
+      const capture = () => {
+        if (document.documentElement.dataset.reduceTransparency !== 'true') return
+        const style = getComputedStyle(document.querySelector('.command-surface'))
+        observer.disconnect()
+        clearTimeout(timer)
+        resolve({
+          attribute: document.documentElement.dataset.reduceTransparency,
+          backdropFilter: style.backdropFilter,
+          backgroundColor: style.backgroundColor,
+        })
+      }
+      observer.observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ['data-reduce-transparency'],
+      })
+      timer = setTimeout(() => {
+        observer.disconnect()
+        reject(new Error('reduced-transparency state was not observed'))
+      }, 2000)
+      capture()
+    })
+  })()`)
   shellContents.send(IPC_CHANNELS.state, {
     ...shellStateSnapshot(),
     theme: { mode: 'dark', forcedColors: false, reduceTransparency: true },
   })
-  await waitForCondition(
-    () =>
-      shellContents.executeJavaScript(
-        "document.documentElement.dataset.reduceTransparency === 'true'",
-      ),
-    'shell did not apply reduced-transparency state',
+  const reducedTransparencyStyle = await shellContents.executeJavaScript(
+    'window.__auroraReducedTransparencyProbe',
   )
-  const reducedTransparencyStyle = await shellContents.executeJavaScript(`(() => {
-    const style = getComputedStyle(document.querySelector('.command-surface'))
-    return { backdropFilter: style.backdropFilter, backgroundColor: style.backgroundColor }
-  })()`)
+  assert.equal(reducedTransparencyStyle.attribute, 'true')
   assert.equal(reducedTransparencyStyle.backdropFilter, 'none')
   assert.notEqual(reducedTransparencyStyle.backgroundColor, 'rgba(0, 0, 0, 0)')
+  await shellContents.executeJavaScript('delete window.__auroraReducedTransparencyProbe')
 
   shellContents.send(IPC_CHANNELS.state, {
     ...shellStateSnapshot(),
