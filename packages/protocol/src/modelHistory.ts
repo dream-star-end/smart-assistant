@@ -42,6 +42,147 @@ const MODEL_HISTORY_SEMANTIC_ROLES = new Set<ModelHistorySemanticRole>([
 
 type UnknownRecord = Record<string, unknown>
 
+const DATA_URI_PREFIX = 'data:'
+const DATA_URI_BASE64_SEPARATOR = ';base64,'
+
+function isBase64Character(char: string): boolean {
+  const code = char.charCodeAt(0)
+  return (
+    (code >= 0x41 && code <= 0x5a) ||
+    (code >= 0x61 && code <= 0x7a) ||
+    (code >= 0x30 && code <= 0x39) ||
+    char === '+' || char === '/' || char === '-' || char === '_' || char === '='
+  )
+}
+
+function binaryProjectionMarker(mediaType: string, base64Characters: number): string {
+  const approximateBytes = Math.max(0, Math.floor(base64Characters * 3 / 4))
+  return `[binary ${mediaType || 'application/octet-stream'} omitted from model context; base64_chars=${base64Characters}; approx_bytes=${approximateBytes}]`
+}
+
+function isExplicitBase64Payload(value: string): boolean {
+  if (!value) return false
+  for (let index = 0; index < value.length; index += 1) {
+    if (!isBase64Character(value[index]!)) return false
+  }
+  return true
+}
+
+function boundedIndexOf(text: string, needle: string, start: number, maxDistance: number): number {
+  const end = Math.min(text.length - needle.length, start + maxDistance)
+  for (let index = start; index <= end; index += 1) {
+    if (text.startsWith(needle, index)) return index
+  }
+  return -1
+}
+
+/** Replace only explicit data:...;base64 payloads. The scanner is linear and
+ * deliberately does not guess that an unlabelled long ASCII run is binary. */
+function sanitizeExplicitDataUris(text: string): string {
+  let cursor = 0
+  let out = ''
+  for (;;) {
+    const start = text.indexOf(DATA_URI_PREFIX, cursor)
+    if (start < 0) return out ? out + text.slice(cursor) : text
+    const separator = boundedIndexOf(
+      text,
+      DATA_URI_BASE64_SEPARATOR,
+      start + DATA_URI_PREFIX.length,
+      256,
+    )
+    if (separator < 0) {
+      out += text.slice(cursor, start + DATA_URI_PREFIX.length)
+      cursor = start + DATA_URI_PREFIX.length
+      continue
+    }
+    const mediaType = text.slice(start + DATA_URI_PREFIX.length, separator)
+    if (!mediaType || /[\s"'<>]/.test(mediaType)) {
+      out += text.slice(cursor, start + DATA_URI_PREFIX.length)
+      cursor = start + DATA_URI_PREFIX.length
+      continue
+    }
+    let end = separator + DATA_URI_BASE64_SEPARATOR.length
+    while (end < text.length && isBase64Character(text[end]!)) end += 1
+    const payloadStart = separator + DATA_URI_BASE64_SEPARATOR.length
+    if (end === payloadStart) {
+      out += text.slice(cursor, payloadStart)
+      cursor = payloadStart
+      continue
+    }
+    out += text.slice(cursor, start)
+    out += binaryProjectionMarker(mediaType, end - payloadStart)
+    cursor = end
+  }
+}
+
+function serializedForModel(value: unknown): string {
+  if (value === undefined || value === null) return ''
+  if (typeof value === 'string') return sanitizeExplicitDataUris(value)
+  return JSON.stringify(value, function (key, child) {
+    if (typeof child !== 'string') return child
+    const parent = this as UnknownRecord
+    if (
+      key === 'data' &&
+      parent.type === 'base64' &&
+      isExplicitBase64Payload(child)
+    ) {
+      return binaryProjectionMarker(
+        typeof parent.media_type === 'string' ? parent.media_type : 'application/octet-stream',
+        child.length,
+      )
+    }
+    return sanitizeExplicitDataUris(child)
+  }) ?? ''
+}
+
+/** Sanitize immutable sidecars written before binary projection existed.
+ * Only compact JSON objects with an explicit type=base64 + data field are
+ * recognized. A SQL suffix that starts mid-payload is intentionally retained;
+ * the byte-worst model budget still guarantees that it cannot overfill. */
+export function sanitizePersistedModelHistoryText(text: string): string {
+  const replacements: Array<{ start: number; end: number; marker: string }> = []
+  let cursor = 0
+  const typeNeedle = '"type":"base64"'
+  const dataNeedle = '"data":"'
+  while (cursor < text.length) {
+    const typeAt = text.indexOf(typeNeedle, cursor)
+    if (typeAt < 0) break
+    const dataAt = boundedIndexOf(text, dataNeedle, typeAt + typeNeedle.length, 512)
+    if (dataAt < 0) {
+      cursor = typeAt + typeNeedle.length
+      continue
+    }
+    if (text.slice(typeAt + typeNeedle.length, dataAt).includes('}')) {
+      cursor = typeAt + typeNeedle.length
+      continue
+    }
+    const payloadStart = dataAt + dataNeedle.length
+    let payloadEnd = payloadStart
+    while (payloadEnd < text.length && isBase64Character(text[payloadEnd]!)) payloadEnd += 1
+    if (payloadEnd > payloadStart && text[payloadEnd] === '"') {
+      const localPrefix = text.slice(typeAt, dataAt)
+      const mediaMatch = localPrefix.match(/"media_type":"([^"\\]{1,128})"/)
+      replacements.push({
+        start: payloadStart,
+        end: payloadEnd,
+        marker: binaryProjectionMarker(mediaMatch?.[1] ?? 'application/octet-stream', payloadEnd - payloadStart),
+      })
+      cursor = payloadEnd
+      continue
+    }
+    cursor = typeAt + typeNeedle.length
+  }
+  if (replacements.length === 0) return sanitizeExplicitDataUris(text)
+  const parts: string[] = []
+  let copyFrom = 0
+  for (const replacement of replacements) {
+    parts.push(text.slice(copyFrom, replacement.start), replacement.marker)
+    copyFrom = replacement.end
+  }
+  parts.push(text.slice(copyFrom))
+  return sanitizeExplicitDataUris(parts.join(''))
+}
+
 function asRecord(value: unknown): UnknownRecord | null {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
     ? value as UnknownRecord
@@ -62,9 +203,7 @@ function textContent(message: UnknownRecord): string {
 }
 
 function serialized(value: unknown): string {
-  if (value === undefined || value === null) return ''
-  if (typeof value === 'string') return value
-  return JSON.stringify(value) ?? ''
+  return serializedForModel(value)
 }
 
 function appendSection(parts: string[], label: string, value: unknown): void {
@@ -130,12 +269,14 @@ export function modelHistorySemanticRole(value: unknown): ModelHistorySemanticRo
 }
 
 /**
- * Serialize the complete semantic facts of one browser-visible record.
+ * Serialize the model-useful semantic facts of one browser-visible record.
  *
  * This is intentionally not a UI projection or a summary. Tool input/output,
- * structured plans/goals and delegate child results are copied exactly into a
+ * structured plans/goals and delegate child results are copied into a
  * deterministic textual envelope so a CCB↔Codex switch does not make the new
- * runner redo completed work. The later model-window selector may retain an
+ * runner redo completed work. Explicit opaque binary bytes are represented by
+ * deterministic size/type markers; their exact payload remains in the
+ * immutable browser/audit tape. The later model-window selector may retain an
  * explicitly labelled exact suffix solely when the physical provider context
  * cannot hold the whole transcript; browser history remains untouched.
  */
@@ -228,6 +369,13 @@ export function estimateModelHistoryTokens(text: string): number {
     else nonAscii += 1
   }
   return Math.ceil(ascii / 4) + nonAscii
+}
+
+/** Conservative tokenizer-independent upper bound used when a transcript is
+ * rebuilt as one synthetic prompt. Byte-level tokenizers cannot emit more
+ * tokens than the UTF-8 bytes supplied to them. */
+export function estimateModelHistoryUtf8Bytes(text: string): number {
+  return new TextEncoder().encode(text).byteLength
 }
 
 /** Resolve the executable context window used for model-history transport. */

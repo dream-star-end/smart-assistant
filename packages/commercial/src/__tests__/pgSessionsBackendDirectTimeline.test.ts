@@ -173,6 +173,98 @@ test("finite model context reads immutable semantic sidecars including exact Bas
   assert.equal(sqlCalls.some((sql) => sql.includes("client_session_turn_tape_records")), false);
 });
 
+test("CCB finite rebuild budgets dense ASCII by UTF-8 worst case without changing exact tape payloads", async () => {
+  const base64 = "A".repeat(64 * 1024);
+  const denseAscii = `recent-${"x".repeat(20_000)}-tail`;
+  const legacyImage = `Output: {"source":{"type":"base64","media_type":"image/jpeg","data":"${base64}"},"caption":"keep-caption"}`;
+  const rows = [
+    { physical_ordinal: 1, logical_ordinal: 0, msg_id: "dense", role: "assistant", token_estimate: 5_003, ts: "102", client_message_id: null },
+    { physical_ordinal: 0, logical_ordinal: 0, msg_id: "legacy-image", role: "tool", token_estimate: 16_410, ts: "101", client_message_id: null },
+  ];
+  const fakePool = {
+    query: async (sql: string, params?: unknown[]) => {
+      if (sql.includes("SELECT messages, archived_through_seq FROM client_sessions")) {
+        return { rows: [{ messages: JSON.stringify([completeTapeAnchor()]), archived_through_seq: 0 }] };
+      }
+      if (sql.includes("SELECT tape_sha256,model_record_count")) {
+        return { rows: [{ tape_sha256: "a".repeat(64), model_record_count: rows.length }] };
+      }
+      if (sql.includes("ORDER BY physical_ordinal DESC,logical_ordinal DESC")) return { rows };
+      if (sql.includes("SELECT right(semantic_text")) {
+        const source = Number(params?.[3]) === 1 ? denseAscii : legacyImage;
+        return { rows: [{ semantic_text: source.slice(-Number(params?.[5])) }] };
+      }
+      if (sql.includes("SELECT semantic_text FROM client_session_turn_tape_model_records")) {
+        return { rows: [{ semantic_text: Number(params?.[3]) === 1 ? denseAscii : legacyImage }] };
+      }
+      if (sql.includes("FROM client_session_archive_chunks")) return { rows: [] };
+      throw new Error(`unexpected query: ${sql}`);
+    },
+  } as unknown as Pool;
+  const backend = createPgSessionsBackend(fakePool, { expectedGeneration: 0 });
+
+  const contextWindow = 34_400;
+  const currentUserText = "继续 dense ASCII task";
+  const context = await backend.getEngineContextMessages("session-1", "c:1", {
+    contextWindow,
+    engine: "ccb",
+    currentUserText,
+  });
+  const rebuiltBytes = Buffer.byteLength(
+    (context ?? []).map((row) => String(row.text ?? "")).join("\n\n"),
+    "utf8",
+  );
+  assert.ok(rebuiltBytes <= contextWindow - 33_256 - Buffer.byteLength(currentUserText, "utf8"));
+  assert.match(String(context?.at(-1)?.text), /-tail$/);
+
+  const exactVisible = userVisibleTapeRecord({
+    id: "legacy-image", role: "tool", toolName: "Read", output: legacyImage,
+  });
+  assert.match(JSON.stringify(exactVisible), new RegExp(`A{${base64.length}}`),
+    "browser/audit projection keeps the exact binary payload");
+});
+
+test("finite rebuild sanitizes a complete legacy Base64 sidecar before model injection", async () => {
+  const base64 = "A".repeat(4_096);
+  const legacyImage = `Output: {"source":{"type":"base64","media_type":"image/jpeg","data":"${base64}"},"caption":"keep-caption"}`;
+  const fakePool = {
+    query: async (sql: string) => {
+      if (sql.includes("SELECT messages, archived_through_seq FROM client_sessions")) {
+        return { rows: [{ messages: JSON.stringify([completeTapeAnchor()]), archived_through_seq: 0 }] };
+      }
+      if (sql.includes("SELECT tape_sha256,model_record_count")) {
+        return { rows: [{ tape_sha256: "a".repeat(64), model_record_count: 1 }] };
+      }
+      if (sql.includes("ORDER BY physical_ordinal DESC,logical_ordinal DESC")) {
+        return { rows: [{
+          physical_ordinal: 0,
+          logical_ordinal: 0,
+          msg_id: "legacy-image",
+          role: "tool",
+          token_estimate: 1_040,
+          ts: "101",
+          client_message_id: null,
+        }] };
+      }
+      if (sql.includes("SELECT semantic_text FROM client_session_turn_tape_model_records")) {
+        return { rows: [{ semantic_text: legacyImage }] };
+      }
+      if (sql.includes("FROM client_session_archive_chunks")) return { rows: [] };
+      throw new Error(`unexpected query: ${sql}`);
+    },
+  } as unknown as Pool;
+  const backend = createPgSessionsBackend(fakePool, { expectedGeneration: 0 });
+  const context = await backend.getEngineContextMessages("session-1", "c:1", {
+    contextWindow: 40_000,
+    engine: "ccb",
+    currentUserText: "继续",
+  });
+  const text = String(context?.[0]?.text);
+  assert.match(text, /binary image\/jpeg omitted from model context/);
+  assert.match(text, /keep-caption/);
+  assert.equal(text.includes(base64), false);
+});
+
 test("finite model context selects a Unicode-safe SQL suffix without loading a giant semantic row", async () => {
   const sqlCalls: Array<{ sql: string; params?: unknown[] }> = [];
   const exactTail = `${"末".repeat(300)}😀END`;

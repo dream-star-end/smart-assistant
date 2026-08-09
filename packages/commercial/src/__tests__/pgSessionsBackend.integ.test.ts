@@ -5530,17 +5530,20 @@ function directTape(
     structuredBlocks?: Array<Record<string, unknown>>;
     assistantSegments?: Array<{ index: number; text: string; ts: number; eventOrdinal?: number }>;
     turnIndex?: number;
+    status?: "completed" | "interrupted" | "crashed";
+    errorCode?: string;
   } = {},
 ) {
   return buildTape({
     sessionId,
     agentId: "main",
     turnIndex: over.turnIndex ?? 1,
-    status: "completed",
+    status: over.status ?? "completed",
     turnKey,
     text: over.text ?? "最终回答",
     createdAt: over.createdAt ?? 1_783_944_000_000,
     usage: { inputTokens: 1, outputTokens: 2 },
+    ...(over.errorCode !== undefined ? { errorCode: over.errorCode } : {}),
     ...(over.clientMessageId !== undefined ? { clientMessageId: over.clientMessageId } : {}),
     ...(over.tools !== undefined ? { tools: over.tools } : {}),
     ...(over.thinkingText !== undefined ? { thinkingText: over.thinkingText } : {}),
@@ -5663,7 +5666,7 @@ describe("pgSessionsBackend direct turn timeline", () => {
     await assertSafeSidecars();
   });
 
-  maybe("Codex rebuilt history budgets dense ASCII at its byte-level worst case", async () => {
+  maybe("CCB and Codex rebuilt history budget dense ASCII at their byte-level worst case", async () => {
     const sessionId = "s-direct-codex-history-safety";
     const userId = "u-direct-codex-history-safety";
     const exactTail = "CODEX-HISTORY-TAIL";
@@ -5690,8 +5693,11 @@ describe("pgSessionsBackend direct turn timeline", () => {
     });
     const ccbTool = String(ccb?.find((message) => message.role === "tool")?.text ?? "");
     const codexTool = String(codex?.find((message) => message.role === "tool")?.text ?? "");
-    assert.ok(codexTool.length < ccbTool.length / 2);
+    assert.equal(ccbTool, codexTool);
+    assert.ok(codexTool.length < 40_000);
+    assert.match(ccbTool, new RegExp(exactTail));
     assert.match(codexTool, new RegExp(exactTail));
+    assert.equal(ccb?.at(-1)?.text, "final answer");
     assert.equal(codex?.at(-1)?.text, "final answer");
   });
 
@@ -6067,15 +6073,43 @@ describe("pgSessionsBackend direct turn timeline", () => {
     const exhaustedSessionId = "s-direct-exhausted-api-error";
     const exhaustedUserId = "u-direct-exhausted-api-error";
     await backend.upsertClientSession(mkSession({ id: exhaustedSessionId, userId: exhaustedUserId }));
-    const exhausted = directTape(exhaustedSessionId, "8".repeat(64), { text: recoveredError });
+    const exhaustedErrors = [
+      'API Error: 502 {"error":{"code":"UPSTREAM_ERROR"},"request_id":"attempt-1"}',
+      'API Error: 502 {"error":{"code":"UPSTREAM_ERROR"},"request_id":"attempt-2"}',
+      'API Error: 502 {"error":{"code":"UPSTREAM_ERROR"},"request_id":"terminal"}',
+    ];
+    const exhausted = directTape(exhaustedSessionId, "8".repeat(64), {
+      text: exhaustedErrors.join(""),
+      status: "crashed",
+      errorCode: "upstream_failed",
+      assistantSegments: exhaustedErrors.map((text, index) => ({
+        index,
+        text,
+        ts: 1_783_944_010_001 + index,
+        eventOrdinal: index + 1,
+      })),
+    });
     await stageAndFinalize(exhaustedUserId, exhausted);
     const exhaustedTimeline = await backend.getClientSession(
       exhaustedSessionId, exhaustedUserId, { view: "timeline" },
     );
     assert.ok(exhaustedTimeline);
-    assert.equal(browserVisibleTimeline(exhaustedTimeline.messages as MessageLike[]).some(
-      (message) => message.role === "assistant" && message.text === recoveredError), true,
-    "an unrecovered terminal API Error remains available to the terminal error surface");
+    assert.deepEqual(browserVisibleTimeline(exhaustedTimeline.messages as MessageLike[]).filter(
+      (message) => message.role === "assistant").map((message) => message.text),
+    [exhaustedErrors.at(-1)],
+    "only the terminal API Error remains available to the structured error surface");
+    const terminalVisible = browserVisibleTimeline(
+      exhaustedTimeline.messages as MessageLike[],
+    ).find((message) => message.role === "assistant");
+    assert.equal(terminalVisible?._errorCode, "upstream_failed");
+    const exhaustedRaw = await pool.query<{ semantic_text: string }>(
+      `SELECT semantic_text FROM client_session_turn_tape_model_records
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND role='assistant'
+        ORDER BY physical_ordinal`,
+      [exhaustedSessionId, exhaustedUserId, exhausted.finalize.tapeId],
+    );
+    assert.deepEqual(exhaustedRaw.rows.map((row) => row.semantic_text), exhaustedErrors,
+      "all failed attempts remain immutable audit evidence");
   });
 
   maybe("transport-only continuation rows never consume logical page slots or hide the real final answer", async () => {
