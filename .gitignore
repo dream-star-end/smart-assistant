@@ -26,3 +26,7 @@ packages/commercial/node-agent/node-agent*
 packages/**/dist-types/
 packages/**/*.tsbuildinfo
 commercial-unit.tap
+
+# Windows desktop local dependencies and installers
+packages/desktop/node_modules/
+packages/desktop/release/

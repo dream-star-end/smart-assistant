@@ -1,0 +1,40 @@
+appId: chat.claudeai.aurora
+productName: OpenClaude Aurora
+asar: true
+
+directories:
+  output: release
+  buildResources: ../web-react/public/icons
+
+files:
+  - src/**/*
+  - package.json
+
+win:
+  executableName: Aurora
+  target:
+    - target: nsis
+      arch:
+        - x64
+  icon: icon-512.png
+  artifactName: Aurora-Setup-${version}-${arch}.${ext}
+  forceCodeSigning: false
+  verifyUpdateCodeSignature: true
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: OpenClaude Aurora
+  deleteAppDataOnUninstall: false
+
+electronFuses:
+  runAsNode: false
+  enableCookieEncryption: true
+  enableNodeOptionsEnvironmentVariable: false
+  enableNodeCliInspectArguments: false
+  grantFileProtocolExtraPrivileges: false
+  enableEmbeddedAsarIntegrityValidation: true
+  onlyLoadAppFromAsar: true
