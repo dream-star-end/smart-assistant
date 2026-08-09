@@ -49,6 +49,7 @@ function initializeShell() {
   const bridge = globalThis.auroraDesktop
   const elements = {
     back: document.getElementById('back-button'),
+    commandSurface: document.querySelector('.command-surface'),
     connectionLabel: document.getElementById('connection-label'),
     connectionStatus: document.getElementById('connection-status'),
     downloadsBadge: document.getElementById('downloads-badge'),
@@ -284,6 +285,7 @@ function initializeShell() {
     document.documentElement.dataset.theme = state.theme.mode
     document.documentElement.dataset.forcedColors = String(state.theme.forcedColors)
     document.documentElement.dataset.reduceTransparency = String(state.theme.reduceTransparency)
+    elements.commandSurface.classList.toggle('reduce-transparency', state.theme.reduceTransparency)
     elements.back.disabled = !state.navigation.canGoBack
     elements.forward.disabled = !state.navigation.canGoForward
     renderConnection()

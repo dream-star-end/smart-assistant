@@ -1030,6 +1030,9 @@ async function runSmokeContract() {
         clearTimeout(timer)
         resolve({
           attribute: document.documentElement.dataset.reduceTransparency,
+          modifierClass: document
+            .querySelector('.command-surface')
+            .classList.contains('reduce-transparency'),
           backdropFilter: style.backdropFilter,
           backgroundColor: style.backgroundColor,
         })
@@ -1053,6 +1056,7 @@ async function runSmokeContract() {
     'window.__auroraReducedTransparencyProbe',
   )
   assert.equal(reducedTransparencyStyle.attribute, 'true')
+  assert.equal(reducedTransparencyStyle.modifierClass, true)
   assert.equal(reducedTransparencyStyle.backdropFilter, 'none')
   assert.notEqual(reducedTransparencyStyle.backgroundColor, 'rgba(0, 0, 0, 0)')
   await shellContents.executeJavaScript('delete window.__auroraReducedTransparencyProbe')
