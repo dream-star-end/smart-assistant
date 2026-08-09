@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { stat } from 'node:fs/promises'
+import { stat, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -1226,10 +1226,31 @@ async function runSmokeTest() {
     return 0
   } catch (error) {
     console.error('[windows] smoke failed:', error instanceof Error ? error.stack : error)
+    await writeSmokeFailureReport('smoke', error)
     if (isAlive(mainWindow)) mainWindow.close()
     return 1
   } finally {
     clearTimeout(timeout)
+  }
+}
+
+async function writeSmokeFailureReport(stage, error) {
+  if (!smokeTest) return
+  const reportPath = process.env.OPENCLAUDE_SMOKE_REPORT_PATH
+  if (typeof reportPath !== 'string' || reportPath.length === 0 || reportPath.length > 32_767)
+    return
+
+  const detail = error instanceof Error ? error.stack || error.message : String(error)
+  try {
+    await writeFile(reportPath, `[windows] ${stage} failed:\n${detail}\n`, {
+      encoding: 'utf8',
+      mode: 0o600,
+    })
+  } catch (reportError) {
+    console.error(
+      '[windows] could not write smoke report:',
+      reportError instanceof Error ? reportError.message : reportError,
+    )
   }
 }
 
@@ -1285,8 +1306,9 @@ if (!hasSingleInstanceLock) {
       }
       await ensureNormalMainWindow()
     })
-    .catch((error) => {
+    .catch(async (error) => {
       console.error('[windows] startup failed:', error instanceof Error ? error.stack : error)
+      await writeSmokeFailureReport('startup', error)
       app.exit(1)
     })
 }

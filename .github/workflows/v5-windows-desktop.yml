@@ -104,6 +104,8 @@ jobs:
           if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
             throw "packaged executable missing: $exe"
           }
+          $smokeReport = Join-Path $env:RUNNER_TEMP 'aurora-unpacked-smoke.txt'
+          $env:OPENCLAUDE_SMOKE_REPORT_PATH = $smokeReport
 
           # --smoke-test is an offline desktop contract: it creates the trusted shell
           # and isolated product WebContentsViews, validates bridge/layout/navigation
@@ -115,8 +117,13 @@ jobs:
               throw 'Aurora.exe --smoke-test exceeded the hard 30 second timeout'
             }
             $process.Refresh()
-            if ($process.ExitCode -ne 0) {
-              throw "Aurora.exe --smoke-test exited with code $($process.ExitCode)"
+          if ($process.ExitCode -ne 0) {
+            $detail = if (Test-Path -LiteralPath $smokeReport -PathType Leaf) {
+              Get-Content -LiteralPath $smokeReport -Raw
+            } else {
+              'No application smoke report was produced.'
+            }
+            throw "Aurora.exe --smoke-test exited with code $($process.ExitCode)`n$detail"
             }
           }
           finally {
@@ -150,6 +157,8 @@ jobs:
           if (-not (Test-Path -LiteralPath $installedExe -PathType Leaf)) {
             throw "installed executable missing: $installedExe"
           }
+          $installedSmokeReport = Join-Path $env:RUNNER_TEMP 'aurora-installed-smoke.txt'
+          $env:OPENCLAUDE_SMOKE_REPORT_PATH = $installedSmokeReport
           $smoke = Start-Process -FilePath $installedExe -ArgumentList '--smoke-test' -PassThru
           if (-not $smoke.WaitForExit(30000)) {
             Stop-Process -Id $smoke.Id -Force -ErrorAction SilentlyContinue
@@ -157,7 +166,12 @@ jobs:
           }
           $smoke.Refresh()
           if ($smoke.ExitCode -ne 0) {
-            throw "installed Aurora.exe --smoke-test exited with code $($smoke.ExitCode)"
+            $detail = if (Test-Path -LiteralPath $installedSmokeReport -PathType Leaf) {
+              Get-Content -LiteralPath $installedSmokeReport -Raw
+            } else {
+              'No installed application smoke report was produced.'
+            }
+            throw "installed Aurora.exe --smoke-test exited with code $($smoke.ExitCode)`n$detail"
           }
 
           $uninstallers = @(Get-ChildItem -LiteralPath $installDir -Filter 'Uninstall*.exe' -File)
