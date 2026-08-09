@@ -168,6 +168,13 @@ function isSafeDbId(value: string): boolean {
   return Number.isSafeInteger(numeric) && numeric > 0
 }
 
+function zhihuPreview(value: unknown): string {
+  const text = String(value ?? '')
+    .replace(/\s+/g, ' ')
+    .trim()
+  return text.length > 800 ? `${text.slice(0, 799)}…` : text
+}
+
 function actionProjection(action: { id: string; description: string; effect: 'read' | 'write' }) {
   return {
     id: action.id,
@@ -1308,7 +1315,8 @@ export class PluginRuntimeFacade {
     if (
       Object.hasOwn(input.params, 'editSnapshot') ||
       Object.hasOwn(input.params, 'deleteSnapshot') ||
-      Object.hasOwn(input.params, 'replySnapshot')
+      Object.hasOwn(input.params, 'replySnapshot') ||
+      Object.hasOwn(input.params, 'targetPreview')
     )
       throw new PluginRuntimeFacadeError('BAD_REQUEST', 'server-owned Plugin fields are forbidden')
 
@@ -1340,6 +1348,17 @@ export class PluginRuntimeFacade {
       const snapshot = { expectedDigest, owned: true }
       if (input.actionId.startsWith('edit_')) prepared.editSnapshot = snapshot
       else prepared.deleteSnapshot = snapshot
+      const author = item.author as Record<string, unknown> | undefined
+      const contentPreview = zhihuPreview(item.content)
+      if (!contentPreview)
+        throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin target preview is unavailable')
+      prepared.targetPreview = {
+        label: answer
+          ? `问题 ${String(item.questionId ?? '')} 下的回答`
+          : String(item.title ?? `文章 ${id}`),
+        ...(typeof author?.name === 'string' ? { authorName: author.name } : {}),
+        contentPreview,
+      }
     }
 
     if (input.actionId === 'reply_comment' || input.actionId === 'delete_comment') {
@@ -1376,6 +1395,15 @@ export class PluginRuntimeFacade {
       }
       if (input.actionId === 'reply_comment') prepared.replySnapshot = snapshot
       else prepared.deleteSnapshot = snapshot
+      const author = comment.author as Record<string, unknown> | undefined
+      const contentPreview = zhihuPreview(comment.text)
+      if (!contentPreview)
+        throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin comment preview is unavailable')
+      prepared.targetPreview = {
+        label: `${targetKind === 'answer' ? '回答' : '文章'} ${targetId} 下的评论`,
+        ...(typeof author?.name === 'string' ? { authorName: author.name } : {}),
+        contentPreview,
+      }
     }
     return prepared
   }

@@ -399,7 +399,14 @@ describe('Plugin runtime facade', () => {
       assert.equal(input.actionId, 'get_answer')
       assert.deepEqual(input.params, { answerId: '123' })
       return {
-        answer: { id: '123', owned: true, contentDigest: 'a'.repeat(64) },
+        answer: {
+          id: '123',
+          questionId: '99',
+          author: { name: '作者甲' },
+          content: '原回答正文',
+          owned: true,
+          contentDigest: 'a'.repeat(64),
+        },
       }
     }
     const answer = await prepare({
@@ -411,10 +418,22 @@ describe('Plugin runtime facade', () => {
       expectedDigest: 'a'.repeat(64),
       owned: true,
     })
+    assert.deepEqual(answer.targetPreview, {
+      label: '问题 99 下的回答',
+      authorName: '作者甲',
+      contentPreview: '原回答正文',
+    })
     ;(facade as unknown as { call: PluginRuntimeFacade['call'] }).call = async (input) => {
       assert.equal(input.actionId, 'get_article')
       return {
-        article: { id: '456', owned: true, contentDigest: 'b'.repeat(64) },
+        article: {
+          id: '456',
+          title: '原文章标题',
+          author: { name: '作者乙' },
+          content: '原文章正文',
+          owned: true,
+          contentDigest: 'b'.repeat(64),
+        },
       }
     }
     const article = await prepare({
@@ -426,6 +445,11 @@ describe('Plugin runtime facade', () => {
       expectedDigest: 'b'.repeat(64),
       owned: true,
     })
+    assert.deepEqual(article.targetPreview, {
+      label: '原文章标题',
+      authorName: '作者乙',
+      contentPreview: '原文章正文',
+    })
     ;(facade as unknown as { call: PluginRuntimeFacade['call'] }).call = async (input) => {
       assert.equal(input.actionId, 'get_comment')
       return {
@@ -434,6 +458,8 @@ describe('Plugin runtime facade', () => {
           targetKind: 'answer',
           targetId: '123',
           parentCommentId: 'd'.repeat(64),
+          author: { name: '评论者' },
+          text: '原评论正文',
           owned: false,
           contentDigest: 'e'.repeat(64),
         },
@@ -455,6 +481,11 @@ describe('Plugin runtime facade', () => {
       targetId: '123',
       owned: false,
       parentCommentId: 'd'.repeat(64),
+    })
+    assert.deepEqual(reply.targetPreview, {
+      label: '回答 123 下的评论',
+      authorName: '评论者',
+      contentPreview: '原评论正文',
     })
     await assert.rejects(
       prepare({

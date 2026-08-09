@@ -152,42 +152,61 @@ async function exactImageSmoke(
   const own = await run('list_user_content', { urlToken: selfId, kind: 'all', count: 10 })
   await run('list_favorites', { count: 5 })
   await run('list_notifications', { count: 5 })
-  const candidates = [hot.items, search.items, own.items].flatMap((items) =>
+  const candidateRows = [hot.items, search.items, own.items].flatMap((items) =>
     Array.isArray(items) ? (items as Record<string, unknown>[]) : [],
   )
-  const question = candidates.find((item) => item.kind === 'question')
-  const answer = candidates.find((item) => item.kind === 'answer')
-  const article = candidates.find((item) => item.kind === 'article')
-  if (!question && !answer && !article)
-    throw new Error('verified account has no DOM-readable content for detail smoke')
-  if (question) {
-    const questionId = String(question.id ?? '')
-    await run('get_question', { questionId })
-    await run('list_question_answers', { questionId, count: 5 })
+  for (const kind of ['question', 'answer', 'article'] as const) {
+    if (candidateRows.some((item) => item.kind === kind)) continue
+    const discovered = await run('search_content', { keyword: '知乎', kind, count: 20 })
+    if (Array.isArray(discovered.items))
+      candidateRows.push(...(discovered.items as Record<string, unknown>[]))
   }
-  if (answer) {
-    const answerId = String(answer.id ?? '')
-    await run('get_answer', { answerId })
-    const comments = await run('list_comments', {
-      targetKind: 'answer',
-      targetId: answerId,
-      count: 5,
-    })
+  const answerSummary = candidateRows.find((item) => item.kind === 'answer')
+  const articleSummary = candidateRows.find((item) => item.kind === 'article')
+  if (!answerSummary || !articleSummary)
+    throw new Error('verified smoke requires DOM-readable answer and article targets')
+  const answerId = String(answerSummary.id ?? '')
+  const articleId = String(articleSummary.id ?? '')
+  const answerRead = await run('get_answer', { answerId })
+  const answer = answerRead.answer as Record<string, unknown> | undefined
+  const questionSummary = candidateRows.find((item) => item.kind === 'question')
+  const questionId = String(questionSummary?.id ?? answer?.questionId ?? '')
+  if (!/^\d{1,32}$/.test(questionId))
+    throw new Error('verified smoke requires a DOM-readable question target')
+  await run('get_question', { questionId })
+  await run('list_question_answers', { questionId, count: 5 })
+  await run('get_article', { articleId })
+
+  let commentTarget: {
+    targetKind: 'answer' | 'article'
+    targetId: string
+    commentId: string
+  } | null = null
+  for (const target of [
+    { targetKind: 'answer' as const, targetId: answerId },
+    { targetKind: 'article' as const, targetId: articleId },
+  ]) {
+    const comments = await run('list_comments', { ...target, count: 20 })
     const first = Array.isArray(comments.comments)
       ? (comments.comments[0] as Record<string, unknown> | undefined)
       : undefined
-    if (first)
-      await run('get_comment', {
-        targetKind: 'answer',
-        targetId: answerId,
-        commentId: String(first.id ?? ''),
-      })
+    if (first && typeof first.id === 'string') {
+      commentTarget = { ...target, commentId: first.id }
+      break
+    }
   }
-  if (article) {
-    const articleId = String(article.id ?? '')
-    await run('get_article', { articleId })
-    await run('list_comments', { targetKind: 'article', targetId: articleId, count: 5 })
-  }
+  if (!commentTarget) throw new Error('verified smoke requires a DOM-readable comment target')
+  await run('get_comment', commentTarget)
+
+  const expected = ZHIHU_PLUGIN_CONTRACT.actions
+    .filter((action) => action.effect === 'read')
+    .map((action) => action.id)
+    .sort()
+  assert.deepEqual(
+    [...passed].sort(),
+    expected,
+    'every declared Zhihu read action must pass exact-image smoke',
+  )
   return { storageState, selfId, passed, degraded: [] }
 }
 

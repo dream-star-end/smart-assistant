@@ -50,6 +50,14 @@ const pageResult = {
   hasMore: { type: 'boolean' },
   nextOffset: { type: 'integer', minimum: 0, maximum: 2_147_483_647 },
 }
+const contentPageParams = {
+  contentOffset: { type: 'integer', minimum: 0, maximum: 2_147_483_647 },
+  contentChars: { type: 'integer', minimum: 1, maximum: 400_000 },
+}
+const detailPageParams = {
+  detailOffset: { type: 'integer', minimum: 0, maximum: 2_147_483_647 },
+  detailChars: { type: 'integer', minimum: 1, maximum: 300_000 },
+}
 const mutationResultSchema = {
   type: 'object',
   properties: { ok: { type: 'boolean' }, changed: { type: 'boolean' } },
@@ -78,6 +86,10 @@ const questionSchema = {
     id: numericIdSchema,
     title: { type: 'string', minLength: 1, maxLength: 1_000 },
     detail: { type: 'string', maxLength: 300_000 },
+    detailOffset: { type: 'integer', minimum: 0 },
+    detailLength: { type: 'integer', minimum: 0 },
+    hasMoreDetail: { type: 'boolean' },
+    nextDetailOffset: { type: 'integer', minimum: 0 },
     url: { type: 'string', maxLength: 1_024 },
     answerCount: { type: 'integer', minimum: 0 },
     followerCount: { type: 'integer', minimum: 0 },
@@ -86,7 +98,18 @@ const questionSchema = {
     owned: { type: 'boolean' },
     contentDigest: sha256Schema,
   },
-  required: ['id', 'title', 'url', 'followed', 'owned', 'contentDigest'],
+  required: [
+    'id',
+    'title',
+    'url',
+    'followed',
+    'owned',
+    'contentDigest',
+    'detailOffset',
+    'detailLength',
+    'hasMoreDetail',
+    'nextDetailOffset',
+  ],
   additionalProperties: false,
 }
 const answerSchema = {
@@ -95,7 +118,11 @@ const answerSchema = {
     id: numericIdSchema,
     questionId: numericIdSchema,
     author: userSchema,
-    content: { type: 'string', maxLength: 500_000 },
+    content: { type: 'string', maxLength: 400_000 },
+    contentOffset: { type: 'integer', minimum: 0 },
+    contentLength: { type: 'integer', minimum: 0 },
+    hasMoreContent: { type: 'boolean' },
+    nextContentOffset: { type: 'integer', minimum: 0 },
     url: { type: 'string', maxLength: 1_024 },
     createdAt: { type: 'string', maxLength: 128 },
     updatedAt: { type: 'string', maxLength: 128 },
@@ -116,6 +143,10 @@ const answerSchema = {
     'favorited',
     'owned',
     'contentDigest',
+    'contentOffset',
+    'contentLength',
+    'hasMoreContent',
+    'nextContentOffset',
   ],
   additionalProperties: false,
 }
@@ -125,7 +156,11 @@ const articleSchema = {
     id: numericIdSchema,
     title: { type: 'string', minLength: 1, maxLength: 1_000 },
     author: userSchema,
-    content: { type: 'string', maxLength: 500_000 },
+    content: { type: 'string', maxLength: 400_000 },
+    contentOffset: { type: 'integer', minimum: 0 },
+    contentLength: { type: 'integer', minimum: 0 },
+    hasMoreContent: { type: 'boolean' },
+    nextContentOffset: { type: 'integer', minimum: 0 },
     url: { type: 'string', maxLength: 1_024 },
     createdAt: { type: 'string', maxLength: 128 },
     updatedAt: { type: 'string', maxLength: 128 },
@@ -135,7 +170,20 @@ const articleSchema = {
     owned: { type: 'boolean' },
     contentDigest: sha256Schema,
   },
-  required: ['id', 'title', 'author', 'content', 'url', 'favorited', 'owned', 'contentDigest'],
+  required: [
+    'id',
+    'title',
+    'author',
+    'content',
+    'url',
+    'favorited',
+    'owned',
+    'contentDigest',
+    'contentOffset',
+    'contentLength',
+    'hasMoreContent',
+    'nextContentOffset',
+  ],
   additionalProperties: false,
 }
 const commentSchema = {
@@ -217,6 +265,16 @@ const commentSnapshotSchema = {
   required: ['expectedDigest', 'targetKind', 'targetId', 'owned'],
   additionalProperties: false,
 }
+const targetPreviewSchema = {
+  type: 'object',
+  properties: {
+    label: { type: 'string', minLength: 1, maxLength: 1_000 },
+    authorName: { type: 'string', maxLength: 128 },
+    contentPreview: { type: 'string', minLength: 1, maxLength: 800 },
+  },
+  required: ['label', 'contentPreview'],
+  additionalProperties: false,
+}
 
 export const ZHIHU_NETWORK_ORIGINS = Object.freeze([
   'https://www.zhihu.com',
@@ -290,13 +348,16 @@ export const ZHIHU_PLUGIN_ARTIFACT = Object.freeze({
       timeoutSeconds: 120,
       params: {
         type: 'object',
-        properties: { count: { type: 'integer', minimum: 1, maximum: 50 } },
+        properties: { ...pageParams },
         additionalProperties: false,
       },
       result: {
         type: 'object',
-        properties: { items: { type: 'array', maxItems: 50, items: contentSummarySchema } },
-        required: ['items'],
+        properties: {
+          items: { type: 'array', maxItems: 50, items: contentSummarySchema },
+          ...pageResult,
+        },
+        required: ['items', 'hasMore'],
         additionalProperties: false,
       },
     },
@@ -307,7 +368,7 @@ export const ZHIHU_PLUGIN_ARTIFACT = Object.freeze({
       timeoutSeconds: 120,
       params: {
         type: 'object',
-        properties: { questionId: numericIdSchema },
+        properties: { questionId: numericIdSchema, ...detailPageParams },
         required: ['questionId'],
         additionalProperties: false,
       },
@@ -350,7 +411,7 @@ export const ZHIHU_PLUGIN_ARTIFACT = Object.freeze({
       timeoutSeconds: 120,
       params: {
         type: 'object',
-        properties: { answerId: numericIdSchema },
+        properties: { answerId: numericIdSchema, ...contentPageParams },
         required: ['answerId'],
         additionalProperties: false,
       },
@@ -368,7 +429,7 @@ export const ZHIHU_PLUGIN_ARTIFACT = Object.freeze({
       timeoutSeconds: 120,
       params: {
         type: 'object',
-        properties: { articleId: numericIdSchema },
+        properties: { articleId: numericIdSchema, ...contentPageParams },
         required: ['articleId'],
         additionalProperties: false,
       },
@@ -567,6 +628,7 @@ export const ZHIHU_PLUGIN_ARTIFACT = Object.freeze({
           answerId: numericIdSchema,
           content: { type: 'string', minLength: 1, maxLength: 400_000 },
           editSnapshot: ownedSnapshotSchema,
+          targetPreview: targetPreviewSchema,
         },
         required: ['answerId', 'content'],
         additionalProperties: false,
@@ -585,7 +647,11 @@ export const ZHIHU_PLUGIN_ARTIFACT = Object.freeze({
       timeoutSeconds: 180,
       params: {
         type: 'object',
-        properties: { answerId: numericIdSchema, deleteSnapshot: ownedSnapshotSchema },
+        properties: {
+          answerId: numericIdSchema,
+          deleteSnapshot: ownedSnapshotSchema,
+          targetPreview: targetPreviewSchema,
+        },
         required: ['answerId'],
         additionalProperties: false,
       },
@@ -624,6 +690,7 @@ export const ZHIHU_PLUGIN_ARTIFACT = Object.freeze({
           title: { type: 'string', minLength: 1, maxLength: 1_000 },
           content: { type: 'string', minLength: 1, maxLength: 400_000 },
           editSnapshot: ownedSnapshotSchema,
+          targetPreview: targetPreviewSchema,
         },
         required: ['articleId', 'title', 'content'],
         additionalProperties: false,
@@ -642,7 +709,11 @@ export const ZHIHU_PLUGIN_ARTIFACT = Object.freeze({
       timeoutSeconds: 180,
       params: {
         type: 'object',
-        properties: { articleId: numericIdSchema, deleteSnapshot: ownedSnapshotSchema },
+        properties: {
+          articleId: numericIdSchema,
+          deleteSnapshot: ownedSnapshotSchema,
+          targetPreview: targetPreviewSchema,
+        },
         required: ['articleId'],
         additionalProperties: false,
       },
@@ -683,6 +754,7 @@ export const ZHIHU_PLUGIN_ARTIFACT = Object.freeze({
           commentId: commentIdSchema,
           text: { type: 'string', minLength: 1, maxLength: 5_000 },
           replySnapshot: commentSnapshotSchema,
+          targetPreview: targetPreviewSchema,
         },
         required: ['targetKind', 'targetId', 'commentId', 'text'],
         additionalProperties: false,
@@ -706,6 +778,7 @@ export const ZHIHU_PLUGIN_ARTIFACT = Object.freeze({
           targetId: numericIdSchema,
           commentId: commentIdSchema,
           deleteSnapshot: commentSnapshotSchema,
+          targetPreview: targetPreviewSchema,
         },
         required: ['targetKind', 'targetId', 'commentId'],
         additionalProperties: false,

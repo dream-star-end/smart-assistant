@@ -278,46 +278,58 @@ export function buildWriteSummary(
         `用知乎${hint}回答问题 ${String(params.questionId ?? '')}：「${ellipsize(String(params.content ?? ''), 300)}」`,
         2000,
       )
-    case 'zhihu/edit_answer':
+    case 'zhihu/edit_answer': {
+      const preview = (params.targetPreview as Record<string, unknown> | undefined) ?? {}
       return ellipsize(
-        `用知乎${hint}编辑回答 ${String(params.answerId ?? '')}：「${ellipsize(String(params.content ?? ''), 300)}」`,
+        `用知乎${hint}编辑${String(preview.label ?? `回答 ${String(params.answerId ?? '')}`)}（原文：「${ellipsize(String(preview.contentPreview ?? ''), 180)}」）为：「${ellipsize(String(params.content ?? ''), 300)}」`,
         2000,
       )
-    case 'zhihu/delete_answer':
+    }
+    case 'zhihu/delete_answer': {
+      const preview = (params.targetPreview as Record<string, unknown> | undefined) ?? {}
       return ellipsize(
-        `用知乎${hint}永久删除回答 ${String(params.answerId ?? '')}（不可撤销）`,
+        `用知乎${hint}永久删除${String(preview.label ?? `回答 ${String(params.answerId ?? '')}`)}，作者 ${String(preview.authorName ?? '未知')}：「${ellipsize(String(preview.contentPreview ?? ''), 300)}」（不可撤销）`,
         2000,
       )
+    }
     case 'zhihu/create_article':
       return ellipsize(
         `用知乎${hint}发布文章「${ellipsize(String(params.title ?? ''), 200)}」：「${ellipsize(String(params.content ?? ''), 300)}」`,
         2000,
       )
-    case 'zhihu/edit_article':
+    case 'zhihu/edit_article': {
+      const preview = (params.targetPreview as Record<string, unknown> | undefined) ?? {}
       return ellipsize(
-        `用知乎${hint}编辑文章 ${String(params.articleId ?? '')}「${ellipsize(String(params.title ?? ''), 200)}」`,
+        `用知乎${hint}编辑文章「${ellipsize(String(preview.label ?? params.articleId ?? ''), 200)}」为「${ellipsize(String(params.title ?? ''), 200)}」`,
         2000,
       )
-    case 'zhihu/delete_article':
+    }
+    case 'zhihu/delete_article': {
+      const preview = (params.targetPreview as Record<string, unknown> | undefined) ?? {}
       return ellipsize(
-        `用知乎${hint}永久删除文章 ${String(params.articleId ?? '')}（不可撤销）`,
+        `用知乎${hint}永久删除文章「${ellipsize(String(preview.label ?? params.articleId ?? ''), 200)}」，作者 ${String(preview.authorName ?? '未知')}：「${ellipsize(String(preview.contentPreview ?? ''), 300)}」（不可撤销）`,
         2000,
       )
+    }
     case 'zhihu/create_comment':
       return ellipsize(
         `用知乎${hint}评论${String(params.targetKind ?? '')} ${String(params.targetId ?? '')}：「${ellipsize(String(params.text ?? ''), 300)}」`,
         2000,
       )
-    case 'zhihu/reply_comment':
+    case 'zhihu/reply_comment': {
+      const preview = (params.targetPreview as Record<string, unknown> | undefined) ?? {}
       return ellipsize(
-        `用知乎${hint}回复评论 ${String(params.commentId ?? '')}：「${ellipsize(String(params.text ?? ''), 300)}」`,
+        `用知乎${hint}回复 ${String(preview.authorName ?? '未知用户')} 的评论「${ellipsize(String(preview.contentPreview ?? ''), 240)}」：「${ellipsize(String(params.text ?? ''), 300)}」`,
         2000,
       )
-    case 'zhihu/delete_comment':
+    }
+    case 'zhihu/delete_comment': {
+      const preview = (params.targetPreview as Record<string, unknown> | undefined) ?? {}
       return ellipsize(
-        `用知乎${hint}永久删除评论 ${String(params.commentId ?? '')}（不可撤销）`,
+        `用知乎${hint}永久删除 ${String(preview.authorName ?? '未知用户')} 的评论「${ellipsize(String(preview.contentPreview ?? ''), 300)}」（不可撤销）`,
         2000,
       )
+    }
     case 'zhihu/set_answer_vote':
       return ellipsize(
         `用知乎${hint}把回答 ${String(params.answerId ?? '')} 设置为${params.vote === 'up' ? '已赞同' : params.vote === 'down' ? '已反对' : '无赞同或反对'}`,
@@ -550,6 +562,7 @@ export function buildWriteDetail(
         questionId: String(params.questionId ?? ''),
         answerId: params.answerId ?? null,
         content: String(params.content ?? ''),
+        targetPreview: params.targetPreview ?? null,
         warning:
           action === 'edit_answer'
             ? '知乎回答正文将被修改；最终复核与网页点击之间仍存在极短竞态窗口。'
@@ -559,6 +572,7 @@ export function buildWriteDetail(
       return {
         kind: 'zhihu_delete_answer',
         answerId: String(params.answerId ?? ''),
+        targetPreview: params.targetPreview ?? null,
         irreversible: true,
       }
     case 'zhihu/create_article':
@@ -568,6 +582,7 @@ export function buildWriteDetail(
         articleId: params.articleId ?? null,
         title: String(params.title ?? ''),
         content: String(params.content ?? ''),
+        targetPreview: params.targetPreview ?? null,
         warning:
           action === 'edit_article'
             ? '知乎文章标题和正文将被修改；最终复核与网页点击之间仍存在极短竞态窗口。'
@@ -577,6 +592,7 @@ export function buildWriteDetail(
       return {
         kind: 'zhihu_delete_article',
         articleId: String(params.articleId ?? ''),
+        targetPreview: params.targetPreview ?? null,
         irreversible: true,
       }
     case 'zhihu/create_comment':
@@ -587,6 +603,7 @@ export function buildWriteDetail(
         targetId: String(params.targetId ?? ''),
         commentId: params.commentId ?? null,
         text: String(params.text ?? ''),
+        targetPreview: params.targetPreview ?? null,
       }
     case 'zhihu/delete_comment':
       return {
@@ -594,6 +611,7 @@ export function buildWriteDetail(
         targetKind: String(params.targetKind ?? ''),
         targetId: String(params.targetId ?? ''),
         commentId: String(params.commentId ?? ''),
+        targetPreview: params.targetPreview ?? null,
         irreversible: true,
       }
     case 'zhihu/set_answer_vote':
