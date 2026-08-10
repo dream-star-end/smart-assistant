@@ -2,11 +2,13 @@ import { getModelCatalogCache } from './modelCatalogRuntime.js'
 
 export const TERRA_AUTO_DREAM_MODEL = 'gpt-5.6-terra'
 export const DEEPSEEK_AUTO_DREAM_MODEL = 'deepseek-v4-flash'
+export const MINIMAX_AUTO_DREAM_MODEL = 'MiniMax-M3'
 export const DEFAULT_AUTO_DREAM_MODEL = DEEPSEEK_AUTO_DREAM_MODEL
 export const LEGACY_AUTO_DREAM_MODEL = DEEPSEEK_AUTO_DREAM_MODEL
 const AUTO_DREAM_OPTIMIZER_ENGINES = new Map<string, 'codex' | 'ccb'>([
   [TERRA_AUTO_DREAM_MODEL, 'codex'],
   [DEEPSEEK_AUTO_DREAM_MODEL, 'ccb'],
+  [MINIMAX_AUTO_DREAM_MODEL, 'ccb'],
 ])
 
 export interface AutoDreamModelOption {

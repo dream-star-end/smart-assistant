@@ -278,7 +278,7 @@ export const KEY_META: Record<
   },
   auto_dream_model: {
     kind: "model",
-    description: "Auto-Dream 全面优化审计模型（默认使用 active/public 的 DeepSeek V4 Flash）",
+    description: "Auto-Dream 整理与全面优化模型（须为 active/public 模型）",
   },
 };
 

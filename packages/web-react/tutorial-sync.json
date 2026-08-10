@@ -118,13 +118,13 @@
       "sourceHash": "61c6247fc88f036e7ff86a75a8cd4b310a4f8f5ac664def5130a194e6cb12ae0"
     },
     "memory-auto-dream": {
-      "contentHash": "cdbe87a0647d21af25b14732e045694225dc3e6e4760e6bfd7726cd4d5c0136b",
-      "contentVersion": 6,
+      "contentHash": "8bfeb3ca5353a33d36e4815171845bb0e28a64514d5d9fcb36d51c0282db6187",
+      "contentVersion": 7,
       "mediaHash": "ea8238104ece9dd33f817cc09a1abfe79a0e5aea0e27fcdc196278087b44dce1",
       "mediaKey": "memory-auto-dream",
       "mediaVersion": 3,
       "registryHash": "d6eedd237f502594cdeabe6703344d61ca8d511710e70ed1b9a56e2827d33fee",
-      "sourceHash": "92e38bae9829c0467c1f97b3f3ad002cdd9a4765df8383577a5ac3e8caaf75db"
+      "sourceHash": "b92414e8ba740ea3757d4e5437cf8581b5045c263c7a75c5041b60cba628ec3b"
     },
     "models-reasoning": {
       "contentHash": "94ae018d06f7ed3aa73106d60050dca4fef067d96738c87476f44fab0e9ec8df",

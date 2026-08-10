@@ -177,6 +177,7 @@ export interface AutoDreamLastReport {
 
 export interface AutoDreamPublicStatus {
   status: AutoDreamStatus
+  mode?: 'legacy_memory_v1' | 'optimizer_v2'
   startedAt?: string
   pendingSessions: number
   lastReport?: AutoDreamLastReport
@@ -308,7 +309,11 @@ export class AutoDreamService {
   /** Identity-bound container API projection; stale paid attempts converge to a visible failure. */
   async getPublicStatus(agentId: string): Promise<AutoDreamPublicStatus> {
     await this.reconcileStaleRun(agentId)
-    return projectAutoDreamPublicStatus(await readState(paths.agentAutoDreamState(agentId)))
+    const status = projectAutoDreamPublicStatus(
+      await readState(paths.agentAutoDreamState(agentId)),
+    )
+    const policy = await this.policyClient.get()
+    return policy.enabled ? { ...status, mode: policy.mode } : status
   }
 
   private async reconcileStaleRun(agentId: string): Promise<void> {
