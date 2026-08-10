@@ -658,6 +658,29 @@ describe("admin pricing/plans — HTTP", () => {
     assert.equal(body.slo.windows.last_15m.success, 2);
     assert.equal(body.slo.windows.last_15m.failure, 1);
     assert.equal(body.slo.windows.last_15m.affected_users, 1);
+
+    await query(
+      `DELETE FROM client_session_turn_tapes
+        WHERE session_id IN ('ops-overview-0','ops-overview-1')`,
+    );
+    const internalOnlyResponse = await fetch(`${baseUrl}/api/admin/ops-overview`, {
+      headers: { Authorization: `Bearer ${await tokenFor(admin, "admin")}` },
+    });
+    assert.equal(internalOnlyResponse.status, 200);
+    const internalOnlyBody = await internalOnlyResponse.json() as {
+      slo: { windows: Record<string, {
+        success: number; failure: number; affected_users: number;
+        latency_ms: { p50: number | null; p95: number | null };
+      }> };
+    };
+    for (const window of ["last_15m", "last_1h", "last_24h"]) {
+      assert.deepEqual(internalOnlyBody.slo.windows[window], {
+        success: 0,
+        failure: 0,
+        affected_users: 0,
+        latency_ms: { p50: null, p95: null },
+      });
+    }
   });
 
   test("marketplace cohort follows ordered user+skill journey and ignores user-layer usage", async (t) => {
