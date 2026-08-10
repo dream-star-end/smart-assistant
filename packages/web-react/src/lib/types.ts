@@ -798,6 +798,7 @@ export type AutoDreamLastReport = {
 
 export type AutoDreamReportResponse = {
   status: "idle" | "running" | "success" | "failed";
+  mode?: "legacy_memory_v1" | "optimizer_v2";
   startedAt?: string;
   pendingSessions: number;
   lastReport?: AutoDreamLastReport;

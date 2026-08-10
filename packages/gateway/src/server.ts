@@ -8018,7 +8018,7 @@ export class Gateway {
     const expectedEngine =
       model === 'gpt-5.6-terra'
         ? 'codex'
-        : model === 'deepseek-v4-flash'
+        : model === 'deepseek-v4-flash' || model === 'MiniMax-M3'
           ? 'ccb'
           : null
     const engine = execution?.engine ?? expectedEngine

@@ -54,7 +54,7 @@ describe("PreferencesTab · Auto-Dream", () => {
     expect(apiKeysSection).toHaveBeenCalledTimes(1);
   });
 
-  test("显示 DeepSeek 全面审计范围，并提供优化建议入口", async () => {
+  test("滚动兼容阶段不承诺具体模型，并提供优化建议入口", async () => {
     vi.spyOn(api, "getPublicModels").mockResolvedValue([]);
     const openMemory = vi.fn();
 
@@ -86,7 +86,9 @@ describe("PreferencesTab · Auto-Dream", () => {
       />,
     );
 
-    expect(screen.getByText(/DeepSeek V4 Flash 结合平台功能与技能/)).toBeInTheDocument();
+    expect(screen.getByText(/平台统一的 Auto-Dream 模型结合平台功能与技能/)).toBeInTheDocument();
+    expect(screen.queryByText(/DeepSeek V4 Flash/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/MiniMax M3/)).not.toBeInTheDocument();
     expect(screen.queryByText(/deepseek-v4-flash/)).not.toBeInTheDocument();
     expect(screen.getByText(/所有用户内容和功能设置修改都先展示差异/)).toBeInTheDocument();
 

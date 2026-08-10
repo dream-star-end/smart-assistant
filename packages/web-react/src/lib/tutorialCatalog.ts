@@ -561,9 +561,9 @@ export const TUTORIAL_TOPICS = {
   },
   "memory-auto-dream": {
     featureId: "memory-auto-dream",
-    contentVersion: 6,
+    contentVersion: 7,
     intro:
-      "长期记忆按智能体隔离保存稳定信息。新版 Auto-Dream 使用 DeepSeek V4 Flash，在你明确同意后结合 V5 平台能力和技能，全面审计相关会话、操作与日志，并提出记忆、设置、技能、规则、Agent、插件和定时任务等优化建议。",
+      "长期记忆按智能体隔离保存稳定信息。新版 Auto-Dream 使用平台统一的整理模型，在你明确同意后结合 V5 平台能力和技能，全面审计相关会话、操作与日志，并提出记忆、设置、技能、规则、Agent、插件和定时任务等优化建议。",
     outcome: "不只整理记忆，而是在保留用户控制权的前提下持续优化整个智能体工作环境。",
     scenarios: [
       "记住职业与沟通偏好",
@@ -593,7 +593,7 @@ export const TUTORIAL_TOPICS = {
       "建议冲突时先重新审计，不要覆盖审计后由你手动修改的内容。",
     ],
     cautions: [
-      "全面审计按 DeepSeek V4 Flash 实际用量计费；执行环境禁用工具和网络。",
+      "全面审计按实际生效模型的用量计费；执行环境禁用工具和网络。",
       "不要把密码、密钥、身份证号等秘密写进长期记忆。",
     ],
     example:

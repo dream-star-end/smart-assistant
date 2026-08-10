@@ -184,7 +184,7 @@ const html = `<!doctype html><html><head><meta charset="utf-8"><style>${producti
   #root{position:static;height:auto;overflow:visible}
   .timeline-scroll-probe{height:360px;width:640px;overflow-y:auto;position:relative;border:1px solid #ccc;scrollbar-gutter:stable}
   #timeline-archive-root .chat-virtual-item{min-height:40px}
-</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="ask-question-root"></div><div id="model-selector-root"></div><div id="markdown-rich-root"></div><div id="media-task-root"></div><div id="connectors-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
+</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="ask-question-root"></div><div id="model-selector-root"></div><div id="markdown-rich-root"></div><div id="media-task-root"></div><div id="connectors-root"></div><div id="memory-report-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
 
 // ── drive ───────────────────────────────────────────────────────────────────
 let browser;
@@ -254,6 +254,41 @@ const serveBuiltAsset = (route, request) => {
 };
 // 先注册 catch-all,再注册 harness 页:playwright 后注册者优先,harness URL 命中专用处理。
 await page.route("**/*", serveBuiltAsset);
+await page.route("**/api/agents/main/**", (route, request) => {
+  const url = new URL(request.url());
+  if (url.pathname === "/api/agents/main/memory/memory" && request.method() === "GET") {
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ kind: "index", text: "", files: [], version: "browser-memory-v1" }),
+    });
+  }
+  if (url.pathname === "/api/agents/main/auto-dream-report" && request.method() === "GET") {
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        status: "failed",
+        mode: "optimizer_v2",
+        pendingSessions: 5,
+        lastReport: {
+          status: "failed",
+          finishedAt: "2026-08-08T00:00:00.000Z",
+          sessionsReviewed: 5,
+          summary: "本次整理未完成，没有改动记忆。",
+          created: [],
+          updated: [],
+          deleted: [],
+        },
+      }),
+    });
+  }
+  return route.fulfill({
+    status: 404,
+    contentType: "application/json",
+    body: JSON.stringify({ error: { code: "NOT_FOUND" } }),
+  });
+});
 await page.route("**/api/media-generation/**", (route, request) => {
   const url = new URL(request.url());
   if (url.pathname === "/api/media-generation/capabilities") {
@@ -431,6 +466,20 @@ const plusButton = primaryComposer.getByRole("button", { name: "更多选项" })
 // DropdownMenuContent renders in a body-level portal. Scope only the trigger
 // to the primary composer; the menu item itself must be located from the page.
 const attachItem = page.getByText("添加附件");
+
+await check("T34 全面优化模式隐藏不会再更新的旧版梦境失败回执", async () => {
+  const memoryRoot = page.locator("#memory-report-root");
+  await memoryRoot.getByText("还没有核心记忆", { exact: true }).waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
+  if (await memoryRoot.getByRole("region", { name: "Auto-Dream 梦境报告" }).count() !== 0) {
+    throw new Error("全面优化模式仍展示旧版梦境报告卡");
+  }
+  if (await memoryRoot.getByText("本次整理未完成，没有改动记忆。", { exact: true }).count() !== 0) {
+    throw new Error("全面优化模式仍展示永远不会更新的旧版失败回执");
+  }
+});
 
 await check("T1 点「+」→「添加附件」→ filechooser 真实弹出", async () => {
   await plusButton.click();
