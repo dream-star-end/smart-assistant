@@ -81,7 +81,8 @@
     "0199_qwen38_codex_responses",
     "0200_media_generation_jobs",
     "0201_durable_live_turn_frames",
-    "0202_turn_recovery_control"
+    "0202_turn_recovery_control",
+    "0203_admin_ops_outreach"
   ],
   "capabilities": [
     "sessions-store-pg-v1",
