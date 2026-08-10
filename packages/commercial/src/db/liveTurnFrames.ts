@@ -119,36 +119,52 @@ export async function persistGatewayLiveFrame(
       throw new Error("live frame stream identity conflict");
     }
 
-    const inserted = await client.query(
-      `INSERT INTO client_session_live_frames
-         (stream_key,source,agent_container_id,session_key,frame_seq,payload,payload_sha256)
-       VALUES ($1,'gateway',$2,$3,$4,$5,$6)
-       ON CONFLICT (agent_container_id,session_key,frame_seq)
-         WHERE source='gateway' DO NOTHING
-       RETURNING record_id`,
-      [streamKey, input.agentContainerId, input.sessionKey, input.frameSeq, payload, payloadSha256],
-    );
-    if ((inserted.rowCount ?? 0) === 1) return;
+    type StoredGatewayFrame = {
+      stream_key: string;
+      payload_sha256: string;
+      payload: Buffer;
+    };
+    const insertOrReadExisting = async (storageSessionKey: string): Promise<StoredGatewayFrame | null> => {
+      const inserted = await client.query(
+        `INSERT INTO client_session_live_frames
+           (stream_key,source,agent_container_id,session_key,frame_seq,payload,payload_sha256)
+         VALUES ($1,'gateway',$2,$3,$4,$5,$6)
+         ON CONFLICT (agent_container_id,session_key,frame_seq)
+           WHERE source='gateway' DO NOTHING
+         RETURNING record_id`,
+        [streamKey, input.agentContainerId, storageSessionKey, input.frameSeq, payload, payloadSha256],
+      );
+      if ((inserted.rowCount ?? 0) === 1) return null;
 
-    const existing = (
-      await client.query<{
-        stream_key: string;
-        payload_sha256: string;
-        payload: Buffer;
-      }>(
-        `SELECT stream_key,payload_sha256,payload
-           FROM client_session_live_frames
-          WHERE source='gateway' AND agent_container_id=$1 AND session_key=$2 AND frame_seq=$3
-          FOR UPDATE`,
-        [input.agentContainerId, input.sessionKey, input.frameSeq],
-      )
-    ).rows[0];
-    if (
-      !existing ||
-      existing.stream_key !== streamKey ||
-      existing.payload_sha256 !== payloadSha256 ||
-      !Buffer.from(existing.payload).equals(payload)
-    ) {
+      return (
+        await client.query<StoredGatewayFrame>(
+          `SELECT stream_key,payload_sha256,payload
+             FROM client_session_live_frames
+            WHERE source='gateway' AND agent_container_id=$1 AND session_key=$2 AND frame_seq=$3
+            FOR UPDATE`,
+          [input.agentContainerId, storageSessionKey, input.frameSeq],
+        )
+      ).rows[0] ?? null;
+    };
+    const matchesCurrentFrame = (existing: StoredGatewayFrame | null): boolean =>
+      existing !== null &&
+      existing.stream_key === streamKey &&
+      existing.payload_sha256 === payloadSha256 &&
+      Buffer.from(existing.payload).equals(payload);
+
+    const existing = await insertOrReadExisting(input.sessionKey);
+    if (existing === null || matchesCurrentFrame(existing)) return;
+    if (dispatch === null || existing.stream_key === streamKey) {
+      throw new Error("live frame immutable payload conflict");
+    }
+
+    // A destroyed gateway session can later reuse the same wire session key
+    // after its outbound frame sequence restarts. Keep the first generation's
+    // legacy identity, but namespace later dispatches so one stale generation
+    // cannot poison every subsequent turn on the user's shared WebSocket.
+    const storageSessionKey = `v2:${JSON.stringify([input.sessionKey, streamKey])}`;
+    const namespacedExisting = await insertOrReadExisting(storageSessionKey);
+    if (namespacedExisting !== null && !matchesCurrentFrame(namespacedExisting)) {
       throw new Error("live frame immutable payload conflict");
     }
   });
