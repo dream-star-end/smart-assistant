@@ -16,6 +16,7 @@ import {
 import { createRoot } from "react-dom/client";
 import { Composer } from "../src/components/Composer";
 import { MessageFeedbackDialog } from "../src/components/chat/MessageFeedbackDialog";
+import { MemoryPanel } from "../src/components/manage/MemoryPanel";
 import { MediaTaskCenter } from "../src/components/MediaTaskCenter";
 import { Markdown } from "../src/components/Markdown";
 import { MessageList, MessageRenderer } from "../src/components/MessageRenderer";
@@ -23,6 +24,7 @@ import { ModelSelector } from "../src/components/ModelSelector";
 import { ToolCard } from "../src/components/ToolCard";
 import { TeamPanel } from "../src/components/chat/TeamPanel";
 import { ConnectorsTab } from "../src/components/settings/ConnectorsTab";
+import { ToastProvider, TooltipProvider } from "../src/components/ui";
 import {
   captureVisibleVirtualRowAnchor,
   restoreVisibleVirtualRowAnchor,
@@ -233,6 +235,21 @@ window.__runPendingDispatchJournalProbe = async () => {
 
 const mediaTaskAuth = createMemoryAuthSession(() => {}, "browser-media-token");
 const connectorsAuth = createMemoryAuthSession(() => {}, "browser-connectors-token");
+const memoryAuth = createMemoryAuthSession(() => {}, "browser-memory-token");
+
+createRoot(document.getElementById("memory-report-root")!).render(
+  <StrictMode>
+    <TooltipProvider>
+      <ToastProvider>
+        <MemoryPanel
+          auth={memoryAuth}
+          agentId="main"
+          agents={[{ id: "main", name: "全能助手" }]}
+        />
+      </ToastProvider>
+    </TooltipProvider>
+  </StrictMode>,
+);
 
 createRoot(document.getElementById("connectors-root")!).render(
   <StrictMode><ConnectorsTab auth={connectorsAuth} /></StrictMode>,
