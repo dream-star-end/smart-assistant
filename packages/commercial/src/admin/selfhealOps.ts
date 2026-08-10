@@ -66,6 +66,8 @@ export interface IncidentRowView {
   opened_at: string;
   updated_at: string;
   resolved_at: string | null;
+  latest_repair_status: string | null;
+  latest_repair_at: string | null;
 }
 
 interface IncidentRow {
@@ -85,6 +87,8 @@ interface IncidentRow {
   opened_at: Date;
   updated_at: Date;
   resolved_at: Date | null;
+  latest_repair_status: string | null;
+  latest_repair_at: Date | null;
 }
 
 /** M4:自由文本出口清洗(null 透传;值级凭据形状见 selfheal/redact.ts)。 */
@@ -111,6 +115,8 @@ function serialize(r: IncidentRow): IncidentRowView {
     opened_at: r.opened_at.toISOString(),
     updated_at: r.updated_at.toISOString(),
     resolved_at: r.resolved_at ? r.resolved_at.toISOString() : null,
+    latest_repair_status: r.latest_repair_status,
+    latest_repair_at: r.latest_repair_at?.toISOString() ?? null,
   };
 }
 
@@ -122,7 +128,12 @@ export interface ListIncidentsInput {
 
 export async function listIncidents(
   input: ListIncidentsInput,
-): Promise<{ rows: IncidentRowView[]; next_before: string | null }> {
+): Promise<{
+  rows: IncidentRowView[];
+  next_before: string | null;
+  total: number;
+  open_total: number;
+}> {
   let limit = input.limit ?? INCIDENTS_DEFAULT_LIMIT;
   if (!Number.isInteger(limit) || limit <= 0) limit = INCIDENTS_DEFAULT_LIMIT;
   if (limit > INCIDENTS_MAX_LIMIT) limit = INCIDENTS_MAX_LIMIT;
@@ -134,30 +145,46 @@ export async function listIncidents(
       throw new RangeError("invalid status");
     }
     params.push(input.status);
-    where.push(`status = $${params.length}`);
+    where.push(`i.status = $${params.length}`);
   }
   if (input.before !== undefined) {
     if (!ID_RE.test(input.before)) throw new RangeError("invalid before");
     params.push(input.before);
-    where.push(`id < $${params.length}`);
+    where.push(`i.id < $${params.length}`);
   }
   const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
   params.push(limit);
 
-  const r = await query<IncidentRow>(
+  const aggregateParams = input.status === undefined ? [] : [input.status];
+  const [r, totals] = await Promise.all([query<IncidentRow>(
     // qualify ORDER BY(SELECT 有 id::text AS id,避免按 text 别名排)。
-    `SELECT id::text AS id, dedupe_key, condition_key, policy_id::text AS policy_id,
-            status, severity, surface, audience, user_title, user_message, ops_detail,
-            rev::text AS rev, resolve_source, opened_at, updated_at, resolved_at
-       FROM incidents
+    `SELECT i.id::text AS id, i.dedupe_key, i.condition_key, i.policy_id::text AS policy_id,
+            i.status, i.severity, i.surface, i.audience, i.user_title, i.user_message, i.ops_detail,
+            i.rev::text AS rev, i.resolve_source, i.opened_at, i.updated_at, i.resolved_at,
+            latest.status AS latest_repair_status,latest.updated_at AS latest_repair_at
+       FROM incidents i
+       LEFT JOIN LATERAL (
+         SELECT r.status,r.updated_at FROM codex_repairs r
+          WHERE r.incident_id=i.id ORDER BY r.id DESC LIMIT 1
+       ) latest ON TRUE
        ${whereClause}
-      ORDER BY incidents.id DESC
+      ORDER BY i.id DESC
       LIMIT $${params.length}`,
     params,
-  );
+  ), query<{ total: number; open_total: number }>(
+    `SELECT COUNT(*) FILTER (WHERE ($1::text IS NULL OR status=$1))::int AS total,
+            COUNT(*) FILTER (WHERE status<>'resolved')::int AS open_total
+       FROM incidents`,
+    [aggregateParams[0] ?? null],
+  )]);
   const rows = r.rows.map(serialize);
   const next = rows.length === limit ? rows[rows.length - 1].id : null;
-  return { rows, next_before: next };
+  return {
+    rows,
+    next_before: next,
+    total: totals.rows[0]?.total ?? 0,
+    open_total: totals.rows[0]?.open_total ?? 0,
+  };
 }
 
 // ─── detail:incident + repairs + events(脱敏)──────────────────────
@@ -213,10 +240,16 @@ export interface IncidentDetail {
 export async function getIncidentDetail(id: string): Promise<IncidentDetail | null> {
   if (!ID_RE.test(id)) throw new RangeError("invalid id");
   const incR = await query<IncidentRow>(
-    `SELECT id::text AS id, dedupe_key, condition_key, policy_id::text AS policy_id,
-            status, severity, surface, audience, user_title, user_message, ops_detail,
-            rev::text AS rev, resolve_source, opened_at, updated_at, resolved_at
-       FROM incidents WHERE id = $1::bigint`,
+    `SELECT i.id::text AS id, i.dedupe_key, i.condition_key, i.policy_id::text AS policy_id,
+            i.status, i.severity, i.surface, i.audience, i.user_title, i.user_message, i.ops_detail,
+            i.rev::text AS rev, i.resolve_source, i.opened_at, i.updated_at, i.resolved_at,
+            latest.status AS latest_repair_status,latest.updated_at AS latest_repair_at
+       FROM incidents i
+       LEFT JOIN LATERAL (
+         SELECT r.status,r.updated_at FROM codex_repairs r
+          WHERE r.incident_id=i.id ORDER BY r.id DESC LIMIT 1
+       ) latest ON TRUE
+      WHERE i.id = $1::bigint`,
     [id],
   );
   if (incR.rows.length === 0) return null;

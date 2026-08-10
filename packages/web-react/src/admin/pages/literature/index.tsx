@@ -1,7 +1,7 @@
-import { FlaskConical, Save } from "lucide-react";
+import { FlaskConical, RefreshCw, Save } from "lucide-react";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import { Badge, Button, Input, Skeleton, Spinner, Switch, useToast } from "../../../components/ui";
-import { PageHeader, SectionCard, TimeAgo } from "../../components";
+import { PageHeader, SectionCard, StatCard, StatCardRow, TimeAgo } from "../../components";
 import { adminGet, adminSend, apiErrorMessage } from "../../lib/adminApi";
 import { useAdminPoll } from "../../lib/useAdminPoll";
 import { getAdminPage } from "../../registry";
@@ -17,6 +17,27 @@ interface LiteratureConfig {
   timeout_sec: number;
   updated_at?: string;
   updated_by?: string | null;
+}
+
+interface LiteratureOperations {
+  daily: {
+    utc_day: string;
+    used: number | null;
+    cap: number;
+    source: string;
+  };
+  metrics: {
+    scope: "since_process_start" | "unavailable" | (string & {});
+    since: string | null;
+    counts: Record<string, number>;
+    last_success_at: string | null;
+    latency_ms: { p50: number | null; p95: number | null } | null;
+  };
+}
+
+interface LiteratureResponse {
+  config: LiteratureConfig;
+  operations?: LiteratureOperations | null;
 }
 
 interface TestResult {
@@ -51,14 +72,14 @@ function seedForm(c: LiteratureConfig): FormState {
 
 // 配置页（非监控页）：首载拉一次即可。useAdminPoll 无「纯 once」档，用超大间隔逼近
 // 「首载 + 手动重拉」；保存后经返回体就地重播种 + refresh() 刷新掩码/更新时间。
-const NO_POLL_MS = 6 * 60 * 60 * 1000;
+const OPS_POLL_MS = 30_000;
 
 export default function LiteraturePage() {
   const meta = getAdminPage("literature");
   const toast = useToast();
 
-  const config = useAdminPoll(() => adminGet<{ config: LiteratureConfig }>("/literature"), {
-    intervalMs: NO_POLL_MS,
+  const config = useAdminPoll(() => adminGet<LiteratureResponse>("/literature"), {
+    intervalMs: OPS_POLL_MS,
   });
   const c = config.data?.config ?? null;
 
@@ -167,7 +188,17 @@ export default function LiteraturePage() {
 
   return (
     <div className="flex flex-col gap-5">
-      <PageHeader title={meta.title} desc={meta.desc} />
+      <PageHeader
+        title={meta.title}
+        desc={meta.desc}
+        actions={
+          <Button variant="secondary" size="sm" onClick={config.refresh} disabled={config.loading}>
+            <RefreshCw size={14} className={config.loading ? "animate-spin" : undefined} />刷新运行数据
+          </Button>
+        }
+      />
+
+      <LiteratureOps operations={config.data?.operations ?? null} loading={config.loading && !config.data} />
 
       <SectionCard title="DeepXiv 文献检索" hint="平台级单例配置 · 改完点保存立即生效">
         {!ready && config.error ? (
@@ -326,6 +357,57 @@ export default function LiteraturePage() {
         )}
       </SectionCard>
     </div>
+  );
+}
+
+function LiteratureOps({
+  operations,
+  loading,
+}: {
+  operations: LiteratureOperations | null;
+  loading: boolean;
+}) {
+  if (loading) {
+    return <div className="h-28 animate-pulse rounded-xl bg-hover" />;
+  }
+  if (!operations) {
+    return (
+      <SectionCard title="运行数据" hint="数据窗口：不可用">
+        <p className="text-[13px] text-muted">当前版本未返回文献检索运行指标；不会把配置值当作真实使用量。</p>
+      </SectionCard>
+    );
+  }
+  const { daily, metrics } = operations;
+  const counts = metrics.counts ?? {};
+  const success = counts.success ?? counts.allowed ?? 0;
+  const errors = counts.error ?? 0;
+  const timeout = counts.timeout ?? 0;
+  const windowLabel = metrics.scope === "since_process_start"
+    ? `自本进程启动${metrics.since ? `（${new Date(metrics.since).toLocaleString("zh-CN", { hour12: false })}）` : ""}`
+    : "不可用";
+  const pct = daily.used !== null && daily.cap > 0 ? Math.min(100, (daily.used / daily.cap) * 100) : 0;
+  return (
+    <SectionCard title="运行数据" hint={`请求指标窗口：${windowLabel}`} bodyClassName="flex flex-col gap-4">
+      <div>
+        <div className="flex flex-wrap items-center justify-between gap-2 text-[13px]">
+          <span className="font-medium text-fg">今日用量（UTC {daily.utc_day}）</span>
+          <span className="tabular-nums text-muted">{daily.used === null ? "不可用" : daily.used.toLocaleString("en-US")} / {daily.cap.toLocaleString("en-US")} · {daily.source}</span>
+        </div>
+        <div className="mt-2 h-2 overflow-hidden rounded-full bg-hover" role="progressbar" tabIndex={0} aria-label="今日文献检索用量" aria-valuemin={0} aria-valuemax={daily.cap} aria-valuenow={daily.used ?? undefined}>
+          <div className="h-full rounded-full bg-accent" style={{ width: `${pct}%` }} />
+        </div>
+      </div>
+      <StatCardRow cols={3}>
+        <StatCard label="成功" value={success.toLocaleString("en-US")} hint="allowed" tone="success" />
+        <StatCard label="错误" value={errors.toLocaleString("en-US")} hint="上游、Redis 或配置读取" tone={errors > 0 ? "danger" : "neutral"} />
+        <StatCard label="超时" value={timeout.toLocaleString("en-US")} hint="upstream timeout" tone={timeout > 0 ? "danger" : "neutral"} />
+      </StatCardRow>
+      <div className="flex flex-wrap gap-x-6 gap-y-1 text-[12px] text-muted">
+        <span>最近成功：{metrics.last_success_at ? <TimeAgo value={metrics.last_success_at} /> : "暂无"}</span>
+        <span>延迟 p50：{metrics.latency_ms?.p50 == null ? "—" : `${Math.round(metrics.latency_ms.p50)} ms`}</span>
+        <span>延迟 p95：{metrics.latency_ms?.p95 == null ? "—" : `${Math.round(metrics.latency_ms.p95)} ms`}</span>
+      </div>
+    </SectionCard>
   );
 }
 

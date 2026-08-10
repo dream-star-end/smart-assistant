@@ -1,6 +1,7 @@
-import { Activity, CheckCircle2, RefreshCw, TriangleAlert } from "lucide-react";
+import { Activity, CheckCircle2, Clock3, Link2, RefreshCw, TriangleAlert, Users } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
-import { Badge, Button, Card } from "../../../components/ui";
+import type { ReactNode } from "react";
+import { Alert, Badge, Button, Card } from "../../../components/ui";
 import { type Column, DataTable, StatCard, StatCardRow } from "../../components";
 import { adminGet, apiErrorMessage } from "../../lib/adminApi";
 
@@ -14,9 +15,28 @@ type ModelRow = {
   attempts_7d: string; success_7d: string; failures_7d: string; cancellations_7d: string;
 };
 type CountRow = Record<string, string>;
+type EventWindow = {
+  total: number;
+  affected_users: number;
+  outcomes: {
+    failed: number;
+    recovered: number;
+    succeeded: number;
+    abandoned: number;
+    pending: number;
+    cancelled: number;
+  };
+  latest_occurrence: string | null;
+  trace: { total: number; with_trace: number; missing_trace: number };
+};
 type ProductFrictionResponse = {
   generated_at: string;
   windows: { operational_days: number; funnel_days: number };
+  event_summary: {
+    last_1h: EventWindow;
+    last_24h: EventWindow;
+    last_7d: EventWindow;
+  };
   events: EventRow[];
   models: ModelRow[];
   model_failures: CountRow[];
@@ -105,6 +125,8 @@ export function ProductFrictionTab() {
     const pending = data?.events.reduce((sum, row) => sum + n(row.pending_7d), 0) ?? 0;
     return { attempts, failures, cancellations, recovered, pending };
   }, [data]);
+  const currentWindow = data?.event_summary?.last_1h;
+  const latest = data?.event_summary?.last_7d.latest_occurrence;
 
   if (error) {
     return (
@@ -118,10 +140,26 @@ export function ProductFrictionTab() {
   return (
     <div className="flex flex-col gap-4">
       <div className="flex items-center justify-between gap-3">
-        <p className="text-[12px] text-faint">重试是过程，不等于终局失败；模型、图片、订单、GitHub 与评分分别使用各自权威表，不跨来源相加。</p>
+        <p className="text-[12px] text-faint">重试是过程，不等于终局失败；这里按时间窗和受影响用户判断当前是否仍在持续。</p>
         <Button size="sm" variant="secondary" onClick={() => setReload((v) => v + 1)} disabled={loading}>
           <RefreshCw size={14} />刷新
         </Button>
+      </div>
+      {!loading && currentWindow && (
+        currentWindow.total > 0 ? (
+          <Alert tone="warning" icon={<TriangleAlert size={17} />} title="最近 1 小时仍有产品摩擦">
+            {currentWindow.total} 个事件，影响 {currentWindow.affected_users} 位用户；最近发生于{latest ? ` ${new Date(latest).toLocaleString('zh-CN')}` : '未知时间'}。
+          </Alert>
+        ) : (
+          <Alert tone="success" icon={<CheckCircle2 size={17} />} title="最近 1 小时未继续发生">
+            7 天历史数据仅用于复盘，不代表故障仍在持续。最近一次发生于{latest ? ` ${new Date(latest).toLocaleString('zh-CN')}` : '暂无记录'}。
+          </Alert>
+        )
+      )}
+      <div className="grid gap-3 md:grid-cols-3">
+        <WindowCard title="最近 1 小时" value={data?.event_summary?.last_1h} loading={loading} />
+        <WindowCard title="最近 24 小时" value={data?.event_summary?.last_24h} loading={loading} />
+        <WindowCard title="最近 7 天" value={data?.event_summary?.last_7d} loading={loading} />
       </div>
       <StatCardRow>
         <StatCard label="24 小时模型尝试" value={summary.attempts.toLocaleString()} icon={Activity} tone="info" loading={loading} />
@@ -148,4 +186,48 @@ export function ProductFrictionTab() {
       </div>
     </div>
   );
+}
+
+function WindowCard({ title, value, loading }: { title: string; value?: EventWindow; loading: boolean }) {
+  const traceRate = value && value.trace.total > 0
+    ? `${((value.trace.with_trace / value.trace.total) * 100).toFixed(1)}%`
+    : '—'
+  return (
+    <Card className="min-w-0 p-4">
+      <div className="flex items-center justify-between gap-2">
+        <h3 className="text-[13px] font-semibold text-fg">{title}</h3>
+        <Clock3 size={15} className="text-faint" />
+      </div>
+      {loading ? (
+        <p className="mt-3 text-sm text-faint">加载中…</p>
+      ) : (
+        <>
+          <div className="mt-3 flex flex-wrap gap-x-4 gap-y-2">
+            <Metric icon={<Activity size={13} />} label="事件" value={value?.total ?? 0} />
+            <Metric icon={<Users size={13} />} label="用户" value={value?.affected_users ?? 0} />
+            <Metric icon={<Link2 size={13} />} label="trace" value={traceRate} />
+          </div>
+          <div className="mt-3 grid grid-cols-2 gap-1 text-[11px] text-faint sm:grid-cols-3">
+            <span>失败 <b className="text-danger">{value?.outcomes.failed ?? 0}</b></span>
+            <span>恢复 <b className="text-success">{value?.outcomes.recovered ?? 0}</b></span>
+            <span>成功 <b className="text-success">{value?.outcomes.succeeded ?? 0}</b></span>
+            <span>放弃 <b className="text-warning">{value?.outcomes.abandoned ?? 0}</b></span>
+            <span>进行中 <b className="text-fg">{value?.outcomes.pending ?? 0}</b></span>
+            <span>取消 <b className="text-fg">{value?.outcomes.cancelled ?? 0}</b></span>
+          </div>
+          <p className="mt-3 truncate text-[11px] text-faint" title={value?.latest_occurrence ?? undefined}>
+            最近：{value?.latest_occurrence ? new Date(value.latest_occurrence).toLocaleString('zh-CN') : '暂无'}
+          </p>
+        </>
+      )}
+    </Card>
+  )
+}
+
+function Metric({ icon, label, value }: { icon: ReactNode; label: string; value: string | number }) {
+  return (
+    <span className="inline-flex items-center gap-1 text-[12px] text-muted">
+      {icon}{label} <b className="tabular-nums text-fg">{value}</b>
+    </span>
+  )
 }

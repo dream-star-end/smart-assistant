@@ -27,11 +27,11 @@ import {
 import { type ComponentType, type LazyExoticComponent, lazy } from "react";
 
 /**
- * 管理后台页面注册表 —— 22 页 / 6 分组的**唯一权威**。
+ * 管理后台页面注册表 —— 页面与分组的**唯一权威**。
  *
- * 分组结构与中文文案抄旧 vanilla admin 的 ADMIN_TAB_META（packages/web/public/modules/
- * admin.js:436-458），保证与运维肌肉记忆、深链一致。每页组件经 React.lazy 动态 import
- * 拆成独立按需 chunk（首屏只下载 Shell + 当前页）。
+ * 页面 key 保持旧版深链兼容；分组按运营任务重组，让用户声音、用户触达、内容运营和
+ * 运行事故各自成域。每页组件经 React.lazy 动态 import 拆成独立按需 chunk（首屏只下载
+ * Shell + 当前页）。
  *
  * 各页面 agent 只需替换 `pages/<key>/index.tsx` 的默认导出实现；本表的 key/分组/文案/图标
  * 不属于页面 agent 的所有权（改分组/文案回到本文件）。
@@ -42,8 +42,12 @@ export type AdminGroup =
   | "账号与调度"
   | "运行资源"
   | "财务与商业"
+  | "用户声音与体验"
   | "用户触达"
-  | "系统运营";
+  | "内容运营"
+  | "系统配置"
+  | "运行与事故"
+  | "审计与安全";
 
 /** 侧栏分组渲染顺序（权威）。 */
 export const ADMIN_GROUP_ORDER: AdminGroup[] = [
@@ -51,8 +55,12 @@ export const ADMIN_GROUP_ORDER: AdminGroup[] = [
   "账号与调度",
   "运行资源",
   "财务与商业",
+  "用户声音与体验",
   "用户触达",
-  "系统运营",
+  "内容运营",
+  "系统配置",
+  "运行与事故",
+  "审计与安全",
 ];
 
 export type AdminPage = {
@@ -88,18 +96,23 @@ export const adminPages: AdminPage[] = [
   { key: "plans", title: "充值套餐", group: "财务与商业", desc: "金额、积分和排序", icon: CreditCard, Component: lz(() => import("./pages/plans")) },
   { key: "org", title: "组织", group: "财务与商业", desc: "组织账户、成员和开票申请", icon: Building2, Component: lz(() => import("./pages/org")) },
   { key: "modelGrants", title: "用户模型授权", group: "财务与商业", desc: "按用户放行特殊模型", icon: ShieldCheck, Component: lz(() => import("./pages/modelGrants")) },
+  // ── 用户声音与体验 ──
+  { key: "feedback", title: "反馈与评分", group: "用户声音与体验", desc: "用户反馈、响应评分与处理闭环", icon: MessageSquare, Component: lz(() => import("./pages/feedback")) },
+  { key: "autoDreamFindings", title: "平台优化发现", group: "用户声音与体验", desc: "Auto‑Dream 匿名聚合的平台改进建议", icon: WandSparkles, Component: lz(() => import("./pages/autoDreamFindings")) },
+  { key: "productFriction", title: "产品摩擦", group: "用户声音与体验", desc: "用户可见失败、恢复与受影响范围", icon: Activity, Component: lz(() => import("./pages/audit/ProductFrictionTab").then((m) => ({ default: m.ProductFrictionTab }))) },
   // ── 用户触达 ──
-  { key: "feedback", title: "反馈", group: "用户触达", desc: "用户问题、优先级和确认", icon: MessageSquare, Component: lz(() => import("./pages/feedback")) },
-  { key: "autoDreamFindings", title: "平台优化发现", group: "用户触达", desc: "Auto‑Dream 匿名聚合的平台改进建议", icon: WandSparkles, Component: lz(() => import("./pages/autoDreamFindings")) },
   { key: "inbox", title: "站内信", group: "用户触达", desc: "发送、历史和触达记录", icon: Mail, Component: lz(() => import("./pages/inbox")) },
-  { key: "marketplace", title: "技能市场", group: "用户触达", desc: "审核投稿、上架和下架", icon: Store, Component: lz(() => import("./pages/marketplace")) },
-  // ── 系统运营 ──
-  { key: "literature", title: "文献检索", group: "系统运营", desc: "检索服务连接和配额", icon: BookOpen, Component: lz(() => import("./pages/literature")) },
-  { key: "settings", title: "系统设置", group: "系统运营", desc: "开关、阈值和 JSON 配置", icon: Settings, Component: lz(() => import("./pages/settings")) },
-  { key: "audit", title: "审计日志", group: "系统运营", desc: "操作者、对象和配置变更", icon: History, Component: lz(() => import("./pages/audit")) },
-  { key: "health", title: "健康面板", group: "系统运营", desc: "服务依赖和探针状态", icon: Activity, Component: lz(() => import("./pages/health")) },
-  { key: "alerts", title: "告警", group: "系统运营", desc: "风险确认、静默和处理", icon: Bell, Component: lz(() => import("./pages/alerts")) },
-  { key: "selfheal", title: "自愈修复", group: "系统运营", desc: "异常事故与 codex 自动修复审计", icon: Wrench, Component: lz(() => import("./pages/selfheal")) },
+  // ── 内容运营 ──
+  { key: "marketplace", title: "技能市场", group: "内容运营", desc: "审核投稿、上架和下架", icon: Store, Component: lz(() => import("./pages/marketplace")) },
+  // ── 系统配置 ──
+  { key: "literature", title: "文献检索", group: "系统配置", desc: "检索服务连接、配额和运行数据", icon: BookOpen, Component: lz(() => import("./pages/literature")) },
+  { key: "settings", title: "系统设置", group: "系统配置", desc: "配置风险、变更预览和审计", icon: Settings, Component: lz(() => import("./pages/settings")) },
+  // ── 运行与事故 ──
+  { key: "health", title: "健康与 SLO", group: "运行与事故", desc: "业务 SLO、服务依赖和当前行动", icon: Activity, Component: lz(() => import("./pages/health")) },
+  { key: "alerts", title: "告警", group: "运行与事故", desc: "当前行动、确认、静默和投递", icon: Bell, Component: lz(() => import("./pages/alerts")) },
+  { key: "selfheal", title: "自愈修复", group: "运行与事故", desc: "异常事故、持续时间与自动修复审计", icon: Wrench, Component: lz(() => import("./pages/selfheal")) },
+  // ── 审计与安全 ──
+  { key: "audit", title: "审计与安全", group: "审计与安全", desc: "管理操作、安全事件与主机审计", icon: History, Component: lz(() => import("./pages/audit")) },
 ];
 
 /** tab key 白名单（路由回落判定）。 */
