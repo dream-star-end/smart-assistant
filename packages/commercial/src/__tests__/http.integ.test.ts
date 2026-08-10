@@ -435,13 +435,84 @@ describe("commercial HTTP router (integ)", () => {
       user_id: string | null;
       description: string;
       request_id: string | null;
+      traffic_class: string | null;
     }>(
-      "SELECT user_id::text AS user_id,description,request_id FROM feedback ORDER BY id",
+      "SELECT user_id::text AS user_id,description,request_id,traffic_class FROM feedback ORDER BY id",
     );
     assert.deepEqual(rows.rows, [
-      { user_id: null, description: "好", request_id: null },
-      { user_id: userId, description: "短", request_id: "trace-feedback-1" },
+      { user_id: null, description: "好", request_id: null, traffic_class: null },
+      { user_id: userId, description: "短", request_id: "trace-feedback-1", traffic_class: "production_user" },
     ]);
+    await query(
+      `INSERT INTO feedback(user_id,category,description)
+       VALUES ($1::bigint,'bug','migration 0203 之前的历史反馈')`,
+      [userId],
+    );
+
+    const adminRow = await query<{ id: string }>(
+      `INSERT INTO users(email,password_hash,email_verified,role)
+       VALUES ('feedback-admin@example.com','x',true,'admin') RETURNING id::text`,
+    );
+    const adminAccess = (await signAccess({ sub: adminRow.rows[0].id, role: "admin" }, JWT_SECRET)).token;
+    const listed = await fetch(`${baseUrl}/api/admin/feedback?limit=1`, {
+      headers: { Authorization: `Bearer ${adminAccess}` },
+    });
+    assert.equal(listed.status, 200);
+    const listBody = await listed.json() as {
+      rows: Array<{ id: string; traffic_class: string }>;
+      totals: { total: number; by_status: { open: number } };
+    };
+    assert.equal(listBody.totals.total, 1, "anonymous feedback must not enter production totals");
+    assert.equal(listBody.rows[0]?.traffic_class, "production_user");
+    const legacyListed = await fetch(
+      `${baseUrl}/api/admin/feedback?traffic_class=legacy_unavailable`,
+      { headers: { Authorization: `Bearer ${adminAccess}` } },
+    );
+    assert.equal(legacyListed.status, 200);
+    const legacyBody = await legacyListed.json() as {
+      rows: Array<{ traffic_class: string }>;
+      totals: { total: number };
+    };
+    assert.equal(legacyBody.totals.total, 1);
+    assert.equal(legacyBody.rows[0]?.traffic_class, "legacy_unavailable");
+    const feedbackId = listBody.rows[0]!.id;
+    const assigned = await postJson(
+      `/api/admin/feedback/${feedbackId}/assign`,
+      { assigned_to: adminRow.rows[0].id },
+      { Authorization: `Bearer ${adminAccess}` },
+    );
+    assert.equal(assigned.status, 200, JSON.stringify(assigned.json));
+    const invalidAssignee = await postJson(
+      `/api/admin/feedback/${feedbackId}/assign`,
+      { assigned_to: userId },
+      { Authorization: `Bearer ${adminAccess}` },
+    );
+    assert.equal(invalidAssignee.status, 400, JSON.stringify(invalidAssignee.json));
+    const priority = await postJson(
+      `/api/admin/feedback/${feedbackId}/priority`,
+      { priority: "high" },
+      { Authorization: `Bearer ${adminAccess}` },
+    );
+    assert.equal(priority.status, 200, JSON.stringify(priority.json));
+    const closed = await postJson(
+      `/api/admin/feedback/${feedbackId}/close`,
+      { resolution: "已定位并处理" },
+      { Authorization: `Bearer ${adminAccess}` },
+    );
+    assert.equal(closed.status, 200, JSON.stringify(closed.json));
+    const reopened = await postJson(
+      `/api/admin/feedback/${feedbackId}/reopen`,
+      {},
+      { Authorization: `Bearer ${adminAccess}` },
+    );
+    assert.equal(reopened.status, 200, JSON.stringify(reopened.json));
+    const workflow = await query<{ status: string; priority: string; resolution: string; assigned_to: string }>(
+      `SELECT status,priority,resolution,assigned_to::text FROM feedback WHERE id=$1`, [feedbackId],
+    );
+    assert.deepEqual(workflow.rows[0], {
+      status: "open", priority: "high", resolution: "已定位并处理",
+      assigned_to: adminRow.rows[0].id,
+    });
   });
 
   test("admin response-ratings source defaults explicit, supports implicit/all, rejects unknown", async (t) => {

@@ -613,6 +613,211 @@ describe("admin pricing — NOTIFY 联动", () => {
 // ============================================================
 
 describe("admin pricing/plans — HTTP", () => {
+  test("ops overview counts durable production turns and only failed users as affected", async (t) => {
+    if (skipIfNoHttp(t)) return;
+    const admin = await createUser("ops-overview-admin@x.com", "admin");
+    const first = await createUser("ops-overview-first@x.com");
+    const second = await createUser("ops-overview-second@x.com");
+    const internal = await createUser("ops-overview-internal@x.com");
+    await query("UPDATE users SET signal_traffic_class='internal_admin' WHERE id=$1", [internal.toString()]);
+    const now = Date.now();
+    for (const [index, user] of [first, second, internal].entries()) {
+      await query(
+        `INSERT INTO client_sessions(id,user_id,agent_id,title,created_at,last_at,updated_at)
+         VALUES ($1,$2,'main','ops overview',$3,$3,$3)`,
+        [`ops-overview-${index}`, `c:${user.toString()}`, now],
+      );
+    }
+    const tapes = [
+      ["ops-overview-0", first, "completed", "1", 100],
+      ["ops-overview-0", first, "crashed", "2", 300],
+      ["ops-overview-1", second, "completed", "3", 500],
+      ["ops-overview-2", internal, "crashed", "4", 700],
+    ] as const;
+    for (const [sessionId, user, status, suffix, duration] of tapes) {
+      await query(
+        `INSERT INTO client_session_turn_tapes
+           (session_id,user_id,tape_id,agent_id,turn_index,status,turn_key,tape_sha256,
+            total_bytes,part_count,created_at,finalized_at)
+         VALUES ($1,$2,$3,'main',0,$4,$5,$6,1,1,$7,$8)`,
+        [sessionId, `c:${user.toString()}`, `tape-${suffix}`, status,
+          suffix.repeat(64), suffix.repeat(64), now-60_000, now-60_000+duration],
+      );
+    }
+
+    const response = await fetch(`${baseUrl}/api/admin/ops-overview`, {
+      headers: { Authorization: `Bearer ${await tokenFor(admin, "admin")}` },
+    });
+    assert.equal(response.status, 200);
+    const body = await response.json() as {
+      slo: { source: string; windows: Record<string, {
+        success: number; failure: number; affected_users: number;
+      }> };
+    };
+    assert.equal(body.slo.source, "durable");
+    assert.equal(body.slo.windows.last_15m.success, 2);
+    assert.equal(body.slo.windows.last_15m.failure, 1);
+    assert.equal(body.slo.windows.last_15m.affected_users, 1);
+
+    await query(
+      `DELETE FROM client_session_turn_tapes
+        WHERE session_id IN ('ops-overview-0','ops-overview-1')`,
+    );
+    const internalOnlyResponse = await fetch(`${baseUrl}/api/admin/ops-overview`, {
+      headers: { Authorization: `Bearer ${await tokenFor(admin, "admin")}` },
+    });
+    assert.equal(internalOnlyResponse.status, 200);
+    const internalOnlyBody = await internalOnlyResponse.json() as {
+      slo: { windows: Record<string, {
+        success: number; failure: number; affected_users: number;
+        latency_ms: { p50: number | null; p95: number | null };
+      }> };
+    };
+    for (const window of ["last_15m", "last_1h", "last_24h"]) {
+      assert.deepEqual(internalOnlyBody.slo.windows[window], {
+        success: 0,
+        failure: 0,
+        affected_users: 0,
+        latency_ms: { p50: null, p95: null },
+      });
+    }
+  });
+
+  test("marketplace cohort follows ordered user+skill journey and ignores user-layer usage", async (t) => {
+    if (skipIfNoHttp(t)) return;
+    const admin = await createUser("market-cohort-admin@x.com", "admin");
+    const user = await createUser("market-cohort-user@x.com");
+    const slugs = ["ordered-journey", "out-of-order-journey"];
+    for (const slug of slugs) {
+      await query(
+        `INSERT INTO marketplace_skill_listings(slug,owner_user_id) VALUES ($1,$2)`,
+        [slug, user.toString()],
+      );
+      const version = await query<{ id: string }>(
+        `INSERT INTO marketplace_skill_versions
+           (slug,version,name,description,raw_skill_md,artifact_hash,embedding_hash,status,submitted_by)
+         VALUES ($1,'1.0.0',$1,'test','# test',$1||'-artifact',$1||'-embedding','approved',$2)
+         RETURNING id::text AS id`,
+        [slug, user.toString()],
+      );
+      const exposureAt = slug === "ordered-journey" ? "4 minutes" : "4 minutes";
+      const detailAt = slug === "ordered-journey" ? "3 minutes" : "5 minutes";
+      await recordProductFrictionEvent({
+        correlation: `${slug}-exposure`, userId: user, surface: "marketplace",
+        stage: "catalog_exposure", code: "CATALOG_EXPOSURE", outcome: "succeeded", entitySlug: slug,
+      });
+      await recordProductFrictionEvent({
+        correlation: `${slug}-detail`, userId: user, surface: "marketplace",
+        stage: "detail_view", code: "DETAIL_VIEW", outcome: "succeeded", entitySlug: slug,
+      });
+      await query(
+        `UPDATE product_friction_events SET created_at=NOW()-$4::interval
+          WHERE user_id=$1 AND surface='marketplace' AND entity_slug=$2 AND stage=$3`,
+        [user.toString(), slug, "catalog_exposure", exposureAt],
+      );
+      await query(
+        `UPDATE product_friction_events SET created_at=NOW()-$4::interval
+          WHERE user_id=$1 AND surface='marketplace' AND entity_slug=$2 AND stage=$3`,
+        [user.toString(), slug, "detail_view", detailAt],
+      );
+      await query(
+        `INSERT INTO marketplace_installs
+           (user_id,slug,version_id,artifact_hash,installed_by,installed_at)
+         VALUES ($1,$2,$3,$2||'-artifact',$1,NOW()-INTERVAL '2 minutes')`,
+        [user.toString(), slug, version.rows[0]!.id],
+      );
+      await query(
+        `INSERT INTO marketplace_skill_usage_events
+           (user_id,slug,event_id,layer,created_at)
+         VALUES
+           ($1,$2,$2||'-hub-1','hub',NOW()-INTERVAL '1 minute'),
+           ($1,$2,$2||'-hub-2','hub',NOW()-INTERVAL '30 seconds'),
+           ($1,$2,$2||'-private','user',NOW()-INTERVAL '15 seconds')`,
+        [user.toString(), slug],
+      );
+    }
+
+    const response = await fetch(`${baseUrl}/api/admin/marketplace/funnel`, {
+      headers: { Authorization: `Bearer ${await tokenFor(admin, "admin")}` },
+    });
+    assert.equal(response.status, 200);
+    const body = await response.json() as {
+      cohort: {
+        availability: string; exposure_pairs: number; detail_pairs: number;
+        installed_pairs: number; first_use_pairs: number; repeat_pairs: number;
+      };
+    };
+    assert.deepEqual(body.cohort, {
+      availability: "available",
+      unavailable_events: 0,
+      exposure_pairs: 2,
+      detail_pairs: 1,
+      installed_pairs: 1,
+      first_use_pairs: 1,
+      repeat_pairs: 1,
+      conversions: {
+        exposure_to_detail: 0.5,
+        detail_to_install: 1,
+        install_to_first_use: 1,
+        first_use_to_repeat: 1,
+      },
+    });
+  });
+
+  test("authenticated marketplace exposure batch persists every user+slug row; anonymous and oversized batches are ignored", async (t) => {
+    if (skipIfNoHttp(t)) return;
+    const user = await createUser("market-batch-user@x.com");
+    const token = await tokenFor(user, "user");
+    const event = (slug: string, code = "BATCH_EXPOSURE") => ({
+      event_id: `batch-${slug}`,
+      surface: "marketplace",
+      stage: "catalog_exposure",
+      code,
+      outcome: "succeeded",
+      entity_slug: slug,
+    });
+
+    const accepted = await fetch(`${baseUrl}/api/client-errors`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ events: [event("batch-one"), event("batch-two")] }),
+    });
+    assert.equal(accepted.status, 200);
+
+    const anonymous = await fetch(`${baseUrl}/api/client-errors`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ events: [event("batch-anonymous", "BATCH_ANONYMOUS")] }),
+    });
+    assert.equal(anonymous.status, 200);
+
+    const oversized = await fetch(`${baseUrl}/api/client-errors`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        events: Array.from({ length: 51 }, (_, index) =>
+          event(`batch-oversized-${index}`, "BATCH_OVERSIZED")),
+      }),
+    });
+    assert.equal(oversized.status, 200);
+
+    const rows = await query<{
+      user_id: string | null;
+      entity_slug: string | null;
+      surface: string;
+      stage: string;
+      code: string;
+    }>(
+      `SELECT user_id::text AS user_id,entity_slug,surface,stage,code
+         FROM product_friction_events
+        WHERE code LIKE 'BATCH_%' ORDER BY entity_slug`,
+    );
+    assert.deepEqual(rows.rows, [
+      { user_id: user.toString(), entity_slug: "batch-one", surface: "marketplace", stage: "catalog_exposure", code: "BATCH_EXPOSURE" },
+      { user_id: user.toString(), entity_slug: "batch-two", surface: "marketplace", stage: "catalog_exposure", code: "BATCH_EXPOSURE" },
+    ]);
+  });
+
   test("GET /product-friction returns recovery-aware source-separated telemetry", async (t) => {
     if (skipIfNoHttp(t)) return;
     const admin = await createUser("friction-admin@x.com", "admin");
@@ -710,10 +915,17 @@ describe("admin pricing/plans — HTTP", () => {
       images: Array<{ status: string; code: string; records: string }>;
       image_attempts: Array<{ outcome: string; code: string; attempts_7d: string }>;
       orders: unknown[]; github: Array<{ status: string; code: string; missing_session: string }>; ratings: unknown[];
+      event_summary: Record<string, {
+        total: number; affected_users: number; latest_occurrence: string | null;
+        outcomes: { recovered: number }; trace: { total: number; missing_trace: number };
+      }>;
     };
     assert.deepEqual(body.windows, { operational_days: 7, funnel_days: 30 });
     assert.ok(Array.isArray(body.models) && Array.isArray(body.images) && Array.isArray(body.orders));
     assert.ok(Array.isArray(body.github) && Array.isArray(body.ratings));
+    assert.ok(body.event_summary.last_1h.total >= 1);
+    assert.ok(body.event_summary.last_24h.latest_occurrence);
+    assert.equal(body.event_summary.last_7d.trace.total, body.event_summary.last_7d.total);
     const event = body.events.find((row) => row.surface === "auth" && row.code === "REFRESH_RACE");
     assert.ok(event, `missing auth refresh journey: ${JSON.stringify(body.events)}`);
     assert.equal(event.attempts_7d, "2");
@@ -735,6 +947,59 @@ describe("admin pricing/plans — HTTP", () => {
       "1",
       "canonical c:<uid> active session must not be reported as missing",
     );
+  });
+
+  test("AutoDream findings support evidence filters and audited batch ownership/status", async (t) => {
+    if (skipIfNoHttp(t)) return;
+    const admin = await createUser("auto-dream-ops@x.com", "admin");
+    const token = await tokenFor(admin, "admin");
+    const inserted = await query<{ id: string }>(
+      `INSERT INTO auto_dream_platform_findings
+         (fingerprint,taxonomy,capability_id,severity,title,problem,impact,recommendation,
+          occurrence_count,affected_user_count,last_model,last_run_id)
+       VALUES
+         (repeat('7',64),'reliability','admin.ops.one','high','运维发现一','问题一','影响一','建议一',
+          2,2,'gpt-5.6-terra','00000000-0000-4000-8000-000000000071'),
+         (repeat('8',64),'performance','admin.ops.two','medium','运维发现二','问题二','影响二','建议二',
+          1,1,'gpt-5.6-terra','00000000-0000-4000-8000-000000000081')
+       RETURNING id::text`,
+    );
+    await query(
+      `INSERT INTO auto_dream_platform_finding_occurrences
+         (finding_id,subject_hash,run_id,agent_hash,signal_count,evidence_hash,model,traffic_class)
+       VALUES
+         ($1,repeat('1',64),'00000000-0000-4000-8000-000000000071',repeat('2',64),1,repeat('3',64),'gpt-5.6-terra','production_user'),
+         ($1,repeat('4',64),'00000000-0000-4000-8000-000000000072',repeat('5',64),1,repeat('6',64),'gpt-5.6-terra','production_user'),
+         ($2,repeat('9',64),'00000000-0000-4000-8000-000000000081',repeat('a',64),1,repeat('b',64),'gpt-5.6-terra','production_user')`,
+      [inserted.rows[0]!.id, inserted.rows[1]!.id],
+    );
+    const filtered = await fetch(
+      `${baseUrl}/api/admin/auto-dream-findings?traffic_class=production_user&model=all&seen_within=24h&min_affected_users=2`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+    assert.equal(filtered.status, 200);
+    const filteredBody = await filtered.json() as { total: number; rows: Array<{ id: string }> };
+    assert.equal(filteredBody.total, 1);
+    assert.equal(filteredBody.rows[0]?.id, inserted.rows[0]!.id);
+
+    const updated = await fetch(`${baseUrl}/api/admin/auto-dream-findings/batch`, {
+      method: "PATCH",
+      headers: { Authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ ids: inserted.rows.map((row) => row.id), status: "planned", owner: "dx" }),
+    });
+    assert.equal(updated.status, 200);
+    assert.deepEqual(await updated.json(), { ok: true, updated: 2 });
+    const stored = await query<{ status: string; owner: string }>(
+      `SELECT status,owner FROM auto_dream_platform_findings
+        WHERE id=ANY($1::bigint[]) ORDER BY id`,
+      [inserted.rows.map((row) => row.id)],
+    );
+    assert.deepEqual(stored.rows, [
+      { status: "planned", owner: "dx" },
+      { status: "planned", owner: "dx" },
+    ]);
+    const audits = await listAdminAudit({ action: "auto_dream_finding.batch" });
+    assert.equal(audits.rows.length, 1);
   });
 
   test("非 admin → 403;admin GET /pricing → 列表", async (t) => {
