@@ -3761,6 +3761,96 @@ describe("durable live turn frame journal", () => {
     assert.equal(projected.hasTapeProjection, true);
   });
 
+  maybe("keeps later dispatches durable when a gateway session restarts its frame sequence", async () => {
+    const sessionId = "s-live-frame-sequence-reset";
+    const userId = "c:903";
+    const sessionKey = "agent:main:webchat:dm:s-live-frame-sequence-reset";
+    const firstDispatchId = randomUUID();
+    const secondDispatchId = randomUUID();
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    await pool.query(
+      `INSERT INTO turn_dispatches
+         (dispatch_id,user_id,session_id,client_message_id,agent_id,request_hash,
+          billing_request_id,status,owner_id,lease_until)
+       VALUES
+         ($1,903,$3,'cm-reset-first','main',$4,$5,'accepted','test-owner',NOW()+INTERVAL '1 minute'),
+         ($2,903,$3,'cm-reset-second','main',$6,$7,'accepted','test-owner',NOW()+INTERVAL '1 minute')`,
+      [
+        firstDispatchId,
+        secondDispatchId,
+        sessionId,
+        "3".repeat(64),
+        `billing-${firstDispatchId}`,
+        "4".repeat(64),
+        `billing-${secondDispatchId}`,
+      ],
+    );
+    const firstPayload = JSON.stringify({
+      type: "outbound.message",
+      sessionKey,
+      frameSeq: 1,
+      peer: { id: sessionId, kind: "dm" },
+      clientMessageId: "cm-reset-first",
+      blocks: [{ kind: "text", text: "first generation" }],
+    });
+    const secondPayload = JSON.stringify({
+      type: "outbound.message",
+      sessionKey,
+      frameSeq: 1,
+      peer: { id: sessionId, kind: "dm" },
+      clientMessageId: "cm-reset-second",
+      blocks: [{ kind: "text", text: "second generation" }],
+    });
+    const base = {
+      uid: 903n,
+      sessionId,
+      agentContainerId: 445,
+      sessionKey,
+      frameSeq: 1,
+    };
+
+    await persistGatewayLiveFrame(pool, {
+      ...base,
+      clientMessageId: "cm-reset-first",
+      payload: firstPayload,
+    });
+    await Promise.all([
+      persistGatewayLiveFrame(pool, {
+        ...base,
+        clientMessageId: "cm-reset-second",
+        payload: secondPayload,
+      }),
+      persistGatewayLiveFrame(pool, {
+        ...base,
+        clientMessageId: "cm-reset-second",
+        payload: secondPayload,
+      }),
+    ]);
+    await assert.rejects(
+      persistGatewayLiveFrame(pool, {
+        ...base,
+        clientMessageId: "cm-reset-second",
+        payload: `${secondPayload} `,
+      }),
+      /immutable payload conflict/,
+    );
+
+    const stored = await pool.query<{ frame_count: string; session_key_count: string }>(
+      `SELECT COUNT(*)::text AS frame_count,COUNT(DISTINCT session_key)::text AS session_key_count
+         FROM client_session_live_frames
+        WHERE agent_container_id=$1 AND frame_seq=1`,
+      [base.agentContainerId],
+    );
+    assert.deepEqual(stored.rows[0], { frame_count: "2", session_key_count: "2" });
+    const page = await readClientSessionLiveFrames(pool, sessionId, userId, 0, 10);
+    assert.ok(page);
+    assert.deepEqual(
+      page.frames.map((frame) => frame.payload),
+      [JSON.parse(firstPayload), JSON.parse(secondPayload)],
+    );
+    assert.deepEqual(page.streamClientMessageIds, ["cm-reset-first", "cm-reset-second"]);
+  });
+
   maybe("imports one proven crashed rollout atomically and rejects identity or payload drift", async () => {
     const sessionId = "s-live-rollout-import";
     const userId = "c:902";
