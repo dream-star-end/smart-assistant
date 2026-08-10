@@ -157,10 +157,6 @@ DEPLOY_SURFACE_CHECK="$SCRIPT_DIR/v5-deploy-surface-check.mjs"
   exit 1
 }
 TURN_WAIVER_SQL_GATE="$SCRIPT_DIR/v5-turn-waiver-sql-gate.sh"
-[ -x "$TURN_WAIVER_SQL_GATE" ] || {
-  echo "FATAL: 缺或不可执行的 turn waiver SQL gate: $TURN_WAIVER_SQL_GATE" >&2
-  exit 1
-}
 BRANCH_POLICY_SCRIPT="$SCRIPT_DIR/v5-branch-policy.sh"
 [ -f "$BRANCH_POLICY_SCRIPT" ] || {
   echo "FATAL: 缺 V5 branch policy: $BRANCH_POLICY_SCRIPT" >&2
@@ -3140,6 +3136,10 @@ build_release() {
   BUILT_RELEASE_SOURCE_COMMIT="$full_sha"
   # 审计 9:build_release 是「哪个 commit 会变成线上 release」的唯一收口点,CI 绿门挂在这里。
   assert_ci_green_for_source_commit "$full_sha" || return 1
+  [ -x "$TURN_WAIVER_SQL_GATE" ] || {
+    echo "✗ 缺或不可执行的 turn waiver SQL gate: $TURN_WAIVER_SQL_GATE" >&2
+    return 1
+  }
   if [[ "$DRY" == 1 ]]; then
     OC_V5_TURN_WAIVER_SOURCE_COMMIT="$full_sha" "$TURN_WAIVER_SQL_GATE" --source-only || return 1
   else
