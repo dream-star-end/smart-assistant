@@ -1152,6 +1152,34 @@
           "assertion": "断线重连:回复到达或明确失败,绝不永久静默"
         }
       ]
+    },
+    {
+      "id": "INC-20260810-TURN-WAIVER-PARAM-TYPE",
+      "occurredAt": "2026-08-10",
+      "severity": "P1",
+      "symptom": "自动免单写入定向收件箱时，同一个 PostgreSQL 参数被同时推断为 bigint 与 text，导致 waiver 事务报 42P08 并回滚，用户无法收到免单退款与回执。",
+      "rootFixCommit": "eef1a6c1",
+      "coverageCommits": [
+        "5c781c06",
+        "7667982a"
+      ],
+      "regressions": [
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/turnWaiver.integ.test.ts",
+          "assertion": "refunds only the exact 259-credit turn to original personal buckets and sends once"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/turnWaiver.integ.test.ts",
+          "assertion": "concurrent settlement and waiver always end free with one receipt"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/v5-turn-waiver-sql-gate.sh",
+          "assertion": "PREPARE oc_v5_turn_waiver_receipt AS"
+        }
+      ]
     }
   ]
 }
