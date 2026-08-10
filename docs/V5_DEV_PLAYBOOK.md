@@ -143,6 +143,10 @@ scope、fireEvent 非受信不触发 React discrete 同步 flush,「点击添加
 - 部署后线上旅程由 `scripts/v5-e2e-journey-canary.mjs`(E2E 旅程门,§4.2)兜底。
 - 浏览器解析单一权威=`scripts/lib/resolve-browser.mjs`(env OC_E2E_BROWSER→系统
   Chrome→ms-playwright 缓存);找不到浏览器=fail-loud,禁"缺浏览器就跳过"(fail-open)。
+🔴 **长任务状态 UI 必须单一归属**:一个状态只进入一个既有反馈面,一个动作只保留一个
+主入口。turn 阶段/重试/恢复属于消息区活动行,Stop 属于 Composer,权限属于权限卡；不得把
+后端状态枚举逐项翻译成新的常驻卡片或重复按钮。新卡片只有在承载无法由既有组件表达的
+独立可操作对象时才允许，并须用移动端真浏览器证明信息不断流、主操作不重复。
 **commercial unit 失败判定法**(不许因存量失败误判,也不许漏掉新增失败):
 ```bash
 # 在基线 commit 的树与你的树各跑一次,diff 失败名单;你的失败集必须 ⊆ 基线失败集

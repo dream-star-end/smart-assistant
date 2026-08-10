@@ -3627,6 +3627,185 @@ describe("ChatSocket interrupted continuation", () => {
     sock.stop();
   });
 
+  test("durable journal rebuilds once, then appends only records after the shared cursor", async () => {
+    const sock = makeSocket();
+    const sessId = "s-live-cursor";
+    const clientMessageId = "cm-live-cursor";
+    const sessionKey = `agent:main:webchat:dm:${sessId}`;
+    const session = sock.ensureSession(sessId, "main");
+    session.messages.push(
+      { id: clientMessageId, role: "user", text: "long task", ts: 1, status: "sent" },
+      {
+        id: "stale-before-cursor",
+        role: "thinking",
+        text: "stale",
+        ts: 2,
+        _turnOwnerId: clientMessageId,
+      },
+    );
+    const record = (recordId: string, frameSeq: number, blocks: unknown[]) => ({
+      recordId,
+      streamKey: "dispatch:55555555-5555-4555-8555-555555555555:1",
+      source: "gateway" as const,
+      clientMessageId,
+      payload: {
+        type: "outbound.message",
+        sessionKey,
+        frameSeq,
+        peer: { id: sessId, kind: "dm" },
+        clientMessageId,
+        blocks,
+        isFinal: false,
+        ts: frameSeq + 10,
+      },
+    });
+    const initialAfter: string[] = [];
+    await sock.hydrateDurableLiveFrameJournal(
+      sessId,
+      async (after) => {
+        initialAfter.push(after);
+        return after === "0"
+          ? {
+              frames: [record("1", 1, [{ kind: "thinking", text: "visible thought" }])],
+              nextCursor: "1",
+              hasMore: false,
+              streamClientMessageIds: [clientMessageId],
+              hasTapeProjection: false,
+            }
+          : {
+              frames: [],
+              nextCursor: null,
+              hasMore: false,
+              streamClientMessageIds: [clientMessageId],
+              hasTapeProjection: false,
+            };
+      },
+      async () => {},
+    );
+    expect(initialAfter).toEqual(["0", "1"]);
+    expect(session.messages.find((message) => message.id === "stale-before-cursor")).toBeUndefined();
+
+    const incrementalAfter: string[] = [];
+    await sock.hydrateDurableLiveFrameJournal(
+      sessId,
+      async (after) => {
+        incrementalAfter.push(after);
+        return {
+          frames: [record("2", 2, [{ kind: "text", text: "visible answer" }])],
+          nextCursor: "2",
+          hasMore: false,
+          streamClientMessageIds: [clientMessageId],
+          hasTapeProjection: false,
+        };
+      },
+      async () => {},
+    );
+    expect(incrementalAfter).toEqual(["1"]);
+    expect(session.messages.filter((m) => m.role === "thinking" && m.text === "visible thought")).toHaveLength(1);
+    expect(session.messages.filter((m) => m.role === "assistant" && m.text === "visible answer")).toHaveLength(1);
+    sock.stop();
+  });
+
+  test("failed incremental paging retries from the last committed cursor without duplicating frames", async () => {
+    const sock = makeSocket();
+    const sessId = "s-live-retry-cursor";
+    const clientMessageId = "cm-live-retry-cursor";
+    const sessionKey = `agent:main:webchat:dm:${sessId}`;
+    const session = sock.ensureSession(sessId, "main");
+    session.messages.push({ id: clientMessageId, role: "user", text: "long task", ts: 1, status: "sent" });
+    const record = (recordId: string, frameSeq: number, text: string) => ({
+      recordId,
+      streamKey: "dispatch:66666666-6666-4666-8666-666666666666:1",
+      source: "gateway" as const,
+      clientMessageId,
+      payload: {
+        type: "outbound.message",
+        sessionKey,
+        frameSeq,
+        peer: { id: sessId, kind: "dm" },
+        clientMessageId,
+        blocks: [{ kind: "text", text }],
+        isFinal: false,
+        ts: frameSeq + 10,
+      },
+    });
+    await sock.hydrateDurableLiveFrameJournal(
+      sessId,
+      async () => ({
+        frames: [], nextCursor: null, hasMore: false,
+        streamClientMessageIds: [clientMessageId], hasTapeProjection: false,
+      }),
+      async () => {},
+    );
+
+    let failedPage = 0;
+    await expect(sock.hydrateDurableLiveFrameJournal(
+      sessId,
+      async (after) => {
+        failedPage += 1;
+        if (failedPage === 1) {
+          expect(after).toBe("0");
+          return {
+            frames: [record("1", 1, "first exact delta")], nextCursor: "1", hasMore: true,
+            streamClientMessageIds: [clientMessageId], hasTapeProjection: false,
+          };
+        }
+        throw new Error("page unavailable");
+      },
+      async () => {},
+    )).rejects.toThrow("page unavailable");
+
+    const retryAfter: string[] = [];
+    await sock.hydrateDurableLiveFrameJournal(
+      sessId,
+      async (after) => {
+        retryAfter.push(after);
+        return after === "0"
+          ? {
+              frames: [record("1", 1, "first exact delta")], nextCursor: "1", hasMore: true,
+              streamClientMessageIds: [clientMessageId], hasTapeProjection: false,
+            }
+          : {
+              frames: [record("2", 2, "second exact delta")], nextCursor: "2", hasMore: false,
+              streamClientMessageIds: [clientMessageId], hasTapeProjection: false,
+            };
+      },
+      async () => {},
+    );
+    expect(retryAfter).toEqual(["0", "1"]);
+    const assistantText = session.messages
+      .filter((message) => message.role === "assistant")
+      .map((message) => message.text)
+      .join("");
+    expect(assistantText.split("first exact delta")).toHaveLength(2);
+    expect(assistantText.split("second exact delta")).toHaveLength(2);
+    sock.stop();
+  });
+
+  test("a live owner projecting to tape triggers one authoritative cutover read", async () => {
+    const sock = makeSocket();
+    const sessId = "s-live-tape-cutover";
+    const clientMessageId = "cm-live-tape-cutover";
+    sock.ensureSession(sessId, "main");
+    const applyTapeProjection = vi.fn(async () => {});
+    const page = (owners: string[], hasTapeProjection: boolean) => async () => ({
+      frames: [], nextCursor: null, hasMore: false,
+      streamClientMessageIds: owners, hasTapeProjection,
+    });
+
+    await sock.hydrateDurableLiveFrameJournal(
+      sessId,
+      page([clientMessageId], false),
+      applyTapeProjection,
+    );
+    expect(applyTapeProjection).not.toHaveBeenCalled();
+    await sock.hydrateDurableLiveFrameJournal(sessId, page([], true), applyTapeProjection);
+    expect(applyTapeProjection).toHaveBeenCalledTimes(1);
+    await sock.hydrateDurableLiveFrameJournal(sessId, page([], true), applyTapeProjection);
+    expect(applyTapeProjection).toHaveBeenCalledTimes(1);
+    sock.stop();
+  });
+
   test("journal page1 → overlapping WS frame → page2 applies thinking/tool/text exactly once", async () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const sock = makeSocket();
@@ -5518,6 +5697,43 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     expect(syncSession).toHaveBeenCalledTimes(2);
     expect(session._reconciling).toBe(false);
     expect(session._recoveryStatus?.kind).toBe("completed");
+    sock.stop();
+  });
+
+  test("successful active journal sync stays on a one-second live cadence", async () => {
+    vi.useFakeTimers();
+    let sock!: ChatSocket;
+    const syncSession = vi.fn(async () => {
+      if (syncSession.mock.calls.length === 3) {
+        const session = sock.sessions.get("s1")!;
+        session._sendingInFlight = false;
+        session._activeClientMessageId = undefined;
+      }
+      return true;
+    });
+    sock = makeSocket({ syncSession });
+    const now = Date.now();
+    sock.loadStored({
+      id: "s1",
+      agentId: "main",
+      title: "s1",
+      messages: [{ id: "u-live", role: "user", text: "long task", ts: now, status: "sent" }],
+      createdAt: now,
+      lastAt: now,
+      _sendingInFlight: true,
+      _activeClientMessageId: "u-live",
+      _turnStartedAt: now,
+    });
+
+    await Promise.resolve();
+    expect(syncSession).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(syncSession).toHaveBeenCalledTimes(2);
+    // Attempt 2 used to back off for two seconds even though REST was healthy,
+    // leaving a broken-WS client visibly stale. A successful poll stays at 1s.
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(syncSession).toHaveBeenCalledTimes(3);
+    expect(sock.sessions.get("s1")?._reconciling).toBe(false);
     sock.stop();
   });
 

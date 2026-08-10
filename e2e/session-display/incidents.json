@@ -1207,6 +1207,35 @@
           "assertion": "T34 全面优化模式隐藏不会再更新的旧版梦境失败回执"
         }
       ]
+    },
+    {
+      "id": "INC-20260810-LIVE-TURN-VISIBILITY",
+      "occurredAt": "2026-08-10",
+      "severity": "P1",
+      "symptom": "Agent 后台持续执行且 live-frame 已持久化时，前端断线恢复仍从游标 0 反复全量重放并按成功次数指数退避，导致长会话已生成的思考、工具和正文长时间不可见；自动重试又额外展示带 Stop 的独立卡片，与输入框主 Stop 重复。",
+      "rootFixCommit": "6d4e70b1",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "durable journal rebuilds once, then appends only records after the shared cursor"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/turnActivity.test.tsx",
+          "assertion": "retrying → 滚动旧 max 也统一为「模型繁忙，正在重试中（n/10）」"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T31 journal page1→WS N→page2(N)：已响应思考/工具/正文各恰好一次"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T35 Composer 是唯一 Stop 入口，停止结算中原按钮禁用且不重复提交"
+        }
+      ]
     }
   ]
 }

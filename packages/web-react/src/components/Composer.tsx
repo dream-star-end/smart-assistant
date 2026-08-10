@@ -60,6 +60,7 @@ function clipboardImages(data: DataTransfer): File[] {
 export function Composer({
   onSend,
   busy,
+  stopping,
   onStop,
   disabled,
   placeholder = "给 OpenClaude 发消息…",
@@ -77,6 +78,8 @@ export function Composer({
   /** 发送：当前正文 + 可选已上传媒体 + 可选精确引用快照。 */
   onSend: (text: string, media?: MediaRef[], replyTo?: MessageReplyQuote) => void;
   busy?: boolean;
+  /** The same send/stop control is settling an acknowledged Stop. */
+  stopping?: boolean;
   onStop?: () => void;
   disabled?: boolean;
   placeholder?: string;
@@ -489,9 +492,15 @@ export function Composer({
           <button
             type="button"
             data-product-control
-            aria-label={busy ? "停止" : "发送"}
-            onClick={() => (busy ? onStop?.() : submit())}
-            disabled={(!canSend && !busy) || disabled}
+            aria-label={stopping ? "正在停止" : busy ? "停止" : "发送"}
+            onClick={() => {
+              if (busy) {
+                if (!stopping) onStop?.();
+                return;
+              }
+              submit();
+            }}
+            disabled={stopping || (!canSend && !busy) || disabled}
             className={cn(
               "mb-0.5 flex size-9 shrink-0 items-center justify-center rounded-full transition-all",
               busy
@@ -501,7 +510,13 @@ export function Composer({
                   : "bg-hover text-faint",
             )}
           >
-            {busy ? <Square size={15} className="fill-current" /> : <ArrowUp size={19} />}
+            {stopping ? (
+              <Loader2 size={17} className="animate-spin" />
+            ) : busy ? (
+              <Square size={15} className="fill-current" />
+            ) : (
+              <ArrowUp size={19} />
+            )}
           </button>
         </div>
       </div>
