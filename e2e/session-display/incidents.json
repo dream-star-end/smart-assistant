@@ -1133,6 +1133,25 @@
           "assertion": "T29 自动重试统一显示模型繁忙与共享 n/10 进度；重试成功保持实时可见"
         }
       ]
+    },
+    {
+      "id": "INC-20260810-LIVE-FRAME-SEQUENCE-RESET",
+      "occurredAt": "2026-08-10",
+      "severity": "P1",
+      "symptom": "同一容器会话销毁后重新连接时，Gateway 帧序号从 1 重新开始并撞上另一 dispatch 的历史持久化身份，导致持久化失败关闭用户共享 WebSocket，页面持续断线重连。",
+      "rootFixCommit": "6d2c930c",
+      "regressions": [
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
+          "assertion": "keeps later dispatches durable when a gateway session restarts its frame sequence"
+        },
+        {
+          "layer": "live-e2e",
+          "path": "e2e/session-display/tests/03-reconnect-inflight.spec.ts",
+          "assertion": "断线重连:回复到达或明确失败,绝不永久静默"
+        }
+      ]
     }
   ]
 }
