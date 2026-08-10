@@ -759,7 +759,7 @@
     "method": "POST",
     "pathKind": "pathPrefix",
     "pathValue": "/api/admin/feedback/",
-    "handler": "handleAdminAckFeedback|handleAdminFeedbackWorkflow"
+    "handler": "handleAdminFeedbackPost"
   },
   {
     "method": "GET",

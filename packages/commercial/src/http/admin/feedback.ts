@@ -206,3 +206,17 @@ export async function handleAdminFeedbackWorkflow(
     throw err;
   }
 }
+
+/** Route-level dispatcher for the shared POST /api/admin/feedback/* prefix. */
+export async function handleAdminFeedbackPost(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  const pathname = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`).pathname;
+  if (pathname.endsWith("/ack")) {
+    return handleAdminAckFeedback(req, res, ctx, deps);
+  }
+  return handleAdminFeedbackWorkflow(req, res, ctx, deps);
+}

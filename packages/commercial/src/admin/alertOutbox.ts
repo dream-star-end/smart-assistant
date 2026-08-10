@@ -826,26 +826,29 @@ export async function listRuleStates(): Promise<RuleStateRow[]> {
   const now = Date.now();
   const staleAfterMs = 15 * 60 * 1000;
   const recoveredWithinMs = 24 * 60 * 60 * 1000;
-  return r.rows.map((row) => ({
-    rule_id: row.rule_id,
-    firing: row.firing,
-    acked: row.acked,
-    acked_at: row.acked_at ? row.acked_at.toISOString() : null,
-    acked_by: row.acked_by,
-    dedupe_key: row.dedupe_key,
-    last_transition_at: row.last_transition_at ? row.last_transition_at.toISOString() : null,
-    last_evaluated_at: row.last_evaluated_at ? row.last_evaluated_at.toISOString() : null,
-    last_payload: parsePayload(row.last_payload),
-    stale: row.last_evaluated_at === null || now-row.last_evaluated_at.getTime() > staleAfterMs,
-    classification: row.firing
-      ? "firing"
-      : row.last_evaluated_at === null || now-row.last_evaluated_at.getTime() > staleAfterMs
+  return r.rows.map((row) => {
+    const stale = row.last_evaluated_at === null || now-row.last_evaluated_at.getTime() > staleAfterMs;
+    return {
+      rule_id: row.rule_id,
+      firing: row.firing,
+      acked: row.acked,
+      acked_at: row.acked_at ? row.acked_at.toISOString() : null,
+      acked_by: row.acked_by,
+      dedupe_key: row.dedupe_key,
+      last_transition_at: row.last_transition_at ? row.last_transition_at.toISOString() : null,
+      last_evaluated_at: row.last_evaluated_at ? row.last_evaluated_at.toISOString() : null,
+      last_payload: parsePayload(row.last_payload),
+      stale,
+      classification: stale
         ? "stale"
-        : row.last_transition_at !== null && now-row.last_transition_at.getTime() <= recoveredWithinMs
-          ? "recovered"
-          : "healthy",
-    classification_basis: { stale_after_minutes: 15, recovered_within_hours: 24 },
-  }));
+        : row.firing
+          ? "firing"
+          : row.last_transition_at !== null && now-row.last_transition_at.getTime() <= recoveredWithinMs
+            ? "recovered"
+            : "healthy",
+      classification_basis: { stale_after_minutes: 15, recovered_within_hours: 24 },
+    };
+  });
 }
 
 // ─── M8.3/P2-21:retry + ack ─────────────────────────────────────────

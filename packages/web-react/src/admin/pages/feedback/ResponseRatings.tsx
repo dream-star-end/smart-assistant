@@ -245,7 +245,6 @@ export function ResponseRatings() {
           value={traffic}
           options={[
             { label: "真实用户", value: "production_user" },
-            { label: "匿名反馈", value: "anonymous" },
             { label: "全部流量", value: "all" },
             { label: "内部管理员", value: "internal_admin" },
             { label: "合成灰度", value: "synthetic_canary" },

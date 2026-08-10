@@ -287,7 +287,7 @@ export function HistoryTable({ reloadKey }: { reloadKey: number }) {
           aria-label="按消息来源筛选"
           value={sourceType}
           onChange={(event) => { setOffset(0); setSourceType(event.target.value); }}
-          placeholder="来源，如 cron_delivery"
+          placeholder="来源，如 cron_delivery / unattributed"
           className="w-full sm:w-56"
         />
       </div>

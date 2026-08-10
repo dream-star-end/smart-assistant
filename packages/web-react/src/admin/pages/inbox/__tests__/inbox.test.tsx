@@ -63,7 +63,7 @@ function stubApi() {
         window_days: 30,
         snapshot_coverage: { captured_messages: 1, legacy_unavailable_messages: 0 },
         read_funnel: { messages: 1, recipients: 100, reads: 3, read_rate: 0.03 },
-        by_source: [{ source_type: "manual", messages: 1, recipients: 100, reads: 3, read_rate: 0.03 }],
+        by_source: [{ source_type: "unattributed", messages: 1, recipients: 100, reads: 3, read_rate: 0.03 }],
         by_category: [{ category: "user", messages: 1, recipients: 100, reads: 3, read_rate: 0.03 }],
         recipient_load: { users: 100, p50: 1, p90: 2, max: 3, over_20: 0, over_100: 0 },
       });
@@ -134,6 +134,23 @@ describe("InboxPage", () => {
         }),
       ),
     );
+  });
+
+  test("受众变更后丢弃在飞的旧预览，不会解锁错误受众发送", async () => {
+    stubApi();
+    let resolvePreview!: (value: unknown) => void;
+    adminSend.mockImplementation((_method: string, path: string) => path === "/messages/preview"
+      ? new Promise((resolve) => { resolvePreview = resolve; })
+      : Promise.resolve({ message: {} }));
+    renderPage(<InboxPage />);
+    await screen.findByText("系统维护通知");
+
+    fireEvent.click(screen.getByRole("button", { name: "预览受众" }));
+    fireEvent.click(screen.getByRole("tab", { name: "单个用户" }));
+    resolvePreview({ audience: "all", category: "user", recipients: 100, sample: [], recipient_load: { p50_30d: 1, p90_30d: 2, max_30d: 3 } });
+
+    await waitFor(() => expect(screen.getByRole("button", { name: /^发送$/ })).toBeDisabled());
+    expect(screen.queryByText("预计收件人")).not.toBeInTheDocument();
   });
 
   test("历史分类筛选会重置分页并传 category", async () => {

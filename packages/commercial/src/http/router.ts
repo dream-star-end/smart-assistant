@@ -107,7 +107,7 @@ import {
   handleAdminExportOrdersCsv,
   handleAdminExportUsersCsv,
 } from './admin/export.js'
-import { handleAdminAckFeedback, handleAdminFeedbackWorkflow, handleAdminListFeedback } from './admin/feedback.js'
+import { handleAdminFeedbackPost, handleAdminListFeedback } from './admin/feedback.js'
 import {
   handleAdminListAutoDreamFindings,
   handleAdminUpdateAutoDreamFinding,
@@ -1276,13 +1276,7 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     { method: 'GET', pathPrefix: '/api/admin/orders/', handler: handleAdminGetOrder },
     // P1-2 反馈 admin —— GET 列表 / POST :id/ack
     { method: 'GET', path: '/api/admin/feedback', handler: handleAdminListFeedback },
-    {
-      method: 'POST',
-      pathPrefix: '/api/admin/feedback/',
-      handler: (req, res, ctx) => new URL(req.url ?? '/', `http://${req.headers.host ?? 'x.invalid'}`).pathname.endsWith('/ack')
-        ? handleAdminAckFeedback(req, res, ctx, deps)
-        : handleAdminFeedbackWorkflow(req, res, ctx, deps),
-    },
+    { method: 'POST', pathPrefix: '/api/admin/feedback/', handler: handleAdminFeedbackPost },
     { method: 'GET', path: '/api/admin/auto-dream-findings', handler: handleAdminListAutoDreamFindings },
     {
       method: 'PATCH',

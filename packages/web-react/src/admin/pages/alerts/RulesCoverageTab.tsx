@@ -45,7 +45,7 @@ function RuleStatesSection({ query }: { query: Reloadable<{ rows: RuleStateRow[]
       title: "rule_id",
       render: (r) => (
         <span className="flex items-center gap-2">
-          {r.firing && !r.acked && <span className="size-1.5 shrink-0 rounded-full bg-danger" />}
+          {r.classification === "firing" && !r.acked && <span className="size-1.5 shrink-0 rounded-full bg-danger" />}
           <span className="font-mono text-[12.5px]">{r.rule_id}</span>
         </span>
       ),
@@ -72,7 +72,7 @@ function RuleStatesSection({ query }: { query: Reloadable<{ rows: RuleStateRow[]
       title: "确认",
       width: 130,
       render: (r) => {
-        if (!r.firing) return <span className="text-faint">—</span>;
+        if (r.classification !== "firing") return <span className="text-faint">—</span>;
         if (r.acked)
           return (
             <span className="text-[12px]">
@@ -118,7 +118,7 @@ function RuleStatesSection({ query }: { query: Reloadable<{ rows: RuleStateRow[]
       width: 72,
       align: "right",
       render: (r) =>
-        r.firing && !r.acked ? (
+        r.classification === "firing" && !r.acked ? (
           <Button variant="secondary" size="sm" onClick={() => onAck(r)}>
             确认
           </Button>

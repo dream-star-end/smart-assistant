@@ -66,7 +66,7 @@ export async function handleAdminOpsOverview(
     generated_at: new Date().toISOString(),
     slo: { source: 'durable', windows },
     current_actions: {
-      firing_alerts: rules.filter((row) => row.firing),
+      firing_alerts: rules.filter((row) => row.classification === 'firing'),
       stale_alerts: rules.filter((row) => row.stale),
       recovered_alerts: rules.filter((row) => row.classification === 'recovered'),
       open_incidents: incidents.rows.map((row) => ({

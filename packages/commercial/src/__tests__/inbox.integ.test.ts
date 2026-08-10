@@ -40,7 +40,7 @@ import { AddressInfo } from "node:net";
 import IORedis from "ioredis";
 import sharp from "sharp";
 import { createPool, closePool, setPoolOverride, resetPool } from "../db/index.js";
-import { query } from "../db/queries.js";
+import { query, tx } from "../db/queries.js";
 import { runMigrations } from "../db/migrate.js";
 import { createCommercialHandler } from "../http/router.js";
 import { wrapIoredis } from "../middleware/rateLimit.js";
@@ -563,6 +563,47 @@ describe("inbox DB ops (integ)", () => {
     const stats = await getAdminInboxStats(30);
     assert.equal(stats.read_funnel.messages, 2);
     assert.ok(stats.by_category.some((row) => row.category === "marketing"));
+  });
+
+  test("audience snapshot is send-time immutable and pre-migration rows stay explicitly unavailable", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const captured = await createInboxMessage(admin, {
+      audience: "all", title: "captured audience", body_md: "x",
+    });
+    const before = (await adminListInbox({ limit: 10 })).messages.find(
+      (message) => message.id === captured.id,
+    );
+    assert.ok(before);
+    assert.equal(before.audience_snapshot_status, "captured");
+    assert.ok(before.recipients >= 3);
+
+    await makeUser(`joined-after-send-${Date.now()}@inbox.test`);
+    const after = (await adminListInbox({ limit: 10 })).messages.find(
+      (message) => message.id === captured.id,
+    );
+    assert.ok(after);
+    assert.equal(after.recipients, before.recipients, "later users must not rewrite old audience");
+
+    const legacyId = await tx(async (client) => {
+      await client.query("SET LOCAL session_replication_role = replica");
+      const inserted = await client.query<{ id: string }>(
+        `INSERT INTO inbox_messages(audience,title,body_md,level,created_by)
+         VALUES ('all','legacy audience','x','info',$1)
+         RETURNING id::text AS id`,
+        [admin.toString()],
+      );
+      return inserted.rows[0]!.id;
+    });
+    const listed = await adminListInbox({ limit: 10, sourceType: "unattributed" });
+    const legacy = listed.messages.find((message) => message.id === legacyId);
+    assert.ok(legacy);
+    assert.equal(legacy.audience_snapshot_status, "legacy_unavailable");
+    assert.equal(legacy.recipients, 0);
+
+    const stats = await getAdminInboxStats(30);
+    assert.equal(stats.snapshot_coverage.captured_messages, 1);
+    assert.equal(stats.snapshot_coverage.legacy_unavailable_messages, 1);
+    assert.ok(stats.by_source.some((row) => row.source_type === "unattributed"));
   });
 
   test("JWT 用户在 DB 中不存在 → 看不到任何广播(失败闭合)", async (t) => {

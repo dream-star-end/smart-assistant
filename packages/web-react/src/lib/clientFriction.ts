@@ -38,33 +38,52 @@ function deviceClass(): "desktop" | "mobile" | "tablet" | "unknown" {
   return "desktop";
 }
 
-export function reportClientFriction(signal: ClientFrictionSignal, token?: string | null): string {
-  const eventId = signal.eventId ?? buildId();
+function wireSignal(signal: ClientFrictionSignal, eventId: string): Record<string, unknown> {
+  return {
+    event_id: eventId,
+    surface: signal.surface,
+    stage: signal.stage,
+    code: signal.code,
+    outcome: signal.outcome ?? "failed",
+    attempts: signal.attempts,
+    latency_ms: signal.latencyMs,
+    trace_id: signal.traceId,
+    session_id: signal.sessionId,
+    model: signal.model,
+    provider: signal.provider,
+    entity_slug: signal.entitySlug,
+    client_build: clientBuild(),
+    browser_family: browserFamily(),
+    device_class: deviceClass(),
+  };
+}
+
+function report(body: unknown, token?: string | null): void {
   const headers: Record<string, string> = { "content-type": "application/json" };
   if (token) headers.Authorization = `Bearer ${token}`;
   void fetch("/api/client-errors", {
     method: "POST",
     credentials: "include",
     headers,
-    body: JSON.stringify({
-      event_id: eventId,
-      surface: signal.surface,
-      stage: signal.stage,
-      code: signal.code,
-      outcome: signal.outcome ?? "failed",
-      attempts: signal.attempts,
-      latency_ms: signal.latencyMs,
-      trace_id: signal.traceId,
-      session_id: signal.sessionId,
-      model: signal.model,
-      provider: signal.provider,
-      entity_slug: signal.entitySlug,
-      client_build: clientBuild(),
-      browser_family: browserFamily(),
-      device_class: deviceClass(),
-    }),
+    body: JSON.stringify(body),
   }).catch(() => {});
+}
+
+export function reportClientFriction(signal: ClientFrictionSignal, token?: string | null): string {
+  const eventId = signal.eventId ?? buildId();
+  report(wireSignal(signal, eventId), token);
   return eventId;
+}
+
+/** One request for a rendered marketplace page, so per-entity truth does not exhaust telemetry rate limits. */
+export function reportClientFrictionBatch(
+  signals: ClientFrictionSignal[],
+  token?: string | null,
+): string[] {
+  if (signals.length === 0) return [];
+  const eventIds = signals.map((signal) => signal.eventId ?? buildId());
+  report({ events: signals.map((signal, index) => wireSignal(signal, eventIds[index]!)) }, token);
+  return eventIds;
 }
 
 let globalHandlersInstalled = false;

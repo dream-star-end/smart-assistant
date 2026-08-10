@@ -741,6 +741,60 @@ describe("admin pricing/plans — HTTP", () => {
     });
   });
 
+  test("authenticated marketplace exposure batch persists every user+slug row; anonymous and oversized batches are ignored", async (t) => {
+    if (skipIfNoHttp(t)) return;
+    const user = await createUser("market-batch-user@x.com");
+    const token = await tokenFor(user, "user");
+    const event = (slug: string, code = "BATCH_EXPOSURE") => ({
+      event_id: `batch-${slug}`,
+      surface: "marketplace",
+      stage: "catalog_exposure",
+      code,
+      outcome: "succeeded",
+      entity_slug: slug,
+    });
+
+    const accepted = await fetch(`${baseUrl}/api/client-errors`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ events: [event("batch-one"), event("batch-two")] }),
+    });
+    assert.equal(accepted.status, 200);
+
+    const anonymous = await fetch(`${baseUrl}/api/client-errors`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ events: [event("batch-anonymous", "BATCH_ANONYMOUS")] }),
+    });
+    assert.equal(anonymous.status, 200);
+
+    const oversized = await fetch(`${baseUrl}/api/client-errors`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        events: Array.from({ length: 51 }, (_, index) =>
+          event(`batch-oversized-${index}`, "BATCH_OVERSIZED")),
+      }),
+    });
+    assert.equal(oversized.status, 200);
+
+    const rows = await query<{
+      user_id: string | null;
+      entity_slug: string | null;
+      surface: string;
+      stage: string;
+      code: string;
+    }>(
+      `SELECT user_id::text AS user_id,entity_slug,surface,stage,code
+         FROM product_friction_events
+        WHERE code LIKE 'BATCH_%' ORDER BY entity_slug`,
+    );
+    assert.deepEqual(rows.rows, [
+      { user_id: user.toString(), entity_slug: "batch-one", surface: "marketplace", stage: "catalog_exposure", code: "BATCH_EXPOSURE" },
+      { user_id: user.toString(), entity_slug: "batch-two", surface: "marketplace", stage: "catalog_exposure", code: "BATCH_EXPOSURE" },
+    ]);
+  });
+
   test("GET /product-friction returns recovery-aware source-separated telemetry", async (t) => {
     if (skipIfNoHttp(t)) return;
     const admin = await createUser("friction-admin@x.com", "admin");

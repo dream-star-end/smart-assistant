@@ -24,7 +24,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, apiErrorMessage } from "../../lib/api";
-import { reportClientFriction } from "../../lib/clientFriction";
+import { reportClientFrictionBatch } from "../../lib/clientFriction";
 import {
   benchmarkBadgeLabel,
   formatInstallCount,
@@ -500,20 +500,19 @@ export function BrowsePanel({
   // 并在面板生命周期内按 slug 去重，避免静默刷新重复放大曝光。
   useEffect(() => {
     const token = auth.snapshot().token;
+    const signals = [];
     for (const card of exposedCards) {
       if (reportedExposureSlugs.current.has(card.slug)) continue;
       reportedExposureSlugs.current.add(card.slug);
-      reportClientFriction(
-        {
-          surface: "marketplace",
-          stage: "catalog_exposure",
-          code: "CATALOG_EXPOSURE",
-          outcome: "succeeded",
-          entitySlug: card.slug,
-        },
-        token,
-      );
+      signals.push({
+        surface: "marketplace",
+        stage: "catalog_exposure",
+        code: "CATALOG_EXPOSURE",
+        outcome: "succeeded" as const,
+        entitySlug: card.slug,
+      });
     }
+    if (signals.length > 0) reportClientFrictionBatch(signals, token);
   }, [auth, exposedCards]);
 
   const flatTitle = debouncedQ

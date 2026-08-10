@@ -120,6 +120,7 @@ export function ComposeCard({ onSent }: { onSent: () => void }) {
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const assetsRef = useRef<ComposerAsset[]>([])
+  const previewSeqRef = useRef(0)
 
   const [audience, setAudience] = useState<InboxAudience>('all')
   const [userId, setUserId] = useState('')
@@ -139,10 +140,15 @@ export function ComposeCard({ onSent }: { onSent: () => void }) {
 
   const [emailCfg, setEmailCfg] = useState<EmailConfig | null>(null)
   const [emailHint, setEmailHint] = useState('加载中…')
+  const previewInputKey = `${audience}\0${category}\0${userId.trim()}`
+  const previewInputKeyRef = useRef(previewInputKey)
+  previewInputKeyRef.current = previewInputKey
 
   useEffect(() => {
+    previewSeqRef.current += 1
     setAudiencePreview(null)
     setPreviewError(null)
+    setPreviewBusy(false)
   }, [audience, category, userId])
 
   assetsRef.current = assets
@@ -375,6 +381,8 @@ export function ComposeCard({ onSent }: { onSent: () => void }) {
       toast('user_id 必须是正整数', 'error')
       return
     }
+    const requestSeq = ++previewSeqRef.current
+    const requestKey = previewInputKey
     setPreviewBusy(true)
     setPreviewError(null)
     try {
@@ -383,12 +391,17 @@ export function ComposeCard({ onSent }: { onSent: () => void }) {
         category,
       }
       if (audience === 'user') payload.user_id = userId.trim()
-      setAudiencePreview(await adminSend<MessagePreviewResp>('POST', '/messages/preview', payload))
+      const preview = await adminSend<MessagePreviewResp>('POST', '/messages/preview', payload)
+      if (requestSeq !== previewSeqRef.current || requestKey !== previewInputKeyRef.current) return
+      setAudiencePreview(preview)
     } catch (error) {
+      if (requestSeq !== previewSeqRef.current || requestKey !== previewInputKeyRef.current) return
       setAudiencePreview(null)
       setPreviewError(apiErrorMessage(error, '受众预览失败'))
     } finally {
-      setPreviewBusy(false)
+      if (requestSeq === previewSeqRef.current && requestKey === previewInputKeyRef.current) {
+        setPreviewBusy(false)
+      }
     }
   }
 

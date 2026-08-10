@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
 
-import { installGlobalClientFrictionHandlers, reportClientFriction } from "./clientFriction";
+import {
+  installGlobalClientFrictionHandlers,
+  reportClientFriction,
+  reportClientFrictionBatch,
+} from "./clientFriction";
 
 afterEach(() => {
   document.querySelector('meta[name="oc-build"]')?.remove();
@@ -68,5 +72,24 @@ describe("client friction reporter", () => {
     const bodies = fetchMock.mock.calls.map((call) => JSON.parse(String((call[1] as RequestInit).body)));
     expect(bodies.map((b) => b.code)).toEqual(["JS_ERROR", "UNHANDLED_REJECTION"]);
     expect(JSON.stringify(bodies)).not.toContain("DO_NOT_SEND");
+  });
+
+  test("batches per-entity exposures into one telemetry request", () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("matchMedia", vi.fn(() => ({ matches: false })));
+
+    const ids = reportClientFrictionBatch([
+      { eventId: "exposure_1", surface: "marketplace", stage: "catalog_exposure", code: "CATALOG_EXPOSURE", outcome: "succeeded", entitySlug: "skill.one" },
+      { eventId: "exposure_2", surface: "marketplace", stage: "catalog_exposure", code: "CATALOG_EXPOSURE", outcome: "succeeded", entitySlug: "skill.two" },
+    ], "token");
+
+    expect(ids).toEqual(["exposure_1", "exposure_2"]);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const body = JSON.parse(String((fetchMock.mock.calls[0]![1] as RequestInit).body));
+    expect(body.events.map((event: { entity_slug: string }) => event.entity_slug)).toEqual([
+      "skill.one",
+      "skill.two",
+    ]);
   });
 });

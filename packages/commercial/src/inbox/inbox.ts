@@ -659,7 +659,7 @@ export interface AdminListInput {
   limit?: number;
   offset?: number;
   category?: InboxCategory | null;
-  /** `manual` selects rows without a machine source_type. */
+  /** `unattributed` selects rows whose source was not captured. */
   sourceType?: string | null;
 }
 
@@ -769,7 +769,7 @@ export async function adminListInbox(input: AdminListInput): Promise<AdminListRe
        FROM inbox_messages m
       WHERE ($3::text IS NULL OR m.category=$3)
         AND ($4::text IS NULL OR
-             ($4='manual' AND m.source_type IS NULL) OR m.source_type=$4)
+             ($4='unattributed' AND m.source_type IS NULL) OR m.source_type=$4)
       ORDER BY m.created_at DESC, m.id DESC
       LIMIT $1 OFFSET $2`,
     [limit, offset, input.category ?? null, input.sourceType ?? null],
@@ -780,7 +780,7 @@ export async function adminListInbox(input: AdminListInput): Promise<AdminListRe
        FROM inbox_messages
       WHERE ($1::text IS NULL OR category=$1)
         AND ($2::text IS NULL OR
-             ($2='manual' AND source_type IS NULL) OR source_type=$2)`,
+             ($2='unattributed' AND source_type IS NULL) OR source_type=$2)`,
     [input.category ?? null, input.sourceType ?? null],
   );
 
@@ -849,17 +849,20 @@ export async function previewInboxAudience(input: {
       params,
     ),
     query<{ p50: string | null; p90: string | null; max: number | null }>(
-      `WITH recipients AS (
-         SELECT s.user_id,COUNT(*)::int AS messages
-           FROM inbox_message_audience_snapshots s
-           JOIN inbox_messages m ON m.id=s.message_id
-          WHERE m.created_at>=NOW()-INTERVAL '30 days'
-            AND ($1::bigint IS NULL OR s.user_id=$1)
-          GROUP BY s.user_id
+      `WITH audience AS (
+         SELECT u.id AS user_id FROM users u
+          WHERE u.status='active' AND ($1::bigint IS NULL OR u.id=$1)
+       ), recipient_load AS (
+         SELECT a.user_id,COUNT(m.id)::int AS messages
+           FROM audience a
+           LEFT JOIN inbox_message_audience_snapshots s ON s.user_id=a.user_id
+           LEFT JOIN inbox_messages m ON m.id=s.message_id
+             AND m.created_at>=NOW()-INTERVAL '30 days'
+          GROUP BY a.user_id
        )
        SELECT percentile_cont(0.5) WITHIN GROUP(ORDER BY messages)::text AS p50,
               percentile_cont(0.9) WITHIN GROUP(ORDER BY messages)::text AS p90,
-              MAX(messages)::int AS max FROM recipients`,
+              MAX(messages)::int AS max FROM recipient_load`,
       [userId],
     ),
   ]);
@@ -889,14 +892,15 @@ export async function getAdminInboxStats(days = 30): Promise<AdminInboxStats> {
   const windowDays = Math.min(90, Math.max(1, Math.trunc(days)));
   const params = [windowDays];
   const aggregateSql = (group: "source_type" | "category") => {
-    const fallback = group === "source_type" ? "manual" : "unknown";
+    const fallback = group === "source_type" ? "unattributed" : "unknown";
     return `
     SELECT COALESCE(m.${group},'${fallback}') AS key,COUNT(DISTINCT m.id)::int AS messages,
            COUNT(s.user_id)::int AS recipients,COUNT(r.user_id)::int AS reads
       FROM inbox_messages m
-      JOIN inbox_message_audience_snapshots s ON s.message_id=m.id
+      LEFT JOIN inbox_message_audience_snapshots s ON s.message_id=m.id
       LEFT JOIN inbox_message_reads r ON r.message_id=m.id AND r.user_id=s.user_id
      WHERE m.created_at>=NOW()-($1::int*INTERVAL '1 day')
+       AND m.audience_snapshotted_at IS NOT NULL
      GROUP BY COALESCE(m.${group},'${fallback}') ORDER BY COUNT(DISTINCT m.id) DESC`;
   };
   const [coverage, funnel, sources, categories, load] = await Promise.all([
@@ -908,9 +912,10 @@ export async function getAdminInboxStats(days = 30): Promise<AdminInboxStats> {
       `SELECT COUNT(DISTINCT m.id)::int AS messages,COUNT(s.user_id)::int AS recipients,
               COUNT(r.user_id)::int AS reads
          FROM inbox_messages m
-         JOIN inbox_message_audience_snapshots s ON s.message_id=m.id
+         LEFT JOIN inbox_message_audience_snapshots s ON s.message_id=m.id
          LEFT JOIN inbox_message_reads r ON r.message_id=m.id AND r.user_id=s.user_id
-        WHERE m.created_at>=NOW()-($1::int*INTERVAL '1 day')`, params),
+        WHERE m.created_at>=NOW()-($1::int*INTERVAL '1 day')
+          AND m.audience_snapshotted_at IS NOT NULL`, params),
     query<{ key: string; messages: number; recipients: number; reads: number }>(aggregateSql("source_type"), params),
     query<{ key: string; messages: number; recipients: number; reads: number }>(aggregateSql("category"), params),
     query<{ users: number; p50: string | null; p90: string | null; max: number | null; over_20: number; over_100: number }>(

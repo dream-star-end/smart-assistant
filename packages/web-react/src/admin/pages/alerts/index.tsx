@@ -107,9 +107,13 @@ function AlertActionQueue({
     for (const row of rows) initial[classificationOf(row)]++;
     return initial;
   }, [rows]);
-  const firing = rows
-    .filter((row) => classificationOf(row) === "firing")
-    .sort((a, b) => Number(a.acked) - Number(b.acked));
+  const actionable = rows
+    .filter((row) => ["firing", "stale"].includes(classificationOf(row)))
+    .sort((a, b) => {
+      const classificationOrder = Number(classificationOf(a) === "stale")
+        - Number(classificationOf(b) === "stale");
+      return classificationOrder || Number(a.acked) - Number(b.acked);
+    });
 
   const ack = async (row: RuleStateRow) => {
     try {
@@ -132,26 +136,34 @@ function AlertActionQueue({
         <div className="flex items-center gap-2 text-[13px] text-danger"><AlertTriangle size={15} />加载行动队列失败：{errText(query.error)}</div>
       ) : query.loading && !query.data ? (
         <div className="h-20 animate-pulse rounded-lg bg-hover" />
-      ) : firing.length === 0 ? (
-        <div className="flex items-center gap-2 text-[13px] text-muted"><Check size={15} className="text-success" />当前没有 firing 告警。</div>
+      ) : actionable.length === 0 ? (
+        <div className="flex items-center gap-2 text-[13px] text-muted"><Check size={15} className="text-success" />当前没有 firing 或 stale 告警。</div>
       ) : (
         <ul className="divide-y divide-border">
-          {firing.map((row) => {
+          {actionable.map((row) => {
+            const stale = classificationOf(row) === "stale";
             const runbook = safeRunbookHref(row.last_payload ?? {});
             const incidentId = incidentIdOf(row.last_payload ?? {});
             return (
               <li key={row.rule_id} className="flex flex-col gap-3 py-3 first:pt-0 last:pb-0 sm:flex-row sm:items-center sm:justify-between">
                 <div className="min-w-0">
                   <div className="flex flex-wrap items-center gap-2">
-                    <Badge tone={row.acked ? "warning" : "danger"}>{row.acked ? "ACKED" : "FIRING"}</Badge>
+                    <Badge tone={stale || row.acked ? "warning" : "danger"}>
+                      {stale ? "STALE" : row.acked ? "ACKED" : "FIRING"}
+                    </Badge>
                     <span className="break-all font-mono text-[12.5px] text-fg">{row.rule_id}</span>
                   </div>
                   <p className="mt-1 flex items-center gap-1.5 text-[12px] text-muted">
                     <Clock3 size={12} />持续时间 {row.last_transition_at ? <TimeAgo value={row.last_transition_at} /> : "未知"}
                   </p>
+                  {stale && row.firing && (
+                    <p className="mt-1 text-[12px] text-warning">
+                      最近一次记录为 FIRING，但已超过 {row.classification_basis.stale_after_minutes} 分钟未评估
+                    </p>
+                  )}
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
-                  {!row.acked && <Button variant="secondary" size="sm" onClick={() => void ack(row)}>确认</Button>}
+                  {!stale && !row.acked && <Button variant="secondary" size="sm" onClick={() => void ack(row)}>确认</Button>}
                   <Button variant="secondary" size="sm" onClick={() => onSilence(row.rule_id)}>静默</Button>
                   {runbook && <a href={runbook} target="_blank" rel="noreferrer" className="inline-flex h-8 items-center gap-1 rounded-md px-2.5 text-[12px] font-medium text-accent outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring"><BookOpen size={13} />runbook</a>}
                   {incidentId && <a href={`#tab=selfheal&incident_id=${encodeURIComponent(incidentId)}`} className="inline-flex h-8 items-center rounded-md px-2.5 text-[12px] font-medium text-accent outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring">事故 #{incidentId}</a>}

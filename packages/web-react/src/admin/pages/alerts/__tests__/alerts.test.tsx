@@ -47,8 +47,8 @@ const COVERAGE: CoverageRow[] = [
 ];
 
 const RULES: RuleStateRow[] = [
-  { rule_id: "account_pool.all_down", firing: true, acked: false, acked_at: null, acked_by: null, dedupe_key: "k", last_transition_at: "2026-07-09T00:00:00Z", last_evaluated_at: "2026-07-10T00:00:00Z", last_payload: { n: 1, runbook_url: "https://ops.example/runbooks/pool", incident_id: "9" }, classification: "firing", stale: true, classification_basis: { stale_after_minutes: 15, recovered_within_hours: 24 } },
-  { rule_id: "legacy.retired", firing: false, acked: false, acked_at: null, acked_by: null, dedupe_key: null, last_transition_at: "2026-06-01T00:00:00Z", last_evaluated_at: "2026-06-01T00:00:00Z", last_payload: {}, classification: "stale", stale: true, classification_basis: { stale_after_minutes: 15, recovered_within_hours: 24 } },
+  { rule_id: "account_pool.all_down", firing: true, acked: false, acked_at: null, acked_by: null, dedupe_key: "k", last_transition_at: "2026-07-09T00:00:00Z", last_evaluated_at: "2026-07-10T00:00:00Z", last_payload: { n: 1, runbook_url: "https://ops.example/runbooks/pool", incident_id: "9" }, classification: "firing", stale: false, classification_basis: { stale_after_minutes: 15, recovered_within_hours: 24 } },
+  { rule_id: "legacy.retired", firing: true, acked: false, acked_at: null, acked_by: null, dedupe_key: null, last_transition_at: "2026-06-01T00:00:00Z", last_evaluated_at: "2026-06-01T00:00:00Z", last_payload: {}, classification: "stale", stale: true, classification_basis: { stale_after_minutes: 15, recovered_within_hours: 24 } },
 ];
 
 function routeGet(path: string): Promise<unknown> {
@@ -143,15 +143,27 @@ describe("AlertsPage 分区切换", () => {
     expect(screen.getByText("运维")).toBeTruthy();
     // FIRING 规则可见
     expect(screen.getAllByText("FIRING").length).toBeGreaterThanOrEqual(1);
-    expect(screen.getByText("STALE")).toBeTruthy();
+    expect(screen.getAllByText("STALE").length).toBeGreaterThanOrEqual(1);
   });
 
   test("行动队列静默按钮打开预填 rule_id 的静默弹窗", async () => {
     renderPage(<AlertsPage />);
     await screen.findByText("account_pool.all_down");
-    fireEvent.click(screen.getByRole("button", { name: "静默" }));
+    const freshRow = screen.getByText("account_pool.all_down").closest("li");
+    if (!freshRow) throw new Error("fresh action row not found");
+    fireEvent.click(within(freshRow).getByRole("button", { name: "静默" }));
     const dialog = await screen.findByRole("dialog", { name: "新建静默" });
     expect((within(dialog).getByDisplayValue("account_pool.all_down") as HTMLInputElement).value).toBe("account_pool.all_down");
+    fireEvent.click(within(dialog).getByRole("button", { name: "取消" }));
+
+    const staleRow = screen.getByText("legacy.retired").closest("li");
+    if (!staleRow) throw new Error("stale action row not found");
+    expect(within(staleRow).getByText("STALE")).toBeTruthy();
+    expect(within(staleRow).queryByRole("button", { name: "确认" })).toBeNull();
+    expect(within(staleRow).getByText(/最近一次记录为 FIRING/)).toBeTruthy();
+    fireEvent.click(within(staleRow).getByRole("button", { name: "静默" }));
+    const reopened = await screen.findByRole("dialog", { name: "新建静默" });
+    expect((within(reopened).getByDisplayValue("legacy.retired") as HTMLInputElement).value).toBe("legacy.retired");
   });
 });
 

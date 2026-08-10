@@ -253,6 +253,7 @@ describe("FeedbackPage · 响应评分", () => {
     expect(screen.getByText("Trace 完整率")).toBeInTheDocument();
     expect(screen.getByText("30 天显式覆盖率")).toBeInTheDocument();
     expect(screen.getByText("3/百 turn")).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "匿名反馈" })).not.toBeInTheDocument();
     expect(await screen.findByText("答非所问")).toBeInTheDocument();
     expect(adminGet).toHaveBeenCalledWith(
       "/response-ratings",

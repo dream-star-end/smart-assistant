@@ -33,6 +33,10 @@ export function SilencesTab({
   const [creating, setCreating] = useState(() => !!requestedRule);
   const [deleting, setDeleting] = useState<Set<string>>(new Set());
 
+  useEffect(() => {
+    if (requestedRule) setCreating(true);
+  }, [requestedRule]);
+
   const { data, loading, error, reload } = useReloadable<{ rows: SilenceRow[] }>(() =>
     adminGet("/alerts/silences"),
   );
