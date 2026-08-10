@@ -16,6 +16,7 @@ import {
 import { createRoot } from "react-dom/client";
 import { Composer } from "../src/components/Composer";
 import { MessageFeedbackDialog } from "../src/components/chat/MessageFeedbackDialog";
+import { TurnCostReminder } from "../src/components/chat/TurnCostReminder";
 import { MemoryPanel } from "../src/components/manage/MemoryPanel";
 import { MediaTaskCenter } from "../src/components/MediaTaskCenter";
 import { Markdown } from "../src/components/Markdown";
@@ -55,6 +56,8 @@ declare global {
   interface Window {
     __sends: Array<{ text: string; mediaCount: number }>;
     __uploads: string[];
+    __composerStops: number;
+    __setComposerState: (busy: boolean, stopping: boolean) => void;
     __lazyTimeline: {
       userFetches: number;
       tapeFetches: number;
@@ -126,6 +129,7 @@ declare global {
         toolCount: number;
         answerCount: number;
         cursor: number;
+        requests: string[];
       }>;
       /** Replay the two production error shapes through durable hydration. */
       runDurableErrorReplay: () => Promise<{
@@ -155,6 +159,8 @@ declare global {
 }
 window.__sends = [];
 window.__uploads = [];
+window.__composerStops = 0;
+window.__setComposerState = () => {};
 window.__lazyTimeline = { userFetches: 0, tapeFetches: 0, userRetry: null, tapeFetch: null };
 window.__scrollTimeline = {
   calls: [],
@@ -279,17 +285,29 @@ const uploadStub = async (file: File): Promise<MediaRef> => {
   return { kind: "file", url: "https://stub.invalid/browser-test", filename: file.name };
 };
 
+function ComposerProbe() {
+  const [state, setState] = useState({ busy: false, stopping: false });
+  window.__setComposerState = (busy, stopping) => setState({ busy, stopping });
+  return (
+    <>
+      {state.busy && <TurnCostReminder credits="731" />}
+      <Composer
+        onSend={(text, media) => {
+          window.__sends.push({ text, mediaCount: media?.length ?? 0 });
+        }}
+        busy={state.busy}
+        stopping={state.stopping}
+        onStop={() => { window.__composerStops += 1; }}
+        onUpload={uploadStub}
+        onSetGoal={async () => {}}
+        onGoalAction={async () => {}}
+      />
+    </>
+  );
+}
+
 createRoot(document.getElementById("root")!).render(
-  <StrictMode>
-    <Composer
-      onSend={(text, media) => {
-        window.__sends.push({ text, mediaCount: media?.length ?? 0 });
-      }}
-      onUpload={uploadStub}
-      onSetGoal={async () => {}}
-      onGoalAction={async () => {}}
-    />
-  </StrictMode>,
+  <StrictMode><ComposerProbe /></StrictMode>,
 );
 
 const feedbackAuth = createMemoryAuthSession(() => {}, "browser-feedback-token");
@@ -1097,16 +1115,47 @@ createRoot(document.getElementById("timeline-replay-root")!).render(
         },
         { kind: "text", text: markers.answer },
       ];
-      await replaySocket.runDurableLiveFrameHydration(REPLAY_SESSION_ID, async () => {
-        const page1 = record("1", 1, [{ kind: "thinking", text: "BROWSER_DURABLE_PAGE1" }]);
-        live().deliver(payload(2, overlapBlocks));
-        const page2 = record("2", 2, overlapBlocks);
-        replaySocket.applyDurableLiveFrames(
-          REPLAY_SESSION_ID,
-          [page1, page2],
-          [clientMessageId],
-        );
-      });
+      const requests: string[] = [];
+      const page1 = record("1", 1, [{ kind: "thinking", text: "BROWSER_DURABLE_PAGE1" }]);
+      const page2 = record("2", 2, overlapBlocks);
+      await replaySocket.hydrateDurableLiveFrameJournal(
+        REPLAY_SESSION_ID,
+        async (after) => {
+          requests.push(after);
+          if (after === "0") {
+            // This live frame is persisted between journal pages and overlaps page2.
+            live().deliver(payload(2, overlapBlocks));
+            return {
+              frames: [page1], nextCursor: "1", hasMore: true,
+              streamClientMessageIds: [clientMessageId], hasTapeProjection: false,
+            };
+          }
+          if (after === "1") {
+            return {
+              frames: [page2], nextCursor: "2", hasMore: false,
+              streamClientMessageIds: [clientMessageId], hasTapeProjection: false,
+            };
+          }
+          return {
+            frames: [], nextCursor: null, hasMore: false,
+            streamClientMessageIds: [clientMessageId], hasTapeProjection: false,
+          };
+        },
+        async () => {},
+      );
+      // A later reconcile must start at the shared record cursor and preserve
+      // every already-visible process row instead of replaying from zero.
+      await replaySocket.hydrateDurableLiveFrameJournal(
+        REPLAY_SESSION_ID,
+        async (after) => {
+          requests.push(after);
+          return {
+            frames: [], nextCursor: null, hasMore: false,
+            streamClientMessageIds: [clientMessageId], hasTapeProjection: false,
+          };
+        },
+        async () => {},
+      );
       return {
         markers,
         thinkingCount: session.messages
@@ -1117,6 +1166,7 @@ createRoot(document.getElementById("timeline-replay-root")!).render(
         answerCount: session.messages.filter((m) =>
           m.role === "assistant" && m.text === markers.answer).length,
         cursor: session._lastFrameSeqByKey?.[sessionKey] ?? -1,
+        requests,
       };
     },
     runDurableErrorReplay: async () => {

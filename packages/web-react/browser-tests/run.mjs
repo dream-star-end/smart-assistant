@@ -1703,7 +1703,7 @@ await check("T29 自动重试统一显示模型繁忙与共享 n/10 进度；重
   }
   await waitForReplay((state) => state.sending, "重试证明轮没有进入真实发送态");
   await page.evaluate(() => window.__replayDrive.pushRetryStatus());
-  await replayRoot.getByText("模型繁忙，正在自动重试中（2/10）", { exact: true }).waitFor({
+  await replayRoot.getByText("模型繁忙，正在重试中（2/10）", { exact: true }).waitFor({
     state: "visible",
     timeout: 3000,
   });
@@ -1728,6 +1728,28 @@ await check("T29 自动重试统一显示模型繁忙与共享 n/10 进度；重
   if (await replayRoot.getByText(/并发会话已达上限|concurrent limit|API Error: 429/).count()) {
     throw new Error("已恢复的中间 API 错误仍渲染为终态红卡");
   }
+});
+
+await check("T35 Composer 是唯一 Stop 入口，停止结算中原按钮禁用且不重复提交", async () => {
+  await page.evaluate(() => window.__setComposerState(true, false));
+  const stop = primaryComposer.getByRole("button", { name: "停止", exact: true });
+  await stop.waitFor({ state: "visible", timeout: 3000 });
+  if (await primaryComposer.getByRole("button", { name: /停止/ }).count() !== 1) {
+    throw new Error("活动轮或消费提醒出现了多个 Stop 控件");
+  }
+  const before = await page.evaluate(() => window.__composerStops);
+  await stop.click();
+  const after = await page.evaluate(() => window.__composerStops);
+  if (after !== before + 1) throw new Error(`Composer Stop 未精确提交一次:${before}→${after}`);
+
+  await page.evaluate(() => window.__setComposerState(true, true));
+  const stopping = primaryComposer.getByRole("button", { name: "正在停止", exact: true });
+  await stopping.waitFor({ state: "visible", timeout: 3000 });
+  if (!(await stopping.isDisabled())) throw new Error("Stop 结算中 Composer 控件仍可重复点击");
+  if (await primaryComposer.getByRole("button", { name: /停止/ }).count() !== 1) {
+    throw new Error("Stop 结算中仍残留第二个可操作停止入口");
+  }
+  await page.evaluate(() => window.__setComposerState(false, false));
 });
 
 await check("T30 视频任务中心持久排队、实时进度与可信取消交互", async () => {
@@ -1772,7 +1794,8 @@ await check("T31 journal page1→WS N→page2(N)：已响应思考/工具/正文
     result.thinkingCount !== 1 ||
     result.toolCount !== 1 ||
     result.answerCount !== 1 ||
-    result.cursor !== 2
+    result.cursor !== 2 ||
+    JSON.stringify(result.requests) !== JSON.stringify(["0", "1", "2", "2"])
   ) {
     throw new Error(`durable hydration 重复/丢失:${JSON.stringify(result)}`);
   }

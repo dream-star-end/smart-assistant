@@ -56,17 +56,37 @@ describe("TurnActivity（激活 computeTypingLabel 死代码：阶段反馈接�
     expect(screen.getByLabelText("生成中").textContent).toContain("正在压缩上下文");
   });
 
-  test("retrying → 滚动旧 max 也统一为「模型繁忙，正在自动重试中（n/10）」", () => {
+  test("retrying → 滚动旧 max 也统一为「模型繁忙，正在重试中（n/10）」", () => {
     renderTA({
       startedAt: Date.now(),
       turnStatus: { kind: "retrying", attempt: 2, max: 3, retryAt: Date.now() + 4500 },
     });
     const node = screen.getByLabelText("生成中");
     const t = node.textContent ?? "";
-    expect(t).toContain("模型繁忙，正在自动重试中（2/10）");
+    expect(t).toContain("模型繁忙，正在重试中（2/10）");
     expect(t).not.toContain("后重试");
     // 软提示走 warning 色(text-warning),不是红卡。
     expect(node.className).toContain("text-warning");
+  });
+
+  test("连接恢复与 Stop 复用活动行，不冒充模型重试", () => {
+    const { unmount } = render(
+      <TurnActivity info={{
+        startedAt: Date.now(),
+        agentName: "助手",
+        recoveryStatus: { kind: "retrying", attempt: 4 },
+      }} />,
+    );
+    expect(screen.getByLabelText("生成中")).toHaveTextContent("正在恢复实时内容…");
+    expect(screen.queryByText(/模型繁忙/)).not.toBeInTheDocument();
+    unmount();
+
+    renderTA({
+      recoveryStatus: { kind: "stopping", masterPersisted: true },
+      turnStatus: { kind: "retrying", attempt: 2, max: 10, retryAt: Date.now() + 1000 },
+    });
+    expect(screen.getByLabelText("生成中")).toHaveTextContent("正在停止…");
+    expect(screen.queryByText(/模型繁忙/)).not.toBeInTheDocument();
   });
 
   test("团队模式：leaderStep → 「队长正在执行:<step>」", () => {

@@ -128,7 +128,7 @@ import {
   turnRecoveryAttemptIdentity,
   turnRecoveryIdentity,
 } from "@openclaude/protocol";
-import type { DurableLiveFrame, RefreshOutcome } from "../types";
+import type { DurableLiveFrame, DurableLiveFramePage, RefreshOutcome } from "../types";
 
 export type { ChatStatusClass };
 
@@ -543,6 +543,13 @@ export class ChatSocket {
    * released through the same frameSeq reducer so REST/WS overlap is exact. */
   private readonly durableHydrationStates = new Map<string, { buffered: OutboundWire[] }>();
   private readonly durableHydrationTails = new Map<string, Promise<void>>();
+  /** Page-lifetime journal checkpoint shared by history selection and continuous reconcile.
+   * The first exact rebuild starts at zero; later reads append strictly after `cursor` and
+   * never destructively reset an already-visible process transcript. */
+  private readonly durableLiveJournalCheckpoints = new Map<string, {
+    cursor: string;
+    liveClientMessageIds: Set<string>;
+  }>();
   /** Exact active-turn candidate sets already attempted on the current WS.
    * History can arrive after the initial shell hello; each new candidate set
    * gets one targeted registration hello, then waits for a reconnect before
@@ -760,6 +767,7 @@ export class ChatSocket {
     this.reconcileInFlight.clear();
     this.reconcileRunTokens.clear();
     this.reconcileClientMessageIds.clear();
+    this.durableLiveJournalCheckpoints.clear();
     for (const t of this.controlPersistRetryTimers.values()) clearTimeout(t);
     this.controlPersistRetryTimers.clear();
     const ws = this.ws;
@@ -1106,7 +1114,13 @@ export class ChatSocket {
           this.scheduleNotify();
           return;
         }
-        const delay = Math.min(30_000, 1000 * (2 ** Math.min(attempt - 1, 5)));
+        // A successful active sync means the service is healthy and the journal
+        // is our current live transport. Keep it near-real-time; exponential
+        // backoff is only for failed requests. Incremental cursor reads make the
+        // steady poll cheap without replaying the full transcript.
+        const delay = synced === true
+          ? 1000
+          : Math.min(30_000, 1000 * (2 ** Math.min(attempt - 1, 5)));
         if (current._recoveryStatus?.kind !== "stopping") {
           current._recoveryStatus = {
             kind: "retrying",
@@ -2340,6 +2354,7 @@ export class ChatSocket {
       void this.deps.deletePendingControl?.(sessId, item.controlId).catch(() => {});
     }
     this.clearContinuousReconcile(sessId);
+    this.durableLiveJournalCheckpoints.delete(sessId);
     this.maybePromoteToConnected();
     this.pendingRepoBind.delete(sessId);
     this.transientNotices.delete(sessId);
@@ -2370,6 +2385,7 @@ export class ChatSocket {
     this.reconcileInFlight.clear();
     this.reconcileRunTokens.clear();
     this.reconcileClientMessageIds.clear();
+    this.durableLiveJournalCheckpoints.clear();
     for (const timer of this.controlPersistRetryTimers.values()) clearTimeout(timer);
     this.controlPersistRetryTimers.clear();
     this.activeReplayAttemptKeys.clear();
@@ -2811,6 +2827,73 @@ export class ChatSocket {
     if (full && this.ws && this.ws.readyState === 1) {
       this.sendHelloFrame(false, sessId, true);
     }
+  }
+
+  /**
+   * Hydrate the exact live journal without repeatedly replaying its entire history.
+   *
+   * One cold/page-lifetime read stages the unbounded snapshot from zero and resets
+   * the affected client-owned rows exactly once. Every later caller (session history
+   * selection or continuous reconcile) resumes from the same committed record cursor,
+   * so a long active turn only applies newly persisted frames. A failed page never
+   * advances past unapplied data; replaying an already-applied page remains safe via
+   * the ordinary sessionKey+frameSeq dedupe.
+   */
+  hydrateDurableLiveFrameJournal(
+    sessId: string,
+    fetchPage: (after: string) => Promise<DurableLiveFramePage>,
+    applyTapeProjection: () => Promise<void>,
+  ): Promise<void> {
+    return this.runDurableLiveFrameHydration(sessId, async () => {
+      const checkpoint = this.durableLiveJournalCheckpoints.get(sessId);
+      const initial = checkpoint === undefined;
+      let cursor = checkpoint?.cursor ?? "0";
+      const previousLiveOwners = checkpoint?.liveClientMessageIds ?? new Set<string>();
+      let currentLiveOwners = new Set(previousLiveOwners);
+      const observedLiveOwners = new Set(previousLiveOwners);
+      let sawTapeProjection = false;
+
+      const readPages = async (stage: DurableLiveFrame[] | null): Promise<void> => {
+        for (;;) {
+          const page = await fetchPage(cursor);
+          sawTapeProjection ||= page.hasTapeProjection === true;
+          currentLiveOwners = new Set(page.streamClientMessageIds);
+          for (const clientMessageId of currentLiveOwners) observedLiveOwners.add(clientMessageId);
+          if (stage) {
+            stage.push(...page.frames);
+          } else if (page.frames.length > 0) {
+            this.applyDurableLiveFrames(sessId, page.frames);
+          }
+          if (page.hasMore && !page.nextCursor) {
+            throw new Error("live frame page missing cursor");
+          }
+          if (page.nextCursor) cursor = page.nextCursor;
+          if (!page.hasMore) break;
+        }
+      };
+
+      if (initial) {
+        const stagedFrames: DurableLiveFrame[] = [];
+        await readPages(stagedFrames);
+        this.applyDurableLiveFrames(sessId, stagedFrames, [...observedLiveOwners]);
+        // Close snapshot→reset races while stamped WS frames remain buffered.
+        await readPages(null);
+      } else {
+        await readPages(null);
+      }
+
+      const liveOwnerProjectedToTape = [...previousLiveOwners].some(
+        (clientMessageId) => !currentLiveOwners.has(clientMessageId),
+      );
+      if ((initial && sawTapeProjection) || liveOwnerProjectedToTape) {
+        await applyTapeProjection();
+      }
+
+      this.durableLiveJournalCheckpoints.set(sessId, {
+        cursor,
+        liveClientMessageIds: currentLiveOwners,
+      });
+    });
   }
 
   /** Serialize one session's REST journal rebuild and hold overlapping stamped

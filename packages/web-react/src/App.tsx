@@ -22,7 +22,6 @@ import {
 } from "./components/chat/imageEditActions";
 import { extractLatestTodos, PinnedTaskTracker } from "./components/chat/PinnedTaskTracker";
 import { deriveActivePlanStep, type TurnActivityInfo } from "./components/chat/TurnActivity";
-import { RecoveryStatusCard } from "./components/chat/RecoveryStatusCard";
 import { EmptyState } from "./components/EmptyState";
 import { type ChatError, ErrorBanner } from "./components/ErrorBanner";
 import { UpdateBanner } from "./components/UpdateBanner";
@@ -1374,6 +1373,7 @@ export function App() {
       startedAt: activeSess._turnStartedAt ?? null,
       lastFrameAt: activeSess._lastFrameAt,
       turnStatus: activeSess._turnStatus ?? null,
+      recoveryStatus: activeSess._recoveryStatus ?? null,
       coldStart: !!activeSess._isFirstTurnAfterReady,
       agentName: agent.name || "助手",
       leaderStep: teamLeaderActive ? deriveActivePlanStep(extractLatestTodos(wsMessages)) : null,
@@ -2363,14 +2363,6 @@ export function App() {
 
         {/* composer-safe-b:底部 Home 指示条安全区(叠在原 pb-3 上),否则发送区被遮 */}
         <div className="shrink-0 composer-safe-b">
-          {!demo && !gated && activeSess?._recoveryStatus && (
-            <div className="mx-auto mb-2 max-w-3xl px-4">
-              <RecoveryStatusCard
-                status={activeSess._recoveryStatus}
-                onStop={activeSess._recoveryStatus.kind === "completed" ? undefined : stopTurn}
-              />
-            </div>
-          )}
           {/* 任务列表 HUD:钉在输入框上方,始终可见(取代会滚走的 inline TodoWrite 卡)。
               初始展开全部 → ~3s 自动折叠成「正在执行的一条」;无任务时组件自渲染 null。 */}
           {!demo && !gated && (
@@ -2389,7 +2381,6 @@ export function App() {
             <div className="mx-auto mb-2 max-w-3xl px-4">
               <TurnCostReminder
                 credits={activeSess._turnCostReminderCredits}
-                onStop={stopTurn}
               />
             </div>
           )}
@@ -2417,6 +2408,7 @@ export function App() {
               send(text, media, undefined, undefined, replyTo)
             }
             busy={sending}
+            stopping={activeSess?._recoveryStatus?.kind === "stopping"}
             onStop={stopTurn}
             disabled={gated}
             placeholder={`和「${agent.name}」对话…`}
