@@ -44,7 +44,7 @@ after(async () => {
 })
 
 async function seedSetting(value?: string): Promise<void> {
-  await resetAndMigrateBefore('0203')
+    await resetAndMigrateBefore('0204')
   if (value === undefined) {
     await query("DELETE FROM system_settings WHERE key='auto_dream_model'")
     return
