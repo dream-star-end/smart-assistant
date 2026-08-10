@@ -1,10 +1,6 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
 
-import {
-  installGlobalClientFrictionHandlers,
-  reportClientFriction,
-  reportClientFrictionBatch,
-} from "./clientFriction";
+import { installGlobalClientFrictionHandlers, reportClientFriction } from "./clientFriction";
 
 afterEach(() => {
   document.querySelector('meta[name="oc-build"]')?.remove();
@@ -26,7 +22,6 @@ describe("client friction reporter", () => {
     const eventId = reportClientFriction({
       eventId: "event_1", surface: "auth", stage: "refresh", code: "REFRESH_RACE",
       outcome: "recovered", attempts: 2, latencyMs: 180, traceId: "trace_1",
-      entitySlug: "academic-translate",
       // Prove extra fields cannot flow into the explicit wire projection.
       message: "DO_NOT_SEND", stack: "DO_NOT_SEND", url: "DO_NOT_SEND",
     } as never, "token");
@@ -39,7 +34,6 @@ describe("client friction reporter", () => {
     expect(body).toMatchObject({
       event_id: "event_1", surface: "auth", stage: "refresh", code: "REFRESH_RACE",
       outcome: "recovered", attempts: 2, latency_ms: 180, trace_id: "trace_1",
-      entity_slug: "academic-translate",
       client_build: "build-abc", browser_family: "chrome", device_class: "desktop",
     });
     expect(JSON.stringify(body)).not.toContain("DO_NOT_SEND");
@@ -72,24 +66,5 @@ describe("client friction reporter", () => {
     const bodies = fetchMock.mock.calls.map((call) => JSON.parse(String((call[1] as RequestInit).body)));
     expect(bodies.map((b) => b.code)).toEqual(["JS_ERROR", "UNHANDLED_REJECTION"]);
     expect(JSON.stringify(bodies)).not.toContain("DO_NOT_SEND");
-  });
-
-  test("batches per-entity exposures into one telemetry request", () => {
-    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
-    vi.stubGlobal("fetch", fetchMock);
-    vi.stubGlobal("matchMedia", vi.fn(() => ({ matches: false })));
-
-    const ids = reportClientFrictionBatch([
-      { eventId: "exposure_1", surface: "marketplace", stage: "catalog_exposure", code: "CATALOG_EXPOSURE", outcome: "succeeded", entitySlug: "skill.one" },
-      { eventId: "exposure_2", surface: "marketplace", stage: "catalog_exposure", code: "CATALOG_EXPOSURE", outcome: "succeeded", entitySlug: "skill.two" },
-    ], "token");
-
-    expect(ids).toEqual(["exposure_1", "exposure_2"]);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    const body = JSON.parse(String((fetchMock.mock.calls[0]![1] as RequestInit).body));
-    expect(body.events.map((event: { entity_slug: string }) => event.entity_slug)).toEqual([
-      "skill.one",
-      "skill.two",
-    ]);
   });
 });

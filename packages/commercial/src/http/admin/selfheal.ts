@@ -63,12 +63,7 @@ export async function handleAdminListIncidents(
       before: optional(p.get("before")),
       limit,
     });
-    sendJson(res, 200, {
-      rows: r.rows,
-      next_before: r.next_before,
-      total: r.total,
-      open_total: r.open_total,
-    });
+    sendJson(res, 200, { rows: r.rows, next_before: r.next_before });
   } catch (err) {
     translateRangeError(err);
   }

@@ -126,13 +126,6 @@ const createSchema = z
   })
   .strict()
   .superRefine((v, ctx) => {
-    if (v.category === "operations") {
-      ctx.addIssue({
-        code: "custom",
-        path: ["category"],
-        message: "operations incident notices must use the selfheal approval workflow",
-      });
-    }
     if (v.audience === "all" && v.user_id != null) {
       ctx.addIssue({
         code: "custom",
@@ -659,8 +652,6 @@ export interface AdminListInput {
   limit?: number;
   offset?: number;
   category?: InboxCategory | null;
-  /** `unattributed` selects rows whose source was not captured. */
-  sourceType?: string | null;
 }
 
 export interface AdminInboxRow extends InboxMessage, InboxEmailFields {
@@ -672,7 +663,6 @@ export interface AdminInboxRow extends InboxMessage, InboxEmailFields {
   source_type: string | null;
   source_id: string | null;
   source_phase: string | null;
-  audience_snapshot_status: "captured" | "legacy_unavailable";
 }
 
 export interface AdminListResult {
@@ -733,7 +723,6 @@ export async function adminListInbox(input: AdminListInput): Promise<AdminListRe
     source_type: string | null;
     source_id: string | null;
     source_phase: string | null;
-    audience_snapshot_status: "captured" | "legacy_unavailable";
   }>(
     `SELECT m.id::text AS id,
             m.audience,
@@ -762,26 +751,23 @@ export async function adminListInbox(input: AdminListInput): Promise<AdminListRe
               )
             END AS thread_count,
             COALESCE((SELECT COUNT(*)::int FROM inbox_message_reads r WHERE r.message_id = m.id), 0) AS read_count,
-            COALESCE((SELECT COUNT(*)::int FROM inbox_message_audience_snapshots s
-                       WHERE s.message_id=m.id),0) AS recipients,
-            CASE WHEN m.audience_snapshotted_at IS NOT NULL
-              THEN 'captured' ELSE 'legacy_unavailable' END AS audience_snapshot_status
+            CASE WHEN m.audience = 'user' THEN 1
+                 ELSE COALESCE(
+                   (SELECT COUNT(*)::int FROM users u
+                     WHERE u.status = 'active' AND u.created_at <= m.created_at), 0)
+            END AS recipients
        FROM inbox_messages m
       WHERE ($3::text IS NULL OR m.category=$3)
-        AND ($4::text IS NULL OR
-             ($4='unattributed' AND m.source_type IS NULL) OR m.source_type=$4)
       ORDER BY m.created_at DESC, m.id DESC
       LIMIT $1 OFFSET $2`,
-    [limit, offset, input.category ?? null, input.sourceType ?? null],
+    [limit, offset, input.category ?? null],
   );
 
   const totalRes = await query<{ n: number }>(
     `SELECT COUNT(*)::int AS n
        FROM inbox_messages
-      WHERE ($1::text IS NULL OR category=$1)
-        AND ($2::text IS NULL OR
-             ($2='unattributed' AND source_type IS NULL) OR source_type=$2)`,
-    [input.category ?? null, input.sourceType ?? null],
+      WHERE ($1::text IS NULL OR category=$1)`,
+    [input.category ?? null],
   );
 
   return {
@@ -807,152 +793,8 @@ export async function adminListInbox(input: AdminListInput): Promise<AdminListRe
       source_type: row.source_type,
       source_id: row.source_id,
       source_phase: row.source_phase,
-      audience_snapshot_status: row.audience_snapshot_status,
     })),
     total: totalRes.rows[0]?.n ?? 0,
-  };
-}
-
-export interface InboxAudiencePreview {
-  audience: Audience;
-  category: InboxCategory;
-  recipients: number;
-  sample: Array<{
-    user_id: string;
-    username: string | null;
-    traffic_class: string;
-  }>;
-  recipient_load: { p50_30d: number; p90_30d: number; max_30d: number };
-}
-
-export async function previewInboxAudience(input: {
-  audience: Audience;
-  user_id?: string | null;
-  category?: InboxCategory | null;
-}): Promise<InboxAudiencePreview> {
-  const userId = input.audience === "user" ? input.user_id ?? null : null;
-  if (input.audience === "user" && (userId === null || !/^[1-9]\d{0,19}$/.test(userId))) {
-    throw new InboxError("VALIDATION", "user_id is required for user audience");
-  }
-  const category = input.category ?? "user";
-  const audienceSql = input.audience === "all"
-    ? "u.status='active'"
-    : "u.status='active' AND u.id=$1::bigint";
-  const params = input.audience === "all" ? [] : [userId];
-  const [audience, load] = await Promise.all([
-    query<{ user_id: string; username: string | null; traffic_class: string; total: number }>(
-      `SELECT u.id::text AS user_id,COALESCE(u.display_name,u.email) AS username,
-              u.signal_traffic_class AS traffic_class,
-              COUNT(*) OVER()::int AS total
-         FROM users u WHERE ${audienceSql}
-        ORDER BY u.id LIMIT 20`,
-      params,
-    ),
-    query<{ p50: string | null; p90: string | null; max: number | null }>(
-      `WITH audience AS (
-         SELECT u.id AS user_id FROM users u
-          WHERE u.status='active' AND ($1::bigint IS NULL OR u.id=$1)
-       ), recipient_load AS (
-         SELECT a.user_id,COUNT(m.id)::int AS messages
-           FROM audience a
-           LEFT JOIN inbox_message_audience_snapshots s ON s.user_id=a.user_id
-           LEFT JOIN inbox_messages m ON m.id=s.message_id
-             AND m.created_at>=NOW()-INTERVAL '30 days'
-          GROUP BY a.user_id
-       )
-       SELECT percentile_cont(0.5) WITHIN GROUP(ORDER BY messages)::text AS p50,
-              percentile_cont(0.9) WITHIN GROUP(ORDER BY messages)::text AS p90,
-              MAX(messages)::int AS max FROM recipient_load`,
-      [userId],
-    ),
-  ]);
-  return {
-    audience: input.audience,
-    category,
-    recipients: audience.rows[0]?.total ?? 0,
-    sample: audience.rows.map(({ total: _total, ...row }) => row),
-    recipient_load: {
-      p50_30d: Number(load.rows[0]?.p50 ?? 0),
-      p90_30d: Number(load.rows[0]?.p90 ?? 0),
-      max_30d: load.rows[0]?.max ?? 0,
-    },
-  };
-}
-
-export interface AdminInboxStats {
-  window_days: number;
-  snapshot_coverage: { captured_messages: number; legacy_unavailable_messages: number };
-  read_funnel: { messages: number; recipients: number; reads: number; read_rate: number | null };
-  by_source: Array<{ source_type: string; messages: number; recipients: number; reads: number; read_rate: number | null }>;
-  by_category: Array<{ category: string; messages: number; recipients: number; reads: number; read_rate: number | null }>;
-  recipient_load: { users: number; p50: number; p90: number; max: number; over_20: number; over_100: number };
-}
-
-export async function getAdminInboxStats(days = 30): Promise<AdminInboxStats> {
-  const windowDays = Math.min(90, Math.max(1, Math.trunc(days)));
-  const params = [windowDays];
-  const aggregateSql = (group: "source_type" | "category") => {
-    const fallback = group === "source_type" ? "unattributed" : "unknown";
-    return `
-    SELECT COALESCE(m.${group},'${fallback}') AS key,COUNT(DISTINCT m.id)::int AS messages,
-           COUNT(s.user_id)::int AS recipients,COUNT(r.user_id)::int AS reads
-      FROM inbox_messages m
-      LEFT JOIN inbox_message_audience_snapshots s ON s.message_id=m.id
-      LEFT JOIN inbox_message_reads r ON r.message_id=m.id AND r.user_id=s.user_id
-     WHERE m.created_at>=NOW()-($1::int*INTERVAL '1 day')
-       AND m.audience_snapshotted_at IS NOT NULL
-     GROUP BY COALESCE(m.${group},'${fallback}') ORDER BY COUNT(DISTINCT m.id) DESC`;
-  };
-  const [coverage, funnel, sources, categories, load] = await Promise.all([
-    query<{ captured: number; legacy: number }>(
-      `SELECT COUNT(*) FILTER (WHERE m.audience_snapshotted_at IS NOT NULL)::int AS captured,
-              COUNT(*) FILTER (WHERE m.audience_snapshotted_at IS NULL)::int AS legacy
-         FROM inbox_messages m WHERE m.created_at>=NOW()-($1::int*INTERVAL '1 day')`, params),
-    query<{ messages: number; recipients: number; reads: number }>(
-      `SELECT COUNT(DISTINCT m.id)::int AS messages,COUNT(s.user_id)::int AS recipients,
-              COUNT(r.user_id)::int AS reads
-         FROM inbox_messages m
-         LEFT JOIN inbox_message_audience_snapshots s ON s.message_id=m.id
-         LEFT JOIN inbox_message_reads r ON r.message_id=m.id AND r.user_id=s.user_id
-        WHERE m.created_at>=NOW()-($1::int*INTERVAL '1 day')
-          AND m.audience_snapshotted_at IS NOT NULL`, params),
-    query<{ key: string; messages: number; recipients: number; reads: number }>(aggregateSql("source_type"), params),
-    query<{ key: string; messages: number; recipients: number; reads: number }>(aggregateSql("category"), params),
-    query<{ users: number; p50: string | null; p90: string | null; max: number | null; over_20: number; over_100: number }>(
-      `WITH loads AS (
-         SELECT s.user_id,COUNT(*)::int AS messages
-           FROM inbox_message_audience_snapshots s JOIN inbox_messages m ON m.id=s.message_id
-          WHERE m.created_at>=NOW()-($1::int*INTERVAL '1 day') GROUP BY s.user_id
-       ) SELECT COUNT(*)::int AS users,
-                percentile_cont(0.5) WITHIN GROUP(ORDER BY messages)::text AS p50,
-                percentile_cont(0.9) WITHIN GROUP(ORDER BY messages)::text AS p90,
-                MAX(messages)::int AS max,
-                COUNT(*) FILTER (WHERE messages>20)::int AS over_20,
-                COUNT(*) FILTER (WHERE messages>100)::int AS over_100 FROM loads`, params),
-  ]);
-  const rate = (reads: number, recipients: number): number | null =>
-    recipients > 0 ? Math.round((reads / recipients) * 10_000) / 10_000 : null;
-  const f = funnel.rows[0] ?? { messages: 0, recipients: 0, reads: 0 };
-  const mapRows = (rows: Array<{ key: string; messages: number; recipients: number; reads: number }>) =>
-    rows.map((row) => ({ ...row, read_rate: rate(row.reads, row.recipients) }));
-  const l = load.rows[0];
-  return {
-    window_days: windowDays,
-    snapshot_coverage: {
-      captured_messages: coverage.rows[0]?.captured ?? 0,
-      legacy_unavailable_messages: coverage.rows[0]?.legacy ?? 0,
-    },
-    read_funnel: { ...f, read_rate: rate(f.reads, f.recipients) },
-    by_source: mapRows(sources.rows).map(({ key, ...row }) => ({ source_type: key, ...row })),
-    by_category: mapRows(categories.rows).map(({ key, ...row }) => ({ category: key, ...row })),
-    recipient_load: {
-      users: l?.users ?? 0,
-      p50: Number(l?.p50 ?? 0),
-      p90: Number(l?.p90 ?? 0),
-      max: l?.max ?? 0,
-      over_20: l?.over_20 ?? 0,
-      over_100: l?.over_100 ?? 0,
-    },
   };
 }
 

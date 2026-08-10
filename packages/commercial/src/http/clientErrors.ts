@@ -85,7 +85,6 @@ export function normalizeClientFrictionReport(
       : "unknown",
     traceId,
     sessionId,
-    entitySlug: safeToken(body.entity_slug, 128, /^[a-z0-9][a-z0-9._-]*$/),
   };
 }
 
@@ -104,44 +103,25 @@ export async function handleClientErrorReport(
   if (claims && /^\d+$/.test(claims.sub)) userId = BigInt(claims.sub);
 
   const body = (await readJsonBody(req)) as Record<string, unknown> | undefined;
-  if (!body || typeof body !== "object" || Array.isArray(body)) {
-    sendJson(res, 200, { ok: true });
-    return;
-  }
-
-  const persist = async (report: NormalizedClientFrictionReport): Promise<void> => {
-    await recordProductFrictionEvent({ ...report, userId }).catch((err: unknown) => {
-    // Telemetry must never affect the user path. Keep only structural database
-    // diagnostics: PostgreSQL messages can include rejected row values, so raw
-    // message/detail/stack must not become a second telemetry payload.
-      ctx.log.warn("client_friction_persist_failed", {
-        surface: report.surface, stage: report.stage, code: report.code,
-        ...classifyClientFrictionPersistError(err),
-      });
-    });
-  };
-
-  const events = body.events;
-  if (Array.isArray(events)) {
-    // Marketplace pages expose at most one 50-card page per request. Batch only
-    // authenticated signals so the existing 30 req/min anti-spam boundary is not
-    // multiplied for anonymous callers.
-    if (!claims || events.length < 1 || events.length > 50) {
-      sendJson(res, 200, { ok: true });
-      return;
-    }
-    const reports = events
-      .filter((event): event is Record<string, unknown> =>
-        !!event && typeof event === "object" && !Array.isArray(event))
-      .map((event, index) => normalizeClientFrictionReport(event, `${ctx.requestId}-${index}`));
-    for (const report of reports) await persist(report);
-    ctx.log.info("client_friction_batch_report", { uid: claims.sub, count: reports.length });
+  if (!body || typeof body !== "object") {
     sendJson(res, 200, { ok: true });
     return;
   }
 
   const report = normalizeClientFrictionReport(body, ctx.requestId);
-  await persist(report);
+
+  await recordProductFrictionEvent({
+    ...report,
+    userId,
+  }).catch((err: unknown) => {
+    // Telemetry must never affect the user path. Keep only structural database
+    // diagnostics: PostgreSQL messages can include rejected row values, so raw
+    // message/detail/stack must not become a second telemetry payload.
+    ctx.log.warn("client_friction_persist_failed", {
+      surface: report.surface, stage: report.stage, code: report.code,
+      ...classifyClientFrictionPersistError(err),
+    });
+  });
 
   const logFields = {
     uid: claims?.sub ?? null,

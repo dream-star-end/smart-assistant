@@ -117,11 +117,6 @@ const TRACE = {
 const PRODUCT_FRICTION = {
   generated_at: new Date().toISOString(),
   windows: { operational_days: 7, funnel_days: 30 },
-  event_summary: {
-    last_1h: { total: 0, affected_users: 0, outcomes: { failed: 0, recovered: 0, succeeded: 0, abandoned: 0, pending: 0, cancelled: 0 }, latest_occurrence: null, trace: { total: 0, with_trace: 0, missing_trace: 0 } },
-    last_24h: { total: 3, affected_users: 2, outcomes: { failed: 1, recovered: 2, succeeded: 0, abandoned: 0, pending: 0, cancelled: 0 }, latest_occurrence: new Date(Date.now() - 2 * 60 * 60_000).toISOString(), trace: { total: 3, with_trace: 2, missing_trace: 1 } },
-    last_7d: { total: 5, affected_users: 2, outcomes: { failed: 1, recovered: 3, succeeded: 1, abandoned: 0, pending: 0, cancelled: 0 }, latest_occurrence: new Date(Date.now() - 2 * 60 * 60_000).toISOString(), trace: { total: 5, with_trace: 4, missing_trace: 1 } },
-  },
   events: [{
     surface: "auth", stage: "refresh", code: "REFRESH_RACE",
     journeys_1d: "2", journeys_7d: "3", attempts_1d: "3", attempts_7d: "5",
@@ -265,8 +260,7 @@ describe("AuditPage", () => {
     expect((await screen.findAllByText("qwen3.7-max")).length).toBeGreaterThanOrEqual(2);
     expect(adminGet.mock.calls.some((c) => c[0] === "/product-friction")).toBe(true);
     expect(screen.getByText(/重试是过程，不等于终局失败/)).toBeTruthy();
-    expect(screen.getByText(/最近 1 小时未继续发生/)).toBeTruthy();
-    expect(screen.getByText(/7 天历史数据仅用于复盘/)).toBeTruthy();
+    expect(screen.getByText(/不跨来源相加/)).toBeTruthy();
     expect(screen.getByText("REFRESH_RACE")).toBeTruthy();
     expect(screen.getByText("24 小时模型尝试").parentElement?.textContent).toContain("10");
     expect(screen.getByText("24 小时终局失败").parentElement?.textContent).toContain("2");

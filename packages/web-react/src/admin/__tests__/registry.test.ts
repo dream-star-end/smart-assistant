@@ -7,26 +7,22 @@ import {
   getAdminPage,
 } from "../registry";
 
-// 分组 → 期望 key 列表（权威源 = React registry 的运营信息架构）。
+// 分组 → 期望 key 列表（权威源 = 旧 vanilla ADMIN_TAB_META）。
 const EXPECTED: Record<string, string[]> = {
   经营驾驶舱: ["dashboard", "users"],
   账号与调度: ["accounts", "accountGroups", "egressProxies"],
   运行资源: ["containers", "hosts"],
   财务与商业: ["ledger", "orders", "pricing", "plans", "org", "modelGrants"],
-  用户声音与体验: ["feedback", "autoDreamFindings", "productFriction"],
-  用户触达: ["inbox"],
-  内容运营: ["marketplace"],
-  系统配置: ["literature", "settings"],
-  运行与事故: ["health", "alerts", "selfheal"],
-  审计与安全: ["audit"],
+  用户触达: ["feedback", "autoDreamFindings", "inbox", "marketplace"],
+  系统运营: ["literature", "settings", "audit", "health", "alerts", "selfheal"],
 };
 
 describe("registry 完整性", () => {
-  test("恰好 24 个页面，key 无重复", () => {
-    expect(adminPages).toHaveLength(24);
+  test("恰好 23 个页面，key 无重复", () => {
+    expect(adminPages).toHaveLength(23);
     const keys = adminPages.map((p) => p.key);
-    expect(new Set(keys).size).toBe(24);
-    expect(adminTabKeys.size).toBe(24);
+    expect(new Set(keys).size).toBe(23);
+    expect(adminTabKeys.size).toBe(23);
   });
 
   test("每个 key 都存在且分组正确", () => {
@@ -43,8 +39,8 @@ describe("registry 完整性", () => {
     expect(ADMIN_GROUP_ORDER).toEqual(Object.keys(EXPECTED));
     expect(adminGroups.map((g) => g.group)).toEqual(ADMIN_GROUP_ORDER);
     const flat = adminGroups.flatMap((g) => g.pages.map((p) => p.key));
-    expect(flat).toHaveLength(24);
-    expect(new Set(flat).size).toBe(24);
+    expect(flat).toHaveLength(23);
+    expect(new Set(flat).size).toBe(23);
   });
 
   test("每页有标题/描述/图标/懒组件", () => {
@@ -59,7 +55,6 @@ describe("registry 完整性", () => {
   test("getAdminPage：命中返回本页，非法 key 回落 dashboard", () => {
     expect(getAdminPage("users").key).toBe("users");
     expect(getAdminPage("accountGroups").key).toBe("accountGroups");
-    expect(getAdminPage("productFriction").key).toBe("productFriction");
     expect(getAdminPage("nope").key).toBe("dashboard");
     expect(getAdminPage("").key).toBe("dashboard");
   });

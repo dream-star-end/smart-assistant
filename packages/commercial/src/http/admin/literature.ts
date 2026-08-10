@@ -24,7 +24,6 @@ import {
 } from "../../admin/literatureConfig.js";
 import type { CommercialHttpDeps, RequestContext } from "../handlers.js";
 import { translateRangeError } from "./_shared.js";
-import { getLiteratureOperationalSnapshot, utcDayKey } from "../../literatureProxy.js";
 
 // Per-admin test 冷却 — 防连点。进程内 Map,重启即清。10s 已经够 admin "改 → 立刻测"。
 const TEST_COOLDOWN_MS = 10_000;
@@ -60,24 +59,7 @@ export async function handleAdminGetLiterature(
 ): Promise<void> {
   await requireAdmin(req, deps.jwtSecret);
   const view = await getLiteratureConfig(true);
-  const utcDay = utcDayKey().slice("deepxiv:daily:".length);
-  let used: number | null = null;
-  let source: "redis" | "unavailable" = "unavailable";
-  if (deps.literatureDailyUsage) {
-    try {
-      used = await deps.literatureDailyUsage(utcDayKey());
-      source = "redis";
-    } catch {
-      used = null;
-    }
-  }
-  sendJson(res, 200, {
-    config: view,
-    operations: {
-      daily: { utc_day: utcDay, used, cap: view.daily_cap, source },
-      metrics: getLiteratureOperationalSnapshot(),
-    },
-  });
+  sendJson(res, 200, { config: view });
 }
 
 // ─── PATCH /api/admin/literature ───────────────────────────────────

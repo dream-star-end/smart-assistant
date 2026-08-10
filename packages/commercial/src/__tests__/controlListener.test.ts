@@ -122,13 +122,6 @@ function closeServer(s: net.Server | http.Server): Promise<void> {
   });
 }
 
-async function freePortPair(): Promise<[number, number]> {
-  const reservations = await Promise.all([occupyPort(0), occupyPort(0)]);
-  const ports = reservations.map((server) => (server.address() as net.AddressInfo).port);
-  await Promise.all(reservations.map(closeServer));
-  return [ports[0]!, ports[1]!];
-}
-
 // ── 资源登记(afterEach 兜底关闭)────────────────────────────────────────────────
 let listener: ControlListener | null = null;
 const openServers = new Set<net.Server | http.Server>();
@@ -159,9 +152,8 @@ describe("controlListener 常量导出", () => {
 
 describe("controlListener bind / VIP 生命周期", () => {
   it("① desired==self → start 后 VIP + 私有口都 bound 且返回 ok", async () => {
-    const [vipPort, privatePort] = await freePortPair();
-    const vip = { host: "127.0.0.1", port: vipPort };
-    const priv = { host: "127.0.0.1", port: privatePort };
+    const vip = { host: "127.0.0.1", port: 39894 };
+    const priv = { host: "127.0.0.1", port: 39896 };
     const watch = makeFakeWatch("A");
     listener = createControlListener({ slot: "A", desiredWatch: watch, handler: okHandler, vip, privateAddr: priv });
     await listener.start();
@@ -176,9 +168,8 @@ describe("controlListener bind / VIP 生命周期", () => {
   });
 
   it("② desired 翻走 → VIP 优雅 close,私有口仍 bound", async () => {
-    const [vipPort, privatePort] = await freePortPair();
-    const vip = { host: "127.0.0.1", port: vipPort };
-    const priv = { host: "127.0.0.1", port: privatePort };
+    const vip = { host: "127.0.0.1", port: 39898 };
+    const priv = { host: "127.0.0.1", port: 39900 };
     const watch = makeFakeWatch("A");
     listener = createControlListener({ slot: "A", desiredWatch: watch, handler: okHandler, vip, privateAddr: priv });
     await listener.start();
@@ -197,9 +188,8 @@ describe("controlListener bind / VIP 生命周期", () => {
   });
 
   it("③ desired 翻回 self → VIP 重 bind", async () => {
-    const [vipPort, privatePort] = await freePortPair();
-    const vip = { host: "127.0.0.1", port: vipPort };
-    const priv = { host: "127.0.0.1", port: privatePort };
+    const vip = { host: "127.0.0.1", port: 39902 };
+    const priv = { host: "127.0.0.1", port: 39904 };
     const watch = makeFakeWatch("A");
     listener = createControlListener({ slot: "A", desiredWatch: watch, handler: okHandler, vip, privateAddr: priv });
     await listener.start();
@@ -215,9 +205,8 @@ describe("controlListener bind / VIP 生命周期", () => {
   });
 
   it("④ EADDRINUSE:占住 VIP 口 → start 不抛、vipBound 暂 false;释放后重试周期内 bound", async () => {
-    const [vipPort, privatePort] = await freePortPair();
-    const vip = { host: "127.0.0.1", port: vipPort };
-    const priv = { host: "127.0.0.1", port: privatePort };
+    const vip = { host: "127.0.0.1", port: 39906 };
+    const priv = { host: "127.0.0.1", port: 39908 };
     const blocker = await occupyPort(vip.port);
     openServers.add(blocker);
 
@@ -244,9 +233,8 @@ describe("controlListener bind / VIP 生命周期", () => {
   });
 
   it("⑥ bind pending(EADDRINUSE 重试中)时 desired 翻走 → releaseVip 取消在途 bind,释放端口后不 bind(BLOCKER 3)", async () => {
-    const [vipPort, privatePort] = await freePortPair();
-    const vip = { host: "127.0.0.1", port: vipPort };
-    const priv = { host: "127.0.0.1", port: privatePort };
+    const vip = { host: "127.0.0.1", port: 39914 };
+    const priv = { host: "127.0.0.1", port: 39916 };
     // 占住 VIP 口 → start() 走 EADDRINUSE 重试路径(bind pending)。
     const blocker = await occupyPort(vip.port);
     openServers.add(blocker);
@@ -279,9 +267,8 @@ describe("controlListener bind / VIP 生命周期", () => {
   });
 
   it("⑤ 私有口 fail-loud:占住私有口 → start reject", async () => {
-    const [vipPort, privatePort] = await freePortPair();
-    const vip = { host: "127.0.0.1", port: vipPort };
-    const priv = { host: "127.0.0.1", port: privatePort };
+    const vip = { host: "127.0.0.1", port: 39910 };
+    const priv = { host: "127.0.0.1", port: 39912 };
     const blocker = await occupyPort(priv.port);
     openServers.add(blocker);
 

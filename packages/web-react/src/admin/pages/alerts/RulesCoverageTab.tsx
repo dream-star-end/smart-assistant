@@ -4,14 +4,14 @@ import { Badge, Button, useToast } from "../../../components/ui";
 import { type Column, DataTable, LevelBadge, SectionCard, TimeAgo } from "../../components";
 import { ApiError, adminGet, adminSend } from "../../lib/adminApi";
 import { SEVERITY_TONE, TRIGGER_HINT, TRIGGER_LABEL, groupLabel, orderedGroups } from "./constants";
-import { type Reloadable, useReloadable } from "./useReloadable";
+import { useReloadable } from "./useReloadable";
 import type { CoverageRow, RuleStateRow } from "./types";
 import { errText } from "./util";
 
-export function RulesCoverageTab({ ruleStatesQ }: { ruleStatesQ: Reloadable<{ rows: RuleStateRow[] }> }) {
+export function RulesCoverageTab() {
   return (
     <div className="flex flex-col gap-5">
-      <RuleStatesSection query={ruleStatesQ} />
+      <RuleStatesSection />
       <CoverageSection />
     </div>
   );
@@ -19,9 +19,11 @@ export function RulesCoverageTab({ ruleStatesQ }: { ruleStatesQ: Reloadable<{ ro
 
 // ─── 规则状态 ─────────────────────────────────────────────────────────
 
-function RuleStatesSection({ query }: { query: Reloadable<{ rows: RuleStateRow[] }> }) {
+function RuleStatesSection() {
   const toast = useToast();
-  const { data, loading, error, reload } = query;
+  const { data, loading, error, reload } = useReloadable<{ rows: RuleStateRow[] }>(() =>
+    adminGet("/alerts/rule-states"),
+  );
   const rows = data?.rows ?? [];
 
   const onAck = async (r: RuleStateRow) => {
@@ -45,7 +47,7 @@ function RuleStatesSection({ query }: { query: Reloadable<{ rows: RuleStateRow[]
       title: "rule_id",
       render: (r) => (
         <span className="flex items-center gap-2">
-          {r.classification === "firing" && !r.acked && <span className="size-1.5 shrink-0 rounded-full bg-danger" />}
+          {r.firing && !r.acked && <span className="size-1.5 shrink-0 rounded-full bg-danger" />}
           <span className="font-mono text-[12.5px]">{r.rule_id}</span>
         </span>
       ),
@@ -55,12 +57,8 @@ function RuleStatesSection({ query }: { query: Reloadable<{ rows: RuleStateRow[]
       title: "状态",
       width: 96,
       render: (r) =>
-        r.classification === "stale" ? (
-          <Badge tone="warning">STALE</Badge>
-        ) : r.classification === "healthy" ? (
-          <Badge tone="neutral">HEALTHY</Badge>
-        ) : !r.firing ? (
-          <Badge tone="success">RECOVERED</Badge>
+        !r.firing ? (
+          <Badge tone="success">resolved</Badge>
         ) : r.acked ? (
           <Badge tone="warning">ACKED</Badge>
         ) : (
@@ -72,7 +70,7 @@ function RuleStatesSection({ query }: { query: Reloadable<{ rows: RuleStateRow[]
       title: "确认",
       width: 130,
       render: (r) => {
-        if (r.classification !== "firing") return <span className="text-faint">—</span>;
+        if (!r.firing) return <span className="text-faint">—</span>;
         if (r.acked)
           return (
             <span className="text-[12px]">
@@ -118,7 +116,7 @@ function RuleStatesSection({ query }: { query: Reloadable<{ rows: RuleStateRow[]
       width: 72,
       align: "right",
       render: (r) =>
-        r.classification === "firing" && !r.acked ? (
+        r.firing && !r.acked ? (
           <Button variant="secondary" size="sm" onClick={() => onAck(r)}>
             确认
           </Button>
@@ -129,7 +127,7 @@ function RuleStatesSection({ query }: { query: Reloadable<{ rows: RuleStateRow[]
   return (
     <SectionCard
       title="规则状态"
-      hint="FIRING 当前异常 · RECOVERED 已恢复 · STALE 长时间未评估 · HEALTHY 当前健康"
+      hint="polled scheduler 快照 —— FIRING 需确认(ack),resolved 表示已恢复"
       action={
         <Button variant="secondary" size="sm" onClick={reload} disabled={loading}>
           <RefreshCw size={14} className={loading ? "animate-spin" : undefined} /> 刷新
@@ -194,8 +192,8 @@ function CoverageSection() {
             <div className="flex items-center gap-2 rounded-lg border border-warning/40 bg-warning-soft px-3 py-2.5 text-[12.5px] text-warning">
               <AlertTriangle size={15} className="shrink-0" />
               <span>
-                有 <strong className="tabular-nums">{orphanCount}</strong> 个事件<strong>没有主动通道订阅</strong>
-                ，仅会写入管理员站内信兜底；如需及时主动送达，请新增或编辑通道订阅。
+                有 <strong className="tabular-nums">{orphanCount}</strong> 个事件<strong>没有任何通道订阅</strong>
+                ,这些告警不会送达任何人 —— 请为其新增 / 编辑通道订阅。
               </span>
             </div>
           )}

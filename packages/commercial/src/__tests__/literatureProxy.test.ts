@@ -32,7 +32,6 @@ import {
   makePerContainerLimiter,
   utcDayKey,
   getMetricsSnapshot,
-  getLiteratureOperationalSnapshot,
   _resetMetricsForTest,
 } from "../literatureProxy.js";
 import type { ContainerIdentityRepo } from "../auth/containerIdentity.js";
@@ -262,10 +261,6 @@ describe("makeLiteratureProxyHandler", () => {
     assert.equal(res.statusCode, 200);
     assert.deepEqual(JSON.parse(res.body), upstreamBody);
     assert.equal(getMetricsSnapshot().allowed, 1);
-    const operational = getLiteratureOperationalSnapshot();
-    assert.deepEqual(operational.counts, { success: 1, error: 0, timeout: 0 });
-    assert.ok(operational.last_success_at);
-    assert.ok(operational.latency_ms);
     assert.equal(f.redis.getCounter(), 1);
   });
 

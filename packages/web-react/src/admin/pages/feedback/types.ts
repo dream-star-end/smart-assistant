@@ -2,14 +2,6 @@
 
 // ─── 用户反馈（GET /api/admin/feedback） ─────────────────────────────
 export type FeedbackStatus = "open" | "acked" | "closed";
-export type FeedbackPriority = "low" | "normal" | "high" | "urgent";
-export type FeedbackTrafficClass =
-  | "production_user"
-  | "anonymous"
-  | "legacy_unavailable"
-  | "internal_admin"
-  | "synthetic_canary"
-  | "e2e";
 
 export interface FeedbackRow {
   id: string;
@@ -25,22 +17,12 @@ export interface FeedbackRow {
   status: FeedbackStatus;
   handled_by: string | null;
   handled_at: string | null;
-  assigned_to: string | null;
-  priority: FeedbackPriority | null;
-  resolution: string | null;
   created_at: string;
-  traffic_class: FeedbackTrafficClass;
-}
-
-export interface FeedbackTotals {
-  total: number;
-  by_status: Record<FeedbackStatus, number>;
-  by_priority: Record<FeedbackPriority | "unassigned", number>;
+  traffic_class: "production_user" | "internal_admin" | "synthetic_canary" | "e2e";
 }
 
 export interface FeedbackListResp {
   rows: FeedbackRow[];
-  totals: FeedbackTotals;
   next_before_created_at: string | null;
   next_before_id: string | null;
 }
@@ -70,11 +52,6 @@ export interface ResponseRatingStats {
   completed_turns: { last_7d: number; last_30d: number };
   explicit_coverage: { last_7d: number | null; last_30d: number | null };
   implicit_per_100_completed_turns: { last_7d: number | null; last_30d: number | null };
-  trace_completeness: {
-    total: number;
-    with_trace: number;
-    missing_trace: number;
-  };
 }
 
 export interface DownRatingRow {

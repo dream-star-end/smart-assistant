@@ -107,7 +107,7 @@ import {
   handleAdminExportOrdersCsv,
   handleAdminExportUsersCsv,
 } from './admin/export.js'
-import { handleAdminFeedbackPost, handleAdminListFeedback } from './admin/feedback.js'
+import { handleAdminAckFeedback, handleAdminListFeedback } from './admin/feedback.js'
 import {
   handleAdminListAutoDreamFindings,
   handleAdminUpdateAutoDreamFinding,
@@ -116,8 +116,6 @@ import {
   handleAdminCreateInbox,
   handleAdminDeleteInbox,
   handleAdminGetInboxEmailConfig,
-  handleAdminPreviewInbox,
-  handleAdminInboxStats,
   handleAdminListInbox,
 } from './admin/inbox.js'
 import { handleAdminListLedger } from './admin/ledger.js'
@@ -127,7 +125,6 @@ import {
   handleAdminTestLiterature,
 } from './admin/literature.js'
 import { handleAdminMetrics } from './admin/metrics.js'
-import { handleAdminOpsOverview } from './admin/opsOverview.js'
 import { handleAdminRemoveUserModelGrant } from './admin/modelGrants.js'
 import {
   handleAdminModelOpsOverview,
@@ -899,7 +896,6 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     { method: 'GET', path: '/api/admin/security-events', handler: handleAdminListSecurityEvents },
     { method: 'GET', path: '/api/admin/host-audit', handler: handleAdminListHostAudit },
     { method: 'GET', path: '/api/admin/product-friction', handler: handleAdminProductFriction },
-    { method: 'GET', path: '/api/admin/ops-overview', handler: handleAdminOpsOverview },
     { method: 'GET', pathPrefix: '/api/admin/trace/', handler: handleAdminTraceLookup },
     // v5 自愈体系 — incident/repair 审计页。exact list 在 prefix 之前(matchRoute exact-first);
     // 详情/resolve 走 prefix,handler 内 regex 抠 :id 并区分 /resolve 尾段。
@@ -1276,13 +1272,8 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     { method: 'GET', pathPrefix: '/api/admin/orders/', handler: handleAdminGetOrder },
     // P1-2 反馈 admin —— GET 列表 / POST :id/ack
     { method: 'GET', path: '/api/admin/feedback', handler: handleAdminListFeedback },
-    { method: 'POST', pathPrefix: '/api/admin/feedback/', handler: handleAdminFeedbackPost },
+    { method: 'POST', pathPrefix: '/api/admin/feedback/', handler: handleAdminAckFeedback },
     { method: 'GET', path: '/api/admin/auto-dream-findings', handler: handleAdminListAutoDreamFindings },
-    {
-      method: 'PATCH',
-      path: '/api/admin/auto-dream-findings/batch',
-      handler: handleAdminUpdateAutoDreamFinding,
-    },
     {
       method: 'PATCH',
       pathPrefix: '/api/admin/auto-dream-findings/',
@@ -1327,8 +1318,6 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     //                                              注:GET /api/admin/messages/email-config 走
     //                                              path 完全匹配,不是 prefix,所以独立项即可.
     { method: 'GET', path: '/api/admin/messages', handler: handleAdminListInbox },
-    { method: 'POST', path: '/api/admin/messages/preview', handler: handleAdminPreviewInbox },
-    { method: 'GET', path: '/api/admin/messages/stats', handler: handleAdminInboxStats },
     {
       method: 'GET',
       path: '/api/admin/messages/email-config',

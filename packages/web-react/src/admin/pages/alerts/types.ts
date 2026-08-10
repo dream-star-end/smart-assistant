@@ -13,7 +13,6 @@ export type AibotConnState =
   | "unknown";
 export type OutboxStatus = "pending" | "sent" | "failed" | "suppressed" | "skipped";
 export type EventTrigger = "polled" | "passive" | "both";
-export type RuleClassification = "firing" | "recovered" | "stale" | "healthy";
 
 export interface AlertChannel {
   id: string;
@@ -101,8 +100,4 @@ export interface RuleStateRow {
   last_transition_at: string | null;
   last_evaluated_at: string | null;
   last_payload: Record<string, unknown>;
-  /** 服务端基于 firing 与评估新鲜度给出的运营分类。 */
-  classification: RuleClassification;
-  stale: boolean;
-  classification_basis: { stale_after_minutes: number; recovered_within_hours: number };
 }

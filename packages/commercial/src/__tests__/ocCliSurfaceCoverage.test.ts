@@ -63,9 +63,6 @@ function run(
     child.stdout.on('data', (chunk) => (stdout += String(chunk)))
     child.stderr.on('data', (chunk) => (stderr += String(chunk)))
     child.once('error', reject)
-    child.stdin.on('error', (error: NodeJS.ErrnoException) => {
-      if (error.code !== 'EPIPE') reject(error)
-    })
     child.once('close', (code) => done({ code, stdout, stderr }))
     child.stdin.end(options.input ?? '')
   })

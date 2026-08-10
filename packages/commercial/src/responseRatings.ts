@@ -186,7 +186,6 @@ export interface ResponseRatingStats {
   rating_users: number;
   completed_turns: { last_7d: number; last_30d: number };
   explicit_coverage: { last_7d: number | null; last_30d: number | null };
-  trace_completeness: { total: number; with_trace: number; missing_trace: number };
   implicit_per_100_completed_turns: { last_7d: number | null; last_30d: number | null };
 }
 
@@ -232,8 +231,6 @@ export async function getResponseRatingStats(
     rating_users: number;
     implicit_7d: number;
     implicit_30d: number;
-    explicit_with_trace: number;
-    explicit_missing_trace: number;
   }>(
     `SELECT
        COUNT(*) FILTER (WHERE NOT ($1 = ANY(r.tags)) AND r.rating = 'up')::int   AS up_all,
@@ -255,8 +252,6 @@ export async function getResponseRatingStats(
            AND r.created_at >= NOW() - INTERVAL '30 days'
        )::int AS down_30d,
        COUNT(DISTINCT r.user_id) FILTER (WHERE NOT ($1 = ANY(r.tags)))::int AS rating_users,
-       COUNT(*) FILTER (WHERE NOT ($1 = ANY(r.tags)) AND r.trace_id IS NOT NULL)::int AS explicit_with_trace,
-       COUNT(*) FILTER (WHERE NOT ($1 = ANY(r.tags)) AND r.trace_id IS NULL)::int AS explicit_missing_trace,
        COUNT(*) FILTER (WHERE $1 = ANY(r.tags) AND r.created_at >= NOW() - INTERVAL '7 days')::int AS implicit_7d,
        COUNT(*) FILTER (WHERE $1 = ANY(r.tags) AND r.created_at >= NOW() - INTERVAL '30 days')::int AS implicit_30d
      FROM response_rating r
@@ -274,8 +269,6 @@ export async function getResponseRatingStats(
     rating_users: 0,
     implicit_7d: 0,
     implicit_30d: 0,
-    explicit_with_trace: 0,
-    explicit_missing_trace: 0,
   };
 
   const byModel = await query<{ model: string | null; up: number; down: number }>(
@@ -320,11 +313,6 @@ export async function getResponseRatingStats(
     explicit_coverage: {
       last_7d: ratio(w.up_7d + w.down_7d, turns7d),
       last_30d: ratio(w.up_30d + w.down_30d, turns30d),
-    },
-    trace_completeness: {
-      total: w.explicit_with_trace + w.explicit_missing_trace,
-      with_trace: w.explicit_with_trace,
-      missing_trace: w.explicit_missing_trace,
     },
     implicit_per_100_completed_turns: {
       last_7d: turns7d > 0 ? Math.round((w.implicit_7d / turns7d) * 10000) / 100 : null,

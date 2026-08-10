@@ -542,9 +542,5 @@ describe("M4 admin 出口:ops_detail/summary/fail_reason/event message 值级脱
     const row = list.rows.find((x) => x.id === inc.rows[0].id);
     assert.ok(row);
     assert.ok(!(row.ops_detail ?? "").includes("sk-live0123456789abcdef"), "列表出口同样被清");
-    assert.ok(list.total >= 1);
-    assert.ok(list.open_total >= 1);
-    assert.equal(row.latest_repair_status, "failed");
-    assert.ok(row.latest_repair_at);
   });
 });

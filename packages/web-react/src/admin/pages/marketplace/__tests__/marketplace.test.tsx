@@ -57,25 +57,6 @@ beforeEach(() => {
       repeat_pairs: 2,
     },
     uninstall_reasons: [{ reason: "missing_capability", count: 1 }],
-    cohort: {
-      availability: "available",
-      unavailable_events: 0,
-      exposure_pairs: 12,
-      detail_pairs: 8,
-      installed_pairs: 5,
-      first_use_pairs: 4,
-      repeat_pairs: 2,
-      conversions: {
-        exposure_to_detail: 8 / 12,
-        detail_to_install: 5 / 8,
-        install_to_first_use: 4 / 5,
-        first_use_to_repeat: 0.5,
-      },
-    },
-    hub_only: { exposure_users: 12, exposure_events: 20 },
-    skill_level: [{ skill_slug: "research", exposure_pairs: 6, installed_pairs: 3, first_use_pairs: 2, repeat_pairs: 1 }],
-    time_to_first_use: { sample_size: 4, median_seconds: 120, p95_seconds: 600 },
-    install_failures: [],
   });
 });
 afterEach(cleanup);
@@ -95,29 +76,13 @@ describe("MarketplacePage", () => {
     renderPage(<MarketplacePage />);
     fireEvent.click(screen.getByRole("tab", { name: "使用漏斗" }));
 
-    expect(await screen.findByText("曝光→详情")).toBeInTheDocument();
-    expect(screen.getByText(/同一 user \+ skill 前向 cohort/)).toBeInTheDocument();
-    expect(screen.getByText("research")).toBeInTheDocument();
+    expect(await screen.findByText("目录曝光用户")).toBeInTheDocument();
     expect(await screen.findByText("缺少能力 · 1")).toBeInTheDocument();
     await waitFor(() =>
       expect(adminGet).toHaveBeenCalledWith("/marketplace/funnel", {
         traffic_class: "production_user",
       }),
     );
-  });
-
-  test("历史阶段无法组成同 user+skill cohort 时不展示转化率", async () => {
-    adminGet.mockResolvedValueOnce({
-      traffic_class: "production_user",
-      funnel: { exposure_users: 12, exposure_events: 20, detail_users: 8, detail_events: 10, install_users: 5, installs: 6, first_use_users: 4, used_pairs: 4, repeat_pairs: 2 },
-      uninstall_reasons: [],
-      cohort: { availability: "partial", unavailable_events: 42, exposure_pairs: 0, detail_pairs: 0, installed_pairs: 0, first_use_pairs: 0, repeat_pairs: 0, conversions: { exposure_to_detail: null, detail_to_install: null, install_to_first_use: null, first_use_to_repeat: null } },
-    });
-    renderPage(<MarketplacePage />);
-    fireEvent.click(screen.getByRole("tab", { name: "使用漏斗" }));
-    expect(await screen.findByText("历史数据不可计算漏斗")).toBeInTheDocument();
-    expect(screen.getByText(/不计算或暗示转化率/)).toBeInTheDocument();
-    expect(screen.queryByText("曝光→详情")).not.toBeInTheDocument();
   });
 
   test("切到「精选管理」tab → 挂载 FeaturedPanel(空目录空态)", async () => {
