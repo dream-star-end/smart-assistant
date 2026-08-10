@@ -3,12 +3,14 @@ import { describe, test } from 'node:test'
 
 import {
   DEFAULT_AUTO_DREAM_MODEL,
+  LEGACY_AUTO_DREAM_MODEL,
   isAutoDreamOptimizerModel,
 } from '../billing/autoDreamModels.js'
 
 describe('isAutoDreamOptimizerModel', () => {
-  test('defaults Auto-Dream V2 to DeepSeek V4 Flash', () => {
-    assert.equal(DEFAULT_AUTO_DREAM_MODEL, 'deepseek-v4-flash')
+  test('unifies the optimizer and legacy memory organizer on MiniMax M3', () => {
+    assert.equal(DEFAULT_AUTO_DREAM_MODEL, 'MiniMax-M3')
+    assert.equal(LEGACY_AUTO_DREAM_MODEL, 'MiniMax-M3')
   })
 
   test('accepts only the rollback-compatible Terra/Codex and static-provider/CCB pairs', () => {

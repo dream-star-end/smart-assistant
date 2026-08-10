@@ -54,7 +54,7 @@ describe("PreferencesTab · Auto-Dream", () => {
     expect(apiKeysSection).toHaveBeenCalledTimes(1);
   });
 
-  test("滚动兼容阶段不承诺具体模型，并提供优化建议入口", async () => {
+  test("显示 MiniMax 全面审计范围，并提供优化建议入口", async () => {
     vi.spyOn(api, "getPublicModels").mockResolvedValue([]);
     const openMemory = vi.fn();
 
@@ -74,8 +74,8 @@ describe("PreferencesTab · Auto-Dream", () => {
             min_interval_hours: 168,
             min_new_sessions: 5,
             // 模拟滚动发布期间旧响应仍带字段；UI 也不能显示。
-            model_id: "deepseek-v4-flash",
-            model_name: "DeepSeek V4 Flash",
+            model_id: "MiniMax-M3",
+            model_name: "MiniMax M3",
           } as never
         }
         theme="system"
@@ -86,10 +86,8 @@ describe("PreferencesTab · Auto-Dream", () => {
       />,
     );
 
-    expect(screen.getByText(/平台统一的 Auto-Dream 模型结合平台功能与技能/)).toBeInTheDocument();
-    expect(screen.queryByText(/DeepSeek V4 Flash/)).not.toBeInTheDocument();
-    expect(screen.queryByText(/MiniMax M3/)).not.toBeInTheDocument();
-    expect(screen.queryByText(/deepseek-v4-flash/)).not.toBeInTheDocument();
+    expect(screen.getByText(/MiniMax M3 结合平台功能与技能/)).toBeInTheDocument();
+    expect(screen.queryByText(/MiniMax-M3/)).not.toBeInTheDocument();
     expect(screen.getByText(/所有用户内容和功能设置修改都先展示差异/)).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "查看优化建议" }));
