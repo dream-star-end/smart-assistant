@@ -1111,7 +1111,15 @@
       "severity": "P1",
       "symptom": "CCB 长会话把完整 Base64 工具结果按字符数低估后重新注入上游，触发上下文 400；同一轮自动重试又持久化多条原始 API Error，导致会话无法继续且 UI 同时展示重复原始错误。",
       "rootFixCommit": "1b7c4c07",
+      "coverageCommits": [
+        "3ef0ecec"
+      ],
       "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/sessionManagerResumeMap.test.ts",
+          "assertion": "CCB resume map rebuilds obsolete history contexts while preserving current CCB and Codex resumes"
+        },
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/sessionManagerEngineTurn.test.ts",

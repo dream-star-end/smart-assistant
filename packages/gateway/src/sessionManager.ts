@@ -2426,6 +2426,15 @@ export class SessionManager {
    *  tag when an on-disk resume-map entry omits `provider` (legacy format). */
   private static CCB_PROVIDER_TAG = 'ccb'
 
+  /**
+   * Version 1 means a CCB native session was created after provider-switch
+   * history became model-window-bounded. Older native JSONL may contain one
+   * immutable, oversized synthetic history prompt; resuming it makes every
+   * later CCB auto-compaction replay the same rejected request. Such entries
+   * must rebuild once from the exact finite PG history suffix instead.
+   */
+  private static CCB_RESUME_HISTORY_CONTEXT_VERSION = 1
+
   /** Return the resumable id for this session iff the persisted entry was
    *  produced by `wantProvider`. Cross-provider mismatches return undefined
    *  so we never feed a CCB session_id to codex (or vice versa).
@@ -2521,27 +2530,34 @@ export class SessionManager {
     for (const path of [this.resumeMapPath, this.resumeMapPath + '.bak']) {
       try {
         if (!existsSync(path)) continue
-        // File mtime acts as the lower-bound timestamp for entries that lack
-        // their own `ts` (pre-Phase-0.2 legacy string values). Using Date.now()
-        // here would reset the TTL clock on every gateway restart, letting
-        // stale entries live forever — that's the bug this fixes. If stat
-        // fails (race with atomic-rename), fall back to 0 so _pruneResumeMap
-        // treats the entry as unknown-age and evicts it on first sweep.
-        let fileMtime = 0
-        try {
-          fileMtime = statSync(path).mtimeMs
-        } catch {}
         const data = JSON.parse(readFileSync(path, 'utf-8'))
         // Support both legacy format {key: sessionId} and new format
-        // {key: {id, ts, lastCost?, provider?}}
+        // {key: {id, ts, lastCost?, provider?, historyContextVersion?}}
         // Missing `provider` → treated as CCB (the only provider before
         // codex-native landed), matching _resumeIdFor's fallback.
         for (const [key, val] of Object.entries(data)) {
           if (typeof val === 'string') {
-            this._resumeMap.set(key, val)
-            this._resumeMapTimestamps.set(key, fileMtime)
-            this._resumeMapProvider.set(key, SessionManager.CCB_PROVIDER_TAG)
+            log.info('dropping CCB resume from obsolete history context contract', {
+              sessionKey: key,
+              historyContextVersion: null,
+            })
           } else if (val && typeof val === 'object' && 'id' in (val as any)) {
+            const prov = SessionManager.normalizeEngineTag(
+              typeof (val as any).provider === 'string' && (val as any).provider
+                ? (val as any).provider
+                : undefined,
+            )
+            if (
+              prov === SessionManager.CCB_PROVIDER_TAG &&
+              (val as any).historyContextVersion !==
+                SessionManager.CCB_RESUME_HISTORY_CONTEXT_VERSION
+            ) {
+              log.info('dropping CCB resume from obsolete history context contract', {
+                sessionKey: key,
+                historyContextVersion: (val as any).historyContextVersion ?? null,
+              })
+              continue
+            }
             this._resumeMap.set(key, (val as any).id)
             this._resumeMapTimestamps.set(key, (val as any).ts ?? Date.now())
             // Optional cost-delta baseline for the resumed CCB. If present,
@@ -2552,14 +2568,8 @@ export class SessionManager {
             if (typeof lastCost === 'number' && Number.isFinite(lastCost) && lastCost >= 0) {
               this._resumeMapLastCost.set(key, lastCost)
             }
-            const prov = (val as any).provider
             // M1a:tag 归一为 engine id(历史 'codex-native' → 'codex')。
-            this._resumeMapProvider.set(
-              key,
-              SessionManager.normalizeEngineTag(
-                typeof prov === 'string' && prov ? prov : undefined,
-              ),
-            )
+            this._resumeMapProvider.set(key, prov)
           }
         }
         return // Successfully parsed (even if empty — empty means all sessions were destroyed)
@@ -2572,7 +2582,13 @@ export class SessionManager {
   private _saveResumeMap(): void {
     // Merge: start from the loaded resume-map (includes sessions not yet re-activated),
     // then overlay with live sessions (which may have updated ccbSessionIds after resume).
-    type ResumeEntry = { id: string; ts: number; lastCost?: number; provider?: string }
+    type ResumeEntry = {
+      id: string
+      ts: number
+      lastCost?: number
+      provider?: string
+      historyContextVersion?: number
+    }
     const obj: Record<string, ResumeEntry> = {}
     const now = Date.now()
     for (const [key, val] of this._resumeMap) {
@@ -2582,10 +2598,11 @@ export class SessionManager {
       }
       const cached = this._resumeMapLastCost.get(key)
       if (cached !== undefined && cached > 0) entry.lastCost = cached
-      // Only serialize provider when it differs from the implicit 'ccb' default
-      // so legacy tooling that reads this file sees no unexpected new fields
-      // for CCB sessions.
-      const prov = this._resumeMapProvider.get(key)
+      const prov = SessionManager.normalizeEngineTag(this._resumeMapProvider.get(key))
+      if (prov === SessionManager.CCB_PROVIDER_TAG) {
+        entry.historyContextVersion = SessionManager.CCB_RESUME_HISTORY_CONTEXT_VERSION
+      }
+      // Only serialize provider when it differs from the implicit 'ccb' default.
       if (prov && prov !== SessionManager.CCB_PROVIDER_TAG) entry.provider = prov
       obj[key] = entry
     }
@@ -2596,7 +2613,10 @@ export class SessionManager {
           ts: now,
         }
         if (sess._lastCcbCumulativeCost > 0) entry.lastCost = sess._lastCcbCumulativeCost
-        const prov = this._resumeMapProvider.get(key)
+        const prov = SessionManager.normalizeEngineTag(this._resumeMapProvider.get(key))
+        if (prov === SessionManager.CCB_PROVIDER_TAG) {
+          entry.historyContextVersion = SessionManager.CCB_RESUME_HISTORY_CONTEXT_VERSION
+        }
         if (prov && prov !== SessionManager.CCB_PROVIDER_TAG) entry.provider = prov
         obj[key] = entry
         // Keep in-memory maps in sync
