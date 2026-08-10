@@ -1180,6 +1180,33 @@
           "assertion": "PREPARE oc_v5_turn_waiver_receipt AS"
         }
       ]
+    },
+    {
+      "id": "INC-20260810-AUTODREAM-STALE-REPORT",
+      "occurredAt": "2026-08-10",
+      "severity": "P1",
+      "symptom": "全面优化已接管梦境整理后，记忆中心仍反复展示已停用旧版任务的最后失败回执，让用户误以为当前整理始终未完成。",
+      "rootFixCommit": "27611390",
+      "coverageCommits": [
+        "da945b0c"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/manage/MemoryPanel.test.tsx",
+          "assertion": "全面优化模式不再展示永远不会更新的旧版失败回执"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/autoDream.test.ts",
+          "assertion": "projects optimizer mode beside the preserved legacy receipt"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T34 全面优化模式隐藏不会再更新的旧版梦境失败回执"
+        }
+      ]
     }
   ]
 }
