@@ -7475,6 +7475,14 @@ wait $!
 
   test('real-turn canary requires exact answer and keeps reconnect signals attempt-local', async () => {
     const source = await readFile(turnCanary, 'utf8')
+    assert.match(
+      source,
+      /const DEFAULT_SILENCE_MS = MODEL === 'deepseek-v4-flash' \? 270_000 : 90_000/,
+    )
+    assert.match(
+      source,
+      /process\.env\.V5_TURN_SILENCE_MS \?\? DEFAULT_SILENCE_MS/,
+    )
     const attemptAt = source.indexOf('const attempt = () => new Promise')
     assert.ok(attemptAt >= 0)
     const beforeAttempt = source.slice(0, attemptAt)
