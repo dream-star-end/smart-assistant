@@ -27,6 +27,8 @@ export interface ProductFrictionEvent {
   deviceClass?: "desktop" | "mobile" | "tablet" | "unknown" | null;
   traceId?: string | null;
   sessionId?: string | null;
+  /** Stable product entity identity (for example marketplace skill slug). */
+  entitySlug?: string | null;
 }
 
 function clampText(value: string | null | undefined, max: number): string | null {
@@ -61,8 +63,8 @@ export async function recordProductFrictionEvent(
     `INSERT INTO product_friction_events
        (event_key, user_id, surface, stage, code, outcome, attempts, latency_ms,
         model, provider, client_build, browser_family, device_class, trace_id,
-        session_id, recovered_at)
-     VALUES ($1,$2,$3,$4,$5,$6::varchar,$7,$8,$9,$10,$11,$12,$13,$14,$15,
+        session_id, entity_slug, recovered_at)
+     VALUES ($1,$2,$3,$4,$5,$6::varchar,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
              CASE WHEN $6::varchar IN ('recovered','succeeded') THEN NOW() ELSE NULL END)
      ON CONFLICT (event_key) DO UPDATE SET
        outcome = CASE
@@ -85,6 +87,7 @@ export async function recordProductFrictionEvent(
        device_class = COALESCE(product_friction_events.device_class, EXCLUDED.device_class),
        trace_id = COALESCE(product_friction_events.trace_id, EXCLUDED.trace_id),
        session_id = COALESCE(product_friction_events.session_id, EXCLUDED.session_id),
+       entity_slug = COALESCE(product_friction_events.entity_slug, EXCLUDED.entity_slug),
        recovered_at = CASE
          WHEN product_friction_events.outcome IN ('recovered','succeeded','abandoned','cancelled')
            THEN product_friction_events.recovered_at
@@ -108,6 +111,7 @@ export async function recordProductFrictionEvent(
       input.deviceClass ?? null,
       clampText(input.traceId, 96),
       clampText(input.sessionId, 96),
+      clampText(input.entitySlug, 128),
     ],
     runner,
   );

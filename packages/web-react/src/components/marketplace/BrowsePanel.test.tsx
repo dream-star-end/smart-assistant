@@ -58,14 +58,18 @@ test("空查询渲染分区视图:平台精选 + 分类分区 + 未分类兜底"
   expect(await screen.findByRole("heading", { name: "平台精选" })).toBeInTheDocument();
   expect(screen.getByRole("heading", { name: "办公文档" })).toBeInTheDocument();
   expect(screen.getByRole("heading", { name: "数据分析" })).toBeInTheDocument();
-  expect(reportClientFriction).toHaveBeenCalledWith(
-    expect.objectContaining({
-      surface: "marketplace",
-      stage: "catalog_exposure",
-      outcome: "succeeded",
-    }),
-    "tok",
-  );
+  expect(reportClientFriction).toHaveBeenCalledTimes(CATALOG.length);
+  for (const item of CATALOG) {
+    expect(reportClientFriction).toHaveBeenCalledWith(
+      expect.objectContaining({
+        surface: "marketplace",
+        stage: "catalog_exposure",
+        outcome: "succeeded",
+        entitySlug: item.slug,
+      }),
+      "tok",
+    );
+  }
   // 无分类卡片进入「未分类」兜底分区
   expect(screen.getByRole("heading", { name: "未分类" })).toBeInTheDocument();
 });

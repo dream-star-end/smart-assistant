@@ -24,6 +24,7 @@ import {
 } from 'react'
 import { Markdown } from '../../../components/Markdown'
 import {
+  Alert,
   Badge,
   Button,
   IconButton,
@@ -45,6 +46,7 @@ import {
   type InboxAudience,
   type InboxCategory,
   type InboxLevel,
+  type MessagePreviewResp,
 } from './types'
 
 const AUDIENCE_TABS = [
@@ -128,12 +130,20 @@ export function ComposeCard({ onSent }: { onSent: () => void }) {
   const [expires, setExpires] = useState('')
   const [notifyEmail, setNotifyEmail] = useState(false)
   const [busy, setBusy] = useState(false)
+  const [previewBusy, setPreviewBusy] = useState(false)
+  const [audiencePreview, setAudiencePreview] = useState<MessagePreviewResp | null>(null)
+  const [previewError, setPreviewError] = useState<string | null>(null)
   const [mobilePane, setMobilePane] = useState<'edit' | 'preview'>('edit')
   const [dragging, setDragging] = useState(false)
   const [assets, setAssets] = useState<ComposerAsset[]>([])
 
   const [emailCfg, setEmailCfg] = useState<EmailConfig | null>(null)
   const [emailHint, setEmailHint] = useState('加载中…')
+
+  useEffect(() => {
+    setAudiencePreview(null)
+    setPreviewError(null)
+  }, [audience, category, userId])
 
   assetsRef.current = assets
   useEffect(
@@ -266,6 +276,14 @@ export function ComposeCard({ onSent }: { onSent: () => void }) {
   }
 
   const send = async () => {
+    if (category === 'operations') {
+      toast('事故通知必须从自愈事故页发起并经企业微信审批', 'error')
+      return
+    }
+    if (!audiencePreview) {
+      toast('请先预览并确认本次收件受众', 'error')
+      return
+    }
     const trimmedTitle = title.trim()
     if (!trimmedTitle) {
       toast('标题不能为空', 'error')
@@ -352,6 +370,28 @@ export function ComposeCard({ onSent }: { onSent: () => void }) {
     }
   }
 
+  const previewAudience = async () => {
+    if (audience === 'user' && !USER_ID_RE.test(userId.trim())) {
+      toast('user_id 必须是正整数', 'error')
+      return
+    }
+    setPreviewBusy(true)
+    setPreviewError(null)
+    try {
+      const payload: Pick<CreateMessagePayload, 'audience' | 'category' | 'user_id'> = {
+        audience,
+        category,
+      }
+      if (audience === 'user') payload.user_id = userId.trim()
+      setAudiencePreview(await adminSend<MessagePreviewResp>('POST', '/messages/preview', payload))
+    } catch (error) {
+      setAudiencePreview(null)
+      setPreviewError(apiErrorMessage(error, '受众预览失败'))
+    } finally {
+      setPreviewBusy(false)
+    }
+  }
+
   return (
     <SectionCard title="新建站内信" hint="卡片消息 · Markdown · 图片 · 数据图表">
       {confirmEl}
@@ -374,6 +414,45 @@ export function ComposeCard({ onSent }: { onSent: () => void }) {
                 inputMode="numeric"
               />
             </Field>
+          )}
+        </div>
+
+        <div className="rounded-xl border border-border bg-elevated p-3 sm:p-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h3 className="text-[13px] font-semibold text-fg">受众 dry-run</h3>
+              <p className="mt-1 text-[12px] text-faint">只计算受众，不创建消息；发送时将固化不可变收件人快照。</p>
+            </div>
+            <Button variant="secondary" size="sm" onClick={() => void previewAudience()} disabled={previewBusy || busy}>
+              <Eye size={14} />{previewBusy ? '计算中…' : '预览受众'}
+            </Button>
+          </div>
+          {previewError && <Alert tone="danger" density="compact" className="mt-3">{previewError}</Alert>}
+          {audiencePreview && (
+            <div className="mt-3 grid gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,2fr)]">
+              <div className="rounded-lg bg-surface px-3 py-2">
+                <p className="text-[11px] text-faint">预计收件人</p>
+                <p className="mt-1 text-xl font-semibold tabular-nums text-fg">{audiencePreview.recipients}</p>
+                <p className="mt-1 text-[11px] text-faint">
+                  近30天接收量 p50 {audiencePreview.recipient_load.p50_30d} · p90 {audiencePreview.recipient_load.p90_30d} · max {audiencePreview.recipient_load.max_30d}
+                </p>
+              </div>
+              <div className="min-w-0 rounded-lg bg-surface px-3 py-2">
+                <p className="text-[11px] text-faint">样本（仅供人工核对）</p>
+                <div className="mt-2 flex flex-wrap gap-1.5">
+                  {audiencePreview.sample.length === 0 ? <span className="text-[12px] text-faint">无匹配用户</span> : audiencePreview.sample.map((user) => (
+                    <Badge key={user.user_id} tone={user.traffic_class === 'production_user' ? 'success' : 'neutral'}>
+                      {user.username ?? `#${user.user_id}`} · {user.traffic_class}
+                    </Badge>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
+          {audiencePreview && audiencePreview.recipient_load.max_30d > 20 && (
+            <Alert tone="warning" density="compact" className="mt-3">
+              高负荷提示：该受众中单用户近30天最多已接收 {audiencePreview.recipient_load.max_30d} 条。仅透明提示，不自动阻断或静默缩小受众。
+            </Alert>
           )}
         </div>
 
@@ -554,6 +633,12 @@ export function ComposeCard({ onSent }: { onSent: () => void }) {
           </Field>
         </div>
 
+        {category === 'operations' && (
+          <Alert tone="danger" title="普通站内信不能发送事故通知">
+            涉及线上事故或受影响用户的通知必须从「自愈事故」流程发起，并先经企业微信向 dx 审批；此编辑器不提供绕过入口。
+          </Alert>
+        )}
+
         <Field label="邮件推送">
           <div className="flex flex-col gap-1.5">
             <div className="flex items-center gap-2.5">
@@ -572,7 +657,12 @@ export function ComposeCard({ onSent }: { onSent: () => void }) {
         </Field>
 
         <div className="flex justify-end">
-          <Button variant="primary" onClick={send} disabled={busy}>
+          <Button
+            variant="primary"
+            onClick={send}
+            disabled={busy || previewBusy || !audiencePreview || audiencePreview.recipients === 0 || category === 'operations'}
+            title={!audiencePreview ? '请先预览受众' : category === 'operations' ? '事故通知必须走自愈审批' : undefined}
+          >
             <Send size={15} />
             {busy ? '发送中…' : '发送'}
           </Button>

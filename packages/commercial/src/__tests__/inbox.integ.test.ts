@@ -55,6 +55,8 @@ import {
   createInboxMessage,
   createCronDeliveryInboxMessage,
   adminListInbox,
+  previewInboxAudience,
+  getAdminInboxStats,
   adminDeleteInbox,
   InboxError,
 } from "../inbox/inbox.js";
@@ -542,6 +544,8 @@ describe("inbox DB ops (integ)", () => {
     assert.equal(byId.get(m2.id)!.thread_key, `cron:user:${alice.toString()}`);
     assert.equal(byId.get(m2.id)!.thread_count, 1);
     assert.equal(byId.get(m2.id)!.source_type, "cron_delivery");
+    assert.equal(byId.get(m1.id)!.audience_snapshot_status, "captured");
+    assert.equal(byId.get(m2.id)!.audience_snapshot_status, "captured");
     // recipients='all' 至少应该有 admin/alice/bob 3 个 active
     assert.ok(byId.get(m1.id)!.recipients >= 3);
 
@@ -551,6 +555,14 @@ describe("inbox DB ops (integ)", () => {
       filtered.messages.map((message) => message.id),
       [m2.id],
     );
+
+    const preview = await previewInboxAudience({ audience: "all", category: "marketing" });
+    assert.ok(preview.recipients >= 3);
+    assert.ok(preview.sample.length > 0);
+
+    const stats = await getAdminInboxStats(30);
+    assert.equal(stats.read_funnel.messages, 2);
+    assert.ok(stats.by_category.some((row) => row.category === "marketing"));
   });
 
   test("JWT 用户在 DB 中不存在 → 看不到任何广播(失败闭合)", async (t) => {

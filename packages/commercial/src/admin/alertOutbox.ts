@@ -771,6 +771,9 @@ export interface RuleStateRow {
   last_transition_at: string | null;
   last_evaluated_at: string | null;
   last_payload: Record<string, unknown>;
+  classification: "firing" | "recovered" | "stale" | "healthy";
+  stale: boolean;
+  classification_basis: { stale_after_minutes: number; recovered_within_hours: number };
 }
 
 /**
@@ -820,6 +823,9 @@ export async function listRuleStates(): Promise<RuleStateRow[]> {
             dedupe_key, last_transition_at, last_evaluated_at, last_payload
        FROM admin_alert_rule_state ORDER BY rule_id`,
   );
+  const now = Date.now();
+  const staleAfterMs = 15 * 60 * 1000;
+  const recoveredWithinMs = 24 * 60 * 60 * 1000;
   return r.rows.map((row) => ({
     rule_id: row.rule_id,
     firing: row.firing,
@@ -830,6 +836,15 @@ export async function listRuleStates(): Promise<RuleStateRow[]> {
     last_transition_at: row.last_transition_at ? row.last_transition_at.toISOString() : null,
     last_evaluated_at: row.last_evaluated_at ? row.last_evaluated_at.toISOString() : null,
     last_payload: parsePayload(row.last_payload),
+    stale: row.last_evaluated_at === null || now-row.last_evaluated_at.getTime() > staleAfterMs,
+    classification: row.firing
+      ? "firing"
+      : row.last_evaluated_at === null || now-row.last_evaluated_at.getTime() > staleAfterMs
+        ? "stale"
+        : row.last_transition_at !== null && now-row.last_transition_at.getTime() <= recoveredWithinMs
+          ? "recovered"
+          : "healthy",
+    classification_basis: { stale_after_minutes: 15, recovered_within_hours: 24 },
   }));
 }
 

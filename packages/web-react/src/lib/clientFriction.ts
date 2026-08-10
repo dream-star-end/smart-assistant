@@ -10,6 +10,7 @@ export type ClientFrictionSignal = {
   sessionId?: string;
   model?: string;
   provider?: string;
+  entitySlug?: string;
 };
 
 function buildId(): string {
@@ -57,6 +58,7 @@ export function reportClientFriction(signal: ClientFrictionSignal, token?: strin
       session_id: signal.sessionId,
       model: signal.model,
       provider: signal.provider,
+      entity_slug: signal.entitySlug,
       client_build: clientBuild(),
       browser_family: browserFamily(),
       device_class: deviceClass(),

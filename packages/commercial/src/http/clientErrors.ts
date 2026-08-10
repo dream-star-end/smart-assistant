@@ -85,6 +85,7 @@ export function normalizeClientFrictionReport(
       : "unknown",
     traceId,
     sessionId,
+    entitySlug: safeToken(body.entity_slug, 128, /^[a-z0-9][a-z0-9._-]*$/),
   };
 }
 

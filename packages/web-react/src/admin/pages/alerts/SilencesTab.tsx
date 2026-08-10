@@ -1,5 +1,5 @@
 import { Plus, RefreshCw } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Badge, Button, Input, Modal, useConfirm, useToast } from "../../../components/ui";
 import { type Column, DataTable, FilterBar, TimeAgo } from "../../components";
 import { adminGet, adminSend } from "../../lib/adminApi";
@@ -19,10 +19,18 @@ function matcherSummary(m: SilenceRow["matcher"]): { text: string; empty: boolea
   return { text: parts.join("  ·  "), empty: parts.length === 0 };
 }
 
-export function SilencesTab({ events }: { events: EventMeta[] }) {
+export function SilencesTab({
+  events,
+  requestedRule,
+  onRequestHandled,
+}: {
+  events: EventMeta[];
+  requestedRule?: string | null;
+  onRequestHandled?: () => void;
+}) {
   const toast = useToast();
   const [confirm, confirmEl] = useConfirm();
-  const [creating, setCreating] = useState(false);
+  const [creating, setCreating] = useState(() => !!requestedRule);
   const [deleting, setDeleting] = useState<Set<string>>(new Set());
 
   const { data, loading, error, reload } = useReloadable<{ rows: SilenceRow[] }>(() =>
@@ -147,6 +155,8 @@ export function SilencesTab({ events }: { events: EventMeta[] }) {
         onOpenChange={setCreating}
         events={events}
         onCreated={reload}
+        initialRuleId={requestedRule ?? ""}
+        onInitialRuleApplied={onRequestHandled}
       />
     </div>
   );
@@ -157,19 +167,29 @@ function CreateSilenceModal({
   onOpenChange,
   events,
   onCreated,
+  initialRuleId,
+  onInitialRuleApplied,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   events: EventMeta[];
   onCreated: () => void;
+  initialRuleId: string;
+  onInitialRuleApplied?: () => void;
 }) {
   const toast = useToast();
   const [eventType, setEventType] = useState("");
   const [severity, setSeverity] = useState("");
-  const [ruleId, setRuleId] = useState("");
+  const [ruleId, setRuleId] = useState(initialRuleId);
   const [endsAt, setEndsAt] = useState(() => toLocalDatetimeInput(new Date(Date.now() + 60 * 60 * 1000)));
   const [reason, setReason] = useState("");
   const [submitting, setSubmitting] = useState(false);
+
+  useEffect(() => {
+    if (!open || !initialRuleId) return;
+    setRuleId(initialRuleId);
+    onInitialRuleApplied?.();
+  }, [initialRuleId, onInitialRuleApplied, open]);
 
   const reset = () => {
     setEventType("");

@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { ToastProvider, TooltipProvider } from "../../../../components/ui";
@@ -6,6 +6,7 @@ import { collapseEventTypes } from "../EventPicker";
 import { activationBadge, friendlyTestError } from "../constants";
 import AlertsPage from "../index";
 import type { AlertChannel, CoverageRow, EventMeta, RuleStateRow } from "../types";
+import { useReloadable } from "../useReloadable";
 
 // adminApi 走 mock（保留真实 ApiError,便于 instanceof 分支）;只桩 adminGet/adminSend/adminText。
 const adminGet = vi.fn();
@@ -46,7 +47,8 @@ const COVERAGE: CoverageRow[] = [
 ];
 
 const RULES: RuleStateRow[] = [
-  { rule_id: "account_pool.all_down", firing: true, acked: false, acked_at: null, acked_by: null, dedupe_key: "k", last_transition_at: "2026-07-09T00:00:00Z", last_evaluated_at: "2026-07-10T00:00:00Z", last_payload: { n: 1 } },
+  { rule_id: "account_pool.all_down", firing: true, acked: false, acked_at: null, acked_by: null, dedupe_key: "k", last_transition_at: "2026-07-09T00:00:00Z", last_evaluated_at: "2026-07-10T00:00:00Z", last_payload: { n: 1, runbook_url: "https://ops.example/runbooks/pool", incident_id: "9" }, classification: "firing", stale: true, classification_basis: { stale_after_minutes: 15, recovered_within_hours: 24 } },
+  { rule_id: "legacy.retired", firing: false, acked: false, acked_at: null, acked_by: null, dedupe_key: null, last_transition_at: "2026-06-01T00:00:00Z", last_evaluated_at: "2026-06-01T00:00:00Z", last_payload: {}, classification: "stale", stale: true, classification_basis: { stale_after_minutes: 15, recovered_within_hours: 24 } },
 ];
 
 function routeGet(path: string): Promise<unknown> {
@@ -75,7 +77,10 @@ beforeEach(() => {
   adminGet.mockImplementation((path: string) => routeGet(path));
   adminSend.mockResolvedValue({});
 });
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.useRealTimers();
+});
 
 describe("AlertsPage 通道区", () => {
   test("渲染通道卡:类型/就绪徽标/订阅数/aibot 待绑定提示", async () => {
@@ -90,6 +95,10 @@ describe("AlertsPage 通道区", () => {
     expect(screen.getByText(/给该机器人发一条消息/)).toBeTruthy();
     expect(screen.getByText("订阅全部")).toBeTruthy();
     expect(screen.getByText("订阅 1 种")).toBeTruthy();
+    // 顶部行动队列跨 tab 常驻，含持续时间与 runbook / incident 深链。
+    expect(screen.getByText("当前行动队列")).toBeTruthy();
+    expect(screen.getByText("runbook").closest("a")?.getAttribute("href")).toBe("https://ops.example/runbooks/pool");
+    expect(screen.getByText("事故 #9").closest("a")?.getAttribute("href")).toBe("#tab=selfheal&incident_id=9");
   });
 
   test("测试送达打 POST /alerts/channels/:id/test", async () => {
@@ -128,11 +137,21 @@ describe("AlertsPage 分区切换", () => {
     await screen.findByText("ops-tg");
     fireEvent.click(screen.getByRole("tab", { name: "规则与覆盖" }));
     // 覆盖矩阵:1 个事件无人订阅 → 红色横幅
-    expect(await screen.findByText(/没有任何通道订阅/)).toBeTruthy();
+    expect(await screen.findByText(/没有主动通道订阅/)).toBeTruthy();
+    expect(screen.getByText(/仅会写入管理员站内信兜底/)).toBeTruthy();
     // 新 ops.* 运维组必须展示(旧 vanilla 漏了它)
     expect(screen.getByText("运维")).toBeTruthy();
     // FIRING 规则可见
-    expect(screen.getByText("FIRING")).toBeTruthy();
+    expect(screen.getAllByText("FIRING").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText("STALE")).toBeTruthy();
+  });
+
+  test("行动队列静默按钮打开预填 rule_id 的静默弹窗", async () => {
+    renderPage(<AlertsPage />);
+    await screen.findByText("account_pool.all_down");
+    fireEvent.click(screen.getByRole("button", { name: "静默" }));
+    const dialog = await screen.findByRole("dialog", { name: "新建静默" });
+    expect((within(dialog).getByDisplayValue("account_pool.all_down") as HTMLInputElement).value).toBe("account_pool.all_down");
   });
 });
 
@@ -156,6 +175,32 @@ describe("纯函数", () => {
       issue: () => undefined,
     });
     expect(msg).toContain("等待激活");
+  });
+});
+
+describe("自动刷新生命周期", () => {
+  test("定时刷新在组件卸载后停止", async () => {
+    vi.useFakeTimers();
+    const fetcher = vi.fn().mockResolvedValue({ value: 1 });
+    function Harness() {
+      useReloadable(fetcher, [], { intervalMs: 1_000 });
+      return <div>polling</div>;
+    }
+    const view = render(<Harness />);
+    await act(async () => { await Promise.resolve(); });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      vi.advanceTimersByTime(1_000);
+      await Promise.resolve();
+    });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    view.unmount();
+    await act(async () => {
+      vi.advanceTimersByTime(2_000);
+      await Promise.resolve();
+    });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    vi.useRealTimers();
   });
 });
 

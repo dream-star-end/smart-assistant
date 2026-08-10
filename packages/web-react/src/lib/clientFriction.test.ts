@@ -22,6 +22,7 @@ describe("client friction reporter", () => {
     const eventId = reportClientFriction({
       eventId: "event_1", surface: "auth", stage: "refresh", code: "REFRESH_RACE",
       outcome: "recovered", attempts: 2, latencyMs: 180, traceId: "trace_1",
+      entitySlug: "academic-translate",
       // Prove extra fields cannot flow into the explicit wire projection.
       message: "DO_NOT_SEND", stack: "DO_NOT_SEND", url: "DO_NOT_SEND",
     } as never, "token");
@@ -34,6 +35,7 @@ describe("client friction reporter", () => {
     expect(body).toMatchObject({
       event_id: "event_1", surface: "auth", stage: "refresh", code: "REFRESH_RACE",
       outcome: "recovered", attempts: 2, latency_ms: 180, trace_id: "trace_1",
+      entity_slug: "academic-translate",
       client_build: "build-abc", browser_family: "chrome", device_class: "desktop",
     });
     expect(JSON.stringify(body)).not.toContain("DO_NOT_SEND");
