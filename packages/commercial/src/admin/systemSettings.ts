@@ -278,7 +278,7 @@ export const KEY_META: Record<
   },
   auto_dream_model: {
     kind: "model",
-    description: "Auto-Dream 整理与全面优化模型（须为 active/public 模型）",
+    description: "Auto-Dream 整理与全面优化模型（统一使用 active/public 的 MiniMax M3）",
   },
 };
 
