@@ -833,7 +833,7 @@ export async function handleAdminMarketplaceFunnel(
     throw new HttpError(400, 'VALIDATION', 'invalid traffic_class')
   }
   const trafficClass = signalTrafficFilterValue(traffic)
-  const [browser, installs, usage, uninstalls] = await Promise.all([
+  const [browser, installs, usage, uninstalls, cohort] = await Promise.all([
     query<{ stage: string; users: string; events: string }>(
       `SELECT e.stage,
               COUNT(DISTINCT e.user_id)::text AS users,
@@ -863,6 +863,7 @@ export async function handleAdminMarketplaceFunnel(
            FROM marketplace_skill_usage_events e
            JOIN users u ON u.id=e.user_id
           WHERE e.created_at >= NOW() - INTERVAL '30 days'
+            AND e.layer='hub'
             AND ($1::text IS NULL OR u.signal_traffic_class=$1)
           GROUP BY e.user_id,e.slug
        )
@@ -883,8 +884,69 @@ export async function handleAdminMarketplaceFunnel(
         ORDER BY COUNT(*) DESC`,
       [trafficClass],
     ),
+    query<{
+      unavailable_events: string;
+      exposure_pairs: string;
+      detail_pairs: string;
+      installed_pairs: string;
+      first_use_pairs: string;
+      repeat_pairs: string;
+    }>(
+      `WITH browser AS (
+         SELECT e.user_id,e.entity_slug AS slug,e.stage,e.created_at
+           FROM product_friction_events e
+           JOIN users u ON u.id=e.user_id
+          WHERE e.surface='marketplace'
+            AND e.stage IN ('catalog_exposure','detail_view')
+            AND e.outcome='succeeded'
+            AND e.created_at >= NOW()-INTERVAL '30 days'
+            AND ($1::text IS NULL OR u.signal_traffic_class=$1)
+       ), exposures AS (
+         SELECT user_id,slug,MIN(created_at) AS exposed_at FROM browser
+          WHERE stage='catalog_exposure' AND slug IS NOT NULL
+          GROUP BY user_id,slug
+       ), details AS (
+         SELECT b.user_id,b.slug,MIN(b.created_at) AS detailed_at FROM browser b
+          JOIN exposures e USING(user_id,slug)
+          WHERE b.stage='detail_view' AND b.slug IS NOT NULL
+            AND b.created_at>=e.exposed_at
+          GROUP BY b.user_id,b.slug
+       ), installs AS (
+         SELECT i.user_id,i.slug,MIN(i.installed_at) AS installed_at
+           FROM marketplace_installs i
+           JOIN users u ON u.id=i.user_id
+           JOIN details d ON d.user_id=i.user_id AND d.slug=i.slug
+          WHERE i.installed_at >= NOW()-INTERVAL '30 days'
+            AND i.installed_at>=d.detailed_at
+            AND ($1::text IS NULL OR u.signal_traffic_class=$1)
+          GROUP BY i.user_id,i.slug
+       ), uses AS (
+         SELECT e.user_id,e.slug,COUNT(*)::int AS uses
+           FROM marketplace_skill_usage_events e
+           JOIN installs i USING(user_id,slug)
+          WHERE e.layer='hub' AND e.created_at >= i.installed_at
+          GROUP BY e.user_id,e.slug
+       )
+       SELECT
+         (SELECT COUNT(*)::text FROM browser WHERE slug IS NULL) AS unavailable_events,
+         (SELECT COUNT(*)::text FROM exposures) AS exposure_pairs,
+         (SELECT COUNT(*)::text FROM details) AS detail_pairs,
+         (SELECT COUNT(*)::text FROM installs) AS installed_pairs,
+         (SELECT COUNT(*)::text FROM uses) AS first_use_pairs,
+         (SELECT COUNT(*)::text FROM uses WHERE uses>=2) AS repeat_pairs`,
+      [trafficClass],
+    ),
   ])
   const browserByStage = new Map(browser.rows.map((row) => [row.stage, row]))
+  const c = cohort.rows[0] ?? {
+    unavailable_events: '0', exposure_pairs: '0', detail_pairs: '0',
+    installed_pairs: '0', first_use_pairs: '0', repeat_pairs: '0',
+  }
+  const count = (value: string): number => Number(value)
+  const conversion = (numerator: string, denominator: string): number | null =>
+    count(denominator) > 0
+      ? Math.round((count(numerator) / count(denominator)) * 10_000) / 10_000
+      : null
   sendJson(res, 200, {
     window: '30d',
     traffic_class: traffic,
@@ -903,6 +965,21 @@ export async function handleAdminMarketplaceFunnel(
       reason: row.reason,
       count: Number(row.count),
     })),
+    cohort: {
+      availability: count(c.unavailable_events) === 0 ? 'available' : 'partial',
+      unavailable_events: count(c.unavailable_events),
+      exposure_pairs: count(c.exposure_pairs),
+      detail_pairs: count(c.detail_pairs),
+      installed_pairs: count(c.installed_pairs),
+      first_use_pairs: count(c.first_use_pairs),
+      repeat_pairs: count(c.repeat_pairs),
+      conversions: {
+        exposure_to_detail: conversion(c.detail_pairs, c.exposure_pairs),
+        detail_to_install: conversion(c.installed_pairs, c.detail_pairs),
+        install_to_first_use: conversion(c.first_use_pairs, c.installed_pairs),
+        first_use_to_repeat: conversion(c.repeat_pairs, c.first_use_pairs),
+      },
+    },
   })
 }
 

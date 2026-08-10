@@ -1,10 +1,15 @@
-import { Check, Search, X } from "lucide-react";
-import { useState } from "react";
-import { Alert, Badge, Button, IconButton, Sheet, useToast } from "../../../components/ui";
+import { Check, RotateCcw, Save, Search, X } from "lucide-react";
+import { useEffect, useState } from "react";
+import { Alert, Badge, Button, IconButton, Input, Sheet, Textarea, useToast } from "../../../components/ui";
 import { CopyChip, KeyValue, TimeAgo } from "../../components";
 import { ApiError, adminGet, adminSend, apiErrorMessage } from "../../lib/adminApi";
 import type { TraceInfo, TraceLookupResp } from "../audit/types";
-import { FEEDBACK_STATUS_LABELS, FEEDBACK_STATUS_TONE, type FeedbackRow } from "./types";
+import {
+  FEEDBACK_STATUS_LABELS,
+  FEEDBACK_STATUS_TONE,
+  type FeedbackPriority,
+  type FeedbackRow,
+} from "./types";
 
 function fmt(ts: string | null): string {
   if (!ts) return "—";
@@ -20,12 +25,12 @@ export function FeedbackDetailSheet({
   row,
   open,
   onOpenChange,
-  onAcked,
+  onUpdated,
 }: {
   row: FeedbackRow | null;
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  onAcked: (updated: FeedbackRow) => void;
+  onUpdated: (updated: FeedbackRow) => void;
 }) {
   const toast = useToast();
   const [busy, setBusy] = useState(false);
@@ -36,33 +41,70 @@ export function FeedbackDetailSheet({
     | { status: "error"; message: string }
     | null
   >(null);
+  const [current, setCurrent] = useState(row);
+  const [owner, setOwner] = useState(row?.assigned_to ?? "");
+  const [priority, setPriority] = useState<FeedbackPriority | "">(row?.priority ?? "");
+  const [resolution, setResolution] = useState(row?.resolution ?? "");
 
-  const ack = async () => {
-    if (!row) return;
+  useEffect(() => {
+    setCurrent(row);
+    setOwner(row?.assigned_to ?? "");
+    setPriority(row?.priority ?? "");
+    setResolution(row?.resolution ?? "");
+    setTraceResult(null);
+  }, [row]);
+
+  const acceptUpdate = (updated: FeedbackRow, message: string) => {
+    setCurrent(updated);
+    setOwner(updated.assigned_to ?? "");
+    setPriority(updated.priority ?? "");
+    setResolution(updated.resolution ?? "");
+    onUpdated(updated);
+    toast(message, "success");
+  };
+
+  const mutate = async (
+    action: "ack" | "assign" | "priority" | "resolution" | "close" | "reopen",
+    body: Record<string, unknown>,
+    success: string,
+  ) => {
+    if (!current || busy) return;
     setBusy(true);
     try {
       const resp = await adminSend<{ feedback: FeedbackRow }>(
         "POST",
-        `/feedback/${encodeURIComponent(row.id)}/ack`,
-        {},
+        `/feedback/${encodeURIComponent(current.id)}/${action}`,
+        body,
       );
-      toast(`已确认反馈 #${row.id}`, "success");
-      onAcked(resp.feedback);
-      onOpenChange(false);
+      acceptUpdate(resp.feedback, success);
     } catch (e) {
-      toast(apiErrorMessage(e, "确认失败"), "error");
+      toast(apiErrorMessage(e, "更新失败"), "error");
     } finally {
       setBusy(false);
     }
   };
 
+  const ack = async () => {
+    if (!current) return;
+    await mutate("ack", {}, `已确认反馈 #${current.id}`);
+  };
+
+  const saveOwner = () => {
+    const value = owner.trim();
+    if (value && !/^[1-9]\d{0,19}$/.test(value)) {
+      toast("负责人必须是管理员数字 ID", "error");
+      return;
+    }
+    void mutate("assign", { assigned_to: value || null }, "负责人已更新");
+  };
+
   const lookupTrace = async () => {
-    if (!row?.request_id || traceBusy) return;
+    if (!current?.request_id || traceBusy) return;
     setTraceBusy(true);
     setTraceResult(null);
     try {
       const data = await adminGet<TraceLookupResp>(
-        `/trace/${encodeURIComponent(row.request_id)}`,
+        `/trace/${encodeURIComponent(current.request_id)}`,
       );
       setTraceResult({ status: "found", trace: data.trace });
     } catch (e) {
@@ -77,7 +119,7 @@ export function FeedbackDetailSheet({
   };
 
   const metaText =
-    row?.meta && Object.keys(row.meta).length > 0 ? JSON.stringify(row.meta, null, 2) : "（无 meta）";
+    current?.meta && Object.keys(current.meta).length > 0 ? JSON.stringify(current.meta, null, 2) : "（无 meta）";
 
   return (
     <Sheet
@@ -87,13 +129,13 @@ export function FeedbackDetailSheet({
       srTitle="反馈详情"
       className="w-[34rem] max-w-[94vw] bg-surface"
     >
-      {row && (
+      {current && (
         <>
           <div className="flex items-center justify-between gap-3 border-b border-border px-5 py-4">
             <div className="flex items-center gap-2">
-              <h2 className="text-[15px] font-semibold text-fg">反馈 #{row.id}</h2>
-              <Badge tone={FEEDBACK_STATUS_TONE[row.status]}>
-                {FEEDBACK_STATUS_LABELS[row.status]}
+              <h2 className="text-[15px] font-semibold text-fg">反馈 #{current.id}</h2>
+              <Badge tone={FEEDBACK_STATUS_TONE[current.status]}>
+                {FEEDBACK_STATUS_LABELS[current.status]}
               </Badge>
             </div>
             <IconButton size="sm" aria-label="关闭" onClick={() => onOpenChange(false)}>
@@ -103,28 +145,28 @@ export function FeedbackDetailSheet({
 
           <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
             <div className="divide-y divide-border">
-              <KeyValue label="提交时间" value={fmt(row.created_at)} />
+              <KeyValue label="提交时间" value={fmt(current.created_at)} />
               <KeyValue
                 label="用户"
                 value={
-                  row.user_id ? (
+                  current.user_id ? (
                     <span>
-                      {row.username ? `${row.username} ` : ""}
-                      <span className="font-mono text-faint">#{row.user_id}</span>
+                      {current.username ? `${current.username} ` : ""}
+                      <span className="font-mono text-faint">#{current.user_id}</span>
                     </span>
                   ) : (
                     <span className="text-faint">匿名</span>
                   )
                 }
               />
-              <KeyValue label="分类" value={<Badge tone="neutral">{row.category}</Badge>} />
-              {row.handled_by && (
+              <KeyValue label="分类" value={<Badge tone="neutral">{current.category}</Badge>} />
+              {current.handled_by && (
                 <KeyValue
-                  label="处理人"
+                  label="确认操作人"
                   value={
                     <span>
-                      admin <span className="font-mono text-faint">#{row.handled_by}</span> ·{" "}
-                      {fmt(row.handled_at)}
+                      admin <span className="font-mono text-faint">#{current.handled_by}</span> ·{" "}
+                      {fmt(current.handled_at)}
                     </span>
                   }
                 />
@@ -134,35 +176,35 @@ export function FeedbackDetailSheet({
             <div className="mt-4">
               <p className="mb-1.5 text-[12px] font-medium text-faint">描述</p>
               <pre className="max-h-52 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-border bg-surface px-3 py-2 text-[13px] leading-relaxed text-fg">
-                {row.description}
+                {current.description}
               </pre>
             </div>
 
             <div className="mt-4">
               <p className="mb-1.5 text-[12px] font-medium text-faint">上下文</p>
               <div className="flex flex-col gap-1.5">
-                {row.request_id && (
+                {current.request_id && (
                   <div className="flex items-center gap-2 text-[12px]">
                     <span className="w-20 shrink-0 text-faint">request_id</span>
-                    <CopyChip value={row.request_id} />
+                    <CopyChip value={current.request_id} />
                   </div>
                 )}
-                {row.session_id && (
+                {current.session_id && (
                   <div className="flex items-center gap-2 text-[12px]">
                     <span className="w-20 shrink-0 text-faint">session_id</span>
-                    <CopyChip value={row.session_id} />
+                    <CopyChip value={current.session_id} />
                   </div>
                 )}
-                {row.version && (
+                {current.version && (
                   <div className="flex items-center gap-2 text-[12px]">
                     <span className="w-20 shrink-0 text-faint">version</span>
-                    <span className="font-mono text-muted">{row.version}</span>
+                    <span className="font-mono text-muted">{current.version}</span>
                   </div>
                 )}
-                {row.user_agent && (
+                {current.user_agent && (
                   <div className="flex items-start gap-2 text-[12px]">
                     <span className="w-20 shrink-0 text-faint">UA</span>
-                    <span className="break-all font-mono text-muted">{row.user_agent}</span>
+                    <span className="break-all font-mono text-muted">{current.user_agent}</span>
                   </div>
                 )}
               </div>
@@ -175,7 +217,7 @@ export function FeedbackDetailSheet({
               </pre>
             </div>
 
-            {row.request_id && (
+            {current.request_id && (
               <div className="mt-4">
                 <div className="mb-2 flex items-center justify-between gap-3">
                   <p className="text-[12px] font-medium text-faint">请求归属</p>
@@ -229,19 +271,108 @@ export function FeedbackDetailSheet({
                 )}
               </div>
             )}
+
+            <div className="mt-5 rounded-xl border border-border bg-elevated p-4">
+              <h3 className="text-[13px] font-semibold text-fg">处理闭环</h3>
+              <p className="mt-1 text-[12px] text-faint">
+                负责人独立于确认操作人；优先级和解决结论可分别维护。
+              </p>
+              <div className="mt-4 grid gap-4 sm:grid-cols-2">
+                <label className="flex flex-col gap-1.5 text-[12px] font-medium text-muted">
+                  负责人
+                  <div className="flex gap-2">
+                    <Input
+                      aria-label="反馈负责人"
+                      value={owner}
+                      onChange={(event) => setOwner(event.target.value)}
+                      placeholder="管理员数字 ID；留空取消指派"
+                      inputMode="numeric"
+                      disabled={busy}
+                    />
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      disabled={busy || owner.trim() === (current.assigned_to ?? "")}
+                      onClick={saveOwner}
+                    >
+                      <Save size={14} />保存
+                    </Button>
+                  </div>
+                </label>
+                <label className="flex flex-col gap-1.5 text-[12px] font-medium text-muted">
+                  优先级
+                  <div className="flex gap-2">
+                    <select
+                      aria-label="反馈优先级"
+                      value={priority}
+                      onChange={(event) => setPriority(event.target.value as FeedbackPriority | "")}
+                      disabled={busy}
+                      className="h-9 min-w-0 flex-1 rounded-md border border-border bg-surface px-2.5 text-[12px] text-fg outline-none focus:border-accent focus:ring-2 focus:ring-ring"
+                    >
+                      <option value="">未设置</option>
+                      <option value="low">低</option>
+                      <option value="normal">普通</option>
+                      <option value="high">高</option>
+                      <option value="urgent">紧急</option>
+                    </select>
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      disabled={busy || priority === (current.priority ?? "")}
+                      onClick={() => void mutate("priority", { priority: priority || null }, "优先级已更新")}
+                    >
+                      <Save size={14} />保存
+                    </Button>
+                  </div>
+                </label>
+              </div>
+              <label className="mt-4 flex flex-col gap-1.5 text-[12px] font-medium text-muted">
+                解决结论
+                <Textarea
+                  aria-label="反馈解决结论"
+                  value={resolution}
+                  onChange={(event) => setResolution(event.target.value)}
+                  placeholder="记录已采取的处理、用户影响或无需处理的理由"
+                  rows={4}
+                  disabled={busy}
+                />
+              </label>
+              <div className="mt-2 flex justify-end">
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  disabled={busy || resolution.trim() === (current.resolution ?? "")}
+                  onClick={() => void mutate("resolution", { resolution: resolution.trim() || null }, "解决结论已更新")}
+                >
+                  <Save size={14} />保存结论
+                </Button>
+              </div>
+            </div>
           </div>
 
-          {row.status === "open" && (
-            <div className="flex justify-end gap-2 border-t border-border px-5 py-4">
-              <Button variant="ghost" onClick={() => onOpenChange(false)}>
-                关闭
+          <div className="flex flex-wrap justify-end gap-2 border-t border-border px-5 py-4">
+            <Button variant="ghost" onClick={() => onOpenChange(false)} disabled={busy}>
+              退出详情
+            </Button>
+            {current.status === "open" && (
+              <Button variant="secondary" onClick={ack} disabled={busy}>
+                <Check size={15} />确认收到
               </Button>
-              <Button variant="primary" onClick={ack} disabled={busy}>
-                <Check size={15} />
-                确认处理
+            )}
+            {current.status !== "closed" ? (
+              <Button
+                variant="primary"
+                onClick={() => void mutate("close", resolution.trim() ? { resolution: resolution.trim() } : {}, "反馈已关闭")}
+                disabled={busy}
+              >
+                <Check size={15} />关闭反馈
               </Button>
-            </div>
-          )}
+            ) : (
+              <Button variant="primary" onClick={() => void mutate("reopen", {}, "反馈已重新打开")} disabled={busy}>
+                <RotateCcw size={15} />重新打开
+              </Button>
+            )}
+          </div>
         </>
       )}
     </Sheet>

@@ -11,13 +11,14 @@ export type Reloadable<T> = {
 /**
  * 首载 + 手动/依赖重拉 的只读数据 hook(告警各子区共用)。
  *
- * 与地基 `useAdminPoll` 的区别:告警的通道/outbox/静默/规则是「首载 + 手动刷新」型
- * (对齐旧 vanilla,无 30s 自动轮询),不需要可见性暂停/定时 tick。deps 变化(如切换过滤)
- * 自动重拉并废弃在飞旧结果。fetcher 经 ref 取最新,不必调用方 useCallback。
+ * 缺省保持「首载 + 手动刷新」；当前行动队列可显式传 intervalMs，并只在页面可见时轮询。
+ * deps 变化(如切换过滤)自动重拉并废弃在飞旧结果。fetcher 经 ref 取最新，调用方无需
+ * useCallback。
  */
 export function useReloadable<T>(
   fetcher: () => Promise<T>,
   deps: DependencyList = [],
+  options: { intervalMs?: number } = {},
 ): Reloadable<T> {
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState<Error | null>(null);
@@ -47,15 +48,23 @@ export function useReloadable<T>(
       });
   }, []);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: 这是自定义数据 hook，调用方 deps 是显式刷新契约；load 本身稳定。
   useEffect(() => {
     aliveRef.current = true;
     load();
+    const intervalMs = options.intervalMs ?? 0;
+    const timer = intervalMs > 0
+      ? window.setInterval(() => {
+          if (document.visibilityState !== "hidden") load();
+        }, intervalMs)
+      : undefined;
     return () => {
       aliveRef.current = false;
+      if (timer !== undefined) window.clearInterval(timer);
     };
     // load 稳定;deps 变化重拉(废弃在飞)。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, deps);
+  }, [...deps, options.intervalMs]);
 
   return { data, error, loading, reload: load };
 }
