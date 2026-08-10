@@ -30,26 +30,21 @@ export async function handleAdminOpsOverview(
                 ('last_24h',86400000::bigint)
        )
        SELECT w.window_key,
-              COUNT(*) FILTER (WHERE u.id IS NOT NULL AND t.status='completed')::int AS success,
-              COUNT(*) FILTER (WHERE u.id IS NOT NULL AND t.status='crashed')::int AS failure,
-              COUNT(DISTINCT t.user_id) FILTER (
-                WHERE u.id IS NOT NULL AND t.status='crashed'
-              )::int AS affected_users,
+              COUNT(*) FILTER (WHERE t.status='completed')::int AS success,
+              COUNT(*) FILTER (WHERE t.status='crashed')::int AS failure,
+              COUNT(DISTINCT t.user_id) FILTER (WHERE t.status='crashed')::int AS affected_users,
               percentile_cont(0.5) WITHIN GROUP (
                 ORDER BY (t.finalized_at-t.created_at)
-              ) FILTER (
-                WHERE u.id IS NOT NULL AND t.status='completed' AND t.finalized_at IS NOT NULL
-              )::text AS p50,
+              ) FILTER (WHERE t.status='completed' AND t.finalized_at IS NOT NULL)::text AS p50,
               percentile_cont(0.95) WITHIN GROUP (
                 ORDER BY (t.finalized_at-t.created_at)
-              ) FILTER (
-                WHERE u.id IS NOT NULL AND t.status='completed' AND t.finalized_at IS NOT NULL
-              )::text AS p95
+              ) FILTER (WHERE t.status='completed' AND t.finalized_at IS NOT NULL)::text AS p95
          FROM windows w
          LEFT JOIN client_session_turn_tapes t
            ON t.created_at >= (EXTRACT(EPOCH FROM NOW())*1000)::bigint-w.span_ms
          LEFT JOIN users u ON t.user_id='c:'||u.id::text
           AND u.signal_traffic_class='production_user'
+        WHERE t.user_id IS NULL OR u.id IS NOT NULL
         GROUP BY w.window_key,w.span_ms ORDER BY w.span_ms`,
     ),
     listRuleStates(),
