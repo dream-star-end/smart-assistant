@@ -213,9 +213,6 @@ const metrics: Record<LiteratureResult, number> = {
   config_read_error: 0,
   bad_input: 0,
 };
-const metricsStartedAt = new Date();
-let lastSuccessAt: Date | null = null;
-const successLatenciesMs: number[] = [];
 
 function incMetric(k: LiteratureResult): void {
   metrics[k] += 1;
@@ -225,31 +222,9 @@ export function getMetricsSnapshot(): Record<LiteratureResult, number> {
   return { ...metrics };
 }
 
-export function getLiteratureOperationalSnapshot(): {
-  scope: "since_process_start";
-  since: string;
-  counts: { success: number; error: number; timeout: number };
-  last_success_at: string | null;
-  latency_ms: { p50: number; p95: number } | null;
-} {
-  const values = [...successLatenciesMs].sort((a, b) => a-b);
-  const percentile = (p: number): number => values[Math.ceil(p*values.length)-1] ?? 0;
-  const error = metrics.upstream_4xx + metrics.upstream_5xx +
-    metrics.upstream_body_too_large + metrics.redis_error + metrics.config_read_error;
-  return {
-    scope: "since_process_start",
-    since: metricsStartedAt.toISOString(),
-    counts: { success: metrics.allowed, error, timeout: metrics.timeout },
-    last_success_at: lastSuccessAt?.toISOString() ?? null,
-    latency_ms: values.length > 0 ? { p50: percentile(0.5), p95: percentile(0.95) } : null,
-  };
-}
-
 /** Tests only — 不在 prod 调用。 */
 export function _resetMetricsForTest(): void {
   for (const k of Object.keys(metrics) as LiteratureResult[]) metrics[k] = 0;
-  lastSuccessAt = null;
-  successLatenciesMs.splice(0);
 }
 
 // ─── Handler factory ───────────────────────────────────────────────
@@ -387,7 +362,6 @@ export function makeLiteratureProxyHandler(deps: LiteratureProxyDeps): Literatur
     });
 
   return async function handle(req, res, ctx) {
-    const requestStartedAt = Date.now();
     if (req.method !== "POST") {
       sendError(res, 405, "METHOD_NOT_ALLOWED", "POST required");
       return;
@@ -595,9 +569,6 @@ export function makeLiteratureProxyHandler(deps: LiteratureProxyDeps): Literatur
       }
 
       incMetric("allowed");
-      lastSuccessAt = new Date();
-      successLatenciesMs.push(Date.now()-requestStartedAt);
-      if (successLatenciesMs.length > 1_000) successLatenciesMs.splice(0, successLatenciesMs.length-1_000);
       sendJson(res, 200, json);
     } finally {
       // 兜底:任何分支退出都清 timer(避免 setTimeout 留下未触发的 abort 影响后续请求)

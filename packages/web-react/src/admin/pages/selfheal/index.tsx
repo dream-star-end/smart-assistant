@@ -1,5 +1,5 @@
 import { AlertTriangle, Check, FileText, RefreshCw, Rocket, ShieldX, X } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Badge, Button, Modal, useConfirm, usePrompt, useToast } from "../../../components/ui";
 import {
   type Column,
@@ -16,7 +16,6 @@ import { PageHeader } from "../../components";
 import { adminGet, adminSend, apiErrorMessage } from "../../lib/adminApi";
 import { useAdminPoll } from "../../lib/useAdminPoll";
 import { getAdminPage } from "../../registry";
-import { useAdminRoute } from "../../router";
 import {
   ACTIVE_REPAIR_STATUSES,
   type IncidentDetailResp,
@@ -751,8 +750,6 @@ export default function SelfhealPage() {
   const [resolving, setResolving] = useState(false);
   const [unsuppressing, setUnsuppressing] = useState<string | null>(null);
   const [clearingFuse, setClearingFuse] = useState(false);
-  const { params } = useAdminRoute();
-  const handledDeepLink = useRef<string | null>(null);
 
   const { data, error, loading, refresh } = useAdminPoll<IncidentListResp>(
     () => adminGet("/selfheal/incidents", { status, limit }),
@@ -781,20 +778,10 @@ export default function SelfhealPage() {
     { intervalMs: POLL_MS },
   );
 
-  const incidents = data?.rows ?? [];
-  const canLoadMore = !!data?.next_before && limit < MAX_LIMIT;
-  const suppressedRows = suppressedData?.rows ?? [];
+  const incidents = data?.incidents ?? [];
+  const canLoadMore = !!data?.nextBeforeId && limit < MAX_LIMIT;
+  const suppressedRows = suppressedData?.items ?? [];
   const noticeRows = noticeData?.proposals ?? [];
-
-  // 告警行动队列可带 incident_id 深链；只在对应行首次进入列表时打开，关闭后不反复弹回。
-  useEffect(() => {
-    const id = params.incident_id;
-    if (!id || handledDeepLink.current === id) return;
-    const match = incidents.find((incident) => incident.id === id);
-    if (!match) return;
-    handledDeepLink.current = id;
-    setSelected(match);
-  }, [incidents, params.incident_id]);
 
   // 列表刷新后同步弹窗选中行的状态（如已被后台标记 resolved，footer 的 resolve 钮随之禁用）。
   // biome-ignore lint/correctness/useExhaustiveDependencies: 有意只在列表数据 data 到达时同步一次;依赖 selected/incidents 会在 setSelected 后自触发循环。
@@ -844,10 +831,10 @@ export default function SelfhealPage() {
       confirmText: "解除压制",
     });
     if (!ok) return;
-    setUnsuppressing(row.condition_key);
+    setUnsuppressing(row.conditionKey);
     try {
       await adminSend("POST", "/selfheal/conditions/unsuppress", {
-        conditionKey: row.condition_key,
+        conditionKey: row.conditionKey,
       });
       toast("已解除压制，该检测项恢复正常投影", "success");
       refreshSuppressed();
@@ -904,9 +891,9 @@ export default function SelfhealPage() {
 
   const suppressedColumns: Column<SuppressedConditionRow>[] = [
     {
-      key: "condition_key",
+      key: "conditionKey",
       title: "检测项",
-      render: (r) => <span className="font-mono text-[12px] break-all">{r.condition_key}</span>,
+      render: (r) => <span className="font-mono text-[12px] break-all">{r.conditionKey}</span>,
     },
     {
       key: "level",
@@ -915,18 +902,18 @@ export default function SelfhealPage() {
       render: (r) => (r.level ? <LevelBadge level={r.level} /> : <span className="text-faint">—</span>),
     },
     {
-      key: "suppressed_at",
+      key: "suppressedAt",
       title: "压制时间",
       width: 96,
       render: (r) =>
-        r.suppressed_at ? <TimeAgo value={r.suppressed_at} /> : <span className="text-faint">—</span>,
+        r.suppressedAt ? <TimeAgo value={r.suppressedAt} /> : <span className="text-faint">—</span>,
     },
     {
-      key: "suppressed_by",
+      key: "suppressedBy",
       title: "操作人",
       width: 120,
       render: (r) => (
-        <span className="text-[12px] text-muted">{r.suppressed_by ?? "—"}</span>
+        <span className="text-[12px] text-muted">{r.suppressedBy ?? "—"}</span>
       ),
     },
     {
@@ -941,7 +928,7 @@ export default function SelfhealPage() {
           onClick={() => void onUnsuppress(r)}
           disabled={unsuppressing !== null}
         >
-          {unsuppressing === r.condition_key ? "处理中…" : "解除压制"}
+          {unsuppressing === r.conditionKey ? "处理中…" : "解除压制"}
         </Button>
       ),
     },
@@ -988,30 +975,9 @@ export default function SelfhealPage() {
     },
     {
       key: "opened_at",
-      title: "持续时间",
-      width: 112,
-      render: (r) =>
-        r.status === "resolved" ? (
-          <span className="text-faint">已恢复</span>
-        ) : (
-          <span className="text-muted">已持续 <TimeAgo value={r.opened_at} /></span>
-        ),
-    },
-    {
-      key: "latest_repair_status",
-      title: "修复状态",
-      width: 112,
-      render: (r) =>
-        r.latest_repair_status ? (
-          <span className="flex flex-col items-start gap-0.5">
-            <Badge tone={repairTone(r.latest_repair_status)}>{r.latest_repair_status}</Badge>
-            {r.latest_repair_at && (
-              <TimeAgo value={r.latest_repair_at} className="text-[11px] text-faint" />
-            )}
-          </span>
-        ) : (
-          <span className="text-faint">未触发</span>
-        ),
+      title: "发生时间",
+      width: 96,
+      render: (r) => <TimeAgo value={r.opened_at} />,
     },
     {
       key: "actions",
@@ -1085,11 +1051,6 @@ export default function SelfhealPage() {
           <Button variant="secondary" size="sm" onClick={refresh} disabled={loading}>
             <RefreshCw size={14} className={loading ? "animate-spin" : undefined} /> 刷新
           </Button>
-          <span className="ml-auto text-[12px] text-muted" aria-live="polite">
-            {typeof data?.total === "number"
-              ? `共 ${data.total} 条${typeof data.open_total === "number" ? ` · ${data.open_total} 条未恢复` : ""}`
-              : `已加载 ${incidents.length} 条${data?.next_before ? "，仍有更多" : ""}`}
-          </span>
         </FilterBar>
 
         {error && (
@@ -1167,7 +1128,7 @@ export default function SelfhealPage() {
           <DataTable
             columns={suppressedColumns}
             rows={suppressedRows}
-            rowKey={(r) => r.condition_key}
+            rowKey={(r) => r.conditionKey}
             loading={suppressedLoading && suppressedRows.length === 0}
             emptyTitle="当前没有被压制的检测项"
             emptyHint="手动 resolve 仍在异常的探测类事故后，压制记录会出现在这里。"

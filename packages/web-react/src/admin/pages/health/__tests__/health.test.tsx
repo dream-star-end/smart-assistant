@@ -53,46 +53,26 @@ const DIAGNOSTICS = {
   account_pool: { total: 10, active: 8, cooldown: 1, disabled: 1, banned: 0, avg_health: 88, today_requests: 500, today_success_rate: 0.99 },
 };
 
-const OPS_OVERVIEW = {
-  slo: {
-    source: "durable",
-    windows: {
-      last_15m: { success: 12, failure: 1, affected_users: 1, latency_ms: { p50: 520, p95: 1400 } },
-      last_1h: { success: 50, failure: 2, affected_users: 2, latency_ms: { p50: 600, p95: 1700 } },
-      last_24h: { success: 425, failure: 8, affected_users: 5, latency_ms: { p50: 700, p95: 2100 } },
-    },
-  },
-  current_actions: {
-    firing_alerts: [{ rule_id: "ops.failed_units" }, { rule_id: "ops.mem" }],
-    open_incidents: [{ id: "9", condition_key: "ops.mem", opened_at: "2026-08-01T00:00:00Z" }],
-    stale_alerts: Array.from({ length: 6 }, (_, i) => ({ rule_id: `stale.${i}` })),
-    recovered_alerts: Array.from({ length: 4 }, (_, i) => ({ rule_id: `recovered.${i}` })),
-  },
-};
-
 beforeEach(() => {
   adminGet.mockReset();
   adminText.mockReset();
   adminText.mockResolvedValue(METRICS);
   adminGet.mockImplementation((path: string) => {
     if (path === "/diagnostics") return Promise.resolve(DIAGNOSTICS);
-    if (path === "/ops-overview") return Promise.resolve(OPS_OVERVIEW);
     return Promise.resolve(null);
   });
 });
 afterEach(cleanup);
 
 describe("HealthPage", () => {
-  test("进程 counters 明确标注时间窗口 + 页头", async () => {
+  test("渲染 KPI 总请求 + 页头", async () => {
     renderPage(<HealthPage />);
     // KPI 总请求 = 100 + 5 = 105
     expect(await screen.findByText("105")).toBeTruthy();
     expect(screen.getByText("健康面板")).toBeTruthy();
-    expect(screen.getByText("HTTP 请求（自本进程启动）")).toBeTruthy();
     // metrics 走 adminText('/metrics')，diagnostics 走 adminGet('/diagnostics')
     expect(adminText).toHaveBeenCalledWith("/metrics");
     expect(adminGet).toHaveBeenCalledWith("/diagnostics");
-    expect(adminGet).toHaveBeenCalledWith("/ops-overview");
   });
 
   test("诊断卡读真实嵌套形状：版本 tag / firing / active", async () => {
@@ -108,26 +88,6 @@ describe("HealthPage", () => {
   test("账号池健康表渲染 account_id", async () => {
     renderPage(<HealthPage />);
     expect(await screen.findByText("57")).toBeTruthy();
-  });
-
-  test("展示持久化 15m/1h/24h SLO 与当前行动深链", async () => {
-    renderPage(<HealthPage />);
-    expect(await screen.findByText("最近 15 分钟")).toBeTruthy();
-    expect(screen.getByText("425 成功")).toBeTruthy();
-    expect(screen.getByText(/延迟 p50 700 ms · p95 2,100 ms/)).toBeTruthy();
-    expect(screen.getByText("2 firing").closest("a")?.getAttribute("href")).toBe("#tab=alerts");
-    expect(screen.getByText("1 open").closest("a")?.getAttribute("href")).toBe("#tab=selfheal");
-  });
-
-  test("SLO 不可用时诚实展示，不拿 counter 冒充历史窗口", async () => {
-    adminGet.mockImplementation((path: string) => {
-      if (path === "/diagnostics") return Promise.resolve(DIAGNOSTICS);
-      if (path === "/ops-overview") return Promise.reject(new Error("not ready"));
-      return Promise.resolve(null);
-    });
-    renderPage(<HealthPage />);
-    expect(await screen.findByText(/时间窗口 SLO 暂不可用/)).toBeTruthy();
-    expect(screen.getByText(/不会用进程累计 counter 伪装历史数据/)).toBeTruthy();
   });
 
   test("diagnostics 失败不致命：仍渲染 KPI + 失败提示", async () => {

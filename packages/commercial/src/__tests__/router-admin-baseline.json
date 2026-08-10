@@ -139,12 +139,6 @@
   },
   {
     "method": "GET",
-    "pathKind": "path",
-    "pathValue": "/api/admin/ops-overview",
-    "handler": "handleAdminOpsOverview"
-  },
-  {
-    "method": "GET",
     "pathKind": "pathPrefix",
     "pathValue": "/api/admin/trace/",
     "handler": "handleAdminTraceLookup"
@@ -759,19 +753,13 @@
     "method": "POST",
     "pathKind": "pathPrefix",
     "pathValue": "/api/admin/feedback/",
-    "handler": "handleAdminFeedbackPost"
+    "handler": "handleAdminAckFeedback"
   },
   {
     "method": "GET",
     "pathKind": "path",
     "pathValue": "/api/admin/auto-dream-findings",
     "handler": "handleAdminListAutoDreamFindings"
-  },
-  {
-    "method": "PATCH",
-    "pathKind": "path",
-    "pathValue": "/api/admin/auto-dream-findings/batch",
-    "handler": "handleAdminUpdateAutoDreamFinding"
   },
   {
     "method": "PATCH",
@@ -790,18 +778,6 @@
     "pathKind": "path",
     "pathValue": "/api/admin/messages",
     "handler": "handleAdminListInbox"
-  },
-  {
-    "method": "POST",
-    "pathKind": "path",
-    "pathValue": "/api/admin/messages/preview",
-    "handler": "handleAdminPreviewInbox"
-  },
-  {
-    "method": "GET",
-    "pathKind": "path",
-    "pathValue": "/api/admin/messages/stats",
-    "handler": "handleAdminInboxStats"
   },
   {
     "method": "GET",

@@ -85,15 +85,7 @@ export const ADMIN_AUDIT_ACTIONS = {
 
   // ── 反馈/收件箱────────────────────────────────────────────────────
   "feedback.ack": { kind: "write", mode: "tx" },
-  "feedback.assign": { kind: "write", mode: "tx" },
-  "feedback.priority": { kind: "write", mode: "tx" },
-  "feedback.resolution": { kind: "write", mode: "tx" },
-  "feedback.close": { kind: "write", mode: "tx" },
-  "feedback.reopen": { kind: "write", mode: "tx" },
   "auto_dream_finding.status": { kind: "write", mode: "tx" },
-  "auto_dream_finding.owner": { kind: "write", mode: "tx" },
-  "auto_dream_finding.update": { kind: "write", mode: "tx" },
-  "auto_dream_finding.batch": { kind: "write", mode: "tx" },
   "inbox.create": { kind: "write", mode: "best-effort" },
   "inbox.delete": { kind: "write", mode: "best-effort" },
 

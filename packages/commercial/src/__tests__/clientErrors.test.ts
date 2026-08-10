@@ -18,7 +18,6 @@ describe("client friction normalization", () => {
       latency_ms: 180,
       trace_id: "trace_1",
       session_id: "session_1",
-      entity_slug: "skill.one",
       model: "qwen3.7-max",
       provider: "opencodego",
       client_build: "abc-123",
@@ -47,7 +46,6 @@ describe("client friction normalization", () => {
       deviceClass: "desktop",
       traceId: "trace_1",
       sessionId: "session_1",
-      entitySlug: "skill.one",
     });
     assert.equal(JSON.stringify(normalized).includes("DO_NOT_PERSIST"), false);
   });
@@ -73,7 +71,6 @@ describe("client friction normalization", () => {
       provider: "UPPERCASE",
       browser_family: "bad/slash",
       device_class: "watch",
-      entity_slug: "contains spaces",
     }, "fallback_id");
     assert.equal(normalized.correlation, "fallback_id");
     assert.equal(normalized.surface, "client");
@@ -84,7 +81,6 @@ describe("client friction normalization", () => {
     assert.equal(normalized.provider, null);
     assert.equal(normalized.browserFamily, null);
     assert.equal(normalized.deviceClass, "unknown");
-    assert.equal(normalized.entitySlug, null);
   });
 
   test("persist failures expose bounded structure without leaking raw database detail", () => {

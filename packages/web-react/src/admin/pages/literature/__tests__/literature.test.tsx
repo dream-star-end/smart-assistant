@@ -34,20 +34,10 @@ const CONFIG_SET = {
 };
 
 const CONFIG_UNSET = { ...CONFIG_SET, token_set: false, token_hint: null, updated_by: null };
-const OPERATIONS = {
-  daily: { utc_day: "2026-08-10", used: 42, cap: 10000, source: "redis" },
-  metrics: {
-    scope: "since_process_start",
-    since: "2026-08-10T02:00:00Z",
-    counts: { allowed: 38, rejected_daily_cap: 1, upstream_5xx: 2, timeout: 1 },
-    last_success_at: "2026-08-10T03:00:00Z",
-    latency_ms: { p50: 320, p95: 880 },
-  },
-};
 
 function mockConfig(cfg: Record<string, unknown>) {
   adminGet.mockImplementation((path: string) => {
-    if (path === "/literature") return Promise.resolve({ config: cfg, operations: OPERATIONS });
+    if (path === "/literature") return Promise.resolve({ config: cfg });
     return Promise.resolve({});
   });
 }
@@ -74,15 +64,6 @@ describe("LiteraturePage", () => {
     renderPage(<LiteraturePage />);
     await screen.findByDisplayValue("https://data.rag.ac.cn");
     expect(screen.getByText("未设置")).toBeTruthy();
-  });
-
-  test("展示 UTC 日用量与自进程启动运行指标，不伪装 24h", async () => {
-    renderPage(<LiteraturePage />);
-    expect(await screen.findByText("42 / 10,000 · redis")).toBeTruthy();
-    expect(screen.getByText(/请求指标窗口：自本进程启动/)).toBeTruthy();
-    expect(screen.getByText("38")).toBeTruthy();
-    expect(screen.getByText(/延迟 p50：320 ms/)).toBeTruthy();
-    expect(screen.queryByText(/24h/)).toBeNull();
   });
 
   test("测试连接：打 POST /literature/test 并渲染 ok 摘要", async () => {

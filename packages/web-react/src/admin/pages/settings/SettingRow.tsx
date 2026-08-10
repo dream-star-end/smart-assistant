@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { adminSend, apiErrorMessage } from "../../lib/adminApi";
 import { TimeAgo } from "../../components";
-import { Badge, Button, Input, Switch, Textarea, useConfirm, useToast } from "../../../components/ui";
+import { Badge, Button, Input, Switch, Textarea, useToast } from "../../../components/ui";
 import type { SettingRow as Row } from "./types";
 
 // 原生 <select> 复用 Input 视觉；enum editor 用它（jsdom 友好、表单语义直接）。
@@ -44,40 +44,6 @@ function initialDraft(r: Row): string | boolean {
 
 type Converted = { ok: true; value: unknown } | { ok: false; msg: string };
 
-type SettingRisk = "critical" | "high" | "normal";
-const CRITICAL_KEYS = new Set([
-  "maintenance_mode",
-  "allow_registration",
-  "alerts_enabled",
-  "rate_limit_chat_per_min",
-]);
-const HIGH_KEYS = new Set([
-  "idle_sweep_min",
-  "onboarding_enabled",
-  "onboarding_dry_run",
-  "register_email_domain_blocklist",
-  "phase6_account_uuid_enforce",
-  "session_pin_mode",
-]);
-
-function settingRisk(key: string): SettingRisk {
-  if (CRITICAL_KEYS.has(key)) return "critical";
-  if (HIGH_KEYS.has(key)) return "high";
-  return "normal";
-}
-
-const RISK_META: Record<SettingRisk, { label: string; tone: "danger" | "warning" | "neutral" }> = {
-  critical: { label: "关键风险", tone: "danger" },
-  high: { label: "高风险", tone: "warning" },
-  normal: { label: "常规", tone: "neutral" },
-};
-
-function diffValue(value: unknown): string {
-  if (typeof value === "string") return value;
-  const encoded = JSON.stringify(value);
-  return encoded === undefined ? String(value) : encoded;
-}
-
 /** 保存前的 JS 类型转换 —— 与 vanilla saveSetting 逐条对齐；server 端仍做严格 zod 二次校验。 */
 function convert(r: Row, draft: string | boolean): Converted {
   const key = r.key;
@@ -119,20 +85,13 @@ function convert(r: Row, draft: string | boolean): Converted {
 /** 单条系统设置：editor（按 kind）+ 可编辑 description + 逐项保存；保存成功后触发整表重拉。 */
 export function SettingRow({ row, onSaved }: { row: Row; onSaved: () => Promise<void> }) {
   const toast = useToast();
-  const [confirm, confirmEl] = useConfirm();
-  const initial = initialDraft(row);
-  const initialDescription = row.description ?? row.meta.description ?? "";
-  const [draft, setDraft] = useState<string | boolean>(initial);
+  const [draft, setDraft] = useState<string | boolean>(() => initialDraft(row));
   // description 预填 r.description || meta.description（对齐 vanilla；保存即持久化该说明）
-  const [desc, setDesc] = useState<string>(initialDescription);
+  const [desc, setDesc] = useState<string>(() => row.description ?? row.meta.description ?? "");
   const [saving, setSaving] = useState(false);
 
   const kind = row.meta.kind;
   const isDefault = row.is_default;
-  const risk = settingRisk(row.key);
-  const riskMeta = RISK_META[risk];
-  const baseline = convert(row, initial);
-  const dirty = isDefault || desc !== initialDescription || draft !== initial;
 
   const save = async () => {
     const c = convert(row, draft);
@@ -140,30 +99,6 @@ export function SettingRow({ row, onSaved }: { row: Row; onSaved: () => Promise<
       toast(c.msg, "error");
       return;
     }
-    const ok = await confirm({
-      title: risk === "critical" ? "确认关键设置变更？" : "确认保存设置？",
-      body: (
-        <div className="flex flex-col gap-3 text-[13px]">
-          <div className="flex items-center gap-2">
-            <Badge tone={riskMeta.tone}>{riskMeta.label}</Badge>
-            <span className="break-all font-mono text-fg">{row.key}</span>
-          </div>
-          <div className="grid gap-2 rounded-lg border border-border bg-hover p-3 sm:grid-cols-2">
-            <div className="min-w-0"><div className="text-[11px] text-faint">当前值{isDefault ? "（继承默认）" : ""}</div><code className="mt-1 block break-all text-[12px] text-muted">{diffValue(baseline.ok ? baseline.value : row.value)}</code></div>
-            <div className="min-w-0"><div className="text-[11px] text-faint">保存后</div><code className="mt-1 block break-all text-[12px] text-fg">{diffValue(c.value)}</code></div>
-          </div>
-          {desc !== initialDescription && (
-            <div className="rounded-lg border border-border p-3 text-[12px] text-muted">
-              说明：<span className="line-through">{initialDescription || "（空）"}</span> → <span className="text-fg">{desc || "（空）"}</span>
-            </div>
-          )}
-          {risk === "critical" && <p className="font-medium text-danger">该设置可能立即影响用户访问、注册、限流或告警能力，请再次核对。</p>}
-        </div>
-      ),
-      confirmText: "确认保存",
-      danger: risk === "critical",
-    });
-    if (!ok) return;
     setSaving(true);
     try {
       await adminSend("PUT", `/settings/${encodeURIComponent(row.key)}`, {
@@ -263,7 +198,6 @@ export function SettingRow({ row, onSaved }: { row: Row; onSaved: () => Promise<
           <div className="break-all font-mono text-[13px] font-semibold text-fg">{row.key}</div>
           <div className="mt-1 flex flex-wrap items-center gap-1.5">
             <Badge tone="neutral">{String(kind)}</Badge>
-            <Badge tone={riskMeta.tone} title={`风险等级：${riskMeta.label}`}>{riskMeta.label}</Badge>
             <span className="font-mono text-[11px] text-faint">{rangeHint(row)}</span>
             {isDefault ? (
               <Badge tone="neutral" title="继承平台默认值，尚未持久化">
@@ -277,15 +211,6 @@ export function SettingRow({ row, onSaved }: { row: Row; onSaved: () => Promise<
             {!isDefault && row.updated_at && (
               <TimeAgo value={row.updated_at} className="text-[11px] text-faint" />
             )}
-            {!isDefault && row.updated_by && (
-              <span className="font-mono text-[11px] text-faint">by #{row.updated_by}</span>
-            )}
-            <a
-              href="#tab=audit"
-              className="rounded text-[11px] text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring"
-            >
-              查看审计
-            </a>
           </div>
           {row.meta.description && (
             <p className="mt-1.5 max-w-prose text-[12px] leading-relaxed text-muted">
@@ -293,7 +218,7 @@ export function SettingRow({ row, onSaved }: { row: Row; onSaved: () => Promise<
             </p>
           )}
         </div>
-        <Button variant="primary" size="sm" onClick={save} disabled={saving || !dirty} className="shrink-0">
+        <Button variant="primary" size="sm" onClick={save} disabled={saving} className="shrink-0">
           {saving ? "保存中…" : "保存"}
         </Button>
       </div>
@@ -316,7 +241,6 @@ export function SettingRow({ row, onSaved }: { row: Row; onSaved: () => Promise<
           />
         </div>
       </div>
-      {confirmEl}
     </div>
   );
 }

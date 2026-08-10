@@ -48,9 +48,6 @@ function serializeAdminInboxMessage(
     ...("source_type" in m ? { source_type: m.source_type } : {}),
     ...("source_id" in m ? { source_id: m.source_id } : {}),
     ...("source_phase" in m ? { source_phase: m.source_phase } : {}),
-    ...("audience_snapshot_status" in m
-      ? { audience_snapshot_status: m.audience_snapshot_status }
-      : {}),
   };
 }
 
@@ -170,20 +167,15 @@ export async function handleAdminListInbox(
   const limit = parsePositiveInt(sp.get("limit"), "limit", 100);
   const offset = parseNonNegativeInt(sp.get("offset"), "offset");
   const categoryRaw = sp.get("category");
-  const sourceTypeRaw = sp.get("source_type");
   const categories = ["user", "automation", "billing", "operations", "marketing"] as const;
   if (categoryRaw && !(categories as readonly string[]).includes(categoryRaw)) {
     throw new HttpError(400, "VALIDATION", "invalid category");
-  }
-  if (sourceTypeRaw && !/^[a-z][a-z0-9_]{0,47}$/.test(sourceTypeRaw)) {
-    throw new HttpError(400, "VALIDATION", "invalid source_type");
   }
   const { adminListInbox } = await import("../../inbox/inbox.js");
   const r = await adminListInbox({
     limit,
     offset,
     category: (categoryRaw || null) as import("../../inbox/inbox.js").InboxCategory | null,
-    sourceType: sourceTypeRaw || null,
   });
   sendJson(res, 200, {
     messages: r.messages.map((m) => ({
@@ -194,53 +186,6 @@ export async function handleAdminListInbox(
     })),
     total: r.total,
   });
-}
-
-const INBOX_CATEGORIES = ["user", "automation", "billing", "operations", "marketing"] as const;
-
-export async function handleAdminPreviewInbox(
-  req: IncomingMessage,
-  res: ServerResponse,
-  _ctx: RequestContext,
-  deps: CommercialHttpDeps,
-): Promise<void> {
-  await requireAdmin(req, deps.jwtSecret);
-  const body = (await readJsonBody(req, 16 * 1024)) as Record<string, unknown> | undefined;
-  if (!body || typeof body !== "object" || Array.isArray(body)) {
-    throw new HttpError(400, "VALIDATION", "body must be a JSON object");
-  }
-  if (body.audience !== "all" && body.audience !== "user") {
-    throw new HttpError(400, "VALIDATION", "invalid audience");
-  }
-  if (body.category !== undefined &&
-      !(INBOX_CATEGORIES as readonly unknown[]).includes(body.category)) {
-    throw new HttpError(400, "VALIDATION", "invalid category");
-  }
-  const { previewInboxAudience, InboxError } = await import("../../inbox/inbox.js");
-  try {
-    const preview = await previewInboxAudience({
-      audience: body.audience,
-      user_id: typeof body.user_id === "string" ? body.user_id : null,
-      category: (body.category ?? null) as import("../../inbox/inbox.js").InboxCategory | null,
-    });
-    sendJson(res, 200, preview);
-  } catch (err) {
-    if (err instanceof InboxError) throw new HttpError(400, "VALIDATION", err.message);
-    throw err;
-  }
-}
-
-export async function handleAdminInboxStats(
-  req: IncomingMessage,
-  res: ServerResponse,
-  _ctx: RequestContext,
-  deps: CommercialHttpDeps,
-): Promise<void> {
-  await requireAdmin(req, deps.jwtSecret);
-  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
-  const days = parsePositiveInt(url.searchParams.get("days"), "days", 90) ?? 30;
-  const { getAdminInboxStats } = await import("../../inbox/inbox.js");
-  sendJson(res, 200, await getAdminInboxStats(days));
 }
 
 export async function handleAdminDeleteInbox(

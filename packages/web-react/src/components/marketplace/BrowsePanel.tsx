@@ -24,7 +24,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, apiErrorMessage } from "../../lib/api";
-import { reportClientFrictionBatch } from "../../lib/clientFriction";
+import { reportClientFriction } from "../../lib/clientFriction";
 import {
   benchmarkBadgeLabel,
   formatInstallCount,
@@ -351,7 +351,6 @@ export function BrowsePanel({
   const [installed, setInstalled] = useState<Map<string, MarketplaceInstalled>>(new Map());
   const [active, setActive] = useState<string | null>(null);
   const [reloadInstalled, setReloadInstalled] = useState(0);
-  const reportedExposureSlugs = useRef(new Set<string>());
   /** 选中的分类筛选片(null=全部/分区视图;taxonomy id 或 UNCAT=平铺该类)。 */
   const [selectedCat, setSelectedCat] = useState<string | null>(null);
 
@@ -384,6 +383,17 @@ export function BrowsePanel({
       try {
         const result = await api.searchMarketplace(auth, debouncedQ, kind, limit);
         if (seq !== cardRequestSeq.current) return;
+        if (result.results.length > 0) {
+          reportClientFriction(
+            {
+              surface: "marketplace",
+              stage: "catalog_exposure",
+              code: "CATALOG_EXPOSURE",
+              outcome: "succeeded",
+            },
+            auth.snapshot().token,
+          );
+        }
         // 信任服务端顺序:目录态已按 featured_rank/热度排好,搜索态是相关度排序。
         setCards(result.results);
         setErr(null);
@@ -485,36 +495,6 @@ export function BrowsePanel({
   }, [debouncedQ, cards, grouped, selectedCat]);
 
   const flatMode = Boolean(debouncedQ) || selectedCat !== null;
-  const exposedCards = useMemo(() => {
-    if (!cards) return [];
-    if (flatMode) return flatCards;
-    if (!sections) return cards;
-    return [
-      ...sections.featured,
-      ...sections.categories.flatMap((section) => section.cards),
-      ...sections.uncategorized,
-    ];
-  }, [cards, flatCards, flatMode, sections]);
-
-  // Cohort 必须按同一 user + skill 关联；只记录本次市场面板实际渲染过的卡片，
-  // 并在面板生命周期内按 slug 去重，避免静默刷新重复放大曝光。
-  useEffect(() => {
-    const token = auth.snapshot().token;
-    const signals = [];
-    for (const card of exposedCards) {
-      if (reportedExposureSlugs.current.has(card.slug)) continue;
-      reportedExposureSlugs.current.add(card.slug);
-      signals.push({
-        surface: "marketplace",
-        stage: "catalog_exposure",
-        code: "CATALOG_EXPOSURE",
-        outcome: "succeeded" as const,
-        entitySlug: card.slug,
-      });
-    }
-    if (signals.length > 0) reportClientFrictionBatch(signals, token);
-  }, [auth, exposedCards]);
-
   const flatTitle = debouncedQ
     ? `“${debouncedQ}” 的结果`
     : selectedCat === UNCAT

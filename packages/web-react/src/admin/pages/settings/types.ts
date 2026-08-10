@@ -20,7 +20,6 @@ export type SettingRow = {
   is_default: boolean;
   description?: string | null;
   updated_at?: string | null;
-  updated_by?: string | null;
   meta: SettingMeta;
 };
 

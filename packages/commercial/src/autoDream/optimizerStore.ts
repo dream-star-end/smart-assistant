@@ -296,9 +296,6 @@ export async function listAutoDreamPlatformFindings(
     offset: number
     trafficClass: SignalTrafficClass | null
     model: 'current' | 'all' | string
-    seenAfter?: Date | null
-    minAffectedUsers?: number
-    owner?: string | null
   },
 ): Promise<{ rows: Record<string, unknown>[]; total: number; model: string | null }> {
   const status = input.status && input.status !== 'all' ? input.status : null
@@ -314,16 +311,7 @@ export async function listAutoDreamPlatformFindings(
       : input.model === 'all'
         ? null
         : input.model
-  const params = [
-    status,
-    input.trafficClass,
-    currentModel,
-    input.seenAfter?.toISOString() ?? null,
-    input.minAffectedUsers ?? 0,
-    input.owner ?? null,
-    input.limit,
-    input.offset,
-  ]
+  const params = [status, input.trafficClass, currentModel, input.limit, input.offset]
   const evidenceCte = `
     WITH evidence AS (
       SELECT o.finding_id,
@@ -335,7 +323,6 @@ export async function listAutoDreamPlatformFindings(
         FROM auto_dream_platform_finding_occurrences o
        WHERE ($2::text IS NULL OR o.traffic_class=$2)
          AND ($3::text IS NULL OR o.model=$3)
-         AND ($4::timestamptz IS NULL OR o.created_at >= $4)
        GROUP BY o.finding_id
     )
   `
@@ -345,7 +332,7 @@ export async function listAutoDreamPlatformFindings(
        SELECT f.id::text,f.fingerprint,f.taxonomy,f.capability_id,f.severity,f.title,f.problem,
               f.impact,f.recommendation,f.status,e.occurrence_count,e.affected_user_count,
               e.run_count,f.first_seen_at,e.filtered_last_seen_at AS last_seen_at,
-              e.filtered_last_model AS last_model,f.last_run_id::text,f.updated_at,f.owner,
+              e.filtered_last_model AS last_model,f.last_run_id::text,f.updated_at,
               CASE
                 WHEN e.affected_user_count::bigint >= 2 AND e.run_count::bigint >= 2
                   THEN 'corroborated'
@@ -354,12 +341,9 @@ export async function listAutoDreamPlatformFindings(
          FROM auto_dream_platform_findings f
          JOIN evidence e ON e.finding_id=f.id
         WHERE ($1::text IS NULL OR f.status=$1)
-          AND e.affected_user_count::bigint >= $5::bigint
-          AND ($6::text IS NULL OR f.owner=$6)
-        ORDER BY e.affected_user_count::bigint DESC,
-                 CASE f.severity WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
+        ORDER BY CASE f.severity WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
                  e.filtered_last_seen_at DESC
-        LIMIT $7 OFFSET $8`,
+        LIMIT $4 OFFSET $5`,
       params,
     ),
     pool.query<{ count: string }>(
@@ -367,88 +351,14 @@ export async function listAutoDreamPlatformFindings(
        SELECT COUNT(*)::text AS count
          FROM auto_dream_platform_findings f
          JOIN evidence e ON e.finding_id=f.id
-        WHERE ($1::text IS NULL OR f.status=$1)
-          AND e.affected_user_count::bigint >= $5::bigint
-          AND ($6::text IS NULL OR f.owner=$6)`,
-      params.slice(0, 6),
+        WHERE ($1::text IS NULL OR f.status=$1)`,
+      params.slice(0, 3),
     ),
   ])
   return {
     rows: rows.rows,
     total: Number(count.rows[0]?.count ?? 0),
     model: currentModel,
-  }
-}
-
-export async function updateAutoDreamPlatformFindings(
-  pool: Pool,
-  input: {
-    ids: string[]
-    status?: string
-    owner?: string | null
-    adminId: bigint | number | string
-    ip?: string | null
-    userAgent?: string | null
-  },
-): Promise<number> {
-  if (
-    input.ids.length < 1 ||
-    input.ids.length > 200 ||
-    input.ids.some((id) => !/^\d+$/.test(id)) ||
-    (input.status !== undefined &&
-      !['new', 'triaged', 'planned', 'resolved', 'dismissed'].includes(input.status)) ||
-    (input.owner !== undefined && input.owner !== null &&
-      (input.owner.trim().length < 1 || input.owner.length > 128)) ||
-    (input.status === undefined && input.owner === undefined)
-  ) {
-    throw new Error('AUTO_DREAM_INVALID_FINDING_UPDATE')
-  }
-  const client = await pool.connect()
-  try {
-    await client.query('BEGIN')
-    const prior = await client.query<{ id: string; status: string; owner: string | null }>(
-      `SELECT id::text,status,owner FROM auto_dream_platform_findings
-        WHERE id=ANY($1::bigint[]) ORDER BY id FOR UPDATE`,
-      [input.ids],
-    )
-    if (prior.rows.length === 0) {
-      await client.query('ROLLBACK')
-      return 0
-    }
-    const statusProvided = input.status !== undefined
-    const ownerProvided = input.owner !== undefined
-    await client.query(
-      `UPDATE auto_dream_platform_findings
-          SET status=CASE WHEN $2::boolean THEN $3 ELSE status END,
-              owner=CASE WHEN $4::boolean THEN $5 ELSE owner END,
-              updated_at=NOW()
-        WHERE id=ANY($1::bigint[])`,
-      [input.ids, statusProvided, input.status ?? null, ownerProvided, input.owner ?? null],
-    )
-    await writeAdminAudit(client, {
-      adminId: input.adminId,
-      action: input.ids.length === 1
-        ? statusProvided && ownerProvided
-          ? 'auto_dream_finding.update'
-          : statusProvided
-            ? 'auto_dream_finding.status'
-            : 'auto_dream_finding.owner'
-        : 'auto_dream_finding.batch',
-      target: input.ids.length === 1
-        ? `auto_dream_finding:${input.ids[0]}`
-        : `auto_dream_finding_batch:${input.ids.length}`,
-      before: { rows: prior.rows },
-      after: { ids: prior.rows.map((row) => row.id), status: input.status, owner: input.owner },
-      ip: input.ip,
-      userAgent: input.userAgent,
-    })
-    await client.query('COMMIT')
-    return prior.rows.length
-  } catch (err) {
-    await client.query('ROLLBACK').catch(() => {})
-    throw err
-  } finally {
-    client.release()
   }
 }
 

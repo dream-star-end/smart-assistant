@@ -1,4 +1,4 @@
-import { Link2, MessageSquare, ThumbsDown, ThumbsUp, TrendingUp, Users } from "lucide-react";
+import { ThumbsDown, ThumbsUp, TrendingUp } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Alert, Badge, Button } from "../../../components/ui";
 import {
@@ -29,12 +29,6 @@ type DownRatingSource = "explicit" | "implicit" | "all";
 
 function pct(rate: number | null): string {
   return rate === null ? "—" : `${(rate * 100).toFixed(1)}%`;
-}
-
-function rateConclusion(bucket: RatingBucket | undefined): string {
-  if (!bucket || bucket.sample_note === "no_sample") return "暂无样本";
-  if (bucket.sample_note === "small_sample") return `样本不足（n=${bucket.total}）`;
-  return pct(bucket.up_rate);
 }
 
 /** 好评率 → 语义色：≥90% 绿，≥70% 黄，其余红；无样本灰。 */
@@ -255,49 +249,11 @@ export function ResponseRatings() {
       </FilterBar>
       <StatCardRow>
         <StatCard
-          label="30 天显式样本"
-          value={stats?.last_30d.total ?? 0}
-          icon={MessageSquare}
-          tone="neutral"
-          hint={`${stats?.completed_turns.last_30d ?? 0} 个完成 turn`}
-          loading={loading}
-        />
-        <StatCard
-          label="30 天显式覆盖率"
-          value={loading ? "…" : pct(stats?.explicit_coverage.last_30d ?? null)}
-          icon={TrendingUp}
-          tone="neutral"
-          hint="评分数 / 完成 turn"
-          loading={loading}
-        />
-        <StatCard
-          label="评分用户"
-          value={stats?.rating_users ?? 0}
-          icon={Users}
-          tone="neutral"
-          hint="去重用户数"
-          loading={loading}
-        />
-        <StatCard
-          label="Trace 完整率"
-          value={loading ? "…" : pct(
-            stats?.trace_completeness && stats.trace_completeness.total > 0
-              ? stats.trace_completeness.with_trace / stats.trace_completeness.total
-              : null,
-          )}
-          icon={Link2}
-          tone="neutral"
-          hint={`${stats?.trace_completeness?.with_trace ?? 0} / ${stats?.trace_completeness?.total ?? 0} 条可追踪`}
-          loading={loading}
-        />
-      </StatCardRow>
-      <StatCardRow>
-        <StatCard
-          label="总体好评率结论"
-          value={loading ? "…" : rateConclusion(overall)}
+          label="总好评率"
+          value={loading ? "…" : pct(overall?.up_rate ?? null)}
           icon={TrendingUp}
           tone={rateTone(overall?.up_rate ?? null, overall?.sample_note)}
-          hint={overall ? `${pct(overall.up_rate)} · ${interval(overall)}` : "加载中"}
+          hint={`${overall ? interval(overall) : "加载中"} · ${stats?.rating_users ?? 0} 位用户`}
           loading={loading}
         />
         <StatCard
@@ -312,6 +268,24 @@ export function ResponseRatings() {
           value={overall?.down ?? 0}
           icon={ThumbsDown}
           tone={((overall?.down ?? 0) > 0 ? "danger" : "neutral") as "danger" | "neutral"}
+          loading={loading}
+        />
+        <StatCard
+          label="近 7 天好评率"
+          value={loading ? "…" : pct(stats?.last_7d.up_rate ?? null)}
+          icon={TrendingUp}
+          tone={rateTone(stats?.last_7d.up_rate ?? null, stats?.last_7d.sample_note)}
+          hint={`${stats ? interval(stats.last_7d) : "加载中"} · ${stats?.last_7d.total ?? 0} 条`}
+          loading={loading}
+        />
+      </StatCardRow>
+      <StatCardRow>
+        <StatCard
+          label="30 天显式覆盖率"
+          value={loading ? "…" : pct(stats?.explicit_coverage.last_30d ?? null)}
+          icon={TrendingUp}
+          tone="neutral"
+          hint={`${stats?.last_30d.total ?? 0} 条评分 / ${stats?.completed_turns.last_30d ?? 0} 个完成 turn`}
           loading={loading}
         />
         <StatCard

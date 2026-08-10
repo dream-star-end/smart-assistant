@@ -1,11 +1,10 @@
-import { Code2, Eye, MessageSquare, Trash2, TriangleAlert, Users } from "lucide-react";
+import { Code2, Eye, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { Markdown } from "../../../components/Markdown";
 import {
   Badge,
   Button,
   IconButton,
-  Input,
   Modal,
   Tabs,
   useConfirm,
@@ -18,8 +17,6 @@ import {
   Pagination,
   SectionCard,
   SelectFilter,
-  StatCard,
-  StatCardRow,
   TimeAgo,
 } from "../../components";
 import { adminGet, adminSend, apiErrorMessage } from "../../lib/adminApi";
@@ -29,8 +26,6 @@ import {
   INBOX_LEVEL_TONE,
   type InboxCategory,
   type InboxMessage,
-  type MessageStatsBreakdown,
-  type MessageStatsResp,
   type MessagesResp,
 } from "./types";
 
@@ -42,10 +37,6 @@ const CATEGORY_LABEL: Record<InboxCategory, string> = {
   operations: "运维",
   marketing: "营销",
 };
-
-function rate(value: number | null): string {
-  return value === null ? "—" : `${(value * 100).toFixed(1)}%`;
-}
 
 /** 邮件状态徽章：未开启邮件推送显 "—"，否则 status + sent/total（tooltip 展开明细）。 */
 function EmailChip({ m }: { m: InboxMessage }) {
@@ -90,10 +81,6 @@ export function HistoryTable({ reloadKey }: { reloadKey: number }) {
   const [detail, setDetail] = useState<InboxMessage | null>(null);
   const [detailMode, setDetailMode] = useState<"preview" | "source">("preview");
   const [category, setCategory] = useState<InboxCategory | "">("");
-  const [sourceType, setSourceType] = useState("");
-  const [stats, setStats] = useState<MessageStatsResp | null>(null);
-  const [statsLoading, setStatsLoading] = useState(true);
-  const [statsError, setStatsError] = useState<Error | null>(null);
 
   const openDetail = (message: InboxMessage) => {
     setDetail(message);
@@ -108,7 +95,6 @@ export function HistoryTable({ reloadKey }: { reloadKey: number }) {
         limit: PAGE_SIZE,
         offset,
         category: category || undefined,
-        source_type: sourceType || undefined,
       });
       setData(r);
     } catch (e) {
@@ -116,23 +102,12 @@ export function HistoryTable({ reloadKey }: { reloadKey: number }) {
     } finally {
       setLoading(false);
     }
-  }, [offset, category, sourceType]);
+  }, [offset, category]);
 
   // offset / 外部 reloadKey（发送后）变化即重拉。
   useEffect(() => {
     void load();
   }, [load, reloadKey]);
-
-  useEffect(() => {
-    let alive = true;
-    setStatsLoading(true);
-    setStatsError(null);
-    adminGet<MessageStatsResp>("/messages/stats", { days: 30 })
-      .then((value) => { if (alive) setStats(value); })
-      .catch((reason) => { if (alive) setStatsError(reason instanceof Error ? reason : new Error(String(reason))); })
-      .finally(() => { if (alive) setStatsLoading(false); });
-    return () => { alive = false; };
-  }, [reloadKey]);
 
   const del = async (m: InboxMessage) => {
     const ok = await confirm({
@@ -197,17 +172,7 @@ export function HistoryTable({ reloadKey }: { reloadKey: number }) {
       width: 110,
       align: "right",
       cellClassName: "tabular-nums text-muted",
-      render: (m) => m.audience_snapshot_status === "captured"
-        ? `${m.read_count} / ${m.recipients}`
-        : <span className="text-faint">— · 历史无快照</span>,
-    },
-    {
-      key: "snapshot",
-      title: "受众快照",
-      width: 100,
-      render: (m) => m.audience_snapshot_status === "captured"
-        ? <Badge tone="success">已固化</Badge>
-        : <Badge tone="neutral">历史不可用</Badge>,
+      render: (m) => `${m.read_count} / ${m.recipients}`,
     },
     { key: "email", title: "邮件", width: 120, render: (m) => <EmailChip m={m} /> },
     {
@@ -231,64 +196,28 @@ export function HistoryTable({ reloadKey }: { reloadKey: number }) {
   const rows = data?.messages ?? [];
   const total = data?.total ?? 0;
 
-  const breakdownColumns: Column<MessageStatsBreakdown>[] = [
-    { key: "name", title: "来源 / 分类", render: (row) => <span className="font-mono text-[12px]">{row.source_type ?? (row.category ? CATEGORY_LABEL[row.category] : "未知")}</span> },
-    { key: "messages", title: "消息", align: "right" },
-    { key: "recipients", title: "收件", align: "right" },
-    { key: "reads", title: "已读", align: "right" },
-    { key: "read_rate", title: "已读率", align: "right", render: (row) => rate(row.read_rate) },
-  ];
-
   return (
-    <div className="flex flex-col gap-4">
-      <SectionCard title="30 天触达效果" hint="仅使用发送时不可变受众快照；历史缺失不猜测">
-        {statsError ? (
-          <p className="text-[13px] text-danger">加载失败：{apiErrorMessage(statsError, "统计加载失败")}</p>
-        ) : (
-          <div className="flex flex-col gap-4">
-            <StatCardRow>
-              <StatCard label="消息" value={stats?.read_funnel.messages ?? 0} icon={MessageSquare} tone="neutral" loading={statsLoading} />
-              <StatCard label="发送收件" value={stats?.read_funnel.recipients ?? 0} icon={Users} tone="info" loading={statsLoading} />
-              <StatCard label="已读" value={stats?.read_funnel.reads ?? 0} icon={Eye} tone="success" hint={rate(stats?.read_funnel.read_rate ?? null)} loading={statsLoading} />
-              <StatCard label="后续行动" value="不可用" icon={TriangleAlert} tone="neutral" hint="尚无可靠 action 归因，不伪造转化" loading={statsLoading} />
-            </StatCardRow>
-            {stats && stats.snapshot_coverage.legacy_unavailable_messages > 0 && (
-              <p className="text-[12px] text-faint">
-                快照覆盖：{stats.snapshot_coverage.captured_messages} 条已固化；{stats.snapshot_coverage.legacy_unavailable_messages} 条历史消息不可计算收件/已读率。
-              </p>
-            )}
-            {stats && (stats.recipient_load.over_20 > 0 || stats.recipient_load.over_100 > 0) && (
-              <div className="rounded-lg border border-warning/30 bg-warning-soft px-3 py-2 text-[12px] text-fg">
-                高负荷提示：{stats.recipient_load.over_20} 位用户近30天收到超过20条，{stats.recipient_load.over_100} 位超过100条；p50 {stats.recipient_load.p50}、p90 {stats.recipient_load.p90}、最高 {stats.recipient_load.max}。仅透明提示，不自动硬频控。
-              </div>
-            )}
-            <div className="grid min-w-0 gap-3 lg:grid-cols-2">
-              <div className="min-w-0">
-                <p className="mb-2 text-[12px] font-semibold text-fg">按来源</p>
-                <DataTable columns={breakdownColumns} rows={stats?.by_source ?? []} rowKey={(row) => `source:${row.source_type}`} loading={statsLoading} emptyTitle="暂无来源统计" />
-              </div>
-              <div className="min-w-0">
-                <p className="mb-2 text-[12px] font-semibold text-fg">按分类</p>
-                <DataTable columns={breakdownColumns} rows={stats?.by_category ?? []} rowKey={(row) => `category:${row.category}`} loading={statsLoading} emptyTitle="暂无分类统计" />
-              </div>
-            </div>
-          </div>
-        )}
-      </SectionCard>
-      <SectionCard
+    <SectionCard
       title="历史消息"
       hint={loading ? "加载中…" : `共 ${total} 条`}
       bodyClassName="px-0 py-0"
     >
       {confirmEl}
-      <div className="flex flex-wrap gap-3 border-b border-border px-4 py-3">
-        <SelectFilter label="分类" value={category} options={[{ label: "全部分类", value: "" }, ...Object.entries(CATEGORY_LABEL).map(([value, label]) => ({ value: value as InboxCategory, label }))]} onChange={(value) => { setOffset(0); setCategory(value as InboxCategory | ""); }} />
-        <Input
-          aria-label="按消息来源筛选"
-          value={sourceType}
-          onChange={(event) => { setOffset(0); setSourceType(event.target.value); }}
-          placeholder="来源，如 cron_delivery / unattributed"
-          className="w-full sm:w-56"
+      <div className="border-b border-border px-4 py-3">
+        <SelectFilter
+          label="分类"
+          value={category}
+          options={[
+            { label: "全部分类", value: "" },
+            ...Object.entries(CATEGORY_LABEL).map(([value, label]) => ({
+              value: value as InboxCategory,
+              label,
+            })),
+          ]}
+          onChange={(value) => {
+            setOffset(0);
+            setCategory(value as InboxCategory | "");
+          }}
         />
       </div>
       {error ? (
@@ -344,9 +273,8 @@ export function HistoryTable({ reloadKey }: { reloadKey: number }) {
               />
               <KeyValue
                 label="站内已读 / 收件人"
-                value={detail.audience_snapshot_status === "captured" ? `${detail.read_count} / ${detail.recipients}` : "历史无受众快照，无法计算"}
+                value={`${detail.read_count} / ${detail.recipients}`}
               />
-              <KeyValue label="发送时受众快照" value={detail.audience_snapshot_status === "captured" ? "已固化" : "历史不可用"} />
               <KeyValue label="分类" value={CATEGORY_LABEL[detail.category]} />
               {detail.thread_key && (
                 <KeyValue
@@ -392,7 +320,6 @@ export function HistoryTable({ reloadKey }: { reloadKey: number }) {
           </div>
         )}
       </Modal>
-      </SectionCard>
-    </div>
+    </SectionCard>
   );
 }

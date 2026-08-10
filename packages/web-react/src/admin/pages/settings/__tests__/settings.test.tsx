@@ -18,11 +18,10 @@ vi.mock("../../../lib/adminApi", () => ({
 // 混合 kind 的设置项，含一个 is_default 项。
 const ROWS = [
   {
-    key: "allow_registration",
+    key: "signup_enabled",
     value: true,
     is_default: false,
     updated_at: "2026-07-01T00:00:00Z",
-    updated_by: "7",
     meta: { kind: "boolean" },
   },
   {
@@ -69,7 +68,7 @@ describe("SettingsPage", () => {
     renderPage();
 
     // 首载完成：所有 key 渲染出来
-    expect(await screen.findByText("allow_registration")).toBeTruthy();
+    expect(await screen.findByText("signup_enabled")).toBeTruthy();
     expect(screen.getByText("signup_free_credits")).toBeTruthy();
     expect(screen.getByText("risk_level")).toBeTruthy();
     expect(screen.getByText("billing_blocklist")).toBeTruthy();
@@ -89,7 +88,7 @@ describe("SettingsPage", () => {
 
   test("boolean 项改开关后保存 → PUT 携带布尔 false", async () => {
     renderPage();
-    const row = await screen.findByTestId("setting-allow_registration");
+    const row = await screen.findByTestId("setting-signup_enabled");
 
     // 初值 true → 点开关切到 false
     const sw = within(row).getByRole("switch");
@@ -97,13 +96,8 @@ describe("SettingsPage", () => {
 
     fireEvent.click(within(row).getByRole("button", { name: "保存" }));
 
-    const dialog = await screen.findByRole("dialog", { name: "确认关键设置变更？" });
-    expect(within(dialog).getByText("true")).toBeTruthy();
-    expect(within(dialog).getByText("false")).toBeTruthy();
-    fireEvent.click(within(dialog).getByRole("button", { name: "确认保存" }));
-
     await waitFor(() =>
-      expect(adminSend).toHaveBeenCalledWith("PUT", "/settings/allow_registration", {
+      expect(adminSend).toHaveBeenCalledWith("PUT", "/settings/signup_enabled", {
         value: false,
         description: "",
       }),
@@ -123,22 +117,11 @@ describe("SettingsPage", () => {
 
     fireEvent.click(within(row).getByRole("button", { name: "保存" }));
 
-    const dialog = await screen.findByRole("dialog", { name: "确认保存设置？" });
-    fireEvent.click(within(dialog).getByRole("button", { name: "确认保存" }));
-
     await waitFor(() => expect(adminSend).toHaveBeenCalledTimes(1));
     const [method, path, body] = adminSend.mock.calls[0];
     expect(method).toBe("PUT");
     expect(path).toBe("/settings/billing_blocklist");
     expect(body.value).toEqual(["alpha.com", "beta.com", "gamma.com"]);
-  });
-
-  test("显示风险等级、更新人和审计深链", async () => {
-    renderPage();
-    const row = await screen.findByTestId("setting-allow_registration");
-    expect(within(row).getByText("关键风险")).toBeTruthy();
-    expect(within(row).getByText((_, el) => el?.textContent === "by #7")).toBeTruthy();
-    expect(within(row).getByText("查看审计").getAttribute("href")).toBe("#tab=audit");
   });
 
   test("number 项空串被拦截，不发请求", async () => {

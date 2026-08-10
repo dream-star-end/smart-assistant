@@ -3466,10 +3466,6 @@ export async function registerCommercial(
     knowledgePlanetAutomation,
     mailer,
     redis: wrapIoredis(redis),
-    literatureDailyUsage: async (key) => {
-      const value = await redis.get(key)
-      return value === null ? 0 : Number(value)
-    },
     turnstileSecret: cfg.TURNSTILE_SECRET,
     turnstileBypass: cfg.TURNSTILE_TEST_BYPASS,
     // 账号级人机验证白名单(2026-07-26 安全整改)。生产上 TURNSTILE_TEST_BYPASS 已被

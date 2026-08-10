@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { adminGet } from "../../lib/adminApi";
-import type { FeedbackListResp, FeedbackRow, FeedbackStatus, FeedbackTotals } from "./types";
+import type { FeedbackListResp, FeedbackRow, FeedbackStatus } from "./types";
 
 const PAGE_SIZE = 50;
 
@@ -12,7 +12,6 @@ export type FeedbackFilters = {
 
 export type FeedbackQueueState = {
   rows: FeedbackRow[];
-  totals: FeedbackTotals | null;
   loading: boolean;
   /** 追加下一页时的加载态（load-more 按钮）。 */
   loadingMore: boolean;
@@ -32,7 +31,6 @@ export type FeedbackQueueState = {
  */
 export function useFeedbackQueue(filters: FeedbackFilters): FeedbackQueueState {
   const [rows, setRows] = useState<FeedbackRow[]>([]);
-  const [totals, setTotals] = useState<FeedbackTotals | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<Error | null>(null);
@@ -68,7 +66,6 @@ export function useFeedbackQueue(filters: FeedbackFilters): FeedbackQueueState {
       };
       setDone(!resp.next_before_created_at || !resp.next_before_id);
       setRows((prev) => (isFirst ? resp.rows : [...prev, ...resp.rows]));
-      setTotals(resp.totals);
     } catch (e) {
       if (mySeq !== seqRef.current) return;
       setError(e instanceof Error ? e : new Error(String(e)));
@@ -104,5 +101,5 @@ export function useFeedbackQueue(filters: FeedbackFilters): FeedbackQueueState {
     setRows((prev) => prev.map((r) => (r.id === next.id ? next : r)));
   }, []);
 
-  return { rows, totals, loading, loadingMore, error, done, loadMore, refresh, patchRow };
+  return { rows, loading, loadingMore, error, done, loadMore, refresh, patchRow };
 }
