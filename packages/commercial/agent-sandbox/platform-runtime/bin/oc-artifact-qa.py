@@ -21,9 +21,6 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
-from PIL import Image
-
-
 TOOL = "oc-artifact-qa"
 SELF_ROOT = Path(__file__).resolve().parent.parent
 SCHEMA_VERSION = 1
@@ -213,6 +210,11 @@ def make_contact_sheets(
     timeout_seconds: int,
 ) -> list[Path]:
     if not pages:
+        return []
+    try:
+        from PIL import Image
+    except Exception as error:
+        add_issue(report, "warnings", "contact-sheet-failed", str(error))
         return []
     contacts = output_dir / "contact-sheets"
     contacts.mkdir(parents=True, exist_ok=False)

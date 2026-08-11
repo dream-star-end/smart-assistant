@@ -21,6 +21,16 @@ const CLI = join(
   REPO_ROOT,
   'packages/commercial/agent-sandbox/platform-runtime/bin/oc-artifact-qa.py',
 )
+const HAS_PILLOW = (() => {
+  try {
+    execFileSync(process.env.PYTHON ?? '/usr/bin/python3', ['-c', 'from PIL import Image'], {
+      stdio: 'ignore',
+    })
+    return true
+  } catch {
+    return false
+  }
+})()
 
 function run(args: string[], env: NodeJS.ProcessEnv): Promise<RunResult> {
   return new Promise((done, reject) => {
@@ -67,7 +77,7 @@ function fakePdfEnvironment(root: string): { bin: string; site: string } {
       'set -e',
       'out="${@: -1}"',
       'for i in $(/usr/bin/seq 1 "${OC_FAKE_PAGE_COUNT:-1}"); do',
-      "  /usr/bin/python3 -c 'from PIL import Image; import sys; i=int(sys.argv[1]); Image.new(\"RGB\",(480,360),(i,0,0)).save(sys.argv[2])' \"$i\" \"${out}-${i}.png\"",
+      "  /usr/bin/python3 -c 'import sys; i=int(sys.argv[1]); open(sys.argv[2],\"wb\").write(b\"P6\\n480 360\\n255\\n\" + bytes((i,0,0)) * (480*360))' \"$i\" \"${out}-${i}.png\"",
       'done',
       '',
     ].join('\n'),
@@ -105,7 +115,11 @@ describe('oc-artifact-qa', () => {
       assert.equal(report.input.sha256, before)
       assert.equal(report.facts.pageCount, 1)
       assert.equal(report.renderedPages.length, 1)
-      assert.equal(report.contactSheets.length, 1)
+      assert.equal(report.contactSheets.length, HAS_PILLOW ? 1 : 0)
+      assert.equal(
+        report.warnings.some((warning: any) => warning.code === 'contact-sheet-failed'),
+        !HAS_PILLOW,
+      )
       assert.equal(createHash('sha256').update(readFileSync(input)).digest('hex'), before)
       assert.deepEqual(JSON.parse(result.stdout), report)
     } finally {
@@ -153,11 +167,12 @@ describe('oc-artifact-qa', () => {
       assert.equal(report.facts.pageCount, 17)
       assert.equal(report.renderedPages.length, 17)
       assert.match(report.renderedPages[16], /page-17\.png$/)
-      assert.equal(report.contactSheets.length, 2)
-      assert.equal(
-        report.warnings.some((warning: any) => warning.code === 'contact-sheet-failed'),
-        false,
+      assert.equal(report.contactSheets.length, HAS_PILLOW ? 2 : 0)
+      const contactFailed = report.warnings.some(
+        (warning: any) => warning.code === 'contact-sheet-failed',
       )
+      assert.equal(contactFailed, !HAS_PILLOW)
+      if (!HAS_PILLOW) return
       const first = report.contactSheets[0]
       const second = report.contactSheets[1]
       assert.deepEqual(pngSize(first), { width: 1944, height: 1464 })
