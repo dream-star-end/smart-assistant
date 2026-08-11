@@ -7,8 +7,14 @@ const SHELL_UNSUPPORTED_RESULT: string = 'aurora-native-shell-unsupported-v1';
 const ACTION_BLOCKED_RESULT: string = 'aurora-native-action-blocked-v1';
 const ACTION_UNSUPPORTED_RESULT: string = 'aurora-native-action-unsupported-v1';
 const ACTION_CLICKED_RESULT: string = 'aurora-native-action-clicked-v1';
+const TOP_LAYER_DISMISS_REQUESTED_RESULT: string =
+  'aurora-native-top-layer-dismiss-requested-v1';
+const MOBILE_SESSION_DISMISS_SELECTOR: string =
+  '[data-aurora-native-dismiss="mobile-session-v1"][data-state="open"]';
 
 export const SHELL_READY_RESULT: string = 'aurora-native-shell-ready-v1';
+export const SHELL_TOP_LAYER_READY_RESULT: string =
+  'aurora-native-shell-top-layer-ready-v1';
 export const SHELL_LIFECYCLE_BRIDGE_NAME: string = 'auroraNativeShellLifecycleV1';
 export const SHELL_LIFECYCLE_BRIDGE_METHOD: string = 'contractChanged';
 
@@ -107,7 +113,8 @@ export function buildShellActivationScript(expectedGeneration: number): string {
     '    }',
     '    document.documentElement.removeAttribute(marker);',
     '  };',
-    '  if (rootNodes.length !== 1 || !(root instanceof HTMLElement) || document.head === null) {',
+    '  if (rootNodes.length !== 1 || !(root instanceof HTMLElement) ||',
+    '    document.head === null || document.body === null) {',
     '    clearStaleShell();',
     `    return '${SHELL_UNSUPPORTED_RESULT}';`,
     '  }',
@@ -115,19 +122,25 @@ export function buildShellActivationScript(expectedGeneration: number): string {
     '    const headerNodes = root.querySelectorAll(\'[data-product-entry-scope="chat-header"]\');',
     '    const agentNodes = root.querySelectorAll(\'button[data-product-feature="agents"]\');',
     '    const modelNodes = root.querySelectorAll(\'button[aria-label="选择对话模型"]\');',
+    `    const topLayerNodes = document.querySelectorAll('${MOBILE_SESSION_DISMISS_SELECTOR}');`,
     '    const header = headerNodes.item(0);',
     '    const agent = agentNodes.item(0);',
     '    const model = modelNodes.item(0);',
     '    const contractSupported = headerNodes.length === 1 && agentNodes.length === 1 &&',
     '      modelNodes.length === 1 && header instanceof HTMLElement &&',
     '      agent instanceof HTMLElement && model instanceof HTMLElement &&',
-    '      agent.parentElement === header && model.parentElement === header;',
+    '      agent.parentElement === header && model.parentElement === header &&',
+    '      topLayerNodes.length <= 1;',
+    '    const topLayerOpen = topLayerNodes.length === 1 &&',
+    '      topLayerNodes.item(0) instanceof HTMLElement;',
     "    const fingerprint = String(headerNodes.length) + ':' + String(agentNodes.length) + ':' +",
-    "      String(modelNodes.length) + ':' + (contractSupported ? '1' : '0');",
+    "      String(modelNodes.length) + ':' + String(topLayerNodes.length) + ':' +",
+    "      (contractSupported ? '1' : '0');",
     '    return {',
     '      header: header,',
     '      agent: agent,',
     '      model: model,',
+    '      topLayerOpen: topLayerOpen,',
     '      contractSupported: contractSupported,',
     '      fingerprint: fingerprint',
     '    };',
@@ -183,11 +196,12 @@ export function buildShellActivationScript(expectedGeneration: number): string {
     '        frameId = requestAnimationFrame(flushContractChange);',
     '      }',
     '    });',
-    '    observer.observe(root, {',
+    '    observer.observe(document.body, {',
     '      childList: true,',
     '      subtree: true,',
     '      attributes: true,',
-    "      attributeFilter: ['data-product-entry-scope', 'data-product-feature', 'aria-label']",
+    "      attributeFilter: ['data-product-entry-scope', 'data-product-feature', 'aria-label',",
+    "        'data-aurora-native-dismiss', 'data-state']",
     '    });',
     '    const observerRecord = {',
     '      generation: expectedGeneration,',
@@ -224,12 +238,11 @@ export function buildShellActivationScript(expectedGeneration: number): string {
     '  }',
     '  document.documentElement.setAttribute(marker, expectedGenerationText);',
     '  style.textContent =',
-    '    \'[data-product-entry-scope="chat-header"]{display:flex!important;height:44px!important;min-height:44px!important;padding:0 12px 4px!important;gap:6px!important;border-bottom:1px solid var(--border)!important;background:var(--surface)!important;}\' +',
+    '    \'[data-product-entry-scope="chat-header"]{display:flex!important;box-sizing:border-box!important;height:52px!important;min-height:52px!important;padding:0 56px!important;gap:2px!important;justify-content:center!important;border-bottom:0!important;background:var(--bg)!important;}\' +',
     '    \'[data-product-entry-scope="chat-header"]>*{display:none!important;}\' +',
     '    \'[data-product-entry-scope="chat-header"]>button[data-product-feature="agents"],[data-product-entry-scope="chat-header"]>button[aria-label="选择对话模型"]{display:flex!important;}\' +',
-    '    \'[data-product-entry-scope="chat-header"]>button[data-product-feature="agents"]{min-width:0!important;flex:1 1 auto!important;}\' +',
-    '    \'[data-product-entry-scope="chat-header"]>button[aria-label="选择对话模型"]{flex:0 1 auto!important;max-width:48%!important;}\';',
-    `  return '${SHELL_READY_RESULT}';`,
+    '    \'[data-product-entry-scope="chat-header"]>button[data-product-feature="agents"],[data-product-entry-scope="chat-header"]>button[aria-label="选择对话模型"]{min-width:0!important;flex:0 1 auto!important;max-width:50%!important;}\';',
+    `  return contract.topLayerOpen ? '${SHELL_TOP_LAYER_READY_RESULT}' : '${SHELL_READY_RESULT}';`,
     '})();'
   ].join('\n');
 }
@@ -296,6 +309,31 @@ export function buildWebActionScript(action: NativeWebAction, expectedGeneration
   ].join('\n');
 }
 
+export function buildTopLayerDismissScript(expectedGeneration: number): string {
+  return [
+    '(() => {',
+    `  if (location.origin !== '${PRIMARY_ORIGIN}') {`,
+    `    return '${ACTION_BLOCKED_RESULT}';`,
+    '  }',
+    `  if (document.documentElement.getAttribute('${SHELL_MARKER}') !== '${expectedGeneration}') {`,
+    `    return '${ACTION_BLOCKED_RESULT}';`,
+    '  }',
+    `  const targets = document.querySelectorAll('${MOBILE_SESSION_DISMISS_SELECTOR}');`,
+    '  const target = targets.item(0);',
+    '  if (targets.length !== 1 || !(target instanceof HTMLElement)) {',
+    `    return '${ACTION_UNSUPPORTED_RESULT}';`,
+    '  }',
+    "  target.dispatchEvent(new KeyboardEvent('keydown', {",
+    "    key: 'Escape',",
+    "    code: 'Escape',",
+    '    bubbles: true,',
+    '    cancelable: true',
+    '  }));',
+    `  return '${TOP_LAYER_DISMISS_REQUESTED_RESULT}';`,
+    '})();'
+  ].join('\n');
+}
+
 export function shouldAcceptWebAction(
   startedGeneration: number,
   currentGeneration: number,
@@ -309,6 +347,19 @@ export function shouldAcceptWebAction(
     clickedResult;
 }
 
+export function shouldAcceptTopLayerDismiss(
+  startedGeneration: number,
+  currentGeneration: number,
+  currentUrl: string,
+  scriptResult: string
+): boolean {
+  const requestedResult: boolean = scriptResult === TOP_LAYER_DISMISS_REQUESTED_RESULT ||
+    scriptResult === `"${TOP_LAYER_DISMISS_REQUESTED_RESULT}"`;
+  return startedGeneration === currentGeneration &&
+    hasExactPrimaryOrigin(currentUrl) &&
+    requestedResult;
+}
+
 export function shouldAcceptShellActivation(
   startedGeneration: number,
   currentGeneration: number,
@@ -316,10 +367,25 @@ export function shouldAcceptShellActivation(
   scriptResult: string
 ): boolean {
   const readyResult: boolean = scriptResult === SHELL_READY_RESULT ||
-    scriptResult === `"${SHELL_READY_RESULT}"`;
+    scriptResult === `"${SHELL_READY_RESULT}"` ||
+    scriptResult === SHELL_TOP_LAYER_READY_RESULT ||
+    scriptResult === `"${SHELL_TOP_LAYER_READY_RESULT}"`;
   return startedGeneration === currentGeneration &&
     hasExactPrimaryOrigin(currentUrl) &&
     readyResult;
+}
+
+export function shouldExposeNativeHeaderControls(
+  startedGeneration: number,
+  currentGeneration: number,
+  currentUrl: string,
+  scriptResult: string
+): boolean {
+  const readyWithoutTopLayer: boolean = scriptResult === SHELL_READY_RESULT ||
+    scriptResult === `"${SHELL_READY_RESULT}"`;
+  return startedGeneration === currentGeneration &&
+    hasExactPrimaryOrigin(currentUrl) &&
+    readyWithoutTopLayer;
 }
 
 export function isShellUnsupportedResult(scriptResult: string): boolean {

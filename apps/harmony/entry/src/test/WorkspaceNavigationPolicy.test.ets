@@ -7,18 +7,26 @@ import {
   decideWebBack,
   hasRoute,
   PendingWebAction,
+  shouldAttemptTopLayerDismiss,
   shouldCreateFreshWebController,
+  shouldOpenInitialConversation,
   shouldPushRoute,
+  shouldTerminateAfterBackgroundFailure,
   WebBackAction
 } from '../main/ets/common/WorkspaceNavigationPolicy';
 
 export default function workspaceNavigationPolicyTest(): void {
   describe('WorkspaceNavigationPolicy', () => {
-    it('treats an empty path stack as the native home', 0, () => {
-      const homePathNames: string[] = [];
-      expect(hasRoute(homePathNames, AURORA_WEB_ROUTE)).assertFalse();
-      expect(shouldPushRoute(homePathNames, AURORA_WEB_ROUTE)).assertTrue();
-      expect(shouldCreateFreshWebController(hasRoute(homePathNames, AURORA_WEB_ROUTE))).assertTrue();
+    it('treats an empty path stack as the one-time launch surface', 0, () => {
+      const launchPathNames: string[] = [];
+      expect(hasRoute(launchPathNames, AURORA_WEB_ROUTE)).assertFalse();
+      expect(shouldPushRoute(launchPathNames, AURORA_WEB_ROUTE)).assertTrue();
+      expect(shouldCreateFreshWebController(hasRoute(launchPathNames, AURORA_WEB_ROUTE)))
+        .assertTrue();
+      expect(shouldOpenInitialConversation(launchPathNames)).assertTrue();
+      expect(shouldOpenInitialConversation([AURORA_WEB_ROUTE])).assertFalse();
+      expect(shouldOpenInitialConversation([AURORA_WEB_ROUTE, AURORA_SETTINGS_ROUTE]))
+        .assertFalse();
     });
 
     it('does not push the current destination twice', 0, () => {
@@ -60,9 +68,21 @@ export default function workspaceNavigationPolicyTest(): void {
       expect(decideWebBack(false, true, false)).assertEqual(WebBackAction.CANCEL_ACTIVE_OAUTH);
     });
 
-    it('uses ordinary web history before returning home', 0, () => {
+    it('uses ordinary web history before backgrounding the app', 0, () => {
       expect(decideWebBack(false, false, true)).assertEqual(WebBackAction.WEB_BACKWARD);
-      expect(decideWebBack(false, false, false)).assertEqual(WebBackAction.POP_TO_HOME);
+      expect(decideWebBack(false, false, false)).assertEqual(WebBackAction.BACKGROUND_APP);
+      expect(shouldTerminateAfterBackgroundFailure(16000061)).assertTrue();
+      expect(shouldTerminateAfterBackgroundFailure(16000011)).assertFalse();
+      expect(shouldTerminateAfterBackgroundFailure(16000050)).assertFalse();
+      expect(shouldTerminateAfterBackgroundFailure(16000065)).assertFalse();
+      expect(shouldTerminateAfterBackgroundFailure(16000066)).assertFalse();
+      expect(shouldTerminateAfterBackgroundFailure(undefined)).assertFalse();
+    });
+
+    it('keeps the top-layer probe eligible while visual shell readiness is reevaluated', 0, () => {
+      expect(shouldAttemptTopLayerDismiss(true, true)).assertTrue();
+      expect(shouldAttemptTopLayerDismiss(false, true)).assertFalse();
+      expect(shouldAttemptTopLayerDismiss(true, false)).assertFalse();
     });
 
     it('keeps pending web actions as a closed native enum', 0, () => {

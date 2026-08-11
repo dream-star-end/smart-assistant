@@ -1,6 +1,7 @@
 import { url } from '@kit.ArkTS';
 
 export const APP_HOME_URL: string = 'https://claudeai.chat/';
+export const APP_CLIENT_URL: string = 'https://claudeai.chat/?client=harmony';
 
 const PRIMARY_HOST: string = 'claudeai.chat';
 const OAUTH_CALLBACK_PATHS: Array<string> = [

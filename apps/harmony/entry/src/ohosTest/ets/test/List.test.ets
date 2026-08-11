@@ -6,6 +6,7 @@ import networkStateClockTest from '../../../test/NetworkStateClock.test';
 import shellEvaluationClockTest from '../../../test/ShellEvaluationClock.test';
 import shellLifecycleBridgeTest from '../../../test/ShellLifecycleBridge.test';
 import workspaceNavigationPolicyTest from '../../../test/WorkspaceNavigationPolicy.test';
+import workspaceUiFixtureTest from '../../../test/WorkspaceUiFixture.test';
 import workspaceUiTest from './WorkspaceUi.test';
 
 export default function testsuite(): void {
@@ -17,5 +18,6 @@ export default function testsuite(): void {
   shellEvaluationClockTest();
   shellLifecycleBridgeTest();
   workspaceNavigationPolicyTest();
+  workspaceUiFixtureTest();
   workspaceUiTest();
 }

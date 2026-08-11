@@ -153,18 +153,6 @@
       "value": "用于在对话中发送语音消息"
     },
     {
-      "name": "home_title",
-      "value": "Aurora 工作台"
-    },
-    {
-      "name": "home_summary",
-      "value": "专注对话与创作，随时进入你的 AI 工作空间。"
-    },
-    {
-      "name": "enter_conversation",
-      "value": "进入对话"
-    },
-    {
       "name": "settings",
       "value": "设置"
     },
@@ -173,40 +161,12 @@
       "value": "打开设置"
     },
     {
-      "name": "home_harmony_features",
-      "value": "HarmonyOS 原生体验"
-    },
-    {
       "name": "system_share",
       "value": "系统分享"
     },
     {
       "name": "system_share_hint",
       "value": "通过系统分享面板发送 Aurora"
-    },
-    {
-      "name": "system_file_picker",
-      "value": "系统文件选择"
-    },
-    {
-      "name": "system_file_picker_hint",
-      "value": "从系统文档选择器安全添加文件"
-    },
-    {
-      "name": "voice_input",
-      "value": "语音输入"
-    },
-    {
-      "name": "voice_input_hint",
-      "value": "按需申请麦克风权限，不在后台录音"
-    },
-    {
-      "name": "safe_session",
-      "value": "安全会话"
-    },
-    {
-      "name": "safe_session_hint",
-      "value": "登录和对话仍由受限会话层单一管理"
     },
     {
       "name": "conversation_section",

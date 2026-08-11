@@ -1,5 +1,7 @@
 import { describe, expect, it } from '@ohos/hypium';
 import {
+  APP_CLIENT_URL,
+  APP_HOME_URL,
   classifyNavigationUrl,
   isOauthCandidateUrl,
   isPrimaryAppOrigin,
@@ -10,6 +12,12 @@ import {
 
 export default function navigationPolicyTest(): void {
   describe('NavigationPolicy', () => {
+    it('separates the app entry from the public share URL', 0, () => {
+      expect(APP_HOME_URL).assertEqual('https://claudeai.chat/');
+      expect(APP_CLIENT_URL).assertEqual('https://claudeai.chat/?client=harmony');
+      expect(classifyNavigationUrl(APP_CLIENT_URL)).assertEqual(NavigationDecision.IN_APP);
+    });
+
     it('keeps only the primary app in ArkWeb by default', 0, () => {
       expect(classifyNavigationUrl('https://claudeai.chat/chat/123?source=app#latest'))
         .assertEqual(NavigationDecision.IN_APP);

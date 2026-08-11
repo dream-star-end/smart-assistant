@@ -83,18 +83,35 @@ Harmony app 需要共享 server/protocol/web 变更时,共享改动仍从 `feat/
 另开标准 worktree、走受保护 PR;验证兼容后再把所需提交有意同步到 app 分支。禁止反过来从
 app 分支部署 v5 server。
 
-产品架构是 **native-first ArkUI + 受限 ArkWeb compat**,不是给网页版套壳。导航、会话入口、
-设置、loading/error/offline、键盘与安全区、上传下载/分享/麦克风/通知等系统能力优先做原生适配;
-登录、会话、计费、连接器与 WebSocket 继续复用 server 权威,禁止复制第二套业务状态机或在原生层
-持久化 access/refresh credential。
+产品架构是参照 ChatGPT 移动端信息架构的 **chat-first native shell + 受限 ArkWeb compat**，
+不是营销工作台，也不是给完整网页套一层无差别 WebView。对话就是首页：只有冷启动且 Navigation
+path stack 为空时，原生层才自动进入对话 Web；禁止再增加“工作台”“进入对话”CTA 或把 Web pop
+回中转页。会话列表、消息时间线、智能体/模型选择和 Composer 都以 Web 为权威；ArkUI 只覆盖顶栏
+两侧的会话入口与设置，以及 loading/error/offline、键盘与安全区、OAuth 域名确认、上传下载、
+分享、麦克风、通知等系统适配。禁止复制第二套业务状态机或在原生层持久化 access/refresh
+credential。
 
-冷启动根页面必须是有实际用途的 ArkUI 工作台,Web 只在用户点击“进入对话”后创建。设置使用
-独立全屏路由,禁止回退为悬浮“应用控制”面板;设置覆盖 Web 时保留 controller,Web pop 回工作台
-前先使生命周期 epoch/异步回调失效,下次 CTA 才创建新 controller。ArkWeb active 状态必须由
-destination active 与 controller attached 双闸经单一幂等 reconcile 收口。设置发出的 reload 等
-pending action 只在双闸就绪后消费一次。系统分享只发固定公开首页 URL,不得从 Web 读取页面文字、
-会话 URL、storage、cookie 或 token。下载必须绑定 Web 实例 epoch;Web pop/组件销毁前取消 active
-`WebDownloadItem` 并清目标缓存,旧 delegate finish/fail 只允许清理,不得再弹保存器或 Toast。
+对话只呈现一层 52vp 顶栏：中间保留 Web 的智能体/模型 selector，两侧由 ArkUI 提供会话和设置
+按钮；selector 契约失败时必须 rollback 并显示未修改的安全 Web，不能留下残缺或双层顶栏。设置
+使用独立全屏二级路由，覆盖 Web 时保留同一个 controller。ArkWeb active 状态必须由 destination
+active 与 controller attached 双闸经单一幂等 reconcile 收口；设置发出的 reload 等 pending
+action 只在双闸就绪后消费一次。
+
+移动会话 Sheet 打开时，Web companion 必须暴露唯一、版本化的 `mobile-session-v1` 标记；同一
+generation observer 识别到该标记后，原生层保留已验证的 Web shell，但暂时隐藏左右按钮、离线条
+和进度条，避免覆盖抽屉与 scrim。标记关闭后再恢复这些 overlay；重复标记必须 fail closed。
+
+系统返回必须按纯策略有序执行：pending OAuth 确认 → OAuth 内部 history/取消 → 通过显式、
+版本化的 mobile-session 契约关闭 Web 顶层 → 普通 Web history →
+`moveAbilityToBackground()`；仅在不支持进入后台的 2in1 设备上使用 ability terminate fallback。
+不要通过 pop/dispose 回到已删除的工作台，也不要为再次进入对话创建新 controller。系统分享只发
+固定公开首页 URL，不得从 Web 读取页面文字、会话 URL、storage、cookie 或 token。下载必须绑定
+Web 实例 epoch；只在 Web 实例真正销毁时取消 active `WebDownloadItem` 并清目标缓存，旧 delegate
+finish/fail 只允许清理，不得再弹保存器或 Toast。
+
+Harmony Web 入口使用 `?client=harmony`。未登录 AuthGate 属于共享 Web companion 改动，必须从
+`feat/v5-aurora-rewrite` 另开独立分支并走受保护 PR，验证后再把兼容提交显式同步到 app 分支；
+不得在 app worktree 混改共享 Web，更不得从 app 分支部署 server/web。
 
 **compat-v1 安全边界必须同时满足**:
 
@@ -122,14 +139,22 @@ pending action 只在双闸就绪后消费一次。系统分享只发固定公�
 per-navigation nonce 与窄 command/event allowlist 绑定在协议中,任一不匹配 fail closed,
 并禁止承载认证秘密。
 
-验收分两层:模拟器实跑冷/热启动、原生导航/返回、offline/retry、键盘/窗口、selector-missing
-fallback、旧 generation 丢弃、外链/OAuth 域名确认、上传下载;签名真机再跑麦克风权限、系统文档
-选择/保存、无刷新登录→原生栏出现、SPA 登出→原生栏消失、外部浏览器往返、前后台恢复、网络
-切换、通知/分享(若涉及)、性能/功耗与 crash/hilog。
+验收分两层：模拟器实跑空 path stack 冷启动直达对话、热启动不重复 push、单层 52vp 顶栏、
+全屏设置覆盖/返回、上述返回优先级、offline/retry、键盘/窗口、selector-missing 回退未修改 Web、
+旧 generation 丢弃、外链/OAuth 域名确认、上传下载；签名真机再跑麦克风权限、系统文档选择/保存、
+未登录 `?client=harmony` AuthGate、无刷新登录→原生栏出现、SPA 登出→原生栏消失、外部浏览器
+往返、手机/平板进入后台、2in1 terminate fallback、前后台恢复、网络切换、通知/分享(若涉及)、
+性能/功耗与 crash/hilog。
 构建成功或只编出 ohosTest HAP 不等于真机验收完成。所有构建、运行、设备与日志动作统一走
 `devecocli`;仪器化旅程必须先用 `devecocli run --module entry` 安装本轮主 HAP,再安装测试 HAP并通过
 `aa test ... OpenHarmonyTestRunner` 启动。直接启动 `TestAbility` 时 AbilityDelegator 不可用,
 不能作为 UI 测试通过证据。
+确定性 UI 旅程只允许在显式 `test` build mode 从 `about:blank` 启动，再以主站为 `baseUrl` 通过
+`WebviewController.loadData` 载入本地无账号 compat 文档，并只放行生成的内部 data 文档 URL；
+`debug`/`release` 始终解析到生产 `?client=harmony`。测试必须真实走原生 compat 控件、
+抽屉 overlay 隐藏 → 系统 Back → 恢复、全屏设置和 reload，并校验 Web controller 身份未重建；
+控件缺失时 fail-loud，禁止用条件分支把未执行的旅程计为通过。完成后无卸载重装 debug 主 HAP，
+恢复生产入口且保留现有应用数据。
 
 ### 2.2 v5 设计原则(与 v3 的关键差异)
 - **v5 未全量上线 → 放开走最优解**:发现次优结构就大胆重构(换抽象/删旧机制/改数据模型),不为"改动小"迁就。架构妥协零容忍;v3 仍守现网约束。

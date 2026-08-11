@@ -2,13 +2,17 @@ import { describe, expect, it } from '@ohos/hypium';
 import {
   buildShellActivationScript,
   buildShellRollbackScript,
+  buildTopLayerDismissScript,
   buildWebActionScript,
   isShellUnsupportedResult,
   NativeWebAction,
   SHELL_LIFECYCLE_BRIDGE_METHOD,
   SHELL_LIFECYCLE_BRIDGE_NAME,
   SHELL_READY_RESULT,
+  SHELL_TOP_LAYER_READY_RESULT,
   shouldAcceptShellActivation,
+  shouldExposeNativeHeaderControls,
+  shouldAcceptTopLayerDismiss,
   shouldAcceptWebAction
 } from '../main/ets/common/NativeShellPolicy';
 
@@ -17,6 +21,8 @@ const STYLE_ID: string = 'aurora-native-shell-v1-style';
 const HEADER_SELECTOR: string = '[data-product-entry-scope="chat-header"]';
 const AGENT_SELECTOR: string = 'button[data-product-feature="agents"]';
 const MODEL_SELECTOR: string = 'button[aria-label="选择对话模型"]';
+const MOBILE_SESSION_DISMISS_SELECTOR: string =
+  '[data-aurora-native-dismiss="mobile-session-v1"][data-state="open"]';
 
 function occurrenceCount(value: string, token: string): number {
   let count: number = 0;
@@ -69,6 +75,16 @@ export default function nativeShellPolicyTest(): void {
       expect(script.indexOf(`${HEADER_SELECTOR}>${MODEL_SELECTOR}`) >= 0).assertTrue();
     });
 
+    it('merges native edge controls into one centered ChatGPT-style header row', 0, () => {
+      const script: string = buildShellActivationScript(21);
+      expect(script.indexOf('height:52px!important') >= 0).assertTrue();
+      expect(script.indexOf('padding:0 56px!important') >= 0).assertTrue();
+      expect(script.indexOf('justify-content:center!important') >= 0).assertTrue();
+      expect(script.indexOf('border-bottom:0!important') >= 0).assertTrue();
+      expect(script.indexOf('flex:0 1 auto!important') >= 0).assertTrue();
+      expect(script.indexOf('flex:1 1 auto!important') < 0).assertTrue();
+    });
+
     it('falls back when either retained control is missing or duplicated', 0, () => {
       const script: string = buildShellActivationScript(21);
       const headerLookup: number = script.indexOf(`root.querySelectorAll('${HEADER_SELECTOR}')`);
@@ -117,7 +133,7 @@ export default function nativeShellPolicyTest(): void {
         .assertTrue();
       expect(script.indexOf('requestAnimationFrame(flushContractChange)') >= 0).assertTrue();
       expect(script.indexOf('characterData') < 0).assertTrue();
-      expect(script.indexOf("attributeFilter: ['data-product-entry-scope', 'data-product-feature', 'aria-label']") >= 0)
+      expect(script.indexOf("'data-aurora-native-dismiss', 'data-state'") >= 0)
         .assertTrue();
     });
 
@@ -163,6 +179,77 @@ export default function nativeShellPolicyTest(): void {
       expect(actionMarkerCheck >= 0).assertTrue();
       expect(actionMarkerCheck < action.indexOf('document.querySelectorAll')).assertTrue();
       expect(actionMarkerCheck < action.indexOf('target.click();')).assertTrue();
+    });
+
+    it('dismisses only the explicit versioned mobile-session top layer', 0, () => {
+      const script: string = buildTopLayerDismissScript(21);
+      const originGuard: number = script.indexOf(ORIGIN_GUARD);
+      const markerGuard: number = script.indexOf(
+        "getAttribute('data-aurora-native-shell-v1') !== '21'"
+      );
+      const targetLookup: number = script.indexOf(
+        `document.querySelectorAll('${MOBILE_SESSION_DISMISS_SELECTOR}')`
+      );
+      expect(originGuard >= 0).assertTrue();
+      expect(markerGuard > originGuard).assertTrue();
+      expect(targetLookup > markerGuard).assertTrue();
+      expect(script.indexOf('targets.length !== 1') > targetLookup).assertTrue();
+      expect(script.indexOf("new KeyboardEvent('keydown'") > targetLookup).assertTrue();
+      expect(script.indexOf("key: 'Escape'") > targetLookup).assertTrue();
+      expect(script.indexOf('[role="dialog"]') < 0).assertTrue();
+      expect(script.indexOf('document.cookie') < 0).assertTrue();
+      expect(script.indexOf('localStorage') < 0).assertTrue();
+      expect(script.indexOf('innerText') < 0).assertTrue();
+      expect(shouldAcceptTopLayerDismiss(
+        21,
+        21,
+        'https://claudeai.chat/s/session-1?client=harmony',
+        'aurora-native-top-layer-dismiss-requested-v1'
+      )).assertTrue();
+      expect(shouldAcceptTopLayerDismiss(
+        20,
+        21,
+        'https://claudeai.chat/s/session-1?client=harmony',
+        'aurora-native-top-layer-dismiss-requested-v1'
+      )).assertFalse();
+      expect(shouldAcceptTopLayerDismiss(
+        21,
+        21,
+        'https://evil.claudeai.chat/',
+        'aurora-native-top-layer-dismiss-requested-v1'
+      )).assertFalse();
+    });
+
+    it('suspends native edge controls while the versioned mobile session sheet is open', 0, () => {
+      const script: string = buildShellActivationScript(21);
+      const targetLookup: number = script.indexOf(
+        `document.querySelectorAll('${MOBILE_SESSION_DISMISS_SELECTOR}')`
+      );
+      expect(targetLookup >= 0).assertTrue();
+      expect(script.indexOf('topLayerNodes.length <= 1') > targetLookup).assertTrue();
+      expect(script.indexOf("String(topLayerNodes.length) + ':'") > targetLookup).assertTrue();
+      expect(script.indexOf('observer.observe(document.body') > targetLookup).assertTrue();
+      expect(script.indexOf(
+        `contract.topLayerOpen ? '${SHELL_TOP_LAYER_READY_RESULT}' : '${SHELL_READY_RESULT}'`
+      ) > targetLookup).assertTrue();
+      expect(shouldAcceptShellActivation(
+        21,
+        21,
+        'https://claudeai.chat/s/session-1?client=harmony',
+        SHELL_TOP_LAYER_READY_RESULT
+      )).assertTrue();
+      expect(shouldExposeNativeHeaderControls(
+        21,
+        21,
+        'https://claudeai.chat/s/session-1?client=harmony',
+        SHELL_TOP_LAYER_READY_RESULT
+      )).assertFalse();
+      expect(shouldExposeNativeHeaderControls(
+        21,
+        21,
+        'https://claudeai.chat/s/session-1?client=harmony',
+        SHELL_READY_RESULT
+      )).assertTrue();
     });
 
     it('keeps a newer generation intact when an old rollback arrives late', 0, () => {

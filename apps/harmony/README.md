@@ -1,24 +1,35 @@
 # Aurora HarmonyOS
 
 OpenClaude v5 商业版的 HarmonyOS NEXT 独立客户端，长期在
-`feat/v5-harmony-app` 分支单独演进。产品采用 **native-first ArkUI + 受限 ArkWeb
-compat**，不是把完整移动网页直接套进 WebView：
+`feat/v5-harmony-app` 分支单独演进。产品采用参照 ChatGPT 移动端信息架构的
+**chat-first native shell + 受限 ArkWeb compat**，不是营销工作台，也不是把整站直接套进
+WebView：
 
-- ArkUI 负责工作台、应用导航栏、连接/离线状态、冷/热加载、全屏设置、安全区、系统返回与 OAuth 域名确认。
-- 对话页只保留 Web 的智能体/模型上下文条、消息时间线和 Composer，避免出现双顶栏或复制第二套聊天状态机。
-- 文件选择/保存、麦克风授权、系统浏览器跳转和下载缓存清理使用 HarmonyOS 系统能力。
-- 登录、会话恢复、WebSocket、计费和连接器仍以 v5 server 为唯一业务权威。
+- 对话就是首页；只有在冷启动且 Navigation path stack 为空时，原生层才自动进入对话 Web，
+  不再提供“工作台”或“进入对话”中转页。
+- 会话列表、消息时间线、智能体/模型选择和 Composer 始终由 Web 负责；ArkUI 不复制业务状态，
+  只覆盖左侧会话入口、右侧设置以及离线、OAuth、安全区和系统返回等原生外壳能力。
+- 对话页只呈现一层 52vp 顶栏：中间保留 Web 的智能体/模型控件，两侧由 ArkUI 提供会话和设置
+  按钮。compat selector 缺失、重复或结构漂移时停止增强并完整回退未修改的 Web。
+- Web 会话抽屉的显式 `mobile-session-v1` 标记打开时，原生左右按钮、离线条和进度条会暂时隐藏，
+  关闭后再由同一 generation observer 恢复，避免原生控件压在抽屉或遮罩之上。
+- 设置是独立全屏二级路由；覆盖 Web 时保留同一个 controller，返回后恢复原会话。
+- 文件选择/保存、麦克风授权、系统浏览器跳转、系统分享和下载缓存清理使用 HarmonyOS 系统
+  能力；登录、会话恢复、WebSocket、计费和连接器仍以 v5 server 为唯一业务权威。
 
-应用冷启动先进入 ArkUI 工作台,由用户明确进入对话;设置使用独立全屏路由,不再用悬浮的
-“应用控制”面板。工作台只展示真实的本机网络状态、对话入口、系统分享、系统文件选择、
-语音权限和安全会话说明,不在原生层伪造会话列表、账户、模型或聊天内容。系统分享固定发送
-`https://claudeai.chat/`,不会读取或拼接当前会话 URL。
+Harmony 客户端入口使用 `?client=harmony`。未登录时所需的 AuthGate 由从
+`feat/v5-aurora-rewrite` 独立开发、受保护评审的 Web companion 分支提供，再显式同步兼容提交；
+app 分支不能直接修改或部署共享 Web。系统分享仍固定发送 `https://claudeai.chat/`，不会读取或
+拼接当前会话 URL。
 
 ArkWeb 生命周期由“NavDestination 已激活 + controller 已连接”双闸统一协调。设置页覆盖 Web
-时只暂停并保留当前 controller;从 Web 返回工作台时先使旧 epoch 与异步回调失效,下一次点击
-“进入对话”才创建新 controller。设置触发的 reload 只在 Web 恢复 active + attached 后消费
-一次,controller 尚未就绪时继续保留请求。下载也绑定独立 Web 实例 epoch;离开 Web 或组件销毁
-前会取消 active item、清理目标缓存,旧 delegate 回调不会在工作台或新会话上弹出保存器/Toast。
+时只暂停并保留 controller；设置触发的 reload 只在 Web 恢复 active + attached 后消费一次，
+controller 尚未就绪时继续保留请求。主返回键按纯策略处理：pending OAuth 确认 → OAuth 内部
+history/取消 → 通过显式、版本化的 mobile-session 契约关闭 Web 顶层 → 普通 Web history →
+`moveAbilityToBackground()`；不支持进入后台的 2in1 设备才使用 ability terminate fallback。
+不会 pop 回工作台，也不会为再次进入对话创建新 controller。下载继续绑定独立 Web 实例 epoch；
+仅在 Web 实例真正销毁时取消 active item、清理目标缓存，旧 delegate 回调只允许清理，不得再弹
+保存器或 Toast。
 
 当前 `compat-v1` 只在精确 origin `https://claudeai.chat` 生效。每次主导航都携带
 generation；注入脚本会再次校验 origin，并要求 ChatHeader、智能体按钮和模型按钮均唯一且
@@ -60,15 +71,21 @@ devecocli log --device "Pura 90"
 此时 `AbilityDelegator` 不可用:
 
 ```bash
-devecocli build --modules entry@ohosTest
-devecocli run --module entry --device "Pura 90" --skip-build
-devecocli run --module entry@ohosTest --ability TestAbility --device "Pura 90" --skip-build
+devecocli build --modules entry@default --build-mode test
+devecocli build --modules entry@ohosTest --build-mode test
+devecocli run --module entry --build-mode test --device "Pura 90" --skip-build
+devecocli run --module entry@ohosTest --build-mode test --ability TestAbility --device "Pura 90" --skip-build
 HDC_BIN="/Applications/DevEco-Studio.app/Contents/sdk/default/openharmony/toolchains/hdc"
 "$HDC_BIN" -t 127.0.0.1:5555 shell \
   "aa test -b chat.claudeai.aurora -m entry_test -s timeout 30000 -s unittest OpenHarmonyTestRunner -w 60000"
 ```
 
-先安装本轮刚构建的 `entry` 主 HAP，再安装测试 HAP；仅安装 `entry@ohosTest` 不会刷新设备上的主应用代码。
+先安装本轮 `test` 模式构建的 `entry` 主 HAP，再安装同模式测试 HAP；仅安装 `entry@ohosTest` 不会
+刷新设备上的主应用代码。`test` 是唯一允许从 `about:blank` 启动、再通过 `loadData` 载入本地无账号
+compat 文档并把 `window.origin` 固定到主站的构建模式；仅放行这两个内部加载 URL，`debug`/`release`
+始终使用生产 `?client=harmony`。测试真实执行抽屉 overlay 隐藏、系统
+Back 恢复、全屏设置与 reload，控件缺失会直接失败。测试结束后重新构建并安装 debug 主 HAP（不要
+卸载）即可恢复生产入口并保留应用数据。
 
 项目 target API 为 24，compatible API 为 17。所有脚手架、构建、运行和调试操作统一使用 `devecocli`。
 

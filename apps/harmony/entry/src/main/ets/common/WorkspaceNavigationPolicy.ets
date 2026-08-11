@@ -2,6 +2,7 @@ export const AURORA_WEB_ROUTE: string = 'aurora-web';
 export const AURORA_SETTINGS_ROUTE: string = 'aurora-settings';
 export const AURORA_PRIVACY_ROUTE: string = 'aurora-privacy';
 export const AURORA_ABOUT_ROUTE: string = 'aurora-about';
+export const BACKGROUND_UNSUPPORTED_ERROR_CODE: number = 16000061;
 
 export enum PendingWebAction {
   NONE = 'none',
@@ -12,7 +13,7 @@ export enum WebBackAction {
   DISMISS_PENDING_OAUTH = 'dismiss-pending-oauth',
   WEB_BACKWARD = 'web-backward',
   CANCEL_ACTIVE_OAUTH = 'cancel-active-oauth',
-  POP_TO_HOME = 'pop-to-home'
+  BACKGROUND_APP = 'background-app'
 }
 
 export function shouldPushRoute(pathNames: string[], target: string): boolean {
@@ -31,6 +32,21 @@ export function hasRoute(pathNames: string[], target: string): boolean {
   return false;
 }
 
+export function shouldOpenInitialConversation(pathNames: string[]): boolean {
+  return pathNames.length === 0;
+}
+
+export function shouldAttemptTopLayerDismiss(
+  shellLifecycleActive: boolean,
+  primaryPage: boolean
+): boolean {
+  return shellLifecycleActive && primaryPage;
+}
+
+export function shouldTerminateAfterBackgroundFailure(errorCode: number | undefined): boolean {
+  return errorCode === BACKGROUND_UNSUPPORTED_ERROR_CODE;
+}
+
 export function decideWebBack(
   hasPendingOauth: boolean,
   activeOauth: boolean,
@@ -42,7 +58,7 @@ export function decideWebBack(
   if (activeOauth) {
     return canGoBackward ? WebBackAction.WEB_BACKWARD : WebBackAction.CANCEL_ACTIVE_OAUTH;
   }
-  return canGoBackward ? WebBackAction.WEB_BACKWARD : WebBackAction.POP_TO_HOME;
+  return canGoBackward ? WebBackAction.WEB_BACKWARD : WebBackAction.BACKGROUND_APP;
 }
 
 export function shouldCreateFreshWebController(hasWebRoute: boolean): boolean {

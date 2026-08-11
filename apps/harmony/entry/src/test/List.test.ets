@@ -6,6 +6,7 @@ import networkStateClockTest from './NetworkStateClock.test';
 import shellEvaluationClockTest from './ShellEvaluationClock.test';
 import shellLifecycleBridgeTest from './ShellLifecycleBridge.test';
 import workspaceNavigationPolicyTest from './WorkspaceNavigationPolicy.test';
+import workspaceUiFixtureTest from './WorkspaceUiFixture.test';
 
 export default function testsuite(): void {
   auroraSharePolicyTest();
@@ -16,4 +17,5 @@ export default function testsuite(): void {
   shellEvaluationClockTest();
   shellLifecycleBridgeTest();
   workspaceNavigationPolicyTest();
+  workspaceUiFixtureTest();
 }

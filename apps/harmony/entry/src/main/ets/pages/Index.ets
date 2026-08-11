@@ -12,7 +12,6 @@ import {
   SettingsDetailPageKind
 } from '../components/SettingsDetailPage';
 import { SettingsPage } from '../components/SettingsPage';
-import { WorkbenchHome } from '../components/WorkbenchHome';
 import {
   APP_HOME_URL,
   classifyNavigationUrl,
@@ -26,12 +25,15 @@ import {
 import {
   buildShellActivationScript,
   buildShellRollbackScript,
+  buildTopLayerDismissScript,
   buildWebActionScript,
   isShellUnsupportedResult,
   NativeWebAction,
   SHELL_LIFECYCLE_BRIDGE_METHOD,
   SHELL_LIFECYCLE_BRIDGE_NAME,
   shouldAcceptShellActivation,
+  shouldExposeNativeHeaderControls,
+  shouldAcceptTopLayerDismiss,
   shouldAcceptWebAction
 } from '../common/NativeShellPolicy';
 import {
@@ -48,11 +50,21 @@ import {
   decideWebBack,
   hasRoute,
   PendingWebAction,
+  shouldAttemptTopLayerDismiss,
   shouldCreateFreshWebController,
+  shouldOpenInitialConversation,
   shouldPushRoute,
+  shouldTerminateAfterBackgroundFailure,
   WebBackAction
 } from '../common/WorkspaceNavigationPolicy';
 import { isCurrentDownloadCallback } from '../common/DownloadLifecyclePolicy';
+import {
+  isWorkspaceUiFixtureBootstrapUrl,
+  loadWorkspaceUiFixture,
+  shouldAllowWorkspaceUiFixtureLoadUrl,
+  WORKSPACE_INITIAL_URL,
+  workspaceUiControllerDescription
+} from '../common/WorkspaceUiFixture';
 import { NetworkMonitor } from '../services/NetworkMonitor';
 import { HapticFeedbackService } from '../services/HapticFeedbackService';
 import {
@@ -88,6 +100,7 @@ class DownloadTarget {
 struct Index {
   private controller: webview.WebviewController = new webview.WebviewController();
   private pathStack: NavPathStack = new NavPathStack();
+  private workspaceUiFixtureLoaded: boolean = false;
   private downloadDelegate: webview.WebDownloadDelegate = new webview.WebDownloadDelegate();
   private downloadDelegateConfigured: boolean = false;
   private downloadTargets: Map<string, DownloadTarget> = new Map<string, DownloadTarget>();
@@ -103,8 +116,11 @@ struct Index {
   private shellEvaluationTimerId: number = -1;
   private webControllerAttached: boolean = false;
   private webDestinationActive: boolean = false;
+  private webDestinationVisible: boolean = false;
   private webInstanceNeedsReset: boolean = true;
   private pendingWebAction: PendingWebAction = PendingWebAction.NONE;
+  private webBackRequestPending: boolean = false;
+  private appBackgroundRequestPending: boolean = false;
   private downloadCacheCleared: boolean = false;
   private networkMonitor: NetworkMonitor | undefined = undefined;
 
@@ -113,6 +129,7 @@ struct Index {
   @State private loadFailed: boolean = false;
   @State private hasLoadedOnce: boolean = false;
   @State private nativeShellReady: boolean = false;
+  @State private nativeHeaderControlsVisible: boolean = false;
   @State private online: boolean = true;
   @State private oauthNavigationActive: boolean = false;
   @State private externalAuthHost: string = '';
@@ -134,6 +151,7 @@ struct Index {
 
   aboutToDisappear(): void {
     this.webDestinationActive = false;
+    this.webDestinationVisible = false;
     this.reconcileWebLifecycle();
     this.invalidateActiveDownloads();
     try {
@@ -149,8 +167,11 @@ struct Index {
   }
 
   private reconcileWebLifecycle(): void {
-    const shouldBeActive: boolean = this.webDestinationActive && this.webControllerAttached;
+    const shouldBeActive: boolean = this.webDestinationVisible &&
+      this.webDestinationActive &&
+      this.webControllerAttached;
     if (!shouldBeActive) {
+      this.webBackRequestPending = false;
       if (!this.shellLifecycleReconciledActive) {
         return;
       }
@@ -162,6 +183,7 @@ struct Index {
       this.clearDeferredShellEvaluation();
       this.shellEvaluationClock.invalidate();
       this.nativeShellReady = false;
+      this.nativeHeaderControlsVisible = false;
       try {
         this.controller.onInactive();
       } catch (_) {
@@ -230,13 +252,17 @@ struct Index {
     this.shellLifecycleEpoch += 1;
     this.webControllerAttached = false;
     this.webDestinationActive = false;
+    this.webDestinationVisible = false;
     this.webInstanceNeedsReset = false;
+    this.workspaceUiFixtureLoaded = false;
     this.pendingWebAction = PendingWebAction.NONE;
+    this.webBackRequestPending = false;
     this.loading = true;
     this.progress = 0;
     this.loadFailed = false;
     this.hasLoadedOnce = false;
     this.nativeShellReady = false;
+    this.nativeHeaderControlsVisible = false;
     this.oauthNavigationActive = false;
     this.externalAuthHost = '';
     this.pendingOauthUrl = '';
@@ -249,6 +275,13 @@ struct Index {
     } catch (_) {
       return [];
     }
+  }
+
+  private openInitialConversation(): void {
+    if (!shouldOpenInitialConversation(this.currentPathNames())) {
+      return;
+    }
+    this.openConversation(false);
   }
 
   private openConversation(withFeedback: boolean = true): void {
@@ -395,6 +428,7 @@ struct Index {
     }
 
     this.nativeShellReady = false;
+    this.nativeHeaderControlsVisible = false;
     if (request === ShellEvaluationRequest.STARTED) {
       this.runNativeShellEvaluation(startedGeneration, startedEpoch);
     }
@@ -411,6 +445,7 @@ struct Index {
     }
 
     this.nativeShellReady = false;
+    this.nativeHeaderControlsVisible = false;
     if (request === ShellEvaluationRequest.QUEUED) {
       return;
     }
@@ -479,6 +514,12 @@ struct Index {
     const unsupported: boolean = !executionFailed &&
       isPrimaryAppOrigin(latestUrl) &&
       isShellUnsupportedResult(result);
+    const exposeHeaderControls: boolean = ready && shouldExposeNativeHeaderControls(
+      startedGeneration,
+      this.navigationGeneration,
+      latestUrl,
+      result
+    );
     const decision: ShellEvaluationDecision = this.shellEvaluationClock.completeEvaluation(
       startedGeneration,
       !ready && !unsupported
@@ -493,10 +534,12 @@ struct Index {
     }
     if (decision === ShellEvaluationDecision.COMMIT) {
       this.nativeShellReady = ready;
+      this.nativeHeaderControlsVisible = exposeHeaderControls;
       return;
     }
 
     this.nativeShellReady = false;
+    this.nativeHeaderControlsVisible = false;
     this.runNativeShellRollback(startedGeneration, startedEpoch);
   }
 
@@ -897,7 +940,7 @@ struct Index {
     this.oauthNavigationActive = false;
     this.externalAuthHost = '';
     try {
-      this.controller.loadUrl(APP_HOME_URL);
+      this.controller.loadUrl(WORKSPACE_INITIAL_URL);
     } catch (_) {
       this.loadFailed = true;
     }
@@ -937,7 +980,7 @@ struct Index {
       this.controller.refresh();
     } catch (_) {
       try {
-        this.controller.loadUrl(APP_HOME_URL);
+        this.controller.loadUrl(WORKSPACE_INITIAL_URL);
       } catch (_) {
         this.loading = false;
         this.loadFailed = true;
@@ -953,60 +996,122 @@ struct Index {
     }
   }
 
-  private disposeWebDestination(): void {
-    this.webDestinationActive = false;
-    this.reconcileWebLifecycle();
-    this.invalidateActiveDownloads();
-    this.webControllerAttached = false;
-    this.pendingWebAction = PendingWebAction.NONE;
-    this.oauthNavigationActive = false;
-    this.externalAuthHost = '';
-    this.pendingOauthUrl = '';
-    this.pendingOauthHost = '';
-    this.loading = false;
-    this.progress = 0;
-    this.loadFailed = false;
-    this.hasLoadedOnce = false;
-    this.nativeShellReady = false;
-    this.webInstanceNeedsReset = true;
-    try {
-      this.controller.deleteJavaScriptRegister(SHELL_LIFECYCLE_BRIDGE_NAME);
-    } catch (_) {
-      // The old Web instance is already detached or being destroyed.
+  private requestAppBackground(): void {
+    if (this.appBackgroundRequestPending) {
+      return;
     }
+
+    this.appBackgroundRequestPending = true;
+    this.triggerTouchFeedback();
     try {
-      this.pathStack.pop();
-    } catch (_) {
-      // The system back gesture may have completed the same transition.
+      this.getAbilityContext().moveAbilityToBackground()
+        .then(() => {
+          this.appBackgroundRequestPending = false;
+        })
+        .catch((error: BusinessError) => {
+          this.appBackgroundRequestPending = false;
+          if (shouldTerminateAfterBackgroundFailure(error.code)) {
+            this.terminateUnsupportedPrimarySurface();
+          }
+        });
+    } catch (error) {
+      this.appBackgroundRequestPending = false;
+      const errorCode: number | undefined = (error as BusinessError | undefined)?.code;
+      if (shouldTerminateAfterBackgroundFailure(errorCode)) {
+        this.terminateUnsupportedPrimarySurface();
+      }
     }
   }
 
-  private handleWebBackPress(): boolean {
+  private terminateUnsupportedPrimarySurface(): void {
+    try {
+      this.getAbilityContext().terminateSelf().catch(() => {});
+    } catch (_) {
+      // The system keeps the current surface when neither background nor
+      // termination is supported by this device category.
+    }
+  }
+
+  private continueOrdinaryWebBack(): void {
     const action: WebBackAction = decideWebBack(
-      this.pendingOauthUrl.length > 0,
-      this.oauthNavigationActive,
+      false,
+      false,
       this.canNavigateWebBackward()
     );
-
-    if (action === WebBackAction.DISMISS_PENDING_OAUTH) {
-      this.dismissOauthCandidate();
-      return true;
-    }
     if (action === WebBackAction.WEB_BACKWARD) {
       try {
         this.controller.backward();
       } catch (_) {
         // A subsequent back press can safely re-evaluate controller state.
       }
-      return true;
+      return;
     }
-    if (action === WebBackAction.CANCEL_ACTIVE_OAUTH) {
-      this.cancelOauthNavigation();
+    this.requestAppBackground();
+  }
+
+  private dismissTopLayerOrContinueBack(): void {
+    if (this.webBackRequestPending) {
+      return;
+    }
+    if (!shouldAttemptTopLayerDismiss(this.shellLifecycleActive, this.isPrimaryPage())) {
+      this.continueOrdinaryWebBack();
+      return;
+    }
+
+    const startedGeneration: number = this.navigationGeneration;
+    const startedEpoch: number = this.shellLifecycleEpoch;
+    this.webBackRequestPending = true;
+    try {
+      this.controller.runJavaScript(
+        buildTopLayerDismissScript(startedGeneration),
+        (error: BusinessError, result: string) => {
+          this.webBackRequestPending = false;
+          if (!this.shellLifecycleActive || startedEpoch !== this.shellLifecycleEpoch ||
+            startedGeneration !== this.navigationGeneration || !this.isPrimaryPage()) {
+            return;
+          }
+          if (!error && shouldAcceptTopLayerDismiss(
+            startedGeneration,
+            this.navigationGeneration,
+            this.currentPageUrl(),
+            result
+          )) {
+            return;
+          }
+          this.continueOrdinaryWebBack();
+        }
+      );
+    } catch (_) {
+      this.webBackRequestPending = false;
+      this.continueOrdinaryWebBack();
+    }
+  }
+
+  private handleWebBackPress(): boolean {
+    if (this.pendingOauthUrl.length > 0) {
+      this.dismissOauthCandidate();
       return true;
     }
 
-    this.triggerTouchFeedback();
-    this.disposeWebDestination();
+    if (this.oauthNavigationActive) {
+      const oauthAction: WebBackAction = decideWebBack(
+        false,
+        true,
+        this.canNavigateWebBackward()
+      );
+      if (oauthAction === WebBackAction.WEB_BACKWARD) {
+        try {
+          this.controller.backward();
+        } catch (_) {
+          // A subsequent back press can safely re-evaluate controller state.
+        }
+      } else {
+        this.cancelOauthNavigation();
+      }
+      return true;
+    }
+
+    this.dismissTopLayerOrContinueBack();
     return true;
   }
 
@@ -1017,6 +1122,14 @@ struct Index {
         this.webContent()
       }
       .hideTitleBar(true)
+      .onShown(() => {
+        this.webDestinationVisible = true;
+        this.reconcileWebLifecycle();
+      })
+      .onHidden(() => {
+        this.webDestinationVisible = false;
+        this.reconcileWebLifecycle();
+      })
       .onActive(() => {
         this.webDestinationActive = true;
         this.reconcileWebLifecycle();
@@ -1079,104 +1192,54 @@ struct Index {
   ): void {
     Button() {
       SymbolGlyph(symbol)
-        .fontSize(22)
+        .fontSize(21)
         .fontColor([$r('app.color.primary_text')])
     }
     .type(ButtonType.Normal)
-    .width(48)
-    .height(48)
+    .width(44)
+    .height(44)
     .padding(0)
-    .borderRadius(12)
+    .borderRadius(22)
     .backgroundColor(Color.Transparent)
+    .hitTestBehavior(HitTestMode.Block)
     .id(stableId)
     .accessibilityText(label)
     .onClick(() => this.runWebAction(action))
   }
 
   @Builder
-  private nativeAppBar(): void {
-    Row({ space: 4 }) {
+  private nativeHeaderOverlay(): void {
+    Row() {
       this.shellIconButton(
-        $r('sys.symbol.open_sidebar'),
+        $r('sys.symbol.line_2_horizontal'),
         $r('app.string.open_sessions'),
         'aurora-web-open-sessions',
         NativeWebAction.OPEN_SESSIONS
       )
 
-      Row() {
-        Row({ space: 10 }) {
-          Image($r('app.media.aurora_icon'))
-            .width(32)
-            .height(32)
-            .borderRadius(9)
-
-          Column({ space: 2 }) {
-            Text('Aurora')
-              .fontSize(15)
-              .fontWeight(FontWeight.Medium)
-              .fontColor($r('app.color.primary_text'))
-              .maxLines(1)
-
-            Row({ space: 5 }) {
-              Circle()
-                .width(6)
-                .height(6)
-                .fill(this.online ? $r('app.color.connected') : $r('app.color.offline_text'))
-              if (this.online) {
-                Text($r('app.string.connected'))
-                  .fontSize(12)
-                  .fontColor($r('app.color.secondary_text'))
-              } else {
-                Text($r('app.string.offline'))
-                  .fontSize(12)
-                  .fontColor($r('app.color.offline_text'))
-              }
-              Text('·')
-                .fontSize(12)
-                .fontColor($r('app.color.faint_text'))
-              Text($r('app.string.model_and_agent'))
-                .fontSize(12)
-                .fontColor($r('app.color.secondary_text'))
-                .maxLines(1)
-                .textOverflow({ overflow: TextOverflow.Ellipsis })
-            }
-            .width('100%')
-          }
-          .alignItems(HorizontalAlign.Start)
-          .layoutWeight(1)
-        }
-        .width('100%')
-        .height('100%')
-      }
+      Blank()
       .layoutWeight(1)
-      .height(48)
-      .padding({ left: 4, right: 8 })
-      .borderRadius(12)
-      .backgroundColor(Color.Transparent)
 
       Button() {
-        SymbolGlyph($r('sys.symbol.more'))
-          .fontSize(22)
+        SymbolGlyph($r('sys.symbol.ellipsis_circle'))
+          .fontSize(21)
           .fontColor([$r('app.color.primary_text')])
       }
       .type(ButtonType.Normal)
-      .width(48)
-      .height(48)
+      .width(44)
+      .height(44)
       .padding(0)
-      .borderRadius(12)
+      .borderRadius(22)
       .backgroundColor(Color.Transparent)
+      .hitTestBehavior(HitTestMode.Block)
       .id('aurora-web-open-settings')
       .accessibilityText($r('app.string.open_more'))
       .onClick(() => this.openSettings())
     }
     .width('100%')
-    .height(56)
-    .padding({ left: 4, right: 4 })
-    .backgroundColor($r('app.color.surface_background'))
-    .border({
-      width: { bottom: 1 },
-      color: $r('app.color.divider')
-    })
+    .height(52)
+    .padding({ left: 6, right: 6, top: 4, bottom: 4 })
+    .hitTestBehavior(HitTestMode.Transparent)
   }
 
   @Builder
@@ -1210,10 +1273,6 @@ struct Index {
   private webContent(): void {
     Stack({ alignContent: Alignment.TopStart }) {
       Column() {
-        if (this.nativeShellReady && this.externalAuthHost.length === 0) {
-          this.nativeAppBar()
-        }
-
         if (this.externalAuthHost.length > 0) {
           Row({ space: 10 }) {
             Column({ space: 2 }) {
@@ -1247,19 +1306,7 @@ struct Index {
           })
         }
 
-        if (this.nativeShellReady && !this.online && this.externalAuthHost.length === 0) {
-          this.offlineBanner()
-        }
-
-        if (this.loading && this.hasLoadedOnce && this.nativeShellReady) {
-          Progress({ value: this.progress, total: 100, type: ProgressType.Linear })
-            .width('100%')
-            .height(2)
-            .color($r('app.color.brand_primary'))
-            .backgroundColor(Color.Transparent)
-        }
-
-        Web({ src: APP_HOME_URL, controller: this.controller })
+        Web({ src: WORKSPACE_INITIAL_URL, controller: this.controller })
         .width('100%')
         .layoutWeight(1)
         .javaScriptAccess(true)
@@ -1287,7 +1334,11 @@ struct Index {
           if (!event.data.isMainFrame()) {
             return false;
           }
-          return this.handleNavigation(event.data.getRequestUrl());
+          const requestUrl: string = event.data.getRequestUrl();
+          if (shouldAllowWorkspaceUiFixtureLoadUrl(requestUrl)) {
+            return false;
+          }
+          return this.handleNavigation(requestUrl);
         })
         .onPermissionRequest((event) => {
           this.handleWebPermission(event.request);
@@ -1301,6 +1352,7 @@ struct Index {
           this.navigationGeneration += 1;
           this.shellEvaluationClock.beginGeneration(this.navigationGeneration);
           this.nativeShellReady = false;
+          this.nativeHeaderControlsVisible = false;
           this.loading = !this.oauthNavigationActive;
           this.loadFailed = false;
           this.progress = 0;
@@ -1308,7 +1360,14 @@ struct Index {
         .onProgressChange((event) => {
           this.progress = event.newProgress;
         })
-        .onPageEnd(() => {
+        .onPageEnd((event) => {
+          if (!this.workspaceUiFixtureLoaded &&
+            isWorkspaceUiFixtureBootstrapUrl(event.url)) {
+            this.workspaceUiFixtureLoaded = loadWorkspaceUiFixture(this.controller);
+            if (this.workspaceUiFixtureLoaded) {
+              return;
+            }
+          }
           this.loading = false;
           this.progress = 100;
           this.hasLoadedOnce = true;
@@ -1326,6 +1385,30 @@ struct Index {
       }
       .width('100%')
       .height('100%')
+
+      if (this.nativeShellReady && this.nativeHeaderControlsVisible &&
+        this.externalAuthHost.length === 0) {
+        this.nativeHeaderOverlay()
+      }
+
+      if (this.nativeShellReady && this.nativeHeaderControlsVisible && !this.online &&
+        this.externalAuthHost.length === 0) {
+        Column() {
+          this.offlineBanner()
+        }
+        .width('100%')
+        .margin({ top: 52 })
+      }
+
+      if (this.loading && this.hasLoadedOnce && this.nativeShellReady &&
+        this.nativeHeaderControlsVisible) {
+        Progress({ value: this.progress, total: 100, type: ProgressType.Linear })
+          .width('100%')
+          .height(2)
+          .margin({ top: this.online ? 52 : 100 })
+          .color($r('app.color.brand_primary'))
+          .backgroundColor(Color.Transparent)
+      }
 
       if (this.loading && !this.loadFailed && !this.hasLoadedOnce) {
         Column({ space: 18 }) {
@@ -1434,21 +1517,40 @@ struct Index {
     .width('100%')
     .height('100%')
     .id('aurora-web-screen')
+    .accessibilityDescription(workspaceUiControllerDescription(this.webControllerEpoch))
+    .backgroundColor($r('app.color.page_background'))
+  }
+
+  @Builder
+  private launchSurface(): void {
+    Column({ space: 20 }) {
+      Image($r('app.media.aurora_icon'))
+        .width(56)
+        .height(56)
+        .borderRadius(16)
+        .accessibilityText($r('app.string.loading'))
+
+      LoadingProgress()
+        .width(22)
+        .height(22)
+        .color($r('app.color.brand_primary'))
+    }
+    .justifyContent(FlexAlign.Center)
+    .alignItems(HorizontalAlign.Center)
+    .width('100%')
+    .height('100%')
+    .id('aurora-launch-screen')
     .backgroundColor($r('app.color.page_background'))
   }
 
   build() {
     Navigation(this.pathStack) {
-      WorkbenchHome({
-        online: this.online,
-        onEnterConversation: () => this.openConversation(),
-        onOpenSettings: () => this.openSettings(),
-        onSystemShare: () => this.openSystemShare()
-      })
+      this.launchSurface()
     }
     .navDestination(this.auroraDestination)
     .hideTitleBar(true)
     .width('100%')
     .height('100%')
+    .onAppear(() => this.openInitialConversation())
   }
 }
