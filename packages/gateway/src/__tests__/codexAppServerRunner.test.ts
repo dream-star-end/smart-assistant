@@ -804,6 +804,48 @@ describe('handleNotification — goals', () => {
     await h.cleanup()
   })
 
+  it('same-thread goal updates remain visible across a background turnId', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).threadId = 'thr-goal'
+    ;(h.runner as any).activeTurnId = 't-user'
+
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'thread/goal/updated',
+      params: {
+        threadId: 'thr-goal',
+        turnId: 't-background-goal',
+        goal: { objective: 'Finish the task', status: 'complete' },
+      },
+    })
+
+    assert.equal(h.messages.length, 1)
+    assert.equal(h.messages[0].type, 'openclaude_goal')
+    assert.equal(h.messages[0].goal.status, 'complete')
+    assert.equal((h.runner as any).activeTurnId, 't-user')
+    await h.cleanup()
+  })
+
+  it('drops goal updates from a different thread', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).threadId = 'thr-goal'
+    ;(h.runner as any).activeTurnId = 't-user'
+
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'thread/goal/updated',
+      params: {
+        threadId: 'thr-other',
+        turnId: 't-background-goal',
+        goal: { objective: 'Do not leak this', status: 'complete' },
+      },
+    })
+
+    assert.equal(h.messages.length, 0)
+    assert.equal((h.runner as any).activeTurnId, 't-user')
+    await h.cleanup()
+  })
+
   it('setGoal cold-starts a thread, sends thread/goal/set, and emits a goal block', async () => {
     const h = await makeHarness({ withFakeProc: true })
 

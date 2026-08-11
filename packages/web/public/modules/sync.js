@@ -5,7 +5,7 @@
 import { apiFetch, apiGet, apiJson, authHeaders } from './api.js'
 import { dbDelete, dbGetAll, dbPut } from './db.js'
 import { projectSessionTape } from './sessionTape.js?v=2'
-import { _rebuildSearchIndex, clearDeleteTombstone, isDeletePending } from './sessions.js?v=14'
+import { _rebuildSearchIndex, clearDeleteTombstone, isDeletePending } from './sessions.js?v=15'
 import { state } from './state.js'
 
 // Dep-injected callback: fired when a push hits a 409 conflict and we
