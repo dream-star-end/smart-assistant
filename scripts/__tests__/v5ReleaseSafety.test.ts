@@ -62,12 +62,17 @@ describe('V5 branch deployment policy', () => {
       { cwd: root, encoding: 'utf8' },
     )
 
-  test('Word runtime installs LibreOffice Math and checks rendered formula content', async () => {
+  test('Word runtime pins Bookworm LibreOffice 25.2 and checks complex formula rendering', async () => {
     const source = await readFile(runtimeDockerfile, 'utf8')
     const overrides = await readFile(v5Overrides, 'utf8')
-    assert.match(source, /libreoffice-writer \\\n\s+libreoffice-math \\/)
+    assert.match(source, /^FROM node:22-bookworm-slim AS base$/m)
+    assert.match(source, /deb http:\/\/deb\.debian\.org\/debian bookworm-backports main/)
+    assert.match(source, /apt-get install -y --no-install-recommends -t bookworm-backports \\\n+\s+libreoffice-writer \\\n+\s+libreoffice-math \\/)
+    assert.match(source, /libreoffice --headless --version \| grep -Eq '\^LibreOffice 25\\\.2\\\.'/)
     assert.match(source, /dpkg-query -W -f='\$\{Status\}\\n' libreoffice-math/)
-    assert.match(source, /pdftotext \/tmp\/oc-docx-smoke-render\/oc-docx-smoke\.pdf - \| grep -Eq 'E\[\[:space:\]\]\*=\[\[:space:\]\]\*m\[\[:space:\]\]\*c'/)
+    assert.match(source, /\\mathrm\{MSE\}=\\frac\{1\}\{n\}\\sum_\{i=1\}\^\{n\}\(y_i-\\hat\{y\}_i\)\^2/)
+    assert.match(source, /grep -q 'y' \/tmp\/oc-docx-smoke\.txt/)
+    assert.match(source, /! grep -q '¿' \/tmp\/oc-docx-smoke\.txt/)
     assert.match(overrides, /^OC_RUNTIME_IMAGE=openclaude\/openclaude-runtime:v5-ccb-cfe6829e4119-slim$/m)
   })
 
