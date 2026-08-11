@@ -310,6 +310,11 @@ usage_records + journal 双查;零输出免单/turn 级 idle 免单已内建;cod
 - `packages/commercial/src/admin/audit*.ts` — RFC §3 manual:自愈审批链 TCB(永久 admin audit:audit.ts/auditActions.ts/auditRedact.ts/auditRetention.ts)
 <!-- selfheal-deploy-surfaces:end -->
 
+`e2e/session-display/incidents.json` 与 `incident-waivers.json` 是事故证据/豁免账本，当前有意保持
+`unmatched_path` fail-closed。候选包含这两类差异时，保留 runtime/platform tuple 的 P3
+`--canary` 必须拒绝；人工核对变更后走官方 ordinary `--with-dist`，不得为绕过发布门而放宽
+分类 manifest。
+
 ### 4.2 标准部署
 
 > **全局发布队列(硬机制)**:`scripts/v5-release-queue.sh` 是“任务级”持久 FIFO，
