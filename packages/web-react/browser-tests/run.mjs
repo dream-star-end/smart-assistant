@@ -184,7 +184,7 @@ const html = `<!doctype html><html><head><meta charset="utf-8"><style>${producti
   #root{position:static;height:auto;overflow:visible}
   .timeline-scroll-probe{height:360px;width:640px;overflow-y:auto;position:relative;border:1px solid #ccc;scrollbar-gutter:stable}
   #timeline-archive-root .chat-virtual-item{min-height:40px}
-</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="interrupted-tool-status-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="ask-question-root"></div><div id="model-selector-root"></div><div id="markdown-rich-root"></div><div id="media-task-root"></div><div id="connectors-root"></div><div id="memory-report-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
+</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="chat-entry-ux-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="interrupted-tool-status-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="ask-question-root"></div><div id="model-selector-root"></div><div id="markdown-rich-root"></div><div id="media-task-root"></div><div id="connectors-root"></div><div id="memory-report-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
 
 // ── drive ───────────────────────────────────────────────────────────────────
 let browser;
@@ -1855,11 +1855,42 @@ await check("T32 durable error replay：用户 Stop 不上报，历史非尾错�
     result.stopErrorText !== "本轮已取消。" ||
     result.stopReports !== 0 ||
     result.stopSyncs !== 0 ||
+    result.stopStatusCount !== 1 ||
+    result.stopAlertCount !== 0 ||
+    result.stopRetryCount !== 0 ||
+    result.stopCancelledCopyCount !== 0 ||
     result.historicalReports !== 1 ||
     result.historicalSyncs !== 0 ||
     result.historicalDecision !== true
   ) {
     throw new Error(`durable error replay 未收敛:${JSON.stringify(result)}`);
+  }
+});
+
+await check("T37 新会话草稿与历史加载反馈：连续新建不增行，部分内容加载不中断可见性", async () => {
+  const root = page.locator("#chat-entry-ux-root");
+  await root.getByText("已有会话", { exact: true }).waitFor({ state: "visible", timeout: 3000 });
+  const button = root.getByRole("button", { name: "新建会话测试" });
+  await button.click();
+  await button.click();
+  if (await root.getByTestId("new-session-count").textContent() !== "1") {
+    throw new Error("连续点击新建制造了额外侧栏占位会话");
+  }
+  if (await root.getByTestId("new-session-active-state").textContent() !== "blank") {
+    throw new Error("新建后没有停留在唯一空白草稿态");
+  }
+
+  await root.getByText("PARTIAL_HISTORY_VISIBLE_MESSAGE", { exact: true }).waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
+  const loader = root.getByRole("status", { name: "正在加载会话内容" });
+  await loader.waitFor({ state: "visible", timeout: 3000 });
+  if (await loader.getAttribute("aria-busy") !== "true") {
+    throw new Error("部分历史加载占位没有暴露 aria-busy");
+  }
+  if (await root.getByTestId("partial-history-skeleton").count() !== 1) {
+    throw new Error("部分历史加载占位缺失或重复");
   }
 });
 

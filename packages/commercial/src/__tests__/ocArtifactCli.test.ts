@@ -189,17 +189,7 @@ describe('self-contained office/document oc-* CLIs', () => {
   test('oc-docx covers Pandoc Markdown and Quarto QMD engines', async () => {
     const work = mkdtempSync(join(tmpdir(), 'oc-docx-cli-'))
     try {
-      const bin = minimalBin(work, [
-        'bash',
-        'readlink',
-        'dirname',
-        'cat',
-        'basename',
-        'mkdir',
-        'pwd',
-        'rm',
-        'mv',
-      ])
+      const bin = minimalBin(work, [])
       const log = join(work, 'render.log')
       executable(
         join(bin, 'pandoc'),
@@ -219,8 +209,8 @@ describe('self-contained office/document oc-* CLIs', () => {
       writeFileSync(qmd, '# Slides')
 
       let result = await run(
-        'bash',
-        [join(BIN_DIR, 'oc-docx.sh'), '--no-reference-doc', md, '-o', mdOut],
+        realCommand('python3'),
+        [join(BIN_DIR, 'oc-docx.py'), '--no-reference-doc', md, '-o', mdOut],
         { env: { PATH: bin, OC_TEST_LOG: log } },
       )
       assert.equal(result.code, 0, result.stderr)
@@ -228,8 +218,8 @@ describe('self-contained office/document oc-* CLIs', () => {
       assert.equal(readFileSync(mdOut, 'utf8'), 'docx')
 
       result = await run(
-        'bash',
-        [join(BIN_DIR, 'oc-docx.sh'), '--no-reference-doc', qmd, '-o', qmdOut],
+        realCommand('python3'),
+        [join(BIN_DIR, 'oc-docx.py'), '--no-reference-doc', qmd, '-o', qmdOut],
         { env: { PATH: bin, OC_TEST_LOG: log } },
       )
       assert.equal(result.code, 0, result.stderr)

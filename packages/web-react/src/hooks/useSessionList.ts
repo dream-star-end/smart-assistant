@@ -99,10 +99,6 @@ export type UseSessionListOptions = {
    * 深链 resolve/放弃后置 false，自动选中恢复正常判定。
    */
   holdAutoSelect?: boolean;
-  /** 新建会话占位时读取"当前有效模型"(App 选择器现值,含空态显式选择),定格为新会话的
-   *  per-session 模型 —— 否则空态选完模型再点「新建会话」,占位无自有模型,resolver 会
-   *  按 default 恢复,空态选择被丢(Codex 审 MAJOR)。 */
-  currentModelId?: () => string | undefined;
 };
 
 export type UseSessionList = {
@@ -374,22 +370,11 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
       return;
     }
     if (!user) return;
-    // 非 demo：新建一个 WS 会话占位（peer.id 用真实 id），socket 侧在首次 send 时
-    // 惰性 ensureSession —— 空会话不必提前占用 service 槽位。
-    const id = genWsSessionId();
-    // 定格当前有效模型为新会话选择(含空态显式选择;见 currentModelId 注释)。纯本地占位,
-    // 服务端落地仍走首发建行 PUT / 建行后收敛 PATCH。
-    const inheritModel = cbRef.current.currentModelId?.();
-    const s: Session = {
-      id,
-      title: "新对话",
-      ownerUserId: user.id,
-      updatedAt: new Date().toISOString(),
-      messageCount: 0,
-      ...(inheritModel ? { modelId: inheritModel } : {}),
-    };
-    setSessions((c) => [s, ...c]);
-    setActiveId(id);
+    // 非 demo：新建按钮只进入一个空白草稿态。真正会话由 App 首次发送时一次性创建，
+    // 避免连续点击在侧栏堆出多个没有消息、标题都叫「新对话」的假会话。
+    // 先封住迟到的 listSessions 自动选中，再清 activeId；否则历史列表会抢回空白态。
+    autoSelectedRef.current = true;
+    setActiveId(undefined);
   }, [demo, user]);
 
   // listSessions 是否已落定（成功或失败都算）：URL 深链恢复用它判定"等无可等"。

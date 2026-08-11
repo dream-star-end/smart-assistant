@@ -24,8 +24,8 @@ const retryableUser: ChatMessage = {
   status: "error",
 } as ChatMessage;
 
-function renderErr(msg: ChatMessage, cb: CardCallbacks) {
-  render(<AssistantCard msg={msg} ctx={ERR_CTX} cb={cb} />);
+function renderErr(msg: ChatMessage, cb: CardCallbacks, tokenUsage?: { totalTokens: number }) {
+  render(<AssistantCard msg={msg} ctx={ERR_CTX} cb={cb} tokenUsage={tokenUsage} />);
 }
 
 describe("F3 UserCard 发送失败重试命中区", () => {
@@ -83,6 +83,28 @@ describe("消息引用动作与已发送引用块", () => {
 });
 
 describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
+  test.each(["stopped", "user_cancelled"])(
+    "%s 是用户主动终止：只显示中性状态，不显示红卡、详情或重试",
+    (code) => {
+      renderErr(errMsg({
+        _errorCode: code,
+        text: "本轮已取消。",
+        _errorDetail: "本轮已取消。",
+        usage: { traceId: "trace-stop" },
+      }), {
+        onRegenerate: vi.fn(),
+      }, { totalTokens: 42 });
+
+      expect(screen.getByRole("status", { name: "已停止生成" })).toBeInTheDocument();
+      expect(screen.queryByText("本轮已取消。")).toBeNull();
+      expect(screen.queryByRole("alert")).toBeNull();
+      expect(screen.queryByRole("button", { name: /重试|重新尝试/ })).toBeNull();
+      expect(screen.getByTestId("assistant-row").textContent?.trim()).toBe("已停止生成");
+      expect(document.body.textContent).not.toContain("trace-stop");
+      expect(document.body.textContent).not.toContain("42");
+    },
+  );
+
   test("可重试码 + _clientMessageId 命中原 user 行 → 显示精确「重试」(不显「重新尝试」)", () => {
     const onRetrySend = vi.fn();
     const onRegenerate = vi.fn();
@@ -152,6 +174,11 @@ describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
     expect(screen.queryByRole("button", { name: "重试" })).toBeNull();
     // 末轮 + 兜底可用 → 「重新尝试」保留。
     expect(screen.getByRole("button", { name: "重新尝试" })).toBeInTheDocument();
+  });
+
+  test("cta=none 的非重试错误找不到精确目标时也不显示「重新尝试」", () => {
+    renderErr(errMsg({ _errorCode: "bad_request" }), { onRegenerate: vi.fn() });
+    expect(screen.queryByRole("button", { name: "重新尝试" })).toBeNull();
   });
 
   test("末轮 idle timeout 且有 durable 断点 → 优先显示「从断点继续」", () => {

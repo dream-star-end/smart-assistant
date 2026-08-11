@@ -34,6 +34,7 @@ import {
   isTurnTapeProcessControl,
 } from "./chat/render";
 import { friendlyDelegateResultPreview } from "./chat/reducer";
+import { sessionTitleFromText } from "./sessionTitle";
 
 /** turn 终态收敛(RFC §5 M5):server 载荷自证的 turn 终态类别。 */
 export type ServerTurnTerminal = "completed" | "error" | "interrupted";
@@ -1623,7 +1624,7 @@ export class SessionStore {
       hydrated.push({
         id: sessId,
         agentId: firstPayload.agentId ?? "main",
-        title: firstText.trim().slice(0, 40) || "新对话",
+        title: sessionTitleFromText(firstText),
         messages,
         createdAt: first.enqueuedAt,
         lastAt: items.at(-1)!.enqueuedAt,

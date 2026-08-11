@@ -346,7 +346,7 @@ oc_hotcfg_finalize_bundle() {
   # prompts/ 子目录缺失 → fail-loud(agent D 依赖)
   [ -d "$staging/prompts" ] || { oc_hotcfg__die "finalize_bundle: 缺 prompts/ 子目录(agent D 未就位?)@ $staging"; return 1; }
   # bin/ 剥扩展名:源仓 bin/ 里是 oc-*.sh/.py(git 可读性),bundle 里必须是 PATH 命令名
-  # (`oc-docx` 而非 `oc-docx.sh`,镜像 dev-fallback COPY 也是逐文件重命名的同一语义)。
+  # (`oc-docx` 而非源码名 `oc-docx.py`,镜像 dev-fallback COPY 也是逐文件重命名的同一语义)。
   # 剥完撞名 = 源目录同名 .sh/.py 并存,fail-loud 人工处置。
   if [ -d "$staging/bin" ]; then
     local f bare

@@ -87,7 +87,8 @@ describe('ccb-baseline skills ↔ manifest', () => {
     assert.match(slides, /oc-slides --deck/)
     assert.match(suite, /oc-slides --deck/)
     assert.doesNotMatch(suite, /oc-slides --spec/)
-    assert.match(pdf, /DroidSansFallbackFull\.ttf/)
+    assert.match(pdf, /wqy-zenhei\.ttc/)
+    assert.match(pdf, /subfontIndex=0/)
     assert.doesNotMatch(pdf, /TTFont\([^\n]*NotoSansCJK-Regular\.ttc/)
   })
 

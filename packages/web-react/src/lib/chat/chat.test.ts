@@ -2573,6 +2573,20 @@ describe("applyOutboundError double-frame suppression (§11)", () => {
   test("legacy Stop terminal renders as cancelled without telemetry or automatic recovery", () => {
     const s = sess();
     const user = addMessage(s, "user", "long task", { status: "sent", ts: 1 });
+    s.messages.push({
+      id: "m-placeholder",
+      role: "system",
+      text: "",
+      ts: 2,
+      _genPlaceholder: {
+        jobId: "a".repeat(32),
+        aspect: 1,
+        status: "running",
+        startedAt: 2,
+      },
+    });
+    s._sendingInFlight = true;
+    s._activeClientMessageId = user.id;
     const reportTurnError = vi.fn();
     const scheduleAutomaticRecovery = vi.fn();
     applyOutboundError(s, {
@@ -2594,6 +2608,8 @@ describe("applyOutboundError double-frame suppression (§11)", () => {
     });
     expect(reportTurnError).not.toHaveBeenCalled();
     expect(scheduleAutomaticRecovery).not.toHaveBeenCalled();
+    expect(user.status).toBe("sent");
+    expect(s.messages.some((message) => message._genPlaceholder?.status === "running")).toBe(false);
   });
 
   test("only automatic-recovery taxonomy codes schedule recovery", () => {
@@ -2661,6 +2677,61 @@ describe("applyOutboundError double-frame suppression (§11)", () => {
     expect(s._sendingInFlight).toBe(false);
     expect(s.messages.find((m) => m.role === "user")?.status).toBe("error");
     expect(persistSession).toHaveBeenCalledWith("s1");
+  });
+
+  test.each(["stopped", "user_cancelled"])(
+    "legacy %s 保持用户消息已发送、清理运行中占位，且不自动恢复",
+    (code) => {
+      const s = sess();
+      const user = addMessage(s, "user", "long task", { status: "sending", ts: 1 });
+      s.messages.push({
+        id: "m-placeholder",
+        role: "system",
+        text: "",
+        ts: 2,
+        _genPlaceholder: {
+          jobId: "b".repeat(32),
+          aspect: 1,
+          status: "running",
+          startedAt: 2,
+        },
+      });
+      s._sendingInFlight = true;
+      s._activeClientMessageId = user.id;
+      const scheduleAutomaticRecovery = vi.fn();
+
+      applyLegacyBridgeError(
+        s,
+        { type: "error", code, message: "cancelled", clientMessageId: user.id } as never,
+        { scheduleAutomaticRecovery },
+      );
+
+      expect(user.status).toBe("sent");
+      expect(s.messages.some((message) => message._genPlaceholder?.status === "running")).toBe(false);
+      expect(scheduleAutomaticRecovery).not.toHaveBeenCalled();
+    },
+  );
+
+  test("无 clientMessageId 的取消只检查最近用户行，不改动更早的排队消息", () => {
+    for (const legacy of [false, true]) {
+      const s = sess();
+      const older = addMessage(s, "user", "older queued", { status: "queued", ts: 1 });
+      const recent = addMessage(s, "user", "recent sent", { status: "sent", ts: 2 });
+      if (legacy) {
+        applyLegacyBridgeError(s, { type: "error", code: "stopped", message: "cancelled" } as never);
+      } else {
+        applyOutboundError(s, {
+          type: "outbound.error",
+          channel: "webchat",
+          peer: { id: "s1", kind: "dm" },
+          code: "stopped",
+          message: "cancelled",
+          isFinal: true,
+        } as never);
+      }
+      expect(recent.status).toBe("sent");
+      expect(older.status).toBe("queued");
+    }
   });
 });
 

@@ -38,9 +38,12 @@ import {
 } from "../src/lib/persist";
 import type { ChatMessage } from "../src/lib/chat/model";
 import type { MediaRef } from "../src/lib/chat/frames";
+import type { User } from "../src/lib/types";
 import type { MediaGenerationJob } from "@openclaude/protocol/mediaGeneration";
 import { createMemoryAuthSession } from "../src/lib/authSession";
 import { ChatSocket } from "../src/lib/chat/socket";
+import { useSessionList } from "../src/hooks/useSessionList";
+import type { UseChatSocket } from "../src/hooks/useChatSocket";
 import {
   admittedAckFrame,
   EXPECTED_TIMELINE_ROLES,
@@ -137,6 +140,10 @@ declare global {
         stopErrorText?: string;
         stopReports: number;
         stopSyncs: number;
+        stopStatusCount: number;
+        stopAlertCount: number;
+        stopRetryCount: number;
+        stopCancelledCopyCount: number;
         historicalReports: number;
         historicalSyncs: number;
         historicalDecision: boolean;
@@ -993,6 +1000,72 @@ createRoot(document.getElementById("timeline-replay-root")!).render(
   <StrictMode><ReplayTimelineProbe /></StrictMode>,
 );
 
+const chatEntryUxAuth = createMemoryAuthSession(() => {}, "browser-chat-entry-ux-token");
+const chatEntryUxUser: User = {
+  id: "browser-chat-entry-user",
+  displayName: "Browser User",
+  roles: ["user"],
+};
+
+function ChatEntryUxProbe() {
+  const socketRef = useRef<UseChatSocket | null>(null);
+  const { sessions, activeId, newSession, onHydrated } = useSessionList({
+    demo: false,
+    auth: null,
+    authSession: chatEntryUxAuth,
+    user: chatEntryUxUser,
+    agentId: "main",
+    sockRef: socketRef,
+    confirmDialog: async () => true,
+    promptText: async () => null,
+    clearChatError: () => {},
+    onNewSessionReset: () => {},
+    onActiveSessionDeleted: () => {},
+  });
+  useLayoutEffect(() => {
+    onHydrated([{
+      id: "browser-existing-session",
+      agentId: "main",
+      title: "已有会话",
+      messages: [],
+      createdAt: 1,
+      lastAt: 1,
+    }]);
+  }, [onHydrated]);
+
+  return (
+    <div>
+      <section data-testid="new-session-probe">
+        <button type="button" onClick={newSession}>新建会话测试</button>
+        <span data-testid="new-session-active-state">{activeId ?? "blank"}</span>
+        <div data-testid="new-session-count">{sessions.length}</div>
+        {sessions.map((session) => (
+          <div key={session.id} data-testid="new-session-row">{session.title}</div>
+        ))}
+      </section>
+      <section data-testid="partial-history-probe">
+        <MessageList
+          messages={[{
+            id: "partial-history-visible",
+            role: "user",
+            text: "PARTIAL_HISTORY_VISIBLE_MESSAGE",
+            ts: 1,
+            status: "sent",
+          }]}
+          sending={false}
+          historyLoading
+          cb={{}}
+          onRespondPermission={() => {}}
+        />
+      </section>
+    </div>
+  );
+}
+
+createRoot(document.getElementById("chat-entry-ux-root")!).render(
+  <StrictMode><ChatEntryUxProbe /></StrictMode>,
+);
+
 {
   let pushed = 0;
   let frames: ReturnType<typeof replayTurnFrames> = [];
@@ -1264,10 +1337,19 @@ createRoot(document.getElementById("timeline-replay-root")!).render(
         [record("stop", stoppedId, "本轮已由用户停止。")],
         [stoppedId],
       );
-      await new Promise((resolve) => setTimeout(resolve, 0));
+      for (let i = 0; i < 100; i++) {
+        if (document.querySelector('#timeline-replay-root output[aria-label="已停止生成"]')) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
       const stoppedError = [...stopped.messages].reverse().find((message) => message.role === "assistant");
       const stopReports = replayReportedErrors;
       const stopSyncs = replaySyncCalls;
+      const stopRoot = document.querySelector("#timeline-replay-root");
+      const stopStatusCount = stopRoot?.querySelectorAll('output[aria-label="已停止生成"]').length ?? 0;
+      const stopAlertCount = stopRoot?.querySelectorAll('[role="alert"]').length ?? 0;
+      const stopRetryCount = [...(stopRoot?.querySelectorAll("button") ?? [])]
+        .filter((button) => /重试|重新尝试/.test(button.textContent ?? "")).length;
+      const stopCancelledCopyCount = (stopRoot?.textContent?.match(/本轮已取消。/g) ?? []).length;
 
       replayReportedErrors = 0;
       replaySyncCalls = 0;
@@ -1284,6 +1366,10 @@ createRoot(document.getElementById("timeline-replay-root")!).render(
         stopErrorText: stoppedError?.text,
         stopReports,
         stopSyncs,
+        stopStatusCount,
+        stopAlertCount,
+        stopRetryCount,
+        stopCancelledCopyCount,
         historicalReports: replayReportedErrors,
         historicalSyncs: replaySyncCalls,
         historicalDecision: historical._automaticRecoveryDecisions?.[historicalId] === true,

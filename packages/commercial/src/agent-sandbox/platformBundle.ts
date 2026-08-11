@@ -429,7 +429,7 @@ function collectBundleFiles(bundleRoot: string): ManifestFileEntry[] {
       }
 
       // 扩展名规则:bin/ 下必须**无扩展名**且 owner 可执行(PATH 命令名即工具名,
-      // `oc-docx` 而非 `oc-docx.sh`;构建期 finalize_bundle 负责剥 .sh/.py);
+      // `oc-docx` 而非源码名 `oc-docx.py`;构建期 finalize_bundle 负责剥 .sh/.py);
       // 其余目录走扩展名白名单。两侧规则同源:v5-runtime-release-lib.sh selfcheck。
       const ext = pathExtname(name).toLowerCase();
       if (rel.startsWith("bin/")) {

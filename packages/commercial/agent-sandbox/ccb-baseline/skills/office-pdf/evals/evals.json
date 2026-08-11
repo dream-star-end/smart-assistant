@@ -18,7 +18,7 @@
       "prompt": "给我做一张收据 PDF,要固定版式:顶部居中大字『收 据』;下面一行『今收到:华信科技有限公司 缴纳培训费 金额:¥3,000.00 元』;再留一行日期『2026 年 7 月 16 日』。中文务必正常显示。请在最终回复里给出关键代码要点(尤其字体注册部分)、所用库和产物绝对路径。",
       "assertions": [
         "使用 reportlab 做精确坐标排版(适合固定版式票据),而非 oc-pdf 流式排版或 HTML 截图",
-        "显式注册了 ReportLab 支持的 CJK TrueType 字体(镜像内 DroidSansFallbackFull.ttf),没有误用带 PostScript outlines 的 Noto CJK TTC",
+        "显式注册了 ReportLab 支持的文泉驿正黑 TTC(subfontIndex=0),并保全中文、Latin、数字和常用符号，没有误用带 PostScript outlines 的 Noto CJK TTC",
         "回复中体现了字体注册这一关键步骤,并说明已确认中文无乱码",
         "产物为合法 PDF(以 %PDF 开头)并给出绝对路径",
         "收据的标题、金额、日期等固定字段按版式落位",

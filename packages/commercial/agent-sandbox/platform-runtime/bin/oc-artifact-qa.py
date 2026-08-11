@@ -21,6 +21,8 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
+from PIL import Image
+
 
 TOOL = "oc-artifact-qa"
 SELF_ROOT = Path(__file__).resolve().parent.parent
@@ -212,37 +214,42 @@ def make_contact_sheets(
 ) -> list[Path]:
     if not pages:
         return []
-    montage = shutil.which("montage")
-    if not montage:
-        add_issue(report, "warnings", "contact-sheet-unavailable", "montage is unavailable")
-        return []
     contacts = output_dir / "contact-sheets"
     contacts.mkdir(parents=True, exist_ok=False)
     made: list[Path] = []
     for index in range(0, len(pages), 16):
+        chunk = pages[index : index + 16]
         output = contacts / f"contact-{index // 16 + 1:04d}.png"
-        result = run_command(
-            [
-                montage,
-                *[str(page) for page in pages[index : index + 16]],
-                "-thumbnail",
-                "480x360>",
-                "-tile",
-                "4x4",
-                "-geometry",
-                "+8+8",
-                str(output),
-            ],
-            timeout_seconds=timeout_seconds,
+        columns = min(4, len(chunk))
+        rows = (len(chunk) + 3) // 4
+        sheet = Image.new(
+            "RGB",
+            (columns * 480 + (columns - 1) * 8, rows * 360 + (rows - 1) * 8),
+            "white",
         )
-        if result.returncode != 0 or not output.is_file():
+        try:
+            for offset, page in enumerate(chunk):
+                with Image.open(page) as source:
+                    thumbnail = source.convert("RGB")
+                    thumbnail.thumbnail((480, 360), Image.Resampling.LANCZOS)
+                    x = (offset % 4) * 488 + (480 - thumbnail.width) // 2
+                    y = (offset // 4) * 368 + (360 - thumbnail.height) // 2
+                    sheet.paste(thumbnail, (x, y))
+                    thumbnail.close()
+            sheet.save(output, format="PNG", optimize=True)
+            if not output.is_file() or output.stat().st_size == 0:
+                raise RuntimeError("Pillow did not produce a contact sheet")
+        except Exception as error:
+            output.unlink(missing_ok=True)
             add_issue(
                 report,
                 "warnings",
                 "contact-sheet-failed",
-                result.stderr.strip() or f"montage exited {result.returncode}",
+                str(error),
             )
             continue
+        finally:
+            sheet.close()
         made.append(output)
     return made
 

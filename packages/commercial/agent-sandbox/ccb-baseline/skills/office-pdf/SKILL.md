@@ -30,16 +30,17 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-pdfmetrics.registerFont(TTFont("DroidCJK", "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf"))
+pdfmetrics.registerFont(TTFont("WQY", "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc", subfontIndex=0))
 c = canvas.Canvas("/home/agent/.openclaude/发票.pdf", pagesize=A4)
-c.setFont("DroidCJK", 20); c.drawString(72, 760, "收 据")
-c.setFont("DroidCJK", 12); c.drawString(72, 720, "今收到:甲方  金额:¥1,000.00")
+c.setFont("WQY", 20); c.drawString(72, 760, "收 据")
+c.setFont("WQY", 12); c.drawString(72, 720, "今收到:甲方  金额:¥1,000.00")
 c.showPage(); c.save()
 ```
 
 > 找不到字体文件时用 `fc-list :lang=zh` 定位字体。ReportLab 的 `TTFont` 不支持
-> Noto CJK TTC 里的 PostScript outlines;固定版式应使用镜像预装的 Droid fallback TTF,
-> 不要照搬 Noto `.ttc` 路径后声称已嵌入。
+> Noto CJK TTC 里的 PostScript outlines;固定版式应使用镜像预装的文泉驿正黑 TTC
+> (`subfontIndex=0`)，它能同时覆盖中文、Latin、数字和常用符号；再通过 QA 的
+> `pdffonts` 结果确认 embedded/unicode 都为 true。
 
 ## 3. 合并 / 拆分 / 水印:pypdf
 

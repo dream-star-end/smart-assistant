@@ -227,6 +227,37 @@ describe("其余 oc-* 卡片", () => {
     expect(screen.getAllByText("x.docx").length).toBeGreaterThanOrEqual(2);
   });
 
+  test("oc-docx render → 逐页质检卡,不把输出目录误报成 DOCX", () => {
+    render(
+      <div>
+        {researchToolCard(
+          "oc-docx render /home/agent/x.docx -o /home/agent/.openclaude/generated/x-qa",
+          tool({ output: '{"pages":["page-1.png"]}' }),
+        )}
+      </div>,
+    );
+    expect(screen.getByText("Word 页面已渲染")).toBeInTheDocument();
+    expect(screen.queryByText("Word 文档已生成")).toBeNull();
+  });
+
+  test("oc-docx inspect/scrub → 分别显示结构检查与清理后的 DOCX 卡", () => {
+    const { rerender } = render(
+      <div>{researchToolCard("oc-docx inspect /home/agent/x.docx", tool({ output: '{"zip_integrity_ok":true}' }))}</div>,
+    );
+    expect(screen.getByText("Word 结构检查完成")).toBeInTheDocument();
+
+    rerender(
+      <div>
+        {researchToolCard(
+          "oc-docx scrub /home/agent/x.docx -o /home/agent/.openclaude/generated/x-clean.docx --keep-title",
+          tool({ output: "/home/agent/.openclaude/generated/x-clean.docx" }),
+        )}
+      </div>,
+    );
+    expect(screen.getByText("Word 文档已清理")).toBeInTheDocument();
+    expect(screen.getAllByText("x-clean.docx").length).toBeGreaterThanOrEqual(2);
+  });
+
   test("oc-pdf 绝对路径 -o → 产物卡 + 签名下载/预览链接(与 oc-report 体验对齐)", async () => {
     const sign = async (paths: string[]) =>
       Object.fromEntries(paths.map((p) => [p, `/api/media?sig=x&path=${encodeURIComponent(p)}`]));

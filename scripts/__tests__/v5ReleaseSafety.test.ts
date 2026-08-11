@@ -44,6 +44,7 @@ const knowledgePlanetSeed = path.join(
   'packages/commercial/scripts/seed-knowledge-planet-plugin.ts',
 )
 const supervisor = path.join(root, 'packages/commercial/src/agent-sandbox/v3supervisor.ts')
+const runtimeDockerfile = path.join(root, 'packages/commercial/agent-sandbox/Dockerfile.openclaude-runtime')
 const v5Overrides = path.join(root, 'deploy/v5/commercial-v5.env.overrides')
 const v5UnitA = path.join(root, 'deploy/v5/openclaude-v5.service')
 const v5UnitB = path.join(root, 'deploy/v5/openclaude-v5-b.service')
@@ -60,6 +61,15 @@ describe('V5 branch deployment policy', () => {
       ['-c', `source "$1"; assert_v5_deploy_branch_allowed "$2" "$3"`, 'branch-policy', branchPolicy, branch, allowAny],
       { cwd: root, encoding: 'utf8' },
     )
+
+  test('Word runtime installs LibreOffice Math and checks rendered formula content', async () => {
+    const source = await readFile(runtimeDockerfile, 'utf8')
+    const overrides = await readFile(v5Overrides, 'utf8')
+    assert.match(source, /libreoffice-writer \\\n\s+libreoffice-math \\/)
+    assert.match(source, /dpkg-query -W -f='\$\{Status\}\\n' libreoffice-math/)
+    assert.match(source, /pdftotext \/tmp\/oc-docx-smoke-render\/oc-docx-smoke\.pdf - \| grep -Eq 'E\[\[:space:\]\]\*=\[\[:space:\]\]\*m\[\[:space:\]\]\*c'/)
+    assert.match(overrides, /^OC_RUNTIME_IMAGE=openclaude\/openclaude-runtime:v5-ccb-cfe6829e4119-slim$/m)
+  })
 
   test('Windows app branches fail closed even when ALLOW_ANY_BRANCH would bypass the generic guard', () => {
     for (const branch of [

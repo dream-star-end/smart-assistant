@@ -50,7 +50,7 @@ function fakePdfEnvironment(root: string): { bin: string; site: string } {
   mkdirSync(join(site, 'pypdf'), { recursive: true })
   writeFileSync(
     join(site, 'pypdf', '__init__.py'),
-    'class PdfReader:\n    def __init__(self,path): self.pages=[object()]; self.metadata={"Title":"QA"}\n',
+    'import os\nclass PdfReader:\n    def __init__(self,path): self.pages=[object()] * int(os.environ.get("OC_FAKE_PAGE_COUNT", "1")); self.metadata={"Title":"QA"}\n',
   )
   executable(
     join(bin, 'pdftotext'),
@@ -62,13 +62,23 @@ function fakePdfEnvironment(root: string): { bin: string; site: string } {
   )
   executable(
     join(bin, 'pdftoppm'),
-    '#!/bin/bash\nout="${@: -1}"\nprintf png > "${out}-1.png"\n',
-  )
-  executable(
-    join(bin, 'montage'),
-    '#!/bin/bash\nout="${@: -1}"\nprintf contact > "$out"\n',
+    [
+      '#!/bin/bash',
+      'set -e',
+      'out="${@: -1}"',
+      'for i in $(/usr/bin/seq 1 "${OC_FAKE_PAGE_COUNT:-1}"); do',
+      "  /usr/bin/python3 -c 'from PIL import Image; import sys; i=int(sys.argv[1]); Image.new(\"RGB\",(480,360),(i,0,0)).save(sys.argv[2])' \"$i\" \"${out}-${i}.png\"",
+      'done',
+      '',
+    ].join('\n'),
   )
   return { bin, site }
+}
+
+function pngSize(path: string): { width: number; height: number } {
+  const bytes = readFileSync(path)
+  assert.equal(bytes.subarray(1, 4).toString('ascii'), 'PNG')
+  return { width: bytes.readUInt32BE(16), height: bytes.readUInt32BE(20) }
 }
 
 describe('oc-artifact-qa', () => {
@@ -89,7 +99,7 @@ describe('oc-artifact-qa', () => {
         ['inspect', '--input', input, '--out-dir', output, '--expect', expect],
         { PATH: bin, PYTHONPATH: site },
       )
-      assert.equal(result.code, 0, result.stderr)
+      assert.equal(result.code, 0, result.stderr || result.stdout)
       const report = JSON.parse(readFileSync(join(output, 'report.json'), 'utf8'))
       assert.equal(report.passed, true)
       assert.equal(report.input.sha256, before)
@@ -121,6 +131,47 @@ describe('oc-artifact-qa', () => {
       assert.equal(report.passed, false)
       assert.ok(report.failures.some((failure: any) => failure.code === 'required-text-source'))
       assert.ok(report.failures.some((failure: any) => failure.code === 'required-text-rendered'))
+    } finally {
+      rmSync(work, { recursive: true, force: true })
+    }
+  })
+
+  test('creates ordered Pillow contact sheets in bounded groups of sixteen pages', async () => {
+    const work = mkdtempSync(join(tmpdir(), 'oc-artifact-qa-contacts-'))
+    try {
+      const { bin, site } = fakePdfEnvironment(work)
+      const input = join(work, 'long-report.pdf')
+      const output = join(work, 'qa')
+      writeFileSync(input, '%PDF-1.7\nimmutable')
+      const result = await run(['inspect', '--input', input, '--out-dir', output], {
+        PATH: bin,
+        PYTHONPATH: site,
+        OC_FAKE_PAGE_COUNT: '17',
+      })
+      assert.equal(result.code, 0, result.stderr || result.stdout)
+      const report = JSON.parse(readFileSync(join(output, 'report.json'), 'utf8'))
+      assert.equal(report.facts.pageCount, 17)
+      assert.equal(report.renderedPages.length, 17)
+      assert.match(report.renderedPages[16], /page-17\.png$/)
+      assert.equal(report.contactSheets.length, 2)
+      assert.equal(
+        report.warnings.some((warning: any) => warning.code === 'contact-sheet-failed'),
+        false,
+      )
+      const first = report.contactSheets[0]
+      const second = report.contactSheets[1]
+      assert.deepEqual(pngSize(first), { width: 1944, height: 1464 })
+      assert.deepEqual(pngSize(second), { width: 480, height: 360 })
+      const sampled = execFileSync(
+        process.env.PYTHON ?? '/usr/bin/python3',
+        [
+          '-c',
+          'from PIL import Image; import sys; im=Image.open(sys.argv[1]); print(",".join(str(im.getpixel(p)[0]) for p in [(10,10),(498,10),(10,378),(1474,1114)]))',
+          first,
+        ],
+        { encoding: 'utf8' },
+      ).trim()
+      assert.equal(sampled, '1,2,5,16')
     } finally {
       rmSync(work, { recursive: true, force: true })
     }
@@ -221,7 +272,7 @@ describe('oc-artifact-qa', () => {
         ['inspect', '--input', input, '--out-dir', output, '--expect', expect],
         { PATH: bin, PYTHONPATH: site },
       )
-      assert.equal(result.code, 0, result.stderr)
+      assert.equal(result.code, 0, result.stderr || result.stdout)
       const report = JSON.parse(readFileSync(join(output, 'report.json'), 'utf8'))
       assert.equal(report.passed, true)
       assert.equal(
