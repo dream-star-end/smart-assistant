@@ -1250,6 +1250,25 @@
           "assertion": "T35 Composer 是唯一 Stop 入口，停止结算中原按钮禁用且不重复提交"
         }
       ]
+    },
+    {
+      "id": "INC-20260811-INTERRUPTED-TOOL-STATUS",
+      "occurredAt": "2026-08-11",
+      "severity": "P1",
+      "symptom": "用户停止 turn 后，输入框已正确恢复发送态，但中断 tape 内未完成的历史子任务仍显示运行中转圈，让用户误以为子任务没有停止。",
+      "rootFixCommit": "276bd969",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/ToolCard.test.tsx",
+          "assertion": "被中断 turn 的未完成历史子任务显示已取消，不再伪装运行中"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T36 被中断历史子任务显示已取消，实时未完成子任务仍运行中"
+        }
+      ]
     }
   ]
 }

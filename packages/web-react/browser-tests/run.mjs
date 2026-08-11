@@ -184,7 +184,7 @@ const html = `<!doctype html><html><head><meta charset="utf-8"><style>${producti
   #root{position:static;height:auto;overflow:visible}
   .timeline-scroll-probe{height:360px;width:640px;overflow-y:auto;position:relative;border:1px solid #ccc;scrollbar-gutter:stable}
   #timeline-archive-root .chat-virtual-item{min-height:40px}
-</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="ask-question-root"></div><div id="model-selector-root"></div><div id="markdown-rich-root"></div><div id="media-task-root"></div><div id="connectors-root"></div><div id="memory-report-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
+</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="interrupted-tool-status-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="ask-question-root"></div><div id="model-selector-root"></div><div id="markdown-rich-root"></div><div id="media-task-root"></div><div id="connectors-root"></div><div id="memory-report-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
 
 // ── drive ───────────────────────────────────────────────────────────────────
 let browser;
@@ -882,6 +882,26 @@ await check("T13 工具卡触控尺寸、键盘交互、渐进列表与移动宽
   if (width.scroll > width.client) throw new Error(`375px 级工具卡横向溢出:${JSON.stringify(width)}`);
   // 折叠态按钮名单恰好只剩卡头(同 T12:正向名单代替恒真的文案缺席断言)。
   await assertVisibleButtonSet("#tool-card-polish-root", ["搜索 AI 市场browser完成"], "美化后的工具卡");
+});
+
+await check("T36 被中断历史子任务显示已取消，实时未完成子任务仍运行中", async () => {
+  const interrupted = page.locator("#interrupted-historical-tool");
+  await interrupted.getByText("已取消", { exact: true }).waitFor({ state: "visible", timeout: 3000 });
+  if (await interrupted.locator(".animate-spin").count() !== 0) {
+    throw new Error("被中断的历史子任务仍显示运行中 spinner");
+  }
+
+  const live = page.locator("#live-incomplete-tool");
+  await live.getByText("运行中", { exact: true }).waitFor({ state: "attached", timeout: 3000 });
+  if (await live.locator(".animate-spin").count() !== 1) {
+    throw new Error("实时未完成子任务没有保持运行中 spinner");
+  }
+
+  const completed = page.locator("#completed-interrupted-tool");
+  await completed.getByText("完成", { exact: true }).waitFor({ state: "visible", timeout: 3000 });
+  if (await completed.getByText("已取消", { exact: true }).count() !== 0) {
+    throw new Error("中断 turn 中已完成的子任务被误标为取消");
+  }
 });
 
 await check("T14 消息反馈弹窗关闭后把焦点还给原消息动作", async () => {

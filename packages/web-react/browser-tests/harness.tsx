@@ -598,6 +598,40 @@ createRoot(document.getElementById("tool-card-polish-root")!).render(
   </StrictMode>,
 );
 
+createRoot(document.getElementById("interrupted-tool-status-root")!).render(
+  <StrictMode>
+    <div>
+      <div id="interrupted-historical-tool">
+        <ToolCard
+          message={{
+            toolName: "Agent",
+            inputJson: { description: "中断的历史子任务" },
+            _completed: false,
+            _timelineRecord: true,
+            _dispatchOutcome: "interrupted",
+          }}
+        />
+      </div>
+      <div id="live-incomplete-tool">
+        <ToolCard
+          message={{ toolName: "Agent", inputJson: { description: "仍在执行的实时子任务" }, _completed: false }}
+        />
+      </div>
+      <div id="completed-interrupted-tool">
+        <ToolCard
+          message={{
+            toolName: "Agent",
+            inputJson: { description: "中断前已完成的子任务" },
+            _completed: true,
+            _timelineRecord: true,
+            _dispatchOutcome: "interrupted",
+          }}
+        />
+      </div>
+    </div>
+  </StrictMode>,
+);
+
 const timelineThinking: ChatMessage = {
   id: "timeline-thinking-live",
   role: "thinking",
