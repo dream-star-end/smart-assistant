@@ -288,9 +288,18 @@ function initializeShell() {
     }
 
     if (mode !== previousMode) {
-      if (downloadsOpen) requestAnimationFrame(() => elements.downloadsClose.focus())
-      if (offlineOpen) requestAnimationFrame(() => elements.offlineRetry.focus())
       previousMode = mode
+      const modalFocusTarget = downloadsOpen
+        ? elements.downloadsClose
+        : offlineOpen
+          ? elements.offlineRetry
+          : null
+      modalFocusTarget?.focus({ preventScroll: true })
+      queueMicrotask(() => {
+        if (state.shellMode === mode && modalFocusTarget && document.activeElement !== modalFocusTarget) {
+          modalFocusTarget.focus({ preventScroll: true })
+        }
+      })
     }
   }
 

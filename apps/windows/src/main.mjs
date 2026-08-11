@@ -1080,9 +1080,9 @@ async function elementCenter(webContents, selector) {
   return point
 }
 
-async function clickElementWithInput(webContents, selector) {
+async function clickElementWithInput(window, webContents, selector) {
+  await focusWebContentsForInput(window, webContents, `click ${selector}`)
   const point = await elementCenter(webContents, selector)
-  webContents.focus()
   webContents.sendInputEvent({ type: 'mouseMove', ...point })
   webContents.sendInputEvent({ type: 'mouseDown', button: 'left', clickCount: 1, ...point })
   await new Promise((resolve) => setTimeout(resolve, 20))
@@ -1090,8 +1090,29 @@ async function clickElementWithInput(webContents, selector) {
   await new Promise((resolve) => setTimeout(resolve, 20))
 }
 
-function sendKeyWithInput(webContents, keyCode, modifiers = []) {
-  webContents.focus()
+async function focusWebContentsForInput(window, webContents, action) {
+  await waitForCondition(
+    async () => {
+      if (!isAlive(window)) return false
+      if (!window.isVisible()) window.show()
+      window.focus()
+      webContents.focus()
+      await webContents.executeJavaScript(
+        'new Promise((resolve) => requestAnimationFrame(resolve))',
+      )
+      return window.isFocused() && webContents.isFocused()
+    },
+    `host window and target WebContents did not acquire native focus for ${action}`,
+  ).catch((error) => {
+    throw new Error(
+      `${error.message}; windowFocused=${window?.isFocused?.() === true}; ` +
+        `webContentsFocused=${webContents.isFocused()}`,
+    )
+  })
+}
+
+async function sendKeyWithInput(window, webContents, keyCode, modifiers = []) {
+  await focusWebContentsForInput(window, webContents, `key ${keyCode}`)
   webContents.sendInputEvent({ type: 'keyDown', keyCode, modifiers })
   webContents.sendInputEvent({ type: 'keyUp', keyCode, modifiers })
 }
@@ -1288,97 +1309,74 @@ async function runSmokeContract() {
     'trusted shell did not receive an initial state snapshot',
   )
 
-  await shellContents.executeJavaScript(`(() => {
-    window.__auroraReducedTransparencyProbe = new Promise((resolve, reject) => {
-      const surface = document.querySelector('.command-surface')
-      let firstFrame
-      let secondFrame
-      let scheduled = false
-      let timer
-      let observer
-      const cleanup = () => {
-        observer.disconnect()
-        cancelAnimationFrame(firstFrame)
-        cancelAnimationFrame(secondFrame)
-        clearTimeout(timer)
-      }
-      const finishCapture = () => {
-        scheduled = false
-        if (
-          document.documentElement.dataset.reduceTransparency !== 'true' ||
-          !surface.classList.contains('reduce-transparency')
-        ) {
-          return
-        }
+  shellContents.send(IPC_CHANNELS.state, {
+    ...shellStateSnapshot(),
+    theme: { mode: 'dark', forcedColors: false, reduceTransparency: true },
+  })
+  let reducedTransparencyStyle = null
+  await waitForCondition(
+    async () => {
+      reducedTransparencyStyle = await shellContents.executeJavaScript(`(() => {
+        const surface = document.querySelector('.command-surface')
         const style = getComputedStyle(surface)
-        cleanup()
-        resolve({
+        return {
           attribute: document.documentElement.dataset.reduceTransparency,
           allowTransparencyClass: surface.classList.contains('allow-transparency'),
           modifierClass: surface.classList.contains('reduce-transparency'),
           backdropFilter: style.backdropFilter,
           backgroundColor: style.backgroundColor,
-        })
-      }
-      const capture = () => {
-        if (
-          scheduled ||
-          document.documentElement.dataset.reduceTransparency !== 'true' ||
-          !surface.classList.contains('reduce-transparency')
-        ) {
-          return
         }
-        scheduled = true
-        firstFrame = requestAnimationFrame(() => {
-          secondFrame = requestAnimationFrame(finishCapture)
-        })
-      }
-      observer = new MutationObserver(capture)
-      observer.observe(document.documentElement, {
-        attributes: true,
-        attributeFilter: ['data-reduce-transparency'],
-      })
-      timer = setTimeout(() => {
-        cleanup()
-        reject(new Error('reduced-transparency state was not observed'))
-      }, 2000)
-      capture()
-    })
-  })()`)
-  shellContents.send(IPC_CHANNELS.state, {
-    ...shellStateSnapshot(),
-    theme: { mode: 'dark', forcedColors: false, reduceTransparency: true },
+      })()`)
+      return (
+        reducedTransparencyStyle.attribute === 'true' &&
+        reducedTransparencyStyle.allowTransparencyClass === false &&
+        reducedTransparencyStyle.modifierClass === true &&
+        reducedTransparencyStyle.backdropFilter === 'none' &&
+        reducedTransparencyStyle.backgroundColor !== 'rgba(0, 0, 0, 0)'
+      )
+    },
+    'reduced-transparency CSS did not settle into its opaque state',
+  ).catch((error) => {
+    throw new Error(`${error.message}; last state: ${JSON.stringify(reducedTransparencyStyle)}`)
   })
-  const reducedTransparencyStyle = await shellContents.executeJavaScript(
-    'window.__auroraReducedTransparencyProbe',
-  )
   assert.equal(reducedTransparencyStyle.attribute, 'true')
   assert.equal(reducedTransparencyStyle.allowTransparencyClass, false)
   assert.equal(reducedTransparencyStyle.modifierClass, true)
   assert.equal(reducedTransparencyStyle.backdropFilter, 'none')
   assert.notEqual(reducedTransparencyStyle.backgroundColor, 'rgba(0, 0, 0, 0)')
-  await shellContents.executeJavaScript('delete window.__auroraReducedTransparencyProbe')
-
   shellContents.send(IPC_CHANNELS.state, {
     ...shellStateSnapshot(),
     theme: { mode: 'light', forcedColors: true, reduceTransparency: false },
   })
-  await shellContents.executeJavaScript(
-    'new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))',
-  )
-  const forcedColorsStyle = await shellContents.executeJavaScript(`(() => {
-    const surface = document.querySelector('.command-surface')
-    const style = getComputedStyle(surface)
-    const iconStyle = getComputedStyle(document.querySelector('#more-menu-button .fluent-icon'))
-    return {
-      attribute: document.documentElement.dataset.forcedColors,
-      allowTransparencyClass: surface.classList.contains('allow-transparency'),
-      backdropFilter: style.backdropFilter,
-      backgroundColor: style.backgroundColor,
-      iconBackgroundColor: iconStyle.backgroundColor,
-      iconForcedColorAdjust: iconStyle.forcedColorAdjust,
-    }
-  })()`)
+  let forcedColorsStyle = null
+  await waitForCondition(
+    async () => {
+      forcedColorsStyle = await shellContents.executeJavaScript(`(() => {
+        const surface = document.querySelector('.command-surface')
+        const style = getComputedStyle(surface)
+        const iconStyle = getComputedStyle(document.querySelector('#more-menu-button .fluent-icon'))
+        return {
+          attribute: document.documentElement.dataset.forcedColors,
+          allowTransparencyClass: surface.classList.contains('allow-transparency'),
+          backdropFilter: style.backdropFilter,
+          backgroundColor: style.backgroundColor,
+          iconBackgroundColor: iconStyle.backgroundColor,
+          iconForcedColorAdjust: iconStyle.forcedColorAdjust,
+        }
+      })()`)
+      return (
+        forcedColorsStyle.attribute === 'true' &&
+        forcedColorsStyle.allowTransparencyClass === false &&
+        forcedColorsStyle.backdropFilter === 'none' &&
+        forcedColorsStyle.backgroundColor !== 'rgba(0, 0, 0, 0)' &&
+        forcedColorsStyle.iconBackgroundColor !== 'rgba(0, 0, 0, 0)' &&
+        forcedColorsStyle.iconForcedColorAdjust === 'none'
+      )
+    },
+    'forced-colors CSS did not settle into its opaque system-color state',
+  ).catch((error) => {
+    throw new Error(`${error.message}; last state: ${JSON.stringify(forcedColorsStyle)}`)
+  })
   assert.equal(forcedColorsStyle.attribute, 'true')
   assert.equal(forcedColorsStyle.allowTransparencyClass, false)
   assert.equal(forcedColorsStyle.backdropFilter, 'none')
@@ -1507,28 +1505,38 @@ async function runSmokeContract() {
   assert.equal(menuTemplate[1].enabled, navigationSnapshot().canGoForward)
 
   const previousMenuOpenCount = smokeMenuOpenCount
-  await clickElementWithInput(shellContents, '#more-menu-button')
+  await clickElementWithInput(window, shellContents, '#more-menu-button')
   await waitForCondition(
     () => smokeMenuOpenCount === previousMenuOpenCount + 1,
     'More button did not invoke the native-menu command stub',
   )
   assert.equal(shellMode, 'toolbar', 'native More menu changed the shell mode')
 
-  await clickElementWithInput(shellContents, '#downloads-button')
+  await clickElementWithInput(window, shellContents, '#downloads-button')
   await waitForCondition(
     () => smokeShellView.getBounds().height > TOOLBAR_HEIGHT,
     'downloads button did not expand the shell view',
   )
+  let downloadsFocusSnapshot = null
   await waitForCondition(
-    async () =>
-      shellContents.isFocused() &&
-      (await shellContents.executeJavaScript(`
-          document.body.dataset.shellMode === 'downloads' &&
-          document.querySelector('#downloads-button')?.getAttribute('aria-expanded') === 'true' &&
-          document.activeElement?.id === 'downloads-close'
-        `)),
+    async () => {
+      downloadsFocusSnapshot = await shellContents.executeJavaScript(`({
+        shellMode: document.body.dataset.shellMode,
+        ariaExpanded: document.querySelector('#downloads-button')?.getAttribute('aria-expanded'),
+        activeElement: document.activeElement?.id || document.activeElement?.tagName || null,
+      })`)
+      downloadsFocusSnapshot.shellFocused = shellContents.isFocused()
+      return (
+        downloadsFocusSnapshot.shellFocused === true &&
+        downloadsFocusSnapshot.shellMode === 'downloads' &&
+        downloadsFocusSnapshot.ariaExpanded === 'true' &&
+        downloadsFocusSnapshot.activeElement === 'downloads-close'
+      )
+    },
     'downloads drawer did not expose modal state and keyboard focus',
-  )
+  ).catch((error) => {
+    throw new Error(`${error.message}; last state: ${JSON.stringify(downloadsFocusSnapshot)}`)
+  })
   const expandedLayout = calculateViewBounds(window.getContentBounds(), {
     shellMode: 'downloads',
   })
@@ -1570,7 +1578,7 @@ async function runSmokeContract() {
   )
   pushShellState()
 
-  sendKeyWithInput(shellContents, '0', ['control'])
+  await sendKeyWithInput(window, shellContents, '0', ['control'])
   await shellContents.executeJavaScript(
     'new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))',
   )
@@ -1578,7 +1586,7 @@ async function runSmokeContract() {
   assert.equal(smokeProductView.getVisible(), false, 'modal shortcut revealed the product view')
   assert.equal(productContents.isFocused(), false, 'modal shortcut focused the hidden product view')
   assert.equal(shellContents.isFocused(), true, 'modal shortcut moved focus out of the shell')
-  sendKeyWithInput(shellContents, 'F6')
+  await sendKeyWithInput(window, shellContents, 'F6')
   await shellContents.executeJavaScript(
     'new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))',
   )
@@ -1626,7 +1634,7 @@ async function runSmokeContract() {
     productContents,
   })
 
-  sendKeyWithInput(shellContents, 'Escape')
+  await sendKeyWithInput(window, shellContents, 'Escape')
   await waitForCondition(
     () => smokeShellView.getBounds().height === TOOLBAR_HEIGHT,
     'Escape did not collapse the downloads view',
@@ -1668,7 +1676,7 @@ async function runSmokeContract() {
     })
   })
   const offlineReloadFinished = waitForWebContentsEvent(productContents, 'did-finish-load')
-  await clickElementWithInput(shellContents, '#offline-retry')
+  await clickElementWithInput(window, shellContents, '#offline-retry')
   assert.deepEqual(
     await offlineLoadingSnapshot,
     {
@@ -1691,7 +1699,7 @@ async function runSmokeContract() {
   const recoveredHome = waitForWebContentsEvent(productContents, 'did-finish-load')
   assert.equal(homeProduct(), true, 'recovered product did not accept the Home action')
   await recoveredHome
-  await clickElementWithInput(productContents, '#fixture-push-route')
+  await clickElementWithInput(window, productContents, '#fixture-push-route')
   await waitForCondition(
     async () =>
       (await productContents.executeJavaScript(
@@ -1700,7 +1708,7 @@ async function runSmokeContract() {
     'recovered product view did not accept real pointer input',
   )
 
-  sendKeyWithInput(productContents, 'F6')
+  await sendKeyWithInput(window, productContents, 'F6')
   await waitForCondition(
     async () =>
       shellContents.isFocused() &&
@@ -1709,7 +1717,7 @@ async function runSmokeContract() {
       )),
     'F6 did not move focus from the product view into the desktop app bar',
   )
-  sendKeyWithInput(shellContents, 'F6')
+  await sendKeyWithInput(window, shellContents, 'F6')
   await waitForCondition(
     () => productContents.isFocused(),
     'F6 did not return focus from the desktop app bar to the product view',
