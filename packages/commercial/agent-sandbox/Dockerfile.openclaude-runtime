@@ -61,7 +61,7 @@ ENV TZ=Asia/Shanghai \
 #   - git / curl / ca-certificates: 个人版 ccb subprocess + 网络请求基本依赖
 #   - ripgrep / jq / unzip / zip / file / sqlite3:搜索、归档、文件识别与轻量数据检查；
 #     unzip 也用于 DOCX smoke/验证
-#   - poppler-utils / imagemagick:PDF 文本、页信息、页面栅格化与图片属性检查；
+#   - poppler-utils / imagemagick / libreoffice-writer:PDF 文本、DOCX→PDF、逐页栅格化与图片属性检查；
 #     这些是 Read/文档技能与图片工作流实际调用的基础命令
 #   - util-linux:提供 kernel flock，V5 Auto-Dream 跨 gateway 进程串行化的硬依赖
 #   - tini: PID 1 转发 SIGTERM 给 entrypoint,避免 zombie
@@ -87,6 +87,7 @@ RUN apt-get update \
         sqlite3 \
         poppler-utils \
         imagemagick \
+        libreoffice-writer \
         util-linux \
         tini \
         bash \
@@ -96,6 +97,7 @@ RUN apt-get update \
         python3-pip \
         python3-venv \
         fonts-noto-cjk \
+        fonts-dejavu-core \
     && flock --version \
     && python --version \
     && rg --version \
@@ -105,6 +107,7 @@ RUN apt-get update \
     && pdftotext -v \
     && pdftoppm -v \
     && identify -version \
+    && libreoffice --headless --version \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* \
     # 清掉 setuid/setgid 二进制(05-SEC §13 精神,减少本地提权面)。
     # **例外**: 保留 /usr/bin/sudo 的 setuid bit — sudo 二进制必须 setuid root
@@ -163,7 +166,9 @@ RUN python3 -m pip install --break-system-packages --no-cache-dir \
 #   - 日程:icalendar(生成 .ics 会议邀请)。
 # **全部宽松许可(MIT/BSD/LGPL-import)**;合规红线:**绝不装 PyMuPDF(AGPL)/ Marker(GPL)**。
 RUN python3 -m pip install --break-system-packages --no-cache-dir \
-      openpyxl XlsxWriter python-docx python-pptx reportlab pypdf pdfplumber duckdb icalendar
+      openpyxl XlsxWriter 'python-docx>=1.1.0,<2.0' python-pptx \
+      'PyYAML>=6.0,<7.0' 'Pillow>=10.0,<13.0' \
+      reportlab pypdf pdfplumber duckdb icalendar
 
 # Generic web/document context extraction MCP dependencies.
 #
@@ -232,7 +237,7 @@ RUN set -eux; \
 
 # ── oc-* 工具:dev fallback(生产走 PATH /run/oc/platform/current/bin 的 bundle,允许滞后)──
 # 镜像内 /usr/local/bin 副本仅当 bundle 未挂载时兜底;source 已迁 platform-runtime/bin/(改动真热)。
-COPY --chown=root:root ./platform-runtime/bin/oc-docx.sh /usr/local/bin/oc-docx
+COPY --chown=root:root ./platform-runtime/bin/oc-docx.py /usr/local/bin/oc-docx
 COPY --chown=root:root ./runtime/create-docgen-reference.py /usr/local/lib/openclaude/create-docgen-reference.py
 COPY --chown=root:root ./platform-runtime/bin/oc-minimax.py /usr/local/bin/oc-minimax
 COPY --chown=root:root ./platform-runtime/bin/oc-web-context.py /usr/local/bin/oc-web-context
@@ -294,7 +299,36 @@ RUN set -eux; \
     test -s /tmp/oc-docx-smoke.docx; \
     unzip -tq /tmp/oc-docx-smoke.docx; \
     unzip -p /tmp/oc-docx-smoke.docx word/document.xml | grep -q 'm:oMath'; \
-    rm -f /tmp/oc-docx-smoke.md /tmp/oc-docx-smoke.docx; \
+    mkdir -p /tmp/oc-docx-smoke-render; \
+    oc-docx render /tmp/oc-docx-smoke.docx -o /tmp/oc-docx-smoke-render --emit-pdf; \
+    test -s /tmp/oc-docx-smoke-render/page-1.png; \
+    test -s /tmp/oc-docx-smoke-render/vision-page-1.jpg; \
+    test "$(stat -c %s /tmp/oc-docx-smoke-render/vision-page-1.jpg)" -lt 4500000; \
+    oc-docx inspect /tmp/oc-docx-smoke.docx --render-dir /tmp/oc-docx-smoke-render --json /tmp/oc-docx-smoke-render/report.json; \
+    oc-docx scrub /tmp/oc-docx-smoke.docx -o /tmp/oc-docx-smoke-clean.docx --keep-title; \
+    unzip -tq /tmp/oc-docx-smoke-clean.docx; \
+    unzip -p /tmp/oc-docx-smoke-clean.docx word/document.xml | grep -q 'm:oMath'; \
+    oc-docx inspect /tmp/oc-docx-smoke-clean.docx >/tmp/oc-docx-smoke-clean.json; \
+    printf '%s\n' \
+      'document:' \
+      '  title: 结构化 DOCX smoke' \
+      '  cover: true' \
+      '  table_of_contents: true' \
+      'sections:' \
+      '  - heading: 第一章' \
+      '    level: 1' \
+      '    blocks:' \
+      '      - type: callout' \
+      '        kind: success' \
+      '        text: 构建成功' \
+      '      - type: table' \
+      '        headers: [列一, 列二]' \
+      '        rows: [[A, B]]' > /tmp/oc-docx-structured.yaml; \
+    oc-docx build /tmp/oc-docx-structured.yaml -o /tmp/oc-docx-structured.docx; \
+    unzip -tq /tmp/oc-docx-structured.docx; \
+    unzip -p /tmp/oc-docx-structured.docx word/document.xml | grep -q 'w:cantSplit'; \
+    rm -rf /tmp/oc-docx-smoke.md /tmp/oc-docx-smoke.docx /tmp/oc-docx-smoke-clean.docx \
+      /tmp/oc-docx-smoke-render /tmp/oc-docx-structured.yaml /tmp/oc-docx-structured.docx; \
     printf '%s\n' '名称,金额' '甲方,100' '乙方,200' > /tmp/oc-xlsx-smoke.csv; \
     oc-xlsx from-csv /tmp/oc-xlsx-smoke.csv -o /tmp/oc-xlsx-smoke.xlsx; \
     test -s /tmp/oc-xlsx-smoke.xlsx; \
