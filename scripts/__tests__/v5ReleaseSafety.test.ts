@@ -68,7 +68,7 @@ describe('V5 branch deployment policy', () => {
     assert.match(source, /libreoffice-writer \\\n\s+libreoffice-math \\/)
     assert.match(source, /dpkg-query -W -f='\$\{Status\}\\n' libreoffice-math/)
     assert.match(source, /pdftotext \/tmp\/oc-docx-smoke-render\/oc-docx-smoke\.pdf - \| grep -Eq 'E\[\[:space:\]\]\*=\[\[:space:\]\]\*m\[\[:space:\]\]\*c'/)
-    assert.match(overrides, /^OC_RUNTIME_IMAGE=openclaude\/openclaude-runtime:v5-ccb-cfe6829e4119-slim$/m)
+    assert.match(overrides, /^OC_RUNTIME_IMAGE=openclaude\/openclaude-runtime:v5-ccb-3462202b4a97-slim$/m)
   })
 
   test('Windows app branches fail closed even when ALLOW_ANY_BRANCH would bypass the generic guard', () => {
