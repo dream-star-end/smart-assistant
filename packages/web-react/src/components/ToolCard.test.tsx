@@ -19,6 +19,54 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
     expect(screen.getByTitle("ls -la")).toHaveClass("truncate");
   });
 
+  test("被中断 turn 的未完成历史子任务显示已取消，不再伪装运行中", () => {
+    const { container } = render(
+      <ToolCard
+        message={{
+          toolName: "Agent",
+          inputJson: { description: "调研登录流程" },
+          _completed: false,
+          _timelineRecord: true,
+          _dispatchOutcome: "interrupted",
+        }}
+      />,
+    );
+
+    expect(screen.getByText("已取消")).toBeInTheDocument();
+    expect(screen.queryByText("运行中")).not.toBeInTheDocument();
+    expect(container.querySelector(".animate-spin")).not.toBeInTheDocument();
+  });
+
+  test("实时未完成子任务没有历史终态证据时仍显示运行中", () => {
+    const { container } = render(
+      <ToolCard
+        message={{ toolName: "Agent", inputJson: { description: "调研登录流程" }, _completed: false }}
+      />,
+    );
+
+    expect(screen.getByText("运行中")).toBeInTheDocument();
+    expect(screen.queryByText("已取消")).not.toBeInTheDocument();
+    expect(container.querySelector(".animate-spin")).toBeInTheDocument();
+  });
+
+  test("被中断 turn 中已经完成的历史子任务仍显示完成", () => {
+    const { container } = render(
+      <ToolCard
+        message={{
+          toolName: "Agent",
+          inputJson: { description: "调研登录流程" },
+          _completed: true,
+          _timelineRecord: true,
+          _dispatchOutcome: "interrupted",
+        }}
+      />,
+    );
+
+    expect(screen.getByText("完成")).toBeInTheDocument();
+    expect(screen.queryByText("已取消")).not.toBeInTheDocument();
+    expect(container.querySelector(".animate-spin")).not.toBeInTheDocument();
+  });
+
   test("涉及 token 的工具卡用紧凑数字实时替换自己的调用消耗", () => {
     const message = {
       toolName: "Bash",
