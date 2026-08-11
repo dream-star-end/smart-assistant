@@ -326,6 +326,7 @@ RUN set -eux; \
       '        rows: [[A, B]]' > /tmp/oc-docx-structured.yaml; \
     oc-docx build /tmp/oc-docx-structured.yaml -o /tmp/oc-docx-structured.docx; \
     unzip -tq /tmp/oc-docx-structured.docx; \
+    unzip -p /tmp/oc-docx-structured.docx word/document.xml | grep -q 'w:cantSplit'; \
     rm -rf /tmp/oc-docx-smoke.md /tmp/oc-docx-smoke.docx /tmp/oc-docx-smoke-clean.docx \
       /tmp/oc-docx-smoke-render /tmp/oc-docx-structured.yaml /tmp/oc-docx-structured.docx; \
     printf '%s\n' '名称,金额' '甲方,100' '乙方,200' > /tmp/oc-xlsx-smoke.csv; \

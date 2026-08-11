@@ -355,6 +355,15 @@ def set_repeat_table_header(row: Any) -> None:
     header.set(qn("w:val"), "true")
 
 
+def set_cant_split(row: Any) -> None:
+    tr_pr = row._tr.get_or_add_trPr()
+    cant_split = tr_pr.find(qn("w:cantSplit"))
+    if cant_split is None:
+        cant_split = OxmlElement("w:cantSplit")
+        tr_pr.append(cant_split)
+    cant_split.set(qn("w:val"), "true")
+
+
 def _toggle_paragraph_property(paragraph: Any, tag: str, enabled: bool = True) -> None:
     p_pr = paragraph._p.get_or_add_pPr()
     element = p_pr.find(qn(f"w:{tag}"))
@@ -709,12 +718,14 @@ class DocumentBuilder:
         table.style = "Table Grid"
         table.autofit = True
         set_repeat_table_header(table.rows[0])
+        set_cant_split(table.rows[0])
         for index, header in enumerate(headers):
             _set_cell_text(table.rows[0].cells[index], header, self.font, bold=True, color="FFFFFF")
             set_cell_shading(table.rows[0].cells[index], self.theme.accent)
         for row_index, row_data in enumerate(rows):
             values = row_data if isinstance(row_data, list) else [row_data]
             row = table.add_row()
+            set_cant_split(row)
             for index in range(len(headers)):
                 _set_cell_text(row.cells[index], values[index] if index < len(values) else "", self.font)
                 if row_index % 2 == 1:
