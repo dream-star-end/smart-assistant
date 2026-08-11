@@ -57,7 +57,14 @@ import {
 import { MediaSignProvider } from "./components/chat/media";
 import { ChatInteractionContext, ToolCardActionsContext } from "./components/tool/context";
 import { Sidebar } from "./components/Sidebar";
-import { Alert, Sheet, Spinner, useConfirm, usePrompt } from "./components/ui";
+import {
+  Alert,
+  MOBILE_SESSION_NATIVE_DISMISS,
+  Sheet,
+  Spinner,
+  useConfirm,
+  usePrompt,
+} from "./components/ui";
 import { useAgentGate } from "./hooks/useAgentGate";
 import {
   type PanelParam,
@@ -208,9 +215,64 @@ type ImplicitReason = "中途打断" | "改写重发";
 const HISTORY_SKELETON_GRACE_MS = 800;
 const HISTORY_SKELETON_CAP_MS = 8000;
 
+const HARMONY_CLIENT_SESSION_KEY = "aurora:harmony-client-mode:v1";
+const HARMONY_OAUTH_RETURN_PARAMS = [
+  "github_linked",
+  "github_error",
+  "connector_linked",
+  "connector_error",
+] as const;
+
+function hasHarmonyOAuthReturn(params: URLSearchParams): boolean {
+  return HARMONY_OAUTH_RETURN_PARAMS.some((name) => params.has(name));
+}
+
+function hasHarmonyClientSession(): boolean {
+  try {
+    return window.sessionStorage.getItem(HARMONY_CLIENT_SESSION_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function updateHarmonyClientSession(enabled: boolean): void {
+  try {
+    if (enabled) {
+      window.sessionStorage.setItem(HARMONY_CLIENT_SESSION_KEY, "1");
+    } else {
+      window.sessionStorage.removeItem(HARMONY_CLIENT_SESSION_KEY);
+    }
+  } catch {
+    // sessionStorage can be unavailable in hardened browser contexts. The explicit
+    // query contract still works; only OAuth return restoration is skipped.
+  }
+}
+
 export function App() {
   const params = new URLSearchParams(location.search);
   const demo = params.get("demo") === "1";
+  // Harmony 原生壳只借用这一条显式、可版本化的入口契约。它仍复用同一套 Web 鉴权/
+  // 会话权威，但匿名态必须像正常客户端一样直达登录，而不是先露出营销 Landing。
+  // 只认精确 query 值，普通浏览器（包括携带其它 campaign query）语义完全不变。
+  const harmonyClientRequested = !demo && params.get("client") === "harmony";
+  const harmonyOAuthReturn = !demo && hasHarmonyOAuthReturn(params);
+  // OAuth providers return to fixed callback URLs and cannot be trusted to preserve
+  // arbitrary query parameters. Restore Harmony mode only for that exact, short-lived
+  // return shape and only when this tab previously entered through ?client=harmony.
+  const harmonyClientRestored =
+    !demo &&
+    params.get("client") === null &&
+    harmonyOAuthReturn &&
+    hasHarmonyClientSession();
+  const harmonyClient = harmonyClientRequested || harmonyClientRestored;
+  useEffect(() => {
+    if (demo) return;
+    if (harmonyClientRequested) {
+      updateHarmonyClientSession(true);
+      return;
+    }
+    if (!harmonyClientRestored) updateHarmonyClientSession(false);
+  }, [demo, harmonyClientRequested, harmonyClientRestored]);
   // 密码重置邮件链接：/reset-password?token=…（gateway SPA fallback 对无扩展名路径回退
   // index.html，故 SPA 能接住）。启动即检测 → 直接进入 AuthGate 的 reset 模式。
   const resetToken =
@@ -232,7 +294,9 @@ export function App() {
   );
   // 视图态：home=营销首页,app=登录页/工作区。启动静默续期成功（useAuth onBootAuthed）
   // 直接置 app,失败停在 home。
-  const [view, setView] = useState<"home" | "app">(resetToken ? "app" : "home");
+  const [view, setView] = useState<"home" | "app">(
+    resetToken || harmonyClient ? "app" : "home",
+  );
   // AuthGate 初始模式：「登录」与「免费开始」入口均=login（登录页自带「立即注册」链接，
   // 新用户不受阻），重置链接=reset。
   const [authMode, setAuthMode] = useState<AuthMode>(resetToken ? "reset" : "login");
@@ -408,7 +472,7 @@ export function App() {
       setTutorialOpen(keepPublicTutorial);
       setTutorialCase(keepPublicTutorial ? parseTutorialCase(publicQuery) : null);
       setTutorialTopic(keepPublicTutorial ? parseTutorialTopic(publicQuery) : null);
-      setView("home");
+      setView(harmonyClient ? "app" : "home");
     },
     // 登出前清本 user 的 IndexedDB 命名空间（隐私，类比 P5 媒体缓存按 authKey 失效）。
     onLogout: () => void sockRef.current?.wipePersistence(),
@@ -1123,6 +1187,10 @@ export function App() {
       sp.delete("connector_error");
       touched = true;
     }
+    if (harmonyClientRestored) {
+      sp.set("client", "harmony");
+      touched = true;
+    }
     if (touched) {
       const q = sp.toString();
       window.history.replaceState(
@@ -1131,7 +1199,7 @@ export function App() {
         window.location.pathname + (q ? `?${q}` : "") + window.location.hash,
       );
     }
-  }, [demo, toast]);
+  }, [demo, harmonyClientRestored, toast]);
 
   // 组织邀请接受流:URL 带 ?orgInvite=<token>。已登录 → 确认弹层 → accept → 刷新 /api/me;
   // 未登录 → token 留在 URL(不清),先走 AuthGate 登录/注册,进工作区后本 effect 再触发续接。
@@ -2070,7 +2138,7 @@ export function App() {
   }
   // A transient boot failure is not a logout. Surface the dedicated recovery
   // action immediately instead of hiding it behind the ordinary landing page.
-  if (!demo && view === "home" && !authRecoveryAvailable) {
+  if (!demo && !harmonyClient && view === "home" && !authRecoveryAvailable) {
     return (
       <>
         <LazyBoundary fallback={<SplashFallback />}>
@@ -2150,6 +2218,7 @@ export function App() {
           setAuthMode("login");
           setView("home");
         }}
+        showHomeBack={!harmonyClient}
         theme={theme}
         onCycleTheme={cycle}
         turnstileBypass={publicCfg?.turnstileBypass}
@@ -2248,6 +2317,7 @@ export function App() {
         onOpenChange={setMobileNavOpen}
         side="left"
         srTitle="会话导航"
+        nativeDismissMarker={MOBILE_SESSION_NATIVE_DISMISS}
         className="w-[268px] max-w-[82vw] md:hidden"
         overlayClassName="md:hidden"
       >

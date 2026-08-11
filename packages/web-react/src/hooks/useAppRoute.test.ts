@@ -20,8 +20,9 @@ describe('教程 URL 深链', () => {
   })
 
   it('往返保留无关 query，并在离开 help 时清理 topic', () => {
-    const source = new URLSearchParams('campaign=summer&panel=settings')
+    const source = new URLSearchParams('client=harmony&campaign=summer&panel=settings')
     const help = withPanelParams(source, 'help', PRODUCT_CAPABILITIES.teamMode.id)
+    expect(help.get('client')).toBe('harmony')
     expect(help.toString()).toContain('campaign=summer')
     expect(help.get('panel')).toBe('help')
     expect(help.get('topic')).toBe('team-mode')
