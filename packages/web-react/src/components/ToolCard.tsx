@@ -63,8 +63,11 @@ export function ToolCard({
   const reportedError = name === "Bash" && /^#{1,6}\s*Error\b/m.test(outputText);
   const isBlocked = name === "Bash" && /(?:^|\n)oc-web:\s*blocked:/i.test(outputText);
   const isError = !!renderTool.error || reportedError;
+  // 历史 tape 是不可变真记录：turn 已中断时，未完成 tool 代表被取消，而不是仍在运行。
+  const isInterruptedHistorical =
+    !completed && renderTool._timelineRecord === true && renderTool._dispatchOutcome === "interrupted";
   // 取消(如 Codex item status 'cancelled')是中性终态:≠ 失败(不红)、≠ 运行中(不转圈)。
-  const isCancelled = !isError && !!renderTool.cancelled;
+  const isCancelled = !isError && (!!renderTool.cancelled || isInterruptedHistorical);
   const isRunning = !completed && !isError && !isBlocked && !isCancelled;
   const statusLabel = isRunning
     ? "运行中"
