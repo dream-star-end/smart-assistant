@@ -233,7 +233,14 @@ const OC_SURFACES: Record<string, Record<string, Probe>> = {
     render: scriptProbe('oc-diagram.sh', ['--help'], { code: 0, stdout: /oc-diagram/ }),
   },
   'oc-docx': {
-    render: scriptProbe('oc-docx.sh', ['--help'], { code: 0, stdout: /oc-docx/ }),
+    convert: scriptProbe('oc-docx.py', ['convert', '--help'], {
+      code: 0,
+      stdout: /Markdown\/Quarto/,
+    }),
+    build: scriptProbe('oc-docx.py', ['build', '--help'], { code: 0, stdout: /YAML/ }),
+    render: scriptProbe('oc-docx.py', ['render', '--help'], { code: 0, stdout: /视觉安全 JPEG/ }),
+    inspect: scriptProbe('oc-docx.py', ['inspect', '--help'], { code: 0, stdout: /逐页配对/ }),
+    scrub: scriptProbe('oc-docx.py', ['scrub', '--help'], { code: 0, stdout: /--keep-author/ }),
   },
   'oc-figcheck': {
     check: tsFailureProbe('packages/gateway/src/ocFigCheckCli.ts', [], /usage: oc-figcheck/),
@@ -783,6 +790,15 @@ function singlePurpose(relativePath: string, operation: string, usage: RegExp): 
   return new Set([operation])
 }
 
+function pythonArgparseCommands(relativePath: string): Set<string> {
+  const value = source(relativePath)
+  const commands = new Set(
+    [...value.matchAll(/subparsers\.add_parser\(\s*"([a-z0-9-]+)"/g)].map((match) => match[1]),
+  )
+  assert.ok(commands.size > 0, `${relativePath}: argparse commands not found`)
+  return commands
+}
+
 function productionSurfaces(): Record<string, Set<string>> {
   const connect = tsDispatchCommands('packages/gateway/src/ocConnectCli.ts', 'command')
   const memory = tsDispatchCommands('packages/mcp-memory/src/ocMemoryCli.ts', 'cmd')
@@ -801,10 +817,8 @@ function productionSurfaces(): Record<string, Set<string>> {
       'render',
       /用法: \$TOOL/,
     ),
-    'oc-docx': singlePurpose(
-      'packages/commercial/agent-sandbox/platform-runtime/bin/oc-docx.sh',
-      'render',
-      /Usage:\s+oc-docx/,
+    'oc-docx': pythonArgparseCommands(
+      'packages/commercial/agent-sandbox/platform-runtime/bin/oc-docx.py',
     ),
     'oc-figcheck': singlePurpose(
       'packages/gateway/src/ocFigCheckCli.ts',

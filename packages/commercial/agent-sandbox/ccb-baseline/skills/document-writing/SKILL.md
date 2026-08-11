@@ -1,148 +1,135 @@
 ---
 name: document-writing
-description: 用 Pandoc/Quarto 生成排版美观、公式为 Word 原生可编辑格式的 DOCX/Word 文档。用户要求写报告、论文、方案、含公式 Word、导出 docx 时调用。
+description: 用 Pandoc/Quarto 或结构化 YAML/JSON 生成高质量 DOCX，并在交付前完成逐页视觉质检、结构检查和隐私清理。用户要求 Word、DOCX、报告、论文、方案或公式文档时调用。
 priority: 8
 ---
 
-# 高质量 Word/DOCX 写作流程
+# 高质量 Word/DOCX 写作与逐页质检
 
-当用户要 **Word / DOCX / 报告 / 论文 / 含公式文档** 时,不要手写 HTML 再改扩展名,也不要把公式截图塞进 Word。默认采用源文档管线:
+生成成功只是中间结果。交付 `.docx` 前必须完成：**生成 → 渲染全部页面 → 结构检查 → 逐页视觉检查 → 必要时修复并重新渲染 → 隐私清理 → 最终结构复验**。不得把 HTML/纯文本改扩展名冒充 Word，也不得把公式截图塞进文档。
 
-```text
-结构化 Markdown/Quarto + LaTeX 公式
-  → Pandoc/Quarto
-  → DOCX(Word 原生 OMML 公式,可继续编辑)
-```
+## 1. 选对生成路线
 
-## 0. 先选格式
+### Pandoc / Quarto：公式、引用和用户模板
 
-- **长报告、论文、技术文档、需要标题页/目录/交叉引用/代码块**:写 `.qmd`,用 Quarto。
-- **简单 Markdown 文档、快速交付 Word**:写 `.md`,用 `oc-docx` 的 Pandoc 路径。
-- **用户已有 Word 模板**:让用户上传/指定 `reference.docx`,用 `--reference-doc` 套样式。
+以下任一条件成立时使用 Markdown/Quarto 路线：
 
-容器内应已有工具:
+- 需要 Word 原生可编辑公式、引用、交叉引用或复杂图片；
+- 用户上传了 `reference.docx`；
+- 长论文/技术报告需要 Quarto 的目录、编号和文献能力。
 
-```bash
-quarto --version
-pandoc --version      # OpenClaude 包装为 Quarto bundled Pandoc
-oc-docx --help
-```
-
-## 1. 写源文档规则
-
-1. 标题层级清楚:`#` / `##` / `###`,不要跳级。
-2. 公式必须保留 LaTeX 源:
-   - 行内公式:`$a^2 + b^2 = c^2$`
-   - 块公式:
-     ```tex
-     $$
-     E = mc^2
-     $$
-     ```
-3. 表格优先用 Markdown pipe table;复杂表格先生成 CSV/Markdown,不要用空格对齐。
-4. 图片用 Markdown 语法并写 caption/alt:`![图 1: 说明](figure.png)`。
-5. 中文报告默认中英文混排,避免全角/半角混乱;数学变量仍用 LaTeX。
-6. 不确定公式是否合法时,先生成一个最小 DOCX 测试,不要等全文写完才发现公式坏。
-
-## 2. 推荐 Quarto 模板
-
-`report.qmd` 可从这个骨架开始:
+公式保留 LaTeX 源，交给 Pandoc 转成 OMML：
 
 ```markdown
----
-title: "文档标题"
-subtitle: "可选副标题"
-author: "OpenClaude"
-format:
-  docx:
-    toc: true
-    number-sections: true
-    reference-doc: /usr/local/share/openclaude-docgen/reference.docx
----
-
-# 摘要
-
-这里写摘要。
-
-# 方法
-
-行内公式 $a^2 + b^2 = c^2$。
+行内公式 $a^2+b^2=c^2$。
 
 $$
-E = mc^2
+E=mc^2
 $$
-
-# 结论
-
-这里写结论。
 ```
-
-生成:
 
 ```bash
-quarto render report.qmd --to docx
+oc-docx convert report.qmd -o /home/agent/.openclaude/generated/report-draft.docx
+# 旧调用仍兼容：oc-docx report.md -o ...
+oc-docx convert report.md --reference-doc /path/to/reference.docx -o /home/agent/.openclaude/generated/report-draft.docx
 ```
 
-如果想指定输出路径,更省心用平台 helper:
+### 结构化 YAML/JSON：封面、主题和精排组件
+
+没有公式/交叉引用，但强调封面、页眉页脚、主题、callout、代码块或表格精排时使用：
+
+```yaml
+document:
+  title: 文档标题
+  subtitle: 可选副标题
+  author: 仅在用户明确指定时填写
+  cover: true
+  table_of_contents: true
+  table_of_contents_mode: static  # static / field / both
+  footer: 可选页脚
+  fonts:
+    east_asia: Noto Sans CJK SC
+    latin: DejaVu Sans
+    mono: DejaVu Sans Mono
+sections:
+  - heading: 第一章
+    level: 1
+    blocks:
+      - type: paragraph
+        text: 正文
+      - type: bullets
+        items: [第一项, 第二项]
+      - type: code
+        language: python
+        text: |
+          print("hello")
+      - type: table
+        caption: 表 1
+        headers: [列一, 列二]
+        rows: [[A, B]]
+      - type: callout
+        kind: warning  # info / warning / success / danger
+        title: 注意
+        text: 风险说明
+```
+
+支持 block：`paragraph`、`bullets`、`numbered`、`code`、`table`、`quote`、`callout`、`link`、`page_break`。
 
 ```bash
-oc-docx --quarto report.qmd -o /home/agent/.openclaude/report.docx
+oc-docx build content.yaml -o /home/agent/.openclaude/generated/report-draft.docx
 ```
 
-## 3. 快速 Markdown → Word
+## 2. 强制逐页质量闭环
+
+QA 目录必须位于 vision 可信根，固定使用：
 
 ```bash
-cat > /home/agent/.openclaude/report.md <<'EOF_MD'
-# 标题
-
-这是正文,公式 $x = y^2$。
-
-$$
-\int_0^1 x^2\,dx = \frac{1}{3}
-$$
-EOF_MD
-
-oc-docx /home/agent/.openclaude/report.md -o /home/agent/.openclaude/report.docx
+QA=/home/agent/.openclaude/generated/report-qa
+oc-docx render /home/agent/.openclaude/generated/report-draft.docx -o "$QA" --emit-pdf
+oc-docx inspect /home/agent/.openclaude/generated/report-draft.docx \
+  --render-dir "$QA" --json "$QA/report.json"
 ```
 
-默认样式模板:
+`render` 为每一页同时生成：
 
-```text
-/usr/local/share/openclaude-docgen/reference.docx
-```
+- `page-N.png`：160 DPI 原始页面，保留作高精度复核；
+- `vision-page-N.jpg`：最长边/质量按 4.5MB 预算自动规范化，供 `oc-vision` 使用。
 
-用户给了自己的模板时:
+必须按自然页序枚举**全部**视觉副本，不得设页数上限、抽样或因单页过大跳过：
 
 ```bash
-oc-docx report.md --reference-doc /path/to/reference.docx -o final.docx
+find "$QA" -maxdepth 1 -type f -name 'vision-page-*.jpg' -print | sort -V
+oc-vision understand "$QA/vision-page-1.jpg" --prompt "检查本页是否有裁切、表格断裂、异常分页、缺字乱码、页眉页脚错误、空白页或过度拥挤；明确给出 PASS 或问题。"
+# 对 find 列出的每一页逐一执行同样检查
 ```
 
-## 4. 交付前必须验证
+任何一页有问题：修改源 `.qmd/.md/.yaml/.json`，重新生成、render、inspect，并从第一页重新逐页检查。`inspect` 的自动警告不能替代视觉检查。
 
-生成 DOCX 后至少跑:
+## 3. 隐私清理与最终验证
+
+默认不写 `author: OpenClaude`。只有用户明确指定作者时才保留作者属性：
 
 ```bash
-test -s /path/to/final.docx
-unzip -tq /path/to/final.docx
+oc-docx scrub /home/agent/.openclaude/generated/report-draft.docx \
+  -o /home/agent/.openclaude/generated/report.docx --keep-title
+# 用户明确要求保留作者时再加 --keep-author
+
+oc-docx inspect /home/agent/.openclaude/generated/report.docx
+unzip -tq /home/agent/.openclaude/generated/report.docx
 ```
 
-如果文档含公式,再确认有 Word 原生公式 OMML:
+含公式时还必须确认清理后仍为原生 OMML：
 
 ```bash
-unzip -p /path/to/final.docx word/document.xml | grep -q 'm:oMath' \
-  && echo 'OK: native Word equations found'
+unzip -p /home/agent/.openclaude/generated/report.docx word/document.xml | grep -q 'm:oMath'
 ```
 
-如果没有 `m:oMath`,说明公式可能被当普通文本或图片处理了:回到源文档检查 `$...$` / `$$...$$` 是否闭合,不要交付。
+scrub 只清理元数据和 `rsid`，不改变可见版式；因此通过视觉质检后无需因 scrub 重渲染，但最终 ZIP/结构/OMML 必须复验。
 
-## 5. 给用户的交付方式
+## 4. 交付
 
-- 最终回复里给 **绝对路径**,例如:`/home/agent/.openclaude/report.docx`。
-- 简短说明:文档由 Pandoc/Quarto 生成,公式是 Word 原生可编辑公式。
-- 如果同时生成了源 `.qmd/.md`,也给路径,方便用户后续修改再导出。
+最终只交付清理后的 `.docx`（以及用户需要的源文件），给出绝对路径。不要把 QA PNG/JPEG 当正式附件，除非用户明确要求。
 
-## 工具调用纪律(重要)
+## 工具调用纪律
 
-- **只用本 skill 对应的命令/工具传参调用**;它已把鉴权、端点、底层请求全封装好,你只需给参数。
-- **绝不**自己拼 `curl` / `wget` / 直连 HTTP,**绝不**猜测或硬编码任何 URL / 端口 / 接口路径 / token。
-- 命令失败时按本 skill 的失败处理重试或如实告诉用户,**绝不**改用 curl/HTTP 兜底。
+只调用本 skill 给出的 `oc-docx` / `oc-vision` / 本地校验命令；绝不自行拼 `curl`、URL、端口或 token。命令失败时读清错误并修正输入/路径，不能用 HTML 改扩展名兜底。

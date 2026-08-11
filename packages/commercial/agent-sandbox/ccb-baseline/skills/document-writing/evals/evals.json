@@ -44,6 +44,17 @@
         "产物为合法 .docx 并给出绝对路径",
         "最终回复说明了验证 OMML 的方式与所用命令"
       ]
+    },
+    {
+      "id": "structured-docx-page-qa-scrub",
+      "prompt": "请生成一份排版完整的 Word(.docx)《项目风险评审简报》：需要封面、目录、页眉页脚和页码；正文包含风险 callout、一段 Python 代码、一个至少 25 行且会跨页的风险表格。没有数学公式。交付前必须逐页检查是否裁切、表格断裂、异常分页、乱码或页眉页脚错误，并清理生成器/最后修改人等隐私元数据。最终回复说明生成路线、逐页检查证据、清理结果和产物绝对路径。",
+      "assertions": [
+        "使用 oc-docx build 的 YAML/JSON 结构化路线，包含封面、目录、页眉页脚、页码、callout、代码块和跨页表格",
+        "用 oc-docx render 在 /home/agent/.openclaude/generated 下生成全部 page-N.png 与逐页对应的 vision-page-N.jpg，没有抽样或页数上限",
+        "用 oc-docx inspect 验证 ZIP/结构与原图-视觉副本页数一一对应，并对每个 vision-page-N.jpg 逐页调用视觉检查",
+        "发现布局问题时回改源配置并重新生成、渲染、检查；没有把自动白页警告冒充视觉验收",
+        "用 oc-docx scrub 生成最终 DOCX，保留标题但不保留未明确要求的作者，并对清理后文件再次做结构/ZIP 验证"
+      ]
     }
   ]
 }
