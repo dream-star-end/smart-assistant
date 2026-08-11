@@ -4,10 +4,21 @@ import test from 'node:test'
 import { TOOLBAR_HEIGHT, calculateViewBounds } from '../src/window-layout.mjs'
 
 test('toolbar mode reserves a fixed product offset without overlap', () => {
-  assert.equal(TOOLBAR_HEIGHT, 52)
+  assert.equal(TOOLBAR_HEIGHT, 44)
   assert.deepEqual(calculateViewBounds({ width: 1280, height: 800 }), {
-    shell: { x: 0, y: 0, width: 1280, height: 52 },
-    product: { x: 0, y: 52, width: 1280, height: 748 },
+    shell: { x: 0, y: 0, width: 1280, height: 44 },
+    product: { x: 0, y: 44, width: 1280, height: 756 },
+  })
+})
+
+test('desktop target sizes keep the 44px app bar and fill the remaining product area', () => {
+  assert.deepEqual(calculateViewBounds({ width: 520, height: 360 }), {
+    shell: { x: 0, y: 0, width: 520, height: 44 },
+    product: { x: 0, y: 44, width: 520, height: 316 },
+  })
+  assert.deepEqual(calculateViewBounds({ width: 1366, height: 768 }), {
+    shell: { x: 0, y: 0, width: 1366, height: 44 },
+    product: { x: 0, y: 44, width: 1366, height: 724 },
   })
 })
 

@@ -40,7 +40,14 @@ import {
   resolveStartUrl,
   sanitizeWindowsFilename,
 } from './security-policy.mjs'
-import { canOpenDownloads, shellModeAfterDownloadsClose } from './shell-mode.mjs'
+import {
+  canFocusProduct,
+  canOpenDownloads,
+  canOpenMoreMenu,
+  normalizeShellMode,
+  shellModeAfterDownloadsClose,
+  shouldShowProduct,
+} from './shell-mode.mjs'
 import {
   SHELL_ORIGIN,
   SHELL_URL,
@@ -93,6 +100,7 @@ let windowStateStore = null
 let detachWindowState = null
 let removeWindowListeners = null
 let creatingMainWindow = null
+let smokeMenuOpenCount = 0
 
 const viewerWindows = new Set()
 const configuredProductSessions = new WeakSet()
@@ -550,16 +558,22 @@ function layoutViews() {
   shellView.setBounds(layout.shell)
 }
 
-function setShellMode(nextMode) {
-  const normalized = ['toolbar', 'downloads', 'offline'].includes(nextMode) ? nextMode : 'toolbar'
-  if (shellMode === normalized) {
-    if (normalized !== 'toolbar') focusShell()
+function setShellMode(nextMode, { focusProductOnToolbar = false } = {}) {
+  const normalized = normalizeShellMode(nextMode)
+  shellMode = normalized
+
+  if (!shouldShowProduct(normalized)) {
+    productView?.setVisible(false)
+    layoutViews()
+    focusShell()
     pushShellState()
     return
   }
-  shellMode = normalized
+
+  // Keep this order stable: reveal first, restore geometry second, and focus last.
+  productView?.setVisible(true)
   layoutViews()
-  if (normalized !== 'toolbar') focusShell()
+  if (focusProductOnToolbar) focusProduct()
   pushShellState()
 }
 
@@ -573,10 +587,9 @@ function markProductReady() {
   productState.network = 'online'
   productState.error = null
   const recoveredFromOffline = shellMode === 'offline'
-  if (recoveredFromOffline) shellMode = 'toolbar'
-  layoutViews()
-  if (recoveredFromOffline) focusProduct()
-  pushShellState()
+  setShellMode(recoveredFromOffline ? 'toolbar' : shellMode, {
+    focusProductOnToolbar: recoveredFromOffline,
+  })
 }
 
 function markProductFailed(kind = 'load-failed') {
@@ -597,41 +610,58 @@ function focusShell() {
   return true
 }
 
+function focusShellAppBar() {
+  const shellWebContents = shellView?.webContents
+  if (!focusShell() || !shellWebContents || shellWebContents.isDestroyed()) return false
+  void shellWebContents
+    .executeJavaScript("document.querySelector('#downloads-button')?.focus()")
+    .catch(() => {})
+  return true
+}
+
 function focusProduct() {
+  if (!canFocusProduct(shellMode) || !productView || productView.getVisible() !== true) return false
   if (!productWebContents || productWebContents.isDestroyed()) return false
   productWebContents.focus()
   return true
 }
 
+function focusForShellMode() {
+  return canFocusProduct(shellMode) ? focusProduct() : focusShell()
+}
+
 function goBack() {
   const history = productWebContents?.navigationHistory
   if (!history?.canGoBack()) return false
+  if (!canFocusProduct(shellMode)) focusShell()
   history.goBack()
-  focusProduct()
+  focusForShellMode()
   return true
 }
 
 function goForward() {
   const history = productWebContents?.navigationHistory
   if (!history?.canGoForward()) return false
+  if (!canFocusProduct(shellMode)) focusShell()
   history.goForward()
-  focusProduct()
+  focusForShellMode()
   return true
 }
 
 function reloadProduct() {
   if (!productWebContents || productWebContents.isDestroyed()) return false
+  if (!canFocusProduct(shellMode)) focusShell()
   markProductLoading()
   productWebContents.reload()
-  focusProduct()
+  focusForShellMode()
   return true
 }
 
 function homeProduct() {
   if (!activeStartUrl || !productWebContents || productWebContents.isDestroyed()) return false
-  if (shellMode === 'downloads') setShellMode('toolbar')
+  if (!canFocusProduct(shellMode)) focusShell()
   void loadProductUrl(activeStartUrl)
-  focusProduct()
+  focusForShellMode()
   return true
 }
 
@@ -640,7 +670,7 @@ function setProductZoom(nextFactor) {
   const normalized = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, Number(nextFactor.toFixed(2))))
   productWebContents.setZoomFactor(normalized)
   pushShellState()
-  focusProduct()
+  focusForShellMode()
   return true
 }
 
@@ -649,15 +679,58 @@ function adjustProductZoom(delta) {
   return setProductZoom(productWebContents.getZoomFactor() + delta)
 }
 
-function desktopActions() {
+function desktopActions(source = 'product') {
   return {
     back: goBack,
     forward: goForward,
+    focusNextPane: source === 'shell' ? focusProduct : focusShellAppBar,
     reload: reloadProduct,
     zoomIn: () => adjustProductZoom(ZOOM_STEP),
     zoomOut: () => adjustProductZoom(-ZOOM_STEP),
     zoomReset: () => setProductZoom(1),
   }
+}
+
+function buildMoreMenuTemplate() {
+  const navigation = navigationSnapshot()
+  return [
+    {
+      label: '后退',
+      accelerator: 'Alt+Left',
+      enabled: navigation.canGoBack,
+      click: () => goBack(),
+    },
+    {
+      label: '前进',
+      accelerator: 'Alt+Right',
+      enabled: navigation.canGoForward,
+      click: () => goForward(),
+    },
+    { label: '重新加载', accelerator: 'CmdOrCtrl+R', click: () => reloadProduct() },
+    { label: '主页', click: () => homeProduct() },
+    { type: 'separator' },
+    { label: '放大', accelerator: 'CmdOrCtrl+Plus', click: () => adjustProductZoom(ZOOM_STEP) },
+    { label: '缩小', accelerator: 'CmdOrCtrl+-', click: () => adjustProductZoom(-ZOOM_STEP) },
+    { label: '重置缩放', accelerator: 'CmdOrCtrl+0', click: () => setProductZoom(1) },
+    { type: 'separator' },
+    { label: '打开下载文件夹', click: () => openDownloadsFolder() },
+  ]
+}
+
+function openMoreMenu() {
+  if (!canOpenMoreMenu(shellMode) || !isAlive(mainWindow)) return false
+  if (smokeTest) {
+    smokeMenuOpenCount += 1
+    focusProduct()
+    return true
+  }
+
+  const menu = Menu.buildFromTemplate(buildMoreMenuTemplate())
+  menu.popup({
+    window: mainWindow,
+    callback: () => focusProduct(),
+  })
+  return true
 }
 
 function openDownloadsFolder() {
@@ -700,6 +773,8 @@ function executeShellCommand(command) {
       return reloadProduct()
     case 'home':
       return homeProduct()
+    case 'open-more-menu':
+      return openMoreMenu()
     case 'focus-product':
       return focusProduct()
     case 'downloads-open':
@@ -708,8 +783,7 @@ function executeShellCommand(command) {
       return true
     case 'downloads-close': {
       const nextMode = shellModeAfterDownloadsClose(productState)
-      setShellMode(nextMode)
-      if (nextMode === 'toolbar') focusProduct()
+      setShellMode(nextMode, { focusProductOnToolbar: nextMode === 'toolbar' })
       return true
     }
     case 'open-downloads-folder':
@@ -760,7 +834,7 @@ function installProductEvents(webContents, { appOrigin, isSmoke }) {
   })
   webContents.on('render-process-gone', () => markProductFailed('load-failed'))
   webContents.on('before-input-event', (event, input) => {
-    if (handleDesktopShortcut(input, desktopActions())) event.preventDefault()
+    if (handleDesktopShortcut(input, desktopActions('product'))) event.preventDefault()
   })
 }
 
@@ -900,6 +974,7 @@ async function createMainWindow({ startUrl, appOrigin, isSmoke = false } = {}) {
   })
   const localShellView = new WebContentsView({ webPreferences: shellWebPreferences() })
   localShellView.setBackgroundColor('#00000000')
+  localProductView.setVisible(true)
   productView = localProductView
   shellView = localShellView
   productWebContents = localProductView.webContents
@@ -913,7 +988,7 @@ async function createMainWindow({ startUrl, appOrigin, isSmoke = false } = {}) {
   installShellHardening(localShellView.webContents)
   installProductEvents(localProductView.webContents, { appOrigin, isSmoke })
   localShellView.webContents.on('before-input-event', (event, input) => {
-    if (handleDesktopShortcut(input, desktopActions())) event.preventDefault()
+    if (handleDesktopShortcut(input, desktopActions('shell'))) event.preventDefault()
   })
   localShellView.webContents.on('did-finish-load', () => {
     shellReady = true
@@ -981,7 +1056,215 @@ function waitForWebContentsEvent(webContents, eventName, timeoutMs = 4_000) {
   })
 }
 
+async function elementCenter(webContents, selector) {
+  const point = await webContents.executeJavaScript(`((selector) => {
+    const element = document.querySelector(selector)
+    if (!element) return null
+    const bounds = element.getBoundingClientRect()
+    const style = getComputedStyle(element)
+    if (
+      bounds.width <= 0 ||
+      bounds.height <= 0 ||
+      style.display === 'none' ||
+      style.visibility === 'hidden' ||
+      style.pointerEvents === 'none'
+    ) {
+      return null
+    }
+    return {
+      x: Math.floor(bounds.left + bounds.width / 2),
+      y: Math.floor(bounds.top + bounds.height / 2),
+    }
+  })(${JSON.stringify(selector)})`)
+  assert.ok(point, `expected ${selector} to be visible and interactive`)
+  return point
+}
+
+async function clickElementWithInput(window, webContents, selector) {
+  await focusWebContentsForInput(window, webContents, `click ${selector}`)
+  const point = await elementCenter(webContents, selector)
+  webContents.sendInputEvent({ type: 'mouseMove', ...point })
+  webContents.sendInputEvent({ type: 'mouseDown', button: 'left', clickCount: 1, ...point })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  webContents.sendInputEvent({ type: 'mouseUp', button: 'left', clickCount: 1, ...point })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+}
+
+async function focusWebContentsForInput(window, webContents, action) {
+  await waitForCondition(
+    async () => {
+      if (!isAlive(window)) return false
+      if (!window.isVisible()) window.show()
+      window.focus()
+      webContents.focus()
+      await webContents.executeJavaScript(
+        'new Promise((resolve) => requestAnimationFrame(resolve))',
+      )
+      return window.isFocused() && webContents.isFocused()
+    },
+    `host window and target WebContents did not acquire native focus for ${action}`,
+  ).catch((error) => {
+    throw new Error(
+      `${error.message}; windowFocused=${window?.isFocused?.() === true}; ` +
+        `webContentsFocused=${webContents.isFocused()}`,
+    )
+  })
+}
+
+async function sendKeyWithInput(window, webContents, keyCode, modifiers = []) {
+  await focusWebContentsForInput(window, webContents, `key ${keyCode}`)
+  webContents.sendInputEvent({ type: 'keyDown', keyCode, modifiers })
+  webContents.sendInputEvent({ type: 'keyUp', keyCode, modifiers })
+}
+
+async function waitForViewLayout(window, shell, product, width, height, mode = shellMode) {
+  window.setContentSize(width, height)
+  await waitForCondition(() => {
+    const bounds = window.getContentBounds()
+    if (bounds.width !== width || bounds.height !== height) return false
+    const expected = calculateViewBounds(bounds, { shellMode: mode })
+    return (
+      JSON.stringify(shell.getBounds()) === JSON.stringify(expected.shell) &&
+      JSON.stringify(product.getBounds()) === JSON.stringify(expected.product)
+    )
+  }, `child view bounds did not match ${width}x${height}`)
+}
+
+async function writeOptionalSmokeScreenshot({
+  window,
+  shell,
+  product,
+  shellContents,
+  productContents,
+}) {
+  const screenshotPath = process.env.OPENCLAUDE_SMOKE_SCREENSHOT_PATH
+  if (screenshotPath === undefined || screenshotPath === '') return false
+  assert.equal(
+    path.isAbsolute(screenshotPath),
+    true,
+    'OPENCLAUDE_SMOKE_SCREENSHOT_PATH must be an absolute path',
+  )
+  assert.ok(
+    [SMOKE_PRODUCT_URL, SMOKE_PRODUCT_ROUTE_URL].includes(productContents.getURL()),
+    'visual smoke capture must use the local product fixture',
+  )
+  assert.equal(shellMode, 'downloads', 'visual smoke capture requires the downloads surface')
+  assert.equal(product.getVisible(), false, 'visual smoke capture must hide the product view')
+
+  await waitForViewLayout(window, shell, product, 1280, 800, 'downloads')
+  productContents.setZoomFactor(1)
+  shellContents.setZoomFactor(1)
+  shellContents.send(IPC_CHANNELS.state, {
+    ...shellStateSnapshot(),
+    shellMode: 'downloads',
+    theme: { mode: 'light', forcedColors: false, reduceTransparency: true },
+  })
+  await shellContents.executeJavaScript(`new Promise((resolve) => {
+    document.documentElement.dataset.visualCapture = 'true'
+    requestAnimationFrame(() => requestAnimationFrame(resolve))
+  })`)
+
+  try {
+    assert.equal(
+      await shellContents.executeJavaScript(
+        "document.documentElement.dataset.theme === 'light' && document.body.dataset.shellMode === 'downloads'",
+      ),
+      true,
+      'visual smoke capture did not settle into its canonical light downloads state',
+    )
+    const image = await shellContents.capturePage()
+    const png = image.toPNG()
+    assert.ok(png.length > 0, 'visual smoke capture produced an empty PNG')
+    await writeFile(screenshotPath, png, { mode: 0o600 })
+  } finally {
+    await shellContents.executeJavaScript(
+      "delete document.documentElement.dataset.visualCapture",
+    )
+    pushShellState()
+  }
+  return true
+}
+
+function companionScreenshotPath(screenshotPath, suffix) {
+  const parsed = path.parse(screenshotPath)
+  return path.join(parsed.dir, `${parsed.name}-${suffix}${parsed.ext || '.png'}`)
+}
+
+async function writeOptionalToolbarScreenshots({
+  window,
+  shell,
+  product,
+  shellContents,
+  productContents,
+}) {
+  const screenshotPath = process.env.OPENCLAUDE_SMOKE_SCREENSHOT_PATH
+  if (screenshotPath === undefined || screenshotPath === '') return false
+  assert.equal(
+    path.isAbsolute(screenshotPath),
+    true,
+    'OPENCLAUDE_SMOKE_SCREENSHOT_PATH must be an absolute path',
+  )
+  assert.ok(
+    [SMOKE_PRODUCT_URL, SMOKE_PRODUCT_ROUTE_URL].includes(productContents.getURL()),
+    'toolbar capture must use the local product fixture',
+  )
+  assert.equal(shellMode, 'toolbar', 'toolbar capture requires the normal workspace surface')
+  assert.equal(product.getVisible(), true, 'toolbar capture requires the visible product view')
+
+  await waitForViewLayout(window, shell, product, 1280, 800, 'toolbar')
+  productContents.setZoomFactor(1)
+  shellContents.setZoomFactor(1)
+  shellContents.send(IPC_CHANNELS.state, {
+    ...shellStateSnapshot(),
+    shellMode: 'toolbar',
+    theme: { mode: 'light', forcedColors: false, reduceTransparency: true },
+  })
+  await Promise.all([
+    shellContents.executeJavaScript(`new Promise((resolve) => {
+      document.documentElement.dataset.visualCapture = 'true'
+      requestAnimationFrame(() => requestAnimationFrame(resolve))
+    })`),
+    productContents.executeJavaScript(`new Promise((resolve) => {
+      document.documentElement.dataset.visualCapture = 'true'
+      requestAnimationFrame(() => requestAnimationFrame(resolve))
+    })`),
+  ])
+
+  try {
+    assert.equal(
+      await shellContents.executeJavaScript(
+        "document.documentElement.dataset.theme === 'light' && document.body.dataset.shellMode === 'toolbar'",
+      ),
+      true,
+      'toolbar capture did not settle into its canonical light state',
+    )
+    const [shellImage, productImage] = await Promise.all([
+      shellContents.capturePage(),
+      productContents.capturePage(),
+    ])
+    assert.deepEqual(shellImage.getSize(), { width: 1280, height: TOOLBAR_HEIGHT })
+    assert.deepEqual(productImage.getSize(), {
+      width: 1280,
+      height: 800 - TOOLBAR_HEIGHT,
+    })
+    const toolbarPath = companionScreenshotPath(screenshotPath, 'toolbar')
+    const productPath = companionScreenshotPath(screenshotPath, 'product')
+    await Promise.all([
+      writeFile(toolbarPath, shellImage.toPNG(), { mode: 0o600 }),
+      writeFile(productPath, productImage.toPNG(), { mode: 0o600 }),
+    ])
+  } finally {
+    await Promise.all([
+      shellContents.executeJavaScript("delete document.documentElement.dataset.visualCapture"),
+      productContents.executeJavaScript("delete document.documentElement.dataset.visualCapture"),
+    ])
+    pushShellState()
+  }
+  return true
+}
+
 async function runSmokeContract() {
+  smokeMenuOpenCount = 0
   const context = await createMainWindow({
     startUrl: SMOKE_PRODUCT_URL,
     appOrigin: PINNED_APP_ORIGIN,
@@ -1026,76 +1309,81 @@ async function runSmokeContract() {
     'trusted shell did not receive an initial state snapshot',
   )
 
-  await shellContents.executeJavaScript(`(() => {
-    window.__auroraReducedTransparencyProbe = new Promise((resolve, reject) => {
-      const surface = document.querySelector('.command-surface')
-      let firstFrame
-      let secondFrame
-      let scheduled = false
-      let timer
-      let observer
-      const cleanup = () => {
-        observer.disconnect()
-        cancelAnimationFrame(firstFrame)
-        cancelAnimationFrame(secondFrame)
-        clearTimeout(timer)
-      }
-      const finishCapture = () => {
-        scheduled = false
-        if (
-          document.documentElement.dataset.reduceTransparency !== 'true' ||
-          !surface.classList.contains('reduce-transparency')
-        ) {
-          return
-        }
+  shellContents.send(IPC_CHANNELS.state, {
+    ...shellStateSnapshot(),
+    theme: { mode: 'dark', forcedColors: false, reduceTransparency: true },
+  })
+  let reducedTransparencyStyle = null
+  await waitForCondition(
+    async () => {
+      reducedTransparencyStyle = await shellContents.executeJavaScript(`(() => {
+        const surface = document.querySelector('.command-surface')
         const style = getComputedStyle(surface)
-        cleanup()
-        resolve({
+        return {
           attribute: document.documentElement.dataset.reduceTransparency,
           allowTransparencyClass: surface.classList.contains('allow-transparency'),
           modifierClass: surface.classList.contains('reduce-transparency'),
           backdropFilter: style.backdropFilter,
           backgroundColor: style.backgroundColor,
-        })
-      }
-      const capture = () => {
-        if (
-          scheduled ||
-          document.documentElement.dataset.reduceTransparency !== 'true' ||
-          !surface.classList.contains('reduce-transparency')
-        ) {
-          return
         }
-        scheduled = true
-        firstFrame = requestAnimationFrame(() => {
-          secondFrame = requestAnimationFrame(finishCapture)
-        })
-      }
-      observer = new MutationObserver(capture)
-      observer.observe(document.documentElement, {
-        attributes: true,
-        attributeFilter: ['data-reduce-transparency'],
-      })
-      timer = setTimeout(() => {
-        cleanup()
-        reject(new Error('reduced-transparency state was not observed'))
-      }, 2000)
-      capture()
-    })
-  })()`)
-  shellContents.send(IPC_CHANNELS.state, {
-    ...shellStateSnapshot(),
-    theme: { mode: 'dark', forcedColors: false, reduceTransparency: true },
+      })()`)
+      return (
+        reducedTransparencyStyle.attribute === 'true' &&
+        reducedTransparencyStyle.allowTransparencyClass === false &&
+        reducedTransparencyStyle.modifierClass === true &&
+        reducedTransparencyStyle.backdropFilter === 'none' &&
+        reducedTransparencyStyle.backgroundColor !== 'rgba(0, 0, 0, 0)'
+      )
+    },
+    'reduced-transparency CSS did not settle into its opaque state',
+  ).catch((error) => {
+    throw new Error(`${error.message}; last state: ${JSON.stringify(reducedTransparencyStyle)}`)
   })
-  const reducedTransparencyStyle = await shellContents.executeJavaScript(
-    'window.__auroraReducedTransparencyProbe',
-  )
   assert.equal(reducedTransparencyStyle.attribute, 'true')
   assert.equal(reducedTransparencyStyle.allowTransparencyClass, false)
   assert.equal(reducedTransparencyStyle.modifierClass, true)
   assert.equal(reducedTransparencyStyle.backdropFilter, 'none')
   assert.notEqual(reducedTransparencyStyle.backgroundColor, 'rgba(0, 0, 0, 0)')
-  await shellContents.executeJavaScript('delete window.__auroraReducedTransparencyProbe')
+  shellContents.send(IPC_CHANNELS.state, {
+    ...shellStateSnapshot(),
+    theme: { mode: 'light', forcedColors: true, reduceTransparency: false },
+  })
+  let forcedColorsStyle = null
+  await waitForCondition(
+    async () => {
+      forcedColorsStyle = await shellContents.executeJavaScript(`(() => {
+        const surface = document.querySelector('.command-surface')
+        const style = getComputedStyle(surface)
+        const iconStyle = getComputedStyle(document.querySelector('#more-menu-button .fluent-icon'))
+        return {
+          attribute: document.documentElement.dataset.forcedColors,
+          allowTransparencyClass: surface.classList.contains('allow-transparency'),
+          backdropFilter: style.backdropFilter,
+          backgroundColor: style.backgroundColor,
+          iconBackgroundColor: iconStyle.backgroundColor,
+          iconForcedColorAdjust: iconStyle.forcedColorAdjust,
+        }
+      })()`)
+      return (
+        forcedColorsStyle.attribute === 'true' &&
+        forcedColorsStyle.allowTransparencyClass === false &&
+        forcedColorsStyle.backdropFilter === 'none' &&
+        forcedColorsStyle.backgroundColor !== 'rgba(0, 0, 0, 0)' &&
+        forcedColorsStyle.iconBackgroundColor !== 'rgba(0, 0, 0, 0)' &&
+        forcedColorsStyle.iconForcedColorAdjust === 'none'
+      )
+    },
+    'forced-colors CSS did not settle into its opaque system-color state',
+  ).catch((error) => {
+    throw new Error(`${error.message}; last state: ${JSON.stringify(forcedColorsStyle)}`)
+  })
+  assert.equal(forcedColorsStyle.attribute, 'true')
+  assert.equal(forcedColorsStyle.allowTransparencyClass, false)
+  assert.equal(forcedColorsStyle.backdropFilter, 'none')
+  assert.notEqual(forcedColorsStyle.backgroundColor, 'rgba(0, 0, 0, 0)')
+  assert.notEqual(forcedColorsStyle.iconBackgroundColor, 'rgba(0, 0, 0, 0)')
+  assert.equal(forcedColorsStyle.iconForcedColorAdjust, 'none')
+  pushShellState()
 
   shellContents.send(IPC_CHANNELS.state, {
     ...shellStateSnapshot(),
@@ -1126,6 +1414,16 @@ async function runSmokeContract() {
       "[...document.querySelectorAll('.download-meta > span')].map((node) => node.textContent)",
     ),
     ['正在下载', '文件不可用'],
+  )
+  assert.deepEqual(
+    await shellContents.executeJavaScript(`(() => {
+      const progress = document.querySelector(
+        '.download-item[data-state="progressing"] .download-meta progress',
+      )
+      return { exists: Boolean(progress), hasValue: progress?.hasAttribute('value') ?? true }
+    })()`),
+    { exists: true, hasValue: false },
+    'unknown-size download must render an indeterminate progress element',
   )
   pushShellState()
 
@@ -1191,31 +1489,155 @@ async function runSmokeContract() {
   )
   assert.ok(nextReloadCount > reloadCount)
 
-  await shellContents.executeJavaScript("window.auroraDesktop.send({ type: 'downloads-open' })")
+  const menuTemplate = buildMoreMenuTemplate()
+  assert.equal(buildMoreMenuTemplate.length, 0)
+  assert.equal(openMoreMenu.length, 0)
+  assert.deepEqual(
+    menuTemplate.filter((item) => item.type !== 'separator').map((item) => item.label),
+    ['后退', '前进', '重新加载', '主页', '放大', '缩小', '重置缩放', '打开下载文件夹'],
+  )
+  assert.deepEqual(
+    menuTemplate.filter((item) => item.accelerator).map((item) => item.accelerator),
+    ['Alt+Left', 'Alt+Right', 'CmdOrCtrl+R', 'CmdOrCtrl+Plus', 'CmdOrCtrl+-', 'CmdOrCtrl+0'],
+  )
+  assert.equal(menuTemplate.filter((item) => typeof item.click === 'function').length, 8)
+  assert.equal(menuTemplate[0].enabled, navigationSnapshot().canGoBack)
+  assert.equal(menuTemplate[1].enabled, navigationSnapshot().canGoForward)
+
+  const previousMenuOpenCount = smokeMenuOpenCount
+  await clickElementWithInput(window, shellContents, '#more-menu-button')
+  await waitForCondition(
+    () => smokeMenuOpenCount === previousMenuOpenCount + 1,
+    'More button did not invoke the native-menu command stub',
+  )
+  assert.equal(shellMode, 'toolbar', 'native More menu changed the shell mode')
+
+  await clickElementWithInput(window, shellContents, '#downloads-button')
   await waitForCondition(
     () => smokeShellView.getBounds().height > TOOLBAR_HEIGHT,
-    'downloads command did not expand the shell view',
+    'downloads button did not expand the shell view',
   )
+  let downloadsFocusSnapshot = null
   await waitForCondition(
-    async () =>
-      shellContents.isFocused() &&
-      (await shellContents.executeJavaScript(`
-          document.body.dataset.shellMode === 'downloads' &&
-          document.querySelector('#downloads-button')?.getAttribute('aria-expanded') === 'true' &&
-          document.activeElement?.id === 'downloads-close'
-        `)),
+    async () => {
+      downloadsFocusSnapshot = await shellContents.executeJavaScript(`({
+        shellMode: document.body.dataset.shellMode,
+        ariaExpanded: document.querySelector('#downloads-button')?.getAttribute('aria-expanded'),
+        activeElement: document.activeElement?.id || document.activeElement?.tagName || null,
+      })`)
+      downloadsFocusSnapshot.shellFocused = shellContents.isFocused()
+      return (
+        downloadsFocusSnapshot.shellFocused === true &&
+        downloadsFocusSnapshot.shellMode === 'downloads' &&
+        downloadsFocusSnapshot.ariaExpanded === 'true' &&
+        downloadsFocusSnapshot.activeElement === 'downloads-close'
+      )
+    },
     'downloads drawer did not expose modal state and keyboard focus',
-  )
+  ).catch((error) => {
+    throw new Error(`${error.message}; last state: ${JSON.stringify(downloadsFocusSnapshot)}`)
+  })
   const expandedLayout = calculateViewBounds(window.getContentBounds(), {
     shellMode: 'downloads',
   })
   assert.deepEqual(smokeShellView.getBounds(), expandedLayout.shell)
   assert.deepEqual(smokeProductView.getBounds(), expandedLayout.product)
+  assert.equal(smokeProductView.getVisible(), false, 'downloads did not hide the product view')
+  assert.equal(productContents.isFocused(), false, 'hidden product retained native focus')
 
-  await shellContents.executeJavaScript("window.auroraDesktop.send({ type: 'downloads-close' })")
+  const completedDownload = {
+    id: 'smoke-completed',
+    name: 'Aurora-notes.txt',
+    state: 'completed',
+    progress: 1,
+    canShow: true,
+  }
+  shellContents.send(IPC_CHANNELS.state, {
+    ...shellStateSnapshot(),
+    downloads: [completedDownload, { id: 'smoke-live', name: 'archive.zip', state: 'progressing', progress: 0.25, canShow: false }],
+  })
+  await waitForCondition(
+    () =>
+      shellContents.executeJavaScript(
+        "document.querySelector('.show-download-button') !== null",
+      ),
+    'downloads drawer did not render the focus restoration fixture',
+  )
+  await shellContents.executeJavaScript("document.querySelector('.show-download-button').focus()")
+  shellContents.send(IPC_CHANNELS.state, {
+    ...shellStateSnapshot(),
+    downloads: [completedDownload, { id: 'smoke-live', name: 'archive.zip', state: 'progressing', progress: 0.5, canShow: false }],
+  })
+  await waitForCondition(
+    () =>
+      shellContents.executeJavaScript(`
+        document.activeElement?.classList.contains('show-download-button') === true &&
+        document.activeElement.closest('.download-item')?.dataset.downloadId === 'smoke-completed'
+      `),
+    'download refresh did not preserve focus inside the modal dialog',
+  )
+  pushShellState()
+
+  await sendKeyWithInput(window, shellContents, '0', ['control'])
+  await shellContents.executeJavaScript(
+    'new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))',
+  )
+  assert.equal(shellMode, 'downloads', 'modal shortcut dismissed the downloads surface')
+  assert.equal(smokeProductView.getVisible(), false, 'modal shortcut revealed the product view')
+  assert.equal(productContents.isFocused(), false, 'modal shortcut focused the hidden product view')
+  assert.equal(shellContents.isFocused(), true, 'modal shortcut moved focus out of the shell')
+  await sendKeyWithInput(window, shellContents, 'F6')
+  await shellContents.executeJavaScript(
+    'new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))',
+  )
+  assert.equal(shellMode, 'downloads', 'modal F6 dismissed the downloads surface')
+  assert.equal(smokeProductView.getVisible(), false, 'modal F6 revealed the product view')
+  assert.equal(productContents.isFocused(), false, 'modal F6 focused the hidden product view')
+  assert.equal(shellContents.isFocused(), true, 'modal F6 moved focus out of the shell')
+
+  await waitForViewLayout(window, smokeShellView, smokeProductView, 520, 360, 'downloads')
+  assert.deepEqual(
+    await shellContents.executeJavaScript(`(() => {
+      const dialog = document.querySelector('#downloads-dialog')
+      const empty = document.querySelector('#downloads-empty')
+      const bounds = dialog.getBoundingClientRect()
+      return {
+        insideViewport:
+          bounds.left >= 0 &&
+          bounds.top >= ${TOOLBAR_HEIGHT} &&
+          bounds.right <= innerWidth &&
+          bounds.bottom <= innerHeight,
+        noHorizontalOverflow: document.documentElement.scrollWidth === innerWidth,
+        emptyVisible: empty.hidden === false && empty.clientHeight > 0,
+        emptyFits: empty.scrollHeight <= empty.clientHeight,
+        statusTextPresent:
+          getComputedStyle(document.querySelector('#connection-label')).display !== 'none' &&
+          document.querySelector('#connection-label').textContent.trim().length > 0,
+      }
+    })()`),
+    {
+      insideViewport: true,
+      noHorizontalOverflow: true,
+      emptyVisible: true,
+      emptyFits: true,
+      statusTextPresent: true,
+    },
+    '520x360 downloads surface clipped or overflowed',
+  )
+  await waitForViewLayout(window, smokeShellView, smokeProductView, 1000, 700, 'downloads')
+
+  await writeOptionalSmokeScreenshot({
+    window,
+    shell: smokeShellView,
+    product: smokeProductView,
+    shellContents,
+    productContents,
+  })
+
+  await sendKeyWithInput(window, shellContents, 'Escape')
   await waitForCondition(
     () => smokeShellView.getBounds().height === TOOLBAR_HEIGHT,
-    'downloads close command did not collapse the shell view',
+    'Escape did not collapse the downloads view',
   )
   await waitForCondition(
     async () =>
@@ -1229,6 +1651,7 @@ async function runSmokeContract() {
   )
   assert.equal(productContents.isFocused(), true, 'downloads close did not keep product focus')
   assert.equal(shellContents.isFocused(), false, 'shell stole focus after downloads close')
+  assert.equal(smokeProductView.getVisible(), true, 'downloads close did not reveal the product')
 
   markProductFailed('load-failed')
   await waitForCondition(
@@ -1239,29 +1662,78 @@ async function runSmokeContract() {
       )),
     'non-network load failure did not show the focused recovery surface',
   )
-  await shellContents.executeJavaScript("window.auroraDesktop.send({ type: 'downloads-open' })")
-  await shellContents.executeJavaScript("window.auroraDesktop.send({ type: 'downloads-close' })")
-  await shellContents.executeJavaScript(
-    'new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))',
+  assert.equal(smokeProductView.getVisible(), false, 'recovery did not hide the product view')
+  assert.equal(productContents.isFocused(), false, 'recovery left the product focused')
+
+  const offlineLoadingSnapshot = new Promise((resolve) => {
+    productContents.once('did-start-loading', () => {
+      resolve({
+        shellMode,
+        productVisible: smokeProductView.getVisible(),
+        productFocused: productContents.isFocused(),
+        shellFocused: shellContents.isFocused(),
+      })
+    })
+  })
+  const offlineReloadFinished = waitForWebContentsEvent(productContents, 'did-finish-load')
+  await clickElementWithInput(window, shellContents, '#offline-retry')
+  assert.deepEqual(
+    await offlineLoadingSnapshot,
+    {
+      shellMode: 'offline',
+      productVisible: false,
+      productFocused: false,
+      shellFocused: true,
+    },
+    'offline retry did not preserve recovery focus while the product started loading',
   )
-  assert.equal(shellMode, 'offline', 'downloads command escaped a product recovery state')
-  assert.equal(shellContents.isFocused(), true, 'product recovery surface lost native focus')
-  markProductReady()
+  await offlineReloadFinished
   await waitForCondition(
-    () => shellContents.executeJavaScript("document.body.dataset.shellMode === 'toolbar'"),
-    'ready product did not dismiss the recovery surface',
+    async () =>
+      smokeProductView.getVisible() === true &&
+      productContents.isFocused() &&
+      (await shellContents.executeJavaScript("document.body.dataset.shellMode === 'toolbar'")),
+    'successful retry did not restore the visible, focused product',
   )
 
-  window.setContentSize(1120, 760)
-  await waitForCondition(() => {
-    const expected = calculateViewBounds(window.getContentBounds(), {
-      shellMode: 'toolbar',
-    })
-    return (
-      JSON.stringify(smokeShellView.getBounds()) === JSON.stringify(expected.shell) &&
-      JSON.stringify(smokeProductView.getBounds()) === JSON.stringify(expected.product)
-    )
-  }, 'child view bounds did not follow BaseWindow resize')
+  const recoveredHome = waitForWebContentsEvent(productContents, 'did-finish-load')
+  assert.equal(homeProduct(), true, 'recovered product did not accept the Home action')
+  await recoveredHome
+  await clickElementWithInput(window, productContents, '#fixture-push-route')
+  await waitForCondition(
+    async () =>
+      (await productContents.executeJavaScript(
+        "document.querySelector('#fixture-route').textContent",
+      )) === pushedRoute,
+    'recovered product view did not accept real pointer input',
+  )
+
+  await sendKeyWithInput(window, productContents, 'F6')
+  await waitForCondition(
+    async () =>
+      shellContents.isFocused() &&
+      (await shellContents.executeJavaScript(
+        "document.activeElement?.id === 'downloads-button'",
+      )),
+    'F6 did not move focus from the product view into the desktop app bar',
+  )
+  await sendKeyWithInput(window, shellContents, 'F6')
+  await waitForCondition(
+    () => productContents.isFocused(),
+    'F6 did not return focus from the desktop app bar to the product view',
+  )
+
+  await writeOptionalToolbarScreenshots({
+    window,
+    shell: smokeShellView,
+    product: smokeProductView,
+    shellContents,
+    productContents,
+  })
+
+  window.setMinimumSize(1, 1)
+  await waitForViewLayout(window, smokeShellView, smokeProductView, 520, 360, 'toolbar')
+  await waitForViewLayout(window, smokeShellView, smokeProductView, 1366, 768, 'toolbar')
 
   await shellContents.executeJavaScript('window.__auroraSmokeUnsubscribe()')
   window.close()

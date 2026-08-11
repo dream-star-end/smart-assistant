@@ -22,6 +22,7 @@ test('parseShellCommand accepts only enumerated exact-shape commands', () => {
     'forward',
     'reload',
     'home',
+    'open-more-menu',
     'focus-product',
     'downloads-open',
     'downloads-close',

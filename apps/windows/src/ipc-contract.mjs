@@ -12,6 +12,7 @@ const SIMPLE_COMMANDS = new Set([
   'forward',
   'reload',
   'home',
+  'open-more-menu',
   'focus-product',
   'downloads-open',
   'downloads-close',

@@ -145,16 +145,18 @@ test('applyWindowsAppearance catches unavailable Mica and still applies opaque f
   ])
 })
 
-test('handleDesktopShortcut maps Windows navigation, reload, and zoom keys', () => {
+test('handleDesktopShortcut maps pane focus, Windows navigation, reload, and zoom keys', () => {
   const calls = []
   const actions = {
     back: () => calls.push('back'),
     forward: () => calls.push('forward'),
+    focusNextPane: () => calls.push('focus-next-pane'),
     reload: () => calls.push('reload'),
     zoomIn: () => calls.push('zoom-in'),
     zoomOut: () => calls.push('zoom-out'),
     zoomReset: () => calls.push('zoom-reset'),
   }
+  assert.equal(handleDesktopShortcut({ type: 'keyDown', key: 'F6' }, actions), true)
   assert.equal(
     handleDesktopShortcut({ type: 'keyDown', alt: true, key: 'ArrowLeft' }, actions),
     true,
@@ -170,11 +172,22 @@ test('handleDesktopShortcut maps Windows navigation, reload, and zoom keys', () 
   )
   assert.equal(handleDesktopShortcut({ type: 'keyDown', control: true, key: '-' }, actions), true)
   assert.equal(handleDesktopShortcut({ type: 'keyDown', control: true, key: '0' }, actions), true)
-  assert.deepEqual(calls, ['back', 'forward', 'reload', 'zoom-in', 'zoom-out', 'zoom-reset'])
+  assert.deepEqual(calls, [
+    'focus-next-pane',
+    'back',
+    'forward',
+    'reload',
+    'zoom-in',
+    'zoom-out',
+    'zoom-reset',
+  ])
 })
 
-test('handleDesktopShortcut does not interfere with IME, AltGr, key-up, or unknown keys', () => {
-  const actions = { reload: () => assert.fail('must not run') }
+test('handleDesktopShortcut does not interfere with IME, AltGr, modified F6, key-up, or unknown keys', () => {
+  const actions = {
+    focusNextPane: () => assert.fail('must not run'),
+    reload: () => assert.fail('must not run'),
+  }
   assert.equal(
     handleDesktopShortcut(
       { type: 'keyDown', control: true, key: 'Process', isComposing: true },
@@ -198,6 +211,7 @@ test('handleDesktopShortcut does not interfere with IME, AltGr, key-up, or unkno
     false,
   )
   assert.equal(handleDesktopShortcut({ type: 'keyUp', control: true, key: 'r' }, actions), false)
+  assert.equal(handleDesktopShortcut({ type: 'keyDown', shift: true, key: 'F6' }, actions), false)
   assert.equal(
     handleDesktopShortcut({ type: 'keyDown', control: true, shift: true, key: 'r' }, actions),
     false,

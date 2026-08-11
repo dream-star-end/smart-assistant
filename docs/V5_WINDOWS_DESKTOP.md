@@ -72,6 +72,11 @@ V3/V5 的 release/rollback rsync 均排除 `apps/windows`（并保留旧 `packag
 历史工件），因此 app-only 变化不要求 runtime image、master、dist 或 egress 部署。安装包通过
 GitHub Actions artifact；正式发布渠道另行受控。
 
+这条边界必须按生效面明确记录：仅修改 `apps/windows/**`、本文或 Windows workflow 时，
+**server runtime image rebuild = no**，不得运行 `scripts/deploy-v5.sh`；验证与发布仅走
+`Windows app gate` 和 installer lane。只有任务同时修改共享 server/protocol/web 代码时，才另开
+upstream 工作并按 V5 server 流程重新分类，不能由 app-only PR 隐式扩大部署范围。
+
 ## 3. Electron 安全模型
 
 ### 3.1 shell 与产品 view
@@ -88,6 +93,22 @@ GitHub Actions artifact；正式发布渠道另行受控。
 本地 shell 使用 `app://aurora-shell` 精确 host/path 白名单、非持久 session 与严格 CSP。shell 的
 preload 只能暴露冻结的 `send/subscribe` 窄接口；main 同时校验 sender、senderFrame、精确 origin、
 main frame 和 payload schema。禁止任意 URL/path、原始 `ipcRenderer`、文件系统或进程能力。
+
+### 3.1.1 Codex 风格桌面框架合同
+
+视觉层级参考 Codex 桌面版，但不复制其本地仓库/任务数据模型。shell 只提供一条 44px 高的本地
+app bar，标题固定为安装包内的“Aurora / 桌面工作区”，不读取远端页面 DOM、路由标题或聊天内容。
+远端 V5 产品区仍占据 app bar 下方的完整工作区，并继续是认证、会话和核心 UI 的唯一权威。
+
+app bar 只显示本地可验证的下载和连接状态。后退、前进、刷新、主页、缩放、打开下载等命令由
+Electron 原生 `Menu` 与既有键盘/鼠标快捷键承载；不得用自绘 HTML 菜单假冒 Windows 原生菜单，
+也不得为了填充 Codex 风格导航而生成虚假的项目、任务、环境或 agent 数据。正常态下 F6 必须在
+product view 与本地 app bar 间循环焦点；modal 态不得把焦点交给已经隐藏的 product view。
+
+下载列表和离线恢复页是本地 modal 状态，不是透明盖在可交互 product view 上的浮层。进入任一
+modal 时，main 必须先隐藏 product view，再把 shell 布局扩展到整个窗口；关闭下载 modal 或网络
+恢复后，main 必须按当前窗口尺寸恢复 product view、重新应用布局并把焦点还给产品区。smoke 必须
+覆盖“隐藏 → 恢复 → product 获得焦点”，防止隐藏的远端 renderer 抢键盘/指针输入。
 
 `BaseWindow` 关闭时必须显式关闭 shell/product 两个 child `webContents` 并清监听；resize、maximize、
 display/DPI 改变统一经过一个 layout 函数。窗口状态恢复必须按当前 display workArea 裁剪，防止
@@ -189,7 +210,7 @@ Workflow：`.github/workflows/v5-windows-desktop.yml`。
 | macOS 本地 | `check`、双-view 离线 smoke、当前平台 `pack` | 产品无 bridge，布局/销毁合同成立，包结构完整 |
 | Windows CI | 独立 `npm ci`、check、NSIS、unpacked/installed smoke、silent uninstall、SHA-256 | 35 分钟 job 内全部通过，installer 恰好一个 |
 | Windows 10/11 真机 | 安装、启动、快捷方式、卸载 | 普通用户可安装；卸载不误删浏览器/其他应用数据 |
-| Windows UI | 1366×768/1080p、多屏拔插、100–200% 缩放、浅/深/高对比、键盘/Narrator | shell 不遮挡产品区，焦点和 IME 正常，窗口始终可恢复 |
+| Windows UI | 1366×768/1080p、多屏拔插、100–200% 缩放、浅/深/高对比、F6、键盘/Narrator | shell 不遮挡产品区，焦点和 IME 正常，窗口始终可恢复 |
 | 登录 | 密码登录、刷新恢复、退出、LinuxDo OAuth | callback 回到同一 Electron session，重启仍保持预期登录态 |
 | 连接器 | GitHub 与至少一个动态 OAuth connector | 隔离授权窗完成往返，主窗口不获得跨源桌面能力 |
 | 核心聊天 | 新建会话、流式回复、停止、重连、长会话恢复 | REST/WS 正常，无空白回复或重复 turn |
