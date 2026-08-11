@@ -286,13 +286,14 @@ describe('V5 P3 preserved runtime tuple surface gate', () => {
 
     const rejected = await fixture()
     await rejected.write('scripts/new.sh')
-    await rejected.write('e2e/unmatched.txt')
+    await rejected.write('e2e/session-display/incidents.json')
     const rejectedTarget = rejected.commit()
     const rejectedResult = rejected.invoke(rejected.base, rejectedTarget)
     assert.equal(rejectedResult.status, 0, rejectedResult.stderr || rejectedResult.stdout)
     const rejectedPlan = JSON.parse(rejectedResult.stdout)
     assert.ok(rejectedPlan.manual.some((entry: { reason: string }) => entry.reason.startsWith('manual_glob:')))
-    assert.ok(rejectedPlan.manual.some((entry: { reason: string }) => entry.reason === 'unmatched_path'))
+    assert.ok(rejectedPlan.manual.some((entry: { path: string, reason: string }) =>
+      entry.path === 'e2e/session-display/incidents.json' && entry.reason === 'unmatched_path'))
   })
 
   test('symlink/type changes, invalid manifests, invalid commits, and non-ancestor ranges fail closed', async () => {
