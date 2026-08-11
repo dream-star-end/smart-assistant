@@ -1409,6 +1409,22 @@ export class CodexAppServerRunner extends EventEmitter {
       return
     }
 
+    // Goals belong to the thread, not to one user-visible turn. Codex can
+    // keep advancing a goal in a background turn after the foreground turn
+    // has completed; a later user turn may then be queued behind that work.
+    // Surface the goal state for this thread, but keep the ordinary turnId
+    // filter below for item/text notifications so background output is never
+    // attributed to the wrong user message.
+    if (method === 'thread/goal/updated' || method === 'thread/goal/cleared') {
+      if (!this.threadId || p.threadId !== this.threadId) return
+      this.emitGoalBlock(
+        method === 'thread/goal/cleared'
+          ? normalizeCodexGoal(undefined, true)
+          : normalizeCodexGoal(p.goal),
+      )
+      return
+    }
+
     // Filter turn-scoped notifications. codex may emit notifications for
     // system-internal turns (compaction, hooks) that the client should ignore.
     //
@@ -1433,14 +1449,6 @@ export class CodexAppServerRunner extends EventEmitter {
       }
     }
 
-    if (method === 'thread/goal/updated') {
-      this.emitGoalBlock(normalizeCodexGoal(p.goal))
-      return
-    }
-    if (method === 'thread/goal/cleared') {
-      this.emitGoalBlock(normalizeCodexGoal(undefined, true))
-      return
-    }
     if (method === 'thread/tokenUsage/updated') {
       if (!turnId) return
       if (typeof p.threadId === 'string' && this.threadId && p.threadId !== this.threadId) return

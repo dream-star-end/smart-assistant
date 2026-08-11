@@ -94,6 +94,10 @@ built-ins expose right now.
 - Before a categorical diagnosis, cite the code path, log, test, or primary
   source that proves it. Never attribute an interruption to the user without
   timestamped evidence.
+- When recursively searching shared or temporary trees (especially \`/tmp\`),
+  traverse regular files only and skip devices, FIFOs, and sockets (for
+  example, use \`grep --devices=skip\` or \`find ... -type f\`). Opening a
+  special file can block an otherwise completed turn indefinitely.
 - If later evidence disproves an earlier claim, correct it explicitly.
 - After tools create external side effects, reconcile the actual external
   state before claiming success or failure.

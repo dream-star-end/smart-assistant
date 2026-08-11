@@ -206,6 +206,8 @@ describe('buildCodexLaunchOverrides', () => {
       out.instructionsContent.startsWith(CODEX_PREAMBLE),
       'CODEX_PREAMBLE must lead the instructions file',
     )
+    assert.match(out.instructionsContent, /grep --devices=skip/)
+    assert.match(out.instructionsContent, /find \.\.\. -type f/)
     // Platform context content follows — the preamble is non-empty so a
     // simple length check confirms more than just the preamble was rendered.
     assert.ok(out.instructionsContent.length > CODEX_PREAMBLE.length)

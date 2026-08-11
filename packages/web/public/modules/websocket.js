@@ -4,7 +4,7 @@ import { shouldSuppressGoalStatusToast } from './goalControl.js?v=3'
 import { renderGoalModePanel, settleGoalModePanel } from './goalMode.js?v=3'
 import { maybeNotify, setTitleBusy } from './notifications.js'
 import { getSession, state } from './state.js'
-import { maybeSyncNow, retryDeferredHydration } from './sync.js?v=14'
+import { maybeSyncNow, retryDeferredHydration } from './sync.js?v=15'
 import { toast } from './ui.js'
 
 // ── Late-binding for circular deps (sessions.js, messages.js) ──
@@ -162,6 +162,20 @@ export function markFrameReceived(sess) {
   if (sess) sess._lastFrameAt = Date.now()
 }
 
+function terminalGoalLabel(sess) {
+  for (let i = (sess?.messages?.length || 0) - 1; i >= 0; i--) {
+    const msg = sess.messages[i]
+    if (msg?.role !== 'goal') continue
+    if (msg.cleared) return ''
+    if (sess._turnStartedAt && msg.completedAt < sess._turnStartedAt) return ''
+    if (msg.status === 'complete') return '目标已完成'
+    if (msg.status === 'budgetLimited') return '目标已达到预算限制'
+    if (msg.status === 'usageLimited') return '目标已达到用量限制'
+    return ''
+  }
+  return ''
+}
+
 // Clear turn-timing fields on a session when the turn actually ends (isFinal / stop / stuck).
 // Kept separate from hideTypingIndicator so session switches (which merely hide DOM) do not
 // reset timing for a session whose turn is still alive.
@@ -198,10 +212,24 @@ export function showTypingIndicator() {
     const label = el.querySelector('.typing-label')
     if (!label) return
     const silenceMs = Date.now() - lastFrame
+    const terminalGoal = terminalGoalLabel(_sess)
     if (_sess?._turnStatus === 'compacting') {
       label.textContent = `${name} 正在压缩上下文 (${secs}s)`
       el.classList.remove('stale-warn', 'stale-danger')
       el.classList.add('compacting')
+    } else if (terminalGoal) {
+      if (silenceMs >= STALE_DANGER_MS) {
+        label.textContent = `${terminalGoal}，但残留执行已 ${Math.round(silenceMs / 1000)}s 无新数据；可点击停止`
+        el.classList.add('stale-danger')
+        el.classList.remove('stale-warn', 'compacting')
+      } else if (silenceMs >= STALE_WARN_MS) {
+        label.textContent = `${terminalGoal}，正在等待残留执行收尾 (${Math.round(silenceMs / 1000)}s 无新数据)`
+        el.classList.add('stale-warn')
+        el.classList.remove('stale-danger', 'compacting')
+      } else {
+        label.textContent = `${terminalGoal}，正在等待当前执行收尾 (${secs}s)`
+        el.classList.remove('stale-warn', 'stale-danger', 'compacting')
+      }
     } else if (silenceMs >= STALE_DANGER_MS) {
       label.textContent = `${name} 可能已卡住 (${secs}s · 已 ${Math.round(silenceMs / 1000)}s 无响应)`
       el.classList.add('stale-danger')
@@ -1975,7 +2003,6 @@ function handleOutboundTurnStatus(frame) {
   const peerId = frame.peer?.id
   const sess = peerId ? state.sessions.get(peerId) : null
   if (!sess) return
-  markFrameReceived(sess)
   const status = ['running', 'compacting', 'idle', 'completed', 'interrupted', 'unknown'].includes(
     frame.status,
   )
@@ -2048,8 +2075,10 @@ function handleOutboundTurnStatus(frame) {
     el.classList.remove('stale-warn', 'stale-danger')
     el.classList.add('compacting')
   } else if (status === 'running') {
-    label.textContent = `${name} 仍在运行 (${secs}s，可随时取消)`
-    el.classList.remove('stale-warn', 'stale-danger', 'compacting')
+    // The 30s authoritative running heartbeat proves only that the gateway
+    // still owns the turn; it is not model/tool progress. Leave the label and
+    // stale classes to the timer above so heartbeats cannot hide a real stall.
+    el.classList.remove('compacting')
   } else {
     el.classList.remove('compacting')
   }
