@@ -87,3 +87,25 @@ export function MessageListSkeleton() {
     </div>
   );
 }
+
+/** 已有部分真实消息时的轻量尾部占位：不遮内容，只说明剩余内容仍在加载。 */
+export function PartialHistorySkeleton() {
+  return (
+    <output
+      className="flex gap-4 py-1 text-muted"
+      aria-label="正在加载会话内容"
+      aria-live="polite"
+      aria-busy="true"
+      data-testid="partial-history-skeleton"
+    >
+      <Avatar tone="brand" className="mt-0.5 hidden shadow-sm sm:inline-flex">
+        <Sparkles size={16} />
+      </Avatar>
+      <div className="min-w-0 flex-1 space-y-2">
+        <span className="block text-xs">正在加载会话内容…</span>
+        <Skeleton className="h-4 w-4/5" />
+        <Skeleton className="h-4 w-2/3" />
+      </div>
+    </output>
+  );
+}

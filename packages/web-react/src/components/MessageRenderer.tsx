@@ -50,6 +50,7 @@ import { ToolCardSlot } from "./chat/toolCardSlot";
 import { TurnActivity, type TurnActivityInfo } from "./chat/TurnActivity";
 import { currentTurnStartIndex, turnFinalAssistantFlags } from "./chat/turnSegment";
 import { loadedArchivedMetrics } from "./chat/archivePaging";
+import { PartialHistorySkeleton } from "./chat/HistorySkeleton";
 import { MessageBoundary } from "./MessageBoundary";
 import { asStr, resolveToolInput } from "./tool/format";
 import { Alert, Avatar, Spinner } from "./ui";
@@ -896,6 +897,7 @@ export function MessageList({
   liveTurnUsage,
   turnActivity,
   transientNotice,
+  historyLoading = false,
   archive,
   cb,
   onRespondPermission,
@@ -911,6 +913,8 @@ export function MessageList({
   turnActivity?: TurnActivityInfo | null;
   /** 会话级 transient 软提示（"较长时间未收到新内容…"，非消息卡片，末尾 info 条渲染）。*/
   transientNotice?: { text: string } | null;
+  /** 已有部分消息可见，但 canonical history / durable journal 仍在加载。 */
+  historyLoading?: boolean;
   /** 归档分页上下文；缺省=无归档(仅本地翻页)。*/
   archive?: MessageListArchive | null;
   cb: CardCallbacks;
@@ -1254,6 +1258,7 @@ export function MessageList({
           {transientNotice.text}
         </Alert>
       )}
+      {historyLoading && <PartialHistorySkeleton />}
     </div>
   );
 

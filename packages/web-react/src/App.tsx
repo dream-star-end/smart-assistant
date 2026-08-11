@@ -30,6 +30,7 @@ import { RepoStatusBanner } from "./components/github/RepoStatusBanner";
 import { InboxDialog } from "./components/InboxDialog";
 import { PendingPaymentRecovery } from "./components/payment/PendingPaymentRecovery";
 import { CHAT_CREATE_TEMPLATES } from "./lib/chatCreateTemplates";
+import { sessionTitleFromText } from "./lib/sessionTitle";
 // 分区注册表在 lib（不是 ManageCenter）：ManageCenter 是 lazy chunk，从组件里取值会把
 // 六个面板一起拖进主包。默认落地页 = 注册表首位，两处不再各写各的。
 import { DEFAULT_MANAGE_TAB, type ManageTab } from "./lib/manageTabs";
@@ -489,6 +490,7 @@ export function App() {
       interrupt();
       setMessages([]);
       setChatError(null);
+      setPendingRouteSession(null);
     },
     onDeleteSession: (id) => {
       localStore.current.delete(id);
@@ -500,8 +502,6 @@ export function App() {
     },
     // URL 深链恢复未决：暂停自动选中（URL 指定 > 最近会话）。
     holdAutoSelect: pendingRouteSession !== null,
-    // 新建会话占位定格当前有效模型(含空态显式选择,防被 resolver 按 default 覆盖)。
-    currentModelId: () => modelId,
   });
 
   // ── per-session 模型选择(会话间互不影响,持久化恢复)────────────────────────
@@ -580,6 +580,7 @@ export function App() {
     ) => {
       setChatError(null);
       const visibleText = displayText ?? text;
+      const sessionTitle = sessionTitleFromText(visibleText);
 
       // demo：本地流式回放（无网络），仅用于离线预览设计。
       if (demo) {
@@ -626,7 +627,7 @@ export function App() {
         sessionId = genWsSessionId();
         createdSession = {
           id: sessionId,
-          title: visibleText.slice(0, 24) || "新对话",
+          title: sessionTitle,
           ownerUserId: user.id,
           updatedAt: new Date().toISOString(),
           messageCount: 0,
@@ -640,7 +641,17 @@ export function App() {
         // per-session 键 —— 否则该会话只靠全局默认,会被其它会话的开关翻动(切走再回来变样)。
         writeTeamMode(sessionId, teamMode);
       }
-      sockRef.current?.ensureSession(sessionId, agent.id, visibleText.slice(0, 24));
+      const materializedDraft =
+        !createdSession && sessions.some((session) => session.id === sessionId && session.messageCount === 0);
+      sockRef.current?.ensureSession(sessionId, agent.id, sessionTitle);
+      if (materializedDraft) {
+        // Goal/GitHub 可在首条消息前物化服务端行。首发时须同步收敛真正标题；否则
+        // 后端幂等 INSERT 不更新既有行，刷新后 listSessions 会把「新对话」盖回来。
+        sockRef.current?.renameSession(sessionId, sessionTitle);
+        void api.patchSessionTitle(authRef.current, sessionId, sessionTitle).catch(() => {
+          // 行尚未建时 PATCH 可 404；随后 send 的幂等 PUT 会使用上面已更新的 socket 标题。
+        });
+      }
       // model / effortLevel 都是 inbound.message 顶层路由字段。用户未设置 effort 或
       // 当前模型不支持时省略,让模型沿用自身默认。
       // media：已上传附件（图片/文件等），随 inbound.message.content.media 发送。
@@ -667,11 +678,11 @@ export function App() {
         const sid = sessionId!;
         const found = c.find((s) => s.id === sid);
         const base: Session =
-          found ?? createdSession ?? { id: sid, title: visibleText.slice(0, 24) || "新对话", ownerUserId: user.id, updatedAt: "", messageCount: 0 };
+          found ?? createdSession ?? { id: sid, title: sessionTitle, ownerUserId: user.id, updatedAt: "", messageCount: 0 };
         const updated: Session = {
           ...base,
           id: sid,
-          title: found?.title && found.messageCount > 0 ? found.title : visibleText.slice(0, 24) || "新对话",
+          title: found?.title && found.messageCount > 0 ? found.title : sessionTitle,
           updatedAt: new Date().toISOString(),
           messageCount: (found?.messageCount ?? 0) + 1,
         };
@@ -690,6 +701,7 @@ export function App() {
       models,
       preferenceEffort,
       teamMode,
+      sessions,
       setSessions,
       setActiveId,
     ],
@@ -813,10 +825,8 @@ export function App() {
     [image2Available, submitImageEdit, submitImageComment, image2UnavailableReason],
   );
 
-  // 会话物化:GitHub 绑定是 per-session,新会话未发首条消息前 activeId 为空 → 绑定确定钮
-  // 恒禁用(!sessionId)。需要绑定时先物化一个会话占位(与「+新对话」同款:仅生成 peer.id +
-  // 入侧栏 + 选中,不提前 ensureSession/持久化——空会话不占 service 槽位)。sessionId 立即可用;
-  // 真绑定时 sendRepoBind 内部会自行 ensureSession+hello 注册 peer;首条消息也复用该会话。
+  // 会话物化:新建按钮本身只进入空白草稿态；GitHub 绑定 / 设定目标这类明确依赖
+  // per-session 身份的首轮前操作，才在用户确认操作时物化一个会话 id。
   const ensureActiveSession = useCallback((): string | undefined => {
     if (demo || !user) return activeId;
     if (activeId) return activeId;
@@ -827,11 +837,16 @@ export function App() {
       ownerUserId: user.id,
       updatedAt: new Date().toISOString(),
       messageCount: 0,
+      ...(modelId ? { modelId } : {}),
     };
+    // 首轮前操作会紧接着 ensureServerSession/sendRepoBind；先把空白态显式模型写入
+    // ChatSession，确保建行 PUT 与后续首发都携带同一选择，不被 activeId effect 回落默认值。
+    sockRef.current?.ensureSession(id, agent.id, "新对话");
+    if (modelId) sockRef.current?.setSessionModel(id, modelId);
     setSessions((c) => [s, ...c]);
     setActiveId(id);
     return id;
-  }, [demo, user, activeId, setSessions, setActiveId]);
+  }, [demo, user, activeId, agent.id, modelId, setSessions, setActiveId]);
 
   // 打开 GitHub 绑定 modal:先确保有承载会话,否则「确认绑定」因 !sessionId 恒禁用
   // (输入框底部入口 → 发消息前即可绑定)。
@@ -1342,14 +1357,16 @@ export function App() {
     expectedStateRevision: number;
   }) => {
     const auth = authRef.current;
-    if (!auth || !activeId) return;
+    if (!auth) return;
+    const sessionId = activeId ?? ensureActiveSession();
+    if (!sessionId) return;
     const sessionTitle =
-      activeSess?.title ?? sessions.find((session) => session.id === activeId)?.title ?? "新对话";
-    const ensured = await sockRef.current?.ensureServerSession(activeId, agent.id, sessionTitle);
+      activeSess?.title ?? sessions.find((session) => session.id === sessionId)?.title ?? "新对话";
+    const ensured = await sockRef.current?.ensureServerSession(sessionId, agent.id, sessionTitle);
     if (!ensured) throw new Error("会话尚未创建成功，请检查网络后重试");
-    const goal = await api.setSessionGoal(auth, activeId, input);
-    sockRef.current?.setGoalState(activeId, goal);
-  }, [activeId, activeSess?.title, agent.id, sessions]);
+    const goal = await api.setSessionGoal(auth, sessionId, input);
+    sockRef.current?.setGoalState(sessionId, goal);
+  }, [activeId, activeSess?.title, agent.id, ensureActiveSession, sessions]);
 
   const transitionSessionGoal = useCallback(async (
     action: "pause" | "resume" | "complete" | "clear",
@@ -2351,6 +2368,7 @@ export function App() {
                 liveTurnUsage={activeSess?._liveTurnUsage}
                 turnActivity={turnActivity}
                 transientNotice={transientNotice}
+                historyLoading={historyLoading}
                 archive={messageListArchive}
                 cb={cardCallbacks}
                 onRespondPermission={onRespondPermission}
@@ -2420,8 +2438,8 @@ export function App() {
             repoSelection={demo ? null : repo.selection}
             onOpenRepo={demo ? undefined : openRepo}
             goal={activeSess?.goalState}
-            onSetGoal={demo || !activeId ? undefined : setSessionGoal}
-            onGoalAction={demo || !activeId ? undefined : transitionSessionGoal}
+            onSetGoal={demo ? undefined : setSessionGoal}
+            onGoalAction={demo ? undefined : transitionSessionGoal}
           />
         </div>
       </main>
