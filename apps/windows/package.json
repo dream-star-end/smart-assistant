@@ -1,6 +1,6 @@
 {
   "name": "@openclaude/windows-app",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "OpenClaude Aurora V5 hybrid Windows application",
   "private": true,
   "type": "module",

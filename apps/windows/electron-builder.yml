@@ -8,6 +8,7 @@ directories:
 
 files:
   - src/**/*
+  - THIRD_PARTY_NOTICES.md
   - package.json
 
 win:

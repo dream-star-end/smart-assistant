@@ -1,4 +1,4 @@
-export const TOOLBAR_HEIGHT = 52
+export const TOOLBAR_HEIGHT = 44
 
 function toPixel(value, fallback = 0) {
   return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : fallback

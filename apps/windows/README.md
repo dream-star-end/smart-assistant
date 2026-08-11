@@ -29,12 +29,19 @@ BaseWindow
 
 ## Windows 适配
 
-- Fluent 命令栏：后退、前进、刷新、主页、下载状态和连接/错误状态。
+- 参考 Codex 桌面版的信息层级，窗口顶部保留 44px 本地 app bar；标题固定为安装包内的
+  “Aurora / 桌面工作区”，不读取远端 DOM，也不伪造项目、任务或会话标题。
+- app bar 只承载下载状态和更多操作；后退、前进、刷新、主页、缩放与下载等桌面命令由
+  Electron 原生 `Menu` 和既有键盘快捷键提供，不在远端产品区注入脚本。
 - Segoe UI Variable/system 字体、键盘可达、可见焦点、forced-colors/high-contrast 和 reduced
   motion 支持。
 - 窗口位置/尺寸/maximized 持久化，多屏拔插后按当前 workArea 回收；Windows 11 22H2+ Mica 在不适用
   时安全回退不透明背景。
-- Alt+Left/Right、Ctrl+R、Ctrl+0/+/-、鼠标前进/后退键和固定无隐私 Jump List 任务。
+- F6 在远端产品区与本地 app bar 间循环焦点；Alt+Left/Right、Ctrl+R、Ctrl+0/+/-、鼠标
+  前进/后退键和固定无隐私 Jump List 任务。
+- 下载与离线状态是本地 modal：进入 modal 时 main 隐藏 product view，shell 扩展为整窗；关闭下载
+  modal 或网络恢复后，main 恢复 product view、重新布局并把焦点还给产品区。两块 renderer 不叠层
+  抢占输入。
 - 暂不做 close-to-tray、自动启动、深链、自动更新或离线聊天。
 
 ## 开发与验证
@@ -79,3 +86,9 @@ unsigned NSIS 构建、packaged 双-view smoke 和 SHA-256。当前产物明确�
 Windows 可能显示未知发布者/SmartScreen 警告，不能伪装成公开正式版，也不能指导用户关闭系统
 保护。公开分发前必须完成组织代码签名、可信时间戳、`signtool verify`、不可变产物与 Win10/11
 安装/升级/卸载真机矩阵。
+
+本目录的 shell、Electron main、测试、图标、文档或 installer 改动均为 app-only：
+**server runtime image rebuild = no**，不得运行 `scripts/deploy-v5.sh`，只走 Windows installer lane。
+
+本地 shell 使用的 Microsoft Fluent UI System Icons 第三方来源、固定版本、registry integrity 与
+MIT 许可见 [`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md)。

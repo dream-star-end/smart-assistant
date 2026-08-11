@@ -145,6 +145,9 @@ export function handleDesktopShortcut(input, actions = {}) {
   const shift = input.shift === true
   const meta = input.meta === true
 
+  if (!control && !alt && !shift && !meta && lowerKey === 'f6') {
+    return run(actions, 'focusNextPane')
+  }
   if (alt && !control && !shift && !meta) {
     if (lowerKey === 'arrowleft') return run(actions, 'back')
     if (lowerKey === 'arrowright') return run(actions, 'forward')

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
 import path from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
@@ -17,6 +18,29 @@ import {
 
 const testDirectory = path.dirname(fileURLToPath(import.meta.url))
 const rootDirectory = path.resolve(testDirectory, '../src/shell')
+const iconPaths = [
+  '/icons/aurora.svg',
+  '/icons/arrow_download_20_regular.svg',
+  '/icons/more_horizontal_20_regular.svg',
+  '/icons/folder_open_20_regular.svg',
+  '/icons/dismiss_20_regular.svg',
+  '/icons/wifi_off_24_regular.svg',
+  '/icons/arrow_clockwise_20_regular.svg',
+  '/icons/document_20_regular.svg',
+]
+
+function extractRendererIconUrls(css, html) {
+  const urls = new Set()
+  for (const match of css.matchAll(/url\(\s*["']?(app:\/\/aurora-shell\/icons\/[^"')\s]+)["']?\s*\)/g)) {
+    urls.add(match[1])
+  }
+  for (const match of html.matchAll(
+    /<img\b[^>]*\bsrc\s*=\s*["'](app:\/\/aurora-shell\/icons\/[^"']+)["'][^>]*>/gi,
+  )) {
+    urls.add(match[1])
+  }
+  return urls
+}
 
 test('registerShellScheme grants only the minimum secure standard privileges', () => {
   let registrations = null
@@ -92,6 +116,7 @@ test('shell handler serves only normalized allowlisted paths and rejects travers
     [SHELL_URL, 'text/html; charset=utf-8'],
     [`${SHELL_ORIGIN}/shell.css`, 'text/css; charset=utf-8'],
     [`${SHELL_ORIGIN}/shell.mjs`, 'text/javascript; charset=utf-8'],
+    ...iconPaths.map((iconPath) => [`${SHELL_ORIGIN}${iconPath}`, 'image/svg+xml']),
     [SMOKE_PRODUCT_URL, 'text/html; charset=utf-8'],
     [SMOKE_PRODUCT_ROUTE_URL, 'text/html; charset=utf-8'],
   ]
@@ -122,6 +147,41 @@ test('shell handler serves only normalized allowlisted paths and rejects travers
       { rootDirectory },
     )
     assert.equal(response.status, 404, requestUrl)
+  }
+})
+
+test('shell handler returns 404 for every SVG outside the fixed file allowlist', async () => {
+  for (const requestUrl of [
+    `${SHELL_ORIGIN}/icons/unknown.svg`,
+    `${SHELL_ORIGIN}/icons/arrow_download_24_regular.svg`,
+    `${SHELL_ORIGIN}/icons/arrow-download-20-regular.svg`,
+    `${SHELL_ORIGIN}/icons/nested/document_20_regular.svg`,
+  ]) {
+    assert.equal(resolveShellAsset(requestUrl), null, requestUrl)
+    const response = await createShellResponse(
+      { method: 'GET', url: requestUrl },
+      { rootDirectory },
+    )
+    assert.equal(response.status, 404, requestUrl)
+  }
+})
+
+test('every local icon referenced by the renderer resolves through the exact SVG allowlist', async () => {
+  const [css, html] = await Promise.all([
+    readFile(path.join(rootDirectory, 'shell.css'), 'utf8'),
+    readFile(path.join(rootDirectory, 'index.html'), 'utf8'),
+  ])
+  const referencedUrls = extractRendererIconUrls(css, html)
+  assert.ok(referencedUrls.size > 0, 'renderer must reference at least one local icon')
+
+  for (const requestUrl of referencedUrls) {
+    assert.ok(resolveShellAsset(requestUrl), requestUrl)
+    const response = await createShellResponse(
+      { method: 'GET', url: requestUrl },
+      { rootDirectory },
+    )
+    assert.equal(response.status, 200, requestUrl)
+    assert.equal(response.headers.get('content-type'), 'image/svg+xml', requestUrl)
   }
 })
 

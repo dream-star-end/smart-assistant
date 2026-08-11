@@ -48,7 +48,6 @@ function initializeSmokeProduct() {
 function initializeShell() {
   const bridge = globalThis.auroraDesktop
   const elements = {
-    back: document.getElementById('back-button'),
     commandSurface: document.querySelector('.command-surface'),
     connectionLabel: document.getElementById('connection-label'),
     connectionStatus: document.getElementById('connection-status'),
@@ -60,16 +59,14 @@ function initializeShell() {
     downloadsLayer: document.getElementById('downloads-layer'),
     downloadsList: document.getElementById('downloads-list'),
     downloadsScrim: document.getElementById('downloads-scrim'),
-    forward: document.getElementById('forward-button'),
-    home: document.getElementById('home-button'),
     loadingTrack: document.getElementById('loading-track'),
+    moreMenuButton: document.getElementById('more-menu-button'),
     offlineMessage: document.getElementById('offline-message'),
     offlineNetwork: document.getElementById('offline-network'),
     offlineRetry: document.getElementById('offline-retry'),
     offlineTitle: document.getElementById('offline-title'),
     offlineWorkspace: document.getElementById('offline-workspace'),
     openDownloadsFolder: document.getElementById('open-downloads-folder'),
-    reload: document.getElementById('reload-button'),
   }
 
   const initialState = {
@@ -180,19 +177,14 @@ function initializeShell() {
 
     const item = document.createElement('li')
     item.className = 'download-item'
+    item.dataset.downloadId = download.id
     item.dataset.state = typeof download.state === 'string' ? download.state : 'progressing'
 
     const icon = document.createElement('span')
     icon.className = 'download-icon'
     icon.setAttribute('aria-hidden', 'true')
-    const svgNamespace = 'http://www.w3.org/2000/svg'
-    const fileIcon = document.createElementNS(svgNamespace, 'svg')
-    fileIcon.setAttribute('viewBox', '0 0 24 24')
-    for (const shape of ['M7 3.5h7l4 4v13H7Z', 'M14 3.5v4h4']) {
-      const filePath = document.createElementNS(svgNamespace, 'path')
-      filePath.setAttribute('d', shape)
-      fileIcon.append(filePath)
-    }
+    const fileIcon = document.createElement('span')
+    fileIcon.className = 'fluent-icon icon-document'
     icon.append(fileIcon)
 
     const copy = document.createElement('div')
@@ -211,9 +203,9 @@ function initializeShell() {
     if (download.state === 'progressing') {
       const progress = document.createElement('progress')
       progress.max = 1
-      const numericProgress = Number(download.progress)
-      if (Number.isFinite(numericProgress))
-        progress.value = Math.min(1, Math.max(0, numericProgress))
+      if (typeof download.progress === 'number' && Number.isFinite(download.progress)) {
+        progress.value = Math.min(1, Math.max(0, download.progress))
+      }
       progress.setAttribute('aria-label', `${name.textContent} 下载进度`)
       meta.prepend(progress)
     }
@@ -233,6 +225,12 @@ function initializeShell() {
   }
 
   function renderDownloads() {
+    const focusedElement = document.activeElement
+    const focusedDownloadId = focusedElement
+      ?.closest?.('.download-item')
+      ?.getAttribute('data-download-id')
+    const restoreDownloadAction = focusedElement?.classList?.contains('show-download-button')
+    const focusWasInDialog = elements.downloadsDialog.contains(focusedElement)
     const fragment = document.createDocumentFragment()
     let renderedCount = 0
     for (const download of state.downloads) {
@@ -249,6 +247,19 @@ function initializeShell() {
       'aria-label',
       renderedCount === 0 ? '下载，没有记录' : `下载，${renderedCount} 项记录`,
     )
+
+    if (state.shellMode !== 'downloads' || !focusWasInDialog) return
+    if (restoreDownloadAction && focusedDownloadId) {
+      const restoredItem = [...elements.downloadsList.querySelectorAll('.download-item')].find(
+        (item) => item.dataset.downloadId === focusedDownloadId,
+      )
+      const restoredAction = restoredItem?.querySelector('.show-download-button')
+      if (restoredAction) {
+        restoredAction.focus()
+        return
+      }
+    }
+    if (!elements.downloadsDialog.contains(document.activeElement)) elements.downloadsClose.focus()
   }
 
   function renderMode() {
@@ -258,6 +269,8 @@ function initializeShell() {
     const offlineOpen = mode === 'offline'
     elements.downloadsLayer.hidden = !downloadsOpen
     elements.downloadsButton.setAttribute('aria-expanded', String(downloadsOpen))
+    elements.downloadsButton.disabled = offlineOpen
+    elements.moreMenuButton.disabled = mode !== 'toolbar'
     elements.offlineWorkspace.hidden = !offlineOpen
 
     if (offlineOpen) {
@@ -276,6 +289,7 @@ function initializeShell() {
 
     if (mode !== previousMode) {
       if (downloadsOpen) requestAnimationFrame(() => elements.downloadsClose.focus())
+      if (offlineOpen) requestAnimationFrame(() => elements.offlineRetry.focus())
       previousMode = mode
     }
   }
@@ -288,8 +302,6 @@ function initializeShell() {
     const transparencyAllowed = !state.theme.forcedColors && !state.theme.reduceTransparency
     elements.commandSurface.classList.toggle('allow-transparency', transparencyAllowed)
     elements.commandSurface.classList.toggle('reduce-transparency', !transparencyAllowed)
-    elements.back.disabled = !state.navigation.canGoBack
-    elements.forward.disabled = !state.navigation.canGoForward
     renderConnection()
     renderDownloads()
     renderMode()
@@ -299,13 +311,10 @@ function initializeShell() {
     if (state.shellMode === 'downloads') send('downloads-close')
   }
 
-  elements.back.addEventListener('click', () => send('back'))
-  elements.forward.addEventListener('click', () => send('forward'))
-  elements.reload.addEventListener('click', () => send('reload'))
-  elements.home.addEventListener('click', () => send('home'))
   elements.downloadsButton.addEventListener('click', () => {
     send(state.shellMode === 'downloads' ? 'downloads-close' : 'downloads-open')
   })
+  elements.moreMenuButton.addEventListener('click', () => send('open-more-menu'))
   elements.downloadsClose.addEventListener('click', closeDownloads)
   elements.downloadsScrim.addEventListener('click', closeDownloads)
   elements.openDownloadsFolder.addEventListener('click', () => send('open-downloads-folder'))

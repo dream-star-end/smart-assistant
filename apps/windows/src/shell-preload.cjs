@@ -11,6 +11,7 @@ const COMMAND_TYPES = new Set([
   'focus-product',
   'forward',
   'home',
+  'open-more-menu',
   'open-downloads-folder',
   'ready',
   'reload',

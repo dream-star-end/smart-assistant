@@ -27,6 +27,44 @@ const ASSETS = new Map([
   ['/shell.css', Object.freeze({ filename: 'shell.css', mime: 'text/css; charset=utf-8' })],
   ['/shell.mjs', Object.freeze({ filename: 'shell.mjs', mime: 'text/javascript; charset=utf-8' })],
   [
+    '/icons/aurora.svg',
+    Object.freeze({ filename: 'icons/aurora.svg', mime: 'image/svg+xml' }),
+  ],
+  [
+    '/icons/arrow_download_20_regular.svg',
+    Object.freeze({
+      filename: 'icons/arrow_download_20_regular.svg',
+      mime: 'image/svg+xml',
+    }),
+  ],
+  [
+    '/icons/more_horizontal_20_regular.svg',
+    Object.freeze({
+      filename: 'icons/more_horizontal_20_regular.svg',
+      mime: 'image/svg+xml',
+    }),
+  ],
+  [
+    '/icons/arrow_clockwise_20_regular.svg',
+    Object.freeze({ filename: 'icons/arrow_clockwise_20_regular.svg', mime: 'image/svg+xml' }),
+  ],
+  [
+    '/icons/folder_open_20_regular.svg',
+    Object.freeze({ filename: 'icons/folder_open_20_regular.svg', mime: 'image/svg+xml' }),
+  ],
+  [
+    '/icons/dismiss_20_regular.svg',
+    Object.freeze({ filename: 'icons/dismiss_20_regular.svg', mime: 'image/svg+xml' }),
+  ],
+  [
+    '/icons/wifi_off_24_regular.svg',
+    Object.freeze({ filename: 'icons/wifi_off_24_regular.svg', mime: 'image/svg+xml' }),
+  ],
+  [
+    '/icons/document_20_regular.svg',
+    Object.freeze({ filename: 'icons/document_20_regular.svg', mime: 'image/svg+xml' }),
+  ],
+  [
     '/smoke-product.html',
     Object.freeze({ filename: 'smoke-product.html', mime: 'text/html; charset=utf-8' }),
   ],
