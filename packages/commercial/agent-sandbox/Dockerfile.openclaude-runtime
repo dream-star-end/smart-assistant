@@ -61,7 +61,8 @@ ENV TZ=Asia/Shanghai \
 #   - git / curl / ca-certificates: 个人版 ccb subprocess + 网络请求基本依赖
 #   - ripgrep / jq / unzip / zip / file / sqlite3:搜索、归档、文件识别与轻量数据检查；
 #     unzip 也用于 DOCX smoke/验证
-#   - poppler-utils / imagemagick / libreoffice-writer:PDF 文本、DOCX→PDF、逐页栅格化与图片属性检查；
+#   - poppler-utils / imagemagick / libreoffice-writer / libreoffice-math:PDF 文本、DOCX→PDF、
+#     原生 OMML 公式渲染、逐页栅格化与图片属性检查；
 #     这些是 Read/文档技能与图片工作流实际调用的基础命令
 #   - util-linux:提供 kernel flock，V5 Auto-Dream 跨 gateway 进程串行化的硬依赖
 #   - tini: PID 1 转发 SIGTERM 给 entrypoint,避免 zombie
@@ -88,6 +89,7 @@ RUN apt-get update \
         poppler-utils \
         imagemagick \
         libreoffice-writer \
+        libreoffice-math \
         util-linux \
         tini \
         bash \
@@ -108,6 +110,7 @@ RUN apt-get update \
     && pdftoppm -v \
     && identify -version \
     && libreoffice --headless --version \
+    && dpkg-query -W -f='${Status}\n' libreoffice-math | grep -qx 'install ok installed' \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* \
     # 清掉 setuid/setgid 二进制(05-SEC §13 精神,减少本地提权面)。
     # **例外**: 保留 /usr/bin/sudo 的 setuid bit — sudo 二进制必须 setuid root
@@ -304,6 +307,7 @@ RUN set -eux; \
     test -s /tmp/oc-docx-smoke-render/page-1.png; \
     test -s /tmp/oc-docx-smoke-render/vision-page-1.jpg; \
     test "$(stat -c %s /tmp/oc-docx-smoke-render/vision-page-1.jpg)" -lt 4500000; \
+    pdftotext /tmp/oc-docx-smoke-render/oc-docx-smoke.pdf - | grep -Eq 'E[[:space:]]*=[[:space:]]*m[[:space:]]*c'; \
     oc-docx inspect /tmp/oc-docx-smoke.docx --render-dir /tmp/oc-docx-smoke-render --json /tmp/oc-docx-smoke-render/report.json; \
     oc-docx scrub /tmp/oc-docx-smoke.docx -o /tmp/oc-docx-smoke-clean.docx --keep-title; \
     unzip -tq /tmp/oc-docx-smoke-clean.docx; \
