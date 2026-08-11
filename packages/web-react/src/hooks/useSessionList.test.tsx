@@ -1,5 +1,5 @@
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
-import { afterEach, describe, expect, test, vi, type Mock } from "vitest";
+import { type Mock, afterEach, describe, expect, test, vi } from "vitest";
 import { api } from "../lib/api";
 import { createMemoryAuthSession } from "../lib/authSession";
 import type { SessionDetail, User } from "../lib/types";
@@ -254,6 +254,56 @@ describe("useSessionList 重命名会话", () => {
     expect(blank.result.current.sessions.find((s) => s.id === "webkeepme001")?.title).toBe(
       "保留的会话",
     );
+  });
+});
+
+describe("useSessionList 新建会话", () => {
+  test("非 demo 连点新建只进入一个空白态，不提前制造侧栏占位会话", async () => {
+    const { result } = await renderSessionList({ confirmResult: true, promptResult: null });
+    await waitFor(() => expect(result.current.activeId).toBe("webkeepme001"));
+    const existingIds = result.current.sessions.map((session) => session.id);
+
+    act(() => {
+      result.current.newSession();
+      result.current.newSession();
+    });
+
+    expect(result.current.activeId).toBeUndefined();
+    expect(result.current.sessions.map((session) => session.id)).toEqual(existingIds);
+  });
+
+  test("用户先进入空白新会话后，迟到的历史列表不会自动抢走选中态", async () => {
+    const list = deferred<ReturnType<typeof meta>[]>();
+    vi.spyOn(api, "listSessions").mockImplementation(async () => list.promise as never);
+    const auth = createMemoryAuthSession(() => {}, "token");
+    const user: User = { id: "u1", displayName: "User", roles: ["user"] };
+    const socket = {
+      storedMaxSeq: () => 0,
+      storedHistoryRevision: () => 1,
+      mergeServerHistory: vi.fn(),
+    } as unknown as UseChatSocket;
+    const { result } = renderHook(() => useSessionList({
+      demo: false,
+      auth,
+      authSession: auth,
+      user,
+      agentId: "main",
+      sockRef: { current: socket },
+      confirmDialog: async () => true,
+      promptText: async () => null,
+      clearChatError: () => {},
+      onNewSessionReset: () => {},
+      onActiveSessionDeleted: () => {},
+    }));
+
+    act(() => result.current.newSession());
+    await act(async () => {
+      list.resolve([meta("weblate00001", "迟到的会话")]);
+      await list.promise;
+    });
+    await waitFor(() => expect(result.current.sessions).toHaveLength(1));
+
+    expect(result.current.activeId).toBeUndefined();
   });
 });
 

@@ -2094,6 +2094,7 @@ export function applyOutboundError(sess: ChatSession, frame: OutboundErrorWire, 
       frame.detail === "本轮已由用户停止。"
     ? "user_cancelled"
     : normalizeBridgeErrorCode(frame.code);
+  const userCancelled = normalized === "stopped" || normalized === "user_cancelled";
   addMessage(sess, "assistant", friendlyBridgeErrorMessage(normalized, frame.message || "出错了"), {
     _errorCode: normalized,
     _errorDetail: safeBridgeErrorDetail(normalized, frame.traceId),
@@ -2112,18 +2113,24 @@ export function applyOutboundError(sess: ChatSession, frame: OutboundErrorWire, 
     clearTurnTiming(sess);
     resetReplyTracker(sess);
     sess._localTeardownAt = sess._trackerResetAt;
-    // 生成占位卡（需求 C）：本轮出错 → 运行中占位转失败态（danger 边 + 原因）。
-    failGenPlaceholders(sess, errorLabel(normalized));
+    // 用户主动停止不应留下失败卡；真正错误仍把运行中生成占位转为失败态。
+    if (userCancelled) resolveGenPlaceholders(sess);
+    else failGenPlaceholders(sess, errorLabel(normalized));
   }
   const exactUser = frame.clientMessageId
     ? sess.messages.find((m) => m?.role === "user" && m.id === frame.clientMessageId)
     : undefined;
   if (exactUser) {
-    exactUser.status = "error";
+    exactUser.status = userCancelled ? "sent" : "error";
   } else if (!frame.clientMessageId) {
     for (let i = sess.messages.length - 1; i >= 0; i--) {
       const m = sess.messages[i];
-      if (m?.role === "user" && (m.status === "sending" || m.status === "sent" || m.status === "queued")) {
+      if (m?.role !== "user") continue;
+      if (userCancelled) {
+        if (m.status === "sending" || m.status === "queued") m.status = "sent";
+        break;
+      }
+      if (m.status === "sending" || m.status === "sent" || m.status === "queued") {
         m.status = "error";
         break;
       }
@@ -2154,6 +2161,7 @@ export function applyLegacyBridgeError(sess: ChatSession, frame: LegacyBridgeErr
     return;
   }
   const normalized = normalizeBridgeErrorCode(frame.code);
+  const userCancelled = normalized === "stopped" || normalized === "user_cancelled";
   const text = friendlyBridgeErrorMessage(frame.code, frame.message);
   addMessage(sess, "assistant", text, {
     _errorCode: normalized,
@@ -2171,18 +2179,23 @@ export function applyLegacyBridgeError(sess: ChatSession, frame: LegacyBridgeErr
     clearTurnTiming(sess);
     resetReplyTracker(sess);
     sess._localTeardownAt = sess._trackerResetAt;
-    // 生成占位卡（需求 C）：本轮出错 → 运行中占位转失败态。
-    failGenPlaceholders(sess, errorLabel(normalized));
+    if (userCancelled) resolveGenPlaceholders(sess);
+    else failGenPlaceholders(sess, errorLabel(normalized));
   }
   const exactUser = frame.clientMessageId
     ? sess.messages.find((m) => m?.role === "user" && m.id === frame.clientMessageId)
     : undefined;
   if (exactUser) {
-    exactUser.status = "error";
+    exactUser.status = userCancelled ? "sent" : "error";
   } else if (!frame.clientMessageId) {
     for (let i = sess.messages.length - 1; i >= 0; i--) {
       const m = sess.messages[i];
-      if (m?.role === "user" && (m.status === "sending" || m.status === "sent" || m.status === "queued")) {
+      if (m?.role !== "user") continue;
+      if (userCancelled) {
+        if (m.status === "sending" || m.status === "queued") m.status = "sent";
+        break;
+      }
+      if (m.status === "sending" || m.status === "sent" || m.status === "queued") {
         m.status = "error";
         break;
       }
@@ -2190,7 +2203,9 @@ export function applyLegacyBridgeError(sess: ChatSession, frame: LegacyBridgeErr
   }
   effects.persistSession?.(sess.id);
   if (normalized === "insufficient_credits") effects.refreshBalance?.();
-  effects.scheduleAutomaticRecovery?.(sess.id, frame.clientMessageId);
+  if (supportsAutomaticTurnRecovery(normalized)) {
+    effects.scheduleAutomaticRecovery?.(sess.id, frame.clientMessageId);
+  }
 }
 
 // ═══════════════ resume_failed（§4 第三层）═══════════════
