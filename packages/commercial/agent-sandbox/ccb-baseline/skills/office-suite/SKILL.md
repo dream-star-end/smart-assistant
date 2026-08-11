@@ -16,7 +16,8 @@ priority: 9
 | Word/报告/公文 | `oc-docx`(Markdown/Quarto→docx,公式原生) | document-writing |
 | Excel/数据表 | `oc-xlsx` + openpyxl/pandas/duckdb | office-spreadsheet |
 | PDF | `oc-pdf`(Typst) / reportlab | office-pdf |
-| PPT 汇报 | `oc-slides --spec deck.json -o out.pptx` | research-slides |
+| PPT 汇报 | `oc-slides --deck deck.json -o out.pptx` | research-slides |
+| PDF/PPTX/XLSX 交付检查 | `oc-artifact-qa inspect --input <文件> --out-dir <新目录> --expect <JSON>` | 对应文档 skill |
 | 配图/头图/语音 | `mmx image|speech` | minimax-media |
 | 读网页/长文档/Office 文件 | `oc-web extract <url>` / `oc-web parse <文件>` | web-context |
 | 图表 | matplotlib(出 PNG)/ ` ```mermaid ` / ` ```chart ` | scientific-figures / platform-capabilities |
@@ -27,7 +28,7 @@ priority: 9
 问清:周期、条线、受众(给领导还是团队)。结构默认"本期进展→数据/成果→问题与风险→下期计划"。有数据就先 `oc-xlsx` 出表/图,再写进 Markdown,`oc-docx` 出 Word(或 `oc-pdf` 出 PDF)。避免空话套话,用具体数字和事实。
 
 ### 2. 汇报 PPT
-先定叙事线(背景→问题→方案→数据→结论→计划),每页一个要点、要点不超过 5 条。用 `oc-slides` 的 SlideDeck JSON 出真·可编辑 pptx(不要用 HTML/图片冒充 PPT)。需要配图用 `mmx image` 或 matplotlib/mermaid。详见 research-slides skill 的 spec 格式。
+先定叙事线(背景→问题→方案→数据→结论→计划),每页一个结论;内容多就拆页,不缩成小字或截断。用 `oc-slides --deck` 的 SlideDeck JSON 出真·可编辑 pptx(不要用 HTML/图片冒充 PPT)。需要配图用 `mmx image` 或 matplotlib/mermaid。交付前用 `oc-artifact-qa` 渲染全部页面并检查。详见 research-slides skill 的 deck 格式。
 
 ### 3. 会议纪要(含待办与责任人)
 输入可以是用户给的录音转写文本 / 速记 / 要点。产出四段:**议题结论、关键决策、待办事项(任务|责任人|截止)、遗留问题**。待办用表格,能落 `oc-xlsx` 就落表,便于跟踪。忠实于原文,不臆造决策或责任人;信息缺失就标"待明确"。
@@ -63,6 +64,7 @@ open("/home/agent/.openclaude/邀请.ics","wb").write(cal.to_ical())
 ## 交付纪律
 
 - **产文件、给绝对路径**(如 `/home/agent/.openclaude/周报.docx`),不要只回一段文本了事。
+- PDF/PPTX/XLSX 必须先过对应 skill 的 `oc-artifact-qa` 结构与渲染闭环;不能只验证扩展名或复述“已检查”。
 - 一次任务尽量**闭环交付**(数据→分析→成品),必要时同时给 Word + PDF 两种格式。
 - 事实性内容(数字、人名、单位、日期、决策、责任人)**忠实于用户提供的信息**,缺失标"待明确",绝不臆造。
 - 合规:不代登录/爬取任何需要账号或付费墙的内容;不装/用 AGPL/GPL 传染性许可库。

@@ -215,6 +215,12 @@ function xlsxCommandProbe(command: string): Probe {
  * adding a bin/oc-* file or a public operation without a probe makes this suite red.
  */
 const OC_SURFACES: Record<string, Record<string, Probe>> = {
+  'oc-artifact-qa': {
+    inspect: scriptProbe('oc-artifact-qa.py', ['--help'], {
+      code: 0,
+      stdout: /Inspect and render PDF\/PPTX\/XLSX artifacts/,
+    }),
+  },
   'oc-browser': {
     forward: browserLauncherProbe,
   },
@@ -789,6 +795,11 @@ function productionSurfaces(): Record<string, Set<string>> {
   assert.equal(memory.delete('memory'), true, 'oc-memory: retired memory branch not discovered')
   memory.add('memory.retired')
   return {
+    'oc-artifact-qa': singlePurpose(
+      'packages/commercial/agent-sandbox/platform-runtime/bin/oc-artifact-qa.py',
+      'inspect',
+      /add_parser\("inspect"/,
+    ),
     'oc-browser': singlePurpose(
       'packages/commercial/agent-sandbox/platform-runtime/bin/oc-browser.sh',
       'forward',

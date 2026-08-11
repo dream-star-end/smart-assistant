@@ -87,6 +87,8 @@ RUN apt-get update \
         sqlite3 \
         poppler-utils \
         imagemagick \
+        libreoffice-impress-nogui \
+        libreoffice-calc-nogui \
         util-linux \
         tini \
         bash \
@@ -96,6 +98,7 @@ RUN apt-get update \
         python3-pip \
         python3-venv \
         fonts-noto-cjk \
+        fonts-droid-fallback \
     && flock --version \
     && python --version \
     && rg --version \
@@ -105,6 +108,7 @@ RUN apt-get update \
     && pdftotext -v \
     && pdftoppm -v \
     && identify -version \
+    && soffice --version \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* \
     # 清掉 setuid/setgid 二进制(05-SEC §13 精神,减少本地提权面)。
     # **例外**: 保留 /usr/bin/sudo 的 setuid bit — sudo 二进制必须 setuid root
@@ -265,9 +269,11 @@ COPY --chown=root:root ./platform-runtime/bin/oc-poster.sh /usr/local/bin/oc-pos
 # oc-rank: 确定性候选排名(tournament debate / tree-search 选分支),文档见 research-tournament skill。
 COPY --chown=root:root ./platform-runtime/bin/oc-rank.sh /usr/local/bin/oc-rank
 # oc-xlsx / oc-pdf: 办公助手确定性产物(Excel via openpyxl / 通用 PDF via Quarto-Typst)。
+# oc-artifact-qa:PDF/PPTX/XLSX 结构检查 + LibreOffice/Poppler 全页渲染质量证据。
 # 文档见 office-spreadsheet / office-pdf baseline skill。
 COPY --chown=root:root ./platform-runtime/bin/oc-xlsx.py /usr/local/bin/oc-xlsx
 COPY --chown=root:root ./platform-runtime/bin/oc-pdf.sh /usr/local/bin/oc-pdf
+COPY --chown=root:root ./platform-runtime/bin/oc-artifact-qa.py /usr/local/bin/oc-artifact-qa
 # oc-vision: 识图 CLI(纯文本模型看图兜底,复用 mcpVisionServer 核心 / 默认 MiniMax-M3
 # 后端)。取代已退役的常驻 openclaude-vision MCP stdio server。文档见 oc-vision baseline skill。
 COPY --chown=root:root ./platform-runtime/bin/oc-vision.sh /usr/local/bin/oc-vision
@@ -286,7 +292,7 @@ COPY --chown=root:root ./platform-runtime/bin/oc-memory.sh /usr/local/bin/oc-mem
 # 文档见 app-connectors baseline skill。
 COPY --chown=root:root ./platform-runtime/bin/oc-connect.sh /usr/local/bin/oc-connect
 RUN set -eux; \
-    chmod 0755 /usr/local/bin/oc-docx /usr/local/bin/oc-minimax /usr/local/bin/oc-web-context /usr/local/bin/oc-web /usr/local/bin/oc-browser /usr/local/bin/oc-market /usr/local/bin/oc-skill /usr/local/bin/oc-lit /usr/local/bin/oc-cite /usr/local/bin/oc-ingest /usr/local/bin/oc-litrag /usr/local/bin/oc-report /usr/local/bin/oc-slides /usr/local/bin/oc-poster /usr/local/bin/oc-rank /usr/local/bin/oc-xlsx /usr/local/bin/oc-pdf /usr/local/bin/oc-vision /usr/local/bin/oc-figcheck /usr/local/bin/oc-diagram /usr/local/bin/oc-memory /usr/local/bin/oc-connect /usr/local/lib/openclaude/create-docgen-reference.py; \
+    chmod 0755 /usr/local/bin/oc-docx /usr/local/bin/oc-minimax /usr/local/bin/oc-web-context /usr/local/bin/oc-web /usr/local/bin/oc-browser /usr/local/bin/oc-market /usr/local/bin/oc-skill /usr/local/bin/oc-lit /usr/local/bin/oc-cite /usr/local/bin/oc-ingest /usr/local/bin/oc-litrag /usr/local/bin/oc-report /usr/local/bin/oc-slides /usr/local/bin/oc-poster /usr/local/bin/oc-rank /usr/local/bin/oc-xlsx /usr/local/bin/oc-pdf /usr/local/bin/oc-artifact-qa /usr/local/bin/oc-vision /usr/local/bin/oc-figcheck /usr/local/bin/oc-diagram /usr/local/bin/oc-memory /usr/local/bin/oc-connect /usr/local/lib/openclaude/create-docgen-reference.py; \
     ln -sf /usr/local/bin/oc-minimax /usr/local/bin/mmx; \
     python3 /usr/local/lib/openclaude/create-docgen-reference.py /usr/local/share/openclaude-docgen/reference.docx; \
     printf '%s\n' '# DOCX smoke' 'Inline $a^2+b^2=c^2$.' '' '$$' 'E = mc^2' '$$' > /tmp/oc-docx-smoke.md; \
@@ -304,7 +310,49 @@ RUN set -eux; \
     oc-pdf /tmp/oc-pdf-smoke.md -o /tmp/oc-pdf-smoke.pdf; \
     test -s /tmp/oc-pdf-smoke.pdf; \
     head -c 5 /tmp/oc-pdf-smoke.pdf | grep -q '%PDF'; \
-    rm -f /tmp/oc-pdf-smoke.md /tmp/oc-pdf-smoke.pdf; \
+    printf '%s\n' '{"kind":"pdf","requiredText":["办公助手","中文正文"],"pageCount":1}' > /tmp/oc-pdf-smoke.expect.json; \
+    oc-artifact-qa inspect --input /tmp/oc-pdf-smoke.pdf --out-dir /tmp/oc-pdf-smoke.qa --expect /tmp/oc-pdf-smoke.expect.json > /tmp/oc-pdf-smoke.report.json; \
+    jq -e '.passed == true and .facts.pageCount == 1 and (.renderedPages | length) == 1' /tmp/oc-pdf-smoke.report.json; \
+    printf '%s\n' \
+      'from reportlab.pdfgen.canvas import Canvas' \
+      'from reportlab.pdfbase import pdfmetrics' \
+      'from reportlab.pdfbase.ttfonts import TTFont' \
+      'pdfmetrics.registerFont(TTFont("DroidCJK","/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf"))' \
+      'c=Canvas("/tmp/oc-reportlab-cjk-smoke.pdf"); c.setFont("DroidCJK",18); c.drawString(72,760,"收 据")' \
+      'c.setFont("DroidCJK",12); c.drawString(72,720,"华信科技有限公司"); c.showPage(); c.save()' \
+      > /tmp/oc-reportlab-cjk-smoke.py; \
+    python3 /tmp/oc-reportlab-cjk-smoke.py; \
+    printf '%s\n' '{"kind":"pdf","requiredText":["收 据","华信科技有限公司"],"pageCount":1}' > /tmp/oc-reportlab-cjk-smoke.expect.json; \
+    oc-artifact-qa inspect --input /tmp/oc-reportlab-cjk-smoke.pdf --out-dir /tmp/oc-reportlab-cjk-smoke.qa --expect /tmp/oc-reportlab-cjk-smoke.expect.json > /tmp/oc-reportlab-cjk-smoke.report.json; \
+    jq -e '.passed == true and (.facts.fonts | any(.embedded == true and .unicode == true))' /tmp/oc-reportlab-cjk-smoke.report.json; \
+    printf '%s\n' \
+      'from pptx import Presentation' \
+      'from pptx.util import Inches' \
+      'deck=Presentation(); slide=deck.slides.add_slide(deck.slide_layouts[5])' \
+      'box=slide.shapes.add_textbox(Inches(1), Inches(1), Inches(8), Inches(2))' \
+      'box.text_frame.text="季度工作汇报"' \
+      'deck.save("/tmp/oc-pptx-smoke.pptx")' \
+      > /tmp/oc-pptx-smoke.py; \
+    python3 /tmp/oc-pptx-smoke.py; \
+    printf '%s\n' '{"kind":"pptx","requiredText":["季度工作汇报"],"slideCount":1}' > /tmp/oc-pptx-smoke.expect.json; \
+    oc-artifact-qa inspect --input /tmp/oc-pptx-smoke.pptx --out-dir /tmp/oc-pptx-smoke.qa --expect /tmp/oc-pptx-smoke.expect.json > /tmp/oc-pptx-smoke.report.json; \
+    jq -e '.passed == true and .facts.slideCount == 1 and (.renderedPages | length) == 1' /tmp/oc-pptx-smoke.report.json; \
+    printf '%s\n' \
+      'from openpyxl import Workbook' \
+      'from openpyxl.worksheet.datavalidation import DataValidation' \
+      'wb=Workbook(); ws=wb.active; ws.title="汇总"' \
+      'ws.append(["项目","金额","状态"]); ws.append(["研发",100,"待确认"]); ws["B3"]="=SUM(B2:B2)"' \
+      'dv=DataValidation(type="list",formula1="\"待确认,已完成\""); ws.add_data_validation(dv); dv.add(ws["C2"])' \
+      'wb.save("/tmp/oc-xlsx-formula-smoke.xlsx")' \
+      > /tmp/oc-xlsx-formula-smoke.py; \
+    python3 /tmp/oc-xlsx-formula-smoke.py; \
+    printf '%s\n' '{"kind":"xlsx","requiredText":["项目","研发"],"requiredSheets":["汇总"],"requiredFormulaCells":["汇总!B3"],"minDataValidations":1}' > /tmp/oc-xlsx-formula-smoke.expect.json; \
+    oc-artifact-qa inspect --input /tmp/oc-xlsx-formula-smoke.xlsx --out-dir /tmp/oc-xlsx-formula-smoke.qa --expect /tmp/oc-xlsx-formula-smoke.expect.json > /tmp/oc-xlsx-formula-smoke.report.json; \
+    jq -e '.passed == true and .facts.formulaCount == 1 and .facts.dataValidationCount == 1' /tmp/oc-xlsx-formula-smoke.report.json; \
+    rm -rf /tmp/oc-pdf-smoke.md /tmp/oc-pdf-smoke.pdf /tmp/oc-pdf-smoke.expect.json /tmp/oc-pdf-smoke.report.json /tmp/oc-pdf-smoke.qa \
+      /tmp/oc-reportlab-cjk-smoke.py /tmp/oc-reportlab-cjk-smoke.pdf /tmp/oc-reportlab-cjk-smoke.expect.json /tmp/oc-reportlab-cjk-smoke.report.json /tmp/oc-reportlab-cjk-smoke.qa \
+      /tmp/oc-pptx-smoke.py /tmp/oc-pptx-smoke.pptx /tmp/oc-pptx-smoke.expect.json /tmp/oc-pptx-smoke.report.json /tmp/oc-pptx-smoke.qa \
+      /tmp/oc-xlsx-formula-smoke.py /tmp/oc-xlsx-formula-smoke.xlsx /tmp/oc-xlsx-formula-smoke.expect.json /tmp/oc-xlsx-formula-smoke.report.json /tmp/oc-xlsx-formula-smoke.qa; \
     printf '%s\n' \
       'import matplotlib; matplotlib.use("Agg")' \
       'import matplotlib.pyplot as plt' \

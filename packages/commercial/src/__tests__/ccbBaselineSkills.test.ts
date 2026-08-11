@@ -76,6 +76,21 @@ describe('ccb-baseline skills ↔ manifest', () => {
     assert.ok((V3_CCB_BASELINE_SKILL_NAMES as readonly string[]).includes('market'))
   })
 
+  it('closes PDF/PPTX/XLSX delivery with artifact-backed QA and the real slides flag', () => {
+    const pdf = readFileSync(join(skillsDir, 'office-pdf', 'SKILL.md'), 'utf8')
+    const slides = readFileSync(join(skillsDir, 'research-slides', 'SKILL.md'), 'utf8')
+    const spreadsheet = readFileSync(join(skillsDir, 'office-spreadsheet', 'SKILL.md'), 'utf8')
+    const suite = readFileSync(join(skillsDir, 'office-suite', 'SKILL.md'), 'utf8')
+    for (const body of [pdf, slides, spreadsheet, suite]) {
+      assert.match(body, /oc-artifact-qa inspect/)
+    }
+    assert.match(slides, /oc-slides --deck/)
+    assert.match(suite, /oc-slides --deck/)
+    assert.doesNotMatch(suite, /oc-slides --spec/)
+    assert.match(pdf, /DroidSansFallbackFull\.ttf/)
+    assert.doesNotMatch(pdf, /TTFont\([^\n]*NotoSansCJK-Regular\.ttc/)
+  })
+
   it('routes ordinary video requests to durable H3 instead of the MiniMax Token Plan', () => {
     const body = readFileSync(join(skillsDir, 'minimax-media', 'SKILL.md'), 'utf8')
     assert.match(body, /For ordinary video requests, use `oc-h3`/)

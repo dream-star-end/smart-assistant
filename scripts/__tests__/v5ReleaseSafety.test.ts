@@ -7786,10 +7786,10 @@ esac
     assert.match(source, /glob\.glob\(os\.path\.join\(expected_dir, '\*\/evals\/evals\.json'\)\)/)
     assert.match(source, /缺少评测结果/)
     assert.match(source, /baseline coverage: \{done_expected\}\/\{len\(expected\)\} done/)
-    assert.match(service, /TimeoutStartSec=43200/, '9 个技能 × 单技能 60min 后必须保留汇总余量')
+    assert.match(service, /TimeoutStartSec=43200/, '10 个技能 × 单技能 60min 后必须保留汇总余量')
   })
 
-  test('repository baseline eval inventory is the reviewed nine-skill set', async () => {
+  test('repository baseline eval inventory is the reviewed ten-skill set', async () => {
     const baselineSkills = path.join(root, 'packages/commercial/agent-sandbox/ccb-baseline/skills')
     const entries = await readdir(baselineSkills, { withFileTypes: true })
     const actual: string[] = []
@@ -7808,6 +7808,7 @@ esac
       'memory-management',
       'office-pdf',
       'office-spreadsheet',
+      'research-slides',
       'scheduled-tasks',
       'scientific-figures',
       'skill-search',
