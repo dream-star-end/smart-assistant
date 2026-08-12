@@ -289,6 +289,7 @@ await page.route("**/api/agents/main/**", (route, request) => {
     body: JSON.stringify({ error: { code: "NOT_FOUND" } }),
   });
 });
+let browserMediaCanceled = false;
 await page.route("**/api/media-generation/**", (route, request) => {
   const url = new URL(request.url());
   if (url.pathname === "/api/media-generation/capabilities") {
@@ -301,22 +302,22 @@ await page.route("**/api/media-generation/**", (route, request) => {
         requestId: "browser-media-request",
         kind: "h3_generate",
         resourceClass: "gpu-h3",
-        status: "queued",
-        phase: "queued",
+        status: browserMediaCanceled ? "canceled" : "queued",
+        phase: browserMediaCanceled ? "canceled" : "queued",
         prompt: "BROWSER_MEDIA_TASK",
         sessionId: null,
         projectId: null,
         projectShotId: null,
         currentStep: null,
         totalSteps: 20,
-        queuePosition: 2,
+        queuePosition: browserMediaCanceled ? null : 2,
         resultUrl: null,
         resultSha256: null,
         resultSize: null,
         errorCode: null,
         errorMessage: null,
         createdAt: "2026-08-05T00:00:00.000Z",
-        updatedAt: "2026-08-05T00:00:00.000Z",
+        updatedAt: browserMediaCanceled ? "2026-08-05T00:00:01.000Z" : "2026-08-05T00:00:00.000Z",
       }],
       nextCursor: null,
     }) });
@@ -325,6 +326,7 @@ await page.route("**/api/media-generation/**", (route, request) => {
     return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ projects: [], nextCursor: null }) });
   }
   if (url.pathname.endsWith("/cancel") && request.method() === "POST") {
+    browserMediaCanceled = true;
     return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ job: {
       id: "33333333-3333-4333-8333-333333333333", requestId: "browser-media-request",
       kind: "h3_generate", resourceClass: "gpu-h3", status: "canceled", phase: "canceled",
@@ -1772,7 +1774,7 @@ await check("T35 Composer 是唯一 Stop 入口，停止结算中原按钮禁用
   await page.evaluate(() => window.__setComposerState(false, false));
 });
 
-await check("T30 视频任务中心持久排队、实时进度与可信取消交互", async () => {
+await check("T30 视频任务中心持久排队、实时进度与跨 worker 取消终态", async () => {
   await page.evaluate(() => window.__openMediaTask(true));
   await page.getByText("BROWSER_MEDIA_TASK", { exact: true }).waitFor({ state: "visible", timeout: 5000 });
   await page.getByText("排队中 · queued", { exact: true }).waitFor({ state: "visible" });
@@ -1805,6 +1807,10 @@ await check("T30 视频任务中心持久排队、实时进度与可信取消交
   await page.getByRole("button", { name: "取消" }).click();
   const request = await canceled;
   if (request.postData() !== "{}") throw new Error(`取消请求体漂移: ${request.postData()}`);
+  await page.getByText("已取消 · canceled", { exact: true }).waitFor({ state: "visible", timeout: 3000 });
+  if (await page.getByRole("button", { name: "取消", exact: true }).count()) {
+    throw new Error("跨 worker 取消已终态后仍显示可重复取消入口");
+  }
   await page.evaluate(() => window.__openMediaTask(false));
 });
 
