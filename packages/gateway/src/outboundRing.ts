@@ -355,7 +355,6 @@ export class OutboundRingBuffer {
   /** Drop the ring (but keep lastSeq) for a session — used on session destroy. */
   clear(sessionKey: string): void {
     this.rings.delete(sessionKey)
-    this.lastSeq.delete(sessionKey)
     this.activeTurns.delete(sessionKey)
   }
 
