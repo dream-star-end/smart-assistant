@@ -59,6 +59,10 @@ export type SessionStreamEvent =
          *  | 'pause_turn' | 'refusal'. Used by sessionManager for phantom
          *  judgment and by frontend for empty-turn notice text. */
         stopReason?: string
+        /** Set to 'user' when the turn ended because the user pressed Stop, so
+         *  the frontend can render a neutral cancellation instead of an error.
+         *  Absent for genuine failures and for internal/selfheal interrupts. */
+        interrupted?: string
         usageStatus?: 'observed' | 'unavailable'
         costStatus?: 'observed' | 'unavailable'
       }
@@ -698,6 +702,8 @@ export class ClaudeMessageParser {
       typeof (msg as any).stop_reason === 'string' ? ((msg as any).stop_reason as string) : null
     const numTurns =
       typeof (msg as any).num_turns === 'number' ? ((msg as any).num_turns as number) : null
+    // Only 'user' is forwarded: it is the one cause the UI renders differently.
+    const interrupted = (msg as any).interrupted === 'user' ? 'user' : null
 
     this.turnResult = {
       cost: turnCost,
@@ -726,6 +732,7 @@ export class ClaudeMessageParser {
         turn: this._sessionTotals.turns,
         isError: this.turnResult.isError,
         ...(stopReason !== null ? { stopReason } : {}),
+        ...(interrupted !== null ? { interrupted } : {}),
         usageStatus: this.turnResult.usageStatus,
         costStatus: this.turnResult.costStatus,
       },

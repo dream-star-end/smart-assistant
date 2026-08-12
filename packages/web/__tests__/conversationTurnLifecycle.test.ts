@@ -33,6 +33,16 @@ describe('conversation turn lifetime', () => {
     assert.doesNotMatch(SRC, /state\._reconnectInFlightTimer\s*=\s*setTimeout/)
   })
 
+  it('renders a self-cancelled empty turn neutrally rather than as a failure', () => {
+    // The gateway tags meta.interrupted='user' for an explicit Stop. Without
+    // this branch, a stop with no output falls through to the generic notice
+    // and tells the user "未收到回复 … 请重试" about their own cancellation.
+    assert.match(SRC, /const userCancelled = frame\.meta\?\.interrupted === 'user'/)
+    assert.match(SRC, /if \(userCancelled\) \{\s*\n\s*noticeText = '已取消本轮/)
+    // Soft styling too, otherwise the notice still renders in the alarm style.
+    assert.match(SRC, /_emptyTurnSoft: userCancelled \|\| priorTurnHadContent/)
+  })
+
   it('does not force-complete a busy turn while draining offline messages', () => {
     assert.doesNotMatch(SRC, /state\._drainTimeout\s*=\s*setTimeout/)
     assert.match(SRC, /still busy after 60s, deferring/)
