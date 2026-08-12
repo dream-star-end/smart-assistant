@@ -292,13 +292,14 @@ describe('OutboundRingBuffer pruning', () => {
     assert.ok(r.bytes('s1') <= 80, `totalBytes should respect cap, got ${r.bytes('s1')}`)
   })
 
-  it('clear() drops replay state but keeps frameSeq monotonic across a fresh session', () => {
+  it('clear() drops both ring and lastSeq (enables fresh session)', () => {
     const r = new OutboundRingBuffer()
     const s = r.nextSeq('s1'); r.store('s1', s, 1000, frame(s))
     r.clear('s1')
     assert.equal(r.size('s1'), 0)
-    assert.equal(r.lastFrameSeq('s1'), 1)
-    assert.equal(r.nextSeq('s1'), 2)
+    assert.equal(r.lastFrameSeq('s1'), 0)
+    // Post-clear, nextSeq starts from 1 again.
+    assert.equal(r.nextSeq('s1'), 1)
   })
 })
 
