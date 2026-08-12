@@ -638,4 +638,157 @@ describe('ocrProxy SCNet adapter', () => {
     assert.equal(response.status, 429)
     assert.equal([...store.jobs.values()][0]?.status, 'failed')
   })
+
+  test('retries the exact uploaded-file visibility rejection before accepting the job', async () => {
+    const sleeps: number[] = []
+    let submitCalls = 0
+    const fetchImpl = (async (url: string | URL | Request) => {
+      const pathname = new URL(String(url)).pathname
+      if (pathname.endsWith('/upload/presign')) return presignResponse()
+      submitCalls += 1
+      if (submitCalls <= 2) {
+        return Response.json(
+          {
+            code: '10013',
+            msg: 'file_url is not reachable or the file cannot be read: https://uploads.example/private?signature=secret',
+          },
+          { status: 422 },
+        )
+      }
+      return Response.json({
+        code: '0',
+        data: { output: { task_id: 'task-visible', task_status: 'pending' } },
+      })
+    }) as typeof fetch
+    const base = await listen(
+      makeOcrProxyHandler({
+        identityRepo: repo(),
+        store: new MemoryOcrStore(),
+        fetchImpl,
+        apiKey: 'provider-key',
+        ticketKeys: KEYS,
+        resultDir: await resultDir(),
+        sleep: async (delayMs) => {
+          sleeps.push(delayMs)
+        },
+        uploadFile: consumeUpload,
+      }),
+    )
+
+    await submit(base)
+    assert.equal(submitCalls, 3)
+    assert.deepEqual(sleeps, [250, 500])
+  })
+
+  test('does not retry other SCNet parameter errors', async () => {
+    const sleeps: number[] = []
+    let submitCalls = 0
+    const store = new MemoryOcrStore()
+    const base = await listen(
+      makeOcrProxyHandler({
+        identityRepo: repo(),
+        store,
+        fetchImpl: (async (url: string | URL | Request) => {
+          if (new URL(String(url)).pathname.endsWith('/upload/presign')) return presignResponse()
+          submitCalls += 1
+          return Response.json(
+            { code: '10013', msg: 'Parameter illegal: invalid ocr_type' },
+            { status: 422 },
+          )
+        }) as typeof fetch,
+        apiKey: 'provider-key',
+        ticketKeys: KEYS,
+        resultDir: await resultDir(),
+        sleep: async (delayMs) => {
+          sleeps.push(delayMs)
+        },
+        uploadFile: consumeUpload,
+      }),
+    )
+
+    const response = await post(base, '/v3/ocr/submit', Buffer.from('x'), {
+      'content-length': '1',
+    })
+    assert.equal(response.status, 422)
+    assert.equal(submitCalls, 1)
+    assert.deepEqual(sleeps, [])
+    assert.equal([...store.jobs.values()][0]?.status, 'failed')
+  })
+
+  test('does not retry the file visibility payload under a non-422 status', async () => {
+    const sleeps: number[] = []
+    let submitCalls = 0
+    const base = await listen(
+      makeOcrProxyHandler({
+        identityRepo: repo(),
+        store: new MemoryOcrStore(),
+        fetchImpl: (async (url: string | URL | Request) => {
+          if (new URL(String(url)).pathname.endsWith('/upload/presign')) return presignResponse()
+          submitCalls += 1
+          return Response.json({
+            code: '10013',
+            msg: 'file_url is not reachable or the file cannot be read: https://uploads.example/private?signature=secret',
+          })
+        }) as typeof fetch,
+        apiKey: 'provider-key',
+        ticketKeys: KEYS,
+        resultDir: await resultDir(),
+        sleep: async (delayMs) => {
+          sleeps.push(delayMs)
+        },
+        uploadFile: consumeUpload,
+      }),
+    )
+
+    const response = await post(base, '/v3/ocr/submit', Buffer.from('x'), {
+      'content-length': '1',
+    })
+    assert.equal(response.status, 502)
+    assert.equal(submitCalls, 1)
+    assert.deepEqual(sleeps, [])
+  })
+
+  test('bounds file visibility retries and redacts the presigned URL on exhaustion', async () => {
+    const sleeps: number[] = []
+    let submitCalls = 0
+    const store = new MemoryOcrStore()
+    const base = await listen(
+      makeOcrProxyHandler({
+        identityRepo: repo(),
+        store,
+        fetchImpl: (async (url: string | URL | Request) => {
+          if (new URL(String(url)).pathname.endsWith('/upload/presign')) return presignResponse()
+          submitCalls += 1
+          return Response.json(
+            {
+              code: '10013',
+              msg: 'file_url is not reachable or the file cannot be read: https://uploads.example/private?signature=secret',
+            },
+            { status: 422 },
+          )
+        }) as typeof fetch,
+        apiKey: 'provider-key',
+        ticketKeys: KEYS,
+        resultDir: await resultDir(),
+        sleep: async (delayMs) => {
+          sleeps.push(delayMs)
+        },
+        uploadFile: consumeUpload,
+      }),
+    )
+
+    const response = await post(base, '/v3/ocr/submit', Buffer.from('x'), {
+      'content-length': '1',
+    })
+    assert.equal(response.status, 422)
+    assert.equal(submitCalls, 6)
+    assert.deepEqual(sleeps, [250, 500, 1_000, 2_000, 4_000])
+    const value = (await response.json()) as any
+    assert.equal(value.error.message.includes('https://'), false)
+    assert.equal(value.error.message.includes('signature=secret'), false)
+    assert.match(value.error.message, /\[redacted-url\]/)
+    const job = [...store.jobs.values()][0]
+    assert.equal(job?.status, 'failed')
+    assert.equal(job?.errorMessage?.includes('signature=secret'), false)
+  })
 })

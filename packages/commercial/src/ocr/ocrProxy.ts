@@ -48,6 +48,8 @@ const SCNET_API_BASE = 'https://api.scnet.cn/api/llm/v1'
 const PROVIDER_REQUEST_TIMEOUT_MS = 30_000
 const STALE_SUBMIT_MS = 65 * 60_000
 const GC_INTERVAL_MS = 60 * 60_000
+const FILE_VISIBILITY_RETRY_DELAYS_MS = [250, 500, 1_000, 2_000, 4_000] as const
+const FILE_NOT_READY_PREFIX = 'file_url is not reachable or the file cannot be read:'
 const log = rootLogger.child({ subsys: 'scnet-ocr' })
 
 type HandlerCtx = { hostUuid: string; boundIp: string }
@@ -63,6 +65,7 @@ export interface OcrProxyDeps {
   ticketKeys?: string
   resultDir?: string
   now?: () => number
+  sleep?: (delayMs: number) => Promise<void>
   fileUploadDeps?: ScnetFileUploadDeps
   uploadFile?: (input: ScnetFileUploadInput) => Promise<void>
   resultDownloadDeps?: ScnetResultDownloadDeps
@@ -213,7 +216,17 @@ function providerStatus(response: Response, value: any): number {
 
 function providerMessage(value: any, fallback: string, apiKey: string): string {
   const raw = typeof value?.msg === 'string' ? value.msg : fallback
-  return (apiKey ? raw.replaceAll(apiKey, '[redacted]') : raw).slice(0, 1000)
+  const withoutKey = apiKey ? raw.replaceAll(apiKey, '[redacted]') : raw
+  return withoutKey.replace(/https?:\/\/\S+/giu, '[redacted-url]').slice(0, 1000)
+}
+
+function isUploadedFileNotReady(response: Response, value: any): boolean {
+  return (
+    response.status === 422 &&
+    String(value?.code) === '10013' &&
+    typeof value?.msg === 'string' &&
+    value.msg.startsWith(FILE_NOT_READY_PREFIX)
+  )
 }
 
 function publicStatus(ticket: string, job: OcrJob): Record<string, unknown> {
@@ -236,6 +249,8 @@ export function makeOcrProxyHandler(deps: OcrProxyDeps): OcrProxyHandler {
   const keyConfig = deps.ticketKeys ?? process.env.OC_OCR_TICKET_KEYS ?? ''
   const resultDir = deps.resultDir ?? process.env.OC_OCR_RESULT_DIR ?? ''
   const now = deps.now ?? Date.now
+  const sleep =
+    deps.sleep ?? ((delayMs: number) => new Promise<void>((done) => setTimeout(done, delayMs)))
   const materializations = new Map<string, Promise<void>>()
   let keys: TicketKey[] = []
   try {
@@ -516,15 +531,20 @@ export function makeOcrProxyHandler(deps: OcrProxyDeps): OcrProxyHandler {
             is_doc_ori: 'true',
             is_inline_formula: 'true',
           })
-          response = await providerFetch('/ocrdoc/submit', {
-            method: 'POST',
-            headers: {
-              'content-type': 'application/x-www-form-urlencoded',
-            },
-            body: form.toString(),
-            signal: AbortSignal.timeout(PROVIDER_REQUEST_TIMEOUT_MS),
-          })
-          value = await jsonOf(response)
+          for (let attempt = 0; ; attempt += 1) {
+            response = await providerFetch('/ocrdoc/submit', {
+              method: 'POST',
+              headers: {
+                'content-type': 'application/x-www-form-urlencoded',
+              },
+              body: form.toString(),
+              signal: AbortSignal.timeout(PROVIDER_REQUEST_TIMEOUT_MS),
+            })
+            value = await jsonOf(response)
+            const delay = FILE_VISIBILITY_RETRY_DELAYS_MS[attempt]
+            if (!isUploadedFileNotReady(response, value) || delay === undefined) break
+            await sleep(delay)
+          }
         } catch (error) {
           const failure =
             error instanceof ProviderError
