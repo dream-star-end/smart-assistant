@@ -154,14 +154,15 @@ export async function persistGatewayLiveFrame(
 
     const existing = await insertOrReadExisting(input.sessionKey);
     if (existing === null || matchesCurrentFrame(existing)) return;
-    if (dispatch === null || existing.stream_key === streamKey) {
+    if (existing.stream_key === streamKey) {
       throw new Error("live frame immutable payload conflict");
     }
 
     // A destroyed gateway session can later reuse the same wire session key
     // after its outbound frame sequence restarts. Keep the first generation's
-    // legacy identity, but namespace later dispatches so one stale generation
-    // cannot poison every subsequent turn on the user's shared WebSocket.
+    // legacy identity, but namespace a later distinct stream (including a
+    // server-authored stream without a dispatch) so one stale generation cannot
+    // poison every subsequent frame on the user's shared WebSocket.
     const storageSessionKey = `v2:${JSON.stringify([input.sessionKey, streamKey])}`;
     const namespacedExisting = await insertOrReadExisting(storageSessionKey);
     if (namespacedExisting !== null && !matchesCurrentFrame(namespacedExisting)) {

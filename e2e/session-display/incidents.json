@@ -1146,13 +1146,16 @@
       "id": "INC-20260810-LIVE-FRAME-SEQUENCE-RESET",
       "occurredAt": "2026-08-10",
       "severity": "P1",
-      "symptom": "同一容器会话销毁后重新连接时，Gateway 帧序号从 1 重新开始并撞上另一 dispatch 的历史持久化身份，导致持久化失败关闭用户共享 WebSocket，页面持续断线重连。",
+      "symptom": "同一容器会话销毁后重新连接时，Gateway 帧序号从 1 重新开始并撞上另一 dispatch 或无 dispatch 的服务端定时任务历史持久化身份，导致持久化失败关闭用户共享 WebSocket，页面持续断线重连。",
       "rootFixCommit": "6d2c930c",
+      "coverageCommits": [
+        "bab6c8c6"
+      ],
       "regressions": [
         {
           "layer": "integration",
           "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
-          "assertion": "keeps later dispatches durable when a gateway session restarts its frame sequence"
+          "assertion": "keeps later dispatches and server-authored frames durable after a frame sequence restart"
         },
         {
           "layer": "live-e2e",
