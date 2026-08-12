@@ -442,6 +442,7 @@ import {
   makeOcrProxyHandler,
   type OcrProxyHandler,
 } from "./ocr/ocrProxy.js";
+import { PgOcrJobStore } from "./ocr/ocrStore.js";
 import { getResearchConfigPublic } from "./admin/researchConfig.js";
 import {
   seedPlatformGeneralAgents,
@@ -1943,9 +1944,12 @@ export async function registerCommercial(
         identityRepo,
         redis,
       });
-      // /v3/ocr/* — container-authenticated async OCR jobs. Worker credentials,
-      // release pinning and tenant ownership stay on master.
-      const ocrProxyHandler: OcrProxyHandler = makeOcrProxyHandler({ identityRepo });
+      // /v3/ocr/* — container-authenticated async SCNet document parsing.
+      // Provider credentials and durable tenant ownership stay on master.
+      const ocrProxyHandler: OcrProxyHandler = makeOcrProxyHandler({
+        identityRepo,
+        store: new PgOcrJobStore(getPool()),
+      });
       // /internal/v3/platform-prompt-slots — 容器 → master 拉取平台级 prompt slot
       // (SKILLS_LITERATURE / MODEL_HINT)。镜像 build 排除 packages/commercial,所以
       // 容器进程内的 gateway 看不到 setLiteratureSkillProvider / setModelHintProvider
