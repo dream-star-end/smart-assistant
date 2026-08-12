@@ -45,6 +45,7 @@ export {
   V3_CODEX_HOME_MOUNT,
   V3_USER_LOCAL_MOUNT,
   V3_USER_CONFIG_MOUNT,
+  V5_CURSOR_AUTH_RO_MOUNT,
   // V3 image preheat(per-host cap admission 现在直接读 compute_hosts.max_containers,
   // 无全局 cap 常量需要 re-export)
   preheatV3Image,
@@ -52,6 +53,7 @@ export {
   DEFAULT_V3_CCB_BASELINE_DIR,
   V3_CCB_BASELINE_SKILL_NAMES,
   resolveCcbBaselineMounts,
+  resolveV5CursorAuthMount,
   readPlatformBundleOptionalFromEnv,
   type V3SupervisorDeps,
   type V3RuntimeTuple,
