@@ -68,7 +68,11 @@ chmod 600 "$DEV_HOME/openclaude.json" || true
 # individually and point the workspace packages at THIS root.
 link_shared_deps() {
   local dst="$DEV_ROOT/node_modules"
-  local entry name pkg rel
+  local entry name pkg rel canonical_real
+  # Strip against the canonicalised root: CANONICAL_ROOT is a caller-settable
+  # env var, so a trailing slash or a symlinked path would otherwise fail to
+  # match readlink's normalised output and yield a bogus link target.
+  canonical_real=$(readlink -f "$CANONICAL_ROOT")
   mkdir -p "$dst"
   shopt -s dotglob nullglob
   for entry in "$CANONICAL_ROOT"/node_modules/*; do
@@ -83,7 +87,7 @@ link_shared_deps() {
   for pkg in "$CANONICAL_ROOT"/node_modules/@openclaude/*; do
     name=$(basename "$pkg")
     rel=$(readlink -f "$pkg")
-    rel=${rel#"$CANONICAL_ROOT"/}
+    rel=${rel#"$canonical_real"/}
     ln -sfn "$DEV_ROOT/$rel" "$dst/@openclaude/$name"
   done
   shopt -u dotglob nullglob
