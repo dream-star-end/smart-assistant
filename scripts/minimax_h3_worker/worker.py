@@ -326,6 +326,9 @@ class Worker:
     def __init__(self):
         self.root = Path(os.environ.get("H3_WORKER_STATE", "/root/private_data/openclaude-h3-worker"))
         self.worktree = Path(os.environ.get("H3_WORKER_RELEASE", "/root/private_data/minimax-h3-v5-worker"))
+        self.h3_worktree = Path(
+            os.environ.get("H3_SP_WORKTREE", "/root/private_data/minimax-h3-v5-worker")
+        )
         self.sp_state = Path(os.environ.get("H3_SP_STATE_ROOT", "/root/minimax-h3-sp-runtime"))
         self.python = Path(os.environ.get("H3_SP_PYTHON", "/root/minimax-h3-runtime/venv/bin/python"))
         self.token = os.environ.get("H3_WORKER_TOKEN", "")
@@ -793,7 +796,11 @@ class Worker:
         if healthy:
             return
         env = os.environ.copy()
-        env.update(H3_SP_WORKTREE=str(self.worktree), H3_SP_STATE_ROOT=str(self.sp_state), H3_SP_PYTHON=str(self.python))
+        env.update(
+            H3_SP_WORKTREE=str(self.h3_worktree),
+            H3_SP_STATE_ROOT=str(self.sp_state),
+            H3_SP_PYTHON=str(self.python),
+        )
         subprocess.run([str(self.worktree / "scripts/minimax_h3_sp/start.sh")], env=env, check=True, timeout=300)
 
     def _stop_ranks(self):
