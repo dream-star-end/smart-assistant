@@ -44,7 +44,9 @@ For `/v1/attempts/:job_id/:attempt_id`:
    `X-Input-Kind`, and `X-Input-Filename`.
 2. `POST /submit` accepts `fence_version`, `resource_class`, and `request`.
 3. `GET /status` returns durable phase and sampling-step progress.
-4. `POST /cancel` terminates the active process group.
+4. `POST /cancel` includes `resource_class`, terminates the active process group, and
+   durably tombstones an absent fenced attempt so cancellation remains final when a
+   V5 queue reconnects to a replacement worker.
 5. `GET /result` streams the verified MP4.
 6. `POST /ack` removes opaque attempt staging after V5 has persisted the result.
 

@@ -422,6 +422,58 @@ class WorkerContractTest(unittest.TestCase):
         self.assertTrue(self.worker.store.cas_terminal("job-1", "attempt-1", 7, "canceled"))
         self.assertFalse(self.worker.store.cas_terminal("job-1", "attempt-1", 7, "completed"))
 
+    def test_missing_cancellation_creates_fenced_tombstone_that_cannot_be_submitted(self):
+        canceled = self.worker.cancel(
+            "job-migrated", "attempt-migrated", 4, "gpu-h3"
+        )
+        self.assertEqual(canceled["status"], "canceled")
+        self.assertEqual(canceled["phase"], "canceled")
+        self.assertEqual(canceled["resource_class"], "gpu-h3")
+        self.assertEqual(canceled["origin_release"], self.worker.release)
+
+        repeated = self.worker.cancel(
+            "job-migrated", "attempt-migrated", 4, "gpu-h3"
+        )
+        self.assertEqual(repeated["status"], "canceled")
+        with self.assertRaisesRegex(Conflict, "stale_fence"):
+            self.worker.cancel("job-migrated", "attempt-migrated", 3, "gpu-h3")
+        with self.assertRaisesRegex(Conflict, "attempt_not_staging"):
+            self.worker.store.submit(
+                "job-migrated",
+                "attempt-migrated",
+                4,
+                "gpu-h3",
+                "d" * 64,
+                {"prompt": {"1": {"class_type": "Output", "inputs": {}}}},
+            )
+
+    def test_missing_cancellation_rejects_invalid_or_absent_resource_class(self):
+        with self.assertRaisesRegex(ValueError, "invalid_resource_class"):
+            self.worker.cancel("job-invalid", "attempt-invalid", 1, "gpu-other")
+        with self.assertRaisesRegex(ValueError, "resource_class is required"):
+            self.worker.cancel("job-invalid", "attempt-invalid", 1)
+
+    def test_http_cancel_creates_a_missing_attempt_tombstone(self):
+        server, thread = self.server()
+        request = Request(
+            f"http://127.0.0.1:{server.server_port}/v1/attempts/job-http/attempt-http/cancel",
+            data=json.dumps({"resource_class": "cpu-compose"}).encode(),
+            method="POST",
+            headers={
+                "Authorization": "Bearer test-token",
+                "Content-Type": "application/json",
+                "X-Fence-Version": "9",
+            },
+        )
+        try:
+            with urlopen(request, timeout=5) as response:
+                canceled = json.load(response)
+            self.assertEqual(canceled["status"], "canceled")
+            self.assertEqual(canceled["resource_class"], "cpu-compose")
+            self.assertEqual(canceled["fence_version"], 9)
+        finally:
+            self.stop_server(server, thread)
+
     def test_recovery_restarts_durably_queued_attempt(self):
         self.worker.store.ensure_staging("job-queued", "attempt-queued", 1)
         self.worker.store.submit(
