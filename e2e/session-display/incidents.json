@@ -1277,7 +1277,8 @@
       "symptom": "原 H3 worker 永久下线后，已经进入 staging 的取消任务在替换 worker 上反复收到 attempt 404，永久停留在 worker_cancel_state_unknown，用户持续看到无法收敛的任务。",
       "rootFixCommit": "abffc3ab",
       "coverageCommits": [
-        "702885fd"
+        "702885fd",
+        "b6234527"
       ],
       "regressions": [
         {
