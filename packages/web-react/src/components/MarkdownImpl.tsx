@@ -175,13 +175,7 @@ function hasMarkdownImage(children: ReactNode): boolean {
   });
 }
 
-export default function MarkdownImpl({
-  children,
-  signMedia,
-  live,
-  readOnly,
-  blockImages,
-}: MarkdownProps) {
+export default function MarkdownImpl({ children, signMedia, live, readOnly }: MarkdownProps) {
   return (
     <div className="prose">
       <ReactMarkdown
@@ -196,13 +190,10 @@ export default function MarkdownImpl({
         components={{
           pre: ({ children }) => <>{children}</>,
           table: ({ node: _node, ...props }) => <MarkdownTable {...props} />,
-          ...(signMedia || blockImages
+          ...(signMedia
             ? {
                 img: ({ node: _node, ...props }) => {
                   const src = typeof props.src === "string" ? props.src : "";
-                  if (blockImages) {
-                    return <span className="text-faint">[{props.alt || "图片已隐藏"}]</span>;
-                  }
                   if (readOnly && /^(?:https?:)?\/\//i.test(src)) {
                     return (
                       <ZoomableImage

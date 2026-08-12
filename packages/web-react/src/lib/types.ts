@@ -975,53 +975,6 @@ export type SkillDetail = SkillSummary & {
   files?: string[];
 };
 
-// ── 社区共建教程 ─────────────────────────────────────────────────────────
-
-export type CommunityTutorialCategory = "research" | "coding" | "general";
-export type CommunityTutorialStatus = "pending" | "approved" | "rejected" | "withdrawn";
-
-export type CommunityTutorialSummary = {
-  id: string;
-  title: string;
-  summary: string;
-  category: CommunityTutorialCategory;
-  authorName: string;
-  publishedAt: string;
-};
-
-export type CommunityTutorialDetail = CommunityTutorialSummary & {
-  bodyMarkdown: string;
-};
-
-export type CommunityTutorialMine = {
-  id: string;
-  title: string;
-  summary: string;
-  category: CommunityTutorialCategory;
-  bodyMarkdown: string;
-  status: CommunityTutorialStatus;
-  reviewNote: string | null;
-  createdAt: string;
-  reviewedAt: string | null;
-  publishedAt: string | null;
-};
-
-export type CommunityTutorialPending = CommunityTutorialMine & {
-  authorName: string;
-};
-
-export type CommunityTutorialDraft = {
-  title: string;
-  summary: string;
-  category: CommunityTutorialCategory;
-  bodyMarkdown: string;
-};
-
-export type CommunityTutorialPage<T> = {
-  tutorials: T[];
-  nextCursor: string | null;
-};
-
 // ── AI 市场（marketplace，见 packages/commercial/src/marketplace） ──────────
 
 /** 静态安全扫描命中项（发布被拦截时返回，前端做友好提示）。 */

@@ -31,14 +31,13 @@
     { "id": "T27", "proves": "对话输入框粘贴 PNG 时阻止默认文本污染、onUpload 只收到一次精确 File、图片 chip 正常完成" },
     { "id": "T28", "proves": "iPhone Safari 手机支付首次渲染不请求 PC 二维码、受信点击真跳安全 mobile_url，返回后恢复订单并自动确认；微信 WebView 无链接、无二维码并提示改用系统浏览器" },
     { "id": "T29", "proves": "真 Chromium 中 retrying wire 帧经 HarnessWebSocket→ChatSocket→reducer→真实 MessageList 后只显示一行模型繁忙 n/10 软提示；同一在途 turn 随后收到实时正文与 final 时成功内容可见、发送态结束且没有中间 API Error 红卡" },
-    { "id": "T30", "proves": "视频任务中心真 Chromium 中展示持久排队，接收实时进度后原位更新，通过可信点击发出精确取消请求并收敛为已取消终态" },
+    { "id": "T30", "proves": "视频任务中心真 Chromium 中展示持久排队，接收实时进度后原位更新，并通过可信点击发出精确取消请求" },
     { "id": "T31", "proves": "journal page1→实时 WS N→page2 同含 N 的确定性交错中，thinking/tool/text 各恰好一次；后续恢复从共享 record cursor 增量读取且不清空已有过程" },
     { "id": "T32", "proves": "durable error journal 重放时，旧 wire 用户 Stop 归一为取消且不上报/不恢复；已有较新 user 的普通历史错误持久化 decision 且不触发 REST sync 循环" },
     { "id": "T33", "proves": "当前版本微博账号在真浏览器中始终显示重新登录入口，确认后 POST 精确原 accountId 且扫码会话启动前不 DELETE 旧连接" },
     { "id": "T34", "proves": "全面优化模式收到旧版失败回执时，记忆中心不再展示永远不会更新的旧版梦境报告卡" },
     { "id": "T35", "proves": "活动轮含消费提醒时仍只有 Composer 一个 Stop 入口；停止结算时同一按钮切换为禁用加载态且不能重复提交" },
     { "id": "T36", "proves": "不可变历史 tape 已中断时未完成子任务显示已取消且无 spinner；实时未完成子任务仍运行中；中断前已完成子任务仍显示完成" },
-    { "id": "T37", "proves": "真 Chromium 中连续点击新建只保留一个未持久化空白草稿态；已有部分消息时真实内容与明确的会话加载占位同时可见" },
-    { "id": "T38", "proves": "社区教程在真 Chromium 中可公开只读查看、登录用户可提交进入待审核，且 390px 视口不横向溢出" }
+    { "id": "T37", "proves": "真 Chromium 中连续点击新建只保留一个未持久化空白草稿态；已有部分消息时真实内容与明确的会话加载占位同时可见" }
   ]
 }

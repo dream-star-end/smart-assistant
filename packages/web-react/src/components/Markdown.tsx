@@ -22,8 +22,6 @@ export type MarkdownProps = {
   live?: boolean;
   /** 站内信/后台预览等只读上下文：仅渲染站内资产/外链图，禁 HTML 执行与聊天交互。 */
   readOnly?: boolean;
-  /** 完全禁用正文图片加载；用于公开投稿等不可信内容，避免远程像素追踪。 */
-  blockImages?: boolean;
 };
 
 const MarkdownImpl = lazy(() => import("./MarkdownImpl"));
@@ -117,23 +115,12 @@ class MarkdownBoundary extends Component<{ fallback: ReactNode; children: ReactN
   }
 }
 
-export const Markdown = memo(function Markdown({
-  children,
-  signMedia,
-  live,
-  readOnly,
-  blockImages,
-}: MarkdownProps) {
+export const Markdown = memo(function Markdown({ children, signMedia, live, readOnly }: MarkdownProps) {
   const fallback = <MarkdownFallback live={live} readOnly={readOnly}>{children}</MarkdownFallback>;
   return (
     <MarkdownBoundary fallback={fallback}>
       <Suspense fallback={fallback}>
-        <MarkdownImpl
-          signMedia={signMedia}
-          live={live}
-          readOnly={readOnly}
-          blockImages={blockImages}
-        >
+        <MarkdownImpl signMedia={signMedia} live={live} readOnly={readOnly}>
           {children}
         </MarkdownImpl>
       </Suspense>

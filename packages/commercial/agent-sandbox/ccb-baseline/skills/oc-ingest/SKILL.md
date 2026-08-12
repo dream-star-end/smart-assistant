@@ -1,6 +1,6 @@
 ---
 name: oc-ingest
-description: 用 `oc-ingest` 把用户文档解析成可检索、可引用接地的权威文档；扫描PDF/图片先用 `oc-ocr` 异步文档解析，再把完整Markdown入库。用户上传 PDF/图片/CAJ/文档要读、分析、综述或提取证据时使用。
+description: 用 `oc-ingest` 把用户文档解析成可检索、可引用接地的权威文档；扫描PDF/图片先用私有 `oc-ocr` 异步OCR，再把完整Markdown入库。用户上传 PDF/图片/CAJ/文档要读、分析、综述或提取证据时使用。
 tags: [research, ingest, parse, pdf, ocr]
 ---
 
@@ -27,12 +27,11 @@ oc-ocr run <原文件> --out <原文件名>.ocr.md --mode hybrid
 oc-ingest parse <原文件名>.ocr.md
 ```
 
-- 底层统一使用 SCNet 文档解析，保留表格 HTML、公式和逐页结构化 JSONL。`--mode` / `--fallback` 是旧命令兼容参数，不再选择不同引擎；继续使用默认 `hybrid` 即可。
-- 进度在 stderr 持续显示；命令一开始会打印 ticket。连接中断后可用 `oc-ocr status <ticket>`、`oc-ocr download <ticket> --out ...` 续取。
-- Ctrl-C / `oc-ocr cancel` 会立即停止本地等待和结果交付；SCNet 当前没有远端取消接口，已提交任务可能仍会在服务端处理完成。
-- 结果默认保留 7 天；需要长期使用时应在任务完成后立即下载并入库。
-- 若服务返回旋转页空结果，任务会明确失败而不是静默产出空文档；如实告知用户需要先校正页面方向后重试。
-- OCR 输出按页完整写入 Markdown，不用摘要替代正文、不静默跳页；任一结果不完整时整单会明确失败。
+- 默认 `hybrid`：PP-OCRv6 高吞吐识别全部页面，再把每页低置信区域交给 PaddleOCR-VL 修正；适合几百页文档。
+- `--mode pp`：只用 PP，最快；用户明确只要速度或版面很简单时用。
+- `--mode vl`：整页纯 VL，最慢但可用于复杂页面对照；不要默认用于几百页文档。
+- 进度在 stderr 持续显示；Ctrl-C 会取消排队/运行任务。命令一开始会打印 ticket；连接中断后可用 `oc-ocr status <ticket>`、`oc-ocr download <ticket> --out ...` 续取，或 `oc-ocr cancel <ticket>` 取消。
+- OCR 输出按页完整写入 Markdown，不用摘要替代正文、不静默跳页；任何页触发安全物理边界或模型输出不完整时，整单会明确失败。
 
 ## 默认行为
 

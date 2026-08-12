@@ -10,7 +10,6 @@ packages/commercial/src/__tests__/connectorsRpcDeclarative.integ.test.ts
 packages/commercial/src/__tests__/connectorsSeed.integ.test.ts
 packages/commercial/src/__tests__/connectorsSpecKernelReview.integ.test.ts
 packages/commercial/src/__tests__/connectorsStore.integ.test.ts
-packages/commercial/src/__tests__/communityTutorials.integ.test.ts
 packages/commercial/src/__tests__/marketplaceCapabilityMigration.integ.test.ts
 packages/commercial/src/__tests__/marketplaceDb.integ.test.ts
 packages/commercial/src/__tests__/marketplacePluginKernel.integ.test.ts

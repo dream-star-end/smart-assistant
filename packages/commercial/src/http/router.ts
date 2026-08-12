@@ -53,15 +53,6 @@ import {
 } from '../marketplace/marketplaceRoutes.js'
 import { handleMarketplaceSearch } from '../marketplace/marketplaceSearch.js'
 import { isActiveAdmin, isInMaintenance } from '../middleware/maintenanceMode.js'
-import {
-  handleAdminPendingCommunityTutorials,
-  handleAdminReviewCommunityTutorial,
-  handleGetCommunityTutorial,
-  handleListCommunityTutorials,
-  handleListOwnCommunityTutorials,
-  handleSubmitCommunityTutorial,
-  handleWithdrawCommunityTutorial,
-} from '../tutorials/communityTutorialRoutes.js'
 import { ContainerUnreadyError } from '../ws/userChatBridge.js'
 import {
   handleAdminCreateAccountGroup,
@@ -758,44 +749,6 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     { method: 'POST', path: '/api/container-preview/ticket', handler: handleCreateContainerPreviewTicket },
     { method: 'POST', path: '/api/container-preview/heartbeat', handler: handleHeartbeatContainerPreview },
     { method: 'POST', path: '/api/container-preview/revoke', handler: handleRevokeContainerPreview },
-    // ── 用户共建教程：公开目录 + 登录投稿 + 管理审核 ──
-    // approved 目录/详情允许匿名读取；投稿/我的/撤回要求浏览器用户 JWT；管理员审核
-    // 由 requireAdminVerifyDb 再核验数据库角色。/api/tutorials 不进入容器 bridge allowlist。
-    {
-      method: 'GET',
-      path: '/api/tutorials',
-      handler: handleListCommunityTutorials,
-    },
-    {
-      method: 'POST',
-      path: '/api/tutorials',
-      handler: (req, res) => handleSubmitCommunityTutorial(req, res, deps),
-    },
-    {
-      method: 'GET',
-      path: '/api/tutorials/mine',
-      handler: (req, res) => handleListOwnCommunityTutorials(req, res, deps),
-    },
-    {
-      method: 'POST',
-      pathPrefix: '/api/tutorials/',
-      handler: (req, res) => handleWithdrawCommunityTutorial(req, res, deps),
-    },
-    {
-      method: 'GET',
-      pathPrefix: '/api/tutorials/',
-      handler: handleGetCommunityTutorial,
-    },
-    {
-      method: 'GET',
-      path: '/api/admin/tutorials/pending',
-      handler: (req, res) => handleAdminPendingCommunityTutorials(req, res, deps),
-    },
-    {
-      method: 'POST',
-      pathPrefix: '/api/admin/tutorials/',
-      handler: (req, res) => handleAdminReviewCommunityTutorial(req, res, deps),
-    },
     // ── Skill marketplace (B2) — browser-only user/admin routes ──
     // These serve commercial browser users (requireAuth / requireAdminVerifyDb).
     // Agent-bypass is enforced structurally, NOT via BLOCKED_FOR_USER_RULES (that
@@ -1464,9 +1417,6 @@ export const COMMERCIAL_ROUTE_PREFIXES: readonly string[] = [
     // Covers exact `/api/marketplace` + prefix `/api/marketplace/*`; admin
     // marketplace is already covered by `/api/admin/`.
     '/api/marketplace',
-    // 用户共建教程：匹配 exact `/api/tutorials` 与所有用户侧详情/投稿子路由。
-    // 管理审核路由已由 `/api/admin/` 认领。
-    '/api/tutorials',
     // V3 CC 外接 plan Phase 3(2026-05-18)— public-facing
     // `POST /api/anthropic/v1/messages`。必须列在这里,让:
     //   - maintenance gate(L802 起)能把维护期请求统一 503;
