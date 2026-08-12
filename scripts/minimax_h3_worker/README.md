@@ -35,6 +35,20 @@ The listener defaults to loopback. Public binding is accepted only when
 that mode only behind the SCNet HTTPS custom-service proxy. Bearer authentication
 remains mandatory for every route, including health checks.
 
+The immutable worker release contains the worker and sequence-parallel control
+scripts. `H3_SP_WORKTREE` must point to a separately manifest-bound, complete
+ComfyUI engine snapshot containing `main.py`; the worker never falls back from an
+explicit path. `H3_SP_MODEL_ROOT` identifies the persistent model-asset root used
+to write `extra_model_paths.yaml`. Production must pin both variables to exact,
+read-only paths and verify the engine and model manifests before starting a
+session.
+
+SCNet notebook containers do not run systemd. Stage an exact commit archive with
+`stage-notebook-release.sh`, then keep `session_supervisor.py` alive from the V5
+host with `host-session.sh` and `openclaude-h3-worker-session.service`. The host
+session uses SSH stdin only as a lease; generated video traffic still uses the
+authenticated SCNet HTTPS endpoint.
+
 ## Attempt protocol
 
 For `/v1/attempts/:job_id/:attempt_id`:

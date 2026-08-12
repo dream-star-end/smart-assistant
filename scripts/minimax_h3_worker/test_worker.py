@@ -5,6 +5,7 @@ import os
 import sqlite3
 import signal
 import subprocess
+import tarfile
 import tempfile
 import threading
 import time
@@ -39,6 +40,7 @@ class WorkerContractTest(unittest.TestCase):
         os.environ.pop("H3_WORKER_HOST", None)
         os.environ.pop("H3_WORKER_ALLOW_PUBLIC_BIND", None)
         os.environ.pop("H3_WORKER_GPU_RELEASE_MAX_PERCENT", None)
+        os.environ.pop("H3_SP_WORKTREE", None)
         self.worker = Worker()
 
     def tearDown(self):
@@ -142,6 +144,23 @@ class WorkerContractTest(unittest.TestCase):
         ):
             self.worker._stop_ranks()
         stop.assert_called_once()
+
+    def test_rank_launcher_separates_immutable_worker_release_from_engine_root(self):
+        engine = Path(self.tmp.name) / "engine"
+        self.worker.h3_worktree = engine
+        with (
+            patch("worker.urllib.request.urlopen", side_effect=OSError("not ready")),
+            patch("worker.subprocess.run") as start,
+        ):
+            self.worker._ensure_ranks()
+        start.assert_called_once()
+        args, kwargs = start.call_args
+        self.assertEqual(
+            args[0],
+            [str(self.worker.worktree / "scripts/minimax_h3_sp/start.sh")],
+        )
+        self.assertEqual(kwargs["env"]["H3_SP_WORKTREE"], str(engine))
+        self.assertNotEqual(kwargs["env"]["H3_SP_WORKTREE"], str(self.worker.worktree))
 
     def test_gpu_release_keeps_the_lease_poisoned_above_a_card_limit(self):
         self.worker.gpu_release_max_percent = (18, 2)
@@ -740,6 +759,88 @@ class WorkerContractTest(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("incomplete or unsigned", result.stderr)
+
+    def test_notebook_release_staging_is_manifest_bound_and_fail_closed(self):
+        worker_dir = Path(__file__).resolve().parent
+        release = "a" * 40
+        source = Path(self.tmp.name) / "archive-source"
+        for relative, executable in (
+            ("scripts/minimax_h3_worker/worker.py", False),
+            ("scripts/minimax_h3_worker/session_supervisor.py", False),
+            ("scripts/minimax_h3_sp/start.sh", True),
+            ("scripts/minimax_h3_sp/coordinator.py", False),
+        ):
+            path = source / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(relative, encoding="utf-8")
+            if executable:
+                path.chmod(0o755)
+        archive = Path(self.tmp.name) / "worker.tar"
+        with tarfile.open(archive, "w") as bundle:
+            bundle.add(source / "scripts", arcname="scripts")
+        archive_sha = hashlib.sha256(archive.read_bytes()).hexdigest()
+        release_root = Path(self.tmp.name) / "notebook-releases"
+        env = {**os.environ, "H3_WORKER_RELEASE_ROOT": str(release_root)}
+        command = [
+            "bash", str(worker_dir / "stage-notebook-release.sh"),
+            str(archive), release, archive_sha,
+        ]
+        first = subprocess.run(command, env=env, check=True, capture_output=True, text=True)
+        self.assertEqual(first.stdout.strip(), release)
+        candidate = release_root / "releases" / release
+        manifest = release_root / "manifests" / f"{release}.sha256"
+        subprocess.run(
+            ["sha256sum", "-c", str(manifest)], cwd=candidate,
+            check=True, capture_output=True, text=True,
+        )
+        second = subprocess.run(command, env=env, check=True, capture_output=True, text=True)
+        self.assertEqual(second.stdout.strip(), release)
+        worker = candidate / "scripts/minimax_h3_worker/worker.py"
+        worker.chmod(0o644)
+        worker.write_text("corrupt", encoding="utf-8")
+        rejected = subprocess.run(command, env=env, capture_output=True, text=True)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("failed manifest verification", rejected.stderr)
+
+    def test_host_session_pins_release_engine_and_model_without_a_password(self):
+        worker_dir = Path(__file__).resolve().parent
+        fake_bin = Path(self.tmp.name) / "fake-bin"
+        fake_bin.mkdir()
+        fake_ssh = fake_bin / "ssh"
+        fake_ssh.write_text(
+            "#!/bin/bash\nIFS= read -r lease\nprintf 'lease=%s\\n' \"$lease\"\nprintf 'arg=%s\\n' \"$@\"\n",
+            encoding="utf-8",
+        )
+        fake_ssh.chmod(0o755)
+        identity = Path(self.tmp.name) / "identity"
+        known_hosts = Path(self.tmp.name) / "known_hosts"
+        identity.write_text("key", encoding="utf-8")
+        known_hosts.write_text("host", encoding="utf-8")
+        release_path = f"/opt/openclaude-h3-worker/releases/{'a' * 40}"
+        engine_path = f"/opt/openclaude-h3-engine/releases/{'b' * 64}"
+        result = subprocess.run(
+            ["bash", str(worker_dir / "host-session.sh")],
+            env={
+                **os.environ,
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                "H3_WORKER_SSH_HOST": "ssh.example.test",
+                "H3_WORKER_SSH_PORT": "10047",
+                "H3_WORKER_SSH_IDENTITY": str(identity),
+                "H3_WORKER_SSH_KNOWN_HOSTS": str(known_hosts),
+                "H3_REMOTE_WORKER_RELEASE": release_path,
+                "H3_REMOTE_ENGINE_RELEASE": engine_path,
+                "H3_REMOTE_MODEL_ROOT": "/root/private_data/minimax-h3/ComfyUI",
+                "H3_WORKER_HEARTBEAT_SECONDS": "0.01",
+            },
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        self.assertIn("lease=lease", result.stdout)
+        self.assertIn(release_path, result.stdout)
+        self.assertIn(engine_path, result.stdout)
+        self.assertIn("H3_SP_MODEL_ROOT=/root/private_data/minimax-h3/ComfyUI", result.stdout)
+        self.assertNotIn("password", result.stdout.lower())
 
     def test_activation_backs_up_real_worker_db_and_status_reports_it(self):
         worker_dir = Path(__file__).resolve().parent
