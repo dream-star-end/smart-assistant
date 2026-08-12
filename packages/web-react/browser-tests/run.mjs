@@ -289,6 +289,7 @@ await page.route("**/api/agents/main/**", (route, request) => {
     body: JSON.stringify({ error: { code: "NOT_FOUND" } }),
   });
 });
+let browserMediaCanceled = false;
 await page.route("**/api/media-generation/**", (route, request) => {
   const url = new URL(request.url());
   if (url.pathname === "/api/media-generation/capabilities") {
@@ -301,22 +302,22 @@ await page.route("**/api/media-generation/**", (route, request) => {
         requestId: "browser-media-request",
         kind: "h3_generate",
         resourceClass: "gpu-h3",
-        status: "queued",
-        phase: "queued",
+        status: browserMediaCanceled ? "canceled" : "queued",
+        phase: browserMediaCanceled ? "canceled" : "queued",
         prompt: "BROWSER_MEDIA_TASK",
         sessionId: null,
         projectId: null,
         projectShotId: null,
         currentStep: null,
         totalSteps: 20,
-        queuePosition: 2,
+        queuePosition: browserMediaCanceled ? null : 2,
         resultUrl: null,
         resultSha256: null,
         resultSize: null,
         errorCode: null,
         errorMessage: null,
         createdAt: "2026-08-05T00:00:00.000Z",
-        updatedAt: "2026-08-05T00:00:00.000Z",
+        updatedAt: browserMediaCanceled ? "2026-08-05T00:00:01.000Z" : "2026-08-05T00:00:00.000Z",
       }],
       nextCursor: null,
     }) });
@@ -325,6 +326,7 @@ await page.route("**/api/media-generation/**", (route, request) => {
     return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ projects: [], nextCursor: null }) });
   }
   if (url.pathname.endsWith("/cancel") && request.method() === "POST") {
+    browserMediaCanceled = true;
     return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ job: {
       id: "33333333-3333-4333-8333-333333333333", requestId: "browser-media-request",
       kind: "h3_generate", resourceClass: "gpu-h3", status: "canceled", phase: "canceled",
