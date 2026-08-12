@@ -1464,6 +1464,9 @@ export const COMMERCIAL_ROUTE_PREFIXES: readonly string[] = [
     // Covers exact `/api/marketplace` + prefix `/api/marketplace/*`; admin
     // marketplace is already covered by `/api/admin/`.
     '/api/marketplace',
+    // 用户共建教程：匹配 exact `/api/tutorials` 与所有用户侧详情/投稿子路由。
+    // 管理审核路由已由 `/api/admin/` 认领。
+    '/api/tutorials',
     // V3 CC 外接 plan Phase 3(2026-05-18)— public-facing
     // `POST /api/anthropic/v1/messages`。必须列在这里,让:
     //   - maintenance gate(L802 起)能把维护期请求统一 503;
