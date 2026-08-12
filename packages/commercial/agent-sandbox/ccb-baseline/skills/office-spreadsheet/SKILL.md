@@ -71,16 +71,30 @@ df.to_excel("/home/agent/.openclaude/汇总.xlsx", index=False)   # pandas 走 o
 - 金额/数量等应是**数字类型**(参与公式/图表),不要写成带引号的文本。
 - 表头简明、列宽足够放中文(oc-xlsx 已按中文 2 倍宽估算列宽)。
 
-## 5. 交付前验证
+## 5. 交付前验证:结构、重算、渲染
 
 ```bash
-test -s out.xlsx && unzip -tq out.xlsx      # xlsx 本质是 zip,结构完好即合法
+cat > qa-expect.json <<'JSON'
+{
+  "kind":"xlsx",
+  "requiredText":["表头","关键结果"],
+  "requiredSheets":["汇总"],
+  "requiredFormulaCells":["汇总!D2"],
+  "minDataValidations":1
+}
+JSON
+oc-artifact-qa inspect --input out.xlsx --out-dir out.xlsx.qa --expect qa-expect.json
 ```
 
-最终回复给**绝对路径**(如 `/home/agent/.openclaude/结果.xlsx`)并一句话说明表里有什么、哪些是公式。
+简单表可删去不适用的公式/验证断言,但必须保留真实结构检查和 LibreOffice 渲染。查看全部
+contact sheet,确认列宽、换行、数字格式和图表可读;复杂表还要确认重算后没有 `#REF!`、
+`#DIV/0!` 等错误。失败就修工作簿并重新 QA,不能只用 `unzip -t` 或最终回复自述代替。
+
+最终回复给**绝对路径**(如 `/home/agent/.openclaude/结果.xlsx`)并说明 sheet、公式和 QA 结果。
 
 ## 工具调用纪律(重要)
 
 - 生成 Excel **优先 `oc-xlsx` 或 openpyxl/pandas/duckdb**,不要输出"假表格"(纯文本对齐/HTML 表)冒充 xlsx。
 - 写公式就写**真公式**让 Excel 重算,不要预先算成常数。
+- 先分清输入、计算和输出区域;金额/日期/百分比用对应 number format,枚举输入用数据验证。
 - 合规:**绝不装或用 PyMuPDF(AGPL)、Marker(GPL)** 等传染性许可库处理数据;本 skill 依赖全部宽松许可。

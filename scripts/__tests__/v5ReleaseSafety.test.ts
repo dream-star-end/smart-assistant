@@ -73,7 +73,7 @@ describe('V5 branch deployment policy', () => {
     assert.match(source, /\\mathrm\{MSE\}=\\frac\{1\}\{n\}\\sum_\{i=1\}\^\{n\}\(y_i-\\hat\{y\}_i\)\^2/)
     assert.match(source, /grep -q 'y' \/tmp\/oc-docx-smoke\.txt/)
     assert.match(source, /! grep -q '¿' \/tmp\/oc-docx-smoke\.txt/)
-    assert.match(overrides, /^OC_RUNTIME_IMAGE=openclaude\/openclaude-runtime:v5-ccb-f8800e0c0480-slim$/m)
+    assert.match(overrides, /^OC_RUNTIME_IMAGE=openclaude\/openclaude-runtime:v5-ccb-3462202b4a97-slim$/m)
     assert.match(overrides, /v5-ccb-f8800e0c0480-embedded\(OC_RUNTIME_EMERGENCY_TUPLE/)
   })
 
@@ -7802,10 +7802,10 @@ esac
     assert.match(source, /glob\.glob\(os\.path\.join\(expected_dir, '\*\/evals\/evals\.json'\)\)/)
     assert.match(source, /缺少评测结果/)
     assert.match(source, /baseline coverage: \{done_expected\}\/\{len\(expected\)\} done/)
-    assert.match(service, /TimeoutStartSec=43200/, '9 个技能 × 单技能 60min 后必须保留汇总余量')
+    assert.match(service, /TimeoutStartSec=43200/, '10 个技能 × 单技能 60min 后必须保留汇总余量')
   })
 
-  test('repository baseline eval inventory is the reviewed nine-skill set', async () => {
+  test('repository baseline eval inventory is the reviewed ten-skill set', async () => {
     const baselineSkills = path.join(root, 'packages/commercial/agent-sandbox/ccb-baseline/skills')
     const entries = await readdir(baselineSkills, { withFileTypes: true })
     const actual: string[] = []
@@ -7824,6 +7824,7 @@ esac
       'memory-management',
       'office-pdf',
       'office-spreadsheet',
+      'research-slides',
       'scheduled-tasks',
       'scientific-figures',
       'skill-search',
