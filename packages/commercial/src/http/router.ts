@@ -53,6 +53,15 @@ import {
 } from '../marketplace/marketplaceRoutes.js'
 import { handleMarketplaceSearch } from '../marketplace/marketplaceSearch.js'
 import { isActiveAdmin, isInMaintenance } from '../middleware/maintenanceMode.js'
+import {
+  handleAdminPendingCommunityTutorials,
+  handleAdminReviewCommunityTutorial,
+  handleGetCommunityTutorial,
+  handleListCommunityTutorials,
+  handleListOwnCommunityTutorials,
+  handleSubmitCommunityTutorial,
+  handleWithdrawCommunityTutorial,
+} from '../tutorials/communityTutorialRoutes.js'
 import { ContainerUnreadyError } from '../ws/userChatBridge.js'
 import {
   handleAdminCreateAccountGroup,
@@ -749,6 +758,44 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     { method: 'POST', path: '/api/container-preview/ticket', handler: handleCreateContainerPreviewTicket },
     { method: 'POST', path: '/api/container-preview/heartbeat', handler: handleHeartbeatContainerPreview },
     { method: 'POST', path: '/api/container-preview/revoke', handler: handleRevokeContainerPreview },
+    // ── 用户共建教程：公开目录 + 登录投稿 + 管理审核 ──
+    // approved 目录/详情允许匿名读取；投稿/我的/撤回要求浏览器用户 JWT；管理员审核
+    // 由 requireAdminVerifyDb 再核验数据库角色。/api/tutorials 不进入容器 bridge allowlist。
+    {
+      method: 'GET',
+      path: '/api/tutorials',
+      handler: handleListCommunityTutorials,
+    },
+    {
+      method: 'POST',
+      path: '/api/tutorials',
+      handler: (req, res) => handleSubmitCommunityTutorial(req, res, deps),
+    },
+    {
+      method: 'GET',
+      path: '/api/tutorials/mine',
+      handler: (req, res) => handleListOwnCommunityTutorials(req, res, deps),
+    },
+    {
+      method: 'POST',
+      pathPrefix: '/api/tutorials/',
+      handler: (req, res) => handleWithdrawCommunityTutorial(req, res, deps),
+    },
+    {
+      method: 'GET',
+      pathPrefix: '/api/tutorials/',
+      handler: handleGetCommunityTutorial,
+    },
+    {
+      method: 'GET',
+      path: '/api/admin/tutorials/pending',
+      handler: (req, res) => handleAdminPendingCommunityTutorials(req, res, deps),
+    },
+    {
+      method: 'POST',
+      pathPrefix: '/api/admin/tutorials/',
+      handler: (req, res) => handleAdminReviewCommunityTutorial(req, res, deps),
+    },
     // ── Skill marketplace (B2) — browser-only user/admin routes ──
     // These serve commercial browser users (requireAuth / requireAdminVerifyDb).
     // Agent-bypass is enforced structurally, NOT via BLOCKED_FOR_USER_RULES (that

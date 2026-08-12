@@ -184,7 +184,7 @@ const html = `<!doctype html><html><head><meta charset="utf-8"><style>${producti
   #root{position:static;height:auto;overflow:visible}
   .timeline-scroll-probe{height:360px;width:640px;overflow-y:auto;position:relative;border:1px solid #ccc;scrollbar-gutter:stable}
   #timeline-archive-root .chat-virtual-item{min-height:40px}
-</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="chat-entry-ux-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="interrupted-tool-status-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="ask-question-root"></div><div id="model-selector-root"></div><div id="markdown-rich-root"></div><div id="media-task-root"></div><div id="connectors-root"></div><div id="memory-report-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
+</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="chat-entry-ux-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="interrupted-tool-status-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="ask-question-root"></div><div id="model-selector-root"></div><div id="markdown-rich-root"></div><div id="media-task-root"></div><div id="connectors-root"></div><div id="memory-report-root"></div><div id="community-tutorial-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
 
 // ── drive ───────────────────────────────────────────────────────────────────
 let browser;
@@ -354,6 +354,75 @@ const weiboSetupView = {
   createdAt: "2026-08-08T00:00:00.000Z",
   expiresAt: "2026-08-08T00:04:00.000Z",
 };
+const communityTutorialHttp = { submissions: [] };
+const communityTutorialSummary = {
+  id: "7",
+  title: "BROWSER_COMMUNITY_TUTORIAL",
+  summary: "一份用于真浏览器验证的社区共建教程摘要。",
+  category: "coding",
+  authorName: "浏览器作者",
+  publishedAt: "2026-08-12T08:00:00.000Z",
+};
+await page.route("**/api/tutorials**", (route, request) => {
+  const url = new URL(request.url());
+  if (url.pathname === "/api/tutorials" && request.method() === "GET") {
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ tutorials: [communityTutorialSummary], nextCursor: null }),
+    });
+  }
+  if (url.pathname === "/api/tutorials/7" && request.method() === "GET") {
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ tutorial: {
+        ...communityTutorialSummary,
+        bodyMarkdown: [
+          "# BROWSER_COMMUNITY_DETAIL",
+          "",
+          "![BROWSER_REMOTE_TRACKER](https://tracker.invalid/community.png)",
+          "",
+          "```htmlpreview",
+          "<script>window.__communityTutorialScriptRan = true</script><p>unsafe preview</p>",
+          "```",
+        ].join("\n"),
+      } }),
+    });
+  }
+  if (url.pathname === "/api/tutorials" && request.method() === "POST") {
+    communityTutorialHttp.submissions.push(JSON.parse(request.postData() ?? "null"));
+    return route.fulfill({
+      status: 201,
+      contentType: "application/json",
+      body: JSON.stringify({ tutorial: {
+        id: "8",
+        status: "pending",
+        createdAt: "2026-08-12T09:00:00.000Z",
+      } }),
+    });
+  }
+  if (url.pathname === "/api/tutorials/mine" && request.method() === "GET") {
+    const draft = communityTutorialHttp.submissions.at(-1);
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        tutorials: draft ? [{
+          id: "8",
+          ...draft,
+          status: "pending",
+          reviewNote: null,
+          createdAt: "2026-08-12T09:00:00.000Z",
+          updatedAt: "2026-08-12T09:00:00.000Z",
+          publishedAt: null,
+        }] : [],
+        nextCursor: null,
+      }),
+    });
+  }
+  return route.fulfill({ status: 404, contentType: "application/json", body: JSON.stringify({ error: { code: "NOT_FOUND" } }) });
+});
 await page.route("**/api/plugins/**", (route, request) => {
   const url = new URL(request.url());
   if (url.pathname === "/api/plugins/management" && request.method() === "GET") {
@@ -1898,6 +1967,56 @@ await check("T37 新会话草稿与历史加载反馈：连续新建不增行，
   if (await root.getByTestId("partial-history-skeleton").count() !== 1) {
     throw new Error("部分历史加载占位缺失或重复");
   }
+});
+
+await check("T38 社区教程真浏览器：公开阅读只读，用户投稿进入待审核且移动端不横溢", async () => {
+  const root = page.locator("#community-tutorial-root");
+  await root.getByText("BROWSER_COMMUNITY_TUTORIAL", { exact: true }).waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
+  await root.getByText("BROWSER_COMMUNITY_TUTORIAL", { exact: true }).click();
+  await root.getByText("BROWSER_COMMUNITY_DETAIL", { exact: true }).waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
+  const unsafeRender = await root.evaluate((element) => ({
+    iframes: element.querySelectorAll("iframe").length,
+    images: element.querySelectorAll("img").length,
+    scriptRan: window.__communityTutorialScriptRan === true,
+  }));
+  if (unsafeRender.iframes !== 0 || unsafeRender.images !== 0 || unsafeRender.scriptRan) {
+    throw new Error(`社区教程正文未保持只读:${JSON.stringify(unsafeRender)}`);
+  }
+
+  await root.getByRole("button", { name: "返回社区教程" }).click();
+  await root.getByRole("button", { name: "发布教程" }).click();
+  await root.getByLabel("标题").fill("BROWSER_SUBMITTED_TITLE");
+  await root.getByLabel("摘要").fill("这是一份覆盖真实投稿流程和审核状态的完整摘要。");
+  await root.getByLabel("分类").selectOption("research");
+  await root.getByLabel("教程正文").fill(
+    "# BROWSER_SUBMITTED_BODY\n\n这是足够长的正文，用于验证所有登录用户都可以提交社区教程并进入管理员审核。",
+  );
+  await root.getByRole("button", { name: "提交审核" }).click();
+  await root.getByText("BROWSER_SUBMITTED_TITLE", { exact: true }).waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
+  await root.getByText("待审核", { exact: true }).waitFor({ state: "visible", timeout: 3000 });
+
+  const submission = communityTutorialHttp.submissions.at(-1);
+  if (
+    submission?.title !== "BROWSER_SUBMITTED_TITLE" ||
+    submission?.category !== "research" ||
+    !submission?.bodyMarkdown?.includes("BROWSER_SUBMITTED_BODY")
+  ) {
+    throw new Error(`社区教程投稿 payload 错误:${JSON.stringify(submission)}`);
+  }
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  const overflows = await root.evaluate((element) => element.scrollWidth > element.clientWidth + 1);
+  if (overflows) throw new Error("社区教程在 390px 视口发生横向溢出");
+  if (DEFAULT_VIEWPORT) await page.setViewportSize(DEFAULT_VIEWPORT);
 });
 
 // 主 harness 仍在:预览用例没有把它换成空页面(否则后续缺席断言全部恒真)。

@@ -84,7 +84,8 @@
     "0202_turn_recovery_control",
     "0203_admin_ops_outreach",
     "0204_auto_dream_minimax_m3",
-    "0205_scnet_ocr_jobs"
+    "0205_scnet_ocr_jobs",
+    "0206_community_tutorials"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

@@ -2,6 +2,18 @@
   {
     "method": "GET",
     "pathKind": "path",
+    "pathValue": "/api/admin/tutorials/pending",
+    "handler": "handleAdminPendingCommunityTutorials"
+  },
+  {
+    "method": "POST",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/tutorials/",
+    "handler": "handleAdminReviewCommunityTutorial"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
     "pathValue": "/api/admin/marketplace/funnel",
     "handler": "handleAdminMarketplaceFunnel"
   },
