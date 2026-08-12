@@ -3761,7 +3761,7 @@ describe("durable live turn frame journal", () => {
     assert.equal(projected.hasTapeProjection, true);
   });
 
-  maybe("keeps later dispatches durable when a gateway session restarts its frame sequence", async () => {
+  maybe("keeps later dispatches and server-authored frames durable after a frame sequence restart", async () => {
     const sessionId = "s-live-frame-sequence-reset";
     const userId = "c:903";
     const sessionKey = "agent:main:webchat:dm:s-live-frame-sequence-reset";
@@ -3801,6 +3801,14 @@ describe("durable live turn frame journal", () => {
       clientMessageId: "cm-reset-second",
       blocks: [{ kind: "text", text: "second generation" }],
     });
+    const serverAuthoredPayload = JSON.stringify({
+      type: "outbound.message",
+      sessionKey,
+      frameSeq: 1,
+      peer: { id: sessionId, kind: "dm" },
+      blocks: [{ kind: "text", text: "scheduled result" }],
+      cronJob: { id: "remind-live-frame-reset", heartbeat: false },
+    });
     const base = {
       uid: 903n,
       sessionId,
@@ -3826,6 +3834,18 @@ describe("durable live turn frame journal", () => {
         payload: secondPayload,
       }),
     ]);
+    await Promise.all([
+      persistGatewayLiveFrame(pool, {
+        ...base,
+        clientMessageId: null,
+        payload: serverAuthoredPayload,
+      }),
+      persistGatewayLiveFrame(pool, {
+        ...base,
+        clientMessageId: null,
+        payload: serverAuthoredPayload,
+      }),
+    ]);
     await assert.rejects(
       persistGatewayLiveFrame(pool, {
         ...base,
@@ -3841,12 +3861,12 @@ describe("durable live turn frame journal", () => {
         WHERE agent_container_id=$1 AND frame_seq=1`,
       [base.agentContainerId],
     );
-    assert.deepEqual(stored.rows[0], { frame_count: "2", session_key_count: "2" });
+    assert.deepEqual(stored.rows[0], { frame_count: "3", session_key_count: "3" });
     const page = await readClientSessionLiveFrames(pool, sessionId, userId, 0, 10);
     assert.ok(page);
     assert.deepEqual(
       page.frames.map((frame) => frame.payload),
-      [JSON.parse(firstPayload), JSON.parse(secondPayload)],
+      [JSON.parse(firstPayload), JSON.parse(secondPayload), JSON.parse(serverAuthoredPayload)],
     );
     assert.deepEqual(page.streamClientMessageIds, ["cm-reset-first", "cm-reset-second"]);
   });
