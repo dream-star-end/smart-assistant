@@ -40,6 +40,7 @@ EXPECTED_SKILLS=(
   office-pdf
   office-suite
   coding-suite
+  cursor-cli
   code-review
   debugging
   testing

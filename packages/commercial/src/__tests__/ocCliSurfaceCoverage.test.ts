@@ -129,6 +129,15 @@ function browserLauncherProbe(): void {
   assert.match(value, /"\$cli_bin" "\$@" 9>&-/)
 }
 
+function cursorLauncherProbe(): void {
+  const value = readFileSync(join(BIN_DIR, 'oc-cursor.sh'), 'utf8')
+  assert.match(value, /cursor_bin=\/opt\/cursor-agent\/versions\/2026\.08\.11-e8db854\/cursor-agent/)
+  assert.match(value, /auth_file=\/run\/oc\/cursor-auth\/api-key/)
+  assert.match(value, /--output-format stream-json --stream-partial-output/)
+  assert.match(value, /CURSOR_API_KEY="\$api_key"/)
+  assert.match(value, /setsid "\$cursor_bin"/)
+}
+
 function skillProbe(argv: string[], expectedKind: string): Probe {
   return () => assert.equal(planSkillCommand(argv).kind, expectedKind)
 }
@@ -223,6 +232,9 @@ const OC_SURFACES: Record<string, Record<string, Probe>> = {
   },
   'oc-browser': {
     forward: browserLauncherProbe,
+  },
+  'oc-cursor': {
+    run: cursorLauncherProbe,
   },
   'oc-cite': {
     verify: tsFailureProbe('packages/gateway/src/ocCiteCli.ts', ['verify'], /verify <id/),
@@ -820,6 +832,11 @@ function productionSurfaces(): Record<string, Set<string>> {
       'packages/commercial/agent-sandbox/platform-runtime/bin/oc-browser.sh',
       'forward',
       /\/usr\/local\/bin\/playwright-cli/,
+    ),
+    'oc-cursor': singlePurpose(
+      'packages/commercial/agent-sandbox/platform-runtime/bin/oc-cursor.sh',
+      'run',
+      /--output-format stream-json --stream-partial-output/,
     ),
     'oc-cite': tsDispatchCommands('packages/gateway/src/ocCiteCli.ts', 'cmd'),
     'oc-connect': new Set(connect),

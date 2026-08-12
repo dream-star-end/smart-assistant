@@ -495,7 +495,7 @@ if ((process.env.OC_ENTRYPOINT_VALIDATE_ONLY || "").trim() === "1") {
 // 不覆盖普通文件/目录/异向链接：这些异常只告警，避免 entrypoint 擅自删除用户内容。
 const PLATFORM_BIN_DIR = "/run/oc/platform/current/bin";
 const USER_PLATFORM_BIN_DIR = "/home/agent/.local/bin";
-const PLATFORM_LINKED_CLIS = ["oc-plugin", "oc-ocr", "oc-h3", "oc-video"] as const;
+const PLATFORM_LINKED_CLIS = ["oc-plugin", "oc-ocr", "oc-h3", "oc-video", "oc-cursor"] as const;
 for (const cliName of PLATFORM_LINKED_CLIS) {
   const source = join(PLATFORM_BIN_DIR, cliName);
   const userLink = join(USER_PLATFORM_BIN_DIR, cliName);
