@@ -8653,7 +8653,7 @@ SQL
 
 close_emergency_debt() {
   [[ "$DRY" == 1 ]] && { echo "  [dry-run] validate protected merge/Codex/tests/CI evidence and close debt"; return 0; }
-  local evidence origin_head
+  local evidence local_head origin_head
   [[ "$BR" == feat/v5-aurora-rewrite && -z "$(git status --porcelain)" ]] \
     || { echo "✗ emergency debt 只能从 clean canonical branch 关闭" >&2; return 1; }
   env -u HTTPS_PROXY -u HTTP_PROXY -u https_proxy -u http_proxy \
@@ -8668,8 +8668,9 @@ if (j.schema!==1 || j.codexReview!=='PASS' || j.regressionTests!=='PASS' || j.ci
 process.stdout.write(JSON.stringify(j));
 NODE
 )" || return 1
-  git merge-base --is-ancestor "$PROTECTED_MERGE_SHA" HEAD \
-    || { echo "✗ protected merge sha 不在 canonical HEAD 血缘" >&2; return 1; }
+  local_head="$(git rev-parse HEAD 2>/dev/null || true)"
+  [[ "$local_head" == "$PROTECTED_MERGE_SHA" ]] \
+    || { echo "✗ canonical HEAD($local_head) != protected merge sha($PROTECTED_MERGE_SHA)" >&2; return 1; }
   origin_head="$(git rev-parse origin/feat/v5-aurora-rewrite 2>/dev/null || true)"
   [[ "$origin_head" == "$PROTECTED_MERGE_SHA" ]] \
     || { echo "✗ origin protected branch head($origin_head) != protected merge sha($PROTECTED_MERGE_SHA)" >&2; return 1; }
@@ -10071,11 +10072,12 @@ assert_development_release_queue || exit 3
 # 故一并跳过下面三道写前门。
 # Recovery/compensation must not depend on forward migrations declared only by
 # today's checkout. Those lanes validate the immutable target release instead
-# (abort/rollback/recover), or execute Luna's self-contained fail-closed audit
-# transaction (hide-luna). This keeps rollback available when canonical moves
-# ahead of the currently deployed schema.
+# (abort/rollback/recover), execute a self-contained transaction against their
+# already-established schema (hide-luna/close-emergency-debt), or do not write
+# production state (smoke/reclaim). This keeps recovery and evidence closure
+# available when canonical moves ahead of the currently deployed schema.
 case "$MODE" in
-  smoke|bootstrap|reclaim-mutation-lease|abort|rollback|recover|hide-luna) ;;
+  smoke|bootstrap|reclaim-mutation-lease|abort|rollback|recover|hide-luna|close-emergency-debt) ;;
   *) assert_repo_required_migrations || exit 1 ;;
 esac
 # Smoke 也必须验证应用角色真能使用已记账的 0151 对象；bootstrap 在 env 建好后

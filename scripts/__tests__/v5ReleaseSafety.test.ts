@@ -2044,6 +2044,23 @@ describe('v5 release safety lanes', () => {
         `${mode} must not depend on forward migrations declared only by current HEAD`,
       )
     }
+
+    const evidenceDir = await mkdtemp(path.join(tmpdir(), 'v5-close-emergency-debt-'))
+    dirs.push(evidenceDir)
+    const evidenceFile = path.join(evidenceDir, 'evidence.json')
+    await writeFile(evidenceFile, '{}\n')
+    const closeDebt = run(deploy, [
+      '--dry-run',
+      '--close-emergency-debt=INC-20260812-FRAME-RESET',
+      `--protected-merge-sha=${'a'.repeat(40)}`,
+      `--ci-evidence-file=${evidenceFile}`,
+    ])
+    assert.equal(closeDebt.status, 0, closeDebt.stderr || closeDebt.stdout)
+    assert.doesNotMatch(
+      closeDebt.stdout + closeDebt.stderr,
+      /校验 requiredMigrations 已全部记录/,
+      'emergency debt closure uses its existing schema and must not depend on unrelated forward migrations',
+    )
   })
 
   test('post-finalize egress handoff refreshes the committed active lane before smoke or rollback', () => {
@@ -7468,6 +7485,11 @@ wait $!
     assert.match(source, /regressionTests!=='PASS'/)
     assert.match(source, /j\.ci!=='PASS'/)
     assert.match(source, /j\.commit!==process\.argv\[3\]/)
+    const closeStart = source.indexOf('\nclose_emergency_debt() {')
+    const closeEnd = source.indexOf('\n}\n\nset_luna_visibility()', closeStart)
+    const close = source.slice(closeStart, closeEnd)
+    assert.match(close, /local_head="\$\(git rev-parse HEAD/)
+    assert.match(close, /"\$local_head" == "\$PROTECTED_MERGE_SHA"/)
 
     const canaryStart = source.indexOf('\ncanary() {')
     const canaryEnd = source.indexOf('\n# 内部账号 allowlist', canaryStart)
