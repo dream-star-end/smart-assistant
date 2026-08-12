@@ -15,6 +15,7 @@ import {
 } from "react";
 import { createRoot } from "react-dom/client";
 import { Composer } from "../src/components/Composer";
+import { CommunityTutorials } from "../src/components/tutorials/CommunityTutorials";
 import { MessageFeedbackDialog } from "../src/components/chat/MessageFeedbackDialog";
 import { TurnCostReminder } from "../src/components/chat/TurnCostReminder";
 import { MemoryPanel } from "../src/components/manage/MemoryPanel";
@@ -249,6 +250,17 @@ window.__runPendingDispatchJournalProbe = async () => {
 const mediaTaskAuth = createMemoryAuthSession(() => {}, "browser-media-token");
 const connectorsAuth = createMemoryAuthSession(() => {}, "browser-connectors-token");
 const memoryAuth = createMemoryAuthSession(() => {}, "browser-memory-token");
+const communityTutorialAuth = createMemoryAuthSession(() => {}, "browser-community-token");
+
+createRoot(document.getElementById("community-tutorial-root")!).render(
+  <StrictMode>
+    <TooltipProvider>
+      <ToastProvider>
+        <CommunityTutorials auth={communityTutorialAuth} />
+      </ToastProvider>
+    </TooltipProvider>
+  </StrictMode>,
+);
 
 createRoot(document.getElementById("memory-report-root")!).render(
   <StrictMode>

@@ -29,6 +29,18 @@ describe('MarkdownImpl readOnly', () => {
     expect(container.querySelector('img')).toBeNull()
   })
 
+  test('不可信只读正文完全禁用图片加载，避免远程像素追踪', () => {
+    const { container } = render(
+      <MarkdownImpl readOnly blockImages>
+        {'![远程追踪](https://tracker.test/pixel.png)\n\n![本地图片](/api/media/private.png)'}
+      </MarkdownImpl>,
+    )
+
+    expect(container.querySelector('img')).toBeNull()
+    expect(container.textContent).toContain('[远程追踪]')
+    expect(container.textContent).toContain('[本地图片]')
+  })
+
   test('只读链接图片只开灯箱，并保留 lazy loading 与全链路 no-referrer', () => {
     const { container } = render(
       <MarkdownImpl signMedia readOnly>
@@ -41,8 +53,14 @@ describe('MarkdownImpl readOnly', () => {
     expect(thumbnail).toHaveAttribute('loading', 'lazy')
     expect(thumbnail.closest('a')).toBeNull()
     expect(thumbnail.closest('strong')).not.toBeNull()
-    expect(screen.getByRole('link', { name: '打开关联链接' })).toHaveAttribute('href', 'https://report.test')
-    expect(container.querySelector('a[href="https://report.test"]')).toHaveAttribute('rel', 'noreferrer')
+    expect(screen.getByRole('link', { name: '打开关联链接' })).toHaveAttribute(
+      'href',
+      'https://report.test',
+    )
+    expect(container.querySelector('a[href="https://report.test"]')).toHaveAttribute(
+      'rel',
+      'noreferrer',
+    )
     fireEvent.click(screen.getByRole('button', { name: '放大查看 外链' }))
 
     const images = screen.getAllByAltText('外链')

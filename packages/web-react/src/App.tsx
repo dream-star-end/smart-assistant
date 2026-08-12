@@ -2117,6 +2117,12 @@ export function App() {
               }}
               caseActionLabel="登录后试用"
               onRunCase={runTutorialCase}
+              auth={auth}
+              onRequireLogin={() => {
+                setTutorialOpen(false);
+                setAuthMode("login");
+                setView("app");
+              }}
               onClose={() => setTutorialOpen(false)}
               actionState={() => ({
                 enabled: true,
@@ -2662,6 +2668,7 @@ export function App() {
             }}
             caseActionLabel="带着指令去对话"
             onRunCase={runTutorialCase}
+            auth={auth}
             onClose={() => setTutorialOpen(false)}
             actionState={(feature) => resolveTutorialAction(feature, tutorialActionContext)}
             onRunAction={runTutorialAction}

@@ -5,6 +5,13 @@ import type {
   ApiKeySummary,
   AuthSession,
   CreatedApiKey,
+  CommunityTutorialCategory,
+  CommunityTutorialDetail,
+  CommunityTutorialDraft,
+  CommunityTutorialMine,
+  CommunityTutorialPage,
+  CommunityTutorialPending,
+  CommunityTutorialSummary,
   CronCreateInput,
   CronJob,
   GithubBranch,
@@ -2731,6 +2738,91 @@ export const api = {
           credentials: "include",
           headers: bearerHeaders(t, true),
           body: JSON.stringify(name ? { name } : {}),
+        }),
+      ),
+    ),
+
+  // ── 社区共建教程 ───────────────────────────────────────────────────────
+
+  listCommunityTutorials: (opts?: {
+    cursor?: string | null;
+    query?: string;
+    category?: CommunityTutorialCategory | null;
+    limit?: number;
+  }) => {
+    const qs = new URLSearchParams();
+    if (opts?.cursor) qs.set("cursor", opts.cursor);
+    if (opts?.query) qs.set("q", opts.query);
+    if (opts?.category) qs.set("category", opts.category);
+    if (opts?.limit) qs.set("limit", String(opts.limit));
+    const suffix = qs.size > 0 ? `?${qs.toString()}` : "";
+    return jsonOrThrow<CommunityTutorialPage<CommunityTutorialSummary>>(
+      fetch(`/api/tutorials${suffix}`),
+    );
+  },
+
+  getCommunityTutorial: (id: string) =>
+    jsonOrThrow<{ tutorial: CommunityTutorialDetail }>(
+      fetch(`/api/tutorials/${encodeURIComponent(id)}`),
+    ).then((result) => result.tutorial),
+
+  submitCommunityTutorial: (a: AuthSession, draft: CommunityTutorialDraft) =>
+    jsonOrThrow<{ tutorial: { id: string; status: "pending"; createdAt: string } }>(
+      callWithRefresh(a, (token) =>
+        fetch("/api/tutorials", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(token, true),
+          body: JSON.stringify(draft),
+        }),
+      ),
+    ).then((result) => result.tutorial),
+
+  listMyCommunityTutorials: (a: AuthSession, cursor?: string | null) =>
+    jsonOrThrow<CommunityTutorialPage<CommunityTutorialMine>>(
+      callWithRefresh(a, (token) =>
+        fetch(`/api/tutorials/mine${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`, {
+          credentials: "include",
+          headers: bearerHeaders(token),
+        }),
+      ),
+    ),
+
+  withdrawCommunityTutorial: (a: AuthSession, id: string) =>
+    jsonOrThrow<{ ok: boolean }>(
+      callWithRefresh(a, (token) =>
+        fetch(`/api/tutorials/${encodeURIComponent(id)}/withdraw`, {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(token, true),
+          body: JSON.stringify({}),
+        }),
+      ),
+    ),
+
+  adminPendingCommunityTutorials: (a: AuthSession, cursor?: string | null) =>
+    jsonOrThrow<CommunityTutorialPage<CommunityTutorialPending>>(
+      callWithRefresh(a, (token) =>
+        fetch(`/api/admin/tutorials/pending${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`, {
+          credentials: "include",
+          headers: bearerHeaders(token),
+        }),
+      ),
+    ),
+
+  adminReviewCommunityTutorial: (
+    a: AuthSession,
+    id: string,
+    decision: "approve" | "reject",
+    note?: string,
+  ) =>
+    jsonOrThrow<{ ok: boolean }>(
+      callWithRefresh(a, (token) =>
+        fetch(`/api/admin/tutorials/${encodeURIComponent(id)}/review`, {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(token, true),
+          body: JSON.stringify({ decision, note }),
         }),
       ),
     ),

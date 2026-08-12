@@ -35,6 +35,7 @@ import {
   Upload,
   Users,
   Wallet,
+  Waypoints,
   X,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -67,7 +68,9 @@ import {
   tutorialIsRead,
 } from "../lib/tutorialProgress";
 import { cn } from "../lib/utils";
+import type { AuthSession } from "../lib/types";
 import { CASE_PRESENTATION, CaseArtwork } from "./tutorials/CaseArtwork";
+import { CommunityTutorials } from "./tutorials/CommunityTutorials";
 import { MissionReplay } from "./tutorials/MissionReplay";
 import { TutorialReplay } from "./tutorials/TutorialReplay";
 import { Badge, Button, IconButton } from "./ui";
@@ -186,6 +189,8 @@ export function TutorialCenter({
   onClose,
   actionState,
   onRunAction,
+  auth = null,
+  onRequireLogin,
 }: {
   open: boolean;
   topicId: ProductFeatureId | null;
@@ -198,8 +203,11 @@ export function TutorialCenter({
   onClose: () => void;
   actionState: (feature: ProductCapability) => TutorialActionState;
   onRunAction: (feature: ProductCapability) => void;
+  auth?: AuthSession | null;
+  onRequireLogin?: () => void;
 }) {
-  const mode = topicId ? "features" : "cases";
+  const [communityOpen, setCommunityOpen] = useState(false);
+  const mode = communityOpen ? "community" : topicId ? "features" : "cases";
   const selectedTopicId = topicId ?? PRODUCT_CAPABILITIES.chatBasics.id;
   const [query, setQuery] = useState("");
   const [featureCategory, setFeatureCategory] = useState<ProductFeatureCategory | "all">("all");
@@ -237,6 +245,7 @@ export function TutorialCenter({
     if (!open) {
       setQuery("");
       setFeatureCategory("all");
+      setCommunityOpen(false);
       return;
     }
     if (!topicId) return;
@@ -264,12 +273,19 @@ export function TutorialCenter({
 
   const showCases = () => {
     setQuery("");
+    setCommunityOpen(false);
     onShowCaseGallery();
   };
 
   const showFeatures = () => {
     setQuery("");
+    setCommunityOpen(false);
     onTopicChange(selectedTopicId);
+  };
+
+  const showCommunity = () => {
+    setQuery("");
+    setCommunityOpen(true);
   };
 
   return (
@@ -292,10 +308,14 @@ export function TutorialCenter({
               </span>
               <div className="min-w-0">
                 <Dialog.Title className="truncate text-[15px] font-semibold text-fg sm:text-[17px]">
-                  {mode === "cases" ? "V5 实战拆解" : "功能教程"}
+                  {mode === "cases" ? "V5 实战拆解" : mode === "features" ? "功能教程" : "社区共建教程"}
                 </Dialog.Title>
                 <p className="hidden text-[11.5px] text-faint sm:block">
-                  {mode === "cases" ? "一个真实任务，从材料到成果" : "按功能快速找到使用方法"}
+                  {mode === "cases"
+                    ? "一个真实任务，从材料到成果"
+                    : mode === "features"
+                      ? "按功能快速找到使用方法"
+                      : "人人可投稿，审核通过即上线"}
                 </p>
               </div>
             </div>
@@ -322,11 +342,7 @@ export function TutorialCenter({
                   </span>
                 </div>
               </>
-            ) : (
-              <Button variant="ghost" size="sm" onClick={showFeatures} className="ml-auto">
-                <Sparkles size={14} /> 功能索引
-              </Button>
-            )}
+            ) : <div className="ml-auto" />}
             <Dialog.Close asChild>
               <IconButton aria-label="关闭教程" variant="muted" shape="square">
                 <X size={18} />
@@ -334,16 +350,17 @@ export function TutorialCenter({
             </Dialog.Close>
           </header>
 
-          {mode === "features" && (
-            <div className="flex shrink-0 items-center gap-1 border-b border-border bg-surface px-3 py-2 sm:px-5">
-              <ViewTab active={false} onClick={showCases} icon={TestTube2}>
-                实战回放
-              </ViewTab>
-              <ViewTab active onClick={showFeatures} icon={Sparkles}>
-                功能索引
-              </ViewTab>
-            </div>
-          )}
+          <div className="no-scrollbar flex shrink-0 items-center gap-1 overflow-x-auto border-b border-border bg-surface px-3 py-2 sm:px-5">
+            <ViewTab active={mode === "cases"} onClick={showCases} icon={TestTube2}>
+              实战回放
+            </ViewTab>
+            <ViewTab active={mode === "features"} onClick={showFeatures} icon={Sparkles}>
+              功能索引
+            </ViewTab>
+            <ViewTab active={mode === "community"} onClick={showCommunity} icon={Waypoints}>
+              社区共建
+            </ViewTab>
+          </div>
 
           {mode === "features" && (
             <div className="no-scrollbar flex shrink-0 gap-2 overflow-x-auto border-b border-border bg-surface px-3 py-2 lg:hidden">
@@ -395,7 +412,9 @@ export function TutorialCenter({
               )}
 
               <main className="tutorial-detail min-h-0 flex-1 overflow-y-auto">
-                {mode === "cases" ? (
+                {mode === "community" ? (
+                  <CommunityTutorials auth={auth} onRequireLogin={onRequireLogin} />
+                ) : mode === "cases" ? (
                   showMissionReplay ? (
                     <MissionReplay
                       caseId={caseId}
