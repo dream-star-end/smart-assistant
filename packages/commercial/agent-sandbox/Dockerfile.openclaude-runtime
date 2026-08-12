@@ -34,7 +34,7 @@
 # OC_EMBED_SOURCE:**全局 ARG**(FROM embed-${OC_EMBED_SOURCE} 需在首个 FROM 前声明)。
 # =0 瘦身(v5 生产,源码走 release ro 挂载),=1 内嵌源码+装依赖(默认;v3 + canary)。见文件尾部 embed 段。
 ARG OC_EMBED_SOURCE=1
-FROM node:22-slim AS base
+FROM node:22-bookworm-slim AS base
 
 # 时区 + 语言环境(显式 Asia/Shanghai 与商用版宿主同步;不依赖 host 默认)
 ENV TZ=Asia/Shanghai \
@@ -245,6 +245,18 @@ RUN set -eux; \
 
 # ── oc-* 工具:dev fallback(生产走 PATH /run/oc/platform/current/bin 的 bundle,允许滞后)──
 # 镜像内 /usr/local/bin 副本仅当 bundle 未挂载时兜底;source 已迁 platform-runtime/bin/(改动真热)。
+# Debian 12 自带 LibreOffice 7.4 会把 Pandoc 原生 OMML 求和式中的括号/变量渲染成“¿”。
+# 仅升级 Writer/Math 到同发行版 backports；基础镜像已锁 bookworm，禁止跨发行版混装。
+RUN printf '%s\n' 'deb http://deb.debian.org/debian bookworm-backports main' \
+        > /etc/apt/sources.list.d/bookworm-backports.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends -t bookworm-backports \
+        libreoffice-writer \
+        libreoffice-math \
+    && libreoffice --headless --version | grep -Eq '^LibreOffice 25\.2\.' \
+    && dpkg-query -W -f='${Status}\n' libreoffice-math | grep -qx 'install ok installed' \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+
 COPY --chown=root:root ./platform-runtime/bin/oc-docx.py /usr/local/bin/oc-docx
 COPY --chown=root:root ./runtime/create-docgen-reference.py /usr/local/lib/openclaude/create-docgen-reference.py
 COPY --chown=root:root ./platform-runtime/bin/oc-minimax.py /usr/local/bin/oc-minimax
@@ -304,7 +316,7 @@ RUN set -eux; \
     chmod 0755 /usr/local/bin/oc-docx /usr/local/bin/oc-minimax /usr/local/bin/oc-web-context /usr/local/bin/oc-web /usr/local/bin/oc-browser /usr/local/bin/oc-market /usr/local/bin/oc-skill /usr/local/bin/oc-lit /usr/local/bin/oc-cite /usr/local/bin/oc-ingest /usr/local/bin/oc-litrag /usr/local/bin/oc-report /usr/local/bin/oc-slides /usr/local/bin/oc-poster /usr/local/bin/oc-rank /usr/local/bin/oc-xlsx /usr/local/bin/oc-pdf /usr/local/bin/oc-artifact-qa /usr/local/bin/oc-vision /usr/local/bin/oc-figcheck /usr/local/bin/oc-diagram /usr/local/bin/oc-memory /usr/local/bin/oc-connect /usr/local/lib/openclaude/create-docgen-reference.py; \
     ln -sf /usr/local/bin/oc-minimax /usr/local/bin/mmx; \
     python3 /usr/local/lib/openclaude/create-docgen-reference.py /usr/local/share/openclaude-docgen/reference.docx; \
-    printf '%s\n' '# DOCX smoke' 'Inline $a^2+b^2=c^2$.' '' '$$' 'E = mc^2' '$$' > /tmp/oc-docx-smoke.md; \
+    printf '%s\n' '# DOCX smoke' 'Inline $\bar{x}=\frac{1}{n}\sum_{i=1}^{n}x_i$.' '' '$$' '\mathrm{MSE}=\frac{1}{n}\sum_{i=1}^{n}(y_i-\hat{y}_i)^2' '$$' > /tmp/oc-docx-smoke.md; \
     oc-docx /tmp/oc-docx-smoke.md -o /tmp/oc-docx-smoke.docx; \
     test -s /tmp/oc-docx-smoke.docx; \
     unzip -tq /tmp/oc-docx-smoke.docx; \
@@ -314,7 +326,10 @@ RUN set -eux; \
     test -s /tmp/oc-docx-smoke-render/page-1.png; \
     test -s /tmp/oc-docx-smoke-render/vision-page-1.jpg; \
     test "$(stat -c %s /tmp/oc-docx-smoke-render/vision-page-1.jpg)" -lt 4500000; \
-    pdftotext /tmp/oc-docx-smoke-render/oc-docx-smoke.pdf - | grep -Eq 'E[[:space:]]*=[[:space:]]*m[[:space:]]*c'; \
+    pdftotext /tmp/oc-docx-smoke-render/oc-docx-smoke.pdf /tmp/oc-docx-smoke.txt; \
+    grep -Eq 'M[[:space:]]*S[[:space:]]*E' /tmp/oc-docx-smoke.txt; \
+    grep -q 'y' /tmp/oc-docx-smoke.txt; \
+    ! grep -q '¿' /tmp/oc-docx-smoke.txt; \
     oc-docx inspect /tmp/oc-docx-smoke.docx --render-dir /tmp/oc-docx-smoke-render --json /tmp/oc-docx-smoke-render/report.json; \
     oc-docx scrub /tmp/oc-docx-smoke.docx -o /tmp/oc-docx-smoke-clean.docx --keep-title; \
     unzip -tq /tmp/oc-docx-smoke-clean.docx; \
