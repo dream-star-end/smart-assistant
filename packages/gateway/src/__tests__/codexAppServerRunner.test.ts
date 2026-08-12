@@ -21,6 +21,7 @@ import {
   CodexAppServerRunner,
   __setCodexAppServerSpawnForTests,
   _classifyJsonRpcLine,
+  isMissingRolloutStderrLine,
 } from '../codexAppServerRunner.js'
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -2101,6 +2102,268 @@ describe('thread/resume missing-rollout self-heal (Codex review #019e0b72 BLOCKE
     assert.equal(rpcErr.rpcCode, -32600)
     assert.equal(rpcErr.rpcMessage, 'no rollout found for thread id xyz')
     assert.equal(rpcErr.rpcMethod, 'thread/resume')
+    await h.cleanup()
+  })
+})
+
+describe('stderr missing-rollout self-heal', () => {
+  // Production failure this covers: `thread/resume` succeeded (so the
+  // resume-time self-heal above never fired), but the rollout backing the
+  // thread was gone, so every turn logged `failed to record rollout items:
+  // no rollout found` to stderr and then hung with zero output — one turn
+  // spun 66 minutes, 1088 such lines across two sessions. stderr was only
+  // being logged, so nothing ever ended the turn.
+  //
+  // These tests drive the real spawn path (not an inline replica) so the
+  // production stderr handler, the interrupt, and runTurn's closing branch
+  // are all exercised end to end.
+
+  /** Spawn-backed harness with an in-flight turn on an already-attached
+   *  thread, so stderr can be pushed at a live `activeTurnId`. */
+  async function makeTurnInFlight(threadId: string): Promise<{
+    h: Harness
+    runner: any
+    proc: any
+    turnPromise: Promise<unknown>
+  }> {
+    const h = await makeHarness()
+    let proc: any
+    __setCodexAppServerSpawnForTests((() => {
+      proc = makeSpawnedFakeProc(h.written)
+      return proc
+    }) as any)
+
+    // Spawn for real (written[0] = initialize) so the production stderr
+    // handler is the one under test; then skip thread/resume so the turn
+    // starts against an already-attached thread, as in production.
+    assert.equal(await h.runner.warmup(2000), true)
+    const runner = h.runner as any
+    runner.threadId = threadId
+    runner.attached = true
+
+    const turnPromise = runner.runTurn('hello')
+    // written: [initialize, turn/start]
+    await waitFor(() => h.written.length >= 2)
+    const turnReq = JSON.parse(h.written[1])
+    assert.equal(turnReq.method, 'turn/start')
+    feed(h.runner, { jsonrpc: '2.0', id: turnReq.id, result: { turn: { id: 't-1' } } })
+    await waitFor(() => runner.activeTurnId === 't-1')
+
+    return { h, runner, proc, turnPromise }
+  }
+
+  it('classifies stderr lines: both markers required', () => {
+    assert.equal(
+      isMissingRolloutStderrLine(
+        'ERROR codex_core::rollout: failed to record rollout items: no rollout found for thread 0199',
+      ),
+      true,
+    )
+    // The resume-time RPC text also says "no rollout found" but is handled by
+    // isMissingRolloutError; matching it here would rebuild the thread twice.
+    assert.equal(isMissingRolloutStderrLine('no rollout found for thread id thr-stale'), false)
+    // Real stderr noise seen every few minutes in production.
+    assert.equal(
+      isMissingRolloutStderrLine(
+        'WARN codex_models_manager: failed to refresh available models: timeout',
+      ),
+      false,
+    )
+    assert.equal(isMissingRolloutStderrLine('failed to record rollout items: disk full'), false)
+  })
+
+  it('marker split across two stderr chunks still interrupts, rebuilds the thread and closes the turn exactly once', async () => {
+    const { h, runner, proc, turnPromise } = await makeTurnInFlight('thr-dead-rollout')
+
+    // The marker arrives split mid-word — stderr `data` chunks are not
+    // line-aligned, so without buffering this signal would be missed.
+    proc.stderr.write('ERROR codex_core::rollout: failed to record rollo')
+    proc.stderr.write('ut items: no rollout found for thread 0199\n')
+
+    await waitFor(() => h.written.length >= 3)
+    const intReq = JSON.parse(h.written[2])
+    assert.equal(intReq.method, 'turn/interrupt')
+    assert.equal(intReq.params.turnId, 't-1')
+    feed(h.runner, { jsonrpc: '2.0', id: intReq.id, result: {} })
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'turn/completed',
+      params: {
+        threadId: 'thr-dead-rollout',
+        turn: { id: 't-1', status: 'interrupted', durationMs: 5 },
+      },
+    })
+
+    // runTurn drops the dead thread and starts a fresh one before closing.
+    await waitFor(() => h.written.length >= 4)
+    const startReq = JSON.parse(h.written[3])
+    assert.equal(startReq.method, 'thread/start')
+    feed(h.runner, { jsonrpc: '2.0', id: startReq.id, result: { thread: { id: 'thr-NEW' } } })
+
+    await turnPromise
+
+    assert.equal(runner.threadId, 'thr-NEW', 'dead thread must be replaced')
+    assert.equal(runner.attached, true)
+    assert.deepEqual(h.sessionIds, ['thr-NEW'], 'new thread id must reach the resume map')
+
+    const results = h.messages.filter((m) => m.type === 'result')
+    assert.equal(results.length, 1, 'the interrupt waiter and runTurn must not both close the turn')
+    assert.equal(results[0].is_error, true)
+    assert.equal(results[0].session_id, 'thr-NEW', 'closing result must carry the live thread id')
+    assert.match(results[0].result, /已重建会话,请重新发送/)
+    assert.equal(
+      results[0].interrupted,
+      undefined,
+      'a broken rollout is a failure, not a user cancellation',
+    )
+    // The prompt must never be replayed: tool side effects already ran.
+    assert.equal(
+      h.written.filter((l) => JSON.parse(l).method === 'turn/start').length,
+      1,
+      'runner must not resubmit the prompt',
+    )
+
+    await h.cleanup()
+  })
+
+  it('unrelated stderr noise never interrupts a healthy turn', async () => {
+    const { h, runner, proc, turnPromise } = await makeTurnInFlight('thr-healthy')
+
+    proc.stderr.write('WARN codex_models_manager: failed to refresh available models: timeout\n')
+    proc.stderr.write('no rollout found for thread id thr-healthy\n')
+    proc.stderr.write('failed to record rollout items: disk full\n')
+    await new Promise((r) => setTimeout(r, 30))
+
+    assert.equal(h.written.length, 2, `no interrupt expected, got: ${h.written.join(' | ')}`)
+    assert.equal(runner.turnTerminationReason, null)
+
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'turn/completed',
+      params: { threadId: 'thr-healthy', turn: { id: 't-1', status: 'completed', durationMs: 5 } },
+    })
+    await turnPromise
+
+    const results = h.messages.filter((m) => m.type === 'result')
+    assert.equal(results.length, 1)
+    assert.equal(results[0].is_error, false, 'healthy turn must stay healthy')
+    assert.equal(runner.threadId, 'thr-healthy', 'thread must not be rebuilt')
+
+    await h.cleanup()
+  })
+
+  it('rebuild failure surfaces a retry message and leaves the runner unattached', async () => {
+    const { h, runner, proc, turnPromise } = await makeTurnInFlight('thr-rebuild-fail')
+
+    proc.stderr.write('ERROR: failed to record rollout items: no rollout found for thread x\n')
+    await waitFor(() => h.written.length >= 3)
+    const intReq = JSON.parse(h.written[2])
+    feed(h.runner, { jsonrpc: '2.0', id: intReq.id, result: {} })
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'turn/completed',
+      params: {
+        threadId: 'thr-rebuild-fail',
+        turn: { id: 't-1', status: 'interrupted', durationMs: 5 },
+      },
+    })
+
+    await waitFor(() => h.written.length >= 4)
+    const startReq = JSON.parse(h.written[3])
+    assert.equal(startReq.method, 'thread/start')
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      id: startReq.id,
+      error: { code: -32603, message: 'internal error' },
+    })
+
+    await turnPromise
+
+    assert.equal(runner.attached, false, 'next turn must redo the whole attach path')
+    const results = h.messages.filter((m) => m.type === 'result')
+    assert.equal(results.length, 1)
+    assert.equal(results[0].is_error, true)
+    assert.match(results[0].result, /重建失败/)
+
+    await h.cleanup()
+  })
+})
+
+describe('interrupt source tagging', () => {
+  /** Run one turn that ends as `interrupted`, optionally requesting the stop
+   *  through the public interrupt() with the given source. */
+  async function runInterruptedTurn(
+    h: Harness,
+    threadId: string,
+    source?: 'user' | 'system',
+  ): Promise<any> {
+    const runner = h.runner as any
+    runner.threadId = threadId
+    runner.attached = true
+    const prevWritten = h.written.length
+    const turnId = `t-${prevWritten}` // unique per turn on a reused harness
+    const turnPromise = runner.runTurn('hello')
+    await waitFor(() => h.written.length > prevWritten)
+    const turnReq = JSON.parse(h.written[prevWritten])
+    assert.equal(turnReq.method, 'turn/start')
+    feed(h.runner, { jsonrpc: '2.0', id: turnReq.id, result: { turn: { id: turnId } } })
+    await waitFor(() => runner.activeTurnId === turnId)
+
+    assert.equal(source ? h.runner.interrupt(source) : h.runner.interrupt(), true)
+    const intReq = JSON.parse(h.written[h.written.length - 1])
+    feed(h.runner, { jsonrpc: '2.0', id: intReq.id, result: {} })
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'turn/completed',
+      params: { threadId, turn: { id: turnId, status: 'interrupted', durationMs: 5 } },
+    })
+    await turnPromise
+    return h.messages.filter((m) => m.type === 'result').pop()
+  }
+
+  it("a user Stop tags the closing result with interrupted='user'", async () => {
+    const h = await makeHarness({ withFakeProc: true })
+    const result = await runInterruptedTurn(h, 'thr-user-stop', 'user')
+    // is_error stays true so sessionManager's phantom-turn guard still
+    // forwards the frame; `interrupted` is what makes the UI neutral.
+    assert.equal(result.is_error, true)
+    assert.equal(result.interrupted, 'user')
+    await h.cleanup()
+  })
+
+  it('an internal interrupt stays untagged, and the tag never leaks into the next turn', async () => {
+    const h = await makeHarness({ withFakeProc: true })
+
+    const systemResult = await runInterruptedTurn(h, 'thr-sys-stop')
+    assert.equal(systemResult.is_error, true)
+    assert.equal(systemResult.interrupted, undefined)
+
+    // Same runner, a user Stop, then a clean turn: turnTerminationReason is
+    // per-turn state, so the clean turn must not inherit the cancellation.
+    const userResult = await runInterruptedTurn(h, 'thr-sys-stop', 'user')
+    assert.equal(userResult.interrupted, 'user')
+
+    const runner = h.runner as any
+    const prevWritten = h.written.length
+    const turnPromise = runner.runTurn('again')
+    await waitFor(() => h.written.length > prevWritten)
+    const turnReq = JSON.parse(h.written[prevWritten])
+    assert.equal(runner.turnTerminationReason, null, 'reason must reset at turn start')
+    feed(h.runner, { jsonrpc: '2.0', id: turnReq.id, result: { turn: { id: 't-clean' } } })
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'turn/completed',
+      params: {
+        threadId: 'thr-sys-stop',
+        turn: { id: 't-clean', status: 'completed', durationMs: 5 },
+      },
+    })
+    await turnPromise
+
+    const cleanResult = h.messages.filter((m) => m.type === 'result').pop()
+    assert.equal(cleanResult.is_error, false)
+    assert.equal(cleanResult.interrupted, undefined)
+
     await h.cleanup()
   })
 })

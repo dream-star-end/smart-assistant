@@ -1404,46 +1404,58 @@ export function handleOutbound(frame) {
           // drop, etc.), fall back to the priorTurnHadContent wording.
           // See docs/ccb-telemetry-refactor-plan.md §5.6.
           const stopReason = frame.meta?.stopReason
+          // A user Stop that produced nothing is not a fault: without this the
+          // notice below would tell the user "未收到回复 ... 请重试" for a turn
+          // they cancelled themselves. Only 'user' is tagged by the gateway;
+          // internal/selfheal interrupts keep the generic wording.
+          const userCancelled = frame.meta?.interrupted === 'user'
           console.warn('[ws] empty-turn: isFinal with zero blocks', {
             sessionId: sess.id,
             targetMsgId: _targetMsg.id,
             priorTurnHadContent,
             stopReason: stopReason ?? null,
+            userCancelled,
           })
           let noticeText
-          switch (stopReason) {
-            case 'end_turn':
-              noticeText =
-                '模型本轮主动结束(通常表示它判断不需要再回复或上下文已表达完整)。可继续追问。'
-              break
-            case 'pause_turn':
-              noticeText = '模型暂停了本轮(通常因长任务超时),可直接重新发送让它继续。'
-              break
-            case 'max_tokens':
-              noticeText = '本轮输出达到 token 上限,内容可能不完整。可让它"继续"。'
-              break
-            case 'refusal':
-              noticeText = '模型拒绝回复本轮内容。'
-              break
-            case 'tool_use':
-              // stop_reason=tool_use but 0 blocks → tool_use stream was cut
-              noticeText = '工具调用流意外中断,请重试。'
-              break
-            case 'stop_sequence':
-              noticeText = '模型命中停止序列结束本轮。'
-              break
-            default:
-              if (stopReason) {
-                noticeText = `模型本轮无内容输出 (stop_reason=${stopReason})。可重试或继续追问。`
-              } else if (priorTurnHadContent) {
-                noticeText = '模型本轮未输出新内容,可继续追问或重新提问。'
-              } else {
-                noticeText = '未收到回复 — 服务端标记已完成,但没有生成任何内容。请重试。'
-              }
+          if (userCancelled) {
+            noticeText = '已取消本轮,未产生输出。可重新发送或继续提问。'
+          } else {
+            switch (stopReason) {
+              case 'end_turn':
+                noticeText =
+                  '模型本轮主动结束(通常表示它判断不需要再回复或上下文已表达完整)。可继续追问。'
+                break
+              case 'pause_turn':
+                noticeText = '模型暂停了本轮(通常因长任务超时),可直接重新发送让它继续。'
+                break
+              case 'max_tokens':
+                noticeText = '本轮输出达到 token 上限,内容可能不完整。可让它"继续"。'
+                break
+              case 'refusal':
+                noticeText = '模型拒绝回复本轮内容。'
+                break
+              case 'tool_use':
+                // stop_reason=tool_use but 0 blocks → tool_use stream was cut
+                noticeText = '工具调用流意外中断,请重试。'
+                break
+              case 'stop_sequence':
+                noticeText = '模型命中停止序列结束本轮。'
+                break
+              default:
+                if (stopReason) {
+                  noticeText = `模型本轮无内容输出 (stop_reason=${stopReason})。可重试或继续追问。`
+                } else if (priorTurnHadContent) {
+                  noticeText = '模型本轮未输出新内容,可继续追问或重新提问。'
+                } else {
+                  noticeText = '未收到回复 — 服务端标记已完成,但没有生成任何内容。请重试。'
+                }
+            }
           }
           addMessage(sess, 'assistant', noticeText, {
             _emptyTurn: true,
-            _emptyTurnSoft: priorTurnHadContent || !!stopReason,
+            // A user cancellation is expected, not a fault — keep it in the
+            // soft (non-alarmist) style like the other benign endings.
+            _emptyTurnSoft: userCancelled || priorTurnHadContent || !!stopReason,
             _emptyTurnStopReason: stopReason ?? null,
           })
         }

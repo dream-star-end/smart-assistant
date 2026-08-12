@@ -5986,7 +5986,9 @@ export class Gateway {
         sessionKey = routed.sessionKey
       }
     }
-    const ok = this.sessions.interrupt(sessionKey)
+    // The only user-originated interrupt entry point — tagged so the closing
+    // result renders as a cancellation rather than an execution error.
+    const ok = this.sessions.interrupt(sessionKey, 'user')
     turnInterruptTotal.inc({ source: 'user', outcome: ok ? 'interrupted' : 'not_running' })
     this.log.info('interrupt', { sessionKey, ok })
   }

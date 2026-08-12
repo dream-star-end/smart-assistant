@@ -19,7 +19,7 @@ import {
   upsertSessionMeta,
 } from '@openclaude/storage'
 import { ClaudeMessageParser, type SessionStreamEvent } from './claudeMessageParser.js'
-import { CodexAppServerRunner } from './codexAppServerRunner.js'
+import { CodexAppServerRunner, type InterruptSource } from './codexAppServerRunner.js'
 import { CodexRunner } from './codexRunner.js'
 import { createEvent, eventBus } from './eventBus.js'
 import { createLogger } from './logger.js'
@@ -2442,9 +2442,18 @@ export class SessionManager {
     watch.resolveDone()
   }
 
-  interrupt(sessionKey: string): boolean {
+  /** `source` is only forwarded to the codex app-server runner, which is the
+   *  one that tags its closing result so the UI can tell a user Stop apart
+   *  from a failure. Defaults to 'system' so selfheal cancellation and other
+   *  internal callers keep the existing error rendering. */
+  interrupt(sessionKey: string, source: InterruptSource = 'system'): boolean {
     const s = this.sessions.get(sessionKey)
     if (!s) return false
+    // Narrow through `unknown` (as elsewhere in this file): CodexAppServerRunner
+    // is only structurally compatible with SubprocessRunner, so a direct
+    // instanceof on `s.runner` collapses the else branch to `never`.
+    const runner: unknown = s.runner
+    if (runner instanceof CodexAppServerRunner) return runner.interrupt(source)
     return s.runner.interrupt()
   }
 

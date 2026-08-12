@@ -340,6 +340,28 @@ export function isMissingRolloutError(err: unknown): err is JsonRpcCallError {
   )
 }
 
+/** Who asked for the interrupt. Only an explicit user Stop maps to 'user';
+ *  selfheal cancellation and internal recovery paths stay 'system' so they
+ *  keep rendering as errors. */
+export type InterruptSource = 'user' | 'system'
+
+/**
+ * Detects the codex-internal failure where `thread/resume` succeeded (the
+ * thread row exists) but its rollout is gone, so every attempt to persist
+ * turn history fails. Unlike `isMissingRolloutError` this never surfaces as a
+ * JSON-RPC error — it only appears on the app-server's stderr, which is why
+ * the existing self-heal never fired for it (production: 1088 occurrences
+ * across two sessions, one turn spun 66min with zero output).
+ *
+ * Deliberately narrow: both markers must be present. `no rollout found` alone
+ * would also match the resume-time RPC text, and stderr carries unrelated
+ * noise (e.g. `codex_models_manager: failed to refresh available models`,
+ * which fires every few minutes) that must never trigger a thread rebuild.
+ */
+export function isMissingRolloutStderrLine(line: string): boolean {
+  return /failed to record rollout items/i.test(line) && /no rollout found/i.test(line)
+}
+
 function activeTurnIdFromInterruptMismatch(err: unknown): string | null {
   if (!(err instanceof Error)) return null
   const e = err as Partial<JsonRpcCallError>
@@ -378,6 +400,9 @@ interface RunnerMessage {
   total_cost_usd?: number
   duration_ms?: number
   is_error?: boolean
+  /** Termination cause for a non-ok turn. Distinguishes a user-requested stop
+   *  from a genuine execution failure so the UI can render it neutrally. */
+  interrupted?: InterruptSource
   usage?: {
     input_tokens?: number
     output_tokens?: number
@@ -566,6 +591,13 @@ export class CodexAppServerRunner extends EventEmitter {
    *  one stdout chunk cannot strand either waiter. */
   private pendingInterrupt: PendingInterrupt | null = null
   private stdoutBuf = ''
+  /** stderr needs the same newline reassembly as stdout: `data` chunks are not
+   *  line-aligned, so a marker line can arrive split across two chunks. */
+  private stderrBuf = ''
+  /** Why the current turn is being terminated. Per-turn: reset at turn start
+   *  so one Stop cannot leak into the next queued turn. Owned by runTurn,
+   *  which is the single place that emits the closing result. */
+  private turnTerminationReason: 'rollout-broken' | InterruptSource | null = null
   /** Accumulated assistant text for the current turn — used to dedupe
    *  imageGeneration savedPath emissions against text the model already
    *  surfaced via deltas. */
@@ -638,9 +670,14 @@ export class CodexAppServerRunner extends EventEmitter {
     return false
   }
 
-  interrupt(): boolean {
+  /** `source` defaults to 'system' so only an explicit user Stop is rendered
+   *  as a cancellation; selfheal and internal recovery callers keep the
+   *  existing error semantics without having to opt out. */
+  interrupt(source: InterruptSource = 'system'): boolean {
     if (!this.proc || this.proc.killed) return false
     if (!this.threadId || !this.activeTurnId) return false
+    // First cause for this turn wins (see handleStderrLine).
+    if (this.turnTerminationReason === null) this.turnTerminationReason = source
     if (this.pendingInterrupt) return true
     void this.interruptAndWaitForTerminal(this.activeTurnId, 'public').catch((err) => {
       // Common case: the turn already completed between us deciding to
@@ -864,6 +901,7 @@ export class CodexAppServerRunner extends EventEmitter {
     this.attached = false
     this.proc = null
     this.stdoutBuf = ''
+    this.stderrBuf = ''
     // Tear down the per-spawn launch overrides so the next post-shutdown
     // submit() rebuilds against a fresh sessionDir. Re-using a stale
     // overrides reference after we rmSync the dir would point codex at a
@@ -910,8 +948,10 @@ export class CodexAppServerRunner extends EventEmitter {
     // #019dde20 BLOCKER round 3): stdoutBuf is runner-scoped, so without
     // this, a fragment like '{"jsonrpc":"2.0",' left by the old proc would
     // get prepended to the new proc's first stdout chunk and corrupt the
-    // initialize response.
+    // initialize response. stderrBuf carries the same residue risk for the
+    // missing-rollout line matcher.
     this.stdoutBuf = ''
+    this.stderrBuf = ''
     // Build platform context overrides BEFORE spawn so the long-lived
     // app-server proc has model_instructions_file + mcp-memory available
     // from its very first turn. Failure here is non-fatal — fall back to
@@ -1032,13 +1072,14 @@ export class CodexAppServerRunner extends EventEmitter {
       // is misleading in the journal.
       if (this.proc !== proc) return
       this.lastActivityAt = Date.now()
-      // Codex app-server logs structured errors to stderr; surface them at
-      // warn level so the journal has them but they don't fail the turn —
-      // the JSON-RPC error response is the source of truth for failures.
-      log.warn('codex app-server stderr', {
-        sessionKey: this.opts.sessionKey,
-        line: chunk.toString('utf8').trim().slice(0, 1024),
-      })
+      this.stderrBuf += chunk.toString('utf8')
+      let nl = this.stderrBuf.indexOf('\n')
+      while (nl >= 0) {
+        const line = this.stderrBuf.slice(0, nl)
+        this.stderrBuf = this.stderrBuf.slice(nl + 1)
+        if (line.trim()) this.handleStderrLine(line)
+        nl = this.stderrBuf.indexOf('\n')
+      }
     })
     proc.on('error', (err) => {
       // Identity check: a delayed error from a discarded proc must not corrupt
@@ -1060,6 +1101,7 @@ export class CodexAppServerRunner extends EventEmitter {
       // stdoutBuf cleared so any partial-line residue doesn't poison the
       // next proc's first response (see ensureSpawned for fuller comment).
       this.stdoutBuf = ''
+      this.stderrBuf = ''
     })
     proc.on('close', (code, signal) => {
       // Identity check: see the `error` handler comment. Without this, the
@@ -1092,6 +1134,7 @@ export class CodexAppServerRunner extends EventEmitter {
       // Clear stdoutBuf so the next proc's first response isn't prepended
       // with a partial line residue from this dying proc.
       this.stdoutBuf = ''
+      this.stderrBuf = ''
       // Drop the launch overrides cache too — the dir contents are tied to
       // the dead proc, and the next ensureSpawned() will lazy-rebuild a
       // fresh dir + instructions file. Not strictly required (shutdown
@@ -1134,6 +1177,42 @@ export class CodexAppServerRunner extends EventEmitter {
       pending.rejectTerminal(err)
     }
     pending.bufferedTerminalById.clear()
+  }
+
+  /** Per-line stderr handling. The logging is unchanged; the only added
+   *  behaviour is latching the missing-rollout signal and asking the active
+   *  turn to stop, so runTurn can rebuild the thread and close the turn
+   *  exactly once. This callback never emits a result itself. */
+  private handleStderrLine(line: string): void {
+    // Codex app-server logs structured errors to stderr; surface them at
+    // warn level so the journal has them but they don't fail the turn —
+    // the JSON-RPC error response is the source of truth for failures.
+    log.warn('codex app-server stderr', {
+      sessionKey: this.opts.sessionKey,
+      line: line.trim().slice(0, 1024),
+    })
+    if (!isMissingRolloutStderrLine(line)) return
+    // First cause for this turn wins, so a user Stop already in flight keeps
+    // its own semantics. Without an active turn there is nothing to interrupt
+    // and the next turn's attach path handles recovery on its own.
+    if (this.turnTerminationReason !== null) return
+    const turnId = this.activeTurnId
+    if (!turnId) return
+    this.turnTerminationReason = 'rollout-broken'
+    log.error('codex rollout unrecordable — interrupting turn to rebuild thread', {
+      sessionKey: this.opts.sessionKey,
+      threadId: this.threadId,
+      turnId,
+    })
+    // Fire-and-forget, mirroring the public interrupt(): the resulting
+    // terminal notification settles runTurn's `completed`, and runTurn owns
+    // both the rebuild and the single closing result.
+    void this.interruptAndWaitForTerminal(turnId, 'public').catch((err) => {
+      log.warn('codex rollout self-heal interrupt failed', {
+        sessionKey: this.opts.sessionKey,
+        err: (err as Error).message,
+      })
+    })
   }
 
   private dispatchTurnCompleted(turn: TurnCompletion): void {
@@ -1922,6 +2001,34 @@ export class CodexAppServerRunner extends EventEmitter {
     this.attached = true
   }
 
+  /** Drop a thread whose rollout can no longer be recorded and start a fresh
+   *  one. The new id reaches sessionManager through the existing `session_id`
+   *  event (→ resume-map.json), so the next turn resumes against the live
+   *  thread instead of the dead one. */
+  private async rebuildThreadAfterRolloutLoss(): Promise<boolean> {
+    const staleThreadId = this.threadId
+    try {
+      this.threadId = null
+      await this._startNewThread()
+      log.warn('codex thread rebuilt after rollout loss', {
+        sessionKey: this.opts.sessionKey,
+        staleThreadId,
+        threadId: this.threadId,
+      })
+      return true
+    } catch (err) {
+      // Leave the runner unattached so the next turn retries the whole attach
+      // path rather than reusing the dead thread id.
+      this.attached = false
+      log.error('codex thread rebuild after rollout loss failed', {
+        sessionKey: this.opts.sessionKey,
+        staleThreadId,
+        err: (err as Error).message,
+      })
+      return false
+    }
+  }
+
   /** Ensure the JSON-RPC proc is initialized and attached to a thread.
    *  Shared by ordinary turns and out-of-band goal controls. */
   private async ensureThreadAttached(): Promise<void> {
@@ -1994,6 +2101,7 @@ export class CodexAppServerRunner extends EventEmitter {
     this.activePlanBlockId = null
     this.reasoningItemsWithDeltas.clear()
     this.currentTokenUsage = null
+    this.turnTerminationReason = null
 
     try {
       await this.ensureThreadAttached()
@@ -2063,12 +2171,35 @@ export class CodexAppServerRunner extends EventEmitter {
           usage: this.currentTokenUsage ?? undefined,
         })
       } else if (status === 'interrupted') {
-        this.emitResult({
-          durationMs,
-          ok: false,
-          error: 'codex turn interrupted',
-          usage: this.currentTokenUsage ?? undefined,
-        })
+        // Single closing point for every interrupt cause. handleStderrLine and
+        // interrupt() only latch the reason; emitting the result here (exactly
+        // once) is what keeps the interrupt waiter and the turn completer from
+        // both closing the turn.
+        if (this.turnTerminationReason === 'rollout-broken') {
+          // The rollout backing this thread is gone, so its history can never
+          // be persisted again — same trade-off as the thread/resume self-heal:
+          // drop the dead thread and let the next turn start clean. We do NOT
+          // replay the prompt: tool calls and their gateway side effects
+          // (cron writes, file edits) are emitted live during the turn, so a
+          // replay could run them twice.
+          const rebuilt = await this.rebuildThreadAfterRolloutLoss()
+          this.emitResult({
+            durationMs,
+            ok: false,
+            error: rebuilt
+              ? '会话历史已损坏,已重建会话,请重新发送这条消息。'
+              : '会话历史已损坏且重建失败,请重试。',
+            usage: this.currentTokenUsage ?? undefined,
+          })
+        } else {
+          this.emitResult({
+            durationMs,
+            ok: false,
+            error: 'codex turn interrupted',
+            usage: this.currentTokenUsage ?? undefined,
+            interrupted: this.turnTerminationReason === 'user' ? 'user' : undefined,
+          })
+        }
       } else {
         this.emitResult({
           durationMs,
@@ -2136,6 +2267,7 @@ export class CodexAppServerRunner extends EventEmitter {
     ok: boolean
     text?: string
     error?: string
+    interrupted?: InterruptSource
     usage?: {
       input_tokens?: number
       output_tokens?: number
@@ -2148,7 +2280,12 @@ export class CodexAppServerRunner extends EventEmitter {
       session_id: this.threadId,
       total_cost_usd: 0,
       duration_ms: opts.durationMs,
+      // Kept true for a user Stop as well: sessionManager's phantom-turn guard
+      // rejects a non-error final that carries no tokens/blocks, which would
+      // drop the closing frame for a stop with zero output. The `interrupted`
+      // tag below is what lets the UI render it neutrally.
       is_error: !opts.ok,
+      ...(opts.interrupted ? { interrupted: opts.interrupted } : {}),
       result: opts.ok ? (opts.text ?? '') : (opts.error ?? 'codex error'),
       usage: opts.usage,
       usage_status: opts.usage ? 'observed' : 'unavailable',

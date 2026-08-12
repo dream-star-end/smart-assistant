@@ -350,6 +350,50 @@ describe('ClaudeMessageParser: result', () => {
     }
   })
 
+  it("forwards interrupted='user' into the final meta so the UI can render a cancellation", () => {
+    // The runner tags a user Stop on the result frame, but the final meta is
+    // rebuilt field by field here — without an explicit pass-through the tag
+    // is silently dropped and the frontend still shows "未收到回复 … 请重试".
+    const { parser, events } = createParser()
+
+    parser.parse({
+      type: 'result',
+      is_error: true,
+      interrupted: 'user',
+      total_cost_usd: 0,
+      usage: {},
+    } as any)
+
+    const finalEvent = events.find((e) => e.kind === 'final')
+    assert.ok(finalEvent)
+    if (finalEvent?.kind === 'final') {
+      assert.equal(finalEvent.meta?.interrupted, 'user')
+      assert.equal(finalEvent.meta?.isError, true)
+    }
+  })
+
+  it('omits interrupted for ordinary and internally-interrupted turns', () => {
+    for (const extra of [{}, { interrupted: 'system' }, { interrupted: 'rollout-broken' }]) {
+      const { parser, events } = createParser()
+      parser.parse({
+        type: 'result',
+        is_error: true,
+        total_cost_usd: 0,
+        usage: {},
+        ...extra,
+      } as any)
+      const finalEvent = events.find((e) => e.kind === 'final')
+      assert.ok(finalEvent)
+      if (finalEvent?.kind === 'final') {
+        assert.equal(
+          finalEvent.meta?.interrupted,
+          undefined,
+          `only a user Stop may be tagged, got ${JSON.stringify(extra)}`,
+        )
+      }
+    }
+  })
+
   it('ignores messages after finalization', () => {
     const { parser, events } = createParser()
 
