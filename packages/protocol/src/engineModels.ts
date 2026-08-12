@@ -49,6 +49,22 @@ export const CODEX_ENGINE_MODEL_IDS = CODEX_ENGINE_MODELS.map((m) => m.id)
 
 export type CodexEngineModelId = (typeof CODEX_ENGINE_MODELS)[number]['id']
 
+/** xAI 官方 Grok CLI 的编码产品型号。 */
+export const GROK_ENGINE_MODELS = [
+  { id: 'grok-build', displayName: 'Grok Build', upstreamModel: 'grok-build' },
+] as const
+
+export const GROK_ENGINE_MODEL_IDS = GROK_ENGINE_MODELS.map((m) => m.id)
+export type GrokEngineModelId = (typeof GROK_ENGINE_MODELS)[number]['id']
+export const DEFAULT_GROK_ENGINE_MODEL: GrokEngineModelId = GROK_ENGINE_MODELS[0].id
+
+export function isGrokEngineModel(modelId: string | null | undefined): boolean {
+  return (
+    typeof modelId === 'string' &&
+    (GROK_ENGINE_MODEL_IDS as readonly string[]).includes(modelId)
+  )
+}
+
 /** codex seed agent(id='codex')的固定模型 —— entrypoint desiredCodexAgent 同值。 */
 export const DEFAULT_CODEX_ENGINE_MODEL: CodexEngineModelId = CODEX_ENGINE_MODELS[0].id
 export const DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME: string =
@@ -76,6 +92,13 @@ export function modelReasoningPolicy(modelId: string): ModelReasoningPolicy {
     return {
       supported: PLATFORM_REASONING_EFFORTS,
       codexModelDefault: codex.defaultReasoningEffort,
+    }
+  }
+
+  if (isGrokEngineModel(modelId)) {
+    return {
+      supported: ['low', 'medium', 'high'],
+      codexModelDefault: null,
     }
   }
 

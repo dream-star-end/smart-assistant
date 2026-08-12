@@ -81,6 +81,8 @@ import {
 import { createHttpHupijiaoClient, type HupijiaoClient, type HupijiaoConfig } from "./payment/hupijiao/client.js";
 import {
   AccountScheduler,
+  AccountPoolBusyError,
+  AccountPoolUnavailableError,
   ContainerStaleBindingError,
   pickCodexAccountForBindingInTx,
 } from "./account-pool/scheduler.js";
@@ -214,6 +216,7 @@ import type {
   StaticProviderId,
   StaticProviderKeys,
 } from "@openclaude/protocol";
+import { isGrokEngineModel } from "@openclaude/protocol";
 import { makePlatformContextLoader } from "./platform/platformContextLoader.js";
 import { makeDefaultVolumeContextReader } from "./platform/volumeContextReader.js";
 import {
@@ -233,14 +236,23 @@ import {
 } from "./http/codexInternalAssembly.js";
 import {
   createCodexRouteContextForModel,
+  createGrokRouteContextForModel,
   expireCodexRouteContext,
+  expireGrokRouteContext,
+  expireGrokRouteContextByLease,
   hasActiveOfficialOAuthAccountInGroup,
+  listActiveGrokRouteLeases,
   listEnabledGroupsForModel,
 } from "./account-pool/groups.js";
 import {
   CODEX_RELAY_PREFIX,
   type CodexRelayHandler,
 } from "./http/internalCodexRelay.js";
+import {
+  GROK_RELAY_PREFIX,
+  makeGrokRelayHandler,
+  type GrokRelayHandler,
+} from "./http/internalGrokRelay.js";
 import {
   SKILL_EMBED_PREFIX,
   makeSkillEmbedHandler,
@@ -1997,6 +2009,17 @@ export async function registerCommercial(
           })
         },
       });
+      const grokRelayHandler: GrokRelayHandler = makeGrokRelayHandler({
+        identityRepo,
+        renewSlot: (accountId, slotId) => {
+          if (!scheduler.renewCodexSlot(accountId, slotId)) {
+            // resolveGrokRouteContext already proved the durable row active.
+            // Rebuild a local mirror forgotten by a restart/orphan reaper.
+            scheduler.restoreCodexSlot(accountId, slotId);
+          }
+          return true;
+        },
+      });
       // /internal/v3/skill-embed — 容器内 mcp-memory 语义 skill_search 回源 master。
       // master 持 SKILL_EMBEDDING_API_KEY/DASHSCOPE_API_KEY(只在 master env,不注入容器),
       // 同款 verifyContainerIdentity 双因子鉴权;向量跨租户 PG 缓存,fail-closed 回落关键词。
@@ -2284,6 +2307,9 @@ export async function registerCommercial(
         }
         if (path === CODEX_RELAY_PREFIX || path.startsWith(`${CODEX_RELAY_PREFIX}/`)) {
           return codexRelayHandler(req, res, ctx);
+        }
+        if (path === GROK_RELAY_PREFIX || path.startsWith(`${GROK_RELAY_PREFIX}/`)) {
+          return grokRelayHandler(req, res, ctx);
         }
         if (path === SKILL_EMBED_PREFIX) {
           return skillEmbedHandler(req, res, ctx);
@@ -3704,11 +3730,77 @@ export async function registerCommercial(
   // M2 — 网页(bridge)codex turn 的 per-turn 路由决策(与 wechat 版差异:bridge
   // 需要 api_relay / official_oauth / unavailable 判别联合,由 bridge 决定占槽
   // 还是 fast-fail;wechat 只走 api_relay)。恢复源 = P1f^ 同名函数,零语义改动。
-  const createCommercialCodexRoute = async ({ containerId, userId, modelId }: {
+  const createCommercialCodexRoute = async ({ containerId, userId, modelId, sessionId }: {
     containerId: number;
     userId: bigint;
     modelId: string;
+    sessionId?: string;
   }) => {
+    if (isGrokEngineModel(modelId)) {
+      // grok_route_contexts is the durable concurrency authority. Rebuild the
+      // local scheduler mirror before every allocation so a browser disconnect,
+      // generic slot reaper, or Master restart cannot make a live route vanish
+      // from the cap check.
+      for (const lease of await listActiveGrokRouteLeases()) {
+        scheduler.restoreCodexSlot(lease.accountId, lease.slotId);
+      }
+      const groups = await listEnabledGroupsForModel({ modelId, provider: "grok" });
+      let busy: AccountPoolBusyError | null = null;
+      for (const group of groups) {
+        let picked;
+        try {
+          picked = await scheduler.pick({
+            mode: "agent",
+            provider: "grok",
+            groupId: group.id,
+            sessionId: sessionId ?? `container:${containerId}`,
+          });
+        } catch (err) {
+          if (err instanceof AccountPoolBusyError) { busy = err; continue; }
+          if (err instanceof AccountPoolUnavailableError) continue;
+          throw err;
+        }
+        picked.token.fill(0);
+        picked.refresh?.fill(0);
+        let route;
+        try {
+          route = await tx((client) => createGrokRouteContextForModel({
+            containerId,
+            userId,
+            modelId,
+            accountId: picked.account_id,
+            slotId: picked.slotId,
+            groupId: group.id,
+            runner: client,
+            maxConcurrent: scheduler.maxConcurrent,
+          }));
+        } catch (err) {
+          scheduler.releaseCodexSlot(picked.account_id, picked.slotId);
+          throw err;
+        }
+        if (!route) {
+          scheduler.releaseCodexSlot(picked.account_id, picked.slotId);
+          continue;
+        }
+        return {
+          kind: "api_relay" as const,
+          engine: "grok" as const,
+          token: route.token,
+          baseUrl: `http://127.0.0.1:${V3_CONTAINER_PORT}/internal/v5/grok-relay/route/${route.token}/v1`,
+          modelProvider: "grok",
+          providerName: "xAI Grok subscription",
+          wireApi: "chat" as const,
+          preferredAuthMethod: "apikey" as const,
+          disableResponseStorage: true,
+          groupId: route.group.id.toString(),
+          credentialId: route.accountId.toString(),
+          accountId: route.accountId.toString(),
+          slotId: picked.slotId,
+        };
+      }
+      if (busy) throw busy;
+      return { kind: "unavailable" as const, reason: "no usable Grok subscription account" };
+    }
     const groups = await listEnabledGroupsForModel({ modelId, provider: "codex" });
     if (groups.length === 0) return null;
     for (const group of groups) {
@@ -3722,6 +3814,7 @@ export async function registerCommercial(
         if (!route) continue;
         return {
           kind: "api_relay" as const,
+          engine: "codex" as const,
           token: route.token,
           baseUrl: `http://127.0.0.1:${V3_CONTAINER_PORT}/internal/v3/codex-relay/route/${route.token}`,
           modelProvider: route.credential.model_provider,
@@ -4829,6 +4922,9 @@ export async function registerCommercial(
         release(account_id: bigint, slotId: string): void {
           try { scheduler.releaseCodexSlot(account_id, slotId); } catch { /* */ }
         },
+        renew(account_id: bigint, slotId: string): boolean {
+          try { return scheduler.renewCodexSlot(account_id, slotId); } catch { return false; }
+        },
       }
     : undefined;
 
@@ -4993,7 +5089,14 @@ export async function registerCommercial(
     codexBinding,
     createCodexRoute: createCommercialCodexRoute,
     expireCodexRoute: async (token) => {
-      await expireCodexRouteContext(token);
+      await Promise.all([expireCodexRouteContext(token), expireGrokRouteContext(token)]);
+    },
+    releaseGrokRouteLease: async (accountId, slotId) => {
+      // Expire durable authority before freeing the local mirror. If PG is
+      // unavailable the slot remains occupied and the immutable terminal frame
+      // can retry without admitting an over-cap turn.
+      await expireGrokRouteContextByLease(accountId, slotId);
+      scheduler.releaseCodexSlot(accountId, slotId);
     },
     // PR2 v1.0.66 → M2 — codex 真扣费三件套(pgPool / preCheckRedis / pricing 进程级
     //   singleton):bridge 内 preCheckWithCost / startInflightJournal,settle 收口

@@ -95,7 +95,7 @@ export type JsonValue =
   | readonly JsonValue[]
   | { readonly [key: string]: JsonValue }
 
-export type ModelAuthorityEngine = 'ccb' | 'codex'
+export type ModelAuthorityEngine = 'ccb' | 'codex' | 'grok'
 
 /**
  * 该模型的**完整规范化执行语义**(方案 §2 R2-B3):容器该 turn 的 engine/capability/

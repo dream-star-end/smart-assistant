@@ -388,7 +388,7 @@ export function resolveModelHistoryContextWindow(
     Number.isSafeInteger(declaredContextWindow) &&
     declaredContextWindow > 0
   ) return declaredContextWindow
-  return declaredContextWindow === null && engine === 'codex'
+  return declaredContextWindow === null && (engine === 'codex' || engine === 'grok')
     ? CODEX_NATIVE_HISTORY_CONTEXT_WINDOW_TOKENS
     : null
 }
@@ -418,7 +418,7 @@ export function availableModelHistoryTokens(
  * first compact request can itself exceed the window.
  */
 export function modelHistoryReservedTokens(engine?: string): number {
-  return engine === 'ccb' || engine === 'codex' ? 33_256 : 256
+  return engine === 'ccb' || engine === 'codex' || engine === 'grok' ? 33_256 : 256
 }
 
 /** Return a Unicode-safe exact suffix that fits the approximate token budget. */

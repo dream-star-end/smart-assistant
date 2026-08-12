@@ -22,9 +22,10 @@ import {
   resolveEngine,
   type EngineCreateOpts,
 } from "../engine/registry.js";
-// side-effect:注册 'ccb' / 'codex' factory(与 sessionManager 的注册路径一致)。
+// side-effect:注册 'ccb' / 'codex' / 'grok' factory(与 sessionManager 的注册路径一致)。
 import "../engine/ccbAdapter.js";
 import "../engine/codexAdapter.js";
+import "../engine/grokAdapter.js";
 import { SessionManager } from "../sessionManager.js";
 import type { OpenClaudeConfig, AgentDef } from "@openclaude/storage";
 
@@ -62,6 +63,10 @@ describe("resolveEngine", () => {
       assert.equal(resolveEngine(model, { id: "main" }), "codex");
     }
     assert.equal(resolveEngine("gpt-5.5", { id: "main" }), "ccb");
+  });
+
+  test("Grok Build → 'grok'(任意 agent,由模型权威决定)", () => {
+    assert.equal(resolveEngine("grok-build", { id: "main" }), "grok");
   });
 
   test("codex-native provider 显式 pin → 'codex'(runnerKind 缺省/app-server)", () => {
@@ -116,6 +121,15 @@ describe("createEngine fail-closed", () => {
     assert.equal(adapter.capabilities.needsServerRequestId, true);
   });
 
+  test("'grok' 已注册且使用 engine-reported 计费与原生 session 续传", () => {
+    assert.ok(registeredEngines().includes("grok"));
+    const adapter = createEngine("grok", minimalCreateOpts());
+    assert.equal(adapter.engineId, "grok");
+    assert.equal(adapter.capabilities.billingMode, "engine-reported");
+    assert.equal(adapter.capabilities.resumeKind, "grok-session");
+    assert.equal(adapter.capabilities.needsServerRequestId, true);
+  });
+
   test("未注册 engine → 抛错(fail-closed 语义,假 engine id 锁死)", () => {
     assert.throws(() => createEngine("no-such-engine", minimalCreateOpts()), /fail-closed/);
   });
@@ -146,6 +160,20 @@ describe("getOrCreate engine 路由(M1a)", () => {
     assert.equal(session.runner.engineId, "codex");
     assert.equal(session.providerTag, "codex");
     assert.equal(session.model, "gpt-5.6-terra");
+  });
+
+  test("普通 agent + inbound model grok-build → 'grok' adapter session", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    const session = await sm.getOrCreate({
+      sessionKey: "agent:main:webchat:dm:gate-peer-grok",
+      agent: { id: "main", model: "glm-5.2" } as AgentDef,
+      channel: "webchat",
+      peerId: "gate-peer-grok",
+      model: "grok-build",
+    });
+    assert.equal(session.runner.engineId, "grok");
+    assert.equal(session.providerTag, "grok");
+    assert.equal(session.model, "grok-build");
   });
 
   test("codex-native + runnerKind 'exec' → getOrCreate 仍 fail-closed 抛错", async () => {

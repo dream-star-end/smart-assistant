@@ -16,6 +16,7 @@
     "@openclaude/protocol": "*",
     "@openclaude/storage": "*",
     "@tencent-connect/qqbot-nodejs": "^1.0.4",
+    "@xai-official/grok": "1.0.3",
     "argon2": "^0.44.0",
     "dockerode": "^4.0.10",
     "imapflow": "^1.0.191",

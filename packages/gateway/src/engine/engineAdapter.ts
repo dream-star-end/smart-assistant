@@ -36,7 +36,7 @@ export interface EngineCapabilities {
    *  'engine-reported' = runner 上报 billing 帧 → master bridge settle(codex)。 */
   billingMode: 'proxy' | 'engine-reported'
   supportsEffort: boolean
-  resumeKind: 'ccb-session' | 'codex-thread'
+  resumeKind: 'ccb-session' | 'codex-thread' | 'grok-session'
   needsServerRequestId: boolean
 }
 
@@ -155,7 +155,7 @@ export interface EngineTurnRun {
  * M0 保持与 SubprocessRunner 同名同语义,后续底座各自实现或声明不支持。
  */
 export interface EngineAdapter extends EventEmitter {
-  readonly engineId: string // 'ccb' | 'codex'
+  readonly engineId: string // 'ccb' | 'codex' | 'grok'
   readonly capabilities: EngineCapabilities
 
   // ── lifecycle ──

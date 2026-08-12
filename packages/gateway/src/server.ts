@@ -51,10 +51,12 @@ import {
   parseTraceIdCandidate,
   STATIC_KEY_INBOUND_MODEL_IDS,
   CODEX_ENGINE_MODEL_IDS,
+  GROK_ENGINE_MODEL_IDS,
   PLATFORM_REASONING_EFFORTS,
   MAX_ATTACHMENTS_PER_MESSAGE,
   AUTOMATIC_TURN_RETRY_MAX,
   isCodexEngineModel,
+  isGrokEngineModel,
   isClientMessageId,
   isPersistedClientMessageId,
   formatMessageReplyPrompt,
@@ -275,6 +277,11 @@ import {
   V3_CODEX_RELAY_PREFIX,
 } from './v3CodexRelay.js'
 import {
+  handleV5GrokRelayLocal,
+  readV5GrokRelayConfig,
+  V5_GROK_RELAY_PREFIX,
+} from './v5GrokRelay.js'
+import {
   handleV3MarketplaceRelayLocal,
   readV3MarketplaceRelayConfig,
   V3_MARKETPLACE_LOCAL_RELAY_PREFIX,
@@ -428,6 +435,7 @@ function teamMemberCapabilityHint(agent: AgentDef): string {
  */
 export const ALLOWED_INBOUND_MODELS = new Set<string>([
   ...CODEX_ENGINE_MODEL_IDS,
+  ...GROK_ENGINE_MODEL_IDS,
   ...STATIC_KEY_INBOUND_MODEL_IDS,
 ])
 
@@ -517,12 +525,12 @@ export function resolveSyntheticTurnModel(
   // 硬 pin 的 codex-native:model 替换无效(见 registry.resolveEngine),保持 fail-closed。
   if (agent.provider === 'codex-native') return undefined
   const effective = resolveExecutionModel(agent.model, defaultModel)
-  if (!isCodexEngineModel(effective)) return undefined
+  if (!isCodexEngineModel(effective) && !isGrokEngineModel(effective)) return undefined
   const raw = process.env.OPENCLAUDE_SYNTHETIC_TURN_MODEL?.trim()
   // env 兜底自身必须**非 codex 且在入站白名单内**,否则忽略回默认 —— 防"把 bug 换个门再引入"
   // (例如误配成 gpt-5.5 又绕回 codex,或配一个会被 resolveExecutionModel 收敛掉的下线模型)。
   const candidate =
-    raw && ALLOWED_INBOUND_MODELS.has(raw) && !isCodexEngineModel(raw)
+    raw && ALLOWED_INBOUND_MODELS.has(raw) && !isCodexEngineModel(raw) && !isGrokEngineModel(raw)
       ? raw
       : SYNTHETIC_TURN_NON_CODEX_MODEL_DEFAULT
   // ── routable 自检(MAJOR-1)──────────────────────────────────────────────
@@ -572,7 +580,7 @@ export interface LocalExecutionDecision {
   /** catalog 归一后的 canonical model id(alias 已解析)。 */
   readonly canonicalModel: string
   /** 取自投影的 engine(不查 baked MODEL_ENGINE_MAP)。 */
-  readonly engine: 'ccb' | 'codex'
+  readonly engine: 'ccb' | 'codex' | 'grok'
   readonly supportsVision: boolean
   /** 非空 = 发生了 codex → 非 codex 降级('synthetic' kind);原模型供透明披露(MAJOR-2)。 */
   readonly downgradedFrom?: string
@@ -622,7 +630,7 @@ export function decideLocalExecution(args: {
     const descriptor = view.resolve(canonicalModel)
     const engine = descriptor?.engine
     if (engine === undefined || descriptor == null) continue
-    if (engine !== 'codex') return { canonicalModel, engine, supportsVision: descriptor.supportsVision }
+    if (engine === 'ccb') return { canonicalModel, engine, supportsVision: descriptor.supportsVision }
 
     // codex 意图(engine 取自投影,不看 baked)。
     if (kind === 'prewarm' || kind === 'auto_dream') {
@@ -631,8 +639,8 @@ export function decideLocalExecution(args: {
     if (kind === 'turn') {
       throw new LocalExecutionRejected(
         'DELEGATE_CODEX_UNSUPPORTED',
-        `model '${canonicalModel}' runs on the codex engine, which cannot run on a local ` +
-          `(non-bridge) turn: codex billing needs a master-minted request id.`,
+        `model '${canonicalModel}' runs on the ${engine} engine, which cannot run on a local ` +
+          `(non-bridge) turn: engine-reported billing needs a master-minted request id.`,
       )
     }
     return downgradeSyntheticCodex(view, canonicalModel, args.defaultModel, env)
@@ -708,7 +716,7 @@ export function localExecutionOverride(decision: LocalExecutionDecision | undefi
   model?: string
   executionAuthority?: {
     canonicalModel: string
-    engine: 'ccb' | 'codex'
+    engine: 'ccb' | 'codex' | 'grok'
     source: 'local_catalog'
   }
 } {
@@ -872,7 +880,7 @@ export function _buildSafeCodexRouteOverride(args: {
    *  base_url 指回本进程的 /internal/v3/codex-relay handler。 */
   officialRelayPort: number
   /** master 签名的执行权威(有则 engine 判定只认它,见 registry.resolveEngine)。 */
-  authority?: { canonicalModel: string; engine: 'ccb' | 'codex' }
+  authority?: { canonicalModel: string; engine: 'ccb' | 'codex' | 'grok' }
 }): CodexProviderConfigOverride | null {
   if (!args.rawRoute || typeof args.rawRoute !== 'object' || Array.isArray(args.rawRoute)) {
     return null
@@ -947,6 +955,44 @@ export function _buildSafeCodexRouteOverride(args: {
     disableResponseStorage:
       typeof r.disableResponseStorage === 'boolean' ? r.disableResponseStorage : null,
   }
+}
+
+/** Validate the master-owned opaque route consumed by the Grok adapter. */
+export function _buildSafeGrokRouteOverride(args: {
+  agent: { id: string; provider?: string; runnerKind?: string }
+  model?: string
+  rawRoute: unknown
+  officialRelayPort: number
+  authority?: { canonicalModel: string; engine: 'ccb' | 'codex' | 'grok' }
+}): { baseUrl: string; routeToken: string } | null {
+  if (!args.rawRoute || typeof args.rawRoute !== 'object' || Array.isArray(args.rawRoute)) return null
+  let engineId: string
+  try {
+    engineId = resolveEngine(args.model, args.agent as never, args.authority)
+  } catch {
+    return null
+  }
+  if (engineId !== 'grok') return null
+  const route = args.rawRoute as Record<string, unknown>
+  if (Object.keys(route).sort().join(',') !== 'baseUrl,routeToken') return null
+  if (typeof route.routeToken !== 'string' || !/^[0-9a-f]{64}$/.test(route.routeToken)) return null
+  if (typeof route.baseUrl !== 'string' || route.baseUrl.length > 512) return null
+  if (!Number.isInteger(args.officialRelayPort) || args.officialRelayPort <= 0 || args.officialRelayPort > 65535) return null
+  try {
+    const parsed = new URL(route.baseUrl)
+    const expectedPath = `${V5_GROK_RELAY_PREFIX}/route/${route.routeToken}/v1`
+    if (
+      parsed.protocol !== 'http:' ||
+      parsed.hostname !== '127.0.0.1' ||
+      Number(parsed.port || '80') !== args.officialRelayPort ||
+      parsed.pathname !== expectedPath ||
+      parsed.search ||
+      parsed.hash
+    ) return null
+  } catch {
+    return null
+  }
+  return { baseUrl: route.baseUrl, routeToken: route.routeToken }
 }
 
 // ─── handleUpload TOCTOU hardening test seam (v3 commercial v1.0.155) ───────
@@ -3089,6 +3135,23 @@ export class Gateway {
         this.log.error('v3 codex local relay crashed', undefined, err)
         if (!res.headersSent) {
           try { this.sendJson(res, 500, { error: { code: 'INTERNAL', message: 'codex relay crashed' } }) } catch {}
+        } else {
+          try { res.end() } catch {}
+        }
+      })
+      return
+    }
+
+    if (url.pathname === V5_GROK_RELAY_PREFIX || url.pathname.startsWith(`${V5_GROK_RELAY_PREFIX}/`)) {
+      const relayCfg = readV5GrokRelayConfig(process.env)
+      if (!relayCfg) {
+        this.sendJson(res, 404, { error: { code: 'GROK_RELAY_NOT_CONFIGURED', message: 'grok relay not configured' } })
+        return
+      }
+      handleV5GrokRelayLocal(req, res, relayCfg).catch((err) => {
+        this.log.error('v5 grok local relay crashed', undefined, err)
+        if (!res.headersSent) {
+          try { this.sendJson(res, 500, { error: { code: 'INTERNAL', message: 'grok relay crashed' } }) } catch {}
         } else {
           try { res.end() } catch {}
         }
@@ -13427,6 +13490,20 @@ export class Gateway {
           }
         : {}),
     })
+    const safeGrokRoute = _buildSafeGrokRouteOverride({
+      agent,
+      model: safeModelForRouting,
+      rawRoute: (frame as any).__oc_grok_route,
+      officialRelayPort: this.deps.config.gateway.port,
+      ...(turnAuthority !== undefined
+        ? {
+            authority: {
+              canonicalModel: turnAuthority.canonicalModel,
+              engine: turnAuthority.engine,
+            },
+          }
+        : {}),
+    })
 
     const baseToolsets = agent.toolsets ?? this.deps.config.defaults.toolsets
     let effectiveToolsets = mergeOnDemandToolsets(
@@ -14734,6 +14811,7 @@ export class Gateway {
     const leaderSubmitOpts = {
       historicalMessages: masterHistoricalMessages,
       codexRoute: safeCodexRoute,
+      grokRoute: safeGrokRoute,
       ...(automaticRetryState ? { automaticRetryState } : {}),
       // DispatchTurnContext(uid/…)→ sessionManager 逻辑键形状(userId/…)。
       ...(turnDispatchContext

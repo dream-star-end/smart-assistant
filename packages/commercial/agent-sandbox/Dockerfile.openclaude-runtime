@@ -497,6 +497,23 @@ RUN if [ "$OC_INCLUDE_CURSOR" = "1" ]; then set -eux; \
 COPY --chown=root:root ./platform-runtime/etc-codex/managed_config.toml /etc/codex/managed_config.toml
 
 # ------------------------------------------------------------
+# Grok Build CLI — official xAI subscription runner
+# ------------------------------------------------------------
+# V5 Grok releases opt in explicitly. The npm trampoline normally expands the
+# native binary under $GROK_HOME; copy that verified binary to /usr/local/bin so
+# per-user persistent homes do not each receive a ~100 MB duplicate.
+ARG OC_INCLUDE_GROK=0
+RUN if [ "$OC_INCLUDE_GROK" = "1" ]; then set -eux; \
+      npm install -g @xai-official/grok@1.0.3 --no-audit --no-fund; \
+      grok --version | grep -q '^grok 1\.0\.3 '; \
+      cp -L /root/.grok/bin/grok /usr/local/bin/grok-native; \
+      chmod 0755 /usr/local/bin/grok-native; \
+      /usr/local/bin/grok-native --version | grep -q '^grok 1\.0\.3 '; \
+      npm cache clean --force; \
+      rm -rf /root/.npm /root/.grok; \
+    else echo "[runtime] skip Grok CLI install (OC_INCLUDE_GROK=0)"; fi
+
+# ------------------------------------------------------------
 # Playwright CLI + Chromium for Agent browser automation
 # ------------------------------------------------------------
 # Agent turns use @playwright/cli through the browser Skill + oc-browser launcher;

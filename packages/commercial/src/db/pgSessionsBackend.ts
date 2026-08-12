@@ -3842,7 +3842,7 @@ async function computeFiniteEngineContextMessages(
         0,
         contextWindow - modelHistoryReservedTokens(options.engine) -
           estimateModelHistoryUtf8Bytes(options.currentUserText ?? ""),
-      ) / (options.engine === "ccb" || options.engine === "codex" ? 4 : 1),
+      ) / (options.engine === "ccb" || options.engine === "codex" || options.engine === "grok" ? 4 : 1),
     ),
     stopped: false,
     newestFirst: [],
