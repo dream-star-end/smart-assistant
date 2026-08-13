@@ -26,7 +26,8 @@ EOF
 cursor_bin=/opt/cursor-agent/versions/2026.08.11-e8db854/cursor-agent
 auth_file=/run/oc/cursor-auth/api-key
 [ -x "$cursor_bin" ] || die "pinned Cursor Agent CLI is unavailable"
-[ -e "$auth_file" ] || die "Cursor CLI is not enabled for this account"
+/usr/bin/sudo -n /usr/bin/test -f "$auth_file" 2>/dev/null \
+  || die "Cursor CLI is not enabled for this account"
 
 model=""
 mode=""
