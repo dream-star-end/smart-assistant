@@ -6,7 +6,7 @@
 > 分支：`feat/v5-workspace-git-stat`  
 > 配套审计：`docs/V5_WEB_CODEX_DESKTOP_ALIGNMENT.md` §2 / §4.2 PR8 / §5「git/文件树安全」  
 > 环境限制：本机没有 `oc-worktree` 注册表，按独立开发环境例外使用 `git worktree add`。  
-> Codex 威胁模型审 #1：**FAIL**（5 Finding）。#2：**FAIL**（父目录 symlink 绕过 `.git` segment）。#3 待审本版。
+> Codex 威胁模型审 #1：**FAIL**（5 Finding）。#2：**FAIL**（父目录 symlink 绕过 `.git` segment）。#3：**PASS**（`/tmp/codex-workspace-inspect-threat-r3.txt`）。允许进入实现方案评审。
 
 ---
 
