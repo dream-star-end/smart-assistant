@@ -5106,6 +5106,7 @@ export async function registerCommercial(
     pgPool: getPool(),
     preCheckRedis,
     pricing,
+    selfHostId: selfHostUuid ?? null,
     // Plan §4.2 改动 4a — codex billing commit 路径同样把 debit 持久化进
     // master's `client_sessions.messages[i].usage.costCredits`。与 anthropicProxy
     // 走同一个 storage helper,签名一致。

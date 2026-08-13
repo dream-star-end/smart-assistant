@@ -22,6 +22,7 @@ import { readFile } from "node:fs/promises";
 import * as http from "node:http";
 import * as net from "node:net";
 import { WebSocket, WebSocketServer } from "ws";
+import type { Pool } from "pg";
 import { signAccess } from "../auth/jwt.js";
 import type { Logger } from "../logging/logger.js";
 import {
@@ -32,6 +33,7 @@ import {
   _encode4503Reason,
   _rawDataLen,
   _sanitizeMasterHistoricalMessagesForFrame,
+  isCursorContainerOnSelfHost,
   type ResolveContainerEndpoint,
   type UserChatBridgeDeps,
   type UserChatBridgeHandler,
@@ -2183,7 +2185,7 @@ describe("tryAutoRebindFlush regression tripwire", () => {
 });
 
 describe("Cursor external authority regression tripwire", () => {
-  test("Cursor uses the existing non-CCB authority classification and owner/local audit gates", async () => {
+  test("Cursor uses the existing non-CCB authority classification and owner/audit gates", async () => {
     const source = await readFile(new URL("../ws/userChatBridge.ts", import.meta.url), "utf8");
     const cursorBranch = source.slice(
       source.indexOf("if (isCursorInboundFrame && containerId !== undefined)"),
@@ -2191,8 +2193,45 @@ describe("Cursor external authority regression tripwire", () => {
     );
     assert.match(cursorBranch, /classifiedCodex: true/);
     assert.match(cursorBranch, /OC_V5_CURSOR_OWNER_UID/);
-    assert.match(cursorBranch, /host_uuid IS NULL/);
+    assert.match(cursorBranch, /isCursorContainerOnSelfHost/);
     assert.match(cursorBranch, /INSERT INTO cursor_external_usage_audit/);
+  });
+
+  test("Cursor accepts only an active row on the trusted self host", async () => {
+    const selfHostId = "bc99292f-7337-4552-aa8b-756f68f3b449";
+    let storedHostId = selfHostId;
+    const calls: Array<{ sql: string; params: unknown[] }> = [];
+    const pgPool = {
+      query: async (sql: string, params: unknown[]) => {
+        calls.push({ sql, params });
+        return {
+          rowCount: storedHostId === params[2] ? 1 : 0,
+          rows: storedHostId === params[2] ? [{ ok: 1 }] : [],
+        };
+      },
+    } as unknown as Pool;
+
+    assert.equal(await isCursorContainerOnSelfHost(pgPool, 6495, 4n, selfHostId), true);
+    assert.deepEqual(calls[0]!.params, [6495, 4n, selfHostId]);
+    assert.match(calls[0]!.sql, /state='active' AND host_uuid=\$3::uuid/);
+
+    storedHostId = "b230af20-1cd9-4bd5-bc92-5e7f67065bea";
+    assert.equal(await isCursorContainerOnSelfHost(pgPool, 6495, 4n, selfHostId), false);
+  });
+
+  test("Cursor fails closed without a trusted self host and does not query", async () => {
+    let queryCount = 0;
+    const pgPool = {
+      query: async () => {
+        queryCount += 1;
+        return { rowCount: 1, rows: [{ ok: 1 }] };
+      },
+    } as unknown as Pool;
+
+    assert.equal(await isCursorContainerOnSelfHost(pgPool, 6495, 4n, null), false);
+    assert.equal(await isCursorContainerOnSelfHost(pgPool, 6495, 4n, undefined), false);
+    assert.equal(await isCursorContainerOnSelfHost(pgPool, 6495, 4n, "  "), false);
+    assert.equal(queryCount, 0);
   });
 });
 
