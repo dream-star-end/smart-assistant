@@ -69,6 +69,7 @@ export function Composer({
   prefill,
   repoSelection,
   onOpenRepo,
+  showRepoPill = true,
   goal,
   onSetGoal,
   onGoalAction,
@@ -93,6 +94,8 @@ export function Composer({
   repoSelection?: RepoSelection | null;
   /** 打开 GitHub 仓库绑定 modal（入口在底部左侧）。 */
   onOpenRepo?: () => void;
+  /** xl 右栏已展示绑定卡时卸载中栏 pill（单实例）。未绑定 CTA 仍走底部入口。 */
+  showRepoPill?: boolean;
   /** 当前会话目标快照（驱动「+」菜单里目标项的状态点；省略 onSetGoal/onGoalAction 则不渲染目标入口，如 demo）。 */
   goal?: GoalStateSnapshot | null;
   /** 设定/更新会话目标（入口从会话头部迁至「+」菜单）。 */
@@ -522,9 +525,9 @@ export function Composer({
       </div>
       {/* 底部工具条:左=GitHub 仓库绑定入口;右=语音状态(仅录音/转写时显示)。
           原「内容由 AI 生成」免责声明已移除。 */}
-      {(onOpenRepo || voiceStatus) && (
+      {( (onOpenRepo && showRepoPill) || voiceStatus) && (
         <div className="flex min-h-[30px] items-center gap-2 px-1.5 py-1.5 text-xs">
-          {onOpenRepo && <RepoPill selection={repoSelection ?? null} onClick={onOpenRepo} />}
+          {onOpenRepo && showRepoPill && <RepoPill selection={repoSelection ?? null} onClick={onOpenRepo} />}
           {voiceStatus && <span className="ml-auto">{voiceStatus}</span>}
         </div>
       )}

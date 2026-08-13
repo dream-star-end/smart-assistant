@@ -43,6 +43,7 @@
     { "id": "T39", "proves": "刷新恢复同一会话的多代 live journal 时，旧容器高 frameSeq 不吞掉新容器从 1 重启的实时思考与正文，旧持久过程仍保留" },
     { "id": "T40", "proves": "390px 真 Chromium 失败轮只显示一个重试出口，不重复发送失败、不泄露供应商路由名、无请求 ID 时不显示详情，且紧凑 warning 卡不横溢" },
     { "id": "T41", "proves": "PR1 Codex 密度 token：Composer 非聚焦/聚焦边框、ToolCard rounded-md+px-3 py-2、Sidebar 活跃竖条与顶栏入口在 1440/390 明暗主题均成立，且不删除教程/组织/管理后台" },
-    { "id": "T42", "proves": "PR2 设置壳：默认关闭不盖住 harness；390 单列不横溢且能切到账户/用量/偏好/反馈/关于；1440 竖导航 168px；现有教程深链 section 仍是 preferences/account/feedback" }
+    { "id": "T42", "proves": "PR2 设置壳：默认关闭不盖住 harness；390 单列不横溢且能切到账户/用量/偏好/反馈/关于；1440 竖导航 168px；现有教程深链 section 仍是 preferences/account/feedback" },
+    { "id": "T43", "proves": "PR3 右栏：390 无 aside、RepoPill+Tracker 在中栏且不横溢；1440 有数据时 rail≈280px 且中栏对应块 count=0；隐藏后中栏接回并出现显示上下文；无数据 DOM 不占宽；未绑定 CTA 仍留中栏" }
   ]
 }
