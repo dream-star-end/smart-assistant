@@ -1,5 +1,5 @@
 import { Sparkles } from "lucide-react";
-import { useCallback, useEffect, useState, type KeyboardEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from "react";
 import type { Theme } from "../hooks/useTheme";
 import { useMdViewport } from "../hooks/useMdViewport";
 import { api, apiErrorMessage } from "../lib/api";
@@ -249,23 +249,20 @@ function VerticalNav({
   onChange: (section: SettingsSection) => void;
 }) {
   const ids = SECTIONS.map((s) => s.id);
+  const refs = useRef<(HTMLButtonElement | null)[]>([]);
 
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     const index = ids.indexOf(value);
     if (index < 0) return;
-    if (event.key === "ArrowDown") {
-      event.preventDefault();
-      onChange(ids[(index + 1) % ids.length]!);
-    } else if (event.key === "ArrowUp") {
-      event.preventDefault();
-      onChange(ids[(index - 1 + ids.length) % ids.length]!);
-    } else if (event.key === "Home") {
-      event.preventDefault();
-      onChange(ids[0]!);
-    } else if (event.key === "End") {
-      event.preventDefault();
-      onChange(ids[ids.length - 1]!);
-    }
+    let next = -1;
+    if (event.key === "ArrowDown") next = (index + 1) % ids.length;
+    else if (event.key === "ArrowUp") next = (index - 1 + ids.length) % ids.length;
+    else if (event.key === "Home") next = 0;
+    else if (event.key === "End") next = ids.length - 1;
+    if (next < 0) return;
+    event.preventDefault();
+    onChange(ids[next]!);
+    refs.current[next]?.focus();
   };
 
   return (
@@ -283,12 +280,17 @@ function VerticalNav({
           </div>
           {group.items.map((it) => {
             const selected = it.id === value;
+            const index = ids.indexOf(it.id);
             return (
               <button
                 key={it.id}
+                ref={(el) => {
+                  refs.current[index] = el;
+                }}
                 type="button"
                 role="tab"
                 id={`settings-nav-${it.id}`}
+                aria-controls={selected ? `settings-panel-${it.id}` : undefined}
                 aria-selected={selected}
                 tabIndex={selected ? 0 : -1}
                 data-product-feature={it.featureId}

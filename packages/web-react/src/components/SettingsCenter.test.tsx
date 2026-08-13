@@ -105,12 +105,28 @@ test('md 以上用 168px 竖导航，窄屏不并排', () => {
   const desktopNav = screen.getByRole('tablist', { name: '设置分区' })
   expect(desktopNav).toHaveAttribute('aria-orientation', 'vertical')
   expect(desktopNav).toHaveClass('w-[168px]')
+  expect(screen.getByRole('tab', { name: '账户与计费' })).toHaveAttribute(
+    'aria-controls',
+    'settings-panel-account',
+  )
 
   stubMd(false)
   rerender(<SettingsCenter {...base} />)
   const mobileNav = screen.getByRole('tablist', { name: '设置分区' })
   expect(mobileNav).not.toHaveAttribute('aria-orientation', 'vertical')
   expect(mobileNav.closest('.flex-col, .flex') ?? mobileNav.parentElement?.parentElement).toBeTruthy()
+})
+
+test('桌面竖导航方向键移动焦点到新 tab', () => {
+  stubMd(true)
+  render(<SettingsCenter {...base} />)
+  const current = screen.getByRole('tab', { name: '账户与计费' })
+  current.focus()
+  fireEvent.keyDown(screen.getByRole('tablist', { name: '设置分区' }), { key: 'ArrowDown' })
+  expect(screen.getByRole('tab', { name: '用量' })).toHaveAttribute('aria-selected', 'true')
+  expect(screen.getByRole('tab', { name: '用量' })).toHaveFocus()
+  expect(screen.getByRole('tab', { name: '用量' })).toHaveAttribute('aria-controls', 'settings-panel-usage')
+  expect(screen.getByRole('tab', { name: '账户与计费' })).not.toHaveAttribute('aria-controls')
 })
 
 test('GitHub / 插件深链先关设置再打开目标', () => {

@@ -1666,7 +1666,6 @@ function SettingsShellProbe() {
       </button>
       <SettingsCenter
         open={open}
-        demo
         auth={createMemoryAuthSession(() => {}, "settings-shell-token")}
         user={DENSITY_USER}
         theme="light"
