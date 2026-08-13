@@ -1295,6 +1295,25 @@
           "assertion": "T30 视频任务中心持久排队、实时进度与跨 worker 取消终态"
         }
       ]
+    },
+    {
+      "id": "INC-20260813-GROK-AUTHORITY-REJECTED",
+      "occurredAt": "2026-08-13",
+      "severity": "P1",
+      "symptom": "管理员选择 Grok 后，容器 runtime 将签名 authority 中的 engine=grok 当作未知引擎拒绝，turn 未进入 Grok relay 且页面没有回复。",
+      "rootFixCommit": "78eaad0b",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/modelAuthorityConsume.test.ts",
+          "assertion": "Grok authority:engine=grok 验签消费后保持 Grok 执行描述符"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/v5-smoke-turn-canary.mjs",
+          "assertion": "turn-canary: TURN_OK model=${MODEL} exact_text=2 final=${result.sawFinal} cost_charged=${result.sawCost}"
+        }
+      ]
     }
   ]
 }
