@@ -402,7 +402,7 @@ slot_baseline_dir() { # <A|B>
 
 run_baseline_guard_remote() { # <check-release|harden-release|check-dir|harden-dir> <absolute-path>
   local guard_mode="$1" target="$2" qmode qtarget
-  [[ "$guard_mode" =~ ^(check-release|harden-release|check-dir|harden-dir)$ ]] \
+  [[ "$guard_mode" =~ ^(check-release|harden-release|check-release-legacy-cursor|harden-release-legacy-cursor|check-dir|harden-dir)$ ]] \
     || { echo "✗ baseline guard mode 非法:$guard_mode" >&2; return 2; }
   [[ "$target" =~ ^/[A-Za-z0-9._/-]+$ ]] \
     || { echo "✗ baseline guard path 非法:$target" >&2; return 2; }
@@ -423,6 +423,16 @@ assert_release_baseline_security() { # <absolute-release-root>
 harden_release_baseline() { # <absolute-release-root>
   run_baseline_guard_remote harden-release "$1" \
     || { echo "✗ release CCB baseline 权限收紧/复验失败:$1" >&2; return 1; }
+}
+
+harden_legacy_release_baseline() { # <absolute-release-root>
+  run_baseline_guard_remote harden-release-legacy-cursor "$1" \
+    || { echo "✗ legacy release CCB baseline 权限收紧/复验失败:$1" >&2; return 1; }
+}
+
+assert_legacy_release_baseline_security() { # <absolute-release-root>
+  run_baseline_guard_remote check-release-legacy-cursor "$1" \
+    || { echo "✗ legacy serving release 的 CCB baseline 不完整/不安全:$1" >&2; return 1; }
 }
 
 install_v5_slot_units() {
@@ -640,9 +650,9 @@ prepare_live_baseline_safety() {
   fi
   echo "── V5 CCB baseline 一次性安全迁移(current=$live_release)──"
   install_v5_slot_units || return 1
-  harden_release_baseline "$live_release" || return 1
+  harden_legacy_release_baseline "$live_release" || return 1
   strip_shared_baseline_env_keys || return 1
-  assert_release_baseline_security "$live_release" || return 1
+  assert_legacy_release_baseline_security "$live_release" || return 1
 }
 
 assert_live_baseline_security_for_slot() { # <A|B>

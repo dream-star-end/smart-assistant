@@ -1682,6 +1682,31 @@ describe('v5 release safety lanes', () => {
     assert.match(untraversableResult.stderr, /not world-readable\/traversable/)
   })
 
+  test('legacy serving baseline compat allows only a missing cursor skill', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-baseline-legacy-cursor-')); dirs.push(dir)
+    const release = path.join(dir, 'release')
+    const baseline = path.join(release, 'packages/commercial/agent-sandbox/ccb-baseline')
+    await mkdir(path.dirname(baseline), { recursive: true })
+    await cp(path.join(root, 'packages/commercial/agent-sandbox/ccb-baseline'), baseline, { recursive: true })
+    await rm(path.join(baseline, 'skills/cursor-cli'), { recursive: true })
+    const strict = spawnSync('bash', [baselineGuard, 'check-release', release], { encoding: 'utf8' })
+    assert.notEqual(strict.status, 0)
+    const compat = spawnSync('bash', [baselineGuard, 'harden-release-legacy-cursor', release], { encoding: 'utf8' })
+    assert.equal(compat.status, 0, compat.stderr)
+    await mkdir(path.join(baseline, 'skills/undeclared'))
+    await writeFile(path.join(baseline, 'skills/undeclared/SKILL.md'), '# unexpected\n')
+    const drift = spawnSync('bash', [baselineGuard, 'check-release-legacy-cursor', release], { encoding: 'utf8' })
+    assert.notEqual(drift.status, 0)
+    assert.match(drift.stderr, /skill manifest mismatch/)
+
+    const source = await readFile(deploy, 'utf8')
+    const prepare = source.match(/prepare_live_baseline_safety\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
+    assert.match(prepare, /harden_legacy_release_baseline "\$live_release"/)
+    assert.match(prepare, /assert_legacy_release_baseline_security "\$live_release"/)
+    assert.doesNotMatch(prepare, /harden_release_baseline "\$live_release"/)
+    assert.doesNotMatch(prepare, /assert_release_baseline_security "\$live_release"/)
+  })
+
   test('baseline release/config guards cover build, slots, smoke, canary and rollback activation', async () => {
     const [source, overrides, unitA, unitB, portGuardSocket, portGuardService, indexSource] = await Promise.all([
       readFile(deploy, 'utf8'),
@@ -1712,7 +1737,7 @@ describe('v5 release safety lanes', () => {
     assert.match(portGuardService, /^ExecStart=\/usr\/lib\/systemd\/systemd-socket-proxyd .*baseline-port-disabled\.sock$/m)
 
     const transition = source.match(/prepare_live_baseline_safety\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
-    assert.ok(transition.indexOf('install_v5_slot_units') < transition.indexOf('harden_release_baseline'))
+    assert.ok(transition.indexOf('install_v5_slot_units') < transition.indexOf('harden_legacy_release_baseline'))
     const bootstrap = source.match(/^bootstrap\(\) \{([\s\S]*?)\n\}/m)?.[1] ?? ''
     assert.ok(bootstrap.indexOf('install_v5_slot_units') < bootstrap.indexOf('harden_release_baseline "$REMOTE_SRC"'))
     assert.ok(bootstrap.indexOf('install_v5_slot_units') < bootstrap.indexOf('rsync -az --delete'))
