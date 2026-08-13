@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
@@ -8,19 +8,28 @@ import { AddressInfo } from 'node:net'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { Gateway, isFileAllowed, isFileBlocked } from '../server.js'
 import type { RepoSnapshot } from '../sessionRepoWorkspace.js'
+import { WORKSPACE_INSPECT_MAX_JSON_BYTES } from '@openclaude/protocol'
 import {
   collectGitSnapshot,
   collectListDir,
+  GIT_HERMETIC_ARGS,
   hasGitPathSegment,
   isLinuxFdAnchorAvailable,
+  lastGitKillReasonForTests,
   lastOpendirPathForTests,
   lastTrustedGitDirForTests,
   parseGitHead,
+  parseGitNumstatZ,
+  parseGitStatusZ,
   parseRelPath,
   parseSessionId,
   releaseInspect,
   resetInspectLimiterForTests,
+  setInspectTimeoutOverrideForTests,
   setWorkspaceInspectAfterObjectsFdForTests,
+  setWorkspaceInspectHoldForTests,
+  setWorkspaceInspectReposRootOverrideForTests,
+  setWorkspaceInspectSnapshotOverrideForTests,
   tryAcquireInspect,
   type WorkspaceInspectRuntime,
 } from '../workspaceInspect.js'
@@ -70,6 +79,23 @@ function initRepo(dir: string): void {
   git(dir, ['add', 'README.md'])
   git(dir, ['commit', '-m', 'init'])
 }
+
+describe('parseGitStatusZ / parseGitNumstatZ', () => {
+  it('parses rename records by destination path', () => {
+    const status = Buffer.from('R  new-name\0old-name\0M  kept.txt\0')
+    const st = parseGitStatusZ(status, 50)
+    assert.deepEqual(st.entries.map((e) => e.path), ['new-name', 'kept.txt'])
+    const num = parseGitNumstatZ(Buffer.from(`1\t1\t\0old-name\0new-name\0` + `3\t0\tkept.txt\0`))
+    assert.equal(num.entries.find((e) => e.path === 'new-name')?.added, 1)
+    assert.equal(num.entries.find((e) => e.path === 'kept.txt')?.added, 3)
+  })
+
+  it('parses copy records by destination path', () => {
+    const st = parseGitStatusZ(Buffer.from('C  dest.txt\0src.txt\0'), 50)
+    assert.deepEqual(st.entries.map((e) => e.path), ['dest.txt'])
+    assert.equal(st.entries[0]?.xy[0], 'C')
+  })
+})
 
 describe('parseGitHead', () => {
   it('accepts a single trailing LF and rejects other shapes', () => {
@@ -252,9 +278,41 @@ describe('workspace inspect collection', () => {
     const r = await collectListDir(rt, 'sess-1', '')
     assert.equal(r.kind, 'ok')
     if (r.kind !== 'ok' || !('entries' in r.body)) return
-    const json = JSON.stringify(r.body)
-    assert.equal(json.includes('\nname'), false)
-    assert.equal(json.includes('\u001b'), false)
+    const parsed = JSON.parse(JSON.stringify(r.body)) as { cwd: string; entries: { name: string }[] }
+    const blob = `${parsed.cwd}\n${parsed.entries.map((e) => e.name).join('\n')}`
+    assert.equal(blob.includes('\nname'), false)
+    assert.equal(blob.includes('\u001b'), false)
+  })
+
+  it('counts unsanitizable raw dirents toward the list cap', async () => {
+    for (let i = 0; i < 180; i++) {
+      writeFileSync(join(workspaceDir, `g${String(i).padStart(3, '0')}.txt`), 'x')
+    }
+    let hidden = 0
+    for (let i = 1; i < 32; i++) {
+      if (i === 9 || i === 10 || i === 13) continue
+      try {
+        writeFileSync(join(workspaceDir, String.fromCharCode(i)), 'x')
+        hidden++
+      } catch {
+        /* filesystem rejected the name */
+      }
+    }
+    for (let i = 1; i < 32; i++) {
+      try {
+        writeFileSync(join(workspaceDir, `\x01${String.fromCharCode(i)}\x7f`), 'x')
+        hidden++
+      } catch {
+        /* filesystem rejected the name */
+      }
+    }
+    assert.ok(hidden >= 9, `need enough hidden names to exceed the raw cap, got ${hidden}`)
+    const rt = makeRt(workspaceDir, reposRoot)
+    const r = await collectListDir(rt, 'sess-1', '')
+    assert.equal(r.kind, 'ok')
+    if (r.kind !== 'ok' || !('entries' in r.body)) return
+    assert.equal(r.body.truncated, true)
+    assert.ok(r.body.entries.length <= 200)
   })
 
   it('asserts Linux list-dir uses /proc/self/fd', async () => {
@@ -404,15 +462,18 @@ describe('workspace inspect collection', () => {
 
   it('does not follow objects swap after ofd is opened', async () => {
     if (!isLinuxFdAnchorAvailable()) return
+    writeFileSync(join(workspaceDir, 'README.md'), 'hello\nchanged\n')
     setWorkspaceInspectAfterObjectsFdForTests(({ objectsPath }) => {
       const moved = `${objectsPath}.orig`
       renameSync(objectsPath, moved)
-      symlinkSync(tmp, objectsPath)
+      mkdirSync(objectsPath)
     })
-    writeFileSync(join(workspaceDir, 'changed.txt'), 'x')
     const rt = makeRt(workspaceDir, reposRoot)
     const r = await collectGitSnapshot(rt, 'sess-1')
     assert.equal(r.kind, 'ok')
+    if (r.kind !== 'ok' || !('snapshot' in r.body)) return
+    assert.equal(r.body.snapshot.live_head.sha.length, 40)
+    assert.ok(r.body.snapshot.entries.some((e) => e.path === 'README.md'))
   })
 
   it('fails immediately on FIFO HEAD and removes the trusted gitdir', async () => {
@@ -446,11 +507,136 @@ describe('workspace inspect collection', () => {
     const r = await collectListDir(rt, 'sess-1', '')
     assert.equal(r.kind, 'ok')
     if (r.kind !== 'ok' || !('entries' in r.body)) return
-    const json = JSON.stringify(r.body)
-    assert.equal(json.includes('\u007f'), false)
-    assert.equal(json.includes('\u0085'), false)
-    assert.equal(json.includes('\u202e'), false)
-    assert.equal(json.includes('<img>'), true)
+    const parsed = JSON.parse(JSON.stringify(r.body)) as { cwd: string; entries: { name: string }[] }
+    const blob = `${parsed.cwd}\n${parsed.entries.map((e) => e.name).join('\n')}`
+    assert.equal(blob.includes('\u007f'), false)
+    assert.equal(blob.includes('\u0085'), false)
+    assert.equal(blob.includes('\u202e'), false)
+    assert.ok(parsed.entries.some((e) => e.name.includes('<img>')))
+  })
+
+  it('reads packed-only refs without a loose ref file', async () => {
+    git(workspaceDir, ['pack-refs', '--all', '--prune'])
+    const head = readFileSync(join(workspaceDir, '.git', 'HEAD'), 'utf8').trim()
+    assert.ok(head.startsWith('ref: '))
+    const loose = join(workspaceDir, '.git', head.slice('ref: '.length))
+    assert.equal(existsSync(loose), false)
+    assert.equal(existsSync(join(workspaceDir, '.git', 'packed-refs')), true)
+    const packed = readFileSync(join(workspaceDir, '.git', 'packed-refs'), 'utf8')
+    assert.ok(packed.includes(head.slice('ref: '.length)))
+    const rt = makeRt(workspaceDir, reposRoot)
+    const r = await collectGitSnapshot(rt, 'sess-1')
+    assert.equal(r.kind, 'ok')
+    if (r.kind === 'ok' && 'snapshot' in r.body) {
+      assert.equal(r.body.snapshot.live_head.sha.length, 40)
+    }
+  })
+
+  it('does not report a fake clean snapshot when git exits non-zero', async () => {
+    rmSync(join(workspaceDir, '.git', 'objects'), { recursive: true, force: true })
+    mkdirSync(join(workspaceDir, '.git', 'objects'), { recursive: true })
+    const rt = makeRt(workspaceDir, reposRoot)
+    const r = await collectGitSnapshot(rt, 'sess-1')
+    assert.notEqual(r.kind, 'ok')
+    assert.equal(JSON.stringify(r).includes('"added":0'), false)
+  })
+
+  it('does not preview a tracked symlink that points outside the workspace', async () => {
+    symlinkSync('/etc/passwd', join(workspaceDir, 'leak'))
+    git(workspaceDir, ['add', '-f', 'leak'])
+    const rt = makeRt(workspaceDir, reposRoot)
+    const listed = await collectListDir(rt, 'sess-1', '')
+    assert.equal(listed.kind, 'ok')
+    if (listed.kind === 'ok' && 'entries' in listed.body) {
+      const leak = listed.body.entries.find((e) => e.name === 'leak')
+      assert.equal(leak?.kind, 'symlink')
+      assert.equal(leak?.preview_path, undefined)
+    }
+    const snap = await collectGitSnapshot(rt, 'sess-1')
+    assert.equal(snap.kind, 'ok')
+    if (snap.kind === 'ok' && 'snapshot' in snap.body) {
+      const leak = snap.body.snapshot.entries.find((e) => e.path === 'leak')
+      assert.ok(leak)
+      assert.equal(leak.previewable, false)
+      assert.equal(leak.preview_path, undefined)
+    }
+  })
+
+  it('sanitizes cwd in JSON.parse values', async () => {
+    const raw = 'dir\u202e'
+    mkdirSync(join(workspaceDir, raw), { recursive: true })
+    writeFileSync(join(workspaceDir, raw, 'a.txt'), 'x')
+    const rt = makeRt(workspaceDir, reposRoot)
+    const r = await collectListDir(rt, 'sess-1', raw)
+    assert.equal(r.kind, 'ok')
+    if (r.kind !== 'ok' || !('cwd' in r.body)) return
+    const parsed = JSON.parse(JSON.stringify(r.body)) as { cwd: string }
+    assert.equal(parsed.cwd.includes('\u202e'), false)
+    assert.equal(parsed.cwd, 'dir')
+  })
+
+
+  it('reports git mv as renamed destination not origin', async () => {
+    git(workspaceDir, ['mv', 'README.md', 'README2.md'])
+    const rt = makeRt(workspaceDir, reposRoot)
+    const r = await collectGitSnapshot(rt, 'sess-1')
+    assert.equal(r.kind, 'ok')
+    if (r.kind !== 'ok' || !('snapshot' in r.body)) return
+    const paths = r.body.snapshot.entries.map((e) => e.path)
+    assert.equal(paths.includes('README2.md'), true)
+    assert.equal(paths.includes('README.md'), false)
+    const row = r.body.snapshot.entries.find((e) => e.path === 'README2.md')
+    assert.equal(row?.status, 'renamed')
+  })
+
+  it('kills git at the entry cap and releases the inspect limiter', async () => {
+    for (let i = 0; i < 520; i++) {
+      writeFileSync(join(workspaceDir, `u${String(i).padStart(4, '0')}.txt`), 'x')
+    }
+    const rt = makeRt(workspaceDir, reposRoot)
+    const r = await collectGitSnapshot(rt, 'sess-1')
+    assert.equal(r.kind, 'ok')
+    if (r.kind !== 'ok' || !('snapshot' in r.body)) return
+    assert.equal(r.body.snapshot.truncated, true)
+    assert.equal(r.body.snapshot.truncation?.reason, 'max_entries')
+    assert.ok(r.body.snapshot.entries.length <= 500)
+    assert.equal(lastGitKillReasonForTests, 'entries')
+    assert.equal(tryAcquireInspect('sess-1'), 'ok')
+    releaseInspect('sess-1')
+  })
+
+  it('truncates git JSON to the wire 256KiB envelope', async () => {
+    const rel = Array.from({ length: 40 }, () => 'abcdefghij').join('/')
+    mkdirSync(join(workspaceDir, rel), { recursive: true })
+    writeFileSync(join(workspaceDir, rel, '.keep'), '')
+    git(workspaceDir, ['add', join(rel, '.keep')])
+    git(workspaceDir, ['commit', '-m', 'keep'])
+    for (let i = 0; i < 500; i++) {
+      writeFileSync(join(workspaceDir, rel, `f${i}.txt`), 'x')
+    }
+    const rt = makeRt(workspaceDir, reposRoot)
+    const r = await collectGitSnapshot(rt, 'sess-1')
+    assert.equal(r.kind, 'ok')
+    if (r.kind !== 'ok' || !('snapshot' in r.body)) return
+    const wire = JSON.stringify(r.body)
+    assert.ok(Buffer.byteLength(wire, 'utf8') <= WORKSPACE_INSPECT_MAX_JSON_BYTES)
+    assert.equal(r.body.snapshot.truncated, true)
+    assert.equal(r.body.snapshot.truncation?.reason, 'byte_budget')
+  })
+
+  it('returns 409 when only the workspace inode changes', async () => {
+    const rt = makeRt(workspaceDir, reposRoot)
+    setWorkspaceInspectHoldForTests(async () => {
+      const prev = `${workspaceDir}.prev`
+      renameSync(workspaceDir, prev)
+      mkdirSync(workspaceDir, { recursive: true })
+    })
+    const r = await collectListDir(rt, 'sess-1', '')
+    assert.equal(r.kind, 'error')
+    if (r.kind === 'error') {
+      assert.equal(r.status, 409)
+      assert.equal(r.body.error.code, 'WORKSPACE_CHANGED')
+    }
   })
 
   it('second acquire for the same session is immediate IN_FLIGHT', () => {
@@ -462,6 +648,13 @@ describe('workspace inspect collection', () => {
     assert.equal(tryAcquireInspect('sess-3'), 'process')
     releaseInspect('sess-1')
     releaseInspect('sess-2')
+  })
+})
+
+describe('hermetic git argv', () => {
+  it('does not pass --no-lazy-fetch and is accepted by installed git', () => {
+    assert.equal(GIT_HERMETIC_ARGS.includes('--no-lazy-fetch'), false)
+    execFileSync('git', [...GIT_HERMETIC_ARGS, 'version'], { stdio: 'ignore' })
   })
 })
 
@@ -530,6 +723,169 @@ describe('workspace inspect HTTP handler', () => {
       resetInspectLimiterForTests()
       delete process.env.OC_CONTAINER_ID
       await new Promise<void>((resolve, reject) => server.close((e) => (e ? reject(e) : resolve())))
+    }
+  })
+
+  it('timeout response is 504 without a partial snapshot body', async () => {
+    process.env.OC_CONTAINER_ID = '123'
+    process.env[ENV_KEY] = '1'
+    resetInspectLimiterForTests()
+    const tmp = mkdtempSync(join(tmpdir(), 'oc-inspect-http-'))
+    const reposRoot = join(tmp, 'repos')
+    const workspaceDir = join(reposRoot, 'sess-1', '1')
+    initRepo(workspaceDir)
+    setWorkspaceInspectReposRootOverrideForTests(reposRoot)
+    setWorkspaceInspectSnapshotOverrideForTests(() => readySnap(workspaceDir))
+    setInspectTimeoutOverrideForTests({ list: 40, git: 40 })
+    setWorkspaceInspectHoldForTests(() => new Promise<void>((resolve) => { setTimeout(resolve, 400) }))
+    const gw = new Gateway({
+      config: {
+        version: 1,
+        gateway: { bind: '127.0.0.1', port: 0, accessToken: 't' },
+        auth: { mode: 'subscription', claudeCodePath: '/tmp/ccb' },
+        defaults: { model: 'x', permissionMode: 'default' },
+        channels: { webchat: { enabled: true } },
+        mcpServers: [],
+      } as never,
+      agentsConfig: { agents: [] } as never,
+    })
+    const server = createServer((req, res) => {
+      const url = new URL(req.url ?? '/', 'http://127.0.0.1')
+      void gw.handleWorkspaceInspectForTests(req, res, url)
+    })
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    try {
+      const port = (server.address() as AddressInfo).port
+      const res = await fetch('http://127.0.0.1:' + port + '/api/workspace/list-dir?sessionId=sess-1')
+      const text = await res.text()
+      assert.equal(res.status, 504)
+      const body = JSON.parse(text)
+      assert.equal(body.ok, false)
+      assert.equal(body.error?.code, 'LIST_TIMEOUT')
+      assert.equal('entries' in body, false)
+      assert.equal('snapshot' in body, false)
+    } finally {
+      await new Promise((r) => setTimeout(r, 500))
+      setWorkspaceInspectHoldForTests(undefined)
+      setInspectTimeoutOverrideForTests(undefined)
+      setWorkspaceInspectReposRootOverrideForTests(undefined)
+      setWorkspaceInspectSnapshotOverrideForTests(undefined)
+      resetInspectLimiterForTests()
+      delete process.env.OC_CONTAINER_ID
+      rmSync(tmp, { recursive: true, force: true })
+      await new Promise((resolve, reject) => server.close((e) => (e ? reject(e) : resolve())))
+    }
+  })
+
+  it('two real HTTP requests: second is immediate 429 while first is in flight', async () => {
+    process.env.OC_CONTAINER_ID = '123'
+    process.env[ENV_KEY] = '1'
+    resetInspectLimiterForTests()
+    const tmp = mkdtempSync(join(tmpdir(), 'oc-inspect-http-'))
+    const reposRoot = join(tmp, 'repos')
+    const workspaceDir = join(reposRoot, 'sess-1', '1')
+    initRepo(workspaceDir)
+    setWorkspaceInspectReposRootOverrideForTests(reposRoot)
+    setWorkspaceInspectSnapshotOverrideForTests(() => readySnap(workspaceDir))
+    let entered = false
+    let releaseHold = () => {}
+    setWorkspaceInspectHoldForTests(async () => {
+      entered = true
+      await new Promise((resolve) => { releaseHold = resolve })
+    })
+    const gw = new Gateway({
+      config: {
+        version: 1,
+        gateway: { bind: '127.0.0.1', port: 0, accessToken: 't' },
+        auth: { mode: 'subscription', claudeCodePath: '/tmp/ccb' },
+        defaults: { model: 'x', permissionMode: 'default' },
+        channels: { webchat: { enabled: true } },
+        mcpServers: [],
+      } as never,
+      agentsConfig: { agents: [] } as never,
+    })
+    const server = createServer((req, res) => {
+      const url = new URL(req.url ?? '/', 'http://127.0.0.1')
+      void gw.handleWorkspaceInspectForTests(req, res, url)
+    })
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    try {
+      const port = (server.address() as AddressInfo).port
+      const p1 = fetch('http://127.0.0.1:' + port + '/api/workspace/list-dir?sessionId=sess-1')
+      const tWait = Date.now()
+      while (!entered && Date.now() - tWait < 2000) {
+        await new Promise((r) => setTimeout(r, 5))
+      }
+      assert.equal(entered, true)
+      const t0 = Date.now()
+      const r2 = await fetch('http://127.0.0.1:' + port + '/api/workspace/list-dir?sessionId=sess-1')
+      const b2 = await r2.json()
+      assert.equal(r2.status, 429)
+      assert.equal(b2.error?.code, 'IN_FLIGHT')
+      assert.ok(Date.now() - t0 < 200)
+      releaseHold()
+      const r1 = await p1
+      assert.notEqual(r1.status, 429)
+    } finally {
+      releaseHold()
+      setWorkspaceInspectHoldForTests(undefined)
+      setWorkspaceInspectReposRootOverrideForTests(undefined)
+      setWorkspaceInspectSnapshotOverrideForTests(undefined)
+      resetInspectLimiterForTests()
+      delete process.env.OC_CONTAINER_ID
+      rmSync(tmp, { recursive: true, force: true })
+      await new Promise((resolve, reject) => server.close((e) => (e ? reject(e) : resolve())))
+    }
+  })
+
+  it('T6 control characters are absent from HTTP wire bytes', async () => {
+    process.env.OC_CONTAINER_ID = '123'
+    process.env[ENV_KEY] = '1'
+    resetInspectLimiterForTests()
+    const tmp = mkdtempSync(join(tmpdir(), 'oc-inspect-http-'))
+    const reposRoot = join(tmp, 'repos')
+    const workspaceDir = join(reposRoot, 'sess-1', '1')
+    initRepo(workspaceDir)
+    writeFileSync(join(workspaceDir, 'ok<img>x.txt'), 'x')
+    try {
+      writeFileSync(join(workspaceDir, 'bad\u007fdel.txt'), 'x')
+      writeFileSync(join(workspaceDir, 'c1\u0085.txt'), 'x')
+      writeFileSync(join(workspaceDir, 'bidi\u202e.txt'), 'x')
+    } catch {}
+    setWorkspaceInspectReposRootOverrideForTests(reposRoot)
+    setWorkspaceInspectSnapshotOverrideForTests(() => readySnap(workspaceDir))
+    const gw = new Gateway({
+      config: {
+        version: 1,
+        gateway: { bind: '127.0.0.1', port: 0, accessToken: 't' },
+        auth: { mode: 'subscription', claudeCodePath: '/tmp/ccb' },
+        defaults: { model: 'x', permissionMode: 'default' },
+        channels: { webchat: { enabled: true } },
+        mcpServers: [],
+      } as never,
+      agentsConfig: { agents: [] } as never,
+    })
+    const server = createServer((req, res) => {
+      const url = new URL(req.url ?? '/', 'http://127.0.0.1')
+      void gw.handleWorkspaceInspectForTests(req, res, url)
+    })
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    try {
+      const port = (server.address() as AddressInfo).port
+      const res = await fetch('http://127.0.0.1:' + port + '/api/workspace/list-dir?sessionId=sess-1')
+      const text = await res.text()
+      assert.equal(res.status, 200)
+      assert.equal(text.includes('\u007f'), false)
+      assert.equal(text.includes('\u0085'), false)
+      assert.equal(text.includes('\u202e'), false)
+      assert.equal(text.includes('<img>'), true)
+    } finally {
+      setWorkspaceInspectReposRootOverrideForTests(undefined)
+      setWorkspaceInspectSnapshotOverrideForTests(undefined)
+      resetInspectLimiterForTests()
+      delete process.env.OC_CONTAINER_ID
+      rmSync(tmp, { recursive: true, force: true })
+      await new Promise((resolve, reject) => server.close((e) => (e ? reject(e) : resolve())))
     }
   })
 })

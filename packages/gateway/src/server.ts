@@ -254,11 +254,11 @@ import {
   collectGitSnapshot,
   collectListDir,
   hasGitPathSegment,
+  inspectGitTimeoutMs,
+  inspectListTimeoutMs,
   parseSessionId,
   releaseInspect,
   tryAcquireInspect,
-  WORKSPACE_INSPECT_GIT_TIMEOUT_MS,
-  WORKSPACE_INSPECT_LIST_TIMEOUT_MS,
   workspaceInspectReposRootOverride,
   workspaceInspectSnapshotOverride,
   type WorkspaceInspectRuntime,
@@ -6387,7 +6387,7 @@ export class Gateway {
     }
 
     const kind = url.pathname === '/api/workspace/git-snapshot' ? 'git' : 'list'
-    const timeoutMs = kind === 'git' ? WORKSPACE_INSPECT_GIT_TIMEOUT_MS : WORKSPACE_INSPECT_LIST_TIMEOUT_MS
+    const timeoutMs = kind === 'git' ? inspectGitTimeoutMs() : inspectListTimeoutMs()
     const rt: WorkspaceInspectRuntime = {
       getRepoSnapshot: (id) =>
         workspaceInspectSnapshotOverride ? workspaceInspectSnapshotOverride(id) : this._repoWorkspace.getRepoSnapshot(id),
@@ -6403,11 +6403,13 @@ export class Gateway {
     }
 
     let sent = false
+    const ac = new AbortController()
     const work =
       kind === 'git'
-        ? collectGitSnapshot(rt, sessionId)
-        : collectListDir(rt, sessionId, url.searchParams.get('path'))
+        ? collectGitSnapshot(rt, sessionId, ac.signal)
+        : collectListDir(rt, sessionId, url.searchParams.get('path'), undefined, ac.signal)
     const timer = setTimeout(() => {
+      ac.abort()
       if (sent || res.headersSent) return
       sent = true
       const code = kind === 'git' ? 'GIT_TIMEOUT' : 'LIST_TIMEOUT'

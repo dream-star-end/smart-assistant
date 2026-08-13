@@ -14,6 +14,7 @@ import {
   mkdirSync,
   mkdtempSync,
   openSync,
+  readFileSync,
   readSync,
   realpathSync,
   rmSync,
@@ -325,6 +326,7 @@ export async function collectListDir(
   sessionId: string,
   relRaw: string | null,
   meta?: ListDirMeta,
+  signal?: AbortSignal,
 ): Promise<InspectResult> {
   const parsed = parseRelPath(relRaw)
   if (!parsed.ok) return err(400, 'BAD_PATH', 'invalid path')
@@ -336,6 +338,8 @@ export async function collectListDir(
   if (!('realRoot' in ws)) return ws
   const { realRoot, identity, rootFd } = ws
   try {
+    if (workspaceInspectHoldForTests) await workspaceInspectHoldForTests()
+    if (signal?.aborted) return err(504, 'LIST_TIMEOUT', 'list timed out')
     const targetPath = parsed.rel ? posixJoinUnder(realRoot, parsed.rel) : realRoot
     if (hasGitPathSegment(targetPath)) return err(403, 'PATH_DENIED', 'git directory is not listable')
 
@@ -385,14 +389,16 @@ export async function collectListDir(
       try {
         let seen = 0
         for await (const dirent of dir) {
-          if (seen >= WORKSPACE_INSPECT_MAX_LIST_ENTRIES) {
+          if (signal?.aborted) return err(504, 'LIST_TIMEOUT', 'list timed out')
+          seen++
+          if (seen > WORKSPACE_INSPECT_MAX_LIST_ENTRIES) {
             truncated = true
             truncReason = 'max_entries'
             break
           }
-          const name = sanitizeName(dirent.name)
-          if (!name) continue
-          const child = buildListChild(rt, canonical, tfd, name, linux)
+          const display = sanitizeName(dirent.name)
+          if (!display) continue
+          const child = buildListChild(rt, canonical, tfd, dirent.name, display, linux)
           const piece = Buffer.byteLength(JSON.stringify(child), 'utf8') + 1
           if (jsonBytes + piece > WORKSPACE_INSPECT_MAX_JSON_BYTES) {
             truncated = true
@@ -401,7 +407,6 @@ export async function collectListDir(
           }
           entries.push(child)
           jsonBytes += piece
-          seen++
         }
       } finally {
         await dir.close().catch(() => {})
@@ -416,12 +421,17 @@ export async function collectListDir(
     const body: WorkspaceInspectListDirBody = {
       ok: true,
       empty: false,
-      cwd: parsed.rel,
+      cwd: sanitizeName(parsed.rel) ?? '',
       entries,
       truncated,
       truncation: truncated
         ? { reason: truncReason ?? 'max_entries', omitted: 'unknown' }
         : null,
+    }
+    while (utf8JsonBytes(body) > WORKSPACE_INSPECT_MAX_JSON_BYTES && body.entries.length > 0) {
+      body.entries.pop()
+      body.truncated = true
+      body.truncation = { reason: 'byte_budget', omitted: 'unknown' }
     }
     return { kind: 'ok', status: 200, body }
   } finally {
@@ -433,36 +443,44 @@ function buildListChild(
   rt: WorkspaceInspectRuntime,
   parentCanonical: string,
   parentFd: number,
-  name: string,
+  rawName: string,
+  displayName: string,
   linux: boolean,
 ): WorkspaceInspectListEntry {
-  const skip = skipReasonForName(name)
-  if (skip) return { name, kind: 'skipped', reason: skip }
+  const skip = skipReasonForName(rawName) ?? skipReasonForName(displayName)
+  if (skip) return { name: displayName, kind: 'skipped', reason: skip }
 
-  const childPath = linux ? `/proc/self/fd/${parentFd}/${name}` : join(parentCanonical, name)
+  const childPath = linux ? `/proc/self/fd/${parentFd}/${rawName}` : join(parentCanonical, rawName)
   let st: Stats
   try {
     st = lstatSync(childPath)
   } catch {
-    return { name, kind: 'skipped', reason: 'denied' }
+    return { name: displayName, kind: 'skipped', reason: 'denied' }
   }
-  if (st.isSymbolicLink()) return { name, kind: 'symlink' }
+  if (st.isSymbolicLink()) return { name: displayName, kind: 'symlink' }
 
-  const abs = posixJoinUnder(parentCanonical, name)
+  const abs = posixJoinUnder(parentCanonical, rawName)
   if (st.isDirectory()) {
     if (rt.acl.isFileBlocked(abs) || hasGitPathSegment(abs)) {
-      return { name, kind: 'skipped', reason: 'denied' }
+      return { name: displayName, kind: 'skipped', reason: 'denied' }
     }
-    return { name, kind: 'dir' }
+    return { name: displayName, kind: 'dir' }
   }
   if (st.isFile()) {
     const prev = previewForFile(abs, rt.acl)
-    return { name, kind: 'file', ...prev }
+    return { name: displayName, kind: 'file', ...prev }
   }
-  return { name, kind: 'symlink' }
+  return { name: displayName, kind: 'symlink' }
 }
 
-const GIT_HERMETIC_ARGS = [
+/**
+ * Hermetic git argv shared by every inspect spawn.
+ * Do not add `--no-lazy-fetch`: it was added in Git 2.45, and the runtime
+ * image is Debian bookworm apt Git 2.39.x. An unknown flag makes `rev-parse`
+ * fail with empty stdout, which this collector must not map to a fake empty repo
+ * without checking the exit code — and must not use the flag at all.
+ */
+export const GIT_HERMETIC_ARGS = [
   '-c',
   'core.hooksPath=/dev/null',
   '-c',
@@ -472,7 +490,6 @@ const GIT_HERMETIC_ARGS = [
   '-c',
   'core.worktree=',
   '--no-optional-locks',
-  '--no-lazy-fetch',
 ] as const
 
 const OPEN_FILE_FLAGS = fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK
@@ -489,11 +506,45 @@ const TRUSTED_GITDIR_PREFIX = 'oc-inspect-git-'
 /** Tests may swap `.git/objects` after ofd is opened. Production leaves this unset. */
 export let workspaceInspectAfterObjectsFdForTests: ((ctx: { objectsPath: string }) => void) | undefined
 export let lastTrustedGitDirForTests: string | null = null
+/** Last reason `runGit` terminated the child. Tests assert entry-cap kill. */
+export let lastGitKillReasonForTests: 'timeout' | 'stdout' | 'entries' | null = null
+/** Tests may await this inside collect* after the workspace identity is captured. */
+export let workspaceInspectHoldForTests: (() => Promise<void>) | undefined
+/** Tests may shorten the HTTP/collect clocks. Production leaves this unset. */
+export let inspectTimeoutOverrideForTests: { git?: number; list?: number } | undefined
+
+export function inspectGitTimeoutMs(): number {
+  return inspectTimeoutOverrideForTests?.git ?? WORKSPACE_INSPECT_GIT_TIMEOUT_MS
+}
+
+export function inspectListTimeoutMs(): number {
+  return inspectTimeoutOverrideForTests?.list ?? WORKSPACE_INSPECT_LIST_TIMEOUT_MS
+}
 
 export function setWorkspaceInspectAfterObjectsFdForTests(
   fn: ((ctx: { objectsPath: string }) => void) | undefined,
 ): void {
   workspaceInspectAfterObjectsFdForTests = fn
+}
+
+export function setWorkspaceInspectHoldForTests(fn: (() => Promise<void>) | undefined): void {
+  workspaceInspectHoldForTests = fn
+}
+
+export function setInspectTimeoutOverrideForTests(
+  value: { git?: number; list?: number } | undefined,
+): void {
+  inspectTimeoutOverrideForTests = value
+}
+
+export function setWorkspaceInspectReposRootOverrideForTests(value: string | undefined): void {
+  workspaceInspectReposRootOverride = value
+}
+
+export function setWorkspaceInspectSnapshotOverrideForTests(
+  fn: ((sessionId: string) => RepoSnapshot | null) | undefined,
+): void {
+  workspaceInspectSnapshotOverride = fn
 }
 
 function gitEnv(): NodeJS.ProcessEnv {
@@ -580,8 +631,33 @@ function readFdRegular(fd: number, max: number, budget: { used: number }): Buffe
   return buf.subarray(0, off)
 }
 
+function packedRefsHasRef(tmpGit: string, rel: string): boolean {
+  try {
+    const raw = readFileSync(join(tmpGit, 'packed-refs'), 'utf8')
+    for (const line of raw.split('\n')) {
+      if (!line || line.startsWith('#') || line.startsWith('^')) continue
+      const sp = line.indexOf(' ')
+      if (sp <= 0) continue
+      const sha = line.slice(0, sp)
+      const ref = line.slice(sp + 1)
+      if (SHA_RE.test(sha) && ref === rel) return true
+    }
+  } catch {
+    return false
+  }
+  return false
+}
+
 function writeTrustedCopy(tmpGit: string, rel: string, data: Buffer): void {
+  if (!rel || rel.includes('\0') || rel.startsWith('/') || rel.includes('\\')) {
+    throw new Error('bad_rel')
+  }
+  const segs = rel.split('/')
+  if (segs.some((s) => !s || s === '.' || s === '..')) throw new Error('bad_rel')
   const dest = join(tmpGit, rel)
+  const base = pathResolve(tmpGit)
+  const resolved = pathResolve(dest)
+  if (resolved !== base && !resolved.startsWith(base + '/')) throw new Error('escape')
   mkdirSync(dirname(dest), { recursive: true })
   writeFileSync(dest, data)
 }
@@ -653,11 +729,31 @@ function prepareTrustedGitDir(
     const head = parseGitHead(headBuf)
     if (!head) throw new Error('bad_head')
     writeTrustedCopy(tmpGit, 'HEAD', headBuf)
+    mkdirSync(join(tmpGit, 'refs'), { recursive: true })
 
     copyGitFile(gfd, gitPath, 'index', tmpGit, INDEX_FILE_MAX, budget, deadline, false)
-    copyGitFile(gfd, gitPath, 'packed-refs', tmpGit, PACKED_REFS_MAX, budget, deadline, false)
+    const packedCopied = copyGitFile(
+      gfd,
+      gitPath,
+      'packed-refs',
+      tmpGit,
+      PACKED_REFS_MAX,
+      budget,
+      deadline,
+      false,
+    )
     if (head.kind === 'ref') {
-      copyGitFile(gfd, gitPath, head.rel, tmpGit, REF_FILE_MAX, budget, deadline, true)
+      const looseCopied = copyGitFile(
+        gfd,
+        gitPath,
+        head.rel,
+        tmpGit,
+        REF_FILE_MAX,
+        budget,
+        deadline,
+        false,
+      )
+      if (!looseCopied && !packedRefsHasRef(tmpGit, head.rel)) throw new Error('missing')
     }
 
     throwIfDeadline(deadline)
@@ -690,6 +786,8 @@ type GitRun = {
   stdout: Buffer
   timedOut: boolean
   truncated: boolean
+  killedForEntries: boolean
+  exitCode: number | null
 }
 
 function terminateGit(child: ChildProcess): void {
@@ -715,6 +813,8 @@ async function runGit(opts: {
   tmpGit: string
   extra: string[]
   timeoutMs: number
+  stopAfterPorcelainEntries?: number
+  signal?: AbortSignal
 }): Promise<GitRun> {
   const linux = isLinuxFdAnchorAvailable()
   const prefix = [
@@ -728,6 +828,12 @@ async function runGit(opts: {
     : ['ignore', 'pipe', 'pipe']
 
   return await new Promise((resolve) => {
+    let settled = false
+    const finish = (result: GitRun) => {
+      if (settled) return
+      settled = true
+      resolve(result)
+    }
     let child: ChildProcess
     try {
       child = spawn('git', args, {
@@ -736,30 +842,58 @@ async function runGit(opts: {
         windowsHide: true,
       })
     } catch {
-      resolve({ stdout: Buffer.alloc(0), timedOut: false, truncated: false })
+      finish({
+        stdout: Buffer.alloc(0),
+        timedOut: false,
+        truncated: false,
+        killedForEntries: false,
+        exitCode: null,
+      })
       return
     }
     const chunks: Buffer[] = []
     let total = 0
     let truncated = false
     let timedOut = false
+    let killedForEntries = false
+    let terminating = false
     let stderrSeen = 0
-    const timer = setTimeout(() => {
-      timedOut = true
+    const stop = (reason: 'timeout' | 'stdout' | 'entries') => {
+      if (terminating) return
+      terminating = true
+      if (reason === 'timeout') timedOut = true
+      if (reason === 'stdout' || reason === 'entries') truncated = true
+      if (reason === 'entries') killedForEntries = true
+      lastGitKillReasonForTests = reason
+      try {
+        child.stdout?.destroy()
+      } catch {
+        /* ignore */
+      }
       terminateGit(child)
-    }, opts.timeoutMs)
+    }
+    const timer = setTimeout(() => stop('timeout'), opts.timeoutMs)
+    const onAbort = () => stop('timeout')
+    if (opts.signal?.aborted) onAbort()
+    else opts.signal?.addEventListener('abort', onAbort, { once: true })
     child.stdout?.on('data', (buf: Buffer) => {
-      if (truncated || timedOut) return
+      if (truncated || timedOut || killedForEntries) return
       if (total + buf.length > WORKSPACE_INSPECT_MAX_GIT_STDOUT_BYTES) {
         const room = WORKSPACE_INSPECT_MAX_GIT_STDOUT_BYTES - total
         if (room > 0) chunks.push(buf.subarray(0, room))
         total = WORKSPACE_INSPECT_MAX_GIT_STDOUT_BYTES
-        truncated = true
-        terminateGit(child)
+        stop('stdout')
         return
       }
       chunks.push(buf)
       total += buf.length
+      if (opts.stopAfterPorcelainEntries != null) {
+        const acc = Buffer.concat(chunks, total)
+        const parsed = parseGitStatusZ(acc, opts.stopAfterPorcelainEntries)
+        if (parsed.entries.length >= opts.stopAfterPorcelainEntries) {
+          stop('entries')
+        }
+      }
     })
     child.stderr?.on('data', (buf: Buffer) => {
       stderrSeen += buf.length
@@ -768,18 +902,32 @@ async function runGit(opts: {
       }
     })
     child.stderr?.resume()
-    child.on('close', () => {
+    child.on('close', (code) => {
       clearTimeout(timer)
-      resolve({ stdout: Buffer.concat(chunks, total), timedOut, truncated })
+      opts.signal?.removeEventListener('abort', onAbort)
+      finish({
+        stdout: Buffer.concat(chunks, total),
+        timedOut,
+        truncated,
+        killedForEntries,
+        exitCode: typeof code === 'number' ? code : null,
+      })
     })
     child.on('error', () => {
       clearTimeout(timer)
-      resolve({ stdout: Buffer.alloc(0), timedOut, truncated })
+      opts.signal?.removeEventListener('abort', onAbort)
+      finish({
+        stdout: Buffer.concat(chunks, total),
+        timedOut,
+        truncated,
+        killedForEntries,
+        exitCode: null,
+      })
     })
   })
 }
 
-function parseZStrings(buf: Buffer): { records: string[]; incomplete: boolean } {
+export function parseZStrings(buf: Buffer): { records: string[]; incomplete: boolean } {
   const records: string[] = []
   let start = 0
   for (let i = 0; i < buf.length; i++) {
@@ -790,6 +938,126 @@ function parseZStrings(buf: Buffer): { records: string[]; incomplete: boolean } 
   }
   const incomplete = start < buf.length
   return { records, incomplete }
+}
+
+export type ParsedPorcelainEntry = { xy: string; path: string }
+
+/**
+ * `git status --porcelain=v1 -z`: a rename/copy is `XY dest\\0orig\\0`.
+ * Keep the destination (first path); consume the original (second) without
+ * using it as the current path.
+ */
+export function parseGitStatusZ(
+  buf: Buffer,
+  maxEntries: number,
+): { entries: ParsedPorcelainEntry[]; complete: boolean } {
+  const { records, incomplete } = parseZStrings(buf)
+  const entries: ParsedPorcelainEntry[] = []
+  let i = 0
+  let complete = !incomplete
+  while (i < records.length && entries.length < maxEntries) {
+    const rec = records[i]!
+    if (rec.length < 3) {
+      i++
+      continue
+    }
+    const xy = rec.slice(0, 2)
+    const dest = rec.slice(3)
+    if (xy[0] === 'R' || xy[0] === 'C') {
+      if (i + 1 >= records.length) {
+        complete = false
+        break
+      }
+      entries.push({ xy, path: dest })
+      i += 2
+      continue
+    }
+    entries.push({ xy, path: dest })
+    i++
+  }
+  if (entries.length >= maxEntries && i < records.length) complete = false
+  return { entries, complete }
+}
+
+export type ParsedNumstat = {
+  path: string
+  added: number | null
+  deleted: number | null
+  binary: boolean
+}
+
+/**
+ * `git diff --numstat -z`: a normal record is `added\\tdeleted\\tpath\\0`.
+ * A rename/copy is `added\\tdeleted\\t\\0orig\\0dest\\0` — key by dest.
+ */
+export function parseGitNumstatZ(buf: Buffer): { entries: ParsedNumstat[]; complete: boolean } {
+  const { records, incomplete } = parseZStrings(buf)
+  const entries: ParsedNumstat[] = []
+  let i = 0
+  let complete = !incomplete
+  while (i < records.length) {
+    const rec = records[i]!
+    const firstTab = rec.indexOf('\t')
+    const secondTab = firstTab >= 0 ? rec.indexOf('\t', firstTab + 1) : -1
+    if (firstTab < 0 || secondTab < 0) {
+      i++
+      continue
+    }
+    const a = rec.slice(0, firstTab)
+    const d = rec.slice(firstTab + 1, secondTab)
+    const p = rec.slice(secondTab + 1)
+    const binary = a === '-' && d === '-'
+    const added = binary ? null : Number.parseInt(a, 10)
+    const deleted = binary ? null : Number.parseInt(d, 10)
+    if (p === '') {
+      const orig = records[i + 1]
+      const dest = records[i + 2]
+      if (orig == null || dest == null) {
+        complete = false
+        break
+      }
+      entries.push({ path: dest.replace(/\\/g, '/'), added, deleted, binary })
+      i += 3
+      continue
+    }
+    entries.push({ path: p.replace(/\\/g, '/'), added, deleted, binary })
+    i++
+  }
+  return { entries, complete }
+}
+
+function utf8JsonBytes(value: unknown): number {
+  return Buffer.byteLength(JSON.stringify(value), 'utf8')
+}
+
+function gitCommandFailed(run: GitRun): boolean {
+  if (run.timedOut || run.truncated || run.killedForEntries) return false
+  return run.exitCode !== 0
+}
+
+function confineGitPath(
+  realRoot: string,
+  rawRel: string,
+  acl: InspectFileAcl,
+): { path: string; previewable: boolean; preview_path?: string } | null {
+  if (hasGitPathSegment(rawRel) || rawRel.split('/').includes('.git')) return null
+  const display = sanitizeName(rawRel.replace(/\\/g, '/'))
+  if (!display) return null
+  const abs = posixJoinUnder(realRoot, rawRel)
+  if (!isUnderRoot(realRoot, pathResolve(abs))) return null
+  try {
+    const st = lstatSync(abs)
+    if (st.isSymbolicLink()) return { path: display, previewable: false }
+    if (st.isFile()) {
+      const real = realpathSync(abs)
+      if (!isUnderRoot(realRoot, real)) return null
+      const prev = previewForFile(real, acl)
+      return { path: display, previewable: prev.previewable, preview_path: prev.preview_path }
+    }
+  } catch {
+    return { path: display, previewable: false }
+  }
+  return { path: display, previewable: false }
 }
 
 function mapPorcelainStatus(xy: string): WorkspaceInspectGitStatus {
@@ -808,6 +1076,7 @@ function mapPorcelainStatus(xy: string): WorkspaceInspectGitStatus {
 export async function collectGitSnapshot(
   rt: WorkspaceInspectRuntime,
   sessionId: string,
+  signal?: AbortSignal,
 ): Promise<InspectResult> {
   const ws = await resolveReadyWorkspace(rt, sessionId)
   if (!('realRoot' in ws)) return ws
@@ -815,6 +1084,8 @@ export async function collectGitSnapshot(
   let gfd: number | undefined
   let prepared: TrustedGitDir | undefined
   try {
+    if (workspaceInspectHoldForTests) await workspaceInspectHoldForTests()
+    if (signal?.aborted) return err(504, 'GIT_TIMEOUT', 'git timed out')
     const gitPath = join(realRoot, '.git')
     let gitLst: Stats
     try {
@@ -831,7 +1102,7 @@ export async function collectGitSnapshot(
       return empty('not_a_repo')
     }
 
-    const deadline = Date.now() + WORKSPACE_INSPECT_GIT_TIMEOUT_MS
+    const deadline = Date.now() + inspectGitTimeoutMs()
     try {
       prepared = prepareTrustedGitDir(gfd, gitPath, deadline)
     } catch (e) {
@@ -844,7 +1115,7 @@ export async function collectGitSnapshot(
 
     const workTreePath = isLinuxFdAnchorAvailable() ? `/proc/self/fd/3` : realRoot
     const remain = () => Math.max(1, deadline - Date.now())
-    const run = (extra: string[]) =>
+    const run = (extra: string[], stopAfterPorcelainEntries?: number) =>
       runGit({
         wfd: rootFd,
         gfd: gitFd,
@@ -853,21 +1124,27 @@ export async function collectGitSnapshot(
         tmpGit: trusted.tmpGit,
         extra,
         timeoutMs: remain(),
+        stopAfterPorcelainEntries,
+        signal,
       })
 
     const headRun = await run(['rev-parse', 'HEAD'])
     if (headRun.timedOut) return err(504, 'GIT_TIMEOUT', 'git timed out')
-    const sha = headRun.stdout.toString('utf8').trim()
-    if (!SHA_RE.test(sha)) return empty('not_a_repo')
+    const sha = headRun.stdout.toString("utf8").trim()
+    if (headRun.exitCode !== 0 || !SHA_RE.test(sha)) return empty('not_a_repo')
 
     const branchRun = await run(['rev-parse', '--abbrev-ref', 'HEAD'])
     if (branchRun.timedOut) return err(504, 'GIT_TIMEOUT', 'git timed out')
     const branchRaw = sanitizeName(branchRun.stdout.toString('utf8').trim().replace(/\0/g, '')) ?? 'HEAD'
-    const detached = branchRaw === 'HEAD'
+    const detached = branchRun.exitCode !== 0 || branchRaw === 'HEAD'
     const branch = detached ? null : branchRaw
 
-    const statusRun = await run(['status', '-z', '--porcelain=v1', '-unormal', '--ignore-submodules=all'])
+    const statusRun = await run(
+      ['status', '-z', '--porcelain=v1', '-unormal', '--ignore-submodules=all'],
+      WORKSPACE_INSPECT_MAX_GIT_ENTRIES,
+    )
     if (statusRun.timedOut) return err(504, 'GIT_TIMEOUT', 'git timed out')
+    if (gitCommandFailed(statusRun)) return empty('not_a_repo')
 
     const numstatRun = await run([
       'diff',
@@ -880,68 +1157,28 @@ export async function collectGitSnapshot(
     ])
     if (numstatRun.timedOut) return err(504, 'GIT_TIMEOUT', 'git timed out')
 
-    const stdoutLimited = statusRun.truncated || numstatRun.truncated
-    const statusParsed = parseZStrings(statusRun.stdout)
-    const numParsed = parseZStrings(numstatRun.stdout)
+    const stdoutLimited =
+      (statusRun.truncated && !statusRun.killedForEntries) || numstatRun.truncated
+    const statusParsed = parseGitStatusZ(statusRun.stdout, WORKSPACE_INSPECT_MAX_GIT_ENTRIES)
+    const numParsed = parseGitNumstatZ(numstatRun.stdout)
 
     const numstat = new Map<string, { added: number | null; deleted: number | null; binary: boolean }>()
-    let numstatComplete = !numParsed.incomplete && !numstatRun.truncated
-    // numstat -z: "added\tdeleted\tpath\0" but renamed paths can be split. Treat each
-    // NUL field; skip incomplete trailing record.
-    for (const rec of numParsed.records) {
-      if (!rec) continue
-      const firstTab = rec.indexOf('\t')
-      const secondTab = rec.indexOf('\t', firstTab + 1)
-      if (firstTab < 0 || secondTab < 0) continue
-      const a = rec.slice(0, firstTab)
-      const d = rec.slice(firstTab + 1, secondTab)
-      let p = rec.slice(secondTab + 1)
-      if (p.startsWith('\0') || p.includes('\0')) continue
-      p = p.replace(/\\/g, '/')
-      if (hasGitPathSegment(p) || p.split('/').includes('.git')) continue
-      const binary = a === '-' && d === '-'
-      numstat.set(p, {
-        added: binary ? null : Number.parseInt(a, 10),
-        deleted: binary ? null : Number.parseInt(d, 10),
-        binary,
-      })
+    const numstatComplete = numParsed.complete && !numstatRun.truncated && !gitCommandFailed(numstatRun)
+    for (const rec of numParsed.entries) {
+      if (hasGitPathSegment(rec.path) || rec.path.split('/').includes('.git')) continue
+      numstat.set(rec.path, { added: rec.added, deleted: rec.deleted, binary: rec.binary })
     }
 
     const entries: WorkspaceInspectGitEntry[] = []
-    let i = 0
-    const recs = statusParsed.records
-    let statusComplete = !statusParsed.incomplete && !statusRun.truncated
-    while (i < recs.length && entries.length < WORKSPACE_INSPECT_MAX_GIT_ENTRIES) {
-      const rec = recs[i]!
-      if (rec.length < 3) {
-        i++
-        continue
-      }
-      const xy = rec.slice(0, 2)
-      let pathRel = rec.slice(3)
-      if (xy[0] === 'R' || xy[0] === 'C') {
-        const orig = pathRel
-        i++
-        const next = recs[i]
-        if (next == null) {
-          statusComplete = false
-          break
-        }
-        pathRel = next
-        void orig
-      }
-      i++
-      const clean = sanitizeName(pathRel.replace(/\\/g, '/'))
-      if (!clean) continue
-      if (hasGitPathSegment(clean) || clean.split('/').includes('.git')) continue
-      const abs = posixJoinUnder(realRoot, clean)
-      if (!isUnderRoot(realRoot, pathResolve(abs))) continue
-      const st = mapPorcelainStatus(xy)
-      const ns = numstat.get(clean)
+    for (const rec of statusParsed.entries) {
+      const confined = confineGitPath(realRoot, rec.path, rt.acl)
+      if (!confined) continue
+      const st = mapPorcelainStatus(rec.xy)
+      const ns = numstat.get(rec.path.replace(/\\/g, '/')) ?? numstat.get(confined.path)
       const binary = ns?.binary === true
-      const prev = st === 'deleted' ? { previewable: false } : previewForFile(abs, rt.acl)
+      const prev = st === 'deleted' ? { previewable: false } : confined
       entries.push({
-        path: clean,
+        path: confined.path,
         status: st,
         added: binary ? null : (ns?.added ?? null),
         deleted: binary ? null : (ns?.deleted ?? null),
@@ -950,34 +1187,21 @@ export async function collectGitSnapshot(
         ...(prev.preview_path ? { preview_path: prev.preview_path } : {}),
       })
     }
-    if (entries.length >= WORKSPACE_INSPECT_MAX_GIT_ENTRIES && i < recs.length) {
-      statusComplete = false
-    }
 
     let truncated = false
     let truncReason: WorkspaceInspectTruncationReason | null = null
     if (stdoutLimited) {
       truncated = true
       truncReason = 'stdout_limit'
-    } else if (entries.length >= WORKSPACE_INSPECT_MAX_GIT_ENTRIES) {
+    } else if (
+      statusRun.killedForEntries ||
+      (entries.length >= WORKSPACE_INSPECT_MAX_GIT_ENTRIES && !statusParsed.complete)
+    ) {
       truncated = true
       truncReason = 'max_entries'
     }
 
-    let jsonBytes = 128
-    const kept: WorkspaceInspectGitEntry[] = []
-    for (const e of entries) {
-      const piece = Buffer.byteLength(JSON.stringify(e), 'utf8') + 1
-      if (jsonBytes + piece > WORKSPACE_INSPECT_MAX_JSON_BYTES) {
-        truncated = true
-        truncReason = 'byte_budget'
-        break
-      }
-      kept.push(e)
-      jsonBytes += piece
-    }
-
-    const diffOk = numstatComplete && !stdoutLimited && truncReason !== 'stdout_limit'
+    const diffOk = numstatComplete && !stdoutLimited
     let added = 0
     let deleted = 0
     if (diffOk) {
@@ -993,13 +1217,19 @@ export async function collectGitSnapshot(
     const snapshot: WorkspaceInspectGitSnapshot = {
       live_head: { authority: 'live', branch, sha, detached },
       diff: diffOk ? { added, deleted } : null,
-      entries: kept,
+      entries,
       truncated,
       truncation: truncated
         ? { reason: truncReason ?? 'max_entries', omitted: 'unknown' }
         : null,
     }
-    return { kind: 'ok', status: 200, body: { ok: true, empty: false, snapshot } }
+    const body = { ok: true as const, empty: false as const, snapshot }
+    while (utf8JsonBytes(body) > WORKSPACE_INSPECT_MAX_JSON_BYTES && snapshot.entries.length > 0) {
+      snapshot.entries.pop()
+      snapshot.truncated = true
+      snapshot.truncation = { reason: 'byte_budget', omitted: 'unknown' }
+    }
+    return { kind: 'ok', status: 200, body }
   } finally {
     closeQuiet(prepared?.ofd)
     if (prepared?.tmpGit) {
@@ -1013,6 +1243,7 @@ export async function collectGitSnapshot(
     closeQuiet(rootFd)
   }
 }
+
 
 type Slot = { sessionId: string }
 const processSlots: Slot[] = []
@@ -1035,6 +1266,9 @@ export function releaseInspect(sessionId: string): void {
 export function resetInspectLimiterForTests(): void {
   processSlots.length = 0
   sessionHeld.clear()
+  lastGitKillReasonForTests = null
+  workspaceInspectHoldForTests = undefined
+  inspectTimeoutOverrideForTests = undefined
 }
 
 export function withInspectLock<T>(
