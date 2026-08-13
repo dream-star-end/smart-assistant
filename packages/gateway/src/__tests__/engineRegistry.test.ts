@@ -27,6 +27,7 @@ import "../engine/ccbAdapter.js";
 import "../engine/codexAdapter.js";
 import "../engine/grokAdapter.js";
 import { SessionManager } from "../sessionManager.js";
+import { CURSOR_ENGINE_MODEL_IDS } from "@openclaude/protocol";
 import type { OpenClaudeConfig, AgentDef } from "@openclaude/storage";
 
 function makeConfigStub(): OpenClaudeConfig {
@@ -69,9 +70,12 @@ describe("resolveEngine", () => {
     assert.equal(resolveEngine("grok-build", { id: "main" }), "grok");
   });
 
-  test("Cursor Auto → 'cursor';参数化伪模型不进入 Cursor", () => {
-    assert.equal(resolveEngine("cursor-auto", { id: "main" }), "cursor");
+  test("Cursor allowlist → 'cursor';参数化伪模型不进入 Cursor", () => {
+    for (const model of CURSOR_ENGINE_MODEL_IDS) {
+      assert.equal(resolveEngine(model, { id: "main" }), "cursor");
+    }
     assert.equal(resolveEngine("cursor-auto --force", { id: "main" }), "ccb");
+    assert.equal(resolveEngine("gpt-5.3-codex", { id: "main" }), "ccb");
   });
 
   test("codex-native provider 显式 pin → 'codex'(runnerKind 缺省/app-server)", () => {

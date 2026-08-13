@@ -87,7 +87,8 @@
     "0205_scnet_ocr_jobs",
     "0206_community_tutorials",
     "0207_grok_build_admin_pool",
-    "0208_cursor_engine"
+    "0208_cursor_engine",
+    "0209_cursor_multimodel_shared_credential"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

@@ -28,10 +28,14 @@ oc-cursor --force -- "修复已复现的测试失败，并运行最小相关测�
 可选固定模型或只读模式：
 
 ```bash
-oc-cursor --model composer-2.5 --mode plan -- "审阅当前 git diff，指出阻塞问题"
+oc-cursor --model composer-2.5-fast --mode plan -- "审阅当前 git diff，指出阻塞问题"
 ```
 
 `oc-cursor` 固定以官方 `stream-json` 输出，并原样保留该固定 CLI 版本实际发出的 NDJSON
+
+`--model` 仅接受平台验证过的官方 CLI 型号：`cursor-grok-4.6-high`、
+`composer-2.5-fast`、`claude-opus-5-thinking-high`、
+`claude-fable-5-thinking-high`、`cursor-grok-4.5-high`；省略时使用 Auto。
 事件（当前包括 system/user/assistant/tool_call/result，未来可能增加字段或事件）。不要把它
 改成 text，也不要丢弃原始事件；成功时核对 terminal result，失败时同时看非零退出码和
 stderr（失败流可能没有 terminal result）。

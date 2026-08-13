@@ -4,7 +4,12 @@
 import { spawn, type ChildProcessByStdio } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import type { Readable } from 'node:stream'
-import type { GoalStateSnapshot, OutboundContentBlock } from '@openclaude/protocol'
+import {
+  CURSOR_ENGINE_MODELS,
+  DEFAULT_CURSOR_ENGINE_MODEL,
+  type GoalStateSnapshot,
+  type OutboundContentBlock,
+} from '@openclaude/protocol'
 import type { OpenClaudeConfig } from '@openclaude/storage'
 import type { ExecutionTarget } from '../remoteTarget.js'
 import type { EngineAdapter, EngineCapabilities, EngineTurnRun, TurnParams } from './engineAdapter.js'
@@ -12,7 +17,6 @@ import type { EngineExternalBillingEvent, PartialSnapshot, PhantomSignals, Segme
 import { type EngineCreateOpts, registerEngine } from './registry.js'
 import { classifyRunError } from '../errorClassify.js'
 
-const CURSOR_MODEL = 'cursor-auto'
 const REQUEST_ID_RE = /^[0-9a-f]{32}$/
 const EMPTY_SIGNALS: PhantomSignals = { apiState: 'unknown', skipReason: null }
 
@@ -132,7 +136,12 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     let cwd = this.opts.agentBaseDir
     if (this.opts.sessionId && this.opts.getRepoSnapshot) { const s = this.opts.getRepoSnapshot(this.opts.sessionId); if (s?.status === 'ready' && s.workspaceDir) cwd = s.workspaceDir }
     const bin = process.env.OC_CURSOR_WRAPPER_BIN?.trim() || '/usr/local/bin/oc-cursor'
-    const args = ['--mode', 'ask', '--', promptOf(ctx.params.input)]
+    const selected = CURSOR_ENGINE_MODELS.find((model) => model.id === this.currentModel)
+    if (!selected) throw new Error(`Cursor model '${String(this.currentModel)}' is not allowlisted`)
+    const args = [
+      ...(selected.upstreamModel === null ? [] : ['--model', selected.upstreamModel]),
+      '--mode', 'ask', '--', promptOf(ctx.params.input),
+    ]
     const env = { ...process.env }
     for (const key of Object.keys(env)) if (key.startsWith('CURSOR_')) delete env[key]
     const proc = spawn(bin, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], detached: true, env })
@@ -224,7 +233,13 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
   waitForOutputDrain(): Promise<void> { return this.drain }
   get nativeSessionId(): null { return null }
   clearSessionId(): void {}
-  setModel(model: string | undefined): void { if (model !== undefined && model !== CURSOR_MODEL) throw new Error(`Cursor model '${model}' is not allowlisted`); this.currentModel = model }
+  setModel(model: string | undefined): void {
+    const selected = model ?? DEFAULT_CURSOR_ENGINE_MODEL
+    if (!CURSOR_ENGINE_MODELS.some((entry) => entry.id === selected)) {
+      throw new Error(`Cursor model '${selected}' is not allowlisted`)
+    }
+    this.currentModel = selected
+  }
   get model(): string | undefined { return this.currentModel }
   setEffortLevel(level: string | undefined): void { if (level !== undefined) throw new Error('Cursor engine does not expose reasoning effort') }
   get effortLevel(): undefined { return undefined }

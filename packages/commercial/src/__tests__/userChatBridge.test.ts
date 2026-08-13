@@ -2185,16 +2185,19 @@ describe("tryAutoRebindFlush regression tripwire", () => {
 });
 
 describe("Cursor external authority regression tripwire", () => {
-  test("Cursor uses the existing non-CCB authority classification and owner/audit gates", async () => {
+  test("Cursor uses the existing non-CCB authority classification and credential/audit gates", async () => {
     const source = await readFile(new URL("../ws/userChatBridge.ts", import.meta.url), "utf8");
     const cursorBranch = source.slice(
       source.indexOf("if (isCursorInboundFrame && containerId !== undefined)"),
       source.indexOf("if (\n        isCodexInboundFrame &&", source.indexOf("if (isCursorInboundFrame && containerId !== undefined)")),
     );
     assert.match(cursorBranch, /classifiedCodex: true/);
-    assert.match(cursorBranch, /OC_V5_CURSOR_OWNER_UID/);
+    assert.match(cursorBranch, /isCursorCredentialMember\(uid\)/);
+    assert.match(cursorBranch, /isCursorEngineModel\(modelCapture\)/);
+    assert.match(cursorBranch, /authorityExec\.canonicalModel !== modelCapture/);
     assert.match(cursorBranch, /isCursorContainerOnSelfHost/);
     assert.match(cursorBranch, /INSERT INTO cursor_external_usage_audit/);
+    assert.match(cursorBranch, /peerCapture, modelCapture/);
   });
 
   test("Cursor accepts only an active row on the trusted self host", async () => {

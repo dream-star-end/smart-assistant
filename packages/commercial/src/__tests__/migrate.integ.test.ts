@@ -175,6 +175,28 @@ describe("migrate.runMigrations", () => {
       "SELECT COUNT(*)::text AS cnt FROM schema_migrations",
     );
     assert.equal(cnt.rows[0].cnt, String(r.applied.length));
+
+    const cursorModels = await query<{
+      model_id: string;
+      upstream_model_id: string | null;
+      state: string;
+      enabled: boolean;
+      visibility: string;
+    }>(
+      `SELECT c.model_id, c.upstream_model_id, c.state, p.enabled, p.visibility
+         FROM model_catalog c
+         JOIN model_pricing p ON p.model_id = c.model_id
+        WHERE c.engine = 'cursor'
+        ORDER BY c.model_id`,
+    );
+    assert.deepEqual(cursorModels.rows, [
+      { model_id: "cursor-auto", upstream_model_id: null, state: "staged", enabled: false, visibility: "admin" },
+      { model_id: "cursor-composer-2.5-fast", upstream_model_id: "composer-2.5-fast", state: "staged", enabled: false, visibility: "hidden" },
+      { model_id: "cursor-fable-5-high", upstream_model_id: "claude-fable-5-thinking-high", state: "staged", enabled: false, visibility: "hidden" },
+      { model_id: "cursor-grok-4.5-high", upstream_model_id: "cursor-grok-4.5-high", state: "staged", enabled: false, visibility: "hidden" },
+      { model_id: "cursor-grok-4.6-high", upstream_model_id: "cursor-grok-4.6-high", state: "staged", enabled: false, visibility: "hidden" },
+      { model_id: "cursor-opus-5-high", upstream_model_id: "claude-opus-5-thinking-high", state: "staged", enabled: false, visibility: "hidden" },
+    ]);
   });
 
   test("running migrate again is idempotent (no duplicate inserts, no changes)", async (t) => {

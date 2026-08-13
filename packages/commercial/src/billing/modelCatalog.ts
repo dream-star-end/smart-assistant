@@ -39,6 +39,7 @@ import { query, type QueryRunner } from "../db/queries.js";
 import { getPool } from "../db/index.js";
 import { projectContextWindowForRole } from "./modelRolePolicy.js";
 import type { ModelPricing, ModelVisibility } from "./pricing.js";
+import { isCursorCredentialMember } from "../cursor/access.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 类型
@@ -535,8 +536,7 @@ export class ModelCatalogSnapshot {
     // not turn the UI visibility setting into an execution bypass.
     if (this.activeByModel.get(canonical)?.engine === "grok" && scope.role !== "admin") return false;
     if (this.activeByModel.get(canonical)?.engine === "cursor") {
-      const ownerUid = process.env.OC_V5_CURSOR_OWNER_UID?.trim();
-      if (!ownerUid || String(scope.uid) !== ownerUid) return false;
+      if (!isCursorCredentialMember(scope.uid)) return false;
     }
     if (scope.deniedModelIds?.has(canonical)) return false;
     const p = this.pricing.get(canonical);
