@@ -310,7 +310,9 @@ function verifyWorkspaceUnchanged(
 function previewForFile(absPath: string, acl: InspectFileAcl): { previewable: boolean; preview_path?: string } {
   if (hasGitPathSegment(absPath)) return { previewable: false }
   if (!acl.isFileAllowed(absPath) || acl.isFileBlocked(absPath)) return { previewable: false }
-  return { previewable: true, preview_path: absPath }
+  const cleaned = sanitizeName(absPath)
+  if (!cleaned) return { previewable: false }
+  return { previewable: true, preview_path: cleaned }
 }
 
 export let lastOpendirPathForTests: string | null = null
@@ -510,6 +512,8 @@ export let lastTrustedGitDirForTests: string | null = null
 export let lastGitKillReasonForTests: 'timeout' | 'stdout' | 'entries' | null = null
 /** Tests may await this inside collect* after the workspace identity is captured. */
 export let workspaceInspectHoldForTests: (() => Promise<void>) | undefined
+/** Tests may pause after git spawn so HTTP timeout can fire against a live child. */
+export let workspaceInspectAfterGitSpawnForTests: (() => Promise<void>) | undefined
 /** Tests may shorten the HTTP/collect clocks. Production leaves this unset. */
 export let inspectTimeoutOverrideForTests: { git?: number; list?: number } | undefined
 
@@ -529,6 +533,10 @@ export function setWorkspaceInspectAfterObjectsFdForTests(
 
 export function setWorkspaceInspectHoldForTests(fn: (() => Promise<void>) | undefined): void {
   workspaceInspectHoldForTests = fn
+}
+
+export function setWorkspaceInspectAfterGitSpawnForTests(fn: (() => Promise<void>) | undefined): void {
+  workspaceInspectAfterGitSpawnForTests = fn
 }
 
 export function setInspectTimeoutOverrideForTests(
@@ -851,6 +859,11 @@ async function runGit(opts: {
       })
       return
     }
+    try {
+      child.stdout?.pause()
+    } catch {
+      /* ignore */
+    }
     const chunks: Buffer[] = []
     let total = 0
     let truncated = false
@@ -858,6 +871,10 @@ async function runGit(opts: {
     let killedForEntries = false
     let terminating = false
     let stderrSeen = 0
+    let sawClose = false
+    let closedCode: number | null = null
+    let hookDone = workspaceInspectAfterGitSpawnForTests == null
+    let drainAndFinish: () => void = () => {}
     const stop = (reason: 'timeout' | 'stdout' | 'entries') => {
       if (terminating) return
       terminating = true
@@ -871,6 +888,7 @@ async function runGit(opts: {
         /* ignore */
       }
       terminateGit(child)
+      drainAndFinish()
     }
     const timer = setTimeout(() => stop('timeout'), opts.timeoutMs)
     const onAbort = () => stop('timeout')
@@ -902,27 +920,70 @@ async function runGit(opts: {
       }
     })
     child.stderr?.resume()
-    child.on('close', (code) => {
-      clearTimeout(timer)
-      opts.signal?.removeEventListener('abort', onAbort)
+    const resumeOut = () => {
+      try {
+        child.stdout?.resume()
+      } catch {
+        /* ignore */
+      }
+    }
+    drainAndFinish = () => {
+      if (!sawClose) return
+      if (!hookDone && !terminating) return
+      try {
+        const leftover = child.stdout?.read()
+        if (leftover && leftover.length > 0 && !timedOut && !truncated && !killedForEntries) {
+          if (total + leftover.length > WORKSPACE_INSPECT_MAX_GIT_STDOUT_BYTES) {
+            const room = WORKSPACE_INSPECT_MAX_GIT_STDOUT_BYTES - total
+            if (room > 0) chunks.push(leftover.subarray(0, room))
+            total = WORKSPACE_INSPECT_MAX_GIT_STDOUT_BYTES
+          } else {
+            chunks.push(leftover)
+            total += leftover.length
+          }
+        }
+      } catch {
+        /* ignore */
+      }
       finish({
         stdout: Buffer.concat(chunks, total),
         timedOut,
         truncated,
         killedForEntries,
-        exitCode: typeof code === 'number' ? code : null,
+        exitCode: typeof closedCode === 'number' ? closedCode : null,
       })
+    }
+    if (workspaceInspectAfterGitSpawnForTests) {
+      void Promise.resolve()
+        .then(() => workspaceInspectAfterGitSpawnForTests?.())
+        .then(
+          () => {
+            hookDone = true
+            resumeOut()
+            drainAndFinish()
+          },
+          () => {
+            hookDone = true
+            resumeOut()
+            drainAndFinish()
+          },
+        )
+    } else {
+      resumeOut()
+    }
+    const onChildDone = (code: number | null) => {
+      if (sawClose) return
+      sawClose = true
+      closedCode = code
+      clearTimeout(timer)
+      opts.signal?.removeEventListener('abort', onAbort)
+      drainAndFinish()
+    }
+    child.on('close', (code) => {
+      onChildDone(typeof code === 'number' ? code : null)
     })
     child.on('error', () => {
-      clearTimeout(timer)
-      opts.signal?.removeEventListener('abort', onAbort)
-      finish({
-        stdout: Buffer.concat(chunks, total),
-        timedOut,
-        truncated,
-        killedForEntries,
-        exitCode: null,
-      })
+      onChildDone(null)
     })
   })
 }
@@ -1271,6 +1332,7 @@ export function resetInspectLimiterForTests(): void {
   sessionHeld.clear()
   lastGitKillReasonForTests = null
   workspaceInspectHoldForTests = undefined
+  workspaceInspectAfterGitSpawnForTests = undefined
   inspectTimeoutOverrideForTests = undefined
 }
 
