@@ -3777,6 +3777,262 @@ describe("ChatSocket interrupted continuation", () => {
     sock.stop();
   });
 
+  test("durable journal resets the reducer cursor when a replacement container restarts frameSeq", async () => {
+    const sock = makeSocket();
+    const sessId = "s-live-container-generation";
+    const sessionKey = `agent:main:webchat:dm:${sessId}`;
+    const oldClientMessageId = "cm-live-old-container";
+    const currentClientMessageId = "cm-live-current-container";
+    const session = sock.ensureSession(sessId, "main");
+    session.messages.push(
+      { id: oldClientMessageId, role: "user", text: "old interrupted task", ts: 1, status: "sent" },
+      {
+        id: "old-durable-thinking",
+        role: "thinking",
+        text: "OLD_GENERATION_PROCESS",
+        ts: 1_000,
+        _source: "server",
+        _turnOwnerId: oldClientMessageId,
+      },
+      {
+        id: "old-durable-answer",
+        role: "assistant",
+        text: "OLD_GENERATION_PARTIAL",
+        ts: 2_000,
+        _source: "server",
+        _turnOwnerId: oldClientMessageId,
+      },
+      { id: currentClientMessageId, role: "user", text: "current task", ts: 2, status: "sent" },
+    );
+    // This is the exact cold-refresh shape from production: IndexedDB still
+    // carries the high cursor from the previous container generation.
+    session._lastFrameSeqByKey = { [sessionKey]: 1_914 };
+    session._lastFrameSeq = 1_914;
+    session._sendingInFlight = true;
+    session._activeClientMessageId = currentClientMessageId;
+
+    const record = (
+      recordId: string,
+      streamKey: string,
+      clientMessageId: string,
+      frameSeq: number,
+      blocks: unknown[],
+      isFinal = false,
+    ) => ({
+      recordId,
+      streamKey,
+      source: "gateway" as const,
+      clientMessageId,
+      payload: {
+        type: "outbound.message",
+        sessionKey,
+        frameSeq,
+        peer: { id: sessId, kind: "dm" },
+        clientMessageId,
+        blocks,
+        isFinal,
+        // record_id order is also wall-clock order. A replacement container
+        // resets frameSeq, not the outbound timestamp.
+        ts: Number(recordId) * 1_000,
+      },
+    });
+    const oldStream = "dispatch:77777777-7777-4777-8777-777777777777:1";
+    const currentStream = "dispatch:88888888-8888-4888-8888-888888888888:1";
+    const requests: string[] = [];
+
+    await sock.hydrateDurableLiveFrameJournal(
+      sessId,
+      async (after) => {
+        requests.push(after);
+        return after === "0"
+          ? {
+              frames: [
+                record("1", oldStream, oldClientMessageId, 998, [{
+                  kind: "thinking", text: "OLD_GENERATION_PROCESS",
+                }]),
+                record("2", oldStream, oldClientMessageId, 1_914, [{
+                  kind: "text", text: "OLD_GENERATION_PARTIAL",
+                }], true),
+                record("3", currentStream, currentClientMessageId, 1, [{
+                  kind: "thinking", text: "CURRENT_GENERATION_PROCESS",
+                }]),
+                record("4", currentStream, currentClientMessageId, 2, [{
+                  kind: "text", text: "CURRENT_GENERATION_ANSWER",
+                }]),
+              ],
+              nextCursor: "4",
+              hasMore: false,
+              streamClientMessageIds: [oldClientMessageId, currentClientMessageId],
+              hasTapeProjection: false,
+            }
+          : {
+              frames: [], nextCursor: null, hasMore: false,
+              streamClientMessageIds: [oldClientMessageId, currentClientMessageId],
+              hasTapeProjection: false,
+            };
+      },
+      async () => {},
+    );
+
+    expect(requests).toEqual(["0", "4"]);
+    expect(session._lastFrameSeqByKey?.[sessionKey]).toBe(2);
+    expect(session.messages.some((message) =>
+      message.role === "thinking" && message.text === "OLD_GENERATION_PROCESS"
+    )).toBe(true);
+    expect(session.messages.some((message) =>
+      message.role === "assistant" && message.text === "OLD_GENERATION_PARTIAL"
+    )).toBe(true);
+    expect(session.messages.some((message) =>
+      message.role === "thinking" && message.text === "CURRENT_GENERATION_PROCESS"
+    )).toBe(true);
+    expect(session.messages.filter((message) =>
+      message.role === "assistant" && message.text === "CURRENT_GENERATION_ANSWER"
+    )).toHaveLength(1);
+
+    await sock.hydrateDurableLiveFrameJournal(
+      sessId,
+      async (after) => {
+        expect(after).toBe("4");
+        return {
+          frames: [record("5", currentStream, currentClientMessageId, 3, [{
+            kind: "text", text: "CURRENT_GENERATION_INCREMENT",
+          }])],
+          nextCursor: "5",
+          hasMore: false,
+          streamClientMessageIds: [oldClientMessageId, currentClientMessageId],
+          hasTapeProjection: false,
+        };
+      },
+      async () => {},
+    );
+    expect(session._lastFrameSeqByKey?.[sessionKey]).toBe(3);
+    const currentAnswer = session.messages
+      .filter((message) =>
+        message.role === "assistant" && message._turnOwnerId === currentClientMessageId
+      )
+      .map((message) => message.text)
+      .join("");
+    expect(currentAnswer).toContain("CURRENT_GENERATION_ANSWER");
+    expect(currentAnswer.split("CURRENT_GENERATION_INCREMENT")).toHaveLength(2);
+    sock.stop();
+  });
+
+  test("durable generation boundary keeps a newer live cursor below the old high-water mark", () => {
+    const sock = makeSocket();
+    const sessId = "s-live-generation-overlap";
+    const sessionKey = `agent:main:webchat:dm:${sessId}`;
+    const clientMessageId = "cm-live-generation-overlap";
+    const session = sock.ensureSession(sessId, "main");
+    session.messages.push({
+      id: clientMessageId,
+      role: "user",
+      text: "current task",
+      ts: 1,
+      status: "sent",
+    });
+    const generationCursor = new Map([[sessionKey, {
+      frameSeq: 1_914,
+      consumedAuthoritativeResetEpoch: 0,
+    }]]);
+    const payload = {
+      type: "outbound.message",
+      sessionKey,
+      frameSeq: 1,
+      peer: { id: sessId, kind: "dm" },
+      clientMessageId,
+      blocks: [{ kind: "thinking", text: "LIVE_BEFORE_JOURNAL" }],
+      isFinal: false,
+      ts: 3_000,
+    };
+    // sys.cold_start/resume or the live socket already admitted frame 1 from
+    // the replacement container before the durable copy reached the reducer.
+    session._lastFrameSeqByKey = { [sessionKey]: 0 };
+    session._lastFrameSeq = 0;
+    applyOutboundMessage(session, payload as unknown as OutboundMessageWire, {});
+    expect(session._lastFrameSeqByKey?.[sessionKey]).toBe(1);
+
+    sock.applyDurableLiveFrames(
+      sessId,
+      [{
+        recordId: "2",
+        streamKey: "dispatch:99999999-9999-4999-8999-999999999999:1",
+        source: "gateway",
+        clientMessageId,
+        payload,
+      }],
+      [],
+      generationCursor,
+    );
+
+    expect(session._lastFrameSeqByKey?.[sessionKey]).toBe(1);
+    expect(session.messages.filter((message) =>
+      message.role === "thinking" && message.text === "LIVE_BEFORE_JOURNAL"
+    )).toHaveLength(1);
+    sock.stop();
+  });
+
+  test("durable generation boundary does not replay a new live cursor above the old high-water mark", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    const sessId = "s-live-generation-high-overlap";
+    const sessionKey = `agent:main:webchat:dm:${sessId}`;
+    const clientMessageId = "cm-live-generation-high-overlap";
+    const session = sock.ensureSession(sessId, "main");
+    session.messages.push({
+      id: clientMessageId,
+      role: "user",
+      text: "current task",
+      ts: 1,
+      status: "sent",
+    });
+    session._lastFrameSeqByKey = { [sessionKey]: 1_914 };
+    session._lastFrameSeq = 1_914;
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.active_turn_replay_start",
+      sessionKey,
+      channel: "webchat",
+      peer: { id: sessId, kind: "dm" },
+      clientMessageId,
+    }) });
+    const livePayload = {
+      type: "outbound.message",
+      sessionKey,
+      frameSeq: 2_000,
+      peer: { id: sessId, kind: "dm" },
+      clientMessageId,
+      blocks: [{ kind: "thinking", text: "HIGH_LIVE_BEFORE_JOURNAL" }],
+      isFinal: false,
+      ts: 4_000,
+    };
+    ws.onmessage?.({ data: JSON.stringify(livePayload) });
+    expect(session._lastFrameSeqByKey?.[sessionKey]).toBe(2_000);
+
+    sock.applyDurableLiveFrames(
+      sessId,
+      [{
+        recordId: "2",
+        streamKey: "dispatch:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa:1",
+        source: "gateway",
+        clientMessageId,
+        payload: { ...livePayload, frameSeq: 1 },
+      }],
+      [],
+      new Map([[sessionKey, {
+        frameSeq: 1_914,
+        consumedAuthoritativeResetEpoch: 0,
+      }]]),
+    );
+
+    expect(session._lastFrameSeqByKey?.[sessionKey]).toBe(2_000);
+    expect(session.messages.filter((message) =>
+      message.role === "thinking" && message.text === "HIGH_LIVE_BEFORE_JOURNAL"
+    )).toHaveLength(1);
+    sock.stop();
+  });
+
   test("failed incremental paging retries from the last committed cursor without duplicating frames", async () => {
     const sock = makeSocket();
     const sessId = "s-live-retry-cursor";

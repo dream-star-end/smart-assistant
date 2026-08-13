@@ -76,6 +76,8 @@ import {
   KEEPALIVE_INTERVAL_MS,
   LIVENESS_CONFIRM_MS,
   OFFLINE_LATCH_GRACE_MS,
+  frameSeqKey,
+  getFrameSeqCursor,
   onopenSetInitialStatus,
   PROBE_TIMEOUT_KEEPALIVE_MS,
   PROBE_TIMEOUT_VISIBILITY_MS,
@@ -543,12 +545,23 @@ export class ChatSocket {
    * released through the same frameSeq reducer so REST/WS overlap is exact. */
   private readonly durableHydrationStates = new Map<string, { buffered: OutboundWire[] }>();
   private readonly durableHydrationTails = new Map<string, Promise<void>>();
+  /** Page-lifetime count of server-authoritative cursor resets. The durable
+   * checkpoint consumes these epochs at a journal generation boundary so a
+   * replacement-container stream already applied live is never replayed. */
+  private readonly authoritativeFrameSeqResetEpochBySessionKey = new Map<string, number>();
   /** Page-lifetime journal checkpoint shared by history selection and continuous reconcile.
    * The first exact rebuild starts at zero; later reads append strictly after `cursor` and
    * never destructively reset an already-visible process transcript. */
   private readonly durableLiveJournalCheckpoints = new Map<string, {
     cursor: string;
     liveClientMessageIds: Set<string>;
+    /** Last journaled frameSeq for each raw wire sessionKey. Unlike the
+     * reducer cursor, this follows record_id order across container
+     * generations so a sequence restart can be recognized exactly once. */
+    lastDurableFrameSeqBySessionKey: Map<string, {
+      frameSeq: number;
+      consumedAuthoritativeResetEpoch: number;
+    }>;
   }>();
   /** Exact active-turn candidate sets already attempted on the current WS.
    * History can arrive after the initial shell hello; each new candidate set
@@ -1769,6 +1782,7 @@ export class ChatSocket {
         // Only this direct, server-verified boundary may move an agent-scoped
         // cursor backwards. The following replay contains exclusively frames
         // after that exact turn's server-owned baseSeq.
+        this.noteAuthoritativeFrameSeqReset(sess, frame);
         resetFrameSeqCursor(sess, frame);
         sess._activeClientMessageId = frame.clientMessageId;
         sess._sendingInFlight = true;
@@ -1780,7 +1794,12 @@ export class ChatSocket {
       case "outbound.resume_failed": {
         const frame = f as OutboundResumeFailedWire;
         const sess = frame.peer?.id ? this.sessions.get(frame.peer.id) : null;
-        if (sess) applyResumeFailed(sess, frame, this.effects());
+        if (sess) {
+          if (frame.to === 0 && frame.reason === "no_buffer") {
+            this.noteAuthoritativeFrameSeqReset(sess, frame);
+          }
+          applyResumeFailed(sess, frame, this.effects());
+        }
         return;
       }
       case "outbound.cost_charged": {
@@ -1819,6 +1838,7 @@ export class ChatSocket {
           // frameSeq 游标立即归零,否则新生代帧 seq=1..旧游标 被 acceptFrameSeq 当重复帧
           // 黑洞(与 resume_failed no_buffer 同根因;此处覆盖「连接不断、容器中途回收」
           // 没有 hello 仲裁的场景,生产实证见 reducer.resetFrameSeqCursor 注释)。
+          this.noteAuthoritativeAgentFrameSeqResets(sess);
           resetAgentFrameSeqCursorsForSession(sess);
           this.deps.persistSession?.(sess.id); // 游标变更立即落地(断点续传语义)
         }
@@ -1930,6 +1950,29 @@ export class ChatSocket {
     if (!state) return false;
     state.buffered.push(f);
     return true;
+  }
+
+  private noteAuthoritativeFrameSeqReset(
+    sess: ChatSession,
+    frame: { sessionKey?: string },
+  ): void {
+    const key = frameSeqKey(frame, sess.id);
+    this.authoritativeFrameSeqResetEpochBySessionKey.set(
+      key,
+      (this.authoritativeFrameSeqResetEpochBySessionKey.get(key) ?? 0) + 1,
+    );
+  }
+
+  private noteAuthoritativeAgentFrameSeqResets(sess: ChatSession): void {
+    const byKey = sess._lastFrameSeqByKey;
+    if (!byKey || typeof byKey !== "object") return;
+    const safeId = String(sess.id).replace(/[^a-zA-Z0-9_-]/g, "_");
+    const suffix = `:webchat:dm:${safeId}`;
+    for (const key of Object.keys(byKey)) {
+      if (key.startsWith("agent:") && key.endsWith(suffix)) {
+        this.noteAuthoritativeFrameSeqReset(sess, { sessionKey: key });
+      }
+    }
   }
 
   /** Reconcile a server-confirmed duplicate without touching another queued
@@ -2355,6 +2398,13 @@ export class ChatSocket {
     }
     this.clearContinuousReconcile(sessId);
     this.durableLiveJournalCheckpoints.delete(sessId);
+    const safeId = String(sessId).replace(/[^a-zA-Z0-9_-]/g, "_");
+    const suffix = `:webchat:dm:${safeId}`;
+    for (const key of this.authoritativeFrameSeqResetEpochBySessionKey.keys()) {
+      if (key === `peer:${sessId}` || key.endsWith(suffix)) {
+        this.authoritativeFrameSeqResetEpochBySessionKey.delete(key);
+      }
+    }
     this.maybePromoteToConnected();
     this.pendingRepoBind.delete(sessId);
     this.transientNotices.delete(sessId);
@@ -2386,6 +2436,7 @@ export class ChatSocket {
     this.reconcileRunTokens.clear();
     this.reconcileClientMessageIds.clear();
     this.durableLiveJournalCheckpoints.clear();
+    this.authoritativeFrameSeqResetEpochBySessionKey.clear();
     for (const timer of this.controlPersistRetryTimers.values()) clearTimeout(timer);
     this.controlPersistRetryTimers.clear();
     this.activeReplayAttemptKeys.clear();
@@ -2851,6 +2902,12 @@ export class ChatSocket {
       const previousLiveOwners = checkpoint?.liveClientMessageIds ?? new Set<string>();
       let currentLiveOwners = new Set(previousLiveOwners);
       const observedLiveOwners = new Set(previousLiveOwners);
+      // Work on a copy and commit it with the record cursor only after every
+      // page succeeds. A failed later page must leave both checkpoints at the
+      // same retry boundary.
+      const lastDurableFrameSeqBySessionKey = new Map(
+        checkpoint?.lastDurableFrameSeqBySessionKey ?? [],
+      );
       let sawTapeProjection = false;
 
       const readPages = async (stage: DurableLiveFrame[] | null): Promise<void> => {
@@ -2862,7 +2919,12 @@ export class ChatSocket {
           if (stage) {
             stage.push(...page.frames);
           } else if (page.frames.length > 0) {
-            this.applyDurableLiveFrames(sessId, page.frames);
+            this.applyDurableLiveFrames(
+              sessId,
+              page.frames,
+              [],
+              lastDurableFrameSeqBySessionKey,
+            );
           }
           if (page.hasMore && !page.nextCursor) {
             throw new Error("live frame page missing cursor");
@@ -2875,7 +2937,12 @@ export class ChatSocket {
       if (initial) {
         const stagedFrames: DurableLiveFrame[] = [];
         await readPages(stagedFrames);
-        this.applyDurableLiveFrames(sessId, stagedFrames, [...observedLiveOwners]);
+        this.applyDurableLiveFrames(
+          sessId,
+          stagedFrames,
+          [...observedLiveOwners],
+          lastDurableFrameSeqBySessionKey,
+        );
         // Close snapshot→reset races while stamped WS frames remain buffered.
         await readPages(null);
       } else {
@@ -2892,6 +2959,7 @@ export class ChatSocket {
       this.durableLiveJournalCheckpoints.set(sessId, {
         cursor,
         liveClientMessageIds: currentLiveOwners,
+        lastDurableFrameSeqBySessionKey,
       });
     });
   }
@@ -2939,6 +3007,10 @@ export class ChatSocket {
     sessId: string,
     frames: DurableLiveFrame[],
     resetClientMessageIds: string[] = [],
+    lastDurableFrameSeqBySessionKey?: Map<string, {
+      frameSeq: number;
+      consumedAuthoritativeResetEpoch: number;
+    }>,
   ): void {
     const sess = this.sessions.get(sessId);
     if (!sess) return;
@@ -2976,6 +3048,53 @@ export class ChatSocket {
         !peer || typeof peer !== "object" || Array.isArray(peer) ||
         (peer as { id?: unknown }).id !== sessId
       ) continue;
+      const rawSessionKey = raw.sessionKey;
+      const frameSeq = raw.frameSeq;
+      if (
+        lastDurableFrameSeqBySessionKey &&
+        typeof rawSessionKey === "string" && rawSessionKey &&
+        typeof frameSeq === "number" && Number.isSafeInteger(frameSeq) && frameSeq > 0
+      ) {
+        const previousDurable = lastDurableFrameSeqBySessionKey.get(rawSessionKey);
+        const authoritativeResetEpoch =
+          this.authoritativeFrameSeqResetEpochBySessionKey.get(rawSessionKey) ?? 0;
+        if (previousDurable !== undefined && frameSeq <= previousDurable.frameSeq) {
+          // A replacement container starts its outbound ring at one while the
+          // wire sessionKey stays stable. If refresh restored the previous
+          // generation's high reducer cursor, reset it before replaying this
+          // generation. A server-authoritative cold-start/resume reset may
+          // already have admitted this generation live, even beyond the old
+          // high-water mark; its unconsumed epoch keeps that live cursor so
+          // journal/WS overlap stays deduplicated.
+          const currentReducerSeq = getFrameSeqCursor(
+            sess._lastFrameSeqByKey,
+            sess._lastFrameSeq,
+            rawSessionKey,
+          );
+          const resetAlreadyApplied = authoritativeResetEpoch >
+            previousDurable.consumedAuthoritativeResetEpoch;
+          if (!resetAlreadyApplied && currentReducerSeq >= previousDurable.frameSeq) {
+            resetFrameSeqCursor(sess, { sessionKey: rawSessionKey });
+          }
+          lastDurableFrameSeqBySessionKey.set(rawSessionKey, {
+            frameSeq,
+            consumedAuthoritativeResetEpoch: authoritativeResetEpoch,
+          });
+        } else if (previousDurable) {
+          // An authoritative reset can race ahead of still-arriving records
+          // from the old journal generation. Consume its epoch only when the
+          // sequence actually crosses the generation boundary.
+          lastDurableFrameSeqBySessionKey.set(rawSessionKey, {
+            ...previousDurable,
+            frameSeq,
+          });
+        } else {
+          lastDurableFrameSeqBySessionKey.set(rawSessionKey, {
+            frameSeq,
+            consumedAuthoritativeResetEpoch: authoritativeResetEpoch,
+          });
+        }
+      }
       this.dispatch(raw as unknown as OutboundWire);
     }
     rebuildIndexes(sess);
