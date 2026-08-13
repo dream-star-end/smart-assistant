@@ -44,5 +44,6 @@ Windows 10/11 Narrator、高对比、100–200% 缩放、Snap、Alt 菜单焦点
 
 ## Verification
 
-- `npm --prefix apps/windows run check` — 78 tests, 0 fail
+- `npm --prefix apps/windows run check` — 82 tests, 0 fail
 - dual-view `--smoke-test`：`sendInputEvent`、F6、modal hide/restore、下载焦点、indeterminate、forced-colors、520×360、1366×768、未就绪 overlay 140px 预留、resize 后 chrome 合同
+- Windows packaged smoke 允许两种 settle：`env(titlebar-area-*)>0` 走 WCO safe-area；env=0 时 `overlayActive && !wcoReady` + 右侧 140px 预留为合法稳定态（WebContentsView 可能拿不到 CSS env）

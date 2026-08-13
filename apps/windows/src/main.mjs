@@ -1251,16 +1251,37 @@ const SHELL_CHROME_CONTRACT_SCRIPT = `(() => {
     titlebarAreaWidth: envNumber('titlebar-area-width'),
     titlebarAreaHeight: envNumber('titlebar-area-height'),
     wcoReady: document.documentElement.dataset.wcoReady,
+    paddingRight: Number.parseFloat(getComputedStyle(document.querySelector('.command-surface')).paddingRight),
+    moreRight: document.querySelector('#more-menu-button').getBoundingClientRect().right,
+    surfaceRight: document.querySelector('.command-surface').getBoundingClientRect().right,
   }
 })()`
+
+function overlayChromeSettled(chromeContract, overlayIsActive) {
+  if (!chromeContract || chromeContract.overlayActive !== overlayIsActive) return false
+  if (overlayIsActive !== true) return chromeContract.wcoReady === 'false'
+  if (chromeContract.wcoReady === 'true') {
+    return chromeContract.titlebarAreaWidth > 0 && chromeContract.titlebarAreaHeight > 0
+  }
+  return (
+    chromeContract.wcoReady === 'false' &&
+    chromeContract.paddingRight >= 139 &&
+    chromeContract.moreRight <= chromeContract.surfaceRight - 139
+  )
+}
 
 function assertShellChromeContract(chromeContract, overlayIsActive) {
   assert.equal(chromeContract.overlayActive, overlayIsActive)
   assert.equal(chromeContract.downloadsRegion, 'no-drag')
   assert.equal(chromeContract.moreRegion, 'no-drag')
   assert.equal(chromeContract.statusRegion, 'no-drag')
-  if (overlayIsActive) {
-    assert.equal(chromeContract.wcoReady, 'true')
+  if (overlayIsActive !== true) {
+    assert.equal(chromeContract.wcoReady, 'false')
+    assert.notEqual(chromeContract.brandRegion, 'drag')
+    assert.notEqual(chromeContract.spacerRegion, 'drag')
+    return
+  }
+  if (chromeContract.wcoReady === 'true') {
     assert.ok(chromeContract.titlebarAreaWidth > 0, 'win32 overlay must expose a positive WCO width')
     assert.ok(
       chromeContract.titlebarAreaHeight > 0,
@@ -1280,11 +1301,16 @@ function assertShellChromeContract(chromeContract, overlayIsActive) {
       assert.ok(chromeContract[name].top >= safeTop - 1, `${name} top escaped WCO safe area`)
       assert.ok(chromeContract[name].bottom <= safeBottom + 1, `${name} bottom escaped WCO safe area`)
     }
-  } else {
-    assert.equal(chromeContract.wcoReady, 'false')
-    assert.notEqual(chromeContract.brandRegion, 'drag')
-    assert.notEqual(chromeContract.spacerRegion, 'drag')
+    return
   }
+  assert.equal(chromeContract.wcoReady, 'false')
+  assert.ok(chromeContract.paddingRight >= 139, 'unready overlay must reserve caption-button space')
+  assert.notEqual(chromeContract.brandRegion, 'drag')
+  assert.notEqual(chromeContract.spacerRegion, 'drag')
+  assert.ok(
+    chromeContract.moreRight <= chromeContract.surfaceRight - 139,
+    'More button entered the unready caption reserve',
+  )
 }
 
 async function waitForShellChromeContract(shellContents, overlayIsActive, message) {
@@ -1292,11 +1318,7 @@ async function waitForShellChromeContract(shellContents, overlayIsActive, messag
   await waitForCondition(
     async () => {
       chromeContract = await shellContents.executeJavaScript(SHELL_CHROME_CONTRACT_SCRIPT)
-      return (
-        chromeContract &&
-        chromeContract.overlayActive === overlayIsActive &&
-        chromeContract.wcoReady === (overlayIsActive ? 'true' : 'false')
-      )
+      return overlayChromeSettled(chromeContract, overlayIsActive)
     },
     message,
   ).catch((error) => {

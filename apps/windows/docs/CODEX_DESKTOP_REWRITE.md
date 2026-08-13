@@ -157,7 +157,7 @@ Aurora 现网 `SettingsCenter` 只有：账户与计费 / 用量 / 偏好 / 反�
 
 | 界面/状态 | 当前 | 目标 | 本轮 | 验收点 |
 | --- | --- | --- | --- | --- |
-| 窗口 chrome | 系统标题栏或 WCO | 内容顶到上沿；Win caption 右上 44px | **shell** | overlayActive 时 drag/safe-area；失败回退默认标题栏 |
+| 窗口 chrome | 系统标题栏或 WCO | 内容顶到上沿；Win caption 右上 44px | **shell** | `overlayActive && wcoReady` 才 drag/safe-area；env=0 时 140px 预留为合法稳定态；构造失败回退默认标题栏 |
 | 44px app bar | Aurora / 下载 / More | 克制；无浏览器按钮；无会话标题 | **shell** | 静态文案；F6 循环 |
 | 主聊天三栏 | web 已有左栏 268px + 中栏；无 Codex 式右栏 | 截图三栏 | **web PR** | 比例/折叠/最小宽 |
 | 会话列表 | web `Sidebar`：时间分组，非项目文件夹 | 项目/工作区层级 + 活跃条 | **web PR** | 不进 shell |
@@ -198,9 +198,9 @@ BaseWindow
 
 原子双路径：第一次 `hidden + overlay(height:44)`；仅构造抛错才 destroy 后走不含 overlay 的第二路径。`overlayActive` 仅成功路径为 true。
 
-**几何合同**：`data-wco-ready` 仅当 overlay 激活 **且** `env(titlebar-area-width/height) > 0`。监听 `resize` 与 `windowControlsOverlay.geometrychange` 重新测量，禁止把过期 ready 留在最大化/还原之后。CSS drag / width 同时要求 `data-overlay-active=true` 与 `data-wco-ready=true`。
+**几何合同**：`data-wco-ready` 仅当 overlay 激活 **且 CSS** `env(titlebar-area-width/height) > 0`。这是 drag/width 的唯一几何源，不另用 `getTitlebarAreaRect()` 以免与 env=0 的布局分裂。监听 `resize` 与 `windowControlsOverlay.geometrychange` 重新测量。
 
-**未就绪安全态**：`overlayActive && !wcoReady` 时不启用 drag/width，`.command-surface` 右侧 padding 140px，避免按钮落到系统最小/最大/关闭之下。Smoke 用属性探测锁定该合同；`0 → valid → 0 → valid` 与 maximize/unmaximize 在 win32 overlay 路径上断言。
+**未就绪安全态**：Electron `WebContentsView` 上 WCO 构造成功后 env 仍可能为 0。此时 `overlayActive && !wcoReady` 是**合法稳定态**：不启用 drag/width，右侧 padding 140px，避免控件落到系统 caption 下。Smoke 两种都 settle：env 正值走 safe-area；env=0 走 140px 预留。
 
 ### 5.3 菜单与 IME
 
