@@ -1,0 +1,16 @@
+[Unit]
+Description=Cloudflared quick tunnel for OpenClaude V5 self-host gateway (18790)
+After=network.target openclaude-v5-selfhost.service
+Wants=openclaude-v5-selfhost.service
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:18790
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/var/log/cloudflared-v5-selfhost.log
+StandardError=append:/var/log/cloudflared-v5-selfhost.log
+
+[Install]
+WantedBy=multi-user.target

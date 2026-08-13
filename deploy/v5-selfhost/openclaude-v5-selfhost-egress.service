@@ -1,0 +1,23 @@
+[Unit]
+Description=OpenClaude v5 Selfhost Egress Proxy (LLM upstream plane)
+After=network.target postgresql.service redis-server.service docker.service
+Wants=postgresql.service redis-server.service docker.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/openclaude/openclaude-v5-selfhost
+EnvironmentFile=/etc/openclaude/commercial-v5-selfhost.env
+Environment="PATH=/root/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="NODE_ENV=production"
+ExecStart=/usr/bin/npx tsx packages/commercial/src/egress/main.ts
+Restart=on-failure
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=1860
+SendSIGKILL=yes
+StandardOutput=append:/var/log/openclaude-v5-selfhost-egress.log
+StandardError=append:/var/log/openclaude-v5-selfhost-egress.log
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,16 @@
+[Unit]
+# 让 v5 容器网段能访问宿主 22。必须插在 V5_EGRESS_IN 链首:
+# setup-host-net.sh 重建该链时链尾是 DROP。本 unit Requires hostnet,保证开机顺序;
+# 但 oneshot 已 active 时不会因 hostnet 重跑而自动再执行,部署脚本在手工
+# setup-host-net 之后必须 systemctl restart 本 unit。
+Description=OpenClaude v5 selfhost: allow container SSH to host:22
+After=openclaude-v5-selfhost-hostnet.service
+Requires=openclaude-v5-selfhost-hostnet.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash /opt/openclaude/openclaude-v5-selfhost/deploy/v5-selfhost/sshgate-insert.sh
+
+[Install]
+WantedBy=multi-user.target

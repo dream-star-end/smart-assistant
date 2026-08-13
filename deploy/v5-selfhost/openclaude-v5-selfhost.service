@@ -1,0 +1,29 @@
+[Unit]
+# v5 本机自用实例 —— 与个人版 openclaude.service 隔离,不触碰 kl-mirror 生产。
+Description=OpenClaude Gateway (v5 selfhost)
+After=network.target postgresql.service redis-server.service docker.service openclaude.service
+Wants=postgresql.service redis-server.service docker.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/openclaude/openclaude-v5-selfhost
+EnvironmentFile=/etc/openclaude/commercial-v5-selfhost.env
+Environment="PATH=/root/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="OPENCLAUDE_HOME=/root/.openclaude-v5-selfhost"
+Environment="NODE_ENV=production"
+Environment="OC_V3_CCB_BASELINE_DIR=/opt/openclaude/openclaude-v5-selfhost/packages/commercial/agent-sandbox/ccb-baseline"
+ExecStart=/usr/bin/npx tsx packages/cli/src/index.ts gateway
+Restart=on-failure
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=15
+SendSIGKILL=yes
+StandardOutput=append:/var/log/openclaude-v5-selfhost.log
+StandardError=append:/var/log/openclaude-v5-selfhost.log
+LimitNOFILE=65536
+StateDirectory=openclaude-v5-selfhost
+StateDirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target
