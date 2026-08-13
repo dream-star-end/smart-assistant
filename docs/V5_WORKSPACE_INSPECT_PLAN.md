@@ -2,7 +2,7 @@
 
 > 威胁模型：`docs/V5_WORKSPACE_INSPECT_THREAT_MODEL.md`（Codex #3 **PASS**；迟到审查补丁已写入 T2/T5/T6）  
 > 实现方案审 #1：**FAIL**（6 Finding，已闭合于 `b685671d3`）。#2：**PASS**（只核对该 6 条）。  
-> #3：**FAIL**（3 Finding）。#4：**FAIL**（HEAD 误拒正常终止 LF）。本版已吸收；待 #5 PASS 才写生产代码。  
+> #3：**FAIL**（3 Finding）。#4：**FAIL**（HEAD 误拒正常终止 LF）。#5：**FAIL**（objects swap 测试未进 §4.4/§6）。本版已吸收；待 #6 PASS 才写生产代码。  
 > 本轮：**纯后端**。合入后前端零行为变化。PR-B 不做。不部署、不合入。  
 > 基线：`origin/feat/v5-aurora-rewrite` @ `e4f3fc930`  
 > 分支：`feat/v5-workspace-git-stat`
@@ -112,7 +112,7 @@ Vendor/VCS skip 名：`node_modules` `.git` `.svn` `.hg` `.venv` `venv` `__pycac
 3. **受信临时 gitdir**（`mkdtemp`）：只写最小 `config`（无 `filter.*` / `include.path` / `includeIf` / `core.worktree` / hooks / fsmonitor）。**不**把 `--git-dir` 或 `alternates` 指回原始 `.git` 文本路径。
    - **HEAD 契约（先校验再拷贝）**：经 `gfd` 逐段 nofollow 打开 `HEAD`。读出后**只剥一个终止 LF**（`\\n` / U+000A），再校验。允许 (a) 40-hex detached SHA，或 (b) `ref: refs/<rest>`，其中 `<rest>` 按 `/` 拆段，每段 `^[A-Za-z0-9._-]+$`、禁止 `.`/`..`/空段，完整路径必须落在 `refs/**`。拒绝：其它前后空白、CR、嵌入换行、多行、`ref: ../../etc/passwd`、绝对路径、相对 `objects/`。正常 `ref: refs/heads/main\\n` 与 `40hex\\n` 必须成功。失败 → `not_a_repo`。
    - **拷贝闸**：只拷 `HEAD`、`index`、可选 `packed-refs`、以及（b）指向的**那一个** ref 文件。每一跳 `lstat`+`open(O_RDONLY|O_NOFOLLOW|O_NONBLOCK)`，**`fstat` 必须是 regular file**（拒 FIFO/socket/dir/symlink）。单文件上限：HEAD/ref 256B、`packed-refs` 2MiB、`index` 8MiB；合计 ≤ 10MiB。超限或非 regular → 失败并清理。
-   - **objects 独立 fd**：`open(O_RDONLY|O_DIRECTORY|O_NOFOLLOW)` `gfd` 下的 `objects` → `ofd`。`objects/info/alternates` 只写子进程里继承到的 `/proc/self/fd/<ofd>`（与 wfd/gfd 一样进 `stdio` 继承表），**禁止**写 `/proc/self/fd/<gfd>/objects` 这种仍可被中间段 symlink/swap 的路径。
+   - **objects 独立 fd**：`open(O_RDONLY|O_DIRECTORY|O_NOFOLLOW)` `gfd` 下的 `objects` → `ofd`。`objects/info/alternates` 只写子进程里继承到的 `/proc/self/fd/<ofd>`（与 wfd/gfd 一样进 `stdio` 继承表），**禁止**写 `/proc/self/fd/<gfd>/objects` 这种仍可被中间段 symlink/swap 的路径。`ofd` 打开之后，即使原 `objects` 路径被 rename / 换成 symlink / 换成树外目录，git 也只能经已锚定 inode 读；不得回退到路径文本。
    - 不拷贝、不 symlink 原始 `config`、`hooks`、`commondir`。`finally` 删除临时目录。
 4. `spawn` **显式继承** `wfd`/`gfd`/`ofd`。argv：`--git-dir=<tmpdir> --work-tree=/proc/self/fd/<wfd>` `--no-optional-locks` `--ignore-submodules=all` `--no-lazy-fetch`。`diff`/`numstat` 加 `--no-ext-diff --no-textconv`（纵深，不是 filter 的替代）。
 5. env 仅：`PATH` `LC_ALL=C` `GIT_CONFIG_NOSYSTEM=1` `GIT_CONFIG_GLOBAL=/dev/null` `GIT_TERMINAL_PROMPT=0` `GIT_OPTIONAL_LOCKS=0` `GIT_PAGER=cat` `PAGER=cat`。不继承 `GIT_EXTERNAL_DIFF` `GIT_DIR` `GIT_WORK_TREE` `GIT_ASKPASS` `GIT_TRACE`。
@@ -121,7 +121,7 @@ Vendor/VCS skip 名：`node_modules` `.git` `.svn` `.hg` `.venv` `venv` `__pycac
 8. **准备阶段纳入同一 deadline**：步骤 1–3 的 open/copy 与 spawn 共用 git 5s 时钟。FIFO 因 `O_NONBLOCK`+regular-file 闸立即失败，不得阻塞到超时。失败路径同样 `finally` 删临时目录、关 fd、放信号量。
 9. 结束后按 §4.3.8 复核 snapshot+inode；失败 409。
 
-测试：`.git/config` 写入 `core.worktree=/etc` 不得列出 `/etc`；`.git` 本身是 symlink 或 gitfile → 拒；hooks/fsmonitor 不被执行；**恶意 `filter.pwn.clean/process` + `.gitattributes` `* filter=pwn` 的 sentinel 命令不得执行**（sentinel 文件不得出现）；**`HEAD` 为 `ref: ../../tmp/x` 或 `objects` 为 symlink → 拒**；**`HEAD`/`index` 换成 FIFO 或超大文件 → 立即失败，临时目录与信号量均释放**；**正向：symbolic/detached HEAD 仅带一个终止 LF 仍可用**；**反向：前导空白、CR、多行 HEAD 拒**。
+测试：`.git/config` 写入 `core.worktree=/etc` 不得列出 `/etc`；`.git` 本身是 symlink 或 gitfile → 拒；hooks/fsmonitor 不被执行；**恶意 `filter.pwn.clean/process` + `.gitattributes` `* filter=pwn` 的 sentinel 命令不得执行**（sentinel 文件不得出现）；**`HEAD` 为 `ref: ../../tmp/x` → 拒**；**`objects` 为 symlink → 拒**；**objects swap：先打开 `ofd`，再把原 `objects` 路径 rename/替换成 symlink 或树外目录，git 仍只能读已锚定 inode（不得跟到新目标）**；**`HEAD`/`index` 换成 FIFO 或超大文件 → 立即失败，临时目录与信号量均释放**；**正向：symbolic/detached HEAD 仅带一个终止 LF 仍可用**；**反向：前导空白、CR、多行 HEAD 拒**。
 
 ### 4.5 并发
 
@@ -160,7 +160,7 @@ commercial `router.ts`：
 |---|---|
 | `protocol/src/__tests__/workspaceInspect.test.ts` | 常量、空态形状、错误码 |
 | `gateway/src/__tests__/security.test.ts` | 新 regex；`foo.git` 不误伤；trusted `.git/config` `isFileAllowed===false` |
-| `gateway/src/__tests__/workspaceInspect.test.ts` | 穿越；symlink 树外/git-creds/`/etc`；**list-dir 目标 `.config`/`.ssh` → 403**；blocked 子目录 `skipped/denied`；空态无 `added:0`；流式截断；字节预算；hermetic hooks/fsmonitor；**`core.worktree=/etc` 不逃逸**；**.git 为 symlink/gitfile 拒**；**filter clean/process sentinel 不执行**；**恶意 HEAD ref / objects symlink 拒**；**FIFO 或超大 index 失败后临时目录与信号量释放**；snapshot 变更 → 409；同 session 第二请求立即 429；Linux 断言走 `/proc/self/fd`；达 cap 后 git 被 kill 且信号量释放；T6：parse 后及 wire 上 C0、**DEL(U+007F)**、**C1（至少 U+0085 或 U+009B）**、ESC、bidi 均消失，`<img>` 允许保留 |
+| `gateway/src/__tests__/workspaceInspect.test.ts` | 穿越；symlink 树外/git-creds/`/etc`；**list-dir 目标 `.config`/`.ssh` → 403**；blocked 子目录 `skipped/denied`；空态无 `added:0`；流式截断；字节预算；hermetic hooks/fsmonitor；**`core.worktree=/etc` 不逃逸**；**.git 为 symlink/gitfile 拒**；**filter clean/process sentinel 不执行**；**恶意 HEAD ref 拒**；**objects symlink 拒**；**objects swap（open `ofd` 后 rename/替换原路径）仍锚定旧 inode、不跟随新目标**；**FIFO 或超大 index 失败后临时目录与信号量释放**；snapshot 变更 → 409；同 session 第二请求立即 429；Linux 断言走 `/proc/self/fd`；达 cap 后 git 被 kill 且信号量释放；T6：parse 后及 wire 上 C0、**DEL(U+007F)**、**C1（至少 U+0085 或 U+009B）**、ESC、bidi 均消失，`<img>` 允许保留 |
 | `gateway/src/__tests__/apiFileGitAcl.test.ts` | **真实 handler/HTTP 往返**（不许用抽出 guard 替代）：直链 `.git/config` 403；父 `.git` 为 symlink 仍 403；spy 证明未调用 `_resolveMediaDirs` / `realpathSync` / remote pull；目录仍 404；`foo.git` 不被这段误伤 |
 | `gateway/src/__tests__/bridgeApiAllowlist.test.ts` | 两条 GET 可代理；POST 不可 |
 | `commercial/src/__tests__/workspaceInspectRoutes.test.ts`（新） | **显式**：两条均可 `matchCommercialContainerApiProxy` GET；POST 否；两条均命中 `BLOCKED_FOR_USER_RULES`；user 与 admin（无 host-scope）进入 container proxy；admin+host-scope **即使 v3Supervisor/bridgeSecret 缺失** 仍 403 且不进 host handler |
@@ -184,10 +184,12 @@ PR-B UI、Commit/Push、Undo、递归整树、未绑定仓库扫描、第二套�
 
 ---
 
-## 9. Codex 审查问题（方案 · 第 5 轮）
+## 9. Codex 审查问题（方案 · 第 6 轮）
 
-#4 唯一 Finding：HEAD 解析只剥一个终止 LF，再校验 40-hex 或 `refs/**`；拒绝其它空白/CR/多行。正向测正常 LF；反向测前导空白与多行。
+#5 唯一 Finding：`objects` **swap** 必须进入 §4.4 测试段与 §6 矩阵，不能只写在审查问题里。symlink 测试不能代替「`ofd` 打开后原路径被 rename/替换」的回归。威胁模型 T2 要求 symlink **和** swap 都测。
 
-#3/#4 其余项仍须在：ofd 锚定、FIFO/大小闸、T6 DEL+C1、filter 隔离、host-scope 403、真实 `/api/file` handler 往返。
+#4 已闭合项仍须在：HEAD 只剥一个终止 LF 再校验；正向正常 LF；反向前导空白/CR/多行。
+
+其余仍须在：ofd 锚定、FIFO/大小闸、T6 DEL+C1、filter 隔离、host-scope 403、真实 `/api/file` handler 往返。
 
 第一行 `PASS` / `FAIL` / `PARTIAL`。Finding 必须修才能写代码。不要改代码。
