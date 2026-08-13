@@ -1184,7 +1184,7 @@ export async function collectGitSnapshot(
         deleted: binary ? null : (ns?.deleted ?? null),
         binary,
         previewable: prev.previewable,
-        ...(prev.preview_path ? { preview_path: prev.preview_path } : {}),
+        ...('preview_path' in prev && prev.preview_path ? { preview_path: prev.preview_path } : {}),
       })
     }
 

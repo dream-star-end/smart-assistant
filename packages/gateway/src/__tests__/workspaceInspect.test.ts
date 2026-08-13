@@ -653,7 +653,7 @@ describe('workspace inspect collection', () => {
 
 describe('hermetic git argv', () => {
   it('does not pass --no-lazy-fetch and is accepted by installed git', () => {
-    assert.equal(GIT_HERMETIC_ARGS.includes('--no-lazy-fetch'), false)
+    assert.equal((GIT_HERMETIC_ARGS as readonly string[]).includes('--no-lazy-fetch'), false)
     execFileSync('git', [...GIT_HERMETIC_ARGS, 'version'], { stdio: 'ignore' })
   })
 })
@@ -753,7 +753,7 @@ describe('workspace inspect HTTP handler', () => {
       const url = new URL(req.url ?? '/', 'http://127.0.0.1')
       void gw.handleWorkspaceInspectForTests(req, res, url)
     })
-    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    await new Promise<void>((resolve) => { server.listen(0, '127.0.0.1', () => resolve()) })
     try {
       const port = (server.address() as AddressInfo).port
       const res = await fetch('http://127.0.0.1:' + port + '/api/workspace/list-dir?sessionId=sess-1')
@@ -765,7 +765,7 @@ describe('workspace inspect HTTP handler', () => {
       assert.equal('entries' in body, false)
       assert.equal('snapshot' in body, false)
     } finally {
-      await new Promise((r) => setTimeout(r, 500))
+      await new Promise<void>((r) => { setTimeout(r, 500) })
       setWorkspaceInspectHoldForTests(undefined)
       setInspectTimeoutOverrideForTests(undefined)
       setWorkspaceInspectReposRootOverrideForTests(undefined)
@@ -773,7 +773,7 @@ describe('workspace inspect HTTP handler', () => {
       resetInspectLimiterForTests()
       delete process.env.OC_CONTAINER_ID
       rmSync(tmp, { recursive: true, force: true })
-      await new Promise((resolve, reject) => server.close((e) => (e ? reject(e) : resolve())))
+      await new Promise<void>((resolve, reject) => { server.close((e) => (e ? reject(e) : resolve())) })
     }
   })
 
@@ -788,10 +788,10 @@ describe('workspace inspect HTTP handler', () => {
     setWorkspaceInspectReposRootOverrideForTests(reposRoot)
     setWorkspaceInspectSnapshotOverrideForTests(() => readySnap(workspaceDir))
     let entered = false
-    let releaseHold = () => {}
+    let releaseHold: () => void = () => {}
     setWorkspaceInspectHoldForTests(async () => {
       entered = true
-      await new Promise((resolve) => { releaseHold = resolve })
+      await new Promise<void>((resolve) => { releaseHold = resolve })
     })
     const gw = new Gateway({
       config: {
@@ -808,18 +808,18 @@ describe('workspace inspect HTTP handler', () => {
       const url = new URL(req.url ?? '/', 'http://127.0.0.1')
       void gw.handleWorkspaceInspectForTests(req, res, url)
     })
-    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    await new Promise<void>((resolve) => { server.listen(0, '127.0.0.1', () => resolve()) })
     try {
       const port = (server.address() as AddressInfo).port
       const p1 = fetch('http://127.0.0.1:' + port + '/api/workspace/list-dir?sessionId=sess-1')
       const tWait = Date.now()
       while (!entered && Date.now() - tWait < 2000) {
-        await new Promise((r) => setTimeout(r, 5))
+        await new Promise<void>((r) => { setTimeout(r, 5) })
       }
       assert.equal(entered, true)
       const t0 = Date.now()
       const r2 = await fetch('http://127.0.0.1:' + port + '/api/workspace/list-dir?sessionId=sess-1')
-      const b2 = await r2.json()
+      const b2 = await r2.json() as { error?: { code?: string } }
       assert.equal(r2.status, 429)
       assert.equal(b2.error?.code, 'IN_FLIGHT')
       assert.ok(Date.now() - t0 < 200)
@@ -834,7 +834,7 @@ describe('workspace inspect HTTP handler', () => {
       resetInspectLimiterForTests()
       delete process.env.OC_CONTAINER_ID
       rmSync(tmp, { recursive: true, force: true })
-      await new Promise((resolve, reject) => server.close((e) => (e ? reject(e) : resolve())))
+      await new Promise<void>((resolve, reject) => { server.close((e) => (e ? reject(e) : resolve())) })
     }
   })
 
@@ -869,7 +869,7 @@ describe('workspace inspect HTTP handler', () => {
       const url = new URL(req.url ?? '/', 'http://127.0.0.1')
       void gw.handleWorkspaceInspectForTests(req, res, url)
     })
-    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    await new Promise<void>((resolve) => { server.listen(0, '127.0.0.1', () => resolve()) })
     try {
       const port = (server.address() as AddressInfo).port
       const res = await fetch('http://127.0.0.1:' + port + '/api/workspace/list-dir?sessionId=sess-1')
@@ -885,7 +885,7 @@ describe('workspace inspect HTTP handler', () => {
       resetInspectLimiterForTests()
       delete process.env.OC_CONTAINER_ID
       rmSync(tmp, { recursive: true, force: true })
-      await new Promise((resolve, reject) => server.close((e) => (e ? reject(e) : resolve())))
+      await new Promise<void>((resolve, reject) => { server.close((e) => (e ? reject(e) : resolve())) })
     }
   })
 })
