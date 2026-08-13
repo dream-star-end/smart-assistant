@@ -2500,10 +2500,9 @@ export function App() {
             onRefreshMe={refreshMe}
             onPreferencesChange={applyConversationPreferences}
             feedbackContext={settingsFeedbackContext}
-            onOpenMemory={() => {
-              setSettingsOpen(false);
-              openManage("optimization");
-            }}
+            onOpenMemory={() => openManage("optimization")}
+            onOpenManage={() => openManage("connectors")}
+            onOpenRepo={demo ? undefined : openRepo}
           />
         </LazyBoundary>
       )}

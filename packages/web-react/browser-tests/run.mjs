@@ -184,7 +184,7 @@ const html = `<!doctype html><html><head><meta charset="utf-8"><style>${producti
   #root{position:static;height:auto;overflow:visible}
   .timeline-scroll-probe{height:360px;width:640px;overflow-y:auto;position:relative;border:1px solid #ccc;scrollbar-gutter:stable}
   #timeline-archive-root .chat-virtual-item{min-height:40px}
-</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="chat-entry-ux-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="interrupted-tool-status-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="error-ux-root"></div><div id="ask-question-root"></div><div id="model-selector-root"></div><div id="markdown-rich-root"></div><div id="media-task-root"></div><div id="connectors-root"></div><div id="memory-report-root"></div><div id="community-tutorial-root"></div><div id="codex-density-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
+</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="chat-entry-ux-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="interrupted-tool-status-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="error-ux-root"></div><div id="ask-question-root"></div><div id="model-selector-root"></div><div id="markdown-rich-root"></div><div id="media-task-root"></div><div id="connectors-root"></div><div id="memory-report-root"></div><div id="community-tutorial-root"></div><div id="codex-density-root"></div><div id="settings-shell-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
 
 // ── drive ───────────────────────────────────────────────────────────────────
 let browser;
@@ -2152,6 +2152,187 @@ await check("T41 Codex 密度 token：Composer/ToolCard/Sidebar 在 1440 与 390
   await assertTheme("dark");
   const composerOverflow = await page.locator("#root").evaluate((el) => el.scrollWidth > el.clientWidth + 1);
   if (composerOverflow) throw new Error("Composer 在 390px 发生横向溢出");
+
+  if (DEFAULT_VIEWPORT) await page.setViewportSize(DEFAULT_VIEWPORT);
+  await page.evaluate(() => document.documentElement.classList.remove("dark"));
+});
+
+await check("T42 设置壳 390 单列可切五分区、1440 竖导航 168px、默认关闭不盖 harness", async () => {
+  const emptyUsage = {
+    summary: {
+      input_tokens: "0",
+      output_tokens: "0",
+      cache_read_tokens: "0",
+      cache_write_tokens: "0",
+      requests_total: "0",
+      billed_credits: "0",
+      debited_credits: "0",
+    },
+    legacy_unattributed: {
+      requests: "0",
+      input_tokens: "0",
+      output_tokens: "0",
+      cache_read_tokens: "0",
+      cache_write_tokens: "0",
+      billed_credits: "0",
+    },
+    savings: {
+      savings_credits: null,
+      savings_is_estimate: false,
+      savings_unavailable: true,
+      savings_rows_skipped: 0,
+    },
+    cache: { hit_rate: null },
+    sessions: { rows: [], limit: 20, offset: 0, has_more: false },
+    ledger: { rows: [], next_before: null },
+    cutoff_started_at: null,
+  };
+  const emptyReport = {
+    window: "30d",
+    summary: {
+      requests: "0",
+      input_tokens: "0",
+      output_tokens: "0",
+      cache_read_tokens: "0",
+      cache_write_tokens: "0",
+      credits: "0",
+    },
+    trend: [],
+    models: [],
+    ledger: { trend: [], by_reason: [] },
+  };
+  await page.route("**/api/public/models", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ models: [] }),
+    }),
+  );
+  await page.route("**/api/subscription/me", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        ok: true,
+        data: {
+          subscription: {
+            plan_code: "free",
+            plan_name: "Free",
+            status: "active",
+            period_start: "2026-08-01T00:00:00.000Z",
+            period_end: "2026-09-01T00:00:00.000Z",
+            period_credits: "0",
+            monthly_credits: "0",
+            price_cents: "0",
+            tier: 0,
+            paid: false,
+          },
+          balance: { wallet: "0", period: "0", total: "0" },
+        },
+      }),
+    }),
+  );
+  await page.route("**/api/me/**", (route, request) => {
+    const pathname = new URL(request.url()).pathname;
+    if (pathname.startsWith("/api/me/preferences")) {
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ prefs: {} }),
+      });
+    }
+    if (pathname.startsWith("/api/me/usage/report")) {
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(emptyReport),
+      });
+    }
+    if (pathname.startsWith("/api/me/usage")) {
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(emptyUsage),
+      });
+    }
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: "{}",
+    });
+  });
+
+  const probe = page.locator("#settings-shell-root");
+  if (await page.getByRole("dialog", { name: "设置" }).count() !== 0) {
+    throw new Error("设置壳探针默认就把 Dialog 打开了，会盖住其余 harness");
+  }
+
+  const SECTIONS = [
+    ["账户与计费", "当前套餐"],
+    ["用量", "会话用量明细"],
+    ["偏好", "外观主题"],
+    ["反馈", "反馈内容"],
+    ["关于", "备案信息待补充"],
+  ];
+
+  async function assertNoOverflow(dialog, label) {
+    const overflow = await dialog.evaluate((el) => el.scrollWidth > el.clientWidth + 1);
+    if (overflow) throw new Error(`设置壳在 ${label} 发生横向溢出`);
+  }
+
+  async function assertTheme(theme, viewport) {
+    await page.evaluate((next) => {
+      document.documentElement.classList.toggle("dark", next === "dark");
+    }, theme);
+
+    const dialog = page.getByRole("dialog", { name: "设置" });
+    await dialog.waitFor({ state: "visible", timeout: 3000 });
+    await assertNoOverflow(dialog, `${viewport} ${theme}`);
+
+    const tablist = dialog.getByRole("tablist", { name: "设置分区" });
+    const orientation = await tablist.getAttribute("aria-orientation");
+    if (viewport === "390") {
+      if (orientation === "vertical") {
+        throw new Error(`390 仍渲染了竖导航(${theme})`);
+      }
+      const navBox = await tablist.boundingBox();
+      const panel = dialog.getByRole("tabpanel");
+      const panelBox = await panel.boundingBox();
+      if (navBox && panelBox && Math.abs(navBox.y - panelBox.y) < 8 && navBox.x + navBox.width <= panelBox.x + 8) {
+        throw new Error(`390 出现 master-detail 并排(${theme})`);
+      }
+    } else {
+      if (orientation !== "vertical") {
+        throw new Error(`1440 没有竖导航(${theme}): ${orientation}`);
+      }
+      const width = await tablist.evaluate((el) => el.getBoundingClientRect().width);
+      if (Math.abs(width - 168) > 1) {
+        throw new Error(`1440 竖导航应为 168px,实际 ${width}(${theme})`);
+      }
+    }
+  }
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await probe.getByRole("button", { name: "打开设置壳" }).click();
+  await assertTheme("light", "390");
+  const dialog = page.getByRole("dialog", { name: "设置" });
+  for (const [name, marker] of SECTIONS) {
+    const tab = dialog.getByRole("tab", { name, exact: true });
+    await tab.click();
+    if ((await tab.getAttribute("aria-selected")) !== "true") {
+      throw new Error(`390 切到「${name}」后未选中`);
+    }
+    await dialog.getByText(marker, { exact: true }).waitFor({ state: "visible", timeout: 3000 });
+    await assertNoOverflow(dialog, `390 分区 ${name}`);
+  }
+  await assertTheme("dark", "390");
+
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await assertTheme("light", "1440");
+  await assertTheme("dark", "1440");
+
+  await dialog.getByRole("button", { name: "关闭" }).click();
+  await dialog.waitFor({ state: "hidden", timeout: 3000 });
 
   if (DEFAULT_VIEWPORT) await page.setViewportSize(DEFAULT_VIEWPORT);
   await page.evaluate(() => document.documentElement.classList.remove("dark"));
