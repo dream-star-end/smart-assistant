@@ -1,0 +1,75 @@
+{
+  "generatedAt": "2026-08-13T19:28:36.915Z",
+  "repo": "/Users/dengxuan/git_project/openclaude_v3/openclaude-v5-web-codex-impl",
+  "outDir": "/Users/dengxuan/git_project/openclaude_v3/openclaude-v5-web-codex-impl/packages/web-react/docs/shots/pr4",
+  "viewports": {
+    "desktop": {
+      "width": 1440,
+      "height": 900,
+      "deviceScaleFactor": 2
+    },
+    "mobile": {
+      "width": 390,
+      "height": 844,
+      "deviceScaleFactor": 2,
+      "isMobile": true,
+      "hasTouch": true
+    }
+  },
+  "themes": [
+    "light",
+    "dark"
+  ],
+  "scenes": [
+    {
+      "id": "workspace-chat-density",
+      "label": "工作区 · 会话栏+工具卡+输入框密度",
+      "group": "工作区",
+      "viewports": [
+        "desktop",
+        "mobile"
+      ]
+    }
+  ],
+  "shots": [
+    {
+      "name": "workspace-chat-density--desktop--light.png",
+      "scene": "workspace-chat-density",
+      "label": "工作区 · 会话栏+工具卡+输入框密度",
+      "group": "工作区",
+      "viewport": "desktop",
+      "theme": "light",
+      "clipped": false
+    },
+    {
+      "name": "workspace-chat-density--desktop--dark.png",
+      "scene": "workspace-chat-density",
+      "label": "工作区 · 会话栏+工具卡+输入框密度",
+      "group": "工作区",
+      "viewport": "desktop",
+      "theme": "dark",
+      "clipped": false
+    },
+    {
+      "name": "workspace-chat-density--mobile--light.png",
+      "scene": "workspace-chat-density",
+      "label": "工作区 · 会话栏+工具卡+输入框密度",
+      "group": "工作区",
+      "viewport": "mobile",
+      "theme": "light",
+      "clipped": false
+    },
+    {
+      "name": "workspace-chat-density--mobile--dark.png",
+      "scene": "workspace-chat-density",
+      "label": "工作区 · 会话栏+工具卡+输入框密度",
+      "group": "工作区",
+      "viewport": "mobile",
+      "theme": "dark",
+      "clipped": false
+    }
+  ],
+  "failures": [],
+  "retried": [],
+  "unmockedApi": []
+}

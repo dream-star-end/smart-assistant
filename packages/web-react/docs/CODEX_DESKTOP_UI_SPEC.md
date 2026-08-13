@@ -85,9 +85,9 @@ Windows 本地 44px app bar 在产品区 **之外**，本规格不包含它。�
 
 ### 3.1 顶栏
 
-高 56px（现 h-14=56，含 safe-area）。左：折叠时展开+新建；agent 切换；团队 chip（仅团队模式）。右：模型选择器（**默认保留于此**，搬到 Composer 需拍板）、余额、inbox、媒体任务、主题、教程。
+高 56px（现 h-14=56，含 safe-area）。左：折叠时展开+新建；agent 切换；团队 chip（仅团队模式）。右：余额、inbox、媒体任务、主题、教程。模型选择器在 Composer 发送钮左侧（已拍板落地）。
 
-`需改造`：信息层级（agent 名过重、模型选择不够像输入区附属）。功能集合 `已满足`。
+`需改造`：信息层级（agent 名过重）。模型选择器已迁 Composer，功能集合 `已满足`。
 
 ### 3.2 消息排版
 
@@ -118,7 +118,7 @@ Windows 本地 44px app bar 在产品区 **之外**，本规格不包含它。�
 | textarea | 中，placeholder「给 OpenClaude 发消息…」 | `已满足`；文案可改「输入内容…」属文案 PR |
 | 语音 | 输入条内麦标 | `已满足` |
 | 发送 | 右下圆钮 36px；busy=停止 | `已满足`；粗指针 44px 仍登记在 UX 债 COMP-02 |
-| 模型/思考 | **默认顶栏** | 搬到输入条 = 拍板后 `需改造` |
+| 模型/思考 | Composer 发送钮左侧（compact） | `已满足`（PR4 已拍板落地）；思考深度仍在设置偏好 |
 | GitHub pill | 输入条下方左；`xl` 且已绑定后迁右栏并卸载 pill | `已满足`；迁栏必须单实例 |
 
 Enter：细指针发送，粗指针换行。`已满足`，禁止改坏。
@@ -313,7 +313,7 @@ PR1 **只改下列项**。未列出的 token 保持原值。每一项必须在 P
 |---|---|---|---|---|
 | T1 | 会话行活跃态 | 仅 `bg-active` | 增加左侧 2px `bg-accent` 竖条，条目 `rounded-md` | 不改分组轴、不改宽度 268 |
 | T2 | 会话行高度 | `py-2` 偏松 | 桌面行高约 36px（`py-1.5` + `text-section`） | 触屏 `[@media(hover:none)]` 保持现可点区 |
-| T3 | Composer 边框 | `border-border`（分隔色，对比弱） | 非聚焦 `border-border-control` 或等价可见控件边；聚焦 `border-border-strong` + 现有 ring | 不改 `rounded-[26px]`、不搬模型选择器 |
+| T3 | Composer 边框 | `border-border`（分隔色，对比弱） | 非聚焦 `border-border-control` 或等价可见控件边；聚焦 `border-border-strong` + 现有 ring | PR1 不改 `rounded-[26px]`、当时不搬模型选择器（PR4 已迁到发送钮左侧） |
 | T4 | 设置 Dialog 分区 Tab | 部分 `text-[15px]`/`text-[13px]` 任意值 | 标题 `text-title`，说明 `text-caption text-faint` | 本 PR **不**改成左导航（那是 PR2） |
 | T5 | 工具卡/文件卡密度 | 卡内 padding 不统一 | 统一 `px-3 py-2`、圆角 `rounded-md`、diff 行 `text-xs` | 不改折叠规则、不新增 Undo |
 | T6 | 左栏顶入口 | 管理中心等与「新建」权重接近 | 「新建」保持 secondary 主按钮；管理/市场改为 `text-muted` + 更小副文案 | 不删除入口 |
