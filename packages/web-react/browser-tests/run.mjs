@@ -184,7 +184,7 @@ const html = `<!doctype html><html><head><meta charset="utf-8"><style>${producti
   #root{position:static;height:auto;overflow:visible}
   .timeline-scroll-probe{height:360px;width:640px;overflow-y:auto;position:relative;border:1px solid #ccc;scrollbar-gutter:stable}
   #timeline-archive-root .chat-virtual-item{min-height:40px}
-</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="chat-entry-ux-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="interrupted-tool-status-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="error-ux-root"></div><div id="ask-question-root"></div><div id="model-selector-root"></div><div id="markdown-rich-root"></div><div id="media-task-root"></div><div id="connectors-root"></div><div id="memory-report-root"></div><div id="community-tutorial-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
+</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="chat-entry-ux-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="interrupted-tool-status-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="error-ux-root"></div><div id="ask-question-root"></div><div id="model-selector-root"></div><div id="markdown-rich-root"></div><div id="media-task-root"></div><div id="connectors-root"></div><div id="memory-report-root"></div><div id="community-tutorial-root"></div><div id="codex-density-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
 
 // ── drive ───────────────────────────────────────────────────────────────────
 let browser;
@@ -2069,6 +2069,92 @@ await check("T40 390px 失败轮只显示一个中性紧凑重试出口", async 
     throw new Error("唯一重试入口没有精确触发一次重发");
   }
   if (DEFAULT_VIEWPORT) await page.setViewportSize(DEFAULT_VIEWPORT);
+});
+
+await check("T41 Codex 密度 token：Composer/ToolCard/Sidebar 在 1440 与 390 明暗主题成立", async () => {
+  async function assertTheme(theme) {
+    await page.evaluate((next) => {
+      document.documentElement.classList.toggle("dark", next === "dark");
+    }, theme);
+
+    const composerClass = await page.locator("#root [class*='rounded-[26px]']").first().getAttribute("class") ?? "";
+    if (!composerClass.includes("border-border-control")) {
+      throw new Error(`Composer 非聚焦边框丢失(${theme}): ${composerClass}`);
+    }
+    if (!composerClass.includes("focus-within:border-border-strong")) {
+      throw new Error(`Composer 聚焦边框丢失(${theme}): ${composerClass}`);
+    }
+    if (/(?:^|\s)border-border(?:\s|$)/.test(composerClass)) {
+      throw new Error(`Composer 仍用分隔线 border-border(${theme}): ${composerClass}`);
+    }
+
+    const tool = await page.locator("#tool-card-polish-root").evaluate((root) => {
+      const header = root.querySelector("button");
+      if (!(header instanceof HTMLElement)) return { error: "找不到工具卡头部" };
+      const card = header.closest("div.overflow-hidden.rounded-md");
+      const body = card?.querySelector(".border-t");
+      return {
+        headerClass: header.className,
+        cardClass: card?.className ?? "",
+        bodyClass: body?.className ?? "",
+      };
+    });
+    if (tool.error) throw new Error(`${tool.error}(${theme})`);
+    if (!tool.cardClass.includes("rounded-md")) {
+      throw new Error(`工具卡圆角丢失(${theme}): ${tool.cardClass}`);
+    }
+    if (!tool.headerClass.includes("px-3") || !tool.headerClass.includes("py-2")) {
+      throw new Error(`工具卡头部 padding 丢失(${theme}): ${tool.headerClass}`);
+    }
+
+    const sidebar = page.locator("#codex-density-root");
+    const active = sidebar.getByRole("button", { name: "密度验收活跃会话" });
+    await active.waitFor({ state: "visible", timeout: 3000 });
+    const accent = await active.evaluate((btn) => Boolean(btn.closest("div")?.querySelector(".bg-accent")));
+    if (!accent) throw new Error(`活跃会话缺少 accent 竖条(${theme})`);
+    const idleAccent = await sidebar.getByRole("button", { name: "密度验收空闲会话" }).evaluate(
+      (btn) => Boolean(btn.closest("div")?.querySelector(".bg-accent")),
+    );
+    if (idleAccent) throw new Error(`空闲会话不应有 accent 竖条(${theme})`);
+
+    const createClass = await sidebar.getByRole("button", { name: "新建会话" }).getAttribute("class") ?? "";
+    if (!createClass.includes("text-section") || !createClass.includes("border-border") || !createClass.includes("bg-surface")) {
+      throw new Error(`新建会话未保持 secondary(${theme}): ${createClass}`);
+    }
+    const manageClass = await sidebar.getByRole("button", { name: /管理中心/ }).getAttribute("class") ?? "";
+    if (!manageClass.includes("text-body") || !manageClass.includes("text-muted")) {
+      throw new Error(`管理中心入口权重未下降(${theme}): ${manageClass}`);
+    }
+    const marketClass = await sidebar.getByRole("button", { name: /^市场/ }).getAttribute("class") ?? "";
+    if (!marketClass.includes("text-body") || !marketClass.includes("text-muted")) {
+      throw new Error(`市场入口权重未下降(${theme}): ${marketClass}`);
+    }
+    if (await sidebar.getByRole("button", { name: /使用教程/ }).count() !== 1) {
+      throw new Error(`教程入口丢失(${theme})`);
+    }
+    if (await sidebar.getByRole("button", { name: /组织/ }).count() !== 1) {
+      throw new Error(`组织入口丢失(${theme})`);
+    }
+    const adminHref = await sidebar.getByRole("link", { name: /管理后台/ }).getAttribute("href");
+    if (adminHref !== "/admin.html") throw new Error(`管理后台入口丢失或 href 错误(${theme}): ${adminHref}`);
+  }
+
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await assertTheme("light");
+  const asideWidth = await page.locator("#codex-density-root aside").evaluate((el) => el.getBoundingClientRect().width);
+  if (Math.abs(asideWidth - 268) > 1) {
+    throw new Error(`1440 下侧栏宽度应为 268px,实际 ${asideWidth}`);
+  }
+  await assertTheme("dark");
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await assertTheme("light");
+  await assertTheme("dark");
+  const composerOverflow = await page.locator("#root").evaluate((el) => el.scrollWidth > el.clientWidth + 1);
+  if (composerOverflow) throw new Error("Composer 在 390px 发生横向溢出");
+
+  if (DEFAULT_VIEWPORT) await page.setViewportSize(DEFAULT_VIEWPORT);
+  await page.evaluate(() => document.documentElement.classList.remove("dark"));
 });
 
 // 主 harness 仍在:预览用例没有把它换成空页面(否则后续缺席断言全部恒真)。

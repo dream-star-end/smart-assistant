@@ -94,7 +94,7 @@ export function ToolCard({
       className={cn(
         // 不带外边距——间距交由容器（MessageList 的 gap / AgentGroupCard 的 space-y）统一控制，
         // 避免 margin 与父级 gap 叠加导致卡片间距过大（boss 反馈"卡片间距好大"的根因之一）。
-        "overflow-hidden rounded-xl border bg-surface shadow-[0_1px_2px_rgba(0,0,0,0.025)] transition-colors",
+        "overflow-hidden rounded-md border bg-surface shadow-[0_1px_2px_rgba(0,0,0,0.025)] transition-colors",
         isError
           ? "border-danger/30"
           : isBlocked
@@ -109,7 +109,7 @@ export function ToolCard({
         onClick={() => hasBody && setOpen((o) => !o)}
         aria-expanded={hasBody ? open : undefined}
         className={cn(
-          "flex min-h-11 w-full items-center gap-2.5 px-3.5 py-2.5 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+          "flex min-h-11 w-full items-center gap-2.5 px-3 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
           hasBody && "cursor-pointer hover:bg-hover/70 active:bg-active/70",
         )}
       >
@@ -155,7 +155,7 @@ export function ToolCard({
         </span>
       </button>
       {open && hasBody && (
-        <div className="border-t border-border/80 bg-bg/35 px-3.5 py-3 [&>*:first-child]:mt-0">
+        <div className="border-t border-border/80 bg-bg/35 px-3 py-2 [&>*:first-child]:mt-0">
           <ToolBody name={name} input={input} tool={renderTool} />
         </div>
       )}
