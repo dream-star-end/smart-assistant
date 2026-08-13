@@ -104,6 +104,19 @@ const GROK = entry({
     ccb: { capabilityZero: false, supportsThinking: false },
   },
 });
+const CURSOR = entry({
+  entryId: 4,
+  modelId: "cursor-opus-5-high",
+  engine: "cursor",
+  providerId: "cursor",
+  upstreamModelId: "claude-opus-5-thinking-high",
+  contextWindow: null,
+  capabilityProfile: {
+    supportsVision: false,
+    reasoning: { supported: [], codexModelDefault: null },
+    ccb: { capabilityZero: false, supportsThinking: true },
+  },
+});
 
 // ─── canonicalJson ───────────────────────────────────────────────────────
 
@@ -367,6 +380,25 @@ describe("per-uid 投影", () => {
     assert.equal(grok.isEngineReportedModel("grok-build"), true);
     assert.deepEqual(grok.listForUser(user).map((row) => row.modelId), ["glm-5.2"]);
     assert.deepEqual(grok.listForUser(admin).map((row) => row.modelId), ["glm-5.2", "grok-build"]);
+  });
+
+  test("Cursor model grant 与共享凭据成员是两层 fail-closed 授权", () => {
+    const previous = process.env.OC_V5_CURSOR_CREDENTIAL_UIDS;
+    process.env.OC_V5_CURSOR_CREDENTIAL_UIDS = "1,4";
+    try {
+      const cursor = snap({
+        entries: [GLM, CURSOR],
+        pricing: [price("glm-5.2"), price("cursor-opus-5-high", { visibility: "hidden" })],
+      });
+      const grant = new Set(["cursor-opus-5-high"]);
+      assert.equal(cursor.canUseModel({ uid: 1, role: "admin", grantedModelIds: grant }, CURSOR.modelId), true);
+      assert.equal(cursor.canUseModel({ uid: 4, role: "user", grantedModelIds: grant }, CURSOR.modelId), true);
+      assert.equal(cursor.canUseModel({ uid: 2, role: "user", grantedModelIds: grant }, CURSOR.modelId), false);
+      assert.equal(cursor.canUseModel({ uid: 1, role: "admin", grantedModelIds: new Set() }, CURSOR.modelId), false);
+    } finally {
+      if (previous === undefined) delete process.env.OC_V5_CURSOR_CREDENTIAL_UIDS;
+      else process.env.OC_V5_CURSOR_CREDENTIAL_UIDS = previous;
+    }
   });
 
   test("projectionRevision 是 per-uid 的:同内容不同 uid → 不同 hash", () => {

@@ -76,6 +76,7 @@ import { buildCodexRelayLocalBaseUrl, readCodexUpstreamBaseUrl } from "../http/i
 import { isPromptQueueV1Enabled } from "../http/internalPromptQueue.js";
 import { skillShadowContainerEnv } from "../http/internalSkillShadow.js";
 import { zeroBuffer } from "../crypto/keys.js";
+import { isCursorCredentialMember } from "../cursor/access.js";
 import {
   removeCodexContainerAuthDir,
   writeCodexContainerAuthFile,
@@ -291,13 +292,15 @@ export interface V5CursorAuthMountOptions {
   uid: number;
   runtimeChannel: RuntimeChannel;
   useRemote: boolean;
+  credentialUids?: string;
+  /** Rollback compatibility for releases before shared credential membership. */
   ownerUid?: string;
   authDir?: string;
 }
 
 /**
- * Resolve the host Cursor auth directory only for the explicitly configured
- * local V5 owner. Invalid or incomplete configuration is fail-closed: the
+ * Resolve the host Cursor auth directory only for an explicitly configured
+ * local V5 credential member. Invalid or incomplete configuration is fail-closed: the
  * Agent container still starts, but no Cursor credential is mounted.
  */
 export function resolveV5CursorAuthMount(
@@ -305,12 +308,11 @@ export function resolveV5CursorAuthMount(
 ): string | null {
   if (options.runtimeChannel !== "v5" || options.useRemote) return null;
 
-  const ownerRaw = options.ownerUid?.trim() ?? "";
   const dirRaw = options.authDir?.trim() ?? "";
-  if (!ownerRaw || !dirRaw || !/^[1-9][0-9]*$/.test(ownerRaw)) return null;
-
-  const owner = Number(ownerRaw);
-  if (!Number.isSafeInteger(owner) || owner !== options.uid) return null;
+  const credentialUids = options.credentialUids?.trim()
+    ? options.credentialUids
+    : options.ownerUid;
+  if (!dirRaw || !isCursorCredentialMember(options.uid, credentialUids)) return null;
   if (!pathIsAbsolute(dirRaw)) return null;
 
   const normalized = pathNormalize(dirRaw).replace(/(?<!^)\/+$/, "");
@@ -2842,6 +2844,7 @@ export async function provisionV3Container(
       uid,
       runtimeChannel: getRuntimeChannel(),
       useRemote,
+      credentialUids: process.env.OC_V5_CURSOR_CREDENTIAL_UIDS,
       ownerUid: process.env.OC_V5_CURSOR_OWNER_UID,
       authDir: process.env.OC_V5_CURSOR_AUTH_DIR,
     });
@@ -2850,7 +2853,12 @@ export async function provisionV3Container(
     } else if (
       getRuntimeChannel() === "v5"
       && !useRemote
-      && process.env.OC_V5_CURSOR_OWNER_UID?.trim() === String(uid)
+      && isCursorCredentialMember(
+        uid,
+        process.env.OC_V5_CURSOR_CREDENTIAL_UIDS?.trim()
+          ? process.env.OC_V5_CURSOR_CREDENTIAL_UIDS
+          : process.env.OC_V5_CURSOR_OWNER_UID,
+      )
     ) {
       // Do not print the configured path or inspect secret contents. A bad
       // owner-scoped mount must disable only Cursor, never the primary Agent.

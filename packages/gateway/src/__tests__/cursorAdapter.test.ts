@@ -9,13 +9,13 @@ import type { EngineEvent, EngineExternalBillingEvent } from '../engine/engineEv
 import type { EngineCreateOpts } from '../engine/registry.js'
 
 const REQUEST = 'b'.repeat(32)
-function opts(cwd: string): EngineCreateOpts {
+function opts(cwd: string, model = 'cursor-auto'): EngineCreateOpts {
   return {
     sessionKey: 'agent:main:webchat:dm:cursor-test',
     agentId: 'main',
     agentBaseDir: cwd,
     config: { defaults: { model: 'cursor-auto' } } as OpenClaudeConfig,
-    model: 'cursor-auto',
+    model,
   } as EngineCreateOpts
 }
 function restoreEnv(name: string, value: string | undefined): void {
@@ -335,9 +335,52 @@ while :; do sleep 1; done
     },
   )
 
-  test('rejects every model except controlled cursor-auto', () => {
+  test('maps every canonical model to its exact controlled CLI argument', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-models-'))
+    const fake = path.join(dir, 'fake.cjs')
+    const capture = path.join(dir, 'capture.jsonl')
+    await writeFile(fake, `#!/usr/bin/env node
+const fs=require('node:fs'); fs.appendFileSync(process.env.CAPTURE,JSON.stringify(process.argv.slice(2))+'\\n');
+console.log(JSON.stringify({type:'result',subtype:'success',is_error:false}));
+`)
+    await chmod(fake, 0o755)
+    const oldBin = process.env.OC_CURSOR_WRAPPER_BIN
+    const oldCapture = process.env.CAPTURE
+    process.env.OC_CURSOR_WRAPPER_BIN = fake
+    process.env.CAPTURE = capture
+    const models: Array<[string, string | null]> = [
+      ['cursor-auto', null],
+      ['cursor-grok-4.6-high', 'cursor-grok-4.6-high'],
+      ['cursor-composer-2.5-fast', 'composer-2.5-fast'],
+      ['cursor-opus-5-high', 'claude-opus-5-thinking-high'],
+      ['cursor-fable-5-high', 'claude-fable-5-thinking-high'],
+      ['cursor-grok-4.5-high', 'cursor-grok-4.5-high'],
+    ]
+    try {
+      for (const [model] of models) {
+        const adapter = new CursorAdapter(opts(dir, model))
+        adapter.on('error', () => {})
+        const run = adapter.submitTurn({ input: 'x', requestId: REQUEST, onEvent: () => {}, sessionTotals: { totalCostUSD: 0, turns: 0 }, toolUseIdToName: new Map() })
+        await run.submitted
+        await run.summary
+        await adapter.waitForOutputDrain()
+      }
+      const launched = (await readFile(capture, 'utf8')).trim().split('\n').map((line) => JSON.parse(line) as string[])
+      models.forEach(([, upstream], index) => {
+        if (upstream === null) assert.equal(launched[index]!.includes('--model'), false)
+        else assert.deepEqual(launched[index]!.slice(0, 2), ['--model', upstream])
+      })
+    } finally {
+      restoreEnv('OC_CURSOR_WRAPPER_BIN', oldBin)
+      restoreEnv('CAPTURE', oldCapture)
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('rejects models outside the controlled allowlist', () => {
     const adapter = new CursorAdapter(opts('/tmp'))
     assert.throws(() => adapter.setModel('cursor-auto --force'), /not allowlisted/)
+    assert.throws(() => adapter.setModel('gpt-5.3-codex'), /not allowlisted/)
     assert.throws(() => adapter.setEffortLevel('high'), /does not expose/)
   })
 })

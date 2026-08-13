@@ -41,6 +41,7 @@ import type { Duplex } from "node:stream";
 import { randomUUID, randomBytes } from "node:crypto";
 import { WebSocketServer, WebSocket, type RawData } from "ws";
 import type { Pool } from "pg";
+import { isCursorCredentialMember } from "../cursor/access.js";
 
 import { verifyAccess, JwtError, type AccessClaims } from "../auth/jwt.js";
 import { ConnectionRegistry, type Conn } from "./connections.js";
@@ -4594,13 +4595,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         void (async () => {
           let dispatchRecord: AdmittedDispatch | undefined;
           try {
-            if (!deps.pgPool || parsedCapture === null || traceCapture === null || modelCapture !== 'cursor-auto') {
+            if (!deps.pgPool || parsedCapture === null || traceCapture === null || !isCursorEngineModel(modelCapture)) {
               rejectPromptQueueDispatch('CURSOR_UNAVAILABLE');
               sendErrorFrame(userWs, 'CURSOR_UNAVAILABLE', 'Cursor is unavailable for this account');
               return;
             }
-            const ownerUid = process.env.OC_V5_CURSOR_OWNER_UID?.trim();
-            if (!ownerUid || ownerUid !== String(uid)) {
+            if (!isCursorCredentialMember(uid)) {
               rejectPromptQueueDispatch('UNAUTHORIZED_MODEL');
               sendErrorFrame(userWs, 'UNAUTHORIZED_MODEL', 'Cursor is not enabled for this account');
               return;
@@ -4626,7 +4626,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               // resolveAuthorityExecOrReject's legacy boolean means "non-CCB"
               // (not literally Codex); Cursor is therefore classified true.
               authorityExec = await resolveAuthorityExecOrReject({ model: authorityModelCapture, classifiedCodex: true, log: logCapture, onReject: rejectPromptQueueDispatch });
-              if (authorityExec === null || authorityExec.engine !== 'cursor') {
+              if (
+                authorityExec === null
+                || authorityExec.engine !== 'cursor'
+                || authorityExec.canonicalModel !== modelCapture
+              ) {
                 failDispatchPreForward(dispatchRecord, 'cursor_authority_rejected');
                 return;
               }
@@ -4634,8 +4638,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             const requestId = dispatchRecord ? dispatchRecord.billingRequestId : ensureRequestIdServerSide();
             await deps.pgPool.query(
               `INSERT INTO cursor_external_usage_audit(request_id,user_id,container_id,session_id,model_id,status)
-               VALUES($1,$2,$3,$4,'cursor-auto','pending') ON CONFLICT (request_id) DO NOTHING`,
-              [requestId, uid, cid, peerCapture],
+               VALUES($1,$2,$3,$4,$5,'pending') ON CONFLICT (request_id) DO NOTHING`,
+              [requestId, uid, cid, peerCapture, modelCapture],
             );
             let authorityFields: Record<string, unknown> = {};
             if (authorityExec !== null) {

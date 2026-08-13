@@ -124,7 +124,7 @@ describe('oc-cursor wrapper', () => {
     const f = fixture()
     const result = spawnSync(
       f.wrapper,
-      ['--model', 'composer-2.5', '--mode', 'plan', '--force', '--', 'inspect', 'this', 'diff'],
+      ['--model', 'composer-2.5-fast', '--mode', 'plan', '--force', '--', 'inspect', 'this', 'diff'],
       { cwd: f.dir, env: f.env, encoding: 'utf8' },
     )
     assert.equal(result.status, 0, result.stderr)
@@ -142,7 +142,7 @@ describe('oc-cursor wrapper', () => {
       '--mode',
       'plan',
       '--model',
-      'composer-2.5',
+      'composer-2.5-fast',
       '-p',
       '--trust',
       '--workspace',
@@ -184,6 +184,19 @@ describe('oc-cursor wrapper', () => {
       })
       assert.equal(blocked.status, 2, args.join(' '))
       assert.match(blocked.stderr, /managed by OpenClaude/)
+    }
+  })
+
+  test('rejects models outside the pinned official allowlist', () => {
+    const f = fixture()
+    for (const model of ['gpt-5.6-sol-medium', 'gpt-5.3-codex', 'composer-2.5-fast --force']) {
+      const result = spawnSync(f.wrapper, ['--model', model, '--', 'hello'], {
+        cwd: f.dir,
+        env: f.env,
+        encoding: 'utf8',
+      })
+      assert.equal(result.status, 2)
+      assert.match(result.stderr, /model is not allowlisted/)
     }
   })
 
