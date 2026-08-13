@@ -46,6 +46,7 @@ import {
 } from "./types";
 
 const STATUS_KEY = "admin_acc_status";
+const PROVIDER_KEY = "admin_acc_provider";
 
 function errMsg(e: unknown): string {
   return apiErrorMessage(e, "请求失败");
@@ -63,6 +64,7 @@ export default function AccountsPage() {
   const [confirm, confirmEl] = useConfirm();
 
   const [status, setStatus] = useState<string>(() => sessionStorage.getItem(STATUS_KEY) || "");
+  const [provider, setProvider] = useState<string>(() => sessionStorage.getItem(PROVIDER_KEY) || "");
 
   const { data, error, loading, refresh } = useAdminPoll<AccountsData>(
     async () => {
@@ -70,13 +72,14 @@ export default function AccountsPage() {
         with_stats: 1,
         limit: 500,
         status: status || undefined,
+        provider: provider || undefined,
       });
       const statsP = adminGet<AccountsPoolStats>("/accounts/stats").catch(() => null);
       const snapP = adminGet<AccountPoolSnapshot>("/stats/account-pool").catch(() => null);
       const [rowsR, stats, snapshot] = await Promise.all([rowsP, statsP, snapP]);
       return { rows: Array.isArray(rowsR.rows) ? rowsR.rows : [], stats, snapshot };
     },
-    { intervalMs: 30_000, deps: [status] },
+    { intervalMs: 30_000, deps: [status, provider] },
   );
 
   const rows = data?.rows ?? [];
@@ -91,6 +94,10 @@ export default function AccountsPage() {
   const onStatusChange = useCallback((v: string) => {
     setStatus(v);
     sessionStorage.setItem(STATUS_KEY, v);
+  }, []);
+  const onProviderChange = useCallback((v: string) => {
+    setProvider(v);
+    sessionStorage.setItem(PROVIDER_KEY, v);
   }, []);
 
   const doReset = useCallback(
@@ -144,6 +151,7 @@ export default function AccountsPage() {
       ),
     },
     { key: "plan", title: "plan", width: 64, render: (a) => a.plan },
+    { key: "provider", title: "provider", width: 90, render: (a) => a.provider },
     { key: "status", title: "状态", width: 90, render: (a) => <StatusBadge status={a.status} /> },
     { key: "health", title: "health", align: "right", cellClassName: "tabular-nums", render: (a) => a.health_score ?? "—" },
     { key: "today", title: "今日 / 错误率", align: "right", render: (a) => <TodayCell a={a} /> },
@@ -286,6 +294,17 @@ export default function AccountsPage() {
       <PoolDonut snapshot={snapshot} />
 
       <FilterBar>
+        <SelectFilter
+          label="provider"
+          value={provider}
+          onChange={onProviderChange}
+          options={[
+            { label: "全部", value: "" },
+            { label: "Claude", value: "claude" },
+            { label: "Codex", value: "codex" },
+            { label: "Grok", value: "grok" },
+          ]}
+        />
         <SelectFilter
           label="状态"
           value={status}

@@ -3550,9 +3550,11 @@ describe('v5 release safety lanes', () => {
       'hotcfg_ship_lib() { :; }',
       'ssh() {',
       '  if [[ "$*" == *"docker image inspect"* && "$*" == *"source_commit"* ]]; then',
-      `    printf '%s|%s|%s\\n' "\${ACTUAL_ID:-${imageId}}" "\${SOURCE_COMMIT:-${sourceCommit}}" "\${EMBED_SOURCE:-0}"`,
+      `    printf '%s|%s|%s|%s\\n' "\${ACTUAL_ID:-${imageId}}" "\${SOURCE_COMMIT:-${sourceCommit}}" "\${EMBED_SOURCE:-0}" "\${INCLUDE_GROK:-1}"`,
       '  elif [[ "$*" == *"docker image inspect"* ]]; then',
       `    printf '%s\\n' "\${ACTUAL_ID:-${imageId}}"`,
+      '  elif [[ "$*" == *"--entrypoint grok-native"* ]]; then',
+      '    printf "%s\\n" "${GROK_VERSION:-grok 1.0.3 (test)}"',
       '  elif [[ "$*" == *"OC_RUNTIME_RELEASE"* ]]; then',
       '    printf "%s\\n" /runtime/prev',
       '  else',
@@ -3586,6 +3588,8 @@ describe('v5 release safety lanes', () => {
     for (const [env, pattern] of [
       [{ ACTUAL_ID: `sha256:${'9'.repeat(64)}` }, /immutable ID 漂移/],
       [{ EMBED_SOURCE: '1' }, /只接受 slim image/],
+      [{ INCLUDE_GROK: '0' }, /缺 official Grok binary/],
+      [{ GROK_VERSION: 'grok 1.0.2 (old)' }, /Grok binary=/],
       [{ SOURCE_COMMIT: 'a'.repeat(40), ANCESTOR_RC: '1' }, /不是 canonical HEAD 的可验证 ancestor/],
     ] as const) {
       await writeFile(capture, '')

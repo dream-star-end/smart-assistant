@@ -102,6 +102,7 @@ import {
   stripDispatchAuthorityField,
   computeDispatchRequestHash,
   isCodexEngineModel,
+  isGrokEngineModel,
   isClientMessageId,
   formatMessageReplyPrompt,
   modelHistorySemanticRole,
@@ -1059,9 +1060,12 @@ export interface UserChatBridgeDeps {
     containerId: number;
     userId: bigint;
     modelId: string;
+    sessionId?: string;
   }) => Promise<CodexRouteDecision | null>;
   /** Expire an opaque per-turn Codex API relay route after the turn settles or aborts. */
   expireCodexRoute?: (token: string) => Promise<void>;
+  /** Expire and release the exact durable Grok subscription lease. */
+  releaseGrokRouteLease?: (accountId: bigint, slotId: string) => Promise<void>;
   /**
    * PR2 v1.0.66 — codex 真扣费三件套(必须同时注入或同时缺省)。
    *
@@ -1118,12 +1122,15 @@ export interface UserChatBridgeDeps {
 export interface CodexBindingHandle {
   /** 成功返回 {account_id, slotId};legacy NULL 容器返 null。slotId 为 per-slot 租约 id。 */
   acquire(containerId: number, groupId?: string | null): Promise<{ account_id: bigint; slotId: string } | null>;
+  /** Keep a live long-running turn ahead of the orphan-slot reaper. */
+  renew?(account_id: bigint, slotId: string): boolean;
   /** 必须用 acquire 时记录的 (account_id, slotId) 成对还槽(精确 + reaper 兜底)。 */
   release(account_id: bigint, slotId: string): void;
 }
 
 export interface CodexApiRelayRoute {
   kind?: "api_relay";
+  engine?: "codex" | "grok";
   token: string;
   baseUrl: string;
   modelProvider: string;
@@ -1133,6 +1140,9 @@ export interface CodexApiRelayRoute {
   disableResponseStorage?: boolean;
   groupId: string;
   credentialId: string;
+  /** Grok selects and occupies its subscription account per turn. */
+  accountId?: string;
+  slotId?: string;
 }
 
 export interface CodexOfficialOAuthRoute {
@@ -2605,7 +2615,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         return reject("MODEL_AUTHORITY_UNAVAILABLE", "model catalog unavailable, retry shortly");
       }
       if (cleaned) return null;
-      const execIsCodex = exec.engine === "codex";
+      const execIsCodex = exec.engine !== "ccb";
       if (execIsCodex !== args.classifiedCodex) {
         args.log?.warn("user-chat-bridge: engine reclassified mid-turn", {
           model: args.model,
@@ -2693,18 +2703,62 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       readonly peerId: string | null;
       readonly clientMessageId: string | null;
       readonly promptQueueGrantId: string | null;
+      engine: "codex" | "grok";
       acquireInflight: boolean;
       acquiredAccountId: bigint | null;
       acquiredSlotId: string | null;
       apiRelayRouteToken: string | null;
+      billingRequestId: string | null;
       turnForwarded: boolean;
       releaseTimer: ReturnType<typeof setTimeout> | null;
+      slotHeartbeat: ReturnType<typeof setInterval> | null;
     };
     const activeCodexTurnsByPeer = new Map<string, ActiveCodexTurnState>();
     const promptQueueDispatchCancellations = new Map<string, {
       request: PromptQueueDispatchRequest;
       cancel(reasonCode: string): Promise<void>;
     }>();
+    type PendingGrokLeaseRelease = {
+      accountId: bigint;
+      slotId: string;
+      reason: string;
+      inFlight: Promise<void> | null;
+      retryRequested: boolean;
+    };
+    // Retain the exact lease identity after local turn state is removed. A
+    // transient durable-expiry failure is retried by the immutable terminal
+    // billing frame (same bridge here; a new bridge uses journal ctx below).
+    const pendingGrokLeaseReleases = new Map<string, PendingGrokLeaseRelease>();
+    const retryPendingGrokLeaseRelease = (requestId: string): void => {
+      const pending = pendingGrokLeaseReleases.get(requestId);
+      if (pending === undefined || deps.releaseGrokRouteLease === undefined) return;
+      if (pending.inFlight !== null) {
+        pending.retryRequested = true;
+        return;
+      }
+      const attempt = deps.releaseGrokRouteLease(pending.accountId, pending.slotId)
+        .then(() => {
+          if (pendingGrokLeaseReleases.get(requestId) === pending) {
+            pendingGrokLeaseReleases.delete(requestId);
+          }
+        })
+        .catch((err) => {
+          bridgeLog?.warn("user-chat-bridge: release durable Grok route lease failed; terminal frame remains retryable", {
+            requestId,
+            reason: pending.reason,
+            err: (err as Error)?.message ?? String(err),
+          });
+        })
+        .finally(() => {
+          if (pendingGrokLeaseReleases.get(requestId) !== pending) return;
+          pending.inFlight = null;
+          if (pending.retryRequested) {
+            pending.retryRequested = false;
+            retryPendingGrokLeaseRelease(requestId);
+          }
+        });
+      pending.inFlight = attempt;
+    };
     const codexPeerKey = (peerId: string | null): string =>
       peerId === null ? "__missing_peer__" : `peer:${peerId}`;
     const isCurrentCodexTurnState = (state: ActiveCodexTurnState): boolean =>
@@ -2724,10 +2778,15 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       state: ActiveCodexTurnState,
       reason: string,
       expireRouteTokenOnRelease = true,
+      preserveAccountSlot = false,
     ): void => {
       if (state.releaseTimer !== null) {
         clearTimeout(state.releaseTimer);
         state.releaseTimer = null;
+      }
+      if (state.slotHeartbeat !== null) {
+        clearInterval(state.slotHeartbeat);
+        state.slotHeartbeat = null;
       }
       const accountId = state.acquiredAccountId;
       const slotId = state.acquiredSlotId;
@@ -2745,10 +2804,25 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       if (state.promptQueueGrantId !== null) {
         promptQueueDispatchCancellations.delete(state.promptQueueGrantId);
       }
-      if (accountId !== null && slotId !== null && deps.codexBinding !== undefined) {
+      const durableGrokRelease =
+        !preserveAccountSlot && state.engine === "grok" &&
+        accountId !== null && slotId !== null && deps.releaseGrokRouteLease !== undefined;
+      if (durableGrokRelease) {
+        const releaseKey = state.billingRequestId ?? `state:${state.stateId}`;
+        if (!pendingGrokLeaseReleases.has(releaseKey)) {
+          pendingGrokLeaseReleases.set(releaseKey, {
+            accountId,
+            slotId,
+            reason,
+            inFlight: null,
+            retryRequested: false,
+          });
+        }
+        retryPendingGrokLeaseRelease(releaseKey);
+      } else if (!preserveAccountSlot && accountId !== null && slotId !== null && deps.codexBinding !== undefined) {
         try { deps.codexBinding.release(accountId, slotId); } catch { /* best effort */ }
       }
-      if (expireRouteTokenOnRelease) {
+      if (expireRouteTokenOnRelease && !durableGrokRelease) {
         expireCodexRouteToken(routeToken, reason);
       }
     };
@@ -4349,9 +4423,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             // IIFE 里的 epoch fence,fence 不过一律拒帧,故错选路不会造成错计费。
             isCodexInboundFrame =
               authorityOn && authorityModelForFrame !== null
-                ? (authorityDeps?.catalog.peek()?.isCodexModel(authorityModelForFrame) ??
-                   isCodexEngineModel(effectiveModel))
-                : isCodexEngineModel(effectiveModel);
+                ? (authorityDeps?.catalog.peek()?.isEngineReportedModel(authorityModelForFrame) ??
+                   (isCodexEngineModel(effectiveModel) || isGrokEngineModel(effectiveModel)))
+                : (isCodexEngineModel(effectiveModel) || isGrokEngineModel(effectiveModel));
             // 提取 peer.id(用于 session-scoped admission 与 outbound 终态匹配)。
             if (isCodexInboundFrame) {
               const peerObj = (parsed as { peer?: { id?: unknown } }).peer;
@@ -4392,6 +4466,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               sanitizedParsed,
               "__oc_codex_route",
             );
+            const hasClientGrokRoute = Object.prototype.hasOwnProperty.call(
+              sanitizedParsed,
+              "__oc_grok_route",
+            );
             const hasClientWorkspaceMode = Object.prototype.hasOwnProperty.call(
               sanitizedParsed,
               "_workspaceMode",
@@ -4399,6 +4477,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             if (
               (rawClientTrace !== undefined && !clientHint.ok) ||
               hasClientCodexRoute ||
+              hasClientGrokRoute ||
               hasClientWorkspaceMode ||
               teamModeMain
             ) {
@@ -4408,6 +4487,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               }
               if (hasClientCodexRoute) {
                 delete sanitizedParsed.__oc_codex_route;
+              }
+              if (hasClientGrokRoute) {
+                delete sanitizedParsed.__oc_grok_route;
               }
               if (hasClientWorkspaceMode) {
                 const { _workspaceMode: _discard, ...withoutWorkspaceMode } = sanitizedParsed;
@@ -4627,12 +4709,15 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           peerId: peerIdForAcquire,
           clientMessageId: clientMessageIdForAcquire,
           promptQueueGrantId: dispatchRequest?.grantId ?? null,
+          engine: "codex",
           acquireInflight: true,
           acquiredAccountId: null,
           acquiredSlotId: null,
           apiRelayRouteToken: null,
+          billingRequestId: null,
           turnForwarded: false,
           releaseTimer: null,
+          slotHeartbeat: null,
         };
         activeCodexTurnsByPeer.set(peerKeyForAcquire, codexTurnState);
         const turnIdentity = {
@@ -4656,6 +4741,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         // 快照进 IIFE 局部,IIFE 跑期间 onUserMessage 不会再修改这几个 let(下一帧
         // 走 G7 busy 拒绝路径,不会到这里),但稳妥起见还是 capture。
         const effectiveModelCapture = effectiveModelForFrame;
+        const engineDisplayName = isGrokEngineModel(effectiveModelCapture) ? "Grok Build" : "GPT";
         const inboundAgentIdCapture = inboundAgentIdForFrame;
         const inboundParsedCapture = inboundParsedFrame;
         const authorityModelCapture = authorityModelForFrame;
@@ -4717,6 +4803,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 containerId: cid,
                 userId: uid,
                 modelId: effectiveModelCapture,
+                ...(inboundPeerIdForFrame ? { sessionId: inboundPeerIdForFrame } : {}),
               });
               if (!isCurrentCodexTurnState(codexTurnState)) {
                 if (
@@ -4725,6 +4812,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   decision.kind !== "unavailable"
                 ) {
                   expireCodexRouteToken(decision.token, "stale_route_creation");
+                  if (decision.engine === 'grok' && decision.accountId && decision.slotId && codexBinding) {
+                    try { codexBinding.release(BigInt(decision.accountId), decision.slotId); } catch { /* best effort */ }
+                  }
                 }
                 return;
               }
@@ -4735,12 +4825,16 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   throw Object.assign(new Error(decision.reason), { name: "CodexRouteUnavailable" });
                 } else {
                   codexRoute = decision;
+                  codexTurnState.engine = decision.engine ?? "codex";
                   codexTurnState.apiRelayRouteToken = decision.token;
                 }
               }
             }
 
-            let acquired: { account_id: bigint; slotId: string } | null = null;
+            let acquired: { account_id: bigint; slotId: string } | null =
+              codexRoute?.engine === 'grok' && codexRoute.accountId && codexRoute.slotId
+                ? { account_id: BigInt(codexRoute.accountId), slotId: codexRoute.slotId }
+                : null;
             if (codexRoute === null) {
               if (codexBinding === undefined) {
                 throw Object.assign(new Error("no enabled Codex API relay group"), { name: "CodexRouteUnavailable" });
@@ -4775,10 +4869,25 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               codexTurnState.acquiredSlotId = acquired.slotId;
             }
             codexTurnState.acquireInflight = false;
-            codexTurnState.releaseTimer = setTimeout(() => {
-              releaseCodexTurnState(codexTurnState, "timeout");
-            }, sessionMaxMs);
-            codexTurnState.releaseTimer.unref?.();
+            if (codexRoute?.engine === 'grok') {
+              // Grok Build is a coding agent, so a valid turn must not be cut off
+              // by Codex's legacy 10-minute fallback. Terminal/error/bridge cleanup
+              // remains authoritative; this heartbeat only preserves its occupied
+              // account slot against the generic orphan reaper while it is live.
+              codexTurnState.slotHeartbeat = setInterval(() => {
+                const accountId = codexTurnState.acquiredAccountId;
+                const slotId = codexTurnState.acquiredSlotId;
+                if (accountId !== null && slotId !== null) {
+                  deps.codexBinding?.renew?.(accountId, slotId);
+                }
+              }, 60_000);
+              codexTurnState.slotHeartbeat.unref?.();
+            } else {
+              codexTurnState.releaseTimer = setTimeout(() => {
+                releaseCodexTurnState(codexTurnState, "timeout");
+              }, sessionMaxMs);
+              codexTurnState.releaseTimer.unref?.();
+            }
 
             // PR2 v1.0.66 → M2 — codex 真扣费 path:preCheck → journal → snapshot
             //   (finalizer 延迟到 billing 帧构造)→ inflightCodexTurns Map 注册 →
@@ -4787,7 +4896,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             //
             //   codexBillingEnabled=false(测试 / 个人版上下文,三件套未注入)→ 走
             //   下方 else 分支:仍 rewrite 注入 traceId(CG2a 合同硬门),只是不动 requestId。
-            const codexRouteFrame = codexRoute !== null ? {
+            const codexRouteFrame = codexRoute !== null && codexRoute.engine !== 'grok' ? {
               baseUrl: codexRoute.baseUrl,
               modelProvider: codexRoute.modelProvider,
               providerName: codexRoute.providerName ?? null,
@@ -4796,6 +4905,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               disableResponseStorage: codexRoute.disableResponseStorage ?? true,
             } : officialOAuthGroupId !== null ? {
               kind: "official_oauth" as const,
+            } : null;
+            const grokRouteFrame = codexRoute?.engine === 'grok' ? {
+              baseUrl: codexRoute.baseUrl,
+              routeToken: codexRoute.token,
             } : null;
             let frameForwardData: RawData;
             const frameForwardIsBinary = false;
@@ -4868,6 +4981,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               // durable dispatch:复用受理铸的稳定 billingRequestId 作 server requestId
               // (接管跨 attempt 稳定;journal/票据/结算全绑同一值)。
               const requestId = dispatchRecordB ? dispatchRecordB.billingRequestId : ensureRequestIdServerSide();
+              codexTurnState.billingRequestId = requestId;
               let verificationSponsorship;
               try {
                 verificationSponsorship = await admitVerificationSponsorship(pgPool, {
@@ -4962,6 +5076,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                       accountIdForQuota === 0n
                         ? null
                         : accountIdForQuota.toString(),
+                    ...(codexRoute?.engine === "grok" && acquired !== null
+                      ? {
+                          grokAccountId: acquired.account_id.toString(),
+                          grokSlotId: acquired.slotId,
+                        }
+                      : {}),
                     source: "codex_bridge",
                     durableBillingRecovery: DURABLE_CODEX_RECOVERY_VERSION,
                     // 已复合 agent override 的最终价格。跨 bridge 恢复必须用这份
@@ -5084,7 +5204,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 traceId: turnTraceIdCapture,
                 codexRouteToken: codexRoute?.token ?? null,
                 releaseBridgeTurnState(reason: string): boolean {
-                  if (!isCurrentCodexTurnState(codexTurnState)) return false;
+                  if (!isCurrentCodexTurnState(codexTurnState)) {
+                    if (codexTurnState.engine === "grok") retryPendingGrokLeaseRelease(requestId);
+                    return false;
+                  }
                   releaseCodexTurnState(codexTurnState, reason);
                   return true;
                 },
@@ -5199,6 +5322,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 requestId,
                 traceId: turnTraceIdCapture,
                 ...(codexRouteFrame !== null ? { __oc_codex_route: codexRouteFrame } : {}),
+                ...(grokRouteFrame !== null ? { __oc_grok_route: grokRouteFrame } : {}),
                 // 模型执行权威:签票绑定本 turn 的 server-owned requestId(billingRequestId),
                 // 并把 frame.model 归一为 canonical(容器断言 canonicalModel === frame.model)。
                 ...authorityFields,
@@ -5286,6 +5410,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 ...enrichedParsed,
                 traceId: turnTraceIdCapture,
                 ...(codexRouteFrame !== null ? { __oc_codex_route: codexRouteFrame } : {}),
+                ...(grokRouteFrame !== null ? { __oc_grok_route: grokRouteFrame } : {}),
                 // billing 未启用(legacy NULL 容器 / 测试):无 server requestId 可绑,
                 // 仍必须签票 —— 容器侧(flag 开)对无 envelope 的帧一律拒。
                 ...authorityFields,
@@ -5352,7 +5477,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               if (!cleaned && userWs.readyState === WebSocket.OPEN) {
                 sendTurnErrorFrame(
                   "CODEX_ROUTE_UNAVAILABLE",
-                  "GPT 服务暂时不可用，请稍后重试。",
+                  `${engineDisplayName} 服务暂时不可用，请稍后重试。`,
                 );
               }
             } else if (errName === "AccountPoolBusyError") {
@@ -5368,7 +5493,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               if (!cleaned && userWs.readyState === WebSocket.OPEN) {
                 sendTurnErrorFrame(
                   "CODEX_UNAVAILABLE",
-                  "GPT 服务暂时不可用，请稍后重试。",
+                  `${engineDisplayName} 服务暂时不可用，请稍后重试。`,
                 );
               }
             }
@@ -5964,7 +6089,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               //     settle；committed/finalizing 从 immutable attribution 恢复，
               //     finalizing 尚无可见证据时保持可重试；aborted 免单 + 告警。
               if (locallySettledCodexTurns.has(reqId)) {
-                bridgeLog?.info("user-chat-bridge: codex_billing duplicate for locally settled turn — dropped", {
+                const retryingGrokLease = pendingGrokLeaseReleases.has(reqId);
+                if (retryingGrokLease) retryPendingGrokLeaseRelease(reqId);
+                bridgeLog?.info(retryingGrokLease
+                  ? "user-chat-bridge: duplicate terminal billing retries pending durable Grok lease release"
+                  : "user-chat-bridge: codex_billing duplicate for locally settled turn — dropped", {
                   requestId: reqId,
                 });
                 return;
@@ -6877,6 +7006,22 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             });
             return;
           }
+          const ctx = (row.ctx !== null && typeof row.ctx === "object"
+            ? row.ctx
+            : {}) as Record<string, unknown>;
+          const grokAccountId = typeof ctx.grokAccountId === "string" && /^[1-9]\d*$/.test(ctx.grokAccountId)
+            ? BigInt(ctx.grokAccountId)
+            : null;
+          const grokSlotId = typeof ctx.grokSlotId === "string" && ctx.grokSlotId.length > 0
+            ? ctx.grokSlotId
+            : null;
+          if (grokAccountId !== null && grokSlotId !== null && deps.releaseGrokRouteLease !== undefined) {
+            // A terminal billing frame is the logical-turn boundary. Do this
+            // before journal-state branching so committed/finalizing/waived
+            // replays also clean the exact surviving lease. A transient DB
+            // failure leaves the journal/tape retryable and the route occupied.
+            await deps.releaseGrokRouteLease(grokAccountId, grokSlotId);
+          }
           if (row.state === "committed" || row.state === "finalizing") {
             // Settlement may have committed immediately before the old process
             // died, leaving its exact pending locator unfurled and its live goal
@@ -6965,9 +7110,6 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             });
           }
           // state === 'inflight' — 跨桥恢复 settle。
-          const ctx = (row.ctx !== null && typeof row.ctx === "object"
-            ? row.ctx
-            : {}) as Record<string, unknown>;
           const model = typeof ctx.model === "string" ? ctx.model : null;
           const agentId = typeof ctx.agentId === "string" ? ctx.agentId : "codex";
           const ctxTraceId = typeof ctx.traceId === "string" ? ctx.traceId : null;
@@ -7378,7 +7520,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // keep it active across reconnect and let its container+user-bound TTL own
       // cleanup if no later terminal frame reaches this bridge.
       for (const state of [...activeCodexTurnsByPeer.values()]) {
-        releaseCodexTurnState(state, "bridge_cleanup", !state.turnForwarded);
+        // A forwarded Grok turn can outlive this browser bridge. Keep its account slot
+        // leased to the relay; terminal handling or the generic slot reaper releases it.
+        const preserveGrokSlot = state.engine === "grok" && state.turnForwarded;
+        releaseCodexTurnState(state, "bridge_cleanup", !state.turnForwarded, preserveGrokSlot);
       }
       try { connectAbort.abort(); } catch { /* */ }
       try {

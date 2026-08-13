@@ -27,6 +27,7 @@ import {
 // ('ccb' / 'codex' factory)。
 import './engine/ccbAdapter.js'
 import './engine/codexAdapter.js'
+import './engine/grokAdapter.js'
 import type {
   AutomaticRetryState,
   CollabAgentPolicy,
@@ -46,6 +47,7 @@ import type {
 import { createEngine, resolveEngine } from './engine/registry.js'
 import { isModelAuthorityRequired } from './modelAuthority.js'
 import type { CodexProviderConfigOverride } from './engine/codexShared.js'
+import type { GrokRouteOverride } from './engine/grokAdapter.js'
 import { eventBus, createEvent } from './eventBus.js'
 import { createLogger } from './logger.js'
 import {
@@ -428,7 +430,8 @@ export function pickIdleTimeoutMs(
     pendingToolCalls > 0 ||
     inNonStreamingPhase ||
     engineId === 'ccb' ||
-    engineId === 'codex'
+    engineId === 'codex' ||
+    engineId === 'grok'
   ) {
     return IDLE_TIMEOUT_TOOL_MS
   }
@@ -2522,6 +2525,7 @@ export class SessionManager {
    *  防新旧 tag 混用导致 resume 条目被误判跨底座。 */
   private static normalizeEngineTag(tag: string | undefined): string {
     if (tag === 'codex-native' || tag === 'codex') return 'codex'
+    if (tag === 'grok') return 'grok'
     return SessionManager.CCB_PROVIDER_TAG
   }
 
@@ -2734,7 +2738,7 @@ export class SessionManager {
      */
     executionAuthority?: {
       canonicalModel: string
-      engine: 'ccb' | 'codex'
+      engine: 'ccb' | 'codex' | 'grok'
       source?: 'bridge_signed' | 'local_catalog'
     }
     /**
@@ -3134,6 +3138,8 @@ export class SessionManager {
        *  路由覆盖。每 turn 显式 set(null = 清除 stale route);仅 codex engine
        *  runner 实现 setCodexRoute,其余 runner duck-type 缺方法 → noop。 */
       codexRoute?: CodexProviderConfigOverride | null
+      /** Grok CLI receives only this one-turn opaque loopback relay route. */
+      grokRoute?: GrokRouteOverride | null
       /** Master-authored platform goal snapshot for this exact turn. null
        * explicitly clears stale engine state; omission is for legacy callers. */
       platformGoal?: GoalStateSnapshot | null
@@ -3319,6 +3325,10 @@ export class SessionManager {
       const maybeSetCodexRoute = (session.runner as any).setCodexRoute
       if (typeof maybeSetCodexRoute === 'function') {
         maybeSetCodexRoute.call(session.runner, opts?.codexRoute ?? null)
+      }
+      const maybeSetGrokRoute = (session.runner as any).setGrokRoute
+      if (typeof maybeSetGrokRoute === 'function') {
+        maybeSetGrokRoute.call(session.runner, opts?.grokRoute ?? null)
       }
       // effort + model 应用都必须在本 turn 真正启动**之前**完成,且必须在 prev 之后:
       //   - prev 之前:可能中断别人的 in-flight turn

@@ -79,6 +79,9 @@ import {
   handleAdminCreateAccount,
   handleAdminDeleteAccount,
   handleAdminGetAccount,
+  handleAdminGrokDeviceCancel,
+  handleAdminGrokDeviceStart,
+  handleAdminGrokDeviceStatus,
   handleAdminListAccounts,
   handleAdminListRefreshEvents,
   handleAdminOAuthExchange,
@@ -1064,6 +1067,9 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
       path: '/api/admin/accounts/oauth/exchange',
       handler: handleAdminOAuthExchange,
     },
+    { method: 'POST', path: '/api/admin/accounts/grok-device/start', handler: handleAdminGrokDeviceStart },
+    { method: 'GET', pathPrefix: '/api/admin/accounts/grok-device/', handler: handleAdminGrokDeviceStatus },
+    { method: 'DELETE', pathPrefix: '/api/admin/accounts/grok-device/', handler: handleAdminGrokDeviceCancel },
     // R3:reset-cooldown 子资源。pathPrefix 命中 /accounts/,handler 内部用 regex 抠
     //  `/accounts/:id/reset-cooldown`;POST 会先匹配到这条(method 一致),
     //  adjustCredits 走的是不同 prefix。

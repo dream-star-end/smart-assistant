@@ -419,11 +419,13 @@ docker build \
   --label "oc.runtime.cursor_agent_version=$CURSOR_AGENT_VERSION" \
   --label "oc.runtime.include_cursor=${OC_INCLUDE_CURSOR:-0}" \
   --label "oc.runtime.include_codex=${OC_INCLUDE_CODEX:-1}" \
+  --label "oc.runtime.include_grok=${OC_INCLUDE_GROK:-0}" \
   --label "oc.runtime.embed_source=${OC_EMBED_SOURCE:-1}" \
   --build-arg "OC_INCLUDE_CODEX=${OC_INCLUDE_CODEX:-1}" \
   --build-arg "OC_CURSOR_AGENT_VERSION=$CURSOR_AGENT_VERSION" \
   --build-arg "OC_CURSOR_AGENT_SHA256=$CURSOR_AGENT_SHA256" \
   --build-arg "OC_INCLUDE_CURSOR=${OC_INCLUDE_CURSOR:-0}" \
+  --build-arg "OC_INCLUDE_GROK=${OC_INCLUDE_GROK:-0}" \
   --build-arg "OC_EMBED_SOURCE=${OC_EMBED_SOURCE:-1}" \
   -f "$BUILD_CTX/Dockerfile.openclaude-runtime" \
   -t "$IMAGE_FULL" \

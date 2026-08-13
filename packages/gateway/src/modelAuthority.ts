@@ -462,7 +462,7 @@ export class ModelAuthorityConsumer {
         `frame.model=${String(frameModel)} != authority.canonicalModel=${payload.canonicalModel}`,
       )
     }
-    if (payload.engine === 'codex') {
+    if (payload.engine === 'codex' || payload.engine === 'grok') {
       const frameRequestId = typeof frame.requestId === 'string' ? frame.requestId : undefined
       if (
         typeof payload.billingRequestId !== 'string' ||
@@ -471,7 +471,7 @@ export class ModelAuthorityConsumer {
       ) {
         throw new AuthorityRejected(
           'billing_request_mismatch',
-          'codex authority billingRequestId does not match frame.requestId',
+          'engine-reported authority billingRequestId does not match frame.requestId',
         )
       }
     }

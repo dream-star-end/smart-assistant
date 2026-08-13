@@ -51,6 +51,12 @@ import {
   type OAuthProvider,
 } from "../../admin/oauth.js";
 import { AccountNotFoundError, type AccountRow } from "../../account-pool/store.js";
+import { getEgressProxyUrlPlaintext } from "../../admin/egressProxies.js";
+import {
+  cancelGrokDeviceAuth,
+  getGrokDeviceAuthStatus,
+  startGrokDeviceAuth,
+} from "../../admin/grokDeviceAuth.js";
 import {
   listRefreshEvents,
   MAX_LIST_LIMIT as REFRESH_EVENTS_MAX_LIMIT,
@@ -150,13 +156,13 @@ export async function handleAdminListAccounts(
   // V3 admin tab "Claude / Codex" 切换 — UI 显式传 provider=claude 或 codex 来过滤。
   // 不传/空字符串/"all" = 不过滤(向后兼容老调用者)。前端 G 节会显式传值,因此
   // 该兼容路径仅用于:外部脚本 / curl 调试 / 历史调用点。
-  let providerFilter: OAuthProvider | undefined;
+  let providerFilter: AccountRow["provider"] | undefined;
   if (providerRaw === null || providerRaw === "" || providerRaw === "all") {
     providerFilter = undefined;
-  } else if (providerRaw === "claude" || providerRaw === "codex") {
+  } else if (providerRaw === "claude" || providerRaw === "codex" || providerRaw === "grok") {
     providerFilter = providerRaw;
   } else {
-    throw new HttpError(400, "VALIDATION", "provider must be claude/codex/all");
+    throw new HttpError(400, "VALIDATION", "provider must be claude/codex/grok/all");
   }
   const limit = parsePositiveInt(sp.get("limit"), "limit", 500);
   const offset = parseNonNegativeInt(sp.get("offset"), "offset");
@@ -331,10 +337,10 @@ export async function handleAdminCreateAccount(
   }
   // V3 — provider 默认 'claude' 与历史行为一致;传 'codex' 时 admin 层会同时
   // 强制要求 oauth_refresh_token(refresh actor 60s tick 依赖)。
-  let provider: OAuthProvider | undefined;
+  let provider: AdminCreateAccountInput["provider"];
   if (b.provider !== undefined) {
-    if (b.provider === "claude" || b.provider === "codex") provider = b.provider;
-    else throw new HttpError(400, "VALIDATION", "provider must be 'claude' or 'codex'");
+    if (b.provider === "claude" || b.provider === "codex" || b.provider === "grok") provider = b.provider;
+    else throw new HttpError(400, "VALIDATION", "provider must be 'claude', 'codex', or 'grok'");
   }
   // 0055: 拒绝 legacy raw egress_proxy 字段。所有出口必须通过 egress_proxies 池
   // (egress_proxy_id),raw text 列已 CHECK NULL 锁死。
@@ -373,6 +379,16 @@ export async function handleAdminCreateAccount(
       throw new HttpError(400, "VALIDATION", "oauth_expires_at must be ISO string or null");
     }
     input.oauth_expires_at = b.oauth_expires_at as string | null;
+  }
+  if (b.oauth_principal_type !== undefined || b.oauth_principal_id !== undefined) {
+    if (
+      (b.oauth_principal_type !== null && typeof b.oauth_principal_type !== "string") ||
+      (b.oauth_principal_id !== null && typeof b.oauth_principal_id !== "string")
+    ) {
+      throw new HttpError(400, "VALIDATION", "oauth principal fields must be strings or null");
+    }
+    input.oauth_principal_type = b.oauth_principal_type as string | null | undefined;
+    input.oauth_principal_id = b.oauth_principal_id as string | null | undefined;
   }
   if (b.subscription_end_at !== undefined) {
     if (b.subscription_end_at !== null && typeof b.subscription_end_at !== "string") {
@@ -653,4 +669,61 @@ export async function handleAdminOAuthExchange(
     }
     throw err;
   }
+}
+
+function grokDeviceSessionId(req: IncomingMessage): string {
+  const parsed = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
+  const prefix = "/api/admin/accounts/grok-device/";
+  const id = parsed.pathname.startsWith(prefix) ? parsed.pathname.slice(prefix.length) : "";
+  if (!/^[0-9a-f]{32}$/.test(id)) throw new HttpError(400, "VALIDATION", "invalid Grok device session id");
+  return id;
+}
+
+export async function handleAdminGrokDeviceStart(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  await requireAdminVerifyDb(req, deps.jwtSecret);
+  const body = (await readJsonBody(req)) ?? {};
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    throw new HttpError(400, "VALIDATION", "request body must be JSON object");
+  }
+  const proxyId = (body as Record<string, unknown>).egress_proxy_id;
+  if ((typeof proxyId !== "string" && typeof proxyId !== "number") || !/^[1-9][0-9]{0,19}$/.test(String(proxyId))) {
+    throw new HttpError(400, "VALIDATION", "egress_proxy_id is required");
+  }
+  const proxyUrl = await getEgressProxyUrlPlaintext(String(proxyId));
+  if (!proxyUrl) throw new HttpError(400, "VALIDATION", "egress proxy must exist and be active");
+  try {
+    sendJson(res, 200, await startGrokDeviceAuth({ proxyUrl }));
+  } catch (err) {
+    const code = err instanceof Error ? err.message : "GROK_DEVICE_AUTH_FAILED";
+    throw new HttpError(503, "OAUTH_FAILED", code);
+  }
+}
+
+export async function handleAdminGrokDeviceStatus(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  await requireAdminVerifyDb(req, deps.jwtSecret);
+  const status = getGrokDeviceAuthStatus(grokDeviceSessionId(req));
+  if (!status) throw new HttpError(404, "NOT_FOUND", "Grok device session not found");
+  sendJson(res, 200, status);
+}
+
+export async function handleAdminGrokDeviceCancel(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  await requireAdminVerifyDb(req, deps.jwtSecret);
+  const removed = cancelGrokDeviceAuth(grokDeviceSessionId(req));
+  if (!removed) throw new HttpError(404, "NOT_FOUND", "Grok device session not found");
+  sendJson(res, 200, { ok: true });
 }

@@ -674,6 +674,17 @@ describe('per-slot 租约:cap 与 slotId 唯一性', () => {
 })
 
 describe('reapExpiredSlots(B7)', () => {
+  test('renew keeps a live long-running slot ahead of the orphan reaper', () => {
+    const nowRef = { ms: 0 }
+    const s = mkSlotScheduler({ slotIds: ['long-turn'], nowRef })
+    const slotId = s.acquireCodexSlot('100')
+    nowRef.ms = s.slotLeaseTtlMs - 1
+    assert.equal(s.renewCodexSlot('100', slotId), true)
+    assert.equal(s.renewCodexSlot('100', 'unknown'), false)
+    assert.equal(s.reapExpiredSlots(s.slotLeaseTtlMs + 1), 0)
+    assert.equal(s.getInflight('100'), 1)
+  })
+
   test('回收超 TTL 的槽,保留新槽', () => {
     const nowRef = { ms: 0 }
     const s = mkSlotScheduler({ slotIds: ['old', 'fresh'], nowRef })
@@ -686,6 +697,24 @@ describe('reapExpiredSlots(B7)', () => {
     const reaped = s.reapExpiredSlots(ttl + 1)
     assert.equal(reaped, 1)
     assert.equal(s.getInflight('100'), 1)
+  })
+
+  test('durable Grok lease rehydrates after 30m+ reaper and blocks reallocation until terminal release', () => {
+    const nowRef = { ms: 0 }
+    const s = mkSlotScheduler({ slotIds: ['original', 'next'], nowRef, maxConcurrent: 1 })
+    const slotId = s.acquireCodexSlot('100')
+    nowRef.ms = s.slotLeaseTtlMs + 1
+    assert.equal(s.reapExpiredSlots(), 1)
+    assert.equal(s.getInflight('100'), 0)
+
+    // An active grok_route_context is reloaded before the next allocation.
+    s.restoreCodexSlot('100', slotId)
+    assert.equal(s.getInflight('100'), 1)
+    assert.throws(() => s.acquireCodexSlot('100'), AccountPoolBusyError)
+
+    // Terminal billing expires the durable row and releases this exact mirror.
+    s.releaseCodexSlot('100', slotId)
+    assert.equal(s.acquireCodexSlot('100'), 'next')
   })
 
   test('全部未过期:reap 不回收,返回 0', () => {

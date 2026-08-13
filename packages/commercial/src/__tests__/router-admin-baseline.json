@@ -355,6 +355,24 @@
   },
   {
     "method": "POST",
+    "pathKind": "path",
+    "pathValue": "/api/admin/accounts/grok-device/start",
+    "handler": "handleAdminGrokDeviceStart"
+  },
+  {
+    "method": "GET",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/accounts/grok-device/",
+    "handler": "handleAdminGrokDeviceStatus"
+  },
+  {
+    "method": "DELETE",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/accounts/grok-device/",
+    "handler": "handleAdminGrokDeviceCancel"
+  },
+  {
+    "method": "POST",
     "pathKind": "pathPrefix",
     "pathValue": "/api/admin/accounts/",
     "handler": "handleAdminResetAccountCooldown"

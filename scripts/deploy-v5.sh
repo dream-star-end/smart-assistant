@@ -1733,10 +1733,14 @@ jq -e '.ok == true and .channel == "v5"' <<<"$public" >/dev/null || { echo 'FATA
 target_image_id="$(docker image inspect --format '{{.Id}}' "$target_image")"
 image_commit="$(docker image inspect --format '{{ index .Config.Labels "oc.runtime.source_commit" }}' "$target_image")"
 image_codex="$(docker image inspect --format '{{ index .Config.Labels "oc.runtime.codex_version" }}' "$target_image")"
+image_grok="$(docker image inspect --format '{{ index .Config.Labels "oc.runtime.include_grok" }}' "$target_image")"
 [[ "$image_commit" =~ ^[0-9a-f]{7,40}$ && "$target_commit" == "$image_commit"* ]] || { echo "FATAL: image source_commit is not a prefix of target commit" >&2; exit 1; }
 [[ -n "$image_codex" ]] || { echo 'FATAL: image missing codex version label' >&2; exit 1; }
+[[ "$image_grok" == 1 ]] || { echo 'FATAL: image missing official Grok runtime (oc.runtime.include_grok=1)' >&2; exit 1; }
 actual_codex="$(docker run --rm --entrypoint codex "$target_image" --version)"
 [[ "$actual_codex" == "codex-cli $image_codex" ]] || { echo 'FATAL: image codex label/binary mismatch' >&2; exit 1; }
+actual_grok="$(docker run --rm --entrypoint grok-native "$target_image" --version)"
+[[ "$actual_grok" == grok\ 1.0.3\ * ]] || { echo 'FATAL: image Grok binary mismatch' >&2; exit 1; }
 
 dburl="$(grep '^DATABASE_URL=' "$env_file" | tail -n 1 | cut -d= -f2-)"
 [[ -n "$dburl" ]] || { echo 'FATAL: DATABASE_URL missing' >&2; exit 1; }
@@ -5079,7 +5083,7 @@ hotcfg_history_present() {
 assert_target_runtime_image_ready() {
   [[ -n "$TARGET_RUNTIME_IMAGE" ]] || return 0
   local -a pinned=()
-  local inspect actual_id source_commit embed_source
+  local inspect actual_id source_commit embed_source include_grok actual_grok
   mapfile -t pinned < <(grep -E '^OC_RUNTIME_IMAGE=' "$REPO_ROOT/deploy/v5/commercial-v5.env.overrides" || true)
   [[ ${#pinned[@]} == 1 && "${pinned[0]#OC_RUNTIME_IMAGE=}" == "$TARGET_RUNTIME_IMAGE" ]] || {
     echo "✗ repo overrides 必须唯一且精确钉住 --runtime-image（先合并 durable config）" >&2
@@ -5093,11 +5097,11 @@ assert_target_runtime_image_ready() {
     echo "✗ --runtime-image 要求 runtime release hotcfg 轴已开启（或本次显式 --enable-runtime-release）" >&2
     return 1
   }
-  inspect="$(ssh "$KL_HOST" "docker image inspect --format '{{.Id}}|{{ index .Config.Labels \"oc.runtime.source_commit\" }}|{{ index .Config.Labels \"oc.runtime.embed_source\" }}' '$TARGET_RUNTIME_IMAGE'" 2>/dev/null)" || {
+  inspect="$(ssh "$KL_HOST" "docker image inspect --format '{{.Id}}|{{ index .Config.Labels \"oc.runtime.source_commit\" }}|{{ index .Config.Labels \"oc.runtime.embed_source\" }}|{{ index .Config.Labels \"oc.runtime.include_grok\" }}' '$TARGET_RUNTIME_IMAGE'" 2>/dev/null)" || {
     echo "✗ 目标 runtime image 不存在或 inspect 失败:$TARGET_RUNTIME_IMAGE" >&2
     return 1
   }
-  IFS='|' read -r actual_id source_commit embed_source <<<"$inspect"
+  IFS='|' read -r actual_id source_commit embed_source include_grok <<<"$inspect"
   [[ "$actual_id" == "$TARGET_RUNTIME_IMAGE_ID" ]] || {
     echo "✗ 目标 runtime image immutable ID 漂移(expected=$TARGET_RUNTIME_IMAGE_ID actual=${actual_id:-<none>})" >&2
     return 1
@@ -5106,13 +5110,22 @@ assert_target_runtime_image_ready() {
     echo "✗ --runtime-image 在线切换只接受 slim image(oc.runtime.embed_source=0)" >&2
     return 1
   }
+  [[ "$include_grok" == 1 ]] || {
+    echo "✗ target runtime image 缺 official Grok binary(oc.runtime.include_grok=1)" >&2
+    return 1
+  }
+  actual_grok="$(ssh "$KL_HOST" "docker run --rm --entrypoint grok-native '$TARGET_RUNTIME_IMAGE' --version")" || return 1
+  [[ "$actual_grok" == grok\ 1.0.3\ * ]] || {
+    echo "✗ target runtime image Grok binary=$actual_grok,expected='grok 1.0.3 (...)'" >&2
+    return 1
+  }
   [[ "$source_commit" =~ ^[0-9a-f]{40}$ ]] \
     && git -C "$REPO_ROOT" cat-file -e "${source_commit}^{commit}" 2>/dev/null \
     && git -C "$REPO_ROOT" merge-base --is-ancestor "$source_commit" HEAD || {
     echo "✗ 目标 runtime image source_commit 不是 canonical HEAD 的可验证 ancestor:${source_commit:-<none>}" >&2
     return 1
   }
-  echo "  ✓ target runtime image 已钉死(ref=$TARGET_RUNTIME_IMAGE id=$TARGET_RUNTIME_IMAGE_ID source=$source_commit slim=1)"
+  echo "  ✓ target runtime image 已钉死(ref=$TARGET_RUNTIME_IMAGE id=$TARGET_RUNTIME_IMAGE_ID source=$source_commit slim=1 grok=$actual_grok)"
 }
 
 # ── 1. build_platform_bundle:从**钉死的** BUILT_RELEASE 内 platform-runtime/ 组装 → 落 bundles/<rev> ──
@@ -7101,7 +7114,7 @@ activate_staged_inner() {
     || echo "⚠ staged source 的 Knowledge Planet 插件制品与 DB 已审批版本不一致:插件将 RUNTIME_UNAVAILABLE 直至验证晋升(运行时按内容 pin fail-closed);staged cutover 不因此阻断(2026-07-17 纠偏)" >&2
   install_cutover_target_image_env
   local expected_commit expected_full_commit expected_build remote_commit remote_build runtime_image
-  local image_commit image_codex_version actual_codex_version
+  local image_commit image_codex_version image_include_grok actual_codex_version actual_grok_version
   expected_commit="$(git -C "$REPO_ROOT" rev-parse --short HEAD)"
   expected_full_commit="$(git -C "$REPO_ROOT" rev-parse HEAD)"
   expected_build=""
@@ -7121,17 +7134,25 @@ activate_staged_inner() {
     ssh "$KL_HOST" "docker image inspect '$runtime_image' >/dev/null"
     image_commit="$(ssh "$KL_HOST" "docker image inspect --format '{{ index .Config.Labels \"oc.runtime.source_commit\" }}' '$runtime_image'")"
     image_codex_version="$(ssh "$KL_HOST" "docker image inspect --format '{{ index .Config.Labels \"oc.runtime.codex_version\" }}' '$runtime_image'")"
+    image_include_grok="$(ssh "$KL_HOST" "docker image inspect --format '{{ index .Config.Labels \"oc.runtime.include_grok\" }}' '$runtime_image'")"
     [[ "$image_commit" =~ ^[0-9a-f]{7,40}$ && "$expected_full_commit" == "$image_commit"* ]] || {
       echo "✗ runtime image source_commit=$image_commit is not target commit $expected_full_commit 的前缀" >&2; exit 1;
     }
     [[ "$image_codex_version" == "0.144.0" ]] || {
       echo "✗ runtime image codex label=$image_codex_version,expected=0.144.0" >&2; exit 1;
     }
+    [[ "$image_include_grok" == 1 ]] || {
+      echo "✗ runtime image 缺 official Grok binary label(oc.runtime.include_grok=1)" >&2; exit 1;
+    }
     actual_codex_version="$(ssh "$KL_HOST" "docker run --rm --entrypoint codex '$runtime_image' --version")"
     [[ "$actual_codex_version" == "codex-cli 0.144.0" ]] || {
       echo "✗ runtime image codex binary=$actual_codex_version,expected='codex-cli 0.144.0'" >&2; exit 1;
     }
-    echo "  ✓ runtime image source=$image_commit,codex=$actual_codex_version"
+    actual_grok_version="$(ssh "$KL_HOST" "docker run --rm --entrypoint grok-native '$runtime_image' --version")"
+    [[ "$actual_grok_version" == grok\ 1.0.3\ * ]] || {
+      echo "✗ runtime image Grok binary=$actual_grok_version,expected='grok 1.0.3 (...)'" >&2; exit 1;
+    }
+    echo "  ✓ runtime image source=$image_commit,codex=$actual_codex_version,grok=$actual_grok_version"
   fi
   # RFC §1.2:此处 sshk start 是 staged lane 的真正激活翻转点(unit 从停机→起旧同构状态)。翻转前
   # 活体断言远端 lease;此刻 unit 仍停(live 未改),失活即 rc=86，wrapper 明确跳过 recover_cutover。

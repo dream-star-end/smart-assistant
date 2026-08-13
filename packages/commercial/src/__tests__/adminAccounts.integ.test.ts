@@ -726,6 +726,53 @@ describe("admin accounts — 0070 account_uuid 同步 fetch", () => {
     assert.equal(r.rows[0].uuid, null, "codex 不应该写 account_uuid");
   });
 
+  test("create grok → encrypted official OAuth account is assigned to the Grok group", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const admin = await createUser("grok-admin@x.com", "admin");
+    const epid = await setupEgressProxy(admin);
+    setProfileMockBehavior({ kind: "network_error" });
+
+    const created = await adminCreateAccount(
+      {
+        label: "grok-1",
+        plan: "max",
+        provider: "grok",
+        oauth_token: "grok-access",
+        oauth_refresh_token: "grok-refresh",
+        oauth_expires_at: "2030-01-01T00:00:00.000Z",
+        oauth_principal_type: "Team",
+        oauth_principal_id: "team-123",
+        egress_proxy_id: epid,
+      },
+      { adminId: admin },
+    );
+    const r = await query<{
+      provider: string;
+      account_uuid: string | null;
+      group_provider: string | null;
+      oauth_principal_type: string | null;
+      oauth_principal_id: string | null;
+      has_plaintext: boolean;
+    }>(
+      `SELECT a.provider,a.account_uuid::text,
+              g.provider AS group_provider,
+              a.oauth_principal_type,a.oauth_principal_id,
+              position(convert_to('grok-access','UTF8') in a.oauth_token_enc) > 0 AS has_plaintext
+         FROM claude_accounts a
+         LEFT JOIN account_groups g ON g.id=a.group_id
+        WHERE a.id=$1`,
+      [created.id.toString()],
+    );
+    assert.deepEqual(r.rows, [{
+      provider: "grok",
+      account_uuid: null,
+      group_provider: "grok",
+      oauth_principal_type: "Team",
+      oauth_principal_id: "team-123",
+      has_plaintext: false,
+    }]);
+  });
+
   test("fetch 401 → RangeError uuid_fetch_failed:token_invalid,DB 不留行", async (t) => {
     if (skipIfNoPg(t)) return;
     const admin = await createUser("a@x.com", "admin");

@@ -561,7 +561,7 @@ cutover manifest，也不要求新 migration。仅真正紧急人工维护可为
 ```bash
 # 在 kl-mirror 上、源=已部署树。⚠️ 非交互 ssh 必须带 bun 的 PATH,否则 FATAL 没 bun
 ssh kl-mirror 'cd /opt/openclaude/openclaude-v5 && nohup env PATH=/root/.bun/bin:$PATH \
-  PERSONAL_SRC=/opt/openclaude/openclaude-v5 OC_BUILD_NETWORK_HOST=1 OC_BUILD_SKIP_TAR=1 OC_INCLUDE_CODEX=1 \
+  PERSONAL_SRC=/opt/openclaude/openclaude-v5 OC_BUILD_NETWORK_HOST=1 OC_BUILD_SKIP_TAR=1 OC_INCLUDE_CODEX=1 OC_INCLUDE_GROK=1 \
   bash packages/commercial/agent-sandbox/build-image.sh v5-ccb-<12位sha> > /tmp/v5-image-build.log 2>&1 &'
 # 完成判定:docker images 出现该 tag(日志 grep FATAL 会误报 Dockerfile 里的 echo 字符串)
 ssh kl-mirror 'sed -i "s|^OC_RUNTIME_IMAGE=.*|OC_RUNTIME_IMAGE=openclaude/openclaude-runtime:v5-ccb-<sha>|" /etc/openclaude/commercial-v5.env'
