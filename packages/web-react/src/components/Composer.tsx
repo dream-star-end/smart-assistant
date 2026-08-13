@@ -294,7 +294,7 @@ export function Composer({
     <div className="mx-auto w-full max-w-3xl px-4">
       <div
         className={cn(
-          "rounded-[26px] border border-border bg-surface shadow-[var(--shadow-float)] transition-all",
+          "rounded-[26px] border border-border-control bg-surface shadow-[var(--shadow-float)] transition-all",
           "focus-within:border-border-strong",
         )}
       >

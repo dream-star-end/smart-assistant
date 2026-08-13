@@ -117,6 +117,42 @@ describe("Sidebar 会话列表", () => {
     );
   });
 
+  it("活跃会话行有左侧 accent 竖条，且桌面行用 py-1.5；非活跃行无竖条、圆角同为 rounded-md", () => {
+    renderSidebar({ sessions: listSessions, activeId: "s-beta" });
+    const activeBtn = screen.getByRole("button", { name: "Beta 上线检查" });
+    const activeRow = activeBtn.closest("div");
+    expect(activeRow).toHaveClass("rounded-md", "bg-active");
+    expect(activeRow?.querySelector(".bg-accent")).not.toBeNull();
+    expect(activeBtn).toHaveClass("py-1.5");
+    expect(activeBtn.className).toContain("[@media(hover:none)]:py-2");
+
+    const idleBtn = screen.getByRole("button", { name: "季度复盘 Alpha" });
+    const idleRow = idleBtn.closest("div");
+    expect(idleRow).toHaveClass("rounded-md");
+    expect(idleRow?.querySelector(".bg-accent")).toBeNull();
+  });
+
+  it("管理/市场入口权重低于「新建会话」：text-body + text-muted，新建保持 secondary 主按钮", () => {
+    renderSidebar({
+      onOpenManage: () => {},
+      onOpenMarketplace: () => {},
+      onOpenTutorial: () => {},
+      onOpenOrg: () => {},
+      showAdmin: true,
+    });
+    const create = screen.getByRole("button", { name: "新建会话" });
+    expect(create).toHaveClass("text-section");
+    expect(create.className).toMatch(/border-border/);
+    expect(create.className).toMatch(/bg-surface/);
+    const manage = screen.getByRole("button", { name: /管理中心/ });
+    const market = screen.getByRole("button", { name: /^市场/ });
+    expect(manage).toHaveClass("text-body", "text-muted", "py-1.5");
+    expect(market).toHaveClass("text-body", "text-muted", "py-1.5");
+    expect(screen.getByRole("button", { name: /使用教程/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /组织/ })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /管理后台/ })).toHaveAttribute("href", "/admin.html");
+  });
+
   it("点击会话行把该会话 id 上抛（核心导航）", () => {
     const onSelect = vi.fn();
     renderSidebar({ sessions: listSessions, onSelect });

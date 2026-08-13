@@ -149,7 +149,7 @@ export function SettingsCenter({
           className="oc-center-dialog fixed left-1/2 z-50 flex max-h-[85vh] max-h-[85dvh] w-[calc(100vw-2rem)] max-w-2xl -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-xl border border-border bg-surface shadow-float focus:outline-none data-[state=open]:animate-in"
         >
           <div className="flex items-center justify-between px-5 py-4">
-            <Dialog.Title className="text-[15px] font-semibold text-fg">设置</Dialog.Title>
+            <Dialog.Title className="text-title font-semibold text-fg">设置</Dialog.Title>
             <Dialog.Close asChild>
               <button
                 type="button"
@@ -175,7 +175,7 @@ export function SettingsCenter({
 
           <div className="min-h-0 flex-1 overflow-y-auto">
             {!auth ? (
-              <p className="px-5 py-10 text-center text-[13px] text-faint">请先登录。</p>
+              <p className="px-5 py-10 text-center text-body text-faint">请先登录。</p>
             ) : (
               <>
                 {section === "account" && (
@@ -199,7 +199,7 @@ export function SettingsCenter({
                 {section === "preferences" && (
                   <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.preferences.id}>
                     {prefsLoading || !prefs ? (
-                      <div className="flex items-center justify-center gap-2 py-16 text-[13px] text-faint">
+                      <div className="flex items-center justify-center gap-2 py-16 text-body text-faint">
                         {prefsErr ? (
                           <div className="flex flex-col items-center gap-3 text-center">
                             <span className="text-danger">{prefsErr}</span>
@@ -238,7 +238,7 @@ export function SettingsCenter({
                     {user ? (
                       <FeedbackTab auth={auth} userId={user.id} context={feedbackContext} />
                     ) : (
-                      <p className="px-5 py-10 text-center text-[13px] text-faint">
+                      <p className="px-5 py-10 text-center text-body text-faint">
                         正在加载账号信息…
                       </p>
                     )}
@@ -272,12 +272,12 @@ function AboutSection() {
           <Sparkles size={22} />
         </Avatar>
         <div>
-          <div className="text-[16px] font-semibold text-fg">{BRAND.name}</div>
-          <div className="text-[12.5px] text-faint">{BRAND.slogan}</div>
+          <div className="text-title font-semibold text-fg">{BRAND.name}</div>
+          <div className="text-caption text-faint">{BRAND.slogan}</div>
         </div>
       </div>
-      <p className="mt-4 text-[13.5px] leading-relaxed text-muted">{BRAND.intro}</p>
-      <dl className="mt-4 flex flex-col gap-2 text-[12.5px]">
+      <p className="mt-4 text-body leading-relaxed text-muted">{BRAND.intro}</p>
+      <dl className="mt-4 flex flex-col gap-2 text-caption">
         <div className="flex items-center justify-between gap-3">
           <dt className="shrink-0 text-faint">运营主体</dt>
           <dd className="truncate text-fg">{BRAND.company}</dd>

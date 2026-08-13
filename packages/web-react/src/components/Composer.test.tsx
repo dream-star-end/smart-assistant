@@ -5,6 +5,17 @@ import { Composer } from "./Composer";
 
 afterEach(cleanup);
 
+describe("Composer 控件边框 token", () => {
+  test("外壳非聚焦用 border-border-control，聚焦用 border-border-strong，不用分隔线 border-border", () => {
+    const { container } = render(<Composer onSend={() => {}} />);
+    const shell = container.querySelector(".rounded-\\[26px\\]");
+    expect(shell).toBeTruthy();
+    expect(shell?.className).toContain("border-border-control");
+    expect(shell?.className).toContain("focus-within:border-border-strong");
+    expect(shell?.className).not.toMatch(/(?:^|\s)border-border(?:\s|$)/);
+  });
+});
+
 describe("Composer Stop ownership", () => {
   test("the composer is the sole active Stop control", () => {
     const onStop = vi.fn();

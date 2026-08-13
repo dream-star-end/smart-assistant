@@ -2,6 +2,7 @@ import '@testing-library/jest-dom/vitest'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, expect, test, vi } from 'vitest'
 import { api } from '../lib/api'
+import { BRAND } from '../lib/brand'
 import type { AuthSession } from '../lib/types'
 import { createMemoryAuthSession } from '../lib/authSession'
 import { SettingsCenter } from './SettingsCenter'
@@ -49,6 +50,25 @@ test('设置中心可发现反馈分区并进入真实反馈表单', () => {
   expect(screen.getByRole('button', { name: '关闭' })).toHaveClass('[@media(hover:none)]:size-11')
   expect(screen.getByRole('dialog')).toHaveClass('oc-center-dialog', 'max-h-[85vh]', 'max-h-[85dvh]')
   expect(screen.getByRole('dialog')).not.toHaveClass('top-1/2')
+  expect(screen.getByRole('heading', { name: '设置' })).toHaveClass('text-title')
+})
+
+test('关于分区说明使用 text-caption text-faint，标题保持 text-title', () => {
+  render(
+    <SettingsCenter
+      open
+      auth={auth}
+      user={{ id: 'about-user', displayName: '用户', roles: ['user'], role: 'user' }}
+      theme="light"
+      onClose={() => {}}
+      onSetTheme={() => {}}
+      onOpenMemory={() => {}}
+      initialSection="about"
+    />,
+  )
+
+  expect(screen.getByRole('heading', { name: '设置' })).toHaveClass('text-title')
+  expect(screen.getByText(BRAND.slogan)).toHaveClass('text-caption', 'text-faint')
 })
 
 test('设置中心只把 API Key 管理权限授予 admin', async () => {
