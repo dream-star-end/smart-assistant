@@ -1107,6 +1107,26 @@ export const OutboundCodexBilling = Type.Object({
 })
 export type OutboundCodexBilling = Static<typeof OutboundCodexBilling>
 
+/** Internal, non-chargeable audit terminal for user-subscription engines. */
+export const OutboundExternalEngineBilling = Type.Object({
+  type: Type.Literal('outbound.external_engine_billing'),
+  sessionKey: Type.String(), channel: Type.String(), peer: Peer,
+  requestId: Type.String({ pattern: '^[0-9a-f]{32}$' }),
+  engine: Type.Literal('cursor'),
+  status: Type.Union([Type.Literal('success'), Type.Literal('error'), Type.Literal('unavailable')]),
+  terminalCode: Type.Optional(Type.Union([
+    Type.Literal('USER_CANCELLED'), Type.Literal('AUTH_UNAVAILABLE'),
+    Type.Literal('QUOTA_UNAVAILABLE'), Type.Literal('ENGINE_ERROR'),
+  ])),
+  durationMs: Type.Number(),
+  usage: Type.Optional(Type.Object({
+    input_tokens: Type.Optional(Type.Number()), output_tokens: Type.Optional(Type.Number()),
+    cache_read_input_tokens: Type.Optional(Type.Number()), cache_creation_input_tokens: Type.Optional(Type.Number()),
+  })),
+  traceId: Type.Optional(TraceIdString),
+})
+export type OutboundExternalEngineBilling = Static<typeof OutboundExternalEngineBilling>
+
 // ───────────────────────────────────────────────
 // OutboundTurnStatus — 当前 turn 的 backend-side 非流式阶段状态。
 //
@@ -1303,6 +1323,7 @@ export const AnyFrame = Type.Union([
   OutboundActiveTurnReplayStart,
   OutboundError,
   OutboundCodexBilling,
+  OutboundExternalEngineBilling,
   OutboundTurnStatus,
   OutboundTurnUsage,
   OutboundCallUsage,

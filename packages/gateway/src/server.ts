@@ -30,6 +30,7 @@ import {
   type InboundFrame,
   type InboundMessage,
   type OutboundCodexBilling,
+  type OutboundExternalEngineBilling,
   type OutboundCallUsage,
   type OutboundError,
   type OutboundMessage,
@@ -52,11 +53,13 @@ import {
   STATIC_KEY_INBOUND_MODEL_IDS,
   CODEX_ENGINE_MODEL_IDS,
   GROK_ENGINE_MODEL_IDS,
+  CURSOR_ENGINE_MODEL_IDS,
   PLATFORM_REASONING_EFFORTS,
   MAX_ATTACHMENTS_PER_MESSAGE,
   AUTOMATIC_TURN_RETRY_MAX,
   isCodexEngineModel,
   isGrokEngineModel,
+  isCursorEngineModel,
   isClientMessageId,
   isPersistedClientMessageId,
   formatMessageReplyPrompt,
@@ -436,6 +439,7 @@ function teamMemberCapabilityHint(agent: AgentDef): string {
 export const ALLOWED_INBOUND_MODELS = new Set<string>([
   ...CODEX_ENGINE_MODEL_IDS,
   ...GROK_ENGINE_MODEL_IDS,
+  ...CURSOR_ENGINE_MODEL_IDS,
   ...STATIC_KEY_INBOUND_MODEL_IDS,
 ])
 
@@ -525,12 +529,12 @@ export function resolveSyntheticTurnModel(
   // 硬 pin 的 codex-native:model 替换无效(见 registry.resolveEngine),保持 fail-closed。
   if (agent.provider === 'codex-native') return undefined
   const effective = resolveExecutionModel(agent.model, defaultModel)
-  if (!isCodexEngineModel(effective) && !isGrokEngineModel(effective)) return undefined
+  if (!isCodexEngineModel(effective) && !isGrokEngineModel(effective) && !isCursorEngineModel(effective)) return undefined
   const raw = process.env.OPENCLAUDE_SYNTHETIC_TURN_MODEL?.trim()
   // env 兜底自身必须**非 codex 且在入站白名单内**,否则忽略回默认 —— 防"把 bug 换个门再引入"
   // (例如误配成 gpt-5.5 又绕回 codex,或配一个会被 resolveExecutionModel 收敛掉的下线模型)。
   const candidate =
-    raw && ALLOWED_INBOUND_MODELS.has(raw) && !isCodexEngineModel(raw) && !isGrokEngineModel(raw)
+    raw && ALLOWED_INBOUND_MODELS.has(raw) && !isCodexEngineModel(raw) && !isGrokEngineModel(raw) && !isCursorEngineModel(raw)
       ? raw
       : SYNTHETIC_TURN_NON_CODEX_MODEL_DEFAULT
   // ── routable 自检(MAJOR-1)──────────────────────────────────────────────
@@ -580,7 +584,7 @@ export interface LocalExecutionDecision {
   /** catalog 归一后的 canonical model id(alias 已解析)。 */
   readonly canonicalModel: string
   /** 取自投影的 engine(不查 baked MODEL_ENGINE_MAP)。 */
-  readonly engine: 'ccb' | 'codex' | 'grok'
+  readonly engine: 'ccb' | 'codex' | 'grok' | 'cursor'
   readonly supportsVision: boolean
   /** 非空 = 发生了 codex → 非 codex 降级('synthetic' kind);原模型供透明披露(MAJOR-2)。 */
   readonly downgradedFrom?: string
@@ -716,7 +720,7 @@ export function localExecutionOverride(decision: LocalExecutionDecision | undefi
   model?: string
   executionAuthority?: {
     canonicalModel: string
-    engine: 'ccb' | 'codex' | 'grok'
+    engine: 'ccb' | 'codex' | 'grok' | 'cursor'
     source: 'local_catalog'
   }
 } {
@@ -880,7 +884,7 @@ export function _buildSafeCodexRouteOverride(args: {
    *  base_url 指回本进程的 /internal/v3/codex-relay handler。 */
   officialRelayPort: number
   /** master 签名的执行权威(有则 engine 判定只认它,见 registry.resolveEngine)。 */
-  authority?: { canonicalModel: string; engine: 'ccb' | 'codex' | 'grok' }
+  authority?: { canonicalModel: string; engine: 'ccb' | 'codex' | 'grok' | 'cursor' }
 }): CodexProviderConfigOverride | null {
   if (!args.rawRoute || typeof args.rawRoute !== 'object' || Array.isArray(args.rawRoute)) {
     return null
@@ -963,7 +967,7 @@ export function _buildSafeGrokRouteOverride(args: {
   model?: string
   rawRoute: unknown
   officialRelayPort: number
-  authority?: { canonicalModel: string; engine: 'ccb' | 'codex' | 'grok' }
+  authority?: { canonicalModel: string; engine: 'ccb' | 'codex' | 'grok' | 'cursor' }
 }): { baseUrl: string; routeToken: string } | null {
   if (!args.rawRoute || typeof args.rawRoute !== 'object' || Array.isArray(args.rawRoute)) return null
   let engineId: string
@@ -14731,6 +14735,18 @@ export class Gateway {
           ...(e.rateLimits ? { rateLimits: e.rateLimits } : {}),
         }
         this.deliver(billingFrame, adapter)
+      } else if (e.kind === 'external_billing') {
+        const billingFrame: OutboundExternalEngineBilling & { _userId?: string } = {
+          type: 'outbound.external_engine_billing',
+          ..._inheritOutboundRouting(out),
+          requestId: e.requestId,
+          engine: e.engine,
+          status: e.status,
+          ...(e.terminalCode ? { terminalCode: e.terminalCode } : {}),
+          durationMs: e.durationMs,
+          ...(e.usage ? { usage: e.usage } : {}),
+        }
+        this.deliver(billingFrame, adapter)
       } else if (e.kind === 'error') {
         // Plan 2 — turn 终态前清 turn_status cache,语义同 final 分支。
         session.currentTurnStatus = null
@@ -15087,6 +15103,7 @@ export class Gateway {
       | OutboundMessage
       | OutboundError
       | OutboundCodexBilling
+      | OutboundExternalEngineBilling
       | OutboundTurnStatus
       | OutboundTurnUsage
       | OutboundCallUsage

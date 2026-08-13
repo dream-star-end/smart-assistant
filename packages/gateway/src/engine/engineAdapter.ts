@@ -34,9 +34,9 @@ import type {
 export interface EngineCapabilities {
   /** 'proxy' = 上游代理旁路计费(CCB/anthropicProxy);
    *  'engine-reported' = runner 上报 billing 帧 → master bridge settle(codex)。 */
-  billingMode: 'proxy' | 'engine-reported'
+  billingMode: 'proxy' | 'engine-reported' | 'external'
   supportsEffort: boolean
-  resumeKind: 'ccb-session' | 'codex-thread' | 'grok-session'
+  resumeKind: 'ccb-session' | 'codex-thread' | 'grok-session' | 'cursor-session'
   needsServerRequestId: boolean
 }
 
@@ -155,7 +155,7 @@ export interface EngineTurnRun {
  * M0 保持与 SubprocessRunner 同名同语义,后续底座各自实现或声明不支持。
  */
 export interface EngineAdapter extends EventEmitter {
-  readonly engineId: string // 'ccb' | 'codex' | 'grok'
+  readonly engineId: string // 'ccb' | 'codex' | 'grok' | 'cursor'
   readonly capabilities: EngineCapabilities
 
   // ── lifecycle ──

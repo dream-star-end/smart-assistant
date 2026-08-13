@@ -74,7 +74,7 @@ export const CLIENT_CAPABILITY_SCHEMA_VERSION = 1
 export interface LocalCatalogModel {
   readonly modelId: string
   readonly displayName: string
-  readonly engine: 'ccb' | 'codex' | 'grok'
+  readonly engine: 'ccb' | 'codex' | 'grok' | 'cursor'
   readonly providerId: string | null
   readonly contextWindow: number | null
   readonly supportedEfforts: readonly string[]
@@ -444,7 +444,7 @@ export function getLocalCatalogToken(): Promise<string> {
 interface WireRow {
   model_id: string
   display_name: string
-  engine: 'ccb' | 'codex' | 'grok'
+  engine: 'ccb' | 'codex' | 'grok' | 'cursor'
   provider_id: string | null
   context_window: number | null
   supported_efforts: string[]
@@ -508,7 +508,7 @@ export function parseCatalogResponse(raw: unknown): LocalCatalogView {
     if (
       !r ||
       typeof r.model_id !== 'string' ||
-      (r.engine !== 'ccb' && r.engine !== 'codex' && r.engine !== 'grok') ||
+      (r.engine !== 'ccb' && r.engine !== 'codex' && r.engine !== 'grok' && r.engine !== 'cursor') ||
       typeof r.supports_vision !== 'boolean' ||
       typeof r.capability_zero !== 'boolean' ||
       typeof r.supports_thinking !== 'boolean' ||

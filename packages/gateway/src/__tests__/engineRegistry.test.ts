@@ -69,6 +69,11 @@ describe("resolveEngine", () => {
     assert.equal(resolveEngine("grok-build", { id: "main" }), "grok");
   });
 
+  test("Cursor Auto → 'cursor';参数化伪模型不进入 Cursor", () => {
+    assert.equal(resolveEngine("cursor-auto", { id: "main" }), "cursor");
+    assert.equal(resolveEngine("cursor-auto --force", { id: "main" }), "ccb");
+  });
+
   test("codex-native provider 显式 pin → 'codex'(runnerKind 缺省/app-server)", () => {
     assert.equal(resolveEngine("gpt-5.6-sol", { id: "codex", provider: "codex-native" }), "codex");
     assert.equal(

@@ -74,6 +74,7 @@ export function codexProviderIds(): string[] {
 export function grokProviderIds(): string[] {
   return ['grok'];
 }
+export function cursorProviderIds(): string[] { return ['cursor']; }
 
 // ─── 视图类型 ────────────────────────────────────────────────────────────────
 
@@ -170,7 +171,7 @@ export function normalizeVersionInput(raw: unknown): CatalogVersionInput & {
     throw new RangeError("invalid_model_id");
   }
   const engine = b.engine;
-  if (engine !== "ccb" && engine !== "codex" && engine !== "grok") throw new RangeError("invalid_engine");
+  if (engine !== "ccb" && engine !== "codex" && engine !== "grok" && engine !== "cursor") throw new RangeError("invalid_engine");
   const providerRaw = b.provider_id;
   const providerId =
     providerRaw === undefined || providerRaw === null ? null : String(providerRaw);
@@ -236,7 +237,7 @@ export function validateVersionSemantics(
 
   // ① provider_id ∈ 机制集。model_id/engine 的合法性由签名 descriptor 驱动，
   // 不再拿 baked CODEX_ENGINE_MODEL_IDS 做第二次审判。
-  const allowed = engine === "codex" ? codexProviderIds() : engine === "grok" ? grokProviderIds() : ccbProviderIds();
+  const allowed = engine === "codex" ? codexProviderIds() : engine === "grok" ? grokProviderIds() : engine === "cursor" ? cursorProviderIds() : ccbProviderIds();
   if (providerId === null || !allowed.includes(providerId)) {
     out.push(
       `provider_id='${providerId ?? "null"}' ∉ engine='${engine}' 的服务端机制集 [${allowed.join(",")}]`,
@@ -265,7 +266,7 @@ export function validateVersionSemantics(
       out.push("engine='ccb' 不得声明 codex_model_default(该字段只对 codex 型号有意义)");
     }
   }
-  if (engine === "codex" || engine === "grok") {
+  if (engine === "codex" || engine === "grok" || engine === "cursor") {
     const def = capability.reasoning.codexModelDefault;
     if (def !== null && !capability.reasoning.supported.includes(def)) {
       out.push(`codex_model_default='${def}' ∉ reasoning.supported`);

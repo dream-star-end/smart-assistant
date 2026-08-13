@@ -18,6 +18,7 @@
 
 import { describe, test, before, after } from "node:test";
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import * as http from "node:http";
 import * as net from "node:net";
 import { WebSocket, WebSocketServer } from "ws";
@@ -2178,6 +2179,20 @@ describe("tryAutoRebindFlush regression tripwire", () => {
       "finally 块里再触发 tryAutoRebindFlush 的 if 条件必须包含 progressMade," +
         "不能只看 size > 0 (会触发 V8 microtask 死循环 — 见 v1.0.119 复盘)",
     );
+  });
+});
+
+describe("Cursor external authority regression tripwire", () => {
+  test("Cursor uses the existing non-CCB authority classification and owner/local audit gates", async () => {
+    const source = await readFile(new URL("../ws/userChatBridge.ts", import.meta.url), "utf8");
+    const cursorBranch = source.slice(
+      source.indexOf("if (isCursorInboundFrame && containerId !== undefined)"),
+      source.indexOf("if (\n        isCodexInboundFrame &&", source.indexOf("if (isCursorInboundFrame && containerId !== undefined)")),
+    );
+    assert.match(cursorBranch, /classifiedCodex: true/);
+    assert.match(cursorBranch, /OC_V5_CURSOR_OWNER_UID/);
+    assert.match(cursorBranch, /host_uuid IS NULL/);
+    assert.match(cursorBranch, /INSERT INTO cursor_external_usage_audit/);
   });
 });
 
