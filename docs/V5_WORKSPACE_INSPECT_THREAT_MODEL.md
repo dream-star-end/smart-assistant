@@ -6,7 +6,7 @@
 > 分支：`feat/v5-workspace-git-stat`  
 > 配套审计：`docs/V5_WEB_CODEX_DESKTOP_ALIGNMENT.md` §2 / §4.2 PR8 / §5「git/文件树安全」  
 > 环境限制：本机没有 `oc-worktree` 注册表，按独立开发环境例外使用 `git worktree add`。  
-> Codex 威胁模型审 #1：**FAIL**（5 Finding）。本版已吸收；待 #2 PASS 才写代码。
+> Codex 威胁模型审 #1：**FAIL**（5 Finding）。#2：**FAIL**（父目录 symlink 绕过 `.git` segment）。#3 待审本版。
 
 ---
 
@@ -134,8 +134,8 @@ XSS 不在本协议修复范围；本协议必须做到：**即便脚本能调 A
 **控制（语义选定：永不跟随目录 symlink）：**
 
 - 工作树根与 list-dir 目标必须是**真实目录**，不是 symlink。`lstat` 为 symlink → 403 `PATH_DENIED`（作为目标时）或子项 `kind: "symlink"`（作为 child 时，无 `preview_path`，不展开）。这消除「`O_NOFOLLOW` vs 树内 symlink 目录可列」的矛盾。
-- 打开目标：`openSync(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)`，Linux 再 `realpath(/proc/self/fd/n)` 做前缀检查。之后 **`readdir` / `lstat` 必须走该目录 fd**（`openat`/`Dirent` from `fs.promises.opendir` on the fd / `fdopendir`），禁止用可被替换的原始 path 字符串再扫一遍。
-- darwin 单测没有 `/proc/self/fd`：`lstat` 拒绝 symlink 目录 + `realpath` 前缀检查；注释标明生产路径是 fd。不在单测里假装 Linux fd 已覆盖。
+- 打开目标：`openSync(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)`，记下 fd。Linux 再 `realpath(/proc/self/fd/n)` 做前缀检查。
+- **`readdir` / child `lstat` 禁止退回原始目录 path。** Node 的 `fs.promises.opendir` **不接受数值 fd**，Linux 生产实现必须对**已验证 fd** 打开 `/proc/self/fd/<n>`（内核按该 inode 列目录，等价 openat），再对子项 `lstat('/proc/self/fd/<n>/'+name, {throwIfNoEntry})` 且 `O_NOFOLLOW`。darwin 单测没有 `/proc`：`lstat` 拒绝 symlink 目录 + `realpath` 前缀检查；注释标明生产路径是 `/proc/self/fd/<n>`，不在单测里假装 Linux fd 已覆盖。
 - git 采集 **fd/inode 锚定**：
   1. `open` 工作树根（`O_DIRECTORY|O_NOFOLLOW`），记下 `fstat` 的 `dev/ino`。
   2. Linux：`git -C /proc/self/fd/<n> ...`（cwd 绑在已打开的 inode，不跟随后续 rename）。darwin 测试退化为 `-C realpath` + 采集结束后再 `fstat` 比对。
@@ -179,22 +179,34 @@ XSS 不在本协议修复范围；本协议必须做到：**即便脚本能调 A
 | `.git/config`、`git-creds/**`、`.env`、`.npmrc`、`id_rsa`、`.ssh`、`.config/**` | 不作为可预览项；若出现在 listings 则 `previewable: false` 且无 `preview_path` | 同左 | 已有 `isFileBlocked` → 403 |
 | `/run/oc/**`、`/etc/**`、`sessions.db` | 403 / 不可达（根不在工作树） | 不可达 | 已有 blocklist |
 
-**`.git` 必须进全局 `FILE_BLOCKED_PATTERNS`（Codex #1 Finding 1，硬门槛）。** 商业容器固定 `OC_V3_TRUSTED_FILE_SERVE=1`，trusted 分支允许整个 `/home/agent/**` 再减 blocklist。当前 blocklist **没有** `.git` segment，因此现网 `GET /api/file?path=/home/agent/.openclaude/repos/<sid>/<ver>/.git/config` 会把 `credential.helper`（内含 `cat <tokenPath>`）当普通文件返回。inspect 层拒绝不够——预览点击走的就是 `/api/file`。
+**`.git` 必须进全局 `FILE_BLOCKED_PATTERNS`，且必须在 `realpathSync` 之前拦 lexical 路径（Codex #2 Finding 1，硬门槛）。**
 
-本 PR **必须**追加精确规则（只匹配 path segment `.git`，不误伤 `foo.git`）：
+商业容器固定 `OC_V3_TRUSTED_FILE_SERVE=1`，trusted 分支允许整个 `/home/agent/**` 再减 blocklist。当前 blocklist **没有** `.git` segment，因此现网 `GET /api/file?path=.../repos/<sid>/<ver>/.git/config` 会把 `credential.helper`（内含 `cat <tokenPath>`）当普通文件返回。inspect 层拒绝不够——预览点击走的就是 `/api/file`。
+
+只把 regex 加进 `isFileBlocked(canonical)` **不够**。`handleApiFile` 今天是先 `realpathSync` 再跑 allow/block（`server.ts` ~6134 / ~6220）。攻击者可把 `.git` 目录挪到 `/home/agent/x`，再让工作树 `.git` → `/home/agent/x`：请求 `workspace/.git/config` 会被规范化成 `/home/agent/x/config`，canonical 上已经看不到 `.git` segment，trusted 模式又放行未被 block 的 `/home/agent/**`。`openFileHardened` 的 `O_NOFOLLOW` 只挡住最终那一跳，挡不住这种**稳定的父目录 symlink**。
+
+本 PR **必须同时**做下面两道（不是二选一）：
+
+1. **Lexical 预检（`realpathSync` 之前）**：对 `resolve(filePath)`（POSIX 规范化、**不跟随 symlink**）拆 path segment，任一 segment 为 `.git` → 403。这拦住请求文本里出现的 `.git`，无论后面 realpath 把它折叠成什么。
+2. **Canonical 再检（`realpathSync` 之后）**：继续跑完整 `isFileAllowed` + `isFileBlocked`，其中 `FILE_BLOCKED_PATTERNS` **必须**含精确规则（只匹配 path segment `.git`，不误伤 `foo.git`）：
 
 ```ts
 /(^|\/)\.git(\/|$)/
 ```
 
+两道都要：lexical 防「请求里的 `.git` 被 realpath 吃掉」；canonical 防「realpath 之后路径仍带 `.git`」。覆盖攻击：工作树 `.git` → `/home/agent/x`，`GET /api/file?path=<workspace>/.git/config` 在 realpath 前就被 lexical 拦成 403。
+
+残留（接受，不在本 Finding 范围）：攻击者若让客户端直接请求已改名、路径中不含 `.git` segment 的 `/home/agent/x/config`，lexical 看不见 `.git`。这要求攻击者另开一条已知绝对路径；内容读取仍受现有 blocklist，且本协议的 `preview_path` 不会为 `.git` 下发。不把「任意 `/home/agent/**` 文件」扩成默认拒绝。
+
 测试至少锁定：
 
 - trusted `isFileAllowed('/home/agent/.openclaude/repos/s/1/.git/config') === false`
 - `isFileBlocked(.../.git/config) === true`；`.git/HEAD`、`.git/objects/...` 同拒
-- `isFileBlocked('/home/agent/foo.git') === false`；`isFileAllowed` 在 trusted 下对 `foo.git` 仍按其它规则
-- handler 往返：`GET /api/file?path=.../.git/config` → 403
+- `isFileBlocked('/home/agent/foo.git') === false`；`isFileAllowed` 在 trusted 下对 `foo.git` 仍按其它规则（**不误伤**）
+- handler 往返：`GET /api/file?path=.../.git/config` → 403（直链 `.git` 目录）
+- handler 往返：**父目录 `.git` 是 symlink**（`workspace/.git -> /home/agent/x`，请求 `workspace/.git/config`）仍 403；不得因为 realpath 变成 `/home/agent/x/config` 而 200
 
-list-dir / git 路径规范化仍额外拒绝 `.git` segment（纵深），但不能替代这条全局规则。
+list-dir / git 路径规范化仍额外拒绝 `.git` segment（纵深），但不能替代 `/api/file` 这两道。
 
 **测试：** `.env`、`.git/config`、`git-creds`、`.npmrc`、`id_rsa`、`.ssh/id_ed25519`、`.config/gh/hosts.yml` 全部不可预览；list-dir `path=.git` → 403。
 
@@ -214,7 +226,7 @@ list-dir / git 路径规范化仍额外拒绝 `.git` segment（纵深），但�
 
 Vendor 目录 `kind: skipped`，**不** `readdir` 展开。二进制：numstat 的 `-` `\t` `-` → `binary: true`，`added/deleted: null`，不读文件字节。
 
-**测试：** 201+ dirent 断言 `truncated===true` 且未把全目录读进数组（可用 spy/计数）；超字节预算；同容器第三请求 429；timeout 无部分体。
+**测试：** 201+ dirent 断言 `truncated===true` 且未把全目录读进数组（可用 spy/计数）；超字节预算；timeout 无部分体；**同 session 第二个并发请求立即 429、无等待**；同容器两个不同 session 可各占 1 个槽，第三请求（第 3 个并发）429。
 
 ### T6 输出净化
 
@@ -256,7 +268,7 @@ git / `readdir` 可能吐出换行、ANSI、RTL override、`<script>` 文件名�
 
 均 JSON，`Cache-Control: no-store`。无 body。
 
-**明确不改：** `GET /api/file`。目录继续 404。不增加 `?list=1`。
+**`GET /api/file`：** 不改变路由、查询参数与响应契约（仍要求绝对路径、目录继续 404、不增加 `?list=1`）。**会增强其全局 ACL**：lexical `.git` segment 预检 + `FILE_BLOCKED_PATTERNS` 增加 `/(^|\/)\.git(\/|$)/`。这是内容读取通道的加固，不是新枚举能力。
 
 ### 4.2 空态（产品门控）
 
@@ -381,9 +393,11 @@ HTTP **200**：
 - [ ] T2 symlink 指向树外 / git-creds / `/etc` 被拒
 - [ ] T3 无 snapshot 空态；host blocked 规则存在；allowlist `proxyFromCommercial`
 - [ ] T4 敏感路径不可预览；`.git/config` 全局 blocklist + `/api/file` 403；`foo.git` 不误伤
+- [ ] `/api/file`：lexical `.git` 预检在 `realpathSync` 之前；**父 `.git` 为 symlink**（realpath 后路径不再含 `.git`）仍 403
 - [ ] admin + `X-OC-Host-Scope: 1` → 403，不进 host handler；`OC_CONTAINER_ID` 空 → 403
 - [ ] 无 repo → `empty: true`，JSON 无 `added: 0`
-- [ ] 超大目录流式截断：`truncated===true`，`omitted` 不要求精确剩余数；字节预算；第三请求 429
+- [ ] 超大目录流式截断：`truncated===true`，`omitted` 不要求精确剩余数；字节预算
+- [ ] **同 session 第二个并发请求立即 429、无等待**；同容器第三并发 429
 - [ ] 超时 504 无部分体
 - [ ] 输出无控制字符
 - [ ] `/api/file` 对目录仍 404（回归）
@@ -399,18 +413,20 @@ HTTP **200**：
 2. 变更列表可能包含用户误提交的密钥**文件名**（不含内容）。内容仍被 `/api/file` 拒绝。  
 3. 单层 list-dir 仍可被客户端循环展开；靠 entries 上限 + vendor skip + 超时 + in-flight 锁，不能防一个决心耗 CPU 的合法用户。与现有 Bash 工具面同类。  
 4. darwin 单测没有 `/proc/self/fd`；Linux 容器才有 fd-realpath。单测用 `lstat` + `realpath` 等价断言，并在注释标明生产路径。  
-5. XSS 若能调 API，能看到该用户工作树布局。需 CSP / 前端文本渲染（PR-B）。
+5. XSS 若能调 API，能看到该用户工作树布局。需 CSP / 前端文本渲染（PR-B）。  
+6. 请求若直接指向已改名、路径中不含 `.git` segment 的 git 对象库（`/home/agent/x/config`），lexical 预检看不见 `.git`。不把整个 `/home/agent/**` 改成默认拒绝；`preview_path` 不会为 `.git` 下发。属于「已知绝对路径 + trusted ACL」的既有面，不是本协议新开的枚举面。
 
 ---
 
-## 9. Codex 审查问题（本文件 · 第 2 轮）
+## 9. Codex 审查问题（本文件 · 第 3 轮）
 
-上一轮 **FAIL**，5 条 Finding 已写入正文。请只审查本修订稿，不要改代码。逐条确认是否闭合：
+#1 FAIL（5 Finding），#2 FAIL（仅剩父目录 symlink 绕过 `.git`）。本版针对 #2 唯一硬 Finding + 两条 Suggestion + Nit。请只审查增量，不要改代码。
 
-1. 全局 `FILE_BLOCKED_PATTERNS` 增加 `/(^|\/)\.git(\/|$)/` + `/api/file` 403 测试 —— Finding 1 是否闭合？
-2. git hermetic env/argv + `-z` 解析 —— Finding 2 是否闭合？是否还缺必须写进模型的变量/开关？
-3. 目录永不 follow symlink；list-dir 走目录 fd；git 用 `/proc/self/fd/n` + 采集后 ino 复核 —— Finding 3 是否闭合？
-4. admin host-scope terminal 403 + handler 要求 `OC_CONTAINER_ID` —— Finding 4 是否闭合？
-5. 流式 opendir、omitted 未知语义、256KiB 字节预算、容器级信号量、立即 429 —— Finding 5 是否闭合？
+闭合标准（全部满足才 PASS）：
 
-要求格式：第一行 `PASS` / `FAIL` / `PARTIAL`。Finding 必须修才能进实现。不要改代码。
+1. `/api/file` 在 `realpathSync` **之前**对 lexical `resolve(filePath)` 做 `.git` segment block；realpath **之后**仍跑 canonical `isFileBlocked`（两道都要）。handler 测试包含「工作树 `.git` 是指向 `/home/agent/x` 的 symlink，请求 `.../.git/config` 仍 403」。`foo.git` 不误伤。
+2. Linux list-dir 明确走已验证 fd 的 `/proc/self/fd/<n>`，不把 `fs.promises.opendir(原始 path)` 当生产路径。
+3. 测试清单含「同 session 第二个并发请求立即 429、无等待」。
+4. 正文不再写「明确不改 `/api/file`」，改为「不改路由/响应契约，但增强全局 ACL」。
+
+要求格式：第一行 `PASS` / `FAIL` / `PARTIAL`。有新的必须修 Finding 就不要 PASS。不要改代码。
