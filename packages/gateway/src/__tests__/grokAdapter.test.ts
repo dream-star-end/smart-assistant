@@ -131,7 +131,7 @@ for (const event of [
       }])
 
       const captured = JSON.parse(await readFile(capture, 'utf8')) as { argv: string[]; env: Record<string, string> }
-      assert.deepEqual(captured.argv.slice(0, 4), ['--agent', 'grok-build', '--model', 'grok-build'])
+      assert.deepEqual(captured.argv.slice(0, 4), ['--agent', 'grok-build', '--model', 'grok-4.6'])
       assert.ok(captured.argv.includes('--resume'))
       assert.equal(captured.argv[captured.argv.indexOf('--resume') + 1], 'prior-session')
       assert.equal(captured.argv[captured.argv.indexOf('--reasoning-effort') + 1], 'high')

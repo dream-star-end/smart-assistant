@@ -51,7 +51,7 @@ export type CodexEngineModelId = (typeof CODEX_ENGINE_MODELS)[number]['id']
 
 /** xAI 官方 Grok CLI 的编码产品型号。 */
 export const GROK_ENGINE_MODELS = [
-  { id: 'grok-build', displayName: 'Grok Build', upstreamModel: 'grok-build' },
+  { id: 'grok-build', displayName: 'Grok Build', upstreamModel: 'grok-4.6' },
 ] as const
 
 export const GROK_ENGINE_MODEL_IDS = GROK_ENGINE_MODELS.map((m) => m.id)

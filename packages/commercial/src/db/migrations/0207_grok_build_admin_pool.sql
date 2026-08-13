@@ -111,7 +111,7 @@ INSERT INTO model_catalog (
   capability_profile, capability_schema_version, state
 )
 VALUES (
-  'grok-build', 'grok', 'grok', 'grok-build', 500000,
+  'grok-build', 'grok', 'grok', 'grok-4.6', 500000,
   '{"supports_vision":false,"reasoning":{"supported":["low","medium","high"],"codex_model_default":null},"ccb":{"capability_zero":false,"supports_thinking":false}}'::jsonb,
   1, 'staged'
 );
@@ -191,7 +191,7 @@ BEGIN
        AND p.default_effort = 'high'
        AND c.engine = 'grok'
        AND c.provider_id = 'grok'
-       AND c.upstream_model_id = 'grok-build'
+       AND c.upstream_model_id = 'grok-4.6'
        AND c.context_window = 500000
   ) THEN
     RAISE EXCEPTION '0207 Grok groundwork catalog/pricing verification failed';

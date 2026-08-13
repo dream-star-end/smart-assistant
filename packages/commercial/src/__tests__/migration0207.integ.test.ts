@@ -41,7 +41,7 @@ describe('0207_grok_build_admin_pool', () => {
       model_id: 'grok-build',
       engine: 'grok',
       provider_id: 'grok',
-      upstream_model_id: 'grok-build',
+      upstream_model_id: 'grok-4.6',
       context_window: 500_000,
       state: 'staged',
       enabled: false,

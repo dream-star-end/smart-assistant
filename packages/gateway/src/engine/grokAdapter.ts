@@ -31,7 +31,7 @@ import { engineSessionId } from './engineSessionId.js'
 import { type EngineCreateOpts, registerEngine } from './registry.js'
 import { buildCodexEnv } from './codexShared.js'
 
-const GROK_UPSTREAM_MODEL = 'grok-build'
+const GROK_UPSTREAM_MODEL = 'grok-4.6'
 const ROUTE_TOKEN_RE = /^[0-9a-f]{64}$/
 const EMPTY_SIGNALS: Readonly<PhantomSignals> = Object.freeze({
   apiState: 'unknown',

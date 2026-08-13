@@ -96,7 +96,7 @@ const GROK = entry({
   modelId: "grok-build",
   engine: "grok",
   providerId: "grok",
-  upstreamModelId: "grok-build",
+  upstreamModelId: "grok-4.6",
   contextWindow: 500_000,
   capabilityProfile: {
     supportsVision: false,
