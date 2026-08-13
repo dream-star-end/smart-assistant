@@ -1385,6 +1385,9 @@
           "path": "scripts/deploy-v5.sh",
           "assertion": "candidate Cursor stream-json parser gate"
         }
+      ],
+      "coverageCommits": [
+        "35defe79"
       ]
     }
   ]
