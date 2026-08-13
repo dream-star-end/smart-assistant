@@ -194,6 +194,24 @@ describe('modelAuthority — 验签 + gateway 断言全集', () => {
     assert.equal(d.leaseEnvelope, raw.lease)
   })
 
+  test('Grok authority:engine=grok 验签消费后保持 Grok 执行描述符', () => {
+    const key = makeKey('mak1_grok')
+    const consumer = makeConsumer(key)
+    const conn = consumer.newConnection()
+    const billingRequestId = '0123456789abcdef0123456789abcdef'
+    const frame = mintFrame(key, {
+      connectionChallenge: conn.challenge,
+      canonicalModel: 'grok-build',
+      engine: 'grok',
+      billingRequestId,
+    })
+    frame.requestId = billingRequestId
+
+    const d = consumer.consume(frame, conn)
+    assert.equal(d.canonicalModel, 'grok-build')
+    assert.equal(d.engine, 'grok')
+  })
+
   test('伪造签名(不在 keyring 的私钥)→ unknown_key', () => {
     const real = makeKey('mak1_real')
     const forged = makeKey('mak1_forged')
