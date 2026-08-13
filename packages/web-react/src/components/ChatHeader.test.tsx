@@ -67,3 +67,23 @@ describe("ChatHeader 团队模式指示 chip", () => {
     expect(trigger.textContent).toContain("GLM-5.2");
   });
 });
+
+describe("ChatHeader 上下文重开", () => {
+  it("传入 onShowContext 才渲染「显示上下文」", () => {
+    const { rerender } = renderHeader();
+    expect(screen.queryByRole("button", { name: "显示上下文" })).toBeNull();
+    rerender(
+      <ChatHeader
+        agent={MAIN_AGENT}
+        onAgentClick={() => {}}
+        models={MODELS}
+        selectedModelId="glm-5.2"
+        onSelectModel={() => {}}
+        theme="light"
+        onCycleTheme={() => {}}
+        onShowContext={() => {}}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "显示上下文" })).toBeInTheDocument();
+  });
+});

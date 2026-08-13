@@ -20,7 +20,13 @@ import {
   ImageEditActionsContext,
   type ImageEditSubmit,
 } from "./components/chat/imageEditActions";
-import { extractLatestTodos, PinnedTaskTracker } from "./components/chat/PinnedTaskTracker";
+import {
+  extractLatestTodos,
+  isPinnedTaskTrackerVisible,
+  PinnedTaskTracker,
+} from "./components/chat/PinnedTaskTracker";
+import { BoundRepoCard } from "./components/contextRail/BoundRepoCard";
+import { ContextRail } from "./components/contextRail/ContextRail";
 import { deriveActivePlanStep, type TurnActivityInfo } from "./components/chat/TurnActivity";
 import { EmptyState } from "./components/EmptyState";
 import { type ChatError, ErrorBanner } from "./components/ErrorBanner";
@@ -73,7 +79,9 @@ import { type UseChatSocket, useChatSocket } from "./hooks/useChatSocket";
 import { useInbox } from "./hooks/useInbox";
 import { useOptimizerPending } from "./hooks/useOptimizerPending";
 import { useRepoBinding } from "./hooks/useRepoBinding";
+import { useContextRailHidden } from "./hooks/useContextRailHidden";
 import { useTheme } from "./hooks/useTheme";
+import { useXlViewport } from "./hooks/useXlViewport";
 import { useToast } from "./components/ui";
 import { githubErrorText } from "./lib/github";
 import { connectorErrorText } from "./lib/connectors";
@@ -239,6 +247,8 @@ export function App() {
   // 主题的唯一权威源：useTheme 是「挂载读 localStorage」的单实例，经 props 下传给顶栏快捷开关
   // 与设置中心「偏好·外观」分区，二者共享同一状态——杜绝多个 useTheme 实例各自镜像、互不同步。
   const { theme, setTheme, cycle } = useTheme();
+  const isXl = useXlViewport();
+  const [railHidden, setRailHidden] = useContextRailHidden();
 
   // 公开配置（Turnstile bypass / site key）：登录页驱动 AuthGate 是否渲染真 widget。
   const [publicCfg, setPublicCfg] = useState<PublicConfig | null>(null);
@@ -2173,6 +2183,11 @@ export function App() {
   // 对话前置门：非 demo 且尚无访问权（容器未就绪/未订阅/出错等）→ 由 AgentGate 占据对话区
   // 并禁用 Composer。demo 与已就绪（ready|dormant）放行正常对话。
   const gated = !demo && !gate.access;
+  const latestTodos = extractLatestTodos(wsMessages);
+  const pinnedVisible = !demo && !gated && isPinnedTaskTrackerVisible(latestTodos, wsSending);
+  const boundRepo = !demo && repo.selection?.selected === true;
+  const hasRailData = boundRepo || pinnedVisible;
+  const showRail = isXl && !railHidden && hasRailData;
 
   // 冷会话加载骨架：切换/深链到本地无缓存会话、getSession 拉取期间显示消息形骨架，
   // 取代「空白 → 突然填满」。meta（messageCount）取自侧栏当前选中会话，metaKnown
@@ -2299,6 +2314,7 @@ export function App() {
           unreadCount={inbox.unreadCount}
           theme={theme}
           onCycleTheme={cycle}
+          onShowContext={isXl && railHidden && hasRailData ? () => setRailHidden(false) : undefined}
         />
 
         {!demo && repo.showBanner && repo.selection?.selected && (
@@ -2389,9 +2405,9 @@ export function App() {
         <div className="shrink-0 composer-safe-b">
           {/* 任务列表 HUD:钉在输入框上方,始终可见(取代会滚走的 inline TodoWrite 卡)。
               初始展开全部 → ~3s 自动折叠成「正在执行的一条」;无任务时组件自渲染 null。 */}
-          {!demo && !gated && (
+          {!demo && !gated && !showRail && (
             <PinnedTaskTracker
-              todos={extractLatestTodos(wsMessages)}
+              todos={latestTodos}
               active={wsSending}
               tokenUsage={activeSess?._liveTurnUsage?.usage}
             />
@@ -2443,12 +2459,33 @@ export function App() {
             onCancelReply={() => setMessageReplyTarget(null)}
             repoSelection={demo ? null : repo.selection}
             onOpenRepo={demo ? undefined : openRepo}
+            showRepoPill={!(showRail && boundRepo)}
             goal={activeSess?.goalState}
             onSetGoal={demo ? undefined : setSessionGoal}
             onGoalAction={demo ? undefined : transitionSessionGoal}
           />
         </div>
       </main>
+
+      {showRail && (
+        <ContextRail
+          renderers={{
+            "bound-repo":
+              boundRepo && repo.selection?.selected ? (
+                <BoundRepoCard selection={repo.selection} onOpenRepo={openRepo} />
+              ) : null,
+            "pinned-tasks": pinnedVisible ? (
+              <PinnedTaskTracker
+                todos={latestTodos}
+                active={wsSending}
+                tokenUsage={activeSess?._liveTurnUsage?.usage}
+                compact
+              />
+            ) : null,
+          }}
+          onHide={() => setRailHidden(true)}
+        />
+      )}
 
       <AgentPicker
         open={pickerOpen}
