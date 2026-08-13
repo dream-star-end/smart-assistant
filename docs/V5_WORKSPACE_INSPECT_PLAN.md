@@ -2,7 +2,7 @@
 
 > 威胁模型：`docs/V5_WORKSPACE_INSPECT_THREAT_MODEL.md`（Codex #3 **PASS**；迟到审查补丁已写入 T2/T5/T6）  
 > 实现方案审 #1：**FAIL**（6 Finding，已闭合于 `b685671d3`）。#2：**PASS**（只核对该 6 条）。  
-> #3：**FAIL**（3 Finding）。#4：**FAIL**（HEAD 误拒正常终止 LF）。#5：**FAIL**（objects swap 测试未进 §4.4/§6）。本版已吸收；待 #6 PASS 才写生产代码。  
+> #3：**FAIL**（3 Finding）。#4：**FAIL**（HEAD 误拒正常终止 LF）。#5：**FAIL**（objects swap 测试未进 §4.4/§6）。#6：**PASS**（`/tmp/codex-workspace-inspect-plan-r6.txt`）。  
 > 本轮：**纯后端**。合入后前端零行为变化。PR-B 不做。不部署、不合入。  
 > 基线：`origin/feat/v5-aurora-rewrite` @ `e4f3fc930`  
 > 分支：`feat/v5-workspace-git-stat`
