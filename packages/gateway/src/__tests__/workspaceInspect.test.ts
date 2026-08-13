@@ -95,6 +95,13 @@ describe('parseGitStatusZ / parseGitNumstatZ', () => {
     assert.deepEqual(st.entries.map((e) => e.path), ['dest.txt'])
     assert.equal(st.entries[0]?.xy[0], 'C')
   })
+
+  it('parses worktree rename/copy from the Y column', () => {
+    const renamed = parseGitStatusZ(Buffer.from(' R dest.txt\0orig.txt\0M  kept.txt\0'), 50)
+    assert.deepEqual(renamed.entries.map((e) => e.path), ['dest.txt', 'kept.txt'])
+    const copied = parseGitStatusZ(Buffer.from(' C dest.txt\0src.txt\0'), 50)
+    assert.deepEqual(copied.entries.map((e) => e.path), ['dest.txt'])
+  })
 })
 
 describe('parseGitHead', () => {
@@ -404,6 +411,17 @@ describe('workspace inspect collection', () => {
     assert.equal(r.body.snapshot.live_head.authority, 'live')
     assert.equal(r.body.snapshot.live_head.sha.length, 40)
     assert.equal(JSON.stringify(r.body).includes('"bind"'), false)
+  })
+
+  it('returns a live detached HEAD as ok with branch null', async () => {
+    git(workspaceDir, ['checkout', '--detach', 'HEAD'])
+    const rt = makeRt(workspaceDir, reposRoot)
+    const r = await collectGitSnapshot(rt, 'sess-1')
+    assert.equal(r.kind, 'ok')
+    if (r.kind !== 'ok' || !('snapshot' in r.body)) return
+    assert.equal(r.body.snapshot.live_head.detached, true)
+    assert.equal(r.body.snapshot.live_head.branch, null)
+    assert.equal(r.body.snapshot.live_head.sha.length, 40)
   })
 
   it('does not execute filter clean/process from repo config', async () => {

@@ -963,7 +963,7 @@ export function parseGitStatusZ(
     }
     const xy = rec.slice(0, 2)
     const dest = rec.slice(3)
-    if (xy[0] === 'R' || xy[0] === 'C') {
+    if (xy[0] === 'R' || xy[0] === 'C' || xy[1] === 'R' || xy[1] === 'C') {
       if (i + 1 >= records.length) {
         complete = false
         break
@@ -1130,13 +1130,15 @@ export async function collectGitSnapshot(
 
     const headRun = await run(['rev-parse', 'HEAD'])
     if (headRun.timedOut) return err(504, 'GIT_TIMEOUT', 'git timed out')
-    const sha = headRun.stdout.toString("utf8").trim()
+    const sha = headRun.stdout.toString('utf8').trim()
     if (headRun.exitCode !== 0 || !SHA_RE.test(sha)) return empty('not_a_repo')
 
     const branchRun = await run(['rev-parse', '--abbrev-ref', 'HEAD'])
     if (branchRun.timedOut) return err(504, 'GIT_TIMEOUT', 'git timed out')
+    // Detached HEAD is exit 0 + "HEAD". Unexpected non-zero is fail-closed, not a fake clean snapshot.
+    if (gitCommandFailed(branchRun)) return empty('not_a_repo')
     const branchRaw = sanitizeName(branchRun.stdout.toString('utf8').trim().replace(/\0/g, '')) ?? 'HEAD'
-    const detached = branchRun.exitCode !== 0 || branchRaw === 'HEAD'
+    const detached = branchRaw === 'HEAD'
     const branch = detached ? null : branchRaw
 
     const statusRun = await run(
@@ -1156,6 +1158,7 @@ export async function collectGitSnapshot(
       'HEAD',
     ])
     if (numstatRun.timedOut) return err(504, 'GIT_TIMEOUT', 'git timed out')
+    if (gitCommandFailed(numstatRun)) return empty('not_a_repo')
 
     const stdoutLimited =
       (statusRun.truncated && !statusRun.killedForEntries) || numstatRun.truncated
@@ -1163,7 +1166,7 @@ export async function collectGitSnapshot(
     const numParsed = parseGitNumstatZ(numstatRun.stdout)
 
     const numstat = new Map<string, { added: number | null; deleted: number | null; binary: boolean }>()
-    const numstatComplete = numParsed.complete && !numstatRun.truncated && !gitCommandFailed(numstatRun)
+    const numstatComplete = numParsed.complete && !numstatRun.truncated
     for (const rec of numParsed.entries) {
       if (hasGitPathSegment(rec.path) || rec.path.split('/').includes('.git')) continue
       numstat.set(rec.path, { added: rec.added, deleted: rec.deleted, binary: rec.binary })
