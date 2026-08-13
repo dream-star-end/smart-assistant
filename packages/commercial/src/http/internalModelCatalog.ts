@@ -114,7 +114,7 @@ export type ModelCatalogHandler = (
 export interface WireModelRow {
   model_id: string;
   display_name: string;
-  engine: "ccb" | "codex" | "grok";
+  engine: "ccb" | "codex" | "grok" | "cursor";
   provider_id: string | null;
   context_window: number | null;
   supported_efforts: readonly string[];

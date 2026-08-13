@@ -65,6 +65,20 @@ export function isGrokEngineModel(modelId: string | null | undefined): boolean {
   )
 }
 
+/** Cursor's account-selected Auto model. The adapter deliberately omits
+ * `--model`; no user-controlled value ever reaches the CLI. */
+export const CURSOR_ENGINE_MODELS = [
+  { id: 'cursor-auto', displayName: 'Cursor Auto', upstreamModel: null },
+] as const
+export const CURSOR_ENGINE_MODEL_IDS = CURSOR_ENGINE_MODELS.map((m) => m.id)
+export type CursorEngineModelId = (typeof CURSOR_ENGINE_MODELS)[number]['id']
+export const DEFAULT_CURSOR_ENGINE_MODEL: CursorEngineModelId = CURSOR_ENGINE_MODELS[0].id
+
+export function isCursorEngineModel(modelId: string | null | undefined): boolean {
+  return typeof modelId === 'string' &&
+    (CURSOR_ENGINE_MODEL_IDS as readonly string[]).includes(modelId)
+}
+
 /** codex seed agent(id='codex')的固定模型 —— entrypoint desiredCodexAgent 同值。 */
 export const DEFAULT_CODEX_ENGINE_MODEL: CodexEngineModelId = CODEX_ENGINE_MODELS[0].id
 export const DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME: string =
@@ -100,6 +114,10 @@ export function modelReasoningPolicy(modelId: string): ModelReasoningPolicy {
       supported: ['low', 'medium', 'high'],
       codexModelDefault: null,
     }
+  }
+
+  if (isCursorEngineModel(modelId)) {
+    return { supported: [], codexModelDefault: null }
   }
 
   const provider = findRouteProviderForModel(modelId)

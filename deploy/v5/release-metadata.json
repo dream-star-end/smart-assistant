@@ -86,7 +86,8 @@
     "0204_auto_dream_minimax_m3",
     "0205_scnet_ocr_jobs",
     "0206_community_tutorials",
-    "0207_grok_build_admin_pool"
+    "0207_grok_build_admin_pool",
+    "0208_cursor_engine"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

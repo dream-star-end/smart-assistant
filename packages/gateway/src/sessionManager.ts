@@ -28,6 +28,7 @@ import {
 import './engine/ccbAdapter.js'
 import './engine/codexAdapter.js'
 import './engine/grokAdapter.js'
+import './engine/cursorAdapter.js'
 import type {
   AutomaticRetryState,
   CollabAgentPolicy,
@@ -37,6 +38,7 @@ import type {
 import type {
   DurableRuntimeEvent,
   EngineBillingEvent,
+  EngineExternalBillingEvent,
   EngineEvent,
   EngineFinalMeta,
   SegmentRecord,
@@ -431,7 +433,8 @@ export function pickIdleTimeoutMs(
     inNonStreamingPhase ||
     engineId === 'ccb' ||
     engineId === 'codex' ||
-    engineId === 'grok'
+    engineId === 'grok' ||
+    engineId === 'cursor'
   ) {
     return IDLE_TIMEOUT_TOOL_MS
   }
@@ -2738,7 +2741,7 @@ export class SessionManager {
      */
     executionAuthority?: {
       canonicalModel: string
-      engine: 'ccb' | 'codex' | 'grok'
+      engine: 'ccb' | 'codex' | 'grok' | 'cursor'
       source?: 'bridge_signed' | 'local_catalog'
     }
     /**
@@ -4263,13 +4266,17 @@ export class SessionManager {
       let pendingFinal: SessionStreamEvent | null = null
       let observedFinalMeta: EngineFinalMeta | undefined
       let terminalEngineBilling: EngineBillingEvent | undefined
+      let terminalExternalBilling: EngineExternalBillingEvent | undefined
       let terminalBillingFlushed = false
       const flushTerminalBilling = () => {
-        if (!terminalEngineBilling || terminalBillingFlushed) return
+        if ((!terminalEngineBilling && !terminalExternalBilling) || terminalBillingFlushed) return
         terminalBillingFlushed = true
-        const billing = structuredClone(terminalEngineBilling)
-        session._durableDelegateEngineBillings?.push(structuredClone(billing))
-        onEvent({ kind: 'codex_billing', ...billing })
+        if (terminalEngineBilling) {
+          const billing = structuredClone(terminalEngineBilling)
+          session._durableDelegateEngineBillings?.push(structuredClone(billing))
+          onEvent({ kind: 'codex_billing', ...billing })
+        }
+        if (terminalExternalBilling) onEvent({ kind: 'external_billing', ...structuredClone(terminalExternalBilling) })
       }
       const handleEngineEvent = (e: EngineEvent) => {
         if (
@@ -4429,6 +4436,9 @@ export class SessionManager {
         // durable fallback for a lost live frame.
         terminalEngineBilling = structuredClone(b)
       }
+      const handleExternalBilling = (b: EngineExternalBillingEvent) => {
+        if (!detached) terminalExternalBilling = structuredClone(b)
+      }
       // Per-turn parse_error listener (previously only installed at runner
       // construction). Must be detached with the rest to avoid per-turn
       // listener accumulation (R9).
@@ -4478,6 +4488,7 @@ export class SessionManager {
         // turn 终态时清(旧 runner.off('telemetry') 的对位物)。
         runner.off('activity', handleActivity)
         runner.off('billing', handleBilling)
+        runner.off('external_billing', handleExternalBilling)
         runner.off('error', handleError)
         runner.off('exit', handleExit)
         runner.off('parse_error', handleParseError)
@@ -5459,6 +5470,7 @@ export class SessionManager {
 
       runner.on('activity', handleActivity)
       runner.on('billing', handleBilling)
+      runner.on('external_billing', handleExternalBilling)
       runner.on('error', handleError)
       runner.on('exit', handleExit)
       runner.on('parse_error', handleParseError)

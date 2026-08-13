@@ -103,6 +103,7 @@ import {
   computeDispatchRequestHash,
   isCodexEngineModel,
   isGrokEngineModel,
+  isCursorEngineModel,
   isClientMessageId,
   formatMessageReplyPrompt,
   modelHistorySemanticRole,
@@ -3900,6 +3901,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // 模型执行权威签发用的 model(= effectiveModel,帧完全无线索时回落默认 agent 的模型)。
       let authorityModelForFrame: string | null = null;
       let isCodexInboundFrame = false;
+      let isCursorInboundFrame = false;
       let isAnnotatedImageInboundFrame = false;
       // Session-scoped Codex admission key. Outbound terminal frames match this
       // peer plus clientMessageId; missing peer falls back to a bridge-local
@@ -4426,8 +4428,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 ? (authorityDeps?.catalog.peek()?.isEngineReportedModel(authorityModelForFrame) ??
                    (isCodexEngineModel(effectiveModel) || isGrokEngineModel(effectiveModel)))
                 : (isCodexEngineModel(effectiveModel) || isGrokEngineModel(effectiveModel));
+            isCursorInboundFrame =
+              authorityOn && authorityModelForFrame !== null
+                ? (authorityDeps?.catalog.peek()?.isExternalBillingModel(authorityModelForFrame) ??
+                   isCursorEngineModel(effectiveModel))
+                : isCursorEngineModel(effectiveModel);
             // 提取 peer.id(用于 session-scoped admission 与 outbound 终态匹配)。
-            if (isCodexInboundFrame) {
+            if (isCodexInboundFrame || isCursorInboundFrame) {
               const peerObj = (parsed as { peer?: { id?: unknown } }).peer;
               const peerIdRaw = peerObj && typeof peerObj === "object" ? peerObj.id : undefined;
               inboundPeerIdForFrame = typeof peerIdRaw === "string" ? peerIdRaw : null;
@@ -4553,6 +4560,78 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       //   - 否则:async acquire → 成功 forward;Busy / 其他 fail → fast-fail error 帧
       //
       // 非 codex 帧 / 没注入 codexBinding / 没 containerId → 直接走下方原同步 forward
+      if (isCursorInboundFrame && containerId !== undefined) {
+        const parsedCapture = inboundParsedFrame;
+        const traceCapture = turnTraceIdForFrame;
+        const logCapture = turnLogForFrame;
+        const authorityModelCapture = authorityModelForFrame;
+        const modelCapture = effectiveModelForFrame;
+        const peerCapture = inboundPeerIdForFrame;
+        const cid = containerId;
+        void (async () => {
+          let dispatchRecord: AdmittedDispatch | undefined;
+          try {
+            if (!deps.pgPool || parsedCapture === null || traceCapture === null || modelCapture !== 'cursor-auto') {
+              rejectPromptQueueDispatch('CURSOR_UNAVAILABLE');
+              sendErrorFrame(userWs, 'CURSOR_UNAVAILABLE', 'Cursor is unavailable for this account');
+              return;
+            }
+            const ownerUid = process.env.OC_V5_CURSOR_OWNER_UID?.trim();
+            if (!ownerUid || ownerUid !== String(uid)) {
+              rejectPromptQueueDispatch('UNAUTHORIZED_MODEL');
+              sendErrorFrame(userWs, 'UNAUTHORIZED_MODEL', 'Cursor is not enabled for this account');
+              return;
+            }
+            // Local supervisor mounts the owner credential only when host_uuid
+            // is NULL. A remotely scheduled container must fail before forward.
+            const eligible = await deps.pgPool.query<{ ok: number }>(
+              `SELECT 1 AS ok FROM agent_containers
+                WHERE id=$1 AND user_id=$2 AND state='active' AND host_uuid IS NULL`,
+              [cid, uid],
+            );
+            if (eligible.rowCount !== 1) {
+              rejectPromptQueueDispatch('CURSOR_UNAVAILABLE');
+              sendErrorFrame(userWs, 'CURSOR_UNAVAILABLE', 'Cursor requires the account-owned local runtime');
+              return;
+            }
+            const enriched = await attachMasterTurnState(parsedCapture, logCapture, traceCapture, !isPromptQueueDispatch, rejectPromptQueueDispatch, authorityModelCapture, recoveryJob);
+            if (enriched === null) return;
+            dispatchRecord = lookupAdmittedDispatch(enriched);
+            let authorityExec: ResolvedTurnExecution | null = null;
+            if (authorityOn) {
+              // resolveAuthorityExecOrReject's legacy boolean means "non-CCB"
+              // (not literally Codex); Cursor is therefore classified true.
+              authorityExec = await resolveAuthorityExecOrReject({ model: authorityModelCapture, classifiedCodex: true, log: logCapture, onReject: rejectPromptQueueDispatch });
+              if (authorityExec === null || authorityExec.engine !== 'cursor') {
+                failDispatchPreForward(dispatchRecord, 'cursor_authority_rejected');
+                return;
+              }
+            }
+            const requestId = dispatchRecord ? dispatchRecord.billingRequestId : ensureRequestIdServerSide();
+            await deps.pgPool.query(
+              `INSERT INTO cursor_external_usage_audit(request_id,user_id,container_id,session_id,model_id,status)
+               VALUES($1,$2,$3,$4,'cursor-auto','pending') ON CONFLICT (request_id) DO NOTHING`,
+              [requestId, uid, cid, peerCapture],
+            );
+            let authorityFields: Record<string, unknown> = {};
+            if (authorityExec !== null) {
+              const sealed = await sealAuthorityFieldsOrReject({ exec: authorityExec, billingRequestId: requestId, log: logCapture, onReject: rejectPromptQueueDispatch });
+              if (sealed === null) { failDispatchPreForward(dispatchRecord, 'cursor_authority_seal_rejected'); return; }
+              authorityFields = sealed;
+            }
+            const forwarded = { ...enriched, requestId, traceId: traceCapture, ...authorityFields, ...dispatchAuthorityField(dispatchRecord) };
+            const encoded = JSON.stringify(forwarded); const len = Buffer.byteLength(encoded);
+            if (len > maxFrameBytes) { failDispatchPreForward(dispatchRecord, 'ERR_FRAME_TOO_BIG'); rejectPromptQueueDispatch('ERR_FRAME_TOO_BIG'); return; }
+            await forwardPreparedFrame(Buffer.from(encoded, 'utf8'), false, len);
+          } catch (err) {
+            logCapture?.error('user-chat-bridge: Cursor external admission failed', { err });
+            failDispatchPreForward(dispatchRecord, 'cursor_external_admission_failed');
+            rejectPromptQueueDispatch('CURSOR_UNAVAILABLE');
+            if (!cleaned && userWs.readyState === WebSocket.OPEN) sendErrorFrame(userWs, 'CURSOR_UNAVAILABLE', 'Cursor is temporarily unavailable');
+          }
+        })();
+        return;
+      }
       if (
         isCodexInboundFrame &&
         isAnnotatedImageInboundFrame &&
@@ -5753,6 +5832,28 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             (parsedAttest as { type?: unknown }).type === CONTAINER_ATTEST_FRAME_TYPE
           ) {
             onContainerAttest(parsedAttest as Record<string, unknown>);
+            return;
+          }
+        }
+        if (attestPeek !== null && attestPeek.includes('"outbound.external_engine_billing"')) {
+          let external: unknown = null;
+          try { external = JSON.parse(attestPeek); } catch { /* rejected below */ }
+          if (isPlainRecord(external) && external.type === 'outbound.external_engine_billing') {
+            const requestId = typeof external.requestId === 'string' && /^[0-9a-f]{32}$/.test(external.requestId) ? external.requestId : null;
+            const status = external.status === 'success' || external.status === 'error' || external.status === 'unavailable' ? external.status : null;
+            const terminalCode = external.terminalCode === 'USER_CANCELLED' || external.terminalCode === 'AUTH_UNAVAILABLE' || external.terminalCode === 'QUOTA_UNAVAILABLE' || external.terminalCode === 'ENGINE_ERROR' ? external.terminalCode : null;
+            const durationMs = typeof external.durationMs === 'number' && Number.isFinite(external.durationMs) && external.durationMs >= 0 ? Math.floor(external.durationMs) : null;
+            const usage = isPlainRecord(external.usage) ? external.usage : null;
+            if (deps.pgPool && requestId && status && durationMs !== null && external.engine === 'cursor') {
+              void deps.pgPool.query(
+                `UPDATE cursor_external_usage_audit
+                    SET status=$2, terminal_code=$3, duration_ms=$4, reported_usage=$5, completed_at=NOW()
+                  WHERE request_id=$1 AND user_id=$6 AND status='pending'`,
+                [requestId, status, terminalCode, durationMs, usage, uid],
+              ).catch((err) => bridgeLog?.warn('user-chat-bridge: Cursor external audit terminal write failed', { requestId, err }));
+            } else {
+              bridgeLog?.warn('user-chat-bridge: malformed Cursor external billing frame dropped');
+            }
             return;
           }
         }

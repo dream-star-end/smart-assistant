@@ -44,7 +44,7 @@ import type { ModelPricing, ModelVisibility } from "./pricing.js";
 // 类型
 // ─────────────────────────────────────────────────────────────────────────────
 
-export type ModelEngine = "ccb" | "codex" | "grok";
+export type ModelEngine = "ccb" | "codex" | "grok" | "cursor";
 export type ModelCatalogState = "staged" | "active" | "disabled" | "retired";
 
 /**
@@ -440,6 +440,10 @@ export class ModelCatalogSnapshot {
     return engine === "codex" || engine === "grok";
   }
 
+  isExternalBillingModel(modelId: string): boolean {
+    return this.activeByModel.get(this.aliasToCanonical(modelId))?.engine === "cursor";
+  }
+
   /**
    * 是否可路由(可执行 + 可计费)。三个条件缺一不可:
    *   ① catalog 有 active 行;② capability schema 本进程能理解(未来版本 fail-closed);
@@ -530,6 +534,10 @@ export class ModelCatalogSnapshot {
     // Grok is initially a platform-admin tool. A stale or malicious grant must
     // not turn the UI visibility setting into an execution bypass.
     if (this.activeByModel.get(canonical)?.engine === "grok" && scope.role !== "admin") return false;
+    if (this.activeByModel.get(canonical)?.engine === "cursor") {
+      const ownerUid = process.env.OC_V5_CURSOR_OWNER_UID?.trim();
+      if (!ownerUid || String(scope.uid) !== ownerUid) return false;
+    }
     if (scope.deniedModelIds?.has(canonical)) return false;
     const p = this.pricing.get(canonical);
     if (!p) return false;
