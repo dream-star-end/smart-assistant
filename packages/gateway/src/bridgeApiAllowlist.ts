@@ -258,6 +258,18 @@ export const BRIDGE_API_ALLOWLIST: readonly BridgeApiAllowRule[] = [
     methods: M('GET'),
     proxyFromCommercial: true,
   },
+  {
+    label: '/api/workspace/git-snapshot',
+    re: /^\/api\/workspace\/git-snapshot$/,
+    methods: M('GET'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/workspace/list-dir',
+    re: /^\/api\/workspace\/list-dir$/,
+    methods: M('GET'),
+    proxyFromCommercial: true,
+  },
 ]
 
 export function matchBridgeApiAllowlist(path: string, method: string): BridgeApiAllowRule | null {
