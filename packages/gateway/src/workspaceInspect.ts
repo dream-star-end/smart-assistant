@@ -311,8 +311,8 @@ function previewForFile(absPath: string, acl: InspectFileAcl): { previewable: bo
   if (hasGitPathSegment(absPath)) return { previewable: false }
   if (!acl.isFileAllowed(absPath) || acl.isFileBlocked(absPath)) return { previewable: false }
   const cleaned = sanitizeName(absPath)
-  if (!cleaned) return { previewable: false }
-  return { previewable: true, preview_path: cleaned }
+  if (!cleaned || cleaned !== absPath) return { previewable: false }
+  return { previewable: true, preview_path: absPath }
 }
 
 export let lastOpendirPathForTests: string | null = null

@@ -594,9 +594,10 @@ describe('workspace inspect collection', () => {
     assert.equal(parsed.cwd, 'dir')
   })
 
-  it('strips T6 controls from preview_path of an allowed file', async () => {
+  it('does not preview an allowed file whose path contains T6 controls', async () => {
     const nasty = 'ok<img>' + '\u0085\u202e' + '.txt'
     writeFileSync(join(workspaceDir, nasty), 'x')
+    writeFileSync(join(workspaceDir, 'ok<img>plain.txt'), 'x')
     const rt: WorkspaceInspectRuntime = {
       ...makeRt(workspaceDir, reposRoot),
       acl: { isFileAllowed: () => true, isFileBlocked },
@@ -607,13 +608,15 @@ describe('workspace inspect collection', () => {
     const wire = JSON.stringify(r.body)
     assert.equal(wire.includes('\u0085'), false)
     assert.equal(wire.includes('\u202e'), false)
-    const img = r.body.entries.find((e) => e.name.includes('<img>'))
-    assert.ok(img, JSON.stringify(r.body.entries.map((e) => e.name)))
-    const preview = img?.preview_path ?? ''
-    assert.ok(preview)
-    assert.equal(preview.includes('\u0085'), false)
-    assert.equal(preview.includes('\u202e'), false)
-    assert.equal(preview.includes('<img>'), true)
+    const nastyEntry = r.body.entries.find((e) => e.name === 'ok<img>.txt')
+    assert.ok(nastyEntry, JSON.stringify(r.body.entries.map((e) => e.name)))
+    assert.equal(nastyEntry?.previewable, false)
+    assert.equal(nastyEntry?.preview_path, undefined)
+    const clean = r.body.entries.find((e) => e.name === 'ok<img>plain.txt')
+    const cleanPreview = clean?.preview_path ?? ''
+    assert.ok(cleanPreview)
+    assert.equal(cleanPreview.includes('<img>'), true)
+    assert.equal(cleanPreview.includes('\u0085'), false)
   })
 
 
@@ -976,14 +979,13 @@ describe('workspace inspect HTTP handler', () => {
       assert.equal(text.includes('\u0085'), false)
       assert.equal(text.includes('\u202e'), false)
       assert.equal(text.includes('<img>'), true)
-      const parsed = JSON.parse(text) as { entries?: Array<{ preview_path?: string; name?: string }> }
-      const img = parsed.entries?.find((e) => (e.name ?? '').includes('<img>'))
-      const preview = img?.preview_path ?? ''
-      if (process.platform === 'linux') {
-        assert.ok(preview, 'linux TEMP_PREFIX should allow preview_path')
+      const parsed = JSON.parse(text) as { entries?: Array<{ preview_path?: string; previewable?: boolean; name?: string }> }
+      const nastyEntry = parsed.entries?.find((e) => e.name === 'ok<img>.txt')
+      assert.equal(nastyEntry?.preview_path, undefined)
+      for (const e of parsed.entries ?? []) {
+        assert.equal((e.preview_path ?? '').includes('\u0085'), false)
+        assert.equal((e.preview_path ?? '').includes('\u202e'), false)
       }
-      assert.equal(preview.includes('\u0085'), false)
-      assert.equal(preview.includes('\u202e'), false)
     } finally {
       setWorkspaceInspectReposRootOverrideForTests(undefined)
       setWorkspaceInspectSnapshotOverrideForTests(undefined)
