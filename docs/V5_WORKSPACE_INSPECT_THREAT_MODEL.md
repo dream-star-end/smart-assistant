@@ -8,7 +8,7 @@
 > 环境限制：本机没有 `oc-worktree` 注册表，按独立开发环境例外使用 `git worktree add`。  
 > Codex 威胁模型审 #1：**FAIL**（5 Finding）。#2：**FAIL**（父目录 symlink 绕过 `.git` segment）。#3：**PASS**（`/tmp/codex-workspace-inspect-threat-r3.txt`）。  
 > 方案迟到审查（对照 `45bc8802e`）补了 4 条威胁模型缺口，已写入 T2 hermetic gitdir / T2 结束复核 / T5 子进程终止 / T6 净化契约。  
-> 方案 #3：**FAIL**（HEAD/objects 未锚定、准备阶段无资源闸、T6 测试漏 DEL/C1）。已写入 T2/T5/T6。实现方案 #4 PASS 前仍禁止写生产代码。
+> 方案 #3：**FAIL**。#4：**FAIL**（HEAD 误拒正常终止 LF）。已写入 T2。实现方案 #5 PASS 前仍禁止写生产代码。
 
 ---
 
@@ -142,7 +142,7 @@ XSS 不在本协议修复范围；本协议必须做到：**即便脚本能调 A
   1. `lstat` + `open(O_DIRECTORY|O_NOFOLLOW)` 工作树根 → `wfd`；同样打开真实 `.git` 目录 → `gfd`。`.git` 为 symlink 或 gitfile（`gitdir:` 文件）→ 空态 `not_a_repo`，不跟随。
   2. spawn **显式继承** `wfd`/`gfd`。argv 用 `--work-tree=/proc/self/fd/<wfd>`。**禁止**把 `--git-dir` 指到原始 `.git`（那会加载 local `filter.*.clean/process`、`core.worktree`、`include.path`）。
   3. 另建受信临时 gitdir：只写入最小 `config`（无 `filter.*` / `include` / `core.worktree` / hooks / fsmonitor）。`--git-dir` 只指向该临时目录。结束时删除临时目录。
-     - **HEAD**：经 `gfd` 逐段 nofollow 打开。只接受 40-hex detached，或 `ref: refs/<rest>`（每段 `^[A-Za-z0-9._-]+$`，禁 `.`/`..`/空段）。`ref: ../../...` 等 → `not_a_repo`。
+     - **HEAD**：经 `gfd` 逐段 nofollow 打开。只剥一个终止 LF，再校验 40-hex detached 或 `ref: refs/<rest>`（每段 `^[A-Za-z0-9._-]+$`，禁 `.`/`..`/空段）。拒绝其它前后空白、CR、嵌入换行、多行。正常 `...\\n` 必须成功。`ref: ../../...` 等 → `not_a_repo`。
      - 拷贝 `HEAD`/`index`/`packed-refs`/那一个 ref：每跳 `O_NOFOLLOW|O_NONBLOCK`，`fstat` 必须 regular file（拒 FIFO）。上限 HEAD/ref 256B、packed-refs 2MiB、index 8MiB、合计 10MiB。
      - **objects 独立 `ofd`**：`open(O_DIRECTORY|O_NOFOLLOW)` 后继承进子进程；`alternates` 只写 `/proc/self/fd/<ofd>`。禁止 `/proc/self/fd/<gfd>/objects`。
      - 不拷贝、不 symlink 原始 `config`、`hooks`、`commondir`。
@@ -156,7 +156,7 @@ XSS 不在本协议修复范围；本协议必须做到：**即便脚本能调 A
   - 达 stdout/entries 上限必须 **关闭 pipe 并终止 git**（`SIGTERM` → 短等 → `SIGKILL`，始终 reap），stderr 独立限额并持续 drain；不得让 git 堵在满管道上占信号量。intentional truncation 是 200 + `truncated`；timeout 是 504 无 body。
 - 内容读取的 TOCTOU 仍由现有 `openFileHardened` 关（本协议不读内容）。
 
-**测试：** 真实 `symlinkSync` 指向 `/etc`、指向 `git-creds`、指向工作树外；目录 swap 用例至少覆盖「list 目标是 symlink 且 target 在树外 → 403」。gitdir：恶意 `HEAD` `ref: ../../tmp/x`、`objects` symlink/swap、`HEAD`/`index` 为 FIFO 均拒。
+**测试：** 真实 `symlinkSync` 指向 `/etc`、指向 `git-creds`、指向工作树外；目录 swap 用例至少覆盖「list 目标是 symlink 且 target 在树外 → 403」。gitdir：恶意 `HEAD` `ref: ../../tmp/x`、`objects` symlink/swap、`HEAD`/`index` 为 FIFO 均拒；正常 HEAD 仅带终止 LF 可用；前导空白/多行 HEAD 拒。
 
 ### T3 跨用户 / 跨容器 volume 越权
 

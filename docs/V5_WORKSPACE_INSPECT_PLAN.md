@@ -2,7 +2,7 @@
 
 > 威胁模型：`docs/V5_WORKSPACE_INSPECT_THREAT_MODEL.md`（Codex #3 **PASS**；迟到审查补丁已写入 T2/T5/T6）  
 > 实现方案审 #1：**FAIL**（6 Finding，已闭合于 `b685671d3`）。#2：**PASS**（只核对该 6 条）。  
-> #3：**FAIL**（3 Finding：HEAD/objects 未锚定、gitdir 准备阶段无资源闸、T6 测试漏 DEL/C1）。本版已吸收；待 #4 PASS 才写生产代码。  
+> #3：**FAIL**（3 Finding）。#4：**FAIL**（HEAD 误拒正常终止 LF）。本版已吸收；待 #5 PASS 才写生产代码。  
 > 本轮：**纯后端**。合入后前端零行为变化。PR-B 不做。不部署、不合入。  
 > 基线：`origin/feat/v5-aurora-rewrite` @ `e4f3fc930`  
 > 分支：`feat/v5-workspace-git-stat`
@@ -110,7 +110,7 @@ Vendor/VCS skip 名：`node_modules` `.git` `.svn` `.hg` `.venv` `venv` `__pycac
 1. `lstat` + `open(O_DIRECTORY|O_NOFOLLOW)` 工作树根 → `wfd`。realpath(`/proc/self/fd/wfd`) 必须仍在 `resolveReadyWorkspace` 给出的根下。
 2. 对 `<root>/.git` 同样 `lstat`（拒 symlink）+ `open(O_RDONLY|O_DIRECTORY|O_NOFOLLOW)` → `gfd`。`.git` 是文件（gitfile / `gitdir:`）→ 空态 `not_a_repo`，本 PR 不跟随。
 3. **受信临时 gitdir**（`mkdtemp`）：只写最小 `config`（无 `filter.*` / `include.path` / `includeIf` / `core.worktree` / hooks / fsmonitor）。**不**把 `--git-dir` 或 `alternates` 指回原始 `.git` 文本路径。
-   - **HEAD 契约（先校验再拷贝）**：经 `gfd` 逐段 nofollow 打开 `HEAD`。内容只能是 (a) 40-hex detached SHA，或 (b) `ref: refs/<rest>`，其中 `<rest>` 按 `/` 拆段，每段 `^[A-Za-z0-9._-]+$`、禁止 `.`/`..`/空段，完整路径必须落在 `refs/**`。其它形状（`ref: ../../etc/passwd`、`ref: /etc/passwd`、相对 `objects/`、带空白）→ 失败，当 `not_a_repo`。
+   - **HEAD 契约（先校验再拷贝）**：经 `gfd` 逐段 nofollow 打开 `HEAD`。读出后**只剥一个终止 LF**（`\\n` / U+000A），再校验。允许 (a) 40-hex detached SHA，或 (b) `ref: refs/<rest>`，其中 `<rest>` 按 `/` 拆段，每段 `^[A-Za-z0-9._-]+$`、禁止 `.`/`..`/空段，完整路径必须落在 `refs/**`。拒绝：其它前后空白、CR、嵌入换行、多行、`ref: ../../etc/passwd`、绝对路径、相对 `objects/`。正常 `ref: refs/heads/main\\n` 与 `40hex\\n` 必须成功。失败 → `not_a_repo`。
    - **拷贝闸**：只拷 `HEAD`、`index`、可选 `packed-refs`、以及（b）指向的**那一个** ref 文件。每一跳 `lstat`+`open(O_RDONLY|O_NOFOLLOW|O_NONBLOCK)`，**`fstat` 必须是 regular file**（拒 FIFO/socket/dir/symlink）。单文件上限：HEAD/ref 256B、`packed-refs` 2MiB、`index` 8MiB；合计 ≤ 10MiB。超限或非 regular → 失败并清理。
    - **objects 独立 fd**：`open(O_RDONLY|O_DIRECTORY|O_NOFOLLOW)` `gfd` 下的 `objects` → `ofd`。`objects/info/alternates` 只写子进程里继承到的 `/proc/self/fd/<ofd>`（与 wfd/gfd 一样进 `stdio` 继承表），**禁止**写 `/proc/self/fd/<gfd>/objects` 这种仍可被中间段 symlink/swap 的路径。
    - 不拷贝、不 symlink 原始 `config`、`hooks`、`commondir`。`finally` 删除临时目录。
@@ -121,7 +121,7 @@ Vendor/VCS skip 名：`node_modules` `.git` `.svn` `.hg` `.venv` `venv` `__pycac
 8. **准备阶段纳入同一 deadline**：步骤 1–3 的 open/copy 与 spawn 共用 git 5s 时钟。FIFO 因 `O_NONBLOCK`+regular-file 闸立即失败，不得阻塞到超时。失败路径同样 `finally` 删临时目录、关 fd、放信号量。
 9. 结束后按 §4.3.8 复核 snapshot+inode；失败 409。
 
-测试：`.git/config` 写入 `core.worktree=/etc` 不得列出 `/etc`；`.git` 本身是 symlink 或 gitfile → 拒；hooks/fsmonitor 不被执行；**恶意 `filter.pwn.clean/process` + `.gitattributes` `* filter=pwn` 的 sentinel 命令不得执行**（sentinel 文件不得出现）；**`HEAD` 为 `ref: ../../tmp/x` 或 `objects` 为 symlink → 拒**；**`HEAD`/`index` 换成 FIFO 或超大文件 → 立即失败，临时目录与信号量均释放**。
+测试：`.git/config` 写入 `core.worktree=/etc` 不得列出 `/etc`；`.git` 本身是 symlink 或 gitfile → 拒；hooks/fsmonitor 不被执行；**恶意 `filter.pwn.clean/process` + `.gitattributes` `* filter=pwn` 的 sentinel 命令不得执行**（sentinel 文件不得出现）；**`HEAD` 为 `ref: ../../tmp/x` 或 `objects` 为 symlink → 拒**；**`HEAD`/`index` 换成 FIFO 或超大文件 → 立即失败，临时目录与信号量均释放**；**正向：symbolic/detached HEAD 仅带一个终止 LF 仍可用**；**反向：前导空白、CR、多行 HEAD 拒**。
 
 ### 4.5 并发
 
@@ -184,14 +184,10 @@ PR-B UI、Commit/Push、Undo、递归整树、未绑定仓库扫描、第二套�
 
 ---
 
-## 9. Codex 审查问题（方案 · 第 4 轮）
+## 9. Codex 审查问题（方案 · 第 5 轮）
 
-#3 FAIL 的 3 条 Finding 已写入 §4.4 与测试矩阵。请确认是否闭合：
+#4 唯一 Finding：HEAD 解析只剥一个终止 LF，再校验 40-hex 或 `refs/**`；拒绝其它空白/CR/多行。正向测正常 LF；反向测前导空白与多行。
 
-1. HEAD 只允许 40-hex 或校验过的 `refs/**` symbolic ref；拷贝逐段 nofollow；`objects` 用独立继承 `ofd` 写 alternates，不用 `/proc/self/fd/<gfd>/objects`。测恶意 HEAD ref 与 objects symlink/swap。
-2. 准备阶段：regular-file `fstat`、`O_NONBLOCK`、单文件/合计字节上限、同一 5s deadline/`finally`。测 FIFO 与超大文件后临时目录+信号量释放。
-3. T6 测试显式覆盖 DEL(U+007F) 与至少一个 C1（U+0085 或 U+009B），并保留 `<img>` 正向断言。
-
-#3 已闭合项仍须在：临时 gitdir 隔离 filter、ACL 单一权威、spawn 后 kill+reap、fd 继承、host-scope 403 在 deps 闸外、真实 `/api/file` handler 往返。
+#3/#4 其余项仍须在：ofd 锚定、FIFO/大小闸、T6 DEL+C1、filter 隔离、host-scope 403、真实 `/api/file` handler 往返。
 
 第一行 `PASS` / `FAIL` / `PARTIAL`。Finding 必须修才能写代码。不要改代码。
