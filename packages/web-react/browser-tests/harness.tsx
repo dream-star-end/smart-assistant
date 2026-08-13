@@ -15,6 +15,7 @@ import {
 } from "react";
 import { createRoot } from "react-dom/client";
 import { Composer } from "../src/components/Composer";
+import { SettingsCenter } from "../src/components/SettingsCenter";
 import { Sidebar } from "../src/components/Sidebar";
 import { CommunityTutorials } from "../src/components/tutorials/CommunityTutorials";
 import { MessageFeedbackDialog } from "../src/components/chat/MessageFeedbackDialog";
@@ -1651,5 +1652,36 @@ createRoot(document.getElementById("codex-density-root")!).render(
         showAdmin
       />
     </div>
+  </StrictMode>,
+);
+
+// PR2 设置壳：默认关闭，避免 Dialog 盖住其余 harness。T42 用受信点击打开后
+// 锁 390 单列不横溢 / 五分区可切 / 1440 竖导航 168px。
+function SettingsShellProbe() {
+  const [open, setOpen] = useState(false);
+  return (
+    <TooltipProvider>
+      <button type="button" onClick={() => setOpen(true)}>
+        打开设置壳
+      </button>
+      <SettingsCenter
+        open={open}
+        demo
+        auth={createMemoryAuthSession(() => {}, "settings-shell-token")}
+        user={DENSITY_USER}
+        theme="light"
+        onClose={() => setOpen(false)}
+        onSetTheme={() => {}}
+        onOpenMemory={() => {}}
+        onOpenManage={() => {}}
+        onOpenRepo={() => {}}
+        initialSection="about"
+      />
+    </TooltipProvider>
+  );
+}
+createRoot(document.getElementById("settings-shell-root")!).render(
+  <StrictMode>
+    <SettingsShellProbe />
   </StrictMode>,
 );
