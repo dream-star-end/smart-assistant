@@ -135,6 +135,15 @@ declare global {
         cursor: number;
         requests: string[];
       }>;
+      /** Replay a cold refresh spanning two container frameSeq generations. */
+      runDurableGenerationReset: () => Promise<{
+        markers: { oldProcess: string; currentProcess: string; currentAnswer: string };
+        oldProcessCount: number;
+        currentProcessCount: number;
+        currentAnswerCount: number;
+        cursor: number;
+        requests: string[];
+      }>;
       /** Replay the two production error shapes through durable hydration. */
       runDurableErrorReplay: () => Promise<{
         stopErrorCode?: string;
@@ -199,6 +208,9 @@ window.__replayDrive = {
   pushRetrySuccess: () => {},
   runDurableOverlap: async () => {
     throw new Error("durable overlap probe 未挂载");
+  },
+  runDurableGenerationReset: async () => {
+    throw new Error("durable generation-reset probe 未挂载");
   },
   runDurableErrorReplay: async () => {
     throw new Error("durable error replay probe 未挂载");
@@ -1284,6 +1296,125 @@ createRoot(document.getElementById("chat-entry-ux-root")!).render(
           m.role === "tool" && m.output === markers.toolOutput).length,
         answerCount: session.messages.filter((m) =>
           m.role === "assistant" && m.text === markers.answer).length,
+        cursor: session._lastFrameSeqByKey?.[sessionKey] ?? -1,
+        requests,
+      };
+    },
+    runDurableGenerationReset: async () => {
+      replaySocket.removeSession(REPLAY_SESSION_ID);
+      const session = replaySocket.ensureSession(
+        REPLAY_SESSION_ID,
+        REPLAY_AGENT_ID,
+        "durable container generations",
+      );
+      const oldClientMessageId = "m-browser-old-container";
+      const currentClientMessageId = "m-browser-current-container";
+      const sessionKey = `agent:${REPLAY_AGENT_ID}:webchat:dm:${REPLAY_SESSION_ID}`;
+      const markers = {
+        oldProcess: "BROWSER_OLD_CONTAINER_PROCESS",
+        currentProcess: "BROWSER_CURRENT_CONTAINER_PROCESS",
+        currentAnswer: "BROWSER_CURRENT_CONTAINER_ANSWER",
+      };
+      session.messages.push(
+        {
+          id: oldClientMessageId,
+          role: "user",
+          text: "BROWSER_OLD_CONTAINER_USER",
+          ts: 1,
+          status: "sent",
+        },
+        {
+          id: "browser-old-durable-process",
+          role: "thinking",
+          text: markers.oldProcess,
+          ts: 1_000,
+          _source: "server",
+          _turnOwnerId: oldClientMessageId,
+        },
+        {
+          id: currentClientMessageId,
+          role: "user",
+          text: "BROWSER_CURRENT_CONTAINER_USER",
+          ts: 2,
+          status: "sent",
+        },
+      );
+      // IndexedDB persisted this cursor before the running turn moved to a
+      // replacement container whose outbound ring starts again at one.
+      session._lastFrameSeqByKey = { [sessionKey]: 1_914 };
+      session._lastFrameSeq = 1_914;
+      session._sendingInFlight = true;
+      session._activeClientMessageId = currentClientMessageId;
+      const record = (
+        recordId: string,
+        streamKey: string,
+        clientMessageId: string,
+        frameSeq: number,
+        blocks: unknown[],
+        isFinal = false,
+      ) => ({
+        recordId,
+        streamKey,
+        source: "gateway" as const,
+        clientMessageId,
+        payload: {
+          type: "outbound.message",
+          sessionKey,
+          frameSeq,
+          channel: "webchat",
+          peer: { id: REPLAY_SESSION_ID, kind: "dm" },
+          clientMessageId,
+          blocks,
+          isFinal,
+          ts: Number(recordId) * 1_000,
+        },
+      });
+      const oldStream = "dispatch:77777777-7777-4777-8777-777777777777:1";
+      const currentStream = "dispatch:88888888-8888-4888-8888-888888888888:1";
+      const requests: string[] = [];
+      await replaySocket.hydrateDurableLiveFrameJournal(
+        REPLAY_SESSION_ID,
+        async (after) => {
+          requests.push(after);
+          if (after === "0") {
+            return {
+              frames: [
+                record("1", oldStream, oldClientMessageId, 998, [{
+                  kind: "thinking", text: markers.oldProcess,
+                }]),
+                record("2", oldStream, oldClientMessageId, 1_914, [], true),
+                record("3", currentStream, currentClientMessageId, 1, [{
+                  kind: "thinking", text: markers.currentProcess,
+                }]),
+                record("4", currentStream, currentClientMessageId, 2, [{
+                  kind: "text", text: markers.currentAnswer,
+                }]),
+              ],
+              nextCursor: "4",
+              hasMore: false,
+              streamClientMessageIds: [oldClientMessageId, currentClientMessageId],
+              hasTapeProjection: false,
+            };
+          }
+          return {
+            frames: [], nextCursor: null, hasMore: false,
+            streamClientMessageIds: [oldClientMessageId, currentClientMessageId],
+            hasTapeProjection: false,
+          };
+        },
+        async () => {},
+      );
+      return {
+        markers,
+        oldProcessCount: session.messages.filter((message) =>
+          message.role === "thinking" && message.text === markers.oldProcess
+        ).length,
+        currentProcessCount: session.messages.filter((message) =>
+          message.role === "thinking" && message.text === markers.currentProcess
+        ).length,
+        currentAnswerCount: session.messages.filter((message) =>
+          message.role === "assistant" && message.text === markers.currentAnswer
+        ).length,
         cursor: session._lastFrameSeqByKey?.[sessionKey] ?? -1,
         requests,
       };

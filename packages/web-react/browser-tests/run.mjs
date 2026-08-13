@@ -1942,6 +1942,30 @@ await check("T32 durable error replay：用户 Stop 不上报，历史非尾错�
   }
 });
 
+await check("T39 刷新跨容器代际恢复：旧高游标不再吞掉新容器实时内容", async () => {
+  const result = await page.evaluate(() => window.__replayDrive.runDurableGenerationReset());
+  if (
+    result.oldProcessCount !== 1 ||
+    result.currentProcessCount !== 1 ||
+    result.currentAnswerCount !== 1 ||
+    result.cursor !== 2 ||
+    JSON.stringify(result.requests) !== JSON.stringify(["0", "4"])
+  ) {
+    throw new Error(`跨容器 durable hydration 未恢复:${JSON.stringify(result)}`);
+  }
+  const thinkingHeader = replayRoot.getByRole("button", { name: /思考|已思考/ }).last();
+  await thinkingHeader.waitFor({ state: "visible", timeout: 3000 });
+  await thinkingHeader.click();
+  await replayRoot.getByText(result.markers.currentProcess, { exact: true }).waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
+  await replayRoot.getByText(result.markers.currentAnswer, { exact: true }).waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
+});
+
 await check("T37 新会话草稿与历史加载反馈：连续新建不增行，部分内容加载不中断可见性", async () => {
   const root = page.locator("#chat-entry-ux-root");
   await root.getByText("已有会话", { exact: true }).waitFor({ state: "visible", timeout: 3000 });

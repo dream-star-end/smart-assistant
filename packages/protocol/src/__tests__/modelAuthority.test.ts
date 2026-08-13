@@ -216,6 +216,12 @@ describe('verifyAuthority', () => {
     assert.deepEqual(got, p)
   })
 
+  it('Grok engine 签发 → 验签 → 载荷逐字段还原', () => {
+    const p = makePayload({ canonicalModel: 'grok-build', engine: 'grok' })
+    const got = verifyAuthority(signAuthorityEnvelope(p), keyring, NOW + 1000)
+    assert.deepEqual(got, p)
+  })
+
   it('可选字段 billingRequestId 缺席/存在都能往返', () => {
     const withId = makePayload({ billingRequestId: 'req_123' })
     assert.equal(
