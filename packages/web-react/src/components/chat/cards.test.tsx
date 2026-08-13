@@ -29,9 +29,10 @@ function renderErr(msg: ChatMessage, cb: CardCallbacks, tokenUsage?: { totalToke
 }
 
 describe("F3 UserCard 发送失败重试命中区", () => {
-  test("error 态 + onRetrySend → 重试按钮补 44px 触控命中区并可点回调", () => {
+  test("仅有 transport error 时保留发送失败与 44px 重试出口", () => {
     const onRetrySend = vi.fn();
     render(<UserCard msg={userMsg({ status: "error" })} cb={{ onRetrySend }} />);
+    expect(screen.getByText("发送失败")).toBeInTheDocument();
     const btn = screen.getByRole("button", { name: /重试/ });
     // 对齐同批其它命中区写法（MessageRenderer 续轮按钮）：粗指针下 ≥44px。
     expect(btn).toHaveClass("[@media(hover:none)]:min-h-11");
@@ -39,9 +40,39 @@ describe("F3 UserCard 发送失败重试命中区", () => {
     expect(onRetrySend).toHaveBeenCalledTimes(1);
   });
 
+  test("同一轮已有可见错误卡时隐藏重复的发送失败与重试", () => {
+    render(
+      <UserCard
+        msg={userMsg({ status: "error" })}
+        cb={{ onRetrySend: vi.fn() }}
+        failurePresentedBelow
+      />,
+    );
+    expect(screen.getByTestId("message-text")).toHaveTextContent("你好");
+    expect(screen.queryByText("发送失败")).toBeNull();
+    expect(screen.queryByRole("button", { name: /重试/ })).toBeNull();
+  });
+
   test("非 error 态不渲染重试按钮", () => {
     render(<UserCard msg={userMsg({ status: "sent" })} cb={{ onRetrySend: () => {} }} />);
     expect(screen.queryByRole("button", { name: /重试/ })).toBeNull();
+  });
+});
+
+describe("AssistantCard 预期错误视觉语义", () => {
+  test("route unavailable 使用紧凑 warning 卡且无 trace 时不渲染详情", () => {
+    renderErr(errMsg({
+      _errorCode: "codex_route_unavailable",
+      _clientMessageId: "u1",
+      _errorDetail: "",
+    }), {});
+
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveClass("border-warning/30", "px-3", "py-2");
+    expect(alert).not.toHaveClass("border-danger/30");
+    expect(alert).toHaveTextContent("模型服务暂时不可用");
+    expect(alert).not.toHaveTextContent("GPT");
+    expect(screen.queryByText("查看请求信息")).toBeNull();
   });
 });
 

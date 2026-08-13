@@ -98,6 +98,7 @@ declare global {
         replyTo?: { messageId: string; role: "user" | "assistant"; text: string };
       }>;
     };
+    __errorUxRetries: number;
     __mountAskQuestion: () => void;
     __completeTimelineThinking: () => void;
     /** fixture 的精确文本标记与期望顺序,供 run.mjs 读取 —— 断言常量不在两处各写一份。 */
@@ -189,6 +190,7 @@ window.__scrollTimeline = {
 window.__archiveTimeline = { calls: 0, mergedPages: 0, messageCount: 0 };
 window.__askQuestion = { responses: [] };
 window.__messageQuote = { sends: [] };
+window.__errorUxRetries = 0;
 window.__mountAskQuestion = () => {};
 window.__completeTimelineThinking = () => {};
 window.__replayFixture = {
@@ -429,6 +431,36 @@ function MessageQuoteProbe() {
 
 createRoot(document.getElementById("message-quote-root")!).render(
   <StrictMode><MessageQuoteProbe /></StrictMode>,
+);
+
+const errorUxUser: ChatMessage = {
+  id: "browser-error-ux-user",
+  role: "user",
+  text: "你是什么模型",
+  ts: 1,
+  status: "error",
+};
+const errorUxAssistant: ChatMessage = {
+  id: "browser-error-ux-assistant",
+  role: "assistant",
+  text: "",
+  ts: 2,
+  _errorCode: "codex_route_unavailable",
+  _clientMessageId: errorUxUser.id,
+};
+
+createRoot(document.getElementById("error-ux-root")!).render(
+  <StrictMode>
+    <MessageList
+      messages={[errorUxUser, errorUxAssistant]}
+      sending={false}
+      cb={{
+        onRetrySend: () => { window.__errorUxRetries += 1; },
+        resolveRetryTarget: (id) => id === errorUxUser.id ? errorUxUser : undefined,
+      }}
+      onRespondPermission={() => {}}
+    />
+  </StrictMode>,
 );
 
 const activeAskQuestion: ChatMessage = {

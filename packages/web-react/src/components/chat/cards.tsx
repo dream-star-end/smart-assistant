@@ -363,8 +363,18 @@ function ReplyQuoteBlock({
 // reducer/socket 对 msg 就地 mutate(同引用),叶子层 {msg} 浅比较要么永不重渲(状态标签
 // 卡死在首帧,如 user status),要么因 ctx 每帧新对象而形同虚设 —— 三种 memo 策略并存徒增
 // 认知负担。sig 层已捕获全部渲染所读字段(render.ts messageSignature),叶子直接裸函数。
-export function UserCard({ msg, cb }: { msg: ChatMessage; cb?: CardCallbacks }) {
+export function UserCard({
+  msg,
+  cb,
+  failurePresentedBelow = false,
+}: {
+  msg: ChatMessage;
+  cb?: CardCallbacks;
+  /** 同一轮已有可见终态错误卡时，错误说明与重试出口由该卡独占。 */
+  failurePresentedBelow?: boolean;
+}) {
   const status = msg.status;
+  const showStatus = status && !(status === "error" && failurePresentedBelow);
   return (
     <div className="group flex flex-col items-end animate-in" data-testid="user-row">
       <div
@@ -379,7 +389,7 @@ export function UserCard({ msg, cb }: { msg: ChatMessage; cb?: CardCallbacks }) 
       {msg._media && msg._media.length > 0 && (
         <Media media={msg._media} className="justify-end" />
       )}
-      {status && (
+      {showStatus && (
         <div
           className={cn(
             "mt-1 flex items-center gap-2 text-[11px]",
@@ -504,6 +514,8 @@ export function AssistantCard({
   // 语义(retryable/cta)从 protocol taxonomy 派生,不在组件里手写码判断。
   const normalizedCode = normalizeTurnErrorCode(msg._errorCode);
   const sem = turnErrorSemantics(normalizedCode);
+  const expectedError = sem.expected === true;
+  const errorTone = presentedError?.waived || expectedError ? "warning" : "danger";
   const isUserCancelled = normalizedCode === "stopped" || normalizedCode === "user_cancelled";
   const isInsufficient = normalizedCode === "insufficient_credits";
   // 「精确重试」资格:非免单 + 该码可重试 + cta∈{retry,retry_or_switch} + 会话内能定位到带完整
@@ -631,8 +643,9 @@ export function AssistantCard({
           </output>
         ) : presentedError && (
           <Alert
-            tone={presentedError.waived ? "warning" : "danger"}
-            className="mt-2.5 max-w-full overflow-hidden px-3.5 py-3 sm:px-4"
+            tone={errorTone}
+            density={expectedError && !presentedError.waived ? "compact" : "comfortable"}
+            className="mt-2.5 max-w-full overflow-hidden"
             icon={presentedError.waived ? <ShieldCheck size={17} /> : <AlertTriangle size={17} />}
             title={presentedError.title}
           >

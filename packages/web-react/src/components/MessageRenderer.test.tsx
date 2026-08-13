@@ -592,6 +592,107 @@ describe("permission 审批", () => {
   });
 });
 
+describe("MessageList 失败轮单一错误出口", () => {
+  const failedUser = mk("user", {
+    id: "u-paired-error",
+    text: "你是什么模型",
+    status: "error",
+  });
+
+  test("可见助手错误卡接管失败说明与重试，用户行不重复展示", () => {
+    const onRetrySend = vi.fn();
+    const messages = [
+      failedUser,
+      mk("assistant", {
+        id: "a-paired-error",
+        _clientMessageId: failedUser.id,
+        _errorCode: "codex_route_unavailable",
+        _errorDetail: "",
+      }),
+    ];
+    render(
+      <MessageList
+        messages={messages}
+        sending={false}
+        cb={{
+          onRetrySend,
+          resolveRetryTarget: (id) => id === failedUser.id ? failedUser : undefined,
+        }}
+        onRespondPermission={() => {}}
+      />,
+    );
+
+    expect(screen.getByText("你是什么模型")).toBeInTheDocument();
+    expect(screen.queryByText("发送失败")).toBeNull();
+    const retries = screen.getAllByRole("button", { name: "重试" });
+    expect(retries).toHaveLength(1);
+    expect(screen.getByRole("alert")).toHaveTextContent("模型服务暂时不可用");
+    expect(document.body).not.toHaveTextContent("GPT");
+    expect(screen.queryByText("查看请求信息")).toBeNull();
+
+    fireEvent.click(retries[0]);
+    expect(onRetrySend).toHaveBeenCalledTimes(1);
+    expect(onRetrySend).toHaveBeenCalledWith(failedUser);
+  });
+
+  test("没有可见错误卡的 transport-only 失败仍保留用户行重试", () => {
+    render(
+      <MessageList
+        messages={[failedUser]}
+        sending={false}
+        cb={{ onRetrySend: vi.fn() }}
+        onRespondPermission={() => {}}
+      />,
+    );
+    expect(screen.getByText("发送失败")).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: "重试" })).toHaveLength(1);
+  });
+
+  test("自动恢复最终耗尽时把隐藏 child 的错误归回可见原问题", () => {
+    const recoveryChild = mk("user", {
+      id: "u-hidden-recovery-child",
+      text: "AUTO_RECOVERY_CONTROL_ROW",
+      status: "error",
+      _isAutoRetry: true,
+      _automaticRecovery: true,
+      _recoveryOfClientMessageId: failedUser.id,
+    });
+    const onRetrySend = vi.fn();
+    render(
+      <MessageList
+        messages={[
+          failedUser,
+          mk("assistant", {
+            id: "a-intermediate-recovery-error",
+            _clientMessageId: failedUser.id,
+            _errorCode: "model_capacity",
+          }),
+          recoveryChild,
+          mk("assistant", {
+            id: "a-final-recovery-error",
+            _clientMessageId: recoveryChild.id,
+            _errorCode: "codex_route_unavailable",
+          }),
+        ]}
+        sending={false}
+        cb={{
+          onRetrySend,
+          resolveRetryTarget: (id) => id === recoveryChild.id ? recoveryChild : undefined,
+        }}
+        onRespondPermission={() => {}}
+      />,
+    );
+
+    expect(screen.getByText("你是什么模型")).toBeInTheDocument();
+    expect(screen.queryByText("AUTO_RECOVERY_CONTROL_ROW")).toBeNull();
+    expect(screen.queryByText("发送失败")).toBeNull();
+    const retries = screen.getAllByRole("button", { name: "重试" });
+    expect(retries).toHaveLength(1);
+    fireEvent.click(retries[0]);
+    expect(onRetrySend).toHaveBeenCalledWith(recoveryChild);
+  });
+});
+
 describe("MessageList 每张调用卡 token 实时展示", () => {
   test("思考和工具卡只显示自己的调用消耗，最终助手保留本轮快照", () => {
     const messages: ChatMessage[] = [
