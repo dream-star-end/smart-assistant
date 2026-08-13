@@ -144,3 +144,23 @@ export function groupLabel(iso: string): string {
   if (days < 30) return "本月";
   return "更早";
 }
+
+/** 侧栏分组：`pinned===true` 单独「置顶」且不重复进日期组；无置顶则只出日期组。 */
+export function groupSidebarSessions<T extends { title: string; updatedAt: string; pinned?: boolean }>(
+  sessions: T[],
+  query: string,
+): [string, T[]][] {
+  const q = query.trim().toLowerCase();
+  const filtered = q
+    ? sessions.filter((s) => s.title.toLowerCase().includes(q))
+    : sessions;
+  const pinned = filtered.filter((s) => s.pinned === true);
+  const rest = filtered.filter((s) => s.pinned !== true);
+  const map = new Map<string, T[]>();
+  for (const s of rest) {
+    const k = groupLabel(s.updatedAt);
+    (map.get(k) || map.set(k, []).get(k)!).push(s);
+  }
+  const dated = [...map.entries()];
+  return pinned.length > 0 ? [["置顶", pinned], ...dated] : dated;
+}
