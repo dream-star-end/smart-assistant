@@ -27,6 +27,10 @@ const ASSETS = new Map([
   ['/shell.css', Object.freeze({ filename: 'shell.css', mime: 'text/css; charset=utf-8' })],
   ['/shell.mjs', Object.freeze({ filename: 'shell.mjs', mime: 'text/javascript; charset=utf-8' })],
   [
+    '/wco-geometry.mjs',
+    Object.freeze({ filename: 'wco-geometry.mjs', mime: 'text/javascript; charset=utf-8' }),
+  ],
+  [
     '/icons/aurora.svg',
     Object.freeze({ filename: 'icons/aurora.svg', mime: 'image/svg+xml' }),
   ],

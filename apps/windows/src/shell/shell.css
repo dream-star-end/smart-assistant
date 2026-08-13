@@ -6,17 +6,17 @@
   --accent-pressed: #4e3da8;
   --accent-soft: #f0edfb;
   --canvas: #ffffff;
-  --appbar: rgba(250, 251, 252, 0.97);
-  --appbar-solid: #fafbfc;
-  --sidebar-tint: #eef7fa;
+  --appbar: rgba(255, 255, 255, 0.97);
+  --appbar-solid: #ffffff;
+  --sidebar-tint: #f7f8fa;
   --surface: #ffffff;
-  --surface-subtle: #f7f8f9;
-  --surface-hover: #f0f1f2;
+  --surface-subtle: #f7f8fa;
+  --surface-hover: #f0f1f3;
   --surface-pressed: #e7e8ea;
-  --text: #202124;
-  --text-muted: #697077;
-  --text-faint: #697077;
-  --border: #e3e5e7;
+  --text: #1f2328;
+  --text-muted: #6b7280;
+  --text-faint: #6b7280;
+  --border: #e5e7eb;
   --border-strong: #d5d8db;
   --success: #178653;
   --danger: #b32636;
@@ -150,6 +150,23 @@ button:focus-visible,
   background: var(--appbar-solid);
   -webkit-backdrop-filter: none;
   backdrop-filter: none;
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+
+:root[data-overlay-active="true"][data-wco-ready="true"] .command-surface {
+  left: env(titlebar-area-x, 0px);
+  width: env(titlebar-area-width);
+}
+
+:root[data-overlay-active="true"][data-wco-ready="false"] .command-surface {
+  padding-right: 140px;
+}
+
+:root[data-overlay-active="true"][data-wco-ready="true"] .brand,
+:root[data-overlay-active="true"][data-wco-ready="true"] .command-spacer {
+  -webkit-app-region: drag;
+  app-region: drag;
 }
 
 .command-surface.allow-transparency {
@@ -223,6 +240,8 @@ button:focus-visible,
   border-radius: 7px;
   background: transparent;
   transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
 }
 
 .icon-button {
@@ -292,6 +311,8 @@ button:focus-visible,
   color: var(--text-muted);
   overflow: hidden;
   white-space: nowrap;
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
 }
 
 .connection-status[data-state="online"] {
@@ -347,6 +368,8 @@ button:focus-visible,
   z-index: 10;
   inset: 44px 0 0;
   background: var(--canvas);
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
 }
 
 .downloads-scrim {
@@ -542,20 +565,22 @@ button:focus-visible,
   position: absolute;
   z-index: 8;
   inset: 44px 0 0;
-  background: linear-gradient(90deg, var(--sidebar-tint) 0 220px, var(--canvas) 220px);
+  background: var(--canvas);
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
 }
 
 .offline-card {
   position: absolute;
-  top: 46%;
-  left: calc(50% + 110px);
+  top: 50%;
+  left: 50%;
   width: min(430px, calc(100% - 48px));
   padding: 30px;
   transform: translate(-50%, -50%);
   border: 1px solid var(--border);
-  border-radius: 14px;
+  border-radius: 12px;
   background: var(--surface);
-  box-shadow: 0 12px 34px rgba(31, 35, 40, 0.08);
+  box-shadow: var(--shadow);
   text-align: center;
 }
 

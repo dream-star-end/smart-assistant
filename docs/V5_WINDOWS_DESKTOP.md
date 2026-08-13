@@ -100,10 +100,16 @@ main frame 和 payload schema。禁止任意 URL/path、原始 `ipcRenderer`、�
 app bar，标题固定为安装包内的“Aurora / 桌面工作区”，不读取远端页面 DOM、路由标题或聊天内容。
 远端 V5 产品区仍占据 app bar 下方的完整工作区，并继续是认证、会话和核心 UI 的唯一权威。
 
+Windows 上 app bar 与 Electron Window Controls Overlay（`titleBarOverlay`，高度同样 44px）合并，
+保留系统最小/最大/关闭和 Snap。overlay 创建必须走原子双路径：失败时回退标准标题栏，且不得留下
+`titleBarStyle: hidden` 却没有 caption 按钮的窗口。macOS/Linux 不启用 overlay。
+
 app bar 只显示本地可验证的下载和连接状态。后退、前进、刷新、主页、缩放、打开下载等命令由
-Electron 原生 `Menu` 与既有键盘/鼠标快捷键承载；不得用自绘 HTML 菜单假冒 Windows 原生菜单，
-也不得为了填充 Codex 风格导航而生成虚假的项目、任务、环境或 agent 数据。正常态下 F6 必须在
-product view 与本地 app bar 间循环焦点；modal 态不得把焦点交给已经隐藏的 product view。
+Electron 原生应用菜单与 More 弹出（共用命令描述表）以及 composition-aware 键盘/鼠标快捷键承载；
+菜单 accelerator 在 Windows/Linux 仅展示（`registerAccelerator: false`），在 macOS 完全省略，
+避免绕过 IME 保护。不得用自绘 HTML 菜单假冒 Windows 原生菜单，也不得伪造项目、任务、环境或
+agent 数据。正常态下 F6 必须在 product view 与本地 app bar 间循环焦点；modal 态不得把焦点交给
+已经隐藏的 product view。
 
 下载列表和离线恢复页是本地 modal 状态，不是透明盖在可交互 product view 上的浮层。进入任一
 modal 时，main 必须先隐藏 product view，再把 shell 布局扩展到整个窗口；关闭下载 modal 或网络
@@ -166,7 +172,7 @@ npm --prefix apps/windows run smoke
 `--smoke-test` 使用独立非持久 partition 与安装包内 fixture，真实创建 shell/product 两个
 `WebContentsView`，断言 shell bridge 存在且窄、product 没有 `process/require/auroraDesktop`、
 导航命令和 resize 布局生效、关闭后两个 webContents 均销毁，再退出 0。它不访问公网、DNS 或
-生产服务；应用内有硬超时，CI 再施加 30 秒外层超时。
+生产服务；应用内有硬超时（25 秒），CI 再施加 45 秒外层超时。
 
 macOS 还可验证当前平台 unpacked 打包结构：
 
@@ -194,7 +200,7 @@ Workflow：`.github/workflows/v5-windows-desktop.yml`。
 1. 用 `apps/windows` 独立 lockfile 执行 `npm ci`。
 2. 执行策略、合同、窗口/IPC/下载和语法检查 `npm run check`。
 3. 以 electron-builder 构建 Windows x64 NSIS。
-4. 启动 `release/win-unpacked/Aurora.exe --smoke-test` 跑 packaged 双-view 行为合同，30 秒未退出即强杀并判红。
+4. 启动 `release/win-unpacked/Aurora.exe --smoke-test` 跑 packaged 双-view 行为合同，45 秒未退出即强杀并判红。
 5. 静默安装到 runner 临时目录，再跑一次 installed smoke，最后静默卸载并确认 exe 消失。
 6. 对唯一的 `Aurora-Setup-*.exe` 生成 `SHA256SUMS.txt`。
 7. 上传 installer、blockmap/metadata（若生成）和 SHA-256，保留 14 天。

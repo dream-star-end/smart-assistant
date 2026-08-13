@@ -116,6 +116,7 @@ test('shell handler serves only normalized allowlisted paths and rejects travers
     [SHELL_URL, 'text/html; charset=utf-8'],
     [`${SHELL_ORIGIN}/shell.css`, 'text/css; charset=utf-8'],
     [`${SHELL_ORIGIN}/shell.mjs`, 'text/javascript; charset=utf-8'],
+    [`${SHELL_ORIGIN}/wco-geometry.mjs`, 'text/javascript; charset=utf-8'],
     ...iconPaths.map((iconPath) => [`${SHELL_ORIGIN}${iconPath}`, 'image/svg+xml']),
     [SMOKE_PRODUCT_URL, 'text/html; charset=utf-8'],
     [SMOKE_PRODUCT_ROUTE_URL, 'text/html; charset=utf-8'],

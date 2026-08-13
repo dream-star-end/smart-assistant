@@ -8,6 +8,7 @@ import {
   BaseWindow,
   BrowserWindow,
   Menu,
+  Notification,
   WebContentsView,
   app,
   dialog,
@@ -18,6 +19,20 @@ import {
   shell,
 } from 'electron'
 
+import {
+  applyCaptionOverlay,
+  createWindowWithCaptionFallback,
+} from './desktop-chrome.mjs'
+import {
+  applyNavigationEnabled,
+  buildApplicationMenuTemplate,
+  buildMoreMenuTemplate,
+} from './desktop-menu.mjs'
+import {
+  canNotifyDownloadComplete,
+  createDownloadCompletedNotification,
+  shouldReleaseNotificationOnClose,
+} from './download-notify.mjs'
 import { DownloadRegistry, taskbarProgressState } from './download-registry.mjs'
 import { IPC_CHANNELS, isTrustedShellEvent, parseShellCommand } from './ipc-contract.mjs'
 import { permissionDecision } from './permission-adapter.mjs'
@@ -56,6 +71,13 @@ import {
   registerShellProtocol,
   registerShellScheme,
 } from './shell-protocol.mjs'
+import {
+  clickElementWithInput,
+  sendKeyWithInput,
+  waitForCondition,
+  waitForViewLayout,
+  waitForWebContentsEvent,
+} from './smoke-harness.mjs'
 import { TOOLBAR_HEIGHT, calculateViewBounds } from './window-layout.mjs'
 import {
   DEFAULT_WINDOW_STATE,
@@ -75,7 +97,7 @@ import {
 const APP_ID = 'chat.claudeai.aurora'
 const APP_NAME = 'OpenClaude Aurora'
 const SHELL_PARTITION = 'openclaude-v5-shell-v1'
-const SMOKE_TIMEOUT_MS = 15_000
+const SMOKE_TIMEOUT_MS = 25_000
 const ZOOM_MIN = 0.5
 const ZOOM_MAX = 3
 const ZOOM_STEP = 0.1
@@ -101,6 +123,9 @@ let detachWindowState = null
 let removeWindowListeners = null
 let creatingMainWindow = null
 let smokeMenuOpenCount = 0
+let overlayActive = false
+let applicationMenu = null
+const liveNotifications = new Set()
 
 const viewerWindows = new Set()
 const configuredProductSessions = new WeakSet()
@@ -475,11 +500,29 @@ function installDownloadPolicy(desktopSession, appOrigin) {
     })
     item.once('done', (_doneEvent, state) => {
       if (state === 'completed') {
-        downloads.complete(id, {
+        const completed = downloads.complete(id, {
           filePath: item.getSavePath(),
           receivedBytes: item.getReceivedBytes(),
           totalBytes: item.getTotalBytes(),
         })
+        if (
+          canNotifyDownloadComplete({
+            completed,
+            windowAlive: isAlive(mainWindow),
+            smokeTest,
+          })
+        ) {
+          createDownloadCompletedNotification({
+            NotificationImpl: Notification,
+            id,
+            registry: liveNotifications,
+            releaseOnClose: shouldReleaseNotificationOnClose(process.platform),
+            onShowDownload: (downloadId) => {
+              if (!isAlive(mainWindow)) return
+              void showRegisteredDownload(downloadId)
+            },
+          })
+        }
       } else {
         downloads.fail(id, state === 'cancelled' ? 'cancelled' : 'interrupted')
       }
@@ -541,10 +584,12 @@ function shellStateSnapshot() {
     error: productState.error,
     shellMode,
     zoomFactor,
+    overlayActive,
   }
 }
 
 function pushShellState() {
+  refreshApplicationMenuEnabled()
   const shellWebContents = shellView?.webContents
   if (!shellReady || !shellWebContents || shellWebContents.isDestroyed()) return
   shellWebContents.send(IPC_CHANNELS.state, shellStateSnapshot())
@@ -679,6 +724,35 @@ function adjustProductZoom(delta) {
   return setProductZoom(productWebContents.getZoomFactor() + delta)
 }
 
+function menuActions() {
+  return {
+    back: goBack,
+    forward: goForward,
+    reload: reloadProduct,
+    home: homeProduct,
+    zoomIn: () => adjustProductZoom(ZOOM_STEP),
+    zoomOut: () => adjustProductZoom(-ZOOM_STEP),
+    zoomReset: () => setProductZoom(1),
+    openDownloadsFolder,
+  }
+}
+
+function refreshApplicationMenuEnabled() {
+  if (!applicationMenu) return
+  applyNavigationEnabled(applicationMenu, navigationSnapshot())
+}
+
+function installApplicationMenu() {
+  applicationMenu = Menu.buildFromTemplate(
+    buildApplicationMenuTemplate({
+      platform: process.platform,
+      actions: menuActions(),
+      navigation: navigationSnapshot(),
+    }),
+  )
+  Menu.setApplicationMenu(applicationMenu)
+}
+
 function desktopActions(source = 'product') {
   return {
     back: goBack,
@@ -691,32 +765,6 @@ function desktopActions(source = 'product') {
   }
 }
 
-function buildMoreMenuTemplate() {
-  const navigation = navigationSnapshot()
-  return [
-    {
-      label: '后退',
-      accelerator: 'Alt+Left',
-      enabled: navigation.canGoBack,
-      click: () => goBack(),
-    },
-    {
-      label: '前进',
-      accelerator: 'Alt+Right',
-      enabled: navigation.canGoForward,
-      click: () => goForward(),
-    },
-    { label: '重新加载', accelerator: 'CmdOrCtrl+R', click: () => reloadProduct() },
-    { label: '主页', click: () => homeProduct() },
-    { type: 'separator' },
-    { label: '放大', accelerator: 'CmdOrCtrl+Plus', click: () => adjustProductZoom(ZOOM_STEP) },
-    { label: '缩小', accelerator: 'CmdOrCtrl+-', click: () => adjustProductZoom(-ZOOM_STEP) },
-    { label: '重置缩放', accelerator: 'CmdOrCtrl+0', click: () => setProductZoom(1) },
-    { type: 'separator' },
-    { label: '打开下载文件夹', click: () => openDownloadsFolder() },
-  ]
-}
-
 function openMoreMenu() {
   if (!canOpenMoreMenu(shellMode) || !isAlive(mainWindow)) return false
   if (smokeTest) {
@@ -725,7 +773,13 @@ function openMoreMenu() {
     return true
   }
 
-  const menu = Menu.buildFromTemplate(buildMoreMenuTemplate())
+  const menu = Menu.buildFromTemplate(
+    buildMoreMenuTemplate({
+      platform: process.platform,
+      actions: menuActions(),
+      navigation: navigationSnapshot(),
+    }),
+  )
   menu.popup({
     window: mainWindow,
     callback: () => focusProduct(),
@@ -863,6 +917,7 @@ function installWindowLifecycle(window, localShellView, localProductView) {
       transparencyEnabled: !reduceTransparency,
       reduceTransparency,
     })
+    applyCaptionOverlay(window, { overlayActive, nativeTheme })
     pushShellState()
   }
   const onDisplayChanged = () => {
@@ -927,7 +982,9 @@ function installWindowLifecycle(window, localShellView, localProductView) {
     closeWebContentsView(localShellView)
     closeWebContentsView(localProductView)
     downloads.clear()
+    liveNotifications.clear()
     shellReady = false
+    overlayActive = false
     if (mainWindow === window) mainWindow = null
     if (shellView === localShellView) shellView = null
     if (productView === localProductView) productView = null
@@ -953,18 +1010,28 @@ async function createMainWindow({ startUrl, appOrigin, isSmoke = false } = {}) {
     initialState = await windowStateStore.load({ workAreas: screen.getAllDisplays() })
   }
 
-  const window = new BaseWindow({
-    ...(Number.isFinite(initialState.x) ? { x: initialState.x } : {}),
-    ...(Number.isFinite(initialState.y) ? { y: initialState.y } : {}),
-    width: initialState.width,
-    height: initialState.height,
-    minWidth: MIN_WINDOW_WIDTH,
-    minHeight: MIN_WINDOW_HEIGHT,
-    show: false,
-    autoHideMenuBar: true,
-    title: APP_NAME,
-    backgroundColor: '#202020',
+  const { window, overlayActive: createdOverlay } = createWindowWithCaptionFallback({
+    platform: process.platform,
+    theme: {
+      dark: nativeTheme.shouldUseDarkColors === true,
+      forcedColors:
+        nativeTheme.inForcedColorsMode === true || nativeTheme.shouldUseHighContrastColors === true,
+    },
+    extraOptions: {
+      ...(Number.isFinite(initialState.x) ? { x: initialState.x } : {}),
+      ...(Number.isFinite(initialState.y) ? { y: initialState.y } : {}),
+      width: initialState.width,
+      height: initialState.height,
+      minWidth: MIN_WINDOW_WIDTH,
+      minHeight: MIN_WINDOW_HEIGHT,
+      show: false,
+      autoHideMenuBar: true,
+      title: APP_NAME,
+      backgroundColor: '#202020',
+    },
+    createWindow: (options) => new BaseWindow(options),
   })
+  overlayActive = createdOverlay
   window.accessibleTitle = APP_NAME
   mainWindow = window
 
@@ -1017,117 +1084,6 @@ async function createMainWindow({ startUrl, appOrigin, isSmoke = false } = {}) {
   else void productLoad
 
   return { window, shellView: localShellView, productView: localProductView }
-}
-
-function waitForCondition(check, message, timeoutMs = 4_000) {
-  return new Promise((resolve, reject) => {
-    const deadline = Date.now() + timeoutMs
-    const poll = async () => {
-      try {
-        if (await check()) {
-          resolve()
-          return
-        }
-      } catch (error) {
-        reject(error)
-        return
-      }
-      if (Date.now() >= deadline) {
-        reject(new Error(message))
-        return
-      }
-      setTimeout(poll, 25)
-    }
-    void poll()
-  })
-}
-
-function waitForWebContentsEvent(webContents, eventName, timeoutMs = 4_000) {
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      webContents.removeListener(eventName, onEvent)
-      reject(new Error(`timed out waiting for ${eventName}`))
-    }, timeoutMs)
-    const onEvent = (...args) => {
-      clearTimeout(timeout)
-      resolve(args)
-    }
-    webContents.once(eventName, onEvent)
-  })
-}
-
-async function elementCenter(webContents, selector) {
-  const point = await webContents.executeJavaScript(`((selector) => {
-    const element = document.querySelector(selector)
-    if (!element) return null
-    const bounds = element.getBoundingClientRect()
-    const style = getComputedStyle(element)
-    if (
-      bounds.width <= 0 ||
-      bounds.height <= 0 ||
-      style.display === 'none' ||
-      style.visibility === 'hidden' ||
-      style.pointerEvents === 'none'
-    ) {
-      return null
-    }
-    return {
-      x: Math.floor(bounds.left + bounds.width / 2),
-      y: Math.floor(bounds.top + bounds.height / 2),
-    }
-  })(${JSON.stringify(selector)})`)
-  assert.ok(point, `expected ${selector} to be visible and interactive`)
-  return point
-}
-
-async function clickElementWithInput(window, webContents, selector) {
-  await focusWebContentsForInput(window, webContents, `click ${selector}`)
-  const point = await elementCenter(webContents, selector)
-  webContents.sendInputEvent({ type: 'mouseMove', ...point })
-  webContents.sendInputEvent({ type: 'mouseDown', button: 'left', clickCount: 1, ...point })
-  await new Promise((resolve) => setTimeout(resolve, 20))
-  webContents.sendInputEvent({ type: 'mouseUp', button: 'left', clickCount: 1, ...point })
-  await new Promise((resolve) => setTimeout(resolve, 20))
-}
-
-async function focusWebContentsForInput(window, webContents, action) {
-  await waitForCondition(
-    async () => {
-      if (!isAlive(window)) return false
-      if (!window.isVisible()) window.show()
-      window.focus()
-      webContents.focus()
-      await webContents.executeJavaScript(
-        'new Promise((resolve) => requestAnimationFrame(resolve))',
-      )
-      return window.isFocused() && webContents.isFocused()
-    },
-    `host window and target WebContents did not acquire native focus for ${action}`,
-  ).catch((error) => {
-    throw new Error(
-      `${error.message}; windowFocused=${window?.isFocused?.() === true}; ` +
-        `webContentsFocused=${webContents.isFocused()}`,
-    )
-  })
-}
-
-async function sendKeyWithInput(window, webContents, keyCode, modifiers = []) {
-  await focusWebContentsForInput(window, webContents, `key ${keyCode}`)
-  webContents.sendInputEvent({ type: 'keyDown', keyCode, modifiers })
-  webContents.sendInputEvent({ type: 'keyUp', keyCode, modifiers })
-}
-
-async function waitForViewLayout(window, shell, product, width, height, mode = shellMode) {
-  window.setContentSize(width, height)
-  await waitForCondition(() => {
-    const bounds = window.getContentBounds()
-    if (bounds.width !== width || bounds.height !== height) return false
-    const expected = calculateViewBounds(bounds, { shellMode: mode })
-    return (
-      JSON.stringify(shell.getBounds()) === JSON.stringify(expected.shell) &&
-      JSON.stringify(product.getBounds()) === JSON.stringify(expected.product)
-    )
-  }, `child view bounds did not match ${width}x${height}`)
 }
 
 async function writeOptionalSmokeScreenshot({
@@ -1263,6 +1219,115 @@ async function writeOptionalToolbarScreenshots({
   return true
 }
 
+const SHELL_CHROME_CONTRACT_SCRIPT = `(() => {
+  const overlayActive = document.documentElement.dataset.overlayActive === 'true'
+  const region = (selector) => getComputedStyle(document.querySelector(selector)).webkitAppRegion
+  const hitRect = (selector) => {
+    const bounds = document.querySelector(selector).getBoundingClientRect()
+    return { left: bounds.left, right: bounds.right, top: bounds.top, bottom: bounds.bottom }
+  }
+  function envNumber(name) {
+    const probe = document.createElement('div')
+    probe.style.position = 'absolute'
+    probe.style.width = 'env(' + name + ', -1px)'
+    document.body.append(probe)
+    const value = Number.parseFloat(getComputedStyle(probe).width)
+    probe.remove()
+    return Number.isFinite(value) ? value : -1
+  }
+  return {
+    overlayActive,
+    brandRegion: region('.brand'),
+    spacerRegion: region('.command-spacer'),
+    downloadsRegion: region('#downloads-button'),
+    moreRegion: region('#more-menu-button'),
+    statusRegion: region('#connection-status'),
+    downloads: hitRect('#downloads-button'),
+    more: hitRect('#more-menu-button'),
+    status: hitRect('#connection-status'),
+    brand: hitRect('.brand'),
+    statusVisible: document.querySelector('#connection-status').getBoundingClientRect().width > 0,
+    titlebarAreaX: envNumber('titlebar-area-x'),
+    titlebarAreaWidth: envNumber('titlebar-area-width'),
+    titlebarAreaHeight: envNumber('titlebar-area-height'),
+    wcoReady: document.documentElement.dataset.wcoReady,
+    paddingRight: Number.parseFloat(getComputedStyle(document.querySelector('.command-surface')).paddingRight),
+    moreRight: document.querySelector('#more-menu-button').getBoundingClientRect().right,
+    surfaceRight: document.querySelector('.command-surface').getBoundingClientRect().right,
+  }
+})()`
+
+function overlayChromeSettled(chromeContract, overlayIsActive) {
+  if (!chromeContract || chromeContract.overlayActive !== overlayIsActive) return false
+  if (overlayIsActive !== true) return chromeContract.wcoReady === 'false'
+  if (chromeContract.wcoReady === 'true') {
+    return chromeContract.titlebarAreaWidth > 0 && chromeContract.titlebarAreaHeight > 0
+  }
+  return (
+    chromeContract.wcoReady === 'false' &&
+    chromeContract.paddingRight >= 139 &&
+    chromeContract.moreRight <= chromeContract.surfaceRight - 139
+  )
+}
+
+function assertShellChromeContract(chromeContract, overlayIsActive) {
+  assert.equal(chromeContract.overlayActive, overlayIsActive)
+  assert.equal(chromeContract.downloadsRegion, 'no-drag')
+  assert.equal(chromeContract.moreRegion, 'no-drag')
+  assert.equal(chromeContract.statusRegion, 'no-drag')
+  if (overlayIsActive !== true) {
+    assert.equal(chromeContract.wcoReady, 'false')
+    assert.notEqual(chromeContract.brandRegion, 'drag')
+    assert.notEqual(chromeContract.spacerRegion, 'drag')
+    return
+  }
+  if (chromeContract.wcoReady === 'true') {
+    assert.ok(chromeContract.titlebarAreaWidth > 0, 'win32 overlay must expose a positive WCO width')
+    assert.ok(
+      chromeContract.titlebarAreaHeight > 0,
+      'win32 overlay must expose a positive WCO height',
+    )
+    assert.equal(chromeContract.brandRegion, 'drag')
+    assert.equal(chromeContract.spacerRegion, 'drag')
+    const safeLeft = chromeContract.titlebarAreaX
+    const safeRight = chromeContract.titlebarAreaX + chromeContract.titlebarAreaWidth
+    const safeTop = 0
+    const safeBottom = chromeContract.titlebarAreaHeight
+    const names = ['downloads', 'more', 'brand']
+    if (chromeContract.statusVisible) names.push('status')
+    for (const name of names) {
+      assert.ok(chromeContract[name].left >= safeLeft - 1, `${name} left escaped WCO safe area`)
+      assert.ok(chromeContract[name].right <= safeRight + 1, `${name} right escaped WCO safe area`)
+      assert.ok(chromeContract[name].top >= safeTop - 1, `${name} top escaped WCO safe area`)
+      assert.ok(chromeContract[name].bottom <= safeBottom + 1, `${name} bottom escaped WCO safe area`)
+    }
+    return
+  }
+  assert.equal(chromeContract.wcoReady, 'false')
+  assert.ok(chromeContract.paddingRight >= 139, 'unready overlay must reserve caption-button space')
+  assert.notEqual(chromeContract.brandRegion, 'drag')
+  assert.notEqual(chromeContract.spacerRegion, 'drag')
+  assert.ok(
+    chromeContract.moreRight <= chromeContract.surfaceRight - 139,
+    'More button entered the unready caption reserve',
+  )
+}
+
+async function waitForShellChromeContract(shellContents, overlayIsActive, message) {
+  let chromeContract = null
+  await waitForCondition(
+    async () => {
+      chromeContract = await shellContents.executeJavaScript(SHELL_CHROME_CONTRACT_SCRIPT)
+      return overlayChromeSettled(chromeContract, overlayIsActive)
+    },
+    message,
+  ).catch((error) => {
+    throw new Error(`${error.message}; last state: ${JSON.stringify(chromeContract)}`)
+  })
+  assertShellChromeContract(chromeContract, overlayIsActive)
+  return chromeContract
+}
+
 async function runSmokeContract() {
   smokeMenuOpenCount = 0
   const context = await createMainWindow({
@@ -1307,6 +1372,77 @@ async function runSmokeContract() {
   await waitForCondition(
     () => shellContents.executeJavaScript('window.__auroraSmokeStates.length > 0'),
     'trusted shell did not receive an initial state snapshot',
+  )
+
+  await waitForShellChromeContract(
+    shellContents,
+    overlayActive,
+    'shell did not report caption overlay chrome contract',
+  )
+
+  let unreadyOverlay = null
+  await waitForCondition(
+    async () => {
+      unreadyOverlay = await shellContents.executeJavaScript(`(() => {
+        const root = document.documentElement
+        root.dataset.overlayActive = 'true'
+        root.dataset.wcoReady = 'false'
+        const surface = document.querySelector('.command-surface')
+        const more = document.querySelector('#more-menu-button').getBoundingClientRect()
+        const surfaceBox = surface.getBoundingClientRect()
+        return {
+          brandRegion: getComputedStyle(document.querySelector('.brand')).webkitAppRegion,
+          moreRegion: getComputedStyle(document.querySelector('#more-menu-button')).webkitAppRegion,
+          paddingRight: Number.parseFloat(getComputedStyle(surface).paddingRight),
+          moreRight: more.right,
+          surfaceRight: surfaceBox.right,
+        }
+      })()`)
+      return (
+        unreadyOverlay &&
+        unreadyOverlay.paddingRight >= 139 &&
+        unreadyOverlay.brandRegion !== 'drag' &&
+        unreadyOverlay.moreRegion === 'no-drag'
+      )
+    },
+    'unready overlay did not keep controls out of the caption-button reserve',
+  ).catch((error) => {
+    throw new Error(`${error.message}; last state: ${JSON.stringify(unreadyOverlay)}`)
+  })
+  assert.ok(
+    unreadyOverlay.moreRight <= unreadyOverlay.surfaceRight - 139,
+    'More button entered the unready caption reserve',
+  )
+  pushShellState()
+  await waitForShellChromeContract(
+    shellContents,
+    overlayActive,
+    'shell did not restore chrome contract after unready overlay probe',
+  )
+
+  const wcoSyncBefore = Number.parseInt(
+    await shellContents.executeJavaScript('document.documentElement.dataset.wcoSyncCount || "0"'),
+    10,
+  )
+  const overlayApiPresent = await shellContents.executeJavaScript(
+    'Boolean(navigator.windowControlsOverlay && typeof navigator.windowControlsOverlay.addEventListener === "function")',
+  )
+  await shellContents.executeJavaScript(`(() => {
+    window.dispatchEvent(new Event('resize'))
+    const overlay = navigator.windowControlsOverlay
+    if (overlay && typeof overlay.dispatchEvent === 'function') {
+      overlay.dispatchEvent(new Event('geometrychange'))
+    }
+  })()`)
+  await waitForCondition(
+    async () => {
+      const count = Number.parseInt(
+        await shellContents.executeJavaScript('document.documentElement.dataset.wcoSyncCount || "0"'),
+        10,
+      )
+      return count >= wcoSyncBefore + (overlayApiPresent ? 2 : 1)
+    },
+    'WCO geometry listeners did not remeasure after resize/geometrychange',
   )
 
   shellContents.send(IPC_CHANNELS.state, {
@@ -1489,17 +1625,29 @@ async function runSmokeContract() {
   )
   assert.ok(nextReloadCount > reloadCount)
 
-  const menuTemplate = buildMoreMenuTemplate()
+  const menuTemplate = buildMoreMenuTemplate({
+    platform: process.platform,
+    actions: menuActions(),
+    navigation: navigationSnapshot(),
+  })
   assert.equal(buildMoreMenuTemplate.length, 0)
   assert.equal(openMoreMenu.length, 0)
   assert.deepEqual(
     menuTemplate.filter((item) => item.type !== 'separator').map((item) => item.label),
     ['后退', '前进', '重新加载', '主页', '放大', '缩小', '重置缩放', '打开下载文件夹'],
   )
-  assert.deepEqual(
-    menuTemplate.filter((item) => item.accelerator).map((item) => item.accelerator),
-    ['Alt+Left', 'Alt+Right', 'CmdOrCtrl+R', 'CmdOrCtrl+Plus', 'CmdOrCtrl+-', 'CmdOrCtrl+0'],
-  )
+  if (process.platform === 'darwin') {
+    assert.equal(menuTemplate.filter((item) => item.accelerator).length, 0)
+  } else {
+    assert.deepEqual(
+      menuTemplate.filter((item) => item.accelerator).map((item) => item.accelerator),
+      ['Alt+Left', 'Alt+Right', 'CmdOrCtrl+R', 'CmdOrCtrl+Plus', 'CmdOrCtrl+-', 'CmdOrCtrl+0'],
+    )
+    assert.equal(
+      menuTemplate.filter((item) => item.accelerator).every((item) => item.registerAccelerator === false),
+      true,
+    )
+  }
   assert.equal(menuTemplate.filter((item) => typeof item.click === 'function').length, 8)
   assert.equal(menuTemplate[0].enabled, navigationSnapshot().canGoBack)
   assert.equal(menuTemplate[1].enabled, navigationSnapshot().canGoForward)
@@ -1734,6 +1882,36 @@ async function runSmokeContract() {
   window.setMinimumSize(1, 1)
   await waitForViewLayout(window, smokeShellView, smokeProductView, 520, 360, 'toolbar')
   await waitForViewLayout(window, smokeShellView, smokeProductView, 1366, 768, 'toolbar')
+  await shellContents.executeJavaScript('window.dispatchEvent(new Event("resize"))')
+  await waitForShellChromeContract(
+    shellContents,
+    overlayActive,
+    'shell chrome contract drifted after resize',
+  )
+  if (overlayActive && typeof window.maximize === 'function' && typeof window.unmaximize === 'function') {
+    window.maximize()
+    await waitForCondition(
+      () => window.isMaximized() === true,
+      'window did not enter maximized state',
+    )
+    await shellContents.executeJavaScript('window.dispatchEvent(new Event("resize"))')
+    await waitForShellChromeContract(
+      shellContents,
+      overlayActive,
+      'shell chrome contract drifted after maximize',
+    )
+    window.unmaximize()
+    await waitForCondition(
+      () => window.isMaximized() === false,
+      'window did not leave maximized state',
+    )
+    await waitForViewLayout(window, smokeShellView, smokeProductView, 1366, 768, 'toolbar')
+    await waitForShellChromeContract(
+      shellContents,
+      overlayActive,
+      'shell chrome contract drifted after unmaximize',
+    )
+  }
 
   await shellContents.executeJavaScript('window.__auroraSmokeUnsubscribe()')
   window.close()
@@ -1829,7 +2007,7 @@ if (!hasSingleInstanceLock) {
   app
     .whenReady()
     .then(async () => {
-      Menu.setApplicationMenu(null)
+      installApplicationMenu()
       if (!smokeTest && process.platform === 'win32') installJumpList({ app })
       if (smokeTest) {
         const exitCode = await runSmokeTest()

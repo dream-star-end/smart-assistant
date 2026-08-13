@@ -1,3 +1,5 @@
+import { attachWcoGeometryListeners, isPositiveTitlebarGeometry } from './wco-geometry.mjs'
+
 const fixtureName = document.documentElement.dataset.auroraFixture
 
 if (fixtureName === 'smoke-product') {
@@ -78,9 +80,30 @@ function initializeShell() {
     error: null,
     shellMode: 'toolbar',
     zoomFactor: 1,
+    overlayActive: false,
   }
   let state = initialState
   let previousMode = initialState.shellMode
+
+  function measureWcoReady(overlayIsActive) {
+    if (overlayIsActive !== true) return false
+    const probe = document.createElement('div')
+    probe.style.position = 'absolute'
+    probe.style.width = 'env(titlebar-area-width, -1px)'
+    probe.style.height = 'env(titlebar-area-height, -1px)'
+    document.body.append(probe)
+    const style = getComputedStyle(probe)
+    const width = Number.parseFloat(style.width)
+    const height = Number.parseFloat(style.height)
+    probe.remove()
+    return isPositiveTitlebarGeometry(width, height)
+  }
+
+  function syncWcoReady() {
+    document.documentElement.dataset.wcoReady = String(measureWcoReady(state.overlayActive === true))
+    const next = Number.parseInt(document.documentElement.dataset.wcoSyncCount || '0', 10) + 1
+    document.documentElement.dataset.wcoSyncCount = String(Number.isFinite(next) ? next : 1)
+  }
 
   function send(type, details = null) {
     try {
@@ -135,6 +158,7 @@ function initializeShell() {
         typeof value.zoomFactor === 'number' && Number.isFinite(value.zoomFactor)
           ? value.zoomFactor
           : 1,
+      overlayActive: value.overlayActive === true,
     }
   }
 
@@ -308,6 +332,8 @@ function initializeShell() {
     document.documentElement.dataset.theme = state.theme.mode
     document.documentElement.dataset.forcedColors = String(state.theme.forcedColors)
     document.documentElement.dataset.reduceTransparency = String(state.theme.reduceTransparency)
+    document.documentElement.dataset.overlayActive = String(state.overlayActive === true)
+    syncWcoReady()
     const transparencyAllowed = !state.theme.forcedColors && !state.theme.reduceTransparency
     elements.commandSurface.classList.toggle('allow-transparency', transparencyAllowed)
     elements.commandSurface.classList.toggle('reduce-transparency', !transparencyAllowed)
@@ -353,6 +379,11 @@ function initializeShell() {
 
   window.addEventListener('offline', () => render({ ...state, network: 'offline' }))
   window.addEventListener('online', () => render({ ...state, network: 'online' }))
+  attachWcoGeometryListeners({
+    window,
+    overlay: globalThis.navigator?.windowControlsOverlay,
+    onChange: syncWcoReady,
+  })
 
   render(initialState)
   document.documentElement.dataset.initialTransparencyAllowed = String(
