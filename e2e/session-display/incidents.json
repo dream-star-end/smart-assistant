@@ -1295,6 +1295,30 @@
           "assertion": "T30 视频任务中心持久排队、实时进度与跨 worker 取消终态"
         }
       ]
+    },
+    {
+      "id": "INC-20260813-LIVE-REPLAY-GENERATION",
+      "occurredAt": "2026-08-13",
+      "severity": "P1",
+      "symptom": "Agent 执行期间刷新页面后，旧容器的高位持久化帧游标吞掉新容器从 1 重新开始的实时帧，页面永久停留在「正在恢复实时内容」且已生成内容不可见。",
+      "rootFixCommit": "7d44e0a4",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "durable journal resets the reducer cursor when a replacement container restarts frameSeq"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "durable generation boundary does not replay a new live cursor above the old high-water mark"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T39 刷新跨容器代际恢复：旧高游标不再吞掉新容器实时内容"
+        }
+      ]
     }
   ]
 }
