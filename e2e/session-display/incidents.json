@@ -1362,6 +1362,30 @@
           "assertion": "candidate Cursor authority ticket consume gate"
         }
       ]
+    },
+    {
+      "id": "INC-20260813-CURSOR-STREAM-JSON",
+      "occurredAt": "2026-08-13",
+      "severity": "P1",
+      "symptom": "Cursor 官方 CLI 已返回正确答案，但一等 adapter 把嵌套 assistant.message 对象序列化成文本，并再次追加最终聚合事件，导致前台展示 JSON 且答案重复。",
+      "rootFixCommit": "f63f06c1",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorAdapter.test.ts",
+          "assertion": "parses pinned official stream-json without duplicating the final assistant flush"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorAdapter.test.ts",
+          "assertion": "parses pinned official tool_call started/completed, including completion-only calls"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/deploy-v5.sh",
+          "assertion": "candidate Cursor stream-json parser gate"
+        }
+      ]
     }
   ]
 }
