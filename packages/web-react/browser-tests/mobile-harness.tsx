@@ -117,8 +117,6 @@ function MobileChatPage() {
           agent={MOBILE_AGENT}
           onAgentClick={() => {}}
           models={MOBILE_MODELS}
-          selectedModelId={modelId}
-          onSelectModel={setModelId}
           credits="123456"
           onOpenBilling={() => {}}
           onNew={() => {}}
@@ -151,6 +149,9 @@ function MobileChatPage() {
               window.__mobilePage.sends.push({ text, mediaCount: media?.length ?? 0 });
             }}
             placeholder="和「全能助手」对话…"
+            models={MOBILE_MODELS}
+            selectedModelId={modelId}
+            onSelectModel={setModelId}
             onUpload={async (file: File): Promise<MediaRef> => ({
               kind: "file",
               url: "https://stub.invalid/mobile",

@@ -7,7 +7,7 @@
       "mediaKey": "agents",
       "mediaVersion": 3,
       "registryHash": "94e8049f80ed0fcaca43608b1796cdd361d6f8dbb0fcb9a10b3e86121eb5aea6",
-      "sourceHash": "1f17b9818fae2f0b20d9accae874ba6b9bff71f6fdd81391acd40bb38e59e33d"
+      "sourceHash": "51e481f928df6b75c482248febae86acaf69a75d0722e4c35c98859e1b4bc8c8"
     },
     "artifacts-download": {
       "contentHash": "3c4e0d07709579bddddd1309d257599c2d4a8aec7e2ba633c4d1480a19402e33",
@@ -34,7 +34,7 @@
       "mediaKey": "chat-basics",
       "mediaVersion": 3,
       "registryHash": "343b05739f30ffb4df16583570adcf768ad03a8f0df19d80097465aec77dc35f",
-      "sourceHash": "c8cbea5cc040d5ad09a04bdfb2ce52f37fa3cb422e8d5909324433af29a2fd48"
+      "sourceHash": "7ce7f7d5ec3f4a681632bc54ae1acbca6c3f9420ab677a0807df2e583b3c2791"
     },
     "connectors": {
       "contentHash": "3273aeac669b33e701c19aad3473ab19adc5e6f0db455d0a975ea2927b0d3b48",
@@ -133,7 +133,7 @@
       "mediaKey": "models-reasoning",
       "mediaVersion": 2,
       "registryHash": "e7810af073bb4425162754c943fdd589c374280ccb614bf6e17596eac69ca180",
-      "sourceHash": "4317757d80e765f54149d5e3a1279c780695752315cdef0a3cad3ab3e5950eb7"
+      "sourceHash": "786f9f6dd22fab01d0e20588a97c87b1d5242fa8c896594c4762167bc5da3046"
     },
     "organization": {
       "contentHash": "7cb835c5e2b81ac2543f0f161a8e706139b7f5bafc5dae6080ab475b95e7e0dd",

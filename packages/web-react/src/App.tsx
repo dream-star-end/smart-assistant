@@ -2295,11 +2295,6 @@ export function App() {
           agent={agent}
           onAgentClick={() => setPickerOpen(true)}
           models={models}
-          selectedModelId={modelId}
-          onSelectModel={selectModel}
-          modelsLoading={modelsLoading}
-          // 团队模式知情指示:与 send 的生效条件同构(teamMode 只对 main 生效,
-          // 见上方 send 的 agent.id === "main" 判定)——顶栏所见 = 实际所发。
           teamModeActive={!demo && teamMode && agent.id === "main"}
           onDisableTeamMode={() => setTeamMode(false)}
           credits={demo ? null : (user?.credits ?? null)}
@@ -2460,6 +2455,11 @@ export function App() {
             repoSelection={demo ? null : repo.selection}
             onOpenRepo={demo ? undefined : openRepo}
             showRepoPill={!(showRail && boundRepo)}
+            models={models}
+            selectedModelId={modelId}
+            onSelectModel={selectModel}
+            modelsLoading={modelsLoading}
+            teamModeActive={!demo && teamMode && agent.id === "main"}
             goal={activeSess?.goalState}
             onSetGoal={demo ? undefined : setSessionGoal}
             onGoalAction={demo ? undefined : transitionSessionGoal}
