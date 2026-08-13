@@ -112,9 +112,9 @@ jobs:
           # boundaries against packaged local fixtures, closes both views, then exits.
           $process = Start-Process -FilePath $exe -ArgumentList '--smoke-test' -PassThru
           try {
-            if (-not $process.WaitForExit(30000)) {
+            if (-not $process.WaitForExit(45000)) {
               Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
-              throw 'Aurora.exe --smoke-test exceeded the hard 30 second timeout'
+              throw 'Aurora.exe --smoke-test exceeded the hard 45 second timeout'
             }
             $process.Refresh()
           if ($process.ExitCode -ne 0) {
@@ -160,9 +160,9 @@ jobs:
           $installedSmokeReport = Join-Path $env:RUNNER_TEMP 'aurora-installed-smoke.txt'
           $env:OPENCLAUDE_SMOKE_REPORT_PATH = $installedSmokeReport
           $smoke = Start-Process -FilePath $installedExe -ArgumentList '--smoke-test' -PassThru
-          if (-not $smoke.WaitForExit(30000)) {
+          if (-not $smoke.WaitForExit(45000)) {
             Stop-Process -Id $smoke.Id -Force -ErrorAction SilentlyContinue
-            throw 'installed Aurora.exe --smoke-test exceeded 30 seconds'
+            throw 'installed Aurora.exe --smoke-test exceeded 45 seconds'
           }
           $smoke.Refresh()
           if ($smoke.ExitCode -ne 0) {

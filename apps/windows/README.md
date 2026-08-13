@@ -29,7 +29,8 @@ BaseWindow
 
 ## Windows 适配
 
-- 参考 Codex 桌面版的信息层级，窗口顶部保留 44px 本地 app bar；标题固定为安装包内的
+- 参考 Codex 桌面版的信息层级，窗口顶部保留 44px 本地 app bar；Windows 上与系统 caption
+  通过 Electron Window Controls Overlay 合并，失败则回退标准标题栏。标题固定为安装包内的
   “Aurora / 桌面工作区”，不读取远端 DOM，也不伪造项目、任务或会话标题。
 - app bar 只承载下载状态和更多操作；后退、前进、刷新、主页、缩放与下载等桌面命令由
   Electron 原生 `Menu` 和既有键盘快捷键提供，不在远端产品区注入脚本。

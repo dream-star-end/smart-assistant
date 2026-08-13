@@ -1,6 +1,6 @@
 {
   "name": "@openclaude/windows-app",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "OpenClaude Aurora V5 hybrid Windows application",
   "private": true,
   "type": "module",
@@ -9,7 +9,7 @@
     "start": "electron .",
     "smoke": "electron . --smoke-test",
     "test": "node --test test/*.test.mjs",
-    "check": "node --check src/main.mjs && node --check src/product-view.mjs && node --check src/shell-protocol.mjs && node --check src/shell-mode.mjs && node --check src/shell-preload.cjs && node --check src/shell/shell.mjs && node --check src/permission-adapter.mjs && node --check src/security-policy.mjs && npm test",
+    "check": "node --check src/main.mjs && node --check src/product-view.mjs && node --check src/shell-protocol.mjs && node --check src/shell-mode.mjs && node --check src/shell-preload.cjs && node --check src/shell/shell.mjs && node --check src/shell/wco-geometry.mjs && node --check src/permission-adapter.mjs && node --check src/security-policy.mjs && node --check src/desktop-chrome.mjs && node --check src/desktop-menu.mjs && node --check src/download-notify.mjs && node --check src/smoke-harness.mjs && npm test",
     "pack": "electron-builder --dir --publish never",
     "dist:win": "electron-builder --win nsis --x64 --publish never"
   },
