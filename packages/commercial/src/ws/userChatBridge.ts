@@ -1068,6 +1068,12 @@ export interface UserChatBridgeDeps {
   /** Expire and release the exact durable Grok subscription lease. */
   releaseGrokRouteLease?: (accountId: bigint, slotId: string) => Promise<void>;
   /**
+   * Trusted UUID of the compute host running this bridge. Cursor credentials
+   * are mounted only by that host's local supervisor, so Cursor dispatch must
+   * match the container row to this exact host. Missing means fail closed.
+   */
+  selfHostId?: string | null;
+  /**
    * PR2 v1.0.66 — codex 真扣费三件套(必须同时注入或同时缺省)。
    *
    * - 注入(commercial 路径):codex inbound 帧走 preCheck → inflight journal →
@@ -1519,6 +1525,23 @@ export async function resolveTurnGoalState(
     }
     return { kind: "unavailable", err };
   }
+}
+
+/** Cursor may execute only in an active container owned by this bridge host. */
+export async function isCursorContainerOnSelfHost(
+  pgPool: Pool,
+  containerId: number,
+  uid: bigint,
+  selfHostId: string | null | undefined,
+): Promise<boolean> {
+  const trustedHostId = selfHostId?.trim();
+  if (!trustedHostId) return false;
+  const eligible = await pgPool.query<{ ok: number }>(
+    `SELECT 1 AS ok FROM agent_containers
+      WHERE id=$1 AND user_id=$2 AND state='active' AND host_uuid=$3::uuid`,
+    [containerId, uid, trustedHostId],
+  );
+  return eligible.rowCount === 1;
 }
 
 // ---------- 主入口 ----------------------------------------------------------
@@ -4582,14 +4605,15 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               sendErrorFrame(userWs, 'UNAUTHORIZED_MODEL', 'Cursor is not enabled for this account');
               return;
             }
-            // Local supervisor mounts the owner credential only when host_uuid
-            // is NULL. A remotely scheduled container must fail before forward.
-            const eligible = await deps.pgPool.query<{ ok: number }>(
-              `SELECT 1 AS ok FROM agent_containers
-                WHERE id=$1 AND user_id=$2 AND state='active' AND host_uuid IS NULL`,
-              [cid, uid],
+            // The local supervisor mounts the owner credential only on this
+            // compute host. Missing host identity and remote rows fail closed.
+            const eligible = await isCursorContainerOnSelfHost(
+              deps.pgPool,
+              cid,
+              uid,
+              deps.selfHostId,
             );
-            if (eligible.rowCount !== 1) {
+            if (!eligible) {
               rejectPromptQueueDispatch('CURSOR_UNAVAILABLE');
               sendErrorFrame(userWs, 'CURSOR_UNAVAILABLE', 'Cursor requires the account-owned local runtime');
               return;
