@@ -6,7 +6,8 @@
 > 分支：`feat/v5-workspace-git-stat`  
 > 配套审计：`docs/V5_WEB_CODEX_DESKTOP_ALIGNMENT.md` §2 / §4.2 PR8 / §5「git/文件树安全」  
 > 环境限制：本机没有 `oc-worktree` 注册表，按独立开发环境例外使用 `git worktree add`。  
-> Codex 威胁模型审 #1：**FAIL**（5 Finding）。#2：**FAIL**（父目录 symlink 绕过 `.git` segment）。#3：**PASS**（`/tmp/codex-workspace-inspect-threat-r3.txt`）。允许进入实现方案评审。
+> Codex 威胁模型审 #1：**FAIL**（5 Finding）。#2：**FAIL**（父目录 symlink 绕过 `.git` segment）。#3：**PASS**（`/tmp/codex-workspace-inspect-threat-r3.txt`）。  
+> 方案迟到审查（对照 `45bc8802e`）补了 4 条威胁模型缺口，已写入 T2 hermetic gitdir / T2 结束复核 / T5 子进程终止 / T6 净化契约。实现方案 #3 PASS 前仍禁止写生产代码。
 
 ---
 
@@ -136,15 +137,18 @@ XSS 不在本协议修复范围；本协议必须做到：**即便脚本能调 A
 - 工作树根与 list-dir 目标必须是**真实目录**，不是 symlink。`lstat` 为 symlink → 403 `PATH_DENIED`（作为目标时）或子项 `kind: "symlink"`（作为 child 时，无 `preview_path`，不展开）。这消除「`O_NOFOLLOW` vs 树内 symlink 目录可列」的矛盾。
 - 打开目标：`openSync(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)`，记下 fd。Linux 再 `realpath(/proc/self/fd/n)` 做前缀检查。
 - **`readdir` / child `lstat` 禁止退回原始目录 path。** Node 的 `fs.promises.opendir` **不接受数值 fd**，Linux 生产实现必须对**已验证 fd** 打开 `/proc/self/fd/<n>`（内核按该 inode 列目录，等价 openat），再对子项 `lstat('/proc/self/fd/<n>/'+name, {throwIfNoEntry})` 且 `O_NOFOLLOW`。darwin 单测没有 `/proc`：`lstat` 拒绝 symlink 目录 + `realpath` 前缀检查；注释标明生产路径是 `/proc/self/fd/<n>`，不在单测里假装 Linux fd 已覆盖。
-- git 采集 **fd/inode 锚定**：
-  1. `open` 工作树根（`O_DIRECTORY|O_NOFOLLOW`），记下 `fstat` 的 `dev/ino`。
-  2. Linux：`git -C /proc/self/fd/<n> ...`（cwd 绑在已打开的 inode，不跟随后续 rename）。darwin 测试退化为 `-C realpath` + 采集结束后再 `fstat` 比对。
-  3. 采集结束后再次 `fstat(fd)`；`dev/ino` 变化 → **丢弃全部结果**，504/409 `WORKSPACE_CHANGED`，不下发 branch/SHA/entries。
-  4. git 输出的路径仍走 T1 join+realpath；逃出则丢弃该条目。无路径的 live HEAD 依赖步骤 3，不单独信任。
-- git 必须 **hermetic**（Finding 2）：不能只设 `GIT_CONFIG_NOSYSTEM=1`。工作树 `.git/config` 仍会被 git 读取，agent 可写入 `core.fsmonitor` / hooks / `diff.external` / textconv。规定：
+- git 采集 **双 fd 锚定 + 受信临时 gitdir**（不得让 git 读攻击者可写的 `.git/config`）：
+  1. `lstat` + `open(O_DIRECTORY|O_NOFOLLOW)` 工作树根 → `wfd`；同样打开真实 `.git` 目录 → `gfd`。`.git` 为 symlink 或 gitfile（`gitdir:` 文件）→ 空态 `not_a_repo`，不跟随。
+  2. spawn **显式继承** `wfd`/`gfd`。argv 用 `--work-tree=/proc/self/fd/<wfd>`。**禁止**把 `--git-dir` 指到原始 `.git`（那会加载 local `filter.*.clean/process`、`core.worktree`、`include.path`）。
+  3. 另建受信临时 gitdir：只写入最小 `config`（无 `filter.*` / `include` / `core.worktree` / hooks / fsmonitor）、用 `O_NOFOLLOW` 从 `gfd` 拷贝 `HEAD`/`index`/`packed-refs` 及 HEAD 指向的单个 ref（任一段是 symlink 则失败）。objects 经 `objects/info/alternates` 指向 `/proc/self/fd/<gfd>/objects`。不拷贝、不 symlink 原始 `config`、`hooks`、`commondir`。`--git-dir` 只指向该临时目录。结束时删除临时目录。
+  4. 不能靠枚举 `filter.*` 再 `-c` 覆盖（竞态/漏项）。`--no-ext-diff --no-textconv` 仍加，但**不能**当作 filter 的替代。
+  5. 结束复核**不能**对同一打开 fd 再 `fstat`（rename 后 ino 不变，且旧 version 目录故意保留）。必须再读 `getRepoSnapshot`，比较 `status+selectionVersion+workspaceDir`，再 open 当前权威路径比 inode。失败 → 丢弃结果，**HTTP 409** `WORKSPACE_CHANGED`。
+  6. git 输出的路径仍走 T1 join+realpath；逃出则丢弃该条目。无路径的 live HEAD 依赖步骤 5，不单独信任。
+- git 必须 **hermetic**（env + 临时 gitdir + 子进程生命周期）：
   - env 白名单：`PATH`、`LC_ALL=C`、`GIT_CONFIG_NOSYSTEM=1`、`GIT_CONFIG_GLOBAL=/dev/null`、`GIT_TERMINAL_PROMPT=0`、`GIT_OPTIONAL_LOCKS=0`、`GIT_PAGER=cat`、`PAGER=cat`。不继承 `GIT_EXTERNAL_DIFF`、`GIT_TRACE`、`GIT_DIR`、`GIT_WORK_TREE`、`GIT_ASKPASS`。
-  - argv 强制：`-c core.hooksPath=/dev/null` `-c core.fsmonitor=` `-c diff.external=` `--no-optional-locks`；`diff`/`numstat` 加 `--no-ext-diff --no-textconv`。
+  - argv 另加：`--no-optional-locks` `--ignore-submodules=all` `--no-lazy-fetch`；`diff`/`numstat` 加 `--no-ext-diff --no-textconv`。
   - `status` / `numstat` / `rev-parse` 一律 `-z` 或单行 40-hex；**禁止**按换行切 path 再净化。
+  - 达 stdout/entries 上限必须 **关闭 pipe 并终止 git**（`SIGTERM` → 短等 → `SIGKILL`，始终 reap），stderr 独立限额并持续 drain；不得让 git 堵在满管道上占信号量。intentional truncation 是 200 + `truncated`；timeout 是 504 无 body。
 - 内容读取的 TOCTOU 仍由现有 `openFileHardened` 关（本协议不读内容）。
 
 **测试：** 真实 `symlinkSync` 指向 `/etc`、指向 `git-creds`、指向工作树外；目录 swap 用例至少覆盖「list 目标是 symlink 且 target 在树外 → 403」。
@@ -216,8 +220,8 @@ list-dir / git 路径规范化仍额外拒绝 `.git` segment（纵深），但�
 |---|---|---|
 | git spawn 超时 | 5s | 504 `GIT_TIMEOUT`，**无部分 body** |
 | list-dir 超时 | 2s | 504 `LIST_TIMEOUT`，无部分 body |
-| git stdout | 1 MiB | 读到 cap 即停。若 `-z` 流在 cap 处截断导致最后一条不完整：**丢弃不完整记录**；`truncated: true` + `truncation.reason=stdout_limit`。合计数字仅在完整读完 numstat 时下发，否则 `diff: null`（禁止假 0） |
-| git entries | 500 | 解析满 500 条即停读；`truncated: true` + `reason=max_entries`。`omitted` **不**承诺精确剩余数（可为 `null` 或 `"unknown"`） |
+| git stdout | 1 MiB | 读到 cap 即**停消费、关 stdin/stdout、终止子进程并 reap**。若 `-z` 流在 cap 处截断导致最后一条不完整：**丢弃不完整记录**；`truncated: true` + `truncation.reason=stdout_limit`。合计数字仅在完整读完 numstat 时下发，否则 `diff: null`（禁止假 0） |
+| git entries | 500 | 解析满 500 条即停读并按上条终止 git；`truncated: true` + `reason=max_entries`。`omitted` **不**承诺精确剩余数（可为 `null` 或 `"unknown"`） |
 | list-dir entries | 200 | **流式 `opendir`**，读到 201 条即 stop。`truncated: true`；`omitted` 语义是「至少还有 1 条」，不是全量计数（全量计数等于把巨型目录扫完，与上限矛盾） |
 | JSON 字节预算 | 256 KiB | 边组装边计 UTF-8 字节，超预算停止追加 entries，标 `reason=byte_budget`。必须保证序列化后 < `containerApiProxy` 的 2 MiB 硬顶，否则会变 502 |
 | 相对路径深度 | 32 segment | 400 `BAD_PATH` |
@@ -230,13 +234,14 @@ Vendor 目录 `kind: skipped`，**不** `readdir` 展开。二进制：numstat �
 
 ### T6 输出净化
 
-git / `readdir` 可能吐出换行、ANSI、RTL override、`<script>` 文件名。
+git / `readdir` 可能吐出换行、ANSI、bidi override、`<script>` 文件名。选定契约（与「只去控制字符」一致，不再要求抹掉 HTML 标签字节）：
 
-- 每个 `name` / `path`：去掉 C0 + DEL + C1；拒绝内嵌 `NUL`。
+- 每个 `name` / `path`：删除 C0（U+0000–U+001F）、DEL（U+007F）、C1（U+0080–U+009F）、以及 bidi/isolate 控制符：U+061C、U+200E、U+200F、U+202A–U+202E、U+2066–U+2069。内嵌 `NUL` 的路径在解析阶段已 400。
+- **不**删除 `<` `>` `&`。`JSON.stringify` 会保留 `<img>` 子串；这不是 XSS 漏洞。XSS 由 PR-B 用 textContent/text 节点渲染保证，本 PR 不把 HTML 标签当控制字符清掉。
+- 紧凑 `JSON.stringify`（不 pretty-print），保证 wire 上的 JSON 字符串值不含 raw C0/C1/DEL/bidi。换行在 JSON 里以 `\n` 转义出现是允许的（那是两字节 `\`+`n`，不是 U+000A）。
 - 不把路径写进普通 info 日志。warn 只用 `sessionId` + 错误码 + `rel` 的 hash 或截断到 64 且已净化的相对路径。
-- JSON 本身会转义；前端仍必须当文本渲染（PR-B 的责任）。本 PR 保证 wire 上没有 raw 控制字符。
 
-**测试：** 文件名含 `\n`、`\x1b[31m`、`<img>` → 返回体无那些字节。
+**测试：** 文件名含 `\n`、`\x1b[31m`、U+202E → `JSON.parse` 后的 `name` 不含这些码点，响应 buffer 不含 raw ESC/bidi。文件名含 `<img>` → 解析后的 name 可以含 `<img>`，**禁止**断言响应体没有 `<img>` 字节。
 
 ### T7 鉴权
 

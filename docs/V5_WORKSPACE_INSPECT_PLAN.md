@@ -1,7 +1,8 @@
 # V5 容器工作区 inspect — PR-A 实现方案
 
-> 威胁模型：`docs/V5_WORKSPACE_INSPECT_THREAT_MODEL.md`（Codex #3 **PASS**）  
-> 实现方案审 #1：**FAIL**（6 Finding）。本版已吸收；待 #2 PASS 才写生产代码。  
+> 威胁模型：`docs/V5_WORKSPACE_INSPECT_THREAT_MODEL.md`（Codex #3 **PASS**；迟到审查补丁已写入 T2/T5/T6）  
+> 实现方案审 #1：**FAIL**（6 Finding，已闭合于 `b685671d3`）。#2：**PASS**（只核对该 6 条）。  
+> 迟到审查（对照 `45bc8802e`）：**FAIL**，另 4 条硬 Finding（filter 执行、ACL 单一权威、子进程生命周期、T6 净化）。本版已吸收；待 #3 PASS 才写生产代码。  
 > 本轮：**纯后端**。合入后前端零行为变化。PR-B 不做。不部署、不合入。  
 > 基线：`origin/feat/v5-aurora-rewrite` @ `e4f3fc930`  
 > 分支：`feat/v5-workspace-git-stat`
@@ -15,8 +16,9 @@
 | 包 | 文件 | 做什么 |
 |---|---|---|
 | protocol | `src/workspaceInspect.ts` + `index.ts` export | 常量、错误码、JSON 形状（无 IO） |
-| gateway | `src/workspaceInspect.ts`（新） | 路径、hermetic git、list-dir、信号量 |
-| gateway | `src/server.ts` | `FILE_BLOCKED_PATTERNS`；`handleApiFile` lexical `.git` 预检；两条 HTTP handler；dispatch |
+| gateway | `src/workspaceInspect.ts`（新） | 路径、受信 gitdir、list-dir、信号量。**禁止** import `server.ts` |
+| gateway | `src/sessionRepoWorkspace.ts` | 导出 sessionId 校验与 reposRoot；`resolveReadyWorkspace` 权威方法 |
+| gateway | `src/server.ts` | `FILE_BLOCKED_PATTERNS`；`handleApiFile` lexical `.git` 预检；两条 HTTP handler；向采集层 **注入** 同一套 `isFileAllowed`/`isFileBlocked`/`getRepoSnapshot` |
 | gateway | `src/bridgeApiAllowlist.ts` | GET 两条，`proxyFromCommercial: true` |
 | gateway | `src/index.ts` | 如需 re-export 采集层给 commercial 测试（尽量不） |
 | commercial | `src/http/router.ts` | BLOCKED 兜底；admin host-scope **terminal 403（在 proxy deps 闸外）**；`COMMERCIAL_ROUTE_PREFIXES` 加 `/api/workspace/`（注意尾斜杠） |
@@ -68,15 +70,19 @@ Vendor/VCS skip 名：`node_modules` `.git` `.svn` `.hg` `.venv` `venv` `__pycac
 
 ## 4. gateway 采集层
 
-### 4.1 工作区根
+### 4.1 工作区根与单一权威（禁止第二套 ACL / 第二套 root）
 
-`getRepoSnapshot(sessionId)`，`status==='ready'`，`workspaceDir` 绝对。`realpath(workspaceDir)` 必须 `=== reposRoot/sessionId/version` 或以其 `+'/'` 为前缀。`reposRoot = realpath('/home/agent/.openclaude/repos')`（测试可注入）。否则空态，不扫 cwd / `/home/agent`。
+`workspaceInspect.ts` **禁止** `import` `server.ts`（否则与 `server.ts → workspaceInspect.ts` 循环）。也禁止复制 `isFileAllowed` / `isFileBlocked` / `FILE_BLOCKED_PATTERNS` / `SESSION_ID_RE` / `REPOS_ROOT`。
 
-无 `OC_CONTAINER_ID` → handler 直接 403 `HOST_FORBIDDEN`。
+接线：
+
+- `SessionRepoWorkspaceManager` 导出 `isValidSessionRepoId`（现有 `SESSION_ID_RE`）和 `getSessionReposRoot()`（现有 `REPOS_ROOT`），并新增权威方法 `resolveReadyWorkspace(sessionId)`：内部 `getRepoSnapshot` + sessionId 校验 + `workspaceDir` 必须落在 `realpath(reposRoot)/sessionId/<version>`（`===` 或 `realRoot+'/'` 前缀）。不 ready / 无 snapshot / 路径越界 → `{ empty:true, reason }`。测试可注入 manager 或 root。
+- HTTP handler 在 `server.ts` 把 **同一份** 已导出的 `isFileAllowed` / `isFileBlocked` 作为 deps 注入采集层。`preview_path` 只经这套 predicate；内容读取仍只走现有 `/api/file`。
+- 无 `OC_CONTAINER_ID` → handler 直接 403 `HOST_FORBIDDEN`。不扫 cwd / `/home/agent`。
 
 ### 4.2 路径
 
-`sessionId`：`^[A-Za-z0-9_-]+$`。相对 path：空=根；拒 NUL/C0/`\`/绝对/盘符/`.`/`..`/空 segment；深度≤32。join 后打开前再 `hasGitPathSegment`。前缀检查用 `realRoot + '/'`，禁止裸 `startsWith(realRoot)`。
+`sessionId` 只用 `isValidSessionRepoId`，不另写正则。相对 path：空=根；拒 NUL/C0/`\`/绝对/盘符/`.`/`..`/空 segment；深度≤32。join 后打开前再 `hasGitPathSegment`。前缀检查用 `realRoot + '/'`，禁止裸 `startsWith(realRoot)`。
 
 ### 4.3 list-dir（Linux 生产）
 
@@ -95,27 +101,32 @@ Vendor/VCS skip 名：`node_modules` `.git` `.svn` `.hg` `.venv` `venv` `__pycac
 
 `preview_path` 仅常规文件且 `isFileAllowed && !isFileBlocked && !hasGitPathSegment`。
 
-### 4.4 hermetic git（fd 继承 + 钉死 worktree）
+### 4.4 hermetic git（受信临时 gitdir，不读仓库 local config）
 
-不能只写 `git -C /proc/self/fd/n`：Node `spawn` 默认 close-on-exec，子进程可能看不见该 fd；可写的 `.git/config` 里 `core.worktree=/etc` 会把 status/diff 指到工作树外。
+不能只写 `git -C /proc/self/fd/n`，也不能把 `--git-dir` 指到原始 `.git`：Node `spawn` 默认 close-on-exec；可写的 `.git/config` 里 `core.worktree=/etc`、`filter.*.clean/process` + `.gitattributes` 会在 `git diff`/`status` 里 exec 攻击者命令。`--no-ext-diff --no-textconv` **不**禁用 clean/process filter。禁止靠枚举 `filter.*` 再逐个 `-c` 覆盖。
 
 必须：
 
-1. `lstat` + `open(O_DIRECTORY|O_NOFOLLOW)` 工作树根 → `wfd`。realpath(`/proc/self/fd/wfd`) 必须仍在 `reposRoot/sessionId/version` 下。
-2. 对 `<root>/.git` 同样 `lstat`（拒 symlink）+ `open(O_RDONLY|O_DIRECTORY|O_NOFOLLOW)` → `gfd`。`.git` 是文件（gitfile）→ 403/空态 `not_a_repo`，本 PR 不跟随 gitfile。
-3. `spawn` **显式继承** `wfd`/`gfd`（`stdio` 传 fd 或 `ChildProcess` 的 fd 继承，禁止依赖「碰巧没 CLOEXEC」）。
-4. argv 用 `--git-dir=/proc/self/fd/<gfd> --work-tree=/proc/self/fd/<wfd>`，**不用**单独的 `-C` 当唯一锚。再加 hermetic `-c`：`core.hooksPath=/dev/null` `core.fsmonitor=` `diff.external=` `core.worktree=` `--no-optional-locks`。`diff`/`numstat` 加 `--no-ext-diff --no-textconv`。
+1. `lstat` + `open(O_DIRECTORY|O_NOFOLLOW)` 工作树根 → `wfd`。realpath(`/proc/self/fd/wfd`) 必须仍在 `resolveReadyWorkspace` 给出的根下。
+2. 对 `<root>/.git` 同样 `lstat`（拒 symlink）+ `open(O_RDONLY|O_DIRECTORY|O_NOFOLLOW)` → `gfd`。`.git` 是文件（gitfile / `gitdir:`）→ 空态 `not_a_repo`，本 PR 不跟随。
+3. **受信临时 gitdir**（`mkdtemp`）：只写最小 `config`（无 `filter.*` / `include.path` / `includeIf` / `core.worktree` / hooks / fsmonitor）。用 `O_NOFOLLOW` 从 `gfd` 拷贝 `HEAD`、`index`、可选 `packed-refs`、以及 HEAD 指向的单个 ref（任一段 symlink → 失败）。`objects/info/alternates` 写 `/proc/self/fd/<gfd>/objects`。不拷贝、不 symlink 原始 `config`、`hooks`、`commondir`。`finally` 删除临时目录。
+4. `spawn` **显式继承** `wfd`/`gfd`。argv：`--git-dir=<tmpdir> --work-tree=/proc/self/fd/<wfd>` `--no-optional-locks` `--ignore-submodules=all` `--no-lazy-fetch`。`diff`/`numstat` 加 `--no-ext-diff --no-textconv`（纵深，不是 filter 的替代）。
 5. env 仅：`PATH` `LC_ALL=C` `GIT_CONFIG_NOSYSTEM=1` `GIT_CONFIG_GLOBAL=/dev/null` `GIT_TERMINAL_PROMPT=0` `GIT_OPTIONAL_LOCKS=0` `GIT_PAGER=cat` `PAGER=cat`。不继承 `GIT_EXTERNAL_DIFF` `GIT_DIR` `GIT_WORK_TREE` `GIT_ASKPASS` `GIT_TRACE`。
 6. `status`/`numstat` 用 `-z`；`rev-parse` 校验 40-hex。禁止按换行切 path。stdout cap 1MiB；不完整记录丢弃；numstat 未完整则 `diff:null`（禁止假 0）。entries 满 500 停。
-7. 结束后按 §4.3.8 复核 snapshot+inode；失败 409。
+7. **达 cap/entries 上限：立即停消费、关闭 pipes、`SIGTERM` → 200ms → `SIGKILL`、始终 reap。** stderr 独立 64KiB 限额并持续 drain，避免 git 堵在满 stderr 上。intentional truncation → 200 + `truncated`；timeout → 504 无 body。任何路径（含异常）在 `finally` 释放 per-session 与全局信号量。
+8. 结束后按 §4.3.8 复核 snapshot+inode；失败 409。
 
-测试：`.git/config` 写入 `core.worktree=/etc` 不得列出 `/etc`；`.git` 本身是 symlink → 拒；hooks/fsmonitor 不被执行。
+测试：`.git/config` 写入 `core.worktree=/etc` 不得列出 `/etc`；`.git` 本身是 symlink 或 gitfile → 拒；hooks/fsmonitor 不被执行；**恶意 `filter.pwn.clean/process` + `.gitattributes` `* filter=pwn` 的 sentinel 命令不得执行**（sentinel 文件不得出现）。
 
 ### 4.5 并发
 
 进程级信号量 = 2；**每 session 同时 1 个**。争抢失败 **立即 429 `IN_FLIGHT`**，不排队。
 
-超时：git 5s / list 2s → 504，无部分 body。
+超时：git 5s / list 2s → 终止子进程（同 §4.4.7）后 504，无部分 body。
+
+### 4.6 输出净化（T6）
+
+每个 `name` / `path`：删除 C0、DEL、C1、以及 bidi/isolate（U+061C、U+200E、U+200F、U+202A–U+202E、U+2066–U+2069）。**不**删除 `<` `>` `&`。响应用紧凑 `JSON.stringify`。`<img>` 可出现在 JSON 字节里；XSS 是 PR-B textContent 的责任。
 
 ---
 
@@ -144,7 +155,7 @@ commercial `router.ts`：
 |---|---|
 | `protocol/src/__tests__/workspaceInspect.test.ts` | 常量、空态形状、错误码 |
 | `gateway/src/__tests__/security.test.ts` | 新 regex；`foo.git` 不误伤；trusted `.git/config` `isFileAllowed===false` |
-| `gateway/src/__tests__/workspaceInspect.test.ts` | 穿越；symlink 树外/git-creds/`/etc`；**list-dir 目标 `.config`/`.ssh` → 403**；blocked 子目录 `skipped/denied`；空态无 `added:0`；流式截断；字节预算；hermetic hooks/fsmonitor；**`core.worktree=/etc` 不逃逸**；**.git 为 symlink 拒**；snapshot 变更 → 409；同 session 第二请求立即 429；Linux 断言走 `/proc/self/fd`；净化控制字符 |
+| `gateway/src/__tests__/workspaceInspect.test.ts` | 穿越；symlink 树外/git-creds/`/etc`；**list-dir 目标 `.config`/`.ssh` → 403**；blocked 子目录 `skipped/denied`；空态无 `added:0`；流式截断；字节预算；hermetic hooks/fsmonitor；**`core.worktree=/etc` 不逃逸**；**.git 为 symlink/gitfile 拒**；**filter clean/process sentinel 不执行**；snapshot 变更 → 409；同 session 第二请求立即 429；Linux 断言走 `/proc/self/fd`；达 cap 后 git 被 kill 且信号量释放；T6：C0/ESC/bidi 从 parse 后的 name 消失，`<img>` 允许保留 |
 | `gateway/src/__tests__/apiFileGitAcl.test.ts` | **真实 handler/HTTP 往返**（不许用抽出 guard 替代）：直链 `.git/config` 403；父 `.git` 为 symlink 仍 403；spy 证明未调用 `_resolveMediaDirs` / `realpathSync` / remote pull；目录仍 404；`foo.git` 不被这段误伤 |
 | `gateway/src/__tests__/bridgeApiAllowlist.test.ts` | 两条 GET 可代理；POST 不可 |
 | `commercial/src/__tests__/workspaceInspectRoutes.test.ts`（新） | **显式**：两条均可 `matchCommercialContainerApiProxy` GET；POST 否；两条均命中 `BLOCKED_FOR_USER_RULES`；user 与 admin（无 host-scope）进入 container proxy；admin+host-scope **即使 v3Supervisor/bridgeSecret 缺失** 仍 403 且不进 host handler |
@@ -168,15 +179,15 @@ PR-B UI、Commit/Push、Undo、递归整树、未绑定仓库扫描、第二套�
 
 ---
 
-## 9. Codex 审查问题（方案 · 第 2 轮）
+## 9. Codex 审查问题（方案 · 第 3 轮）
 
-#1 FAIL 的 6 条 Finding 已写入正文。请确认是否闭合：
+迟到审查（对照旧快照 `45bc8802e`）的 4 条新 Finding 已写入正文与威胁模型。请确认是否闭合，并核对与威胁模型 T2/T5/T6 无矛盾：
 
-1. git：显式继承 wfd/gfd + `--git-dir/--work-tree=/proc/self/fd/...` + 覆盖 `core.worktree`；`.git` symlink 拒。
-2. 结束复核改读 snapshot + 重开当前路径比 inode；HTTP 固定 409。
-3. list-dir 目标 `isFileBlocked` → 403；blocked 子目录 `skipped/denied`。
-4. admin host-scope 403 在 proxy deps 闸外；deps 缺失仍 403。
-5. 显式路由断言，不依赖 closure 测试当证明。
-6. `/api/file` 必须真实 handler 往返 + spy，guard 在 resolver 之前。
+1. git **不读** 原始 `.git/config`：受信临时 gitdir + objects alternates；恶意 `filter.*.clean/process` sentinel 不得执行。不能只靠 `--no-ext-diff/--no-textconv` 或枚举 `-c filter.*`。
+2. ACL/root 单一权威：采集层不 import `server.ts`、不复制 blocklist/session 正则；`resolveReadyWorkspace` + 注入同一份 `isFileAllowed`/`isFileBlocked`。
+3. 达 stdout/entries 上限立即 kill+reap git，stderr drain，truncation≠timeout，信号量必释放。
+4. T6：删 C0/DEL/C1/bidi；**不**删 `<img>` 字节；测试按此断言。
 
-第一行 `PASS` / `FAIL` / `PARTIAL`。不要改代码。
+顺带确认 #1/#2 已闭合项仍在：fd 继承、`.git` symlink/gitfile 拒、结束复核 snapshot+inode、HTTP 409、blocked 目录、host-scope 403 在 deps 闸外、真实 `/api/file` handler 往返。
+
+第一行 `PASS` / `FAIL` / `PARTIAL`。Finding 必须修才能写代码。不要改代码。
