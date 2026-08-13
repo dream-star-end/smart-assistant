@@ -77,6 +77,7 @@ printf '%s\\n' '{"type":"result","subtype":"success","usage":{"inputTokens":1,"o
       `cursor_bin=${fakeBin}`,
     )
     .replace('auth_file=/run/oc/cursor-auth/api-key', `auth_file=${auth}`)
+    .replace('/usr/bin/sudo -n /usr/bin/test -f', '/usr/bin/test -f')
     .replace('/usr/bin/sudo -n /bin/cat', '/bin/cat')
   writeFileSync(wrapper, rewritten, { mode: 0o755 })
   chmodSync(wrapper, 0o755)
@@ -97,6 +98,7 @@ describe('oc-cursor wrapper', () => {
   test('pins a checksum-verified official build in the immutable runtime image', () => {
     const source = readFileSync(dockerfile, 'utf8')
     const buildSource = readFileSync(buildImageScript, 'utf8')
+    const wrapperSource = readFileSync(sourceWrapper, 'utf8')
     assert.match(source, /OC_CURSOR_AGENT_VERSION=2026\.08\.11-e8db854/)
     assert.match(source, /ARG OC_INCLUDE_CURSOR=0/)
     assert.match(source, /if \[ "\$OC_INCLUDE_CURSOR" = "1" \]/)
@@ -108,6 +110,8 @@ describe('oc-cursor wrapper', () => {
     assert.match(source, /chmod -R a-w "\$install_root"/)
     assert.match(source, /cursor-agent --version/)
     assert.match(buildSource, /CURSOR_AGENT_VERSION="2026\.08\.11-e8db854"/)
+    assert.match(wrapperSource, /\/usr\/bin\/sudo -n \/usr\/bin\/test -f "\$auth_file" 2>\/dev\/null/)
+    assert.doesNotMatch(wrapperSource, /\[ -e "\$auth_file" \]/)
     assert.match(
       buildSource,
       /CURSOR_AGENT_SHA256="bfff4bf6f4e9dd30c1d0ef0a70b6077b074015dd2948e4c50685d53afdcfce5a"/,
