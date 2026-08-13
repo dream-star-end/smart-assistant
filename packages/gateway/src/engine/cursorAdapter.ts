@@ -23,7 +23,7 @@ interface TurnCtx {
   assistantText: string; thinkingText: string; assistantSegments: SegmentRecord[]; thinkingSegments: SegmentRecord[]
   tools: Map<string, TurnToolEntry>; pending: Set<string>; startedTools: Map<string, number>
   stderr: string; terminal: boolean; interrupted: boolean; error: string | null; usage?: ReportedUsage
-  assistantPartialText: string
+  assistantPartialText: string; pendingAssistantText: string | null
   resolve: (value: TurnSummary | null) => void
 }
 
@@ -123,7 +123,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
   submitTurn(params: TurnParams): EngineTurnRun {
     let resolve!: (value: TurnSummary | null) => void
     const summary = new Promise<TurnSummary | null>((r) => { resolve = r })
-    const ctx: TurnCtx = { params, startedAt: Date.now(), proc: null, assistantText: '', thinkingText: '', assistantSegments: [], thinkingSegments: [], tools: new Map(), pending: new Set(), startedTools: new Map(), stderr: '', terminal: false, interrupted: false, error: null, assistantPartialText: '', resolve }
+    const ctx: TurnCtx = { params, startedAt: Date.now(), proc: null, assistantText: '', thinkingText: '', assistantSegments: [], thinkingSegments: [], tools: new Map(), pending: new Set(), startedTools: new Map(), stderr: '', terminal: false, interrupted: false, error: null, assistantPartialText: '', pendingAssistantText: null, resolve }
     this.active = ctx; this.lastActivityAt = Date.now(); this.drain = new Promise((r) => { this.resolveDrain = r })
     const submitted = this.spawnTurn(ctx).catch((err) => { if (!ctx.terminal) this.finish(ctx, String(err)); this.resolveDrain?.(); this.resolveDrain = null; if (this.active === ctx) this.active = null; throw err })
     return { submitted, summary, end: () => this.forceEnd(ctx), getPartialSnapshot: () => snapshot(ctx), getPhantomSignals: () => ({ ...EMPTY_SIGNALS }), get finalized() { return ctx.terminal }, get pendingToolCalls() { return ctx.pending.size } }
@@ -141,7 +141,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     proc.stdout.setEncoding('utf8'); proc.stdout.on('data', (chunk: string) => { this.lastActivityAt = Date.now(); this.emit('activity'); buffer += chunk; for (;;) { const n = buffer.indexOf('\n'); if (n < 0) break; const line = buffer.slice(0, n).trim(); buffer = buffer.slice(n + 1); if (line) this.handleLine(ctx, line) } })
     proc.stderr.setEncoding('utf8'); proc.stderr.on('data', (chunk: string) => { this.lastActivityAt = Date.now(); this.emit('activity'); if (ctx.stderr.length < 32768) ctx.stderr += chunk.slice(0, 32768 - ctx.stderr.length) })
     proc.once('error', (err) => { if (!ctx.terminal) this.finish(ctx, String(err)); this.emit('error', err) })
-    proc.once('close', (code, signal) => { if (buffer.trim()) this.handleLine(ctx, buffer.trim()); this.resolveDrain?.(); this.resolveDrain = null; if (!ctx.terminal) this.finish(ctx, ctx.stderr.trim() || `Cursor CLI exited with code ${String(code)}`); this.emit('exit', { code, signal, crashed: !ctx.interrupted && code !== 0 }); if (this.active === ctx) this.active = null })
+    proc.once('close', (code, signal) => { if (buffer.trim()) this.handleLine(ctx, buffer.trim()); this.flushPendingAssistant(ctx, false); this.resolveDrain?.(); this.resolveDrain = null; if (!ctx.terminal) this.finish(ctx, ctx.stderr.trim() || `Cursor CLI exited with code ${String(code)}`); this.emit('exit', { code, signal, crashed: !ctx.interrupted && code !== 0 }); if (this.active === ctx) this.active = null })
   }
   private emitText(ctx: TurnCtx, kind: 'text' | 'thinking', value: unknown): void {
     const valueText = textOf(value); if (!valueText) return
@@ -155,11 +155,15 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     let event: CursorEvent
     try { event = JSON.parse(line) as CursorEvent } catch (err) { this.emit('parse_error', { line, err }); return }
     const type = textOf(event.type).toLowerCase()
+    const aggregateBoundary = type === 'retry'
+      || (type === 'interaction_query' && textOf(event.subtype).toLowerCase() === 'request')
+    this.flushPendingAssistant(ctx, aggregateBoundary)
     if (type === 'assistant') {
       const value = assistantTextOf(event); if (!value) return
       const officialNested = recordOf(event.message) !== null
       const partialDelta = officialNested && typeof event.timestamp_ms === 'number' && event.model_call_id === undefined
-      if (partialDelta) { ctx.assistantPartialText += value; this.emitText(ctx, 'text', value) }
+      if (partialDelta && value === ctx.assistantPartialText && ctx.assistantPartialText) ctx.pendingAssistantText = value
+      else if (partialDelta) { ctx.assistantPartialText += value; this.emitText(ctx, 'text', value) }
       else { if (value !== ctx.assistantPartialText) this.emitText(ctx, 'text', value); ctx.assistantPartialText = '' }
       return
     }
@@ -178,6 +182,12 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
       const failed = event.is_error === true || ['error', 'failed', 'failure'].includes(textOf(event.subtype).toLowerCase())
       this.finish(ctx, failed ? textOf(event.error ?? event.result ?? event.message) || ctx.error || 'Cursor CLI error' : ctx.error)
     }
+  }
+  private flushPendingAssistant(ctx: TurnCtx, aggregateBoundary: boolean): void {
+    const value = ctx.pendingAssistantText; if (value === null) return
+    ctx.pendingAssistantText = null
+    if (aggregateBoundary) { ctx.assistantPartialText = ''; return }
+    ctx.assistantPartialText += value; this.emitText(ctx, 'text', value)
   }
   private toolStart(ctx: TurnCtx, event: CursorEvent): void {
     const id = textOf(event.call_id ?? event.tool_call_id ?? event.toolCallId ?? event.id) || `cursor-tool-${ctx.tools.size + 1}`

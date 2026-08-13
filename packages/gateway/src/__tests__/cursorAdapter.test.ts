@@ -107,6 +107,49 @@ for(const e of [
     }
   })
 
+  test('suppresses timestamped aggregate flushes before retry and interaction_query', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-boundary-'))
+    const fake = path.join(dir, 'fake.cjs')
+    await writeFile(
+      fake,
+      `#!/usr/bin/env node
+for(const e of [
+  {type:'assistant',message:{role:'assistant',content:[{type:'text',text:'A'}]},timestamp_ms:1},
+  {type:'assistant',message:{role:'assistant',content:[{type:'text',text:'A'}]},timestamp_ms:2},
+  {type:'retry',subtype:'rate_limit',timestamp_ms:3},
+  {type:'assistant',message:{role:'assistant',content:[{type:'text',text:'B'}]},timestamp_ms:4},
+  {type:'assistant',message:{role:'assistant',content:[{type:'text',text:'B'}]},timestamp_ms:5},
+  {type:'interaction_query',subtype:'request',query_type:'ask_question',timestamp_ms:6},
+  {type:'interaction_query',subtype:'response',query_type:'ask_question',timestamp_ms:7},
+  {type:'assistant',message:{role:'assistant',content:[{type:'text',text:'C'}]},timestamp_ms:8},
+  {type:'assistant',message:{role:'assistant',content:[{type:'text',text:'C'}]}},
+  {type:'result',subtype:'success',is_error:false},
+]) console.log(JSON.stringify(e))
+`,
+    )
+    await chmod(fake, 0o755)
+    const old = process.env.OC_CURSOR_WRAPPER_BIN
+    process.env.OC_CURSOR_WRAPPER_BIN = fake
+    try {
+      const adapter = new CursorAdapter(opts(dir))
+      adapter.on('error', () => {})
+      const run = adapter.submitTurn({
+        input: 'x',
+        requestId: REQUEST,
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run.submitted
+      const summary = await run.summary
+      await adapter.waitForOutputDrain()
+      assert.equal(summary?.assistantText, 'ABC')
+    } finally {
+      restoreEnv('OC_CURSOR_WRAPPER_BIN', old)
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
   test('parses pinned official tool_call started/completed, including completion-only calls', async () => {
     const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-tool-'))
     const fake = path.join(dir, 'fake.cjs')
