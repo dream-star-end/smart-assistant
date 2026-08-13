@@ -1,0 +1,416 @@
+# V5 容器工作区 inspect 数据面 — 威胁模型（PR8 / PR-A）
+
+> 状态：实现前安全评审。本文件过 Codex PASS 之前禁止写生产代码。  
+> 基线：`origin/feat/v5-aurora-rewrite` @ `e4f3fc930`  
+> 工作树：`/Users/dengxuan/git_project/openclaude_v3/openclaude-v5-workspace-git-stat`  
+> 分支：`feat/v5-workspace-git-stat`  
+> 配套审计：`docs/V5_WEB_CODEX_DESKTOP_ALIGNMENT.md` §2 / §4.2 PR8 / §5「git/文件树安全」  
+> 环境限制：本机没有 `oc-worktree` 注册表，按独立开发环境例外使用 `git worktree add`。  
+> Codex 威胁模型审 #1：**FAIL**（5 Finding）。本版已吸收；待 #2 PASS 才写代码。
+
+---
+
+## 0. 一句话结论（安全签字）
+
+**建议上线（降级后的 PR-A）：** 只对「本会话已 clone 且 `status=ready` 的 GitHub 工作树」提供两类只读 JSON：
+
+1. **live git snapshot**：live HEAD（明确标 `authority: live`）+ `git diff --numstat` 合计 + 变更文件列表。  
+2. **单层 list-dir**：每次只列工作树内一个目录的直接子项，禁止递归 dump。
+
+已知路径的**内容读取**继续走现有 `GET /api/file`（`handleApiFile` + allowlist + blocklist + `openFileHardened`）。本协议**不得**让 `/api/file` 变成能枚举目录的东西。
+
+**建议砍掉 / 永不做：**
+
+| 能力 | 理由 |
+|---|---|
+| 整棵工作区递归文件树一次返回 | 资源耗尽面（`node_modules`、深树）+ 敏感路径枚举面同时放大；产品图右栏其实是变更列表，不是 IDE 全树 |
+| 未绑定仓库时扫描 `/home/agent` 或默认 cwd 找 git | 把整个容器家目录变成浏览面；无 repo 必须返回空 |
+| 跟随 symlink 进入工作树外 / 其它 volume | 经典逃逸 |
+| 浏览或读取 `.git/` 内部（含 `config`） | `credential.helper` 指向 token 文件；对象库可被当数据面拖 |
+| Commit & Push / Create PR / Undo / Approve | 审计已否决；写面 + OAuth 超出本数据面 |
+| 第二套裸文件读取通道 | 必须复用 `/api/file` |
+| 把 bind 快照 `RepoSelection.branch/head_sha` 标成「当前分支」 | 双权威 |
+
+没有 ready 工作树时：**HTTP 200 + `empty: true` + `snapshot: null`**。禁止返回 `{added:0,deleted:0}` 或空树骨架。容器未就绪是 **503**，不是空态。
+
+---
+
+## 1. 资产与信任边界
+
+### 1.1 资产
+
+| 资产 | 位置 | 若泄漏 |
+|---|---|---|
+| 用户工作区源码与产物 | 容器 `/home/agent/.openclaude/repos/<sessionId>/<version>/` | 用户代码、可能含误提交的密钥 |
+| GitHub PAT（clone 凭证） | `/home/agent/.openclaude/git-creds/<sessionId>/<version>/token`；`.git/config` 的 helper 命令含该 path | 冒充用户打 GitHub |
+| 容器内运行时密钥 | `~/.codex/auth.json`、`~/.config/**`、`sessions.db`、`.env`、SSH key 等（已有 `FILE_BLOCKED_PATTERNS`） | 账号接管 / 跨会话 |
+| 其它租户的 named volume | 宿主机 `/var/lib/docker/volumes/oc-v[35]-data-u<uid>/`；远端 compute host 上的对应用户卷 | 跨用户 IDOR |
+| live HEAD / 工作区布局 | 本协议新暴露的元数据 | 信息泄漏（可接受，但必须绑当前用户容器） |
+
+### 1.2 信任边界
+
+```
+浏览器  --JWT-->  v5 master commercial router
+                      |  (只认 JWT.sub → 该 uid 的容器)
+                      |  不读容器 FS，不信前端给的绝对路径当根
+                      v
+              containerApiProxy
+              (bridge IP 白名单 + HMAC nonce + 本 channel docker 网段)
+                      |
+                      +-- 本机 dockerode fetch boundIp:18789
+                      +-- 跨 host：node-agent tunnel（404 必须同时认 statusCode 与 httpStatus）
+                      v
+              容器内 gateway
+              checkBridgeBypass (IP + containerId + nonce) 或用户 JWT
+                      |
+                      v
+              SessionRepoWorkspaceManager.getRepoSnapshot(sessionId)
+              仅当 status=ready 且 workspaceDir 落在 REPOS_ROOT 下
+                      |
+                      v
+              git / readdir 采集（净化）──JSON──> 浏览器
+              文件内容 ──仍走──> GET /api/file（独立通道，已有 ACL）
+```
+
+**不变量：**
+
+- 前端传的 `sessionId` **不是租户键**。租户键只有 JWT.sub → 该用户自己的容器。同容器内用户只能看到自己的 session 工作树。
+- master **从不**根据前端给的绝对路径去宿主机 `readdir` / `git`。跨 host 时 master 本机根本没有那份 volume。
+- `/api/file` 继续拒绝目录（`!isFile()` → 404）。list-dir 是新路径。
+
+### 1.3 工作区根的唯一定义
+
+```
+workspace root = SessionRepoWorkspaceManager.getRepoSnapshot(sessionId)
+                 且 status === 'ready'
+                 且 workspaceDir 是绝对路径
+                 且 realpath(workspaceDir) 位于
+                    realpath('/home/agent/.openclaude/repos') + '/' + sessionId + '/'
+```
+
+不扫描其它 git repo。不回落到 agent cwd / `/home/agent` / `/tmp`。unbind / cloning / failed / 无 snapshot → 空态。
+
+---
+
+## 2. 攻击者模型
+
+| 角色 | 能力 | 目标 |
+|---|---|---|
+| 已登录用户（恶意或 XSS） | 合法 JWT；可对**自己的**容器发 HTTP | 读到 token、逃出工作树、拖 `node_modules`/`.git`、把 `/api/file` 变成枚举器 |
+| 跨租户攻击者 | 合法 JWT，猜别人的 sessionId / 绝对路径 / volume 名 | 读别人容器 |
+| 容器内 agent 进程 | 可在自己 volume 里 `ln -s`、`mv` 目录（TOCTOU） | 把 list-dir / git 引到 `/etc`、`/run/oc`、别人的 mount |
+| 未认证 / 伪造 JWT | 无有效 cookie | 任何 inspect 数据 |
+| 资源耗尽 | 并发打 git/list-dir；巨型仓库 | 打满容器 CPU / 撑爆 2MB API proxy |
+
+XSS 不在本协议修复范围；本协议必须做到：**即便脚本能调 API，也拿不到工作树外的内容和密钥文件内容**。
+
+---
+
+## 3. 威胁与控制（拒绝矩阵）
+
+每条：攻击 → 在哪一层拦 → 失败语义 → 测试落点。
+
+### T1 路径穿越（`..` / 绝对路径 / 编码 / Windows 分隔符）
+
+**攻击：** `path=../git-creds/...`、`path=/etc/passwd`、`path=%2e%2e%2f`、`path=..%2f`、`path=foo%00.png`、`path=foo\\..\\etc`、双重编码 `%252e%252e`。
+
+**控制（gateway 采集层，fail-closed）：**
+
+1. `sessionId`：`typeof string` 且 `^[A-Za-z0-9_-]+$`（与 `sessionRepoWorkspace.ts` 同一正则）。非法 → 400 `BAD_SESSION_ID`。
+2. 相对路径 `rel`：只接受空（表示工作树根）或 UTF-8 字符串；长度 ≤ 4096。
+3. **拒绝**（任一即 400 `BAD_PATH`）：含 `NUL` / 其它 C0 控制字符 / DEL；含 `\`；以 `/` 开头；Windows 盘符 `^[A-Za-z]:`；任意 path segment 为 `''` / `.` / `..`；decode 一次后仍含 `%2e`/`%2f`/`%5c` 这类「看起来还是编码穿越」的残留不是硬条件——权威是 segment 拆分 + 最终 realpath 前缀。
+4. `URL.searchParams.get` 已经 decode 一次。不要再 decode 循环到「看起来干净」（避免 `%252e` → `%2e` → `.` 的宽松解码）。拆 segment 在 decode 之后做。
+5. `join(workspaceDir, rel)` 后 `realpath`。`realpath` 失败 → 404 `NOT_FOUND`（不区分「不存在」与「无权限」以外的敏感目录；对 **blocked** 路径见 T4）。
+6. 前缀检查必须用 `realRoot === realTarget || realTarget.startsWith(realRoot + '/')`。禁止裸 `startsWith(realRoot)`（避免 `repos/sess-1` 命中 `repos/sess-10`）。
+
+**不在 `/api/file` 做。** `/api/file` 继续要求绝对路径且 `includes('..')` 直接 400，行为不变。
+
+**测试：** `workspaceInspectPath.test.ts` 覆盖上列变体；断言 400/403，永不 200 出工作树外的 name。
+
+### T2 符号链接逃逸 + TOCTOU
+
+**攻击：** 工作树内 `ln -s /home/agent/.openclaude/git-creds s`；或 check 之后把目录换成 symlink（容器 uid 对 named volume 可写，见 `docs/audit-file-toctou.md`）。
+
+**控制（语义选定：永不跟随目录 symlink）：**
+
+- 工作树根与 list-dir 目标必须是**真实目录**，不是 symlink。`lstat` 为 symlink → 403 `PATH_DENIED`（作为目标时）或子项 `kind: "symlink"`（作为 child 时，无 `preview_path`，不展开）。这消除「`O_NOFOLLOW` vs 树内 symlink 目录可列」的矛盾。
+- 打开目标：`openSync(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)`，Linux 再 `realpath(/proc/self/fd/n)` 做前缀检查。之后 **`readdir` / `lstat` 必须走该目录 fd**（`openat`/`Dirent` from `fs.promises.opendir` on the fd / `fdopendir`），禁止用可被替换的原始 path 字符串再扫一遍。
+- darwin 单测没有 `/proc/self/fd`：`lstat` 拒绝 symlink 目录 + `realpath` 前缀检查；注释标明生产路径是 fd。不在单测里假装 Linux fd 已覆盖。
+- git 采集 **fd/inode 锚定**：
+  1. `open` 工作树根（`O_DIRECTORY|O_NOFOLLOW`），记下 `fstat` 的 `dev/ino`。
+  2. Linux：`git -C /proc/self/fd/<n> ...`（cwd 绑在已打开的 inode，不跟随后续 rename）。darwin 测试退化为 `-C realpath` + 采集结束后再 `fstat` 比对。
+  3. 采集结束后再次 `fstat(fd)`；`dev/ino` 变化 → **丢弃全部结果**，504/409 `WORKSPACE_CHANGED`，不下发 branch/SHA/entries。
+  4. git 输出的路径仍走 T1 join+realpath；逃出则丢弃该条目。无路径的 live HEAD 依赖步骤 3，不单独信任。
+- git 必须 **hermetic**（Finding 2）：不能只设 `GIT_CONFIG_NOSYSTEM=1`。工作树 `.git/config` 仍会被 git 读取，agent 可写入 `core.fsmonitor` / hooks / `diff.external` / textconv。规定：
+  - env 白名单：`PATH`、`LC_ALL=C`、`GIT_CONFIG_NOSYSTEM=1`、`GIT_CONFIG_GLOBAL=/dev/null`、`GIT_TERMINAL_PROMPT=0`、`GIT_OPTIONAL_LOCKS=0`、`GIT_PAGER=cat`、`PAGER=cat`。不继承 `GIT_EXTERNAL_DIFF`、`GIT_TRACE`、`GIT_DIR`、`GIT_WORK_TREE`、`GIT_ASKPASS`。
+  - argv 强制：`-c core.hooksPath=/dev/null` `-c core.fsmonitor=` `-c diff.external=` `--no-optional-locks`；`diff`/`numstat` 加 `--no-ext-diff --no-textconv`。
+  - `status` / `numstat` / `rev-parse` 一律 `-z` 或单行 40-hex；**禁止**按换行切 path 再净化。
+- 内容读取的 TOCTOU 仍由现有 `openFileHardened` 关（本协议不读内容）。
+
+**测试：** 真实 `symlinkSync` 指向 `/etc`、指向 `git-creds`、指向工作树外；目录 swap 用例至少覆盖「list 目标是 symlink 且 target 在树外 → 403」。
+
+### T3 跨用户 / 跨容器 volume 越权
+
+**攻击：** 用户 A 带自己的 JWT，请求 `sessionId=B的会话` 或 `/api/file?path=/var/lib/docker/volumes/oc-v5-data-uB/...`。跨 host 时 master 上没有 B 的 volume，错误形状还可能不是 dockerode 的 `statusCode=404`。
+
+**控制：**
+
+- master：JWT.sub → `getV3ContainerStatus(uid)` → **只**代理到该 uid 的容器。sessionId 到不了别的容器。
+- 用户 A 的容器里没有用户 B 的 `repos/<B-sid>` → 空态或 404，不是 B 的数据。
+- 新 API **不**走 host 侧 volume 路径，因此不引入新的 host-path IDOR。`COMMERCIAL_USER_VOLUME_MEDIA_GATE` 仍只服务 `/api/file`。
+- 跨 host：沿用 `containerApiProxy` 的 tunnel。容器 vanished → `CONTAINER_NOT_RUNNING` 503。识别 missing 容器时若将来在本路径 catch docker 错误，必须同时认 `statusCode===404` 与 `httpStatus===404`（`v3-multihost-404-error-shapes`）。本 PR 的 proxy 层已按 status 对象而非 raw docker err 判断 `state !== 'running'`，不新开「只看 statusCode」的 catch。
+- host singleton 兜底 **不能**只靠 `BLOCKED_FOR_USER_RULES`。现网 active admin 会 `blocked_for_user_admin_bypass` 后 `return false`，请求继续进 **host gateway**（`router.ts` ~1893；`blockedForUser.integ.test.ts` 锁定了这个行为）。若只登记 BLOCKED，admin + `X-OC-Host-Scope: 1` 会打到 master 的新 handler。
+- 两道 terminal deny（admin 也不能绕）：
+  1. **commercial router**：`/api/workspace/*` 在 containerApiProxy 命中且 `admin && x-oc-host-scope=1` 时 **直接 403** `HOST_FORBIDDEN`，禁止 fall through。普通 user/admin 无该头 → 仍代理进**自己的**容器。
+  2. **容器 handler**：`process.env.OC_CONTAINER_ID` 未设置（即 host / 个人版 master 进程）→ 403 `HOST_FORBIDDEN`。即使 router 漏拦，host 上也没有用户 session repo。
+- 测试：admin + `X-OC-Host-Scope: 1` GET `/api/workspace/git-snapshot` → 403，**不**进入 host handler（可用 handler 计数/探针断言）。
+
+**测试：** allowlist/blocked 闭包（现有 `containerRouteProxyClosure.test.ts` 会强制登记）；handler 单测：无 snapshot → empty，不读传入的绝对路径。
+
+### T4 敏感文件
+
+**原则：allowlist 优先于 blacklist。** Blacklist 永远赶不上新密钥文件名。本数据面的 allow 根是「ready 的 session repo 工作树」，不是「`/home/agent` 减一段正则」。`FILE_BLOCKED_PATTERNS` 是第二道，用来挡住工作树里误放/symlink 进来的密钥，以及 `.git/`。
+
+| 路径 / 名字 | list-dir | git entries | `/api/file` 预览 |
+|---|---|---|---|
+| 工作树内普通源码 | 可列 | 可列 | 走现有 ACL（trusted 模式下 `/home/agent/**` 允许） |
+| `node_modules` / `.venv` / `dist` 等 vendor | `kind: skipped`，不展开 | 若 git 跟踪则出现在 entries，无 preview | 现有规则 |
+| `.git` 目录 | `kind: skipped`（`reason=vcs`） | 不出现（不在 worktree） | 拒绝（新增：`.git/` 段必须进 block 或 list-dir 根拒绝） |
+| `.git/config`、`git-creds/**`、`.env`、`.npmrc`、`id_rsa`、`.ssh`、`.config/**` | 不作为可预览项；若出现在 listings 则 `previewable: false` 且无 `preview_path` | 同左 | 已有 `isFileBlocked` → 403 |
+| `/run/oc/**`、`/etc/**`、`sessions.db` | 403 / 不可达（根不在工作树） | 不可达 | 已有 blocklist |
+
+**`.git` 必须进全局 `FILE_BLOCKED_PATTERNS`（Codex #1 Finding 1，硬门槛）。** 商业容器固定 `OC_V3_TRUSTED_FILE_SERVE=1`，trusted 分支允许整个 `/home/agent/**` 再减 blocklist。当前 blocklist **没有** `.git` segment，因此现网 `GET /api/file?path=/home/agent/.openclaude/repos/<sid>/<ver>/.git/config` 会把 `credential.helper`（内含 `cat <tokenPath>`）当普通文件返回。inspect 层拒绝不够——预览点击走的就是 `/api/file`。
+
+本 PR **必须**追加精确规则（只匹配 path segment `.git`，不误伤 `foo.git`）：
+
+```ts
+/(^|\/)\.git(\/|$)/
+```
+
+测试至少锁定：
+
+- trusted `isFileAllowed('/home/agent/.openclaude/repos/s/1/.git/config') === false`
+- `isFileBlocked(.../.git/config) === true`；`.git/HEAD`、`.git/objects/...` 同拒
+- `isFileBlocked('/home/agent/foo.git') === false`；`isFileAllowed` 在 trusted 下对 `foo.git` 仍按其它规则
+- handler 往返：`GET /api/file?path=.../.git/config` → 403
+
+list-dir / git 路径规范化仍额外拒绝 `.git` segment（纵深），但不能替代这条全局规则。
+
+**测试：** `.env`、`.git/config`、`git-creds`、`.npmrc`、`id_rsa`、`.ssh/id_ed25519`、`.config/gh/hosts.yml` 全部不可预览；list-dir `path=.git` → 403。
+
+### T5 资源耗尽
+
+| 上限 | 值 | 超限语义（禁止静默截断） |
+|---|---|---|
+| git spawn 超时 | 5s | 504 `GIT_TIMEOUT`，**无部分 body** |
+| list-dir 超时 | 2s | 504 `LIST_TIMEOUT`，无部分 body |
+| git stdout | 1 MiB | 读到 cap 即停。若 `-z` 流在 cap 处截断导致最后一条不完整：**丢弃不完整记录**；`truncated: true` + `truncation.reason=stdout_limit`。合计数字仅在完整读完 numstat 时下发，否则 `diff: null`（禁止假 0） |
+| git entries | 500 | 解析满 500 条即停读；`truncated: true` + `reason=max_entries`。`omitted` **不**承诺精确剩余数（可为 `null` 或 `"unknown"`） |
+| list-dir entries | 200 | **流式 `opendir`**，读到 201 条即 stop。`truncated: true`；`omitted` 语义是「至少还有 1 条」，不是全量计数（全量计数等于把巨型目录扫完，与上限矛盾） |
+| JSON 字节预算 | 256 KiB | 边组装边计 UTF-8 字节，超预算停止追加 entries，标 `reason=byte_budget`。必须保证序列化后 < `containerApiProxy` 的 2 MiB 硬顶，否则会变 502 |
+| 相对路径深度 | 32 segment | 400 `BAD_PATH` |
+| 单次 list 深度 | 1（不递归） | 协议层 |
+| 并发 | **每容器（进程）inspect 信号量 = 2**；同 session 同时只允许 1 个。第二发 **立即 429 `IN_FLIGHT`**，禁止排队等待 | 多 session 不能绕过 per-session 锁打满 CPU |
+
+Vendor 目录 `kind: skipped`，**不** `readdir` 展开。二进制：numstat 的 `-` `\t` `-` → `binary: true`，`added/deleted: null`，不读文件字节。
+
+**测试：** 201+ dirent 断言 `truncated===true` 且未把全目录读进数组（可用 spy/计数）；超字节预算；同容器第三请求 429；timeout 无部分体。
+
+### T6 输出净化
+
+git / `readdir` 可能吐出换行、ANSI、RTL override、`<script>` 文件名。
+
+- 每个 `name` / `path`：去掉 C0 + DEL + C1；拒绝内嵌 `NUL`。
+- 不把路径写进普通 info 日志。warn 只用 `sessionId` + 错误码 + `rel` 的 hash 或截断到 64 且已净化的相对路径。
+- JSON 本身会转义；前端仍必须当文本渲染（PR-B 的责任）。本 PR 保证 wire 上没有 raw 控制字符。
+
+**测试：** 文件名含 `\n`、`\x1b[31m`、`<img>` → 返回体无那些字节。
+
+### T7 鉴权
+
+| 层 | 要求 |
+|---|---|
+| master | 必须 commercial JWT。普通 user/admin → 只 proxy 进**自己的**容器。`admin && X-OC-Host-Scope: 1` → **terminal 403** `HOST_FORBIDDEN`，禁止 fall through 到 host gateway。 |
+| 容器 | 新路径进 `BRIDGE_API_ALLOWLIST` 且 `proxyFromCommercial: true`。`checkBridgeBypass` 四条件 或（`OC_CONTAINER_ID` 已设置 **且** `checkHttpAuth`）。`OC_CONTAINER_ID` 空 → 403，挡住 host 进程。 |
+| sessionId | 只在已经进入该用户容器之后解析工作树。 |
+| 前端伪造 sessionId | 最多看到自己容器里没有的空态。 |
+
+无 JWT → 401（现有 blocked/auth 链）。不要用「空态 200」掩盖未登录。
+
+### T8 审计日志与隐私
+
+- 禁止 log：文件内容、PAT、`git-creds` 绝对路径、完整 `workspaceDir`（info 最多 `repos/<sessionId>/<version>` 这种相对后缀）。
+- 允许 log：`uid`、`sessionId`、错误码、`truncated`、耗时、route label。
+- git stderr 截断进 failed status 前必须滤 token URL（clone 路径已有此纪律；inspect 的 git 不带 URL）。
+
+---
+
+## 4. 协议契约（实现必须遵守；细节以 protocol 模块为准）
+
+### 4.1 路由
+
+| 方法 | 路径 | 查询 |
+|---|---|---|
+| GET | `/api/workspace/git-snapshot` | `sessionId`（必填） |
+| GET | `/api/workspace/list-dir` | `sessionId`（必填），`path`（可选，相对工作树，默认根） |
+
+均 JSON，`Cache-Control: no-store`。无 body。
+
+**明确不改：** `GET /api/file`。目录继续 404。不增加 `?list=1`。
+
+### 4.2 空态（产品门控）
+
+HTTP **200**：
+
+```json
+{
+  "ok": true,
+  "empty": true,
+  "reason": "no_workspace",
+  "snapshot": null
+}
+```
+
+`reason`：`no_workspace` | `not_ready` | `not_a_repo`。  
+前端（PR-B）：`empty===true` → **不渲染** git 卡 / 文件树（退回两栏）。禁止画 0 或骨架。
+
+容器未运行：master **503** `CONTAINER_NOT_RUNNING` / `CONTAINER_UNREADY`。前端同样不画树。
+
+### 4.3 git-snapshot 非空
+
+```json
+{
+  "ok": true,
+  "empty": false,
+  "snapshot": {
+    "live_head": {
+      "authority": "live",
+      "branch": "feat/x",
+      "sha": "0123…40hex",
+      "detached": false
+    },
+    "diff": { "added": 10, "deleted": 2 },
+    "entries": [
+      {
+        "path": "src/a.ts",
+        "status": "modified",
+        "added": 8,
+        "deleted": 1,
+        "binary": false,
+        "previewable": true,
+        "preview_path": "/home/agent/.openclaude/repos/s1/1/src/a.ts"
+      }
+    ],
+    "truncated": false,
+    "truncation": null
+  }
+}
+```
+
+- `live_head.authority` 常量 `"live"`。**不**返回 bind 快照字段，避免一张卡两个权威。Bind 继续走现有 `RepoSelection`。
+- `preview_path` 仅当 `previewable` 且通过 `isFileAllowed` + `!isFileBlocked` + 不在 `.git`。前端预览只许把它交给现有 `/api/file?path=`。
+- detached HEAD：`branch: null`，`detached: true`，仍给 `sha`。
+- 超限见 T5。`truncated===true` 时必须有 `truncation.reason`（`max_entries | stdout_limit | byte_budget`）。`omitted` 可为 `null` / `"unknown"`，禁止为了填精确数字而扫完全量。
+- PR-B（本轮不做）渲染门：仅 `200 && empty===false && snapshot!=null`。`empty:true` 与任何非 2xx **禁止**画 `{added:0,deleted:0}`。
+
+### 4.4 list-dir 非空
+
+```json
+{
+  "ok": true,
+  "empty": false,
+  "cwd": "src",
+  "entries": [
+    { "name": "a.ts", "kind": "file", "previewable": true, "preview_path": "/home/agent/..." },
+    { "name": "lib", "kind": "dir" },
+    { "name": "node_modules", "kind": "skipped", "reason": "vendor" },
+    { "name": "tmp_link", "kind": "symlink" }
+  ],
+  "truncated": false,
+  "truncation": null
+}
+```
+
+`kind`：`file | dir | symlink | skipped`。`skipped.reason`：`vendor | vcs | denied`。
+
+### 4.5 错误
+
+| HTTP | code | 何时 |
+|---|---|---|
+| 400 | `BAD_SESSION_ID` / `BAD_PATH` / `MISSING_SESSION_ID` | 输入非法 |
+| 401 | 现有 auth | 未登录 |
+| 403 | `PATH_DENIED` | 越出工作树 / `.git` / blocked 目录 |
+| 404 | `NOT_FOUND` | 相对路径不存在（realpath 失败且非越权） |
+| 429 | `IN_FLIGHT` | 同 session 采集未完成 |
+| 503 | `CONTAINER_NOT_RUNNING` 等 | 容器没有 |
+| 504 | `GIT_TIMEOUT` / `LIST_TIMEOUT` | 超时，无部分成功体 |
+| 200 empty | — | 无 ready 工作树 |
+
+非法穿越**不得**用空态 200 掩饰（否则前端会当成「没 repo」而不是攻击失败）。
+
+---
+
+## 5. 生效面（本轮不部署）
+
+| 轴 | 要动吗 | 说明 |
+|---|---|---|
+| **runtime-source** | **要** | 容器内 `packages/gateway/**` + `packages/protocol/**` 采集与 handler。hotcfg release + tuple 激活后存量容器 runtimeStale 滚动 |
+| **gateway / master** | **要** | `bridgeApiAllowlist`、`BLOCKED_FOR_USER_RULES`、闭包测试。master 只多认领两条 JSON 代理，不读 FS |
+| **dist** | PR-A **不要** | 纯后端，未接入则前端无行为变化 |
+| runtime image | 不要 | 不改 Dockerfile / git 二进制（镜像已有 git） |
+| platform bundle | 不要 | |
+| egress | 不要 | 不新访问 GitHub |
+| migration | 不要 | |
+
+回滚：revert PR-A → 容器 release 回上一 tuple 后新路由 404，前端 PR-B 尚未合入则用户无感。**禁止**只回 master 不回 runtime-source（静默不生效 / 半套协议）。
+
+---
+
+## 6. 与 PR-B / 前端 PR3
+
+- PR-A 合入后 web-react **零 UI 变化**。
+- PR-B 必须等 PR3 右栏壳扩展点合入；消费本 API，`xl:`（≥1280）门控，无数据隐藏。
+- 并行线 `feat/v5-web-codex-token-density` 目前尚未见右栏扩展点；本轮不做 PR-B。
+- 不做 Commit & Push / 会话文件夹。
+
+---
+
+## 7. 测试清单（质量门，不许为变绿放宽）
+
+- [ ] T1 全部穿越变体被拒
+- [ ] T2 symlink 指向树外 / git-creds / `/etc` 被拒
+- [ ] T3 无 snapshot 空态；host blocked 规则存在；allowlist `proxyFromCommercial`
+- [ ] T4 敏感路径不可预览；`.git/config` 全局 blocklist + `/api/file` 403；`foo.git` 不误伤
+- [ ] admin + `X-OC-Host-Scope: 1` → 403，不进 host handler；`OC_CONTAINER_ID` 空 → 403
+- [ ] 无 repo → `empty: true`，JSON 无 `added: 0`
+- [ ] 超大目录流式截断：`truncated===true`，`omitted` 不要求精确剩余数；字节预算；第三请求 429
+- [ ] 超时 504 无部分体
+- [ ] 输出无控制字符
+- [ ] `/api/file` 对目录仍 404（回归）
+- [ ] gateway handler 往返 + 采集层单测；CI `typecheck` / `gateway` / `storage` / `commercial-unit` / `v5-ops`
+
+不在真实用户容器做破坏性验证。不跑 `scripts/deploy-v5.sh`。
+
+---
+
+## 8. 残留风险（接受）
+
+1. 工作树内用户**自己的源码**对已登录的该用户可见——这是产品意图。  
+2. 变更列表可能包含用户误提交的密钥**文件名**（不含内容）。内容仍被 `/api/file` 拒绝。  
+3. 单层 list-dir 仍可被客户端循环展开；靠 entries 上限 + vendor skip + 超时 + in-flight 锁，不能防一个决心耗 CPU 的合法用户。与现有 Bash 工具面同类。  
+4. darwin 单测没有 `/proc/self/fd`；Linux 容器才有 fd-realpath。单测用 `lstat` + `realpath` 等价断言，并在注释标明生产路径。  
+5. XSS 若能调 API，能看到该用户工作树布局。需 CSP / 前端文本渲染（PR-B）。
+
+---
+
+## 9. Codex 审查问题（本文件 · 第 2 轮）
+
+上一轮 **FAIL**，5 条 Finding 已写入正文。请只审查本修订稿，不要改代码。逐条确认是否闭合：
+
+1. 全局 `FILE_BLOCKED_PATTERNS` 增加 `/(^|\/)\.git(\/|$)/` + `/api/file` 403 测试 —— Finding 1 是否闭合？
+2. git hermetic env/argv + `-z` 解析 —— Finding 2 是否闭合？是否还缺必须写进模型的变量/开关？
+3. 目录永不 follow symlink；list-dir 走目录 fd；git 用 `/proc/self/fd/n` + 采集后 ino 复核 —— Finding 3 是否闭合？
+4. admin host-scope terminal 403 + handler 要求 `OC_CONTAINER_ID` —— Finding 4 是否闭合？
+5. 流式 opendir、omitted 未知语义、256KiB 字节预算、容器级信号量、立即 429 —— Finding 5 是否闭合？
+
+要求格式：第一行 `PASS` / `FAIL` / `PARTIAL`。Finding 必须修才能进实现。不要改代码。
