@@ -3,7 +3,7 @@ import { useMemo, useState } from "react";
 import { BRAND } from "../lib/brand";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import type { Session, User } from "../lib/types";
-import { cn, formatCredits, groupLabel } from "../lib/utils";
+import { cn, formatCredits, groupSidebarSessions } from "../lib/utils";
 import { Avatar, Badge, Button, IconButton } from "./ui";
 
 export function Sidebar({
@@ -58,15 +58,7 @@ export function Sidebar({
 }) {
   const [q, setQ] = useState("");
 
-  const groups = useMemo(() => {
-    const filtered = sessions.filter((s) => s.title.toLowerCase().includes(q.toLowerCase()));
-    const map = new Map<string, Session[]>();
-    for (const s of filtered) {
-      const k = groupLabel(s.updatedAt);
-      (map.get(k) || map.set(k, []).get(k)!).push(s);
-    }
-    return [...map.entries()];
-  }, [sessions, q]);
+  const groups = useMemo(() => groupSidebarSessions(sessions, q), [sessions, q]);
 
   return (
     <aside className="flex h-full w-[268px] shrink-0 flex-col bg-sidebar">
