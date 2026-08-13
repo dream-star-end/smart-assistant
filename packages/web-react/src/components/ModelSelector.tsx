@@ -44,7 +44,7 @@ export function teamEngineLabel(models: PublicModel[]): string {
 }
 
 /**
- * 对话模型选择器（Aurora 顶栏）。完全由 GET /api/public/models 的结果驱动，
+ * 对话模型选择器（Aurora Composer 输入条右侧）。完全由 GET /api/public/models 的结果驱动，
  * 不持有任何硬编码/demo 模型列表（demo 预览的 fixture 由调用方注入）。选中的 model id
  * 上抛给 App 顶层状态，P4 的 WS inbound.message 据此发送（前端只发 agentId + model，
  * agent→model 的最终权威在后端）。
