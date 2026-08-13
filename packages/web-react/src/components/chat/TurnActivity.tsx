@@ -13,7 +13,11 @@
 import { useEffect, useState } from "react";
 import { AUTOMATIC_TURN_RETRY_MAX } from "@openclaude/protocol";
 import type { TodoItem } from "./PinnedTaskTracker";
-import { isRetryingTurnStatus, type TurnStatusState } from "../../lib/chat/model";
+import {
+  isRetryingTurnStatus,
+  type RecoveryStatusState,
+  type TurnStatusState,
+} from "../../lib/chat/model";
 import { computeTypingLabel } from "../../lib/chat/pure";
 import { cn } from "../../lib/utils";
 
@@ -30,6 +34,9 @@ export type TurnActivityInfo = {
   /** turn 非流式阶段态(判别联合,单一权威 model.ts TurnStatusState):
    *  'compacting' → 「正在压缩上下文」;{kind:'retrying'} → 统一自动重试文案。 */
   turnStatus?: TurnStatusState | null;
+  /** Browser/service recovery stays in this existing activity row instead of
+   * creating a second card or action surface above the composer. */
+  recoveryStatus?: RecoveryStatusState | null;
   /** 容器冷启（sys.cold_start）：typing 文案追加「容器首次加载中」后缀。 */
   coldStart?: boolean;
   /** 显示用 agent 名（如「主助手」「编程助手」）。 */
@@ -77,12 +84,19 @@ export function TurnActivity({ info }: { info: TurnActivityInfo }) {
   // 自动重试软提示优先级最高。所有底座/跨 turn 恢复只呈现这一行，不再各自
   // 插 assistant notice、synthetic user bubble 或倒计时变体。
   const retry = isRetryingTurnStatus(info.turnStatus) ? info.turnStatus : null;
+  const recoveryKind = info.recoveryStatus?.kind;
 
   let text: string;
   let cls = "";
-  if (retry) {
-    text = `模型繁忙，正在自动重试中（${retry.attempt}/${AUTOMATIC_TURN_RETRY_MAX}）`;
+  if (recoveryKind === "stopping") {
+    text = "正在停止…";
+    cls = "stopping";
+  } else if (retry) {
+    text = `模型繁忙，正在重试中（${retry.attempt}/${AUTOMATIC_TURN_RETRY_MAX}）`;
     cls = "retrying";
+  } else if (recoveryKind === "waiting-service" || recoveryKind === "retrying") {
+    text = "正在恢复实时内容…";
+    cls = "recovering";
   } else if (info.turnStatus === "compacting") {
     // 压缩上下文（即便团队模式）：computeTypingLabel 产出「正在压缩上下文 (Xs)」。
     ({ text, cls } = computeTypingLabel({ name: info.agentName, secs, silenceMs, turnStatus: "compacting" }));

@@ -454,6 +454,8 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
   test('fresh conversation can create its server row and set GoalState before the first turn', async () => {
     const base = routedFetch()
     const mutations: string[] = []
+    const sessionBodies: Array<Record<string, unknown>> = []
+    const patchBodies: Array<Record<string, unknown>> = []
     fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
       const u = String(url)
       const method = init?.method ?? 'GET'
@@ -462,7 +464,14 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
       }
       if (/\/api\/sessions\/[^/]+$/.test(u) && method === 'PUT') {
         mutations.push('session')
+        sessionBodies.push(JSON.parse(String(init?.body ?? '{}')))
         return okJson({ ok: true })
+      }
+      if (/\/api\/sessions\/[^/]+$/.test(u) && method === 'PATCH') {
+        const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>
+        patchBodies.push(body)
+        mutations.push(typeof body.title === 'string' ? 'title' : 'model')
+        return okJson({ ok: true, updatedAt: Date.now() })
       }
       if (/\/api\/session-goals\/[^/]+$/.test(u) && method === 'PUT') {
         mutations.push('goal')
@@ -493,6 +502,14 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     render(<App />)
     await loginViaUi()
     fireEvent.click(await screen.findByRole('button', { name: /新建会话/ }))
+    // 空白态显式换模：随后 Goal 物化会话也必须定格该选择，不能因 activeId 改变回落默认。
+    const modelTrigger = screen.getByRole('button', { name: '选择对话模型' })
+    fireEvent.pointerDown(modelTrigger, { button: 0, pointerType: 'mouse' })
+    const modelTarget = (await screen.findAllByRole('menuitem'))
+      .find((item) => item.textContent?.includes('GPT-5.6-Terra'))
+    expect(modelTarget).toBeTruthy()
+    fireEvent.click(modelTarget!)
+    expect(modelTrigger.textContent).toContain('GPT-5.6-Terra')
     // 目标入口已迁入输入框「+」选项菜单(07-17 boss 产品决策):先开菜单再点设定目标。
     // Radix DropdownMenu trigger 在 jsdom 下需要 pointerdown 序列才会开菜单。
     const plusTrigger = await screen.findByRole('button', { name: '更多选项' })
@@ -505,9 +522,22 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     })
     fireEvent.click(screen.getByRole('button', { name: '开始目标' }))
 
-    await waitFor(() => expect(mutations).toEqual(['session', 'goal']))
+    await waitFor(() => expect(mutations).toContain('goal'))
+    expect(mutations.indexOf('session')).toBeLessThan(mutations.indexOf('goal'))
+    expect(sessionBodies[0]?.modelId).toBe('gpt-5.6-terra')
+    expect(modelTrigger.textContent).toContain('GPT-5.6-Terra')
     expect(screen.getAllByText('先设目标再执行').length).toBeGreaterThan(0)
     expect(screen.queryByText(/会话尚未创建成功/)).toBeNull()
+
+    // 已被 Goal 提前建行的空会话首发时，真实首消息标题还要 PATCH 回服务端；否则刷新会回退。
+    fireEvent.click(screen.getByRole('button', { name: '关闭' }))
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+    const composer = screen.getByPlaceholderText('和「全能助手」对话…')
+    fireEvent.change(composer, { target: { value: '首条消息成为会话标题' } })
+    fireEvent.click(screen.getByRole('button', { name: '发送' }))
+    await waitFor(() => expect(
+      patchBodies.some((body) => body.title === '首条消息成为会话标题'),
+    ).toBe(true))
   })
 
   test('team mode switch persists while reopening the agent picker', async () => {
@@ -586,7 +616,7 @@ describe('Aurora v5 — P3 对话前置（模型选择器 + 订阅/容器门）'
     render(<App />)
     await loginViaUi()
 
-    // 顶栏模型选择器与 Composer 底部均展示后端返回的首个模型名。
+    // Composer 输入条右侧的模型选择器展示后端返回的首个模型名。
     await waitFor(() => expect(screen.getAllByText('GPT-5.6-Sol').length).toBeGreaterThan(0))
     const modelsCall = fetchMock.mock.calls.find(([u]) => String(u).includes('/api/public/models'))
     expect(modelsCall).toBeTruthy()
@@ -798,6 +828,33 @@ function routedFetchTwoSessions() {
 }
 
 describe('Aurora v5 — P7 最小路由', () => {
+  test('boot 深链列表迟到前点新建：保持空白草稿，不被目标会话抢回', async () => {
+    window.history.replaceState({}, '', '/s/webhist01')
+    let resolveList!: (value: ReturnType<typeof okJson>) => void
+    const list = new Promise<ReturnType<typeof okJson>>((resolve) => { resolveList = resolve })
+    const base = routedFetchTwoSessions()
+    fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      if (String(url).includes('/api/sessions/list')) return list
+      return (base as unknown as (url: string, init?: RequestInit) => Promise<unknown>)(url, init)
+    }) as unknown as FetchMock
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: /新建会话/ }))
+    await waitFor(() => expect(window.location.pathname).toBe('/'))
+
+    await act(async () => {
+      resolveList(okJson(HIST_META_TWO))
+      await list
+    })
+    await waitFor(() => expect(screen.getByText('历史会话甲')).toBeInTheDocument())
+    expect(window.location.pathname).toBe('/')
+    expect(screen.queryByText('历史答复正文')).toBeNull()
+    expect(
+      fetchMock.mock.calls.some(([u]) => String(u).includes('/api/sessions/webhist01')),
+    ).toBe(false)
+  })
+
   test('boot 恢复 /s/<id>：URL 指定的会话优先于"最近会话"自动选中', async () => {
     // 深链到较旧的甲：若按"最近会话"逻辑会选中乙 —— 本用例锁定 URL 指定 > 最近会话。
     window.history.replaceState({}, '', '/s/webhist01')
@@ -942,14 +999,14 @@ describe('Aurora v5 — P7 最小路由', () => {
     await waitFor(
       () =>
         expect(
-          screen.getByRole('heading', { name: '公开数据到可复现的单车需求分析' }),
+          screen.getByRole('heading', { name: '你不用守着它。回来时，过程和成果都还在。' }),
         ).toBeInTheDocument(),
       { timeout: 5000 },
     )
     expect(window.location.search).toContain('campaign=docs')
     expect(window.location.search).toContain('case=research-bike-demand')
 
-    fireEvent.click(screen.getByRole('button', { name: /带着我的材料开始.*登录后试用/ }))
+    fireEvent.click(screen.getByRole('button', { name: /用我的材料开始.*登录后试用/ }))
     await waitFor(() =>
       expect(screen.getByRole('heading', { name: '欢迎使用 Aurora' })).toBeInTheDocument(),
     )

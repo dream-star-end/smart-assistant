@@ -34,6 +34,7 @@ import {
   isTurnTapeProcessControl,
 } from "./chat/render";
 import { friendlyDelegateResultPreview } from "./chat/reducer";
+import { sessionTitleFromText } from "./sessionTitle";
 
 /** turn 终态收敛(RFC §5 M5):server 载荷自证的 turn 终态类别。 */
 export type ServerTurnTerminal = "completed" | "error" | "interrupted";
@@ -181,6 +182,8 @@ export type StoredSession = {
   /** 会话级模型选择(per-session 持久化;同设备 reload 即时恢复,服务端 canonical 到达后
    *  server-wins。与 _lastRouting 语义不同:那是"最近实际发送"供合成续写,这是"用户选择"。 */
   _selectedModelId?: string;
+  /** 服务端 SessionMeta/Detail.pinned 的本地镜像。list 到达前的 IDB 注水用；不碰 DB。 */
+  _pinned?: boolean;
   _pendingDispatches?: StoredPendingDispatch[];
   /** Hydration-only view of the exact durable control journal. It is stored in
    * the existing v1 dispatch DB, never inline in the best-effort session row. */
@@ -1623,7 +1626,7 @@ export class SessionStore {
       hydrated.push({
         id: sessId,
         agentId: firstPayload.agentId ?? "main",
-        title: firstText.trim().slice(0, 40) || "新对话",
+        title: sessionTitleFromText(firstText),
         messages,
         createdAt: first.enqueuedAt,
         lastAt: items.at(-1)!.enqueuedAt,

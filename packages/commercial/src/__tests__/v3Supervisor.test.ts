@@ -39,6 +39,7 @@ import {
   v3UserLocalVolumeNameFor,
   v3UserConfigVolumeNameFor,
   resolveCcbBaselineMounts,
+  resolveV5CursorAuthMount,
   V3_CCB_BASELINE_SKILL_NAMES,
   V3_NETWORK_NAME,
   V3_GATEWAY_IP,
@@ -51,6 +52,7 @@ import {
   V3_CODEX_HOME_MOUNT,
   V3_USER_LOCAL_MOUNT,
   V3_USER_CONFIG_MOUNT,
+  V5_CURSOR_AUTH_RO_MOUNT,
   SupervisorError,
   classifyRuntimeArtifactFailure,
 } from "../agent-sandbox/index.js";
@@ -602,6 +604,62 @@ describe("v3ContainerNameFor / v3VolumeNameFor / v3ProjectsVolumeNameFor / v3{Co
   });
 });
 
+describe("resolveV5CursorAuthMount", () => {
+  function makeAuthDir(): string {
+    const dir = mkdtempSync(pathJoin(tmpdir(), "oc-cursor-auth-"));
+    chmodSync(dir, 0o700);
+    writeFileSync(pathJoin(dir, "api-key"), "crsr_dummy\n", { mode: 0o600 });
+    chmodSync(pathJoin(dir, "api-key"), 0o600);
+    return dir;
+  }
+
+  test("accepts only the configured local V5 owner and strict root-only metadata", () => {
+    const dir = makeAuthDir();
+    try {
+      const base = {
+        uid: 4,
+        runtimeChannel: "v5" as const,
+        useRemote: false,
+        ownerUid: "4",
+        authDir: dir,
+      };
+      assert.equal(resolveV5CursorAuthMount(base), dir);
+      assert.equal(resolveV5CursorAuthMount({ ...base, uid: 5 }), null);
+      assert.equal(resolveV5CursorAuthMount({ ...base, runtimeChannel: "v3" }), null);
+      assert.equal(resolveV5CursorAuthMount({ ...base, useRemote: true }), null);
+      assert.equal(resolveV5CursorAuthMount({ ...base, ownerUid: "04" }), null);
+      assert.equal(resolveV5CursorAuthMount({ ...base, authDir: "relative" }), null);
+
+      chmodSync(pathJoin(dir, "api-key"), 0o644);
+      assert.equal(resolveV5CursorAuthMount(base), null);
+      chmodSync(pathJoin(dir, "api-key"), 0o600);
+      chmodSync(dir, 0o755);
+      assert.equal(resolveV5CursorAuthMount(base), null);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects a symlinked api-key", () => {
+    const dir = makeAuthDir();
+    const target = pathJoin(dir, "real-key");
+    try {
+      rmSync(pathJoin(dir, "api-key"));
+      writeFileSync(target, "crsr_dummy\n", { mode: 0o600 });
+      symlinkSync(target, pathJoin(dir, "api-key"));
+      assert.equal(resolveV5CursorAuthMount({
+        uid: 4,
+        runtimeChannel: "v5",
+        useRemote: false,
+        ownerUid: "4",
+        authDir: dir,
+      }), null);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 // ───────────────────────────────────────────────────────────────────────
 //  provisionV3Container — happy path 全契约
 // ───────────────────────────────────────────────────────────────────────
@@ -873,6 +931,69 @@ describe("provisionV3Container", () => {
       else process.env.OC_RUNTIME_CHANNEL = savedChannel;
       if (savedPromptQueue === undefined) delete process.env.OC_PROMPT_QUEUE_V1;
       else process.env.OC_PROMPT_QUEUE_V1 = savedPromptQueue;
+    }
+  });
+
+  test("v5 Cursor auth bind is mounted only for configured local uid and never enters Docker Env", async () => {
+    const keys = [
+      "OC_RUNTIME_CHANNEL",
+      "OC_V5_CURSOR_OWNER_UID",
+      "OC_V5_CURSOR_AUTH_DIR",
+    ] as const;
+    const saved = new Map(keys.map((key) => [key, process.env[key]]));
+    const dir = mkdtempSync(pathJoin(tmpdir(), "oc-cursor-provision-"));
+    chmodSync(dir, 0o700);
+    writeFileSync(pathJoin(dir, "api-key"), "crsr_dummy\n", { mode: 0o600 });
+    chmodSync(pathJoin(dir, "api-key"), 0o600);
+    try {
+      process.env.OC_RUNTIME_CHANNEL = "v5";
+      process.env.OC_V5_CURSOR_OWNER_UID = "4";
+      process.env.OC_V5_CURSOR_AUTH_DIR = dir;
+
+      const ownerDocker = makeDocker();
+      await provisionV3Container(
+        {
+          docker: ownerDocker.docker,
+          pool: pool as unknown as Pool,
+          image: TEST_IMAGE,
+          selfHostId: TEST_HOST,
+          randomIp: () => "172.31.5.45",
+          randomSecret: fixedSecret("e".repeat(64)),
+        },
+        4,
+      );
+      const ownerOpts = ownerDocker.captured.containersCreated[0]!;
+      assert.ok(
+        ownerOpts.HostConfig?.Binds?.includes(`${dir}:${V5_CURSOR_AUTH_RO_MOUNT}:ro`),
+      );
+      assert.ok(
+        !(ownerOpts.Env ?? []).some((entry) =>
+          entry.includes("CURSOR") || entry.includes("crsr_dummy") || entry.includes(dir)
+        ),
+        "Cursor key, path, and feature config must stay out of Docker Env",
+      );
+
+      const otherDocker = makeDocker();
+      await provisionV3Container(
+        {
+          docker: otherDocker.docker,
+          pool: pool as unknown as Pool,
+          image: TEST_IMAGE,
+          selfHostId: TEST_HOST,
+          randomIp: () => "172.31.5.46",
+          randomSecret: fixedSecret("f".repeat(64)),
+        },
+        5,
+      );
+      const otherBinds = otherDocker.captured.containersCreated[0]?.HostConfig?.Binds ?? [];
+      assert.ok(!otherBinds.some((bind) => bind.includes(V5_CURSOR_AUTH_RO_MOUNT)));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      for (const key of keys) {
+        const previous = saved.get(key);
+        if (previous === undefined) delete process.env[key];
+        else process.env[key] = previous;
+      }
     }
   });
 

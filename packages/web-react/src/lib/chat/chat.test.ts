@@ -16,6 +16,7 @@ import {
   normalizeBridgeErrorCode,
   onopenSetInitialStatus,
   parsePartialJson,
+  safeBridgeErrorDetail,
   shouldAutoContinueEmptyTurn,
 } from "./pure";
 import {
@@ -346,6 +347,20 @@ describe("friendlyBridgeErrorMessage · 服务端 message 白名单", () => {
 
   test("container_outdated 正文指向刷新页面(不是重试)", () => {
     expect(friendlyBridgeErrorMessage("container_outdated")).toMatch(/刷新页面/);
+  });
+});
+
+describe("模型路由错误的公开文案与详情", () => {
+  test("route unavailable 使用供应商中性文案，不泄露 GPT 路由名", () => {
+    const message = friendlyBridgeErrorMessage("CODEX_ROUTE_UNAVAILABLE");
+    expect(message).toBe("模型服务暂时不可用，你的消息已保留，请稍后重试。");
+    expect(message).not.toContain("GPT");
+  });
+
+  test("无 trace 时不生成重复详情，有 trace 时只展示安全请求 ID", () => {
+    expect(safeBridgeErrorDetail("CODEX_ROUTE_UNAVAILABLE")).toBe("");
+    expect(safeBridgeErrorDetail("CODEX_ROUTE_UNAVAILABLE", " trace-12345678 "))
+      .toBe("请求 ID：trace-12345678");
   });
 });
 
@@ -2566,13 +2581,27 @@ describe("applyOutboundError double-frame suppression (§11)", () => {
     applyOutboundError(s, { type: "outbound.error", sessionKey: "k", channel: "webchat", peer: { id: "s1", kind: "dm" }, code: "some_new_code", message: "server shutting down", isFinal: true } as never);
     const err = s.messages.filter((m) => m.role === "assistant").at(-1)!;
     expect(err.text).toBe("系统暂时不可用，请稍后重试。"); // 友好通用,不抛裸英文
-    expect(err._errorDetail).toBe("系统暂时不可用，请稍后重试。");
+    expect(err._errorDetail).toBe("");
     expect(err._errorDetail).not.toMatch(/server shutting down/);
   });
 
   test("legacy Stop terminal renders as cancelled without telemetry or automatic recovery", () => {
     const s = sess();
     const user = addMessage(s, "user", "long task", { status: "sent", ts: 1 });
+    s.messages.push({
+      id: "m-placeholder",
+      role: "system",
+      text: "",
+      ts: 2,
+      _genPlaceholder: {
+        jobId: "a".repeat(32),
+        aspect: 1,
+        status: "running",
+        startedAt: 2,
+      },
+    });
+    s._sendingInFlight = true;
+    s._activeClientMessageId = user.id;
     const reportTurnError = vi.fn();
     const scheduleAutomaticRecovery = vi.fn();
     applyOutboundError(s, {
@@ -2590,10 +2619,12 @@ describe("applyOutboundError double-frame suppression (§11)", () => {
       role: "assistant",
       text: "本轮已取消。",
       _errorCode: "user_cancelled",
-      _errorDetail: "本轮已取消。",
+      _errorDetail: "",
     });
     expect(reportTurnError).not.toHaveBeenCalled();
     expect(scheduleAutomaticRecovery).not.toHaveBeenCalled();
+    expect(user.status).toBe("sent");
+    expect(s.messages.some((message) => message._genPlaceholder?.status === "running")).toBe(false);
   });
 
   test("only automatic-recovery taxonomy codes schedule recovery", () => {
@@ -2644,7 +2675,7 @@ describe("applyOutboundError double-frame suppression (§11)", () => {
     expect(s.messages.at(-1)).toMatchObject({
       role: "assistant",
       _clientMessageId: older.id,
-      _errorDetail: "任务执行暂时中断，你的消息已保留，可直接重试。",
+      _errorDetail: "",
     });
   });
 
@@ -2661,6 +2692,61 @@ describe("applyOutboundError double-frame suppression (§11)", () => {
     expect(s._sendingInFlight).toBe(false);
     expect(s.messages.find((m) => m.role === "user")?.status).toBe("error");
     expect(persistSession).toHaveBeenCalledWith("s1");
+  });
+
+  test.each(["stopped", "user_cancelled"])(
+    "legacy %s 保持用户消息已发送、清理运行中占位，且不自动恢复",
+    (code) => {
+      const s = sess();
+      const user = addMessage(s, "user", "long task", { status: "sending", ts: 1 });
+      s.messages.push({
+        id: "m-placeholder",
+        role: "system",
+        text: "",
+        ts: 2,
+        _genPlaceholder: {
+          jobId: "b".repeat(32),
+          aspect: 1,
+          status: "running",
+          startedAt: 2,
+        },
+      });
+      s._sendingInFlight = true;
+      s._activeClientMessageId = user.id;
+      const scheduleAutomaticRecovery = vi.fn();
+
+      applyLegacyBridgeError(
+        s,
+        { type: "error", code, message: "cancelled", clientMessageId: user.id } as never,
+        { scheduleAutomaticRecovery },
+      );
+
+      expect(user.status).toBe("sent");
+      expect(s.messages.some((message) => message._genPlaceholder?.status === "running")).toBe(false);
+      expect(scheduleAutomaticRecovery).not.toHaveBeenCalled();
+    },
+  );
+
+  test("无 clientMessageId 的取消只检查最近用户行，不改动更早的排队消息", () => {
+    for (const legacy of [false, true]) {
+      const s = sess();
+      const older = addMessage(s, "user", "older queued", { status: "queued", ts: 1 });
+      const recent = addMessage(s, "user", "recent sent", { status: "sent", ts: 2 });
+      if (legacy) {
+        applyLegacyBridgeError(s, { type: "error", code: "stopped", message: "cancelled" } as never);
+      } else {
+        applyOutboundError(s, {
+          type: "outbound.error",
+          channel: "webchat",
+          peer: { id: "s1", kind: "dm" },
+          code: "stopped",
+          message: "cancelled",
+          isFinal: true,
+        } as never);
+      }
+      expect(recent.status).toBe("sent");
+      expect(older.status).toBe("queued");
+    }
   });
 });
 
@@ -3624,6 +3710,441 @@ describe("ChatSocket interrupted continuation", () => {
     expect(session.messages.some((message) =>
       message.role === "assistant" && message.text === "exact final answer"
     )).toBe(true);
+    sock.stop();
+  });
+
+  test("durable journal rebuilds once, then appends only records after the shared cursor", async () => {
+    const sock = makeSocket();
+    const sessId = "s-live-cursor";
+    const clientMessageId = "cm-live-cursor";
+    const sessionKey = `agent:main:webchat:dm:${sessId}`;
+    const session = sock.ensureSession(sessId, "main");
+    session.messages.push(
+      { id: clientMessageId, role: "user", text: "long task", ts: 1, status: "sent" },
+      {
+        id: "stale-before-cursor",
+        role: "thinking",
+        text: "stale",
+        ts: 2,
+        _turnOwnerId: clientMessageId,
+      },
+    );
+    const record = (recordId: string, frameSeq: number, blocks: unknown[]) => ({
+      recordId,
+      streamKey: "dispatch:55555555-5555-4555-8555-555555555555:1",
+      source: "gateway" as const,
+      clientMessageId,
+      payload: {
+        type: "outbound.message",
+        sessionKey,
+        frameSeq,
+        peer: { id: sessId, kind: "dm" },
+        clientMessageId,
+        blocks,
+        isFinal: false,
+        ts: frameSeq + 10,
+      },
+    });
+    const initialAfter: string[] = [];
+    await sock.hydrateDurableLiveFrameJournal(
+      sessId,
+      async (after) => {
+        initialAfter.push(after);
+        return after === "0"
+          ? {
+              frames: [record("1", 1, [{ kind: "thinking", text: "visible thought" }])],
+              nextCursor: "1",
+              hasMore: false,
+              streamClientMessageIds: [clientMessageId],
+              hasTapeProjection: false,
+            }
+          : {
+              frames: [],
+              nextCursor: null,
+              hasMore: false,
+              streamClientMessageIds: [clientMessageId],
+              hasTapeProjection: false,
+            };
+      },
+      async () => {},
+    );
+    expect(initialAfter).toEqual(["0", "1"]);
+    expect(session.messages.find((message) => message.id === "stale-before-cursor")).toBeUndefined();
+
+    const incrementalAfter: string[] = [];
+    await sock.hydrateDurableLiveFrameJournal(
+      sessId,
+      async (after) => {
+        incrementalAfter.push(after);
+        return {
+          frames: [record("2", 2, [{ kind: "text", text: "visible answer" }])],
+          nextCursor: "2",
+          hasMore: false,
+          streamClientMessageIds: [clientMessageId],
+          hasTapeProjection: false,
+        };
+      },
+      async () => {},
+    );
+    expect(incrementalAfter).toEqual(["1"]);
+    expect(session.messages.filter((m) => m.role === "thinking" && m.text === "visible thought")).toHaveLength(1);
+    expect(session.messages.filter((m) => m.role === "assistant" && m.text === "visible answer")).toHaveLength(1);
+    sock.stop();
+  });
+
+  test("durable journal resets the reducer cursor when a replacement container restarts frameSeq", async () => {
+    const sock = makeSocket();
+    const sessId = "s-live-container-generation";
+    const sessionKey = `agent:main:webchat:dm:${sessId}`;
+    const oldClientMessageId = "cm-live-old-container";
+    const currentClientMessageId = "cm-live-current-container";
+    const session = sock.ensureSession(sessId, "main");
+    session.messages.push(
+      { id: oldClientMessageId, role: "user", text: "old interrupted task", ts: 1, status: "sent" },
+      {
+        id: "old-durable-thinking",
+        role: "thinking",
+        text: "OLD_GENERATION_PROCESS",
+        ts: 1_000,
+        _source: "server",
+        _turnOwnerId: oldClientMessageId,
+      },
+      {
+        id: "old-durable-answer",
+        role: "assistant",
+        text: "OLD_GENERATION_PARTIAL",
+        ts: 2_000,
+        _source: "server",
+        _turnOwnerId: oldClientMessageId,
+      },
+      { id: currentClientMessageId, role: "user", text: "current task", ts: 2, status: "sent" },
+    );
+    // This is the exact cold-refresh shape from production: IndexedDB still
+    // carries the high cursor from the previous container generation.
+    session._lastFrameSeqByKey = { [sessionKey]: 1_914 };
+    session._lastFrameSeq = 1_914;
+    session._sendingInFlight = true;
+    session._activeClientMessageId = currentClientMessageId;
+
+    const record = (
+      recordId: string,
+      streamKey: string,
+      clientMessageId: string,
+      frameSeq: number,
+      blocks: unknown[],
+      isFinal = false,
+    ) => ({
+      recordId,
+      streamKey,
+      source: "gateway" as const,
+      clientMessageId,
+      payload: {
+        type: "outbound.message",
+        sessionKey,
+        frameSeq,
+        peer: { id: sessId, kind: "dm" },
+        clientMessageId,
+        blocks,
+        isFinal,
+        // record_id order is also wall-clock order. A replacement container
+        // resets frameSeq, not the outbound timestamp.
+        ts: Number(recordId) * 1_000,
+      },
+    });
+    const oldStream = "dispatch:77777777-7777-4777-8777-777777777777:1";
+    const currentStream = "dispatch:88888888-8888-4888-8888-888888888888:1";
+    const requests: string[] = [];
+
+    await sock.hydrateDurableLiveFrameJournal(
+      sessId,
+      async (after) => {
+        requests.push(after);
+        return after === "0"
+          ? {
+              frames: [
+                record("1", oldStream, oldClientMessageId, 998, [{
+                  kind: "thinking", text: "OLD_GENERATION_PROCESS",
+                }]),
+                record("2", oldStream, oldClientMessageId, 1_914, [{
+                  kind: "text", text: "OLD_GENERATION_PARTIAL",
+                }], true),
+                record("3", currentStream, currentClientMessageId, 1, [{
+                  kind: "thinking", text: "CURRENT_GENERATION_PROCESS",
+                }]),
+                record("4", currentStream, currentClientMessageId, 2, [{
+                  kind: "text", text: "CURRENT_GENERATION_ANSWER",
+                }]),
+              ],
+              nextCursor: "4",
+              hasMore: false,
+              streamClientMessageIds: [oldClientMessageId, currentClientMessageId],
+              hasTapeProjection: false,
+            }
+          : {
+              frames: [], nextCursor: null, hasMore: false,
+              streamClientMessageIds: [oldClientMessageId, currentClientMessageId],
+              hasTapeProjection: false,
+            };
+      },
+      async () => {},
+    );
+
+    expect(requests).toEqual(["0", "4"]);
+    expect(session._lastFrameSeqByKey?.[sessionKey]).toBe(2);
+    expect(session.messages.some((message) =>
+      message.role === "thinking" && message.text === "OLD_GENERATION_PROCESS"
+    )).toBe(true);
+    expect(session.messages.some((message) =>
+      message.role === "assistant" && message.text === "OLD_GENERATION_PARTIAL"
+    )).toBe(true);
+    expect(session.messages.some((message) =>
+      message.role === "thinking" && message.text === "CURRENT_GENERATION_PROCESS"
+    )).toBe(true);
+    expect(session.messages.filter((message) =>
+      message.role === "assistant" && message.text === "CURRENT_GENERATION_ANSWER"
+    )).toHaveLength(1);
+
+    await sock.hydrateDurableLiveFrameJournal(
+      sessId,
+      async (after) => {
+        expect(after).toBe("4");
+        return {
+          frames: [record("5", currentStream, currentClientMessageId, 3, [{
+            kind: "text", text: "CURRENT_GENERATION_INCREMENT",
+          }])],
+          nextCursor: "5",
+          hasMore: false,
+          streamClientMessageIds: [oldClientMessageId, currentClientMessageId],
+          hasTapeProjection: false,
+        };
+      },
+      async () => {},
+    );
+    expect(session._lastFrameSeqByKey?.[sessionKey]).toBe(3);
+    const currentAnswer = session.messages
+      .filter((message) =>
+        message.role === "assistant" && message._turnOwnerId === currentClientMessageId
+      )
+      .map((message) => message.text)
+      .join("");
+    expect(currentAnswer).toContain("CURRENT_GENERATION_ANSWER");
+    expect(currentAnswer.split("CURRENT_GENERATION_INCREMENT")).toHaveLength(2);
+    sock.stop();
+  });
+
+  test("durable generation boundary keeps a newer live cursor below the old high-water mark", () => {
+    const sock = makeSocket();
+    const sessId = "s-live-generation-overlap";
+    const sessionKey = `agent:main:webchat:dm:${sessId}`;
+    const clientMessageId = "cm-live-generation-overlap";
+    const session = sock.ensureSession(sessId, "main");
+    session.messages.push({
+      id: clientMessageId,
+      role: "user",
+      text: "current task",
+      ts: 1,
+      status: "sent",
+    });
+    const generationCursor = new Map([[sessionKey, {
+      frameSeq: 1_914,
+      consumedAuthoritativeResetEpoch: 0,
+    }]]);
+    const payload = {
+      type: "outbound.message",
+      sessionKey,
+      frameSeq: 1,
+      peer: { id: sessId, kind: "dm" },
+      clientMessageId,
+      blocks: [{ kind: "thinking", text: "LIVE_BEFORE_JOURNAL" }],
+      isFinal: false,
+      ts: 3_000,
+    };
+    // sys.cold_start/resume or the live socket already admitted frame 1 from
+    // the replacement container before the durable copy reached the reducer.
+    session._lastFrameSeqByKey = { [sessionKey]: 0 };
+    session._lastFrameSeq = 0;
+    applyOutboundMessage(session, payload as unknown as OutboundMessageWire, {});
+    expect(session._lastFrameSeqByKey?.[sessionKey]).toBe(1);
+
+    sock.applyDurableLiveFrames(
+      sessId,
+      [{
+        recordId: "2",
+        streamKey: "dispatch:99999999-9999-4999-8999-999999999999:1",
+        source: "gateway",
+        clientMessageId,
+        payload,
+      }],
+      [],
+      generationCursor,
+    );
+
+    expect(session._lastFrameSeqByKey?.[sessionKey]).toBe(1);
+    expect(session.messages.filter((message) =>
+      message.role === "thinking" && message.text === "LIVE_BEFORE_JOURNAL"
+    )).toHaveLength(1);
+    sock.stop();
+  });
+
+  test("durable generation boundary does not replay a new live cursor above the old high-water mark", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    const sessId = "s-live-generation-high-overlap";
+    const sessionKey = `agent:main:webchat:dm:${sessId}`;
+    const clientMessageId = "cm-live-generation-high-overlap";
+    const session = sock.ensureSession(sessId, "main");
+    session.messages.push({
+      id: clientMessageId,
+      role: "user",
+      text: "current task",
+      ts: 1,
+      status: "sent",
+    });
+    session._lastFrameSeqByKey = { [sessionKey]: 1_914 };
+    session._lastFrameSeq = 1_914;
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.active_turn_replay_start",
+      sessionKey,
+      channel: "webchat",
+      peer: { id: sessId, kind: "dm" },
+      clientMessageId,
+    }) });
+    const livePayload = {
+      type: "outbound.message",
+      sessionKey,
+      frameSeq: 2_000,
+      peer: { id: sessId, kind: "dm" },
+      clientMessageId,
+      blocks: [{ kind: "thinking", text: "HIGH_LIVE_BEFORE_JOURNAL" }],
+      isFinal: false,
+      ts: 4_000,
+    };
+    ws.onmessage?.({ data: JSON.stringify(livePayload) });
+    expect(session._lastFrameSeqByKey?.[sessionKey]).toBe(2_000);
+
+    sock.applyDurableLiveFrames(
+      sessId,
+      [{
+        recordId: "2",
+        streamKey: "dispatch:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa:1",
+        source: "gateway",
+        clientMessageId,
+        payload: { ...livePayload, frameSeq: 1 },
+      }],
+      [],
+      new Map([[sessionKey, {
+        frameSeq: 1_914,
+        consumedAuthoritativeResetEpoch: 0,
+      }]]),
+    );
+
+    expect(session._lastFrameSeqByKey?.[sessionKey]).toBe(2_000);
+    expect(session.messages.filter((message) =>
+      message.role === "thinking" && message.text === "HIGH_LIVE_BEFORE_JOURNAL"
+    )).toHaveLength(1);
+    sock.stop();
+  });
+
+  test("failed incremental paging retries from the last committed cursor without duplicating frames", async () => {
+    const sock = makeSocket();
+    const sessId = "s-live-retry-cursor";
+    const clientMessageId = "cm-live-retry-cursor";
+    const sessionKey = `agent:main:webchat:dm:${sessId}`;
+    const session = sock.ensureSession(sessId, "main");
+    session.messages.push({ id: clientMessageId, role: "user", text: "long task", ts: 1, status: "sent" });
+    const record = (recordId: string, frameSeq: number, text: string) => ({
+      recordId,
+      streamKey: "dispatch:66666666-6666-4666-8666-666666666666:1",
+      source: "gateway" as const,
+      clientMessageId,
+      payload: {
+        type: "outbound.message",
+        sessionKey,
+        frameSeq,
+        peer: { id: sessId, kind: "dm" },
+        clientMessageId,
+        blocks: [{ kind: "text", text }],
+        isFinal: false,
+        ts: frameSeq + 10,
+      },
+    });
+    await sock.hydrateDurableLiveFrameJournal(
+      sessId,
+      async () => ({
+        frames: [], nextCursor: null, hasMore: false,
+        streamClientMessageIds: [clientMessageId], hasTapeProjection: false,
+      }),
+      async () => {},
+    );
+
+    let failedPage = 0;
+    await expect(sock.hydrateDurableLiveFrameJournal(
+      sessId,
+      async (after) => {
+        failedPage += 1;
+        if (failedPage === 1) {
+          expect(after).toBe("0");
+          return {
+            frames: [record("1", 1, "first exact delta")], nextCursor: "1", hasMore: true,
+            streamClientMessageIds: [clientMessageId], hasTapeProjection: false,
+          };
+        }
+        throw new Error("page unavailable");
+      },
+      async () => {},
+    )).rejects.toThrow("page unavailable");
+
+    const retryAfter: string[] = [];
+    await sock.hydrateDurableLiveFrameJournal(
+      sessId,
+      async (after) => {
+        retryAfter.push(after);
+        return after === "0"
+          ? {
+              frames: [record("1", 1, "first exact delta")], nextCursor: "1", hasMore: true,
+              streamClientMessageIds: [clientMessageId], hasTapeProjection: false,
+            }
+          : {
+              frames: [record("2", 2, "second exact delta")], nextCursor: "2", hasMore: false,
+              streamClientMessageIds: [clientMessageId], hasTapeProjection: false,
+            };
+      },
+      async () => {},
+    );
+    expect(retryAfter).toEqual(["0", "1"]);
+    const assistantText = session.messages
+      .filter((message) => message.role === "assistant")
+      .map((message) => message.text)
+      .join("");
+    expect(assistantText.split("first exact delta")).toHaveLength(2);
+    expect(assistantText.split("second exact delta")).toHaveLength(2);
+    sock.stop();
+  });
+
+  test("a live owner projecting to tape triggers one authoritative cutover read", async () => {
+    const sock = makeSocket();
+    const sessId = "s-live-tape-cutover";
+    const clientMessageId = "cm-live-tape-cutover";
+    sock.ensureSession(sessId, "main");
+    const applyTapeProjection = vi.fn(async () => {});
+    const page = (owners: string[], hasTapeProjection: boolean) => async () => ({
+      frames: [], nextCursor: null, hasMore: false,
+      streamClientMessageIds: owners, hasTapeProjection,
+    });
+
+    await sock.hydrateDurableLiveFrameJournal(
+      sessId,
+      page([clientMessageId], false),
+      applyTapeProjection,
+    );
+    expect(applyTapeProjection).not.toHaveBeenCalled();
+    await sock.hydrateDurableLiveFrameJournal(sessId, page([], true), applyTapeProjection);
+    expect(applyTapeProjection).toHaveBeenCalledTimes(1);
+    await sock.hydrateDurableLiveFrameJournal(sessId, page([], true), applyTapeProjection);
+    expect(applyTapeProjection).toHaveBeenCalledTimes(1);
     sock.stop();
   });
 
@@ -5518,6 +6039,43 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     expect(syncSession).toHaveBeenCalledTimes(2);
     expect(session._reconciling).toBe(false);
     expect(session._recoveryStatus?.kind).toBe("completed");
+    sock.stop();
+  });
+
+  test("successful active journal sync stays on a one-second live cadence", async () => {
+    vi.useFakeTimers();
+    let sock!: ChatSocket;
+    const syncSession = vi.fn(async () => {
+      if (syncSession.mock.calls.length === 3) {
+        const session = sock.sessions.get("s1")!;
+        session._sendingInFlight = false;
+        session._activeClientMessageId = undefined;
+      }
+      return true;
+    });
+    sock = makeSocket({ syncSession });
+    const now = Date.now();
+    sock.loadStored({
+      id: "s1",
+      agentId: "main",
+      title: "s1",
+      messages: [{ id: "u-live", role: "user", text: "long task", ts: now, status: "sent" }],
+      createdAt: now,
+      lastAt: now,
+      _sendingInFlight: true,
+      _activeClientMessageId: "u-live",
+      _turnStartedAt: now,
+    });
+
+    await Promise.resolve();
+    expect(syncSession).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(syncSession).toHaveBeenCalledTimes(2);
+    // Attempt 2 used to back off for two seconds even though REST was healthy,
+    // leaving a broken-WS client visibly stale. A successful poll stays at 1s.
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(syncSession).toHaveBeenCalledTimes(3);
+    expect(sock.sessions.get("s1")?._reconciling).toBe(false);
     sock.stop();
   });
 

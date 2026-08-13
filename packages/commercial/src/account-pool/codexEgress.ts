@@ -61,6 +61,14 @@ export async function resolveCodexAccountEgressDispatcher(
   accountId: bigint | string,
   deps: CodexEgressResolverDeps = {},
 ): Promise<CodexEgressDispatcher> {
+  return resolveOfficialOAuthAccountEgressDispatcher(accountId, 'codex', deps)
+}
+
+export async function resolveOfficialOAuthAccountEgressDispatcher(
+  accountId: bigint | string,
+  provider: 'codex' | 'grok',
+  deps: CodexEgressResolverDeps = {},
+): Promise<CodexEgressDispatcher> {
   const id = String(accountId)
   const queryFn = deps.queryFn ?? query
   const keyFn = deps.keyFn ?? loadKmsKey
@@ -83,10 +91,10 @@ export async function resolveCodexAccountEgressDispatcher(
   if (!row) {
     throw new CodexEgressError('account_not_found', `codex account ${id} not found`, { accountId: id })
   }
-  if (row.provider !== 'codex') {
+  if (row.provider !== provider) {
     throw new CodexEgressError(
       'provider_mismatch',
-      `account ${id} is provider=${row.provider}, expected codex`,
+      `account ${id} is provider=${row.provider}, expected ${provider}`,
       { accountId: id, proxyId: row.egress_proxy_id },
     )
   }

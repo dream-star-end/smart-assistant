@@ -404,7 +404,7 @@ describe("V5 CCB baseline remount classification", () => {
       },
     };
     await verifyPlatformCliLinks(container as never);
-    assert.match(command, /for name in oc-plugin oc-ocr oc-h3 oc-video/);
+    assert.match(command, /for name in oc-plugin oc-ocr oc-h3 oc-video oc-cursor/);
     assert.match(command, /\/home\/agent\/\.local\/bin\/\$name/);
     assert.match(command, /\/run\/oc\/platform\/current\/bin\/\$name/);
     assert.match(command, /readlink/);

@@ -38,6 +38,10 @@ function serializeSetting(
     updated_by: row.updated_by,
     is_default: row.is_default,
     meta,
+    audit: {
+      action: "system_settings.set",
+      target: `setting:${row.key}`,
+    },
   };
 }
 

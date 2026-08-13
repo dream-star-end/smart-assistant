@@ -45,6 +45,7 @@ export function OutboxTab({ events }: { events: EventMeta[] }) {
   const { data, loading, error, reload } = useReloadable<{ rows: OutboxRow[]; next_before: string | null }>(
     () => adminGet("/alerts/outbox", { limit, event_type: eventType, status }),
     [eventType, status, limit],
+    { intervalMs: 15_000 },
   );
 
   const rows = useMemo(() => {

@@ -40,6 +40,7 @@ EXPECTED_SKILLS=(
   office-pdf
   office-suite
   coding-suite
+  cursor-cli
   code-review
   debugging
   testing
@@ -48,6 +49,8 @@ EXPECTED_SKILLS=(
   app-connectors
   connector-authoring
 )
+
+ALLOW_LEGACY_MISSING_CURSOR=0
 
 die() {
   printf 'FATAL: V5 CCB baseline guard: %s\n' "$*" >&2
@@ -84,7 +87,11 @@ assert_structure() { # <baseline-dir>
   [[ -f "$root/AGENTS.md" && -f "$root/CLAUDE.md" && -d "$root/skills" ]] \
     || die "AGENTS.md, CLAUDE.md and skills/ are required"
 
-  skills_expected="$(printf '%s\n' "${EXPECTED_SKILLS[@]}" | sorted_lines)"
+  if [[ "$ALLOW_LEGACY_MISSING_CURSOR" == 1 && ! -e "$root/skills/cursor-cli" ]]; then
+    skills_expected="$(printf '%s\n' "${EXPECTED_SKILLS[@]}" | grep -vx cursor-cli | sorted_lines)"
+  else
+    skills_expected="$(printf '%s\n' "${EXPECTED_SKILLS[@]}" | sorted_lines)"
+  fi
   # Runtime resolveCcbBaselineMounts() enumerates every skills/ entry before it
   # validates directories. Mirror that exact boundary: an undeclared regular
   # file at this level is manifest drift too, not something to silently ignore.
@@ -94,6 +101,7 @@ assert_structure() { # <baseline-dir>
   # 与 runtime resolveCcbBaselineMounts() 同一白名单(2026-07-16 扩展):
   # skill 目录允许恰好 {SKILL.md} 或 {SKILL.md, evals/};evals/ 内恰好一个 evals.json。
   for skill in "${EXPECTED_SKILLS[@]}"; do
+    [[ "$ALLOW_LEGACY_MISSING_CURSOR" == 1 && "$skill" == cursor-cli && ! -e "$root/skills/$skill" ]] && continue
     [[ -d "$root/skills/$skill" ]] || die "missing skill directory: $skill"
     entries="$(find -P "$root/skills/$skill" -mindepth 1 -maxdepth 1 -printf '%f\n' | sorted_lines)"
     if [[ "$entries" == "SKILL.md" ]]; then
@@ -160,6 +168,8 @@ usage() {
 usage:
   v5-baseline-security.sh check-release <absolute-release-root>
   v5-baseline-security.sh harden-release <absolute-release-root>
+  v5-baseline-security.sh check-release-legacy-cursor <absolute-release-root>
+  v5-baseline-security.sh harden-release-legacy-cursor <absolute-release-root>
   v5-baseline-security.sh check-dir <absolute-baseline-dir>
   v5-baseline-security.sh harden-dir <absolute-baseline-dir>
 EOF
@@ -172,6 +182,8 @@ path="$2"
 case "$mode" in
   check-release)   check_baseline "${path%/}/$BASELINE_REL" ;;
   harden-release)  harden_baseline "${path%/}/$BASELINE_REL" ;;
+  check-release-legacy-cursor) ALLOW_LEGACY_MISSING_CURSOR=1; check_baseline "${path%/}/$BASELINE_REL" ;;
+  harden-release-legacy-cursor) ALLOW_LEGACY_MISSING_CURSOR=1; harden_baseline "${path%/}/$BASELINE_REL" ;;
   check-dir)       check_baseline "${path%/}" ;;
   harden-dir)      harden_baseline "${path%/}" ;;
   *) usage ;;

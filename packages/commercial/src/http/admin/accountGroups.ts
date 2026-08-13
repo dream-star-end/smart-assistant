@@ -80,8 +80,8 @@ function parseGroupCreate(b: Record<string, unknown>): AdminCreateAccountGroupIn
   if (b.kind !== "official_oauth" && b.kind !== "api_relay") {
     throw new HttpError(400, "VALIDATION", "kind must be official_oauth or api_relay");
   }
-  if (b.provider !== "claude" && b.provider !== "codex") {
-    throw new HttpError(400, "VALIDATION", "provider must be claude or codex");
+  if (b.provider !== "claude" && b.provider !== "codex" && b.provider !== "grok") {
+    throw new HttpError(400, "VALIDATION", "provider must be claude, codex, or grok");
   }
   const input: AdminCreateAccountGroupInput = {
     label: b.label,

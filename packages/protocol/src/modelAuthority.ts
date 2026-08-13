@@ -95,7 +95,7 @@ export type JsonValue =
   | readonly JsonValue[]
   | { readonly [key: string]: JsonValue }
 
-export type ModelAuthorityEngine = 'ccb' | 'codex'
+export type ModelAuthorityEngine = 'ccb' | 'codex' | 'grok' | 'cursor'
 
 /**
  * 该模型的**完整规范化执行语义**(方案 §2 R2-B3):容器该 turn 的 engine/capability/
@@ -870,7 +870,7 @@ function modelList(o: Record<string, unknown>, key: string): readonly string[] {
 
 function engine(o: Record<string, unknown>, key: string): ModelAuthorityEngine {
   const v = o[key]
-  if (v !== 'ccb' && v !== 'codex') {
+  if (v !== 'ccb' && v !== 'codex' && v !== 'grok' && v !== 'cursor') {
     throw new ModelAuthorityError('BadShape', `field ${key}: unknown engine ${String(v)}`)
   }
   return v

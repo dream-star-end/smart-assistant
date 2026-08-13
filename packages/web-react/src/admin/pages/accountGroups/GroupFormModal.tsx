@@ -36,6 +36,7 @@ export function GroupFormModal({
   const isCreate = !group;
   const [label, setLabel] = useState("");
   const [kind, setKind] = useState<"official_oauth" | "api_relay">("api_relay");
+  const [provider, setProvider] = useState<"claude" | "codex" | "grok">("codex");
   const [enabled, setEnabled] = useState(true);
   const [priority, setPriority] = useState("100");
   const [models, setModels] = useState("");
@@ -45,6 +46,7 @@ export function GroupFormModal({
     if (!open) return;
     setLabel(group?.label ?? "");
     setKind(group?.kind ?? "api_relay");
+    setProvider((group?.provider as "claude" | "codex" | "grok" | undefined) ?? "codex");
     setEnabled(group?.enabled ?? true);
     setPriority(String(group?.priority ?? 100));
     setModels((group?.models ?? []).join(", "));
@@ -67,7 +69,7 @@ export function GroupFormModal({
         await adminSend("POST", "/account-groups", {
           label: lbl,
           kind,
-          provider: "claude",
+          provider,
           enabled,
           priority: prio,
           models: parseModels(models),
@@ -123,7 +125,11 @@ export function GroupFormModal({
         {isCreate && (
           <div className="grid grid-cols-2 gap-3">
             <Field label="类型">
-              <Select value={kind} onChange={(e) => setKind(e.target.value as typeof kind)}>
+              <Select value={kind} onChange={(e) => {
+                const next = e.target.value as typeof kind;
+                setKind(next);
+                if (next === "api_relay") setProvider("codex");
+              }}>
                 {GROUP_KINDS.map((k) => (
                   <option key={k} value={k}>
                     {k === "official_oauth" ? "官方 OAuth 订阅" : "API 中转站"}
@@ -131,9 +137,11 @@ export function GroupFormModal({
                 ))}
               </Select>
             </Field>
-            <Field label="provider" hint="v5 ccb-only:仅 claude。">
-              <Select value="claude" disabled>
-                <option value="claude">claude</option>
+            <Field label="provider" hint={kind === "api_relay" ? "API 中转站仅支持 codex。" : "官方订阅账号池。"}>
+              <Select value={provider} onChange={(e) => setProvider(e.target.value as typeof provider)} disabled={kind === "api_relay"}>
+                {kind === "official_oauth" && <option value="claude">claude</option>}
+                <option value="codex">codex</option>
+                {kind === "official_oauth" && <option value="grok">grok</option>}
               </Select>
             </Field>
           </div>

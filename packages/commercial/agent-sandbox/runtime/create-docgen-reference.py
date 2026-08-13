@@ -52,10 +52,10 @@ def patch_styles_xml(styles: str) -> str:
         styles,
         count=1,
     )
-    styles = re.sub(r'<w:spacing w:after="200"\s*/>', '<w:spacing w:after="120" w:line="360" w:lineRule="auto" />', styles, count=1)
+    styles = re.sub(r'<w:spacing w:after="200"\s*/>', '<w:spacing w:after="120" w:line="324" w:lineRule="auto" />', styles, count=1)
 
-    body_ppr = '<w:pPr><w:spacing w:before="80" w:after="120" w:line="360" w:lineRule="auto" /></w:pPr>'
-    body_rpr = '<w:rPr><w:rFonts w:ascii="Aptos" w:hAnsi="Aptos" w:eastAsia="Microsoft YaHei" w:cs="Times New Roman" /><w:sz w:val="22" /><w:szCs w:val="22" /></w:rPr>'
+    body_ppr = '<w:pPr><w:spacing w:before="80" w:after="120" w:line="324" w:lineRule="auto" /></w:pPr>'
+    body_rpr = '<w:rPr><w:rFonts w:ascii="Aptos" w:hAnsi="Aptos" w:eastAsia="Microsoft YaHei" w:cs="Times New Roman" /><w:sz w:val="21" /><w:szCs w:val="21" /></w:rPr>'
     styles = patch_style(styles, "Normal", ppr=body_ppr, rpr=body_rpr)
     styles = patch_style(styles, "BodyText", ppr=body_ppr, rpr=body_rpr)
 
@@ -63,16 +63,16 @@ def patch_styles_xml(styles: str) -> str:
         styles,
         "Title",
         ppr='<w:pPr><w:jc w:val="center" /><w:spacing w:before="240" w:after="240" /></w:pPr>',
-        rpr='<w:rPr><w:rFonts w:ascii="Aptos Display" w:hAnsi="Aptos Display" w:eastAsia="Microsoft YaHei" /><w:b /><w:color w:val="1F4E79" /><w:sz w:val="40" /><w:szCs w:val="40" /></w:rPr>',
+        rpr='<w:rPr><w:rFonts w:ascii="Aptos Display" w:hAnsi="Aptos Display" w:eastAsia="Microsoft YaHei" /><w:b /><w:color w:val="1F4E79" /><w:sz w:val="52" /><w:szCs w:val="52" /></w:rPr>',
     )
     styles = patch_style(
         styles,
         "Subtitle",
         ppr='<w:pPr><w:jc w:val="center" /><w:spacing w:after="240" /></w:pPr>',
-        rpr='<w:rPr><w:rFonts w:ascii="Aptos" w:hAnsi="Aptos" w:eastAsia="Microsoft YaHei" /><w:color w:val="666666" /><w:sz w:val="24" /><w:szCs w:val="24" /></w:rPr>',
+        rpr='<w:rPr><w:rFonts w:ascii="Aptos" w:hAnsi="Aptos" w:eastAsia="Microsoft YaHei" /><w:color w:val="666666" /><w:sz w:val="26" /><w:szCs w:val="26" /></w:rPr>',
     )
     heading_specs = {
-        "Heading1": ("1F4E79", "32", "360", "160"),
+        "Heading1": ("1F4E79", "36", "360", "160"),
         "Heading2": ("2F5597", "28", "280", "120"),
         "Heading3": ("3B6EA8", "24", "220", "100"),
     }
@@ -92,12 +92,47 @@ def patch_styles_xml(styles: str) -> str:
             ppr='<w:pPr><w:jc w:val="center" /><w:spacing w:before="80" w:after="120" /></w:pPr>',
             rpr=caption_rpr,
         )
+    styles = patch_style(
+        styles,
+        "BlockText",
+        ppr='<w:pPr><w:ind w:left="700" w:right="400" /><w:spacing w:before="80" w:after="140" /><w:pBdr><w:left w:val="single" w:sz="10" w:space="8" w:color="1F4E79" /></w:pBdr></w:pPr>',
+        rpr='<w:rPr><w:rFonts w:ascii="Aptos" w:hAnsi="Aptos" w:eastAsia="Microsoft YaHei" /><w:i /><w:color w:val="666666" /><w:sz w:val="21" /><w:szCs w:val="21" /></w:rPr>',
+    )
+    styles = patch_style(
+        styles,
+        "VerbatimChar",
+        rpr='<w:rPr><w:rFonts w:ascii="Consolas" w:hAnsi="Consolas" w:eastAsia="Microsoft YaHei" /><w:sz w:val="19" /><w:szCs w:val="19" /></w:rPr>',
+    )
     return styles
 
 
 def patch_settings_xml(settings: str) -> str:
-    # Prefer modern compatibility mode. If upstream changes remove the tag, skip.
-    return re.sub(r'<w:zoom\b[^>]*/>', '<w:zoom w:percent="100" />', settings, count=1)
+    # Prefer modern compatibility mode and request TOC/page-field refresh on open.
+    settings = re.sub(r'<w:zoom\b[^>]*/>', '<w:zoom w:percent="100" />', settings, count=1)
+    if "<w:updateFields" not in settings:
+        settings = settings.replace("</w:settings>", '<w:updateFields w:val="true" /></w:settings>')
+    return settings
+
+
+def patch_document_xml(document: str) -> str:
+    """Set the empty Pandoc reference section to A4 and readable margins."""
+    section = (
+        '<w:sectPr>'
+        '<w:pgSz w:w="11906" w:h="16838" />'
+        '<w:pgMar w:top="1247" w:right="1247" w:bottom="1134" w:left="1361" '
+        'w:header="567" w:footer="567" w:gutter="0" />'
+        '</w:sectPr>'
+    )
+    patched, count = re.subn(
+        r'<w:sectPr\b[^>]*(?:/>|>.*?</w:sectPr>)',
+        section,
+        document,
+        count=1,
+        flags=re.S,
+    )
+    if count != 1:
+        raise RuntimeError("section properties not found in Pandoc reference.docx")
+    return patched
 
 
 def main() -> int:
@@ -119,6 +154,9 @@ def main() -> int:
         settings_path = src / "word" / "settings.xml"
         if settings_path.exists():
             settings_path.write_text(patch_settings_xml(settings_path.read_text(encoding="utf-8")), encoding="utf-8")
+
+        document_path = src / "word" / "document.xml"
+        document_path.write_text(patch_document_xml(document_path.read_text(encoding="utf-8")), encoding="utf-8")
 
         tmp_out = out.with_suffix(out.suffix + ".tmp")
         if tmp_out.exists():

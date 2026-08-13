@@ -20,9 +20,14 @@ import {
   ImageEditActionsContext,
   type ImageEditSubmit,
 } from "./components/chat/imageEditActions";
-import { extractLatestTodos, PinnedTaskTracker } from "./components/chat/PinnedTaskTracker";
+import {
+  extractLatestTodos,
+  isPinnedTaskTrackerVisible,
+  PinnedTaskTracker,
+} from "./components/chat/PinnedTaskTracker";
+import { BoundRepoCard } from "./components/contextRail/BoundRepoCard";
+import { ContextRail } from "./components/contextRail/ContextRail";
 import { deriveActivePlanStep, type TurnActivityInfo } from "./components/chat/TurnActivity";
-import { RecoveryStatusCard } from "./components/chat/RecoveryStatusCard";
 import { EmptyState } from "./components/EmptyState";
 import { type ChatError, ErrorBanner } from "./components/ErrorBanner";
 import { UpdateBanner } from "./components/UpdateBanner";
@@ -31,6 +36,7 @@ import { RepoStatusBanner } from "./components/github/RepoStatusBanner";
 import { InboxDialog } from "./components/InboxDialog";
 import { PendingPaymentRecovery } from "./components/payment/PendingPaymentRecovery";
 import { CHAT_CREATE_TEMPLATES } from "./lib/chatCreateTemplates";
+import { sessionTitleFromText } from "./lib/sessionTitle";
 // 分区注册表在 lib（不是 ManageCenter）：ManageCenter 是 lazy chunk，从组件里取值会把
 // 六个面板一起拖进主包。默认落地页 = 注册表首位，两处不再各写各的。
 import { DEFAULT_MANAGE_TAB, type ManageTab } from "./lib/manageTabs";
@@ -73,7 +79,9 @@ import { type UseChatSocket, useChatSocket } from "./hooks/useChatSocket";
 import { useInbox } from "./hooks/useInbox";
 import { useOptimizerPending } from "./hooks/useOptimizerPending";
 import { useRepoBinding } from "./hooks/useRepoBinding";
+import { useContextRailHidden } from "./hooks/useContextRailHidden";
 import { useTheme } from "./hooks/useTheme";
+import { useXlViewport } from "./hooks/useXlViewport";
 import { useToast } from "./components/ui";
 import { githubErrorText } from "./lib/github";
 import { connectorErrorText } from "./lib/connectors";
@@ -239,6 +247,8 @@ export function App() {
   // 主题的唯一权威源：useTheme 是「挂载读 localStorage」的单实例，经 props 下传给顶栏快捷开关
   // 与设置中心「偏好·外观」分区，二者共享同一状态——杜绝多个 useTheme 实例各自镜像、互不同步。
   const { theme, setTheme, cycle } = useTheme();
+  const isXl = useXlViewport();
+  const [railHidden, setRailHidden] = useContextRailHidden();
 
   // 公开配置（Turnstile bypass / site key）：登录页驱动 AuthGate 是否渲染真 widget。
   const [publicCfg, setPublicCfg] = useState<PublicConfig | null>(null);
@@ -490,6 +500,7 @@ export function App() {
       interrupt();
       setMessages([]);
       setChatError(null);
+      setPendingRouteSession(null);
     },
     onDeleteSession: (id) => {
       localStore.current.delete(id);
@@ -501,8 +512,6 @@ export function App() {
     },
     // URL 深链恢复未决：暂停自动选中（URL 指定 > 最近会话）。
     holdAutoSelect: pendingRouteSession !== null,
-    // 新建会话占位定格当前有效模型(含空态显式选择,防被 resolver 按 default 覆盖)。
-    currentModelId: () => modelId,
   });
 
   // ── per-session 模型选择(会话间互不影响,持久化恢复)────────────────────────
@@ -581,6 +590,7 @@ export function App() {
     ) => {
       setChatError(null);
       const visibleText = displayText ?? text;
+      const sessionTitle = sessionTitleFromText(visibleText);
 
       // demo：本地流式回放（无网络），仅用于离线预览设计。
       if (demo) {
@@ -627,7 +637,7 @@ export function App() {
         sessionId = genWsSessionId();
         createdSession = {
           id: sessionId,
-          title: visibleText.slice(0, 24) || "新对话",
+          title: sessionTitle,
           ownerUserId: user.id,
           updatedAt: new Date().toISOString(),
           messageCount: 0,
@@ -641,7 +651,17 @@ export function App() {
         // per-session 键 —— 否则该会话只靠全局默认,会被其它会话的开关翻动(切走再回来变样)。
         writeTeamMode(sessionId, teamMode);
       }
-      sockRef.current?.ensureSession(sessionId, agent.id, visibleText.slice(0, 24));
+      const materializedDraft =
+        !createdSession && sessions.some((session) => session.id === sessionId && session.messageCount === 0);
+      sockRef.current?.ensureSession(sessionId, agent.id, sessionTitle);
+      if (materializedDraft) {
+        // Goal/GitHub 可在首条消息前物化服务端行。首发时须同步收敛真正标题；否则
+        // 后端幂等 INSERT 不更新既有行，刷新后 listSessions 会把「新对话」盖回来。
+        sockRef.current?.renameSession(sessionId, sessionTitle);
+        void api.patchSessionTitle(authRef.current, sessionId, sessionTitle).catch(() => {
+          // 行尚未建时 PATCH 可 404；随后 send 的幂等 PUT 会使用上面已更新的 socket 标题。
+        });
+      }
       // model / effortLevel 都是 inbound.message 顶层路由字段。用户未设置 effort 或
       // 当前模型不支持时省略,让模型沿用自身默认。
       // media：已上传附件（图片/文件等），随 inbound.message.content.media 发送。
@@ -668,11 +688,11 @@ export function App() {
         const sid = sessionId!;
         const found = c.find((s) => s.id === sid);
         const base: Session =
-          found ?? createdSession ?? { id: sid, title: visibleText.slice(0, 24) || "新对话", ownerUserId: user.id, updatedAt: "", messageCount: 0 };
+          found ?? createdSession ?? { id: sid, title: sessionTitle, ownerUserId: user.id, updatedAt: "", messageCount: 0 };
         const updated: Session = {
           ...base,
           id: sid,
-          title: found?.title && found.messageCount > 0 ? found.title : visibleText.slice(0, 24) || "新对话",
+          title: found?.title && found.messageCount > 0 ? found.title : sessionTitle,
           updatedAt: new Date().toISOString(),
           messageCount: (found?.messageCount ?? 0) + 1,
         };
@@ -691,6 +711,7 @@ export function App() {
       models,
       preferenceEffort,
       teamMode,
+      sessions,
       setSessions,
       setActiveId,
     ],
@@ -814,10 +835,8 @@ export function App() {
     [image2Available, submitImageEdit, submitImageComment, image2UnavailableReason],
   );
 
-  // 会话物化:GitHub 绑定是 per-session,新会话未发首条消息前 activeId 为空 → 绑定确定钮
-  // 恒禁用(!sessionId)。需要绑定时先物化一个会话占位(与「+新对话」同款:仅生成 peer.id +
-  // 入侧栏 + 选中,不提前 ensureSession/持久化——空会话不占 service 槽位)。sessionId 立即可用;
-  // 真绑定时 sendRepoBind 内部会自行 ensureSession+hello 注册 peer;首条消息也复用该会话。
+  // 会话物化:新建按钮本身只进入空白草稿态；GitHub 绑定 / 设定目标这类明确依赖
+  // per-session 身份的首轮前操作，才在用户确认操作时物化一个会话 id。
   const ensureActiveSession = useCallback((): string | undefined => {
     if (demo || !user) return activeId;
     if (activeId) return activeId;
@@ -828,11 +847,16 @@ export function App() {
       ownerUserId: user.id,
       updatedAt: new Date().toISOString(),
       messageCount: 0,
+      ...(modelId ? { modelId } : {}),
     };
+    // 首轮前操作会紧接着 ensureServerSession/sendRepoBind；先把空白态显式模型写入
+    // ChatSession，确保建行 PUT 与后续首发都携带同一选择，不被 activeId effect 回落默认值。
+    sockRef.current?.ensureSession(id, agent.id, "新对话");
+    if (modelId) sockRef.current?.setSessionModel(id, modelId);
     setSessions((c) => [s, ...c]);
     setActiveId(id);
     return id;
-  }, [demo, user, activeId, setSessions, setActiveId]);
+  }, [demo, user, activeId, agent.id, modelId, setSessions, setActiveId]);
 
   // 打开 GitHub 绑定 modal:先确保有承载会话,否则「确认绑定」因 !sessionId 恒禁用
   // (输入框底部入口 → 发消息前即可绑定)。
@@ -1343,14 +1367,16 @@ export function App() {
     expectedStateRevision: number;
   }) => {
     const auth = authRef.current;
-    if (!auth || !activeId) return;
+    if (!auth) return;
+    const sessionId = activeId ?? ensureActiveSession();
+    if (!sessionId) return;
     const sessionTitle =
-      activeSess?.title ?? sessions.find((session) => session.id === activeId)?.title ?? "新对话";
-    const ensured = await sockRef.current?.ensureServerSession(activeId, agent.id, sessionTitle);
+      activeSess?.title ?? sessions.find((session) => session.id === sessionId)?.title ?? "新对话";
+    const ensured = await sockRef.current?.ensureServerSession(sessionId, agent.id, sessionTitle);
     if (!ensured) throw new Error("会话尚未创建成功，请检查网络后重试");
-    const goal = await api.setSessionGoal(auth, activeId, input);
-    sockRef.current?.setGoalState(activeId, goal);
-  }, [activeId, activeSess?.title, agent.id, sessions]);
+    const goal = await api.setSessionGoal(auth, sessionId, input);
+    sockRef.current?.setGoalState(sessionId, goal);
+  }, [activeId, activeSess?.title, agent.id, ensureActiveSession, sessions]);
 
   const transitionSessionGoal = useCallback(async (
     action: "pause" | "resume" | "complete" | "clear",
@@ -1374,6 +1400,7 @@ export function App() {
       startedAt: activeSess._turnStartedAt ?? null,
       lastFrameAt: activeSess._lastFrameAt,
       turnStatus: activeSess._turnStatus ?? null,
+      recoveryStatus: activeSess._recoveryStatus ?? null,
       coldStart: !!activeSess._isFirstTurnAfterReady,
       agentName: agent.name || "助手",
       leaderStep: teamLeaderActive ? deriveActivePlanStep(extractLatestTodos(wsMessages)) : null,
@@ -2100,6 +2127,12 @@ export function App() {
               }}
               caseActionLabel="登录后试用"
               onRunCase={runTutorialCase}
+              auth={auth}
+              onRequireLogin={() => {
+                setTutorialOpen(false);
+                setAuthMode("login");
+                setView("app");
+              }}
               onClose={() => setTutorialOpen(false)}
               actionState={() => ({
                 enabled: true,
@@ -2150,6 +2183,11 @@ export function App() {
   // 对话前置门：非 demo 且尚无访问权（容器未就绪/未订阅/出错等）→ 由 AgentGate 占据对话区
   // 并禁用 Composer。demo 与已就绪（ready|dormant）放行正常对话。
   const gated = !demo && !gate.access;
+  const latestTodos = extractLatestTodos(wsMessages);
+  const pinnedVisible = !demo && !gated && isPinnedTaskTrackerVisible(latestTodos, wsSending);
+  const boundRepo = !demo && repo.selection?.selected === true;
+  const hasRailData = boundRepo || pinnedVisible;
+  const showRail = isXl && !railHidden && hasRailData;
 
   // 冷会话加载骨架：切换/深链到本地无缓存会话、getSession 拉取期间显示消息形骨架，
   // 取代「空白 → 突然填满」。meta（messageCount）取自侧栏当前选中会话，metaKnown
@@ -2257,11 +2295,6 @@ export function App() {
           agent={agent}
           onAgentClick={() => setPickerOpen(true)}
           models={models}
-          selectedModelId={modelId}
-          onSelectModel={selectModel}
-          modelsLoading={modelsLoading}
-          // 团队模式知情指示:与 send 的生效条件同构(teamMode 只对 main 生效,
-          // 见上方 send 的 agent.id === "main" 判定)——顶栏所见 = 实际所发。
           teamModeActive={!demo && teamMode && agent.id === "main"}
           onDisableTeamMode={() => setTeamMode(false)}
           credits={demo ? null : (user?.credits ?? null)}
@@ -2276,6 +2309,7 @@ export function App() {
           unreadCount={inbox.unreadCount}
           theme={theme}
           onCycleTheme={cycle}
+          onShowContext={isXl && railHidden && hasRailData ? () => setRailHidden(false) : undefined}
         />
 
         {!demo && repo.showBanner && repo.selection?.selected && (
@@ -2351,6 +2385,7 @@ export function App() {
                 liveTurnUsage={activeSess?._liveTurnUsage}
                 turnActivity={turnActivity}
                 transientNotice={transientNotice}
+                historyLoading={historyLoading}
                 archive={messageListArchive}
                 cb={cardCallbacks}
                 onRespondPermission={onRespondPermission}
@@ -2363,19 +2398,11 @@ export function App() {
 
         {/* composer-safe-b:底部 Home 指示条安全区(叠在原 pb-3 上),否则发送区被遮 */}
         <div className="shrink-0 composer-safe-b">
-          {!demo && !gated && activeSess?._recoveryStatus && (
-            <div className="mx-auto mb-2 max-w-3xl px-4">
-              <RecoveryStatusCard
-                status={activeSess._recoveryStatus}
-                onStop={activeSess._recoveryStatus.kind === "completed" ? undefined : stopTurn}
-              />
-            </div>
-          )}
           {/* 任务列表 HUD:钉在输入框上方,始终可见(取代会滚走的 inline TodoWrite 卡)。
               初始展开全部 → ~3s 自动折叠成「正在执行的一条」;无任务时组件自渲染 null。 */}
-          {!demo && !gated && (
+          {!demo && !gated && !showRail && (
             <PinnedTaskTracker
-              todos={extractLatestTodos(wsMessages)}
+              todos={latestTodos}
               active={wsSending}
               tokenUsage={activeSess?._liveTurnUsage?.usage}
             />
@@ -2389,7 +2416,6 @@ export function App() {
             <div className="mx-auto mb-2 max-w-3xl px-4">
               <TurnCostReminder
                 credits={activeSess._turnCostReminderCredits}
-                onStop={stopTurn}
               />
             </div>
           )}
@@ -2417,6 +2443,7 @@ export function App() {
               send(text, media, undefined, undefined, replyTo)
             }
             busy={sending}
+            stopping={activeSess?._recoveryStatus?.kind === "stopping"}
             onStop={stopTurn}
             disabled={gated}
             placeholder={`和「${agent.name}」对话…`}
@@ -2427,12 +2454,38 @@ export function App() {
             onCancelReply={() => setMessageReplyTarget(null)}
             repoSelection={demo ? null : repo.selection}
             onOpenRepo={demo ? undefined : openRepo}
+            showRepoPill={!(showRail && boundRepo)}
+            models={models}
+            selectedModelId={modelId}
+            onSelectModel={selectModel}
+            modelsLoading={modelsLoading}
+            teamModeActive={!demo && teamMode && agent.id === "main"}
             goal={activeSess?.goalState}
-            onSetGoal={demo || !activeId ? undefined : setSessionGoal}
-            onGoalAction={demo || !activeId ? undefined : transitionSessionGoal}
+            onSetGoal={demo ? undefined : setSessionGoal}
+            onGoalAction={demo ? undefined : transitionSessionGoal}
           />
         </div>
       </main>
+
+      {showRail && (
+        <ContextRail
+          renderers={{
+            "bound-repo":
+              boundRepo && repo.selection?.selected ? (
+                <BoundRepoCard selection={repo.selection} onOpenRepo={openRepo} />
+              ) : null,
+            "pinned-tasks": pinnedVisible ? (
+              <PinnedTaskTracker
+                todos={latestTodos}
+                active={wsSending}
+                tokenUsage={activeSess?._liveTurnUsage?.usage}
+                compact
+              />
+            ) : null,
+          }}
+          onHide={() => setRailHidden(true)}
+        />
+      )}
 
       <AgentPicker
         open={pickerOpen}
@@ -2484,10 +2537,9 @@ export function App() {
             onRefreshMe={refreshMe}
             onPreferencesChange={applyConversationPreferences}
             feedbackContext={settingsFeedbackContext}
-            onOpenMemory={() => {
-              setSettingsOpen(false);
-              openManage("optimization");
-            }}
+            onOpenMemory={() => openManage("optimization")}
+            onOpenManage={() => openManage("connectors")}
+            onOpenRepo={demo ? undefined : openRepo}
           />
         </LazyBoundary>
       )}
@@ -2652,6 +2704,7 @@ export function App() {
             }}
             caseActionLabel="带着指令去对话"
             onRunCase={runTutorialCase}
+            auth={auth}
             onClose={() => setTutorialOpen(false)}
             actionState={(feature) => resolveTutorialAction(feature, tutorialActionContext)}
             onRunAction={runTutorialAction}

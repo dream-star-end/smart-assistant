@@ -24,14 +24,15 @@ const retryableUser: ChatMessage = {
   status: "error",
 } as ChatMessage;
 
-function renderErr(msg: ChatMessage, cb: CardCallbacks) {
-  render(<AssistantCard msg={msg} ctx={ERR_CTX} cb={cb} />);
+function renderErr(msg: ChatMessage, cb: CardCallbacks, tokenUsage?: { totalTokens: number }) {
+  render(<AssistantCard msg={msg} ctx={ERR_CTX} cb={cb} tokenUsage={tokenUsage} />);
 }
 
 describe("F3 UserCard 发送失败重试命中区", () => {
-  test("error 态 + onRetrySend → 重试按钮补 44px 触控命中区并可点回调", () => {
+  test("仅有 transport error 时保留发送失败与 44px 重试出口", () => {
     const onRetrySend = vi.fn();
     render(<UserCard msg={userMsg({ status: "error" })} cb={{ onRetrySend }} />);
+    expect(screen.getByText("发送失败")).toBeInTheDocument();
     const btn = screen.getByRole("button", { name: /重试/ });
     // 对齐同批其它命中区写法（MessageRenderer 续轮按钮）：粗指针下 ≥44px。
     expect(btn).toHaveClass("[@media(hover:none)]:min-h-11");
@@ -39,9 +40,39 @@ describe("F3 UserCard 发送失败重试命中区", () => {
     expect(onRetrySend).toHaveBeenCalledTimes(1);
   });
 
+  test("同一轮已有可见错误卡时隐藏重复的发送失败与重试", () => {
+    render(
+      <UserCard
+        msg={userMsg({ status: "error" })}
+        cb={{ onRetrySend: vi.fn() }}
+        failurePresentedBelow
+      />,
+    );
+    expect(screen.getByTestId("message-text")).toHaveTextContent("你好");
+    expect(screen.queryByText("发送失败")).toBeNull();
+    expect(screen.queryByRole("button", { name: /重试/ })).toBeNull();
+  });
+
   test("非 error 态不渲染重试按钮", () => {
     render(<UserCard msg={userMsg({ status: "sent" })} cb={{ onRetrySend: () => {} }} />);
     expect(screen.queryByRole("button", { name: /重试/ })).toBeNull();
+  });
+});
+
+describe("AssistantCard 预期错误视觉语义", () => {
+  test("route unavailable 使用紧凑 warning 卡且无 trace 时不渲染详情", () => {
+    renderErr(errMsg({
+      _errorCode: "codex_route_unavailable",
+      _clientMessageId: "u1",
+      _errorDetail: "",
+    }), {});
+
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveClass("border-warning/30", "px-3", "py-2");
+    expect(alert).not.toHaveClass("border-danger/30");
+    expect(alert).toHaveTextContent("模型服务暂时不可用");
+    expect(alert).not.toHaveTextContent("GPT");
+    expect(screen.queryByText("查看请求信息")).toBeNull();
   });
 });
 
@@ -83,6 +114,28 @@ describe("消息引用动作与已发送引用块", () => {
 });
 
 describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
+  test.each(["stopped", "user_cancelled"])(
+    "%s 是用户主动终止：只显示中性状态，不显示红卡、详情或重试",
+    (code) => {
+      renderErr(errMsg({
+        _errorCode: code,
+        text: "本轮已取消。",
+        _errorDetail: "本轮已取消。",
+        usage: { traceId: "trace-stop" },
+      }), {
+        onRegenerate: vi.fn(),
+      }, { totalTokens: 42 });
+
+      expect(screen.getByRole("status", { name: "已停止生成" })).toBeInTheDocument();
+      expect(screen.queryByText("本轮已取消。")).toBeNull();
+      expect(screen.queryByRole("alert")).toBeNull();
+      expect(screen.queryByRole("button", { name: /重试|重新尝试/ })).toBeNull();
+      expect(screen.getByTestId("assistant-row").textContent?.trim()).toBe("已停止生成");
+      expect(document.body.textContent).not.toContain("trace-stop");
+      expect(document.body.textContent).not.toContain("42");
+    },
+  );
+
   test("可重试码 + _clientMessageId 命中原 user 行 → 显示精确「重试」(不显「重新尝试」)", () => {
     const onRetrySend = vi.fn();
     const onRegenerate = vi.fn();
@@ -152,6 +205,11 @@ describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
     expect(screen.queryByRole("button", { name: "重试" })).toBeNull();
     // 末轮 + 兜底可用 → 「重新尝试」保留。
     expect(screen.getByRole("button", { name: "重新尝试" })).toBeInTheDocument();
+  });
+
+  test("cta=none 的非重试错误找不到精确目标时也不显示「重新尝试」", () => {
+    renderErr(errMsg({ _errorCode: "bad_request" }), { onRegenerate: vi.fn() });
+    expect(screen.queryByRole("button", { name: "重新尝试" })).toBeNull();
   });
 
   test("末轮 idle timeout 且有 durable 断点 → 优先显示「从断点继续」", () => {

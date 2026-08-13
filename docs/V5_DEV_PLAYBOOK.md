@@ -143,6 +143,10 @@ scope、fireEvent 非受信不触发 React discrete 同步 flush,「点击添加
 - 部署后线上旅程由 `scripts/v5-e2e-journey-canary.mjs`(E2E 旅程门,§4.2)兜底。
 - 浏览器解析单一权威=`scripts/lib/resolve-browser.mjs`(env OC_E2E_BROWSER→系统
   Chrome→ms-playwright 缓存);找不到浏览器=fail-loud,禁"缺浏览器就跳过"(fail-open)。
+🔴 **长任务状态 UI 必须单一归属**:一个状态只进入一个既有反馈面,一个动作只保留一个
+主入口。turn 阶段/重试/恢复属于消息区活动行,Stop 属于 Composer,权限属于权限卡；不得把
+后端状态枚举逐项翻译成新的常驻卡片或重复按钮。新卡片只有在承载无法由既有组件表达的
+独立可操作对象时才允许，并须用移动端真浏览器证明信息不断流、主操作不重复。
 **commercial unit 失败判定法**(不许因存量失败误判,也不许漏掉新增失败):
 ```bash
 # 在基线 commit 的树与你的树各跑一次,diff 失败名单;你的失败集必须 ⊆ 基线失败集
@@ -305,6 +309,11 @@ usage_records + journal 双查;零输出免单/turn 级 idle 免单已内建;cod
 - `packages/commercial/src/http/admin/selfheal.ts` — RFC §3 manual:自愈审批链 TCB(admin 放行 HTTP 入口,§P1)
 - `packages/commercial/src/admin/audit*.ts` — RFC §3 manual:自愈审批链 TCB(永久 admin audit:audit.ts/auditActions.ts/auditRedact.ts/auditRetention.ts)
 <!-- selfheal-deploy-surfaces:end -->
+
+`e2e/session-display/incidents.json` 与 `incident-waivers.json` 是事故证据/豁免账本，当前有意保持
+`unmatched_path` fail-closed。候选包含这两类差异时，保留 runtime/platform tuple 的 P3
+`--canary` 必须拒绝；人工核对变更后走官方 ordinary `--with-dist`，不得为绕过发布门而放宽
+分类 manifest。
 
 ### 4.2 标准部署
 
@@ -552,7 +561,7 @@ cutover manifest，也不要求新 migration。仅真正紧急人工维护可为
 ```bash
 # 在 kl-mirror 上、源=已部署树。⚠️ 非交互 ssh 必须带 bun 的 PATH,否则 FATAL 没 bun
 ssh kl-mirror 'cd /opt/openclaude/openclaude-v5 && nohup env PATH=/root/.bun/bin:$PATH \
-  PERSONAL_SRC=/opt/openclaude/openclaude-v5 OC_BUILD_NETWORK_HOST=1 OC_BUILD_SKIP_TAR=1 OC_INCLUDE_CODEX=1 \
+  PERSONAL_SRC=/opt/openclaude/openclaude-v5 OC_BUILD_NETWORK_HOST=1 OC_BUILD_SKIP_TAR=1 OC_INCLUDE_CODEX=1 OC_INCLUDE_GROK=1 \
   bash packages/commercial/agent-sandbox/build-image.sh v5-ccb-<12位sha> > /tmp/v5-image-build.log 2>&1 &'
 # 完成判定:docker images 出现该 tag(日志 grep FATAL 会误报 Dockerfile 里的 echo 字符串)
 ssh kl-mirror 'sed -i "s|^OC_RUNTIME_IMAGE=.*|OC_RUNTIME_IMAGE=openclaude/openclaude-runtime:v5-ccb-<sha>|" /etc/openclaude/commercial-v5.env'

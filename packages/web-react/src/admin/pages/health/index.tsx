@@ -11,6 +11,7 @@ import {
   KeyRound,
   RefreshCw,
   Tag,
+  Wrench,
 } from "lucide-react";
 import { type ReactNode, useCallback, useMemo, useRef } from "react";
 import { Badge, Button, Card, useToast } from "../../../components/ui";
@@ -63,7 +64,35 @@ function pgVersionShort(v?: string): string {
   return parts.slice(0, 2).join(" ") || v.slice(0, 40);
 }
 
-type HealthData = { metricsText: string; diagnostics: Diagnostics | null };
+type SloWindow = {
+  success: number;
+  failure: number;
+  affected_users: number;
+  latency_ms: { p50: number | null; p95: number | null };
+};
+
+type OpsOverview = {
+  slo: {
+    source: "durable" | "unavailable" | "since_process_start" | (string & {});
+    windows: {
+      last_15m: SloWindow;
+      last_1h: SloWindow;
+      last_24h: SloWindow;
+    };
+  } | null;
+  current_actions: {
+    firing_alerts: Array<{ rule_id: string }>;
+    open_incidents: Array<{ id: string; condition_key: string; opened_at: string }>;
+    stale_alerts: Array<{ rule_id: string }>;
+    recovered_alerts: Array<{ rule_id: string }>;
+  } | null;
+};
+
+type HealthData = {
+  metricsText: string;
+  diagnostics: Diagnostics | null;
+  opsOverview: OpsOverview | null;
+};
 
 export default function HealthPage() {
   const toast = useToast();
@@ -72,11 +101,12 @@ export default function HealthPage() {
   // 隐藏暂停 / 切回补拉由 useAdminPoll 内置。
   const poll = useAdminPoll<HealthData>(
     async () => {
-      const [metricsText, diagnostics] = await Promise.all([
+      const [metricsText, diagnostics, opsOverview] = await Promise.all([
         adminText("/metrics"),
         adminGet<Diagnostics>("/diagnostics").catch(() => null),
+        adminGet<OpsOverview>("/ops-overview").catch(() => null),
       ]);
-      return { metricsText, diagnostics };
+      return { metricsText, diagnostics, opsOverview };
     },
     { intervalMs: 30_000 },
   );
@@ -85,9 +115,10 @@ export default function HealthPage() {
   const first = poll.loading && !d;
   const failed = !!poll.error && !d;
 
+  const metricsText = d?.metricsText;
   const view = useMemo<HealthView | null>(
-    () => (d ? deriveHealthView(d.metricsText) : null),
-    [d?.metricsText],
+    () => (metricsText === undefined ? null : deriveHealthView(metricsText)),
+    [metricsText],
   );
   const diag = d?.diagnostics ?? null;
 
@@ -141,6 +172,8 @@ export default function HealthPage() {
         </Card>
       ) : (
         <>
+          <CurrentActions overview={d?.opsOverview ?? null} loading={first} />
+          <SloSection overview={d?.opsOverview ?? null} loading={first} />
           <DiagnosticsSection diag={diag} loading={first} />
           <KpiRow view={view} loading={first} />
           <ChartsSection view={view} loading={first} />
@@ -148,6 +181,92 @@ export default function HealthPage() {
         </>
       )}
     </div>
+  );
+}
+
+function CurrentActions({ overview, loading }: { overview: OpsOverview | null; loading: boolean }) {
+  const actions = overview?.current_actions;
+  if (loading) return <div className="h-24 animate-pulse rounded-xl bg-hover" />;
+  if (!actions) {
+    return (
+      <SectionCard title="当前行动" hint="告警与事故的待处理入口">
+        <p className="text-[13px] text-muted">行动汇总暂不可用，请分别进入告警和自愈修复查看。</p>
+      </SectionCard>
+    );
+  }
+  const active = actions.firing_alerts.length + actions.open_incidents.length;
+  return (
+    <SectionCard
+      title="当前行动"
+      hint={active > 0 ? `${active} 项当前需要处理` : "当前没有 firing 告警或 open 事故"}
+      bodyClassName="grid grid-cols-1 gap-3 sm:grid-cols-2"
+    >
+      <a
+        href="#tab=alerts"
+        className="rounded-lg border border-border p-4 outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        <div className="flex items-center justify-between gap-3">
+          <span className="flex items-center gap-2 text-[13px] font-medium text-fg"><BellRing size={16} /> 告警行动队列</span>
+          <Badge tone={actions.firing_alerts.length > 0 ? "danger" : "success"}>{actions.firing_alerts.length} firing</Badge>
+        </div>
+        <p className="mt-2 text-[12px] text-muted">已恢复 {actions.recovered_alerts.length} · 陈旧 {actions.stale_alerts.length} · 查看确认、静默与 runbook</p>
+      </a>
+      <a
+        href="#tab=selfheal"
+        className="rounded-lg border border-border p-4 outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        <div className="flex items-center justify-between gap-3">
+          <span className="flex items-center gap-2 text-[13px] font-medium text-fg"><Wrench size={16} /> 自愈事故</span>
+          <Badge tone={actions.open_incidents.length > 0 ? "danger" : "success"}>{actions.open_incidents.length} open</Badge>
+        </div>
+        <p className="mt-2 text-[12px] text-muted">查看持续时间、修复状态与完整事件时间线</p>
+      </a>
+    </SectionCard>
+  );
+}
+
+function fmtLatencyMs(value: number | null): string {
+  return value == null ? "—" : `${Math.round(value).toLocaleString("en-US")} ms`;
+}
+
+function SloSection({ overview, loading }: { overview: OpsOverview | null; loading: boolean }) {
+  const slo = overview?.slo;
+  const entries: Array<[string, SloWindow | undefined]> = [
+    ["最近 15 分钟", slo?.windows.last_15m],
+    ["最近 1 小时", slo?.windows.last_1h],
+    ["最近 24 小时", slo?.windows.last_24h],
+  ];
+  const sourceLabel = slo?.source === "durable"
+    ? "持久化 turn 数据"
+    : slo?.source === "since_process_start"
+      ? "仅自本进程启动"
+      : "不可用";
+  return (
+    <SectionCard title="Agent Turn SLO" hint={`数据窗口：${sourceLabel}`} bodyClassName="p-0">
+      {loading ? (
+        <div className="grid grid-cols-1 gap-3 p-4 sm:grid-cols-3">
+          {[0, 1, 2].map((i) => <div key={i} className="h-28 animate-pulse rounded-lg bg-hover" />)}
+        </div>
+      ) : !slo || slo.source === "unavailable" ? (
+        <div className="px-4 py-5 text-[13px] text-muted">时间窗口 SLO 暂不可用；不会用进程累计 counter 伪装历史数据。</div>
+      ) : (
+        <div className="grid grid-cols-1 divide-y divide-border sm:grid-cols-3 sm:divide-x sm:divide-y-0">
+          {entries.map(([label, w]) => (
+            <div key={label} className="p-4">
+              <div className="text-[12px] font-medium text-faint">{label}</div>
+              <div className="mt-2 flex flex-wrap items-baseline gap-x-3 gap-y-1">
+                <span className="text-[20px] font-semibold tabular-nums text-success">{fmtInt(w?.success ?? 0)} 成功</span>
+                <span className={(w?.failure ?? 0) > 0 ? "text-[13px] text-danger" : "text-[13px] text-muted"}>{fmtInt(w?.failure ?? 0)} 失败</span>
+              </div>
+              <div className="mt-2 text-[12px] leading-relaxed text-muted">
+                受影响用户 {fmtInt(w?.affected_users ?? 0)}<br />
+                延迟 p50 {fmtLatencyMs(w?.latency_ms.p50 ?? null)} · p95 {fmtLatencyMs(w?.latency_ms.p95 ?? null)}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </SectionCard>
   );
 }
 
@@ -303,7 +422,7 @@ function KpiRow({ view, loading }: { view: HealthView | null; loading: boolean }
   return (
     <StatCardRow>
       <StatCard
-        label="总请求"
+        label="HTTP 请求（自本进程启动）"
         value={view ? fmtInt(view.reqTotal) : "—"}
         hint={view ? `OK ${fmtInt(view.okStatusSum)} · 5xx ${fmtInt(view.errStatusSum)}` : undefined}
         tone={view && view.errStatusSum > 0 ? "danger" : "success"}
@@ -319,7 +438,7 @@ function KpiRow({ view, loading }: { view: HealthView | null; loading: boolean }
         loading={loading}
       />
       <StatCard
-        label="计费 success"
+        label="计费 success（自本进程启动）"
         value={view ? fmtInt(debit.success || 0) : "—"}
         hint={`insufficient ${fmtInt(debitInsuf)} · error ${fmtInt(debitErr)}`}
         tone={debitTone}
@@ -327,7 +446,7 @@ function KpiRow({ view, loading }: { view: HealthView | null; loading: boolean }
         loading={loading}
       />
       <StatCard
-        label="Claude 调用 success"
+        label="Claude success（自本进程启动）"
         value={view ? fmtInt(claude.success || 0) : "—"}
         hint={`error ${fmtInt(claudeErr)}`}
         tone={claudeErr > 0 ? "danger" : "success"}
@@ -349,7 +468,7 @@ function ChartsSection({ view, loading }: { view: HealthView | null; loading: bo
       <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
         <ChartPanel
           title="HTTP 状态码分布"
-          hint={view ? `共 ${fmtInt(view.reqTotal)} 请求` : undefined}
+          hint={view ? `自本进程启动 · 共 ${fmtInt(view.reqTotal)} 请求` : undefined}
           loading={loading}
           empty={statusEntries.length === 0}
           data={statusEntries}
@@ -435,7 +554,7 @@ function TablesSection({ view, loading }: { view: HealthView | null; loading: bo
 
   return (
     <div className="flex flex-col gap-4">
-      <SectionCard title="HTTP 请求按状态码" bodyClassName="p-0">
+      <SectionCard title="HTTP 请求按状态码" hint="自本进程启动累计" bodyClassName="p-0">
         <KvTable obj={view?.reqByStatus ?? {}} keyHeader="status" valHeader="count" loading={loading} />
       </SectionCard>
 

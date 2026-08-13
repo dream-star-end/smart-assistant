@@ -67,6 +67,21 @@ const SCRATCH_INPUT_NAMES = [
   "workspace",
   "browserCliScratch",
   "browserMcpScratch",
+  "sharedSkillsScratch",
+  "skillDraftsScratch",
+  "skillEvalsScratch",
+  "agentSkillsScratch",
+];
+const REQUIRED_STANDARD_SCRATCH_NAMES = [
+  "workspace",
+  "browserCli",
+  "browserMcp",
+];
+const OPTIONAL_STANDARD_SKILL_STATE_NAMES = [
+  "sharedSkills",
+  "skillDrafts",
+  "skillEvals",
+  "agentSkills",
 ];
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "..");
@@ -1188,14 +1203,26 @@ export function assertPersistentScratchIdentity(value, label) {
     || typeof value !== "object"
     || Array.isArray(value)
     || JSON.stringify(Object.keys(value).sort())
-      !== JSON.stringify(["browserCli", "browserMcp", "workspace"])
+      !== JSON.stringify([
+        ...REQUIRED_STANDARD_SCRATCH_NAMES,
+        ...OPTIONAL_STANDARD_SKILL_STATE_NAMES,
+      ].sort())
   ) {
     fail(`${label} has an invalid shape`);
   }
-  for (const name of ["workspace", "browserCli", "browserMcp"]) {
+  for (const name of [
+    ...REQUIRED_STANDARD_SCRATCH_NAMES,
+    ...OPTIONAL_STANDARD_SKILL_STATE_NAMES,
+  ]) {
     const identity = value[name];
     if (!identity || typeof identity !== "object" || Array.isArray(identity)) {
       fail(`${label}.${name} is missing`);
+    }
+    if (
+      OPTIONAL_STANDARD_SKILL_STATE_NAMES.includes(name)
+      && identity.state === "absent"
+    ) {
+      continue;
     }
     if (
       identity.state !== "tree"
@@ -1209,6 +1236,74 @@ export function assertPersistentScratchIdentity(value, label) {
     }
   }
   return value;
+}
+
+function archiveMutationName(value) {
+  const name = String(value || "");
+  const direct = name.split(/[:./]/).at(-1);
+  for (const action of ["archival_add", "archival_delete"]) {
+    if (direct === action || name.endsWith(`__${action}`)) return action;
+  }
+  return null;
+}
+
+function canonicalToolName(block) {
+  const direct = archiveMutationName(block?.toolName);
+  if (direct) return direct;
+  const input = block?.inputJson && typeof block.inputJson === "object"
+    ? block.inputJson
+    : {};
+  return archiveMutationName(
+    input.tool || input.toolName || input.tool_name || "",
+  );
+}
+
+function containsArchiveMutationCommand(value) {
+  if (typeof value === "string") {
+    const prefix = String.raw`(?:(?:env\s+(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)+)|(?:sudo(?:\s+-\S+)*\s+)|(?:command(?:\s+--)?\s+)|(?:timeout\s+\S+\s+)|(?:(?:\/[A-Za-z0-9._/-]+\/)?(?:bash|sh)\s+-[A-Za-z]*c[A-Za-z]*\s+["']?\s*))*`;
+    const command = String.raw`(?:\/[A-Za-z0-9._/-]+\/)?oc-memory\s+archival-(?:add|delete)(?:\s|$)`;
+    return new RegExp(String.raw`(?:^|[\n;&|])\s*${prefix}${command}`, "m").test(value);
+  }
+  if (Array.isArray(value)) return value.some(containsArchiveMutationCommand);
+  if (value && typeof value === "object") {
+    return Object.values(value).some(containsArchiveMutationCommand);
+  }
+  return false;
+}
+
+export function assertNoUnisolatedArchiveMutations(framesPath) {
+  const document = JSON.parse(readFileSync(framesPath, "utf8"));
+  if (!document || !Array.isArray(document.frames)) {
+    fail("raw frame evidence is invalid for archive mutation detection");
+  }
+  const uses = new Map();
+  const completed = new Set();
+  for (const frame of document.frames) {
+    if (frame?.direction !== "received") continue;
+    let value;
+    try { value = JSON.parse(frame.text); } catch { continue; }
+    if (value?.type !== "outbound.message" || !Array.isArray(value.blocks)) {
+      continue;
+    }
+    for (const block of value.blocks) {
+      if (block?.kind === "tool_use" && typeof block.blockId === "string") {
+        uses.set(block.blockId, block);
+      } else if (
+        block?.kind === "tool_result"
+        && block.isError === false
+        && typeof block.toolUseBlockId === "string"
+      ) {
+        completed.add(block.toolUseBlockId);
+      }
+    }
+  }
+  for (const blockId of completed) {
+    const block = uses.get(blockId);
+    if (!block) continue;
+    if (canonicalToolName(block) || containsArchiveMutationCommand(block.inputJson)) {
+      fail(`unisolated archive mutation completed during synthetic arm: ${blockId}`);
+    }
+  }
 }
 
 export function assertTurnUsageMatchesFrames(turn, evidence) {
@@ -1723,6 +1818,7 @@ export function main(argv = process.argv.slice(2)) {
         extraPromptPath: outputPaths.extraPrompt,
       },
     );
+    assertNoUnisolatedArchiveMutations(outputPaths.frames);
     assertHelperTreesUnchanged(helpers);
     const caseAfterTurn = verifyCasePack(
       options.casePack,

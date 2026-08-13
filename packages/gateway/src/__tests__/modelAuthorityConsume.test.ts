@@ -194,6 +194,49 @@ describe('modelAuthority — 验签 + gateway 断言全集', () => {
     assert.equal(d.leaseEnvelope, raw.lease)
   })
 
+  test('Grok authority:engine=grok 验签消费后保持 Grok 执行描述符', () => {
+    const key = makeKey('mak1_grok')
+    const consumer = makeConsumer(key)
+    const conn = consumer.newConnection()
+    const billingRequestId = '0123456789abcdef0123456789abcdef'
+    const frame = mintFrame(key, {
+      connectionChallenge: conn.challenge,
+      canonicalModel: 'grok-build',
+      engine: 'grok',
+      billingRequestId,
+    })
+    frame.requestId = billingRequestId
+
+    const d = consumer.consume(frame, conn)
+    assert.equal(d.canonicalModel, 'grok-build')
+    assert.equal(d.engine, 'grok')
+  })
+
+  test('Cursor authority:engine=cursor 验签消费后保持受控 Cursor 执行描述符', () => {
+    const key = makeKey('mak1_cursor')
+    const consumer = makeConsumer(key)
+    const conn = consumer.newConnection()
+    const billingRequestId = 'abcdef0123456789abcdef0123456789'
+    const frame = mintFrame(key, {
+      connectionChallenge: conn.challenge,
+      canonicalModel: 'cursor-auto',
+      engine: 'cursor',
+      billingRequestId,
+    })
+    frame.requestId = billingRequestId
+
+    const d = consumer.consume(frame, conn)
+    assert.equal(d.canonicalModel, 'cursor-auto')
+    assert.equal(d.engine, 'cursor')
+    assert.equal(
+      resolveEngine('cursor-auto', { id: 'main' } as never, {
+        canonicalModel: d.canonicalModel,
+        engine: d.engine,
+      }),
+      'cursor',
+    )
+  })
+
   test('伪造签名(不在 keyring 的私钥)→ unknown_key', () => {
     const real = makeKey('mak1_real')
     const forged = makeKey('mak1_forged')
@@ -380,6 +423,20 @@ describe('modelAuthority — 验签 + gateway 断言全集', () => {
       engine: 'codex',
       billingRequestId: '0123456789abcdef0123456789abcdef',
       executionDescriptor: CODEX_DESCRIPTOR,
+    })
+    frame.requestId = 'fedcba9876543210fedcba9876543210'
+    expectReject(() => consumer.consume(frame, conn), 'billing_request_mismatch')
+  })
+
+  test('Cursor billingRequestId 必须与 external audit 的 frame.requestId 精确绑定', () => {
+    const key = makeKey('mak1_cursor')
+    const consumer = makeConsumer(key)
+    const conn = consumer.newConnection()
+    const frame = mintFrame(key, {
+      connectionChallenge: conn.challenge,
+      canonicalModel: 'cursor-auto',
+      engine: 'cursor',
+      billingRequestId: '0123456789abcdef0123456789abcdef',
     })
     frame.requestId = 'fedcba9876543210fedcba9876543210'
     expectReject(() => consumer.consume(frame, conn), 'billing_request_mismatch')

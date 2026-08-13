@@ -63,6 +63,9 @@ function run(
     child.stdout.on('data', (chunk) => (stdout += String(chunk)))
     child.stderr.on('data', (chunk) => (stderr += String(chunk)))
     child.once('error', reject)
+    child.stdin.on('error', (error: NodeJS.ErrnoException) => {
+      if (error.code !== 'EPIPE') reject(error)
+    })
     child.once('close', (code) => done({ code, stdout, stderr }))
     child.stdin.end(options.input ?? '')
   })
@@ -124,6 +127,15 @@ function browserLauncherProbe(): void {
   assert.match(value, /flock -x 9/)
   assert.match(value, /__openclaude_reap/)
   assert.match(value, /"\$cli_bin" "\$@" 9>&-/)
+}
+
+function cursorLauncherProbe(): void {
+  const value = readFileSync(join(BIN_DIR, 'oc-cursor.sh'), 'utf8')
+  assert.match(value, /cursor_bin=\/opt\/cursor-agent\/versions\/2026\.08\.11-e8db854\/cursor-agent/)
+  assert.match(value, /auth_file=\/run\/oc\/cursor-auth\/api-key/)
+  assert.match(value, /--output-format stream-json --stream-partial-output/)
+  assert.match(value, /CURSOR_API_KEY="\$api_key"/)
+  assert.match(value, /setsid "\$cursor_bin"/)
 }
 
 function skillProbe(argv: string[], expectedKind: string): Probe {
@@ -212,8 +224,17 @@ function xlsxCommandProbe(command: string): Probe {
  * adding a bin/oc-* file or a public operation without a probe makes this suite red.
  */
 const OC_SURFACES: Record<string, Record<string, Probe>> = {
+  'oc-artifact-qa': {
+    inspect: scriptProbe('oc-artifact-qa.py', ['--help'], {
+      code: 0,
+      stdout: /Inspect and render PDF\/PPTX\/XLSX artifacts/,
+    }),
+  },
   'oc-browser': {
     forward: browserLauncherProbe,
+  },
+  'oc-cursor': {
+    run: cursorLauncherProbe,
   },
   'oc-cite': {
     verify: tsFailureProbe('packages/gateway/src/ocCiteCli.ts', ['verify'], /verify <id/),
@@ -230,7 +251,14 @@ const OC_SURFACES: Record<string, Record<string, Probe>> = {
     render: scriptProbe('oc-diagram.sh', ['--help'], { code: 0, stdout: /oc-diagram/ }),
   },
   'oc-docx': {
-    render: scriptProbe('oc-docx.sh', ['--help'], { code: 0, stdout: /oc-docx/ }),
+    convert: scriptProbe('oc-docx.py', ['convert', '--help'], {
+      code: 0,
+      stdout: /Markdown\/Quarto/,
+    }),
+    build: scriptProbe('oc-docx.py', ['build', '--help'], { code: 0, stdout: /YAML/ }),
+    render: scriptProbe('oc-docx.py', ['render', '--help'], { code: 0, stdout: /视觉安全 JPEG/ }),
+    inspect: scriptProbe('oc-docx.py', ['inspect', '--help'], { code: 0, stdout: /逐页配对/ }),
+    scrub: scriptProbe('oc-docx.py', ['scrub', '--help'], { code: 0, stdout: /--keep-author/ }),
   },
   'oc-figcheck': {
     check: tsFailureProbe('packages/gateway/src/ocFigCheckCli.ts', [], /usage: oc-figcheck/),
@@ -780,16 +808,35 @@ function singlePurpose(relativePath: string, operation: string, usage: RegExp): 
   return new Set([operation])
 }
 
+function pythonArgparseCommands(relativePath: string): Set<string> {
+  const value = source(relativePath)
+  const commands = new Set(
+    [...value.matchAll(/subparsers\.add_parser\(\s*"([a-z0-9-]+)"/g)].map((match) => match[1]),
+  )
+  assert.ok(commands.size > 0, `${relativePath}: argparse commands not found`)
+  return commands
+}
+
 function productionSurfaces(): Record<string, Set<string>> {
   const connect = tsDispatchCommands('packages/gateway/src/ocConnectCli.ts', 'command')
   const memory = tsDispatchCommands('packages/mcp-memory/src/ocMemoryCli.ts', 'cmd')
   assert.equal(memory.delete('memory'), true, 'oc-memory: retired memory branch not discovered')
   memory.add('memory.retired')
   return {
+    'oc-artifact-qa': singlePurpose(
+      'packages/commercial/agent-sandbox/platform-runtime/bin/oc-artifact-qa.py',
+      'inspect',
+      /add_parser\("inspect"/,
+    ),
     'oc-browser': singlePurpose(
       'packages/commercial/agent-sandbox/platform-runtime/bin/oc-browser.sh',
       'forward',
       /\/usr\/local\/bin\/playwright-cli/,
+    ),
+    'oc-cursor': singlePurpose(
+      'packages/commercial/agent-sandbox/platform-runtime/bin/oc-cursor.sh',
+      'run',
+      /--output-format stream-json --stream-partial-output/,
     ),
     'oc-cite': tsDispatchCommands('packages/gateway/src/ocCiteCli.ts', 'cmd'),
     'oc-connect': new Set(connect),
@@ -798,10 +845,8 @@ function productionSurfaces(): Record<string, Set<string>> {
       'render',
       /用法: \$TOOL/,
     ),
-    'oc-docx': singlePurpose(
-      'packages/commercial/agent-sandbox/platform-runtime/bin/oc-docx.sh',
-      'render',
-      /Usage:\s+oc-docx/,
+    'oc-docx': pythonArgparseCommands(
+      'packages/commercial/agent-sandbox/platform-runtime/bin/oc-docx.py',
     ),
     'oc-figcheck': singlePurpose(
       'packages/gateway/src/ocFigCheckCli.ts',

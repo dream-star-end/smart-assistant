@@ -1,135 +1,97 @@
 ---
 name: document-writing
-description: Generate polished Word/DOCX documents with Pandoc/Quarto, keeping formulas as native editable Word equations. Use when the user asks for reports, papers, proposals, Word files, DOCX export, or formula-heavy documents.
+description: Generate polished Word/DOCX documents through Pandoc/Quarto or structured YAML/JSON, then render and inspect every page and scrub private metadata before delivery. Use for reports, papers, proposals, Word files, DOCX export, or formula-heavy documents.
 ---
 
-# Document writing with high-quality DOCX output
+# High-quality Word/DOCX authoring and page-by-page QA
 
-Use this skill when producing **Word / DOCX / reports / papers / formula-heavy documents**. Do not fake a Word file by saving HTML with a `.docx` extension, and do not turn equations into screenshots unless the user explicitly asks for images.
+A created `.docx` is only an intermediate artifact. Before delivery, always complete: **generate → render every page → structural inspection → visual review of every page → fix and re-render if needed → metadata scrub → final structural verification**. Never rename HTML/plain text to `.docx`, and never rasterize equations unless the user explicitly requests images.
 
-Preferred pipeline:
+## Choose the authoring path
 
-```text
-Structured Markdown or Quarto + LaTeX math
-  -> Pandoc/Quarto
-  -> DOCX with native Word OMML equations
-```
-
-## Choose the source format
-
-- Use `.qmd` + Quarto for long reports, papers, technical docs, title pages, tables of contents, section numbering, cross references, or code-heavy documents.
-- Use `.md` + Pandoc for simple Word exports.
-- If the user provides a Word template, pass it as `--reference-doc`.
-
-Available runtime tools:
+Use `convert` for editable Word equations, citations/cross-references, image-heavy documents, or a user-supplied Word template:
 
 ```bash
-quarto --version
-pandoc --version      # wrapper around Quarto's bundled Pandoc
-oc-docx --help
+oc-docx convert report.qmd -o /home/agent/.openclaude/generated/report-draft.docx
+oc-docx convert report.md --reference-doc /path/to/reference.docx \
+  -o /home/agent/.openclaude/generated/report-draft.docx
+# Legacy `oc-docx report.md -o ...` remains supported.
 ```
 
-Default style reference:
+Keep equations as LaTeX `$...$` / `$$...$$`; Pandoc/Quarto converts them to native editable OMML.
 
-```text
-/usr/local/share/openclaude-docgen/reference.docx
+Use `build` when the document has no equations/cross-references but needs a polished cover, header/footer, theme, callouts, code blocks, quotes, or styled tables:
+
+```yaml
+document:
+  title: Document title
+  author: Only set when explicitly requested by the user
+  cover: true
+  table_of_contents: true
+  table_of_contents_mode: static  # static / field / both
+sections:
+  - heading: First section
+    level: 1
+    blocks:
+      - type: paragraph
+        text: Body text
+      - type: callout
+        kind: warning  # info / warning / success / danger
+        title: Note
+        text: Important information
+      - type: table
+        headers: [Column A, Column B]
+        rows: [[A, B]]
 ```
 
-## Source rules
-
-1. Keep heading levels clean: `#`, `##`, `###`; do not skip levels.
-2. Keep equations as LaTeX source:
-   - Inline: `$a^2 + b^2 = c^2$`
-   - Display:
-     ```tex
-     $$
-     E = mc^2
-     $$
-     ```
-3. Use Markdown tables or CSV-derived tables; do not align tables with spaces.
-4. Include captions/alt text for images: `![Figure 1: explanation](figure.png)`.
-5. For mixed Chinese/English documents, keep prose in natural Chinese/English but keep mathematical variables in LaTeX.
-
-## Recommended Quarto skeleton
-
-```markdown
----
-title: "Document Title"
-subtitle: "Optional subtitle"
-author: "OpenClaude"
-format:
-  docx:
-    toc: true
-    number-sections: true
-    reference-doc: /usr/local/share/openclaude-docgen/reference.docx
----
-
-# Summary
-
-Write the summary here.
-
-# Method
-
-Inline equation $a^2 + b^2 = c^2$.
-
-$$
-E = mc^2
-$$
-
-# Conclusion
-
-Write the conclusion here.
-```
-
-Render with either:
+Supported blocks: `paragraph`, `bullets`, `numbered`, `code`, `table`, `quote`, `callout`, `link`, `page_break`.
 
 ```bash
-quarto render report.qmd --to docx
+oc-docx build content.yaml -o /home/agent/.openclaude/generated/report-draft.docx
 ```
 
-or, when an explicit output path is useful:
+## Mandatory render and visual inspection
+
+The QA directory must be inside the vision-safe generated root:
 
 ```bash
-oc-docx --quarto report.qmd -o /home/agent/.openclaude/report.docx
+QA=/home/agent/.openclaude/generated/report-qa
+oc-docx render /home/agent/.openclaude/generated/report-draft.docx -o "$QA" --emit-pdf
+oc-docx inspect /home/agent/.openclaude/generated/report-draft.docx \
+  --render-dir "$QA" --json "$QA/report.json"
 ```
 
-## Quick Markdown to Word
+For each page, `render` keeps the 160-DPI `page-N.png` and creates a matching, sub-4.5MB `vision-page-N.jpg`. Enumerate every vision copy in natural order, with no sampling or page limit:
 
 ```bash
-oc-docx /home/agent/.openclaude/report.md -o /home/agent/.openclaude/report.docx
+find "$QA" -maxdepth 1 -type f -name 'vision-page-*.jpg' -print | sort -V
+oc-vision understand "$QA/vision-page-1.jpg" --prompt \
+  "Check this page for clipping, broken tables, odd page breaks, missing glyphs, header/footer errors, blank pages, or overcrowding. Return PASS or list concrete issues."
+# Repeat for every path returned by find.
 ```
 
-With a user template:
+If any page fails, edit the source, regenerate, re-render, re-run inspect, and visually review every page again. Automated warnings do not replace visual review.
+
+## Privacy cleanup and final validation
+
+Do not use `author: OpenClaude`. Preserve title and preserve author only when explicitly requested:
 
 ```bash
-oc-docx report.md --reference-doc /path/to/reference.docx -o final.docx
+oc-docx scrub /home/agent/.openclaude/generated/report-draft.docx \
+  -o /home/agent/.openclaude/generated/report.docx --keep-title
+# Add --keep-author only for an explicitly requested author.
+oc-docx inspect /home/agent/.openclaude/generated/report.docx
+unzip -tq /home/agent/.openclaude/generated/report.docx
 ```
 
-## Required verification before delivery
-
-Always verify the output exists and is a valid DOCX zip:
+For formula documents, verify scrub preserved editable equations:
 
 ```bash
-test -s /path/to/final.docx
-unzip -tq /path/to/final.docx
+unzip -p /home/agent/.openclaude/generated/report.docx word/document.xml | grep -q 'm:oMath'
 ```
 
-If formulas are expected, verify native Word equations are present:
-
-```bash
-unzip -p /path/to/final.docx word/document.xml | grep -q 'm:oMath' \
-  && echo 'OK: native Word equations found'
-```
-
-If `m:oMath` is missing for a formula-heavy document, inspect the source for broken `$...$` or `$$...$$` delimiters before delivering.
+Scrub changes metadata/`rsid`, not visible layout, so it does not require another render after a passed visual review.
 
 ## Delivery
 
-Reply with absolute paths only, for example:
-
-```text
-/home/agent/.openclaude/report.docx
-/home/agent/.openclaude/report.qmd
-```
-
-Briefly mention that the DOCX was generated through Pandoc/Quarto and formulas are native editable Word equations when verified.
+Return the absolute path of the cleaned final DOCX and any requested source file. Do not deliver internal QA images unless requested. Use only the documented `oc-docx`/`oc-vision` commands; never invent URLs, ports, tokens, or curl fallbacks.

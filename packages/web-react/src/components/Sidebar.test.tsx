@@ -117,6 +117,42 @@ describe("Sidebar 会话列表", () => {
     );
   });
 
+  it("活跃会话行有左侧 accent 竖条，且桌面行用 py-1.5；非活跃行无竖条、圆角同为 rounded-md", () => {
+    renderSidebar({ sessions: listSessions, activeId: "s-beta" });
+    const activeBtn = screen.getByRole("button", { name: "Beta 上线检查" });
+    const activeRow = activeBtn.closest("div");
+    expect(activeRow).toHaveClass("rounded-md", "bg-active");
+    expect(activeRow?.querySelector(".bg-accent")).not.toBeNull();
+    expect(activeBtn).toHaveClass("py-1.5");
+    expect(activeBtn.className).toContain("[@media(hover:none)]:py-2");
+
+    const idleBtn = screen.getByRole("button", { name: "季度复盘 Alpha" });
+    const idleRow = idleBtn.closest("div");
+    expect(idleRow).toHaveClass("rounded-md");
+    expect(idleRow?.querySelector(".bg-accent")).toBeNull();
+  });
+
+  it("管理/市场入口权重低于「新建会话」：text-body + text-muted，新建保持 secondary 主按钮", () => {
+    renderSidebar({
+      onOpenManage: () => {},
+      onOpenMarketplace: () => {},
+      onOpenTutorial: () => {},
+      onOpenOrg: () => {},
+      showAdmin: true,
+    });
+    const create = screen.getByRole("button", { name: "新建会话" });
+    expect(create).toHaveClass("text-section");
+    expect(create.className).toMatch(/border-border/);
+    expect(create.className).toMatch(/bg-surface/);
+    const manage = screen.getByRole("button", { name: /管理中心/ });
+    const market = screen.getByRole("button", { name: /^市场/ });
+    expect(manage).toHaveClass("text-body", "text-muted", "py-1.5");
+    expect(market).toHaveClass("text-body", "text-muted", "py-1.5");
+    expect(screen.getByRole("button", { name: /使用教程/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /组织/ })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /管理后台/ })).toHaveAttribute("href", "/admin.html");
+  });
+
   it("点击会话行把该会话 id 上抛（核心导航）", () => {
     const onSelect = vi.fn();
     renderSidebar({ sessions: listSessions, onSelect });
@@ -190,5 +226,27 @@ describe("Sidebar 会话列表", () => {
     });
     expect(screen.getByText("今天")).toBeInTheDocument();
     expect(screen.getByText("更早")).toBeInTheDocument();
+  });
+
+  it("pinned 会话单独成「置顶」组且不重复出现在日期组", () => {
+    const old = new Date(Date.now() - 90 * 86400000).toISOString();
+    renderSidebar({
+      sessions: [
+        session({ id: "s-pin", title: "钉住的会话", pinned: true, updatedAt: old }),
+        session({ id: "s-today", title: "今天的会话" }),
+      ],
+    });
+    expect(screen.getByText("置顶")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "钉住的会话" })).toBeInTheDocument();
+    expect(screen.getByText("今天")).toBeInTheDocument();
+    expect(screen.queryByText("更早")).toBeNull();
+  });
+
+  it("没有任何 pinned 会话时不渲染「置顶」组", () => {
+    renderSidebar({
+      sessions: [session({ id: "s-today", title: "今天的会话" })],
+    });
+    expect(screen.queryByText("置顶")).toBeNull();
+    expect(screen.getByText("今天")).toBeInTheDocument();
   });
 });

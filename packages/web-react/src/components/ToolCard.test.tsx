@@ -19,6 +19,54 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
     expect(screen.getByTitle("ls -la")).toHaveClass("truncate");
   });
 
+  test("被中断 turn 的未完成历史子任务显示已取消，不再伪装运行中", () => {
+    const { container } = render(
+      <ToolCard
+        message={{
+          toolName: "Agent",
+          inputJson: { description: "调研登录流程" },
+          _completed: false,
+          _timelineRecord: true,
+          _dispatchOutcome: "interrupted",
+        }}
+      />,
+    );
+
+    expect(screen.getByText("已取消")).toBeInTheDocument();
+    expect(screen.queryByText("运行中")).not.toBeInTheDocument();
+    expect(container.querySelector(".animate-spin")).not.toBeInTheDocument();
+  });
+
+  test("实时未完成子任务没有历史终态证据时仍显示运行中", () => {
+    const { container } = render(
+      <ToolCard
+        message={{ toolName: "Agent", inputJson: { description: "调研登录流程" }, _completed: false }}
+      />,
+    );
+
+    expect(screen.getByText("运行中")).toBeInTheDocument();
+    expect(screen.queryByText("已取消")).not.toBeInTheDocument();
+    expect(container.querySelector(".animate-spin")).toBeInTheDocument();
+  });
+
+  test("被中断 turn 中已经完成的历史子任务仍显示完成", () => {
+    const { container } = render(
+      <ToolCard
+        message={{
+          toolName: "Agent",
+          inputJson: { description: "调研登录流程" },
+          _completed: true,
+          _timelineRecord: true,
+          _dispatchOutcome: "interrupted",
+        }}
+      />,
+    );
+
+    expect(screen.getByText("完成")).toBeInTheDocument();
+    expect(screen.queryByText("已取消")).not.toBeInTheDocument();
+    expect(container.querySelector(".animate-spin")).not.toBeInTheDocument();
+  });
+
   test("涉及 token 的工具卡用紧凑数字实时替换自己的调用消耗", () => {
     const message = {
       toolName: "Bash",
@@ -261,7 +309,7 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
       kind: "skill",
       description: `能力说明 ${index + 1}`,
     }));
-    const { container } = render(
+    render(
       <ToolCard
         message={{
           toolName: "Bash",
@@ -272,8 +320,12 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
       />,
     );
     const header = screen.getByRole("button", { name: /搜索 AI 市场.*design.*完成/ });
-    expect(container.querySelectorAll(".rounded-xl.border")).toHaveLength(1);
+    const card = header.closest("div.overflow-hidden.rounded-md");
+    expect(card).toBeTruthy();
+    expect(card).toHaveClass("rounded-md");
+    expect(header).toHaveClass("px-3", "py-2");
     fireEvent.click(header);
+    expect(card?.querySelector(".border-t")).toHaveClass("px-3", "py-2");
     expect(screen.getByText("能力 1")).toBeInTheDocument();
     expect(screen.queryByText("能力 9")).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /查看更多/ }));
@@ -282,7 +334,7 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
   });
 
   test("浏览器调用使用统一状态与友好动作正文", () => {
-    const { container } = render(
+    render(
       <ToolCard
         message={{
           toolName: "Bash",
@@ -293,7 +345,10 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
       />,
     );
     const header = screen.getByRole("button", { name: /点击页面.*元素 e12.*完成/ });
-    expect(container.querySelectorAll(".rounded-xl.border")).toHaveLength(1);
+    const card = header.closest("div.overflow-hidden.rounded-md");
+    expect(card).toBeTruthy();
+    expect(card).toHaveClass("rounded-md");
+    expect(header).toHaveClass("px-3", "py-2");
     fireEvent.click(header);
     expect(screen.getAllByText("点击页面").length).toBeGreaterThanOrEqual(1);
     expect(screen.getAllByText(/元素 e12/).length).toBeGreaterThanOrEqual(1);

@@ -469,9 +469,10 @@ describe('pickCodexAccountForBindingInTx', () => {
     })
 
     assert.equal(out?.account_id, 200n)
-    // 0098 channel 划分:picker 恒带 runtime_channel 过滤($1),groupId 顺延为 $2。
-    assert.match(observed.sql ?? '', /runtime_channel = \$1/)
-    assert.match(observed.sql ?? '', /group_id = \$2/)
-    assert.deepEqual(observed.params, ['v3', '42'])
+    // provider 已参数化以供 Grok 共用；Codex 仍按自身 runtime channel 过滤。
+    assert.match(observed.sql ?? '', /provider = \$1/)
+    assert.match(observed.sql ?? '', /runtime_channel = \$2/)
+    assert.match(observed.sql ?? '', /group_id = \$3/)
+    assert.deepEqual(observed.params, ['codex', 'v3', '42'])
   })
 })

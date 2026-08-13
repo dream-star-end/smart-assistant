@@ -11,9 +11,10 @@ import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import { useImageEditActions } from "./chat/imageEditActions";
 import { GoalDialog, goalNearBudget, visibleGoalOf, type GoalSetInput } from "./GoalDialog";
 import type { MediaRef } from "../lib/chat/frames";
-import type { RepoSelection } from "../lib/types";
+import type { PublicModel, RepoSelection } from "../lib/types";
 import { cn } from "../lib/utils";
 import { RepoPill } from "./github/RepoPill";
+import { ModelSelector } from "./ModelSelector";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -60,6 +61,7 @@ function clipboardImages(data: DataTransfer): File[] {
 export function Composer({
   onSend,
   busy,
+  stopping,
   onStop,
   disabled,
   placeholder = "给 OpenClaude 发消息…",
@@ -68,6 +70,12 @@ export function Composer({
   prefill,
   repoSelection,
   onOpenRepo,
+  showRepoPill = true,
+  models,
+  selectedModelId,
+  onSelectModel,
+  modelsLoading,
+  teamModeActive,
   goal,
   onSetGoal,
   onGoalAction,
@@ -77,6 +85,8 @@ export function Composer({
   /** 发送：当前正文 + 可选已上传媒体 + 可选精确引用快照。 */
   onSend: (text: string, media?: MediaRef[], replyTo?: MessageReplyQuote) => void;
   busy?: boolean;
+  /** The same send/stop control is settling an acknowledged Stop. */
+  stopping?: boolean;
   onStop?: () => void;
   disabled?: boolean;
   placeholder?: string;
@@ -90,6 +100,15 @@ export function Composer({
   repoSelection?: RepoSelection | null;
   /** 打开 GitHub 仓库绑定 modal（入口在底部左侧）。 */
   onOpenRepo?: () => void;
+  /** xl 右栏已展示绑定卡时卸载中栏 pill（单实例）。未绑定 CTA 仍走底部入口。 */
+  showRepoPill?: boolean;
+  /** 对话模型列表（GET /api/public/models；省略 onSelectModel 则不渲染选择器）。 */
+  models?: PublicModel[];
+  selectedModelId?: string;
+  onSelectModel?: (id: string) => void;
+  modelsLoading?: boolean;
+  /** 团队模式已开启且当前会话是 main；选择器如实显示队长引擎。 */
+  teamModeActive?: boolean;
   /** 当前会话目标快照（驱动「+」菜单里目标项的状态点；省略 onSetGoal/onGoalAction 则不渲染目标入口，如 demo）。 */
   goal?: GoalStateSnapshot | null;
   /** 设定/更新会话目标（入口从会话头部迁至「+」菜单）。 */
@@ -291,7 +310,7 @@ export function Composer({
     <div className="mx-auto w-full max-w-3xl px-4">
       <div
         className={cn(
-          "rounded-[26px] border border-border bg-surface shadow-[var(--shadow-float)] transition-all",
+          "rounded-[26px] border border-border-control bg-surface shadow-[var(--shadow-float)] transition-all",
           "focus-within:border-border-strong",
         )}
       >
@@ -468,7 +487,7 @@ export function Composer({
             }}
             enterKeyHint={coarsePointer ? "enter" : "send"}
             placeholder={placeholder}
-            className="max-h-[240px] min-h-[24px] flex-1 resize-none bg-transparent py-2 text-[16px] leading-relaxed text-fg outline-none placeholder:text-faint disabled:opacity-50"
+            className="max-h-[240px] min-h-[24px] min-w-0 flex-1 resize-none bg-transparent py-2 text-[16px] leading-relaxed text-fg outline-none placeholder:text-faint disabled:opacity-50"
           />
           <IconButton
             data-product-feature={PRODUCT_CAPABILITIES.voice.id}
@@ -486,12 +505,28 @@ export function Composer({
               <Mic size={19} />
             )}
           </IconButton>
+          {models && onSelectModel && (
+            <ModelSelector
+              compact
+              models={models}
+              selectedId={selectedModelId}
+              onSelect={onSelectModel}
+              loading={modelsLoading}
+              teamEngineActive={teamModeActive}
+            />
+          )}
           <button
             type="button"
             data-product-control
-            aria-label={busy ? "停止" : "发送"}
-            onClick={() => (busy ? onStop?.() : submit())}
-            disabled={(!canSend && !busy) || disabled}
+            aria-label={stopping ? "正在停止" : busy ? "停止" : "发送"}
+            onClick={() => {
+              if (busy) {
+                if (!stopping) onStop?.();
+                return;
+              }
+              submit();
+            }}
+            disabled={stopping || (!canSend && !busy) || disabled}
             className={cn(
               "mb-0.5 flex size-9 shrink-0 items-center justify-center rounded-full transition-all",
               busy
@@ -501,15 +536,21 @@ export function Composer({
                   : "bg-hover text-faint",
             )}
           >
-            {busy ? <Square size={15} className="fill-current" /> : <ArrowUp size={19} />}
+            {stopping ? (
+              <Loader2 size={17} className="animate-spin" />
+            ) : busy ? (
+              <Square size={15} className="fill-current" />
+            ) : (
+              <ArrowUp size={19} />
+            )}
           </button>
         </div>
       </div>
       {/* 底部工具条:左=GitHub 仓库绑定入口;右=语音状态(仅录音/转写时显示)。
           原「内容由 AI 生成」免责声明已移除。 */}
-      {(onOpenRepo || voiceStatus) && (
+      {( (onOpenRepo && showRepoPill) || voiceStatus) && (
         <div className="flex min-h-[30px] items-center gap-2 px-1.5 py-1.5 text-xs">
-          {onOpenRepo && <RepoPill selection={repoSelection ?? null} onClick={onOpenRepo} />}
+          {onOpenRepo && showRepoPill && <RepoPill selection={repoSelection ?? null} onClick={onOpenRepo} />}
           {voiceStatus && <span className="ml-auto">{voiceStatus}</span>}
         </div>
       )}

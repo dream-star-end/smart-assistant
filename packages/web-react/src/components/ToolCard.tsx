@@ -63,8 +63,11 @@ export function ToolCard({
   const reportedError = name === "Bash" && /^#{1,6}\s*Error\b/m.test(outputText);
   const isBlocked = name === "Bash" && /(?:^|\n)oc-web:\s*blocked:/i.test(outputText);
   const isError = !!renderTool.error || reportedError;
+  // 历史 tape 是不可变真记录：turn 已中断时，未完成 tool 代表被取消，而不是仍在运行。
+  const isInterruptedHistorical =
+    !completed && renderTool._timelineRecord === true && renderTool._dispatchOutcome === "interrupted";
   // 取消(如 Codex item status 'cancelled')是中性终态:≠ 失败(不红)、≠ 运行中(不转圈)。
-  const isCancelled = !isError && !!renderTool.cancelled;
+  const isCancelled = !isError && (!!renderTool.cancelled || isInterruptedHistorical);
   const isRunning = !completed && !isError && !isBlocked && !isCancelled;
   const statusLabel = isRunning
     ? "运行中"
@@ -91,7 +94,7 @@ export function ToolCard({
       className={cn(
         // 不带外边距——间距交由容器（MessageList 的 gap / AgentGroupCard 的 space-y）统一控制，
         // 避免 margin 与父级 gap 叠加导致卡片间距过大（boss 反馈"卡片间距好大"的根因之一）。
-        "overflow-hidden rounded-xl border bg-surface shadow-[0_1px_2px_rgba(0,0,0,0.025)] transition-colors",
+        "overflow-hidden rounded-md border bg-surface shadow-[0_1px_2px_rgba(0,0,0,0.025)] transition-colors",
         isError
           ? "border-danger/30"
           : isBlocked
@@ -106,7 +109,7 @@ export function ToolCard({
         onClick={() => hasBody && setOpen((o) => !o)}
         aria-expanded={hasBody ? open : undefined}
         className={cn(
-          "flex min-h-11 w-full items-center gap-2.5 px-3.5 py-2.5 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+          "flex min-h-11 w-full items-center gap-2.5 px-3 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
           hasBody && "cursor-pointer hover:bg-hover/70 active:bg-active/70",
         )}
       >
@@ -152,7 +155,7 @@ export function ToolCard({
         </span>
       </button>
       {open && hasBody && (
-        <div className="border-t border-border/80 bg-bg/35 px-3.5 py-3 [&>*:first-child]:mt-0">
+        <div className="border-t border-border/80 bg-bg/35 px-3 py-2 [&>*:first-child]:mt-0">
           <ToolBody name={name} input={input} tool={renderTool} />
         </div>
       )}

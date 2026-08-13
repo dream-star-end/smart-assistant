@@ -4,12 +4,12 @@ import type { PoolClient } from "pg";
 import { encrypt, decryptToBuffer } from "../crypto/aead.js";
 import { loadKmsKey, zeroBuffer } from "../crypto/keys.js";
 import { query, tx, type QueryRunner } from "../db/queries.js";
-import { getCodexAccountRuntimeChannel } from "../runtimeChannel.js";
+import { getCodexAccountRuntimeChannel, getRuntimeChannel } from "../runtimeChannel.js";
 
 export const ACCOUNT_GROUP_KINDS = ["official_oauth", "api_relay"] as const;
 export type AccountGroupKind = (typeof ACCOUNT_GROUP_KINDS)[number];
 
-export const ACCOUNT_GROUP_PROVIDERS = ["claude", "codex"] as const;
+export const ACCOUNT_GROUP_PROVIDERS = ["claude", "codex", "grok"] as const;
 export type AccountGroupProvider = (typeof ACCOUNT_GROUP_PROVIDERS)[number];
 
 export const RELAY_CREDENTIAL_STATUSES = ["active", "disabled", "cooldown"] as const;
@@ -201,7 +201,7 @@ function parseRelay(row: RawRelayCredentialRow): RelayCredentialRow {
 }
 
 export function assertSupportedGroupCombo(kind: AccountGroupKind, provider: AccountGroupProvider): void {
-  if (kind === "official_oauth" && (provider === "claude" || provider === "codex")) return;
+  if (kind === "official_oauth" && (provider === "claude" || provider === "codex" || provider === "grok")) return;
   if (kind === "api_relay" && provider === "codex") return;
   throw new RangeError("unsupported_group_kind_provider");
 }
@@ -490,7 +490,11 @@ export async function hasActiveOfficialOAuthAccountInGroup(
   if (!group || !group.enabled || group.kind !== "official_oauth" || group.provider !== provider) return false;
   // 0098 channel 划分(M1b):codex 账号池权威按 runtime_channel 归属 —— codex 行
   // 严格只认本 channel(v5 取不到 v3 行,fail-closed);claude 行维持共享池语义不过滤。
-  const codexChannel = provider === "codex" ? getCodexAccountRuntimeChannel() : null;
+  const codexChannel = provider === "codex"
+    ? getCodexAccountRuntimeChannel()
+    : provider === "grok"
+      ? getRuntimeChannel()
+      : null;
   const res = await query<{ ok: number }>(
     `SELECT 1 AS ok
        FROM claude_accounts
@@ -651,6 +655,163 @@ export async function expireCodexRouteContext(token: string): Promise<boolean> {
       WHERE token_hash = $1
         AND status = 'active'`,
     [hashRouteToken(token)],
+  );
+  return (res.rowCount ?? 0) > 0;
+}
+
+export interface GrokRouteContextCreated {
+  token: string;
+  group: AccountGroupRow;
+  accountId: bigint;
+  expiresAt: Date;
+}
+
+// Route expiry is an orphaned-secret cleanup boundary, not a turn duration cap.
+// Live requests slide it forward; normal terminal/error paths expire immediately.
+const GROK_ROUTE_ORPHAN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+export async function createGrokRouteContextForModel(args: {
+  containerId: number;
+  userId: bigint;
+  modelId: string;
+  accountId: bigint;
+  slotId: string;
+  groupId: bigint;
+  runner: PoolClient;
+  maxConcurrent: number;
+  ttlMs?: number;
+}): Promise<GrokRouteContextCreated | null> {
+  const groups = await listEnabledGroupsForModel({
+    modelId: args.modelId,
+    kind: "official_oauth",
+    provider: "grok",
+    runner: args.runner,
+  });
+  const group = groups.find((candidate) => candidate.id === args.groupId);
+  if (!group) return null;
+  // The route row, rather than a browser/WebSocket-local timer, is the durable
+  // Grok concurrency lease. Serialize count+insert per subscription account so
+  // split egress, bridge reconnects, Master restarts, and concurrent Masters
+  // cannot exceed the configured account cap.
+  await args.runner.query(
+    `SELECT pg_advisory_xact_lock(hashtextextended('grok-route:' || $1::text, 0))`,
+    [String(args.accountId)],
+  );
+  const capacity = await args.runner.query<{ active_count: string }>(
+    `SELECT COUNT(*)::text AS active_count
+       FROM grok_route_contexts
+      WHERE account_id = $1 AND status = 'active' AND expires_at > NOW()`,
+    [String(args.accountId)],
+  );
+  if (BigInt(capacity.rows[0]?.active_count ?? "0") >= BigInt(args.maxConcurrent)) return null;
+  const token = mintRouteToken();
+  const expiresAt = new Date(Date.now() + (args.ttlMs ?? GROK_ROUTE_ORPHAN_TTL_MS));
+  const inserted = await args.runner.query(
+      `INSERT INTO grok_route_contexts(
+         token_hash, container_id, user_id, account_id, slot_id, model_id, expires_at
+       )
+       SELECT $1,$2,$3,a.id,$5,$6,$7
+         FROM claude_accounts a
+        WHERE a.id = $4
+          AND a.provider = 'grok'
+          AND a.runtime_channel = $8
+          AND a.status = 'active'
+          AND a.group_id = $9`,
+    [
+      hashRouteToken(token),
+      String(args.containerId),
+      String(args.userId),
+      String(args.accountId),
+      args.slotId,
+      normalizeModelId(args.modelId),
+      expiresAt,
+      getRuntimeChannel(),
+      String(group.id),
+    ],
+  );
+  return (inserted.rowCount ?? 0) > 0
+    ? { token, group, accountId: args.accountId, expiresAt }
+    : null;
+}
+
+export interface ResolvedGrokRouteContext {
+  modelId: string;
+  accountId: bigint;
+  slotId: string;
+}
+
+export async function resolveGrokRouteContext(args: {
+  token: string;
+  containerId: number;
+  userId: bigint;
+  runner?: QueryRunner;
+}): Promise<ResolvedGrokRouteContext | null> {
+  const tokenHash = hashRouteToken(args.token);
+  const res = await query<{ model_id: string; account_id: string; slot_id: string }>(
+    `UPDATE grok_route_contexts c
+        SET last_used_at = NOW(),
+            expires_at = GREATEST(c.expires_at, NOW() + INTERVAL '7 days')
+       FROM claude_accounts a
+      WHERE c.token_hash = $1
+        AND c.container_id = $2
+        AND c.user_id = $3
+        AND c.status = 'active'
+        AND c.expires_at > NOW()
+        AND a.id = c.account_id
+        AND a.provider = 'grok'
+        AND a.runtime_channel = $4
+        AND a.status = 'active'
+      RETURNING c.model_id, c.account_id::text AS account_id, c.slot_id`,
+    [tokenHash, String(args.containerId), String(args.userId), getRuntimeChannel()],
+    args.runner,
+  );
+  const row = res.rows[0];
+  return row ? { modelId: row.model_id, accountId: BigInt(row.account_id), slotId: row.slot_id } : null;
+}
+
+export async function expireGrokRouteContext(token: string): Promise<boolean> {
+  const res = await query(
+    `UPDATE grok_route_contexts
+        SET status = 'expired', expires_at = NOW()
+      WHERE token_hash = $1 AND status = 'active'`,
+    [hashRouteToken(token)],
+  );
+  return (res.rowCount ?? 0) > 0;
+}
+
+export interface ActiveGrokRouteLease {
+  accountId: bigint;
+  slotId: string;
+}
+
+/** Durable active Grok leases used to rebuild the scheduler's local cap mirror. */
+export async function listActiveGrokRouteLeases(
+  runner?: QueryRunner,
+): Promise<ActiveGrokRouteLease[]> {
+  const res = await query<{ account_id: string; slot_id: string }>(
+    `SELECT c.account_id::text AS account_id, c.slot_id
+       FROM grok_route_contexts c
+       JOIN claude_accounts a ON a.id = c.account_id
+      WHERE c.status = 'active' AND c.expires_at > NOW()
+        AND a.provider = 'grok' AND a.runtime_channel = $1`,
+    [getRuntimeChannel()],
+    runner,
+  );
+  return res.rows.map((row) => ({ accountId: BigInt(row.account_id), slotId: row.slot_id }));
+}
+
+/** Terminal billing cleanup by durable lease identity (idempotent). */
+export async function expireGrokRouteContextByLease(
+  accountId: bigint,
+  slotId: string,
+  runner?: QueryRunner,
+): Promise<boolean> {
+  const res = await query(
+    `UPDATE grok_route_contexts
+        SET status = 'expired', expires_at = NOW()
+      WHERE account_id = $1 AND slot_id = $2 AND status = 'active'`,
+    [String(accountId), slotId],
+    runner,
   );
   return (res.rowCount ?? 0) > 0;
 }

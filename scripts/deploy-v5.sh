@@ -156,6 +156,7 @@ DEPLOY_SURFACE_CHECK="$SCRIPT_DIR/v5-deploy-surface-check.mjs"
   echo "FATAL: 缺或不可执行的 V5 deploy surface check: $DEPLOY_SURFACE_CHECK" >&2
   exit 1
 }
+TURN_WAIVER_SQL_GATE="$SCRIPT_DIR/v5-turn-waiver-sql-gate.sh"
 BRANCH_POLICY_SCRIPT="$SCRIPT_DIR/v5-branch-policy.sh"
 [ -f "$BRANCH_POLICY_SCRIPT" ] || {
   echo "FATAL: 缺 V5 branch policy: $BRANCH_POLICY_SCRIPT" >&2
@@ -401,7 +402,7 @@ slot_baseline_dir() { # <A|B>
 
 run_baseline_guard_remote() { # <check-release|harden-release|check-dir|harden-dir> <absolute-path>
   local guard_mode="$1" target="$2" qmode qtarget
-  [[ "$guard_mode" =~ ^(check-release|harden-release|check-dir|harden-dir)$ ]] \
+  [[ "$guard_mode" =~ ^(check-release|harden-release|check-release-legacy-cursor|harden-release-legacy-cursor|check-dir|harden-dir)$ ]] \
     || { echo "✗ baseline guard mode 非法:$guard_mode" >&2; return 2; }
   [[ "$target" =~ ^/[A-Za-z0-9._/-]+$ ]] \
     || { echo "✗ baseline guard path 非法:$target" >&2; return 2; }
@@ -422,6 +423,16 @@ assert_release_baseline_security() { # <absolute-release-root>
 harden_release_baseline() { # <absolute-release-root>
   run_baseline_guard_remote harden-release "$1" \
     || { echo "✗ release CCB baseline 权限收紧/复验失败:$1" >&2; return 1; }
+}
+
+harden_legacy_release_baseline() { # <absolute-release-root>
+  run_baseline_guard_remote harden-release-legacy-cursor "$1" \
+    || { echo "✗ legacy release CCB baseline 权限收紧/复验失败:$1" >&2; return 1; }
+}
+
+assert_legacy_release_baseline_security() { # <absolute-release-root>
+  run_baseline_guard_remote check-release-legacy-cursor "$1" \
+    || { echo "✗ legacy serving release 的 CCB baseline 不完整/不安全:$1" >&2; return 1; }
 }
 
 install_v5_slot_units() {
@@ -639,9 +650,9 @@ prepare_live_baseline_safety() {
   fi
   echo "── V5 CCB baseline 一次性安全迁移(current=$live_release)──"
   install_v5_slot_units || return 1
-  harden_release_baseline "$live_release" || return 1
+  harden_legacy_release_baseline "$live_release" || return 1
   strip_shared_baseline_env_keys || return 1
-  assert_release_baseline_security "$live_release" || return 1
+  assert_legacy_release_baseline_security "$live_release" || return 1
 }
 
 assert_live_baseline_security_for_slot() { # <A|B>
@@ -1732,10 +1743,14 @@ jq -e '.ok == true and .channel == "v5"' <<<"$public" >/dev/null || { echo 'FATA
 target_image_id="$(docker image inspect --format '{{.Id}}' "$target_image")"
 image_commit="$(docker image inspect --format '{{ index .Config.Labels "oc.runtime.source_commit" }}' "$target_image")"
 image_codex="$(docker image inspect --format '{{ index .Config.Labels "oc.runtime.codex_version" }}' "$target_image")"
+image_grok="$(docker image inspect --format '{{ index .Config.Labels "oc.runtime.include_grok" }}' "$target_image")"
 [[ "$image_commit" =~ ^[0-9a-f]{7,40}$ && "$target_commit" == "$image_commit"* ]] || { echo "FATAL: image source_commit is not a prefix of target commit" >&2; exit 1; }
 [[ -n "$image_codex" ]] || { echo 'FATAL: image missing codex version label' >&2; exit 1; }
+[[ "$image_grok" == 1 ]] || { echo 'FATAL: image missing official Grok runtime (oc.runtime.include_grok=1)' >&2; exit 1; }
 actual_codex="$(docker run --rm --entrypoint codex "$target_image" --version)"
 [[ "$actual_codex" == "codex-cli $image_codex" ]] || { echo 'FATAL: image codex label/binary mismatch' >&2; exit 1; }
+actual_grok="$(docker run --rm --entrypoint grok-native "$target_image" --version)"
+[[ "$actual_grok" == grok\ 1.0.3\ * ]] || { echo 'FATAL: image Grok binary mismatch' >&2; exit 1; }
 
 dburl="$(grep '^DATABASE_URL=' "$env_file" | tail -n 1 | cut -d= -f2-)"
 [[ -n "$dburl" ]] || { echo 'FATAL: DATABASE_URL missing' >&2; exit 1; }
@@ -3136,6 +3151,15 @@ build_release() {
   BUILT_RELEASE_SOURCE_COMMIT="$full_sha"
   # 审计 9:build_release 是「哪个 commit 会变成线上 release」的唯一收口点,CI 绿门挂在这里。
   assert_ci_green_for_source_commit "$full_sha" || return 1
+  [ -x "$TURN_WAIVER_SQL_GATE" ] || {
+    echo "✗ 缺或不可执行的 turn waiver SQL gate: $TURN_WAIVER_SQL_GATE" >&2
+    return 1
+  }
+  if [[ "$DRY" == 1 ]]; then
+    OC_V5_TURN_WAIVER_SOURCE_COMMIT="$full_sha" "$TURN_WAIVER_SQL_GATE" --source-only || return 1
+  else
+    OC_V5_TURN_WAIVER_SOURCE_COMMIT="$full_sha" "$TURN_WAIVER_SQL_GATE" || return 1
+  fi
   short_sha="$(git -C "$REPO_ROOT" rev-parse --short "$full_sha")"   # 从 full_sha 派生,不二次读 HEAD(R2#2:消两读竞态)
   ts="$(date -u +%Y%m%d-%H%M%S)"
   cur="$(bg_current_release)"
@@ -5070,7 +5094,7 @@ hotcfg_history_present() {
 assert_target_runtime_image_ready() {
   [[ -n "$TARGET_RUNTIME_IMAGE" ]] || return 0
   local -a pinned=()
-  local inspect actual_id source_commit embed_source
+  local inspect actual_id source_commit embed_source include_grok actual_grok
   mapfile -t pinned < <(grep -E '^OC_RUNTIME_IMAGE=' "$REPO_ROOT/deploy/v5/commercial-v5.env.overrides" || true)
   [[ ${#pinned[@]} == 1 && "${pinned[0]#OC_RUNTIME_IMAGE=}" == "$TARGET_RUNTIME_IMAGE" ]] || {
     echo "✗ repo overrides 必须唯一且精确钉住 --runtime-image（先合并 durable config）" >&2
@@ -5084,11 +5108,11 @@ assert_target_runtime_image_ready() {
     echo "✗ --runtime-image 要求 runtime release hotcfg 轴已开启（或本次显式 --enable-runtime-release）" >&2
     return 1
   }
-  inspect="$(ssh "$KL_HOST" "docker image inspect --format '{{.Id}}|{{ index .Config.Labels \"oc.runtime.source_commit\" }}|{{ index .Config.Labels \"oc.runtime.embed_source\" }}' '$TARGET_RUNTIME_IMAGE'" 2>/dev/null)" || {
+  inspect="$(ssh "$KL_HOST" "docker image inspect --format '{{.Id}}|{{ index .Config.Labels \"oc.runtime.source_commit\" }}|{{ index .Config.Labels \"oc.runtime.embed_source\" }}|{{ index .Config.Labels \"oc.runtime.include_grok\" }}' '$TARGET_RUNTIME_IMAGE'" 2>/dev/null)" || {
     echo "✗ 目标 runtime image 不存在或 inspect 失败:$TARGET_RUNTIME_IMAGE" >&2
     return 1
   }
-  IFS='|' read -r actual_id source_commit embed_source <<<"$inspect"
+  IFS='|' read -r actual_id source_commit embed_source include_grok <<<"$inspect"
   [[ "$actual_id" == "$TARGET_RUNTIME_IMAGE_ID" ]] || {
     echo "✗ 目标 runtime image immutable ID 漂移(expected=$TARGET_RUNTIME_IMAGE_ID actual=${actual_id:-<none>})" >&2
     return 1
@@ -5097,13 +5121,22 @@ assert_target_runtime_image_ready() {
     echo "✗ --runtime-image 在线切换只接受 slim image(oc.runtime.embed_source=0)" >&2
     return 1
   }
+  [[ "$include_grok" == 1 ]] || {
+    echo "✗ target runtime image 缺 official Grok binary(oc.runtime.include_grok=1)" >&2
+    return 1
+  }
+  actual_grok="$(ssh "$KL_HOST" "docker run --rm --entrypoint grok-native '$TARGET_RUNTIME_IMAGE' --version")" || return 1
+  [[ "$actual_grok" == grok\ 1.0.3\ * ]] || {
+    echo "✗ target runtime image Grok binary=$actual_grok,expected='grok 1.0.3 (...)'" >&2
+    return 1
+  }
   [[ "$source_commit" =~ ^[0-9a-f]{40}$ ]] \
     && git -C "$REPO_ROOT" cat-file -e "${source_commit}^{commit}" 2>/dev/null \
     && git -C "$REPO_ROOT" merge-base --is-ancestor "$source_commit" HEAD || {
     echo "✗ 目标 runtime image source_commit 不是 canonical HEAD 的可验证 ancestor:${source_commit:-<none>}" >&2
     return 1
   }
-  echo "  ✓ target runtime image 已钉死(ref=$TARGET_RUNTIME_IMAGE id=$TARGET_RUNTIME_IMAGE_ID source=$source_commit slim=1)"
+  echo "  ✓ target runtime image 已钉死(ref=$TARGET_RUNTIME_IMAGE id=$TARGET_RUNTIME_IMAGE_ID source=$source_commit slim=1 grok=$actual_grok)"
 }
 
 # ── 1. build_platform_bundle:从**钉死的** BUILT_RELEASE 内 platform-runtime/ 组装 → 落 bundles/<rev> ──
@@ -7092,7 +7125,7 @@ activate_staged_inner() {
     || echo "⚠ staged source 的 Knowledge Planet 插件制品与 DB 已审批版本不一致:插件将 RUNTIME_UNAVAILABLE 直至验证晋升(运行时按内容 pin fail-closed);staged cutover 不因此阻断(2026-07-17 纠偏)" >&2
   install_cutover_target_image_env
   local expected_commit expected_full_commit expected_build remote_commit remote_build runtime_image
-  local image_commit image_codex_version actual_codex_version
+  local image_commit image_codex_version image_include_grok actual_codex_version actual_grok_version
   expected_commit="$(git -C "$REPO_ROOT" rev-parse --short HEAD)"
   expected_full_commit="$(git -C "$REPO_ROOT" rev-parse HEAD)"
   expected_build=""
@@ -7112,17 +7145,25 @@ activate_staged_inner() {
     ssh "$KL_HOST" "docker image inspect '$runtime_image' >/dev/null"
     image_commit="$(ssh "$KL_HOST" "docker image inspect --format '{{ index .Config.Labels \"oc.runtime.source_commit\" }}' '$runtime_image'")"
     image_codex_version="$(ssh "$KL_HOST" "docker image inspect --format '{{ index .Config.Labels \"oc.runtime.codex_version\" }}' '$runtime_image'")"
+    image_include_grok="$(ssh "$KL_HOST" "docker image inspect --format '{{ index .Config.Labels \"oc.runtime.include_grok\" }}' '$runtime_image'")"
     [[ "$image_commit" =~ ^[0-9a-f]{7,40}$ && "$expected_full_commit" == "$image_commit"* ]] || {
       echo "✗ runtime image source_commit=$image_commit is not target commit $expected_full_commit 的前缀" >&2; exit 1;
     }
     [[ "$image_codex_version" == "0.144.0" ]] || {
       echo "✗ runtime image codex label=$image_codex_version,expected=0.144.0" >&2; exit 1;
     }
+    [[ "$image_include_grok" == 1 ]] || {
+      echo "✗ runtime image 缺 official Grok binary label(oc.runtime.include_grok=1)" >&2; exit 1;
+    }
     actual_codex_version="$(ssh "$KL_HOST" "docker run --rm --entrypoint codex '$runtime_image' --version")"
     [[ "$actual_codex_version" == "codex-cli 0.144.0" ]] || {
       echo "✗ runtime image codex binary=$actual_codex_version,expected='codex-cli 0.144.0'" >&2; exit 1;
     }
-    echo "  ✓ runtime image source=$image_commit,codex=$actual_codex_version"
+    actual_grok_version="$(ssh "$KL_HOST" "docker run --rm --entrypoint grok-native '$runtime_image' --version")"
+    [[ "$actual_grok_version" == grok\ 1.0.3\ * ]] || {
+      echo "✗ runtime image Grok binary=$actual_grok_version,expected='grok 1.0.3 (...)'" >&2; exit 1;
+    }
+    echo "  ✓ runtime image source=$image_commit,codex=$actual_codex_version,grok=$actual_grok_version"
   fi
   # RFC §1.2:此处 sshk start 是 staged lane 的真正激活翻转点(unit 从停机→起旧同构状态)。翻转前
   # 活体断言远端 lease;此刻 unit 仍停(live 未改),失活即 rc=86，wrapper 明确跳过 recover_cutover。
@@ -8589,6 +8630,13 @@ run_candidate_release_verification() {
   local cand="$1" release="$2" generation="$3" incident_sha result_sha
   [[ "$DRY" == 1 ]] && { echo "  [dry-run] fixed Luna/DeepSeek live E2E + zero-skip evidence"; return 0; }
   npm run check:v5:incidents || return 1
+  echo "── candidate Cursor authority ticket consume gate(exact immutable release)──"
+  ssh "$KL_HOST" "cd '$release' && npx --no-install tsx --test \
+    --test-name-pattern='Cursor authority|Cursor billingRequestId' \
+    packages/gateway/src/__tests__/modelAuthorityConsume.test.ts" || return 1
+  echo "── candidate Cursor stream-json parser gate(exact immutable release)──"
+  ssh "$KL_HOST" "cd '$release' && npx --no-install tsx --test \
+    packages/gateway/src/__tests__/cursorAdapter.test.ts" || return 1
   npx --no-install tsx "$REPO_ROOT/scripts/v5-auto-dream-collector-smoke.ts" || return 1
   create_release_verification_run "$release" "$generation" || return 1
   rm -rf "$REPO_ROOT/e2e/session-display/reports" "$REPO_ROOT/e2e/session-display/test-results"
@@ -8644,7 +8692,7 @@ SQL
 
 close_emergency_debt() {
   [[ "$DRY" == 1 ]] && { echo "  [dry-run] validate protected merge/Codex/tests/CI evidence and close debt"; return 0; }
-  local evidence origin_head
+  local evidence local_head origin_head
   [[ "$BR" == feat/v5-aurora-rewrite && -z "$(git status --porcelain)" ]] \
     || { echo "✗ emergency debt 只能从 clean canonical branch 关闭" >&2; return 1; }
   env -u HTTPS_PROXY -u HTTP_PROXY -u https_proxy -u http_proxy \
@@ -8659,8 +8707,9 @@ if (j.schema!==1 || j.codexReview!=='PASS' || j.regressionTests!=='PASS' || j.ci
 process.stdout.write(JSON.stringify(j));
 NODE
 )" || return 1
-  git merge-base --is-ancestor "$PROTECTED_MERGE_SHA" HEAD \
-    || { echo "✗ protected merge sha 不在 canonical HEAD 血缘" >&2; return 1; }
+  local_head="$(git rev-parse HEAD 2>/dev/null || true)"
+  [[ "$local_head" == "$PROTECTED_MERGE_SHA" ]] \
+    || { echo "✗ canonical HEAD($local_head) != protected merge sha($PROTECTED_MERGE_SHA)" >&2; return 1; }
   origin_head="$(git rev-parse origin/feat/v5-aurora-rewrite 2>/dev/null || true)"
   [[ "$origin_head" == "$PROTECTED_MERGE_SHA" ]] \
     || { echo "✗ origin protected branch head($origin_head) != protected merge sha($PROTECTED_MERGE_SHA)" >&2; return 1; }
@@ -10062,11 +10111,12 @@ assert_development_release_queue || exit 3
 # 故一并跳过下面三道写前门。
 # Recovery/compensation must not depend on forward migrations declared only by
 # today's checkout. Those lanes validate the immutable target release instead
-# (abort/rollback/recover), or execute Luna's self-contained fail-closed audit
-# transaction (hide-luna). This keeps rollback available when canonical moves
-# ahead of the currently deployed schema.
+# (abort/rollback/recover), execute a self-contained transaction against their
+# already-established schema (hide-luna/close-emergency-debt), or do not write
+# production state (smoke/reclaim). This keeps recovery and evidence closure
+# available when canonical moves ahead of the currently deployed schema.
 case "$MODE" in
-  smoke|bootstrap|reclaim-mutation-lease|abort|rollback|recover|hide-luna) ;;
+  smoke|bootstrap|reclaim-mutation-lease|abort|rollback|recover|hide-luna|close-emergency-debt) ;;
   *) assert_repo_required_migrations || exit 1 ;;
 esac
 # Smoke 也必须验证应用角色真能使用已记账的 0151 对象；bootstrap 在 env 建好后

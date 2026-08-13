@@ -363,8 +363,18 @@ function ReplyQuoteBlock({
 // reducer/socket 对 msg 就地 mutate(同引用),叶子层 {msg} 浅比较要么永不重渲(状态标签
 // 卡死在首帧,如 user status),要么因 ctx 每帧新对象而形同虚设 —— 三种 memo 策略并存徒增
 // 认知负担。sig 层已捕获全部渲染所读字段(render.ts messageSignature),叶子直接裸函数。
-export function UserCard({ msg, cb }: { msg: ChatMessage; cb?: CardCallbacks }) {
+export function UserCard({
+  msg,
+  cb,
+  failurePresentedBelow = false,
+}: {
+  msg: ChatMessage;
+  cb?: CardCallbacks;
+  /** 同一轮已有可见终态错误卡时，错误说明与重试出口由该卡独占。 */
+  failurePresentedBelow?: boolean;
+}) {
   const status = msg.status;
+  const showStatus = status && !(status === "error" && failurePresentedBelow);
   return (
     <div className="group flex flex-col items-end animate-in" data-testid="user-row">
       <div
@@ -379,7 +389,7 @@ export function UserCard({ msg, cb }: { msg: ChatMessage; cb?: CardCallbacks }) 
       {msg._media && msg._media.length > 0 && (
         <Media media={msg._media} className="justify-end" />
       )}
-      {status && (
+      {showStatus && (
         <div
           className={cn(
             "mt-1 flex items-center gap-2 text-[11px]",
@@ -504,6 +514,9 @@ export function AssistantCard({
   // 语义(retryable/cta)从 protocol taxonomy 派生,不在组件里手写码判断。
   const normalizedCode = normalizeTurnErrorCode(msg._errorCode);
   const sem = turnErrorSemantics(normalizedCode);
+  const expectedError = sem.expected === true;
+  const errorTone = presentedError?.waived || expectedError ? "warning" : "danger";
+  const isUserCancelled = normalizedCode === "stopped" || normalizedCode === "user_cancelled";
   const isInsufficient = normalizedCode === "insufficient_credits";
   // 「精确重试」资格:非免单 + 该码可重试 + cta∈{retry,retry_or_switch} + 会话内能定位到带完整
   // payload 的原 user 行(_clientMessageId 命中且 status='error')。任一不满足 → 不显示精确「重试」,
@@ -542,6 +555,7 @@ export function AssistantCard({
     isLastTurn &&
     !showInterruptedContinuation &&
     !retryTarget &&
+    (sem.cta === "retry" || sem.cta === "retry_or_switch") &&
     !!cb.onRegenerate;
   const showTopUp = isInsufficient && !!cb.onTopUp;
   const showActionRow =
@@ -580,7 +594,7 @@ export function AssistantCard({
             - 流式已起但正文尚空 → 本轮活动指示取代裸三点。 */}
         {msg.text && !hasError ? (
           <ProgressiveMarkdown text={msg.text} live={live} />
-        ) : hasError && presentedError?.bodyText ? (
+        ) : hasError && !isUserCancelled && presentedError?.bodyText ? (
           <ProgressiveMarkdown text={presentedError.bodyText} />
         ) : live && !hasError && !ctx.activityInFooter ? (
           ctx.turnActivity ? <TurnActivity info={ctx.turnActivity} /> : <TypingDots />
@@ -619,10 +633,19 @@ export function AssistantCard({
         )}
 
         {/* 终态错误卡：自动免单用温和提示，不把平台 JSON/英文堆栈甩给用户。 */}
-        {presentedError && (
+        {isUserCancelled ? (
+          <output
+            className="mt-2.5 flex items-center gap-2 py-1 text-[13px] text-muted"
+            aria-label="已停止生成"
+          >
+            <Square size={14} className="shrink-0" />
+            <span>已停止生成</span>
+          </output>
+        ) : presentedError && (
           <Alert
-            tone={presentedError.waived ? "warning" : "danger"}
-            className="mt-2.5 max-w-full overflow-hidden px-3.5 py-3 sm:px-4"
+            tone={errorTone}
+            density={expectedError && !presentedError.waived ? "compact" : "comfortable"}
+            className="mt-2.5 max-w-full overflow-hidden"
             icon={presentedError.waived ? <ShieldCheck size={17} /> : <AlertTriangle size={17} />}
             title={presentedError.title}
           >
@@ -681,7 +704,7 @@ export function AssistantCard({
           </Alert>
         )}
 
-        {tokenUsage && tokenUsage.totalTokens > 0 && (
+        {!isUserCancelled && tokenUsage && tokenUsage.totalTokens > 0 && (
           <div className="mt-2">
             <TokenUsageBadge usage={tokenUsage} />
           </div>
@@ -690,7 +713,7 @@ export function AssistantCard({
         {!live && !hasError && msg.text && (
           <MessageActions msg={msg} cb={cb} showRegen={showRegenerate && !hasError} />
         )}
-        {!live && !(ctx.sending && ctx.inActiveTurn) && <MetaRow msg={msg} />}
+        {!live && !isUserCancelled && !(ctx.sending && ctx.inActiveTurn) && <MetaRow msg={msg} />}
         {/* 逐条评价反馈行(极轻,常驻):仅对有正文、非 error 的 assistant 回复出现,且**只挂在
             所在轮的末条 assistant 正文上**(turnFinalAssistant,轮边界判定在 turnSegment.ts)——
             一轮里穿插工具卡/思考卡/委派的多段中间文本回复不再各自带"这条回复怎么样?"(boss 07-11)。

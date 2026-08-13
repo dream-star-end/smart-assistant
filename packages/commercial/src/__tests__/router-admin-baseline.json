@@ -2,6 +2,18 @@
   {
     "method": "GET",
     "pathKind": "path",
+    "pathValue": "/api/admin/tutorials/pending",
+    "handler": "handleAdminPendingCommunityTutorials"
+  },
+  {
+    "method": "POST",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/tutorials/",
+    "handler": "handleAdminReviewCommunityTutorial"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
     "pathValue": "/api/admin/marketplace/funnel",
     "handler": "handleAdminMarketplaceFunnel"
   },
@@ -136,6 +148,12 @@
     "pathKind": "path",
     "pathValue": "/api/admin/product-friction",
     "handler": "handleAdminProductFriction"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/ops-overview",
+    "handler": "handleAdminOpsOverview"
   },
   {
     "method": "GET",
@@ -334,6 +352,24 @@
     "pathKind": "path",
     "pathValue": "/api/admin/accounts/oauth/exchange",
     "handler": "handleAdminOAuthExchange"
+  },
+  {
+    "method": "POST",
+    "pathKind": "path",
+    "pathValue": "/api/admin/accounts/grok-device/start",
+    "handler": "handleAdminGrokDeviceStart"
+  },
+  {
+    "method": "GET",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/accounts/grok-device/",
+    "handler": "handleAdminGrokDeviceStatus"
+  },
+  {
+    "method": "DELETE",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/accounts/grok-device/",
+    "handler": "handleAdminGrokDeviceCancel"
   },
   {
     "method": "POST",
@@ -753,13 +789,19 @@
     "method": "POST",
     "pathKind": "pathPrefix",
     "pathValue": "/api/admin/feedback/",
-    "handler": "handleAdminAckFeedback"
+    "handler": "handleAdminFeedbackPost"
   },
   {
     "method": "GET",
     "pathKind": "path",
     "pathValue": "/api/admin/auto-dream-findings",
     "handler": "handleAdminListAutoDreamFindings"
+  },
+  {
+    "method": "PATCH",
+    "pathKind": "path",
+    "pathValue": "/api/admin/auto-dream-findings/batch",
+    "handler": "handleAdminUpdateAutoDreamFinding"
   },
   {
     "method": "PATCH",
@@ -778,6 +820,18 @@
     "pathKind": "path",
     "pathValue": "/api/admin/messages",
     "handler": "handleAdminListInbox"
+  },
+  {
+    "method": "POST",
+    "pathKind": "path",
+    "pathValue": "/api/admin/messages/preview",
+    "handler": "handleAdminPreviewInbox"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/messages/stats",
+    "handler": "handleAdminInboxStats"
   },
   {
     "method": "GET",

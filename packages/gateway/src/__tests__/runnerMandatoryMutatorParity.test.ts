@@ -45,9 +45,10 @@ import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 
-// 导入即注册(两个 adapter 模块底部各自 registerEngine)。
+// 导入即注册(adapter 模块底部各自 registerEngine)。
 import '../engine/ccbAdapter.js'
 import '../engine/codexAdapter.js'
+import '../engine/grokAdapter.js'
 import type { EngineAdapter } from '../engine/engineAdapter.js'
 import { type EngineCreateOpts, createEngine, registeredEngines } from '../engine/registry.js'
 
@@ -114,6 +115,12 @@ const MUTATOR_PROBES: Record<string, MutatorProbe> = {
     // CCB 无此概念,允许缺失。
     requiredOnEngines: ['codex'],
   },
+  setGrokRoute: {
+    arg: null,
+    // grok 专属:缺失 = master 下发的订阅 relay 路由被静默丢弃,turn 会在
+    // provider spawn 前失败。CCB/Codex 无此概念,允许缺失。
+    requiredOnEngines: ['grok'],
+  },
 }
 
 function makeOpts(sessionKey: string): EngineCreateOpts {
@@ -163,9 +170,9 @@ describe('runner mandatory-mutator parity — 权威源有效性', () => {
     )
   })
 
-  it('engine 注册表可枚举且含两个生产引擎', () => {
+  it('engine 注册表可枚举且含全部生产引擎', () => {
     const engines = registeredEngines()
-    for (const id of ['ccb', 'codex']) {
+    for (const id of ['ccb', 'codex', 'grok']) {
       assert.ok(engines.includes(id), `engine registry 缺少 ${id} —— 注册副作用或权威源已变`)
     }
   })
