@@ -157,7 +157,7 @@ export function ChatHeader({
       )}
       <div className="ml-auto flex shrink-0 items-center gap-1.5">
         {onShowContext && (
-          <Button size="sm" variant="ghost" onClick={onShowContext}>
+          <Button data-product-control size="sm" variant="ghost" onClick={onShowContext}>
             显示上下文
           </Button>
         )}
