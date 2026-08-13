@@ -23,6 +23,7 @@ interface TurnCtx {
   assistantText: string; thinkingText: string; assistantSegments: SegmentRecord[]; thinkingSegments: SegmentRecord[]
   tools: Map<string, TurnToolEntry>; pending: Set<string>; startedTools: Map<string, number>
   stderr: string; terminal: boolean; interrupted: boolean; error: string | null; usage?: ReportedUsage
+  assistantPartialText: string
   resolve: (value: TurnSummary | null) => void
 }
 
@@ -37,17 +38,44 @@ function promptOf(input: TurnParams['input']): string {
 function nonnegative(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.floor(value) : undefined
 }
+function recordOf(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null
+}
+function assistantTextOf(event: CursorEvent): string {
+  if (typeof event.text === 'string') return event.text
+  if (typeof event.content === 'string') return event.content
+  if (typeof event.delta === 'string') return event.delta
+  if (typeof event.message === 'string') return event.message
+  const message = recordOf(event.message)
+  if (!message || !Array.isArray(message.content)) return ''
+  return message.content.map((block) => {
+    const item = recordOf(block)
+    return item?.type === 'text' && typeof item.text === 'string' ? item.text : ''
+  }).join('')
+}
 function usageOf(event: CursorEvent): ReportedUsage | undefined {
-  const raw = event.usage && typeof event.usage === 'object' ? event.usage as Record<string, unknown> : null
+  const raw = recordOf(event.usage)
   if (!raw) return undefined
+  const input = nonnegative(raw.input_tokens ?? raw.inputTokens)
+  const output = nonnegative(raw.output_tokens ?? raw.outputTokens)
+  const cacheRead = nonnegative(raw.cache_read_input_tokens ?? raw.cacheReadInputTokens ?? raw.cacheReadTokens)
+  const cacheCreation = nonnegative(raw.cache_creation_input_tokens ?? raw.cacheCreationInputTokens ?? raw.cacheWriteTokens)
   const usage: ReportedUsage = {
-    input_tokens: nonnegative(raw.input_tokens ?? raw.inputTokens),
-    output_tokens: nonnegative(raw.output_tokens ?? raw.outputTokens),
-    cache_read_input_tokens: nonnegative(raw.cache_read_input_tokens ?? raw.cacheReadInputTokens),
-    cache_creation_input_tokens: nonnegative(raw.cache_creation_input_tokens ?? raw.cacheCreationInputTokens),
+    ...(input !== undefined ? { input_tokens: input } : {}),
+    ...(output !== undefined ? { output_tokens: output } : {}),
+    ...(cacheRead !== undefined ? { cache_read_input_tokens: cacheRead } : {}),
+    ...(cacheCreation !== undefined ? { cache_creation_input_tokens: cacheCreation } : {}),
   }
-  for (const key of Object.keys(usage) as (keyof ReportedUsage)[]) if (usage[key] === undefined) delete usage[key]
   return Object.keys(usage).length ? usage : undefined
+}
+function finalUsageMeta(usage: ReportedUsage | undefined): Record<string, number> {
+  if (!usage) return {}
+  return {
+    ...(usage.input_tokens !== undefined ? { inputTokens: usage.input_tokens } : {}),
+    ...(usage.output_tokens !== undefined ? { outputTokens: usage.output_tokens } : {}),
+    ...(usage.cache_read_input_tokens !== undefined ? { cacheReadTokens: usage.cache_read_input_tokens } : {}),
+    ...(usage.cache_creation_input_tokens !== undefined ? { cacheCreationTokens: usage.cache_creation_input_tokens } : {}),
+  }
 }
 function unavailable(detail: string): 'auth' | 'quota' | null {
   if (/auth|credential|unauthorized|forbidden|api.?key|not logged in|\b401\b|\b403\b/i.test(detail)) return 'auth'
@@ -59,6 +87,23 @@ function snapshot(ctx: TurnCtx | null): PartialSnapshot {
     completedTools: [...ctx.tools.values()].map((v) => structuredClone(v)),
     assistantSegments: ctx.assistantSegments.map((v) => ({ ...v })), thinkingSegments: ctx.thinkingSegments.map((v) => ({ ...v })), runtimeEvents: [] }
     : { assistantText: '', thinkingText: '', completedTools: [], assistantSegments: [], thinkingSegments: [], runtimeEvents: [] }
+}
+function toolCallOf(event: CursorEvent): Record<string, unknown> | null {
+  return recordOf(event.tool_call ?? event.toolCall)
+}
+function toolNameOf(event: CursorEvent): string {
+  const direct = event.tool_name ?? event.toolName ?? event.name
+  if (typeof direct === 'string' && direct) return direct
+  const call = toolCallOf(event); const nestedTool = recordOf(call?.tool)
+  for (const candidate of [call?.name, call?.tool_name, call?.toolName, call?.type, nestedTool?.case]) {
+    if (typeof candidate === 'string' && candidate) return candidate
+  }
+  return 'CursorTool'
+}
+function toolFailed(event: CursorEvent): boolean {
+  const call = toolCallOf(event); const result = recordOf(call?.result)
+  const status = textOf(event.status ?? call?.status ?? result?.case).toLowerCase()
+  return event.is_error === true || ['error', 'failed', 'failure'].includes(status)
 }
 
 export class CursorAdapter extends EventEmitter implements EngineAdapter {
@@ -78,7 +123,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
   submitTurn(params: TurnParams): EngineTurnRun {
     let resolve!: (value: TurnSummary | null) => void
     const summary = new Promise<TurnSummary | null>((r) => { resolve = r })
-    const ctx: TurnCtx = { params, startedAt: Date.now(), proc: null, assistantText: '', thinkingText: '', assistantSegments: [], thinkingSegments: [], tools: new Map(), pending: new Set(), startedTools: new Map(), stderr: '', terminal: false, interrupted: false, error: null, resolve }
+    const ctx: TurnCtx = { params, startedAt: Date.now(), proc: null, assistantText: '', thinkingText: '', assistantSegments: [], thinkingSegments: [], tools: new Map(), pending: new Set(), startedTools: new Map(), stderr: '', terminal: false, interrupted: false, error: null, assistantPartialText: '', resolve }
     this.active = ctx; this.lastActivityAt = Date.now(); this.drain = new Promise((r) => { this.resolveDrain = r })
     const submitted = this.spawnTurn(ctx).catch((err) => { if (!ctx.terminal) this.finish(ctx, String(err)); this.resolveDrain?.(); this.resolveDrain = null; if (this.active === ctx) this.active = null; throw err })
     return { submitted, summary, end: () => this.forceEnd(ctx), getPartialSnapshot: () => snapshot(ctx), getPhantomSignals: () => ({ ...EMPTY_SIGNALS }), get finalized() { return ctx.terminal }, get pendingToolCalls() { return ctx.pending.size } }
@@ -110,17 +155,33 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     let event: CursorEvent
     try { event = JSON.parse(line) as CursorEvent } catch (err) { this.emit('parse_error', { line, err }); return }
     const type = textOf(event.type).toLowerCase()
-    if (type === 'assistant' || type === 'text' || type === 'assistant_delta') { this.emitText(ctx, 'text', event.text ?? event.message ?? event.content ?? event.delta); return }
+    if (type === 'assistant') {
+      const value = assistantTextOf(event); if (!value) return
+      const officialNested = recordOf(event.message) !== null
+      const partialDelta = officialNested && typeof event.timestamp_ms === 'number' && event.model_call_id === undefined
+      if (partialDelta) { ctx.assistantPartialText += value; this.emitText(ctx, 'text', value) }
+      else { if (value !== ctx.assistantPartialText) this.emitText(ctx, 'text', value); ctx.assistantPartialText = '' }
+      return
+    }
+    if (type === 'text' || type === 'assistant_delta') { this.emitText(ctx, 'text', event.text ?? event.content ?? event.delta); return }
     if (type === 'thinking' || type === 'thought' || type === 'thinking_delta') { this.emitText(ctx, 'thinking', event.text ?? event.message ?? event.content ?? event.delta); return }
-    if (type === 'tool_call' || type === 'tool_use' || type === 'tool_start') { this.toolStart(ctx, event); return }
+    if (type === 'tool_call') {
+      if (textOf(event.subtype).toLowerCase() === 'completed') this.toolResult(ctx, event)
+      else this.toolStart(ctx, event)
+      return
+    }
+    if (type === 'tool_use' || type === 'tool_start') { this.toolStart(ctx, event); return }
     if (type === 'tool_result' || type === 'tool_call_update' || type === 'tool_end') { this.toolResult(ctx, event); return }
     const reported = usageOf(event); if (reported) ctx.usage = reported
     if (type === 'error') { ctx.error = textOf(event.message ?? event.error ?? event.data) || 'Cursor CLI error'; return }
-    if (type === 'result') this.finish(ctx, ctx.error)
+    if (type === 'result') {
+      const failed = event.is_error === true || ['error', 'failed', 'failure'].includes(textOf(event.subtype).toLowerCase())
+      this.finish(ctx, failed ? textOf(event.error ?? event.result ?? event.message) || ctx.error || 'Cursor CLI error' : ctx.error)
+    }
   }
   private toolStart(ctx: TurnCtx, event: CursorEvent): void {
-    const id = textOf(event.tool_call_id ?? event.toolCallId ?? event.id) || `cursor-tool-${ctx.tools.size + 1}`
-    const name = textOf(event.tool_name ?? event.toolName ?? event.name) || 'CursorTool'; const input = event.input ?? event.rawInput ?? event.arguments ?? {}
+    const id = textOf(event.call_id ?? event.tool_call_id ?? event.toolCallId ?? event.id) || `cursor-tool-${ctx.tools.size + 1}`
+    const name = toolNameOf(event); const input = event.input ?? event.rawInput ?? event.arguments ?? event.tool_call ?? {}
     if (ctx.tools.has(id)) return
     const tool: TurnToolEntry = { toolUseId: id, blockId: id, toolName: name, inputJson: structuredClone(input), inputPreview: textOf(input).slice(0, 500), output: '', completed: false, isError: false, durationMs: 0, ts: Date.now(), arrivedAt: Date.now(), eventOrdinal: ctx.params.nextDurableEventOrdinal?.() }
     ctx.tools.set(id, tool); ctx.pending.add(id); ctx.startedTools.set(id, Date.now()); ctx.params.toolUseIdToName.set(id, name)
@@ -128,10 +189,10 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     ctx.params.onEvent({ kind: 'block', block }); ctx.params.onEvent({ kind: 'tool_use_detected', tool: { name, id, input: input && typeof input === 'object' ? structuredClone(input) as Record<string, any> : {} } })
   }
   private toolResult(ctx: TurnCtx, event: CursorEvent): void {
-    const id = textOf(event.tool_call_id ?? event.toolCallId ?? event.id); if (!id) return
+    const id = textOf(event.call_id ?? event.tool_call_id ?? event.toolCallId ?? event.id); if (!id) return
     if (!ctx.tools.has(id)) this.toolStart(ctx, event)
     const tool = ctx.tools.get(id)!; if (tool.completed) return
-    const outputJson = event.output ?? event.rawOutput ?? event.result ?? event.content ?? ''; const output = textOf(outputJson); const status = textOf(event.status).toLowerCase(); const isError = event.is_error === true || ['error', 'failed'].includes(status)
+    const outputJson = event.output ?? event.rawOutput ?? event.result ?? event.content ?? event.tool_call ?? ''; const output = textOf(outputJson); const isError = toolFailed(event)
     Object.assign(tool, { output, outputJson: structuredClone(outputJson), completed: true, isError, durationMs: Date.now() - (ctx.startedTools.get(id) ?? Date.now()), ts: Date.now() }); ctx.pending.delete(id)
     ctx.params.onEvent({ kind: 'block', block: { kind: 'tool_result', toolUseBlockId: id, toolName: tool.toolName, isError, output, outputJson: structuredClone(outputJson), preview: output.slice(0, 500) } }); ctx.params.onEvent({ kind: 'tool_result_detected', result: { toolUseId: id, toolName: tool.toolName, preview: output.slice(0, 500), isError, durationMs: tool.durationMs, inputPreview: tool.inputPreview } })
   }
@@ -143,7 +204,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     const errorClass = detail ? classifyRunError(detail).code : undefined
     if (detail) ctx.params.onEvent({ kind: 'error', error: safeDetail!, errorClass, ...(ctx.interrupted ? { errorCode: 'user_cancelled' as const } : {}) })
     if (ctx.usage) ctx.params.onEvent({ kind: 'usage', usage: { inputTokens: ctx.usage.input_tokens ?? 0, outputTokens: ctx.usage.output_tokens ?? 0, cacheReadTokens: ctx.usage.cache_read_input_tokens ?? 0, cacheCreationTokens: ctx.usage.cache_creation_input_tokens ?? 0, totalTokens: Object.values(ctx.usage).reduce((a, b) => a + (b ?? 0), 0) } })
-    ctx.params.onEvent({ kind: 'final', meta: { ...(ctx.usage ? { inputTokens: ctx.usage.input_tokens, outputTokens: ctx.usage.output_tokens, cacheReadTokens: ctx.usage.cache_read_input_tokens, cacheCreationTokens: ctx.usage.cache_creation_input_tokens } : {}), stopReason: ctx.interrupted ? 'interrupted' : undefined } })
+    ctx.params.onEvent({ kind: 'final', meta: { ...finalUsageMeta(ctx.usage), ...(ctx.interrupted ? { stopReason: 'interrupted' } : {}) } })
     ctx.params.sessionTotals.turns += 1
     const u = ctx.usage; ctx.resolve({ usage: { cost: 0, inputTokens: u?.input_tokens ?? 0, outputTokens: u?.output_tokens ?? 0, cacheReadTokens: u?.cache_read_input_tokens ?? 0, cacheCreationTokens: u?.cache_creation_input_tokens ?? 0, totalTokens: u ? Object.values(u).reduce((a, b) => a + (b ?? 0), 0) : 0 }, assistantText: ctx.assistantText, thinkingText: ctx.thinkingText, assistantSegments: ctx.assistantSegments.map((v) => ({ ...v })), thinkingSegments: ctx.thinkingSegments.map((v) => ({ ...v })), tools: [...ctx.tools.values()].map((v) => structuredClone(v)), runtimeEvents: [], stopReason: ctx.interrupted ? 'interrupted' : null, numTurns: 1, isError: !!detail, ...(detail ? { errorKind: 'other' as const, errorClass, errorDetail: safeDetail! } : {}), staleResumeId: false, phantomSignals: { ...EMPTY_SIGNALS } })
   }
