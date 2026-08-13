@@ -10,7 +10,7 @@
 set -euo pipefail
 
 ENV_FILE=/etc/openclaude/commercial-v5-selfhost.env
-LOG_FILE=/var/log/cloudflared-v5-selfhost.log
+LOG_FILE="${LOG_FILE:-/var/log/cloudflared-v5-selfhost.log}"
 UNIT=openclaude-v5-selfhost.service
 APPLY=0
 [[ "${1:-}" == "--apply" ]] && APPLY=1
@@ -19,28 +19,33 @@ TUNNEL_UNIT=cloudflared-v5-selfhost.service
 systemctl is-active --quiet "$TUNNEL_UNIT" ||
   { echo "✗ $TUNNEL_UNIT 未运行" >&2; exit 1; }
 
-# 日志是 append-only,上一次启动的旧域名还留在里面。cloudflared 进入 active 到
-# 打印新域名之间有几秒窗口,只 tail -1 会抓到已失效的旧域名,所以按本次启动
-# 时间过滤,并等到本次启动真的产出域名为止。
-started=$(date -d "$(systemctl show "$TUNNEL_UNIT" --value -p ExecMainStartTimestamp)" +%s)
+# 日志是 append-only,上一次启动的旧域名还留在里面,而 cloudflared 进入 active 到
+# 打印新域名之间有几秒窗口,只 tail -1 会抓到已失效的旧域名。日志时间戳只到秒,
+# 单纯比时间在"旧域名与本次启动同秒"时仍会取错,所以改为锚定 cloudflared 自己打的
+# 会话起始行:取本次启动之后最后一次 "Requesting new quick Tunnel",只认它之后的域名。
+STARTED=$(date -d "$(systemctl show "$TUNNEL_UNIT" --value -p ExecMainStartTimestamp)" +%s)
+REQUEST_MARK='Requesting new quick Tunnel'
 
-url_since_start() {
-  local line ts
+url_this_session() {
+  local line lineno ts anchor=0
   while IFS= read -r line; do
-    ts=$(date -d "${line%% *}" +%s 2>/dev/null) || continue
-    [[ "$ts" -ge "$started" ]] || continue
-    printf '%s' "$line" | grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com'
-  done < <(grep -E 'https://[a-z0-9-]+\.trycloudflare\.com' "$LOG_FILE") | tail -1
+    lineno="${line%%:*}"
+    ts=$(date -d "$(printf '%s' "${line#*:}" | cut -d' ' -f1)" +%s 2>/dev/null) || continue
+    [[ "$ts" -ge "$STARTED" ]] && anchor="$lineno"
+  done < <(grep -n -F "$REQUEST_MARK" "$LOG_FILE")
+  [[ "$anchor" -gt 0 ]] || return 0
+  tail -n "+$anchor" "$LOG_FILE" |
+    grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | head -1
 }
 
 url=""
 for _ in $(seq 1 30); do
-  url=$(url_since_start)
+  url=$(url_this_session)
   [[ -n "$url" ]] && break
   sleep 2
 done
 [[ -n "$url" ]] || {
-  echo "✗ 本次启动($(date -d "@$started" '+%F %T'))后 60s 内没在 $LOG_FILE 抓到域名" >&2
+  echo "✗ 本次启动($(date -d "@$STARTED" '+%F %T'))后 60s 内没在 $LOG_FILE 抓到域名" >&2
   exit 1
 }
 
