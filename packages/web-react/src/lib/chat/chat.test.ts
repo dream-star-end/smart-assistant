@@ -16,6 +16,7 @@ import {
   normalizeBridgeErrorCode,
   onopenSetInitialStatus,
   parsePartialJson,
+  safeBridgeErrorDetail,
   shouldAutoContinueEmptyTurn,
 } from "./pure";
 import {
@@ -346,6 +347,20 @@ describe("friendlyBridgeErrorMessage · 服务端 message 白名单", () => {
 
   test("container_outdated 正文指向刷新页面(不是重试)", () => {
     expect(friendlyBridgeErrorMessage("container_outdated")).toMatch(/刷新页面/);
+  });
+});
+
+describe("模型路由错误的公开文案与详情", () => {
+  test("route unavailable 使用供应商中性文案，不泄露 GPT 路由名", () => {
+    const message = friendlyBridgeErrorMessage("CODEX_ROUTE_UNAVAILABLE");
+    expect(message).toBe("模型服务暂时不可用，你的消息已保留，请稍后重试。");
+    expect(message).not.toContain("GPT");
+  });
+
+  test("无 trace 时不生成重复详情，有 trace 时只展示安全请求 ID", () => {
+    expect(safeBridgeErrorDetail("CODEX_ROUTE_UNAVAILABLE")).toBe("");
+    expect(safeBridgeErrorDetail("CODEX_ROUTE_UNAVAILABLE", " trace-12345678 "))
+      .toBe("请求 ID：trace-12345678");
   });
 });
 
@@ -2566,7 +2581,7 @@ describe("applyOutboundError double-frame suppression (§11)", () => {
     applyOutboundError(s, { type: "outbound.error", sessionKey: "k", channel: "webchat", peer: { id: "s1", kind: "dm" }, code: "some_new_code", message: "server shutting down", isFinal: true } as never);
     const err = s.messages.filter((m) => m.role === "assistant").at(-1)!;
     expect(err.text).toBe("系统暂时不可用，请稍后重试。"); // 友好通用,不抛裸英文
-    expect(err._errorDetail).toBe("系统暂时不可用，请稍后重试。");
+    expect(err._errorDetail).toBe("");
     expect(err._errorDetail).not.toMatch(/server shutting down/);
   });
 
@@ -2604,7 +2619,7 @@ describe("applyOutboundError double-frame suppression (§11)", () => {
       role: "assistant",
       text: "本轮已取消。",
       _errorCode: "user_cancelled",
-      _errorDetail: "本轮已取消。",
+      _errorDetail: "",
     });
     expect(reportTurnError).not.toHaveBeenCalled();
     expect(scheduleAutomaticRecovery).not.toHaveBeenCalled();
@@ -2660,7 +2675,7 @@ describe("applyOutboundError double-frame suppression (§11)", () => {
     expect(s.messages.at(-1)).toMatchObject({
       role: "assistant",
       _clientMessageId: older.id,
-      _errorDetail: "任务执行暂时中断，你的消息已保留，可直接重试。",
+      _errorDetail: "",
     });
   });
 

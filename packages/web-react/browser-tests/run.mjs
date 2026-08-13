@@ -184,7 +184,7 @@ const html = `<!doctype html><html><head><meta charset="utf-8"><style>${producti
   #root{position:static;height:auto;overflow:visible}
   .timeline-scroll-probe{height:360px;width:640px;overflow-y:auto;position:relative;border:1px solid #ccc;scrollbar-gutter:stable}
   #timeline-archive-root .chat-virtual-item{min-height:40px}
-</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="chat-entry-ux-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="interrupted-tool-status-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="ask-question-root"></div><div id="model-selector-root"></div><div id="markdown-rich-root"></div><div id="media-task-root"></div><div id="connectors-root"></div><div id="memory-report-root"></div><div id="community-tutorial-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
+</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="chat-entry-ux-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="interrupted-tool-status-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="error-ux-root"></div><div id="ask-question-root"></div><div id="model-selector-root"></div><div id="markdown-rich-root"></div><div id="media-task-root"></div><div id="connectors-root"></div><div id="memory-report-root"></div><div id="community-tutorial-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
 
 // ── drive ───────────────────────────────────────────────────────────────────
 let browser;
@@ -2040,6 +2040,34 @@ await check("T38 社区教程真浏览器：公开阅读只读，用户投稿进
   await page.setViewportSize({ width: 390, height: 844 });
   const overflows = await root.evaluate((element) => element.scrollWidth > element.clientWidth + 1);
   if (overflows) throw new Error("社区教程在 390px 视口发生横向溢出");
+  if (DEFAULT_VIEWPORT) await page.setViewportSize(DEFAULT_VIEWPORT);
+});
+
+await check("T40 390px 失败轮只显示一个中性紧凑重试出口", async () => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  const root = page.locator("#error-ux-root");
+  await root.getByText("你是什么模型", { exact: true }).waitFor({ state: "visible", timeout: 3000 });
+  const text = await root.textContent() ?? "";
+  if (text.includes("发送失败")) throw new Error("用户行仍重复展示发送失败");
+  if (text.includes("GPT")) throw new Error("供应商路由名仍暴露给用户");
+  if (await root.getByRole("button", { name: "重试", exact: true }).count() !== 1) {
+    throw new Error("失败轮没有收敛为唯一重试入口");
+  }
+  if (await root.getByText("查看请求信息", { exact: true }).count() !== 0) {
+    throw new Error("无请求 ID 时仍展示冗余详情入口");
+  }
+  const alert = root.getByRole("alert");
+  const className = await alert.getAttribute("class") ?? "";
+  if (!className.includes("border-warning/30") || !className.includes("px-3") || !className.includes("py-2")) {
+    throw new Error(`预期错误没有使用紧凑 warning 视觉:${className}`);
+  }
+  const overflows = await root.evaluate((element) => element.scrollWidth > element.clientWidth + 1);
+  if (overflows) throw new Error("错误轮在 390px 视口发生横向溢出");
+
+  await root.getByRole("button", { name: "重试", exact: true }).click();
+  if (await page.evaluate(() => window.__errorUxRetries) !== 1) {
+    throw new Error("唯一重试入口没有精确触发一次重发");
+  }
   if (DEFAULT_VIEWPORT) await page.setViewportSize(DEFAULT_VIEWPORT);
 });
 

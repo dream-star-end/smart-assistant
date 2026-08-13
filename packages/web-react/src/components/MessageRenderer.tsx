@@ -95,6 +95,8 @@ type RendererProps = {
   onRespondPermission: PermissionRespond;
   /** 只读会话查看：禁止权限/问答卡触发任何写动作。 */
   readOnly?: boolean;
+  /** 同一可见轮已有错误卡/状态卡，用户行不再重复展示失败标签和重试。 */
+  failurePresentedBelow?: boolean;
 };
 
 export const MessageRenderer = memo(
@@ -114,6 +116,7 @@ export const MessageRenderer = memo(
     cb,
     onRespondPermission,
     readOnly = false,
+    failurePresentedBelow = false,
   }: RendererProps) {
     const ctx = {
       isLast,
@@ -144,6 +147,7 @@ export const MessageRenderer = memo(
           cb={cb}
           onRespondPermission={onRespondPermission}
           readOnly={readOnly}
+          failurePresentedBelow={failurePresentedBelow}
         />
       );
     }
@@ -156,7 +160,7 @@ export const MessageRenderer = memo(
     }
     switch (messageKind(message)) {
       case "user":
-        return <UserCard msg={message} cb={cb} />;
+        return <UserCard msg={message} cb={cb} failurePresentedBelow={failurePresentedBelow} />;
       case "assistant":
         return <AssistantCard msg={message} ctx={ctx} cb={cb} tokenUsage={tokenUsage} />;
       case "thinking":
@@ -242,6 +246,7 @@ export const MessageRenderer = memo(
     a.historyGeneration === b.historyGeneration &&
     a.processPaging === b.processPaging &&
     a.readOnly === b.readOnly &&
+    a.failurePresentedBelow === b.failurePresentedBelow &&
     a.cb === b.cb &&
     a.onRespondPermission === b.onRespondPermission,
 );
@@ -363,6 +368,7 @@ function DeferredTapeRecordCard({
   onRespondPermission,
   readOnly,
   turnFinalAssistant,
+  failurePresentedBelow,
 }: Omit<RendererProps, "sig" | "delegateCost">) {
   const ref = useRef<HTMLDivElement>(null);
   const isUserPayload = message._userPayloadDeferred === true;
@@ -547,6 +553,7 @@ function DeferredTapeRecordCard({
               cb={cb}
               onRespondPermission={onRespondPermission}
               readOnly={readOnly}
+              failurePresentedBelow={failurePresentedBelow}
             />
           );
         })}
@@ -1086,6 +1093,44 @@ export function MessageList({
       !isRedundantRuntimeEnvelope(m) &&
       !isTurnStatusSuppressedByTape(m, resolvedDispatchTurnIds),
   );
+  const visibleUserIds = new Set(
+    renderableMessages
+      .filter((message) => message.role === "user")
+      .map((message) => message.id),
+  );
+  const automaticRecoveryParents = new Map(
+    messages
+      .filter(
+        (message) =>
+          message.role === "user" &&
+          message._automaticRecovery === true &&
+          typeof message._recoveryOfClientMessageId === "string" &&
+          message._recoveryOfClientMessageId.length > 0,
+      )
+      .map((message) => [message.id, message._recoveryOfClientMessageId as string]),
+  );
+  const visibleErrorTurnId = (clientMessageId: string) => {
+    let current = clientMessageId;
+    const visited = new Set<string>();
+    while (!visibleUserIds.has(current) && !visited.has(current)) {
+      visited.add(current);
+      const parent = automaticRecoveryParents.get(current);
+      if (!parent) break;
+      current = parent;
+    }
+    return current;
+  };
+  const presentedErrorTurnIds = new Set(
+    renderableMessages
+      .filter(
+        (message) =>
+          typeof message._clientMessageId === "string" &&
+          message._clientMessageId.length > 0 &&
+          (message._turnStatusRecord === true ||
+            (message.role === "assistant" && !!message._errorCode)),
+      )
+      .map((message) => visibleErrorTurnId(message._clientMessageId as string)),
+  );
   const legacyArchivedRemaining = archive?.hasMore === undefined
     ? Math.max(
         0,
@@ -1187,9 +1232,13 @@ export function MessageList({
       );
     }
     const turnFinalAssistant = ratingFinal[it.idx] ?? false;
-    const rowSig =
-      messageSignature(it.m, { isLast: it.isLast, sending, turnFinalAssistant }) +
-      `|tu:${tokenUsageSignature(it.tokenUsage)}|du:${tokenUsageSignature(delegateTokenUsage(it.m))}`;
+    const failurePresentedBelow =
+      it.m.role === "user" && presentedErrorTurnIds.has(it.m.id);
+    const rowSig = `${messageSignature(it.m, {
+      isLast: it.isLast,
+      sending,
+      turnFinalAssistant,
+    })}|tu:${tokenUsageSignature(it.tokenUsage)}|du:${tokenUsageSignature(delegateTokenUsage(it.m))}|pe:${failurePresentedBelow ? 1 : 0}`;
     return (
       <MessageBoundary messageId={it.m._timelineUnitKey ?? it.m.id} sig={rowSig}>
         <MessageRenderer
@@ -1208,6 +1257,7 @@ export function MessageList({
           cb={cb}
           onRespondPermission={onRespondPermission}
           readOnly={readOnly}
+          failurePresentedBelow={failurePresentedBelow}
         />
       </MessageBoundary>
     );
