@@ -7,7 +7,8 @@
 > 配套审计：`docs/V5_WEB_CODEX_DESKTOP_ALIGNMENT.md` §2 / §4.2 PR8 / §5「git/文件树安全」  
 > 环境限制：本机没有 `oc-worktree` 注册表，按独立开发环境例外使用 `git worktree add`。  
 > Codex 威胁模型审 #1：**FAIL**（5 Finding）。#2：**FAIL**（父目录 symlink 绕过 `.git` segment）。#3：**PASS**（`/tmp/codex-workspace-inspect-threat-r3.txt`）。  
-> 方案迟到审查（对照 `45bc8802e`）补了 4 条威胁模型缺口，已写入 T2 hermetic gitdir / T2 结束复核 / T5 子进程终止 / T6 净化契约。实现方案 #3 PASS 前仍禁止写生产代码。
+> 方案迟到审查（对照 `45bc8802e`）补了 4 条威胁模型缺口，已写入 T2 hermetic gitdir / T2 结束复核 / T5 子进程终止 / T6 净化契约。  
+> 方案 #3：**FAIL**（HEAD/objects 未锚定、准备阶段无资源闸、T6 测试漏 DEL/C1）。已写入 T2/T5/T6。实现方案 #4 PASS 前仍禁止写生产代码。
 
 ---
 
@@ -140,7 +141,11 @@ XSS 不在本协议修复范围；本协议必须做到：**即便脚本能调 A
 - git 采集 **双 fd 锚定 + 受信临时 gitdir**（不得让 git 读攻击者可写的 `.git/config`）：
   1. `lstat` + `open(O_DIRECTORY|O_NOFOLLOW)` 工作树根 → `wfd`；同样打开真实 `.git` 目录 → `gfd`。`.git` 为 symlink 或 gitfile（`gitdir:` 文件）→ 空态 `not_a_repo`，不跟随。
   2. spawn **显式继承** `wfd`/`gfd`。argv 用 `--work-tree=/proc/self/fd/<wfd>`。**禁止**把 `--git-dir` 指到原始 `.git`（那会加载 local `filter.*.clean/process`、`core.worktree`、`include.path`）。
-  3. 另建受信临时 gitdir：只写入最小 `config`（无 `filter.*` / `include` / `core.worktree` / hooks / fsmonitor）、用 `O_NOFOLLOW` 从 `gfd` 拷贝 `HEAD`/`index`/`packed-refs` 及 HEAD 指向的单个 ref（任一段是 symlink 则失败）。objects 经 `objects/info/alternates` 指向 `/proc/self/fd/<gfd>/objects`。不拷贝、不 symlink 原始 `config`、`hooks`、`commondir`。`--git-dir` 只指向该临时目录。结束时删除临时目录。
+  3. 另建受信临时 gitdir：只写入最小 `config`（无 `filter.*` / `include` / `core.worktree` / hooks / fsmonitor）。`--git-dir` 只指向该临时目录。结束时删除临时目录。
+     - **HEAD**：经 `gfd` 逐段 nofollow 打开。只接受 40-hex detached，或 `ref: refs/<rest>`（每段 `^[A-Za-z0-9._-]+$`，禁 `.`/`..`/空段）。`ref: ../../...` 等 → `not_a_repo`。
+     - 拷贝 `HEAD`/`index`/`packed-refs`/那一个 ref：每跳 `O_NOFOLLOW|O_NONBLOCK`，`fstat` 必须 regular file（拒 FIFO）。上限 HEAD/ref 256B、packed-refs 2MiB、index 8MiB、合计 10MiB。
+     - **objects 独立 `ofd`**：`open(O_DIRECTORY|O_NOFOLLOW)` 后继承进子进程；`alternates` 只写 `/proc/self/fd/<ofd>`。禁止 `/proc/self/fd/<gfd>/objects`。
+     - 不拷贝、不 symlink 原始 `config`、`hooks`、`commondir`。
   4. 不能靠枚举 `filter.*` 再 `-c` 覆盖（竞态/漏项）。`--no-ext-diff --no-textconv` 仍加，但**不能**当作 filter 的替代。
   5. 结束复核**不能**对同一打开 fd 再 `fstat`（rename 后 ino 不变，且旧 version 目录故意保留）。必须再读 `getRepoSnapshot`，比较 `status+selectionVersion+workspaceDir`，再 open 当前权威路径比 inode。失败 → 丢弃结果，**HTTP 409** `WORKSPACE_CHANGED`。
   6. git 输出的路径仍走 T1 join+realpath；逃出则丢弃该条目。无路径的 live HEAD 依赖步骤 5，不单独信任。
@@ -151,7 +156,7 @@ XSS 不在本协议修复范围；本协议必须做到：**即便脚本能调 A
   - 达 stdout/entries 上限必须 **关闭 pipe 并终止 git**（`SIGTERM` → 短等 → `SIGKILL`，始终 reap），stderr 独立限额并持续 drain；不得让 git 堵在满管道上占信号量。intentional truncation 是 200 + `truncated`；timeout 是 504 无 body。
 - 内容读取的 TOCTOU 仍由现有 `openFileHardened` 关（本协议不读内容）。
 
-**测试：** 真实 `symlinkSync` 指向 `/etc`、指向 `git-creds`、指向工作树外；目录 swap 用例至少覆盖「list 目标是 symlink 且 target 在树外 → 403」。
+**测试：** 真实 `symlinkSync` 指向 `/etc`、指向 `git-creds`、指向工作树外；目录 swap 用例至少覆盖「list 目标是 symlink 且 target 在树外 → 403」。gitdir：恶意 `HEAD` `ref: ../../tmp/x`、`objects` symlink/swap、`HEAD`/`index` 为 FIFO 均拒。
 
 ### T3 跨用户 / 跨容器 volume 越权
 
@@ -227,10 +232,11 @@ list-dir / git 路径规范化仍额外拒绝 `.git` segment（纵深），但�
 | 相对路径深度 | 32 segment | 400 `BAD_PATH` |
 | 单次 list 深度 | 1（不递归） | 协议层 |
 | 并发 | **每容器（进程）inspect 信号量 = 2**；同 session 同时只允许 1 个。第二发 **立即 429 `IN_FLIGHT`**，禁止排队等待 | 多 session 不能绕过 per-session 锁打满 CPU |
+| gitdir 准备（HEAD/index/packed-refs/ref） | regular file；HEAD/ref 256B、packed-refs 2MiB、index 8MiB、合计 10MiB；`O_NONBLOCK` | 非 regular / 超限 → 失败；FIFO 不得阻塞到 5s。计入同一 git deadline；`finally` 删临时目录并放信号量 |
 
 Vendor 目录 `kind: skipped`，**不** `readdir` 展开。二进制：numstat 的 `-` `\t` `-` → `binary: true`，`added/deleted: null`，不读文件字节。
 
-**测试：** 201+ dirent 断言 `truncated===true` 且未把全目录读进数组（可用 spy/计数）；超字节预算；timeout 无部分体；**同 session 第二个并发请求立即 429、无等待**；同容器两个不同 session 可各占 1 个槽，第三请求（第 3 个并发）429。
+**测试：** 201+ dirent 断言 `truncated===true` 且未把全目录读进数组（可用 spy/计数）；超字节预算；timeout 无部分体；**同 session 第二个并发请求立即 429、无等待**；同容器两个不同 session 可各占 1 个槽，第三请求（第 3 个并发）429；**FIFO 或超大 index 后临时目录与信号量均释放**。
 
 ### T6 输出净化
 
@@ -241,7 +247,7 @@ git / `readdir` 可能吐出换行、ANSI、bidi override、`<script>` 文件名
 - 紧凑 `JSON.stringify`（不 pretty-print），保证 wire 上的 JSON 字符串值不含 raw C0/C1/DEL/bidi。换行在 JSON 里以 `\n` 转义出现是允许的（那是两字节 `\`+`n`，不是 U+000A）。
 - 不把路径写进普通 info 日志。warn 只用 `sessionId` + 错误码 + `rel` 的 hash 或截断到 64 且已净化的相对路径。
 
-**测试：** 文件名含 `\n`、`\x1b[31m`、U+202E → `JSON.parse` 后的 `name` 不含这些码点，响应 buffer 不含 raw ESC/bidi。文件名含 `<img>` → 解析后的 name 可以含 `<img>`，**禁止**断言响应体没有 `<img>` 字节。
+**测试：** 文件名含 `\n`、`\x1b[31m`、U+202E、**DEL(U+007F)**、**至少一个 C1（U+0085 或 U+009B）** → `JSON.parse` 后的 `name` 不含这些码点，响应 buffer 不含 raw ESC/bidi/DEL/C1。文件名含 `<img>` → 解析后的 name 可以含 `<img>`，**禁止**断言响应体没有 `<img>` 字节。
 
 ### T7 鉴权
 
@@ -404,7 +410,8 @@ HTTP **200**：
 - [ ] 超大目录流式截断：`truncated===true`，`omitted` 不要求精确剩余数；字节预算
 - [ ] **同 session 第二个并发请求立即 429、无等待**；同容器第三并发 429
 - [ ] 超时 504 无部分体
-- [ ] 输出无控制字符
+- [ ] 输出无控制字符（含 DEL 与 C1；`<img>` 可保留）
+- [ ] 恶意 HEAD ref / objects symlink / FIFO gitdir 输入被拒，临时目录与信号量释放
 - [ ] `/api/file` 对目录仍 404（回归）
 - [ ] gateway handler 往返 + 采集层单测；CI `typecheck` / `gateway` / `storage` / `commercial-unit` / `v5-ops`
 

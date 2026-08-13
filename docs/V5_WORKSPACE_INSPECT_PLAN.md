@@ -2,7 +2,7 @@
 
 > 威胁模型：`docs/V5_WORKSPACE_INSPECT_THREAT_MODEL.md`（Codex #3 **PASS**；迟到审查补丁已写入 T2/T5/T6）  
 > 实现方案审 #1：**FAIL**（6 Finding，已闭合于 `b685671d3`）。#2：**PASS**（只核对该 6 条）。  
-> 迟到审查（对照 `45bc8802e`）：**FAIL**，另 4 条硬 Finding（filter 执行、ACL 单一权威、子进程生命周期、T6 净化）。本版已吸收；待 #3 PASS 才写生产代码。  
+> #3：**FAIL**（3 Finding：HEAD/objects 未锚定、gitdir 准备阶段无资源闸、T6 测试漏 DEL/C1）。本版已吸收；待 #4 PASS 才写生产代码。  
 > 本轮：**纯后端**。合入后前端零行为变化。PR-B 不做。不部署、不合入。  
 > 基线：`origin/feat/v5-aurora-rewrite` @ `e4f3fc930`  
 > 分支：`feat/v5-workspace-git-stat`
@@ -109,14 +109,19 @@ Vendor/VCS skip 名：`node_modules` `.git` `.svn` `.hg` `.venv` `venv` `__pycac
 
 1. `lstat` + `open(O_DIRECTORY|O_NOFOLLOW)` 工作树根 → `wfd`。realpath(`/proc/self/fd/wfd`) 必须仍在 `resolveReadyWorkspace` 给出的根下。
 2. 对 `<root>/.git` 同样 `lstat`（拒 symlink）+ `open(O_RDONLY|O_DIRECTORY|O_NOFOLLOW)` → `gfd`。`.git` 是文件（gitfile / `gitdir:`）→ 空态 `not_a_repo`，本 PR 不跟随。
-3. **受信临时 gitdir**（`mkdtemp`）：只写最小 `config`（无 `filter.*` / `include.path` / `includeIf` / `core.worktree` / hooks / fsmonitor）。用 `O_NOFOLLOW` 从 `gfd` 拷贝 `HEAD`、`index`、可选 `packed-refs`、以及 HEAD 指向的单个 ref（任一段 symlink → 失败）。`objects/info/alternates` 写 `/proc/self/fd/<gfd>/objects`。不拷贝、不 symlink 原始 `config`、`hooks`、`commondir`。`finally` 删除临时目录。
-4. `spawn` **显式继承** `wfd`/`gfd`。argv：`--git-dir=<tmpdir> --work-tree=/proc/self/fd/<wfd>` `--no-optional-locks` `--ignore-submodules=all` `--no-lazy-fetch`。`diff`/`numstat` 加 `--no-ext-diff --no-textconv`（纵深，不是 filter 的替代）。
+3. **受信临时 gitdir**（`mkdtemp`）：只写最小 `config`（无 `filter.*` / `include.path` / `includeIf` / `core.worktree` / hooks / fsmonitor）。**不**把 `--git-dir` 或 `alternates` 指回原始 `.git` 文本路径。
+   - **HEAD 契约（先校验再拷贝）**：经 `gfd` 逐段 nofollow 打开 `HEAD`。内容只能是 (a) 40-hex detached SHA，或 (b) `ref: refs/<rest>`，其中 `<rest>` 按 `/` 拆段，每段 `^[A-Za-z0-9._-]+$`、禁止 `.`/`..`/空段，完整路径必须落在 `refs/**`。其它形状（`ref: ../../etc/passwd`、`ref: /etc/passwd`、相对 `objects/`、带空白）→ 失败，当 `not_a_repo`。
+   - **拷贝闸**：只拷 `HEAD`、`index`、可选 `packed-refs`、以及（b）指向的**那一个** ref 文件。每一跳 `lstat`+`open(O_RDONLY|O_NOFOLLOW|O_NONBLOCK)`，**`fstat` 必须是 regular file**（拒 FIFO/socket/dir/symlink）。单文件上限：HEAD/ref 256B、`packed-refs` 2MiB、`index` 8MiB；合计 ≤ 10MiB。超限或非 regular → 失败并清理。
+   - **objects 独立 fd**：`open(O_RDONLY|O_DIRECTORY|O_NOFOLLOW)` `gfd` 下的 `objects` → `ofd`。`objects/info/alternates` 只写子进程里继承到的 `/proc/self/fd/<ofd>`（与 wfd/gfd 一样进 `stdio` 继承表），**禁止**写 `/proc/self/fd/<gfd>/objects` 这种仍可被中间段 symlink/swap 的路径。
+   - 不拷贝、不 symlink 原始 `config`、`hooks`、`commondir`。`finally` 删除临时目录。
+4. `spawn` **显式继承** `wfd`/`gfd`/`ofd`。argv：`--git-dir=<tmpdir> --work-tree=/proc/self/fd/<wfd>` `--no-optional-locks` `--ignore-submodules=all` `--no-lazy-fetch`。`diff`/`numstat` 加 `--no-ext-diff --no-textconv`（纵深，不是 filter 的替代）。
 5. env 仅：`PATH` `LC_ALL=C` `GIT_CONFIG_NOSYSTEM=1` `GIT_CONFIG_GLOBAL=/dev/null` `GIT_TERMINAL_PROMPT=0` `GIT_OPTIONAL_LOCKS=0` `GIT_PAGER=cat` `PAGER=cat`。不继承 `GIT_EXTERNAL_DIFF` `GIT_DIR` `GIT_WORK_TREE` `GIT_ASKPASS` `GIT_TRACE`。
 6. `status`/`numstat` 用 `-z`；`rev-parse` 校验 40-hex。禁止按换行切 path。stdout cap 1MiB；不完整记录丢弃；numstat 未完整则 `diff:null`（禁止假 0）。entries 满 500 停。
 7. **达 cap/entries 上限：立即停消费、关闭 pipes、`SIGTERM` → 200ms → `SIGKILL`、始终 reap。** stderr 独立 64KiB 限额并持续 drain，避免 git 堵在满 stderr 上。intentional truncation → 200 + `truncated`；timeout → 504 无 body。任何路径（含异常）在 `finally` 释放 per-session 与全局信号量。
-8. 结束后按 §4.3.8 复核 snapshot+inode；失败 409。
+8. **准备阶段纳入同一 deadline**：步骤 1–3 的 open/copy 与 spawn 共用 git 5s 时钟。FIFO 因 `O_NONBLOCK`+regular-file 闸立即失败，不得阻塞到超时。失败路径同样 `finally` 删临时目录、关 fd、放信号量。
+9. 结束后按 §4.3.8 复核 snapshot+inode；失败 409。
 
-测试：`.git/config` 写入 `core.worktree=/etc` 不得列出 `/etc`；`.git` 本身是 symlink 或 gitfile → 拒；hooks/fsmonitor 不被执行；**恶意 `filter.pwn.clean/process` + `.gitattributes` `* filter=pwn` 的 sentinel 命令不得执行**（sentinel 文件不得出现）。
+测试：`.git/config` 写入 `core.worktree=/etc` 不得列出 `/etc`；`.git` 本身是 symlink 或 gitfile → 拒；hooks/fsmonitor 不被执行；**恶意 `filter.pwn.clean/process` + `.gitattributes` `* filter=pwn` 的 sentinel 命令不得执行**（sentinel 文件不得出现）；**`HEAD` 为 `ref: ../../tmp/x` 或 `objects` 为 symlink → 拒**；**`HEAD`/`index` 换成 FIFO 或超大文件 → 立即失败，临时目录与信号量均释放**。
 
 ### 4.5 并发
 
@@ -155,7 +160,7 @@ commercial `router.ts`：
 |---|---|
 | `protocol/src/__tests__/workspaceInspect.test.ts` | 常量、空态形状、错误码 |
 | `gateway/src/__tests__/security.test.ts` | 新 regex；`foo.git` 不误伤；trusted `.git/config` `isFileAllowed===false` |
-| `gateway/src/__tests__/workspaceInspect.test.ts` | 穿越；symlink 树外/git-creds/`/etc`；**list-dir 目标 `.config`/`.ssh` → 403**；blocked 子目录 `skipped/denied`；空态无 `added:0`；流式截断；字节预算；hermetic hooks/fsmonitor；**`core.worktree=/etc` 不逃逸**；**.git 为 symlink/gitfile 拒**；**filter clean/process sentinel 不执行**；snapshot 变更 → 409；同 session 第二请求立即 429；Linux 断言走 `/proc/self/fd`；达 cap 后 git 被 kill 且信号量释放；T6：C0/ESC/bidi 从 parse 后的 name 消失，`<img>` 允许保留 |
+| `gateway/src/__tests__/workspaceInspect.test.ts` | 穿越；symlink 树外/git-creds/`/etc`；**list-dir 目标 `.config`/`.ssh` → 403**；blocked 子目录 `skipped/denied`；空态无 `added:0`；流式截断；字节预算；hermetic hooks/fsmonitor；**`core.worktree=/etc` 不逃逸**；**.git 为 symlink/gitfile 拒**；**filter clean/process sentinel 不执行**；**恶意 HEAD ref / objects symlink 拒**；**FIFO 或超大 index 失败后临时目录与信号量释放**；snapshot 变更 → 409；同 session 第二请求立即 429；Linux 断言走 `/proc/self/fd`；达 cap 后 git 被 kill 且信号量释放；T6：parse 后及 wire 上 C0、**DEL(U+007F)**、**C1（至少 U+0085 或 U+009B）**、ESC、bidi 均消失，`<img>` 允许保留 |
 | `gateway/src/__tests__/apiFileGitAcl.test.ts` | **真实 handler/HTTP 往返**（不许用抽出 guard 替代）：直链 `.git/config` 403；父 `.git` 为 symlink 仍 403；spy 证明未调用 `_resolveMediaDirs` / `realpathSync` / remote pull；目录仍 404；`foo.git` 不被这段误伤 |
 | `gateway/src/__tests__/bridgeApiAllowlist.test.ts` | 两条 GET 可代理；POST 不可 |
 | `commercial/src/__tests__/workspaceInspectRoutes.test.ts`（新） | **显式**：两条均可 `matchCommercialContainerApiProxy` GET；POST 否；两条均命中 `BLOCKED_FOR_USER_RULES`；user 与 admin（无 host-scope）进入 container proxy；admin+host-scope **即使 v3Supervisor/bridgeSecret 缺失** 仍 403 且不进 host handler |
@@ -179,15 +184,14 @@ PR-B UI、Commit/Push、Undo、递归整树、未绑定仓库扫描、第二套�
 
 ---
 
-## 9. Codex 审查问题（方案 · 第 3 轮）
+## 9. Codex 审查问题（方案 · 第 4 轮）
 
-迟到审查（对照旧快照 `45bc8802e`）的 4 条新 Finding 已写入正文与威胁模型。请确认是否闭合，并核对与威胁模型 T2/T5/T6 无矛盾：
+#3 FAIL 的 3 条 Finding 已写入 §4.4 与测试矩阵。请确认是否闭合：
 
-1. git **不读** 原始 `.git/config`：受信临时 gitdir + objects alternates；恶意 `filter.*.clean/process` sentinel 不得执行。不能只靠 `--no-ext-diff/--no-textconv` 或枚举 `-c filter.*`。
-2. ACL/root 单一权威：采集层不 import `server.ts`、不复制 blocklist/session 正则；`resolveReadyWorkspace` + 注入同一份 `isFileAllowed`/`isFileBlocked`。
-3. 达 stdout/entries 上限立即 kill+reap git，stderr drain，truncation≠timeout，信号量必释放。
-4. T6：删 C0/DEL/C1/bidi；**不**删 `<img>` 字节；测试按此断言。
+1. HEAD 只允许 40-hex 或校验过的 `refs/**` symbolic ref；拷贝逐段 nofollow；`objects` 用独立继承 `ofd` 写 alternates，不用 `/proc/self/fd/<gfd>/objects`。测恶意 HEAD ref 与 objects symlink/swap。
+2. 准备阶段：regular-file `fstat`、`O_NONBLOCK`、单文件/合计字节上限、同一 5s deadline/`finally`。测 FIFO 与超大文件后临时目录+信号量释放。
+3. T6 测试显式覆盖 DEL(U+007F) 与至少一个 C1（U+0085 或 U+009B），并保留 `<img>` 正向断言。
 
-顺带确认 #1/#2 已闭合项仍在：fd 继承、`.git` symlink/gitfile 拒、结束复核 snapshot+inode、HTTP 409、blocked 目录、host-scope 403 在 deps 闸外、真实 `/api/file` handler 往返。
+#3 已闭合项仍须在：临时 gitdir 隔离 filter、ACL 单一权威、spawn 后 kill+reap、fd 继承、host-scope 403 在 deps 闸外、真实 `/api/file` handler 往返。
 
 第一行 `PASS` / `FAIL` / `PARTIAL`。Finding 必须修才能写代码。不要改代码。
