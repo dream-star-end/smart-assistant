@@ -870,7 +870,7 @@ function modelList(o: Record<string, unknown>, key: string): readonly string[] {
 
 function engine(o: Record<string, unknown>, key: string): ModelAuthorityEngine {
   const v = o[key]
-  if (v !== 'ccb' && v !== 'codex' && v !== 'grok') {
+  if (v !== 'ccb' && v !== 'codex' && v !== 'grok' && v !== 'cursor') {
     throw new ModelAuthorityError('BadShape', `field ${key}: unknown engine ${String(v)}`)
   }
   return v

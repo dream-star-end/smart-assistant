@@ -1338,6 +1338,30 @@
           "assertion": "turn-canary: TURN_OK model=${MODEL} exact_text=2 final=${result.sawFinal} cost_charged=${result.sawCost}"
         }
       ]
+    },
+    {
+      "id": "INC-20260813-CURSOR-AUTHORITY-REJECTED",
+      "occurredAt": "2026-08-13",
+      "severity": "P1",
+      "symptom": "管理员受控启用 Cursor 后，容器 runtime 将签名 authority 中的 engine=cursor 当作未知引擎拒绝，turn 未启动 Cursor CLI 且页面没有回复。",
+      "rootFixCommit": "db7332ff",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/modelAuthorityConsume.test.ts",
+          "assertion": "Cursor authority:engine=cursor 验签消费后保持受控 Cursor 执行描述符"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/modelAuthorityConsume.test.ts",
+          "assertion": "Cursor billingRequestId 必须与 external audit 的 frame.requestId 精确绑定"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/deploy-v5.sh",
+          "assertion": "candidate Cursor authority ticket consume gate"
+        }
+      ]
     }
   ]
 }
