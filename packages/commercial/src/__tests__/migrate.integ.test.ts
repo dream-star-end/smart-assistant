@@ -799,10 +799,11 @@ describe("migrate.runMigrations", () => {
       "cache_read_per_mtok",
       "cache_write_per_mtok",
       "multiplier",
-      "enabled",
     ] as const) {
       assert.equal(target[field], source[field], field);
     }
+    assert.equal(source.enabled, false);
+    assert.equal(target.enabled, true);
     assert.equal(target.display_name, "Qwen3.8 Max");
     assert.equal(target.sort_order, 88);
     assert.equal(target.visibility, "admin");

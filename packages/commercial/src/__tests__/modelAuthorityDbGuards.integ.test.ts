@@ -395,7 +395,7 @@ describe("0144 ② catalog 状态机边界", () => {
   test("DELETE 只允许 staged 行 —— active/disabled/retired 是历史,不可物理删除", async (t) => {
     if (skipIfNoPg(t)) return;
     await expectRejected(
-      "DELETE FROM model_catalog WHERE model_id='glm-5.2'",
+      "DELETE FROM model_catalog WHERE model_id='kimi-k3-ark'",
       "cannot be deleted",
     );
     await expectRejected(
@@ -443,7 +443,7 @@ describe("0144 ② catalog 状态机边界", () => {
       "execution fields of a disabled entry are immutable",
     );
     await expectRejected(
-      "UPDATE model_catalog SET provider_id='codex' WHERE model_id='glm-5.2'", // active
+      "UPDATE model_catalog SET provider_id='codex' WHERE model_id='kimi-k3-ark'", // active
       "execution fields of a active entry are immutable",
     );
     // staged 行可编辑(它是唯一的编辑面)
@@ -461,21 +461,21 @@ describe("0144 ② catalog 状态机边界", () => {
   test("状态转移矩阵不变(retired 单向;被 alias 引用禁退休)", async (t) => {
     if (skipIfNoPg(t)) return;
     // alias 必须在行还是 active/staged 时挂上(alias 不可指向 disabled/retired)
-    await query("SELECT fn_model_alias_set('glm-latest','glm-5.1')");
-    await query("UPDATE model_catalog SET state='disabled' WHERE model_id='glm-5.1'");
+    await query("SELECT fn_model_alias_set('glm-latest','kimi-k3')");
+    await query("UPDATE model_catalog SET state='disabled' WHERE model_id='kimi-k3'");
     await expectRejected(
-      "UPDATE model_catalog SET state='staged' WHERE model_id='glm-5.1'",
+      "UPDATE model_catalog SET state='staged' WHERE model_id='kimi-k3'",
       "illegal state transition",
     );
     // 被 alias 引用的行禁止退休(alias 在 disable 后保留 —— disable 不需要先删 alias)
     await expectRejected(
-      "UPDATE model_catalog SET state='retired' WHERE model_id='glm-5.1'",
+      "UPDATE model_catalog SET state='retired' WHERE model_id='kimi-k3'",
       "referenced by alias",
     );
     await query("SELECT fn_model_alias_remove('glm-latest')");
-    await query("UPDATE model_catalog SET state='retired' WHERE model_id='glm-5.1'");
+    await query("UPDATE model_catalog SET state='retired' WHERE model_id='kimi-k3'");
     await expectRejected(
-      "UPDATE model_catalog SET updated_by=1 WHERE model_id='glm-5.1'",
+      "UPDATE model_catalog SET updated_by=1 WHERE model_id='kimi-k3'",
       "retired entry .* is immutable",
     );
   });
@@ -483,8 +483,8 @@ describe("0144 ② catalog 状态机边界", () => {
   test("平台运行必需模型不能被禁用或删价(事务最终态 deferred guard)", async (t) => {
     if (skipIfNoPg(t)) return;
     await assert.rejects(
-      () => query("UPDATE model_pricing SET enabled=false WHERE model_id='glm-5.2'"),
-      /required runtime models must remain active and priced: glm-5\.2/i,
+      () => query("UPDATE model_pricing SET enabled=false WHERE model_id='glm-5.3'"),
+      /required runtime models must remain active and priced: glm-5\.3/i,
     );
     await assert.rejects(
       () => query("DELETE FROM model_pricing WHERE model_id='gpt-5.6-sol'"),
@@ -500,13 +500,13 @@ describe("0144 ② catalog 状态机边界", () => {
 describe("0144 ③ model_pricing 兼容层", () => {
   test("DELETE FROM model_pricing → **软退役**(0143 会物理删光全部版本历史)", async (t) => {
     if (skipIfNoPg(t)) return;
-    const before = await statesOf("glm-5.1");
+    const before = await statesOf("kimi-k3");
     assert.equal(before.length, 1);
     assert.equal(before[0].state, "active");
 
-    await query("DELETE FROM model_pricing WHERE model_id='glm-5.1'");
+    await query("DELETE FROM model_pricing WHERE model_id='kimi-k3'");
 
-    const after = await statesOf("glm-5.1");
+    const after = await statesOf("kimi-k3");
     assert.equal(after.length, 1, "catalog 历史行必须还在(不是物理删除)");
     assert.equal(after[0].state, "retired");
     assert.equal(after[0].entry_id, before[0].entry_id, "同一 entry_id —— 历史可回溯");
@@ -515,9 +515,9 @@ describe("0144 ③ model_pricing 兼容层", () => {
     await query(
       `INSERT INTO model_pricing(model_id, display_name, input_per_mtok, output_per_mtok,
          cache_read_per_mtok, cache_write_per_mtok, multiplier, enabled, sort_order, visibility)
-       VALUES ('glm-5.1','GLM 5.1',1,1,1,0,1.000,TRUE,88,'hidden')`,
+       VALUES ('kimi-k3','Kimi K3',1,1,1,0,1.000,TRUE,88,'hidden')`,
     );
-    const revived = await statesOf("glm-5.1");
+    const revived = await statesOf("kimi-k3");
     assert.equal(revived.length, 2, "旧 retired 历史 + 新 active");
     assert.deepEqual(revived.map((r) => r.state), ["retired", "active"]);
   });
@@ -550,7 +550,7 @@ describe("0144 ③ model_pricing 兼容层", () => {
 
   test("不变量:model_pricing.enabled 恒等于 (catalog 有 active 行)", async (t) => {
     if (skipIfNoPg(t)) return;
-    await query("UPDATE model_pricing SET enabled=false WHERE model_id='glm-5.1'");
+    await query("UPDATE model_pricing SET enabled=false WHERE model_id='kimi-k3'");
     await query("UPDATE model_pricing SET enabled=true  WHERE model_id='gpt-5.5'");
     await query("DELETE FROM model_pricing WHERE model_id='gpt-5.6-terra'");
     const drift = await query<{ model_id: string }>(
@@ -593,7 +593,7 @@ describe("0144 ④ 受控状态机过程", () => {
     await assert.rejects(
       () =>
         query(
-          `SELECT fn_model_stage_version('glm-5.2','codex','codex',NULL,NULL,'${CAPABILITY}'::jsonb,1,NULL)`,
+          `SELECT fn_model_stage_version('kimi-k3-ark','codex','codex',NULL,NULL,'${CAPABILITY}'::jsonb,1,NULL)`,
         ),
       /already has a active version/i,
     );
@@ -601,18 +601,22 @@ describe("0144 ④ 受控状态机过程", () => {
 
   test("switch_version:旧行 retire + 新行 active + alias 重指(单事务,历史保留)", async (t) => {
     if (skipIfNoPg(t)) return;
-    await query("SELECT fn_model_alias_set('glm-latest','glm-5.2')");
-    const oldEntry = (await statesOf("glm-5.2"))[0].entry_id;
+    await query("SELECT fn_model_alias_set('glm-latest','kimi-k3-ark')");
+    const old = await query<{ entry_id: string; lock_version: number }>(
+      "SELECT entry_id::text AS entry_id, lock_version FROM model_catalog WHERE model_id='kimi-k3-ark' AND state='active'",
+    );
+    const oldEntry = old.rows[0].entry_id;
 
     await query(
-      `SELECT fn_model_switch_version('glm-5.2','codex','codex',NULL,NULL,
+      `SELECT fn_model_switch_version('kimi-k3-ark','codex','codex',NULL,NULL,
          '{"supports_vision":false,"reasoning":{"supported":["low","medium","high","xhigh","max"],"codex_model_default":"xhigh"},"ccb":{"capability_zero":false,"supports_thinking":false}}'::jsonb,
-         1,NULL,0)`,
+         1,NULL,$1)`,
+      [old.rows[0].lock_version],
     );
 
     const rows = await query<{ entry_id: string; engine: string; state: string }>(
       `SELECT c.entry_id::text AS entry_id, c.engine, c.state
-         FROM model_catalog c WHERE c.model_id='glm-5.2' ORDER BY c.entry_id`,
+         FROM model_catalog c WHERE c.model_id='kimi-k3-ark' ORDER BY c.entry_id`,
     );
     assert.equal(rows.rows.length, 2);
     assert.deepEqual(
@@ -684,9 +688,9 @@ describe("0144 ④ 受控状态机过程", () => {
 
   test("alias 不可指向 disabled/retired 行", async (t) => {
     if (skipIfNoPg(t)) return;
-    await query("UPDATE model_catalog SET state='disabled' WHERE model_id='glm-5.1'");
+    await query("UPDATE model_catalog SET state='disabled' WHERE model_id='kimi-k3'");
     await assert.rejects(
-      () => query("SELECT fn_model_alias_set('glm-latest','glm-5.1')"),
+      () => query("SELECT fn_model_alias_set('glm-latest','kimi-k3')"),
       /has no staged\/active version/i,
     );
   });
@@ -717,7 +721,7 @@ describe("0144 ⑤ 应用角色权限边界(割接后形态)", () => {
        VALUES ('app-evil','ccb','deepseek','${CAPABILITY}','staged')`,
     );
     await expectDenied("UPDATE model_catalog SET state='active' WHERE model_id='gpt-5.5'");
-    await expectDenied("DELETE FROM model_catalog WHERE model_id='glm-5.2'");
+    await expectDenied("DELETE FROM model_catalog WHERE model_id='kimi-k3-ark'");
     await expectDenied("TRUNCATE model_catalog");
     await expectDenied("INSERT INTO model_aliases (alias, entry_id) VALUES ('x', 1)");
     await expectDenied("DELETE FROM model_aliases");
@@ -728,7 +732,7 @@ describe("0144 ⑤ 应用角色权限边界(割接后形态)", () => {
     if (skipIfNoPg(t)) return;
     await expectDenied("SELECT fn_model_catalog_apply_enabled('gpt-5.5', TRUE, NULL)");
     await expectDenied("SELECT fn_model_security_epoch_bump()");
-    await expectDenied("SELECT fn_model_catalog_retire_all('glm-5.2', NULL)");
+    await expectDenied("SELECT fn_model_catalog_retire_all('kimi-k3-ark', NULL)");
     await expectDenied("SELECT fn_model_catalog_ensure_for_pricing('x', TRUE, NULL)");
   });
 
@@ -763,7 +767,7 @@ describe("0144 ⑤ 应用角色权限边界(割接后形态)", () => {
       1,
     );
     await assert.rejects(
-      () => deployPool!.query("UPDATE model_catalog SET state='disabled' WHERE model_id='glm-5.2'"),
+      () => deployPool!.query("UPDATE model_catalog SET state='disabled' WHERE model_id='kimi-k3-ark'"),
       /permission denied/i,
     );
   });
@@ -772,14 +776,14 @@ describe("0144 ⑤ 应用角色权限边界(割接后形态)", () => {
     if (skipIfNoPg(t)) return;
     assert.ok(appPool);
     const e0 = await epochNow();
-    await appPool.query("UPDATE model_pricing SET enabled=false WHERE model_id='glm-5.1'");
-    assert.equal((await statesOf("glm-5.1"))[0].state, "disabled", "写 pricing 镜像列 → 路由到 catalog 状态机");
+    await appPool.query("UPDATE model_pricing SET enabled=false WHERE model_id='kimi-k3'");
+    assert.equal((await statesOf("kimi-k3"))[0].state, "disabled", "写 pricing 镜像列 → 路由到 catalog 状态机");
     assert.ok((await epochNow()) > e0, "安全写 → epoch bump(经 DEFINER trigger,受限角色也能触发)");
 
     // admin/pricing.ts 的真实形状:SELECT FOR UPDATE + UPDATE ... RETURNING
     const out = await appPool.query<{ enabled: boolean }>(
       `UPDATE model_pricing SET multiplier=$1, lock_version=lock_version+1, updated_at=NOW()
-        WHERE model_id='glm-5.1' RETURNING enabled`,
+        WHERE model_id='kimi-k3' RETURNING enabled`,
       ["3.000"],
     );
     assert.equal(out.rows[0].enabled, false, "RETURNING 反映权威后态");
@@ -811,13 +815,13 @@ describe("0144 ⑤ 应用角色权限边界(割接后形态)", () => {
     await adminPool.query("SELECT fn_model_activate('app-mod')");
     assert.equal((await statesOf("app-mod"))[0].state, "active");
     await adminPool.query("SELECT fn_model_disable('app-mod')");
-    await adminPool.query("SELECT fn_model_alias_set('app-alias','glm-5.2')");
+    await adminPool.query("SELECT fn_model_alias_set('app-alias','kimi-k3-ark')");
     await adminPool.query("SELECT fn_model_alias_remove('app-alias')");
     // 过程内部照样受 trigger 约束(状态机不因 DEFINER 而放宽)
     await assert.rejects(
       () =>
         adminPool!.query(
-          `SELECT fn_model_stage_version('glm-5.2','codex','codex',NULL,NULL,'${CAPABILITY}'::jsonb,1,NULL)`,
+          `SELECT fn_model_stage_version('kimi-k3-ark','codex','codex',NULL,NULL,'${CAPABILITY}'::jsonb,1,NULL)`,
         ),
       /already has a active version/i,
     );
