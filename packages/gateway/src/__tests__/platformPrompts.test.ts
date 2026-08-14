@@ -3,7 +3,7 @@
  *
  * 设计出处:V5_RUNTIME_HOTCFG_PLAN.md §1.2 / §4.2。断言覆盖:
  *   - env 未设 → 恒回落 fallback,且不建立任何快照(不起轮询);
- *   - 三文件齐全+合法 → 整套生效,getPlatformPrompt 返回文件内容;
+ *   - 四文件齐全+合法 → 整套生效,getPlatformPrompt 返回文件内容;
  *   - 缺一个/超大/非空校验失败 → 保留 last-known-good + console.error 告警(半套不生效);
  *   - 翻转 current symlink 后按 rev 变化 TTL 重读;TTL 未到不重读;
  *   - workspace 缺省 cwd(sessionManager.resolveDefaultWorkspaceCwd);
@@ -14,15 +14,17 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, readFileSyn
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
-import {
-  getPlatformPrompt,
-  _internals,
-  type PlatformPromptKey,
-} from '../platformPrompts.js'
+import { getPlatformPrompt, _internals, type PlatformPromptKey } from '../platformPrompts.js'
 import { _platformPromptFallbacks } from '../promptSlots.js'
 import { _internals as codexInternals } from '../codexLaunchOverrides.js'
+import { _internals as cursorInternals } from '../engine/cursorAdapter.js'
 
-const KEYS: PlatformPromptKey[] = ['platform-capabilities', 'memory-instructions', 'codex-preamble']
+const KEYS: PlatformPromptKey[] = [
+  'platform-capabilities',
+  'memory-instructions',
+  'codex-preamble',
+  'cursor-preamble',
+]
 const FILES = _internals.PROMPT_FILES
 
 // 每个 case 独立造一个 bundle 根:bundles/<rev>/ + current -> bundles/<rev>,
@@ -30,7 +32,11 @@ const FILES = _internals.PROMPT_FILES
 function makeBundleRoot(): string {
   return mkdtempSync(join(tmpdir(), 'oc-prompts-'))
 }
-function writeBundle(root: string, rev: string, contents: Record<PlatformPromptKey, string>): string {
+function writeBundle(
+  root: string,
+  rev: string,
+  contents: Record<PlatformPromptKey, string>,
+): string {
   const revDir = join(root, 'bundles', rev, 'prompts')
   mkdirSync(revDir, { recursive: true })
   for (const k of KEYS) writeFileSync(join(revDir, FILES[k]), contents[k], 'utf8')
@@ -53,6 +59,7 @@ const sample = (tag: string): Record<PlatformPromptKey, string> => ({
   'platform-capabilities': `CAP-${tag} {{WECHAT_VISION_HINT}}`,
   'memory-instructions': `MEM-${tag} {{MEMORY_DIR}} {{MEMORY_MD}} {{USER_MD}}`,
   'codex-preamble': `CODEX-${tag}`,
+  'cursor-preamble': `CURSOR-${tag}`,
 })
 // 便捷取样(替代早期硬编码的 'CAP-r1' 等 —— 现样本含占位符)。
 const cap = (tag: string) => sample(tag)['platform-capabilities']
@@ -92,7 +99,7 @@ describe('platformPrompts LKG 加载器', () => {
     assert.equal(_internals.currentRev(), null)
   })
 
-  it('三文件齐全+合法 → 整套生效,返回文件内容而非 fallback', () => {
+  it('四文件齐全+合法 → 整套生效,返回文件内容而非 fallback', () => {
     const root = makeBundleRoot()
     roots.push(root)
     writeBundle(root, 'r1', sample('r1'))
@@ -112,14 +119,21 @@ describe('platformPrompts LKG 加载器', () => {
     mkdirSync(revDir, { recursive: true })
     // 只写两个(含合法占位符,确保失败点是「缺文件」而非「缺占位符」),故意缺 codex-preamble
     writeFileSync(join(revDir, FILES['platform-capabilities']), cap('r1'), 'utf8')
-    writeFileSync(join(revDir, FILES['memory-instructions']), sample('r1')['memory-instructions'], 'utf8')
+    writeFileSync(
+      join(revDir, FILES['memory-instructions']),
+      sample('r1')['memory-instructions'],
+      'utf8',
+    )
     pointCurrent(root, 'r1')
     process.env.OPENCLAUDE_PLATFORM_PROMPTS_DIR = promptsDirVia(root)
     // 半套不生效:连齐全的两个也回落 fallback
     assert.equal(getPlatformPrompt('platform-capabilities', 'FB-CAP'), 'FB-CAP')
     assert.equal(getPlatformPrompt('codex-preamble', 'FB-CODEX'), 'FB-CODEX')
     assert.equal(_internals.hasSnapshot(), false)
-    assert.ok(errorLogs.some((l) => l.includes('platform-prompts')), '缺文件必须 console.error 告警')
+    assert.ok(
+      errorLogs.some((l) => l.includes('platform-prompts')),
+      '缺文件必须 console.error 告警',
+    )
   })
 
   it('单文件超 256KB → 整套拒(回落 fallback)+ 告警', () => {
@@ -184,7 +198,7 @@ describe('platformPrompts LKG 加载器', () => {
     assert.notEqual(_internals.currentRev(), rev1, 'rev 应随 current 翻转而变')
   })
 
-  it('M3 混 rev 防护:翻到内容全不同的 r2 → 三键整套一致来自 r2(无半套 / 无 r1 残留混读)', () => {
+  it('M3 混 rev 防护:翻到内容全不同的 r2 → 四键整套一致来自 r2(无半套 / 无 r1 残留混读)', () => {
     // M3 修复:readValidatedSet 一次 realpath 得 resolved rev,三个文件全部从 resolved rev 读,
     // 翻转中途不会混用两版。此处以「翻到内容全不同的 r2 后三键必须整套一致」固化该整套读语义。
     const root = makeBundleRoot()
@@ -198,7 +212,8 @@ describe('platformPrompts LKG 加载器', () => {
     pointCurrent(root, 'r2')
     _internals.pollNow()
     // 三键必须全部来自 r2(任一残留 r1 = 混 rev,视为回归)
-    for (const k of KEYS) assert.equal(getPlatformPrompt(k, `FB-${k}`), sample('r2')[k], `${k} 必须整套翻到 r2`)
+    for (const k of KEYS)
+      assert.equal(getPlatformPrompt(k, `FB-${k}`), sample('r2')[k], `${k} 必须整套翻到 r2`)
     assert.equal(_internals.hasSnapshot(), true)
   })
 
@@ -232,7 +247,10 @@ describe('platformPrompts LKG 加载器', () => {
     assert.equal(getPlatformPrompt('memory-instructions', 'FB-MEM'), 'FB-MEM')
     assert.equal(getPlatformPrompt('platform-capabilities', 'FB-CAP'), 'FB-CAP')
     assert.equal(_internals.hasSnapshot(), false)
-    assert.ok(errorLogs.some((l) => l.includes('占位符')), '缺占位符必须告警')
+    assert.ok(
+      errorLogs.some((l) => l.includes('占位符')),
+      '缺占位符必须告警',
+    )
   })
 
   it('m2 占位符缺失:先成功后翻到缺占位符的 r2 → 保留 LKG(不回落、不半套)+ 告警', () => {
@@ -241,7 +259,11 @@ describe('platformPrompts LKG 加载器', () => {
     writeBundle(root, 'r1', sample('r1'))
     pointCurrent(root, 'r1')
     process.env.OPENCLAUDE_PLATFORM_PROMPTS_DIR = promptsDirVia(root)
-    assert.equal(getPlatformPrompt('memory-instructions', 'FB'), sample('r1')['memory-instructions'], '首轮加载成功')
+    assert.equal(
+      getPlatformPrompt('memory-instructions', 'FB'),
+      sample('r1')['memory-instructions'],
+      '首轮加载成功',
+    )
 
     // r2:memory 去掉一个必需占位符 {{USER_MD}}(其余合法)
     const c = sample('r2')
@@ -250,15 +272,21 @@ describe('platformPrompts LKG 加载器', () => {
     pointCurrent(root, 'r2')
     _internals.pollNow()
     // LKG:三键仍是 r1(缺占位符的 r2 整套不生效)
-    for (const k of KEYS) assert.equal(getPlatformPrompt(k, `FB-${k}`), sample('r1')[k], `${k} 应保 LKG=r1`)
+    for (const k of KEYS)
+      assert.equal(getPlatformPrompt(k, `FB-${k}`), sample('r1')[k], `${k} 应保 LKG=r1`)
     assert.ok(errorLogs.some((l) => l.includes('占位符')))
   })
 
-  it('m2 占位符登记表:三 key 必需占位符与消费方注入契约一致', () => {
+  it('m2 占位符登记表:四 key 必需占位符与消费方注入契约一致', () => {
     const req = _internals.REQUIRED_PLACEHOLDERS
     assert.deepEqual([...req['platform-capabilities']], ['{{WECHAT_VISION_HINT}}'])
-    assert.deepEqual([...req['memory-instructions']].sort(), ['{{MEMORY_DIR}}', '{{MEMORY_MD}}', '{{USER_MD}}'])
+    assert.deepEqual([...req['memory-instructions']].sort(), [
+      '{{MEMORY_DIR}}',
+      '{{MEMORY_MD}}',
+      '{{USER_MD}}',
+    ])
     assert.deepEqual([...req['codex-preamble']], [])
+    assert.deepEqual([...req['cursor-preamble']], [])
   })
 })
 
@@ -350,6 +378,12 @@ describe('fallback 常量 === bundle 文件(逐字同步门)', () => {
     assert.equal(
       readFileSync(join(dir, 'codex-preamble.md'), 'utf8'),
       codexInternals.CODEX_PREAMBLE,
+    )
+  })
+  it('cursor-preamble.md === CURSOR_PREAMBLE', () => {
+    assert.equal(
+      readFileSync(join(dir, 'cursor-preamble.md'), 'utf8'),
+      cursorInternals.CURSOR_PREAMBLE,
     )
   })
 })
