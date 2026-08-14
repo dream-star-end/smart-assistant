@@ -1229,11 +1229,11 @@ await check("T22 Enter 发送 / Shift+Enter 换行 / IME 组合中回车不误�
 });
 
 // ── T23 会话内切模型 ─────────────────────────────────────────────────────────
-// 用户可见事实:点模型选择器 → 菜单弹出 → 点另一个模型 → 真的切过去(菜单关闭、
-// 触发器显示新模型、上层收到精确 model id);标了「暂不可用」的模型点不动、也不会被
+// 用户可见事实:点顶栏模型名 → 菜单弹出 → 点另一个模型 → 真的切过去(菜单关闭、
+// 顶栏显示新模型、上层收到精确 model id);标了「暂不可用」的模型点不动、也不会被
 // 静默切过去。前半段守的是 2026-07-18 附件事故那一类(Radix 菜单项受信点击的
 // post-dispatch 副作用被同步卸载杀死),jsdom 的 fireEvent 走不出这条真实序列。
-await check("T23 模型选择器:受信点选生效并回显,降级模型点不动", async () => {
+await check("T23 顶栏切模型:受信点选生效并回显,降级模型点不动", async () => {
   const fixture = await page.evaluate(() => window.__modelFixture);
   const { markers, ids } = fixture;
   const modelRoot = page.locator("#model-selector-root");
@@ -1550,13 +1550,12 @@ await check("T25 390×844 整页:顶栏入口不被挤出、宽正文不被裁�
     );
   }
 
-  // ③ 顶栏入口全在视口内(挤爆时最先被推出去的就是右侧主题/铃铛)。
-  //    模型选择器已迁到 Composer 发送钮左侧，不在顶栏。
+  // ③ 顶栏四个入口全在视口内(挤爆时最先被推出去的就是右侧主题/铃铛)。
   const headerEntries = [
     ["打开菜单", "汉堡(唯一的移动侧栏入口)"],
     ["站内信", "站内信"],
     ["账户与计费", "余额"],
-    ["打开使用教程", "教程"],
+    ["选择对话模型", "模型选择器"],
   ];
   for (const [label, human] of headerEntries) {
     const box = await mobilePage.getByRole("button", { name: label }).boundingBox();
@@ -1586,17 +1585,6 @@ await check("T25 390×844 整页:顶栏入口不被挤出、宽正文不被裁�
   if (sendBox.x + sendBox.width > 390 + 1) {
     throw new Error(`发送按钮被挤出视口: right=${Math.round(sendBox.x + sendBox.width)}`);
   }
-  const modelBtn = mobilePage.getByRole("button", { name: "选择对话模型" });
-  const modelBox = await modelBtn.boundingBox();
-  if (!modelBox) throw new Error("Composer 模型选择器不可见");
-  if (modelBox.x < 0 || modelBox.x + modelBox.width > 390 + 1) {
-    throw new Error(`Composer 模型选择器被挤出视口: x=${Math.round(modelBox.x)} w=${Math.round(modelBox.width)}`);
-  }
-  await modelBtn.click();
-  const modelItem = mobilePage.getByRole("menuitem", { name: /均衡 Pro/ });
-  await modelItem.waitFor({ state: "visible", timeout: 3000 });
-  await mobilePage.keyboard.press("Escape");
-  await modelItem.waitFor({ state: "hidden", timeout: 3000 });
   await send.click();
   const sends = await mobilePage.evaluate(() => window.__mobilePage.sends);
   if (JSON.stringify(sends) !== JSON.stringify([{ text: "MOBILE_SEND_MARKER", mediaCount: 0 }])) {

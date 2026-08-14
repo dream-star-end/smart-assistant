@@ -35,16 +35,6 @@ describe("ModelSelector 团队模式诚信显示", () => {
     expect(trigger.textContent).not.toContain("GLM-5.2");
   });
 
-  it("compact：团队态只显示引擎名，不重复「团队模式 ·」前缀", () => {
-    render(
-      <ModelSelector compact models={MODELS} selectedId="glm-5.2" onSelect={() => {}} teamEngineActive />,
-    );
-    const trigger = screen.getByRole("button", { name: "选择对话模型" });
-    expect(trigger.textContent).toContain("GPT-5.6-Sol");
-    expect(trigger.textContent).not.toContain("团队模式 ·");
-    expect(trigger.textContent).not.toContain("GLM-5.2");
-  });
-
   it("团队态：菜单含不可选说明态（非 menuitem），自选模型保留选中记忆并标注生效时机", async () => {
     render(
       <ModelSelector models={MODELS} selectedId="glm-5.2" onSelect={() => {}} teamEngineActive />,

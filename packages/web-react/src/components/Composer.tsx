@@ -11,10 +11,9 @@ import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import { useImageEditActions } from "./chat/imageEditActions";
 import { GoalDialog, goalNearBudget, visibleGoalOf, type GoalSetInput } from "./GoalDialog";
 import type { MediaRef } from "../lib/chat/frames";
-import type { PublicModel, RepoSelection } from "../lib/types";
+import type { RepoSelection } from "../lib/types";
 import { cn } from "../lib/utils";
 import { RepoPill } from "./github/RepoPill";
-import { ModelSelector } from "./ModelSelector";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -71,11 +70,6 @@ export function Composer({
   repoSelection,
   onOpenRepo,
   showRepoPill = true,
-  models,
-  selectedModelId,
-  onSelectModel,
-  modelsLoading,
-  teamModeActive,
   goal,
   onSetGoal,
   onGoalAction,
@@ -102,13 +96,6 @@ export function Composer({
   onOpenRepo?: () => void;
   /** xl 右栏已展示绑定卡时卸载中栏 pill（单实例）。未绑定 CTA 仍走底部入口。 */
   showRepoPill?: boolean;
-  /** 对话模型列表（GET /api/public/models；省略 onSelectModel 则不渲染选择器）。 */
-  models?: PublicModel[];
-  selectedModelId?: string;
-  onSelectModel?: (id: string) => void;
-  modelsLoading?: boolean;
-  /** 团队模式已开启且当前会话是 main；选择器如实显示队长引擎。 */
-  teamModeActive?: boolean;
   /** 当前会话目标快照（驱动「+」菜单里目标项的状态点；省略 onSetGoal/onGoalAction 则不渲染目标入口，如 demo）。 */
   goal?: GoalStateSnapshot | null;
   /** 设定/更新会话目标（入口从会话头部迁至「+」菜单）。 */
@@ -487,7 +474,7 @@ export function Composer({
             }}
             enterKeyHint={coarsePointer ? "enter" : "send"}
             placeholder={placeholder}
-            className="max-h-[240px] min-h-[24px] min-w-0 flex-1 resize-none bg-transparent py-2 text-[16px] leading-relaxed text-fg outline-none placeholder:text-faint disabled:opacity-50"
+            className="max-h-[240px] min-h-[24px] flex-1 resize-none bg-transparent py-2 text-[16px] leading-relaxed text-fg outline-none placeholder:text-faint disabled:opacity-50"
           />
           <IconButton
             data-product-feature={PRODUCT_CAPABILITIES.voice.id}
@@ -505,16 +492,6 @@ export function Composer({
               <Mic size={19} />
             )}
           </IconButton>
-          {models && onSelectModel && (
-            <ModelSelector
-              compact
-              models={models}
-              selectedId={selectedModelId}
-              onSelect={onSelectModel}
-              loading={modelsLoading}
-              teamEngineActive={teamModeActive}
-            />
-          )}
           <button
             type="button"
             data-product-control

@@ -72,15 +72,7 @@ function WorkspaceChat() {
             />
           </div>
         </div>
-        <Composer
-          onSend={() => {}}
-          models={[
-            { id: "glm-5.2", display_name: "GLM-5.2" },
-            { id: "gpt-5.6-sol", display_name: "GPT-5.6-Sol" },
-          ]}
-          selectedModelId="glm-5.2"
-          onSelectModel={() => {}}
-        />
+        <Composer onSend={() => {}} />
       </div>
     </div>
   );
@@ -125,12 +117,6 @@ function WorkspaceContextRail() {
           onOpenRepo={() => {}}
           repoSelection={RAIL_SELECTION}
           showRepoPill={!isXl}
-          models={[
-            { id: "glm-5.2", display_name: "GLM-5.2" },
-            { id: "gpt-5.6-sol", display_name: "GPT-5.6-Sol" },
-          ]}
-          selectedModelId="glm-5.2"
-          onSelectModel={() => {}}
         />
       </div>
       {isXl && (

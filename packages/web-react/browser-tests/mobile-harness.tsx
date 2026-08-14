@@ -7,7 +7,7 @@
 // → Composer),CSS 用的是同一份 production 产物,视口 390×844。
 //
 // 守的是哪一类用户可见事实:
-//   ① 390px 下顶栏不被挤爆(汉堡/智能体/主题入口全在视口内且可点)；模型选择器在输入条右侧且可点;
+//   ① 390px 下顶栏不被挤爆(汉堡/智能体/模型/主题四个入口全在视口内且可点);
 //   ② 助手正文里的宽内容(长 URL、宽代码块、宽表格、长 Bash 命令)要么放得下,
 //      要么落在自己的横向滚动区里 —— 聊天滚动区是 overflow-x-hidden,超出即被裁掉
 //      看不见,而"看不见"在 jsdom 与单组件用例里都测不出来;
@@ -117,6 +117,8 @@ function MobileChatPage() {
           agent={MOBILE_AGENT}
           onAgentClick={() => {}}
           models={MOBILE_MODELS}
+          selectedModelId={modelId}
+          onSelectModel={setModelId}
           credits="123456"
           onOpenBilling={() => {}}
           onNew={() => {}}
@@ -149,9 +151,6 @@ function MobileChatPage() {
               window.__mobilePage.sends.push({ text, mediaCount: media?.length ?? 0 });
             }}
             placeholder="和「全能助手」对话…"
-            models={MOBILE_MODELS}
-            selectedModelId={modelId}
-            onSelectModel={setModelId}
             onUpload={async (file: File): Promise<MediaRef> => ({
               kind: "file",
               url: "https://stub.invalid/mobile",

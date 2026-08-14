@@ -616,7 +616,7 @@ describe('Aurora v5 — P3 对话前置（模型选择器 + 订阅/容器门）'
     render(<App />)
     await loginViaUi()
 
-    // Composer 输入条右侧的模型选择器展示后端返回的首个模型名。
+    // 顶栏模型选择器与 Composer 底部均展示后端返回的首个模型名。
     await waitFor(() => expect(screen.getAllByText('GPT-5.6-Sol').length).toBeGreaterThan(0))
     const modelsCall = fetchMock.mock.calls.find(([u]) => String(u).includes('/api/public/models'))
     expect(modelsCall).toBeTruthy()
