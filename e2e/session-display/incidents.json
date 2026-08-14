@@ -1386,6 +1386,11 @@
           "assertion": "switching an untouched Codex prewarm with a native thread id to Cursor creates no rebuild notice"
         },
         {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/sessionManagerEngineTurn.test.ts",
+          "assertion": "fresh Cursor switch consumes an empty first rebuild attempt so routine replay stays silent"
+        },
+        {
           "layer": "deploy-gate",
           "path": "scripts/deploy-v5.sh",
           "assertion": "candidate Cursor stream-json parser gate"
@@ -1395,7 +1400,8 @@
         "35defe79",
         "96b40ae5",
         "dd86a3e8",
-        "793ad326"
+        "793ad326",
+        "523c09af"
       ]
     }
   ]
