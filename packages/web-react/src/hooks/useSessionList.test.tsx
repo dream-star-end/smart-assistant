@@ -3,7 +3,6 @@ import { type Mock, afterEach, describe, expect, test, vi } from "vitest";
 import { api } from "../lib/api";
 import { createMemoryAuthSession } from "../lib/authSession";
 import type { SessionDetail, User } from "../lib/types";
-import type { StoredSession } from "../lib/persist";
 import type { UseChatSocket } from "./useChatSocket";
 import { useSessionList } from "./useSessionList";
 
@@ -47,7 +46,7 @@ function detail(id: string): SessionDetail {
 // canonical),漏一处的表现都是"看起来成了,刷新又回去"或者"本地没了、云端复活"。
 // 删除更是不可逆(确认文案:本地与云端记录都将删除,不可恢复),取消路径必须一处都不动。
 // 这些行为此前零覆盖。
-function meta(id: string, title: string, extra: { pinned?: boolean } = {}) {
+function meta(id: string, title: string) {
   return {
     id,
     title,
@@ -55,7 +54,6 @@ function meta(id: string, title: string, extra: { pinned?: boolean } = {}) {
     updatedAt: 2_000,
     lastAt: 2_000,
     messageCount: 3,
-    pinned: extra.pinned === true,
   };
 }
 
@@ -360,78 +358,5 @@ describe("useSessionList history loading fence", () => {
     });
     await waitFor(() => expect(result.current.historyLoading).toBe(false));
     expect(socket.mergeServerHistory).toHaveBeenCalledTimes(1);
-  });
-});
-
-describe("useSessionList pinned 字段打通", () => {
-  test("listSessions 的 pinned 透传到侧栏 Session，false 也显式落键", async () => {
-    vi.spyOn(api, "listSessions").mockResolvedValue([
-      meta("webpinned01", "置顶会话", { pinned: true }),
-      meta("webplain001", "普通会话"),
-    ] as never);
-    vi.spyOn(api, "getSession").mockResolvedValue(detail("webpinned01"));
-    const auth = createMemoryAuthSession(() => {}, "token");
-    const user: User = { id: "u1", displayName: "User", roles: ["user"] };
-    const socket = {
-      storedMaxSeq: () => 0,
-      storedHistoryRevision: () => 1,
-      mergeServerHistory: vi.fn(),
-      renameSession: vi.fn(),
-      removeSession: vi.fn(),
-      removePersisted: vi.fn(),
-    } as unknown as UseChatSocket;
-    const { result } = renderHook(() => useSessionList({
-      demo: false,
-      auth,
-      authSession: auth,
-      user,
-      agentId: "main",
-      sockRef: { current: socket },
-      confirmDialog: async () => false,
-      promptText: async () => null,
-      clearChatError: () => {},
-      onNewSessionReset: () => {},
-      onActiveSessionDeleted: () => {},
-    }));
-    await waitFor(() => expect(result.current.sessions.length).toBe(2));
-    expect(result.current.sessions.find((s) => s.id === "webpinned01")?.pinned).toBe(true);
-    expect(result.current.sessions.find((s) => s.id === "webplain001")?.pinned).toBe(false);
-  });
-
-  test("IndexedDB 注水保留 _pinned；随后 listSessions server-wins 可把 true 盖成 false", async () => {
-    const { result } = await renderSessionList({
-      confirmResult: false,
-      promptResult: null,
-    });
-    const local: StoredSession = {
-      id: "webkeepme001",
-      agentId: "main",
-      title: "保留的会话",
-      messages: [],
-      createdAt: 1,
-      lastAt: 1,
-      updatedAt: 9_000,
-      _pinned: true,
-    };
-    act(() => {
-      result.current.onHydrated([local]);
-    });
-    // incomingWins=false：本地不覆盖既有。list 已落 pinned:false，故仍 false。
-    expect(result.current.sessions.find((s) => s.id === "webkeepme001")?.pinned).toBe(false);
-
-    const fresh: StoredSession = {
-      id: "weblocalpin1",
-      agentId: "main",
-      title: "仅本地置顶",
-      messages: [],
-      createdAt: 1,
-      lastAt: 1,
-      updatedAt: 9_000,
-      _pinned: true,
-    };
-    act(() => {
-      result.current.onHydrated([fresh]);
-    });
-    expect(result.current.sessions.find((s) => s.id === "weblocalpin1")?.pinned).toBe(true);
   });
 });

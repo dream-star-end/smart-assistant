@@ -6,7 +6,7 @@ import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import { AgentAvatar } from "./AgentAvatar";
 import type { PublicModel } from "../lib/types";
 import { formatCredits } from "../lib/utils";
-import { teamEngineLabel } from "./ModelSelector";
+import { ModelSelector, teamEngineLabel } from "./ModelSelector";
 import { ThemeToggle } from "./ThemeToggle";
 import { Button, IconButton, Popover, PopoverContent, PopoverTrigger } from "./ui";
 
@@ -14,6 +14,9 @@ export function ChatHeader({
   agent,
   onAgentClick,
   models,
+  selectedModelId,
+  onSelectModel,
+  modelsLoading,
   teamModeActive,
   onDisableTeamMode,
   credits,
@@ -28,15 +31,18 @@ export function ChatHeader({
   unreadCount,
   theme,
   onCycleTheme,
-  onShowContext,
 }: {
   agent: Agent;
   onAgentClick: () => void;
-  /** 团队模式说明弹层展示队长引擎名（省略则用 protocol 固定标签）。 */
+  /** 对话模型列表（GET /api/public/models 驱动；省略则不渲染选择器）。 */
   models?: PublicModel[];
+  selectedModelId?: string;
+  onSelectModel?: (id: string) => void;
+  modelsLoading?: boolean;
   /**
    * 团队模式已开启且当前会话是 main（队长引擎覆盖生效）。true 时 agent 名旁显示
-   * 「团队模式」chip（点击弹说明 + 关闭入口）。条件由 App 的 teamMode 单一状态推导。
+   * 「团队模式」chip（点击弹说明 + 关闭入口），并让 ModelSelector 切换到如实的
+   * 队长引擎显示态。条件由 App 的 teamMode 单一状态推导，此处不持第二份状态。
    */
   teamModeActive?: boolean;
   /** 关闭团队模式（直接翻转 App 的全局 flag；省略则 chip 弹层不渲染关闭按钮）。 */
@@ -60,8 +66,6 @@ export function ChatHeader({
   unreadCount?: number;
   theme: Theme;
   onCycleTheme: () => void;
-  /** xl 下用户隐藏右栏后的重开入口。省略则不渲染。 */
-  onShowContext?: () => void;
 }) {
   const low = credits != null && (credits.trim().startsWith("-") || /^-?0+$/.test(credits.trim()));
   // 团队模式说明弹层的受控开关：点「关闭团队模式」需要主动收起弹层（chip 随
@@ -93,11 +97,11 @@ export function ChatHeader({
       <button
         data-product-feature={PRODUCT_CAPABILITIES.agents.id}
         onClick={onAgentClick}
-        className="flex min-w-0 flex-1 items-center gap-2 rounded-xl px-2.5 py-1.5 outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98]"
+        className="flex min-w-0 items-center gap-2 rounded-xl px-2.5 py-1.5 outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98]"
       >
         <AgentAvatar agent={agent} className="size-7 rounded-lg" iconSize={15} />
-        {/* 模型选择器迁走后，智能体名吃掉中段留白，避免顶栏空洞。 */}
-        <span className="min-w-0 truncate whitespace-nowrap text-[15px] font-semibold text-fg">
+        {/* 窄屏不折行：截断而非换行（避免"全能/助手"难看的两行）。 */}
+        <span className="max-w-[7.5rem] truncate whitespace-nowrap text-[15px] font-semibold text-fg sm:max-w-none">
           {agent.name}
         </span>
         <ChevronDown size={15} className="shrink-0 text-faint" />
@@ -139,12 +143,16 @@ export function ChatHeader({
           </PopoverContent>
         </Popover>
       )}
+      {models && onSelectModel && (
+        <ModelSelector
+          models={models}
+          selectedId={selectedModelId}
+          onSelect={onSelectModel}
+          loading={modelsLoading}
+          teamEngineActive={teamModeActive}
+        />
+      )}
       <div className="ml-auto flex shrink-0 items-center gap-1.5">
-        {onShowContext && (
-          <Button data-product-control size="sm" variant="ghost" onClick={onShowContext}>
-            显示上下文
-          </Button>
-        )}
         {onOpenMediaTasks && (
           <IconButton data-product-control onClick={onOpenMediaTasks} aria-label="视频任务" title="视频任务" shape="square">
             <Film size={18} />

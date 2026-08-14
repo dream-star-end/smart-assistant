@@ -34,7 +34,6 @@ function storedToSession(s: StoredSession, ownerUserId: string): Session {
     messageCount: Array.isArray(s.messages) ? s.messages.length : 0,
     // modelId 无值时不落键:upsertSessions 的 spread 合并按"键缺席=不表态"保留另一侧的值。
     ...(s._selectedModelId ? { modelId: s._selectedModelId } : {}),
-    ...(typeof s._pinned === "boolean" ? { pinned: s._pinned } : {}),
   };
 }
 
@@ -48,8 +47,6 @@ function metaToSession(m: SessionMeta, ownerUserId: string): Session {
     messageCount: m.messageCount ?? 0,
     // 服务端无值(该会话从未显式选过/PATCH 尚未落地)= 键缺席,server-wins 合并不清掉本地意图。
     ...(m.modelId ? { modelId: m.modelId } : {}),
-    // pinned 必须显式落布尔：键缺席会让 server-wins 合并不清掉本地 true。
-    pinned: m.pinned === true,
   };
 }
 

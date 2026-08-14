@@ -44,7 +44,7 @@ export function teamEngineLabel(models: PublicModel[]): string {
 }
 
 /**
- * 对话模型选择器（Aurora Composer 输入条右侧）。完全由 GET /api/public/models 的结果驱动，
+ * 对话模型选择器（Aurora 顶栏）。完全由 GET /api/public/models 的结果驱动，
  * 不持有任何硬编码/demo 模型列表（demo 预览的 fixture 由调用方注入）。选中的 model id
  * 上抛给 App 顶层状态，P4 的 WS inbound.message 据此发送（前端只发 agentId + model，
  * agent→model 的最终权威在后端）。
@@ -60,7 +60,6 @@ export function ModelSelector({
   onSelect,
   loading,
   teamEngineActive,
-  compact,
 }: {
   models: PublicModel[];
   selectedId?: string;
@@ -68,8 +67,6 @@ export function ModelSelector({
   loading?: boolean;
   /** 团队模式已开启且当前会话是 main（队长引擎覆盖生效）。由 App 的 teamMode 单一状态推导。 */
   teamEngineActive?: boolean;
-  /** Composer 输入条右侧：更紧凑、菜单向右对齐。 */
-  compact?: boolean;
 }) {
   const selected = models.find((m) => m.id === selectedId);
   // 已选模型被降级(且非团队模式覆盖态)→ 菜单顶部提示条建议换模;可用替代 = 下方未降级模型。
@@ -78,8 +75,8 @@ export function ModelSelector({
     (m) => !isDegraded(m) && m.id !== selectedId,
   );
   const engineLabel = teamEngineLabel(models);
-  // 团队态标签拆前缀/主体:顶栏形态 sm+ 显示「团队模式 · 」；Composer compact 只留引擎名
-  // （顶栏已有团队 chip，前缀会把输入条挤爆）。
+  // 团队态标签拆前缀/主体:移动端只显引擎名(前缀与头部 chip 冗余,Users 图标已表意),
+  // sm+ 恢复"团队模式 · "全称。
   const baseLabel = selected
     ? modelLabel(selected)
     : loading
@@ -99,12 +96,9 @@ export function ModelSelector({
           disabled={disabled}
           aria-label="选择对话模型"
           className={cn(
-            "flex items-center outline-none transition-colors",
+            "flex items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-[13.5px] font-medium text-muted outline-none transition-colors",
             "hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98]",
             "disabled:pointer-events-none disabled:opacity-50",
-            compact
-              ? "mb-0.5 max-w-[7.5rem] gap-1 rounded-lg px-1.5 py-1 text-caption font-medium text-muted sm:max-w-[9.5rem]"
-              : "gap-1.5 rounded-xl px-2.5 py-1.5 text-[13.5px] font-medium text-muted",
             teamEngineActive && "text-accent hover:text-accent",
           )}
         >
@@ -113,17 +107,17 @@ export function ModelSelector({
           ) : (
             <Cpu size={14} className="text-faint" />
           )}
-          {teamEngineActive && !compact && (
+          {teamEngineActive && (
             <span className="hidden sm:inline">{"团队模式 · "}</span>
           )}
-          <span className={cn("truncate", compact ? "min-w-0" : "max-w-[6.5rem] sm:max-w-[180px]")}>
+          <span className="max-w-[6.5rem] truncate sm:max-w-[180px]">
             {label}
           </span>
           <ChevronDown size={14} className="text-faint" />
         </button>
       </DropdownMenuTrigger>
       <DropdownMenuContent
-        align={compact ? "end" : "start"}
+        align="start"
         data-product-feature={PRODUCT_CAPABILITIES.models.id}
         className="min-w-[15rem]"
       >

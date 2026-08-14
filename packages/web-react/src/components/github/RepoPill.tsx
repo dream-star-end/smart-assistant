@@ -51,7 +51,6 @@ export function RepoPill({
   return (
     <button
       type="button"
-      data-testid="repo-pill"
       data-product-feature={PRODUCT_CAPABILITIES.github.id}
       onClick={onClick}
       aria-label={sel ? `代码仓库 ${sel.owner}/${sel.repo}，点击管理` : "关联 GitHub 仓库"}

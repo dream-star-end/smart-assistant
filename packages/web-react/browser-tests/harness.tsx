@@ -17,13 +17,6 @@ import { createRoot } from "react-dom/client";
 import { Composer } from "../src/components/Composer";
 import { SettingsCenter } from "../src/components/SettingsCenter";
 import { Sidebar } from "../src/components/Sidebar";
-import { BoundRepoCard } from "../src/components/contextRail/BoundRepoCard";
-import { ContextRail } from "../src/components/contextRail/ContextRail";
-import { RepoPill } from "../src/components/github/RepoPill";
-import { PinnedTaskTracker } from "../src/components/chat/PinnedTaskTracker";
-import { useContextRailHidden } from "../src/hooks/useContextRailHidden";
-import { useXlViewport } from "../src/hooks/useXlViewport";
-import type { RepoSelection } from "../src/lib/types";
 import { CommunityTutorials } from "../src/components/tutorials/CommunityTutorials";
 import { MessageFeedbackDialog } from "../src/components/chat/MessageFeedbackDialog";
 import { TurnCostReminder } from "../src/components/chat/TurnCostReminder";
@@ -1691,78 +1684,3 @@ createRoot(document.getElementById("settings-shell-root")!).render(
     <SettingsShellProbe />
   </StrictMode>,
 );
-
-const RAIL_SELECTION: Extract<RepoSelection, { selected: true }> = {
-  selected: true,
-  owner: "acme",
-  repo: "aurora",
-  branch: "feat/rail",
-  status: "ready",
-  head_sha: "abcdef1234567890",
-  selection_version: 1,
-};
-const RAIL_TODOS = [{ content: "修右栏单实例", status: "in_progress", activeForm: "正在修右栏" }];
-
-/** PR3 右栏：默认挂着即可。T43 用视口切换证明 390 回中栏、1440 单实例、隐藏接回、无数据不占宽。 */
-function ContextRailDataProbe() {
-  const isXl = useXlViewport();
-  const [railHidden, setRailHidden] = useContextRailHidden();
-  const showRail = isXl && !railHidden;
-  return (
-    <div data-testid="context-rail-data-shell" className="flex h-[420px] w-full overflow-x-hidden bg-bg text-fg">
-      <main data-testid="center-column" className="flex min-w-0 flex-1 flex-col gap-2 p-3">
-        {isXl && railHidden && (
-          <button type="button" onClick={() => setRailHidden(false)}>
-            显示上下文
-          </button>
-        )}
-        {!showRail && <RepoPill selection={RAIL_SELECTION} onClick={() => {}} />}
-        {!showRail && <PinnedTaskTracker todos={RAIL_TODOS} active />}
-        <p>中栏对照正文 https://example.com/very/long/path/for/overflow-check</p>
-      </main>
-      {showRail && (
-        <ContextRail
-          renderers={{
-            "bound-repo": <BoundRepoCard selection={RAIL_SELECTION} onOpenRepo={() => {}} />,
-            "pinned-tasks": <PinnedTaskTracker todos={RAIL_TODOS} active compact />,
-          }}
-          onHide={() => setRailHidden(true)}
-        />
-      )}
-    </div>
-  );
-}
-
-function ContextRailUnboundProbe() {
-  const isXl = useXlViewport();
-  return (
-    <div data-testid="context-rail-unbound-shell" className="flex h-[200px] w-full overflow-x-hidden bg-bg text-fg">
-      <main data-testid="unbound-center" className="flex min-w-0 flex-1 flex-col gap-2 p-3">
-        <RepoPill selection={{ selected: false }} onClick={() => {}} />
-        {isXl ? null : <PinnedTaskTracker todos={RAIL_TODOS} active />}
-      </main>
-      {isXl && (
-        <ContextRail
-          renderers={{
-            "bound-repo": null,
-            "pinned-tasks": <PinnedTaskTracker todos={RAIL_TODOS} active compact />,
-          }}
-          onHide={() => {}}
-        />
-      )}
-    </div>
-  );
-}
-
-createRoot(document.getElementById("context-rail-root")!).render(
-  <StrictMode>
-    <TooltipProvider>
-      <ContextRailDataProbe />
-      <div data-testid="context-rail-empty-shell">
-        <ContextRail renderers={{ "bound-repo": null, "pinned-tasks": null }} onHide={() => {}} />
-      </div>
-      <ContextRailUnboundProbe />
-    </TooltipProvider>
-  </StrictMode>,
-);
-

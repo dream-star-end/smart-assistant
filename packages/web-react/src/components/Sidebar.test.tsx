@@ -227,26 +227,4 @@ describe("Sidebar 会话列表", () => {
     expect(screen.getByText("今天")).toBeInTheDocument();
     expect(screen.getByText("更早")).toBeInTheDocument();
   });
-
-  it("pinned 会话单独成「置顶」组且不重复出现在日期组", () => {
-    const old = new Date(Date.now() - 90 * 86400000).toISOString();
-    renderSidebar({
-      sessions: [
-        session({ id: "s-pin", title: "钉住的会话", pinned: true, updatedAt: old }),
-        session({ id: "s-today", title: "今天的会话" }),
-      ],
-    });
-    expect(screen.getByText("置顶")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "钉住的会话" })).toBeInTheDocument();
-    expect(screen.getByText("今天")).toBeInTheDocument();
-    expect(screen.queryByText("更早")).toBeNull();
-  });
-
-  it("没有任何 pinned 会话时不渲染「置顶」组", () => {
-    renderSidebar({
-      sessions: [session({ id: "s-today", title: "今天的会话" })],
-    });
-    expect(screen.queryByText("置顶")).toBeNull();
-    expect(screen.getByText("今天")).toBeInTheDocument();
-  });
 });

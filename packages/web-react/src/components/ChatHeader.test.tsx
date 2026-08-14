@@ -19,6 +19,8 @@ function renderHeader(extra: Partial<Parameters<typeof ChatHeader>[0]> = {}) {
       agent={MAIN_AGENT}
       onAgentClick={() => {}}
       models={MODELS}
+      selectedModelId="glm-5.2"
+      onSelectModel={() => {}}
       theme="light"
       onCycleTheme={() => {}}
       {...extra}
@@ -52,26 +54,16 @@ describe("ChatHeader 团队模式指示 chip", () => {
     expect(onDisableTeamMode).toHaveBeenCalledTimes(1);
   });
 
-  it("模型选择器已迁出顶栏", () => {
-    renderHeader();
-    expect(screen.queryByRole("button", { name: "选择对话模型" })).toBeNull();
+  it("teamModeActive=true 时顶栏 ModelSelector 显示实际生效的队长引擎", () => {
+    renderHeader({ teamModeActive: true, onDisableTeamMode: () => {} });
+    const trigger = screen.getByRole("button", { name: "选择对话模型" });
+    expect(trigger.textContent).toContain("团队模式 · GPT-5.6-Sol");
+    expect(trigger.textContent).not.toContain("GLM-5.2");
   });
-});
 
-describe("ChatHeader 上下文重开", () => {
-  it("传入 onShowContext 才渲染「显示上下文」", () => {
-    const { rerender } = renderHeader();
-    expect(screen.queryByRole("button", { name: "显示上下文" })).toBeNull();
-    rerender(
-      <ChatHeader
-        agent={MAIN_AGENT}
-        onAgentClick={() => {}}
-        models={MODELS}
-        theme="light"
-        onCycleTheme={() => {}}
-        onShowContext={() => {}}
-      />,
-    );
-    expect(screen.getByRole("button", { name: "显示上下文" })).toBeInTheDocument();
+  it("常态下 ModelSelector 仍显示用户自选模型", () => {
+    renderHeader();
+    const trigger = screen.getByRole("button", { name: "选择对话模型" });
+    expect(trigger.textContent).toContain("GLM-5.2");
   });
 });
