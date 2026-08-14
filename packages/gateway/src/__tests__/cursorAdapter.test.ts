@@ -64,6 +64,21 @@ async function createBaselineSkills(root: string): Promise<string> {
 }
 
 describe('CursorAdapter', () => {
+  test('prefers the hot-config Cursor wrapper and preserves the image fallback', () => {
+    assert.equal(
+      _internals.resolveCursorWrapperBin(undefined, true),
+      '/run/oc/platform/current/bin/oc-cursor',
+    )
+    assert.equal(
+      _internals.resolveCursorWrapperBin(undefined, false),
+      '/usr/local/bin/oc-cursor',
+    )
+    assert.equal(
+      _internals.resolveCursorWrapperBin('  /tmp/test-cursor-wrapper  ', true),
+      '/tmp/test-cursor-wrapper',
+    )
+  })
+
   test('parses pinned official stream-json without duplicating the final assistant flush', async () => {
     const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-adapter-'))
     const fake = path.join(dir, 'fake.cjs')

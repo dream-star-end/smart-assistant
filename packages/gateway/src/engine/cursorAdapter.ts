@@ -4,7 +4,7 @@
 import { spawn, type ChildProcessByStdio } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
-import { chmodSync, lstatSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, lstatSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, resolve } from 'node:path'
 import type { Readable } from 'node:stream'
@@ -30,6 +30,19 @@ export const CURSOR_MAX_PROMPT_ARG_BYTES = 96 * 1024
 export const CURSOR_MAX_TURN_PAYLOAD_BYTES = 48 * 1024
 export const CURSOR_MAX_PLATFORM_ENVELOPE_BYTES = 48 * 1024
 const CURSOR_CONTEXT_DIR_PREFIX = 'openclaude-cursor-context-'
+// Prefer the root-owned read-only hot-config bundle in production; retain the
+// image copy only for supported dev/fallback environments without that mount.
+const CURSOR_HOTCFG_WRAPPER_BIN = '/run/oc/platform/current/bin/oc-cursor'
+const CURSOR_IMAGE_WRAPPER_BIN = '/usr/local/bin/oc-cursor'
+
+function resolveCursorWrapperBin(
+  override = process.env.OC_CURSOR_WRAPPER_BIN,
+  hotConfigAvailable = existsSync(CURSOR_HOTCFG_WRAPPER_BIN),
+): string {
+  const explicit = override?.trim()
+  if (explicit) return explicit
+  return hotConfigAvailable ? CURSOR_HOTCFG_WRAPPER_BIN : CURSOR_IMAGE_WRAPPER_BIN
+}
 
 // Commercial authority is platform-runtime/prompts/cursor-preamble.md. Keep
 // this fallback byte-identical for personal/dev environments where the bundle
@@ -513,7 +526,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
       if (repoSnapshot?.status === 'ready' && repoSnapshot.workspaceDir)
         cwd = repoSnapshot.workspaceDir
     }
-    const bin = process.env.OC_CURSOR_WRAPPER_BIN?.trim() || '/usr/local/bin/oc-cursor'
+    const bin = resolveCursorWrapperBin()
     const selected = CURSOR_ENGINE_MODELS.find((model) => model.id === this.currentModel)
     if (!selected) throw new Error(`Cursor model '${String(this.currentModel)}' is not allowlisted`)
 
@@ -790,6 +803,9 @@ export const _internals = {
   validateCursorFinalPrompt,
   buildCursorMemoryMcpConfig,
   buildCursorSpawnEnv,
+  CURSOR_HOTCFG_WRAPPER_BIN,
+  CURSOR_IMAGE_WRAPPER_BIN,
+  resolveCursorWrapperBin,
 }
 
 registerEngine('cursor', (opts) => new CursorAdapter(opts))
