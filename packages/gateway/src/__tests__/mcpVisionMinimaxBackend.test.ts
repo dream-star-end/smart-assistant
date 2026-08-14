@@ -50,6 +50,7 @@ describe('shouldEnableOpenClaudeVision gating', () => {
     assert.equal(vision.shouldEnableOpenClaudeVision('ark', 'glm-5.1'), true)
     assert.equal(vision.shouldEnableOpenClaudeVision('ark', 'glm-5.2'), true)
     assert.equal(vision.shouldEnableOpenClaudeVision(undefined, 'GLM-5.2'), true)
+    assert.equal(vision.shouldEnableOpenClaudeVision('ark', 'glm-5.3'), true)
   })
   it('MiniMax-M3(原生多模态)→ false(它直接识图,不注入工具)', () => {
     assert.equal(vision.shouldEnableOpenClaudeVision('minimax', 'MiniMax-M3'), false)
@@ -67,8 +68,9 @@ describe('shouldEnableOpenClaudeVision gating', () => {
       assert.equal(vision.shouldEnableOpenClaudeVision('ark', 'glm-5.2'), false)
     })
   })
-  it('纯文本静态新成员(qwen3.7-max/plus / kimi-k2.7-code,supportsVision=false)→ true', () => {
+  it('纯文本静态成员(OpenCode Go / kimi-k2.7-code,supportsVision=false)→ true', () => {
     // 派生自 protocol supportsVision,不再依赖 gateway 侧字面量 allowlist。
+    assert.equal(vision.shouldEnableOpenClaudeVision('opencodego', 'deepseek-v4-flash-opencode-go'), true)
     assert.equal(vision.shouldEnableOpenClaudeVision('opencodego', 'qwen3.7-max'), true)
     assert.equal(vision.shouldEnableOpenClaudeVision('opencodego', 'qwen3.7-plus'), true)
     assert.equal(vision.shouldEnableOpenClaudeVision('kimi', 'kimi-k2.7-code'), true)

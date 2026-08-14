@@ -46,6 +46,7 @@ const NOOP_DEPS: PickUpstreamDeps = {
     ark: "ark-key",
     deepseek: "ds-key",
     minimax: "mm-key",
+    opencodego: "opencode-go-key",
     "ark-k3": "ark-plan-key",
     bailian: "bailian-key",
   },
@@ -104,6 +105,20 @@ describe("selectUpstreamRoute — provider_id 驱动(catalog hint)", () => {
     assert.deepEqual((requestBody as { thinking?: unknown }).thinking, { type: "disabled" });
   });
 
+  test("opencodego catalog descriptor 保持 canonical 计费 id 与 upstream 型号分离", async () => {
+    const route = selectUpstreamRoute("deepseek-v4-flash-opencode-go", {
+      providerId: "opencodego",
+      upstreamModelId: "deepseek-v4-flash",
+    });
+    const r = await pickUpstream(NOOP_DEPS, body("deepseek-v4-flash-opencode-go"), route, log);
+    assert.ok(r.ok);
+    const headers: Record<string, string> = {};
+    r.session.applyUpstreamAuth(headers, body("deepseek-v4-flash-opencode-go"), log);
+    assert.equal(r.session.upstreamModel, "deepseek-v4-flash");
+    assert.equal(headers["x-api-key"], "opencode-go-key");
+    assert.equal(headers.authorization, undefined);
+  });
+
   test("bailian catalog descriptor 选择 qwen3.8-max 机制与 x-api-key", async () => {
     const route = selectUpstreamRoute("catalog-qwen-max", {
       providerId: "bailian",
@@ -140,6 +155,8 @@ describe("selectUpstreamRoute — provider_id 驱动(catalog hint)", () => {
   test("无 hint(legacy / 影子期)→ 与本批次之前逐字节一致", () => {
     assert.equal(selectUpstreamRoute("deepseek-v4-pro").kind, "static");
     assert.equal(selectUpstreamRoute("glm-5.2").kind, "static");
+    assert.equal(selectUpstreamRoute("glm-5.3").kind, "static");
+    assert.equal(selectUpstreamRoute("deepseek-v4-flash-opencode-go").kind, "static");
     assert.equal(selectUpstreamRoute("MiniMax-M3").kind, "static");
     assert.equal(selectUpstreamRoute("claude-sonnet-4-5").kind, "oauth");
   });

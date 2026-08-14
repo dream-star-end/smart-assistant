@@ -29,7 +29,7 @@ const { modelSupportsThinking, modelSupportsAdaptiveThinking } = await import(
 );
 afterEach(() => { delete process.env.OC_MODEL_EXECUTION_DESCRIPTOR; });
 
-describe("glm-5.1 (Ark) thinking capability", () => {
+describe("Ark GLM / OpenCode Go thinking capability", () => {
   test("catalog 新 id 的 thinking 只认 descriptor", () => {
     process.env.OC_MODEL_EXECUTION_DESCRIPTOR = JSON.stringify({
       canonicalModel: "new-ccb-model",
@@ -56,6 +56,13 @@ describe("glm-5.1 (Ark) thinking capability", () => {
     expect(modelSupportsThinking("GLM-5.2")).toBe(true);
   });
 
+  test("glm-5.3 与 OpenCode Go DeepSeek alias thinking=true、adaptive=false", () => {
+    expect(modelSupportsThinking("glm-5.3")).toBe(true);
+    expect(modelSupportsAdaptiveThinking("glm-5.3")).toBe(false);
+    expect(modelSupportsThinking("deepseek-v4-flash-opencode-go")).toBe(true);
+    expect(modelSupportsAdaptiveThinking("deepseek-v4-flash-opencode-go")).toBe(false);
+  });
+
   test("kimi-k3-ark(火山 Agent Plan K3)thinking=true、adaptive=false", () => {
     expect(modelSupportsThinking("kimi-k3-ark")).toBe(true);
     expect(modelSupportsAdaptiveThinking("kimi-k3-ark")).toBe(false);
@@ -66,9 +73,10 @@ describe("glm-5.1 (Ark) thinking capability", () => {
     expect(modelSupportsAdaptiveThinking("qwen3.8-max")).toBe(false);
   });
 
-  test("glm-5.1/glm-5.2 不支持 adaptive thinking → CCB 走 enabled+budget(Ark 实测可用的格式)", () => {
+  test("glm-5.1/5.2/5.3 不支持 adaptive thinking → CCB 走 enabled+budget(Ark 实测可用的格式)", () => {
     expect(modelSupportsAdaptiveThinking("glm-5.1")).toBe(false);
     expect(modelSupportsAdaptiveThinking("glm-5.2")).toBe(false);
+    expect(modelSupportsAdaptiveThinking("glm-5.3")).toBe(false);
     expect(modelSupportsAdaptiveThinking("MiniMax-M3")).toBe(false);
   });
 });

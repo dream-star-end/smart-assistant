@@ -83,10 +83,12 @@ describe('SubprocessRunner.model getter / setModel', () => {
     assert.ok(ALLOWED_INBOUND_MODELS.has('deepseek-v4-pro'))
     // MiniMax-M3 Token Plan anthropic-compatible 上游:
     assert.ok(ALLOWED_INBOUND_MODELS.has('MiniMax-M3'))
-    // glm-5.1/glm-5.2 火山方舟 Ark Coding Plan anthropic-compatible 上游(glm-5.2=平台默认 2026-06-17):
+    // glm-5.1/5.2/5.3 火山方舟 Ark Coding Plan anthropic-compatible 上游:
     assert.ok(ALLOWED_INBOUND_MODELS.has('glm-5.1'))
     assert.ok(ALLOWED_INBOUND_MODELS.has('glm-5.2'))
-    // qwen3.7-max/plus OpenCode Go anthropic-compatible 上游(2026-07-05):
+    assert.ok(ALLOWED_INBOUND_MODELS.has('glm-5.3'))
+    // DeepSeek V4 Flash alias + qwen3.7 历史模型走 OpenCode Go anthropic-compatible 上游:
+    assert.ok(ALLOWED_INBOUND_MODELS.has('deepseek-v4-flash-opencode-go'))
     assert.ok(ALLOWED_INBOUND_MODELS.has('qwen3.7-max'))
     assert.ok(ALLOWED_INBOUND_MODELS.has('qwen3.7-plus'))
     // kimi-k2.7-code 火山方舟 Agent Plan anthropic-compatible 上游(2026-07-06):

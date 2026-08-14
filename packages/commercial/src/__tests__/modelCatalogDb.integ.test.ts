@@ -131,8 +131,12 @@ function expectedContextWindow(modelId: string): number | null {
   if (isCodexEngineModel(modelId)) return null;
   const m = modelId.trim().toLowerCase();
   if (m === "minimax-m3") return 512_000;
-  if (m === "deepseek-v4-flash" || m === "deepseek-v4-pro") return 1_000_000;
-  if (m === "glm-5.2") return 1_000_000;
+  if (
+    m === "deepseek-v4-flash" ||
+    m === "deepseek-v4-pro" ||
+    m === "deepseek-v4-flash-opencode-go"
+  ) return 1_000_000;
+  if (m === "glm-5.2" || m === "glm-5.3") return 1_000_000;
   if (m === "glm-5.1") return 200_000;
   if (m === "qwen3.7-max" || m === "qwen3.7-plus") return 1_000_000;
   if (m === "kimi-k2.7-code") return 256_000;
@@ -186,7 +190,13 @@ describe("0143 回填 + 后续 catalog engine 迁移", () => {
       // Ark K3 uses the platform alias kimi-k3-ark for pricing and rewrites only upstream.
       assert.equal(
         r.upstream_model_id,
-        id === "kimi-k3-ark" ? "kimi-k3" : (catalogSwitchedQwen ? "qwen3.8-max" : null),
+        id === "kimi-k3-ark"
+          ? "kimi-k3"
+          : id === "deepseek-v4-flash-opencode-go"
+            ? "deepseek-v4-flash"
+            : id === "glm-5.3"
+              ? "glm-5.3"
+              : (catalogSwitchedQwen ? "qwen3.8-max" : null),
         `${id}: upstream_model_id`,
       );
 

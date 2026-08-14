@@ -1,9 +1,9 @@
 // 静态 key 文本 provider 注册表 —— 平台持有静态 API key、按 model id 路由到第三方
 // Anthropic 兼容上游(不占 OAuth 账号池)的 provider 的单一权威声明。
 //
-// 当前成员：DeepSeek、MiniMax、火山方舟 Ark(glm-5.2 主力 + glm-5.1 兼容存量)、
-// OpenCode Go(Zen 网关 Go 档,qwen3.7-max/plus,2026-07-05)、Ark Agent Plan Kimi
-// (kimi-k2.7-code,与 minimax 同订阅同 key,2026-07-06)。
+// 当前成员：DeepSeek、MiniMax、火山方舟 Ark(glm-5.3 + glm-5.2/5.1 兼容存量)、
+// OpenCode Go(Zen 网关 Go 档,DeepSeek V4 Flash 平台 alias + Qwen3.7 兼容存量)、
+// Ark Agent Plan Kimi(kimi-k2.7-code,与 minimax 同订阅同 key,2026-07-06)。
 //
 // 设计边界(只放 commercial + gateway 都消费的"路由元数据"纯数据/纯函数)：
 //   - **不**含 commercial 语义(key 的 config 字段名 / 503 错误码 / metric label) —— 那些在
@@ -54,6 +54,12 @@ export interface StaticKeyProviderSpec {
    * 未声明(undefined)= 透传不动(glm 支持 disabled/qwen disabled 生效/minimax 容忍)。
    */
   readonly stripDisabledThinking?: boolean
+  /**
+   * 同一 provider 内只有部分型号不支持 `thinking:{type:'disabled'}` 时，列出其**上游**
+   * model 字面量。master 用 catalog 已解析的 upstreamModel 精确、大小写不敏感匹配。
+   * 不能提升成 provider-wide 开关：Ark 的 glm-5.1/5.2 支持 disabled，只有 glm-5.3 会 400。
+   */
+  readonly stripDisabledThinkingModels?: readonly string[]
   /**
    * commercial master proxy 路由 gate。命中 → 切到本 provider 静态 key 上游。
    *   - deepseek: **大小写敏感** `modelId.startsWith('deepseek-')`(与 shared.ts 现状逐字节一致)
@@ -112,7 +118,11 @@ const DEEPSEEK: StaticKeyProviderSpec = {
   upstreamEndpoint: 'https://api.deepseek.com/anthropic/v1/messages',
   matchesRoute(modelId) {
     // 大小写敏感前缀家族 —— 不要改成 toLowerCase，否则扩大准入面(Codex plan review)。
-    return modelId.startsWith('deepseek-')
+    // OpenCode Go 的同名模型使用独立平台 alias，必须从 direct DeepSeek 家族排除。
+    return (
+      modelId.startsWith('deepseek-') &&
+      modelId.toLowerCase() !== 'deepseek-v4-flash-opencode-go'
+    )
   },
   inboundModelIds: ['deepseek-v4-flash', 'deepseek-v4-pro'],
   canonicalizeForPricing() {
@@ -151,75 +161,71 @@ const MINIMAX: StaticKeyProviderSpec = {
 
 const ARK: StaticKeyProviderSpec = {
   id: 'ark',
-  // 火山方舟 Coding Plan 的 Anthropic 兼容 base URL = https://ark.cn-beijing.volces.com/api/coding；
-  // 本注册表持有完整 /v1/messages endpoint(同 MiniMax 模式补齐 path)。
-  // **2026-06-17 起主力模型 glm-5.2**(火山已支持;coder + 队长/平台默认全切 glm-5.2)。
-  // glm-5.1 **仍路由**(向后兼容存量会话/prefs),但已从 picker 撤下(定价 visibility=hidden)。
+  // 火山方舟 Coding Plan Anthropic 兼容端点。2026-08-14 实测 glm-5.3 的
+  // normal/SSE/high|max effort/tool loop 全通；官方模型卡确认 1M/text-only。
+  // glm-5.1/5.2 保留 transport plumbing，执行下线由 DB catalog 决定。
   upstreamEndpoint: 'https://ark.cn-beijing.volces.com/api/coding/v1/messages',
   matchesRoute(modelId) {
     const m = modelId.toLowerCase()
-    return m === 'glm-5.1' || m === 'glm-5.2'
+    return m === 'glm-5.1' || m === 'glm-5.2' || m === 'glm-5.3'
   },
-  inboundModelIds: ['glm-5.2', 'glm-5.1'],
+  inboundModelIds: ['glm-5.3', 'glm-5.2', 'glm-5.1'],
   canonicalizeForPricing(modelId) {
     const m = modelId.toLowerCase()
-    return m === 'glm-5.1' ? 'glm-5.1' : m === 'glm-5.2' ? 'glm-5.2' : null
+    return m === 'glm-5.1'
+      ? 'glm-5.1'
+      : m === 'glm-5.2'
+        ? 'glm-5.2'
+        : m === 'glm-5.3'
+          ? 'glm-5.3'
+          : null
   },
   stripHeaders: ['anthropic-beta'],
-  // **与 MiniMax 不同:不 strip `thinking`**。glm-5.1/glm-5.2 都是 thinking 模型，火山 Ark Anthropic
-  // 兼容层实测支持 `thinking:{type:enabled,budget_tokens}` / `{type:disabled}`(glm-5.1 2026-06-15 直连验证;
-  // glm-5.2 同通道同协议)。CCB 对 glm-5.1/glm-5.2 modelSupportsThinking=true，会按用户设置发 thinking，
-  // 故必须放行。
-  // **output_config 不整体 strip**:火山 ark 支持 `output_config.effort`(思考深度,boss 2026-06-17
-  // 实测端点合法值 low/medium/high/max,glm-5.2 上线高/最高两档=high/max)。改由 outputConfigEffortOnly
-  // 让 master 只保留合法 effort、删掉 CCB 其他 firstParty-only 子字段(task_budget/format 等火山不识别)。
-  // 其余 2 个 firstParty-only body 字段仍整体 strip(Ark 不识别/可能拒)。
+  // glm 三代都支持 enabled+budget；但 glm-5.3 的 disabled 会 400，故只对该上游
+  // 字面量删 disabled 参数，不能改变仍支持 disabled 的 glm-5.1/5.2。
+  stripDisabledThinkingModels: ['glm-5.3'],
+  // Ark 只识别 output_config.effort；其余 firstParty-only 字段在边界剥离。
   stripBodyFields: ['context_management', 'service_tier'],
-  // 火山端点合法档位 low/medium/high/max,但 glm-5.2 产品只暴露高/最高;收窄到这两档,
-  // 任何其他值(含 low/medium/minimal/xhigh)在 master 兜底剥成"无 effort"(火山默认思考)。
+  // 上游接受 low/medium/high/max，产品仍只开放高/最高。
   allowedOutputConfigEfforts: ['high', 'max'],
-  // **glm-5.2 上下文窗口 1M**(火山规格,boss 2026-06-17 确认);glm-5.1 200k(已退场)。
-  // maxInputTokens 是 provider 级单值 input guard(估算 JSON.length/4),取 glm-5.2 的 1M:
-  //   - glm-5.2 长上下文(200k~1M)不再被 master 误拒 413;
-  //   - glm-5.1(退场)guard 随之放宽到 1M,存量 glm-5.1 超 200k 的罕见请求由火山端点兜底拒(400)。
-  // 注:CCB auto-compact 上限是 **per-model 精确**的(staticKeyModels STATIC_MODEL_CONTEXT_WINDOW:
-  //     5.2=1M / 5.1=200k),防 glm-5.1 存量会话按 1M 不压缩而超窗。
+  // glm-5.2/5.3 机制窗口 1M；glm-5.1 的 200K 由 CCB per-model authority 收紧。
   maxInputTokens: 1_000_000,
 }
 
 const OPENCODE_GO: StaticKeyProviderSpec = {
   id: 'opencodego',
-  // OpenCode Zen「Go 计划」网关(https://opencode.ai/docs/go/)—— 订阅制静态 key(Go 订阅
-  // $10/月,配额 5h/$12、周/$30、月/$60,官方允许 opencode 客户端之外直接 API 调用)。
-  // 2026-07-05 接入 v5 缺口的两个 Qwen 旗舰。Go 档还有 kimi/mimo 家族,但其 Anthropic 兼容层
-  // 实测整族 400 "Upstream request failed"(同模型走 OpenAI /chat/completions 正常 → 网关
-  // 转换层问题),等 opencode 修好后追加 inboundModelIds + 定价行即可,不需要新机制。
-  // 实测(2026-07-05,qwen3.7-max/plus 直连探针):非流式/SSE 流式/tool_use/tool_result 回环/
-  // system+cache_control/stop_sequences 全通;usage 含 cache_read/cache_creation 字段。
+  // OpenCode Zen「Go 计划」网关。2026-08-14 接入 DeepSeek V4 Flash；平台 canonical
+  // 使用 deepseek-v4-flash-opencode-go，避免覆盖 direct DeepSeek 的既有 canonical。
+  // /messages normal/SSE/thinking/tool_use+result/cache usage 全通。Qwen3.7 仅保留历史
+  // transport plumbing，执行下线由 DB catalog 决定。
   upstreamEndpoint: 'https://opencode.ai/zen/go/v1/messages',
-  // /messages 只认 x-api-key(Bearer→401 Missing API key,2026-07-05 实测;其 /models 反而
-  // 认 Bearer —— 端点风格不一致是 opencode 侧现状,以 /messages 为准)。
+  // /messages 使用 x-api-key；/models 的 Bearer 风格不影响执行端点。
   authScheme: 'x-api-key',
   matchesRoute(modelId) {
     const m = modelId.toLowerCase()
-    return m === 'qwen3.7-max' || m === 'qwen3.7-plus'
+    return m === 'deepseek-v4-flash-opencode-go' || m === 'qwen3.7-max' || m === 'qwen3.7-plus'
   },
-  inboundModelIds: ['qwen3.7-max', 'qwen3.7-plus'],
+  inboundModelIds: ['deepseek-v4-flash-opencode-go', 'qwen3.7-max', 'qwen3.7-plus'],
   canonicalizeForPricing(modelId) {
     const m = modelId.toLowerCase()
-    return m === 'qwen3.7-max' ? 'qwen3.7-max' : m === 'qwen3.7-plus' ? 'qwen3.7-plus' : null
+    return m === 'deepseek-v4-flash-opencode-go'
+      ? 'deepseek-v4-flash-opencode-go'
+      : m === 'qwen3.7-max'
+        ? 'qwen3.7-max'
+        : m === 'qwen3.7-plus'
+          ? 'qwen3.7-plus'
+          : null
+  },
+  upstreamModelForRequest(modelId) {
+    return modelId.toLowerCase() === 'deepseek-v4-flash-opencode-go'
+      ? 'deepseek-v4-flash'
+      : modelId
   },
   stripHeaders: ['anthropic-beta'],
-  // **保留 thinking**:qwen3.7 是思考模型,实测(2026-07-05)网关接受 thinking:{type:enabled,
-  // budget_tokens},且 {type:disabled} 真的关掉思考(返回直答,output_tokens=1)。
-  // 三个 firstParty-only 字段今日实测网关容忍,但第三方兼容层的容忍面不作承诺,按 minimax
-  // 先例仍 strip(CCB 侧 capabilityZero 不生成是根治,这里是兜底)。
+  // Go 的 Anthropic converter 接受 standard thinking/tool loop；firstParty-only 字段仍剥离。
   stripBodyFields: ['output_config', 'context_management', 'service_tier'],
-  // qwen3.7-max/plus 官方规格均 1M 窗口(max input 991.8k / max output 65.5k)。
-  // max_tokens 超限网关自钳制(实测 100k 照收不 400),无需输出 cap 机制。
   maxInputTokens: 1_000_000,
-  // 实测 image block → 400 InvalidParameter "Unexpected item type in content" → 纯文本接入,
-  // master strip 图,understand_image 工具兜底(mcpVisionServer/promptSlots 已同步登记)。
+  // 红/蓝图像探针只消耗 reasoning、无可验证文本结果，按纯文本接入并启用 vision 工具兜底。
   supportsVision: false,
 }
 
@@ -371,7 +377,7 @@ export function getStaticProvider(id: StaticProviderId): StaticKeyProviderSpec {
   return BY_ID[id]
 }
 
-/** gateway inbound 白名单：所有静态 provider 的精确字面量(deepseek 2 项 + MiniMax-M3 + glm-5.1 + glm-5.2 + qwen3.7-max/plus + kimi-k2.7-code)。 */
+/** gateway inbound 白名单：所有静态 provider 的精确字面量。 */
 export const STATIC_KEY_INBOUND_MODEL_IDS: readonly string[] = STATIC_KEY_PROVIDERS.flatMap(
   (p) => [...p.inboundModelIds],
 )

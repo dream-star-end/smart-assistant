@@ -63,16 +63,21 @@ export function getAuthorityModelCapabilities(
 //      betas/thinking 也走默认路径,本次一字不动。
 //   2) 静态模型的 context window(auto-compact 上限)。DeepSeek V4 Flash / Pro 官方窗口均为 1M。
 
-/** 火山方舟 Ark Coding Plan 模型:**glm-5.2**(2026-06-17 起主力 = coder/队长/平台默认)+ glm-5.1
- *  (退 picker 但兼容存量)。两者同走火山 ark 端点,能力处理一致(capabilityZero / thinking / 200k 窗口)。
- *  精确匹配,大小写不敏感。 */
+/** 火山方舟 Ark Coding Plan 模型。glm-5.3/5.2 为 1M，glm-5.1 为兼容存量 200K。
+ *  精确匹配,大小写不敏感；disabled-thinking 的型号差异由 master proxy 处理。 */
 export function isArkGlmModel(model: string): boolean {
   const m = model.trim().toLowerCase()
-  return m === 'glm-5.1' || m === 'glm-5.2'
+  return m === 'glm-5.1' || m === 'glm-5.2' || m === 'glm-5.3'
 }
 
-/** OpenCode Go(Zen 网关 Go 档)接入的 Qwen 模型:qwen3.7-max + qwen3.7-plus(2026-07-05)。
- *  精确匹配,大小写/空白不敏感,与 protocol opencodego.matchesRoute 同口径。 */
+/** OpenCode Go 当前模型 + 历史 transport 集。DeepSeek 使用独立平台 alias，避免覆盖 direct
+ *  provider；Qwen3.7 保留历史 plumbing 但由 DB catalog 下线。 */
+export function isOpencodeGoModel(model: string): boolean {
+  const m = model.trim().toLowerCase()
+  return m === 'deepseek-v4-flash-opencode-go' || m === 'qwen3.7-max' || m === 'qwen3.7-plus'
+}
+
+/** 只识别 OpenCode Go 的历史 Qwen 子集。 */
 export function isOpencodeQwenModel(model: string): boolean {
   const m = model.trim().toLowerCase()
   return m === 'qwen3.7-max' || m === 'qwen3.7-plus'
@@ -120,7 +125,7 @@ export function isCapabilityZeroStaticModel(model: string): boolean {
   return (
     isMiniMaxM3Model(model) ||
     isArkGlmModel(model) ||
-    isOpencodeQwenModel(model) ||
+    isOpencodeGoModel(model) ||
     isArkPlanKimiModel(model) ||
     isArkPlanKimiK3Model(model) ||
     isMoonshotKimiK3Model(model) ||
@@ -147,10 +152,16 @@ export const STATIC_MODEL_CONTEXT_WINDOW: ReadonlyArray<{
     },
     contextWindow: 1_000_000,
   },
-  { matches: (m) => m.trim().toLowerCase() === 'glm-5.2', contextWindow: 1_000_000 },
+  {
+    matches: (m) => {
+      const model = m.trim().toLowerCase()
+      return model === 'glm-5.2' || model === 'glm-5.3'
+    },
+    contextWindow: 1_000_000,
+  },
   { matches: (m) => m.trim().toLowerCase() === 'glm-5.1', contextWindow: 200_000 },
-  // qwen3.7-max/plus 官方规格均 1M(max input 991.8k);两型号同窗,家族函数一条即可。
-  { matches: isOpencodeQwenModel, contextWindow: 1_000_000 },
+  // DeepSeek alias 与历史 qwen3.7 均为 1M；direct DeepSeek 由上面的精确表独立处理。
+  { matches: isOpencodeGoModel, contextWindow: 1_000_000 },
   // kimi-k2.7-code 官方规格 256K(火山 Agent Plan 托管,max output 上游硬顶 32768)。
   { matches: isArkPlanKimiModel, contextWindow: 256_000 },
   // kimi-k3-ark 火山 Agent Plan K3，机制窗口 1,048,576。
