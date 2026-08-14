@@ -2,7 +2,7 @@ import "@testing-library/jest-dom/vitest";
 import { act, cleanup, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../../lib/chat/model";
-import { extractLatestTodos, isPinnedTaskTrackerVisible, PinnedTaskTracker } from "./PinnedTaskTracker";
+import { extractLatestTodos, PinnedTaskTracker } from "./PinnedTaskTracker";
 
 afterEach(cleanup);
 
@@ -164,17 +164,5 @@ describe("PinnedTaskTracker 交互", () => {
   test("当前 turn 非运行态 → 未完成历史任务也不渲染", () => {
     const { container } = render(<PinnedTaskTracker todos={TODOS} active={false} />);
     expect(container.firstChild).toBeNull();
-  });
-
-  test("isPinnedTaskTrackerVisible 与渲染条件同构", () => {
-    expect(isPinnedTaskTrackerVisible(TODOS, true)).toBe(true);
-    expect(isPinnedTaskTrackerVisible(TODOS, false)).toBe(false);
-    expect(isPinnedTaskTrackerVisible([], true)).toBe(false);
-    expect(isPinnedTaskTrackerVisible([{ content: "完", status: "completed" }], true)).toBe(false);
-  });
-
-  test("compact 去掉中栏 max-w-3xl 外壳", () => {
-    const { container } = render(<PinnedTaskTracker todos={TODOS} active compact />);
-    expect(container.firstElementChild?.className ?? "").not.toContain("max-w-3xl");
   });
 });

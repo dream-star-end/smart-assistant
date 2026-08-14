@@ -38,25 +38,3 @@ describe("Composer Stop ownership", () => {
     expect(onStop).not.toHaveBeenCalled();
   });
 });
-
-describe("Composer 仓库 pill 单实例", () => {
-  const bound = {
-    selected: true as const,
-    owner: "acme",
-    repo: "aurora",
-    branch: "main",
-    status: "ready" as const,
-    selection_version: 1,
-  };
-
-  test("showRepoPill=false 时卸载中栏 pill", () => {
-    const { rerender } = render(
-      <Composer onSend={() => {}} onOpenRepo={() => {}} repoSelection={bound} />,
-    );
-    expect(screen.getByTestId("repo-pill")).toBeInTheDocument();
-    rerender(
-      <Composer onSend={() => {}} onOpenRepo={() => {}} showRepoPill={false} repoSelection={bound} />,
-    );
-    expect(screen.queryByTestId("repo-pill")).toBeNull();
-  });
-});

@@ -38,7 +38,7 @@
 // 跑法:npm run test:browser(web-react 包内);失败截图落 $OC_BROWSER_TEST_ARTIFACTS
 // (默认 /tmp)。退出码:0 全过 / 1 断言失败 / 2 环境错误(浏览器缺失等,同样视为门失败)。
 import { createRequire } from "node:module";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -184,7 +184,7 @@ const html = `<!doctype html><html><head><meta charset="utf-8"><style>${producti
   #root{position:static;height:auto;overflow:visible}
   .timeline-scroll-probe{height:360px;width:640px;overflow-y:auto;position:relative;border:1px solid #ccc;scrollbar-gutter:stable}
   #timeline-archive-root .chat-virtual-item{min-height:40px}
-</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="chat-entry-ux-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="interrupted-tool-status-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="error-ux-root"></div><div id="ask-question-root"></div><div id="model-selector-root"></div><div id="markdown-rich-root"></div><div id="media-task-root"></div><div id="connectors-root"></div><div id="memory-report-root"></div><div id="community-tutorial-root"></div><div id="codex-density-root"></div><div id="settings-shell-root"></div><div id="context-rail-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
+</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="chat-entry-ux-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="interrupted-tool-status-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="error-ux-root"></div><div id="ask-question-root"></div><div id="model-selector-root"></div><div id="markdown-rich-root"></div><div id="media-task-root"></div><div id="connectors-root"></div><div id="memory-report-root"></div><div id="community-tutorial-root"></div><div id="codex-density-root"></div><div id="settings-shell-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
 
 // ── drive ───────────────────────────────────────────────────────────────────
 let browser;
@@ -2333,135 +2333,6 @@ await check("T42 设置壳 390 单列可切五分区、1440 竖导航 168px、�
 
   await dialog.getByRole("button", { name: "关闭" }).click();
   await dialog.waitFor({ state: "hidden", timeout: 3000 });
-
-  if (DEFAULT_VIEWPORT) await page.setViewportSize(DEFAULT_VIEWPORT);
-  await page.evaluate(() => document.documentElement.classList.remove("dark"));
-});
-
-await check("T43 右栏 390 回中栏、1440 单实例约 280px、隐藏接回、无数据不占宽", async () => {
-  const shotDir = join(HERE, "..", "docs", "shots", "pr3");
-  mkdirSync(shotDir, { recursive: true });
-  await page.evaluate(() => {
-    try {
-      sessionStorage.removeItem("oc.contextRail.hidden");
-    } catch {
-      /* ignore */
-    }
-  });
-
-  const shell = page.locator('[data-testid="context-rail-data-shell"]');
-  const center = shell.locator('[data-testid="center-column"]');
-  const empty = page.locator('[data-testid="context-rail-empty-shell"]');
-  const unbound = page.locator('[data-testid="context-rail-unbound-shell"]');
-
-  async function assertNoOverflow(label) {
-    const overflow = await shell.evaluate((el) => el.scrollWidth > el.clientWidth + 1);
-    if (overflow) throw new Error(`右栏探针在 ${label} 发生横向溢出`);
-  }
-
-  async function shot(name) {
-    await shell.screenshot({ path: join(shotDir, name) });
-  }
-
-  await page.setViewportSize({ width: 390, height: 844 });
-  await page.evaluate(() => document.documentElement.classList.remove("dark"));
-  if ((await shell.locator('[data-testid="context-rail"]').count()) !== 0) {
-    throw new Error("390 仍渲染了右栏 aside");
-  }
-  if ((await center.locator('[data-testid="repo-pill"]').count()) !== 1) {
-    throw new Error("390 中栏应有绑定仓库 pill");
-  }
-  if ((await center.locator('[data-testid="pinned-task-tracker"]').count()) !== 1) {
-    throw new Error("390 中栏应有任务 HUD");
-  }
-  await assertNoOverflow("390 light");
-  await shot("context-rail--mobile--light.png");
-  await page.evaluate(() => document.documentElement.classList.add("dark"));
-  await assertNoOverflow("390 dark");
-  await shot("context-rail--mobile--dark.png");
-  await page.evaluate(() => document.documentElement.classList.remove("dark"));
-
-  await page.setViewportSize({ width: 1440, height: 900 });
-  const rail = shell.locator('[data-testid="context-rail"]');
-  await rail.waitFor({ state: "visible", timeout: 3000 });
-  const railWidth = await rail.evaluate((el) => el.getBoundingClientRect().width);
-  if (Math.abs(railWidth - 280) > 1) {
-    throw new Error(`1440 右栏宽度应为 280px,实际 ${railWidth}`);
-  }
-  if ((await center.locator('[data-testid="repo-pill"]').count()) !== 0) {
-    throw new Error("1440 中栏仍挂着 RepoPill，破坏单实例");
-  }
-  if ((await center.locator('[data-testid="pinned-task-tracker"]').count()) !== 0) {
-    throw new Error("1440 中栏仍挂着 PinnedTaskTracker，破坏单实例");
-  }
-  if ((await rail.locator('[data-testid="bound-repo-card"]').count()) !== 1) {
-    throw new Error("1440 右栏缺少绑定仓库卡");
-  }
-  if ((await rail.locator('[data-testid="pinned-task-tracker"]').count()) !== 1) {
-    throw new Error("1440 右栏缺少任务 HUD");
-  }
-  const railText = await rail.innerText();
-  if (railText.includes("当前分支")) {
-    throw new Error("右栏出现禁止文案「当前分支」");
-  }
-  if (!railText.includes("绑定仓库") || !railText.includes("绑定分支") || !railText.includes("绑定时 HEAD")) {
-    throw new Error("右栏未展示绑定仓库 / 绑定分支 / 绑定时 HEAD");
-  }
-  await assertNoOverflow("1440 light");
-  await shot("context-rail--desktop--light.png");
-  await page.evaluate(() => document.documentElement.classList.add("dark"));
-  await assertNoOverflow("1440 dark");
-  await shot("context-rail--desktop--dark.png");
-  await page.evaluate(() => document.documentElement.classList.remove("dark"));
-
-  if ((await empty.locator('[data-testid="context-rail"]').count()) !== 0) {
-    throw new Error("无数据时 ContextRail 仍占了 DOM");
-  }
-
-  const unboundCenter = unbound.locator('[data-testid="unbound-center"]');
-  const unboundRail = unbound.locator('[data-testid="context-rail"]');
-  await unboundRail.waitFor({ state: "visible", timeout: 3000 });
-  if ((await unboundCenter.getByRole("button", { name: "关联 GitHub 仓库" }).count()) !== 1) {
-    throw new Error("xl 未绑定 CTA 没有留在中栏");
-  }
-  if ((await unboundRail.locator('[data-testid="bound-repo-card"]').count()) !== 0) {
-    throw new Error("未绑定仍画了仓库卡");
-  }
-  if ((await unboundCenter.locator('[data-testid="pinned-task-tracker"]').count()) !== 0) {
-    throw new Error("未绑定探针 1440 中栏仍有任务 HUD");
-  }
-
-  await shell.getByRole("button", { name: "隐藏上下文" }).click();
-  await rail.waitFor({ state: "hidden", timeout: 3000 });
-  if ((await center.locator('[data-testid="repo-pill"]').count()) !== 1) {
-    throw new Error("隐藏右栏后中栏未接回 RepoPill");
-  }
-  if ((await center.locator('[data-testid="pinned-task-tracker"]').count()) !== 1) {
-    throw new Error("隐藏右栏后中栏未接回任务 HUD");
-  }
-  await shell.getByRole("button", { name: "显示上下文" }).click();
-  await rail.waitFor({ state: "visible", timeout: 3000 });
-  if ((await center.locator('[data-testid="repo-pill"]').count()) !== 0) {
-    throw new Error("重开右栏后中栏 RepoPill 未卸载");
-  }
-
-  writeFileSync(
-    join(shotDir, "manifest.json"),
-    JSON.stringify(
-      {
-        generatedAt: new Date().toISOString(),
-        outDir: shotDir,
-        shots: [
-          "context-rail--mobile--light.png",
-          "context-rail--mobile--dark.png",
-          "context-rail--desktop--light.png",
-          "context-rail--desktop--dark.png",
-        ],
-      },
-      null,
-      2,
-    ),
-  );
 
   if (DEFAULT_VIEWPORT) await page.setViewportSize(DEFAULT_VIEWPORT);
   await page.evaluate(() => document.documentElement.classList.remove("dark"));

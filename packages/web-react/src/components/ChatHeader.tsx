@@ -31,7 +31,6 @@ export function ChatHeader({
   unreadCount,
   theme,
   onCycleTheme,
-  onShowContext,
 }: {
   agent: Agent;
   onAgentClick: () => void;
@@ -67,8 +66,6 @@ export function ChatHeader({
   unreadCount?: number;
   theme: Theme;
   onCycleTheme: () => void;
-  /** xl 下用户隐藏右栏后的重开入口。省略则不渲染。 */
-  onShowContext?: () => void;
 }) {
   const low = credits != null && (credits.trim().startsWith("-") || /^-?0+$/.test(credits.trim()));
   // 团队模式说明弹层的受控开关：点「关闭团队模式」需要主动收起弹层（chip 随
@@ -156,11 +153,6 @@ export function ChatHeader({
         />
       )}
       <div className="ml-auto flex shrink-0 items-center gap-1.5">
-        {onShowContext && (
-          <Button data-product-control size="sm" variant="ghost" onClick={onShowContext}>
-            显示上下文
-          </Button>
-        )}
         {onOpenMediaTasks && (
           <IconButton data-product-control onClick={onOpenMediaTasks} aria-label="视频任务" title="视频任务" shape="square">
             <Film size={18} />
