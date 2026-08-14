@@ -190,13 +190,48 @@ describe("migrate.runMigrations", () => {
         ORDER BY c.model_id`,
     );
     assert.deepEqual(cursorModels.rows, [
-      { model_id: "cursor-auto", upstream_model_id: null, state: "staged", enabled: false, visibility: "admin" },
-      { model_id: "cursor-composer-2.5-fast", upstream_model_id: "composer-2.5-fast", state: "staged", enabled: false, visibility: "hidden" },
-      { model_id: "cursor-fable-5-high", upstream_model_id: "claude-fable-5-thinking-high", state: "staged", enabled: false, visibility: "hidden" },
-      { model_id: "cursor-grok-4.5-high", upstream_model_id: "cursor-grok-4.5-high", state: "staged", enabled: false, visibility: "hidden" },
-      { model_id: "cursor-grok-4.6-high", upstream_model_id: "cursor-grok-4.6-high", state: "staged", enabled: false, visibility: "hidden" },
-      { model_id: "cursor-opus-5-high", upstream_model_id: "claude-opus-5-thinking-high", state: "staged", enabled: false, visibility: "hidden" },
+      { model_id: "cursor-auto", upstream_model_id: null, state: "active", enabled: true, visibility: "hidden" },
+      { model_id: "cursor-composer-2.5-fast", upstream_model_id: "composer-2.5-fast", state: "active", enabled: true, visibility: "hidden" },
+      { model_id: "cursor-fable-5-high", upstream_model_id: "claude-fable-5-thinking-high", state: "active", enabled: true, visibility: "hidden" },
+      { model_id: "cursor-grok-4.5-high", upstream_model_id: "cursor-grok-4.5-high", state: "active", enabled: true, visibility: "hidden" },
+      { model_id: "cursor-grok-4.6-high", upstream_model_id: "cursor-grok-4.6-high", state: "active", enabled: true, visibility: "hidden" },
+      { model_id: "cursor-opus-5-high", upstream_model_id: "claude-opus-5-thinking-high", state: "active", enabled: true, visibility: "hidden" },
     ]);
+  });
+
+  test("0210 activates Cursor and grants only users 1/4 with append-only audit", async (t) => {
+    if (skipIfNoPg(t)) return;
+    await runBuiltInMigrationsThrough("0209_cursor_multimodel_shared_credential.sql");
+    await query(
+      `INSERT INTO users(id, email, email_verified, password_hash, role)
+       VALUES
+         (1, 'cursor-admin@example.com', TRUE, 'argon2$stub', 'admin'),
+         (4, 'cursor-user@example.com', TRUE, 'argon2$stub', 'user')`,
+    );
+    await query(
+      `INSERT INTO model_visibility_grants(user_id, model_id, granted_by)
+       VALUES (4, 'cursor-auto', 1)`,
+    );
+
+    const applied = await runBuiltInMigrationsThrough("0210_cursor_multimodel_activation.sql");
+    assert.deepEqual(applied.applied, ["0210_cursor_multimodel_activation"]);
+
+    const grants = await query<{ user_id: string; model_id: string }>(
+      `SELECT user_id::text AS user_id, model_id
+         FROM model_visibility_grants
+        WHERE model_id LIKE 'cursor-%'
+        ORDER BY user_id, model_id`,
+    );
+    assert.equal(grants.rows.length, 12);
+    assert.deepEqual(new Set(grants.rows.map((row) => row.user_id)), new Set(["1", "4"]));
+
+    const audit = await query<{ count: string }>(
+      `SELECT COUNT(*)::text AS count
+         FROM admin_audit
+        WHERE action = 'model_grant.add'
+          AND after->>'source' = 'migration:0210'`,
+    );
+    assert.equal(audit.rows[0].count, "11", "existing user4 Auto grant must not duplicate its audit");
   });
 
   test("running migrate again is idempotent (no duplicate inserts, no changes)", async (t) => {

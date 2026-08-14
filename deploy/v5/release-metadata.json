@@ -88,7 +88,8 @@
     "0206_community_tutorials",
     "0207_grok_build_admin_pool",
     "0208_cursor_engine",
-    "0209_cursor_multimodel_shared_credential"
+    "0209_cursor_multimodel_shared_credential",
+    "0210_cursor_multimodel_activation"
   ],
   "capabilities": [
     "sessions-store-pg-v1",
