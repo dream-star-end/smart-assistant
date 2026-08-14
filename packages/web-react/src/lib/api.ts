@@ -886,6 +886,38 @@ export type ContainerPreviewTicketResponse = {
   };
 };
 
+function decodeCanonicalBase64urlUtf8(value: string): string {
+  if (!/^[A-Za-z0-9_-]+$/.test(value) || value.length % 4 === 1) {
+    throw new Error("invalid immutable deferred payload record id encoding");
+  }
+  const padded = value.replace(/-/g, "+").replace(/_/g, "/") +
+    "=".repeat((4 - (value.length % 4)) % 4);
+  let binary = "";
+  try {
+    binary = atob(padded);
+  } catch {
+    throw new Error("invalid immutable deferred payload record id encoding");
+  }
+  const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+  let decoded = "";
+  try {
+    decoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw new Error("invalid immutable deferred payload record id encoding");
+  }
+  const canonical = btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  if (canonical !== value) {
+    throw new Error("invalid immutable deferred payload record id encoding");
+  }
+  return decoded;
+}
+
+function immutableRecordIdFromHeaders(headers: Headers): string {
+  const encoded = headers.get("x-openclaude-record-id-base64url");
+  if (encoded !== null) return decodeCanonicalBase64urlUtf8(encoded);
+  return headers.get("x-openclaude-record-id") ?? "";
+}
+
 /** Resolve immutable metadata with a one-byte Range GET, then assemble the
  * exact JSON with byte-range requests. A public proxy may transparently gzip a
  * HEAD response and rewrite Content-Length/ETag; a 206 range response preserves
@@ -910,7 +942,7 @@ export async function getExactDeferredPayload(
   );
   const totalBytes = rangeMatch ? Number(rangeMatch[1]) : Number.NaN;
   const contentSha256 = probe.headers.get("x-openclaude-content-sha256") ?? "";
-  const recordId = probe.headers.get("x-openclaude-record-id") ?? "";
+  const recordId = immutableRecordIdFromHeaders(probe.headers);
   const role = probe.headers.get("x-openclaude-record-role") ?? "";
   const probeEncoding = probe.headers.get("content-encoding")?.toLowerCase();
   if (
@@ -950,7 +982,7 @@ export async function getExactDeferredPayload(
       (rangeEncoding !== undefined && rangeEncoding !== "identity") ||
       res.headers.get("content-range") !== `bytes ${offset}-${end}/${totalBytes}` ||
       res.headers.get("x-openclaude-content-sha256") !== contentSha256 ||
-      res.headers.get("x-openclaude-record-id") !== recordId ||
+      immutableRecordIdFromHeaders(res.headers) !== recordId ||
       res.headers.get("x-openclaude-record-role") !== role
     ) {
       void res.body?.cancel().catch(() => {});

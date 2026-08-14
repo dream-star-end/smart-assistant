@@ -258,6 +258,7 @@ const PROXY_CAPS: EngineCapabilities = {
   supportsEffort: true,
   resumeKind: 'ccb-session',
   needsServerRequestId: false,
+  historyMode: 'native-resume',
 }
 
 class FakeRouteRunner extends EventEmitter {

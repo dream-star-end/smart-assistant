@@ -109,6 +109,7 @@ const CODEX_CAPS: EngineCapabilities = {
   supportsEffort: true,
   resumeKind: "codex-thread",
   needsServerRequestId: true,
+  historyMode: "native-resume",
 };
 
 const CCB_CAPS: EngineCapabilities = {
@@ -116,6 +117,7 @@ const CCB_CAPS: EngineCapabilities = {
   supportsEffort: true,
   resumeKind: "ccb-session",
   needsServerRequestId: false,
+  historyMode: "native-resume",
 };
 
 function makeSession(runner: FakeEngineAdapter): AgentSession {

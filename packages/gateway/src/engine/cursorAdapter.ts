@@ -2,6 +2,7 @@
  * Authentication remains exclusively inside the account-scoped oc-cursor
  * launcher; this adapter neither reads nor transports credentials. */
 import { spawn, type ChildProcessByStdio } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import type { Readable } from 'node:stream'
 import {
@@ -19,6 +20,7 @@ import { classifyRunError } from '../errorClassify.js'
 
 const REQUEST_ID_RE = /^[0-9a-f]{32}$/
 const EMPTY_SIGNALS: PhantomSignals = { apiState: 'unknown', skipReason: null }
+export const CURSOR_MAX_PROMPT_BYTES = 96 * 1024
 
 type CursorEvent = Record<string, unknown> & { type?: unknown }
 type ReportedUsage = { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number }
@@ -28,6 +30,8 @@ interface TurnCtx {
   tools: Map<string, TurnToolEntry>; pending: Set<string>; startedTools: Map<string, number>
   stderr: string; terminal: boolean; interrupted: boolean; error: string | null; usage?: ReportedUsage
   assistantPartialText: string; pendingAssistantText: string | null
+  assistantSegmentClosed: boolean; thinkingSegmentClosed: boolean
+  rawToSafeToolId: Map<string, string>; safeToRawToolId: Map<string, string>; fallbackToolSequence: number
   resolve: (value: TurnSummary | null) => void
 }
 
@@ -95,24 +99,140 @@ function snapshot(ctx: TurnCtx | null): PartialSnapshot {
 function toolCallOf(event: CursorEvent): Record<string, unknown> | null {
   return recordOf(event.tool_call ?? event.toolCall)
 }
-function toolNameOf(event: CursorEvent): string {
+function toolVariantOf(event: CursorEvent): { key: string; value: Record<string, unknown> } | null {
+  const call = toolCallOf(event)
+  if (!call) return null
+  for (const [key, value] of Object.entries(call)) {
+    const variant = recordOf(value)
+    if (/ToolCall$/.test(key) && variant) return { key, value: variant }
+  }
+  return null
+}
+function rawToolIdOf(event: CursorEvent): string {
+  const call = toolCallOf(event)
+  return textOf(
+    event.call_id ?? event.tool_call_id ?? event.toolCallId ?? event.id ??
+    call?.call_id ?? call?.tool_call_id ?? call?.toolCallId,
+  )
+}
+function cursorToolKindOf(event: CursorEvent): string {
   const direct = event.tool_name ?? event.toolName ?? event.name
   if (typeof direct === 'string' && direct) return direct
-  const call = toolCallOf(event); const nestedTool = recordOf(call?.tool)
+  const variant = toolVariantOf(event)
+  if (variant) return variant.key
+  const call = toolCallOf(event)
+  const nestedTool = recordOf(call?.tool)
   for (const candidate of [call?.name, call?.tool_name, call?.toolName, call?.type, nestedTool?.case]) {
     if (typeof candidate === 'string' && candidate) return candidate
   }
   return 'CursorTool'
 }
+function toolNameOf(event: CursorEvent): string {
+  const kind = cursorToolKindOf(event)
+  if (kind === 'shellToolCall') return 'Bash'
+  if (kind === 'readToolCall') return 'Read'
+  if (kind === 'globToolCall') return 'Glob'
+  return 'CursorTool'
+}
+function toolInputOf(event: CursorEvent): unknown {
+  const call = toolCallOf(event)
+  const variant = toolVariantOf(event)
+  const source = variant?.value ?? call ?? {}
+  const args = recordOf(source.args) ?? source
+  const kind = cursorToolKindOf(event)
+  if (kind === 'shellToolCall') {
+    return { command: textOf(args.command ?? call?.command ?? event.input) }
+  }
+  if (kind === 'readToolCall') {
+    const filePath = textOf(args.path ?? args.file_path ?? call?.path)
+    return {
+      file_path: filePath,
+      ...(nonnegative(args.offset) !== undefined ? { offset: nonnegative(args.offset) } : {}),
+      ...(nonnegative(args.limit) !== undefined ? { limit: nonnegative(args.limit) } : {}),
+    }
+  }
+  if (kind === 'globToolCall') {
+    return {
+      pattern: textOf(args.globPattern ?? args.pattern ?? call?.globPattern),
+      path: textOf(args.targetDirectory ?? args.path ?? call?.targetDirectory),
+    }
+  }
+  return event.input ?? event.rawInput ?? event.arguments ?? variant?.value ?? call ?? {}
+}
+function toolResultValueOf(event: CursorEvent): unknown {
+  const call = toolCallOf(event)
+  const variant = toolVariantOf(event)
+  return event.output ?? event.rawOutput ?? variant?.value.result ?? call?.result ?? event.result ?? event.content ?? call ?? ''
+}
+function failureValueOf(value: unknown): unknown {
+  const result = recordOf(value)
+  if (!result) return undefined
+  return result.error ?? result.failure ?? result.rejected
+}
 function toolFailed(event: CursorEvent): boolean {
-  const call = toolCallOf(event); const result = recordOf(call?.result)
-  const status = textOf(event.status ?? call?.status ?? result?.case).toLowerCase()
-  return event.is_error === true || ['error', 'failed', 'failure'].includes(status)
+  const call = toolCallOf(event)
+  const variant = toolVariantOf(event)
+  const resultValue = toolResultValueOf(event)
+  const result = recordOf(resultValue)
+  const statuses = [
+    event.status,
+    event.subtype,
+    call?.status,
+    variant?.value.status,
+    result?.case,
+    result?.status,
+  ].map((value) => textOf(value).toLowerCase())
+  return event.is_error === true ||
+    failureValueOf(resultValue) !== undefined ||
+    failureValueOf(variant?.value.result) !== undefined ||
+    failureValueOf(call?.result) !== undefined ||
+    statuses.some((status) => ['error', 'failed', 'failure', 'rejected'].includes(status))
+}
+function toolOutputOf(event: CursorEvent): { output: string; outputJson: unknown } {
+  const call = toolCallOf(event)
+  const variant = toolVariantOf(event)
+  const rawResult = toolResultValueOf(event)
+  const result = recordOf(rawResult)
+  const failed =
+    failureValueOf(rawResult) ??
+    failureValueOf(variant?.value.result) ??
+    failureValueOf(call?.result) ??
+    failureValueOf(event.result)
+  if (failed !== undefined) return { output: textOf(failed), outputJson: structuredClone(failed) }
+  const success = recordOf(result?.success) ?? result
+  const source = success ?? variant?.value ?? call ?? {}
+  const kind = cursorToolKindOf(event)
+  if (kind === 'shellToolCall') {
+    const stdout = textOf(source.stdout ?? variant?.value.stdout ?? call?.stdout)
+    const stderr = textOf(source.stderr ?? variant?.value.stderr ?? call?.stderr)
+    const output = [stdout, stderr].filter(Boolean).join(stdout && stderr ? '\n' : '')
+    const outputJson = { ...(stdout ? { stdout } : {}), ...(stderr ? { stderr } : {}) }
+    return { output: output || textOf(rawResult), outputJson }
+  }
+  if (kind === 'readToolCall') {
+    const content = source.content ?? variant?.value.content ?? call?.content ?? rawResult
+    return { output: textOf(content), outputJson: structuredClone(content) }
+  }
+  if (kind === 'globToolCall') {
+    const files = source.files ?? variant?.value.files ?? call?.files ?? rawResult
+    return {
+      output: Array.isArray(files) ? files.map(textOf).join('\n') : textOf(files),
+      outputJson: structuredClone(files),
+    }
+  }
+  return { output: textOf(rawResult), outputJson: structuredClone(rawResult) }
 }
 
 export class CursorAdapter extends EventEmitter implements EngineAdapter {
   readonly engineId = 'cursor'
-  readonly capabilities: EngineCapabilities = { billingMode: 'external', supportsEffort: false, resumeKind: 'cursor-session', needsServerRequestId: true }
+  readonly capabilities: EngineCapabilities = {
+    billingMode: 'external',
+    supportsEffort: false,
+    resumeKind: 'cursor-session',
+    needsServerRequestId: true,
+    historyMode: 'stateless-replay',
+    maxPromptBytes: CURSOR_MAX_PROMPT_BYTES,
+  }
   private readonly opts: EngineCreateOpts
   private active: TurnCtx | null = null
   private currentModel: string | undefined
@@ -127,7 +247,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
   submitTurn(params: TurnParams): EngineTurnRun {
     let resolve!: (value: TurnSummary | null) => void
     const summary = new Promise<TurnSummary | null>((r) => { resolve = r })
-    const ctx: TurnCtx = { params, startedAt: Date.now(), proc: null, assistantText: '', thinkingText: '', assistantSegments: [], thinkingSegments: [], tools: new Map(), pending: new Set(), startedTools: new Map(), stderr: '', terminal: false, interrupted: false, error: null, assistantPartialText: '', pendingAssistantText: null, resolve }
+    const ctx: TurnCtx = { params, startedAt: Date.now(), proc: null, assistantText: '', thinkingText: '', assistantSegments: [], thinkingSegments: [], tools: new Map(), pending: new Set(), startedTools: new Map(), stderr: '', terminal: false, interrupted: false, error: null, assistantPartialText: '', pendingAssistantText: null, assistantSegmentClosed: false, thinkingSegmentClosed: false, rawToSafeToolId: new Map(), safeToRawToolId: new Map(), fallbackToolSequence: 0, resolve }
     this.active = ctx; this.lastActivityAt = Date.now(); this.drain = new Promise((r) => { this.resolveDrain = r })
     const submitted = this.spawnTurn(ctx).catch((err) => { if (!ctx.terminal) this.finish(ctx, String(err)); this.resolveDrain?.(); this.resolveDrain = null; if (this.active === ctx) this.active = null; throw err })
     return { submitted, summary, end: () => this.forceEnd(ctx), getPartialSnapshot: () => snapshot(ctx), getPhantomSignals: () => ({ ...EMPTY_SIGNALS }), get finalized() { return ctx.terminal }, get pendingToolCalls() { return ctx.pending.size } }
@@ -138,9 +258,13 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     const bin = process.env.OC_CURSOR_WRAPPER_BIN?.trim() || '/usr/local/bin/oc-cursor'
     const selected = CURSOR_ENGINE_MODELS.find((model) => model.id === this.currentModel)
     if (!selected) throw new Error(`Cursor model '${String(this.currentModel)}' is not allowlisted`)
+    const prompt = promptOf(ctx.params.input)
+    if (Buffer.byteLength(prompt, 'utf8') > CURSOR_MAX_PROMPT_BYTES) {
+      throw new Error('PROMPT_TOO_LONG: engine prompt transport limit exceeded')
+    }
     const args = [
       ...(selected.upstreamModel === null ? [] : ['--model', selected.upstreamModel]),
-      '--mode', 'ask', '--', promptOf(ctx.params.input),
+      '--mode', 'ask', '--', prompt,
     ]
     const env = { ...process.env }
     for (const key of Object.keys(env)) if (key.startsWith('CURSOR_')) delete env[key]
@@ -155,10 +279,17 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
   private emitText(ctx: TurnCtx, kind: 'text' | 'thinking', value: unknown): void {
     const valueText = textOf(value); if (!valueText) return
     const segments = kind === 'text' ? ctx.assistantSegments : ctx.thinkingSegments
-    const current = segments.at(-1); if (!current) segments.push({ index: 0, text: '', ts: Date.now(), eventOrdinal: ctx.params.nextDurableEventOrdinal?.() })
-    segments.at(-1)!.text += valueText
+    const segmentClosed = kind === 'text' ? ctx.assistantSegmentClosed : ctx.thinkingSegmentClosed
+    if (!segments.at(-1) || segmentClosed) {
+      segments.push({ index: segments.length, text: '', ts: Date.now(), eventOrdinal: ctx.params.nextDurableEventOrdinal?.() })
+      if (kind === 'text') ctx.assistantSegmentClosed = false
+      else ctx.thinkingSegmentClosed = false
+    }
+    const segment = segments.at(-1)!
+    segment.text += valueText
     if (kind === 'text') ctx.assistantText += valueText; else ctx.thinkingText += valueText
-    ctx.params.onEvent({ kind: 'block', block: { kind, text: valueText, ...(kind === 'text' && ctx.params.assistantMessageId ? { messageId: ctx.params.assistantMessageId } : {}), ...(kind === 'thinking' && ctx.params.thinkingMessageId ? { messageId: ctx.params.thinkingMessageId } : {}) } })
+    const messageIdBase = kind === 'text' ? ctx.params.assistantMessageId : ctx.params.thinkingMessageId
+    ctx.params.onEvent({ kind: 'block', block: { kind, text: valueText, ...(messageIdBase ? { messageId: `${messageIdBase}-s${segment.index}` } : {}) } })
   }
   private handleLine(ctx: TurnCtx, line: string): void {
     let event: CursorEvent
@@ -198,20 +329,49 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     if (aggregateBoundary) { ctx.assistantPartialText = ''; return }
     ctx.assistantPartialText += value; this.emitText(ctx, 'text', value)
   }
-  private toolStart(ctx: TurnCtx, event: CursorEvent): void {
-    const id = textOf(event.call_id ?? event.tool_call_id ?? event.toolCallId ?? event.id) || `cursor-tool-${ctx.tools.size + 1}`
-    const name = toolNameOf(event); const input = event.input ?? event.rawInput ?? event.arguments ?? event.tool_call ?? {}
+  private safeToolId(ctx: TurnCtx, rawId: string): string {
+    const existing = ctx.rawToSafeToolId.get(rawId)
+    if (existing) return existing
+    for (let counter = 0; ; counter += 1) {
+      const digest = createHash('sha256')
+        .update(`openclaude:cursor-tool-id:v1:${counter}:${rawId}`)
+        .digest('hex')
+      const candidate = `cursor-tool-${digest}`
+      const owner = ctx.safeToRawToolId.get(candidate)
+      if (owner !== undefined && owner !== rawId) continue
+      ctx.rawToSafeToolId.set(rawId, candidate)
+      ctx.safeToRawToolId.set(candidate, rawId)
+      return candidate
+    }
+  }
+  private nextFallbackToolId(ctx: TurnCtx): string {
+    ctx.fallbackToolSequence += 1
+    return `generated:${ctx.fallbackToolSequence}`
+  }
+  private closeContentSegments(ctx: TurnCtx): void {
+    ctx.assistantPartialText = ''
+    ctx.pendingAssistantText = null
+    ctx.assistantSegmentClosed = ctx.assistantSegments.length > 0
+    ctx.thinkingSegmentClosed = ctx.thinkingSegments.length > 0
+  }
+  private toolStart(ctx: TurnCtx, event: CursorEvent, rawIdOverride?: string): void {
+    const rawId = rawIdOverride ?? (rawToolIdOf(event) || this.nextFallbackToolId(ctx))
+    const id = this.safeToolId(ctx, rawId)
+    const name = toolNameOf(event); const input = toolInputOf(event)
     if (ctx.tools.has(id)) return
+    this.flushPendingAssistant(ctx, false)
+    this.closeContentSegments(ctx)
     const tool: TurnToolEntry = { toolUseId: id, blockId: id, toolName: name, inputJson: structuredClone(input), inputPreview: textOf(input).slice(0, 500), output: '', completed: false, isError: false, durationMs: 0, ts: Date.now(), arrivedAt: Date.now(), eventOrdinal: ctx.params.nextDurableEventOrdinal?.() }
     ctx.tools.set(id, tool); ctx.pending.add(id); ctx.startedTools.set(id, Date.now()); ctx.params.toolUseIdToName.set(id, name)
     const block: OutboundContentBlock = { kind: 'tool_use', blockId: id, toolName: name, inputJson: structuredClone(input), inputPreview: tool.inputPreview, partial: false }
     ctx.params.onEvent({ kind: 'block', block }); ctx.params.onEvent({ kind: 'tool_use_detected', tool: { name, id, input: input && typeof input === 'object' ? structuredClone(input) as Record<string, any> : {} } })
   }
   private toolResult(ctx: TurnCtx, event: CursorEvent): void {
-    const id = textOf(event.call_id ?? event.tool_call_id ?? event.toolCallId ?? event.id); if (!id) return
-    if (!ctx.tools.has(id)) this.toolStart(ctx, event)
+    const rawId = rawToolIdOf(event) || this.nextFallbackToolId(ctx)
+    const id = this.safeToolId(ctx, rawId)
+    if (!ctx.tools.has(id)) this.toolStart(ctx, event, rawId)
     const tool = ctx.tools.get(id)!; if (tool.completed) return
-    const outputJson = event.output ?? event.rawOutput ?? event.result ?? event.content ?? event.tool_call ?? ''; const output = textOf(outputJson); const isError = toolFailed(event)
+    const { output, outputJson } = toolOutputOf(event); const isError = toolFailed(event)
     Object.assign(tool, { output, outputJson: structuredClone(outputJson), completed: true, isError, durationMs: Date.now() - (ctx.startedTools.get(id) ?? Date.now()), ts: Date.now() }); ctx.pending.delete(id)
     ctx.params.onEvent({ kind: 'block', block: { kind: 'tool_result', toolUseBlockId: id, toolName: tool.toolName, isError, output, outputJson: structuredClone(outputJson), preview: output.slice(0, 500) } }); ctx.params.onEvent({ kind: 'tool_result_detected', result: { toolUseId: id, toolName: tool.toolName, preview: output.slice(0, 500), isError, durationMs: tool.durationMs, inputPreview: tool.inputPreview } })
   }
