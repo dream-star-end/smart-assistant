@@ -92,7 +92,8 @@
     "0210_cursor_multimodel_activation",
     "0211_stage_glm53_opencode_flash",
     "0212_public_glm53_opencode_flash",
-    "0213_glm53_default_transition"
+    "0213_glm53_default_transition",
+    "0214_disable_legacy_models"
   ],
   "capabilities": [
     "sessions-store-pg-v1",
