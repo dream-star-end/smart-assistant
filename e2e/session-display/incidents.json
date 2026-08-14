@@ -1387,7 +1387,8 @@
         }
       ],
       "coverageCommits": [
-        "35defe79"
+        "35defe79",
+        "96b40ae5"
       ]
     }
   ]
