@@ -36,6 +36,15 @@ function makeManager() {
   return sm
 }
 
+function recordNativePrewarmId(sm: InstanceType<typeof SessionManager>, key: string, id: string) {
+  const session = (sm as any).sessions.get(key)
+  session.runner.emit('session_id', id)
+  // makeManager stubs _saveResumeMap; mirror its synchronous in-memory overlay.
+  ;(sm as any)._resumeMap.set(key, id)
+  assert.equal(session.ccbSessionId, id)
+  assert.equal((sm as any)._resumeMapProvider.get(key), 'codex')
+}
+
 const agent = { id: 'main', model: 'gpt-5.6-sol' } as any
 
 after(async () => {
@@ -43,7 +52,7 @@ after(async () => {
   await rm(testHome, { recursive: true, force: true })
 })
 
-test('switching an untouched default-engine prewarm to Cursor creates no rebuild notice', async () => {
+test('switching an untouched Codex prewarm with a native thread id to Cursor creates no rebuild notice', async () => {
   const sm = makeManager()
   const key = 'agent:main:webchat:dm:fresh-prewarm-cursor'
   const prewarmed = await sm.getOrCreate({
@@ -54,6 +63,9 @@ test('switching an untouched default-engine prewarm to Cursor creates no rebuild
     model: 'gpt-5.6-sol',
   })
   assert.equal(prewarmed.turns, 0)
+  assert.equal(await hasPersistedTurnActivity([key]), false)
+  recordNativePrewarmId(sm, key, 'codex-prewarm-thread-without-turn')
+  assert.equal((sm as any)._resumeMap.get(key), 'codex-prewarm-thread-without-turn')
   assert.equal(await hasPersistedTurnActivity([key]), false)
 
   const cursor = await sm.getOrCreate({
@@ -79,6 +91,8 @@ test('a durable turn reservation preserves the switch notice before async FTS in
     model: 'gpt-5.6-sol',
   })
   assert.equal(prewarmed.turns, 0)
+  recordNativePrewarmId(sm, key, 'codex-thread-with-reserved-turn')
+  assert.equal((sm as any)._resumeMap.get(key), 'codex-thread-with-reserved-turn')
 
   assert.equal(await reserveTurnIndex(key), 1)
   assert.equal(await getMaxTurnIdx([key]), 0, 'the async FTS projection is intentionally absent')

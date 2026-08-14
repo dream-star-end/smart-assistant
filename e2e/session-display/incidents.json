@@ -1383,7 +1383,7 @@
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/sessionContextRebuildNoticeLifecycle.test.ts",
-          "assertion": "switching an untouched default-engine prewarm to Cursor creates no rebuild notice"
+          "assertion": "switching an untouched Codex prewarm with a native thread id to Cursor creates no rebuild notice"
         },
         {
           "layer": "deploy-gate",
@@ -1394,7 +1394,8 @@
       "coverageCommits": [
         "35defe79",
         "96b40ae5",
-        "dd86a3e8"
+        "dd86a3e8",
+        "793ad326"
       ]
     }
   ]
