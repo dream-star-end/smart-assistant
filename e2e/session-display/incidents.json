@@ -1382,6 +1382,21 @@
         },
         {
           "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorAdapter.test.ts",
+          "assertion": "rebuilds platform and MCP context for every stateless turn on one adapter"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorAdapter.test.ts",
+          "assertion": "maps every canonical model to its exact controlled CLI argument"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/cursorCliWrapper.test.ts",
+          "assertion": "copies one validated adapter MCP config, approves it, and unsets the source env"
+        },
+        {
+          "layer": "unit",
           "path": "packages/gateway/src/__tests__/sessionContextRebuildNoticeLifecycle.test.ts",
           "assertion": "switching an untouched Codex prewarm with a native thread id to Cursor creates no rebuild notice"
         },
@@ -1401,7 +1416,8 @@
         "96b40ae5",
         "dd86a3e8",
         "793ad326",
-        "523c09af"
+        "523c09af",
+        "ba962e0c"
       ]
     }
   ]

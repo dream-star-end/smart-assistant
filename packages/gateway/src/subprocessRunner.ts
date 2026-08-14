@@ -17,6 +17,7 @@ import {
   getModelCatalogClient,
 } from './modelCatalogClient.js'
 import { buildPromptContext } from './promptSlots.js'
+import { resolveMcpMemoryEntry } from './mcpMemoryEntry.js'
 import type { ExecutionTarget } from './remoteTarget.js'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 import { type TerminalBackend, createBackend } from './terminalBackend.js'
@@ -481,27 +482,6 @@ export function buildHostSpawnProviderEnv(input: HostSpawnProviderEnvInput): Hos
   // settings.json / 容器 proxy env 掌权;secondary 走全局 deepseek-v4-flash(容器可达)。
   Object.assign(providerEnv, _buildSecondaryUtilityModelEnv())
   return { env: providerEnv, routing: 'settings-default' }
-}
-
-/** Three-candidate fallback for resolving the bundled `openclaude-memory`
- *  MCP server entry path. Returns the first existing absolute path, or `null`
- *  if none exist (caller decides whether to log+skip or fall back to no MCP).
- *
- *  @param claudeCodePath Optional CCB install root. Used to construct the
- *    third candidate (the path inside the v3 commercial container image). */
-export function resolveMcpMemoryEntry(claudeCodePath?: string): string | null {
-  const moduleDir = new URL('.', import.meta.url).pathname.replace(/^\/([A-Za-z]):/, '$1:')
-  const candidates: string[] = [
-    resolve(moduleDir, '../../mcp-memory/src/index.ts'),
-    resolve(process.cwd(), 'packages/mcp-memory/src/index.ts'),
-  ]
-  if (claudeCodePath) {
-    candidates.push(resolve(claudeCodePath, '..', 'openclaude/packages/mcp-memory/src/index.ts'))
-  }
-  for (const c of candidates) {
-    if (existsSync(c)) return c
-  }
-  return null
 }
 
 /** Resolve the built-in OpenClaude vision MCP entry used by CCB text-only

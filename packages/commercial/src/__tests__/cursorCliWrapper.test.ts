@@ -1,6 +1,17 @@
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  chmodSync,
+  chownSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
@@ -47,7 +58,11 @@ set -eu
 [ -n "\${CURSOR_API_KEY:-}" ]
 printf '%s\\n' "$HOME" > "$OC_CURSOR_TEST_CAPTURE/home"
 printf '%s\\n' "$@" > "$OC_CURSOR_TEST_CAPTURE/argv"
-mkdir -p "$HOME/.config/cursor"
+printf '%s\\n' "\${OPENCLAUDE_CURSOR_MCP_CONFIG-unset}" > "$OC_CURSOR_TEST_CAPTURE/mcp-env"
+if [ -f "$HOME/.cursor/mcp.json" ]; then
+  /bin/cp "$HOME/.cursor/mcp.json" "$OC_CURSOR_TEST_CAPTURE/mcp.json"
+fi
+/bin/mkdir -p "$HOME/.config/cursor"
 printf '%s\\n' "\${CURSOR_API_KEY}" > "$HOME/.config/cursor/auth.json"
 if [ "\${OC_CURSOR_TEST_SLEEP:-0}" = 1 ]; then
   trap 'printf term > "$OC_CURSOR_TEST_CAPTURE/term"; exit 143' TERM
@@ -110,7 +125,10 @@ describe('oc-cursor wrapper', () => {
     assert.match(source, /chmod -R a-w "\$install_root"/)
     assert.match(source, /cursor-agent --version/)
     assert.match(buildSource, /CURSOR_AGENT_VERSION="2026\.08\.11-e8db854"/)
-    assert.match(wrapperSource, /\/usr\/bin\/sudo -n \/usr\/bin\/test -f "\$auth_file" 2>\/dev\/null/)
+    assert.match(
+      wrapperSource,
+      /\/usr\/bin\/sudo -n \/usr\/bin\/test -f "\$auth_file" 2>\/dev\/null/,
+    )
     assert.doesNotMatch(wrapperSource, /\[ -e "\$auth_file" \]/)
     assert.match(
       buildSource,
@@ -124,7 +142,17 @@ describe('oc-cursor wrapper', () => {
     const f = fixture()
     const result = spawnSync(
       f.wrapper,
-      ['--model', 'composer-2.5-fast', '--mode', 'plan', '--force', '--', 'inspect', 'this', 'diff'],
+      [
+        '--model',
+        'composer-2.5-fast',
+        '--mode',
+        'plan',
+        '--force',
+        '--',
+        'inspect',
+        'this',
+        'diff',
+      ],
       { cwd: f.dir, env: f.env, encoding: 'utf8' },
     )
     assert.equal(result.status, 0, result.stderr)
@@ -157,6 +185,62 @@ describe('oc-cursor wrapper', () => {
     assert.ok(ephemeralHome.startsWith('/tmp/openclaude-cursor.'))
     assert.equal(spawnSync('test', ['!', '-e', ephemeralHome]).status, 0)
     assert.doesNotMatch(readFileSync(join(f.capture, 'argv'), 'utf8'), /crsr_dummy/)
+  })
+
+  test('copies one validated adapter MCP config, approves it, and unsets the source env', () => {
+    const f = fixture()
+    const config = join(f.dir, 'adapter-mcp.json')
+    const sentinel = join(f.dir, 'source-parent-sentinel')
+    const body = '{"mcpServers":{"openclaude-memory":{"command":"npx"}}}\n'
+    writeFileSync(config, body, { mode: 0o600 })
+    chmodSync(config, 0o600)
+    writeFileSync(sentinel, 'keep')
+
+    const result = spawnSync(f.wrapper, ['--', 'use platform skill'], {
+      cwd: f.dir,
+      env: { ...f.env, OPENCLAUDE_CURSOR_MCP_CONFIG: config },
+      encoding: 'utf8',
+    })
+    assert.equal(result.status, 0, result.stderr)
+    const argv = readFileSync(join(f.capture, 'argv'), 'utf8').trim().split('\n')
+    assert.ok(argv.includes('--approve-mcps'))
+    assert.equal(readFileSync(join(f.capture, 'mcp.json'), 'utf8'), body)
+    assert.equal(readFileSync(join(f.capture, 'mcp-env'), 'utf8').trim(), 'unset')
+    assert.equal(statSync(config).mode & 0o777, 0o600)
+    assert.equal(readFileSync(sentinel, 'utf8'), 'keep')
+  })
+
+  test('rejects relative, symlinked, loose-mode, and foreign-owned MCP configs', () => {
+    const f = fixture()
+    const valid = join(f.dir, 'valid-mcp.json')
+    const symlink = join(f.dir, 'symlink-mcp.json')
+    const loose = join(f.dir, 'loose-mcp.json')
+    writeFileSync(valid, '{}\n', { mode: 0o600 })
+    symlinkSync(valid, symlink)
+    writeFileSync(loose, '{}\n', { mode: 0o640 })
+    chmodSync(loose, 0o640)
+
+    const cases: Array<[string, RegExp]> = [
+      ['relative-mcp.json', /must be absolute/],
+      [symlink, /must not be a symlink/],
+      [loose, /mode must be 0600/],
+    ]
+    if (typeof process.getuid === 'function' && process.getuid() === 0) {
+      const foreign = join(f.dir, 'foreign-mcp.json')
+      writeFileSync(foreign, '{}\n', { mode: 0o600 })
+      chownSync(foreign, 65534, 65534)
+      cases.push([foreign, /owner is invalid/])
+    }
+    for (const [config, message] of cases) {
+      const result = spawnSync(f.wrapper, ['--', 'hello'], {
+        cwd: f.dir,
+        env: { ...f.env, OPENCLAUDE_CURSOR_MCP_CONFIG: config },
+        encoding: 'utf8',
+      })
+      assert.equal(result.status, 2, config)
+      assert.match(result.stderr, message)
+    }
+    assert.equal(existsSync(valid), true)
   })
 
   test('fails closed without a mount and rejects caller-controlled auth or endpoint flags', () => {
@@ -218,7 +302,20 @@ describe('oc-cursor wrapper', () => {
 
   test('ignores user-writable PATH shims for every security-sensitive executable', () => {
     const f = fixture()
-    for (const name of ['readlink', 'dirname', 'sudo', 'cat', 'mktemp', 'rm', 'setsid']) {
+    for (const name of [
+      'readlink',
+      'dirname',
+      'sudo',
+      'cat',
+      'mktemp',
+      'rm',
+      'setsid',
+      'stat',
+      'id',
+      'mkdir',
+      'cp',
+      'chmod',
+    ]) {
       const marker = join(f.capture, `path-hijack-${name}`)
       const shim = join(f.dir, 'bin', name)
       writeFileSync(shim, `#!/bin/sh\nprintf invoked > ${marker}\nexit 97\n`, { mode: 0o755 })
@@ -230,7 +327,20 @@ describe('oc-cursor wrapper', () => {
       encoding: 'utf8',
     })
     assert.equal(result.status, 0, result.stderr)
-    for (const name of ['readlink', 'dirname', 'sudo', 'cat', 'mktemp', 'rm', 'setsid']) {
+    for (const name of [
+      'readlink',
+      'dirname',
+      'sudo',
+      'cat',
+      'mktemp',
+      'rm',
+      'setsid',
+      'stat',
+      'id',
+      'mkdir',
+      'cp',
+      'chmod',
+    ]) {
       assert.equal(
         spawnSync('test', ['!', '-e', join(f.capture, `path-hijack-${name}`)]).status,
         0,

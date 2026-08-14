@@ -1,27 +1,66 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { chmod, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, test } from 'node:test'
 import type { OpenClaudeConfig } from '@openclaude/storage'
-import { CursorAdapter } from '../engine/cursorAdapter.js'
+import {
+  CURSOR_MAX_PLATFORM_ENVELOPE_BYTES,
+  CURSOR_MAX_PROMPT_ARG_BYTES,
+  CURSOR_MAX_TURN_PAYLOAD_BYTES,
+  CursorAdapter,
+  _internals,
+} from '../engine/cursorAdapter.js'
 import type { EngineEvent, EngineExternalBillingEvent } from '../engine/engineEvents.js'
 import type { EngineCreateOpts } from '../engine/registry.js'
 
 const REQUEST = 'b'.repeat(32)
+const GATEWAY_SECRET = 'gateway_secret_must_only_be_in_token_file'
+const AMBIENT_SECRET_KEYS = [
+  'OPENCLAUDE_V3_CONTAINER_TOKEN',
+  'ANTHROPIC_API_KEY',
+  'CURSOR_API_KEY',
+  'DATABASE_URL',
+  'MINIMAX_API_KEY',
+] as const
 function opts(cwd: string, model = 'cursor-auto'): EngineCreateOpts {
   return {
     sessionKey: 'agent:main:webchat:dm:cursor-test',
     agentId: 'main',
     agentBaseDir: cwd,
-    config: { defaults: { model: 'cursor-auto' } } as OpenClaudeConfig,
+    config: {
+      version: 1,
+      gateway: { bind: '127.0.0.1', port: 18789, accessToken: GATEWAY_SECRET },
+      auth: { mode: 'api_key', claudeCodePath: cwd },
+      defaults: { model: 'cursor-auto', permissionMode: 'default' },
+    } as OpenClaudeConfig,
+    persona: path.join(cwd, 'persona.md'),
+    permissionMode: 'bypassPermissions',
     model,
   } as EngineCreateOpts
 }
 function restoreEnv(name: string, value: string | undefined): void {
   if (value === undefined) Reflect.deleteProperty(process.env, name)
   else process.env[name] = value
+}
+async function createBaselineSkills(root: string): Promise<string> {
+  const baselineRoot = path.join(root, 'baseline-skills')
+  const skillDir = path.join(baselineRoot, 'skill-search')
+  await mkdir(skillDir, { recursive: true })
+  await writeFile(
+    path.join(skillDir, 'SKILL.md'),
+    [
+      '---',
+      'name: skill-search',
+      'description: "Search the OpenClaude skill catalog"',
+      'version: 1.0.0',
+      '---',
+      '',
+      '# skill-search',
+    ].join('\n'),
+  )
+  return baselineRoot
 }
 
 describe('CursorAdapter', () => {
@@ -30,10 +69,24 @@ describe('CursorAdapter', () => {
     const fake = path.join(dir, 'fake.cjs')
     const capture = path.join(dir, 'capture.json')
     const sentinel = 'crsr_secret_must_not_leak'
+    await writeFile(path.join(dir, 'persona.md'), 'CURSOR_PERSONA_MARKER')
+    const baselineSkills = await createBaselineSkills(dir)
     await writeFile(
       fake,
       `#!/usr/bin/env node
-const fs=require('node:fs'); fs.writeFileSync(process.env.CAPTURE,JSON.stringify({argv:process.argv.slice(2),key:process.env.CURSOR_API_KEY}))
+const fs=require('node:fs'); const crypto=require('node:crypto');
+const configPath=process.env.OPENCLAUDE_CURSOR_MCP_CONFIG;
+const configText=fs.readFileSync(configPath,'utf8'); const config=JSON.parse(configText);
+const mcpEnv=config.mcpServers['openclaude-memory'].env; const tokenFile=mcpEnv.OPENCLAUDE_GATEWAY_TOKEN_FILE;
+fs.writeFileSync(${JSON.stringify(capture)},JSON.stringify({
+  argv:process.argv.slice(2), key:process.env.CURSOR_API_KEY,
+  gatewayTokenEnv:process.env.OPENCLAUDE_GATEWAY_TOKEN, configPath, configText, config,
+  ambientSecrets:Object.fromEntries(${JSON.stringify(AMBIENT_SECRET_KEYS)}.map((name)=>[name,process.env[name]])),
+  agentId:process.env.OC_AGENT_ID, sessionKey:process.env.OC_SESSION_KEY, path:process.env.PATH,
+  tokenHash:crypto.createHash('sha256').update(fs.readFileSync(tokenFile)).digest('hex'),
+  configMode:fs.statSync(configPath).mode & 0o777, tokenMode:fs.statSync(tokenFile).mode & 0o777,
+  contextMode:fs.statSync(require('node:path').dirname(configPath)).mode & 0o777,
+}))
 for(const e of [
   {type:'system',subtype:'init',apiKeySource:'env',model:'Auto'},
   {type:'thinking',subtype:'delta',text:'think'},
@@ -48,19 +101,34 @@ for(const e of [
     )
     await chmod(fake, 0o755)
     const oldBin = process.env.OC_CURSOR_WRAPPER_BIN
-    const oldCapture = process.env.CAPTURE
-    const oldSecret = process.env.CURSOR_API_KEY
+    const oldBaselineSkills = process.env.OPENCLAUDE_BASELINE_SKILLS_DIR
+    const oldAmbientSecrets = Object.fromEntries(
+      AMBIENT_SECRET_KEYS.map((key) => [key, process.env[key]]),
+    ) as Record<(typeof AMBIENT_SECRET_KEYS)[number], string | undefined>
     process.env.OC_CURSOR_WRAPPER_BIN = fake
-    process.env.CAPTURE = capture
-    process.env.CURSOR_API_KEY = sentinel
+    process.env.OPENCLAUDE_BASELINE_SKILLS_DIR = baselineSkills
+    for (const key of AMBIENT_SECRET_KEYS) process.env[key] = `${sentinel}_${key}`
     try {
-      const adapter = new CursorAdapter(opts(dir))
+      const adapterOpts = opts(dir)
+      adapterOpts.sessionId = 'cursor-repo-session'
+      adapterOpts.getRepoSnapshot = () => ({
+        status: 'ready',
+        selectionVersion: 1,
+        owner: 'example',
+        repo: 'context-repo',
+        branch: 'main',
+        workspaceDir: dir,
+        headSha: '1234567890abcdef',
+        errorCode: null,
+        errorMessage: null,
+      })
+      const adapter = new CursorAdapter(adapterOpts)
       const events: EngineEvent[] = []
       const billing: EngineExternalBillingEvent[] = []
       adapter.on('external_billing', (event) => billing.push(event))
       adapter.on('error', () => {})
       const run = adapter.submitTurn({
-        input: `do not expose ${sentinel}`,
+        input: 'plain cursor turn payload',
         requestId: REQUEST,
         onEvent: (event) => events.push(event),
         sessionTotals: { totalCostUSD: 0, turns: 0 },
@@ -95,15 +163,132 @@ for(const e of [
         .join('')
       assert.equal(text, 'CURSOR_OK')
       const launched = JSON.parse(await readFile(capture, 'utf8'))
-      assert.deepEqual(launched.argv.slice(0, 3), ['--mode', 'ask', '--'])
+      assert.deepEqual(launched.argv.slice(0, 2), ['--force', '--'])
+      assert.equal(launched.argv.includes('--mode'), false)
       assert.equal(launched.argv.includes('--model'), false)
       assert.equal(launched.argv.includes('--output-format'), false)
       assert.equal(launched.key, undefined)
+      assert.equal(launched.gatewayTokenEnv, undefined)
+      assert.deepEqual(launched.ambientSecrets, {})
+      assert.equal(launched.agentId, 'main')
+      assert.equal(launched.sessionKey, 'agent:main:webchat:dm:cursor-test')
+      assert.equal(launched.path, '/usr/local/bin:/usr/bin:/bin')
+      assert.equal(launched.configMode, 0o600)
+      assert.equal(launched.tokenMode, 0o600)
+      assert.equal(launched.contextMode, 0o700)
+      assert.equal(launched.tokenHash, createHash('sha256').update(GATEWAY_SECRET).digest('hex'))
+      assert.deepEqual(Object.keys(launched.config), ['mcpServers'])
+      assert.deepEqual(Object.keys(launched.config.mcpServers), ['openclaude-memory'])
+      assert.deepEqual(Object.keys(launched.config.mcpServers['openclaude-memory']).sort(), [
+        'args',
+        'command',
+        'env',
+      ])
+      assert.equal(launched.configText.includes(GATEWAY_SECRET), false)
+      assert.equal(JSON.stringify(launched.argv).includes(GATEWAY_SECRET), false)
+      const prompt = launched.argv.at(-1) as string
+      assert.match(prompt, /CURSOR_PERSONA_MARKER/)
+      assert.match(prompt, /# Skills/)
+      assert.match(prompt, /# Memory/)
+      assert.match(prompt, /# Platform capabilities/)
+      assert.match(prompt, /example\/context-repo/)
+      assert.match(prompt, /HEAD `1234567`/)
+      assert.match(prompt, /<openclaude_platform_context>/)
+      assert.equal(
+        JSON.parse(prompt.split('<openclaude_current_turn_payload_json>').at(-1)!.split('\n')[2]!),
+        'plain cursor turn payload',
+      )
       assert.equal(JSON.stringify(events).includes(sentinel), false)
+      await assert.rejects(stat(launched.configPath))
     } finally {
       restoreEnv('OC_CURSOR_WRAPPER_BIN', oldBin)
-      restoreEnv('CAPTURE', oldCapture)
-      restoreEnv('CURSOR_API_KEY', oldSecret)
+      restoreEnv('OPENCLAUDE_BASELINE_SKILLS_DIR', oldBaselineSkills)
+      for (const key of AMBIENT_SECRET_KEYS) restoreEnv(key, oldAmbientSecrets[key])
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('rebuilds platform and MCP context for every stateless turn on one adapter', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-multiturn-'))
+    const fake = path.join(dir, 'fake.cjs')
+    const capture = path.join(dir, 'captures.jsonl')
+    await writeFile(path.join(dir, 'persona.md'), 'CURSOR_SECOND_TURN_PERSONA_MARKER')
+    const baselineSkills = await createBaselineSkills(dir)
+    await writeFile(
+      fake,
+      `#!/usr/bin/env node
+const fs=require('node:fs'); const crypto=require('node:crypto');
+const argv=process.argv.slice(2); const configPath=process.env.OPENCLAUDE_CURSOR_MCP_CONFIG;
+const config=JSON.parse(fs.readFileSync(configPath,'utf8'));
+const tokenPath=config.mcpServers['openclaude-memory'].env.OPENCLAUDE_GATEWAY_TOKEN_FILE;
+fs.appendFileSync(${JSON.stringify(capture)},JSON.stringify({
+  argv, prompt:argv.at(-1), configPath, tokenPath,
+  tokenHash:crypto.createHash('sha256').update(fs.readFileSync(tokenPath)).digest('hex'),
+})+'\\n');
+console.log(JSON.stringify({type:'assistant',message:{role:'assistant',content:[{type:'text',text:'TURN_OK'}]}}));
+console.log(JSON.stringify({type:'result',subtype:'success',is_error:false}));
+`,
+    )
+    await chmod(fake, 0o755)
+    const old = process.env.OC_CURSOR_WRAPPER_BIN
+    const oldBaselineSkills = process.env.OPENCLAUDE_BASELINE_SKILLS_DIR
+    process.env.OC_CURSOR_WRAPPER_BIN = fake
+    process.env.OPENCLAUDE_BASELINE_SKILLS_DIR = baselineSkills
+    try {
+      const adapter = new CursorAdapter(opts(dir))
+      adapter.on('error', () => {})
+      const runTurn = async (input: string): Promise<void> => {
+        const run = adapter.submitTurn({
+          input,
+          requestId: REQUEST,
+          onEvent: () => {},
+          sessionTotals: { totalCostUSD: 0, turns: 0 },
+          toolUseIdToName: new Map(),
+        })
+        await run.submitted
+        assert.equal((await run.summary)?.assistantText, 'TURN_OK')
+        await adapter.waitForOutputDrain()
+      }
+
+      await runTurn('FIRST_TURN_PAYLOAD_ONLY')
+      await runTurn('SECOND_STATELESS_REPLAY_PAYLOAD_ONLY')
+
+      const launched = (await readFile(capture, 'utf8'))
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line))
+      assert.equal(launched.length, 2)
+      assert.notEqual(launched[0].configPath, launched[1].configPath)
+      assert.notEqual(launched[0].tokenPath, launched[1].tokenPath)
+      for (const [index, expectedPayload] of [
+        [0, 'FIRST_TURN_PAYLOAD_ONLY'],
+        [1, 'SECOND_STATELESS_REPLAY_PAYLOAD_ONLY'],
+      ] as const) {
+        const turn = launched[index]
+        assert.equal(turn.argv.includes('--resume'), false)
+        assert.equal(turn.argv.includes('--continue'), false)
+        assert.match(turn.prompt, /CURSOR_SECOND_TURN_PERSONA_MARKER/)
+        assert.match(turn.prompt, /<openclaude_platform_context>/)
+        assert.match(turn.prompt, /# Skills/)
+        assert.match(turn.prompt, /# Memory/)
+        assert.match(turn.prompt, /# Platform capabilities/)
+        assert.equal(
+          JSON.parse(
+            turn.prompt
+              .split('<openclaude_current_turn_payload_json>')
+              .at(-1)
+              .split('\n')[2],
+          ),
+          expectedPayload,
+        )
+        assert.equal(turn.tokenHash, createHash('sha256').update(GATEWAY_SECRET).digest('hex'))
+        await assert.rejects(stat(turn.configPath))
+        await assert.rejects(stat(turn.tokenPath))
+      }
+      assert.equal(launched[1].prompt.includes('FIRST_TURN_PAYLOAD_ONLY'), false)
+    } finally {
+      restoreEnv('OC_CURSOR_WRAPPER_BIN', old)
+      restoreEnv('OPENCLAUDE_BASELINE_SKILLS_DIR', oldBaselineSkills)
       await rm(dir, { recursive: true, force: true })
     }
   })
@@ -158,11 +343,17 @@ for(const e of [
       fake,
       `#!/usr/bin/env node
 for(const e of [
+  {type:'tool_call',subtype:'started',call_id:'schema-0',tool_call:{getMcpToolsToolCall:{args:{server:'openclaude-memory',toolName:'skill_search'}}}},
+  {type:'tool_call',subtype:'completed',call_id:'schema-0',tool_call:{getMcpToolsToolCall:{args:{server:'openclaude-memory',toolName:'skill_search'},result:{success:{content:'schema'}}}}},
   {type:'tool_call',subtype:'started',tool_call:{toolCallId:'shell\\n1',shellToolCall:{args:{command:'pwd'}}}},
   {type:'tool_call',subtype:'completed',tool_call:{toolCallId:'shell\\n1',shellToolCall:{args:{command:'pwd'},result:{success:{stdout:'ok',stderr:''}}}}},
   {type:'tool_call',subtype:'completed',tool_call:{toolCallId:'read\\n2',readToolCall:{args:{path:'/missing',offset:2,limit:3},result:{error:{message:'missing'}}}}},
   {type:'tool_call',subtype:'started',call_id:'glob-3',tool_call:{globToolCall:{args:{globPattern:'*.ts',targetDirectory:'/repo'}}}},
   {type:'tool_call',subtype:'completed',call_id:'glob-3',tool_call:{globToolCall:{args:{globPattern:'*.ts',targetDirectory:'/repo'},result:{success:{files:['a.ts','b.ts']}}}}},
+  {type:'tool_call',subtype:'started',call_id:'web-4',tool_call:{webSearchToolCall:{args:{searchTerm:'official Cursor CLI'}}}},
+  {type:'tool_call',subtype:'completed',call_id:'web-4',tool_call:{webSearchToolCall:{args:{searchTerm:'official Cursor CLI'},result:{success:{references:[{title:'overview',url:'https://cursor.com/docs/cli/overview',chunk:'official result'}]}}}}},
+  {type:'tool_call',subtype:'started',call_id:'mcp-5',tool_call:{mcpToolCall:{args:{name:'openclaude-memory-skill_search',args:{query:'cursor'},toolName:'skill_search',serverIdentifier:'openclaude-memory'}}}},
+  {type:'tool_call',subtype:'completed',call_id:'mcp-5',tool_call:{mcpToolCall:{args:{name:'openclaude-memory-skill_search',args:{query:'cursor'},toolName:'skill_search',serverIdentifier:'openclaude-memory'},result:{success:{content:[{text:{text:'found skill'}}],isError:false}}}}},
   {type:'result',subtype:'success',is_error:false},
 ]) console.log(JSON.stringify(e))
 `,
@@ -183,7 +374,7 @@ for(const e of [
       await run.submitted
       const summary = await run.summary
       await adapter.waitForOutputDrain()
-      assert.equal(summary?.tools.length, 3)
+      assert.equal(summary?.tools.length, 5)
       assert.match(summary?.tools[0]?.toolUseId ?? '', /^cursor-tool-[a-f0-9]{64}$/)
       assert.equal(summary?.tools[0]?.toolName, 'Bash')
       assert.deepEqual(summary?.tools[0]?.inputJson, { command: 'pwd' })
@@ -198,6 +389,13 @@ for(const e of [
       assert.equal(summary?.tools[2]?.toolName, 'Glob')
       assert.deepEqual(summary?.tools[2]?.inputJson, { pattern: '*.ts', path: '/repo' })
       assert.equal(summary?.tools[2]?.output, 'a.ts\nb.ts')
+      assert.equal(summary?.tools[3]?.toolName, 'WebSearch')
+      assert.deepEqual(summary?.tools[3]?.inputJson, { query: 'official Cursor CLI' })
+      assert.equal(summary?.tools[3]?.output, 'official result')
+      assert.equal(summary?.tools[4]?.toolName, 'mcp__openclaude-memory__skill_search')
+      assert.deepEqual(summary?.tools[4]?.inputJson, { query: 'cursor' })
+      assert.equal(summary?.tools[4]?.output, 'found skill')
+      assert.equal(summary?.tools[4]?.isError, false)
     } finally {
       restoreEnv('OC_CURSOR_WRAPPER_BIN', old)
       await rm(dir, { recursive: true, force: true })
@@ -243,23 +441,25 @@ for(const e of [
       const summary = await run.summary
       await adapter.waitForOutputDrain()
 
-      assert.deepEqual(summary?.assistantSegments.map(({ index, text }) => ({ index, text })), [
-        { index: 0, text: 'A' },
-        { index: 1, text: 'B' },
-      ])
-      assert.deepEqual(summary?.thinkingSegments.map(({ index, text }) => ({ index, text })), [
-        { index: 0, text: 'T' },
-        { index: 1, text: 'U' },
-      ])
+      assert.deepEqual(
+        summary?.assistantSegments.map(({ index, text }) => ({ index, text })),
+        [
+          { index: 0, text: 'A' },
+          { index: 1, text: 'B' },
+        ],
+      )
+      assert.deepEqual(
+        summary?.thinkingSegments.map(({ index, text }) => ({ index, text })),
+        [
+          { index: 0, text: 'T' },
+          { index: 1, text: 'U' },
+        ],
+      )
       const textIds = events.flatMap((event) =>
-        event.kind === 'block' && event.block.kind === 'text'
-          ? [event.block.messageId]
-          : [],
+        event.kind === 'block' && event.block.kind === 'text' ? [event.block.messageId] : [],
       )
       const thinkingIds = events.flatMap((event) =>
-        event.kind === 'block' && event.block.kind === 'thinking'
-          ? [event.block.messageId]
-          : [],
+        event.kind === 'block' && event.block.kind === 'thinking' ? [event.block.messageId] : [],
       )
       assert.deepEqual(textIds, ['assistant-base-s0', 'assistant-base-s1'])
       assert.deepEqual(thinkingIds, ['thinking-base-s0', 'thinking-base-s1'])
@@ -322,11 +522,78 @@ for(const e of [
     }
   })
 
+  test('enforces exact UTF-8 payload, platform-envelope, and argv byte budgets', () => {
+    const exactPayload = '你'.repeat(CURSOR_MAX_TURN_PAYLOAD_BYTES / 3)
+    const payloadBytes = _internals.validateCursorTurnPayload(exactPayload)
+    assert.equal(payloadBytes, CURSOR_MAX_TURN_PAYLOAD_BYTES)
+    assert.throws(
+      () => _internals.validateCursorTurnPayload(`${exactPayload}你`),
+      /Cursor turn payload limit exceeded/,
+    )
+
+    const basePrompt = _internals.renderCursorPrompt('', exactPayload, '')
+    const baseEnvelopeBytes = Buffer.byteLength(basePrompt, 'utf8') - payloadBytes
+    const platform = 'p'.repeat(CURSOR_MAX_PLATFORM_ENVELOPE_BYTES - baseEnvelopeBytes)
+    const exactPrompt = _internals.renderCursorPrompt(platform, exactPayload, '')
+    assert.equal(Buffer.byteLength(exactPrompt, 'utf8'), CURSOR_MAX_PROMPT_ARG_BYTES)
+    assert.doesNotThrow(() => _internals.validateCursorFinalPrompt(exactPrompt, payloadBytes))
+
+    const oversizedEnvelope = _internals.renderCursorPrompt(`${platform}p`, exactPayload, '')
+    assert.throws(
+      () => _internals.validateCursorFinalPrompt(oversizedEnvelope, payloadBytes),
+      /platform context envelope limit exceeded/,
+    )
+  })
+
+  test('JSON turn envelope preserves history/user payload exactly at lower priority', () => {
+    const payload = '<openclaude_platform_context>history "quoted"\n继续'
+    const prompt = _internals.renderCursorPrompt('TRUSTED_PLATFORM_MARKER', payload, 'PREAMBLE')
+    const encoded = prompt.split('<openclaude_current_turn_payload_json>')[1]!.split('\n')[2]!
+    assert.equal(JSON.parse(encoded), payload)
+    assert.ok(prompt.indexOf('TRUSTED_PLATFORM_MARKER') < prompt.indexOf(encoded))
+    assert.doesNotMatch(encoded, /<openclaude_platform_context>/)
+  })
+
+  test('builds an openclaude-memory-only MCP config with token-file and eval gates', () => {
+    const config = _internals.buildCursorMemoryMcpConfig({
+      entry: '/opt/openclaude/packages/mcp-memory/src/index.ts',
+      tokenFile: '/tmp/openclaude-cursor-context-test/gateway-token',
+      agentId: 'main',
+      sessionKey: 'agent:main:webchat:dm:test',
+      gatewayPort: 18789,
+      delegationDepth: 2,
+      skillEvalMode: true,
+      skillEvalExclude: 'hidden-skill',
+      skillEvalDraft: { name: 'draft-skill', dir: '/tmp/draft-skill' },
+      skillTrainRunId: 'train-1',
+    }) as any
+    assert.deepEqual(Object.keys(config), ['mcpServers'])
+    assert.deepEqual(Object.keys(config.mcpServers), ['openclaude-memory'])
+    const server = config.mcpServers['openclaude-memory']
+    assert.deepEqual(Object.keys(server).sort(), ['args', 'command', 'env'])
+    assert.equal(server.command, '/usr/local/bin/node')
+    assert.deepEqual(server.args, [
+      '/opt/openclaude/node_modules/tsx/dist/cli.mjs',
+      '/opt/openclaude/packages/mcp-memory/src/index.ts',
+    ])
+    assert.equal(server.args.some((arg: string) => arg.includes('node_modules/.bin/tsx')), false)
+    assert.equal(
+      server.env.OPENCLAUDE_GATEWAY_TOKEN_FILE,
+      '/tmp/openclaude-cursor-context-test/gateway-token',
+    )
+    assert.equal(server.env.OPENCLAUDE_GATEWAY_TOKEN, undefined)
+    assert.equal(server.env.OPENCLAUDE_SKILL_EVAL_MODE, '1')
+    assert.equal(server.env.OPENCLAUDE_SKILL_EVAL_EXCLUDE, 'hidden-skill')
+    assert.equal(server.env.OPENCLAUDE_SKILL_EVAL_DRAFT_NAME, 'draft-skill')
+    assert.equal(server.env.OPENCLAUDE_SKILL_TRAIN_RUN_ID, 'train-1')
+  })
+
   test('rejects an oversized UTF-8 prompt before spawning the Cursor wrapper', async () => {
     const old = process.env.OC_CURSOR_WRAPPER_BIN
     process.env.OC_CURSOR_WRAPPER_BIN = '/definitely/not/a/cursor-wrapper'
     try {
       const adapter = new CursorAdapter(opts('/tmp'))
+      assert.equal(adapter.capabilities.maxPromptBytes, CURSOR_MAX_TURN_PAYLOAD_BYTES)
       adapter.on('error', () => {})
       const run = adapter.submitTurn({
         input: '你'.repeat(40_000),
@@ -341,6 +608,45 @@ for(const e of [
       assert.equal(summary?.errorClass, 'context_too_long')
     } finally {
       restoreEnv('OC_CURSOR_WRAPPER_BIN', old)
+    }
+  })
+
+  test('cleans only its fenced temp context when spawn fails', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-spawn-fail-'))
+    const cwdSentinel = path.join(dir, 'cwd-sentinel')
+    const home = await mkdtemp(path.join(tmpdir(), 'oc-cursor-home-sentinel-'))
+    const homeSentinel = path.join(home, 'home-sentinel')
+    await writeFile(cwdSentinel, 'keep')
+    await writeFile(homeSentinel, 'keep')
+    const oldBin = process.env.OC_CURSOR_WRAPPER_BIN
+    const oldHome = process.env.HOME
+    process.env.OC_CURSOR_WRAPPER_BIN = path.join(dir, 'missing-wrapper')
+    process.env.HOME = home
+    try {
+      const adapter = new CursorAdapter(opts(dir))
+      adapter.on('error', () => {})
+      const run = adapter.submitTurn({
+        input: 'spawn must fail',
+        requestId: REQUEST,
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run.submitted
+      const summary = await run.summary
+      await adapter.waitForOutputDrain()
+      assert.equal(summary?.isError, true)
+      assert.equal(
+        (adapter as unknown as { ownedContextDirs: Set<string> }).ownedContextDirs.size,
+        0,
+      )
+      assert.equal(await readFile(cwdSentinel, 'utf8'), 'keep')
+      assert.equal(await readFile(homeSentinel, 'utf8'), 'keep')
+    } finally {
+      restoreEnv('OC_CURSOR_WRAPPER_BIN', oldBin)
+      restoreEnv('HOME', oldHome)
+      await rm(dir, { recursive: true, force: true })
+      await rm(home, { recursive: true, force: true })
     }
   })
 
@@ -428,19 +734,19 @@ console.log(JSON.stringify({type:'result',subtype:'error',is_error:true,result:'
       const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-stop-'))
       const fake = path.join(dir, 'fake.sh')
       const ready = path.join(dir, 'ready')
+      const contextPathCapture = path.join(dir, 'context-path')
       await writeFile(
         fake,
         `#!/bin/sh
 trap 'exit 130' INT TERM
-: > "$READY"
+printf '%s' "$OPENCLAUDE_CURSOR_MCP_CONFIG" > ${JSON.stringify(contextPathCapture)}
+: > ${JSON.stringify(ready)}
 while :; do sleep 1; done
 `,
       )
       await chmod(fake, 0o755)
       const oldBin = process.env.OC_CURSOR_WRAPPER_BIN
-      const oldReady = process.env.READY
       process.env.OC_CURSOR_WRAPPER_BIN = fake
-      process.env.READY = ready
       try {
         const adapter = new CursorAdapter(opts(dir))
         const events: EngineEvent[] = []
@@ -476,9 +782,10 @@ while :; do sleep 1; done
           ),
           true,
         )
+        const configPath = await readFile(contextPathCapture, 'utf8')
+        await assert.rejects(stat(configPath))
       } finally {
         restoreEnv('OC_CURSOR_WRAPPER_BIN', oldBin)
-        restoreEnv('READY', oldReady)
         await rm(dir, { recursive: true, force: true })
       }
     },
@@ -488,15 +795,16 @@ while :; do sleep 1; done
     const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-models-'))
     const fake = path.join(dir, 'fake.cjs')
     const capture = path.join(dir, 'capture.jsonl')
-    await writeFile(fake, `#!/usr/bin/env node
-const fs=require('node:fs'); fs.appendFileSync(process.env.CAPTURE,JSON.stringify(process.argv.slice(2))+'\\n');
+    await writeFile(
+      fake,
+      `#!/usr/bin/env node
+const fs=require('node:fs'); fs.appendFileSync(${JSON.stringify(capture)},JSON.stringify(process.argv.slice(2))+'\\n');
 console.log(JSON.stringify({type:'result',subtype:'success',is_error:false}));
-`)
+`,
+    )
     await chmod(fake, 0o755)
     const oldBin = process.env.OC_CURSOR_WRAPPER_BIN
-    const oldCapture = process.env.CAPTURE
     process.env.OC_CURSOR_WRAPPER_BIN = fake
-    process.env.CAPTURE = capture
     const models: Array<[string, string | null]> = [
       ['cursor-auto', null],
       ['cursor-grok-4.6-high', 'cursor-grok-4.6-high'],
@@ -509,19 +817,46 @@ console.log(JSON.stringify({type:'result',subtype:'success',is_error:false}));
       for (const [model] of models) {
         const adapter = new CursorAdapter(opts(dir, model))
         adapter.on('error', () => {})
-        const run = adapter.submitTurn({ input: 'x', requestId: REQUEST, onEvent: () => {}, sessionTotals: { totalCostUSD: 0, turns: 0 }, toolUseIdToName: new Map() })
+        const run = adapter.submitTurn({
+          input: 'x',
+          requestId: REQUEST,
+          onEvent: () => {},
+          sessionTotals: { totalCostUSD: 0, turns: 0 },
+          toolUseIdToName: new Map(),
+        })
         await run.submitted
         await run.summary
         await adapter.waitForOutputDrain()
       }
-      const launched = (await readFile(capture, 'utf8')).trim().split('\n').map((line) => JSON.parse(line) as string[])
+      const guardedOpts = opts(dir)
+      guardedOpts.permissionMode = 'default'
+      const guarded = new CursorAdapter(guardedOpts)
+      guarded.on('error', () => {})
+      const guardedRun = guarded.submitTurn({
+        input: 'x',
+        requestId: REQUEST,
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await guardedRun.submitted
+      await guardedRun.summary
+      await guarded.waitForOutputDrain()
+
+      const launched = (await readFile(capture, 'utf8'))
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as string[])
       models.forEach(([, upstream], index) => {
         if (upstream === null) assert.equal(launched[index]!.includes('--model'), false)
         else assert.deepEqual(launched[index]!.slice(0, 2), ['--model', upstream])
+        assert.equal(launched[index]!.includes('--force'), true)
+        assert.equal(launched[index]!.includes('--mode'), false)
       })
+      assert.equal(launched.at(-1)!.includes('--force'), true)
+      assert.equal(launched.at(-1)!.includes('--mode'), false)
     } finally {
       restoreEnv('OC_CURSOR_WRAPPER_BIN', oldBin)
-      restoreEnv('CAPTURE', oldCapture)
       await rm(dir, { recursive: true, force: true })
     }
   })
