@@ -121,11 +121,17 @@ function bodyFor(model: string): {
 // ─── selectUpstreamRoute ─────────────────────────────────────────────────
 
 describe("selectUpstreamRoute", () => {
-  test("model 以 deepseek- 开头(大小写敏感) → static/deepseek", () => {
+  test("model 以 deepseek- 开头(大小写敏感) → static/deepseek，但 OpenCode alias 不被抢路由", () => {
     for (const m of ["deepseek-v4-pro", "deepseek-chat"]) {
       const r = selectUpstreamRoute(m);
       assert.equal(r.kind, "static");
       if (r.kind === "static") assert.equal(r.provider.id, "deepseek");
+    }
+    const alias = selectUpstreamRoute("deepseek-v4-flash-opencode-go");
+    assert.equal(alias.kind, "static");
+    if (alias.kind === "static") {
+      assert.equal(alias.provider.id, "opencodego");
+      assert.equal(alias.upstreamModel, "deepseek-v4-flash");
     }
   });
   test("MiniMax-M3(大小写不敏感) → static/minimax", () => {
@@ -135,8 +141,8 @@ describe("selectUpstreamRoute", () => {
       if (r.kind === "static") assert.equal(r.provider.id, "minimax");
     }
   });
-  test("glm-5.1 / glm-5.2(大小写不敏感) → static/ark", () => {
-    for (const m of ["glm-5.1", "GLM-5.1", "glm-5.2", "GLM-5.2"]) {
+  test("glm-5.1 / glm-5.2 / glm-5.3(大小写不敏感) → static/ark", () => {
+    for (const m of ["glm-5.1", "GLM-5.1", "glm-5.2", "GLM-5.2", "glm-5.3", "GLM-5.3"]) {
       const r = selectUpstreamRoute(m);
       assert.equal(r.kind, "static");
       if (r.kind === "static") assert.equal(r.provider.id, "ark");
@@ -425,6 +431,34 @@ describe("pickUpstream — Ark glm-5.1 route", () => {
   });
 });
 
+// ─── Ark model-scoped disabled thinking 清洗───────────────────────────────
+
+describe("pickUpstream — Ark disabled thinking 型号差异", () => {
+  async function cleanse(model: string): Promise<unknown> {
+    const sched = makeScheduler({});
+    const res = await pickUpstream(
+      { scheduler: sched.scheduler, staticProviderKeys: { ark: "k" } },
+      bodyFor(model),
+      selectUpstreamRoute(model),
+      log,
+    );
+    assert.equal(res.ok, true);
+    if (!res.ok) return undefined;
+    const requestBody = {
+      model,
+      thinking: { type: "disabled" },
+    } as unknown as Parameters<typeof res.session.applyUpstreamAuth>[1];
+    res.session.applyUpstreamAuth({}, requestBody, log);
+    return (requestBody as { thinking?: unknown }).thinking;
+  }
+
+  test("glm-5.3 删 disabled 避免上游 400；glm-5.1/5.2 保持原语义", async () => {
+    assert.equal(await cleanse("glm-5.3"), undefined);
+    assert.deepEqual(await cleanse("glm-5.2"), { type: "disabled" });
+    assert.deepEqual(await cleanse("glm-5.1"), { type: "disabled" });
+  });
+});
+
 // ─── Ark output_config effort 白名单清洗(边界)────────────────────────────
 
 describe("pickUpstream — Ark output_config effort 白名单清洗", () => {
@@ -486,6 +520,27 @@ describe("pickUpstream — Ark output_config effort 白名单清洗", () => {
 });
 
 // ─── OpenCode Go signature-bound history retention ─────────────────────
+
+describe("pickUpstream — OpenCode Go DeepSeek alias", () => {
+  test("canonical 与 upstream id 分离；仍使用 x-api-key /messages", async () => {
+    const route = selectUpstreamRoute("deepseek-v4-flash-opencode-go");
+    const sched = makeScheduler({});
+    const res = await pickUpstream(
+      { scheduler: sched.scheduler, staticProviderKeys: { opencodego: "GO-KEY" } },
+      bodyFor("deepseek-v4-flash-opencode-go"),
+      route,
+      log,
+    );
+    assert.equal(res.ok, true);
+    if (!res.ok) return;
+    assert.equal(res.session.upstreamModel, "deepseek-v4-flash");
+    assert.equal(res.session.endpoint, "https://opencode.ai/zen/go/v1/messages");
+    const headers: Record<string, string> = {};
+    res.session.applyUpstreamAuth(headers, bodyFor("deepseek-v4-flash-opencode-go"), log);
+    assert.equal(headers["x-api-key"], "GO-KEY");
+    assert.equal(headers.authorization, undefined);
+  });
+});
 
 describe("pickUpstream — OpenCode Go 同 provider 历史", () => {
   test("合法签名块首发原样保留，且不改持久历史", async () => {

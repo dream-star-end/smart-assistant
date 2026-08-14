@@ -8,6 +8,7 @@ import {
   isArkPlanKimiModel,
   isBailianQwen38MaxModel,
   isCapabilityZeroStaticModel,
+  isOpencodeGoModel,
   isOpencodeQwenModel,
   getStaticModelContextWindow,
   getAuthorityModelCapabilities,
@@ -38,15 +39,27 @@ describe("signed execution descriptor override", () => {
 });
 
 describe("isArkGlmModel", () => {
-  test("精确匹配 glm-5.1 + glm-5.2,大小写/空白不敏感", () => {
+  test("精确匹配 glm-5.1 + glm-5.2 + glm-5.3,大小写/空白不敏感", () => {
     expect(isArkGlmModel("glm-5.1")).toBe(true);
     expect(isArkGlmModel("GLM-5.1")).toBe(true);
     expect(isArkGlmModel("  glm-5.1  ")).toBe(true);
     expect(isArkGlmModel("glm-5.2")).toBe(true);
     expect(isArkGlmModel("GLM-5.2")).toBe(true);
     expect(isArkGlmModel("  glm-5.2  ")).toBe(true);
+    expect(isArkGlmModel("glm-5.3")).toBe(true);
+    expect(isArkGlmModel(" GLM-5.3 ")).toBe(true);
     expect(isArkGlmModel("glm-5")).toBe(false);
-    expect(isArkGlmModel("glm-5.3")).toBe(false);
+    expect(isArkGlmModel("glm-5.4")).toBe(false);
+  });
+});
+
+describe("isOpencodeGoModel", () => {
+  test("精确匹配 DeepSeek 平台 alias 与历史 Qwen", () => {
+    expect(isOpencodeGoModel("deepseek-v4-flash-opencode-go")).toBe(true);
+    expect(isOpencodeGoModel(" DeepSeek-V4-Flash-OpenCode-Go ")).toBe(true);
+    expect(isOpencodeGoModel("deepseek-v4-flash")).toBe(false);
+    expect(isOpencodeGoModel("qwen3.7-max")).toBe(true);
+    expect(isOpencodeGoModel("qwen3.7-plus")).toBe(true);
   });
 });
 
@@ -90,13 +103,15 @@ describe("isBailianQwen38MaxModel", () => {
 });
 
 describe("isCapabilityZeroStaticModel — minimax + ark + opencodego qwen(不含 deepseek)", () => {
-  test("MiniMax-M3 / glm-5.1 / glm-5.2 / qwen3.7-max/plus → true", () => {
+  test("MiniMax-M3 / glm-5.x / OpenCode Go models → true", () => {
     expect(isCapabilityZeroStaticModel("MiniMax-M3")).toBe(true);
     expect(isCapabilityZeroStaticModel("minimax-m3")).toBe(true);
     expect(isCapabilityZeroStaticModel("glm-5.1")).toBe(true);
     expect(isCapabilityZeroStaticModel("GLM-5.1")).toBe(true);
     expect(isCapabilityZeroStaticModel("glm-5.2")).toBe(true);
     expect(isCapabilityZeroStaticModel("GLM-5.2")).toBe(true);
+    expect(isCapabilityZeroStaticModel("glm-5.3")).toBe(true);
+    expect(isCapabilityZeroStaticModel("deepseek-v4-flash-opencode-go")).toBe(true);
     expect(isCapabilityZeroStaticModel("qwen3.7-max")).toBe(true);
     expect(isCapabilityZeroStaticModel("qwen3.7-plus")).toBe(true);
     expect(isCapabilityZeroStaticModel("kimi-k2.7-code")).toBe(true);
@@ -114,12 +129,14 @@ describe("isCapabilityZeroStaticModel — minimax + ark + opencodego qwen(不含
 });
 
 describe("getStaticModelContextWindow", () => {
-  test("minimax=512k, ark glm-5.1=200k / glm-5.2=1M, opencodego qwen=1M(per-model)", () => {
+  test("minimax=512k, ark glm-5.1=200k / glm-5.2+5.3=1M, OpenCode Go=1M", () => {
     expect(getStaticModelContextWindow("MiniMax-M3")).toBe(512_000);
     expect(getStaticModelContextWindow("glm-5.1")).toBe(200_000);
     expect(getStaticModelContextWindow("GLM-5.1")).toBe(200_000);
     expect(getStaticModelContextWindow("glm-5.2")).toBe(1_000_000);
     expect(getStaticModelContextWindow("GLM-5.2")).toBe(1_000_000);
+    expect(getStaticModelContextWindow("glm-5.3")).toBe(1_000_000);
+    expect(getStaticModelContextWindow("deepseek-v4-flash-opencode-go")).toBe(1_000_000);
     expect(getStaticModelContextWindow("qwen3.7-max")).toBe(1_000_000);
     expect(getStaticModelContextWindow("qwen3.7-plus")).toBe(1_000_000);
     expect(getStaticModelContextWindow("kimi-k2.7-code")).toBe(256_000);

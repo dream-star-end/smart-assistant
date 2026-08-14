@@ -15,7 +15,7 @@ import {
   isBailianQwen38MaxModel,
   isCapabilityZeroStaticModel,
   isMoonshotKimiK3Model,
-  isOpencodeQwenModel,
+  isOpencodeGoModel,
 } from './model/staticKeyModels.js'
 import { isMiniMaxM3Model } from './model/minimax.js'
 
@@ -116,11 +116,11 @@ export function modelSupportsThinking(model: string): boolean {
   if (isMiniMaxM3Model(model)) {
     return true
   }
-  // qwen3.7-max/plus(OpenCode Go)是 thinking 模型 —— 同在 isCapabilityZeroStaticModel 集合
+  // OpenCode Go DeepSeek alias / 历史 qwen3.7 都是 thinking 模型 —— 同在 isCapabilityZeroStaticModel 集合
   // (betas/effort/adaptive-thinking 仍全关),thinking 例外放行:2026-07-05 直连验证
   // https://opencode.ai/zen/go/v1/messages 接受 thinking:{type:enabled,budget_tokens},且
   // {type:disabled} 真关思考(直答,output_tokens=1)。同走 enabled+budget 分支。
-  if (isOpencodeQwenModel(model)) {
+  if (isOpencodeGoModel(model)) {
     return true
   }
   // kimi-k2.7-code(火山 Agent Plan)是**恒思考**模型 —— 在 isCapabilityZeroStaticModel 集合

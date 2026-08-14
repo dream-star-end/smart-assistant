@@ -28,6 +28,8 @@ describe('staticKeyProviders — matchesRoute', () => {
     const ds = getStaticProvider('deepseek')
     assert.equal(ds.matchesRoute('deepseek-v4-pro'), true)
     assert.equal(ds.matchesRoute('deepseek-chat'), true)
+    assert.equal(ds.matchesRoute('deepseek-v4-flash-opencode-go'), false)
+    assert.equal(ds.matchesRoute('deepseek-V4-Flash-OpenCode-Go'), false)
     // 大小写敏感:大写 D 不命中(等价 shared.ts:87 现状)
     assert.equal(ds.matchesRoute('DeepSeek-v4-pro'), false)
     assert.equal(ds.matchesRoute('claude-x'), false)
@@ -38,17 +40,22 @@ describe('staticKeyProviders — matchesRoute', () => {
     assert.equal(mm.matchesRoute('minimax-m3'), true)
     assert.equal(mm.matchesRoute('minimax-m2'), false)
   })
-  it('ark(glm-5.1 + glm-5.2)精确,大小写不敏感', () => {
+  it('ark(glm-5.1 + glm-5.2 + glm-5.3)精确,大小写不敏感', () => {
     const ark = getStaticProvider('ark')
     assert.equal(ark.matchesRoute('glm-5.1'), true)
     assert.equal(ark.matchesRoute('GLM-5.1'), true)
     assert.equal(ark.matchesRoute('glm-5.2'), true)
     assert.equal(ark.matchesRoute('GLM-5.2'), true)
+    assert.equal(ark.matchesRoute('glm-5.3'), true)
+    assert.equal(ark.matchesRoute('GLM-5.3'), true)
     assert.equal(ark.matchesRoute('glm-5'), false)
-    assert.equal(ark.matchesRoute('glm-5.3'), false)
+    assert.equal(ark.matchesRoute('glm-5.4'), false)
   })
-  it('opencodego(qwen3.7-max/plus)精确,大小写不敏感', () => {
+  it('opencodego(DeepSeek alias + qwen3.7 legacy)精确,大小写不敏感', () => {
     const og = getStaticProvider('opencodego')
+    assert.equal(og.matchesRoute('deepseek-v4-flash-opencode-go'), true)
+    assert.equal(og.matchesRoute('DeepSeek-V4-Flash-OpenCode-Go'), true)
+    assert.equal(og.matchesRoute('deepseek-v4-flash'), false)
     assert.equal(og.matchesRoute('qwen3.7-max'), true)
     assert.equal(og.matchesRoute('Qwen3.7-Max'), true)
     assert.equal(og.matchesRoute('qwen3.7-plus'), true)
@@ -96,6 +103,8 @@ describe('staticKeyProviders — findRouteProviderForModel', () => {
     assert.equal(findRouteProviderForModel('MiniMax-M3')?.id, 'minimax')
     assert.equal(findRouteProviderForModel('glm-5.1')?.id, 'ark')
     assert.equal(findRouteProviderForModel('glm-5.2')?.id, 'ark')
+    assert.equal(findRouteProviderForModel('glm-5.3')?.id, 'ark')
+    assert.equal(findRouteProviderForModel('deepseek-v4-flash-opencode-go')?.id, 'opencodego')
     assert.equal(findRouteProviderForModel('qwen3.7-max')?.id, 'opencodego')
     assert.equal(findRouteProviderForModel('qwen3.7-plus')?.id, 'opencodego')
     assert.equal(findRouteProviderForModel('kimi-k2.7-code')?.id, 'kimi')
@@ -115,10 +124,11 @@ describe('staticKeyProviders — inboundModelIds(与 route 面故意不同)', ()
       'deepseek-v4-pro',
     ])
   })
-  it('minimax 1 项 / ark 2 项(glm-5.1 兼容 + glm-5.2 主力)/ opencodego 2 项', () => {
+  it('minimax 1 项 / ark 3 项 / opencodego 新 alias + 2 个历史 Qwen', () => {
     assert.deepEqual([...getStaticProvider('minimax').inboundModelIds], ['MiniMax-M3'])
-    assert.deepEqual([...getStaticProvider('ark').inboundModelIds], ['glm-5.2', 'glm-5.1'])
+    assert.deepEqual([...getStaticProvider('ark').inboundModelIds], ['glm-5.3', 'glm-5.2', 'glm-5.1'])
     assert.deepEqual([...getStaticProvider('opencodego').inboundModelIds], [
+      'deepseek-v4-flash-opencode-go',
       'qwen3.7-max',
       'qwen3.7-plus',
     ])
@@ -132,8 +142,10 @@ describe('staticKeyProviders — inboundModelIds(与 route 面故意不同)', ()
       'deepseek-v4-flash',
       'deepseek-v4-pro',
       'MiniMax-M3',
+      'glm-5.3',
       'glm-5.2',
       'glm-5.1',
+      'deepseek-v4-flash-opencode-go',
       'qwen3.7-max',
       'qwen3.7-plus',
       'kimi-k2.7-code',
@@ -156,16 +168,21 @@ describe('staticKeyProviders — canonicalizeForPricing', () => {
     assert.equal(mm.canonicalizeForPricing('MiniMax-M3'), 'MiniMax-M3')
     assert.equal(mm.canonicalizeForPricing('claude-x'), null)
   })
-  it('ark → glm-5.1 / glm-5.2(各自原样)', () => {
+  it('ark → glm-5.1 / glm-5.2 / glm-5.3(各自原样)', () => {
     const ark = getStaticProvider('ark')
     assert.equal(ark.canonicalizeForPricing('GLM-5.1'), 'glm-5.1')
     assert.equal(ark.canonicalizeForPricing('glm-5.1'), 'glm-5.1')
     assert.equal(ark.canonicalizeForPricing('GLM-5.2'), 'glm-5.2')
     assert.equal(ark.canonicalizeForPricing('glm-5.2'), 'glm-5.2')
-    assert.equal(ark.canonicalizeForPricing('glm-5.3'), null)
+    assert.equal(ark.canonicalizeForPricing('GLM-5.3'), 'glm-5.3')
+    assert.equal(ark.canonicalizeForPricing('glm-5.3'), 'glm-5.3')
+    assert.equal(ark.canonicalizeForPricing('glm-5.4'), null)
   })
-  it('opencodego → qwen3.7-max / qwen3.7-plus(小写归一)', () => {
+  it('opencodego → 独立 Flash alias / qwen3.7 legacy(小写归一)', () => {
     const og = getStaticProvider('opencodego')
+    assert.equal(og.canonicalizeForPricing('DeepSeek-V4-Flash-OpenCode-Go'), 'deepseek-v4-flash-opencode-go')
+    assert.equal(og.upstreamModelForRequest?.('DeepSeek-V4-Flash-OpenCode-Go'), 'deepseek-v4-flash')
+    assert.equal(og.canonicalizeForPricing('deepseek-v4-flash'), null)
     assert.equal(og.canonicalizeForPricing('qwen3.7-max'), 'qwen3.7-max')
     assert.equal(og.canonicalizeForPricing('Qwen3.7-Max'), 'qwen3.7-max')
     assert.equal(og.canonicalizeForPricing('qwen3.7-plus'), 'qwen3.7-plus')
@@ -315,8 +332,9 @@ describe('staticKeyProviders — authScheme(上游鉴权头风格)', () => {
 })
 
 describe('staticKeyProviders — stripDisabledThinking(恒思考模型删参兜底)', () => {
-  it('kimi = true(火山 400 does not support disabling thinking,2026-07-06 实测);其余未声明', () => {
+  it('kimi provider-wide；ark 仅 glm-5.3 model-scoped', () => {
     assert.equal(getStaticProvider('kimi').stripDisabledThinking, true)
+    assert.deepEqual(getStaticProvider('ark').stripDisabledThinkingModels, ['glm-5.3'])
     assert.equal(getStaticProvider('deepseek').stripDisabledThinking, undefined)
     assert.equal(getStaticProvider('minimax').stripDisabledThinking, undefined)
     assert.equal(getStaticProvider('ark').stripDisabledThinking, undefined)

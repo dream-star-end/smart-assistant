@@ -23,11 +23,13 @@ import {
 import { applyModelDefaultEffort, type ProxyBody } from "../http/proxy/shared.js";
 
 describe("effortMetaForModel — protocol 推导适用性", () => {
-  it("ark glm-5.2:白名单 high/max", () => {
-    assert.deepEqual(effortMetaForModel("glm-5.2"), { applicable: true, allowed: ["high", "max"] });
+  it("ark glm-5.2/5.3:白名单 high/max", () => {
+    for (const model of ["glm-5.2", "glm-5.3"]) {
+      assert.deepEqual(effortMetaForModel(model), { applicable: true, allowed: ["high", "max"] });
+    }
   });
   it("capability-zero 静态(strip output_config):kimi/qwen/minimax → 不适用", () => {
-    for (const m of ["kimi-k2.7-code", "kimi-k3-ark", "qwen3.7-max", "qwen3.7-plus", "qwen3.8-max", "MiniMax-M3"]) {
+    for (const m of ["kimi-k2.7-code", "kimi-k3-ark", "deepseek-v4-flash-opencode-go", "qwen3.7-max", "qwen3.7-plus", "qwen3.8-max", "MiniMax-M3"]) {
       assert.deepEqual(effortMetaForModel(m), { applicable: false, allowed: [] }, m);
     }
   });
