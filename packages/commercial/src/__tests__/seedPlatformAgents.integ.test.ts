@@ -42,6 +42,7 @@ const listPublicModels = () => [
   { id: 'deepseek-v4-pro' },
   { id: 'MiniMax-M3' },
   { id: 'glm-5.2' },
+  { id: 'glm-5.3' },
 ]
 
 const EXPECTED_SLUGS = ['research-assistant']
@@ -372,10 +373,10 @@ describe('seedPlatformGeneralAgents (integ) — 办公助手 + 编程助手', ()
     assert.deepEqual(
       await listCurrentAgentDefaults(GENERAL_SLUGS),
       {
-        'coding-assistant': { version: '1.0.2', model: 'glm-5.2' },
+        'coding-assistant': { version: '1.0.3', model: 'glm-5.3' },
         'office-assistant': { version: '1.0.1', model: 'MiniMax-M3' },
       },
-      '当前 approved 版本应体现不同助手的默认模型(办公 MiniMax,编程 GLM-5.2 Coding Plan)',
+      '当前 approved 版本应体现不同助手的默认模型(办公 MiniMax,编程 GLM-5.3 Coding Plan)',
     )
 
     // kind 隔离:通用 agent 不进 skill 目录。
@@ -409,7 +410,7 @@ describe('seedPlatformGeneralAgents (integ) — 办公助手 + 编程助手', ()
     const upgraded = await seedPlatformGeneralAgents({ listPublicModels })
     assert.deepEqual(upgraded.errors, [])
     assert.deepEqual(await listCurrentAgentDefaults(['coding-assistant']), {
-      'coding-assistant': { version: '1.0.2', model: 'glm-5.2' },
+      'coding-assistant': { version: '1.0.3', model: 'glm-5.3' },
     })
 
     const versionsAfterUpgrade = await query<{ version: string; status: string }>(
@@ -420,7 +421,7 @@ describe('seedPlatformGeneralAgents (integ) — 办公助手 + 编程助手', ()
     )
     assert.deepEqual(versionsAfterUpgrade.rows, [
       { version: '1.0.1', status: 'approved' },
-      { version: '1.0.2', status: 'approved' },
+      { version: '1.0.3', status: 'approved' },
     ])
 
     // 模拟另一 release 取得领导权并把共享 current 指向自己的版本；随后重新调用当前 release
@@ -434,7 +435,7 @@ describe('seedPlatformGeneralAgents (integ) — 办公助手 + 编程助手', ()
     assert.deepEqual(reacquired.errors, [])
     assert.ok(reacquired.skipped.includes('coding-assistant'), '已存在版本应走 DUPLICATE 幂等分支')
     assert.deepEqual(await listCurrentAgentDefaults(['coding-assistant']), {
-      'coding-assistant': { version: '1.0.2', model: 'glm-5.2' },
+      'coding-assistant': { version: '1.0.3', model: 'glm-5.3' },
     })
     assert.equal(
       (

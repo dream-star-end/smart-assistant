@@ -1762,7 +1762,7 @@ export async function registerCommercial(
     selfHostUuid
   ) {
     // fail-closed guard(Codex plan review #4 + diff review Blocker):平台默认模型(2026-06-17 起
-    // glm-5.2)路由到静态 provider ark,若 ARK_CODING_PLAN_KEY 未配 → throw,loud fail 拒绝启动。
+    // glm-5.3)路由到静态 provider ark,若 ARK_CODING_PLAN_KEY 未配 → throw,loud fail 拒绝启动。
     // guard 动态走 PLATFORM_DEFAULT_MODEL→provider→meta.keyConfigField,非硬编码某 provider。
     // 注:minimax(文本走 ARK_AGENT_PLAN_KEY)/deepseek 不是平台默认,其 key 不被本 guard 拦,
     // 缺失则命中各自模型时 503。
@@ -1843,7 +1843,7 @@ export async function registerCommercial(
         // 静态 key 文本 provider 的 key 解析表(deepseek/minimax/ark)。cfg 在外层闭包已
         // loadConfig() 过,这里直接读取;某 provider 未配 → 命中其模型时 503(各自 reject reason)。
         // 这是 internal proxy(容器/agent runtime 走的上游),三个 provider 全注入。
-        // key 只留 master,不进用户容器。平台默认模型 glm-5.2(ark)的 key(ARK_CODING_PLAN_KEY)缺失
+        // key 只留 master,不进用户容器。平台默认模型 glm-5.3(ark)的 key(ARK_CODING_PLAN_KEY)缺失
         // 已由下方 assertPlatformDefaultModelConfigured guard 在装配前 loud-fail;minimax(文本走
         // ARK_AGENT_PLAN_KEY)/deepseek 不被该 guard 拦,缺失则命中其模型时 503。
         staticProviderKeys: {

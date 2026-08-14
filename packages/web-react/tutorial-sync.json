@@ -210,24 +210,24 @@
   },
   "cases": {
     "coding-dependency-upgrade": {
-      "contentHash": "55eddfe4711266bd2b7d292e910b11c17a35ec812b9db1bf848b53d4039019d5",
-      "contentVersion": 1
+      "contentHash": "89d07497f122b2c608b650279f362e402eddc2a18ad94eaf1d71d2fe27f63706",
+      "contentVersion": 2
     },
     "coding-feature-delivery": {
-      "contentHash": "b9b57f54b2eb0ae59ccab631fb4272500308c26b493a85741f9d3fc492f73f4c",
-      "contentVersion": 1
+      "contentHash": "311a0b9265b08c79e1c84e1c02fe7b42943cb5c896a21e0a8bbe08153bf7912e",
+      "contentVersion": 2
     },
     "coding-frontend-quality": {
-      "contentHash": "877d629372d31096857a69fbc365b784f24b4090151c231a904f6f9cf0fd5ce7",
-      "contentVersion": 1
+      "contentHash": "9338ae726f4f6e39671bedd4569a33e2f7ab2ea2f2ebd47104cf8c4d25b9cad8",
+      "contentVersion": 2
     },
     "coding-regression-rescue": {
-      "contentHash": "ff1a5fce302358d72fd77dc823b171af281fb3229771445b5f20ad73a8bfbd8c",
-      "contentVersion": 2
+      "contentHash": "6bf88c740281de6e715fd43a15c04f3b199038a40f9f47de4db71a28ae0807e8",
+      "contentVersion": 3
     },
     "coding-swe-bench-fix": {
-      "contentHash": "5fe359f220be33d5ef200f1f5ebfbfec9f0ebf9a3e0c96e9fca9cb6779372145",
-      "contentVersion": 2
+      "contentHash": "5e410d5768a19a652c311dc9c88bf2eb639ae39c82804921f8038e8c8ebc8423",
+      "contentVersion": 3
     },
     "general-meeting-actions": {
       "contentHash": "17b0e2955d5feb43491db7c36e5939bf84c3332aa8fb4cb5ef2d5bd5f8ace23f",
