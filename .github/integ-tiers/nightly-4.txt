@@ -23,3 +23,4 @@ packages/commercial/src/__tests__/migration0204.integ.test.ts
 packages/commercial/src/__tests__/migration0207.integ.test.ts
 packages/commercial/src/__tests__/migration0211.integ.test.ts
 packages/commercial/src/__tests__/migration0212.integ.test.ts
+packages/commercial/src/__tests__/migration0213.integ.test.ts

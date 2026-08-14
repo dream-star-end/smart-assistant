@@ -91,7 +91,8 @@
     "0209_cursor_multimodel_shared_credential",
     "0210_cursor_multimodel_activation",
     "0211_stage_glm53_opencode_flash",
-    "0212_public_glm53_opencode_flash"
+    "0212_public_glm53_opencode_flash",
+    "0213_glm53_default_transition"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

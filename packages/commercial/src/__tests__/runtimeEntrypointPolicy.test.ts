@@ -663,10 +663,10 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
 
   test("web agents fallback uses MiniMax-M3 (platform default) instead of an unsupported Claude default", () => {
     const src = readFileSync(WEB_AGENTS_MODULE_PATH, "utf-8");
-    // main 队长 = glm-5.2/ark(2026-06-17);researcher 仍 MiniMax-M3/minimax;coder = glm-5.2/ark。
+    // main 队长 = glm-5.3/ark(2026-08-14);researcher 仍 MiniMax-M3/minimax;coder = glm-5.3/ark。
     assert.match(src, /model:\s*'MiniMax-M3'/, "web fallback must still have MiniMax-M3 (researcher)");
     assert.match(src, /provider:\s*'minimax'/, "web fallback must still have minimax provider (researcher)");
-    assert.match(src, /model:\s*'glm-5\.2'/, "web fallback main/coder must use glm-5.2");
+    assert.match(src, /model:\s*'glm-5\.3'/, "web fallback main/coder must use glm-5.3");
     assert.match(src, /provider:\s*'ark'/, "web fallback main/coder must use ark provider");
     assert.match(src, /id:\s*'scientist'/, "web fallback must include the scientist agent");
     assert.match(src, /displayName:\s*'科研分析师'/, "web fallback scientist display name must match runtime seed");
@@ -751,10 +751,10 @@ describe("模型权威阶段 A 一致性锚:platform-seed 声明 == master 常�
     assert.equal(agents.codex?.runnerKind, "app-server", "codex runner 必须是 app-server");
     assert.equal(agents["hidden-reviewer"]?.forcePersona, true, "隐藏审查员 persona 必须每 boot 强刷(裁决词同步)");
 
-    // 当前期望值(2026-06-17 起 glm-5.2 / ark —— boss 决定替换 glm-5.1、队长全切 glm-5.2,接受跨境风险)
-    assert.equal(PLATFORM_DEFAULT_MODEL, "glm-5.2");
+    // 当前期望值(2026-08-14 起 glm-5.3 / ark Coding Plan)。
+    assert.equal(PLATFORM_DEFAULT_MODEL, "glm-5.3");
     assert.equal(PLATFORM_DEFAULT_PROVIDER, "ark");
-    assert.equal(PLATFORM_HIDDEN_REVIEWER_MODEL, "glm-5.2");
+    assert.equal(PLATFORM_HIDDEN_REVIEWER_MODEL, "glm-5.3");
     assert.equal(PLATFORM_HIDDEN_REVIEWER_PROVIDER, "ark");
   });
 

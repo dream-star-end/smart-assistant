@@ -89,7 +89,7 @@ export type TutorialCaseFieldReport = {
 export type TutorialCaseSuggestion = {
   agentId: 'research-assistant' | 'coding-assistant' | 'office-assistant'
   agentName: '科研助手' | '编程助手' | '办公助手'
-  modelId: 'deepseek-v4-pro' | 'glm-5.2' | 'MiniMax-M3'
+  modelId: 'deepseek-v4-pro' | 'glm-5.3' | 'MiniMax-M3'
   modelGuidance: string
   why: string
 }
@@ -868,7 +868,7 @@ export const TUTORIAL_CASES = [
   },
   {
     id: 'coding-swe-bench-fix',
-    contentVersion: 2,
+    contentVersion: 3,
     category: 'coding',
     title: '像真实维护者一样修一个 SWE-bench Bug',
     summary:
@@ -1006,7 +1006,7 @@ export const TUTORIAL_CASES = [
     suggestion: {
       agentId: 'coding-assistant',
       agentName: '编程助手',
-      modelId: 'glm-5.2',
+      modelId: 'glm-5.3',
       modelGuidance: '高推理编码模型负责复现与根因；审查者只报告正确性、安全和数据 blocker。',
       why: '真实修复需要可失败测试和独立 harness，不应由生成补丁的模型自行宣布成功。',
     },
@@ -1042,7 +1042,7 @@ export const TUTORIAL_CASES = [
   },
   {
     id: 'coding-feature-delivery',
-    contentVersion: 1,
+    contentVersion: 2,
     category: 'coding',
     title: '从一条需求交付可合并的 API 功能',
     summary:
@@ -1162,7 +1162,7 @@ export const TUTORIAL_CASES = [
     suggestion: {
       agentId: 'coding-assistant',
       agentName: '编程助手',
-      modelId: 'glm-5.2',
+      modelId: 'glm-5.3',
       modelGuidance: '选择能长时间操作仓库、运行测试和浏览器的编码模型；复杂迁移用高推理档。',
       why: '案例强调跨数据库、API、前端的最小纵向交付，而不是生成孤立代码。',
     },
@@ -1170,7 +1170,7 @@ export const TUTORIAL_CASES = [
   },
   {
     id: 'coding-regression-rescue',
-    contentVersion: 2,
+    contentVersion: 3,
     category: 'coding',
     title: '修复 pytest 的 walrus 重复求值回归',
     summary:
@@ -1299,7 +1299,7 @@ export const TUTORIAL_CASES = [
     suggestion: {
       agentId: 'coding-assistant',
       agentName: '编程助手',
-      modelId: 'glm-5.2',
+      modelId: 'glm-5.3',
       modelGuidance: '用高推理模型分析时间线；让第二任务只复核因果链而不另起重构。',
       why: '偶发问题需要可重复证据，更多防御代码不能代替定位。',
     },
@@ -1307,7 +1307,7 @@ export const TUTORIAL_CASES = [
   },
   {
     id: 'coding-frontend-quality',
-    contentVersion: 1,
+    contentVersion: 2,
     category: 'coding',
     title: '用真实浏览器修一条前端可访问性问题',
     summary:
@@ -1438,7 +1438,7 @@ export const TUTORIAL_CASES = [
     suggestion: {
       agentId: 'coding-assistant',
       agentName: '编程助手',
-      modelId: 'glm-5.2',
+      modelId: 'glm-5.3',
       modelGuidance: '选择能操控真实浏览器和修改仓库的模型；视觉审查可由独立任务复核。',
       why: '前端质量必须以用户可操作页面为证据，静态代码审查不够。',
     },
@@ -1446,7 +1446,7 @@ export const TUTORIAL_CASES = [
   },
   {
     id: 'coding-dependency-upgrade',
-    contentVersion: 1,
+    contentVersion: 2,
     category: 'coding',
     title: '把依赖升级做成可回退的工程变更',
     summary:
@@ -1580,7 +1580,7 @@ export const TUTORIAL_CASES = [
     suggestion: {
       agentId: 'coding-assistant',
       agentName: '编程助手',
-      modelId: 'glm-5.2',
+      modelId: 'glm-5.3',
       modelGuidance: '普通编码模型可执行；涉及破坏性版本或复杂矩阵时提高推理档。',
       why: '重点是读取上游契约和可回退验证，不是一次更新更多依赖。',
     },

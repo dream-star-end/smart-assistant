@@ -3436,9 +3436,9 @@ export class SessionManager {
         // 同步更新 session.model,outbound 帧 / metrics / audit 都靠它,避免
         // 下次 spawn 前的窗口期 stale。runner.model 要等 spawn 才生效;但 shutdown
         // 已让 runner 死,窗口期内不会产生新 metrics —— session.model 提前对齐安全。
-        // 最后兜底用 glm-5.2(平台默认、v3/v5 都合法的静态 key 模型)。
+        // 最后兜底用 glm-5.3(平台默认、v5 合法的静态 key 模型)。
         // 不再硬编码 claude-opus-4-7 —— Claude 官方模型已下线,那会造出非法默认 → spawn 失败。
-        session.model = desiredModel ?? this.config.defaults.model ?? 'glm-5.2'
+        session.model = desiredModel ?? this.config.defaults.model ?? 'glm-5.3'
       }
       if (toolsetsChanged) {
         maybeSetToolsets.call(session.runner, desiredToolsets)

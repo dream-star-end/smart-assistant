@@ -134,6 +134,9 @@ export const PERMANENT_OPS_LEDGER_TABLES: readonly string[] = [
   // 每个 release fuse epoch（含尚未裁决的 pending uncertainty）都是永久防重放/
   // 防丢失栅栏；删除会让迟到 callback 重拉闸或让并发 epoch 消失。
   "selfheal_release_fuse_epochs",
+  // 0213 默认模型迁移的精确 before-image + 条件补偿栅栏。量小且属于发布运维账本,
+  // 永久保留以证明迁移/补偿未覆盖迁移后的用户选择。
+  "model_default_transition_snapshots",
 ] as const;
 
 // 模块加载即校验:合规永久表与运维永久账本表名不得重叠(命名域彻底分离,防混淆)。
