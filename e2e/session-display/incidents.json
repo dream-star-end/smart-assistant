@@ -1419,6 +1419,25 @@
         "523c09af",
         "ba962e0c"
       ]
+    },
+    {
+      "id": "INC-20260814-CURSOR-HOTCFG-WRAPPER",
+      "occurredAt": "2026-08-14",
+      "severity": "P1",
+      "symptom": "Cursor 平台 bundle 已激活，但 adapter 仍调用镜像内旧 /usr/local/bin/oc-cursor，导致 adapter 生成的 openclaude-memory MCP 配置没有被复制加载，技能检索与记忆工具显示 MCP server does not exist。",
+      "rootFixCommit": "e5486e43",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorAdapter.test.ts",
+          "assertion": "prefers the hot-config Cursor wrapper and preserves the image fallback"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/deploy-v5.sh",
+          "assertion": "candidate Cursor stream-json parser gate + hot-config wrapper gate(exact immutable release)"
+        }
+      ]
     }
   ]
 }
