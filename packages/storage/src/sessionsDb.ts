@@ -1179,6 +1179,34 @@ export async function getMaxTurnIdx(sessionIds: string[]): Promise<number> {
 }
 
 /**
+ * Return whether this logical runner session has ever reserved or persisted a
+ * real turn. Unlike getMaxTurnIdx(), this check includes the synchronous
+ * reservation ledger, so it remains true during the async FTS write window and
+ * after an FTS indexing failure. FTS/meta fallbacks cover pre-reservation data.
+ */
+export async function hasPersistedTurnActivity(sessionIds: string[]): Promise<boolean> {
+  if (sessionIds.length === 0) return false
+  const db = await getSessionsDb()
+  const placeholders = sessionIds.map(() => '?').join(',')
+  const maxOf = (table: 'session_turn_counters' | 'sessions_fts' | 'sessions_meta',
+    column: 'last_reserved_turn' | 'turn_idx' | 'turn_count',
+    idColumn: 'session_id' | 'id',
+  ): number => {
+    const row = db
+      .prepare(
+        `SELECT MAX(CAST(${column} AS INTEGER)) AS m
+           FROM ${table}
+          WHERE ${idColumn} IN (${placeholders})`,
+      )
+      .get(...sessionIds) as { m: number | null } | undefined
+    return row?.m == null ? 0 : Math.floor(row.m)
+  }
+  return maxOf('session_turn_counters', 'last_reserved_turn', 'session_id') > 0 ||
+    maxOf('sessions_fts', 'turn_idx', 'session_id') > 0 ||
+    maxOf('sessions_meta', 'turn_count', 'id') > 0
+}
+
+/**
  * Atomically reserve the next never-reused turn index for one logical runner
  * session.  The allocation is committed to the container's persistent SQLite
  * volume before the model is allowed to run.

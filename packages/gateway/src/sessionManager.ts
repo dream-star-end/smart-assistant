@@ -9,6 +9,7 @@ import {
   getClientSession,
   getEngineContextMessages,
   getMaxTurnIdx,
+  hasPersistedTurnActivity,
   indexTurn,
   MemoryDir,
   type MemoryTurnPolicyDecision,
@@ -2912,9 +2913,9 @@ export class SessionManager {
       const workspaceModeChanged =
         opts.workspaceMode !== undefined && existing.workspaceMode !== workspaceMode
       if (existing.providerTag !== desiredEngine || workspaceModeChanged) {
-        contextRebuildNotice = existing.providerTag !== desiredEngine
-          ? 'engine-switch'
-          : 'native-resume-loss'
+        const replacementNotice: NonNullable<AgentSession['_contextRebuildNotice']> =
+          existing.providerTag !== desiredEngine ? 'engine-switch' : 'native-resume-loss'
+        contextRebuildNotice = replacementNotice
         if (
           this._promptQueueExecutionKeys.has(opts.sessionKey) ||
           (this._promptQueueDispatchFences.has(opts.sessionKey) && !ownsDispatchFence)
@@ -2930,6 +2931,33 @@ export class SessionManager {
         // first submit().
         try {
           await existing.lock
+          try {
+            const legacyId = this._resumeMap.get(opts.sessionKey)
+            const ids =
+              legacyId && legacyId !== opts.sessionKey
+                ? [opts.sessionKey, legacyId]
+                : [opts.sessionKey]
+            const hadPriorProviderState =
+              existing.turns > 0 ||
+              existing.ccbSessionId !== null ||
+              legacyId !== undefined ||
+              await hasPersistedTurnActivity(ids)
+            // Browser creation persists the UI-default engine before the first
+            // real turn. Switching that untouched prewarm to Cursor is not a
+            // provider-context rebuild and must not create a notice. The durable
+            // reservation table is checked here (after existing.lock), rather
+            // than inferring freshness from an empty selected-history snapshot:
+            // current-input budgeting can legitimately select [] for old chats.
+            contextRebuildNotice = hadPriorProviderState ? replacementNotice : undefined
+          } catch (historyErr) {
+            // Failure to prove freshness must preserve the exceptional notice.
+            // Suppressing a real provider switch is worse than a best-effort
+            // notice; runner replacement itself must still continue.
+            log.warn('session-replacement prior-turn read failed; preserving rebuild notice', {
+              sessionKey: opts.sessionKey,
+              replacementNotice,
+            }, historyErr)
+          }
           await existing.runner.shutdown()
         } catch (err) {
           log.warn('session-replacement shutdown failed', {

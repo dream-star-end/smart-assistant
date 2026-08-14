@@ -1381,6 +1381,11 @@
           "assertion": "parses pinned official tool_call started/completed, including completion-only calls"
         },
         {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/sessionContextRebuildNoticeLifecycle.test.ts",
+          "assertion": "switching an untouched default-engine prewarm to Cursor creates no rebuild notice"
+        },
+        {
           "layer": "deploy-gate",
           "path": "scripts/deploy-v5.sh",
           "assertion": "candidate Cursor stream-json parser gate"
@@ -1388,7 +1393,8 @@
       ],
       "coverageCommits": [
         "35defe79",
-        "96b40ae5"
+        "96b40ae5",
+        "dd86a3e8"
       ]
     }
   ]
