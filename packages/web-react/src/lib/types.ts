@@ -70,8 +70,6 @@ export type Session = {
   /** 会话级模型选择(per-session 持久化;缺省 = 未显式选择 → 选择器回落 default_model)。
    *  来源:本地选择写通 / IndexedDB 注水 / listSessions server-wins;App 切会话据此恢复选择器。 */
   modelId?: string;
-  /** 服务端已有的置顶标记（SessionMeta.pinned）。缺席 = 未置顶。不在本层发明写入口。 */
-  pinned?: boolean;
 };
 
 export type Message = {

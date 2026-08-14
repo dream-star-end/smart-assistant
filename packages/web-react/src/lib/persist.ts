@@ -182,8 +182,6 @@ export type StoredSession = {
   /** 会话级模型选择(per-session 持久化;同设备 reload 即时恢复,服务端 canonical 到达后
    *  server-wins。与 _lastRouting 语义不同:那是"最近实际发送"供合成续写,这是"用户选择"。 */
   _selectedModelId?: string;
-  /** 服务端 SessionMeta/Detail.pinned 的本地镜像。list 到达前的 IDB 注水用；不碰 DB。 */
-  _pinned?: boolean;
   _pendingDispatches?: StoredPendingDispatch[];
   /** Hydration-only view of the exact durable control journal. It is stored in
    * the existing v1 dispatch DB, never inline in the best-effort session row. */
