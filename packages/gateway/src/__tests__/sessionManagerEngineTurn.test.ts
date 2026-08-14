@@ -2521,6 +2521,191 @@ describe("crash/interrupt partial persistence", () => {
     );
   });
 
+  test("fresh Cursor switch consumes an empty first rebuild attempt so routine replay stays silent", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    const runner = new FakeCcbRunner(() => {});
+    const session = makeSession(runner, {
+      sessionKey: "agent:main:webchat:dm:cursor-empty-notice",
+      channel: "webchat",
+      peerId: "cursor-empty-notice",
+      providerTag: "cursor",
+      ccbSessionId: null,
+      _contextRebuildNotice: "engine-switch",
+    } as Partial<AgentSession>);
+    Object.assign(session.runner.capabilities, {
+      historyMode: "stateless-replay",
+      maxPromptBytes: 96 * 1024,
+    });
+    const payloads: string[] = [];
+    const notices: number[] = [];
+    const internals = sm as unknown as {
+      runOneTurnWithRetry: (
+        session: AgentSession,
+        payload: string,
+        ...rest: unknown[]
+      ) => Promise<void>;
+    };
+    internals.runOneTurnWithRetry = async (_session, payload) => {
+      payloads.push(payload);
+    };
+
+    const first = "remember teal-comet";
+    await sm.submit(
+      session,
+      first,
+      () => {},
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {
+        historicalMessages: [
+          { role: "user", id: "client-first", text: first, status: "sending" },
+        ],
+        emitContextRebuilt: ({ messageCount }) => notices.push(messageCount),
+      },
+    );
+
+    assert.equal(payloads[0], first);
+    assert.equal(session._contextRebuildNotice, undefined);
+    assert.equal(notices.length, 0);
+
+    const second = "what was the code";
+    await sm.submit(
+      session,
+      second,
+      () => {},
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {
+        historicalMessages: [
+          { role: "user", id: "client-first", text: first, status: "completed" },
+          {
+            role: "assistant",
+            id: `srv-${session.peerId}-${session.agentId}-t1`,
+            text: "saved teal-comet",
+            status: "completed",
+          },
+          { role: "user", id: "client-second", text: second, status: "sending" },
+        ],
+        emitContextRebuilt: ({ messageCount }) => notices.push(messageCount),
+      },
+    );
+
+    assert.match(payloads[1]!, /<openclaude_previous_context_json>/);
+    assert.match(payloads[1]!, /saved teal-comet/);
+    assert.match(payloads[1]!, /what was the code/);
+    assert.equal(notices.length, 0);
+    assert.equal(session._contextRebuildNotice, undefined);
+  });
+
+  test("stateless replay preserves a rebuild notice when eligible history cannot fit", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    const runner = new FakeCcbRunner(() => {});
+    const session = makeSession(runner, {
+      sessionKey: "agent:main:webchat:dm:cursor-cap-notice",
+      channel: "webchat",
+      peerId: "cursor-cap-notice",
+      providerTag: "cursor",
+      ccbSessionId: null,
+      _contextRebuildNotice: "engine-switch",
+    } as Partial<AgentSession>);
+    Object.assign(session.runner.capabilities, {
+      historyMode: "stateless-replay",
+      maxPromptBytes: 32,
+    });
+    const payloads: string[] = [];
+    const internals = sm as unknown as {
+      runOneTurnWithRetry: (
+        session: AgentSession,
+        payload: string,
+        ...rest: unknown[]
+      ) => Promise<void>;
+    };
+    internals.runOneTurnWithRetry = async (_session, payload) => {
+      payloads.push(payload);
+    };
+
+    await sm.submit(
+      session,
+      "continue",
+      () => {},
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {
+        historicalMessages: [{
+          role: "assistant",
+          id: `srv-${session.peerId}-${session.agentId}-t1`,
+          text: "eligible history",
+        }],
+      },
+    );
+
+    assert.equal(payloads[0], "continue");
+    assert.equal(session._contextRebuildNotice, "engine-switch");
+  });
+
+  test("native rebuild emits once and consumes its explicit notice", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    const runner = new FakeCcbRunner(() => {});
+    const session = makeSession(runner, {
+      sessionKey: "agent:main:webchat:dm:native-notice-once",
+      channel: "webchat",
+      peerId: "native-notice-once",
+      ccbSessionId: null,
+      _contextRebuildNotice: "native-resume-loss",
+    } as Partial<AgentSession>);
+    const payloads: string[] = [];
+    const notices: number[] = [];
+    const internals = sm as unknown as {
+      runOneTurnWithRetry: (
+        session: AgentSession,
+        payload: string,
+        ...rest: unknown[]
+      ) => Promise<void>;
+    };
+    internals.runOneTurnWithRetry = async (_session, payload) => {
+      payloads.push(payload);
+    };
+    const historicalMessages = [
+      { role: "user", id: "native-u1", text: "remember amber-river" },
+      {
+        role: "assistant",
+        id: `srv-${session.peerId}-${session.agentId}-t1`,
+        text: "saved amber-river",
+      },
+    ];
+
+    for (const input of ["continue once", "continue twice"]) {
+      await sm.submit(
+        session,
+        input,
+        () => {},
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        {
+          historicalMessages,
+          emitContextRebuilt: ({ messageCount }) => notices.push(messageCount),
+        },
+      );
+    }
+
+    assert.match(payloads[0]!, /saved amber-river/);
+    assert.equal(payloads[1], "continue twice");
+    assert.deepEqual(notices, [2]);
+    assert.equal(session._contextRebuildNotice, undefined);
+  });
+
   test("runner error waits for drained late output instead of freezing an early partial", async () => {
     const captured = makeCapturingSink();
     setV3MasterSinkSingleton(captured.sink);

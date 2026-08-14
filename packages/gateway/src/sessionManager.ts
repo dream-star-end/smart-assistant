@@ -3635,6 +3635,10 @@ export class SessionManager {
                 },
               )) ?? [],
             )
+          const hasHistoricalContextRows =
+            historyMessages && typeof userTextOrBlocks === 'string'
+              ? buildHistoricalContextPrompt(historyMessages, userTextOrBlocks) !== null
+              : false
           const historicalPrompt = historyMessages && typeof userTextOrBlocks === 'string'
             ? buildHistoricalContextPrompt(
                 historyMessages,
@@ -3671,6 +3675,17 @@ export class SessionManager {
                 log.warn('emit sys.context_rebuilt failed', { sessionKey: session.sessionKey }, emitErr)
               }
             }
+            session._contextRebuildNotice = undefined
+          } else if (!hasHistoricalContextRows) {
+            // A replacement runner owns this reason only for its first
+            // successful history lookup. A fresh conversation can have no
+            // semantic rows beyond the optimistic current user message, so
+            // there is nothing to rebuild or announce. Consume the reason now
+            // instead of leaking it into Cursor's routine next-turn replay.
+            //
+            // The uncapped classification above remains non-null when eligible
+            // history exists but does not fit the provider's byte cap. Keep
+            // the reason in that case for a later successful rebuild notice.
             session._contextRebuildNotice = undefined
           }
         } catch (err) {
