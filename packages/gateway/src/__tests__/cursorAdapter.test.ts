@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { chmod, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, test } from 'node:test'
@@ -44,6 +44,24 @@ function restoreEnv(name: string, value: string | undefined): void {
   if (value === undefined) Reflect.deleteProperty(process.env, name)
   else process.env[name] = value
 }
+async function createBaselineSkills(root: string): Promise<string> {
+  const baselineRoot = path.join(root, 'baseline-skills')
+  const skillDir = path.join(baselineRoot, 'skill-search')
+  await mkdir(skillDir, { recursive: true })
+  await writeFile(
+    path.join(skillDir, 'SKILL.md'),
+    [
+      '---',
+      'name: skill-search',
+      'description: "Search the OpenClaude skill catalog"',
+      'version: 1.0.0',
+      '---',
+      '',
+      '# skill-search',
+    ].join('\n'),
+  )
+  return baselineRoot
+}
 
 describe('CursorAdapter', () => {
   test('parses pinned official stream-json without duplicating the final assistant flush', async () => {
@@ -52,6 +70,7 @@ describe('CursorAdapter', () => {
     const capture = path.join(dir, 'capture.json')
     const sentinel = 'crsr_secret_must_not_leak'
     await writeFile(path.join(dir, 'persona.md'), 'CURSOR_PERSONA_MARKER')
+    const baselineSkills = await createBaselineSkills(dir)
     await writeFile(
       fake,
       `#!/usr/bin/env node
@@ -82,10 +101,12 @@ for(const e of [
     )
     await chmod(fake, 0o755)
     const oldBin = process.env.OC_CURSOR_WRAPPER_BIN
+    const oldBaselineSkills = process.env.OPENCLAUDE_BASELINE_SKILLS_DIR
     const oldAmbientSecrets = Object.fromEntries(
       AMBIENT_SECRET_KEYS.map((key) => [key, process.env[key]]),
     ) as Record<(typeof AMBIENT_SECRET_KEYS)[number], string | undefined>
     process.env.OC_CURSOR_WRAPPER_BIN = fake
+    process.env.OPENCLAUDE_BASELINE_SKILLS_DIR = baselineSkills
     for (const key of AMBIENT_SECRET_KEYS) process.env[key] = `${sentinel}_${key}`
     try {
       const adapterOpts = opts(dir)
@@ -181,6 +202,7 @@ for(const e of [
       await assert.rejects(stat(launched.configPath))
     } finally {
       restoreEnv('OC_CURSOR_WRAPPER_BIN', oldBin)
+      restoreEnv('OPENCLAUDE_BASELINE_SKILLS_DIR', oldBaselineSkills)
       for (const key of AMBIENT_SECRET_KEYS) restoreEnv(key, oldAmbientSecrets[key])
       await rm(dir, { recursive: true, force: true })
     }
@@ -191,6 +213,7 @@ for(const e of [
     const fake = path.join(dir, 'fake.cjs')
     const capture = path.join(dir, 'captures.jsonl')
     await writeFile(path.join(dir, 'persona.md'), 'CURSOR_SECOND_TURN_PERSONA_MARKER')
+    const baselineSkills = await createBaselineSkills(dir)
     await writeFile(
       fake,
       `#!/usr/bin/env node
@@ -208,7 +231,9 @@ console.log(JSON.stringify({type:'result',subtype:'success',is_error:false}));
     )
     await chmod(fake, 0o755)
     const old = process.env.OC_CURSOR_WRAPPER_BIN
+    const oldBaselineSkills = process.env.OPENCLAUDE_BASELINE_SKILLS_DIR
     process.env.OC_CURSOR_WRAPPER_BIN = fake
+    process.env.OPENCLAUDE_BASELINE_SKILLS_DIR = baselineSkills
     try {
       const adapter = new CursorAdapter(opts(dir))
       adapter.on('error', () => {})
@@ -263,6 +288,7 @@ console.log(JSON.stringify({type:'result',subtype:'success',is_error:false}));
       assert.equal(launched[1].prompt.includes('FIRST_TURN_PAYLOAD_ONLY'), false)
     } finally {
       restoreEnv('OC_CURSOR_WRAPPER_BIN', old)
+      restoreEnv('OPENCLAUDE_BASELINE_SKILLS_DIR', oldBaselineSkills)
       await rm(dir, { recursive: true, force: true })
     }
   })
