@@ -314,6 +314,7 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
     supportsEffort: true,
     resumeKind: 'codex-thread',
     needsServerRequestId: true,
+    historyMode: 'native-resume',
   }
 
   private readonly kernel: CodexAppServerRunner

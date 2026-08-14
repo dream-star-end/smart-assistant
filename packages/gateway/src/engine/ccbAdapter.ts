@@ -238,6 +238,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
     supportsEffort: true,
     resumeKind: 'ccb-session',
     needsServerRequestId: false,
+    historyMode: 'native-resume',
   }
 
   private readonly runner: SubprocessRunner

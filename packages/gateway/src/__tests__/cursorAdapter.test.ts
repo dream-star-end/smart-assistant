@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { chmod, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -150,16 +151,18 @@ for(const e of [
     }
   })
 
-  test('parses pinned official tool_call started/completed, including completion-only calls', async () => {
+  test('parses pinned official tool_call started/completed, including completion-only calls, and normalizes one-of variants', async () => {
     const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-tool-'))
     const fake = path.join(dir, 'fake.cjs')
     await writeFile(
       fake,
       `#!/usr/bin/env node
 for(const e of [
-  {type:'tool_call',subtype:'started',call_id:'t1',tool_call:{tool:{case:'shellToolCall'},command:'pwd'}},
-  {type:'tool_call',subtype:'completed',call_id:'t1',tool_call:{tool:{case:'shellToolCall'},result:{case:'success'},stdout:'ok'}},
-  {type:'tool_call',subtype:'completed',call_id:'t2',tool_call:{tool:{case:'readToolCall'},result:{case:'failure'},error:'missing'}},
+  {type:'tool_call',subtype:'started',tool_call:{toolCallId:'shell\\n1',shellToolCall:{args:{command:'pwd'}}}},
+  {type:'tool_call',subtype:'completed',tool_call:{toolCallId:'shell\\n1',shellToolCall:{args:{command:'pwd'},result:{success:{stdout:'ok',stderr:''}}}}},
+  {type:'tool_call',subtype:'completed',tool_call:{toolCallId:'read\\n2',readToolCall:{args:{path:'/missing',offset:2,limit:3},result:{error:{message:'missing'}}}}},
+  {type:'tool_call',subtype:'started',call_id:'glob-3',tool_call:{globToolCall:{args:{globPattern:'*.ts',targetDirectory:'/repo'}}}},
+  {type:'tool_call',subtype:'completed',call_id:'glob-3',tool_call:{globToolCall:{args:{globPattern:'*.ts',targetDirectory:'/repo'},result:{success:{files:['a.ts','b.ts']}}}}},
   {type:'result',subtype:'success',is_error:false},
 ]) console.log(JSON.stringify(e))
 `,
@@ -180,18 +183,164 @@ for(const e of [
       await run.submitted
       const summary = await run.summary
       await adapter.waitForOutputDrain()
-      assert.equal(summary?.tools.length, 2)
-      assert.equal(summary?.tools[0]?.toolUseId, 't1')
-      assert.equal(summary?.tools[0]?.toolName, 'shellToolCall')
+      assert.equal(summary?.tools.length, 3)
+      assert.match(summary?.tools[0]?.toolUseId ?? '', /^cursor-tool-[a-f0-9]{64}$/)
+      assert.equal(summary?.tools[0]?.toolName, 'Bash')
+      assert.deepEqual(summary?.tools[0]?.inputJson, { command: 'pwd' })
+      assert.equal(summary?.tools[0]?.output, 'ok')
       assert.equal(summary?.tools[0]?.completed, true)
       assert.equal(summary?.tools[0]?.isError, false)
-      assert.equal(summary?.tools[1]?.toolUseId, 't2')
-      assert.equal(summary?.tools[1]?.toolName, 'readToolCall')
+      assert.equal(summary?.tools[1]?.toolName, 'Read')
+      assert.deepEqual(summary?.tools[1]?.inputJson, { file_path: '/missing', offset: 2, limit: 3 })
       assert.equal(summary?.tools[1]?.completed, true)
+      assert.equal(summary?.tools[1]?.isError, true)
+      assert.match(summary?.tools[1]?.output ?? '', /missing/)
+      assert.equal(summary?.tools[2]?.toolName, 'Glob')
+      assert.deepEqual(summary?.tools[2]?.inputJson, { pattern: '*.ts', path: '/repo' })
+      assert.equal(summary?.tools[2]?.output, 'a.ts\nb.ts')
+    } finally {
+      restoreEnv('OC_CURSOR_WRAPPER_BIN', old)
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('creates ordered text/thinking segments across one tool boundary with indexed live ids', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-segments-'))
+    const fake = path.join(dir, 'fake.cjs')
+    await writeFile(
+      fake,
+      `#!/usr/bin/env node
+for(const e of [
+  {type:'text',text:'A'},
+  {type:'thinking',text:'T'},
+  {type:'tool_call',subtype:'started',call_id:'tool-1',tool_call:{shellToolCall:{args:{command:'pwd'}}}},
+  {type:'tool_call',subtype:'completed',call_id:'tool-1',tool_call:{shellToolCall:{result:{success:{stdout:'ok'}}}}},
+  {type:'text',text:'B'},
+  {type:'thinking',text:'U'},
+  {type:'result',subtype:'success',is_error:false},
+]) console.log(JSON.stringify(e))
+`,
+    )
+    await chmod(fake, 0o755)
+    const old = process.env.OC_CURSOR_WRAPPER_BIN
+    process.env.OC_CURSOR_WRAPPER_BIN = fake
+    try {
+      const adapter = new CursorAdapter(opts(dir))
+      adapter.on('error', () => {})
+      const events: EngineEvent[] = []
+      let ordinal = 0
+      const run = adapter.submitTurn({
+        input: 'x',
+        requestId: REQUEST,
+        assistantMessageId: 'assistant-base',
+        thinkingMessageId: 'thinking-base',
+        nextDurableEventOrdinal: () => ordinal++,
+        onEvent: (event) => events.push(event),
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run.submitted
+      const summary = await run.summary
+      await adapter.waitForOutputDrain()
+
+      assert.deepEqual(summary?.assistantSegments.map(({ index, text }) => ({ index, text })), [
+        { index: 0, text: 'A' },
+        { index: 1, text: 'B' },
+      ])
+      assert.deepEqual(summary?.thinkingSegments.map(({ index, text }) => ({ index, text })), [
+        { index: 0, text: 'T' },
+        { index: 1, text: 'U' },
+      ])
+      const textIds = events.flatMap((event) =>
+        event.kind === 'block' && event.block.kind === 'text'
+          ? [event.block.messageId]
+          : [],
+      )
+      const thinkingIds = events.flatMap((event) =>
+        event.kind === 'block' && event.block.kind === 'thinking'
+          ? [event.block.messageId]
+          : [],
+      )
+      assert.deepEqual(textIds, ['assistant-base-s0', 'assistant-base-s1'])
+      assert.deepEqual(thinkingIds, ['thinking-base-s0', 'thinking-base-s1'])
+      const firstTextOrdinal = summary?.assistantSegments[0]?.eventOrdinal ?? -1
+      const firstThinkingOrdinal = summary?.thinkingSegments[0]?.eventOrdinal ?? -1
+      const toolOrdinal = summary?.tools[0]?.eventOrdinal ?? -1
+      const secondTextOrdinal = summary?.assistantSegments[1]?.eventOrdinal ?? -1
+      const secondThinkingOrdinal = summary?.thinkingSegments[1]?.eventOrdinal ?? -1
+      assert.ok(firstTextOrdinal < firstThinkingOrdinal)
+      assert.ok(firstThinkingOrdinal < toolOrdinal)
+      assert.ok(toolOrdinal < secondTextOrdinal)
+      assert.ok(secondTextOrdinal < secondThinkingOrdinal)
+    } finally {
+      restoreEnv('OC_CURSOR_WRAPPER_BIN', old)
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('domain-separated tool ids remain stable and cannot collide with raw safe-looking ids', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-tool-ids-'))
+    const fake = path.join(dir, 'fake.cjs')
+    const firstRaw = 'unsafe\nraw'
+    const firstDerived = `cursor-tool-${createHash('sha256')
+      .update(`openclaude:cursor-tool-id:v1:0:${firstRaw}`)
+      .digest('hex')}`
+    await writeFile(
+      fake,
+      `#!/usr/bin/env node
+for(const e of [
+  {type:'tool_call',subtype:'started',call_id:${JSON.stringify(firstRaw)},tool_call:{shellToolCall:{args:{command:'pwd'}}}},
+  {type:'tool_call',subtype:'completed',call_id:${JSON.stringify(firstRaw)},tool_call:{shellToolCall:{result:{success:{stdout:'ok'}}}}},
+  {type:'tool_call',subtype:'completed',call_id:${JSON.stringify(firstDerived)},tool_call:{globToolCall:{args:{globPattern:'*'},result:{rejected:{message:'no'}}}}},
+  {type:'result',subtype:'success',is_error:false},
+]) console.log(JSON.stringify(e))
+`,
+    )
+    await chmod(fake, 0o755)
+    const old = process.env.OC_CURSOR_WRAPPER_BIN
+    process.env.OC_CURSOR_WRAPPER_BIN = fake
+    try {
+      const adapter = new CursorAdapter(opts(dir))
+      adapter.on('error', () => {})
+      const run = adapter.submitTurn({
+        input: 'x',
+        requestId: REQUEST,
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run.submitted
+      const summary = await run.summary
+      await adapter.waitForOutputDrain()
+      assert.equal(summary?.tools[0]?.toolUseId, firstDerived)
+      assert.notEqual(summary?.tools[1]?.toolUseId, firstDerived)
+      assert.notEqual(summary?.tools[0]?.toolUseId, summary?.tools[1]?.toolUseId)
       assert.equal(summary?.tools[1]?.isError, true)
     } finally {
       restoreEnv('OC_CURSOR_WRAPPER_BIN', old)
       await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('rejects an oversized UTF-8 prompt before spawning the Cursor wrapper', async () => {
+    const old = process.env.OC_CURSOR_WRAPPER_BIN
+    process.env.OC_CURSOR_WRAPPER_BIN = '/definitely/not/a/cursor-wrapper'
+    try {
+      const adapter = new CursorAdapter(opts('/tmp'))
+      adapter.on('error', () => {})
+      const run = adapter.submitTurn({
+        input: '你'.repeat(40_000),
+        requestId: REQUEST,
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await assert.rejects(run.submitted, /PROMPT_TOO_LONG/)
+      const summary = await run.summary
+      assert.equal(summary?.isError, true)
+      assert.equal(summary?.errorClass, 'context_too_long')
+    } finally {
+      restoreEnv('OC_CURSOR_WRAPPER_BIN', old)
     }
   })
 

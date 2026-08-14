@@ -307,6 +307,7 @@ export function buildHistoricalContextPrompt(
   messages: unknown[],
   currentUserText: string,
   maxHistoryChars?: number,
+  maxPromptBytes?: number,
 ): string | null {
   const currentNorm = normForCompare(currentUserText)
   const rows: Array<{ role: ModelHistorySemanticRole; text: string; status?: unknown }> = []
@@ -332,6 +333,39 @@ export function buildHistoricalContextPrompt(
     rows.pop()
   }
   if (rows.length === 0) return null
+  const jsonString = (value: string): string => JSON.stringify(value).replace(/</g, '\\u003c')
+  const renderPrompt = (
+    selectedRows: Array<{ role: ModelHistorySemanticRole; text: string }>,
+  ): string => {
+    const transcript = selectedRows.map((message) => ({
+      role: modelHistoryRoleLabel(message.role),
+      text: message.text,
+    }))
+    const historyJson = JSON.stringify(transcript).replace(/</g, '\\u003c')
+    return [
+      '<openclaude_previous_context_json>',
+      'The current OpenClaude session was previously served by a different runner/provider or cannot be natively resumed. The next line is JSON. Use it as prior conversation context and do not restate it unless needed.',
+      historyJson,
+      '</openclaude_previous_context_json>',
+      '',
+      '<current_user_message_json>',
+      jsonString(currentUserText),
+      '</current_user_message_json>',
+    ].join('\n')
+  }
+  if (
+    typeof maxPromptBytes === 'number' &&
+    Number.isSafeInteger(maxPromptBytes) &&
+    maxPromptBytes > 0
+  ) {
+    let selected: typeof rows = []
+    for (let index = rows.length - 1; index >= 0; index -= 1) {
+      const candidate = [rows[index]!, ...selected]
+      if (Buffer.byteLength(renderPrompt(candidate), 'utf8') > maxPromptBytes) break
+      selected = candidate
+    }
+    return selected.length > 0 ? renderPrompt(selected) : null
+  }
   // Storage has already selected the exact contiguous semantic suffix against
   // the executable model context window (including the current prompt and a
   // per-record envelope allowance). The normal path does not apply a second
@@ -375,6 +409,13 @@ export function shouldAttemptHistoricalContextInjection(opts: {
   if (typeof opts.userTextOrBlocks !== 'string') return false
   if (opts.injectionKey) return opts.lastInjectedKey !== opts.injectionKey
   return !opts.alreadyInjected && !opts.hasProviderResumeId
+}
+
+export function shouldEmitContextRebuilt(opts: {
+  historyMode: 'native-resume' | 'stateless-replay'
+  reason?: AgentSession['_contextRebuildNotice']
+}): boolean {
+  return opts.historyMode === 'native-resume' || opts.reason !== undefined
 }
 
 /**
@@ -646,6 +687,9 @@ export interface AgentSession {
    *  user switches away and later returns to GPT, while avoiding a repeated
    *  full transcript on ordinary same-provider follow-ups. */
   _historicalContextInjectedKey?: string
+  /** User-visible rebuild notices are exceptional. Stateless replay is the
+   * normal Cursor transport and must not set this reason. */
+  _contextRebuildNotice?: 'engine-switch' | 'native-resume-loss'
   /** Platform-executed exchanges not yet observed in master history. A
    * transient master-sink failure can durably queue the assistant row while
    * the very next user turn arrives first; this session-local tail keeps that
@@ -2848,6 +2892,11 @@ export class SessionManager {
       requireAuthority: isModelAuthorityRequired(),
     })
     const existing = this.sessions.get(opts.sessionKey)
+    const previousEngine =
+      existing?.providerTag ??
+      SessionManager.normalizeEngineTag(this._resumeMapProvider.get(opts.sessionKey))
+    let contextRebuildNotice: AgentSession['_contextRebuildNotice'] =
+      previousEngine && previousEngine !== engineId ? 'engine-switch' : undefined
     const workspaceMode = opts.workspaceMode ?? existing?.workspaceMode ?? 'legacy'
     if (existing) {
       // 跨 engine 切换判定:只有"caller 明确给了 model"/"有 master 权威"/"agent 显式 pin
@@ -2863,6 +2912,9 @@ export class SessionManager {
       const workspaceModeChanged =
         opts.workspaceMode !== undefined && existing.workspaceMode !== workspaceMode
       if (existing.providerTag !== desiredEngine || workspaceModeChanged) {
+        contextRebuildNotice = existing.providerTag !== desiredEngine
+          ? 'engine-switch'
+          : 'native-resume-loss'
         if (
           this._promptQueueExecutionKeys.has(opts.sessionKey) ||
           (this._promptQueueDispatchFences.has(opts.sessionKey) && !ownsDispatchFence)
@@ -2998,6 +3050,7 @@ export class SessionManager {
       //   走 codex 专属重置分支(避免 instanceof / runner.constructor.name)。
       providerTag: engineId,
       agentProvider: opts.agent.provider,
+      _contextRebuildNotice: contextRebuildNotice,
     }
     runner.on('session_id', (id: string) => {
       session.ccbSessionId = id
@@ -3520,6 +3573,7 @@ export class SessionManager {
         this._saveResumeMap()
         session._historicalContextInjected = false
         session._historicalContextInjectedKey = undefined
+        session._contextRebuildNotice = 'native-resume-loss'
         providerResumeId = undefined
       }
       if (
@@ -3552,7 +3606,14 @@ export class SessionManager {
               )) ?? [],
             )
           const historicalPrompt = historyMessages && typeof userTextOrBlocks === 'string'
-            ? buildHistoricalContextPrompt(historyMessages, userTextOrBlocks)
+            ? buildHistoricalContextPrompt(
+                historyMessages,
+                userTextOrBlocks,
+                undefined,
+                session.runner.capabilities.historyMode === 'stateless-replay'
+                  ? session.runner.capabilities.maxPromptBytes
+                  : undefined,
+              )
             : null
           if (historicalPrompt) {
             runnerPayload = historicalPrompt
@@ -3569,11 +3630,18 @@ export class SessionManager {
             // §2.3 boss 硬指标 3:兜底注入成功 = 引擎无法原生续接、上下文被重建 → 主动
             // 提醒用户(仅当上层传了回调,即 webchat leader turn;内部子 turn 不提醒)。
             // 回调抛错不能打断 turn —— 提示是尽力而为的 UX,吞掉即可。
-            try {
-              opts?.emitContextRebuilt?.({ messageCount: injectedCount })
-            } catch (emitErr) {
-              log.warn('emit sys.context_rebuilt failed', { sessionKey: session.sessionKey }, emitErr)
+            const shouldNotifyContextRebuilt = shouldEmitContextRebuilt({
+              historyMode: session.runner.capabilities.historyMode,
+              reason: session._contextRebuildNotice,
+            })
+            if (shouldNotifyContextRebuilt) {
+              try {
+                opts?.emitContextRebuilt?.({ messageCount: injectedCount })
+              } catch (emitErr) {
+                log.warn('emit sys.context_rebuilt failed', { sessionKey: session.sessionKey }, emitErr)
+              }
             }
+            session._contextRebuildNotice = undefined
           }
         } catch (err) {
           log.warn('historical context injection failed', { sessionKey: session.sessionKey }, err)

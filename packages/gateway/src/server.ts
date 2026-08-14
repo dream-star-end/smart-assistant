@@ -3936,7 +3936,7 @@ export class Gateway {
           'Content-Length': contentLength,
           'Accept-Ranges': 'bytes',
           'ETag': `"${head.contentSha256}"`,
-          'X-OpenClaude-Record-Id': head.msgId,
+          ..._immutableRecordIdHeaders(head.msgId),
           'X-OpenClaude-Record-Role': head.role,
           'X-OpenClaude-Content-Sha256': head.contentSha256,
           ...(range ? { 'Content-Range': `bytes ${start}-${endExclusive - 1}/${head.totalBytes}` } : {}),
@@ -4032,7 +4032,7 @@ export class Gateway {
           'Content-Length': contentLength,
           'Accept-Ranges': 'bytes',
           'ETag': `"${head.contentSha256}"`,
-          'X-OpenClaude-Record-Id': head.msgId,
+          ..._immutableRecordIdHeaders(head.msgId),
           'X-OpenClaude-Record-Role': head.role,
           'X-OpenClaude-Content-Sha256': head.contentSha256,
           ...(range ? { 'Content-Range': `bytes ${start}-${endExclusive - 1}/${head.totalBytes}` } : {}),
@@ -16309,6 +16309,18 @@ export function staticCacheControl(safePath: string, mode: 'vanilla' | 'spa' | u
       : 'no-cache'
   }
   return safePath === '/sw.js' ? 'no-cache, no-store, must-revalidate' : 'public, max-age=3600'
+}
+
+/** Deferred record IDs are immutable identity metadata. New records normally
+ * use visible ASCII IDs, but historical Cursor call IDs may contain LF or
+ * Unicode. Never pass those bytes directly to node:http header validation. */
+export function _immutableRecordIdHeaders(recordId: string): Record<string, string> {
+  if (/^[\x21-\x7e]{1,1024}$/.test(recordId)) {
+    return { 'X-OpenClaude-Record-Id': recordId }
+  }
+  return {
+    'X-OpenClaude-Record-Id-Base64url': Buffer.from(recordId, 'utf8').toString('base64url'),
+  }
 }
 
 // 活跃内容 MIME 集合 + inline 判定已收敛到 @openclaude/protocol 的单一权威(批D D5)。

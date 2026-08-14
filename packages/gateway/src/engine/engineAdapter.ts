@@ -38,6 +38,12 @@ export interface EngineCapabilities {
   supportsEffort: boolean
   resumeKind: 'ccb-session' | 'codex-thread' | 'grok-session' | 'cursor-session'
   needsServerRequestId: boolean
+  /** Native engines retain provider-owned state across turns. Stateless
+   * engines must receive a bounded master-history replay on every turn. */
+  historyMode: 'native-resume' | 'stateless-replay'
+  /** Maximum UTF-8 bytes allowed for the final prompt argument, when the
+   * engine transports the prompt as one argv element. */
+  maxPromptBytes?: number
 }
 
 /**

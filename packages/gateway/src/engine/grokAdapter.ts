@@ -151,6 +151,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     supportsEffort: true,
     resumeKind: 'grok-session',
     needsServerRequestId: true,
+    historyMode: 'native-resume',
   }
 
   private readonly opts: EngineCreateOpts
