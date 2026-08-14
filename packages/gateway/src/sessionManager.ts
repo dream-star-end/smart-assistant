@@ -2937,10 +2937,12 @@ export class SessionManager {
               legacyId && legacyId !== opts.sessionKey
                 ? [opts.sessionKey, legacyId]
                 : [opts.sessionKey]
+            // Native resume ids are process/thread handles, not turn evidence:
+            // Codex app-server can emit one during an untouched browser prewarm.
+            // Durable reservations are the authority for attempted real turns;
+            // FTS/meta inside the helper cover pre-reservation legacy history.
             const hadPriorProviderState =
               existing.turns > 0 ||
-              existing.ccbSessionId !== null ||
-              legacyId !== undefined ||
               await hasPersistedTurnActivity(ids)
             // Browser creation persists the UI-default engine before the first
             // real turn. Switching that untouched prewarm to Cursor is not a
