@@ -23,7 +23,8 @@
 #   scripts/deploy-v5.sh --with-dist --defer-knowledge-planet-upgrade
 #                                  # 一次性先上线知识星球扫码 UI；保留旧 v1.0 执行 pin，扫码后再走正常升级
 #   scripts/deploy-v5.sh --smoke       # 仅跑 v5 健康/隔离断言
-#   scripts/deploy-v5.sh --hot-config  # 纯配置热更新:白名单校验 + 不重建 dist + 与 --with-dist 同强度健康门
+#   scripts/deploy-v5.sh --hot-config  # 安全带:打印 v5-change-route 后拒绝部署(allow 为空,走写 lane=绿灯空发布)
+#   scripts/v5-change-route.sh         # 改动路由顾问:输入变更集,输出该走哪条 lane
 #                                  # 只接受 catalog/env/文案;TS/JS/schema/迁移直接拒绝。绕过必须
 #                                  # --hot-config-force + OC_V5_HOT_CONFIG_FORCE_REASON(写审计日志)。
 #   scripts/deploy-v5.sh --dist        # 仅前端生效面:vite build + 竞态安全 rsync + 资产GC + restart + 版本握手 smoke
@@ -369,18 +370,24 @@ if [[ "$HOT_CONFIG" == 1 ]]; then
     exit 2
   }
   [[ "$WITH_DIST" != 1 ]] || {
-    echo "✗ --hot-config 与 --with-dist 互斥:热配置路径明确不重建 dist" >&2
+    echo "✗ --hot-config 与 --with-dist 互斥:热配置路径明确不重建 dist。若要同时看路由,请跑 scripts/v5-change-route.sh" >&2
     exit 2
   }
   [[ "$DEFER_KNOWLEDGE_PLANET_UPGRADE" != 1 ]] || {
     echo "✗ --hot-config 不能与 --defer-knowledge-planet-upgrade 同用" >&2
     exit 2
   }
-  # 锁/lease 之前本地 fail-closed:脏源码 diff 绝不能靠「已经抢到锁」继续。
-  # dry-run 也跑,这样 --hot-config --dry-run 在本机就能验白名单,不必 SSH 生产。
+  # 安全带:allow 集为空。打印改动路由后拒绝部署,避免绿灯空发布。
+  # 日常请直接跑 scripts/v5-change-route.sh;本旗标不会抢锁、不会 SSH。
   if [[ "${V5_DEPLOY_SOURCE_ONLY:-0}" != 1 ]]; then
-    assert_hot_config_changeset || exit 2
+    echo "── --hot-config 是安全带,不会部署。改动路由如下 ──"
+    bash "$SCRIPT_DIR/v5-change-route.sh" || true
   fi
+  echo "✗ --hot-config 拒绝执行 deploy:当前没有任何已证明的热配置生效面。请走 scripts/v5-change-route.sh 给出的 lane。" >&2
+  if [[ "$HOT_CONFIG_FORCE" == 1 ]]; then
+    echo "✗ --hot-config-force 也不能把空发布变成真发布。紧急绕过只留在 v5-hot-config-lib.sh --check + 审计日志,deploy 入口不再走写 lane。" >&2
+  fi
+  exit 2
 fi
 [[ -n "$CUTOVER_NONCE" && ! "$CUTOVER_NONCE" =~ ^[0-9a-f]{32}$ ]] && { echo "✗ cutover nonce 必须是 32 位小写 hex" >&2; exit 2; }
 [[ "$CADDY_HTTP_PORT" =~ ^[1-9][0-9]{0,4}$ ]] && (( CADDY_HTTP_PORT <= 65535 )) \
