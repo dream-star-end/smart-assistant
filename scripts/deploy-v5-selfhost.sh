@@ -48,6 +48,8 @@ V5_CONTROL_PORT="18894"
 V5_BASELINE_PORT="18893"
 PG_DB="openclaude_v5_selfhost"
 PG_ROLE="oc_v5_selfhost"
+# catalog mutation 专用低权角色。必须与 PG_ROLE 不同名,否则 master 开 model authority 拒启。
+CATALOG_ADMIN_ROLE="${PG_ROLE}_catalog_admin"
 REDIS_URL="redis://127.0.0.1:6379/3"
 RUNTIME_IMAGE="openclaude/openclaude-runtime:v5-grok-21e30788a613-slim"
 SECRETS_ENV="/etc/openclaude/secrets.env"
@@ -326,6 +328,76 @@ enable_registration() {
      ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW();" \
     || die "写 allow_registration 失败。补救: 确认 migration 已建 system_settings 且连的是 ${PG_DB}。"
   log "  ✓ allow_registration=true"
+}
+
+# ── model authority ──────────────────────────────────────────────────────
+#
+# 不开 OC_MODEL_AUTHORITY,master 不处理容器 attest → containerHasDurableDispatch 恒 false
+# → 永不 admitUserTurn → turn_dispatches 空 → liveTurnFrames 的 streamKey 退化成
+# legacy:<容器>:<会话>(不含 clientMessageId)→ 同一会话第二条消息撞上第一条建的
+# client_session_live_streams 行 → "live frame stream identity conflict" → 整条连接断。
+# 生产这个键由 deploy-v5.sh --enable-model-authority 单独写入,不在 commercial-v5.env.overrides
+# 里,照抄 overrides 就会漏(2026-08-14 本实例即因此每个会话只能发一条消息)。
+#
+# 开 flag 后 master 启动期 fail-closed 要求 MODEL_CATALOG_ADMIN_DATABASE_URL 指向一个与
+# app role **不同名**的角色(modelCatalogAdmin.ts:26),所以角色与 flag 必须同一步写齐,
+# 否则 master 拒启。授权只走 0144 定义的 fn_model_authority_grant_admin_role:它先撤直写
+# 权限再授 SELECT + 受控 mutation procedure + admin_audit,手工授表权限既过宽又会漏审计权限。
+#
+# 回滚不是「删掉 flag 重启」:已带 flag 的容器仍要求签名 envelope,而关掉的 master 不再
+# 签发,清退完成前用户消息会被 runtime 拒(modelAuthorityRollback.ts:4-8)。正确顺序是
+# ① 保持 OC_MODEL_AUTHORITY=1,先把 OC_MODEL_AUTHORITY_PROVISION_REQUIRED 改 0 并重启,
+# 停止制造新强制容器;② authenticated drain 掉所有 flagged/provisioning/unknown 容器并
+# 满足 quiet window;③ 最后才关总 flag,且仍按 egress→master 顺序切。
+
+ensure_model_authority() {
+  local pass admin_url cur got
+  log "── 启用 model authority(durable turn dispatch 的前置)──"
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] 建 role ${CATALOG_ADMIN_ROLE} + fn_model_authority_grant_admin_role();upsert MODEL_CATALOG_ADMIN_DATABASE_URL / OC_MODEL_AUTHORITY=1 / OC_MODEL_AUTHORITY_PROVISION_REQUIRED=1"
+    return 0
+  fi
+  [[ -f "$V5_ENV" ]] || die "缺 $V5_ENV。补救: write_env_file 应先跑。"
+
+  # 已有可连的 admin URL 就不轮换密码,避免每次 deploy 无谓改密。
+  cur="$(oc_hotcfg_env_get "$V5_ENV" MODEL_CATALOG_ADMIN_DATABASE_URL)"
+  if [[ -n "$cur" ]] && psql "$cur" -X -tAc 'SELECT 1' >/dev/null 2>&1; then
+    admin_url="$cur"
+    log "  ⚠ catalog admin 连接已可用 → 保留现有密码"
+  else
+    # hex 密码:URL 里无需 percent-encode。
+    pass="$(openssl rand -hex 24)"
+    psql_as_postgres -d "$PG_DB" -c "
+      DO \$\$
+      BEGIN
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname='${CATALOG_ADMIN_ROLE}') THEN
+          ALTER ROLE ${CATALOG_ADMIN_ROLE} WITH LOGIN PASSWORD '${pass}';
+        ELSE
+          CREATE ROLE ${CATALOG_ADMIN_ROLE} LOGIN PASSWORD '${pass}';
+        END IF;
+      END
+      \$\$;
+      GRANT CONNECT ON DATABASE ${PG_DB} TO ${CATALOG_ADMIN_ROLE};
+      GRANT USAGE ON SCHEMA public TO ${CATALOG_ADMIN_ROLE};" \
+      || die "建 catalog admin role 失败。补救: 确认能 sudo -u postgres 且库 ${PG_DB} 可连。"
+    admin_url="postgres://${CATALOG_ADMIN_ROLE}:${pass}@127.0.0.1:5432/${PG_DB}"
+    log "  ✓ role ${CATALOG_ADMIN_ROLE} 就绪"
+  fi
+
+  # 幂等,且后续 migration 新增受控 procedure 后能补授权,所以每次都重跑。
+  psql_as_postgres -d "$PG_DB" -c "SELECT fn_model_authority_grant_admin_role('${CATALOG_ADMIN_ROLE}')" >/dev/null \
+    || die "fn_model_authority_grant_admin_role 执行失败。补救: 确认 0144_model_authority_guards 已 apply(run_migrations 应先跑)。"
+
+  # 启动期断言等价校验:角色解析正确 + 真拿到 catalog 读与审计写。
+  got="$(psql "$admin_url" -X -tAc "SELECT current_user || ':' || has_table_privilege('model_catalog','SELECT')::text || ':' || has_table_privilege('admin_audit','INSERT')::text" | tr -d '[:space:]')"
+  # boolean::text 是 'true'/'false',不是 psql 布尔列显示的 t/f。
+  [[ "$got" == "${CATALOG_ADMIN_ROLE}:true:true" ]] \
+    || die "catalog admin 权限校验失败(得到 '${got}',期望 '${CATALOG_ADMIN_ROLE}:true:true')。补救: 检查 fn_model_authority_grant_admin_role 是否覆盖 model_catalog/admin_audit。"
+
+  ensure_env_kv "$V5_ENV" MODEL_CATALOG_ADMIN_DATABASE_URL "$admin_url"
+  ensure_env_kv "$V5_ENV" OC_MODEL_AUTHORITY 1
+  ensure_env_kv "$V5_ENV" OC_MODEL_AUTHORITY_PROVISION_REQUIRED 1
+  log "  ✓ OC_MODEL_AUTHORITY=1 / PROVISION_REQUIRED=1 / MODEL_CATALOG_ADMIN_DATABASE_URL"
 }
 
 # ── env / HOME ───────────────────────────────────────────────────────────
@@ -761,12 +833,23 @@ hotcfg_smoke_cmd() {
   printf '%s' 'hz=""; for i in $(seq 1 30); do hz=$(curl -fsS --max-time 5 http://127.0.0.1:'"$V5_PORT"'/healthz 2>/dev/null||true); echo "$hz" | jq -e ".ok==true and .runtime.controlPlaneEnabled==true and .runtime.leadership.state==\"leader\"" >/dev/null 2>&1 && break; sleep 2; done; echo "$hz" | jq -e ".ok==true and .runtime.controlPlaneEnabled==true and .runtime.leadership.state==\"leader\"" >/dev/null'
 }
 
+# egress 必须先于 master 就绪:反过来会出现「新 master 已签发 authority envelope、
+# 旧 egress 还没 enforce」的 fail-open 窗口(尤其 ensure_model_authority 刚把 flag 从
+# 无写到有的那次 deploy)。一次 systemctl 传两个 unit 是并行提交 job,不保证顺序,
+# 两个 unit 之间也没有 Before/After 依赖,所以这里显式串行 + 就绪断言。
+#
+# 判据用端口而不是解析 append-only 日志:egress/main.ts 里 model_catalog_ready(:189)
+# 早于 egress_listening(:493),所以「端口可连」即「catalog 已就绪且 enforce 已定」。
+egress_then_master_restart_cmd() {
+  printf '%s' "systemctl restart '$V5_EGRESS_UNIT' && timeout 90 bash -c 'until (exec 3<>/dev/tcp/$V5_EGRESS_BIND/$V5_EGRESS_PORT) 2>/dev/null; do sleep 1; done' && systemctl restart '$V5_UNIT'"
+}
+
 activate_tuple() {
   local image_id bundle_val restart_cmd smoke_cmd
   log "── 激活 runtime tuple saga ──"
   image_id="$RUNTIME_IMAGE_ID"
   bundle_val="$OC_HOTCFG_PLATFORM_ROOT/bundles/$BUILT_BUNDLE_REV"
-  restart_cmd="systemctl restart '$V5_EGRESS_UNIT' '$V5_UNIT'"
+  restart_cmd="$(egress_then_master_restart_cmd)"
   smoke_cmd="$(hotcfg_smoke_cmd)"
   if [[ "$DRY" == 1 ]]; then
     echo "  [dry-run] oc_hotcfg_activate_saga env=$V5_ENV image=$RUNTIME_IMAGE release=$BUILT_RUNTIME_RELEASE bundle=$bundle_val restart='$restart_cmd'"
@@ -784,8 +867,11 @@ activate_tuple() {
 }
 
 enable_now_services() {
-  log "── enable --now egress + master ──"
-  run "systemctl enable --now '$V5_EGRESS_UNIT' '$V5_UNIT'"
+  log "── enable --now egress + master(egress 先就绪,理由见 egress_then_master_restart_cmd)──"
+  run "systemctl enable '$V5_EGRESS_UNIT' '$V5_UNIT'"
+  run "systemctl start '$V5_EGRESS_UNIT'"
+  run "timeout 90 bash -c 'until (exec 3<>/dev/tcp/$V5_EGRESS_BIND/$V5_EGRESS_PORT) 2>/dev/null; do sleep 1; done'"
+  run "systemctl start '$V5_UNIT'"
 }
 
 # ── smoke / status ───────────────────────────────────────────────────────
@@ -926,6 +1012,7 @@ cmd_bootstrap() {
   enable_registration "$url"
   write_env_file "$pass"
   ensure_selfhost_env_keys
+  ensure_model_authority
   ensure_home_config
   ensure_worktree_complete
   cutover_sessions_to_pg "$url"
@@ -958,6 +1045,8 @@ cmd_deploy() {
   # env 固定 COMMERCIAL_AUTO_MIGRATE=0,新代码要的表/列没人建。runner 靠
   # schema_migrations 记账幂等,所以每次 deploy 都跑,且必须赶在切 tuple 重启之前。
   run_migrations "$(read_env_db_url)"
+  # 老实例升级路径:bootstrap 时还没有这段的实例,在这里补齐 flag 与 catalog admin 角色。
+  ensure_model_authority
   local sha
   sha="$(source_commit)"
   build_runtime_release "$sha"
