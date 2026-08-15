@@ -250,6 +250,19 @@ import {
 import { RateLimiter } from './rateLimit.js'
 import { USER_PROFILE_INJECT_MAX_CHARS } from './promptSlots.js'
 import { matchBridgeApiAllowlist } from './bridgeApiAllowlist.js'
+import {
+  collectGitSnapshot,
+  collectListDir,
+  hasGitPathSegment,
+  inspectGitTimeoutMs,
+  inspectListTimeoutMs,
+  parseSessionId,
+  releaseInspect,
+  tryAcquireInspect,
+  workspaceInspectReposRootOverride,
+  workspaceInspectSnapshotOverride,
+  type WorkspaceInspectRuntime,
+} from './workspaceInspect.js'
 import { handleOpenAIRequest } from './openaiCompat.js'
 import { DEFAULT_RING_CONFIG, OutboundRingBuffer, type EvictionStats } from './outboundRing.js'
 import { Router } from './router.js'
@@ -1604,6 +1617,18 @@ export function normalizeAutoDreamSchedule(
     ...(typeof row.createdAt === 'number' ? { createdAt: row.createdAt } : {}),
   }
 }
+
+/**
+ * Test hooks for /api/file ACL order. Production must leave this empty.
+ * Spies prove lexical `.git` denial happens before resolver / realpath / remote pull.
+ */
+export const apiFileTestHooks: {
+  realpathSync?: (p: string) => string
+  onResolveMediaDirs?: () => void
+  onRemotePull?: () => void
+} = {}
+
+export { hasGitPathSegment }
 
 export class Gateway {
   private wss!: WebSocketServer
@@ -4883,6 +4908,20 @@ export class Gateway {
       return
     }
 
+    if (
+      (url.pathname === '/api/workspace/git-snapshot' || url.pathname === '/api/workspace/list-dir') &&
+      (req.method === 'GET' || req.method === 'HEAD')
+    ) {
+      this.handleWorkspaceInspect(req, res, url).catch((err) => {
+        if (!res.headersSent) {
+          this.sendInternalError(res, err)
+        } else {
+          try { res.end() } catch { /* socket gone */ }
+        }
+      })
+      return
+    }
+
     // ── API / WS 404 守卫（仅 spa 模式）────────────────────────────────────
     // 走到这里说明请求未匹配上方任何 /api/* 或 /ws/* 路由(所有已匹配路由都已 return)。
     // spa 模式必须在 SPA fallback 之前对未匹配的 /api/*、/ws/* 显式返回 404 JSON:
@@ -6094,6 +6133,12 @@ export class Gateway {
   }
 
   /**
+   * Test hooks for /api/file ACL order. Production must leave this empty.
+   * Spies prove lexical `.git` denial happens before resolver / realpath / remote pull.
+   */
+  // placed next to handleApiFile so the production path and the test seam stay together.
+
+  /**
    * GET /api/file?path=<absolute> — fetch a file by absolute path (allowlisted).
    *
    * Used by the UI when an agent tool output references a file by absolute
@@ -6133,11 +6178,18 @@ export class Gateway {
     // /root/openclaude.json would pass isFileAllowed (text startsWith check)
     // and leak the config.
     const resolved = resolve(filePath)
+    if (hasGitPathSegment(filePath) || hasGitPathSegment(resolved)) {
+      this.log.warn('api/file blocked git path')
+      res.writeHead(403)
+      res.end('access denied')
+      return
+    }
     const userId = this.getUserId(req)
+    apiFileTestHooks.onResolveMediaDirs?.()
     const mediaLoc = await this._resolveMediaDirs(userId)
     let realPath: string
     try {
-      realPath = realpathSync(resolved)
+      realPath = (apiFileTestHooks.realpathSync ?? realpathSync)(resolved)
     } catch {
       // 2026-05-16 Phase 2:本地 realpathSync 失败时,若该路径文本上属于 remote-host
       // 用户的 docker volume uploads/generated 子目录(master 本机物理上没这个
@@ -6155,6 +6207,7 @@ export class Gateway {
       ) {
         const remoteScoped = makeUserScopedMediaPredicate(mediaLoc.uploads, mediaLoc.generated)
         if (remoteScoped(resolved)) {
+          apiFileTestHooks.onRemotePull?.()
           let buf: Buffer | null = null
           try {
             buf = await this.deps.commercial.pullRemoteHostMedia({
@@ -6266,6 +6319,140 @@ export class Gateway {
       },
       { rangeHeader: req.headers.range, isHead: req.method === 'HEAD' },
     )
+  }
+
+  /** Production /api/file handler, exposed so ACL tests can HTTP-wrap the real method. */
+  async handleApiFileForTests(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+    return this.handleApiFile(req, res, url)
+  }
+
+  /** Production workspace inspect handler, exposed for HTTP ACL tests. */
+  async handleWorkspaceInspectForTests(
+    req: IncomingMessage,
+    res: ServerResponse,
+    url: URL,
+  ): Promise<void> {
+    return this.handleWorkspaceInspect(req, res, url)
+  }
+
+  private sendInspectJson(res: ServerResponse, status: number, body: unknown): void {
+    res.writeHead(status, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Cache-Control': 'no-store',
+    })
+    res.end(JSON.stringify(body))
+  }
+
+  private async handleWorkspaceInspect(
+    req: IncomingMessage,
+    res: ServerResponse,
+    url: URL,
+  ): Promise<void> {
+    const started = Date.now()
+    if (!process.env.OC_CONTAINER_ID) {
+      this.sendInspectJson(res, 403, {
+        ok: false,
+        error: { code: 'HOST_FORBIDDEN', message: 'workspace inspect is container-only' },
+      })
+      return
+    }
+    const sessionRaw = url.searchParams.get('sessionId')
+    if (sessionRaw == null || sessionRaw === '') {
+      this.sendInspectJson(res, 400, {
+        ok: false,
+        error: { code: 'MISSING_SESSION_ID', message: 'missing sessionId' },
+      })
+      return
+    }
+    const sessionId = parseSessionId(sessionRaw)
+    if (!sessionId) {
+      this.sendInspectJson(res, 400, {
+        ok: false,
+        error: { code: 'BAD_SESSION_ID', message: 'invalid sessionId' },
+      })
+      return
+    }
+    const gate = tryAcquireInspect(sessionId)
+    if (gate !== 'ok') {
+      this.sendInspectJson(res, 429, {
+        ok: false,
+        error: { code: 'IN_FLIGHT', message: 'inspect already in flight' },
+      })
+      this.log.info('workspace_inspect', {
+        sessionId,
+        code: 'IN_FLIGHT',
+        truncated: false,
+        durationMs: Date.now() - started,
+      })
+      return
+    }
+
+    const kind = url.pathname === '/api/workspace/git-snapshot' ? 'git' : 'list'
+    const timeoutMs = kind === 'git' ? inspectGitTimeoutMs() : inspectListTimeoutMs()
+    const rt: WorkspaceInspectRuntime = {
+      getRepoSnapshot: (id) =>
+        workspaceInspectSnapshotOverride ? workspaceInspectSnapshotOverride(id) : this._repoWorkspace.getRepoSnapshot(id),
+      reposRoot: workspaceInspectReposRootOverride,
+      acl: {
+        isFileAllowed: (p) => isFileAllowed(p),
+        isFileBlocked,
+      },
+      log: {
+        warn: (msg, fields) => this.log.warn(msg, fields),
+        info: (msg, fields) => this.log.info(msg, fields),
+      },
+    }
+
+    let sent = false
+    const ac = new AbortController()
+    const work =
+      kind === 'git'
+        ? collectGitSnapshot(rt, sessionId, ac.signal)
+        : collectListDir(rt, sessionId, url.searchParams.get('path'), undefined, ac.signal)
+    const timer = setTimeout(() => {
+      ac.abort()
+      if (sent || res.headersSent) return
+      sent = true
+      const code = kind === 'git' ? 'GIT_TIMEOUT' : 'LIST_TIMEOUT'
+      this.sendInspectJson(res, 504, {
+        ok: false,
+        error: { code, message: `${kind} timed out` },
+      })
+      this.log.info('workspace_inspect', {
+        sessionId,
+        code,
+        truncated: false,
+        durationMs: Date.now() - started,
+      })
+    }, timeoutMs)
+
+    try {
+      const result = await work
+      if (sent || res.headersSent) return
+      sent = true
+      this.sendInspectJson(res, result.status, result.body)
+      const code =
+        result.kind === 'error'
+          ? result.body.error.code
+          : result.kind === 'empty'
+            ? result.body.reason
+            : 'ok'
+      const truncated =
+        result.kind === 'ok' && 'snapshot' in result.body
+          ? Boolean(result.body.snapshot.truncated)
+          : result.kind === 'ok' && 'truncated' in result.body
+            ? Boolean(result.body.truncated)
+            : false
+      this.log.info('workspace_inspect', {
+        sessionId,
+        code,
+        truncated,
+        durationMs: Date.now() - started,
+      })
+    } finally {
+      clearTimeout(timer)
+      releaseInspect(sessionId)
+    }
   }
 
   /**
@@ -16110,6 +16297,11 @@ export const FILE_BLOCKED_PATTERNS = [
   // this regex makes the intent explicit and survives any future allowlist
   // change.
   /^\/etc(\/|$)/,
+
+  // Git metadata / credential.helper (must match path segment `.git` only; do not
+  // collide with `foo.git`). Canonical half of the /api/file `.git` ACL; lexical
+  // pre-check in handleApiFile runs before realpathSync.
+  /(^|\/)\.git(\/|$)/,
 ]
 
 /** Returns true if the resolved path matches any sensitive-file pattern. */
@@ -16364,7 +16556,7 @@ const KNOWN_ROUTES = [
   '/api/wechat/binding', '/api/wechat/binding/status',
   '/api/auth/session', '/api/auth/logout', '/api/auth/claude/start',
   '/api/auth/claude/callback', '/api/auth/claude/status',
-  '/api/file', '/healthz', '/metrics',
+  '/api/file', '/api/workspace/git-snapshot', '/api/workspace/list-dir', '/healthz', '/metrics',
 ]
 
 /** Normalize URL paths for metrics labels (replace dynamic IDs with :id to avoid high cardinality). */

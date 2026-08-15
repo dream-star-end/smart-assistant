@@ -48,6 +48,16 @@ const DATA_ROOT = '/home/agent/.openclaude'
 const REPOS_ROOT = path.join(DATA_ROOT, 'repos')
 const CREDS_ROOT = path.join(DATA_ROOT, 'git-creds')
 
+/** Single authority for inspect + clone session ids. Do not copy this regex. */
+export function isValidSessionRepoId(sessionId: string): boolean {
+  return typeof sessionId === 'string' && SESSION_ID_RE.test(sessionId)
+}
+
+/** Single authority for the container session-repo root. */
+export function getSessionReposRoot(): string {
+  return REPOS_ROOT
+}
+
 export interface SessionRepoBindFrame {
   type: 'inbound.control.session_repo_bind'
   sessionId: string

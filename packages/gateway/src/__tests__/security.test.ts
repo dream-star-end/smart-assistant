@@ -679,6 +679,16 @@ describe('T07: v3 trusted-backend mode (OC_V3_TRUSTED_FILE_SERVE=1)', () => {
     it('denies ~/.git-credentials (git store credential helper)', () => {
       assert.ok(!isFileAllowed('/home/agent/.git-credentials'))
     })
+    it('denies workspace .git/config (credential.helper) in trusted mode', () => {
+      assert.ok(isFileBlocked('/home/agent/.openclaude/repos/s/1/.git/config'))
+      assert.ok(!isFileAllowed('/home/agent/.openclaude/repos/s/1/.git/config'))
+      assert.ok(isFileBlocked('/home/agent/.openclaude/repos/s/1/.git/HEAD'))
+      assert.ok(isFileBlocked('/home/agent/.openclaude/repos/s/1/.git/objects/aa/bb'))
+    })
+    it('does not treat foo.git as a .git segment', () => {
+      assert.equal(isFileBlocked('/home/agent/foo.git'), false)
+      assert.ok(isFileAllowed('/home/agent/foo.git'))
+    })
 
     // ScanSci PDF config/cookies/browser state
     it('denies ScanSci config.json (API keys / source settings)', () => {

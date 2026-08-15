@@ -234,4 +234,18 @@ describe('bridge API allowlist', () => {
       null,
     )
   })
+
+  it('proxies workspace inspect GET and rejects POST', () => {
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/workspace/git-snapshot', 'GET')?.label,
+      '/api/workspace/git-snapshot',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/workspace/list-dir', 'GET')?.label,
+      '/api/workspace/list-dir',
+    )
+    assert.equal(matchCommercialContainerApiProxy('/api/workspace/git-snapshot', 'POST'), null)
+    assert.equal(matchCommercialContainerApiProxy('/api/workspace/list-dir', 'POST'), null)
+    assert.equal(matchBridgeApiAllowlist('/api/workspace/git-snapshot', 'GET')?.proxyFromCommercial, true)
+  })
 })

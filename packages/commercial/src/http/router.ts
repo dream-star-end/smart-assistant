@@ -505,6 +505,12 @@ const BLOCKED_FOR_USER_RULES: readonly BlockedForUserRule[] = [
   { re: /^\/api\/file$/, label: '/api/file' },
   { re: /^\/api\/media\/.+$/, label: '/api/media/:file' },
 
+  // Container workspace inspect JSON — host singleton must never serve these.
+  // Admin + X-OC-Host-Scope:1 is a terminal 403 in commercialHandler (outside
+  // the proxy-deps gate); this BLOCKED row is the user/no-token host fallback.
+  { re: /^\/api\/workspace\/git-snapshot$/, label: '/api/workspace/git-snapshot' },
+  { re: /^\/api\/workspace\/list-dir$/, label: '/api/workspace/list-dir' },
+
   // ─── HOST RCE 面(OpenAI 兼容层,POST body.prompt → sessions.submit → host main agent)───
   // 覆盖 /v1/chat/completions、/v1/models;后者仅列模型但合并策略拦更简。admin bypass。
   { re: /^\/v1\/.+$/, label: '/v1/*' },
@@ -1479,6 +1485,9 @@ export const COMMERCIAL_ROUTE_PREFIXES: readonly string[] = [
     //   - 末尾 isOurs 兜底命中,无 route 命中时返 404 而非 fall through 给 gateway。
     // 实际 dispatch 由 pre-route adapter 处理(见下方 `CC 外接 endpoint` 块)。
     '/api/anthropic/',
+    // Workspace inspect JSON (container-only). Trailing slash avoids claiming
+    // `/api/workspaceevil`. Unmatched `/api/workspace/foo` → commercial 404.
+    '/api/workspace/',
     // 切片②ⓐ:codex 修复回调命名空间(经 SSH 隧道 loopback 到达)。必须列此使 isOurs()=true,
     // 否则 commercialHandler 返回 false → fall through gateway 404。鉴权在 handler 内自理。
     SELFHEAL_REPAIRS_PREFIX,
@@ -1638,6 +1647,30 @@ export function createCommercialHandler(
       }
       incrGatewayRequest('__cc_external__', method, res.statusCode)
       return true
+    }
+
+    // Workspace inspect is container-only. Admin host-scope must never fall
+    // through to host gateway — including when proxy deps are missing (otherwise
+    // BLOCKED admin bypass returns false).
+    if (path.startsWith('/api/workspace/')) {
+      const hostScopeToken = extractTokenFromReq(req)
+      const hostScopeClaims = hostScopeToken
+        ? verifyCommercialJwtSync(hostScopeToken, deps.jwtSecret)
+        : null
+      if (hostScopeClaims?.role === 'admin' && req.headers['x-oc-host-scope'] === '1') {
+        setSecurityHeaders(res)
+        const requestId = ensureRequestId(req)
+        res.setHeader(REQUEST_ID_HEADER, requestId)
+        sendError(
+          res,
+          403,
+          'HOST_FORBIDDEN',
+          'workspace inspect is container-only',
+          requestId,
+        )
+        incrGatewayRequest('__workspace_inspect_host_deny__', method, res.statusCode)
+        return true
+      }
     }
 
     // ── P0/P1 v3 user-container API proxy ──────────────────────────────
