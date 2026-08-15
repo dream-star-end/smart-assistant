@@ -5,7 +5,7 @@
  * `/root/.openclaude-v5/openclaude.json` 无 claudeOAuth、settings.json 不存在、进程 env
  * 无任何 ANTHROPIC_* —— subprocessRunner 的 "settings.json controls routing" 默认分支在
  * host 上完全落空。host 平台 agent 历史上没踩坑只因 `main` 恒 gpt-5.5(codex-native runner
- * 不走 CCB anthropic env)。合成首帧改路由到静态模型(deepseek-v4-pro)后,若不补路由,
+ * 不走 CCB anthropic env)。合成首帧改路由到静态模型(deepseek-v4-flash)后,若不补路由,
  * CCB 会以零 provider 配置起进程 → 上游 401 死(比原来的闸拒更糟)。
  *
  * 模式(仓内先例):marketplaceAiReview / voiceTranscribe 的 deepseek「平台直连」——

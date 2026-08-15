@@ -11,6 +11,7 @@ import path from 'node:path'
 import { describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 
+import { addGrant, removeGrant } from '../admin/modelGrants.js'
 import { query } from '../db/queries.js'
 import { resetAndMigrateBefore, useDedicatedTestDatabase } from './helpers/db.js'
 
@@ -37,12 +38,12 @@ async function prepareFloor(): Promise<string> {
   return readFile(migrationPath, 'utf8')
 }
 
-async function createUser(email: string): Promise<string> {
+async function createUser(email: string, role = 'user'): Promise<string> {
   const result = await query<{ id: string }>(
     `INSERT INTO users(email,password_hash,role)
-     VALUES ($1,'x','user')
+     VALUES ($1,'x',$2)
      RETURNING id::text AS id`,
-    [email],
+    [email, role],
   )
   return result.rows[0]!.id
 }
@@ -71,8 +72,17 @@ async function requirementPairs(): Promise<string[]> {
   return result.rows.map((row) => `${row.model_id}:${row.requirement}`)
 }
 
+async function grantModels(userId: string): Promise<string[]> {
+  const result = await query<{ model_id: string }>(
+    `SELECT model_id FROM model_visibility_grants
+      WHERE user_id=$1::bigint ORDER BY model_id`,
+    [userId],
+  )
+  return result.rows.map((row) => row.model_id)
+}
+
 describe('0218_deepseek_v4_pro_transition', () => {
-  test('backfills prefs/sessions/grants, shifts official_seed_agent, preserves history, and is idempotent', async (t) => {
+  test('backfills prefs/sessions, shifts official_seed_agent, leaves grants, and is idempotent', async (t) => {
     if (db.skipIfUnavailable(t)) return
     const sql = await prepareFloor()
     const movedUser = await createUser('dsv4pro-backfill@test.invalid')
@@ -127,21 +137,8 @@ describe('0218_deepseek_v4_pro_transition', () => {
     assert.equal(sessions.rows.find((row) => row.id === 'deleted-pro')?.model_id, 'deepseek-v4-pro')
     assert.equal(sessions.rows.find((row) => row.id === 'live-other')?.model_id, 'glm-5.3')
 
-    const grants = await query<{ user_id: string; model_id: string }>(
-      `SELECT user_id::text,model_id FROM model_visibility_grants ORDER BY user_id,model_id`,
-    )
-    assert.deepEqual(
-      grants.rows.filter((row) => row.user_id === movedUser).map((row) => row.model_id),
-      ['deepseek-v4-flash'],
-    )
-    assert.deepEqual(
-      grants.rows.filter((row) => row.user_id === overlapUser).map((row) => row.model_id),
-      ['deepseek-v4-flash'],
-    )
-    assert.equal(
-      grants.rows.filter((row) => row.model_id === 'deepseek-v4-pro').length,
-      0,
-    )
+    assert.deepEqual(await grantModels(movedUser), ['deepseek-v4-pro'])
+    assert.deepEqual(await grantModels(overlapUser), ['deepseek-v4-flash', 'deepseek-v4-pro'])
 
     assert.deepEqual(await requirementPairs(), [
       'deepseek-v4-flash:ccb_secondary_utility',
@@ -155,9 +152,14 @@ describe('0218_deepseek_v4_pro_transition', () => {
     )
     assert.deepEqual(snapshotsBefore.rows, [
       { kind: 'client_sessions', n: '1' },
-      { kind: 'model_visibility_grants', n: '2' },
+      { kind: 'runtime_requirement', n: '1' },
       { kind: 'user_preferences', n: '2' },
     ])
+    const seedSource = await query<{ original_model_id: string }>(
+      `SELECT original_model_id FROM model_dsv4pro_transition_snapshots
+        WHERE subject_kind='runtime_requirement' AND subject_key='official_seed_agent'`,
+    )
+    assert.equal(seedSource.rows[0]?.original_model_id, 'deepseek-v4-pro')
 
     const catalog = await query<{
       model_id: string
@@ -195,9 +197,10 @@ describe('0218_deepseek_v4_pro_transition', () => {
       'deepseek-v4-flash:ccb_secondary_utility',
       'deepseek-v4-flash:official_seed_agent',
     ])
+    assert.deepEqual(await grantModels(movedUser), ['deepseek-v4-pro'])
   })
 
-  test('temporary security-definer fences normalize Pro writes under an unprivileged app role', async (t) => {
+  test('temporary security-definer fences normalize prefs/sessions but leave grants on Pro', async (t) => {
     if (db.skipIfUnavailable(t)) return
     const sql = await prepareFloor()
     const userId = await createUser('dsv4pro-fence@test.invalid')
@@ -245,13 +248,9 @@ describe('0218_deepseek_v4_pro_transition', () => {
     const session = await query<{ model_id: string }>(
       `SELECT model_id FROM client_sessions WHERE id='fence-session'`,
     )
-    const grant = await query<{ model_id: string }>(
-      `SELECT model_id FROM model_visibility_grants WHERE user_id=$1`,
-      [userId],
-    )
     assert.equal(preference.rows[0]?.model, 'deepseek-v4-flash')
     assert.equal(session.rows[0]?.model_id, 'deepseek-v4-flash')
-    assert.deepEqual(grant.rows.map((row) => row.model_id), ['deepseek-v4-flash'])
+    assert.deepEqual(await grantModels(userId), ['deepseek-v4-pro'])
 
     const objects = await query<{ name: string; owner: string; security_definer: boolean }>(
       `SELECT p.proname AS name,
@@ -265,7 +264,10 @@ describe('0218_deepseek_v4_pro_transition', () => {
         )
         ORDER BY p.proname`,
     )
-    assert.equal(objects.rows.length, 3)
+    assert.deepEqual(
+      objects.rows.map((row) => row.name),
+      ['fn_0218_normalize_client_session_model', 'fn_0218_normalize_user_default_model'],
+    )
     assert.ok(objects.rows.every((row) => row.security_definer))
     assert.equal(new Set(objects.rows.map((row) => row.owner)).size, 1)
 
@@ -276,6 +278,44 @@ describe('0218_deepseek_v4_pro_transition', () => {
     )
     assert.equal(snapshotOwner.rows[0]?.owner, objects.rows[0]?.owner)
     assert.notEqual(snapshotOwner.rows[0]?.owner, 'oc_migration0218_app')
+  })
+
+  test('addGrant/removeGrant keep the Pro contract after 0218', async (t) => {
+    if (db.skipIfUnavailable(t)) return
+    const sql = await prepareFloor()
+    const adminId = await createUser('dsv4pro-grant-admin@test.invalid', 'admin')
+    const userId = await createUser('dsv4pro-grant-user@test.invalid')
+    await query(
+      `INSERT INTO model_visibility_grants(user_id,model_id) VALUES ($1,'deepseek-v4-pro')`,
+      [userId],
+    )
+    await query(sql)
+    assert.deepEqual(await grantModels(userId), ['deepseek-v4-pro'])
+
+    const first = await addGrant(userId, 'deepseek-v4-pro', { adminId })
+    assert.equal(first.inserted, false)
+    assert.equal(first.row.model_id, 'deepseek-v4-pro')
+    assert.deepEqual(await grantModels(userId), ['deepseek-v4-pro'])
+
+    const removed = await removeGrant(userId, 'deepseek-v4-pro', { adminId })
+    assert.equal(removed.deleted, true)
+    assert.deepEqual(await grantModels(userId), [])
+
+    const missing = await removeGrant(userId, 'deepseek-v4-pro', { adminId })
+    assert.equal(missing.deleted, false)
+
+    const inserted = await addGrant(userId, 'deepseek-v4-pro', { adminId })
+    assert.equal(inserted.inserted, true)
+    assert.equal(inserted.row.model_id, 'deepseek-v4-pro')
+    assert.equal(inserted.row.user_id, userId)
+    assert.deepEqual(await grantModels(userId), ['deepseek-v4-pro'])
+
+    const flash = await addGrant(userId, 'deepseek-v4-flash', { adminId })
+    assert.equal(flash.inserted, true)
+    assert.deepEqual(await grantModels(userId), ['deepseek-v4-flash', 'deepseek-v4-pro'])
+    const removedPro = await removeGrant(userId, 'deepseek-v4-pro', { adminId })
+    assert.equal(removedPro.deleted, true)
+    assert.deepEqual(await grantModels(userId), ['deepseek-v4-flash'])
   })
 
   test('fails atomically when deepseek-v4-flash is not active', async (t) => {
@@ -315,7 +355,7 @@ describe('0218_deepseek_v4_pro_transition', () => {
     assert.deepEqual(await requirementPairs(), ['deepseek-v4-pro:official_seed_agent'])
   })
 
-  test('tested compensation restores only rows unchanged since normalization', async (t) => {
+  test('tested compensation restores unchanged prefs/sessions and the snapshotted seed source', async (t) => {
     if (db.skipIfUnavailable(t)) return
     const sql = await prepareFloor()
     const rollbackSql = testedManualRollbackSql(sql)
@@ -408,20 +448,8 @@ describe('0218_deepseek_v4_pro_transition', () => {
       'deepseek-v4-pro',
     )
 
-    const grants = await query<{ user_id: string; model_id: string }>(
-      `SELECT user_id::text,model_id FROM model_visibility_grants
-        WHERE user_id=ANY($1::bigint[])
-        ORDER BY user_id,model_id`,
-      [[unchangedUser, changedUser]],
-    )
-    assert.deepEqual(
-      grants.rows.filter((row) => row.user_id === unchangedUser).map((row) => row.model_id),
-      ['deepseek-v4-pro'],
-    )
-    assert.deepEqual(
-      grants.rows.filter((row) => row.user_id === changedUser).map((row) => row.model_id),
-      ['deepseek-v4-pro'],
-    )
+    assert.deepEqual(await grantModels(unchangedUser), ['deepseek-v4-pro'])
+    assert.deepEqual(await grantModels(changedUser), ['deepseek-v4-pro'])
 
     const triggers = await query<{ n: string }>(
       `SELECT count(*)::text AS n FROM pg_trigger
@@ -435,10 +463,44 @@ describe('0218_deepseek_v4_pro_transition', () => {
     const snapshots = await query<{ n: string }>(
       'SELECT count(*)::text AS n FROM model_dsv4pro_transition_snapshots',
     )
-    assert.equal(snapshots.rows[0]?.n, '8', 'permanent compensation evidence must remain')
+    assert.equal(snapshots.rows[0]?.n, '7', 'permanent compensation evidence must remain')
     assert.deepEqual(await requirementPairs(), [
       'deepseek-v4-flash:ccb_secondary_utility',
       'deepseek-v4-pro:official_seed_agent',
+    ])
+  })
+
+  test('compensation restores official_seed_agent to Flash when that was the pre-0218 source', async (t) => {
+    if (db.skipIfUnavailable(t)) return
+    const sql = await prepareFloor()
+    const rollbackSql = testedManualRollbackSql(sql)
+    await query(
+      `DELETE FROM model_runtime_requirements
+        WHERE model_id='deepseek-v4-pro' AND requirement='official_seed_agent'`,
+    )
+    await query(
+      `INSERT INTO model_runtime_requirements(model_id,requirement)
+       VALUES ('deepseek-v4-flash','official_seed_agent')
+       ON CONFLICT (model_id,requirement) DO NOTHING`,
+    )
+    assert.deepEqual(await requirementPairs(), [
+      'deepseek-v4-flash:ccb_secondary_utility',
+      'deepseek-v4-flash:official_seed_agent',
+    ])
+    await query(sql)
+    const source = await query<{ original_model_id: string }>(
+      `SELECT original_model_id FROM model_dsv4pro_transition_snapshots
+        WHERE subject_kind='runtime_requirement' AND subject_key='official_seed_agent'`,
+    )
+    assert.equal(source.rows[0]?.original_model_id, 'deepseek-v4-flash')
+    assert.deepEqual(await requirementPairs(), [
+      'deepseek-v4-flash:ccb_secondary_utility',
+      'deepseek-v4-flash:official_seed_agent',
+    ])
+    await query(rollbackSql)
+    assert.deepEqual(await requirementPairs(), [
+      'deepseek-v4-flash:ccb_secondary_utility',
+      'deepseek-v4-flash:official_seed_agent',
     ])
   })
 })

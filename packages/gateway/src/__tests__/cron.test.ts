@@ -580,9 +580,9 @@ describe('CronScheduler.runJob — 合成首帧非 codex 路由字段补齐', ()
   // 并把 model 路由字段同点传入 getOrCreate(决定 runner engine)+ submit(路由字段)。
   //
   // MAJOR-1 routable 自检:降级前 resolveSyntheticTurnModel 会自检兜底模型可路由性。测试进程
-  // 非容器,需注入 host 静态 provider seam(等价 commercial 已装配 deepseek key),否则 gate
-  // 判"不可路由"→ 不降级(见 hostStaticProviders.test.ts / syntheticTurnModel.test.ts)。
-  beforeEach(() => setHostStaticProviderKeys({ deepseek: 'sk-deep' }))
+  // 非容器,需注入 host 静态 provider seam(等价 commercial 已装配 OpenCode Go key;合成兜底
+  // 现为 deepseek-v4-flash),否则 gate 判"不可路由"→ 不降级。
+  beforeEach(() => setHostStaticProviderKeys({ opencodego: 'og-key' }))
   afterEach(() => setHostStaticProviderKeys(null))
   type SubmitCall = { model: unknown }
   function makeSchedulerWithSpies(defaultModel: string): {
@@ -616,16 +616,16 @@ describe('CronScheduler.runJob — 合成首帧非 codex 路由字段补齐', ()
     const outcome = await (sched as any).runJob(job, { id: 'main' }, NOOP_CRON_DURABILITY)
     assert.deepEqual(outcome, { kind: 'terminal_failure', code: 'EMPTY_OUTPUT' })
     assert.equal(getOrCreateOpts.length, 1)
-    assert.equal(getOrCreateOpts[0].model, 'deepseek-v4-pro', 'getOrCreate 必须收到非 codex 模型(runner engine 决定点)')
+    assert.equal(getOrCreateOpts[0].model, 'deepseek-v4-flash', 'getOrCreate 必须收到非 codex 模型(runner engine 决定点)')
     assert.equal(submitCalls.length, 1)
-    assert.equal(submitCalls[0].model, 'deepseek-v4-pro', 'submit 必须带同源 model 路由字段')
+    assert.equal(submitCalls[0].model, 'deepseek-v4-flash', 'submit 必须带同源 model 路由字段')
   })
 
   it('agent 显式 gpt-5.6-sol(codex)→ 同样替换为非 codex 兜底', async () => {
     const { sched, getOrCreateOpts, submitCalls } = makeSchedulerWithSpies('glm-5.2')
     await (sched as any).runJob(job, { id: 'main', model: 'gpt-5.6-sol' }, NOOP_CRON_DURABILITY)
-    assert.equal(getOrCreateOpts[0].model, 'deepseek-v4-pro')
-    assert.equal(submitCalls[0].model, 'deepseek-v4-pro')
+    assert.equal(getOrCreateOpts[0].model, 'deepseek-v4-flash')
+    assert.equal(submitCalls[0].model, 'deepseek-v4-flash')
   })
 
   it('非 codex agent(glm-5.2)→ 不覆盖(getOrCreate 不带 model,submit model=undefined)', async () => {

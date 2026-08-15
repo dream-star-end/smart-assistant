@@ -2,17 +2,22 @@
 --
 -- This migration is applied before the code release that stops hardcoding
 -- deepseek-v4-pro. The old stable release can still execute Pro during that
--- window, so the temporary BEFORE triggers are a deliberate write fence: every
--- stale Pro write is normalized to deepseek-v4-flash and recorded in a
--- permanent, tiny before-image ledger. 0219 removes the fence only after its
--- catalog-disable transaction has proved that no live Pro reference remains.
+-- window. Temporary BEFORE triggers fence user_preferences.default_model and
+-- live client_sessions.model_id so stale Pro writes cannot reappear.
 --
--- official_seed_agent moves to deepseek-v4-flash in this migration. Flash already
--- carries ccb_secondary_utility; 0144's primary key is (model_id, requirement),
--- so both requirements coexist. The deferred runtime-requirements guard only
--- demands that every required model stay active+priced, and does not forbid a
--- model from satisfying more than one requirement.
+-- Visibility grants are intentionally NOT remapped or fenced here. The old
+-- admin addGrant/removeGrant contract keys on the caller-supplied model_id;
+-- rewriting Pro→Flash (or swallowing the INSERT) makes revoke return
+-- deleted=false while a Flash grant remains. Grants stay on Pro until a
+-- later release applies 0219 after this code is already deployed.
 --
+-- official_seed_agent moves to Flash when it is still on Pro. The source is
+-- snapshotted so compensation restores that exact source (Pro or already-Flash).
+-- Flash already carries ccb_secondary_utility; 0144's primary key is
+-- (model_id, requirement), so both requirements coexist.
+--
+-- deploy-v5 requiredMigrations is an exact listing of this tree's migration
+-- files, so 0219 cannot be registered in the same release as this code.
 -- Historical usage/audit rows and deleted sessions are intentionally untouched.
 
 -- BEGIN TESTED MANUAL ROLLBACK 0218
@@ -28,20 +33,14 @@
 --      WHERE tgrelid = 'client_sessions'::regclass
 --        AND tgname = 'trg_0218_normalize_client_session_model'
 --        AND NOT tgisinternal
---   ) OR NOT EXISTS (
---     SELECT 1 FROM pg_trigger
---      WHERE tgrelid = 'model_visibility_grants'::regclass
---        AND tgname = 'trg_0218_normalize_visibility_grant'
---        AND NOT tgisinternal
 --   ) THEN
---     RAISE EXCEPTION '0218 rollback requires all three transition write fences';
+--     RAISE EXCEPTION '0218 rollback requires both transition write fences';
 --   END IF;
 -- END
 -- $rollback_preflight$;
 --
 -- DROP TRIGGER trg_0218_normalize_user_default_model ON user_preferences;
 -- DROP TRIGGER trg_0218_normalize_client_session_model ON client_sessions;
--- DROP TRIGGER trg_0218_normalize_visibility_grant ON model_visibility_grants;
 --
 -- UPDATE user_preferences AS p
 --    SET prefs = jsonb_set(p.prefs, '{default_model}', to_jsonb(s.original_model_id), true),
@@ -64,34 +63,17 @@
 --    AND c.model_id = 'deepseek-v4-flash'
 --    AND c.updated_at = s.normalized_at_ms;
 --
--- INSERT INTO model_visibility_grants(user_id, model_id, granted_at, granted_by)
--- SELECT (s.grant_before->>'user_id')::bigint,
---        s.grant_before->>'model_id',
---        (s.grant_before->>'granted_at')::timestamptz,
---        (s.grant_before->>'granted_by')::bigint
---   FROM model_dsv4pro_transition_snapshots AS s
---  WHERE s.subject_kind = 'model_visibility_grants'
--- ON CONFLICT (user_id, model_id) DO NOTHING;
---
--- DELETE FROM model_visibility_grants AS g
---  USING model_dsv4pro_transition_snapshots AS s
---  WHERE s.subject_kind = 'model_visibility_grants'
---    AND s.grant_flash_existed IS FALSE
---    AND g.user_id::text = s.subject_key
---    AND g.model_id = 'deepseek-v4-flash'
---    AND g.granted_at IS NOT DISTINCT FROM (s.grant_before->>'granted_at')::timestamptz
---    AND g.granted_by IS NOT DISTINCT FROM (s.grant_before->>'granted_by')::bigint;
---
 -- DELETE FROM model_runtime_requirements
---  WHERE model_id = 'deepseek-v4-flash'
---    AND requirement = 'official_seed_agent';
+--  WHERE requirement = 'official_seed_agent'
+--    AND model_id IN ('deepseek-v4-pro', 'deepseek-v4-flash');
 -- INSERT INTO model_runtime_requirements(model_id, requirement)
--- VALUES ('deepseek-v4-pro', 'official_seed_agent')
--- ON CONFLICT (model_id, requirement) DO NOTHING;
+-- SELECT s.original_model_id, 'official_seed_agent'
+--   FROM model_dsv4pro_transition_snapshots AS s
+--  WHERE s.subject_kind = 'runtime_requirement'
+--    AND s.subject_key = 'official_seed_agent';
 --
 -- DROP FUNCTION fn_0218_normalize_user_default_model();
 -- DROP FUNCTION fn_0218_normalize_client_session_model();
--- DROP FUNCTION fn_0218_normalize_visibility_grant();
 -- END TESTED MANUAL ROLLBACK 0218
 
 LOCK TABLE model_catalog, model_pricing, model_runtime_requirements,
@@ -166,10 +148,11 @@ CREATE TABLE IF NOT EXISTS model_dsv4pro_transition_snapshots (
                        CHECK (subject_kind IN (
                          'user_preferences',
                          'client_sessions',
-                         'model_visibility_grants'
+                         'runtime_requirement'
                        )),
   subject_key          TEXT NOT NULL CHECK (subject_key <> ''),
-  original_model_id    TEXT NOT NULL CHECK (original_model_id = 'deepseek-v4-pro'),
+  original_model_id    TEXT NOT NULL
+                       CHECK (original_model_id IN ('deepseek-v4-pro', 'deepseek-v4-flash')),
   normalized_at        TIMESTAMPTZ,
   normalized_at_ms     BIGINT,
   grant_before         JSONB,
@@ -178,27 +161,30 @@ CREATE TABLE IF NOT EXISTS model_dsv4pro_transition_snapshots (
   PRIMARY KEY (subject_kind, subject_key),
   CHECK (
     (subject_kind = 'user_preferences'
+      AND original_model_id = 'deepseek-v4-pro'
       AND normalized_at IS NOT NULL
       AND normalized_at_ms IS NULL
       AND grant_before IS NULL
       AND grant_flash_existed IS NULL)
     OR
     (subject_kind = 'client_sessions'
+      AND original_model_id = 'deepseek-v4-pro'
       AND normalized_at IS NULL
       AND normalized_at_ms IS NOT NULL
       AND grant_before IS NULL
       AND grant_flash_existed IS NULL)
     OR
-    (subject_kind = 'model_visibility_grants'
+    (subject_kind = 'runtime_requirement'
+      AND subject_key = 'official_seed_agent'
       AND normalized_at IS NULL
       AND normalized_at_ms IS NULL
-      AND grant_before IS NOT NULL
-      AND grant_flash_existed IS NOT NULL)
+      AND grant_before IS NULL
+      AND grant_flash_existed IS NULL)
   )
 );
 
 COMMENT ON TABLE model_dsv4pro_transition_snapshots IS
-  'Permanent ops ledger for the 0218 DeepSeek V4 Pro → Flash transition. Stores only rows normalized by the temporary write fences or the grant backfill; conditional compensation compares the exact normalization marker so later user choices win.';
+  'Permanent ops ledger for the 0218 DeepSeek V4 Pro → Flash transition. Stores fence before-images and the official_seed_agent source. original_model_id is first-write-wins; fence repeats may refresh only the compensation marker.';
 
 CREATE OR REPLACE FUNCTION fn_0218_normalize_user_default_model()
 RETURNS TRIGGER
@@ -220,11 +206,8 @@ BEGIN
       'user_preferences', NEW.user_id::text, v_requested, v_marker, NULL, NULL, NULL
     )
     ON CONFLICT (subject_kind, subject_key) DO UPDATE
-      SET original_model_id = EXCLUDED.original_model_id,
-          normalized_at = EXCLUDED.normalized_at,
-          normalized_at_ms = NULL,
-          grant_before = NULL,
-          grant_flash_existed = NULL;
+      SET normalized_at = EXCLUDED.normalized_at
+      WHERE model_dsv4pro_transition_snapshots.original_model_id = EXCLUDED.original_model_id;
 
     NEW.prefs := jsonb_set(NEW.prefs, '{default_model}', to_jsonb('deepseek-v4-flash'::text), true);
     NEW.updated_at := v_marker;
@@ -259,11 +242,8 @@ BEGIN
       'client_sessions', NEW.id, v_requested, NULL, v_marker, NULL, NULL
     )
     ON CONFLICT (subject_kind, subject_key) DO UPDATE
-      SET original_model_id = EXCLUDED.original_model_id,
-          normalized_at = NULL,
-          normalized_at_ms = EXCLUDED.normalized_at_ms,
-          grant_before = NULL,
-          grant_flash_existed = NULL;
+      SET normalized_at_ms = EXCLUDED.normalized_at_ms
+      WHERE model_dsv4pro_transition_snapshots.original_model_id = EXCLUDED.original_model_id;
 
     NEW.model_id := 'deepseek-v4-flash';
     NEW.updated_at := v_marker;
@@ -272,56 +252,8 @@ BEGIN
 END
 $function$;
 
-CREATE OR REPLACE FUNCTION fn_0218_normalize_visibility_grant()
-RETURNS TRIGGER
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = pg_catalog
-AS $function$
-DECLARE
-  v_flash_existed BOOLEAN;
-BEGIN
-  IF NEW.model_id <> 'deepseek-v4-pro' THEN
-    RETURN NEW;
-  END IF;
-
-  SELECT EXISTS (
-    SELECT 1 FROM public.model_visibility_grants
-     WHERE user_id = NEW.user_id
-       AND model_id = 'deepseek-v4-flash'
-  ) INTO v_flash_existed;
-
-  INSERT INTO public.model_dsv4pro_transition_snapshots(
-    subject_kind, subject_key, original_model_id, normalized_at, normalized_at_ms,
-    grant_before, grant_flash_existed
-  ) VALUES (
-    'model_visibility_grants',
-    NEW.user_id::text,
-    'deepseek-v4-pro',
-    NULL,
-    NULL,
-    to_jsonb(NEW),
-    v_flash_existed
-  )
-  ON CONFLICT (subject_kind, subject_key) DO UPDATE
-    SET original_model_id = EXCLUDED.original_model_id,
-        normalized_at = NULL,
-        normalized_at_ms = NULL,
-        grant_before = EXCLUDED.grant_before,
-        grant_flash_existed = EXCLUDED.grant_flash_existed;
-
-  IF v_flash_existed THEN
-    RETURN NULL;
-  END IF;
-
-  NEW.model_id := 'deepseek-v4-flash';
-  RETURN NEW;
-END
-$function$;
-
 REVOKE ALL ON FUNCTION fn_0218_normalize_user_default_model() FROM PUBLIC;
 REVOKE ALL ON FUNCTION fn_0218_normalize_client_session_model() FROM PUBLIC;
-REVOKE ALL ON FUNCTION fn_0218_normalize_visibility_grant() FROM PUBLIC;
 
 DROP TRIGGER IF EXISTS trg_0218_normalize_user_default_model ON user_preferences;
 CREATE TRIGGER trg_0218_normalize_user_default_model
@@ -333,10 +265,6 @@ CREATE TRIGGER trg_0218_normalize_client_session_model
 BEFORE INSERT OR UPDATE OF model_id ON client_sessions
 FOR EACH ROW EXECUTE FUNCTION fn_0218_normalize_client_session_model();
 
-DROP TRIGGER IF EXISTS trg_0218_normalize_visibility_grant ON model_visibility_grants;
-CREATE TRIGGER trg_0218_normalize_visibility_grant
-BEFORE INSERT OR UPDATE OF user_id, model_id ON model_visibility_grants
-FOR EACH ROW EXECUTE FUNCTION fn_0218_normalize_visibility_grant();
 
 UPDATE user_preferences
    SET prefs = prefs
@@ -351,29 +279,17 @@ INSERT INTO model_dsv4pro_transition_snapshots(
   subject_kind, subject_key, original_model_id, normalized_at, normalized_at_ms,
   grant_before, grant_flash_existed
 )
-SELECT 'model_visibility_grants',
-       g.user_id::text,
-       'deepseek-v4-pro',
+SELECT 'runtime_requirement',
+       'official_seed_agent',
+       r.model_id,
        NULL,
        NULL,
-       to_jsonb(g),
-       EXISTS (
-         SELECT 1 FROM model_visibility_grants t
-          WHERE t.user_id = g.user_id
-            AND t.model_id = 'deepseek-v4-flash'
-       )
-  FROM model_visibility_grants g
- WHERE g.model_id = 'deepseek-v4-pro'
+       NULL,
+       NULL
+  FROM model_runtime_requirements r
+ WHERE r.requirement = 'official_seed_agent'
+   AND r.model_id IN ('deepseek-v4-pro', 'deepseek-v4-flash')
 ON CONFLICT (subject_kind, subject_key) DO NOTHING;
-
-INSERT INTO model_visibility_grants(user_id, model_id, granted_at, granted_by)
-SELECT user_id, 'deepseek-v4-flash', granted_at, granted_by
-  FROM model_visibility_grants
- WHERE model_id = 'deepseek-v4-pro'
-ON CONFLICT (user_id, model_id) DO NOTHING;
-
-DELETE FROM model_visibility_grants
- WHERE model_id = 'deepseek-v4-pro';
 
 DO $requirements$
 DECLARE
@@ -413,12 +329,6 @@ BEGIN
     RAISE EXCEPTION '0218 left a stale live client-session model';
   END IF;
   IF EXISTS (
-    SELECT 1 FROM model_visibility_grants
-     WHERE model_id = 'deepseek-v4-pro'
-  ) THEN
-    RAISE EXCEPTION '0218 left a stale visibility grant';
-  END IF;
-  IF EXISTS (
     SELECT 1 FROM account_group_models WHERE model_id = 'deepseek-v4-pro'
   ) OR EXISTS (
     SELECT 1
@@ -447,14 +357,13 @@ BEGIN
        WHERE c.model_id = 'deepseek-v4-pro'
          AND c.state = 'active'
          AND p.enabled IS TRUE) <> 1 THEN
-    RAISE EXCEPTION '0218 must keep deepseek-v4-pro executable until 0219';
+    RAISE EXCEPTION '0218 must keep deepseek-v4-pro executable until a later disable release';
   END IF;
   IF (SELECT count(*) FROM pg_trigger
        WHERE tgname IN (
          'trg_0218_normalize_user_default_model',
-         'trg_0218_normalize_client_session_model',
-         'trg_0218_normalize_visibility_grant'
-       ) AND NOT tgisinternal AND tgenabled = 'O') <> 3 THEN
+         'trg_0218_normalize_client_session_model'
+       ) AND NOT tgisinternal AND tgenabled = 'O') <> 2 THEN
     RAISE EXCEPTION '0218 transition write fences are not all enabled';
   END IF;
 END
