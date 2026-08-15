@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, resolve } from 'node:path'
 import { type McpServerConfig, type OpenClaudeConfig, paths } from '@openclaude/storage'
 import { createLogger } from './logger.js'
+import { buildCcbEfficiencySettings } from './efficiencyHookConfig.js'
 import { isV3ContainerRuntime, resolveHostStaticProviderEnv } from './hostStaticProviders.js'
 import type { GoalStateSnapshot, StaticProviderKeys } from '@openclaude/protocol'
 import { modelHintAppliedTotal } from './metrics.js'
@@ -746,8 +747,10 @@ export function buildCcbCliArgs(input: CcbCliArgsInput): string[] {
   if (!hermeticNoTools) args.push('--permission-prompt-tool', 'stdio')
   if (hermeticNoTools) {
     args.push('--bare', '--tools', '', '--strict-mcp-config')
-    if (settingsFile) args.push('--settings', settingsFile)
   }
+  // Non-hermetic: platform efficiency PreToolUse hooks. Hermetic: apiKeyHelper-only
+  // settings from Auto-Dream. Both go through the same --settings flag.
+  if (settingsFile) args.push('--settings', settingsFile)
   // Single merged prompt file: persona + identity + platform + skills + memory
   // (Cannot pass --append-system-prompt-file twice; Commander takes last value only)
   if (!hermeticNoTools && extraPromptFile) args.push('--append-system-prompt-file', extraPromptFile)
@@ -1835,6 +1838,21 @@ export class SubprocessRunner extends EventEmitter {
     } catch (err) {
       runnerLog.warn(
         'failed to write mcp config',
+        { sessionKey: this.opts.sessionKey, agentId: this.opts.agentId },
+        err,
+      )
+    }
+
+    try {
+      const efficiencySettings = buildCcbEfficiencySettings()
+      if (efficiencySettings) {
+        const settingsPath = resolve(sessionDir, 'settings.json')
+        writeFileSync(settingsPath, JSON.stringify(efficiencySettings), { mode: 0o600 })
+        out.settingsFile = settingsPath
+      }
+    } catch (err) {
+      runnerLog.warn(
+        'failed to write efficiency hook settings',
         { sessionKey: this.opts.sessionKey, agentId: this.opts.agentId },
         err,
       )

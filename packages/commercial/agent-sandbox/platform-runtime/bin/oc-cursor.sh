@@ -186,6 +186,28 @@ if [ -n "$mcp_config" ]; then
 fi
 unset OPENCLAUDE_CURSOR_MCP_CONFIG
 
+# Optional platform efficiency hooks.json (same validation as MCP config).
+hooks_json=${OPENCLAUDE_CURSOR_HOOKS_JSON:-}
+if [ -n "$hooks_json" ]; then
+  case "$hooks_json" in /*) ;; *) die "hooks path must be absolute" ;; esac
+  [ ! -L "$hooks_json" ] || die "hooks must not be a symlink"
+  [ -f "$hooks_json" ] || die "hooks must be a regular file"
+  hooks_uid=$(/usr/bin/stat -c %u -- "$hooks_json" 2>/dev/null) \
+    || die "hooks metadata is unavailable"
+  current_uid=$(/usr/bin/id -u) || die "current uid is unavailable"
+  [ "$hooks_uid" = "$current_uid" ] || die "hooks owner is invalid"
+  hooks_mode=$(/usr/bin/stat -c %a -- "$hooks_json" 2>/dev/null) \
+    || die "hooks metadata is unavailable"
+  [ "$hooks_mode" = "600" ] || die "hooks mode must be 0600"
+  /bin/mkdir -m 700 -- "$cursor_home/.cursor" 2>/dev/null || true
+  [ -d "$cursor_home/.cursor" ] || die "cannot create ephemeral Cursor config directory"
+  /bin/cp -- "$hooks_json" "$cursor_home/.cursor/hooks.json" \
+    || die "cannot copy Cursor hooks"
+  /bin/chmod 600 -- "$cursor_home/.cursor/hooks.json" \
+    || die "cannot secure Cursor hooks"
+fi
+unset OPENCLAUDE_CURSOR_HOOKS_JSON
+
 prompt=$1
 shift
 for word in "$@"; do

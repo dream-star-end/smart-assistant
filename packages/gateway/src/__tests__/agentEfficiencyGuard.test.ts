@@ -114,6 +114,25 @@ describe('lintBashCommand — false positives (must not fire)', () => {
     assert.deepEqual(codes('echo "while true heartbeat"'), [])
   })
 
+  it('does not treat heredoc / comment / string mentions as a heartbeat loop', () => {
+    assert.deepEqual(
+      codes("cat <<'EOF'\nwhile true; do echo heartbeat; sleep 5; done\nEOF"),
+      [],
+    )
+    assert.deepEqual(codes('# while true; do oc-lease renew; done\ntrue'), [])
+    assert.deepEqual(codes("printf '%s\\n' 'while true; do echo heartbeat; done'"), [])
+  })
+
+  it('allows short sleep and host-channel cat even in deny evaluation', async () => {
+    const { evaluateShellForHook } = await import('../agentEfficiencyGuard.js')
+    assert.equal(evaluateShellForHook('sleep 5', 'deny').decision, 'allow')
+    assert.equal(
+      evaluateShellForHook("host 'cat /opt/openclaude/openclaude-v5-aurora/README.md'", 'deny')
+        .decision,
+      'allow',
+    )
+  })
+
   it('allows host-channel reads of host files', () => {
     assert.deepEqual(codes("host 'cat /opt/openclaude/openclaude-v5-aurora/README.md'"), [])
     assert.deepEqual(

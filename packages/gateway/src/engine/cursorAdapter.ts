@@ -23,6 +23,7 @@ import { classifyRunError } from '../errorClassify.js'
 import { createLogger } from '../logger.js'
 import { resolveMcpMemoryEntry } from '../mcpMemoryEntry.js'
 import { getPlatformPrompt } from '../platformPrompts.js'
+import { buildCursorEfficiencyHooks } from '../efficiencyHookConfig.js'
 import { detachChildStdio, killProcessGroup, shutdownTimeoutMs, waitForCloseWithin } from '../processGroupShutdown.js'
 import { buildPromptContext } from '../promptSlots.js'
 
@@ -598,6 +599,18 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         writeFileSync(configFile, `${JSON.stringify(mcpConfig, null, 2)}\n`, { mode: 0o600 })
         chmodSync(configFile, 0o600)
         env.OPENCLAUDE_CURSOR_MCP_CONFIG = configFile
+      }
+
+      try {
+        const hooks = buildCursorEfficiencyHooks()
+        if (hooks) {
+          const hooksFile = resolve(contextDir, 'hooks.json')
+          writeFileSync(hooksFile, `${JSON.stringify(hooks, null, 2)}\n`, { mode: 0o600 })
+          chmodSync(hooksFile, 0o600)
+          env.OPENCLAUDE_CURSOR_HOOKS_JSON = hooksFile
+        }
+      } catch (err) {
+        log.warn('failed to write cursor efficiency hooks', { sessionKey: this.opts.sessionKey }, err)
       }
 
       const args = [

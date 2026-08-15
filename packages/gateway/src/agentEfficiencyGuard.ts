@@ -16,7 +16,7 @@
  *          gateway cannot preempt an in-flight builtin Bash)
  */
 import { createHash, randomUUID } from 'node:crypto'
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { paths } from '@openclaude/storage'
 
@@ -67,6 +67,8 @@ export const DEFAULT_VERIFICATION_BUDGET_MS = 15 * 60_000
 export const DEFAULT_BASH_COUNT_WARN = 24
 export const DEFAULT_TOOL_COUNT_WARN = 80
 export const FANOUT_READ_PROBE_THRESHOLD = 3
+/** 命令中带此标记则单次豁免拦截(仍写审计日志)。 */
+export const EFFICIENCY_ESCAPE_TOKEN = 'OC_EFFICIENCY_ALLOW'
 
 const SLEEP_CMD_RE =
   /(?:^|[;&|\n]|(?:\b(?:then|do)\s+))\s*sleep\s+(\d+(?:\.\d+)?)([smhd])?\b/gi
@@ -157,17 +159,46 @@ function looksLikeSourcePath(argStr: string): boolean {
   return SOURCE_EXT_RE.test(argStr) || CODE_ROOT_RE.test(argStr)
 }
 
+/** 去掉 heredoc 体、注释、引号字面量,避免把脚本内容/字符串里的 sleep/while 当成交。 */
+export function stripNonCodeContext(command: string): string {
+  let out = command.replace(/<<-?['"]?(\w+)['"]?[\s\S]*?\n\1\b/g, ' ')
+  out = out.replace(/#[^\n]*/g, ' ')
+  out = out.replace(/'(?:\\'|[^'])*'/g, "''")
+  out = out.replace(/"(?:\\.|[^"\\])*"/g, '""')
+  return out
+}
+
+export function hasEfficiencyEscape(command: string): boolean {
+  return command.includes(EFFICIENCY_ESCAPE_TOKEN)
+}
+
+export function suggestAlternative(hit: LintHit): string {
+  switch (hit.code) {
+    case 'sleep_ge_60':
+      return '替代: `nohup <长任务> >/tmp/oc-job.log 2>&1 & echo $!; tail -n 50 /tmp/oc-job.log`'
+    case 'fg_watch':
+      return '替代: `gh pr checks` 或 `gh run view --json status`(不要 --watch)'
+    case 'heartbeat_loop':
+      return '替代: 后台跑任务并 `tail` 日志,不要 `while true` + renew/heartbeat'
+    case 'local_file_via_shell':
+      return '替代: 用原生 Read/Grep/Glob 读容器内文件;宿主文件才用 `host cat/rg`'
+    default:
+      return hit.message
+  }
+}
+
 export function lintBashCommand(command: string, mode: GuardMode = 'warn'): LintHit[] {
   if (mode === 'off' || !command) return []
   const hits: LintHit[] = []
   const act = actionOf(mode)
+  const visible = stripNonCodeContext(command)
 
   SLEEP_CMD_RE.lastIndex = 0
   SLEEP_WORD_RE.lastIndex = 0
   for (const re of [SLEEP_CMD_RE, SLEEP_WORD_RE]) {
     let m: RegExpExecArray | null
-    while ((m = re.exec(command))) {
-      const before = command.slice(Math.max(0, m.index - 12), m.index)
+    while ((m = re.exec(visible))) {
+      const before = visible.slice(Math.max(0, m.index - 12), m.index)
       if (/\becho\b/.test(before)) continue
       const secs = sleepSeconds(m[1], m[2])
       if (secs >= 60) {
@@ -183,7 +214,7 @@ export function lintBashCommand(command: string, mode: GuardMode = 'warn'): Lint
     if (hits.some((h) => h.code === 'sleep_ge_60')) break
   }
 
-  if (FG_WATCH_RE.test(command)) {
+  if (FG_WATCH_RE.test(visible)) {
     hits.push({
       code: 'fg_watch',
       action: act,
@@ -192,7 +223,7 @@ export function lintBashCommand(command: string, mode: GuardMode = 'warn'): Lint
     })
   }
 
-  if (HEARTBEAT_LOOP_RE.test(command)) {
+  if (HEARTBEAT_LOOP_RE.test(visible)) {
     hits.push({
       code: 'heartbeat_loop',
       action: act,
@@ -466,5 +497,55 @@ export async function finalizeEfficiencyTurn(
     await writeVerificationBudget(session.sessionKey, budget)
   } catch {
     // same fail-soft as prepare
+  }
+}
+
+export interface HookDecision {
+  decision: 'allow' | 'deny'
+  escaped: boolean
+  hits: LintHit[]
+  message: string | null
+}
+
+/** 前置钩子与事后观测共用的判定。deny 模式命中则 decision='deny'。 */
+export function evaluateShellForHook(
+  command: string,
+  mode: GuardMode = resolveGuardMode(),
+): HookDecision {
+  if (mode === 'off' || !command) {
+    return { decision: 'allow', escaped: false, hits: [], message: null }
+  }
+  if (hasEfficiencyEscape(command)) {
+    return { decision: 'allow', escaped: true, hits: [], message: null }
+  }
+  const hits = lintBashCommand(command, mode)
+  if (hits.length === 0) return { decision: 'allow', escaped: false, hits: [], message: null }
+  const lines = hits.map((h) => `${h.message} ${suggestAlternative(h)}`)
+  if (mode === 'deny') {
+    lines.push(`逃生: 命令中加 ${EFFICIENCY_ESCAPE_TOKEN} 可单次豁免(会记审计日志)。`)
+    return { decision: 'deny', escaped: false, hits, message: lines.join('\n') }
+  }
+  return { decision: 'allow', escaped: false, hits, message: lines.join('\n') }
+}
+
+export async function auditEfficiencyEscape(
+  command: string,
+  extra: Record<string, unknown> = {},
+): Promise<void> {
+  const preview = command.replace(/\s+/g, ' ').slice(0, 240)
+  const rec = {
+    ts: new Date().toISOString(),
+    event: 'efficiency_escape',
+    token: EFFICIENCY_ESCAPE_TOKEN,
+    commandPreview: preview,
+    ...extra,
+  }
+  console.error(`[oc-efficiency-guard] escape used ${JSON.stringify(rec)}`)
+  try {
+    const dir = join(paths.home, '.efficiency-guard')
+    await mkdir(dir, { recursive: true, mode: 0o700 })
+    await appendFile(join(dir, 'audit.jsonl'), `${JSON.stringify(rec)}\n`, { mode: 0o600 })
+  } catch {
+    // stderr already has the record
   }
 }
