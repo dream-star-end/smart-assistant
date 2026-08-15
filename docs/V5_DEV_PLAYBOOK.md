@@ -80,6 +80,54 @@ git worktree add ../openclaude-v5-<slug> -b feat/v5-<slug> feat/v5-aurora-rewrit
   `mkdir -p packages/<pkg>/node_modules/@openclaude && ln -sfn ../../../protocol packages/<pkg>/node_modules/@openclaude/protocol`
 - 先充分调研(git log 相关文件、找既有抽象),方案过 Codex,再写码。
 
+### 2.1a 要写数据库迁移?先申领编号,再过"部署窗口三问"(2026-08-15)
+
+仓库常年挂着 80+ worktree,迁移是"每人新建一个文件"的形态 —— **git 永远不报重号冲突**,
+而 `migrate.ts` 的 out-of-order 门要求「任何未应用版本严格 > max(applied)」。两支分支各占
+0218/0219 时:0218 先 apply 一切正常;0219 先 apply 则 0218 被判 out-of-order,**整个迁移
+运行 fail-closed**,卡死的是那支什么都没做错的分支的部署。
+
+**先记住一条结论,别再犯**:让号消除的是重号,**消除不了顺序依赖** —— 完整性门要的就是严格
+递增,小号那支永远必须先 apply。禁止在 commit / PR 正文里写"让号后 apply order 无关"。
+
+```bash
+# 1) 开写之前先申领(只读,秒级):列出所有 worktree + 远端分支高于 canonical 的在途占号
+scripts/v5-migration-claim.sh
+```
+
+- 建议号 = canonical 最高号 + 1,且无人占中间号 → 直接用,没有顺序依赖。
+- 中间号被别人占着(输出标 `GAP`)→ 你是后落的一方,必须在迁移文件**头部注释块**声明:
+
+```sql
+-- order-dependency: 0218_public_zai_glm53
+-- (或者:-- order-dependency: none  (0218 由 feat/x 保留,该分支已放弃))
+```
+
+  声明有两处强制:`scripts/check-migration-order.ts`(本地 `npm run lint:migration-order`;
+  CI 里由 `scripts/__tests__/migrationOrderGate.test.ts` 的真实仓库断言执行,挂在
+  `test:v5:ops` job —— 缺口未声明当场红)与 `migrate.ts` 的 apply 前断言(依赖未 applied
+  且不在本批目录 → 立刻 fail-closed,错误信息直接指出该先合并哪一支)。
+  PR 正文同时写明发布顺序,交发布队列人工保证。
+  解析权威只有 `packages/commercial/src/db/migrationOrder.ts` 一份,不要另写一份。
+- 存量豁免是一份**冻结名单**(`scripts/migration-order-baseline.json`),不是编号区间:名单里
+  那 217 支的历史重号(0102/0103/0130/0134/0135)与缺口不追溯,**任何新增文件无论取什么号都受约束**。
+  用区间豁免的话,新迁移只要把自己命名成区间内的号就能整体绕过门;取历史空洞里的号(如 0013 与
+  0015 之间补一支 0014)更是既不重号也不产生缺口,要到部署期才被 out-of-order 门判死。
+- 让号时容易漏的五处见「让号操作」:`.sql` 文件名、`migration02XX.integ.test.ts`、SQL 里的
+  `fn_02XX_*`/`trg_02XX_*`/`RAISE EXCEPTION '02XX ...'` 前缀、测试里的 `resetAndMigrateBefore`、
+  `release-metadata.json` 与 `.github/integ-tiers/*.txt` 登记。
+
+**部署窗口三问(写 SQL 之前问,别等 diff 审查才发现)** —— 这三问对应的都是"代码全写完之后
+才暴露、只能整批返工"的设计错误:
+
+1. **这支迁移对当前线上 active release 的旧代码安全吗?** 迁移先于新代码上线,部署窗口内旧代码
+   仍在跑。旧代码会不会写回你刚归一化掉的引用?会不会按旧字段回查、结果静默失败(撤权/授权类
+   最危险)?
+2. **`release-metadata.json.requiredMigrations` 能表达你想要的顺序吗?** 它是扁平精确清单,
+   表达不了"迁移 → 部署代码 → 再迁移";要那种顺序就必须**拆成两个 release**,别指望一个 release
+   里塞两支互相依赖的迁移。
+3. **有没有别的分支占着更小的编号?** 见上面的申领。有 → 顺序依赖必须显式声明并写进 PR 正文。
+
 ### 2.2 v5 设计原则(与 v3 的关键差异)
 - **v5 未全量上线 → 放开走最优解**:发现次优结构就大胆重构(换抽象/删旧机制/改数据模型),不为"改动小"迁就。架构妥协零容忍;v3 仍守现网约束。
 - 判断标准:worktree 基于 feat/v5-aurora-rewrite → 最优解;基于 v3 → 现网纪律。
