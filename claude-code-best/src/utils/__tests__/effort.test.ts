@@ -382,6 +382,23 @@ describe("MiniMax-M3 effort support", () => {
   });
 });
 
+describe("Moonshot K3 family effort support", () => {
+  test("kimi-k3/k3-256k 放行 low/high/max，不注入默认，xhigh 降级 high", () => {
+    const saved = process.env.CLAUDE_CODE_EFFORT_LEVEL;
+    delete process.env.CLAUDE_CODE_EFFORT_LEVEL;
+    for (const model of ["kimi-k3", "K3-256K"]) {
+      expect(modelSupportsEffort(model)).toBe(true);
+      expect(modelSupportsMaxEffort(model)).toBe(true);
+      expect(resolveAppliedEffort(model, "low")).toBe("low");
+      expect(resolveAppliedEffort(model, "high")).toBe("high");
+      expect(resolveAppliedEffort(model, "max")).toBe("max");
+      expect(resolveAppliedEffort(model, "xhigh")).toBe("high");
+      expect(resolveAppliedEffort(model, undefined)).toBeUndefined();
+    }
+    if (saved !== undefined) process.env.CLAUDE_CODE_EFFORT_LEVEL = saved;
+  });
+});
+
 // glm-5.1/glm-5.2(火山 Ark)虽在"firstParty 能力全关"静态模型集(isCapabilityZeroStaticModel),
 // 但**例外支持 output_config.effort**:火山端点接受 effort 思考深度(boss 2026-06-17 上线高/最高两档)。
 // 行为与 deepseek-v4 对称(high/max 两档,默认 max,xhigh 降级 high)。master proxy 按 protocol

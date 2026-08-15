@@ -74,11 +74,15 @@ describe('staticKeyProviders — matchesRoute', () => {
     assert.equal(km.matchesRoute('kimi-k2.6'), false)
     assert.equal(km.matchesRoute('kimi-k2.7-code-preview'), false)
   })
-  it('moonshot(kimi-k3)精确,大小写不敏感;与 kimi(k2.7)互不越界', () => {
+  it('moonshot(kimi-k3/k3-256k)精确,大小写不敏感;与 kimi(k2.7)互不越界', () => {
     const ms = getStaticProvider('moonshot')
     assert.equal(ms.matchesRoute('kimi-k3'), true)
     assert.equal(ms.matchesRoute('Kimi-K3'), true)
+    assert.equal(ms.matchesRoute('k3-256k'), true)
+    assert.equal(ms.matchesRoute('K3-256K'), true)
     assert.equal(ms.matchesRoute('kimi-k3-preview'), false)
+    assert.equal(ms.matchesRoute('k3-256k-preview'), false)
+    assert.equal(ms.matchesRoute('k3-128k'), false)
     assert.equal(ms.matchesRoute('kimi-k2.7-code'), false)
     // 两家 kimi 上游的路由面必须互斥:k2.7 → 火山 'kimi',k3 → 官方 'moonshot'
     assert.equal(getStaticProvider('kimi').matchesRoute('kimi-k3'), false)
@@ -113,6 +117,7 @@ describe('staticKeyProviders — findRouteProviderForModel', () => {
     assert.equal(findRouteProviderForModel('kimi-k2.7-code')?.id, 'kimi')
     assert.equal(findRouteProviderForModel('kimi-k3-ark')?.id, 'ark-k3')
     assert.equal(findRouteProviderForModel('kimi-k3')?.id, 'moonshot')
+    assert.equal(findRouteProviderForModel('k3-256k')?.id, 'moonshot')
     assert.equal(findRouteProviderForModel('qwen3.8-max')?.id, 'bailian')
     assert.equal(findRouteProviderForModel('claude-opus-4-7'), undefined)
     assert.equal(findRouteProviderForModel('DeepSeek-v4-pro'), undefined)
@@ -135,7 +140,7 @@ describe('staticKeyProviders — inboundModelIds(与 route 面故意不同)', ()
     ])
     assert.deepEqual([...getStaticProvider('kimi').inboundModelIds], ['kimi-k2.7-code'])
     assert.deepEqual([...getStaticProvider('ark-k3').inboundModelIds], ['kimi-k3-ark'])
-    assert.deepEqual([...getStaticProvider('moonshot').inboundModelIds], ['kimi-k3'])
+    assert.deepEqual([...getStaticProvider('moonshot').inboundModelIds], ['kimi-k3', 'k3-256k'])
     assert.deepEqual([...getStaticProvider('bailian').inboundModelIds], ['qwen3.8-max'])
   })
   it('STATIC_KEY_INBOUND_MODEL_IDS = 全 provider 字面量展开', () => {
@@ -152,6 +157,7 @@ describe('staticKeyProviders — inboundModelIds(与 route 面故意不同)', ()
       'kimi-k2.7-code',
       'kimi-k3-ark',
       'kimi-k3',
+      'k3-256k',
       'qwen3.8-max',
     ])
   })
@@ -197,10 +203,13 @@ describe('staticKeyProviders — canonicalizeForPricing', () => {
     assert.equal(km.canonicalizeForPricing('Kimi-K2.7-Code'), 'kimi-k2.7-code')
     assert.equal(km.canonicalizeForPricing('kimi-k2.6'), null)
   })
-  it('moonshot → kimi-k3(小写归一)', () => {
+  it('moonshot → kimi-k3/k3-256k(分别小写归一)', () => {
     const ms = getStaticProvider('moonshot')
     assert.equal(ms.canonicalizeForPricing('kimi-k3'), 'kimi-k3')
     assert.equal(ms.canonicalizeForPricing('Kimi-K3'), 'kimi-k3')
+    assert.equal(ms.canonicalizeForPricing('k3-256k'), 'k3-256k')
+    assert.equal(ms.canonicalizeForPricing('K3-256K'), 'k3-256k')
+    assert.equal(ms.canonicalizeForPricing('k3-256k-preview'), null)
     assert.equal(ms.canonicalizeForPricing('kimi-k2.7-code'), null)
   })
   it('ark-k3 pricing 保持平台 alias；legacy transport 精确改写为上游 kimi-k3', () => {
@@ -301,6 +310,16 @@ describe('staticKeyProviders — strip / endpoint', () => {
       'https://ark.cn-beijing.volces.com/api/plan/v1/messages',
     )
   })
+  it('moonshot K3 family 使用 x-api-key、provider 1M ceiling，并按白名单保留 effort', () => {
+    const moonshot = getStaticProvider('moonshot')
+    assert.equal(moonshot.authScheme, 'x-api-key')
+    assert.deepEqual([...moonshot.stripHeaders], ['anthropic-beta'])
+    assert.deepEqual([...moonshot.stripBodyFields], ['context_management', 'service_tier'])
+    assert.equal(moonshot.stripBodyFields.includes('output_config'), false)
+    assert.equal(moonshot.stripBodyFields.includes('thinking'), false)
+    assert.equal(moonshot.maxInputTokens, 1_048_576)
+    assert.equal(moonshot.supportsVision, true)
+  })
   it('bailian qwen3.8-max 使用 Token Plan x-api-key、983616 窗口并保留 thinking', () => {
     const bailian = getStaticProvider('bailian')
     assert.equal(
@@ -322,8 +341,9 @@ describe('staticKeyProviders — strip / endpoint', () => {
 })
 
 describe('staticKeyProviders — authScheme(上游鉴权头风格)', () => {
-  it('opencodego = x-api-key(/messages 不认 Bearer,2026-07-05 实测);其余缺省 bearer', () => {
+  it('opencodego/moonshot/bailian = x-api-key;其余缺省 bearer', () => {
     assert.equal(getStaticProvider('opencodego').authScheme, 'x-api-key')
+    assert.equal(getStaticProvider('moonshot').authScheme, 'x-api-key')
     assert.equal(getStaticProvider('deepseek').authScheme, undefined)
     assert.equal(getStaticProvider('minimax').authScheme, undefined)
     assert.equal(getStaticProvider('ark').authScheme, undefined)
@@ -347,8 +367,13 @@ describe('staticKeyProviders — stripDisabledThinking(恒思考模型删参兜�
 })
 
 describe('staticKeyProviders — allowedOutputConfigEfforts(思考深度白名单)', () => {
-  it('ark = [high, max];deepseek/minimax 未声明(undefined)', () => {
+  it('ark = [high,max]；moonshot = [low,high,max]；其余未声明', () => {
     assert.deepEqual([...(getStaticProvider('ark').allowedOutputConfigEfforts ?? [])], [
+      'high',
+      'max',
+    ])
+    assert.deepEqual([...(getStaticProvider('moonshot').allowedOutputConfigEfforts ?? [])], [
+      'low',
       'high',
       'max',
     ])

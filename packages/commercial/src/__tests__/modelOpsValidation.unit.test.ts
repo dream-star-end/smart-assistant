@@ -28,6 +28,14 @@ describe("effortMetaForModel — protocol 推导适用性", () => {
       assert.deepEqual(effortMetaForModel(model), { applicable: true, allowed: ["high", "max"] });
     }
   });
+  it("moonshot kimi-k3/k3-256k:白名单 low/high/max", () => {
+    for (const model of ["kimi-k3", "k3-256k"]) {
+      assert.deepEqual(effortMetaForModel(model), {
+        applicable: true,
+        allowed: ["low", "high", "max"],
+      });
+    }
+  });
   it("capability-zero 静态(strip output_config):kimi/qwen/minimax → 不适用", () => {
     for (const m of ["kimi-k2.7-code", "kimi-k3-ark", "deepseek-v4-flash-opencode-go", "qwen3.7-max", "qwen3.7-plus", "qwen3.8-max", "MiniMax-M3"]) {
       assert.deepEqual(effortMetaForModel(m), { applicable: false, allowed: [] }, m);

@@ -48,6 +48,7 @@ const NOOP_DEPS: PickUpstreamDeps = {
     minimax: "mm-key",
     opencodego: "opencode-go-key",
     "ark-k3": "ark-plan-key",
+    moonshot: "moonshot-key",
     bailian: "bailian-key",
   },
 };
@@ -240,6 +241,14 @@ describe("能力上限:catalog capability ⊆ provider 机制上限", () => {
     );
     assert.equal(ceiling.supportsVision, true);
     assert.deepEqual([...(ceiling.efforts ?? [])], []);
+  });
+
+  test("moonshot 机制 ceiling = vision=true / efforts=[low,high,max]", () => {
+    for (const model of ["kimi-k3", "k3-256k"]) {
+      const ceiling = providerCapabilityCeiling(selectUpstreamRoute(model));
+      assert.equal(ceiling.supportsVision, true);
+      assert.deepEqual([...(ceiling.efforts ?? [])], ["low", "high", "max"]);
+    }
   });
 
   test("deepseek(无白名单、不 strip output_config)→ 无 effort 机制限制", () => {
