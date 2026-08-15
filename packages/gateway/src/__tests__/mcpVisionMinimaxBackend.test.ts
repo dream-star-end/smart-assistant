@@ -70,6 +70,7 @@ describe('shouldEnableOpenClaudeVision gating', () => {
   })
   it('纯文本静态成员(OpenCode Go / kimi-k2.7-code,supportsVision=false)→ true', () => {
     // 派生自 protocol supportsVision,不再依赖 gateway 侧字面量 allowlist。
+    assert.equal(vision.shouldEnableOpenClaudeVision('opencodego', 'deepseek-v4-flash'), true)
     assert.equal(vision.shouldEnableOpenClaudeVision('opencodego', 'deepseek-v4-flash-opencode-go'), true)
     assert.equal(vision.shouldEnableOpenClaudeVision('opencodego', 'qwen3.7-max'), true)
     assert.equal(vision.shouldEnableOpenClaudeVision('opencodego', 'qwen3.7-plus'), true)

@@ -4,7 +4,6 @@
     {
       "id": "deepseek",
       "inboundModelIds": [
-        "deepseek-v4-flash",
         "deepseek-v4-pro"
       ],
       "maxInputTokens": null,
@@ -41,6 +40,7 @@
       "id": "opencodego",
       "inboundModelIds": [
         "deepseek-v4-flash-opencode-go",
+        "deepseek-v4-flash",
         "qwen3.7-max",
         "qwen3.7-plus"
       ],

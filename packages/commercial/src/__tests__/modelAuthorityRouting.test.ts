@@ -105,15 +105,15 @@ describe("selectUpstreamRoute — provider_id 驱动(catalog hint)", () => {
     assert.deepEqual((requestBody as { thinking?: unknown }).thinking, { type: "disabled" });
   });
 
-  test("opencodego catalog descriptor 保持 canonical 计费 id 与 upstream 型号分离", async () => {
-    const route = selectUpstreamRoute("deepseek-v4-flash-opencode-go", {
+  test("opencodego catalog descriptor 让 provider-neutral canonical id 走 Go transport", async () => {
+    const route = selectUpstreamRoute("deepseek-v4-flash", {
       providerId: "opencodego",
       upstreamModelId: "deepseek-v4-flash",
     });
-    const r = await pickUpstream(NOOP_DEPS, body("deepseek-v4-flash-opencode-go"), route, log);
+    const r = await pickUpstream(NOOP_DEPS, body("deepseek-v4-flash"), route, log);
     assert.ok(r.ok);
     const headers: Record<string, string> = {};
-    r.session.applyUpstreamAuth(headers, body("deepseek-v4-flash-opencode-go"), log);
+    r.session.applyUpstreamAuth(headers, body("deepseek-v4-flash"), log);
     assert.equal(r.session.upstreamModel, "deepseek-v4-flash");
     assert.equal(headers["x-api-key"], "opencode-go-key");
     assert.equal(headers.authorization, undefined);
@@ -156,6 +156,7 @@ describe("selectUpstreamRoute — provider_id 驱动(catalog hint)", () => {
     assert.equal(selectUpstreamRoute("deepseek-v4-pro").kind, "static");
     assert.equal(selectUpstreamRoute("glm-5.2").kind, "static");
     assert.equal(selectUpstreamRoute("glm-5.3").kind, "static");
+    assert.equal(selectUpstreamRoute("deepseek-v4-flash").kind, "static");
     assert.equal(selectUpstreamRoute("deepseek-v4-flash-opencode-go").kind, "static");
     assert.equal(selectUpstreamRoute("MiniMax-M3").kind, "static");
     assert.equal(selectUpstreamRoute("claude-sonnet-4-5").kind, "oauth");

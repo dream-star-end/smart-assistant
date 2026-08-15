@@ -216,10 +216,10 @@ export function _buildCcbUsageAttributionEnv(
  * and → 402.
  *
  * Root fix: decouple the utility model from the main model and pin it to ONE
- * dedicated cheap static-key model. deepseek-v4-flash is the right choice: cheap,
+ * dedicated cheap static-key model. OpenCode Go-backed deepseek-v4-flash is the right choice: cheap,
  * 1M context, strong Chinese, no thinking-format quirks, and it never touches the
- * OAuth account pool. The commercial master's anthropicProxy dispatches by model
- * name (isDeepseekModel), so this routes correctly for any proxy-routed session
+ * OAuth account pool. The commercial master's static-provider registry dispatches by model
+ * name, so this routes correctly for any proxy-routed session
  * regardless of its main model.
  *
  * The caller gates this: it is applied only when the container routes through the

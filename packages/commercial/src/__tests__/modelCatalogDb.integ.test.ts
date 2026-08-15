@@ -192,7 +192,7 @@ describe("0143 回填 + 后续 catalog engine 迁移", () => {
         r.upstream_model_id,
         id === "kimi-k3-ark"
           ? "kimi-k3"
-          : id === "deepseek-v4-flash-opencode-go"
+          : id === "deepseek-v4-flash" || id === "deepseek-v4-flash-opencode-go"
             ? "deepseek-v4-flash"
             : id === "glm-5.3"
               ? "glm-5.3"

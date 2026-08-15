@@ -799,8 +799,8 @@ describe("extractSessionId — 边界", () => {
 // ─── isDeepseekModel — 2026-05-02 deepseek 接入 ────────────────────────────
 
 describe("isDeepseekModel", () => {
-  test("deepseek-v4-flash → true", () => {
-    assert.equal(isDeepseekModel("deepseek-v4-flash"), true);
+  test("deepseek-v4-flash 已切到 OpenCode Go → false", () => {
+    assert.equal(isDeepseekModel("deepseek-v4-flash"), false);
   });
 
   test("deepseek-v4-pro → true", () => {

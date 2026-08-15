@@ -93,7 +93,8 @@
     "0211_stage_glm53_opencode_flash",
     "0212_public_glm53_opencode_flash",
     "0213_glm53_default_transition",
-    "0214_disable_legacy_models"
+    "0214_disable_legacy_models",
+    "0215_deepseek_flash_opencode_canonical"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

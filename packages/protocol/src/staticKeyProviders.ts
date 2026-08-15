@@ -118,13 +118,16 @@ const DEEPSEEK: StaticKeyProviderSpec = {
   upstreamEndpoint: 'https://api.deepseek.com/anthropic/v1/messages',
   matchesRoute(modelId) {
     // 大小写敏感前缀家族 —— 不要改成 toLowerCase，否则扩大准入面(Codex plan review)。
-    // OpenCode Go 的同名模型使用独立平台 alias，必须从 direct DeepSeek 家族排除。
+    // DeepSeek V4 Flash 已统一切到 OpenCode Go；canonical 与历史 provider alias 都必须从
+    // direct DeepSeek 家族排除，只保留 Pro/未来明确的 direct DeepSeek 型号。
+    const lower = modelId.toLowerCase()
     return (
       modelId.startsWith('deepseek-') &&
-      modelId.toLowerCase() !== 'deepseek-v4-flash-opencode-go'
+      lower !== 'deepseek-v4-flash' &&
+      lower !== 'deepseek-v4-flash-opencode-go'
     )
   },
-  inboundModelIds: ['deepseek-v4-flash', 'deepseek-v4-pro'],
+  inboundModelIds: ['deepseek-v4-pro'],
   canonicalizeForPricing() {
     return null
   },
@@ -194,8 +197,8 @@ const ARK: StaticKeyProviderSpec = {
 
 const OPENCODE_GO: StaticKeyProviderSpec = {
   id: 'opencodego',
-  // OpenCode Zen「Go 计划」网关。2026-08-14 接入 DeepSeek V4 Flash；平台 canonical
-  // 使用 deepseek-v4-flash-opencode-go，避免覆盖 direct DeepSeek 的既有 canonical。
+  // OpenCode Zen「Go 计划」网关。2026-08-15 起平台 canonical 统一为 provider-neutral 的
+  // deepseek-v4-flash；旧 deepseek-v4-flash-opencode-go 只保留作存量客户端兼容 alias。
   // /messages normal/SSE/thinking/tool_use+result/cache usage 全通。Qwen3.7 仅保留历史
   // transport plumbing，执行下线由 DB catalog 决定。
   upstreamEndpoint: 'https://opencode.ai/zen/go/v1/messages',
@@ -203,13 +206,23 @@ const OPENCODE_GO: StaticKeyProviderSpec = {
   authScheme: 'x-api-key',
   matchesRoute(modelId) {
     const m = modelId.toLowerCase()
-    return m === 'deepseek-v4-flash-opencode-go' || m === 'qwen3.7-max' || m === 'qwen3.7-plus'
+    return (
+      m === 'deepseek-v4-flash' ||
+      m === 'deepseek-v4-flash-opencode-go' ||
+      m === 'qwen3.7-max' ||
+      m === 'qwen3.7-plus'
+    )
   },
-  inboundModelIds: ['deepseek-v4-flash-opencode-go', 'qwen3.7-max', 'qwen3.7-plus'],
+  inboundModelIds: [
+    'deepseek-v4-flash-opencode-go',
+    'deepseek-v4-flash',
+    'qwen3.7-max',
+    'qwen3.7-plus',
+  ],
   canonicalizeForPricing(modelId) {
     const m = modelId.toLowerCase()
-    return m === 'deepseek-v4-flash-opencode-go'
-      ? 'deepseek-v4-flash-opencode-go'
+    return m === 'deepseek-v4-flash' || m === 'deepseek-v4-flash-opencode-go'
+      ? 'deepseek-v4-flash'
       : m === 'qwen3.7-max'
         ? 'qwen3.7-max'
         : m === 'qwen3.7-plus'
@@ -217,7 +230,8 @@ const OPENCODE_GO: StaticKeyProviderSpec = {
           : null
   },
   upstreamModelForRequest(modelId) {
-    return modelId.toLowerCase() === 'deepseek-v4-flash-opencode-go'
+    const m = modelId.toLowerCase()
+    return m === 'deepseek-v4-flash' || m === 'deepseek-v4-flash-opencode-go'
       ? 'deepseek-v4-flash'
       : modelId
   },
