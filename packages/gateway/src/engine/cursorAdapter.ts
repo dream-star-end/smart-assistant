@@ -113,7 +113,7 @@ interface TurnCtx {
   params: TurnParams; startedAt: number; proc: ChildProcessByStdio<null, Readable, Readable> | null
   assistantText: string; thinkingText: string; assistantSegments: SegmentRecord[]; thinkingSegments: SegmentRecord[]
   tools: Map<string, TurnToolEntry>; pending: Set<string>; startedTools: Map<string, number>
-  stderr: string; terminal: boolean; procClosed: boolean; abandoned: boolean; interrupted: boolean; error: string | null; usage?: ReportedUsage
+  stderr: string; terminal: boolean; procClosed: boolean; abandoned: boolean; resolveDrain: (() => void) | null; interrupted: boolean; error: string | null; usage?: ReportedUsage
   assistantPartialText: string; pendingAssistantText: string | null
   assistantSegmentClosed: boolean; thinkingSegmentClosed: boolean
   contextDir: string | null
@@ -479,7 +479,6 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
   private currentToolsets: string[] | undefined
   private target: ExecutionTarget = { kind: 'local' }
   private drain: Promise<void> = Promise.resolve()
-  private resolveDrain: (() => void) | null = null
   private readonly ownedContextDirs = new Set<string>()
   lastActivityAt = 0
 
@@ -488,9 +487,21 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
   submitTurn(params: TurnParams): EngineTurnRun {
     let resolve!: (value: TurnSummary | null) => void
     const summary = new Promise<TurnSummary | null>((r) => { resolve = r })
-    const ctx: TurnCtx = { params, startedAt: Date.now(), proc: null, assistantText: '', thinkingText: '', assistantSegments: [], thinkingSegments: [], tools: new Map(), pending: new Set(), startedTools: new Map(), stderr: '', terminal: false, procClosed: false, abandoned: false, interrupted: false, error: null, assistantPartialText: '', pendingAssistantText: null, assistantSegmentClosed: false, thinkingSegmentClosed: false, contextDir: null, rawToSafeToolId: new Map(), safeToRawToolId: new Map(), fallbackToolSequence: 0, resolve }
-    this.active = ctx; this.lastActivityAt = Date.now(); this.drain = new Promise((r) => { this.resolveDrain = r })
-    const submitted = this.spawnTurn(ctx).catch((err) => { this.cleanupContextDir(ctx); if (!ctx.terminal) this.finish(ctx, String(err)); this.resolveDrain?.(); this.resolveDrain = null; if (this.active === ctx) this.active = null; throw err })
+    const ctx: TurnCtx = { params, startedAt: Date.now(), proc: null, assistantText: '', thinkingText: '', assistantSegments: [], thinkingSegments: [], tools: new Map(), pending: new Set(), startedTools: new Map(), stderr: '', terminal: false, procClosed: false, abandoned: false, resolveDrain: null, interrupted: false, error: null, assistantPartialText: '', pendingAssistantText: null, assistantSegmentClosed: false, thinkingSegmentClosed: false, contextDir: null, rawToSafeToolId: new Map(), safeToRawToolId: new Map(), fallbackToolSequence: 0, resolve }
+    this.active = ctx; this.lastActivityAt = Date.now(); this.drain = new Promise((r) => { ctx.resolveDrain = r })
+    const submitted = this.spawnTurn(ctx).catch((err) => {
+      // Only ever settle this turn's own barrier: shutdown() may have already
+      // abandoned it, in which case `active` and `drain` belong to a later turn
+      // that this failure says nothing about.
+      if (!ctx.abandoned) {
+        this.cleanupContextDir(ctx)
+        if (!ctx.terminal) this.finish(ctx, String(err))
+        if (this.active === ctx) this.active = null
+      }
+      ctx.resolveDrain?.()
+      ctx.resolveDrain = null
+      throw err
+    })
     return { submitted, summary, end: () => this.forceEnd(ctx), getPartialSnapshot: () => snapshot(ctx), getPhantomSignals: () => ({ ...EMPTY_SIGNALS }), get finalized() { return ctx.terminal }, get pendingToolCalls() { return ctx.pending.size } }
   }
   private createContextDir(ctx: TurnCtx): string {
@@ -629,21 +640,24 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         if (ctx.stderr.length < 32768) ctx.stderr += chunk.slice(0, 32768 - ctx.stderr.length)
       })
       proc.once('error', (err) => {
+        // An abandoned turn has already been finalized and `active` has moved
+        // on; surfacing this would report a later turn as failed.
+        if (ctx.abandoned) return
         this.cleanupContextDir(ctx)
         if (!ctx.terminal) this.finish(ctx, String(err))
         this.emit('error', err)
       })
       proc.once('close', (code, signal) => {
         // shutdown() may have already given up on this process and finalized
-        // the turn. `drain`, `resolveDrain` and `active` are adapter-level and
-        // by now belong to a later turn, which this handler must not touch.
+        // the turn, in which case `active` belongs to a later turn that this
+        // handler must not touch.
         if (ctx.abandoned) return
         ctx.procClosed = true
         if (buffer.trim()) this.handleLine(ctx, buffer.trim())
         this.flushPendingAssistant(ctx, false)
         this.cleanupContextDir(ctx)
-        this.resolveDrain?.()
-        this.resolveDrain = null
+        ctx.resolveDrain?.()
+        ctx.resolveDrain = null
         if (!ctx.terminal)
           this.finish(ctx, ctx.stderr.trim() || `Cursor CLI exited with code ${String(code)}`)
         this.emit('exit', { code, signal, crashed: !ctx.interrupted && code !== 0 })
@@ -851,8 +865,8 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     if (proc) detachChildStdio(proc)
     this.cleanupContextDir(ctx)
     if (!ctx.terminal) this.finish(ctx, detail)
-    this.resolveDrain?.()
-    this.resolveDrain = null
+    ctx.resolveDrain?.()
+    ctx.resolveDrain = null
     if (this.active === ctx) this.active = null
     if (proc) {
       try { proc.unref() } catch { /* already detached */ }

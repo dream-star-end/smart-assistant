@@ -146,6 +146,7 @@ interface GrokTurnContext {
   terminal: boolean
   procClosed: boolean
   abandoned: boolean
+  resolveDrain: (() => void) | null
   interrupted: boolean
   errorDetail: string | null
   lastUsage: ReturnType<typeof grokUsage>
@@ -173,7 +174,6 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
   private currentTarget: ExecutionTarget = { kind: 'local' }
   private traceId: string | undefined
   private drain: Promise<void> = Promise.resolve()
-  private resolveDrain: (() => void) | null = null
   lastActivityAt = 0
 
   constructor(opts: EngineCreateOpts) {
@@ -214,6 +214,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       terminal: false,
       procClosed: false,
       abandoned: false,
+      resolveDrain: null,
       interrupted: false,
       errorDetail: null,
       lastUsage: grokUsage({}),
@@ -221,12 +222,17 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     }
     this.active = ctx
     this.lastActivityAt = Date.now()
-    this.drain = new Promise<void>((resolve) => { this.resolveDrain = resolve })
+    this.drain = new Promise<void>((resolve) => { ctx.resolveDrain = resolve })
     const submitted = this.spawnTurn(ctx).catch((err) => {
-      this.forceEnd(ctx)
-      this.resolveDrain?.()
-      this.resolveDrain = null
-      if (this.active === ctx) this.active = null
+      // Only ever settle this turn's own barrier: shutdown() may have already
+      // abandoned it, in which case `active` and `drain` belong to a later turn
+      // that this failure says nothing about.
+      if (!ctx.abandoned) {
+        this.forceEnd(ctx)
+        if (this.active === ctx) this.active = null
+      }
+      ctx.resolveDrain?.()
+      ctx.resolveDrain = null
       throw err
     })
     return {
@@ -334,18 +340,21 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       ctx.stderr += chunk
     })
     proc.once('error', (err) => {
+      // An abandoned turn has already been finalized and `active` has moved on;
+      // surfacing this would report a later turn as failed.
+      if (ctx.abandoned) return
       if (!ctx.terminal) this.finishError(ctx, String(err))
       this.emit('error', err)
     })
     proc.once('close', (code, signal) => {
-      // shutdown() may have already given up on this process and finalized the
-      // turn. `drain`, `resolveDrain` and `active` are adapter-level and by now
-      // belong to a later turn, which this handler must not touch.
+      // shutdown() may have already given up on this process and finalized
+      // the turn, in which case `active` belongs to a later turn that this
+      // handler must not touch.
       if (ctx.abandoned) return
       ctx.procClosed = true
       if (stdoutBuffer.trim()) this.handleLine(ctx, stdoutBuffer.trim())
-      this.resolveDrain?.()
-      this.resolveDrain = null
+      ctx.resolveDrain?.()
+      ctx.resolveDrain = null
       const crashed = !ctx.interrupted && code !== 0
       if (!ctx.terminal) {
         const detail = ctx.errorDetail || ctx.stderr.trim() || `grok exited with code ${String(code)}`
@@ -674,8 +683,8 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     ctx.abandoned = true
     if (proc) detachChildStdio(proc)
     if (!ctx.terminal) this.finishError(ctx, detail)
-    this.resolveDrain?.()
-    this.resolveDrain = null
+    ctx.resolveDrain?.()
+    ctx.resolveDrain = null
     if (this.active === ctx) this.active = null
     if (proc) {
       try { proc.unref() } catch { /* already detached */ }
