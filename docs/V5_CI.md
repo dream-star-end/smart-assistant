@@ -30,6 +30,9 @@ check:ci-parity`(挂在 typecheck job 里)机器核对 —— 任一方向差集
 历史教训:2026-07-26 审计发现 `check:v5` 缺 `test:browser`、CI 缺 `test:mcp-memory`,
 开发者按文档跑绿却漏掉最贵的那道门。
 
+
+本地预检快车道:`npm run check:v5:fast`(`scripts/select-gates.ts` + `scripts/run-v5-fast.ts`)。它按 `git diff origin/feat/v5-aurora-rewrite...HEAD` ∪ 工作区裁剪要跑的门,并把独立门并行执行;带 `test-mutex.sh commercial` 锁的 两门(unit / integ)彼此串行,避免再制造锁竞争。**它不是 CI 的替代,也不进入 `check:v5` 链** —— parity 门只核对全量集合。T2 / nightly / 合并前仍跑 `npm run check:v5`。
+
 注意:`check:v5` 是 v5 的质量门,**不含** biome lint(`npm run lint`,当前 3657 error
 存量,见「已知风险」)/ `test:web` / `lint:undefined-refs`(后两者只服务
 `packages/web`);v3 / 个人版的全量门仍是 `npm run check`。

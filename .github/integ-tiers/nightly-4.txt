@@ -28,4 +28,5 @@ packages/commercial/src/__tests__/migration0214.integ.test.ts
 packages/commercial/src/__tests__/migration0215.integ.test.ts
 packages/commercial/src/__tests__/migration0216.integ.test.ts
 packages/commercial/src/__tests__/migration0217.integ.test.ts
+packages/commercial/src/__tests__/migration0218.integ.test.ts
 packages/commercial/src/__tests__/migration0219.integ.test.ts
