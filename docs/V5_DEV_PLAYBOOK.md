@@ -109,7 +109,10 @@ scripts/v5-migration-claim.sh
   且不在本批目录 → 立刻 fail-closed,错误信息直接指出该先合并哪一支)。
   PR 正文同时写明发布顺序,交发布队列人工保证。
   解析权威只有 `packages/commercial/src/db/migrationOrder.ts` 一份,不要另写一份。
-- 强制区间从 `0220` 起;更早的重号(0102/0103/0130/0134/0135)与缺口是已 apply 的历史,不追溯。
+- 存量豁免是一份**冻结名单**(`scripts/migration-order-baseline.json`),不是编号区间:名单里
+  那 217 支的历史重号(0102/0103/0130/0134/0135)与缺口不追溯,**任何新增文件无论取什么号都受约束**。
+  用区间豁免的话,新迁移只要把自己命名成区间内的号就能整体绕过门;取历史空洞里的号(如 0013 与
+  0015 之间补一支 0014)更是既不重号也不产生缺口,要到部署期才被 out-of-order 门判死。
 - 让号时容易漏的五处见「让号操作」:`.sql` 文件名、`migration02XX.integ.test.ts`、SQL 里的
   `fn_02XX_*`/`trg_02XX_*`/`RAISE EXCEPTION '02XX ...'` 前缀、测试里的 `resetAndMigrateBefore`、
   `release-metadata.json` 与 `.github/integ-tiers/*.txt` 登记。

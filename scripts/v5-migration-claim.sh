@@ -13,7 +13,7 @@
 # 用法:
 #   scripts/v5-migration-claim.sh              # 占号表 + 建议编号
 #   scripts/v5-migration-claim.sh --fetch      # 先 git fetch,再扫(跨机器协作时用)
-#   BRANCH_SCAN_LIMIT=60 scripts/v5-migration-claim.sh
+#   BRANCH_SCAN_LIMIT=40 scripts/v5-migration-claim.sh   # 只扫最近 N 支(默认全扫)
 #
 # 申领到编号之后:
 #   * 若建议号 = canonical 最高号 + 1 → 直接用,没有顺序依赖。
@@ -25,7 +25,9 @@
 set -euo pipefail
 
 CANONICAL_REF="${CANONICAL_REF:-origin/feat/v5-aurora-rewrite}"
-BRANCH_SCAN_LIMIT="${BRANCH_SCAN_LIMIT:-40}"
+# 默认全扫。占号是「有没有」的判断,不是「最近有没有」:一支半年前推上去、本地 worktree
+# 早已删除的分支照样占着号,漏掉它就会再次建议同一个号。实测 166 支远端分支全扫 ~3s。
+BRANCH_SCAN_LIMIT="${BRANCH_SCAN_LIMIT:-0}"
 MIG_DIR="packages/commercial/src/db/migrations"
 
 cd "$(git rev-parse --show-toplevel)"
@@ -68,11 +70,16 @@ git worktree list --porcelain | awk '/^worktree /{print $2}' | while read -r wt;
     done
 done >> "$TMP"
 
-# b) 最近推过的远端分支(已 push 但 worktree 已删的情况)。
-# 用 --count 而不是 `| head`:后者在 refs 很多时会让 for-each-ref 吃 SIGPIPE,
-# 在 `set -o pipefail` 下把整个脚本带死。
-git for-each-ref --count="$BRANCH_SCAN_LIMIT" --sort=-committerdate \
-  --format='%(refname:short)' refs/remotes/origin | while read -r br; do
+# b) 远端分支(已 push 但 worktree 已删的情况)。默认不设上限 —— 设了上限就等于
+# 声称"旧分支不会占号",而那恰恰是最容易漏的一类。若确实要截断,用 --count 而不是
+# `| head`:后者在 refs 很多时会让 for-each-ref 吃 SIGPIPE,在 `set -o pipefail`
+# 下把整个脚本带死。
+SCAN_ARGS=(--sort=-committerdate --format='%(refname:short)' refs/remotes/origin)
+if [ "$BRANCH_SCAN_LIMIT" -gt 0 ] 2>/dev/null; then
+  SCAN_ARGS=(--count="$BRANCH_SCAN_LIMIT" "${SCAN_ARGS[@]}")
+  echo "  (注意:BRANCH_SCAN_LIMIT=$BRANCH_SCAN_LIMIT,只扫了最近 $BRANCH_SCAN_LIMIT 支远端分支)" >&2
+fi
+git for-each-ref "${SCAN_ARGS[@]}" | while read -r br; do
     versions_in_ref "$br" | while read -r v; do
       if [ "$v" \> "$CANON_MAX" ]; then
         printf '%s\tremote %s\n' "$v" "$br"

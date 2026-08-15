@@ -17,8 +17,8 @@
 //
 // 规则:
 //   R1  迁移文件名必须是 `NNNN_snake_case.sql`
-//   R2  ENFORCE_FROM 起不得重号(两支迁移共用同一个 4 位前缀)
-//   R3  ENFORCE_FROM 起,编号相对前一支存在缺口时,必须在文件头声明
+//   R2  新迁移不得重号(两支迁移共用同一个 4 位前缀)
+//   R3  新迁移的编号相对前一支存在缺口时,必须在文件头声明
 //       `-- order-dependency: <version>` 或 `-- order-dependency: none <理由>`
 //       —— 缺口意味着中间号被另一支分支占着,那就是一条必须显式化的发布顺序依赖
 //   R4  声明语法合法,且每条依赖的编号严格小于自身 —— 这两项都要在 PR 期判掉,
@@ -29,6 +29,11 @@
 //       漏登记 = 部署期才 fail-closed)
 //   R6  requiredMigrations 里的每一条都必须在磁盘上存在
 //   R7  requiredMigrations 必须字典序升序(= 真实 apply 顺序,便于人工核对)
+//   R8  新迁移不得取基线里已用到的编号或更小的号 —— 往历史空洞里插号(如 0013→0015
+//       之间补一支 0014)不重号也不产生缺口,能安静过完 R2/R3,却必然在部署期被
+//       out-of-order 门判死
+//
+// 「新迁移」= 不在 scripts/migration-order-baseline.json 冻结快照里的文件。
 //
 // 用法:npm run lint:migration-order   (退出 0 = 全过;1 = 有违规)
 
@@ -44,18 +49,33 @@ import {
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const MIGRATIONS_DIR = join(REPO_ROOT, "packages/commercial/src/db/migrations");
 const RELEASE_METADATA = join(REPO_ROOT, "deploy/v5/release-metadata.json");
-
-/**
- * 存量豁免线。0220 之前的历史里既有重号(0102/0103/0130/0134/0135)也有缺口
- * (0013→0015、0115→0117、0164→0166、0170→0173),都已 apply 到生产,追溯改名会
- * 破坏 schema_migrations 记账。门禁引入时在途的 0218/0219 同样不追溯 —— 让在途分支
- * 因为一道新门变红,只会逼人绕门。**新迁移从这里开始受约束。**
- */
-const ENFORCE_FROM = "0220";
+const BASELINE_FILE = join(REPO_ROOT, "scripts/migration-order-baseline.json");
 
 interface Problem {
-  rule: "R1" | "R2" | "R3" | "R4" | "R5" | "R6" | "R7";
+  rule: "R1" | "R2" | "R3" | "R4" | "R5" | "R6" | "R7" | "R8";
   message: string;
+}
+
+/**
+ * 存量豁免:门引入时磁盘上已有的那一批文件的**冻结名单**。
+ *
+ * 这里刻意不用「编号阈值」(最初写的是 `ENFORCE_FROM = "0220"`)。阈值豁免的是一个
+ * 区间,而不是具体文件 —— 新迁移只要把自己命名成 `0219_*`,就能同时绕过 R2/R3/R4,
+ * 而 R5..R7 只看登记是否完整,识别不出这是个新插进来的历史编号。名单则只豁免当时
+ * 确实存在的那 217 支:任何后来新增的文件,无论取什么号,都落在约束内。
+ */
+export interface Baseline {
+  versions: ReadonlySet<string>;
+  /** 快照里的最高 4 位编号;新迁移必须严格大于它(R8)。 */
+  maxNumber: string;
+}
+
+export function loadBaseline(file: string): Baseline {
+  const raw = JSON.parse(readFileSync(file, "utf8")) as { versions: string[] };
+  const versions = new Set(raw.versions);
+  if (versions.size === 0) throw new Error(`${file}:基线快照为空,门会把所有存量判成新迁移`);
+  const maxNumber = [...versions].sort().at(-1)!.slice(0, 4);
+  return { versions, maxNumber };
 }
 
 export interface MigrationFile {
@@ -82,11 +102,18 @@ export function listMigrationFiles(dir: string): { files: MigrationFile[]; probl
   return { files, problems };
 }
 
-/** R2:受约束区间内不得重号。 */
-export function checkDuplicateNumbers(files: ReadonlyArray<MigrationFile>): Problem[] {
+/**
+ * R2:不得重号。
+ *
+ * 只有「整组都是基线存量」的重号才放行(那几对已 apply 到生产,改不动了)。只要组里
+ * 有一支是新迁移,就报 —— 包括新迁移去撞一个历史编号的情况。
+ */
+export function checkDuplicateNumbers(
+  files: ReadonlyArray<MigrationFile>,
+  baseline: Baseline,
+): Problem[] {
   const byNumber = new Map<string, string[]>();
   for (const f of files) {
-    if (f.version < ENFORCE_FROM) continue;
     const list = byNumber.get(f.number) ?? [];
     list.push(f.version);
     byNumber.set(f.number, list);
@@ -94,6 +121,7 @@ export function checkDuplicateNumbers(files: ReadonlyArray<MigrationFile>): Prob
   const problems: Problem[] = [];
   for (const [number, versions] of byNumber) {
     if (versions.length < 2) continue;
+    if (versions.every((v) => baseline.versions.has(v))) continue;
     problems.push({
       rule: "R2",
       message:
@@ -114,16 +142,19 @@ export function checkDuplicateNumbers(files: ReadonlyArray<MigrationFile>): Prob
  * 依赖的**有效性**在这里判(编号必须更小),而不是留给 runtime:声明一个更大或等于自身
  * 的编号在任何应用顺序下都不可能被满足,让它绿到部署期才 fail-closed 是最贵的失败方式。
  * 但**不要求依赖已经在目录里** —— 依赖分支尚未合并正是这条声明存在的理由。
+ *
+ * R3 只对新迁移生效(历史缺口已 apply,补不回来了);R4 对所有文件生效 —— 一条写坏的
+ * 声明不会因为文件年代久远就变得能被满足。
  */
 export function checkOrderDeclarations(
   files: ReadonlyArray<MigrationFile>,
   readSql: (file: string) => string,
+  baseline: Baseline,
 ): Problem[] {
   const problems: Problem[] = [];
   const sorted = [...files].sort((a, b) => (a.version < b.version ? -1 : 1));
   for (let i = 0; i < sorted.length; i++) {
     const cur = sorted[i]!;
-    if (cur.version < ENFORCE_FROM) continue;
     const prev = sorted[i - 1];
 
     let declared = false;
@@ -145,6 +176,8 @@ export function checkOrderDeclarations(
       continue;
     }
 
+    if (baseline.versions.has(cur.version)) continue;
+
     // 编号相等 = 重号,已由 R2 报;这里不再重复报一条 R3,免得同一个错出两种说法。
     const hasGap =
       prev !== undefined &&
@@ -161,6 +194,34 @@ export function checkOrderDeclarations(
           `      -- order-dependency: none  (<编号> 曾由 <分支> 保留,已放弃)`,
       });
     }
+  }
+  return problems;
+}
+
+/**
+ * R8:新迁移不得取基线最高号或更小的号。
+ *
+ * 这条堵的是 R2/R3 都看不见的一类:往历史空洞里插号。基线里 0013 与 0015 之间是空的,
+ * 新加一支 0014 既不重号、也不制造缺口(反倒把缺口填上了),R2/R3 全绿 —— 但 0015 及
+ * 其之后的两百支早已 applied,这支 0014 在部署期必然被 out-of-order 门判死,而且是让
+ * **整个迁移运行** fail-closed。同理,`0219_*` 这种「取一个刚好在基线之下的号」的写法
+ * 也在这里被截住,不再能靠编号绕过前面几条。
+ */
+export function checkBaselineInsertion(
+  files: ReadonlyArray<MigrationFile>,
+  baseline: Baseline,
+): Problem[] {
+  const problems: Problem[] = [];
+  for (const f of files) {
+    if (baseline.versions.has(f.version)) continue;
+    if (f.number > baseline.maxNumber) continue;
+    problems.push({
+      rule: "R8",
+      message:
+        `${f.file}:编号 ${f.number} 不高于基线最高号 ${baseline.maxNumber},但它不是基线里的文件 —— ` +
+        `即新迁移占用了历史编号。基线之下的迁移都已 apply,这支在部署期会被 out-of-order 门判死并让` +
+        `整个迁移运行 fail-closed。跑 scripts/v5-migration-claim.sh 申领一个未被占用的新号。`,
+    });
   }
   return problems;
 }
@@ -213,11 +274,17 @@ function main(): void {
     minimumRequiredMigration: string;
     requiredMigrations: string[];
   };
+  const baseline = loadBaseline(BASELINE_FILE);
 
   const all = [
     ...problems,
-    ...checkDuplicateNumbers(files),
-    ...checkOrderDeclarations(files, (file) => readFileSync(join(MIGRATIONS_DIR, file), "utf8")),
+    ...checkDuplicateNumbers(files, baseline),
+    ...checkOrderDeclarations(
+      files,
+      (file) => readFileSync(join(MIGRATIONS_DIR, file), "utf8"),
+      baseline,
+    ),
+    ...checkBaselineInsertion(files, baseline),
     ...checkRequiredMigrations(files, metadata),
   ];
 
@@ -226,14 +293,15 @@ function main(): void {
     for (const p of all) console.error(`  [${p.rule}] ${p.message}`);
     console.error(
       `\n  参考 docs/V5_DEV_PLAYBOOK.md §2.1a「迁移编号申领」。` +
-        `强制区间从 ${ENFORCE_FROM} 起(更早的重号/缺口是已 apply 的历史,不追溯)。`,
+        `存量豁免只覆盖 scripts/migration-order-baseline.json 里冻结的那批文件` +
+        `(最高号 ${baseline.maxNumber}),新增文件一律受约束。`,
     );
     process.exit(1);
   }
 
-  const enforced = files.filter((f) => f.version >= ENFORCE_FROM).length;
+  const fresh = files.filter((f) => !baseline.versions.has(f.version)).length;
   console.log(
-    `✓ 迁移编号/登记门通过:${files.length} 支迁移(其中 ${enforced} 支在 ${ENFORCE_FROM}+ 强制区间),` +
+    `✓ 迁移编号/登记门通过:${files.length} 支迁移(其中 ${fresh} 支在基线 ${baseline.maxNumber} 之后新增),` +
       `requiredMigrations ${metadata.requiredMigrations.length} 条登记完整且有序。`,
   );
 }
