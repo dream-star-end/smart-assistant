@@ -105,6 +105,7 @@ async function createExactVerifiedCycle(
   omitGrantRemoveAudit = false,
   reorderGrantAudits = false,
   interleaveUnrelatedAudit = false,
+  useSqlNullPayloads = false,
 ): Promise<void> {
   const canaryId = await installAuditPrincipals()
   const target = await query<{ entry_id: string; lock_version: number }>(
@@ -139,7 +140,7 @@ async function createExactVerifiedCycle(
   const addGrantAudit = () =>
     query(
       `INSERT INTO admin_audit(admin_id,action,target,before,after)
-       VALUES (1,'model_grant.add',$1,NULL,$2::jsonb)`,
+       VALUES (1,'model_grant.add',$1,${useSqlNullPayloads ? 'NULL' : "'null'::jsonb"},$2::jsonb)`,
       [
         `user:${canaryId}/model:${modelId}`,
         JSON.stringify({ user_id: canaryId, model_id: modelId, granted_by: '1' }),
@@ -153,7 +154,7 @@ async function createExactVerifiedCycle(
   if (!omitGrantRemoveAudit) {
     await query(
       `INSERT INTO admin_audit(admin_id,action,target,before,after)
-       VALUES (1,'model_grant.remove',$1,$2::jsonb,NULL)`,
+       VALUES (1,'model_grant.remove',$1,$2::jsonb,${useSqlNullPayloads ? 'NULL' : "'null'::jsonb"})`,
       [
         `user:${canaryId}/model:${modelId}`,
         JSON.stringify({
@@ -252,7 +253,7 @@ describe('0218_public_zai_glm53', () => {
     await assertPublic(5, '1')
   })
 
-  test('rejects missing or reordered verification audit atomically', async (t) => {
+  test('rejects missing, reordered, or SQL-NULL verification audit atomically', async (t) => {
     if (db.skipIfUnavailable(t)) return
     const sql = await prepareFloor()
     await createExactVerifiedCycle(true)
@@ -269,6 +270,14 @@ describe('0218_public_zai_glm53', () => {
     await assert.rejects(query(sql), /audit sequence mismatch/)
 
     assert.deepEqual(await targetProjection(), reordered)
+
+    await prepareFloor()
+    await createExactVerifiedCycle(false, false, false, true)
+    const sqlNullPayloads = await targetProjection()
+
+    await assert.rejects(query(sql), /audit sequence mismatch/)
+
+    assert.deepEqual(await targetProjection(), sqlNullPayloads)
   })
 
   test('rejects pricing or authority-binding drift before publication', async (t) => {

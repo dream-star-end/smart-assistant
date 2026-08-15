@@ -277,12 +277,12 @@ BEGIN
        OR v_a1.after IS DISTINCT FROM '{"state":"active","model_id":"glm-5.3-zai"}'::jsonb
        OR v_a2.action <> 'model_grant.add'
        OR v_a2.target <> 'user:'||v_canary_id::text||'/model:glm-5.3-zai'
-       OR v_a2.before IS NOT NULL
+       OR v_a2.before IS DISTINCT FROM 'null'::jsonb
        OR v_a2.after IS DISTINCT FROM jsonb_build_object(
             'user_id',v_canary_id::text,'model_id','glm-5.3-zai','granted_by','1')
        OR v_a3.action <> 'model_grant.remove'
        OR v_a3.target <> 'user:'||v_canary_id::text||'/model:glm-5.3-zai'
-       OR v_a3.after IS NOT NULL
+       OR v_a3.after IS DISTINCT FROM 'null'::jsonb
        OR v_a3.before-'granted_at'
           IS DISTINCT FROM jsonb_build_object(
             'user_id',v_canary_id::text,'model_id','glm-5.3-zai','granted_by','1')
