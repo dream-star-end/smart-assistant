@@ -98,5 +98,11 @@ describe("STATIC_PROVIDER_META 完整性", () => {
       rejectMetricLabel: "bailian_config",
       egress: "direct",
     });
+    assert.deepEqual(STATIC_PROVIDER_META.zai, {
+      keyConfigField: "ZAI_CODING_PLAN_KEY",
+      notConfiguredHttpCode: "ZAI_NOT_CONFIGURED",
+      rejectMetricLabel: "zai_config",
+      egress: "direct",
+    });
   });
 });

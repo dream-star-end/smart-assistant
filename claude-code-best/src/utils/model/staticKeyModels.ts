@@ -70,6 +70,12 @@ export function isArkGlmModel(model: string): boolean {
   return m === 'glm-5.1' || m === 'glm-5.2' || m === 'glm-5.3'
 }
 
+/** 智谱国际版 Z.AI Coding Plan 的平台 alias。与火山 Ark 的 glm-5.3 是同一品牌型号、
+ * 不同上游/凭据，必须保持独立 canonical id。 */
+export function isZaiGlm53Model(model: string): boolean {
+  return model.trim().toLowerCase() === 'glm-5.3-zai'
+}
+
 /** OpenCode Go 当前模型 + 历史 transport 集。DeepSeek 使用独立平台 alias，避免覆盖 direct
  *  provider；Qwen3.7 保留历史 plumbing 但由 DB catalog 下线。 */
 export function isOpencodeGoModel(model: string): boolean {
@@ -126,6 +132,7 @@ export function isCapabilityZeroStaticModel(model: string): boolean {
   return (
     isMiniMaxM3Model(model) ||
     isArkGlmModel(model) ||
+    isZaiGlm53Model(model) ||
     isOpencodeGoModel(model) ||
     isArkPlanKimiModel(model) ||
     isArkPlanKimiK3Model(model) ||
@@ -161,6 +168,7 @@ export const STATIC_MODEL_CONTEXT_WINDOW: ReadonlyArray<{
     contextWindow: 1_000_000,
   },
   { matches: (m) => m.trim().toLowerCase() === 'glm-5.1', contextWindow: 200_000 },
+  { matches: isZaiGlm53Model, contextWindow: 1_000_000 },
   // DeepSeek alias 与历史 qwen3.7 均为 1M；direct DeepSeek 由上面的精确表独立处理。
   { matches: isOpencodeGoModel, contextWindow: 1_000_000 },
   // kimi-k2.7-code 官方规格 256K(火山 Agent Plan 托管,max output 上游硬顶 32768)。

@@ -16,6 +16,7 @@ import {
   isCapabilityZeroStaticModel,
   isMoonshotKimiK3Model,
   isOpencodeGoModel,
+  isZaiGlm53Model,
 } from './model/staticKeyModels.js'
 import { isMiniMaxM3Model } from './model/minimax.js'
 
@@ -107,6 +108,10 @@ export function modelSupportsThinking(model: string): boolean {
   // 实测支持 thinking:{type:enabled,budget_tokens}。故先判，让 CCB 默认发 enabled(claude.ts
   // 因 modelSupportsAdaptiveThinking=false 走 enabled+budget 分支，正是 Ark 接受的格式)。
   if (isArkGlmModel(model)) {
+    return true
+  }
+  // Z.AI Coding Plan glm-5.3 alias 支持 enabled+budget；与 Ark 同品牌但独立 provider。
+  if (isZaiGlm53Model(model)) {
     return true
   }
   // MiniMax-M3 是思考模型 —— 它在 isCapabilityZeroStaticModel 集合里(betas/effort/adaptive-thinking

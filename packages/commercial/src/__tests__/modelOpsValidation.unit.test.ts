@@ -24,7 +24,7 @@ import { applyModelDefaultEffort, type ProxyBody } from "../http/proxy/shared.js
 
 describe("effortMetaForModel — protocol 推导适用性", () => {
   it("ark glm-5.2/5.3:白名单 high/max", () => {
-    for (const model of ["glm-5.2", "glm-5.3"]) {
+    for (const model of ["glm-5.2", "glm-5.3", "glm-5.3-zai"]) {
       assert.deepEqual(effortMetaForModel(model), { applicable: true, allowed: ["high", "max"] });
     }
   });
@@ -61,6 +61,7 @@ describe("provider ops 派生枚举", () => {
     assert.ok(opsProviderIds().includes("ark-k3"));
     assert.ok(opsProviderIds().includes("moonshot"));
     assert.ok(opsProviderIds().includes("bailian"));
+    assert.ok(opsProviderIds().includes("zai"));
   });
 });
 

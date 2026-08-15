@@ -2,6 +2,7 @@
 // Anthropic 兼容上游(不占 OAuth 账号池)的 provider 的单一权威声明。
 //
 // 当前成员：DeepSeek、MiniMax、火山方舟 Ark(glm-5.3 + glm-5.2/5.1 兼容存量)、
+// 智谱国际版 Z.AI Coding Plan(glm-5.3-zai 平台 alias)、
 // OpenCode Go(Zen 网关 Go 档,DeepSeek V4 Flash 平台 alias + Qwen3.7 兼容存量)、
 // Ark Agent Plan Kimi(kimi-k2.7-code,与 minimax 同订阅同 key,2026-07-06)。
 //
@@ -22,6 +23,7 @@ export type StaticProviderId =
   | 'deepseek'
   | 'minimax'
   | 'ark'
+  | 'zai'
   | 'opencodego'
   | 'kimi'
   | 'ark-k3'
@@ -193,6 +195,33 @@ const ARK: StaticKeyProviderSpec = {
   allowedOutputConfigEfforts: ['high', 'max'],
   // glm-5.2/5.3 机制窗口 1M；glm-5.1 的 200K 由 CCB per-model authority 收紧。
   maxInputTokens: 1_000_000,
+}
+
+const ZAI_CODING_PLAN: StaticKeyProviderSpec = {
+  id: 'zai',
+  // 智谱国际版 Z.AI GLM Coding Plan Anthropic 兼容端点。2026-08-15 从生产网络实测
+  // glm-5.3 normal/SSE/high|max effort/tool_use+tool_result 全通，usage 数字完整。
+  // 平台使用独立 canonical alias，不能覆盖已由火山 Ark 服务的 glm-5.3。
+  upstreamEndpoint: 'https://api.z.ai/api/anthropic/v1/messages',
+  matchesRoute(modelId) {
+    return modelId.toLowerCase() === 'glm-5.3-zai'
+  },
+  inboundModelIds: ['glm-5.3-zai'],
+  canonicalizeForPricing(modelId) {
+    return modelId.toLowerCase() === 'glm-5.3-zai' ? 'glm-5.3-zai' : null
+  },
+  upstreamModelForRequest(modelId) {
+    return modelId.toLowerCase() === 'glm-5.3-zai' ? 'glm-5.3' : modelId
+  },
+  stripHeaders: ['anthropic-beta'],
+  // Z.AI 接受 enabled+budget、disabled 与 output_config.effort；只保留产品开放的
+  // high/max，first-party-only context/service 字段在边界剥离。
+  stripBodyFields: ['context_management', 'service_tier'],
+  allowedOutputConfigEfforts: ['high', 'max'],
+  maxInputTokens: 1_000_000,
+  // 官方 Cline 配置要求关闭图片；红/蓝对照探针把红图也回答为蓝，证明兼容端点没有
+  // 可靠消费图像内容。按纯文本接入并由 understand_image 工具兜底。
+  supportsVision: false,
 }
 
 const OPENCODE_GO: StaticKeyProviderSpec = {
@@ -367,6 +396,7 @@ export const STATIC_KEY_PROVIDERS: readonly StaticKeyProviderSpec[] = [
   DEEPSEEK,
   MINIMAX,
   ARK,
+  ZAI_CODING_PLAN,
   OPENCODE_GO,
   ARK_PLAN_KIMI,
   ARK_PLAN_KIMI_K3,
@@ -378,6 +408,7 @@ const BY_ID: Record<StaticProviderId, StaticKeyProviderSpec> = {
   deepseek: DEEPSEEK,
   minimax: MINIMAX,
   ark: ARK,
+  zai: ZAI_CODING_PLAN,
   opencodego: OPENCODE_GO,
   kimi: ARK_PLAN_KIMI,
   'ark-k3': ARK_PLAN_KIMI_K3,

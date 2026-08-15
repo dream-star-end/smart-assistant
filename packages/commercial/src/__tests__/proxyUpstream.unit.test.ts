@@ -39,6 +39,7 @@ import { directEgressDispatcher } from "../account-pool/egressDispatcher.js";
 const DEEPSEEK_ROUTE = { kind: "static" as const, provider: getStaticProvider("deepseek") };
 const MINIMAX_ROUTE = { kind: "static" as const, provider: getStaticProvider("minimax") };
 const ARK_ROUTE = { kind: "static" as const, provider: getStaticProvider("ark") };
+const ZAI_ROUTE = { kind: "static" as const, provider: getStaticProvider("zai") };
 const OPENCODEGO_ROUTE = { kind: "static" as const, provider: getStaticProvider("opencodego") };
 const ARK_K3_ROUTE = { kind: "static" as const, provider: getStaticProvider("ark-k3") };
 const MOONSHOT_ROUTE = { kind: "static" as const, provider: getStaticProvider("moonshot") };
@@ -151,6 +152,17 @@ describe("selectUpstreamRoute", () => {
       if (r.kind === "static") assert.equal(r.provider.id, "ark");
     }
   });
+  test("glm-5.3-zai 只走 static/zai，并把 transport model 改写为 glm-5.3", () => {
+    for (const model of ["glm-5.3-zai", "GLM-5.3-ZAI"]) {
+      const route = selectUpstreamRoute(model);
+      assert.equal(route.kind, "static");
+      if (route.kind === "static") {
+        assert.equal(route.provider.id, "zai");
+        assert.equal(route.upstreamModel, "glm-5.3");
+      }
+    }
+    assert.deepEqual(selectUpstreamRoute("glm-5.3-zai-preview"), { kind: "oauth" });
+  });
   test("qwen3.7-max / plus → static/opencodego", () => {
     for (const m of ["qwen3.7-max", "qwen3.7-plus"]) {
       const r = selectUpstreamRoute(m);
@@ -205,6 +217,10 @@ describe("validateUpstreamConfig", () => {
       kind: "static_not_configured",
       providerId: "ark",
     });
+    assert.deepEqual(validateUpstreamConfig(ZAI_ROUTE, {}), {
+      kind: "static_not_configured",
+      providerId: "zai",
+    });
     assert.deepEqual(validateUpstreamConfig(ARK_K3_ROUTE, {}), {
       kind: "static_not_configured",
       providerId: "ark-k3",
@@ -229,6 +245,10 @@ describe("validateUpstreamConfig", () => {
     );
     assert.equal(
       validateUpstreamConfig(ARK_ROUTE, { staticProviderKeys: { ark: "ark-key" } }),
+      null,
+    );
+    assert.equal(
+      validateUpstreamConfig(ZAI_ROUTE, { staticProviderKeys: { zai: "zai-key" } }),
       null,
     );
     assert.equal(
@@ -445,6 +465,72 @@ describe("pickUpstream — Ark glm-5.1 route", () => {
     if (!res.ok) return;
     const messages = [{ role: "user", content: "hi" }];
     assert.equal(res.session.sanitizeMessages(messages, "glm-5.1", log), messages);
+    res.session.zeroizeSecrets();
+    res.session.zeroizeSecrets();
+  });
+});
+
+// ─── pickUpstream — Z.AI glm-5.3 alias ──────────────────────────────────
+
+describe("pickUpstream — Z.AI glm-5.3 route", () => {
+  test("Bearer/direct + upstream glm-5.3；保留 thinking/high|max，strip first-party 字段", async () => {
+    const sched = makeScheduler({});
+    const route = selectUpstreamRoute("glm-5.3-zai");
+    const res = await pickUpstream(
+      { scheduler: sched.scheduler, staticProviderKeys: { zai: "ZAI-KEY" } },
+      bodyFor("glm-5.3-zai"),
+      route,
+      log,
+    );
+    assert.equal(res.ok, true);
+    if (!res.ok) return;
+    assert.equal(sched.pickCalls, 0);
+    assert.equal(res.session.endpoint, "https://api.z.ai/api/anthropic/v1/messages");
+    assert.equal(res.session.upstreamModel, "glm-5.3");
+    assert.equal(res.session.dispatcher, directEgressDispatcher());
+
+    const headers: Record<string, string> = { "anthropic-beta": "strip-me" };
+    const requestBody = {
+      model: "glm-5.3-zai",
+      output_config: { effort: "max", extra: true },
+      context_management: { edits: [] },
+      service_tier: "priority",
+      thinking: { type: "enabled", budget_tokens: 2048 },
+    } as unknown as Parameters<typeof res.session.applyUpstreamAuth>[1];
+    res.session.applyUpstreamAuth(headers, requestBody, log);
+    assert.equal(headers.authorization, "Bearer ZAI-KEY");
+    assert.equal(headers["x-api-key"], undefined);
+    assert.equal(headers["anthropic-beta"], undefined);
+    assert.deepEqual((requestBody as { output_config?: unknown }).output_config, {
+      effort: "max",
+    });
+    assert.equal((requestBody as { context_management?: unknown }).context_management, undefined);
+    assert.equal((requestBody as { service_tier?: unknown }).service_tier, undefined);
+    assert.deepEqual((requestBody as { thinking?: unknown }).thinking, {
+      type: "enabled",
+      budget_tokens: 2048,
+    });
+
+    const lowBody = {
+      output_config: { effort: "low" },
+      thinking: { type: "disabled" },
+    } as unknown as Parameters<typeof res.session.applyUpstreamAuth>[1];
+    res.session.applyUpstreamAuth({}, lowBody, log);
+    assert.equal((lowBody as { output_config?: unknown }).output_config, undefined);
+    assert.deepEqual((lowBody as { thinking?: unknown }).thinking, { type: "disabled" });
+  });
+
+  test("sanitizeMessages 返回原引用；zeroizeSecrets 幂等", async () => {
+    const res = await pickUpstream(
+      { scheduler: makeScheduler({}).scheduler, staticProviderKeys: { zai: "k" } },
+      bodyFor("glm-5.3-zai"),
+      ZAI_ROUTE,
+      log,
+    );
+    assert.equal(res.ok, true);
+    if (!res.ok) return;
+    const messages = [{ role: "user", content: "hi" }];
+    assert.equal(res.session.sanitizeMessages(messages, "glm-5.3-zai", log), messages);
     res.session.zeroizeSecrets();
     res.session.zeroizeSecrets();
   });

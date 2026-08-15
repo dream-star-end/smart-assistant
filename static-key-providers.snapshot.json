@@ -37,6 +37,17 @@
       "supportsVision": false
     },
     {
+      "id": "zai",
+      "inboundModelIds": [
+        "glm-5.3-zai"
+      ],
+      "maxInputTokens": 1000000,
+      "upstreamEndpoint": "https://api.z.ai/api/anthropic/v1/messages",
+      "capabilityZero": true,
+      "contextWindow": 1000000,
+      "supportsVision": false
+    },
+    {
       "id": "opencodego",
       "inboundModelIds": [
         "deepseek-v4-flash-opencode-go",
