@@ -20,6 +20,10 @@
 //   在根 package.json 里加一条 alias(例:`test:browser`),两侧都用 alias。
 //
 // 用法:npm run check:ci-parity  (退出 0 = 一致;1 = 有差异)
+//
+// 本地快车道 `check:v5:fast` 故意不在本核对范围内:它不是 CI 权威,也不得
+// 写进 check:v5 链或 v5-ci.yml。把它加进 check:v5 会让本门要求 CI 也改成
+// 快车道 —— 那是削弱 CI。
 
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
