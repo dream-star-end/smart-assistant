@@ -68,6 +68,13 @@ describe("Ark GLM / OpenCode Go thinking capability", () => {
     expect(modelSupportsAdaptiveThinking("kimi-k3-ark")).toBe(false);
   });
 
+  test("Moonshot kimi-k3/k3-256k thinking=true、adaptive=false", () => {
+    for (const model of ["kimi-k3", "k3-256k"]) {
+      expect(modelSupportsThinking(model)).toBe(true);
+      expect(modelSupportsAdaptiveThinking(model)).toBe(false);
+    }
+  });
+
   test("qwen3.8-max(百炼 Token Plan)thinking=true、adaptive=false", () => {
     expect(modelSupportsThinking("qwen3.8-max")).toBe(true);
     expect(modelSupportsAdaptiveThinking("qwen3.8-max")).toBe(false);

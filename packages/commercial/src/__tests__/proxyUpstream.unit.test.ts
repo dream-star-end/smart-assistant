@@ -41,6 +41,7 @@ const MINIMAX_ROUTE = { kind: "static" as const, provider: getStaticProvider("mi
 const ARK_ROUTE = { kind: "static" as const, provider: getStaticProvider("ark") };
 const OPENCODEGO_ROUTE = { kind: "static" as const, provider: getStaticProvider("opencodego") };
 const ARK_K3_ROUTE = { kind: "static" as const, provider: getStaticProvider("ark-k3") };
+const MOONSHOT_ROUTE = { kind: "static" as const, provider: getStaticProvider("moonshot") };
 const BAILIAN_ROUTE = { kind: "static" as const, provider: getStaticProvider("bailian") };
 import {
   AccountPoolBusyError,
@@ -171,6 +172,14 @@ describe("selectUpstreamRoute", () => {
       assert.equal(r.upstreamModel, "kimi-k3");
     }
   });
+  test("kimi-k3 / k3-256k → static/moonshot；相似前后缀不误路由", () => {
+    for (const model of ["kimi-k3", "k3-256k"]) {
+      const route = selectUpstreamRoute(model);
+      assert.equal(route.kind, "static");
+      if (route.kind === "static") assert.equal(route.provider.id, "moonshot");
+    }
+    assert.deepEqual(selectUpstreamRoute("k3-256k-preview"), { kind: "oauth" });
+  });
   test("其它 model → kind=oauth", () => {
     assert.deepEqual(selectUpstreamRoute("claude-sonnet-4-6"), { kind: "oauth" });
     assert.deepEqual(selectUpstreamRoute("gpt-5"), { kind: "oauth" });
@@ -204,6 +213,10 @@ describe("validateUpstreamConfig", () => {
       kind: "static_not_configured",
       providerId: "bailian",
     });
+    assert.deepEqual(validateUpstreamConfig(MOONSHOT_ROUTE, {}), {
+      kind: "static_not_configured",
+      providerId: "moonshot",
+    });
   });
   test("static 路由 + 有自己的 key → null(放行)", () => {
     assert.equal(
@@ -224,6 +237,10 @@ describe("validateUpstreamConfig", () => {
     );
     assert.equal(
       validateUpstreamConfig(BAILIAN_ROUTE, { staticProviderKeys: { bailian: "sk-sp-test" } }),
+      null,
+    );
+    assert.equal(
+      validateUpstreamConfig(MOONSHOT_ROUTE, { staticProviderKeys: { moonshot: "moonshot-key" } }),
       null,
     );
   });
@@ -518,6 +535,71 @@ describe("pickUpstream — Ark output_config effort 白名单清洗", () => {
     assert.equal(cleanse(s, ["max"]), undefined); // array(typeof==object)被 Array.isArray 排除
     assert.equal(cleanse(s, null), undefined);
     assert.equal(cleanse(s, undefined), undefined);
+  });
+});
+
+// ─── Moonshot K3 family x-api-key + effort 白名单 ──────────────────────
+
+describe("pickUpstream — Moonshot kimi-k3 / k3-256k", () => {
+  async function moonshotSession(model = "k3-256k") {
+    const sched = makeScheduler({});
+    const res = await pickUpstream(
+      { scheduler: sched.scheduler, staticProviderKeys: { moonshot: "MOONSHOT-KEY" } },
+      bodyFor(model),
+      selectUpstreamRoute(model),
+      log,
+    );
+    assert.equal(res.ok, true);
+    if (!res.ok) throw new Error("moonshot pick failed");
+    assert.equal(sched.pickCalls, 0);
+    assert.equal(res.session.endpoint, "https://api.kimi.com/coding/v1/messages");
+    assert.equal(res.session.upstreamModel, model);
+    assert.equal(res.session.dispatcher, directEgressDispatcher());
+    return res.session;
+  }
+
+  test("两模型均走 x-api-key/direct dispatcher；保留 thinking，strip first-party 字段", async () => {
+    for (const model of ["kimi-k3", "k3-256k"]) {
+      const session = await moonshotSession(model);
+      const headers: Record<string, string> = { "anthropic-beta": "strip-me" };
+      const requestBody = {
+        model,
+        output_config: { effort: "high", task_budget: { tokens: 1 } },
+        context_management: { edits: [] },
+        service_tier: "priority",
+        thinking: { type: "enabled", budget_tokens: 1024 },
+      } as unknown as Parameters<typeof session.applyUpstreamAuth>[1];
+      session.applyUpstreamAuth(headers, requestBody, log);
+      assert.equal(headers["x-api-key"], "MOONSHOT-KEY");
+      assert.equal(headers.authorization, undefined);
+      assert.equal(headers["anthropic-beta"], undefined);
+      assert.deepEqual((requestBody as { output_config?: unknown }).output_config, {
+        effort: "high",
+      });
+      assert.equal((requestBody as { context_management?: unknown }).context_management, undefined);
+      assert.equal((requestBody as { service_tier?: unknown }).service_tier, undefined);
+      assert.deepEqual((requestBody as { thinking?: unknown }).thinking, {
+        type: "enabled",
+        budget_tokens: 1024,
+      });
+    }
+  });
+
+  test("仅 low/high/max 保留；medium/xhigh/ultra 删除", async () => {
+    const session = await moonshotSession();
+    const cleanse = (effort: string): unknown => {
+      const requestBody = {
+        output_config: { effort, extra: true },
+      } as unknown as Parameters<typeof session.applyUpstreamAuth>[1];
+      session.applyUpstreamAuth({}, requestBody, log);
+      return (requestBody as { output_config?: unknown }).output_config;
+    };
+    for (const effort of ["low", "high", "max"]) {
+      assert.deepEqual(cleanse(effort), { effort });
+    }
+    for (const effort of ["medium", "xhigh", "ultra"]) {
+      assert.equal(cleanse(effort), undefined);
+    }
   });
 });
 
