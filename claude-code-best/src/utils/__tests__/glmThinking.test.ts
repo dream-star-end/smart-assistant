@@ -56,9 +56,11 @@ describe("Ark GLM / OpenCode Go thinking capability", () => {
     expect(modelSupportsThinking("GLM-5.2")).toBe(true);
   });
 
-  test("glm-5.3 与 OpenCode Go DeepSeek alias thinking=true、adaptive=false", () => {
+  test("glm-5.3 / Z.AI alias 与 OpenCode Go DeepSeek alias thinking=true、adaptive=false", () => {
     expect(modelSupportsThinking("glm-5.3")).toBe(true);
     expect(modelSupportsAdaptiveThinking("glm-5.3")).toBe(false);
+    expect(modelSupportsThinking("glm-5.3-zai")).toBe(true);
+    expect(modelSupportsAdaptiveThinking("glm-5.3-zai")).toBe(false);
     expect(modelSupportsThinking("deepseek-v4-flash-opencode-go")).toBe(true);
     expect(modelSupportsAdaptiveThinking("deepseek-v4-flash-opencode-go")).toBe(false);
   });

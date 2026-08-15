@@ -425,3 +425,43 @@ describe("glm-5.1 / glm-5.2 (Ark) effort support", () => {
     if (saved !== undefined) process.env.CLAUDE_CODE_EFFORT_LEVEL = saved;
   });
 });
+
+describe("glm-5.3-zai effort support", () => {
+  test("signed descriptor 与 legacy fallback 均保留 high/max，xhigh 降级 high", () => {
+    const savedEffort = process.env.CLAUDE_CODE_EFFORT_LEVEL;
+    const savedDescriptor = process.env.OC_MODEL_EXECUTION_DESCRIPTOR;
+    delete process.env.CLAUDE_CODE_EFFORT_LEVEL;
+    delete process.env.OC_MODEL_EXECUTION_DESCRIPTOR;
+
+    expect(modelSupportsEffort("glm-5.3-zai")).toBe(true);
+    expect(modelSupportsMaxEffort("glm-5.3-zai")).toBe(true);
+    expect(resolveAppliedEffort("glm-5.3-zai", "high")).toBe("high");
+    expect(resolveAppliedEffort("glm-5.3-zai", "max")).toBe("max");
+    expect(resolveAppliedEffort("glm-5.3-zai", "xhigh")).toBe("high");
+
+    process.env.OC_MODEL_EXECUTION_DESCRIPTOR = JSON.stringify({
+      canonicalModel: "glm-5.3-zai",
+      contextWindow: 1_000_000,
+      capabilityZero: true,
+      supportsThinking: true,
+      supportsVision: false,
+      supportedEfforts: ["high", "max"],
+    });
+    expect(modelSupportsEffort("glm-5.3-zai")).toBe(true);
+    expect(modelSupportsMaxEffort("glm-5.3-zai")).toBe(true);
+    expect(resolveAppliedEffort("glm-5.3-zai", "high")).toBe("high");
+    expect(resolveAppliedEffort("glm-5.3-zai", "max")).toBe("max");
+    expect(resolveAppliedEffort("glm-5.3-zai", "xhigh")).toBe("high");
+
+    if (savedEffort === undefined) {
+      delete process.env.CLAUDE_CODE_EFFORT_LEVEL;
+    } else {
+      process.env.CLAUDE_CODE_EFFORT_LEVEL = savedEffort;
+    }
+    if (savedDescriptor === undefined) {
+      delete process.env.OC_MODEL_EXECUTION_DESCRIPTOR;
+    } else {
+      process.env.OC_MODEL_EXECUTION_DESCRIPTOR = savedDescriptor;
+    }
+  });
+});

@@ -11,6 +11,7 @@ import {
   isCapabilityZeroStaticModel,
   isOpencodeGoModel,
   isOpencodeQwenModel,
+  isZaiGlm53Model,
   getStaticModelContextWindow,
   getAuthorityModelCapabilities,
 } from "../staticKeyModels";
@@ -51,6 +52,15 @@ describe("isArkGlmModel", () => {
     expect(isArkGlmModel(" GLM-5.3 ")).toBe(true);
     expect(isArkGlmModel("glm-5")).toBe(false);
     expect(isArkGlmModel("glm-5.4")).toBe(false);
+  });
+});
+
+describe("isZaiGlm53Model", () => {
+  test("精确匹配 glm-5.3-zai，不抢 Ark glm-5.3", () => {
+    expect(isZaiGlm53Model("glm-5.3-zai")).toBe(true);
+    expect(isZaiGlm53Model(" GLM-5.3-ZAI ")).toBe(true);
+    expect(isZaiGlm53Model("glm-5.3")).toBe(false);
+    expect(isZaiGlm53Model("glm-5.3-zai-preview")).toBe(false);
   });
 });
 
@@ -121,6 +131,7 @@ describe("isCapabilityZeroStaticModel — minimax + ark + opencodego qwen(不含
     expect(isCapabilityZeroStaticModel("glm-5.2")).toBe(true);
     expect(isCapabilityZeroStaticModel("GLM-5.2")).toBe(true);
     expect(isCapabilityZeroStaticModel("glm-5.3")).toBe(true);
+    expect(isCapabilityZeroStaticModel("glm-5.3-zai")).toBe(true);
     expect(isCapabilityZeroStaticModel("deepseek-v4-flash-opencode-go")).toBe(true);
     expect(isCapabilityZeroStaticModel("qwen3.7-max")).toBe(true);
     expect(isCapabilityZeroStaticModel("qwen3.7-plus")).toBe(true);
@@ -148,6 +159,7 @@ describe("getStaticModelContextWindow", () => {
     expect(getStaticModelContextWindow("glm-5.2")).toBe(1_000_000);
     expect(getStaticModelContextWindow("GLM-5.2")).toBe(1_000_000);
     expect(getStaticModelContextWindow("glm-5.3")).toBe(1_000_000);
+    expect(getStaticModelContextWindow("glm-5.3-zai")).toBe(1_000_000);
     expect(getStaticModelContextWindow("deepseek-v4-flash-opencode-go")).toBe(1_000_000);
     expect(getStaticModelContextWindow("qwen3.7-max")).toBe(1_000_000);
     expect(getStaticModelContextWindow("qwen3.7-plus")).toBe(1_000_000);

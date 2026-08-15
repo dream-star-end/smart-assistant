@@ -52,6 +52,8 @@ export const KNOWN_SEED_PROVIDERS: readonly string[] = [
   "deepseek",
   "minimax",
   "ark",
+  // 智谱国际版 Z.AI GLM Coding Plan(glm-5.3-zai)。
+  "zai",
   "opencodego",
   "kimi",
   // 火山方舟 Agent Plan Kimi K3(kimi-k3-ark,2026-07-22)。

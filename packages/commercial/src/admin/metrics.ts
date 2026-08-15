@@ -576,6 +576,8 @@ export type ProxyRejectReason =
   | "moonshot_config"
   // 阿里百炼 Token Plan(qwen3.8-max,2026-08-04):缺 BAILIAN_TOKEN_PLAN_KEY 时独立打点。
   | "bailian_config"
+  // 智谱国际版 Z.AI Coding Plan(glm-5.3-zai):缺 ZAI_CODING_PLAN_KEY 时独立打点。
+  | "zai_config"
   // glm-5.1 命中但 ARK_CODING_PLAN_KEY 未配置(火山方舟 Coding Plan 文本路由 503)
   | "ark_config"
   // Phase 5 platform envelope rewriter:**handler-level** deps.platformContextLoader

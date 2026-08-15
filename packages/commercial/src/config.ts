@@ -597,6 +597,15 @@ export const commercialConfigSchema = z
      */
     BAILIAN_TOKEN_PLAN_KEY: z.string().trim().min(1).max(512).optional(),
     /**
+     * 智谱国际版 Z.AI GLM Coding Plan key(glm-5.3-zai)。
+     * - Anthropic Messages:https://api.z.ai/api/anthropic/v1/messages
+     * - Authorization Bearer；平台 canonical glm-5.3-zai，上游 literal glm-5.3
+     * - 只存在于 master/egress EnvironmentFile，绝不注入用户容器或写入 git
+     * - 未配置 → 503 ZAI_NOT_CONFIGURED + reject 'zai_config'
+     * - 订阅配额由全部 V5 用户共享，不替换现有 Ark glm-5.3，也不作为默认模型
+     */
+    ZAI_CODING_PLAN_KEY: z.string().trim().min(1).max(512).optional(),
+    /**
      * Deepgram Nova-3 streaming ASR key for browser voice input.
      *
      * - 只在 master-side `/ws/voice-transcribe` 使用,前端永远不见 key。
