@@ -1,46 +1,97 @@
 #!/usr/bin/env bash
 # v5-hot-config-lib.sh — --hot-config 变更集白名单守卫。
 #
-# 只允许「不产生代码 dist 变化」的路径进入热配置 lane。TS/JS 源码、schema、
-# 迁移、lockfile、构建配置一律拒绝。绕过必须 --hot-config-force + 非空理由，
-# 并写 durable 审计日志；没有理由的 force 直接失败。
+# 只放行「确定会在运行时从本次 release 树读到、且不经过 dist/bundle」的路径。
+# 2026-08-16 收敛：原先允许的 public/locales/changelog/catalog-json/env.overrides/md
+# 经核对都不是这条语义（见报告「白名单收敛依据」）。当前 allow 集为空；
+# --hot-config 的价值是拒绝静默空发布，不是放宽边界。
 #
-# 可被 deploy-v5.sh source，也可独立执行:
-#   bash scripts/v5-hot-config-lib.sh --check
-#   bash scripts/v5-hot-config-lib.sh --list-changed
+# 绕过必须 --hot-config-force + OC_V5_HOT_CONFIG_FORCE_REASON(≥8)，写审计日志。
 set -euo pipefail
 
 HOT_CONFIG_CANONICAL_REF="${OC_V5_HOT_CONFIG_BASE:-origin/feat/v5-aurora-rewrite}"
 HOT_CONFIG_AUDIT_LOG="${OC_V5_HOT_CONFIG_AUDIT_LOG:-/var/log/openclaude-v5/hot-config-force.log}"
 
-hot_config_is_denied() {
+# 分类(deny 优先)。stdout=class: frontend|source|changelog|catalog-bundle|env-template|docs|unknown
+hot_config_classify() {
   local f="$1"
-  [[ "$f" == package.json || "$f" == package-lock.json || "$f" == bun.lock \
-    || "$f" == bun.lockb || "$f" == pnpm-lock.yaml || "$f" == yarn.lock ]] && return 0
-  [[ "$f" == tsconfig.json || "$f" == tsconfig.base.json || "$f" == biome.json \
-    || "$f" == bunfig.toml ]] && return 0
-  [[ "$f" == .github || "$f" == .github/* ]] && return 0
-  [[ "$f" == */migrations/* || "$f" == *.sql ]] && return 0
-  [[ "$f" == *.ts || "$f" == *.tsx || "$f" == *.js || "$f" == *.jsx \
-    || "$f" == *.mjs || "$f" == *.cjs || "$f" == *.mts || "$f" == *.cts ]] && return 0
-  [[ "$f" == scripts/select-gates.ts || "$f" == scripts/check-*.ts ]] && return 0
+  if [[ "$f" == packages/web-react || "$f" == packages/web-react/* ]]; then
+    printf '%s\n' frontend
+    return 0
+  fi
+  if [[ "$f" == */locales/* || "$f" == */i18n/* || "$f" == */locale/* \
+    || "$f" == locales/* || "$f" == i18n/* || "$f" == locale/* ]]; then
+    printf '%s\n' frontend
+    return 0
+  fi
+  if [[ "$f" == package.json || "$f" == package-lock.json || "$f" == bun.lock \
+    || "$f" == bun.lockb || "$f" == pnpm-lock.yaml || "$f" == yarn.lock \
+    || "$f" == tsconfig.json || "$f" == tsconfig.base.json || "$f" == biome.json \
+    || "$f" == bunfig.toml || "$f" == .github || "$f" == .github/* \
+    || "$f" == */migrations/* || "$f" == *.sql \
+    || "$f" == *.ts || "$f" == *.tsx || "$f" == *.js || "$f" == *.jsx \
+    || "$f" == *.mjs || "$f" == *.cjs || "$f" == *.mts || "$f" == *.cts \
+    || "$f" == scripts/select-gates.ts || "$f" == scripts/check-*.ts ]]; then
+    printf '%s\n' source
+    return 0
+  fi
+  if [[ "$f" == changelog.json ]]; then
+    printf '%s\n' changelog
+    return 0
+  fi
+  if [[ "$f" == *model-catalog*.json || "$f" == *modelCatalog*.json ]]; then
+    printf '%s\n' catalog-bundle
+    return 0
+  fi
+  if [[ "$f" == deploy/v5/commercial-v5.env.overrides \
+    || "$f" == deploy/v5/*.env || "$f" == deploy/v5/*.env.* \
+    || "$f" == *.env || "$f" == *.env.overrides ]]; then
+    printf '%s\n' env-template
+    return 0
+  fi
+  if [[ "$f" == *.md || "$f" == docs || "$f" == docs/* ]]; then
+    printf '%s\n' docs
+    return 0
+  fi
+  printf '%s\n' unknown
+}
+
+hot_config_is_denied() {
+  local class
+  class="$(hot_config_classify "$1")"
+  [[ "$class" != allowed ]]
+}
+
+# 当前没有任何已证明「运行时读 release 树、且不经 dist/bundle」的路径。
+# 要新增必须先在报告里写读取点证据，禁止凭感觉放行。
+hot_config_is_allowed() {
   return 1
 }
 
-hot_config_is_allowed() {
-  local f="$1"
-  [[ "$f" == deploy/v5/commercial-v5.env.overrides || "$f" == deploy/v5/*.env \
-    || "$f" == deploy/v5/*.env.* ]] && return 0
-  [[ "$f" == changelog.json ]] && return 0
-  [[ "$f" == *model-catalog*.json || "$f" == *modelCatalog*.json ]] && return 0
-  [[ "$f" == */locales/* || "$f" == */i18n/* || "$f" == */locale/* ]] && return 0
-  if [[ "$f" == packages/web-react/public/* ]] \
-    && [[ "$f" == *.svg || "$f" == *.png || "$f" == *.jpg || "$f" == *.jpeg \
-      || "$f" == *.webp || "$f" == *.ico || "$f" == *.gif || "$f" == *.json ]]; then
-    return 0
-  fi
-  [[ "$f" == docs/*.md || "$f" == docs/*/*.md || "$f" == deploy/v5/*.md || "$f" == *.md ]] && return 0
-  return 1
+hot_config_reason_for_class() {
+  case "$1" in
+    frontend)
+      printf '%s\n' "前端生效面(vite dist / Caddy 直服)。--hot-config 不重建 dist、继承上一版。请改用 --with-dist（或 --dist）。"
+      ;;
+    source)
+      printf '%s\n' "源码/schema/迁移/lockfile。请改用完整 deploy；含前端时加 --with-dist。"
+      ;;
+    changelog)
+      printf '%s\n' "changelog.json 由网关从 OPENCLAUDE_HOME 读盘(/api/changelog)，V5 deploy-v5.sh 不会把它 rsync 到 HOME（那是 V3 路径）。改仓库内该文件走 --hot-config 是静默空发布。"
+      ;;
+    catalog-bundle)
+      printf '%s\n' "model-catalog JSON 是 platform bundle 叶子，运行时读 /run/oc/platform/current/etc-codex/…，不是 master release 树。上下线走 admin catalog/DB；改这份 JSON 要重建 platform bundle，不是 --hot-config。"
+      ;;
+    env-template)
+      printf '%s\n' "commercial-v5.env.overrides 只在 bootstrap 且 live env 不存在时派生 /etc/openclaude/commercial-v5.env；增量部署明确不重生成。现网权威是 EnvironmentFile=该 live env。改密钥请持 lease 写 live env / remote_env_set。"
+      ;;
+    docs)
+      printf '%s\n' "文档不参与部署产物，单独改 md 不要走生产写 lane。"
+      ;;
+    *)
+      printf '%s\n' "未列入已证明的运行时配置面。--hot-config 只接受确定安全的那一小类（当前为空）。"
+      ;;
+  esac
 }
 
 hot_config_repo_root() {
@@ -69,10 +120,6 @@ hot_config_resolve_base() {
   git -C "$root" rev-parse HEAD
 }
 
-# stdout: 变更路径,一行一个。
-# 1) 相对 merge-base(canonical)...HEAD 的已提交 diff
-# 2) 暂存 / 未暂存
-# 3) 若 1+2 为空且 HEAD==base(刚合入 canonical 的典型形态),再看 tip 相对第一父
 hot_config_list_changed() {
   local root="$1" base="$2" head listed
   head="$(git -C "$root" rev-parse HEAD)"
@@ -109,7 +156,7 @@ hot_config_audit_force() {
 }
 
 assert_hot_config_changeset() {
-  local root base changed denied allowed unknown f
+  local root base changed denied allowed unknown f class
   root="$(hot_config_repo_root)"
   [[ -d "$root/.git" || -f "$root/.git" ]] || {
     echo "✗ --hot-config 需要 git 工作树:$root" >&2
@@ -124,15 +171,16 @@ assert_hot_config_changeset() {
   fi
 
   denied=""; allowed=""; unknown=""
+  local -A seen_class=()
   while IFS= read -r f; do
     [[ -z "$f" ]] && continue
-    if hot_config_is_denied "$f"; then
-      denied+="$f"$'\n'
-    elif hot_config_is_allowed "$f"; then
+    if hot_config_is_allowed "$f"; then
       allowed+="$f"$'\n'
-    else
-      unknown+="$f"$'\n'
+      continue
     fi
+    class="$(hot_config_classify "$f")"
+    seen_class["$class"]=1
+    denied+="$f"$'\t'"$class"$'\n'
   done <<<"$changed"
 
   echo "── hot-config 变更集(base=$(git -C "$root" rev-parse --short "$base"))──"
@@ -140,10 +188,17 @@ assert_hot_config_changeset() {
     echo "  白名单:"
     printf '%s' "$allowed" | sed 's/^/    + /'
   fi
-  if [[ -n "$denied$unknown" ]]; then
+  if [[ -n "$denied" ]]; then
     echo "  拒绝:"
-    printf '%s' "$denied$unknown" | sed 's/^/    ✗ /'
-    echo "✗ --hot-config 拒绝:变更集含源码/schema/迁移/未知路径。请改用完整 deploy(--with-dist 如含前端)。" >&2
+    while IFS=$'\t' read -r f class; do
+      [[ -z "$f" ]] && continue
+      echo "    ✗ $f  [$class]"
+    done <<<"$denied"
+    echo "✗ --hot-config 拒绝:变更集不是已证明的运行时热配置面。放行会造成绿灯空发布。" >&2
+    for class in frontend source changelog catalog-bundle env-template docs unknown; do
+      [[ -n "${seen_class[$class]:-}" ]] || continue
+      echo "  · $class: $(hot_config_reason_for_class "$class")" >&2
+    done
     echo "  不允许用开关静默绕过。若紧急放行:同时给 --hot-config-force 且导出 OC_V5_HOT_CONFIG_FORCE_REASON(≥8 字符)。" >&2
     if [[ "${HOT_CONFIG_FORCE:-0}" == 1 ]]; then
       local reason="${OC_V5_HOT_CONFIG_FORCE_REASON:-}"
@@ -152,9 +207,9 @@ assert_hot_config_changeset() {
         return 2
       fi
       local csv
-      csv="$(printf '%s' "$denied$unknown" | awk 'NF' | paste -sd, -)"
+      csv="$(printf '%s' "$denied" | awk -F'\t' 'NF{print $1}' | paste -sd, -)"
       hot_config_audit_force "$reason" "$root" "$csv"
-      echo "⚠ hot-config force 已放行并记账。发布内容仍不重建 dist;前端/协议变更不会生效。"
+      echo "⚠ hot-config force 已放行并记账。发布内容仍不重建 dist;前端/bundle/live-env 变更不会生效。"
       return 0
     fi
     return 2

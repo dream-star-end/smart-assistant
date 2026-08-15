@@ -180,3 +180,32 @@ test('wait is unchanged and acquire without --daemon starts no process', () => {
     rmSync(git, { recursive: true, force: true })
   }
 })
+
+test('wait fails loud on a stale foreign active instead of spinning', () => {
+  const git = initGit()
+  const dir = mkdtempSync(path.join(tmpdir(), 'v5-rq-ghost-'))
+  try {
+    const commit = spawnSync('git', ['-C', git, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim()
+    const extra = { OC_V5_RELEASE_QUEUE_REPO_ROOT: git, OC_V5_HEARTBEAT_STALE_SECONDS: '8' }
+    const blocker = rq(dir, ['submit', '--task', 'ghost', '--branch', 'feat/ghost', '--sha', commit, '--actor', 'dead'], extra).stdout.trim()
+    const waiter = rq(dir, ['submit', '--task', 'next', '--branch', 'feat/next', '--sha', commit, '--actor', 'wt-b2'], extra).stdout.trim()
+    const acq = rq(dir, ['acquire', '--id', blocker, '--owner', 'dead'], extra)
+    assert.equal(acq.status, 0, acq.stderr)
+    const db = path.join(dir, 'queue.db')
+    const backdate = spawnSync(
+      'sqlite3',
+      [db, "UPDATE release_queue_jobs SET updated_at='2020-01-01T00:00:00Z' WHERE id='" + blocker + "';"],
+      { encoding: 'utf8' },
+    )
+    assert.equal(backdate.status, 0, backdate.stderr)
+    const started = Date.now()
+    const wait = rq(dir, ['wait', '--id', waiter, '--owner', 'wt-b2', '--timeout', '6'], extra)
+    const elapsed = Date.now() - started
+    assert.equal(wait.status, 75, wait.stdout + wait.stderr)
+    assert.match(wait.stderr, /陈旧|幽灵|abandon-active/)
+    assert.ok(elapsed < 4000, `wait spun too long: ${elapsed}ms`)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+    rmSync(git, { recursive: true, force: true })
+  }
+})

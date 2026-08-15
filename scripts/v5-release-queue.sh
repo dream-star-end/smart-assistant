@@ -144,6 +144,34 @@ SQL
   printf '%s\n' "$id"
 }
 
+describe_blocking_active_locked() { # <blocking-id> <wanted-id>
+  local blocking="$1" wanted="$2" owner updated age_line stale=0
+  owner="$(job_field_locked "$blocking" owner)"
+  updated="$(job_field_locked "$blocking" updated_at)"
+  stale="$(sqlite3 -noheader "$QUEUE_DB" \
+    "SELECT CASE WHEN updated_at < strftime('%Y-%m-%dT%H:%M:%SZ','now','-${HEARTBEAT_STALE_SECONDS} seconds')
+                THEN 1 ELSE 0 END
+       FROM release_queue_jobs WHERE id='$(sql_quote "$blocking")';")"
+  echo "⏳ 当前发布项仍在执行:$blocking owner=${owner:-?} updated_at=${updated:-?} wanted=$wanted" >&2
+  if [[ "$stale" == 1 ]]; then
+    echo "⚠ 该 active 已陈旧(updated_at 超过 ${HEARTBEAT_STALE_SECONDS}s)。守护进程停了也不会自动 abandon；队列会一直堵到有人收口。" >&2
+    echo "  发现: scripts/v5-release-queue.sh status" >&2
+    echo "  处理: 联系 owner=${owner:-?} 跑 finish；或在生产 phase=stable / candidate 空 / marker 不在 后:" >&2
+    echo "        scripts/v5-release-queue.sh abandon-active --id $blocking --result not-deployed --reason stale-ghost --operator \$USER" >&2
+  fi
+}
+
+stale_foreign_active_locked() { # <wanted-id> → 0 if a different active job is stale
+  local wanted="$1" row
+  row="$(sqlite3 -noheader "$QUEUE_DB" \
+    "SELECT id FROM release_queue_jobs
+      WHERE status='active'
+        AND id != '$(sql_quote "$wanted")'
+        AND updated_at < strftime('%Y-%m-%dT%H:%M:%SZ','now','-${HEARTBEAT_STALE_SECONDS} seconds')
+      LIMIT 1;")"
+  [[ -n "$row" ]]
+}
+
 acquire_locked() {
   local id="$1" actor="$2" status active oldest created
   status="$(job_field_locked "$id" status)"
@@ -158,7 +186,7 @@ acquire_locked() {
   active="$(sqlite3 -noheader "$QUEUE_DB" \
     "SELECT id FROM release_queue_jobs WHERE status='active' LIMIT 1;")"
   [[ -z "$active" ]] || {
-    echo "⏳ 当前发布项仍在执行:$active" >&2
+    describe_blocking_active_locked "$active" "$id"
     return 75
   }
   oldest="$(sqlite3 -noheader "$QUEUE_DB" \
@@ -635,6 +663,11 @@ case "$command_name" in
         rc=$?
       fi
       [[ "$rc" == 75 ]] || exit "$rc"
+      # 别人的 active 已经陈旧:再 sleep 也等不来 finish。禁止把 wait 变成第二种 while true。
+      if with_queue_lock stale_foreign_active_locked "$id"; then
+        echo "✗ wait 拒绝空转:挡住 $id 的是陈旧幽灵 active,不会自动消失。见上方 abandon-active 提示。" >&2
+        exit 75
+      fi
       (( timeout == 0 || SECONDS - started < timeout )) || exit 75
       sleep 2
     done

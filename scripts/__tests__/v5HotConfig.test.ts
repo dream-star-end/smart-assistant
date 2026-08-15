@@ -36,25 +36,66 @@ function initRepo(): string {
   return dir
 }
 
-test('hot-config accepts env override and catalog json only', () => {
+function commitFiles(dir: string, files: Record<string, string>, message: string) {
+  for (const [rel, body] of Object.entries(files)) {
+    mkdirSync(path.join(dir, path.dirname(rel)), { recursive: true })
+    writeFileSync(path.join(dir, rel), body)
+  }
+  const add = spawnSync('git', ['add', '.'], { cwd: dir, encoding: 'utf8' })
+  assert.equal(add.status, 0, add.stderr)
+  const commit = spawnSync('git', ['commit', '-m', message], { cwd: dir, encoding: 'utf8' })
+  assert.equal(commit.status, 0, commit.stderr)
+}
+
+test('hot-config rejects web-react public assets as a silent empty frontend publish', () => {
   const dir = initRepo()
   try {
-    writeFileSync(path.join(dir, 'deploy/v5/commercial-v5.env.overrides'), 'OC_X=2\n')
-    mkdirSync(path.join(dir, 'packages/commercial/agent-sandbox/platform-runtime/etc-codex'), {
-      recursive: true,
-    })
-    writeFileSync(
-      path.join(dir, 'packages/commercial/agent-sandbox/platform-runtime/etc-codex/model-catalog.local.json'),
-      '{}\n',
+    commitFiles(
+      dir,
+      { 'packages/web-react/public/logo.svg': '<svg/>\n' },
+      'logo',
     )
-    const add = spawnSync('git', ['add', '.'], { cwd: dir, encoding: 'utf8' })
-    assert.equal(add.status, 0, add.stderr)
-    const commit = spawnSync('git', ['commit', '-m', 'cfg'], { cwd: dir, encoding: 'utf8' })
-    assert.equal(commit.status, 0, commit.stderr)
-
     const result = sh([lib, '--check'], { OC_V5_HOT_CONFIG_REPO_ROOT: dir })
-    assert.equal(result.status, 0, result.stderr + result.stdout)
-    assert.match(result.stdout, /变更集全部落在 hot-config 白名单/)
+    assert.equal(result.status, 2, result.stdout + result.stderr)
+    assert.match(result.stderr, /前端生效面/)
+    assert.match(result.stderr, /--with-dist/)
+    assert.match(result.stderr, /--dist/)
+    assert.match(result.stdout, /logo\.svg/)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('hot-config rejects changelog.json because V5 never publishes it to HOME', () => {
+  const dir = initRepo()
+  try {
+    commitFiles(dir, { 'changelog.json': '{"currentVersion":"v0.0.1","releases":[]}\n' }, 'log')
+    const result = sh([lib, '--check'], { OC_V5_HOT_CONFIG_REPO_ROOT: dir })
+    assert.equal(result.status, 2, result.stdout + result.stderr)
+    assert.match(result.stderr, /OPENCLAUDE_HOME/)
+    assert.match(result.stderr, /静默空发布/)
+    assert.doesNotMatch(result.stderr, /全部落在 hot-config 白名单/)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('hot-config rejects env overrides and catalog json as non-runtime deploy surfaces', () => {
+  const dir = initRepo()
+  try {
+    commitFiles(
+      dir,
+      {
+        'deploy/v5/commercial-v5.env.overrides': 'OC_X=2\n',
+        'packages/commercial/agent-sandbox/platform-runtime/etc-codex/model-catalog.local.json':
+          '{}\n',
+      },
+      'cfg',
+    )
+    const result = sh([lib, '--check'], { OC_V5_HOT_CONFIG_REPO_ROOT: dir })
+    assert.equal(result.status, 2, result.stdout + result.stderr)
+    assert.match(result.stderr, /bootstrap|live env|EnvironmentFile/)
+    assert.match(result.stderr, /platform bundle|admin catalog/)
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
