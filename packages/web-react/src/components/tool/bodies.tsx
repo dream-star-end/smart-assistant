@@ -29,6 +29,7 @@ import {
 } from "./format";
 import { parseMcpName } from "./meta";
 import { researchToolCard, safeArtifactSrc, WebSearchResultsCard } from "./researchCards";
+import { renderReleaseJobCard } from "./releaseCards";
 
 type Input = Record<string, unknown> | null;
 type BodyProps = { input: Input; tool: ToolLike };
@@ -168,6 +169,8 @@ function BashBody({ input, tool }: BodyProps) {
   // 而非原始"$ 命令 + JSON"终端块。不认/出错 → 回落下方通用渲染。
   const ocCard = researchToolCard(command, tool);
   if (ocCard) return ocCard;
+  const releaseCard = renderReleaseJobCard(command, tool);
+  if (releaseCard) return releaseCard;
   const fileWrite = detectShellFileWrites(rawCommand);
   const out = tool.output;
   // bg-bash 的 tool_result.preview 只是占位文案（"Command running in background…"），

@@ -2677,6 +2677,17 @@ export const api = {
       ),
     ),
 
+  /** 后台发布任务状态（GET /api/v5/release-jobs/:id;刷新后进度卡回源）。 */
+  getReleaseJob: (a: AuthSession, id: string) =>
+    jsonOrThrow<Record<string, unknown>>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/v5/release-jobs/${encodeURIComponent(id)}`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ),
+
   /** 启动训练 run（POST /api/skills/:name/train;消耗积分,调用前必须已过成本确认）。
    *  响应可带 feedbackRefs(命中的差评真实使用记录条数;旧后端缺省)。 */
   startSkillTrain: (a: AuthSession, name: string, body?: { focus?: string; autoEval?: boolean }) =>
