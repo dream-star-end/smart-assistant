@@ -531,10 +531,15 @@ function makeStaticKeyUpstream(
       for (const field of spec.stripBodyFields) {
         delete mutableBody[field];
       }
-      // 恒思考模型兜底(kimi-k2.7-code):上游不支持 thinking:{type:'disabled'}(火山 400
-      // "does not support disabling thinking"),删参退回上游默认(照常思考)。覆盖一切调用方
-      // (含 CCB 内部 side-query 显式 disabled 的路径)。语义见 protocol spec 注释。
-      if (spec.stripDisabledThinking) {
+      // 恒思考模型兜底：provider-wide(kimi-k2.7-code)或 model-scoped(glm-5.3)
+      // 不支持 thinking:{type:'disabled'}；删参退回上游默认(照常思考)。model-scoped
+      // 必须按 catalog 已解析的 upstreamModel 判定，不能误改同 provider 的兼容型号。
+      const stripDisabledThinking =
+        spec.stripDisabledThinking === true ||
+        spec.stripDisabledThinkingModels?.some(
+          (model) => model.toLowerCase() === upstreamModel.toLowerCase(),
+        ) === true;
+      if (stripDisabledThinking) {
         const th = mutableBody.thinking;
         if (
           th !== null &&

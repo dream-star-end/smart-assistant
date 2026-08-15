@@ -28,13 +28,18 @@
 import { readFileSync, realpathSync } from 'node:fs'
 import { join } from 'node:path'
 
-export type PlatformPromptKey = 'platform-capabilities' | 'memory-instructions' | 'codex-preamble'
+export type PlatformPromptKey =
+  | 'platform-capabilities'
+  | 'memory-instructions'
+  | 'codex-preamble'
+  | 'cursor-preamble'
 
 /** key → bundle 内文件名。整套 = 这三项;任一缺失即整套不生效(LKG)。 */
 const PROMPT_FILES: Record<PlatformPromptKey, string> = {
   'platform-capabilities': 'platform-capabilities.md',
   'memory-instructions': 'memory-instructions.md',
   'codex-preamble': 'codex-preamble.md',
+  'cursor-preamble': 'cursor-preamble.md',
 }
 const PROMPT_KEYS = Object.keys(PROMPT_FILES) as PlatformPromptKey[]
 
@@ -44,12 +49,13 @@ const PROMPT_KEYS = Object.keys(PROMPT_FILES) as PlatformPromptKey[]
  * `replaceAll` 静默 no-op、注入契约悄悄断裂(如微信识图提示 / memdir 运行时路径注不进去)。
  *   - platform-capabilities:{{WECHAT_VISION_HINT}}(buildAgentsSlot 按模型注入 CLI/原生变体);
  *   - memory-instructions:{{MEMORY_DIR}}/{{MEMORY_MD}}/{{USER_MD}}(renderMemoryInstructions 注入);
- *   - codex-preamble:无(纯静态文案,无运行时注入点)。
+ *   - codex-preamble / cursor-preamble:无(纯静态文案,无运行时注入点)。
  */
 const REQUIRED_PLACEHOLDERS: Record<PlatformPromptKey, readonly string[]> = {
   'platform-capabilities': ['{{WECHAT_VISION_HINT}}'],
   'memory-instructions': ['{{MEMORY_DIR}}', '{{MEMORY_MD}}', '{{USER_MD}}'],
   'codex-preamble': [],
+  'cursor-preamble': [],
 }
 
 const ENV_DIR_KEY = 'OPENCLAUDE_PLATFORM_PROMPTS_DIR'
@@ -85,7 +91,9 @@ function readValidatedSet(dir: string): Snapshot {
     const file = join(rev, PROMPT_FILES[key]) // 从 resolved rev 读,而非含 current 的原 dir
     const buf = readFileSync(file) // 文件缺失 → 抛 → 整套不生效
     if (buf.byteLength > MAX_PROMPT_BYTES) {
-      throw new Error(`${PROMPT_FILES[key]} 超出单文件上限 ${MAX_PROMPT_BYTES}B(实际 ${buf.byteLength}B)`)
+      throw new Error(
+        `${PROMPT_FILES[key]} 超出单文件上限 ${MAX_PROMPT_BYTES}B(实际 ${buf.byteLength}B)`,
+      )
     }
     const text = utf8Decoder.decode(buf) // 非 UTF-8 → 抛
     if (text.trim().length === 0) throw new Error(`${PROMPT_FILES[key]} 为空`)

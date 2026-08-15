@@ -38,7 +38,8 @@ const MAX_HOTKEYS = 32;
 
 /**
  * 偏好 Tab：外观主题（接 useTheme，写穿到 preferences）+ 默认模型 + 思考深度 +
- * 通知开关 + 快捷键，最后嵌 API Key 自管。prefs 状态由 SettingsCenter 集中持有，
+ * 通知开关。快捷键已拆到独立导航（pane="hotkeys"），仍读写同一份 prefs。
+ * 最后嵌 API Key 自管。prefs 状态由 SettingsCenter 集中持有，本组件只负责 patch。
  * 本组件受控（onPatch 返回后由父刷新快照）。
  *
  * 主题权威源仍是 useTheme（live + localStorage）；这里只在用户切换时写穿一份到
@@ -55,6 +56,7 @@ export function PreferencesTab({
   onUpgrade,
   onOpenMemory,
   canManageApiKeys = false,
+  pane = "preferences",
 }: {
   auth: AuthSession;
   prefs: PrefsView;
@@ -66,6 +68,8 @@ export function PreferencesTab({
   onUpgrade: () => void;
   onOpenMemory: () => void;
   canManageApiKeys?: boolean;
+  /** 快捷键从偏好拆到独立导航；hotkeys 仍读同一份 prefs。 */
+  pane?: "preferences" | "hotkeys";
 }) {
   const [models, setModels] = useState<PublicModel[]>([]);
   const [err, setErr] = useState<string | null>(null);
@@ -109,6 +113,21 @@ export function PreferencesTab({
     prefs.default_effort && supportedEfforts.includes(prefs.default_effort)
       ? prefs.default_effort
       : "";
+
+  if (pane === "hotkeys") {
+    return (
+      <div className="flex flex-col">
+        {err && (
+          <div className="px-5 pt-3">
+            <Alert tone="danger" className="text-[12.5px]">
+              {err}
+            </Alert>
+          </div>
+        )}
+        <HotkeysEditor hotkeys={prefs.hotkeys ?? {}} onPatch={patch} />
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col">
@@ -338,9 +357,6 @@ export function PreferencesTab({
           </label>
         ))}
       </div>
-
-      {/* 快捷键 */}
-      <HotkeysEditor hotkeys={prefs.hotkeys ?? {}} onPatch={patch} />
 
       {/* API Key 自管（admin-only rollout 命中 403 时整段隐藏） */}
       {canManageApiKeys && <ApiKeysSection auth={auth} />}

@@ -1362,6 +1362,82 @@
           "assertion": "candidate Cursor authority ticket consume gate"
         }
       ]
+    },
+    {
+      "id": "INC-20260813-CURSOR-STREAM-JSON",
+      "occurredAt": "2026-08-13",
+      "severity": "P1",
+      "symptom": "Cursor 官方 CLI 已返回正确答案，但一等 adapter 把嵌套 assistant.message 对象序列化成文本，并再次追加最终聚合事件，导致前台展示 JSON 且答案重复。",
+      "rootFixCommit": "f63f06c1",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorAdapter.test.ts",
+          "assertion": "parses pinned official stream-json without duplicating the final assistant flush"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorAdapter.test.ts",
+          "assertion": "parses pinned official tool_call started/completed, including completion-only calls"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorAdapter.test.ts",
+          "assertion": "rebuilds platform and MCP context for every stateless turn on one adapter"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorAdapter.test.ts",
+          "assertion": "maps every canonical model to its exact controlled CLI argument"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/cursorCliWrapper.test.ts",
+          "assertion": "copies one validated adapter MCP config, approves it, and unsets the source env"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/sessionContextRebuildNoticeLifecycle.test.ts",
+          "assertion": "switching an untouched Codex prewarm with a native thread id to Cursor creates no rebuild notice"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/sessionManagerEngineTurn.test.ts",
+          "assertion": "fresh Cursor switch consumes an empty first rebuild attempt so routine replay stays silent"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/deploy-v5.sh",
+          "assertion": "candidate Cursor stream-json parser gate"
+        }
+      ],
+      "coverageCommits": [
+        "35defe79",
+        "96b40ae5",
+        "dd86a3e8",
+        "793ad326",
+        "523c09af",
+        "ba962e0c"
+      ]
+    },
+    {
+      "id": "INC-20260814-CURSOR-HOTCFG-WRAPPER",
+      "occurredAt": "2026-08-14",
+      "severity": "P1",
+      "symptom": "Cursor 平台 bundle 已激活，但 adapter 仍调用镜像内旧 /usr/local/bin/oc-cursor，导致 adapter 生成的 openclaude-memory MCP 配置没有被复制加载，技能检索与记忆工具显示 MCP server does not exist。",
+      "rootFixCommit": "e5486e43",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorAdapter.test.ts",
+          "assertion": "prefers the hot-config Cursor wrapper and preserves the image fallback"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/deploy-v5.sh",
+          "assertion": "candidate Cursor stream-json parser gate + hot-config wrapper gate(exact immutable release)"
+        }
+      ]
     }
   ]
 }

@@ -563,7 +563,7 @@ describe('descriptor 驱动执行选择(engine / model)', () => {
 
   test('resolveExecutionModel:有 descriptor → 不过 baked 白名单(新模型不再被降级)', () => {
     // 旧行为:白名单外的模型被收敛成平台默认。
-    assert.equal(resolveExecutionModel('catalog-only-model', undefined), 'glm-5.2')
+    assert.equal(resolveExecutionModel('catalog-only-model', undefined), 'glm-5.3')
     // descriptor 存在 → 直接落地(catalog 是唯一判定者)。
     assert.equal(
       resolveExecutionModel('catalog-only-model', undefined, {

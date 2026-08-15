@@ -150,7 +150,7 @@ export const DEV_FALLBACK_SEED_DOC: PlatformSeedDoc = {
   agents: [
     {
       id: "main",
-      model: "glm-5.2",
+      model: "glm-5.3",
       provider: "ark",
       permissionMode: "bypassPermissions",
       displayName: "全能助手",

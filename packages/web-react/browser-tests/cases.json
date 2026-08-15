@@ -41,6 +41,8 @@
     { "id": "T37", "proves": "真 Chromium 中连续点击新建只保留一个未持久化空白草稿态；已有部分消息时真实内容与明确的会话加载占位同时可见" },
     { "id": "T38", "proves": "社区教程在真 Chromium 中可公开只读查看、登录用户可提交进入待审核，且 390px 视口不横向溢出" },
     { "id": "T39", "proves": "刷新恢复同一会话的多代 live journal 时，旧容器高 frameSeq 不吞掉新容器从 1 重启的实时思考与正文，旧持久过程仍保留" },
-    { "id": "T40", "proves": "390px 真 Chromium 失败轮只显示一个重试出口，不重复发送失败、不泄露供应商路由名、无请求 ID 时不显示详情，且紧凑 warning 卡不横溢" }
+    { "id": "T40", "proves": "390px 真 Chromium 失败轮只显示一个重试出口，不重复发送失败、不泄露供应商路由名、无请求 ID 时不显示详情，且紧凑 warning 卡不横溢" },
+    { "id": "T41", "proves": "PR1 Codex 密度 token：Composer 非聚焦/聚焦边框、ToolCard rounded-md+px-3 py-2、Sidebar 活跃竖条与顶栏入口在 1440/390 明暗主题均成立，且不删除教程/组织/管理后台" },
+    { "id": "T42", "proves": "PR2 设置壳：默认关闭不盖住 harness；390 单列不横溢且能切到账户/用量/偏好/反馈/关于；1440 竖导航 168px；现有教程深链 section 仍是 preferences/account/feedback" }
   ]
 }

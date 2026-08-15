@@ -2,9 +2,12 @@ import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
 import {
   CODEX_ENGINE_MODEL_IDS,
+  CURSOR_ENGINE_MODELS,
+  CURSOR_ENGINE_MODEL_IDS,
   DEFAULT_CODEX_ENGINE_MODEL,
   PLATFORM_REASONING_EFFORTS,
   isCodexEngineModel,
+  isCursorEngineModel,
   modelReasoningPolicy,
 } from '../engineModels.js'
 
@@ -39,5 +42,22 @@ describe('GPT-5.6 engine model authority', () => {
     assert.deepEqual(modelReasoningPolicy('glm-5.2').supported, ['high', 'max'])
     assert.deepEqual(modelReasoningPolicy('MiniMax-M3').supported, [])
     assert.deepEqual(modelReasoningPolicy('deepseek-v4-pro').supported, PLATFORM_REASONING_EFFORTS)
+  })
+})
+
+describe('Cursor engine model authority', () => {
+  test('uses only the pinned CLI allowlist and excludes GPT/Codex entries', () => {
+    assert.deepEqual(CURSOR_ENGINE_MODELS, [
+      { id: 'cursor-auto', displayName: 'Cursor Auto', upstreamModel: null },
+      { id: 'cursor-grok-4.6-high', displayName: 'Cursor Grok 4.6 High', upstreamModel: 'cursor-grok-4.6-high' },
+      { id: 'cursor-composer-2.5-fast', displayName: 'Cursor Composer 2.5 Fast', upstreamModel: 'composer-2.5-fast' },
+      { id: 'cursor-opus-5-high', displayName: 'Cursor Opus 5 High', upstreamModel: 'claude-opus-5-thinking-high' },
+      { id: 'cursor-fable-5-high', displayName: 'Cursor Fable 5 High (Non-ZDR)', upstreamModel: 'claude-fable-5-thinking-high' },
+      { id: 'cursor-grok-4.5-high', displayName: 'Cursor Grok 4.5 High', upstreamModel: 'cursor-grok-4.5-high' },
+    ])
+    for (const id of CURSOR_ENGINE_MODEL_IDS) assert.equal(isCursorEngineModel(id), true)
+    assert.equal(isCursorEngineModel('gpt-5.6-sol-medium'), false)
+    assert.equal(isCursorEngineModel('gpt-5.3-codex'), false)
+    assert.equal(isCursorEngineModel('cursor-auto --force'), false)
   })
 })

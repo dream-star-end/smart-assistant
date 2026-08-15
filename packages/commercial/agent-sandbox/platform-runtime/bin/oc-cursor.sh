@@ -84,6 +84,12 @@ while [ "$#" -gt 0 ]; do
 done
 [ "$#" -gt 0 ] || die "a prompt is required"
 
+case "$model" in
+  ""|cursor-grok-4.6-high|composer-2.5-fast|claude-opus-5-thinking-high|\
+  claude-fable-5-thinking-high|cursor-grok-4.5-high) ;;
+  *) die "model is not allowlisted" ;;
+esac
+
 workspace=$(pwd -P)
 [ -d "$workspace" ] || die "current workspace is unavailable"
 
@@ -138,6 +144,32 @@ trap 'forward_signal HUP 129' HUP
 trap 'forward_signal INT 130' INT
 trap 'forward_signal TERM 143' TERM
 
+# The gateway may provide one adapter-owned Cursor MCP config. Copy it into
+# this invocation's ephemeral HOME only after strict source validation. The
+# source remains gateway-owned and is never removed by this wrapper.
+mcp_config=${OPENCLAUDE_CURSOR_MCP_CONFIG:-}
+mcp_approval=0
+if [ -n "$mcp_config" ]; then
+  case "$mcp_config" in /*) ;; *) die "MCP config path must be absolute" ;; esac
+  [ ! -L "$mcp_config" ] || die "MCP config must not be a symlink"
+  [ -f "$mcp_config" ] || die "MCP config must be a regular file"
+  config_uid=$(/usr/bin/stat -c %u -- "$mcp_config" 2>/dev/null) \
+    || die "MCP config metadata is unavailable"
+  current_uid=$(/usr/bin/id -u) || die "current uid is unavailable"
+  [ "$config_uid" = "$current_uid" ] || die "MCP config owner is invalid"
+  config_mode=$(/usr/bin/stat -c %a -- "$mcp_config" 2>/dev/null) \
+    || die "MCP config metadata is unavailable"
+  [ "$config_mode" = "600" ] || die "MCP config mode must be 0600"
+  /bin/mkdir -m 700 -- "$cursor_home/.cursor" \
+    || die "cannot create ephemeral Cursor config directory"
+  /bin/cp -- "$mcp_config" "$cursor_home/.cursor/mcp.json" \
+    || die "cannot copy Cursor MCP config"
+  /bin/chmod 600 -- "$cursor_home/.cursor/mcp.json" \
+    || die "cannot secure Cursor MCP config"
+  mcp_approval=1
+fi
+unset OPENCLAUDE_CURSOR_MCP_CONFIG
+
 prompt=$1
 shift
 for word in "$@"; do
@@ -145,6 +177,7 @@ for word in "$@"; do
 done
 set -- -p --trust --workspace "$workspace" \
   --output-format stream-json --stream-partial-output -- "$prompt"
+[ "$mcp_approval" -eq 0 ] || set -- --approve-mcps "$@"
 [ -z "$model" ] || set -- --model "$model" "$@"
 [ -z "$mode" ] || set -- --mode "$mode" "$@"
 [ "$force" -eq 0 ] || set -- --force "$@"

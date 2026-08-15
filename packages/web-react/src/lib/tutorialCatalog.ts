@@ -175,7 +175,7 @@ export const TUTORIAL_TOPICS = {
   },
   "models-reasoning": {
     featureId: "models-reasoning",
-    contentVersion: 2,
+    contentVersion: 4,
     intro:
       "顶栏模型选择器决定本会话下一条任务由哪个模型执行；设置里的默认模型和思考深度决定新会话的起点。不同模型在速度、复杂推理、编程与成本上各有侧重，平台会如实显示当前可用范围和计费。",
     outcome: "按任务难度选择合适模型，在响应速度、质量与积分消耗之间取得平衡。",
@@ -407,7 +407,7 @@ export const TUTORIAL_TOPICS = {
   },
   "image-create-edit": {
     featureId: "image-create-edit",
-    contentVersion: 2,
+    contentVersion: 4,
     intro:
       "在支持 Image 2 的 GPT 模型下，可以用自然语言生成图片，也可以打开已有图片进行评论、圈选和局部修改。图片编辑会保留你的原图语境，圈选区域越准确，修改越可控。",
     outcome: "完成从概念图到局部修订、导出成品的一条闭环。",

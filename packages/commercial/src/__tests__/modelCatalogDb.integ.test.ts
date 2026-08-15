@@ -131,8 +131,12 @@ function expectedContextWindow(modelId: string): number | null {
   if (isCodexEngineModel(modelId)) return null;
   const m = modelId.trim().toLowerCase();
   if (m === "minimax-m3") return 512_000;
-  if (m === "deepseek-v4-flash" || m === "deepseek-v4-pro") return 1_000_000;
-  if (m === "glm-5.2") return 1_000_000;
+  if (
+    m === "deepseek-v4-flash" ||
+    m === "deepseek-v4-pro" ||
+    m === "deepseek-v4-flash-opencode-go"
+  ) return 1_000_000;
+  if (m === "glm-5.2" || m === "glm-5.3") return 1_000_000;
   if (m === "glm-5.1") return 200_000;
   if (m === "qwen3.7-max" || m === "qwen3.7-plus") return 1_000_000;
   if (m === "kimi-k2.7-code") return 256_000;
@@ -186,7 +190,13 @@ describe("0143 回填 + 后续 catalog engine 迁移", () => {
       // Ark K3 uses the platform alias kimi-k3-ark for pricing and rewrites only upstream.
       assert.equal(
         r.upstream_model_id,
-        id === "kimi-k3-ark" ? "kimi-k3" : (catalogSwitchedQwen ? "qwen3.8-max" : null),
+        id === "kimi-k3-ark"
+          ? "kimi-k3"
+          : id === "deepseek-v4-flash-opencode-go"
+            ? "deepseek-v4-flash"
+            : id === "glm-5.3"
+              ? "glm-5.3"
+              : (catalogSwitchedQwen ? "qwen3.8-max" : null),
         `${id}: upstream_model_id`,
       );
 
@@ -263,42 +273,42 @@ async function epoch(): Promise<bigint> {
 describe("0143 状态机 trigger", () => {
   test("合法转移:active→disabled→active→disabled→retired", async (t) => {
     if (skipIfNoPg(t)) return;
-    await query("UPDATE model_catalog SET state='disabled' WHERE model_id='glm-5.1'");
-    assert.deepEqual(await stateOf("glm-5.1"), ["disabled"]);
-    await query("UPDATE model_catalog SET state='active' WHERE model_id='glm-5.1'");
-    assert.deepEqual(await stateOf("glm-5.1"), ["active"]);
-    await query("UPDATE model_catalog SET state='disabled' WHERE model_id='glm-5.1'");
-    await query("UPDATE model_catalog SET state='retired' WHERE model_id='glm-5.1'");
-    assert.deepEqual(await stateOf("glm-5.1"), ["retired"]);
+    await query("UPDATE model_catalog SET state='disabled' WHERE model_id='kimi-k3'");
+    assert.deepEqual(await stateOf("kimi-k3"), ["disabled"]);
+    await query("UPDATE model_catalog SET state='active' WHERE model_id='kimi-k3'");
+    assert.deepEqual(await stateOf("kimi-k3"), ["active"]);
+    await query("UPDATE model_catalog SET state='disabled' WHERE model_id='kimi-k3'");
+    await query("UPDATE model_catalog SET state='retired' WHERE model_id='kimi-k3'");
+    assert.deepEqual(await stateOf("kimi-k3"), ["retired"]);
   });
 
   test("非法转移全拒:active→retired / active→staged / disabled→staged / staged 直接跳过校验", async (t) => {
     if (skipIfNoPg(t)) return;
     await assert.rejects(
-      () => query("UPDATE model_catalog SET state='retired' WHERE model_id='glm-5.1'"),
+      () => query("UPDATE model_catalog SET state='retired' WHERE model_id='kimi-k3'"),
       /illegal state transition active→retired/,
     );
     await assert.rejects(
-      () => query("UPDATE model_catalog SET state='staged' WHERE model_id='glm-5.1'"),
+      () => query("UPDATE model_catalog SET state='staged' WHERE model_id='kimi-k3'"),
       /illegal state transition active→staged/,
     );
-    await query("UPDATE model_catalog SET state='disabled' WHERE model_id='glm-5.1'");
+    await query("UPDATE model_catalog SET state='disabled' WHERE model_id='kimi-k3'");
     await assert.rejects(
-      () => query("UPDATE model_catalog SET state='staged' WHERE model_id='glm-5.1'"),
+      () => query("UPDATE model_catalog SET state='staged' WHERE model_id='kimi-k3'"),
       /illegal state transition disabled→staged/,
     );
   });
 
   test("retired 单向终态:任何后续修改都拒(含审计列)", async (t) => {
     if (skipIfNoPg(t)) return;
-    await query("UPDATE model_catalog SET state='disabled' WHERE model_id='glm-5.1'");
-    await query("UPDATE model_catalog SET state='retired' WHERE model_id='glm-5.1'");
+    await query("UPDATE model_catalog SET state='disabled' WHERE model_id='kimi-k3'");
+    await query("UPDATE model_catalog SET state='retired' WHERE model_id='kimi-k3'");
     await assert.rejects(
-      () => query("UPDATE model_catalog SET state='active' WHERE model_id='glm-5.1'"),
+      () => query("UPDATE model_catalog SET state='active' WHERE model_id='kimi-k3'"),
       /retired entry .* is immutable/,
     );
     await assert.rejects(
-      () => query("UPDATE model_catalog SET updated_by=1 WHERE model_id='glm-5.1'"),
+      () => query("UPDATE model_catalog SET updated_by=1 WHERE model_id='kimi-k3'"),
       /retired entry .* is immutable/,
     );
   });
@@ -325,15 +335,15 @@ describe("0143 状态机 trigger", () => {
     const mutations: Array<[string, RegExp]> = [
       ["engine='codex', provider_id='codex'", /execution fields of a active entry are immutable/],
       ["provider_id='deepseek'", /immutable/],
-      ["upstream_model_id='glm-5.2-0712'", /immutable/],
+      ["upstream_model_id='kimi-k3-ark-0712'", /immutable/],
       ["context_window=123456", /immutable/],
       [`capability_profile='{"supports_vision": true, "reasoning": {"supported": [], "codex_model_default": null}}'::jsonb`, /immutable/],
       ["capability_schema_version=2", /immutable/],
-      ["model_id='glm-5.2-renamed'", /immutable/],
+      ["model_id='kimi-k3-ark-renamed'", /immutable/],
     ];
     for (const [set, re] of mutations) {
       await assert.rejects(
-        () => query(`UPDATE model_catalog SET ${set} WHERE model_id='glm-5.1'`),
+        () => query(`UPDATE model_catalog SET ${set} WHERE model_id='kimi-k3'`),
         re,
         `mutation should be rejected: ${set}`,
       );
@@ -341,9 +351,9 @@ describe("0143 状态机 trigger", () => {
     // 0144:**disabled 行也冻结**。0143 允许原地改写 disabled 行再 disabled→active,
     // 同一 entry_id 的执行语义被静默篡改(历史不再是历史,usage_records 的
     // execution_revision 归因失效)。改执行语义必须产生新版本(fn_model_switch_version)。
-    await query("UPDATE model_catalog SET state='disabled' WHERE model_id='glm-5.1'");
+    await query("UPDATE model_catalog SET state='disabled' WHERE model_id='kimi-k3'");
     await assert.rejects(
-      () => query("UPDATE model_catalog SET context_window=123456 WHERE model_id='glm-5.1'"),
+      () => query("UPDATE model_catalog SET context_window=123456 WHERE model_id='kimi-k3'"),
       /execution fields of a disabled entry are immutable/,
     );
     // staged 行是唯一的编辑面
@@ -364,7 +374,7 @@ describe("0143 状态机 trigger", () => {
       () =>
         query(
           `INSERT INTO model_catalog(model_id, engine, provider_id, capability_profile, state)
-           VALUES ('glm-5.2','ccb','ark','{}'::jsonb,'staged')`,
+           VALUES ('kimi-k3-ark','ccb','ark','{}'::jsonb,'staged')`,
         ),
       /uq_model_catalog_live/,
     );
@@ -399,12 +409,12 @@ describe("0143 alias trigger", () => {
 
   test("alias 可指向 active/staged;不可指向 disabled/retired", async (t) => {
     if (skipIfNoPg(t)) return;
-    const glm = await activeEntryId("glm-5.1");
+    const glm = await activeEntryId("kimi-k3");
     await query("INSERT INTO model_aliases(alias, entry_id) VALUES ('glm-latest', $1)", [glm]);
 
-    await query("UPDATE model_catalog SET state='disabled' WHERE model_id='glm-5.1'");
+    await query("UPDATE model_catalog SET state='disabled' WHERE model_id='kimi-k3'");
     const disabled = await query<{ entry_id: string }>(
-      "SELECT entry_id::text AS entry_id FROM model_catalog WHERE model_id='glm-5.1'",
+      "SELECT entry_id::text AS entry_id FROM model_catalog WHERE model_id='kimi-k3'",
     );
     await assert.rejects(
       () =>
@@ -417,16 +427,16 @@ describe("0143 alias trigger", () => {
 
   test("alias 不得与 live canonical model_id 撞名", async (t) => {
     if (skipIfNoPg(t)) return;
-    const glm = await activeEntryId("glm-5.2");
+    const glm = await activeEntryId("kimi-k3-ark");
     await assert.rejects(
-      () => query("INSERT INTO model_aliases(alias, entry_id) VALUES ('glm-5.1', $1)", [glm]),
+      () => query("INSERT INTO model_aliases(alias, entry_id) VALUES ('kimi-k3', $1)", [glm]),
       /collides with a live canonical model_id/,
     );
   });
 
   test("被 alias 引用的行禁止 retire;但允许 disable(disable 不需要先删 alias)", async (t) => {
     if (skipIfNoPg(t)) return;
-    const glm = await activeEntryId("glm-5.1");
+    const glm = await activeEntryId("kimi-k3");
     await query("INSERT INTO model_aliases(alias, entry_id) VALUES ('glm-latest', $1)", [glm]);
 
     await query("UPDATE model_catalog SET state='disabled' WHERE entry_id=$1", [glm]); // 允许
@@ -438,7 +448,7 @@ describe("0143 alias trigger", () => {
 
   test("alias 变更 bump epoch", async (t) => {
     if (skipIfNoPg(t)) return;
-    const glm = await activeEntryId("glm-5.2");
+    const glm = await activeEntryId("kimi-k3-ark");
     const before = await epoch();
     await query("INSERT INTO model_aliases(alias, entry_id) VALUES ('glm-latest', $1)", [glm]);
     const afterInsert = await epoch();
@@ -456,17 +466,17 @@ describe("0143 security epoch", () => {
   test("state 离开 active → bump", async (t) => {
     if (skipIfNoPg(t)) return;
     const before = await epoch();
-    await query("UPDATE model_catalog SET state='disabled' WHERE model_id='glm-5.1'");
+    await query("UPDATE model_catalog SET state='disabled' WHERE model_id='kimi-k3'");
     assert.equal(await epoch(), before + 1n);
   });
 
   test("价格 / multiplier / visibility / default_effort 变更 → bump", async (t) => {
     if (skipIfNoPg(t)) return;
     for (const sql of [
-      "UPDATE model_pricing SET input_per_mtok = input_per_mtok + 1 WHERE model_id='glm-5.2'",
-      "UPDATE model_pricing SET multiplier = 3.000 WHERE model_id='glm-5.2'",
-      "UPDATE model_pricing SET visibility = 'hidden' WHERE model_id='glm-5.2'",
-      "UPDATE model_pricing SET default_effort = 'max' WHERE model_id='glm-5.2'",
+      "UPDATE model_pricing SET input_per_mtok = input_per_mtok + 1 WHERE model_id='kimi-k3-ark'",
+      "UPDATE model_pricing SET multiplier = 3.000 WHERE model_id='kimi-k3-ark'",
+      "UPDATE model_pricing SET visibility = 'hidden' WHERE model_id='kimi-k3-ark'",
+      "UPDATE model_pricing SET default_effort = 'max' WHERE model_id='kimi-k3-ark'",
     ]) {
       const before = await epoch();
       await query(sql);
@@ -478,7 +488,7 @@ describe("0143 security epoch", () => {
     if (skipIfNoPg(t)) return;
     const before = await epoch();
     await query(
-      "UPDATE model_pricing SET display_name='X', sort_order=7, extra_system_prompt='hi' WHERE model_id='glm-5.2'",
+      "UPDATE model_pricing SET display_name='X', sort_order=7, extra_system_prompt='hi' WHERE model_id='kimi-k3-ark'",
     );
     assert.equal(await epoch(), before, "display-only change must not bump epoch");
   });
@@ -487,8 +497,8 @@ describe("0143 security epoch", () => {
     if (skipIfNoPg(t)) return;
     const before = await epoch();
     await tx(async (c) => {
-      await c.query("UPDATE model_pricing SET multiplier=3.000 WHERE model_id IN ('glm-5.2','glm-5.1','MiniMax-M3')");
-      await c.query("UPDATE model_catalog SET state='disabled' WHERE model_id='glm-5.1'");
+      await c.query("UPDATE model_pricing SET multiplier=3.000 WHERE model_id IN ('kimi-k3-ark','kimi-k3')");
+      await c.query("UPDATE model_catalog SET state='disabled' WHERE model_id='kimi-k3'");
     });
     assert.equal(await epoch(), before + 1n);
   });
@@ -502,7 +512,7 @@ describe("0143 security epoch", () => {
       () => query("UPDATE model_security_epoch SET epoch = 0 WHERE id"),
       /advance by exactly 1/,
     );
-    await query("UPDATE model_pricing SET multiplier=9.000 WHERE model_id='glm-5.2'"); // 抬到 2
+    await query("UPDATE model_pricing SET multiplier=9.000 WHERE model_id='kimi-k3-ark'"); // 抬到 2
     await assert.rejects(
       () => query("UPDATE model_security_epoch SET epoch = 1 WHERE id"),
       /advance by exactly 1/,
@@ -517,17 +527,19 @@ describe("0143 security epoch", () => {
 describe("0143 fn_model_switch_version", () => {
   test("engine 变更:旧行 retired + 新行 active + alias 重指 + 可用性不变 + epoch bump 一次", async (t) => {
     if (skipIfNoPg(t)) return;
-    const old = await query<{ entry_id: string }>(
-      "SELECT entry_id::text AS entry_id FROM model_catalog WHERE model_id='glm-5.2' AND state='active'",
+    const old = await query<{ entry_id: string; lock_version: number }>(
+      "SELECT entry_id::text AS entry_id, lock_version FROM model_catalog WHERE model_id='kimi-k3-ark' AND state='active'",
     );
     const oldId = Number(old.rows[0].entry_id);
+    const oldLockVersion = old.rows[0].lock_version;
     await query("INSERT INTO model_aliases(alias, entry_id) VALUES ('glm-latest', $1)", [oldId]);
     const before = await epoch();
 
     const r = await query<{ new_entry: string }>(
-      `SELECT fn_model_switch_version('glm-5.2','codex','codex',NULL,NULL,
+      `SELECT fn_model_switch_version('kimi-k3-ark','codex','codex',NULL,NULL,
          '{"supports_vision": false, "reasoning": {"supported": ["low","medium","high","xhigh","max"], "codex_model_default": "high"}}'::jsonb,
-         1, NULL, 0)::text AS new_entry`,
+         1, NULL, $1)::text AS new_entry`,
+      [oldLockVersion],
     );
     const newId = Number(r.rows[0].new_entry);
     assert.notEqual(newId, oldId);
@@ -536,7 +548,7 @@ describe("0143 fn_model_switch_version", () => {
     // **文本**排序('15' < '6'),排出错误顺序(PG 的 output-column-name 优先规则)。
     const rows = await query<{ eid: string; state: string; engine: string }>(
       `SELECT entry_id::text AS eid, state, engine
-         FROM model_catalog WHERE model_id='glm-5.2' ORDER BY model_catalog.entry_id`,
+         FROM model_catalog WHERE model_id='kimi-k3-ark' ORDER BY model_catalog.entry_id`,
     );
     assert.deepEqual(
       rows.rows.map((x) => [Number(x.eid), x.state, x.engine]),
@@ -552,7 +564,7 @@ describe("0143 fn_model_switch_version", () => {
     assert.equal(Number(alias.rows[0].entry_id), newId, "alias must be repointed to the new entry");
 
     const mirror = await query<{ enabled: boolean }>(
-      "SELECT enabled FROM model_pricing WHERE model_id='glm-5.2'",
+      "SELECT enabled FROM model_pricing WHERE model_id='kimi-k3-ark'",
     );
     assert.equal(mirror.rows[0].enabled, true, "switching an active model keeps it available");
     assert.equal(await epoch(), before + 1n, "one tx = one bump");
@@ -598,18 +610,22 @@ describe("0143 fn_model_switch_version", () => {
 
   test("中间态不外泄:整个切换在调用方事务内(回滚 → 目录零变化)", async (t) => {
     if (skipIfNoPg(t)) return;
-    const before = await stateOf("glm-5.2");
+    const before = await stateOf("kimi-k3-ark");
+    const current = await query<{ lock_version: number }>(
+      "SELECT lock_version FROM model_catalog WHERE model_id='kimi-k3-ark' AND state='active'",
+    );
     await assert.rejects(
       () =>
         tx(async (c) => {
           await c.query(
-            `SELECT fn_model_switch_version('glm-5.2','codex','codex',NULL,NULL,'{"supports_vision": false, "reasoning": {"supported": [], "codex_model_default": null}}'::jsonb, 1, NULL, 0)`,
+            `SELECT fn_model_switch_version('kimi-k3-ark','codex','codex',NULL,NULL,'{"supports_vision": false, "reasoning": {"supported": [], "codex_model_default": null}}'::jsonb, 1, NULL, $1)`,
+            [current.rows[0].lock_version],
           );
           throw new Error("boom");
         }),
       /boom/,
     );
-    assert.deepEqual(await stateOf("glm-5.2"), before, "rolled back switch must leave no trace");
+    assert.deepEqual(await stateOf("kimi-k3-ark"), before, "rolled back switch must leave no trace");
   });
 });
 
@@ -632,21 +648,21 @@ describe("0143 兼容地板(旧 master 回滚后的读写路径)", () => {
 
   test("legacy `UPDATE model_pricing SET enabled=...` → 路由到 catalog 状态机", async (t) => {
     if (skipIfNoPg(t)) return;
-    await query("UPDATE model_pricing SET enabled=false WHERE model_id='qwen3.7-max'");
-    assert.equal(await catalogState("qwen3.7-max"), "disabled");
-    assert.equal(await enabledOf("qwen3.7-max"), false);
+    await query("UPDATE model_pricing SET enabled=false WHERE model_id='deepseek-v4-flash-opencode-go'");
+    assert.equal(await catalogState("deepseek-v4-flash-opencode-go"), "disabled");
+    assert.equal(await enabledOf("deepseek-v4-flash-opencode-go"), false);
 
-    await query("UPDATE model_pricing SET enabled=true WHERE model_id='qwen3.7-max'");
-    assert.equal(await catalogState("qwen3.7-max"), "active");
-    assert.equal(await enabledOf("qwen3.7-max"), true);
+    await query("UPDATE model_pricing SET enabled=true WHERE model_id='deepseek-v4-flash-opencode-go'");
+    assert.equal(await catalogState("deepseek-v4-flash-opencode-go"), "active");
+    assert.equal(await enabledOf("deepseek-v4-flash-opencode-go"), true);
   });
 
   test("catalog 状态机写 → enabled 镜像同步(反向)", async (t) => {
     if (skipIfNoPg(t)) return;
-    await query("UPDATE model_catalog SET state='disabled' WHERE model_id='glm-5.1'");
-    assert.equal(await enabledOf("glm-5.1"), false);
-    await query("UPDATE model_catalog SET state='active' WHERE model_id='glm-5.1'");
-    assert.equal(await enabledOf("glm-5.1"), true);
+    await query("UPDATE model_catalog SET state='disabled' WHERE model_id='kimi-k3'");
+    assert.equal(await enabledOf("kimi-k3"), false);
+    await query("UPDATE model_catalog SET state='active' WHERE model_id='kimi-k3'");
+    assert.equal(await enabledOf("kimi-k3"), true);
   });
 
   test("INSERT ... ON CONFLICT DO UPDATE(adminPricing.integ / 历史 seed 迁移的写法)照跑", async (t) => {
@@ -684,12 +700,12 @@ describe("0143 兼容地板(旧 master 回滚后的读写路径)", () => {
     if (skipIfNoPg(t)) return;
     const out = await tx(async (c) => {
       const before = await c.query<{ lock_version: number; enabled: boolean }>(
-        "SELECT model_id, enabled, lock_version FROM model_pricing WHERE model_id='glm-5.1' FOR UPDATE",
+        "SELECT model_id, enabled, lock_version FROM model_pricing WHERE model_id='kimi-k3' FOR UPDATE",
       );
       assert.equal(before.rows.length, 1);
       const after = await c.query<{ enabled: boolean; lock_version: number; multiplier: string }>(
         `UPDATE model_pricing SET multiplier=$1, enabled=$2, lock_version = lock_version + 1, updated_at = NOW()
-          WHERE model_id='glm-5.1'
+          WHERE model_id='kimi-k3'
           RETURNING enabled, lock_version, multiplier::text AS multiplier`,
         ["3.000", false],
       );
@@ -697,7 +713,7 @@ describe("0143 兼容地板(旧 master 回滚后的读写路径)", () => {
     });
     assert.equal(out.after.enabled, false, "RETURNING 必须反映权威后态");
     assert.equal(out.after.lock_version, out.before.lock_version + 1);
-    assert.equal(await catalogState("glm-5.1"), "disabled");
+    assert.equal(await catalogState("kimi-k3"), "disabled");
   });
 
   // 0144:DELETE FROM model_pricing 从「级联物理删除 catalog 全部版本」改为**软退役**。
@@ -705,9 +721,9 @@ describe("0143 兼容地板(旧 master 回滚后的读写路径)", () => {
   //   抹掉 —— 计费行(usage_records.execution_revision)从此无从回溯。
   test("DELETE FROM model_pricing → catalog 行**软退役**(历史保留,不留孤儿 active;0144)", async (t) => {
     if (skipIfNoPg(t)) return;
-    await query("DELETE FROM model_pricing WHERE model_id='glm-5.1'");
+    await query("DELETE FROM model_pricing WHERE model_id='kimi-k3'");
     const r = await query<{ state: string }>(
-      "SELECT state FROM model_catalog WHERE model_id='glm-5.1'",
+      "SELECT state FROM model_catalog WHERE model_id='kimi-k3'",
     );
     assert.equal(r.rows.length, 1, "历史行必须还在");
     assert.equal(r.rows[0].state, "retired", "不再可路由,但不物理删除");
@@ -715,18 +731,18 @@ describe("0143 兼容地板(旧 master 回滚后的读写路径)", () => {
     await query(
       `INSERT INTO model_pricing(model_id, display_name, input_per_mtok, output_per_mtok,
          cache_read_per_mtok, cache_write_per_mtok, multiplier, enabled, sort_order, visibility)
-       VALUES ('glm-5.1','GLM 5.1',684,2880,137,0,1.000,TRUE,88,'public')`,
+       VALUES ('kimi-k3','Kimi K3',684,2880,137,0,1.000,TRUE,88,'public')`,
     );
     const revived = await query<{ state: string }>(
-      "SELECT state FROM model_catalog WHERE model_id='glm-5.1' ORDER BY entry_id",
+      "SELECT state FROM model_catalog WHERE model_id='kimi-k3' ORDER BY entry_id",
     );
     assert.deepEqual(revived.rows.map((x) => x.state), ["retired", "active"]);
   });
 
   test("不变量:model_pricing.enabled 恒等于 (catalog 有 active 行)", async (t) => {
     if (skipIfNoPg(t)) return;
-    await query("UPDATE model_pricing SET enabled=false WHERE model_id='qwen3.7-plus'");
-    await query("UPDATE model_catalog SET state='disabled' WHERE model_id='glm-5.1'");
+    await query("UPDATE model_pricing SET enabled=false WHERE model_id='kimi-k3-ark'");
+    await query("UPDATE model_catalog SET state='disabled' WHERE model_id='kimi-k3'");
     await query("UPDATE model_catalog SET state='active' WHERE model_id='gpt-5.5'");
     const drift = await query<{ model_id: string }>(
       `SELECT p.model_id FROM model_pricing p
@@ -748,7 +764,7 @@ describe("0143 消费侧", () => {
     const s2 = await loadCatalogSnapshot(getPool());
     assert.equal(s1.executionRevision, s2.executionRevision, "同一 DB 状态 → 同一 revision");
     assert.equal(s1.securityEpoch, 1n);
-    assert.equal(s1.isRoutable("glm-5.2"), true);
+    assert.equal(s1.isRoutable("kimi-k3-ark"), true);
     assert.equal(s1.isCodexModel("gpt-5.6-sol"), true);
     assert.equal(s1.isRoutable("gpt-5.5"), false, "disabled 模型不可路由");
     const d = s1.resolve("gpt-5.6-sol");
@@ -756,40 +772,40 @@ describe("0143 消费侧", () => {
     assert.equal(d?.capabilityProfile.reasoning.codexModelDefault, "xhigh");
 
     // 安全写 → epoch + revision 都变
-    await query("UPDATE model_catalog SET state='disabled' WHERE model_id='glm-5.1'");
+    await query("UPDATE model_catalog SET state='disabled' WHERE model_id='kimi-k3'");
     const s3 = await loadCatalogSnapshot(getPool());
     assert.equal(s3.securityEpoch, 2n);
     assert.notEqual(s3.executionRevision, s1.executionRevision);
-    assert.equal(s3.isRoutable("glm-5.1"), false);
+    assert.equal(s3.isRoutable("kimi-k3"), false);
   });
 
   test("PricingCache.enabled 来自 catalog 权威(镜像列被写歪也不受影响)", async (t) => {
     if (skipIfNoPg(t)) return;
     const cache = new PricingCache();
     await cache.load();
-    assert.equal(cache.get("glm-5.1")?.enabled, true);
+    assert.equal(cache.get("kimi-k3")?.enabled, true);
 
     // 绕过 trigger 直接把镜像列写歪(模拟外力/回滚事故):catalog 仍是 active。
     // 必须同一 client(session GUC),故走 tx() 而不是 pool 上的两条独立 query()。
     await tx(async (c) => {
       await c.query("SET LOCAL session_replication_role = replica");
-      await c.query("UPDATE model_pricing SET enabled=false WHERE model_id='glm-5.1'");
+      await c.query("UPDATE model_pricing SET enabled=false WHERE model_id='kimi-k3'");
     });
     const crooked = await query<{ enabled: boolean }>(
-      "SELECT enabled FROM model_pricing WHERE model_id='glm-5.1'",
+      "SELECT enabled FROM model_pricing WHERE model_id='kimi-k3'",
     );
     assert.equal(crooked.rows[0].enabled, false, "前提:镜像列确实被写歪了");
 
     await cache.load();
     assert.equal(
-      cache.get("glm-5.1")?.enabled,
+      cache.get("kimi-k3")?.enabled,
       true,
       "PricingCache 必须读 catalog.state,而不是被写歪的 enabled 镜像列",
     );
 
     // 真正的权威写 → 立刻反映
-    await query("UPDATE model_catalog SET state='disabled' WHERE model_id='glm-5.1'");
+    await query("UPDATE model_catalog SET state='disabled' WHERE model_id='kimi-k3'");
     await cache.load();
-    assert.equal(cache.get("glm-5.1")?.enabled, false);
+    assert.equal(cache.get("kimi-k3")?.enabled, false);
   });
 });

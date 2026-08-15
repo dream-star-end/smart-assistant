@@ -15,6 +15,8 @@ import {
 } from "react";
 import { createRoot } from "react-dom/client";
 import { Composer } from "../src/components/Composer";
+import { SettingsCenter } from "../src/components/SettingsCenter";
+import { Sidebar } from "../src/components/Sidebar";
 import { CommunityTutorials } from "../src/components/tutorials/CommunityTutorials";
 import { MessageFeedbackDialog } from "../src/components/chat/MessageFeedbackDialog";
 import { TurnCostReminder } from "../src/components/chat/TurnCostReminder";
@@ -1606,5 +1608,79 @@ createRoot(document.getElementById("markdown-rich-root")!).render(
   <StrictMode>
     <div data-testid="mermaid-ok"><Markdown>{MERMAID_OK}</Markdown></div>
     <div data-testid="mermaid-broken"><Markdown>{MERMAID_BROKEN}</Markdown></div>
+  </StrictMode>,
+);
+
+// PR1 Codex 密度门：真实 Sidebar（活跃竖条 / 顶栏入口权重），与 #root Composer、
+// #tool-card-polish-root ToolCard 一起由 T41 在 1440/390 明暗主题下锁 class 契约。
+const DENSITY_USER: User = {
+  id: "density-user",
+  displayName: "密度验收",
+  roles: ["user"],
+  role: "admin",
+};
+createRoot(document.getElementById("codex-density-root")!).render(
+  <StrictMode>
+    <div style={{ height: 640 }}>
+      <Sidebar
+        sessions={[
+          {
+            id: "density-active",
+            title: "密度验收活跃会话",
+            ownerUserId: DENSITY_USER.id,
+            updatedAt: new Date().toISOString(),
+            messageCount: 3,
+          },
+          {
+            id: "density-idle",
+            title: "密度验收空闲会话",
+            ownerUserId: DENSITY_USER.id,
+            updatedAt: new Date().toISOString(),
+            messageCount: 1,
+          },
+        ]}
+        activeId="density-active"
+        user={DENSITY_USER}
+        onSelect={() => {}}
+        onNew={() => {}}
+        onRename={() => {}}
+        onDelete={() => {}}
+        onOpenManage={() => {}}
+        onOpenMarketplace={() => {}}
+        onOpenTutorial={() => {}}
+        onOpenOrg={() => {}}
+        showAdmin
+      />
+    </div>
+  </StrictMode>,
+);
+
+// PR2 设置壳：默认关闭，避免 Dialog 盖住其余 harness。T42 用受信点击打开后
+// 锁 390 单列不横溢 / 五分区可切 / 1440 竖导航 168px。
+function SettingsShellProbe() {
+  const [open, setOpen] = useState(false);
+  return (
+    <TooltipProvider>
+      <button type="button" onClick={() => setOpen(true)}>
+        打开设置壳
+      </button>
+      <SettingsCenter
+        open={open}
+        auth={createMemoryAuthSession(() => {}, "settings-shell-token")}
+        user={DENSITY_USER}
+        theme="light"
+        onClose={() => setOpen(false)}
+        onSetTheme={() => {}}
+        onOpenMemory={() => {}}
+        onOpenManage={() => {}}
+        onOpenRepo={() => {}}
+        initialSection="about"
+      />
+    </TooltipProvider>
+  );
+}
+createRoot(document.getElementById("settings-shell-root")!).render(
+  <StrictMode>
+    <SettingsShellProbe />
   </StrictMode>,
 );

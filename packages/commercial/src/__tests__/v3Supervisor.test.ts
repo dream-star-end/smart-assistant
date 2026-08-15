@@ -613,21 +613,24 @@ describe("resolveV5CursorAuthMount", () => {
     return dir;
   }
 
-  test("accepts only the configured local V5 owner and strict root-only metadata", () => {
+  test("accepts only configured local V5 credential members and strict root-only metadata", () => {
     const dir = makeAuthDir();
     try {
       const base = {
         uid: 4,
         runtimeChannel: "v5" as const,
         useRemote: false,
+        credentialUids: "1,4",
         ownerUid: "4",
         authDir: dir,
       };
       assert.equal(resolveV5CursorAuthMount(base), dir);
+      assert.equal(resolveV5CursorAuthMount({ ...base, uid: 1 }), dir);
       assert.equal(resolveV5CursorAuthMount({ ...base, uid: 5 }), null);
       assert.equal(resolveV5CursorAuthMount({ ...base, runtimeChannel: "v3" }), null);
       assert.equal(resolveV5CursorAuthMount({ ...base, useRemote: true }), null);
-      assert.equal(resolveV5CursorAuthMount({ ...base, ownerUid: "04" }), null);
+      assert.equal(resolveV5CursorAuthMount({ ...base, credentialUids: "1,04" }), null);
+      assert.equal(resolveV5CursorAuthMount({ ...base, credentialUids: "1,4,evil" }), null);
       assert.equal(resolveV5CursorAuthMount({ ...base, authDir: "relative" }), null);
 
       chmodSync(pathJoin(dir, "api-key"), 0o644);
@@ -938,6 +941,7 @@ describe("provisionV3Container", () => {
     const keys = [
       "OC_RUNTIME_CHANNEL",
       "OC_V5_CURSOR_OWNER_UID",
+      "OC_V5_CURSOR_CREDENTIAL_UIDS",
       "OC_V5_CURSOR_AUTH_DIR",
     ] as const;
     const saved = new Map(keys.map((key) => [key, process.env[key]]));
@@ -948,6 +952,7 @@ describe("provisionV3Container", () => {
     try {
       process.env.OC_RUNTIME_CHANNEL = "v5";
       process.env.OC_V5_CURSOR_OWNER_UID = "4";
+      process.env.OC_V5_CURSOR_CREDENTIAL_UIDS = "1,4";
       process.env.OC_V5_CURSOR_AUTH_DIR = dir;
 
       const ownerDocker = makeDocker();
@@ -965,6 +970,22 @@ describe("provisionV3Container", () => {
       const ownerOpts = ownerDocker.captured.containersCreated[0]!;
       assert.ok(
         ownerOpts.HostConfig?.Binds?.includes(`${dir}:${V5_CURSOR_AUTH_RO_MOUNT}:ro`),
+      );
+
+      const adminDocker = makeDocker();
+      await provisionV3Container(
+        {
+          docker: adminDocker.docker,
+          pool: pool as unknown as Pool,
+          image: TEST_IMAGE,
+          selfHostId: TEST_HOST,
+          randomIp: () => "172.31.5.44",
+          randomSecret: fixedSecret("d".repeat(64)),
+        },
+        1,
+      );
+      assert.ok(
+        adminDocker.captured.containersCreated[0]?.HostConfig?.Binds?.includes(`${dir}:${V5_CURSOR_AUTH_RO_MOUNT}:ro`),
       );
       assert.ok(
         !(ownerOpts.Env ?? []).some((entry) =>

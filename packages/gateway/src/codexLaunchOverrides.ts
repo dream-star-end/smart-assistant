@@ -31,12 +31,12 @@
  *     stage1/stage2 memory writer touch our MemoryStore.
  */
 import { createHash } from 'node:crypto'
-import { existsSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { createLogger } from './logger.js'
 import { modelHintAppliedTotal } from './metrics.js'
 import { buildPromptContext } from './promptSlots.js'
 import { getPlatformPrompt } from './platformPrompts.js'
+import { resolveMcpMemoryEntry } from './mcpMemoryEntry.js'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 
 const overridesLog = createLogger({ module: 'codexLaunchOverrides' })
@@ -141,10 +141,10 @@ unless the user explicitly asks for a saved/downloadable file.
 
 // ── mcp-memory / vision entry resolution + vision MCP env ──
 //
-// P1f 把 resolveMcpMemoryEntry / resolveOpenClaudeVisionEntry /
-// buildOpenClaudeVisionMcpEnv 三个共享函数并入 subprocessRunner.ts(CCB 路径
-// 也用)。M1a 复活本文件时**反向 import**,不复制第二份 —— 单一权威在
-// subprocessRunner。注意语义差(复活底稿 A2,有意保留):现版
+// resolveMcpMemoryEntry 的 runner-neutral 单一权威在 mcpMemoryEntry.ts,
+// 避免 Cursor/Codex adapter 反向 import subprocessRunner 形成运行时循环。
+// vision entry/env 仍由 subprocessRunner.ts 与 CCB 路径共享。注意语义差
+// (复活底稿 A2,有意保留):现版
 // buildOpenClaudeVisionMcpEnv 不再注入 4 个 codex vision 专用 env 键
 // (CODEX_HOME / OPENCLAUDE_VISION_CODEX_MODEL /
 // OPENCLAUDE_VISION_CODEX_REFRESH_TIMEOUT_MS / OPENCLAUDE_VISION_CODEX_REFRESH_DISABLED)。
@@ -153,7 +153,6 @@ unless the user explicitly asks for a saved/downloadable file.
 // subprocessRunner.buildOpenClaudeVisionMcpEnv 回补这 4 键即可(一处生效)。
 import {
   buildOpenClaudeVisionMcpEnv,
-  resolveMcpMemoryEntry,
   resolveOpenClaudeVisionEntry,
 } from './subprocessRunner.js'
 

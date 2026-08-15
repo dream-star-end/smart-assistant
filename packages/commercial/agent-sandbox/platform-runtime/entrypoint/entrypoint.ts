@@ -1051,7 +1051,7 @@ try {
     "审阅员",
     "GPT 5.5 (Codex)",
     // 遗留 display 识别串:旧版镜像把 main 污染成 GPT 5.5 默认显示的容器在
-    // merge 时被规范化回 ccb 默认(main 仍归 glm-5.2;codex agent 独立 seed)。
+    // merge 时被规范化回 ccb 默认(main 仍归 glm-5.3;codex agent 独立 seed)。
     "GPT 5.5 (default)",
     "GPT 5.5 队长",
     "GPT-5.6-Sol 队长",

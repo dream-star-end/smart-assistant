@@ -87,7 +87,13 @@
     "0205_scnet_ocr_jobs",
     "0206_community_tutorials",
     "0207_grok_build_admin_pool",
-    "0208_cursor_engine"
+    "0208_cursor_engine",
+    "0209_cursor_multimodel_shared_credential",
+    "0210_cursor_multimodel_activation",
+    "0211_stage_glm53_opencode_flash",
+    "0212_public_glm53_opencode_flash",
+    "0213_glm53_default_transition",
+    "0214_disable_legacy_models"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

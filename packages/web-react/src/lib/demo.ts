@@ -4,11 +4,11 @@ export const DEMO_USER: User = { id: "demo", displayName: "rqmn", roles: ["user"
 
 /**
  * 离线预览用的模型列表（?demo=1）。真实工作区一律由 GET /api/public/models 驱动
- * （glm-5.2/deepseek/minimax；Claude 官方模型已全面下线，不再暴露）；这里只是为了
+ * （glm-5.3/deepseek/minimax；Claude 官方模型已全面下线，不再暴露）；这里只是为了
  * 让 demo 模式在零网络下也能展示模型选择器的视觉，刻意与后端权威源解耦、不参与任何请求。
  */
 export const DEMO_MODELS: PublicModel[] = [
-  { id: "glm-5.2", display_name: "GLM-5.2" },
+  { id: "glm-5.3", display_name: "GLM-5.3" },
   { id: "deepseek", display_name: "DeepSeek" },
   { id: "MiniMax-M3", display_name: "MiniMax M3" },
 ];

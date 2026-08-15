@@ -3,7 +3,10 @@
   "providers": [
     {
       "id": "deepseek",
-      "inboundModelIds": ["deepseek-v4-flash", "deepseek-v4-pro"],
+      "inboundModelIds": [
+        "deepseek-v4-flash",
+        "deepseek-v4-pro"
+      ],
       "maxInputTokens": null,
       "upstreamEndpoint": "https://api.deepseek.com/anthropic/v1/messages",
       "capabilityZero": false,
@@ -12,7 +15,9 @@
     },
     {
       "id": "minimax",
-      "inboundModelIds": ["MiniMax-M3"],
+      "inboundModelIds": [
+        "MiniMax-M3"
+      ],
       "maxInputTokens": 512000,
       "upstreamEndpoint": "https://api.minimaxi.com/anthropic/v1/messages",
       "capabilityZero": true,
@@ -21,7 +26,11 @@
     },
     {
       "id": "ark",
-      "inboundModelIds": ["glm-5.2", "glm-5.1"],
+      "inboundModelIds": [
+        "glm-5.3",
+        "glm-5.2",
+        "glm-5.1"
+      ],
       "maxInputTokens": 1000000,
       "upstreamEndpoint": "https://ark.cn-beijing.volces.com/api/coding/v1/messages",
       "capabilityZero": true,
@@ -30,7 +39,11 @@
     },
     {
       "id": "opencodego",
-      "inboundModelIds": ["qwen3.7-max", "qwen3.7-plus"],
+      "inboundModelIds": [
+        "deepseek-v4-flash-opencode-go",
+        "qwen3.7-max",
+        "qwen3.7-plus"
+      ],
       "maxInputTokens": 1000000,
       "upstreamEndpoint": "https://opencode.ai/zen/go/v1/messages",
       "capabilityZero": true,
@@ -39,7 +52,9 @@
     },
     {
       "id": "kimi",
-      "inboundModelIds": ["kimi-k2.7-code"],
+      "inboundModelIds": [
+        "kimi-k2.7-code"
+      ],
       "maxInputTokens": 256000,
       "upstreamEndpoint": "https://ark.cn-beijing.volces.com/api/plan/v1/messages",
       "capabilityZero": true,
@@ -48,7 +63,9 @@
     },
     {
       "id": "ark-k3",
-      "inboundModelIds": ["kimi-k3-ark"],
+      "inboundModelIds": [
+        "kimi-k3-ark"
+      ],
       "maxInputTokens": 1048576,
       "upstreamEndpoint": "https://ark.cn-beijing.volces.com/api/plan/v1/messages",
       "capabilityZero": true,
@@ -57,7 +74,9 @@
     },
     {
       "id": "moonshot",
-      "inboundModelIds": ["kimi-k3"],
+      "inboundModelIds": [
+        "kimi-k3"
+      ],
       "maxInputTokens": 1048576,
       "upstreamEndpoint": "https://api.kimi.com/coding/v1/messages",
       "capabilityZero": true,
@@ -66,7 +85,9 @@
     },
     {
       "id": "bailian",
-      "inboundModelIds": ["qwen3.8-max"],
+      "inboundModelIds": [
+        "qwen3.8-max"
+      ],
       "maxInputTokens": 983616,
       "upstreamEndpoint": "https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic/v1/messages",
       "capabilityZero": true,

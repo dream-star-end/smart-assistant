@@ -65,10 +65,21 @@ export function isGrokEngineModel(modelId: string | null | undefined): boolean {
   )
 }
 
-/** Cursor's account-selected Auto model. The adapter deliberately omits
- * `--model`; no user-controlled value ever reaches the CLI. */
+/**
+ * Pinned official Cursor Agent CLI model allowlist.
+ *
+ * `id` is the OpenClaude-facing canonical model. `upstreamModel` is either the
+ * exact value reported by the pinned CLI's `--list-models`, or null for Auto
+ * (where the adapter deliberately omits `--model`). User input is never used
+ * as a CLI argument.
+ */
 export const CURSOR_ENGINE_MODELS = [
   { id: 'cursor-auto', displayName: 'Cursor Auto', upstreamModel: null },
+  { id: 'cursor-grok-4.6-high', displayName: 'Cursor Grok 4.6 High', upstreamModel: 'cursor-grok-4.6-high' },
+  { id: 'cursor-composer-2.5-fast', displayName: 'Cursor Composer 2.5 Fast', upstreamModel: 'composer-2.5-fast' },
+  { id: 'cursor-opus-5-high', displayName: 'Cursor Opus 5 High', upstreamModel: 'claude-opus-5-thinking-high' },
+  { id: 'cursor-fable-5-high', displayName: 'Cursor Fable 5 High (Non-ZDR)', upstreamModel: 'claude-fable-5-thinking-high' },
+  { id: 'cursor-grok-4.5-high', displayName: 'Cursor Grok 4.5 High', upstreamModel: 'cursor-grok-4.5-high' },
 ] as const
 export const CURSOR_ENGINE_MODEL_IDS = CURSOR_ENGINE_MODELS.map((m) => m.id)
 export type CursorEngineModelId = (typeof CURSOR_ENGINE_MODELS)[number]['id']

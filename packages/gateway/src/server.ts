@@ -426,14 +426,14 @@ function teamMemberCapabilityHint(agent: AgentDef): string {
  *     在 claude-subscription agent 上跑就够,不需要切 agent
  *   - MiniMax-M3 — master 侧切到 MiniMax Token Plan Anthropic 兼容端点,
  *     同样跑 claude-subscription/non-codex agent,不进 codex-native
- *   - glm-5.1 / glm-5.2 — master 侧切到火山方舟 Ark Coding Plan Anthropic 兼容端点,
- *     同 non-codex,glm-5.2 是**平台全局默认模型**
+ *   - glm-5.1 / glm-5.2 / glm-5.3 — master 侧切到火山方舟 Ark Coding Plan Anthropic 兼容端点,
+ *     同 non-codex,glm-5.3 是**平台全局默认模型**
  *
  * **Claude 官方模型(claude-opus-4-7 / claude-sonnet-4-6 / claude-haiku-4-5)已全面下线**
  * (v3 + v5 均不支持),不在白名单;stale prefs / 构造帧带 Claude 模型会被拒,而不是路由到
  * 已下线的 Anthropic 上游。
  *
- * 静态 key 文本 provider 的字面量(deepseek-v4-flash/pro, MiniMax-M3, glm-5.1/5.2)从
+ * 静态 key 文本 provider 的字面量(deepseek-v4-flash/pro, MiniMax-M3, glm-5.1/5.2/5.3)从
  * @openclaude/protocol 注册表 STATIC_KEY_INBOUND_MODEL_IDS 注入,新增 provider 零改本处。
  */
 export const ALLOWED_INBOUND_MODELS = new Set<string>([
@@ -445,9 +445,9 @@ export const ALLOWED_INBOUND_MODELS = new Set<string>([
 
 const ALLOWED_REASONING_EFFORTS = new Set<string>(PLATFORM_REASONING_EFFORTS)
 
-/** 平台执行模型兜底:v3/v5 两渠道都合法的静态 key 平台默认。 */
+/** 平台执行模型兜底:V5 当前合法的静态 key 平台默认。 */
 export const EXECUTION_MODEL_FALLBACK_ROUTE = [
-  'glm-5.2',
+  'glm-5.3',
   'MiniMax-M3',
   'deepseek-v4-pro',
   'deepseek-v4-flash',
@@ -461,7 +461,7 @@ export const EXECUTION_MODEL_FALLBACK = EXECUTION_MODEL_FALLBACK_ROUTE[0]
  * delegate 委派)会**绕过入站校验**,在 SessionManager.getOrCreate 里直接作为 CCB `--model`
  * spawn。已下线模型(如某个 stale 已安装 agent 里残留的 claude-*)会让 CCB 用不可路由的
  * --model 启动 → spawn 失败 / session 卡死。runner 创建是唯一收口点,这里把任何不在白名单的
- * 模型降级到平台默认(glm-5.2),使"Claude 官方模型下线"在 agent 级路径上也真正生效。
+ * 模型降级到平台默认(glm-5.3),使"Claude 官方模型下线"在 agent 级路径上也真正生效。
  */
 export function resolveExecutionModel(
   preferred: string | undefined | null,
@@ -471,7 +471,7 @@ export function resolveExecutionModel(
    * 不过 ALLOWED_INBOUND_MODELS 这张 baked 白名单。
    *
    * 为什么不能再过白名单:baked 白名单是容器镜像里的第二信任源。catalog 里新 staged→active
-   * 的模型(镜像没这一版)会被它降级成 glm-5.2 —— master 按新模型预扣/签发,容器却跑
+   * 的模型(镜像没这一版)会被它降级成 glm-5.3 —— master 按新模型预扣/签发,容器却跑
    * 另一个模型,计费与执行分裂。descriptor 已经是「master 唯一判定者」的产物(active +
    * 有价 + capability schema 可理解),再拿旧白名单去二次审判它,等于让旧快照否决新快照。
    */
@@ -3936,7 +3936,7 @@ export class Gateway {
           'Content-Length': contentLength,
           'Accept-Ranges': 'bytes',
           'ETag': `"${head.contentSha256}"`,
-          'X-OpenClaude-Record-Id': head.msgId,
+          ..._immutableRecordIdHeaders(head.msgId),
           'X-OpenClaude-Record-Role': head.role,
           'X-OpenClaude-Content-Sha256': head.contentSha256,
           ...(range ? { 'Content-Range': `bytes ${start}-${endExclusive - 1}/${head.totalBytes}` } : {}),
@@ -4032,7 +4032,7 @@ export class Gateway {
           'Content-Length': contentLength,
           'Accept-Ranges': 'bytes',
           'ETag': `"${head.contentSha256}"`,
-          'X-OpenClaude-Record-Id': head.msgId,
+          ..._immutableRecordIdHeaders(head.msgId),
           'X-OpenClaude-Record-Role': head.role,
           'X-OpenClaude-Content-Sha256': head.contentSha256,
           ...(range ? { 'Content-Range': `bytes ${start}-${endExclusive - 1}/${head.totalBytes}` } : {}),
@@ -16309,6 +16309,18 @@ export function staticCacheControl(safePath: string, mode: 'vanilla' | 'spa' | u
       : 'no-cache'
   }
   return safePath === '/sw.js' ? 'no-cache, no-store, must-revalidate' : 'public, max-age=3600'
+}
+
+/** Deferred record IDs are immutable identity metadata. New records normally
+ * use visible ASCII IDs, but historical Cursor call IDs may contain LF or
+ * Unicode. Never pass those bytes directly to node:http header validation. */
+export function _immutableRecordIdHeaders(recordId: string): Record<string, string> {
+  if (/^[\x21-\x7e]{1,1024}$/.test(recordId)) {
+    return { 'X-OpenClaude-Record-Id': recordId }
+  }
+  return {
+    'X-OpenClaude-Record-Id-Base64url': Buffer.from(recordId, 'utf8').toString('base64url'),
+  }
 }
 
 // 活跃内容 MIME 集合 + inline 判定已收敛到 @openclaude/protocol 的单一权威(批D D5)。

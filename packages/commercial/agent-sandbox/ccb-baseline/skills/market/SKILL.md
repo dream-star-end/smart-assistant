@@ -80,7 +80,7 @@ oc-market publish-skill --slug my-skill --name "学术翻译" --version 1.8.0 \
 发布**智能体**(人设写到文件;toolsets 只能取平台白名单 core/browser/research/web_context;model 取当前可用模型;`--skill-deps`/`--plugin-deps` 选择已上架能力;**category/use-cases 同样必填**):
 ```bash
 oc-market publish-agent --slug my-agent --name "写作助手" --version 1.0.0 \
-  --description "中文写作润色专家" --model glm-5.2 --toolsets core \
+  --description "中文写作润色专家" --model glm-5.3 --toolsets core \
   --category office-docs \
   --use-cases "把口语要点扩写成成文;给中文稿件做润色和降 AI 味" \
   --skill-deps academic-translate --plugin-deps paper-search \

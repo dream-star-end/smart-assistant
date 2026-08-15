@@ -43,6 +43,7 @@
 import type { PoolClient } from 'pg'
 import { query, tx } from '../db/queries.js'
 import { writeAdminAudit } from './audit.js'
+import { isCursorCredentialMember } from '../cursor/access.js'
 
 /**
  * grant 写提交后收敛本进程 catalog 快照(epoch 已被 0144 的 trigger bump)。
@@ -182,6 +183,9 @@ export async function addGrant(
     if (modelR.rows.length === 0) throw new GrantModelNotFoundError(mid)
     if (modelR.rows[0]?.engine === 'grok' && userR.rows[0]?.role !== 'admin') {
       throw new GrantInvalidInputError('admin_only_model')
+    }
+    if (modelR.rows[0]?.engine === 'cursor' && !isCursorCredentialMember(uid)) {
+      throw new GrantInvalidInputError('cursor_credential_not_enabled')
     }
 
     const ins = await client.query<ModelGrantRowView>(

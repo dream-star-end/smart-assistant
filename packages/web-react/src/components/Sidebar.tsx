@@ -112,7 +112,7 @@ export function Sidebar({
           <button
             data-product-feature={PRODUCT_CAPABILITIES.memory.id}
             onClick={onOpenManage}
-            className="flex items-center gap-2.5 rounded-lg px-3 py-2 text-left text-section font-medium text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+            className="flex items-center gap-2.5 rounded-lg px-3 py-1.5 text-left text-body font-medium text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
           >
             <LayoutGrid size={16} className="text-faint" />
             管理中心
@@ -132,7 +132,7 @@ export function Sidebar({
           <button
             data-product-feature={PRODUCT_CAPABILITIES.marketplace.id}
             onClick={onOpenMarketplace}
-            className="flex items-center gap-2.5 rounded-lg px-3 py-2 text-left text-section font-medium text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+            className="flex items-center gap-2.5 rounded-lg px-3 py-1.5 text-left text-body font-medium text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
           >
             <Store size={16} className="text-faint" />
             市场
@@ -146,7 +146,7 @@ export function Sidebar({
             type="button"
             data-product-control
             onClick={onOpenTutorial}
-            className="flex items-center gap-2.5 rounded-lg px-3 py-2 text-left text-section font-medium text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+            className="flex items-center gap-2.5 rounded-lg px-3 py-1.5 text-left text-body font-medium text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
           >
             <BookOpen size={16} className="text-faint" />
             使用教程
@@ -158,7 +158,7 @@ export function Sidebar({
           <button
             data-product-feature={PRODUCT_CAPABILITIES.organization.id}
             onClick={onOpenOrg}
-            className="flex items-center gap-2.5 rounded-lg px-3 py-2 text-left text-section font-medium text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+            className="flex items-center gap-2.5 rounded-lg px-3 py-1.5 text-left text-body font-medium text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
           >
             <Building2 size={16} className="text-faint" />
             组织
@@ -170,7 +170,7 @@ export function Sidebar({
           <a
             data-product-control
             href="/admin.html"
-            className="flex items-center gap-2.5 rounded-lg px-3 py-2 text-left text-section font-medium text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+            className="flex items-center gap-2.5 rounded-lg px-3 py-1.5 text-left text-body font-medium text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
           >
             <ShieldCheck size={16} className="text-faint" />
             管理后台
@@ -198,15 +198,18 @@ export function Sidebar({
               <div
                 key={s.id}
                 className={cn(
-                  "group flex items-center gap-2 rounded-lg pr-2 text-section transition-colors",
+                  "group relative flex items-center gap-2 rounded-md pr-2 text-section transition-colors",
                   s.id === activeId ? "bg-active text-fg" : "text-muted hover:bg-hover hover:text-fg",
                 )}
               >
+                {s.id === activeId && (
+                  <span aria-hidden className="absolute inset-y-1 left-0 w-0.5 rounded-full bg-accent" />
+                )}
                 <button
                   type="button"
                   onClick={() => onSelect(s.id)}
                   aria-current={s.id === activeId ? "true" : undefined}
-                  className="min-w-0 flex-1 truncate rounded-lg px-3 py-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  className="min-w-0 flex-1 truncate rounded-md px-3 py-1.5 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:py-2"
                 >
                   {s.title || "新对话"}
                 </button>

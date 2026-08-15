@@ -8633,6 +8633,9 @@ run_candidate_release_verification() {
   ssh "$KL_HOST" "cd '$release' && npx --no-install tsx --test \
     --test-name-pattern='Cursor authority|Cursor billingRequestId' \
     packages/gateway/src/__tests__/modelAuthorityConsume.test.ts" || return 1
+  echo "── candidate Cursor stream-json parser gate + hot-config wrapper gate(exact immutable release)──"
+  ssh "$KL_HOST" "cd '$release' && npx --no-install tsx --test \
+    packages/gateway/src/__tests__/cursorAdapter.test.ts" || return 1
   npx --no-install tsx "$REPO_ROOT/scripts/v5-auto-dream-collector-smoke.ts" || return 1
   create_release_verification_run "$release" "$generation" || return 1
   rm -rf "$REPO_ROOT/e2e/session-display/reports" "$REPO_ROOT/e2e/session-display/test-results"

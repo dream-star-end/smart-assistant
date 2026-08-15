@@ -43,6 +43,13 @@ function unauthorized() {
   return { ok: false, status: 401, headers: { get: () => null }, json: async () => ({}) }
 }
 
+function base64urlUtf8(value: string): string {
+  const bytes = new TextEncoder().encode(value)
+  let binary = ''
+  for (const byte of bytes) binary += String.fromCharCode(byte)
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '')
+}
+
 test('getSession pairs since cursor with history revision and omits invalid revisions', async () => {
   const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => ok({
     id: 'web-session-1', messages: [], isPartial: true, maxSeq: 42, historyRevision: 7,
@@ -143,6 +150,75 @@ test('getTapeRecordPayload resolves metadata with a one-byte Range and reconstru
   })
   expect(reconstructed.length).toBe(source.length)
   expect(reconstructed.every((byte, index) => byte === source[index])).toBe(true)
+})
+
+test('getTapeRecordPayload prefers and decodes the Unicode base64url record id on every range', async () => {
+  const source = new Uint8Array([1, 2])
+  const hash = 'c'.repeat(64)
+  const recordId = 'call-one\n记录-🙂'
+  const encoded = base64urlUtf8(recordId)
+  const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+    const range = new Headers(init?.headers).get('range')
+    const start = range === 'bytes=0-0' ? 0 : 1
+    return new Response(source.slice(start, start + 1), {
+      status: 206,
+      headers: {
+        'content-range': `bytes ${start}-${start}/2`,
+        'x-openclaude-content-sha256': hash,
+        'x-openclaude-record-id': 'legacy-must-not-win',
+        'x-openclaude-record-id-base64url': encoded,
+        'x-openclaude-record-role': 'tool',
+      },
+    })
+  })
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+  const { session } = makeSession('tok-encoded-record')
+
+  const result = await api.getTapeRecordPayload(session, 'session-encoded', 'tape-encoded', 1)
+  expect(result.recordId).toBe(recordId)
+  expect(Array.from(new Uint8Array(result.bytes))).toEqual([1, 2])
+  expect(fetchMock).toHaveBeenCalledTimes(2)
+})
+
+test.each([
+  ['invalid alphabet', 'Zg='],
+  ['impossible length', 'A'],
+  ['noncanonical trailing bits', 'Zh'],
+  ['invalid UTF-8', '_w'],
+])('getTapeRecordPayload rejects a present malformed alternate id: %s', async (_label, encoded) => {
+  vi.stubGlobal('fetch', vi.fn(async () => new Response(new Uint8Array([1]), {
+    status: 206,
+    headers: {
+      'content-range': 'bytes 0-0/1',
+      'x-openclaude-content-sha256': 'd'.repeat(64),
+      'x-openclaude-record-id': 'legacy-must-not-fallback',
+      'x-openclaude-record-id-base64url': encoded,
+      'x-openclaude-record-role': 'tool',
+    },
+  })))
+  const { session } = makeSession('tok-malformed-record')
+  await expect(api.getTapeRecordPayload(session, 'session-malformed', 'tape-malformed', 1))
+    .rejects.toThrow('invalid immutable deferred payload record id encoding')
+})
+
+test('getTapeRecordPayload rejects a decoded record identity change on a later range', async () => {
+  const hash = 'e'.repeat(64)
+  const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+    const first = new Headers(init?.headers).get('range') === 'bytes=0-0'
+    return new Response(new Uint8Array([first ? 1 : 2]), {
+      status: 206,
+      headers: {
+        'content-range': first ? 'bytes 0-0/2' : 'bytes 1-1/2',
+        'x-openclaude-content-sha256': hash,
+        'x-openclaude-record-id-base64url': base64urlUtf8(first ? 'record-one' : 'record-two'),
+        'x-openclaude-record-role': 'tool',
+      },
+    })
+  })
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+  const { session } = makeSession('tok-mixed-record')
+  await expect(api.getTapeRecordPayload(session, 'session-mixed', 'tape-mixed', 1))
+    .rejects.toThrow('immutable deferred payload range identity mismatch')
 })
 
 test('getTapeRecordPayload rejects an ignored Range before consuming the full response body', async () => {
