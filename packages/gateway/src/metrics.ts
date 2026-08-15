@@ -123,6 +123,11 @@ export const outboundRingSizeBytes = { value: 0 }
 // 基数受 model_pricing 表行数约束(目前 6 行,不会爆)。
 export const modelHintAppliedTotal = new Counter()
 
+export const usageLogInsertedTotal = new Counter()
+export const usageLogDuplicateTotal = new Counter()
+export const usageLogConflictTotal = new Counter()
+export const usageLogFailedTotal = new Counter()
+
 // ── EventBus subscriber ──
 
 let _metricsStarted = false
@@ -195,6 +200,22 @@ export function serializeMetrics(): string {
     modelHintAppliedTotal.serialize(
       'oc_model_hint_applied_total',
       'Per-model extra_system_prompt injected at CCB/codex spawn (labelled by canonical model_id)',
+    ),
+    usageLogInsertedTotal.serialize(
+      'oc_usage_log_inserted_total',
+      'usage_log rows successfully inserted (labelled by terminal status)',
+    ),
+    usageLogDuplicateTotal.serialize(
+      'oc_usage_log_duplicate_total',
+      'usage_log inserts ignored as idempotent duplicates',
+    ),
+    usageLogConflictTotal.serialize(
+      'oc_usage_log_conflict_total',
+      'usage_log inserts ignored because a conflicting row already exists',
+    ),
+    usageLogFailedTotal.serialize(
+      'oc_usage_log_failed_total',
+      'usage_log inserts that threw (true loss)',
     ),
   ]
   return sections.join('\n\n') + '\n'

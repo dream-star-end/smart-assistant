@@ -3,6 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { PoolClient } from "pg";
 import { getPool } from "./index.js";
+import { verifyOrderDependencies } from "./migrationOrder.js";
 
 /**
  * 迁移系统(T-02)。
@@ -23,6 +24,10 @@ import { getPool } from "./index.js";
  *         否则抛错(防止有人删掉历史 migration 文件造成静默漂移)
  *     (b) 新增的 .sql 文件版本号必须严格大于所有已 applied 的版本
  *         (防止回填编号 0003,而 0005 已经跑过这种 "out-of-order" 状态)
+ *     (c) 待应用迁移若在文件头声明了 `-- order-dependency: <version>`,那条依赖
+ *         必须已 applied 或同批在目录里;否则在 apply 任何一支之前 fail-closed。
+ *         (b) 只能在**受害方**部署时才炸,且报错落在无辜的分支上;(c) 让占大号的
+ *         那支在自己部署时就先炸,错误信息直接指出该先合并哪一支。
  * - 允许编号不连续(例如 0001、0005、0010):项目有时会预留号段,
  *   硬要求"不跳号"太僵;但"新插入的版本号必须 > max(applied)"足以防止漂移
  *
@@ -202,6 +207,46 @@ function verifyIntegrity(
   }
 }
 
+/**
+ * 顺序依赖前置断言(完整性校验 c)。
+ *
+ * 多分支并行时,占大号的一支必须等占小号的那支先合并并 apply —— 这条依赖靠 (b) 是
+ * 检测不到的:(b) 只会在**小号那支**部署时才发现自己 out-of-order,于是整个迁移运行
+ * fail-closed,炸在没做错任何事的一方身上,排查成本极高。
+ *
+ * 这里让占大号的一方在 apply 之前就自检:声明了 `-- order-dependency: X` 而 X 既未
+ * applied、也不在本次目录里(即不会在同一次运行中先被应用)→ 立刻 fail-closed,
+ * 且错误信息直接说明该先合并哪一支。
+ *
+ * 只检查**待应用**的迁移:已 applied 的那些,依赖在当时已被满足,重放校验只会把
+ * 历史噪声变成新的部署阻塞。未声明的迁移零行为变化(存量迁移全部无声明)。
+ */
+async function assertOrderDependencies(
+  files: ReadonlyArray<{ version: string; file: string }>,
+  applied: ReadonlySet<string>,
+  dir: string,
+): Promise<void> {
+  const pendingFiles = files.filter((f) => !applied.has(f.version));
+  if (pendingFiles.length === 0) return;
+
+  const known = new Set<string>(applied);
+  for (const f of files) known.add(f.version);
+
+  const pending = await Promise.all(
+    pendingFiles.map(async (f) => ({
+      version: f.version,
+      sql: await readFile(path.join(dir, f.file), "utf8"),
+    })),
+  );
+
+  const violations = verifyOrderDependencies(pending, known);
+  if (violations.length > 0) {
+    throw new MigrationIntegrityError(
+      `order-dependency violation(s):\n  - ${violations.join("\n  - ")}`,
+    );
+  }
+}
+
 async function runMigrationsInner(
   client: PoolClient,
   dir: string,
@@ -215,6 +260,7 @@ async function runMigrationsInner(
   const alreadyApplied = new Set(appliedRows.rows.map((r) => r.version));
 
   verifyIntegrity(files, alreadyApplied);
+  await assertOrderDependencies(files, alreadyApplied, dir);
 
   const applied: string[] = [];
   const skipped: string[] = [];

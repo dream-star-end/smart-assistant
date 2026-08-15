@@ -52,6 +52,7 @@ import { isModelAuthorityRequired } from './modelAuthority.js'
 import type { CodexProviderConfigOverride } from './engine/codexShared.js'
 import type { GrokRouteOverride } from './engine/grokAdapter.js'
 import { eventBus, createEvent } from './eventBus.js'
+import { createTurnUsageRecorder, mapTurnTerminalStatus, type TurnTerminalStatus } from './turnUsage.js'
 import { createLogger } from './logger.js'
 import {
   deriveLosslessTurnKey,
@@ -4361,6 +4362,35 @@ export class SessionManager {
     const prevCostUSD = session.totalCostUSD
     const prevTurns = session.turns
     const prevLastCcbCost = session._lastCcbCumulativeCost
+    const turnUsage = createTurnUsageRecorder()
+    const recordTurnUsage = (
+      terminalStatus: TurnTerminalStatus,
+      usage?: {
+        inputTokens?: number
+        outputTokens?: number
+        cacheReadTokens?: number
+        cacheCreationTokens?: number
+        costUsd?: number
+        model?: string
+      },
+      turnIndex = Math.max(session.turns, prevTurns + 1),
+    ): boolean => turnUsage.record({
+      agentId: session.agentId,
+      sessionKey: session.sessionKey,
+      turnIndex,
+      usage: {
+        inputTokens: usage?.inputTokens ?? 0,
+        outputTokens: usage?.outputTokens ?? 0,
+        cacheReadTokens: usage?.cacheReadTokens ?? 0,
+        cacheCreationTokens: usage?.cacheCreationTokens ?? 0,
+        costUsd: usage?.costUsd ?? 0,
+        model: usage?.model ?? session.model,
+      },
+      toolCalls: turnToolCallCount,
+      durationMs: Date.now() - turnStartTime,
+      terminalStatus,
+      ...(requestId ? { requestId } : {}),
+    })
 
     await new Promise<void>((resolve, reject) => {
       let settled = false
@@ -4777,6 +4807,24 @@ export class SessionManager {
               })
             }
           } finally {
+            const usageForLog = terminalUsageForPersistence({
+              finalMeta: observedFinalMeta,
+              billing: terminalEngineBilling,
+              traceId,
+              turnIndex: prevTurns + 1,
+              model: session.model,
+            })
+            recordTurnUsage(
+              mapTurnTerminalStatus({ persistStatus: status, errorCode }),
+              {
+                inputTokens: usageForLog.inputTokens,
+                outputTokens: usageForLog.outputTokens,
+                cacheReadTokens: usageForLog.cacheReadTokens,
+                cacheCreationTokens: usageForLog.cacheCreationTokens,
+                model: session.model,
+              },
+              prevTurns + 1,
+            )
             // A queued tape is durable locally but not yet visible from the
             // authoritative PG history. Never expose a terminal frame until
             // the master has ACKed it; reconnect/relogin must not turn a live
@@ -5495,12 +5543,15 @@ export class SessionManager {
               persistenceAcknowledged = await persistence
             }
 
-            // Emit turn.completed event (triggers event_log + usage_log persistence)
-            const turnDurationMs = Date.now() - turnStartTime
-            eventBus.emit('turn.completed', createEvent('turn.completed', session.agentId, {
-              sessionKey: session.sessionKey,
-              turnIndex: session.turns,
-              usage: {
+            // Unified turn-usage emit (eventPersist writes usage_log).
+            recordTurnUsage(
+              mapTurnTerminalStatus({
+                persistStatus: terminalOverride?.status,
+                errorCode: terminalOverride?.errorCode,
+                hasResult: true,
+                resultIsError: terminalOverride !== null || result.isError,
+              }),
+              {
                 inputTokens: result.usage.inputTokens,
                 outputTokens: result.usage.outputTokens,
                 cacheReadTokens: result.usage.cacheReadTokens,
@@ -5508,12 +5559,8 @@ export class SessionManager {
                 costUsd: result.usage.cost,
                 model: session.model,
               },
-              toolCalls: turnToolCallCount,
-              durationMs: turnDurationMs,
-              // PR2 v1.0.66 — codex-native turn 把 server-owned requestId 透到这里,
-              // 让 event_log / 异步 audit 能关联到 inflightCodexTurns 行。其它路径 undefined。
-              ...(requestId ? { requestId } : {}),
-            }))
+              session.turns,
+            )
 
             // Emit cost.recorded for budget tracking
             eventBus.emit('cost.recorded', createEvent('cost.recorded', session.agentId, {
@@ -5551,6 +5598,9 @@ export class SessionManager {
           // A transient persistence failure stays in the unlimited fsynced
           // retry queue. Do not emit a new user-facing notice and do not expose
           // terminal completion until the authoritative master ACKs it.
+          if (!result) {
+            recordTurnUsage(mapTurnTerminalStatus({ hasResult: false }))
+          }
           if (persistenceAcknowledged) {
             if (terminalErrorForClient) {
               // 审计 R3:errorClass 已是 TurnSummary 的权威字段(各 adapter 的

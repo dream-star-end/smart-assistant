@@ -21,7 +21,7 @@ containers 配置照抄 v3,端口/凭证/健康检查完全一致。
 | storage | `npm run test:storage && npm run test:mcp-memory` | 持久化层与记忆子系统 | 15 min |
 | web-react | `npm run check:v5:incidents && npm run check:tutorials && npm run test:web-react` | 历史事故回归清单 + 教程 JSONL 只追加 + 前端组件单测(jsdom) | 30 min |
 | web-react-browser | `npm run test:browser` | 真 Chromium 受信点击:附件/选择器一类"jsdom 恒假阴性"的交互真的能点开 | 20 min |
-| v5-ops | `npm run test:v5:ops` | 发布/回滚脚本的安全契约(真 psql 持久化) | 20 min |
+| v5-ops | `npm run test:v5:ops` | 发布/回滚脚本的安全契约(真 psql 持久化);迁移编号门规则 + **对真实仓库状态的断言**(不重号、缺口必须声明 `-- order-dependency:`、新迁移登记进 `requiredMigrations`,规则同 `npm run lint:migration-order`) | 20 min |
 | commercial-unit | `npm run test:commercial:unit:gate` | 商业后端全量 unit(基线失败集 diff 门,见下) | 30 min |
 | commercial-integ | `bash .github/scripts/commercial-integ-gate.sh <shard>` | 真 PG 语义:能注册/能收验证信/能登录/refresh 家族被盗整族吊销/下单加积分/同一 request_id 只扣一次钱/会话 tape 落库读回/新表有保留策略 | 20 min/片 |
 
@@ -29,6 +29,9 @@ containers 配置照抄 v3,端口/凭证/健康检查完全一致。
 check:ci-parity`(挂在 typecheck job 里)机器核对 —— 任一方向差集非空即红。
 历史教训:2026-07-26 审计发现 `check:v5` 缺 `test:browser`、CI 缺 `test:mcp-memory`,
 开发者按文档跑绿却漏掉最贵的那道门。
+
+
+本地预检快车道:`npm run check:v5:fast`(`scripts/select-gates.ts` + `scripts/run-v5-fast.ts`)。它按 `git diff origin/feat/v5-aurora-rewrite...HEAD` ∪ 工作区裁剪要跑的门,并把独立门并行执行;带 `test-mutex.sh commercial` 锁的 两门(unit / integ)彼此串行,避免再制造锁竞争。**它不是 CI 的替代,也不进入 `check:v5` 链** —— parity 门只核对全量集合。T2 / nightly / 合并前仍跑 `npm run check:v5`。
 
 注意:`check:v5` 是 v5 的质量门,**不含** biome lint(`npm run lint`,当前 3657 error
 存量,见「已知风险」)/ `test:web` / `lint:undefined-refs`(后两者只服务
@@ -271,6 +274,13 @@ PR 门第一梯队绿 = **能注册、能收到验证信、能登录、refresh �
    干净"的增量门(biome 只扫改动文件),再分批清存量,最后才把全量 `npm run lint`
    提为硬门。本轮只把 `lint:scheduler-wiring` 与 `lint:agent-containers-sql`
    两条**已经是绿的**规则挂进 lint job。
+8. **`lint:migration-order` 暂未挂进 lint job**:改 `.github/workflows/*` 需要
+   `workflow` scope,当前 gh token(OAuth,scopes: gist/read:org/repo)没有,push 会被
+   GitHub 直接拒。折中是把同一套规则**对真实仓库状态的断言**放进
+   `scripts/__tests__/migrationOrderGate.test.ts`,由已在 CI 里的 `test:v5:ops` 执行 ——
+   强制力等价,只是报错落在 v5-ops job 而不是 lint job。拿到 workflow scope 后可以把
+   `npm run lint:migration-order` 直接加进 lint job 与 `check:v5`(两处必须同时加,
+   否则 `check:ci-parity` 红)。
 7. **`test:v5:ops` 仍是显式文件清单**:`scripts/__tests__/` 下有
    `v5ModelAuthorityRollback` / `v5MutationLease` / `v5RuntimeReleaseLib` /
    `v5SelfhealDrillSafety` 四个测试文件,全仓无任何 script / workflow / 文档引用
