@@ -301,15 +301,19 @@ ensure_pg() {
 }
 
 run_migrations() {
-  local url="$1"
+  local url="$1" migration_pgoptions
   log "── 跑 commercial 全量 migration(仓库既有 runner) ──"
   if [[ "$DRY" == 1 ]]; then
-    echo "  [dry-run] 断言 current_database()=$PG_DB; DATABASE_URL=<redacted> REDIS_URL=$REDIS_URL npx --no-install tsx packages/commercial/src/db/migrate.ts"
+    echo "  [dry-run] 断言 current_database()=$PG_DB; migration_profile=v5-selfhost; DATABASE_URL=<redacted> REDIS_URL=$REDIS_URL npx --no-install tsx packages/commercial/src/db/migrate.ts"
     return 0
   fi
   assert_connected_db "$url"
   [[ -d "$REPO_ROOT/node_modules" ]] || die "worktree 无 node_modules,无法跑 migration runner。补救: 先 npm ci。"
-  env DATABASE_URL="$url" REDIS_URL="$REDIS_URL" COMMERCIAL_ENABLED=1 COMMERCIAL_AUTO_MIGRATE=1 \
+  # 0210 的生产 users 1/4 grant 契约不适用于独立 selfhost 用户 ID 空间。
+  # 只把 exact profile 绑到本 migration 子进程；不得 export 到 deploy 的其它步骤。
+  migration_pgoptions="${PGOPTIONS:+${PGOPTIONS} }-c openclaude.migration_profile=v5-selfhost"
+  env PGOPTIONS="$migration_pgoptions" DATABASE_URL="$url" REDIS_URL="$REDIS_URL" \
+    COMMERCIAL_ENABLED=1 COMMERCIAL_AUTO_MIGRATE=1 \
     npx --no-install tsx packages/commercial/src/db/migrate.ts \
     || die "migration 失败。补救: 看上方 [commercial/migrate] 日志;确认连的是 ${PG_DB} 且 pgcrypto 可由库 owner 创建。"
 }
