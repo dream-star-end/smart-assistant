@@ -112,7 +112,7 @@ describe('hook config injection (single policy source)', () => {
     const pre = (settings as { hooks: { PreToolUse: Array<{ matcher: string; hooks: Array<{ command: string }> }> } })
       .hooks.PreToolUse[0]
     assert.equal(pre.matcher, 'Bash|Shell')
-    assert.match(pre.hooks[0].command, /efficiencyPreToolHook\.ts/)
+    assert.match(pre.hooks[0].command, /efficiencyHookRunner\.cjs/)
     assert.match(pre.hooks[0].command, /--protocol=ccb/)
     assert.match(pre.hooks[0].command, /--mode=deny/)
     assert.doesNotMatch(pre.hooks[0].command, /sleep_ge_60|while true/)
@@ -124,7 +124,7 @@ describe('hook config injection (single policy source)', () => {
       hooks: { beforeShellExecution: Array<{ command: string }> }
     }
     assert.equal(hooks.version, 1)
-    assert.match(hooks.hooks.beforeShellExecution[0].command, /efficiencyPreToolHook\.ts/)
+    assert.match(hooks.hooks.beforeShellExecution[0].command, /efficiencyHookRunner\.cjs/)
     assert.match(hooks.hooks.beforeShellExecution[0].command, /--protocol=cursor/)
   })
 })

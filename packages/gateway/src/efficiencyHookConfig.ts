@@ -1,29 +1,26 @@
 /**
  * Engine-session hook injection: CCB settings.json + Cursor hooks.json.
- * Command strings point at efficiencyPreToolHook.ts, which imports
- * agentEfficiencyGuard.ts — one policy source.
+ * Command strings point at efficiencyHookRunner.cjs (fail-open wrapper),
+ * which execs efficiencyPreToolHook.ts. Policy still lives in
+ * agentEfficiencyGuard.ts — this file only builds config.
  */
-import { createRequire } from 'node:module'
+import { randomBytes } from 'node:crypto'
+import { mkdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { resolveGuardMode, type GuardMode } from './agentEfficiencyGuard.js'
 
 export type HookProtocol = 'ccb' | 'cursor'
 
+/** Engine-side backstop (seconds). Our runner times out well below this. */
+export const EFFICIENCY_HOOK_ENGINE_TIMEOUT_SEC = 3
+
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`
 }
 
-export function resolveTsxRunner(execPath = process.execPath): string {
-  try {
-    const require = createRequire(import.meta.url)
-    return `${shellQuote(execPath)} ${shellQuote(require.resolve('tsx/cli'))}`
-  } catch {
-    return `${shellQuote(execPath)} --import tsx`
-  }
-}
-
-export function resolveEfficiencyHookScript(): string {
-  return fileURLToPath(new URL('./efficiencyPreToolHook.ts', import.meta.url))
+export function resolveEfficiencyHookRunner(): string {
+  return fileURLToPath(new URL('./efficiencyHookRunner.cjs', import.meta.url))
 }
 
 export function resolveEfficiencyHookCommand(
@@ -31,7 +28,25 @@ export function resolveEfficiencyHookCommand(
   mode: GuardMode = resolveGuardMode(),
 ): string | null {
   if (mode === 'off') return null
-  return `${resolveTsxRunner()} ${shellQuote(resolveEfficiencyHookScript())} --protocol=${protocol} --mode=${mode}`
+  return `${shellQuote(process.execPath)} ${shellQuote(resolveEfficiencyHookRunner())} --protocol=${protocol} --mode=${mode}`
+}
+
+/** tmp + rename so a crash cannot leave a half-written JSON the engine will parse. */
+export function atomicWriteJsonFile(target: string, value: unknown, mode = 0o600): void {
+  const dir = dirname(target)
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
+  const tmp = join(dir, `.${target.split('/').pop()}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`)
+  try {
+    writeFileSync(tmp, `${JSON.stringify(value)}\n`, { mode })
+    renameSync(tmp, target)
+  } catch (err) {
+    try {
+      unlinkSync(tmp)
+    } catch {
+      /* ignore */
+    }
+    throw err
+  }
 }
 
 export function buildCcbEfficiencySettings(
@@ -44,7 +59,7 @@ export function buildCcbEfficiencySettings(
       PreToolUse: [
         {
           matcher: 'Bash|Shell',
-          hooks: [{ type: 'command', command, timeout: 8 }],
+          hooks: [{ type: 'command', command, timeout: EFFICIENCY_HOOK_ENGINE_TIMEOUT_SEC }],
         },
       ],
     },
@@ -59,7 +74,13 @@ export function buildCursorEfficiencyHooks(
   return {
     version: 1,
     hooks: {
-      beforeShellExecution: [{ command, timeout: 8 }],
+      beforeShellExecution: [
+        {
+          command,
+          timeout: EFFICIENCY_HOOK_ENGINE_TIMEOUT_SEC,
+          failClosed: false,
+        },
+      ],
     },
   }
 }

@@ -259,6 +259,19 @@ describe('oc-cursor wrapper', () => {
     assert.equal(statSync(hooks).mode & 0o777, 0o600)
   })
 
+  test('missing hooks.json fails open and still launches Cursor', () => {
+    const f = fixture()
+    const result = spawnSync(f.wrapper, ['--', 'use platform skill'], {
+      cwd: f.dir,
+      env: { ...f.env, OPENCLAUDE_CURSOR_HOOKS_JSON: join(f.dir, 'missing-hooks.json') },
+      encoding: 'utf8',
+    })
+    assert.equal(result.status, 0, result.stderr)
+    assert.match(result.stderr, /fail-open/)
+    assert.equal(existsSync(join(f.capture, 'hooks.json')), false)
+    assert.equal(readFileSync(join(f.capture, 'hooks-env'), 'utf8').trim(), 'unset')
+  })
+
   test('copies one validated adapter MCP config, approves it, and unsets the source env', () => {
     const f = fixture()
     const config = join(f.dir, 'adapter-mcp.json')

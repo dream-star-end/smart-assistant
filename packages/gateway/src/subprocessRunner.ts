@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, resolve } from 'node:path'
 import { type McpServerConfig, type OpenClaudeConfig, paths } from '@openclaude/storage'
 import { createLogger } from './logger.js'
-import { buildCcbEfficiencySettings } from './efficiencyHookConfig.js'
+import { atomicWriteJsonFile, buildCcbEfficiencySettings } from './efficiencyHookConfig.js'
 import { isV3ContainerRuntime, resolveHostStaticProviderEnv } from './hostStaticProviders.js'
 import type { GoalStateSnapshot, StaticProviderKeys } from '@openclaude/protocol'
 import { modelHintAppliedTotal } from './metrics.js'
@@ -1847,7 +1847,7 @@ export class SubprocessRunner extends EventEmitter {
       const efficiencySettings = buildCcbEfficiencySettings()
       if (efficiencySettings) {
         const settingsPath = resolve(sessionDir, 'settings.json')
-        writeFileSync(settingsPath, JSON.stringify(efficiencySettings), { mode: 0o600 })
+        atomicWriteJsonFile(settingsPath, efficiencySettings, 0o600)
         out.settingsFile = settingsPath
       }
     } catch (err) {

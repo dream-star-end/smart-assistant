@@ -29,7 +29,7 @@ EOF
 # it inside an `|| true` cleanup path.
 for required_tool in /usr/bin/sudo /usr/bin/test /bin/cat /usr/bin/mktemp \
   /bin/rm /bin/sleep /usr/bin/setsid /usr/bin/stat /usr/bin/id /bin/mkdir \
-  /bin/cp /bin/chmod; do
+  /bin/cp /bin/chmod /bin/mv; do
   [ -x "$required_tool" ] || die "runtime image is missing $required_tool"
 done
 
@@ -186,25 +186,37 @@ if [ -n "$mcp_config" ]; then
 fi
 unset OPENCLAUDE_CURSOR_MCP_CONFIG
 
-# Optional platform efficiency hooks.json (same validation as MCP config).
+# Optional platform efficiency hooks.json. Fail-open: a bad/missing hooks
+# file must never take down the Cursor session.
 hooks_json=${OPENCLAUDE_CURSOR_HOOKS_JSON:-}
 if [ -n "$hooks_json" ]; then
-  case "$hooks_json" in /*) ;; *) die "hooks path must be absolute" ;; esac
-  [ ! -L "$hooks_json" ] || die "hooks must not be a symlink"
-  [ -f "$hooks_json" ] || die "hooks must be a regular file"
-  hooks_uid=$(/usr/bin/stat -c %u -- "$hooks_json" 2>/dev/null) \
-    || die "hooks metadata is unavailable"
-  current_uid=$(/usr/bin/id -u) || die "current uid is unavailable"
-  [ "$hooks_uid" = "$current_uid" ] || die "hooks owner is invalid"
-  hooks_mode=$(/usr/bin/stat -c %a -- "$hooks_json" 2>/dev/null) \
-    || die "hooks metadata is unavailable"
-  [ "$hooks_mode" = "600" ] || die "hooks mode must be 0600"
-  /bin/mkdir -m 700 -- "$cursor_home/.cursor" 2>/dev/null || true
-  [ -d "$cursor_home/.cursor" ] || die "cannot create ephemeral Cursor config directory"
-  /bin/cp -- "$hooks_json" "$cursor_home/.cursor/hooks.json" \
-    || die "cannot copy Cursor hooks"
-  /bin/chmod 600 -- "$cursor_home/.cursor/hooks.json" \
-    || die "cannot secure Cursor hooks"
+  hooks_ok=0
+  case "$hooks_json" in /*) hooks_ok=1 ;; esac
+  if [ "$hooks_ok" -eq 1 ] && [ ! -L "$hooks_json" ] && [ -f "$hooks_json" ]; then
+    hooks_uid=$(/usr/bin/stat -c %u -- "$hooks_json" 2>/dev/null || echo "")
+    current_uid=$(/usr/bin/id -u 2>/dev/null || echo "")
+    hooks_mode=$(/usr/bin/stat -c %a -- "$hooks_json" 2>/dev/null || echo "")
+    if [ -n "$hooks_uid" ] && [ "$hooks_uid" = "$current_uid" ] && [ "$hooks_mode" = "600" ]; then
+      /bin/mkdir -m 700 -- "$cursor_home/.cursor" 2>/dev/null || true
+      if [ -d "$cursor_home/.cursor" ]; then
+        hooks_tmp="$cursor_home/.cursor/hooks.json.tmp"
+        if /bin/cp -- "$hooks_json" "$hooks_tmp" \
+          && /bin/chmod 600 -- "$hooks_tmp" \
+          && /bin/mv -f -- "$hooks_tmp" "$cursor_home/.cursor/hooks.json"; then
+          :
+        else
+          /bin/rm -f -- "$hooks_tmp" 2>/dev/null || true
+          echo "[oc-efficiency-guard] fail-open: hooks.json install failed" >&2
+        fi
+      else
+        echo "[oc-efficiency-guard] fail-open: cannot create Cursor config dir" >&2
+      fi
+    else
+      echo "[oc-efficiency-guard] fail-open: hooks.json rejected (uid/mode)" >&2
+    fi
+  else
+    echo "[oc-efficiency-guard] fail-open: hooks.json missing or not a regular file" >&2
+  fi
 fi
 unset OPENCLAUDE_CURSOR_HOOKS_JSON
 
