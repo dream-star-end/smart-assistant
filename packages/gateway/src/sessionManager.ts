@@ -52,6 +52,7 @@ import { isModelAuthorityRequired } from './modelAuthority.js'
 import type { CodexProviderConfigOverride } from './engine/codexShared.js'
 import type { GrokRouteOverride } from './engine/grokAdapter.js'
 import { eventBus, createEvent } from './eventBus.js'
+import { createTurnUsageRecorder, mapTurnTerminalStatus, type TurnTerminalStatus } from './turnUsage.js'
 import { createLogger } from './logger.js'
 import {
   deriveLosslessTurnKey,
@@ -1510,6 +1511,12 @@ export class SessionManager {
   /** Cooperative Stop grace before the gateway escalates to runner shutdown.
    * Private test seam; the production boundary remains five seconds. */
   private _terminalRequestGraceMs = 5_000
+  /** Outer deadline on the post-shutdown stdout-close barrier. The barrier
+   * keeps late paid bytes inside the turn, but a descendant that escaped the
+   * supervisor's process group can hold the pipe open forever; without a
+   * deadline the turn never reaches a terminal state and the client sits in
+   * "stopping" indefinitely. Private test seam. */
+  private _terminalOutputDrainTimeoutMs = 15_000
   /**
    * F2 — owner 级 tail 预算,按 ownerTurnKey 键控,**SessionManager 级**(跨会话共享:
    * 多个 delegate 子会话共用同一 parent ownerTurnKey 时同领一份 64 额度,而非各领 64)。
@@ -4196,6 +4203,39 @@ export class SessionManager {
     return Math.min(30_000, 2000 * 2 ** attempt) + Math.random() * 1000
   }
 
+  /** Wait for the runner's stdout to really close, but never forever.
+   *
+   * The supervisor's own shutdown is already bounded, so reaching the deadline
+   * here means a descendant outlived a process-group SIGKILL and still owns
+   * the pipe. Giving up costs at most the bytes that descendant has yet to
+   * write; refusing to give up costs the turn its terminal state. */
+  private async _awaitBoundedOutputDrain(
+    runner: Pick<EngineAdapter, 'waitForOutputDrain'>,
+    session: AgentSession,
+  ): Promise<void> {
+    const timeoutMs = this._terminalOutputDrainTimeoutMs
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      await runner.waitForOutputDrain()
+      return
+    }
+    let timer: NodeJS.Timeout | undefined
+    const drained = await Promise.race([
+      // A barrier that settles after the deadline must not resurface as an
+      // unhandled rejection once we have already moved on.
+      runner.waitForOutputDrain().then(() => true, () => true),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), timeoutMs)
+      }),
+    ])
+    if (timer) clearTimeout(timer)
+    if (drained) return
+    log.error('terminal output drain deadline exceeded; finalizing turn without stdout close', {
+      sessionKey: session.sessionKey,
+      provider: session.providerTag,
+      timeoutMs,
+    })
+  }
+
   // (auth 错误关键字分类已下沉 engine/ccbAdapter.ts —— 错误字符串是 CCB 底座私有
   //  知识;本层只消费 TurnSummary.errorKind === 'auth'。)
 
@@ -4322,6 +4362,35 @@ export class SessionManager {
     const prevCostUSD = session.totalCostUSD
     const prevTurns = session.turns
     const prevLastCcbCost = session._lastCcbCumulativeCost
+    const turnUsage = createTurnUsageRecorder()
+    const recordTurnUsage = (
+      terminalStatus: TurnTerminalStatus,
+      usage?: {
+        inputTokens?: number
+        outputTokens?: number
+        cacheReadTokens?: number
+        cacheCreationTokens?: number
+        costUsd?: number
+        model?: string
+      },
+      turnIndex = Math.max(session.turns, prevTurns + 1),
+    ): boolean => turnUsage.record({
+      agentId: session.agentId,
+      sessionKey: session.sessionKey,
+      turnIndex,
+      usage: {
+        inputTokens: usage?.inputTokens ?? 0,
+        outputTokens: usage?.outputTokens ?? 0,
+        cacheReadTokens: usage?.cacheReadTokens ?? 0,
+        cacheCreationTokens: usage?.cacheCreationTokens ?? 0,
+        costUsd: usage?.costUsd ?? 0,
+        model: usage?.model ?? session.model,
+      },
+      toolCalls: turnToolCallCount,
+      durationMs: Date.now() - turnStartTime,
+      terminalStatus,
+      ...(requestId ? { requestId } : {}),
+    })
 
     await new Promise<void>((resolve, reject) => {
       let settled = false
@@ -4738,6 +4807,24 @@ export class SessionManager {
               })
             }
           } finally {
+            const usageForLog = terminalUsageForPersistence({
+              finalMeta: observedFinalMeta,
+              billing: terminalEngineBilling,
+              traceId,
+              turnIndex: prevTurns + 1,
+              model: session.model,
+            })
+            recordTurnUsage(
+              mapTurnTerminalStatus({ persistStatus: status, errorCode }),
+              {
+                inputTokens: usageForLog.inputTokens,
+                outputTokens: usageForLog.outputTokens,
+                cacheReadTokens: usageForLog.cacheReadTokens,
+                cacheCreationTokens: usageForLog.cacheCreationTokens,
+                model: session.model,
+              },
+              prevTurns + 1,
+            )
             // A queued tape is durable locally but not yet visible from the
             // authoritative PG history. Never expose a terminal frame until
             // the master has ACKed it; reconnect/relogin must not turn a live
@@ -4812,7 +4899,7 @@ export class SessionManager {
               'RUNNER_SHUTDOWN_FAILED',
             )
           }
-          await runner.waitForOutputDrain()
+          await this._awaitBoundedOutputDrain(runner, session)
           // Let synchronously parsed final/result frames schedule their
           // summary/finalization microtasks before deciding a partial is needed.
           await Promise.resolve()
@@ -5456,12 +5543,15 @@ export class SessionManager {
               persistenceAcknowledged = await persistence
             }
 
-            // Emit turn.completed event (triggers event_log + usage_log persistence)
-            const turnDurationMs = Date.now() - turnStartTime
-            eventBus.emit('turn.completed', createEvent('turn.completed', session.agentId, {
-              sessionKey: session.sessionKey,
-              turnIndex: session.turns,
-              usage: {
+            // Unified turn-usage emit (eventPersist writes usage_log).
+            recordTurnUsage(
+              mapTurnTerminalStatus({
+                persistStatus: terminalOverride?.status,
+                errorCode: terminalOverride?.errorCode,
+                hasResult: true,
+                resultIsError: terminalOverride !== null || result.isError,
+              }),
+              {
                 inputTokens: result.usage.inputTokens,
                 outputTokens: result.usage.outputTokens,
                 cacheReadTokens: result.usage.cacheReadTokens,
@@ -5469,12 +5559,8 @@ export class SessionManager {
                 costUsd: result.usage.cost,
                 model: session.model,
               },
-              toolCalls: turnToolCallCount,
-              durationMs: turnDurationMs,
-              // PR2 v1.0.66 — codex-native turn 把 server-owned requestId 透到这里,
-              // 让 event_log / 异步 audit 能关联到 inflightCodexTurns 行。其它路径 undefined。
-              ...(requestId ? { requestId } : {}),
-            }))
+              session.turns,
+            )
 
             // Emit cost.recorded for budget tracking
             eventBus.emit('cost.recorded', createEvent('cost.recorded', session.agentId, {
@@ -5512,6 +5598,9 @@ export class SessionManager {
           // A transient persistence failure stays in the unlimited fsynced
           // retry queue. Do not emit a new user-facing notice and do not expose
           // terminal completion until the authoritative master ACKs it.
+          if (!result) {
+            recordTurnUsage(mapTurnTerminalStatus({ hasResult: false }))
+          }
           if (persistenceAcknowledged) {
             if (terminalErrorForClient) {
               // 审计 R3:errorClass 已是 TurnSummary 的权威字段(各 adapter 的
