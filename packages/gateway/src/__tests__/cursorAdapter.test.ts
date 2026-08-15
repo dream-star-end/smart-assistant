@@ -882,4 +882,75 @@ console.log(JSON.stringify({type:'result',subtype:'success',is_error:false}));
     assert.throws(() => adapter.setModel('gpt-5.3-codex'), /not allowlisted/)
     assert.throws(() => adapter.setEffortLevel('high'), /does not expose/)
   })
+
+  // The wrapper starts the CLI through setsid, so a descendant that outlives
+  // it sits in a session no signal of ours reaches while still holding this
+  // turn's stdout. 'close' then never fires. Shutdown used to await that
+  // barrier forever, which left the turn without a terminal state and the
+  // client stuck in "stopping".
+  test('shutdown gives up on a descendant that keeps stdout open', { timeout: 20_000 }, async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-escaped-'))
+    const fake = path.join(dir, 'fake.cjs')
+    const escapedPidFile = path.join(dir, 'escaped.pid')
+    await writeFile(path.join(dir, 'persona.md'), 'PERSONA')
+    await writeFile(
+      fake,
+      `#!/usr/bin/env node
+const { spawn } = require('node:child_process'); const fs = require('node:fs');
+const escaped = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'],
+  { detached: true, stdio: ['ignore', 'inherit', 'inherit'] });
+escaped.unref();
+fs.writeFileSync(${JSON.stringify(escapedPidFile)}, String(escaped.pid));
+console.log(JSON.stringify({ type: 'assistant', text: 'working' }));
+setInterval(() => {}, 1000);
+`,
+    )
+    await chmod(fake, 0o755)
+    const oldBin = process.env.OC_CURSOR_WRAPPER_BIN
+    const oldGrace = process.env.OPENCLAUDE_CURSOR_SHUTDOWN_GRACE_MS
+    const oldFinal = process.env.OPENCLAUDE_CURSOR_SHUTDOWN_FINAL_DRAIN_MS
+    process.env.OC_CURSOR_WRAPPER_BIN = fake
+    process.env.OPENCLAUDE_CURSOR_SHUTDOWN_GRACE_MS = '150'
+    process.env.OPENCLAUDE_CURSOR_SHUTDOWN_FINAL_DRAIN_MS = '150'
+    let escapedPid: number | undefined
+    try {
+      const adapter = new CursorAdapter(opts(dir))
+      adapter.on('error', () => {})
+      const run = adapter.submitTurn({
+        input: 'turn that escapes its process group',
+        requestId: REQUEST,
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run.submitted
+      for (let i = 0; i < 200 && escapedPid === undefined; i += 1) {
+        try {
+          escapedPid = Number.parseInt(await readFile(escapedPidFile, 'utf8'), 10)
+        } catch {
+          await new Promise((ready) => setTimeout(ready, 25))
+        }
+      }
+      assert.ok(escapedPid, 'the fake wrapper never spawned its escaped descendant')
+
+      adapter.interrupt()
+      const started = Date.now()
+      await adapter.shutdown()
+      await adapter.waitForOutputDrain()
+      const elapsed = Date.now() - started
+      assert.ok(elapsed < 10_000, `shutdown must be bounded, took ${elapsed}ms`)
+      // The escalation is what makes the wait bounded rather than lucky: the
+      // wrapper itself must be gone even though its descendant is not.
+      assert.equal(adapter.isRunning, false)
+      assert.equal(process.kill(escapedPid, 0), true)
+    } finally {
+      if (escapedPid) {
+        try { process.kill(escapedPid, 'SIGKILL') } catch { /* already reaped */ }
+      }
+      restoreEnv('OC_CURSOR_WRAPPER_BIN', oldBin)
+      restoreEnv('OPENCLAUDE_CURSOR_SHUTDOWN_GRACE_MS', oldGrace)
+      restoreEnv('OPENCLAUDE_CURSOR_SHUTDOWN_FINAL_DRAIN_MS', oldFinal)
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
 })

@@ -30,7 +30,13 @@ import type {
 import { engineSessionId } from './engineSessionId.js'
 import { type EngineCreateOpts, registerEngine } from './registry.js'
 import { buildCodexEnv } from './codexShared.js'
+import { createLogger } from '../logger.js'
+import { killProcessGroup, shutdownTimeoutMs, waitForCloseWithin } from '../processGroupShutdown.js'
 
+const log = createLogger({ module: 'grokAdapter' })
+
+const GROK_SHUTDOWN_GRACE_DEFAULT_MS = 3_000
+const GROK_SHUTDOWN_FINAL_DRAIN_DEFAULT_MS = 3_000
 const GROK_UPSTREAM_MODEL = 'grok-4.6'
 const ROUTE_TOKEN_RE = /^[0-9a-f]{64}$/
 const EMPTY_SIGNALS: Readonly<PhantomSignals> = Object.freeze({
@@ -138,6 +144,7 @@ interface GrokTurnContext {
   pendingToolIds: Set<string>
   stderr: string
   terminal: boolean
+  procClosed: boolean
   interrupted: boolean
   errorDetail: string | null
   lastUsage: ReturnType<typeof grokUsage>
@@ -204,6 +211,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       pendingToolIds: new Set(),
       stderr: '',
       terminal: false,
+      procClosed: false,
       interrupted: false,
       errorDetail: null,
       lastUsage: grokUsage({}),
@@ -319,6 +327,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       this.emit('error', err)
     })
     proc.once('close', (code, signal) => {
+      ctx.procClosed = true
       if (stdoutBuffer.trim()) this.handleLine(ctx, stdoutBuffer.trim())
       this.resolveDrain?.()
       this.resolveDrain = null
@@ -579,16 +588,51 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     const ctx = this.active
     if (!ctx?.proc || ctx.proc.killed) return false
     ctx.interrupted = true
-    try { process.kill(-ctx.proc.pid!, 'SIGINT') } catch { ctx.proc.kill('SIGINT') }
+    killProcessGroup(ctx.proc, 'SIGINT')
     return true
   }
 
+  /** Stop has to reach a terminal state even when a tool descendant escapes
+   * the CLI's process group and keeps this turn's stdout open. Escalate to a
+   * process-group SIGKILL, then put a deadline on the close barrier: an
+   * unbounded wait leaves the turn without a terminal event and the client
+   * stuck in "stopping" indefinitely. */
   async shutdown(): Promise<void> {
     const ctx = this.active
-    if (ctx?.proc && !ctx.proc.killed) {
-      try { process.kill(-ctx.proc.pid!, 'SIGTERM') } catch { ctx.proc.kill('SIGTERM') }
+    if (!ctx) return
+    const proc = ctx.proc
+    if (!proc || ctx.procClosed) {
+      await this.waitForOutputDrain()
+      return
     }
-    await this.waitForOutputDrain()
+    const closeBarrier = this.drain
+    killProcessGroup(proc, 'SIGTERM')
+    let closed = await waitForCloseWithin(
+      closeBarrier,
+      shutdownTimeoutMs('OPENCLAUDE_GROK_SHUTDOWN_GRACE_MS', GROK_SHUTDOWN_GRACE_DEFAULT_MS),
+    )
+    if (!closed) {
+      killProcessGroup(proc, 'SIGKILL')
+      closed = await waitForCloseWithin(
+        closeBarrier,
+        shutdownTimeoutMs(
+          'OPENCLAUDE_GROK_SHUTDOWN_FINAL_DRAIN_MS',
+          GROK_SHUTDOWN_FINAL_DRAIN_DEFAULT_MS,
+        ),
+      )
+    }
+    if (closed) return
+    log.error('grok stdout never closed after process-group SIGKILL', {
+      sessionKey: this.opts.sessionKey,
+      pid: proc.pid,
+    })
+    // Release the barrier so the caller can persist a terminal snapshot. The
+    // 'close' handler stays attached: if the escaped descendant ever exits,
+    // its late output is still parsed into this turn.
+    this.resolveDrain?.()
+    this.resolveDrain = null
+    if (this.active === ctx) this.active = null
+    try { proc.unref() } catch { /* already detached */ }
   }
 
   waitForOutputDrain(): Promise<void> { return this.drain }

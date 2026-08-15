@@ -1307,6 +1307,7 @@ const DELEGATE_QUEUE_POLL_DEFAULT_MS = 2_500
  * close barrier and turn settlement before freezing its transcript. */
 const DELEGATE_INTERRUPT_DRAIN_DEFAULT_MS = 5_000
 const DELEGATE_SHUTDOWN_WAIT_DEFAULT_MS = 8_000
+const DELEGATE_OUTPUT_DRAIN_WAIT_DEFAULT_MS = 15_000
 /** 同时排队者上限:内存高压期每个等待者都挂着一条 HTTP 请求,不设上限会把
  *  "排队"本身堆成第二波雪崩;超出直接按原闸形状立即拒。 */
 export const DELEGATE_QUEUE_MAX_WAITERS = 8
@@ -10195,7 +10196,22 @@ export class Gateway {
               error: (shutdown.error as Error)?.message ?? String(shutdown.error),
             })
           }
-          await session.runner.waitForOutputDrain()
+          const drained = await waitForDelegateSettlement(
+            session.runner.waitForOutputDrain(),
+            parseNonNegativeMs(
+              'OPENCLAUDE_DELEGATE_OUTPUT_DRAIN_WAIT_MS',
+              DELEGATE_OUTPUT_DRAIN_WAIT_DEFAULT_MS,
+            ),
+          )
+          if (!drained.settled) {
+            // A descendant that survived the runner's process-group SIGKILL
+            // still owns stdout. Stop waiting: the delegate call must return a
+            // result to its caller instead of hanging on an escaped process.
+            this.log.error('delegate output drain exceeded terminal deadline', {
+              targetAgentId,
+              sessionKey,
+            })
+          }
           try {
             await submitPromise
             settlement = { settled: true }

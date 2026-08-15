@@ -28,6 +28,11 @@ function config(): OpenClaudeConfig {
   } as unknown as OpenClaudeConfig
 }
 
+function restoreEnv(name: string, value: string | undefined): void {
+  if (value === undefined) Reflect.deleteProperty(process.env, name)
+  else process.env[name] = value
+}
+
 function createOpts(cwd: string): EngineCreateOpts {
   return {
     sessionKey: 'agent:main:webchat:dm:grok-test',
@@ -221,6 +226,77 @@ fs.writeFileSync(process.env.FAKE_GROK_READY, 'ready')
     } finally {
       if (previousBin === undefined) delete process.env.OC_GROK_CLI_BIN; else process.env.OC_GROK_CLI_BIN = previousBin
       if (previousReady === undefined) delete process.env.FAKE_GROK_READY; else process.env.FAKE_GROK_READY = previousReady
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  // A tool child that escapes the CLI's process group keeps this turn's stdout
+  // open, so 'close' never fires. Shutdown used to await that barrier forever,
+  // leaving the turn without a terminal state and the client stuck in
+  // "stopping".
+  test('shutdown gives up on a descendant that keeps stdout open', { timeout: 20_000 }, async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-grok-escaped-'))
+    const fake = path.join(dir, 'fake-grok-escaped.cjs')
+    const escapedPidFile = path.join(dir, 'escaped.pid')
+    await writeFile(fake, `#!/usr/bin/env node
+const { spawn } = require('node:child_process')
+const fs = require('node:fs')
+const escaped = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'],
+  { detached: true, stdio: ['ignore', 'inherit', 'inherit'] })
+escaped.unref()
+fs.writeFileSync(process.env.FAKE_GROK_ESCAPED_PID, String(escaped.pid))
+setInterval(() => {}, 1000)
+`)
+    await chmod(fake, 0o755)
+    const previousBin = process.env.OC_GROK_CLI_BIN
+    const previousPidFile = process.env.FAKE_GROK_ESCAPED_PID
+    const previousGrace = process.env.OPENCLAUDE_GROK_SHUTDOWN_GRACE_MS
+    const previousFinal = process.env.OPENCLAUDE_GROK_SHUTDOWN_FINAL_DRAIN_MS
+    process.env.OC_GROK_CLI_BIN = fake
+    process.env.FAKE_GROK_ESCAPED_PID = escapedPidFile
+    process.env.OPENCLAUDE_GROK_SHUTDOWN_GRACE_MS = '150'
+    process.env.OPENCLAUDE_GROK_SHUTDOWN_FINAL_DRAIN_MS = '150'
+    let escapedPid: number | undefined
+    try {
+      const adapter = new GrokAdapter(createOpts(dir))
+      adapter.setGrokRoute({
+        baseUrl: `http://127.0.0.1:18789/internal/v5/grok-relay/route/${TOKEN}/v1`,
+        routeToken: TOKEN,
+      })
+      adapter.on('error', () => {})
+      const run = adapter.submitTurn({
+        input: 'turn that escapes its process group',
+        requestId: REQUEST_ID,
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run.submitted
+      for (let i = 0; i < 200 && escapedPid === undefined; i += 1) {
+        try {
+          escapedPid = Number.parseInt(await readFile(escapedPidFile, 'utf8'), 10)
+        } catch {
+          await new Promise<void>((ready) => setTimeout(ready, 25))
+        }
+      }
+      assert.ok(escapedPid, 'the fake CLI never spawned its escaped descendant')
+
+      adapter.interrupt()
+      const started = Date.now()
+      await adapter.shutdown()
+      await adapter.waitForOutputDrain()
+      const elapsed = Date.now() - started
+      assert.ok(elapsed < 10_000, `shutdown must be bounded, took ${elapsed}ms`)
+      assert.equal(adapter.isRunning, false)
+      assert.equal(process.kill(escapedPid, 0), true)
+    } finally {
+      if (escapedPid) {
+        try { process.kill(escapedPid, 'SIGKILL') } catch { /* already reaped */ }
+      }
+      restoreEnv('OC_GROK_CLI_BIN', previousBin)
+      restoreEnv('FAKE_GROK_ESCAPED_PID', previousPidFile)
+      restoreEnv('OPENCLAUDE_GROK_SHUTDOWN_GRACE_MS', previousGrace)
+      restoreEnv('OPENCLAUDE_GROK_SHUTDOWN_FINAL_DRAIN_MS', previousFinal)
       await rm(dir, { recursive: true, force: true })
     }
   })

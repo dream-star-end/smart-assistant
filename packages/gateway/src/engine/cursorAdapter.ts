@@ -20,11 +20,17 @@ import type { EngineAdapter, EngineCapabilities, EngineTurnRun, TurnParams } fro
 import type { EngineExternalBillingEvent, PartialSnapshot, PhantomSignals, SegmentRecord, TurnSummary, TurnToolEntry } from './engineEvents.js'
 import { type EngineCreateOpts, registerEngine } from './registry.js'
 import { classifyRunError } from '../errorClassify.js'
+import { createLogger } from '../logger.js'
 import { resolveMcpMemoryEntry } from '../mcpMemoryEntry.js'
 import { getPlatformPrompt } from '../platformPrompts.js'
+import { killProcessGroup, shutdownTimeoutMs, waitForCloseWithin } from '../processGroupShutdown.js'
 import { buildPromptContext } from '../promptSlots.js'
 
+const log = createLogger({ module: 'cursorAdapter' })
+
 const REQUEST_ID_RE = /^[0-9a-f]{32}$/
+const CURSOR_SHUTDOWN_GRACE_DEFAULT_MS = 3_000
+const CURSOR_SHUTDOWN_FINAL_DRAIN_DEFAULT_MS = 3_000
 const EMPTY_SIGNALS: PhantomSignals = { apiState: 'unknown', skipReason: null }
 export const CURSOR_MAX_PROMPT_ARG_BYTES = 96 * 1024
 export const CURSOR_MAX_TURN_PAYLOAD_BYTES = 48 * 1024
@@ -107,7 +113,7 @@ interface TurnCtx {
   params: TurnParams; startedAt: number; proc: ChildProcessByStdio<null, Readable, Readable> | null
   assistantText: string; thinkingText: string; assistantSegments: SegmentRecord[]; thinkingSegments: SegmentRecord[]
   tools: Map<string, TurnToolEntry>; pending: Set<string>; startedTools: Map<string, number>
-  stderr: string; terminal: boolean; interrupted: boolean; error: string | null; usage?: ReportedUsage
+  stderr: string; terminal: boolean; procClosed: boolean; interrupted: boolean; error: string | null; usage?: ReportedUsage
   assistantPartialText: string; pendingAssistantText: string | null
   assistantSegmentClosed: boolean; thinkingSegmentClosed: boolean
   contextDir: string | null
@@ -482,7 +488,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
   submitTurn(params: TurnParams): EngineTurnRun {
     let resolve!: (value: TurnSummary | null) => void
     const summary = new Promise<TurnSummary | null>((r) => { resolve = r })
-    const ctx: TurnCtx = { params, startedAt: Date.now(), proc: null, assistantText: '', thinkingText: '', assistantSegments: [], thinkingSegments: [], tools: new Map(), pending: new Set(), startedTools: new Map(), stderr: '', terminal: false, interrupted: false, error: null, assistantPartialText: '', pendingAssistantText: null, assistantSegmentClosed: false, thinkingSegmentClosed: false, contextDir: null, rawToSafeToolId: new Map(), safeToRawToolId: new Map(), fallbackToolSequence: 0, resolve }
+    const ctx: TurnCtx = { params, startedAt: Date.now(), proc: null, assistantText: '', thinkingText: '', assistantSegments: [], thinkingSegments: [], tools: new Map(), pending: new Set(), startedTools: new Map(), stderr: '', terminal: false, procClosed: false, interrupted: false, error: null, assistantPartialText: '', pendingAssistantText: null, assistantSegmentClosed: false, thinkingSegmentClosed: false, contextDir: null, rawToSafeToolId: new Map(), safeToRawToolId: new Map(), fallbackToolSequence: 0, resolve }
     this.active = ctx; this.lastActivityAt = Date.now(); this.drain = new Promise((r) => { this.resolveDrain = r })
     const submitted = this.spawnTurn(ctx).catch((err) => { this.cleanupContextDir(ctx); if (!ctx.terminal) this.finish(ctx, String(err)); this.resolveDrain?.(); this.resolveDrain = null; if (this.active === ctx) this.active = null; throw err })
     return { submitted, summary, end: () => this.forceEnd(ctx), getPartialSnapshot: () => snapshot(ctx), getPhantomSignals: () => ({ ...EMPTY_SIGNALS }), get finalized() { return ctx.terminal }, get pendingToolCalls() { return ctx.pending.size } }
@@ -618,6 +624,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         this.emit('error', err)
       })
       proc.once('close', (code, signal) => {
+        ctx.procClosed = true
         if (buffer.trim()) this.handleLine(ctx, buffer.trim())
         this.flushPendingAssistant(ctx, false)
         this.cleanupContextDir(ctx)
@@ -757,17 +764,53 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
       this.cleanupContextDir(ctx)
       return
     }
-    try { process.kill(-ctx.proc.pid!, 'SIGTERM') } catch { ctx.proc.kill('SIGTERM') }
+    killProcessGroup(ctx.proc, 'SIGTERM')
   }
-  interrupt(): boolean { const c = this.active; if (!c?.proc || c.proc.killed) return false; c.interrupted = true; try { process.kill(-c.proc.pid!, 'SIGINT') } catch { c.proc.kill('SIGINT') }; return true }
+  interrupt(): boolean { const c = this.active; if (!c?.proc || c.proc.killed) return false; c.interrupted = true; killProcessGroup(c.proc, 'SIGINT'); return true }
+  /** Stop has to reach a terminal state even when the CLI escapes us. The
+   * wrapper runs the CLI through setsid, so a descendant that outlives the
+   * wrapper sits in a session no signal of ours can address while still
+   * holding this turn's stdout. Escalate to a process-group SIGKILL, then put
+   * a deadline on the close barrier: an unbounded wait leaves the turn without
+   * a terminal event and the client stuck in "stopping" indefinitely. */
   async shutdown(): Promise<void> {
-    const c = this.active
-    if (c?.proc && !c.proc.killed) {
-      try { process.kill(-c.proc.pid!, 'SIGTERM') } catch { c.proc.kill('SIGTERM') }
-    } else if (c) {
-      this.cleanupContextDir(c)
+    const ctx = this.active
+    if (!ctx) return
+    const proc = ctx.proc
+    if (!proc || ctx.procClosed) {
+      this.cleanupContextDir(ctx)
+      await this.waitForOutputDrain()
+      return
     }
-    await this.waitForOutputDrain()
+    const closeBarrier = this.drain
+    killProcessGroup(proc, 'SIGTERM')
+    let closed = await waitForCloseWithin(
+      closeBarrier,
+      shutdownTimeoutMs('OPENCLAUDE_CURSOR_SHUTDOWN_GRACE_MS', CURSOR_SHUTDOWN_GRACE_DEFAULT_MS),
+    )
+    if (!closed) {
+      killProcessGroup(proc, 'SIGKILL')
+      closed = await waitForCloseWithin(
+        closeBarrier,
+        shutdownTimeoutMs(
+          'OPENCLAUDE_CURSOR_SHUTDOWN_FINAL_DRAIN_MS',
+          CURSOR_SHUTDOWN_FINAL_DRAIN_DEFAULT_MS,
+        ),
+      )
+    }
+    if (closed) return
+    log.error('cursor stdout never closed after process-group SIGKILL', {
+      sessionKey: this.opts.sessionKey,
+      pid: proc.pid,
+    })
+    // Release the barrier so the caller can persist a terminal snapshot. The
+    // 'close' handler stays attached: if the escaped descendant ever exits,
+    // its late output is still parsed into this turn.
+    this.cleanupContextDir(ctx)
+    this.resolveDrain?.()
+    this.resolveDrain = null
+    if (this.active === ctx) this.active = null
+    try { proc.unref() } catch { /* already detached */ }
   }
   waitForOutputDrain(): Promise<void> { return this.drain }
   get nativeSessionId(): null { return null }
