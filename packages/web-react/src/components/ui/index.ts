@@ -43,7 +43,7 @@ export { EmptyState, Panel, PanelHeader } from "./Panel";
 export { Popover, PopoverContent, PopoverTrigger } from "./Popover";
 export { Progress, type ProgressProps } from "./Progress";
 export { Select, type SelectOption, type SelectProps } from "./Select";
-export { Sheet } from "./Sheet";
+export { MOBILE_SESSION_NATIVE_DISMISS, Sheet } from "./Sheet";
 export { Skeleton } from "./Skeleton";
 export { Spinner } from "./Spinner";
 export { StatCard, StatCardRow, type StatDelta, type StatTone } from "./StatCard";

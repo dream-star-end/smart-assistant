@@ -13,6 +13,12 @@ import { cn } from "../../lib/utils";
  */
 export type SheetSide = "left" | "right" | "bottom";
 
+/**
+ * Harmony 原生壳关闭移动会话抽屉的唯一 DOM 契约。版本放在值里，未来结构变化必须显式
+ * 升版，避免原生层退化成匹配任意 dialog / overlay 的脆弱选择器。
+ */
+export const MOBILE_SESSION_NATIVE_DISMISS = "mobile-session-v1" as const;
+
 const sheetVariants = cva(
   "fixed z-50 flex flex-col bg-sidebar shadow-float outline-none transition-transform",
   {
@@ -41,6 +47,7 @@ export function Sheet({
   onOpenChange,
   side = "left",
   srTitle = "侧边面板",
+  nativeDismissMarker,
   className,
   overlayClassName,
   children,
@@ -49,6 +56,8 @@ export function Sheet({
   onOpenChange: (open: boolean) => void;
   side?: SheetSide;
   srTitle?: string;
+  /** 仅移动会话导航传入；其它 Sheet 不得复用这个原生关闭标记。 */
+  nativeDismissMarker?: typeof MOBILE_SESSION_NATIVE_DISMISS;
   className?: string;
   /** 遮罩附加类。窄屏专属抽屉应传 md:hidden,避免移动→桌面 resize 后遮罩残留挡屏。 */
   overlayClassName?: string;
@@ -65,6 +74,7 @@ export function Sheet({
         />
         <RD.Content
           aria-describedby={undefined}
+          data-aurora-native-dismiss={nativeDismissMarker}
           className={cn(sheetVariants({ side }), className)}
         >
           <RD.Title className="sr-only">{srTitle}</RD.Title>

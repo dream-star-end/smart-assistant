@@ -28,6 +28,7 @@ export function AuthGate({
   error,
   onRetrySession,
   onBack,
+  showHomeBack = true,
   theme,
   onCycleTheme,
   turnstileBypass,
@@ -63,6 +64,8 @@ export function AuthGate({
   /** Recover a valid refresh-cookie session after a transient boot fault. */
   onRetrySession?: () => void;
   onBack?: () => void;
+  /** 原生客户端可隐藏 login 态的营销首页返回口；注册等子流程仍可返回登录。 */
+  showHomeBack?: boolean;
   theme: Theme;
   onCycleTheme: () => void;
   /** GET /api/public/config 的 turnstile_bypass；undefined=config 尚未加载。*/
@@ -385,7 +388,7 @@ export function AuthGate({
             "radial-gradient(60% 50% at 50% -10%, color-mix(in srgb, var(--accent) 16%, transparent), transparent 70%)",
         }}
       />
-      {onBack && mode !== "reset" && (
+      {onBack && mode !== "reset" && (mode !== "login" || showHomeBack) && (
         <Button
           variant="ghost"
           size="sm"

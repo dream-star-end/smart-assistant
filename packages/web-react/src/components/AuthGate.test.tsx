@@ -28,6 +28,23 @@ function fill() {
 }
 
 describe("AuthGate — Turnstile gating", () => {
+  test("原生客户端隐藏登录态的返回首页，但注册子流程仍可返回登录", () => {
+    render(
+      <AuthGate
+        {...base}
+        onLogin={vi.fn()}
+        onRegister={vi.fn()}
+        onBack={vi.fn()}
+        showHomeBack={false}
+        turnstileBypass={true}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "返回首页" })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "立即注册" }));
+    expect(screen.getByRole("button", { name: "返回登录" })).toBeInTheDocument();
+  });
+
   test("transient bootstrap failure exposes an explicit session recovery action", () => {
     const retry = vi.fn();
     render(

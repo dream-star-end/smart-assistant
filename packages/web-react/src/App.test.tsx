@@ -144,6 +144,7 @@ let fetchMock: FetchMock
 beforeEach(() => {
   window.history.replaceState({}, '', '/')
   localStorage.clear()
+  sessionStorage.clear()
   imageByteCache.clear()
   document.documentElement.classList.remove('dark')
 })
@@ -153,6 +154,7 @@ afterEach(() => {
   imageByteCache.clear()
   vi.unstubAllGlobals()
   window.history.replaceState({}, '', '/')
+  sessionStorage.clear()
 })
 
 async function loginViaUi() {
@@ -178,6 +180,79 @@ describe('Aurora v5 skeleton — landing (de-branded)', () => {
     expect((await screen.findAllByText('Aurora')).length).toBeGreaterThan(0)
     expect(document.body.textContent).not.toContain('乾元')
     expect(document.body.textContent).not.toContain('易经')
+  })
+})
+
+describe('Aurora v5 — Harmony 原生客户端入口', () => {
+  test('?client=harmony 匿名启动且 refresh 明确失效时直达 AuthGate，不渲染 Landing 或返回首页', async () => {
+    window.history.replaceState({}, '', '/?client=harmony')
+    fetchMock = routedFetch()
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(<App />)
+
+    await waitFor(() => expect(screen.getByPlaceholderText('邮箱')).toBeInTheDocument())
+    expect(screen.queryByRole('button', { name: '返回首页' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /免费开始/ })).not.toBeInTheDocument()
+    expect(window.location.search).toContain('client=harmony')
+    expect(
+      fetchMock.mock.calls.some(([url]) => String(url).includes('/api/auth/refresh')),
+    ).toBe(true)
+  })
+
+  test('?client=harmony 登出后仍回 AuthGate，并保留客户端 query', async () => {
+    window.history.replaceState({}, '', '/?client=harmony')
+    fetchMock = routedFetchTwoSessions()
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(<App />)
+    await waitFor(() => expect(screen.getByRole('button', { name: /新建会话/ })).toBeInTheDocument())
+    fireEvent.click(screen.getByRole('button', { name: '退出登录' }))
+
+    await waitFor(() => expect(screen.getByPlaceholderText('邮箱')).toBeInTheDocument())
+    expect(screen.queryByRole('button', { name: '返回首页' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /免费开始/ })).not.toBeInTheDocument()
+    expect(new URLSearchParams(window.location.search).get('client')).toBe('harmony')
+  })
+
+  test('OAuth 固定回跳丢失 query 时恢复 Harmony 模式，随后登出仍回 AuthGate', async () => {
+    window.history.replaceState({}, '', '/?client=harmony')
+    fetchMock = routedFetchTwoSessions()
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(<App />)
+    await waitFor(() => expect(screen.getByRole('button', { name: /新建会话/ })).toBeInTheDocument())
+    cleanup()
+
+    // GitHub / connector OAuth 后端使用固定回跳地址；原生 client query 不会被透传。
+    window.history.replaceState({}, '', '/?github_linked=1')
+    render(<ToastProvider><App /></ToastProvider>)
+    await waitFor(() => expect(screen.getByRole('button', { name: /新建会话/ })).toBeInTheDocument())
+    await waitFor(() => {
+      const callbackParams = new URLSearchParams(window.location.search)
+      expect(callbackParams.get('client')).toBe('harmony')
+      expect(callbackParams.has('github_linked')).toBe(false)
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: '退出登录' }))
+    await waitFor(() => expect(screen.getByPlaceholderText('邮箱')).toBeInTheDocument())
+    expect(screen.queryByRole('button', { name: '返回首页' })).not.toBeInTheDocument()
+    expect(new URLSearchParams(window.location.search).get('client')).toBe('harmony')
+  })
+
+  test('无 OAuth 回跳标记的普通 Web 启动不会继承 Harmony 会话标记', async () => {
+    window.history.replaceState({}, '', '/?client=harmony')
+    fetchMock = routedFetch()
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(<App />)
+    await waitFor(() => expect(screen.getByPlaceholderText('邮箱')).toBeInTheDocument())
+    cleanup()
+
+    window.history.replaceState({}, '', '/')
+    render(<App />)
+    expect((await screen.findAllByRole('button', { name: /免费开始/ })).length).toBeGreaterThan(0)
+    expect(new URLSearchParams(window.location.search).has('client')).toBe(false)
   })
 })
 
@@ -853,6 +928,27 @@ describe('Aurora v5 — P7 最小路由', () => {
     expect(
       fetchMock.mock.calls.some(([u]) => String(u).includes('/api/sessions/webhist01')),
     ).toBe(false)
+  })
+
+  test('Harmony client query 在会话 replace/push 与新建回根路径时始终保留', async () => {
+    window.history.replaceState({}, '', '/?client=harmony&campaign=native')
+    fetchMock = routedFetchTwoSessions()
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(<App />)
+    await waitFor(() => expect(window.location.pathname).toBe('/s/webother02'))
+    expect(window.location.search).toContain('client=harmony')
+    expect(window.location.search).toContain('campaign=native')
+
+    fireEvent.click(await screen.findByText('历史会话甲'))
+    await waitFor(() => expect(window.location.pathname).toBe('/s/webhist01'))
+    expect(window.location.search).toContain('client=harmony')
+    expect(window.location.search).toContain('campaign=native')
+
+    fireEvent.click(screen.getByRole('button', { name: /新建会话/ }))
+    await waitFor(() => expect(window.location.pathname).toBe('/'))
+    expect(window.location.search).toContain('client=harmony')
+    expect(window.location.search).toContain('campaign=native')
   })
 
   test('boot 恢复 /s/<id>：URL 指定的会话优先于"最近会话"自动选中', async () => {
