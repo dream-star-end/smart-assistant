@@ -1446,7 +1446,9 @@
       "symptom": "会话点 Stop 后前端永久停在「正在停止…」。oc-cursor.sh 用绝对路径调 /bin/kill，而运行时镜像只装 util-linux 未装 procps，退码 127 被 || true 吞掉，使整个 TERM/KILL 升级块成为死代码；setsid 起的 cursor-agent 因此成为孤儿并继续持有 gateway 的 stdout，adapter 与 sessionManager 都在无上限 await waitForOutputDrain()，turn 永不落终态，客户端拿不到 control receipt。",
       "rootFixCommit": "425b283a",
       "coverageCommits": [
-        "5a5aa310"
+        "5a5aa310",
+        "b48f8b73",
+        "5adf5d6f"
       ],
       "regressions": [
         {
@@ -1488,6 +1490,11 @@
           "layer": "deploy-gate",
           "path": "scripts/deploy-v5.sh",
           "assertion": "candidate engine Stop terminal-deadline gate(exact immutable release)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorAdapter.test.ts",
+          "assertion": "Stop racing a turn that has not spawned yet stays bounded and leaves no child"
         }
       ]
     }
