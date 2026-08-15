@@ -882,4 +882,241 @@ console.log(JSON.stringify({type:'result',subtype:'success',is_error:false}));
     assert.throws(() => adapter.setModel('gpt-5.3-codex'), /not allowlisted/)
     assert.throws(() => adapter.setEffortLevel('high'), /does not expose/)
   })
+
+  // The wrapper starts the CLI through setsid, so a descendant that outlives
+  // it sits in a session no signal of ours reaches while still holding this
+  // turn's stdout. 'close' then never fires. Shutdown used to await that
+  // barrier forever, which left the turn without a terminal state and the
+  // client stuck in "stopping".
+  test('shutdown gives up on a descendant that keeps stdout open', { timeout: 20_000 }, async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-escaped-'))
+    const fake = path.join(dir, 'fake.cjs')
+    const escapedPidFile = path.join(dir, 'escaped.pid')
+    await writeFile(path.join(dir, 'persona.md'), 'PERSONA')
+    await writeFile(
+      fake,
+      `#!/usr/bin/env node
+const { spawn } = require('node:child_process'); const fs = require('node:fs');
+const escaped = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'],
+  { detached: true, stdio: ['ignore', 'inherit', 'inherit'] });
+escaped.unref();
+fs.writeFileSync(${JSON.stringify(escapedPidFile)}, String(escaped.pid));
+console.log(JSON.stringify({ type: 'assistant', text: 'working' }));
+setInterval(() => {}, 1000);
+`,
+    )
+    await chmod(fake, 0o755)
+    const oldBin = process.env.OC_CURSOR_WRAPPER_BIN
+    const oldGrace = process.env.OPENCLAUDE_CURSOR_SHUTDOWN_GRACE_MS
+    const oldFinal = process.env.OPENCLAUDE_CURSOR_SHUTDOWN_FINAL_DRAIN_MS
+    process.env.OC_CURSOR_WRAPPER_BIN = fake
+    process.env.OPENCLAUDE_CURSOR_SHUTDOWN_GRACE_MS = '150'
+    process.env.OPENCLAUDE_CURSOR_SHUTDOWN_FINAL_DRAIN_MS = '150'
+    let escapedPid: number | undefined
+    try {
+      const adapter = new CursorAdapter(opts(dir))
+      adapter.on('error', () => {})
+      const run = adapter.submitTurn({
+        input: 'turn that escapes its process group',
+        requestId: REQUEST,
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run.submitted
+      for (let i = 0; i < 200 && escapedPid === undefined; i += 1) {
+        try {
+          escapedPid = Number.parseInt(await readFile(escapedPidFile, 'utf8'), 10)
+        } catch {
+          await new Promise((ready) => setTimeout(ready, 25))
+        }
+      }
+      assert.ok(escapedPid, 'the fake wrapper never spawned its escaped descendant')
+
+      adapter.interrupt()
+      const started = Date.now()
+      await adapter.shutdown()
+      await adapter.waitForOutputDrain()
+      const elapsed = Date.now() - started
+      assert.ok(elapsed < 10_000, `shutdown must be bounded, took ${elapsed}ms`)
+      // The escalation is what makes the wait bounded rather than lucky: the
+      // wrapper itself must be gone even though its descendant is not.
+      assert.equal(adapter.isRunning, false)
+      assert.equal(process.kill(escapedPid, 0), true)
+    } finally {
+      if (escapedPid) {
+        try { process.kill(escapedPid, 'SIGKILL') } catch { /* already reaped */ }
+      }
+      restoreEnv('OC_CURSOR_WRAPPER_BIN', oldBin)
+      restoreEnv('OPENCLAUDE_CURSOR_SHUTDOWN_GRACE_MS', oldGrace)
+      restoreEnv('OPENCLAUDE_CURSOR_SHUTDOWN_FINAL_DRAIN_MS', oldFinal)
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  // Giving up on a process hands it to the OS but keeps the adapter alive for
+  // the next turn. The abandoned turn's 'close' can then fire hours later,
+  // when the barrier it would resolve and the `active` context it would clear
+  // belong to a live turn — freezing that turn's transcript mid-stream.
+  test('a late close from an abandoned turn cannot settle the next one', { timeout: 20_000 }, async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-late-close-'))
+    const escaping = path.join(dir, 'escaping.cjs')
+    const surviving = path.join(dir, 'surviving.cjs')
+    const escapedPidFile = path.join(dir, 'escaped.pid')
+    await writeFile(path.join(dir, 'persona.md'), 'PERSONA')
+    await writeFile(
+      escaping,
+      `#!/usr/bin/env node
+const { spawn } = require('node:child_process'); const fs = require('node:fs');
+const escaped = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'],
+  { detached: true, stdio: ['ignore', 'inherit', 'inherit'] });
+escaped.unref();
+fs.writeFileSync(${JSON.stringify(escapedPidFile)}, String(escaped.pid));
+setInterval(() => {}, 1000);
+`,
+    )
+    await writeFile(
+      surviving,
+      `#!/usr/bin/env node
+console.log(JSON.stringify({ type: 'assistant', text: 'the live turn' }));
+setInterval(() => {}, 1000);
+`,
+    )
+    await chmod(escaping, 0o755)
+    await chmod(surviving, 0o755)
+    const oldBin = process.env.OC_CURSOR_WRAPPER_BIN
+    const oldGrace = process.env.OPENCLAUDE_CURSOR_SHUTDOWN_GRACE_MS
+    const oldFinal = process.env.OPENCLAUDE_CURSOR_SHUTDOWN_FINAL_DRAIN_MS
+    process.env.OPENCLAUDE_CURSOR_SHUTDOWN_GRACE_MS = '150'
+    process.env.OPENCLAUDE_CURSOR_SHUTDOWN_FINAL_DRAIN_MS = '150'
+    const adapter = new CursorAdapter(opts(dir))
+    adapter.on('error', () => {})
+    let escapedPid: number | undefined
+    try {
+      process.env.OC_CURSOR_WRAPPER_BIN = escaping
+      const abandoned = adapter.submitTurn({
+        input: 'turn whose descendant never lets go of stdout',
+        requestId: REQUEST,
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await abandoned.submitted
+      for (let i = 0; i < 200 && escapedPid === undefined; i += 1) {
+        try {
+          escapedPid = Number.parseInt(await readFile(escapedPidFile, 'utf8'), 10)
+        } catch {
+          await new Promise((ready) => setTimeout(ready, 25))
+        }
+      }
+      assert.ok(escapedPid, 'the fake wrapper never spawned its escaped descendant')
+      adapter.interrupt()
+      await adapter.shutdown()
+
+      process.env.OC_CURSOR_WRAPPER_BIN = surviving
+      const live = adapter.submitTurn({
+        input: 'the turn that must not be settled by its predecessor',
+        requestId: REQUEST,
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await live.submitted
+
+      // Whatever the abandoned wrapper was still holding is released now.
+      process.kill(escapedPid, 'SIGKILL')
+      escapedPid = undefined
+
+      const stillOpen = Symbol('still-open')
+      const settled: unknown = await Promise.race([
+        adapter.waitForOutputDrain().then(() => 'drained'),
+        new Promise((late) => setTimeout(() => late(stillOpen), 500)),
+      ])
+      assert.equal(settled, stillOpen, 'the abandoned turn resolved the live turn\'s close barrier')
+      assert.equal(adapter.isRunning, true)
+      assert.equal(live.finalized, false)
+      live.end()
+    } finally {
+      if (escapedPid) {
+        try { process.kill(escapedPid, 'SIGKILL') } catch { /* already reaped */ }
+      }
+      await adapter.shutdown().catch(() => {})
+      restoreEnv('OC_CURSOR_WRAPPER_BIN', oldBin)
+      restoreEnv('OPENCLAUDE_CURSOR_SHUTDOWN_GRACE_MS', oldGrace)
+      restoreEnv('OPENCLAUDE_CURSOR_SHUTDOWN_FINAL_DRAIN_MS', oldFinal)
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  // submitTurn() awaits the platform prompt before it spawns anything, so Stop
+  // can arrive while the turn has no child at all. The close barrier only ever
+  // resolves through a child, so waiting on it here would hang Stop; giving up
+  // without arming the spawn would strand a CLI holding CURSOR_API_KEY. Which
+  // of the two sides wins is a real race and this test does not fix it — both
+  // outcomes owe the same invariant, so both are asserted.
+  test('Stop racing a turn that has not spawned yet stays bounded and leaves no child', { timeout: 20_000 }, async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-prespawn-'))
+    const fake = path.join(dir, 'fake.cjs')
+    const pidFile = path.join(dir, 'wrapper.pid')
+    await writeFile(path.join(dir, 'persona.md'), 'PERSONA')
+    await writeFile(
+      fake,
+      `#!/usr/bin/env node
+require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+setInterval(() => {}, 1000);
+`,
+    )
+    await chmod(fake, 0o755)
+    const oldBin = process.env.OC_CURSOR_WRAPPER_BIN
+    const oldGrace = process.env.OPENCLAUDE_CURSOR_SHUTDOWN_GRACE_MS
+    process.env.OC_CURSOR_WRAPPER_BIN = fake
+    process.env.OPENCLAUDE_CURSOR_SHUTDOWN_GRACE_MS = '0'
+    try {
+      const adapter = new CursorAdapter(opts(dir))
+      adapter.on('error', () => {})
+      const run = adapter.submitTurn({
+        input: 'stopped before it ever spawned',
+        requestId: REQUEST,
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      run.submitted.catch(() => {})
+      // No await on `submitted`: that is the whole point — the turn is still
+      // suspended inside buildPromptContext() and ctx.proc is still null.
+      const started = Date.now()
+      await adapter.shutdown()
+      const elapsed = Date.now() - started
+      assert.ok(elapsed < 10_000, `shutdown must be bounded, took ${elapsed}ms`)
+      await run.submitted.catch(() => {})
+      assert.equal(adapter.isRunning, false)
+
+      // Whichever side won the race, the wrapper must not survive the turn.
+      let wrapperPid: number | undefined
+      try {
+        wrapperPid = Number.parseInt(await readFile(pidFile, 'utf8'), 10)
+      } catch {
+        wrapperPid = undefined
+      }
+      if (wrapperPid) {
+        let alive = true
+        for (let i = 0; i < 100 && alive; i += 1) {
+          try {
+            process.kill(wrapperPid, 0)
+            await new Promise((wait) => setTimeout(wait, 25))
+          } catch {
+            alive = false
+          }
+        }
+        if (alive) {
+          try { process.kill(wrapperPid, 'SIGKILL') } catch { /* already reaped */ }
+        }
+        assert.equal(alive, false, 'the wrapper spawned after Stop was left running')
+      }
+    } finally {
+      restoreEnv('OC_CURSOR_WRAPPER_BIN', oldBin)
+      restoreEnv('OPENCLAUDE_CURSOR_SHUTDOWN_GRACE_MS', oldGrace)
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
 })

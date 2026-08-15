@@ -23,6 +23,16 @@ official stream-json event sequence unchanged.
 EOF
 }
 
+# Absolute paths keep executable resolution off the user-writable PATH, which
+# means a tool missing from the runtime image turns into a silent 127 instead
+# of a visible failure. Assert the whole set up front rather than discovering
+# it inside an `|| true` cleanup path.
+for required_tool in /usr/bin/sudo /usr/bin/test /bin/cat /usr/bin/mktemp \
+  /bin/rm /bin/sleep /usr/bin/setsid /usr/bin/stat /usr/bin/id /bin/mkdir \
+  /bin/cp /bin/chmod; do
+  [ -x "$required_tool" ] || die "runtime image is missing $required_tool"
+done
+
 cursor_bin=/opt/cursor-agent/versions/2026.08.11-e8db854/cursor-agent
 auth_file=/run/oc/cursor-auth/api-key
 [ -x "$cursor_bin" ] || die "pinned Cursor Agent CLI is unavailable"
@@ -110,18 +120,24 @@ cursor_home=$(/usr/bin/mktemp -d /tmp/openclaude-cursor.XXXXXXXX) \
   || die "cannot create ephemeral Cursor state"
 child_pid=""
 
+# `kill` must stay the shell builtin. On Debian /bin/kill belongs to procps,
+# which the runtime image does not install, so an absolute path silently exits
+# 127 and `|| true` swallows it: the CLI would then survive Stop, keep holding
+# the gateway's stdout pipe and hang the turn in "stopping" forever. A builtin
+# also cannot be shadowed through PATH. dash's builtin rejects the `--`
+# separator, so the negated process group id is passed directly.
 cleanup() {
   # Cursor may return while a tool subprocess is still alive. Every process in
   # the session inherits CURSOR_API_KEY, so do not let descendants outlive the
   # one-shot wrapper on either normal completion or Stop.
-  if [ -n "$child_pid" ] && /bin/kill -0 -- "-$child_pid" 2>/dev/null; then
-    /bin/kill -TERM -- "-$child_pid" 2>/dev/null || true
+  if [ -n "$child_pid" ] && kill -0 "-$child_pid" 2>/dev/null; then
+    kill -TERM "-$child_pid" 2>/dev/null || true
     attempts=0
-    while [ "$attempts" -lt 20 ] && /bin/kill -0 -- "-$child_pid" 2>/dev/null; do
+    while [ "$attempts" -lt 20 ] && kill -0 "-$child_pid" 2>/dev/null; do
       /bin/sleep 0.05
       attempts=$((attempts + 1))
     done
-    /bin/kill -KILL -- "-$child_pid" 2>/dev/null || true
+    kill -KILL "-$child_pid" 2>/dev/null || true
   fi
   if [ -n "$child_pid" ]; then
     wait "$child_pid" 2>/dev/null || true
@@ -134,7 +150,7 @@ forward_signal() {
   code=$2
   trap - HUP INT TERM
   if [ -n "$child_pid" ]; then
-    /bin/kill -"$signal" -- "-$child_pid" 2>/dev/null || true
+    kill -"$signal" "-$child_pid" 2>/dev/null || true
   fi
   exit "$code"
 }
