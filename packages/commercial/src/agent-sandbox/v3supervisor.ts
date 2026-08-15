@@ -2613,6 +2613,12 @@ export async function provisionV3Container(
       );
       if (!promptQueueEnabled) env.push(`OC_USER_ID=${String(uid)}`);
       if (deps.modelAuthority.required) env.push("OC_MODEL_AUTHORITY=1");
+      // selfhost 豁免门(OC_SELFHOST_ENGINE_LOCAL_TURNS=1)单向下发:容器内 gateway 的
+      // decideLocalExecution / CODEX_BILLING_GUARD 与 master 同源读它,不允许两侧各自
+      // 解释。master 未设 -> 不注入,容器行为与生产完全一致(fail-closed 不变)。
+      if (process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS === "1") {
+        env.push("OC_SELFHOST_ENGINE_LOCAL_TURNS=1");
+      }
       // 次级模型(WebFetch/WebSearch 等隐藏调用走的 ANTHROPIC_SMALL_FAST_MODEL)由 **master
       // 单向下发**:master 签发 authority 时把它列进 auxModels(egress 据此放行),这里注入同一
       // 值让容器实际用它 —— 二者同源,消除"master 签 A、容器发 B"的版本 skew(master 与
