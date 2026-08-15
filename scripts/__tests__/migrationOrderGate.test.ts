@@ -13,7 +13,7 @@ import assert from "node:assert/strict";
 import {
   type MigrationFile,
   checkDuplicateNumbers,
-  checkGapDeclarations,
+  checkOrderDeclarations,
   checkRequiredMigrations,
   listMigrationFiles,
 } from "../check-migration-order.js";
@@ -58,20 +58,20 @@ describe("checkDuplicateNumbers", () => {
   });
 });
 
-describe("checkGapDeclarations", () => {
+describe("checkOrderDeclarations", () => {
   test("连号 → 无需声明", () => {
-    assert.deepEqual(checkGapDeclarations([mf("0219_x"), mf("0220_y")], NO_SQL), []);
+    assert.deepEqual(checkOrderDeclarations([mf("0219_x"), mf("0220_y")], NO_SQL), []);
   });
 
   test("缺口且未声明 → R3", () => {
-    const p = checkGapDeclarations([mf("0219_x"), mf("0221_y")], NO_SQL);
+    const p = checkOrderDeclarations([mf("0219_x"), mf("0221_y")], NO_SQL);
     assert.equal(p.length, 1);
     assert.equal(p[0]!.rule, "R3");
     assert.match(p[0]!.message, /order-dependency/);
   });
 
   test("缺口但已声明 → 通过", () => {
-    const p = checkGapDeclarations(
+    const p = checkOrderDeclarations(
       [mf("0219_x"), mf("0221_y")],
       (f) => (f === "0221_y.sql" ? "-- order-dependency: 0220_other\nSELECT 1;\n" : NO_SQL()),
     );
@@ -79,24 +79,48 @@ describe("checkGapDeclarations", () => {
   });
 
   test("缺口声明 none 也算显式表态 → 通过", () => {
-    const p = checkGapDeclarations([mf("0219_x"), mf("0221_y")], (f) =>
+    const p = checkOrderDeclarations([mf("0219_x"), mf("0221_y")], (f) =>
       f === "0221_y.sql" ? "-- order-dependency: none (0220 已放弃)\nSELECT 1;\n" : NO_SQL(),
     );
     assert.deepEqual(p, []);
   });
 
   test("强制线以下的历史缺口不追溯", () => {
-    assert.deepEqual(checkGapDeclarations([mf("0170_a"), mf("0173_b")], NO_SQL), []);
+    assert.deepEqual(checkOrderDeclarations([mf("0170_a"), mf("0173_b")], NO_SQL), []);
   });
 
   test("重号不额外报 R3(由 R2 单独负责,免得一个错出两种说法)", () => {
-    assert.deepEqual(checkGapDeclarations([mf("0221_a"), mf("0221_b")], NO_SQL), []);
+    assert.deepEqual(checkOrderDeclarations([mf("0221_a"), mf("0221_b")], NO_SQL), []);
   });
 
   test("声明语法错 → R4", () => {
-    const p = checkGapDeclarations([mf("0220_x")], () => "-- order-dependency: 220!\nSELECT 1;\n");
+    const p = checkOrderDeclarations([mf("0220_x")], () => "-- order-dependency: 220!\nSELECT 1;\n");
     assert.equal(p.length, 1);
     assert.equal(p[0]!.rule, "R4");
+  });
+
+  test("依赖编号大于自身 → R4(不能等到部署期才被 migrate.ts 拒)", () => {
+    const p = checkOrderDeclarations(
+      [mf("0220_x")],
+      () => "-- order-dependency: 9999_future\nSELECT 1;\n",
+    );
+    assert.equal(p.length, 1);
+    assert.equal(p[0]!.rule, "R4");
+    assert.match(p[0]!.message, /9999_future/);
+  });
+
+  test("依赖等于自身 → R4", () => {
+    const p = checkOrderDeclarations([mf("0220_x")], () => "-- order-dependency: 0220_x\nS;\n");
+    assert.equal(p.length, 1);
+    assert.equal(p[0]!.rule, "R4");
+  });
+
+  test("依赖尚未合并(不在目录里)不算违规 —— 那正是这条声明存在的理由", () => {
+    const p = checkOrderDeclarations(
+      [mf("0219_x"), mf("0221_y")],
+      (f) => (f === "0221_y.sql" ? "-- order-dependency: 0220_elsewhere\nS;\n" : NO_SQL()),
+    );
+    assert.deepEqual(p, []);
   });
 });
 
@@ -123,7 +147,7 @@ describe("真实仓库状态", () => {
     const all = [
       ...problems,
       ...checkDuplicateNumbers(files),
-      ...checkGapDeclarations(files, (f) => readFileSync(join(migrationsDir, f), "utf8")),
+      ...checkOrderDeclarations(files, (f) => readFileSync(join(migrationsDir, f), "utf8")),
       ...checkRequiredMigrations(files, metadata),
     ];
     assert.deepEqual(

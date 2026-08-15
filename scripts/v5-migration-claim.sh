@@ -69,8 +69,10 @@ git worktree list --porcelain | awk '/^worktree /{print $2}' | while read -r wt;
 done >> "$TMP"
 
 # b) 最近推过的远端分支(已 push 但 worktree 已删的情况)。
-git for-each-ref --sort=-committerdate --format='%(refname:short)' refs/remotes/origin |
-  head -n "$BRANCH_SCAN_LIMIT" | while read -r br; do
+# 用 --count 而不是 `| head`:后者在 refs 很多时会让 for-each-ref 吃 SIGPIPE,
+# 在 `set -o pipefail` 下把整个脚本带死。
+git for-each-ref --count="$BRANCH_SCAN_LIMIT" --sort=-committerdate \
+  --format='%(refname:short)' refs/remotes/origin | while read -r br; do
     versions_in_ref "$br" | while read -r v; do
       if [ "$v" \> "$CANON_MAX" ]; then
         printf '%s\tremote %s\n' "$v" "$br"

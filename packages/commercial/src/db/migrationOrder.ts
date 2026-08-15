@@ -17,7 +17,9 @@
 // 设计取舍:
 //   * 声明落在**各自的 .sql 文件头**,不引入新的全局单例清单 —— 那种清单本身就是
 //     并行会话的冲突源(release-metadata.json 已经是一个)。
-//   * 解析只看第一条非注释非空行之前的头部块,与既有 `-- no-transaction` 标记同范式。
+//   * 解析只看第一条非注释非空行之前的头部块。既有的 `-- no-transaction` 标记用
+//     `/^--\s*no-transaction\b/im` 扫全文,本模块**故意更严**:埋在 SQL 中段的声明
+//     容易在后续编辑里被连带删掉而无人察觉,而这条声明一旦丢失就会静默失去保护。
 //   * 本模块是纯函数、无 IO、无 pg 依赖,两个消费者共用,禁止各自再实现一份:
 //       - packages/commercial/src/db/migrate.ts —— apply 前 fail-closed 断言
 //       - scripts/check-migration-order.ts      —— PR 期编号/声明漂移门

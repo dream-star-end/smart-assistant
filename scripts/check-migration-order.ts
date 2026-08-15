@@ -21,7 +21,9 @@
 //   R3  ENFORCE_FROM 起,编号相对前一支存在缺口时,必须在文件头声明
 //       `-- order-dependency: <version>` 或 `-- order-dependency: none <理由>`
 //       —— 缺口意味着中间号被另一支分支占着,那就是一条必须显式化的发布顺序依赖
-//   R4  声明语法合法,且依赖编号小于自身(migrationOrder.ts 解析)
+//   R4  声明语法合法,且每条依赖的编号严格小于自身 —— 这两项都要在 PR 期判掉,
+//       否则 `-- order-dependency: 9999_future` 这类声明会一路绿到部署期才被
+//       migrate.ts 的断言拒绝(fail-closed 落在最贵的时刻)
 //   R5  磁盘上 >= minimumRequiredMigration 的迁移必须登记进 release-metadata.json
 //       的 requiredMigrations(它是 deploy/dist/rollback/canary/finalize 的统一硬门,
 //       漏登记 = 部署期才 fail-closed)
@@ -104,12 +106,16 @@ export function checkDuplicateNumbers(files: ReadonlyArray<MigrationFile>): Prob
 }
 
 /**
- * R3/R4:缺口必须显式声明顺序依赖。
+ * R3/R4:缺口必须显式声明顺序依赖,且声明本身必须站得住。
  *
  * 缺口 = 本支编号不是"磁盘上前一支编号 + 1",说明中间那些号被别的分支占着(或曾被占过)。
  * 这正是"谁先 apply"会决定成败的场景,必须写下来,而不是留在某个会话的记忆里。
+ *
+ * 依赖的**有效性**在这里判(编号必须更小),而不是留给 runtime:声明一个更大或等于自身
+ * 的编号在任何应用顺序下都不可能被满足,让它绿到部署期才 fail-closed 是最贵的失败方式。
+ * 但**不要求依赖已经在目录里** —— 依赖分支尚未合并正是这条声明存在的理由。
  */
-export function checkGapDeclarations(
+export function checkOrderDeclarations(
   files: ReadonlyArray<MigrationFile>,
   readSql: (file: string) => string,
 ): Problem[] {
@@ -122,7 +128,18 @@ export function checkGapDeclarations(
 
     let declared = false;
     try {
-      declared = parseOrderDependency(readSql(cur.file)).declared;
+      const decl = parseOrderDependency(readSql(cur.file));
+      declared = decl.declared;
+      for (const dep of decl.dependsOn) {
+        if (dep >= cur.version) {
+          problems.push({
+            rule: "R4",
+            message:
+              `${cur.file}:声明依赖 ${dep},但依赖编号必须严格小于自身 —— 顺序门只保证"小号先 apply",` +
+              `更大或相等的编号在任何顺序下都不可能被满足。`,
+          });
+        }
+      }
     } catch (err) {
       problems.push({ rule: "R4", message: `${cur.file}:${(err as Error).message}` });
       continue;
@@ -200,7 +217,7 @@ function main(): void {
   const all = [
     ...problems,
     ...checkDuplicateNumbers(files),
-    ...checkGapDeclarations(files, (file) => readFileSync(join(MIGRATIONS_DIR, file), "utf8")),
+    ...checkOrderDeclarations(files, (file) => readFileSync(join(MIGRATIONS_DIR, file), "utf8")),
     ...checkRequiredMigrations(files, metadata),
   ];
 

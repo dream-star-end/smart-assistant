@@ -1090,6 +1090,71 @@ describe("migrate.runMigrations", () => {
     }
   });
 
+  test("fails closed when a declared order-dependency is neither applied nor in this run", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const dir = await mkdtemp(path.join(tmpdir(), "mig-dep-missing-"));
+    try {
+      await writeFile(
+        path.join(dir, "0001_first.sql"),
+        "CREATE TABLE _dep_a (id BIGSERIAL PRIMARY KEY);",
+        "utf8",
+      );
+      await runMigrations({ dir });
+
+      // 并行分支占着 0002,本支只有 0003 —— 对方还没合并,本支不该先落地。
+      await writeFile(
+        path.join(dir, "0003_needs_0002.sql"),
+        "-- order-dependency: 0002_other_branch\nCREATE TABLE _dep_c (id BIGSERIAL PRIMARY KEY);",
+        "utf8",
+      );
+
+      await assert.rejects(
+        runMigrations({ dir }),
+        (err: unknown) =>
+          err instanceof MigrationIntegrityError &&
+          /order-dependency/.test(err.message) &&
+          /0002_other_branch/.test(err.message),
+      );
+
+      // 断言发生在 apply 之前:0003 的表不能被建出来
+      const tbls = await query<{ table_name: string }>(
+        "SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_name = '_dep_c'",
+      );
+      assert.equal(tbls.rows.length, 0);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+      await query("DROP TABLE IF EXISTS _dep_a, _dep_c CASCADE");
+    }
+  });
+
+  test("declared order-dependency satisfied in the same run (lexically earlier) applies fine", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const dir = await mkdtemp(path.join(tmpdir(), "mig-dep-same-run-"));
+    try {
+      await writeFile(
+        path.join(dir, "0002_other_branch.sql"),
+        "CREATE TABLE _dep_b (id BIGSERIAL PRIMARY KEY);",
+        "utf8",
+      );
+      await writeFile(
+        path.join(dir, "0003_needs_0002.sql"),
+        "-- order-dependency: 0002_other_branch\nCREATE TABLE _dep_c (id BIGSERIAL PRIMARY KEY);",
+        "utf8",
+      );
+
+      // 依赖未 applied,但排序在前 → 同一次运行里会先落,不该被拒。
+      const r = await runMigrations({ dir });
+      assert.deepEqual(r.applied, ["0002_other_branch", "0003_needs_0002"]);
+
+      // 依赖已 applied 之后重跑同样通过(幂等,且不因历史声明反复校验而变红)。
+      const again = await runMigrations({ dir });
+      assert.deepEqual(again.applied, []);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+      await query("DROP TABLE IF EXISTS _dep_b, _dep_c CASCADE");
+    }
+  });
+
   test("credit_ledger UPDATE/DELETE are no-ops (append-only RULE)", async (t) => {
     if (skipIfNoPg(t)) return;
     await runMigrations();
