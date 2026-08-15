@@ -77,6 +77,7 @@ import {
   classifyDelegateOutputError,
   classifyRunError,
 } from './errorClassify.js'
+import { defaultReleaseJobDir, isReleaseJobId, publicReleaseJob, readReleaseJob } from './releaseJobStore.js'
 import { ContainerPreviewHandler } from './containerPreview.js'
 import {
   PROMPT_QUEUE_DISPATCH_CANCEL_TYPE,
@@ -4616,6 +4617,11 @@ export class Gateway {
       )
       return
     }
+    const releaseJobMatch = url.pathname.match(/^\/api\/v5\/release-jobs\/(rel-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12})$/)
+    if (releaseJobMatch) {
+      this._handleReleaseJobStatus(req, res, releaseJobMatch[1])
+      return
+    }
 
     // ── SkillOpt skill-training (async; train → diff → confirm-merge) ──
     const skillTrainStartMatch = url.pathname.match(/^\/api\/skills\/([a-z0-9-]+)\/train$/)
@@ -7777,6 +7783,16 @@ export class Gateway {
       ...(run.note ? { note: run.note } : {}),
       usage: run.usage,
     })
+  }
+
+  /** GET /api/v5/release-jobs/:id — hydrate the in-chat release card after refresh. */
+  private _handleReleaseJobStatus(req: IncomingMessage, res: ServerResponse, id: string): void {
+    if (req.method !== 'GET') return this.sendError(res, 405, 'method not allowed')
+    if (!isReleaseJobId(id)) return this.sendError(res, 400, 'invalid release job id')
+    this.getUserId(req)
+    const job = readReleaseJob(defaultReleaseJobDir(), id)
+    if (!job) return this.sendError(res, 404, 'release job not found')
+    this.sendJson(res, 200, publicReleaseJob(job))
   }
 
   /**
