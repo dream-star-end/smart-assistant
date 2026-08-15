@@ -1047,4 +1047,76 @@ setInterval(() => {}, 1000);
       await rm(dir, { recursive: true, force: true })
     }
   })
+
+  // submitTurn() awaits the platform prompt before it spawns anything, so Stop
+  // can arrive while the turn has no child at all. The close barrier only ever
+  // resolves through a child, so waiting on it here would hang Stop; giving up
+  // without arming the spawn would strand a CLI holding CURSOR_API_KEY. Which
+  // of the two sides wins is a real race and this test does not fix it — both
+  // outcomes owe the same invariant, so both are asserted.
+  test('Stop racing a turn that has not spawned yet stays bounded and leaves no child', { timeout: 20_000 }, async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-prespawn-'))
+    const fake = path.join(dir, 'fake.cjs')
+    const pidFile = path.join(dir, 'wrapper.pid')
+    await writeFile(path.join(dir, 'persona.md'), 'PERSONA')
+    await writeFile(
+      fake,
+      `#!/usr/bin/env node
+require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+setInterval(() => {}, 1000);
+`,
+    )
+    await chmod(fake, 0o755)
+    const oldBin = process.env.OC_CURSOR_WRAPPER_BIN
+    const oldGrace = process.env.OPENCLAUDE_CURSOR_SHUTDOWN_GRACE_MS
+    process.env.OC_CURSOR_WRAPPER_BIN = fake
+    process.env.OPENCLAUDE_CURSOR_SHUTDOWN_GRACE_MS = '0'
+    try {
+      const adapter = new CursorAdapter(opts(dir))
+      adapter.on('error', () => {})
+      const run = adapter.submitTurn({
+        input: 'stopped before it ever spawned',
+        requestId: REQUEST,
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      run.submitted.catch(() => {})
+      // No await on `submitted`: that is the whole point — the turn is still
+      // suspended inside buildPromptContext() and ctx.proc is still null.
+      const started = Date.now()
+      await adapter.shutdown()
+      const elapsed = Date.now() - started
+      assert.ok(elapsed < 10_000, `shutdown must be bounded, took ${elapsed}ms`)
+      await run.submitted.catch(() => {})
+      assert.equal(adapter.isRunning, false)
+
+      // Whichever side won the race, the wrapper must not survive the turn.
+      let wrapperPid: number | undefined
+      try {
+        wrapperPid = Number.parseInt(await readFile(pidFile, 'utf8'), 10)
+      } catch {
+        wrapperPid = undefined
+      }
+      if (wrapperPid) {
+        let alive = true
+        for (let i = 0; i < 100 && alive; i += 1) {
+          try {
+            process.kill(wrapperPid, 0)
+            await new Promise((wait) => setTimeout(wait, 25))
+          } catch {
+            alive = false
+          }
+        }
+        if (alive) {
+          try { process.kill(wrapperPid, 'SIGKILL') } catch { /* already reaped */ }
+        }
+        assert.equal(alive, false, 'the wrapper spawned after Stop was left running')
+      }
+    } finally {
+      restoreEnv('OC_CURSOR_WRAPPER_BIN', oldBin)
+      restoreEnv('OPENCLAUDE_CURSOR_SHUTDOWN_GRACE_MS', oldGrace)
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
 })

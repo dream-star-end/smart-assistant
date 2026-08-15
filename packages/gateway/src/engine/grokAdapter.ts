@@ -302,6 +302,15 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       || (existsSync('/usr/local/bin/grok-native') ? '/usr/local/bin/grok-native' : 'grok')
     const proc = spawn(bin, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], detached: true })
     ctx.proc = proc
+    if (ctx.abandoned) {
+      // shutdown() gave up on this turn while we were still composing the
+      // prompt. Nobody will read this process and it carries the turn's route
+      // token, so it must not outlive the turn it belongs to.
+      killProcessGroup(proc, 'SIGKILL')
+      detachChildStdio(proc)
+      try { proc.unref() } catch { /* already detached */ }
+      return
+    }
     this.emit('spawn', { resumed: this.nativeId !== null })
 
     let stdoutBuffer = ''
@@ -606,17 +615,34 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
   async shutdown(): Promise<void> {
     const ctx = this.active
     if (!ctx) return
-    const proc = ctx.proc
-    if (!proc || ctx.procClosed) {
+    if (ctx.procClosed) {
       await this.waitForOutputDrain()
       return
     }
-    const closeBarrier = this.drain
-    killProcessGroup(proc, 'SIGTERM')
-    let closed = await waitForCloseWithin(
-      closeBarrier,
-      shutdownTimeoutMs('OPENCLAUDE_GROK_SHUTDOWN_GRACE_MS', GROK_SHUTDOWN_GRACE_DEFAULT_MS),
+    const grace = shutdownTimeoutMs(
+      'OPENCLAUDE_GROK_SHUTDOWN_GRACE_MS',
+      GROK_SHUTDOWN_GRACE_DEFAULT_MS,
     )
+    const closeBarrier = this.drain
+    let proc = ctx.proc
+    if (!proc) {
+      // Stop can land while submitTurn() is still composing the prompt. There
+      // is nothing to signal yet and the barrier only resolves through a child
+      // that does not exist, so give the spawn a bounded chance to appear
+      // instead of either blocking Stop or stranding a CLI we could have
+      // killed a moment later.
+      if (await waitForCloseWithin(closeBarrier, grace)) return
+      proc = ctx.proc
+      if (!proc) {
+        log.error('grok turn never spawned a child before shutdown', {
+          sessionKey: this.opts.sessionKey,
+        })
+        this.abandonTurn(ctx, null, 'grok never started')
+        return
+      }
+    }
+    killProcessGroup(proc, 'SIGTERM')
+    let closed = await waitForCloseWithin(closeBarrier, grace)
     if (!closed) {
       killProcessGroup(proc, 'SIGKILL')
       closed = await waitForCloseWithin(
@@ -632,17 +658,28 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       sessionKey: this.opts.sessionKey,
       pid: proc.pid,
     })
-    // Finish the turn here rather than leaving anything to 'close'. The
-    // descendant can hold the pipe for hours, and by then the barrier and
-    // `active` belong to a later turn that a stale handler would resolve and
-    // terminate early.
+    this.abandonTurn(ctx, proc, 'grok did not exit after SIGKILL')
+  }
+  /** Finish a turn we can no longer reach, in full, right here.
+   *
+   * Leaving any of it to 'close' is what makes an escaped descendant
+   * dangerous: it can hold the pipe for hours, and by then the barrier and
+   * `active` belong to a later turn that a stale handler would resolve and
+   * terminate early. */
+  private abandonTurn(
+    ctx: GrokTurnContext,
+    proc: ChildProcessByStdio<null, Readable, Readable> | null,
+    detail: string,
+  ): void {
     ctx.abandoned = true
-    detachChildStdio(proc)
-    if (!ctx.terminal) this.finishError(ctx, 'grok did not exit after SIGKILL')
+    if (proc) detachChildStdio(proc)
+    if (!ctx.terminal) this.finishError(ctx, detail)
     this.resolveDrain?.()
     this.resolveDrain = null
     if (this.active === ctx) this.active = null
-    try { proc.unref() } catch { /* already detached */ }
+    if (proc) {
+      try { proc.unref() } catch { /* already detached */ }
+    }
   }
 
   waitForOutputDrain(): Promise<void> { return this.drain }
