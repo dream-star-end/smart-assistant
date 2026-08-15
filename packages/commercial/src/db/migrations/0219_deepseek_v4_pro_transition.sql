@@ -1,4 +1,4 @@
--- 0218 — move persisted DeepSeek V4 Pro selections to DeepSeek V4 Flash.
+-- 0219 — move persisted DeepSeek V4 Pro selections to DeepSeek V4 Flash.
 --
 -- This migration is applied before the code release that stops hardcoding
 -- deepseek-v4-pro. The old stable release can still execute Pro during that
@@ -20,27 +20,27 @@
 -- files, so 0219 cannot be registered in the same release as this code.
 -- Historical usage/audit rows and deleted sessions are intentionally untouched.
 
--- BEGIN TESTED MANUAL ROLLBACK 0218
+-- BEGIN TESTED MANUAL ROLLBACK 0219
 -- DO $rollback_preflight$
 -- BEGIN
 --   IF NOT EXISTS (
 --     SELECT 1 FROM pg_trigger
 --      WHERE tgrelid = 'user_preferences'::regclass
---        AND tgname = 'trg_0218_normalize_user_default_model'
+--        AND tgname = 'trg_0219_normalize_user_default_model'
 --        AND NOT tgisinternal
 --   ) OR NOT EXISTS (
 --     SELECT 1 FROM pg_trigger
 --      WHERE tgrelid = 'client_sessions'::regclass
---        AND tgname = 'trg_0218_normalize_client_session_model'
+--        AND tgname = 'trg_0219_normalize_client_session_model'
 --        AND NOT tgisinternal
 --   ) THEN
---     RAISE EXCEPTION '0218 rollback requires both transition write fences';
+--     RAISE EXCEPTION '0219 rollback requires both transition write fences';
 --   END IF;
 -- END
 -- $rollback_preflight$;
 --
--- DROP TRIGGER trg_0218_normalize_user_default_model ON user_preferences;
--- DROP TRIGGER trg_0218_normalize_client_session_model ON client_sessions;
+-- DROP TRIGGER trg_0219_normalize_user_default_model ON user_preferences;
+-- DROP TRIGGER trg_0219_normalize_client_session_model ON client_sessions;
 --
 -- UPDATE user_preferences AS p
 --    SET prefs = jsonb_set(p.prefs, '{default_model}', to_jsonb(s.original_model_id), true),
@@ -72,9 +72,9 @@
 --  WHERE s.subject_kind = 'runtime_requirement'
 --    AND s.subject_key = 'official_seed_agent';
 --
--- DROP FUNCTION fn_0218_normalize_user_default_model();
--- DROP FUNCTION fn_0218_normalize_client_session_model();
--- END TESTED MANUAL ROLLBACK 0218
+-- DROP FUNCTION fn_0219_normalize_user_default_model();
+-- DROP FUNCTION fn_0219_normalize_client_session_model();
+-- END TESTED MANUAL ROLLBACK 0219
 
 LOCK TABLE model_catalog, model_pricing, model_runtime_requirements,
   user_preferences, client_sessions, model_visibility_grants,
@@ -104,30 +104,30 @@ BEGIN
 
   IF (SELECT count(*) FROM model_catalog
        WHERE model_id = 'deepseek-v4-flash' AND state = 'active') <> 1 THEN
-    RAISE EXCEPTION '0218 requires exactly one active deepseek-v4-flash catalog row';
+    RAISE EXCEPTION '0219 requires exactly one active deepseek-v4-flash catalog row';
   END IF;
   IF (SELECT count(*) FROM model_pricing
        WHERE model_id = 'deepseek-v4-flash' AND enabled IS TRUE) <> 1 THEN
-    RAISE EXCEPTION '0218 requires enabled deepseek-v4-flash pricing';
+    RAISE EXCEPTION '0219 requires enabled deepseek-v4-flash pricing';
   END IF;
   IF (SELECT count(*) FROM model_catalog
        WHERE model_id = 'deepseek-v4-pro' AND state = 'active') <> 1 THEN
-    RAISE EXCEPTION '0218 requires exactly one active deepseek-v4-pro catalog row';
+    RAISE EXCEPTION '0219 requires exactly one active deepseek-v4-pro catalog row';
   END IF;
   IF (SELECT count(*) FROM model_pricing
        WHERE model_id = 'deepseek-v4-pro' AND enabled IS TRUE) <> 1 THEN
-    RAISE EXCEPTION '0218 requires enabled deepseek-v4-pro pricing';
+    RAISE EXCEPTION '0219 requires enabled deepseek-v4-pro pricing';
   END IF;
 
   IF (SELECT count(*) FROM model_runtime_requirements
        WHERE model_id = 'deepseek-v4-flash'
          AND requirement = 'ccb_secondary_utility') <> 1 THEN
-    RAISE EXCEPTION '0218 requires deepseek-v4-flash to keep ccb_secondary_utility';
+    RAISE EXCEPTION '0219 requires deepseek-v4-flash to keep ccb_secondary_utility';
   END IF;
   IF (SELECT count(*) FROM model_runtime_requirements
        WHERE requirement = 'official_seed_agent'
          AND model_id IN ('deepseek-v4-pro', 'deepseek-v4-flash')) <> 1 THEN
-    RAISE EXCEPTION '0218 requires official_seed_agent on Pro or already on Flash';
+    RAISE EXCEPTION '0219 requires official_seed_agent on Pro or already on Flash';
   END IF;
 
   IF EXISTS (
@@ -138,7 +138,7 @@ BEGIN
       JOIN model_catalog c ON c.entry_id = a.entry_id
      WHERE c.model_id = 'deepseek-v4-pro'
   ) THEN
-    RAISE EXCEPTION '0218 requires zero Pro group mappings/aliases';
+    RAISE EXCEPTION '0219 requires zero Pro group mappings/aliases';
   END IF;
 END
 $preflight$;
@@ -184,9 +184,9 @@ CREATE TABLE IF NOT EXISTS model_dsv4pro_transition_snapshots (
 );
 
 COMMENT ON TABLE model_dsv4pro_transition_snapshots IS
-  'Permanent ops ledger for the 0218 DeepSeek V4 Pro → Flash transition. Stores fence before-images and the official_seed_agent source. original_model_id is first-write-wins; fence repeats may refresh only the compensation marker.';
+  'Permanent ops ledger for the 0219 DeepSeek V4 Pro → Flash transition. Stores fence before-images and the official_seed_agent source. original_model_id is first-write-wins; fence repeats may refresh only the compensation marker.';
 
-CREATE OR REPLACE FUNCTION fn_0218_normalize_user_default_model()
+CREATE OR REPLACE FUNCTION fn_0219_normalize_user_default_model()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -216,7 +216,7 @@ BEGIN
 END
 $function$;
 
-CREATE OR REPLACE FUNCTION fn_0218_normalize_client_session_model()
+CREATE OR REPLACE FUNCTION fn_0219_normalize_client_session_model()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -252,18 +252,18 @@ BEGIN
 END
 $function$;
 
-REVOKE ALL ON FUNCTION fn_0218_normalize_user_default_model() FROM PUBLIC;
-REVOKE ALL ON FUNCTION fn_0218_normalize_client_session_model() FROM PUBLIC;
+REVOKE ALL ON FUNCTION fn_0219_normalize_user_default_model() FROM PUBLIC;
+REVOKE ALL ON FUNCTION fn_0219_normalize_client_session_model() FROM PUBLIC;
 
-DROP TRIGGER IF EXISTS trg_0218_normalize_user_default_model ON user_preferences;
-CREATE TRIGGER trg_0218_normalize_user_default_model
+DROP TRIGGER IF EXISTS trg_0219_normalize_user_default_model ON user_preferences;
+CREATE TRIGGER trg_0219_normalize_user_default_model
 BEFORE INSERT OR UPDATE OF prefs ON user_preferences
-FOR EACH ROW EXECUTE FUNCTION fn_0218_normalize_user_default_model();
+FOR EACH ROW EXECUTE FUNCTION fn_0219_normalize_user_default_model();
 
-DROP TRIGGER IF EXISTS trg_0218_normalize_client_session_model ON client_sessions;
-CREATE TRIGGER trg_0218_normalize_client_session_model
+DROP TRIGGER IF EXISTS trg_0219_normalize_client_session_model ON client_sessions;
+CREATE TRIGGER trg_0219_normalize_client_session_model
 BEFORE INSERT OR UPDATE OF model_id ON client_sessions
-FOR EACH ROW EXECUTE FUNCTION fn_0218_normalize_client_session_model();
+FOR EACH ROW EXECUTE FUNCTION fn_0219_normalize_client_session_model();
 
 
 UPDATE user_preferences
@@ -308,7 +308,7 @@ BEGIN
      WHERE model_id = 'deepseek-v4-flash'
        AND requirement = 'official_seed_agent'
   ) THEN
-    RAISE EXCEPTION '0218 official_seed_agent is missing from both Pro and Flash';
+    RAISE EXCEPTION '0219 official_seed_agent is missing from both Pro and Flash';
   END IF;
 END
 $requirements$;
@@ -319,14 +319,14 @@ BEGIN
     SELECT 1 FROM user_preferences
      WHERE prefs->>'default_model' = 'deepseek-v4-pro'
   ) THEN
-    RAISE EXCEPTION '0218 left a stale user default model';
+    RAISE EXCEPTION '0219 left a stale user default model';
   END IF;
   IF EXISTS (
     SELECT 1 FROM client_sessions
      WHERE deleted_at IS NULL
        AND model_id = 'deepseek-v4-pro'
   ) THEN
-    RAISE EXCEPTION '0218 left a stale live client-session model';
+    RAISE EXCEPTION '0219 left a stale live client-session model';
   END IF;
   IF EXISTS (
     SELECT 1 FROM account_group_models WHERE model_id = 'deepseek-v4-pro'
@@ -336,7 +336,7 @@ BEGIN
       JOIN model_catalog c ON c.entry_id = a.entry_id
      WHERE c.model_id = 'deepseek-v4-pro'
   ) THEN
-    RAISE EXCEPTION '0218 left a Pro group mapping or alias';
+    RAISE EXCEPTION '0219 left a Pro group mapping or alias';
   END IF;
   IF (SELECT count(*) FROM model_runtime_requirements
        WHERE model_id = 'deepseek-v4-flash'
@@ -349,7 +349,7 @@ BEGIN
      OR (SELECT count(*) FROM model_runtime_requirements
           WHERE model_id = 'deepseek-v4-flash'
             AND requirement = 'ccb_secondary_utility') <> 1 THEN
-    RAISE EXCEPTION '0218 runtime requirement transition failed';
+    RAISE EXCEPTION '0219 runtime requirement transition failed';
   END IF;
   IF (SELECT count(*)
         FROM model_catalog c
@@ -357,14 +357,14 @@ BEGIN
        WHERE c.model_id = 'deepseek-v4-pro'
          AND c.state = 'active'
          AND p.enabled IS TRUE) <> 1 THEN
-    RAISE EXCEPTION '0218 must keep deepseek-v4-pro executable until a later disable release';
+    RAISE EXCEPTION '0219 must keep deepseek-v4-pro executable until a later disable release';
   END IF;
   IF (SELECT count(*) FROM pg_trigger
        WHERE tgname IN (
-         'trg_0218_normalize_user_default_model',
-         'trg_0218_normalize_client_session_model'
+         'trg_0219_normalize_user_default_model',
+         'trg_0219_normalize_client_session_model'
        ) AND NOT tgisinternal AND tgenabled = 'O') <> 2 THEN
-    RAISE EXCEPTION '0218 transition write fences are not all enabled';
+    RAISE EXCEPTION '0219 transition write fences are not all enabled';
   END IF;
 END
 $postcondition$;

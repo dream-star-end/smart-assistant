@@ -1,9 +1,9 @@
 /**
- * 0218 DeepSeek V4 Pro → Flash transition and deploy-gap write fence.
+ * 0219 DeepSeek V4 Pro → Flash transition and deploy-gap write fence.
  *
  * Run through the commercial test mutex, never invoke this file directly:
  * REQUIRE_TEST_DB=1 bash scripts/test-mutex.sh commercial \
- *   'npx tsx --test --test-force-exit packages/commercial/src/__tests__/migration0218.integ.test.ts'
+ *   'npx tsx --test --test-force-exit packages/commercial/src/__tests__/migration0219.integ.test.ts'
  */
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
@@ -15,13 +15,13 @@ import { addGrant, removeGrant } from '../admin/modelGrants.js'
 import { query } from '../db/queries.js'
 import { resetAndMigrateBefore, useDedicatedTestDatabase } from './helpers/db.js'
 
-const db = useDedicatedTestDatabase('models_0218_test')
+const db = useDedicatedTestDatabase('models_0219_test')
 const here = path.dirname(fileURLToPath(import.meta.url))
-const migrationPath = path.resolve(here, '../db/migrations/0218_deepseek_v4_pro_transition.sql')
+const migrationPath = path.resolve(here, '../db/migrations/0219_deepseek_v4_pro_transition.sql')
 
 function testedManualRollbackSql(migrationSql: string): string {
-  const start = '-- BEGIN TESTED MANUAL ROLLBACK 0218'
-  const end = '-- END TESTED MANUAL ROLLBACK 0218'
+  const start = '-- BEGIN TESTED MANUAL ROLLBACK 0219'
+  const end = '-- END TESTED MANUAL ROLLBACK 0219'
   assert.ok(migrationSql.includes(start) && migrationSql.includes(end))
   const body = migrationSql.slice(
     migrationSql.indexOf(start) + start.length,
@@ -34,7 +34,7 @@ function testedManualRollbackSql(migrationSql: string): string {
 }
 
 async function prepareFloor(): Promise<string> {
-  await resetAndMigrateBefore('0218')
+  await resetAndMigrateBefore('0219')
   return readFile(migrationPath, 'utf8')
 }
 
@@ -81,7 +81,7 @@ async function grantModels(userId: string): Promise<string[]> {
   return result.rows.map((row) => row.model_id)
 }
 
-describe('0218_deepseek_v4_pro_transition', () => {
+describe('0219_deepseek_v4_pro_transition', () => {
   test('backfills prefs/sessions, shifts official_seed_agent, leaves grants, and is idempotent', async (t) => {
     if (db.skipIfUnavailable(t)) return
     const sql = await prepareFloor()
@@ -215,20 +215,20 @@ describe('0218_deepseek_v4_pro_transition', () => {
     await query(
       `DO $role$
        BEGIN
-         IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='oc_migration0218_app') THEN
-           CREATE ROLE oc_migration0218_app NOLOGIN;
+         IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='oc_migration0219_app') THEN
+           CREATE ROLE oc_migration0219_app NOLOGIN;
          END IF;
        END
        $role$;
-       GRANT USAGE ON SCHEMA public TO oc_migration0218_app;
+       GRANT USAGE ON SCHEMA public TO oc_migration0219_app;
        GRANT SELECT,INSERT,UPDATE ON user_preferences,client_sessions,model_visibility_grants
-         TO oc_migration0218_app;
-       GRANT SELECT ON model_catalog TO oc_migration0218_app;
-       REVOKE ALL ON model_dsv4pro_transition_snapshots FROM oc_migration0218_app;`,
+         TO oc_migration0219_app;
+       GRANT SELECT ON model_catalog TO oc_migration0219_app;
+       REVOKE ALL ON model_dsv4pro_transition_snapshots FROM oc_migration0219_app;`,
     )
     await query(
       `BEGIN;
-       SET LOCAL ROLE oc_migration0218_app;
+       SET LOCAL ROLE oc_migration0219_app;
        UPDATE user_preferences
           SET prefs=jsonb_set(prefs,'{default_model}','"deepseek-v4-pro"'::jsonb,true),
               updated_at=clock_timestamp()
@@ -258,15 +258,15 @@ describe('0218_deepseek_v4_pro_transition', () => {
               p.prosecdef AS security_definer
          FROM pg_proc p
         WHERE p.proname IN (
-          'fn_0218_normalize_user_default_model',
-          'fn_0218_normalize_client_session_model',
-          'fn_0218_normalize_visibility_grant'
+          'fn_0219_normalize_user_default_model',
+          'fn_0219_normalize_client_session_model',
+          'fn_0219_normalize_visibility_grant'
         )
         ORDER BY p.proname`,
     )
     assert.deepEqual(
       objects.rows.map((row) => row.name),
-      ['fn_0218_normalize_client_session_model', 'fn_0218_normalize_user_default_model'],
+      ['fn_0219_normalize_client_session_model', 'fn_0219_normalize_user_default_model'],
     )
     assert.ok(objects.rows.every((row) => row.security_definer))
     assert.equal(new Set(objects.rows.map((row) => row.owner)).size, 1)
@@ -277,10 +277,10 @@ describe('0218_deepseek_v4_pro_transition', () => {
         WHERE c.oid='model_dsv4pro_transition_snapshots'::regclass`,
     )
     assert.equal(snapshotOwner.rows[0]?.owner, objects.rows[0]?.owner)
-    assert.notEqual(snapshotOwner.rows[0]?.owner, 'oc_migration0218_app')
+    assert.notEqual(snapshotOwner.rows[0]?.owner, 'oc_migration0219_app')
   })
 
-  test('addGrant/removeGrant keep the Pro contract after 0218', async (t) => {
+  test('addGrant/removeGrant keep the Pro contract after 0219', async (t) => {
     if (db.skipIfUnavailable(t)) return
     const sql = await prepareFloor()
     const adminId = await createUser('dsv4pro-grant-admin@test.invalid', 'admin')
@@ -454,9 +454,9 @@ describe('0218_deepseek_v4_pro_transition', () => {
     const triggers = await query<{ n: string }>(
       `SELECT count(*)::text AS n FROM pg_trigger
         WHERE tgname IN (
-          'trg_0218_normalize_user_default_model',
-          'trg_0218_normalize_client_session_model',
-          'trg_0218_normalize_visibility_grant'
+          'trg_0219_normalize_user_default_model',
+          'trg_0219_normalize_client_session_model',
+          'trg_0219_normalize_visibility_grant'
         ) AND NOT tgisinternal`,
     )
     assert.equal(triggers.rows[0]?.n, '0')
@@ -470,7 +470,7 @@ describe('0218_deepseek_v4_pro_transition', () => {
     ])
   })
 
-  test('compensation restores official_seed_agent to Flash when that was the pre-0218 source', async (t) => {
+  test('compensation restores official_seed_agent to Flash when that was the pre-0219 source', async (t) => {
     if (db.skipIfUnavailable(t)) return
     const sql = await prepareFloor()
     const rollbackSql = testedManualRollbackSql(sql)
