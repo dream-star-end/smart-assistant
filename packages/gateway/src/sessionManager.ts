@@ -87,6 +87,11 @@ import {
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 import type { TurnModelAuthority, UsageAttributionTag } from './subprocessRunner.js'
 import { startMemoryTurnPolicyLease } from './memoryTurnPolicyLease.js'
+import {
+  applyEfficiencyToolObservation,
+  finalizeEfficiencyTurn,
+  prepareEfficiencyTurnNote,
+} from './agentEfficiencyGuard.js'
 
 const log = createLogger({ module: 'sessionManager' })
 
@@ -651,6 +656,10 @@ export interface AgentSession {
   // 当前 turn 的文本累积器(用于 FTS5 索引)
   currentUserText?: string
   currentAssistantBuf?: string
+  /** Per-turn efficiency linter state (tool_use_detected hook). */
+  _efficiencyTurn?: import('./agentEfficiencyGuard.js').TurnGuardState
+  _efficiencyPendingHits?: import('./agentEfficiencyGuard.js').LintHit[]
+  _efficiencyBudget?: import('./agentEfficiencyGuard.js').VerificationBudget
   // Model name for cost attribution
   model?: string
   // CCB CronCreate bridge: maps tool_use_id/content_key → gateway cron job ID
@@ -3533,6 +3542,17 @@ export class SessionManager {
         session.turns = await getMaxTurnIdx(ids)
       }
       let runnerPayload = userTextOrBlocks
+      try {
+        const efficiencyNote = await prepareEfficiencyTurnNote(
+          session,
+          session.currentUserText ?? '',
+        )
+        if (efficiencyNote && typeof runnerPayload === 'string') {
+          runnerPayload = `${efficiencyNote}\n\n${runnerPayload}`
+        }
+      } catch (err) {
+        log.debug('efficiency guard prepare failed', { sessionKey: session.sessionKey, err: String(err) })
+      }
       const masterHistoricalMessages = Array.isArray(opts?.historicalMessages)
         ? opts.historicalMessages
         : null
@@ -3824,6 +3844,9 @@ export class SessionManager {
         throw err
       }
     } finally {
+      await finalizeEfficiencyTurn(session).catch((err) => {
+        log.debug('efficiency guard finalize failed', { sessionKey: session.sessionKey, err: String(err) })
+      })
       await memoryTurnPolicyLease?.stop().catch((err) => {
         log.warn('memory turn policy cleanup failed', { sessionKey: session.sessionKey, err: String(err) })
       })
@@ -4507,6 +4530,11 @@ export class SessionManager {
         if (e.kind === 'tool_use_detected') {
           const tool = e.tool
           turnToolCallCount++
+          try {
+            applyEfficiencyToolObservation(session, tool, turnToolCallCount)
+          } catch (err) {
+            log.debug('efficiency guard observe failed', { sessionKey: session.sessionKey, err: String(err) })
+          }
           // Bridge CCB CronCreate/CronDelete via EventBus
           if (tool.name === 'CronCreate') {
             const gatewayJobId = `ccb-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
