@@ -234,28 +234,28 @@
       "contentVersion": 2
     },
     "general-public-data-brief": {
-      "contentHash": "2e71f0fa07b827a1991d864a81a38160ddf39d505324f60de4e0a6ee95ed0074",
-      "contentVersion": 2
-    },
-    "research-bike-demand": {
-      "contentHash": "1c9457aaa50687096260885818586af9ef4f2e7ff02240e65ecdd7d8f28ba823",
+      "contentHash": "0c2bac73a724589b58ce9a91d94d0d041465c4acb459b8d17e76d2b017512a20",
       "contentVersion": 3
     },
+    "research-bike-demand": {
+      "contentHash": "0c63f2b953d1696c7ee6a7e6ae30cc4a43195a9395d3eb3791e446e3c30c0ec3",
+      "contentVersion": 4
+    },
     "research-evidence-map": {
-      "contentHash": "379b354b22dfdd8dc0dc0c6a89c27145de11579b3f7d74332263abbbc8d64d72",
-      "contentVersion": 2
+      "contentHash": "42636480d1f42a0c424e364c00879275c8c8f4eace6fe964c962dd43cb892170",
+      "contentVersion": 3
     },
     "research-open-peer-review": {
-      "contentHash": "97e316997c7aa94ab558cafe39865fa98b3b341ab3845cc7f5ca93e7520e717f",
-      "contentVersion": 2
+      "contentHash": "61e1ff13bb1163775394e2ece1cd66c64013e4e1da56e970d5f2ba5002998775",
+      "contentVersion": 3
     },
     "research-replication-audit": {
-      "contentHash": "2d8bda5bed3b794c50c6bea234572e471d7b8c60a7fe06a8ca9863b0e56463c4",
-      "contentVersion": 1
+      "contentHash": "ef90cde15f6ac3f4c903875e4c850cfb1b7a1a2ef08d5c2616bf5cdcee604e90",
+      "contentVersion": 2
     },
     "research-systematic-screening": {
-      "contentHash": "a9bef68d1f0f5ede4b755adb373875a96a07495bc7c81ca17d2ee20de17874a1",
-      "contentVersion": 2
+      "contentHash": "d30d1121aca7345ec66beac83235f6bf757ae1e77160d189e7d9fc633160b53b",
+      "contentVersion": 3
     }
   },
   "catalogSchema": 2,

@@ -559,7 +559,7 @@ describe("migrate.runMigrations", () => {
         .map((row) => [row.state, row.context_window, row.provider_id]),
       [
         ["retired", 200_000, "deepseek"],
-        ["active", 1_000_000, "deepseek"],
+        ["disabled", 1_000_000, "deepseek"],
       ],
     );
     const migration0195Sql = await readFile(
@@ -569,7 +569,7 @@ describe("migrate.runMigrations", () => {
       ),
       "utf8",
     );
-    await assert.rejects(query(migration0195Sql), /execution descriptor history drifted/);
+    await assert.rejects(query(migration0195Sql), /0195: DeepSeek pricing precondition failed|execution descriptor history drifted/);
     assert.deepEqual(
       (await readLineage()).rows,
       clean.rows,
@@ -597,7 +597,7 @@ describe("migrate.runMigrations", () => {
         WHERE model_id = 'deepseek-v4-flash' AND state = 'active'`,
     );
     const mixed = await readLineage();
-    await assert.rejects(query(migration0195Sql), /execution descriptor history drifted/);
+    await assert.rejects(query(migration0195Sql), /0195: DeepSeek pricing precondition failed|execution descriptor history drifted/);
     assert.deepEqual(
       (await readLineage()).rows,
       mixed.rows,

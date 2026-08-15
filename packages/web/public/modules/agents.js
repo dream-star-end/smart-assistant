@@ -35,7 +35,7 @@ const COMMERCIAL_FALLBACK_AGENTS = Object.freeze([
     id: 'scientist',
     displayName: '科研分析师',
     avatarEmoji: '🔬',
-    model: 'deepseek-v4-pro',
+    model: 'deepseek-v4-flash',
     provider: 'deepseek',
   },
   {
@@ -49,7 +49,7 @@ const COMMERCIAL_FALLBACK_AGENTS = Object.freeze([
     id: 'reviewer',
     displayName: '审阅员',
     avatarEmoji: '🧪',
-    model: 'deepseek-v4-pro',
+    model: 'deepseek-v4-flash',
     provider: 'deepseek',
   },
   {

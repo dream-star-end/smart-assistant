@@ -673,7 +673,7 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     // scholar(P2 综述写手)三权威源同步:web fallback 必含,与 entrypoint seed 一致
     assert.match(src, /id:\s*'scholar'/, "web fallback must include the scholar agent");
     assert.match(src, /displayName:\s*'科研写手'/, "web fallback scholar display name must match runtime seed");
-    assert.match(src, /model:\s*'deepseek-v4-pro'/, "web fallback scientist/reviewer must use DeepSeek V4 Pro");
+    assert.match(src, /model:\s*'deepseek-v4-flash'/, "web fallback scientist/reviewer must use DeepSeek V4 Flash");
     assert.match(src, /provider:\s*'deepseek'/, "web fallback scientist/reviewer must use the deepseek provider");
     assert.doesNotMatch(
       src,
