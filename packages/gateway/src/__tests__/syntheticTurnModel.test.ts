@@ -136,7 +136,7 @@ describe('resolveSyntheticTurnModel', () => {
     assert.equal(resolveSyntheticTurnModel(agent({ model: 'gpt-5.6-sol' }), 'glm-5.2'), undefined)
   })
 
-  test('routable gate:兜底 deepseek-v4-pro 但 seam 只有 ark key → undefined(该 provider 不可路由)', () => {
+  test('routable gate:兜底 deepseek-v4-flash 但 seam 只有 ark key → undefined(该 provider 不可路由)', () => {
     delete process.env[ENV_KEY]
     setHostStaticProviderKeys({ ark: 'ark-coding' })
     assert.equal(resolveSyntheticTurnModel(agent({ model: 'gpt-5.6-sol' }), 'glm-5.2'), undefined)

@@ -72,7 +72,7 @@ describe('buildSkillTrainPrompt', () => {
   })
 
   it('embeds the locked model and the lookback window', () => {
-    assert.match(prompt, /Training model: deepseek-v4-pro/)
+    assert.match(prompt, new RegExp(`Training model: ${SKILL_TRAIN_DEFAULT_MODEL}`))
     assert.match(prompt, /2026-06-17T00:00:00\.000Z through 2026-06-18T00:00:00\.000Z/)
   })
 
@@ -146,7 +146,7 @@ describe('buildSkillTrainContext', () => {
     const ctx = buildSkillTrainContext(normalizeSkillTrainArgs({ runId: 'r3' }, 'main'))
     assert.match(ctx, /draft mode/)
     assert.match(ctx, /runId=r3/)
-    assert.match(ctx, /model=deepseek-v4-pro/)
+    assert.match(ctx, new RegExp(`model=${SKILL_TRAIN_DEFAULT_MODEL}`))
     assert.match(ctx, /targetSkill=\(auto\)/)
   })
 })

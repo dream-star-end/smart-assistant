@@ -16,9 +16,9 @@
 // isolation. The actual session creation + DeepSeek binding + draft writes happen in
 // the gateway training Job + the skill_propose tool.
 
-/** Default training model. `pro` is quality-first; `flash` is the cheaper lever. */
-export const SKILL_TRAIN_DEFAULT_MODEL = 'deepseek-v4-pro'
-export const SKILL_TRAIN_MODELS = ['deepseek-v4-pro', 'deepseek-v4-flash'] as const
+/** Default training model. Flash is the only remaining DeepSeek train target after V4 Pro disable. */
+export const SKILL_TRAIN_DEFAULT_MODEL = 'deepseek-v4-flash'
+export const SKILL_TRAIN_MODELS = ['deepseek-v4-flash'] as const
 export type SkillTrainModel = (typeof SKILL_TRAIN_MODELS)[number]
 
 /** Training always runs DeepSeek at max thinking (effort passes through to upstream). */
@@ -34,7 +34,7 @@ export interface SkillTrainArgs {
   maxSessions?: number
   /** Max candidate drafts to stage this run. */
   maxProposals?: number
-  /** DeepSeek variant; defaults to pro. */
+  /** DeepSeek variant; defaults to flash. */
   model?: SkillTrainModel
   focus?: string
 }

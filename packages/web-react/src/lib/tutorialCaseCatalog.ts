@@ -89,7 +89,7 @@ export type TutorialCaseFieldReport = {
 export type TutorialCaseSuggestion = {
   agentId: 'research-assistant' | 'coding-assistant' | 'office-assistant'
   agentName: '科研助手' | '编程助手' | '办公助手'
-  modelId: 'deepseek-v4-pro' | 'glm-5.3' | 'MiniMax-M3'
+  modelId: 'deepseek-v4-flash' | 'glm-5.3' | 'MiniMax-M3'
   modelGuidance: string
   why: string
 }
@@ -184,7 +184,7 @@ const PENDING_REPLAY: TutorialCaseReplay = {
 export const TUTORIAL_CASES = [
   {
     id: 'research-evidence-map',
-    contentVersion: 2,
+    contentVersion: 3,
     category: 'research',
     title: '从 30 篇论文到可追溯证据图谱',
     summary:
@@ -318,7 +318,7 @@ export const TUTORIAL_CASES = [
     suggestion: {
       agentId: 'research-assistant',
       agentName: '科研助手',
-      modelId: 'deepseek-v4-pro',
+      modelId: 'deepseek-v4-flash',
       modelGuidance: '优先选择擅长长上下文与工具调用的高推理模型；筛选阶段不必追求最高档。',
       why: '任务难点在检索留痕与逐条引文核验，不在生成更长的综述。',
     },
@@ -326,7 +326,7 @@ export const TUTORIAL_CASES = [
   },
   {
     id: 'research-bike-demand',
-    contentVersion: 3,
+    contentVersion: 4,
     category: 'research',
     title: '公开数据到可复现的单车需求分析',
     summary:
@@ -439,7 +439,7 @@ export const TUTORIAL_CASES = [
     suggestion: {
       agentId: 'research-assistant',
       agentName: '科研助手',
-      modelId: 'deepseek-v4-pro',
+      modelId: 'deepseek-v4-flash',
       modelGuidance: '用高推理模型制定计划与审查泄漏；机械绘图和测试可交给更快模型。',
       why: '需要代码、统计解释与可复现性三条链同时闭合。',
     },
@@ -475,7 +475,7 @@ export const TUTORIAL_CASES = [
   },
   {
     id: 'research-systematic-screening',
-    contentVersion: 2,
+    contentVersion: 3,
     category: 'research',
     title: '把系统综述筛选做成可审计流水线',
     summary:
@@ -600,7 +600,7 @@ export const TUTORIAL_CASES = [
     suggestion: {
       agentId: 'research-assistant',
       agentName: '科研助手',
-      modelId: 'deepseek-v4-pro',
+      modelId: 'deepseek-v4-flash',
       modelGuidance: '使用两个相互独立的高推理筛选子任务；最后由人做裁决。',
       why: '独立判断与完整分歧记录比让同一模型自我确认更有价值。',
     },
@@ -608,7 +608,7 @@ export const TUTORIAL_CASES = [
   },
   {
     id: 'research-open-peer-review',
-    contentVersion: 2,
+    contentVersion: 3,
     category: 'research',
     title: '对开放论文做逐条可核验同行评议',
     summary:
@@ -722,7 +722,7 @@ export const TUTORIAL_CASES = [
     suggestion: {
       agentId: 'research-assistant',
       agentName: '科研助手',
-      modelId: 'deepseek-v4-pro',
+      modelId: 'deepseek-v4-flash',
       modelGuidance: '高推理模型负责方法和统计审查；另一模型独立检查文字与引用。',
       why: '分工可减少一份流畅总评掩盖证据和严重性边界。',
     },
@@ -730,7 +730,7 @@ export const TUTORIAL_CASES = [
   },
   {
     id: 'research-replication-audit',
-    contentVersion: 1,
+    contentVersion: 2,
     category: 'research',
     title: '复跑固定开放研究并定位复现差异',
     summary:
@@ -860,7 +860,7 @@ export const TUTORIAL_CASES = [
     suggestion: {
       agentId: 'research-assistant',
       agentName: '科研助手',
-      modelId: 'deepseek-v4-pro',
+      modelId: 'deepseek-v4-flash',
       modelGuidance: '编码模型负责环境和日志，科研模型负责预期结果与结论边界。',
       why: '复现失败常混合工程与科研判断，分工后证据边界更清晰。',
     },
@@ -1714,7 +1714,7 @@ export const TUTORIAL_CASES = [
   },
   {
     id: 'general-public-data-brief',
-    contentVersion: 2,
+    contentVersion: 3,
     category: 'general',
     title: '用公开数据做一页市场进入简报',
     summary:
@@ -1855,7 +1855,7 @@ export const TUTORIAL_CASES = [
     suggestion: {
       agentId: 'research-assistant',
       agentName: '科研助手',
-      modelId: 'deepseek-v4-pro',
+      modelId: 'deepseek-v4-flash',
       modelGuidance: '默认模型即可；开启联网和成果预览。',
       why: '数据量小，价值来自来源血缘和结论边界，而不是更昂贵的推理。',
     },

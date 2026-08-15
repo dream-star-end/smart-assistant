@@ -1,7 +1,10 @@
 /**
- * GATING SMOKE — does DeepSeek (deepseek-v4-pro) actually drive the agentic
- * skill-training loop? This is the P0 risk: the whole feature locks training to
- * DeepSeek, so before building the rest we must confirm DeepSeek can, over multiple
+ * GATING SMOKE — does DeepSeek's Anthropic-compatible endpoint actually drive the
+ * agentic skill-training loop? Production train default is now deepseek-v4-flash
+ * (OpenCode Go), but this probe still hits api.deepseek.com with deepseek-v4-pro
+ * to verify the upstream can run the real prompt + tool schemas. Not catalog-gated.
+ *
+ * Original P0 risk: the feature locks training to DeepSeek, so we must confirm it can, over multiple
  * turns, call the discovery tools (skill_list → session_search → skill_view) and then
  * emit a well-formed `skill_propose` — using the REAL training prompt + REAL tool
  * schemas, against the REAL DeepSeek Anthropic-compatible endpoint (mirrors prod:

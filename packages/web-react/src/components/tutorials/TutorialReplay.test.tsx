@@ -99,7 +99,7 @@ function fixture(
         bytes: new TextEncoder().encode(manifestText).byteLength,
         repeatRuns: 3,
         agentId: "research-assistant",
-        modelId: "deepseek-v4-pro",
+        modelId: "deepseek-v4-flash",
         engine: "ccb",
       },
       checkReport: `/tutorials/cases/${caseId}/checks.json`,

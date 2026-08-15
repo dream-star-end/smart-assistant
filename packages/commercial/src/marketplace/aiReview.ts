@@ -1,5 +1,5 @@
 /**
- * 市场发布 AI 自动审批 worker（deepseek-v4-pro）。
+ * 市场发布 AI 自动审批 worker（deepseek-v4-flash）。
  *
  * 设计权威:本次需求方案 + 迁移 0107 头注。skill / agent 发布(同一管线
  * marketplace_skill_versions,kind 判别)从纯人审改为 AI 自动审批,三态:
@@ -51,7 +51,7 @@ import {
 import type { RiskFlag } from './skillScanner.js'
 
 // ─── 常量 ────────────────────────────────────────────────────────────
-export const AI_REVIEW_MODEL = 'deepseek-v4-pro'
+export const AI_REVIEW_MODEL = 'deepseek-v4-flash'
 export const DEFAULT_INTERVAL_MS = 15_000
 export const MIN_INTERVAL_MS = 5_000
 /** 每 tick 最多处理版本数(每个 ≤60s;inflight guard 防 tick 重叠)。 */

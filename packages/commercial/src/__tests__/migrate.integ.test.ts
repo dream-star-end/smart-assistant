@@ -569,7 +569,7 @@ describe("migrate.runMigrations", () => {
       ),
       "utf8",
     );
-    await assert.rejects(query(migration0195Sql), /execution descriptor history drifted/);
+    await assert.rejects(query(migration0195Sql), /0195: deepseek-v4-flash execution descriptor history drifted/);
     assert.deepEqual(
       (await readLineage()).rows,
       clean.rows,
@@ -597,7 +597,7 @@ describe("migrate.runMigrations", () => {
         WHERE model_id = 'deepseek-v4-flash' AND state = 'active'`,
     );
     const mixed = await readLineage();
-    await assert.rejects(query(migration0195Sql), /execution descriptor history drifted/);
+    await assert.rejects(query(migration0195Sql), /0195: deepseek-v4-flash execution descriptor history drifted/);
     assert.deepEqual(
       (await readLineage()).rows,
       mixed.rows,

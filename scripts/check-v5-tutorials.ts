@@ -1057,7 +1057,7 @@ function validateCaseCatalog(): void {
         fail(`${item.id}: 引用了未知产品能力 ${capabilityId}`);
     }
     const officialAgents = {
-      "research-assistant": { name: "科研助手", model: "deepseek-v4-pro" },
+      "research-assistant": { name: "科研助手", model: "deepseek-v4-flash" },
       "coding-assistant": { name: "编程助手", model: "glm-5.3" },
       "office-assistant": { name: "办公助手", model: "MiniMax-M3" },
     } as const;

@@ -421,7 +421,7 @@ function teamMemberCapabilityHint(agent: AgentDef): string {
  *
  * 当前 commercial 暴露集合:
  *   - gpt-5.5 — codex agent 走 codex JSON-RPC(v5 从 picker dropGptForV5Channel,但入站仍受)
- *   - deepseek-v4-pro — master 侧 direct DeepSeek 静态 key 路由
+ *   - deepseek-v4-pro — master 侧 direct DeepSeek 静态 key 路由(入站/回放仍注册;执行下线由 catalog 决定,同 glm-5.1/5.2)
  *   - deepseek-v4-flash — provider-neutral 产品 id，master 侧实际走 OpenCode Go 静态 key 路由
  *     二者都在 claude-subscription agent 上跑即可,不需要切 agent
  *   - MiniMax-M3 — master 侧切到 MiniMax Token Plan Anthropic 兼容端点,
@@ -449,7 +449,6 @@ const ALLOWED_REASONING_EFFORTS = new Set<string>(PLATFORM_REASONING_EFFORTS)
 export const EXECUTION_MODEL_FALLBACK_ROUTE = [
   'glm-5.3',
   'MiniMax-M3',
-  'deepseek-v4-pro',
   'deepseek-v4-flash',
 ] as const
 export const EXECUTION_MODEL_FALLBACK = EXECUTION_MODEL_FALLBACK_ROUTE[0]
@@ -502,7 +501,7 @@ export function resolveExecutionModel(
  * 语义(返回 `SyntheticTurnModel | undefined`):
  *   - agent/默认模型解析为**非 codex** → 返回 `undefined`,尊重原配置,合成路径行为不变;
  *   - 解析为 **codex(模型驱动)** → 返回 `{ model, originalModel, downgraded:true }`:`model` 是
- *     显式非 codex 兜底模型(env `OPENCLAUDE_SYNTHETIC_TURN_MODEL` 覆盖,默认 `deepseek-v4-pro`),
+ *     显式非 codex 兜底模型(env `OPENCLAUDE_SYNTHETIC_TURN_MODEL` 覆盖,默认 `deepseek-v4-flash`),
  *     `originalModel` 是若不降级本会落地的 codex 模型(供用户面/审计**透明披露**降级,不静默换
  *     模型 —— MAJOR-2)。同时补齐这些路径一直缺失的 `model` 路由字段(合成 inbound 铁律)。
  *   - agent.provider === 'codex-native'(**硬 pin**)→ 返回 `undefined`:model 替换救不了它
@@ -521,7 +520,7 @@ export interface SyntheticTurnModel {
   downgraded: true
 }
 
-export const SYNTHETIC_TURN_NON_CODEX_MODEL_DEFAULT = 'deepseek-v4-pro'
+export const SYNTHETIC_TURN_NON_CODEX_MODEL_DEFAULT = 'deepseek-v4-flash'
 export function resolveSyntheticTurnModel(
   agent: Pick<AgentDef, 'id' | 'model' | 'provider'>,
   defaultModel: string | undefined | null,
@@ -539,7 +538,7 @@ export function resolveSyntheticTurnModel(
       : SYNTHETIC_TURN_NON_CODEX_MODEL_DEFAULT
   // ── routable 自检(MAJOR-1)──────────────────────────────────────────────
   // 兜底模型必须在当前进程形态下真正可达:host 上走静态 provider 平台直连,若该 provider 的
-  // 平台 key 未经 commercial seam 注入(缺配 / 个人版),换成 deepseek-v4-pro 也是必 401。此时
+  // 平台 key 未经 commercial seam 注入(缺配 / 个人版),换成 deepseek-v4-flash 也是必 401。此时
   // **不降级**,返回 undefined 让 CODEX_BILLING_GUARD 按原样 fail-closed(Codex 明确:闸的显式
   // 错误优于换一个必 401 的模型)。容器身份 isHostRoutableStaticModel 恒 true(经 master
   // internal proxy 按模型名路由可达),不受影响。
@@ -659,7 +658,7 @@ export function decideLocalExecution(args: {
 /**
  * 合成路径的 codex → 非 codex 降级(真值表 'synthetic' 分支)。
  *
- * 与 `resolveSyntheticTurnModel` 同一套兜底选择(env 覆盖 → deepseek-v4-pro → config 默认 →
+ * 与 `resolveSyntheticTurnModel` 同一套兜底选择(env 覆盖 → deepseek-v4-flash → config 默认 →
  * 平台兜底),差别只在**每一级都必须过投影**(可路由 + 非 codex)——"换一个必 401 的模型"
  * 比闸的显式错误更糟(MAJOR-1 的同构结论):全部兜底都不可路由 → MODEL_NOT_AVAILABLE。
  */

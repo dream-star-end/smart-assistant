@@ -99,9 +99,9 @@ function view(
   })
 }
 
-/** 该 uid 的常规投影:glm-5.2(ccb)+ deepseek-v4-pro(ccb 兜底)+ gpt-5.6-sol(codex)。 */
+/** 该 uid 的常规投影:glm-5.2(ccb)+ deepseek-v4-flash(ccb 兜底)+ gpt-5.6-sol(codex)。 */
 function normalView(): LocalCatalogView {
-  return view([row('glm-5.2', 'ccb'), row('deepseek-v4-pro', 'ccb'), row('gpt-5.6-sol', 'codex')], {
+  return view([row('glm-5.2', 'ccb'), row('deepseek-v4-flash', 'ccb'), row('gpt-5.6-sol', 'codex')], {
     'glm-latest': 'glm-5.2',
   })
 }
@@ -137,7 +137,7 @@ function installCatalog(opts: { fail?: boolean; calls?: string[] } = {}): void {
         {
           models: [
             row('glm-5.2', 'ccb'),
-            row('deepseek-v4-pro', 'ccb'),
+            row('deepseek-v4-flash', 'ccb'),
             row('gpt-5.6-sol', 'codex'),
           ],
           projection_revision: 'proj-1',
@@ -238,14 +238,14 @@ describe('② flag 开 + catalog 可用 → engine/model 取投影', () => {
   })
 
   test('disabled / 未授权模型(不在投影)→ 按多级 route 逐级兜底', () => {
-    // glm / MiniMax 都不在投影，route 第三级 deepseek-v4-pro 可用。
+    // glm / MiniMax 都不在投影，route 末级 deepseek-v4-flash 可用。
     const routed = decideLocalExecution({
-      view: view([row('deepseek-v4-pro', 'ccb')]),
+      view: view([row('deepseek-v4-flash', 'ccb')]),
       agent: { id: 'x', model: 'retired-model' },
       defaultModel: 'missing-default',
       kind: 'turn',
     })
-    assert.equal(routed.canonicalModel, 'deepseek-v4-pro')
+    assert.equal(routed.canonicalModel, 'deepseek-v4-flash')
 
     // 全 route 都不在投影 → 保持结构化 MODEL_NOT_AVAILABLE。
     assert.throws(
@@ -276,7 +276,7 @@ describe('② flag 开 + catalog 可用 → engine/model 取投影', () => {
     assert.equal(d.canonicalModel, 'deepseek-v4-pro')
   })
 
-  test('agent 默认也不可用时按 glm → MiniMax → DeepSeek Pro → Flash 多级路由', () => {
+  test('agent 默认也不可用时按 glm → MiniMax → DeepSeek Flash 多级路由', () => {
     const d = decideLocalExecution({
       view: view([
         row('glm-5.2', 'ccb', { available: false }),
@@ -511,7 +511,7 @@ describe('⑥ cron/synthetic 的 codex 意图 → 降级为非 codex(既有语�
       env: {} as NodeJS.ProcessEnv,
     })
     assert.equal(d.engine, 'ccb')
-    assert.equal(d.canonicalModel, 'deepseek-v4-pro', '默认合成兜底')
+    assert.equal(d.canonicalModel, 'deepseek-v4-flash', '默认合成兜底')
     assert.equal(d.downgradedFrom, 'gpt-5.6-sol', 'MAJOR-2 透明披露:降级不静默')
   })
 
@@ -523,7 +523,7 @@ describe('⑥ cron/synthetic 的 codex 意图 → 降级为非 codex(既有语�
       kind: 'synthetic',
       env: { OPENCLAUDE_SYNTHETIC_TURN_MODEL: 'not-in-projection' } as NodeJS.ProcessEnv,
     })
-    assert.equal(d.canonicalModel, 'deepseek-v4-pro')
+    assert.equal(d.canonicalModel, 'deepseek-v4-flash')
 
     const d2 = decideLocalExecution({
       view: normalView(),
