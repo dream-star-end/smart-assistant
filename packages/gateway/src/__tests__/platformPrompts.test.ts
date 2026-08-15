@@ -311,8 +311,75 @@ describe('fallback 常量 === bundle 文件(逐字同步门)', () => {
     }
     assert.ok(prompt.includes('即使未开启团队模式'))
     assert.ok(prompt.includes('按收益机会式委派'))
+    assert.equal(prompt.match(/### 并行关键路径调度与质量闸门（fan-out 唯一权威）/g)?.length, 1)
+    assert.ok(prompt.includes('专业成员能明显提升质量'))
+    assert.ok(prompt.includes('不覆盖这种质量驱动的单任务路由'))
+    assert.ok(prompt.includes('team-mode 继续服从它的领域优先和 hidden-reviewer 规则'))
+    assert.ok(!prompt.includes('多个互不依赖的读取、搜索或状态检查应在一次工具调用里批量执行'))
+
+    for (const contract of [
+      '当前已知用户要求和验收标准的最小充分工作集',
+      '并行只重排这个工作集,不扩大任务或证据范围',
+      '不得为凑并行增加来源、重复目标或预启动备用路径',
+      '只有用户要求、新证据或真实失败改变了完整交付所需内容时,才受控更新工作集',
+      '当前已就绪、互不依赖且不写同一状态',
+      '一次原生批量/并发调用同时启动',
+      '节省的关键路径时间大于委派、整合和验证开销',
+      '平台 1–4 fan-out、递归、并发、轮次、计费和工具集限制',
+      '来源、范围、格式、安全和验收约束同时约束每个工具目标与 child context',
+      '父 agent 按验收项核对',
+      '解决来源冲突,无法解决时如实披露',
+      '只丢弃已证伪或越界内容',
+      '只交付有证据支持的事实和完整产物',
+      '内部编排默认不倾倒到最终内容',
+      '用户要求方法或审计过程、或解释限制所必需时必须保留',
+      '只为尚未完成的必需项选择一个修正后的工具或路径',
+      '不得在失败前并发重复同一目标或同时尝试多个推测性 fallback',
+      '有依赖关系的步骤、共享状态写入、简单任务或协调/验证开销更高的工作保持串行/直接执行',
+      '不得为了满足规则而并行或委派',
+    ]) {
+      assert.ok(prompt.includes(contract), `并行关键路径规则缺契约: ${contract}`)
+    }
+
+    const authorityStart = prompt.indexOf('### 并行关键路径调度与质量闸门（fan-out 唯一权威）')
+    const authorityEnd = prompt.indexOf('\n子 agent 在隔离上下文中运行', authorityStart)
+    assert.ok(authorityStart >= 0 && authorityEnd > authorityStart)
+    const authority = prompt.slice(authorityStart, authorityEnd)
+    for (const trainingSpecific of [
+      'V1',
+      'V2',
+      'Node',
+      '浏览器',
+      'SQLite',
+      'PostgreSQL',
+      'Git',
+      '论文',
+      'browser-version',
+      'storage-failure-domain',
+      'source-trap',
+    ]) {
+      assert.ok(
+        !authority.includes(trainingSpecific),
+        `fan-out 权威段不应特化训练领域: ${trainingSpecific}`,
+      )
+    }
+    assert.doesNotMatch(authority.replace('1–4', ''), /\d/, 'fan-out 权威段不应新增数字阈值')
     assert.ok(!prompt.includes('Agent 工具 spawn 子 agent'))
     assert.ok(!prompt.includes('子 agent 会继承你的全部工具和上下文'))
+  })
+  it('team-mode 专业路由、hidden-reviewer 与平台委派安全边界保持原契约', () => {
+    const server = readFileSync('packages/gateway/src/server.ts', 'utf8')
+    for (const contract of [
+      "if (teamMode && agent.id === 'main')",
+      '领域匹配优先于泛泛并行',
+      '只走 `delegate_task` / `delegate_tasks`',
+      '平台已停用 codex 原生 `Agent`/子进程编排',
+      '`request_review(draft)`',
+      '除非任务明显简单',
+      '单次最多 4 个',
+    ]) {
+      assert.ok(server.includes(contract), `team-mode 既有契约缺失: ${contract}`)
+    }
   })
   it('选择题使用运行时专用 Ask 工具，不再把 options 富块当交互入口', () => {
     const prompt = _platformPromptFallbacks.PLATFORM_CAPABILITIES_FALLBACK
