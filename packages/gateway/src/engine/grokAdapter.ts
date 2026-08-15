@@ -31,7 +31,7 @@ import { engineSessionId } from './engineSessionId.js'
 import { type EngineCreateOpts, registerEngine } from './registry.js'
 import { buildCodexEnv } from './codexShared.js'
 import { createLogger } from '../logger.js'
-import { killProcessGroup, shutdownTimeoutMs, waitForCloseWithin } from '../processGroupShutdown.js'
+import { detachChildStdio, killProcessGroup, shutdownTimeoutMs, waitForCloseWithin } from '../processGroupShutdown.js'
 
 const log = createLogger({ module: 'grokAdapter' })
 
@@ -145,6 +145,7 @@ interface GrokTurnContext {
   stderr: string
   terminal: boolean
   procClosed: boolean
+  abandoned: boolean
   interrupted: boolean
   errorDetail: string | null
   lastUsage: ReturnType<typeof grokUsage>
@@ -212,6 +213,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       stderr: '',
       terminal: false,
       procClosed: false,
+      abandoned: false,
       interrupted: false,
       errorDetail: null,
       lastUsage: grokUsage({}),
@@ -327,6 +329,10 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       this.emit('error', err)
     })
     proc.once('close', (code, signal) => {
+      // shutdown() may have already given up on this process and finalized the
+      // turn. `drain`, `resolveDrain` and `active` are adapter-level and by now
+      // belong to a later turn, which this handler must not touch.
+      if (ctx.abandoned) return
       ctx.procClosed = true
       if (stdoutBuffer.trim()) this.handleLine(ctx, stdoutBuffer.trim())
       this.resolveDrain?.()
@@ -626,9 +632,13 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       sessionKey: this.opts.sessionKey,
       pid: proc.pid,
     })
-    // Release the barrier so the caller can persist a terminal snapshot. The
-    // 'close' handler stays attached: if the escaped descendant ever exits,
-    // its late output is still parsed into this turn.
+    // Finish the turn here rather than leaving anything to 'close'. The
+    // descendant can hold the pipe for hours, and by then the barrier and
+    // `active` belong to a later turn that a stale handler would resolve and
+    // terminate early.
+    ctx.abandoned = true
+    detachChildStdio(proc)
+    if (!ctx.terminal) this.finishError(ctx, 'grok did not exit after SIGKILL')
     this.resolveDrain?.()
     this.resolveDrain = null
     if (this.active === ctx) this.active = null

@@ -953,4 +953,98 @@ setInterval(() => {}, 1000);
       await rm(dir, { recursive: true, force: true })
     }
   })
+
+  // Giving up on a process hands it to the OS but keeps the adapter alive for
+  // the next turn. The abandoned turn's 'close' can then fire hours later,
+  // when the barrier it would resolve and the `active` context it would clear
+  // belong to a live turn — freezing that turn's transcript mid-stream.
+  test('a late close from an abandoned turn cannot settle the next one', { timeout: 20_000 }, async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-late-close-'))
+    const escaping = path.join(dir, 'escaping.cjs')
+    const surviving = path.join(dir, 'surviving.cjs')
+    const escapedPidFile = path.join(dir, 'escaped.pid')
+    await writeFile(path.join(dir, 'persona.md'), 'PERSONA')
+    await writeFile(
+      escaping,
+      `#!/usr/bin/env node
+const { spawn } = require('node:child_process'); const fs = require('node:fs');
+const escaped = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'],
+  { detached: true, stdio: ['ignore', 'inherit', 'inherit'] });
+escaped.unref();
+fs.writeFileSync(${JSON.stringify(escapedPidFile)}, String(escaped.pid));
+setInterval(() => {}, 1000);
+`,
+    )
+    await writeFile(
+      surviving,
+      `#!/usr/bin/env node
+console.log(JSON.stringify({ type: 'assistant', text: 'the live turn' }));
+setInterval(() => {}, 1000);
+`,
+    )
+    await chmod(escaping, 0o755)
+    await chmod(surviving, 0o755)
+    const oldBin = process.env.OC_CURSOR_WRAPPER_BIN
+    const oldGrace = process.env.OPENCLAUDE_CURSOR_SHUTDOWN_GRACE_MS
+    const oldFinal = process.env.OPENCLAUDE_CURSOR_SHUTDOWN_FINAL_DRAIN_MS
+    process.env.OPENCLAUDE_CURSOR_SHUTDOWN_GRACE_MS = '150'
+    process.env.OPENCLAUDE_CURSOR_SHUTDOWN_FINAL_DRAIN_MS = '150'
+    const adapter = new CursorAdapter(opts(dir))
+    adapter.on('error', () => {})
+    let escapedPid: number | undefined
+    try {
+      process.env.OC_CURSOR_WRAPPER_BIN = escaping
+      const abandoned = adapter.submitTurn({
+        input: 'turn whose descendant never lets go of stdout',
+        requestId: REQUEST,
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await abandoned.submitted
+      for (let i = 0; i < 200 && escapedPid === undefined; i += 1) {
+        try {
+          escapedPid = Number.parseInt(await readFile(escapedPidFile, 'utf8'), 10)
+        } catch {
+          await new Promise((ready) => setTimeout(ready, 25))
+        }
+      }
+      assert.ok(escapedPid, 'the fake wrapper never spawned its escaped descendant')
+      adapter.interrupt()
+      await adapter.shutdown()
+
+      process.env.OC_CURSOR_WRAPPER_BIN = surviving
+      const live = adapter.submitTurn({
+        input: 'the turn that must not be settled by its predecessor',
+        requestId: REQUEST,
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await live.submitted
+
+      // Whatever the abandoned wrapper was still holding is released now.
+      process.kill(escapedPid, 'SIGKILL')
+      escapedPid = undefined
+
+      const stillOpen = Symbol('still-open')
+      const settled: unknown = await Promise.race([
+        adapter.waitForOutputDrain().then(() => 'drained'),
+        new Promise((late) => setTimeout(() => late(stillOpen), 500)),
+      ])
+      assert.equal(settled, stillOpen, 'the abandoned turn resolved the live turn\'s close barrier')
+      assert.equal(adapter.isRunning, true)
+      assert.equal(live.finalized, false)
+      live.end()
+    } finally {
+      if (escapedPid) {
+        try { process.kill(escapedPid, 'SIGKILL') } catch { /* already reaped */ }
+      }
+      await adapter.shutdown().catch(() => {})
+      restoreEnv('OC_CURSOR_WRAPPER_BIN', oldBin)
+      restoreEnv('OPENCLAUDE_CURSOR_SHUTDOWN_GRACE_MS', oldGrace)
+      restoreEnv('OPENCLAUDE_CURSOR_SHUTDOWN_FINAL_DRAIN_MS', oldFinal)
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
 })

@@ -300,4 +300,98 @@ setInterval(() => {}, 1000)
       await rm(dir, { recursive: true, force: true })
     }
   })
+
+  // Giving up on a process hands it to the OS but keeps the adapter alive for
+  // the next turn. The abandoned turn's 'close' can then fire hours later,
+  // when the barrier it would resolve and the `active` context it would clear
+  // belong to a live turn — freezing that turn's transcript mid-stream.
+  test('a late close from an abandoned turn cannot settle the next one', { timeout: 20_000 }, async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-grok-late-close-'))
+    const escaping = path.join(dir, 'fake-grok-escaping.cjs')
+    const surviving = path.join(dir, 'fake-grok-surviving.cjs')
+    const escapedPidFile = path.join(dir, 'escaped.pid')
+    await writeFile(escaping, `#!/usr/bin/env node
+const { spawn } = require('node:child_process')
+const fs = require('node:fs')
+const escaped = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'],
+  { detached: true, stdio: ['ignore', 'inherit', 'inherit'] })
+escaped.unref()
+fs.writeFileSync(process.env.FAKE_GROK_ESCAPED_PID, String(escaped.pid))
+setInterval(() => {}, 1000)
+`)
+    await writeFile(surviving, `#!/usr/bin/env node
+setInterval(() => {}, 1000)
+`)
+    await chmod(escaping, 0o755)
+    await chmod(surviving, 0o755)
+    const previousBin = process.env.OC_GROK_CLI_BIN
+    const previousPidFile = process.env.FAKE_GROK_ESCAPED_PID
+    const previousGrace = process.env.OPENCLAUDE_GROK_SHUTDOWN_GRACE_MS
+    const previousFinal = process.env.OPENCLAUDE_GROK_SHUTDOWN_FINAL_DRAIN_MS
+    process.env.FAKE_GROK_ESCAPED_PID = escapedPidFile
+    process.env.OPENCLAUDE_GROK_SHUTDOWN_GRACE_MS = '150'
+    process.env.OPENCLAUDE_GROK_SHUTDOWN_FINAL_DRAIN_MS = '150'
+    const adapter = new GrokAdapter(createOpts(dir))
+    adapter.setGrokRoute({
+      baseUrl: `http://127.0.0.1:18789/internal/v5/grok-relay/route/${TOKEN}/v1`,
+      routeToken: TOKEN,
+    })
+    adapter.on('error', () => {})
+    let escapedPid: number | undefined
+    try {
+      process.env.OC_GROK_CLI_BIN = escaping
+      const abandoned = adapter.submitTurn({
+        input: 'turn whose descendant never lets go of stdout',
+        requestId: REQUEST_ID,
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await abandoned.submitted
+      for (let i = 0; i < 200 && escapedPid === undefined; i += 1) {
+        try {
+          escapedPid = Number.parseInt(await readFile(escapedPidFile, 'utf8'), 10)
+        } catch {
+          await new Promise<void>((ready) => setTimeout(ready, 25))
+        }
+      }
+      assert.ok(escapedPid, 'the fake CLI never spawned its escaped descendant')
+      adapter.interrupt()
+      await adapter.shutdown()
+
+      process.env.OC_GROK_CLI_BIN = surviving
+      const live = adapter.submitTurn({
+        input: 'the turn that must not be settled by its predecessor',
+        requestId: REQUEST_ID,
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await live.submitted
+
+      // Whatever the abandoned CLI was still holding is released now.
+      process.kill(escapedPid, 'SIGKILL')
+      escapedPid = undefined
+
+      const stillOpen = Symbol('still-open')
+      const settled: unknown = await Promise.race([
+        adapter.waitForOutputDrain().then(() => 'drained'),
+        new Promise((late) => setTimeout(() => late(stillOpen), 500)),
+      ])
+      assert.equal(settled, stillOpen, 'the abandoned turn resolved the live turn\'s close barrier')
+      assert.equal(adapter.isRunning, true)
+      assert.equal(live.finalized, false)
+      live.end()
+    } finally {
+      if (escapedPid) {
+        try { process.kill(escapedPid, 'SIGKILL') } catch { /* already reaped */ }
+      }
+      await adapter.shutdown().catch(() => {})
+      restoreEnv('OC_GROK_CLI_BIN', previousBin)
+      restoreEnv('FAKE_GROK_ESCAPED_PID', previousPidFile)
+      restoreEnv('OPENCLAUDE_GROK_SHUTDOWN_GRACE_MS', previousGrace)
+      restoreEnv('OPENCLAUDE_GROK_SHUTDOWN_FINAL_DRAIN_MS', previousFinal)
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
 })

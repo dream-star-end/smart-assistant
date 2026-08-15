@@ -7,6 +7,8 @@
  * turn's stdout open, and a caller blocked on the close barrier would never
  * write a terminal state. */
 
+import type { Readable } from 'node:stream'
+
 type SignalTarget = {
   pid?: number | undefined
   kill(signal: NodeJS.Signals): boolean
@@ -48,5 +50,29 @@ export function killProcessGroup(proc: SignalTarget, signal: NodeJS.Signals): vo
     proc.kill(signal)
   } catch {
     /* ignore */
+  }
+}
+
+/** Drop our read ends of a child's stdio.
+ *
+ * A descendant that outlived a process-group SIGKILL still owns the write
+ * ends, so 'close' never fires and the fds stay pinned for as long as the
+ * gateway runs. Releasing our side both frees them and is usually what finally
+ * lets 'close' fire. */
+export function detachChildStdio(proc: {
+  stdout?: Readable | null
+  stderr?: Readable | null
+}): void {
+  for (const stream of [proc.stdout, proc.stderr]) {
+    if (!stream) continue
+    try {
+      stream.removeAllListeners('data')
+      // An unhandled 'error' from the teardown itself would take the gateway
+      // down, and nothing above this point listens on the streams.
+      stream.on('error', () => {})
+      stream.destroy()
+    } catch {
+      /* already torn down */
+    }
   }
 }

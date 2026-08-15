@@ -23,7 +23,7 @@ import { classifyRunError } from '../errorClassify.js'
 import { createLogger } from '../logger.js'
 import { resolveMcpMemoryEntry } from '../mcpMemoryEntry.js'
 import { getPlatformPrompt } from '../platformPrompts.js'
-import { killProcessGroup, shutdownTimeoutMs, waitForCloseWithin } from '../processGroupShutdown.js'
+import { detachChildStdio, killProcessGroup, shutdownTimeoutMs, waitForCloseWithin } from '../processGroupShutdown.js'
 import { buildPromptContext } from '../promptSlots.js'
 
 const log = createLogger({ module: 'cursorAdapter' })
@@ -113,7 +113,7 @@ interface TurnCtx {
   params: TurnParams; startedAt: number; proc: ChildProcessByStdio<null, Readable, Readable> | null
   assistantText: string; thinkingText: string; assistantSegments: SegmentRecord[]; thinkingSegments: SegmentRecord[]
   tools: Map<string, TurnToolEntry>; pending: Set<string>; startedTools: Map<string, number>
-  stderr: string; terminal: boolean; procClosed: boolean; interrupted: boolean; error: string | null; usage?: ReportedUsage
+  stderr: string; terminal: boolean; procClosed: boolean; abandoned: boolean; interrupted: boolean; error: string | null; usage?: ReportedUsage
   assistantPartialText: string; pendingAssistantText: string | null
   assistantSegmentClosed: boolean; thinkingSegmentClosed: boolean
   contextDir: string | null
@@ -488,7 +488,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
   submitTurn(params: TurnParams): EngineTurnRun {
     let resolve!: (value: TurnSummary | null) => void
     const summary = new Promise<TurnSummary | null>((r) => { resolve = r })
-    const ctx: TurnCtx = { params, startedAt: Date.now(), proc: null, assistantText: '', thinkingText: '', assistantSegments: [], thinkingSegments: [], tools: new Map(), pending: new Set(), startedTools: new Map(), stderr: '', terminal: false, procClosed: false, interrupted: false, error: null, assistantPartialText: '', pendingAssistantText: null, assistantSegmentClosed: false, thinkingSegmentClosed: false, contextDir: null, rawToSafeToolId: new Map(), safeToRawToolId: new Map(), fallbackToolSequence: 0, resolve }
+    const ctx: TurnCtx = { params, startedAt: Date.now(), proc: null, assistantText: '', thinkingText: '', assistantSegments: [], thinkingSegments: [], tools: new Map(), pending: new Set(), startedTools: new Map(), stderr: '', terminal: false, procClosed: false, abandoned: false, interrupted: false, error: null, assistantPartialText: '', pendingAssistantText: null, assistantSegmentClosed: false, thinkingSegmentClosed: false, contextDir: null, rawToSafeToolId: new Map(), safeToRawToolId: new Map(), fallbackToolSequence: 0, resolve }
     this.active = ctx; this.lastActivityAt = Date.now(); this.drain = new Promise((r) => { this.resolveDrain = r })
     const submitted = this.spawnTurn(ctx).catch((err) => { this.cleanupContextDir(ctx); if (!ctx.terminal) this.finish(ctx, String(err)); this.resolveDrain?.(); this.resolveDrain = null; if (this.active === ctx) this.active = null; throw err })
     return { submitted, summary, end: () => this.forceEnd(ctx), getPartialSnapshot: () => snapshot(ctx), getPhantomSignals: () => ({ ...EMPTY_SIGNALS }), get finalized() { return ctx.terminal }, get pendingToolCalls() { return ctx.pending.size } }
@@ -624,6 +624,10 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         this.emit('error', err)
       })
       proc.once('close', (code, signal) => {
+        // shutdown() may have already given up on this process and finalized
+        // the turn. `drain`, `resolveDrain` and `active` are adapter-level and
+        // by now belong to a later turn, which this handler must not touch.
+        if (ctx.abandoned) return
         ctx.procClosed = true
         if (buffer.trim()) this.handleLine(ctx, buffer.trim())
         this.flushPendingAssistant(ctx, false)
@@ -803,10 +807,14 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
       sessionKey: this.opts.sessionKey,
       pid: proc.pid,
     })
-    // Release the barrier so the caller can persist a terminal snapshot. The
-    // 'close' handler stays attached: if the escaped descendant ever exits,
-    // its late output is still parsed into this turn.
+    // Finish the turn here rather than leaving anything to 'close'. The
+    // descendant can hold the pipe for hours, and by then the barrier and
+    // `active` belong to a later turn that a stale handler would resolve and
+    // terminate early.
+    ctx.abandoned = true
+    detachChildStdio(proc)
     this.cleanupContextDir(ctx)
+    if (!ctx.terminal) this.finish(ctx, 'Cursor CLI did not exit after SIGKILL')
     this.resolveDrain?.()
     this.resolveDrain = null
     if (this.active === ctx) this.active = null
