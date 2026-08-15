@@ -148,6 +148,16 @@ export const TurnCompletedEvent = Type.Intersect([
     /** PR2 v1.0.66 — server-owned per-turn id;codex-native turn 才有,subprocess
      *  / 旧 codex exec 路径不带。给 audit / 异步 settle 关联 inflightCodexTurns 用。 */
     requestId: Type.Optional(Type.String()),
+    /** How the turn ended. Absent on historical events means completed. */
+    terminalStatus: Type.Optional(Type.Union([
+      Type.Literal('completed'),
+      Type.Literal('error'),
+      Type.Literal('crashed'),
+      Type.Literal('aborted'),
+      Type.Literal('stopped'),
+      Type.Literal('timeout'),
+      Type.Literal('reconciled'),
+    ])),
   }),
 ])
 export type TurnCompletedEvent = Static<typeof TurnCompletedEvent>
