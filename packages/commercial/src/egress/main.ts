@@ -163,6 +163,8 @@ export async function startEgress(): Promise<void> {
     // 2026-07-07:切回 MiniMax 官方(回退 06-30 火山迁移;火山 Ark 大图识图挂死,官方 4.9s)。
     minimax: cfg.MINIMAX_TOKEN_PLAN_KEY,
     ark: cfg.ARK_CODING_PLAN_KEY,
+    // 2026-08-15:智谱国际版 Z.AI GLM Coding Plan(glm-5.3-zai)。
+    zai: cfg.ZAI_CODING_PLAN_KEY,
     // 2026-07-05:OpenCode Go(qwen3.7-max/plus)。与 master internalProxyHandler 同口径注入。
     opencodego: cfg.OPENCODE_GO_API_KEY,
     // 2026-07-06:火山 Agent Plan Kimi(kimi-k2.7-code),与 minimax 共 ARK_AGENT_PLAN_KEY。

@@ -138,6 +138,55 @@ describe('oc-cursor wrapper', () => {
     assert.match(buildSource, /OC_INCLUDE_CURSOR=\$\{OC_INCLUDE_CURSOR:-0\}/)
   })
 
+  // Absolute paths make executable resolution deterministic, but they also
+  // make a tool that is absent from the runtime image exit 127 — and every
+  // call in the termination path is followed by `|| true`. That is how
+  // /bin/kill (procps, which the image does not install) turned the whole
+  // Stop path into dead code that still passed on a developer host.
+  test('never depends on an absolute-path tool it has not asserted is present', () => {
+    const wrapperSource = readFileSync(sourceWrapper, 'utf8')
+    const declaration = wrapperSource.match(/for required_tool in ([\s\S]*?); do/)
+    assert.ok(declaration, 'the wrapper must assert its required tools up front')
+    const declared = new Set(declaration[1]!.split(/\s+/).filter((token) => token.startsWith('/')))
+    const body = wrapperSource
+      .split('\n')
+      .filter((line) => !line.trimStart().startsWith('#'))
+      .join('\n')
+      .replace(/for required_tool in [\s\S]*?; do/, '')
+    const invoked = new Set(body.match(/\/(?:usr\/)?bin\/[A-Za-z0-9_.-]+/g) ?? [])
+    // These two resolve SELF_ROOT before `die` exists, and their absence is
+    // already fatal through the `[ -d "$SELF_ROOT" ]` guard.
+    invoked.delete('/usr/bin/dirname')
+    invoked.delete('/usr/bin/readlink')
+    assert.deepEqual([...invoked].filter((tool) => !declared.has(tool)).sort(), [])
+
+    assert.doesNotMatch(
+      body,
+      /\/bin\/kill/,
+      'kill must stay the shell builtin: /bin/kill is procps, absent from the runtime image',
+    )
+    assert.match(body, /kill -TERM "-\$child_pid"/)
+    assert.match(body, /kill -KILL "-\$child_pid"/)
+  })
+
+  test('fails closed when the runtime image lacks a tool it invokes by absolute path', () => {
+    const f = fixture()
+    const broken = join(f.dir, 'oc-cursor-missing-tool')
+    writeFileSync(
+      broken,
+      readFileSync(f.wrapper, 'utf8').replace('/usr/bin/stat', '/usr/bin/oc-absent-tool'),
+      { mode: 0o755 },
+    )
+    chmodSync(broken, 0o755)
+    const result = spawnSync(broken, ['--', 'hello'], {
+      cwd: f.dir,
+      env: f.env,
+      encoding: 'utf8',
+    })
+    assert.equal(result.status, 2)
+    assert.match(result.stderr, /runtime image is missing \/usr\/bin\/oc-absent-tool/)
+  })
+
   test('injects the key only into a one-shot child and preserves stream-json output byte-for-byte', () => {
     const f = fixture()
     const result = spawnSync(
@@ -303,6 +352,7 @@ describe('oc-cursor wrapper', () => {
   test('ignores user-writable PATH shims for every security-sensitive executable', () => {
     const f = fixture()
     for (const name of [
+      'kill',
       'readlink',
       'dirname',
       'sudo',
@@ -328,6 +378,7 @@ describe('oc-cursor wrapper', () => {
     })
     assert.equal(result.status, 0, result.stderr)
     for (const name of [
+      'kill',
       'readlink',
       'dirname',
       'sudo',

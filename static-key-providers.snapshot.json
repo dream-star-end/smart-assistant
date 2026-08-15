@@ -4,7 +4,6 @@
     {
       "id": "deepseek",
       "inboundModelIds": [
-        "deepseek-v4-flash",
         "deepseek-v4-pro"
       ],
       "maxInputTokens": null,
@@ -38,9 +37,21 @@
       "supportsVision": false
     },
     {
+      "id": "zai",
+      "inboundModelIds": [
+        "glm-5.3-zai"
+      ],
+      "maxInputTokens": 1000000,
+      "upstreamEndpoint": "https://api.z.ai/api/anthropic/v1/messages",
+      "capabilityZero": true,
+      "contextWindow": 1000000,
+      "supportsVision": false
+    },
+    {
       "id": "opencodego",
       "inboundModelIds": [
         "deepseek-v4-flash-opencode-go",
+        "deepseek-v4-flash",
         "qwen3.7-max",
         "qwen3.7-plus"
       ],
@@ -75,7 +86,8 @@
     {
       "id": "moonshot",
       "inboundModelIds": [
-        "kimi-k3"
+        "kimi-k3",
+        "k3-256k"
       ],
       "maxInputTokens": 1048576,
       "upstreamEndpoint": "https://api.kimi.com/coding/v1/messages",

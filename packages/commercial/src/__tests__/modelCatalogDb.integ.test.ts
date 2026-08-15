@@ -79,7 +79,11 @@ before(async () => {
   // 每个用例从该快照原样还原(状态机是单向的,不能靠 UPDATE 复位 —— retired 行不可逆)。
   await dropSchema();
   await runMigrations();
-  await query("CREATE TABLE _fx_catalog AS TABLE model_catalog");
+  // 单用例状态机地板只保留当前 live 版本。后续迁移允许同 model_id 留存 retired
+  // 审计历史（0215/0216 都会产生）；把历史行复制进每个用例会让按 model_id 操作的
+  // 0143 单版本状态机用例同时命中 immutable retired 行，而不是在测目标 live 行。
+  // 版本切换用例会从这份 live 地板自行产生并断言 retired 历史。
+  await query("CREATE TABLE _fx_catalog AS SELECT * FROM model_catalog WHERE state <> 'retired'");
   await query("CREATE TABLE _fx_pricing AS TABLE model_pricing");
 });
 
@@ -140,6 +144,7 @@ function expectedContextWindow(modelId: string): number | null {
   if (m === "glm-5.1") return 200_000;
   if (m === "qwen3.7-max" || m === "qwen3.7-plus") return 1_000_000;
   if (m === "kimi-k2.7-code") return 256_000;
+  if (m === "k3-256k") return 262_144;
   if (m === "kimi-k3" || m === "kimi-k3-ark") return 1_048_576;
   return 200_000;
 }
@@ -192,7 +197,7 @@ describe("0143 回填 + 后续 catalog engine 迁移", () => {
         r.upstream_model_id,
         id === "kimi-k3-ark"
           ? "kimi-k3"
-          : id === "deepseek-v4-flash-opencode-go"
+          : id === "deepseek-v4-flash" || id === "deepseek-v4-flash-opencode-go"
             ? "deepseek-v4-flash"
             : id === "glm-5.3"
               ? "glm-5.3"

@@ -44,10 +44,12 @@ const NOOP_DEPS: PickUpstreamDeps = {
   },
   staticProviderKeys: {
     ark: "ark-key",
+    zai: "zai-key",
     deepseek: "ds-key",
     minimax: "mm-key",
     opencodego: "opencode-go-key",
     "ark-k3": "ark-plan-key",
+    moonshot: "moonshot-key",
     bailian: "bailian-key",
   },
 };
@@ -105,15 +107,15 @@ describe("selectUpstreamRoute — provider_id 驱动(catalog hint)", () => {
     assert.deepEqual((requestBody as { thinking?: unknown }).thinking, { type: "disabled" });
   });
 
-  test("opencodego catalog descriptor 保持 canonical 计费 id 与 upstream 型号分离", async () => {
-    const route = selectUpstreamRoute("deepseek-v4-flash-opencode-go", {
+  test("opencodego catalog descriptor 让 provider-neutral canonical id 走 Go transport", async () => {
+    const route = selectUpstreamRoute("deepseek-v4-flash", {
       providerId: "opencodego",
       upstreamModelId: "deepseek-v4-flash",
     });
-    const r = await pickUpstream(NOOP_DEPS, body("deepseek-v4-flash-opencode-go"), route, log);
+    const r = await pickUpstream(NOOP_DEPS, body("deepseek-v4-flash"), route, log);
     assert.ok(r.ok);
     const headers: Record<string, string> = {};
-    r.session.applyUpstreamAuth(headers, body("deepseek-v4-flash-opencode-go"), log);
+    r.session.applyUpstreamAuth(headers, body("deepseek-v4-flash"), log);
     assert.equal(r.session.upstreamModel, "deepseek-v4-flash");
     assert.equal(headers["x-api-key"], "opencode-go-key");
     assert.equal(headers.authorization, undefined);
@@ -130,6 +132,40 @@ describe("selectUpstreamRoute — provider_id 驱动(catalog hint)", () => {
     r.session.applyUpstreamAuth(headers, body("catalog-qwen-max"), log);
     assert.equal(headers["x-api-key"], "bailian-key");
     assert.equal(r.session.upstreamModel, "qwen3.8-max");
+  });
+
+  test("zai catalog descriptor 保持 canonical alias，transport 使用 glm-5.3 + Bearer/direct", async () => {
+    const route = selectUpstreamRoute("glm-5.3-zai", {
+      providerId: "zai",
+      upstreamModelId: "glm-5.3",
+    });
+    const r = await pickUpstream(NOOP_DEPS, body("glm-5.3-zai"), route, log);
+    assert.ok(r.ok);
+    assert.equal(r.session.endpoint, "https://api.z.ai/api/anthropic/v1/messages");
+    assert.equal(r.session.upstreamModel, "glm-5.3");
+    assert.equal(r.session.dispatcher, directEgressDispatcher());
+
+    const headers: Record<string, string> = { "anthropic-beta": "strip-me" };
+    const requestBody = {
+      model: "glm-5.3-zai",
+      output_config: { effort: "high", task_budget: { tokens: 1 } },
+      context_management: { edits: [] },
+      service_tier: "auto",
+      thinking: { type: "enabled", budget_tokens: 1024 },
+    } as unknown as Parameters<typeof r.session.applyUpstreamAuth>[1];
+    r.session.applyUpstreamAuth(headers, requestBody, log);
+    assert.equal(headers.authorization, "Bearer zai-key");
+    assert.equal(headers["x-api-key"], undefined);
+    assert.equal(headers["anthropic-beta"], undefined);
+    assert.deepEqual((requestBody as { output_config?: unknown }).output_config, {
+      effort: "high",
+    });
+    assert.equal((requestBody as { context_management?: unknown }).context_management, undefined);
+    assert.equal((requestBody as { service_tier?: unknown }).service_tier, undefined);
+    assert.deepEqual((requestBody as { thinking?: unknown }).thinking, {
+      type: "enabled",
+      budget_tokens: 1024,
+    });
   });
 
   test("provider_id='anthropic' / null → OAuth 池", () => {
@@ -156,6 +192,8 @@ describe("selectUpstreamRoute — provider_id 驱动(catalog hint)", () => {
     assert.equal(selectUpstreamRoute("deepseek-v4-pro").kind, "static");
     assert.equal(selectUpstreamRoute("glm-5.2").kind, "static");
     assert.equal(selectUpstreamRoute("glm-5.3").kind, "static");
+    assert.equal(selectUpstreamRoute("glm-5.3-zai").kind, "static");
+    assert.equal(selectUpstreamRoute("deepseek-v4-flash").kind, "static");
     assert.equal(selectUpstreamRoute("deepseek-v4-flash-opencode-go").kind, "static");
     assert.equal(selectUpstreamRoute("MiniMax-M3").kind, "static");
     assert.equal(selectUpstreamRoute("claude-sonnet-4-5").kind, "oauth");
@@ -220,6 +258,21 @@ describe("能力上限:catalog capability ⊆ provider 机制上限", () => {
     );
   });
 
+  test("zai 机制 ceiling = vision=false / efforts=[high,max]", () => {
+    const zai = providerCapabilityCeiling(
+      selectUpstreamRoute("glm-5.3-zai", {
+        providerId: "zai",
+        upstreamModelId: "glm-5.3",
+      }),
+    );
+    assert.equal(zai.supportsVision, false);
+    assert.deepEqual([...(zai.efforts ?? [])], ["high", "max"]);
+    assert.equal(
+      checkCapabilityWithinCeiling({ supportsVision: false, supportedEfforts: ["max"] }, zai),
+      null,
+    );
+  });
+
   test("整体 strip output_config 的 provider(minimax/kimi/opencodego)→ 机制上不支持任何 effort 档", () => {
     const mm = providerCapabilityCeiling(selectUpstreamRoute("MiniMax-M3"));
     assert.deepEqual([...(mm.efforts ?? [])], []);
@@ -239,6 +292,14 @@ describe("能力上限:catalog capability ⊆ provider 机制上限", () => {
     );
     assert.equal(ceiling.supportsVision, true);
     assert.deepEqual([...(ceiling.efforts ?? [])], []);
+  });
+
+  test("moonshot 机制 ceiling = vision=true / efforts=[low,high,max]", () => {
+    for (const model of ["kimi-k3", "k3-256k"]) {
+      const ceiling = providerCapabilityCeiling(selectUpstreamRoute(model));
+      assert.equal(ceiling.supportsVision, true);
+      assert.deepEqual([...(ceiling.efforts ?? [])], ["low", "high", "max"]);
+    }
   });
 
   test("deepseek(无白名单、不 strip output_config)→ 无 effort 机制限制", () => {

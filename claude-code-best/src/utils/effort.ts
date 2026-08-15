@@ -9,7 +9,7 @@ import { isEnvTruthy } from './envUtils.js'
 import type { EffortLevel } from 'src/entrypoints/sdk/runtimeTypes.js'
 import { resolveAntModel } from './model/antModels.js'
 import { getAntModelOverrideConfig } from './model/antModels.js'
-import { getAuthorityModelCapabilities, isArkGlmModel, isCapabilityZeroStaticModel } from './model/staticKeyModels.js'
+import { getAuthorityModelCapabilities, isArkGlmModel, isCapabilityZeroStaticModel, isMoonshotKimiK3Model, isZaiGlm53Model } from './model/staticKeyModels.js'
 import {
   isChatGPTAuthMode,
   isChatGPTCodexReasoningModel,
@@ -39,7 +39,11 @@ export function modelSupportsEffort(model: string): boolean {
   // glm-5.x(火山方舟 ark)虽在 capabilityZero 集,但火山端点支持 output_config.effort(high/max,
   // 端点 error message 实测合法值 low/medium/high/max)。**例外放行**(在 capabilityZero return 之前),
   // 同 thinking.ts 对 glm 的处理。master proxy 会把 output_config 清洗成只剩 effort 透传火山。
-  if (isArkGlmModel(model)) {
+  if (
+    isArkGlmModel(model) ||
+    isZaiGlm53Model(model) ||
+    isMoonshotKimiK3Model(model)
+  ) {
     return true
   }
   if (isCapabilityZeroStaticModel(model)) {
@@ -89,7 +93,11 @@ export function modelSupportsMaxEffort(model: string): boolean {
   const authority = getAuthorityModelCapabilities(model)
   if (authority) return authority.supportedEfforts.includes('max')
   // glm-5.x(火山 ark)支持 effort=max(端点合法值含 max)。例外放行。
-  if (isArkGlmModel(model)) {
+  if (
+    isArkGlmModel(model) ||
+    isZaiGlm53Model(model) ||
+    isMoonshotKimiK3Model(model)
+  ) {
     return true
   }
   if (isCapabilityZeroStaticModel(model)) {
@@ -237,8 +245,14 @@ export function resolveAppliedEffort(
   if (envOverride === null) {
     return undefined
   }
-  // glm-5.x(火山 ark)是 capabilityZero 但支持 effort(high/max),不在此 early-return。
-  if (isCapabilityZeroStaticModel(model) && !isArkGlmModel(model)) {
+  // Ark/Z.AI glm-5.x 与 Moonshot K3 family 是 capabilityZero 但支持 effort,
+  // 不在此 early-return。
+  if (
+    isCapabilityZeroStaticModel(model) &&
+    !isArkGlmModel(model) &&
+    !isZaiGlm53Model(model) &&
+    !isMoonshotKimiK3Model(model)
+  ) {
     return undefined
   }
   const resolved =

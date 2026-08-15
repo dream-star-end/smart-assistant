@@ -7,9 +7,11 @@ import {
   isArkPlanKimiK3Model,
   isArkPlanKimiModel,
   isBailianQwen38MaxModel,
+  isMoonshotKimiK3Model,
   isCapabilityZeroStaticModel,
   isOpencodeGoModel,
   isOpencodeQwenModel,
+  isZaiGlm53Model,
   getStaticModelContextWindow,
   getAuthorityModelCapabilities,
 } from "../staticKeyModels";
@@ -53,6 +55,15 @@ describe("isArkGlmModel", () => {
   });
 });
 
+describe("isZaiGlm53Model", () => {
+  test("精确匹配 glm-5.3-zai，不抢 Ark glm-5.3", () => {
+    expect(isZaiGlm53Model("glm-5.3-zai")).toBe(true);
+    expect(isZaiGlm53Model(" GLM-5.3-ZAI ")).toBe(true);
+    expect(isZaiGlm53Model("glm-5.3")).toBe(false);
+    expect(isZaiGlm53Model("glm-5.3-zai-preview")).toBe(false);
+  });
+});
+
 describe("isOpencodeGoModel", () => {
   test("精确匹配 DeepSeek 平台 alias 与历史 Qwen", () => {
     expect(isOpencodeGoModel("deepseek-v4-flash-opencode-go")).toBe(true);
@@ -93,6 +104,15 @@ describe("isArkPlanKimiK3Model", () => {
   });
 });
 
+describe("isMoonshotKimiK3Model", () => {
+  test("精确匹配官方 kimi-k3 / k3-256k，不扩放前后缀", () => {
+    expect(isMoonshotKimiK3Model("kimi-k3")).toBe(true);
+    expect(isMoonshotKimiK3Model(" K3-256K ")).toBe(true);
+    expect(isMoonshotKimiK3Model("k3-256k-preview")).toBe(false);
+    expect(isMoonshotKimiK3Model("kimi-k3-ark")).toBe(false);
+  });
+});
+
 describe("isBailianQwen38MaxModel", () => {
   test("精确匹配正式 qwen3.8-max，不放过 preview/旧型号", () => {
     expect(isBailianQwen38MaxModel("qwen3.8-max")).toBe(true);
@@ -111,11 +131,14 @@ describe("isCapabilityZeroStaticModel — minimax + ark + opencodego qwen(不含
     expect(isCapabilityZeroStaticModel("glm-5.2")).toBe(true);
     expect(isCapabilityZeroStaticModel("GLM-5.2")).toBe(true);
     expect(isCapabilityZeroStaticModel("glm-5.3")).toBe(true);
+    expect(isCapabilityZeroStaticModel("glm-5.3-zai")).toBe(true);
     expect(isCapabilityZeroStaticModel("deepseek-v4-flash-opencode-go")).toBe(true);
     expect(isCapabilityZeroStaticModel("qwen3.7-max")).toBe(true);
     expect(isCapabilityZeroStaticModel("qwen3.7-plus")).toBe(true);
     expect(isCapabilityZeroStaticModel("kimi-k2.7-code")).toBe(true);
     expect(isCapabilityZeroStaticModel("kimi-k3-ark")).toBe(true);
+    expect(isCapabilityZeroStaticModel("kimi-k3")).toBe(true);
+    expect(isCapabilityZeroStaticModel("k3-256k")).toBe(true);
     expect(isCapabilityZeroStaticModel("qwen3.8-max")).toBe(true);
   });
   test("deepseek **不在**能力全关集(保留 effort=max 等默认路径能力)", () => {
@@ -136,11 +159,14 @@ describe("getStaticModelContextWindow", () => {
     expect(getStaticModelContextWindow("glm-5.2")).toBe(1_000_000);
     expect(getStaticModelContextWindow("GLM-5.2")).toBe(1_000_000);
     expect(getStaticModelContextWindow("glm-5.3")).toBe(1_000_000);
+    expect(getStaticModelContextWindow("glm-5.3-zai")).toBe(1_000_000);
     expect(getStaticModelContextWindow("deepseek-v4-flash-opencode-go")).toBe(1_000_000);
     expect(getStaticModelContextWindow("qwen3.7-max")).toBe(1_000_000);
     expect(getStaticModelContextWindow("qwen3.7-plus")).toBe(1_000_000);
     expect(getStaticModelContextWindow("kimi-k2.7-code")).toBe(256_000);
     expect(getStaticModelContextWindow("kimi-k3-ark")).toBe(1_048_576);
+    expect(getStaticModelContextWindow("kimi-k3")).toBe(1_048_576);
+    expect(getStaticModelContextWindow("k3-256k")).toBe(262_144);
     expect(getStaticModelContextWindow("qwen3.8-max")).toBe(983_616);
   });
   test("deepseek V4 Flash / Pro 精确命中 1M，未声明的 deepseek-* 不扩放", () => {

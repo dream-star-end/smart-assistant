@@ -24,8 +24,16 @@ import { applyModelDefaultEffort, type ProxyBody } from "../http/proxy/shared.js
 
 describe("effortMetaForModel — protocol 推导适用性", () => {
   it("ark glm-5.2/5.3:白名单 high/max", () => {
-    for (const model of ["glm-5.2", "glm-5.3"]) {
+    for (const model of ["glm-5.2", "glm-5.3", "glm-5.3-zai"]) {
       assert.deepEqual(effortMetaForModel(model), { applicable: true, allowed: ["high", "max"] });
+    }
+  });
+  it("moonshot kimi-k3/k3-256k:白名单 low/high/max", () => {
+    for (const model of ["kimi-k3", "k3-256k"]) {
+      assert.deepEqual(effortMetaForModel(model), {
+        applicable: true,
+        allowed: ["low", "high", "max"],
+      });
     }
   });
   it("capability-zero 静态(strip output_config):kimi/qwen/minimax → 不适用", () => {
@@ -53,6 +61,7 @@ describe("provider ops 派生枚举", () => {
     assert.ok(opsProviderIds().includes("ark-k3"));
     assert.ok(opsProviderIds().includes("moonshot"));
     assert.ok(opsProviderIds().includes("bailian"));
+    assert.ok(opsProviderIds().includes("zai"));
   });
 });
 

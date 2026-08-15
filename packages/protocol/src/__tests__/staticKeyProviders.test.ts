@@ -5,7 +5,7 @@
  *
  * 覆盖:
  *   - matchesRoute(deepseek 大小写敏感前缀 / minimax,ark 精确大小写不敏感)
- *   - inboundModelIds 精确字面量(deepseek 2 项,与 route 面故意不同)
+ *   - inboundModelIds 精确字面量(Flash 归 OpenCode Go；direct DeepSeek 只保留 Pro)
  *   - canonicalizeForPricing(deepseek→null 原样 / minimax→MiniMax-M3 / ark→glm-5.1)
  *   - findRouteProviderForModel / STATIC_KEY_INBOUND_MODEL_IDS
  *   - 漂移守护:protocol-owned 字段与仓库根 static-key-providers.snapshot.json 一致
@@ -28,6 +28,7 @@ describe('staticKeyProviders — matchesRoute', () => {
     const ds = getStaticProvider('deepseek')
     assert.equal(ds.matchesRoute('deepseek-v4-pro'), true)
     assert.equal(ds.matchesRoute('deepseek-chat'), true)
+    assert.equal(ds.matchesRoute('deepseek-v4-flash'), false)
     assert.equal(ds.matchesRoute('deepseek-v4-flash-opencode-go'), false)
     assert.equal(ds.matchesRoute('deepseek-V4-Flash-OpenCode-Go'), false)
     // 大小写敏感:大写 D 不命中(等价 shared.ts:87 现状)
@@ -51,11 +52,20 @@ describe('staticKeyProviders — matchesRoute', () => {
     assert.equal(ark.matchesRoute('glm-5'), false)
     assert.equal(ark.matchesRoute('glm-5.4'), false)
   })
-  it('opencodego(DeepSeek alias + qwen3.7 legacy)精确,大小写不敏感', () => {
+  it('zai 只匹配独立 glm-5.3-zai alias，不抢 Ark glm-5.3', () => {
+    const zai = getStaticProvider('zai')
+    assert.equal(zai.matchesRoute('glm-5.3-zai'), true)
+    assert.equal(zai.matchesRoute('GLM-5.3-ZAI'), true)
+    assert.equal(zai.matchesRoute('glm-5.3'), false)
+    assert.equal(zai.matchesRoute('glm-5.3-zai-preview'), false)
+    assert.equal(getStaticProvider('ark').matchesRoute('glm-5.3-zai'), false)
+  })
+  it('opencodego(Flash canonical + 历史 alias + qwen3.7 legacy)精确,大小写不敏感', () => {
     const og = getStaticProvider('opencodego')
     assert.equal(og.matchesRoute('deepseek-v4-flash-opencode-go'), true)
     assert.equal(og.matchesRoute('DeepSeek-V4-Flash-OpenCode-Go'), true)
-    assert.equal(og.matchesRoute('deepseek-v4-flash'), false)
+    assert.equal(og.matchesRoute('deepseek-v4-flash'), true)
+    assert.equal(og.matchesRoute('DeepSeek-V4-Flash'), true)
     assert.equal(og.matchesRoute('qwen3.7-max'), true)
     assert.equal(og.matchesRoute('Qwen3.7-Max'), true)
     assert.equal(og.matchesRoute('qwen3.7-plus'), true)
@@ -72,11 +82,15 @@ describe('staticKeyProviders — matchesRoute', () => {
     assert.equal(km.matchesRoute('kimi-k2.6'), false)
     assert.equal(km.matchesRoute('kimi-k2.7-code-preview'), false)
   })
-  it('moonshot(kimi-k3)精确,大小写不敏感;与 kimi(k2.7)互不越界', () => {
+  it('moonshot(kimi-k3/k3-256k)精确,大小写不敏感;与 kimi(k2.7)互不越界', () => {
     const ms = getStaticProvider('moonshot')
     assert.equal(ms.matchesRoute('kimi-k3'), true)
     assert.equal(ms.matchesRoute('Kimi-K3'), true)
+    assert.equal(ms.matchesRoute('k3-256k'), true)
+    assert.equal(ms.matchesRoute('K3-256K'), true)
     assert.equal(ms.matchesRoute('kimi-k3-preview'), false)
+    assert.equal(ms.matchesRoute('k3-256k-preview'), false)
+    assert.equal(ms.matchesRoute('k3-128k'), false)
     assert.equal(ms.matchesRoute('kimi-k2.7-code'), false)
     // 两家 kimi 上游的路由面必须互斥:k2.7 → 火山 'kimi',k3 → 官方 'moonshot'
     assert.equal(getStaticProvider('kimi').matchesRoute('kimi-k3'), false)
@@ -100,16 +114,19 @@ describe('staticKeyProviders — matchesRoute', () => {
 describe('staticKeyProviders — findRouteProviderForModel', () => {
   it('命中各 provider;非静态 → undefined', () => {
     assert.equal(findRouteProviderForModel('deepseek-v4-pro')?.id, 'deepseek')
+    assert.equal(findRouteProviderForModel('deepseek-v4-flash')?.id, 'opencodego')
     assert.equal(findRouteProviderForModel('MiniMax-M3')?.id, 'minimax')
     assert.equal(findRouteProviderForModel('glm-5.1')?.id, 'ark')
     assert.equal(findRouteProviderForModel('glm-5.2')?.id, 'ark')
     assert.equal(findRouteProviderForModel('glm-5.3')?.id, 'ark')
+    assert.equal(findRouteProviderForModel('glm-5.3-zai')?.id, 'zai')
     assert.equal(findRouteProviderForModel('deepseek-v4-flash-opencode-go')?.id, 'opencodego')
     assert.equal(findRouteProviderForModel('qwen3.7-max')?.id, 'opencodego')
     assert.equal(findRouteProviderForModel('qwen3.7-plus')?.id, 'opencodego')
     assert.equal(findRouteProviderForModel('kimi-k2.7-code')?.id, 'kimi')
     assert.equal(findRouteProviderForModel('kimi-k3-ark')?.id, 'ark-k3')
     assert.equal(findRouteProviderForModel('kimi-k3')?.id, 'moonshot')
+    assert.equal(findRouteProviderForModel('k3-256k')?.id, 'moonshot')
     assert.equal(findRouteProviderForModel('qwen3.8-max')?.id, 'bailian')
     assert.equal(findRouteProviderForModel('claude-opus-4-7'), undefined)
     assert.equal(findRouteProviderForModel('DeepSeek-v4-pro'), undefined)
@@ -118,39 +135,40 @@ describe('staticKeyProviders — findRouteProviderForModel', () => {
 })
 
 describe('staticKeyProviders — inboundModelIds(与 route 面故意不同)', () => {
-  it('deepseek 只放 2 个精确字面量(不放过未声明 deepseek- 变体)', () => {
-    assert.deepEqual([...getStaticProvider('deepseek').inboundModelIds], [
-      'deepseek-v4-flash',
-      'deepseek-v4-pro',
-    ])
+  it('deepseek direct 只放 Pro(Flash 已统一归 OpenCode Go)', () => {
+    assert.deepEqual([...getStaticProvider('deepseek').inboundModelIds], ['deepseek-v4-pro'])
   })
-  it('minimax 1 项 / ark 3 项 / opencodego 新 alias + 2 个历史 Qwen', () => {
+  it('minimax 1 项 / ark 3 项 / opencodego Flash canonical+alias + 2 个历史 Qwen', () => {
     assert.deepEqual([...getStaticProvider('minimax').inboundModelIds], ['MiniMax-M3'])
     assert.deepEqual([...getStaticProvider('ark').inboundModelIds], ['glm-5.3', 'glm-5.2', 'glm-5.1'])
+    assert.deepEqual([...getStaticProvider('zai').inboundModelIds], ['glm-5.3-zai'])
     assert.deepEqual([...getStaticProvider('opencodego').inboundModelIds], [
       'deepseek-v4-flash-opencode-go',
+      'deepseek-v4-flash',
       'qwen3.7-max',
       'qwen3.7-plus',
     ])
     assert.deepEqual([...getStaticProvider('kimi').inboundModelIds], ['kimi-k2.7-code'])
     assert.deepEqual([...getStaticProvider('ark-k3').inboundModelIds], ['kimi-k3-ark'])
-    assert.deepEqual([...getStaticProvider('moonshot').inboundModelIds], ['kimi-k3'])
+    assert.deepEqual([...getStaticProvider('moonshot').inboundModelIds], ['kimi-k3', 'k3-256k'])
     assert.deepEqual([...getStaticProvider('bailian').inboundModelIds], ['qwen3.8-max'])
   })
   it('STATIC_KEY_INBOUND_MODEL_IDS = 全 provider 字面量展开', () => {
     assert.deepEqual([...STATIC_KEY_INBOUND_MODEL_IDS], [
-      'deepseek-v4-flash',
       'deepseek-v4-pro',
       'MiniMax-M3',
       'glm-5.3',
       'glm-5.2',
       'glm-5.1',
+      'glm-5.3-zai',
       'deepseek-v4-flash-opencode-go',
+      'deepseek-v4-flash',
       'qwen3.7-max',
       'qwen3.7-plus',
       'kimi-k2.7-code',
       'kimi-k3-ark',
       'kimi-k3',
+      'k3-256k',
       'qwen3.8-max',
     ])
   })
@@ -178,11 +196,18 @@ describe('staticKeyProviders — canonicalizeForPricing', () => {
     assert.equal(ark.canonicalizeForPricing('glm-5.3'), 'glm-5.3')
     assert.equal(ark.canonicalizeForPricing('glm-5.4'), null)
   })
-  it('opencodego → 独立 Flash alias / qwen3.7 legacy(小写归一)', () => {
+  it('zai pricing 保持平台 alias；legacy transport 精确改写为上游 glm-5.3', () => {
+    const zai = getStaticProvider('zai')
+    assert.equal(zai.canonicalizeForPricing('GLM-5.3-ZAI'), 'glm-5.3-zai')
+    assert.equal(zai.canonicalizeForPricing('glm-5.3'), null)
+    assert.equal(zai.upstreamModelForRequest?.('GLM-5.3-ZAI'), 'glm-5.3')
+  })
+  it('opencodego → provider-neutral Flash canonical / 历史 alias 同归一 / qwen3.7 legacy', () => {
     const og = getStaticProvider('opencodego')
-    assert.equal(og.canonicalizeForPricing('DeepSeek-V4-Flash-OpenCode-Go'), 'deepseek-v4-flash-opencode-go')
+    assert.equal(og.canonicalizeForPricing('DeepSeek-V4-Flash-OpenCode-Go'), 'deepseek-v4-flash')
     assert.equal(og.upstreamModelForRequest?.('DeepSeek-V4-Flash-OpenCode-Go'), 'deepseek-v4-flash')
-    assert.equal(og.canonicalizeForPricing('deepseek-v4-flash'), null)
+    assert.equal(og.canonicalizeForPricing('deepseek-v4-flash'), 'deepseek-v4-flash')
+    assert.equal(og.upstreamModelForRequest?.('DeepSeek-V4-Flash'), 'deepseek-v4-flash')
     assert.equal(og.canonicalizeForPricing('qwen3.7-max'), 'qwen3.7-max')
     assert.equal(og.canonicalizeForPricing('Qwen3.7-Max'), 'qwen3.7-max')
     assert.equal(og.canonicalizeForPricing('qwen3.7-plus'), 'qwen3.7-plus')
@@ -195,10 +220,13 @@ describe('staticKeyProviders — canonicalizeForPricing', () => {
     assert.equal(km.canonicalizeForPricing('Kimi-K2.7-Code'), 'kimi-k2.7-code')
     assert.equal(km.canonicalizeForPricing('kimi-k2.6'), null)
   })
-  it('moonshot → kimi-k3(小写归一)', () => {
+  it('moonshot → kimi-k3/k3-256k(分别小写归一)', () => {
     const ms = getStaticProvider('moonshot')
     assert.equal(ms.canonicalizeForPricing('kimi-k3'), 'kimi-k3')
     assert.equal(ms.canonicalizeForPricing('Kimi-K3'), 'kimi-k3')
+    assert.equal(ms.canonicalizeForPricing('k3-256k'), 'k3-256k')
+    assert.equal(ms.canonicalizeForPricing('K3-256K'), 'k3-256k')
+    assert.equal(ms.canonicalizeForPricing('k3-256k-preview'), null)
     assert.equal(ms.canonicalizeForPricing('kimi-k2.7-code'), null)
   })
   it('ark-k3 pricing 保持平台 alias；legacy transport 精确改写为上游 kimi-k3', () => {
@@ -254,6 +282,17 @@ describe('staticKeyProviders — strip / endpoint', () => {
       'https://ark.cn-beijing.volces.com/api/coding/v1/messages',
     )
   })
+  it('zai 使用 Bearer、1M/text-only，并按白名单保留 high|max effort', () => {
+    const zai = getStaticProvider('zai')
+    assert.equal(zai.upstreamEndpoint, 'https://api.z.ai/api/anthropic/v1/messages')
+    assert.equal(zai.authScheme, undefined)
+    assert.deepEqual([...zai.stripHeaders], ['anthropic-beta'])
+    assert.deepEqual([...zai.stripBodyFields], ['context_management', 'service_tier'])
+    assert.deepEqual([...(zai.allowedOutputConfigEfforts ?? [])], ['high', 'max'])
+    assert.equal(zai.stripDisabledThinking, undefined)
+    assert.equal(zai.maxInputTokens, 1_000_000)
+    assert.equal(zai.supportsVision, false)
+  })
   it('opencodego strip anthropic-beta + 3 body 字段(**保留 thinking**,2026-07-05 实测)+ 1M cap', () => {
     const og = getStaticProvider('opencodego')
     assert.deepEqual([...og.stripHeaders], ['anthropic-beta'])
@@ -299,6 +338,16 @@ describe('staticKeyProviders — strip / endpoint', () => {
       'https://ark.cn-beijing.volces.com/api/plan/v1/messages',
     )
   })
+  it('moonshot K3 family 使用 x-api-key、provider 1M ceiling，并按白名单保留 effort', () => {
+    const moonshot = getStaticProvider('moonshot')
+    assert.equal(moonshot.authScheme, 'x-api-key')
+    assert.deepEqual([...moonshot.stripHeaders], ['anthropic-beta'])
+    assert.deepEqual([...moonshot.stripBodyFields], ['context_management', 'service_tier'])
+    assert.equal(moonshot.stripBodyFields.includes('output_config'), false)
+    assert.equal(moonshot.stripBodyFields.includes('thinking'), false)
+    assert.equal(moonshot.maxInputTokens, 1_048_576)
+    assert.equal(moonshot.supportsVision, true)
+  })
   it('bailian qwen3.8-max 使用 Token Plan x-api-key、983616 窗口并保留 thinking', () => {
     const bailian = getStaticProvider('bailian')
     assert.equal(
@@ -320,11 +369,13 @@ describe('staticKeyProviders — strip / endpoint', () => {
 })
 
 describe('staticKeyProviders — authScheme(上游鉴权头风格)', () => {
-  it('opencodego = x-api-key(/messages 不认 Bearer,2026-07-05 实测);其余缺省 bearer', () => {
+  it('opencodego/moonshot/bailian = x-api-key;zai 与其余缺省 bearer', () => {
     assert.equal(getStaticProvider('opencodego').authScheme, 'x-api-key')
+    assert.equal(getStaticProvider('moonshot').authScheme, 'x-api-key')
     assert.equal(getStaticProvider('deepseek').authScheme, undefined)
     assert.equal(getStaticProvider('minimax').authScheme, undefined)
     assert.equal(getStaticProvider('ark').authScheme, undefined)
+    assert.equal(getStaticProvider('zai').authScheme, undefined)
     assert.equal(getStaticProvider('kimi').authScheme, undefined)
     assert.equal(getStaticProvider('ark-k3').authScheme, undefined)
     assert.equal(getStaticProvider('bailian').authScheme, 'x-api-key')
@@ -338,6 +389,7 @@ describe('staticKeyProviders — stripDisabledThinking(恒思考模型删参兜�
     assert.equal(getStaticProvider('deepseek').stripDisabledThinking, undefined)
     assert.equal(getStaticProvider('minimax').stripDisabledThinking, undefined)
     assert.equal(getStaticProvider('ark').stripDisabledThinking, undefined)
+    assert.equal(getStaticProvider('zai').stripDisabledThinking, undefined)
     assert.equal(getStaticProvider('opencodego').stripDisabledThinking, undefined)
     assert.equal(getStaticProvider('ark-k3').stripDisabledThinking, undefined)
     assert.equal(getStaticProvider('bailian').stripDisabledThinking, undefined)
@@ -345,8 +397,17 @@ describe('staticKeyProviders — stripDisabledThinking(恒思考模型删参兜�
 })
 
 describe('staticKeyProviders — allowedOutputConfigEfforts(思考深度白名单)', () => {
-  it('ark = [high, max];deepseek/minimax 未声明(undefined)', () => {
+  it('ark/zai = [high,max]；moonshot = [low,high,max]；其余未声明', () => {
     assert.deepEqual([...(getStaticProvider('ark').allowedOutputConfigEfforts ?? [])], [
+      'high',
+      'max',
+    ])
+    assert.deepEqual([...(getStaticProvider('zai').allowedOutputConfigEfforts ?? [])], [
+      'high',
+      'max',
+    ])
+    assert.deepEqual([...(getStaticProvider('moonshot').allowedOutputConfigEfforts ?? [])], [
+      'low',
       'high',
       'max',
     ])
@@ -371,13 +432,14 @@ describe('staticKeyProviders — allowedOutputConfigEfforts(思考深度白名�
 })
 
 describe('staticKeyProviders — supportsVision(原生多模态标记)', () => {
-  it('minimax/ark-k3/moonshot/bailian=true;deepseek/ark/opencodego/kimi(纯文本)=false', () => {
+  it('minimax/ark-k3/moonshot/bailian=true;deepseek/ark/zai/opencodego/kimi(纯文本)=false', () => {
     assert.equal(getStaticProvider('minimax').supportsVision, true)
     assert.equal(getStaticProvider('ark-k3').supportsVision, true)
     assert.equal(getStaticProvider('moonshot').supportsVision, true)
     assert.equal(getStaticProvider('bailian').supportsVision, true)
     assert.equal(getStaticProvider('deepseek').supportsVision ?? false, false)
     assert.equal(getStaticProvider('ark').supportsVision ?? false, false)
+    assert.equal(getStaticProvider('zai').supportsVision ?? false, false)
     // opencodego 2026-07-05 实测 image block → 400 InvalidParameter,纯文本接入。
     assert.equal(getStaticProvider('opencodego').supportsVision ?? false, false)
     // kimi 2026-07-06 实测 image block → 400 InvalidParameter(同 lane 的 M3 反而是多模态)。

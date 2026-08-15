@@ -56,9 +56,11 @@ describe("Ark GLM / OpenCode Go thinking capability", () => {
     expect(modelSupportsThinking("GLM-5.2")).toBe(true);
   });
 
-  test("glm-5.3 与 OpenCode Go DeepSeek alias thinking=true、adaptive=false", () => {
+  test("glm-5.3 / Z.AI alias 与 OpenCode Go DeepSeek alias thinking=true、adaptive=false", () => {
     expect(modelSupportsThinking("glm-5.3")).toBe(true);
     expect(modelSupportsAdaptiveThinking("glm-5.3")).toBe(false);
+    expect(modelSupportsThinking("glm-5.3-zai")).toBe(true);
+    expect(modelSupportsAdaptiveThinking("glm-5.3-zai")).toBe(false);
     expect(modelSupportsThinking("deepseek-v4-flash-opencode-go")).toBe(true);
     expect(modelSupportsAdaptiveThinking("deepseek-v4-flash-opencode-go")).toBe(false);
   });
@@ -66,6 +68,13 @@ describe("Ark GLM / OpenCode Go thinking capability", () => {
   test("kimi-k3-ark(火山 Agent Plan K3)thinking=true、adaptive=false", () => {
     expect(modelSupportsThinking("kimi-k3-ark")).toBe(true);
     expect(modelSupportsAdaptiveThinking("kimi-k3-ark")).toBe(false);
+  });
+
+  test("Moonshot kimi-k3/k3-256k thinking=true、adaptive=false", () => {
+    for (const model of ["kimi-k3", "k3-256k"]) {
+      expect(modelSupportsThinking(model)).toBe(true);
+      expect(modelSupportsAdaptiveThinking(model)).toBe(false);
+    }
   });
 
   test("qwen3.8-max(百炼 Token Plan)thinking=true、adaptive=false", () => {

@@ -70,6 +70,12 @@ export function isArkGlmModel(model: string): boolean {
   return m === 'glm-5.1' || m === 'glm-5.2' || m === 'glm-5.3'
 }
 
+/** 智谱国际版 Z.AI Coding Plan 的平台 alias。与火山 Ark 的 glm-5.3 是同一品牌型号、
+ * 不同上游/凭据，必须保持独立 canonical id。 */
+export function isZaiGlm53Model(model: string): boolean {
+  return model.trim().toLowerCase() === 'glm-5.3-zai'
+}
+
 /** OpenCode Go 当前模型 + 历史 transport 集。DeepSeek 使用独立平台 alias，避免覆盖 direct
  *  provider；Qwen3.7 保留历史 plumbing 但由 DB catalog 下线。 */
 export function isOpencodeGoModel(model: string): boolean {
@@ -96,11 +102,12 @@ export function isArkPlanKimiK3Model(model: string): boolean {
   return model.trim().toLowerCase() === 'kimi-k3-ark'
 }
 
-/** Moonshot 官方 Kimi For Coding 接入的模型:kimi-k3(2026-07-17)。精确匹配,大小写/空白
+/** Moonshot 官方 Kimi For Coding 接入的模型:kimi-k3 / k3-256k。精确匹配,大小写/空白
  *  不敏感,与 protocol moonshot.matchesRoute 同口径。与 isArkPlanKimiModel(火山转售 k2.7)
  *  是两家上游。thinking 支持 enabled+budget 且 disabled 真生效(实测,同 qwen 语义)。 */
 export function isMoonshotKimiK3Model(model: string): boolean {
-  return model.trim().toLowerCase() === 'kimi-k3'
+  const m = model.trim().toLowerCase()
+  return m === 'kimi-k3' || m === 'k3-256k'
 }
 
 /** 阿里云百炼 Token Plan 正式 Qwen3.8 Max。精确匹配，避免 preview/未来家族型号
@@ -125,6 +132,7 @@ export function isCapabilityZeroStaticModel(model: string): boolean {
   return (
     isMiniMaxM3Model(model) ||
     isArkGlmModel(model) ||
+    isZaiGlm53Model(model) ||
     isOpencodeGoModel(model) ||
     isArkPlanKimiModel(model) ||
     isArkPlanKimiK3Model(model) ||
@@ -160,12 +168,15 @@ export const STATIC_MODEL_CONTEXT_WINDOW: ReadonlyArray<{
     contextWindow: 1_000_000,
   },
   { matches: (m) => m.trim().toLowerCase() === 'glm-5.1', contextWindow: 200_000 },
+  { matches: isZaiGlm53Model, contextWindow: 1_000_000 },
   // DeepSeek alias 与历史 qwen3.7 均为 1M；direct DeepSeek 由上面的精确表独立处理。
   { matches: isOpencodeGoModel, contextWindow: 1_000_000 },
   // kimi-k2.7-code 官方规格 256K(火山 Agent Plan 托管,max output 上游硬顶 32768)。
   { matches: isArkPlanKimiModel, contextWindow: 256_000 },
   // kimi-k3-ark 火山 Agent Plan K3，机制窗口 1,048,576。
   { matches: isArkPlanKimiK3Model, contextWindow: 1_048_576 },
+  // 精确的 256k 型号必须放在 Moonshot K3 family 条目之前。
+  { matches: (m) => m.trim().toLowerCase() === 'k3-256k', contextWindow: 262_144 },
   // kimi-k3 官方规格 1M=1,048,576(Moonshot 官方 Kimi For Coding)。这是**机制窗口**兜底值
   // (无 descriptor 的回落路径);角色分档(admin 1M/其他 500k)由 authority descriptor 下发,
   // getAuthorityModelCapabilities 先判已覆盖。

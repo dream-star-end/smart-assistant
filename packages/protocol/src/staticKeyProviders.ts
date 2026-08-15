@@ -2,6 +2,7 @@
 // Anthropic 兼容上游(不占 OAuth 账号池)的 provider 的单一权威声明。
 //
 // 当前成员：DeepSeek、MiniMax、火山方舟 Ark(glm-5.3 + glm-5.2/5.1 兼容存量)、
+// 智谱国际版 Z.AI Coding Plan(glm-5.3-zai 平台 alias)、
 // OpenCode Go(Zen 网关 Go 档,DeepSeek V4 Flash 平台 alias + Qwen3.7 兼容存量)、
 // Ark Agent Plan Kimi(kimi-k2.7-code,与 minimax 同订阅同 key,2026-07-06)。
 //
@@ -22,6 +23,7 @@ export type StaticProviderId =
   | 'deepseek'
   | 'minimax'
   | 'ark'
+  | 'zai'
   | 'opencodego'
   | 'kimi'
   | 'ark-k3'
@@ -118,13 +120,16 @@ const DEEPSEEK: StaticKeyProviderSpec = {
   upstreamEndpoint: 'https://api.deepseek.com/anthropic/v1/messages',
   matchesRoute(modelId) {
     // 大小写敏感前缀家族 —— 不要改成 toLowerCase，否则扩大准入面(Codex plan review)。
-    // OpenCode Go 的同名模型使用独立平台 alias，必须从 direct DeepSeek 家族排除。
+    // DeepSeek V4 Flash 已统一切到 OpenCode Go；canonical 与历史 provider alias 都必须从
+    // direct DeepSeek 家族排除，只保留 Pro/未来明确的 direct DeepSeek 型号。
+    const lower = modelId.toLowerCase()
     return (
       modelId.startsWith('deepseek-') &&
-      modelId.toLowerCase() !== 'deepseek-v4-flash-opencode-go'
+      lower !== 'deepseek-v4-flash' &&
+      lower !== 'deepseek-v4-flash-opencode-go'
     )
   },
-  inboundModelIds: ['deepseek-v4-flash', 'deepseek-v4-pro'],
+  inboundModelIds: ['deepseek-v4-pro'],
   canonicalizeForPricing() {
     return null
   },
@@ -192,10 +197,37 @@ const ARK: StaticKeyProviderSpec = {
   maxInputTokens: 1_000_000,
 }
 
+const ZAI_CODING_PLAN: StaticKeyProviderSpec = {
+  id: 'zai',
+  // 智谱国际版 Z.AI GLM Coding Plan Anthropic 兼容端点。2026-08-15 从生产网络实测
+  // glm-5.3 normal/SSE/high|max effort/tool_use+tool_result 全通，usage 数字完整。
+  // 平台使用独立 canonical alias，不能覆盖已由火山 Ark 服务的 glm-5.3。
+  upstreamEndpoint: 'https://api.z.ai/api/anthropic/v1/messages',
+  matchesRoute(modelId) {
+    return modelId.toLowerCase() === 'glm-5.3-zai'
+  },
+  inboundModelIds: ['glm-5.3-zai'],
+  canonicalizeForPricing(modelId) {
+    return modelId.toLowerCase() === 'glm-5.3-zai' ? 'glm-5.3-zai' : null
+  },
+  upstreamModelForRequest(modelId) {
+    return modelId.toLowerCase() === 'glm-5.3-zai' ? 'glm-5.3' : modelId
+  },
+  stripHeaders: ['anthropic-beta'],
+  // Z.AI 接受 enabled+budget、disabled 与 output_config.effort；只保留产品开放的
+  // high/max，first-party-only context/service 字段在边界剥离。
+  stripBodyFields: ['context_management', 'service_tier'],
+  allowedOutputConfigEfforts: ['high', 'max'],
+  maxInputTokens: 1_000_000,
+  // 官方 Cline 配置要求关闭图片；红/蓝对照探针把红图也回答为蓝，证明兼容端点没有
+  // 可靠消费图像内容。按纯文本接入并由 understand_image 工具兜底。
+  supportsVision: false,
+}
+
 const OPENCODE_GO: StaticKeyProviderSpec = {
   id: 'opencodego',
-  // OpenCode Zen「Go 计划」网关。2026-08-14 接入 DeepSeek V4 Flash；平台 canonical
-  // 使用 deepseek-v4-flash-opencode-go，避免覆盖 direct DeepSeek 的既有 canonical。
+  // OpenCode Zen「Go 计划」网关。2026-08-15 起平台 canonical 统一为 provider-neutral 的
+  // deepseek-v4-flash；旧 deepseek-v4-flash-opencode-go 只保留作存量客户端兼容 alias。
   // /messages normal/SSE/thinking/tool_use+result/cache usage 全通。Qwen3.7 仅保留历史
   // transport plumbing，执行下线由 DB catalog 决定。
   upstreamEndpoint: 'https://opencode.ai/zen/go/v1/messages',
@@ -203,13 +235,23 @@ const OPENCODE_GO: StaticKeyProviderSpec = {
   authScheme: 'x-api-key',
   matchesRoute(modelId) {
     const m = modelId.toLowerCase()
-    return m === 'deepseek-v4-flash-opencode-go' || m === 'qwen3.7-max' || m === 'qwen3.7-plus'
+    return (
+      m === 'deepseek-v4-flash' ||
+      m === 'deepseek-v4-flash-opencode-go' ||
+      m === 'qwen3.7-max' ||
+      m === 'qwen3.7-plus'
+    )
   },
-  inboundModelIds: ['deepseek-v4-flash-opencode-go', 'qwen3.7-max', 'qwen3.7-plus'],
+  inboundModelIds: [
+    'deepseek-v4-flash-opencode-go',
+    'deepseek-v4-flash',
+    'qwen3.7-max',
+    'qwen3.7-plus',
+  ],
   canonicalizeForPricing(modelId) {
     const m = modelId.toLowerCase()
-    return m === 'deepseek-v4-flash-opencode-go'
-      ? 'deepseek-v4-flash-opencode-go'
+    return m === 'deepseek-v4-flash' || m === 'deepseek-v4-flash-opencode-go'
+      ? 'deepseek-v4-flash'
       : m === 'qwen3.7-max'
         ? 'qwen3.7-max'
         : m === 'qwen3.7-plus'
@@ -217,7 +259,8 @@ const OPENCODE_GO: StaticKeyProviderSpec = {
           : null
   },
   upstreamModelForRequest(modelId) {
-    return modelId.toLowerCase() === 'deepseek-v4-flash-opencode-go'
+    const m = modelId.toLowerCase()
+    return m === 'deepseek-v4-flash' || m === 'deepseek-v4-flash-opencode-go'
       ? 'deepseek-v4-flash'
       : modelId
   },
@@ -292,8 +335,8 @@ const MOONSHOT_CODING: StaticKeyProviderSpec = {
   // Moonshot(月之暗面)官方「Kimi For Coding」订阅套餐的 Anthropic 兼容端点(2026-07-17 接入,
   // boss 的 Allegretto 档订阅)。**与现有 id='kimi'(火山方舟 Agent Plan 托管 kimi-k2.7-code)
   // 是两家上游**:端点/key/能力面全不同,不能合并——'kimi' 是方舟转售,本 spec 是厂商官方。
-  // 模型 kimi-k3(2026-07-16 发布旗舰,1M 窗口):官方文档声明恒推理(reasoning_effort 仅 max 档)、
-  // 多模态(image/video in)、tool calling。
+  // 模型 kimi-k3(1M)与 k3-256k(262,144):官方文档声明支持可调 reasoning effort、
+  // 多模态(image/video in)、tool calling。二者是同一订阅端点的精确模型字面量。
   // 实测(2026-07-17,部署机直连探针):非流式全通;thinking 默认返回带 signature 的 thinking block;
   // **{type:'disabled'} 真生效**(纯直答无思考块,与 k2.7 的 400 不同,故不需要 stripDisabledThinking);
   // image block 接受(supportsVision=true);max_tokens=100k 不拒(无 k2.7 那种 32768 输出硬顶)。
@@ -301,18 +344,21 @@ const MOONSHOT_CODING: StaticKeyProviderSpec = {
   // 实测 x-api-key 鉴权可用(Anthropic 原生风格,官方 Claude Code 接入文档同款)。
   authScheme: 'x-api-key',
   matchesRoute(modelId) {
-    return modelId.toLowerCase() === 'kimi-k3'
+    const model = modelId.toLowerCase()
+    return model === 'kimi-k3' || model === 'k3-256k'
   },
-  inboundModelIds: ['kimi-k3'],
+  inboundModelIds: ['kimi-k3', 'k3-256k'],
   canonicalizeForPricing(modelId) {
-    return modelId.toLowerCase() === 'kimi-k3' ? 'kimi-k3' : null
+    const model = modelId.toLowerCase()
+    return model === 'kimi-k3' || model === 'k3-256k' ? model : null
   },
   stripHeaders: ['anthropic-beta'],
-  // **保留 thinking**:kimi-k3 默认思考,实测接受 thinking:{type:enabled,budget_tokens} 且
-  // disabled 语义正确(见上)。effort 档位官方仅 max 一档 → 不暴露档位选择,output_config 整体
-  // strip(CCB capabilityZero 不生成是根治,这里兜底;与 minimax/opencodego/kimi 同款)。
-  stripBodyFields: ['output_config', 'context_management', 'service_tier'],
-  // kimi-k3 官方规格 1,048,576(1M)窗口,计费不按长度分段。
+  // **保留 thinking**:两型号实测接受 enabled+budget / disabled。output_config 仅透传
+  // effort=low/high/max,其余 first-party 子字段由 master 收窄清洗。
+  stripBodyFields: ['context_management', 'service_tier'],
+  allowedOutputConfigEfforts: ['low', 'high', 'max'],
+  // provider 机制上限取较大的 kimi-k3 1,048,576；k3-256k 的 262,144 由签名 catalog
+  // descriptor + 已有 signed-window guard 收窄，不能把整个 provider 降到 256k。
   // 注意平台产品层另有按角色的窗口分档(admin 1M / 其他 500k),那是 commercial
   // modelRolePolicy 的投影语义,不属于本机制注册表 —— 这里只声明机制上限。
   maxInputTokens: 1_048_576,
@@ -350,6 +396,7 @@ export const STATIC_KEY_PROVIDERS: readonly StaticKeyProviderSpec[] = [
   DEEPSEEK,
   MINIMAX,
   ARK,
+  ZAI_CODING_PLAN,
   OPENCODE_GO,
   ARK_PLAN_KIMI,
   ARK_PLAN_KIMI_K3,
@@ -361,6 +408,7 @@ const BY_ID: Record<StaticProviderId, StaticKeyProviderSpec> = {
   deepseek: DEEPSEEK,
   minimax: MINIMAX,
   ark: ARK,
+  zai: ZAI_CODING_PLAN,
   opencodego: OPENCODE_GO,
   kimi: ARK_PLAN_KIMI,
   'ark-k3': ARK_PLAN_KIMI_K3,

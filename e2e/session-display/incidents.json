@@ -1438,6 +1438,89 @@
           "assertion": "candidate Cursor stream-json parser gate + hot-config wrapper gate(exact immutable release)"
         }
       ]
+    },
+    {
+      "id": "INC-20260815-ZAI-AUDIT-JSON-NULL",
+      "occurredAt": "2026-08-15",
+      "severity": "P1",
+      "symptom": "Z.AI GLM-5.3 发布迁移把真实管理 API 写入的 JSONB null 误当成 SQL NULL 校验，导致 0218 在生产安全回滚并阻塞模型公开。",
+      "rootFixCommit": "2948a259",
+      "regressions": [
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/migration0218.integ.test.ts",
+          "assertion": "accepts only the exact audited production verification lineage"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/migration0218.integ.test.ts",
+          "assertion": "rejects missing, reordered, or SQL-NULL verification audit atomically"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/deploy-v5.sh",
+          "assertion": "required migration not applied"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260815-ENGINE-STOP-DRAIN-HANG",
+      "occurredAt": "2026-08-15",
+      "severity": "P1",
+      "symptom": "会话点 Stop 后前端永久停在「正在停止…」。oc-cursor.sh 用绝对路径调 /bin/kill，而运行时镜像只装 util-linux 未装 procps，退码 127 被 || true 吞掉，使整个 TERM/KILL 升级块成为死代码；setsid 起的 cursor-agent 因此成为孤儿并继续持有 gateway 的 stdout，adapter 与 sessionManager 都在无上限 await waitForOutputDrain()，turn 永不落终态，客户端拿不到 control receipt。",
+      "rootFixCommit": "425b283a",
+      "coverageCommits": [
+        "5a5aa310",
+        "b48f8b73",
+        "5adf5d6f"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/cursorCliWrapper.test.ts",
+          "assertion": "never depends on an absolute-path tool it has not asserted is present"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/cursorCliWrapper.test.ts",
+          "assertion": "fails closed when the runtime image lacks a tool it invokes by absolute path"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorAdapter.test.ts",
+          "assertion": "shutdown gives up on a descendant that keeps stdout open"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorAdapter.test.ts",
+          "assertion": "a late close from an abandoned turn cannot settle the next one"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/grokAdapter.test.ts",
+          "assertion": "shutdown gives up on a descendant that keeps stdout open"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/grokAdapter.test.ts",
+          "assertion": "a late close from an abandoned turn cannot settle the next one"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/terminalOutputDrainDeadline.test.ts",
+          "assertion": "returns at the deadline when stdout never closes"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/deploy-v5.sh",
+          "assertion": "candidate engine Stop terminal-deadline gate(exact immutable release)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorAdapter.test.ts",
+          "assertion": "Stop racing a turn that has not spawned yet stays bounded and leaves no child"
+        }
+      ]
     }
   ]
 }
