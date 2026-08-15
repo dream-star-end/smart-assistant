@@ -421,9 +421,9 @@ function teamMemberCapabilityHint(agent: AgentDef): string {
  *
  * 当前 commercial 暴露集合:
  *   - gpt-5.5 — codex agent 走 codex JSON-RPC(v5 从 picker dropGptForV5Channel,但入站仍受)
- *   - deepseek-v4-flash / deepseek-v4-pro — anthropicProxy 在 master 侧 isDeepseekModel
- *     命中后切换上游(DEEPSEEK_UPSTREAM_ENDPOINT + DEEPSEEK_API_KEY),
- *     在 claude-subscription agent 上跑就够,不需要切 agent
+ *   - deepseek-v4-pro — master 侧 direct DeepSeek 静态 key 路由
+ *   - deepseek-v4-flash — provider-neutral 产品 id，master 侧实际走 OpenCode Go 静态 key 路由
+ *     二者都在 claude-subscription agent 上跑即可,不需要切 agent
  *   - MiniMax-M3 — master 侧切到 MiniMax Token Plan Anthropic 兼容端点,
  *     同样跑 claude-subscription/non-codex agent,不进 codex-native
  *   - glm-5.1 / glm-5.2 / glm-5.3 — master 侧切到火山方舟 Ark Coding Plan Anthropic 兼容端点,

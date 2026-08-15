@@ -77,9 +77,8 @@ describe('SubprocessRunner.model getter / setModel', () => {
       assert.ok(ALLOWED_INBOUND_MODELS.has(model))
     }
     assert.equal(ALLOWED_INBOUND_MODELS.has('gpt-5.5'), false)
-    // DeepSeek anthropic-compatible 上游(在 anthropicProxy
+    // direct DeepSeek anthropic-compatible 上游(在 anthropicProxy
     // isDeepseekModel 命中后切 DEEPSEEK_UPSTREAM_ENDPOINT):
-    assert.ok(ALLOWED_INBOUND_MODELS.has('deepseek-v4-flash'))
     assert.ok(ALLOWED_INBOUND_MODELS.has('deepseek-v4-pro'))
     // MiniMax-M3 Token Plan anthropic-compatible 上游:
     assert.ok(ALLOWED_INBOUND_MODELS.has('MiniMax-M3'))
@@ -87,7 +86,8 @@ describe('SubprocessRunner.model getter / setModel', () => {
     assert.ok(ALLOWED_INBOUND_MODELS.has('glm-5.1'))
     assert.ok(ALLOWED_INBOUND_MODELS.has('glm-5.2'))
     assert.ok(ALLOWED_INBOUND_MODELS.has('glm-5.3'))
-    // DeepSeek V4 Flash alias + qwen3.7 历史模型走 OpenCode Go anthropic-compatible 上游:
+    // DeepSeek V4 Flash canonical/兼容 alias + qwen3.7 历史模型走 OpenCode Go:
+    assert.ok(ALLOWED_INBOUND_MODELS.has('deepseek-v4-flash'))
     assert.ok(ALLOWED_INBOUND_MODELS.has('deepseek-v4-flash-opencode-go'))
     assert.ok(ALLOWED_INBOUND_MODELS.has('qwen3.7-max'))
     assert.ok(ALLOWED_INBOUND_MODELS.has('qwen3.7-plus'))

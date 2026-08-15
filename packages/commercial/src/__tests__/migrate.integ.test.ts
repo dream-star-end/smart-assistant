@@ -524,7 +524,7 @@ describe("migrate.runMigrations", () => {
     );
   });
 
-  test("0195 is a no-op on the clean 0194-forward lineage and its reactivation rollback refuses it", async (t) => {
+  test("0195 reapply/rollback refuse the later 0215 Flash provider lineage atomically", async (t) => {
     if (skipIfNoPg(t)) return;
     const first = await runMigrations();
     assert.ok(first.applied.includes("0194_deepseek_1m_context"));
@@ -534,24 +534,34 @@ describe("migrate.runMigrations", () => {
         model_id: string;
         state: string;
         context_window: number;
+        provider_id: string | null;
       }>(
-        `SELECT model_id, state, context_window
+        `SELECT model_id, state, context_window, provider_id
          FROM model_catalog
         WHERE model_id IN ('deepseek-v4-flash', 'deepseek-v4-pro')
         ORDER BY model_id, entry_id`,
       );
     const clean = await readLineage();
-    assert.equal(clean.rows.length, 4);
-    for (const modelId of ["deepseek-v4-flash", "deepseek-v4-pro"]) {
-      const rows = clean.rows.filter((row) => row.model_id === modelId);
-      assert.deepEqual(
-        rows.map((row) => [row.state, row.context_window]),
-        [
-          ["retired", 200_000],
-          ["active", 1_000_000],
-        ],
-      );
-    }
+    assert.equal(clean.rows.length, 5);
+    assert.deepEqual(
+      clean.rows
+        .filter((row) => row.model_id === "deepseek-v4-flash")
+        .map((row) => [row.state, row.context_window, row.provider_id]),
+      [
+        ["retired", 200_000, "deepseek"],
+        ["retired", 1_000_000, "deepseek"],
+        ["active", 1_000_000, "opencodego"],
+      ],
+    );
+    assert.deepEqual(
+      clean.rows
+        .filter((row) => row.model_id === "deepseek-v4-pro")
+        .map((row) => [row.state, row.context_window, row.provider_id]),
+      [
+        ["retired", 200_000, "deepseek"],
+        ["active", 1_000_000, "deepseek"],
+      ],
+    );
     const migration0195Sql = await readFile(
       new URL(
         "../db/migrations/0195_deepseek_1m_reactivate.sql",
@@ -559,11 +569,11 @@ describe("migrate.runMigrations", () => {
       ),
       "utf8",
     );
-    await query(migration0195Sql);
+    await assert.rejects(query(migration0195Sql), /execution descriptor history drifted/);
     assert.deepEqual(
       (await readLineage()).rows,
       clean.rows,
-      "0195 direct reapply must no-op on clean lineage",
+      "0195 direct reapply must refuse the later 0215 provider lineage atomically",
     );
     const rollback0195Sql = testedManualRollbackSql(migration0195Sql, "0195");
     await assert.rejects(
@@ -587,11 +597,11 @@ describe("migrate.runMigrations", () => {
         WHERE model_id = 'deepseek-v4-flash' AND state = 'active'`,
     );
     const mixed = await readLineage();
-    await assert.rejects(query(migration0195Sql), /mixed lineage states/);
+    await assert.rejects(query(migration0195Sql), /execution descriptor history drifted/);
     assert.deepEqual(
       (await readLineage()).rows,
       mixed.rows,
-      "0195 must reject a mixed clean/rollback lineage atomically",
+      "0195 must keep rejecting after a later Flash version switch",
     );
     assert.deepEqual(
       (

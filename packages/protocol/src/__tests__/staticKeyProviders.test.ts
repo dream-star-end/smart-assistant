@@ -5,7 +5,7 @@
  *
  * 覆盖:
  *   - matchesRoute(deepseek 大小写敏感前缀 / minimax,ark 精确大小写不敏感)
- *   - inboundModelIds 精确字面量(deepseek 2 项,与 route 面故意不同)
+ *   - inboundModelIds 精确字面量(Flash 归 OpenCode Go；direct DeepSeek 只保留 Pro)
  *   - canonicalizeForPricing(deepseek→null 原样 / minimax→MiniMax-M3 / ark→glm-5.1)
  *   - findRouteProviderForModel / STATIC_KEY_INBOUND_MODEL_IDS
  *   - 漂移守护:protocol-owned 字段与仓库根 static-key-providers.snapshot.json 一致
@@ -28,6 +28,7 @@ describe('staticKeyProviders — matchesRoute', () => {
     const ds = getStaticProvider('deepseek')
     assert.equal(ds.matchesRoute('deepseek-v4-pro'), true)
     assert.equal(ds.matchesRoute('deepseek-chat'), true)
+    assert.equal(ds.matchesRoute('deepseek-v4-flash'), false)
     assert.equal(ds.matchesRoute('deepseek-v4-flash-opencode-go'), false)
     assert.equal(ds.matchesRoute('deepseek-V4-Flash-OpenCode-Go'), false)
     // 大小写敏感:大写 D 不命中(等价 shared.ts:87 现状)
@@ -51,11 +52,12 @@ describe('staticKeyProviders — matchesRoute', () => {
     assert.equal(ark.matchesRoute('glm-5'), false)
     assert.equal(ark.matchesRoute('glm-5.4'), false)
   })
-  it('opencodego(DeepSeek alias + qwen3.7 legacy)精确,大小写不敏感', () => {
+  it('opencodego(Flash canonical + 历史 alias + qwen3.7 legacy)精确,大小写不敏感', () => {
     const og = getStaticProvider('opencodego')
     assert.equal(og.matchesRoute('deepseek-v4-flash-opencode-go'), true)
     assert.equal(og.matchesRoute('DeepSeek-V4-Flash-OpenCode-Go'), true)
-    assert.equal(og.matchesRoute('deepseek-v4-flash'), false)
+    assert.equal(og.matchesRoute('deepseek-v4-flash'), true)
+    assert.equal(og.matchesRoute('DeepSeek-V4-Flash'), true)
     assert.equal(og.matchesRoute('qwen3.7-max'), true)
     assert.equal(og.matchesRoute('Qwen3.7-Max'), true)
     assert.equal(og.matchesRoute('qwen3.7-plus'), true)
@@ -100,6 +102,7 @@ describe('staticKeyProviders — matchesRoute', () => {
 describe('staticKeyProviders — findRouteProviderForModel', () => {
   it('命中各 provider;非静态 → undefined', () => {
     assert.equal(findRouteProviderForModel('deepseek-v4-pro')?.id, 'deepseek')
+    assert.equal(findRouteProviderForModel('deepseek-v4-flash')?.id, 'opencodego')
     assert.equal(findRouteProviderForModel('MiniMax-M3')?.id, 'minimax')
     assert.equal(findRouteProviderForModel('glm-5.1')?.id, 'ark')
     assert.equal(findRouteProviderForModel('glm-5.2')?.id, 'ark')
@@ -118,17 +121,15 @@ describe('staticKeyProviders — findRouteProviderForModel', () => {
 })
 
 describe('staticKeyProviders — inboundModelIds(与 route 面故意不同)', () => {
-  it('deepseek 只放 2 个精确字面量(不放过未声明 deepseek- 变体)', () => {
-    assert.deepEqual([...getStaticProvider('deepseek').inboundModelIds], [
-      'deepseek-v4-flash',
-      'deepseek-v4-pro',
-    ])
+  it('deepseek direct 只放 Pro(Flash 已统一归 OpenCode Go)', () => {
+    assert.deepEqual([...getStaticProvider('deepseek').inboundModelIds], ['deepseek-v4-pro'])
   })
-  it('minimax 1 项 / ark 3 项 / opencodego 新 alias + 2 个历史 Qwen', () => {
+  it('minimax 1 项 / ark 3 项 / opencodego Flash canonical+alias + 2 个历史 Qwen', () => {
     assert.deepEqual([...getStaticProvider('minimax').inboundModelIds], ['MiniMax-M3'])
     assert.deepEqual([...getStaticProvider('ark').inboundModelIds], ['glm-5.3', 'glm-5.2', 'glm-5.1'])
     assert.deepEqual([...getStaticProvider('opencodego').inboundModelIds], [
       'deepseek-v4-flash-opencode-go',
+      'deepseek-v4-flash',
       'qwen3.7-max',
       'qwen3.7-plus',
     ])
@@ -139,13 +140,13 @@ describe('staticKeyProviders — inboundModelIds(与 route 面故意不同)', ()
   })
   it('STATIC_KEY_INBOUND_MODEL_IDS = 全 provider 字面量展开', () => {
     assert.deepEqual([...STATIC_KEY_INBOUND_MODEL_IDS], [
-      'deepseek-v4-flash',
       'deepseek-v4-pro',
       'MiniMax-M3',
       'glm-5.3',
       'glm-5.2',
       'glm-5.1',
       'deepseek-v4-flash-opencode-go',
+      'deepseek-v4-flash',
       'qwen3.7-max',
       'qwen3.7-plus',
       'kimi-k2.7-code',
@@ -178,11 +179,12 @@ describe('staticKeyProviders — canonicalizeForPricing', () => {
     assert.equal(ark.canonicalizeForPricing('glm-5.3'), 'glm-5.3')
     assert.equal(ark.canonicalizeForPricing('glm-5.4'), null)
   })
-  it('opencodego → 独立 Flash alias / qwen3.7 legacy(小写归一)', () => {
+  it('opencodego → provider-neutral Flash canonical / 历史 alias 同归一 / qwen3.7 legacy', () => {
     const og = getStaticProvider('opencodego')
-    assert.equal(og.canonicalizeForPricing('DeepSeek-V4-Flash-OpenCode-Go'), 'deepseek-v4-flash-opencode-go')
+    assert.equal(og.canonicalizeForPricing('DeepSeek-V4-Flash-OpenCode-Go'), 'deepseek-v4-flash')
     assert.equal(og.upstreamModelForRequest?.('DeepSeek-V4-Flash-OpenCode-Go'), 'deepseek-v4-flash')
-    assert.equal(og.canonicalizeForPricing('deepseek-v4-flash'), null)
+    assert.equal(og.canonicalizeForPricing('deepseek-v4-flash'), 'deepseek-v4-flash')
+    assert.equal(og.upstreamModelForRequest?.('DeepSeek-V4-Flash'), 'deepseek-v4-flash')
     assert.equal(og.canonicalizeForPricing('qwen3.7-max'), 'qwen3.7-max')
     assert.equal(og.canonicalizeForPricing('Qwen3.7-Max'), 'qwen3.7-max')
     assert.equal(og.canonicalizeForPricing('qwen3.7-plus'), 'qwen3.7-plus')
