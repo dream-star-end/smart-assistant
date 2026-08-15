@@ -48,7 +48,7 @@ import type {
   TurnToolEntry,
 } from './engine/engineEvents.js'
 import { createEngine, resolveEngine } from './engine/registry.js'
-import { isModelAuthorityRequired } from './modelAuthority.js'
+import { isEngineLocalTurnExempt, isModelAuthorityRequired } from './modelAuthority.js'
 import type { CodexProviderConfigOverride } from './engine/codexShared.js'
 import type { GrokRouteOverride } from './engine/grokAdapter.js'
 import { eventBus, createEvent } from './eventBus.js'
@@ -3302,7 +3302,11 @@ export class SessionManager {
     if (
       session.runner.capabilities.needsServerRequestId &&
       !(typeof requestId === 'string' && /^[0-9a-f]{32}$/.test(requestId)) &&
-      isCommercialManagedRuntime()
+      isCommercialManagedRuntime() &&
+      // selfhost 豁免门(OC_SELFHOST_ENGINE_LOCAL_TURNS=1):单租户自用部署显式接受
+      // 无 bridge 计费编排的 engine-reported turn(与 decideLocalExecution 真值表同源,
+      // 语义/代价见 modelAuthority.isEngineLocalTurnExempt)。生产不设 -> fail-closed 不变。
+      !isEngineLocalTurnExempt()
     ) {
       log.error('codex turn rejected: missing/malformed server-owned requestId (billing guard)', {
         sessionKey: session.sessionKey,

@@ -442,6 +442,39 @@ describe('④⑤ codex delegate / provider pin 的本地 turn → DELEGATE_CODEX
     )
   })
 
+  test('豁免门开(OC_SELFHOST_ENGINE_LOCAL_TURNS=1):kind=turn 的 codex 意图放行,不降级', () => {
+    const d = decideLocalExecution({
+      view: normalView(),
+      agent: { id: 'member', model: 'gpt-5.6-sol' },
+      kind: 'turn',
+      env: { OC_SELFHOST_ENGINE_LOCAL_TURNS: '1' } as NodeJS.ProcessEnv,
+    })
+    assert.equal(d.engine, 'codex')
+    assert.equal(d.canonicalModel, 'gpt-5.6-sol')
+    assert.equal(d.downgradedFrom, undefined, '放行不是降级')
+  })
+
+  test('豁免门开:codex-native pin 的本地 turn 同样放行(单租户知情豁免)', () => {
+    const d = decideLocalExecution({
+      view: normalView(),
+      agent: CODEX_PINNED,
+      kind: 'turn',
+      env: { OC_SELFHOST_ENGINE_LOCAL_TURNS: '1' } as NodeJS.ProcessEnv,
+    })
+    assert.equal(d.engine, 'codex')
+  })
+
+  test('豁免门只影响 kind=turn:synthetic 的 codex 意图仍降级', () => {
+    const d = decideLocalExecution({
+      view: normalView(),
+      agent: { id: 'main', model: 'gpt-5.6-sol' },
+      kind: 'synthetic',
+      env: { OC_SELFHOST_ENGINE_LOCAL_TURNS: '1' } as NodeJS.ProcessEnv,
+    })
+    assert.equal(d.engine, 'ccb')
+    assert.equal(d.canonicalModel, 'deepseek-v4-pro')
+  })
+
   test('prewarm 不套 codex 真值表(不是 turn:不执行/不计费),engine 仍取投影', () => {
     const d = decideLocalExecution({ view: normalView(), agent: CODEX_PINNED, kind: 'prewarm' })
     assert.equal(d.engine, 'codex')
@@ -465,6 +498,24 @@ describe('④⑤ codex delegate / provider pin 的本地 turn → DELEGATE_CODEX
       assert.equal(gw._activeDelegations, 0)
     } finally {
       restoreFlag(prev)
+    }
+  })
+
+  test('HTTP delegate 端点:豁免门开 + flag 开 -> codex 目标放行,runner 创建照常', async () => {
+    installCatalog()
+    const prev = process.env.OC_MODEL_AUTHORITY
+    const prevExempt = process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS
+    process.env.OC_MODEL_AUTHORITY = '1'
+    process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS = '1'
+    try {
+      const gw = makeDelegateGateway()
+      const r = await runDelegate(gw, 'codex-member', { goal: 'codex 子任务', sourceAgent: 'main' })
+      assert.equal(r.status, 200)
+      assert.equal(gw.sessions.getOrCreateCalls, 1, '豁免门开 -> 不再结构化拒')
+    } finally {
+      restoreFlag(prev)
+      if (prevExempt === undefined) process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS = undefined
+      else process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS = prevExempt
     }
   })
 
@@ -597,6 +648,7 @@ function makeDelegateGateway(): any {
   const main = { id: 'main', model: 'glm-5.2' }
   const codexLeader = { id: 'codex-leader', model: 'gpt-5.6-sol', provider: 'codex-native' }
   const coding = { id: 'coding-assistant', model: 'glm-5.2' }
+  const codexMember = { id: 'codex-member', model: 'gpt-5.6-sol' }
   const gw = Object.create(Gateway.prototype) as any
   gw._shuttingDown = false
   gw.clientsByPeer = new Map()
@@ -616,7 +668,7 @@ function makeDelegateGateway(): any {
       channels: { webchat: { enabled: true } },
     },
   }
-  gw._getAgentsConfig = async () => ({ default: 'main', agents: [main, codexLeader, coding] })
+  gw._getAgentsConfig = async () => ({ default: 'main', agents: [main, codexLeader, coding, codexMember] })
   gw._isIdempotencyDuplicate = () => false
   gw._markIdempotencyKey = () => {}
   gw._runLog = { start: () => ({}), complete: () => {} }

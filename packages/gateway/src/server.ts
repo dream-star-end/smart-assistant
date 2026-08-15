@@ -315,6 +315,7 @@ import {
   attachTurnAuthority,
   buildContainerAttestFrame,
   getTurnAuthority,
+  isEngineLocalTurnExempt,
   isModelAuthorityRequired,
   stripModelAuthorityField,
   type ConnectionAuthorityContext,
@@ -612,7 +613,13 @@ export function decideLocalExecution(args: {
   const env = args.env ?? process.env
 
   // ① provider 硬 pin:engine 恒 codex,换模型无效 → 本地 turn 一律拒(prewarm 除外)。
-  if (agent.provider === 'codex-native' && kind !== 'prewarm' && kind !== 'auto_dream') {
+  if (
+    agent.provider === 'codex-native' &&
+    kind !== 'prewarm' &&
+    kind !== 'auto_dream' &&
+    // selfhost 豁免门开着时放行(modelAuthority.isEngineLocalTurnExempt,代价说明见彼处)。
+    !isEngineLocalTurnExempt(env)
+  ) {
     throw new LocalExecutionRejected(
       'DELEGATE_CODEX_UNSUPPORTED',
       `agent '${agent.id}' is pinned to the codex engine, which cannot run on a local ` +
@@ -641,11 +648,17 @@ export function decideLocalExecution(args: {
       return { canonicalModel, engine, supportsVision: descriptor.supportsVision }
     }
     if (kind === 'turn') {
-      throw new LocalExecutionRejected(
-        'DELEGATE_CODEX_UNSUPPORTED',
-        `model '${canonicalModel}' runs on the ${engine} engine, which cannot run on a local ` +
-          `(non-bridge) turn: engine-reported billing needs a master-minted request id.`,
-      )
+      // selfhost 豁免门(OC_SELFHOST_ENGINE_LOCAL_TURNS=1)未开 -> 结构化拒(现状)。
+      if (!isEngineLocalTurnExempt(env)) {
+        throw new LocalExecutionRejected(
+          'DELEGATE_CODEX_UNSUPPORTED',
+          `model '${canonicalModel}' runs on the ${engine} engine, which cannot run on a local ` +
+            `(non-bridge) turn: engine-reported billing needs a master-minted request id.`,
+        )
+      }
+      // 豁免门开 -> 按投影 engine 放行执行(单租户自用部署接受该 turn 不走 master
+      // 计费编排:usage 不结算,仍落 event/usage log 与 durable tape)。
+      return { canonicalModel, engine, supportsVision: descriptor.supportsVision }
     }
     return downgradeSyntheticCodex(view, canonicalModel, args.defaultModel, env)
   }
