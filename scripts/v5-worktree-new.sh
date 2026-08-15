@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
-# v5-worktree-new.sh — 创建 V5 worktree 并复用 node_modules / tsc 增量缓存。
+# v5-worktree-new.sh — 创建 V5 worktree 并复用第三方依赖 / tsc 增量缓存。
 #
-# 目标:把「新任务分支冷启动」从数分钟(npm ci + 全量 tsc)压到秒级。
-# 默认用 symlink 挂 donor 的 node_modules(含各 package 级);tsc 增量缓存
-# 按 base commit 分桶拷贝,避免跨 commit 污染。
-#
-# 红线:只创建/删除本脚本自己建的 worktree;--report 只列不删。
+# 第三方依赖从 donor 共享(省 npm ci)。工作区包(@openclaude/*)必须自指回
+# **本 worktree** 的 packages/,绝不能整棵软链 node_modules —— Node 会解析到
+# donor 源码,门绿但验的是别人的树。
 set -euo pipefail
 
 CANONICAL="${OC_V5_CANONICAL:-/opt/openclaude/openclaude-v5-aurora}"
@@ -20,19 +18,21 @@ Usage:
   scripts/v5-worktree-new.sh <name> [base-branch]
   scripts/v5-worktree-new.sh --fresh <name> [base-branch]
   scripts/v5-worktree-new.sh --heal <worktree-path>
+  scripts/v5-worktree-new.sh --self-check <worktree-path>
   scripts/v5-worktree-new.sh --report
   scripts/v5-worktree-new.sh --self-test-share
 
 Options:
   --donor PATH          依赖/缓存来源(默认 /opt/openclaude/openclaude-v5-aurora)
-  --method symlink|hardlink   默认 symlink;hardlink 走 cp -al
+  --method symlink|hardlink   第三方依赖的共享方式;工作区包一律自指本树
   --base-dir PATH       worktree 父目录(默认 /opt/openclaude)
   --branch NAME         新分支名(默认 feat/v5-<name>)
   --path PATH           worktree 路径(默认 <base-dir>/openclaude-v5-<name>)
   --fresh               不复用,在新 worktree 里 npm ci
-  --heal PATH           检测共享缓存损坏并自愈(拆坏链 / 丢弃污染的 tsbuildinfo)
+  --heal PATH           拆整棵 donor 软链、把 @openclaude/* 自指回本树
+  --self-check PATH     只跑工作区自指断言(不改树)
   --report              列出重复 node_modules 磁盘占用;绝不删除
-  --self-test-share     在临时目录实测 symlink vs hardlink 的 .bin 可用性
+  --self-test-share     在临时目录实测第三方共享 + 工作区自指
 
 环境:
   OC_V5_CANONICAL  OC_V5_WORKTREE_BASE_DIR  OC_V5_WORKTREE_CACHE
@@ -69,41 +69,166 @@ valid_name() {
   [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && ${#1} -le 80 ]]
 }
 
-share_node_modules() {
+# stdout: "name<TAB>relpath" 一行一个工作区包。无 package.json 则空。
+list_workspace_packages() {
+  local root="$1"
+  python3 - "$root" <<'PY'
+import json, glob, os, sys
+root = sys.argv[1]
+pj = os.path.join(root, "package.json")
+if not os.path.isfile(pj):
+    sys.exit(0)
+meta = json.load(open(pj))
+for pat in meta.get("workspaces") or []:
+    for d in glob.glob(os.path.join(root, pat)):
+        pkg = os.path.join(d, "package.json")
+        if not os.path.isfile(pkg):
+            continue
+        name = json.load(open(pkg)).get("name") or ""
+        if name:
+            print(f"{name}\t{os.path.relpath(d, root)}")
+PY
+}
+
+link_third_party() {
+  local src="$1" dst="$2" method="$3"
+  if [[ "$method" == hardlink ]]; then
+    cp -al "$src" "$dst"
+  else
+    ln -s "$src" "$dst"
+  fi
+}
+
+# 拆开共享:第三方条目链到 donor, @openclaude/* 绝对软链回本树 packages/。
+share_root_node_modules() {
+  local donor="$1" wt="$2" method="$3"
+  local src="$donor/node_modules" dst="$wt/node_modules"
+  if [[ -L "$dst" ]]; then
+    echo "  · 拆除整棵 node_modules 软链(会把 @openclaude 解析进 donor)"
+    rm -f "$dst"
+  fi
+  mkdir -p "$dst"
+
+  local entry name
+  shopt -s dotglob nullglob
+  for entry in "$src"/*; do
+    name="$(basename "$entry")"
+    [[ "$name" == @openclaude ]] && continue
+    if [[ -e "$dst/$name" || -L "$dst/$name" ]]; then
+      continue
+    fi
+    link_third_party "$entry" "$dst/$name" "$method"
+  done
+  shopt -u dotglob nullglob
+
+  rebind_workspace_packages "$wt"
+  echo "  · 根 node_modules:第三方→$method donor, @openclaude/* → 本树 packages/"
+}
+
+rebind_workspace_packages() {
+  local wt="$1" name rel dest
+  if [[ ! -f "$wt/package.json" ]]; then
+    echo "  · 无 package.json,跳过工作区自指"
+    return 0
+  fi
+  # 整棵 @openclaude 若是指向 donor 的软链,mkdir -p 会跟进去改 donor。先拆掉。
+  if [[ -L "$wt/node_modules/@openclaude" ]]; then
+    rm -f "$wt/node_modules/@openclaude"
+  fi
+  mkdir -p "$wt/node_modules/@openclaude"
+  while IFS=$'\t' read -r name rel; do
+    [[ -n "$name" ]] || continue
+    dest="$wt/node_modules/${name}"
+    mkdir -p "$(dirname "$dest")"
+    rm -f "$dest"
+    ln -sfn "$wt/$rel" "$dest"
+    echo "  · 自指 $name -> $wt/$rel"
+  done < <(list_workspace_packages "$wt")
+}
+
+share_package_node_modules() {
   local src="$1" dst="$2" method="$3"
   if [[ -e "$dst" || -L "$dst" ]]; then
-    echo "  · 已存在 $dst — 跳过"
     return 0
   fi
-  if [[ ! -e "$src" ]]; then
-    return 0
+  [[ -e "$src" ]] || return 0
+  # 包级 node_modules 若含 @openclaude,整棵软链同样会泄漏到 donor。
+  if [[ -e "$src/@openclaude" || -L "$src/@openclaude" ]]; then
+    mkdir -p "$dst"
+    local entry name
+    shopt -s dotglob nullglob
+    for entry in "$src"/*; do
+      name="$(basename "$entry")"
+      [[ "$name" == @openclaude ]] && continue
+      link_third_party "$entry" "$dst/$name" "$method"
+    done
+    shopt -u dotglob nullglob
+    echo "  · 包级拆分 $dst (去掉 @openclaude,避免二次泄漏)"
+  else
+    mkdir -p "$(dirname "$dst")"
+    link_third_party "$src" "$dst" "$method"
+    echo "  · 包级第三方 $dst -> $src"
   fi
-  mkdir -p "$(dirname "$dst")"
-  case "$method" in
-    symlink)
-      ln -s "$src" "$dst"
-      echo "  · symlink $dst -> $src"
-      ;;
-    hardlink)
-      cp -al "$src" "$dst"
-      echo "  · hardlink-tree $src -> $dst"
-      ;;
-    *) die "未知 method:$method" ;;
-  esac
 }
 
 share_all_node_modules() {
   local donor="$1" wt="$2" method="$3" src rel
-  share_node_modules "$donor/node_modules" "$wt/node_modules" "$method"
-  # 根 workspace + 各 package(含 channels/*)的 node_modules 都要挂上。
+  share_root_node_modules "$donor" "$wt" "$method"
   while IFS= read -r src; do
     rel="${src#"$donor"/}"
-    share_node_modules "$src" "$wt/$rel" "$method"
+    share_package_node_modules "$src" "$wt/$rel" "$method"
   done < <(find "$donor/packages" -mindepth 2 -maxdepth 4 -type d -name node_modules 2>/dev/null || true)
 }
 
-# tsc 增量缓存按 base commit 分桶。只有 donor HEAD == 新 worktree HEAD 时才拷贝
-# dist-types / tsbuildinfo,否则宁可冷启动,也不给出错误的增量结果。
+# 0=通过。有 workspaces 时每个包的 realpath 必须在本树内;
+# 非 --fresh 时第三方(typescript/tsx)必须仍落在 donor 内。
+assert_workspace_self_point() {
+  local wt="$1" donor="${2:-}"
+  local name rel dest real wt_real leaked=0 expected=0
+  wt_real="$(realpath "$wt")"
+  while IFS=$'\t' read -r name rel; do
+    [[ -n "$name" ]] || continue
+    expected=$((expected + 1))
+    dest="$wt/node_modules/${name}"
+    if [[ ! -e "$dest" && ! -L "$dest" ]]; then
+      echo "✗ 自检失败:缺少 $dest($name → $rel)" >&2
+      leaked=1
+      continue
+    fi
+    real="$(realpath "$dest")"
+    if [[ "$real" != "$wt_real" && "$real" != "$wt_real"/* ]]; then
+      echo "✗ 自检失败:$name → $real 不在本树 $wt_real" >&2
+      echo "  Node 会解析软链到真实路径。整棵 node_modules 链到 donor 时,相对 ../../packages 会落到 donor 源码。" >&2
+      leaked=1
+    fi
+  done < <(list_workspace_packages "$wt")
+  if [[ "$expected" -gt 0 && "$leaked" != 0 ]]; then
+    return 2
+  fi
+  if [[ "$expected" -gt 0 && ! -d "$wt/node_modules/@openclaude" ]]; then
+    echo "✗ 自检失败:没有 $wt/node_modules/@openclaude —— 工作区包未自指,门会验到别的树" >&2
+    return 2
+  fi
+
+  if [[ -n "$donor" && -d "$donor/node_modules" ]]; then
+    local donor_real sample
+    donor_real="$(realpath "$donor")"
+    for sample in typescript tsx; do
+      if [[ -e "$wt/node_modules/$sample" ]]; then
+        real="$(realpath "$wt/node_modules/$sample")"
+        if [[ "$real" != "$donor_real" && "$real" != "$donor_real"/* ]]; then
+          echo "✗ 自检失败:第三方 $sample → $real 不在 donor $donor_real(共享被破坏)" >&2
+          return 2
+        fi
+      fi
+    done
+    echo "  · 自检通过:工作区包 ${expected} 个全在本树内,第三方仍指向 donor"
+  else
+    echo "  · 自检通过:工作区包 ${expected} 个全在本树内"
+  fi
+  return 0
+}
+
 install_tsc_cache() {
   local donor="$1" wt="$2" head="$3"
   local donor_head bucket src dest
@@ -126,7 +251,6 @@ install_tsc_cache() {
   done < <(find "$donor/packages" \( -name dist-types -o -name tsconfig.tsbuildinfo \) \
             -not -path '*/node_modules/*' 2>/dev/null || true)
 
-  # 同步一份到按 commit 分桶的共享目录,供后续同 SHA worktree 复用。
   if [[ "$copied" -gt 0 ]]; then
     mkdir -p "$bucket/packages"
     rsync -a --delete \
@@ -178,17 +302,12 @@ create_worktree() {
 
   need_tool git
   donor="$(resolve_donor "$donor")"
-  local repo
-  repo="$(git -C "$donor" rev-parse --absolute-git-dir)"
-  repo="${repo%.git}"
-  repo="${repo%/.}"
 
   echo "══ v5-worktree-new name=$name base=$base_branch method=$method fresh=$fresh ══"
   echo "  donor=$donor"
   echo "  path=$path"
   echo "  branch=$branch"
 
-  # 从 donor 所在仓库建 worktree。-b 新分支,起点是 base-branch。
   git -C "$donor" fetch origin --quiet 2>/dev/null || true
   local start
   start="$(git -C "$donor" rev-parse --verify "$base_branch^{commit}" 2>/dev/null \
@@ -205,10 +324,12 @@ create_worktree() {
     need_tool npm
     echo "── --fresh: npm ci(不复用)──"
     (cd "$path" && npm ci)
+    assert_workspace_self_point "$path" "" || die "工作区自指自检失败,拒绝交付这棵树"
   else
-    echo "── 复用 node_modules($method)──"
+    echo "── 复用第三方依赖($method)并自指工作区包──"
     share_all_node_modules "$donor" "$path" "$method"
     verify_bins "$path"
+    assert_workspace_self_point "$path" "$donor" || die "工作区自指自检失败,拒绝交付这棵树"
     echo "── 安装 tsc 增量缓存──"
     install_tsc_cache "$donor" "$path" "$head"
   fi
@@ -217,51 +338,91 @@ create_worktree() {
   printf '%s\n' "$path"
 }
 
+infer_donor_from_tree() {
+  local wt="$1" explicit="$2"
+  if [[ -n "$explicit" && -d "$explicit/node_modules" ]]; then
+    printf '%s\n' "$explicit"
+    return 0
+  fi
+  if [[ -f "$wt/$STAMP_NAME" ]]; then
+    python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('donor',''))" "$wt/$STAMP_NAME"
+    return 0
+  fi
+  if [[ -L "$wt/node_modules" ]]; then
+    local nm
+    nm="$(realpath "$wt/node_modules")"
+    printf '%s\n' "$(dirname "$nm")"
+    return 0
+  fi
+  if [[ -L "$wt/node_modules/typescript" ]]; then
+    printf '%s\n' "$(dirname "$(dirname "$(realpath "$wt/node_modules/typescript")")")"
+    return 0
+  fi
+  return 1
+}
+
 heal_worktree() {
   local wt="$1"
   [[ -d "$wt" ]] || die "worktree 不存在:$wt"
-  [[ -f "$wt/$STAMP_NAME" ]] || die "不是本脚本创建的 worktree(缺 $STAMP_NAME):$wt"
 
   echo "══ heal $wt ══"
+  local donor method=symlink
+  donor="$(infer_donor_from_tree "$wt" "$DONOR")" || {
+    echo "✗ 无法推断 donor。请加 --donor /opt/openclaude/openclaude-v5-aurora" >&2
+    return 2
+  }
+  donor="$(resolve_donor "$donor")"
+  if [[ -f "$wt/$STAMP_NAME" ]]; then
+    method="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('method','symlink'))" "$wt/$STAMP_NAME" 2>/dev/null || echo symlink)"
+  fi
+  [[ "$method" == hardlink || "$method" == symlink ]] || method=symlink
+
   local broken=0
+  if [[ -L "$wt/node_modules" ]]; then
+    echo "  · 整棵 node_modules 是软链 — 这会把 @openclaude 解析进 donor,正在拆开重绑"
+    rm -f "$wt/node_modules"
+    share_all_node_modules "$donor" "$wt" "$method"
+    broken=1
+  elif [[ -d "$wt/node_modules/@openclaude" ]]; then
+    echo "  · 重绑 @openclaude/* 到本树"
+    rebind_workspace_packages "$wt"
+    broken=1
+  fi
+
   if [[ ! -x "$wt/node_modules/.bin/tsc" ]] || ! "$wt/node_modules/.bin/tsc" --version >/dev/null 2>&1; then
-    echo "  · node_modules/.bin 不可用 — 拆除共享链"
-    if [[ -L "$wt/node_modules" ]]; then
-      rm -f "$wt/node_modules"
-    elif [[ -d "$wt/node_modules" ]]; then
-      echo "  · $wt/node_modules 是真实目录,不自动删除。请人工确认后 --fresh 重建。"
-    fi
-    # package-level 坏链一并拆掉
-    find "$wt/packages" -mindepth 2 -maxdepth 4 \( -type l -o -type d \) -name node_modules 2>/dev/null \
-      | while IFS= read -r p; do
-          if [[ -L "$p" ]]; then
-            rm -f "$p"
-            echo "  · 拆除 $p"
-          fi
-        done
+    echo "  · .bin 不可用 — 重新共享第三方"
+    share_all_node_modules "$donor" "$wt" "$method"
     broken=1
   else
     echo "  · .bin 正常"
   fi
 
-  # 共享 tsbuildinfo 导致「增量结果不对」时的自愈:丢掉本树缓存,下次 tsc 全量。
-  # 判据:stamp.head 与当前 HEAD 不一致,或用户显式要求。
-  local stamp_head current
-  stamp_head="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('head',''))" "$wt/$STAMP_NAME" 2>/dev/null || true)"
-  current="$(git -C "$wt" rev-parse HEAD 2>/dev/null || true)"
-  if [[ -n "$stamp_head" && -n "$current" && "$stamp_head" != "$current" ]]; then
-    echo "  · HEAD 已离开缓存桶($stamp_head → $current) — 丢弃本树 tsbuildinfo"
-    find "$wt/packages" \( -name .tsbuildinfo -o -name tsconfig.tsbuildinfo \) \
-      -not -path '*/node_modules/*' -delete 2>/dev/null || true
+  if ! assert_workspace_self_point "$wt" "$donor"; then
+    echo "  · 自检仍失败,再拆一次根 node_modules 重绑"
+    if [[ -L "$wt/node_modules" ]]; then
+      rm -f "$wt/node_modules"
+    elif [[ -d "$wt/node_modules/@openclaude" ]]; then
+      rm -rf "$wt/node_modules/@openclaude"
+    fi
+    share_all_node_modules "$donor" "$wt" "$method"
+    assert_workspace_self_point "$wt" "$donor" || die "heal 后自检仍失败"
     broken=1
   fi
 
-  if [[ "$broken" == 1 ]]; then
-    echo "  下一步:在 $wt 跑 scripts/v5-worktree-new.sh --fresh 对应 name,或从仍健康的 donor 重新 symlink。"
-    echo "  本命令不自动 npm ci,也不删除他人 worktree。"
-    return 1
+  local stamp_head current
+  if [[ -f "$wt/$STAMP_NAME" ]]; then
+    stamp_head="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('head',''))" "$wt/$STAMP_NAME" 2>/dev/null || true)"
+    current="$(git -C "$wt" rev-parse HEAD 2>/dev/null || true)"
+    if [[ -n "$stamp_head" && -n "$current" && "$stamp_head" != "$current" ]]; then
+      echo "  · HEAD 已离开缓存桶($stamp_head → $current) — 丢弃本树 tsbuildinfo"
+      find "$wt/packages" \( -name .tsbuildinfo -o -name tsconfig.tsbuildinfo \) \
+        -not -path '*/node_modules/*' -delete 2>/dev/null || true
+      broken=1
+    fi
   fi
-  echo "✓ 共享缓存看起来健康"
+
+  verify_bins "$wt"
+  echo "✓ heal 完成(workspace 自指已修复,第三方仍共享 donor=$donor)"
   return 0
 }
 
@@ -271,7 +432,6 @@ report_duplicates() {
   local n_real=0 n_link=0 total=0
   local path kind size
   printf '%-10s %12s  %s\n' "KIND" "BYTES" "PATH"
-  # 用 find -maxdepth 2,避免深入 node_modules。
   while IFS= read -r path; do
     if [[ -L "$path" ]]; then
       kind="symlink"
@@ -301,29 +461,27 @@ self_test_share() {
   local tmp
   tmp="$(mktemp -d /tmp/v5-share-probe.XXXXXX)"
   echo "══ self-test-share donor=$donor tmp=$tmp ══"
-  local method dir tsc_ok tsx_ok
+  # 用 donor 自己当「假 worktree 根」会自指回 donor,只能测 .bin。
+  # 完整自指测试见 __tests__/v5WorktreeNew.test.ts。
+  local method dir
   for method in symlink hardlink; do
     dir="$tmp/$method"
     mkdir -p "$dir"
-    share_node_modules "$donor/node_modules" "$dir/node_modules" "$method"
-    tsc_ok=0; tsx_ok=0
-    if [[ -x "$dir/node_modules/.bin/tsc" ]] && "$dir/node_modules/.bin/tsc" --version >/dev/null 2>&1; then
-      tsc_ok=1
-    fi
-    if [[ -x "$dir/node_modules/.bin/tsx" ]] && "$dir/node_modules/.bin/tsx" --version >/dev/null 2>&1; then
-      tsx_ok=1
-    fi
-    echo "  $method tsc=$tsc_ok tsx=$tsx_ok version=$("$dir/node_modules/.bin/tsc" --version 2>/dev/null || echo FAIL)"
+    # 最小:只链第三方 typescript
+    mkdir -p "$dir/node_modules"
+    link_third_party "$donor/node_modules/typescript" "$dir/node_modules/typescript" "$method"
+    link_third_party "$donor/node_modules/.bin" "$dir/node_modules/.bin" symlink
+    echo "  $method tsc=$("$dir/node_modules/.bin/tsc" --version 2>/dev/null || echo FAIL)"
   done
   rm -rf "$tmp"
   echo "✓ self-test-share 完成(临时目录已清)"
 }
 
-# ── argv ──
 FRESH=0
 METHOD="${OC_V5_WORKTREE_METHOD:-symlink}"
 DONOR="$CANONICAL"
 HEAL_PATH=""
+SELF_CHECK_PATH=""
 DO_REPORT=0
 DO_SELFTEST=0
 BRANCH_OVERRIDE=""
@@ -335,6 +493,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --fresh) FRESH=1; shift ;;
     --heal) HEAL_PATH="${2:-}"; shift 2 ;;
+    --self-check) SELF_CHECK_PATH="${2:-}"; shift 2 ;;
     --report) DO_REPORT=1; shift ;;
     --self-test-share) DO_SELFTEST=1; shift ;;
     --donor) DONOR="${2:-}"; shift 2 ;;
@@ -370,6 +529,12 @@ if [[ "$DO_SELFTEST" == 1 ]]; then
 fi
 if [[ -n "$HEAL_PATH" ]]; then
   heal_worktree "$HEAL_PATH"
+  exit $?
+fi
+if [[ -n "$SELF_CHECK_PATH" ]]; then
+  [[ -d "$SELF_CHECK_PATH" ]] || die "worktree 不存在:$SELF_CHECK_PATH"
+  donor="$(infer_donor_from_tree "$SELF_CHECK_PATH" "$DONOR" || true)"
+  assert_workspace_self_point "$SELF_CHECK_PATH" "$donor"
   exit $?
 fi
 [[ -n "$NAME" ]] || { usage >&2; exit 2; }
