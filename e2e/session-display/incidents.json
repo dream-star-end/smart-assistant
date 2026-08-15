@@ -1440,6 +1440,30 @@
       ]
     },
     {
+      "id": "INC-20260815-ZAI-AUDIT-JSON-NULL",
+      "occurredAt": "2026-08-15",
+      "severity": "P1",
+      "symptom": "Z.AI GLM-5.3 发布迁移把真实管理 API 写入的 JSONB null 误当成 SQL NULL 校验，导致 0218 在生产安全回滚并阻塞模型公开。",
+      "rootFixCommit": "2948a259",
+      "regressions": [
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/migration0218.integ.test.ts",
+          "assertion": "accepts only the exact audited production verification lineage"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/migration0218.integ.test.ts",
+          "assertion": "rejects missing, reordered, or SQL-NULL verification audit atomically"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/deploy-v5.sh",
+          "assertion": "required migration not applied"
+        }
+      ]
+    },
+    {
       "id": "INC-20260815-ENGINE-STOP-DRAIN-HANG",
       "occurredAt": "2026-08-15",
       "severity": "P1",

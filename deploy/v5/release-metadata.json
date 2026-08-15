@@ -96,7 +96,8 @@
     "0214_disable_legacy_models",
     "0215_deepseek_flash_opencode_canonical",
     "0216_kimi_k3_256k",
-    "0217_stage_zai_glm53"
+    "0217_stage_zai_glm53",
+    "0218_public_zai_glm53"
   ],
   "capabilities": [
     "sessions-store-pg-v1",
