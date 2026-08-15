@@ -1510,6 +1510,12 @@ export class SessionManager {
   /** Cooperative Stop grace before the gateway escalates to runner shutdown.
    * Private test seam; the production boundary remains five seconds. */
   private _terminalRequestGraceMs = 5_000
+  /** Outer deadline on the post-shutdown stdout-close barrier. The barrier
+   * keeps late paid bytes inside the turn, but a descendant that escaped the
+   * supervisor's process group can hold the pipe open forever; without a
+   * deadline the turn never reaches a terminal state and the client sits in
+   * "stopping" indefinitely. Private test seam. */
+  private _terminalOutputDrainTimeoutMs = 15_000
   /**
    * F2 — owner 级 tail 预算,按 ownerTurnKey 键控,**SessionManager 级**(跨会话共享:
    * 多个 delegate 子会话共用同一 parent ownerTurnKey 时同领一份 64 额度,而非各领 64)。
@@ -4200,6 +4206,39 @@ export class SessionManager {
     return Math.min(30_000, 2000 * 2 ** attempt) + Math.random() * 1000
   }
 
+  /** Wait for the runner's stdout to really close, but never forever.
+   *
+   * The supervisor's own shutdown is already bounded, so reaching the deadline
+   * here means a descendant outlived a process-group SIGKILL and still owns
+   * the pipe. Giving up costs at most the bytes that descendant has yet to
+   * write; refusing to give up costs the turn its terminal state. */
+  private async _awaitBoundedOutputDrain(
+    runner: Pick<EngineAdapter, 'waitForOutputDrain'>,
+    session: AgentSession,
+  ): Promise<void> {
+    const timeoutMs = this._terminalOutputDrainTimeoutMs
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      await runner.waitForOutputDrain()
+      return
+    }
+    let timer: NodeJS.Timeout | undefined
+    const drained = await Promise.race([
+      // A barrier that settles after the deadline must not resurface as an
+      // unhandled rejection once we have already moved on.
+      runner.waitForOutputDrain().then(() => true, () => true),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), timeoutMs)
+      }),
+    ])
+    if (timer) clearTimeout(timer)
+    if (drained) return
+    log.error('terminal output drain deadline exceeded; finalizing turn without stdout close', {
+      sessionKey: session.sessionKey,
+      provider: session.providerTag,
+      timeoutMs,
+    })
+  }
+
   // (auth 错误关键字分类已下沉 engine/ccbAdapter.ts —— 错误字符串是 CCB 底座私有
   //  知识;本层只消费 TurnSummary.errorKind === 'auth'。)
 
@@ -4816,7 +4855,7 @@ export class SessionManager {
               'RUNNER_SHUTDOWN_FAILED',
             )
           }
-          await runner.waitForOutputDrain()
+          await this._awaitBoundedOutputDrain(runner, session)
           // Let synchronously parsed final/result frames schedule their
           // summary/finalization microtasks before deciding a partial is needed.
           await Promise.resolve()

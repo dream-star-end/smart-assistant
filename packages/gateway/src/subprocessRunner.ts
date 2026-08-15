@@ -16,6 +16,11 @@ import {
   TURN_LEASE_HEADER,
   getModelCatalogClient,
 } from './modelCatalogClient.js'
+import {
+  killProcessGroup as killRunnerProcessGroup,
+  shutdownTimeoutMs as runnerShutdownTimeoutMs,
+  waitForCloseWithin,
+} from './processGroupShutdown.js'
 import { buildPromptContext } from './promptSlots.js'
 import { resolveMcpMemoryEntry } from './mcpMemoryEntry.js'
 import type { ExecutionTarget } from './remoteTarget.js'
@@ -31,45 +36,6 @@ type RunnerExitInfo = {
   code: number | null
   signal: NodeJS.Signals | null
   crashed: boolean
-}
-
-function runnerShutdownTimeoutMs(name: string, fallback: number): number {
-  const raw = Number(process.env[name])
-  return Number.isFinite(raw) && raw >= 0 ? raw : fallback
-}
-
-function waitForCloseWithin(closePromise: Promise<void>, timeoutMs: number): Promise<boolean> {
-  return new Promise((resolve) => {
-    let done = false
-    const finish = (closed: boolean) => {
-      if (done) return
-      done = true
-      clearTimeout(timer)
-      resolve(closed)
-    }
-    const timer = setTimeout(() => finish(false), timeoutMs)
-    closePromise.then(() => finish(true))
-  })
-}
-
-function killRunnerProcessGroup(
-  proc: ChildProcessWithoutNullStreams,
-  signal: NodeJS.Signals,
-): void {
-  try {
-    if (typeof proc.pid === 'number' && proc.pid > 0) {
-      process.kill(-proc.pid, signal)
-      return
-    }
-  } catch {
-    // Fall back to the direct child if the detached process group is already
-    // gone or unavailable on this platform.
-  }
-  try {
-    proc.kill(signal)
-  } catch {
-    /* ignore */
-  }
 }
 
 /**
