@@ -21,6 +21,10 @@ REMOTE_MUTATION_LOCK="/run/openclaude-v5/production-mutation.lock"
 REMOTE_MANUAL_LEASE_PROOF="${REMOTE_MUTATION_LOCK}.manual-holder"
 LEASE_WRAPPER="${OC_V5_RELEASE_QUEUE_LEASE_WRAPPER:-$SCRIPT_DIR/with-production-mutation-lease.sh}"
 SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
+QUEUE_RUN_DIR="${OC_V5_RELEASE_QUEUE_RUN_DIR:-/var/run/openclaude-v5/release-queue}"
+HEARTBEAT_INTERVAL="${OC_V5_HEARTBEAT_INTERVAL:-30}"
+HEARTBEAT_MAX_SECONDS="${OC_V5_HEARTBEAT_MAX_SECONDS:-14400}"
+HEARTBEAT_STALE_SECONDS="${OC_V5_HEARTBEAT_STALE_SECONDS:-180}"
 
 die() {
   echo "✗ $*" >&2
@@ -381,12 +385,160 @@ status_locked() {
   fi
 }
 
+
+heartbeat_pidfile() { printf '%s/%s.heartbeat.pid\n' "$QUEUE_RUN_DIR" "$1"; }
+heartbeat_logfile() { printf '%s/%s.heartbeat.log\n' "$QUEUE_RUN_DIR" "$1"; }
+heartbeat_metafile() { printf '%s/%s.heartbeat.meta\n' "$QUEUE_RUN_DIR" "$1"; }
+
+read_pidfile_pid() {
+  local file="$1"
+  [[ -f "$file" ]] || return 1
+  awk -F= '/^pid=/{print $2; exit}' "$file"
+}
+
+daemon_process_alive() {
+  local pid="$1"
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$pid" 2>/dev/null
+}
+
+reap_heartbeat_pidfile() {
+  local id="$1" file pid
+  file="$(heartbeat_pidfile "$id")"
+  [[ -f "$file" ]] || return 0
+  pid="$(read_pidfile_pid "$file" || true)"
+  if [[ -n "$pid" ]] && daemon_process_alive "$pid"; then
+    return 1
+  fi
+  rm -f "$file" "$(heartbeat_metafile "$id")"
+  return 0
+}
+
+stop_heartbeat_daemon() {
+  local id="$1" owner="${2:-}" file pid meta_owner
+  file="$(heartbeat_pidfile "$id")"
+  if [[ ! -f "$file" ]]; then
+    echo "  · heartbeat daemon 未运行:$id"
+    return 0
+  fi
+  if [[ -n "$owner" ]]; then
+    meta_owner="$(awk -F= '/^owner=/{print $2; exit}' "$file" 2>/dev/null || true)"
+    if [[ -n "$meta_owner" && "$meta_owner" != "$owner" ]]; then
+      die "heartbeat daemon owner 不匹配:$id owner=$meta_owner actor=$owner"
+    fi
+  fi
+  pid="$(read_pidfile_pid "$file" || true)"
+  if [[ -n "$pid" ]] && daemon_process_alive "$pid"; then
+    kill -TERM "$pid" 2>/dev/null || true
+    local i
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+      daemon_process_alive "$pid" || break
+      sleep 0.2
+    done
+    if daemon_process_alive "$pid"; then
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+  fi
+  rm -f "$file" "$(heartbeat_metafile "$id")"
+  echo "✓ heartbeat daemon 已停止:$id"
+}
+
+status_heartbeat_daemon() {
+  local id="$1" file pid alive=0
+  file="$(heartbeat_pidfile "$id")"
+  if [[ ! -f "$file" ]]; then
+    echo "heartbeat-daemon id=$id state=absent"
+    return 0
+  fi
+  pid="$(read_pidfile_pid "$file" || true)"
+  if [[ -n "$pid" ]] && daemon_process_alive "$pid"; then
+    alive=1
+  fi
+  echo "heartbeat-daemon id=$id state=$([[ "$alive" == 1 ]] && echo running || echo stale-pidfile) pid=${pid:-none}"
+  cat "$file"
+  if [[ "$alive" != 1 ]]; then
+    echo "  · pidfile 残留但进程已死;跑 heartbeat-daemon reap 清理"
+    return 1
+  fi
+  return 0
+}
+
+reap_all_heartbeat_orphans() {
+  mkdir -p "$QUEUE_RUN_DIR"
+  local f id n=0
+  for f in "$QUEUE_RUN_DIR"/rq-*.heartbeat.pid; do
+    [[ -e "$f" ]] || continue
+    id="$(basename "$f" .heartbeat.pid)"
+    if reap_heartbeat_pidfile "$id"; then
+      echo "  · reaped orphan $id"
+      n=$((n + 1))
+    fi
+  done
+  echo "✓ reap 完成 orphan_pidfiles=$n"
+}
+
+start_heartbeat_daemon() {
+  local id="$1" owner="$2"
+  local interval="${3:-$HEARTBEAT_INTERVAL}"
+  local max_seconds="${4:-$HEARTBEAT_MAX_SECONDS}"
+  local file pid
+  [[ "$interval" =~ ^[1-9][0-9]*$ ]] || die "heartbeat interval 必须是正整数秒"
+  [[ "$max_seconds" =~ ^[1-9][0-9]*$ ]] || die "heartbeat max-seconds 必须是正整数秒"
+  (( interval < 60 )) || die "heartbeat interval 必须 < 60(禁止前台级长 sleep;守护进程也保持短间隔)"
+  mkdir -p "$QUEUE_RUN_DIR"
+  file="$(heartbeat_pidfile "$id")"
+  if [[ -f "$file" ]]; then
+    pid="$(read_pidfile_pid "$file" || true)"
+    if [[ -n "$pid" ]] && daemon_process_alive "$pid"; then
+      local meta_owner
+      meta_owner="$(awk -F= '/^owner=/{print $2; exit}' "$file" 2>/dev/null || true)"
+      [[ "$meta_owner" == "$owner" ]] \
+        || die "heartbeat daemon 已由其他 owner 运行:$id owner=$meta_owner"
+      echo "✓ heartbeat daemon 已在运行:$id pid=$pid(幂等)"
+      printf '%s\n' "$pid"
+      return 0
+    fi
+    reap_heartbeat_pidfile "$id" || true
+  fi
+
+  local log
+  log="$(heartbeat_logfile "$id")"
+  # setsid+nohup:与发起 agent 的 session/turn 脱钩。agent turn 结束、SSH 断开
+  # 都不会带走守护进程;发布仍可在后台跑。被 kill 后不再 heartbeat,租约靠
+  # updated_at 陈旧(HEARTBEAT_STALE_SECONDS)被其他会话识别,不自动 abandon。
+  setsid nohup env \
+    OC_V5_RELEASE_QUEUE_DB="$QUEUE_DB" \
+    OC_V5_RELEASE_QUEUE_LOCK="$QUEUE_LOCK" \
+    OC_V5_RELEASE_QUEUE_REPO_ROOT="$REPO_ROOT" \
+    OC_V5_RELEASE_QUEUE_RUN_DIR="$QUEUE_RUN_DIR" \
+    "$SELF" __heartbeat-loop --id "$id" --owner "$owner" \
+      --interval "$interval" --max-seconds "$max_seconds" \
+      --pidfile "$file" --logfile "$log" \
+    </dev/null >>"$log" 2>&1 &
+  pid=$!
+  # 短等 pidfile 落盘(守护进程自己写,含 pid/owner/pgid)。
+  local i
+  for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    if [[ -f "$file" ]] && daemon_process_alive "$(read_pidfile_pid "$file" || true)"; then
+      echo "✓ heartbeat daemon 已启动:$id pid=$(read_pidfile_pid "$file") log=$log"
+      printf '%s\n' "$(read_pidfile_pid "$file")"
+      return 0
+    fi
+    sleep 0.1
+  done
+  die "heartbeat daemon 启动后未写出存活 pidfile:$id(见 $log)"
+}
+
 usage() {
   cat <<'EOF'
 Usage:
   v5-release-queue.sh submit --task T --branch B --sha SHA [--actor A]
-  v5-release-queue.sh acquire --id ID --owner O
+  v5-release-queue.sh acquire --id ID --owner O [--daemon] [--interval SECONDS]
   v5-release-queue.sh heartbeat --id ID --owner O
+  v5-release-queue.sh heartbeat-daemon start --id ID --owner O [--interval SECONDS] [--max-seconds N]
+  v5-release-queue.sh heartbeat-daemon stop --id ID [--owner O]
+  v5-release-queue.sh heartbeat-daemon status --id ID
+  v5-release-queue.sh heartbeat-daemon reap
+  v5-release-queue.sh release --id ID --owner O
   v5-release-queue.sh wait --id ID --owner O [--timeout SECONDS]
   v5-release-queue.sh pin --id ID --sha CANONICAL_SHA --actor A
   v5-release-queue.sh assert [--id ID]
@@ -394,6 +546,14 @@ Usage:
   v5-release-queue.sh cancel --id ID --reason R --actor A
   v5-release-queue.sh abandon-active --id ID --result deployed|not-deployed --reason R --operator O
   v5-release-queue.sh status [--json]
+
+Heartbeat daemon:
+  acquire --daemon 在取得 active 后用 setsid+nohup 拉起后台续租。
+  agent 只需 acquire 一次、finish/release 一次;中间不要写 while true。
+  守护进程与发起 session 脱钩:agent turn 结束、发布还在跑时续租继续。
+  进程被 kill / 到达 --max-seconds 后停止续租,updated_at 超过
+  OC_V5_HEARTBEAT_STALE_SECONDS(默认 180s)即视为陈旧;不自动 abandon。
+  release = 只停守护进程,队列项保持 active(把收尾交给后续 turn / finish)。
 EOF
 }
 
@@ -424,17 +584,22 @@ case "$command_name" in
     with_queue_lock submit_locked "$task" "$branch" "$sha" "$actor"
     ;;
   acquire)
-    id=""; owner=""
+    id=""; owner=""; daemon=0; interval="$HEARTBEAT_INTERVAL"
     while [[ $# -gt 0 ]]; do
       case "$1" in
         --id) id="${2:-}"; shift 2 ;;
         --owner) owner="${2:-}"; shift 2 ;;
+        --daemon) daemon=1; shift ;;
+        --interval) interval="${2:-}"; shift 2 ;;
         *) die "acquire 未知参数:$1" ;;
       esac
     done
     valid_id "$id" || die "非法 id:$id"
     valid_label "$owner" || die "非法 owner:$owner"
     with_queue_lock acquire_locked "$id" "$owner"
+    if [[ "$daemon" == 1 ]]; then
+      start_heartbeat_daemon "$id" "$owner" "$interval"
+    fi
     ;;
   heartbeat)
     id=""; owner=""
@@ -530,6 +695,7 @@ case "$command_name" in
     [[ "$result" == deployed || "$result" == not-deployed ]] || die "非法 result:$result"
     [[ -n "$reason" ]] || die "reason 不能为空"
     valid_label "$actor" || die "非法 actor:$actor"
+    stop_heartbeat_daemon "$id" "$actor" || true
     with_queue_lock finish_locked "$id" "$result" "$reason" "$actor"
     ;;
   cancel)
@@ -545,6 +711,7 @@ case "$command_name" in
     valid_id "$id" || die "非法 id:$id"
     [[ -n "$reason" ]] || die "reason 不能为空"
     valid_label "$actor" || die "非法 actor:$actor"
+    stop_heartbeat_daemon "$id" "$actor" || true
     with_queue_lock cancel_locked "$id" "$reason" "$actor"
     ;;
   abandon-active)
@@ -565,6 +732,7 @@ case "$command_name" in
     [[ -x "$LEASE_WRAPPER" ]] || die "官方 production mutation lease wrapper 不可执行:$LEASE_WRAPPER"
     [[ "${OC_V5_SKIP_MUTATION_LEASE:-0}" != 1 ]] \
       || die "abandon-active 禁止 OC_V5_SKIP_MUTATION_LEASE=1；active 保持不变"
+    stop_heartbeat_daemon "$id" "$operator" || true
     mkdir -p "$(dirname "$DEPLOY_LOCK")"
     exec 211>"$DEPLOY_LOCK"
     flock -w 900 211 || die "900s 未取得本地 deploy lock；active 保持不变"
@@ -578,6 +746,118 @@ case "$command_name" in
     verify_local_deploy_lock "${OC_V5_RELEASE_QUEUE_DEPLOY_LOCK_FD:-}"
     with_queue_lock abandon_internal_locked "$1" "$2" "$3" "$4"
     ;;
+  release)
+    id=""; owner=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --id) id="${2:-}"; shift 2 ;;
+        --owner) owner="${2:-}"; shift 2 ;;
+        *) die "release 未知参数:$1" ;;
+      esac
+    done
+    valid_id "$id" || die "非法 id:$id"
+    valid_label "$owner" || die "非法 owner:$owner"
+    stop_heartbeat_daemon "$id" "$owner"
+    echo "✓ release:heartbeat 已停,队列项 $id 仍保持原 status(收尾请 finish/abandon)"
+    ;;
+  heartbeat-daemon)
+    sub="${1:-}"; shift || true
+    case "$sub" in
+      start)
+        id=""; owner=""; interval="$HEARTBEAT_INTERVAL"; max_seconds="$HEARTBEAT_MAX_SECONDS"
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            --id) id="${2:-}"; shift 2 ;;
+            --owner) owner="${2:-}"; shift 2 ;;
+            --interval) interval="${2:-}"; shift 2 ;;
+            --max-seconds) max_seconds="${2:-}"; shift 2 ;;
+            *) die "heartbeat-daemon start 未知参数:$1" ;;
+          esac
+        done
+        valid_id "$id" || die "非法 id:$id"
+        valid_label "$owner" || die "非法 owner:$owner"
+        start_heartbeat_daemon "$id" "$owner" "$interval" "$max_seconds"
+        ;;
+      stop)
+        id=""; owner=""
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            --id) id="${2:-}"; shift 2 ;;
+            --owner) owner="${2:-}"; shift 2 ;;
+            *) die "heartbeat-daemon stop 未知参数:$1" ;;
+          esac
+        done
+        valid_id "$id" || die "非法 id:$id"
+        stop_heartbeat_daemon "$id" "$owner"
+        ;;
+      status)
+        id=""
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            --id) id="${2:-}"; shift 2 ;;
+            *) die "heartbeat-daemon status 未知参数:$1" ;;
+          esac
+        done
+        valid_id "$id" || die "非法 id:$id"
+        status_heartbeat_daemon "$id"
+        ;;
+      reap)
+        reap_all_heartbeat_orphans
+        ;;
+      *)
+        die "heartbeat-daemon 未知子命令:${sub:-missing}(start|stop|status|reap)"
+        ;;
+    esac
+    ;;
+  __heartbeat-loop)
+    id=""; owner=""; interval="$HEARTBEAT_INTERVAL"; max_seconds="$HEARTBEAT_MAX_SECONDS"
+    pidfile=""; logfile=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --id) id="${2:-}"; shift 2 ;;
+        --owner) owner="${2:-}"; shift 2 ;;
+        --interval) interval="${2:-}"; shift 2 ;;
+        --max-seconds) max_seconds="${2:-}"; shift 2 ;;
+        --pidfile) pidfile="${2:-}"; shift 2 ;;
+        --logfile) logfile="${2:-}"; shift 2 ;;
+        *) die "internal heartbeat-loop 未知参数:$1" ;;
+      esac
+    done
+    valid_id "$id" || die "非法 id:$id"
+    valid_label "$owner" || die "非法 owner:$owner"
+    [[ -n "$pidfile" ]] || die "internal heartbeat-loop 缺 --pidfile"
+    mkdir -p "$(dirname "$pidfile")"
+    # 先写 pidfile 再进入循环,让 start 能探测到存活。
+    cat >"$pidfile" <<META
+pid=$$
+pgid=$$
+id=$id
+owner=$owner
+interval=$interval
+max_seconds=$max_seconds
+started=$(now_iso)
+META
+    cleanup_loop() {
+      rm -f "$pidfile"
+      echo "$(now_iso) heartbeat-loop exit id=$id owner=$owner" >>"${logfile:-/dev/null}"
+    }
+    trap cleanup_loop EXIT
+    trap 'exit 0' TERM INT
+    deadline=$((SECONDS + max_seconds))
+    while (( SECONDS < deadline )); do
+      if ! with_queue_lock heartbeat_locked "$id" "$owner"; then
+        echo "$(now_iso) heartbeat 停止:队列项不再 active 或 owner 不匹配" >>"${logfile:-/dev/null}"
+        exit 0
+      fi
+      # 短睡;到点或被 signal 打断即退出。不用 sleep>=60,也不用 while true。
+      remaining=$((deadline - SECONDS))
+      (( remaining > 0 )) || break
+      chunk="$interval"
+      (( chunk <= remaining )) || chunk=$remaining
+      sleep "$chunk" || true
+    done
+    echo "$(now_iso) heartbeat-loop 到达 max-seconds=$max_seconds,自然退出(租约将陈旧)" >>"${logfile:-/dev/null}"
+    ;;
   status)
     json=0
     while [[ $# -gt 0 ]]; do
@@ -587,6 +867,14 @@ case "$command_name" in
       esac
     done
     with_queue_lock status_locked "$json"
+    if [[ "$json" != 1 ]]; then
+      stale="$(sqlite3 -noheader "$QUEUE_DB"         "SELECT id FROM release_queue_jobs
+          WHERE status='active'
+            AND updated_at < strftime('%Y-%m-%dT%H:%M:%SZ','now','-${HEARTBEAT_STALE_SECONDS} seconds');" 2>/dev/null || true)"
+      if [[ -n "$stale" ]]; then
+        echo "⚠ stale active(updated_at > ${HEARTBEAT_STALE_SECONDS}s): $stale"
+      fi
+    fi
     ;;
   help|-h|--help)
     usage

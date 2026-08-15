@@ -23,6 +23,9 @@
 #   scripts/deploy-v5.sh --with-dist --defer-knowledge-planet-upgrade
 #                                  # 一次性先上线知识星球扫码 UI；保留旧 v1.0 执行 pin，扫码后再走正常升级
 #   scripts/deploy-v5.sh --smoke       # 仅跑 v5 健康/隔离断言
+#   scripts/deploy-v5.sh --hot-config  # 纯配置热更新:白名单校验 + 不重建 dist + 与 --with-dist 同强度健康门
+#                                  # 只接受 catalog/env/文案;TS/JS/schema/迁移直接拒绝。绕过必须
+#                                  # --hot-config-force + OC_V5_HOT_CONFIG_FORCE_REASON(写审计日志)。
 #   scripts/deploy-v5.sh --dist        # 仅前端生效面:vite build + 竞态安全 rsync + 资产GC + restart + 版本握手 smoke
 #   scripts/deploy-v5.sh --census-ccb-baseline  # 只读统计缺 baseline mount 的 V5 容器
 #   scripts/deploy-v5.sh --remount-ccb-baseline # 持部署锁，逐个 drain/reprovision 后复验
@@ -151,6 +154,10 @@ RELEASE_QUEUE_SCRIPT="$SCRIPT_DIR/v5-release-queue.sh"
   echo "FATAL: 缺或不可执行的 V5 release queue: $RELEASE_QUEUE_SCRIPT" >&2
   exit 1
 }
+HOT_CONFIG_LIB="$SCRIPT_DIR/v5-hot-config-lib.sh"
+[ -f "$HOT_CONFIG_LIB" ] || { echo "FATAL: 缺 hot-config lib: $HOT_CONFIG_LIB" >&2; exit 1; }
+# shellcheck source=scripts/v5-hot-config-lib.sh
+source "$HOT_CONFIG_LIB"
 DEPLOY_SURFACE_CHECK="$SCRIPT_DIR/v5-deploy-surface-check.mjs"
 [ -x "$DEPLOY_SURFACE_CHECK" ] || {
   echo "FATAL: 缺或不可执行的 V5 deploy surface check: $DEPLOY_SURFACE_CHECK" >&2
@@ -223,7 +230,7 @@ assert_overrides_no_remove_keys() {
   [ "$bad" = 0 ] || exit 1
 }
 
-DRY=0; MODE="deploy"; ROLLBACK_N=1; RESTART_EGRESS=0; WITH_DIST=0; ALLOW_UNVERIFIED_CI=0
+DRY=0; MODE="deploy"; ROLLBACK_N=1; RESTART_EGRESS=0; WITH_DIST=0; ALLOW_UNVERIFIED_CI=0; HOT_CONFIG=0; HOT_CONFIG_FORCE=0
 DEFER_KNOWLEDGE_PLANET_UPGRADE=0
 KNOWLEDGE_PLANET_VERIFY_USER=""
 CUTOVER_NONCE=""; CUTOVER_TARGET_IMAGE=""
@@ -250,6 +257,8 @@ for arg in "$@"; do
     --dry-run) DRY=1 ;;
     # 代码+前端两生效面合并为一次重启(见 deploy() 内注释,2026-07-10 成对重启事故)
     --with-dist) WITH_DIST=1 ;;
+    --hot-config) HOT_CONFIG=1 ;;
+    --hot-config-force) HOT_CONFIG=1; HOT_CONFIG_FORCE=1 ;;
     # 一次性 setup-first lane：仅把扫码实时感知/加密持久化先上线，DB 继续钉旧
     # Knowledge Planet v1.0。用户扫码后，正常 deploy 再消费同一账号升级到 v1.1。
     --defer-knowledge-planet-upgrade) DEFER_KNOWLEDGE_PLANET_UPGRADE=1 ;;
@@ -353,6 +362,25 @@ if [[ "$DEFER_KNOWLEDGE_PLANET_UPGRADE" == 1 \
       && ( "$MODE" != "deploy" || "$WITH_DIST" != 1 ) ]]; then
   echo "✗ --defer-knowledge-planet-upgrade 仅允许与普通 deploy + --with-dist 同用" >&2
   exit 2
+fi
+if [[ "$HOT_CONFIG" == 1 ]]; then
+  [[ "$MODE" == "deploy" ]] || {
+    echo "✗ --hot-config 只允许普通 deploy lane(不要和 --canary/--dist/--smoke 叠用)" >&2
+    exit 2
+  }
+  [[ "$WITH_DIST" != 1 ]] || {
+    echo "✗ --hot-config 与 --with-dist 互斥:热配置路径明确不重建 dist" >&2
+    exit 2
+  }
+  [[ "$DEFER_KNOWLEDGE_PLANET_UPGRADE" != 1 ]] || {
+    echo "✗ --hot-config 不能与 --defer-knowledge-planet-upgrade 同用" >&2
+    exit 2
+  }
+  # 锁/lease 之前本地 fail-closed:脏源码 diff 绝不能靠「已经抢到锁」继续。
+  # dry-run 也跑,这样 --hot-config --dry-run 在本机就能验白名单,不必 SSH 生产。
+  if [[ "${V5_DEPLOY_SOURCE_ONLY:-0}" != 1 ]]; then
+    assert_hot_config_changeset || exit 2
+  fi
 fi
 [[ -n "$CUTOVER_NONCE" && ! "$CUTOVER_NONCE" =~ ^[0-9a-f]{32}$ ]] && { echo "✗ cutover nonce 必须是 32 位小写 hex" >&2; exit 2; }
 [[ "$CADDY_HTTP_PORT" =~ ^[1-9][0-9]{0,4}$ ]] && (( CADDY_HTTP_PORT <= 65535 )) \
@@ -6739,6 +6767,10 @@ activate_egress_release() {
 # ───────────────────────── deploy:增量 ─────────────────────────
 deploy() {
   echo "══ v5 deploy on $KL_HOST(蓝绿:release 目录 + 原子 symlink)══"
+  if [[ "$HOT_CONFIG" == 1 ]]; then
+    echo "── hot-config lane:不重建 dist,健康门按 deploy_state.active_slot 推导 ──"
+    assert_hot_config_changeset || exit 2
+  fi
   echo "── 守卫:overrides 不得含 REMOVE_KEYS ──"
   assert_overrides_no_remove_keys
   # MAJOR 3:cohort rollout 进行中(phase≠stable)拒绝传统 deploy(状态机外入口封死)。
@@ -6944,7 +6976,7 @@ deploy() {
     && ! minimum_functional_core deploy "$BUILT_RELEASE" "$ACTIVE_PORT"; then
     validation_failure="minimum functional core failed(双引擎真 turn / J1-J5 用户旅程)"
   fi
-  if [[ -z "$validation_failure" && "$WITH_DIST" == 1 ]] \
+  if [[ -z "$validation_failure" && ( "$WITH_DIST" == 1 || "$HOT_CONFIG" == 1 ) ]] \
     && ! dist_handshake_smoke "$ACTIVE_PORT"; then
     validation_failure="frontend build handshake failed"
   fi
