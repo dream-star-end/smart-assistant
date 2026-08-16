@@ -1834,7 +1834,7 @@ export class Gateway {
   }
 
   // ── In-memory cache for static web UI files ──
-  private _staticFileCache = new Map<string, { content: Buffer; mime: string; etag: string }>()
+  private _staticFileCache = new Map<string, { content: Buffer; mime: string; etag: string; mtimeMs: number }>()
   // (channel, peer.id) → 当前活跃的 ws client(用于回传 outbound)
   private clientsByPeer = new Map<string, Set<WebSocket>>()
   /** Commercial bridge sockets are the only valid path for an internal queue
@@ -4932,79 +4932,76 @@ export class Gateway {
       const cacheHeader = staticCacheControl(safePath, this.deps.staticMode)
       const filePath = resolve(this.deps.webRoot, `.${safePath}`)
       if (filePath.startsWith(resolve(this.deps.webRoot))) {
-        const cached = this._staticFileCache.get(filePath)
-        if (cached) {
-          if (req.headers['if-none-match'] === cached.etag) {
-            res.writeHead(304)
-            res.end()
-            return
-          }
-          res.writeHead(200, { 'Content-Type': cached.mime, 'ETag': cached.etag, 'Cache-Control': cacheHeader })
-          res.end(cached.content)
-          return
-        }
-        try {
-          const s = statSync(filePath)
-          if (s.isFile()) {
-            const content = readFileSync(filePath)
-            const mime = mimeFor(filePath)
-            const etag = `"${createHash('md5').update(content).digest('hex').slice(0, 16)}"`
-            if (this._staticFileCache.size >= 200) {
-              const firstKey = this._staticFileCache.keys().next().value
-              if (firstKey !== undefined) this._staticFileCache.delete(firstKey)
-            }
-            this._staticFileCache.set(filePath, { content, mime, etag })
-            if (req.headers['if-none-match'] === etag) {
-              res.writeHead(304)
-              res.end()
-              return
-            }
-            res.writeHead(200, { 'Content-Type': mime, 'ETag': etag, 'Cache-Control': cacheHeader })
-            res.end(content)
-            return
-          }
-        } catch {}
+        if (this._serveStaticCached(filePath, cacheHeader, req, res, mimeFor(filePath))) return
       }
       // SPA fallback — only for navigation requests (no file extension)
       // Static assets (.js/.css/.map/.min.js etc.) should 404, not serve index.html
       const hasExtension = /\.\w+$/.test(url.pathname)
       if (!hasExtension) {
         const indexPath = resolve(this.deps.webRoot, 'index.html')
-        const cachedIndex = this._staticFileCache.get(indexPath)
-        if (cachedIndex) {
-          if (req.headers['if-none-match'] === cachedIndex.etag) {
-            res.writeHead(304)
-            res.end()
-            return
-          }
-          res.writeHead(200, { 'Content-Type': 'text/html', 'ETag': cachedIndex.etag, 'Cache-Control': 'no-cache' })
-          res.end(cachedIndex.content)
-          return
-        }
-        try {
-          const s = statSync(indexPath)
-          if (s.isFile()) {
-            const content = readFileSync(indexPath)
-            const etag = `"${createHash('md5').update(content).digest('hex').slice(0, 16)}"`
-            if (this._staticFileCache.size >= 200) {
-              const firstKey = this._staticFileCache.keys().next().value
-              if (firstKey !== undefined) this._staticFileCache.delete(firstKey)
-            }
-            this._staticFileCache.set(indexPath, { content, mime: 'text/html', etag })
-            if (req.headers['if-none-match'] === etag) {
-              res.writeHead(304)
-              res.end()
-              return
-            }
-            res.writeHead(200, { 'Content-Type': 'text/html', 'ETag': etag, 'Cache-Control': 'no-cache' })
-            res.end(content)
-            return
-          }
-        } catch {}
+        if (this._serveStaticCached(indexPath, 'no-cache', req, res, 'text/html')) return
       }
     }
     res.writeHead(404)
     res.end('not found')
+  }
+
+  /**
+   * 静态文件内存缓存的统一命中+读盘路径(通用静态资产与 SPA fallback 的 index.html 共用)。
+   * 缓存条目带源文件 mtimeMs,命中时 stat 回盘比对:dist 被 rsync 覆盖(mtime 变)后
+   * 下一个请求即拿到新内容 —— 与 ws/frontendBuild.ts 版本探针同语义自愈,漏重启 master
+   * 时不会出现「WS 帧已收敛到新 build、HTTP 却一直吐旧 index.html」的分裂(那种分裂会让
+   * 前端 update banner 陷入刷新死循环)。
+   * 返回 true = 已响应(200/304);false = 磁盘无此文件,由调用方走兜底/404。
+   */
+  private _serveStaticCached(
+    filePath: string,
+    cacheHeader: string,
+    req: IncomingMessage,
+    res: ServerResponse,
+    mime: string,
+  ): boolean {
+    const cached = this._staticFileCache.get(filePath)
+    if (cached && this._staticCacheFreshOnDisk(filePath, cached)) {
+      if (req.headers['if-none-match'] === cached.etag) {
+        res.writeHead(304)
+        res.end()
+        return true
+      }
+      res.writeHead(200, { 'Content-Type': cached.mime, 'ETag': cached.etag, 'Cache-Control': cacheHeader })
+      res.end(cached.content)
+      return true
+    }
+    try {
+      const s = statSync(filePath)
+      if (!s.isFile()) return false
+      const content = readFileSync(filePath)
+      const etag = `"${createHash('md5').update(content).digest('hex').slice(0, 16)}"`
+      if (this._staticFileCache.size >= 200) {
+        const firstKey = this._staticFileCache.keys().next().value
+        if (firstKey !== undefined) this._staticFileCache.delete(firstKey)
+      }
+      this._staticFileCache.set(filePath, { content, mime, etag, mtimeMs: s.mtimeMs })
+      if (req.headers['if-none-match'] === etag) {
+        res.writeHead(304)
+        res.end()
+        return true
+      }
+      res.writeHead(200, { 'Content-Type': mime, 'ETag': etag, 'Cache-Control': cacheHeader })
+      res.end(content)
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  /** 缓存条目与磁盘是否仍一致(mtimeMs 比对;stat 失败/文件已删 → 视为失效)。 */
+  private _staticCacheFreshOnDisk(filePath: string, entry: { mtimeMs: number }): boolean {
+    try {
+      return statSync(filePath).mtimeMs === entry.mtimeMs
+    } catch {
+      return false
+    }
   }
 
   /** Extract bearer token from request (header, WS protocol, or cookie). */
