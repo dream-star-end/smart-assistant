@@ -19,6 +19,10 @@ import type { Pool } from 'pg'
 import { EVENTS } from '../admin/alertEvents.js'
 import { safeEnqueueAlert } from '../admin/alertOutbox.js'
 import { isPermanentCodexWaiver, permanentCodexWaiverReason } from '../billing/codexFinalizer.js'
+import {
+  GATEWAY_EXITED_AT_CTX_KEY,
+  markGatewayShutdownEvidence,
+} from '../billing/finalizeJournalReconciler.js'
 import { advanceClientTimelineIdentityInTransaction } from '../db/pgSessionsBackend.js'
 import type { ContainerCallResult, DispatchIdentity } from './containerDispatchClient.js'
 import {
@@ -58,6 +62,10 @@ export const SINK_WAIT_ALERT_MS = 24 * 3_600_000
  * 收敛链瘫痪 27h 无人知晓。求证失败必须有告警出口,不允许无限静默重试。
  */
 export const ACCEPTED_UNREACHABLE_ALERT_MS = 15 * 60 * 1000
+/** 优雅停机总预算:先落证据,再尽力求证;超时放弃求证,不挡退出。 */
+export const DEFAULT_SHUTDOWN_HANDOFF_BUDGET_MS = 5_000
+/** 停机单次容器求证上限,避免默认 5s transport timeout 吃完整预算。 */
+export const SHUTDOWN_PROBE_TIMEOUT_MS = 700
 
 /** accepted stuck 阈值解析:向上夹(同 finalizeJournalReconciler.resolveStuckThresholdMs 模式)。 */
 export function resolveDispatchStuckThresholdMs(
@@ -177,6 +185,11 @@ export interface TurnDispatchReconcilerDeps {
   rejectMinAgeMs?: number
   limit?: number
   now?: () => number
+  /**
+   * 测试注入:本轮哪些 dispatch 带有「承载进程已退出」证据。
+   * 默认查 journal.ctx.gatewayExitedAt。
+   */
+  listCarrierDeadDispatchIds?: () => Promise<string[]>
 }
 
 function idOf(row: TurnDispatchRow): DispatchIdentity {
@@ -211,6 +224,11 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
   const stuckMs = deps.stuckThresholdMs ?? DEFAULT_ACCEPTED_STUCK_FLOOR_MS
   const assess = deps.assessBilling ?? assessDispatchBilling
   const enqueue = deps.enqueueAlert ?? safeEnqueueAlert
+  const carrierDeadIds = new Set(
+    deps.listCarrierDeadDispatchIds
+      ? await deps.listCarrierDeadDispatchIds()
+      : await loadDispatchIdsWithGatewayExit(deps.pool),
+  )
   const counts: ReconcileTickCounts = {
     rejectedTerminal: 0,
     accepted: 0,
@@ -247,8 +265,11 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
   }
 
   // ── ① admitted ∧ 租约过期 ∧ age>rejectMinAge ─────────────────────────────
-  const admitted = await scanAdmittedLeaseExpired(deps.pool, { minAgeMs: rejectMinAge, limit, now: now() })
+  // 租约过期本身就是「owner 进程不再续租」的证据;5min age 门只挡无证据的幼龄行。
+  const admitted = await scanAdmittedLeaseExpired(deps.pool, { minAgeMs: 0, limit, now: now() })
   for (const row of admitted) {
+    const admittedAge = now() - row.admittedAt.getTime()
+    if (admittedAge < rejectMinAge && !carrierDeadIds.has(row.dispatchId)) continue
     const rejecting = await casAdmittedToRejecting(deps.pool, {
       dispatchId: row.dispatchId,
       expectedEpoch: row.leaseEpoch,
@@ -339,7 +360,8 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
       }
       continue
     }
-    if (age < stuckMs) continue // 探测窗:可达且未到 stuck 阈值 → 不做任何状态迁移。
+    // 无进程死亡证据时保持 90min 门(防误杀活流);有标记则容器已给出 rejected/absent 即可收敛。
+    if (age < stuckMs && !carrierDeadIds.has(row.dispatchId)) continue
     if (res.state === 'rejected') {
       // 容器把这条 accepted 的 inbox 行终态化为 rejected tombstone(如 boot recovery:
       // queued/running 被拒)。这是**显式** durable negative proof(I2 允许),→ CAS
@@ -636,6 +658,123 @@ function alertWarn(
   })
 }
 
+
+async function loadDispatchIdsWithGatewayExit(pool: Pool): Promise<string[]> {
+  try {
+    const res = await pool.query<{ dispatch_id: string }>(
+      `SELECT DISTINCT dispatch_id::text AS dispatch_id
+         FROM request_finalize_journal
+        WHERE dispatch_id IS NOT NULL
+          AND COALESCE(ctx->>$1, '') <> ''`,
+      [GATEWAY_EXITED_AT_CTX_KEY],
+    )
+    return res.rows.map((r) => r.dispatch_id)
+  } catch {
+    return []
+  }
+}
+
+export async function expireAdmittedLeasesOnShutdown(
+  pool: Pool,
+  nowMs?: number,
+): Promise<number> {
+  const at = new Date(nowMs ?? Date.now())
+  const res = await pool.query(
+    `UPDATE turn_dispatches
+        SET lease_until = $1
+      WHERE status = 'admitted'
+        AND lease_until IS NOT NULL
+        AND lease_until > $1`,
+    [at],
+  )
+  return res.rowCount ?? 0
+}
+
+function withProbeBudget(
+  container: TurnDispatchReconcilerDeps['container'],
+  timeoutMs: number,
+): TurnDispatchReconcilerDeps['container'] {
+  const wrap = async (work: Promise<ContainerCallResult>): Promise<ContainerCallResult> => {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      return await Promise.race([
+        work,
+        new Promise<ContainerCallResult>((resolve) => {
+          timer = setTimeout(
+            () => resolve({ kind: 'unreachable', detail: 'shutdown_budget' }),
+            Math.max(50, timeoutMs),
+          )
+        }),
+      ])
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
+    }
+  }
+  return {
+    rejectIfAbsent: (id) => wrap(container.rejectIfAbsent(id)),
+    getDispatchState: (id) => wrap(container.getDispatchState(id)),
+  }
+}
+
+export interface ShutdownHandoffResult {
+  markedJournals: number
+  expiredLeases: number
+  probed: boolean
+  timedOut: boolean
+  tick: ReconcileTickCounts | null
+}
+
+export interface ShutdownHandoffDeps extends TurnDispatchReconcilerDeps {
+  markJournals?: () => Promise<number>
+  expireLeases?: () => Promise<number>
+  budgetMs?: number
+}
+
+/**
+ * 优雅停机钩子:先落「进程在 T 退出」证据,再在预算内复用容器求证收敛已死的 dispatch。
+ * 不盲 finalize——容器回 running/不可达则只留证据,让重启后的 tick 立刻判定。
+ */
+export async function runShutdownDispatchHandoff(
+  deps: ShutdownHandoffDeps,
+): Promise<ShutdownHandoffResult> {
+  const now = deps.now ?? Date.now
+  const started = now()
+  const budgetMs = deps.budgetMs ?? DEFAULT_SHUTDOWN_HANDOFF_BUDGET_MS
+  const markedJournals = await (deps.markJournals
+    ?? (() => markGatewayShutdownEvidence({ reason: 'process_shutdown' })))()
+  const expiredLeases = await (deps.expireLeases
+    ?? (() => expireAdmittedLeasesOnShutdown(deps.pool, now())))()
+
+  const remain = budgetMs - (now() - started)
+  if (remain <= 150) {
+    return { markedJournals, expiredLeases, probed: false, timedOut: true, tick: null }
+  }
+
+  const probeTimeout = Math.min(SHUTDOWN_PROBE_TIMEOUT_MS, Math.max(80, remain - 80))
+  let timedOut = false
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const tickPromise = runReconcileTick({
+    ...deps,
+    container: withProbeBudget(deps.container, probeTimeout),
+    limit: Math.min(deps.limit ?? 8, 8),
+  })
+  const timeoutPromise = new Promise<null>((resolve) => {
+    timer = setTimeout(() => {
+      timedOut = true
+      resolve(null)
+    }, remain)
+  })
+  const tick = await Promise.race([tickPromise, timeoutPromise])
+  if (timer !== undefined) clearTimeout(timer)
+  return {
+    markedJournals,
+    expiredLeases,
+    probed: tick !== null,
+    timedOut,
+    tick,
+  }
+}
+
 // ─── 调度器(leaderBundle shared + trackScheduler)──────────────────────────
 
 export interface TurnDispatchReconcilerHandle {
@@ -659,7 +798,7 @@ export function startTurnDispatchReconciler(
 ): TurnDispatchReconcilerHandle {
   const interval = Math.max(MIN_INTERVAL_MS, opts.intervalMs ?? DEFAULT_RECONCILE_INTERVAL_MS)
   const onError = opts.onError ?? defaultOnError
-  const runOnStart = opts.runOnStart ?? false
+  const runOnStart = opts.runOnStart ?? true
   let stopped = false
   let running = false
 

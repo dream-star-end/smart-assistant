@@ -11,9 +11,11 @@ import type { Pool } from 'pg'
 import {
   assessDispatchBilling,
   DEFAULT_ACCEPTED_STUCK_FLOOR_MS,
+  expireAdmittedLeasesOnShutdown,
   MAX_ACCEPTED_STUCK_MS,
   resolveDispatchStuckThresholdMs,
   runReconcileTick,
+  runShutdownDispatchHandoff,
 } from '../dispatch/turnDispatchReconciler.js'
 import { PERMANENT_CODEX_WAIVER_PREFIX } from '../billing/codexFinalizer.js'
 import type { ContainerCallResult } from '../dispatch/containerDispatchClient.js'
@@ -82,6 +84,7 @@ function makeFakePool(canned: Canned) {
       if (s.includes("status = 'manual_reconcile'")) return { rows: [rawRow({ status: 'manual_reconcile', conflict_reason: 'x' })], rowCount: 1 }
       if (s.includes("status = 'terminal'")) return { rows: [rawRow({ status: 'terminal', outcome: 'not_accepted', terminal_at: new Date() })], rowCount: 1 }
       if (s.includes("status = 'accepted'")) return { rows: [rawRow({ status: 'accepted' })], rowCount: 1 }
+      if (s.includes("status = 'rejecting'")) return { rows: [rawRow({ status: 'rejecting' })], rowCount: 1 }
       return { rows: [], rowCount: 1 }
     }
     // reads (scans)
@@ -518,5 +521,152 @@ describe('assessDispatchBilling (B8: 零计费证明收紧)', () => {
       ),
       'not_billed',
     )
+  })
+})
+
+describe('carrier-death fast path (accepted)', () => {
+  test('有进程退出证据时,探测窗内 container rejected → 立即 terminal', async () => {
+    const pool = makeFakePool({
+      acceptedStuck: [rawRow({ status: 'accepted', accepted_at: new Date(Date.now() - 20 * 60_000) })],
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: {
+        ...noContainer,
+        getDispatchState: async (): Promise<ContainerCallResult> => ({ kind: 'ok', state: 'rejected' }),
+      },
+      listCarrierDeadDispatchIds: async () => ['d-1'],
+    })
+    assert.equal(counts.rejectedTerminal, 1)
+  })
+
+  test('有进程退出证据但容器仍 running → 不终态(不误杀活引擎)', async () => {
+    const pool = makeFakePool({
+      acceptedStuck: [rawRow({ status: 'accepted', accepted_at: new Date(Date.now() - 20 * 60_000) })],
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: {
+        ...noContainer,
+        getDispatchState: async (): Promise<ContainerCallResult> => ({ kind: 'ok', state: 'running' }),
+      },
+      listCarrierDeadDispatchIds: async () => ['d-1'],
+    })
+    assert.equal(counts.rejectedTerminal, 0)
+    assert.equal(counts.manualReconcile, 0)
+    assert.ok(!pool.writes.some((w) => w.includes("status = 'terminal'")))
+  })
+
+  test('幼龄 admitted + 租约过期 + 进程退出证据 → 进入 reject-if-absent', async () => {
+    const pool = makeFakePool({
+      admittedLeaseExpired: [rawRow({
+        status: 'admitted',
+        outcome: null,
+        failure_code: null,
+        admitted_at: new Date(Date.now() - 30_000),
+        lease_until: new Date(Date.now() - 1_000),
+      })],
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: {
+        ...noContainer,
+        rejectIfAbsent: async (): Promise<ContainerCallResult> => ({ kind: 'ok', state: 'rejected' }),
+      },
+      listCarrierDeadDispatchIds: async () => ['d-1'],
+    })
+    assert.equal(counts.rejectedTerminal, 1)
+  })
+
+  test('幼龄 admitted + 租约过期但无进程退出证据 → 仍走 5min 门,不接管', async () => {
+    const pool = makeFakePool({
+      admittedLeaseExpired: [rawRow({
+        status: 'admitted',
+        outcome: null,
+        failure_code: null,
+        admitted_at: new Date(Date.now() - 30_000),
+        lease_until: new Date(Date.now() - 1_000),
+      })],
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: {
+        ...noContainer,
+        rejectIfAbsent: async (): Promise<ContainerCallResult> => ({ kind: 'ok', state: 'rejected' }),
+      },
+    })
+    assert.equal(counts.rejectedTerminal, 0)
+    assert.ok(!pool.writes.some((w) => w.includes("status = 'rejecting'") || w.includes("status = 'terminal'")))
+  })
+})
+
+describe('runShutdownDispatchHandoff', () => {
+  test('先落证据再求证;容器 running 不 finalize', async () => {
+    const pool = makeFakePool({
+      acceptedStuck: [rawRow({ status: 'accepted', accepted_at: new Date() })],
+    })
+    let marked = 0
+    let expired = 0
+    const out = await runShutdownDispatchHandoff({
+      pool: pool as unknown as Pool,
+      container: {
+        ...noContainer,
+        getDispatchState: async (): Promise<ContainerCallResult> => ({ kind: 'ok', state: 'running' }),
+      },
+      markJournals: async () => {
+        marked = 3
+        return 3
+      },
+      expireLeases: async () => {
+        expired = 2
+        return 2
+      },
+      listCarrierDeadDispatchIds: async () => ['d-1'],
+      budgetMs: 2_000,
+    })
+    assert.equal(out.markedJournals, 3)
+    assert.equal(out.expiredLeases, 2)
+    assert.equal(out.timedOut, false)
+    assert.equal(out.probed, true)
+    assert.equal(out.tick?.rejectedTerminal ?? 0, 0)
+    assert.equal(marked, 3)
+    assert.equal(expired, 2)
+  })
+
+  test('预算耗尽时仍返回已落的证据,不把 shutdown 拖死', async () => {
+    const pool = makeFakePool({
+      acceptedStuck: [rawRow({ status: 'accepted', accepted_at: new Date() })],
+    })
+    const started = Date.now()
+    const out = await runShutdownDispatchHandoff({
+      pool: pool as unknown as Pool,
+      container: {
+        rejectIfAbsent: () => new Promise(() => { /* hang */ }),
+        getDispatchState: () => new Promise(() => { /* hang */ }),
+      },
+      markJournals: async () => 1,
+      expireLeases: async () => 1,
+      listCarrierDeadDispatchIds: async () => ['d-1'],
+      budgetMs: 80,
+    })
+    const elapsed = Date.now() - started
+    assert.equal(out.markedJournals, 1)
+    assert.equal(out.expiredLeases, 1)
+    assert.equal(out.timedOut, true)
+    assert.ok(elapsed < 1_500, `shutdown handoff exceeded budget: ${elapsed}ms`)
+  })
+
+  test('expireAdmittedLeasesOnShutdown 只动 admitted 且 lease 仍活的行', async () => {
+    const writes: string[] = []
+    const pool = {
+      async query(sql: string) {
+        writes.push(sql.replace(/\s+/g, ' '))
+        return { rows: [], rowCount: 4 }
+      },
+    }
+    const n = await expireAdmittedLeasesOnShutdown(pool as unknown as Pool, 1_700_000_000_000)
+    assert.equal(n, 4)
+    assert.match(writes[0]!, /status = 'admitted'/)
+    assert.match(writes[0]!, /lease_until > \$1/)
   })
 })

@@ -12,6 +12,9 @@ import {
   DEFAULT_DURABLE_FINALIZING_ALERT_AGE_MS,
   DEFAULT_DURABLE_WAIVER_AGE_MS,
   DEFAULT_STUCK_THRESHOLD_MS,
+  GATEWAY_EXITED_AT_CTX_KEY,
+  journalHasGatewayExitMark,
+  markGatewayShutdownEvidence,
   MAX_DURABLE_FINALIZING_ALERT_AGE_MS,
   MAX_DURABLE_WAIVER_AGE_MS,
   MAX_STUCK_THRESHOLD_MS,
@@ -303,5 +306,33 @@ describe('alertStuckDurableFinalizing — 老化告警 · 行状态不变', () =
     )
     assert.equal(n, 2)
     assert.equal(new Set(sent.map((e) => e.dedupe_key)).size, 2)
+  })
+})
+
+describe('gateway shutdown evidence', () => {
+  test('journalHasGatewayExitMark 只认非空字符串', () => {
+    assert.equal(journalHasGatewayExitMark(undefined), false)
+    assert.equal(journalHasGatewayExitMark({}), false)
+    assert.equal(journalHasGatewayExitMark({ [GATEWAY_EXITED_AT_CTX_KEY]: '' }), false)
+    assert.equal(journalHasGatewayExitMark({ [GATEWAY_EXITED_AT_CTX_KEY]: '2026-08-16T10:00:00.000Z' }), true)
+  })
+
+  test('markGatewayShutdownEvidence 写 ctx 且不改 updated_at / state', async () => {
+    let sql = ''
+    let params: unknown[] = []
+    const n = await markGatewayShutdownEvidence(
+      { now: new Date('2026-08-16T10:23:58.000Z'), reason: 'process_shutdown' },
+      async (q, p) => {
+        sql = q
+        params = p ?? []
+        return { rows: [{ request_id: 'a' }, { request_id: 'b' }], rowCount: 2 }
+      },
+    )
+    assert.equal(n, 2)
+    assert.match(sql, /updated_at = updated_at/)
+    assert.match(sql, /state IN \('inflight', 'finalizing'\)/)
+    assert.equal(params[0], GATEWAY_EXITED_AT_CTX_KEY)
+    assert.equal(params[1], '2026-08-16T10:23:58.000Z')
+    assert.equal(params[3], 'process_shutdown')
   })
 })

@@ -70,6 +70,13 @@ export const DEFAULT_GC_INTERVAL_MS = 3_600_000 // GC 比 reconcile 稀疏
 export const DEFAULT_GC_LIMIT = 5_000 // 单次 GC 批量上限,避免一刀大删
 /** stuck 阈值上限 24h:防 env 写 1e100 之类(指数记法 / 丢精度会把 $1::bigint 打挂)。 */
 export const MAX_STUCK_THRESHOLD_MS = 86_400_000
+/**
+ * journal.ctx 键:承载该行的 gateway 进程在该时刻退出(优雅停机或即将被杀)。
+ * 这不是「turn 已死」——引擎可能仍在容器里跑。重启后的对账用它走秒~分钟级快路径,
+ * 仍必须先看容器/租约,绝不能单凭此键 abort 一轮还在跑的 accepted turn。
+ */
+export const GATEWAY_EXITED_AT_CTX_KEY = 'gatewayExitedAt'
+export const GATEWAY_EXIT_REASON_CTX_KEY = 'gatewayExitReason'
 
 /**
  * durable `finalizing` 老化告警阈值(二级检测,2026-07-17 batch G)。
@@ -97,6 +104,44 @@ export interface ReconcileCounts {
   committed: number
   aborted: number
   durableWaived: number
+}
+
+export function journalHasGatewayExitMark(ctx: unknown): boolean {
+  if (!ctx || typeof ctx !== 'object') return false
+  const v = (ctx as Record<string, unknown>)[GATEWAY_EXITED_AT_CTX_KEY]
+  return typeof v === 'string' && v.length > 0
+}
+
+export type JournalExec = (
+  sql: string,
+  params?: unknown[],
+) => Promise<{ rows: Array<{ request_id: string }>; rowCount: number | null }>
+
+/**
+ * 停机证据:给仍 inflight/finalizing 的 journal 打上 gatewayExitedAt,不改 state、不碰 updated_at
+ * (避免把 30min stuck 时钟重置)。重启后的 reconcile 据此走快路径。
+ */
+export async function markGatewayShutdownEvidence(
+  input: { now?: Date; reason?: string } = {},
+  exec?: JournalExec,
+): Promise<number> {
+  const exitedAt = (input.now ?? new Date()).toISOString()
+  const reason = input.reason ?? 'process_shutdown'
+  const run = exec ?? (async (sql, params) => {
+    const res = await query<{ request_id: string }>(sql, params ?? [])
+    return { rows: res.rows, rowCount: res.rowCount }
+  })
+  const res = await run(
+    `UPDATE request_finalize_journal
+        SET ctx = COALESCE(ctx, '{}'::jsonb)
+          || jsonb_build_object($1::text, $2::text, $3::text, $4::text),
+            updated_at = updated_at
+      WHERE state IN ('inflight', 'finalizing')
+        AND COALESCE(ctx->>'gatewayExitedAt', '') = ''
+      RETURNING request_id`,
+    [GATEWAY_EXITED_AT_CTX_KEY, exitedAt, GATEWAY_EXIT_REASON_CTX_KEY, reason],
+  )
+  return res.rowCount ?? res.rows.length
 }
 
 /**
@@ -272,7 +317,16 @@ export async function reconcileStuckFinalizeJournal(
       WHERE rfj.request_id = ur.request_id
         AND rfj.user_id = ur.user_id
         AND rfj.state IN ('inflight', 'finalizing')
-        AND rfj.updated_at < NOW() - ($1::bigint * INTERVAL '1 millisecond')
+        AND (
+          rfj.updated_at < NOW() - ($1::bigint * INTERVAL '1 millisecond')
+          OR COALESCE(rfj.ctx->>'gatewayExitedAt', '') <> ''
+          OR EXISTS (
+            SELECT 1 FROM turn_dispatches td
+             WHERE td.dispatch_id = rfj.dispatch_id
+               AND td.status IN ('admitted', 'rejecting')
+               AND (td.lease_until IS NULL OR td.lease_until <= NOW())
+          )
+        )
       RETURNING rfj.request_id`,
     [ms],
   )
@@ -285,11 +339,37 @@ export async function reconcileStuckFinalizeJournal(
             ctx = rfj.ctx - 'settlementClaimId',
             updated_at = NOW()
       WHERE rfj.state IN ('inflight', 'finalizing')
-        AND rfj.updated_at < NOW() - ($1::bigint * INTERVAL '1 millisecond')
         AND COALESCE(rfj.ctx->>'durableBillingRecovery', '') <> $2
         AND NOT EXISTS (
           SELECT 1 FROM usage_records ur
            WHERE ur.request_id = rfj.request_id AND ur.user_id = rfj.user_id
+        )
+        AND (
+          rfj.updated_at < NOW() - ($1::bigint * INTERVAL '1 millisecond')
+          OR (
+            -- 进程死亡证据:标记或 admitted/rejecting 租约已过期。accepted 可能仍有活引擎,绝不走此快路径。
+            (
+              COALESCE(rfj.ctx->>'gatewayExitedAt', '') <> ''
+              OR EXISTS (
+                SELECT 1 FROM turn_dispatches td
+                 WHERE td.dispatch_id = rfj.dispatch_id
+                   AND td.status IN ('admitted', 'rejecting')
+                   AND (td.lease_until IS NULL OR td.lease_until <= NOW())
+              )
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM turn_dispatches td
+               WHERE td.dispatch_id = rfj.dispatch_id
+                 AND td.status = 'accepted'
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM turn_dispatches td
+               WHERE td.dispatch_id = rfj.dispatch_id
+                 AND td.status = 'admitted'
+                 AND td.lease_until IS NOT NULL
+                 AND td.lease_until > NOW()
+            )
+          )
         )
       RETURNING rfj.request_id`,
     [ms, DURABLE_CODEX_RECOVERY_VERSION],
