@@ -15,7 +15,7 @@ import {
   GATEWAY_EXITED_AT_CTX_KEY,
   journalHasGatewayExitMark,
   markGatewayShutdownEvidence,
-  clearGatewayShutdownEvidenceByRequestIds,
+  clearGatewayShutdownEvidenceByDispatchIds,
   MAX_DURABLE_FINALIZING_ALERT_AGE_MS,
   MAX_DURABLE_WAIVER_AGE_MS,
   MAX_STUCK_THRESHOLD_MS,
@@ -338,10 +338,10 @@ describe('gateway shutdown evidence', () => {
   })
 })
 
-describe('clearGatewayShutdownEvidenceByRequestIds', () => {
+describe('clearGatewayShutdownEvidenceByDispatchIds', () => {
   test('空列表不发查询', async () => {
     let calls = 0
-    const n = await clearGatewayShutdownEvidenceByRequestIds([], async () => {
+    const n = await clearGatewayShutdownEvidenceByDispatchIds([], async () => {
       calls++
       return { rows: [], rowCount: 0 }
     })
@@ -349,21 +349,22 @@ describe('clearGatewayShutdownEvidenceByRequestIds', () => {
     assert.equal(calls, 0)
   })
 
-  test('按 request_id PK 点更新并摘掉两个 key', async () => {
+  test('按 dispatch_id 摘掉该 turn 下所有 journal 行的两个 key', async () => {
     let sql = ''
     let params: unknown[] = []
-    const n = await clearGatewayShutdownEvidenceByRequestIds(
-      ['req-1', 'req-1', ''],
+    const n = await clearGatewayShutdownEvidenceByDispatchIds(
+      ['11111111-1111-1111-1111-111111111111', '11111111-1111-1111-1111-111111111111', ''],
       async (q, p) => {
         sql = q
         params = p ?? []
-        return { rows: [{ request_id: 'req-1' }], rowCount: 1 }
+        return { rows: [{ request_id: 'call-1' }, { request_id: 'call-2' }], rowCount: 2 }
       },
     )
-    assert.equal(n, 1)
-    assert.match(sql, /request_id = ANY\(\$1::text\[\]\)/)
+    assert.equal(n, 2)
+    assert.match(sql, /dispatch_id = ANY\(\$1::uuid\[\]\)/)
     assert.match(sql, /ctx = ctx - \$2::text - \$3::text/)
-    assert.deepEqual(params[0], ['req-1'])
+    assert.ok(!sql.includes('request_id = ANY'), '不得按 billing/request_id 清,会漏掉调用级 journal')
+    assert.deepEqual(params[0], ['11111111-1111-1111-1111-111111111111'])
     assert.equal(params[1], GATEWAY_EXITED_AT_CTX_KEY)
   })
 })

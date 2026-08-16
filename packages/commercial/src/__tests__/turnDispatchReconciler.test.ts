@@ -672,7 +672,7 @@ describe('runShutdownDispatchHandoff', () => {
   })
 })
 
-describe('loadGatewayExitDispatchIds — PK 反查,禁止全表扫', () => {
+describe('loadGatewayExitDispatchIds — 按 dispatch_id 反查', () => {
   test('空候选不发查询', async () => {
     let calls = 0
     const pool = {
@@ -686,24 +686,55 @@ describe('loadGatewayExitDispatchIds — PK 反查,禁止全表扫', () => {
     assert.equal(calls, 0)
   })
 
-  test('按 billing_request_id 走 journal PK(request_id = ANY),再映射回 dispatchId', async () => {
+  test('标记打在 request_id ≠ billing_request_id 的调用级 journal 上仍能命中', async () => {
     const sqls: string[] = []
     const params: unknown[][] = []
     const pool = {
       async query(sql: string, p?: unknown[]) {
         sqls.push(sql.replace(/\s+/g, ' '))
         params.push(p ?? [])
-        return { rows: [{ request_id: 'br-marked' }], rowCount: 1 }
+        // 模拟:该 dispatch 有多条 journal,标记在 call-level request_id 上,
+        // 若误按 billing_request_id=br-not-marked 查 PK,这里不会被问到。
+        return { rows: [{ dispatch_id: 'd-1' }], rowCount: 1 }
       },
     }
     const ids = await loadGatewayExitDispatchIds(pool as unknown as Pool, [
-      { dispatchId: 'd-keep', billingRequestId: 'br-marked' },
-      { dispatchId: 'd-skip', billingRequestId: 'br-clean' },
+      { dispatchId: 'd-1' },
     ])
-    assert.deepEqual(ids, ['d-keep'])
-    assert.match(sqls[0]!, /request_id = ANY\(\$1::text\[\]\)/)
-    assert.match(sqls[0]!, /FROM request_finalize_journal/)
-    assert.ok(!sqls[0]!.includes('dispatch_id IS NOT NULL'), '不得再扫 journal.dispatch_id 全表')
-    assert.deepEqual(params[0]![0], ['br-marked', 'br-clean'])
+    assert.deepEqual(ids, ['d-1'])
+    assert.match(sqls[0]!, /dispatch_id = ANY\(\$1::uuid\[\]\)/)
+    assert.ok(!/request_id = ANY/.test(sqls[0]!), '按 billing/request_id 查会漏掉调用级标记')
+    assert.deepEqual(params[0]![0], ['d-1'])
+  })
+})
+
+describe('carrier-dead 语义:多 journal 且标记不在 billing_request_id 那一行', () => {
+  test('20min accepted + 容器 rejected + 标记在 call-level journal → 立即 terminal', async () => {
+    const pool = makeFakePool({
+      acceptedStuck: [rawRow({
+        status: 'accepted',
+        accepted_at: new Date(Date.now() - 20 * 60_000),
+        billing_request_id: 'br-not-the-marked-row',
+      })],
+    })
+    const origQuery = pool.query.bind(pool)
+    pool.query = async (sql: string, params?: unknown[]) => {
+      const s = sql.replace(/\s+/g, ' ')
+      if (s.includes('FROM request_finalize_journal') && s.includes('dispatch_id = ANY')) {
+        return { rows: [{ dispatch_id: 'd-1' }], rowCount: 1 }
+      }
+      if (s.includes('FROM request_finalize_journal') && s.includes('request_id = ANY')) {
+        return { rows: [], rowCount: 0 }
+      }
+      return origQuery(sql, params)
+    }
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: {
+        ...noContainer,
+        getDispatchState: async (): Promise<ContainerCallResult> => ({ kind: 'ok', state: 'rejected' }),
+      },
+    })
+    assert.equal(counts.rejectedTerminal, 1, '标记在 request_id≠billing_request_id 的行上必须仍能走快路径')
   })
 })
