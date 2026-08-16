@@ -280,9 +280,20 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
           timelineSnapshotMaxSeq: detail.timelineSnapshotMaxSeq,
           invalidateHistoryCache: detail._historyRevisionUnsupported === true,
         });
+        // Canonical GET is enough to dismiss the history skeleton. Journal
+        // hydrate is a background fill — awaiting it used to pin
+        // 「正在加载会话内容…」for as long as live-frames hung.
+        if (historyFetchingRef.current.get(id) === requestToken) {
+          setHistoryLoadingTokens((current) => {
+            if (current.get(id) !== requestToken) return current;
+            const next = new Map(current);
+            next.delete(id);
+            return next;
+          });
+        }
         const liveSocket = cbRef.current.sockRef.current;
-        if (liveSocket) {
-          await liveSocket.hydrateDurableLiveFrameJournal(
+        if (liveSocket?.hydrateDurableLiveFrameJournal) {
+          void liveSocket.hydrateDurableLiveFrameJournal(
             id,
             (after) => api.getSessionLiveFrames(
               cbRef.current.authSession,
@@ -310,7 +321,9 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
                 invalidateHistoryCache: tapeDetail._historyRevisionUnsupported === true,
               });
             },
-          );
+          ).catch(() => {
+            /* hydrate degrades internally; a thrown first page must not resurrect the skeleton */
+          });
         }
         // 会话级模型选择的侧栏回填:detail 比 boot 时的 listSessions 新(他设备刚改过),
         // 不回填则 App 恢复选择器仍读侧栏旧值。server-wins,detail 无值不清本地

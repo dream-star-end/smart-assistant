@@ -593,10 +593,13 @@ export type ChatSession = {
   _isFirstTurnAfterReady?: boolean;
   _liveStreamBroken?: boolean;
   /** Exact restored/disconnected turn is being reconciled with REST authority.
-   * Delay is capped; attempts are not. */
+   * Attempts and wall-clock are capped (see RESTORE_RECONCILE_MAX_*). */
   _reconciling?: boolean;
   /** Single low-cognition user-visible recovery/control state. */
   _recoveryStatus?: RecoveryStatusState;
+  /** Background live-journal hydrate hit a page/time cap or request timeout.
+   * Not persisted; UI offers an explicit retry. */
+  _liveJournalDegraded?: boolean;
 
   // ── 双帧 error 抑制（§11）──
   _suppressErrorBubbleAtSeq?: number;

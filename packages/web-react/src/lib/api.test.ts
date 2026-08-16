@@ -1129,3 +1129,39 @@ test('refresh 限频早返带 throttled 标记且不发真实网络请求(2026-0
   expect(second.kind === 'transient' && second.retryAfterMs > 0).toBe(true)
   expect(refreshCalls()).toBe(1)
 })
+
+test('getSessionLiveFrames passes an AbortSignal and honors timeoutMs', async () => {
+  const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+    expect(init?.signal).toBeInstanceOf(AbortSignal)
+    return ok({
+      frames: [],
+      nextCursor: null,
+      hasMore: false,
+      streamClientMessageIds: [],
+      hasTapeProjection: false,
+    })
+  })
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+  const { session } = makeSession('tok-live-frames')
+  await api.getSessionLiveFrames(session, 'web-session-1', '0', 200, { timeoutMs: 50 })
+  expect(String(fetchMock.mock.calls[0]?.[0])).toBe(
+    '/api/sessions/web-session-1/live-frames?after=0&limit=200',
+  )
+})
+
+test('getSessionLiveFrames times out a hung request', async () => {
+  vi.useFakeTimers()
+  const fetchMock = vi.fn((_url: string, init?: RequestInit) =>
+    new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => {
+        reject(init.signal?.reason ?? new DOMException('aborted', 'AbortError'))
+      })
+    }),
+  )
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+  const { session } = makeSession('tok-live-frames-timeout')
+  const pending = api.getSessionLiveFrames(session, 'web-session-1', '0', 200, { timeoutMs: 25 })
+  const expectation = expect(pending).rejects.toMatchObject({ name: 'TimeoutError' })
+  await vi.advanceTimersByTimeAsync(25)
+  await expectation
+})

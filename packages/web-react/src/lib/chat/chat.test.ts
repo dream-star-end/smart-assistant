@@ -47,6 +47,9 @@ import {
 } from "./reducer";
 import {
   ChatSocket,
+  EMPTY_JOURNAL_POLL_DELAYS_MS,
+  LIVE_JOURNAL_MAX_PAGES,
+  RESTORE_RECONCILE_MAX_ATTEMPTS,
   automaticTurnRecoveryTarget,
   exactUserReplayPayload,
   interruptedContinuationIdentity,
@@ -4176,6 +4179,47 @@ describe("ChatSocket interrupted continuation", () => {
     sock.stop();
   });
 
+  test("journal hydrate stops paging at the page cap and marks degraded retry", async () => {
+    const sock = makeSocket();
+    sock.ensureSession("s1", "main");
+    let pages = 0;
+    const applyTapeProjection = vi.fn(async () => {});
+    await sock.hydrateDurableLiveFrameJournal(
+      "s1",
+      async (after) => {
+        pages += 1;
+        return {
+          frames: [],
+          nextCursor: String(Number(after) + 1),
+          hasMore: true,
+          streamClientMessageIds: ["u-long"],
+          hasTapeProjection: false,
+        };
+      },
+      applyTapeProjection,
+    );
+    expect(pages).toBe(LIVE_JOURNAL_MAX_PAGES);
+    expect(sock.sessions.get("s1")?._liveJournalDegraded).toBe(true);
+    expect(applyTapeProjection).toHaveBeenCalledTimes(1);
+    sock.stop();
+  });
+
+  test("journal hydrate degrades on the first-page timeout and still pulls tape", async () => {
+    const sock = makeSocket();
+    sock.ensureSession("s1", "main");
+    const applyTapeProjection = vi.fn(async () => {});
+    await sock.hydrateDurableLiveFrameJournal(
+      "s1",
+      async () => {
+        throw new DOMException("live-frames request timeout", "TimeoutError");
+      },
+      applyTapeProjection,
+    );
+    expect(sock.sessions.get("s1")?._liveJournalDegraded).toBe(true);
+    expect(applyTapeProjection).toHaveBeenCalledTimes(1);
+    sock.stop();
+  });
+
   test("tape projection observed only after reconnect (stale checkpoint, no live cutover) still triggers one narrative read", async () => {
     // boss 2026-08-16 现场:页面在网关重启前打开(当时没有任何 tape 投影),重启
     // 断连期间 turn 完成并切到 tape 投影;重连水合带着旧 checkpoint(initial=false)
@@ -6099,6 +6143,11 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     vi.useFakeTimers();
     let sock!: ChatSocket;
     const syncSession = vi.fn(async () => {
+      sock.noteLiveJournalObservation("s1", {
+        frameCount: 2,
+        liveClientMessageIds: ["u-live"],
+        hasTapeProjection: false,
+      });
       if (syncSession.mock.calls.length === 3) {
         const session = sock.sessions.get("s1")!;
         session._sendingInFlight = false;
@@ -6124,11 +6173,155 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     expect(syncSession).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(1000);
     expect(syncSession).toHaveBeenCalledTimes(2);
-    // Attempt 2 used to back off for two seconds even though REST was healthy,
-    // leaving a broken-WS client visibly stale. A successful poll stays at 1s.
+    // Active journal (live owner + frames) stays at 1s so a broken-WS client
+    // does not look stale. Empty journals use backoff; see the sibling test.
     await vi.advanceTimersByTimeAsync(1000);
     expect(syncSession).toHaveBeenCalledTimes(3);
     expect(sock.sessions.get("s1")?._reconciling).toBe(false);
+    sock.stop();
+  });
+
+  test("empty journal without a live owner backs off instead of 1s death-polling", async () => {
+    vi.useFakeTimers();
+    let sock!: ChatSocket;
+    const syncSession = vi.fn(async () => {
+      sock.noteLiveJournalObservation("s1", {
+        frameCount: 0,
+        liveClientMessageIds: [],
+        hasTapeProjection: false,
+      });
+      return true;
+    });
+    sock = makeSocket({ syncSession });
+    const now = Date.now();
+    sock.loadStored({
+      id: "s1",
+      agentId: "main",
+      title: "s1",
+      messages: [{ id: "u-empty", role: "user", text: "done turn", ts: now, status: "sent" }],
+      createdAt: now,
+      lastAt: now,
+      _sendingInFlight: true,
+      _activeClientMessageId: "u-empty",
+      _turnStartedAt: now,
+    });
+
+    await Promise.resolve();
+    expect(syncSession).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(EMPTY_JOURNAL_POLL_DELAYS_MS[0]);
+    expect(syncSession).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(EMPTY_JOURNAL_POLL_DELAYS_MS[0]);
+    expect(syncSession).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(EMPTY_JOURNAL_POLL_DELAYS_MS[1] - EMPTY_JOURNAL_POLL_DELAYS_MS[0]);
+    expect(syncSession).toHaveBeenCalledTimes(3);
+    sock.stop();
+  });
+
+  test("empty journal with tape projection exits restore and clears sending", async () => {
+    vi.useFakeTimers();
+    let sock!: ChatSocket;
+    const syncSession = vi.fn(async () => {
+      sock.noteLiveJournalObservation("s1", {
+        frameCount: 0,
+        liveClientMessageIds: [],
+        hasTapeProjection: true,
+      });
+      return true;
+    });
+    sock = makeSocket({ syncSession });
+    const now = Date.now();
+    sock.loadStored({
+      id: "s1",
+      agentId: "main",
+      title: "s1",
+      messages: [{ id: "u-tape", role: "user", text: "done turn", ts: now, status: "sent" }],
+      createdAt: now,
+      lastAt: now,
+      _sendingInFlight: true,
+      _activeClientMessageId: "u-tape",
+      _turnStartedAt: now,
+    });
+
+    await Promise.resolve();
+    const session = sock.sessions.get("s1")!;
+    expect(session._sendingInFlight).toBe(false);
+    expect(session._reconciling).toBe(false);
+    expect(session._recoveryStatus?.kind).toBe("completed");
+    expect(syncSession).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(syncSession).toHaveBeenCalledTimes(1);
+    sock.stop();
+  });
+
+  test("visible server-authored body after reconcile exits restore", async () => {
+    vi.useFakeTimers();
+    let sock!: ChatSocket;
+    const syncSession = vi.fn(async () => {
+      const session = sock.sessions.get("s1")!;
+      session.messages.push({
+        id: "srv-a1",
+        role: "assistant",
+        text: "已经写完的答复",
+        ts: Date.now(),
+        _source: "server",
+        _clientMessageId: "u-vis",
+      });
+      sock.noteLiveJournalObservation("s1", {
+        frameCount: 0,
+        liveClientMessageIds: [],
+        hasTapeProjection: false,
+      });
+      return true;
+    });
+    sock = makeSocket({ syncSession });
+    const now = Date.now();
+    sock.loadStored({
+      id: "s1",
+      agentId: "main",
+      title: "s1",
+      messages: [{ id: "u-vis", role: "user", text: "please", ts: now, status: "sent" }],
+      createdAt: now,
+      lastAt: now,
+      _sendingInFlight: true,
+      _activeClientMessageId: "u-vis",
+      _turnStartedAt: now,
+    });
+
+    await Promise.resolve();
+    const session = sock.sessions.get("s1")!;
+    expect(session._sendingInFlight).toBe(false);
+    expect(session._reconciling).toBe(false);
+    expect(session._recoveryStatus?.kind).toBe("completed");
+    sock.stop();
+  });
+
+  test("restore attempt cap exits even when journal metadata never arrives", async () => {
+    vi.useFakeTimers();
+    const syncSession = vi.fn(async () => true);
+    const sock = makeSocket({ syncSession });
+    const now = Date.now();
+    sock.loadStored({
+      id: "s1",
+      agentId: "main",
+      title: "s1",
+      messages: [{ id: "u-cap", role: "user", text: "orphan", ts: now, status: "sent" }],
+      createdAt: now,
+      lastAt: now,
+      _sendingInFlight: true,
+      _activeClientMessageId: "u-cap",
+      _turnStartedAt: now,
+    });
+
+    await Promise.resolve();
+    expect(syncSession).toHaveBeenCalledTimes(1);
+    for (let i = 0; i < RESTORE_RECONCILE_MAX_ATTEMPTS; i++) {
+      await vi.advanceTimersByTimeAsync(10_000);
+    }
+    const session = sock.sessions.get("s1")!;
+    expect(syncSession.mock.calls.length).toBeLessThanOrEqual(RESTORE_RECONCILE_MAX_ATTEMPTS);
+    expect(session._reconciling).toBe(false);
+    expect(session._sendingInFlight).toBe(false);
+    expect(session._recoveryStatus?.kind).toBe("completed");
     sock.stop();
   });
 

@@ -37,6 +37,7 @@ import {
   type ChatSession,
   clearTurnTiming,
   createSession,
+  isServerAuthoredRow,
   mintMsgId,
   rebuildIndexes,
   resetReplyTracker,
@@ -133,6 +134,41 @@ import {
 import type { DurableLiveFrame, DurableLiveFramePage, RefreshOutcome } from "../types";
 
 export type { ChatStatusClass };
+
+function messageHasVisibleBody(message: ChatMessage): boolean {
+  if (typeof message.text === "string" && message.text.trim().length > 0) return true;
+  const blocks = (message as ChatMessage & { blocks?: unknown[] }).blocks;
+  return Array.isArray(blocks) && blocks.length > 0;
+}
+
+function isLiveJournalAbort(error: unknown): boolean {
+  if (error instanceof DOMException) {
+    return error.name === "AbortError" || error.name === "TimeoutError";
+  }
+  return error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError");
+}
+
+/** Successful-but-still-in-flight restore polls. A healthy live turn either
+ * gets a WS `onLiveFrame` (exits immediately) or keeps a live owner (we only
+ * drop the recovery chrome, not sending). 8 attempts / 45s is enough to
+ * distinguish "tape already finished" from "first frames still landing"
+ * without leaving the composer on Stop forever. */
+export const RESTORE_RECONCILE_MAX_ATTEMPTS = 8;
+export const RESTORE_RECONCILE_MAX_MS = 45_000;
+/** Empty-journal poll delays: 1s → 2s → 5s → 10s cap. */
+export const EMPTY_JOURNAL_POLL_DELAYS_MS = [1000, 2000, 5000, 10_000] as const;
+/** Background journal rebuild bounds. 24 pages × 500 frames = 12k frames;
+ * 30s wall clock covers a slow first page without silent infinite paging. */
+export const LIVE_JOURNAL_MAX_PAGES = 24;
+export const LIVE_JOURNAL_MAX_MS = 30_000;
+
+export type LiveJournalObservation = {
+  frameCount: number;
+  liveClientMessageIds: Set<string>;
+  hasTapeProjection: boolean;
+  tapeProjectionVersion?: number;
+  degraded?: boolean;
+};
 
 export type ChatSocketDeps = {
   /** 当前内存态 access JWT（WS 子协议鉴权用）。*/
@@ -570,6 +606,11 @@ export class ChatSocket {
       consumedAuthoritativeResetEpoch: number;
     }>;
   }>();
+  /** Last successful/degraded live-frames page observation, used by the
+   * restore state machine to decide exit vs 1s live cadence vs empty backoff. */
+  private readonly lastLiveJournalObservation = new Map<string, LiveJournalObservation>();
+  private readonly reconcileStartedAt = new Map<string, number>();
+  private readonly emptyJournalBackoffIndex = new Map<string, number>();
   /** Exact active-turn candidate sets already attempted on the current WS.
    * History can arrive after the initial shell hello; each new candidate set
    * gets one targeted registration hello, then waits for a reconnect before
@@ -786,7 +827,11 @@ export class ChatSocket {
     this.reconcileTimers.clear();
     this.reconcileInFlight.clear();
     this.reconcileRunTokens.clear();
+    this.reconcileAttempts.clear();
     this.reconcileClientMessageIds.clear();
+    this.reconcileStartedAt.clear();
+    this.emptyJournalBackoffIndex.clear();
+    this.lastLiveJournalObservation.clear();
     this.durableLiveJournalCheckpoints.clear();
     for (const t of this.controlPersistRetryTimers.values()) clearTimeout(t);
     this.controlPersistRetryTimers.clear();
@@ -1060,6 +1105,8 @@ export class ChatSocket {
     this.reconcileRunTokens.delete(sessId);
     this.reconcileAttempts.delete(sessId);
     this.reconcileClientMessageIds.delete(sessId);
+    this.reconcileStartedAt.delete(sessId);
+    this.emptyJournalBackoffIndex.delete(sessId);
     const sess = this.sessions.get(sessId);
     if (!sess) return;
     sess._reconciling = false;
@@ -1090,6 +1137,9 @@ export class ChatSocket {
       this.reconcileClientMessageIds.set(sessId, context.clientMessageId);
     }
     sess._reconciling = true;
+    if (!this.reconcileStartedAt.has(sessId)) {
+      this.reconcileStartedAt.set(sessId, Date.now());
+    }
     if (sess._recoveryStatus?.kind !== "stopping") {
       const attempt = this.reconcileAttempts.get(sessId) ?? 0;
       sess._recoveryStatus = attempt > 0
@@ -1129,17 +1179,19 @@ export class ChatSocket {
         this.reconcileInFlight.delete(sessId);
         const current = this.sessions.get(sessId);
         if (!current?._reconciling) return;
+        if (synced === true && this.finishRestoreIfReady(current, attempt)) {
+          return;
+        }
         if (synced === true && !current._sendingInFlight && !current._stopSettlement) {
           this.clearContinuousReconcile(sessId, true);
           this.scheduleNotify();
           return;
         }
-        // A successful active sync means the service is healthy and the journal
-        // is our current live transport. Keep it near-real-time; exponential
-        // backoff is only for failed requests. Incremental cursor reads make the
-        // steady poll cheap without replaying the full transcript.
+        // Healthy REST: live journal stays on a 1s cadence so a broken WS does
+        // not look stale. Empty journal (completed tape / no live owner) uses
+        // 1s → 2s → 5s → 10s instead of a 1s death-poll. Failures still back off.
         const delay = synced === true
-          ? 1000
+          ? this.nextSuccessfulReconcileDelayMs(sessId)
           : Math.min(30_000, 1000 * (2 ** Math.min(attempt - 1, 5)));
         if (current._recoveryStatus?.kind !== "stopping") {
           current._recoveryStatus = {
@@ -1168,6 +1220,117 @@ export class ChatSocket {
         );
       },
     );
+  }
+
+  /**
+   * Test/harness hook: record the latest live-frames observation so the
+   * restore loop can distinguish an active journal from an empty tape cutover.
+   */
+  noteLiveJournalObservation(sessId: string, observation: {
+    frameCount: number;
+    liveClientMessageIds: Iterable<string>;
+    hasTapeProjection: boolean;
+    tapeProjectionVersion?: number;
+    degraded?: boolean;
+  }): void {
+    this.lastLiveJournalObservation.set(sessId, {
+      frameCount: observation.frameCount,
+      liveClientMessageIds: new Set(observation.liveClientMessageIds),
+      hasTapeProjection: observation.hasTapeProjection,
+      ...(observation.tapeProjectionVersion !== undefined
+        ? { tapeProjectionVersion: observation.tapeProjectionVersion }
+        : {}),
+      ...(observation.degraded ? { degraded: true } : {}),
+    });
+  }
+
+  private sessionHasVisibleTurnBody(sess: ChatSession): boolean {
+    const cmid = sess._activeClientMessageId;
+    return sess.messages.some((message) => {
+      if (message.role !== "assistant" && message.role !== "thinking" && message.role !== "tool") {
+        return false;
+      }
+      if (cmid && message._clientMessageId && message._clientMessageId !== cmid) return false;
+      if (!isServerAuthoredRow(message)) return false;
+      return messageHasVisibleBody(message);
+    });
+  }
+
+  private turnAssistantIsEmpty(sess: ChatSession): boolean {
+    const cmid = sess._activeClientMessageId;
+    const assistants = sess.messages.filter((message) => {
+      if (message.role !== "assistant") return false;
+      if (cmid && message._clientMessageId && message._clientMessageId !== cmid) return false;
+      return true;
+    });
+    if (assistants.length === 0) return true;
+    return assistants.every((message) => !messageHasVisibleBody(message));
+  }
+
+  private nextSuccessfulReconcileDelayMs(sessId: string): number {
+    const obs = this.lastLiveJournalObservation.get(sessId);
+    const sess = this.sessions.get(sessId);
+    const cmid = sess?._activeClientMessageId;
+    const hasLiveOwner = !!(cmid && obs?.liveClientMessageIds.has(cmid));
+    const hasFrames = (obs?.frameCount ?? 0) > 0;
+    if (hasLiveOwner || hasFrames) {
+      this.emptyJournalBackoffIndex.delete(sessId);
+      return 1000;
+    }
+    const idx = this.emptyJournalBackoffIndex.get(sessId) ?? 0;
+    const delay = EMPTY_JOURNAL_POLL_DELAYS_MS[Math.min(idx, EMPTY_JOURNAL_POLL_DELAYS_MS.length - 1)]!;
+    this.emptyJournalBackoffIndex.set(sessId, idx + 1);
+    return delay;
+  }
+
+  /**
+   * Restore must have an exit. Returns true when this poll finished the loop.
+   * A still-live owner only drops recovery chrome (resumed); a finished tape
+   * or visible server body clears sending so the composer is usable again.
+   */
+  private finishRestoreIfReady(sess: ChatSession, attempt: number): boolean {
+    if (sess._stopSettlement) return false;
+    const decision = this.restoreExitDecision(sess, attempt);
+    if (!decision) return false;
+    if (decision.clearSending && sess._sendingInFlight) {
+      this.clearSendingState(sess, { clearThinking: true });
+    }
+    if (decision.kind === "completed") {
+      this.clearContinuousReconcile(sess.id, true);
+    } else {
+      this.clearContinuousReconcile(sess.id, false);
+      if (sess._recoveryStatus?.kind !== "stopping") {
+        sess._recoveryStatus = { kind: "resumed" };
+      }
+      this.deps.persistSession?.(sess.id);
+    }
+    this.scheduleNotify();
+    return true;
+  }
+
+  private restoreExitDecision(
+    sess: ChatSession,
+    attempt: number,
+  ): { clearSending: boolean; kind: "completed" | "resumed" } | null {
+    const obs = this.lastLiveJournalObservation.get(sess.id);
+    const cmid = sess._activeClientMessageId;
+    const liveOwner = !!(cmid && obs?.liveClientMessageIds.has(cmid));
+    const journalEmpty = !obs || obs.frameCount === 0;
+    const hasVisible = this.sessionHasVisibleTurnBody(sess);
+
+    // 对账成功且服务端已有可见正文,且当前 turn 已不是 live owner。
+    if (hasVisible && !liveOwner) {
+      return { clearSending: true, kind: "completed" };
+    }
+    // journal 为空且没有 live owner:streamClientMessageIds 不含当前消息,且 tape 已投影。
+    if (journalEmpty && !liveOwner && obs?.hasTapeProjection === true) {
+      return { clearSending: true, kind: "completed" };
+    }
+    const startedAt = this.reconcileStartedAt.get(sess.id) ?? Date.now();
+    if (attempt >= RESTORE_RECONCILE_MAX_ATTEMPTS || Date.now() - startedAt >= RESTORE_RECONCILE_MAX_MS) {
+      return { clearSending: !liveOwner, kind: liveOwner ? "resumed" : "completed" };
+    }
+    return null;
   }
 
   /**
@@ -2917,10 +3080,30 @@ export class ChatSocket {
       );
       let sawTapeProjection = false;
       let maxTapeProjectionVersion: number | undefined;
+      let frameCount = 0;
+      let degraded = false;
+      const startedAt = Date.now();
+      let pagesRead = 0;
 
       const readPages = async (stage: DurableLiveFrame[] | null): Promise<void> => {
         for (;;) {
-          const page = await fetchPage(cursor);
+          if (pagesRead >= LIVE_JOURNAL_MAX_PAGES || Date.now() - startedAt >= LIVE_JOURNAL_MAX_MS) {
+            degraded = true;
+            break;
+          }
+          let page: DurableLiveFramePage;
+          try {
+            page = await fetchPage(cursor);
+          } catch (error) {
+            // Hung/aborted live-frames must not pin restore. Other page errors
+            // still reject so the checkpoint stays on the last committed cursor.
+            if (isLiveJournalAbort(error)) {
+              degraded = true;
+              return;
+            }
+            throw error;
+          }
+          pagesRead += 1;
           sawTapeProjection ||= page.hasTapeProjection === true;
           if (typeof page.tapeProjectionVersion === "number") {
             maxTapeProjectionVersion = Math.max(
@@ -2930,6 +3113,7 @@ export class ChatSocket {
           }
           currentLiveOwners = new Set(page.streamClientMessageIds);
           for (const clientMessageId of currentLiveOwners) observedLiveOwners.add(clientMessageId);
+          frameCount += page.frames.length;
           if (stage) {
             stage.push(...page.frames);
           } else if (page.frames.length > 0) {
@@ -2957,8 +3141,10 @@ export class ChatSocket {
           [...observedLiveOwners],
           lastDurableFrameSeqBySessionKey,
         );
-        // Close snapshot→reset races while stamped WS frames remain buffered.
-        await readPages(null);
+        if (!degraded) {
+          // Close snapshot→reset races while stamped WS frames remain buffered.
+          await readPages(null);
+        }
       } else {
         await readPages(null);
       }
@@ -2973,6 +3159,8 @@ export class ChatSocket {
       // 2) 布尔回退:旧后端无水位字段,本页首次观察到 tape 投影(含 initial 与
       //    网关重启后带旧 checkpoint 重连)补拉一次;
       // 3) 亲眼看 live owner 切 tape 的既有触发。
+      // 4) 降级或「在飞 + journal 空 + 最后一条 assistant 空白」:刷新后 cursor
+      //    回 0、turn 已切 tape 时 live-frames 不再给正文,必须补拉 tape。
       const versionAdvanced =
         typeof maxTapeProjectionVersion === "number" &&
         (checkpoint?.tapeProjectionVersion === undefined
@@ -2981,8 +3169,37 @@ export class ChatSocket {
       const tapeProjectionAppeared =
         typeof maxTapeProjectionVersion !== "number" &&
         sawTapeProjection && checkpoint?.sawTapeProjection !== true;
-      if (versionAdvanced || tapeProjectionAppeared || liveOwnerProjectedToTape) {
-        await applyTapeProjection();
+      const sess = this.sessions.get(sessId);
+      const activeCmid = sess?._activeClientMessageId;
+      const noLiveOwner = !activeCmid || !currentLiveOwners.has(activeCmid);
+      const emptyInFlightBubble = !!sess?._sendingInFlight && noLiveOwner &&
+        (sess ? this.turnAssistantIsEmpty(sess) : true);
+      if (
+        versionAdvanced ||
+        tapeProjectionAppeared ||
+        liveOwnerProjectedToTape ||
+        degraded ||
+        (sawTapeProjection && emptyInFlightBubble)
+      ) {
+        try {
+          await applyTapeProjection();
+        } catch {
+          degraded = true;
+        }
+      }
+
+      this.noteLiveJournalObservation(sessId, {
+        frameCount,
+        liveClientMessageIds: currentLiveOwners,
+        hasTapeProjection: sawTapeProjection || checkpoint?.sawTapeProjection === true,
+        ...(typeof maxTapeProjectionVersion === "number"
+          ? { tapeProjectionVersion: maxTapeProjectionVersion }
+          : {}),
+        degraded,
+      });
+      if (sess) {
+        sess._liveJournalDegraded = degraded;
+        this.scheduleNotify();
       }
 
       this.durableLiveJournalCheckpoints.set(sessId, {
