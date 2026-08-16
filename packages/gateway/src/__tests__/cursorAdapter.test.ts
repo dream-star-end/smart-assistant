@@ -288,7 +288,7 @@ describe('CursorAdapter', () => {
       tool_call: {
         id: 't-repr-escaped',
         updateTodosToolCall: {
-          args: { todos: `[{'content': 'it\\'s a C:\\path True', 'status': 'TODO_STATUS_COMPLETED'}]` },
+          args: { todos: `[{'content': 'it\\'s a C:\\\\path True', 'status': 'TODO_STATUS_COMPLETED'}]` },
         },
       },
     }
@@ -297,6 +297,59 @@ describe('CursorAdapter', () => {
       throw new Error(`escapes not resolved: ${JSON.stringify(escInput)}`)
     }
     if (escInput.todos[0]!.status !== 'completed') throw new Error('status not normalized 2')
+  })
+
+  test('python repr hex escapes and __proto__ keys stay faithful (codex final-audit)', () => {
+    // \xNN 是 python repr 的正式转义:必须还原成原字符,不能静默变成字面 '\x00'。
+    const hexEsc = {
+      type: 'tool_call',
+      tool_call: {
+        id: 't-repr-hex',
+        updateTodosToolCall: {
+          args: { todos: `[{'content': 'a\\x00b\\x41', 'status': 'TODO_STATUS_PENDING'}]` },
+        },
+      },
+    }
+    const hexInput = _internals.toolInputOf(hexEsc as never) as { todos: Array<{ content: string; status: string }> }
+    if (hexInput.todos?.[0]?.content !== 'a\u0000bA') {
+      throw new Error(`hex escapes not resolved: ${JSON.stringify(hexInput)}`)
+    }
+
+    // 不认识的转义(如 \q)→ 整体回退原始值,绝不静默改写后"成功"。
+    const unsupported = {
+      type: 'tool_call',
+      tool_call: {
+        id: 't-repr-unsupported-esc',
+        updateTodosToolCall: {
+          args: { todos: `[{'content': 'a\\qb', 'status': 'TODO_STATUS_PENDING'}]` },
+        },
+      },
+    }
+    const rawOut = _internals.toolInputOf(unsupported as never) as Record<string, unknown> & { args?: { todos?: string } }
+    if (rawOut.todos !== undefined) throw new Error('unsupported escape must not parse into todos')
+    if (rawOut.args?.todos !== `[{'content': 'a\\qb', 'status': 'TODO_STATUS_PENDING'}]`) {
+      throw new Error('raw fallback must be verbatim')
+    }
+
+    // '__proto__' 作为 python 键只能落成自有属性,不得通过原型链把嵌套 content
+    // 伪造成顶层字段(codex 终审反例)。
+    const protoKey = {
+      type: 'tool_call',
+      tool_call: {
+        id: 't-repr-proto',
+        updateTodosToolCall: {
+          args: { todos: `[{'__proto__': {'content': 'forged'}, 'status': 'TODO_STATUS_PENDING'}]` },
+        },
+      },
+    }
+    const protoInput = _internals.toolInputOf(protoKey as never) as { todos: Array<Record<string, unknown>> }
+    const todo = protoInput.todos?.[0]
+    if (!todo) throw new Error('proto fixture must parse')
+    if (todo.content === 'forged') {
+      throw new Error(`content leaked through prototype chain: ${JSON.stringify(todo)}`)
+    }
+
+    if (todo.status !== 'pending') throw new Error('status not normalized under __proto__ key')
   })
 
   test('keeps raw cursor args when stringified todos cannot be parsed', () => {

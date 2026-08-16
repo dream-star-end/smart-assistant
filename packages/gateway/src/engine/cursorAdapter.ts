@@ -309,7 +309,9 @@ function parsePythonReprValue(input: string): unknown {
     }
     if (ch === '{') {
       pos += 1
-      const obj: Record<string, unknown> = {}
+      // 无原型:python 键 '__proto__' 走 Object 原型 setter 会把嵌套值提升为
+      // 可继承字段(codex 终审反例),null 原型下只能落成自有属性。
+      const obj = Object.create(null) as Record<string, unknown>
       ws()
       if (input[pos] === '}') { pos += 1; return obj }
       for (;;) {
@@ -351,7 +353,19 @@ function parsePythonReprValue(input: string): unknown {
         else if (next === 't') out += '\t'
         else if (next === 'r') out += '\r'
         else if (next === "'" || next === '"' || next === '\\') out += next
-        else { out += ch; out += next }
+        else if (next === 'x') {
+          // python repr 对不可打印 latin-1 字符输出 \xNN;还原成原字符,
+          // 否则内容被静默改写成字面 '\xNN'(codex 终审 warning)。
+          const hex = input.slice(pos + 2, pos + 4)
+          if (!/^[0-9a-fA-F]{2}$/.test(hex)) throw new Error('repr string: bad \\x escape')
+          out += String.fromCharCode(Number.parseInt(hex, 16))
+          pos += 4
+          continue
+        } else {
+          // 未实现/不认识的转义一律失败 → 整体回退原始值:契约是
+          // "成功解析则内容必逐字",宁可不解也不静默改写。
+          throw new Error(`repr string: unsupported escape \\${next}`)
+        }
         pos += 2
         continue
       }
