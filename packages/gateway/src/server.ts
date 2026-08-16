@@ -2830,6 +2830,20 @@ export class Gateway {
     // Check immediately on boot
     this.refreshClaudeOAuthIfNeeded().catch(() => {})
 
+    // Converge orphan live streams BEFORE listen: clients that connect the
+    // instant the port opens would otherwise page the stale live snapshot and
+    // replay frames whose authoritative tape already finalized. One idempotent
+    // UPDATE; failure is logged and must not block startup.
+    try {
+      const { convergeFinalizedTapeLiveStreams } = await import('@openclaude/storage')
+      const { converged } = await convergeFinalizedTapeLiveStreams()
+      if (converged > 0) {
+        this.log.info('converged finalized live streams to tape', { converged })
+      }
+    } catch (err) {
+      this.log.warn('live stream convergence failed', undefined, err)
+    }
+
     await new Promise<void>((res) => {
       this.httpServer.listen(config.gateway.port, config.gateway.bind, () => res())
     })

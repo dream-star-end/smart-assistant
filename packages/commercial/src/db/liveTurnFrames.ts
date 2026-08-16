@@ -72,31 +72,50 @@ export async function persistGatewayLiveFrame(
   const payloadSha256 = sha256(payload);
   const sessionUserId = `c:${input.uid.toString()}`;
 
-  await withTx(pool, async (client) => {
+  await retryOnSerializationFailure(() => withTx(pool, async (client) => {
+    // Lock the dispatch row BEFORE reading tape state, in a SEPARATE statement:
+    // finalizeLosslessTurnTape takes the same row lock (see
+    // convergeDispatchOnFinalize), and READ COMMITTED takes a per-statement
+    // snapshot — the tape probe below runs only after the lock is ours, so a
+    // finalize that committed while we waited is guaranteed visible. Folding
+    // both into one statement would keep the stale pre-wait snapshot.
     const dispatch = input.clientMessageId === null
       ? null
       : (
           await client.query<{ dispatch_id: string; attempt_no: number }>(
             `SELECT dispatch_id::text,attempt_no
                FROM turn_dispatches
-              WHERE user_id=$1 AND session_id=$2 AND client_message_id=$3`,
+              WHERE user_id=$1 AND session_id=$2 AND client_message_id=$3
+              FOR UPDATE`,
             [input.uid.toString(), input.sessionId, input.clientMessageId],
           )
         ).rows[0] ?? null;
     const streamKey = dispatch
       ? `dispatch:${dispatch.dispatch_id}:${dispatch.attempt_no}`
       : `legacy:${input.agentContainerId}:${input.sessionKey}`;
+    // Any finalized tape (completed/interrupted/crashed) is the authoritative
+    // projection for this stream. A turn whose only frame arrives AFTER its
+    // tape finalized (crash before first live frame, then the terminal error
+    // frame) must not mint a permanent orphan live stream.
+    const finalizedTape = dispatch
+      ? (
+          await client.query<{ tape_id: string; status: string; tape_sha256: string }>(
+            `SELECT tape_id,status,tape_sha256
+               FROM client_session_turn_tapes
+              WHERE dispatch_id=$1::uuid AND attempt_no=$2 AND finalized_at IS NOT NULL
+              ORDER BY finalized_at DESC, tape_id DESC LIMIT 1`,
+            [dispatch.dispatch_id, dispatch.attempt_no],
+          )
+        ).rows[0] ?? null
+      : null;
 
     const stream = await client.query(
       `INSERT INTO client_session_live_streams
          (stream_key,session_id,user_id,client_message_id,dispatch_id,attempt_no,
-          agent_container_id,source,projection_source)
+          agent_container_id,source,projection_source,terminal_status,tape_id,tape_sha256)
        VALUES (
          $1,$2,$3,$4,$5::uuid,$6,$7,'gateway',
-         CASE WHEN $5::uuid IS NOT NULL AND EXISTS (
-           SELECT 1 FROM client_session_turn_tapes t
-            WHERE t.dispatch_id=$5::uuid AND t.status='completed' AND t.finalized_at IS NOT NULL
-         ) THEN 'tape' ELSE 'live' END
+         $8,$9,$10,$11
        )
        ON CONFLICT (stream_key) DO UPDATE SET updated_at=NOW()
        WHERE client_session_live_streams.session_id=EXCLUDED.session_id
@@ -115,6 +134,10 @@ export async function persistGatewayLiveFrame(
         dispatch?.dispatch_id ?? null,
         dispatch?.attempt_no ?? null,
         input.agentContainerId,
+        finalizedTape ? "tape" : "live",
+        finalizedTape?.status ?? null,
+        finalizedTape?.tape_id ?? null,
+        finalizedTape?.tape_sha256 ?? null,
       ],
     );
     if ((stream.rowCount ?? 0) !== 1) {
@@ -170,7 +193,28 @@ export async function persistGatewayLiveFrame(
     if (namespacedExisting !== null && !matchesCurrentFrame(namespacedExisting)) {
       throw new Error("live frame immutable payload conflict");
     }
-  });
+  }));
+}
+
+/**
+ * Self-heal only the retry-safe serialization failures. The dispatch-row lock
+ * taken by persistGatewayLiveFrame opposes the finalize transaction's
+ * session→dispatch order, and turnDispatchReconciler locks dispatch→session,
+ * so an occasional 40P01/40001 abort is expected and harmless to retry: every
+ * statement in the frame transaction is idempotent (ON CONFLICT / FOR UPDATE
+ * re-read). All other errors propagate untouched.
+ */
+async function retryOnSerializationFailure(fn: () => Promise<void>): Promise<void> {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      await fn();
+      return;
+    } catch (error) {
+      const code = (error as { code?: string } | null)?.code;
+      if ((code !== "40P01" && code !== "40001") || attempt >= 3) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 50 * attempt));
+    }
+  }
 }
 
 export async function readClientSessionLiveFrames(
@@ -272,16 +316,54 @@ export async function reconcileLiveStreamWithFinalTape(
     tapeSha256: string;
   },
 ): Promise<void> {
+  // Every caller runs inside finalizeLosslessTurnTape with the tape row and its
+  // records already durable, so all three terminal statuses
+  // (completed/interrupted/crashed) project to tape — interrupted tapes carry
+  // the same authoritative records and replaying their live frames on every
+  // cold-start journal hydration is pure waste (0201's original comment kept
+  // abnormal turns on live; records became the authority for them since).
   await client.query(
     `UPDATE client_session_live_streams
         SET terminal_status=$2,
-            projection_source=CASE WHEN $2='completed' THEN 'tape' ELSE 'live' END,
+            projection_source='tape',
             tape_id=$3,
             tape_sha256=$4,
             updated_at=NOW()
       WHERE dispatch_id=$1::uuid AND source='gateway'`,
     [input.dispatchId, input.status, input.tapeId, input.tapeSha256],
   );
+}
+
+/**
+ * One-shot, idempotent convergence of gateway live streams whose dispatch
+ * already has a finalized tape. Rows written before the unconditional
+ * projection fix keep `projection_source='live'` forever because nothing
+ * re-runs their finalize transaction; every cold-start journal hydration
+ * would keep replaying them. Covers both shapes: streams that got
+ * terminal_status+tape_id from the old CASE reconcile but stayed live, and
+ * tape_id-less orphans whose tape finalized only after their last frame.
+ * Backfills tape identity so the rows stay introspectable. Strictly scoped:
+ * a finalized tape per (dispatch_id, attempt_no) is the single authority —
+ * in-flight turns (no tape yet), tapeless dead streams and rollout imports
+ * are never touched.
+ */
+export async function convergeFinalizedTapeLiveStreams(pool: Pool): Promise<{ converged: number }> {
+  const result = await pool.query(
+    `UPDATE client_session_live_streams s
+        SET projection_source='tape',
+            terminal_status=t.status,
+            tape_id=t.tape_id,
+            tape_sha256=t.tape_sha256,
+            updated_at=NOW()
+       FROM turn_dispatches d
+       JOIN client_session_turn_tapes t
+         ON t.dispatch_id=d.dispatch_id AND t.attempt_no=d.attempt_no
+        AND t.finalized_at IS NOT NULL
+      WHERE s.dispatch_id=d.dispatch_id AND s.attempt_no=d.attempt_no
+        AND s.source='gateway' AND s.projection_source='live'
+      RETURNING s.stream_key`,
+  );
+  return { converged: result.rowCount ?? 0 };
 }
 
 export async function importRolloutLiveFrames(

@@ -4324,6 +4324,9 @@ export interface ClientSessionLiveFramePage {
   hasMore: boolean
   streamClientMessageIds: string[]
   hasTapeProjection: boolean
+  /** Monotonic count of tape-projected streams in this read's snapshot; lets
+   * clients detect live→tape cutover that happened between two hydrations. */
+  tapeProjectionVersion: number
 }
 
 /** Private model-context read. This is deliberately separate from browser
@@ -4485,8 +4488,14 @@ async function _sqliteReadClientSessionLiveFrames(
     'SELECT 1 FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL',
   ).get(sessId, userId)
   return row
-    ? { frames: [], nextCursor: null, hasMore: false, streamClientMessageIds: [], hasTapeProjection: false }
+    ? { frames: [], nextCursor: null, hasMore: false, streamClientMessageIds: [], hasTapeProjection: false, tapeProjectionVersion: 0 }
     : null
+}
+
+/** Personal/container SQLite keeps no gateway live-frame journal, so there is
+ * nothing to converge. */
+async function _sqliteConvergeFinalizedTapeLiveStreams(): Promise<{ converged: number }> {
+  return { converged: 0 }
 }
 
 /** 引擎上下文读(RFC §9)。个人版/容器按所选模型的真实上下文预算，从热行向归档
@@ -5013,6 +5022,7 @@ const sqliteBackend = {
   getClientSessionPartial: _sqliteGetClientSessionPartial,
   readArchivedMessages: _sqliteReadArchivedMessages,
   readClientSessionLiveFrames: _sqliteReadClientSessionLiveFrames,
+  convergeFinalizedTapeLiveStreams: _sqliteConvergeFinalizedTapeLiveStreams,
   readClientTimelinePage: _sqliteReadClientTimelinePage,
   getEngineContextMessages: _sqliteGetEngineContextMessages,
   hasCompletedClientTurn: _sqliteHasCompletedClientTurn,
@@ -5125,6 +5135,9 @@ export const readArchivedMessages: ClientSessionsBackend['readArchivedMessages']
 
 export const readClientSessionLiveFrames: ClientSessionsBackend['readClientSessionLiveFrames'] =
   (...args) => getActiveBackend().readClientSessionLiveFrames(...args)
+
+export const convergeFinalizedTapeLiveStreams: ClientSessionsBackend['convergeFinalizedTapeLiveStreams'] =
+  (...args) => getActiveBackend().convergeFinalizedTapeLiveStreams(...args)
 
 export const readClientTimelinePage: ClientSessionsBackend['readClientTimelinePage'] =
   (...args) => getActiveBackend().readClientTimelinePage(...args)

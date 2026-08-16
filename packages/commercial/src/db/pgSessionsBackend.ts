@@ -144,6 +144,7 @@ import { settleStopControlsForTurn } from "../dispatch/turnControlStore.js";
 import {
   readClientSessionLiveFrames as readDurableClientSessionLiveFrames,
   reconcileLiveStreamWithFinalTape,
+  convergeFinalizedTapeLiveStreams,
 } from "./liveTurnFrames.js";
 
 // ── BIGINT codec(RFC D7)─────────────────────────────────────────────────────
@@ -942,6 +943,15 @@ async function convergeDispatchOnFinalize(
   const outcome =
     tapeStatus === "completed" ? "completed" :
     tapeStatus === "interrupted" ? "interrupted" : "crashed";
+  // Serialize against persistGatewayLiveFrame on the dispatch row (it takes
+  // the same FOR UPDATE before deciding projection_source). Without this,
+  // a frame write interleaved between our reconcile and its stream INSERT
+  // could mint a permanent projection_source='live' orphan that tape_id-less
+  // startup convergence can never match.
+  await client.query(
+    `SELECT 1 FROM turn_dispatches WHERE dispatch_id=$1::uuid FOR UPDATE`,
+    [dispatchId],
+  );
   const converged = await casToTerminal(client, {
     dispatchId,
     outcome,
@@ -8590,6 +8600,10 @@ export function createPgSessionsBackend(
         afterRecordId,
         limit,
       );
+    },
+
+    async convergeFinalizedTapeLiveStreams() {
+      return convergeFinalizedTapeLiveStreams(pool);
     },
 
     async readClientTimelinePage(

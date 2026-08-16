@@ -35,6 +35,7 @@ import {
   type PgSessionsBackend,
 } from "../db/pgSessionsBackend.js";
 import {
+  convergeFinalizedTapeLiveStreams,
   importRolloutLiveFrames,
   persistGatewayLiveFrame,
   readClientSessionLiveFrames,
@@ -3761,6 +3762,454 @@ describe("durable live turn frame journal", () => {
     assert.deepEqual(projected.streamClientMessageIds, []);
     assert.equal(projected.hasTapeProjection, true);
     assert.equal(projected.tapeProjectionVersion, 1);
+  });
+
+  maybe("interrupted tape finalize also projects an existing live stream to tape", async () => {
+    const sessionId = "s-live-frame-interrupted-projection";
+    const userId = "c:904";
+    const sessionKey = `agent:main:webchat:dm:${sessionId}`;
+    const clientMessageId = "cm-interrupted";
+    const dispatchId = randomUUID();
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    await pool.query(
+      `INSERT INTO turn_dispatches
+         (dispatch_id,user_id,session_id,client_message_id,agent_id,request_hash,
+          billing_request_id,status,outcome,owner_id,lease_until)
+       VALUES ($1,904,$2,$3,'main',$4,$5,'terminal','interrupted','test-owner',NOW()+INTERVAL '1 minute')`,
+      [dispatchId, sessionId, clientMessageId, "5".repeat(64), `billing-${dispatchId}`],
+    );
+    await persistGatewayLiveFrame(pool, {
+      uid: 904n,
+      sessionId,
+      clientMessageId,
+      agentContainerId: 446,
+      sessionKey,
+      frameSeq: 1,
+      payload: JSON.stringify({
+        type: "outbound.message",
+        sessionKey,
+        frameSeq: 1,
+        peer: { id: sessionId, kind: "dm" },
+        clientMessageId,
+        blocks: [{ kind: "text", text: "partial work" }],
+      }),
+    });
+    const live = await readClientSessionLiveFrames(pool, sessionId, userId, 0, 10);
+    assert.ok(live);
+    assert.equal(live.frames.length, 1);
+    assert.deepEqual(live.streamClientMessageIds, [clientMessageId]);
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await reconcileLiveStreamWithFinalTape(client, {
+        dispatchId,
+        status: "interrupted",
+        tapeId: "e".repeat(64),
+        tapeSha256: "f".repeat(64),
+      });
+      await client.query("COMMIT");
+    } finally {
+      client.release();
+    }
+    const projected = await readClientSessionLiveFrames(pool, sessionId, userId, 0, 10);
+    assert.ok(projected);
+    assert.deepEqual(projected.frames, []);
+    assert.deepEqual(projected.streamClientMessageIds, []);
+    assert.equal(projected.hasTapeProjection, true);
+    assert.equal(projected.tapeProjectionVersion, 1);
+  });
+
+  maybe("first frame after an already-finalized abnormal tape mints a tape stream, not a live orphan", async () => {
+    // Crash-before-first-frame: the tape finalizes while no live stream row
+    // exists yet; the terminal frame that arrives afterwards must not create a
+    // permanent projection_source='live' row the startup convergence can never
+    // match (it would have no tape_id).
+    const sessionId = "s-live-frame-late-first-frame";
+    const userId = "c:905";
+    const sessionKey = `agent:main:webchat:dm:${sessionId}`;
+    const clientMessageId = "cm-late-first";
+    const dispatchId = randomUUID();
+    const tapeId = "9".repeat(64);
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    await pool.query(
+      `INSERT INTO turn_dispatches
+         (dispatch_id,user_id,session_id,client_message_id,agent_id,request_hash,
+          billing_request_id,status,outcome,owner_id,lease_until)
+       VALUES ($1,905,$2,$3,'main',$4,$5,'terminal','interrupted','test-owner',NOW()+INTERVAL '1 minute')`,
+      [dispatchId, sessionId, clientMessageId, "6".repeat(64), `billing-${dispatchId}`],
+    );
+    await pool.query(
+      `INSERT INTO client_session_turn_tapes
+         (session_id,user_id,tape_id,agent_id,turn_index,status,turn_key,tape_sha256,
+          total_bytes,part_count,created_at,finalized_at,dispatch_id,attempt_no,client_message_id)
+       VALUES ($1,$2,$3,'main',1,'interrupted',$4,$5,10,1,1,1,$6::uuid,1,$7)`,
+      [sessionId, userId, tapeId, "7".repeat(64), "8".repeat(64), dispatchId, clientMessageId],
+    );
+    await persistGatewayLiveFrame(pool, {
+      uid: 905n,
+      sessionId,
+      clientMessageId,
+      agentContainerId: 447,
+      sessionKey,
+      frameSeq: 1,
+      payload: JSON.stringify({
+        type: "outbound.message",
+        sessionKey,
+        frameSeq: 1,
+        peer: { id: sessionId, kind: "dm" },
+        clientMessageId,
+        blocks: [{ kind: "text", text: "terminal error frame" }],
+      }),
+    });
+    const streamRow = (
+      await pool.query<{
+        projection_source: string;
+        terminal_status: string | null;
+        tape_id: string | null;
+        tape_sha256: string | null;
+      }>(
+        `SELECT projection_source,terminal_status,tape_id,tape_sha256
+           FROM client_session_live_streams
+          WHERE session_id=$1 AND user_id=$2`,
+        [sessionId, userId],
+      )
+    ).rows[0];
+    assert.ok(streamRow);
+    assert.equal(streamRow.projection_source, "tape");
+    assert.equal(streamRow.terminal_status, "interrupted");
+    assert.equal(streamRow.tape_id, tapeId);
+    assert.equal(streamRow.tape_sha256, "8".repeat(64));
+
+    const page = await readClientSessionLiveFrames(pool, sessionId, userId, 0, 10);
+    assert.ok(page);
+    assert.deepEqual(page.frames, []);
+    assert.deepEqual(page.streamClientMessageIds, []);
+    assert.equal(page.hasTapeProjection, true);
+    assert.equal(page.tapeProjectionVersion, 1);
+  });
+
+  maybe("persist and finalize serialize on the dispatch row (late-first-frame race)", async () => {
+    // Real interleaving through production code: a frame-writer holds the
+    // dispatch row (persist's first statement), a finalize transaction (tape
+    // insert + the same dispatch lock + reconcile) must block on that lock —
+    // proven via pg_locks, not a timer — and once it commits, the production
+    // persistGatewayLiveFrame must mint an already-projected tape stream.
+    const sessionId = "s-live-frame-race-barrier";
+    const userId = "c:907";
+    const sessionKey = `agent:main:webchat:dm:${sessionId}`;
+    const clientMessageId = "cm-race";
+    const dispatchId = randomUUID();
+    const tapeId = "1".repeat(64);
+    const tapeSha256 = "2".repeat(64);
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    await pool.query(
+      `INSERT INTO turn_dispatches
+         (dispatch_id,user_id,session_id,client_message_id,agent_id,request_hash,
+          billing_request_id,status,outcome,owner_id,lease_until)
+       VALUES ($1,907,$2,$3,'main',$4,$5,'terminal','interrupted','test-owner',NOW()+INTERVAL '1 minute')`,
+      [dispatchId, sessionId, clientMessageId, "8".repeat(64), `billing-${dispatchId}`],
+    );
+
+    const holder = await pool.connect();
+    try {
+      await holder.query("BEGIN");
+      // Same first statement as persistGatewayLiveFrame's writer path.
+      await holder.query(
+        `SELECT dispatch_id::text FROM turn_dispatches
+          WHERE user_id=$1 AND session_id=$2 AND client_message_id=$3 FOR UPDATE`,
+        ["907", sessionId, clientMessageId],
+      );
+
+      let finalizeSettled = false;
+      const finalize = (async () => {
+        const c2 = await pool.connect();
+        try {
+          await c2.query("BEGIN");
+          await c2.query(
+            `INSERT INTO client_session_turn_tapes
+               (session_id,user_id,tape_id,agent_id,turn_index,status,turn_key,tape_sha256,
+                total_bytes,part_count,created_at,finalized_at,dispatch_id,attempt_no,client_message_id)
+             VALUES ($1,$2,$3,'main',1,'interrupted',$4,$5,10,1,1,1,$6::uuid,1,$7)`,
+            [sessionId, userId, tapeId, "3".repeat(64), tapeSha256, dispatchId, clientMessageId],
+          );
+          // Same lock protocol as convergeDispatchOnFinalize.
+          await c2.query(`SELECT 1 FROM turn_dispatches WHERE dispatch_id=$1::uuid FOR UPDATE`, [
+            dispatchId,
+          ]);
+          await reconcileLiveStreamWithFinalTape(c2, {
+            dispatchId,
+            status: "interrupted",
+            tapeId,
+            tapeSha256,
+          });
+          await c2.query("COMMIT");
+        } catch (err) {
+          try { await c2.query("ROLLBACK"); } catch { /* connection-level failure */ }
+          throw err;
+        } finally {
+          c2.release();
+        }
+      })().then(() => {
+        finalizeSettled = true;
+      });
+
+      let blockedLocks = 0;
+      for (let probe = 0; probe < 20 && blockedLocks === 0; probe += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        blockedLocks = Number(
+          (
+            await pool.query<{ count: string }>(
+              "SELECT COUNT(*)::text AS count FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND pid <> pg_backend_pid()",
+            )
+          ).rows[0]?.count ?? "0",
+        );
+      }
+      assert.ok(blockedLocks > 0, "finalize should be blocked on the dispatch row lock");
+      assert.equal(finalizeSettled, false);
+
+      await holder.query("ROLLBACK");
+      await finalize;
+
+      // Production writer runs AFTER the finalize committed: its tape probe
+      // statement must observe the committed tape through its fresh snapshot.
+      await persistGatewayLiveFrame(pool, {
+        uid: 907n,
+        sessionId,
+        clientMessageId,
+        agentContainerId: 448,
+        sessionKey,
+        frameSeq: 1,
+        payload: JSON.stringify({
+          type: "outbound.message",
+          sessionKey,
+          frameSeq: 1,
+          peer: { id: sessionId, kind: "dm" },
+          clientMessageId,
+          blocks: [{ kind: "text", text: "post-finalize frame" }],
+        }),
+      });
+      const streamRow = (
+        await pool.query<{
+          projection_source: string;
+          terminal_status: string | null;
+          tape_id: string | null;
+          tape_sha256: string | null;
+        }>(
+          `SELECT projection_source,terminal_status,tape_id,tape_sha256
+             FROM client_session_live_streams
+            WHERE session_id=$1 AND user_id=$2`,
+          [sessionId, userId],
+        )
+      ).rows[0];
+      assert.ok(streamRow);
+      assert.equal(streamRow.projection_source, "tape");
+      assert.equal(streamRow.terminal_status, "interrupted");
+      assert.equal(streamRow.tape_id, tapeId);
+      assert.equal(streamRow.tape_sha256, tapeSha256);
+    } finally {
+      holder.release();
+    }
+  });
+
+  maybe("a frame writer waiting behind a finalize commit still mints a tape stream", async () => {
+    // The critical interleaving from the review: finalize holds the dispatch
+    // row, the PRODUCTION persistGatewayLiveFrame starts and blocks on its
+    // FOR UPDATE, finalize commits (tape now durable), then the writer acquires
+    // the lock and its tape-probe statement — a fresh READ COMMITTED snapshot
+    // — must observe the tape. A regression back to a single locked statement
+    // would keep the pre-wait snapshot, mint a live orphan, and fail here.
+    const sessionId = "s-live-frame-race-finalize-first";
+    const userId = "c:908";
+    const sessionKey = `agent:main:webchat:dm:${sessionId}`;
+    const clientMessageId = "cm-race-fin";
+    const dispatchId = randomUUID();
+    const tapeId = "4".repeat(64);
+    const tapeSha256 = "5".repeat(64);
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    await pool.query(
+      `INSERT INTO turn_dispatches
+         (dispatch_id,user_id,session_id,client_message_id,agent_id,request_hash,
+          billing_request_id,status,outcome,owner_id,lease_until)
+       VALUES ($1,908,$2,$3,'main',$4,$5,'terminal','interrupted','test-owner',NOW()+INTERVAL '1 minute')`,
+      [dispatchId, sessionId, clientMessageId, "9".repeat(64), `billing-${dispatchId}`],
+    );
+
+    const finalizer = await pool.connect();
+    let persistSettled = false;
+    try {
+      await finalizer.query("BEGIN");
+      await finalizer.query(
+        `INSERT INTO client_session_turn_tapes
+           (session_id,user_id,tape_id,agent_id,turn_index,status,turn_key,tape_sha256,
+            total_bytes,part_count,created_at,finalized_at,dispatch_id,attempt_no,client_message_id)
+         VALUES ($1,$2,$3,'main',1,'interrupted',$4,$5,10,1,1,1,$6::uuid,1,$7)`,
+        [sessionId, userId, tapeId, "6".repeat(64), tapeSha256, dispatchId, clientMessageId],
+      );
+      await finalizer.query(`SELECT 1 FROM turn_dispatches WHERE dispatch_id=$1::uuid FOR UPDATE`, [
+        dispatchId,
+      ]);
+
+      const persist = persistGatewayLiveFrame(pool, {
+        uid: 908n,
+        sessionId,
+        clientMessageId,
+        agentContainerId: 449,
+        sessionKey,
+        frameSeq: 1,
+        payload: JSON.stringify({
+          type: "outbound.message",
+          sessionKey,
+          frameSeq: 1,
+          peer: { id: sessionId, kind: "dm" },
+          clientMessageId,
+          blocks: [{ kind: "text", text: "frame during finalize" }],
+        }),
+      }).then(() => {
+        persistSettled = true;
+      });
+
+      let blockedLocks = 0;
+      for (let probe = 0; probe < 20 && blockedLocks === 0; probe += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        blockedLocks = Number(
+          (
+            await pool.query<{ count: string }>(
+              "SELECT COUNT(*)::text AS count FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND pid <> pg_backend_pid()",
+            )
+          ).rows[0]?.count ?? "0",
+        );
+      }
+      assert.ok(blockedLocks > 0, "production persist should be blocked on the dispatch row lock");
+      assert.equal(persistSettled, false);
+
+      await reconcileLiveStreamWithFinalTape(finalizer, {
+        dispatchId,
+        status: "interrupted",
+        tapeId,
+        tapeSha256,
+      });
+      await finalizer.query("COMMIT");
+      await persist;
+      assert.equal(persistSettled, true);
+
+      const streamRow = (
+        await pool.query<{
+          projection_source: string;
+          terminal_status: string | null;
+          tape_id: string | null;
+          tape_sha256: string | null;
+        }>(
+          `SELECT projection_source,terminal_status,tape_id,tape_sha256
+             FROM client_session_live_streams
+            WHERE session_id=$1 AND user_id=$2`,
+          [sessionId, userId],
+        )
+      ).rows[0];
+      assert.ok(streamRow);
+      assert.equal(streamRow.projection_source, "tape");
+      assert.equal(streamRow.terminal_status, "interrupted");
+      assert.equal(streamRow.tape_id, tapeId);
+      assert.equal(streamRow.tape_sha256, tapeSha256);
+    } finally {
+      finalizer.release();
+    }
+  });
+
+  maybe("convergeFinalizedTapeLiveStreams sweeps only finalized abnormal streams, idempotently", async () => {
+    const sessionId = "s-live-frame-converge";
+    const userId = "c:906";
+    const lateTapeDispatchId = randomUUID();
+    const lateTapeId = "d".repeat(64);
+    const backfilledDispatchId = randomUUID();
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    await pool.query(
+      `INSERT INTO turn_dispatches
+         (dispatch_id,user_id,session_id,client_message_id,agent_id,request_hash,
+          billing_request_id,status,outcome,owner_id,lease_until)
+       VALUES ($1,906,$2,'cm-converge-late','main',$3,$4,'terminal','interrupted','test-owner',NOW()+INTERVAL '1 minute'),
+              ($5,906,$2,'cm-converge-a','main',$6,$7,'terminal','interrupted','test-owner',NOW()+INTERVAL '1 minute')`,
+      [
+        lateTapeDispatchId,
+        sessionId,
+        "e".repeat(64),
+        `billing-${lateTapeDispatchId}`,
+        backfilledDispatchId,
+        "1".repeat(64),
+        `billing-${backfilledDispatchId}`,
+      ],
+    );
+    await pool.query(
+      `INSERT INTO client_session_turn_tapes
+         (session_id,user_id,tape_id,agent_id,turn_index,status,turn_key,tape_sha256,
+          total_bytes,part_count,created_at,finalized_at,dispatch_id,attempt_no,client_message_id)
+       VALUES ($1,$2,$3,'main',1,'interrupted',$4,$5,10,1,1,1,$6::uuid,1,'cm-converge-late'),
+              ($1,$2,$7,'main',2,'interrupted',$8,$9,10,1,1,1,$10::uuid,1,'cm-converge-a')`,
+      [
+        sessionId,
+        userId,
+        lateTapeId,
+        "f".repeat(64),
+        "0".repeat(64),
+        lateTapeDispatchId,
+        "a".repeat(64),
+        "2".repeat(64),
+        "3".repeat(64),
+        backfilledDispatchId,
+      ],
+    );
+    // conv-a: pre-fix shape — reconcile backfilled terminal_status+tape_id but
+    // the old CASE kept projection_source='live' (needs dispatch linkage).
+    // conv-e: tape_id-less orphan whose dispatch got its tape finalized later —
+    // the exact backlog shape the startup convergence must also repair.
+    await pool.query(
+      `INSERT INTO client_session_live_streams
+         (stream_key,session_id,user_id,source,projection_source,terminal_status,tape_id,
+          dispatch_id,attempt_no,import_sha256)
+       VALUES
+         ('conv-a',$1,$2,'gateway','live','interrupted',$3,$4::uuid,1,NULL),
+         ('conv-b',$1,$2,'gateway','live',NULL,NULL,NULL,NULL,NULL),
+         ('conv-c',$1,$2,'gateway','live','interrupted',NULL,NULL,NULL,NULL),
+         ('conv-d',$1,$2,'rollout_import','live','crashed',$5,NULL,NULL,$6),
+         ('conv-e',$1,$2,'gateway','live',NULL,NULL,$7::uuid,1,NULL)`,
+      [
+        sessionId,
+        userId,
+        "a".repeat(64),
+        backfilledDispatchId,
+        "b".repeat(64),
+        "c".repeat(64),
+        lateTapeDispatchId,
+      ],
+    );
+    const first = await convergeFinalizedTapeLiveStreams(pool);
+    assert.equal(first.converged, 2);
+    const states = new Map(
+      (
+        await pool.query<{
+          stream_key: string;
+          projection_source: string;
+          terminal_status: string | null;
+          tape_id: string | null;
+          tape_sha256: string | null;
+        }>(
+          `SELECT stream_key,projection_source,terminal_status,tape_id,tape_sha256
+             FROM client_session_live_streams
+            WHERE session_id=$1 AND user_id=$2`,
+          [sessionId, userId],
+        )
+      ).rows.map((row) => [row.stream_key, row]),
+    );
+    assert.equal(states.get("conv-a")?.projection_source, "tape");
+    assert.equal(states.get("conv-b")?.projection_source, "live");
+    assert.equal(states.get("conv-c")?.projection_source, "live");
+    assert.equal(states.get("conv-d")?.projection_source, "live");
+    assert.equal(states.get("conv-e")?.projection_source, "tape");
+    assert.equal(states.get("conv-e")?.terminal_status, "interrupted");
+    assert.equal(states.get("conv-e")?.tape_id, lateTapeId);
+    assert.equal(states.get("conv-e")?.tape_sha256, "0".repeat(64));
+    const second = await convergeFinalizedTapeLiveStreams(pool);
+    assert.equal(second.converged, 0);
   });
 
   maybe("keeps later dispatches and server-authored frames durable after a frame sequence restart", async () => {
