@@ -192,6 +192,14 @@ describe("oc-* CLI 语义卡 (Bash 特判)", () => {
     expect(toolSummary("Bash", { command: "oc-vision understand /home/agent/img.png --prompt 'x'" })).toBe("");
     expect(toolSummary("Bash", { command: "mmx image generate 'a cat' -o /out.png" })).toBe("");
   });
+  test("oc-task Bash 卡不落成通用终端", () => {
+    expect(detectOcCli("oc-task ticket get OCV5-1")).toBe("oc-task");
+    expect(resolveToolMeta("Bash", { command: "oc-task ticket get OCV5-1" }).label).toBe("任务单据");
+    expect(resolveToolMeta("mcp__openclaude-memory__task_create").label).toBe("创建任务单");
+    expect(resolveToolMeta("mcp__openclaude-memory__task_get").label).toBe("查看任务单");
+    expect(toolSummary("mcp__openclaude-memory__task_create", { title: "登录 500" })).toBe("登录 500");
+  });
+
   test("oc-browser / oc-market 根据动作提供友好标签和摘要", () => {
     expect(resolveToolMeta("Bash", { command: "oc-browser open https://example.com/a" }).label).toBe(
       "打开网页",

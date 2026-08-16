@@ -71,6 +71,7 @@ describe('schema / migrate', () => {
       'tb_pipeline',
       'tb_pipeline_stage',
       'tb_project',
+      'tb_settings',
       'tb_ticket',
       'tb_ticket_activity',
       'tb_ticket_comment',

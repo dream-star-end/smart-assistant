@@ -190,6 +190,22 @@ CREATE TABLE IF NOT EXISTS tb_ticket_activity (
 
 CREATE INDEX IF NOT EXISTS idx_tb_ticket_activity_ticket_created
   ON tb_ticket_activity(ticket_id, created_at);
+
+-- 全局护栏运行时配置。单行表(id 恒为 'global')。T3 曾旁路建在 http.ts,
+-- 现并进 V1:目前没有任何已部署的库,不必写 ALTER。
+CREATE TABLE IF NOT EXISTS tb_settings (
+  id TEXT PRIMARY KEY CHECK (id = 'global'),
+  max_concurrent_runs INTEGER NOT NULL,
+  max_runs_per_day INTEGER NOT NULL,
+  max_cost_per_day_usd REAL,
+  quiet_hours_start INTEGER NOT NULL,
+  quiet_hours_end INTEGER NOT NULL,
+  circuit_breaker_threshold INTEGER NOT NULL,
+  max_stage_loops INTEGER NOT NULL,
+  max_runs_per_tick INTEGER NOT NULL,
+  patrol_paused INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL
+);
 `
 
 // ── 可辨识错误(供 HTTP 层映射 409 / 404 / 403 / 422)────────────────────────

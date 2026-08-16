@@ -49,6 +49,13 @@ import {
 import { addRelation, listRelations, removeRelation } from './db/relations.js'
 import { acquireLease, getActiveLease, getRun, insertRun, listRuns, updateRun } from './db/runs.js'
 import { seedDefaultPipelines } from './db/seed.js'
+import {
+  type TaskboardSettings,
+  type TaskboardUsage,
+  getSettings,
+  getUsage,
+  updateSettings,
+} from './db/settings.js'
 import { createTicket, getTicketByIdOrIdentifier, listTickets, updateTicket } from './db/tickets.js'
 import {
   type Actor,
@@ -75,7 +82,10 @@ import {
   type TicketType,
   buildPatrolSessionKey,
 } from './domain.js'
+import { getSharedPatrolSlots } from './guardrails.js'
 import { TaskboardTransitionDenied, assertTransition } from './stateMachine.js'
+
+export type { TaskboardSettings, TaskboardUsage }
 
 // ── 常量 ────────────────────────────────────────────────────────────────────
 
@@ -202,177 +212,7 @@ function actorIdOf(actor: Actor, owner?: string | null): string {
   return envId ? `agent:${envId}` : 'agent:unknown'
 }
 
-// ── settings 表(本文件自建,不改 db/schema.ts)────────────────────────────────
-
-/**
- * 全局护栏运行时配置。DDL 放在 HTTP 层用 CREATE TABLE IF NOT EXISTS 初始化,
- * 不改 db/schema.ts(那是别人的文件)。建议后续并进 schema.ts v2,理由见最终回复。
- */
-export const TASKBOARD_SETTINGS_DDL = `
-CREATE TABLE IF NOT EXISTS tb_settings (
-  id TEXT PRIMARY KEY CHECK (id = 'global'),
-  max_concurrent_runs INTEGER NOT NULL,
-  max_runs_per_day INTEGER NOT NULL,
-  max_cost_per_day_usd REAL,
-  quiet_hours_start INTEGER NOT NULL,
-  quiet_hours_end INTEGER NOT NULL,
-  circuit_breaker_threshold INTEGER NOT NULL,
-  max_stage_loops INTEGER NOT NULL,
-  max_runs_per_tick INTEGER NOT NULL,
-  patrol_paused INTEGER NOT NULL DEFAULT 0,
-  updated_at INTEGER NOT NULL
-);
-`
-
-export interface TaskboardSettings {
-  maxConcurrentRuns: number
-  maxRunsPerDay: number
-  maxCostPerDayUsd: number | null
-  quietHoursStart: number
-  quietHoursEnd: number
-  circuitBreakerThreshold: number
-  maxStageLoops: number
-  maxRunsPerTick: number
-  patrolPaused: boolean
-}
-
-export interface TaskboardUsage {
-  runsToday: number
-  costTodayUsd: number
-  activeRuns: number
-}
-
-interface SettingsRow {
-  max_concurrent_runs: number
-  max_runs_per_day: number
-  max_cost_per_day_usd: number | null
-  quiet_hours_start: number
-  quiet_hours_end: number
-  circuit_breaker_threshold: number
-  max_stage_loops: number
-  max_runs_per_tick: number
-  patrol_paused: number
-}
-
-function defaultSettings(): TaskboardSettings {
-  return {
-    maxConcurrentRuns: GUARDRAIL_DEFAULTS.maxConcurrentRuns,
-    maxRunsPerDay: GUARDRAIL_DEFAULTS.maxRunsPerDay,
-    maxCostPerDayUsd: GUARDRAIL_DEFAULTS.maxCostPerDayUsd,
-    quietHoursStart: GUARDRAIL_DEFAULTS.quietHoursStart,
-    quietHoursEnd: GUARDRAIL_DEFAULTS.quietHoursEnd,
-    circuitBreakerThreshold: GUARDRAIL_DEFAULTS.circuitBreakerThreshold,
-    maxStageLoops: GUARDRAIL_DEFAULTS.maxStageLoops,
-    maxRunsPerTick: GUARDRAIL_DEFAULTS.maxRunsPerTick,
-    patrolPaused: false,
-  }
-}
-
-export function ensureSettingsTable(db: TaskboardDb): void {
-  db.exec(TASKBOARD_SETTINGS_DDL)
-  const existing = db.prepare('SELECT id FROM tb_settings WHERE id = ?').get('global') as
-    | { id: string }
-    | undefined
-  if (existing) return
-  const d = defaultSettings()
-  db.prepare(
-    `INSERT INTO tb_settings (
-       id, max_concurrent_runs, max_runs_per_day, max_cost_per_day_usd,
-       quiet_hours_start, quiet_hours_end, circuit_breaker_threshold,
-       max_stage_loops, max_runs_per_tick, patrol_paused, updated_at
-     ) VALUES (
-       'global', @maxConcurrentRuns, @maxRunsPerDay, @maxCostPerDayUsd,
-       @quietHoursStart, @quietHoursEnd, @circuitBreakerThreshold,
-       @maxStageLoops, @maxRunsPerTick, @patrolPaused, @now
-     )`,
-  ).run({
-    ...d,
-    patrolPaused: d.patrolPaused ? 1 : 0,
-    now: Date.now(),
-  })
-}
-
-function readSettings(db: TaskboardDb): TaskboardSettings {
-  ensureSettingsTable(db)
-  const row = db.prepare('SELECT * FROM tb_settings WHERE id = ?').get('global') as SettingsRow
-  return {
-    maxConcurrentRuns: row.max_concurrent_runs,
-    maxRunsPerDay: row.max_runs_per_day,
-    maxCostPerDayUsd: row.max_cost_per_day_usd,
-    quietHoursStart: row.quiet_hours_start,
-    quietHoursEnd: row.quiet_hours_end,
-    circuitBreakerThreshold: row.circuit_breaker_threshold,
-    maxStageLoops: row.max_stage_loops,
-    maxRunsPerTick: row.max_runs_per_tick,
-    patrolPaused: row.patrol_paused === 1,
-  }
-}
-
-function writeSettings(db: TaskboardDb, patch: Partial<TaskboardSettings>): TaskboardSettings {
-  const cur = readSettings(db)
-  const next: TaskboardSettings = {
-    maxConcurrentRuns: patch.maxConcurrentRuns ?? cur.maxConcurrentRuns,
-    maxRunsPerDay: patch.maxRunsPerDay ?? cur.maxRunsPerDay,
-    maxCostPerDayUsd:
-      patch.maxCostPerDayUsd === undefined ? cur.maxCostPerDayUsd : patch.maxCostPerDayUsd,
-    quietHoursStart: patch.quietHoursStart ?? cur.quietHoursStart,
-    quietHoursEnd: patch.quietHoursEnd ?? cur.quietHoursEnd,
-    circuitBreakerThreshold: patch.circuitBreakerThreshold ?? cur.circuitBreakerThreshold,
-    maxStageLoops: patch.maxStageLoops ?? cur.maxStageLoops,
-    maxRunsPerTick: patch.maxRunsPerTick ?? cur.maxRunsPerTick,
-    patrolPaused: patch.patrolPaused ?? cur.patrolPaused,
-  }
-  db.prepare(
-    `UPDATE tb_settings SET
-       max_concurrent_runs = @maxConcurrentRuns,
-       max_runs_per_day = @maxRunsPerDay,
-       max_cost_per_day_usd = @maxCostPerDayUsd,
-       quiet_hours_start = @quietHoursStart,
-       quiet_hours_end = @quietHoursEnd,
-       circuit_breaker_threshold = @circuitBreakerThreshold,
-       max_stage_loops = @maxStageLoops,
-       max_runs_per_tick = @maxRunsPerTick,
-       patrol_paused = @patrolPaused,
-       updated_at = @now
-     WHERE id = 'global'`,
-  ).run({
-    ...next,
-    patrolPaused: next.patrolPaused ? 1 : 0,
-    now: Date.now(),
-  })
-  return next
-}
-
-function startOfLocalDayMs(now = Date.now()): number {
-  const d = new Date(now)
-  d.setHours(0, 0, 0, 0)
-  return d.getTime()
-}
-
-function readUsage(db: TaskboardDb, now = Date.now()): TaskboardUsage {
-  const start = startOfLocalDayMs(now)
-  const today = db
-    .prepare(
-      `SELECT COUNT(*) AS n, COALESCE(SUM(cost_usd), 0) AS cost
-         FROM tb_ticket_run WHERE created_at >= ?`,
-    )
-    .get(start) as { n: number; cost: number }
-  const active = db
-    .prepare(
-      `SELECT COUNT(*) AS n FROM tb_ticket_run
-        WHERE status IN ('queued', 'running')
-          AND lease_expires_at IS NOT NULL
-          AND lease_expires_at > ?`,
-    )
-    .get(now) as { n: number }
-  return {
-    runsToday: today.n,
-    costTodayUsd: today.cost,
-    activeRuns: active.n,
-  }
-}
-
-// ── T4 接手点:手动巡检后台执行 ──────────────────────────────────────────────
+// ── T4:手动巡检后台执行(由 patrol.ts 的引擎接手)────────────────────────────
 
 export interface PatrolExecutionJob {
   ticketId: string
@@ -388,21 +228,16 @@ export type PatrolExecutionHandler = (job: PatrolExecutionJob) => void
 let _patrolHandler: PatrolExecutionHandler | null = null
 
 /**
- * T4 注册真正的 delegate 执行。M1 默认空转,run 保持 running,前端靠轮询终态。
- *
- * T4 接手:`packages/gateway/src/taskboard/http.ts` 的
- * `enqueuePatrolExecution` / `setPatrolExecutionHandler`。
+ * 注册真正的 delegate 执行。生产由 server.ts 接到 PatrolEngine.executeJob;
+ * 测试可注入 mock。未注册时 enqueue 空转,run 保持 running,前端靠轮询终态。
  */
 export function setPatrolExecutionHandler(handler: PatrolExecutionHandler | null): void {
   _patrolHandler = handler
 }
 
 /**
- * 把一次已 claim 的手动巡检丢进后台。M1 是 TODO(T4) 桩:只调度 handler,
- * 不调 `_runDelegateTask`。
- *
- * TODO(T4): 在 handler 里同进程直调 Gateway._runDelegateTask,写回 run 终态,
- * 再按 stage.onSuccess 走 stateMachine。
+ * 把一次已 claim 的手动巡检丢进后台。handler 由 PatrolEngine.executeJob 提供,
+ * 同进程直调 delegate,不打 HTTP。
  */
 export function enqueuePatrolExecution(job: PatrolExecutionJob): void {
   const handler = _patrolHandler
@@ -702,7 +537,7 @@ export async function handleTaskboardApi(
     sendError(res, 503, 'taskboard not initialized')
     return true
   }
-  ensureSettingsTable(db)
+  getSettings(db)
 
   const actor = resolveActor(req, ctx)
   const method = (req.method ?? 'GET').toUpperCase()
@@ -1634,7 +1469,7 @@ function handlePatrol(
   if (ticket.version !== expectedVersion) {
     throw new TaskboardVersionConflict(ticket.id, expectedVersion, ticket.version)
   }
-  const settings = readSettings(db)
+  const settings = getSettings(db)
   if (settings.patrolPaused) {
     throw new TaskboardValidationError('patrol is paused')
   }
@@ -1644,8 +1479,13 @@ function handlePatrol(
   if (!stage) throw new TaskboardNotFound('stage', stageRef)
   if (stage.kind !== 'ai') throw new TaskboardValidationError('stage is not an ai stage')
 
-  const usage = readUsage(db)
-  if (usage.activeRuns >= settings.maxConcurrentRuns) {
+  const usage = getUsage(db)
+  const slots = getSharedPatrolSlots()
+  slots.setLimit(settings.maxConcurrentRuns)
+  if (
+    usage.activeRuns >= settings.maxConcurrentRuns ||
+    slots.getActive() >= settings.maxConcurrentRuns
+  ) {
     insertRun(db, {
       ticketId: ticket.id,
       stageId: stage.id,
@@ -1697,7 +1537,6 @@ function handlePatrol(
     return { run: withKey, ticket: updated }
   })()
 
-  // TODO(T4): enqueuePatrolExecution 是后台执行接口点,T4 在此接 delegate。
   enqueuePatrolExecution({
     ticketId: result.ticket.id,
     runId: result.run.id,
@@ -1924,7 +1763,7 @@ async function handleListAgents(res: ServerResponse, ctx: TaskboardHttpContext):
 }
 
 function handleGetSettings(res: ServerResponse, db: TaskboardDb): void {
-  sendJson(res, 200, { ...readSettings(db), usage: readUsage(db) })
+  sendJson(res, 200, { ...getSettings(db), usage: getUsage(db) })
 }
 
 function handlePatchSettings(
@@ -1951,6 +1790,6 @@ function handlePatchSettings(
   if (typeof body.maxStageLoops === 'number') patch.maxStageLoops = body.maxStageLoops
   if (typeof body.maxRunsPerTick === 'number') patch.maxRunsPerTick = body.maxRunsPerTick
   if (typeof body.patrolPaused === 'boolean') patch.patrolPaused = body.patrolPaused
-  const settings = writeSettings(db, patch)
-  sendJson(res, 200, { ok: true, ...settings, usage: readUsage(db) })
+  const settings = updateSettings(db, patch)
+  sendJson(res, 200, { ok: true, ...settings, usage: getUsage(db) })
 }

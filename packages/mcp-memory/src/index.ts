@@ -10,7 +10,7 @@
  *   • `skill_view`     — load a skill's full instructions (tier-2/3)
  *   • `skill_save`     — distill a successful task into a reusable skill
  *   • `skill_delete`
- *   • reminder / delegate tools (see TOOLS below)
+ *   • reminder / delegate / taskboard tools (see TOOLS below)
  *
  * NOTE: the recall/archival tools (`session_search`, `archival_add`,
  * `archival_search`, `archival_delete`) used to live here too. They were moved
@@ -59,6 +59,13 @@ import { filterSkillEvalTools, isSkillEvalBlockedTool } from './skillEvalToolPol
 // Tool 定义(TOOLS / SKILL_PROPOSE_TOOL)抽到 ./toolDefs.ts(纯数据模块,无副作用),
 // 让「TOOLS ↔ toolNames.ts」锁步单测能直接 import 校验,而不触发本入口模块顶层的
 // server.connect(见 toolDefs.ts / __tests__/toolNames.test.ts)。
+import {
+  handleTaskComment,
+  handleTaskCreate,
+  handleTaskGet,
+  handleTaskList,
+  handleTaskUpdate,
+} from './taskboardMcp.js'
 import { SKILL_PROPOSE_TOOL, TOOLS } from './toolDefs.js'
 
 const AGENT_ID = process.env.OPENCLAUDE_AGENT_ID ?? 'main'
@@ -226,6 +233,16 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         return await handleDelegateTasks(args as any)
       case 'request_review':
         return await handleRequestReview(args as any)
+      case 'task_create':
+        return await handleTaskCreate(args as any)
+      case 'task_update':
+        return await handleTaskUpdate(args as any)
+      case 'task_comment':
+        return await handleTaskComment(args as any)
+      case 'task_list':
+        return await handleTaskList(args as any)
+      case 'task_get':
+        return await handleTaskGet(args as any)
       default:
         return { content: [{ type: 'text', text: `unknown tool: ${name}` }], isError: true }
     }

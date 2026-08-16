@@ -350,12 +350,16 @@ const PIPELINES: PipelineSeed[] = [
   },
 ]
 
+// 分隔符用 `.` 而不是 `::`:stageId 会被拼进巡检 sessionKey
+// (`agent:<agentId>:taskboard:<ticketId>:<stageId>:<runId>`),而现网多处按冒号切段
+// 解析 sessionKey。id 里带冒号会让段数漂移、解析静默错位,也让日志难读。
+// 这两个 id 从不被反向解析,只要确定性且唯一即可。
 export function pipelineSeedId(projectId: string, type: TicketType): string {
-  return `${projectId}::pipeline::${type}`
+  return `${projectId}.pipeline.${type}`
 }
 
 export function stageSeedId(projectId: string, type: TicketType, ordinal: number): string {
-  return `${projectId}::stage::${type}::${ordinal}`
+  return `${projectId}.stage.${type}.${ordinal}`
 }
 
 export interface SeedResult {
