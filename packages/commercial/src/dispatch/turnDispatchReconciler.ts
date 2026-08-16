@@ -21,6 +21,7 @@ import { safeEnqueueAlert } from '../admin/alertOutbox.js'
 import { isPermanentCodexWaiver, permanentCodexWaiverReason } from '../billing/codexFinalizer.js'
 import {
   GATEWAY_EXITED_AT_CTX_KEY,
+  clearGatewayShutdownEvidenceByRequestIds,
   markGatewayShutdownEvidence,
 } from '../billing/finalizeJournalReconciler.js'
 import { advanceClientTimelineIdentityInTransaction } from '../db/pgSessionsBackend.js'
@@ -151,7 +152,7 @@ export async function abortNeverExecutedJournalForDispatch(
   const res = await client.query<{ user_id: string; request_id: string }>(
     `UPDATE request_finalize_journal
         SET state='aborted', error_msg=$2, failure_code='INTERNAL_ERROR',
-            final_credits=0, ctx=ctx - 'settlementClaimId', updated_at=NOW()
+            final_credits=0, ctx=ctx - 'settlementClaimId' - 'gatewayExitedAt' - 'gatewayExitReason', updated_at=NOW()
       WHERE dispatch_id=$1 AND state='inflight'
         AND NOT EXISTS (SELECT 1 FROM usage_records ur WHERE ur.dispatch_id=$1)
       RETURNING user_id, request_id`,
@@ -224,11 +225,6 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
   const stuckMs = deps.stuckThresholdMs ?? DEFAULT_ACCEPTED_STUCK_FLOOR_MS
   const assess = deps.assessBilling ?? assessDispatchBilling
   const enqueue = deps.enqueueAlert ?? safeEnqueueAlert
-  const carrierDeadIds = new Set(
-    deps.listCarrierDeadDispatchIds
-      ? await deps.listCarrierDeadDispatchIds()
-      : await loadDispatchIdsWithGatewayExit(deps.pool),
-  )
   const counts: ReconcileTickCounts = {
     rejectedTerminal: 0,
     accepted: 0,
@@ -261,15 +257,18 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
       resolution: 'auto_closed:session_deleted',
       now: now(),
     })
+    await clearExitMark(deps, row)
     counts.sessionGoneClosed++
   }
 
   // ── ① admitted ∧ 租约过期 ∧ age>rejectMinAge ─────────────────────────────
   // 租约过期本身就是「owner 进程不再续租」的证据;5min age 门只挡无证据的幼龄行。
   const admitted = await scanAdmittedLeaseExpired(deps.pool, { minAgeMs: 0, limit, now: now() })
+  const youngAdmitted = admitted.filter((row) => now() - row.admittedAt.getTime() < rejectMinAge)
+  const admittedDeadIds = new Set(await resolveCarrierDeadDispatchIds(deps, youngAdmitted))
   for (const row of admitted) {
     const admittedAge = now() - row.admittedAt.getTime()
-    if (admittedAge < rejectMinAge && !carrierDeadIds.has(row.dispatchId)) continue
+    if (admittedAge < rejectMinAge && !admittedDeadIds.has(row.dispatchId)) continue
     const rejecting = await casAdmittedToRejecting(deps.pool, {
       dispatchId: row.dispatchId,
       expectedEpoch: row.leaseEpoch,
@@ -308,6 +307,10 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
     limit,
     now: now(),
   })
+  const youngAccepted = stuck.filter(
+    (row) => now() - (row.acceptedAt ?? row.admittedAt).getTime() < stuckMs,
+  )
+  const acceptedDeadIds = new Set(await resolveCarrierDeadDispatchIds(deps, youngAccepted))
   for (const row of stuck) {
     const age = now() - (row.acceptedAt ?? row.admittedAt).getTime()
     const res = await deps.container.getDispatchState(idOf(row))
@@ -354,6 +357,7 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
       if (terminal) {
         counts.visibleFailures++
         counts.notified++
+        await clearExitMark(deps, row)
         try {
           deps.nudgeClient?.(row.userId, row.sessionId, row.clientMessageId)
         } catch { /* status is durable; live nudge is best-effort */ }
@@ -361,7 +365,7 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
       continue
     }
     // 无进程死亡证据时保持 90min 门(防误杀活流);有标记则容器已给出 rejected/absent 即可收敛。
-    if (age < stuckMs && !carrierDeadIds.has(row.dispatchId)) continue
+    if (age < stuckMs && !acceptedDeadIds.has(row.dispatchId)) continue
     if (res.state === 'rejected') {
       // 容器把这条 accepted 的 inbox 行终态化为 rejected tombstone(如 boot recovery:
       // queued/running 被拒)。这是**显式** durable negative proof(I2 允许),→ CAS
@@ -374,7 +378,10 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
         fromStatuses: ['accepted'],
         now: now(),
       })
-      if (terminal) counts.rejectedTerminal++
+      if (terminal) {
+        counts.rejectedTerminal++
+        await clearExitMark(deps, row)
+      }
     } else if (res.state === 'sink_stage_failed' || res.state === 'absent') {
       const held = await casToManualReconcile(deps.pool, {
         dispatchId: row.dispatchId,
@@ -385,6 +392,7 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
         counts.manualReconcile++
         alertManual(enqueue, row, `container inbox state=${res.state} for an accepted dispatch`)
         counts.alerts++
+        await clearExitMark(deps, row)
       }
     } else if (res.state === 'sink_staged' || res.state === 'terminal') {
       // 等 sink ACK(无 TTL 必达);过久告警但不动状态。
@@ -533,11 +541,13 @@ function finalizeSettlePost(
     counts.manualReconcile++
     alertManual(enqueue, row, post.reason)
     counts.alerts++
+    void clearExitMark(deps, row)
     return
   }
   if (post.notified) {
     counts.visibleFailures++
     counts.notified++
+    void clearExitMark(deps, row)
   }
   // 状态已持久 → 用户在线则推一条轻量 nudge 触发前端 reconcile。
   if (post.notified) {
@@ -600,7 +610,10 @@ async function resolveRejecting(
       fromStatuses: ['rejecting'],
       now: nowMs,
     })
-    if (terminal) counts.rejectedTerminal++
+    if (terminal) {
+      counts.rejectedTerminal++
+      await clearExitMark(deps, row)
+    }
   } else if (res.state === 'absent') {
     // reject-if-absent 契约下不该回 absent(无行必插 tombstone);保守当错误重试。
   } else {
@@ -659,18 +672,54 @@ function alertWarn(
 }
 
 
-async function loadDispatchIdsWithGatewayExit(pool: Pool): Promise<string[]> {
+async function resolveCarrierDeadDispatchIds(
+  deps: TurnDispatchReconcilerDeps,
+  rows: Array<{ dispatchId: string; billingRequestId: string }>,
+): Promise<string[]> {
+  if (deps.listCarrierDeadDispatchIds) return deps.listCarrierDeadDispatchIds()
+  return loadGatewayExitDispatchIds(deps.pool, rows)
+}
+
+/**
+ * 从小集合反查停机标记:候选 dispatch 的 billing_request_id 走 journal PK,
+ * 空候选不发查询。禁止扫 request_finalize_journal 全表。
+ */
+export async function loadGatewayExitDispatchIds(
+  pool: Pool,
+  rows: Array<{ dispatchId: string; billingRequestId: string }>,
+): Promise<string[]> {
+  const billingIds = [...new Set(rows.map((r) => r.billingRequestId).filter((id) => id.length > 0))]
+  if (billingIds.length === 0) return []
   try {
-    const res = await pool.query<{ dispatch_id: string }>(
-      `SELECT DISTINCT dispatch_id::text AS dispatch_id
+    const res = await pool.query<{ request_id: string }>(
+      `SELECT request_id
          FROM request_finalize_journal
-        WHERE dispatch_id IS NOT NULL
-          AND COALESCE(ctx->>$1, '') <> ''`,
-      [GATEWAY_EXITED_AT_CTX_KEY],
+        WHERE request_id = ANY($1::text[])
+          AND COALESCE(ctx->>$2, '') <> ''`,
+      [billingIds, GATEWAY_EXITED_AT_CTX_KEY],
     )
-    return res.rows.map((r) => r.dispatch_id)
+    const marked = new Set(res.rows.map((r) => r.request_id))
+    return rows.filter((r) => marked.has(r.billingRequestId)).map((r) => r.dispatchId)
   } catch {
     return []
+  }
+}
+
+async function clearExitMark(
+  deps: TurnDispatchReconcilerDeps,
+  row: { billingRequestId: string },
+): Promise<void> {
+  if (!row.billingRequestId) return
+  try {
+    await clearGatewayShutdownEvidenceByRequestIds(
+      [row.billingRequestId],
+      async (sql, params) => {
+        const res = await deps.pool.query(sql, params ?? [])
+        return { rows: res.rows as Array<{ request_id: string }>, rowCount: res.rowCount }
+      },
+    )
+  } catch {
+    /* 终态已落,清标记失败下轮 PK 点更新可重试 */
   }
 }
 

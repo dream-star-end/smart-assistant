@@ -145,6 +145,31 @@ export async function markGatewayShutdownEvidence(
 }
 
 /**
+ * 终态时摘掉停机标记(PK 点更新)。dispatch/journal 任一侧翻终态都清,
+ * 避免标记随部署单调堆积,也避免陈年标记让老行永远走快路径。
+ */
+export async function clearGatewayShutdownEvidenceByRequestIds(
+  requestIds: string[],
+  exec?: JournalExec,
+): Promise<number> {
+  const ids = [...new Set(requestIds.filter((id) => id.length > 0))]
+  if (ids.length === 0) return 0
+  const run = exec ?? (async (sql, params) => {
+    const res = await query<{ request_id: string }>(sql, params ?? [])
+    return { rows: res.rows, rowCount: res.rowCount }
+  })
+  const res = await run(
+    `UPDATE request_finalize_journal
+        SET ctx = ctx - $2::text - $3::text
+      WHERE request_id = ANY($1::text[])
+        AND (ctx ? $2 OR ctx ? $3)
+      RETURNING request_id`,
+    [ids, GATEWAY_EXITED_AT_CTX_KEY, GATEWAY_EXIT_REASON_CTX_KEY],
+  )
+  return res.rowCount ?? res.rows.length
+}
+
+/**
  * 解析 stuck 阈值:env 覆盖只允许**向上**(更保守);floor = max(codexMax*3, 30min)。
  * codexMax 非法/缺省 → 600s。
  */
@@ -311,7 +336,7 @@ export async function reconcileStuckFinalizeJournal(
             ledger_id = ur.ledger_id,
             final_credits = ur.cost_credits,
             failure_code = NULL,
-            ctx = rfj.ctx - 'settlementClaimId',
+            ctx = rfj.ctx - 'settlementClaimId' - 'gatewayExitedAt' - 'gatewayExitReason',
             updated_at = NOW()
        FROM usage_records ur
       WHERE rfj.request_id = ur.request_id
@@ -336,7 +361,7 @@ export async function reconcileStuckFinalizeJournal(
             error_msg = 'reconciler_timeout',
             final_credits = 0,
             failure_code = 'INTERNAL_ERROR',
-            ctx = rfj.ctx - 'settlementClaimId',
+            ctx = rfj.ctx - 'settlementClaimId' - 'gatewayExitedAt' - 'gatewayExitReason',
             updated_at = NOW()
       WHERE rfj.state IN ('inflight', 'finalizing')
         AND COALESCE(rfj.ctx->>'durableBillingRecovery', '') <> $2
@@ -384,7 +409,7 @@ export async function reconcileStuckFinalizeJournal(
             error_msg = $3,
             final_credits = 0,
             failure_code = 'INTERNAL_ERROR',
-            ctx = rfj.ctx - 'settlementClaimId',
+            ctx = rfj.ctx - 'settlementClaimId' - 'gatewayExitedAt' - 'gatewayExitReason',
             updated_at = NOW()
       WHERE rfj.state = 'inflight'
         AND rfj.updated_at < NOW() - ($1::bigint * INTERVAL '1 millisecond')

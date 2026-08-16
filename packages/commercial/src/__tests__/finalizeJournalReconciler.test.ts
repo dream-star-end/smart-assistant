@@ -15,6 +15,7 @@ import {
   GATEWAY_EXITED_AT_CTX_KEY,
   journalHasGatewayExitMark,
   markGatewayShutdownEvidence,
+  clearGatewayShutdownEvidenceByRequestIds,
   MAX_DURABLE_FINALIZING_ALERT_AGE_MS,
   MAX_DURABLE_WAIVER_AGE_MS,
   MAX_STUCK_THRESHOLD_MS,
@@ -334,5 +335,35 @@ describe('gateway shutdown evidence', () => {
     assert.equal(params[0], GATEWAY_EXITED_AT_CTX_KEY)
     assert.equal(params[1], '2026-08-16T10:23:58.000Z')
     assert.equal(params[3], 'process_shutdown')
+  })
+})
+
+describe('clearGatewayShutdownEvidenceByRequestIds', () => {
+  test('空列表不发查询', async () => {
+    let calls = 0
+    const n = await clearGatewayShutdownEvidenceByRequestIds([], async () => {
+      calls++
+      return { rows: [], rowCount: 0 }
+    })
+    assert.equal(n, 0)
+    assert.equal(calls, 0)
+  })
+
+  test('按 request_id PK 点更新并摘掉两个 key', async () => {
+    let sql = ''
+    let params: unknown[] = []
+    const n = await clearGatewayShutdownEvidenceByRequestIds(
+      ['req-1', 'req-1', ''],
+      async (q, p) => {
+        sql = q
+        params = p ?? []
+        return { rows: [{ request_id: 'req-1' }], rowCount: 1 }
+      },
+    )
+    assert.equal(n, 1)
+    assert.match(sql, /request_id = ANY\(\$1::text\[\]\)/)
+    assert.match(sql, /ctx = ctx - \$2::text - \$3::text/)
+    assert.deepEqual(params[0], ['req-1'])
+    assert.equal(params[1], GATEWAY_EXITED_AT_CTX_KEY)
   })
 })

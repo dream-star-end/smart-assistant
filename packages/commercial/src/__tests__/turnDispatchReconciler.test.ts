@@ -16,6 +16,7 @@ import {
   resolveDispatchStuckThresholdMs,
   runReconcileTick,
   runShutdownDispatchHandoff,
+  loadGatewayExitDispatchIds,
 } from '../dispatch/turnDispatchReconciler.js'
 import { PERMANENT_CODEX_WAIVER_PREFIX } from '../billing/codexFinalizer.js'
 import type { ContainerCallResult } from '../dispatch/containerDispatchClient.js'
@@ -668,5 +669,41 @@ describe('runShutdownDispatchHandoff', () => {
     assert.equal(n, 4)
     assert.match(writes[0]!, /status = 'admitted'/)
     assert.match(writes[0]!, /lease_until > \$1/)
+  })
+})
+
+describe('loadGatewayExitDispatchIds — PK 反查,禁止全表扫', () => {
+  test('空候选不发查询', async () => {
+    let calls = 0
+    const pool = {
+      async query() {
+        calls++
+        return { rows: [], rowCount: 0 }
+      },
+    }
+    const ids = await loadGatewayExitDispatchIds(pool as unknown as Pool, [])
+    assert.deepEqual(ids, [])
+    assert.equal(calls, 0)
+  })
+
+  test('按 billing_request_id 走 journal PK(request_id = ANY),再映射回 dispatchId', async () => {
+    const sqls: string[] = []
+    const params: unknown[][] = []
+    const pool = {
+      async query(sql: string, p?: unknown[]) {
+        sqls.push(sql.replace(/\s+/g, ' '))
+        params.push(p ?? [])
+        return { rows: [{ request_id: 'br-marked' }], rowCount: 1 }
+      },
+    }
+    const ids = await loadGatewayExitDispatchIds(pool as unknown as Pool, [
+      { dispatchId: 'd-keep', billingRequestId: 'br-marked' },
+      { dispatchId: 'd-skip', billingRequestId: 'br-clean' },
+    ])
+    assert.deepEqual(ids, ['d-keep'])
+    assert.match(sqls[0]!, /request_id = ANY\(\$1::text\[\]\)/)
+    assert.match(sqls[0]!, /FROM request_finalize_journal/)
+    assert.ok(!sqls[0]!.includes('dispatch_id IS NOT NULL'), '不得再扫 journal.dispatch_id 全表')
+    assert.deepEqual(params[0]![0], ['br-marked', 'br-clean'])
   })
 })
