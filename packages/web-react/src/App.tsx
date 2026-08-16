@@ -2419,6 +2419,8 @@ export function App() {
                 turnActivity={turnActivity}
                 transientNotice={transientNotice}
                 historyLoading={historyLoading}
+                journalDegraded={activeSess?._liveJournalDegraded === true}
+                onRetryJournal={activeId ? () => { void chat.retryLiveJournalHydration(activeId); } : undefined}
                 archive={messageListArchive}
                 cb={cardCallbacks}
                 onRespondPermission={onRespondPermission}

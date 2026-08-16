@@ -109,3 +109,23 @@ export function PartialHistorySkeleton() {
     </output>
   );
 }
+
+/** Journal hydrate hit a page/time cap. Do not cover history; offer retry. */
+export function JournalHydrationRetry({ onRetry }: { onRetry: () => void }) {
+  return (
+    <output
+      className="flex items-center justify-between gap-3 py-2 text-muted"
+      aria-label="实时内容未完全加载"
+      data-testid="journal-hydration-retry"
+    >
+      <span className="min-w-0 text-xs">实时内容未完全加载，已显示已有记录。</span>
+      <button
+        type="button"
+        className="shrink-0 text-xs text-foreground underline-offset-2 hover:underline"
+        onClick={onRetry}
+      >
+        重新加载
+      </button>
+    </output>
+  );
+}

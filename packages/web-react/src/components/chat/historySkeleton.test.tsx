@@ -1,7 +1,8 @@
 import "@testing-library/jest-dom/vitest";
 import { cleanup, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import {
+  JournalHydrationRetry,
   MessageListSkeleton,
   PartialHistorySkeleton,
   shouldShowHistorySkeleton,
@@ -90,5 +91,15 @@ describe("PartialHistorySkeleton", () => {
     expect(status).toHaveAttribute("aria-live", "polite");
     expect(status).toHaveAttribute("aria-busy", "true");
     expect(screen.getByText("正在加载会话内容…")).toBeInTheDocument();
+  });
+});
+
+describe("JournalHydrationRetry", () => {
+  test("renders an explicit retry without covering history", () => {
+    const onRetry = vi.fn();
+    render(<JournalHydrationRetry onRetry={onRetry} />);
+    expect(screen.getByLabelText("实时内容未完全加载")).toBeInTheDocument();
+    screen.getByRole("button", { name: "重新加载" }).click();
+    expect(onRetry).toHaveBeenCalledTimes(1);
   });
 });
