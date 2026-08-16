@@ -137,13 +137,13 @@ export function ModelSelector({
       <DropdownMenuContent
         align="start"
         data-product-feature={PRODUCT_CAPABILITIES.models.id}
-        className="min-w-[15rem]"
+        className="flex max-h-[80vh] min-w-[15rem] flex-col"
       >
-        <DropdownMenuLabel>对话模型</DropdownMenuLabel>
+        <DropdownMenuLabel className="shrink-0">对话模型</DropdownMenuLabel>
         {teamEngineActive && (
           <div
             role="note"
-            className="mx-1 mb-1 rounded-md bg-accent-soft px-2.5 py-2 text-xs leading-relaxed"
+            className="mx-1 mb-1 shrink-0 rounded-md bg-accent-soft px-2.5 py-2 text-xs leading-relaxed"
           >
             <span className="flex items-center gap-1.5 font-medium text-accent">
               <Users size={12} className="shrink-0" /> 团队模式 · 队长引擎{" "}
@@ -158,7 +158,7 @@ export function ModelSelector({
         {selectedDegraded && !teamEngineActive && (
           <div
             role="note"
-            className="mx-1 mb-1 rounded-md bg-danger-soft px-2.5 py-2 text-xs leading-relaxed"
+            className="mx-1 mb-1 shrink-0 rounded-md bg-danger-soft px-2.5 py-2 text-xs leading-relaxed"
           >
             <span className="flex items-center gap-1.5 font-medium text-danger">
               <AlertTriangle size={12} className="shrink-0" /> 当前模型暂不可用
@@ -170,6 +170,9 @@ export function ModelSelector({
             </span>
           </div>
         )}
+        {/* 模型列表独立滚动区:目录会长(15+ 模型),移动端整菜单超屏会把档位区块
+            截在视口外(2026-08-16 实测)——列表 flex-1 内滚,档位区块钉在菜单底部。 */}
+        <div className="min-h-0 flex-1 overflow-y-auto">
         {models.map((m) => {
           const active = m.id === selectedId;
           const degraded = isDegraded(m);
@@ -198,8 +201,9 @@ export function ModelSelector({
             </DropdownMenuItem>
           );
         })}
+        </div>
         {effortSupported && effortSupported.length > 0 && onSelectEffort && (
-          <>
+          <div className="shrink-0">
             <DropdownMenuSeparator />
             <DropdownMenuLabel className="flex items-center justify-between">
               思考档位
@@ -235,7 +239,7 @@ export function ModelSelector({
                 </DropdownMenuItem>
               ),
             )}
-          </>
+          </div>
         )}
       </DropdownMenuContent>
     </DropdownMenu>
