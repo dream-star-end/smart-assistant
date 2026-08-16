@@ -38,8 +38,10 @@ import {
   convergeFinalizedTapeLiveStreams,
   importRolloutLiveFrames,
   persistGatewayLiveFrame,
+  pruneProjectedLiveFrames,
   readClientSessionLiveFrames,
   reconcileLiveStreamWithFinalTape,
+  retireDeadLiveStreams,
 } from "../db/liveTurnFrames.js";
 import {
   casAdmittedToAccepted,
@@ -4366,6 +4368,232 @@ describe("durable live turn frame journal", () => {
     await pool.query("DELETE FROM client_sessions WHERE id=$1 AND user_id=$2", [sessionId, userId]);
     const rows = await pool.query("SELECT 1 FROM client_session_live_frames");
     assert.equal(rows.rowCount, 0, "session deletion owns journal retention via cascade");
+  });
+
+  maybe("pruneProjectedLiveFrames deletes recorded tape frames, keeps tapeless tape and live", async () => {
+    const userId = "c:911";
+    const recorded = {
+      sessionId: "s-prune-recorded-tape",
+      dispatchId: randomUUID(),
+      tapeId: "a1".repeat(32),
+      tapeSha: "b1".repeat(32),
+      clientMessageId: "cm-prune-recorded",
+    };
+    const tapeless = {
+      sessionId: "s-prune-tapeless-tape",
+      dispatchId: randomUUID(),
+      tapeId: "a2".repeat(32),
+      tapeSha: "b2".repeat(32),
+      clientMessageId: "cm-prune-tapeless",
+    };
+    const live = {
+      sessionId: "s-prune-keep-live",
+      dispatchId: randomUUID(),
+      clientMessageId: "cm-prune-live",
+    };
+    for (const spec of [recorded, tapeless, live]) {
+      await backend.upsertClientSession(mkSession({ id: spec.sessionId, userId }));
+      await pool.query(
+        `INSERT INTO turn_dispatches
+           (dispatch_id,user_id,session_id,client_message_id,agent_id,request_hash,
+            billing_request_id,status,owner_id,lease_until)
+         VALUES ($1,911,$2,$3,'main',$4,$5,'accepted','test-owner',NOW()+INTERVAL '1 minute')`,
+        [spec.dispatchId, spec.sessionId, spec.clientMessageId, "9".repeat(64), `billing-${spec.dispatchId}`],
+      );
+      await persistGatewayLiveFrame(pool, {
+        uid: 911n,
+        sessionId: spec.sessionId,
+        clientMessageId: spec.clientMessageId,
+        agentContainerId: 460,
+        sessionKey: `agent:main:webchat:dm:${spec.sessionId}`,
+        frameSeq: 1,
+        payload: JSON.stringify({
+          type: "outbound.message",
+          sessionKey: `agent:main:webchat:dm:${spec.sessionId}`,
+          frameSeq: 1,
+          peer: { id: spec.sessionId, kind: "dm" },
+          clientMessageId: spec.clientMessageId,
+          blocks: [{ kind: "text", text: spec.sessionId }],
+        }),
+      });
+    }
+    const project = async (dispatchId: string, tapeId: string, tapeSha: string) => {
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        await reconcileLiveStreamWithFinalTape(client, {
+          dispatchId,
+          status: "completed",
+          tapeId,
+          tapeSha256: tapeSha,
+        });
+        await client.query("COMMIT");
+      } finally {
+        client.release();
+      }
+    };
+    await project(recorded.dispatchId, recorded.tapeId, recorded.tapeSha);
+    await project(tapeless.dispatchId, tapeless.tapeId, tapeless.tapeSha);
+    const payload = Buffer.from(JSON.stringify({ id: "rec-1", role: "assistant", text: "kept" }));
+    await pool.query(
+      `INSERT INTO client_session_turn_tapes
+         (session_id,user_id,tape_id,agent_id,turn_index,status,turn_key,tape_sha256,
+          total_bytes,part_count,billing_anchor_id,created_at,finalized_at)
+       VALUES ($1,$2,$3,'main',1,'completed',$4,$5,$6,1,'rec-1',$7,$7)`,
+      [
+        recorded.sessionId,
+        userId,
+        recorded.tapeId,
+        "c1".repeat(32),
+        recorded.tapeSha,
+        payload.length,
+        Date.now(),
+      ],
+    );
+    await pool.query(
+      `INSERT INTO client_session_turn_tape_records
+         (session_id,user_id,tape_id,msg_id,ordinal,role,ts,content_sha256,payload)
+       VALUES ($1,$2,$3,'rec-1',0,'assistant',$4,$5,$6)`,
+      [recorded.sessionId, userId, recorded.tapeId, Date.now(), sha256(payload), payload],
+    );
+
+    const first = await pruneProjectedLiveFrames(pool, { batchSize: 10 });
+    assert.equal(first.deletedFrames, 1);
+    assert.equal(first.prunedStreams, 1);
+    const second = await pruneProjectedLiveFrames(pool, { batchSize: 10 });
+    assert.deepEqual(second, { deletedFrames: 0, prunedStreams: 0 });
+
+    const remaining = await pool.query<{ session_id: string; n: string }>(
+      `SELECT s.session_id,COUNT(*)::text AS n
+         FROM client_session_live_frames f
+         JOIN client_session_live_streams s ON s.stream_key=f.stream_key
+        WHERE s.session_id=ANY($1::text[])
+        GROUP BY s.session_id
+        ORDER BY s.session_id`,
+      [[recorded.sessionId, tapeless.sessionId, live.sessionId]],
+    );
+    assert.deepEqual(remaining.rows, [
+      { session_id: live.sessionId, n: "1" },
+      { session_id: tapeless.sessionId, n: "1" },
+    ]);
+  });
+
+  maybe("retireDeadLiveStreams retires dead live keys and never touches accepted or rollout", async () => {
+    const userId = "c:912";
+    const dead = {
+      sessionId: "s-retire-dead-terminal",
+      dispatchId: randomUUID(),
+      clientMessageId: "cm-retire-dead",
+    };
+    const accepted = {
+      sessionId: "s-retire-accepted-inflight",
+      dispatchId: randomUUID(),
+      clientMessageId: "cm-retire-accepted",
+    };
+    const freshLegacySessionId = "s-retire-fresh-legacy";
+    await backend.upsertClientSession(mkSession({ id: dead.sessionId, userId }));
+    await backend.upsertClientSession(mkSession({ id: accepted.sessionId, userId }));
+    await backend.upsertClientSession(mkSession({ id: freshLegacySessionId, userId }));
+    await pool.query(
+      `INSERT INTO turn_dispatches
+         (dispatch_id,user_id,session_id,client_message_id,agent_id,request_hash,
+          billing_request_id,status,outcome,owner_id,lease_until,terminal_at)
+       VALUES ($1,912,$2,$3,'main',$4,$5,'terminal','interrupted','test-owner',NOW()-INTERVAL '3 hours',NOW()-INTERVAL '3 hours')`,
+      [dead.dispatchId, dead.sessionId, dead.clientMessageId, "d".repeat(64), `billing-${dead.dispatchId}`],
+    );
+    await pool.query(
+      `INSERT INTO turn_dispatches
+         (dispatch_id,user_id,session_id,client_message_id,agent_id,request_hash,
+          billing_request_id,status,owner_id,lease_until)
+       VALUES ($1,912,$2,$3,'main',$4,$5,'accepted','test-owner',NOW()+INTERVAL '10 minutes')`,
+      [accepted.dispatchId, accepted.sessionId, accepted.clientMessageId, "e".repeat(64), `billing-${accepted.dispatchId}`],
+    );
+    const persist = async (
+      sessionId: string,
+      clientMessageId: string | null,
+      containerId: number,
+    ) => {
+      await persistGatewayLiveFrame(pool, {
+        uid: 912n,
+        sessionId,
+        clientMessageId,
+        agentContainerId: containerId,
+        sessionKey: `agent:main:webchat:dm:${sessionId}`,
+        frameSeq: 1,
+        payload: JSON.stringify({
+          type: "outbound.message",
+          sessionKey: `agent:main:webchat:dm:${sessionId}`,
+          frameSeq: 1,
+          peer: { id: sessionId, kind: "dm" },
+          clientMessageId,
+          blocks: [{ kind: "text", text: sessionId }],
+        }),
+      });
+    };
+    await persist(dead.sessionId, dead.clientMessageId, 470);
+    await persist(accepted.sessionId, accepted.clientMessageId, 471);
+    await persist(freshLegacySessionId, null, 472);
+
+    const rolloutSessionId = "s-retire-rollout";
+    const rolloutDispatchId = randomUUID();
+    await backend.upsertClientSession(mkSession({ id: rolloutSessionId, userId }));
+    await pool.query(
+      `INSERT INTO turn_dispatches
+         (dispatch_id,user_id,session_id,client_message_id,agent_id,request_hash,
+          billing_request_id,status,outcome,terminal_at)
+       VALUES ($1,912,$2,'cm-retire-import','main',$3,$4,'terminal','crashed',NOW()-INTERVAL '3 hours')`,
+      [rolloutDispatchId, rolloutSessionId, "f".repeat(64), `billing-${rolloutDispatchId}`],
+    );
+    await importRolloutLiveFrames(pool, {
+      uid: 912n,
+      sessionId: rolloutSessionId,
+      clientMessageId: "cm-retire-import",
+      dispatchId: rolloutDispatchId,
+      attemptNo: 1,
+      rolloutSha256: "ab".repeat(32),
+      provenance: { threadId: "retire-import" },
+      payloads: [JSON.stringify({ type: "outbound.message", blocks: [{ kind: "text", text: "import" }] })],
+    });
+
+    await pool.query(
+      `UPDATE client_session_live_streams
+          SET updated_at=NOW()-INTERVAL '3 hours'
+        WHERE session_id=ANY($1::text[])`,
+      [[dead.sessionId, accepted.sessionId, rolloutSessionId]],
+    );
+
+    const first = await retireDeadLiveStreams(pool, { minAgeMs: 60 * 60 * 1000 });
+    assert.equal(first.retired, 1);
+    const second = await retireDeadLiveStreams(pool, { minAgeMs: 60 * 60 * 1000 });
+    assert.equal(second.retired, 0);
+
+    const deadPage = await readClientSessionLiveFrames(pool, dead.sessionId, userId, 0, 10);
+    assert.ok(deadPage);
+    assert.deepEqual(deadPage.frames, []);
+    assert.deepEqual(deadPage.streamClientMessageIds, []);
+    assert.equal(deadPage.hasTapeProjection, false);
+    assert.equal(deadPage.tapeProjectionVersion, 0);
+    const deadFrames = await pool.query(
+      `SELECT 1 FROM client_session_live_frames f
+         JOIN client_session_live_streams s ON s.stream_key=f.stream_key
+        WHERE s.session_id=$1`,
+      [dead.sessionId],
+    );
+    assert.equal(deadFrames.rowCount, 1, "retire must keep frames for forensics");
+
+    const acceptedPage = await readClientSessionLiveFrames(pool, accepted.sessionId, userId, 0, 10);
+    assert.ok(acceptedPage);
+    assert.equal(acceptedPage.frames.length, 1);
+    assert.deepEqual(acceptedPage.streamClientMessageIds, [accepted.clientMessageId]);
+
+    const freshPage = await readClientSessionLiveFrames(pool, freshLegacySessionId, userId, 0, 10);
+    assert.ok(freshPage);
+    assert.equal(freshPage.frames.length, 1);
+
+    const rolloutPage = await readClientSessionLiveFrames(pool, rolloutSessionId, userId, 0, 10);
+    assert.ok(rolloutPage);
+    assert.equal(rolloutPage.frames.length, 1);
+    assert.deepEqual(rolloutPage.streamClientMessageIds, ["cm-retire-import"]);
   });
 });
 
