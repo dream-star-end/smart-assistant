@@ -369,6 +369,25 @@ describe('CursorAdapter', () => {
     }
   })
 
+  test('overflowing python integers (±Infinity) fall back verbatim (codex round-5)', () => {
+    for (const literal of ['1' + '0'.repeat(309), '-' + '1' + '0'.repeat(309)]) {
+      const big = {
+        type: 'tool_call',
+        tool_call: {
+          id: 't-repr-overflow',
+          updateTodosToolCall: {
+            args: { todos: `[{'content': ${literal}, 'status': 'TODO_STATUS_PENDING'}]` },
+          },
+        },
+      }
+      const out = _internals.toolInputOf(big as never) as Record<string, unknown> & { args?: { todos?: string } }
+      if (out.todos !== undefined) throw new Error(`overflow integer must not parse: ${literal.slice(0, 8)}…`)
+      if (out.args?.todos !== `[{'content': ${literal}, 'status': 'TODO_STATUS_PENDING'}]`) {
+        throw new Error('raw fallback must keep every digit (overflow)')
+      }
+    }
+  })
+
   test('keeps raw cursor args when stringified todos cannot be parsed', () => {
     const broken = {
       type: 'tool_call',

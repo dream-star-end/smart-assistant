@@ -336,8 +336,10 @@ function parsePythonReprValue(input: string): unknown {
     if (num) {
       const value = Number(num[0])
       // python 整数任意精度;超 Number 安全范围会静默丢字(9007199254740993 → …992),
-      // 属"成功解析但内容改变" → 回退。浮点 repr 本就来自 double,Number() 可精确还原。
-      if (Number.isFinite(value) && /^[+-]?\d+$/.test(num[0]) && !Number.isSafeInteger(value)) {
+      // 溢出成 ±Infinity 时更会一路变 'null' → 属"成功解析但内容改变",一律回退。
+      // 不能拿 isFinite 当前置:Infinity 恰好绕过拒绝分支(codex 第五轮反例)。
+      // 浮点 repr 本就来自 double,Number() 可精确还原,不受此守卫影响。
+      if (/^[+-]?\d+$/.test(num[0]) && !Number.isSafeInteger(value)) {
         throw new Error('repr int exceeds safe integer range')
       }
       pos += num[0].length
