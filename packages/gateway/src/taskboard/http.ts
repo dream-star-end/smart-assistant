@@ -1,0 +1,1956 @@
+// Taskboard HTTP 层 —— `/api/board/*` 路由分发与全部端点。
+//
+// 入口 `handleTaskboardApi` 形状对齐 gateway cron handler:已鉴权之后调用,
+// 返回是否已处理。鉴权本身仍由 server.ts 的 /api/* 闸门负责(JWT / accessToken /
+// bridge bypass),本层不再验一遍。
+//
+// 身份:selfhost 单租户,getUserId 恒为 `default`,不做多租户隔离
+// (商业 proxy 剥掉 Authorization,容器侧 JWT userId 不可用)。
+//
+// actor 判定见 `resolveTaskboardActor` —— 不信 body.actor。
+
+import type { IncomingMessage, ServerResponse } from 'node:http'
+import { filterUserVisibleAgentsForManagement, isHiddenSystemAgentId } from '../agentVisibility.js'
+import { verifyJwt } from '../auth.js'
+import { createActivity, listActivities } from './db/activity.js'
+import { createComment, listComments } from './db/comments.js'
+import {
+  TaskboardCrossProjectError,
+  TaskboardCycleError,
+  type TaskboardDb,
+  TaskboardDuplicateRelationError,
+  TaskboardLeaseHeld,
+  TaskboardNotFound,
+  TaskboardSingleParentError,
+  TaskboardValidationError,
+  TaskboardVersionConflict,
+  getTaskboardDb,
+  isTaskboardError,
+} from './db/index.js'
+import {
+  createPipeline,
+  createStage,
+  getDefaultPipeline,
+  getPipeline,
+  getStage,
+  listPipelines,
+  listStages,
+  updatePipeline,
+  updateStage,
+} from './db/pipelines.js'
+import {
+  archiveProject,
+  createProject,
+  getProject,
+  getProjectByKey,
+  listProjects,
+  updateProject,
+} from './db/projects.js'
+import { addRelation, listRelations, removeRelation } from './db/relations.js'
+import { acquireLease, getActiveLease, getRun, insertRun, listRuns, updateRun } from './db/runs.js'
+import { seedDefaultPipelines } from './db/seed.js'
+import { createTicket, getTicketByIdOrIdentifier, listTickets, updateTicket } from './db/tickets.js'
+import {
+  type Actor,
+  type AuthorKind,
+  GUARDRAIL_DEFAULTS,
+  type OnFailureAction,
+  type OnSuccessAction,
+  type PipelineStage,
+  RELATION_KINDS,
+  type RelationKind,
+  type RunStatus,
+  STAGE_KINDS,
+  type StageKind,
+  TICKET_PRIORITIES,
+  TICKET_SEVERITIES,
+  TICKET_SOURCES,
+  TICKET_STATUSES,
+  TICKET_TYPES,
+  type Ticket,
+  type TicketPriority,
+  type TicketSeverity,
+  type TicketSource,
+  type TicketStatus,
+  type TicketType,
+  buildPatrolSessionKey,
+} from './domain.js'
+import { TaskboardTransitionDenied, assertTransition } from './stateMachine.js'
+
+// ── 常量 ────────────────────────────────────────────────────────────────────
+
+/** 与 commercial `containerApiProxy` body 上限对齐,超限 413 而不是崩。 */
+export const TASKBOARD_MAX_BODY_BYTES = 512 * 1024
+
+/** delegate 硬超时 45 分钟(秒)。stage.timeoutSec 不得超过此值。 */
+const DELEGATE_HARD_TIMEOUT_SEC = 45 * 60
+
+const USER_ID = 'default'
+const HUMAN_ACTOR_ID = `user:${USER_ID}`
+
+const TICKET_ACTIONS = [
+  'ready',
+  'claim',
+  'advance',
+  'block',
+  'approve',
+  'reject',
+  'done',
+  'cancel',
+  'comment',
+  'patrol',
+] as const
+type TicketAction = (typeof TICKET_ACTIONS)[number]
+
+const TICKET_COLLECTIONS = ['runs', 'relations', 'comments', 'activity', 'timeline'] as const
+type TicketCollection = (typeof TICKET_COLLECTIONS)[number]
+
+// ── 上下文 / actor ──────────────────────────────────────────────────────────
+
+export interface BoardAgent {
+  id: string
+  name: string
+  model: string
+  description: string
+}
+
+export interface TaskboardHttpContext {
+  /** 显式传入的库。测试用临时目录;生产省略则走 getTaskboardDb()。null = 未初始化。 */
+  db?: TaskboardDb | null
+  /**
+   * 测试注入的 actor。生产不要设 —— 必须由 resolveActor / resolveTaskboardActor
+   * 从请求凭证推导,禁止调用方在 body 里自称。
+   */
+  actor?: Actor
+  resolveActor?: (req: IncomingMessage) => Actor
+  jwtSecret?: string
+  isCommercialJwt?: (token: string) => boolean
+  listAgents?: () => Promise<BoardAgent[]>
+}
+
+export interface ResolveActorOptions {
+  jwtSecret?: string
+  isCommercialJwt?: (token: string) => boolean
+  /**
+   * server.ts `checkBridgeBypass()` 的真实校验结果。**不要**在本层从请求头推导 ——
+   * 见 resolveTaskboardActor 的注释,那是可被容器内 agent 伪造的提权路径。
+   */
+  bridgeVerified?: boolean
+}
+
+/**
+ * 从已鉴权请求推导状态机 actor。判据(按优先级):
+ *
+ *   1. `Authorization: Bearer` / `oc_session` 能通过个人 JWT 或商业 JWT 验签
+ *      → **human**。浏览器登录走 `/api/auth/login` 签发 JWT。
+ *   2. `opts.bridgeVerified === true` → **human**。这是商业 master 代理进容器的
+ *      浏览器请求(master 已剥掉 Authorization,auth 在 master 那侧验过)。
+ *   3. 其余已鉴权请求(raw gateway accessToken / MCP `OPENCLAUDE_GATEWAY_TOKEN` /
+ *      CLI 读 token file)→ **agent**。
+ *
+ * ⚠ `bridgeVerified` 必须由 server.ts 传入 `checkBridgeBypass()` 的**真实校验结果**,
+ * 不能在本层嗅 `X-OpenClaude-Bridge-Nonce` 请求头。该头是纯客户端可控输入:容器内的
+ * agent 持有 gateway token,走回环调用时鉴权本就能过,再随手加一行伪造的 nonce 头就会
+ * 被判成 human,从而给自己的单据点「完成」或自行批准开工 —— 正好击穿本系统
+ * 「done 永远不属于 AI」的红线。真正的校验在 server.ts `checkBridgeBypass()`:
+ * 源 IP 必须是 docker 网桥网关、container-id 绑定、nonce 走 timingSafeEqual,
+ * 回环调用方无法满足源 IP 这一条。
+ *
+ * 局限(写清以免后人改坏):
+ *   - 人若把 raw accessToken 当 Bearer 用,会被判成 agent,无法与 MCP 区分。
+ *     这是有意的保守方向:宁可把人降级成 agent(少给权限),不可把 agent 升成 human。
+ *   - agent 若拿到浏览器 JWT,会被判成 human。JWT 泄漏本身是更大的问题,不在本层兜。
+ *   - 不能从 JWT 解析 agentId;agent 身份靠 claim.owner 或 OPENCLAUDE_AGENT_ID。
+ *   - **绝不**读取 body.actor / body.authorKind 作为权限依据 —— 那等于把
+ *     权限表交给客户端,AI 一行 `{"actor":"human"}` 就能自己点完成。
+ */
+export function resolveTaskboardActor(req: IncomingMessage, opts: ResolveActorOptions = {}): Actor {
+  const token = extractRequestToken(req)
+  if (token) {
+    if (opts.jwtSecret && verifyJwt(token, opts.jwtSecret)) return 'human'
+    if (opts.isCommercialJwt?.(token)) return 'human'
+  }
+  if (opts.bridgeVerified === true) return 'human'
+  return 'agent'
+}
+
+function extractRequestToken(req: IncomingMessage): string {
+  const auth = req.headers.authorization?.replace(/^Bearer\s+/i, '') ?? ''
+  if (auth) return auth
+  const cookies = (req.headers.cookie || '').split(';').reduce(
+    (acc, part) => {
+      const [k, ...rest] = part.trim().split('=')
+      if (k) acc[k] = rest.join('=')
+      return acc
+    },
+    {} as Record<string, string>,
+  )
+  return cookies.oc_session || ''
+}
+
+function resolveActor(req: IncomingMessage, ctx: TaskboardHttpContext): Actor {
+  if (ctx.actor) return ctx.actor
+  if (ctx.resolveActor) return ctx.resolveActor(req)
+  return resolveTaskboardActor(req, ctx)
+}
+
+function actorIdOf(actor: Actor, owner?: string | null): string {
+  if (actor === 'human') return HUMAN_ACTOR_ID
+  if (actor === 'system') return 'system'
+  if (owner?.trim()) return owner.trim()
+  const envId = process.env.OPENCLAUDE_AGENT_ID
+  return envId ? `agent:${envId}` : 'agent:unknown'
+}
+
+// ── settings 表(本文件自建,不改 db/schema.ts)────────────────────────────────
+
+/**
+ * 全局护栏运行时配置。DDL 放在 HTTP 层用 CREATE TABLE IF NOT EXISTS 初始化,
+ * 不改 db/schema.ts(那是别人的文件)。建议后续并进 schema.ts v2,理由见最终回复。
+ */
+export const TASKBOARD_SETTINGS_DDL = `
+CREATE TABLE IF NOT EXISTS tb_settings (
+  id TEXT PRIMARY KEY CHECK (id = 'global'),
+  max_concurrent_runs INTEGER NOT NULL,
+  max_runs_per_day INTEGER NOT NULL,
+  max_cost_per_day_usd REAL,
+  quiet_hours_start INTEGER NOT NULL,
+  quiet_hours_end INTEGER NOT NULL,
+  circuit_breaker_threshold INTEGER NOT NULL,
+  max_stage_loops INTEGER NOT NULL,
+  max_runs_per_tick INTEGER NOT NULL,
+  patrol_paused INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL
+);
+`
+
+export interface TaskboardSettings {
+  maxConcurrentRuns: number
+  maxRunsPerDay: number
+  maxCostPerDayUsd: number | null
+  quietHoursStart: number
+  quietHoursEnd: number
+  circuitBreakerThreshold: number
+  maxStageLoops: number
+  maxRunsPerTick: number
+  patrolPaused: boolean
+}
+
+export interface TaskboardUsage {
+  runsToday: number
+  costTodayUsd: number
+  activeRuns: number
+}
+
+interface SettingsRow {
+  max_concurrent_runs: number
+  max_runs_per_day: number
+  max_cost_per_day_usd: number | null
+  quiet_hours_start: number
+  quiet_hours_end: number
+  circuit_breaker_threshold: number
+  max_stage_loops: number
+  max_runs_per_tick: number
+  patrol_paused: number
+}
+
+function defaultSettings(): TaskboardSettings {
+  return {
+    maxConcurrentRuns: GUARDRAIL_DEFAULTS.maxConcurrentRuns,
+    maxRunsPerDay: GUARDRAIL_DEFAULTS.maxRunsPerDay,
+    maxCostPerDayUsd: GUARDRAIL_DEFAULTS.maxCostPerDayUsd,
+    quietHoursStart: GUARDRAIL_DEFAULTS.quietHoursStart,
+    quietHoursEnd: GUARDRAIL_DEFAULTS.quietHoursEnd,
+    circuitBreakerThreshold: GUARDRAIL_DEFAULTS.circuitBreakerThreshold,
+    maxStageLoops: GUARDRAIL_DEFAULTS.maxStageLoops,
+    maxRunsPerTick: GUARDRAIL_DEFAULTS.maxRunsPerTick,
+    patrolPaused: false,
+  }
+}
+
+export function ensureSettingsTable(db: TaskboardDb): void {
+  db.exec(TASKBOARD_SETTINGS_DDL)
+  const existing = db.prepare('SELECT id FROM tb_settings WHERE id = ?').get('global') as
+    | { id: string }
+    | undefined
+  if (existing) return
+  const d = defaultSettings()
+  db.prepare(
+    `INSERT INTO tb_settings (
+       id, max_concurrent_runs, max_runs_per_day, max_cost_per_day_usd,
+       quiet_hours_start, quiet_hours_end, circuit_breaker_threshold,
+       max_stage_loops, max_runs_per_tick, patrol_paused, updated_at
+     ) VALUES (
+       'global', @maxConcurrentRuns, @maxRunsPerDay, @maxCostPerDayUsd,
+       @quietHoursStart, @quietHoursEnd, @circuitBreakerThreshold,
+       @maxStageLoops, @maxRunsPerTick, @patrolPaused, @now
+     )`,
+  ).run({
+    ...d,
+    patrolPaused: d.patrolPaused ? 1 : 0,
+    now: Date.now(),
+  })
+}
+
+function readSettings(db: TaskboardDb): TaskboardSettings {
+  ensureSettingsTable(db)
+  const row = db.prepare('SELECT * FROM tb_settings WHERE id = ?').get('global') as SettingsRow
+  return {
+    maxConcurrentRuns: row.max_concurrent_runs,
+    maxRunsPerDay: row.max_runs_per_day,
+    maxCostPerDayUsd: row.max_cost_per_day_usd,
+    quietHoursStart: row.quiet_hours_start,
+    quietHoursEnd: row.quiet_hours_end,
+    circuitBreakerThreshold: row.circuit_breaker_threshold,
+    maxStageLoops: row.max_stage_loops,
+    maxRunsPerTick: row.max_runs_per_tick,
+    patrolPaused: row.patrol_paused === 1,
+  }
+}
+
+function writeSettings(db: TaskboardDb, patch: Partial<TaskboardSettings>): TaskboardSettings {
+  const cur = readSettings(db)
+  const next: TaskboardSettings = {
+    maxConcurrentRuns: patch.maxConcurrentRuns ?? cur.maxConcurrentRuns,
+    maxRunsPerDay: patch.maxRunsPerDay ?? cur.maxRunsPerDay,
+    maxCostPerDayUsd:
+      patch.maxCostPerDayUsd === undefined ? cur.maxCostPerDayUsd : patch.maxCostPerDayUsd,
+    quietHoursStart: patch.quietHoursStart ?? cur.quietHoursStart,
+    quietHoursEnd: patch.quietHoursEnd ?? cur.quietHoursEnd,
+    circuitBreakerThreshold: patch.circuitBreakerThreshold ?? cur.circuitBreakerThreshold,
+    maxStageLoops: patch.maxStageLoops ?? cur.maxStageLoops,
+    maxRunsPerTick: patch.maxRunsPerTick ?? cur.maxRunsPerTick,
+    patrolPaused: patch.patrolPaused ?? cur.patrolPaused,
+  }
+  db.prepare(
+    `UPDATE tb_settings SET
+       max_concurrent_runs = @maxConcurrentRuns,
+       max_runs_per_day = @maxRunsPerDay,
+       max_cost_per_day_usd = @maxCostPerDayUsd,
+       quiet_hours_start = @quietHoursStart,
+       quiet_hours_end = @quietHoursEnd,
+       circuit_breaker_threshold = @circuitBreakerThreshold,
+       max_stage_loops = @maxStageLoops,
+       max_runs_per_tick = @maxRunsPerTick,
+       patrol_paused = @patrolPaused,
+       updated_at = @now
+     WHERE id = 'global'`,
+  ).run({
+    ...next,
+    patrolPaused: next.patrolPaused ? 1 : 0,
+    now: Date.now(),
+  })
+  return next
+}
+
+function startOfLocalDayMs(now = Date.now()): number {
+  const d = new Date(now)
+  d.setHours(0, 0, 0, 0)
+  return d.getTime()
+}
+
+function readUsage(db: TaskboardDb, now = Date.now()): TaskboardUsage {
+  const start = startOfLocalDayMs(now)
+  const today = db
+    .prepare(
+      `SELECT COUNT(*) AS n, COALESCE(SUM(cost_usd), 0) AS cost
+         FROM tb_ticket_run WHERE created_at >= ?`,
+    )
+    .get(start) as { n: number; cost: number }
+  const active = db
+    .prepare(
+      `SELECT COUNT(*) AS n FROM tb_ticket_run
+        WHERE status IN ('queued', 'running')
+          AND lease_expires_at IS NOT NULL
+          AND lease_expires_at > ?`,
+    )
+    .get(now) as { n: number }
+  return {
+    runsToday: today.n,
+    costTodayUsd: today.cost,
+    activeRuns: active.n,
+  }
+}
+
+// ── T4 接手点:手动巡检后台执行 ──────────────────────────────────────────────
+
+export interface PatrolExecutionJob {
+  ticketId: string
+  runId: string
+  stageId: string
+  agentId: string | null
+  trigger: 'manual'
+  sessionKey: string
+}
+
+export type PatrolExecutionHandler = (job: PatrolExecutionJob) => void
+
+let _patrolHandler: PatrolExecutionHandler | null = null
+
+/**
+ * T4 注册真正的 delegate 执行。M1 默认空转,run 保持 running,前端靠轮询终态。
+ *
+ * T4 接手:`packages/gateway/src/taskboard/http.ts` 的
+ * `enqueuePatrolExecution` / `setPatrolExecutionHandler`。
+ */
+export function setPatrolExecutionHandler(handler: PatrolExecutionHandler | null): void {
+  _patrolHandler = handler
+}
+
+/**
+ * 把一次已 claim 的手动巡检丢进后台。M1 是 TODO(T4) 桩:只调度 handler,
+ * 不调 `_runDelegateTask`。
+ *
+ * TODO(T4): 在 handler 里同进程直调 Gateway._runDelegateTask,写回 run 终态,
+ * 再按 stage.onSuccess 走 stateMachine。
+ */
+export function enqueuePatrolExecution(job: PatrolExecutionJob): void {
+  const handler = _patrolHandler
+  if (!handler) return
+  queueMicrotask(() => {
+    try {
+      handler(job)
+    } catch {
+      /* T4 接上之前桩失败不能砸掉 HTTP 响应 */
+    }
+  })
+}
+
+// ── HTTP 小工具 ─────────────────────────────────────────────────────────────
+
+class BodyTooLargeError extends Error {
+  constructor() {
+    super('payload too large')
+    this.name = 'BodyTooLargeError'
+  }
+}
+
+class InvalidJsonError extends Error {
+  constructor() {
+    super('invalid JSON')
+    this.name = 'InvalidJsonError'
+  }
+}
+
+function sendJson(res: ServerResponse, code: number, body: unknown): void {
+  res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' })
+  res.end(JSON.stringify(body))
+}
+
+function sendError(
+  res: ServerResponse,
+  code: number,
+  error: string,
+  extra?: Record<string, unknown>,
+): void {
+  sendJson(res, code, extra ? { error, ...extra } : { error })
+}
+
+function readBody(req: IncomingMessage, maxBytes: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = []
+    let size = 0
+    let settled = false
+    const finish = (fn: () => void) => {
+      if (settled) return
+      settled = true
+      fn()
+    }
+    req.on('data', (chunk: Buffer) => {
+      size += chunk.length
+      if (size > maxBytes) {
+        // 不 destroy:掐连接会让客户端 fetch 直接失败,来不及收 413。
+        req.resume()
+        finish(() => reject(new BodyTooLargeError()))
+        return
+      }
+      chunks.push(chunk)
+    })
+    req.on('end', () => finish(() => resolve(Buffer.concat(chunks).toString('utf-8'))))
+    req.on('error', (err) => finish(() => reject(err)))
+  })
+}
+
+async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
+  const raw = await readBody(req, TASKBOARD_MAX_BODY_BYTES)
+  if (!raw.trim()) return {}
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>
+    }
+    throw new TaskboardValidationError('request body must be an object')
+  } catch (err) {
+    if (err instanceof TaskboardValidationError) throw err
+    throw new InvalidJsonError()
+  }
+}
+
+function urlOf(req: IncomingMessage): URL {
+  return new URL(req.url ?? '/', 'http://127.0.0.1')
+}
+
+function parseLimit(url: URL, fallback = 50, max = 200): number {
+  const raw = url.searchParams.get('limit')
+  if (raw == null || raw === '') return fallback
+  const n = Number(raw)
+  if (!Number.isFinite(n)) return fallback
+  return Math.min(Math.max(Math.trunc(n), 1), max)
+}
+
+function parseOffset(url: URL): number {
+  const raw = url.searchParams.get('offset')
+  if (raw == null || raw === '') return 0
+  const n = Number(raw)
+  if (!Number.isFinite(n)) return 0
+  return Math.max(Math.trunc(n), 0)
+}
+
+function requireExpectedVersion(body: Record<string, unknown>): number {
+  const v = body.expectedVersion
+  if (typeof v !== 'number' || !Number.isInteger(v)) {
+    throw new TaskboardValidationError('expectedVersion is required')
+  }
+  return v
+}
+
+function asString(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined
+}
+
+function asNullableString(value: unknown): string | null | undefined {
+  if (value === undefined) return undefined
+  if (value === null) return null
+  if (typeof value === 'string') return value
+  throw new TaskboardValidationError('expected string or null')
+}
+
+function asNullableNumber(value: unknown): number | null | undefined {
+  if (value === undefined) return undefined
+  if (value === null) return null
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  throw new TaskboardValidationError('expected number or null')
+}
+
+function asBoolean(value: unknown): boolean | undefined {
+  if (value === undefined) return undefined
+  if (typeof value === 'boolean') return value
+  throw new TaskboardValidationError('expected boolean')
+}
+
+function asStringArray(value: unknown): string[] | undefined {
+  if (value === undefined) return undefined
+  if (!Array.isArray(value) || value.some((item) => typeof item !== 'string')) {
+    throw new TaskboardValidationError('expected string[]')
+  }
+  return value
+}
+
+function asNullableStringArray(value: unknown): string[] | null | undefined {
+  if (value === undefined) return undefined
+  if (value === null) return null
+  return asStringArray(value)
+}
+
+function parseCsvEnums<T extends string>(
+  raw: string | null,
+  allowed: readonly T[],
+  field: string,
+): T[] | undefined {
+  if (!raw) return undefined
+  const parts = raw
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean) as T[]
+  for (const part of parts) {
+    if (!allowed.includes(part)) {
+      throw new TaskboardValidationError(`invalid ${field}: ${part}`)
+    }
+  }
+  return parts.length ? parts : undefined
+}
+
+function isUniqueConstraint(err: unknown, needle?: string): boolean {
+  const msg = err instanceof Error ? err.message : String(err)
+  if (!msg.includes('UNIQUE constraint failed')) return false
+  return needle ? msg.includes(needle) : true
+}
+
+function resolveProject(db: TaskboardDb, idOrKey: string) {
+  return getProject(db, idOrKey) ?? getProjectByKey(db, idOrKey)
+}
+
+function requireTicket(db: TaskboardDb, idOrIdent: string): Ticket {
+  const ticket = getTicketByIdOrIdentifier(db, idOrIdent)
+  if (!ticket) throw new TaskboardNotFound('ticket', idOrIdent)
+  return ticket
+}
+
+function currentStage(db: TaskboardDb, ticket: Ticket): PipelineStage | null {
+  if (!ticket.stageId) return null
+  return getStage(db, ticket.stageId)
+}
+
+function nextStage(db: TaskboardDb, stage: PipelineStage): PipelineStage | null {
+  const stages = listStages(db, stage.pipelineId)
+  return stages.find((s) => s.ordinal > stage.ordinal) ?? null
+}
+
+function previousAiStage(db: TaskboardDb, stage: PipelineStage): PipelineStage | null {
+  const stages = listStages(db, stage.pipelineId)
+  const earlier = stages.filter((s) => s.ordinal < stage.ordinal && s.kind === 'ai')
+  return earlier.length ? earlier[earlier.length - 1] : null
+}
+
+function recordActivity(
+  db: TaskboardDb,
+  ticketId: string,
+  actor: Actor,
+  actorId: string,
+  action: string,
+  field?: string | null,
+  fromValue?: string | null,
+  toValue?: string | null,
+): void {
+  createActivity(db, { ticketId, actor, actorId, action, field, fromValue, toValue })
+}
+
+function mapHttpError(res: ServerResponse, err: unknown): boolean {
+  if (err instanceof BodyTooLargeError) {
+    sendError(res, 413, 'payload too large')
+    return true
+  }
+  if (err instanceof InvalidJsonError) {
+    sendError(res, 400, 'invalid JSON')
+    return true
+  }
+  if (err instanceof TaskboardTransitionDenied) {
+    sendError(res, 403, 'forbidden', { code: 'forbidden' })
+    return true
+  }
+  if (err instanceof TaskboardVersionConflict) {
+    sendError(res, 409, err.message, {
+      code: 'version_conflict',
+      expectedVersion: err.expectedVersion,
+      actualVersion: err.actualVersion,
+    })
+    return true
+  }
+  if (err instanceof TaskboardLeaseHeld) {
+    sendError(res, 423, 'lease held', { code: 'lease_held' })
+    return true
+  }
+  if (err instanceof TaskboardNotFound) {
+    sendError(res, 404, err.message, { code: 'not_found' })
+    return true
+  }
+  if (err instanceof TaskboardValidationError) {
+    sendError(res, 400, err.message, { code: 'validation' })
+    return true
+  }
+  if (err instanceof TaskboardCrossProjectError) {
+    sendError(res, 422, err.message, { code: 'cross_project' })
+    return true
+  }
+  if (err instanceof TaskboardCycleError) {
+    sendError(res, 409, err.message, { code: 'cycle' })
+    return true
+  }
+  if (err instanceof TaskboardSingleParentError) {
+    sendError(res, 409, err.message, { code: 'single_parent' })
+    return true
+  }
+  if (err instanceof TaskboardDuplicateRelationError) {
+    sendError(res, 409, err.message, { code: 'duplicate_relation' })
+    return true
+  }
+  if (isTaskboardError(err)) {
+    sendError(res, 400, err.message, { code: err.code })
+    return true
+  }
+  return false
+}
+
+function resolveDb(ctx: TaskboardHttpContext): TaskboardDb | null {
+  if (ctx.db === null) return null
+  if (ctx.db) return ctx.db
+  try {
+    return getTaskboardDb()
+  } catch {
+    return null
+  }
+}
+
+// ── 入口 ────────────────────────────────────────────────────────────────────
+
+/**
+ * `/api/board/*` 分发入口。已处理返回 true;非本前缀返回 false。
+ * 未初始化库 → 503 `{ error: "taskboard not initialized" }`。
+ */
+export async function handleTaskboardApi(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: TaskboardHttpContext = {},
+): Promise<boolean> {
+  const url = urlOf(req)
+  if (url.pathname !== '/api/board' && !url.pathname.startsWith('/api/board/')) {
+    return false
+  }
+
+  const db = resolveDb(ctx)
+  if (!db) {
+    sendError(res, 503, 'taskboard not initialized')
+    return true
+  }
+  ensureSettingsTable(db)
+
+  const actor = resolveActor(req, ctx)
+  const method = (req.method ?? 'GET').toUpperCase()
+
+  try {
+    await dispatch(req, res, url, method, db, actor, ctx)
+  } catch (err) {
+    if (mapHttpError(res, err)) return true
+    throw err
+  }
+  return true
+}
+
+async function dispatch(
+  req: IncomingMessage,
+  res: ServerResponse,
+  url: URL,
+  method: string,
+  db: TaskboardDb,
+  actor: Actor,
+  ctx: TaskboardHttpContext,
+): Promise<void> {
+  const path = url.pathname
+
+  if (path === '/api/board/projects') {
+    if (method === 'GET') return handleListProjects(res, url, db)
+    if (method === 'POST') return handleCreateProject(res, await readJsonBody(req), db)
+    return sendError(res, 405, 'method not allowed')
+  }
+
+  const projectBoard = path.match(/^\/api\/board\/projects\/([^/]+)\/board$/)
+  if (projectBoard) {
+    if (method === 'GET')
+      return handleProjectBoard(res, url, db, decodeURIComponent(projectBoard[1]))
+    return sendError(res, 405, 'method not allowed')
+  }
+
+  const projectItem = path.match(/^\/api\/board\/projects\/([^/]+)$/)
+  if (projectItem) {
+    const id = decodeURIComponent(projectItem[1])
+    if (method === 'GET') return handleGetProject(res, db, id)
+    if (method === 'PATCH') return handlePatchProject(res, await readJsonBody(req), db, id)
+    if (method === 'DELETE') return handleDeleteProject(res, db, id)
+    return sendError(res, 405, 'method not allowed')
+  }
+
+  if (path === '/api/board/tickets') {
+    if (method === 'GET') return handleListTickets(res, url, db)
+    if (method === 'POST') return handleCreateTicket(res, await readJsonBody(req), db, actor)
+    return sendError(res, 405, 'method not allowed')
+  }
+
+  const ticketAction = path.match(/^\/api\/board\/tickets\/([^/]+)\/([^/]+)$/)
+  if (ticketAction) {
+    const idOrIdent = decodeURIComponent(ticketAction[1])
+    const sub = ticketAction[2]
+    if ((TICKET_COLLECTIONS as readonly string[]).includes(sub)) {
+      return handleTicketCollection(
+        req,
+        res,
+        url,
+        method,
+        db,
+        actor,
+        idOrIdent,
+        sub as TicketCollection,
+      )
+    }
+    if ((TICKET_ACTIONS as readonly string[]).includes(sub)) {
+      if (method !== 'POST') return sendError(res, 405, 'method not allowed')
+      return handleTicketAction(
+        res,
+        await readJsonBody(req),
+        db,
+        actor,
+        idOrIdent,
+        sub as TicketAction,
+      )
+    }
+    return sendError(res, 404, 'not found', { code: 'not_found' })
+  }
+
+  const ticketItem = path.match(/^\/api\/board\/tickets\/([^/]+)$/)
+  if (ticketItem) {
+    const idOrIdent = decodeURIComponent(ticketItem[1])
+    if (method === 'GET') return handleGetTicket(res, url, db, idOrIdent)
+    if (method === 'PATCH') {
+      return handlePatchTicket(res, await readJsonBody(req), db, actor, idOrIdent)
+    }
+    return sendError(res, 405, 'method not allowed')
+  }
+
+  if (path === '/api/board/pipelines') {
+    if (method === 'GET') return handleListPipelines(res, url, db)
+    if (method === 'POST') return handleCreatePipeline(res, await readJsonBody(req), db)
+    return sendError(res, 405, 'method not allowed')
+  }
+
+  const pipelineStages = path.match(/^\/api\/board\/pipelines\/([^/]+)\/stages$/)
+  if (pipelineStages) {
+    const id = decodeURIComponent(pipelineStages[1])
+    if (method === 'GET') return handleListStages(res, db, id)
+    if (method === 'POST') return handleCreateStage(res, await readJsonBody(req), db, id)
+    return sendError(res, 405, 'method not allowed')
+  }
+
+  const pipelineItem = path.match(/^\/api\/board\/pipelines\/([^/]+)$/)
+  if (pipelineItem) {
+    const id = decodeURIComponent(pipelineItem[1])
+    if (method === 'GET') return handleGetPipeline(res, db, id)
+    if (method === 'PATCH') return handlePatchPipeline(res, await readJsonBody(req), db, id)
+    return sendError(res, 405, 'method not allowed')
+  }
+
+  const stageItem = path.match(/^\/api\/board\/stages\/([^/]+)$/)
+  if (stageItem) {
+    const id = decodeURIComponent(stageItem[1])
+    if (method === 'GET') return handleGetStage(res, db, id)
+    if (method === 'PATCH') return handlePatchStage(res, await readJsonBody(req), db, id)
+    return sendError(res, 405, 'method not allowed')
+  }
+
+  const runItem = path.match(/^\/api\/board\/runs\/([^/]+)$/)
+  if (runItem) {
+    if (method === 'GET') return handleGetRun(res, db, decodeURIComponent(runItem[1]))
+    return sendError(res, 405, 'method not allowed')
+  }
+
+  const relationItem = path.match(/^\/api\/board\/relations\/([^/]+)$/)
+  if (relationItem) {
+    if (method === 'DELETE') {
+      removeRelation(db, decodeURIComponent(relationItem[1]))
+      return sendJson(res, 200, { ok: true })
+    }
+    return sendError(res, 405, 'method not allowed')
+  }
+
+  if (path === '/api/board/agents') {
+    if (method === 'GET') return handleListAgents(res, ctx)
+    return sendError(res, 405, 'method not allowed')
+  }
+
+  if (path === '/api/board/settings') {
+    if (method === 'GET') return handleGetSettings(res, db)
+    if (method === 'PATCH') return handlePatchSettings(res, await readJsonBody(req), db, actor)
+    return sendError(res, 405, 'method not allowed')
+  }
+
+  sendError(res, 404, 'not found', { code: 'not_found' })
+}
+
+// ── Project ─────────────────────────────────────────────────────────────────
+
+function handleListProjects(res: ServerResponse, url: URL, db: TaskboardDb): void {
+  const includeArchived = url.searchParams.get('includeArchived') === 'true'
+  sendJson(res, 200, { items: listProjects(db, { includeArchived }) })
+}
+
+function handleCreateProject(
+  res: ServerResponse,
+  body: Record<string, unknown>,
+  db: TaskboardDb,
+): void {
+  const key = asString(body.key)
+  const name = asString(body.name)
+  if (!key || !name) throw new TaskboardValidationError('key and name are required')
+  try {
+    const created = db.transaction(() => {
+      const project = createProject(db, {
+        key,
+        name,
+        description: asNullableString(body.description) ?? null,
+        workspace: asNullableString(body.workspace) ?? null,
+        labels: asStringArray(body.labels) ?? [],
+      })
+      seedDefaultPipelines(db, project.id)
+      return project
+    })()
+    sendJson(res, 201, { ok: true, project: created })
+  } catch (err) {
+    if (isUniqueConstraint(err, 'tb_project.key') || isUniqueConstraint(err, 'key')) {
+      sendError(res, 409, 'project key already exists')
+      return
+    }
+    throw err
+  }
+}
+
+function handleGetProject(res: ServerResponse, db: TaskboardDb, idOrKey: string): void {
+  const project = resolveProject(db, idOrKey)
+  if (!project) throw new TaskboardNotFound('project', idOrKey)
+  sendJson(res, 200, { project })
+}
+
+function handlePatchProject(
+  res: ServerResponse,
+  body: Record<string, unknown>,
+  db: TaskboardDb,
+  idOrKey: string,
+): void {
+  const project = resolveProject(db, idOrKey)
+  if (!project) throw new TaskboardNotFound('project', idOrKey)
+  const updated = updateProject(db, project.id, {
+    name: asString(body.name),
+    description: asNullableString(body.description),
+    workspace: asNullableString(body.workspace),
+    labels: asStringArray(body.labels),
+    archivedAt: asNullableNumber(body.archivedAt),
+  })
+  sendJson(res, 200, { ok: true, project: updated })
+}
+
+function handleDeleteProject(res: ServerResponse, db: TaskboardDb, idOrKey: string): void {
+  const project = resolveProject(db, idOrKey)
+  if (!project) throw new TaskboardNotFound('project', idOrKey)
+  const archived = archiveProject(db, project.id)
+  sendJson(res, 200, { ok: true, project: archived })
+}
+
+function handleProjectBoard(res: ServerResponse, url: URL, db: TaskboardDb, idOrKey: string): void {
+  const project = resolveProject(db, idOrKey)
+  if (!project) throw new TaskboardNotFound('project', idOrKey)
+  const requested = url.searchParams.get('ticketType')
+  let ticketType: TicketType = 'bug'
+  if (requested) {
+    if (!(TICKET_TYPES as readonly string[]).includes(requested)) {
+      throw new TaskboardValidationError(`invalid ticketType: ${requested}`)
+    }
+    ticketType = requested as TicketType
+  } else {
+    const first = listPipelines(db, project.id).find((p) => p.isDefault && p.ticketType)
+    if (first?.ticketType) ticketType = first.ticketType
+  }
+  const pipeline = getDefaultPipeline(db, project.id, ticketType)
+  if (!pipeline) throw new TaskboardNotFound('pipeline', `${project.id}:${ticketType}`)
+  const stages = listStages(db, pipeline.id)
+  const listed = listTickets(db, { projectId: project.id, limit: 200, offset: 0 })
+  const inbox = listed.items.filter((t) => t.status === 'waiting_human')
+  sendJson(res, 200, {
+    project,
+    pipeline,
+    ticketType,
+    columns: stages.map((stage) => ({
+      stage,
+      tickets: listed.items.filter((t) => t.stageId === stage.id),
+    })),
+    inbox,
+  })
+}
+
+// ── Ticket ──────────────────────────────────────────────────────────────────
+
+function handleListTickets(res: ServerResponse, url: URL, db: TaskboardDb): void {
+  let projectId = url.searchParams.get('projectId') ?? undefined
+  if (projectId) {
+    const project = resolveProject(db, projectId)
+    if (!project) throw new TaskboardNotFound('project', projectId)
+    projectId = project.id
+  }
+  const status = parseCsvEnums(url.searchParams.get('status'), TICKET_STATUSES, 'status')
+  const type = parseCsvEnums(url.searchParams.get('type'), TICKET_TYPES, 'type')
+  const priorityRaw = url.searchParams.get('priority')
+  let priority: TicketPriority | undefined
+  if (priorityRaw) {
+    if (!(TICKET_PRIORITIES as readonly string[]).includes(priorityRaw)) {
+      throw new TaskboardValidationError(`invalid priority: ${priorityRaw}`)
+    }
+    priority = priorityRaw as TicketPriority
+  }
+  const result = listTickets(db, {
+    projectId,
+    status,
+    type,
+    priority,
+    assignee: url.searchParams.get('assignee') ?? undefined,
+    stageId: url.searchParams.get('stageId') ?? undefined,
+    label: url.searchParams.get('label') ?? undefined,
+    q: url.searchParams.get('q') ?? undefined,
+    limit: parseLimit(url),
+    offset: parseOffset(url),
+  })
+  sendJson(res, 200, result)
+}
+
+function handleCreateTicket(
+  res: ServerResponse,
+  body: Record<string, unknown>,
+  db: TaskboardDb,
+  actor: Actor,
+): void {
+  if ('identifier' in body || 'version' in body || 'id' in body) {
+    throw new TaskboardValidationError('identifier / version / id must not be sent')
+  }
+  const projectRef = asString(body.projectId)
+  const title = asString(body.title)
+  const typeRaw = asString(body.type)
+  if (!projectRef || !title || !typeRaw) {
+    throw new TaskboardValidationError('projectId, type and title are required')
+  }
+  if (!(TICKET_TYPES as readonly string[]).includes(typeRaw)) {
+    throw new TaskboardValidationError(`invalid type: ${typeRaw}`)
+  }
+  const type = typeRaw as TicketType
+  const project = resolveProject(db, projectRef)
+  if (!project) throw new TaskboardNotFound('project', projectRef)
+
+  let pipelineId = asNullableString(body.pipelineId) ?? null
+  let stageId = asNullableString(body.stageId) ?? null
+  if (!pipelineId) {
+    const pipeline = getDefaultPipeline(db, project.id, type)
+    if (pipeline) {
+      pipelineId = pipeline.id
+      if (!stageId) {
+        const first = listStages(db, pipeline.id)[0]
+        stageId = first?.id ?? null
+      }
+    }
+  }
+
+  const priorityRaw = asString(body.priority)
+  if (priorityRaw && !(TICKET_PRIORITIES as readonly string[]).includes(priorityRaw)) {
+    throw new TaskboardValidationError(`invalid priority: ${priorityRaw}`)
+  }
+  const severityRaw = asNullableString(body.severity)
+  if (severityRaw && !(TICKET_SEVERITIES as readonly string[]).includes(severityRaw)) {
+    throw new TaskboardValidationError(`invalid severity: ${severityRaw}`)
+  }
+  const sourceRaw = asString(body.source)
+  if (sourceRaw && !(TICKET_SOURCES as readonly string[]).includes(sourceRaw)) {
+    throw new TaskboardValidationError(`invalid source: ${sourceRaw}`)
+  }
+
+  const ticket = createTicket(db, {
+    projectId: project.id,
+    type,
+    title,
+    body: asString(body.body) ?? '',
+    priority: (priorityRaw as TicketPriority | undefined) ?? 'P2',
+    severity: (severityRaw as TicketSeverity | null | undefined) ?? null,
+    labels: asStringArray(body.labels) ?? [],
+    assignee: asNullableString(body.assignee) ?? null,
+    reporter: asString(body.reporter) ?? HUMAN_ACTOR_ID,
+    source: (sourceRaw as TicketSource | undefined) ?? 'manual',
+    originSessionKey: asNullableString(body.originSessionKey) ?? null,
+    dueDate: asNullableNumber(body.dueDate) ?? null,
+    startDate: asNullableNumber(body.startDate) ?? null,
+    pipelineId,
+    stageId,
+  })
+  recordActivity(
+    db,
+    ticket.id,
+    actor,
+    actorIdOf(actor),
+    'ticket_created',
+    'status',
+    null,
+    ticket.status,
+  )
+  sendJson(res, 201, { ok: true, ticket })
+}
+
+function handleGetTicket(res: ServerResponse, url: URL, db: TaskboardDb, idOrIdent: string): void {
+  const ticket = requireTicket(db, idOrIdent)
+  const expand = (url.searchParams.get('expand') ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+  const extra: { pipeline?: ReturnType<typeof getPipeline>; stage?: ReturnType<typeof getStage> } =
+    {}
+  if (expand.includes('pipeline')) {
+    extra.pipeline = ticket.pipelineId ? getPipeline(db, ticket.pipelineId) : null
+  }
+  if (expand.includes('stage')) {
+    extra.stage = ticket.stageId ? getStage(db, ticket.stageId) : null
+  }
+  sendJson(res, 200, { ticket, ...extra })
+}
+
+function handlePatchTicket(
+  res: ServerResponse,
+  body: Record<string, unknown>,
+  db: TaskboardDb,
+  actor: Actor,
+  idOrIdent: string,
+): void {
+  const ticket = requireTicket(db, idOrIdent)
+  const expectedVersion = requireExpectedVersion(body)
+  const updated = updateTicket(db, ticket.id, expectedVersion, {
+    title: asString(body.title),
+    body: asString(body.body),
+    priority: asString(body.priority) as TicketPriority | undefined,
+    severity: asNullableString(body.severity) as TicketSeverity | null | undefined,
+    labels: asStringArray(body.labels),
+    assignee: asNullableString(body.assignee),
+    dueDate: asNullableNumber(body.dueDate),
+    startDate: asNullableNumber(body.startDate),
+    blockedReason: asNullableString(body.blockedReason),
+  })
+  recordActivity(db, ticket.id, actor, actorIdOf(actor), 'field_updated')
+  sendJson(res, 200, { ok: true, ticket: updated })
+}
+
+async function handleTicketCollection(
+  req: IncomingMessage,
+  res: ServerResponse,
+  url: URL,
+  method: string,
+  db: TaskboardDb,
+  actor: Actor,
+  idOrIdent: string,
+  collection: TicketCollection,
+): Promise<void> {
+  const ticket = requireTicket(db, idOrIdent)
+  if (collection === 'runs') {
+    if (method !== 'GET') return sendError(res, 405, 'method not allowed')
+    const status = parseCsvEnums(
+      url.searchParams.get('status'),
+      ['queued', 'running', 'succeeded', 'failed', 'timeout', 'skipped'] as const,
+      'status',
+    )
+    const result = listRuns(db, {
+      ticketId: ticket.id,
+      stageId: url.searchParams.get('stageId') ?? undefined,
+      status: status as RunStatus[] | undefined,
+      limit: parseLimit(url),
+      offset: parseOffset(url),
+    })
+    return sendJson(res, 200, result)
+  }
+  if (collection === 'relations') {
+    if (method === 'GET') return sendJson(res, 200, { items: listRelations(db, ticket.id) })
+    if (method === 'POST') {
+      const body = await readJsonBody(req)
+      return handleAddRelation(res, body, db, actor, ticket)
+    }
+    return sendError(res, 405, 'method not allowed')
+  }
+  if (collection === 'comments') {
+    if (method !== 'GET') return sendError(res, 405, 'method not allowed')
+    return sendJson(res, 200, {
+      items: listComments(db, ticket.id, {
+        limit: parseLimit(url, 100, 500),
+        offset: parseOffset(url),
+      }),
+    })
+  }
+  if (collection === 'activity') {
+    if (method !== 'GET') return sendError(res, 405, 'method not allowed')
+    return sendJson(res, 200, {
+      items: listActivities(db, ticket.id, {
+        limit: parseLimit(url, 100, 500),
+        offset: parseOffset(url),
+      }),
+    })
+  }
+  if (method !== 'GET') return sendError(res, 405, 'method not allowed')
+  return handleTimeline(res, url, db, ticket)
+}
+
+function handleAddRelation(
+  res: ServerResponse,
+  body: Record<string, unknown>,
+  db: TaskboardDb,
+  actor: Actor,
+  ticket: Ticket,
+): void {
+  const toRef = asString(body.toTicketId)
+  const kindRaw = asString(body.kind)
+  if (!toRef || !kindRaw) throw new TaskboardValidationError('toTicketId and kind are required')
+  if (!(RELATION_KINDS as readonly string[]).includes(kindRaw)) {
+    throw new TaskboardValidationError(`invalid relation kind: ${kindRaw}`)
+  }
+  const to = requireTicket(db, toRef)
+  const relation = addRelation(db, {
+    fromTicketId: ticket.id,
+    toTicketId: to.id,
+    kind: kindRaw as RelationKind,
+  })
+  recordActivity(
+    db,
+    ticket.id,
+    actor,
+    actorIdOf(actor),
+    'relation_added',
+    'relation',
+    null,
+    `${kindRaw}:${to.identifier}`,
+  )
+  sendJson(res, 201, { ok: true, relation })
+}
+
+function handleTimeline(res: ServerResponse, url: URL, db: TaskboardDb, ticket: Ticket): void {
+  const limit = parseLimit(url, 100, 500)
+  const comments = listComments(db, ticket.id, { limit: 500, offset: 0 })
+  const activities = listActivities(db, ticket.id, { limit: 500, offset: 0 })
+  const runs = listRuns(db, { ticketId: ticket.id, limit: 200, offset: 0 }).items
+  type Item =
+    | { kind: 'activity'; createdAt: number; activity: (typeof activities)[number] }
+    | { kind: 'run'; createdAt: number; run: (typeof runs)[number] }
+    | { kind: 'comment'; createdAt: number; comment: (typeof comments)[number] }
+  const items: Item[] = [
+    ...activities.map((activity) => ({
+      kind: 'activity' as const,
+      createdAt: activity.createdAt,
+      activity,
+    })),
+    ...runs.map((run) => ({ kind: 'run' as const, createdAt: run.createdAt, run })),
+    ...comments.map((comment) => ({
+      kind: 'comment' as const,
+      createdAt: comment.createdAt,
+      comment,
+    })),
+  ]
+  items.sort((a, b) => a.createdAt - b.createdAt || a.kind.localeCompare(b.kind))
+  sendJson(res, 200, { items: items.slice(0, limit) })
+}
+
+function handleTicketAction(
+  res: ServerResponse,
+  body: Record<string, unknown>,
+  db: TaskboardDb,
+  actor: Actor,
+  idOrIdent: string,
+  action: TicketAction,
+): void {
+  const ticket = requireTicket(db, idOrIdent)
+  if (action === 'comment') handleComment(res, body, db, actor, ticket)
+  else if (action === 'patrol') handlePatrol(res, body, db, actor, ticket)
+  else if (action === 'claim') handleClaim(res, body, db, actor, ticket)
+  else if (action === 'ready') handleReady(res, body, db, actor, ticket)
+  else if (action === 'advance') handleAdvance(res, body, db, actor, ticket)
+  else if (action === 'block') handleBlock(res, body, db, actor, ticket)
+  else if (action === 'approve') handleApprove(res, body, db, actor, ticket)
+  else if (action === 'reject') handleReject(res, body, db, actor, ticket)
+  else if (action === 'done') handleDone(res, body, db, actor, ticket)
+  else handleCancel(res, body, db, actor, ticket)
+}
+
+function handleComment(
+  res: ServerResponse,
+  body: Record<string, unknown>,
+  db: TaskboardDb,
+  actor: Actor,
+  ticket: Ticket,
+): void {
+  const text = asString(body.body)
+  if (!text || !text.trim()) throw new TaskboardValidationError('comment body is required')
+  const authorKind: AuthorKind = actor
+  const comment = createComment(db, {
+    ticketId: ticket.id,
+    authorKind,
+    author: asString(body.author) ?? actorIdOf(actor),
+    body: text,
+    runId: asNullableString(body.runId) ?? null,
+  })
+  sendJson(res, 200, { ok: true, comment })
+}
+
+function handleReady(
+  res: ServerResponse,
+  body: Record<string, unknown>,
+  db: TaskboardDb,
+  actor: Actor,
+  ticket: Ticket,
+): void {
+  const expectedVersion = requireExpectedVersion(body)
+  const stage = currentStage(db, ticket)
+  assertTransition({
+    from: ticket.status,
+    to: 'ready',
+    actor,
+    autoClose: stage?.autoClose,
+    stageOnSuccess: stage?.onSuccess,
+  })
+  const updated = updateTicket(db, ticket.id, expectedVersion, { status: 'ready' })
+  recordActivity(
+    db,
+    ticket.id,
+    actor,
+    actorIdOf(actor),
+    'status_changed',
+    'status',
+    ticket.status,
+    'ready',
+  )
+  sendJson(res, 200, { ok: true, ticket: updated })
+}
+
+function handleClaim(
+  res: ServerResponse,
+  body: Record<string, unknown>,
+  db: TaskboardDb,
+  actor: Actor,
+  ticket: Ticket,
+): void {
+  const expectedVersion = requireExpectedVersion(body)
+  const stage = currentStage(db, ticket)
+  if (!stage) throw new TaskboardValidationError('ticket has no stage')
+  const owner = asString(body.owner) ?? actorIdOf(actor)
+  const held = getActiveLease(db, ticket.id)
+  if (held) {
+    throw new TaskboardLeaseHeld(ticket.id, held.leaseOwner ?? 'unknown', held.leaseExpiresAt ?? 0)
+  }
+  assertTransition({
+    from: ticket.status,
+    to: 'running',
+    actor,
+    hasLease: true,
+    autoClose: stage.autoClose,
+  })
+  const result = db.transaction(() => {
+    const run = acquireLease(db, ticket.id, stage.id, owner, GUARDRAIL_DEFAULTS.leaseTtlMs, {
+      agentId: stage.agentId,
+      trigger: 'transition',
+    })
+    const updated = updateTicket(db, ticket.id, expectedVersion, { status: 'running' })
+    recordActivity(
+      db,
+      ticket.id,
+      actor,
+      owner,
+      'status_changed',
+      'status',
+      ticket.status,
+      'running',
+    )
+    return { run, ticket: updated }
+  })()
+  sendJson(res, 200, { ok: true, ticket: result.ticket })
+}
+
+function finishActiveRun(
+  db: TaskboardDb,
+  ticket: Ticket,
+  body: Record<string, unknown>,
+  status: 'succeeded' | 'failed' = 'succeeded',
+): void {
+  const runId = asString(body.runId)
+  const run = runId ? getRun(db, runId) : getActiveLease(db, ticket.id)
+  if (!run) return
+  const now = Date.now()
+  updateRun(db, run.id, {
+    status,
+    summary: asNullableString(body.summary) ?? run.summary,
+    outputMd: asNullableString(body.outputMd) ?? run.outputMd,
+    finishedAt: now,
+    durationMs: run.startedAt != null ? now - run.startedAt : null,
+    leaseOwner: null,
+    leaseExpiresAt: null,
+  })
+}
+
+function handleAdvance(
+  res: ServerResponse,
+  body: Record<string, unknown>,
+  db: TaskboardDb,
+  actor: Actor,
+  ticket: Ticket,
+): void {
+  const expectedVersion = requireExpectedVersion(body)
+  const stage = currentStage(db, ticket)
+  if (!stage) throw new TaskboardValidationError('ticket has no stage')
+  const to: TicketStatus = stage.onSuccess === 'wait_human' ? 'waiting_human' : 'ready'
+  assertTransition({
+    from: ticket.status,
+    to,
+    actor,
+    stageOnSuccess: stage.onSuccess,
+    autoClose: stage.autoClose,
+  })
+  let nextStageId = ticket.stageId
+  if (stage.onSuccess === 'advance') {
+    nextStageId = nextStage(db, stage)?.id ?? ticket.stageId
+  }
+  const updated = db.transaction(() => {
+    const active = getActiveLease(db, ticket.id)
+    const runId = asString(body.runId) ?? active?.id ?? null
+    finishActiveRun(db, ticket, body)
+    const summary = asString(body.summary) ?? asString(body.outputMd)
+    if (summary) {
+      createComment(db, {
+        ticketId: ticket.id,
+        authorKind: actor,
+        author: actorIdOf(actor),
+        body: summary,
+        runId,
+      })
+    }
+    const next = updateTicket(db, ticket.id, expectedVersion, {
+      status: to,
+      stageId: nextStageId,
+    })
+    recordActivity(
+      db,
+      ticket.id,
+      actor,
+      actorIdOf(actor),
+      'stage_advanced',
+      'status',
+      ticket.status,
+      to,
+    )
+    return next
+  })()
+  sendJson(res, 200, { ok: true, ticket: updated })
+}
+
+function handleBlock(
+  res: ServerResponse,
+  body: Record<string, unknown>,
+  db: TaskboardDb,
+  actor: Actor,
+  ticket: Ticket,
+): void {
+  const expectedVersion = requireExpectedVersion(body)
+  const reason = asString(body.reason)
+  if (!reason || !reason.trim()) throw new TaskboardValidationError('reason is required')
+  const stage = currentStage(db, ticket)
+  assertTransition({
+    from: ticket.status,
+    to: 'blocked',
+    actor,
+    autoClose: stage?.autoClose,
+    stageOnSuccess: stage?.onSuccess,
+  })
+  const updated = updateTicket(db, ticket.id, expectedVersion, {
+    status: 'blocked',
+    blockedReason: reason,
+  })
+  recordActivity(
+    db,
+    ticket.id,
+    actor,
+    actorIdOf(actor),
+    'status_changed',
+    'status',
+    ticket.status,
+    'blocked',
+  )
+  sendJson(res, 200, { ok: true, ticket: updated })
+}
+
+function handleApprove(
+  res: ServerResponse,
+  body: Record<string, unknown>,
+  db: TaskboardDb,
+  actor: Actor,
+  ticket: Ticket,
+): void {
+  const expectedVersion = requireExpectedVersion(body)
+  const close = asBoolean(body.close) ?? false
+  const stage = currentStage(db, ticket)
+  const nxt = stage ? nextStage(db, stage) : null
+  const isLast = !nxt
+  if (close && isLast) {
+    assertTransition({
+      from: ticket.status,
+      to: 'done',
+      actor,
+      autoClose: stage?.autoClose,
+    })
+    const updated = updateTicket(db, ticket.id, expectedVersion, {
+      status: 'done',
+      closedAt: Date.now(),
+    })
+    recordActivity(
+      db,
+      ticket.id,
+      actor,
+      actorIdOf(actor),
+      'status_changed',
+      'status',
+      ticket.status,
+      'done',
+    )
+    sendJson(res, 200, { ok: true, ticket: updated })
+    return
+  }
+  assertTransition({
+    from: ticket.status,
+    to: 'ready',
+    actor,
+    autoClose: stage?.autoClose,
+  })
+  const updated = updateTicket(db, ticket.id, expectedVersion, {
+    status: 'ready',
+    stageId: nxt?.id ?? ticket.stageId,
+  })
+  recordActivity(
+    db,
+    ticket.id,
+    actor,
+    actorIdOf(actor),
+    'status_changed',
+    'status',
+    ticket.status,
+    'ready',
+  )
+  sendJson(res, 200, { ok: true, ticket: updated })
+}
+
+function handleReject(
+  res: ServerResponse,
+  body: Record<string, unknown>,
+  db: TaskboardDb,
+  actor: Actor,
+  ticket: Ticket,
+): void {
+  const expectedVersion = requireExpectedVersion(body)
+  const reason = asString(body.reason)
+  if (!reason || !reason.trim()) throw new TaskboardValidationError('reason is required')
+  const stage = currentStage(db, ticket)
+  assertTransition({
+    from: ticket.status,
+    to: 'ready',
+    actor,
+    autoClose: stage?.autoClose,
+  })
+  let targetStageId = asNullableString(body.targetStageId) ?? null
+  if (!targetStageId && stage) {
+    targetStageId = previousAiStage(db, stage)?.id ?? ticket.stageId
+  }
+  if (targetStageId) {
+    const target = getStage(db, targetStageId)
+    if (!target) throw new TaskboardNotFound('stage', targetStageId)
+    if (stage && target.pipelineId !== stage.pipelineId) {
+      throw new TaskboardValidationError('targetStageId is not on the current pipeline')
+    }
+  }
+  const updated = updateTicket(db, ticket.id, expectedVersion, {
+    status: 'ready',
+    stageId: targetStageId,
+    blockedReason: null,
+  })
+  createComment(db, {
+    ticketId: ticket.id,
+    authorKind: actor,
+    author: actorIdOf(actor),
+    body: reason,
+  })
+  recordActivity(
+    db,
+    ticket.id,
+    actor,
+    actorIdOf(actor),
+    'status_changed',
+    'status',
+    ticket.status,
+    'ready',
+  )
+  sendJson(res, 200, { ok: true, ticket: updated })
+}
+
+function handleDone(
+  res: ServerResponse,
+  body: Record<string, unknown>,
+  db: TaskboardDb,
+  actor: Actor,
+  ticket: Ticket,
+): void {
+  const expectedVersion = requireExpectedVersion(body)
+  const stage = currentStage(db, ticket)
+  assertTransition({
+    from: ticket.status,
+    to: 'done',
+    actor,
+    autoClose: stage?.autoClose ?? false,
+  })
+  const updated = updateTicket(db, ticket.id, expectedVersion, {
+    status: 'done',
+    closedAt: Date.now(),
+  })
+  recordActivity(
+    db,
+    ticket.id,
+    actor,
+    actorIdOf(actor),
+    'status_changed',
+    'status',
+    ticket.status,
+    'done',
+  )
+  sendJson(res, 200, { ok: true, ticket: updated })
+}
+
+function handleCancel(
+  res: ServerResponse,
+  body: Record<string, unknown>,
+  db: TaskboardDb,
+  actor: Actor,
+  ticket: Ticket,
+): void {
+  const expectedVersion = requireExpectedVersion(body)
+  const stage = currentStage(db, ticket)
+  assertTransition({
+    from: ticket.status,
+    to: 'canceled',
+    actor,
+    autoClose: stage?.autoClose,
+  })
+  const reason = asNullableString(body.reason)
+  const updated = updateTicket(db, ticket.id, expectedVersion, {
+    status: 'canceled',
+    closedAt: Date.now(),
+    blockedReason: reason === undefined ? ticket.blockedReason : reason,
+  })
+  recordActivity(
+    db,
+    ticket.id,
+    actor,
+    actorIdOf(actor),
+    'status_changed',
+    'status',
+    ticket.status,
+    'canceled',
+  )
+  sendJson(res, 200, { ok: true, ticket: updated })
+}
+
+function handlePatrol(
+  res: ServerResponse,
+  body: Record<string, unknown>,
+  db: TaskboardDb,
+  actor: Actor,
+  ticket: Ticket,
+): void {
+  const expectedVersion = requireExpectedVersion(body)
+  if (ticket.version !== expectedVersion) {
+    throw new TaskboardVersionConflict(ticket.id, expectedVersion, ticket.version)
+  }
+  const settings = readSettings(db)
+  if (settings.patrolPaused) {
+    throw new TaskboardValidationError('patrol is paused')
+  }
+  const stageRef = asNullableString(body.stageId) ?? ticket.stageId
+  if (!stageRef) throw new TaskboardValidationError('ticket has no stage')
+  const stage = getStage(db, stageRef)
+  if (!stage) throw new TaskboardNotFound('stage', stageRef)
+  if (stage.kind !== 'ai') throw new TaskboardValidationError('stage is not an ai stage')
+
+  const usage = readUsage(db)
+  if (usage.activeRuns >= settings.maxConcurrentRuns) {
+    insertRun(db, {
+      ticketId: ticket.id,
+      stageId: stage.id,
+      agentId: stage.agentId,
+      trigger: 'manual',
+      status: 'skipped',
+      skipReason: 'concurrency_full',
+    })
+    sendError(res, 429, 'taskboard concurrency full', { code: 'concurrency_full' })
+    return
+  }
+
+  // 从 ready 认领;已经 running 则只会被 lease 挡住(423)。
+  if (ticket.status !== 'running') {
+    assertTransition({
+      from: ticket.status,
+      to: 'running',
+      actor,
+      hasLease: true,
+      autoClose: stage.autoClose,
+    })
+  }
+
+  const owner = actorIdOf(actor)
+  const result = db.transaction(() => {
+    const run = acquireLease(db, ticket.id, stage.id, owner, GUARDRAIL_DEFAULTS.leaseTtlMs, {
+      agentId: stage.agentId,
+      trigger: 'manual',
+    })
+    const agentId = run.agentId ?? stage.agentId ?? 'unknown'
+    const sessionKey = buildPatrolSessionKey(agentId, ticket.id, stage.id, run.id)
+    const withKey = updateRun(db, run.id, { sessionKey })
+    const updated =
+      ticket.status === 'running'
+        ? ticket
+        : updateTicket(db, ticket.id, expectedVersion, { status: 'running' })
+    if (updated.status === 'running' && ticket.status !== 'running') {
+      recordActivity(
+        db,
+        ticket.id,
+        actor,
+        owner,
+        'status_changed',
+        'status',
+        ticket.status,
+        'running',
+      )
+    }
+    return { run: withKey, ticket: updated }
+  })()
+
+  // TODO(T4): enqueuePatrolExecution 是后台执行接口点,T4 在此接 delegate。
+  enqueuePatrolExecution({
+    ticketId: result.ticket.id,
+    runId: result.run.id,
+    stageId: stage.id,
+    agentId: result.run.agentId,
+    trigger: 'manual',
+    sessionKey: result.run.sessionKey ?? '',
+  })
+  sendJson(res, 202, { ok: true, run: result.run, ticket: result.ticket })
+}
+
+// ── Pipeline / Stage ────────────────────────────────────────────────────────
+
+function handleListPipelines(res: ServerResponse, url: URL, db: TaskboardDb): void {
+  const projectRef = url.searchParams.get('projectId')
+  if (!projectRef) throw new TaskboardValidationError('projectId is required')
+  const project = resolveProject(db, projectRef)
+  if (!project) throw new TaskboardNotFound('project', projectRef)
+  sendJson(res, 200, { items: listPipelines(db, project.id) })
+}
+
+function handleCreatePipeline(
+  res: ServerResponse,
+  body: Record<string, unknown>,
+  db: TaskboardDb,
+): void {
+  const projectRef = asString(body.projectId)
+  const name = asString(body.name)
+  if (!projectRef || !name) throw new TaskboardValidationError('projectId and name are required')
+  const project = resolveProject(db, projectRef)
+  if (!project) throw new TaskboardNotFound('project', projectRef)
+  const typeRaw = asNullableString(body.ticketType)
+  if (typeRaw && !(TICKET_TYPES as readonly string[]).includes(typeRaw)) {
+    throw new TaskboardValidationError(`invalid ticketType: ${typeRaw}`)
+  }
+  const pipeline = createPipeline(db, {
+    projectId: project.id,
+    name,
+    ticketType: (typeRaw as TicketType | null | undefined) ?? null,
+    isDefault: asBoolean(body.isDefault) ?? false,
+  })
+  sendJson(res, 201, { ok: true, pipeline })
+}
+
+function handleGetPipeline(res: ServerResponse, db: TaskboardDb, id: string): void {
+  const pipeline = getPipeline(db, id)
+  if (!pipeline) throw new TaskboardNotFound('pipeline', id)
+  sendJson(res, 200, { pipeline, stages: listStages(db, pipeline.id) })
+}
+
+function handlePatchPipeline(
+  res: ServerResponse,
+  body: Record<string, unknown>,
+  db: TaskboardDb,
+  id: string,
+): void {
+  const typeRaw = asNullableString(body.ticketType)
+  if (typeRaw && !(TICKET_TYPES as readonly string[]).includes(typeRaw)) {
+    throw new TaskboardValidationError(`invalid ticketType: ${typeRaw}`)
+  }
+  const pipeline = updatePipeline(db, id, {
+    name: asString(body.name),
+    ticketType: typeRaw as TicketType | null | undefined,
+    isDefault: asBoolean(body.isDefault),
+  })
+  sendJson(res, 200, { ok: true, pipeline })
+}
+
+function handleListStages(res: ServerResponse, db: TaskboardDb, pipelineId: string): void {
+  if (!getPipeline(db, pipelineId)) throw new TaskboardNotFound('pipeline', pipelineId)
+  sendJson(res, 200, { items: listStages(db, pipelineId) })
+}
+
+function validateStageWrite(input: {
+  kind?: StageKind
+  agentId?: string | null
+  promptTemplate?: string | null
+  patrolEnabled?: boolean
+  timeoutSec?: number
+}): void {
+  if (input.kind === 'ai') {
+    if (!input.agentId) throw new TaskboardValidationError('agentId is required for ai stages')
+    if (!input.promptTemplate) {
+      throw new TaskboardValidationError('promptTemplate is required for ai stages')
+    }
+  }
+  if (input.agentId && isHiddenSystemAgentId(input.agentId)) {
+    throw new TaskboardValidationError('hidden-reviewer cannot be bound to a stage')
+  }
+  if (input.kind === 'human' && input.patrolEnabled) {
+    throw new TaskboardValidationError('human stages cannot enable patrol')
+  }
+  if (input.timeoutSec != null && input.timeoutSec > DELEGATE_HARD_TIMEOUT_SEC) {
+    throw new TaskboardValidationError(`timeoutSec must be <= ${DELEGATE_HARD_TIMEOUT_SEC}`)
+  }
+}
+
+function handleCreateStage(
+  res: ServerResponse,
+  body: Record<string, unknown>,
+  db: TaskboardDb,
+  pipelineId: string,
+): void {
+  if (!getPipeline(db, pipelineId)) throw new TaskboardNotFound('pipeline', pipelineId)
+  const name = asString(body.name)
+  const kindRaw = asString(body.kind)
+  if (!name || !kindRaw) throw new TaskboardValidationError('name and kind are required')
+  if (!(STAGE_KINDS as readonly string[]).includes(kindRaw)) {
+    throw new TaskboardValidationError(`invalid kind: ${kindRaw}`)
+  }
+  const kind = kindRaw as StageKind
+  const existing = listStages(db, pipelineId)
+  const ordinal = typeof body.ordinal === 'number' ? body.ordinal : existing.length
+  const agentId = asNullableString(body.agentId) ?? null
+  const promptTemplate = asNullableString(body.promptTemplate) ?? null
+  const patrolEnabled = asBoolean(body.patrolEnabled)
+  const timeoutSec = typeof body.timeoutSec === 'number' ? body.timeoutSec : undefined
+  validateStageWrite({ kind, agentId, promptTemplate, patrolEnabled, timeoutSec })
+  const stage = createStage(db, {
+    pipelineId,
+    ordinal,
+    name,
+    kind,
+    agentId,
+    promptTemplate,
+    toolsets: asNullableStringArray(body.toolsets) ?? null,
+    effort: asNullableString(body.effort) ?? null,
+    patrolCron: asNullableString(body.patrolCron) ?? null,
+    patrolEnabled,
+    patrolTimezone: asString(body.patrolTimezone),
+    quietHoursStart: asNullableNumber(body.quietHoursStart),
+    quietHoursEnd: asNullableNumber(body.quietHoursEnd),
+    maxRunsPerDay: typeof body.maxRunsPerDay === 'number' ? body.maxRunsPerDay : undefined,
+    timeoutSec,
+    maxRetries: typeof body.maxRetries === 'number' ? body.maxRetries : undefined,
+    circuitBreakerThreshold:
+      typeof body.circuitBreakerThreshold === 'number' ? body.circuitBreakerThreshold : undefined,
+    onSuccess: asString(body.onSuccess) as OnSuccessAction | undefined,
+    onFailure: asString(body.onFailure) as OnFailureAction | undefined,
+    entryCondition: asNullableString(body.entryCondition),
+    exitChecklist: asNullableString(body.exitChecklist),
+    requireHumanAck: asBoolean(body.requireHumanAck),
+    autoClose: asBoolean(body.autoClose),
+  })
+  sendJson(res, 201, { ok: true, stage })
+}
+
+function handleGetStage(res: ServerResponse, db: TaskboardDb, id: string): void {
+  const stage = getStage(db, id)
+  if (!stage) throw new TaskboardNotFound('stage', id)
+  sendJson(res, 200, { stage })
+}
+
+function handlePatchStage(
+  res: ServerResponse,
+  body: Record<string, unknown>,
+  db: TaskboardDb,
+  id: string,
+): void {
+  const existing = getStage(db, id)
+  if (!existing) throw new TaskboardNotFound('stage', id)
+  const kind = (asString(body.kind) as StageKind | undefined) ?? existing.kind
+  const agentId =
+    body.agentId === undefined ? existing.agentId : (asNullableString(body.agentId) ?? null)
+  const promptTemplate =
+    body.promptTemplate === undefined
+      ? existing.promptTemplate
+      : (asNullableString(body.promptTemplate) ?? null)
+  const patrolEnabled = asBoolean(body.patrolEnabled) ?? existing.patrolEnabled
+  const timeoutSec = typeof body.timeoutSec === 'number' ? body.timeoutSec : existing.timeoutSec
+  validateStageWrite({ kind, agentId, promptTemplate, patrolEnabled, timeoutSec })
+  const stage = updateStage(db, id, {
+    name: asString(body.name),
+    kind: asString(body.kind) as StageKind | undefined,
+    agentId: asNullableString(body.agentId),
+    promptTemplate: asNullableString(body.promptTemplate),
+    toolsets: asNullableStringArray(body.toolsets),
+    effort: asNullableString(body.effort),
+    patrolCron: asNullableString(body.patrolCron),
+    patrolEnabled: asBoolean(body.patrolEnabled),
+    patrolTimezone: asString(body.patrolTimezone),
+    quietHoursStart: asNullableNumber(body.quietHoursStart),
+    quietHoursEnd: asNullableNumber(body.quietHoursEnd),
+    maxRunsPerDay: typeof body.maxRunsPerDay === 'number' ? body.maxRunsPerDay : undefined,
+    timeoutSec: typeof body.timeoutSec === 'number' ? body.timeoutSec : undefined,
+    maxRetries: typeof body.maxRetries === 'number' ? body.maxRetries : undefined,
+    circuitBreakerThreshold:
+      typeof body.circuitBreakerThreshold === 'number' ? body.circuitBreakerThreshold : undefined,
+    onSuccess: asString(body.onSuccess) as OnSuccessAction | undefined,
+    onFailure: asString(body.onFailure) as OnFailureAction | undefined,
+    entryCondition: asNullableString(body.entryCondition),
+    exitChecklist: asNullableString(body.exitChecklist),
+    requireHumanAck: asBoolean(body.requireHumanAck),
+    autoClose: asBoolean(body.autoClose),
+    ordinal: typeof body.ordinal === 'number' ? body.ordinal : undefined,
+  })
+  sendJson(res, 200, { ok: true, stage })
+}
+
+function handleGetRun(res: ServerResponse, db: TaskboardDb, id: string): void {
+  const run = getRun(db, id)
+  if (!run) throw new TaskboardNotFound('run', id)
+  sendJson(res, 200, { run })
+}
+
+// ── Agents / Settings ───────────────────────────────────────────────────────
+
+async function handleListAgents(res: ServerResponse, ctx: TaskboardHttpContext): Promise<void> {
+  let items: BoardAgent[]
+  if (ctx.listAgents) {
+    items = await ctx.listAgents()
+  } else {
+    const { readAgentsConfig } = await import('@openclaude/storage')
+    const cfg = await readAgentsConfig()
+    items = filterUserVisibleAgentsForManagement(cfg.agents).map((a) => ({
+      id: a.id,
+      name: a.displayName ?? a.id,
+      model: a.model ?? '',
+      description: a.greeting ?? '',
+    }))
+  }
+  items = filterUserVisibleAgentsForManagement(items)
+  sendJson(res, 200, { items })
+}
+
+function handleGetSettings(res: ServerResponse, db: TaskboardDb): void {
+  sendJson(res, 200, { ...readSettings(db), usage: readUsage(db) })
+}
+
+function handlePatchSettings(
+  res: ServerResponse,
+  body: Record<string, unknown>,
+  db: TaskboardDb,
+  actor: Actor,
+): void {
+  if (actor !== 'human') {
+    sendError(res, 403, 'forbidden', { code: 'forbidden' })
+    return
+  }
+  const patch: Partial<TaskboardSettings> = {}
+  if (typeof body.maxConcurrentRuns === 'number') patch.maxConcurrentRuns = body.maxConcurrentRuns
+  if (typeof body.maxRunsPerDay === 'number') patch.maxRunsPerDay = body.maxRunsPerDay
+  if (body.maxCostPerDayUsd === null || typeof body.maxCostPerDayUsd === 'number') {
+    patch.maxCostPerDayUsd = body.maxCostPerDayUsd
+  }
+  if (typeof body.quietHoursStart === 'number') patch.quietHoursStart = body.quietHoursStart
+  if (typeof body.quietHoursEnd === 'number') patch.quietHoursEnd = body.quietHoursEnd
+  if (typeof body.circuitBreakerThreshold === 'number') {
+    patch.circuitBreakerThreshold = body.circuitBreakerThreshold
+  }
+  if (typeof body.maxStageLoops === 'number') patch.maxStageLoops = body.maxStageLoops
+  if (typeof body.maxRunsPerTick === 'number') patch.maxRunsPerTick = body.maxRunsPerTick
+  if (typeof body.patrolPaused === 'boolean') patch.patrolPaused = body.patrolPaused
+  const settings = writeSettings(db, patch)
+  sendJson(res, 200, { ok: true, ...settings, usage: readUsage(db) })
+}

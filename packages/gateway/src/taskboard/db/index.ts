@@ -3,9 +3,7 @@
 // 照抄 packages/storage/src/sessionsDb.ts 的开库范本:
 //   better-sqlite3 + busy_timeout=10000 + journal_mode=WAL + 30min
 //   wal_checkpoint(TRUNCATE) + process.exit 关库。
-// 路径与 sessions.db 同目录:`${OPENCLAUDE_HOME ?? ~/.openclaude}/taskboard.db`。
-// 当前 paths.ts 还没有 taskboardDb 字段(不在本任务清单),这里按同一 HOME
-// 规则本地拼接;后续应在 paths.ts 加一行做成单一权威。
+// 路径用 storage `paths.taskboardDb`,与 sessions.db 同目录。
 //
 // 测试必须传入显式路径(临时目录),禁止打到真实 ~/.openclaude。
 // 单例 getTaskboardDb() 只给生产 / gateway 启动用。
@@ -16,8 +14,8 @@
 //   - ESM 下 paths 在 import 时就读 OPENCLAUDE_HOME,测试里后改 env 无效。
 
 import { mkdirSync } from 'node:fs'
-import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { dirname } from 'node:path'
+import { paths } from '@openclaude/storage'
 import Database from 'better-sqlite3'
 import { TASKBOARD_DDL_V1, TASKBOARD_SCHEMA_VERSION, type TaskboardDb } from './schema.js'
 
@@ -35,10 +33,7 @@ let _db: TaskboardDb | null = null
 let _walTimer: ReturnType<typeof setInterval> | null = null
 
 export function resolveTaskboardDbPath(): string {
-  // 与 packages/storage/src/paths.ts 的 HOME 规则对齐;paths.ts 加
-  // taskboardDb 之前先本地拼,避免本包去 import storage 触发工程引用。
-  const home = process.env.OPENCLAUDE_HOME ?? join(homedir(), '.openclaude')
-  return join(home, 'taskboard.db')
+  return paths.taskboardDb
 }
 
 /**

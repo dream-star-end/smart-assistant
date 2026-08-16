@@ -59,6 +59,13 @@ CREATE TABLE IF NOT EXISTS tb_pipeline (
   updated_at INTEGER NOT NULL
 );
 
+-- 同一项目同一单据类型只能有一条默认流水线。DAO 已在事务里降级旧默认线,这条索引
+-- 是兜底:直写 SQL 或将来新增写路径绕过 DAO 时,数据库自己拦住。ticket_type 可为
+-- NULL(通用兜底线),而 SQLite 的 UNIQUE 认为多个 NULL 互不相等,所以必须 COALESCE
+-- 成空串再参与唯一性,否则通用线可以存在多条默认。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tb_pipeline_single_default
+  ON tb_pipeline(project_id, COALESCE(ticket_type, '')) WHERE is_default = 1;
+
 CREATE TABLE IF NOT EXISTS tb_pipeline_stage (
   id TEXT PRIMARY KEY,
   pipeline_id TEXT NOT NULL REFERENCES tb_pipeline(id) ON DELETE CASCADE,

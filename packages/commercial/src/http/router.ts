@@ -475,6 +475,7 @@ const BLOCKED_FOR_USER_RULES: readonly BlockedForUserRule[] = [
 
   // ─── host cron / tasks / webhooks(所有方法,prompt 注入 = RCE)───
   { re: /^\/api\/cron(\/[^/]+)?$/, label: '/api/cron' },
+  { re: /^\/api\/board(\/.*)?$/, label: '/api/board' },
   { re: /^\/api\/tasks(\/[A-Za-z0-9_\-]+)?$/, label: '/api/tasks' },
   { re: /^\/api\/tasks-executions$/, label: '/api/tasks-executions' },
   { re: /^\/api\/webhooks$/, label: '/api/webhooks' }, // GET 列表 leak secret
@@ -1445,6 +1446,7 @@ export const COMMERCIAL_ROUTE_PREFIXES: readonly string[] = [
     // 安全代理到用户自己的容器,维护期应统一 503。
     '/api/agents',
     '/api/cron',
+    '/api/board',
     '/api/tasks',
     '/api/tasks-executions',
     // P1-2 (2026-04-25):commercial 接管 /api/feedback POST,阻止 fall through

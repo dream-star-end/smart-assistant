@@ -9,8 +9,9 @@
 // 坑:
 //   1. Actor 含 system,给熔断/循环护栏用。system 不能认领(ready→running 必须是
 //      持有 lease 的 agent),也不能关单(除非 stage 显式 auto_close)、不能取消。
-//   2. PipelineStage 目前没有 autoClose 字段(domain.ts 缺口)。autoClose 由调用方
-//      作为上下文传入;本模块不臆造「最后一站 + !requireHumanAck = 自动关单」。
+//   2. autoClose 由调用方作为上下文传入(真值是 PipelineStage.autoClose,已进冻结
+//      契约)。本模块不臆造「最后一站 + !requireHumanAck = 自动关单」——那种推断在
+//      流水线被改序后会静默失效。
 //   3. 同状态自转一律拒绝。状态转移是审计事件;字段 PATCH / 续 lease 不走这里,
 //      放行自转会让前端「这张卡能做什么」出现假动作,也掩盖客户端重复提交。
 //   4. 终态(done/canceled)不可转出,唯一出口是人显式重开 → ready。canceled 与
@@ -19,19 +20,16 @@
 //      advance = 推进下一站后回到待认领;stay = 留在本站等下一轮巡检。
 //      wait_human 只能走 running→waiting_human,不许借 ready 绕过确认门。
 
-import { type Actor, type OnSuccessAction, TICKET_STATUSES, type TicketStatus } from './domain.js'
+import {
+  type Actor,
+  type OnSuccessAction,
+  TICKET_STATUSES,
+  TICKET_STATUS_LABEL,
+  type TicketStatus,
+} from './domain.js'
 
-// ── 显示名(reason / 前端按钮共用,避免各写一份) ─────────────────────────────
-
-export const TICKET_STATUS_LABEL: Record<TicketStatus, string> = {
-  backlog: '待立项',
-  ready: '待执行',
-  running: '执行中',
-  waiting_human: '待确认',
-  blocked: '受阻',
-  done: '完成',
-  canceled: '已取消',
-}
+/** 状态中文名的唯一真值在 domain.ts;这里 re-export 给旧调用方。 */
+export { TICKET_STATUS_LABEL }
 
 export const ACTORS: readonly Actor[] = ['human', 'agent', 'system']
 

@@ -1,7 +1,8 @@
 // Pipeline / PipelineStage DAO。
 //
 // 一个项目可挂多条流水线,按 ticket.type 选默认(is_default + ticket_type)。
-// stage.ordinal 从 0 起,同一 pipeline 内 UNIQUE。
+// 同一 projectId + ticketType 只能有一条 isDefault=true;互斥在本层事务内做
+// (含 ticketType=null 的通用兜底线)。stage.ordinal 从 0 起,同一 pipeline 内 UNIQUE。
 // toolsets 存 JSON TEXT,出库还原为 string[] | null,不把 JSON 泄漏上楼。
 
 import type {
@@ -184,22 +185,54 @@ export interface UpdateStageInput {
   ordinal?: number
 }
 
-export function createPipeline(db: TaskboardDb, input: CreatePipelineInput): Pipeline {
-  const now = nowMs()
-  const id = input.id ?? newId()
+/**
+ * 同项目同 ticketType 只留一条默认线。ticketType=null 用 IS NULL 匹配,
+ * 不能写成 `= NULL`(SQL 三值逻辑会漏降)。
+ */
+function demoteOtherDefaults(
+  db: TaskboardDb,
+  projectId: string,
+  ticketType: TicketType | null,
+  exceptId: string,
+  now: number,
+): void {
+  if (ticketType === null) {
+    db.prepare(
+      `UPDATE tb_pipeline SET is_default = 0, updated_at = ?
+        WHERE project_id = ? AND ticket_type IS NULL AND is_default = 1 AND id != ?`,
+    ).run(now, projectId, exceptId)
+    return
+  }
   db.prepare(
-    `INSERT INTO tb_pipeline (
-       id, project_id, name, ticket_type, is_default, created_at, updated_at
-     ) VALUES (@id, @projectId, @name, @ticketType, @isDefault, @now, @now)`,
-  ).run({
-    id,
-    projectId: input.projectId,
-    name: input.name,
-    ticketType: input.ticketType ?? null,
-    isDefault: boolToInt(input.isDefault ?? false),
-    now,
+    `UPDATE tb_pipeline SET is_default = 0, updated_at = ?
+      WHERE project_id = ? AND ticket_type = ? AND is_default = 1 AND id != ?`,
+  ).run(now, projectId, ticketType, exceptId)
+}
+
+export function createPipeline(db: TaskboardDb, input: CreatePipelineInput): Pipeline {
+  const write = db.transaction(() => {
+    const now = nowMs()
+    const id = input.id ?? newId()
+    const ticketType = input.ticketType ?? null
+    const isDefault = input.isDefault ?? false
+    if (isDefault) {
+      demoteOtherDefaults(db, input.projectId, ticketType, id, now)
+    }
+    db.prepare(
+      `INSERT INTO tb_pipeline (
+         id, project_id, name, ticket_type, is_default, created_at, updated_at
+       ) VALUES (@id, @projectId, @name, @ticketType, @isDefault, @now, @now)`,
+    ).run({
+      id,
+      projectId: input.projectId,
+      name: input.name,
+      ticketType,
+      isDefault: boolToInt(isDefault),
+      now,
+    })
+    return getPipeline(db, id) as Pipeline
   })
-  return getPipeline(db, id) as Pipeline
+  return write()
 }
 
 export function getPipeline(db: TaskboardDb, id: string): Pipeline | null {
@@ -244,24 +277,32 @@ export function getDefaultPipeline(
 }
 
 export function updatePipeline(db: TaskboardDb, id: string, input: UpdatePipelineInput): Pipeline {
-  const existing = getPipeline(db, id)
-  if (!existing) throw new TaskboardNotFound('pipeline', id)
-  const now = nowMs()
-  db.prepare(
-    `UPDATE tb_pipeline SET
-       name = @name,
-       ticket_type = @ticketType,
-       is_default = @isDefault,
-       updated_at = @now
-     WHERE id = @id`,
-  ).run({
-    id,
-    name: input.name ?? existing.name,
-    ticketType: input.ticketType === undefined ? existing.ticketType : input.ticketType,
-    isDefault: boolToInt(input.isDefault ?? existing.isDefault),
-    now,
+  const write = db.transaction(() => {
+    const existing = getPipeline(db, id)
+    if (!existing) throw new TaskboardNotFound('pipeline', id)
+    const now = nowMs()
+    const ticketType = input.ticketType === undefined ? existing.ticketType : input.ticketType
+    const isDefault = input.isDefault ?? existing.isDefault
+    if (isDefault) {
+      demoteOtherDefaults(db, existing.projectId, ticketType, id, now)
+    }
+    db.prepare(
+      `UPDATE tb_pipeline SET
+         name = @name,
+         ticket_type = @ticketType,
+         is_default = @isDefault,
+         updated_at = @now
+       WHERE id = @id`,
+    ).run({
+      id,
+      name: input.name ?? existing.name,
+      ticketType,
+      isDefault: boolToInt(isDefault),
+      now,
+    })
+    return getPipeline(db, id) as Pipeline
   })
-  return getPipeline(db, id) as Pipeline
+  return write()
 }
 
 export function createStage(db: TaskboardDb, input: CreateStageInput): PipelineStage {

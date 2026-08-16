@@ -26,6 +26,7 @@ import {
   migrate,
   openTaskboardDb,
 } from '../db/index.js'
+import { createPipeline, getPipeline, updatePipeline } from '../db/pipelines.js'
 import { archiveProject, createProject, getProject, updateProject } from '../db/projects.js'
 import { addRelation, listRelations } from '../db/relations.js'
 import { acquireLease, getActiveLease, reapExpiredLeases, releaseLease } from '../db/runs.js'
@@ -370,6 +371,77 @@ describe('comment / activity / list', () => {
     const listed = listTickets(db, { projectId: p.id, type: 'feature', q: 'hello' })
     assert.equal(listed.total, 1)
     assert.deepEqual(listed.items[0].labels, ['ui'])
+    db.close()
+  })
+})
+
+describe('pipeline isDefault 互斥', () => {
+  it('同项目同类型连设两条默认,先设的那条自动变 false', () => {
+    const { db } = freshDb()
+    const p = createProject(db, { key: 'OCV5', name: 'V5' })
+    const first = createPipeline(db, {
+      projectId: p.id,
+      name: 'bug-a',
+      ticketType: 'bug',
+      isDefault: true,
+    })
+    const second = createPipeline(db, {
+      projectId: p.id,
+      name: 'bug-b',
+      ticketType: 'bug',
+      isDefault: true,
+    })
+    assert.equal(second.isDefault, true)
+    assert.equal(getPipeline(db, first.id)?.isDefault, false)
+    assert.equal(getPipeline(db, second.id)?.isDefault, true)
+    db.close()
+  })
+
+  it('updatePipeline 把另一条设为默认,原默认被降', () => {
+    const { db } = freshDb()
+    const p = createProject(db, { key: 'OCV5', name: 'V5' })
+    const first = createPipeline(db, {
+      projectId: p.id,
+      name: 'feat-a',
+      ticketType: 'feature',
+      isDefault: true,
+    })
+    const second = createPipeline(db, {
+      projectId: p.id,
+      name: 'feat-b',
+      ticketType: 'feature',
+      isDefault: false,
+    })
+    const updated = updatePipeline(db, second.id, { isDefault: true })
+    assert.equal(updated.isDefault, true)
+    assert.equal(getPipeline(db, first.id)?.isDefault, false)
+    db.close()
+  })
+
+  it('ticketType=null 的通用兜底线同样互斥;不同类型互不影响', () => {
+    const { db } = freshDb()
+    const p = createProject(db, { key: 'OCV5', name: 'V5' })
+    const fallbackA = createPipeline(db, {
+      projectId: p.id,
+      name: 'generic-a',
+      ticketType: null,
+      isDefault: true,
+    })
+    const fallbackB = createPipeline(db, {
+      projectId: p.id,
+      name: 'generic-b',
+      ticketType: null,
+      isDefault: true,
+    })
+    const bug = createPipeline(db, {
+      projectId: p.id,
+      name: 'bug-default',
+      ticketType: 'bug',
+      isDefault: true,
+    })
+    assert.equal(getPipeline(db, fallbackA.id)?.isDefault, false)
+    assert.equal(getPipeline(db, fallbackB.id)?.isDefault, true)
+    assert.equal(bug.isDefault, true)
     db.close()
   })
 })

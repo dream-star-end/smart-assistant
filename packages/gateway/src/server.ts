@@ -215,6 +215,7 @@ import {
   deliverCronViaAdapter,
   isUserInitiatedCronJob,
 } from './cron.js'
+import { handleTaskboardApi, resolveTaskboardActor } from './taskboard/http.js'
 import { sendV3WechatProactive, readV3WechatProactiveConfig } from './v3WechatProactive.js'
 import { sendV3QqProactive, readV3QqProactiveConfig } from './v3QqProactive.js'
 import { postInboxMessage, postInboxMessageDurable } from './v3InboxPost.js'
@@ -4801,6 +4802,53 @@ export class Gateway {
       this.handleCronItem(req, res, cronItemMatch[1]).catch((err) =>
         this.sendInternalError(res, err),
       )
+      return
+    }
+    // ── Taskboard REST API (`/api/board/*`) ──
+    // 分发形态必须写在本文件的 url.pathname === / match 上,containerRouteInventory
+    // 靠扫描这三种字面量收路由;藏进 helper 会让 allowlist 闭包测试变死规则。
+    if (
+      url.pathname === '/api/board/projects' ||
+      url.pathname === '/api/board/tickets' ||
+      url.pathname === '/api/board/pipelines' ||
+      url.pathname === '/api/board/agents' ||
+      url.pathname === '/api/board/settings' ||
+      url.pathname.match(/^\/api\/board\/projects\/([^/]+)$/) ||
+      url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/board$/) ||
+      url.pathname.match(/^\/api\/board\/tickets\/([^/]+)$/) ||
+      url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/(ready|claim|advance)$/) ||
+      url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/(block|approve|reject)$/) ||
+      url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/(done|cancel|comment|patrol)$/) ||
+      url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/runs$/) ||
+      url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/relations$/) ||
+      url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/comments$/) ||
+      url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/activity$/) ||
+      url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/timeline$/) ||
+      url.pathname.match(/^\/api\/board\/pipelines\/([^/]+)$/) ||
+      url.pathname.match(/^\/api\/board\/pipelines\/([^/]+)\/stages$/) ||
+      url.pathname.match(/^\/api\/board\/stages\/([^/]+)$/) ||
+      url.pathname.match(/^\/api\/board\/runs\/([^/]+)$/) ||
+      url.pathname.match(/^\/api\/board\/relations\/([^/]+)$/)
+    ) {
+      handleTaskboardApi(req, res, {
+        resolveActor: (r) =>
+          resolveTaskboardActor(r, {
+            jwtSecret: this.deps.config.gateway.accessToken,
+            isCommercialJwt: (t) => this.verifyCommercialJwt(t) !== null,
+            // 必须传真实校验结果:taskboard 层不得自行嗅 X-OpenClaude-Bridge-Nonce,
+            // 否则容器内 agent 伪造该头即可冒充 human 自批自结单。
+            bridgeVerified: this.checkBridgeBypass(r, url),
+          }),
+        listAgents: async () => {
+          const view = await this._getAgentsConfigUserView()
+          return view.agents.map((a) => ({
+            id: a.id,
+            name: a.displayName ?? a.id,
+            model: a.model ?? '',
+            description: a.greeting ?? '',
+          }))
+        },
+      }).catch((err) => this.sendInternalError(res, err))
       return
     }
     // ── Tasks REST API ──
@@ -16389,7 +16437,9 @@ export { shouldServeInline }
 const KNOWN_ROUTES = [
   '/api/healthz', '/api/doctor', '/api/usage', '/api/usage/events',
   '/api/runs', '/api/sessions', '/api/config', '/api/agents', '/api/search',
-  '/api/cron', '/api/tasks', '/api/tasks-executions', '/api/webhooks',
+  '/api/cron', '/api/board', '/api/board/projects', '/api/board/tickets',
+  '/api/board/pipelines', '/api/board/agents', '/api/board/settings',
+  '/api/tasks', '/api/tasks-executions', '/api/webhooks',
   '/api/wechat/pair/start', '/api/wechat/pair/poll', '/api/wechat/pair/cancel',
   '/api/wechat/binding', '/api/wechat/binding/status',
   '/api/auth/session', '/api/auth/logout', '/api/auth/claude/start',
@@ -16408,6 +16458,15 @@ function normalizePath(p: string): string {
     .replace(/\/api\/agents\/[a-zA-Z0-9_-]+\/([a-z]+)/, '/api/agents/:id/$1')
     .replace(/\/api\/agents\/[a-zA-Z0-9_-]+/, '/api/agents/:id')
     .replace(/\/api\/cron\/[a-zA-Z0-9_-]+/, '/api/cron/:id')
+    .replace(/\/api\/board\/projects\/[^/]+\/board/, '/api/board/projects/:id/board')
+    .replace(/\/api\/board\/projects\/[^/]+/, '/api/board/projects/:id')
+    .replace(/\/api\/board\/tickets\/[^/]+\/[a-z_]+/, '/api/board/tickets/:id/:action')
+    .replace(/\/api\/board\/tickets\/[^/]+/, '/api/board/tickets/:id')
+    .replace(/\/api\/board\/pipelines\/[^/]+\/stages/, '/api/board/pipelines/:id/stages')
+    .replace(/\/api\/board\/pipelines\/[^/]+/, '/api/board/pipelines/:id')
+    .replace(/\/api\/board\/stages\/[^/]+/, '/api/board/stages/:id')
+    .replace(/\/api\/board\/runs\/[^/]+/, '/api/board/runs/:id')
+    .replace(/\/api\/board\/relations\/[^/]+/, '/api/board/relations/:id')
     .replace(/\/api\/tasks\/[a-zA-Z0-9_-]+/, '/api/tasks/:id')
     .replace(/\/api\/webhooks\/[a-zA-Z0-9_-]+/, '/api/webhooks/:id')
     .replace(/\/api\/media\/.+/, '/api/media/:file')
