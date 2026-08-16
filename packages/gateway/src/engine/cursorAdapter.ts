@@ -64,6 +64,13 @@ Your actual Cursor native tool list and loaded MCP tool list are authoritative.
 Descriptions in the platform context may mention tools from another backend;
 do not claim or call a tool unless it is present in your current tool list.
 
+The ask-question tool is the one exception: this hosted run is noninteractive,
+so the runtime resolves Cursor's native ask-question tool instantly as
+"Questions skipped by the user" — the user never sees the prompt and no answer
+will arrive. Never call the native ask-question tool. When you need the user
+to pick options or confirm a decision, present numbered options as plain text
+in your reply and end the turn; the user's next message carries the answer.
+
 Use OpenClaude's storage channels as their sections direct: Core memory through
 \`oc-memory core-search\` plus the exact platform memory files, session/archival
 recall through the \`oc-memory\` CLI, and skills/reminders/delegation through the
@@ -522,7 +529,18 @@ function failureValueOf(value: unknown): unknown {
   if (!result) return undefined
   return result.error ?? result.failure ?? result.rejected
 }
+/** Cursor CLI 以 --force 非交互模式运行:原生 askQuestion 会被 CLI 在毫秒级
+ * 立即按 "Questions skipped by the user" 收尾,用户从未看到问题(真实 turn tape
+ * 实测 durationMs 1~45)。这是托管运行的确定性行为而非工具错误 —— 标成 isError
+ * 会让卡面渲染红色「失败」并掩盖「问题根本没送达用户」的事实;按普通完成卡
+ * 落 tape,问题内容留在卡面,用户仍能以文字作答。 */
+function questionSkippedByRuntime(event: CursorEvent): boolean {
+  if (cursorToolKindOf(event) !== 'askQuestionToolCall') return false
+  const serialized = JSON.stringify([toolResultValueOf(event), event.output, event.rawOutput])
+  return serialized.includes('Questions skipped by the user')
+}
 function toolFailed(event: CursorEvent): boolean {
+  if (questionSkippedByRuntime(event)) return false
   const call = toolCallOf(event)
   const variant = toolVariantOf(event)
   const resultValue = toolResultValueOf(event)
@@ -1141,6 +1159,8 @@ export const _internals = {
   resolveCursorWrapperBin,
   toolNameOf,
   toolInputOf,
+  toolFailed,
+  questionSkippedByRuntime,
 }
 
 registerEngine('cursor', (opts) => new CursorAdapter(opts))

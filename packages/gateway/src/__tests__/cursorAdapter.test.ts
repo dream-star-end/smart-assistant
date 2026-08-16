@@ -1452,4 +1452,59 @@ setInterval(() => {}, 1000);
       await rm(dir, { recursive: true, force: true })
     }
   })
+
+  // 真实 turn tape(selfhost cursor-opus-5-high,2026-08-16)实锤:原生 askQuestion
+  // 在 --force 非交互模式下被 CLI 在 1~45ms 内按 "Questions skipped by the user"
+  // 收尾,isError=true 让卡面渲染红色「失败」,而用户从头到尾没见过问题。
+  // 契约:确定性 runtime 跳过 = 普通完成卡(问题内容留在卡面);真实错误仍失败。
+  test('askQuestion runtime skip is not a tool failure; real errors still are', () => {
+    const skipped = {
+      type: 'tool_call',
+      tool_call: {
+        id: 't-ask-skip',
+        askQuestionToolCall: {
+          args: {
+            title: '部署时机',
+            questions: `[{'prompt': '什么时候部?', 'options': [{'id': 'now', 'label': '现在部'}]}]`,
+          },
+          result: { reason: 'Questions skipped by the user, continue with the information you already have' },
+          status: 'rejected',
+        },
+      },
+    }
+    assert.equal(_internals.toolNameOf(skipped as never), 'AskUserQuestion')
+    assert.equal(_internals.questionSkippedByRuntime(skipped as never), true)
+    assert.equal(_internals.toolFailed(skipped as never), false)
+
+    const erroredAsk = {
+      type: 'tool_call',
+      tool_call: {
+        id: 't-ask-err',
+        askQuestionToolCall: {
+          args: { questions: `[{'prompt': 'q', 'options': [{'id': 'a', 'label': 'A'}]}]` },
+          result: { error: 'boom' },
+        },
+      },
+    }
+    assert.equal(_internals.questionSkippedByRuntime(erroredAsk as never), false)
+    assert.equal(_internals.toolFailed(erroredAsk as never), true)
+
+    // 跳过判定只豁免 askQuestion:其它工具的 rejected 仍然是失败。
+    const rejectedShell = {
+      type: 'tool_call',
+      tool_call: { id: 't-sh', shellToolCall: { args: { command: 'x' }, status: 'rejected' } },
+    }
+    assert.equal(_internals.toolFailed(rejectedShell as never), true)
+
+    // preamble 必须显式禁止原生 ask 工具,把「要决策→文字提问→结束本轮」
+    // 写进引擎侧最高优先级上下文。
+    assert.ok(
+      _internals.CURSOR_PREAMBLE.includes('Questions skipped by the user'),
+      'preamble must explain the deterministic skip',
+    )
+    assert.ok(
+      _internals.CURSOR_PREAMBLE.includes('Never call the native ask-question tool'),
+      'preamble must forbid the native ask tool',
+    )
+  })
 })

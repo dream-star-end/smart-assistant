@@ -85,7 +85,7 @@ const PLATFORM_CAPABILITIES_FALLBACK = `# Platform capabilities
 5. 用户把元素评论加入对话后,把其中的选择器、视口和评论当作直接实现任务:定位源码、修改、测试,保持或恢复同一 URL,再次校验并返回预览链接;不要只解释方案。
 
 详细模板见 \`skill_view("platform-capabilities")\`。
-需要用户在 Web 对话中对少数选项做决定时,必须调用当前运行时提供的专用用户提问工具(CCB: \`AskUserQuestion\`;Codex: \`request_user_input\`)并等待回答;不要输出 fenced \`options\` 代码块,也不要在普通正文里模拟选择卡。若当前工具列表没有专用提问工具,再用普通文字提问并结束本轮回复。
+需要用户在 Web 对话中对少数选项做决定时,必须调用当前运行时提供的专用用户提问工具(CCB: \`AskUserQuestion\`;Codex: \`request_user_input\`)并等待回答;不要输出 fenced \`options\` 代码块,也不要在普通正文里模拟选择卡。Cursor 引擎例外:它没有可用的交互提问工具——原生 ask 工具会被托管运行时立即跳过、用户永远看不到,禁止调用;需要用户决策时,用普通文字列出编号选项并结束本轮回复,由用户下一条消息作答。若当前工具列表没有专用提问工具,也用普通文字提问并结束本轮回复。
 
 ## 子 Agent 与并行处理
 
