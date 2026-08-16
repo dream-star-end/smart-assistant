@@ -3114,7 +3114,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         }
       },
     };
-    const { unregister } = registry.register(conn);
+    const { unregister, evicted } = registry.register(conn);
+    // 踢人必须留痕:互踢循环/超限排查的第一手证据(close code 4505 服务端此前无日志)。
+    for (const victim of evicted) {
+      bridgeLog?.warn("user-chat-bridge: kicked oldest connection (per-user limit)", {
+        uid: uid.toString(), connId, victimConnId: victim.id, maxPerUser,
+      });
+    }
 
     // 同步加入 uid→ws 表,broadcastToUser 用得到。cleanup 里务必同步删除。
     {
