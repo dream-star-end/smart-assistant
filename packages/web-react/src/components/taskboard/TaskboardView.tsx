@@ -2,13 +2,7 @@ import { Kanban, Menu, PanelLeft, PenSquare, Plus } from 'lucide-react'
 import { type ReactNode, useMemo, useState } from 'react'
 import type { BoardViewParam } from '../../hooks/useAppRoute'
 import { useMdViewport } from '../../hooks/useMdViewport'
-import {
-  TICKET_STATUS_LABEL,
-  TICKET_TYPES,
-  TICKET_TYPE_LABEL,
-  type Ticket,
-  type TicketType,
-} from '../../lib/taskboard'
+import { TICKET_TYPES, TICKET_TYPE_LABEL, type Ticket, type TicketType } from '../../lib/taskboard'
 import type { AuthSession } from '../../lib/types'
 import {
   Button,
@@ -17,13 +11,14 @@ import {
   Input,
   ListSkeleton,
   Select,
-  Sheet,
   Tabs,
   useConfirm,
   usePrompt,
   useToast,
 } from '../ui'
 import { BoardColumns } from './BoardColumns'
+import { BoardSettingsPanel } from './BoardSettingsPanel'
+import { TicketDrawer } from './TicketDrawer'
 import { TicketListView } from './TicketListView'
 import { useTaskboard } from './useTaskboard'
 
@@ -35,6 +30,7 @@ export function TaskboardView({
   onOpenTicket,
   onOpenMobileNav,
   onOpenSession,
+  sessionIds = [],
   sidebarCollapsed,
   onExpandSidebar,
 }: {
@@ -45,6 +41,7 @@ export function TaskboardView({
   onOpenTicket: (identifier: string | null) => void
   onOpenMobileNav: () => void
   onOpenSession?: (sessionId: string) => void
+  sessionIds?: readonly string[]
   sidebarCollapsed?: boolean
   onExpandSidebar?: () => void
 }) {
@@ -56,6 +53,7 @@ export function TaskboardView({
   const [creating, setCreating] = useState(false)
   const [draftTitle, setDraftTitle] = useState('')
   const [draftType, setDraftType] = useState<TicketType>('bug')
+  const [reviseOpen, setReviseOpen] = useState(false)
 
   const selected = useMemo(() => {
     if (!ticketId) return null
@@ -119,7 +117,15 @@ export function TaskboardView({
           },
           'danger',
         ),
-        btn('改需求', 'inbox-revise', () => onOpenTicket(ticket.identifier), 'ghost'),
+        btn(
+          '改需求',
+          'inbox-revise',
+          () => {
+            setReviseOpen(true)
+            onOpenTicket(ticket.identifier)
+          },
+          'ghost',
+        ),
       )
     }
     if (ticket.status !== 'done' && ticket.status !== 'canceled' && ticket.status !== 'blocked') {
@@ -226,6 +232,7 @@ export function TaskboardView({
             }
             placeholder="选择项目"
           />
+          <BoardSettingsPanel auth={auth} />
           <Button
             type="button"
             size="sm"
@@ -330,52 +337,25 @@ export function TaskboardView({
         />
       )}
 
-      <Sheet
-        open={!!selected}
-        onOpenChange={(open) => {
-          if (!open) onOpenTicket(null)
+      <TicketDrawer
+        auth={auth}
+        ticket={selected}
+        ticketRef={ticketId}
+        open={!!ticketId}
+        desktop={desktop}
+        agents={board.agents}
+        stages={board.board?.columns.map((c) => c.stage) ?? []}
+        sessionIds={sessionIds}
+        startEditing={reviseOpen}
+        actions={selected ? renderActions(selected) : null}
+        onClose={() => {
+          setReviseOpen(false)
+          onOpenTicket(null)
         }}
-        side={desktop ? 'right' : 'bottom'}
-        srTitle={selected ? selected.identifier : '单据详情'}
-        className={desktop ? 'w-[28rem] max-w-[92vw]' : undefined}
-      >
-        {selected && (
-          <div
-            data-testid="ticket-drawer"
-            className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-4"
-          >
-            <div>
-              <p className="font-mono text-caption text-faint">{selected.identifier}</p>
-              <h2 className="mt-1 text-title font-semibold text-fg">{selected.title}</h2>
-              <p className="mt-1 text-meta text-muted">
-                {TICKET_TYPE_LABEL[selected.type]} · {selected.priority} ·{' '}
-                {TICKET_STATUS_LABEL[selected.status]}
-              </p>
-            </div>
-            {selected.body ? (
-              <p className="whitespace-pre-wrap text-body text-fg">{selected.body}</p>
-            ) : (
-              <p className="text-meta text-faint">还没有描述</p>
-            )}
-            {selected.blockedReason && (
-              <p className="rounded-lg bg-danger-soft px-3 py-2 text-body text-danger">
-                受阻：{selected.blockedReason}
-              </p>
-            )}
-            {renderActions(selected)}
-            {selected.originSessionKey && onOpenSession && (
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                onClick={() => onOpenSession(selected.originSessionKey!)}
-              >
-                回到来源会话
-              </Button>
-            )}
-          </div>
-        )}
-      </Sheet>
+        onReconcile={() => void board.reconcile()}
+        onTicketUpdated={board.replaceTicket}
+        onOpenSession={onOpenSession}
+      />
       {confirmEl}
       {promptEl}
     </div>

@@ -304,6 +304,39 @@ export interface ListPage<T> {
   total: number
 }
 
+export interface TaskboardSettings {
+  maxConcurrentRuns: number
+  maxRunsPerDay: number
+  maxCostPerDayUsd: number | null
+  quietHoursStart: number
+  quietHoursEnd: number
+  circuitBreakerThreshold: number
+  maxStageLoops: number
+  maxRunsPerTick: number
+  patrolPaused: boolean
+}
+
+export interface TaskboardUsage {
+  runsToday: number
+  costTodayUsd: number
+  activeRuns: number
+}
+
+export type TaskboardSettingsSnapshot = TaskboardSettings & {
+  usage: TaskboardUsage
+}
+
+export type TimelineItem =
+  | { kind: 'activity'; createdAt: number; activity: TicketActivity }
+  | { kind: 'run'; createdAt: number; run: TicketRun }
+  | { kind: 'comment'; createdAt: number; comment: TicketComment }
+
+export interface TicketDetail {
+  ticket: Ticket
+  pipeline?: Pipeline | null
+  stage?: PipelineStage | null
+}
+
 // ── 错误码映射 ─────────────────────────────────────────────────────────────
 
 function extractBodyCode(body: unknown): string | undefined {
@@ -337,14 +370,20 @@ export function isForbidden(err: unknown): boolean {
   return err.status === 403 || boardErrorCode(err) === 'forbidden'
 }
 
+export function isConcurrencyFull(err: unknown): boolean {
+  if (!(err instanceof ApiError)) return false
+  return err.status === 429 || boardErrorCode(err) === 'concurrency_full'
+}
+
 /**
- * 把 409 / 423 / 403 收成可读中文；其余走 `apiErrorMessage`。
+ * 把 409 / 423 / 403 / 429 收成可读中文；其余走 `apiErrorMessage`。
  * 上层 toast 只吃这一处，不要自己再翻一遍 status。
  */
 export function taskboardErrorMessage(err: unknown, fallback: string): string {
   if (isVersionConflict(err)) return '单据已被其他人更新，已刷新最新内容'
   if (isLeaseHeld(err)) return '该单据正在执行中，请稍后再试'
   if (isForbidden(err)) return '当前身份无权执行此操作'
+  if (isConcurrencyFull(err)) return '巡检并发已满，请稍后再试'
   return apiErrorMessage(err, fallback)
 }
 
@@ -380,6 +419,147 @@ export function latestRunHint(
   if (latestRunStatus === 'running' || status === 'running') return 'running'
   if (latestRunStatus === 'failed' || latestRunStatus === 'timeout') return 'failed'
   return null
+}
+
+export const RUN_STATUS_LABEL: Record<RunStatus, string> = {
+  queued: '排队中',
+  running: '执行中',
+  succeeded: '成功',
+  failed: '失败',
+  timeout: '超时',
+  skipped: '已跳过',
+}
+
+export const RUN_TRIGGER_LABEL: Record<RunTrigger, string> = {
+  patrol: '定时巡检',
+  manual: '手动巡检',
+  transition: '状态转移',
+  webhook: '外部触发',
+  retry: '重试',
+}
+
+export const RUN_SKIP_REASON_LABEL: Record<RunSkipReason, string> = {
+  blocked_by_dependency: '被依赖单据挡住',
+  daily_quota: '已达每日巡检上限',
+  outside_window: '当前处于静默时段',
+  lease_held: '该单据正在执行中',
+  entry_condition: '未满足进入条件',
+  concurrency_full: '巡检并发已满',
+  budget_exhausted: '今日成本预算已用尽',
+  circuit_open: '连续失败已熔断',
+  loop_guard: '同阶段循环次数过多',
+  patrol_disabled: '巡检已暂停',
+  idle_backoff: '空转降频中',
+}
+
+const ACTIVITY_ACTION_LABEL: Record<string, string> = {
+  ticket_created: '创建了单据',
+  status_changed: '变更了状态',
+  stage_advanced: '推进了阶段',
+  field_updated: '更新了字段',
+  relation_added: '添加了关联',
+}
+
+/** 网页对话 sessionKey：`agent:<agentId>:webchat:dm:<peerId>`，peerId = 侧栏 Session.id。 */
+const WEBCHAT_SESSION_KEY = /^agent:[^:]+:webchat:dm:([A-Za-z0-9_-]{8,50})$/
+const CLIENT_SESSION_ID = /^[A-Za-z0-9_-]{8,50}$/
+
+/**
+ * 从单据 `originSessionKey` 抽出侧栏可用的 Session.id。
+ * 抽不出（巡检 key、带冒号的裸 key、非法形状）一律返回 null，调用方不得把原 key 当 id。
+ */
+export function sessionIdFromOriginKey(originSessionKey: string | null | undefined): string | null {
+  if (!originSessionKey) return null
+  const web = WEBCHAT_SESSION_KEY.exec(originSessionKey)
+  if (web) return web[1]
+  if (!originSessionKey.includes(':') && CLIENT_SESSION_ID.test(originSessionKey)) {
+    return originSessionKey
+  }
+  return null
+}
+
+/**
+ * 在侧栏会话列表里按 id 对账。映射不到就返回 null，禁止硬推 `/s/agent:…`。
+ */
+export function resolveOriginSessionId(
+  originSessionKey: string | null | undefined,
+  sessionIds: readonly string[],
+): string | null {
+  const id = sessionIdFromOriginKey(originSessionKey)
+  if (!id || id.includes(':')) return null
+  return sessionIds.includes(id) ? id : null
+}
+
+export function sortTimelineDesc(items: TimelineItem[]): TimelineItem[] {
+  return [...items].sort((a, b) => b.createdAt - a.createdAt || b.kind.localeCompare(a.kind))
+}
+
+export function mergeTimelineSources(input: {
+  activities?: TicketActivity[]
+  runs?: TicketRun[]
+  comments?: TicketComment[]
+}): TimelineItem[] {
+  const items: TimelineItem[] = [
+    ...(input.activities ?? []).map((activity) => ({
+      kind: 'activity' as const,
+      createdAt: activity.createdAt,
+      activity,
+    })),
+    ...(input.runs ?? []).map((run) => ({ kind: 'run' as const, createdAt: run.createdAt, run })),
+    ...(input.comments ?? []).map((comment) => ({
+      kind: 'comment' as const,
+      createdAt: comment.createdAt,
+      comment,
+    })),
+  ]
+  return sortTimelineDesc(items)
+}
+
+export function formatDurationMs(ms: number | null | undefined): string | null {
+  if (ms == null || !Number.isFinite(ms) || ms < 0) return null
+  if (ms < 1000) return `${Math.round(ms)} 毫秒`
+  const sec = Math.round(ms / 1000)
+  if (sec < 60) return `${sec} 秒`
+  const min = Math.floor(sec / 60)
+  const rem = sec % 60
+  if (min < 60) return rem ? `${min} 分 ${rem} 秒` : `${min} 分`
+  const hr = Math.floor(min / 60)
+  const remMin = min % 60
+  return remMin ? `${hr} 小时 ${remMin} 分` : `${hr} 小时`
+}
+
+export function formatRunCostUsd(cost: number | null | undefined): string | null {
+  if (cost == null || !Number.isFinite(cost)) return null
+  return `$${cost.toFixed(4)}`
+}
+
+export function skipReasonLabel(reason: string | null | undefined): string | null {
+  if (!reason) return null
+  if ((RUN_SKIP_REASONS as readonly string[]).includes(reason)) {
+    return RUN_SKIP_REASON_LABEL[reason as RunSkipReason]
+  }
+  return reason
+}
+
+export function activityActionLabel(action: string): string {
+  return ACTIVITY_ACTION_LABEL[action] ?? action
+}
+
+export function formatActivityLine(activity: TicketActivity): string {
+  const who = assigneeLabel(activity.actorId) ?? activity.actor
+  const verb = activityActionLabel(activity.action)
+  if (activity.field && (activity.fromValue || activity.toValue)) {
+    const from =
+      activity.field === 'status' && activity.fromValue
+        ? (TICKET_STATUS_LABEL[activity.fromValue as TicketStatus] ?? activity.fromValue)
+        : (activity.fromValue ?? '空')
+    const to =
+      activity.field === 'status' && activity.toValue
+        ? (TICKET_STATUS_LABEL[activity.toValue as TicketStatus] ?? activity.toValue)
+        : (activity.toValue ?? '空')
+    return `${who} ${verb}：${from} → ${to}`
+  }
+  return `${who} ${verb}`
 }
 
 export function groupTicketsByStage(tickets: Ticket[], stages: PipelineStage[]): BoardColumn[] {
@@ -492,8 +672,14 @@ export const taskboardApi = {
     boardGet<ListPage<Ticket>>(a, `/api/board/tickets${qs(query)}`),
 
   getTicket: (a: AuthSession, idOrIdent: string) =>
-    boardGet<{ ticket: Ticket }>(a, `/api/board/tickets/${encodeURIComponent(idOrIdent)}`).then(
+    boardGet<TicketDetail>(a, `/api/board/tickets/${encodeURIComponent(idOrIdent)}`).then(
       (b) => b.ticket,
+    ),
+
+  getTicketDetail: (a: AuthSession, idOrIdent: string) =>
+    boardGet<TicketDetail>(
+      a,
+      `/api/board/tickets/${encodeURIComponent(idOrIdent)}${qs({ expand: 'pipeline,stage' })}`,
     ),
 
   createTicket: (a: AuthSession, body: TicketCreateInput) =>
@@ -597,4 +783,25 @@ export const taskboardApi = {
 
   listRuns: (a: AuthSession, idOrIdent: string) =>
     boardGet<ListPage<TicketRun>>(a, `${ticketActionPath(idOrIdent, 'runs')}`),
+
+  listComments: (a: AuthSession, idOrIdent: string) =>
+    boardGet<{ items: TicketComment[] }>(a, ticketActionPath(idOrIdent, 'comments')).then(
+      (b) => b.items || [],
+    ),
+
+  listActivity: (a: AuthSession, idOrIdent: string) =>
+    boardGet<{ items: TicketActivity[] }>(a, ticketActionPath(idOrIdent, 'activity')).then(
+      (b) => b.items || [],
+    ),
+
+  listTimeline: (a: AuthSession, idOrIdent: string) =>
+    boardGet<{ items: TimelineItem[] }>(a, ticketActionPath(idOrIdent, 'timeline')).then(
+      (b) => b.items || [],
+    ),
+
+  getSettings: (a: AuthSession) =>
+    boardGet<TaskboardSettingsSnapshot>(a, '/api/board/settings'),
+
+  patchSettings: (a: AuthSession, body: Partial<TaskboardSettings>) =>
+    boardSend<TaskboardSettingsSnapshot & { ok: boolean }>(a, '/api/board/settings', 'PATCH', body),
 }

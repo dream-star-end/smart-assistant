@@ -1,5 +1,6 @@
 import '@testing-library/jest-dom/vitest'
-import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
+import type { ComponentProps } from 'react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, test, vi } from 'vitest'
 import { workspaceWantPath } from '../../hooks/useAppRoute'
 import { ApiError } from '../../lib/api'
@@ -7,15 +8,27 @@ import { createMemoryAuthSession } from '../../lib/authSession'
 import {
   TICKET_TYPE_LABEL,
   TICKET_TYPE_TONE,
+  type PipelineStage,
   type Ticket,
+  type TicketActivity,
+  type TicketComment,
+  type TicketRun,
+  isConcurrencyFull,
   isForbidden,
   isLeaseHeld,
   isVersionConflict,
+  mergeTimelineSources,
+  resolveOriginSessionId,
+  sessionIdFromOriginKey,
+  skipReasonLabel,
   taskboardApi,
   taskboardErrorMessage,
 } from '../../lib/taskboard'
 import { ToastProvider, TooltipProvider } from '../ui'
+import { BoardSettingsPanel } from './BoardSettingsPanel'
+import { TaskboardView } from './TaskboardView'
 import { TicketCard, ticketPriorityTone, ticketTypeIconClass } from './TicketCard'
+import { TicketDrawer } from './TicketDrawer'
 import { useTaskboard } from './useTaskboard'
 
 afterEach(() => {
@@ -288,5 +301,440 @@ describe('useTaskboard 乐观更新', () => {
     expect(screen.getByText('OCV5-42:waiting_human')).toBeInTheDocument()
     expect(screen.queryByText('OCV5-42:ready')).not.toBeInTheDocument()
     expect(screen.getByText('单据已被其他人更新，已刷新最新内容')).toBeInTheDocument()
+  })
+})
+
+function sampleStage(over: Partial<PipelineStage> = {}): PipelineStage {
+  return {
+    id: 's1',
+    pipelineId: 'pipe1',
+    ordinal: 0,
+    name: '实现',
+    kind: 'ai',
+    agentId: 'coding-assistant',
+    promptTemplate: null,
+    toolsets: null,
+    effort: null,
+    patrolCron: null,
+    patrolEnabled: true,
+    patrolTimezone: 'Asia/Shanghai',
+    quietHoursStart: null,
+    quietHoursEnd: null,
+    maxRunsPerDay: 20,
+    timeoutSec: 2400,
+    maxRetries: 1,
+    circuitBreakerThreshold: 3,
+    onSuccess: 'wait_human',
+    onFailure: 'block',
+    autoClose: false,
+    entryCondition: null,
+    exitChecklist: null,
+    requireHumanAck: true,
+    createdAt: 1,
+    updatedAt: 1,
+    ...over,
+  }
+}
+
+function sampleRun(over: Partial<TicketRun> = {}): TicketRun {
+  return {
+    id: 'r1',
+    ticketId: 't1',
+    stageId: 's1',
+    agentId: 'coding-assistant',
+    trigger: 'manual',
+    sessionKey: 'agent:coding-assistant:taskboard:t1:s1:r1',
+    status: 'skipped',
+    skipReason: 'concurrency_full',
+    leaseOwner: null,
+    leaseExpiresAt: null,
+    startedAt: null,
+    finishedAt: null,
+    durationMs: null,
+    tokensIn: null,
+    tokensOut: null,
+    costUsd: null,
+    summary: null,
+    outputMd: null,
+    error: null,
+    createdAt: 1_700_000_200_000,
+    ...over,
+  }
+}
+
+function sampleComment(over: Partial<TicketComment> = {}): TicketComment {
+  return {
+    id: 'c1',
+    ticketId: 't1',
+    authorKind: 'human',
+    author: 'user:default',
+    body: '可以合',
+    runId: null,
+    createdAt: 1_700_000_300_000,
+    ...over,
+  }
+}
+
+function sampleActivity(over: Partial<TicketActivity> = {}): TicketActivity {
+  return {
+    id: 'a1',
+    ticketId: 't1',
+    actor: 'human',
+    actorId: 'user:default',
+    action: 'status_changed',
+    field: 'status',
+    fromValue: 'backlog',
+    toValue: 'ready',
+    createdAt: 1_700_000_100_000,
+    ...over,
+  }
+}
+
+function sampleSettings() {
+  return {
+    maxConcurrentRuns: 2,
+    maxRunsPerDay: 200,
+    maxCostPerDayUsd: null as number | null,
+    quietHoursStart: 23,
+    quietHoursEnd: 8,
+    circuitBreakerThreshold: 3,
+    maxStageLoops: 5,
+    maxRunsPerTick: 2,
+    patrolPaused: false,
+    usage: { runsToday: 3, costTodayUsd: 0.12, activeRuns: 0 },
+  }
+}
+
+function mockDrawerApis(ticket: Ticket, runs: TicketRun[] = []) {
+  vi.spyOn(taskboardApi, 'getTicketDetail').mockResolvedValue({
+    ticket,
+    pipeline: null,
+    stage: sampleStage(),
+  })
+  vi.spyOn(taskboardApi, 'listRuns').mockResolvedValue({ items: runs, total: runs.length })
+  vi.spyOn(taskboardApi, 'listTimeline').mockResolvedValue(
+    mergeTimelineSources({
+      runs,
+      comments: [sampleComment()],
+      activities: [sampleActivity()],
+    }),
+  )
+}
+
+function renderDrawer(
+  ticket: Ticket,
+  over: Partial<ComponentProps<typeof TicketDrawer>> = {},
+) {
+  const onOpenSession = vi.fn()
+  const view = render(
+    <ToastProvider>
+      <TooltipProvider>
+        <TicketDrawer
+          auth={auth}
+          ticket={ticket}
+          ticketRef={ticket.identifier}
+          open
+          desktop
+          agents={[{ id: 'coding-assistant', name: '编码助手' }]}
+          stages={[sampleStage()]}
+          sessionIds={[]}
+          onClose={() => {}}
+          onReconcile={() => {}}
+          onTicketUpdated={() => {}}
+          onOpenSession={onOpenSession}
+          {...over}
+        />
+      </TooltipProvider>
+    </ToastProvider>,
+  )
+  return { ...view, onOpenSession }
+}
+
+describe('originSessionKey 映射', () => {
+  test('webchat key 抽出 peerId，且绝不带冒号', () => {
+    expect(sessionIdFromOriginKey('agent:main:webchat:dm:webabc12345')).toBe('webabc12345')
+    expect(sessionIdFromOriginKey('agent:main:taskboard:t1:s1:r1')).toBeNull()
+    expect(sessionIdFromOriginKey('agent:main:webchat:dm:webabc12345')?.includes(':')).toBe(false)
+  })
+
+  test('只在侧栏会话列表命中时才返回 id', () => {
+    expect(
+      resolveOriginSessionId('agent:main:webchat:dm:webabc12345', ['webabc12345', 'other']),
+    ).toBe('webabc12345')
+    expect(resolveOriginSessionId('agent:main:webchat:dm:webabc12345', ['other'])).toBeNull()
+    expect(resolveOriginSessionId('agent:main:taskboard:t1:s1:r1', ['t1'])).toBeNull()
+  })
+})
+
+describe('429 concurrency_full 与 settings 客户端', () => {
+  test('429 / concurrency_full 给出并发满中文提示', () => {
+    const err = new ApiError({
+      status: 429,
+      message: 'taskboard concurrency full',
+      code: 'concurrency_full',
+    })
+    expect(isConcurrencyFull(err)).toBe(true)
+    expect(taskboardErrorMessage(err, '启动巡检失败')).toBe('巡检并发已满，请稍后再试')
+    expect(skipReasonLabel('concurrency_full')).toBe('巡检并发已满')
+  })
+
+  test('GET/PATCH /api/board/settings', async () => {
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      if (String(url) === '/api/board/settings' && (!init || init.method === undefined)) {
+        return ok(sampleSettings())
+      }
+      return ok({ ok: true, ...sampleSettings(), patrolPaused: true })
+    })
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+    const got = await taskboardApi.getSettings(auth)
+    expect(got.maxConcurrentRuns).toBe(2)
+    expect(got.usage.runsToday).toBe(3)
+    await taskboardApi.patchSettings(auth, { patrolPaused: true })
+    const patchCall = (fetchMock.mock.calls as unknown as [string, RequestInit][]).find(
+      (c) => c[1]?.method === 'PATCH',
+    )
+    expect(patchCall?.[0]).toBe('/api/board/settings')
+  })
+})
+
+describe('时间线合并', () => {
+  test('activity + run + comment 按时间倒序', () => {
+    const items = mergeTimelineSources({
+      activities: [sampleActivity({ createdAt: 10 })],
+      runs: [sampleRun({ createdAt: 30 })],
+      comments: [sampleComment({ createdAt: 20 })],
+    })
+    expect(items.map((i) => i.kind)).toEqual(['run', 'comment', 'activity'])
+  })
+})
+
+describe('TicketDrawer 详情', () => {
+  test('来源会话：列表命中才打开，传入的是 Session.id 而不是 sessionKey', async () => {
+    const ticket = sampleTicket({
+      originSessionKey: 'agent:main:webchat:dm:webabc12345',
+    })
+    mockDrawerApis(ticket)
+    const { onOpenSession } = renderDrawer(ticket, { sessionIds: ['webabc12345'] })
+    const btn = await screen.findByTestId('ticket-drawer-origin-session')
+    await act(async () => {
+      fireEvent.click(btn)
+    })
+    expect(onOpenSession).toHaveBeenCalledTimes(1)
+    expect(onOpenSession).toHaveBeenCalledWith('webabc12345')
+    expect(String(onOpenSession.mock.calls[0]?.[0])).not.toContain(':')
+  })
+
+  test('来源会话：列表找不到则不调用 onOpenSession，并给出中文说明', async () => {
+    const ticket = sampleTicket({
+      originSessionKey: 'agent:main:webchat:dm:webabc12345',
+    })
+    mockDrawerApis(ticket)
+    const { onOpenSession } = renderDrawer(ticket, { sessionIds: [] })
+    const btn = await screen.findByTestId('ticket-drawer-origin-session')
+    await act(async () => {
+      fireEvent.click(btn)
+    })
+    expect(onOpenSession).not.toHaveBeenCalled()
+    expect(await screen.findByText('来源会话不在当前列表中，可能已删除或不是网页对话')).toBeInTheDocument()
+  })
+
+  test('巡检 sessionKey 不能当来源会话 id', async () => {
+    const ticket = sampleTicket({
+      originSessionKey: 'agent:main:taskboard:t1:s1:r1',
+    })
+    mockDrawerApis(ticket)
+    const { onOpenSession } = renderDrawer(ticket, { sessionIds: ['t1', 'r1'] })
+    const btn = await screen.findByTestId('ticket-drawer-origin-session')
+    await act(async () => {
+      fireEvent.click(btn)
+    })
+    expect(onOpenSession).not.toHaveBeenCalled()
+  })
+
+  test('评论失败回滚乐观条目', async () => {
+    const ticket = sampleTicket()
+    mockDrawerApis(ticket)
+    vi.spyOn(taskboardApi, 'comment').mockRejectedValue(
+      new ApiError({ status: 500, message: 'internal error' }),
+    )
+    renderDrawer(ticket)
+    await screen.findByTestId('ticket-drawer-comment')
+    fireEvent.change(screen.getByTestId('ticket-drawer-comment'), {
+      target: { value: '先别合' },
+    })
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('ticket-drawer-comment-submit'))
+    })
+    await waitFor(() => {
+      expect(screen.getByText('发表评论失败')).toBeInTheDocument()
+    })
+    const timeline = screen.getByTestId('ticket-timeline')
+    expect(timeline.textContent).not.toContain('先别合')
+    expect((screen.getByTestId('ticket-drawer-comment') as HTMLTextAreaElement).value).toBe('先别合')
+  })
+
+  test('改需求 409 冲突提示后强制对账', async () => {
+    const ticket = sampleTicket({ version: 3 })
+    mockDrawerApis(ticket)
+    const reconcile = vi.fn()
+    vi.spyOn(taskboardApi, 'patchTicket').mockRejectedValue(
+      new ApiError({ status: 409, message: 'version conflict', code: 'version_conflict' }),
+    )
+    renderDrawer(ticket, { startEditing: true, onReconcile: reconcile })
+    await screen.findByTestId('ticket-drawer-save')
+    fireEvent.change(screen.getByLabelText('单据标题'), { target: { value: '新标题' } })
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('ticket-drawer-save'))
+    })
+    expect(await screen.findByText('单据已被其他人更新，已刷新最新内容')).toBeInTheDocument()
+    expect(reconcile).toHaveBeenCalled()
+  })
+
+  test('手动巡检 429 concurrency_full 给出中文提示', async () => {
+    const ticket = sampleTicket({ status: 'ready' })
+    mockDrawerApis(ticket)
+    vi.spyOn(taskboardApi, 'patrol').mockRejectedValue(
+      new ApiError({
+        status: 429,
+        message: 'taskboard concurrency full',
+        code: 'concurrency_full',
+      }),
+    )
+    renderDrawer(ticket)
+    const btn = await screen.findByTestId('ticket-drawer-patrol')
+    await act(async () => {
+      fireEvent.click(btn)
+    })
+    expect(await screen.findByText('巡检并发已满，请稍后再试')).toBeInTheDocument()
+  })
+
+  test('run 明细把 skipReason 翻成人话，空用量降级', async () => {
+    const ticket = sampleTicket()
+    const run = sampleRun({ skipReason: 'concurrency_full', durationMs: null, costUsd: null })
+    mockDrawerApis(ticket, [run])
+    renderDrawer(ticket)
+    expect(await screen.findByText('跳过：巡检并发已满')).toBeInTheDocument()
+    expect(screen.getByText(/耗时未记录/)).toBeInTheDocument()
+    expect(screen.getByText(/用量未记录/)).toBeInTheDocument()
+  })
+})
+
+describe('TaskboardView 来源会话不把 key 当 id', () => {
+  test('命中侧栏 id 才回调，回调值不含冒号', async () => {
+    const ticket = sampleTicket({
+      originSessionKey: 'agent:main:webchat:dm:webabc12345',
+    })
+    vi.spyOn(taskboardApi, 'listProjects').mockResolvedValue([
+      {
+        id: 'p1',
+        key: 'OCV5',
+        name: 'V5',
+        description: null,
+        workspace: null,
+        labels: [],
+        archivedAt: null,
+        createdAt: 1,
+        updatedAt: 1,
+      },
+    ])
+    vi.spyOn(taskboardApi, 'listTickets').mockResolvedValue({ items: [ticket], total: 1 })
+    vi.spyOn(taskboardApi, 'listAgents').mockResolvedValue([])
+    vi.spyOn(taskboardApi, 'getProjectBoard').mockResolvedValue({
+      project: {
+        id: 'p1',
+        key: 'OCV5',
+        name: 'V5',
+        description: null,
+        workspace: null,
+        labels: [],
+        archivedAt: null,
+        createdAt: 1,
+        updatedAt: 1,
+      },
+      pipeline: {
+        id: 'pipe1',
+        projectId: 'p1',
+        name: 'bug',
+        ticketType: 'bug',
+        isDefault: true,
+        createdAt: 1,
+        updatedAt: 1,
+      },
+      ticketType: 'bug',
+      columns: [],
+      inbox: [ticket],
+    })
+    mockDrawerApis(ticket)
+    const onOpenSession = vi.fn()
+    render(
+      <ToastProvider>
+        <TooltipProvider>
+          <TaskboardView
+            auth={auth}
+            view="inbox"
+            ticketId="OCV5-42"
+            onViewChange={() => {}}
+            onOpenTicket={() => {}}
+            onOpenMobileNav={() => {}}
+            onOpenSession={onOpenSession}
+            sessionIds={['webabc12345']}
+          />
+        </TooltipProvider>
+      </ToastProvider>,
+    )
+    const btn = await screen.findByTestId('ticket-drawer-origin-session')
+    await act(async () => {
+      fireEvent.click(btn)
+    })
+    expect(onOpenSession).toHaveBeenCalledWith('webabc12345')
+    expect(String(onOpenSession.mock.calls[0]?.[0])).not.toMatch(/:/)
+  })
+})
+
+describe('BoardSettingsPanel', () => {
+  test('非 human 403 收口成中文', async () => {
+    vi.spyOn(taskboardApi, 'getSettings').mockResolvedValue(sampleSettings())
+    vi.spyOn(taskboardApi, 'patchSettings').mockRejectedValue(
+      new ApiError({ status: 403, message: 'forbidden', code: 'forbidden' }),
+    )
+    render(
+      <ToastProvider>
+        <TooltipProvider>
+          <BoardSettingsPanel auth={auth} />
+        </TooltipProvider>
+      </ToastProvider>,
+    )
+    fireEvent.click(screen.getByTestId('board-settings-open'))
+    const save = await screen.findByTestId('board-settings-save')
+    await act(async () => {
+      fireEvent.click(save)
+    })
+    expect(await screen.findByText('当前身份无权执行此操作')).toBeInTheDocument()
+  })
+
+  test('急停开关要二次确认，取消不发请求', async () => {
+    vi.spyOn(taskboardApi, 'getSettings').mockResolvedValue(sampleSettings())
+    const patch = vi.spyOn(taskboardApi, 'patchSettings').mockResolvedValue({
+      ok: true,
+      ...sampleSettings(),
+      patrolPaused: true,
+    })
+    render(
+      <ToastProvider>
+        <TooltipProvider>
+          <BoardSettingsPanel auth={auth} />
+        </TooltipProvider>
+      </ToastProvider>,
+    )
+    fireEvent.click(screen.getByTestId('board-settings-open'))
+    const pause = await screen.findByTestId('board-settings-pause')
+    await act(async () => {
+      fireEvent.click(pause)
+    })
+    expect(await screen.findByText('急停全部巡检？')).toBeInTheDocument()
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '取消' }))
+    })
+    expect(patch).not.toHaveBeenCalled()
   })
 })

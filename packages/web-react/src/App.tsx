@@ -2377,7 +2377,10 @@ export function App() {
               onOpenMobileNav={() => setMobileNavOpen(true)}
               sidebarCollapsed={collapsed}
               onExpandSidebar={() => setCollapsed(false)}
+              sessionIds={sessions.map((s) => s.id)}
               onOpenSession={(id) => {
+                // originSessionKey 是 agent:<id>:webchat:dm:<peerId>，不能当 Session.id。
+                if (!id || id.includes(":") || !sessions.some((s) => s.id === id)) return;
                 setBoardOpen(false);
                 selectSession(id);
               }}

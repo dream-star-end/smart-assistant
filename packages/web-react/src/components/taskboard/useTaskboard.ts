@@ -362,6 +362,7 @@ export function useTaskboard(auth: AuthSession | null, enabled: boolean) {
     applyListQuery,
     createTicket,
     runAction,
+    replaceTicket,
     reconcile,
     refresh: loadInitial,
     isPending: (id: string) => pending.includes(id),
