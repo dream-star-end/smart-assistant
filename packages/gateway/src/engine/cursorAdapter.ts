@@ -333,7 +333,16 @@ function parsePythonReprValue(input: string): unknown {
     if (rest.startsWith('False')) { if (!/False\b/.test(rest)) throw new Error('bad False'); pos += 5; return false }
     if (rest.startsWith('None')) { if (!/None\b/.test(rest)) throw new Error('bad None'); pos += 4; return null }
     const num = /^[+-]?(?:\d+\.?\d*(?:[eE][+-]?\d+)?|\.\d+(?:[eE][+-]?\d+)?)/.exec(rest)
-    if (num) { pos += num[0].length; return Number(num[0]) }
+    if (num) {
+      const value = Number(num[0])
+      // python 整数任意精度;超 Number 安全范围会静默丢字(9007199254740993 → …992),
+      // 属"成功解析但内容改变" → 回退。浮点 repr 本就来自 double,Number() 可精确还原。
+      if (Number.isFinite(value) && /^[+-]?\d+$/.test(num[0]) && !Number.isSafeInteger(value)) {
+        throw new Error('repr int exceeds safe integer range')
+      }
+      pos += num[0].length
+      return value
+    }
     throw new Error(`repr value: unexpected ${JSON.stringify(ch)} at ${pos}`)
   }
   const parseString = (): string => {

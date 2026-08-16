@@ -352,6 +352,23 @@ describe('CursorAdapter', () => {
     if (todo.status !== 'pending') throw new Error('status not normalized under __proto__ key')
   })
 
+  test('unsafe python integers fall back instead of losing digits (codex round-4)', () => {
+    const big = {
+      type: 'tool_call',
+      tool_call: {
+        id: 't-repr-bigint',
+        updateTodosToolCall: {
+          args: { todos: `[{'content': 9007199254740993, 'status': 'TODO_STATUS_PENDING'}]` },
+        },
+      },
+    }
+    const out = _internals.toolInputOf(big as never) as Record<string, unknown> & { args?: { todos?: string } }
+    if (out.todos !== undefined) throw new Error('unsafe integer must not parse')
+    if (out.args?.todos !== `[{'content': 9007199254740993, 'status': 'TODO_STATUS_PENDING'}]`) {
+      throw new Error('raw fallback must keep every digit')
+    }
+  })
+
   test('keeps raw cursor args when stringified todos cannot be parsed', () => {
     const broken = {
       type: 'tool_call',
