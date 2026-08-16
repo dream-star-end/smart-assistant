@@ -228,3 +228,20 @@ describe("Sidebar 会话列表", () => {
     expect(screen.getByText("更早")).toBeInTheDocument();
   });
 });
+
+describe("Sidebar 任务面板入口", () => {
+  it("传入 onOpenBoard 时渲染入口，并用 data-product-control 标注", () => {
+    const onOpenBoard = vi.fn();
+    renderSidebar({ onOpenBoard, boardActive: true });
+    const btn = screen.getByRole("button", { name: /任务面板/ });
+    expect(btn).toHaveAttribute("data-product-control");
+    expect(btn).toHaveAttribute("aria-current", "true");
+    fireEvent.click(btn);
+    expect(onOpenBoard).toHaveBeenCalled();
+  });
+
+  it("省略 onOpenBoard 时不渲染入口（demo）", () => {
+    renderSidebar();
+    expect(screen.queryByRole("button", { name: /任务面板/ })).toBeNull();
+  });
+});

@@ -1,4 +1,4 @@
-import { BookOpen, Building2, LayoutGrid, LogOut, MessageSquareText, PanelLeftClose, Pencil, Plus, Search, ShieldCheck, Sparkles, Store, Trash2 } from "lucide-react";
+import { BookOpen, Building2, Kanban, LayoutGrid, LogOut, MessageSquareText, PanelLeftClose, Pencil, Plus, Search, ShieldCheck, Sparkles, Store, Trash2 } from "lucide-react";
 import { useMemo, useState } from "react";
 import { BRAND } from "../lib/brand";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
@@ -24,6 +24,8 @@ export function Sidebar({
   onOpenMarketplace,
   onOpenTutorial,
   onOpenOrg,
+  onOpenBoard,
+  boardActive,
   showAdmin,
 }: {
   sessions: Session[];
@@ -53,6 +55,10 @@ export function Sidebar({
   onOpenTutorial?: () => void;
   /** 打开组织中心（企业版）。仅 org owner/admin 提供，省略则不渲染入口。 */
   onOpenOrg?: () => void;
+  /** 打开任务面板全屏工作区。省略则不渲染入口（demo）。 */
+  onOpenBoard?: () => void;
+  /** 任务面板当前是否为工作区（选中态）。 */
+  boardActive?: boolean;
   /** 平台超管入口。仅 user.role === 'admin' 时为 true，false/省略则不渲染。 */
   showAdmin?: boolean;
 }) {
@@ -94,6 +100,27 @@ export function Sidebar({
           <Plus size={17} />
           新建会话
         </Button>
+
+        {onOpenBoard && (
+          <button
+            type="button"
+            data-product-control
+            data-testid="taskboard-nav"
+            onClick={onOpenBoard}
+            aria-current={boardActive ? "true" : undefined}
+            className={cn(
+              "relative flex items-center gap-2.5 rounded-lg px-3 py-1.5 text-left text-body font-medium outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring",
+              boardActive ? "bg-active text-fg" : "text-muted",
+            )}
+          >
+            {boardActive && (
+              <span aria-hidden className="absolute inset-y-1 left-0 w-0.5 rounded-full bg-accent" />
+            )}
+            <Kanban size={16} className="text-faint" />
+            任务面板
+            <span className="ml-auto text-caption text-faint">看板 · 待确认</span>
+          </button>
+        )}
 
         <div className="flex items-center gap-2 rounded-xl bg-hover px-3 py-2 transition-shadow focus-within:ring-2 focus-within:ring-ring">
           <Search size={15} className="text-faint" />
