@@ -3071,7 +3071,11 @@ export class ChatSocket {
       let cursor = checkpoint?.cursor ?? "0";
       const previousLiveOwners = checkpoint?.liveClientMessageIds ?? new Set<string>();
       let currentLiveOwners = new Set(previousLiveOwners);
-      const observedLiveOwners = new Set(previousLiveOwners);
+      // Reset owners ≠ live owners. streamClientMessageIds is the in-flight
+      // set (retired streams are omitted). Replay still has to purge local
+      // cache for every cmid that actually arrived in this snapshot, so the
+      // reset list is that set ∪ clientMessageId on the staged frames.
+      const resetOwnerIds = new Set<string>();
       // Work on a copy and commit it with the record cursor only after every
       // page succeeds. A failed later page must leave both checkpoints at the
       // same retry boundary.
@@ -3112,7 +3116,14 @@ export class ChatSocket {
             );
           }
           currentLiveOwners = new Set(page.streamClientMessageIds);
-          for (const clientMessageId of currentLiveOwners) observedLiveOwners.add(clientMessageId);
+          if (stage) {
+            for (const clientMessageId of currentLiveOwners) resetOwnerIds.add(clientMessageId);
+            for (const frame of page.frames) {
+              if (typeof frame.clientMessageId === "string" && frame.clientMessageId) {
+                resetOwnerIds.add(frame.clientMessageId);
+              }
+            }
+          }
           frameCount += page.frames.length;
           if (stage) {
             stage.push(...page.frames);
@@ -3138,7 +3149,7 @@ export class ChatSocket {
         this.applyDurableLiveFrames(
           sessId,
           stagedFrames,
-          [...observedLiveOwners],
+          [...resetOwnerIds],
           lastDurableFrameSeqBySessionKey,
         );
         if (!degraded) {

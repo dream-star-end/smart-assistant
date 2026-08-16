@@ -4220,6 +4220,97 @@ describe("ChatSocket interrupted continuation", () => {
     sock.stop();
   });
 
+  test("retired stream frames still reset local cache but are not live owners", async () => {
+    vi.useFakeTimers();
+    const sessId = "s-retired-stream";
+    const clientMessageId = "cm-retired-stream";
+    const sessionKey = `agent:main:webchat:dm:${sessId}`;
+    let sock!: ChatSocket;
+    const resetLists: string[][] = [];
+    const syncSession = vi.fn(async () => {
+      await sock.hydrateDurableLiveFrameJournal(
+        sessId,
+        async (after) => ({
+          frames: after === "0"
+            ? [{
+                recordId: "1",
+                streamKey: "dispatch:77777777-7777-4777-8777-777777777777:1",
+                source: "gateway" as const,
+                clientMessageId,
+                payload: {
+                  type: "outbound.message",
+                  sessionKey,
+                  frameSeq: 1,
+                  peer: { id: sessId, kind: "dm" },
+                  clientMessageId,
+                  blocks: [{ kind: "text", text: "retired stream answer" }],
+                  isFinal: true,
+                  ts: 11,
+                },
+              }]
+            : [],
+          nextCursor: after === "0" ? "1" : null,
+          hasMore: false,
+          streamClientMessageIds: [],
+          hasTapeProjection: true,
+        }),
+        async () => {},
+      );
+      return true;
+    });
+    sock = makeSocket({ syncSession });
+    const apply = sock.applyDurableLiveFrames.bind(sock);
+    sock.applyDurableLiveFrames = ((...args: Parameters<ChatSocket["applyDurableLiveFrames"]>) => {
+      resetLists.push([...(args[2] ?? [])]);
+      return apply(...args);
+    }) as ChatSocket["applyDurableLiveFrames"];
+    const now = Date.now();
+    sock.loadStored({
+      id: sessId,
+      agentId: "main",
+      title: "retired",
+      messages: [
+        { id: clientMessageId, role: "user", text: "please recover", ts: now, status: "sent" },
+        {
+          id: "stale-local-retired",
+          role: "assistant",
+          text: "stale local copy",
+          ts: now + 1,
+          _clientMessageId: clientMessageId,
+        },
+        {
+          id: "srv-retired-visible",
+          role: "assistant",
+          text: "tape already has the answer",
+          ts: now + 2,
+          _source: "server",
+          _clientMessageId: clientMessageId,
+        },
+      ],
+      createdAt: now,
+      lastAt: now,
+      _sendingInFlight: true,
+      _activeClientMessageId: clientMessageId,
+      _turnStartedAt: now,
+    });
+
+    await vi.waitFor(() => {
+      expect(resetLists.length).toBeGreaterThan(0);
+      expect(sock.sessions.get(sessId)?._reconciling).toBe(false);
+    });
+    const session = sock.sessions.get(sessId)!;
+    expect(resetLists[0]).toEqual([clientMessageId]);
+    expect(resetLists.slice(1).every((ids) => ids.length === 0)).toBe(true);
+    expect(session.messages.find((message) => message.id === "stale-local-retired")).toBeUndefined();
+    expect(session.messages.some((message) => message.text === "retired stream answer")).toBe(true);
+    expect(session._sendingInFlight).toBe(false);
+    expect(session._reconciling).toBe(false);
+    expect(session._recoveryStatus?.kind).toBe("completed");
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(syncSession).toHaveBeenCalledTimes(1);
+    sock.stop();
+  });
+
   test("tape projection observed only after reconnect (stale checkpoint, no live cutover) still triggers one narrative read", async () => {
     // boss 2026-08-16 现场:页面在网关重启前打开(当时没有任何 tape 投影),重启
     // 断连期间 turn 完成并切到 tape 投影;重连水合带着旧 checkpoint(initial=false)
