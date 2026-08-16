@@ -260,6 +260,9 @@ export async function readClientSessionLiveFrames(
     // frames-first join let a generic plan pick client_session_live_frames_pkey
     // with Index Cond (record_id > $cursor) and walk the table; zero matching
     // rows was the slowest case.
+    // Retired streams stay in this frame query: retirement only means "not in
+    // flight" (dropped from streamClientMessageIds). Many dead streams have no
+    // tape and no canonical messages — these frames are the only copy.
     const rows = (
       await client.query<{
         record_id: string;
@@ -280,7 +283,6 @@ export async function readClientSessionLiveFrames(
            ) f
           WHERE s.user_id=$2 AND s.session_id=$1
             AND s.projection_source='live'
-            AND NOT (s.provenance ? 'retired_at')
           ORDER BY f.record_id
           LIMIT $4`,
         [sessionId, userId, cursor, pageSize + 1],
@@ -550,8 +552,13 @@ export async function pruneProjectedLiveFrames(
  * them to tape with a null tape_id would inflate hasTapeProjection /
  * tapeProjectionVersion. Retirement is a provenance.retired_at stamp
  * (no DDL — aurora already occupies 0219; a new column would force a 0220
- * gap and a migrate-before-code deploy order) and the read path excludes
- * those keys.
+ * gap and a migrate-before-code deploy order).
+ *
+ * Retirement is "no longer the in-flight owner", not "content is gone".
+ * The read path still returns retired streams' frames (often the only copy:
+ * no tape, no canonical messages). It only drops them from
+ * streamClientMessageIds, which is what the client uses to decide a turn
+ * is still flying.
  *
  * Eligible, all required:
  *   - source='gateway' (never rollout_import)

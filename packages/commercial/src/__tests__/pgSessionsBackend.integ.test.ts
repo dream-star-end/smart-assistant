@@ -4569,7 +4569,11 @@ describe("durable live turn frame journal", () => {
 
     const deadPage = await readClientSessionLiveFrames(pool, dead.sessionId, userId, 0, 10);
     assert.ok(deadPage);
-    assert.deepEqual(deadPage.frames, []);
+    assert.equal(deadPage.frames.length, 1, "retired streams still project their frames");
+    assert.equal(
+      (deadPage.frames[0]!.payload as { blocks: Array<{ text: string }> }).blocks[0]!.text,
+      dead.sessionId,
+    );
     assert.deepEqual(deadPage.streamClientMessageIds, []);
     assert.equal(deadPage.hasTapeProjection, false);
     assert.equal(deadPage.tapeProjectionVersion, 0);
@@ -4594,6 +4598,82 @@ describe("durable live turn frame journal", () => {
     assert.ok(rolloutPage);
     assert.equal(rolloutPage.frames.length, 1);
     assert.deepEqual(rolloutPage.streamClientMessageIds, ["cm-retire-import"]);
+  });
+  maybe("retired dead stream with content frames still pages those frames but drops streamClientMessageIds", async () => {
+    const sessionId = "s-retire-keeps-content-frames";
+    const userId = "c:913";
+    const clientMessageId = "cm-retire-keeps-content";
+    const dispatchId = randomUUID();
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    await pool.query(
+      `INSERT INTO turn_dispatches
+         (dispatch_id,user_id,session_id,client_message_id,agent_id,request_hash,
+          billing_request_id,status,conflict_reason,owner_id,lease_until)
+       VALUES ($1,913,$2,$3,'main',$4,$5,'manual_reconcile','stale-live-orphan','test-owner',NOW()-INTERVAL '3 hours')`,
+      [dispatchId, sessionId, clientMessageId, "11".repeat(32), `billing-${dispatchId}`],
+    );
+    const payload1 = JSON.stringify({
+      type: "outbound.message",
+      sessionKey: `agent:main:webchat:dm:${sessionId}`,
+      frameSeq: 1,
+      peer: { id: sessionId, kind: "dm" },
+      clientMessageId,
+      blocks: [{ kind: "thinking", text: "only copy" }],
+    });
+    const payload2 = JSON.stringify({
+      type: "outbound.message",
+      sessionKey: `agent:main:webchat:dm:${sessionId}`,
+      frameSeq: 2,
+      peer: { id: sessionId, kind: "dm" },
+      clientMessageId,
+      blocks: [{ kind: "text", text: "sole surviving reply" }],
+    });
+    const base = {
+      uid: 913n,
+      sessionId,
+      clientMessageId,
+      agentContainerId: 480,
+      sessionKey: `agent:main:webchat:dm:${sessionId}`,
+    };
+    await persistGatewayLiveFrame(pool, { ...base, frameSeq: 1, payload: payload1 });
+    await persistGatewayLiveFrame(pool, { ...base, frameSeq: 2, payload: payload2 });
+    await pool.query(
+      `UPDATE client_session_live_streams SET updated_at=NOW()-INTERVAL '3 hours' WHERE session_id=$1`,
+      [sessionId],
+    );
+
+    const before = await readClientSessionLiveFrames(pool, sessionId, userId, 0, 10);
+    assert.ok(before);
+    assert.equal(before.frames.length, 2);
+    assert.deepEqual(before.streamClientMessageIds, [clientMessageId]);
+
+    assert.equal((await retireDeadLiveStreams(pool, { minAgeMs: 60 * 60 * 1000 })).retired, 1);
+
+    const after = await readClientSessionLiveFrames(pool, sessionId, userId, 0, 10);
+    assert.ok(after);
+    assert.equal(after.frames.length, 2);
+    assert.deepEqual(
+      after.frames.map((frame) => frame.payload),
+      [JSON.parse(payload1), JSON.parse(payload2)],
+    );
+    assert.deepEqual(after.streamClientMessageIds, []);
+    assert.equal(after.hasTapeProjection, false);
+    assert.equal(after.tapeProjectionVersion, 0);
+    const firstPage = await readClientSessionLiveFrames(pool, sessionId, userId, 0, 1);
+    assert.ok(firstPage);
+    assert.equal(firstPage.frames.length, 1);
+    assert.equal(firstPage.hasMore, true);
+    const secondPage = await readClientSessionLiveFrames(
+      pool,
+      sessionId,
+      userId,
+      Number(firstPage.nextCursor),
+      1,
+    );
+    assert.ok(secondPage);
+    assert.equal(secondPage.frames.length, 1);
+    assert.deepEqual(secondPage.frames[0]!.payload, JSON.parse(payload2));
+    assert.deepEqual(secondPage.streamClientMessageIds, []);
   });
 });
 
