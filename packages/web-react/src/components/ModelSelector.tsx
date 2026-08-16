@@ -2,7 +2,7 @@ import {
   DEFAULT_CODEX_ENGINE_MODEL,
   DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME,
 } from "@openclaude/protocol";
-import { AlertTriangle, Check, ChevronDown, Cpu, Users, Zap } from "lucide-react";
+import { AlertTriangle, Check, ChevronDown, Cpu, Users } from "lucide-react";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import type { PublicModel } from "../lib/types";
 import { cn } from "../lib/utils";
@@ -12,6 +12,7 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuLabel,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "./ui";
 import type { PreferenceEffort } from "../lib/modelPreferences";
@@ -55,6 +56,12 @@ export function teamEngineLabel(models: PublicModel[]): string {
  * 队长引擎（teamEngineLabel）——此时触发器如实显示实际生效引擎而非用户自选模型，
  * 菜单顶部追加不可选说明态；用户自选模型仍保留选中记忆（团队模式关闭后生效）。
  * 显示诚信原则：用户看到的必须是真的。
+ *
+ * 思考档位是模型菜单内的二级区块（2026-08-16 移动端回归修复:独立顶栏按钮约占 1/4
+ * 宽,把铃铛/钱包/主题图标全挤掉）。选项 = 当前执行模型 supported_efforts ∩ 平台 5
+ * 档;状态由 App 顶层持有（per-session 显式选择,null = 跟随模型默认）;effortLevel
+ * 是 inbound.message 顶层路由字段,档位变化在下一条消息生效。模型不暴露档位或调用方
+ * 未提供回调 → 区块整体不渲染。
  */
 export function ModelSelector({
   models,
@@ -62,6 +69,9 @@ export function ModelSelector({
   onSelect,
   loading,
   teamEngineActive,
+  effortSupported,
+  effortActive,
+  onSelectEffort,
 }: {
   models: PublicModel[];
   selectedId?: string;
@@ -69,6 +79,12 @@ export function ModelSelector({
   loading?: boolean;
   /** 团队模式已开启且当前会话是 main（队长引擎覆盖生效）。由 App 的 teamMode 单一状态推导。 */
   teamEngineActive?: boolean;
+  /** 当前执行模型支持的思考档位(空/省略 = 模型不暴露档位,菜单不渲染档位区块)。 */
+  effortSupported?: readonly string[];
+  /** 当前生效思考档(null/undefined = 跟随模型默认)。 */
+  effortActive?: PreferenceEffort | null;
+  /** 选择思考档;null = 跟随模型默认。 */
+  onSelectEffort?: (value: PreferenceEffort | null) => void;
 }) {
   const selected = models.find((m) => m.id === selectedId);
   // 已选模型被降级(且非团队模式覆盖态)→ 菜单顶部提示条建议换模;可用替代 = 下方未降级模型。
@@ -182,77 +198,45 @@ export function ModelSelector({
             </DropdownMenuItem>
           );
         })}
-      </DropdownMenuContent>
-    </DropdownMenu>
-  );
-}
-
-/**
- * 思考档位选择器(聊天头,与 ModelSelector 并排)。
- *
- * - 数据驱动:选项 = 当前执行模型的 supported_efforts ∩ EFFORT_OPTIONS(平台 5 档
- *   全集);空集(该模型不暴露任何档)→ 调用方不渲染本组件。
- * - 选择状态由 App 顶层持有(per-session 显式选择,null = 跟随模型默认);「当前生效
- *   档」的解析(显式选择 ?? 全局偏好,并按模型支持集过滤)也在 App 侧完成,本组件
- *   只展示 + 上抛,不持第二份状态。
- * - effortLevel 是 inbound.message 顶层路由字段:每条消息携带,档位变化在下一条
- *   消息生效(引擎侧切换 = 重建 runner env,由后端处理)。
- */
-export function EffortSelector({
-  supportedEfforts,
-  activeEffort,
-  onSelect,
-  disabled,
-}: {
-  /** 当前执行模型 API 投影的 supported_efforts(空数组由调用方过滤,不渲染本组件)。 */
-  supportedEfforts: readonly string[];
-  /** 当前生效档:null/undefined = 跟随模型默认(该项打勾);否则对应档位打勾。 */
-  activeEffort?: PreferenceEffort | null;
-  onSelect: (value: PreferenceEffort | null) => void;
-  disabled?: boolean;
-}) {
-  const options = EFFORT_OPTIONS.filter((o) => supportedEfforts.includes(o.value));
-  const followActive = activeEffort == null;
-  const label = followActive
-    ? "思考 · 跟随"
-    : `思考 · ${EFFORT_OPTIONS.find((o) => o.value === activeEffort)?.label ?? activeEffort}`;
-  return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <button
-          type="button"
-          data-product-control
-          disabled={disabled}
-          aria-label="选择思考档位"
-          title="思考档位:控制模型回答前的思考深度"
-          className={cn(
-            "flex items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-[13.5px] font-medium text-muted outline-none transition-colors",
-            "hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98]",
-            "disabled:pointer-events-none disabled:opacity-50",
-          )}
-        >
-          <Zap size={14} className="text-faint" />
-          <span className="max-w-[6rem] truncate sm:max-w-none">{label}</span>
-          <ChevronDown size={14} className="text-faint" />
-        </button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="start" className="min-w-[12rem]">
-        <DropdownMenuLabel>思考档位</DropdownMenuLabel>
-        <DropdownMenuItem onSelect={() => onSelect(null)} className="justify-between">
-          <span>跟随模型默认</span>
-          {followActive && <Check size={14} className="shrink-0 text-accent" />}
-        </DropdownMenuItem>
-        {options.map((o) => (
-          <DropdownMenuItem
-            key={o.value}
-            data-effort={o.value}
-            onSelect={() => onSelect(o.value)}
-            className="justify-between"
-          >
-            <span>{o.label}</span>
-            {activeEffort === o.value && <Check size={14} className="shrink-0 text-accent" />}
-          </DropdownMenuItem>
-        ))}
+        {effortSupported && effortSupported.length > 0 && onSelectEffort && (
+          <>
+            <DropdownMenuSeparator />
+            <DropdownMenuLabel className="flex items-center justify-between">
+              思考档位
+              <span className="text-[11px] font-normal text-faint">
+                {effortActive == null
+                  ? "跟随模型默认"
+                  : (EFFORT_OPTIONS.find((o) => o.value === effortActive)?.label ??
+                    effortActive)}
+              </span>
+            </DropdownMenuLabel>
+            <DropdownMenuItem
+              data-effort="follow"
+              onSelect={() => onSelectEffort(null)}
+              className="justify-between"
+            >
+              <span>跟随模型默认</span>
+              {effortActive == null && (
+                <Check size={14} className="shrink-0 text-accent" />
+              )}
+            </DropdownMenuItem>
+            {EFFORT_OPTIONS.filter((o) => effortSupported.includes(o.value)).map(
+              (o) => (
+                <DropdownMenuItem
+                  key={o.value}
+                  data-effort={o.value}
+                  onSelect={() => onSelectEffort(o.value)}
+                  className="justify-between"
+                >
+                  <span>{o.label}</span>
+                  {effortActive === o.value && (
+                    <Check size={14} className="shrink-0 text-accent" />
+                  )}
+                </DropdownMenuItem>
+              ),
+            )}
+          </>
+        )}
       </DropdownMenuContent>
     </DropdownMenu>
   );
