@@ -554,6 +554,11 @@ export class ChatSocket {
    * never destructively reset an already-visible process transcript. */
   private readonly durableLiveJournalCheckpoints = new Map<string, {
     cursor: string;
+    /** 本页生命周期内已确认服务端存在 tape 投影并补拉过全量叙事。
+     * 网关重启后 WS 重连时 checkpoint 已存在(initial=false),但页面可能在
+     * 断连期间丢失流式正文(增量同步只回存根);靠该标记让"新观察到 tape
+     * 投影但从未拉过叙事"的自愈触发恰好执行一次,不重复打全量。 */
+    sawTapeProjection?: boolean;
     liveClientMessageIds: Set<string>;
     /** Last journaled frameSeq for each raw wire sessionKey. Unlike the
      * reducer cursor, this follows record_id order across container
@@ -2952,12 +2957,19 @@ export class ChatSocket {
       const liveOwnerProjectedToTape = [...previousLiveOwners].some(
         (clientMessageId) => !currentLiveOwners.has(clientMessageId),
       );
-      if ((initial && sawTapeProjection) || liveOwnerProjectedToTape) {
+      // 自愈:本页内首次观察到 tape 投影(含 initial,以及网关重启后带着旧
+      // checkpoint 重连的场景)就补拉一次全量叙事,不再要求 (initial && …)。
+      // 之后由 checkpoint.sawTapeProjection 去重;亲眼看 live→tape 切换的
+      // 既有触发保持不变。
+      const tapeProjectionAppeared =
+        sawTapeProjection && checkpoint?.sawTapeProjection !== true;
+      if (tapeProjectionAppeared || liveOwnerProjectedToTape) {
         await applyTapeProjection();
       }
 
       this.durableLiveJournalCheckpoints.set(sessId, {
         cursor,
+        ...(sawTapeProjection || checkpoint?.sawTapeProjection ? { sawTapeProjection: true } : {}),
         liveClientMessageIds: currentLiveOwners,
         lastDurableFrameSeqBySessionKey,
       });

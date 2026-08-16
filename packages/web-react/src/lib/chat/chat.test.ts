@@ -4148,6 +4148,31 @@ describe("ChatSocket interrupted continuation", () => {
     sock.stop();
   });
 
+  test("tape projection observed only after reconnect (stale checkpoint, no live cutover) still triggers one narrative read", async () => {
+    // boss 2026-08-16 现场:页面在网关重启前打开(当时没有任何 tape 投影),重启
+    // 断连期间 turn 完成并切到 tape 投影;重连水合带着旧 checkpoint(initial=false)
+    // 且从未见过 live owner 切换 —— 旧行为两次触发都不命中,助手正文只剩存根。
+    const sock = makeSocket();
+    const sessId = "s-reconnect-tape-heal";
+    sock.ensureSession(sessId, "main");
+    const applyTapeProjection = vi.fn(async () => {});
+    const page = (hasTapeProjection: boolean) => async () => ({
+      frames: [], nextCursor: null, hasMore: false,
+      streamClientMessageIds: [], hasTapeProjection,
+    });
+
+    // 打开会话时还没有任何 tape 投影:不触发。
+    await sock.hydrateDurableLiveFrameJournal(sessId, page(false), applyTapeProjection);
+    expect(applyTapeProjection).not.toHaveBeenCalled();
+    // 网关重启、重连:同一页面(非 initial),此时才第一次观察到 tape 投影 → 恰好补拉一次。
+    await sock.hydrateDurableLiveFrameJournal(sessId, page(true), applyTapeProjection);
+    expect(applyTapeProjection).toHaveBeenCalledTimes(1);
+    // 之后的常规对账不重复打全量。
+    await sock.hydrateDurableLiveFrameJournal(sessId, page(true), applyTapeProjection);
+    expect(applyTapeProjection).toHaveBeenCalledTimes(1);
+    sock.stop();
+  });
+
   test("journal page1 → overlapping WS frame → page2 applies thinking/tool/text exactly once", async () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const sock = makeSocket();
