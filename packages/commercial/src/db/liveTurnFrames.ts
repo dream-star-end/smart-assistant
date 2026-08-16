@@ -25,6 +25,8 @@ export interface ClientSessionLiveFramePage {
   hasMore: boolean;
   streamClientMessageIds: string[];
   hasTapeProjection: boolean;
+  /** tape 投影版本水位(tape 投影流计数,单调递增)。见 readClientSessionLiveFrames。 */
+  tapeProjectionVersion: number;
 }
 
 function sha256(payload: Buffer): string {
@@ -190,8 +192,11 @@ export async function readClientSessionLiveFrames(
     const streams = await client.query<{
       client_message_id: string | null;
       projection_source: "live" | "tape";
+      tape_projection_version: string | number;
     }>(
-      `SELECT client_message_id,projection_source
+      `SELECT client_message_id,projection_source,
+              COUNT(*) FILTER (WHERE projection_source='tape')
+                OVER ()::text AS tape_projection_version
          FROM client_session_live_streams
         WHERE session_id=$1 AND user_id=$2
         ORDER BY created_at,stream_key`,
@@ -239,12 +244,21 @@ export async function readClientSessionLiveFrames(
         payload: parsed,
       };
     });
+    const versionRaw = streams.rows[0]?.tape_projection_version;
+    const tapeProjectionVersion =
+      typeof versionRaw === "number" && Number.isSafeInteger(versionRaw) && versionRaw >= 0
+        ? versionRaw
+        : Number.parseInt(String(versionRaw ?? "0"), 10) || 0;
     return {
       frames,
       hasMore,
       nextCursor: frames.length > 0 ? frames[frames.length - 1]!.recordId : null,
       streamClientMessageIds,
       hasTapeProjection: streams.rows.some((row) => row.projection_source === "tape"),
+      // tape 投影版本水位 = 当前 tape 投影流计数,单调递增(完成只增不减)。
+      // 客户端据此识别"两次水合之间发生的 live→tape 切换"(含断连期间完成的
+      // turn),一次性布尔标记对那种场景是盲的(codex 审计 blocker)。
+      tapeProjectionVersion,
     };
   }, "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
 }

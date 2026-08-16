@@ -554,11 +554,13 @@ export class ChatSocket {
    * never destructively reset an already-visible process transcript. */
   private readonly durableLiveJournalCheckpoints = new Map<string, {
     cursor: string;
-    /** 本页生命周期内已确认服务端存在 tape 投影并补拉过全量叙事。
-     * 网关重启后 WS 重连时 checkpoint 已存在(initial=false),但页面可能在
-     * 断连期间丢失流式正文(增量同步只回存根);靠该标记让"新观察到 tape
-     * 投影但从未拉过叙事"的自愈触发恰好执行一次,不重复打全量。 */
+    /** 本页生命周期内已确认服务端存在 tape 投影并补拉过全量叙事(布尔回退
+     * 路径;服务端无版本水位时使用)。 */
     sawTapeProjection?: boolean;
+    /** 最近一次观察到的服务端 tape 投影版本水位(tape 投影流计数)。增长 =
+     * 有 turn 切到 tape,包括两次水合之间启动、断连期间完成、前后 live owner
+     * 集都不含它的场景(codex 审计 blocker:一次性布尔对此是盲的)。 */
+    tapeProjectionVersion?: number;
     liveClientMessageIds: Set<string>;
     /** Last journaled frameSeq for each raw wire sessionKey. Unlike the
      * reducer cursor, this follows record_id order across container
@@ -2914,11 +2916,18 @@ export class ChatSocket {
         checkpoint?.lastDurableFrameSeqBySessionKey ?? [],
       );
       let sawTapeProjection = false;
+      let maxTapeProjectionVersion: number | undefined;
 
       const readPages = async (stage: DurableLiveFrame[] | null): Promise<void> => {
         for (;;) {
           const page = await fetchPage(cursor);
           sawTapeProjection ||= page.hasTapeProjection === true;
+          if (typeof page.tapeProjectionVersion === "number") {
+            maxTapeProjectionVersion = Math.max(
+              maxTapeProjectionVersion ?? 0,
+              page.tapeProjectionVersion,
+            );
+          }
           currentLiveOwners = new Set(page.streamClientMessageIds);
           for (const clientMessageId of currentLiveOwners) observedLiveOwners.add(clientMessageId);
           if (stage) {
@@ -2957,19 +2966,33 @@ export class ChatSocket {
       const liveOwnerProjectedToTape = [...previousLiveOwners].some(
         (clientMessageId) => !currentLiveOwners.has(clientMessageId),
       );
-      // 自愈:本页内首次观察到 tape 投影(含 initial,以及网关重启后带着旧
-      // checkpoint 重连的场景)就补拉一次全量叙事,不再要求 (initial && …)。
-      // 之后由 checkpoint.sawTapeProjection 去重;亲眼看 live→tape 切换的
-      // 既有触发保持不变。
+      // 自愈触发(三路,均幂等到 checkpoint):
+      // 1) 版本水位增长(权威):两次水合之间发生的 live→tape 切换,含断连期间
+      //    完成、前后 owner 集都不含它的 turn —— liveOwnerProjectedToTape 对此
+      //    是盲的(codex 审计 blocker);
+      // 2) 布尔回退:旧后端无水位字段,本页首次观察到 tape 投影(含 initial 与
+      //    网关重启后带旧 checkpoint 重连)补拉一次;
+      // 3) 亲眼看 live owner 切 tape 的既有触发。
+      const versionAdvanced =
+        typeof maxTapeProjectionVersion === "number" &&
+        (checkpoint?.tapeProjectionVersion === undefined
+          ? maxTapeProjectionVersion > 0
+          : maxTapeProjectionVersion > checkpoint.tapeProjectionVersion);
       const tapeProjectionAppeared =
+        typeof maxTapeProjectionVersion !== "number" &&
         sawTapeProjection && checkpoint?.sawTapeProjection !== true;
-      if (tapeProjectionAppeared || liveOwnerProjectedToTape) {
+      if (versionAdvanced || tapeProjectionAppeared || liveOwnerProjectedToTape) {
         await applyTapeProjection();
       }
 
       this.durableLiveJournalCheckpoints.set(sessId, {
         cursor,
         ...(sawTapeProjection || checkpoint?.sawTapeProjection ? { sawTapeProjection: true } : {}),
+        ...(typeof maxTapeProjectionVersion === "number"
+          ? { tapeProjectionVersion: maxTapeProjectionVersion }
+          : checkpoint?.tapeProjectionVersion !== undefined
+            ? { tapeProjectionVersion: checkpoint.tapeProjectionVersion }
+            : {}),
         liveClientMessageIds: currentLiveOwners,
         lastDurableFrameSeqBySessionKey,
       });

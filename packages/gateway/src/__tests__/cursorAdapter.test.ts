@@ -198,6 +198,70 @@ describe('CursorAdapter', () => {
     })
   })
 
+  test('python-repr loose parsing never rewrites True/False/None inside string content', () => {
+    // codex 审计 blocker:全局替换会把内容里的英文词改写并持久化。
+    // 字符串字面量内的词必须原样保留,裸字面量才转换。
+    const contentPreserved = {
+      type: 'tool_call',
+      tool_call: {
+        id: 't-repr-words',
+        updateTodosToolCall: {
+          args: {
+            todos: `[{'content': '核验 True / False / None 分支', 'status': 'TODO_STATUS_PENDING'}]`,
+          },
+        },
+      },
+    }
+    const input = _internals.toolInputOf(contentPreserved as never) as { todos: Array<{ content: string; status: string }> }
+    if (input.todos?.[0]?.content !== '核验 True / False / None 分支') {
+      throw new Error(`string content rewritten: ${JSON.stringify(input)}`)
+    }
+    if (input.todos[0]!.status !== 'pending') throw new Error('bare literal not converted')
+
+    // 内容里嵌双引号的 repr 无法无损转换 → 必须整体原样回退(raw args 包装),
+    // 绝不产出被改写的"成功解析"。审计 blocker 的契约:宁可不归一化,不可篡改。
+    const ambiguous = {
+      type: 'tool_call',
+      tool_call: {
+        id: 't-repr-ambiguous',
+        updateTodosToolCall: {
+          args: {
+            todos: `[{'content': '带 "双引号" 的 True 文案', 'status': 'TODO_STATUS_PENDING'}]`,
+          },
+        },
+      },
+    }
+    const rawInput = _internals.toolInputOf(ambiguous as never) as Record<string, unknown> & {
+      args?: { todos?: string }
+    }
+    if (rawInput.todos !== undefined) throw new Error('ambiguous repr must not parse into todos')
+    if (rawInput.args?.todos !== `[{'content': '带 "双引号" 的 True 文案', 'status': 'TODO_STATUS_PENDING'}]`) {
+      throw new Error('raw fallback must preserve the original value verbatim')
+    }
+
+    // 裸 True/False/None + 嵌套引号内容混合:allowMultiple 是裸 False → false;
+    // 选项文案里的词保留;反斜杠转义不吞字符。
+    const ask = {
+      type: 'tool_call',
+      tool_call: {
+        id: 't-repr-ask',
+        askQuestionToolCall: {
+          args: {
+            title: '确认',
+            questions: `[{'allowMultiple': False, 'prompt': '保留 True 与 None 文案', 'options': [{'id': 'a', 'label': 'None'}, {'id': 'b', 'label': 'keep True'}]}]`,
+          },
+        },
+      },
+    }
+    const askInput = _internals.toolInputOf(ask as never) as {
+      questions: Array<{ question: string; multiSelect?: boolean; options: Array<{ label: string }> }>
+    }
+    if (askInput.questions[0]!.question !== '保留 True 与 None 文案') throw new Error('question content rewritten')
+    if (askInput.questions[0]!.multiSelect !== undefined) throw new Error('bare False not converted to false')
+    if (askInput.questions[0]!.options[0]!.label !== 'None') throw new Error('option label rewritten')
+    if (askInput.questions[0]!.options[1]!.label !== 'keep True') throw new Error('option label rewritten 2')
+  })
+
   test('keeps raw cursor args when stringified todos cannot be parsed', () => {
     const broken = {
       type: 'tool_call',

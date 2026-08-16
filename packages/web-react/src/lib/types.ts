@@ -343,6 +343,9 @@ export type DurableLiveFramePage = {
   hasMore: boolean;
   streamClientMessageIds: string[];
   hasTapeProjection: boolean;
+  /** 服务端 tape 投影版本水位(tape 投影流计数,单调递增)。旧后端不带该字段
+   * (undefined)时,客户端回退到 hasTapeProjection 一次性布尔自愈。 */
+  tapeProjectionVersion?: number;
 };
 
 /** GET /api/sessions/:id/timeline — one exact chronological page containing

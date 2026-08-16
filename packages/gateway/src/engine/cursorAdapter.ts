@@ -279,15 +279,40 @@ function looseValue<T>(value: unknown): T | null {
   try {
     // split/join 而非 regex:占位符含控制字符,biome 禁止在正则里写控制字符。
     const placeholder = '\u0000'
-    const jsonish = s
+    const quoted = s
       .split("\\'").join(placeholder)
       .split("'").join('"')
       .split(placeholder).join("\\'")
-      .replace(/\bTrue\b/g, 'true')
-      .replace(/\bFalse\b/g, 'false')
-      .replace(/\bNone\b/g, 'null')
-    return JSON.parse(jsonish) as T
+    return JSON.parse(replacePythonLiteralsOutsideStrings(quoted)) as T
   } catch { return null }
+}
+
+/** Python repr 的裸 True/False/None → JSON 字面量,只替换**字符串字面量之外**的
+ * 词位。全局正则会把内容里的英文词一并改写({'content':'True'} → "true"),静默
+ * 篡改持久化工具记录;这里用双引号字符串状态机(反斜杠转义感知)逐词判断。 */
+function replacePythonLiteralsOutsideStrings(input: string): string {
+  let out = ''
+  let inString = false
+  for (let i = 0; i < input.length; i += 1) {
+    const ch = input[i]!
+    if (inString) {
+      out += ch
+      if (ch === '\\') {
+        if (i + 1 < input.length) { out += input[i + 1]!; i += 1 }
+      } else if (ch === '"') inString = false
+      continue
+    }
+    if (ch === '"') { inString = true; out += ch; continue }
+    const match = /^(?:True|False|None)\b/.exec(input.slice(i))
+    if (match) {
+      const word = match[0]
+      out += word === 'True' ? 'true' : word === 'False' ? 'false' : 'null'
+      i += word.length - 1
+      continue
+    }
+    out += ch
+  }
+  return out
 }
 
 /** Cursor 的 TODO_STATUS_* 枚举 → 产品 TodoWrite 的 pending/in_progress/completed。 */

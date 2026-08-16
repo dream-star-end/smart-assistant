@@ -3727,6 +3727,7 @@ describe("durable live turn frame journal", () => {
     assert.equal(first.frames.length, 1);
     assert.equal(first.hasMore, true);
     assert.equal(first.hasTapeProjection, false);
+    assert.equal(first.tapeProjectionVersion, 0);
     assert.deepEqual(first.streamClientMessageIds, ["cm-live"]);
     assert.deepEqual(first.frames[0]!.payload, JSON.parse(payload1));
     const second = await readClientSessionLiveFrames(
@@ -3759,6 +3760,7 @@ describe("durable live turn frame journal", () => {
     assert.deepEqual(projected.frames, []);
     assert.deepEqual(projected.streamClientMessageIds, []);
     assert.equal(projected.hasTapeProjection, true);
+    assert.equal(projected.tapeProjectionVersion, 1);
   });
 
   maybe("keeps later dispatches and server-authored frames durable after a frame sequence restart", async () => {

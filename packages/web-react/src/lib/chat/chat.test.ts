@@ -4148,6 +4148,34 @@ describe("ChatSocket interrupted continuation", () => {
     sock.stop();
   });
 
+  test("tape projection version watermark heals cutovers that happen between hydrations", async () => {
+    // codex 审计 blocker 场景:turn 在两次水合之间启动、断连期间完成 —— 前后
+    // live owner 集都不含它,liveOwnerProjectedToTape 不触发;一次性布尔标记
+    // 也已置位。版本水位(tape 投影流计数)增长 1→2 必须再次触发自愈。
+    const sock = makeSocket();
+    const sessId = "s-tape-version-heal";
+    sock.ensureSession(sessId, "main");
+    const applyTapeProjection = vi.fn(async () => {});
+    const page = (version: number) => async () => ({
+      frames: [], nextCursor: null, hasMore: false,
+      streamClientMessageIds: [], hasTapeProjection: true,
+      tapeProjectionVersion: version,
+    });
+
+    await sock.hydrateDurableLiveFrameJournal(sessId, page(1), applyTapeProjection);
+    expect(applyTapeProjection).toHaveBeenCalledTimes(1);
+    // 水位不变:常规对账不重复打全量。
+    await sock.hydrateDurableLiveFrameJournal(sessId, page(1), applyTapeProjection);
+    expect(applyTapeProjection).toHaveBeenCalledTimes(1);
+    // 断连期间又有 turn 切到 tape:水位 1→2,即使从未观察到它的 live owner
+    // 也要自愈补拉。
+    await sock.hydrateDurableLiveFrameJournal(sessId, page(2), applyTapeProjection);
+    expect(applyTapeProjection).toHaveBeenCalledTimes(2);
+    await sock.hydrateDurableLiveFrameJournal(sessId, page(2), applyTapeProjection);
+    expect(applyTapeProjection).toHaveBeenCalledTimes(2);
+    sock.stop();
+  });
+
   test("tape projection observed only after reconnect (stale checkpoint, no live cutover) still triggers one narrative read", async () => {
     // boss 2026-08-16 现场:页面在网关重启前打开(当时没有任何 tape 投影),重启
     // 断连期间 turn 完成并切到 tape 投影;重连水合带着旧 checkpoint(initial=false)
