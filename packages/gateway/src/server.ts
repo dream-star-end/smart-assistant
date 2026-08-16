@@ -55,6 +55,7 @@ import {
   GROK_ENGINE_MODEL_IDS,
   CURSOR_ENGINE_MODEL_IDS,
   PLATFORM_REASONING_EFFORTS,
+  AGENT_MODEL_AUTO,
   MAX_ATTACHMENTS_PER_MESSAGE,
   AUTOMATIC_TURN_RETRY_MAX,
   isCodexEngineModel,
@@ -14383,7 +14384,11 @@ export class Gateway {
         members.length > 0
           ? members
               .map((a) => {
-                const model = a.model ? `${a.model}` : '默认模型'
+                const model = a.model
+                  ? a.model === AGENT_MODEL_AUTO
+                    ? '任意模型'
+                    : `${a.model}`
+                  : '默认模型'
                 const provider = a.provider || '继承全局'
                 return `- \`${a.id}\`${a.displayName ? `（${a.displayName}）` : ''} [${model}, ${provider}]${teamMemberCapabilityHint(a)}`
               })

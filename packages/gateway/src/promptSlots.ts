@@ -35,6 +35,7 @@ import {
   readUserProfile,
   scanMemoryContent,
 } from '@openclaude/storage'
+import { AGENT_MODEL_AUTO } from '@openclaude/protocol'
 import { request as undiciRequest } from 'undici'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 import { listCollaboratorAgents } from './collaboratorAgents.js'
@@ -328,7 +329,11 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
       lines.push('')
       for (const a of otherAgents) {
         const name = a.displayName || a.id
-        const model = a.model ? `${a.model}` : '默认模型'
+        const model = a.model
+          ? a.model === AGENT_MODEL_AUTO
+            ? '任意模型'
+            : `${a.model}`
+          : '默认模型'
         const provider = a.provider || '继承全局'
         let capability = ''
         try {

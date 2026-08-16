@@ -104,6 +104,11 @@ import {
   readTeamModeForSession,
   writeTeamMode,
 } from "./lib/teamMode";
+import {
+  clearSessionEffort,
+  readSessionEffort,
+  writeSessionEffort,
+} from "./lib/sessionEffort";
 import { DEFAULT_AGENT, agentFromApiRow, type Agent } from "./lib/agents";
 import {
   PRODUCT_CAPABILITIES,
@@ -495,6 +500,7 @@ export function App() {
     onDeleteSession: (id) => {
       localStore.current.delete(id);
       clearTeamModeForSession(id); // 顺手清该会话的团队模式 per-session 键(不留孤儿键)
+      clearSessionEffort(id); // 同上:思考档位 per-session 键
     },
     onActiveSessionDeleted: () => {
       setMessages([]);
@@ -570,6 +576,23 @@ export function App() {
     setTeamModeState(readTeamModeForSession(activeId));
   }, [activeId]);
 
+  // 思考档位的会话级记忆(语义见 lib/sessionEffort):undefined = 未选择(继承
+  // preferences.default_effort);null = 显式跟随模型默认;档位 = 显式选择。
+  // 与 teamMode 同款 per-session 键;首条消息创建会话后同样落地当前 intent。
+  const [sessionEffort, setSessionEffortState] = useState<PreferenceEffort | null | undefined>(() =>
+    readSessionEffort(activeId),
+  );
+  const setSessionEffort = useCallback(
+    (value: PreferenceEffort | null) => {
+      setSessionEffortState(value);
+      writeSessionEffort(activeId, value);
+    },
+    [activeId],
+  );
+  useEffect(() => {
+    setSessionEffortState(readSessionEffort(activeId));
+  }, [activeId]);
+
   const send = useCallback(
     async (
       text: string,
@@ -640,6 +663,8 @@ export function App() {
         // 空会话态用户可能已在全能助手卡上开/关了团队模式;把当前 intent 落地为新会话的
         // per-session 键 —— 否则该会话只靠全局默认,会被其它会话的开关翻动(切走再回来变样)。
         writeTeamMode(sessionId, teamMode);
+        // 显式档位选择存在才落地(未选择 = 继续继承全局偏好,不写键)。
+        if (sessionEffort !== undefined) writeSessionEffort(sessionId, sessionEffort);
       }
       const materializedDraft =
         !createdSession && sessions.some((session) => session.id === sessionId && session.messageCount === 0);
@@ -653,7 +678,10 @@ export function App() {
         });
       }
       // model / effortLevel 都是 inbound.message 顶层路由字段。用户未设置 effort 或
-      // 当前模型不支持时省略,让模型沿用自身默认。
+      // 当前模型不支持时省略(null=显式清除回模型默认),让模型沿用自身默认。
+      // effort 来源:本会话显式选择(sessionEffort,聊天头档位选择器)优先,缺省回落
+      // 用户全局偏好(preferences.default_effort);effortForModel 负责按当前执行模型
+      // 的支持集过滤(不支持 → null 发送,不硬塞)。
       // media：已上传附件（图片/文件等），随 inbound.message.content.media 发送。
       // teamMode 只对 main 队长生效(其它 agent 无委派语义),故非 main 恒 false。
       const teamLeaderTurn = agent.id === "main" && teamMode;
@@ -666,7 +694,7 @@ export function App() {
         effortLevel: effortForModel(
           models,
           effectiveEffortModelId(modelId, teamLeaderTurn),
-          preferenceEffort,
+          sessionEffort !== undefined ? sessionEffort : preferenceEffort,
         ),
         media,
         imageEdit,
@@ -700,6 +728,7 @@ export function App() {
       modelId,
       models,
       preferenceEffort,
+      sessionEffort,
       teamMode,
       sessions,
       setSessions,
@@ -1384,6 +1413,18 @@ export function App() {
   // 本轮活动快照（喂给 MessageList → TurnActivity）：模型慢时把阶段反馈显性化，取代裸三个点。
   // 团队模式额外带队长当前 plan step（消息区常长时间纯空白时用它填充等待文案）。
   const teamLeaderActive = !demo && teamMode && agent.id === "main";
+  // 思考档位选择器数据:按当前**执行**模型(团队模式下 = 队长引擎,与 send 同口径)
+  // 的支持集渲染选项;生效档 = 会话显式选择 ?? 全局偏好,不被当前模型支持时如实
+  // 显示「跟随」(发送层 effortForModel 同样过滤,所见 = 所发)。
+  const effortModel = models.find(
+    (m) => m.id === effectiveEffortModelId(modelId, teamLeaderActive),
+  );
+  const effortSupported = effortModel?.supported_efforts ?? [];
+  const effortCandidate = sessionEffort !== undefined ? sessionEffort : preferenceEffort;
+  const effortActive =
+    effortCandidate != null && effortSupported.includes(effortCandidate)
+      ? effortCandidate
+      : null;
   const turnActivity = useMemo<TurnActivityInfo | null>(() => {
     if (demo || !activeSess || !activeSess._sendingInFlight) return null;
     return {
@@ -2283,6 +2324,9 @@ export function App() {
           selectedModelId={modelId}
           onSelectModel={selectModel}
           modelsLoading={modelsLoading}
+          effortSupported={effortSupported}
+          effortActive={effortActive}
+          onSelectEffort={demo ? undefined : setSessionEffort}
           // 团队模式知情指示:与 send 的生效条件同构(teamMode 只对 main 生效,
           // 见上方 send 的 agent.id === "main" 判定)——顶栏所见 = 实际所发。
           teamModeActive={!demo && teamMode && agent.id === "main"}

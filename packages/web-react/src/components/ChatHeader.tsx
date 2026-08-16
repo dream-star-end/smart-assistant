@@ -2,11 +2,12 @@ import { Bell, BookOpen, ChevronDown, Film, Menu, PanelLeft, PenSquare, Users, W
 import { useState } from "react";
 import type { Theme } from "../hooks/useTheme";
 import type { Agent } from "../lib/agents";
+import type { PreferenceEffort } from "../lib/modelPreferences";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import { AgentAvatar } from "./AgentAvatar";
 import type { PublicModel } from "../lib/types";
 import { formatCredits } from "../lib/utils";
-import { ModelSelector, teamEngineLabel } from "./ModelSelector";
+import { EffortSelector, ModelSelector, teamEngineLabel } from "./ModelSelector";
 import { ThemeToggle } from "./ThemeToggle";
 import { Button, IconButton, Popover, PopoverContent, PopoverTrigger } from "./ui";
 
@@ -17,6 +18,9 @@ export function ChatHeader({
   selectedModelId,
   onSelectModel,
   modelsLoading,
+  effortSupported,
+  effortActive,
+  onSelectEffort,
   teamModeActive,
   onDisableTeamMode,
   credits,
@@ -39,6 +43,12 @@ export function ChatHeader({
   selectedModelId?: string;
   onSelectModel?: (id: string) => void;
   modelsLoading?: boolean;
+  /** 当前执行模型支持的思考档位（空/省略 = 模型不暴露档位,不渲染选择器）。 */
+  effortSupported?: readonly string[];
+  /** 当前生效思考档（null/undefined = 跟随模型默认）。 */
+  effortActive?: PreferenceEffort | null;
+  /** 选择思考档；null = 跟随模型默认。 */
+  onSelectEffort?: (value: PreferenceEffort | null) => void;
   /**
    * 团队模式已开启且当前会话是 main（队长引擎覆盖生效）。true 时 agent 名旁显示
    * 「团队模式」chip（点击弹说明 + 关闭入口），并让 ModelSelector 切换到如实的
@@ -150,6 +160,13 @@ export function ChatHeader({
           onSelect={onSelectModel}
           loading={modelsLoading}
           teamEngineActive={teamModeActive}
+        />
+      )}
+      {effortSupported && effortSupported.length > 0 && onSelectEffort && (
+        <EffortSelector
+          supportedEfforts={effortSupported}
+          activeEffort={effortActive}
+          onSelect={onSelectEffort}
         />
       )}
       <div className="ml-auto flex shrink-0 items-center gap-1.5">

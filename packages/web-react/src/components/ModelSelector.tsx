@@ -2,7 +2,7 @@ import {
   DEFAULT_CODEX_ENGINE_MODEL,
   DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME,
 } from "@openclaude/protocol";
-import { AlertTriangle, Check, ChevronDown, Cpu, Users } from "lucide-react";
+import { AlertTriangle, Check, ChevronDown, Cpu, Users, Zap } from "lucide-react";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import type { PublicModel } from "../lib/types";
 import { cn } from "../lib/utils";
@@ -14,6 +14,8 @@ import {
   DropdownMenuLabel,
   DropdownMenuTrigger,
 } from "./ui";
+import type { PreferenceEffort } from "../lib/modelPreferences";
+import { EFFORT_OPTIONS } from "./settings/labels";
 
 /**
  * 模型是否被后端标注为降级(0108 provider 健康度)。前端类型宽松透传,运行时 narrowing。
@@ -180,6 +182,77 @@ export function ModelSelector({
             </DropdownMenuItem>
           );
         })}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
+/**
+ * 思考档位选择器(聊天头,与 ModelSelector 并排)。
+ *
+ * - 数据驱动:选项 = 当前执行模型的 supported_efforts ∩ EFFORT_OPTIONS(平台 5 档
+ *   全集);空集(该模型不暴露任何档)→ 调用方不渲染本组件。
+ * - 选择状态由 App 顶层持有(per-session 显式选择,null = 跟随模型默认);「当前生效
+ *   档」的解析(显式选择 ?? 全局偏好,并按模型支持集过滤)也在 App 侧完成,本组件
+ *   只展示 + 上抛,不持第二份状态。
+ * - effortLevel 是 inbound.message 顶层路由字段:每条消息携带,档位变化在下一条
+ *   消息生效(引擎侧切换 = 重建 runner env,由后端处理)。
+ */
+export function EffortSelector({
+  supportedEfforts,
+  activeEffort,
+  onSelect,
+  disabled,
+}: {
+  /** 当前执行模型 API 投影的 supported_efforts(空数组由调用方过滤,不渲染本组件)。 */
+  supportedEfforts: readonly string[];
+  /** 当前生效档:null/undefined = 跟随模型默认(该项打勾);否则对应档位打勾。 */
+  activeEffort?: PreferenceEffort | null;
+  onSelect: (value: PreferenceEffort | null) => void;
+  disabled?: boolean;
+}) {
+  const options = EFFORT_OPTIONS.filter((o) => supportedEfforts.includes(o.value));
+  const followActive = activeEffort == null;
+  const label = followActive
+    ? "思考 · 跟随"
+    : `思考 · ${EFFORT_OPTIONS.find((o) => o.value === activeEffort)?.label ?? activeEffort}`;
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <button
+          type="button"
+          data-product-control
+          disabled={disabled}
+          aria-label="选择思考档位"
+          title="思考档位:控制模型回答前的思考深度"
+          className={cn(
+            "flex items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-[13.5px] font-medium text-muted outline-none transition-colors",
+            "hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98]",
+            "disabled:pointer-events-none disabled:opacity-50",
+          )}
+        >
+          <Zap size={14} className="text-faint" />
+          <span className="max-w-[6rem] truncate sm:max-w-none">{label}</span>
+          <ChevronDown size={14} className="text-faint" />
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="start" className="min-w-[12rem]">
+        <DropdownMenuLabel>思考档位</DropdownMenuLabel>
+        <DropdownMenuItem onSelect={() => onSelect(null)} className="justify-between">
+          <span>跟随模型默认</span>
+          {followActive && <Check size={14} className="shrink-0 text-accent" />}
+        </DropdownMenuItem>
+        {options.map((o) => (
+          <DropdownMenuItem
+            key={o.value}
+            data-effort={o.value}
+            onSelect={() => onSelect(o.value)}
+            className="justify-between"
+          >
+            <span>{o.label}</span>
+            {activeEffort === o.value && <Check size={14} className="shrink-0 text-accent" />}
+          </DropdownMenuItem>
+        ))}
       </DropdownMenuContent>
     </DropdownMenu>
   );

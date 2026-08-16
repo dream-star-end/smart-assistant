@@ -17,7 +17,7 @@
  * marketplace agent can never request bypassPermissions.
  */
 
-import type { MarketplaceCapabilityRef } from '@openclaude/protocol'
+import { AGENT_MODEL_AUTO, type MarketplaceCapabilityRef } from '@openclaude/protocol'
 
 export type { MarketplaceCapabilityKind, MarketplaceCapabilityRef } from '@openclaude/protocol'
 
@@ -196,7 +196,10 @@ export function validateAgentManifest(raw: unknown, opts: ValidateOpts): Validat
   if (version && !/^\d+\.\d+\.\d+$/.test(version)) errors.push('version 须为 N.N.N')
   const persona = asString(o.persona, 'persona', MAX.persona, errors)
   const model = asString(o.model, 'model', MAX.model, errors)
-  if (model && !opts.allowedModels.has(model)) errors.push(`model "${model}" 不在可用模型列表中`)
+  // AGENT_MODEL_AUTO = 「不锁模型」:帧模型优先、缺省落平台默认链(语义见 protocol/engineModels)。
+  // 计费权威侧(agentModelAuthority)会把 auto 归一为平台默认模型,不产生旁路面。
+  if (model && model !== AGENT_MODEL_AUTO && !opts.allowedModels.has(model))
+    errors.push(`model "${model}" 不在可用模型列表中`)
 
   // toolsets: required, non-empty, all vetted; NEVER default-to-all
   const vetted = new Set(opts.vettedToolsets ?? VETTED_AGENT_TOOLSETS)

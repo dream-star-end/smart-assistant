@@ -31,6 +31,21 @@ export const PLATFORM_REASONING_EFFORTS = [
 export type PlatformReasoningEffort = (typeof PLATFORM_REASONING_EFFORTS)[number]
 
 /**
+ * agent manifest `model` 字段的特殊值:「不锁模型」。
+ *
+ * 语义(全链路投影,各消费方见下):
+ *   - 会话帧带 model(用户在模型选择器任选)→ 用帧的,与其它 agent 无差别;
+ *   - 帧不带 model → 跳过该档,落平台默认链(config 默认 → 平台兜底),与 main 同形。
+ * 消费方:
+ *   - commercial `marketplace/agentManifest.ts`:validator 放行该字面量(不要求 ∈ 公开模型集);
+ *   - commercial `ws/agentModelAuthority.ts`:master 计费权威把 auto 归一为平台默认模型
+ *     (与容器侧兜底同构,不产生计费旁路面);
+ *   - gateway `resolveExecutionModel` / `decideLocalExecution`:候选阶梯跳过 auto;
+ *   - 前端/队长展示:auto → 「任意模型(跟随会话)」。
+ */
+export const AGENT_MODEL_AUTO = 'auto'
+
+/**
  * Codex engine 模型号 + 模型自身默认思考深度的单一权威。
  * 顺序有产品语义:第一项同时是 codex seed / 团队模式队长默认型号。
  */

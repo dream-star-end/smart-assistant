@@ -35,7 +35,7 @@
  * 阶段 A 已保证「bundle 声明值 == master 常量」(runtimeEntrypointPolicy 一致性锚测试),
  * 故开 flag 前后判定集合等值 → 切换零行为变化;flag 关掉即回旧路径(可回滚)。
  */
-import { DEFAULT_CODEX_ENGINE_MODEL } from "@openclaude/protocol";
+import { AGENT_MODEL_AUTO, DEFAULT_CODEX_ENGINE_MODEL } from "@openclaude/protocol";
 
 import {
   listRuntimeReadyAgentSets,
@@ -58,13 +58,22 @@ export function seedAuthorityByRevEnabled(env: NodeJS.ProcessEnv = process.env):
   return env[SEED_AUTHORITY_BY_REV_ENV] === "1";
 }
 
-/** manifest JSON → model 字段(形状防御:非法 JSON / 非 string model → null)。 */
+/**
+ * manifest JSON → model 字段(形状防御:非法 JSON / 非 string model → null)。
+ *
+ * `AGENT_MODEL_AUTO`(「不锁模型」声明)归一为 PLATFORM_DEFAULT_MODEL:容器侧
+ * resolveExecutionModel 对 auto 跳过该档 → 落 config.defaults.model,而 defaults.model
+ * 的权威 = platform-seed.yaml 的 main 声明,阶段 A 与本常量字面相等
+ * (runtimeEntrypointPolicy 一致性锚锁死)→ master 归一值与容器执行同构,codex 分类 /
+ * 计费不漂移;auto 也不会成为"推导不出的 null"而触发帧无 model 时 fail-closed 拒。
+ */
 function manifestModel(rawManifest: string): string | null {
   try {
     const parsed: unknown = JSON.parse(rawManifest);
     if (parsed === null || typeof parsed !== "object") return null;
     const model = (parsed as { model?: unknown }).model;
-    return typeof model === "string" && model.trim() !== "" ? model : null;
+    if (typeof model !== "string" || model.trim() === "") return null;
+    return model === AGENT_MODEL_AUTO ? PLATFORM_DEFAULT_MODEL : model;
   } catch {
     return null;
   }

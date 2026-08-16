@@ -214,7 +214,9 @@ function AgentManifestView({
       <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
         <div>
           <FieldLabel className="mb-1">模型</FieldLabel>
-          <Badge tone="neutral">{m.model || '平台默认'}</Badge>
+          <Badge tone="neutral">
+            {m.model === 'auto' ? '任意模型 · 跟随会话选择' : m.model || '平台默认'}
+          </Badge>
         </div>
         {/* 无数据不占位不噪音:空工具集此前渲染一个孤零零的「—」,像加载失败。 */}
         {toolsets.length > 0 && (
