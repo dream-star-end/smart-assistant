@@ -64,6 +64,7 @@ if [ -f "$HOME/.cursor/mcp.json" ]; then
 fi
 /bin/mkdir -p "$HOME/.config/cursor"
 printf '%s\\n' "\${CURSOR_API_KEY}" > "$HOME/.config/cursor/auth.json"
+printf '%s\\n' "\${CURSOR_API_KEY}" > "$OC_CURSOR_TEST_CAPTURE/key"
 if [ "\${OC_CURSOR_TEST_SLEEP:-0}" = 1 ]; then
   trap 'printf term > "$OC_CURSOR_TEST_CAPTURE/term"; exit 143' TERM
   while :; do sleep 1; done
@@ -93,6 +94,7 @@ printf '%s\\n' '{"type":"result","subtype":"success","usage":{"inputTokens":1,"o
     )
     .replace('auth_file=/run/oc/cursor-auth/api-key', `auth_file=${auth}`)
     .replace('/usr/bin/sudo -n /usr/bin/test -f', '/usr/bin/test -f')
+    .replace('/usr/bin/sudo -n /bin/ls', '/bin/ls')
     .replace('/usr/bin/sudo -n /bin/cat', '/bin/cat')
   writeFileSync(wrapper, rewritten, { mode: 0o755 })
   chmodSync(wrapper, 0o755)
@@ -357,6 +359,7 @@ describe('oc-cursor wrapper', () => {
       'dirname',
       'sudo',
       'cat',
+      'ls',
       'mktemp',
       'rm',
       'setsid',
@@ -383,6 +386,7 @@ describe('oc-cursor wrapper', () => {
       'dirname',
       'sudo',
       'cat',
+      'ls',
       'mktemp',
       'rm',
       'setsid',
@@ -439,5 +443,104 @@ describe('oc-cursor wrapper', () => {
     assert.equal(readFileSync(join(f.capture, 'orphan-term'), 'utf8'), 'term')
     const ephemeralHome = readFileSync(join(f.capture, 'home'), 'utf8').trim()
     assert.equal(spawnSync('test', ['!', '-e', ephemeralHome]).status, 0)
+  })
+
+  test('single-key accounts keep the legacy path with no rotation stderr', () => {
+    const f = fixture()
+    const result = spawnSync(f.wrapper, ['--', 'hello'], {
+      cwd: f.dir,
+      env: f.env,
+      encoding: 'utf8',
+    })
+    assert.equal(result.status, 0, result.stderr)
+    assert.doesNotMatch(result.stderr, /credential slot/)
+    assert.equal(readFileSync(join(f.capture, 'key'), 'utf8'), 'crsr_dummy\n')
+  })
+
+  test('round-robins across api-key.N slots and never prints either value', () => {
+    const f = fixture()
+    const authDir = dirname(f.auth)
+    writeFileSync(join(authDir, 'api-key.2'), 'crsr_second\n', { mode: 0o600 })
+    const rotation = join(f.dir, 'rotation')
+    const env = { ...f.env, OC_CURSOR_KEY_ROTATION_FILE: rotation }
+    const keys: string[] = []
+    const slots: string[] = []
+    for (let turn = 0; turn < 3; turn += 1) {
+      const result = spawnSync(f.wrapper, ['--', 'hello'], {
+        cwd: f.dir,
+        env,
+        encoding: 'utf8',
+      })
+      assert.equal(result.status, 0, result.stderr)
+      keys.push(readFileSync(join(f.capture, 'key'), 'utf8'))
+      slots.push(result.stderr)
+      assert.doesNotMatch(`${result.stdout}${result.stderr}`, /crsr_dummy|crsr_second/)
+    }
+    assert.deepEqual(keys, ['crsr_dummy\n', 'crsr_second\n', 'crsr_dummy\n'])
+    assert.match(slots[0]!, /credential slot 1\/2/)
+    assert.match(slots[1]!, /credential slot 2\/2/)
+    assert.match(slots[2]!, /credential slot 1\/2/)
+    assert.equal(readFileSync(rotation, 'utf8'), '1\n')
+  })
+
+  test('ignores non-canonical extra names and keeps one effective slot', () => {
+    const f = fixture()
+    const authDir = dirname(f.auth)
+    for (const name of [
+      'api-key.1',
+      'api-key.02',
+      'api-key.0',
+      'api-key.foo',
+      'api-key.txt',
+      'api-key.3.bak',
+      'staging.tmp',
+    ]) {
+      writeFileSync(join(authDir, name), 'crsr_junk\n', { mode: 0o600 })
+    }
+    const rotation = join(f.dir, 'rotation')
+    for (let turn = 0; turn < 2; turn += 1) {
+      const result = spawnSync(f.wrapper, ['--', 'hello'], {
+        cwd: f.dir,
+        env: { ...f.env, OC_CURSOR_KEY_ROTATION_FILE: rotation },
+        encoding: 'utf8',
+      })
+      assert.equal(result.status, 0, result.stderr)
+      assert.doesNotMatch(result.stderr, /credential slot/)
+      assert.equal(readFileSync(join(f.capture, 'key'), 'utf8'), 'crsr_dummy\n')
+    }
+    assert.equal(existsSync(rotation), false)
+  })
+
+  test('a malformed extra slot fails its own turn and rotation self-heals', () => {
+    const f = fixture()
+    const authDir = dirname(f.auth)
+    writeFileSync(join(authDir, 'api-key.2'), 'crsr_bad\ncrsr_second\n', { mode: 0o600 })
+    const rotation = join(f.dir, 'rotation')
+    const env = { ...f.env, OC_CURSOR_KEY_ROTATION_FILE: rotation }
+
+    const first = spawnSync(f.wrapper, ['--', 'hello'], {
+      cwd: f.dir,
+      env,
+      encoding: 'utf8',
+    })
+    assert.equal(first.status, 0, first.stderr)
+    assert.equal(readFileSync(join(f.capture, 'key'), 'utf8'), 'crsr_dummy\n')
+
+    const second = spawnSync(f.wrapper, ['--', 'hello'], {
+      cwd: f.dir,
+      env,
+      encoding: 'utf8',
+    })
+    assert.equal(second.status, 2)
+    assert.match(second.stderr, /Cursor credential is malformed/)
+    assert.doesNotMatch(second.stderr, /crsr_bad|crsr_second/)
+
+    const third = spawnSync(f.wrapper, ['--', 'hello'], {
+      cwd: f.dir,
+      env,
+      encoding: 'utf8',
+    })
+    assert.equal(third.status, 0, third.stderr)
+    assert.equal(readFileSync(join(f.capture, 'key'), 'utf8'), 'crsr_dummy\n')
   })
 })

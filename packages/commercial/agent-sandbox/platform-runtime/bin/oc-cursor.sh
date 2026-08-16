@@ -4,6 +4,14 @@
 # This is deliberately a one-shot print-mode tool rather than a V5 model
 # engine. The host credential is mounted only into the explicitly authorized
 # user's container and never enters Docker Env, the image, or the repository.
+#
+# Multi-key pool: the host may provision interchangeable Cursor API keys as
+# additional `api-key.<N>` files (N >= 2, canonical decimal, no leading zeros)
+# inside the same root-only auth directory. `api-key` stays mandatory — the
+# supervisor's mount validation gates on it, so an absent primary means the
+# credential mount itself never happened. Non-canonical extra names are
+# ignored. The slot used for a turn is announced on stderr as an index only;
+# key values are never printed.
 set -eu
 
 SELF_ROOT=$(/usr/bin/dirname "$(/usr/bin/readlink -f "$0")")
@@ -27,9 +35,9 @@ EOF
 # means a tool missing from the runtime image turns into a silent 127 instead
 # of a visible failure. Assert the whole set up front rather than discovering
 # it inside an `|| true` cleanup path.
-for required_tool in /usr/bin/sudo /usr/bin/test /bin/cat /usr/bin/mktemp \
-  /bin/rm /bin/sleep /usr/bin/setsid /usr/bin/stat /usr/bin/id /bin/mkdir \
-  /bin/cp /bin/chmod; do
+for required_tool in /usr/bin/sudo /usr/bin/test /bin/cat /bin/ls \
+  /usr/bin/mktemp /bin/rm /bin/sleep /usr/bin/setsid /usr/bin/stat \
+  /usr/bin/id /bin/mkdir /bin/cp /bin/chmod; do
   [ -x "$required_tool" ] || die "runtime image is missing $required_tool"
 done
 
@@ -38,6 +46,37 @@ auth_file=/run/oc/cursor-auth/api-key
 [ -x "$cursor_bin" ] || die "pinned Cursor Agent CLI is unavailable"
 /usr/bin/sudo -n /usr/bin/test -f "$auth_file" 2>/dev/null \
   || die "Cursor CLI is not enabled for this account"
+
+# Enumerate the credential pool. Only `api-key` and canonical `api-key.<N>`
+# (N >= 2) names are eligible; everything else in the root-only directory is
+# ignored. Slot 1 is always the primary file; extras follow `ls -1` order.
+# `set -f` keeps pathname expansion off the unquoted iteration below — the
+# auth directory is root-authored, but a stray glob-shaped entry must not
+# resolve against workspace filenames.
+auth_dir=${auth_file%/*}
+set -f
+key_names=""
+key_count=0
+auth_entries=$(/usr/bin/sudo -n /bin/ls -1 -- "$auth_dir" 2>/dev/null) \
+  || auth_entries=""
+for auth_entry in $auth_entries; do
+  case "$auth_entry" in
+    api-key)
+      key_names="$key_names $auth_entry"
+      key_count=$((key_count + 1))
+      ;;
+    api-key.*)
+      key_suffix=${auth_entry#api-key.}
+      case "$key_suffix" in
+        ''|*[!0-9]*|0*|1) continue ;;
+      esac
+      key_names="$key_names $auth_entry"
+      key_count=$((key_count + 1))
+      ;;
+  esac
+done
+set +f
+[ "$key_count" -gt 0 ] || die "Cursor CLI is not enabled for this account"
 
 model=""
 mode=""
@@ -106,7 +145,34 @@ workspace=$(pwd -P)
 # The host source is root:root 0400/0600. The container agent has sudo by
 # product design, but only the explicitly authorized user's container gets the
 # bind mount. Never print the value or put it in argv.
-api_key=$(/usr/bin/sudo -n /bin/cat -- "$auth_file" 2>/dev/null) \
+#
+# Slot selection: round-robin across the pool so per-account rate limits and
+# quotas spread over turns. The counter lives in the container (per-user,
+# per-container lifetime) and is advanced before the key is read, so a turn
+# that dies on a malformed slot rotates past it on the next turn. Concurrent
+# turns may occasionally collide on a slot — acceptable for load spreading.
+# A single-key account keeps the byte-identical legacy path.
+chosen_key_file=$auth_file
+if [ "$key_count" -gt 1 ]; then
+  rotation_file=${OC_CURSOR_KEY_ROTATION_FILE:-/tmp/openclaude-cursor-key-rotation}
+  rotation_idx=$(/bin/cat -- "$rotation_file" 2>/dev/null) || rotation_idx=0
+  case "$rotation_idx" in
+    ''|*[!0-9]*) rotation_idx=0 ;;
+  esac
+  if [ "$rotation_idx" -ge "$key_count" ]; then rotation_idx=0; fi
+  chosen_slot=$((rotation_idx + 1))
+  slot_position=0
+  for key_name in $key_names; do
+    slot_position=$((slot_position + 1))
+    if [ "$slot_position" -eq "$chosen_slot" ]; then
+      chosen_key_file=$auth_dir/$key_name
+      break
+    fi
+  done
+  printf '%s\n' "$chosen_slot" > "$rotation_file" 2>/dev/null || :
+  echo "oc-cursor: using Cursor credential slot $chosen_slot/$key_count" >&2
+fi
+api_key=$(/usr/bin/sudo -n /bin/cat -- "$chosen_key_file" 2>/dev/null) \
   || die "Cursor credential mount is unreadable"
 [ -n "$api_key" ] || die "Cursor credential is malformed"
 carriage_return=$(printf '\r')
