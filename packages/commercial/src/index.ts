@@ -163,6 +163,13 @@ import {
   type ReconcilerHandle as FinalizeJournalReconcilerHandle,
 } from "./billing/finalizeJournalReconciler.js";
 import {
+  startLiveFrameMaintenanceScheduler,
+  resolveLiveFrameMaintenanceDisabled,
+  resolveLiveFrameMaintenanceIntervalMs,
+  resolvePruneMaxBatches,
+  resolveRetireMinAgeMs,
+} from "./db/liveFrameMaintenanceScheduler.js";
+import {
   startOnboardingScheduler,
   type OnboardingSchedulerHandle,
 } from "./inbox/onboarding.js";
@@ -5340,6 +5347,39 @@ export async function registerCommercial(
           intervalMs,
           thresholdMs,
           durableWaiverAgeMs,
+        }));
+        return { stop: () => h.stop() };
+      },
+    });
+  }
+
+  // live journal 帧表维护:删已投影且确有 tape 记录的流的帧,并给不可能再产帧的
+  // live 流打 retired_at(帧仍可见,只从在飞 owner 集合剔除)。leaderBundle shared
+  // 单跑(双 master 只 leader)。仅 v5(client_session_live_frames 是 v5 表)。
+  // 失败只记日志,start() 同步返回,不挡 leadership / 监听端口。
+  if (runtimeChannel === "v5" && !resolveLiveFrameMaintenanceDisabled()) {
+    leaderBundle.add({
+      name: "liveFrameMaintenance",
+      domain: "shared",
+      start: () => {
+        const intervalMs = resolveLiveFrameMaintenanceIntervalMs(
+          process.env.COMMERCIAL_LIVE_FRAME_MAINTENANCE_INTERVAL_MS,
+        );
+        const pruneMaxBatches = resolvePruneMaxBatches(
+          process.env.COMMERCIAL_LIVE_FRAME_PRUNE_MAX_BATCHES,
+        );
+        const retireMinAgeMs = resolveRetireMinAgeMs(
+          process.env.COMMERCIAL_LIVE_FRAME_RETIRE_MIN_AGE_MS,
+        );
+        const h = trackScheduler("liveFrameMaintenance", "shared", startLiveFrameMaintenanceScheduler({
+          pool: getPool(),
+          intervalMs,
+          pruneMaxBatches,
+          retireMinAgeMs,
+          runOnStart: true,
+          onError: (err) => rootLogger.warn("[liveFrameMaintenance] tick failed", {
+            err: (err as Error)?.message ?? String(err),
+          }),
         }));
         return { stop: () => h.stop() };
       },
