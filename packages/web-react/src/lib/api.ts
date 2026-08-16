@@ -999,6 +999,9 @@ export async function getExactDeferredPayload(
   return { bytes: target.buffer, contentSha256, recordId, role };
 }
 
+/** Per live-frames HTTP request. Journal hydrate adds its own page/time cap. */
+export const LIVE_FRAMES_REQUEST_TIMEOUT_MS = 12_000;
+
 export const api = {
   // ── 鉴权 ───────────────────────────────────────────────────────────
 
@@ -1678,22 +1681,38 @@ export const api = {
   },
 
   /** Cursor-paged exact runtime frames persisted before their original WS
-   * delivery.  Callers keep paging until hasMore=false; there is no total cap. */
+   * delivery. Callers page until hasMore=false; hydrateDurableLiveFrameJournal
+   * owns the total page/time cap. Each request has a timeout so a stuck SQL
+   * plan cannot pin the restore loop forever. */
   getSessionLiveFrames: (
     a: AuthSession,
     id: string,
     after = "0",
     limit = 200,
+    opts?: { signal?: AbortSignal; timeoutMs?: number },
   ): Promise<DurableLiveFramePage> => {
     const params = new URLSearchParams({ after, limit: String(limit) });
+    const timeoutMs = opts?.timeoutMs ?? LIVE_FRAMES_REQUEST_TIMEOUT_MS;
+    const controller = new AbortController();
+    const timeout = setTimeout(
+      () => controller.abort(new DOMException("live-frames request timeout", "TimeoutError")),
+      timeoutMs,
+    );
+    const parent = opts?.signal;
+    const onParentAbort = () => controller.abort(parent?.reason);
+    parent?.addEventListener("abort", onParentAbort);
     return jsonOrThrow<DurableLiveFramePage>(
       callWithRefresh(a, (t) =>
         fetch(`/api/sessions/${encodeURIComponent(id)}/live-frames?${params.toString()}`, {
           credentials: "include",
           headers: bearerHeaders(t),
+          signal: controller.signal,
         }),
       ),
-    );
+    ).finally(() => {
+      clearTimeout(timeout);
+      parent?.removeEventListener("abort", onParentAbort);
+    });
   },
 
   getSessionGoal: (a: AuthSession, id: string): Promise<GoalStateSnapshot | null> =>

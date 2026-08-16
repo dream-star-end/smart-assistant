@@ -157,10 +157,18 @@ import {
   startFinalizeJournalReconciler,
   resolveStuckThresholdMs,
   resolveDurableWaiverAgeMs,
+  markGatewayShutdownEvidence,
   DEFAULT_RECONCILE_INTERVAL_MS,
   MIN_INTERVAL_MS as FINALIZE_RECONCILER_MIN_INTERVAL_MS,
   type ReconcilerHandle as FinalizeJournalReconcilerHandle,
 } from "./billing/finalizeJournalReconciler.js";
+import {
+  startLiveFrameMaintenanceScheduler,
+  resolveLiveFrameMaintenanceDisabled,
+  resolveLiveFrameMaintenanceIntervalMs,
+  resolvePruneMaxBatches,
+  resolveRetireMinAgeMs,
+} from "./db/liveFrameMaintenanceScheduler.js";
 import {
   startOnboardingScheduler,
   type OnboardingSchedulerHandle,
@@ -404,6 +412,8 @@ import { makeContainerDispatchClient } from "./dispatch/containerDispatchClient.
 import {
   resolveDispatchStuckThresholdMs,
   startTurnDispatchReconciler,
+  runShutdownDispatchHandoff,
+  DEFAULT_SHUTDOWN_HANDOFF_BUDGET_MS,
 } from "./dispatch/turnDispatchReconciler.js";
 import { resolveSessionsStoreAuthority } from "./db/sessionsStoreAuthority.js";
 import { getLaneMetricsSnapshot, type LaneMetricsSnapshot } from "./deploy/laneEvaluate.js";
@@ -1214,6 +1224,7 @@ export async function registerCommercial(
   // 拒起(resolveSessionsStoreAuthority 抛错即 registerCommercial 抛错 = master 拒起)。
   // 驱动选择权威在此一处(composition root),函数内禁 if(pg) 分支;pg 则一次性 setClientSessionsBackend。
   let sessionsGcSweeper: { stop: () => Promise<void> } | null = null;
+  let turnDispatchShutdownHandoff: (() => Promise<unknown>) | undefined;
   let losslessTurnTapeStorage: LosslessTurnTapeStorage | undefined;
   // durable turn dispatch(RFC §2):受理、tape-state 与真实终态读需 DispatchAdmissionBackend 面。
   let dispatchAdmissionBackend: DispatchAdmissionBackend | undefined;
@@ -5342,6 +5353,39 @@ export async function registerCommercial(
     });
   }
 
+  // live journal 帧表维护:删已投影且确有 tape 记录的流的帧,并给不可能再产帧的
+  // live 流打 retired_at(帧仍可见,只从在飞 owner 集合剔除)。leaderBundle shared
+  // 单跑(双 master 只 leader)。仅 v5(client_session_live_frames 是 v5 表)。
+  // 失败只记日志,start() 同步返回,不挡 leadership / 监听端口。
+  if (runtimeChannel === "v5" && !resolveLiveFrameMaintenanceDisabled()) {
+    leaderBundle.add({
+      name: "liveFrameMaintenance",
+      domain: "shared",
+      start: () => {
+        const intervalMs = resolveLiveFrameMaintenanceIntervalMs(
+          process.env.COMMERCIAL_LIVE_FRAME_MAINTENANCE_INTERVAL_MS,
+        );
+        const pruneMaxBatches = resolvePruneMaxBatches(
+          process.env.COMMERCIAL_LIVE_FRAME_PRUNE_MAX_BATCHES,
+        );
+        const retireMinAgeMs = resolveRetireMinAgeMs(
+          process.env.COMMERCIAL_LIVE_FRAME_RETIRE_MIN_AGE_MS,
+        );
+        const h = trackScheduler("liveFrameMaintenance", "shared", startLiveFrameMaintenanceScheduler({
+          pool: getPool(),
+          intervalMs,
+          pruneMaxBatches,
+          retireMinAgeMs,
+          runOnStart: true,
+          onError: (err) => rootLogger.warn("[liveFrameMaintenance] tick failed", {
+            err: (err as Error)?.message ?? String(err),
+          }),
+        }));
+        return { stop: () => h.stop() };
+      },
+    });
+  }
+
   // durable turn dispatch reconciler(RFC §2.3):open dispatch 周期收敛(admitted 过期租约 →
   // 容器求证 → terminal/accepted;terminal 未通知 → 财务联查 → 真实终态 / manual_reconcile)。
   // leaderBundle shared 单跑(双 master 只 leader)。仅 v5(turn_dispatches 由 0170 建)。
@@ -5396,19 +5440,18 @@ export async function registerCommercial(
             };
           },
         });
-        const h = trackScheduler("turnDispatchReconciler", "shared", startTurnDispatchReconciler({
+        const reconcilerDeps = {
           pool: getPool(),
           container,
-          intervalMs,
           stuckThresholdMs,
           // B-R1-1:abort 掉从未执行的 pre-forward journal 后,提前释放其 preCheck reservation
           // (best-effort;reservation 本会自然过期)。
-          releaseReservation: (ref) =>
+          releaseReservation: (ref: { userId: string; requestId: string }) =>
             releasePreCheck(preCheckRedis, { userId: ref.userId, requestId: ref.requestId }).then(() => {}),
           // M4:真实终态落库后 best-effort 实时 nudge —— 复用既有 turn_state_unknown
           // reconcile 帧型(前端收到即 forceSync 拉回该 dispatch 的权威状态卡)。
           // published≠delivered:用户离线/已切轮则无害吞掉,终态已持久,下次 sync 必达。
-          nudgeClient: (uid, sessionId, clientMessageId) => {
+          nudgeClient: (uid: bigint, sessionId: string, clientMessageId: string) => {
             try {
               userChatBridge.broadcastToUser(uid, {
                 type: "outbound.message",
@@ -5423,7 +5466,17 @@ export async function registerCommercial(
               /* best-effort */
             }
           },
+        };
+        const h = trackScheduler("turnDispatchReconciler", "shared", startTurnDispatchReconciler({
+          ...reconcilerDeps,
+          intervalMs,
+          runOnStart: true,
         }));
+        turnDispatchShutdownHandoff = () => runShutdownDispatchHandoff({
+          ...reconcilerDeps,
+          budgetMs: DEFAULT_SHUTDOWN_HANDOFF_BUDGET_MS,
+          limit: 8,
+        });
         return { stop: () => h.stop() };
       },
     });
@@ -5882,6 +5935,17 @@ export async function registerCommercial(
         try { await leaderLease.shutdown(); } catch { /* ignore */ }
       } else {
         try { await leaderBundle.stopAndDrain(); } catch { /* ignore */ }
+      }
+      // 停机收尾:先给在飞 journal/dispatch 落「进程退出」证据,预算内再容器求证。
+      // 绝不盲 finalize(引擎可能仍在容器里)。超时只留证据,让重启 tick 立刻判定。
+      try {
+        if (turnDispatchShutdownHandoff) {
+          await turnDispatchShutdownHandoff();
+        } else {
+          await markGatewayShutdownEvidence({ reason: "process_shutdown" });
+        }
+      } catch {
+        /* ignore — 退出优先,证据写失败由重启后的保守阈值兜底 */
       }
       if (controlListener) {
         try { await controlListener.close(); } catch { /* ignore */ }

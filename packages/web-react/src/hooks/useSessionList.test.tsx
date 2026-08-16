@@ -359,4 +359,44 @@ describe("useSessionList history loading fence", () => {
     await waitFor(() => expect(result.current.historyLoading).toBe(false));
     expect(socket.mergeServerHistory).toHaveBeenCalledTimes(1);
   });
+
+  test("canonical getSession 返回后即清骨架,不等 journal 水合", async () => {
+    const history = deferred<SessionDetail>();
+    const journal = deferred<void>();
+    vi.spyOn(api, "listSessions").mockResolvedValue([]);
+    vi.spyOn(api, "getSession").mockImplementation(async () => history.promise);
+    const hydrateDurableLiveFrameJournal = vi.fn(async () => journal.promise);
+    const auth = createMemoryAuthSession(() => {}, "token");
+    const user: User = { id: "u1", displayName: "User", roles: ["user"] };
+    const socket = {
+      storedMaxSeq: () => 0,
+      storedHistoryRevision: () => 1,
+      mergeServerHistory: vi.fn(),
+      hydrateDurableLiveFrameJournal,
+    } as unknown as UseChatSocket;
+    const { result } = renderHook(() => useSessionList({
+      demo: false,
+      auth,
+      authSession: auth,
+      user,
+      agentId: "main",
+      sockRef: { current: socket },
+      confirmDialog: async () => true,
+      promptText: async () => null,
+      clearChatError: () => {},
+      onNewSessionReset: () => {},
+      onActiveSessionDeleted: () => {},
+    }));
+
+    act(() => result.current.selectSession("webhistory02"));
+    await waitFor(() => expect(result.current.historyLoading).toBe(true));
+
+    await act(async () => {
+      history.resolve(detail("webhistory02"));
+      await history.promise;
+    });
+    await waitFor(() => expect(result.current.historyLoading).toBe(false));
+    expect(hydrateDurableLiveFrameJournal).toHaveBeenCalledTimes(1);
+    expect(socket.mergeServerHistory).toHaveBeenCalledTimes(1);
+  });
 });

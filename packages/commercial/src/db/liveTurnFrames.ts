@@ -236,9 +236,11 @@ export async function readClientSessionLiveFrames(
     const streams = await client.query<{
       client_message_id: string | null;
       projection_source: "live" | "tape";
+      retired: boolean;
       tape_projection_version: string | number;
     }>(
       `SELECT client_message_id,projection_source,
+              (provenance ? 'retired_at') AS retired,
               COUNT(*) FILTER (WHERE projection_source='tape')
                 OVER ()::text AS tape_projection_version
          FROM client_session_live_streams
@@ -248,11 +250,19 @@ export async function readClientSessionLiveFrames(
     );
     const streamClientMessageIds = [...new Set(
       streams.rows
-        .filter((row) => row.projection_source === "live")
+        .filter((row) => row.projection_source === "live" && !row.retired)
         .map((row) => row.client_message_id)
         .filter((value): value is string => typeof value === "string" && value.length > 0),
     )];
 
+    // Drive from the session's live stream_key set (idx_live_stream_session_projection)
+    // then LATERAL-page each key via idx_live_frame_stream_order. The previous
+    // frames-first join let a generic plan pick client_session_live_frames_pkey
+    // with Index Cond (record_id > $cursor) and walk the table; zero matching
+    // rows was the slowest case.
+    // Retired streams stay in this frame query: retirement only means "not in
+    // flight" (dropped from streamClientMessageIds). Many dead streams have no
+    // tape and no canonical messages — these frames are the only copy.
     const rows = (
       await client.query<{
         record_id: string;
@@ -262,10 +272,17 @@ export async function readClientSessionLiveFrames(
         payload: Buffer;
       }>(
         `SELECT f.record_id::text,f.stream_key,f.source,s.client_message_id,f.payload
-           FROM client_session_live_frames f
-           JOIN client_session_live_streams s ON s.stream_key=f.stream_key
-          WHERE s.session_id=$1 AND s.user_id=$2 AND s.projection_source='live'
-            AND f.record_id>$3::bigint
+           FROM client_session_live_streams s
+           CROSS JOIN LATERAL (
+             SELECT fr.record_id,fr.stream_key,fr.source,fr.payload
+               FROM client_session_live_frames fr
+              WHERE fr.stream_key=s.stream_key
+                AND fr.record_id>$3::bigint
+              ORDER BY fr.record_id
+              LIMIT $4
+           ) f
+          WHERE s.user_id=$2 AND s.session_id=$1
+            AND s.projection_source='live'
           ORDER BY f.record_id
           LIMIT $4`,
         [sessionId, userId, cursor, pageSize + 1],
@@ -470,4 +487,127 @@ export async function importRolloutLiveFrames(
     }
     return { inserted, idempotent };
   });
+}
+
+const DEFAULT_PRUNE_BATCH_SIZE = 5000;
+const DEFAULT_RETIRE_MIN_AGE_MS = 2 * 60 * 60 * 1000;
+
+function asPositiveInt(value: number | undefined, fallback: number, max: number): number {
+  if (value === undefined) return fallback;
+  if (!Number.isSafeInteger(value) || value < 1) return fallback;
+  return Math.min(max, value);
+}
+
+/**
+ * Delete frames that belong to tape-projected streams whose tape records
+ * actually exist. Read paths only fetch projection_source='live', so these
+ * frames are unreachable — but some tape streams have no tape records
+ * (production had 18 such streams, one with 2343 frames); deleting those
+ * would be real data loss. Eligibility is (session_id, user_id, tape_id)
+ * EXISTS in client_session_turn_tape_records; tape_id IS NULL is skipped.
+ * Batched to avoid a long table lock. Idempotent.
+ */
+export async function pruneProjectedLiveFrames(
+  pool: Pool,
+  options?: { batchSize?: number; maxBatches?: number },
+): Promise<{ deletedFrames: number; prunedStreams: number }> {
+  const batchSize = asPositiveInt(options?.batchSize, DEFAULT_PRUNE_BATCH_SIZE, 20_000);
+  const maxBatches = options?.maxBatches === undefined
+    ? Number.POSITIVE_INFINITY
+    : asPositiveInt(options.maxBatches, 1, 1_000_000);
+  const touched = new Set<string>();
+  let deletedFrames = 0;
+  for (let batch = 0; batch < maxBatches; batch += 1) {
+    const result = await pool.query<{ stream_key: string }>(
+      `DELETE FROM client_session_live_frames
+        WHERE record_id IN (
+          SELECT f.record_id
+            FROM client_session_live_frames f
+            JOIN client_session_live_streams s ON s.stream_key=f.stream_key
+           WHERE s.projection_source='tape'
+             AND s.tape_id IS NOT NULL
+             AND EXISTS (
+               SELECT 1
+                 FROM client_session_turn_tape_records r
+                WHERE r.session_id=s.session_id
+                  AND r.user_id=s.user_id
+                  AND r.tape_id=s.tape_id
+             )
+           LIMIT $1
+        )
+        RETURNING stream_key`,
+      [batchSize],
+    );
+    const count = result.rowCount ?? 0;
+    if (count === 0) break;
+    deletedFrames += count;
+    for (const row of result.rows) touched.add(row.stream_key);
+  }
+  return { deletedFrames, prunedStreams: touched.size };
+}
+
+/**
+ * Retire live streams that cannot produce more frames so hydration stops
+ * treating them as in-flight. Does not change projection_source: flipping
+ * them to tape with a null tape_id would inflate hasTapeProjection /
+ * tapeProjectionVersion. Retirement is a provenance.retired_at stamp
+ * (no DDL — aurora already occupies 0219; a new column would force a 0220
+ * gap and a migrate-before-code deploy order).
+ *
+ * Retirement is "no longer the in-flight owner", not "content is gone".
+ * The read path still returns retired streams' frames (often the only copy:
+ * no tape, no canonical messages). It only drops them from
+ * streamClientMessageIds, which is what the client uses to decide a turn
+ * is still flying.
+ *
+ * Eligible, all required:
+ *   - source='gateway' (never rollout_import)
+ *   - projection_source='live' and not already retired
+ *   - updated_at older than minAgeMs (default 2h)
+ *   - either dispatch_id IS NULL (legacy:* never seen by converge), or the
+ *     dispatch is terminal / manual_reconcile
+ * Never touches accepted/admitted/rejecting dispatches, including an
+ * in-flight accepted turn even if its lease has expired.
+ */
+export async function retireDeadLiveStreams(
+  pool: Pool,
+  options?: { minAgeMs?: number },
+): Promise<{ retired: number }> {
+  const minAgeMs = asPositiveInt(
+    options?.minAgeMs,
+    DEFAULT_RETIRE_MIN_AGE_MS,
+    365 * 24 * 60 * 60 * 1000,
+  );
+  const result = await pool.query<{ stream_key: string }>(
+    `UPDATE client_session_live_streams s
+        SET provenance = s.provenance || jsonb_build_object('retired_at', NOW()::text),
+            terminal_status = COALESCE(
+              s.terminal_status,
+              (
+                SELECT CASE
+                  WHEN d.outcome IN ('completed','interrupted','crashed') THEN d.outcome
+                  ELSE 'interrupted'
+                END
+                  FROM turn_dispatches d
+                 WHERE d.dispatch_id=s.dispatch_id
+              ),
+              'interrupted'
+            ),
+            updated_at = NOW()
+      WHERE s.source='gateway'
+        AND s.projection_source='live'
+        AND NOT (s.provenance ? 'retired_at')
+        AND s.updated_at < NOW() - ($1::bigint * INTERVAL '1 millisecond')
+        AND (
+          s.dispatch_id IS NULL
+          OR EXISTS (
+            SELECT 1 FROM turn_dispatches d
+             WHERE d.dispatch_id=s.dispatch_id
+               AND d.status IN ('terminal','manual_reconcile')
+          )
+        )
+      RETURNING s.stream_key`,
+    [minAgeMs],
+  );
+  return { retired: result.rowCount ?? 0 };
 }
