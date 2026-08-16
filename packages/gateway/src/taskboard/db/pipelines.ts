@@ -58,6 +58,7 @@ interface StageRow {
   entry_condition: string | null
   exit_checklist: string | null
   require_human_ack: number
+  auto_close: number
   created_at: number
   updated_at: number
 }
@@ -71,7 +72,7 @@ const STAGE_COLS = `
   effort, patrol_cron, patrol_enabled, patrol_timezone, quiet_hours_start,
   quiet_hours_end, max_runs_per_day, timeout_sec, max_retries,
   circuit_breaker_threshold, on_success, on_failure, entry_condition,
-  exit_checklist, require_human_ack, created_at, updated_at
+  exit_checklist, require_human_ack, auto_close, created_at, updated_at
 `
 
 function mapPipeline(row: PipelineRow): Pipeline {
@@ -111,6 +112,7 @@ function mapStage(row: StageRow): PipelineStage {
     entryCondition: row.entry_condition,
     exitChecklist: row.exit_checklist,
     requireHumanAck: intToBool(row.require_human_ack),
+    autoClose: intToBool(row.auto_close),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   }
@@ -154,6 +156,7 @@ export interface CreateStageInput {
   entryCondition?: string | null
   exitChecklist?: string | null
   requireHumanAck?: boolean
+  autoClose?: boolean
 }
 
 export interface UpdateStageInput {
@@ -177,6 +180,7 @@ export interface UpdateStageInput {
   entryCondition?: string | null
   exitChecklist?: string | null
   requireHumanAck?: boolean
+  autoClose?: boolean
   ordinal?: number
 }
 
@@ -270,13 +274,13 @@ export function createStage(db: TaskboardDb, input: CreateStageInput): PipelineS
        effort, patrol_cron, patrol_enabled, patrol_timezone, quiet_hours_start,
        quiet_hours_end, max_runs_per_day, timeout_sec, max_retries,
        circuit_breaker_threshold, on_success, on_failure, entry_condition,
-       exit_checklist, require_human_ack, created_at, updated_at
+       exit_checklist, require_human_ack, auto_close, created_at, updated_at
      ) VALUES (
        @id, @pipelineId, @ordinal, @name, @kind, @agentId, @promptTemplate, @toolsets,
        @effort, @patrolCron, @patrolEnabled, @patrolTimezone, @quietHoursStart,
        @quietHoursEnd, @maxRunsPerDay, @timeoutSec, @maxRetries,
        @circuitBreakerThreshold, @onSuccess, @onFailure, @entryCondition,
-       @exitChecklist, @requireHumanAck, @now, @now
+       @exitChecklist, @requireHumanAck, @autoClose, @now, @now
      )`,
   ).run({
     id,
@@ -303,6 +307,7 @@ export function createStage(db: TaskboardDb, input: CreateStageInput): PipelineS
     entryCondition: input.entryCondition ?? null,
     exitChecklist: input.exitChecklist ?? null,
     requireHumanAck: boolToInt(input.requireHumanAck ?? false),
+    autoClose: boolToInt(input.autoClose ?? false),
     now,
   })
   return getStage(db, id) as PipelineStage
@@ -359,6 +364,7 @@ export function updateStage(db: TaskboardDb, id: string, input: UpdateStageInput
        entry_condition = @entryCondition,
        exit_checklist = @exitChecklist,
        require_human_ack = @requireHumanAck,
+       auto_close = @autoClose,
        ordinal = @ordinal,
        updated_at = @now
      WHERE id = @id`,
@@ -387,6 +393,7 @@ export function updateStage(db: TaskboardDb, id: string, input: UpdateStageInput
       input.entryCondition === undefined ? existing.entryCondition : input.entryCondition,
     exitChecklist: input.exitChecklist === undefined ? existing.exitChecklist : input.exitChecklist,
     requireHumanAck: boolToInt(input.requireHumanAck ?? existing.requireHumanAck),
+    autoClose: boolToInt(input.autoClose ?? existing.autoClose),
     ordinal: input.ordinal ?? existing.ordinal,
     now,
   })

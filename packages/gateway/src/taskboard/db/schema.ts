@@ -83,6 +83,7 @@ CREATE TABLE IF NOT EXISTS tb_pipeline_stage (
   entry_condition TEXT,
   exit_checklist TEXT,
   require_human_ack INTEGER NOT NULL DEFAULT 0,
+  auto_close INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   UNIQUE (pipeline_id, ordinal)
