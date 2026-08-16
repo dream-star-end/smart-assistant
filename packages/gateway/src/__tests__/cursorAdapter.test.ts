@@ -79,6 +79,140 @@ describe('CursorAdapter', () => {
     )
   })
 
+  // ── 工具卡归一化:Cursor 原生工具 → 产品工具名 + 产品 input 形态 ──
+  // fixture 形态取自 selfhost 真实 turn tape(cursor-opus-5-high 会话)。
+  test('normalizes cursor-native tool names and inputs to product card shapes', () => {
+    // editToolCall 携带 streamContent(整文件写入)→ Write
+    const editAsWrite = {
+      type: 'tool_call',
+      tool_call: {
+        id: 't-edit-write',
+        editToolCall: { args: { path: '/tmp/probe.sh', streamContent: '#!/bin/bash\nexit 0\n' } },
+      },
+    }
+    assert.equal(_internals.toolNameOf(editAsWrite as never), 'Write')
+    assert.deepEqual(_internals.toolInputOf(editAsWrite as never), {
+      file_path: '/tmp/probe.sh',
+      content: '#!/bin/bash\nexit 0\n',
+    })
+
+    // editToolCall 携带 old/new(局部编辑)→ Edit
+    const editAsEdit = {
+      type: 'tool_call',
+      tool_call: {
+        id: 't-edit-patch',
+        editToolCall: { args: { path: '/tmp/a.ts', old_string: 'foo', new_string: 'bar' } },
+      },
+    }
+    assert.equal(_internals.toolNameOf(editAsEdit as never), 'Edit')
+    assert.deepEqual(_internals.toolInputOf(editAsEdit as never), {
+      file_path: '/tmp/a.ts',
+      old_string: 'foo',
+      new_string: 'bar',
+    })
+
+    // updateTodosToolCall + Python repr 字符串化的 todos → TodoWrite + 产品枚举
+    const todos = {
+      type: 'tool_call',
+      tool_call: {
+        id: 't-todos',
+        updateTodosToolCall: {
+          args: {
+            merge: 'False',
+            todos: `[{'content': '勘察', 'status': 'TODO_STATUS_IN_PROGRESS'}, {'content': '实现', 'status': 'TODO_STATUS_PENDING'}, {'content': '验证', 'status': 'TODO_STATUS_COMPLETED'}]`,
+          },
+        },
+      },
+    }
+    assert.equal(_internals.toolNameOf(todos as never), 'TodoWrite')
+    assert.deepEqual(_internals.toolInputOf(todos as never), {
+      todos: [
+        { content: '勘察', status: 'in_progress' },
+        { content: '实现', status: 'pending' },
+        { content: '验证', status: 'completed' },
+      ],
+    })
+
+    // taskToolCall → Task(description/prompt 提到顶层)
+    const task = {
+      type: 'tool_call',
+      tool_call: {
+        id: 't-task',
+        taskToolCall: {
+          args: { description: '调研项目', prompt: '任务:调研并产出报告', subagentType: '' },
+        },
+      },
+    }
+    assert.equal(_internals.toolNameOf(task as never), 'Task')
+    assert.deepEqual(_internals.toolInputOf(task as never), {
+      description: '调研项目',
+      prompt: '任务:调研并产出报告',
+    })
+
+    // askQuestionToolCall + Python repr questions → AskUserQuestion wire 形态
+    const ask = {
+      type: 'tool_call',
+      tool_call: {
+        id: 't-ask',
+        askQuestionToolCall: {
+          args: {
+            title: '确认下线范围',
+            runAsync: 'False',
+            questions: `[{'allowMultiple': False, 'id': 'replacement', 'options': [{'id': 'flash', 'label': '用 flash 替代'}, {'id': 'none', 'label': '直接下线'}], 'prompt': '下线前需要确认替代方案'}]`,
+          },
+        },
+      },
+    }
+    assert.equal(_internals.toolNameOf(ask as never), 'AskUserQuestion')
+    assert.deepEqual(_internals.toolInputOf(ask as never), {
+      questions: [{
+        question: '下线前需要确认替代方案',
+        header: '确认下线范围',
+        options: [
+          { label: '用 flash 替代' },
+          { label: '直接下线' },
+        ],
+      }],
+    })
+
+    // awaitToolCall → TaskOutput(task_id)
+    const awaitTool = {
+      type: 'tool_call',
+      tool_call: { id: 't-await', awaitToolCall: { args: { taskId: '455287', blockUntilMs: '60000' } } },
+    }
+    assert.equal(_internals.toolNameOf(awaitTool as never), 'TaskOutput')
+    assert.deepEqual(_internals.toolInputOf(awaitTool as never), { task_id: '455287' })
+
+    // grepToolCall → Grep(pattern/path)
+    const grep = {
+      type: 'tool_call',
+      tool_call: {
+        id: 't-grep',
+        grepToolCall: { args: { pattern: 'check:v5', path: '/repo/package.json', outputMode: 'content' } },
+      },
+    }
+    assert.equal(_internals.toolNameOf(grep as never), 'Grep')
+    assert.deepEqual(_internals.toolInputOf(grep as never), {
+      pattern: 'check:v5',
+      path: '/repo/package.json',
+    })
+  })
+
+  test('keeps raw cursor args when stringified todos cannot be parsed', () => {
+    const broken = {
+      type: 'tool_call',
+      tool_call: {
+        id: 't-broken',
+        updateTodosToolCall: { args: { todos: "not-json-at-all{" } },
+      },
+    }
+    assert.equal(_internals.toolNameOf(broken as never), 'TodoWrite')
+    const input = _internals.toolInputOf(broken as never) as Record<string, unknown>
+    // 解不开时退回原始 args 包装,不丢记录
+    assert.ok(input && typeof input === 'object')
+    assert.equal((input as { args?: { todos?: string } }).args?.todos, 'not-json-at-all{')
+  })
+
   test('parses pinned official stream-json without duplicating the final assistant flush', async () => {
     const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-adapter-'))
     const fake = path.join(dir, 'fake.cjs')

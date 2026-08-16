@@ -64,6 +64,9 @@ const TOOL_META: Record<string, ToolMeta> = {
   NotebookEdit: { icon: NotebookPen, label: "笔记本", tone: "neutral" },
   Task: { icon: Bot, label: "子任务", tone: "accent" },
   Agent: { icon: Bot, label: "子任务", tone: "accent" },
+  // cursor 引擎经网关归一化后的产品名;CCB 的 AskUserQuestion 走 PermissionCard 专用答题卡,
+  // 此条只兜 cursor 工具消息与历史降级渲染。
+  AskUserQuestion: { icon: FormInput, label: "向用户提问", tone: "accent" },
   // CCB Kairos cron 工具(已在商业容器禁用,agent 侧改走 openclaude-memory 的
   // reminder 工具族);保留 meta 让历史会话的卡片仍有语义标签。
   CronList: { icon: Clock, label: "定时任务列表", tone: "accent" },
@@ -499,6 +502,13 @@ export function toolSummary(name: string, input: Record<string, unknown> | null)
         asStr(input.message) ||
         asStr(input.prompt)
       ).slice(0, 60)}`;
+    case "AskUserQuestion": {
+      const qs = asArr(input.questions);
+      const first = qs[0] && typeof qs[0] === "object"
+        ? asStr((qs[0] as Record<string, unknown>).question)
+        : "";
+      return first ? `${qs.length} 个问题: ${first.slice(0, 40)}` : `${qs.length} 个问题`;
+    }
     case "delegate_tasks":
       return delegateTasksSummary(input);
   }

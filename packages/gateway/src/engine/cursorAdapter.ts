@@ -231,7 +231,22 @@ function toolNameOf(event: CursorEvent): string {
     webSearchToolCall: 'WebSearch',
     todoToolCall: 'TodoWrite',
     todoWriteToolCall: 'TodoWrite',
+    updateTodosToolCall: 'TodoWrite',
     updatePlanToolCall: 'TodoWrite',
+    taskToolCall: 'Task',
+    askQuestionToolCall: 'AskUserQuestion',
+    awaitToolCall: 'TaskOutput',
+  }
+  // Cursor 的 editToolCall 既承载局部编辑(old/new string)也承载整文件重写
+  // (streamContent)。前者映射产品卡 Edit,后者语义就是 Write,拆开才能让
+  // 前端/移动端按既有卡面(文件路径 + 内容预览)渲染。
+  if (kind === 'editToolCall') {
+    const args = recordOf(toolVariantOf(event)?.value.args)
+    if (
+      args && args.streamContent !== undefined &&
+      args.old_string === undefined && args.new_string === undefined &&
+      args.oldString === undefined && args.newString === undefined
+    ) return 'Write'
   }
   if (nativeNames[kind]) return nativeNames[kind]!
   if (kind === 'mcpToolCall') {
@@ -251,6 +266,38 @@ function toolNameOf(event: CursorEvent): string {
   }
   return 'CursorTool'
 }
+/** Cursor CLI 会把部分结构化 args 值序列化成字符串;部分版本还是 Python repr
+ * (单引号 / True / False / None)。展示层归一化需要尽力解回对象,解不开返回 null
+ * 让调用方退回原始值 —— 绝不因解析失败丢掉整条工具记录。 */
+function looseValue<T>(value: unknown): T | null {
+  if (value === null || value === undefined) return null
+  if (typeof value === 'object') return value as T
+  if (typeof value !== 'string') return null
+  const s = value.trim()
+  if (!s.startsWith('[') && !s.startsWith('{')) return null
+  try { return JSON.parse(s) as T } catch { /* try python repr below */ }
+  try {
+    // split/join 而非 regex:占位符含控制字符,biome 禁止在正则里写控制字符。
+    const placeholder = '\u0000'
+    const jsonish = s
+      .split("\\'").join(placeholder)
+      .split("'").join('"')
+      .split(placeholder).join("\\'")
+      .replace(/\bTrue\b/g, 'true')
+      .replace(/\bFalse\b/g, 'false')
+      .replace(/\bNone\b/g, 'null')
+    return JSON.parse(jsonish) as T
+  } catch { return null }
+}
+
+/** Cursor 的 TODO_STATUS_* 枚举 → 产品 TodoWrite 的 pending/in_progress/completed。 */
+function todoStatusOf(value: unknown): string {
+  const s = textOf(value)
+  if (/COMPLETED|COMPLETING|DONE/i.test(s)) return 'completed'
+  if (/IN_PROGRESS|INPROGRESS|ACTIVE/i.test(s)) return 'in_progress'
+  return 'pending'
+}
+
 function toolInputOf(event: CursorEvent): unknown {
   const call = toolCallOf(event)
   const variant = toolVariantOf(event)
@@ -266,6 +313,85 @@ function toolInputOf(event: CursorEvent): unknown {
       file_path: filePath,
       ...(nonnegative(args.offset) !== undefined ? { offset: nonnegative(args.offset) } : {}),
       ...(nonnegative(args.limit) !== undefined ? { limit: nonnegative(args.limit) } : {}),
+    }
+  }
+  if (kind === 'editToolCall' || kind === 'applyPatchToolCall') {
+    const filePath = textOf(args.path ?? args.file_path ?? call?.path)
+    const oldString = args.old_string ?? args.oldString
+    const newString = args.new_string ?? args.newString
+    if (oldString !== undefined || newString !== undefined) {
+      return {
+        file_path: filePath,
+        ...(oldString !== undefined ? { old_string: textOf(oldString) } : {}),
+        ...(newString !== undefined ? { new_string: textOf(newString) } : {}),
+      }
+    }
+    // streamContent = 整文件内容(cursor 的 edit-as-write 形态),toolNameOf 已拆成 Write。
+    return { file_path: filePath, content: textOf(args.streamContent ?? args.content) }
+  }
+  if (kind === 'writeToolCall' || kind === 'createFileToolCall') {
+    return {
+      file_path: textOf(args.path ?? args.file_path ?? call?.path),
+      content: textOf(args.streamContent ?? args.content),
+    }
+  }
+  if (kind === 'deleteFileToolCall') {
+    return { file_path: textOf(args.path ?? args.file_path ?? call?.path) }
+  }
+  if (kind === 'grepToolCall' || kind === 'searchToolCall') {
+    return {
+      pattern: textOf(args.pattern ?? args.query ?? args.regex),
+      ...(args.path !== undefined ? { path: textOf(args.path) } : {}),
+    }
+  }
+  if (kind === 'todoToolCall' || kind === 'todoWriteToolCall' || kind === 'updateTodosToolCall' || kind === 'updatePlanToolCall') {
+    const rawTodos = looseValue<Record<string, unknown>[]>(args.todos)
+    if (!Array.isArray(rawTodos)) {
+      return event.input ?? event.rawInput ?? event.arguments ?? variant?.value ?? call ?? {}
+    }
+    return {
+      todos: rawTodos.map((todo) => ({
+        content: textOf(todo?.content),
+        status: todoStatusOf(todo?.status),
+        ...(todo?.activeForm !== undefined ? { activeForm: textOf(todo.activeForm) } : {}),
+      })),
+    }
+  }
+  if (kind === 'taskToolCall') {
+    return {
+      ...(args.description !== undefined ? { description: textOf(args.description) } : {}),
+      ...(args.prompt !== undefined ? { prompt: textOf(args.prompt) } : {}),
+      ...(textOf(args.subagentType) ? { subagentType: textOf(args.subagentType) } : {}),
+    }
+  }
+  if (kind === 'askQuestionToolCall') {
+    const rawQuestions = looseValue<Record<string, unknown>[]>(args.questions)
+    if (!Array.isArray(rawQuestions) || rawQuestions.length === 0) {
+      return event.input ?? event.rawInput ?? event.arguments ?? variant?.value ?? call ?? {}
+    }
+    const title = textOf(args.title)
+    const questions = rawQuestions.map((question) => ({
+      question: textOf(question?.prompt ?? question?.question),
+      ...(title ? { header: title.slice(0, 12) } : {}),
+      ...(question?.allowMultiple === true || textOf(question?.allowMultiple).toLowerCase() === 'true'
+        ? { multiSelect: true } : {}),
+      options: (Array.isArray(question?.options) ? question!.options : []).map((option) => {
+        const item = recordOf(option)
+        return {
+          label: textOf(item?.label ?? item?.text ?? item?.id),
+          ...(item?.description !== undefined ? { description: textOf(item.description) } : {}),
+        }
+      }),
+    })).filter((question) => question.question)
+    if (questions.length === 0) {
+      return event.input ?? event.rawInput ?? event.arguments ?? variant?.value ?? call ?? {}
+    }
+    return { questions }
+  }
+  if (kind === 'awaitToolCall') {
+    return {
+      task_id: textOf(args.taskId),
+      ...(nonnegative(args.blockUntilMs) !== undefined ? { block_until_ms: nonnegative(args.blockUntilMs) } : {}),
     }
   }
   if (kind === 'globToolCall') {
@@ -909,6 +1035,8 @@ export const _internals = {
   CURSOR_HOTCFG_WRAPPER_BIN,
   CURSOR_IMAGE_WRAPPER_BIN,
   resolveCursorWrapperBin,
+  toolNameOf,
+  toolInputOf,
 }
 
 registerEngine('cursor', (opts) => new CursorAdapter(opts))

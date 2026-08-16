@@ -279,6 +279,22 @@ describe("记忆更新重标(Write/Edit 命中记忆文件)", () => {
   });
 });
 
+describe("cursor 引擎归一化工具的产品卡支持", () => {
+  test("AskUserQuestion 有专属标签与摘要(cursor askQuestionToolCall 归一化名)", () => {
+    const meta = resolveToolMeta("AskUserQuestion");
+    expect(meta.label).toBe("向用户提问");
+    expect(
+      toolSummary("AskUserQuestion", {
+        questions: [{ question: "下线前需要确认替代方案", options: [{ label: "用 flash 替代" }] }],
+      }),
+    ).toContain("下线前需要确认替代方案");
+  });
+  test("AskUserQuestion 空问题时只报数量,不抛错", () => {
+    expect(toolSummary("AskUserQuestion", { questions: [] })).toBe("0 个问题");
+    expect(toolSummary("AskUserQuestion", null)).toBe("");
+  });
+});
+
 describe("Codex 工具归一化:cancelled 态与 plan 字段对齐 (fix C)", () => {
   const mcpItem = (status: string) => ({
     type: "mcpToolCall",
