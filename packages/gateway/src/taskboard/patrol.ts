@@ -81,6 +81,7 @@ import {
   nextStageLoopCount,
   resetSharedPatrolSlots,
 } from './guardrails.js'
+import { type TaskboardNotifyHooks, fireNotify } from './notify.js'
 import { shouldPatrol } from './patrolWindow.js'
 import { renderPrompt } from './promptRender.js'
 import { assertTransition } from './stateMachine.js'
@@ -116,6 +117,8 @@ export interface PatrolEngineOptions {
   delegate: PatrolDelegateFn
   now?: () => number
   onAlert?: GuardrailAlertHandler
+  /** 待确认 / 每日简报。熔断走 onAlert → notifier.onGuardrailAlert。 */
+  notify?: TaskboardNotifyHooks
   /** 测试注入,避免共用进程级槽位。生产省略则用模块单例。 */
   slots?: PatrolSlotCounter
   idle?: IdleBackoffState
@@ -144,6 +147,7 @@ export class PatrolEngine {
   private readonly delegate: PatrolDelegateFn
   private readonly nowFn: () => number
   private readonly onAlert?: GuardrailAlertHandler
+  private readonly notify?: TaskboardNotifyHooks
   private readonly log: (msg: string, extra?: Record<string, unknown>) => void
   private ticking = false
 
@@ -152,6 +156,7 @@ export class PatrolEngine {
     this.delegate = opts.delegate
     this.nowFn = opts.now ?? Date.now
     this.onAlert = opts.onAlert
+    this.notify = opts.notify
     this.slots = opts.slots ?? getSharedPatrolSlots()
     this.idle = opts.idle ?? sharedIdle
     this.log = opts.log ?? (() => {})
@@ -205,6 +210,23 @@ export class PatrolEngine {
     const settings = getSettings(db)
     this.slots.setLimit(settings.maxConcurrentRuns)
 
+    try {
+      return await this.tickOnceInner(db, at, now, settings)
+    } finally {
+      fireNotify(
+        () => this.notify?.onDigestTick({ db, at, settings }),
+        this.log,
+        'taskboard digest notify failed',
+      )
+    }
+  }
+
+  private async tickOnceInner(
+    db: TaskboardDb,
+    at: Date,
+    now: number,
+    settings: TaskboardSettings,
+  ): Promise<TickReport> {
     const reaped = this.recoverExpired(db, now)
 
     const paused = checkPatrolPaused(settings)
@@ -515,9 +537,9 @@ export class PatrolEngine {
     if (!current || current.status !== 'running') return
 
     if (ok) {
-      this.applySuccess(db, current, stage, settings)
+      this.applySuccess(db, current, stage, settings, run)
     } else {
-      this.applyFailure(db, current, stage, settings, error ?? 'failed')
+      this.applyFailure(db, current, stage, settings, error ?? 'failed', run)
     }
   }
 
@@ -526,10 +548,11 @@ export class PatrolEngine {
     ticket: Ticket,
     stage: PipelineStage,
     settings: TaskboardSettings,
+    run: TicketRun,
   ): void {
     const nxt = nextStageOf(db, stage)
     if (stage.onSuccess === 'wait_human') {
-      this.transition(db, ticket, 'waiting_human', 'agent', stage, { stageId: ticket.stageId })
+      this.transition(db, ticket, 'waiting_human', 'agent', stage, { stageId: ticket.stageId }, run)
       return
     }
     if (stage.onSuccess === 'stay') {
@@ -548,14 +571,22 @@ export class PatrolEngine {
         this.transition(db, ticket, 'done', 'agent', stage, { closedAt: this.nowFn() })
         return
       }
-      this.transition(db, ticket, 'waiting_human', 'agent', stage, {})
+      this.transition(db, ticket, 'waiting_human', 'agent', stage, {}, run)
       return
     }
     if (nxt.kind !== 'ai') {
-      this.transition(db, ticket, 'waiting_human', 'agent', stage, {
-        stageId: nxt.id,
-        stageLoopCount: 0,
-      })
+      this.transition(
+        db,
+        ticket,
+        'waiting_human',
+        'agent',
+        stage,
+        {
+          stageId: nxt.id,
+          stageLoopCount: 0,
+        },
+        run,
+      )
       return
     }
     this.transition(db, ticket, 'ready', 'agent', stage, {
@@ -570,6 +601,7 @@ export class PatrolEngine {
     stage: PipelineStage,
     settings: TaskboardSettings,
     error: string,
+    run: TicketRun,
   ): void {
     const threshold = stage.circuitBreakerThreshold || settings.circuitBreakerThreshold
     const fails = countConsecutiveStageFailures(db, stage.id)
@@ -577,7 +609,7 @@ export class PatrolEngine {
     if (!circuit.ok) this.tripCircuit(db, stage, circuit.alert)
 
     if (stage.onFailure === 'wait_human') {
-      this.transition(db, ticket, 'waiting_human', 'agent', stage, {})
+      this.transition(db, ticket, 'waiting_human', 'agent', stage, {}, run)
       return
     }
     if (stage.onFailure === 'retry') {
@@ -661,6 +693,7 @@ export class PatrolEngine {
       /** 失败重试 / stay 必须显式传 stay,不能借用 stage.onSuccess=wait_human。 */
       stageOnSuccess?: import('./domain.js').OnSuccessAction
     },
+    run?: TicketRun,
   ): void {
     const current = getTicket(db, ticket.id) ?? ticket
     const { stageOnSuccess, ...ticketPatch } = patch
@@ -684,6 +717,15 @@ export class PatrolEngine {
       current.status,
       to,
     )
+    if (to === 'waiting_human' && run) {
+      const fresh = getTicket(db, current.id) ?? { ...current, status: to }
+      fireNotify(
+        () => this.notify?.onWaitingHuman({ ticket: fresh, run, stage }),
+        this.log,
+        'taskboard await notify failed',
+        { ticketId: current.id, runId: run.id },
+      )
+    }
   }
 
   private skipReadyTickets(

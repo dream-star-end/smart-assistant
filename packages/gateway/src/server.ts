@@ -218,9 +218,11 @@ import {
 import { handleTaskboardApi, resolveTaskboardActor, setPatrolExecutionHandler } from './taskboard/http.js'
 import { getTaskboardDb } from './taskboard/db/index.js'
 import { PatrolEngine } from './taskboard/patrol.js'
+import { TaskboardNotifier } from './taskboard/notify.js'
 import { sendV3WechatProactive, readV3WechatProactiveConfig } from './v3WechatProactive.js'
 import { sendV3QqProactive, readV3QqProactiveConfig } from './v3QqProactive.js'
 import { postInboxMessage, postInboxMessageDurable } from './v3InboxPost.js'
+import { postInboxAlert } from './v3InboxAlert.js'
 import { parseDocument } from './documentParser.js'
 import {
   makeDelegateProgressBlock,
@@ -2761,18 +2763,36 @@ export class Gateway {
     }, 60_000)
 
     // Taskboard 统一巡检 tick:一个 60s 定时器扫全部 stage,不按 stage 建 cron job。
+    // 通知复用 onDeliver 瀑布(微信接管则不再推站内信);熔断 warning 走 createInboxMessage。
+    const taskboardNotify = new TaskboardNotifier({
+      getDb: () => getTaskboardDb(),
+      log: (msg, extra) => this.log.warn(msg, extra),
+      transport: {
+        sendWechat: async ({ text, outboundId }) => {
+          const cfg = readV3WechatProactiveConfig()
+          if (!cfg) return { kind: 'fallback' as const, marked: false }
+          return sendV3WechatProactive({ config: cfg, text, outboundId })
+        },
+        postInbox: ({ title, bodyMd, deliveryKey }) =>
+          postInboxMessage({ title, bodyMd, deliveryKey }),
+        createInboxMessage: (args) => postInboxAlert(args),
+      },
+    })
     this._taskboardPatrol = new PatrolEngine({
       getDb: () => getTaskboardDb(),
       delegate: (input) => this._runTaskboardDelegate(input),
       log: (msg, extra) => this.log.info(msg, extra),
-      onAlert: (alert) =>
+      notify: taskboardNotify,
+      onAlert: (alert) => {
         this.log.warn('taskboard guardrail', {
           kind: alert.kind,
           outboundId: alert.outboundId,
           message: alert.message,
           stageId: alert.stageId,
           ticketId: alert.ticketId,
-        }),
+        })
+        void taskboardNotify.onGuardrailAlert(alert)
+      },
     })
     setPatrolExecutionHandler((job) => {
       void this._taskboardPatrol?.executeJob(job).catch((err) =>
