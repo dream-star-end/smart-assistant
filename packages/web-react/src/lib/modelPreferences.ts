@@ -106,7 +106,9 @@ export function resolveSessionModel(
 export function effortForModel(
   models: PublicModel[],
   modelId: string | undefined,
-  preferred: PreferenceEffort | undefined,
+  // null(会话显式「跟随模型默认」)与 undefined(未设置)在函数内同路径:都落到
+  // 返回 null = 发送显式清除,让 runner 回模型自身默认。
+  preferred: PreferenceEffort | null | undefined,
 ): PreferenceEffort | null | undefined {
   if (!modelId) return undefined;
   const model = models.find((m) => m.id === modelId);
