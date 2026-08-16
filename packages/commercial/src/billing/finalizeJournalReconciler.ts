@@ -145,14 +145,14 @@ export async function markGatewayShutdownEvidence(
 }
 
 /**
- * 终态时摘掉停机标记(PK 点更新)。dispatch/journal 任一侧翻终态都清,
- * 避免标记随部署单调堆积,也避免陈年标记让老行永远走快路径。
+ * 终态时按 dispatch_id 摘掉该 turn 下所有 journal 行的停机标记。
+ * 一轮 turn 有多条 journal,request_id 通常 ≠ billing_request_id,不能走 PK。
  */
-export async function clearGatewayShutdownEvidenceByRequestIds(
-  requestIds: string[],
+export async function clearGatewayShutdownEvidenceByDispatchIds(
+  dispatchIds: string[],
   exec?: JournalExec,
 ): Promise<number> {
-  const ids = [...new Set(requestIds.filter((id) => id.length > 0))]
+  const ids = [...new Set(dispatchIds.filter((id) => id.length > 0))]
   if (ids.length === 0) return 0
   const run = exec ?? (async (sql, params) => {
     const res = await query<{ request_id: string }>(sql, params ?? [])
@@ -161,7 +161,7 @@ export async function clearGatewayShutdownEvidenceByRequestIds(
   const res = await run(
     `UPDATE request_finalize_journal
         SET ctx = ctx - $2::text - $3::text
-      WHERE request_id = ANY($1::text[])
+      WHERE dispatch_id = ANY($1::uuid[])
         AND (ctx ? $2 OR ctx ? $3)
       RETURNING request_id`,
     [ids, GATEWAY_EXITED_AT_CTX_KEY, GATEWAY_EXIT_REASON_CTX_KEY],

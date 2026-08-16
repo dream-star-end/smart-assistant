@@ -21,7 +21,7 @@ import { safeEnqueueAlert } from '../admin/alertOutbox.js'
 import { isPermanentCodexWaiver, permanentCodexWaiverReason } from '../billing/codexFinalizer.js'
 import {
   GATEWAY_EXITED_AT_CTX_KEY,
-  clearGatewayShutdownEvidenceByRequestIds,
+  clearGatewayShutdownEvidenceByDispatchIds,
   markGatewayShutdownEvidence,
 } from '../billing/finalizeJournalReconciler.js'
 import { advanceClientTimelineIdentityInTransaction } from '../db/pgSessionsBackend.js'
@@ -674,32 +674,31 @@ function alertWarn(
 
 async function resolveCarrierDeadDispatchIds(
   deps: TurnDispatchReconcilerDeps,
-  rows: Array<{ dispatchId: string; billingRequestId: string }>,
+  rows: Array<{ dispatchId: string }>,
 ): Promise<string[]> {
   if (deps.listCarrierDeadDispatchIds) return deps.listCarrierDeadDispatchIds()
   return loadGatewayExitDispatchIds(deps.pool, rows)
 }
 
 /**
- * 从小集合反查停机标记:候选 dispatch 的 billing_request_id 走 journal PK,
- * 空候选不发查询。禁止扫 request_finalize_journal 全表。
+ * 从小集合按 dispatch_id 反查停机标记。一轮 turn 有多条 journal,
+ * 标记打在调用级 request_id 上,通常 ≠ billing_request_id。空候选不发查询。
  */
 export async function loadGatewayExitDispatchIds(
   pool: Pool,
-  rows: Array<{ dispatchId: string; billingRequestId: string }>,
+  rows: Array<{ dispatchId: string }>,
 ): Promise<string[]> {
-  const billingIds = [...new Set(rows.map((r) => r.billingRequestId).filter((id) => id.length > 0))]
-  if (billingIds.length === 0) return []
+  const dispatchIds = [...new Set(rows.map((r) => r.dispatchId).filter((id) => id.length > 0))]
+  if (dispatchIds.length === 0) return []
   try {
-    const res = await pool.query<{ request_id: string }>(
-      `SELECT request_id
+    const res = await pool.query<{ dispatch_id: string }>(
+      `SELECT DISTINCT dispatch_id::text AS dispatch_id
          FROM request_finalize_journal
-        WHERE request_id = ANY($1::text[])
+        WHERE dispatch_id = ANY($1::uuid[])
           AND COALESCE(ctx->>$2, '') <> ''`,
-      [billingIds, GATEWAY_EXITED_AT_CTX_KEY],
+      [dispatchIds, GATEWAY_EXITED_AT_CTX_KEY],
     )
-    const marked = new Set(res.rows.map((r) => r.request_id))
-    return rows.filter((r) => marked.has(r.billingRequestId)).map((r) => r.dispatchId)
+    return res.rows.map((r) => r.dispatch_id)
   } catch {
     return []
   }
@@ -707,19 +706,19 @@ export async function loadGatewayExitDispatchIds(
 
 async function clearExitMark(
   deps: TurnDispatchReconcilerDeps,
-  row: { billingRequestId: string },
+  row: { dispatchId: string },
 ): Promise<void> {
-  if (!row.billingRequestId) return
+  if (!row.dispatchId) return
   try {
-    await clearGatewayShutdownEvidenceByRequestIds(
-      [row.billingRequestId],
+    await clearGatewayShutdownEvidenceByDispatchIds(
+      [row.dispatchId],
       async (sql, params) => {
         const res = await deps.pool.query(sql, params ?? [])
         return { rows: res.rows as Array<{ request_id: string }>, rowCount: res.rowCount }
       },
     )
   } catch {
-    /* 终态已落,清标记失败下轮 PK 点更新可重试 */
+    /* 终态已落,清标记失败下轮可重试 */
   }
 }
 
