@@ -74,6 +74,7 @@ source "$RUNTIME_LIB"
 
 DRY=0
 FORCE_ENV=0
+ALLOW_DIRTY=0
 MODE=""
 
 die() {
@@ -106,6 +107,7 @@ usage() {
   --smoke        只读健康检查(含个人版回归)
   --status       打印当前状态
   --dry-run      与上述组合:打印将执行的命令,不改任何东西
+  --allow-dirty  仅配合 --deploy:工作区有未提交改动时仍部署(默认拒绝,见 cmd_deploy 脏门)
   --force-env    仅配合 --bootstrap:覆盖已存在的 env 文件
 
 示例:
@@ -121,6 +123,7 @@ for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY=1 ;;
     --force-env) FORCE_ENV=1 ;;
+    --allow-dirty) ALLOW_DIRTY=1 ;;
     --preflight|--bootstrap|--deploy|--smoke|--status)
       [[ -z "$MODE" ]] || die "只能指定一个主模式(已有 --$MODE,又收到 $arg)"
       MODE="${arg#--}"
@@ -139,6 +142,7 @@ done
 
 [[ -n "$MODE" ]] || { usage >&2; exit 2; }
 [[ "$FORCE_ENV" == 1 && "$MODE" != "bootstrap" ]] && die "--force-env 只能与 --bootstrap 同用"
+[[ "$ALLOW_DIRTY" == 1 && "$MODE" != "deploy" ]] && die "--allow-dirty 只能与 --deploy 同用"
 
 [[ "$REPO_ROOT" == /opt/openclaude/openclaude-v5-selfhost ]] \
   || die "必须在 /opt/openclaude/openclaude-v5-selfhost 内执行(当前 REPO_ROOT=$REPO_ROOT)。补救: cd 到该 worktree 再跑。"
@@ -1039,6 +1043,20 @@ cmd_bootstrap() {
 cmd_deploy() {
   log "══ v5 selfhost deploy ══"
   preflight_common
+  # 脏工作区门(2026-08-16):master 直接跑本 worktree 源码(unit WorkingDirectory 即
+  # REPO_ROOT),deploy 打包的是「工作区现状」而非某个 commit —— 多会话并行开发时,
+  # 任何一次 deploy/restart 都会把树上未提交的半成品一起带上线(实例:liveTurnFrames.ts
+  # 带类型错误被别的会话差点部署)。门:git status --porcelain 必须为空;确认要带脏
+  # 部署(明白会把未提交改动一并上线)显式加 --allow-dirty。
+  if [[ "$ALLOW_DIRTY" != 1 ]]; then
+    local dirty
+    dirty="$(git -C "$REPO_ROOT" status --porcelain)"
+    if [[ -n "$dirty" ]]; then
+      die "工作区不干净(存在未提交改动),deploy 会把这些半成品一起带上线:
+$dirty
+补救: 提交或 stash 后再 deploy;确要带脏部署(明白风险)加 --allow-dirty。"
+    fi
+  fi
   [[ -f "$V5_ENV" ]] || die "缺 $V5_ENV,这不是更新路径。补救: 先 --bootstrap。"
   docker network inspect openclaude-v5-net >/dev/null 2>&1 \
     || die "openclaude-v5-net 不存在。补救: 先 --bootstrap(不要在 deploy 里建网,以免误伤残留策略)。"
