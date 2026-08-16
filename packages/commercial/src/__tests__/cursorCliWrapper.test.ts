@@ -65,6 +65,10 @@ fi
 /bin/mkdir -p "$HOME/.config/cursor"
 printf '%s\\n' "\${CURSOR_API_KEY}" > "$HOME/.config/cursor/auth.json"
 printf '%s\\n' "\${CURSOR_API_KEY}" > "$OC_CURSOR_TEST_CAPTURE/key"
+if [ -n "\${OC_CURSOR_TEST_FAIL_ON_KEY:-}" ] && [ "\${CURSOR_API_KEY}" = "\${OC_CURSOR_TEST_FAIL_ON_KEY}" ]; then
+  printf '%s\\n' '{"type":"result","subtype":"error_during_execution","error":"injected"}'
+  exit 1
+fi
 if [ "\${OC_CURSOR_TEST_SLEEP:-0}" = 1 ]; then
   trap 'printf term > "$OC_CURSOR_TEST_CAPTURE/term"; exit 143' TERM
   while :; do sleep 1; done
@@ -368,6 +372,7 @@ describe('oc-cursor wrapper', () => {
       'mkdir',
       'cp',
       'chmod',
+      'date',
     ]) {
       const marker = join(f.capture, `path-hijack-${name}`)
       const shim = join(f.dir, 'bin', name)
@@ -395,6 +400,7 @@ describe('oc-cursor wrapper', () => {
       'mkdir',
       'cp',
       'chmod',
+      'date',
     ]) {
       assert.equal(
         spawnSync('test', ['!', '-e', join(f.capture, `path-hijack-${name}`)]).status,
@@ -457,14 +463,12 @@ describe('oc-cursor wrapper', () => {
     assert.equal(readFileSync(join(f.capture, 'key'), 'utf8'), 'crsr_dummy\n')
   })
 
-  test('round-robins across api-key.N slots and never prints either value', () => {
+  test('prefers the primary slot every turn while it succeeds and never writes rotation state', () => {
     const f = fixture()
     const authDir = dirname(f.auth)
     writeFileSync(join(authDir, 'api-key.2'), 'crsr_second\n', { mode: 0o600 })
     const rotation = join(f.dir, 'rotation')
     const env = { ...f.env, OC_CURSOR_KEY_ROTATION_FILE: rotation }
-    const keys: string[] = []
-    const slots: string[] = []
     for (let turn = 0; turn < 3; turn += 1) {
       const result = spawnSync(f.wrapper, ['--', 'hello'], {
         cwd: f.dir,
@@ -472,15 +476,58 @@ describe('oc-cursor wrapper', () => {
         encoding: 'utf8',
       })
       assert.equal(result.status, 0, result.stderr)
-      keys.push(readFileSync(join(f.capture, 'key'), 'utf8'))
-      slots.push(result.stderr)
+      assert.equal(readFileSync(join(f.capture, 'key'), 'utf8'), 'crsr_dummy\n')
+      assert.match(result.stderr, /credential slot 1\/2/)
       assert.doesNotMatch(`${result.stdout}${result.stderr}`, /crsr_dummy|crsr_second/)
     }
-    assert.deepEqual(keys, ['crsr_dummy\n', 'crsr_second\n', 'crsr_dummy\n'])
-    assert.match(slots[0]!, /credential slot 1\/2/)
-    assert.match(slots[1]!, /credential slot 2\/2/)
-    assert.match(slots[2]!, /credential slot 1\/2/)
-    assert.equal(readFileSync(rotation, 'utf8'), '1\n')
+    assert.equal(existsSync(rotation), false)
+  })
+
+  test('a failing primary fails over to the backup and is probed again after the cooldown', () => {
+    const f = fixture()
+    const authDir = dirname(f.auth)
+    writeFileSync(join(authDir, 'api-key.2'), 'crsr_second\n', { mode: 0o600 })
+    const rotation = join(f.dir, 'rotation')
+    const env = {
+      ...f.env,
+      OC_CURSOR_KEY_ROTATION_FILE: rotation,
+      OC_CURSOR_TEST_FAIL_ON_KEY: 'crsr_dummy',
+    }
+
+    // Primary fails: non-zero exit, failover armed with a future expiry.
+    const first = spawnSync(f.wrapper, ['--', 'hello'], {
+      cwd: f.dir,
+      env,
+      encoding: 'utf8',
+    })
+    assert.equal(first.status, 1, first.stderr)
+    assert.match(first.stderr, /credential slot 1\/2/)
+    assert.doesNotMatch(`${first.stdout}${first.stderr}`, /crsr_dummy|crsr_second/)
+    const armed = readFileSync(rotation, 'utf8').trim().split(' ')
+    assert.equal(armed[0], '1')
+    assert.ok(Number(armed[1]) > Math.floor(Date.now() / 1000))
+
+    // Cooldown still active: the backup serves and the state is untouched.
+    const second = spawnSync(f.wrapper, ['--', 'hello'], {
+      cwd: f.dir,
+      env,
+      encoding: 'utf8',
+    })
+    assert.equal(second.status, 0, second.stderr)
+    assert.match(second.stderr, /credential slot 2\/2/)
+    assert.equal(readFileSync(join(f.capture, 'key'), 'utf8'), 'crsr_second\n')
+    assert.equal(readFileSync(rotation, 'utf8').trim(), armed.join(' '))
+
+    // Cooldown elapsed: the primary is probed again and re-armed on failure.
+    writeFileSync(rotation, `1 1\n`)
+    const third = spawnSync(f.wrapper, ['--', 'hello'], {
+      cwd: f.dir,
+      env,
+      encoding: 'utf8',
+    })
+    assert.equal(third.status, 1, third.stderr)
+    assert.match(third.stderr, /credential slot 1\/2/)
+    assert.match(readFileSync(rotation, 'utf8').trim(), /^1 \d+$/)
   })
 
   test('ignores non-canonical extra names and keeps one effective slot', () => {
@@ -511,36 +558,33 @@ describe('oc-cursor wrapper', () => {
     assert.equal(existsSync(rotation), false)
   })
 
-  test('a malformed extra slot fails its own turn and rotation self-heals', () => {
+  test('a malformed failover slot fails its own turn and the pool self-heals', () => {
     const f = fixture()
     const authDir = dirname(f.auth)
     writeFileSync(join(authDir, 'api-key.2'), 'crsr_bad\ncrsr_second\n', { mode: 0o600 })
     const rotation = join(f.dir, 'rotation')
     const env = { ...f.env, OC_CURSOR_KEY_ROTATION_FILE: rotation }
 
+    // Arm the failover with a live cooldown, as a primary failure would.
+    writeFileSync(rotation, `1 ${Math.floor(Date.now() / 1000) + 3600}\n`)
+
     const first = spawnSync(f.wrapper, ['--', 'hello'], {
       cwd: f.dir,
       env,
       encoding: 'utf8',
     })
-    assert.equal(first.status, 0, first.stderr)
-    assert.equal(readFileSync(join(f.capture, 'key'), 'utf8'), 'crsr_dummy\n')
+    assert.equal(first.status, 2)
+    assert.match(first.stderr, /Cursor credential is malformed/)
+    assert.doesNotMatch(first.stderr, /crsr_bad|crsr_second/)
+    // The dead slot is skipped: wraparound back to the primary under cooldown.
+    assert.match(readFileSync(rotation, 'utf8').trim(), /^0 \d+$/)
 
     const second = spawnSync(f.wrapper, ['--', 'hello'], {
       cwd: f.dir,
       env,
       encoding: 'utf8',
     })
-    assert.equal(second.status, 2)
-    assert.match(second.stderr, /Cursor credential is malformed/)
-    assert.doesNotMatch(second.stderr, /crsr_bad|crsr_second/)
-
-    const third = spawnSync(f.wrapper, ['--', 'hello'], {
-      cwd: f.dir,
-      env,
-      encoding: 'utf8',
-    })
-    assert.equal(third.status, 0, third.stderr)
+    assert.equal(second.status, 0, second.stderr)
     assert.equal(readFileSync(join(f.capture, 'key'), 'utf8'), 'crsr_dummy\n')
   })
 })

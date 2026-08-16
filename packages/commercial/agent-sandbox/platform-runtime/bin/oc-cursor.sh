@@ -10,7 +10,9 @@
 # inside the same root-only auth directory. `api-key` stays mandatory — the
 # supervisor's mount validation gates on it, so an absent primary means the
 # credential mount itself never happened. Non-canonical extra names are
-# ignored. The slot used for a turn is announced on stderr as an index only;
+# ignored. The primary `api-key` is the preferred key: every turn uses it
+# while it works, extras are failover only (see the slot-selection comment
+# below). The slot used for a turn is announced on stderr as an index only;
 # key values are never printed.
 set -eu
 
@@ -37,7 +39,7 @@ EOF
 # it inside an `|| true` cleanup path.
 for required_tool in /usr/bin/sudo /usr/bin/test /bin/cat /bin/ls \
   /usr/bin/mktemp /bin/rm /bin/sleep /usr/bin/setsid /usr/bin/stat \
-  /usr/bin/id /bin/mkdir /bin/cp /bin/chmod; do
+  /usr/bin/id /bin/mkdir /bin/cp /bin/chmod /bin/date; do
   [ -x "$required_tool" ] || die "runtime image is missing $required_tool"
 done
 
@@ -146,20 +148,40 @@ workspace=$(pwd -P)
 # product design, but only the explicitly authorized user's container gets the
 # bind mount. Never print the value or put it in argv.
 #
-# Slot selection: round-robin across the pool so per-account rate limits and
-# quotas spread over turns. The counter lives in the container (per-user,
-# per-container lifetime) and is advanced before the key is read, so a turn
-# that dies on a malformed slot rotates past it on the next turn. Concurrent
-# turns may occasionally collide on a slot — acceptable for load spreading.
-# A single-key account keeps the byte-identical legacy path.
+# Slot selection: the primary (`api-key`) is the preferred key. Extras are
+# failover only: a turn that fails for any reason on a slot — non-zero CLI
+# exit, unreadable or malformed slot file — hands the NEXT turn to the
+# following slot (with wraparound) and starts a cooldown. Successful turns
+# never touch the state, so a healthy failover slot keeps serving until the
+# cooldown elapses; the next turn after that probes the primary again. This
+# prefers the primary without oscillating on every turn when it is down. The
+# offset+cooldown state lives in the container (per-user, per-container
+# lifetime; last writer wins under concurrent turns — acceptable, both keys
+# are interchangeable). A single-key account keeps the byte-identical legacy
+# path.
 chosen_key_file=$auth_file
+rotation_file=${OC_CURSOR_KEY_ROTATION_FILE:-/tmp/openclaude-cursor-key-rotation}
+rotation_cooldown=600
+rotation_idx=0
+rotation_exp=0
 if [ "$key_count" -gt 1 ]; then
-  rotation_file=${OC_CURSOR_KEY_ROTATION_FILE:-/tmp/openclaude-cursor-key-rotation}
-  rotation_idx=$(/bin/cat -- "$rotation_file" 2>/dev/null) || rotation_idx=0
-  case "$rotation_idx" in
-    ''|*[!0-9]*) rotation_idx=0 ;;
+  rotation_state=$(/bin/cat -- "$rotation_file" 2>/dev/null) || rotation_state=""
+  rotation_first=${rotation_state%% *}
+  rotation_rest=${rotation_state#* }
+  if [ "$rotation_rest" = "$rotation_state" ]; then rotation_rest=""; fi
+  case "$rotation_first" in
+    ''|*[!0-9]*) rotation_first=0 ;;
   esac
+  case "$rotation_rest" in
+    ''|*[!0-9]*) rotation_rest=0 ;;
+  esac
+  rotation_idx=$rotation_first
+  rotation_exp=$rotation_rest
   if [ "$rotation_idx" -ge "$key_count" ]; then rotation_idx=0; fi
+  # Cooldown elapsed (or legacy single-int state): return to the primary.
+  if [ "$rotation_idx" -gt 0 ] && [ "$(/bin/date +%s)" -ge "$rotation_exp" ]; then
+    rotation_idx=0
+  fi
   chosen_slot=$((rotation_idx + 1))
   slot_position=0
   for key_name in $key_names; do
@@ -169,16 +191,32 @@ if [ "$key_count" -gt 1 ]; then
       break
     fi
   done
-  printf '%s\n' "$chosen_slot" > "$rotation_file" 2>/dev/null || :
   echo "oc-cursor: using Cursor credential slot $chosen_slot/$key_count" >&2
 fi
-api_key=$(/usr/bin/sudo -n /bin/cat -- "$chosen_key_file" 2>/dev/null) \
-  || die "Cursor credential mount is unreadable"
-[ -n "$api_key" ] || die "Cursor credential is malformed"
+# Advance the pool past the slot that just failed. No-op for single-key
+# accounts, so their failure path stays byte-identical.
+rotation_advance() {
+  [ "$key_count" -gt 1 ] || return 0
+  rotation_next=$((rotation_idx + 1))
+  if [ "$rotation_next" -ge "$key_count" ]; then rotation_next=0; fi
+  printf '%s %s\n' "$rotation_next" "$(( $(/bin/date +%s) + rotation_cooldown ))" \
+    > "$rotation_file" 2>/dev/null || :
+}
+if ! api_key=$(/usr/bin/sudo -n /bin/cat -- "$chosen_key_file" 2>/dev/null); then
+  rotation_advance
+  die "Cursor credential mount is unreadable"
+fi
+if [ -z "$api_key" ]; then
+  rotation_advance
+  die "Cursor credential is malformed"
+fi
 carriage_return=$(printf '\r')
 case "$api_key" in
   *"
-"*|*"$carriage_return"*) die "Cursor credential is malformed" ;;
+"*|*"$carriage_return"*)
+    rotation_advance
+    die "Cursor credential is malformed"
+    ;;
 esac
 
 umask 077
@@ -277,6 +315,13 @@ child_pid=$!
 wait "$child_pid"
 status=$?
 set -e
+
+# A failed turn may be a quota/credential problem on the slot it used: hand
+# the next turn to the following slot under cooldown. Signal-terminated
+# turns (user Stop) exit through forward_signal and do not touch the state.
+if [ "$status" -ne 0 ]; then
+  rotation_advance
+fi
 
 # Shorten the lifetime of the shell copy before EXIT removes the temp HOME.
 api_key=""
