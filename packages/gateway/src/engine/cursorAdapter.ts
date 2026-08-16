@@ -14,7 +14,7 @@ import {
   type GoalStateSnapshot,
   type OutboundContentBlock,
 } from '@openclaude/protocol'
-import type { OpenClaudeConfig } from '@openclaude/storage'
+import { type OpenClaudeConfig, paths } from '@openclaude/storage'
 import type { ExecutionTarget } from '../remoteTarget.js'
 import type { EngineAdapter, EngineCapabilities, EngineTurnRun, TurnParams } from './engineAdapter.js'
 import type { EngineExternalBillingEvent, PartialSnapshot, PhantomSignals, SegmentRecord, TurnSummary, TurnToolEntry } from './engineEvents.js'
@@ -681,6 +681,10 @@ function buildCursorSpawnEnv(agentId: string, sessionKey: string): NodeJS.Proces
     PATH: '/usr/local/bin:/usr/bin:/bin',
     OC_AGENT_ID: agentId,
     OC_SESSION_KEY: sessionKey,
+    // Rebuild from a clean object, so platform CLIs cannot inherit HOME.
+    // Pin OPENCLAUDE_HOME to the storage root explicitly instead of optional
+    // passthrough; a missing gateway value must still resolve to the real home.
+    OPENCLAUDE_HOME: paths.home,
   }
   for (const key of CURSOR_SAFE_ENV_KEYS) {
     const value = process.env[key]

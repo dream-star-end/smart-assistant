@@ -4,7 +4,7 @@ import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/pr
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, test } from 'node:test'
-import type { OpenClaudeConfig } from '@openclaude/storage'
+import { type OpenClaudeConfig, paths } from '@openclaude/storage'
 import {
   CURSOR_MAX_PLATFORM_ENVELOPE_BYTES,
   CURSOR_MAX_PROMPT_ARG_BYTES,
@@ -925,6 +925,15 @@ for(const e of [
     assert.equal(server.env.OPENCLAUDE_SKILL_EVAL_EXCLUDE, 'hidden-skill')
     assert.equal(server.env.OPENCLAUDE_SKILL_EVAL_DRAFT_NAME, 'draft-skill')
     assert.equal(server.env.OPENCLAUDE_SKILL_TRAIN_RUN_ID, 'train-1')
+  })
+
+  test('always pins OPENCLAUDE_HOME on the rebuilt Cursor spawn env', () => {
+    const env = _internals.buildCursorSpawnEnv('main', 'agent:main:webchat:dm:test')
+    assert.equal(env.OPENCLAUDE_HOME, paths.home)
+    assert.equal(env.HOME, undefined)
+    assert.equal(env.PATH, '/usr/local/bin:/usr/bin:/bin')
+    assert.equal(env.OC_AGENT_ID, 'main')
+    assert.equal(env.OC_SESSION_KEY, 'agent:main:webchat:dm:test')
   })
 
   test('rejects an oversized UTF-8 prompt before spawning the Cursor wrapper', async () => {
