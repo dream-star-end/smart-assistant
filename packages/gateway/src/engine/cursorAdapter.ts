@@ -277,42 +277,92 @@ function looseValue<T>(value: unknown): T | null {
   if (!s.startsWith('[') && !s.startsWith('{')) return null
   try { return JSON.parse(s) as T } catch { /* try python repr below */ }
   try {
-    // split/join 而非 regex:占位符含控制字符,biome 禁止在正则里写控制字符。
-    const placeholder = '\u0000'
-    const quoted = s
-      .split("\\'").join(placeholder)
-      .split("'").join('"')
-      .split(placeholder).join("\\'")
-    return JSON.parse(replacePythonLiteralsOutsideStrings(quoted)) as T
+    return parsePythonReprValue(s) as T
   } catch { return null }
 }
 
-/** Python repr 的裸 True/False/None → JSON 字面量,只替换**字符串字面量之外**的
- * 词位。全局正则会把内容里的英文词一并改写({'content':'True'} → "true"),静默
- * 篡改持久化工具记录;这里用双引号字符串状态机(反斜杠转义感知)逐词判断。 */
-function replacePythonLiteralsOutsideStrings(input: string): string {
-  let out = ''
-  let inString = false
-  for (let i = 0; i < input.length; i += 1) {
-    const ch = input[i]!
-    if (inString) {
-      out += ch
-      if (ch === '\\') {
-        if (i + 1 < input.length) { out += input[i + 1]!; i += 1 }
-      } else if (ch === '"') inString = false
-      continue
-    }
-    if (ch === '"') { inString = true; out += ch; continue }
-    const match = /^(?:True|False|None)\b/.exec(input.slice(i))
-    if (match) {
-      const word = match[0]
-      out += word === 'True' ? 'true' : word === 'False' ? 'false' : 'null'
-      i += word.length - 1
-      continue
-    }
-    out += ch
+/** Cursor 部分版本的 args 结构化值是 Python repr 字符串(单引号定界、True/False/None、
+ * \' 转义)。**绝不做任何文本改写后再 JSON.parse**:引号全局替换会让"内容里嵌双引号"
+ * 的输入歪打正着解析成功、内容被静默截断/重组成假键值(codex 复审反例)。这里直接
+ * 递归下降解析出 JS 值:单引号字符串内的任意字符(含双引号)原样保留;任何不认识
+ * 的 token 立即抛出 → looseValue 整体回退原始值(宁可不归一化,不可篡改)。 */
+function parsePythonReprValue(input: string): unknown {
+  let pos = 0
+  const ws = (): void => {
+    while (pos < input.length && /\s/.test(input[pos]!)) pos += 1
   }
-  return out
+  const parseValue = (): unknown => {
+    ws()
+    const ch = input[pos]!
+    if (ch === '[') {
+      pos += 1
+      const items: unknown[] = []
+      ws()
+      if (input[pos] === ']') { pos += 1; return items }
+      for (;;) {
+        items.push(parseValue())
+        ws()
+        if (input[pos] === ',') { pos += 1; continue }
+        if (input[pos] === ']') { pos += 1; return items }
+        throw new Error(`repr list: unexpected ${JSON.stringify(input[pos])} at ${pos}`)
+      }
+    }
+    if (ch === '{') {
+      pos += 1
+      const obj: Record<string, unknown> = {}
+      ws()
+      if (input[pos] === '}') { pos += 1; return obj }
+      for (;;) {
+        ws()
+        const key = parseString()
+        ws()
+        if (input[pos] !== ':') throw new Error(`repr object: expected ':' at ${pos}`)
+        pos += 1
+        obj[key] = parseValue()
+        ws()
+        if (input[pos] === ',') { pos += 1; continue }
+        if (input[pos] === '}') { pos += 1; return obj }
+        throw new Error(`repr object: unexpected ${JSON.stringify(input[pos])} at ${pos}`)
+      }
+    }
+    if (ch === '"' || ch === "'") return parseString()
+    const rest = input.slice(pos)
+    if (rest.startsWith('True')) { if (!/True\b/.test(rest)) throw new Error('bad True'); pos += 4; return true }
+    if (rest.startsWith('False')) { if (!/False\b/.test(rest)) throw new Error('bad False'); pos += 5; return false }
+    if (rest.startsWith('None')) { if (!/None\b/.test(rest)) throw new Error('bad None'); pos += 4; return null }
+    const num = /^[+-]?(?:\d+\.?\d*(?:[eE][+-]?\d+)?|\.\d+(?:[eE][+-]?\d+)?)/.exec(rest)
+    if (num) { pos += num[0].length; return Number(num[0]) }
+    throw new Error(`repr value: unexpected ${JSON.stringify(ch)} at ${pos}`)
+  }
+  const parseString = (): string => {
+    ws()
+    const quote = input[pos]!
+    if (quote !== '"' && quote !== "'") throw new Error(`repr string: expected quote at ${pos}`)
+    pos += 1
+    let out = ''
+    for (;;) {
+      if (pos >= input.length) throw new Error('repr string: unterminated')
+      const ch = input[pos]!
+      if (ch === quote) { pos += 1; return out }
+      if (ch === '\\') {
+        const next = input[pos + 1]
+        if (next === undefined) throw new Error('repr string: dangling escape')
+        if (next === 'n') out += '\n'
+        else if (next === 't') out += '\t'
+        else if (next === 'r') out += '\r'
+        else if (next === "'" || next === '"' || next === '\\') out += next
+        else { out += ch; out += next }
+        pos += 2
+        continue
+      }
+      out += ch
+      pos += 1
+    }
+  }
+  const value = parseValue()
+  ws()
+  if (pos !== input.length) throw new Error(`repr trailing input at ${pos}`)
+  return value
 }
 
 /** Cursor 的 TODO_STATUS_* 枚举 → 产品 TodoWrite 的 pending/in_progress/completed。 */

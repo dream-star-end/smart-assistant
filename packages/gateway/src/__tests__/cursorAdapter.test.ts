@@ -218,8 +218,9 @@ describe('CursorAdapter', () => {
     }
     if (input.todos[0]!.status !== 'pending') throw new Error('bare literal not converted')
 
-    // 内容里嵌双引号的 repr 无法无损转换 → 必须整体原样回退(raw args 包装),
-    // 绝不产出被改写的"成功解析"。审计 blocker 的契约:宁可不归一化,不可篡改。
+    // 内容里嵌双引号:repr 解析器(单引号定界)必须逐字保留并成功归一化 ——
+    // 旧"引号替换+JSON.parse"路线对这种输入要么解析失败回退、要么歪打正着
+    // 篡改内容(codex 审计/复审两轮 blocker)。
     const ambiguous = {
       type: 'tool_call',
       tool_call: {
@@ -231,13 +232,11 @@ describe('CursorAdapter', () => {
         },
       },
     }
-    const rawInput = _internals.toolInputOf(ambiguous as never) as Record<string, unknown> & {
-      args?: { todos?: string }
+    const parsed = _internals.toolInputOf(ambiguous as never) as { todos: Array<{ content: string; status: string }> }
+    if (parsed.todos?.[0]?.content !== '带 "双引号" 的 True 文案') {
+      throw new Error(`embedded dquote content not verbatim: ${JSON.stringify(parsed)}`)
     }
-    if (rawInput.todos !== undefined) throw new Error('ambiguous repr must not parse into todos')
-    if (rawInput.args?.todos !== `[{'content': '带 "双引号" 的 True 文案', 'status': 'TODO_STATUS_PENDING'}]`) {
-      throw new Error('raw fallback must preserve the original value verbatim')
-    }
+    if (parsed.todos[0]!.status !== 'pending') throw new Error('status not normalized 3')
 
     // 裸 True/False/None + 嵌套引号内容混合:allowMultiple 是裸 False → false;
     // 选项文案里的词保留;反斜杠转义不吞字符。
@@ -260,6 +259,44 @@ describe('CursorAdapter', () => {
     if (askInput.questions[0]!.multiSelect !== undefined) throw new Error('bare False not converted to false')
     if (askInput.questions[0]!.options[0]!.label !== 'None') throw new Error('option label rewritten')
     if (askInput.questions[0]!.options[1]!.label !== 'keep True') throw new Error('option label rewritten 2')
+  })
+
+  test('python repr with embedded double quotes parses with content verbatim (codex re-audit)', () => {
+    // 复审反例:内容里嵌双引号 + 裸 True。旧"全局引号替换"路线会把它歪打正着
+    // 解析成 {"content":"a","flag":true,"tail":"b"} —— 内容被静默截断重组。
+    // repr 解析器必须逐字保留单引号字符串内容(含双引号),裸 True 只在字符串外。
+    const embedded = {
+      type: 'tool_call',
+      tool_call: {
+        id: 't-repr-embedded-dquote',
+        updateTodosToolCall: {
+          args: {
+            todos: `[{'content': 'a", "flag": True, "tail": "b', 'status': 'TODO_STATUS_PENDING'}]`,
+          },
+        },
+      },
+    }
+    const input = _internals.toolInputOf(embedded as never) as { todos: Array<{ content: string; status: string }> }
+    if (input.todos?.[0]?.content !== 'a", "flag": True, "tail": "b') {
+      throw new Error(`content not verbatim: ${JSON.stringify(input)}`)
+    }
+    if (input.todos[0]!.status !== 'pending') throw new Error('status not normalized')
+
+    // 转义单引号 \' 与转义反斜杠在内容里按字面还原。
+    const escaped = {
+      type: 'tool_call',
+      tool_call: {
+        id: 't-repr-escaped',
+        updateTodosToolCall: {
+          args: { todos: `[{'content': 'it\\'s a C:\\path True', 'status': 'TODO_STATUS_COMPLETED'}]` },
+        },
+      },
+    }
+    const escInput = _internals.toolInputOf(escaped as never) as { todos: Array<{ content: string; status: string }> }
+    if (escInput.todos?.[0]?.content !== "it's a C:\\path True") {
+      throw new Error(`escapes not resolved: ${JSON.stringify(escInput)}`)
+    }
+    if (escInput.todos[0]!.status !== 'completed') throw new Error('status not normalized 2')
   })
 
   test('keeps raw cursor args when stringified todos cannot be parsed', () => {
