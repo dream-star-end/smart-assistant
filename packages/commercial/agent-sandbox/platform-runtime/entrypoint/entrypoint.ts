@@ -61,6 +61,7 @@ import {
   assertVolumeAncestryNoSymlink,
   buildSeedAgent,
   decidePersonaWrite,
+  decideSystemCliLinkAction,
   DEV_FALLBACK_SEED_DOC,
   isPathWithin,
   resolvePlatformCodexSkillsDir,
@@ -493,9 +494,15 @@ if ((process.env.OC_ENTRYPOINT_VALIDATE_ONLY || "").trim() === "1") {
 // 看不到 `/run/oc/platform/current/bin`。用户 profile 会稳定把 `~/.local/bin` 加回
 // PATH，因此为 platform-bundle 新增但镜像尚未内置的 CLI 安装保留名链接。
 // Cursor/Grok spawn 另钉 PATH=/usr/local/bin:/usr/bin:/bin 且不传 HOME，login shell
-// 的 ~/.profile 加不回去，所以同一批 CLI 还要在 /usr/local/bin 留指向 bundle 的只读软链
-// （与镜像 COPY 的 oc-memory 一样能被直接敲到）。agent 对 /usr/local/bin 无写权限时
-// 走 `sudo -n ln -s`（镜像已给 NOPASSWD）。不覆盖普通文件/目录/异向链接。
+// 的 ~/.profile 加不回去，所以同一批 CLI 还要在 /usr/local/bin 留指向 bundle 的只读软链。
+// agent 对 /usr/local/bin 无写权限时走 `sudo -n ln -s`（镜像已给 NOPASSWD）。
+//
+// 默认不覆盖普通文件/目录/异向链接（防误删用户或其他组件放在 /usr/local/bin 的东西）。
+// 唯一例外:镜像 COPY 的 oc-memory 是预编译前的 tsx-only 旧壳（Dockerfile 钉死
+// RUNTIME_IMAGE，日常部署不重建）。decideSystemCliLinkAction 只在内容命中该旧壳
+// 指纹时 unlink 再链到 bundle 新壳。新壳 exec 的是 /usr/local/bin/node + cjs，
+// 不是再 exec oc-memory，所以 /usr/local/bin/oc-memory → bundle/bin/oc-memory
+// 不会成环（bundle 那份是普通文件，current 只链到 bundles/<rev>）。
 const PLATFORM_BIN_DIR = "/run/oc/platform/current/bin";
 const USER_PLATFORM_BIN_DIR = "/home/agent/.local/bin";
 const SYSTEM_PLATFORM_BIN_DIR = "/usr/local/bin";
@@ -506,6 +513,7 @@ const PLATFORM_LINKED_CLIS = [
   "oc-video",
   "oc-cursor",
   "oc-task",
+  "oc-memory",
 ] as const;
 for (const cliName of PLATFORM_LINKED_CLIS) {
   const source = join(PLATFORM_BIN_DIR, cliName);
@@ -529,10 +537,40 @@ for (const cliName of PLATFORM_LINKED_CLIS) {
     }
     try {
       const systemTarget = lstatSync(systemLink);
-      if (!systemTarget.isSymbolicLink() || readlinkSync(systemLink) !== source) {
+      const isSymbolicLink = systemTarget.isSymbolicLink();
+      const isFile = systemTarget.isFile();
+      const linkTarget = isSymbolicLink ? readlinkSync(systemLink) : null;
+      const fileContent = isFile && !isSymbolicLink ? readFileSync(systemLink, "utf8") : null;
+      const systemLinkAction = decideSystemCliLinkAction({
+        cliName,
+        exists: true,
+        isSymbolicLink,
+        isFile,
+        linkTarget,
+        desiredTarget: source,
+        fileContent,
+      });
+      if (systemLinkAction === "preserve") {
         console.error(
           `[entrypoint] WARN: reserved ${systemLink} already exists with an unexpected target; preserved`,
         );
+      } else if (systemLinkAction === "replace-stale-wrapper") {
+        try {
+          unlinkSync(systemLink);
+        } catch (unlinkErr) {
+          if ((unlinkErr as NodeJS.ErrnoException).code !== "EACCES") throw unlinkErr;
+          execFileSync("/usr/bin/sudo", ["-n", "/bin/rm", "--", systemLink], {
+            stdio: "pipe",
+          });
+        }
+        try {
+          symlinkSync(source, systemLink);
+        } catch (symlinkErr) {
+          if ((symlinkErr as NodeJS.ErrnoException).code !== "EACCES") throw symlinkErr;
+          execFileSync("/usr/bin/sudo", ["-n", "/bin/ln", "-s", "--", source, systemLink], {
+            stdio: "pipe",
+          });
+        }
       }
     } catch (systemLinkErr) {
       if ((systemLinkErr as NodeJS.ErrnoException).code !== "ENOENT") throw systemLinkErr;
