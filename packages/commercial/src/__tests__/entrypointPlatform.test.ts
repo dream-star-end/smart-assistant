@@ -483,20 +483,31 @@ describe("entrypoint.sh 分流 + entrypoint.ts 关键不变量", () => {
     const src = readFileSync(ENTRYPOINT_TS, "utf8");
     assert.match(src, /const PLATFORM_BIN_DIR = "\/run\/oc\/platform\/current\/bin"/);
     assert.match(src, /const USER_PLATFORM_BIN_DIR = "\/home\/agent\/\.local\/bin"/);
+    assert.match(src, /const SYSTEM_PLATFORM_BIN_DIR = "\/usr\/local\/bin"/);
     assert.match(
       src,
       /const PLATFORM_LINKED_CLIS = \[\s*"oc-plugin",\s*"oc-ocr",\s*"oc-h3",\s*"oc-video",\s*"oc-cursor",\s*"oc-task",\s*\] as const/,
     );
     assert.match(src, /const source = join\(PLATFORM_BIN_DIR, cliName\)/);
     assert.match(src, /const userLink = join\(USER_PLATFORM_BIN_DIR, cliName\)/);
+    assert.match(src, /const systemLink = join\(SYSTEM_PLATFORM_BIN_DIR, cliName\)/);
     assert.match(src, /lstatSync\(userLink\)/);
     assert.match(src, /readlinkSync\(userLink\) !== source/);
     assert.match(src, /symlinkSync\(source, userLink\)/);
+    assert.match(src, /lstatSync\(systemLink\)/);
+    assert.match(src, /readlinkSync\(systemLink\) !== source/);
+    assert.match(src, /symlinkSync\(source, systemLink\)/);
+    assert.match(src, /execFileSync\("\/usr\/bin\/sudo", \["-n", "\/bin\/ln", "-s", "--", source, systemLink\]/);
     assert.match(src, /already exists with an unexpected target; preserved/);
     assert.doesNotMatch(
       src,
       /unlinkSync\(userLink\)/,
       "entrypoint 不得删除用户已有的普通文件、目录或异向链接",
+    );
+    assert.doesNotMatch(
+      src,
+      /unlinkSync\(systemLink\)/,
+      "entrypoint 不得删除 /usr/local/bin 已有的普通文件、目录或异向链接",
     );
 
     const validateOnlyIdx = src.indexOf('if ((process.env.OC_ENTRYPOINT_VALIDATE_ONLY || "").trim() === "1")');

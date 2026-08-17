@@ -20,7 +20,7 @@
  *   零额外依赖。
  */
 
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import {
   chownSync,
@@ -492,9 +492,13 @@ if ((process.env.OC_ENTRYPOINT_VALIDATE_ONLY || "").trim() === "1") {
 // Debian `/etc/profile` 会在 `bash -lc` 中重置 Dockerfile 注入的 PATH，导致 Codex
 // 看不到 `/run/oc/platform/current/bin`。用户 profile 会稳定把 `~/.local/bin` 加回
 // PATH，因此为 platform-bundle 新增但镜像尚未内置的 CLI 安装保留名链接。
-// 不覆盖普通文件/目录/异向链接：这些异常只告警，避免 entrypoint 擅自删除用户内容。
+// Cursor/Grok spawn 另钉 PATH=/usr/local/bin:/usr/bin:/bin 且不传 HOME，login shell
+// 的 ~/.profile 加不回去，所以同一批 CLI 还要在 /usr/local/bin 留指向 bundle 的只读软链
+// （与镜像 COPY 的 oc-memory 一样能被直接敲到）。agent 对 /usr/local/bin 无写权限时
+// 走 `sudo -n ln -s`（镜像已给 NOPASSWD）。不覆盖普通文件/目录/异向链接。
 const PLATFORM_BIN_DIR = "/run/oc/platform/current/bin";
 const USER_PLATFORM_BIN_DIR = "/home/agent/.local/bin";
+const SYSTEM_PLATFORM_BIN_DIR = "/usr/local/bin";
 const PLATFORM_LINKED_CLIS = [
   "oc-plugin",
   "oc-ocr",
@@ -506,6 +510,7 @@ const PLATFORM_LINKED_CLIS = [
 for (const cliName of PLATFORM_LINKED_CLIS) {
   const source = join(PLATFORM_BIN_DIR, cliName);
   const userLink = join(USER_PLATFORM_BIN_DIR, cliName);
+  const systemLink = join(SYSTEM_PLATFORM_BIN_DIR, cliName);
   try {
     if (!existsSync(source)) {
       throw new Error(`platform ${cliName} source is missing`);
@@ -521,6 +526,24 @@ for (const cliName of PLATFORM_LINKED_CLIS) {
     } catch (linkErr) {
       if ((linkErr as NodeJS.ErrnoException).code !== "ENOENT") throw linkErr;
       symlinkSync(source, userLink);
+    }
+    try {
+      const systemTarget = lstatSync(systemLink);
+      if (!systemTarget.isSymbolicLink() || readlinkSync(systemLink) !== source) {
+        console.error(
+          `[entrypoint] WARN: reserved ${systemLink} already exists with an unexpected target; preserved`,
+        );
+      }
+    } catch (systemLinkErr) {
+      if ((systemLinkErr as NodeJS.ErrnoException).code !== "ENOENT") throw systemLinkErr;
+      try {
+        symlinkSync(source, systemLink);
+      } catch (symlinkErr) {
+        if ((symlinkErr as NodeJS.ErrnoException).code !== "EACCES") throw symlinkErr;
+        execFileSync("/usr/bin/sudo", ["-n", "/bin/ln", "-s", "--", source, systemLink], {
+          stdio: "pipe",
+        });
+      }
     }
   } catch (platformLinkErr) {
     console.error(
