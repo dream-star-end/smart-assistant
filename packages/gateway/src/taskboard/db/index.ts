@@ -17,7 +17,12 @@ import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { paths } from '@openclaude/storage'
 import Database from 'better-sqlite3'
-import { TASKBOARD_DDL_V1, TASKBOARD_SCHEMA_VERSION, type TaskboardDb } from './schema.js'
+import {
+  TASKBOARD_DDL_V1,
+  TASKBOARD_DDL_V2,
+  TASKBOARD_SCHEMA_VERSION,
+  type TaskboardDb,
+} from './schema.js'
 import { ensureSettingsRow } from './settings.js'
 
 export * from './schema.js'
@@ -30,6 +35,9 @@ export * from './comments.js'
 export * from './activity.js'
 export * from './seed.js'
 export * from './settings.js'
+export * from './costStats.js'
+export * from './templates.js'
+export * from './weeklyReport.js'
 
 let _db: TaskboardDb | null = null
 let _walTimer: ReturnType<typeof setInterval> | null = null
@@ -49,6 +57,9 @@ export function migrate(db: TaskboardDb): void {
   const apply = db.transaction(() => {
     if (current < 1) {
       db.exec(TASKBOARD_DDL_V1)
+    }
+    if (current < 2) {
+      db.exec(TASKBOARD_DDL_V2)
     }
     db.pragma(`user_version = ${TASKBOARD_SCHEMA_VERSION}`)
     ensureSettingsRow(db)

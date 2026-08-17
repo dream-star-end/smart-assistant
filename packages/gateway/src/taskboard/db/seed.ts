@@ -38,7 +38,7 @@ const PLACEHOLDERS =
   '{{ticket.identifier}} {{ticket.title}} {{ticket.body}} ' +
   '{{last_run.summary}} {{comments}} {{stage.exit_checklist}}'
 
-interface StageSeed {
+export interface StageSeed {
   name: string
   kind: 'ai' | 'human'
   agentId: string | null
@@ -370,11 +370,62 @@ export interface SeedResult {
   skippedStages: number
 }
 
-export function seedDefaultPipelines(db: TaskboardDb, projectId: string): SeedResult {
+export function builtinTemplateId(type: TicketType): string {
+  return `builtin:${type}`
+}
+
+export function parseBuiltinTemplateId(id: string): TicketType | null {
+  const m = /^builtin:(bug|feature|spike|chore)$/.exec(id.trim())
+  return m ? (m[1] as TicketType) : null
+}
+
+export interface BuiltinPipelineTemplate {
+  id: string
+  ticketType: TicketType
+  name: string
+  stages: StageSeed[]
+  patrolCron: string
+  quietHoursStart: number
+  quietHoursEnd: number
+  timeoutSec: number
+  circuitBreakerThreshold: number
+}
+
+/** 内置模板 = 种子流水线,同一份定义。id 形如 builtin:bug。 */
+export function listBuiltinPipelineTemplates(): BuiltinPipelineTemplate[] {
+  return PIPELINES.map((pipe) => ({
+    id: builtinTemplateId(pipe.type),
+    ticketType: pipe.type,
+    name: pipe.name,
+    stages: pipe.stages,
+    patrolCron: DEFAULT_PATROL_CRON,
+    quietHoursStart: GUARDRAIL_DEFAULTS.quietHoursStart,
+    quietHoursEnd: GUARDRAIL_DEFAULTS.quietHoursEnd,
+    timeoutSec: GUARDRAIL_DEFAULTS.defaultTimeoutSec,
+    circuitBreakerThreshold: GUARDRAIL_DEFAULTS.circuitBreakerThreshold,
+  }))
+}
+
+export function getBuiltinPipelineTemplate(idOrType: string): BuiltinPipelineTemplate | null {
+  const type = parseBuiltinTemplateId(idOrType) ?? (idOrType as TicketType)
+  return listBuiltinPipelineTemplates().find((t) => t.ticketType === type) ?? null
+}
+
+/**
+ * 给项目种默认流水线。types 缺省 = 四种全种;传入子集则只种那些类型。
+ * 幂等:已有确定性 id 的 pipeline/stage 跳过,不覆盖用户改过的提示词。
+ */
+export function seedDefaultPipelines(
+  db: TaskboardDb,
+  projectId: string,
+  types?: TicketType[],
+): SeedResult {
   const project = db.prepare('SELECT id FROM tb_project WHERE id = ?').get(projectId) as
     | { id: string }
     | undefined
   if (!project) throw new TaskboardNotFound('project', projectId)
+
+  const selected = types?.length ? PIPELINES.filter((p) => types.includes(p.type)) : PIPELINES
 
   const result: SeedResult = {
     projectId,
@@ -385,7 +436,7 @@ export function seedDefaultPipelines(db: TaskboardDb, projectId: string): SeedRe
   }
 
   const seed = db.transaction(() => {
-    for (const pipe of PIPELINES) {
+    for (const pipe of selected) {
       const pid = pipelineSeedId(projectId, pipe.type)
       if (getPipeline(db, pid)) {
         result.skippedPipelines += 1

@@ -12,9 +12,11 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, describe, it } from 'node:test'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import Database from 'better-sqlite3'
 import { createActivity, listActivities } from '../db/activity.js'
 import { createComment, listComments } from '../db/comments.js'
 import {
+  TASKBOARD_DDL_V1,
   TASKBOARD_SCHEMA_VERSION,
   TaskboardCrossProjectError,
   TaskboardCycleError,
@@ -57,7 +59,7 @@ afterEach(() => {
 })
 
 describe('schema / migrate', () => {
-  it('建表后 user_version=1,重复 migrate 不报错不改版本', () => {
+  it('建表后 user_version=2,重复 migrate 不报错不改版本', () => {
     const { db } = freshDb()
     assert.equal(getSchemaVersion(db), TASKBOARD_SCHEMA_VERSION)
     migrate(db)
@@ -70,6 +72,7 @@ describe('schema / migrate', () => {
     assert.deepEqual(names, [
       'tb_pipeline',
       'tb_pipeline_stage',
+      'tb_pipeline_template',
       'tb_project',
       'tb_settings',
       'tb_ticket',
@@ -92,6 +95,36 @@ describe('schema / migrate', () => {
     assert.ok(names.has('idx_tb_ticket_run_ticket_created'))
     assert.ok(names.has('idx_tb_ticket_run_stage_status'))
     assert.ok(names.has('idx_tb_ticket_activity_ticket_created'))
+    db.close()
+  })
+
+  it('v1 库 migrate 到 v2 只加模板表,已有项目行保留', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'oc-tb-v1-'))
+    dirs.push(dir)
+    const path = join(dir, 'taskboard.db')
+    const raw = new Database(path)
+    raw.pragma('foreign_keys = ON')
+    raw.exec(TASKBOARD_DDL_V1)
+    raw.pragma('user_version = 1')
+    raw
+      .prepare(
+        `INSERT INTO tb_project (id, key, name, description, workspace, labels, archived_at, created_at, updated_at, next_ticket_seq)
+         VALUES ('p1', 'OLD', '旧项目', NULL, NULL, '[]', NULL, 1, 1, 0)`,
+      )
+      .run()
+    raw.close()
+    const db = openTaskboardDb(path)
+    assert.equal(getSchemaVersion(db), 2)
+    const tables = db
+      .prepare(
+        `SELECT name FROM sqlite_master WHERE type='table' AND name = 'tb_pipeline_template'`,
+      )
+      .all() as { name: string }[]
+    assert.equal(tables.length, 1)
+    const project = db.prepare(`SELECT key FROM tb_project WHERE id = 'p1'`).get() as {
+      key: string
+    }
+    assert.equal(project.key, 'OLD')
     db.close()
   })
 })

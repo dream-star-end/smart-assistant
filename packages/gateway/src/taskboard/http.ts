@@ -14,6 +14,7 @@ import { filterUserVisibleAgentsForManagement, isHiddenSystemAgentId } from '../
 import { verifyJwt } from '../auth.js'
 import { createActivity, listActivities } from './db/activity.js'
 import { createComment, listComments } from './db/comments.js'
+import { COST_GROUP_BY, queryCostStats, ymdRangeMs } from './db/costStats.js'
 import {
   TaskboardCrossProjectError,
   TaskboardCycleError,
@@ -56,7 +57,16 @@ import {
   getUsage,
   updateSettings,
 } from './db/settings.js'
+import {
+  applyTemplate,
+  applyTemplates,
+  createTemplateFromPipeline,
+  deleteTemplate,
+  getTemplate,
+  listTemplates,
+} from './db/templates.js'
 import { createTicket, getTicketByIdOrIdentifier, listTickets, updateTicket } from './db/tickets.js'
+import { buildWeeklyReport, currentWeekPeriod, periodFromIsoWeek } from './db/weeklyReport.js'
 import {
   type Actor,
   type AuthorKind,
@@ -84,6 +94,7 @@ import {
 } from './domain.js'
 import { parseEntryCondition } from './entryCondition.js'
 import { getSharedPatrolSlots, stageLoopCountOnProgress } from './guardrails.js'
+import { zonedYmd } from './notify.js'
 import { TaskboardTransitionDenied, assertTransition } from './stateMachine.js'
 
 export type { TaskboardSettings, TaskboardUsage }
@@ -704,6 +715,43 @@ async function dispatch(
     return sendError(res, 405, 'method not allowed')
   }
 
+  if (path === '/api/board/stats/cost') {
+    if (method === 'GET') return handleCostStats(res, url, db)
+    return sendError(res, 405, 'method not allowed')
+  }
+
+  if (path === '/api/board/reports/weekly') {
+    if (method === 'GET') return handleWeeklyReport(res, url, db)
+    return sendError(res, 405, 'method not allowed')
+  }
+
+  if (path === '/api/board/templates') {
+    if (method === 'GET') return handleListTemplates(res, db)
+    if (method === 'POST') return handleCreateTemplate(res, await readJsonBody(req), db)
+    return sendError(res, 405, 'method not allowed')
+  }
+
+  const templateApply = path.match(/^\/api\/board\/templates\/([^/]+)\/apply$/)
+  if (templateApply) {
+    if (method === 'POST') {
+      return handleApplyTemplate(
+        res,
+        await readJsonBody(req),
+        db,
+        decodeURIComponent(templateApply[1]),
+      )
+    }
+    return sendError(res, 405, 'method not allowed')
+  }
+
+  const templateItem = path.match(/^\/api\/board\/templates\/([^/]+)$/)
+  if (templateItem) {
+    const id = decodeURIComponent(templateItem[1])
+    if (method === 'GET') return handleGetTemplate(res, db, id)
+    if (method === 'DELETE') return handleDeleteTemplate(res, db, id)
+    return sendError(res, 405, 'method not allowed')
+  }
+
   sendError(res, 404, 'not found', { code: 'not_found' })
 }
 
@@ -731,7 +779,12 @@ function handleCreateProject(
         workspace: asNullableString(body.workspace) ?? null,
         labels: asStringArray(body.labels) ?? [],
       })
-      seedDefaultPipelines(db, project.id)
+      const templateIds = asStringArray(body.templateIds)
+      if (templateIds === undefined) {
+        seedDefaultPipelines(db, project.id)
+      } else if (templateIds.length > 0) {
+        applyTemplates(db, project.id, templateIds)
+      }
       return project
     })()
     sendJson(res, 201, { ok: true, project: created })
@@ -1881,4 +1934,158 @@ function handlePatchSettings(
   if (typeof body.patrolPaused === 'boolean') patch.patrolPaused = body.patrolPaused
   const settings = updateSettings(db, patch)
   sendJson(res, 200, { ok: true, ...settings, usage: getUsage(db) })
+}
+
+// ── M4:成本统计 / 周报 / 流水线模板 ─────────────────────────────────────────
+
+const YMD_RE = /^\d{4}-\d{2}-\d{2}$/
+
+function requireYmd(raw: string | null, field: string): string | undefined {
+  if (raw == null || raw === '') return undefined
+  if (!YMD_RE.test(raw)) throw new TaskboardValidationError(`invalid ${field}: ${raw}`)
+  return raw
+}
+
+function addDaysYmd(ymd: string, delta: number): string {
+  const [y, m, d] = ymd.split('-').map(Number)
+  const utc = Date.UTC(y, m - 1, d) + delta * 86_400_000
+  const dt = new Date(utc)
+  const yy = dt.getUTCFullYear()
+  const mm = String(dt.getUTCMonth() + 1).padStart(2, '0')
+  const dd = String(dt.getUTCDate()).padStart(2, '0')
+  return `${yy}-${mm}-${dd}`
+}
+
+function handleCostStats(res: ServerResponse, url: URL, db: TaskboardDb): void {
+  const timeZone = asString(url.searchParams.get('timeZone') ?? undefined) ?? 'Asia/Shanghai'
+  const today = zonedYmd(new Date(), timeZone)
+  const fromYmd = requireYmd(url.searchParams.get('from'), 'from') ?? addDaysYmd(today, -6)
+  const toYmd = requireYmd(url.searchParams.get('to'), 'to') ?? today
+  if (fromYmd > toYmd) throw new TaskboardValidationError('from must be <= to')
+  const groupRaw = url.searchParams.get('groupBy')
+  const groupBy =
+    groupRaw == null || groupRaw === ''
+      ? undefined
+      : (COST_GROUP_BY as readonly string[]).includes(groupRaw)
+        ? (groupRaw as (typeof COST_GROUP_BY)[number])
+        : (() => {
+            throw new TaskboardValidationError(`invalid groupBy: ${groupRaw}`)
+          })()
+  const projectRef = url.searchParams.get('projectId')
+  const project = projectRef ? resolveProject(db, projectRef) : null
+  if (projectRef && !project) throw new TaskboardNotFound('project', projectRef)
+  const ticketRef = url.searchParams.get('ticketId')
+  const ticket = ticketRef ? getTicketByIdOrIdentifier(db, ticketRef) : null
+  if (ticketRef && !ticket) throw new TaskboardNotFound('ticket', ticketRef)
+  const stageId = url.searchParams.get('stageId') || undefined
+  const { fromMs, toMs } = ymdRangeMs(fromYmd, toYmd, timeZone)
+  const stats = queryCostStats(db, {
+    fromMs,
+    toMs,
+    projectId: project?.id,
+    ticketId: ticket?.id,
+    stageId,
+    groupBy,
+    timeZone,
+  })
+  sendJson(res, 200, {
+    from: fromYmd,
+    to: toYmd,
+    timeZone,
+    groupBy: groupBy ?? null,
+    totals: stats.totals,
+    buckets: stats.buckets,
+  })
+}
+
+function handleWeeklyReport(res: ServerResponse, url: URL, db: TaskboardDb): void {
+  const timeZone = asString(url.searchParams.get('timeZone') ?? undefined) ?? 'Asia/Shanghai'
+  const weekRaw = url.searchParams.get('week')
+  const fromRaw = requireYmd(url.searchParams.get('from'), 'from')
+  const toRaw = requireYmd(url.searchParams.get('to'), 'to')
+  let period = currentWeekPeriod(new Date(), timeZone)
+  if (weekRaw) {
+    const parsed = periodFromIsoWeek(weekRaw, timeZone)
+    if (!parsed) throw new TaskboardValidationError(`invalid week: ${weekRaw}`)
+    period = parsed
+  } else if (fromRaw && toRaw) {
+    if (fromRaw > toRaw) throw new TaskboardValidationError('from must be <= to')
+    const range = ymdRangeMs(fromRaw, toRaw, timeZone)
+    period = {
+      week: `${fromRaw}/${toRaw}`,
+      fromYmd: fromRaw,
+      toYmd: toRaw,
+      fromMs: range.fromMs,
+      toMs: range.toMs,
+      timeZone,
+    }
+  }
+  const projectRef = url.searchParams.get('projectId')
+  const project = projectRef ? resolveProject(db, projectRef) : null
+  if (projectRef && !project) throw new TaskboardNotFound('project', projectRef)
+  const report = buildWeeklyReport(db, {
+    fromMs: period.fromMs,
+    toMs: period.toMs,
+    fromYmd: period.fromYmd,
+    toYmd: period.toYmd,
+    week: period.week,
+    projectId: project?.id,
+    timeZone,
+  })
+  sendJson(res, 200, { report })
+}
+
+function handleListTemplates(res: ServerResponse, db: TaskboardDb): void {
+  sendJson(res, 200, { items: listTemplates(db) })
+}
+
+function handleGetTemplate(res: ServerResponse, db: TaskboardDb, id: string): void {
+  const template = getTemplate(db, id)
+  if (!template) throw new TaskboardNotFound('template', id)
+  sendJson(res, 200, { template })
+}
+
+function handleCreateTemplate(
+  res: ServerResponse,
+  body: Record<string, unknown>,
+  db: TaskboardDb,
+): void {
+  const pipelineId = asString(body.pipelineId)
+  if (!pipelineId) throw new TaskboardValidationError('pipelineId is required')
+  const template = createTemplateFromPipeline(db, {
+    pipelineId,
+    name: asString(body.name),
+    slug: asString(body.slug),
+  })
+  sendJson(res, 201, { ok: true, template })
+}
+
+function handleDeleteTemplate(res: ServerResponse, db: TaskboardDb, id: string): void {
+  deleteTemplate(db, id)
+  sendJson(res, 200, { ok: true })
+}
+
+function handleApplyTemplate(
+  res: ServerResponse,
+  body: Record<string, unknown>,
+  db: TaskboardDb,
+  templateId: string,
+): void {
+  const projectRef = asString(body.projectId)
+  if (!projectRef) throw new TaskboardValidationError('projectId is required')
+  const project = resolveProject(db, projectRef)
+  if (!project) throw new TaskboardNotFound('project', projectRef)
+  const asDefault = asBoolean(body.asDefault)
+  const result = applyTemplate(db, templateId, project.id, {
+    asDefault,
+  })
+  sendJson(res, 200, {
+    ok: true,
+    template: result.template,
+    pipeline: result.pipeline,
+    createdPipelines: result.createdPipelines,
+    createdStages: result.createdStages,
+    skippedPipelines: result.skippedPipelines,
+    skippedStages: result.skippedStages,
+  })
 }

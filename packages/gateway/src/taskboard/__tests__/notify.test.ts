@@ -38,8 +38,6 @@ const dirs: string[] = []
 const WORK = new Date('2026-08-17T02:00:00.000Z')
 /** 上海周一 00:00,落在静默。 */
 const QUIET = new Date('2026-08-16T16:00:00.000Z')
-/** 上海周一 20:00,简报点。 */
-const DIGEST_AT = new Date('2026-08-17T12:00:00.000Z')
 
 function freshDb(): TaskboardDb {
   const dir = mkdtempSync(join(tmpdir(), 'oc-tb-notify-'))
@@ -368,7 +366,7 @@ describe('每日简报', () => {
       reporter: 'user:default',
       status: 'done',
     })
-    updateTicket(db, done.id, done.version, { closedAt: WORK.getTime() })
+    updateTicket(db, done.id, done.version, { closedAt: done.createdAt })
     createTicket(db, {
       projectId: project.id,
       type: 'feature',
@@ -383,8 +381,9 @@ describe('每日简报', () => {
       reporter: 'user:default',
       status: 'blocked',
     })
-    const stats = collectDigestStats(db, '2026-08-17')
-    assert.equal(stats.date, '2026-08-17')
+    const day = zonedYmd(new Date(done.createdAt))
+    const stats = collectDigestStats(db, day)
+    assert.equal(stats.date, day)
     assert.ok(stats.created >= 3)
     assert.equal(stats.waitingHuman, 1)
     assert.equal(stats.blocked.length, 1)
@@ -394,22 +393,24 @@ describe('每日简报', () => {
     assert.match(copy.bodyMd, /待我确认 1/)
     assert.match(copy.bodyMd, /成本未统计/)
 
+    const [y, m, d] = day.split('-').map(Number)
+    const digestAt = new Date(Date.UTC(y, m - 1, d, 12, 0, 0))
     const cap = capture()
     const n = new TaskboardNotifier({
       getDb: () => db,
       transport: cap.transport,
-      now: () => DIGEST_AT.getTime(),
+      now: () => digestAt.getTime(),
     })
     await n.onDigestTick({
       db,
-      at: DIGEST_AT,
+      at: digestAt,
       settings: updateSettings(db, { quietHoursStart: 23, quietHoursEnd: 8 }),
     })
     assert.equal(cap.inbox.length, 1)
-    assert.equal(cap.inbox[0].deliveryKey, 'taskboard-digest:2026-08-17')
+    assert.equal(cap.inbox[0].deliveryKey, digestOutboundId(day))
     await n.onDigestTick({
       db,
-      at: DIGEST_AT,
+      at: digestAt,
       settings: updateSettings(db, { quietHoursStart: 23, quietHoursEnd: 8 }),
     })
     assert.equal(cap.inbox.length, 1, '同一天简报幂等')

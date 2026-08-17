@@ -30,7 +30,7 @@ import type Database from 'better-sqlite3'
 export type TaskboardDb = Database.Database
 
 /** 当前 schema 版本。加列时递增,并在 migrate() 里补一段 < N 的 ALTER。 */
-export const TASKBOARD_SCHEMA_VERSION = 1
+export const TASKBOARD_SCHEMA_VERSION = 2
 
 /** 项目 key:大写字母开头,2–12 位 [A-Z0-9]。创建后冻结。 */
 export const PROJECT_KEY_RE = /^[A-Z][A-Z0-9]{1,11}$/
@@ -204,6 +204,23 @@ CREATE TABLE IF NOT EXISTS tb_settings (
   max_stage_loops INTEGER NOT NULL,
   max_runs_per_tick INTEGER NOT NULL,
   patrol_paused INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL
+);
+`
+
+/**
+ * v2:自定义流水线模板。内置四条(bug/feature/spike/chore)仍以 seed.ts 为唯一真源,
+ * 不写入本表,避免和种子分叉。本表只存用户从已有流水线快照出来的自定义模板。
+ * CREATE IF NOT EXISTS,对已有 v1 库向前兼容,不改已有表、不碰已有行。
+ */
+export const TASKBOARD_DDL_V2 = `
+CREATE TABLE IF NOT EXISTS tb_pipeline_template (
+  id TEXT PRIMARY KEY,
+  slug TEXT NOT NULL UNIQUE,
+  name TEXT NOT NULL,
+  ticket_type TEXT,
+  stages_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
 `

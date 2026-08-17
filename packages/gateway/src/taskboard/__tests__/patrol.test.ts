@@ -381,6 +381,32 @@ describe('依赖 / 日配额 / 准入', () => {
     assert.ok(skipped.some((r) => r.skipReason === 'blocked_by_dependency'))
     db.close()
   })
+
+  it('今日 run 数达 maxRunsPerDay → skipped daily_quota', async () => {
+    const db = freshDb()
+    const { ticket } = seedReadyAi(db, { maxRunsPerDay: 1, onSuccess: 'stay' })
+    const eng = engine(db, okDelegate())
+    const first = await eng.tick(WORK)
+    assert.equal(first.started, 1)
+    const second = await eng.tick(WORK)
+    assert.equal(second.started, 0)
+    const skipped = listRuns(db, { ticketId: ticket.id, status: 'skipped' }).items
+    assert.ok(skipped.some((r) => r.skipReason === 'daily_quota'))
+    db.close()
+  })
+
+  it('不满足 entry_condition → skipped entry_condition', async () => {
+    const db = freshDb()
+    const { ticket } = seedReadyAi(db, {
+      entryCondition: 'has_body_section("复现步骤")',
+    })
+    const eng = engine(db, okDelegate())
+    const report = await eng.tick(WORK)
+    assert.equal(report.started, 0)
+    const skipped = listRuns(db, { ticketId: ticket.id, status: 'skipped' }).items
+    assert.ok(skipped.some((r) => r.skipReason === 'entry_condition'))
+    db.close()
+  })
 })
 
 describe('成本回填', () => {
@@ -569,6 +595,8 @@ function seedReadyAi(
     patrolCron?: string
     quietHoursStart?: number
     quietHoursEnd?: number
+    maxRunsPerDay?: number
+    entryCondition?: string | null
   } = {},
 ): {
   ticket: ReturnType<typeof createTicket>
@@ -596,10 +624,11 @@ function seedReadyAi(
     patrolTimezone: 'Asia/Shanghai',
     quietHoursStart: stageOver.quietHoursStart ?? 0,
     quietHoursEnd: stageOver.quietHoursEnd ?? 0,
-    maxRunsPerDay: 20,
+    maxRunsPerDay: stageOver.maxRunsPerDay ?? 20,
     circuitBreakerThreshold: stageOver.circuitBreakerThreshold ?? 3,
     onSuccess: stageOver.onSuccess ?? 'wait_human',
     onFailure: stageOver.onFailure ?? 'retry',
+    entryCondition: stageOver.entryCondition ?? null,
   })
   const ticket = createTicket(db, {
     projectId: project.id,
