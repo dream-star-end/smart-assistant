@@ -548,7 +548,7 @@ for(const e of [
     }
   })
 
-  test('rebuilds platform and MCP context for every turn on one adapter', async () => {
+  test('rebuilds platform and MCP context for every stateless turn on one adapter', async () => {
     const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-multiturn-'))
     const fake = path.join(dir, 'fake.cjs')
     const capture = path.join(dir, 'captures.jsonl')

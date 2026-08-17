@@ -1221,6 +1221,10 @@ function buildCursorSpawnEnv(agentId: string, sessionKey: string): NodeJS.Proces
     // Pin OPENCLAUDE_HOME to the storage root explicitly instead of optional
     // passthrough; a missing gateway value must still resolve to the real home.
     OPENCLAUDE_HOME: paths.home,
+    // oc-cursor replaces HOME with /tmp/openclaude-cursor.*. Policy files live
+    // under the storage root; this pin is the lease locator even if a later
+    // wrapper drops OPENCLAUDE_HOME. CCB/Codex do not use this spawn env.
+    OC_MEMORY_POLICY_HOME: paths.home,
   }
   for (const key of CURSOR_SAFE_ENV_KEYS) {
     const value = process.env[key]

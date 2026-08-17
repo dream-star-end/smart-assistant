@@ -5,16 +5,17 @@
  * in cache-friendly order: static content first (rarely changes), dynamic last.
  *
  * Slot order(实际生效顺序;按 cache-friendly 静态在前、动态在后排):
- *   1. SOUL              — Agent persona (CLAUDE.md / SOUL.md), rarely changes
- *   2. USER              — User identity & preferences (USER.md), rarely changes
- *   3. AGENTS            — Platform capabilities, agent list, provider tips (semi-static)
- *   4. SKILLS            — Agent 自有 skill summaries (semi-static)
- *   5. SKILLS_LITERATURE — 平台供给文献检索能力 (personal: commercial 反向钩子;v3 容器: master GET fetch;两条路径互斥;none 时不出现)
- *   6. MEMORY            — Agent notes (MEMORY.md), changes frequently
- *   7. TOOLS             — Tool usage hints, learning system instructions (static reference)
- *   8. MODEL_HINT        — per-model 行为补丁 (personal: commercial 反向钩子;v3 容器: master GET fetch;两条路径互斥;none 时不出现)
- *   9. RESEARCH          — 用户显式选中的科研模式守则 (effortLevel='max')
- *   10. REPO             — 当前会话 GitHub repo 绑定快照 (离 user 消息最近)
+ *   1. ENV               — 当轮实测的稳定环境事实(uid/实例/宿主通道/快照),容器生命周期内不变
+ *   2. SOUL              — Agent persona (CLAUDE.md / SOUL.md), rarely changes
+ *   3. USER              — User identity & preferences (USER.md), rarely changes
+ *   4. AGENTS            — Platform capabilities, agent list, provider tips (semi-static)
+ *   5. SKILLS            — Agent 自有 skill summaries (semi-static)
+ *   6. SKILLS_LITERATURE — 平台供给文献检索能力 (personal: commercial 反向钩子;v3 容器: master GET fetch;两条路径互斥;none 时不出现)
+ *   7. MEMORY            — Agent notes (MEMORY.md), changes frequently
+ *   8. TOOLS             — Tool usage hints, learning system instructions (static reference)
+ *   9. MODEL_HINT        — per-model 行为补丁 (personal: commercial 反向钩子;v3 容器: master GET fetch;两条路径互斥;none 时不出现)
+ *   10. RESEARCH         — 用户显式选中的科研模式守则 (effortLevel='max')
+ *   11. REPO             — 当前会话 GitHub repo 绑定快照 (离 user 消息最近)
  *
  * 文案通道边界(设计 §4.2,两通道不重叠):
  *   - **per-model / 随计费** 的 slot(MODEL_HINT、SKILLS_LITERATURE 等)→ 权威在
@@ -29,6 +30,7 @@
 import { existsSync, readFileSync } from 'node:fs'
 import {
   type SkillStore,
+  MemoryDir,
   buildAgentSkillStore,
   paths,
   readAgentsConfig,
@@ -41,6 +43,7 @@ import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 import { listCollaboratorAgents } from './collaboratorAgents.js'
 import { isTextOnlyStaticVisionModel, shouldEnableOpenClaudeVision } from './mcpVisionServer.js'
 import { getPlatformPrompt } from './platformPrompts.js'
+import { buildEnvSlot } from './envProbe.js'
 
 // ── 平台静态 prompt 文案的个人版 fallback 常量(见文件头「文案通道边界」)──
 //
@@ -119,53 +122,22 @@ const PLATFORM_CAPABILITIES_FALLBACK = `# Platform capabilities
 - 登录二维码/验证码/一次性链接失效或用户要求刷新时,必须重新获取最新页面或截图,用文件修改时间或哈希确认不是旧文件,随后立刻把新文件放到 generated 目录并在回复中给出路径;禁止复用旧二维码或只口头说“已刷新”。
 `
 
-/** `# Memory` 常驻指令段;{{MEMORY_DIR}}/{{MEMORY_MD}}/{{MEMORY_INDEX}} 由
+/** `# Memory` 常驻指令段;{{MEMORY_DIR}}/{{MEMORY_MD}}/{{USER_MD}} 由
  *  renderMemoryInstructions 注入运行时值。对应 prompts/memory-instructions.md。 */
 const MEMORY_INSTRUCTIONS_FALLBACK = `# Memory
 
-长期记忆默认不进入新会话。当前请求和当前可验证事实永远优先。
+当前请求优先。有「当前索引」时先看钩子;正文按需 Read。
 
-## 何时检索
+检索:缺存量事实/决定/偏好,或用户提连续性(之前/继续/还记得)时才 \`oc-memory core-search "<主题>"\`,命中后 Read。已自足、忽略历史、或与当前事实冲突则不搜。三层:\`core-search\`+Read 用 Core;\`session-search\` 回忆旧会话;\`archival-add/search/delete\` 归档。高频→Core,详细→Archival。
 
-- 仅当缺少某项具体的存量用户事实、决定或偏好就无法准确完成当前任务,或用户明确表示连续性(如“之前/继续/还记得/按照我的持仓”)时,才运行 \`oc-memory core-search "<具体主题>"\`;命中后按结果路径用 Read 分段读取正文。
-- 当前请求信息已经自足时直接回答;不要仅因主题相似或“可能有用”搜索记忆。Core 不会预加载,无关查询也会返回 No match。
-- \`session-search\` / \`archival-search\` 仍只用于用户明确要求回忆旧会话、历史或已保存/归档资料的场景;不得用它们探索性扫描过去内容。
-- 用户说“忽略历史/从头开始”时,本轮不要搜索、采用或提及记忆。
-- 时间敏感事实不能由旧记忆覆盖当前消息或当前状态。
+写入:明确“记住”或长期默认且范围清楚才写;项目决定/可复用纠正可收尾写;拿不准留本会话。一次性/未确认/可查/寒暄/密钥隐私不写。**写前必须先对同一主题 \`oc-memory core-search\`**;命中则更新,禁止近重复。
 
-## 何时写
+四类:\`user\` 偏好;\`feedback\` 纠正(Why/How);\`project\` 决定;\`reference\` 资料。
 
-用户明确要求“记住”,或信息被明确表述为长期默认/未来会话均适用,且范围清楚时才写。项目关键决定、可复用纠正也可在任务收尾时写。拿不准是否长期有效时留在当前会话,不要写入 Core。
-
-**每次写 Core 前必须先对同一主题运行 \`oc-memory core-search\`**;命中则更新已有文件,避免近似重复。
-
-## 四类记忆
-
-- **user** — 用户的长期偏好。
-- **feedback** — 可复用纠正,写清 Why / How to apply。
-- **project** — 项目关键事实与决定。
-- **reference** — 稳定可复用资料。
-
-## 何时不写
-
-一次性细节、未经确认的推断、可随时查询的信息、纯寒暄,以及任何密钥/token/密码/隐私原文都不写。
-
-## 怎么保存(两步,直接用原生文件工具;没有 \`oc-memory memory\` 命令)
-
-1. 用 Write 在 \`{{MEMORY_DIR}}/\` 新建 \`<slug>.md\`,带 frontmatter:
-   \`\`\`markdown
-   ---
-   name: <kebab-slug>
-   description: <一句话召回摘要>
-   type: user | feedback | project | reference
-   ---
-   <正文>
-   \`\`\`
-2. 用 Edit 往 \`{{MEMORY_MD}}\` 追加 \`- [标题](memory/<slug>.md) — 一句话钩子\`。
-
-更新优先于新建。删除错误/过时记忆时同步删除文件和索引行。索引与正文不会自动进入上下文。
-
-只有用户明确说某偏好是“默认/所有未来会话”都适用时,才可把它放进 \`{{USER_MD}}\` 的 \`<!-- oc-user-always:start -->\` 与 \`<!-- oc-user-always:end -->\` 之间;普通身份、背景和项目资料仍按需检索。
+保存(Write/Edit;无 \`oc-memory memory\`):
+1. Write \`{{MEMORY_DIR}}/<slug>.md\`,frontmatter:\`name\`/\`description\`/\`type\`
+2. Edit \`{{MEMORY_MD}}\` 追加 \`- [标题](memory/<slug>.md) — 钩子\`
+更新优先;删时同步删文件和索引。仅明确“默认/所有未来会话”的偏好才写入 \`{{USER_MD}}\` 的 \`<!-- oc-user-always:start -->\`/\`<!-- oc-user-always:end -->\`。
 `
 
 const WECHAT_VISION_HINT_PLACEHOLDER = '{{WECHAT_VISION_HINT}}'
@@ -217,13 +189,17 @@ export interface PromptSlot {
 // ── 记忆注入预算(注入侧唯一权威,与存储写侧解耦)──
 //
 // memdir 范式下存储层不再有「Core 记忆字符硬预算」:每条记忆一个文件、MEMORY.md 只存
-// 索引。注入成本只由这两个 cap 在读侧控制,与磁盘上实际存了多少解耦。
-//   - 索引常驻注入,MemoryDir.renderForInjection 逐行 scan 后按此上限截断(超出附提示行)。
-//   - 用户画像整段注入,buildUserSlot 按此上限截断(超出附提示行)。
-// 存储层写多少都不拒,注入侧只取前 N 字符 —— 这是「触发少」问题的解:指令段常驻、
+// 索引。注入成本只由这些 cap 在读侧控制,与磁盘上实际存了多少解耦。
+//   - 索引常驻注入:buildMemorySlot → MemoryDir.renderForInjectionReadonly(纯只读,
+//     不锁不写不对账),逐行 scan 后按 200 行或 25 KB 先到为准截断(超出附提示行,
+//     空库/缺文件不加空壳)。自愈对账留给写入路径,不在 prompt 热路径上做。
+//   - 用户画像整段注入,buildUserSlot 按 USER_PROFILE_INJECT_MAX_CHARS 截断(超出附提示行)。
+// 存储层写多少都不拒,注入侧只取前 N —— 这是「触发少」问题的解:指令段常驻、
 // 索引常驻,不依赖存量规模。
-// 导出:memory/user API 把它作为响应里的 `limit` 回报给 UI(memdir 下不再有写侧硬预算,
+// 导出:memory/user API 把 user cap 作为响应里的 `limit` 回报给 UI(memdir 下不再有写侧硬预算,
 // 此 cap = user.md 实际会被注入的上限,也是 UI 预算条唯一有意义的界)。单一权威。
+export const MEMORY_INDEX_INJECT_MAX_CHARS = 25 * 1024
+export const MEMORY_INDEX_INJECT_MAX_LINES = 200
 export const USER_PROFILE_INJECT_MAX_CHARS = 4000
 const USER_ALWAYS_START = '<!-- oc-user-always:start -->'
 const USER_ALWAYS_END = '<!-- oc-user-always:end -->'
@@ -459,15 +435,13 @@ export async function buildSkillsSlot(ctx: PromptSlotContext): Promise<PromptSlo
 }
 
 /**
- * 渲染 `# Memory` 段常驻指令 + 当前索引。
+ * 渲染 `# Memory` 段常驻指令(不含索引)。
  *
- * 结构对标 Claude Code 的 `# Memory`:何时写 / 四类记忆各配示例 / 何时不写 /
- * 两步保存(写文件 + 加索引行)/ 更新优先于新建 / 删错误记忆 / 按需 Read 正文 /
+ * 结构对标 Claude Code 的 `# Memory`:何时检索 / 何时写 / 四类记忆 /
+ * 两步保存(写文件 + 加索引行)/ 更新优先于新建 / 写前 core-search 去重 /
  * 显式绝对路径。写入动作全部走引擎原生 Write/Edit —— memdir 范式下**不再有**
- * `oc-memory memory` 子命令。
- *
- * `index` 为 null(仅 marker / 空)时,指令段照样常驻,索引段落降级为「(空)」。
- * 这是「记忆触发少」问题的根治点:指令不依赖存量,永远在系统提示里。
+ * `oc-memory memory` 子命令。索引由 buildMemorySlot 经
+ * MemoryDir.renderForInjectionReadonly 另行拼接;空库不加「当前索引」空壳。
  */
 function renderMemoryInstructions(args: { memoryDir: string; memoryMd: string; userMd: string }): string {
   return getPlatformPrompt('memory-instructions', MEMORY_INSTRUCTIONS_FALLBACK)
@@ -477,13 +451,25 @@ function renderMemoryInstructions(args: { memoryDir: string; memoryMd: string; u
 }
 
 export async function buildMemorySlot(ctx: PromptSlotContext): Promise<PromptSlot> {
+  const instructions = renderMemoryInstructions({
+    memoryDir: paths.agentMemoryDir(ctx.agentId),
+    memoryMd: paths.agentMemoryMd(ctx.agentId),
+    userMd: paths.sharedUserMd,
+  })
+  let index: string | null = null
+  try {
+    index = await new MemoryDir(ctx.agentId).renderForInjectionReadonly(
+      MEMORY_INDEX_INJECT_MAX_CHARS,
+      MEMORY_INDEX_INJECT_MAX_LINES,
+    )
+  } catch {
+    // 只读失败不能拖垮系统提示构建,静默不注入索引即可。
+    index = null
+  }
+  if (!index) return { name: 'MEMORY', content: instructions }
   return {
     name: 'MEMORY',
-    content: renderMemoryInstructions({
-      memoryDir: paths.agentMemoryDir(ctx.agentId),
-      memoryMd: paths.agentMemoryMd(ctx.agentId),
-      userMd: paths.sharedUserMd,
-    }),
+    content: `${instructions}\n\n## 当前索引\n\n${index}`,
   }
 }
 
@@ -491,6 +477,8 @@ export const _memoryInternals = {
   renderMemoryInstructions,
   extractUserAlwaysBlock,
   USER_PROFILE_INJECT_MAX_CHARS,
+  MEMORY_INDEX_INJECT_MAX_CHARS,
+  MEMORY_INDEX_INJECT_MAX_LINES,
 }
 
 export function buildToolsSlot(): PromptSlot {
@@ -499,17 +487,9 @@ export function buildToolsSlot(): PromptSlot {
     content: [
       '# 学习系统',
       '',
-      '## 三层记忆',
+      '## 记忆工具',
       '',
-      '| 层级 | 怎么用 | 容量 | 何时用 |',
-      '|------|------|------|--------|',
-      '| Core | `oc-memory core-search "<query>"` 后按路径 Read/Write/Edit | 按需检索 | 稳定偏好、项目决定与明确反馈 |',
-      '| Recall | 在 Bash 里运行 `oc-memory session-search "<query>"` | 无限 | 回忆过去对话内容 |',
-      '| Archival | 在 Bash 里运行 `oc-memory archival-add/archival-search/archival-delete` | 无限 | 详细知识、文档、代码模式(需搜索才可见) |',
-      '',
-      'Core 记忆先用 `oc-memory core-search` 按需查找,再直接编辑文件;已经**没有** `oc-memory memory` 命令;',
-      'Recall / Archival 仍是 `oc-memory` 命令行工具(在 Bash 里运行),不是独立工具调用。详见 `skill_view("memory-management")`。',
-      '**原则**: 高频→Core(直接写文件), 详细→Archival, Core 里某条太长→迁到 Archival',
+      '`oc-memory core-search` / `session-search` / `archival-add|search|delete`(Bash)。规则见上方 `# Memory`;详情 `skill_view("memory-management")`。',
       '',
       '## 定时任务',
       '',
@@ -1077,6 +1057,15 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
   // 一般而言两者在 fetch 返回前都早完成。
   const remotePlatformSlotsPromise = fetchPlatformSlotsFromMaster(ctx)
 
+  // Layer 0: 当轮实测的稳定环境事实。放在 SOUL 之前,避免被基线 CLAUDE.md
+  // 「你运行在商业版容器」自述误导(自用实例注入同一份基线)。失败则整段省略。
+  try {
+    const envSlot = buildEnvSlot(ctx)
+    if (envSlot) slots.push(envSlot)
+  } catch {
+    /* 探针异常不能拖垮系统提示构建 */
+  }
+
   // Layer 1: Static identity
   const soul = buildSoulSlot(ctx)
   if (soul) slots.push(soul)
@@ -1129,7 +1118,8 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
   }
 
   // Layer 3: Dynamic context
-  // MEMORY 段常驻(memdir 范式):指令段不依赖存量,索引为空也注入,故 buildMemorySlot 恒返 slot。
+  // MEMORY 段常驻(memdir 范式):指令段不依赖存量,故 buildMemorySlot 恒返 slot;
+  // 有效索引行才拼接「当前索引」,空库/全被 scan 剔除时不加空壳。
   const memory = await buildMemorySlot(ctx)
   slots.push(memory)
 

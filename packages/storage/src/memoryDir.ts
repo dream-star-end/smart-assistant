@@ -11,8 +11,13 @@
 //     per-agent 锁,与 gateway(UI PUT)/ mcp-memory 双进程写互斥。
 //   - 幂等懒迁移:老 §-blob 首次被读到时(首行非 marker)拆成文件 + 建索引 + 备份原 blob。
 //   - 读侧对账(reconcileIndex)是权威自愈:索引缺文件补行、行指向不存在文件剔除。
-//   - 注入(renderForInjection)逐行 scanMemoryContent 过滤 + 超 cap 截断——模型直写文件
-//     会绕过写侧校验,读侧扫描才是安全权威兜底。
+//   - 注入有两条路径,语义刻意不同:
+//       renderForInjection          — 带锁 + ensureMigrated + reconcileIndex(会写盘),
+//         给 API/对账/测试用,自愈索引。
+//       renderForInjectionReadonly  — 纯只读,不锁、不写、不对账;prompt 热路径必须走这条,
+//         缺文件/空库/读失败一律 null,漂移(死链/孤儿)原样容忍。
+//     两条都逐行 scanMemoryContent 过滤 + 超 cap 截断。模型直写文件会绕过写侧校验,
+//     读侧扫描才是安全权威兜底。
 
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
@@ -756,30 +761,62 @@ export class MemoryDir {
   }
 
   /**
-   * 渲染索引供 system prompt 注入:
-   *  ensureMigrated → reconcileIndex → 逐行 scanMemoryContent 过滤(剔注入行)→
-   *  超 maxChars 截断(附提示行)。marker 本身不注入(内部不变量)。
-   *  索引为空(仅 marker、无有效行)→ 返回 null(由 gateway 决定是否仍注入指令段)。
+   * 把索引文本滤成可注入正文:跳过 marker/空行,逐行 scan,超 cap 按行边界截断。
+   * 两条注入路径共用,保证截断/扫描口径一致。
    */
-  async renderForInjection(maxChars: number): Promise<string | null> {
+  private formatIndexLinesForInjection(
+    indexText: string,
+    maxChars: number,
+    maxLines: number,
+  ): string | null {
+    const kept: string[] = []
+    for (const line of indexText.split('\n')) {
+      const t = line.trim()
+      if (t === '' || t === MEMDIR_INDEX_MARKER) continue
+      if (!scanMemoryContent(line).ok) continue // 读侧权威扫描:剔除注入行
+      kept.push(line)
+    }
+    if (kept.length === 0) return null
+    const notice = '\n…（索引已截断，用 `oc-memory core-search` 查完整列表）'
+    const lineLimited = kept.length > maxLines ? kept.slice(0, maxLines) : kept
+    let result = lineLimited.join('\n')
+    if (kept.length <= maxLines && result.length <= maxChars) return result
+    const budget = Math.max(0, maxChars - notice.length)
+    return this.truncateAtLine(lineLimited, budget) + notice
+  }
+
+  /**
+   * 渲染索引供 system prompt 注入(带锁自愈路径):
+   *  ensureMigrated → reconcileIndex → 滤行/截断。会写回索引、空库会落 marker。
+   *  **prompt 热路径不要用这个**;生产注入走 renderForInjectionReadonly。
+   *  本方法语义保持给 API/对账/既有测试:调用后磁盘可能变化。
+   *
+   *  默认 200 行 / 由调用方传入的字符上限对齐 Claude Code MEMORY.md
+   *  (200 行或 25 KB,先到为准)。
+   */
+  async renderForInjection(maxChars: number, maxLines = 200): Promise<string | null> {
     return this.withSharedBarrier(async () => {
       await this.ensureMigratedLocked()
       const indexText = await this.reconcileIndexLocked()
-      const kept: string[] = []
-      for (const line of indexText.split('\n')) {
-        const t = line.trim()
-        if (t === '' || t === MEMDIR_INDEX_MARKER) continue
-        if (!scanMemoryContent(line).ok) continue // 读侧权威扫描:剔除注入行
-        kept.push(line)
-      }
-      if (kept.length === 0) return null
-      let result = kept.join('\n')
-      if (result.length > maxChars) {
-        const notice = '\n…（记忆索引较长已截断,按需 Read 对应记忆文件查看完整内容）'
-        const budget = Math.max(0, maxChars - notice.length)
-        result = this.truncateAtLine(kept, budget) + notice
-      }
-      return result
+      return this.formatIndexLinesForInjection(indexText, maxChars, maxLines)
     })
+  }
+
+  /**
+   * prompt 热路径专用:纯只读渲染索引。
+   *  - 不取共享屏障 / 文件锁,不 ensureMigrated,不 reconcileIndex,不写盘。
+   *  - 索引文件缺失、为空、仅 marker、有效行全被 scan 剔除 → null。
+   *  - 漂移容忍:死链行照注,memory/ 里的孤儿文件不补进索引(因为根本不对账)。
+   *  - 任何读/解析异常(含并发写撕成半截导致 readFile 抛错)→ null,不抛给调用方。
+   *    MemoryDir 自己的写用 temp+rename,读者看到的是完整旧文件或完整新文件;
+   *    引擎原生 Write/Edit 可能就地覆盖,那时宁可本轮不注入也不能阻塞 turn。
+   */
+  async renderForInjectionReadonly(maxChars: number, maxLines = 200): Promise<string | null> {
+    try {
+      const raw = await readFile(this.indexPath(), 'utf-8')
+      return this.formatIndexLinesForInjection(normalizeEol(raw), maxChars, maxLines)
+    } catch {
+      return null
+    }
   }
 }

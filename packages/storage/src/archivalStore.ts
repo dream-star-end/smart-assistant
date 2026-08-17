@@ -1,13 +1,15 @@
 // ArchivalStore — Long-term knowledge storage (the "Archival" layer in
 // Letta/MemGPT-inspired tiered memory).
 //
-// Unlike Core Memory (USER.md + MEMORY.md) which is always in the system
-// prompt, Archival Memory is searched on demand via FTS5.
+// Unlike Core Memory (USER.md always-block + MEMORY.md index, injected into
+// the system prompt; Core file bodies are retrieved on demand), Archival
+// Memory is searched on demand via FTS5.
 // Capacity is unlimited — stored in the same SQLite as sessions.
 //
 // Use cases: API docs, project architecture notes, code patterns,
 // detailed procedures that don't fit in the 4K MEMORY.md budget.
 
+import { migrateArchivalFtsCjk, registerFtsCjkFunctions } from './ftsCjkMigrate.js'
 import { literalFtsQuery } from './ftsQuery.js'
 import { getSessionsDb } from './sessionsDb.js'
 
@@ -51,33 +53,10 @@ async function _runInit(): Promise<void> {
       );
     `)
 
-    // Migrate triggers: the old archival_ad / archival_au used the special
-    // FTS5 'delete' INSERT command which fails with "SQL logic error" in some
-    // SQLite builds and cross-process scenarios.  Drop and recreate all three
-    // triggers so existing databases also get the corrected version.
-    // CREATE TRIGGER IF NOT EXISTS would silently keep a broken old definition.
-    db.exec(`
-      DROP TRIGGER IF EXISTS archival_ai;
-      DROP TRIGGER IF EXISTS archival_ad;
-      DROP TRIGGER IF EXISTS archival_au;
-
-      -- INSERT: add new row to FTS index.
-      CREATE TRIGGER archival_ai AFTER INSERT ON archival BEGIN
-        INSERT INTO archival_fts(rowid, content, tags) VALUES (new.rowid, new.content, new.tags);
-      END;
-
-      -- DELETE: remove FTS row via standard DML (rowid lookup).
-      -- Avoids the fragile FTS5 special 'delete' command.
-      CREATE TRIGGER archival_ad AFTER DELETE ON archival BEGIN
-        DELETE FROM archival_fts WHERE rowid = old.rowid;
-      END;
-
-      -- UPDATE: replace FTS row only when indexed columns actually change.
-      CREATE TRIGGER archival_au AFTER UPDATE OF content, tags ON archival BEGIN
-        DELETE FROM archival_fts WHERE rowid = old.rowid;
-        INSERT INTO archival_fts(rowid, content, tags) VALUES (new.rowid, new.content, new.tags);
-      END;
-    `)
+    // CJK pre-tokenize (idempotent). Must run after archival / archival_fts
+    // exist and after oc_fts_cjk_tokens is registered on this handle.
+    registerFtsCjkFunctions(db)
+    migrateArchivalFtsCjk(db)
 
     // Self-heal orphan FTS rows. Root cause observed 2026-04-17: an old
     // archival row was deleted via a path that bypassed the AFTER DELETE

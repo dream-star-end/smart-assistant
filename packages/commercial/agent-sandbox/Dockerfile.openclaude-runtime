@@ -734,6 +734,8 @@ RUN set -eux; \
             npm install --include=dev --ignore-scripts --no-audit --no-fund || \
             echo "[build] WARN: claude-code-best npm install failed, ccb spawn 模式可能不可用"; \
     fi; \
+    bash packages/mcp-memory/scripts/build-oc-memory-cli.sh; \
+    test -s /opt/openclaude/packages/mcp-memory/dist/oc-memory.cjs; \
     npm cache clean --force; \
     rm -rf /root/.npm /tmp/* /var/tmp/*
 RUN chown -R agent:agent /opt/openclaude
