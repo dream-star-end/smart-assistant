@@ -68,6 +68,17 @@ export interface TaskCreateArgs {
   assignee?: string
 }
 
+const CLIENT_FORBIDDEN_CREATE_KEYS = ['identifier', 'id', 'userId', 'version'] as const
+
+function rejectClientAssignedTicketIds(args: object): TaskToolResult | null {
+  const raw = args as Record<string, unknown>
+  const hit = CLIENT_FORBIDDEN_CREATE_KEYS.filter((key) => key in raw)
+  if (hit.length === 0) return null
+  return toolError(
+    `编号由服务端生成,不接受客户端指定 identifier / id / userId / version(本次含: ${hit.join(', ')})`,
+  )
+}
+
 /**
  * 建单 body。identifier / version / id / userId / originSessionKey 都不从 args 收:
  * identifier 服务端生成;originSessionKey 从 MCP 进程 env 注入。
@@ -113,6 +124,8 @@ export async function handleTaskCreate(
   env: NodeJS.ProcessEnv = process.env,
   fetchImpl: typeof fetch = fetch,
 ): Promise<TaskToolResult> {
+  const forbidden = rejectClientAssignedTicketIds(args)
+  if (forbidden) return forbidden
   if (!args.projectId?.trim() || !args.type || !args.title?.trim()) {
     return toolError('projectId、type、title 必填')
   }

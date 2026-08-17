@@ -352,6 +352,7 @@ export const TOOLS = [
         assignee: { type: 'string', description: 'user:<id> 或 agent:<agentId>' },
       },
       required: ['projectId', 'type', 'title'],
+      additionalProperties: false,
     },
   },
   {
@@ -375,6 +376,7 @@ export const TOOLS = [
         blockedReason: { type: 'string' },
       },
       required: ['id', 'expectedVersion'],
+      additionalProperties: false,
     },
   },
   {
@@ -391,6 +393,7 @@ export const TOOLS = [
         runId: { type: 'string', description: '可选,关联某次 run' },
       },
       required: ['id', 'body'],
+      additionalProperties: false,
     },
   },
   {
@@ -414,6 +417,7 @@ export const TOOLS = [
         limit: { type: 'number' },
         offset: { type: 'number' },
       },
+      additionalProperties: false,
     },
   },
   {
@@ -428,6 +432,7 @@ export const TOOLS = [
         id: { type: 'string', description: '面板返回的 identifier 或 uuid' },
       },
       required: ['id'],
+      additionalProperties: false,
     },
   },
   // (v5 ccb-only:ask_gpt55_codex direct bridge 已移除 —— 无 codex agent。)

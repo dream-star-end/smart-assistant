@@ -82,6 +82,7 @@ import {
   type TicketType,
   buildPatrolSessionKey,
 } from './domain.js'
+import { parseEntryCondition } from './entryCondition.js'
 import { getSharedPatrolSlots } from './guardrails.js'
 import { TaskboardTransitionDenied, assertTransition } from './stateMachine.js'
 
@@ -1610,11 +1611,17 @@ function handleListStages(res: ServerResponse, db: TaskboardDb, pipelineId: stri
   sendJson(res, 200, { items: listStages(db, pipelineId) })
 }
 
+function hasPatrolCron(cron: string | null | undefined): boolean {
+  return typeof cron === 'string' && cron.trim() !== ''
+}
+
 function validateStageWrite(input: {
   kind?: StageKind
   agentId?: string | null
   promptTemplate?: string | null
   patrolEnabled?: boolean
+  patrolCron?: string | null
+  entryCondition?: string | null
   timeoutSec?: number
 }): void {
   if (input.kind === 'ai') {
@@ -1626,11 +1633,21 @@ function validateStageWrite(input: {
   if (input.agentId && isHiddenSystemAgentId(input.agentId)) {
     throw new TaskboardValidationError('hidden-reviewer cannot be bound to a stage')
   }
-  if (input.kind === 'human' && input.patrolEnabled) {
-    throw new TaskboardValidationError('human stages cannot enable patrol')
+  if (input.kind === 'human' && (input.patrolEnabled || hasPatrolCron(input.patrolCron))) {
+    throw new TaskboardValidationError('human 阶段不能启用巡检或设置巡检 cron')
+  }
+  if (input.entryCondition != null && input.entryCondition.trim() !== '') {
+    const parsed = parseEntryCondition(input.entryCondition)
+    if (!parsed.ok) throw new TaskboardValidationError(parsed.error)
   }
   if (input.timeoutSec != null && input.timeoutSec > DELEGATE_HARD_TIMEOUT_SEC) {
     throw new TaskboardValidationError(`timeoutSec must be <= ${DELEGATE_HARD_TIMEOUT_SEC}`)
+  }
+}
+
+function throwIfStageOrdinalConflict(err: unknown): void {
+  if (isUniqueConstraint(err, 'ordinal')) {
+    throw new TaskboardValidationError('同一流水线内阶段序号(ordinal)不能重复')
   }
 }
 
@@ -1653,34 +1670,50 @@ function handleCreateStage(
   const agentId = asNullableString(body.agentId) ?? null
   const promptTemplate = asNullableString(body.promptTemplate) ?? null
   const patrolEnabled = asBoolean(body.patrolEnabled)
+  const patrolCron = asNullableString(body.patrolCron) ?? null
+  const entryCondition = asNullableString(body.entryCondition)
   const timeoutSec = typeof body.timeoutSec === 'number' ? body.timeoutSec : undefined
-  validateStageWrite({ kind, agentId, promptTemplate, patrolEnabled, timeoutSec })
-  const stage = createStage(db, {
-    pipelineId,
-    ordinal,
-    name,
+  validateStageWrite({
     kind,
     agentId,
     promptTemplate,
-    toolsets: asNullableStringArray(body.toolsets) ?? null,
-    effort: asNullableString(body.effort) ?? null,
-    patrolCron: asNullableString(body.patrolCron) ?? null,
     patrolEnabled,
-    patrolTimezone: asString(body.patrolTimezone),
-    quietHoursStart: asNullableNumber(body.quietHoursStart),
-    quietHoursEnd: asNullableNumber(body.quietHoursEnd),
-    maxRunsPerDay: typeof body.maxRunsPerDay === 'number' ? body.maxRunsPerDay : undefined,
+    patrolCron,
+    entryCondition,
     timeoutSec,
-    maxRetries: typeof body.maxRetries === 'number' ? body.maxRetries : undefined,
-    circuitBreakerThreshold:
-      typeof body.circuitBreakerThreshold === 'number' ? body.circuitBreakerThreshold : undefined,
-    onSuccess: asString(body.onSuccess) as OnSuccessAction | undefined,
-    onFailure: asString(body.onFailure) as OnFailureAction | undefined,
-    entryCondition: asNullableString(body.entryCondition),
-    exitChecklist: asNullableString(body.exitChecklist),
-    requireHumanAck: asBoolean(body.requireHumanAck),
-    autoClose: asBoolean(body.autoClose),
   })
+  let stage: PipelineStage
+  try {
+    stage = createStage(db, {
+      pipelineId,
+      ordinal,
+      name,
+      kind,
+      agentId,
+      promptTemplate,
+      toolsets: asNullableStringArray(body.toolsets) ?? null,
+      effort: asNullableString(body.effort) ?? null,
+      patrolCron,
+      patrolEnabled,
+      patrolTimezone: asString(body.patrolTimezone),
+      quietHoursStart: asNullableNumber(body.quietHoursStart),
+      quietHoursEnd: asNullableNumber(body.quietHoursEnd),
+      maxRunsPerDay: typeof body.maxRunsPerDay === 'number' ? body.maxRunsPerDay : undefined,
+      timeoutSec,
+      maxRetries: typeof body.maxRetries === 'number' ? body.maxRetries : undefined,
+      circuitBreakerThreshold:
+        typeof body.circuitBreakerThreshold === 'number' ? body.circuitBreakerThreshold : undefined,
+      onSuccess: asString(body.onSuccess) as OnSuccessAction | undefined,
+      onFailure: asString(body.onFailure) as OnFailureAction | undefined,
+      entryCondition,
+      exitChecklist: asNullableString(body.exitChecklist),
+      requireHumanAck: asBoolean(body.requireHumanAck),
+      autoClose: asBoolean(body.autoClose),
+    })
+  } catch (err) {
+    throwIfStageOrdinalConflict(err)
+    throw err
+  }
   sendJson(res, 201, { ok: true, stage })
 }
 
@@ -1706,33 +1739,50 @@ function handlePatchStage(
       ? existing.promptTemplate
       : (asNullableString(body.promptTemplate) ?? null)
   const patrolEnabled = asBoolean(body.patrolEnabled) ?? existing.patrolEnabled
+  const patrolCron =
+    body.patrolCron === undefined ? existing.patrolCron : asNullableString(body.patrolCron)
+  const entryCondition = asNullableString(body.entryCondition)
   const timeoutSec = typeof body.timeoutSec === 'number' ? body.timeoutSec : existing.timeoutSec
-  validateStageWrite({ kind, agentId, promptTemplate, patrolEnabled, timeoutSec })
-  const stage = updateStage(db, id, {
-    name: asString(body.name),
-    kind: asString(body.kind) as StageKind | undefined,
-    agentId: asNullableString(body.agentId),
-    promptTemplate: asNullableString(body.promptTemplate),
-    toolsets: asNullableStringArray(body.toolsets),
-    effort: asNullableString(body.effort),
-    patrolCron: asNullableString(body.patrolCron),
-    patrolEnabled: asBoolean(body.patrolEnabled),
-    patrolTimezone: asString(body.patrolTimezone),
-    quietHoursStart: asNullableNumber(body.quietHoursStart),
-    quietHoursEnd: asNullableNumber(body.quietHoursEnd),
-    maxRunsPerDay: typeof body.maxRunsPerDay === 'number' ? body.maxRunsPerDay : undefined,
-    timeoutSec: typeof body.timeoutSec === 'number' ? body.timeoutSec : undefined,
-    maxRetries: typeof body.maxRetries === 'number' ? body.maxRetries : undefined,
-    circuitBreakerThreshold:
-      typeof body.circuitBreakerThreshold === 'number' ? body.circuitBreakerThreshold : undefined,
-    onSuccess: asString(body.onSuccess) as OnSuccessAction | undefined,
-    onFailure: asString(body.onFailure) as OnFailureAction | undefined,
-    entryCondition: asNullableString(body.entryCondition),
-    exitChecklist: asNullableString(body.exitChecklist),
-    requireHumanAck: asBoolean(body.requireHumanAck),
-    autoClose: asBoolean(body.autoClose),
-    ordinal: typeof body.ordinal === 'number' ? body.ordinal : undefined,
+  validateStageWrite({
+    kind,
+    agentId,
+    promptTemplate,
+    patrolEnabled,
+    patrolCron,
+    entryCondition,
+    timeoutSec,
   })
+  let stage: PipelineStage
+  try {
+    stage = updateStage(db, id, {
+      name: asString(body.name),
+      kind: asString(body.kind) as StageKind | undefined,
+      agentId: asNullableString(body.agentId),
+      promptTemplate: asNullableString(body.promptTemplate),
+      toolsets: asNullableStringArray(body.toolsets),
+      effort: asNullableString(body.effort),
+      patrolCron: asNullableString(body.patrolCron),
+      patrolEnabled: asBoolean(body.patrolEnabled),
+      patrolTimezone: asString(body.patrolTimezone),
+      quietHoursStart: asNullableNumber(body.quietHoursStart),
+      quietHoursEnd: asNullableNumber(body.quietHoursEnd),
+      maxRunsPerDay: typeof body.maxRunsPerDay === 'number' ? body.maxRunsPerDay : undefined,
+      timeoutSec: typeof body.timeoutSec === 'number' ? body.timeoutSec : undefined,
+      maxRetries: typeof body.maxRetries === 'number' ? body.maxRetries : undefined,
+      circuitBreakerThreshold:
+        typeof body.circuitBreakerThreshold === 'number' ? body.circuitBreakerThreshold : undefined,
+      onSuccess: asString(body.onSuccess) as OnSuccessAction | undefined,
+      onFailure: asString(body.onFailure) as OnFailureAction | undefined,
+      entryCondition,
+      exitChecklist: asNullableString(body.exitChecklist),
+      requireHumanAck: asBoolean(body.requireHumanAck),
+      autoClose: asBoolean(body.autoClose),
+      ordinal: typeof body.ordinal === 'number' ? body.ordinal : undefined,
+    })
+  } catch (err) {
+    throwIfStageOrdinalConflict(err)
+    throw err
+  }
   sendJson(res, 200, { ok: true, stage })
 }
 

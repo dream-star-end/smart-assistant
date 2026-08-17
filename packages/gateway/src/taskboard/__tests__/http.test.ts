@@ -428,3 +428,503 @@ describe('settings / 超大 body', () => {
     db.close()
   })
 })
+
+type PipelineJson = {
+  id: string
+  name: string
+  ticketType: string | null
+  isDefault: boolean
+}
+
+type StageJson = {
+  id: string
+  pipelineId: string
+  ordinal: number
+  name: string
+  kind: string
+  agentId: string | null
+  promptTemplate: string | null
+  patrolCron: string | null
+  patrolEnabled: boolean
+  entryCondition: string | null
+  autoClose: boolean
+  timeoutSec: number
+}
+
+async function createProjectOnly(base: string): Promise<string> {
+  const created = await call(base, 'POST', '/api/board/projects', {
+    key: 'OCV5',
+    name: 'V5 自用',
+  })
+  assert.equal(created.status, 201, JSON.stringify(created.body))
+  return (created.body.project as { id: string }).id
+}
+
+async function createEmptyPipeline(
+  base: string,
+  projectId: string,
+  over: Record<string, unknown> = {},
+): Promise<PipelineJson> {
+  const res = await call(base, 'POST', '/api/board/pipelines', {
+    projectId,
+    name: 'hotfix',
+    ticketType: 'bug',
+    isDefault: false,
+    ...over,
+  })
+  assert.equal(res.status, 201, JSON.stringify(res.body))
+  return res.body.pipeline as PipelineJson
+}
+
+describe('POST /pipelines 建线', () => {
+  it('建线成功,回 201 且可 GET 到', async () => {
+    const db = freshDb()
+    await withServer(humanCtx(db), async (base) => {
+      const projectId = await createProjectOnly(base)
+      const res = await call(base, 'POST', '/api/board/pipelines', {
+        projectId,
+        name: 'hotfix',
+        ticketType: 'bug',
+        isDefault: false,
+      })
+      assert.equal(res.status, 201, JSON.stringify(res.body))
+      assert.equal(res.body.ok, true)
+      const pipeline = res.body.pipeline as PipelineJson
+      assert.equal(pipeline.name, 'hotfix')
+      assert.equal(pipeline.ticketType, 'bug')
+      assert.equal(pipeline.isDefault, false)
+      assert.equal(typeof pipeline.id, 'string')
+
+      const got = await call(base, 'GET', `/api/board/pipelines/${pipeline.id}`)
+      assert.equal(got.status, 200)
+      assert.equal((got.body.pipeline as PipelineJson).id, pipeline.id)
+      assert.deepEqual(got.body.stages, [])
+    })
+    db.close()
+  })
+
+  it('缺 projectId / name → 400 validation', async () => {
+    const db = freshDb()
+    await withServer(humanCtx(db), async (base) => {
+      const projectId = await createProjectOnly(base)
+      const noName = await call(base, 'POST', '/api/board/pipelines', {
+        projectId,
+        ticketType: 'bug',
+      })
+      assert.equal(noName.status, 400, JSON.stringify(noName.body))
+      assert.equal(noName.body.code, 'validation')
+
+      const noProject = await call(base, 'POST', '/api/board/pipelines', {
+        name: 'hotfix',
+        ticketType: 'bug',
+      })
+      assert.equal(noProject.status, 400, JSON.stringify(noProject.body))
+      assert.equal(noProject.body.code, 'validation')
+    })
+    db.close()
+  })
+
+  it('不存在的 projectId → 404', async () => {
+    const db = freshDb()
+    await withServer(humanCtx(db), async (base) => {
+      const res = await call(base, 'POST', '/api/board/pipelines', {
+        projectId: 'no-such-project',
+        name: 'hotfix',
+      })
+      assert.equal(res.status, 404, JSON.stringify(res.body))
+      assert.equal(res.body.code, 'not_found')
+    })
+    db.close()
+  })
+})
+
+describe('POST /pipelines/:id/stages 建站与 ordinal', () => {
+  it('未传 ordinal 时按现有站数追加(0, 1);显式 ordinal 生效', async () => {
+    const db = freshDb()
+    await withServer(humanCtx(db), async (base) => {
+      const projectId = await createProjectOnly(base)
+      const pipeline = await createEmptyPipeline(base, projectId)
+
+      const first = await call(base, 'POST', `/api/board/pipelines/${pipeline.id}/stages`, {
+        name: '实现',
+        kind: 'ai',
+        agentId: 'coding-assistant',
+        promptTemplate: '修这个 bug',
+      })
+      assert.equal(first.status, 201, JSON.stringify(first.body))
+      const s0 = first.body.stage as StageJson
+      assert.equal(s0.ordinal, 0)
+      assert.equal(s0.kind, 'ai')
+      assert.equal(s0.agentId, 'coding-assistant')
+      assert.equal(s0.pipelineId, pipeline.id)
+
+      const second = await call(base, 'POST', `/api/board/pipelines/${pipeline.id}/stages`, {
+        name: '确认',
+        kind: 'human',
+      })
+      assert.equal(second.status, 201, JSON.stringify(second.body))
+      assert.equal((second.body.stage as StageJson).ordinal, 1)
+
+      const explicit = await call(base, 'POST', `/api/board/pipelines/${pipeline.id}/stages`, {
+        name: '收尾',
+        kind: 'human',
+        ordinal: 5,
+      })
+      assert.equal(explicit.status, 201, JSON.stringify(explicit.body))
+      assert.equal((explicit.body.stage as StageJson).ordinal, 5)
+
+      const dup = await call(base, 'POST', `/api/board/pipelines/${pipeline.id}/stages`, {
+        name: '撞号',
+        kind: 'human',
+        ordinal: 0,
+      })
+      assert.equal(dup.status, 400, JSON.stringify(dup.body))
+      assert.equal(dup.body.code, 'validation')
+      assert.match(String(dup.body.error), /ordinal/)
+    })
+    db.close()
+  })
+
+  it('缺 name / kind → 400;不存在的 pipelineId → 404', async () => {
+    const db = freshDb()
+    await withServer(humanCtx(db), async (base) => {
+      const projectId = await createProjectOnly(base)
+      const pipeline = await createEmptyPipeline(base, projectId)
+
+      const missing = await call(base, 'POST', `/api/board/pipelines/${pipeline.id}/stages`, {
+        kind: 'human',
+      })
+      assert.equal(missing.status, 400, JSON.stringify(missing.body))
+      assert.equal(missing.body.code, 'validation')
+
+      const noKind = await call(base, 'POST', `/api/board/pipelines/${pipeline.id}/stages`, {
+        name: '确认',
+      })
+      assert.equal(noKind.status, 400, JSON.stringify(noKind.body))
+      assert.equal(noKind.body.code, 'validation')
+
+      const missingPipe = await call(base, 'POST', '/api/board/pipelines/no-such-pipe/stages', {
+        name: '确认',
+        kind: 'human',
+      })
+      assert.equal(missingPipe.status, 404, JSON.stringify(missingPipe.body))
+      assert.equal(missingPipe.body.code, 'not_found')
+    })
+    db.close()
+  })
+})
+
+describe('PATCH /stages/:id 可写字段', () => {
+  it('能改 agentId / promptTemplate / patrolCron / entryCondition / autoClose / timeoutSec', async () => {
+    const db = freshDb()
+    await withServer(humanCtx(db), async (base) => {
+      const projectId = await createProjectOnly(base)
+      const pipeline = await createEmptyPipeline(base, projectId)
+      const created = await call(base, 'POST', `/api/board/pipelines/${pipeline.id}/stages`, {
+        name: '实现',
+        kind: 'ai',
+        agentId: 'main',
+        promptTemplate: '初稿',
+      })
+      assert.equal(created.status, 201, JSON.stringify(created.body))
+      const stageId = (created.body.stage as StageJson).id
+
+      const patched = await call(base, 'PATCH', `/api/board/stages/${stageId}`, {
+        agentId: 'coding-assistant',
+        promptTemplate: '按复现步骤修',
+        patrolCron: '0 9 * * *',
+        entryCondition: 'no_open_blockers',
+        autoClose: true,
+        timeoutSec: 1800,
+      })
+      assert.equal(patched.status, 200, JSON.stringify(patched.body))
+      const stage = patched.body.stage as StageJson
+      assert.equal(stage.agentId, 'coding-assistant')
+      assert.equal(stage.promptTemplate, '按复现步骤修')
+      assert.equal(stage.patrolCron, '0 9 * * *')
+      assert.equal(stage.entryCondition, 'no_open_blockers')
+      assert.equal(stage.autoClose, true)
+      assert.equal(stage.timeoutSec, 1800)
+    })
+    db.close()
+  })
+})
+
+describe('stage 写路径校验', () => {
+  it('绑定 hidden-reviewer → 400', async () => {
+    const db = freshDb()
+    await withServer(humanCtx(db), async (base) => {
+      const projectId = await createProjectOnly(base)
+      const pipeline = await createEmptyPipeline(base, projectId)
+      const created = await call(base, 'POST', `/api/board/pipelines/${pipeline.id}/stages`, {
+        name: '审查',
+        kind: 'ai',
+        agentId: 'hidden-reviewer',
+        promptTemplate: '审',
+      })
+      assert.equal(created.status, 400, JSON.stringify(created.body))
+      assert.equal(created.body.code, 'validation')
+      assert.match(String(created.body.error), /hidden-reviewer/)
+
+      const ok = await call(base, 'POST', `/api/board/pipelines/${pipeline.id}/stages`, {
+        name: '实现',
+        kind: 'ai',
+        agentId: 'coding-assistant',
+        promptTemplate: '修',
+      })
+      assert.equal(ok.status, 201, JSON.stringify(ok.body))
+      const patched = await call(
+        base,
+        'PATCH',
+        `/api/board/stages/${(ok.body.stage as StageJson).id}`,
+        {
+          agentId: 'hidden-reviewer',
+        },
+      )
+      assert.equal(patched.status, 400, JSON.stringify(patched.body))
+      assert.equal(patched.body.code, 'validation')
+    })
+    db.close()
+  })
+
+  it('kind=human 且 patrolEnabled=true → 400', async () => {
+    const db = freshDb()
+    await withServer(humanCtx(db), async (base) => {
+      const projectId = await createProjectOnly(base)
+      const pipeline = await createEmptyPipeline(base, projectId)
+      const created = await call(base, 'POST', `/api/board/pipelines/${pipeline.id}/stages`, {
+        name: '确认',
+        kind: 'human',
+        patrolEnabled: true,
+      })
+      assert.equal(created.status, 400, JSON.stringify(created.body))
+      assert.equal(created.body.code, 'validation')
+      assert.match(String(created.body.error), /human/i)
+
+      const human = await call(base, 'POST', `/api/board/pipelines/${pipeline.id}/stages`, {
+        name: '确认',
+        kind: 'human',
+      })
+      assert.equal(human.status, 201, JSON.stringify(human.body))
+      const patched = await call(
+        base,
+        'PATCH',
+        `/api/board/stages/${(human.body.stage as StageJson).id}`,
+        { patrolEnabled: true },
+      )
+      assert.equal(patched.status, 400, JSON.stringify(patched.body))
+      assert.equal(patched.body.code, 'validation')
+    })
+    db.close()
+  })
+
+  it('timeoutSec 超过 delegate 硬超时 2700 → 400;2700 边界可通过', async () => {
+    const db = freshDb()
+    await withServer(humanCtx(db), async (base) => {
+      const projectId = await createProjectOnly(base)
+      const pipeline = await createEmptyPipeline(base, projectId)
+      const over = await call(base, 'POST', `/api/board/pipelines/${pipeline.id}/stages`, {
+        name: '实现',
+        kind: 'ai',
+        agentId: 'coding-assistant',
+        promptTemplate: '修',
+        timeoutSec: 2701,
+      })
+      assert.equal(over.status, 400, JSON.stringify(over.body))
+      assert.equal(over.body.code, 'validation')
+      assert.match(String(over.body.error), /2700/)
+
+      const atCap = await call(base, 'POST', `/api/board/pipelines/${pipeline.id}/stages`, {
+        name: '实现',
+        kind: 'ai',
+        agentId: 'coding-assistant',
+        promptTemplate: '修',
+        timeoutSec: 2700,
+      })
+      assert.equal(atCap.status, 201, JSON.stringify(atCap.body))
+      assert.equal((atCap.body.stage as StageJson).timeoutSec, 2700)
+
+      const patched = await call(
+        base,
+        'PATCH',
+        `/api/board/stages/${(atCap.body.stage as StageJson).id}`,
+        { timeoutSec: 2701 },
+      )
+      assert.equal(patched.status, 400, JSON.stringify(patched.body))
+      assert.equal(patched.body.code, 'validation')
+    })
+    db.close()
+  })
+
+  // BUG-1: validateStageWrite 只拦 patrolEnabled,不拦 patrolCron。human+cron 会 201 入库。
+  it('kind=human 带 patrolCron → 400', async () => {
+    const db = freshDb()
+    await withServer(humanCtx(db), async (base) => {
+      const projectId = await createProjectOnly(base)
+      const pipeline = await createEmptyPipeline(base, projectId)
+      const created = await call(base, 'POST', `/api/board/pipelines/${pipeline.id}/stages`, {
+        name: '确认',
+        kind: 'human',
+        patrolCron: '0 9 * * *',
+      })
+      assert.equal(created.status, 400, JSON.stringify(created.body))
+      assert.equal(created.body.code, 'validation')
+
+      const human = await call(base, 'POST', `/api/board/pipelines/${pipeline.id}/stages`, {
+        name: '确认',
+        kind: 'human',
+      })
+      assert.equal(human.status, 201, JSON.stringify(human.body))
+      const patchedCron = await call(
+        base,
+        'PATCH',
+        `/api/board/stages/${(human.body.stage as StageJson).id}`,
+        { patrolCron: '0 9 * * *' },
+      )
+      assert.equal(patchedCron.status, 400, JSON.stringify(patchedCron.body))
+      assert.equal(patchedCron.body.code, 'validation')
+
+      const ai = await call(base, 'POST', `/api/board/pipelines/${pipeline.id}/stages`, {
+        name: '实现',
+        kind: 'ai',
+        agentId: 'coding-assistant',
+        promptTemplate: '修',
+        patrolCron: '0 9 * * *',
+        patrolEnabled: false,
+      })
+      assert.equal(ai.status, 201, JSON.stringify(ai.body))
+      const patchedKind = await call(
+        base,
+        'PATCH',
+        `/api/board/stages/${(ai.body.stage as StageJson).id}`,
+        { kind: 'human' },
+      )
+      assert.equal(patchedKind.status, 400, JSON.stringify(patchedKind.body))
+      assert.equal(patchedKind.body.code, 'validation')
+    })
+    db.close()
+  })
+
+  // BUG-2: handleCreateStage/handlePatchStage 未调用 parseEntryCondition,非法 DSL 原样入库。
+  it('非法 entryCondition DSL → 400 且错误可读', async () => {
+    const db = freshDb()
+    await withServer(humanCtx(db), async (base) => {
+      const projectId = await createProjectOnly(base)
+      const pipeline = await createEmptyPipeline(base, projectId)
+      const created = await call(base, 'POST', `/api/board/pipelines/${pipeline.id}/stages`, {
+        name: '实现',
+        kind: 'ai',
+        agentId: 'coding-assistant',
+        promptTemplate: '修',
+        entryCondition: 'has_repro',
+      })
+      assert.equal(created.status, 400, JSON.stringify(created.body))
+      assert.equal(created.body.code, 'validation')
+      assert.match(String(created.body.error), /未知谓词|不能识别|不完整|谓词/)
+
+      const ok = await call(base, 'POST', `/api/board/pipelines/${pipeline.id}/stages`, {
+        name: '实现2',
+        kind: 'ai',
+        agentId: 'coding-assistant',
+        promptTemplate: '修',
+      })
+      assert.equal(ok.status, 201, JSON.stringify(ok.body))
+      const patched = await call(
+        base,
+        'PATCH',
+        `/api/board/stages/${(ok.body.stage as StageJson).id}`,
+        { entryCondition: 'always &&' },
+      )
+      assert.equal(patched.status, 400, JSON.stringify(patched.body))
+      assert.match(String(patched.body.error), /不完整|谓词|不能识别/)
+    })
+    db.close()
+  })
+
+  it('PATCH 不存在的 stage → 404', async () => {
+    const db = freshDb()
+    await withServer(humanCtx(db), async (base) => {
+      const res = await call(base, 'PATCH', '/api/board/stages/no-such-stage', {
+        name: 'x',
+      })
+      assert.equal(res.status, 404, JSON.stringify(res.body))
+      assert.equal(res.body.code, 'not_found')
+    })
+    db.close()
+  })
+})
+
+describe('isDefault 互斥经 HTTP 生效', () => {
+  it('同项目同 ticketType 把 B 设为默认后 A 自动降为非默认', async () => {
+    const db = freshDb()
+    await withServer(humanCtx(db), async (base) => {
+      const projectId = await createProjectOnly(base)
+      const listed = await call(base, 'GET', `/api/board/pipelines?projectId=${projectId}`)
+      assert.equal(listed.status, 200)
+      const seedBug = (listed.body.items as PipelineJson[]).find(
+        (p) => p.ticketType === 'bug' && p.isDefault,
+      )
+      assert.ok(seedBug)
+      const seedFeature = (listed.body.items as PipelineJson[]).find(
+        (p) => p.ticketType === 'feature' && p.isDefault,
+      )
+      assert.ok(seedFeature)
+
+      const createdB = await call(base, 'POST', '/api/board/pipelines', {
+        projectId,
+        name: 'bug-b',
+        ticketType: 'bug',
+        isDefault: false,
+      })
+      assert.equal(createdB.status, 201, JSON.stringify(createdB.body))
+      const pipeB = createdB.body.pipeline as PipelineJson
+      assert.equal(pipeB.isDefault, false)
+
+      const patched = await call(base, 'PATCH', `/api/board/pipelines/${pipeB.id}`, {
+        isDefault: true,
+      })
+      assert.equal(patched.status, 200, JSON.stringify(patched.body))
+      assert.equal((patched.body.pipeline as PipelineJson).isDefault, true)
+
+      const after = await call(base, 'GET', `/api/board/pipelines?projectId=${projectId}`)
+      const items = after.body.items as PipelineJson[]
+      const a = items.find((p) => p.id === seedBug.id)
+      const b = items.find((p) => p.id === pipeB.id)
+      const feature = items.find((p) => p.id === seedFeature.id)
+      assert.equal(a?.isDefault, false, '原 bug 默认线应被降')
+      assert.equal(b?.isDefault, true)
+      assert.equal(feature?.isDefault, true, '不同类型默认线不受影响')
+    })
+    db.close()
+  })
+
+  it('POST 直接 isDefault=true 也会把同类型原默认线降掉', async () => {
+    const db = freshDb()
+    await withServer(humanCtx(db), async (base) => {
+      const projectId = await createProjectOnly(base)
+      const listed = await call(base, 'GET', `/api/board/pipelines?projectId=${projectId}`)
+      const seedBug = (listed.body.items as PipelineJson[]).find(
+        (p) => p.ticketType === 'bug' && p.isDefault,
+      )
+      assert.ok(seedBug)
+
+      const created = await call(base, 'POST', '/api/board/pipelines', {
+        projectId,
+        name: 'bug-new-default',
+        ticketType: 'bug',
+        isDefault: true,
+      })
+      assert.equal(created.status, 201, JSON.stringify(created.body))
+      assert.equal((created.body.pipeline as PipelineJson).isDefault, true)
+
+      const after = await call(base, 'GET', `/api/board/pipelines?projectId=${projectId}`)
+      const items = after.body.items as PipelineJson[]
+      assert.equal(items.find((p) => p.id === seedBug.id)?.isDefault, false)
+      assert.equal(
+        items.find((p) => p.id === (created.body.pipeline as PipelineJson).id)?.isDefault,
+        true,
+      )
+    })
+    db.close()
+  })
+})
