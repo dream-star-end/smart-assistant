@@ -26,6 +26,7 @@ import {
   collectIndexContentLines,
   existingIndexLinesPreserved,
   isForbiddenAutoMemoryTarget,
+  stampAutoMemoryFrontmatter,
 } from './autoMemoryWrite.js'
 import { acquireKernelFileLock, type KernelFileLock } from './kernelFileLock.js'
 import {
@@ -670,11 +671,20 @@ export class MemoryDir {
    * Existing files are refused. Existing index lines must survive unchanged;
    * otherwise this write is rolled back. Never calls reconcileIndex (that can
    * drop or rewrite human-authored rows).
+   *
+   * Invariant: every file that lands on disk is stamped with `source: auto`
+   * and a valid `expires` (default today+30). Callers cannot skip the TTL gate
+   * by omitting frontmatter. See stampAutoMemoryFrontmatter for the write-side
+   * tighten / retrieval-side loosen asymmetry.
    */
   async applyAutoAdds(input: {
     creates: readonly { file: string; content: string }[]
+    /** Test seam: freeze the TTL calendar day (YYYY-MM-DD). */
+    today?: string
   }): Promise<MemoryAutoAddResult> {
+    const today = input.today ?? memoryCalendarDate()
     const seen = new Set<string>()
+    const stampedCreates: Array<{ file: string; content: string }> = []
     for (const row of input.creates) {
       if (!MEMORY_FILE_RE.test(row.file) || basename(row.file) !== row.file) {
         return { ok: false, error: `invalid memory file name: ${row.file}`, reason: 'invalid' }
@@ -686,8 +696,14 @@ export class MemoryDir {
         return { ok: false, error: `duplicate memory file: ${row.file}`, reason: 'invalid' }
       }
       seen.add(row.file)
-      const scan = scanMemoryContent(row.content)
+      const content = stampAutoMemoryFrontmatter(row.content, today, {
+        warn: ttlWarn,
+        context: row.file,
+        fallbackName: row.file.replace(/\.md$/i, ''),
+      })
+      const scan = scanMemoryContent(content)
       if (!scan.ok) return { ok: false, error: `rejected: ${scan.reason}`, reason: 'invalid' }
+      stampedCreates.push({ file: row.file, content })
     }
     if (seen.size === 0) return { ok: true, created: [] }
 
@@ -701,7 +717,7 @@ export class MemoryDir {
         await this.recoverBatchLocked()
         await this.ensureMigratedLocked()
         const accepted: Array<{ file: string; content: string }> = []
-        for (const row of input.creates) {
+        for (const row of stampedCreates) {
           const full = join(this.dirPath(), row.file)
           if (isForbiddenAutoMemoryTarget(full, this.agentId) || full === paths.sharedUserMd) {
             return {

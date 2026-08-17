@@ -514,6 +514,7 @@ export class AutoDreamService {
         const planned = await this.planAddOnlyCreates(trigger.agentId, proposal, memory, today)
         const result = await memdir.applyAutoAdds({
           creates: planned.map((row) => ({ file: row.file, content: row.content })),
+          today,
         })
         if (!result.ok)
           throw new Error(`AUTO_DREAM_MEMORY_ADD_ONLY_FAILED:${result.reason}:${result.error}`)

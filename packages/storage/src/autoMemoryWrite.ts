@@ -8,7 +8,12 @@
 
 import { basename } from 'node:path'
 import { MEMORY_FILE_RE, parseMemoryFrontmatter } from './memoryFrontmatter.js'
-import { AUTO_MEMORY_SOURCE, defaultAutoExpires } from './memoryTtl.js'
+import {
+  AUTO_MEMORY_SOURCE,
+  defaultAutoExpires,
+  parseMemoryExpires,
+  type MemoryTtlWarn,
+} from './memoryTtl.js'
 import { paths } from './paths.js'
 
 export const FORBIDDEN_AUTO_MEMORY_BASENAMES = new Set(['user.md', 'USER.md'])
@@ -45,12 +50,46 @@ export function isForbiddenAutoMemoryTarget(file: string, agentId?: string): boo
   return false
 }
 
-export function stampAutoMemoryFrontmatter(raw: string, today: string): string {
+export interface StampAutoMemoryOptions {
+  warn?: MemoryTtlWarn
+  context?: string
+  fallbackName?: string
+}
+
+/**
+ * Guarantee `source: auto` and a valid `expires` on auto-written content.
+ *
+ * Write vs retrieval asymmetry (intentional, do not unify):
+ *  - Retrieval (`isMemoryExpired`): illegal/unparseable `expires` is treated as
+ *    not expired so a parse failure cannot hide an existing memory.
+ *  - Write (this function / `MemoryDir.applyAutoAdds`): illegal `expires` is
+ *    replaced with today+30. An auto write must never land as "no expires"
+ *    (that would be a never-expiring auto memory and bypass the TTL gate).
+ * A caller-supplied valid `expires` is kept so a second stamp is idempotent.
+ */
+export function stampAutoMemoryFrontmatter(
+  raw: string,
+  today: string,
+  opts?: StampAutoMemoryOptions,
+): string {
   const { fm, body } = parseMemoryFrontmatter(raw)
-  const name = (fm.name || '').trim() || 'mem'
+  const name = (fm.name || '').trim() || (opts?.fallbackName || '').trim() || 'mem'
   const description = (fm.description || '').trim()
   const type = (fm.type || 'project').trim() || 'project'
-  const expires = defaultAutoExpires(today)
+  const fallback = defaultAutoExpires(today)
+  const rawExpires = fm.expires
+  let expires = fallback
+  if (rawExpires !== undefined && rawExpires.trim() !== '') {
+    const parsed = parseMemoryExpires(rawExpires)
+    if (parsed) {
+      expires = parsed
+    } else {
+      const where = opts?.context ? ` (${opts.context})` : ''
+      opts?.warn?.(
+        `invalid memory expires on auto write${where}: ${JSON.stringify(rawExpires)}; replacing with ${fallback} (write side tightens; retrieval treats invalid expires as not expired)`,
+      )
+    }
+  }
   const rest = body.replace(/\s+$/, '')
   return `---\nname: ${name}\ndescription: ${description}\ntype: ${type}\nsource: ${AUTO_MEMORY_SOURCE}\nexpires: ${expires}\n---\n${rest}\n`
 }

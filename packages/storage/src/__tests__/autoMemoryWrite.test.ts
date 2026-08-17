@@ -37,6 +37,39 @@ describe('auto memory ADD-only', () => {
     assert.match(stamped, /expires: 2026-09-17/)
   })
 
+  it('keeps a valid expires and forces source: auto even if another source is set', () => {
+    const raw =
+      '---\nname: n\ndescription: d\ntype: project\nsource: manual\nexpires: 2026-12-01\n---\nbody\n'
+    const stamped = stampAutoMemoryFrontmatter(raw, '2026-08-18')
+    assert.match(stamped, /source: auto/)
+    assert.doesNotMatch(stamped, /source: manual/)
+    assert.match(stamped, /expires: 2026-12-01/)
+    assert.doesNotMatch(stamped, /expires: 2026-09-17/)
+  })
+
+  it('replaces illegal expires with today+30 and warns (write-side tighten)', () => {
+    const warns: string[] = []
+    const stamped = stampAutoMemoryFrontmatter(
+      '---\nname: n\ndescription: d\ntype: project\nexpires: not-a-date\n---\nbody\n',
+      '2026-08-18',
+      { warn: (m) => warns.push(m), context: 'bad.md' },
+    )
+    assert.match(stamped, /expires: 2026-09-17/)
+    assert.match(stamped, /source: auto/)
+    assert.ok(warns.some((m) => m.includes('not-a-date') && m.includes('replacing')))
+    assert.ok(warns.some((m) => m.includes('write side tightens')))
+  })
+
+  it('stamps body-only content with a fallback name', () => {
+    const stamped = stampAutoMemoryFrontmatter('just a body', '2026-08-18', {
+      fallbackName: 'brandnew',
+    })
+    assert.match(stamped, /name: brandnew/)
+    assert.match(stamped, /source: auto/)
+    assert.match(stamped, /expires: 2026-09-17/)
+    assert.match(stamped, /just a body/)
+  })
+
   it('creates a new file and appends an index line', async () => {
     const agentId = 'add-ok'
     await mkdir(paths.agentDir(agentId), { recursive: true })
@@ -63,6 +96,61 @@ describe('auto memory ADD-only', () => {
     assert.match(index, /人写钩子/)
     assert.match(index, /fresh\.md/)
     assert.match(await readFile(paths.agentMemoryFile(agentId, 'fresh.md'), 'utf8'), /source: auto/)
+  })
+
+  it('applyAutoAdds stamps missing source/expires even when the caller did not', async () => {
+    const agentId = 'add-unstamped'
+    const md = new MemoryDir(agentId)
+    const result = await md.applyAutoAdds({
+      today: '2026-08-18',
+      creates: [
+        {
+          file: 'brandnew.md',
+          content: FM('brandnew', 'auto brandnew', 'body'),
+        },
+      ],
+    })
+    assert.equal(result.ok, true)
+    const raw = await readFile(paths.agentMemoryFile(agentId, 'brandnew.md'), 'utf8')
+    assert.match(raw, /^---\nname: brandnew\n/)
+    assert.match(raw, /source: auto/)
+    assert.match(raw, /expires: 2026-09-17/)
+  })
+
+  it('applyAutoAdds keeps a caller-supplied valid expires and replaces an illegal one', async () => {
+    const agentId = 'add-expires-keep'
+    const md = new MemoryDir(agentId)
+    const keep = await md.applyAutoAdds({
+      today: '2026-08-18',
+      creates: [
+        {
+          file: 'kept-exp.md',
+          content:
+            '---\nname: kept\ndescription: d\ntype: project\nexpires: 2026-10-01\n---\nbody\n',
+        },
+      ],
+    })
+    assert.equal(keep.ok, true)
+    assert.match(
+      await readFile(paths.agentMemoryFile(agentId, 'kept-exp.md'), 'utf8'),
+      /expires: 2026-10-01/,
+    )
+
+    const replaced = await md.applyAutoAdds({
+      today: '2026-08-18',
+      creates: [
+        {
+          file: 'bad-exp.md',
+          content:
+            '---\nname: bad\ndescription: d\ntype: project\nexpires: 2026-13-40\n---\nbody\n',
+        },
+      ],
+    })
+    assert.equal(replaced.ok, true)
+    assert.match(
+      await readFile(paths.agentMemoryFile(agentId, 'bad-exp.md'), 'utf8'),
+      /expires: 2026-09-17/,
+    )
   })
 
   it('refuses to overwrite an existing file and leaves it unchanged', async () => {
