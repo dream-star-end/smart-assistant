@@ -2831,16 +2831,9 @@ export class Gateway {
       } as OutboundMessage)
       this.log.info('pushed crash notification', { peerId: ev.peerId })
 
-      // Any pending permission requests that belonged to the crashed session
-      // will never be answered (subprocess is gone). Clean them up so the
-      // map doesn't leak and any connected tabs dismiss their stuck modal.
-      const pendingToReap: string[] = []
-      for (const [requestId, pending] of this._pendingPermissions) {
-        if (pending.sessionKey === ev.sessionKey) pendingToReap.push(requestId)
-      }
-      for (const requestId of pendingToReap) {
-        this._forceDenyPendingPermission(requestId, 'crashed', 'Session crashed')
-      }
+      // Ordinary pending permissions die with the subprocess. Detached
+      // ask_user cards do not — see `_reapCrashedSessionPendingPermissions`.
+      this._reapCrashedSessionPendingPermissions(ev.sessionKey)
     })
 
     // Periodic OAuth token refresh (every 10 min). Running subprocesses keep
@@ -13264,6 +13257,27 @@ export class Gateway {
       reason,
     })
     return true
+  }
+
+  /**
+   * Reap ordinary pending permission requests after a session crash so the
+   * map does not leak and connected tabs dismiss their stuck modal.
+   *
+   * Detached ask_user cards are the exception: they are not bound to the
+   * subprocess lifetime. The card stays answerable for 24h even after crash,
+   * turn end, or session eviction; the user's answer is delivered as a later
+   * inbound message (possibly to a new session). Same contract as
+   * `_autoDenyPendingPermissions` and `_sweepStalePendingPermissions`.
+   */
+  private _reapCrashedSessionPendingPermissions(sessionKey: string): void {
+    const pendingToReap: string[] = []
+    for (const [requestId, pending] of this._pendingPermissions) {
+      if (isDetachedAskUserPending(pending)) continue
+      if (pending.sessionKey === sessionKey) pendingToReap.push(requestId)
+    }
+    for (const requestId of pendingToReap) {
+      this._forceDenyPendingPermission(requestId, 'crashed', 'Session crashed')
+    }
   }
 
   /** Auto-deny all pending permission requests associated with a peerKey (on disconnect) */

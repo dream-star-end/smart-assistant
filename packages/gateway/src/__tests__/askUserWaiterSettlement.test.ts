@@ -242,3 +242,45 @@ describe('_sweepStalePendingPermissions — detached ask_user', () => {
     assert.equal(gateway._pendingPermissions.has('ask-user:orphaned-session'), true)
   })
 })
+
+describe('_reapCrashedSessionPendingPermissions — detached ask_user', () => {
+  it('does not crash-settle a detached ask-user card', () => {
+    const { gateway, runnerCalls, broadcasts } = makeGateway()
+    installDetached(gateway, 'ask-user:crash-survive')
+
+    gateway._reapCrashedSessionPendingPermissions(SESSION_KEY)
+
+    assert.equal(gateway._pendingPermissions.has('ask-user:crash-survive'), true)
+    assert.deepEqual(runnerCalls, [])
+    assert.deepEqual(broadcasts, [])
+  })
+
+  it('still crash-settles ordinary permission requests on the same session', () => {
+    const { gateway, runnerCalls, broadcasts } = makeGateway()
+    installDetached(gateway, 'ask-user:crash-keep')
+    gateway._pendingPermissions.set('engine-perm-crash', {
+      sessionKey: SESSION_KEY,
+      toolName: 'Bash',
+      input: {},
+      toolUseId: 'toolu-1',
+      peerKey: 'default:webchat:wsess-askuserwait01',
+      userId: 'default',
+      channel: 'webchat',
+      peer: PEER,
+      expiresAt: Date.now() + 30 * 60_000,
+    })
+
+    gateway._reapCrashedSessionPendingPermissions(SESSION_KEY)
+
+    assert.equal(gateway._pendingPermissions.has('ask-user:crash-keep'), true)
+    assert.equal(gateway._pendingPermissions.has('engine-perm-crash'), false)
+    assert.equal(runnerCalls.length, 1)
+    assert.equal(runnerCalls[0]!.requestId, 'engine-perm-crash')
+    assert.equal((runnerCalls[0]!.response as { behavior: string }).behavior, 'deny')
+    assert.equal(broadcasts.length, 1)
+    const payload = broadcasts[0] as unknown[]
+    const settled = payload[1] as { requestId: string; reason: string }
+    assert.equal(settled.requestId, 'engine-perm-crash')
+    assert.equal(settled.reason, 'crashed')
+  })
+})
