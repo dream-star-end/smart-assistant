@@ -312,6 +312,129 @@ export const TOOLS = [
       required: ['draft'],
     },
   },
+  // ── 任务面板(与网页 /board、oc-task CLI 同一份 /api/board)──
+  // identifier 服务端生成,工具参数禁止收 identifier/userId/originSessionKey。
+  // originSessionKey 由 handler 从 OPENCLAUDE_SESSION_KEY 注入,卡片才能点回原对话。
+  {
+    name: 'task_create',
+    description: [
+      '在任务面板建一张单据。用户说「把这个记成单 / 开一张问题单 / 记到任务面板」时使用。',
+      '',
+      '不要传 identifier(服务端生成,返回后再用)。不要传 userId。',
+      '当前对话会自动挂到单据上,卡片可点回本会话。',
+      '新建单默认 backlog(未批准),AI 不许认领;等人在面板点开工。',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        projectId: {
+          type: 'string',
+          description: '项目 uuid 或 key(如 OCV5)。先 task_list / oc-task project list 确认',
+        },
+        type: {
+          type: 'string',
+          enum: ['bug', 'feature', 'spike', 'chore'],
+          description: 'bug 问题单 / feature 需求单 / spike 调研 / chore 杂务',
+        },
+        title: { type: 'string', description: '标题' },
+        body: { type: 'string', description: 'Markdown 正文(复现步骤/需求说明)' },
+        priority: {
+          type: 'string',
+          enum: ['P0', 'P1', 'P2', 'P3'],
+          description: '优先级,默认 P2',
+        },
+        severity: {
+          type: 'string',
+          enum: ['critical', 'major', 'minor', 'trivial'],
+          description: '仅 bug 有意义',
+        },
+        labels: { type: 'array', items: { type: 'string' }, description: '标签' },
+        assignee: { type: 'string', description: 'user:<id> 或 agent:<agentId>' },
+      },
+      required: ['projectId', 'type', 'title'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'task_update',
+    description: [
+      '更新任务单字段(标题/正文/优先级等),不走路状态机。',
+      'id 必须是面板返回的 identifier 或 uuid,禁止自己拼 OCV5-<n>。',
+      'expectedVersion 必填;409 时 task_get 重读后只重试一次,禁止抢别人的 lease。',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: '面板返回的 identifier 或 uuid' },
+        expectedVersion: { type: 'number', description: '乐观锁,来自最近一次 get/create' },
+        title: { type: 'string' },
+        body: { type: 'string' },
+        priority: { type: 'string', enum: ['P0', 'P1', 'P2', 'P3'] },
+        severity: { type: 'string', enum: ['critical', 'major', 'minor', 'trivial'] },
+        labels: { type: 'array', items: { type: 'string' } },
+        assignee: { type: 'string' },
+        blockedReason: { type: 'string' },
+      },
+      required: ['id', 'expectedVersion'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'task_comment',
+    description: [
+      '给任务单写一条评论。做完必须写:改了什么 / 怎么验的 / 有什么风险,再 advance。',
+      'id 只用面板返回值。评论不升 version。',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: '面板返回的 identifier 或 uuid' },
+        body: { type: 'string', description: 'Markdown 评论' },
+        runId: { type: 'string', description: '可选,关联某次 run' },
+      },
+      required: ['id', 'body'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'task_list',
+    description: [
+      '列出任务单。对话里要找「待确认 / 某项目的卡」时用。',
+      '返回 identifier+status+version,后续操作只用返回值,不要自己推导编号。',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        projectId: { type: 'string', description: '项目 uuid 或 key' },
+        status: {
+          type: 'string',
+          description: '单个或逗号分隔: backlog,ready,running,waiting_human,blocked,done,canceled',
+        },
+        type: { type: 'string', description: 'bug/feature/spike/chore,可逗号分隔' },
+        priority: { type: 'string', enum: ['P0', 'P1', 'P2', 'P3'] },
+        assignee: { type: 'string' },
+        q: { type: 'string', description: '模糊搜 title / identifier / body' },
+        limit: { type: 'number' },
+        offset: { type: 'number' },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'task_get',
+    description: [
+      '读取一张任务单及其评论。动手前必须先 get + 看评论(可能有返工要求)。',
+      'id 只用面板返回的 identifier 或 uuid。',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: '面板返回的 identifier 或 uuid' },
+      },
+      required: ['id'],
+      additionalProperties: false,
+    },
+  },
   // (v5 ccb-only:ask_gpt55_codex direct bridge 已移除 —— 无 codex agent。)
   // ── 引擎交互提问桥(cursor 等无原生交互工具的引擎,2026-08-17) ──
   {
@@ -367,19 +490,13 @@ export const TOOLS = [
  * 与网关侧 sanitizeEngineAskUserQuestions 语义对齐 —— 两份实现分属不同
  * 包与不同信任域,不共享依赖,修改时必须同步。
  */
-export function normalizeAskUserQuestions(
-  raw: unknown,
-): Array<Record<string, unknown>> | null {
+export function normalizeAskUserQuestions(raw: unknown): Array<Record<string, unknown>> | null {
   if (!Array.isArray(raw) || raw.length === 0 || raw.length > 4) return null
   const questions: Array<Record<string, unknown>> = []
   for (const item of raw) {
     if (!item || typeof item !== 'object' || Array.isArray(item)) return null
     const question = (item as { question?: unknown }).question
-    if (
-      typeof question !== 'string' ||
-      question.trim().length === 0 ||
-      question.length > 2000
-    ) {
+    if (typeof question !== 'string' || question.trim().length === 0 || question.length > 2000) {
       return null
     }
     const optionsRaw = (item as { options?: unknown }).options
@@ -394,9 +511,7 @@ export function normalizeAskUserQuestions(
       const description = (opt as { description?: unknown }).description
       options.push({
         label,
-        ...(typeof description === 'string' &&
-        description.length > 0 &&
-        description.length <= 1000
+        ...(typeof description === 'string' && description.length > 0 && description.length <= 1000
           ? { description }
           : {}),
       })

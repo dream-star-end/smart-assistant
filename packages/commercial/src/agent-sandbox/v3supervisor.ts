@@ -556,6 +556,7 @@ export const V3_CCB_BASELINE_SKILL_NAMES = [
   "oc-vision",
   "app-connectors",
   "connector-authoring",
+  "manage-taskboard",
 ] as const;
 
 /**

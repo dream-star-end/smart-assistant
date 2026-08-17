@@ -485,7 +485,7 @@ describe("entrypoint.sh 分流 + entrypoint.ts 关键不变量", () => {
     assert.match(src, /const USER_PLATFORM_BIN_DIR = "\/home\/agent\/\.local\/bin"/);
     assert.match(
       src,
-      /const PLATFORM_LINKED_CLIS = \["oc-plugin", "oc-ocr", "oc-h3", "oc-video", "oc-cursor"\] as const/,
+      /const PLATFORM_LINKED_CLIS = \[\s*"oc-plugin",\s*"oc-ocr",\s*"oc-h3",\s*"oc-video",\s*"oc-cursor",\s*"oc-task",\s*\] as const/,
     );
     assert.match(src, /const source = join\(PLATFORM_BIN_DIR, cliName\)/);
     assert.match(src, /const userLink = join\(USER_PLATFORM_BIN_DIR, cliName\)/);

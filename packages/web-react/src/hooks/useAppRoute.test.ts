@@ -1,11 +1,16 @@
 import { describe, expect, it } from 'vitest'
 import { PRODUCT_CAPABILITIES } from '../lib/productCapabilities'
 import {
+  parseBoardPath,
+  parseBoardTicket,
+  parseBoardView,
   parsePanelParam,
   parseTutorialCase,
   parseTutorialTopic,
   tutorialHref,
+  withBoardParams,
   withPanelParams,
+  workspaceWantPath,
 } from './useAppRoute'
 
 describe('教程 URL 深链', () => {
@@ -80,5 +85,41 @@ describe('教程 URL 深链', () => {
     expect(tutorialHref(source, PRODUCT_CAPABILITIES.github.id)).toBe(
       '/s/keep-session?campaign=summer&invite=abc&panel=help&topic=github-repository#result',
     )
+  })
+})
+
+describe('任务面板 /board 深链', () => {
+  it('只认精确 /board，会话路径与根路径仍走旧语义', () => {
+    expect(parseBoardPath('/board')).toBe(true)
+    expect(parseBoardPath('/board/')).toBe(false)
+    expect(parseBoardPath('/s/abc')).toBe(false)
+    expect(parseBoardPath('/')).toBe(false)
+    expect(workspaceWantPath('board', 'abc', false)).toBe('/board')
+    expect(workspaceWantPath('chat', 'abc', false)).toBe('/s/abc')
+  })
+
+  it('view / ticket 与 ?panel= 共存，离开 board 时清掉自己的键', () => {
+    const source = new URLSearchParams('campaign=summer&panel=settings')
+    const onBoard = withBoardParams(source, 'list', 'OCV5-42')
+    expect(onBoard.get('campaign')).toBe('summer')
+    expect(onBoard.get('panel')).toBe('settings')
+    expect(onBoard.get('view')).toBe('list')
+    expect(onBoard.get('ticket')).toBe('OCV5-42')
+
+    const left = withBoardParams(onBoard, null, null)
+    expect(left.get('campaign')).toBe('summer')
+    expect(left.get('panel')).toBe('settings')
+    expect(left.has('view')).toBe(false)
+    expect(left.has('ticket')).toBe(false)
+  })
+
+  it('默认看板省略 view=board；未知 view 回落看板', () => {
+    const clean = withBoardParams(new URLSearchParams('panel=help'), 'board', null)
+    expect(clean.has('view')).toBe(false)
+    expect(clean.get('panel')).toBe('help')
+    expect(parseBoardView(new URLSearchParams('view=inbox'))).toBe('inbox')
+    expect(parseBoardView(new URLSearchParams('view=kanban'))).toBe('board')
+    expect(parseBoardTicket(new URLSearchParams('ticket=OCV5-42'))).toBe('OCV5-42')
+    expect(parseBoardTicket(new URLSearchParams('ticket='))).toBeNull()
   })
 })

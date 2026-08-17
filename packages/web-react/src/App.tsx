@@ -60,7 +60,10 @@ import { Sidebar } from "./components/Sidebar";
 import { Alert, Sheet, Spinner, useConfirm, usePrompt } from "./components/ui";
 import { useAgentGate } from "./hooks/useAgentGate";
 import {
+  type BoardViewParam,
   type PanelParam,
+  parseBoardView,
+  parseBoardTicket,
   parsePanelParam,
   parseSessionPath,
   parseTutorialCase,
@@ -153,6 +156,9 @@ const ContainerWebPreview = lazy(() =>
 const MediaTaskCenter = lazy(() =>
   import("./components/MediaTaskCenter").then((m) => ({ default: m.MediaTaskCenter })),
 );
+const TaskboardView = lazy(() =>
+  import("./components/taskboard/TaskboardView").then((m) => ({ default: m.TaskboardView })),
+);
 
 // UX 体验对冲（红线:优化不得降低体验）:懒加载省首屏,但慢网下首开中心会多一个
 // loading 瞬间。首屏渲染完成后在浏览器空闲期预取这些懒块——Vite 对同一 specifier
@@ -167,6 +173,7 @@ export function prefetchLazyCentersOnIdle(): void {
     void import("./components/OrgCenter").catch(() => {});
     void import("./components/TutorialCenter").catch(() => {});
     void import("./components/MediaTaskCenter").catch(() => {});
+    void import("./components/taskboard/TaskboardView").catch(() => {});
   };
   if (typeof requestIdleCallback === "function") {
     requestIdleCallback(prefetch, { timeout: 8000 });
@@ -234,6 +241,16 @@ export function App() {
   // （URL 指定 > 最近会话）；resolve/放弃后置 null。
   const [pendingRouteSession, setPendingRouteSession] = useState<string | null>(() =>
     routingEnabled ? parseSessionPath(location.pathname) : null,
+  );
+  // 任务面板是并列工作区（整段替换 <main>），不是管理中心 Tab。boot 自 /board。
+  const [boardOpen, setBoardOpen] = useState(
+    () => routingEnabled && location.pathname === "/board",
+  );
+  const [boardView, setBoardView] = useState<BoardViewParam>(() =>
+    routingEnabled ? parseBoardView(params) : "board",
+  );
+  const [boardTicketId, setBoardTicketId] = useState<string | null>(() =>
+    routingEnabled ? parseBoardTicket(params) : null,
   );
   // 视图态：home=营销首页,app=登录页/工作区。启动静默续期成功（useAuth onBootAuthed）
   // 直接置 app,失败停在 home。
@@ -2048,6 +2065,7 @@ export function App() {
     const onKey = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && (e.key === "k" || e.key === "K")) {
         e.preventDefault();
+        setBoardOpen(false);
         newSession();
       } else if (e.key === "Escape" && sending) {
         e.preventDefault();
@@ -2099,6 +2117,14 @@ export function App() {
         setTutorialTopic(topic);
         setTutorialCase(caseId);
       }
+    },
+    workspace: boardOpen ? "board" : "chat",
+    boardView,
+    boardTicket: boardTicketId,
+    onPopWorkspace: (ws) => setBoardOpen(ws === "board"),
+    onPopBoardParams: (nextView, ticket) => {
+      setBoardView(nextView);
+      setBoardTicketId(ticket);
     },
   });
 
@@ -2272,6 +2298,8 @@ export function App() {
       demo || !(user?.org && (user.org.role === "owner" || user.org.role === "admin"))
         ? undefined
         : () => openOrg(),
+    onOpenBoard: demo ? undefined : () => setBoardOpen(true),
+    boardActive: boardOpen,
   };
   return (
     <MediaSignProvider
@@ -2286,7 +2314,18 @@ export function App() {
       {/* 桌面：内联侧栏（可折叠）。窄屏隐藏，改用抽屉。 */}
       {!collapsed && (
         <div className="hidden md:contents">
-          <Sidebar {...sidebarProps} onSelect={selectSession} onCollapse={() => setCollapsed(true)} />
+          <Sidebar
+            {...sidebarProps}
+            onSelect={(id) => {
+              setBoardOpen(false);
+              selectSession(id);
+            }}
+            onNew={() => {
+              setBoardOpen(false);
+              newSession();
+            }}
+            onCollapse={() => setCollapsed(true)}
+          />
         </div>
       )}
 
@@ -2302,14 +2341,24 @@ export function App() {
         <Sidebar
           {...sidebarProps}
           onSelect={(id) => {
+            setBoardOpen(false);
             selectSession(id);
             setMobileNavOpen(false);
           }}
           onNew={() => {
+            setBoardOpen(false);
             newSession();
             setMobileNavOpen(false);
           }}
           onCollapse={() => setMobileNavOpen(false)}
+          onOpenBoard={
+            demo
+              ? undefined
+              : () => {
+                  setBoardOpen(true);
+                  setMobileNavOpen(false);
+                }
+          }
           onOpenFeedback={() => {
             setMobileNavOpen(false);
             openSettings("feedback");
@@ -2318,6 +2367,28 @@ export function App() {
       </Sheet>
 
       <main className="flex min-h-0 min-w-0 flex-1 flex-col">
+        {boardOpen && !demo && auth ? (
+          <LazyBoundary fallback={<SplashFallback />}>
+            <TaskboardView
+              auth={auth}
+              view={boardView}
+              ticketId={boardTicketId}
+              onViewChange={setBoardView}
+              onOpenTicket={setBoardTicketId}
+              onOpenMobileNav={() => setMobileNavOpen(true)}
+              sidebarCollapsed={collapsed}
+              onExpandSidebar={() => setCollapsed(false)}
+              sessionIds={sessions.map((s) => s.id)}
+              onOpenSession={(id) => {
+                // originSessionKey 是 agent:<id>:webchat:dm:<peerId>，不能当 Session.id。
+                if (!id || id.includes(":") || !sessions.some((s) => s.id === id)) return;
+                setBoardOpen(false);
+                selectSession(id);
+              }}
+            />
+          </LazyBoundary>
+        ) : (
+        <>
         <ChatHeader
           agent={agent}
           onAgentClick={() => setPickerOpen(true)}
@@ -2495,6 +2566,8 @@ export function App() {
             onGoalAction={demo ? undefined : transitionSessionGoal}
           />
         </div>
+        </>
+        )}
       </main>
 
       <AgentPicker

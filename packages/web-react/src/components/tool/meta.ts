@@ -118,6 +118,8 @@ export const OC_TOOLS = {
   "oc-market": { icon: Sparkles, label: "AI 市场", tone: "accent" },
   // 对话内发起技能训练优化/生成评测用例(P2,回环 relay 到容器 gateway 自身 train/gen API)。
   "oc-skill": { icon: Sparkles, label: "技能训练", tone: "accent" },
+  // 任务面板 CLI(Bash 调 /api/board)。漏登记会把 oc-task 渲成通用「终端」并外露原始命令。
+  "oc-task": { icon: ListChecks, label: "任务面板", tone: "accent" },
   "oc-xlsx": { icon: BarChart3, label: "表格生成", tone: "success" },
   "oc-pdf": { icon: FileText, label: "PDF 生成", tone: "success" },
   "oc-docx": { icon: FileText, label: "Word 生成", tone: "success" },
@@ -255,6 +257,11 @@ const MCP_OP_META: Record<string, ToolMeta> = {
   "openclaude-memory:request_review": { icon: ShieldCheck, label: "申请质量审查" },
   "openclaude-memory:ask_user": { icon: ListChecks, label: "向用户提问" },
   "openclaude-memory:ask_gpt55_codex": { icon: Bot, label: "Codex 审查" },
+  "openclaude-memory:task_create": { icon: FilePlus, label: "创建任务单" },
+  "openclaude-memory:task_update": { icon: Pencil, label: "更新任务单" },
+  "openclaude-memory:task_comment": { icon: NotebookPen, label: "任务单评论" },
+  "openclaude-memory:task_list": { icon: ListChecks, label: "任务单列表" },
+  "openclaude-memory:task_get": { icon: FileText, label: "查看任务单" },
   // codex 内建 MCP 资源清单(op 无摘要,空态即全部信息)。
   "codex:list_mcp_resources": { icon: Boxes, label: "MCP 资源列表" },
   "codex:list_mcp_resource_templates": { icon: Layers, label: "MCP 资源模板" },
@@ -347,6 +354,15 @@ function ocCommandMeta(cli: OcCli, command: string): ToolMeta {
       uninstall: "卸载市场能力",
       "publish-skill": "发布技能",
       "publish-agent": "发布智能体",
+    };
+    return labels[op] ? { ...base, label: labels[op] } : base;
+  }
+  if (cli === "oc-task") {
+    const labels: Record<string, string> = {
+      project: "任务项目",
+      ticket: "任务单据",
+      relation: "任务关系",
+      run: "任务执行",
     };
     return labels[op] ? { ...base, label: labels[op] } : base;
   }
@@ -565,6 +581,11 @@ function mcpSummary(server: string, op: string, input: Record<string, unknown>):
     if (op === "skill_view" || op === "skill_delete" || op === "skill_save") return asStr(input.name);
     if (op === "skill_search") return asStr(input.query);
     if (op === "ask_gpt55_codex") return (asStr(input.goal) || asStr(input.context)).slice(0, 60);
+    if (op === "task_create") return asStr(input.title);
+    if (op === "task_update" || op === "task_comment" || op === "task_get") {
+      return (asStr(input.id) || asStr(input.identifier) || asStr(input.title)).slice(0, 50);
+    }
+    if (op === "task_list") return asStr(input.q) || asStr(input.status) || asStr(input.projectId);
     return op;
   }
   if (server === "web-context") {

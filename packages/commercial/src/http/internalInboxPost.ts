@@ -44,6 +44,8 @@ import {
 } from "./util.js";
 
 export const INBOX_POST_PATH = "/internal/v3/inbox-post";
+/** 熔断等 warning 级告警。容器 inbox-post 只认 info,必须走这条才能进 createInboxMessage。 */
+export const INBOX_ALERT_PATH = "/internal/v3/inbox-alert";
 
 /** createInboxMessage zod 上限:title ≤ 200 / body_md ≤ 16384。本端点 body 再收紧到 4096。 */
 const MAX_TITLE = 200;
@@ -55,7 +57,7 @@ const DEFAULT_DEDUPE_WINDOW_MS = 6 * 3600_000;
 /** 去重表条目上限:超过即整表剪枝过期项(条目≈活跃容器数×消息种类,正常两位数)。 */
 const DEDUPE_MAX_ENTRIES = 4096;
 
-const BodySchema = z
+const INFO_BODY_SCHEMA = z
   .object({
     title: z.string().min(1),
     bodyMd: z.string().min(1),
@@ -68,12 +70,24 @@ const BodySchema = z
   })
   .strict();
 
-export type InboxPostBody = z.infer<typeof BodySchema>;
+const ALERT_BODY_SCHEMA = z
+  .object({
+    title: z.string().min(1),
+    bodyMd: z.string().min(1),
+    level: z.enum(["info", "warning"]).optional(),
+    deliveryKey: z
+      .string()
+      .regex(/^[A-Za-z0-9._:-]{8,128}$/)
+      .optional(),
+  })
+  .strict();
+
+export type InboxPostBody = z.infer<typeof INFO_BODY_SCHEMA>;
 
 export interface InboxPostMessage {
   title: string;
   bodyMd: string;
-  level: "info";
+  level: "info" | "warning";
   deliveryKey?: string;
 }
 
@@ -89,6 +103,11 @@ export interface InboxPostHandlerDeps {
   /** 同内容去重窗口 ms(测试注入;默认 6h)。 */
   dedupeWindowMs?: number;
   logger?: Logger;
+  /**
+   * inbox-alert 传 true,允许 level=warning 并落入 createInboxMessage。
+   * 默认 false:保持 inbox-post 只认 info。
+   */
+  allowWarning?: boolean;
 }
 
 export interface InboxPostCtx {
@@ -112,6 +131,7 @@ export function makeInboxPostHandler(deps: InboxPostHandlerDeps): InboxPostHandl
   const now = deps.now ?? (() => Date.now());
   const maxPerMin = Math.max(1, deps.maxPerMin ?? DEFAULT_MAX_PER_MIN);
   const dedupeWindowMs = Math.max(0, deps.dedupeWindowMs ?? DEFAULT_DEDUPE_WINDOW_MS);
+  const bodySchema = deps.allowWarning ? ALERT_BODY_SCHEMA : INFO_BODY_SCHEMA;
   /** per-uid 最近一分钟内的写入时刻(ms 滑窗)。 */
   const hits = new Map<number, number[]>();
   /** `${uid}:${sha256(title\n bodyMd)}` → 最近一次落库时刻(ms)。 */
@@ -190,9 +210,9 @@ export function makeInboxPostHandler(deps: InboxPostHandlerDeps): InboxPostHandl
     const uid = identity.userId;
 
     // 2) body 校验。
-    let body: InboxPostBody;
+    let body: { title: string; bodyMd: string; level?: "info" | "warning"; deliveryKey?: string };
     try {
-      const parsed = BodySchema.safeParse(await readJsonBody(req));
+      const parsed = bodySchema.safeParse(await readJsonBody(req));
       if (!parsed.success) {
         sendError(res, 400, "INVALID_BODY", "body schema rejected", requestId);
         return;
@@ -228,7 +248,7 @@ export function makeInboxPostHandler(deps: InboxPostHandlerDeps): InboxPostHandl
       await deps.postMessage(uid, {
         title,
         bodyMd,
-        level: "info",
+        level: body.level ?? "info",
         ...(body.deliveryKey ? { deliveryKey: body.deliveryKey } : {}),
       });
     } catch (err) {

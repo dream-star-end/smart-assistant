@@ -85,6 +85,7 @@ import {
 } from './remoteTarget.js'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 import type { TurnModelAuthority, UsageAttributionTag } from './subprocessRunner.js'
+import { isPatrolSessionKey } from './taskboard/domain.js'
 import { startMemoryTurnPolicyLease } from './memoryTurnPolicyLease.js'
 
 const log = createLogger({ module: 'sessionManager' })
@@ -481,6 +482,23 @@ export function pickIdleTimeoutMs(
     return IDLE_TIMEOUT_TOOL_MS
   }
   return IDLE_TIMEOUT_DEFAULT_MS
+}
+
+/**
+ * LRU 空闲回收的「临时会话」判定。cron / 旧 task / taskboard 巡检走短空闲 TTL
+ * (`maxIdleMsCron` = 30min);webchat 走 2h。
+ *
+ * 判定看的是「距上次活动」而不是会话墙钟时长。`submit()` 把 `lastUsedAt` /
+ * `runner.lastActivityAt` 打到 turn 起点,stdout 与 CCB telemetry 持续刷新
+ * `lastActivityAt`(见本文件 liveness 注释)。巡检 delegate 硬超时 45min 期间
+ * 只要还在产出就不会被 30min 空闲窗杀掉;真静默会先被 15min turn idle
+ * watchdog 收掉,本判定只负责事后把死会话从内存里清掉,避免当成长聊会话
+ * 留 2 小时。
+ */
+export function isTempSessionKey(sessionKey: string): boolean {
+  return (
+    sessionKey.includes(':cron:') || sessionKey.includes(':task:') || isPatrolSessionKey(sessionKey)
+  )
 }
 
 function throwIfLogicalTurnCancelled(signal: AbortSignal | undefined): void {
@@ -6045,7 +6063,7 @@ export class SessionManager {
           const now = Date.now()
           const toEvict: string[] = []
           for (const [key, s] of this.sessions) {
-            const isTempSession = key.includes(':cron:') || key.includes(':task:')
+            const isTempSession = isTempSessionKey(key)
             const maxIdle = isTempSession ? this.maxIdleMsCron : this.maxIdleMsChat
             const lastActive = Math.max(s.lastUsedAt, s.runner.lastActivityAt)
             if (now - lastActive > maxIdle) {

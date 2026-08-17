@@ -359,6 +359,7 @@ import {
   type CronIndexHandler,
 } from "./http/internalCronIndex.js";
 import {
+  INBOX_ALERT_PATH,
   INBOX_POST_PATH,
   makeInboxPostHandler,
   type InboxPostHandler,
@@ -2212,33 +2213,43 @@ export async function registerCommercial(
       // /internal/v3/inbox-post — 容器 onDeliver「离线送达兜底写站内信」。uid 由容器身份推导,
       // audience 硬编码 'user' 只给自己写;created_by = MIN active admin(同 onboarding 语义,
       // 每次现解析,不缓存)。无 admin → 抛错 → handler 500。见 http/internalInboxPost.ts。
+      const postInboxToUser = async (
+        uid: number,
+        msg: { title: string; bodyMd: string; level: "info" | "warning"; deliveryKey?: string },
+      ) => {
+        const adminRow = await getPool().query<{ id: string }>(
+          `SELECT id::text AS id FROM users WHERE role = 'admin' AND status = 'active' ORDER BY id ASC LIMIT 1`,
+        );
+        const senderId = adminRow.rows[0]?.id;
+        if (!senderId) throw new Error("inbox-post: no active admin sender");
+        if (msg.deliveryKey) {
+          await createCronDeliveryInboxMessage({
+            userId: uid,
+            title: msg.title,
+            bodyMd: msg.bodyMd,
+            level: msg.level,
+            createdBy: senderId,
+            deliveryKey: msg.deliveryKey,
+          });
+          return;
+        }
+        await createInboxMessage(senderId, {
+          audience: "user",
+          user_id: uid,
+          title: msg.title,
+          body_md: msg.bodyMd,
+          level: msg.level,
+        });
+      };
       const inboxPostHandler: InboxPostHandler = makeInboxPostHandler({
         identityRepo,
-        postMessage: async (uid, msg) => {
-          const adminRow = await getPool().query<{ id: string }>(
-            `SELECT id::text AS id FROM users WHERE role = 'admin' AND status = 'active' ORDER BY id ASC LIMIT 1`,
-          );
-          const senderId = adminRow.rows[0]?.id;
-          if (!senderId) throw new Error("inbox-post: no active admin sender");
-          if (msg.deliveryKey) {
-            await createCronDeliveryInboxMessage({
-              userId: uid,
-              title: msg.title,
-              bodyMd: msg.bodyMd,
-              level: msg.level,
-              createdBy: senderId,
-              deliveryKey: msg.deliveryKey,
-            });
-            return;
-          }
-          await createInboxMessage(senderId, {
-            audience: "user",
-            user_id: uid,
-            title: msg.title,
-            body_md: msg.bodyMd,
-            level: msg.level,
-          });
-        },
+        postMessage: postInboxToUser,
+      });
+      // 熔断告警:允许 warning,仍走同一 createInboxMessage / deliveryKey 幂等。
+      const inboxAlertHandler: InboxPostHandler = makeInboxPostHandler({
+        identityRepo,
+        postMessage: postInboxToUser,
+        allowWarning: true,
       });
       // /internal/v3/model-catalog{,-epoch} —— 容器 catalog client 的 per-uid 投影下发
       // (模型权威批次 §3/§6)。服务的是**本地路径**(cron/synthetic/delegate)判定;浏览器
@@ -2377,6 +2388,9 @@ export async function registerCommercial(
         }
         if (path === INBOX_POST_PATH) {
           return inboxPostHandler(req, res, ctx);
+        }
+        if (path === INBOX_ALERT_PATH) {
+          return inboxAlertHandler(req, res, ctx);
         }
         if (path.startsWith(MARKETPLACE_AGENT_PREFIX)) {
           return marketplaceAgentHandler(req, res, ctx);

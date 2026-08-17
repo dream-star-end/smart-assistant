@@ -1,13 +1,7 @@
-import { useEffect, useRef } from "react";
-import {
-  isProductFeatureId,
-  type ProductFeatureId,
-} from "../lib/productCapabilities";
-import {
-  parseTutorialCaseId,
-  type TutorialCaseId,
-} from "../lib/tutorialCaseCatalog";
-import type { Session } from "../lib/types";
+import { useEffect, useRef } from 'react'
+import { type ProductFeatureId, isProductFeatureId } from '../lib/productCapabilities'
+import { type TutorialCaseId, parseTutorialCaseId } from '../lib/tutorialCaseCatalog'
+import type { Session } from '../lib/types'
 
 /**
  * P7 —— 最小路由（无路由库，自写）：URL 是 App 状态的单向镜像 + popstate 反灌。
@@ -29,37 +23,93 @@ import type { Session } from "../lib/types";
  * - 面板深链 `?panel=settings|market|manage|org|help`：boot 由 App 在 useState 初始化时读取
  *   （parsePanelParam）；教程另带稳定 `case` 或兼容旧版的 `topic`。打开/关闭经本 hook replaceState 同步回 query
  *   （面板不压栈，且保留其他无关 query）。
+ * - 工作区视图 `chat | board`：board 时路径为 `/board`（与会话路径并列，不是 ?panel=）。
+ *   对话 ↔ 任务面板用 pushState（后退回到上一位置）。`?view=board|list|inbox` 与
+ *   `?ticket=<identifier>` 走 replaceState，复用「保留无关 query」语义；离开 /board 时清掉。
  * - demo / reset-password 特判不启用（enabled=false，URL 原样保留）。
  */
-export type PanelParam = "settings" | "market" | "manage" | "org" | "help";
+export type PanelParam = 'settings' | 'market' | 'manage' | 'org' | 'help'
 
 /** `/s/<id>` → 会话 id（形态对齐后端 peer.id 约束 `[A-Za-z0-9_-]`；不匹配返回 null）。 */
 export function parseSessionPath(pathname: string): string | null {
-  const m = /^\/s\/([A-Za-z0-9_-]{1,64})$/.exec(pathname);
-  return m ? m[1] : null;
+  const m = /^\/s\/([A-Za-z0-9_-]{1,64})$/.exec(pathname)
+  return m ? m[1] : null
+}
+
+/** 工作区视图：对话主区 vs 任务面板全屏主区。 */
+export type WorkspaceView = 'chat' | 'board'
+
+/** `/board` 三视图。缺省 / 未知值回落看板（`board`），防深链打开不存在的视图。 */
+export type BoardViewParam = 'board' | 'list' | 'inbox'
+
+/** `/board` → true。只认精确路径，不吃 `/board/` 或子路径。 */
+export function parseBoardPath(pathname: string): boolean {
+  return pathname === '/board'
+}
+
+/**
+ * 会话路径镜像的 wantPath。board 工作区必须产出 `/board`，否则会话镜像会把
+ * 顶级路径冲回 `/` 或 `/s/<id>`。
+ */
+export function workspaceWantPath(
+  workspace: WorkspaceView,
+  activeId: string | undefined,
+  isEmptyDraft: boolean,
+): string {
+  if (workspace === 'board') return '/board'
+  return activeId && !isEmptyDraft ? `/s/${activeId}` : '/'
+}
+
+/** `?view=` → 任务面板三视图（未知值回落看板）。 */
+export function parseBoardView(sp: URLSearchParams): BoardViewParam {
+  const v = sp.get('view')
+  return v === 'list' || v === 'inbox' || v === 'board' ? v : 'board'
+}
+
+/** `?ticket=` → identifier（空/空白当没有）。 */
+export function parseBoardTicket(sp: URLSearchParams): string | null {
+  const t = sp.get('ticket')?.trim()
+  return t ? t : null
+}
+
+/**
+ * 保留其他 query（含 `?panel=`）；`view`/`ticket` 只在 board 工作区出现。
+ * 默认看板省略 `view=board`，保持 `/board` 干净。离开 board 时两者都清理。
+ */
+export function withBoardParams(
+  input: URLSearchParams,
+  view: BoardViewParam | null,
+  ticket?: string | null,
+): URLSearchParams {
+  const next = new URLSearchParams(input)
+  if (view && view !== 'board') next.set('view', view)
+  else next.delete('view')
+  if (view && ticket) next.set('ticket', ticket)
+  else next.delete('ticket')
+  return next
 }
 
 /** `?panel=` → 面板名（未知值一律当没有，防深链打开不存在的面板）。 */
 export function parsePanelParam(sp: URLSearchParams): PanelParam | null {
-  const v = sp.get("panel");
-  return v === "settings" || v === "market" || v === "manage" || v === "org" || v === "help"
+  const v = sp.get('panel')
+  return v === 'settings' || v === 'market' || v === 'manage' || v === 'org' || v === 'help'
     ? v
-    : null;
+    : null
 }
 
 /** `?panel=help&topic=` → 稳定教程 id；非 help / 未知 id 返回 null。 */
 export function parseTutorialTopic(sp: URLSearchParams): ProductFeatureId | null {
-  if (parsePanelParam(sp) !== "help") return null;
+  if (parsePanelParam(sp) !== 'help') return null
   // case 与 topic 同时出现时，案例优先；这样复制过的新链接不会被旧参数抢走。
-  if (parseTutorialCase(sp)) return null;
-  const topic = sp.get("topic");
-  return isProductFeatureId(topic) ? topic : null;
+  if (parseTutorialCase(sp)) return null
+  const topic = sp.get('topic')
+  return isProductFeatureId(topic) ? topic : null
 }
 
 /** `?panel=help&case=` → 稳定案例 id；非 help / 未知 id 返回 null。 */
 export function parseTutorialCase(sp: URLSearchParams): TutorialCaseId | null {
-  if (parsePanelParam(sp) !== "help") return null;
-  return parseTutorialCaseId(sp.get("case"));
+  if (parsePanelParam(sp) !== 'help') return null
+  return parseTutorialCaseId(sp.get('case'))
 }
 
 /** 保留其他 query；case/topic 互斥；无选择即案例总览；离开 help 时两者都清理。 */
@@ -69,20 +119,20 @@ export function withPanelParams(
   topic?: ProductFeatureId | null,
   caseId?: TutorialCaseId | null,
 ): URLSearchParams {
-  const next = new URLSearchParams(input);
-  if (panel) next.set("panel", panel);
-  else next.delete("panel");
-  if (panel === "help" && caseId) {
-    next.set("case", caseId);
-    next.delete("topic");
-  } else if (panel === "help" && topic) {
-    next.set("topic", topic);
-    next.delete("case");
+  const next = new URLSearchParams(input)
+  if (panel) next.set('panel', panel)
+  else next.delete('panel')
+  if (panel === 'help' && caseId) {
+    next.set('case', caseId)
+    next.delete('topic')
+  } else if (panel === 'help' && topic) {
+    next.set('topic', topic)
+    next.delete('case')
   } else {
-    next.delete("case");
-    next.delete("topic");
+    next.delete('case')
+    next.delete('topic')
   }
-  return next;
+  return next
 }
 
 /**
@@ -96,134 +146,176 @@ export function tutorialHref(
 ): string {
   const query = withPanelParams(
     new URLSearchParams(locationLike.search),
-    "help",
+    'help',
     topic,
     caseId,
-  ).toString();
-  return `${locationLike.pathname}${query ? `?${query}` : ""}${locationLike.hash}`;
+  ).toString()
+  return `${locationLike.pathname}${query ? `?${query}` : ''}${locationLike.hash}`
 }
 
 export type UseAppRouteOptions = {
   /** 非 demo 且非 reset-password 时启用。 */
-  enabled: boolean;
+  enabled: boolean
   /** 已进入工作区（auth+user 就绪）：深链恢复与 popstate 只在工作区内生效。 */
-  inWorkspace: boolean;
-  activeId: string | undefined;
-  sessions: Session[];
+  inWorkspace: boolean
+  activeId: string | undefined
+  sessions: Session[]
   /** listSessions 已落定（useSessionList）：判定深链会话"确实不存在"的依据。 */
-  serverListSettled: boolean;
+  serverListSettled: boolean
   /** 启动深链 `/s/<id>` 的未决恢复目标（App 持有该 state 以同步暂停自动选中）。 */
-  pendingSessionId: string | null;
-  clearPendingSession: () => void;
-  selectSession: (id: string) => void;
+  pendingSessionId: string | null
+  clearPendingSession: () => void
+  selectSession: (id: string) => void
   /** popstate 回到 `/`：清除选中（回空会话态）。 */
-  onPopToRoot: () => void;
+  onPopToRoot: () => void
   /** 当前打开的面板（App 派生；顶层中心互斥并按单一优先级镜像）。 */
-  activePanel: PanelParam | null;
+  activePanel: PanelParam | null
   /** help 打开时的旧版功能教程；案例总览/案例详情为 null。 */
-  activeTopic?: ProductFeatureId | null;
+  activeTopic?: ProductFeatureId | null
   /** help 打开时的案例；功能教程/案例总览为 null。 */
-  activeCase?: TutorialCaseId | null;
+  activeCase?: TutorialCaseId | null
   /** popstate 反灌面板/query（外部 help 深链恢复时使用）。 */
   onPopPanel?: (
     panel: PanelParam | null,
     topic: ProductFeatureId | null,
     caseId: TutorialCaseId | null,
-  ) => void;
-};
+  ) => void
+  /** 当前工作区。缺省 chat，保持旧调用方零改动。 */
+  workspace?: WorkspaceView
+  /** board 工作区的三视图（镜像到 `?view=`）。 */
+  boardView?: BoardViewParam
+  /** board 工作区打开的单据 identifier（镜像到 `?ticket=`）。 */
+  boardTicket?: string | null
+  /** popstate 反灌工作区（`/board` ↔ `/` `/s/<id>`）。 */
+  onPopWorkspace?: (workspace: WorkspaceView) => void
+  /** popstate 反灌 board 的 view/ticket。 */
+  onPopBoardParams?: (view: BoardViewParam, ticket: string | null) => void
+}
 
 export function useAppRoute(opts: UseAppRouteOptions): void {
-  const { enabled, inWorkspace, activeId, sessions, serverListSettled, pendingSessionId } = opts;
-  const { activePanel, activeTopic, activeCase } = opts;
+  const { enabled, inWorkspace, activeId, sessions, serverListSettled, pendingSessionId } = opts
+  const { activePanel, activeTopic, activeCase } = opts
   // 回调/最新值经 ref 镜像（App 每渲染传新闭包；popstate 监听只挂一次仍读最新）。
-  const cbRef = useRef(opts);
-  cbRef.current = opts;
+  const cbRef = useRef(opts)
+  cbRef.current = opts
 
   // popstate：浏览器后退/前进 → URL 为权威反灌状态。仅工作区内响应（登录页/首页的
   // 历史导航不该操作会话态）。
   useEffect(() => {
-    if (!enabled) return;
+    if (!enabled) return
     const onPop = () => {
-      if (!cbRef.current.inWorkspace) return;
-      const query = new URLSearchParams(location.search);
+      if (!cbRef.current.inWorkspace) return
+      const query = new URLSearchParams(location.search)
       cbRef.current.onPopPanel?.(
         parsePanelParam(query),
         parseTutorialTopic(query),
         parseTutorialCase(query),
-      );
-      const id = parseSessionPath(location.pathname);
+      )
+      const id = parseSessionPath(location.pathname)
       if (id) {
+        cbRef.current.onPopWorkspace?.('chat')
         if (cbRef.current.sessions.some((s) => s.id === id)) {
-          cbRef.current.selectSession(id);
+          cbRef.current.selectSession(id)
         } else {
           // 历史栈里的已删除会话:回空态并 replace 修正 URL(不再制造新条目)。
-          cbRef.current.onPopToRoot();
-          history.replaceState({}, "", "/" + location.search + location.hash);
+          cbRef.current.onPopToRoot()
+          history.replaceState({}, '', `/${location.search}${location.hash}`)
         }
-      } else if (location.pathname === "/") {
-        cbRef.current.onPopToRoot();
+      } else if (parseBoardPath(location.pathname)) {
+        // /board 是并列工作区，不能当未知路径掉进空分支（主区会仍停在对话）。
+        cbRef.current.onPopWorkspace?.('board')
+        cbRef.current.onPopBoardParams?.(parseBoardView(query), parseBoardTicket(query))
+      } else if (location.pathname === '/') {
+        cbRef.current.onPopWorkspace?.('chat')
+        cbRef.current.onPopToRoot()
       }
-    };
-    window.addEventListener("popstate", onPop);
-    return () => window.removeEventListener("popstate", onPop);
-  }, [enabled]);
+    }
+    window.addEventListener('popstate', onPop)
+    return () => window.removeEventListener('popstate', onPop)
+  }, [enabled])
 
   // 启动深链恢复：等目标会话出现（IndexedDB 注水或 listSessions 到达）再选中；
   // listSessions 落定仍不存在 → 放弃（URL 由下方镜像 effect 回写 `/`，自动选中随之解锁）。
   useEffect(() => {
-    if (!enabled || !inWorkspace || !pendingSessionId) return;
+    if (!enabled || !inWorkspace || !pendingSessionId) return
     if (sessions.some((s) => s.id === pendingSessionId)) {
-      cbRef.current.clearPendingSession();
-      cbRef.current.selectSession(pendingSessionId);
+      cbRef.current.clearPendingSession()
+      cbRef.current.selectSession(pendingSessionId)
     } else if (serverListSettled) {
-      cbRef.current.clearPendingSession();
+      cbRef.current.clearPendingSession()
     }
-  }, [enabled, inWorkspace, pendingSessionId, sessions, serverListSettled]);
+  }, [enabled, inWorkspace, pendingSessionId, sessions, serverListSettled])
 
   // activeId → URL 路径镜像。空会话 draft（列表里 messageCount=0，典型为「新建会话」
   // 尚未首发）不占 URL —— 首次发送后计数>0 自然落 /s/<id>；popstate 到侧栏没有的 id 时
   // 列表查不到 → 不视作 draft，URL 保持用户所到之处。
   // push/replace 取舍见文件头「历史栈语义」:会话间导航 push,其余 replace。
-  const activeEntry = activeId ? sessions.find((s) => s.id === activeId) : undefined;
-  const isEmptyDraft = activeEntry !== undefined && activeEntry.messageCount === 0;
-  const wantPath = activeId && !isEmptyDraft ? `/s/${activeId}` : "/";
-  const prevIdRef = useRef<string | undefined>(undefined);
+  const activeEntry = activeId ? sessions.find((s) => s.id === activeId) : undefined
+  const isEmptyDraft = activeEntry !== undefined && activeEntry.messageCount === 0
+  const workspace: WorkspaceView = opts.workspace ?? 'chat'
+  const wantPath = workspaceWantPath(workspace, activeId, isEmptyDraft)
+  const prevIdRef = useRef<string | undefined>(undefined)
+  const prevWorkspaceRef = useRef<WorkspaceView | undefined>(undefined)
   useEffect(() => {
-    if (!enabled) return;
+    if (!enabled) return
     // 深链恢复未决：不回写（否则把 URL 里的 /s/<id> 冲成当前空态的 /）。
-    if (pendingSessionId) return;
-    const prevId = prevIdRef.current;
-    prevIdRef.current = activeId;
-    if (location.pathname === wantPath) return; // popstate 反灌/深链恢复:URL 已是权威
-    const suffix = location.search + location.hash;
+    if (pendingSessionId) return
+    const prevId = prevIdRef.current
+    const prevWorkspace = prevWorkspaceRef.current
+    prevIdRef.current = activeId
+    prevWorkspaceRef.current = workspace
+    if (location.pathname === wantPath) return // popstate 反灌/深链恢复:URL 已是权威
+    const suffix = location.search + location.hash
+    // 对话 ↔ 任务面板：用户换工作区，push（后退=上一个位置）。首次 boot 的
+    // prevWorkspace 为空走下面的 replace 分支（启动噪音不压栈）。
+    if (prevWorkspace !== undefined && prevWorkspace !== workspace) {
+      history.pushState({}, '', wantPath + suffix)
+      return
+    }
     // 同一会话的 URL 形态毕业(draft 首发 / → /s/<id>):同一逻辑位置,replace;
     // 首次选中(prevId 空:boot 自动选中最近会话,或落地后的第一次点击):启动噪音不压栈。
     if ((activeId !== undefined && activeId === prevId) || prevId === undefined) {
-      history.replaceState({}, "", wantPath + suffix);
-      return;
+      history.replaceState({}, '', wantPath + suffix)
+      return
     }
     // 回 / 且来源会话已不在列表(删除当前会话):死条目不进历史栈,replace。
     if (
-      wantPath === "/" &&
+      wantPath === '/' &&
       activeId === undefined &&
       !cbRef.current.sessions.some((s) => s.id === prevId)
     ) {
-      history.replaceState({}, "", wantPath + suffix);
-      return;
+      history.replaceState({}, '', wantPath + suffix)
+      return
     }
     // 用户会话导航(切会话/新建):pushState —— 后退=上一个会话。
-    history.pushState({}, "", wantPath + suffix);
-  }, [enabled, pendingSessionId, wantPath, activeId]);
+    history.pushState({}, '', wantPath + suffix)
+  }, [enabled, pendingSessionId, wantPath, activeId, workspace])
 
   // 面板 → ?panel= query（replaceState；关闭时清参数）。不限工作区：未登录携带
   // ?panel= 深链时面板 state 已在 App 初始化为打开（进工作区即呈现），此 effect 恰好
   // no-op 保参；登出后面板关闭 → 参数即时清理。
   useEffect(() => {
-    if (!enabled) return;
-    const current = new URLSearchParams(location.search);
-    const next = withPanelParams(current, activePanel, activeTopic, activeCase);
-    const q = next.toString();
-    if (q === current.toString()) return;
-    history.replaceState({}, "", location.pathname + (q ? `?${q}` : "") + location.hash);
-  }, [enabled, activePanel, activeTopic, activeCase]);
+    if (!enabled) return
+    const current = new URLSearchParams(location.search)
+    const next = withPanelParams(current, activePanel, activeTopic, activeCase)
+    const q = next.toString()
+    if (q === current.toString()) return
+    history.replaceState({}, '', location.pathname + (q ? `?${q}` : '') + location.hash)
+  }, [enabled, activePanel, activeTopic, activeCase])
+
+  // board → ?view= / ?ticket=（replaceState；离开 /board 时清参数）。与 withPanelParams
+  // 一样只改自己的键，campaign / panel 等无关 query 原样保留。
+  const { boardView, boardTicket } = opts
+  useEffect(() => {
+    if (!enabled) return
+    const current = new URLSearchParams(location.search)
+    const next = withBoardParams(
+      current,
+      workspace === 'board' ? (boardView ?? 'board') : null,
+      workspace === 'board' ? boardTicket : null,
+    )
+    const q = next.toString()
+    if (q === current.toString()) return
+    history.replaceState({}, '', location.pathname + (q ? `?${q}` : '') + location.hash)
+  }, [enabled, workspace, boardView, boardTicket])
 }

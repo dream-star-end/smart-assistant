@@ -232,9 +232,15 @@ import {
   deliverCronViaAdapter,
   isUserInitiatedCronJob,
 } from './cron.js'
+import { handleTaskboardApi, resolveTaskboardActor, setPatrolExecutionHandler } from './taskboard/http.js'
+import { getTaskboardDb } from './taskboard/db/index.js'
+import { isPatrolSessionKey } from './taskboard/domain.js'
+import { PatrolEngine } from './taskboard/patrol.js'
+import { TaskboardNotifier } from './taskboard/notify.js'
 import { sendV3WechatProactive, readV3WechatProactiveConfig } from './v3WechatProactive.js'
 import { sendV3QqProactive, readV3QqProactiveConfig } from './v3QqProactive.js'
 import { postInboxMessage, postInboxMessageDurable } from './v3InboxPost.js'
+import { postInboxAlert } from './v3InboxAlert.js'
 import { parseDocument } from './documentParser.js'
 import {
   makeDelegateProgressBlock,
@@ -1429,6 +1435,11 @@ interface RunDelegateInput {
   /** gateway 硬编排触发的隐藏审查员委派。影响:runLog isReview / 资源闸走保留槽 + 免
    *  per-parent 桶 / 完成后解析结构化 verdict / 不置位"本 turn 有非隐藏委派"跟踪。 */
   isReview?: boolean
+  /** 覆盖默认 `agent:<id>:delegate:...`。taskboard 巡检必须传入 buildPatrolSessionKey()。 */
+  sessionKey?: string
+  /** 覆盖默认 channel 'delegate'。taskboard 传 'taskboard',且不得加入
+   *  MASTER_SINK_PERSIST_CHANNELS,否则巡检文本会写进 client_sessions 刷屏。 */
+  channel?: string
 }
 /** `_runDelegateTask` 结果。rejected=闸/校验拒(HTTP 壳映射 4xx/429/503);error=session
  *  创建等意外(映射 500);completed=真正执行完(ok/output/error/timedOut,review 还带 verdict)。 */
@@ -1443,6 +1454,10 @@ type DelegateTaskResult =
       timedOut: boolean
       runId: string
       verdict?: ReviewVerdict
+      /** 从内存 session 抄的用量。taskboard 回写 run;普通 delegate 可忽略。 */
+      tokensIn?: number | null
+      tokensOut?: number | null
+      costUsd?: number | null
     }
 
 // ── hidden 系统 agent 串行委派熔断 ──────────────────────────────────────────
@@ -1666,6 +1681,11 @@ export class Gateway {
   private rateLimiter = new RateLimiter()
   private _wsKeepaliveTimer: ReturnType<typeof setInterval> | null = null
   private _taskSchedulerTimer: ReturnType<typeof setInterval> | null = null
+  /** taskboard 统一 60s tick。与 _taskSchedulerTimer 同款生命周期:start 里
+   *  setInterval + unref, _doShutdown Stage 2 clearInterval。不登记
+   *  check-schedulers.ts(那份 lint 只扫 commercial/src)。 */
+  private _taskboardTickTimer: ReturnType<typeof setInterval> | null = null
+  private _taskboardPatrol: PatrolEngine | null = null
   private _oauthRefreshTimer: ReturnType<typeof setInterval> | null = null
   private _pendingPermissionSweepTimer: ReturnType<typeof setInterval> | null = null
   private _stopEviction: (() => void) | null = null
@@ -2772,6 +2792,50 @@ export class Gateway {
       )
     }, 60_000)
 
+    // Taskboard 统一巡检 tick:一个 60s 定时器扫全部 stage,不按 stage 建 cron job。
+    // 通知复用 onDeliver 瀑布(微信接管则不再推站内信);熔断 warning 走 createInboxMessage。
+    const taskboardNotify = new TaskboardNotifier({
+      getDb: () => getTaskboardDb(),
+      log: (msg, extra) => this.log.warn(msg, extra),
+      transport: {
+        sendWechat: async ({ text, outboundId }) => {
+          const cfg = readV3WechatProactiveConfig()
+          if (!cfg) return { kind: 'fallback' as const, marked: false }
+          return sendV3WechatProactive({ config: cfg, text, outboundId })
+        },
+        postInbox: ({ title, bodyMd, deliveryKey }) =>
+          postInboxMessage({ title, bodyMd, deliveryKey }),
+        createInboxMessage: (args) => postInboxAlert(args),
+      },
+    })
+    this._taskboardPatrol = new PatrolEngine({
+      getDb: () => getTaskboardDb(),
+      delegate: (input) => this._runTaskboardDelegate(input),
+      log: (msg, extra) => this.log.info(msg, extra),
+      notify: taskboardNotify,
+      onAlert: (alert) => {
+        this.log.warn('taskboard guardrail', {
+          kind: alert.kind,
+          outboundId: alert.outboundId,
+          message: alert.message,
+          stageId: alert.stageId,
+          ticketId: alert.ticketId,
+        })
+        void taskboardNotify.onGuardrailAlert(alert)
+      },
+    })
+    setPatrolExecutionHandler((job) => {
+      void this._taskboardPatrol?.executeJob(job).catch((err) =>
+        this.log.error('taskboard patrol job failed', undefined, err),
+      )
+    })
+    this._taskboardTickTimer = setInterval(() => {
+      this._taskboardPatrol?.tick().catch((err) =>
+        this.log.error('taskboard tick failed', undefined, err),
+      )
+    }, 60_000)
+    this._taskboardTickTimer.unref()
+
     // Invalidate task cache when tasks are created or deleted
     eventBus.on('task.created', () => this._invalidateTaskCache())
     eventBus.on('task.deleted', () => this._invalidateTaskCache())
@@ -2948,6 +3012,12 @@ export class Gateway {
       clearInterval(this._taskSchedulerTimer)
       this._taskSchedulerTimer = null
     }
+    if (this._taskboardTickTimer !== null) {
+      clearInterval(this._taskboardTickTimer)
+      this._taskboardTickTimer = null
+    }
+    setPatrolExecutionHandler(null)
+    this._taskboardPatrol = null
     if (this._oauthRefreshTimer !== null) {
       clearInterval(this._oauthRefreshTimer)
       this._oauthRefreshTimer = null
@@ -3825,14 +3895,7 @@ export class Gateway {
       listClientSessions(userId).then((owned) => {
         const ownedIds = new Set(owned.map((s) => s.id))
         // Also include sessions with no matching client session (cron/task sessions) only for default user
-        const filtered = allLive.filter((s) => {
-          // 排除内部委派会话：它们不是用户聊天会话，不能经此 API 泄露（Codex 审）。
-          // key 形如 agent:<id>:delegate:...（第 3 段区分）。
-          const kind = s.sessionKey.split(':')[2] || ''
-          if (kind === 'delegate') return false
-          const peerId = s.sessionKey.split(':')[4] || ''
-          return ownedIds.has(peerId) || (userId === 'default' && !peerId.startsWith('web-'))
-        })
+        const filtered = filterUserVisibleLiveSessions(allLive, ownedIds, userId)
         this.sendJson(res, 200, { sessions: filtered })
       }).catch(() => this.sendJson(res, 200, { sessions: [] }))
       return
@@ -4840,6 +4903,53 @@ export class Gateway {
       this.handleCronItem(req, res, cronItemMatch[1]).catch((err) =>
         this.sendInternalError(res, err),
       )
+      return
+    }
+    // ── Taskboard REST API (`/api/board/*`) ──
+    // 分发形态必须写在本文件的 url.pathname === / match 上,containerRouteInventory
+    // 靠扫描这三种字面量收路由;藏进 helper 会让 allowlist 闭包测试变死规则。
+    if (
+      url.pathname === '/api/board/projects' ||
+      url.pathname === '/api/board/tickets' ||
+      url.pathname === '/api/board/pipelines' ||
+      url.pathname === '/api/board/agents' ||
+      url.pathname === '/api/board/settings' ||
+      url.pathname.match(/^\/api\/board\/projects\/([^/]+)$/) ||
+      url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/board$/) ||
+      url.pathname.match(/^\/api\/board\/tickets\/([^/]+)$/) ||
+      url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/(ready|claim|advance)$/) ||
+      url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/(block|approve|reject)$/) ||
+      url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/(done|cancel|comment|patrol)$/) ||
+      url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/runs$/) ||
+      url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/relations$/) ||
+      url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/comments$/) ||
+      url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/activity$/) ||
+      url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/timeline$/) ||
+      url.pathname.match(/^\/api\/board\/pipelines\/([^/]+)$/) ||
+      url.pathname.match(/^\/api\/board\/pipelines\/([^/]+)\/stages$/) ||
+      url.pathname.match(/^\/api\/board\/stages\/([^/]+)$/) ||
+      url.pathname.match(/^\/api\/board\/runs\/([^/]+)$/) ||
+      url.pathname.match(/^\/api\/board\/relations\/([^/]+)$/)
+    ) {
+      handleTaskboardApi(req, res, {
+        resolveActor: (r) =>
+          resolveTaskboardActor(r, {
+            jwtSecret: this.deps.config.gateway.accessToken,
+            isCommercialJwt: (t) => this.verifyCommercialJwt(t) !== null,
+            // 必须传真实校验结果:taskboard 层不得自行嗅 X-OpenClaude-Bridge-Nonce,
+            // 否则容器内 agent 伪造该头即可冒充 human 自批自结单。
+            bridgeVerified: this.checkBridgeBypass(r, url),
+          }),
+        listAgents: async () => {
+          const view = await this._getAgentsConfigUserView()
+          return view.agents.map((a) => ({
+            id: a.id,
+            name: a.displayName ?? a.id,
+            model: a.model ?? '',
+            description: a.greeting ?? '',
+          }))
+        },
+      }).catch((err) => this.sendInternalError(res, err))
       return
     }
     // ── Tasks REST API ──
@@ -9939,7 +10049,9 @@ export class Gateway {
       }
     }
 
-    const sessionKey = `agent:${targetAgentId}:delegate:${sourceAgent || 'system'}:${Date.now()}`
+    const sessionKey =
+      input.sessionKey ??
+      `agent:${targetAgentId}:delegate:${sourceAgent || 'system'}:${Date.now()}`
     this.log.info('delegate', {
       sourceAgent,
       targetAgentId,
@@ -10114,7 +10226,7 @@ export class Gateway {
         agent: delegatedAgent,
         // flag 未开 → {}(零变化);flag 开 → catalog 投影的 canonicalModel + engine。
         ...localExecutionOverride(delegateExec),
-        channel: 'delegate',
+        channel: input.channel ?? 'delegate',
         peerId: sourceAgent || 'system',
         repoSessionId: progressTarget?.peerId ?? delegateParent?.repoSessionId,
         workspaceMode: delegateParent?.workspaceMode,
@@ -10556,6 +10668,46 @@ export class Gateway {
       timedOut,
       runId: progressRunId,
       verdict,
+      // destroySession 是 fire-and-forget,此时 session 对象还在内存,用量从这里抄。
+      // usage_log 是 eventBus 异步,return 时多半还没落盘,不能只靠它。
+      tokensIn: session.totalInputTokens || null,
+      tokensOut: session.totalOutputTokens || null,
+      costUsd: session.totalCostUSD || null,
+    }
+  }
+
+  /**
+   * taskboard 巡检的 delegate 适配器。同进程直调 _runDelegateTask,才能拿到
+   * timedOut;sessionKey / channel 走巡检专用形状,不进主会话列表。
+   */
+  private async _runTaskboardDelegate(
+    input: import('./taskboard/patrol.js').PatrolDelegateInput,
+  ): Promise<import('./taskboard/patrol.js').PatrolDelegateResult> {
+    const result = await this._runDelegateTask({
+      targetAgentId: input.agentId,
+      goal: input.goal,
+      context: input.context,
+      sourceAgent: 'taskboard',
+      toolsets: input.toolsets ?? undefined,
+      depth: 0,
+      effort: input.effort ?? undefined,
+      sessionKey: input.sessionKey,
+      channel: 'taskboard',
+    })
+    if (result.kind === 'rejected') {
+      return { ok: false, output: '', error: result.message }
+    }
+    if (result.kind === 'error') {
+      return { ok: false, output: '', error: result.message }
+    }
+    return {
+      ok: result.ok && !result.timedOut,
+      output: result.output,
+      error: result.error,
+      timedOut: result.timedOut,
+      tokensIn: result.tokensIn ?? null,
+      tokensOut: result.tokensOut ?? null,
+      costUsd: result.costUsd ?? null,
     }
   }
 
@@ -16145,6 +16297,29 @@ export function _earlyRejectErrorFrames(args: {
   return [structured, legacyFinal] as const
 }
 
+/**
+ * GET /api/sessions 的 live/内存会话列表过滤。
+ *
+ * 巡检 key 必须走 `isPatrolSessionKey`(CORRECTIONS §1.3/§1.4):kind 段是
+ * `taskboard`,若只排除 `delegate`,default 用户会把 stageId 误当成 peerId 放进
+ * 侧栏。内部委派同样不是用户聊天会话。
+ */
+export function filterUserVisibleLiveSessions<T extends { sessionKey: string }>(
+  sessions: readonly T[],
+  ownedIds: ReadonlySet<string>,
+  userId: string,
+): T[] {
+  return sessions.filter((s) => {
+    if (isPatrolSessionKey(s.sessionKey)) return false
+    // 排除内部委派会话：它们不是用户聊天会话，不能经此 API 泄露（Codex 审）。
+    // key 形如 agent:<id>:delegate:...（第 3 段区分）。
+    const kind = s.sessionKey.split(':')[2] || ''
+    if (kind === 'delegate') return false
+    const peerId = s.sessionKey.split(':')[4] || ''
+    return ownedIds.has(peerId) || (userId === 'default' && !peerId.startsWith('web-'))
+  })
+}
+
 // ── 长会话热尾巴 + 归档 (Agent B §2) — pure helpers(`_` 前缀 test seam)──
 
 /**
@@ -17024,7 +17199,9 @@ export { shouldServeInline }
 const KNOWN_ROUTES = [
   '/api/healthz', '/api/doctor', '/api/usage', '/api/usage/events',
   '/api/runs', '/api/sessions', '/api/config', '/api/agents', '/api/search',
-  '/api/cron', '/api/delegate/wait', '/api/tasks', '/api/tasks-executions', '/api/webhooks',
+  '/api/cron', '/api/board', '/api/board/projects', '/api/board/tickets',
+  '/api/board/pipelines', '/api/board/agents', '/api/board/settings',
+  '/api/delegate/wait', '/api/tasks', '/api/tasks-executions', '/api/webhooks',
   '/api/wechat/pair/start', '/api/wechat/pair/poll', '/api/wechat/pair/cancel',
   '/api/wechat/binding', '/api/wechat/binding/status',
   '/api/auth/session', '/api/auth/logout', '/api/auth/claude/start',
@@ -17043,6 +17220,15 @@ function normalizePath(p: string): string {
     .replace(/\/api\/agents\/[a-zA-Z0-9_-]+\/([a-z]+)/, '/api/agents/:id/$1')
     .replace(/\/api\/agents\/[a-zA-Z0-9_-]+/, '/api/agents/:id')
     .replace(/\/api\/cron\/[a-zA-Z0-9_-]+/, '/api/cron/:id')
+    .replace(/\/api\/board\/projects\/[^/]+\/board/, '/api/board/projects/:id/board')
+    .replace(/\/api\/board\/projects\/[^/]+/, '/api/board/projects/:id')
+    .replace(/\/api\/board\/tickets\/[^/]+\/[a-z_]+/, '/api/board/tickets/:id/:action')
+    .replace(/\/api\/board\/tickets\/[^/]+/, '/api/board/tickets/:id')
+    .replace(/\/api\/board\/pipelines\/[^/]+\/stages/, '/api/board/pipelines/:id/stages')
+    .replace(/\/api\/board\/pipelines\/[^/]+/, '/api/board/pipelines/:id')
+    .replace(/\/api\/board\/stages\/[^/]+/, '/api/board/stages/:id')
+    .replace(/\/api\/board\/runs\/[^/]+/, '/api/board/runs/:id')
+    .replace(/\/api\/board\/relations\/[^/]+/, '/api/board/relations/:id')
     .replace(/\/api\/tasks\/[a-zA-Z0-9_-]+/, '/api/tasks/:id')
     .replace(/\/api\/webhooks\/[a-zA-Z0-9_-]+/, '/api/webhooks/:id')
     .replace(/\/api\/media\/.+/, '/api/media/:file')

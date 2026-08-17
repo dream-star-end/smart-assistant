@@ -240,6 +240,123 @@ export const BRIDGE_API_ALLOWLIST: readonly BridgeApiAllowRule[] = [
     proxyFromCommercial: true,
   },
 
+  // Taskboard (`/api/board/*`). 每条子路径 + method 都要有条目,且必须
+  // proxyFromCommercial:true,否则 commercial 不代理进容器,containerRouteProxyClosure 红。
+  {
+    label: '/api/board/projects',
+    re: /^\/api\/board\/projects$/,
+    methods: M('GET', 'POST'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/projects/:id',
+    re: /^\/api\/board\/projects\/[^/]+$/,
+    methods: M('GET', 'PATCH', 'DELETE'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/projects/:id/board',
+    re: /^\/api\/board\/projects\/[^/]+\/board$/,
+    methods: M('GET'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/tickets',
+    re: /^\/api\/board\/tickets$/,
+    methods: M('GET', 'POST'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/tickets/:id',
+    re: /^\/api\/board\/tickets\/[^/]+$/,
+    methods: M('GET', 'PATCH'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/tickets/:id/:action',
+    re: /^\/api\/board\/tickets\/[^/]+\/(ready|claim|advance|block|approve|reject|done|cancel|comment|patrol)$/,
+    methods: M('POST'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/tickets/:id/runs',
+    re: /^\/api\/board\/tickets\/[^/]+\/runs$/,
+    methods: M('GET'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/tickets/:id/relations',
+    re: /^\/api\/board\/tickets\/[^/]+\/relations$/,
+    methods: M('GET', 'POST'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/tickets/:id/comments',
+    re: /^\/api\/board\/tickets\/[^/]+\/comments$/,
+    methods: M('GET'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/tickets/:id/activity',
+    re: /^\/api\/board\/tickets\/[^/]+\/activity$/,
+    methods: M('GET'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/tickets/:id/timeline',
+    re: /^\/api\/board\/tickets\/[^/]+\/timeline$/,
+    methods: M('GET'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/pipelines',
+    re: /^\/api\/board\/pipelines$/,
+    methods: M('GET', 'POST'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/pipelines/:id',
+    re: /^\/api\/board\/pipelines\/[^/]+$/,
+    methods: M('GET', 'PATCH'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/pipelines/:id/stages',
+    re: /^\/api\/board\/pipelines\/[^/]+\/stages$/,
+    methods: M('GET', 'POST'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/stages/:id',
+    re: /^\/api\/board\/stages\/[^/]+$/,
+    methods: M('GET', 'PATCH'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/runs/:id',
+    re: /^\/api\/board\/runs\/[^/]+$/,
+    methods: M('GET'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/relations/:id',
+    re: /^\/api\/board\/relations\/[^/]+$/,
+    methods: M('DELETE'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/agents',
+    re: /^\/api\/board\/agents$/,
+    methods: M('GET'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/settings',
+    re: /^\/api\/board\/settings$/,
+    methods: M('GET', 'PATCH'),
+    proxyFromCommercial: true,
+  },
+
   {
     label: '/api/tasks',
     re: /^\/api\/tasks$/,

@@ -102,6 +102,19 @@ describe('ccb-baseline skills ↔ manifest', () => {
     assert.doesNotMatch(body, /### Video\s+Submit only:\s+```bash\s+mmx video generate/)
   })
 
+  it('ships manage-taskboard with identifier / claim / done iron rules', () => {
+    assert.ok((V3_CCB_BASELINE_SKILL_NAMES as readonly string[]).includes('manage-taskboard'))
+    const body = readFileSync(join(skillsDir, 'manage-taskboard', 'SKILL.md'), 'utf8')
+    assert.match(body, /identifier/)
+    assert.match(body, /绝不自己拼/)
+    assert.match(body, /backlog/)
+    assert.match(body, /claim/)
+    assert.match(body, /done/)
+    assert.match(body, /oc-task/)
+    assert.match(body, /task_create/)
+    assert.doesNotMatch(body, /OCV5-\$\{/)
+  })
+
   it('ships the connector authoring workflow with its authority and safety gates', () => {
     assert.ok(
       (V3_CCB_BASELINE_SKILL_NAMES as readonly string[]).includes('connector-authoring'),

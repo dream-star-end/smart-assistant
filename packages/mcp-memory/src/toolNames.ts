@@ -17,12 +17,17 @@ export const MEMORY_MCP_TOOL_NAMES = [
   'delegate_task',
   'delegate_tasks',
   'request_review',
+  'task_create',
+  'task_update',
+  'task_comment',
+  'task_list',
+  'task_get',
   'ask_user',
-] as const;
+] as const
 
 /** 技能训练会话(OPENCLAUDE_SKILL_TRAIN_RUN_ID)条件注册,替换 skill_save/skill_delete。 */
-export const MEMORY_MCP_TRAIN_ONLY_TOOL_NAMES = ['skill_propose'] as const;
+export const MEMORY_MCP_TRAIN_ONLY_TOOL_NAMES = ['skill_propose'] as const
 
 export type MemoryMcpToolName =
   | (typeof MEMORY_MCP_TOOL_NAMES)[number]
-  | (typeof MEMORY_MCP_TRAIN_ONLY_TOOL_NAMES)[number];
+  | (typeof MEMORY_MCP_TRAIN_ONLY_TOOL_NAMES)[number]
