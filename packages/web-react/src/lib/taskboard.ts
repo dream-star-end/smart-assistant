@@ -62,11 +62,46 @@ export type TicketSource = (typeof TICKET_SOURCES)[number]
 export const STAGE_KINDS = ['ai', 'human', 'gate'] as const
 export type StageKind = (typeof STAGE_KINDS)[number]
 
+export const STAGE_KIND_LABEL: Record<StageKind, string> = {
+  ai: 'AI 阶段',
+  human: '人工阶段',
+  gate: '闸门',
+}
+
 export const ON_SUCCESS_ACTIONS = ['advance', 'wait_human', 'stay'] as const
 export type OnSuccessAction = (typeof ON_SUCCESS_ACTIONS)[number]
 
+export const ON_SUCCESS_LABEL: Record<OnSuccessAction, string> = {
+  advance: '进入下一站',
+  wait_human: '转待我确认',
+  stay: '留在本站',
+}
+
 export const ON_FAILURE_ACTIONS = ['block', 'retry', 'wait_human'] as const
 export type OnFailureAction = (typeof ON_FAILURE_ACTIONS)[number]
+
+export const ON_FAILURE_LABEL: Record<OnFailureAction, string> = {
+  block: '标记受阻',
+  retry: '重试',
+  wait_human: '转待我确认',
+}
+
+export const STAGE_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
+export type StageEffort = (typeof STAGE_EFFORTS)[number]
+
+export const STAGE_EFFORT_LABEL: Record<StageEffort, string> = {
+  low: '低',
+  medium: '中',
+  high: '高',
+  xhigh: '很高',
+  max: '最高',
+}
+
+/** 与 gateway `DELEGATE_HARD_TIMEOUT_SEC` / `handlePatchStage` 上限锁步。 */
+export const DELEGATE_HARD_TIMEOUT_SEC = 45 * 60
+
+/** 与 gateway `PROJECT_KEY_RE` 锁步：2–12 位大写字母或数字，且以字母开头。 */
+export const PROJECT_KEY_RE = /^[A-Z][A-Z0-9]{1,11}$/
 
 export const RUN_TRIGGERS = ['patrol', 'manual', 'transition', 'webhook', 'retry'] as const
 export type RunTrigger = (typeof RUN_TRIGGERS)[number]
@@ -299,6 +334,62 @@ export interface TicketPatchInput {
   blockedReason?: string | null
 }
 
+export interface ProjectCreateInput {
+  key: string
+  name: string
+  description?: string | null
+  workspace?: string | null
+  labels?: string[]
+}
+
+export interface ProjectPatchInput {
+  name?: string
+  description?: string | null
+  workspace?: string | null
+  labels?: string[]
+  archivedAt?: number | null
+}
+
+export interface PipelineCreateInput {
+  projectId: string
+  name: string
+  ticketType?: TicketType | null
+  isDefault?: boolean
+}
+
+export interface PipelinePatchInput {
+  name?: string
+  ticketType?: TicketType | null
+  isDefault?: boolean
+}
+
+export interface StageCreateInput {
+  name: string
+  kind: StageKind
+  ordinal?: number
+  agentId?: string | null
+  promptTemplate?: string | null
+  toolsets?: string[] | null
+  effort?: string | null
+  patrolCron?: string | null
+  patrolEnabled?: boolean
+  patrolTimezone?: string
+  quietHoursStart?: number | null
+  quietHoursEnd?: number | null
+  maxRunsPerDay?: number
+  timeoutSec?: number
+  maxRetries?: number
+  circuitBreakerThreshold?: number
+  onSuccess?: OnSuccessAction
+  onFailure?: OnFailureAction
+  entryCondition?: string | null
+  exitChecklist?: string | null
+  requireHumanAck?: boolean
+  autoClose?: boolean
+}
+
+export type StagePatchInput = Partial<StageCreateInput>
+
 export interface ListPage<T> {
   items: T[]
   total: number
@@ -375,11 +466,52 @@ export function isConcurrencyFull(err: unknown): boolean {
   return err.status === 429 || boardErrorCode(err) === 'concurrency_full'
 }
 
+const VALIDATION_ZH: Array<{ test: (msg: string) => boolean; zh: string }> = [
+  { test: (m) => /project key already exists/i.test(m), zh: '项目前缀已被占用' },
+  {
+    test: (m) => /invalid project key/i.test(m),
+    zh: '项目前缀须为 2–12 位大写字母或数字，且以字母开头',
+  },
+  { test: (m) => /key and name are required/i.test(m), zh: '请填写项目前缀和名称' },
+  { test: (m) => /projectId and name are required/i.test(m), zh: '请填写流水线名称' },
+  { test: (m) => /projectId is required/i.test(m), zh: '请先选择项目' },
+  { test: (m) => /name and kind are required/i.test(m), zh: '请填写阶段名称和类型' },
+  { test: (m) => /agentId is required for ai stages/i.test(m), zh: 'AI 阶段必须绑定 agent' },
+  {
+    test: (m) => /promptTemplate is required for ai stages/i.test(m),
+    zh: 'AI 阶段必须填写提示词模板',
+  },
+  {
+    test: (m) => /hidden-reviewer cannot be bound/i.test(m),
+    zh: '不能把阶段绑定到隐藏 agent',
+  },
+  {
+    test: (m) => /human stages cannot enable patrol/i.test(m),
+    zh: '人工阶段不能开启巡检',
+  },
+  {
+    test: (m) => /timeoutSec must be/i.test(m),
+    zh: `超时不能超过 ${DELEGATE_HARD_TIMEOUT_SEC} 秒（45 分钟）`,
+  },
+  { test: (m) => /invalid kind/i.test(m), zh: '阶段类型只能是 AI、人工或闸门' },
+  { test: (m) => /invalid ticketType/i.test(m), zh: '单据类型无效' },
+]
+
+function rawErrorText(err: unknown): string {
+  if (err instanceof ApiError) return err.message
+  if (err instanceof Error) return err.message
+  return ''
+}
+
 /**
- * 把 409 / 423 / 403 / 429 收成可读中文；其余走 `apiErrorMessage`。
+ * 把 409 / 423 / 403 / 429 / 常见校验英文收成可读中文；其余走 `apiErrorMessage`。
  * 上层 toast 只吃这一处，不要自己再翻一遍 status。
  */
 export function taskboardErrorMessage(err: unknown, fallback: string): string {
+  const raw = rawErrorText(err)
+  for (const row of VALIDATION_ZH) {
+    if (row.test(raw)) return row.zh
+  }
   if (isVersionConflict(err)) return '单据已被其他人更新，已刷新最新内容'
   if (isLeaseHeld(err)) return '该单据正在执行中，请稍后再试'
   if (isForbidden(err)) return '当前身份无权执行此操作'
@@ -657,16 +789,72 @@ export const taskboardApi = {
       (b) => b.project,
     ),
 
-  createProject: (
-    a: AuthSession,
-    body: {
-      key: string
-      name: string
-      description?: string | null
-      workspace?: string | null
-      labels?: string[]
-    },
-  ) => boardSend<{ ok: boolean; project: Project }>(a, '/api/board/projects', 'POST', body),
+  createProject: (a: AuthSession, body: ProjectCreateInput) =>
+    boardSend<{ ok: boolean; project: Project }>(a, '/api/board/projects', 'POST', body),
+
+  patchProject: (a: AuthSession, id: string, body: ProjectPatchInput) =>
+    boardSend<{ ok: boolean; project: Project }>(
+      a,
+      `/api/board/projects/${encodeURIComponent(id)}`,
+      'PATCH',
+      body,
+    ),
+
+  archiveProject: (a: AuthSession, id: string) =>
+    boardSend<{ ok: boolean; project: Project }>(
+      a,
+      `/api/board/projects/${encodeURIComponent(id)}`,
+      'DELETE',
+    ),
+
+  listPipelines: (a: AuthSession, projectId: string) =>
+    boardGet<{ items: Pipeline[] }>(a, `/api/board/pipelines${qs({ projectId })}`).then(
+      (b) => b.items || [],
+    ),
+
+  getPipeline: (a: AuthSession, id: string) =>
+    boardGet<{ pipeline: Pipeline; stages: PipelineStage[] }>(
+      a,
+      `/api/board/pipelines/${encodeURIComponent(id)}`,
+    ),
+
+  createPipeline: (a: AuthSession, body: PipelineCreateInput) =>
+    boardSend<{ ok: boolean; pipeline: Pipeline }>(a, '/api/board/pipelines', 'POST', body),
+
+  patchPipeline: (a: AuthSession, id: string, body: PipelinePatchInput) =>
+    boardSend<{ ok: boolean; pipeline: Pipeline }>(
+      a,
+      `/api/board/pipelines/${encodeURIComponent(id)}`,
+      'PATCH',
+      body,
+    ),
+
+  listStages: (a: AuthSession, pipelineId: string) =>
+    boardGet<{ items: PipelineStage[] }>(
+      a,
+      `/api/board/pipelines/${encodeURIComponent(pipelineId)}/stages`,
+    ).then((b) => b.items || []),
+
+  createStage: (a: AuthSession, pipelineId: string, body: StageCreateInput) =>
+    boardSend<{ ok: boolean; stage: PipelineStage }>(
+      a,
+      `/api/board/pipelines/${encodeURIComponent(pipelineId)}/stages`,
+      'POST',
+      body,
+    ),
+
+  getStage: (a: AuthSession, id: string) =>
+    boardGet<{ stage: PipelineStage }>(a, `/api/board/stages/${encodeURIComponent(id)}`).then(
+      (b) => b.stage,
+    ),
+
+  patchStage: (a: AuthSession, id: string, body: StagePatchInput) =>
+    boardSend<{ ok: boolean; stage: PipelineStage }>(
+      a,
+      `/api/board/stages/${encodeURIComponent(id)}`,
+      'PATCH',
+      body,
+    ),
 
   listTickets: (a: AuthSession, query?: TicketListQuery) =>
     boardGet<ListPage<Ticket>>(a, `/api/board/tickets${qs(query)}`),
@@ -799,8 +987,7 @@ export const taskboardApi = {
       (b) => b.items || [],
     ),
 
-  getSettings: (a: AuthSession) =>
-    boardGet<TaskboardSettingsSnapshot>(a, '/api/board/settings'),
+  getSettings: (a: AuthSession) => boardGet<TaskboardSettingsSnapshot>(a, '/api/board/settings'),
 
   patchSettings: (a: AuthSession, body: Partial<TaskboardSettings>) =>
     boardSend<TaskboardSettingsSnapshot & { ok: boolean }>(a, '/api/board/settings', 'PATCH', body),

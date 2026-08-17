@@ -1,14 +1,15 @@
 import '@testing-library/jest-dom/vitest'
-import type { ComponentProps } from 'react'
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import type { ComponentProps } from 'react'
 import { afterEach, describe, expect, test, vi } from 'vitest'
 import { workspaceWantPath } from '../../hooks/useAppRoute'
 import { ApiError } from '../../lib/api'
 import { createMemoryAuthSession } from '../../lib/authSession'
 import {
+  type PipelineStage,
+  type Project,
   TICKET_TYPE_LABEL,
   TICKET_TYPE_TONE,
-  type PipelineStage,
   type Ticket,
   type TicketActivity,
   type TicketComment,
@@ -26,6 +27,7 @@ import {
 } from '../../lib/taskboard'
 import { ToastProvider, TooltipProvider } from '../ui'
 import { BoardSettingsPanel } from './BoardSettingsPanel'
+import { StageSettings } from './StageSettings'
 import { TaskboardView } from './TaskboardView'
 import { TicketCard, ticketPriorityTone, ticketTypeIconClass } from './TicketCard'
 import { TicketDrawer } from './TicketDrawer'
@@ -421,10 +423,7 @@ function mockDrawerApis(ticket: Ticket, runs: TicketRun[] = []) {
   )
 }
 
-function renderDrawer(
-  ticket: Ticket,
-  over: Partial<ComponentProps<typeof TicketDrawer>> = {},
-) {
+function renderDrawer(ticket: Ticket, over: Partial<ComponentProps<typeof TicketDrawer>> = {}) {
   const onOpenSession = vi.fn()
   const view = render(
     <ToastProvider>
@@ -535,7 +534,9 @@ describe('TicketDrawer 详情', () => {
       fireEvent.click(btn)
     })
     expect(onOpenSession).not.toHaveBeenCalled()
-    expect(await screen.findByText('来源会话不在当前列表中，可能已删除或不是网页对话')).toBeInTheDocument()
+    expect(
+      await screen.findByText('来源会话不在当前列表中，可能已删除或不是网页对话'),
+    ).toBeInTheDocument()
   })
 
   test('巡检 sessionKey 不能当来源会话 id', async () => {
@@ -570,7 +571,9 @@ describe('TicketDrawer 详情', () => {
     })
     const timeline = screen.getByTestId('ticket-timeline')
     expect(timeline.textContent).not.toContain('先别合')
-    expect((screen.getByTestId('ticket-drawer-comment') as HTMLTextAreaElement).value).toBe('先别合')
+    expect((screen.getByTestId('ticket-drawer-comment') as HTMLTextAreaElement).value).toBe(
+      '先别合',
+    )
   })
 
   test('改需求 409 冲突提示后强制对账', async () => {
@@ -736,5 +739,302 @@ describe('BoardSettingsPanel', () => {
       fireEvent.click(screen.getByRole('button', { name: '取消' }))
     })
     expect(patch).not.toHaveBeenCalled()
+  })
+})
+
+function sampleProject(over: Partial<Project> = {}): Project {
+  return {
+    id: 'p1',
+    key: 'OCV5',
+    name: 'V5 自用',
+    description: null,
+    workspace: null,
+    labels: [],
+    archivedAt: null,
+    createdAt: 1,
+    updatedAt: 1,
+    ...over,
+  }
+}
+
+function samplePipeline(over: Partial<import('../../lib/taskboard').Pipeline> = {}) {
+  return {
+    id: 'pipe1',
+    projectId: 'p1',
+    name: '问题单默认线',
+    ticketType: 'bug' as const,
+    isDefault: true,
+    createdAt: 1,
+    updatedAt: 1,
+    ...over,
+  }
+}
+
+function mockEmptyBoard() {
+  vi.spyOn(taskboardApi, 'listTickets').mockResolvedValue({ items: [], total: 0 })
+  vi.spyOn(taskboardApi, 'listAgents').mockResolvedValue([
+    { id: 'coding-assistant', name: '编码助手' },
+    { id: 'research', name: '调研助手' },
+  ])
+  vi.spyOn(taskboardApi, 'getProjectBoard').mockResolvedValue({
+    project: sampleProject(),
+    pipeline: samplePipeline(),
+    ticketType: 'bug',
+    columns: [],
+    inbox: [],
+  })
+}
+
+function renderBoard(over: Partial<ComponentProps<typeof TaskboardView>> = {}) {
+  return render(
+    <ToastProvider>
+      <TooltipProvider>
+        <TaskboardView
+          auth={auth}
+          view="board"
+          ticketId={null}
+          onViewChange={() => {}}
+          onOpenTicket={() => {}}
+          onOpenMobileNav={() => {}}
+          {...over}
+        />
+      </TooltipProvider>
+    </ToastProvider>,
+  )
+}
+
+describe('项目管理', () => {
+  test('空库时能通过界面建项目并自动切过去', async () => {
+    let stored: ReturnType<typeof sampleProject>[] = []
+    vi.spyOn(taskboardApi, 'listProjects').mockImplementation(async () => stored)
+    mockEmptyBoard()
+    const createProject = vi
+      .spyOn(taskboardApi, 'createProject')
+      .mockImplementation(async (_a, body) => {
+        const project = sampleProject({
+          id: 'p-new',
+          key: body.key,
+          name: body.name,
+          description: body.description ?? null,
+        })
+        stored = [project]
+        return { ok: true, project }
+      })
+
+    renderBoard()
+    expect(await screen.findByText('还没有项目')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByTestId('project-create-open'))
+    await screen.findByTestId('project-create')
+    fireEvent.change(screen.getByTestId('project-key'), { target: { value: 'ocv5' } })
+    fireEvent.change(screen.getByTestId('project-name'), { target: { value: 'V5 自用' } })
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('project-create-submit'))
+    })
+
+    await waitFor(() => {
+      expect(createProject).toHaveBeenCalledWith(
+        auth,
+        expect.objectContaining({ key: 'OCV5', name: 'V5 自用', description: null }),
+      )
+    })
+    await waitFor(() => {
+      expect(screen.getByLabelText('项目')).toHaveValue('p-new')
+    })
+    expect(taskboardApi.getProjectBoard).toHaveBeenCalledWith(auth, 'p-new', undefined)
+    expect(screen.queryByText('还没有项目')).not.toBeInTheDocument()
+  })
+
+  test('归档项目默认不出现在下拉里', async () => {
+    vi.spyOn(taskboardApi, 'listProjects').mockResolvedValue([
+      sampleProject({ id: 'p1', key: 'OCV5', name: '在用' }),
+      sampleProject({ id: 'p-arch', key: 'OLD', name: '旧项目', archivedAt: 99 }),
+    ])
+    mockEmptyBoard()
+    renderBoard()
+    const select = await screen.findByLabelText('项目')
+    const values = [...(select as HTMLSelectElement).options].map((o) => o.value)
+    expect(values).toContain('p1')
+    expect(values).not.toContain('p-arch')
+  })
+})
+
+describe('流水线 / 阶段配置', () => {
+  function mockStageApis(stageOver: Partial<PipelineStage> = {}) {
+    const pipeline = samplePipeline()
+    const stage = sampleStage({
+      id: 's1',
+      pipelineId: pipeline.id,
+      name: '定位根因',
+      kind: 'ai',
+      agentId: 'coding-assistant',
+      promptTemplate: '查根因',
+      patrolCron: '*/30 9-19 * * 1-5',
+      patrolEnabled: true,
+      ...stageOver,
+    })
+    vi.spyOn(taskboardApi, 'listPipelines').mockResolvedValue([pipeline])
+    vi.spyOn(taskboardApi, 'getPipeline').mockResolvedValue({ pipeline, stages: [stage] })
+    vi.spyOn(taskboardApi, 'listAgents').mockResolvedValue([
+      { id: 'coding-assistant', name: '编码助手' },
+      { id: 'research', name: '调研助手' },
+    ])
+    return { pipeline, stage }
+  }
+
+  async function openStageEditor() {
+    render(
+      <ToastProvider>
+        <TooltipProvider>
+          <StageSettings auth={auth} projectId="p1" />
+        </TooltipProvider>
+      </ToastProvider>,
+    )
+    fireEvent.click(screen.getByTestId('stage-settings-open'))
+    await screen.findByTestId('stage-settings')
+    const edit = await screen.findByTestId('stage-edit-s1')
+    await act(async () => {
+      fireEvent.click(edit)
+    })
+    await screen.findByTestId('stage-editor-s1')
+  }
+
+  test('阶段配置能加载 agent 下拉，hidden agent 不出现', async () => {
+    mockStageApis()
+    await openStageEditor()
+    const agentSelect = screen.getByLabelText('绑定 agent') as HTMLSelectElement
+    const values = [...agentSelect.options].map((o) => o.value)
+    expect(values).toContain('coding-assistant')
+    expect(values).toContain('research')
+    expect(values).not.toContain('hidden-reviewer')
+    expect(screen.queryByText('hidden-reviewer')).not.toBeInTheDocument()
+    expect(taskboardApi.listAgents).toHaveBeenCalled()
+  })
+
+  test('修改 stage 的 agentId / promptTemplate / patrolCron 会发出正确的 PATCH', async () => {
+    mockStageApis()
+    const patchStage = vi.spyOn(taskboardApi, 'patchStage').mockResolvedValue({
+      ok: true,
+      stage: sampleStage({
+        id: 's1',
+        agentId: 'research',
+        promptTemplate: '新提示词',
+        patrolCron: '0 10 * * 1-5',
+      }),
+    })
+    await openStageEditor()
+    fireEvent.change(screen.getByLabelText('绑定 agent'), { target: { value: 'research' } })
+    fireEvent.change(screen.getByLabelText('提示词模板'), { target: { value: '新提示词' } })
+    fireEvent.change(screen.getByLabelText('巡检表达式'), { target: { value: '0 10 * * 1-5' } })
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('stage-save-s1'))
+    })
+    await waitFor(() => {
+      expect(patchStage).toHaveBeenCalled()
+    })
+    const body = patchStage.mock.calls[0]?.[2]
+    expect(body).toEqual(
+      expect.objectContaining({
+        agentId: 'research',
+        promptTemplate: '新提示词',
+        patrolCron: '0 10 * * 1-5',
+      }),
+    )
+    expect(patchStage.mock.calls[0]?.[1]).toBe('s1')
+  })
+
+  test('kind=human 时巡检 cron 被挡住', async () => {
+    mockStageApis({ kind: 'ai', patrolCron: '*/30 * * * *', patrolEnabled: true })
+    const patchStage = vi.spyOn(taskboardApi, 'patchStage').mockResolvedValue({
+      ok: true,
+      stage: sampleStage({ id: 's1', kind: 'human', patrolCron: null, patrolEnabled: false }),
+    })
+    await openStageEditor()
+    fireEvent.change(screen.getByLabelText('阶段类型'), { target: { value: 'human' } })
+    expect(screen.getByLabelText('巡检表达式')).toBeDisabled()
+    expect(screen.getByLabelText('启用巡检')).toBeDisabled()
+    expect(screen.getByText(/人工阶段不参与巡检/)).toBeInTheDocument()
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('stage-save-s1'))
+    })
+    await waitFor(() => {
+      expect(patchStage).toHaveBeenCalled()
+    })
+    expect(patchStage.mock.calls[0]?.[2]).toEqual(
+      expect.objectContaining({
+        kind: 'human',
+        patrolCron: null,
+        patrolEnabled: false,
+        agentId: null,
+      }),
+    )
+  })
+
+  test('保存遇 409 时提示并重读', async () => {
+    const { pipeline, stage } = mockStageApis()
+    const listPipelines = vi.spyOn(taskboardApi, 'listPipelines')
+    const getPipeline = vi.spyOn(taskboardApi, 'getPipeline')
+    vi.spyOn(taskboardApi, 'patchStage').mockRejectedValue(
+      new ApiError({ status: 409, message: 'version conflict', code: 'version_conflict' }),
+    )
+    await openStageEditor()
+    const pipelinesBefore = listPipelines.mock.calls.length
+    const getBefore = getPipeline.mock.calls.length
+    fireEvent.change(screen.getByLabelText('提示词模板'), { target: { value: '会被丢掉的本地值' } })
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('stage-save-s1'))
+    })
+    expect(await screen.findByText('配置已被其他人更新，已重新加载')).toBeInTheDocument()
+    await waitFor(() => {
+      expect(listPipelines.mock.calls.length).toBeGreaterThan(pipelinesBefore)
+      expect(getPipeline.mock.calls.length).toBeGreaterThan(getBefore)
+      expect(screen.getByLabelText('提示词模板')).toHaveValue(stage.promptTemplate ?? '')
+    })
+    expect(getPipeline).toHaveBeenCalledWith(auth, pipeline.id)
+  })
+
+  test('listPipelines / patchStage / listAgents 走真实端点', async () => {
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      const path = String(url)
+      if (path.startsWith('/api/board/pipelines?')) return ok({ items: [] })
+      if (path === '/api/board/pipelines' && init?.method === 'POST') {
+        return ok({ ok: true, pipeline: samplePipeline() }, 201)
+      }
+      if (path.includes('/stages') && init?.method === 'POST') {
+        return ok({ ok: true, stage: sampleStage() }, 201)
+      }
+      if (path.startsWith('/api/board/stages/') && init?.method === 'PATCH') {
+        return ok({ ok: true, stage: sampleStage() })
+      }
+      if (path === '/api/board/agents') return ok({ items: [] })
+      if (path.startsWith('/api/board/projects/') && init?.method === 'PATCH') {
+        return ok({ ok: true, project: sampleProject() })
+      }
+      return ok({ items: [] })
+    })
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    await taskboardApi.listPipelines(auth, 'p1')
+    expect(String((fetchMock.mock.calls as unknown as [string][])[0]?.[0])).toBe(
+      '/api/board/pipelines?projectId=p1',
+    )
+    await taskboardApi.patchStage(auth, 's1', { agentId: 'research', promptTemplate: 'x' })
+    const patchCall = (fetchMock.mock.calls as unknown as [string, RequestInit][]).find(
+      (c) => c[1]?.method === 'PATCH' && String(c[0]).includes('/stages/'),
+    )
+    expect(patchCall?.[0]).toBe('/api/board/stages/s1')
+    expect(JSON.parse(String(patchCall?.[1]?.body))).toEqual({
+      agentId: 'research',
+      promptTemplate: 'x',
+    })
+    await taskboardApi.listAgents(auth)
+    expect(
+      (fetchMock.mock.calls as unknown as [string][]).some((c) => c[0] === '/api/board/agents'),
+    ).toBe(true)
+    await taskboardApi.patchProject(auth, 'p1', { name: '改名' })
+    const projPatch = (fetchMock.mock.calls as unknown as [string, RequestInit][]).find(
+      (c) => c[1]?.method === 'PATCH' && String(c[0]).includes('/projects/'),
+    )
+    expect(projPatch?.[0]).toBe('/api/board/projects/p1')
   })
 })

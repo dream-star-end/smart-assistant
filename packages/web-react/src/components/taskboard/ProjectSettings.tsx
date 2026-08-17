@@ -1,0 +1,290 @@
+import { FolderPlus, Pencil } from 'lucide-react'
+import { useEffect, useState } from 'react'
+import { AuthEpochStaleError } from '../../lib/api'
+import {
+  PROJECT_KEY_RE,
+  type Project,
+  type ProjectCreateInput,
+  type ProjectPatchInput,
+  taskboardApi,
+  taskboardErrorMessage,
+} from '../../lib/taskboard'
+import type { AuthSession } from '../../lib/types'
+import { Button, Field, IconButton, Input, Sheet, Textarea, useConfirm, useToast } from '../ui'
+
+type Mode = 'create' | 'edit'
+
+export function ProjectSettings({
+  auth,
+  current,
+  onCreate,
+  onPatch,
+  onArchive,
+  onUnarchive,
+}: {
+  auth: AuthSession
+  current: Project | null
+  onCreate: (input: ProjectCreateInput) => Promise<Project | null>
+  onPatch: (id: string, input: ProjectPatchInput) => Promise<Project | null>
+  onArchive: (id: string) => Promise<boolean>
+  onUnarchive: (id: string) => Promise<boolean>
+}) {
+  const toast = useToast()
+  const [confirm, confirmEl] = useConfirm()
+  const [mode, setMode] = useState<Mode | null>(null)
+  const [key, setKey] = useState('')
+  const [name, setName] = useState('')
+  const [description, setDescription] = useState('')
+  const [saving, setSaving] = useState(false)
+  const [archived, setArchived] = useState<Project[]>([])
+
+  const open = mode !== null
+
+  useEffect(() => {
+    if (mode === 'edit' && current) {
+      setKey(current.key)
+      setName(current.name)
+      setDescription(current.description ?? '')
+    }
+    if (mode === 'create') {
+      setKey('')
+      setName('')
+      setDescription('')
+    }
+  }, [mode, current])
+
+  useEffect(() => {
+    if (mode !== 'edit') return
+    let cancelled = false
+    void taskboardApi
+      .listProjects(auth, true)
+      .then((items) => {
+        if (!cancelled) setArchived(items.filter((p) => p.archivedAt != null))
+      })
+      .catch((e) => {
+        if (e instanceof AuthEpochStaleError || cancelled) return
+        toast(taskboardErrorMessage(e, '加载已归档项目失败'), 'error')
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [auth, mode, toast])
+
+  const close = () => setMode(null)
+
+  const submitCreate = async () => {
+    const normalized = key.trim().toUpperCase()
+    const title = name.trim()
+    if (!PROJECT_KEY_RE.test(normalized)) {
+      toast('项目前缀须为 2–12 位大写字母或数字，且以字母开头', 'error')
+      return
+    }
+    if (!title) {
+      toast('请填写项目名称', 'error')
+      return
+    }
+    setSaving(true)
+    try {
+      const created = await onCreate({
+        key: normalized,
+        name: title,
+        description: description.trim() || null,
+      })
+      if (created) close()
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const submitEdit = async () => {
+    if (!current) return
+    const title = name.trim()
+    if (!title) {
+      toast('请填写项目名称', 'error')
+      return
+    }
+    setSaving(true)
+    try {
+      const updated = await onPatch(current.id, {
+        name: title,
+        description: description.trim() || null,
+      })
+      if (updated) close()
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const archiveCurrent = async () => {
+    if (!current) return
+    const ok = await confirm({
+      title: `归档 ${current.key}？`,
+      body: '归档后项目不再出现在下拉里，单据仍保留。可以稍后取消归档。',
+      confirmText: '归档',
+      danger: true,
+    })
+    if (!ok) return
+    setSaving(true)
+    try {
+      const done = await onArchive(current.id)
+      if (done) close()
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <>
+      <Button
+        type="button"
+        size="sm"
+        variant="secondary"
+        data-testid="project-create-open"
+        onClick={() => setMode('create')}
+      >
+        <FolderPlus size={14} />
+        新建项目
+      </Button>
+      {current && (
+        <IconButton
+          data-testid="project-edit-open"
+          aria-label="编辑项目"
+          shape="square"
+          onClick={() => setMode('edit')}
+        >
+          <Pencil size={16} />
+        </IconButton>
+      )}
+      <Sheet
+        open={open}
+        onOpenChange={(next) => {
+          if (!next) close()
+        }}
+        side="right"
+        srTitle={mode === 'edit' ? '编辑项目' : '新建项目'}
+        className="w-[36rem] max-w-[96vw]"
+      >
+        <div
+          data-testid={mode === 'edit' ? 'project-edit' : 'project-create'}
+          className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-4"
+        >
+          <div>
+            <h2 className="text-title font-semibold text-fg">
+              {mode === 'edit' ? '编辑项目' : '新建项目'}
+            </h2>
+            <p className="mt-1 text-caption text-muted">
+              {mode === 'edit'
+                ? '前缀创建后不可改。归档项目默认不出现在下拉里。'
+                : '创建后会自动切到该项目，并带上问题单 / 需求单 / 调研 / 杂务四条默认流水线。'}
+            </p>
+          </div>
+          <Field
+            label="项目前缀"
+            required={mode === 'create'}
+            hint={mode === 'edit' ? '创建后不可改' : '2–12 位大写字母或数字，以字母开头，例如 OCV5'}
+          >
+            <Input
+              aria-label="项目前缀"
+              data-testid="project-key"
+              inputSize="sm"
+              value={key}
+              maxLength={12}
+              disabled={mode === 'edit'}
+              placeholder="OCV5"
+              onChange={(e) => setKey(e.target.value.toUpperCase())}
+            />
+          </Field>
+          <Field label="项目名称" required>
+            <Input
+              aria-label="项目名称"
+              data-testid="project-name"
+              inputSize="sm"
+              value={name}
+              placeholder="V5 自用"
+              onChange={(e) => setName(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') void (mode === 'edit' ? submitEdit() : submitCreate())
+              }}
+            />
+          </Field>
+          <Field label="说明" hint="可选">
+            <Textarea
+              aria-label="项目说明"
+              data-testid="project-description"
+              rows={3}
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+            />
+          </Field>
+          <div className="flex flex-wrap gap-1">
+            {mode === 'create' ? (
+              <Button
+                type="button"
+                size="sm"
+                loading={saving}
+                data-testid="project-create-submit"
+                onClick={() => void submitCreate()}
+              >
+                创建项目
+              </Button>
+            ) : (
+              <>
+                <Button
+                  type="button"
+                  size="sm"
+                  loading={saving}
+                  data-testid="project-edit-save"
+                  onClick={() => void submitEdit()}
+                >
+                  保存
+                </Button>
+                {current && !current.archivedAt && (
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="danger"
+                    loading={saving}
+                    data-testid="project-archive"
+                    onClick={() => void archiveCurrent()}
+                  >
+                    归档
+                  </Button>
+                )}
+              </>
+            )}
+          </div>
+          {mode === 'edit' && archived.length > 0 && (
+            <div className="mt-2 flex flex-col gap-2 border-t border-border pt-3">
+              <h3 className="text-section font-semibold text-fg">已归档项目</h3>
+              <p className="text-caption text-muted">默认不出现在顶栏下拉里。</p>
+              {archived.map((p) => (
+                <div
+                  key={p.id}
+                  className="flex items-center justify-between gap-2 rounded-lg bg-hover px-3 py-2"
+                >
+                  <span className="min-w-0 truncate text-body text-fg">
+                    {p.key} {p.name}
+                  </span>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="secondary"
+                    data-testid={`project-unarchive-${p.id}`}
+                    onClick={() => {
+                      void onUnarchive(p.id).then((ok) => {
+                        if (ok) setArchived((cur) => cur.filter((x) => x.id !== p.id))
+                      })
+                    }}
+                  >
+                    取消归档
+                  </Button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </Sheet>
+      {confirmEl}
+    </>
+  )
+}

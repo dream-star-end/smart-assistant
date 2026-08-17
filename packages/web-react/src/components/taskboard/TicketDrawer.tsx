@@ -1,9 +1,11 @@
 import { History } from 'lucide-react'
-import { type ReactNode, useEffect, useMemo, useState } from 'react'
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { AuthEpochStaleError } from '../../lib/api'
 import {
   type BoardAgent,
   type PipelineStage,
+  RUN_STATUS_LABEL,
+  RUN_TRIGGER_LABEL,
   TICKET_PRIORITIES,
   TICKET_STATUS_LABEL,
   TICKET_TYPE_LABEL,
@@ -22,8 +24,6 @@ import {
   sortTimelineDesc,
   taskboardApi,
   taskboardErrorMessage,
-  RUN_STATUS_LABEL,
-  RUN_TRIGGER_LABEL,
 } from '../../lib/taskboard'
 import type { AuthSession } from '../../lib/types'
 import {
@@ -103,13 +103,17 @@ export function TicketDrawer({
 
   const originSessionId = resolveOriginSessionId(current?.originSessionKey, sessionIds)
 
-  const beginEdit = (src: Ticket) => {
+  const beginEdit = useCallback((src: Ticket) => {
     setDraftTitle(src.title)
     setDraftBody(src.body)
     setDraftPriority(src.priority)
     setDraftAssignee(src.assignee ?? '')
     setEditing(true)
-  }
+  }, [])
+
+  // 只在 ticket.id 变化时重跑；父级轮询换了同一张单的对象引用时不能重置草稿。
+  const latestTicketRef = useRef(ticket)
+  latestTicketRef.current = ticket
 
   useEffect(() => {
     if (!open) {
@@ -117,10 +121,13 @@ export function TicketDrawer({
       setComment('')
       return
     }
-    if (startEditing && ticket) beginEdit(ticket)
+    const src = latestTicketRef.current
+    if (startEditing && src && src.id === ticket?.id) beginEdit(src)
     else setEditing(false)
-  }, [open, startEditing, ticket?.id])
+  }, [beginEdit, open, startEditing, ticket?.id])
 
+  // ticket.version 是「同一 lookup 被外部写入后重新拉详情」的触发器，effect 体只按 lookup 请求。
+  // biome-ignore lint/correctness/useExhaustiveDependencies: ticket.version 是 refetch 触发器，删掉会少拉详情
   useEffect(() => {
     if (!open || !lookup) return
     let cancelled = false
@@ -245,7 +252,10 @@ export function TicketDrawer({
     }
     setComment('')
     setCommenting(true)
-    setTimeline((cur) => [{ kind: 'comment', createdAt: optimistic.createdAt, comment: optimistic }, ...cur])
+    setTimeline((cur) => [
+      { kind: 'comment', createdAt: optimistic.createdAt, comment: optimistic },
+      ...cur,
+    ])
     try {
       const out = await taskboardApi.comment(auth, current.id, { body })
       setTimeline((cur) =>
@@ -366,12 +376,7 @@ export function TicketDrawer({
                   >
                     保存
                   </Button>
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="ghost"
-                    onClick={() => setEditing(false)}
-                  >
+                  <Button type="button" size="sm" variant="ghost" onClick={() => setEditing(false)}>
                     取消
                   </Button>
                 </div>
@@ -463,12 +468,19 @@ export function TicketDrawer({
             </Button>
           </div>
 
-          <div className="flex flex-col gap-2 border-t border-border pt-3" data-testid="ticket-timeline">
+          <div
+            className="flex flex-col gap-2 border-t border-border pt-3"
+            data-testid="ticket-timeline"
+          >
             <p className="text-meta font-medium text-muted">时间线</p>
             {loading && timeline.length === 0 ? (
               <ListSkeleton rows={4} variant="row" />
             ) : timeline.length === 0 ? (
-              <EmptyState icon={History} title="还没有动态" hint="巡检、评论和状态变更会出现在这里。" />
+              <EmptyState
+                icon={History}
+                title="还没有动态"
+                hint="巡检、评论和状态变更会出现在这里。"
+              />
             ) : (
               <ol className="flex flex-col gap-2">
                 {timeline.map((item) => (
@@ -484,7 +496,10 @@ export function TicketDrawer({
                           <span className="text-caption text-muted">
                             {item.comment.authorKind === 'human' ? '评论' : 'agent 评论'}
                           </span>
-                          <TimeAgo value={item.comment.createdAt} className="text-caption text-faint" />
+                          <TimeAgo
+                            value={item.comment.createdAt}
+                            className="text-caption text-faint"
+                          />
                         </div>
                         <p className="whitespace-pre-wrap text-body text-fg">{item.comment.body}</p>
                       </div>
@@ -540,7 +555,9 @@ function RunDetail({
           {RUN_STATUS_LABEL[run.status] ?? run.status}
         </Badge>
         <span className="text-body text-fg">{stageName || '未知阶段'}</span>
-        <span className="text-caption text-faint">{RUN_TRIGGER_LABEL[run.trigger] ?? run.trigger}</span>
+        <span className="text-caption text-faint">
+          {RUN_TRIGGER_LABEL[run.trigger] ?? run.trigger}
+        </span>
         <TimeAgo value={run.createdAt} className="ml-auto text-caption text-faint" />
       </div>
       <p className="text-caption text-muted">

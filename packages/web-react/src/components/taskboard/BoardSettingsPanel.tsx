@@ -9,16 +9,7 @@ import {
   taskboardErrorMessage,
 } from '../../lib/taskboard'
 import type { AuthSession } from '../../lib/types'
-import {
-  Button,
-  IconButton,
-  Input,
-  ListSkeleton,
-  Select,
-  Sheet,
-  useConfirm,
-  useToast,
-} from '../ui'
+import { Button, IconButton, Input, ListSkeleton, Select, Sheet, useConfirm, useToast } from '../ui'
 
 const HOUR_OPTIONS = Array.from({ length: 24 }, (_, h) => ({
   value: String(h),
@@ -171,7 +162,10 @@ export function BoardSettingsPanel({ auth }: { auth: AuthSession }) {
         srTitle="护栏设置"
         className="w-[24rem] max-w-[92vw]"
       >
-        <div data-testid="board-settings" className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-4">
+        <div
+          data-testid="board-settings"
+          className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-4"
+        >
           <div>
             <h2 className="text-title font-semibold text-fg">护栏设置</h2>
             <p className="mt-1 text-caption text-muted">仅本人可改。agent 调用会被拒绝。</p>
@@ -193,9 +187,10 @@ export function BoardSettingsPanel({ auth }: { auth: AuthSession }) {
                   全局巡检已急停
                 </p>
               )}
-              <label className="flex flex-col gap-1.5">
+              <label className="flex flex-col gap-1.5" htmlFor="board-settings-max-concurrent">
                 <span className="text-meta font-medium text-muted">并发上限</span>
                 <Input
+                  id="board-settings-max-concurrent"
                   aria-label="并发上限"
                   type="number"
                   min={1}
@@ -206,9 +201,10 @@ export function BoardSettingsPanel({ auth }: { auth: AuthSession }) {
                   }
                 />
               </label>
-              <label className="flex flex-col gap-1.5">
+              <label className="flex flex-col gap-1.5" htmlFor="board-settings-max-runs-per-day">
                 <span className="text-meta font-medium text-muted">每日巡检上限</span>
                 <Input
+                  id="board-settings-max-runs-per-day"
                   aria-label="每日巡检上限"
                   type="number"
                   min={1}
@@ -219,9 +215,10 @@ export function BoardSettingsPanel({ auth }: { auth: AuthSession }) {
                   }
                 />
               </label>
-              <label className="flex flex-col gap-1.5">
+              <label className="flex flex-col gap-1.5" htmlFor="board-settings-max-cost-per-day">
                 <span className="text-meta font-medium text-muted">每日成本上限（美元）</span>
                 <Input
+                  id="board-settings-max-cost-per-day"
                   aria-label="每日成本上限"
                   type="number"
                   min={0}
@@ -233,9 +230,13 @@ export function BoardSettingsPanel({ auth }: { auth: AuthSession }) {
                 />
               </label>
               <div className="flex gap-2">
-                <label className="flex min-w-0 flex-1 flex-col gap-1.5">
+                <label
+                  className="flex min-w-0 flex-1 flex-col gap-1.5"
+                  htmlFor="board-settings-quiet-start"
+                >
                   <span className="text-meta font-medium text-muted">静默开始</span>
                   <Select
+                    id="board-settings-quiet-start"
                     aria-label="静默开始"
                     inputSize="sm"
                     value={String(draft.quietHoursStart)}
@@ -245,15 +246,17 @@ export function BoardSettingsPanel({ auth }: { auth: AuthSession }) {
                     options={HOUR_OPTIONS}
                   />
                 </label>
-                <label className="flex min-w-0 flex-1 flex-col gap-1.5">
+                <label
+                  className="flex min-w-0 flex-1 flex-col gap-1.5"
+                  htmlFor="board-settings-quiet-end"
+                >
                   <span className="text-meta font-medium text-muted">静默结束</span>
                   <Select
+                    id="board-settings-quiet-end"
                     aria-label="静默结束"
                     inputSize="sm"
                     value={String(draft.quietHoursEnd)}
-                    onValueChange={(v) =>
-                      setDraft((cur) => ({ ...cur, quietHoursEnd: Number(v) }))
-                    }
+                    onValueChange={(v) => setDraft((cur) => ({ ...cur, quietHoursEnd: Number(v) }))}
                     options={HOUR_OPTIONS}
                   />
                 </label>

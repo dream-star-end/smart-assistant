@@ -4,6 +4,8 @@ import {
   type BoardAgent,
   type BoardSnapshot,
   type Project,
+  type ProjectCreateInput,
+  type ProjectPatchInput,
   type Ticket,
   type TicketCreateInput,
   type TicketListQuery,
@@ -227,7 +229,11 @@ export function useTaskboard(auth: AuthSession | null, enabled: boolean) {
   const selectProject = useCallback(
     async (id: string, type?: TicketType | '') => {
       setProjectId(id)
-      if (type !== undefined) setTicketType(type)
+      projectIdRef.current = id
+      if (type !== undefined) {
+        setTicketType(type)
+        ticketTypeRef.current = type
+      }
       const a = authRef.current
       if (!a) return
       const gate = (epoch.current += 1)
@@ -257,6 +263,104 @@ export function useTaskboard(auth: AuthSession | null, enabled: boolean) {
       }
     },
     [toast],
+  )
+
+  const upsertProject = useCallback((fresh: Project) => {
+    setProjects((cur) => {
+      const list = cur ?? []
+      const idx = list.findIndex((p) => p.id === fresh.id)
+      if (idx < 0) return [...list, fresh]
+      const next = list.slice()
+      next[idx] = fresh
+      return next
+    })
+  }, [])
+
+  const createProject = useCallback(
+    async (input: ProjectCreateInput) => {
+      const a = authRef.current
+      if (!a) return null
+      try {
+        const out = await taskboardApi.createProject(a, input)
+        upsertProject(out.project)
+        toast(`已创建项目 ${out.project.key}`, 'success')
+        await selectProject(out.project.id)
+        void reconcile()
+        return out.project
+      } catch (e) {
+        if (e instanceof AuthEpochStaleError) return null
+        toast(taskboardErrorMessage(e, '创建项目失败'), 'error')
+        return null
+      }
+    },
+    [reconcile, selectProject, toast, upsertProject],
+  )
+
+  const patchProject = useCallback(
+    async (id: string, input: ProjectPatchInput) => {
+      const a = authRef.current
+      if (!a) return null
+      try {
+        const out = await taskboardApi.patchProject(a, id, input)
+        upsertProject(out.project)
+        toast('已更新项目', 'success')
+        void reconcile()
+        return out.project
+      } catch (e) {
+        if (e instanceof AuthEpochStaleError) return null
+        toast(taskboardErrorMessage(e, '更新项目失败'), 'error')
+        return null
+      }
+    },
+    [reconcile, toast, upsertProject],
+  )
+
+  const archiveProject = useCallback(
+    async (id: string) => {
+      const a = authRef.current
+      if (!a) return false
+      try {
+        const out = await taskboardApi.archiveProject(a, id)
+        const remaining = await taskboardApi.listProjects(a)
+        if (!mounted.current) return true
+        setProjects(remaining)
+        if (projectIdRef.current === id) {
+          if (remaining[0]) {
+            await selectProject(remaining[0].id)
+          } else {
+            setProjectId(null)
+            setBoard(null)
+          }
+        }
+        toast(`已归档 ${out.project.key}`, 'success')
+        void reconcile()
+        return true
+      } catch (e) {
+        if (e instanceof AuthEpochStaleError) return false
+        toast(taskboardErrorMessage(e, '归档项目失败'), 'error')
+        return false
+      }
+    },
+    [reconcile, selectProject, toast],
+  )
+
+  const unarchiveProject = useCallback(
+    async (id: string) => {
+      const a = authRef.current
+      if (!a) return null
+      try {
+        const out = await taskboardApi.patchProject(a, id, { archivedAt: null })
+        upsertProject(out.project)
+        toast(`已取消归档 ${out.project.key}`, 'success')
+        void reconcile()
+        return out.project
+      } catch (e) {
+        if (e instanceof AuthEpochStaleError) return null
+        toast(taskboardErrorMessage(e, '取消归档失败'), 'error')
+        return null
+      }
+    },
+    [reconcile, toast, upsertProject],
   )
 
   const createTicket = useCallback(
@@ -360,6 +464,10 @@ export function useTaskboard(auth: AuthSession | null, enabled: boolean) {
     selectProject,
     setTicketType,
     applyListQuery,
+    createProject,
+    patchProject,
+    archiveProject,
+    unarchiveProject,
     createTicket,
     runAction,
     replaceTicket,

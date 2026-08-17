@@ -18,6 +18,8 @@ import {
 } from '../ui'
 import { BoardColumns } from './BoardColumns'
 import { BoardSettingsPanel } from './BoardSettingsPanel'
+import { ProjectSettings } from './ProjectSettings'
+import { StageSettings } from './StageSettings'
 import { TicketDrawer } from './TicketDrawer'
 import { TicketListView } from './TicketListView'
 import { useTaskboard } from './useTaskboard'
@@ -220,23 +222,37 @@ export function TaskboardView({
           <Kanban size={16} className="text-faint" />
           <h1 className="truncate text-title font-semibold">任务面板</h1>
         </div>
-        <div className="ml-auto flex min-w-0 items-center gap-2">
+        <div className="ml-auto flex min-w-0 flex-wrap items-center justify-end gap-2">
           <Select
             aria-label="项目"
             className="w-40"
             inputSize="sm"
             value={board.projectId ?? ''}
             onValueChange={(id) => void board.selectProject(id)}
-            options={
-              board.projects?.map((p) => ({ value: p.id, label: `${p.key} ${p.name}` })) ?? []
-            }
+            options={(board.projects ?? [])
+              .filter((p) => !p.archivedAt)
+              .map((p) => ({ value: p.id, label: `${p.key} ${p.name}` }))}
             placeholder="选择项目"
+          />
+          <ProjectSettings
+            auth={auth}
+            current={board.projects?.find((p) => p.id === board.projectId) ?? null}
+            onCreate={(input) => board.createProject(input)}
+            onPatch={(id, input) => board.patchProject(id, input)}
+            onArchive={(id) => board.archiveProject(id)}
+            onUnarchive={(id) => board.unarchiveProject(id).then((p) => !!p)}
+          />
+          <StageSettings
+            auth={auth}
+            projectId={board.projectId}
+            onChanged={() => void board.reconcile()}
           />
           <BoardSettingsPanel auth={auth} />
           <Button
             type="button"
             size="sm"
             variant="secondary"
+            disabled={!board.projectId}
             onClick={() => setCreating((v) => !v)}
           >
             <Plus size={14} />
@@ -304,6 +320,12 @@ export function TaskboardView({
               重试
             </Button>
           }
+        />
+      ) : !board.projectId ? (
+        <EmptyState
+          icon={Kanban}
+          title="还没有项目"
+          hint="新建一个项目后即可开始建单。创建时会自动带上四条默认流水线。"
         />
       ) : view === 'board' ? (
         <BoardColumns
