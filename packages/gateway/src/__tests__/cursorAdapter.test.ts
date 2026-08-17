@@ -10,6 +10,7 @@ import {
   CURSOR_MAX_PROMPT_ARG_BYTES,
   CURSOR_MAX_TURN_PAYLOAD_BYTES,
   CursorAdapter,
+  cursorResumeStorePath,
   _internals,
 } from '../engine/cursorAdapter.js'
 import type { EngineEvent, EngineExternalBillingEvent } from '../engine/engineEvents.js'
@@ -547,7 +548,7 @@ for(const e of [
     }
   })
 
-  test('rebuilds platform and MCP context for every stateless turn on one adapter', async () => {
+  test('rebuilds platform and MCP context for every turn on one adapter', async () => {
     const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-multiturn-'))
     const fake = path.join(dir, 'fake.cjs')
     const capture = path.join(dir, 'captures.jsonl')
@@ -563,6 +564,7 @@ const tokenPath=config.mcpServers['openclaude-memory'].env.OPENCLAUDE_GATEWAY_TO
 fs.appendFileSync(${JSON.stringify(capture)},JSON.stringify({
   argv, prompt:argv.at(-1), configPath, tokenPath,
   tokenHash:crypto.createHash('sha256').update(fs.readFileSync(tokenPath)).digest('hex'),
+  resumeId:process.env.OPENCLAUDE_CURSOR_RESUME_ID ?? null,
 })+'\\n');
 console.log(JSON.stringify({type:'assistant',message:{role:'assistant',content:[{type:'text',text:'TURN_OK'}]}}));
 console.log(JSON.stringify({type:'result',subtype:'success',is_error:false}));
@@ -606,6 +608,7 @@ console.log(JSON.stringify({type:'result',subtype:'success',is_error:false}));
         const turn = launched[index]
         assert.equal(turn.argv.includes('--resume'), false)
         assert.equal(turn.argv.includes('--continue'), false)
+        assert.equal(turn.resumeId, null)
         assert.match(turn.prompt, /CURSOR_SECOND_TURN_PERSONA_MARKER/)
         assert.match(turn.prompt, /<openclaude_platform_context>/)
         assert.match(turn.prompt, /# Skills/)
@@ -1506,5 +1509,253 @@ setInterval(() => {}, 1000);
       _internals.CURSOR_PREAMBLE.includes('Never call the native ask-question tool'),
       'preamble must forbid the native ask tool',
     )
+  })
+
+  // ask_user MCP 桥(cursor 等无原生交互工具的引擎):平台 MCP 工具
+  // mcp__openclaude-memory__ask_user 必须渲染成产品 AskUserQuestion 卡,
+  // input 走 mcpToolCall 的 args.args 透传(schema 本身就是产品形态)。
+  test('mcp ask_user maps to the product AskUserQuestion card', () => {
+    const ask = {
+      type: 'tool_call',
+      tool_call: {
+        id: 't-mcp-ask',
+        mcpToolCall: {
+          args: {
+            serverIdentifier: 'openclaude-memory',
+            toolName: 'ask_user',
+            args: {
+              questions: [
+                {
+                  question: '部署会中断当前会话,什么时候部?',
+                  header: '部署时机',
+                  options: [
+                    { label: '现在就部' },
+                    { label: '稍后我自己跑' },
+                  ],
+                },
+              ],
+            },
+          },
+        },
+      },
+    }
+    assert.equal(_internals.toolNameOf(ask as never), 'AskUserQuestion')
+    assert.deepEqual(_internals.toolInputOf(ask as never), {
+      questions: [
+        {
+          question: '部署会中断当前会话,什么时候部?',
+          header: '部署时机',
+          options: [{ label: '现在就部' }, { label: '稍后我自己跑' }],
+        },
+      ],
+    })
+    // 其它 MCP 工具仍走 mcp__server__tool 命名,不受影响。
+    const other = {
+      type: 'tool_call',
+      tool_call: {
+        id: 't-mcp-other',
+        mcpToolCall: {
+          args: {
+            serverIdentifier: 'openclaude-memory',
+            toolName: 'skill_search',
+            args: { query: 'x' },
+          },
+        },
+      },
+    }
+    assert.equal(_internals.toolNameOf(other as never), 'mcp__openclaude-memory__skill_search')
+
+    // preamble 必须把 ask_user 指认为 cursor 的提问通道。
+    assert.ok(
+      _internals.CURSOR_PREAMBLE.includes('`ask_user`'),
+      'preamble must point cursor at the ask_user MCP tool',
+    )
+  })
+
+  test('declares native-resume with a cursor-session resume kind', () => {
+    const adapter = new CursorAdapter(opts('/tmp'))
+    assert.equal(adapter.capabilities.historyMode, 'native-resume')
+    assert.equal(adapter.capabilities.resumeKind, 'cursor-session')
+  })
+
+  test('captures Cursor session_id from stream-json and emits it once', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-session-id-'))
+    const fake = path.join(dir, 'fake.cjs')
+    const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    await writeFile(
+      fake,
+      `#!/usr/bin/env node
+console.log(JSON.stringify({type:'system',subtype:'init',session_id:${JSON.stringify(sessionId)}}));
+console.log(JSON.stringify({type:'result',subtype:'success',is_error:false,session_id:${JSON.stringify(sessionId)}}));
+`,
+    )
+    await chmod(fake, 0o755)
+    const old = process.env.OC_CURSOR_WRAPPER_BIN
+    process.env.OC_CURSOR_WRAPPER_BIN = fake
+    try {
+      const adapter = new CursorAdapter(opts(dir))
+      const sessionEvents: string[] = []
+      adapter.on('session_id', (id: string) => sessionEvents.push(id))
+      adapter.on('error', () => {})
+      const run = adapter.submitTurn({
+        input: 'hello',
+        requestId: REQUEST,
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run.submitted
+      await run.summary
+      await adapter.waitForOutputDrain()
+      assert.equal(adapter.nativeSessionId, sessionId)
+      assert.deepEqual(sessionEvents, [sessionId])
+    } finally {
+      restoreEnv('OC_CURSOR_WRAPPER_BIN', old)
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('passes a stored resume id through env when the local store exists', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-resume-valid-'))
+    const fake = path.join(dir, 'fake.cjs')
+    const capture = path.join(dir, 'capture.json')
+    const sessionId = '11111111-2222-3333-4444-555555555555'
+    const store = cursorResumeStorePath(dir, sessionId)
+    await mkdir(path.dirname(store), { recursive: true })
+    await writeFile(store, '')
+    await writeFile(
+      fake,
+      `#!/usr/bin/env node
+const fs=require('node:fs');
+fs.writeFileSync(${JSON.stringify(capture)},JSON.stringify({
+  argv:process.argv.slice(2),
+  resumeId:process.env.OPENCLAUDE_CURSOR_RESUME_ID ?? null,
+}));
+console.log(JSON.stringify({type:'system',subtype:'init',session_id:${JSON.stringify(sessionId)}}));
+console.log(JSON.stringify({type:'result',subtype:'success',is_error:false,session_id:${JSON.stringify(sessionId)}}));
+`,
+    )
+    await chmod(fake, 0o755)
+    const old = process.env.OC_CURSOR_WRAPPER_BIN
+    process.env.OC_CURSOR_WRAPPER_BIN = fake
+    try {
+      const adapter = new CursorAdapter({ ...opts(dir), resumeSessionId: sessionId })
+      const spawns: Array<{ resumed: boolean }> = []
+      adapter.on('spawn', (info: { resumed: boolean }) => spawns.push(info))
+      adapter.on('error', () => {})
+      const run = adapter.submitTurn({
+        input: 'resume please',
+        requestId: REQUEST,
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run.submitted
+      await run.summary
+      await adapter.waitForOutputDrain()
+      const launched = JSON.parse(await readFile(capture, 'utf8'))
+      assert.equal(launched.resumeId, sessionId)
+      assert.equal(launched.argv.includes('--resume'), false)
+      assert.deepEqual(spawns, [{ resumed: true }])
+      assert.equal(adapter.nativeSessionId, sessionId)
+    } finally {
+      restoreEnv('OC_CURSOR_WRAPPER_BIN', old)
+      await rm(path.dirname(store), { recursive: true, force: true })
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('drops a stale resume id when the local store is missing', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-resume-stale-'))
+    const fake = path.join(dir, 'fake.cjs')
+    const capture = path.join(dir, 'capture.json')
+    const staleId = 'aaaaaaaa-bbbb-cccc-dddd-ffffffffffff'
+    const freshId = '99999999-8888-7777-6666-555555555555'
+    await writeFile(
+      fake,
+      `#!/usr/bin/env node
+const fs=require('node:fs');
+fs.writeFileSync(${JSON.stringify(capture)},JSON.stringify({
+  argv:process.argv.slice(2),
+  resumeId:process.env.OPENCLAUDE_CURSOR_RESUME_ID ?? null,
+}));
+console.log(JSON.stringify({type:'system',subtype:'init',session_id:${JSON.stringify(freshId)}}));
+console.log(JSON.stringify({type:'result',subtype:'success',is_error:false,session_id:${JSON.stringify(freshId)}}));
+`,
+    )
+    await chmod(fake, 0o755)
+    const old = process.env.OC_CURSOR_WRAPPER_BIN
+    process.env.OC_CURSOR_WRAPPER_BIN = fake
+    try {
+      const adapter = new CursorAdapter({ ...opts(dir), resumeSessionId: staleId })
+      let idAtSpawn: string | null | undefined
+      const spawns: Array<{ resumed: boolean }> = []
+      adapter.on('spawn', (info: { resumed: boolean }) => {
+        spawns.push(info)
+        idAtSpawn = adapter.nativeSessionId
+      })
+      adapter.on('error', () => {})
+      const run = adapter.submitTurn({
+        input: 'stale resume',
+        requestId: REQUEST,
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run.submitted
+      await run.summary
+      await adapter.waitForOutputDrain()
+      const launched = JSON.parse(await readFile(capture, 'utf8'))
+      assert.equal(launched.resumeId, null)
+      assert.equal(launched.argv.includes('--resume'), false)
+      assert.deepEqual(spawns, [{ resumed: false }])
+      assert.equal(idAtSpawn, null)
+      assert.equal(adapter.nativeSessionId, freshId)
+    } finally {
+      restoreEnv('OC_CURSOR_WRAPPER_BIN', old)
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('a resumed turn with the same session_id still emits session_id once', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-resume-emit-'))
+    const fake = path.join(dir, 'fake.cjs')
+    const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    const store = cursorResumeStorePath(dir, sessionId)
+    await mkdir(path.dirname(store), { recursive: true })
+    await writeFile(store, '')
+    await writeFile(
+      fake,
+      `#!/usr/bin/env node
+console.log(JSON.stringify({type:'system',subtype:'init',session_id:${JSON.stringify(sessionId)}}));
+console.log(JSON.stringify({type:'assistant',message:{role:'assistant',content:[{type:'text',text:'ok'}]},session_id:${JSON.stringify(sessionId)}}));
+console.log(JSON.stringify({type:'result',subtype:'success',is_error:false,session_id:${JSON.stringify(sessionId)}}));
+`,
+    )
+    await chmod(fake, 0o755)
+    const old = process.env.OC_CURSOR_WRAPPER_BIN
+    process.env.OC_CURSOR_WRAPPER_BIN = fake
+    try {
+      const adapter = new CursorAdapter({ ...opts(dir), resumeSessionId: sessionId })
+      const sessionEvents: string[] = []
+      adapter.on('session_id', (id: string) => sessionEvents.push(id))
+      adapter.on('error', () => {})
+      const run = adapter.submitTurn({
+        input: 'resume same id',
+        requestId: REQUEST,
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run.submitted
+      await run.summary
+      await adapter.waitForOutputDrain()
+      assert.equal(adapter.nativeSessionId, sessionId)
+      assert.deepEqual(sessionEvents, [sessionId])
+    } finally {
+      restoreEnv('OC_CURSOR_WRAPPER_BIN', old)
+      await rm(path.dirname(store), { recursive: true, force: true })
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 })

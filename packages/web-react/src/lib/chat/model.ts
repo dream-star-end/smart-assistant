@@ -467,6 +467,8 @@ export type ChatMessage = {
   /** Durable permission response exists but Master has not yet reported an
    * applied/terminal outcome. The card stays non-resolved during this phase. */
   _controlPending?: boolean;
+  /** Detached Cursor ask_user card: 24h TTL, answerable after tab/device switch. */
+  _detachedAskUser?: boolean;
 };
 
 /**

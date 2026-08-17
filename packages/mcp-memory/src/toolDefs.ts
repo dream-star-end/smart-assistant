@@ -313,7 +313,105 @@ export const TOOLS = [
     },
   },
   // (v5 ccb-only:ask_gpt55_codex direct bridge 已移除 —— 无 codex agent。)
+  // ── 引擎交互提问桥(cursor 等无原生交互工具的引擎,2026-08-17) ──
+  {
+    name: 'ask_user',
+    description: [
+      '向当前会话的网页用户提出选择题。调用后立即返回(不阻塞、不等待)。',
+      '返回后必须立刻结束本回合;用户的选择会作为下一条普通用户消息到达。',
+      '不要轮询,也不要对同一问题再次调用 ask_user。一次最多 4 个问题,每个 2-4 个选项。',
+      '必须在当前会话有活跃 turn 时调用;子 agent 环境会直接返回 skipped,',
+      '此时自行决策或在最终答复里列编号选项让用户文字作答。',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        questions: {
+          type: 'array',
+          minItems: 1,
+          maxItems: 4,
+          description: '问题列表;question 为题面,options 为可点选的选项。',
+          items: {
+            type: 'object',
+            properties: {
+              question: { type: 'string', description: '题面(必填)' },
+              header: { type: 'string', description: '可选短标签(≤12 字符)' },
+              multiSelect: { type: 'boolean', description: '可选,是否允许多选' },
+              options: {
+                type: 'array',
+                minItems: 2,
+                maxItems: 4,
+                items: {
+                  type: 'object',
+                  properties: {
+                    label: { type: 'string', description: '选项文案(必填)' },
+                    description: { type: 'string', description: '选项补充说明' },
+                  },
+                  required: ['label'],
+                },
+              },
+            },
+            required: ['question', 'options'],
+          },
+        },
+      },
+      required: ['questions'],
+    },
+  },
 ]
+
+/**
+ * ask_user 的 questions 收敛器:宽松接受模型输入,严格产出产品
+ * AskUserQuestion 形态(question/header≤12/multiSelect 仅 true/options 白名单)。
+ * 返回 null = 输入结构不可用(调用方报工具错误,不发起网关请求)。
+ * 与网关侧 sanitizeEngineAskUserQuestions 语义对齐 —— 两份实现分属不同
+ * 包与不同信任域,不共享依赖,修改时必须同步。
+ */
+export function normalizeAskUserQuestions(
+  raw: unknown,
+): Array<Record<string, unknown>> | null {
+  if (!Array.isArray(raw) || raw.length === 0 || raw.length > 4) return null
+  const questions: Array<Record<string, unknown>> = []
+  for (const item of raw) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return null
+    const question = (item as { question?: unknown }).question
+    if (
+      typeof question !== 'string' ||
+      question.trim().length === 0 ||
+      question.length > 2000
+    ) {
+      return null
+    }
+    const optionsRaw = (item as { options?: unknown }).options
+    if (!Array.isArray(optionsRaw) || optionsRaw.length < 2 || optionsRaw.length > 4) return null
+    const options: Array<Record<string, unknown>> = []
+    for (const opt of optionsRaw) {
+      if (!opt || typeof opt !== 'object' || Array.isArray(opt)) return null
+      const label = (opt as { label?: unknown }).label
+      if (typeof label !== 'string' || label.trim().length === 0 || label.length > 300) {
+        return null
+      }
+      const description = (opt as { description?: unknown }).description
+      options.push({
+        label,
+        ...(typeof description === 'string' &&
+        description.length > 0 &&
+        description.length <= 1000
+          ? { description }
+          : {}),
+      })
+    }
+    const header = (item as { header?: unknown }).header
+    const multiSelect = (item as { multiSelect?: unknown }).multiSelect
+    questions.push({
+      question,
+      ...(typeof header === 'string' && header.length > 0 ? { header: header.slice(0, 12) } : {}),
+      ...(multiSelect === true ? { multiSelect: true } : {}),
+      options,
+    })
+  }
+  return questions
+}
 
 // Draft-only skill proposal tool. Exposed ONLY inside a skill-training session
 // (OPENCLAUDE_SKILL_TRAIN_RUN_ID set). Stages a candidate change into the run's draft

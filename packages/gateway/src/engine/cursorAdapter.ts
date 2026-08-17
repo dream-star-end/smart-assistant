@@ -4,9 +4,9 @@
 import { spawn, type ChildProcessByStdio } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
-import { chmodSync, existsSync, lstatSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { basename, dirname, isAbsolute, resolve } from 'node:path'
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import type { Readable } from 'node:stream'
 import {
   CURSOR_ENGINE_MODELS,
@@ -67,9 +67,14 @@ do not claim or call a tool unless it is present in your current tool list.
 The ask-question tool is the one exception: this hosted run is noninteractive,
 so the runtime resolves Cursor's native ask-question tool instantly as
 "Questions skipped by the user" — the user never sees the prompt and no answer
-will arrive. Never call the native ask-question tool. When you need the user
-to pick options or confirm a decision, present numbered options as plain text
-in your reply and end the turn; the user's next message carries the answer.
+will arrive. Never call the native ask-question tool. Use the platform MCP
+tool \`ask_user\` (openclaude-memory server) instead: it posts the questions to
+the web UI and returns immediately. After \`ask_user\` returns, end your turn
+now — do not wait, poll, or call \`ask_user\` again for the same questions.
+The user's choices arrive as your next ordinary user message.
+Subagents get an automatic skip — decide yourself there. If \`ask_user\` is not
+in your current tool list, present numbered options as plain text and end the
+turn; the user's next message carries the answer.
 
 Use OpenClaude's storage channels as their sections direct: Core memory through
 \`oc-memory core-search\` plus the exact platform memory files, session/archival
@@ -97,6 +102,7 @@ const OPENCLAUDE_MEMORY_MCP_TOOLS = [
   'delete_reminder',
   'delegate_task',
   'send_to_agent',
+  'ask_user',
 ] as const
 
 const CURSOR_SAFE_ENV_KEYS = [
@@ -114,7 +120,7 @@ const CURSOR_SAFE_ENV_KEYS = [
 ] as const
 
 
-type CursorEvent = Record<string, unknown> & { type?: unknown }
+type CursorEvent = Record<string, unknown> & { type?: unknown; session_id?: unknown }
 type ReportedUsage = { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number }
 interface TurnCtx {
   params: TurnParams; startedAt: number; proc: ChildProcessByStdio<null, Readable, Readable> | null
@@ -125,6 +131,7 @@ interface TurnCtx {
   assistantSegmentClosed: boolean; thinkingSegmentClosed: boolean
   contextDir: string | null
   rawToSafeToolId: Map<string, string>; safeToRawToolId: Map<string, string>; fallbackToolSequence: number
+  sessionIdEmitted: boolean
   resolve: (value: TurnSummary | null) => void
 }
 
@@ -264,6 +271,7 @@ function toolNameOf(event: CursorEvent): string {
     const server = [args?.serverIdentifier, args?.providerIdentifier].find(
       (candidate): candidate is string => typeof candidate === 'string' && !!candidate,
     )
+    if (tool === 'ask_user') return 'AskUserQuestion'
     if (server && tool) return `mcp__${server}__${tool}`
     if (tool) return tool
   }
@@ -667,6 +675,7 @@ function buildCursorMemoryMcpConfig(input: CursorMemoryMcpConfigInput): Record<s
     OPENCLAUDE_GATEWAY_PORT: String(input.gatewayPort),
     OPENCLAUDE_GATEWAY_TOKEN_FILE: input.tokenFile,
     OPENCLAUDE_DELEGATION_DEPTH: String(input.delegationDepth),
+    OPENCLAUDE_ENGINE: 'cursor',
     ...(process.env.OPENCLAUDE_HOME ? { OPENCLAUDE_HOME: process.env.OPENCLAUDE_HOME } : {}),
     ...(process.env.OPENCLAUDE_BASELINE_SKILLS_DIR
       ? { OPENCLAUDE_BASELINE_SKILLS_DIR: process.env.OPENCLAUDE_BASELINE_SKILLS_DIR }
@@ -711,6 +720,26 @@ function buildCursorSpawnEnv(agentId: string, sessionKey: string): NodeJS.Proces
   return env
 }
 
+export const CURSOR_CHATS_DIR_NAME = 'cursor-chats'
+
+/** Durable Cursor chat store, deliberately OUTSIDE the per-turn ephemeral HOME
+ *  so resume survives while auth.json/JWT still dies with the turn. */
+export function cursorChatsRoot(): string {
+  return join(paths.home, CURSOR_CHATS_DIR_NAME)
+}
+
+/** Mirrors the pinned CLI: chats/<md5(path.resolve(workspace))>/<sessionId>/. */
+export function cursorResumeStorePath(workspacePath: string, sessionId: string): string {
+  const wsHash = createHash('md5').update(resolve(workspacePath)).digest('hex')
+  return join(cursorChatsRoot(), wsHash, sessionId, 'store.db')
+}
+
+/** The CLI silently mints an empty chat for an unknown id, so a missing local
+ *  store is the only stale-resume signal available. */
+export function cursorResumeStoreExists(workspacePath: string, sessionId: string): boolean {
+  try { return existsSync(cursorResumeStorePath(workspacePath, sessionId)) } catch { return false }
+}
+
 export class CursorAdapter extends EventEmitter implements EngineAdapter {
   readonly engineId = 'cursor'
   readonly capabilities: EngineCapabilities = {
@@ -718,7 +747,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     supportsEffort: false,
     resumeKind: 'cursor-session',
     needsServerRequestId: true,
-    historyMode: 'stateless-replay',
+    historyMode: 'native-resume',
     maxPromptBytes: CURSOR_MAX_TURN_PAYLOAD_BYTES,
   }
   private readonly opts: EngineCreateOpts
@@ -728,14 +757,21 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
   private target: ExecutionTarget = { kind: 'local' }
   private drain: Promise<void> = Promise.resolve()
   private readonly ownedContextDirs = new Set<string>()
+  private nativeId: string | null
   lastActivityAt = 0
 
-  constructor(opts: EngineCreateOpts) { super(); this.opts = { ...opts }; this.setModel(opts.model); this.currentToolsets = opts.agentToolsets }
+  constructor(opts: EngineCreateOpts) {
+    super()
+    this.opts = { ...opts }
+    this.nativeId = opts.resumeSessionId ?? null
+    this.setModel(opts.model)
+    this.currentToolsets = opts.agentToolsets
+  }
   start(): Promise<void> { return Promise.resolve() }
   submitTurn(params: TurnParams): EngineTurnRun {
     let resolve!: (value: TurnSummary | null) => void
     const summary = new Promise<TurnSummary | null>((r) => { resolve = r })
-    const ctx: TurnCtx = { params, startedAt: Date.now(), proc: null, assistantText: '', thinkingText: '', assistantSegments: [], thinkingSegments: [], tools: new Map(), pending: new Set(), startedTools: new Map(), stderr: '', terminal: false, procClosed: false, abandoned: false, resolveDrain: null, interrupted: false, error: null, assistantPartialText: '', pendingAssistantText: null, assistantSegmentClosed: false, thinkingSegmentClosed: false, contextDir: null, rawToSafeToolId: new Map(), safeToRawToolId: new Map(), fallbackToolSequence: 0, resolve }
+    const ctx: TurnCtx = { params, startedAt: Date.now(), proc: null, assistantText: '', thinkingText: '', assistantSegments: [], thinkingSegments: [], tools: new Map(), pending: new Set(), startedTools: new Map(), stderr: '', terminal: false, procClosed: false, abandoned: false, resolveDrain: null, interrupted: false, error: null, assistantPartialText: '', pendingAssistantText: null, assistantSegmentClosed: false, thinkingSegmentClosed: false, contextDir: null, rawToSafeToolId: new Map(), safeToRawToolId: new Map(), fallbackToolSequence: 0, sessionIdEmitted: false, resolve }
     this.active = ctx; this.lastActivityAt = Date.now(); this.drain = new Promise((r) => { ctx.resolveDrain = r })
     const submitted = this.spawnTurn(ctx).catch((err) => {
       // Only ever settle this turn's own barrier: shutdown() may have already
@@ -782,6 +818,11 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
       // Cleanup is intentionally best-effort and fenced. Never broaden the
       // deletion target after a validation/stat failure.
     }
+  }
+  private prepareCursorChatsDir(): string {
+    const dir = cursorChatsRoot()
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
+    return dir
   }
   private async spawnTurn(ctx: TurnCtx): Promise<void> {
     let cwd = this.opts.agentBaseDir
@@ -848,6 +889,16 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         env.OPENCLAUDE_CURSOR_MCP_CONFIG = configFile
       }
 
+      this.prepareCursorChatsDir()
+      // Wrapper --workspace is `pwd -P` of this spawn cwd. A symlink cwd would
+      // hash differently from the CLI store path, so realpath before the check.
+      let workspaceForResume = cwd
+      try { workspaceForResume = realpathSync(cwd) } catch { /* keep cwd */ }
+      const resumeId = this.nativeId && cursorResumeStoreExists(workspaceForResume, this.nativeId) ? this.nativeId : null
+      // A stored id whose local store vanished would silently mint an empty chat.
+      if (this.nativeId && resumeId === null) this.nativeId = null
+      if (resumeId !== null) env.OPENCLAUDE_CURSOR_RESUME_ID = resumeId
+
       const args = [
         ...(selected.upstreamModel === null ? [] : ['--model', selected.upstreamModel]),
         '--force',
@@ -866,7 +917,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         this.cleanupContextDir(ctx)
         return
       }
-      this.emit('spawn', { resumed: false })
+      this.emit('spawn', { resumed: resumeId !== null })
       let buffer = ''
       proc.stdout.setEncoding('utf8')
       proc.stdout.on('data', (chunk: string) => {
@@ -934,6 +985,14 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
   private handleLine(ctx: TurnCtx, line: string): void {
     let event: CursorEvent
     try { event = JSON.parse(line) as CursorEvent } catch (err) { this.emit('parse_error', { line, err }); return }
+    const sid = typeof event.session_id === 'string' ? event.session_id : ''
+    if (sid) {
+      if (sid !== this.nativeId) this.nativeId = sid
+      if (!ctx.sessionIdEmitted) {
+        ctx.sessionIdEmitted = true
+        this.emit('session_id', sid)
+      }
+    }
     const type = textOf(event.type).toLowerCase()
     const aggregateBoundary = type === 'retry'
       || (type === 'interaction_query' && textOf(event.subtype).toLowerCase() === 'request')
@@ -1121,8 +1180,8 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     }
   }
   waitForOutputDrain(): Promise<void> { return this.drain }
-  get nativeSessionId(): null { return null }
-  clearSessionId(): void {}
+  get nativeSessionId(): string | null { return this.nativeId }
+  clearSessionId(): void { this.nativeId = null }
   setModel(model: string | undefined): void {
     const selected = model ?? DEFAULT_CURSOR_ENGINE_MODEL
     if (!CURSOR_ENGINE_MODELS.some((entry) => entry.id === selected)) {

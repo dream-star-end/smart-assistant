@@ -145,6 +145,7 @@ import {
   readUserMessagePayload,
   upsertClientSession,
   appendServerAuthoredMessage,
+  patchServerAuthoredMessage,
   deleteClientSession,
   renameClientSession,
   setClientSessionModel,
@@ -155,6 +156,15 @@ import {
   countRuntimeRecycleUnsafeTurnDispatches,
   turnDispatchInboxStats,
 } from '@openclaude/storage'
+import {
+  DETACHED_ASK_USER_TTL_MS,
+  buildDetachedAskUserPersistMessage,
+  buildDetachedAskUserPostedResult,
+  formatAskUserAnswerMessage,
+  isDetachedAskUserPending,
+  isDetachedAskUserRequestId,
+  pendingFromDetachedAskUserMessage,
+} from './detachedAskUser.js'
 import {
   filterUserVisibleAgentsForManagement,
   filterUserVisibleByAgentField,
@@ -1867,11 +1877,17 @@ export class Gateway {
      *  by the janitor even if no disconnect or crash occurred. Prevents orphan
      *  pending entries when a user leaves the tab open across days. */
     expiresAt: number
+    /** Detached Cursor ask_user card: not a real engine permission. Survives
+     *  turn end / disconnect / session eviction; 24h TTL; never auto-denied by
+     *  the 30-minute sweeper. Answer starts a new user turn. */
+    detachedAskUser?: boolean
   }>()
   /** Max wait for a permission response before the janitor auto-denies.
    *  Matched to the outer CCB turn timeout (30 min) so we don't pre-empt
    *  a slow user while a turn is still live. */
   private static readonly PENDING_PERMISSION_TTL_MS = 30 * 60_000
+  /** Detached Cursor ask_user cards stay answerable this long. */
+  private static readonly DETACHED_ASK_USER_TTL_MS = DETACHED_ASK_USER_TTL_MS
   /** How often the janitor scans _pendingPermissions. */
   private static readonly PENDING_PERMISSION_SWEEP_MS = 60_000
   // Recently-settled permission requests: requestId → authoritative result.
@@ -4720,6 +4736,14 @@ export class Gateway {
     const delegateMatch = url.pathname.match(/^\/api\/agents\/([a-zA-Z0-9_-]+)\/delegate$/)
     if (delegateMatch) {
       this.handleDelegateTask(req, res, delegateMatch[1]).catch((err) =>
+        this.sendInternalError(res, err),
+      )
+      return
+    }
+    // ── Engine ask-user bridge (cursor MCP ask_user → web choice cards) ──
+    const askUserMatch = url.pathname.match(/^\/api\/agents\/([a-zA-Z0-9_-]+)\/ask-user$/)
+    if (askUserMatch) {
+      this.handleEngineAskUser(req, res, askUserMatch[1]).catch((err) =>
         this.sendInternalError(res, err),
       )
       return
@@ -12273,7 +12297,11 @@ export class Gateway {
     // Consume pending first so we can use its authoritative channel/peer/sessionKey
     // instead of trusting the client-supplied frame fields. For the not-found /
     // dead-session branches we fall back to frame.* because we have nothing else.
-    const pending = this._pendingPermissions.get(frame.requestId)
+    let pending = this._pendingPermissions.get(frame.requestId)
+    if (pending) this._pendingPermissions.delete(frame.requestId)
+    if (!pending) {
+      pending = (await this._hydrateDetachedAskUserPending(frame)) ?? undefined
+    }
     if (!pending) {
       // Race: another tab (or our own /stop / timeout path) settled this
       // requestId first. Replay the authoritative behavior from the recent-
@@ -12319,10 +12347,12 @@ export class Gateway {
       }
       return
     }
-    this._pendingPermissions.delete(frame.requestId)
 
     const session = this.sessions.getByKey(pending.sessionKey)
-    if (!session) {
+    if (!session && (isDetachedAskUserPending(pending) || isDetachedAskUserRequestId(frame.requestId))) {
+      // Detached ask_user answers start a new turn via dispatchInbound;
+      // an evicted in-memory session is expected after hours away.
+    } else if (!session) {
       this.log.warn('permission response for dead session', { sessionKey: pending.sessionKey })
       // Session is gone, but tabs still hold the modal — clear them.
       // Record the authoritative deny so any late duplicate rebroadcasts deny.
@@ -12386,7 +12416,54 @@ export class Gateway {
     const response = effectiveBehavior === 'allow'
       ? { behavior: 'allow' as const, updatedInput: forwardedInput, toolUseID: pending.toolUseId }
       : { behavior: 'deny' as const, message: effectiveMessage || 'User denied', toolUseID: pending.toolUseId }
-    const ok = session.runner.sendPermissionResponse(frame.requestId, response)
+    const settledAnswers =
+      effectiveBehavior === 'allow' &&
+      pending.toolName === 'AskUserQuestion' &&
+      forwardedInput !== pending.input &&
+      (forwardedInput as { answers?: unknown }).answers &&
+      typeof (forwardedInput as { answers?: unknown }).answers === 'object'
+        ? ((forwardedInput as { answers: Record<string, string> }).answers)
+        : undefined
+    if (isDetachedAskUserPending(pending) || isDetachedAskUserRequestId(frame.requestId)) {
+      this._recordSettlement(frame.requestId, {
+        behavior: effectiveBehavior,
+        channel: pending.channel,
+        peer: pending.peer,
+        sessionKey: pending.sessionKey,
+        userId: pending.userId,
+        ...(settledAnswers ? { answers: settledAnswers } : {}),
+      })
+      this._broadcastPermissionSettled(pending.peerKey, {
+        sessionKey: pending.sessionKey,
+        channel: pending.channel,
+        peer: pending.peer,
+        requestId: frame.requestId,
+        behavior: effectiveBehavior,
+        reason: 'remote',
+        ...(settledAnswers ? { answers: settledAnswers } : {}),
+      })
+      void this._patchDetachedAskUserResolved(pending, frame.requestId, {
+        _resolved: true,
+        _behavior: effectiveBehavior,
+        _settledReason: 'remote',
+        ...(settledAnswers ? { _answers: settledAnswers } : {}),
+      })
+      if (effectiveBehavior === 'allow') {
+        const text = formatAskUserAnswerMessage(pending.input, settledAnswers ?? {})
+        await this._submitDetachedAskUserAnswer(pending, text, frame.requestId)
+      }
+      this.log.info('detached ask_user settled', {
+        requestId: frame.requestId,
+        behavior: effectiveBehavior,
+        startedTurn: effectiveBehavior === 'allow',
+      })
+      return
+    }
+    if (!session) {
+      this.log.warn('permission response for dead session', { sessionKey: pending.sessionKey })
+      return
+    }
+    let ok = session.runner.sendPermissionResponse(frame.requestId, response)
     this.log.info('permission response', {
       requestId: frame.requestId,
       behavior: effectiveBehavior,
@@ -12409,14 +12486,6 @@ export class Gateway {
     // (without having the user re-enter anything) and the sender tab can
     // reconcile its optimistic state if the gateway-visible answers ever
     // differ from what the tab cached locally.
-    const settledAnswers =
-      effectiveBehavior === 'allow' &&
-      pending.toolName === 'AskUserQuestion' &&
-      forwardedInput !== pending.input &&
-      (forwardedInput as { answers?: unknown }).answers &&
-      typeof (forwardedInput as { answers?: unknown }).answers === 'object'
-        ? ((forwardedInput as { answers: Record<string, string> }).answers)
-        : undefined
     this._recordSettlement(frame.requestId, {
       behavior: effectiveBehavior,
       channel: pending.channel,
@@ -12686,6 +12755,194 @@ export class Gateway {
    *  Used by disconnect / timeout / session-crash paths. Safe to call on
    *  sessions that no longer exist — the runner-response step silently
    *  skips in that case (the subprocess is already gone). */
+  /**
+   * Detached Cursor ask_user: register the question, persist it on the session
+   * tape, push the existing permission_request frame, and return immediately.
+   * The model must end its turn; the user's answer arrives as a later user message.
+   */
+  private async handleEngineAskUser(
+    req: IncomingMessage,
+    res: ServerResponse,
+    targetAgentId: string,
+  ): Promise<void> {
+    if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
+    const body = await this.readBody(req)
+    let parsed: any
+    try {
+      parsed = JSON.parse(body)
+    } catch {
+      return this.sendError(res, 400, 'invalid JSON')
+    }
+    const questions = sanitizeEngineAskUserQuestions(parsed?.questions)
+    if (!questions) {
+      return this.sendError(
+        res,
+        400,
+        'questions invalid: need 1-4 items with question + 2-4 options each',
+      )
+    }
+    const sessionKey = typeof parsed.sessionKey === 'string' ? parsed.sessionKey : ''
+    if (!sessionKey) return this.sendError(res, 400, 'sessionKey required')
+    const session = this.sessions.getByKey(sessionKey)
+    if (!session) return this.sendError(res, 404, 'session not found')
+    if (session.agentId !== targetAgentId) {
+      return this.sendError(res, 409, 'session belongs to another agent')
+    }
+    if (session.providerTag && session.providerTag !== 'cursor') {
+      return this.sendError(res, 409, 'ask_user is only available on the cursor engine')
+    }
+    if (!session.runner.isRunning) {
+      return this.sendError(res, 409, 'no active turn on session')
+    }
+
+    const input = { questions }
+    const requestId = `ask-user:${randomBytes(16).toString('hex')}`
+    const userId = session.userId ?? 'default'
+    const channel = session.channel
+    const peer = {
+      id: session.peerId,
+      kind: sessionKey.includes(':group:') ? ('group' as const) : ('dm' as const),
+    }
+    const peerKey = Gateway.makePeerKey(userId, channel, peer.id)
+    const expiresAt = Date.now() + Gateway.DETACHED_ASK_USER_TTL_MS
+    this._pendingPermissions.set(requestId, {
+      sessionKey,
+      toolName: 'AskUserQuestion',
+      input,
+      peerKey,
+      userId,
+      channel,
+      peer,
+      expiresAt,
+      detachedAskUser: true,
+    })
+    this._sendStampedSessionFrame(sessionKey, peerKey, {
+      type: 'outbound.permission_request',
+      sessionKey,
+      channel,
+      peer,
+      requestId,
+      toolName: 'AskUserQuestion',
+      inputPreview: JSON.stringify(input).slice(0, 400),
+      inputJson: input,
+    })
+    this.log.info('engine ask_user posted', {
+      requestId,
+      sessionKey,
+      agentId: session.agentId,
+    })
+    void this._persistDetachedAskUserCard({
+      requestId,
+      questions,
+      sessionKey,
+      userId,
+      channel,
+      peer,
+      expiresAt,
+    })
+    this.sendJson(res, 200, buildDetachedAskUserPostedResult(requestId))
+  }
+
+  private async _persistDetachedAskUserCard(args: {
+    requestId: string
+    questions: Array<Record<string, unknown>>
+    sessionKey: string
+    userId: string
+    channel: string
+    peer: { id: string; kind: 'dm' | 'group' }
+    expiresAt: number
+  }): Promise<void> {
+    try {
+      const msg = buildDetachedAskUserPersistMessage(args)
+      const r = await appendServerAuthoredMessage(args.peer.id, args.userId, msg)
+      if (!r.applied) {
+        this.log.warn('detached ask_user tape persist not applied', {
+          requestId: args.requestId,
+          reason: r.reason,
+        })
+      }
+    } catch (err) {
+      this.log.warn('detached ask_user tape persist failed', { requestId: args.requestId }, err as Error)
+    }
+  }
+
+  private async _patchDetachedAskUserResolved(
+    pending: { peer: { id: string }; userId: string },
+    requestId: string,
+    patch: Record<string, unknown>,
+  ): Promise<void> {
+    try {
+      await patchServerAuthoredMessage(pending.peer.id, pending.userId, requestId, patch)
+    } catch (err) {
+      this.log.warn('detached ask_user tape patch failed', { requestId }, err as Error)
+    }
+  }
+
+  private async _hydrateDetachedAskUserPending(frame: {
+    requestId: string
+    channel: string
+    peer: { id: string; kind: 'dm' | 'group' }
+    /** Stashed by the WS entrypoint from the authenticated connection, never
+     *  from the client frame — this is the only user identity we can trust
+     *  once the in-memory pending entry is gone (restart / TTL rebuild). */
+    _userId?: unknown
+  }): Promise<ReturnType<typeof pendingFromDetachedAskUserMessage>> {
+    if (!isDetachedAskUserRequestId(frame.requestId)) return null
+    const userId = typeof frame._userId === 'string' && frame._userId ? frame._userId : 'default'
+    try {
+      const sess = await getClientSession(frame.peer.id, userId)
+      const messages = Array.isArray(sess?.messages) ? sess!.messages : []
+      const msg = messages.find((m: any) =>
+        m && (m.requestId === frame.requestId || m.id === frame.requestId) && m.role === 'permission',
+      ) as Record<string, unknown> | undefined
+      if (!msg) return null
+      return pendingFromDetachedAskUserMessage(msg, {
+        userId,
+        channel: frame.channel,
+        peer: frame.peer,
+        peerKey: Gateway.makePeerKey(userId, frame.channel, frame.peer.id),
+      })
+    } catch (err) {
+      this.log.warn('detached ask_user hydrate failed', { requestId: frame.requestId }, err as Error)
+      return null
+    }
+  }
+
+  private async _submitDetachedAskUserAnswer(
+    pending: {
+      sessionKey: string
+      userId: string
+      channel: string
+      peer: { id: string; kind: 'dm' | 'group' }
+    },
+    text: string,
+    requestId: string,
+  ): Promise<void> {
+    const agentId = pending.sessionKey.split(':')[1] || 'main'
+    const clientMessageId = `ask-ans-${requestId.replace(/[^A-Za-z0-9_-]/g, '').slice(-24)}`
+    try {
+      await appendServerAuthoredMessage(pending.peer.id, pending.userId, {
+        id: clientMessageId,
+        role: 'user',
+        text,
+        ts: Date.now(),
+      })
+    } catch (err) {
+      this.log.warn('detached ask_user answer persist failed', { requestId }, err as Error)
+    }
+    await this.dispatchInbound({
+      type: 'inbound.message',
+      channel: pending.channel,
+      peer: pending.peer,
+      agentId,
+      content: { text },
+      ts: Date.now(),
+      idempotencyKey: `ask-user-answer:${requestId}`,
+      clientMessageId,
+      _userId: pending.userId,
+    } as any)
+  }
+
   private _forceDenyPendingPermission(
     requestId: string,
     reason: 'disconnect' | 'timeout' | 'crashed',
@@ -12694,8 +12951,11 @@ export class Gateway {
     const pending = this._pendingPermissions.get(requestId)
     if (!pending) return false
     this._pendingPermissions.delete(requestId)
+    // Engine ask_user bridge: unblock the held HTTP caller before anything that
+    // could throw (session lookup / runner forward) so it never hangs to its
+    // own client timeout.
     const session = this.sessions.getByKey(pending.sessionKey)
-    if (session) {
+    if (session && !isDetachedAskUserPending(pending)) {
       // sendPermissionResponse swallows its own errors and returns false if
       // the subprocess is gone — `false` is expected on crash/exit paths.
       const ok = session.runner.sendPermissionResponse(requestId, {
@@ -12707,6 +12967,13 @@ export class Gateway {
         requestId,
         reason,
         runnerAccepted: ok,
+      })
+    }
+    if (isDetachedAskUserPending(pending)) {
+      void this._patchDetachedAskUserResolved(pending, requestId, {
+        _resolved: true,
+        _behavior: 'deny',
+        _settledReason: reason,
       })
     }
     // Record authoritative 'deny' so a late duplicate response (from a
@@ -12737,6 +13004,7 @@ export class Gateway {
     // Snapshot requestIds first — the helper mutates _pendingPermissions.
     const requestIds: string[] = []
     for (const [requestId, pending] of this._pendingPermissions) {
+      if (pending.detachedAskUser) continue
       if (pending.peerKey === peerKey) requestIds.push(requestId)
     }
     for (const requestId of requestIds) {
@@ -12751,6 +13019,11 @@ export class Gateway {
     const now = Date.now()
     const toExpire: Array<{ requestId: string; reason: 'timeout' | 'crashed' }> = []
     for (const [requestId, pending] of this._pendingPermissions) {
+      if (isDetachedAskUserPending(pending)) {
+        // 24h TTL only. Turn end / session eviction must not kill the card.
+        if (now >= pending.expiresAt) toExpire.push({ requestId, reason: 'timeout' })
+        continue
+      }
       if (now >= pending.expiresAt) {
         toExpire.push({ requestId, reason: 'timeout' })
       } else if (!this.sessions.getByKey(pending.sessionKey)) {
@@ -15719,6 +15992,72 @@ export function _shouldPushTurnInterruptedFinal(
   if ((engineTurnCount ?? 0) > 0) return false
   if ((clientTurnCount ?? 0) > 0) return false
   return true
+}
+
+// ── Engine ask_user bridge (cursor MCP) input sanitizer ──
+
+/** Settlement payload handed back to the waiting MCP ask_user HTTP caller. */
+export type EngineAskUserSettlement = {
+  status: 'answered' | 'skipped'
+  answers?: Record<string, string>
+  reason?: string
+}
+
+/**
+ * Server-side validator for the engine ask_user bridge. The MCP client is not
+ * trusted: clamp counts/lengths and strip unknown keys before the questions
+ * enter a pending-permission payload that the web renders (and that
+ * sanitizeAskUserQuestionUpdatedInput later keys answers against). Mirrors the
+ * MCP-side normalizer in packages/mcp-memory toolDefs.ts — two copies on
+ * purpose: different packages, different trust domains, no shared dependency.
+ *
+ * Returns the normalized product-shape questions array, or null when the input
+ * is structurally unusable.
+ */
+export function sanitizeEngineAskUserQuestions(
+  raw: unknown,
+): Array<Record<string, unknown>> | null {
+  if (!Array.isArray(raw) || raw.length === 0 || raw.length > 4) return null
+  const questions: Array<Record<string, unknown>> = []
+  for (const item of raw) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return null
+    const question = (item as { question?: unknown }).question
+    if (
+      typeof question !== 'string' ||
+      question.trim().length === 0 ||
+      question.length > 2000
+    ) {
+      return null
+    }
+    const optionsRaw = (item as { options?: unknown }).options
+    if (!Array.isArray(optionsRaw) || optionsRaw.length < 2 || optionsRaw.length > 4) return null
+    const options: Array<Record<string, unknown>> = []
+    for (const opt of optionsRaw) {
+      if (!opt || typeof opt !== 'object' || Array.isArray(opt)) return null
+      const label = (opt as { label?: unknown }).label
+      if (typeof label !== 'string' || label.trim().length === 0 || label.length > 300) {
+        return null
+      }
+      const description = (opt as { description?: unknown }).description
+      options.push({
+        label,
+        ...(typeof description === 'string' &&
+        description.length > 0 &&
+        description.length <= 1000
+          ? { description }
+          : {}),
+      })
+    }
+    const header = (item as { header?: unknown }).header
+    const multiSelect = (item as { multiSelect?: unknown }).multiSelect
+    questions.push({
+      question,
+      ...(typeof header === 'string' && header.length > 0 ? { header: header.slice(0, 12) } : {}),
+      ...(multiSelect === true ? { multiSelect: true } : {}),
+      options,
+    })
+  }
+  return questions
 }
 
 // ── AskUserQuestion updatedInput sanitizer ──

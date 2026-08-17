@@ -59,9 +59,19 @@ import { filterSkillEvalTools, isSkillEvalBlockedTool } from './skillEvalToolPol
 // Tool 定义(TOOLS / SKILL_PROPOSE_TOOL)抽到 ./toolDefs.ts(纯数据模块,无副作用),
 // 让「TOOLS ↔ toolNames.ts」锁步单测能直接 import 校验,而不触发本入口模块顶层的
 // server.connect(见 toolDefs.ts / __tests__/toolNames.test.ts)。
-import { SKILL_PROPOSE_TOOL, TOOLS } from './toolDefs.js'
+import { SKILL_PROPOSE_TOOL, TOOLS, normalizeAskUserQuestions } from './toolDefs.js'
 
 const AGENT_ID = process.env.OPENCLAUDE_AGENT_ID ?? 'main'
+/** 本 MCP 子进程的委派深度(由网关 spawn env 注入)。>0 = 子 agent 环境,
+ *  没有直接面向用户的交互面 —— ask_user 直接短路返回 skipped。 */
+const DELEGATION_DEPTH = Math.max(
+  0,
+  Number.parseInt(process.env.OPENCLAUDE_DELEGATION_DEPTH || '0', 10) || 0,
+)
+/** 引擎身份(由网关 spawn env 注入)。ask_user 只挂在 Cursor 上 —— CCB/Codex
+ *  各有原生提问工具,必须保持一条机制。未注入时视为非 Cursor,不暴露 ask_user。 */
+const ENGINE_ID = (process.env.OPENCLAUDE_ENGINE || '').trim().toLowerCase()
+const ASK_USER_ENABLED = ENGINE_ID === 'cursor'
 
 /**
  * Read the gateway access token used to authenticate callbacks from this
@@ -176,12 +186,18 @@ const server = new Server(
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   // Training session REMOVES authoritative-write tools (only skill_propose drafts).
-  const base = SKILL_TRAIN_RUN_ID
+  let base = SKILL_TRAIN_RUN_ID
     ? [
         ...TOOLS.filter((t) => t.name !== 'skill_save' && t.name !== 'skill_delete'),
         SKILL_PROPOSE_TOOL,
       ]
     : TOOLS
+  // 子 agent 没有面向用户的交互面:直接不暴露 ask_user(discovery 过滤不是
+  // 授权边界,CallTool 侧还有深度短路兜底)。非 Cursor 引擎各有原生提问工具,
+  // 同样不暴露 —— 每引擎只留一条机制。
+  if (DELEGATION_DEPTH > 0 || !ASK_USER_ENABLED) {
+    base = base.filter((t) => t.name !== 'ask_user')
+  }
   return { tools: filterSkillEvalTools(base, SKILL_EVAL_MODE) }
 })
 
@@ -226,6 +242,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         return await handleDelegateTasks(args as any)
       case 'request_review':
         return await handleRequestReview(args as any)
+      case 'ask_user':
+        return await handleAskUser(args as any)
       default:
         return { content: [{ type: 'text', text: `unknown tool: ${name}` }], isError: true }
     }
@@ -737,6 +755,70 @@ async function handleDelegateTasks(args: { tasks?: unknown }) {
  * env tuning (the gateway can never exceed its own clamp).
  */
 const DELEGATE_CLIENT_TIMEOUT_MS = 2 * 60 * 60_000 + 60_000
+
+/** ask_user 已改为非阻塞:网关登记问题后立即 200,本调用必须远低于 Cursor MCP
+ *  的 60s tools/call 硬超时。15s 只覆盖登记往返,不再等人作答。 */
+const ASK_USER_POST_TIMEOUT_MS = 15_000
+
+/**
+ * 引擎交互提问桥(仅 Cursor):把选择题 POST 给网关后立即返回。网关把选择卡
+ * 挂到会话上;用户作答会作为下一条普通用户消息到达。禁止轮询或对同一问题
+ * 再次调用。子 agent / 非 Cursor 直接短路。
+ */
+async function handleAskUser(args: { questions?: unknown } | undefined | null) {
+  const questions = normalizeAskUserQuestions(args?.questions)
+  if (!questions) {
+    return toolError(
+      'ask_user 参数无效:questions 必须是 1-4 个 {question, options:[{label,(description)}], (header),(multiSelect)}',
+    )
+  }
+  if (DELEGATION_DEPTH > 0) {
+    return toolOk(
+      JSON.stringify({
+        status: 'skipped',
+        reason:
+          'subagent has no interactive user — decide yourself, or list numbered options in your final report',
+      }),
+    )
+  }
+  if (!ASK_USER_ENABLED) {
+    return toolError(
+      'ask_user is only available on the Cursor engine; use the engine-native question tool',
+    )
+  }
+  const sessionKey = process.env.OPENCLAUDE_SESSION_KEY || ''
+  if (!sessionKey) return toolError('ask_user unavailable: no session key in environment')
+  const gatewayPort = process.env.OPENCLAUDE_GATEWAY_PORT || '18789'
+  const gatewayToken = readGatewayToken()
+  const res = await postJsonToGateway(
+    `http://127.0.0.1:${gatewayPort}/api/agents/${encodeURIComponent(AGENT_ID)}/ask-user`,
+    {
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${gatewayToken}`,
+        'x-delegation-depth': String(DELEGATION_DEPTH),
+      },
+      body: JSON.stringify({ sessionKey, questions }),
+      timeoutMs: ASK_USER_POST_TIMEOUT_MS,
+    },
+  )
+  if (res.statusCode === 409) {
+    return toolOk(
+      JSON.stringify({
+        status: 'skipped',
+        reason:
+          'no active turn for interactive questions — present numbered options as plain text and end the turn',
+      }),
+    )
+  }
+  if (res.statusCode < 200 || res.statusCode >= 300) {
+    return toolError(
+      `ask_user failed (HTTP ${res.statusCode}): ${res.body.slice(0, 300)}`,
+    )
+  }
+  // 网关立即回 {status:'posted',...}:问题已展示,本回合必须结束,答案走下一条用户消息。
+  return toolOk(res.body)
+}
 
 /**
  * node:http surfaces the real transport failure on `err.code` (ECONNREFUSED,

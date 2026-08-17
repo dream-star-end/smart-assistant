@@ -2370,12 +2370,25 @@ export function applyCostWaived(sess: ChatSession | null, frame: CostWaivedWire,
 // ═══════════════ permission_request / settled（§3 去重）═══════════════
 export function applyPermissionRequest(sess: ChatSession, frame: OutboundPermissionRequestWire): ChatMessage | null {
   if (!acceptFrameSeq(sess, frame)) return null;
+  const existing = sess.messages.find(
+    (m) => m.role === "permission" && m.requestId === frame.requestId && !isImmutableTapeViewportRow(m),
+  );
+  if (existing) return existing;
+  const detachedAskUser =
+    (frame as { detachedAskUser?: unknown }).detachedAskUser === true ||
+    (typeof frame.requestId === "string" && frame.requestId.startsWith("ask-user:"));
   return addMessage(sess, "permission", frame.toolName, {
+    // Detached ask_user cards share this id with the server tape row so
+    // full-sync / another device merges by id instead of duplicating.
+    ...(typeof frame.requestId === "string" && frame.requestId.startsWith("ask-user:")
+      ? { id: frame.requestId }
+      : {}),
     requestId: frame.requestId,
     toolName: frame.toolName,
     inputPreview: frame.inputPreview || "",
     inputJson: frame.inputJson || null,
     _resolved: false,
+    ...(detachedAskUser ? { _detachedAskUser: true } : {}),
     ...((frame.clientMessageId ?? sess._activeClientMessageId)
       ? { _turnOwnerId: frame.clientMessageId ?? sess._activeClientMessageId }
       : {}),

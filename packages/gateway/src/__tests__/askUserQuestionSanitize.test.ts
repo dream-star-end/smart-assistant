@@ -7,7 +7,10 @@ import * as assert from 'node:assert/strict'
  * Run: npx tsx --test packages/gateway/src/__tests__/askUserQuestionSanitize.test.ts
  */
 import { describe, it } from 'node:test'
-import { sanitizeAskUserQuestionUpdatedInput } from '../server.js'
+import {
+  sanitizeAskUserQuestionUpdatedInput,
+  sanitizeEngineAskUserQuestions,
+} from '../server.js'
 
 // Representative pending.input shape mirroring what CCB sends via
 // control_request: { subtype: 'can_use_tool' } for AskUserQuestion.
@@ -234,5 +237,89 @@ describe('sanitizeAskUserQuestionUpdatedInput', () => {
     assert.ok(out)
     assert.ok((out as any).answers, 'answers key should be present')
     assert.equal(typeof (out as any).answers, 'object')
+  })
+})
+
+describe('sanitizeEngineAskUserQuestions (cursor MCP ask_user bridge)', () => {
+  it('normalizes a well-formed payload and strips unknown keys', () => {
+    const out = sanitizeEngineAskUserQuestions([
+      {
+        question: '数据落点怎么选?',
+        header: '数据落点数据库存储',
+        multiSelect: false,
+        options: [
+          { label: '容器内 SQLite', description: '最快跑通' },
+          { label: 'master PostgreSQL', unrelatedJunk: 'x' },
+        ],
+      },
+    ])
+    assert.ok(out)
+    assert.deepEqual(out, [
+      {
+        question: '数据落点怎么选?',
+        // header 截到 12 字符(与产品 AskUserQuestion 卡面约定一致)
+        header: '数据落点数据库存储'.slice(0, 12),
+        options: [
+          { label: '容器内 SQLite', description: '最快跑通' },
+          { label: 'master PostgreSQL' },
+        ],
+      },
+    ])
+  })
+
+  it('only keeps multiSelect when strictly true', () => {
+    const out = sanitizeEngineAskUserQuestions([
+      {
+        question: 'q',
+        multiSelect: 'yes',
+        options: [{ label: 'a' }, { label: 'b' }],
+      },
+    ])
+    assert.ok(out)
+    assert.equal((out![0] as any).multiSelect, undefined)
+  })
+
+  it('drops overlong descriptions instead of failing the whole call', () => {
+    const out = sanitizeEngineAskUserQuestions([
+      {
+        question: 'q',
+        options: [
+          { label: 'a', description: 'x'.repeat(1500) },
+          { label: 'b', description: 'ok' },
+        ],
+      },
+    ])
+    assert.ok(out)
+    const options = (out![0] as any).options as Array<Record<string, unknown>>
+    assert.equal(options[0].description, undefined)
+    assert.equal(options[1].description, 'ok')
+  })
+
+  it('rejects structurally unusable inputs', () => {
+    assert.equal(sanitizeEngineAskUserQuestions(undefined), null)
+    assert.equal(sanitizeEngineAskUserQuestions('nope'), null)
+    assert.equal(sanitizeEngineAskUserQuestions([]), null)
+    assert.equal(
+      sanitizeEngineAskUserQuestions(
+        Array.from({ length: 5 }, () => ({
+          question: 'q',
+          options: [{ label: 'a' }, { label: 'b' }],
+        })),
+      ),
+      null,
+    )
+    assert.equal(
+      sanitizeEngineAskUserQuestions([{ question: '', options: [{ label: 'a' }, { label: 'b' }] }]),
+      null,
+    )
+    assert.equal(sanitizeEngineAskUserQuestions([{ question: 'q', options: [{ label: 'a' }] }]), null)
+    assert.equal(
+      sanitizeEngineAskUserQuestions([{ question: 'q', options: [{ label: '' }, { label: 'b' }] }]),
+      null,
+    )
+    assert.equal(
+      sanitizeEngineAskUserQuestions([{ question: 'q', options: 'nope' }]),
+      null,
+    )
   })
 })

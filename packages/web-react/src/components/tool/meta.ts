@@ -253,6 +253,7 @@ const MCP_OP_META: Record<string, ToolMeta> = {
   "openclaude-memory:skill_delete": { icon: Sparkles, label: "删除技能" },
   "openclaude-memory:skill_propose": { icon: Sparkles, label: "提议技能" },
   "openclaude-memory:request_review": { icon: ShieldCheck, label: "申请质量审查" },
+  "openclaude-memory:ask_user": { icon: ListChecks, label: "向用户提问" },
   "openclaude-memory:ask_gpt55_codex": { icon: Bot, label: "Codex 审查" },
   // codex 内建 MCP 资源清单(op 无摘要,空态即全部信息)。
   "codex:list_mcp_resources": { icon: Boxes, label: "MCP 资源列表" },

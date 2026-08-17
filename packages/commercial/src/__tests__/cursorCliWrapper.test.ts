@@ -59,6 +59,14 @@ set -eu
 printf '%s\\n' "$HOME" > "$OC_CURSOR_TEST_CAPTURE/home"
 printf '%s\\n' "$@" > "$OC_CURSOR_TEST_CAPTURE/argv"
 printf '%s\\n' "\${OPENCLAUDE_CURSOR_MCP_CONFIG-unset}" > "$OC_CURSOR_TEST_CAPTURE/mcp-env"
+printf '%s\\n' "\${OPENCLAUDE_CURSOR_RESUME_ID-unset}" > "$OC_CURSOR_TEST_CAPTURE/resume-env"
+if [ -L "$HOME/.config/cursor/chats" ]; then
+  readlink "$HOME/.config/cursor/chats" > "$OC_CURSOR_TEST_CAPTURE/chats-link"
+elif [ -e "$HOME/.config/cursor/chats" ]; then
+  printf '%s\\n' "not-symlink" > "$OC_CURSOR_TEST_CAPTURE/chats-link"
+else
+  printf '%s\\n' "missing" > "$OC_CURSOR_TEST_CAPTURE/chats-link"
+fi
 if [ -f "$HOME/.cursor/mcp.json" ]; then
   /bin/cp "$HOME/.cursor/mcp.json" "$OC_CURSOR_TEST_CAPTURE/mcp.json"
 fi
@@ -315,6 +323,8 @@ describe('oc-cursor wrapper', () => {
       ['--endpoint=https://example.invalid', '--', 'hello'],
       ['--header', 'X-Test: value', '--', 'hello'],
       ['--output-format', 'text', '--', 'hello'],
+      ['--resume', 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', '--', 'hello'],
+      ['--continue', '--', 'hello'],
     ]) {
       const blocked = spawnSync(f.wrapper, args, {
         cwd: f.dir,
@@ -373,6 +383,7 @@ describe('oc-cursor wrapper', () => {
       'cp',
       'chmod',
       'date',
+      'ln',
     ]) {
       const marker = join(f.capture, `path-hijack-${name}`)
       const shim = join(f.dir, 'bin', name)
@@ -401,6 +412,7 @@ describe('oc-cursor wrapper', () => {
       'cp',
       'chmod',
       'date',
+      'ln',
     ]) {
       assert.equal(
         spawnSync('test', ['!', '-e', join(f.capture, `path-hijack-${name}`)]).status,
@@ -586,5 +598,79 @@ describe('oc-cursor wrapper', () => {
     })
     assert.equal(second.status, 0, second.stderr)
     assert.equal(readFileSync(join(f.capture, 'key'), 'utf8'), 'crsr_dummy\n')
+  })
+
+  test('resumes via env, links durable chats, and keeps the store after HOME is removed', () => {
+    const f = fixture()
+    const ocHome = join(f.dir, 'oc-home')
+    mkdirSync(ocHome, { mode: 0o700 })
+    const resumeId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    const result = spawnSync(f.wrapper, ['--', 'hello'], {
+      cwd: f.dir,
+      env: {
+        ...f.env,
+        OPENCLAUDE_HOME: ocHome,
+        OPENCLAUDE_CURSOR_RESUME_ID: resumeId,
+      },
+      encoding: 'utf8',
+    })
+    assert.equal(result.status, 0, result.stderr)
+    const argv = readFileSync(join(f.capture, 'argv'), 'utf8').trim().split('\n')
+    const sep = argv.indexOf('--')
+    const resumeAt = argv.indexOf('--resume')
+    assert.ok(resumeAt >= 0, argv.join(' '))
+    assert.ok(sep > resumeAt, argv.join(' '))
+    assert.equal(argv[resumeAt + 1], resumeId)
+    assert.ok(argv.includes('--output-format'))
+    assert.ok(argv.includes('stream-json'))
+    assert.ok(argv.indexOf('--output-format') < sep)
+    assert.ok(argv.indexOf('stream-json') < sep)
+    assert.equal(readFileSync(join(f.capture, 'chats-link'), 'utf8').trim(), join(ocHome, 'cursor-chats'))
+    assert.equal(statSync(join(ocHome, 'cursor-chats')).isDirectory(), true)
+    assert.equal(statSync(join(ocHome, 'cursor-chats')).isSymbolicLink(), false)
+    const ephemeralHome = readFileSync(join(f.capture, 'home'), 'utf8').trim()
+    assert.ok(ephemeralHome.startsWith('/tmp/openclaude-cursor.'))
+    assert.equal(spawnSync('test', ['!', '-e', ephemeralHome]).status, 0)
+    assert.equal(existsSync(join(ocHome, 'cursor-chats')), true)
+    assert.equal(readFileSync(join(f.capture, 'resume-env'), 'utf8').trim(), 'unset')
+  })
+
+  test('rejects a malformed Cursor resume id without invoking the CLI', () => {
+    const f = fixture()
+    const ocHome = join(f.dir, 'oc-home')
+    mkdirSync(ocHome, { mode: 0o700 })
+    const pwned = join(f.dir, 'pwned')
+    for (const bad of ['not-a-uuid', `$(touch ${pwned})`]) {
+      const result = spawnSync(f.wrapper, ['--', 'hello'], {
+        cwd: f.dir,
+        env: {
+          ...f.env,
+          OPENCLAUDE_HOME: ocHome,
+          OPENCLAUDE_CURSOR_RESUME_ID: bad,
+        },
+        encoding: 'utf8',
+      })
+      assert.notEqual(result.status, 0, bad)
+      assert.match(result.stderr, /invalid Cursor resume id/)
+      assert.equal(existsSync(join(f.capture, 'home')), false, `CLI invoked for ${bad}`)
+      assert.equal(existsSync(pwned), false)
+    }
+  })
+
+  test('refuses to resume when OPENCLAUDE_HOME is unset', () => {
+    const f = fixture()
+    const env: NodeJS.ProcessEnv = {
+      ...f.env,
+      OPENCLAUDE_CURSOR_RESUME_ID: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+    }
+    delete env.OPENCLAUDE_HOME
+    const result = spawnSync(f.wrapper, ['--', 'hello'], {
+      cwd: f.dir,
+      env,
+      encoding: 'utf8',
+    })
+    assert.equal(result.status, 2)
+    assert.match(result.stderr, /Cursor resume requires durable chats directory/)
+    assert.equal(existsSync(join(f.capture, 'home')), false)
   })
 })

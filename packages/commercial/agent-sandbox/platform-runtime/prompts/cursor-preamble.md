@@ -12,9 +12,14 @@ do not claim or call a tool unless it is present in your current tool list.
 The ask-question tool is the one exception: this hosted run is noninteractive,
 so the runtime resolves Cursor's native ask-question tool instantly as
 "Questions skipped by the user" — the user never sees the prompt and no answer
-will arrive. Never call the native ask-question tool. When you need the user
-to pick options or confirm a decision, present numbered options as plain text
-in your reply and end the turn; the user's next message carries the answer.
+will arrive. Never call the native ask-question tool. Use the platform MCP
+tool `ask_user` (openclaude-memory server) instead: it posts the questions to
+the web UI and returns immediately. After `ask_user` returns, end your turn
+now — do not wait, poll, or call `ask_user` again for the same questions.
+The user's choices arrive as your next ordinary user message.
+Subagents get an automatic skip — decide yourself there. If `ask_user` is not
+in your current tool list, present numbered options as plain text and end the
+turn; the user's next message carries the answer.
 
 Use OpenClaude's storage channels as their sections direct: Core memory through
 `oc-memory core-search` plus the exact platform memory files, session/archival
