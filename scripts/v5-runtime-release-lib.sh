@@ -526,7 +526,7 @@ oc_hotcfg_finalize_release() {
   # (缺产物会静默回落 7s 路径);旧源无脚本则跳过,保持回滚兼容。
   if [ -f "$staging/packages/mcp-memory/scripts/build-oc-memory-cli.sh" ]; then
     oc_hotcfg__log "build oc-memory CLI bundle"
-    ( cd "$staging" && bash packages/mcp-memory/scripts/build-oc-memory-cli.sh ) \
+    ( cd "$staging" && bash packages/mcp-memory/scripts/build-oc-memory-cli.sh >&2 ) \
       || { oc_hotcfg__die "oc-memory CLI bundle failed"; return 1; }
     [ -s "$staging/packages/mcp-memory/dist/oc-memory.cjs" ] \
       || { oc_hotcfg__die "oc-memory CLI bundle missing after build"; return 1; }

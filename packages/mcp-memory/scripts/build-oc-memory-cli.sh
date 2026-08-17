@@ -39,4 +39,4 @@ else
 fi
 
 [ -s "$OUT" ] || { echo "build-oc-memory-cli: empty output $OUT" >&2; exit 1; }
-echo "build-oc-memory-cli: wrote $OUT ($(wc -c < "$OUT") bytes)"
+echo "build-oc-memory-cli: wrote $OUT ($(wc -c < "$OUT") bytes)" >&2
