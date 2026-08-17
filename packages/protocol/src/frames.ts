@@ -1187,6 +1187,16 @@ export const OutboundTurnStatus = Type.Union([
       retryAt: Type.Integer({ minimum: 0 }),
     }),
   }),
+  // Gateway-authored live progress for a turn that is working but producing
+  // no stdout (Cursor Task subagent). Sideband only: never a content block,
+  // never tape / messages / archive. `detail` is optional so old clients
+  // that ignore unknown union members still receive a liveness tick via
+  // markFrameReceived. Stall must NOT emit this status.
+  Type.Object({
+    ..._turnStatusCommon,
+    status: Type.Literal('working'),
+    detail: Type.Optional(Type.String({ maxLength: 200 })),
+  }),
 ])
 export type OutboundTurnStatus = Static<typeof OutboundTurnStatus>
 

@@ -18,6 +18,8 @@ import {
   parsePartialJson,
   safeBridgeErrorDetail,
   shouldAutoContinueEmptyTurn,
+  computeTypingLabel,
+  STALE_WARN_MS,
 } from "./pure";
 import {
   addMessage,
@@ -471,6 +473,64 @@ describe("applyTurnStatus retrying 判别联合", () => {
       isFinal: false,
     } as never);
     expect(s._turnStatus).toBeNull();
+  });
+
+  test("status=working → 刷新 lastFrameAt、写入 hint、不落消息行", () => {
+    const s = sess();
+    const before = s.messages.length;
+    applyTurnStatus(s, turnStatusFrame({ status: "working", detail: "Read foo.ts" }));
+    expect(s._turnProgressHint).toBe("Read foo.ts");
+    expect(s._turnStatus == null).toBe(true);
+    expect(s._lastFrameAt).toEqual(expect.any(Number));
+    expect(s.messages.length).toBe(before);
+  });
+
+  test("旧前端兼容: unknown status 不抛、不落消息行、仍刷新 lastFrameAt", () => {
+    const s = sess();
+    const before = s.messages.length;
+    applyTurnStatus(s, turnStatusFrame({ status: "subtask" }));
+    expect(s._turnStatus).toBeNull();
+    expect(s.messages.length).toBe(before);
+    expect(s._lastFrameAt).toEqual(expect.any(Number));
+  });
+
+  test("status=null 清 working hint", () => {
+    const s = sess();
+    applyTurnStatus(s, turnStatusFrame({ status: "working", detail: "Grep keepalive" }));
+    expect(s._turnProgressHint).toBe("Grep keepalive");
+    applyTurnStatus(s, turnStatusFrame({ status: null }));
+    expect(s._turnProgressHint).toBeUndefined();
+  });
+
+  test("clearTurnTiming 清 working hint", () => {
+    const s = sess();
+    applyTurnStatus(s, turnStatusFrame({ status: "working", detail: "Bash npx tsc" }));
+    clearTurnTiming(s);
+    expect(s._turnProgressHint).toBeUndefined();
+  });
+});
+
+describe("computeTypingLabel progressHint vs stall", () => {
+  test("progressHint 在 silence 低于 warn 时展示真实进度", () => {
+    const out = computeTypingLabel({
+      name: "助手",
+      secs: 20,
+      silenceMs: 5_000,
+      progressHint: "Read foo.ts",
+    });
+    expect(out.text).toContain("Read foo.ts");
+    expect(out.text).not.toContain("无新数据");
+  });
+
+  test("stall 文案盖过 leftover progressHint，不假装在动", () => {
+    const out = computeTypingLabel({
+      name: "助手",
+      secs: 120,
+      silenceMs: STALE_WARN_MS,
+      progressHint: "Read foo.ts",
+    });
+    expect(out.text).toContain("无新数据");
+    expect(out.text).not.toContain("Read foo.ts");
   });
 });
 

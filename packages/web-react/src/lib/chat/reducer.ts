@@ -2053,8 +2053,16 @@ export function applyTurnStatus(sess: ChatSession, frame: OutboundTurnStatusWire
       max: AUTOMATIC_TURN_RETRY_MAX,
       retryAt: frame.retry.retryAt,
     };
+  } else if (frame.status === "working") {
+    // Do not set a phase that hides silenceMs. Compact/retry stay as they
+    // are; Cursor-only working ticks only refresh liveness + optional hint.
+    // Old clients that ignore this status fall through to the else branch
+    // and still call markFrameReceived above.
+    const detail = typeof frame.detail === "string" ? frame.detail.trim() : "";
+    if (detail) sess._turnProgressHint = detail;
   } else {
     sess._turnStatus = null;
+    sess._turnProgressHint = undefined;
   }
 }
 

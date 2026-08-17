@@ -413,8 +413,9 @@ export function computeTypingLabel(p: {
   silenceMs: number;
   turnStatus?: string | null;
   hint?: string;
+  progressHint?: string;
 }): { text: string; cls: string } {
-  const { name, secs, silenceMs, turnStatus, hint = "" } = p;
+  const { name, secs, silenceMs, turnStatus, hint = "", progressHint = "" } = p;
   if (turnStatus === "compacting") {
     return { text: `${name} 正在压缩上下文 (${secs}s)`, cls: "compacting" };
   }
@@ -425,6 +426,12 @@ export function computeTypingLabel(p: {
   if (silenceMs >= STALE_WARN_MS) {
     const sil = Math.round(silenceMs / 1000);
     return { text: `${name} 深度思考中 (${secs}s · ${sil}s 无新数据)`, cls: "stale-warn" };
+  }
+  const progress = progressHint.trim();
+  if (progress) {
+    const cls = silenceMs >= STALE_GENERATING_MS ? "generating" : "";
+    if (secs >= 5) return { text: `${name} ${progress} (${secs}s)${hint}`, cls };
+    return { text: `${name} ${progress}${hint}`, cls };
   }
   if (silenceMs >= STALE_GENERATING_MS) {
     return { text: `${name} 正在生成内容,请稍候 (${secs}s)`, cls: "generating" };

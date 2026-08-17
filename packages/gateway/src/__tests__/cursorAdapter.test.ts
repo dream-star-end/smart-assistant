@@ -1813,7 +1813,7 @@ console.log(JSON.stringify({type:'result',subtype:'success',is_error:false,sessi
 
   async function withHangingCursorWrapper(
     emitToolStart: boolean,
-    body: (adapter: CursorAdapter, activity: { count: number }) => Promise<void>,
+    body: (adapter: CursorAdapter, activity: { count: number }, events: EngineEvent[]) => Promise<void>,
   ): Promise<void> {
     const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-keepalive-'))
     const fake = path.join(dir, 'fake.cjs')
@@ -1836,18 +1836,19 @@ ${toolLine}setInterval(() => {}, 1000);
     process.env.OPENCLAUDE_CURSOR_SHUTDOWN_FINAL_DRAIN_MS = '200'
     const adapter = new CursorAdapter(opts(dir))
     const activity = { count: 0 }
+    const events: EngineEvent[] = []
     adapter.on('activity', () => { activity.count += 1 })
     adapter.on('error', () => {})
     try {
       const run = adapter.submitTurn({
         input: 'keepalive probe',
         requestId: REQUEST,
-        onEvent: () => {},
+        onEvent: (e) => { events.push(e) },
         sessionTotals: { totalCostUSD: 0, turns: 0 },
         toolUseIdToName: new Map(),
       })
       await run.submitted
-      await body(adapter, activity)
+      await body(adapter, activity, events)
       adapter.interrupt()
       await adapter.shutdown()
       await adapter.waitForOutputDrain()
@@ -2155,5 +2156,140 @@ setInterval(() => {
       )
       assert.ok(adapter.lastActivityAt > activityAt, 'recovery must refresh lastActivityAt')
     })
+  })
+
+  test('pushes working turn_status while keepalive is progressing', { timeout: 10_000 }, async () => {
+    _internals.setPendingKeepaliveTestHooks({
+      intervalMs: 40,
+      maxMs: 60_000,
+      stallMs: 60_000,
+      minCpuDeltaTicks: 1,
+      readCpuTicks: growingCpuProbe(),
+      readTranscriptFingerprint: staticTranscriptProbe(),
+    })
+    await withHangingCursorWrapper(true, async (adapter, _activity, events) => {
+      await waitUntil(() => adapter.pendingToolCalls > 0, 5_000, 'pending tool')
+      const before = events.length
+      await waitUntil(
+        () => events.slice(before).some((e) => e.kind === 'turn_status'),
+        5_000,
+        'working turn_status',
+      )
+      const added = events.slice(before)
+      const statusEvents = added.filter((e) => e.kind === 'turn_status')
+      assert.ok(statusEvents.length >= 1, 'progressing keepalive must push turn_status')
+      for (const event of statusEvents) {
+        assert.equal(event.kind, 'turn_status')
+        if (event.kind === 'turn_status') {
+          assert.equal(typeof event.status, 'object')
+          assert.ok(event.status && typeof event.status === 'object' && event.status.status === 'working')
+          assert.equal(typeof event.status.detail, 'string')
+        }
+      }
+      assert.equal(
+        added.filter((e) => e.kind === 'block').length,
+        0,
+        'keepalive progress must not emit content blocks (not persisted as messages)',
+      )
+    })
+  })
+
+  test('does not push working turn_status while keepalive is stalled', { timeout: 10_000 }, async () => {
+    const probe = { progressing: true, cpu: 8_000, bytes: 400 }
+    _internals.setPendingKeepaliveTestHooks({
+      intervalMs: 40,
+      maxMs: 60_000,
+      stallMs: 80,
+      minCpuDeltaTicks: 1,
+      readCpuTicks: () => {
+        if (probe.progressing) probe.cpu += 10
+        return probe.cpu
+      },
+      readTranscriptFingerprint: () => {
+        if (probe.progressing) probe.bytes += 16
+        return { files: { 'agent.jsonl': { size: probe.bytes, mtimeMs: 9 } } }
+      },
+    })
+    await withHangingCursorWrapper(true, async (adapter, _activity, events) => {
+      await waitUntil(() => adapter.pendingToolCalls > 0, 5_000, 'pending tool')
+      await waitUntil(
+        () => events.some((e) => e.kind === 'turn_status'),
+        5_000,
+        'initial working turn_status',
+      )
+      probe.progressing = false
+      await new Promise((resolve) => setTimeout(resolve, 280))
+      const countWhileStalled = events.filter((e) => e.kind === 'turn_status').length
+      await new Promise((resolve) => setTimeout(resolve, 160))
+      assert.equal(
+        events.filter((e) => e.kind === 'turn_status').length,
+        countWhileStalled,
+        'stalled keepalive must not push turn_status',
+      )
+    })
+  })
+
+  test('progressDetailFromJsonlTail reads only meaningful last records and clamps', () => {
+    const tail = [
+      '{"role":"assistant","message":{"content":[{"type":"text","text":"I will inspect the file"}]}}',
+      JSON.stringify({
+        type: 'tool_call',
+        subtype: 'started',
+        tool_call: { readToolCall: { args: { path: 'packages/gateway/src/engine/cursorAdapter.ts' } } },
+      }),
+      '',
+    ].join('\n')
+    const detail = _internals.progressDetailFromJsonlTail(tail)
+    assert.ok(detail && detail.includes('Read'), `expected Read progress, got ${detail}`)
+    assert.ok(detail.includes('cursorAdapter.ts'), `expected path in progress, got ${detail}`)
+  })
+
+  test('readFileTailUtf8 does not load the whole file', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-tail-'))
+    const file = path.join(dir, 'huge.jsonl')
+    const head = `${'x'.repeat(80_000)}\n`
+    const last = JSON.stringify({
+      type: 'tool_call',
+      subtype: 'started',
+      tool_call: { grepToolCall: { args: { pattern: 'keepalive' } } },
+    })
+    await writeFile(file, `${head}${last}\n`)
+    const tail = _internals.readFileTailUtf8(file, 2048)
+    assert.ok(Buffer.byteLength(tail, 'utf8') <= 2048)
+    const detail = _internals.progressDetailFromJsonlTail(tail)
+    assert.ok(detail && detail.includes('Grep'), `expected Grep from tail, got ${detail}`)
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  test('summarizeGrownTranscriptProgress prefers the grown file', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-grown-'))
+    const stale = path.join(dir, 'old.jsonl')
+    const live = path.join(dir, 'live.jsonl')
+    await writeFile(stale, JSON.stringify({
+      type: 'tool_call',
+      subtype: 'started',
+      tool_call: { readToolCall: { args: { path: 'stale.ts' } } },
+    }) + '\n')
+    await writeFile(live, JSON.stringify({
+      type: 'tool_call',
+      subtype: 'started',
+      tool_call: { shellToolCall: { args: { command: 'npx tsc -b' } } },
+    }) + '\n')
+    const prev = { files: { 'old.jsonl': { size: 10, mtimeMs: 1 }, 'live.jsonl': { size: 10, mtimeMs: 1 } } }
+    const next = {
+      files: {
+        'old.jsonl': { size: 10, mtimeMs: 1 },
+        'live.jsonl': { size: 400, mtimeMs: 9 },
+      },
+    }
+    const detail = _internals.summarizeGrownTranscriptProgress(dir, prev, next)
+    assert.ok(detail && detail.includes('Bash'), `expected Bash from grown file, got ${detail}`)
+    assert.equal(detail?.includes('stale.ts') ?? false, false)
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  test('fallbackPendingToolProgress is a short one-liner', () => {
+    assert.equal(_internals.fallbackPendingToolProgress('Task'), '子任务 Task 运行中')
+    assert.equal(_internals.fallbackPendingToolProgress('unknown'), '子任务运行中')
   })
 })

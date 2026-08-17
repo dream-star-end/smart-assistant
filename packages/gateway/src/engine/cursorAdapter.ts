@@ -4,7 +4,7 @@
 import { spawn, type ChildProcessByStdio } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, closeSync, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import type { Readable } from 'node:stream'
@@ -416,6 +416,139 @@ function transcriptFingerprintGrew(
   }
   return false
 }
+
+const TRANSCRIPT_TAIL_BYTES = 48 * 1024
+const PROGRESS_DETAIL_MAX_CHARS = 120
+
+function clampProgressDetail(text: string, max = PROGRESS_DETAIL_MAX_CHARS): string {
+  const oneLine = text.replace(/\s+/g, ' ').trim()
+  if (!oneLine) return ''
+  if (oneLine.length <= max) return oneLine
+  return `${oneLine.slice(0, Math.max(0, max - 1))}…`
+}
+
+function fallbackPendingToolProgress(oldestToolName: string): string {
+  const name = oldestToolName.trim()
+  if (!name || name === 'unknown') return '子任务运行中'
+  return `子任务 ${name} 运行中`
+}
+
+function readFileTailUtf8(filePath: string, maxBytes = TRANSCRIPT_TAIL_BYTES): string {
+  let fd: number | undefined
+  try {
+    fd = openSync(filePath, 'r')
+    const size = fstatSync(fd).size
+    if (size <= 0) return ''
+    const length = Math.min(size, Math.max(1, maxBytes))
+    const buf = Buffer.alloc(length)
+    readSync(fd, buf, 0, length, size - length)
+    return buf.toString('utf8')
+  } catch {
+    return ''
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd) } catch { /* ignore */ }
+    }
+  }
+}
+
+function parseLastJsonlObjects(tail: string, maxRecords = 12): Record<string, unknown>[] {
+  if (!tail) return []
+  const lines = tail.split('\n')
+  const out: Record<string, unknown>[] = []
+  for (let i = lines.length - 1; i >= 0 && out.length < maxRecords; i--) {
+    const line = lines[i]!.trim()
+    if (!line) continue
+    try {
+      const parsed = JSON.parse(line) as unknown
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        out.push(parsed as Record<string, unknown>)
+      }
+    } catch {
+      continue
+    }
+  }
+  return out.reverse()
+}
+
+function toolProgressFromArgs(toolName: string, args: Record<string, unknown> | null): string {
+  const name = toolName.trim() || 'Tool'
+  if (!args) return name
+  const filePath = textOf(args.path ?? args.file_path ?? args.filePath ?? args.targetDirectory)
+  const pattern = textOf(args.pattern ?? args.query ?? args.searchTerm ?? args.globPattern)
+  const command = textOf(args.command)
+  const desc = textOf(args.description ?? args.prompt)
+  if (filePath) return `${name} ${filePath}`
+  if (pattern) return `${name} ${pattern}`
+  if (command) return `${name} ${command}`
+  if (desc) return `${name} ${desc}`
+  return name
+}
+
+function progressFromTranscriptRecord(record: Record<string, unknown>): string | null {
+  const type = textOf(record.type).toLowerCase()
+  if (type === 'tool_call') {
+    const name = toolNameOf(record as CursorEvent)
+    const input = toolInputOf(record as CursorEvent)
+    const args = recordOf(input)
+    return clampProgressDetail(toolProgressFromArgs(name, args))
+  }
+  const message = recordOf(record.message)
+  const content = message?.content ?? record.content
+  if (Array.isArray(content)) {
+    for (let i = content.length - 1; i >= 0; i--) {
+      const block = recordOf(content[i])
+      if (!block) continue
+      const blockType = textOf(block.type ?? block.kind).toLowerCase()
+      if (blockType === 'tool_use') {
+        const name = textOf(block.name) || 'Tool'
+        return clampProgressDetail(toolProgressFromArgs(name, recordOf(block.input)))
+      }
+      if (blockType === 'text' || blockType === 'thinking') {
+        const text = textOf(block.text).trim()
+        if (text) return clampProgressDetail(text)
+      }
+    }
+  }
+  if (type === 'assistant' || textOf(record.role) === 'assistant') {
+    const text = assistantTextOf(record as CursorEvent).trim()
+    if (text) return clampProgressDetail(text)
+  }
+  return null
+}
+
+function progressDetailFromJsonlTail(tail: string): string | null {
+  const records = parseLastJsonlObjects(tail)
+  for (let i = records.length - 1; i >= 0; i--) {
+    const detail = progressFromTranscriptRecord(records[i]!)
+    if (detail) return detail
+  }
+  return null
+}
+
+function summarizeGrownTranscriptProgress(
+  dir: string,
+  prev: CursorTranscriptFingerprint | null,
+  next: CursorTranscriptFingerprint | null,
+): string | null {
+  if (!next || !dir) return null
+  const grown: { rel: string; size: number; mtimeMs: number }[] = []
+  for (const [rel, stamp] of Object.entries(next.files)) {
+    const old = prev?.files[rel]
+    if (!old || stamp.size > old.size || stamp.mtimeMs > old.mtimeMs) {
+      grown.push({ rel, size: stamp.size, mtimeMs: stamp.mtimeMs })
+    }
+  }
+  if (grown.length === 0) return null
+  grown.sort((a, b) => b.size - a.size || b.mtimeMs - a.mtimeMs)
+  for (const file of grown.slice(0, 3)) {
+    const tail = readFileTailUtf8(join(dir, file.rel))
+    const detail = progressDetailFromJsonlTail(tail)
+    if (detail) return detail
+  }
+  return null
+}
+
 
 function resolveCursorWrapperBin(
   override = process.env.OC_CURSOR_WRAPPER_BIN,
@@ -1583,6 +1716,33 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     this.pendingKeepaliveStalledLogged = false
     this.pendingKeepaliveOverBudgetLogged = false
   }
+  private emitPendingToolProgress(
+    ctx: TurnCtx,
+    args: {
+      oldestToolName: string
+      transcriptGrew: boolean
+      prevFingerprint: CursorTranscriptFingerprint | null
+      fingerprint: CursorTranscriptFingerprint | null
+    },
+  ): void {
+    let detail: string | undefined
+    if (args.transcriptGrew && this.cachedTranscriptsDir) {
+      detail = summarizeGrownTranscriptProgress(
+        this.cachedTranscriptsDir,
+        args.prevFingerprint,
+        args.fingerprint,
+      ) ?? undefined
+    }
+    if (!detail) detail = fallbackPendingToolProgress(args.oldestToolName)
+    try {
+      ctx.params.onEvent({
+        kind: 'turn_status',
+        status: { status: 'working', detail },
+      })
+    } catch {
+      // Keepalive must never throw into the interval.
+    }
+  }
   private stopPendingKeepalive(): void {
     if (this.pendingKeepaliveTimer) {
       clearInterval(this.pendingKeepaliveTimer)
@@ -1654,10 +1814,11 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
 
       const establishing = this.lastKeepaliveCpuTicks === null && this.lastTranscriptFingerprint === null
       const cachedDir = { value: this.cachedTranscriptsDir }
+      const prevFingerprint = this.lastTranscriptFingerprint
       const fingerprint = readKeepaliveTranscriptFingerprint(pid, cachedDir)
       this.cachedTranscriptsDir = cachedDir.value
       const cpuTicks = readKeepaliveCpuTicks(pid)
-      const transcriptGrew = transcriptFingerprintGrew(this.lastTranscriptFingerprint, fingerprint)
+      const transcriptGrew = transcriptFingerprintGrew(prevFingerprint, fingerprint)
       let cpuDeltaTicks: number | undefined
       let cpuGrew = false
       const minCpuDelta = resolvedPendingKeepaliveMinCpuTicks()
@@ -1693,6 +1854,12 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         this.pendingKeepaliveStalledLogged = false
         this.lastActivityAt = Date.now()
         this.emit('activity')
+        this.emitPendingToolProgress(ctx, {
+          oldestToolName,
+          transcriptGrew,
+          prevFingerprint,
+          fingerprint,
+        })
       } else if (!establishing) {
         if (this.pendingKeepaliveStallSince === null) this.pendingKeepaliveStallSince = now
         stallForMs = now - this.pendingKeepaliveStallSince
@@ -1785,6 +1952,10 @@ export const _internals = {
   setPendingKeepaliveTestHooks(hooks: CursorPendingKeepaliveTestHooks | null): void {
     pendingKeepaliveTestHooks = hooks
   },
+  readFileTailUtf8,
+  progressDetailFromJsonlTail,
+  summarizeGrownTranscriptProgress,
+  fallbackPendingToolProgress,
 }
 
 registerEngine('cursor', (opts) => new CursorAdapter(opts))

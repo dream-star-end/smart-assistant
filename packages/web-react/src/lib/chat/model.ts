@@ -558,6 +558,9 @@ export type ChatSession = {
   _turnStartedAt?: number | null;
   _lastFrameAt?: number;
   _turnStatus?: TurnStatusState | null;
+  /** Live one-line progress from outbound.turn_status status=working. Session
+   *  memory only — not a message row, not written to persist snapshots. */
+  _turnProgressHint?: string;
   /** User-row id of the turn currently streaming in this browser. */
   _activeClientMessageId?: string;
   /**
@@ -710,6 +713,7 @@ export function clearTurnTiming(sess: ChatSession): void {
   sess._lastFrameAt = undefined;
   sess._isFirstTurnAfterReady = false;
   sess._turnStatus = null;
+  sess._turnProgressHint = undefined;
   sess._liveTurnUsage = undefined;
   sess._turnCostCredits = "0";
   sess._turnCostSeenRequestIds = new Set();

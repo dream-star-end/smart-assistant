@@ -16051,10 +16051,17 @@ export function _buildEngineErrorFrame(
  */
 export function _turnStatusWireFields(
   phase: GatewayTurnPhase,
-): { status: 'compacting' | null } | { status: 'retrying'; retry: TurnRetryMeta } {
-  return phase && typeof phase === 'object'
-    ? { status: 'retrying', retry: phase.retry }
-    : { status: phase }
+):
+  | { status: 'compacting' | null }
+  | { status: 'retrying'; retry: TurnRetryMeta }
+  | { status: 'working'; detail?: string } {
+  if (phase && typeof phase === 'object') {
+    if (phase.status === 'working') {
+      return phase.detail ? { status: 'working', detail: phase.detail } : { status: 'working' }
+    }
+    return { status: 'retrying', retry: phase.retry }
+  }
+  return { status: phase }
 }
 
 /**
@@ -16067,6 +16074,14 @@ export function _buildTurnStatusFrame(
   phase: GatewayTurnPhase,
 ): OutboundTurnStatus & { _userId?: string } {
   if (phase && typeof phase === 'object') {
+    if (phase.status === 'working') {
+      return {
+        type: 'outbound.turn_status',
+        ...routing,
+        status: 'working',
+        ...(phase.detail ? { detail: phase.detail } : {}),
+      }
+    }
     return { type: 'outbound.turn_status', ...routing, status: 'retrying', retry: phase.retry }
   }
   return { type: 'outbound.turn_status', ...routing, status: phase }
