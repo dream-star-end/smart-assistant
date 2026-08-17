@@ -270,7 +270,7 @@ export interface TicketRun {
   startedAt: number | null
   finishedAt: number | null
   durationMs: number | null
-  /** delegate 返回值里没有用量,M1 允许为 null,M4 从 usage_log 回填。 */
+  /** 巡检收尾从 delegate 同步抄数,缺则从 usage_log 按 sessionKey 回填;失败保持 null。 */
   tokensIn: number | null
   tokensOut: number | null
   costUsd: number | null

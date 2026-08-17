@@ -23,13 +23,14 @@ import { createProject } from '../db/projects.js'
 import { addRelation } from '../db/relations.js'
 import { acquireLease, listRuns } from '../db/runs.js'
 import { seedDefaultPipelines } from '../db/seed.js'
-import { getSettings, updateSettings } from '../db/settings.js'
+import { getSettings, getUsage, updateSettings } from '../db/settings.js'
 import { createTicket, getTicket, updateTicket } from '../db/tickets.js'
-import { IdleBackoffState, PatrolSlotCounter } from '../guardrails.js'
+import { type GuardrailAlertHandler, IdleBackoffState, PatrolSlotCounter } from '../guardrails.js'
 import {
   type PatrolDelegateFn,
   type PatrolDelegateResult,
   PatrolEngine,
+  type RunUsageLookup,
   resetSharedPatrolState,
 } from '../patrol.js'
 import { assertTransition } from '../stateMachine.js'
@@ -69,7 +70,15 @@ function failDelegate(error = 'boom'): PatrolDelegateFn {
 function engine(
   db: TaskboardDb,
   delegate: PatrolDelegateFn,
-  over: { slots?: PatrolSlotCounter; idle?: IdleBackoffState; now?: () => number } = {},
+  over: {
+    slots?: PatrolSlotCounter
+    idle?: IdleBackoffState
+    now?: () => number
+    lookupUsage?: RunUsageLookup
+    usageBackfillDelayMs?: number
+    onAlert?: GuardrailAlertHandler
+    log?: (msg: string, extra?: Record<string, unknown>) => void
+  } = {},
 ): PatrolEngine {
   return new PatrolEngine({
     getDb: () => db,
@@ -77,6 +86,11 @@ function engine(
     now: over.now ?? (() => WORK.getTime()),
     slots: over.slots ?? new PatrolSlotCounter(2),
     idle: over.idle ?? new IdleBackoffState(),
+    // 测试禁止打真实 sessions.db;延迟回填默认关掉,避免 setTimeout 挂住进程。
+    lookupUsage: over.lookupUsage ?? (async () => null),
+    usageBackfillDelayMs: over.usageBackfillDelayMs ?? 0,
+    onAlert: over.onAlert,
+    log: over.log,
   })
 }
 
@@ -196,6 +210,8 @@ describe('失败重试与熔断', () => {
       slots: new PatrolSlotCounter(2),
       idle: new IdleBackoffState(),
       onAlert: (a) => alerts.push(a.kind),
+      lookupUsage: async () => null,
+      usageBackfillDelayMs: 0,
     })
     await eng.tick(WORK)
     await eng.tick(WORK)
@@ -316,6 +332,125 @@ describe('依赖 / 日配额 / 准入', () => {
     await eng.tick(WORK)
     const skipped = listRuns(db, { ticketId: ticket.id, status: 'skipped' }).items
     assert.ok(skipped.some((r) => r.skipReason === 'blocked_by_dependency'))
+    db.close()
+  })
+})
+
+describe('成本回填', () => {
+  it('lookupUsage 成功时 tb_run 写入 tokensIn / tokensOut / costUsd', async () => {
+    const db = freshDb()
+    const { ticket } = seedReadyAi(db)
+    const seenKeys: string[] = []
+    const eng = engine(db, async () => ({ ok: true, output: '已完成,无用量字段。' }), {
+      lookupUsage: async (sessionKey) => {
+        seenKeys.push(sessionKey)
+        return { tokensIn: 1200, tokensOut: 340, costUsd: 0.042 }
+      },
+    })
+    const report = await eng.tick(WORK)
+    assert.equal(report.settled, 1)
+    const run = listRuns(db, { ticketId: ticket.id }).items.find((r) => r.status === 'succeeded')
+    assert.ok(run)
+    assert.equal(run.tokensIn, 1200)
+    assert.equal(run.tokensOut, 340)
+    assert.equal(run.costUsd, 0.042)
+    assert.equal(seenKeys.length, 1)
+    assert.equal(seenKeys[0], run.sessionKey)
+    db.close()
+  })
+
+  it('delegate 已带回用量时不再问 lookup,0 也是合法值', async () => {
+    const db = freshDb()
+    const { ticket } = seedReadyAi(db)
+    let looked = 0
+    const eng = engine(
+      db,
+      async () => ({
+        ok: true,
+        output: 'ok',
+        tokensIn: 0,
+        tokensOut: 0,
+        costUsd: 0,
+      }),
+      {
+        lookupUsage: async () => {
+          looked += 1
+          throw new Error('should not lookup')
+        },
+      },
+    )
+    await eng.tick(WORK)
+    const run = listRuns(db, { ticketId: ticket.id }).items.find((r) => r.status === 'succeeded')
+    assert.ok(run)
+    assert.equal(run.tokensIn, 0)
+    assert.equal(run.tokensOut, 0)
+    assert.equal(run.costUsd, 0)
+    assert.equal(looked, 0)
+    db.close()
+  })
+
+  it('用量源抛异常时 run 仍正常收尾,字段留 null', async () => {
+    const db = freshDb()
+    const { ticket } = seedReadyAi(db)
+    const logs: string[] = []
+    const eng = engine(db, async () => ({ ok: true, output: '做完了。' }), {
+      lookupUsage: async () => {
+        throw new Error('usage_log down')
+      },
+      log: (msg) => logs.push(msg),
+    })
+    const report = await eng.tick(WORK)
+    assert.equal(report.settled, 1)
+    const t = getTicket(db, ticket.id)
+    assert.ok(t)
+    assert.equal(t.status, 'waiting_human')
+    const run = listRuns(db, { ticketId: ticket.id }).items.find((r) => r.status === 'succeeded')
+    assert.ok(run)
+    assert.equal(run.tokensIn, null)
+    assert.equal(run.tokensOut, null)
+    assert.equal(run.costUsd, null)
+    assert.ok(logs.some((m) => m.includes('usage lookup failed')))
+    db.close()
+  })
+})
+
+describe('每日预算护栏读回填成本', () => {
+  it('累计 costUsd 超过 maxCostPerDayUsd 后下一轮 tick 暂停巡检', async () => {
+    const db = freshDb()
+    updateSettings(db, { maxCostPerDayUsd: 1, maxRunsPerDay: 200, maxStageLoops: 20 })
+    const { ticket } = seedReadyAi(db, { onSuccess: 'stay' })
+    const alerts: string[] = []
+    let ran = 0
+    const eng = engine(
+      db,
+      async () => {
+        ran += 1
+        return { ok: true, output: '本站完成。', tokensIn: 800, tokensOut: 200, costUsd: 1.25 }
+      },
+      { onAlert: (a) => alerts.push(a.kind) },
+    )
+
+    const first = await eng.tick(WORK)
+    assert.equal(first.started, 1)
+    assert.equal(first.settled, 1)
+    assert.equal(first.paused, false)
+    const afterFirst = getTicket(db, ticket.id)
+    assert.ok(afterFirst)
+    assert.equal(afterFirst.status, 'ready')
+    const run = listRuns(db, { ticketId: ticket.id }).items.find((r) => r.status === 'succeeded')
+    assert.ok(run)
+    assert.equal(run.costUsd, 1.25)
+    const usage = getUsage(db, WORK.getTime())
+    assert.ok(usage.costTodayUsd >= 1.25)
+    assert.equal(getSettings(db).patrolPaused, false)
+
+    const second = await eng.tick(WORK)
+    assert.equal(second.paused, true)
+    assert.equal(second.started, 0)
+    assert.equal(ran, 1)
+    assert.ok(alerts.includes('budget_exhausted'))
+    assert.equal(getSettings(db).patrolPaused, true)
+    assert.equal(getTicket(db, ticket.id)?.status, 'ready')
     db.close()
   })
 })

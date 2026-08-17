@@ -28,6 +28,7 @@
 //   - tick 里的 timer 由 server.ts 持有并 unref/clearInterval;本文件不自己
 //     setInterval,以便测试进程能退出。
 
+import { getUsageSummary } from '@openclaude/storage'
 import { createActivity } from './db/activity.js'
 import { createComment, listComments } from './db/comments.js'
 import type { TaskboardDb } from './db/index.js'
@@ -112,6 +113,62 @@ export interface PatrolDelegateResult {
 
 export type PatrolDelegateFn = (input: PatrolDelegateInput) => Promise<PatrolDelegateResult>
 
+/** 一次 run 的用量快照。缺字段保持 null,0 是合法值(免费模型 / 空 turn)。 */
+export interface RunUsageSnapshot {
+  tokensIn: number | null
+  tokensOut: number | null
+  costUsd: number | null
+}
+
+export type RunUsageLookup = (sessionKey: string) => Promise<RunUsageSnapshot | null>
+
+/**
+ * 生产默认:从容器 sessions.db 的 usage_log 按 sessionKey 汇总。
+ * 关联键 = eventPersist 写入的 session_id = turn.completed.sessionKey
+ * = buildPatrolSessionKey(),与 tb_ticket_run.session_key 同一把钥匙。
+ * 无行(totalTurns=0)视为尚未落盘,返回 null 让调用方稍后重试,不要写成 0
+ * 把「没记到」伪装成「免费」。
+ */
+export async function lookupUsageFromSessionLog(
+  sessionKey: string,
+): Promise<RunUsageSnapshot | null> {
+  if (!sessionKey) return null
+  const summary = await getUsageSummary({ sessionId: sessionKey })
+  if (!summary || summary.totalTurns <= 0) return null
+  return {
+    tokensIn: summary.totalInputTokens,
+    tokensOut: summary.totalOutputTokens,
+    costUsd: summary.totalCostUsd,
+  }
+}
+
+export function usageFromDelegateResult(result: PatrolDelegateResult): RunUsageSnapshot {
+  return {
+    tokensIn: finiteNumber(result.tokensIn),
+    tokensOut: finiteNumber(result.tokensOut),
+    costUsd: finiteNumber(result.costUsd),
+  }
+}
+
+export function mergeRunUsage(
+  base: RunUsageSnapshot,
+  extra: RunUsageSnapshot | null | undefined,
+): RunUsageSnapshot {
+  if (!extra) return base
+  return {
+    tokensIn: base.tokensIn ?? extra.tokensIn,
+    tokensOut: base.tokensOut ?? extra.tokensOut,
+    costUsd: base.costUsd ?? extra.costUsd,
+  }
+}
+
+export function isRunUsageComplete(usage: RunUsageSnapshot): boolean {
+  return usage.tokensIn != null && usage.tokensOut != null && usage.costUsd != null
+}
+
+/** usage_log 是 eventBus 异步写入,delegate 返回当下多半还没落盘;延迟一次再读。 */
+export const DEFAULT_USAGE_BACKFILL_DELAY_MS = 500
+
 export interface PatrolEngineOptions {
   getDb: () => TaskboardDb
   delegate: PatrolDelegateFn
@@ -123,6 +180,13 @@ export interface PatrolEngineOptions {
   slots?: PatrolSlotCounter
   idle?: IdleBackoffState
   log?: (msg: string, extra?: Record<string, unknown>) => void
+  /**
+   * 用量回填源。生产默认读 sessions.db usage_log;测试注入 mock,禁止打真实库。
+   * 抛错由引擎吞掉记日志,不得让 run 收尾失败。
+   */
+  lookupUsage?: RunUsageLookup
+  /** 0 = 不安排延迟回填(测试默认)。生产 500ms 等 usage_log 落盘。 */
+  usageBackfillDelayMs?: number
 }
 
 export interface TickReport {
@@ -149,6 +213,8 @@ export class PatrolEngine {
   private readonly onAlert?: GuardrailAlertHandler
   private readonly notify?: TaskboardNotifyHooks
   private readonly log: (msg: string, extra?: Record<string, unknown>) => void
+  private readonly lookupUsage: RunUsageLookup
+  private readonly usageBackfillDelayMs: number
   private ticking = false
 
   constructor(opts: PatrolEngineOptions) {
@@ -160,6 +226,8 @@ export class PatrolEngine {
     this.slots = opts.slots ?? getSharedPatrolSlots()
     this.idle = opts.idle ?? sharedIdle
     this.log = opts.log ?? (() => {})
+    this.lookupUsage = opts.lookupUsage ?? lookupUsageFromSessionLog
+    this.usageBackfillDelayMs = opts.usageBackfillDelayMs ?? DEFAULT_USAGE_BACKFILL_DELAY_MS
   }
 
   /**
@@ -504,6 +572,11 @@ export class PatrolEngine {
         ? null
         : (result.error ?? 'delegate failed')
 
+    const sessionKey =
+      run.sessionKey ??
+      buildPatrolSessionKey(run.agentId ?? stage.agentId ?? 'unknown', ticket.id, stage.id, run.id)
+    const usage = await this.resolveUsage(sessionKey, result)
+
     try {
       releaseLease(db, run.id)
     } catch {
@@ -516,12 +589,15 @@ export class PatrolEngine {
       error,
       finishedAt: now,
       durationMs: run.startedAt != null ? now - run.startedAt : null,
-      tokensIn: result.tokensIn ?? null,
-      tokensOut: result.tokensOut ?? null,
-      costUsd: result.costUsd ?? null,
+      tokensIn: usage.tokensIn,
+      tokensOut: usage.tokensOut,
+      costUsd: usage.costUsd,
       leaseOwner: null,
       leaseExpiresAt: null,
     })
+    if (!isRunUsageComplete(usage)) {
+      this.queueUsageBackfill(db, run.id, sessionKey)
+    }
 
     if (summary) {
       createComment(db, {
@@ -761,6 +837,67 @@ export class PatrolEngine {
     })
     return true
   }
+
+  /**
+   * 优先用 delegate 同步带回的用量(server.ts 从内存 session 抄的);
+   * 缺字段再读 usage_log。查找失败只记日志,返回已有快照,不抛。
+   */
+  private async resolveUsage(
+    sessionKey: string,
+    result: PatrolDelegateResult,
+  ): Promise<RunUsageSnapshot> {
+    let usage = usageFromDelegateResult(result)
+    if (isRunUsageComplete(usage)) return usage
+    try {
+      const looked = await this.lookupUsage(sessionKey)
+      usage = mergeRunUsage(usage, looked)
+    } catch (err) {
+      this.log('taskboard usage lookup failed', { sessionKey, err: String(err) })
+    }
+    return usage
+  }
+
+  /** 延迟一次再读 usage_log。timer.unref 避免卡住测试进程退出。 */
+  private queueUsageBackfill(db: TaskboardDb, runId: string, sessionKey: string): void {
+    if (this.usageBackfillDelayMs <= 0) return
+    const timer = setTimeout(() => {
+      void this.backfillRunUsage(db, runId, sessionKey)
+    }, this.usageBackfillDelayMs)
+    timer.unref()
+  }
+
+  private async backfillRunUsage(
+    db: TaskboardDb,
+    runId: string,
+    sessionKey: string,
+  ): Promise<void> {
+    try {
+      const existing = getRun(db, runId)
+      if (!existing) return
+      const current: RunUsageSnapshot = {
+        tokensIn: existing.tokensIn,
+        tokensOut: existing.tokensOut,
+        costUsd: existing.costUsd,
+      }
+      if (isRunUsageComplete(current)) return
+      const looked = await this.lookupUsage(sessionKey)
+      const merged = mergeRunUsage(current, looked)
+      if (
+        merged.tokensIn === current.tokensIn &&
+        merged.tokensOut === current.tokensOut &&
+        merged.costUsd === current.costUsd
+      ) {
+        return
+      }
+      updateRun(db, runId, {
+        tokensIn: merged.tokensIn,
+        tokensOut: merged.tokensOut,
+        costUsd: merged.costUsd,
+      })
+    } catch (err) {
+      this.log('taskboard usage backfill failed', { runId, sessionKey, err: String(err) })
+    }
+  }
 }
 
 function listPatrolEnabledStages(db: TaskboardDb): PipelineStage[] {
@@ -816,6 +953,10 @@ function latestSettledRun(db: TaskboardDb, ticketId: string, exceptId?: string):
         (r.status === 'succeeded' || r.status === 'failed' || r.status === 'timeout'),
     ) ?? null
   )
+}
+
+function finiteNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
 }
 
 function summarize(output: string): string {
