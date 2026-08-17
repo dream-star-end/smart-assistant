@@ -467,15 +467,6 @@ const DEFAULT_CONTAINER_CONNECT_TIMEOUT_MS = 5_000;
  * fence: a late async preparation result is never allowed to start a turn. */
 const DEFAULT_PROMPT_QUEUE_PREPARATION_TIMEOUT_MS = 20_000;
 
-/**
- * Transient outbound persist failures poison later sequence numbers so a
- * reconnect can replay the exact failed seq from the container ring.
- * Current containers do not replay already-advanced seqs, so a poisoned
- * namespace would otherwise stick until process restart. After this TTL
- * the missing seq is skipped and the current frame is allowed through.
- */
-export const OUTBOUND_PERSIST_FAILED_SEQ_TTL_MS = 15_000;
-
 /** ConnectionRegistry 默认 maxPerUser(沿用 connections.ts 的 3)。 */
 const DEFAULT_MAX_PER_USER = 3;
 
@@ -1031,8 +1022,6 @@ export interface UserChatBridgeDeps {
     frameSeq: number;
     payload: string;
   }) => Promise<void>;
-  /** Internal failed-seq poison TTL; override only for focused tests. */
-  outboundPersistFailedSeqTtlMs?: number;
   /** durable turn dispatch 受理面(RFC-v5-durable-turn-dispatch §2.1)。注入且容器 attest
    * DURABLE_TURN_DISPATCH_CAPABILITY 时,替代 persistMasterUserMessage:单事务幂等 append
    * user 行 + UPSERT dispatch 冲突表裁定(受理即拥有 I1)。未注入 / 无 capability → legacy。 */
@@ -1557,23 +1546,100 @@ export async function isCursorContainerOnSelfHost(
   return eligible.rowCount === 1;
 }
 
-// ---------- 主入口 ----------------------------------------------------------
+type OutboundPersistQueueState = {
+  tail: Promise<void>;
+  failedSeq: number | null;
+};
 
 /**
- * Duck-type marker for permanent live-frame journal conflicts.
+ * Serializes durable outbound writes per container/session namespace.
  *
- * Contract: persistOutboundFrame (injected; typically persistGatewayLiveFrame)
- * rejects with `{ liveFramePermanentConflict: true }` for identity / immutable
- * payload conflicts. This file must not import the db module — check the
- * flag, never the error message string.
+ * A failure remains a monotonic barrier while at least one browser bridge is
+ * attached to that namespace. Once the final browser bridge detaches, the
+ * failed state is retired after its current tail drains, so a later reconnect
+ * is not permanently poisoned by a failure from an earlier connection.
  */
-function isPermanentLiveFrameConflict(error: unknown): boolean {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    (error as { liveFramePermanentConflict?: unknown }).liveFramePermanentConflict === true
-  );
+export class _OutboundPersistQueueCoordinator {
+  private readonly queues = new Map<string, OutboundPersistQueueState>();
+  private readonly consumerCounts = new Map<string, number>();
+
+  retain(key: string): void {
+    this.consumerCounts.set(key, (this.consumerCounts.get(key) ?? 0) + 1);
+  }
+
+  release(key: string): void {
+    const count = this.consumerCounts.get(key) ?? 0;
+    if (count > 1) {
+      this.consumerCounts.set(key, count - 1);
+      return;
+    }
+    this.consumerCounts.delete(key);
+    const state = this.queues.get(key);
+    if (state !== undefined) this.scheduleCleanup(key, state, state.tail);
+  }
+
+  enqueue(
+    key: string,
+    frameSeq: number,
+    work: () => Promise<void>,
+    onFailure: (error: unknown) => void,
+  ): void {
+    let state = this.queues.get(key);
+    if (!state) {
+      state = { tail: Promise.resolve(), failedSeq: null };
+      this.queues.set(key, state);
+    }
+    const task = state.tail.then(async () => {
+      // A reconnect may replay the exact failed sequence from the container's
+      // own ring. That exact retry is allowed to heal the namespace; a later
+      // sequence must never overtake it while a browser generation is alive.
+      if (state!.failedSeq !== null && state!.failedSeq !== frameSeq) {
+        onFailure(new Error(`outbound durability blocked at frame ${state!.failedSeq}`));
+        return;
+      }
+      try {
+        await work();
+        if (state!.failedSeq === frameSeq) state!.failedSeq = null;
+      } catch (error) {
+        state!.failedSeq = frameSeq;
+        onFailure(error);
+      }
+    });
+    state.tail = task;
+    this.scheduleCleanup(key, state, task);
+  }
+
+  async drain(): Promise<void> {
+    await Promise.allSettled([...this.queues.values()].map((state) => state.tail));
+  }
+
+  snapshotForTest(): { queues: number; consumerKeys: number; consumers: number } {
+    return {
+      queues: this.queues.size,
+      consumerKeys: this.consumerCounts.size,
+      consumers: [...this.consumerCounts.values()].reduce((sum, count) => sum + count, 0),
+    };
+  }
+
+  private scheduleCleanup(
+    key: string,
+    state: OutboundPersistQueueState,
+    tail: Promise<void>,
+  ): void {
+    const cleanup = (): void => {
+      if (
+        this.queues.get(key) === state &&
+        state.tail === tail &&
+        (state.failedSeq === null || !this.consumerCounts.has(key))
+      ) {
+        this.queues.delete(key);
+      }
+    };
+    void tail.then(cleanup, cleanup);
+  }
 }
+
+// ---------- 主入口 ----------------------------------------------------------
 
 export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHandler {
   // PR2 v1.0.66 — codex 真扣费三件套一致性强校验(Codex BLOCKER 3 修复)。
@@ -1607,11 +1673,6 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       (deps.promptQueuePreparationTimeoutMs ?? 0) > 0
       ? deps.promptQueuePreparationTimeoutMs!
       : DEFAULT_PROMPT_QUEUE_PREPARATION_TIMEOUT_MS;
-  const outboundPersistFailedSeqTtlMs =
-    Number.isSafeInteger(deps.outboundPersistFailedSeqTtlMs) &&
-      (deps.outboundPersistFailedSeqTtlMs ?? 0) > 0
-      ? deps.outboundPersistFailedSeqTtlMs!
-      : OUTBOUND_PERSIST_FAILED_SEQ_TTL_MS;
   const log = deps.logger;
   const metrics = deps.metrics ?? {};
   const createContainerSocket = deps.createContainerSocket
@@ -1650,72 +1711,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
   const outboundRing = new OutboundRingBuffer(DEFAULT_RING_CONFIG);
   // Process-singleton namespace queues preserve commit→send order even when
   // the same container broadcasts duplicate frames through multiple browser
-  // bridges.  A failed namespace is poisoned: later sequence numbers are not
-  // allowed to leap over the missing durable row.
-  const outboundPersistQueues = new Map<string, {
-    tail: Promise<void>;
-    failedSeq: number | null;
-    failedAtMs: number | null;
-  }>();
-  const enqueuePersistedOutbound = (
-    key: string,
-    frameSeq: number,
-    work: () => Promise<void>,
-    onFailure: (error: unknown) => void,
-  ): void => {
-    let state = outboundPersistQueues.get(key);
-    if (!state) {
-      state = { tail: Promise.resolve(), failedSeq: null, failedAtMs: null };
-      outboundPersistQueues.set(key, state);
-    }
-    const task = state.tail.then(async () => {
-      // A reconnect may replay the exact failed sequence from the container's
-      // own ring.  That exact retry is allowed to heal the namespace; a later
-      // sequence must never overtake it.
-      if (state!.failedSeq !== null && state!.failedSeq !== frameSeq) {
-        const failedAgeMs = Date.now() - (state!.failedAtMs ?? 0);
-        if (failedAgeMs > outboundPersistFailedSeqTtlMs) {
-          log?.warn("user-chat-bridge: outbound durability poison expired; skipped missing seq", {
-            skippedFailedSeq: state!.failedSeq,
-            frameSeq,
-          });
-          state!.failedSeq = null;
-          state!.failedAtMs = null;
-        } else {
-          onFailure(new Error(`outbound durability blocked at frame ${state!.failedSeq}`));
-          return;
-        }
-      }
-      try {
-        await work();
-        if (state!.failedSeq === frameSeq) {
-          state!.failedSeq = null;
-          state!.failedAtMs = null;
-        }
-      } catch (error) {
-        if (isPermanentLiveFrameConflict(error)) {
-          log?.error("user-chat-bridge: skipping outbound frame after permanent live-stream conflict", {
-            frameSeq,
-            err: (error as Error)?.message ?? String(error),
-          });
-          return;
-        }
-        state!.failedSeq = frameSeq;
-        state!.failedAtMs = Date.now();
-        onFailure(error);
-      }
-    });
-    state.tail = task;
-    void task.finally(() => {
-      if (
-        state!.failedSeq === null &&
-        outboundPersistQueues.get(key) === state &&
-        state!.tail === task
-      ) {
-        outboundPersistQueues.delete(key);
-      }
-    });
-  };
+  // bridges. A failed namespace blocks later sequence numbers while any
+  // browser generation remains attached; final detach retires the poison so a
+  // future reconnect is not permanently trapped by an earlier DB failure.
+  const outboundPersistQueues = new _OutboundPersistQueueCoordinator();
 
   /**
    * 周期性 lazy prune 兜底。
@@ -3020,6 +3019,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     let drainTimer: ReturnType<typeof setTimeout> | null = null;
     let drainCause: BridgeCloseCause | null = null;
     let userDetached = false;
+    const retainedOutboundPersistQueueKeys = new Set<string>();
+    const retainOutboundPersistQueueKey = (key: string): void => {
+      if (userDetached || retainedOutboundPersistQueueKeys.has(key)) return;
+      outboundPersistQueues.retain(key);
+      retainedOutboundPersistQueueKeys.add(key);
+    };
 
     // ── durable turn dispatch(RFC §2.2 B1)本连接受理簿记 ─────────────────────
     //   admittedDispatches: clientMessageId → dispatch 身份 + lease。仅
@@ -4294,6 +4299,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               const safeId = peer.peerId.replace(/[^a-zA-Z0-9_-]/g, "_");
               const sessionKey = `agent:${aid}:webchat:dm:${safeId}`;
               const storeKey = `${uidStr}:${cidStr}:${sessionKey}`;
+              // Hello is the browser's subscription authority. Register every
+              // visible peer before forwarding/replay so a second attached tab
+              // protects an existing failed-sequence barrier even if it has not
+              // received its first outbound frame yet.
+              retainOutboundPersistQueueKey(storeKey);
               const cursor =
                 typeof peer.lastFrameSeq === "number" ? peer.lastFrameSeq : 0;
               const replay = outboundRing.peekReplay(storeKey, cursor);
@@ -6773,7 +6783,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         deps.persistOutboundFrame
       ) {
         const stamped = durableStampedFrame;
-        enqueuePersistedOutbound(
+        // Fallback for old/non-browser peers that produce stamped output before
+        // sending an inbound.hello subscription.
+        retainOutboundPersistQueueKey(stamped.storeKey);
+        outboundPersistQueues.enqueue(
           stamped.storeKey,
           stamped.frameSeq,
           async () => {
@@ -7579,6 +7592,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     function detachUserSide(triggerCause: BridgeCloseCause): void {
       if (userDetached) return;
       userDetached = true;
+      for (const key of retainedOutboundPersistQueueKeys) {
+        outboundPersistQueues.release(key);
+      }
+      retainedOutboundPersistQueueKeys.clear();
       if (heartbeatTimer !== null) {
         clearInterval(heartbeatTimer);
         heartbeatTimer = null;
@@ -7756,7 +7773,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     clearInterval(controlDrainTimer);
     clearInterval(recoveryDrainTimer);
     registry.closeAll(reason);
-    await Promise.allSettled([...outboundPersistQueues.values()].map((state) => state.tail));
+    await outboundPersistQueues.drain();
     await new Promise<void>((resolve) => {
       try { wss.close(() => resolve()); } catch { resolve(); }
     });
