@@ -55,7 +55,11 @@ export interface TurnRetryMeta {
  * 审计 R3:retrying 形态此前是 ccbMessageParser 的本地加宽(GatewayTurnPhase)+
  * 受控 cast;现正式进权威事件类型,parser / server / sessionManager 不再 cast。
  */
-export type EngineTurnPhase = 'compacting' | null | { status: 'retrying'; retry: TurnRetryMeta }
+export type EngineTurnPhase =
+  | 'compacting'
+  | null
+  | { status: 'retrying'; retry: TurnRetryMeta }
+  | { status: 'working'; detail?: string }
 
 /** Permission request from the engine (CCB: stdio control_request protocol) */
 export interface PermissionRequest {

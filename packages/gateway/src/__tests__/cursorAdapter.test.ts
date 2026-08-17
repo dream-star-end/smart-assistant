@@ -10,6 +10,7 @@ import {
   CURSOR_MAX_PROMPT_ARG_BYTES,
   CURSOR_MAX_TURN_PAYLOAD_BYTES,
   CursorAdapter,
+  cursorResumeStorePath,
   _internals,
 } from '../engine/cursorAdapter.js'
 import type { EngineEvent, EngineExternalBillingEvent } from '../engine/engineEvents.js'
@@ -547,7 +548,7 @@ for(const e of [
     }
   })
 
-  test('rebuilds platform and MCP context for every stateless turn on one adapter', async () => {
+  test('rebuilds platform and MCP context for every turn on one adapter', async () => {
     const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-multiturn-'))
     const fake = path.join(dir, 'fake.cjs')
     const capture = path.join(dir, 'captures.jsonl')
@@ -563,6 +564,7 @@ const tokenPath=config.mcpServers['openclaude-memory'].env.OPENCLAUDE_GATEWAY_TO
 fs.appendFileSync(${JSON.stringify(capture)},JSON.stringify({
   argv, prompt:argv.at(-1), configPath, tokenPath,
   tokenHash:crypto.createHash('sha256').update(fs.readFileSync(tokenPath)).digest('hex'),
+  resumeId:process.env.OPENCLAUDE_CURSOR_RESUME_ID ?? null,
 })+'\\n');
 console.log(JSON.stringify({type:'assistant',message:{role:'assistant',content:[{type:'text',text:'TURN_OK'}]}}));
 console.log(JSON.stringify({type:'result',subtype:'success',is_error:false}));
@@ -606,6 +608,7 @@ console.log(JSON.stringify({type:'result',subtype:'success',is_error:false}));
         const turn = launched[index]
         assert.equal(turn.argv.includes('--resume'), false)
         assert.equal(turn.argv.includes('--continue'), false)
+        assert.equal(turn.resumeId, null)
         assert.match(turn.prompt, /CURSOR_SECOND_TURN_PERSONA_MARKER/)
         assert.match(turn.prompt, /<openclaude_platform_context>/)
         assert.match(turn.prompt, /# Skills/)
@@ -1451,5 +1454,842 @@ setInterval(() => {}, 1000);
       restoreEnv('OPENCLAUDE_CURSOR_SHUTDOWN_GRACE_MS', oldGrace)
       await rm(dir, { recursive: true, force: true })
     }
+  })
+
+  // 真实 turn tape(selfhost cursor-opus-5-high,2026-08-16)实锤:原生 askQuestion
+  // 在 --force 非交互模式下被 CLI 在 1~45ms 内按 "Questions skipped by the user"
+  // 收尾,isError=true 让卡面渲染红色「失败」,而用户从头到尾没见过问题。
+  // 契约:确定性 runtime 跳过 = 普通完成卡(问题内容留在卡面);真实错误仍失败。
+  test('askQuestion runtime skip is not a tool failure; real errors still are', () => {
+    const skipped = {
+      type: 'tool_call',
+      tool_call: {
+        id: 't-ask-skip',
+        askQuestionToolCall: {
+          args: {
+            title: '部署时机',
+            questions: `[{'prompt': '什么时候部?', 'options': [{'id': 'now', 'label': '现在部'}]}]`,
+          },
+          result: { reason: 'Questions skipped by the user, continue with the information you already have' },
+          status: 'rejected',
+        },
+      },
+    }
+    assert.equal(_internals.toolNameOf(skipped as never), 'AskUserQuestion')
+    assert.equal(_internals.questionSkippedByRuntime(skipped as never), true)
+    assert.equal(_internals.toolFailed(skipped as never), false)
+
+    const erroredAsk = {
+      type: 'tool_call',
+      tool_call: {
+        id: 't-ask-err',
+        askQuestionToolCall: {
+          args: { questions: `[{'prompt': 'q', 'options': [{'id': 'a', 'label': 'A'}]}]` },
+          result: { error: 'boom' },
+        },
+      },
+    }
+    assert.equal(_internals.questionSkippedByRuntime(erroredAsk as never), false)
+    assert.equal(_internals.toolFailed(erroredAsk as never), true)
+
+    // 跳过判定只豁免 askQuestion:其它工具的 rejected 仍然是失败。
+    const rejectedShell = {
+      type: 'tool_call',
+      tool_call: { id: 't-sh', shellToolCall: { args: { command: 'x' }, status: 'rejected' } },
+    }
+    assert.equal(_internals.toolFailed(rejectedShell as never), true)
+
+    // preamble 必须显式禁止原生 ask 工具,把「要决策→文字提问→结束本轮」
+    // 写进引擎侧最高优先级上下文。
+    assert.ok(
+      _internals.CURSOR_PREAMBLE.includes('Questions skipped by the user'),
+      'preamble must explain the deterministic skip',
+    )
+    assert.ok(
+      _internals.CURSOR_PREAMBLE.includes('Never call the native ask-question tool'),
+      'preamble must forbid the native ask tool',
+    )
+  })
+
+  // ask_user MCP 桥(cursor 等无原生交互工具的引擎):平台 MCP 工具
+  // mcp__openclaude-memory__ask_user 必须渲染成产品 AskUserQuestion 卡,
+  // input 走 mcpToolCall 的 args.args 透传(schema 本身就是产品形态)。
+  test('mcp ask_user maps to the product AskUserQuestion card', () => {
+    const ask = {
+      type: 'tool_call',
+      tool_call: {
+        id: 't-mcp-ask',
+        mcpToolCall: {
+          args: {
+            serverIdentifier: 'openclaude-memory',
+            toolName: 'ask_user',
+            args: {
+              questions: [
+                {
+                  question: '部署会中断当前会话,什么时候部?',
+                  header: '部署时机',
+                  options: [
+                    { label: '现在就部' },
+                    { label: '稍后我自己跑' },
+                  ],
+                },
+              ],
+            },
+          },
+        },
+      },
+    }
+    assert.equal(_internals.toolNameOf(ask as never), 'AskUserQuestion')
+    assert.deepEqual(_internals.toolInputOf(ask as never), {
+      questions: [
+        {
+          question: '部署会中断当前会话,什么时候部?',
+          header: '部署时机',
+          options: [{ label: '现在就部' }, { label: '稍后我自己跑' }],
+        },
+      ],
+    })
+    // 其它 MCP 工具仍走 mcp__server__tool 命名,不受影响。
+    const other = {
+      type: 'tool_call',
+      tool_call: {
+        id: 't-mcp-other',
+        mcpToolCall: {
+          args: {
+            serverIdentifier: 'openclaude-memory',
+            toolName: 'skill_search',
+            args: { query: 'x' },
+          },
+        },
+      },
+    }
+    assert.equal(_internals.toolNameOf(other as never), 'mcp__openclaude-memory__skill_search')
+
+    // preamble 必须把 ask_user 指认为 cursor 的提问通道。
+    assert.ok(
+      _internals.CURSOR_PREAMBLE.includes('`ask_user`'),
+      'preamble must point cursor at the ask_user MCP tool',
+    )
+  })
+
+  test('declares native-resume with a cursor-session resume kind', () => {
+    const adapter = new CursorAdapter(opts('/tmp'))
+    assert.equal(adapter.capabilities.historyMode, 'native-resume')
+    assert.equal(adapter.capabilities.resumeKind, 'cursor-session')
+  })
+
+  test('captures Cursor session_id from stream-json and emits it once', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-session-id-'))
+    const fake = path.join(dir, 'fake.cjs')
+    const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    await writeFile(
+      fake,
+      `#!/usr/bin/env node
+console.log(JSON.stringify({type:'system',subtype:'init',session_id:${JSON.stringify(sessionId)}}));
+console.log(JSON.stringify({type:'result',subtype:'success',is_error:false,session_id:${JSON.stringify(sessionId)}}));
+`,
+    )
+    await chmod(fake, 0o755)
+    const old = process.env.OC_CURSOR_WRAPPER_BIN
+    process.env.OC_CURSOR_WRAPPER_BIN = fake
+    try {
+      const adapter = new CursorAdapter(opts(dir))
+      const sessionEvents: string[] = []
+      adapter.on('session_id', (id: string) => sessionEvents.push(id))
+      adapter.on('error', () => {})
+      const run = adapter.submitTurn({
+        input: 'hello',
+        requestId: REQUEST,
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run.submitted
+      await run.summary
+      await adapter.waitForOutputDrain()
+      assert.equal(adapter.nativeSessionId, sessionId)
+      assert.deepEqual(sessionEvents, [sessionId])
+    } finally {
+      restoreEnv('OC_CURSOR_WRAPPER_BIN', old)
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('passes a stored resume id through env when the local store exists', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-resume-valid-'))
+    const fake = path.join(dir, 'fake.cjs')
+    const capture = path.join(dir, 'capture.json')
+    const sessionId = '11111111-2222-3333-4444-555555555555'
+    const store = cursorResumeStorePath(dir, sessionId)
+    await mkdir(path.dirname(store), { recursive: true })
+    await writeFile(store, '')
+    await writeFile(
+      fake,
+      `#!/usr/bin/env node
+const fs=require('node:fs');
+fs.writeFileSync(${JSON.stringify(capture)},JSON.stringify({
+  argv:process.argv.slice(2),
+  resumeId:process.env.OPENCLAUDE_CURSOR_RESUME_ID ?? null,
+}));
+console.log(JSON.stringify({type:'system',subtype:'init',session_id:${JSON.stringify(sessionId)}}));
+console.log(JSON.stringify({type:'result',subtype:'success',is_error:false,session_id:${JSON.stringify(sessionId)}}));
+`,
+    )
+    await chmod(fake, 0o755)
+    const old = process.env.OC_CURSOR_WRAPPER_BIN
+    process.env.OC_CURSOR_WRAPPER_BIN = fake
+    try {
+      const adapter = new CursorAdapter({ ...opts(dir), resumeSessionId: sessionId })
+      const spawns: Array<{ resumed: boolean }> = []
+      adapter.on('spawn', (info: { resumed: boolean }) => spawns.push(info))
+      adapter.on('error', () => {})
+      const run = adapter.submitTurn({
+        input: 'resume please',
+        requestId: REQUEST,
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run.submitted
+      await run.summary
+      await adapter.waitForOutputDrain()
+      const launched = JSON.parse(await readFile(capture, 'utf8'))
+      assert.equal(launched.resumeId, sessionId)
+      assert.equal(launched.argv.includes('--resume'), false)
+      assert.deepEqual(spawns, [{ resumed: true }])
+      assert.equal(adapter.nativeSessionId, sessionId)
+    } finally {
+      restoreEnv('OC_CURSOR_WRAPPER_BIN', old)
+      await rm(path.dirname(store), { recursive: true, force: true })
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('drops a stale resume id when the local store is missing', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-resume-stale-'))
+    const fake = path.join(dir, 'fake.cjs')
+    const capture = path.join(dir, 'capture.json')
+    const staleId = 'aaaaaaaa-bbbb-cccc-dddd-ffffffffffff'
+    const freshId = '99999999-8888-7777-6666-555555555555'
+    await writeFile(
+      fake,
+      `#!/usr/bin/env node
+const fs=require('node:fs');
+fs.writeFileSync(${JSON.stringify(capture)},JSON.stringify({
+  argv:process.argv.slice(2),
+  resumeId:process.env.OPENCLAUDE_CURSOR_RESUME_ID ?? null,
+}));
+console.log(JSON.stringify({type:'system',subtype:'init',session_id:${JSON.stringify(freshId)}}));
+console.log(JSON.stringify({type:'result',subtype:'success',is_error:false,session_id:${JSON.stringify(freshId)}}));
+`,
+    )
+    await chmod(fake, 0o755)
+    const old = process.env.OC_CURSOR_WRAPPER_BIN
+    process.env.OC_CURSOR_WRAPPER_BIN = fake
+    try {
+      const adapter = new CursorAdapter({ ...opts(dir), resumeSessionId: staleId })
+      let idAtSpawn: string | null | undefined
+      const spawns: Array<{ resumed: boolean }> = []
+      adapter.on('spawn', (info: { resumed: boolean }) => {
+        spawns.push(info)
+        idAtSpawn = adapter.nativeSessionId
+      })
+      adapter.on('error', () => {})
+      const run = adapter.submitTurn({
+        input: 'stale resume',
+        requestId: REQUEST,
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run.submitted
+      await run.summary
+      await adapter.waitForOutputDrain()
+      const launched = JSON.parse(await readFile(capture, 'utf8'))
+      assert.equal(launched.resumeId, null)
+      assert.equal(launched.argv.includes('--resume'), false)
+      assert.deepEqual(spawns, [{ resumed: false }])
+      assert.equal(idAtSpawn, null)
+      assert.equal(adapter.nativeSessionId, freshId)
+    } finally {
+      restoreEnv('OC_CURSOR_WRAPPER_BIN', old)
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('a resumed turn with the same session_id still emits session_id once', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-resume-emit-'))
+    const fake = path.join(dir, 'fake.cjs')
+    const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    const store = cursorResumeStorePath(dir, sessionId)
+    await mkdir(path.dirname(store), { recursive: true })
+    await writeFile(store, '')
+    await writeFile(
+      fake,
+      `#!/usr/bin/env node
+console.log(JSON.stringify({type:'system',subtype:'init',session_id:${JSON.stringify(sessionId)}}));
+console.log(JSON.stringify({type:'assistant',message:{role:'assistant',content:[{type:'text',text:'ok'}]},session_id:${JSON.stringify(sessionId)}}));
+console.log(JSON.stringify({type:'result',subtype:'success',is_error:false,session_id:${JSON.stringify(sessionId)}}));
+`,
+    )
+    await chmod(fake, 0o755)
+    const old = process.env.OC_CURSOR_WRAPPER_BIN
+    process.env.OC_CURSOR_WRAPPER_BIN = fake
+    try {
+      const adapter = new CursorAdapter({ ...opts(dir), resumeSessionId: sessionId })
+      const sessionEvents: string[] = []
+      adapter.on('session_id', (id: string) => sessionEvents.push(id))
+      adapter.on('error', () => {})
+      const run = adapter.submitTurn({
+        input: 'resume same id',
+        requestId: REQUEST,
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run.submitted
+      await run.summary
+      await adapter.waitForOutputDrain()
+      assert.equal(adapter.nativeSessionId, sessionId)
+      assert.deepEqual(sessionEvents, [sessionId])
+    } finally {
+      restoreEnv('OC_CURSOR_WRAPPER_BIN', old)
+      await rm(path.dirname(store), { recursive: true, force: true })
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('clamps pending keepalive env to documented bounds', () => {
+    assert.equal(_internals.parsePendingKeepaliveIntervalMs(''), _internals.PENDING_KEEPALIVE_INTERVAL_DEFAULT_MS)
+    assert.equal(_internals.parsePendingKeepaliveIntervalMs('bogus'), _internals.PENDING_KEEPALIVE_INTERVAL_DEFAULT_MS)
+    assert.equal(_internals.parsePendingKeepaliveIntervalMs('-1'), _internals.PENDING_KEEPALIVE_INTERVAL_DEFAULT_MS)
+    assert.equal(_internals.parsePendingKeepaliveIntervalMs('1000'), _internals.PENDING_KEEPALIVE_INTERVAL_MIN_MS)
+    assert.equal(_internals.parsePendingKeepaliveIntervalMs('200000'), _internals.PENDING_KEEPALIVE_INTERVAL_MAX_MS)
+    assert.equal(_internals.parsePendingKeepaliveIntervalMs('45000'), 45_000)
+    assert.equal(_internals.PENDING_KEEPALIVE_MAX_DEFAULT_MS, 2 * 60 * 60_000)
+    assert.equal(_internals.parsePendingKeepaliveMaxMs(''), _internals.PENDING_KEEPALIVE_MAX_DEFAULT_MS)
+    assert.equal(_internals.parsePendingKeepaliveMaxMs('1000'), _internals.PENDING_KEEPALIVE_MAX_MIN_MS)
+    assert.equal(
+      _internals.parsePendingKeepaliveMaxMs(String(7 * 60 * 60_000)),
+      _internals.PENDING_KEEPALIVE_MAX_MAX_MS,
+    )
+    assert.equal(_internals.parsePendingKeepaliveMaxMs(String(30 * 60_000)), 30 * 60_000)
+    assert.equal(_internals.PENDING_KEEPALIVE_STALL_DEFAULT_MS, 10 * 60_000)
+    assert.equal(_internals.parsePendingKeepaliveStallMs(''), _internals.PENDING_KEEPALIVE_STALL_DEFAULT_MS)
+    assert.equal(_internals.parsePendingKeepaliveStallMs('bogus'), _internals.PENDING_KEEPALIVE_STALL_DEFAULT_MS)
+    assert.equal(_internals.parsePendingKeepaliveStallMs('1000'), _internals.PENDING_KEEPALIVE_STALL_MIN_MS)
+    assert.equal(
+      _internals.parsePendingKeepaliveStallMs(String(2 * 60 * 60_000)),
+      _internals.PENDING_KEEPALIVE_STALL_MAX_MS,
+    )
+    assert.equal(_internals.parsePendingKeepaliveStallMs(String(15 * 60_000)), 15 * 60_000)
+    assert.equal(_internals.PENDING_KEEPALIVE_MIN_CPU_TICKS_DEFAULT, 2)
+    assert.equal(_internals.parsePendingKeepaliveMinCpuTicks(''), _internals.PENDING_KEEPALIVE_MIN_CPU_TICKS_DEFAULT)
+    assert.equal(_internals.parsePendingKeepaliveMinCpuTicks('0'), _internals.PENDING_KEEPALIVE_MIN_CPU_TICKS_DEFAULT)
+    assert.equal(_internals.parsePendingKeepaliveMinCpuTicks('100'), _internals.PENDING_KEEPALIVE_MIN_CPU_TICKS_MAX)
+    assert.equal(_internals.parsePendingKeepaliveMinCpuTicks('3'), 3)
+  })
+
+  function growingCpuProbe(step = 8): () => number {
+    let ticks = 10_000
+    return () => {
+      ticks += step
+      return ticks
+    }
+  }
+
+  function staticTranscriptProbe(): () => { files: Record<string, { size: number; mtimeMs: number }> } {
+    const files = { 'agent.jsonl': { size: 2048, mtimeMs: 1 } }
+    return () => ({ files: { ...files } })
+  }
+
+  async function waitUntil(predicate: () => boolean, timeoutMs: number, label: string): Promise<void> {
+    const started = Date.now()
+    while (!predicate()) {
+      if (Date.now() - started > timeoutMs) throw new Error(`timed out waiting for ${label}`)
+      await new Promise((resolve) => setTimeout(resolve, 15))
+    }
+  }
+
+  async function withHangingCursorWrapper(
+    emitToolStart: boolean,
+    body: (adapter: CursorAdapter, activity: { count: number }, events: EngineEvent[]) => Promise<void>,
+  ): Promise<void> {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-keepalive-'))
+    const fake = path.join(dir, 'fake.cjs')
+    await writeFile(path.join(dir, 'persona.md'), 'PERSONA')
+    const toolLine = emitToolStart
+      ? "console.log(JSON.stringify({type:'tool_call',subtype:'started',call_id:'task-keep',tool_call:{taskToolCall:{args:{description:'long subagent',prompt:'work'}}}}));\n"
+      : ''
+    await writeFile(
+      fake,
+      `#!/usr/bin/env node
+${toolLine}setInterval(() => {}, 1000);
+`,
+    )
+    await chmod(fake, 0o755)
+    const oldBin = process.env.OC_CURSOR_WRAPPER_BIN
+    const oldGrace = process.env.OPENCLAUDE_CURSOR_SHUTDOWN_GRACE_MS
+    const oldFinal = process.env.OPENCLAUDE_CURSOR_SHUTDOWN_FINAL_DRAIN_MS
+    process.env.OC_CURSOR_WRAPPER_BIN = fake
+    process.env.OPENCLAUDE_CURSOR_SHUTDOWN_GRACE_MS = '200'
+    process.env.OPENCLAUDE_CURSOR_SHUTDOWN_FINAL_DRAIN_MS = '200'
+    const adapter = new CursorAdapter(opts(dir))
+    const activity = { count: 0 }
+    const events: EngineEvent[] = []
+    adapter.on('activity', () => { activity.count += 1 })
+    adapter.on('error', () => {})
+    try {
+      const run = adapter.submitTurn({
+        input: 'keepalive probe',
+        requestId: REQUEST,
+        onEvent: (e) => { events.push(e) },
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run.submitted
+      await body(adapter, activity, events)
+      adapter.interrupt()
+      await adapter.shutdown()
+      await adapter.waitForOutputDrain()
+    } finally {
+      _internals.setPendingKeepaliveTestHooks(null)
+      restoreEnv('OC_CURSOR_WRAPPER_BIN', oldBin)
+      restoreEnv('OPENCLAUDE_CURSOR_SHUTDOWN_GRACE_MS', oldGrace)
+      restoreEnv('OPENCLAUDE_CURSOR_SHUTDOWN_FINAL_DRAIN_MS', oldFinal)
+      await rm(dir, { recursive: true, force: true })
+    }
+  }
+
+  test('emits periodic activity while a tool call is pending', { timeout: 10_000 }, async () => {
+    _internals.setPendingKeepaliveTestHooks({
+      intervalMs: 40,
+      maxMs: 60_000,
+      stallMs: 60_000,
+      minCpuDeltaTicks: 1,
+      readCpuTicks: growingCpuProbe(),
+      readTranscriptFingerprint: staticTranscriptProbe(),
+    })
+    await withHangingCursorWrapper(true, async (adapter, activity) => {
+      await waitUntil(() => adapter.pendingToolCalls > 0, 5_000, 'pending tool')
+      const countAfterStart = activity.count
+      const activityAt = adapter.lastActivityAt
+      await new Promise((resolve) => setTimeout(resolve, 200))
+      assert.ok(
+        activity.count - countAfterStart >= 2,
+        `expected periodic keepalive activity, got ${activity.count - countAfterStart} extra emits`,
+      )
+      assert.ok(adapter.lastActivityAt > activityAt, 'keepalive must refresh lastActivityAt')
+    })
+  })
+
+  test('does not emit keepalive activity when no tool is pending', { timeout: 10_000 }, async () => {
+    _internals.setPendingKeepaliveTestHooks({
+      intervalMs: 40,
+      maxMs: 60_000,
+      stallMs: 60_000,
+      minCpuDeltaTicks: 1,
+      readCpuTicks: growingCpuProbe(),
+      readTranscriptFingerprint: staticTranscriptProbe(),
+    })
+    await withHangingCursorWrapper(false, async (adapter, activity) => {
+      await waitUntil(() => adapter.isRunning, 5_000, 'cursor process running')
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      assert.equal(adapter.pendingToolCalls, 0)
+      const countAfterStart = activity.count
+      const activityAt = adapter.lastActivityAt
+      await new Promise((resolve) => setTimeout(resolve, 150))
+      assert.equal(activity.count, countAfterStart)
+      assert.equal(adapter.lastActivityAt, activityAt)
+    })
+  })
+
+  test('stops keepalive emits after the pending-tool max budget', { timeout: 10_000 }, async () => {
+    const clock = { offsetMs: 0 }
+    _internals.setPendingKeepaliveTestHooks({
+      intervalMs: 40,
+      maxMs: 5_000,
+      stallMs: 60_000,
+      minCpuDeltaTicks: 1,
+      now: () => Date.now() + clock.offsetMs,
+      readCpuTicks: growingCpuProbe(),
+      readTranscriptFingerprint: staticTranscriptProbe(),
+    })
+    await withHangingCursorWrapper(true, async (adapter, activity) => {
+      await waitUntil(() => adapter.pendingToolCalls > 0, 5_000, 'pending tool')
+      const countAfterStart = activity.count
+      await new Promise((resolve) => setTimeout(resolve, 150))
+      assert.ok(
+        activity.count - countAfterStart >= 2,
+        `expected keepalive emits before budget, got ${activity.count - countAfterStart}`,
+      )
+      clock.offsetMs = 60_000
+      await new Promise((resolve) => setTimeout(resolve, 60))
+      const countAfterBudget = activity.count
+      await new Promise((resolve) => setTimeout(resolve, 150))
+      assert.equal(
+        activity.count,
+        countAfterBudget,
+        'keepalive must stop once the oldest pending tool exceeds maxMs',
+      )
+      assert.equal(adapter.pendingToolCalls > 0, true)
+    })
+  })
+
+  test('resumes keepalive for a younger pending tool after the oldest exceeds budget and completes', { timeout: 10_000 }, async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-keepalive-resume-'))
+    const fake = path.join(dir, 'fake.cjs')
+    const emitB = path.join(dir, 'emit-b')
+    const doneA = path.join(dir, 'done-a')
+    await writeFile(path.join(dir, 'persona.md'), 'PERSONA')
+    await writeFile(
+      fake,
+      `#!/usr/bin/env node
+const fs = require('node:fs');
+console.log(JSON.stringify({type:'tool_call',subtype:'started',call_id:'task-a',tool_call:{taskToolCall:{args:{description:'A',prompt:'a'}}}}));
+let emittedB = false;
+let completedA = false;
+setInterval(() => {
+  if (!emittedB && fs.existsSync(${JSON.stringify(emitB)})) {
+    emittedB = true;
+    console.log(JSON.stringify({type:'tool_call',subtype:'started',call_id:'task-b',tool_call:{taskToolCall:{args:{description:'B',prompt:'b'}}}}));
+  }
+  if (!completedA && fs.existsSync(${JSON.stringify(doneA)})) {
+    completedA = true;
+    console.log(JSON.stringify({type:'tool_call',subtype:'completed',call_id:'task-a',tool_call:{taskToolCall:{args:{description:'A',prompt:'a'},result:{success:{content:'done'}}}}}));
+  }
+}, 20);
+`,
+    )
+    await chmod(fake, 0o755)
+    const clock = { now: 1_000_000 }
+    const oldBin = process.env.OC_CURSOR_WRAPPER_BIN
+    const oldGrace = process.env.OPENCLAUDE_CURSOR_SHUTDOWN_GRACE_MS
+    const oldFinal = process.env.OPENCLAUDE_CURSOR_SHUTDOWN_FINAL_DRAIN_MS
+    process.env.OC_CURSOR_WRAPPER_BIN = fake
+    process.env.OPENCLAUDE_CURSOR_SHUTDOWN_GRACE_MS = '200'
+    process.env.OPENCLAUDE_CURSOR_SHUTDOWN_FINAL_DRAIN_MS = '200'
+    _internals.setPendingKeepaliveTestHooks({
+      intervalMs: 40,
+      maxMs: 5_000,
+      stallMs: 60_000,
+      minCpuDeltaTicks: 1,
+      now: () => clock.now,
+      readCpuTicks: growingCpuProbe(),
+      readTranscriptFingerprint: staticTranscriptProbe(),
+    })
+    const adapter = new CursorAdapter(opts(dir))
+    const activity = { count: 0 }
+    adapter.on('activity', () => { activity.count += 1 })
+    adapter.on('error', () => {})
+    try {
+      const run = adapter.submitTurn({
+        input: 'parallel pending keepalive resume',
+        requestId: REQUEST,
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run.submitted
+      await waitUntil(() => adapter.pendingToolCalls === 1, 5_000, 'tool A pending')
+      const countAfterA = activity.count
+      await new Promise((resolve) => setTimeout(resolve, 150))
+      assert.ok(
+        activity.count - countAfterA >= 2,
+        `expected keepalive while only A is pending, got ${activity.count - countAfterA}`,
+      )
+
+      clock.now = 1_002_000
+      await writeFile(emitB, '1')
+      await waitUntil(() => adapter.pendingToolCalls === 2, 5_000, 'tools A and B pending')
+
+      clock.now = 1_005_001
+      await new Promise((resolve) => setTimeout(resolve, 60))
+      const countAfterBudget = activity.count
+      await new Promise((resolve) => setTimeout(resolve, 150))
+      assert.equal(
+        activity.count,
+        countAfterBudget,
+        'oldest tool A over budget must suppress keepalive even though B is still young',
+      )
+      assert.equal(adapter.pendingToolCalls, 2)
+
+      await writeFile(doneA, '1')
+      await waitUntil(() => adapter.pendingToolCalls === 1, 5_000, 'only tool B pending')
+      const countAfterACompleted = activity.count
+      await new Promise((resolve) => setTimeout(resolve, 150))
+      assert.ok(
+        activity.count - countAfterACompleted >= 2,
+        `expected keepalive to resume for remaining young tool B, got ${activity.count - countAfterACompleted} extra emits`,
+      )
+      adapter.interrupt()
+      await adapter.shutdown()
+      await adapter.waitForOutputDrain()
+    } finally {
+      _internals.setPendingKeepaliveTestHooks(null)
+      restoreEnv('OC_CURSOR_WRAPPER_BIN', oldBin)
+      restoreEnv('OPENCLAUDE_CURSOR_SHUTDOWN_GRACE_MS', oldGrace)
+      restoreEnv('OPENCLAUDE_CURSOR_SHUTDOWN_FINAL_DRAIN_MS', oldFinal)
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('emits keepalive when transcript size grows even if CPU is flat', { timeout: 10_000 }, async () => {
+    let bytes = 100
+    _internals.setPendingKeepaliveTestHooks({
+      intervalMs: 40,
+      maxMs: 60_000,
+      stallMs: 60_000,
+      minCpuDeltaTicks: 2,
+      readCpuTicks: () => 4_000,
+      readTranscriptFingerprint: () => {
+        bytes += 32
+        return { files: { 'sub/agent.jsonl': { size: bytes, mtimeMs: 50 } } }
+      },
+    })
+    await withHangingCursorWrapper(true, async (adapter, activity) => {
+      await waitUntil(() => adapter.pendingToolCalls > 0, 5_000, 'pending tool')
+      const countAfterStart = activity.count
+      const activityAt = adapter.lastActivityAt
+      await new Promise((resolve) => setTimeout(resolve, 200))
+      assert.ok(
+        activity.count - countAfterStart >= 2,
+        `expected transcript-growth keepalive, got ${activity.count - countAfterStart} extra emits`,
+      )
+      assert.ok(adapter.lastActivityAt > activityAt, 'transcript growth must refresh lastActivityAt')
+    })
+  })
+
+  test('emits keepalive when process-tree CPU grows even if transcripts are still', { timeout: 10_000 }, async () => {
+    _internals.setPendingKeepaliveTestHooks({
+      intervalMs: 40,
+      maxMs: 60_000,
+      stallMs: 60_000,
+      minCpuDeltaTicks: 2,
+      readCpuTicks: growingCpuProbe(12),
+      readTranscriptFingerprint: staticTranscriptProbe(),
+    })
+    await withHangingCursorWrapper(true, async (adapter, activity) => {
+      await waitUntil(() => adapter.pendingToolCalls > 0, 5_000, 'pending tool')
+      const countAfterStart = activity.count
+      const activityAt = adapter.lastActivityAt
+      await new Promise((resolve) => setTimeout(resolve, 200))
+      assert.ok(
+        activity.count - countAfterStart >= 2,
+        `expected CPU-growth keepalive, got ${activity.count - countAfterStart} extra emits`,
+      )
+      assert.ok(adapter.lastActivityAt > activityAt, 'CPU growth must refresh lastActivityAt')
+    })
+  })
+
+  test('stops keepalive after both progress signals stay silent past the stall window', { timeout: 10_000 }, async () => {
+    const probe = { progressing: true, cpu: 8_000, bytes: 400 }
+    _internals.setPendingKeepaliveTestHooks({
+      intervalMs: 40,
+      maxMs: 60_000,
+      stallMs: 120,
+      minCpuDeltaTicks: 2,
+      readCpuTicks: () => {
+        if (probe.progressing) probe.cpu += 10
+        return probe.cpu
+      },
+      readTranscriptFingerprint: () => {
+        if (probe.progressing) probe.bytes += 16
+        return { files: { 'agent.jsonl': { size: probe.bytes, mtimeMs: 9 } } }
+      },
+    })
+    await withHangingCursorWrapper(true, async (adapter, activity) => {
+      await waitUntil(() => adapter.pendingToolCalls > 0, 5_000, 'pending tool')
+      const countAfterStart = activity.count
+      await new Promise((resolve) => setTimeout(resolve, 160))
+      assert.ok(
+        activity.count - countAfterStart >= 2,
+        `expected keepalive while progressing, got ${activity.count - countAfterStart} extra emits`,
+      )
+      probe.progressing = false
+      await new Promise((resolve) => setTimeout(resolve, 80))
+      const countAfterSilence = activity.count
+      await new Promise((resolve) => setTimeout(resolve, 200))
+      assert.equal(
+        activity.count,
+        countAfterSilence,
+        'keepalive must stop once transcript and CPU stay silent past stallMs',
+      )
+      assert.equal(adapter.pendingToolCalls > 0, true)
+    })
+  })
+
+  test('resumes keepalive when progress returns after a stall', { timeout: 10_000 }, async () => {
+    const probe = { progressing: true, cpu: 8_000, bytes: 400 }
+    _internals.setPendingKeepaliveTestHooks({
+      intervalMs: 40,
+      maxMs: 60_000,
+      stallMs: 120,
+      minCpuDeltaTicks: 2,
+      readCpuTicks: () => {
+        if (probe.progressing) probe.cpu += 10
+        return probe.cpu
+      },
+      readTranscriptFingerprint: () => {
+        if (probe.progressing) probe.bytes += 16
+        return { files: { 'agent.jsonl': { size: probe.bytes, mtimeMs: 9 } } }
+      },
+    })
+    await withHangingCursorWrapper(true, async (adapter, activity) => {
+      await waitUntil(() => adapter.pendingToolCalls > 0, 5_000, 'pending tool')
+      await new Promise((resolve) => setTimeout(resolve, 160))
+      probe.progressing = false
+      await new Promise((resolve) => setTimeout(resolve, 280))
+      const countWhileStalled = activity.count
+      await new Promise((resolve) => setTimeout(resolve, 120))
+      assert.equal(
+        activity.count,
+        countWhileStalled,
+        'stalled keepalive must stay quiet until progress resumes',
+      )
+      probe.progressing = true
+      const activityAt = adapter.lastActivityAt
+      await new Promise((resolve) => setTimeout(resolve, 200))
+      assert.ok(
+        activity.count - countWhileStalled >= 2,
+        `expected keepalive to resume after stall, got ${activity.count - countWhileStalled} extra emits`,
+      )
+      assert.ok(adapter.lastActivityAt > activityAt, 'recovery must refresh lastActivityAt')
+    })
+  })
+
+  test('pushes working turn_status while keepalive is progressing', { timeout: 10_000 }, async () => {
+    _internals.setPendingKeepaliveTestHooks({
+      intervalMs: 40,
+      maxMs: 60_000,
+      stallMs: 60_000,
+      minCpuDeltaTicks: 1,
+      readCpuTicks: growingCpuProbe(),
+      readTranscriptFingerprint: staticTranscriptProbe(),
+    })
+    await withHangingCursorWrapper(true, async (adapter, _activity, events) => {
+      await waitUntil(() => adapter.pendingToolCalls > 0, 5_000, 'pending tool')
+      const before = events.length
+      await waitUntil(
+        () => events.slice(before).some((e) => e.kind === 'turn_status'),
+        5_000,
+        'working turn_status',
+      )
+      const added = events.slice(before)
+      const statusEvents = added.filter((e) => e.kind === 'turn_status')
+      assert.ok(statusEvents.length >= 1, 'progressing keepalive must push turn_status')
+      for (const event of statusEvents) {
+        assert.equal(event.kind, 'turn_status')
+        if (event.kind === 'turn_status') {
+          assert.equal(typeof event.status, 'object')
+          assert.ok(event.status && typeof event.status === 'object' && event.status.status === 'working')
+          assert.equal(typeof event.status.detail, 'string')
+        }
+      }
+      assert.equal(
+        added.filter((e) => e.kind === 'block').length,
+        0,
+        'keepalive progress must not emit content blocks (not persisted as messages)',
+      )
+    })
+  })
+
+  test('does not push working turn_status while keepalive is stalled', { timeout: 10_000 }, async () => {
+    const probe = { progressing: true, cpu: 8_000, bytes: 400 }
+    _internals.setPendingKeepaliveTestHooks({
+      intervalMs: 40,
+      maxMs: 60_000,
+      stallMs: 80,
+      minCpuDeltaTicks: 1,
+      readCpuTicks: () => {
+        if (probe.progressing) probe.cpu += 10
+        return probe.cpu
+      },
+      readTranscriptFingerprint: () => {
+        if (probe.progressing) probe.bytes += 16
+        return { files: { 'agent.jsonl': { size: probe.bytes, mtimeMs: 9 } } }
+      },
+    })
+    await withHangingCursorWrapper(true, async (adapter, _activity, events) => {
+      await waitUntil(() => adapter.pendingToolCalls > 0, 5_000, 'pending tool')
+      await waitUntil(
+        () => events.some((e) => e.kind === 'turn_status'),
+        5_000,
+        'initial working turn_status',
+      )
+      probe.progressing = false
+      await new Promise((resolve) => setTimeout(resolve, 280))
+      const countWhileStalled = events.filter((e) => e.kind === 'turn_status').length
+      await new Promise((resolve) => setTimeout(resolve, 160))
+      assert.equal(
+        events.filter((e) => e.kind === 'turn_status').length,
+        countWhileStalled,
+        'stalled keepalive must not push turn_status',
+      )
+    })
+  })
+
+  test('progressDetailFromJsonlTail reads only meaningful last records and clamps', () => {
+    const tail = [
+      '{"role":"assistant","message":{"content":[{"type":"text","text":"I will inspect the file"}]}}',
+      JSON.stringify({
+        type: 'tool_call',
+        subtype: 'started',
+        tool_call: { readToolCall: { args: { path: 'packages/gateway/src/engine/cursorAdapter.ts' } } },
+      }),
+      '',
+    ].join('\n')
+    const detail = _internals.progressDetailFromJsonlTail(tail)
+    assert.ok(detail && detail.includes('Read'), `expected Read progress, got ${detail}`)
+    assert.ok(detail.includes('cursorAdapter.ts'), `expected path in progress, got ${detail}`)
+  })
+
+  test('readFileTailUtf8 does not load the whole file', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-tail-'))
+    const file = path.join(dir, 'huge.jsonl')
+    const head = `${'x'.repeat(80_000)}\n`
+    const last = JSON.stringify({
+      type: 'tool_call',
+      subtype: 'started',
+      tool_call: { grepToolCall: { args: { pattern: 'keepalive' } } },
+    })
+    await writeFile(file, `${head}${last}\n`)
+    const tail = _internals.readFileTailUtf8(file, 2048)
+    assert.ok(Buffer.byteLength(tail, 'utf8') <= 2048)
+    const detail = _internals.progressDetailFromJsonlTail(tail)
+    assert.ok(detail && detail.includes('Grep'), `expected Grep from tail, got ${detail}`)
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  test('summarizeGrownTranscriptProgress prefers the grown file', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-grown-'))
+    const stale = path.join(dir, 'old.jsonl')
+    const live = path.join(dir, 'live.jsonl')
+    await writeFile(stale, JSON.stringify({
+      type: 'tool_call',
+      subtype: 'started',
+      tool_call: { readToolCall: { args: { path: 'stale.ts' } } },
+    }) + '\n')
+    await writeFile(live, JSON.stringify({
+      type: 'tool_call',
+      subtype: 'started',
+      tool_call: { shellToolCall: { args: { command: 'npx tsc -b' } } },
+    }) + '\n')
+    const prev = { files: { 'old.jsonl': { size: 10, mtimeMs: 1 }, 'live.jsonl': { size: 10, mtimeMs: 1 } } }
+    const next = {
+      files: {
+        'old.jsonl': { size: 10, mtimeMs: 1 },
+        'live.jsonl': { size: 400, mtimeMs: 9 },
+      },
+    }
+    const detail = _internals.summarizeGrownTranscriptProgress(dir, prev, next)
+    assert.ok(detail && detail.includes('Bash'), `expected Bash from grown file, got ${detail}`)
+    assert.equal(detail?.includes('stale.ts') ?? false, false)
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  test('fallbackPendingToolProgress is a short one-liner', () => {
+    assert.equal(_internals.fallbackPendingToolProgress('Task'), '子任务 Task 运行中')
+    assert.equal(_internals.fallbackPendingToolProgress('unknown'), '子任务运行中')
   })
 })

@@ -31,6 +31,7 @@ import {
   CLOSE_BRIDGE,
   BRIDGE_WS_PATH,
   _encode4503Reason,
+  _OutboundPersistQueueCoordinator,
   _rawDataLen,
   _sanitizeMasterHistoricalMessagesForFrame,
   isCursorContainerOnSelfHost,
@@ -485,6 +486,104 @@ describe("userChatBridge — happy path", () => {
 });
 
 describe("userChatBridge — durable outbound frame ordering", () => {
+  test("durability poison survives one detach but retires after the final consumer", async () => {
+    const queues = new _OutboundPersistQueueCoordinator();
+    const key = "703:79:agent:main:webchat:dm:sess-consumer-retire";
+    const attempted: number[] = [];
+    const failures: string[] = [];
+    queues.retain(key);
+    queues.retain(key);
+
+    queues.enqueue(
+      key,
+      9,
+      async () => {
+        attempted.push(9);
+        throw new Error("db unavailable");
+      },
+      (error) => failures.push((error as Error).message),
+    );
+    await queues.drain();
+    assert.deepEqual(queues.snapshotForTest(), { queues: 1, consumerKeys: 1, consumers: 2 });
+
+    queues.release(key);
+    queues.enqueue(
+      key,
+      10,
+      async () => { attempted.push(10); },
+      (error) => failures.push((error as Error).message),
+    );
+    await queues.drain();
+    assert.deepEqual(attempted, [9]);
+    assert.match(failures.at(-1) ?? "", /blocked at frame 9/);
+    assert.deepEqual(queues.snapshotForTest(), { queues: 1, consumerKeys: 1, consumers: 1 });
+
+    queues.release(key);
+    await queues.drain();
+    await Promise.resolve();
+    assert.deepEqual(queues.snapshotForTest(), { queues: 0, consumerKeys: 0, consumers: 0 });
+
+    queues.retain(key);
+    queues.enqueue(
+      key,
+      10,
+      async () => { attempted.push(10); },
+      (error) => failures.push((error as Error).message),
+    );
+    await queues.drain();
+    assert.deepEqual(attempted, [9, 10]);
+    queues.release(key);
+    assert.deepEqual(queues.snapshotForTest(), { queues: 0, consumerKeys: 0, consumers: 0 });
+  });
+
+  test("exact failed sequence retry heals while another consumer remains attached", async () => {
+    const queues = new _OutboundPersistQueueCoordinator();
+    const key = "704:80:agent:main:webchat:dm:sess-exact-heal";
+    let attempts = 0;
+    const failures: string[] = [];
+    queues.retain(key);
+    queues.retain(key);
+
+    const persist = async (): Promise<void> => {
+      attempts++;
+      if (attempts === 1) throw new Error("transient write failure");
+    };
+    queues.enqueue(key, 5, persist, (error) => failures.push((error as Error).message));
+    await queues.drain();
+    queues.enqueue(key, 5, persist, (error) => failures.push((error as Error).message));
+    await queues.drain();
+
+    assert.equal(attempts, 2);
+    assert.deepEqual(failures, ["transient write failure"]);
+    assert.deepEqual(queues.snapshotForTest(), { queues: 0, consumerKeys: 1, consumers: 2 });
+    queues.release(key);
+    queues.release(key);
+    assert.deepEqual(queues.snapshotForTest(), { queues: 0, consumerKeys: 0, consumers: 0 });
+  });
+
+  test("a detached late-frame failure cannot poison a later sequence", async () => {
+    const queues = new _OutboundPersistQueueCoordinator();
+    const key = "705:81:agent:main:webchat:dm:sess-detached-late";
+    const attempted: number[] = [];
+
+    queues.enqueue(
+      key,
+      4,
+      async () => {
+        attempted.push(4);
+        throw new Error("detached write failed");
+      },
+      () => {},
+    );
+    await queues.drain();
+    assert.deepEqual(queues.snapshotForTest(), { queues: 0, consumerKeys: 0, consumers: 0 });
+
+    queues.enqueue(key, 5, async () => { attempted.push(5); }, () => {});
+    await queues.drain();
+    assert.deepEqual(attempted, [4, 5]);
+    assert.deepEqual(queues.snapshotForTest(), { queues: 0, consumerKeys: 0, consumers: 0 });
+  });
+
   test("commits exact stamped frames serially before either becomes browser-visible", async () => {
     const persisted: Array<Parameters<NonNullable<UserChatBridgeDeps["persistOutboundFrame"]>>[0]> = [];
     let releaseFirst!: () => void;
@@ -592,6 +691,119 @@ describe("userChatBridge — durable outbound frame ordering", () => {
       assert.equal(attempts, 2);
       ws2.close();
       await waitClose(ws2);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("a reconnect can advance past a failed sequence after the old bridge detaches", async () => {
+    let attempts = 0;
+    const portRef = { value: 0 };
+    const rig = await startRig({
+      resolve: async () => ({ host: "127.0.0.1", port: portRef.value, containerId: 82 }),
+      persistOutboundFrame: async () => {
+        attempts++;
+        if (attempts === 1) throw new Error("db unavailable");
+      },
+    });
+    portRef.value = rig.containerPort;
+    const frame = (frameSeq: number): string => JSON.stringify({
+      type: "outbound.message",
+      sessionKey: "agent:main:webchat:dm:sess-reconnect-advance",
+      frameSeq,
+      peer: { id: "sess-reconnect-advance", kind: "dm" },
+      clientMessageId: "cm-reconnect-advance",
+      blocks: [{ kind: "text", text: `frame ${frameSeq}` }],
+    });
+    try {
+      const firstContainerOpen = waitNextContainerSocket(rig);
+      const ws1 = openClient(rig.gatewayPort, await makeJwt("706"));
+      await new Promise<void>((resolve) => ws1.once("open", resolve));
+      const firstContainer = await firstContainerOpen;
+      const firstClose = waitClose(ws1);
+      firstContainer.send(frame(9));
+      assert.equal((await firstClose).code, CLOSE_BRIDGE.INTERNAL);
+      await new Promise<void>((resolve) => setTimeout(resolve, 25));
+
+      const secondContainerOpen = waitNextContainerSocket(rig);
+      const ws2 = openClient(rig.gatewayPort, await makeJwt("706"));
+      await new Promise<void>((resolve) => ws2.once("open", resolve));
+      const secondContainer = await secondContainerOpen;
+      const frames = frameCollector(ws2);
+      secondContainer.send(frame(10));
+      const visible = await nextBusinessFrame(frames);
+      assert.equal(visible.frameSeq, 10);
+      assert.equal(attempts, 2);
+      ws2.close();
+      await waitClose(ws2);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("hello counts an attached tab before its first outbound frame", async () => {
+    let attempts = 0;
+    const sessionId = "sess-hello-consumer";
+    const sessionKey = `agent:main:webchat:dm:${sessionId}`;
+    const portRef = { value: 0 };
+    const rig = await startRig({
+      resolve: async () => ({ host: "127.0.0.1", port: portRef.value, containerId: 83 }),
+      persistOutboundFrame: async (input) => {
+        attempts++;
+        if (input.frameSeq === 9) throw new Error("db unavailable");
+      },
+    });
+    portRef.value = rig.containerPort;
+    const hello = JSON.stringify({
+      type: "inbound.hello",
+      peers: [{ peerId: sessionId, agentId: "main", lastFrameSeq: 0 }],
+    });
+    const frame = (frameSeq: number): string => JSON.stringify({
+      type: "outbound.message",
+      sessionKey,
+      frameSeq,
+      peer: { id: sessionId, kind: "dm" },
+      clientMessageId: "cm-hello-consumer",
+      blocks: [{ kind: "text", text: `frame ${frameSeq}` }],
+    });
+    try {
+      const firstContainerOpen = waitNextContainerSocket(rig);
+      const ws1 = openClient(rig.gatewayPort, await makeJwt("707"));
+      await new Promise<void>((resolve) => ws1.once("open", resolve));
+      const firstContainer = await firstContainerOpen;
+
+      const secondContainerOpen = waitNextContainerSocket(rig);
+      const ws2 = openClient(rig.gatewayPort, await makeJwt("707"));
+      await new Promise<void>((resolve) => ws2.once("open", resolve));
+      const secondContainer = await secondContainerOpen;
+
+      ws1.send(hello);
+      ws2.send(hello);
+      await waitFor(() => rig.containerSeen.filter(({ data }) => data.toString() === hello).length === 2);
+
+      const firstClose = waitClose(ws1);
+      firstContainer.send(frame(9));
+      assert.equal((await firstClose).code, CLOSE_BRIDGE.INTERNAL);
+      assert.equal(attempts, 1);
+
+      const secondClose = waitClose(ws2);
+      secondContainer.send(frame(10));
+      assert.equal((await secondClose).code, CLOSE_BRIDGE.INTERNAL);
+      assert.equal(attempts, 1, "the later frame must stay blocked while tab two remains attached");
+      await new Promise<void>((resolve) => setTimeout(resolve, 25));
+
+      const thirdContainerOpen = waitNextContainerSocket(rig);
+      const ws3 = openClient(rig.gatewayPort, await makeJwt("707"));
+      await new Promise<void>((resolve) => ws3.once("open", resolve));
+      const thirdContainer = await thirdContainerOpen;
+      const frames = frameCollector(ws3);
+      ws3.send(hello);
+      thirdContainer.send(frame(10));
+      const visible = await nextBusinessFrame(frames);
+      assert.equal(visible.frameSeq, 10);
+      assert.equal(attempts, 2);
+      ws3.close();
+      await waitClose(ws3);
     } finally {
       await stopRig(rig);
     }

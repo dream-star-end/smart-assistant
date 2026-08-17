@@ -1447,6 +1447,7 @@ export function App() {
     return {
       startedAt: activeSess._turnStartedAt ?? null,
       lastFrameAt: activeSess._lastFrameAt,
+      progressHint: activeSess._turnProgressHint,
       turnStatus: activeSess._turnStatus ?? null,
       recoveryStatus: activeSess._recoveryStatus ?? null,
       coldStart: !!activeSess._isFirstTurnAfterReady,

@@ -3766,6 +3766,210 @@ describe("durable live turn frame journal", () => {
     assert.equal(projected.tapeProjectionVersion, 1);
   });
 
+  maybe("keeps one legacy stream durable when later messages change client identity", async () => {
+    const sessionId = "s-live-frame-legacy-message-shift";
+    const userId = "c:909";
+    const sessionKey = `agent:main:webchat:dm:${sessionId}`;
+    const agentContainerId = 450;
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const persist = async (frameSeq: number, clientMessageId: string | null): Promise<void> => {
+      await persistGatewayLiveFrame(pool, {
+        uid: 909n,
+        sessionId,
+        clientMessageId,
+        agentContainerId,
+        sessionKey,
+        frameSeq,
+        payload: JSON.stringify({
+          type: "outbound.message",
+          sessionKey,
+          frameSeq,
+          peer: { id: sessionId, kind: "dm" },
+          ...(clientMessageId === null ? {} : { clientMessageId }),
+          blocks: [{ kind: "text", text: `legacy frame ${frameSeq}` }],
+        }),
+      });
+    };
+
+    await persist(1, null);
+    await persist(2, "ask-ans-legacy-shift");
+    await persist(3, "m-legacy-shift-later");
+
+    const streams = await pool.query<{
+      stream_key: string;
+      client_message_id: string | null;
+      dispatch_id: string | null;
+      attempt_no: number | null;
+    }>(
+      `SELECT stream_key,client_message_id,dispatch_id::text,attempt_no
+         FROM client_session_live_streams
+        WHERE session_id=$1 AND user_id=$2`,
+      [sessionId, userId],
+    );
+    assert.deepEqual(streams.rows, [{
+      stream_key: `legacy:${agentContainerId}:${sessionKey}`,
+      client_message_id: "m-legacy-shift-later",
+      dispatch_id: null,
+      attempt_no: null,
+    }]);
+    const page = await readClientSessionLiveFrames(pool, sessionId, userId, 0, 10);
+    assert.ok(page);
+    assert.deepEqual(page.frames.map((frame) => (frame.payload as { frameSeq: number }).frameSeq), [1, 2, 3]);
+    assert.deepEqual(page.streamClientMessageIds, ["m-legacy-shift-later"]);
+  });
+
+  maybe("legacy relaxation preserves every strict stream identity guard independently", async () => {
+    // session_id remains strict on a legacy-key collision.
+    const sessionKey = "agent:main:webchat:dm:s-live-guard-shared";
+    await backend.upsertClientSession(mkSession({ id: "s-live-guard-session-a", userId: "c:930" }));
+    await backend.upsertClientSession(mkSession({ id: "s-live-guard-session-b", userId: "c:930" }));
+    const legacyBase = {
+      uid: 930n,
+      sessionId: "s-live-guard-session-a",
+      clientMessageId: null,
+      agentContainerId: 530,
+      sessionKey,
+      frameSeq: 1,
+      payload: JSON.stringify({ type: "outbound.message", sessionKey, frameSeq: 1 }),
+    };
+    await persistGatewayLiveFrame(pool, legacyBase);
+    await assert.rejects(
+      persistGatewayLiveFrame(pool, {
+        ...legacyBase,
+        sessionId: "s-live-guard-session-b",
+        frameSeq: 2,
+        payload: JSON.stringify({ type: "outbound.message", sessionKey, frameSeq: 2 }),
+      }),
+      /live frame stream identity conflict/,
+      "session_id drift must remain rejected",
+    );
+
+    // user_id remains strict even though the session FK itself is shared.
+    const userSessionId = "s-live-guard-user";
+    const userSessionKey = `agent:main:webchat:dm:${userSessionId}`;
+    await backend.upsertClientSession(mkSession({ id: userSessionId, userId: "c:931" }));
+    const userBase = {
+      uid: 931n,
+      sessionId: userSessionId,
+      clientMessageId: null,
+      agentContainerId: 531,
+      sessionKey: userSessionKey,
+      frameSeq: 1,
+      payload: JSON.stringify({ type: "outbound.message", sessionKey: userSessionKey, frameSeq: 1 }),
+    };
+    await persistGatewayLiveFrame(pool, userBase);
+    await assert.rejects(
+      persistGatewayLiveFrame(pool, {
+        ...userBase,
+        uid: 932n,
+        frameSeq: 2,
+        payload: JSON.stringify({ type: "outbound.message", sessionKey: userSessionKey, frameSeq: 2 }),
+      }),
+      /live frame stream identity conflict/,
+      "user_id drift must remain rejected",
+    );
+
+    // source remains strict on an otherwise identical legacy row.
+    const sourceSessionId = "s-live-guard-source";
+    const sourceUserId = "c:933";
+    const sourceSessionKey = `agent:main:webchat:dm:${sourceSessionId}`;
+    const sourceContainerId = 532;
+    await backend.upsertClientSession(mkSession({ id: sourceSessionId, userId: sourceUserId }));
+    await pool.query(
+      `INSERT INTO client_session_live_streams
+         (stream_key,session_id,user_id,client_message_id,dispatch_id,attempt_no,
+          agent_container_id,source,projection_source,import_sha256)
+       VALUES ($1,$2,$3,NULL,NULL,NULL,$4,'rollout_import','live',$5)`,
+      [
+        `legacy:${sourceContainerId}:${sourceSessionKey}`,
+        sourceSessionId,
+        sourceUserId,
+        sourceContainerId,
+        "9".repeat(64),
+      ],
+    );
+    await assert.rejects(
+      persistGatewayLiveFrame(pool, {
+        uid: 933n,
+        sessionId: sourceSessionId,
+        clientMessageId: null,
+        agentContainerId: sourceContainerId,
+        sessionKey: sourceSessionKey,
+        frameSeq: 1,
+        payload: JSON.stringify({ type: "outbound.message", sessionKey: sourceSessionKey, frameSeq: 1 }),
+      }),
+      /live frame stream identity conflict/,
+      "source drift must remain rejected",
+    );
+
+    // Dispatch-backed streams keep exact client-message, dispatch, attempt and
+    // container identity. Seed one independently mismatched dimension per row.
+    const dispatchCases: Array<{
+      label: string;
+      uid: number;
+      storedClientMessageId?: string;
+      storedDispatchId?: string;
+      storedAttemptNo?: number;
+      storedContainerId?: number;
+    }> = [
+      { label: "client_message_id", uid: 934, storedClientMessageId: "cm-other" },
+      { label: "dispatch_id", uid: 935, storedDispatchId: randomUUID() },
+      { label: "attempt_no", uid: 936, storedAttemptNo: 2 },
+      { label: "agent_container_id", uid: 937, storedContainerId: 999 },
+    ];
+    for (const identityCase of dispatchCases) {
+      const dispatchId = randomUUID();
+      const caseSessionId = `s-live-guard-dispatch-${identityCase.label}`;
+      const caseUserId = `c:${identityCase.uid}`;
+      const clientMessageId = `cm-${identityCase.label}`;
+      const caseSessionKey = `agent:main:webchat:dm:${caseSessionId}`;
+      const agentContainerId = 600 + identityCase.uid;
+      await backend.upsertClientSession(mkSession({ id: caseSessionId, userId: caseUserId }));
+      await pool.query(
+        `INSERT INTO turn_dispatches
+           (dispatch_id,user_id,session_id,client_message_id,agent_id,request_hash,
+            billing_request_id,status,owner_id,lease_until)
+         VALUES ($1,$2,$3,$4,'main',$5,$6,'accepted','test-owner',NOW()+INTERVAL '1 minute')`,
+        [
+          dispatchId,
+          identityCase.uid,
+          caseSessionId,
+          clientMessageId,
+          "d".repeat(64),
+          `billing-${dispatchId}`,
+        ],
+      );
+      await pool.query(
+        `INSERT INTO client_session_live_streams
+           (stream_key,session_id,user_id,client_message_id,dispatch_id,attempt_no,
+            agent_container_id,source,projection_source)
+         VALUES ($1,$2,$3,$4,$5::uuid,$6,$7,'gateway','live')`,
+        [
+          `dispatch:${dispatchId}:1`,
+          caseSessionId,
+          caseUserId,
+          identityCase.storedClientMessageId ?? clientMessageId,
+          identityCase.storedDispatchId ?? dispatchId,
+          identityCase.storedAttemptNo ?? 1,
+          identityCase.storedContainerId ?? agentContainerId,
+        ],
+      );
+      await assert.rejects(
+        persistGatewayLiveFrame(pool, {
+          uid: BigInt(identityCase.uid),
+          sessionId: caseSessionId,
+          clientMessageId,
+          agentContainerId,
+          sessionKey: caseSessionKey,
+          frameSeq: 1,
+          payload: JSON.stringify({ type: "outbound.message", sessionKey: caseSessionKey, frameSeq: 1 }),
+        }),
+        /live frame stream identity conflict/,
+        `${identityCase.label} drift must remain rejected`,
+      );
+    }
+  });
+
   maybe("interrupted tape finalize also projects an existing live stream to tape", async () => {
     const sessionId = "s-live-frame-interrupted-projection";
     const userId = "c:904";

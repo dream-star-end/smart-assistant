@@ -1945,6 +1945,11 @@ const CLIENT_PUT_ALLOWED_FIELDS: ReadonlySet<string> = new Set<string>([
   // _teamRun 有意保留:它只是客户端消息上的 opaque 展示元数据(legacy packages/web
   // 仍写入),与已删除的服务端 team_run 子系统无关,server 不解释。
   '_media', '_modelText', '_teamRun',
+  // Detached ask_user permission cards (server-authored; must survive client PUT).
+  'requestId', 'inputPreview', 'inputJson',
+  '_resolved', '_behavior', '_settledReason', '_answers', '_detachedAskUser',
+  '_askUserSessionKey', '_askUserExpiresAt', '_askUserUserId',
+  '_askUserChannel', '_askUserPeer',
 ])
 
 const CLIENT_PUT_ALLOWED_STATUSES: ReadonlySet<string> = new Set<string>([
@@ -3292,7 +3297,7 @@ async function _sqliteAppendServerAuthoredMessage(
      *  但 `mergePreservingServerAuthored` 对它做 **local-wins**(与 assistant/
      *  thinking/tool 的 server-wins 相反)—— 本地 `m-*` 富行(带 childBlocks 子树)
      *  存在时丢弃 server `srv-*` 行,禁止 server 行吞掉子树(2c73030d 回归)。 */
-    role: 'assistant' | 'user' | 'system' | 'thinking' | 'tool' | 'agent-group'
+    role: 'assistant' | 'user' | 'system' | 'thinking' | 'tool' | 'agent-group' | 'permission'
     text?: string
     ts?: number
     [k: string]: unknown
@@ -3842,7 +3847,7 @@ export interface QueuedMessage {
   userId: string
   message: {
     id: string
-    role: 'assistant' | 'user' | 'system' | 'thinking' | 'tool'
+    role: 'assistant' | 'user' | 'system' | 'thinking' | 'tool' | 'permission'
     text?: string
     ts?: number
     status?: 'completed' | 'interrupted' | 'crashed'
@@ -3920,7 +3925,7 @@ export async function appendServerAuthoredMessageDurable(
   userId: string,
   message: {
     id: string
-    role: 'assistant' | 'user' | 'system' | 'thinking' | 'tool'
+    role: 'assistant' | 'user' | 'system' | 'thinking' | 'tool' | 'permission'
     text?: string
     ts?: number
     [k: string]: unknown
@@ -5006,11 +5011,55 @@ async function _sqliteClaimSession(sessionId: string, userId: string): Promise<b
  * _sqlite* 组合)。既是默认 backend,又是 {@link ClientSessionsBackend} 契约的**派生源**:
  * PG backend 必须结构化覆盖本对象的每个方法(漏一个 = 编译错)。
  */
+export type PatchServerAuthoredResult =
+  | { applied: true }
+  | { applied: false; reason: 'session_not_found' | 'session_deleted' | 'not_found' }
+
+async function _sqlitePatchServerAuthoredMessage(
+  sessId: string,
+  userId: string,
+  msgId: string,
+  patch: Record<string, unknown>,
+): Promise<PatchServerAuthoredResult> {
+  const db = await getSessionsDb()
+  const txn = db.transaction((): PatchServerAuthoredResult => {
+    const row = db.prepare(
+      'SELECT messages, next_seq, deleted_at FROM client_sessions WHERE id = ? AND user_id = ?',
+    ).get(sessId, userId) as {
+      messages: string
+      next_seq: number | null
+      deleted_at: number | null
+    } | undefined
+    if (!row) return { applied: false, reason: 'session_not_found' }
+    if (row.deleted_at !== null) return { applied: false, reason: 'session_deleted' }
+    let msgs: MessageLike[]
+    try {
+      const parsed = JSON.parse(row.messages)
+      if (!Array.isArray(parsed)) return { applied: false, reason: 'not_found' }
+      msgs = parsed as MessageLike[]
+    } catch {
+      return { applied: false, reason: 'not_found' }
+    }
+    const idx = msgs.findIndex((m) => m && m.id === msgId)
+    if (idx < 0) return { applied: false, reason: 'not_found' }
+    const nextSeq = typeof row.next_seq === 'number' && row.next_seq > 0 ? row.next_seq : 1
+    msgs[idx] = { ...msgs[idx], ...patch, id: msgId, _source: 'server', _seq: nextSeq }
+    const now = Date.now()
+    const update = db.prepare(
+      'UPDATE client_sessions SET messages = ?, updated_at = MAX(updated_at + 1, ?), next_seq = ?, history_revision = history_revision + 1 WHERE id = ? AND user_id = ? AND deleted_at IS NULL',
+    ).run(JSON.stringify(msgs), now, nextSeq + 1, sessId, userId)
+    if (update.changes !== 1) return { applied: false, reason: 'session_deleted' }
+    return { applied: true }
+  })
+  return txn()
+}
+
 const sqliteBackend = {
   // ── client_sessions 读写 + 归档 + usage 聚合 ──
   probeSessionsDb: _sqliteProbeSessionsDb,
   upsertClientSession: _sqliteUpsertClientSession,
   appendServerAuthoredMessage: _sqliteAppendServerAuthoredMessage,
+  patchServerAuthoredMessage: _sqlitePatchServerAuthoredMessage,
   appendServerAuthoredMessageForRequest: _sqliteAppendServerAuthoredMessageForRequest,
   appendServerAuthoredMessageDrainByUser: _sqliteAppendServerAuthoredMessageDrainByUser,
   appendCostCredits: _sqliteAppendCostCredits,
@@ -5094,6 +5143,9 @@ export const upsertClientSession: ClientSessionsBackend['upsertClientSession'] =
 
 export const appendServerAuthoredMessage: ClientSessionsBackend['appendServerAuthoredMessage'] =
   (...args) => getActiveBackend().appendServerAuthoredMessage(...args)
+
+export const patchServerAuthoredMessage: ClientSessionsBackend['patchServerAuthoredMessage'] =
+  (...args) => getActiveBackend().patchServerAuthoredMessage(...args)
 
 export const appendServerAuthoredMessageForRequest: ClientSessionsBackend['appendServerAuthoredMessageForRequest'] =
   (...args) => getActiveBackend().appendServerAuthoredMessageForRequest(...args)

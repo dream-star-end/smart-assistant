@@ -125,6 +125,17 @@ function acceptFrameSeq(sess: ChatSession, frame: { frameSeq?: number; sessionKe
   return true;
 }
 
+/** Advance the cursor when seq is newer; never reject. Permission prompts are
+ *  idempotent by requestId and must survive stream reordering; other frame
+ *  types keep acceptFrameSeq's drop-on-regression semantics. */
+function noteFrameSeqIfNewer(sess: ChatSession, frame: { frameSeq?: number; sessionKey?: string }): void {
+  const fs = frame.frameSeq;
+  if (!(typeof fs === "number" && fs > 0)) return;
+  const key = frameSeqKey(frame, sess.id);
+  const last = getFrameSeqCursor(sess._lastFrameSeqByKey, sess._lastFrameSeq, key);
+  if (fs > last) setFrameSeqCursor(sess, key, fs);
+}
+
 /** 公开给 resume_failed：把游标推到 server currentLast（§4）。
  *  只进不退:重启后的空 ring/陈旧信号可能带 to=0 或倒退值,回退游标会让后续
  *  重放帧被当新帧重复应用/让本地状态被无谓重置(纵深防御,主修在 bridge 侧)。*/
@@ -2042,8 +2053,16 @@ export function applyTurnStatus(sess: ChatSession, frame: OutboundTurnStatusWire
       max: AUTOMATIC_TURN_RETRY_MAX,
       retryAt: frame.retry.retryAt,
     };
+  } else if (frame.status === "working") {
+    // Do not set a phase that hides silenceMs. Compact/retry stay as they
+    // are; Cursor-only working ticks only refresh liveness + optional hint.
+    // Old clients that ignore this status fall through to the else branch
+    // and still call markFrameReceived above.
+    const detail = typeof frame.detail === "string" ? frame.detail.trim() : "";
+    if (detail) sess._turnProgressHint = detail;
   } else {
     sess._turnStatus = null;
+    sess._turnProgressHint = undefined;
   }
 }
 
@@ -2368,29 +2387,83 @@ export function applyCostWaived(sess: ChatSession | null, frame: CostWaivedWire,
 }
 
 // ═══════════════ permission_request / settled（§3 去重）═══════════════
+function applyPermissionSettlementToCard(
+  msg: ChatMessage,
+  settlement: {
+    behavior: "allow" | "deny";
+    reason?: string | null;
+    answers?: Record<string, string>;
+  },
+): void {
+  msg._resolved = true;
+  msg._behavior = settlement.behavior;
+  msg._settledReason = settlement.reason || null;
+  if (settlement.answers && typeof settlement.answers === "object") msg._answers = settlement.answers;
+}
+
+function consumePendingPermissionSettlement(sess: ChatSession, msg: ChatMessage): void {
+  const requestId = msg.requestId;
+  if (!requestId || !sess._pendingPermissionSettlements) return;
+  const pending = sess._pendingPermissionSettlements[requestId];
+  if (!pending) return;
+  applyPermissionSettlementToCard(msg, pending);
+  delete sess._pendingPermissionSettlements[requestId];
+}
+
 export function applyPermissionRequest(sess: ChatSession, frame: OutboundPermissionRequestWire): ChatMessage | null {
-  if (!acceptFrameSeq(sess, frame)) return null;
-  return addMessage(sess, "permission", frame.toolName, {
-    requestId: frame.requestId,
+  noteFrameSeqIfNewer(sess, frame);
+  const requestId = frame.requestId;
+  const existing = sess.messages.find(
+    (m) =>
+      m.role === "permission" &&
+      !isImmutableTapeViewportRow(m) &&
+      (m.requestId === requestId || m.id === requestId),
+  );
+  if (existing) {
+    consumePendingPermissionSettlement(sess, existing);
+    return existing;
+  }
+  const detachedAskUser =
+    (frame as { detachedAskUser?: unknown }).detachedAskUser === true ||
+    (typeof requestId === "string" && requestId.startsWith("ask-user:"));
+  const expiresAt = (frame as { expiresAt?: unknown }).expiresAt;
+  const card = addMessage(sess, "permission", frame.toolName, {
+    // Detached ask_user cards share this id with the server tape row so
+    // full-sync / another device merges by id instead of duplicating.
+    ...(typeof requestId === "string" && requestId.startsWith("ask-user:")
+      ? { id: requestId }
+      : {}),
+    requestId,
     toolName: frame.toolName,
     inputPreview: frame.inputPreview || "",
     inputJson: frame.inputJson || null,
     _resolved: false,
+    ...(detachedAskUser ? { _detachedAskUser: true } : {}),
+    ...(typeof expiresAt === "number" ? { _askUserExpiresAt: expiresAt } : {}),
     ...((frame.clientMessageId ?? sess._activeClientMessageId)
       ? { _turnOwnerId: frame.clientMessageId ?? sess._activeClientMessageId }
       : {}),
   });
+  consumePendingPermissionSettlement(sess, card);
+  return card;
 }
 
 export function applyPermissionSettled(sess: ChatSession, frame: OutboundPermissionSettledWire): void {
-  if (!acceptFrameSeq(sess, frame)) return;
+  noteFrameSeqIfNewer(sess, frame);
+  const requestId = frame.requestId;
   const msg = sess.messages.find((m) =>
-    m.requestId === frame.requestId && !isImmutableTapeViewportRow(m));
-  if (!msg) return;
-  msg._resolved = true;
-  msg._behavior = frame.behavior;
-  msg._settledReason = frame.reason || null;
-  if (frame.answers && typeof frame.answers === "object") msg._answers = frame.answers;
+    (m.requestId === requestId || m.id === requestId) && !isImmutableTapeViewportRow(m));
+  const settlement = {
+    behavior: frame.behavior,
+    reason: frame.reason || null,
+    ...(frame.answers && typeof frame.answers === "object" ? { answers: frame.answers } : {}),
+  };
+  if (!msg) {
+    sess._pendingPermissionSettlements = sess._pendingPermissionSettlements ?? {};
+    sess._pendingPermissionSettlements[requestId] = settlement;
+    return;
+  }
+  applyPermissionSettlementToCard(msg, settlement);
 }
 
 export { AUTO_CONTINUE_PROMPT };

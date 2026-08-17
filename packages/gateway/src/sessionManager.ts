@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { rename, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -29,7 +29,7 @@ import {
 import './engine/ccbAdapter.js'
 import './engine/codexAdapter.js'
 import './engine/grokAdapter.js'
-import './engine/cursorAdapter.js'
+import { cursorResumeStoreExists } from './engine/cursorAdapter.js'
 import type {
   AutomaticRetryState,
   CollabAgentPolicy,
@@ -570,6 +570,13 @@ export interface AgentSession {
    * session's value so the whole task tree shares one isolated directory. */
   workspaceMode: SessionWorkspaceMode
   /**
+   * Exact cwd handed to the engine adapter as `agentBaseDir` (pinned
+   * `agent.cwd`, or `resolveDefaultWorkspaceCwd`). Cursor chat-store hashes
+   * are keyed by this path after the repo-snapshot overlay and realpath, so
+   * stale-resume detection must read it back instead of recomputing.
+   */
+  workspaceCwd: string
+  /**
    * 直接父会话键。仅 delegate 子会话在创建时物化(handleDelegateTask 传入已校验的
    * 直接父 sessionKey);webchat 根会话为 undefined。用于委派进度**沿父链向上追溯**到
    * 最近的 webchat 祖先(resolveDelegateProgressRouting)——把二级+嵌套委派的进度路由
@@ -706,8 +713,9 @@ export interface AgentSession {
    *  user switches away and later returns to GPT, while avoiding a repeated
    *  full transcript on ordinary same-provider follow-ups. */
   _historicalContextInjectedKey?: string
-  /** User-visible rebuild notices are exceptional. Stateless replay is the
-   * normal Cursor transport and must not set this reason. */
+  /** User-visible rebuild notices are exceptional. Cursor uses native-resume;
+   * set this for an engine switch or a lost native id so the fallback replay
+   * can announce a rebuild. Do not set it on a successful native resume. */
   _contextRebuildNotice?: 'engine-switch' | 'native-resume-loss'
   /** Platform-executed exchanges not yet observed in master history. A
    * transient master-sink failure can durably queue the assistant row while
@@ -2522,7 +2530,7 @@ export class SessionManager {
    *  entry so the next spawn starts a fresh session silently — UI history
    *  stays visible (it lives in the DB), but CCB has no memory of previous
    *  turns (unavoidable when the JSONL is gone). */
-  private _resumeIdFor(sessionKey: string, wantProvider: string): string | undefined {
+  private _resumeIdFor(sessionKey: string, wantProvider: string, workspacePath?: string): string | undefined {
     const id = this._resumeMap.get(sessionKey)
     if (!id) return undefined
     const tag = SessionManager.normalizeEngineTag(this._resumeMapProvider.get(sessionKey))
@@ -2539,7 +2547,39 @@ export class SessionManager {
       this._saveResumeMap()
       return undefined
     }
+    if (tag === 'cursor' && workspacePath && !cursorResumeStoreExists(workspacePath, id)) {
+      log.warn('resume-map entry points to missing Cursor chat store — dropping silently', {
+        sessionKey,
+        resumeId: id,
+      })
+      this._resumeMap.delete(sessionKey)
+      this._resumeMapTimestamps.delete(sessionKey)
+      this._resumeMapProvider.delete(sessionKey)
+      this._resumeMapLastCost.delete(sessionKey)
+      this._saveResumeMap()
+      return undefined
+    }
     return id
+  }
+
+  /** Same cwd projection CursorAdapter.spawnTurn uses: repo workspace when
+   *  ready, otherwise the agent base dir. Wrapper --workspace is pwd -P of
+   *  that cwd, so realpath when the path exists. */
+  private _cursorWorkspacePath(agentBaseDir: string, repoSessionId?: string): string {
+    let cwd = agentBaseDir
+    if (repoSessionId && this._getRepoSnapshot) {
+      const snap = this._getRepoSnapshot(repoSessionId)
+      if (snap?.status === 'ready' && snap.workspaceDir) cwd = snap.workspaceDir
+    }
+    try { return realpathSync(cwd) } catch { return cwd }
+  }
+
+  private _cursorWorkspacePathForSession(session: AgentSession): string | undefined {
+    if (!session.workspaceCwd) return undefined
+    return this._cursorWorkspacePath(
+      session.workspaceCwd,
+      session.repoSessionId ?? session.peerId,
+    )
   }
 
   /** Whether a CCB session's JSONL file exists somewhere under
@@ -2598,6 +2638,7 @@ export class SessionManager {
   private static normalizeEngineTag(tag: string | undefined): string {
     if (tag === 'codex-native' || tag === 'codex') return 'codex'
     if (tag === 'grok') return 'grok'
+    if (tag === 'cursor') return 'cursor'
     return SessionManager.CCB_PROVIDER_TAG
   }
 
@@ -3038,7 +3079,7 @@ export class SessionManager {
       // was wiped (pre-2026-04-22 v3 containers' tmpfs was ephemeral).
       resumeSessionId: opts.hermeticNoTools
         ? undefined
-        : this._resumeIdFor(opts.sessionKey, engineId),
+        : this._resumeIdFor(opts.sessionKey, engineId, this._cursorWorkspacePath(cwd, repoSessionId)),
       effortLevel: initialEffort,
       // Phase 5:repoSessionId 默认等于 peerId;delegate_task 可传父 webchat
       // session id 作为 repo lookup key,但不改变 delegate 自己的 peerId。
@@ -3062,6 +3103,7 @@ export class SessionManager {
       peerId: opts.peerId ?? 'unknown',
       userId: opts.userId,
       workspaceMode,
+      workspaceCwd: cwd,
       repoSessionId,
       title: opts.title ?? 'New conversation',
       // delegate 子会话的直接父指针(webchat/普通会话为 undefined)。物化父链使委派进度
@@ -3608,7 +3650,7 @@ export class SessionManager {
               ))
               .filter((prompt): prompt is string => prompt !== null)
           : []
-      let providerResumeId = this._resumeIdFor(session.sessionKey, session.providerTag)
+      let providerResumeId = this._resumeIdFor(session.sessionKey, session.providerTag, this._cursorWorkspacePathForSession(session))
       const injectionKey = historicalContextInjectionKey({
         messages: effectiveMasterHistoricalMessages,
         peerId: session.peerId,
@@ -3672,9 +3714,7 @@ export class SessionManager {
                 historyMessages,
                 userTextOrBlocks,
                 undefined,
-                session.runner.capabilities.historyMode === 'stateless-replay'
-                  ? session.runner.capabilities.maxPromptBytes
-                  : undefined,
+                session.runner.capabilities.maxPromptBytes,
               )
             : null
           if (historicalPrompt) {
@@ -3709,7 +3749,7 @@ export class SessionManager {
             // successful history lookup. A fresh conversation can have no
             // semantic rows beyond the optimistic current user message, so
             // there is nothing to rebuild or announce. Consume the reason now
-            // instead of leaking it into Cursor's routine next-turn replay.
+            // instead of leaking it into a later turn that has nothing to rebuild.
             //
             // The uncapped classification above remains non-null when eligible
             // history exists but does not fit the provider's byte cap. Keep

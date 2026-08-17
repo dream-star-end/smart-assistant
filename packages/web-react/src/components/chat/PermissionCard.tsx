@@ -41,8 +41,20 @@ const OTHER = "__other__";
  *  （前端改不动 gateway 常量：那是容器内源码面 / runtime release 轴，见 V5_DEV_PLAYBOOK §4.1）。
  *
  *  ⚠️ 只用来决定「是否自动弹框」，绝不用来禁用手动回答入口 —— 万一本地时钟偏差导致误判，
- *  用户仍须能点「回答」把真正在等的 agent 解锁（fail-safe 方向）。 */
+ *  用户仍须能点「回答」把真正在等的 agent 解锁（fail-safe 方向）。
+ *
+ *  Detached Cursor `ask_user` cards (`requestId` 以 `ask-user:` 开头,或
+ *  `_detachedAskUser`) 不受这条 30 分钟启发式约束：它们在网关侧活 24 小时,
+ *  离开再回来仍应自动弹出并可作答。 */
 export const PENDING_PERMISSION_TTL_MS = 30 * 60_000;
+export const DETACHED_ASK_USER_TTL_MS = 24 * 60 * 60_000;
+
+function isDetachedAskUserCard(msg: ChatMessage): boolean {
+  return (
+    msg._detachedAskUser === true ||
+    (typeof msg.requestId === "string" && msg.requestId.startsWith("ask-user:"))
+  );
+}
 
 function asAskUserQuestion(msg: ChatMessage): AqQuestion[] | null {
   if (msg.toolName !== "AskUserQuestion") return null;
@@ -70,14 +82,13 @@ export function PermissionCard({
 
   // 孤儿待决卡的判据（见 PENDING_PERMISSION_TTL_MS 注释）。放在渲染期算：msg.ts 恒定，
   // Date.now() 只在重渲染时前进，跨过阈值会让 effect 再跑一次——那次因 stale=true 不再弹。
+  // Detached ask_user 用 24h TTL：3 小时后换设备回来仍应自动弹出。
+  const ttlMs = isDetachedAskUserCard(msg) ? DETACHED_ASK_USER_TTL_MS : PENDING_PERMISSION_TTL_MS;
   const stale =
-    !resolved && Number.isFinite(msg.ts) && Date.now() - msg.ts > PENDING_PERMISSION_TTL_MS;
+    !resolved && Number.isFinite(msg.ts) && Date.now() - msg.ts > ttlMs;
 
-  // 待审批 → 挂载即自动弹审批框（agent 此刻被阻塞，等用户决策）。
-  // 但「未决」≠「agent 还在等」：permission 卡被刻意排除在服务端 tape 之外（persist.ts §⑦），
-  // 只活在客户端 IndexedDB 里，而解决状态的权威在 gateway 内存（TTL + session 回收）。断线期间
-  // 服务端 force-deny 广播的 settled 帧若没送达（ring 已轮转 / session 已回收），本地就永久留下
-  // 一张未决卡，此后每次挂载都被强行弹开。故超过服务端 TTL 的一律视为孤儿，不再自动弹。
+  // 待审批 → 挂载即自动弹审批框。真实引擎权限卡超过 30min 视为孤儿(服务端已 sweep)。
+  // Detached ask_user 活在 server tape 上、24h 内仍可作答,不按孤儿处理。
   useEffect(() => {
     if (!resolved && !pending && !readOnly && !stale) setOpen(true);
   }, [resolved, pending, readOnly, stale]);

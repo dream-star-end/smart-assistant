@@ -4,9 +4,9 @@
 import { spawn, type ChildProcessByStdio } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
-import { chmodSync, existsSync, lstatSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, closeSync, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { basename, dirname, isAbsolute, resolve } from 'node:path'
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import type { Readable } from 'node:stream'
 import {
   CURSOR_ENGINE_MODELS,
@@ -41,6 +41,515 @@ const CURSOR_CONTEXT_DIR_PREFIX = 'openclaude-cursor-context-'
 const CURSOR_HOTCFG_WRAPPER_BIN = '/run/oc/platform/current/bin/oc-cursor'
 const CURSOR_IMAGE_WRAPPER_BIN = '/usr/local/bin/oc-cursor'
 
+const PENDING_KEEPALIVE_INTERVAL_DEFAULT_MS = 30_000
+const PENDING_KEEPALIVE_INTERVAL_MIN_MS = 5_000
+const PENDING_KEEPALIVE_INTERVAL_MAX_MS = 120_000
+const PENDING_KEEPALIVE_MAX_DEFAULT_MS = 2 * 60 * 60_000
+const PENDING_KEEPALIVE_MAX_MIN_MS = 5 * 60_000
+const PENDING_KEEPALIVE_MAX_MAX_MS = 6 * 60 * 60_000
+const PENDING_KEEPALIVE_STALL_DEFAULT_MS = 10 * 60_000
+const PENDING_KEEPALIVE_STALL_MIN_MS = 2 * 60_000
+const PENDING_KEEPALIVE_STALL_MAX_MS = 60 * 60_000
+const PENDING_KEEPALIVE_MIN_CPU_TICKS_DEFAULT = 2
+const PENDING_KEEPALIVE_MIN_CPU_TICKS_MIN = 1
+const PENDING_KEEPALIVE_MIN_CPU_TICKS_MAX = 50
+const CURSOR_EPHEMERAL_HOME_PREFIX = 'openclaude-cursor.'
+
+export type CursorTranscriptFileStamp = { size: number; mtimeMs: number }
+export type CursorTranscriptFingerprint = { files: Record<string, CursorTranscriptFileStamp> }
+export type CursorPendingKeepaliveProgressSignal = 'transcript' | 'cpu' | 'both' | 'none' | 'init'
+
+export type CursorPendingKeepaliveTestHooks = {
+  now?: () => number
+  intervalMs?: number
+  maxMs?: number
+  stallMs?: number
+  minCpuDeltaTicks?: number
+  /** Injected probes skip /proc and the filesystem. Production never sets these. */
+  readTranscriptFingerprint?: (rootPid: number) => CursorTranscriptFingerprint | null
+  readCpuTicks?: (rootPid: number) => number | null
+}
+
+let pendingKeepaliveTestHooks: CursorPendingKeepaliveTestHooks | null = null
+
+function parseClampedPositiveMs(
+  raw: string | undefined,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  const n = Number(raw)
+  if (!Number.isFinite(n) || n <= 0) return fallback
+  return Math.min(max, Math.max(min, Math.floor(n)))
+}
+
+function parsePendingKeepaliveIntervalMs(
+  raw = process.env.OPENCLAUDE_CURSOR_PENDING_KEEPALIVE_INTERVAL_MS,
+): number {
+  return parseClampedPositiveMs(
+    raw,
+    PENDING_KEEPALIVE_INTERVAL_DEFAULT_MS,
+    PENDING_KEEPALIVE_INTERVAL_MIN_MS,
+    PENDING_KEEPALIVE_INTERVAL_MAX_MS,
+  )
+}
+
+function parsePendingKeepaliveMaxMs(
+  raw = process.env.OPENCLAUDE_CURSOR_PENDING_KEEPALIVE_MAX_MS,
+): number {
+  return parseClampedPositiveMs(
+    raw,
+    PENDING_KEEPALIVE_MAX_DEFAULT_MS,
+    PENDING_KEEPALIVE_MAX_MIN_MS,
+    PENDING_KEEPALIVE_MAX_MAX_MS,
+  )
+}
+
+function parsePendingKeepaliveStallMs(
+  raw = process.env.OPENCLAUDE_CURSOR_PENDING_STALL_MS,
+): number {
+  return parseClampedPositiveMs(
+    raw,
+    PENDING_KEEPALIVE_STALL_DEFAULT_MS,
+    PENDING_KEEPALIVE_STALL_MIN_MS,
+    PENDING_KEEPALIVE_STALL_MAX_MS,
+  )
+}
+
+function parsePendingKeepaliveMinCpuTicks(
+  raw = process.env.OPENCLAUDE_CURSOR_PENDING_KEEPALIVE_MIN_CPU_TICKS,
+): number {
+  return parseClampedPositiveMs(
+    raw,
+    PENDING_KEEPALIVE_MIN_CPU_TICKS_DEFAULT,
+    PENDING_KEEPALIVE_MIN_CPU_TICKS_MIN,
+    PENDING_KEEPALIVE_MIN_CPU_TICKS_MAX,
+  )
+}
+
+function resolvedPendingKeepaliveIntervalMs(): number {
+  return pendingKeepaliveTestHooks?.intervalMs ?? parsePendingKeepaliveIntervalMs()
+}
+
+function resolvedPendingKeepaliveMaxMs(): number {
+  return pendingKeepaliveTestHooks?.maxMs ?? parsePendingKeepaliveMaxMs()
+}
+
+function resolvedPendingKeepaliveStallMs(): number {
+  return pendingKeepaliveTestHooks?.stallMs ?? parsePendingKeepaliveStallMs()
+}
+
+function resolvedPendingKeepaliveMinCpuTicks(): number {
+  return pendingKeepaliveTestHooks?.minCpuDeltaTicks ?? parsePendingKeepaliveMinCpuTicks()
+}
+
+function keepaliveNow(): number {
+  return pendingKeepaliveTestHooks?.now?.() ?? Date.now()
+}
+
+function isPidAlive(pid: number | undefined): boolean {
+  if (typeof pid !== 'number' || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+
+type ProcStatEntry = { pid: number; ppid: number; ticks: number }
+
+/** Parse /proc/<pid>/stat. Fields 14-17 are utime+stime+cutime+cstime (clock ticks). */
+function parseProcStat(raw: string, fallbackPid: number): ProcStatEntry | null {
+  const close = raw.lastIndexOf(')')
+  if (close < 0) return null
+  const pid = Number(raw.slice(0, raw.indexOf(' ')).trim())
+  const rest = raw.slice(close + 2).trim().split(/\s+/)
+  const ppid = Number(rest[1])
+  const utime = Number(rest[11])
+  const stime = Number(rest[12])
+  const cutime = Number(rest[13])
+  const cstime = Number(rest[14])
+  if (![pid, ppid, utime, stime, cutime, cstime].every(Number.isFinite)) return null
+  return {
+    pid: pid > 0 ? pid : fallbackPid,
+    ppid,
+    ticks: utime + stime + cutime + cstime,
+  }
+}
+
+function readProcStatEntry(pid: number): ProcStatEntry | null {
+  try {
+    return parseProcStat(readFileSync(`/proc/${pid}/stat`, 'utf8'), pid)
+  } catch {
+    return null
+  }
+}
+
+function readAllProcStats(): Map<number, ProcStatEntry> {
+  const out = new Map<number, ProcStatEntry>()
+  let names: string[]
+  try {
+    names = readdirSync('/proc')
+  } catch {
+    return out
+  }
+  for (const name of names) {
+    if (!/^[0-9]+$/.test(name)) continue
+    const pid = Number(name)
+    const entry = readProcStatEntry(pid)
+    if (entry) out.set(entry.pid, entry)
+  }
+  return out
+}
+
+/**
+ * Sum CPU ticks for `rootPid` and every descendant via ppid (not pgid).
+ * oc-cursor `setsid` puts the CLI in a different process group, so a pgid
+ * sum would miss the actual agent tree. cutime+cstime covers reaped children
+ * without double-counting live ones. Failures return null.
+ */
+function readProcTreeCpuTicks(rootPid: number): number | null {
+  try {
+    if (!Number.isFinite(rootPid) || rootPid <= 0) return null
+    const stats = readAllProcStats()
+    if (!stats.has(rootPid)) return null
+    const children = new Map<number, number[]>()
+    for (const entry of stats.values()) {
+      const list = children.get(entry.ppid)
+      if (list) list.push(entry.pid)
+      else children.set(entry.ppid, [entry.pid])
+    }
+    let sum = 0
+    const stack = [rootPid]
+    const seen = new Set<number>()
+    while (stack.length > 0) {
+      const pid = stack.pop()!
+      if (seen.has(pid)) continue
+      seen.add(pid)
+      const entry = stats.get(pid)
+      if (!entry) continue
+      sum += entry.ticks
+      const kids = children.get(pid)
+      if (kids) {
+        for (const child of kids) stack.push(child)
+      }
+    }
+    return sum
+  } catch {
+    return null
+  }
+}
+
+function readKeepaliveCpuTicks(rootPid: number): number | null {
+  try {
+    if (pendingKeepaliveTestHooks?.readCpuTicks) {
+      return pendingKeepaliveTestHooks.readCpuTicks(rootPid)
+    }
+    return readProcTreeCpuTicks(rootPid)
+  } catch {
+    return null
+  }
+}
+
+function readProcEnvironValue(pid: number, key: string): string | undefined {
+  try {
+    const raw = readFileSync(`/proc/${pid}/environ`)
+    const prefix = `${key}=`
+    const text = Buffer.isBuffer(raw) ? raw.toString('utf8') : String(raw)
+    for (const part of text.split('\0')) {
+      if (part.startsWith(prefix)) return part.slice(prefix.length)
+    }
+  } catch {
+    /* descendant may have exited */
+  }
+  return undefined
+}
+
+function collectDescendantPids(rootPid: number): number[] {
+  const stats = readAllProcStats()
+  const children = new Map<number, number[]>()
+  for (const entry of stats.values()) {
+    const list = children.get(entry.ppid)
+    if (list) list.push(entry.pid)
+    else children.set(entry.ppid, [entry.pid])
+  }
+  const out: number[] = []
+  const stack = [rootPid]
+  const seen = new Set<number>()
+  while (stack.length > 0) {
+    const pid = stack.pop()!
+    if (seen.has(pid)) continue
+    seen.add(pid)
+    out.push(pid)
+    const kids = children.get(pid)
+    if (kids) {
+      for (const child of kids) stack.push(child)
+    }
+  }
+  return out
+}
+
+function isSafeEphemeralCursorPath(resolved: string): boolean {
+  const parts = resolved.split('/')
+  // Wrapper hardcodes /tmp/openclaude-cursor.XXXXXXXX
+  return parts.length >= 3 && parts[1] === 'tmp' && parts[2].startsWith(CURSOR_EPHEMERAL_HOME_PREFIX)
+}
+
+function isUsableTranscriptsDir(dir: string): boolean {
+  if (!isAbsolute(dir)) return false
+  try {
+    const info = lstatSync(dir)
+    if (info.isSymbolicLink() || !info.isDirectory()) return false
+    const resolved = realpathSync(dir)
+    if (!isSafeEphemeralCursorPath(resolved)) return false
+    if (!resolved.split('/').includes('agent-transcripts')) return false
+    return true
+  } catch {
+    return false
+  }
+}
+
+function findTranscriptsDirUnderHome(home: string): string | null {
+  if (!isAbsolute(home)) return null
+  try {
+    const homeInfo = lstatSync(home)
+    if (homeInfo.isSymbolicLink() || !homeInfo.isDirectory()) return null
+    const resolvedHome = realpathSync(home)
+    if (!isSafeEphemeralCursorPath(resolvedHome)) return null
+    const projects = join(resolvedHome, '.cursor', 'projects')
+    if (!existsSync(projects)) return null
+    const names = readdirSync(projects)
+    for (const name of names) {
+      const candidate = join(projects, name, 'agent-transcripts')
+      if (isUsableTranscriptsDir(candidate)) return candidate
+    }
+  } catch {
+    return null
+  }
+  return null
+}
+
+/** Resolve $HOME/.cursor/projects/<slug>/agent-transcripts from the CLI tree.
+ *  Adapter never sees wrapper mktemp HOME; AGENT_TRANSCRIPTS lives on descendants. */
+function resolveCursorTranscriptsDir(rootPid: number): string | null {
+  try {
+    const pids = collectDescendantPids(rootPid)
+    for (const pid of pids) {
+      const direct = readProcEnvironValue(pid, 'AGENT_TRANSCRIPTS')
+      if (direct && isUsableTranscriptsDir(direct)) return realpathSync(direct)
+    }
+    for (const pid of pids) {
+      const home = readProcEnvironValue(pid, 'HOME')
+      if (!home) continue
+      const found = findTranscriptsDirUnderHome(home)
+      if (found) return found
+    }
+  } catch {
+    return null
+  }
+  return null
+}
+
+function fingerprintTranscriptDir(dir: string): CursorTranscriptFingerprint | null {
+  const files: Record<string, CursorTranscriptFileStamp> = {}
+  const walk = (current: string, rel: string): void => {
+    let entries
+    try {
+      entries = readdirSync(current, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const entry of entries) {
+      if (entry.name === '.' || entry.name === '..') continue
+      const full = join(current, entry.name)
+      const key = rel ? `${rel}/${entry.name}` : entry.name
+      let st
+      try {
+        st = lstatSync(full)
+      } catch {
+        continue
+      }
+      if (st.isSymbolicLink()) continue
+      if (st.isDirectory()) walk(full, key)
+      else if (st.isFile()) files[key] = { size: st.size, mtimeMs: st.mtimeMs }
+    }
+  }
+  try {
+    walk(dir, '')
+    return { files }
+  } catch {
+    return null
+  }
+}
+
+function readKeepaliveTranscriptFingerprint(
+  rootPid: number,
+  cachedDir: { value: string | null },
+): CursorTranscriptFingerprint | null {
+  try {
+    if (pendingKeepaliveTestHooks?.readTranscriptFingerprint) {
+      return pendingKeepaliveTestHooks.readTranscriptFingerprint(rootPid)
+    }
+    let dir = cachedDir.value
+    if (!dir || !isUsableTranscriptsDir(dir)) {
+      dir = resolveCursorTranscriptsDir(rootPid)
+      cachedDir.value = dir
+    }
+    if (!dir) return null
+    return fingerprintTranscriptDir(dir)
+  } catch {
+    return null
+  }
+}
+
+function transcriptFingerprintGrew(
+  prev: CursorTranscriptFingerprint | null,
+  next: CursorTranscriptFingerprint | null,
+): boolean {
+  if (!next) return false
+  if (!prev) return Object.keys(next.files).length > 0
+  for (const [path, stamp] of Object.entries(next.files)) {
+    const old = prev.files[path]
+    if (!old) return true
+    if (stamp.size > old.size || stamp.mtimeMs > old.mtimeMs) return true
+  }
+  return false
+}
+
+const TRANSCRIPT_TAIL_BYTES = 48 * 1024
+const PROGRESS_DETAIL_MAX_CHARS = 120
+
+function clampProgressDetail(text: string, max = PROGRESS_DETAIL_MAX_CHARS): string {
+  const oneLine = text.replace(/\s+/g, ' ').trim()
+  if (!oneLine) return ''
+  if (oneLine.length <= max) return oneLine
+  return `${oneLine.slice(0, Math.max(0, max - 1))}…`
+}
+
+function fallbackPendingToolProgress(oldestToolName: string): string {
+  const name = oldestToolName.trim()
+  if (!name || name === 'unknown') return '子任务运行中'
+  return `子任务 ${name} 运行中`
+}
+
+function readFileTailUtf8(filePath: string, maxBytes = TRANSCRIPT_TAIL_BYTES): string {
+  let fd: number | undefined
+  try {
+    fd = openSync(filePath, 'r')
+    const size = fstatSync(fd).size
+    if (size <= 0) return ''
+    const length = Math.min(size, Math.max(1, maxBytes))
+    const buf = Buffer.alloc(length)
+    readSync(fd, buf, 0, length, size - length)
+    return buf.toString('utf8')
+  } catch {
+    return ''
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd) } catch { /* ignore */ }
+    }
+  }
+}
+
+function parseLastJsonlObjects(tail: string, maxRecords = 12): Record<string, unknown>[] {
+  if (!tail) return []
+  const lines = tail.split('\n')
+  const out: Record<string, unknown>[] = []
+  for (let i = lines.length - 1; i >= 0 && out.length < maxRecords; i--) {
+    const line = lines[i]!.trim()
+    if (!line) continue
+    try {
+      const parsed = JSON.parse(line) as unknown
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        out.push(parsed as Record<string, unknown>)
+      }
+    } catch {
+      continue
+    }
+  }
+  return out.reverse()
+}
+
+function toolProgressFromArgs(toolName: string, args: Record<string, unknown> | null): string {
+  const name = toolName.trim() || 'Tool'
+  if (!args) return name
+  const filePath = textOf(args.path ?? args.file_path ?? args.filePath ?? args.targetDirectory)
+  const pattern = textOf(args.pattern ?? args.query ?? args.searchTerm ?? args.globPattern)
+  const command = textOf(args.command)
+  const desc = textOf(args.description ?? args.prompt)
+  if (filePath) return `${name} ${filePath}`
+  if (pattern) return `${name} ${pattern}`
+  if (command) return `${name} ${command}`
+  if (desc) return `${name} ${desc}`
+  return name
+}
+
+function progressFromTranscriptRecord(record: Record<string, unknown>): string | null {
+  const type = textOf(record.type).toLowerCase()
+  if (type === 'tool_call') {
+    const name = toolNameOf(record as CursorEvent)
+    const input = toolInputOf(record as CursorEvent)
+    const args = recordOf(input)
+    return clampProgressDetail(toolProgressFromArgs(name, args))
+  }
+  const message = recordOf(record.message)
+  const content = message?.content ?? record.content
+  if (Array.isArray(content)) {
+    for (let i = content.length - 1; i >= 0; i--) {
+      const block = recordOf(content[i])
+      if (!block) continue
+      const blockType = textOf(block.type ?? block.kind).toLowerCase()
+      if (blockType === 'tool_use') {
+        const name = textOf(block.name) || 'Tool'
+        return clampProgressDetail(toolProgressFromArgs(name, recordOf(block.input)))
+      }
+      if (blockType === 'text' || blockType === 'thinking') {
+        const text = textOf(block.text).trim()
+        if (text) return clampProgressDetail(text)
+      }
+    }
+  }
+  if (type === 'assistant' || textOf(record.role) === 'assistant') {
+    const text = assistantTextOf(record as CursorEvent).trim()
+    if (text) return clampProgressDetail(text)
+  }
+  return null
+}
+
+function progressDetailFromJsonlTail(tail: string): string | null {
+  const records = parseLastJsonlObjects(tail)
+  for (let i = records.length - 1; i >= 0; i--) {
+    const detail = progressFromTranscriptRecord(records[i]!)
+    if (detail) return detail
+  }
+  return null
+}
+
+function summarizeGrownTranscriptProgress(
+  dir: string,
+  prev: CursorTranscriptFingerprint | null,
+  next: CursorTranscriptFingerprint | null,
+): string | null {
+  if (!next || !dir) return null
+  const grown: { rel: string; size: number; mtimeMs: number }[] = []
+  for (const [rel, stamp] of Object.entries(next.files)) {
+    const old = prev?.files[rel]
+    if (!old || stamp.size > old.size || stamp.mtimeMs > old.mtimeMs) {
+      grown.push({ rel, size: stamp.size, mtimeMs: stamp.mtimeMs })
+    }
+  }
+  if (grown.length === 0) return null
+  grown.sort((a, b) => b.size - a.size || b.mtimeMs - a.mtimeMs)
+  for (const file of grown.slice(0, 3)) {
+    const tail = readFileTailUtf8(join(dir, file.rel))
+    const detail = progressDetailFromJsonlTail(tail)
+    if (detail) return detail
+  }
+  return null
+}
+
+
 function resolveCursorWrapperBin(
   override = process.env.OC_CURSOR_WRAPPER_BIN,
   hotConfigAvailable = existsSync(CURSOR_HOTCFG_WRAPPER_BIN),
@@ -63,6 +572,18 @@ higher-priority platform guidance while answering the current turn.
 Your actual Cursor native tool list and loaded MCP tool list are authoritative.
 Descriptions in the platform context may mention tools from another backend;
 do not claim or call a tool unless it is present in your current tool list.
+
+The ask-question tool is the one exception: this hosted run is noninteractive,
+so the runtime resolves Cursor's native ask-question tool instantly as
+"Questions skipped by the user" — the user never sees the prompt and no answer
+will arrive. Never call the native ask-question tool. Use the platform MCP
+tool \`ask_user\` (openclaude-memory server) instead: it posts the questions to
+the web UI and returns immediately. After \`ask_user\` returns, end your turn
+now — do not wait, poll, or call \`ask_user\` again for the same questions.
+The user's choices arrive as your next ordinary user message.
+Subagents get an automatic skip — decide yourself there. If \`ask_user\` is not
+in your current tool list, present numbered options as plain text and end the
+turn; the user's next message carries the answer.
 
 Use OpenClaude's storage channels as their sections direct: Core memory through
 \`oc-memory core-search\` plus the exact platform memory files, session/archival
@@ -90,6 +611,7 @@ const OPENCLAUDE_MEMORY_MCP_TOOLS = [
   'delete_reminder',
   'delegate_task',
   'send_to_agent',
+  'ask_user',
 ] as const
 
 const CURSOR_SAFE_ENV_KEYS = [
@@ -107,7 +629,7 @@ const CURSOR_SAFE_ENV_KEYS = [
 ] as const
 
 
-type CursorEvent = Record<string, unknown> & { type?: unknown }
+type CursorEvent = Record<string, unknown> & { type?: unknown; session_id?: unknown }
 type ReportedUsage = { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number }
 interface TurnCtx {
   params: TurnParams; startedAt: number; proc: ChildProcessByStdio<null, Readable, Readable> | null
@@ -118,6 +640,7 @@ interface TurnCtx {
   assistantSegmentClosed: boolean; thinkingSegmentClosed: boolean
   contextDir: string | null
   rawToSafeToolId: Map<string, string>; safeToRawToolId: Map<string, string>; fallbackToolSequence: number
+  sessionIdEmitted: boolean
   resolve: (value: TurnSummary | null) => void
 }
 
@@ -257,6 +780,7 @@ function toolNameOf(event: CursorEvent): string {
     const server = [args?.serverIdentifier, args?.providerIdentifier].find(
       (candidate): candidate is string => typeof candidate === 'string' && !!candidate,
     )
+    if (tool === 'ask_user') return 'AskUserQuestion'
     if (server && tool) return `mcp__${server}__${tool}`
     if (tool) return tool
   }
@@ -522,7 +1046,18 @@ function failureValueOf(value: unknown): unknown {
   if (!result) return undefined
   return result.error ?? result.failure ?? result.rejected
 }
+/** Cursor CLI 以 --force 非交互模式运行:原生 askQuestion 会被 CLI 在毫秒级
+ * 立即按 "Questions skipped by the user" 收尾,用户从未看到问题(真实 turn tape
+ * 实测 durationMs 1~45)。这是托管运行的确定性行为而非工具错误 —— 标成 isError
+ * 会让卡面渲染红色「失败」并掩盖「问题根本没送达用户」的事实;按普通完成卡
+ * 落 tape,问题内容留在卡面,用户仍能以文字作答。 */
+function questionSkippedByRuntime(event: CursorEvent): boolean {
+  if (cursorToolKindOf(event) !== 'askQuestionToolCall') return false
+  const serialized = JSON.stringify([toolResultValueOf(event), event.output, event.rawOutput])
+  return serialized.includes('Questions skipped by the user')
+}
 function toolFailed(event: CursorEvent): boolean {
+  if (questionSkippedByRuntime(event)) return false
   const call = toolCallOf(event)
   const variant = toolVariantOf(event)
   const resultValue = toolResultValueOf(event)
@@ -649,6 +1184,7 @@ function buildCursorMemoryMcpConfig(input: CursorMemoryMcpConfigInput): Record<s
     OPENCLAUDE_GATEWAY_PORT: String(input.gatewayPort),
     OPENCLAUDE_GATEWAY_TOKEN_FILE: input.tokenFile,
     OPENCLAUDE_DELEGATION_DEPTH: String(input.delegationDepth),
+    OPENCLAUDE_ENGINE: 'cursor',
     ...(process.env.OPENCLAUDE_HOME ? { OPENCLAUDE_HOME: process.env.OPENCLAUDE_HOME } : {}),
     ...(process.env.OPENCLAUDE_BASELINE_SKILLS_DIR
       ? { OPENCLAUDE_BASELINE_SKILLS_DIR: process.env.OPENCLAUDE_BASELINE_SKILLS_DIR }
@@ -693,6 +1229,26 @@ function buildCursorSpawnEnv(agentId: string, sessionKey: string): NodeJS.Proces
   return env
 }
 
+export const CURSOR_CHATS_DIR_NAME = 'cursor-chats'
+
+/** Durable Cursor chat store, deliberately OUTSIDE the per-turn ephemeral HOME
+ *  so resume survives while auth.json/JWT still dies with the turn. */
+export function cursorChatsRoot(): string {
+  return join(paths.home, CURSOR_CHATS_DIR_NAME)
+}
+
+/** Mirrors the pinned CLI: chats/<md5(path.resolve(workspace))>/<sessionId>/. */
+export function cursorResumeStorePath(workspacePath: string, sessionId: string): string {
+  const wsHash = createHash('md5').update(resolve(workspacePath)).digest('hex')
+  return join(cursorChatsRoot(), wsHash, sessionId, 'store.db')
+}
+
+/** The CLI silently mints an empty chat for an unknown id, so a missing local
+ *  store is the only stale-resume signal available. */
+export function cursorResumeStoreExists(workspacePath: string, sessionId: string): boolean {
+  try { return existsSync(cursorResumeStorePath(workspacePath, sessionId)) } catch { return false }
+}
+
 export class CursorAdapter extends EventEmitter implements EngineAdapter {
   readonly engineId = 'cursor'
   readonly capabilities: EngineCapabilities = {
@@ -700,7 +1256,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     supportsEffort: false,
     resumeKind: 'cursor-session',
     needsServerRequestId: true,
-    historyMode: 'stateless-replay',
+    historyMode: 'native-resume',
     maxPromptBytes: CURSOR_MAX_TURN_PAYLOAD_BYTES,
   }
   private readonly opts: EngineCreateOpts
@@ -710,20 +1266,38 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
   private target: ExecutionTarget = { kind: 'local' }
   private drain: Promise<void> = Promise.resolve()
   private readonly ownedContextDirs = new Set<string>()
+  private nativeId: string | null
   lastActivityAt = 0
+  private pendingKeepaliveTimer: ReturnType<typeof setInterval> | null = null
+  /** Log-dedup only: true while the current oldest pending tool is over budget.
+   *  Must not gate timer start/stop or the keepalive decision itself. */
+  private pendingKeepaliveOverBudgetLogged = false
+  private pendingKeepaliveStalledLogged = false
+  private pendingKeepaliveStallSince: number | null = null
+  private lastKeepaliveCpuTicks: number | null = null
+  private lastTranscriptFingerprint: CursorTranscriptFingerprint | null = null
+  private cachedTranscriptsDir: string | null = null
 
-  constructor(opts: EngineCreateOpts) { super(); this.opts = { ...opts }; this.setModel(opts.model); this.currentToolsets = opts.agentToolsets }
+  constructor(opts: EngineCreateOpts) {
+    super()
+    this.opts = { ...opts }
+    this.nativeId = opts.resumeSessionId ?? null
+    this.setModel(opts.model)
+    this.currentToolsets = opts.agentToolsets
+  }
   start(): Promise<void> { return Promise.resolve() }
   submitTurn(params: TurnParams): EngineTurnRun {
+    this.stopPendingKeepalive()
     let resolve!: (value: TurnSummary | null) => void
     const summary = new Promise<TurnSummary | null>((r) => { resolve = r })
-    const ctx: TurnCtx = { params, startedAt: Date.now(), proc: null, assistantText: '', thinkingText: '', assistantSegments: [], thinkingSegments: [], tools: new Map(), pending: new Set(), startedTools: new Map(), stderr: '', terminal: false, procClosed: false, abandoned: false, resolveDrain: null, interrupted: false, error: null, assistantPartialText: '', pendingAssistantText: null, assistantSegmentClosed: false, thinkingSegmentClosed: false, contextDir: null, rawToSafeToolId: new Map(), safeToRawToolId: new Map(), fallbackToolSequence: 0, resolve }
+    const ctx: TurnCtx = { params, startedAt: Date.now(), proc: null, assistantText: '', thinkingText: '', assistantSegments: [], thinkingSegments: [], tools: new Map(), pending: new Set(), startedTools: new Map(), stderr: '', terminal: false, procClosed: false, abandoned: false, resolveDrain: null, interrupted: false, error: null, assistantPartialText: '', pendingAssistantText: null, assistantSegmentClosed: false, thinkingSegmentClosed: false, contextDir: null, rawToSafeToolId: new Map(), safeToRawToolId: new Map(), fallbackToolSequence: 0, sessionIdEmitted: false, resolve }
     this.active = ctx; this.lastActivityAt = Date.now(); this.drain = new Promise((r) => { ctx.resolveDrain = r })
     const submitted = this.spawnTurn(ctx).catch((err) => {
       // Only ever settle this turn's own barrier: shutdown() may have already
       // abandoned it, in which case `active` and `drain` belong to a later turn
       // that this failure says nothing about.
       if (!ctx.abandoned) {
+        this.stopPendingKeepalive()
         this.cleanupContextDir(ctx)
         if (!ctx.terminal) this.finish(ctx, String(err))
         if (this.active === ctx) this.active = null
@@ -764,6 +1338,11 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
       // Cleanup is intentionally best-effort and fenced. Never broaden the
       // deletion target after a validation/stat failure.
     }
+  }
+  private prepareCursorChatsDir(): string {
+    const dir = cursorChatsRoot()
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
+    return dir
   }
   private async spawnTurn(ctx: TurnCtx): Promise<void> {
     let cwd = this.opts.agentBaseDir
@@ -830,6 +1409,16 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         env.OPENCLAUDE_CURSOR_MCP_CONFIG = configFile
       }
 
+      this.prepareCursorChatsDir()
+      // Wrapper --workspace is `pwd -P` of this spawn cwd. A symlink cwd would
+      // hash differently from the CLI store path, so realpath before the check.
+      let workspaceForResume = cwd
+      try { workspaceForResume = realpathSync(cwd) } catch { /* keep cwd */ }
+      const resumeId = this.nativeId && cursorResumeStoreExists(workspaceForResume, this.nativeId) ? this.nativeId : null
+      // A stored id whose local store vanished would silently mint an empty chat.
+      if (this.nativeId && resumeId === null) this.nativeId = null
+      if (resumeId !== null) env.OPENCLAUDE_CURSOR_RESUME_ID = resumeId
+
       const args = [
         ...(selected.upstreamModel === null ? [] : ['--model', selected.upstreamModel]),
         '--force',
@@ -845,10 +1434,11 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         killProcessGroup(proc, 'SIGKILL')
         detachChildStdio(proc)
         try { proc.unref() } catch { /* already detached */ }
+        this.stopPendingKeepalive()
         this.cleanupContextDir(ctx)
         return
       }
-      this.emit('spawn', { resumed: false })
+      this.emit('spawn', { resumed: resumeId !== null })
       let buffer = ''
       proc.stdout.setEncoding('utf8')
       proc.stdout.on('data', (chunk: string) => {
@@ -873,6 +1463,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         // An abandoned turn has already been finalized and `active` has moved
         // on; surfacing this would report a later turn as failed.
         if (ctx.abandoned) return
+        this.stopPendingKeepalive()
         this.cleanupContextDir(ctx)
         if (!ctx.terminal) this.finish(ctx, String(err))
         this.emit('error', err)
@@ -882,6 +1473,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         // the turn, in which case `active` belongs to a later turn that this
         // handler must not touch.
         if (ctx.abandoned) return
+        this.stopPendingKeepalive()
         ctx.procClosed = true
         if (buffer.trim()) this.handleLine(ctx, buffer.trim())
         this.flushPendingAssistant(ctx, false)
@@ -916,6 +1508,14 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
   private handleLine(ctx: TurnCtx, line: string): void {
     let event: CursorEvent
     try { event = JSON.parse(line) as CursorEvent } catch (err) { this.emit('parse_error', { line, err }); return }
+    const sid = typeof event.session_id === 'string' ? event.session_id : ''
+    if (sid) {
+      if (sid !== this.nativeId) this.nativeId = sid
+      if (!ctx.sessionIdEmitted) {
+        ctx.sessionIdEmitted = true
+        this.emit('session_id', sid)
+      }
+    }
     const type = textOf(event.type).toLowerCase()
     const aggregateBoundary = type === 'retry'
       || (type === 'interaction_query' && textOf(event.subtype).toLowerCase() === 'request')
@@ -989,9 +1589,10 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     this.flushPendingAssistant(ctx, false)
     this.closeContentSegments(ctx)
     const tool: TurnToolEntry = { toolUseId: id, blockId: id, toolName: name, inputJson: structuredClone(input), inputPreview: textOf(input).slice(0, 500), output: '', completed: false, isError: false, durationMs: 0, ts: Date.now(), arrivedAt: Date.now(), eventOrdinal: ctx.params.nextDurableEventOrdinal?.() }
-    ctx.tools.set(id, tool); ctx.pending.add(id); ctx.startedTools.set(id, Date.now()); ctx.params.toolUseIdToName.set(id, name)
+    ctx.tools.set(id, tool); ctx.pending.add(id); ctx.startedTools.set(id, keepaliveNow()); ctx.params.toolUseIdToName.set(id, name)
     const block: OutboundContentBlock = { kind: 'tool_use', blockId: id, toolName: name, inputJson: structuredClone(input), inputPreview: tool.inputPreview, partial: false }
     ctx.params.onEvent({ kind: 'block', block }); ctx.params.onEvent({ kind: 'tool_use_detected', tool: { name, id, input: input && typeof input === 'object' ? structuredClone(input) as Record<string, any> : {} } })
+    this.ensurePendingKeepalive()
   }
   private toolResult(ctx: TurnCtx, event: CursorEvent): void {
     const rawId = rawToolIdOf(event) || this.nextFallbackToolId(ctx)
@@ -1000,9 +1601,11 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     const tool = ctx.tools.get(id)!; if (tool.completed) return
     const { output, outputJson } = toolOutputOf(event); const isError = toolFailed(event)
     Object.assign(tool, { output, outputJson: structuredClone(outputJson), completed: true, isError, durationMs: Date.now() - (ctx.startedTools.get(id) ?? Date.now()), ts: Date.now() }); ctx.pending.delete(id)
+    if (ctx.pending.size === 0) this.stopPendingKeepalive()
     ctx.params.onEvent({ kind: 'block', block: { kind: 'tool_result', toolUseBlockId: id, toolName: tool.toolName, isError, output, outputJson: structuredClone(outputJson), preview: output.slice(0, 500) } }); ctx.params.onEvent({ kind: 'tool_result_detected', result: { toolUseId: id, toolName: tool.toolName, preview: output.slice(0, 500), isError, durationMs: tool.durationMs, inputPreview: tool.inputPreview } })
   }
   private finish(ctx: TurnCtx, detail: string | null): void {
+    this.stopPendingKeepalive()
     if (ctx.terminal) return; ctx.terminal = true; const cls = detail ? unavailable(detail) : null
     const safeDetail = detail === null ? null : ctx.interrupted ? 'Cursor turn cancelled' : cls === 'auth' ? 'Cursor authentication unavailable' : cls === 'quota' ? 'Cursor quota unavailable' : 'Cursor CLI failed'
     const status: EngineExternalBillingEvent['status'] = cls ? 'unavailable' : detail ? 'error' : 'success'
@@ -1015,6 +1618,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     const u = ctx.usage; ctx.resolve({ usage: { cost: 0, inputTokens: u?.input_tokens ?? 0, outputTokens: u?.output_tokens ?? 0, cacheReadTokens: u?.cache_read_input_tokens ?? 0, cacheCreationTokens: u?.cache_creation_input_tokens ?? 0, totalTokens: u ? Object.values(u).reduce((a, b) => a + (b ?? 0), 0) : 0 }, assistantText: ctx.assistantText, thinkingText: ctx.thinkingText, assistantSegments: ctx.assistantSegments.map((v) => ({ ...v })), thinkingSegments: ctx.thinkingSegments.map((v) => ({ ...v })), tools: [...ctx.tools.values()].map((v) => structuredClone(v)), runtimeEvents: [], stopReason: ctx.interrupted ? 'interrupted' : null, numTurns: 1, isError: !!detail, ...(detail ? { errorKind: 'other' as const, errorClass, errorDetail: safeDetail! } : {}), staleResumeId: false, phantomSignals: { ...EMPTY_SIGNALS } })
   }
   private forceEnd(ctx: TurnCtx): void {
+    this.stopPendingKeepalive()
     if (ctx.terminal) return
     ctx.terminal = true
     ctx.resolve(null)
@@ -1024,7 +1628,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     }
     killProcessGroup(ctx.proc, 'SIGTERM')
   }
-  interrupt(): boolean { const c = this.active; if (!c?.proc || c.proc.killed) return false; c.interrupted = true; killProcessGroup(c.proc, 'SIGINT'); return true }
+  interrupt(): boolean { this.stopPendingKeepalive(); const c = this.active; if (!c?.proc || c.proc.killed) return false; c.interrupted = true; killProcessGroup(c.proc, 'SIGINT'); return true }
   /** Stop has to reach a terminal state even when the CLI escapes us. The
    * wrapper runs the CLI through setsid, so a descendant that outlives the
    * wrapper sits in a session no signal of ours can address while still
@@ -1032,6 +1636,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
    * a deadline on the close barrier: an unbounded wait leaves the turn without
    * a terminal event and the client stuck in "stopping" indefinitely. */
   async shutdown(): Promise<void> {
+    this.stopPendingKeepalive()
     const ctx = this.active
     if (!ctx) return
     if (ctx.procClosed) {
@@ -1092,6 +1697,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     detail: string,
   ): void {
     ctx.abandoned = true
+    this.stopPendingKeepalive()
     if (proc) detachChildStdio(proc)
     this.cleanupContextDir(ctx)
     if (!ctx.terminal) this.finish(ctx, detail)
@@ -1102,9 +1708,193 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
       try { proc.unref() } catch { /* already detached */ }
     }
   }
+  private resetPendingKeepaliveObservation(): void {
+    this.lastKeepaliveCpuTicks = null
+    this.lastTranscriptFingerprint = null
+    this.cachedTranscriptsDir = null
+    this.pendingKeepaliveStallSince = null
+    this.pendingKeepaliveStalledLogged = false
+    this.pendingKeepaliveOverBudgetLogged = false
+  }
+  private emitPendingToolProgress(
+    ctx: TurnCtx,
+    args: {
+      oldestToolName: string
+      transcriptGrew: boolean
+      prevFingerprint: CursorTranscriptFingerprint | null
+      fingerprint: CursorTranscriptFingerprint | null
+    },
+  ): void {
+    let detail: string | undefined
+    if (args.transcriptGrew && this.cachedTranscriptsDir) {
+      detail = summarizeGrownTranscriptProgress(
+        this.cachedTranscriptsDir,
+        args.prevFingerprint,
+        args.fingerprint,
+      ) ?? undefined
+    }
+    if (!detail) detail = fallbackPendingToolProgress(args.oldestToolName)
+    try {
+      ctx.params.onEvent({
+        kind: 'turn_status',
+        status: { status: 'working', detail },
+      })
+    } catch {
+      // Keepalive must never throw into the interval.
+    }
+  }
+  private stopPendingKeepalive(): void {
+    if (this.pendingKeepaliveTimer) {
+      clearInterval(this.pendingKeepaliveTimer)
+      this.pendingKeepaliveTimer = null
+    }
+    this.resetPendingKeepaliveObservation()
+  }
+  private ensurePendingKeepalive(): void {
+    if (this.pendingKeepaliveTimer) return
+    const ctx = this.active
+    if (!ctx || ctx.terminal || ctx.abandoned || ctx.pending.size === 0) return
+    const intervalMs = resolvedPendingKeepaliveIntervalMs()
+    if (intervalMs <= 0) return
+    this.resetPendingKeepaliveObservation()
+    this.pendingKeepaliveTimer = setInterval(() => { this.tickPendingKeepalive() }, intervalMs)
+    this.pendingKeepaliveTimer.unref()
+  }
+  private tickPendingKeepalive(): void {
+    try {
+      const ctx = this.active
+      if (!ctx || ctx.terminal || ctx.abandoned || ctx.pending.size === 0) {
+        this.stopPendingKeepalive()
+        return
+      }
+      const pid = ctx.proc?.pid
+      if (!isPidAlive(pid) || typeof pid !== 'number') {
+        this.stopPendingKeepalive()
+        return
+      }
+      let oldestId: string | null = null
+      let oldestStarted = Infinity
+      for (const id of ctx.pending) {
+        const started = ctx.startedTools.get(id) ?? ctx.startedAt
+        if (started < oldestStarted) {
+          oldestStarted = started
+          oldestId = id
+        }
+      }
+      const now = keepaliveNow()
+      const elapsedMs = now - oldestStarted
+      const maxMs = resolvedPendingKeepaliveMaxMs()
+      const stallWindowMs = resolvedPendingKeepaliveStallMs()
+      const oldestTool = oldestId ? ctx.tools.get(oldestId) : undefined
+      const oldestToolName = oldestTool?.toolName ?? 'unknown'
+      const oldestElapsedSec = Math.round(elapsedMs / 1000)
+      if (elapsedMs > maxMs) {
+        if (!this.pendingKeepaliveOverBudgetLogged) {
+          this.pendingKeepaliveOverBudgetLogged = true
+          log.info('cursor pending-tool keepalive exhausted', {
+            sessionKey: this.opts.sessionKey,
+            pendingCount: ctx.pending.size,
+            oldestToolName,
+            oldestElapsedSec,
+            maxMs,
+          })
+        }
+        return
+      }
+      if (this.pendingKeepaliveOverBudgetLogged) {
+        this.pendingKeepaliveOverBudgetLogged = false
+        log.info('cursor pending-tool keepalive resumed', {
+          sessionKey: this.opts.sessionKey,
+          pendingCount: ctx.pending.size,
+          oldestToolName,
+          oldestElapsedSec,
+          maxMs,
+        })
+      }
+
+      const establishing = this.lastKeepaliveCpuTicks === null && this.lastTranscriptFingerprint === null
+      const cachedDir = { value: this.cachedTranscriptsDir }
+      const prevFingerprint = this.lastTranscriptFingerprint
+      const fingerprint = readKeepaliveTranscriptFingerprint(pid, cachedDir)
+      this.cachedTranscriptsDir = cachedDir.value
+      const cpuTicks = readKeepaliveCpuTicks(pid)
+      const transcriptGrew = transcriptFingerprintGrew(prevFingerprint, fingerprint)
+      let cpuDeltaTicks: number | undefined
+      let cpuGrew = false
+      const minCpuDelta = resolvedPendingKeepaliveMinCpuTicks()
+      if (cpuTicks === null) this.lastKeepaliveCpuTicks = null
+      else {
+        if (this.lastKeepaliveCpuTicks !== null) {
+          cpuDeltaTicks = cpuTicks - this.lastKeepaliveCpuTicks
+          cpuGrew = cpuDeltaTicks >= minCpuDelta
+        }
+        this.lastKeepaliveCpuTicks = cpuTicks
+      }
+      this.lastTranscriptFingerprint = fingerprint
+
+      let progressSignal: CursorPendingKeepaliveProgressSignal = 'none'
+      if (establishing) progressSignal = 'init'
+      else if (transcriptGrew && cpuGrew) progressSignal = 'both'
+      else if (transcriptGrew) progressSignal = 'transcript'
+      else if (cpuGrew) progressSignal = 'cpu'
+
+      const progressing = !establishing && (transcriptGrew || cpuGrew)
+      let stallForMs = 0
+      if (progressing) {
+        if (this.pendingKeepaliveStalledLogged) {
+          log.info('cursor pending-tool keepalive recovered', {
+            sessionKey: this.opts.sessionKey,
+            pendingCount: ctx.pending.size,
+            oldestToolName,
+            oldestElapsedSec,
+            progressSignal,
+          })
+        }
+        this.pendingKeepaliveStallSince = null
+        this.pendingKeepaliveStalledLogged = false
+        this.lastActivityAt = Date.now()
+        this.emit('activity')
+        this.emitPendingToolProgress(ctx, {
+          oldestToolName,
+          transcriptGrew,
+          prevFingerprint,
+          fingerprint,
+        })
+      } else if (!establishing) {
+        if (this.pendingKeepaliveStallSince === null) this.pendingKeepaliveStallSince = now
+        stallForMs = now - this.pendingKeepaliveStallSince
+        if (stallForMs >= stallWindowMs && !this.pendingKeepaliveStalledLogged) {
+          this.pendingKeepaliveStalledLogged = true
+          log.info('cursor pending-tool keepalive stalled', {
+            sessionKey: this.opts.sessionKey,
+            pendingCount: ctx.pending.size,
+            oldestToolName,
+            oldestElapsedSec,
+            stallMs: stallWindowMs,
+            stallForMs,
+            progressSignal,
+          })
+        }
+      }
+
+      log.info('cursor pending-tool keepalive', {
+        sessionKey: this.opts.sessionKey,
+        pendingCount: ctx.pending.size,
+        oldestToolName,
+        oldestElapsedSec,
+        progressing,
+        progressSignal,
+        stallForMs: progressing || establishing ? 0 : stallForMs,
+        ...(cpuDeltaTicks !== undefined ? { cpuDeltaTicks } : {}),
+      })
+    } catch {
+      // Keepalive is best-effort. A throw here would become an unhandled
+      // interval exception and take down the gateway process.
+    }
+  }
   waitForOutputDrain(): Promise<void> { return this.drain }
-  get nativeSessionId(): null { return null }
-  clearSessionId(): void {}
+  get nativeSessionId(): string | null { return this.nativeId }
+  clearSessionId(): void { this.nativeId = null }
   setModel(model: string | undefined): void {
     const selected = model ?? DEFAULT_CURSOR_ENGINE_MODEL
     if (!CURSOR_ENGINE_MODELS.some((entry) => entry.id === selected)) {
@@ -1141,6 +1931,31 @@ export const _internals = {
   resolveCursorWrapperBin,
   toolNameOf,
   toolInputOf,
+  toolFailed,
+  questionSkippedByRuntime,
+  parsePendingKeepaliveIntervalMs,
+  parsePendingKeepaliveMaxMs,
+  parsePendingKeepaliveStallMs,
+  parsePendingKeepaliveMinCpuTicks,
+  PENDING_KEEPALIVE_INTERVAL_DEFAULT_MS,
+  PENDING_KEEPALIVE_INTERVAL_MIN_MS,
+  PENDING_KEEPALIVE_INTERVAL_MAX_MS,
+  PENDING_KEEPALIVE_MAX_DEFAULT_MS,
+  PENDING_KEEPALIVE_MAX_MIN_MS,
+  PENDING_KEEPALIVE_MAX_MAX_MS,
+  PENDING_KEEPALIVE_STALL_DEFAULT_MS,
+  PENDING_KEEPALIVE_STALL_MIN_MS,
+  PENDING_KEEPALIVE_STALL_MAX_MS,
+  PENDING_KEEPALIVE_MIN_CPU_TICKS_DEFAULT,
+  PENDING_KEEPALIVE_MIN_CPU_TICKS_MIN,
+  PENDING_KEEPALIVE_MIN_CPU_TICKS_MAX,
+  setPendingKeepaliveTestHooks(hooks: CursorPendingKeepaliveTestHooks | null): void {
+    pendingKeepaliveTestHooks = hooks
+  },
+  readFileTailUtf8,
+  progressDetailFromJsonlTail,
+  summarizeGrownTranscriptProgress,
+  fallbackPendingToolProgress,
 }
 
 registerEngine('cursor', (opts) => new CursorAdapter(opts))

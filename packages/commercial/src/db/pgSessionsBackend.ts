@@ -7550,7 +7550,7 @@ export function createPgSessionsBackend(
       userId: string,
       message: {
         id: string;
-        role: "assistant" | "user" | "system" | "thinking" | "tool" | "agent-group";
+        role: "assistant" | "user" | "system" | "thinking" | "tool" | "agent-group" | "permission";
         text?: string;
         ts?: number;
         [k: string]: unknown;
@@ -7560,6 +7560,39 @@ export function createPgSessionsBackend(
         pgAppendServerAuthoredCore(client, sessId, userId, message as MessageLike & { id: string }),
       );
       return r.applied ? { applied: true } : { applied: false, reason: r.reason };
+    },
+
+    async patchServerAuthoredMessage(
+      sessId: string,
+      userId: string,
+      msgId: string,
+      patch: Record<string, unknown>,
+    ): Promise<{ applied: true } | { applied: false; reason: "session_not_found" | "session_deleted" | "not_found" }> {
+      return withTx(pool, async (client) => {
+        const row = await client.query<{
+          messages: unknown
+          next_seq: number | null
+          deleted_at: Date | string | null
+        }>(
+          "SELECT messages, next_seq, deleted_at FROM client_sessions WHERE id = $1 AND user_id = $2 FOR UPDATE",
+          [sessId, userId],
+        );
+        if (row.rowCount === 0) return { applied: false as const, reason: "session_not_found" as const };
+        const rec = row.rows[0]!;
+        if (rec.deleted_at != null) return { applied: false as const, reason: "session_deleted" as const };
+        const msgs = Array.isArray(rec.messages) ? rec.messages as Array<Record<string, unknown>> : null;
+        if (!msgs) return { applied: false as const, reason: "not_found" as const };
+        const idx = msgs.findIndex((m) => m && m.id === msgId);
+        if (idx < 0) return { applied: false as const, reason: "not_found" as const };
+        const nextSeq = typeof rec.next_seq === "number" && rec.next_seq > 0 ? rec.next_seq : 1;
+        msgs[idx] = { ...msgs[idx], ...patch, id: msgId, _source: "server", _seq: nextSeq };
+        const upd = await client.query(
+          "UPDATE client_sessions SET messages = $1::jsonb, updated_at = GREATEST(updated_at + 1, $2), next_seq = $3, history_revision = history_revision + 1 WHERE id = $4 AND user_id = $5 AND deleted_at IS NULL",
+          [JSON.stringify(msgs), Date.now(), nextSeq + 1, sessId, userId],
+        );
+        if (upd.rowCount !== 1) return { applied: false as const, reason: "session_deleted" as const };
+        return { applied: true as const };
+      });
     },
 
     // ── appendServerAuthoredMessageForRequest(usage 聚合:requestId-keyed 四表原子)──

@@ -15,11 +15,15 @@
 
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 
-import { SessionManager } from "../sessionManager.js";
+import { SessionManager, type AgentSession } from "../sessionManager.js";
 // side-effect:注册 'ccb' / 'codex' factory。
 import "../engine/ccbAdapter.js";
 import "../engine/codexAdapter.js";
+import { cursorResumeStoreExists, cursorResumeStorePath } from "../engine/cursorAdapter.js";
 import type { AgentDef, OpenClaudeConfig } from "@openclaude/storage";
 
 function makeConfigStub(): OpenClaudeConfig {
@@ -38,7 +42,8 @@ interface SmInternals {
   _resumeMapProvider: Map<string, string>;
   _resumeMapLastCost: Map<string, number>;
   _saveResumeMap: () => void;
-  _resumeIdFor: (key: string, wantProvider: string) => string | undefined;
+  _resumeIdFor: (key: string, wantProvider: string, workspacePath?: string) => string | undefined;
+  _cursorWorkspacePathForSession: (session: AgentSession) => string | undefined;
 }
 
 function makeSm(): { sm: SessionManager; ins: SmInternals } {
@@ -297,5 +302,47 @@ describe("stale-resume 时序回归(M0 Codex 评审 nit②)", () => {
 
     assert.equal(ins._resumeMap.get(KEY), "alive-id-3", "非 stale crash 必须保留可恢复 id");
     assert.equal(session.ccbSessionId, "alive-id-3");
+  });
+});
+
+
+describe("Cursor resume workspace path uses the pinned agent cwd", () => {
+  test("stale-store check hashes pinned agent.cwd, not the default workspace", async () => {
+    const pinned = await mkdtemp(path.join(tmpdir(), "oc-cursor-pinned-cwd-"));
+    const defaultWs = await mkdtemp(path.join(tmpdir(), "oc-cursor-default-ws-"));
+    const sessionId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    const store = cursorResumeStorePath(pinned, sessionId);
+    await mkdir(path.dirname(store), { recursive: true });
+    await writeFile(store, "");
+    const oldDefault = process.env.OPENCLAUDE_DEFAULT_WORKSPACE;
+    process.env.OPENCLAUDE_DEFAULT_WORKSPACE = defaultWs;
+    const key = "agent:main:webchat:dm:cursor-pinned-cwd";
+    const { sm, ins } = makeSm();
+    ins._resumeMap.set(key, sessionId);
+    ins._resumeMapProvider.set(key, "cursor");
+    try {
+      const session = await sm.getOrCreate({
+        sessionKey: key,
+        agent: { id: "main", cwd: pinned, model: "cursor-auto" } as AgentDef,
+        channel: "webchat",
+        peerId: "cursor-pinned-cwd",
+        model: "cursor-auto",
+      });
+      assert.equal(session.workspaceCwd, pinned);
+      assert.equal(session.runner.engineId, "cursor");
+      assert.equal(session.runner.nativeSessionId, sessionId);
+      const fromSession = ins._cursorWorkspacePathForSession(session);
+      assert.ok(fromSession);
+      assert.equal(cursorResumeStoreExists(fromSession, sessionId), true);
+      assert.equal(cursorResumeStoreExists(defaultWs, sessionId), false);
+      assert.equal(ins._resumeIdFor(key, "cursor", fromSession), sessionId);
+      assert.notEqual(fromSession, defaultWs);
+    } finally {
+      if (oldDefault === undefined) delete process.env.OPENCLAUDE_DEFAULT_WORKSPACE;
+      else process.env.OPENCLAUDE_DEFAULT_WORKSPACE = oldDefault;
+      await rm(path.dirname(store), { recursive: true, force: true });
+      await rm(pinned, { recursive: true, force: true });
+      await rm(defaultWs, { recursive: true, force: true });
+    }
   });
 });

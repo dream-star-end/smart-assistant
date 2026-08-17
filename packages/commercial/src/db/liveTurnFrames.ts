@@ -117,14 +117,32 @@ export async function persistGatewayLiveFrame(
          $1,$2,$3,$4,$5::uuid,$6,$7,'gateway',
          $8,$9,$10,$11
        )
-       ON CONFLICT (stream_key) DO UPDATE SET updated_at=NOW()
+       ON CONFLICT (stream_key) DO UPDATE SET
+         updated_at=NOW(),
+         client_message_id=CASE
+           WHEN EXCLUDED.dispatch_id IS NULL
+             THEN COALESCE(EXCLUDED.client_message_id,client_session_live_streams.client_message_id)
+           ELSE client_session_live_streams.client_message_id
+         END
        WHERE client_session_live_streams.session_id=EXCLUDED.session_id
          AND client_session_live_streams.user_id=EXCLUDED.user_id
-         AND client_session_live_streams.client_message_id IS NOT DISTINCT FROM EXCLUDED.client_message_id
-         AND client_session_live_streams.dispatch_id IS NOT DISTINCT FROM EXCLUDED.dispatch_id
-         AND client_session_live_streams.attempt_no IS NOT DISTINCT FROM EXCLUDED.attempt_no
          AND client_session_live_streams.agent_container_id IS NOT DISTINCT FROM EXCLUDED.agent_container_id
          AND client_session_live_streams.source='gateway'
+         AND (
+           (
+             EXCLUDED.dispatch_id IS NULL
+             AND EXCLUDED.attempt_no IS NULL
+             AND client_session_live_streams.dispatch_id IS NULL
+             AND client_session_live_streams.attempt_no IS NULL
+           )
+           OR
+           (
+             EXCLUDED.dispatch_id IS NOT NULL
+             AND client_session_live_streams.client_message_id IS NOT DISTINCT FROM EXCLUDED.client_message_id
+             AND client_session_live_streams.dispatch_id IS NOT DISTINCT FROM EXCLUDED.dispatch_id
+             AND client_session_live_streams.attempt_no IS NOT DISTINCT FROM EXCLUDED.attempt_no
+           )
+         )
        RETURNING stream_key`,
       [
         streamKey,

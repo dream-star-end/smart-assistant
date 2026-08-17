@@ -597,13 +597,13 @@ describe("internalServerAuthored handler — lossless turn tape error classifica
 // ─── tests ───────────────────────────────────────────────────────────────
 
 describe("internalServerAuthored handler — method gate", () => {
-  test("405 on non-POST", async () => {
+  test("405 on PUT", async () => {
     const handler = makeServerAuthoredHandler({
       identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
       storage: fakeStorage(async () => ({ applied: true })),
     });
     const { res, rec } = makeRes();
-    await handler(makeReq({ method: "GET" }), res, CTX);
+    await handler(makeReq({ method: "PUT" }), res, CTX);
     assert.equal(rec.status, 405);
   });
 });
@@ -1665,7 +1665,7 @@ describe("internalServerAuthored handler — sink persist metric outcomes", () =
       metric: m.metric,
     });
     const { res } = makeRes();
-    await h(makeReq({ method: "GET" }), res, CTX);
+    await h(makeReq({ method: "PUT" }), res, CTX);
     assert.deepEqual(m.calls, []);
   });
 });
@@ -3133,3 +3133,179 @@ describe("internalServerAuthored handler — agent-group durability (P2 债A)", 
     assert.equal(resRec.status, 400);
   });
 })
+
+describe("internalServerAuthored handler — detached ask_user permissionCards", () => {
+  type Call = [V3SinkPersistOutcome, V3SinkPersistRole | undefined];
+  function captureMetricRich(): { calls: Call[]; metric: (o: V3SinkPersistOutcome, r?: V3SinkPersistRole) => void } {
+    const calls: Call[] = [];
+    return { calls, metric: (o, r) => calls.push([o, r]) };
+  }
+  function authed(body: string) {
+    return makeReq({ body, auth: `Bearer ${VALID_TOKEN}` });
+  }
+  function permCard(over: Record<string, unknown> = {}) {
+    return {
+      requestId: "ask-user:" + "ab".repeat(16),
+      questions: [{ question: "Which editor?", options: [{ label: "Vim" }, { label: "Emacs" }] }],
+      sessionKey: "agent:main:webchat:dm:sess12345",
+      expiresAt: 1_720_086_400_000,
+      ts: 1_720_000_000_000,
+      channel: "webchat",
+      peer: { id: "sess12345", kind: "dm" },
+      ...over,
+    };
+  }
+  function recStore(): {
+    storage: ServerAuthoredStorage;
+    rows: Array<Record<string, unknown>>;
+    patches: Array<{ msgId: string; patch: Record<string, unknown> }>;
+  } {
+    const rows: Array<Record<string, unknown>> = [];
+    const patches: Array<{ msgId: string; patch: Record<string, unknown> }> = [];
+    const store: ServerAuthoredStorage = {
+      async appendServerAuthoredMessage(_s, _u, msg) {
+        rows.push({ ...(msg as unknown as Record<string, unknown>) });
+        return { applied: true };
+      },
+      async appendServerAuthoredMessageForRequest(_r, s, u, msg) {
+        const r = await store.appendServerAuthoredMessage(s, u, msg);
+        return r.applied ? { applied: true } : { applied: false, reason: r.reason ?? "malformed" };
+      },
+      async appendServerAuthoredMessageDrainByUser(s, u, msg) {
+        const r = await store.appendServerAuthoredMessage(s, u, msg);
+        return r.applied ? { applied: true } : { applied: false, reason: r.reason ?? "malformed" };
+      },
+      async drainDelegateCostForClientSession() { return { merged: "0", drained: 0 }; },
+      async getClientSession() {
+        return { messages: rows };
+      },
+      async readArchivedMessages() {
+        return { messages: [], hasMore: false, oldestSeq: null };
+      },
+      async patchServerAuthoredMessage(_s, _u, msgId, patch) {
+        patches.push({ msgId, patch });
+        const idx = rows.findIndex((r) => r.id === msgId);
+        if (idx >= 0) rows[idx] = { ...rows[idx], ...patch };
+        return { applied: true as const };
+      },
+    };
+    return { storage: store, rows, patches };
+  }
+  function handler(rec: ReturnType<typeof recStore>, m: ReturnType<typeof captureMetricRich>) {
+    return makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+      metric: m.metric,
+    });
+  }
+
+  test("permission-only sidecar persists role:permission with requestId as id + 200", async () => {
+    const rec = recStore();
+    const m = captureMetricRich();
+    const { res, rec: resRec } = makeRes();
+    const card = permCard();
+    await handler(rec, m)(authed(JSON.stringify({
+      sessionId: "sess12345", agentId: "main", turnIndex: 0, status: "completed",
+      text: "",
+      permissionCards: [card],
+    })), res, CTX);
+    assert.equal(resRec.status, 200);
+    const row = rec.rows.find((r) => r.role === "permission");
+    assert.ok(row, "permission row was written");
+    assert.equal(row!.id, card.requestId);
+    assert.equal(row!.requestId, card.requestId);
+    assert.equal(row!._detachedAskUser, true);
+    assert.equal(row!._askUserExpiresAt, card.expiresAt);
+    assert.equal(row!._askUserUserId, "c:42", "userId derived from identity, not the wire");
+    assert.equal(row!.toolName, "AskUserQuestion");
+    assert.ok(m.calls.some((c) => c[0] === "ok" && c[1] === "permission"));
+  });
+
+  test("old payload without permissionCards still 200 (backward compatible)", async () => {
+    const rec = recStore();
+    const m = captureMetricRich();
+    const { res, rec: resRec } = makeRes();
+    await handler(rec, m)(authed(JSON.stringify({
+      sessionId: "sess12345", agentId: "main", turnIndex: 1, status: "completed",
+      text: "hello", requestId: "req-12345abc",
+    })), res, CTX);
+    assert.equal(resRec.status, 200);
+    assert.equal(rec.rows.some((r) => r.role === "permission"), false);
+  });
+
+  test("schema rejects a permission card with a client-controlled id", async () => {
+    const rec = recStore();
+    const m = captureMetricRich();
+    const { res, rec: resRec } = makeRes();
+    await handler(rec, m)(authed(JSON.stringify({
+      sessionId: "sess12345", agentId: "main", turnIndex: 0, status: "completed",
+      text: "",
+      permissionCards: [permCard({ requestId: "not-an-ask-user-id" })],
+    })), res, CTX);
+    assert.equal(resRec.status, 400);
+    assert.equal(rec.rows.length, 0);
+  });
+
+  test("GET hydrates a previously persisted permission card by requestId", async () => {
+    const rec = recStore();
+    const m = captureMetricRich();
+    const card = permCard();
+    const { res: postRes, rec: postRec } = makeRes();
+    await handler(rec, m)(authed(JSON.stringify({
+      sessionId: "sess12345", agentId: "main", turnIndex: 0, status: "completed",
+      text: "",
+      permissionCards: [card],
+    })), postRes, CTX);
+    assert.equal(postRec.status, 200);
+
+    const { res, rec: resRec } = makeRes();
+    await handler(rec, m)(makeReq({
+      method: "GET",
+      auth: `Bearer ${VALID_TOKEN}`,
+      url: `${SERVER_AUTHORED_PATH}?sessionId=sess12345&requestId=${card.requestId}`,
+    }), res, CTX);
+    assert.equal(resRec.status, 200);
+    const body = JSON.parse(resRec.body) as { ok: boolean; message: Record<string, unknown> };
+    assert.equal(body.ok, true);
+    assert.equal(body.message.id, card.requestId);
+    assert.equal(body.message._detachedAskUser, true);
+    assert.equal(body.message._askUserExpiresAt, card.expiresAt);
+    assert.equal(body.message._askUserUserId, "c:42");
+  });
+
+  test("permissionPatches mark the durable card resolved and persist the user answer", async () => {
+    const rec = recStore();
+    const m = captureMetricRich();
+    const card = permCard();
+    rec.rows.push({
+      id: card.requestId,
+      role: "permission",
+      _resolved: false,
+      _detachedAskUser: true,
+    });
+    const { res, rec: resRec } = makeRes();
+    await handler(rec, m)(authed(JSON.stringify({
+      sessionId: "sess12345", agentId: "main", turnIndex: 0, status: "completed",
+      text: "",
+      permissionPatches: [{
+        requestId: card.requestId,
+        behavior: "allow",
+        settledReason: "remote",
+        answers: { "Which editor?": "Vim" },
+      }],
+      userAnswerMessages: [{
+        id: "ask-ans-sess12345abcdefghijkl",
+        text: "用户已回答提问：\n\nWhich editor?\n选择：Vim",
+      }],
+    })), res, CTX);
+    assert.equal(resRec.status, 200);
+    assert.equal(rec.patches.length, 1);
+    assert.equal(rec.patches[0]!.msgId, card.requestId);
+    assert.equal(rec.patches[0]!.patch._resolved, true);
+    assert.equal(rec.patches[0]!.patch._behavior, "allow");
+    const userRow = rec.rows.find((r) => r.role === "user");
+    assert.ok(userRow);
+    assert.equal(userRow!.id, "ask-ans-sess12345abcdefghijkl");
+  });
+});
+

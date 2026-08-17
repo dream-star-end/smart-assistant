@@ -15,7 +15,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../../lib/chat/model";
-import { PENDING_PERMISSION_TTL_MS, PermissionCard } from "./PermissionCard";
+import { DETACHED_ASK_USER_TTL_MS, PENDING_PERMISSION_TTL_MS, PermissionCard } from "./PermissionCard";
 
 afterEach(cleanup);
 
@@ -97,6 +97,36 @@ describe("PermissionCard 自动弹框的存活边界", () => {
   test("readOnly surface（管理端会话查看）永不弹框", () => {
     render(<PermissionCard msg={askMsg()} onRespond={vi.fn()} readOnly />);
     expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  test("detached ask_user 超过 30min 仍自动弹（24h TTL,换设备回来仍可作答）", () => {
+    render(
+      <PermissionCard
+        msg={askMsg({
+          requestId: "ask-user:abc123",
+          _detachedAskUser: true,
+          ts: Date.now() - PENDING_PERMISSION_TTL_MS - 3 * 60 * 60_000,
+        })}
+        onRespond={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+  });
+
+  test("detached ask_user 超过 24h 不再自动弹,但手动回答入口仍在", () => {
+    render(
+      <PermissionCard
+        msg={askMsg({
+          requestId: "ask-user:abc123",
+          _detachedAskUser: true,
+          ts: Date.now() - DETACHED_ASK_USER_TTL_MS - 60_000,
+        })}
+        onRespond={vi.fn()}
+      />,
+    );
+    expect(screen.queryByRole("dialog")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "回答" }));
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
   });
 });
 

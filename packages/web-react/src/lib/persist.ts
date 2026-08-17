@@ -429,9 +429,10 @@ export function dispatchDbNameForUser(userId: string | null | undefined): string
  *     内容；旧逻辑只保尾部会在「团队轮之后又有新轮」的 reopen 场景整卡丢失。保留后由
  *     normalizeDelegateCards（loadStored/applyServerMessages 收口处）按 blockId/runId
  *     兜底折叠,不会与 server 带回的 delegate 工具行形成重复卡。
- *  ⑦ **本地 permission 卡**（中段）——permission_request / permission_settled 只在 reducer
- *     生成客户端过程卡，server 历史不产出该 role。断线重连的 auto-deny 往往紧邻 final；full
- *     sync 必须保住它并维持原槽，否则会丢卡或漂到 final 后。
+ *  ⑦ **本地 permission 卡**（中段）——CCB/Codex 引擎权限卡仍只在 reducer 生成；
+ *     detached Cursor ask_user 卡现在会作为 server-authored `role:'permission'` 行
+ *     出现在 getSession/full-sync 里（与 requestId 同 id）。同 id 走 server-wins；
+ *     本地独有的引擎权限卡仍须保留，否则断线重连会丢卡或漂到 final 后。
  *
  * 其余角色（assistant/thinking/tool）乐观消息可能已被 server 以 `srv-*` 重写，中段保留
  * 会出现重复卡片，故仍只保尾部（非尾部=已被取代→丢弃）。
@@ -749,7 +750,7 @@ export function mergeFullServerWins(
           // standalone progress 行(_adoptedInto)已并入 group,不重复保留。
           m.role === "user" ||
           (isTeamOwnedRole(m.role) && !m._adoptedInto) ||
-          // ⑦ permission_request / settled 是 client-owned 过程卡；server 历史无此 role。
+          // ⑦ 引擎权限卡仍是 client-owned；detached ask_user 若已在 server 同 id 则走 server-wins。
           m.role === "permission" ||
           // ⑤ client-owned system 行(context_rebuilt 重建提示):server-authored 通道从不产出。
           (m.role === "system" && !isServerAuthoredRow(m)) ||

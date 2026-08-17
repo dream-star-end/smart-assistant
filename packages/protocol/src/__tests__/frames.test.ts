@@ -22,6 +22,7 @@ import {
   OutboundMessage,
   OutboundPermissionRequest,
   OutboundControlReceipt,
+  OutboundTurnStatus,
   isClientMessageId,
   isControlId,
   isPersistedClientMessageId,
@@ -554,6 +555,26 @@ describe('OutboundPermissionRequest schema', () => {
       false,
     )
   })
+  it('accepts optional expiresAt and detachedAskUser without requiring them', () => {
+    assert.equal(
+      Value.Check(OutboundPermissionRequest, {
+        ...(baseOutboundPermissionRequest() as object),
+        expiresAt: Date.now() + 24 * 60 * 60_000,
+        detachedAskUser: true,
+      }),
+      true,
+    )
+    assert.equal(Value.Check(OutboundPermissionRequest, baseOutboundPermissionRequest()), true)
+  })
+  it('rejects a non-integer expiresAt', () => {
+    assert.equal(
+      Value.Check(OutboundPermissionRequest, {
+        ...(baseOutboundPermissionRequest() as object),
+        expiresAt: 'tomorrow',
+      }),
+      false,
+    )
+  })
 })
 
 describe('OutboundCallUsage schema', () => {
@@ -607,5 +628,31 @@ describe('OutboundCallUsage schema', () => {
       }),
       false,
     )
+  })
+})
+
+describe('OutboundTurnStatus schema', () => {
+  const base = {
+    type: 'outbound.turn_status' as const,
+    sessionKey: 'sess-1',
+    channel: 'webchat',
+    peer,
+  }
+  it('accepts compacting / null (legacy clients)', () => {
+    assert.equal(Value.Check(OutboundTurnStatus, { ...base, status: 'compacting' }), true)
+    assert.equal(Value.Check(OutboundTurnStatus, { ...base, status: null }), true)
+  })
+  it('accepts working with optional detail', () => {
+    assert.equal(Value.Check(OutboundTurnStatus, { ...base, status: 'working' }), true)
+    assert.equal(
+      Value.Check(OutboundTurnStatus, { ...base, status: 'working', detail: 'Read foo.ts' }),
+      true,
+    )
+  })
+  it('rejects unknown status (controlled enum)', () => {
+    assert.equal(Value.Check(OutboundTurnStatus, { ...base, status: 'subtask' }), false)
+  })
+  it('old compacting frame without detail still matches', () => {
+    assert.equal(Value.Check(OutboundTurnStatus, { ...base, status: 'compacting' }), true)
   })
 })

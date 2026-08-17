@@ -39,7 +39,7 @@ EOF
 # it inside an `|| true` cleanup path.
 for required_tool in /usr/bin/sudo /usr/bin/test /bin/cat /bin/ls \
   /usr/bin/mktemp /bin/rm /bin/sleep /usr/bin/setsid /usr/bin/stat \
-  /usr/bin/id /bin/mkdir /bin/cp /bin/chmod /bin/date; do
+  /usr/bin/id /bin/mkdir /bin/cp /bin/chmod /bin/date /bin/ln; do
   [ -x "$required_tool" ] || die "runtime image is missing $required_tool"
 done
 
@@ -290,13 +290,55 @@ if [ -n "$mcp_config" ]; then
 fi
 unset OPENCLAUDE_CURSOR_MCP_CONFIG
 
+# Durable Cursor chat store lives under OPENCLAUDE_HOME (outside the
+# per-turn ephemeral HOME) so --resume can see store.db after HOME is
+# destroyed. The path is derived here; callers cannot supply it.
+chats_linked=0
+oc_home=${OPENCLAUDE_HOME:-}
+case "$oc_home" in
+  /*)
+    if [ -d "$oc_home" ]; then
+      chats_dir="$oc_home/cursor-chats"
+      /bin/mkdir -p -m 0700 -- "$chats_dir" \
+        || die "cannot create durable Cursor chats directory"
+      [ -d "$chats_dir" ] && [ ! -L "$chats_dir" ] \
+        || die "durable Cursor chats directory is invalid"
+      /bin/mkdir -p -- "$cursor_home/.config/cursor" \
+        || die "cannot create ephemeral Cursor config directory"
+      /bin/ln -s -- "$chats_dir" "$cursor_home/.config/cursor/chats" \
+        || die "cannot link durable Cursor chats directory"
+      chats_linked=1
+    fi
+    ;;
+esac
+
+resume_id=${OPENCLAUDE_CURSOR_RESUME_ID:-}
+if [ -n "$resume_id" ]; then
+  case "$resume_id" in
+    [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F])
+      [ "${#resume_id}" -eq 36 ] || die "invalid Cursor resume id"
+      ;;
+    *)
+      die "invalid Cursor resume id"
+      ;;
+  esac
+  [ "$chats_linked" -eq 1 ] || die "Cursor resume requires durable chats directory"
+fi
+unset OPENCLAUDE_CURSOR_RESUME_ID
+
 prompt=$1
 shift
 for word in "$@"; do
   prompt="$prompt $word"
 done
-set -- -p --trust --workspace "$workspace" \
-  --output-format stream-json --stream-partial-output -- "$prompt"
+if [ -n "$resume_id" ]; then
+  set -- -p --trust --workspace "$workspace" \
+    --output-format stream-json --stream-partial-output \
+    --resume "$resume_id" -- "$prompt"
+else
+  set -- -p --trust --workspace "$workspace" \
+    --output-format stream-json --stream-partial-output -- "$prompt"
+fi
 [ "$mcp_approval" -eq 0 ] || set -- --approve-mcps "$@"
 [ -z "$model" ] || set -- --model "$model" "$@"
 [ -z "$mode" ] || set -- --mode "$mode" "$@"

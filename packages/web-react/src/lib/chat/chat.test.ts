@@ -18,6 +18,8 @@ import {
   parsePartialJson,
   safeBridgeErrorDetail,
   shouldAutoContinueEmptyTurn,
+  computeTypingLabel,
+  STALE_WARN_MS,
 } from "./pure";
 import {
   addMessage,
@@ -471,6 +473,64 @@ describe("applyTurnStatus retrying 判别联合", () => {
       isFinal: false,
     } as never);
     expect(s._turnStatus).toBeNull();
+  });
+
+  test("status=working → 刷新 lastFrameAt、写入 hint、不落消息行", () => {
+    const s = sess();
+    const before = s.messages.length;
+    applyTurnStatus(s, turnStatusFrame({ status: "working", detail: "Read foo.ts" }));
+    expect(s._turnProgressHint).toBe("Read foo.ts");
+    expect(s._turnStatus == null).toBe(true);
+    expect(s._lastFrameAt).toEqual(expect.any(Number));
+    expect(s.messages.length).toBe(before);
+  });
+
+  test("旧前端兼容: unknown status 不抛、不落消息行、仍刷新 lastFrameAt", () => {
+    const s = sess();
+    const before = s.messages.length;
+    applyTurnStatus(s, turnStatusFrame({ status: "subtask" }));
+    expect(s._turnStatus).toBeNull();
+    expect(s.messages.length).toBe(before);
+    expect(s._lastFrameAt).toEqual(expect.any(Number));
+  });
+
+  test("status=null 清 working hint", () => {
+    const s = sess();
+    applyTurnStatus(s, turnStatusFrame({ status: "working", detail: "Grep keepalive" }));
+    expect(s._turnProgressHint).toBe("Grep keepalive");
+    applyTurnStatus(s, turnStatusFrame({ status: null }));
+    expect(s._turnProgressHint).toBeUndefined();
+  });
+
+  test("clearTurnTiming 清 working hint", () => {
+    const s = sess();
+    applyTurnStatus(s, turnStatusFrame({ status: "working", detail: "Bash npx tsc" }));
+    clearTurnTiming(s);
+    expect(s._turnProgressHint).toBeUndefined();
+  });
+});
+
+describe("computeTypingLabel progressHint vs stall", () => {
+  test("progressHint 在 silence 低于 warn 时展示真实进度", () => {
+    const out = computeTypingLabel({
+      name: "助手",
+      secs: 20,
+      silenceMs: 5_000,
+      progressHint: "Read foo.ts",
+    });
+    expect(out.text).toContain("Read foo.ts");
+    expect(out.text).not.toContain("无新数据");
+  });
+
+  test("stall 文案盖过 leftover progressHint，不假装在动", () => {
+    const out = computeTypingLabel({
+      name: "助手",
+      secs: 120,
+      silenceMs: STALE_WARN_MS,
+      progressHint: "Read foo.ts",
+    });
+    expect(out.text).toContain("无新数据");
+    expect(out.text).not.toContain("Read foo.ts");
   });
 });
 
@@ -7275,5 +7335,117 @@ describe("applyServerMessages 版本护栏", () => {
     expect(s.messages.some((m) => m.id === "srv-c")).toBe(true);
     expect(s.messages.some((m) => m.id === "srv-a")).toBe(true); // 缺席但无授权 → 保留
     sock.stop();
+  });
+});
+
+describe("applyPermissionRequest — frameSeq exemption + requestId dedupe", () => {
+  const sessionKey = "agent:main:webchat:dm:s1";
+  const requestId = "ask-user:" + "cd".repeat(16);
+
+  function permFrame(over: Record<string, unknown> = {}): OutboundPermissionRequestWire {
+    return {
+      type: "outbound.permission_request",
+      sessionKey,
+      channel: "webchat",
+      peer: { id: "s1", kind: "dm" },
+      requestId,
+      toolName: "AskUserQuestion",
+      detachedAskUser: true,
+      expiresAt: Date.now() + 24 * 60 * 60_000,
+      ...over,
+    } as OutboundPermissionRequestWire;
+  }
+
+  test("a later frameSeq does not permanently drop an earlier permission_request", () => {
+    const s = sess();
+    applyOutboundMessage(s, msgFrame({
+      sessionKey,
+      frameSeq: 240,
+      isFinal: false,
+      blocks: [{ kind: "text", text: "tool result already arrived" }],
+    }));
+    expect(getFrameSeqCursor(s._lastFrameSeqByKey, s._lastFrameSeq, sessionKey)).toBe(240);
+
+    const card = applyPermissionRequest(s, permFrame({ frameSeq: 239 }));
+    expect(card).not.toBeNull();
+    expect(card!.requestId).toBe(requestId);
+    expect(card!._detachedAskUser).toBe(true);
+    expect(s.messages.filter((m) => m.role === "permission" && m.requestId === requestId)).toHaveLength(1);
+    // Must not rewind the cursor — other frame types keep drop-on-regression.
+    expect(getFrameSeqCursor(s._lastFrameSeqByKey, s._lastFrameSeq, sessionKey)).toBe(240);
+  });
+
+  test("the same requestId is not rendered as two cards", () => {
+    const s = sess();
+    const first = applyPermissionRequest(s, permFrame({ frameSeq: 10 }));
+    const second = applyPermissionRequest(s, permFrame({ frameSeq: 9 }));
+    expect(first).toBeTruthy();
+    expect(second).toBe(first);
+    expect(s.messages.filter((m) => m.role === "permission" && (m.requestId === requestId || m.id === requestId))).toHaveLength(1);
+  });
+});
+
+describe("applyPermissionSettled — frameSeq exemption + requestId idempotency", () => {
+  const sessionKey = "agent:main:webchat:dm:s1";
+  const requestId = "ask-user:" + "ef".repeat(16);
+
+  function permFrame(over: Record<string, unknown> = {}): OutboundPermissionRequestWire {
+    return {
+      type: "outbound.permission_request",
+      sessionKey,
+      channel: "webchat",
+      peer: { id: "s1", kind: "dm" },
+      requestId,
+      toolName: "AskUserQuestion",
+      detachedAskUser: true,
+      ...over,
+    } as OutboundPermissionRequestWire;
+  }
+
+  function settledFrame(over: Record<string, unknown> = {}): OutboundPermissionSettledWire {
+    return {
+      type: "outbound.permission_settled",
+      sessionKey,
+      channel: "webchat",
+      peer: { id: "s1", kind: "dm" },
+      requestId,
+      behavior: "allow",
+      reason: "remote",
+      answers: { "Which editor?": "Vim" },
+      ...over,
+    } as OutboundPermissionSettledWire;
+  }
+
+  test("settled arriving before request still marks the later card resolved", () => {
+    const s = sess();
+    applyOutboundMessage(s, msgFrame({
+      sessionKey,
+      frameSeq: 240,
+      isFinal: false,
+      blocks: [{ kind: "text", text: "tool result already arrived" }],
+    }));
+    applyPermissionSettled(s, settledFrame({ frameSeq: 239 }));
+    expect(s.messages.filter((m) => m.role === "permission")).toHaveLength(0);
+    expect(getFrameSeqCursor(s._lastFrameSeqByKey, s._lastFrameSeq, sessionKey)).toBe(240);
+
+    const card = applyPermissionRequest(s, permFrame({ frameSeq: 238 }));
+    expect(card).not.toBeNull();
+    expect(card!._resolved).toBe(true);
+    expect(card!._behavior).toBe("allow");
+    expect(card!._settledReason).toBe("remote");
+    expect(card!._answers).toEqual({ "Which editor?": "Vim" });
+    expect(s.messages.filter((m) => m.role === "permission" && m.requestId === requestId)).toHaveLength(1);
+    expect(getFrameSeqCursor(s._lastFrameSeqByKey, s._lastFrameSeq, sessionKey)).toBe(240);
+  });
+
+  test("duplicate settled frames do not create a second card or undo resolution", () => {
+    const s = sess();
+    const card = applyPermissionRequest(s, permFrame({ frameSeq: 10 }))!;
+    applyPermissionSettled(s, settledFrame({ frameSeq: 11, behavior: "allow" }));
+    applyPermissionSettled(s, settledFrame({ frameSeq: 9, behavior: "allow" }));
+    applyPermissionSettled(s, settledFrame({ frameSeq: 12, behavior: "allow" }));
+    expect(s.messages.filter((m) => m.role === "permission" && m.requestId === requestId)).toHaveLength(1);
+    expect(card._resolved).toBe(true);
+    expect(card._behavior).toBe("allow");
   });
 });

@@ -138,6 +138,11 @@ const SCHEMA_AGENT_GROUP_RESULT_MAX_CHARS = 2 * 1024;
 const SCHEMA_AGENT_GROUP_GOAL_MAX_CHARS = 4 * 1024;
 const SCHEMA_AGENT_GROUP_RUNID_MAX_CHARS = 128;
 const SCHEMA_AGENT_GROUP_AGENTID_MAX_CHARS = 128;
+const SCHEMA_PERMISSION_CARDS_MAX_LEN = 4;
+const SCHEMA_PERMISSION_PATCHES_MAX_LEN = 4;
+const SCHEMA_USER_ANSWER_MESSAGES_MAX_LEN = 4;
+const ASK_USER_REQUEST_ID_RE = /^ask-user:[0-9a-f]{32}$/;
+const ASK_USER_ANSWER_ID_RE = /^ask-ans-[A-Za-z0-9_-]{8,64}$/;
 
 /** One completed tool call within the turn. Mirrors the gateway-side
  *  `TurnToolEntry` shape. Master persists each as a server-authored row
@@ -218,6 +223,63 @@ const AgentGroupEntrySchema = z
     // teamCards.ts REVIEW_VERDICTS 手抄对齐,同 status 手抄 z.enum 风格)。仅审查员
     // 委派行携带,落库映射为 `_reviewVerdict`;普通成员委派恒 undefined。
     verdict: z.enum(["PASS", "NEEDS_FIX"]).optional(),
+  })
+  .strict();
+
+/** Detached Cursor ask_user card. Master persists each as a server-authored
+ *  `role: 'permission'` row using the gateway-generated requestId as the
+ *  message id (`ask-user:<32 hex>`), so hydrate / full-sync merge by id.
+ *  userId is NEVER accepted from the wire — derived from container identity. */
+const PermissionCardSchema = z
+  .object({
+    requestId: z
+      .string()
+      .min(1)
+      .max(64)
+      .regex(ASK_USER_REQUEST_ID_RE, {
+        message: "requestId must match ask-user:<32 hex>",
+      }),
+    questions: z.array(z.unknown()).min(1).max(4),
+    sessionKey: z.string().min(1).max(256),
+    expiresAt: z.number().int().positive(),
+    ts: z.number().int().positive().optional(),
+    channel: z.string().min(1).max(64).optional(),
+    peer: z
+      .object({
+        id: z.string().min(1).max(80),
+        kind: z.enum(["dm", "group"]),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict();
+
+const PermissionPatchSchema = z
+  .object({
+    requestId: z
+      .string()
+      .min(1)
+      .max(64)
+      .regex(ASK_USER_REQUEST_ID_RE, {
+        message: "requestId must match ask-user:<32 hex>",
+      }),
+    behavior: z.enum(["allow", "deny"]),
+    settledReason: z.enum(["remote", "already_settled", "disconnect", "timeout", "crashed"]),
+    answers: z.record(z.string(), z.string().max(512)).optional(),
+  })
+  .strict();
+
+const UserAnswerMessageSchema = z
+  .object({
+    id: z
+      .string()
+      .min(8)
+      .max(80)
+      .regex(ASK_USER_ANSWER_ID_RE, {
+        message: "user answer id must match ask-ans-<token>",
+      }),
+    text: z.string().min(1).max(MAX_BODY_BYTES),
+    ts: z.number().int().positive().optional(),
   })
   .strict();
 
@@ -372,6 +434,23 @@ const BodySchema = z
       .array(AgentGroupEntrySchema)
       .max(SCHEMA_AGENT_GROUPS_MAX_LEN)
       .optional(),
+    /** Detached ask_user cards. Optional; old containers never send this.
+     *  A permission-only POST (empty text, no tools/thinking/groups) is how
+     *  the container persists a 24h question card into master's hot tail. */
+    permissionCards: z
+      .array(PermissionCardSchema)
+      .max(SCHEMA_PERMISSION_CARDS_MAX_LEN)
+      .optional(),
+    /** Resolved-state patches for previously persisted ask_user cards. */
+    permissionPatches: z
+      .array(PermissionPatchSchema)
+      .max(SCHEMA_PERMISSION_PATCHES_MAX_LEN)
+      .optional(),
+    /** User-answer rows that accompany an allow settlement. */
+    userAnswerMessages: z
+      .array(UserAnswerMessageSchema)
+      .max(SCHEMA_USER_ANSWER_MESSAGES_MAX_LEN)
+      .optional(),
   })
   .strict()
   .refine(
@@ -381,10 +460,13 @@ const BodySchema = z
       (v.tools !== undefined && v.tools.length > 0) ||
       (v.assistantSegments !== undefined && v.assistantSegments.length > 0) ||
       (v.thinkingSegments !== undefined && v.thinkingSegments.length > 0) ||
-      (v.agentGroups !== undefined && v.agentGroups.length > 0),
+      (v.agentGroups !== undefined && v.agentGroups.length > 0) ||
+      (v.permissionCards !== undefined && v.permissionCards.length > 0) ||
+      (v.permissionPatches !== undefined && v.permissionPatches.length > 0) ||
+      (v.userAnswerMessages !== undefined && v.userAnswerMessages.length > 0),
     {
       message:
-        "either text, thinkingText, tools[], assistantSegments[], thinkingSegments[], or agentGroups[] must be non-empty",
+        "either text, thinkingText, tools[], assistantSegments[], thinkingSegments[], agentGroups[], permissionCards[], permissionPatches[], or userAnswerMessages[] must be non-empty",
     },
   );
 
@@ -401,7 +483,7 @@ export type ServerAuthoredMessageInput = {
   /** 'thinking' for Phase 0.4 reasoning persistence; 'assistant' for the
    *  user-visible turn text; 'tool' for refresh-durable tool details
    *  (Phase 1 — replaces the ephemeral client-stripped tool rows). */
-  role: "assistant" | "thinking" | "tool" | "agent-group";
+  role: "assistant" | "thinking" | "tool" | "agent-group" | "permission" | "user";
   text: string;
   ts: number;
   status: "completed" | "interrupted" | "crashed";
@@ -457,6 +539,16 @@ export type ServerAuthoredMessageInput = {
   completedAt?: number;
   // P2 债C — 审查裁决展示字段(仅隐藏审查员委派行带);前端渲染 PASS/未通过。
   _reviewVerdict?: "PASS" | "NEEDS_FIX";
+  // ── role: 'permission' fields (detached ask_user) ──────────────────
+  requestId?: string;
+  _resolved?: boolean;
+  _detachedAskUser?: boolean;
+  _askUserSessionKey?: string;
+  _askUserExpiresAt?: number;
+  _askUserUserId?: string;
+  _askUserChannel?: string;
+  _askUserPeer?: { id: string; kind: "dm" | "group" };
+  _source?: "server";
 };
 
 export type ServerAuthoredStorageResult = {
@@ -504,6 +596,26 @@ export interface ServerAuthoredStorage {
     userId: string,
     msgId: string,
   ): Promise<{ merged: string; drained: number }>;
+  /** Optional: hydrate a previously persisted ask_user card (GET). */
+  getClientSession?(
+    sessId: string,
+    userId: string,
+  ): Promise<{ messages?: unknown[] } | null>;
+  readArchivedMessages?(
+    sessId: string,
+    userId: string,
+    beforeSeq?: number,
+    limit?: number,
+  ): Promise<{ messages: unknown[]; hasMore: boolean; oldestSeq: number | null }>;
+  patchServerAuthoredMessage?(
+    sessId: string,
+    userId: string,
+    msgId: string,
+    patch: Record<string, unknown>,
+  ): Promise<
+    | { applied: true }
+    | { applied: false; reason: "session_not_found" | "session_deleted" | "not_found" }
+  >;
 }
 
 export interface ServerAuthoredHandlerDeps {
@@ -633,10 +745,10 @@ export function makeServerAuthoredHandler(
     });
 
     // 0) Method whitelist — caller's path router has already matched the path.
-    if (req.method !== "POST") {
-      // Method violations are caller-routing bugs, not container persist
-      // attempts. Don't pollute the persist metric.
-      sendJsonError(res, 405, "METHOD_NOT_ALLOWED", "POST required", requestId);
+    // POST writes a server-authored row; GET hydrates one previously persisted
+    // detached ask_user card. Other methods are caller-routing bugs.
+    if (req.method !== "POST" && req.method !== "GET") {
+      sendJsonError(res, 405, "METHOD_NOT_ALLOWED", "POST or GET required", requestId);
       return;
     }
 
@@ -670,6 +782,51 @@ export function makeServerAuthoredHandler(
       uid,
       containerId: identity.containerId,
     });
+
+    if (req.method === "GET") {
+      const url = new URL(req.url ?? "/", "http://internal");
+      const sessionId = url.searchParams.get("sessionId") ?? "";
+      const cardRequestId = url.searchParams.get("requestId") ?? "";
+      if (sessionId.length < 8 || sessionId.length > 50) {
+        sendJsonError(res, 400, "BAD_SESSION_ID", "sessionId must be 8-50 chars", requestId);
+        return;
+      }
+      if (!ASK_USER_REQUEST_ID_RE.test(cardRequestId)) {
+        sendJsonError(res, 400, "BAD_REQUEST_ID", "requestId must match ask-user:<32 hex>", requestId);
+        return;
+      }
+      if (!deps.storage.getClientSession) {
+        sendJsonError(res, 503, "LOOKUP_UNAVAILABLE", "session lookup is unavailable", requestId);
+        return;
+      }
+      try {
+        const sess = await deps.storage.getClientSession(sessionId, userId);
+        if (!sess) {
+          sendJsonError(res, 404, "SESSION_NOT_FOUND", "no client_sessions row for sessionId+userId", requestId);
+          return;
+        }
+        let message = findPermissionCardInMessages(sess.messages, cardRequestId);
+        if (!message && deps.storage.readArchivedMessages) {
+          let beforeSeq = 0;
+          for (let pageNo = 0; pageNo < 16 && !message; pageNo++) {
+            const page = await deps.storage.readArchivedMessages(sessionId, userId, beforeSeq, 200);
+            message = findPermissionCardInMessages(page.messages, cardRequestId);
+            if (message) break;
+            if (!page.hasMore || page.oldestSeq == null) break;
+            beforeSeq = page.oldestSeq;
+          }
+        }
+        if (!message) {
+          sendJsonError(res, 404, "PERMISSION_NOT_FOUND", "ask_user card not found", requestId);
+          return;
+        }
+        sendJsonOk(res, 200, { ok: true, message }, requestId);
+      } catch (err) {
+        userLog.error("ask_user_card_lookup_failed", { sessionId, requestId: cardRequestId, err: err as Error });
+        sendJsonError(res, 500, "LOOKUP_ERROR", "ask_user card lookup failed", requestId);
+      }
+      return;
+    }
 
     // 2) Read + schema-validate body
     let body: ServerAuthoredBody;
@@ -1139,15 +1296,192 @@ export function makeServerAuthoredHandler(
       else metric("error", "agent-group"); // malformed
     }
 
+    // ── Write detached ask_user permission cards ──
+    //
+    // Each card persists as a server-authored `role: 'permission'` row whose
+    // id IS the gateway-generated requestId. That is the hydrate / full-sync
+    // merge key. Unlike assistant/tool rows we do NOT derive srv-<session>-tN
+    // ids here — those would collide with the in-flight turn tape.
+    const permissionCards = body.permissionCards ?? [];
+    const permissionCount = permissionCards.length;
+    const hasPermissionCards = permissionCount > 0;
+    const permissionResults: (StorageResult | null)[] = new Array(permissionCount).fill(null);
+    const permissionThrew: boolean[] = new Array(permissionCount).fill(false);
+    const nowMs = deps.now ?? Date.now;
+    for (let i = 0; i < permissionCount; i++) {
+      const card = permissionCards[i]!;
+      const input = { questions: card.questions };
+      try {
+        permissionResults[i] = await deps.storage.appendServerAuthoredMessage(
+          body.sessionId,
+          userId,
+          {
+            id: card.requestId,
+            role: "permission",
+            text: "AskUserQuestion",
+            ts: card.ts ?? body.createdAt ?? nowMs(),
+            status: body.status,
+            requestId: card.requestId,
+            toolName: "AskUserQuestion",
+            inputJson: input,
+            inputPreview: JSON.stringify(input).slice(0, 400),
+            _resolved: false,
+            _detachedAskUser: true,
+            _askUserSessionKey: card.sessionKey,
+            _askUserExpiresAt: card.expiresAt,
+            _askUserUserId: userId,
+            _askUserChannel: card.channel ?? "webchat",
+            ...(card.peer ? { _askUserPeer: card.peer } : {}),
+            _source: "server",
+          },
+        );
+      } catch (err) {
+        permissionThrew[i] = true;
+        userLog.error("permission_card_storage_threw", {
+          sessionId: body.sessionId,
+          requestId: card.requestId,
+          err: err as Error,
+        });
+      }
+    }
+    for (let i = 0; i < permissionCount; i++) {
+      if (permissionThrew[i]) {
+        metric("error", "permission");
+        continue;
+      }
+      const r = permissionResults[i];
+      if (!r) {
+        metric("error", "permission");
+        continue;
+      }
+      if (r.applied) metric("ok", "permission");
+      else if (r.reason === "already_exists") metric("deduped", "permission");
+      else if (r.reason === "session_not_found")
+        metric("reject_session_missing", "permission");
+      else if (r.reason === "session_deleted")
+        metric("reject_session_deleted", "permission");
+      else if (r.reason === "oversized")
+        metric("reject_oversized", "permission");
+      else metric("error", "permission");
+    }
+
+    // ── Patch previously persisted ask_user cards as resolved ──
+    const permissionPatches = body.permissionPatches ?? [];
+    const patchCount = permissionPatches.length;
+    const hasPermissionPatches = patchCount > 0;
+    const patchResults: (StorageResult | null)[] = new Array(patchCount).fill(null);
+    const patchThrew: boolean[] = new Array(patchCount).fill(false);
+    for (let i = 0; i < patchCount; i++) {
+      const patch = permissionPatches[i]!;
+      try {
+        if (!deps.storage.patchServerAuthoredMessage) {
+          throw new Error("patchServerAuthoredMessage is unavailable");
+        }
+        const r = await deps.storage.patchServerAuthoredMessage(
+          body.sessionId,
+          userId,
+          patch.requestId,
+          {
+            _resolved: true,
+            _behavior: patch.behavior,
+            _settledReason: patch.settledReason,
+            ...(patch.answers ? { _answers: patch.answers } : {}),
+          },
+        );
+        patchResults[i] = r.applied
+          ? { applied: true }
+          : {
+              applied: false,
+              reason: r.reason === "not_found" ? "session_not_found" : r.reason,
+            };
+      } catch (err) {
+        patchThrew[i] = true;
+        userLog.error("permission_patch_storage_threw", {
+          sessionId: body.sessionId,
+          requestId: patch.requestId,
+          err: err as Error,
+        });
+      }
+    }
+    for (let i = 0; i < patchCount; i++) {
+      if (patchThrew[i]) {
+        metric("error", "permission");
+        continue;
+      }
+      const r = patchResults[i];
+      if (!r) {
+        metric("error", "permission");
+        continue;
+      }
+      if (r.applied) metric("ok", "permission");
+      else if (r.reason === "session_not_found")
+        metric("reject_session_missing", "permission");
+      else if (r.reason === "session_deleted")
+        metric("reject_session_deleted", "permission");
+      else metric("error", "permission");
+    }
+
+    // ── Persist the user-answer row that accompanies an allow settlement ──
+    const userAnswerMessages = body.userAnswerMessages ?? [];
+    const userAnswerCount = userAnswerMessages.length;
+    const hasUserAnswerMessages = userAnswerCount > 0;
+    const userAnswerResults: (StorageResult | null)[] = new Array(userAnswerCount).fill(null);
+    const userAnswerThrew: boolean[] = new Array(userAnswerCount).fill(false);
+    for (let i = 0; i < userAnswerCount; i++) {
+      const answer = userAnswerMessages[i]!;
+      try {
+        userAnswerResults[i] = await deps.storage.appendServerAuthoredMessage(
+          body.sessionId,
+          userId,
+          {
+            id: answer.id,
+            role: "user",
+            text: answer.text,
+            ts: answer.ts ?? body.createdAt ?? nowMs(),
+            status: body.status,
+            _source: "server",
+          },
+        );
+      } catch (err) {
+        userAnswerThrew[i] = true;
+        userLog.error("user_answer_storage_threw", {
+          sessionId: body.sessionId,
+          id: answer.id,
+          err: err as Error,
+        });
+      }
+    }
+    for (let i = 0; i < userAnswerCount; i++) {
+      if (userAnswerThrew[i]) {
+        metric("error", "permission");
+        continue;
+      }
+      const r = userAnswerResults[i];
+      if (!r) {
+        metric("error", "permission");
+        continue;
+      }
+      if (r.applied) metric("ok", "permission");
+      else if (r.reason === "already_exists") metric("deduped", "permission");
+      else if (r.reason === "session_not_found")
+        metric("reject_session_missing", "permission");
+      else if (r.reason === "session_deleted")
+        metric("reject_session_deleted", "permission");
+      else if (r.reason === "oversized")
+        metric("reject_oversized", "permission");
+      else metric("error", "permission");
+    }
+
     // ── Branch A: no-assistant path — thinking-only, tools-only,
-    //    agentGroups-only, or a mix ──
+    //    agentGroups-only, permission-only, or a mix ──
     //
     // HTTP outcome priority (highest-priority present content decides):
-    //   hasThinking      → thinking decides HTTP; tools/agentGroups best-effort.
-    //   tools-only       → first tool decides HTTP; agentGroups best-effort.
-    //   agentGroups-only → first agent-group decides HTTP.
+    //   hasThinking      → thinking decides HTTP; tools/agentGroups/permission best-effort.
+    //   tools-only       → first tool decides HTTP; agentGroups/permission best-effort.
+    //   agentGroups-only → first agent-group decides HTTP; permission best-effort.
+    //   permission-only  → first permission card decides HTTP.
     if (!hasAssistant) {
-      // Schema refine guarantees hasThinking || hasTools || hasAgentGroups here.
+      // Schema refine guarantees hasThinking || hasTools || hasAgentGroups || hasPermissionCards here.
       if (hasThinking) {
         // Fix B — emit per-segment metrics for non-last thinking writes
         // first (they're best-effort under the segment path); the last
@@ -1357,7 +1691,7 @@ export function makeServerAuthoredHandler(
         requestId,
       );
       return;
-      } else {
+      } else if (hasAgentGroups) {
         // agentGroups-only path — no assistant, no thinking, no tools (leader
         // crashed/interrupted after delegating, before producing text). Schema
         // refine guarantees hasAgentGroups here. First agent-group's outcome
@@ -1432,6 +1766,155 @@ export function makeServerAuthoredHandler(
           "master row data corrupt",
           requestId,
         );
+        return;
+      } else if (hasPermissionCards) {
+        // permission-card-only path — detached ask_user create sidecar.
+        if (permissionThrew[0]) {
+          sendJsonError(res, 500, "STORAGE_ERROR", "storage write failed", requestId);
+          return;
+        }
+        const p0 = permissionResults[0]!;
+        if (p0.applied || p0.reason === "already_exists") {
+          sendJsonOk(
+            res,
+            200,
+            p0.applied ? { ok: true } : { ok: true, idempotent: true },
+            requestId,
+          );
+          return;
+        }
+        if (p0.reason === "session_not_found") {
+          userLog.info("permission_only_session_not_found", {
+            sessionId: body.sessionId,
+            requestId: permissionCards[0]?.requestId,
+          });
+          sendJsonError(
+            res,
+            404,
+            "SESSION_NOT_FOUND",
+            "no client_sessions row for sessionId+userId",
+            requestId,
+          );
+          return;
+        }
+        if (p0.reason === "session_deleted") {
+          userLog.info("permission_only_session_deleted", {
+            sessionId: body.sessionId,
+            requestId: permissionCards[0]?.requestId,
+          });
+          sendJsonError(
+            res,
+            410,
+            "SESSION_DELETED",
+            "client_sessions row is soft-deleted",
+            requestId,
+          );
+          return;
+        }
+        if (p0.reason === "oversized") {
+          userLog.error("permission_only_session_oversized", {
+            sessionId: body.sessionId,
+            postSpillUnexpected: true,
+          });
+          sendJsonError(
+            res,
+            413,
+            "SESSION_OVERSIZED",
+            "client_sessions row exceeds MAX_SESSION_BYTES; admin must strip before further writes",
+            requestId,
+          );
+          return;
+        }
+        userLog.error("master_row_malformed_permission", {
+          sessionId: body.sessionId,
+        });
+        sendJsonError(
+          res,
+          500,
+          "ROW_MALFORMED",
+          "master row data corrupt",
+          requestId,
+        );
+        return;
+      } else if (hasPermissionPatches) {
+        if (patchThrew[0]) {
+          sendJsonError(res, 500, "STORAGE_ERROR", "storage write failed", requestId);
+          return;
+        }
+        const p0 = patchResults[0]!;
+        if (p0.applied) {
+          sendJsonOk(res, 200, { ok: true }, requestId);
+          return;
+        }
+        if (p0.reason === "session_not_found") {
+          sendJsonError(
+            res,
+            404,
+            "SESSION_NOT_FOUND",
+            "no client_sessions row or permission card for sessionId+userId",
+            requestId,
+          );
+          return;
+        }
+        if (p0.reason === "session_deleted") {
+          sendJsonError(
+            res,
+            410,
+            "SESSION_DELETED",
+            "client_sessions row is soft-deleted",
+            requestId,
+          );
+          return;
+        }
+        sendJsonError(res, 500, "ROW_MALFORMED", "master row data corrupt", requestId);
+        return;
+      } else if (hasUserAnswerMessages) {
+        // user-answer-only sidecar
+        if (userAnswerThrew[0]) {
+          sendJsonError(res, 500, "STORAGE_ERROR", "storage write failed", requestId);
+          return;
+        }
+        const u0 = userAnswerResults[0]!;
+        if (u0.applied || u0.reason === "already_exists") {
+          sendJsonOk(
+            res,
+            200,
+            u0.applied ? { ok: true } : { ok: true, idempotent: true },
+            requestId,
+          );
+          return;
+        }
+        if (u0.reason === "session_not_found") {
+          sendJsonError(
+            res,
+            404,
+            "SESSION_NOT_FOUND",
+            "no client_sessions row for sessionId+userId",
+            requestId,
+          );
+          return;
+        }
+        if (u0.reason === "session_deleted") {
+          sendJsonError(
+            res,
+            410,
+            "SESSION_DELETED",
+            "client_sessions row is soft-deleted",
+            requestId,
+          );
+          return;
+        }
+        if (u0.reason === "oversized") {
+          sendJsonError(
+            res,
+            413,
+            "SESSION_OVERSIZED",
+            "client_sessions row exceeds MAX_SESSION_BYTES; admin must strip before further writes",
+            requestId,
+          );
+          return;
+        }
+        sendJsonError(res, 500, "ROW_MALFORMED", "master row data corrupt", requestId);
         return;
       }
     }
@@ -2073,6 +2556,19 @@ async function readBoundedJson(
       `body is not valid JSON: ${(err as Error).message}`,
     );
   }
+}
+
+function findPermissionCardInMessages(
+  messages: unknown,
+  requestId: string,
+): Record<string, unknown> | undefined {
+  if (!Array.isArray(messages)) return undefined;
+  return messages.find((m) => {
+    if (!m || typeof m !== "object" || Array.isArray(m)) return false;
+    const row = m as Record<string, unknown>;
+    if (row.role !== "permission") return false;
+    return row.id === requestId || row.requestId === requestId;
+  }) as Record<string, unknown> | undefined;
 }
 
 function sendJsonOk(

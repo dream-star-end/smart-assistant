@@ -467,6 +467,10 @@ export type ChatMessage = {
   /** Durable permission response exists but Master has not yet reported an
    * applied/terminal outcome. The card stays non-resolved during this phase. */
   _controlPending?: boolean;
+  /** Detached Cursor ask_user card: 24h TTL, answerable after tab/device switch. */
+  _detachedAskUser?: boolean;
+  /** Absolute expiry ms carried on the permission_request frame when present. */
+  _askUserExpiresAt?: number;
 };
 
 /**
@@ -499,6 +503,13 @@ export type ChatSession = {
   // ── frameSeq 去重游标（§3）──
   _lastFrameSeqByKey?: Record<string, number>;
   _lastFrameSeq?: number;
+  /** Settled frames that arrived before their permission_request. Applied
+   *  when the matching card is created; keyed by requestId. */
+  _pendingPermissionSettlements?: Record<string, {
+    behavior: "allow" | "deny";
+    reason?: string | null;
+    answers?: Record<string, string>;
+  }>;
   /** server canonical 增量游标（历史加载 getSession 的 sinceSeq；随 StoredSession 落地）。*/
   _maxSeq?: number;
   /** Server history revision paired with `_maxSeq`; persisted across reload. */
@@ -547,6 +558,9 @@ export type ChatSession = {
   _turnStartedAt?: number | null;
   _lastFrameAt?: number;
   _turnStatus?: TurnStatusState | null;
+  /** Live one-line progress from outbound.turn_status status=working. Session
+   *  memory only — not a message row, not written to persist snapshots. */
+  _turnProgressHint?: string;
   /** User-row id of the turn currently streaming in this browser. */
   _activeClientMessageId?: string;
   /**
@@ -699,6 +713,7 @@ export function clearTurnTiming(sess: ChatSession): void {
   sess._lastFrameAt = undefined;
   sess._isFirstTurnAfterReady = false;
   sess._turnStatus = null;
+  sess._turnProgressHint = undefined;
   sess._liveTurnUsage = undefined;
   sess._turnCostCredits = "0";
   sess._turnCostSeenRequestIds = new Set();

@@ -239,6 +239,38 @@ export interface V3MasterSinkWirePayload {
   runtimeEvents?: DurableRuntimeEvent[]
   /** Final engine-reported usage, durably co-located with the paid turn. */
   engineBilling?: DurableCodexBilling
+  /**
+   * Detached Cursor ask_user cards. Optional and ignored by old masters
+   * on the lossless-tape path (unknown keys are dropped at parse).
+   * A permission-only sidecar is POSTed as the legacy v1 JSON body so
+   * master can `appendServerAuthoredMessage` a `role:'permission'` row
+   * into the hot tail — not a billed turn tape.
+   */
+  permissionCards?: Array<{
+    requestId: string
+    questions: Array<Record<string, unknown>>
+    sessionKey: string
+    expiresAt: number
+    ts?: number
+    channel?: string
+    peer?: { id: string; kind: 'dm' | 'group' }
+  }>
+  /**
+   * Optional resolved-state patches for previously persisted ask_user cards.
+   * Same v1 sidecar as permissionCards — not a billed turn tape.
+   */
+  permissionPatches?: Array<{
+    requestId: string
+    behavior: 'allow' | 'deny'
+    settledReason: 'remote' | 'already_settled' | 'disconnect' | 'timeout' | 'crashed'
+    answers?: Record<string, string>
+  }>
+  /** Optional user-answer rows that accompany an allow settlement. */
+  userAnswerMessages?: Array<{
+    id: string
+    text: string
+    ts?: number
+  }>
 }
 
 /**
@@ -428,6 +460,135 @@ async function postLosslessTurnTapeEnvelope(
   throw new V3SinkError(`master ${status}: ${truncateForLog(bodyText)}`, 'transient', status)
 }
 
+export function isPermissionSidecarPayload(payload: V3MasterSinkWirePayload): boolean {
+  const hasCards = !!(payload.permissionCards && payload.permissionCards.length > 0)
+  const hasPatches = !!(payload.permissionPatches && payload.permissionPatches.length > 0)
+  const hasAnswers = !!(payload.userAnswerMessages && payload.userAnswerMessages.length > 0)
+  if (!hasCards && !hasPatches && !hasAnswers) return false
+  if (payload.text && payload.text.length > 0) return false
+  if (payload.thinkingText) return false
+  if (payload.tools && payload.tools.length > 0) return false
+  if (payload.agentGroups && payload.agentGroups.length > 0) return false
+  if (payload.assistantSegments && payload.assistantSegments.length > 0) return false
+  if (payload.thinkingSegments && payload.thinkingSegments.length > 0) return false
+  if (payload.structuredBlocks && payload.structuredBlocks.length > 0) return false
+  if (payload.runtimeEvents && payload.runtimeEvents.length > 0) return false
+  if (payload.engineBilling) return false
+  if (payload.continuationOfTurnKey) return false
+  return true
+}
+
+export function buildPermissionSidecarV1Body(payload: V3MasterSinkWirePayload & { agentId: string }): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    sessionId: payload.sessionId,
+    agentId: payload.agentId,
+    turnIndex: payload.turnIndex,
+    status: payload.status,
+    text: '',
+    createdAt: payload.createdAt ?? Date.now(),
+  }
+  if (payload.permissionCards && payload.permissionCards.length > 0) {
+    body.permissionCards = payload.permissionCards
+  }
+  if (payload.permissionPatches && payload.permissionPatches.length > 0) {
+    body.permissionPatches = payload.permissionPatches
+  }
+  if (payload.userAnswerMessages && payload.userAnswerMessages.length > 0) {
+    body.userAnswerMessages = payload.userAnswerMessages
+  }
+  return body
+}
+
+export async function fetchAskUserPermissionCard(
+  args: {
+    sessionId: string
+    requestId: string
+    config?: V3MasterSinkConfig | null
+    fetcher?: typeof undiciRequest
+    timeoutMs?: number
+  },
+): Promise<Record<string, unknown> | null> {
+  const config = args.config === undefined ? readV3MasterSinkConfig() : args.config
+  if (!config) return null
+  const fetcher = args.fetcher ?? undiciRequest
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), args.timeoutMs ?? ATTEMPT_TIMEOUT_MS)
+  const url = `${config.baseUrl}${SERVER_AUTHORED_PATH}`
+    + `?sessionId=${encodeURIComponent(args.sessionId)}`
+    + `&requestId=${encodeURIComponent(args.requestId)}`
+  let res: Awaited<ReturnType<typeof undiciRequest>>
+  try {
+    res = await fetcher(url, {
+      method: 'GET',
+      headers: {
+        authorization: `Bearer ${config.bearer}`,
+      },
+      signal: controller.signal,
+    })
+  } catch (err) {
+    clearTimeout(timer)
+    throw new V3SinkError(`network error: ${err instanceof Error ? err.message : String(err)}`, 'transient')
+  }
+  clearTimeout(timer)
+  let bodyText = ''
+  try {
+    bodyText = await readBoundedBody(res.body, MAX_DIAGNOSTIC_RESPONSE_BYTES)
+  } catch {
+    // Status remains authoritative when an error response body cannot be read.
+  }
+  const status = res.statusCode
+  if (status === 404 || status === 410) return null
+  if (status < 200 || status >= 300) {
+    throw new V3SinkError(`master ${status}: ${truncateForLog(bodyText)}`, 'transient', status)
+  }
+  try {
+    const parsed = JSON.parse(bodyText) as { message?: unknown }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
+    const message = parsed.message
+    if (!message || typeof message !== 'object' || Array.isArray(message)) return null
+    return message as Record<string, unknown>
+  } catch {
+    throw new V3SinkError('master GET returned non-JSON body', 'transient', status)
+  }
+}
+
+async function postServerAuthoredJson(body: unknown, deps: AttemptSendDeps): Promise<void> {
+  const fetcher = deps.fetcher ?? undiciRequest
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), deps.timeoutMs ?? ATTEMPT_TIMEOUT_MS)
+  let res: Awaited<ReturnType<typeof undiciRequest>>
+  try {
+    res = await fetcher(`${deps.config.baseUrl}${SERVER_AUTHORED_PATH}`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json; charset=utf-8',
+        authorization: `Bearer ${deps.config.bearer}`,
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    })
+  } catch (err) {
+    clearTimeout(timer)
+    throw new V3SinkError(`network error: ${err instanceof Error ? err.message : String(err)}`, 'transient')
+  }
+  clearTimeout(timer)
+  let bodyText = ''
+  try {
+    bodyText = await readBoundedBody(res.body, MAX_DIAGNOSTIC_RESPONSE_BYTES)
+  } catch {
+    // Status remains authoritative when an error response body cannot be read.
+  }
+  const status = res.statusCode
+  if (status >= 200 && status < 300) return
+  if (status === 404) {
+    throw new V3SinkError(`session_not_found: ${truncateForLog(bodyText)}`, 'session_missing', status)
+  }
+  if (status === 410) {
+    throw new V3SinkError(`session_deleted: ${truncateForLog(bodyText)}`, 'fatal', status)
+  }
+  throw new V3SinkError(`master ${status}: ${truncateForLog(bodyText)}`, 'transient', status)
+}
+
 export async function attemptSendLossless(
   payload: V3MasterSinkWirePayload & { agentId: string },
   deps: AttemptSendDeps,
@@ -452,6 +613,16 @@ export async function attemptSend(
   payload: V3MasterSinkWirePayload,
   deps: AttemptSendDeps,
 ): Promise<void> {
+  if (isPermissionSidecarPayload(payload)) {
+    if (!payload.agentId) {
+      throw new V3SinkError('permission sidecar requires agentId', 'transient')
+    }
+    await postServerAuthoredJson(
+      buildPermissionSidecarV1Body(payload as V3MasterSinkWirePayload & { agentId: string }),
+      deps,
+    )
+    return
+  }
   const upgraded: V3MasterSinkWirePayload & { agentId: string } = payload.agentId
     ? payload as V3MasterSinkWirePayload & { agentId: string }
     : { ...payload, agentId: LOSSLESS_TURN_TAPE_LEGACY_AGENT_ID }

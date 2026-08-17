@@ -392,6 +392,8 @@ import {
   appendServerAuthoredMessageDrainByUser,
   drainDelegateCostForClientSession,
   getClientSession,
+  patchServerAuthoredMessage,
+  readArchivedMessages,
   getEngineContextMessages,
   hasCompletedClientTurn,
   // P1.7 slice 7c — broker assembly 需要的 master sqlite helpers
@@ -1914,6 +1916,9 @@ export async function registerCommercial(
           appendServerAuthoredMessageForRequest,
           appendServerAuthoredMessageDrainByUser,
           drainDelegateCostForClientSession,
+          getClientSession,
+          readArchivedMessages,
+          patchServerAuthoredMessage,
         },
         recordOversized: ({ userId, requestId, sessionId }) => {
           void recordProductFrictionEvent({
@@ -5012,6 +5017,12 @@ export async function registerCommercial(
       : {}),
     metrics: bridgeMetrics,
     markContainerActivity: markActivityForBridge,
+    // 每用户并发 /ws/chat 上限。缺省不传 → bridge 内 DEFAULT_MAX_PER_USER(3)。
+    // OC_WS_MAX_PER_USER 覆盖:自用实例多设备/多标签并发常超 3,超限时 registry
+    // 踢最老 → 被踢端 1s 重连再踢别人,形成互踢循环(2026-08-17 排障实录)。
+    ...(Number(process.env.OC_WS_MAX_PER_USER) > 0
+      ? { maxPerUser: Number(process.env.OC_WS_MAX_PER_USER) }
+      : {}),
     // 版本握手:cli launcher 注入 dist 目录(spa 才有)→ probe 读 index.html 的
     // oc-build meta;v3/测试 undefined → bridge 不发 sys.frontend_build,零变化。
     getFrontendBuildId: options.webDistDir
