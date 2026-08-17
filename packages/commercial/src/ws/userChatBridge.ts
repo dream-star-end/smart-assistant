@@ -140,6 +140,7 @@ import {
   markTurnControlReceipt,
   persistPermissionAuthority,
   releaseTurnControlForRetry,
+  resolvePermissionExpiresAt,
   TurnControlConflictError,
 } from "../dispatch/turnControlStore.js";
 import {
@@ -6454,7 +6455,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               askPayload: parsedPermission.toolName === "AskUserQuestion"
                 ? parsedPermission.inputJson
                 : null,
-              expiresAt: new Date(Date.now() + 30 * 60_000),
+              expiresAt: resolvePermissionExpiresAt(parsedPermission.expiresAt),
             }).then(() => {});
           }
         }

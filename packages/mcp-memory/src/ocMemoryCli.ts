@@ -37,6 +37,12 @@ import {
   handleSessionSearch,
   type MemoryToolResult,
 } from './memoryTools.js'
+import { gatewayAuthHeaders, gatewayBaseUrl, postJsonToGateway } from './gatewayClient.js'
+import {
+  resolveDelegateWaitHardMs,
+  resolveDelegateWaitPollMs,
+  runDelegateWaitLoop,
+} from './delegateWaitCli.js'
 
 const TOOL = 'oc-memory'
 
@@ -86,6 +92,7 @@ const USAGE = [
   '  oc-memory archival-add "<text>" [--tags a,b,c]',
   '  oc-memory archival-search "<query>" [--limit N]',
   '  oc-memory archival-delete <id>',
+  '  oc-memory delegate-wait <jobId> [<jobId>...]',
 ].join('\n')
 
 /**
@@ -138,6 +145,27 @@ async function main(): Promise<void> {
   }
 
   const { positional, flags } = parseFlags(rest)
+
+  // Cursor MCP 60s 上限的委派长等待:走网关 /api/delegate/wait 长轮询,不碰记忆后端。
+  if (cmd === 'delegate-wait') {
+    if (positional.length === 0) fail('delegate-wait requires at least one <jobId> positional argument')
+    const base = gatewayBaseUrl()
+    const headers = gatewayAuthHeaders()
+    const result = await runDelegateWaitLoop({
+      jobIds: positional,
+      pollWaitMs: resolveDelegateWaitPollMs(),
+      hardTimeoutMs: resolveDelegateWaitHardMs(),
+      waitOnce: (jobId, waitMs) =>
+        postJsonToGateway(`${base}/api/delegate/wait`, {
+          headers,
+          body: JSON.stringify({ jobId, waitMs }),
+          timeoutMs: waitMs + 15_000,
+        }),
+    })
+    if (result.stderr) process.stderr.write(result.stderr)
+    if (result.stdout) process.stdout.write(result.stdout)
+    process.exit(result.exitCode)
+  }
   if (cmd === 'core-search') {
     const query = positional[0]
     if (!query) fail('core-search requires a "<query>" positional argument')

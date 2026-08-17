@@ -3847,7 +3847,7 @@ export interface QueuedMessage {
   userId: string
   message: {
     id: string
-    role: 'assistant' | 'user' | 'system' | 'thinking' | 'tool'
+    role: 'assistant' | 'user' | 'system' | 'thinking' | 'tool' | 'permission'
     text?: string
     ts?: number
     status?: 'completed' | 'interrupted' | 'crashed'
@@ -3925,7 +3925,7 @@ export async function appendServerAuthoredMessageDurable(
   userId: string,
   message: {
     id: string
-    role: 'assistant' | 'user' | 'system' | 'thinking' | 'tool'
+    role: 'assistant' | 'user' | 'system' | 'thinking' | 'tool' | 'permission'
     text?: string
     ts?: number
     [k: string]: unknown

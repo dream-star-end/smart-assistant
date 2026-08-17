@@ -391,6 +391,8 @@ import {
   appendServerAuthoredMessageDrainByUser,
   drainDelegateCostForClientSession,
   getClientSession,
+  patchServerAuthoredMessage,
+  readArchivedMessages,
   getEngineContextMessages,
   hasCompletedClientTurn,
   // P1.7 slice 7c — broker assembly 需要的 master sqlite helpers
@@ -1913,6 +1915,9 @@ export async function registerCommercial(
           appendServerAuthoredMessageForRequest,
           appendServerAuthoredMessageDrainByUser,
           drainDelegateCostForClientSession,
+          getClientSession,
+          readArchivedMessages,
+          patchServerAuthoredMessage,
         },
         recordOversized: ({ userId, requestId, sessionId }) => {
           void recordProductFrictionEvent({

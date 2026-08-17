@@ -54,7 +54,7 @@ function makeGateway(opts: {
     userId: '1',
     repoSessionId: undefined,
     _currentTurnKey: 'a'.repeat(64),
-    runner: { lastActivityAt: 1 },
+    runner: Object.assign(new EventEmitter(), { lastActivityAt: 1 }),
   }
   const directDelegate = {
     sessionKey: DIRECT_DELEGATE_KEY,
@@ -69,7 +69,7 @@ function makeGateway(opts: {
     _durableDelegateTranscript: [] as unknown[],
     _durableDelegateRuntimeEvents: [] as unknown[],
     _durableDelegateEngineBillings: [] as unknown[],
-    runner: { lastActivityAt: 1 },
+    runner: Object.assign(new EventEmitter(), { lastActivityAt: 1 }),
   }
   const gw = Object.create(Gateway.prototype) as any
   gw._shuttingDown = false
@@ -187,8 +187,11 @@ describe('handleDelegateTask — child activity keeps synchronous ancestors live
     const pending = delegate(gw, 'coding-assistant', taskBody())
     await submitStarted
     assert.equal(childRunners.length, 1)
+    let parentActivity = 0
+    parentSession.runner.on('activity', () => { parentActivity += 1 })
     childRunners[0].emit('activity')
     assert.ok(parentSession.runner.lastActivityAt > 1, 'child activity must refresh root liveness')
+    assert.equal(parentActivity, 1, 'parent runner must receive activity so the 30-min timer can refresh')
 
     releaseSubmit()
     assert.equal((await pending).status, 200)
@@ -196,6 +199,7 @@ describe('handleDelegateTask — child activity keeps synchronous ancestors live
     parentSession.runner.lastActivityAt = 7
     childRunners[0].emit('activity')
     assert.equal(parentSession.runner.lastActivityAt, 7, 'late child activity must not leak across turns')
+    assert.equal(parentActivity, 1, 'detached child must not emit on parent')
   })
 
   it('nested child raw activity refreshes both direct delegate and webchat root', async () => {
@@ -218,9 +222,15 @@ describe('handleDelegateTask — child activity keeps synchronous ancestors live
       parentSessionKey: DIRECT_DELEGATE_KEY,
     }))
     await submitStarted
+    let directActivity = 0
+    let rootActivity = 0
+    directDelegate.runner.on('activity', () => { directActivity += 1 })
+    parentSession.runner.on('activity', () => { rootActivity += 1 })
     childRunners[0].emit('activity')
     assert.ok(directDelegate.runner.lastActivityAt > 1, 'nested activity must refresh direct parent')
     assert.ok(parentSession.runner.lastActivityAt > 1, 'nested activity must reach the webchat root')
+    assert.equal(directActivity, 1, 'direct parent must receive one activity event')
+    assert.equal(rootActivity, 1, 'webchat root must receive one activity event')
 
     releaseSubmit()
     assert.equal((await pending).status, 200)

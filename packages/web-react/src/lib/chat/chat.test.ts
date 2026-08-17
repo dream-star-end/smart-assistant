@@ -7277,3 +7277,115 @@ describe("applyServerMessages 版本护栏", () => {
     sock.stop();
   });
 });
+
+describe("applyPermissionRequest — frameSeq exemption + requestId dedupe", () => {
+  const sessionKey = "agent:main:webchat:dm:s1";
+  const requestId = "ask-user:" + "cd".repeat(16);
+
+  function permFrame(over: Record<string, unknown> = {}): OutboundPermissionRequestWire {
+    return {
+      type: "outbound.permission_request",
+      sessionKey,
+      channel: "webchat",
+      peer: { id: "s1", kind: "dm" },
+      requestId,
+      toolName: "AskUserQuestion",
+      detachedAskUser: true,
+      expiresAt: Date.now() + 24 * 60 * 60_000,
+      ...over,
+    } as OutboundPermissionRequestWire;
+  }
+
+  test("a later frameSeq does not permanently drop an earlier permission_request", () => {
+    const s = sess();
+    applyOutboundMessage(s, msgFrame({
+      sessionKey,
+      frameSeq: 240,
+      isFinal: false,
+      blocks: [{ kind: "text", text: "tool result already arrived" }],
+    }));
+    expect(getFrameSeqCursor(s._lastFrameSeqByKey, s._lastFrameSeq, sessionKey)).toBe(240);
+
+    const card = applyPermissionRequest(s, permFrame({ frameSeq: 239 }));
+    expect(card).not.toBeNull();
+    expect(card!.requestId).toBe(requestId);
+    expect(card!._detachedAskUser).toBe(true);
+    expect(s.messages.filter((m) => m.role === "permission" && m.requestId === requestId)).toHaveLength(1);
+    // Must not rewind the cursor — other frame types keep drop-on-regression.
+    expect(getFrameSeqCursor(s._lastFrameSeqByKey, s._lastFrameSeq, sessionKey)).toBe(240);
+  });
+
+  test("the same requestId is not rendered as two cards", () => {
+    const s = sess();
+    const first = applyPermissionRequest(s, permFrame({ frameSeq: 10 }));
+    const second = applyPermissionRequest(s, permFrame({ frameSeq: 9 }));
+    expect(first).toBeTruthy();
+    expect(second).toBe(first);
+    expect(s.messages.filter((m) => m.role === "permission" && (m.requestId === requestId || m.id === requestId))).toHaveLength(1);
+  });
+});
+
+describe("applyPermissionSettled — frameSeq exemption + requestId idempotency", () => {
+  const sessionKey = "agent:main:webchat:dm:s1";
+  const requestId = "ask-user:" + "ef".repeat(16);
+
+  function permFrame(over: Record<string, unknown> = {}): OutboundPermissionRequestWire {
+    return {
+      type: "outbound.permission_request",
+      sessionKey,
+      channel: "webchat",
+      peer: { id: "s1", kind: "dm" },
+      requestId,
+      toolName: "AskUserQuestion",
+      detachedAskUser: true,
+      ...over,
+    } as OutboundPermissionRequestWire;
+  }
+
+  function settledFrame(over: Record<string, unknown> = {}): OutboundPermissionSettledWire {
+    return {
+      type: "outbound.permission_settled",
+      sessionKey,
+      channel: "webchat",
+      peer: { id: "s1", kind: "dm" },
+      requestId,
+      behavior: "allow",
+      reason: "remote",
+      answers: { "Which editor?": "Vim" },
+      ...over,
+    } as OutboundPermissionSettledWire;
+  }
+
+  test("settled arriving before request still marks the later card resolved", () => {
+    const s = sess();
+    applyOutboundMessage(s, msgFrame({
+      sessionKey,
+      frameSeq: 240,
+      isFinal: false,
+      blocks: [{ kind: "text", text: "tool result already arrived" }],
+    }));
+    applyPermissionSettled(s, settledFrame({ frameSeq: 239 }));
+    expect(s.messages.filter((m) => m.role === "permission")).toHaveLength(0);
+    expect(getFrameSeqCursor(s._lastFrameSeqByKey, s._lastFrameSeq, sessionKey)).toBe(240);
+
+    const card = applyPermissionRequest(s, permFrame({ frameSeq: 238 }));
+    expect(card).not.toBeNull();
+    expect(card!._resolved).toBe(true);
+    expect(card!._behavior).toBe("allow");
+    expect(card!._settledReason).toBe("remote");
+    expect(card!._answers).toEqual({ "Which editor?": "Vim" });
+    expect(s.messages.filter((m) => m.role === "permission" && m.requestId === requestId)).toHaveLength(1);
+    expect(getFrameSeqCursor(s._lastFrameSeqByKey, s._lastFrameSeq, sessionKey)).toBe(240);
+  });
+
+  test("duplicate settled frames do not create a second card or undo resolution", () => {
+    const s = sess();
+    const card = applyPermissionRequest(s, permFrame({ frameSeq: 10 }))!;
+    applyPermissionSettled(s, settledFrame({ frameSeq: 11, behavior: "allow" }));
+    applyPermissionSettled(s, settledFrame({ frameSeq: 9, behavior: "allow" }));
+    applyPermissionSettled(s, settledFrame({ frameSeq: 12, behavior: "allow" }));
+    expect(s.messages.filter((m) => m.role === "permission" && m.requestId === requestId)).toHaveLength(1);
+    expect(card._resolved).toBe(true);
+    expect(card._behavior).toBe("allow");
+  });
+});

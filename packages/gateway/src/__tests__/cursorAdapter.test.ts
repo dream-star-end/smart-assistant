@@ -1758,4 +1758,402 @@ console.log(JSON.stringify({type:'result',subtype:'success',is_error:false,sessi
       await rm(dir, { recursive: true, force: true })
     }
   })
+
+  test('clamps pending keepalive env to documented bounds', () => {
+    assert.equal(_internals.parsePendingKeepaliveIntervalMs(''), _internals.PENDING_KEEPALIVE_INTERVAL_DEFAULT_MS)
+    assert.equal(_internals.parsePendingKeepaliveIntervalMs('bogus'), _internals.PENDING_KEEPALIVE_INTERVAL_DEFAULT_MS)
+    assert.equal(_internals.parsePendingKeepaliveIntervalMs('-1'), _internals.PENDING_KEEPALIVE_INTERVAL_DEFAULT_MS)
+    assert.equal(_internals.parsePendingKeepaliveIntervalMs('1000'), _internals.PENDING_KEEPALIVE_INTERVAL_MIN_MS)
+    assert.equal(_internals.parsePendingKeepaliveIntervalMs('200000'), _internals.PENDING_KEEPALIVE_INTERVAL_MAX_MS)
+    assert.equal(_internals.parsePendingKeepaliveIntervalMs('45000'), 45_000)
+    assert.equal(_internals.PENDING_KEEPALIVE_MAX_DEFAULT_MS, 2 * 60 * 60_000)
+    assert.equal(_internals.parsePendingKeepaliveMaxMs(''), _internals.PENDING_KEEPALIVE_MAX_DEFAULT_MS)
+    assert.equal(_internals.parsePendingKeepaliveMaxMs('1000'), _internals.PENDING_KEEPALIVE_MAX_MIN_MS)
+    assert.equal(
+      _internals.parsePendingKeepaliveMaxMs(String(7 * 60 * 60_000)),
+      _internals.PENDING_KEEPALIVE_MAX_MAX_MS,
+    )
+    assert.equal(_internals.parsePendingKeepaliveMaxMs(String(30 * 60_000)), 30 * 60_000)
+    assert.equal(_internals.PENDING_KEEPALIVE_STALL_DEFAULT_MS, 10 * 60_000)
+    assert.equal(_internals.parsePendingKeepaliveStallMs(''), _internals.PENDING_KEEPALIVE_STALL_DEFAULT_MS)
+    assert.equal(_internals.parsePendingKeepaliveStallMs('bogus'), _internals.PENDING_KEEPALIVE_STALL_DEFAULT_MS)
+    assert.equal(_internals.parsePendingKeepaliveStallMs('1000'), _internals.PENDING_KEEPALIVE_STALL_MIN_MS)
+    assert.equal(
+      _internals.parsePendingKeepaliveStallMs(String(2 * 60 * 60_000)),
+      _internals.PENDING_KEEPALIVE_STALL_MAX_MS,
+    )
+    assert.equal(_internals.parsePendingKeepaliveStallMs(String(15 * 60_000)), 15 * 60_000)
+    assert.equal(_internals.PENDING_KEEPALIVE_MIN_CPU_TICKS_DEFAULT, 2)
+    assert.equal(_internals.parsePendingKeepaliveMinCpuTicks(''), _internals.PENDING_KEEPALIVE_MIN_CPU_TICKS_DEFAULT)
+    assert.equal(_internals.parsePendingKeepaliveMinCpuTicks('0'), _internals.PENDING_KEEPALIVE_MIN_CPU_TICKS_DEFAULT)
+    assert.equal(_internals.parsePendingKeepaliveMinCpuTicks('100'), _internals.PENDING_KEEPALIVE_MIN_CPU_TICKS_MAX)
+    assert.equal(_internals.parsePendingKeepaliveMinCpuTicks('3'), 3)
+  })
+
+  function growingCpuProbe(step = 8): () => number {
+    let ticks = 10_000
+    return () => {
+      ticks += step
+      return ticks
+    }
+  }
+
+  function staticTranscriptProbe(): () => { files: Record<string, { size: number; mtimeMs: number }> } {
+    const files = { 'agent.jsonl': { size: 2048, mtimeMs: 1 } }
+    return () => ({ files: { ...files } })
+  }
+
+  async function waitUntil(predicate: () => boolean, timeoutMs: number, label: string): Promise<void> {
+    const started = Date.now()
+    while (!predicate()) {
+      if (Date.now() - started > timeoutMs) throw new Error(`timed out waiting for ${label}`)
+      await new Promise((resolve) => setTimeout(resolve, 15))
+    }
+  }
+
+  async function withHangingCursorWrapper(
+    emitToolStart: boolean,
+    body: (adapter: CursorAdapter, activity: { count: number }) => Promise<void>,
+  ): Promise<void> {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-keepalive-'))
+    const fake = path.join(dir, 'fake.cjs')
+    await writeFile(path.join(dir, 'persona.md'), 'PERSONA')
+    const toolLine = emitToolStart
+      ? "console.log(JSON.stringify({type:'tool_call',subtype:'started',call_id:'task-keep',tool_call:{taskToolCall:{args:{description:'long subagent',prompt:'work'}}}}));\n"
+      : ''
+    await writeFile(
+      fake,
+      `#!/usr/bin/env node
+${toolLine}setInterval(() => {}, 1000);
+`,
+    )
+    await chmod(fake, 0o755)
+    const oldBin = process.env.OC_CURSOR_WRAPPER_BIN
+    const oldGrace = process.env.OPENCLAUDE_CURSOR_SHUTDOWN_GRACE_MS
+    const oldFinal = process.env.OPENCLAUDE_CURSOR_SHUTDOWN_FINAL_DRAIN_MS
+    process.env.OC_CURSOR_WRAPPER_BIN = fake
+    process.env.OPENCLAUDE_CURSOR_SHUTDOWN_GRACE_MS = '200'
+    process.env.OPENCLAUDE_CURSOR_SHUTDOWN_FINAL_DRAIN_MS = '200'
+    const adapter = new CursorAdapter(opts(dir))
+    const activity = { count: 0 }
+    adapter.on('activity', () => { activity.count += 1 })
+    adapter.on('error', () => {})
+    try {
+      const run = adapter.submitTurn({
+        input: 'keepalive probe',
+        requestId: REQUEST,
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run.submitted
+      await body(adapter, activity)
+      adapter.interrupt()
+      await adapter.shutdown()
+      await adapter.waitForOutputDrain()
+    } finally {
+      _internals.setPendingKeepaliveTestHooks(null)
+      restoreEnv('OC_CURSOR_WRAPPER_BIN', oldBin)
+      restoreEnv('OPENCLAUDE_CURSOR_SHUTDOWN_GRACE_MS', oldGrace)
+      restoreEnv('OPENCLAUDE_CURSOR_SHUTDOWN_FINAL_DRAIN_MS', oldFinal)
+      await rm(dir, { recursive: true, force: true })
+    }
+  }
+
+  test('emits periodic activity while a tool call is pending', { timeout: 10_000 }, async () => {
+    _internals.setPendingKeepaliveTestHooks({
+      intervalMs: 40,
+      maxMs: 60_000,
+      stallMs: 60_000,
+      minCpuDeltaTicks: 1,
+      readCpuTicks: growingCpuProbe(),
+      readTranscriptFingerprint: staticTranscriptProbe(),
+    })
+    await withHangingCursorWrapper(true, async (adapter, activity) => {
+      await waitUntil(() => adapter.pendingToolCalls > 0, 5_000, 'pending tool')
+      const countAfterStart = activity.count
+      const activityAt = adapter.lastActivityAt
+      await new Promise((resolve) => setTimeout(resolve, 200))
+      assert.ok(
+        activity.count - countAfterStart >= 2,
+        `expected periodic keepalive activity, got ${activity.count - countAfterStart} extra emits`,
+      )
+      assert.ok(adapter.lastActivityAt > activityAt, 'keepalive must refresh lastActivityAt')
+    })
+  })
+
+  test('does not emit keepalive activity when no tool is pending', { timeout: 10_000 }, async () => {
+    _internals.setPendingKeepaliveTestHooks({
+      intervalMs: 40,
+      maxMs: 60_000,
+      stallMs: 60_000,
+      minCpuDeltaTicks: 1,
+      readCpuTicks: growingCpuProbe(),
+      readTranscriptFingerprint: staticTranscriptProbe(),
+    })
+    await withHangingCursorWrapper(false, async (adapter, activity) => {
+      await waitUntil(() => adapter.isRunning, 5_000, 'cursor process running')
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      assert.equal(adapter.pendingToolCalls, 0)
+      const countAfterStart = activity.count
+      const activityAt = adapter.lastActivityAt
+      await new Promise((resolve) => setTimeout(resolve, 150))
+      assert.equal(activity.count, countAfterStart)
+      assert.equal(adapter.lastActivityAt, activityAt)
+    })
+  })
+
+  test('stops keepalive emits after the pending-tool max budget', { timeout: 10_000 }, async () => {
+    const clock = { offsetMs: 0 }
+    _internals.setPendingKeepaliveTestHooks({
+      intervalMs: 40,
+      maxMs: 5_000,
+      stallMs: 60_000,
+      minCpuDeltaTicks: 1,
+      now: () => Date.now() + clock.offsetMs,
+      readCpuTicks: growingCpuProbe(),
+      readTranscriptFingerprint: staticTranscriptProbe(),
+    })
+    await withHangingCursorWrapper(true, async (adapter, activity) => {
+      await waitUntil(() => adapter.pendingToolCalls > 0, 5_000, 'pending tool')
+      const countAfterStart = activity.count
+      await new Promise((resolve) => setTimeout(resolve, 150))
+      assert.ok(
+        activity.count - countAfterStart >= 2,
+        `expected keepalive emits before budget, got ${activity.count - countAfterStart}`,
+      )
+      clock.offsetMs = 60_000
+      await new Promise((resolve) => setTimeout(resolve, 60))
+      const countAfterBudget = activity.count
+      await new Promise((resolve) => setTimeout(resolve, 150))
+      assert.equal(
+        activity.count,
+        countAfterBudget,
+        'keepalive must stop once the oldest pending tool exceeds maxMs',
+      )
+      assert.equal(adapter.pendingToolCalls > 0, true)
+    })
+  })
+
+  test('resumes keepalive for a younger pending tool after the oldest exceeds budget and completes', { timeout: 10_000 }, async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-keepalive-resume-'))
+    const fake = path.join(dir, 'fake.cjs')
+    const emitB = path.join(dir, 'emit-b')
+    const doneA = path.join(dir, 'done-a')
+    await writeFile(path.join(dir, 'persona.md'), 'PERSONA')
+    await writeFile(
+      fake,
+      `#!/usr/bin/env node
+const fs = require('node:fs');
+console.log(JSON.stringify({type:'tool_call',subtype:'started',call_id:'task-a',tool_call:{taskToolCall:{args:{description:'A',prompt:'a'}}}}));
+let emittedB = false;
+let completedA = false;
+setInterval(() => {
+  if (!emittedB && fs.existsSync(${JSON.stringify(emitB)})) {
+    emittedB = true;
+    console.log(JSON.stringify({type:'tool_call',subtype:'started',call_id:'task-b',tool_call:{taskToolCall:{args:{description:'B',prompt:'b'}}}}));
+  }
+  if (!completedA && fs.existsSync(${JSON.stringify(doneA)})) {
+    completedA = true;
+    console.log(JSON.stringify({type:'tool_call',subtype:'completed',call_id:'task-a',tool_call:{taskToolCall:{args:{description:'A',prompt:'a'},result:{success:{content:'done'}}}}}));
+  }
+}, 20);
+`,
+    )
+    await chmod(fake, 0o755)
+    const clock = { now: 1_000_000 }
+    const oldBin = process.env.OC_CURSOR_WRAPPER_BIN
+    const oldGrace = process.env.OPENCLAUDE_CURSOR_SHUTDOWN_GRACE_MS
+    const oldFinal = process.env.OPENCLAUDE_CURSOR_SHUTDOWN_FINAL_DRAIN_MS
+    process.env.OC_CURSOR_WRAPPER_BIN = fake
+    process.env.OPENCLAUDE_CURSOR_SHUTDOWN_GRACE_MS = '200'
+    process.env.OPENCLAUDE_CURSOR_SHUTDOWN_FINAL_DRAIN_MS = '200'
+    _internals.setPendingKeepaliveTestHooks({
+      intervalMs: 40,
+      maxMs: 5_000,
+      stallMs: 60_000,
+      minCpuDeltaTicks: 1,
+      now: () => clock.now,
+      readCpuTicks: growingCpuProbe(),
+      readTranscriptFingerprint: staticTranscriptProbe(),
+    })
+    const adapter = new CursorAdapter(opts(dir))
+    const activity = { count: 0 }
+    adapter.on('activity', () => { activity.count += 1 })
+    adapter.on('error', () => {})
+    try {
+      const run = adapter.submitTurn({
+        input: 'parallel pending keepalive resume',
+        requestId: REQUEST,
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run.submitted
+      await waitUntil(() => adapter.pendingToolCalls === 1, 5_000, 'tool A pending')
+      const countAfterA = activity.count
+      await new Promise((resolve) => setTimeout(resolve, 150))
+      assert.ok(
+        activity.count - countAfterA >= 2,
+        `expected keepalive while only A is pending, got ${activity.count - countAfterA}`,
+      )
+
+      clock.now = 1_002_000
+      await writeFile(emitB, '1')
+      await waitUntil(() => adapter.pendingToolCalls === 2, 5_000, 'tools A and B pending')
+
+      clock.now = 1_005_001
+      await new Promise((resolve) => setTimeout(resolve, 60))
+      const countAfterBudget = activity.count
+      await new Promise((resolve) => setTimeout(resolve, 150))
+      assert.equal(
+        activity.count,
+        countAfterBudget,
+        'oldest tool A over budget must suppress keepalive even though B is still young',
+      )
+      assert.equal(adapter.pendingToolCalls, 2)
+
+      await writeFile(doneA, '1')
+      await waitUntil(() => adapter.pendingToolCalls === 1, 5_000, 'only tool B pending')
+      const countAfterACompleted = activity.count
+      await new Promise((resolve) => setTimeout(resolve, 150))
+      assert.ok(
+        activity.count - countAfterACompleted >= 2,
+        `expected keepalive to resume for remaining young tool B, got ${activity.count - countAfterACompleted} extra emits`,
+      )
+      adapter.interrupt()
+      await adapter.shutdown()
+      await adapter.waitForOutputDrain()
+    } finally {
+      _internals.setPendingKeepaliveTestHooks(null)
+      restoreEnv('OC_CURSOR_WRAPPER_BIN', oldBin)
+      restoreEnv('OPENCLAUDE_CURSOR_SHUTDOWN_GRACE_MS', oldGrace)
+      restoreEnv('OPENCLAUDE_CURSOR_SHUTDOWN_FINAL_DRAIN_MS', oldFinal)
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('emits keepalive when transcript size grows even if CPU is flat', { timeout: 10_000 }, async () => {
+    let bytes = 100
+    _internals.setPendingKeepaliveTestHooks({
+      intervalMs: 40,
+      maxMs: 60_000,
+      stallMs: 60_000,
+      minCpuDeltaTicks: 2,
+      readCpuTicks: () => 4_000,
+      readTranscriptFingerprint: () => {
+        bytes += 32
+        return { files: { 'sub/agent.jsonl': { size: bytes, mtimeMs: 50 } } }
+      },
+    })
+    await withHangingCursorWrapper(true, async (adapter, activity) => {
+      await waitUntil(() => adapter.pendingToolCalls > 0, 5_000, 'pending tool')
+      const countAfterStart = activity.count
+      const activityAt = adapter.lastActivityAt
+      await new Promise((resolve) => setTimeout(resolve, 200))
+      assert.ok(
+        activity.count - countAfterStart >= 2,
+        `expected transcript-growth keepalive, got ${activity.count - countAfterStart} extra emits`,
+      )
+      assert.ok(adapter.lastActivityAt > activityAt, 'transcript growth must refresh lastActivityAt')
+    })
+  })
+
+  test('emits keepalive when process-tree CPU grows even if transcripts are still', { timeout: 10_000 }, async () => {
+    _internals.setPendingKeepaliveTestHooks({
+      intervalMs: 40,
+      maxMs: 60_000,
+      stallMs: 60_000,
+      minCpuDeltaTicks: 2,
+      readCpuTicks: growingCpuProbe(12),
+      readTranscriptFingerprint: staticTranscriptProbe(),
+    })
+    await withHangingCursorWrapper(true, async (adapter, activity) => {
+      await waitUntil(() => adapter.pendingToolCalls > 0, 5_000, 'pending tool')
+      const countAfterStart = activity.count
+      const activityAt = adapter.lastActivityAt
+      await new Promise((resolve) => setTimeout(resolve, 200))
+      assert.ok(
+        activity.count - countAfterStart >= 2,
+        `expected CPU-growth keepalive, got ${activity.count - countAfterStart} extra emits`,
+      )
+      assert.ok(adapter.lastActivityAt > activityAt, 'CPU growth must refresh lastActivityAt')
+    })
+  })
+
+  test('stops keepalive after both progress signals stay silent past the stall window', { timeout: 10_000 }, async () => {
+    const probe = { progressing: true, cpu: 8_000, bytes: 400 }
+    _internals.setPendingKeepaliveTestHooks({
+      intervalMs: 40,
+      maxMs: 60_000,
+      stallMs: 120,
+      minCpuDeltaTicks: 2,
+      readCpuTicks: () => {
+        if (probe.progressing) probe.cpu += 10
+        return probe.cpu
+      },
+      readTranscriptFingerprint: () => {
+        if (probe.progressing) probe.bytes += 16
+        return { files: { 'agent.jsonl': { size: probe.bytes, mtimeMs: 9 } } }
+      },
+    })
+    await withHangingCursorWrapper(true, async (adapter, activity) => {
+      await waitUntil(() => adapter.pendingToolCalls > 0, 5_000, 'pending tool')
+      const countAfterStart = activity.count
+      await new Promise((resolve) => setTimeout(resolve, 160))
+      assert.ok(
+        activity.count - countAfterStart >= 2,
+        `expected keepalive while progressing, got ${activity.count - countAfterStart} extra emits`,
+      )
+      probe.progressing = false
+      await new Promise((resolve) => setTimeout(resolve, 80))
+      const countAfterSilence = activity.count
+      await new Promise((resolve) => setTimeout(resolve, 200))
+      assert.equal(
+        activity.count,
+        countAfterSilence,
+        'keepalive must stop once transcript and CPU stay silent past stallMs',
+      )
+      assert.equal(adapter.pendingToolCalls > 0, true)
+    })
+  })
+
+  test('resumes keepalive when progress returns after a stall', { timeout: 10_000 }, async () => {
+    const probe = { progressing: true, cpu: 8_000, bytes: 400 }
+    _internals.setPendingKeepaliveTestHooks({
+      intervalMs: 40,
+      maxMs: 60_000,
+      stallMs: 120,
+      minCpuDeltaTicks: 2,
+      readCpuTicks: () => {
+        if (probe.progressing) probe.cpu += 10
+        return probe.cpu
+      },
+      readTranscriptFingerprint: () => {
+        if (probe.progressing) probe.bytes += 16
+        return { files: { 'agent.jsonl': { size: probe.bytes, mtimeMs: 9 } } }
+      },
+    })
+    await withHangingCursorWrapper(true, async (adapter, activity) => {
+      await waitUntil(() => adapter.pendingToolCalls > 0, 5_000, 'pending tool')
+      await new Promise((resolve) => setTimeout(resolve, 160))
+      probe.progressing = false
+      await new Promise((resolve) => setTimeout(resolve, 280))
+      const countWhileStalled = activity.count
+      await new Promise((resolve) => setTimeout(resolve, 120))
+      assert.equal(
+        activity.count,
+        countWhileStalled,
+        'stalled keepalive must stay quiet until progress resumes',
+      )
+      probe.progressing = true
+      const activityAt = adapter.lastActivityAt
+      await new Promise((resolve) => setTimeout(resolve, 200))
+      assert.ok(
+        activity.count - countWhileStalled >= 2,
+        `expected keepalive to resume after stall, got ${activity.count - countWhileStalled} extra emits`,
+      )
+      assert.ok(adapter.lastActivityAt > activityAt, 'recovery must refresh lastActivityAt')
+    })
+  })
 })

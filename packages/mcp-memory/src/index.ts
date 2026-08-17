@@ -33,7 +33,6 @@
 // 必须第一个 import:stdout 只留给 JSON-RPC + 未捕获异常不退出(见 mcpStdioGuard 注释)。
 import './mcpStdioGuard.js'
 import { readFileSync } from 'node:fs'
-import { request as httpRequest } from 'node:http'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
@@ -51,9 +50,24 @@ import {
 
 import {
   type FanoutItemResult,
+  type FanoutTask,
   aggregateDelegateFanoutResults,
   normalizeFanoutTasks,
 } from './delegateFanout.js'
+import {
+  formatDelegateFanoutRunning,
+  resolveCursorFastWaitMs,
+  runCursorDelegateFastPath,
+  type FanoutCursorItem,
+  type FormattedDelegateResult,
+} from './delegateCursorFastPath.js'
+import {
+  describeDelegateTransportError,
+  gatewayAuthHeaders,
+  gatewayBaseUrl,
+  postJsonToGateway,
+  readGatewayToken,
+} from './gatewayClient.js'
 import { type ReminderJobView, formatReminderList } from './reminderFormat.js'
 import { filterSkillEvalTools, isSkillEvalBlockedTool } from './skillEvalToolPolicy.js'
 // Tool 定义(TOOLS / SKILL_PROPOSE_TOOL)抽到 ./toolDefs.ts(纯数据模块,无副作用),
@@ -72,43 +86,9 @@ const DELEGATION_DEPTH = Math.max(
  *  各有原生提问工具,必须保持一条机制。未注入时视为非 Cursor,不暴露 ask_user。 */
 const ENGINE_ID = (process.env.OPENCLAUDE_ENGINE || '').trim().toLowerCase()
 const ASK_USER_ENABLED = ENGINE_ID === 'cursor'
-
-/**
- * Read the gateway access token used to authenticate callbacks from this
- * mcp-memory subprocess into the parent gateway HTTP API
- * (`/api/agents/.../message`, `/api/cron`, `/api/...`).
- *
- * Two delivery channels, file-first:
- *
- *   1. `OPENCLAUDE_GATEWAY_TOKEN_FILE` — absolute path to a file containing
- *      the token. v3 codex spawn paths use this so the token is NOT exposed
- *      via the codex argv `-c mcp_servers.openclaude_memory.env={...}`
- *      injection (which would land the token in `ps -ef` / `/proc/<pid>/cmdline`).
- *      The file is written 0600 inside an mkdtemp'd sessionDir owned by the
- *      runner that spawned us, and torn down on shutdown.
- *
- *   2. `OPENCLAUDE_GATEWAY_TOKEN` — direct env var. ccb's subprocessRunner
- *      sets the env via execve (no argv exposure), so it can keep using this
- *      simpler path. master/personal codex paths also still use this.
- *
- * If the file path is set but unreadable we fall back to the env var rather
- * than crash — keeps the agent partially functional (auth-protected calls
- * will fail upstream with 401, which is observable). If neither is set, return
- * empty string and let the gateway reject the unauthenticated call.
- */
-function readGatewayToken(): string {
-  const file = process.env.OPENCLAUDE_GATEWAY_TOKEN_FILE
-  if (file) {
-    try {
-      return readFileSync(file, 'utf8').trim()
-    } catch (err: any) {
-      process.stderr.write(
-        `[mcp-memory] OPENCLAUDE_GATEWAY_TOKEN_FILE unreadable (${file}), falling back to env: ${err?.message ?? err}\n`,
-      )
-    }
-  }
-  return process.env.OPENCLAUDE_GATEWAY_TOKEN || ''
-}
+/** Cursor MCP tools/call 有 60s 硬超时:仅该引擎把委派切成作业句柄 + 快路径。
+ *  CCB/Codex 继续走同步 /delegate,行为不变。 */
+const CURSOR_DELEGATE_ENABLED = ENGINE_ID === 'cursor'
 
 function buildSkillStore(): SkillStore {
   // Overlay (single wiring in @openclaude/storage): platform baseline (ro env)
@@ -701,6 +681,7 @@ async function handleDelegateTask(args: {
 async function handleDelegateTasks(args: { tasks?: unknown }) {
   const normalized = normalizeFanoutTasks(args?.tasks)
   if (!normalized.ok) return toolError(normalized.error)
+  if (CURSOR_DELEGATE_ENABLED) return handleCursorDelegateTasks(normalized.tasks)
   const tasks = normalized.tasks
   const items = await Promise.all(
     tasks.map(async (t): Promise<FanoutItemResult> => {
@@ -821,52 +802,6 @@ async function handleAskUser(args: { questions?: unknown } | undefined | null) {
 }
 
 /**
- * node:http surfaces the real transport failure on `err.code` (ECONNREFUSED,
- * ECONNRESET, socket timeout…). Fold the code into the message so delegation
- * failures are diagnosable instead of the opaque dead-end the old fetch path
- * produced.
- */
-function describeDelegateTransportError(err: any): string {
-  const code = err?.code || err?.cause?.code
-  const base = err?.message ?? String(err)
-  return code ? `${base} (${code})` : base
-}
-
-/**
- * POST JSON to the in-container gateway over node:http. We deliberately avoid
- * global fetch / undici here: the only knob we need is "wait long enough for the
- * gateway to answer", and a socket-inactivity timeout gives exactly that without
- * pulling in undici's separate 5min headersTimeout (the original bug) or a new
- * runtime dependency for this spawned MCP subprocess. Nothing flows on the
- * socket until the gateway finishes the whole child run, so the inactivity timer
- * acts as the total client wait cap.
- */
-function postJsonToGateway(
-  url: string,
-  opts: { headers: Record<string, string>; body: string; timeoutMs: number },
-): Promise<{ statusCode: number; body: string }> {
-  return new Promise((resolve, reject) => {
-    const req = httpRequest(url, { method: 'POST', headers: opts.headers }, (res) => {
-      const chunks: Buffer[] = []
-      res.on('data', (chunk) => chunks.push(chunk as Buffer))
-      res.on('end', () =>
-        resolve({ statusCode: res.statusCode ?? 0, body: Buffer.concat(chunks).toString('utf8') }),
-      )
-      res.on('error', reject)
-    })
-    req.on('error', reject)
-    req.setTimeout(opts.timeoutMs, () => {
-      const err: any = new Error(
-        `delegate client timeout after ${Math.round(opts.timeoutMs / 1000)}s`,
-      )
-      err.code = 'ETIMEDOUT'
-      req.destroy(err)
-    })
-    req.end(opts.body)
-  })
-}
-
-/**
  * 团队质量审查(队长自主送审):草稿经 gateway 委派给隐藏审查员 hidden-reviewer。
  * gateway 侧按目标身份派生审查语义(资源闸保留槽/回传不封顶/结构化 verdict),并做
  * 团队门(非团队 turn 409 拒绝)与审查任务书包装(用户原始需求取服务端权威快照)。
@@ -888,6 +823,106 @@ async function handleRequestReview(args: { draft?: string; revisionNote?: string
   })
 }
 
+async function handleCursorDelegateTasks(tasks: FanoutTask[]) {
+  const items = await Promise.all(
+    tasks.map(async (t): Promise<FanoutCursorItem> => {
+      const label = t.agentId || 'main'
+      try {
+        const r = await runCursorDelegateToAgent(label, {
+          goal: t.goal,
+          context: t.context,
+          effort: t.effort,
+          toolsets: t.toolsets,
+          label,
+        })
+        if (r.kind === 'running') {
+          return {
+            label,
+            goal: t.goal,
+            isError: false,
+            text: r.text,
+            running: true,
+            jobId: r.jobId,
+          }
+        }
+        return {
+          label,
+          goal: t.goal,
+          isError: r.kind === 'error',
+          text: r.kind === 'error' ? `error: ${r.text}` : r.text,
+        }
+      } catch (err: any) {
+        return {
+          label,
+          goal: t.goal,
+          isError: true,
+          text: `委派失败: ${describeDelegateTransportError(err)}`,
+        }
+      }
+    }),
+  )
+  if (items.some((it) => it.running)) return toolOk(formatDelegateFanoutRunning(items))
+  return toolOk(
+    aggregateDelegateFanoutResults(
+      items.map((it) => ({
+        label: it.label,
+        goal: it.goal,
+        isError: it.isError,
+        text: it.text,
+      })),
+    ),
+  )
+}
+
+async function runCursorDelegateToAgent(
+  targetAgent: string,
+  args: {
+    goal: string
+    context?: string
+    effort?: string
+    toolsets?: string[]
+    label: string
+  },
+): Promise<FormattedDelegateResult> {
+  const sourceAgent = process.env.OPENCLAUDE_AGENT_ID || 'unknown'
+  const parentSessionKey = process.env.OPENCLAUDE_SESSION_KEY || ''
+  const currentDepth = Number.parseInt(process.env.OPENCLAUDE_DELEGATION_DEPTH || '0', 10)
+  const headers = {
+    ...gatewayAuthHeaders(),
+    'x-delegation-depth': String(currentDepth),
+  }
+  const base = gatewayBaseUrl()
+  const body = JSON.stringify({
+    goal: args.goal,
+    context: args.context,
+    ...(args.effort ? { effort: args.effort } : {}),
+    sourceAgent,
+    toolsets: args.toolsets,
+    async: true,
+    ...(parentSessionKey ? { streamProgress: true, parentSessionKey } : {}),
+  })
+  const fastWaitMs = resolveCursorFastWaitMs()
+  return runCursorDelegateFastPath({
+    fastWaitMs,
+    label: args.label,
+    goal: args.goal,
+    transport: {
+      start: () =>
+        postJsonToGateway(`${base}/api/agents/${encodeURIComponent(targetAgent)}/delegate`, {
+          headers,
+          body,
+          timeoutMs: 15_000,
+        }),
+      wait: (jobId, waitMs) =>
+        postJsonToGateway(`${base}/api/delegate/wait`, {
+          headers,
+          body: JSON.stringify({ jobId, waitMs }),
+          timeoutMs: waitMs + 15_000,
+        }),
+    },
+  })
+}
+
 async function handleDelegateTaskToAgent(
   targetAgent: string,
   args: {
@@ -898,6 +933,15 @@ async function handleDelegateTaskToAgent(
     label: string
   },
 ) {
+  if (CURSOR_DELEGATE_ENABLED) {
+    try {
+      const r = await runCursorDelegateToAgent(targetAgent, args)
+      if (r.kind === 'error') return toolError(r.text)
+      return toolOk(r.text)
+    } catch (err: any) {
+      return toolError(`委派失败: ${describeDelegateTransportError(err)}`)
+    }
+  }
   const gatewayPort = process.env.OPENCLAUDE_GATEWAY_PORT || '18789'
   const gatewayToken = readGatewayToken()
   const sourceAgent = process.env.OPENCLAUDE_AGENT_ID || 'unknown'

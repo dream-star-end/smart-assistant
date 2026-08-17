@@ -867,6 +867,14 @@ export const OutboundPermissionRequest = Type.Object({
   // V3 S12e — 由 dispatchInbound stamp,标记触发本次 permission 的 turn。
   // permission_settled 是 cross-turn lifecycle 帧,**不在** S12e 范围。
   traceId: Type.Optional(TraceIdString),
+  /** Wall-clock ms when this prompt stops being answerable. Omitted →
+   *  receivers keep their legacy default (Master: 30 minutes). Detached
+   *  Cursor ask_user sets this to now+24h so both in-memory pending and
+   *  turn_permission_requests agree. */
+  expiresAt: Type.Optional(Type.Integer({ minimum: 1 })),
+  /** True when this is a detached ask_user card (24h TTL, no engine wait).
+   *  Omitted on ordinary CCB/Codex permission prompts. */
+  detachedAskUser: Type.Optional(Type.Boolean()),
 })
 export type OutboundPermissionRequest = Static<typeof OutboundPermissionRequest>
 

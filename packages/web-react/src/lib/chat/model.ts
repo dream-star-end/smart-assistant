@@ -469,6 +469,8 @@ export type ChatMessage = {
   _controlPending?: boolean;
   /** Detached Cursor ask_user card: 24h TTL, answerable after tab/device switch. */
   _detachedAskUser?: boolean;
+  /** Absolute expiry ms carried on the permission_request frame when present. */
+  _askUserExpiresAt?: number;
 };
 
 /**
@@ -501,6 +503,13 @@ export type ChatSession = {
   // ── frameSeq 去重游标（§3）──
   _lastFrameSeqByKey?: Record<string, number>;
   _lastFrameSeq?: number;
+  /** Settled frames that arrived before their permission_request. Applied
+   *  when the matching card is created; keyed by requestId. */
+  _pendingPermissionSettlements?: Record<string, {
+    behavior: "allow" | "deny";
+    reason?: string | null;
+    answers?: Record<string, string>;
+  }>;
   /** server canonical 增量游标（历史加载 getSession 的 sinceSeq；随 StoredSession 落地）。*/
   _maxSeq?: number;
   /** Server history revision paired with `_maxSeq`; persisted across reload. */

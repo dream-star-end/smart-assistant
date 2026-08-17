@@ -145,6 +145,7 @@ import {
   readUserMessagePayload,
   upsertClientSession,
   appendServerAuthoredMessage,
+  appendServerAuthoredMessageDurable,
   patchServerAuthoredMessage,
   deleteClientSession,
   renameClientSession,
@@ -158,13 +159,19 @@ import {
 } from '@openclaude/storage'
 import {
   DETACHED_ASK_USER_TTL_MS,
+  agentIdFromAskUserSessionKey,
+  buildDetachedAskUserAnswerMessageId,
   buildDetachedAskUserPersistMessage,
   buildDetachedAskUserPostedResult,
+  buildDetachedAskUserResolvedSinkPayload,
+  buildDetachedAskUserSinkPayload,
+  findDetachedAskUserCardInMessages,
   formatAskUserAnswerMessage,
   isDetachedAskUserPending,
   isDetachedAskUserRequestId,
   pendingFromDetachedAskUserMessage,
 } from './detachedAskUser.js'
+import { fetchAskUserPermissionCard, getV3MasterSinkOrNull, readV3MasterSinkConfig } from './v3MasterSink.js'
 import {
   filterUserVisibleAgentsForManagement,
   filterUserVisibleByAgentField,
@@ -242,6 +249,12 @@ import {
   getDelegateTimeoutReason,
   resolveDelegateTimeoutConfig,
 } from './delegateTimeout.js'
+import {
+  DelegateJobStore,
+  resolveDelegateJobTtlMs,
+  resolveDelegateWaitMs,
+  type DelegateJobHttpResult,
+} from './delegateJobs.js'
 import { eventBus, createEvent } from './eventBus.js'
 import { startEventPersistence } from './eventPersist.js'
 import { parseByteRange, serveFileFdWithRange } from './httpRange.js'
@@ -2928,6 +2941,10 @@ export class Gateway {
       this._stopEviction?.()
     } catch {}
     this._stopEviction = null
+    try {
+      this._delegateJobs?.close()
+    } catch {}
+    this._delegateJobs = undefined
     this._skillShadowReporter?.stop()
     this._skillShadowReporter = null
     if (this._wsKeepaliveTimer !== null) {
@@ -4730,6 +4747,11 @@ export class Gateway {
       this.handleAgentMessage(req, res, agentMsgMatch[1]).catch((err) =>
         this.sendInternalError(res, err),
       )
+      return
+    }
+    // ── Async delegate job long-poll (Cursor MCP 60s ceiling) ──
+    if (url.pathname === '/api/delegate/wait') {
+      this.handleDelegateWait(req, res).catch((err) => this.sendInternalError(res, err))
       return
     }
     // ── Synchronous task delegation ──
@@ -9328,6 +9350,9 @@ export class Gateway {
   private _delegateQueueWaiters: Map<string, () => void> | undefined
   /** 排队复查间隔;测试覆写加速,生产走 DELEGATE_QUEUE_POLL_DEFAULT_MS。 */
   private _delegateQueuePollMs: number | undefined
+  /** Cursor MCP 60s 上限的异步委派作业句柄。测试脚手架 Object.create 不跑字段
+   *  初始化,使用处惰性 ??=。 */
+  private _delegateJobs: DelegateJobStore | undefined
 
   /** 内存水位读取的实例挂钩:生产=模块级 readDelegateMemoryPressure(cgroup 文件),
    *  测试直接覆写本方法注入假读数。 */
@@ -9563,22 +9588,49 @@ export class Gateway {
   }
 
   /**
+   * Reentrancy latch for `_markDelegateAncestorActivity`.
+   * Delegate children bind `activity` → this method, so emitting on an
+   * ancestor (which may itself be a delegate child) would otherwise re-enter
+   * and re-walk the chain. Object.create(Gateway.prototype) test harnesses
+   * skip field initializers; the boolean is treated as unset/false there.
+   */
+  private _markingDelegateAncestorActivity = false
+
+  /**
    * A synchronous delegate_task keeps every ancestor runner blocked inside the
    * tool call. Raw child adapter activity is therefore real liveness for the
    * complete delegate subtree, even though it is not parent stdout. Refresh the
    * existing ancestor sessions only; a genuinely silent subtree still reaches
    * the normal idle watchdog.
+   *
+   * `lastActivityAt` feeds the 15-minute liveness watchdog. Emitting `activity`
+   * is required as well: the 30-minute fallback timer only `refresh()`es on
+   * that event. The latch above ensures one external trigger walks the chain
+   * once (each ancestor emits at most once) and that a cyclic parent pointer
+   * cannot stack-overflow.
    */
   private _markDelegateAncestorActivity(parentSessionKey: string | undefined): void {
-    const seen = new Set<string>()
-    const now = Date.now()
-    let sessionKey = parentSessionKey
-    for (let depth = 0; sessionKey && depth < 5 && !seen.has(sessionKey); depth++) {
-      seen.add(sessionKey)
-      const ancestor = this.sessions.getByKey(sessionKey)
-      if (!ancestor) return
-      ancestor.runner.lastActivityAt = Math.max(ancestor.runner.lastActivityAt, now)
-      sessionKey = ancestor.parentSessionKey
+    if (this._markingDelegateAncestorActivity) return
+    this._markingDelegateAncestorActivity = true
+    try {
+      const seen = new Set<string>()
+      const now = Date.now()
+      let sessionKey = parentSessionKey
+      for (let depth = 0; sessionKey && depth < 5 && !seen.has(sessionKey); depth++) {
+        seen.add(sessionKey)
+        const ancestor = this.sessions.getByKey(sessionKey)
+        if (!ancestor) return
+        ancestor.runner.lastActivityAt = Math.max(ancestor.runner.lastActivityAt, now)
+        try {
+          ancestor.runner.emit?.('activity')
+        } catch {
+          // A throwing listener must not abort the remaining ancestors or
+          // surface into the child runner's activity callback.
+        }
+        sessionKey = ancestor.parentSessionKey
+      }
+    } finally {
+      this._markingDelegateAncestorActivity = false
     }
   }
 
@@ -9649,7 +9701,7 @@ export class Gateway {
     // 委派执行核心与 HTTP req/res 解耦(P2 债C),让 gateway 硬编排 review pass
     // (dispatchInbound)能内部直调同一委派路径拿到结构化结果(verdict/output),
     // 无需伪造 req/res。
-    const result = await this._runDelegateTask({
+    const runInput: RunDelegateInput = {
       targetAgentId,
       goal,
       context: typeof context === 'string' ? context : undefined,
@@ -9660,21 +9712,95 @@ export class Gateway {
       streamProgress: parsed.streamProgress === true,
       depth,
       effort,
-    })
-    if (result.kind === 'rejected') {
-      // 结构化码(DELEGATE_CODEX_UNSUPPORTED / MODEL_NOT_AVAILABLE / MODEL_CATALOG_UNAVAILABLE)
-      // 随信封下发 —— 调用方(delegate_task MCP 工具 / 硬编排)据此稳定分支,不靠 message 文本匹配。
-      if (result.code) {
-        return this.sendJson(res, result.httpStatus, { error: result.message, code: result.code })
-      }
-      return this.sendError(res, result.httpStatus, result.message)
     }
-    if (result.kind === 'error') return this.sendError(res, 500, result.message)
+    // 默认同步:行为与改前完全一致(CCB/Codex 继续堵在 HTTP 上)。仅 `async: true`
+    // 才切作业句柄 —— 子任务仍走同一条 _runDelegateTask(idle/hard/祖先活性/深度/并发闸全在)。
+    if (parsed.async === true) {
+      const store = (this._delegateJobs ??= new DelegateJobStore({
+        ttlMs: resolveDelegateJobTtlMs(),
+      }))
+      const created = store.create(targetAgentId)
+      if ('error' in created) {
+        return this.sendError(res, 503, 'too many in-flight delegate jobs')
+      }
+      const jobId = created.jobId
+      void this._runDelegateTask(runInput)
+        .then((result) => {
+          store.complete(jobId, this._delegateResultToHttp(result, targetAgentId))
+        })
+        .catch((err) => {
+          store.complete(jobId, {
+            httpStatus: 500,
+            body: { error: (err as Error)?.message ?? String(err) },
+          })
+        })
+      return this.sendJson(res, 200, { status: 'running', jobId, agentId: targetAgentId })
+    }
+    const result = await this._runDelegateTask(runInput)
+    const mapped = this._delegateResultToHttp(result, targetAgentId)
+    return this.sendJson(res, mapped.httpStatus, mapped.body)
+  }
+
+  private _delegateResultToHttp(
+    result: DelegateTaskResult,
+    targetAgentId: string,
+  ): DelegateJobHttpResult {
+    if (result.kind === 'rejected') {
+      return {
+        httpStatus: result.httpStatus,
+        body: result.code
+          ? { error: result.message, code: result.code }
+          : { error: result.message },
+      }
+    }
+    if (result.kind === 'error') {
+      return { httpStatus: 500, body: { error: result.message } }
+    }
+    return {
+      httpStatus: 200,
+      body: {
+        ok: result.ok,
+        agentId: targetAgentId,
+        output: result.output,
+        error: result.error || undefined,
+      },
+    }
+  }
+
+  private async handleDelegateWait(
+    req: IncomingMessage,
+    res: ServerResponse,
+  ): Promise<void> {
+    if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
+    const body = await this.readBody(req)
+    let parsed: any
+    try {
+      parsed = JSON.parse(body)
+    } catch {
+      return this.sendError(res, 400, 'invalid JSON')
+    }
+    const jobId = typeof parsed.jobId === 'string' ? parsed.jobId.trim() : ''
+    if (!jobId) return this.sendError(res, 400, 'jobId required')
+    const waitMs = resolveDelegateWaitMs(parsed.waitMs)
+    const store = (this._delegateJobs ??= new DelegateJobStore({
+      ttlMs: resolveDelegateJobTtlMs(),
+    }))
+    const view = await store.wait(jobId, waitMs)
+    if (view.status === 'expired') {
+      return this.sendJson(res, 404, {
+        status: 'expired',
+        jobId,
+        error: 'delegate job not found or expired',
+      })
+    }
+    if (view.status === 'running') {
+      return this.sendJson(res, 200, { status: 'running', jobId })
+    }
     return this.sendJson(res, 200, {
-      ok: result.ok,
-      agentId: targetAgentId,
-      output: result.output,
-      error: result.error || undefined,
+      ...view.body,
+      status: 'done',
+      jobId,
+      httpStatus: view.httpStatus,
     })
   }
 
@@ -12442,15 +12568,23 @@ export class Gateway {
         reason: 'remote',
         ...(settledAnswers ? { answers: settledAnswers } : {}),
       })
-      void this._patchDetachedAskUserResolved(pending, frame.requestId, {
-        _resolved: true,
-        _behavior: effectiveBehavior,
-        _settledReason: 'remote',
-        ...(settledAnswers ? { _answers: settledAnswers } : {}),
-      })
-      if (effectiveBehavior === 'allow') {
-        const text = formatAskUserAnswerMessage(pending.input, settledAnswers ?? {})
-        await this._submitDetachedAskUserAnswer(pending, text, frame.requestId)
+      const answerText = effectiveBehavior === 'allow'
+        ? formatAskUserAnswerMessage(pending.input, settledAnswers ?? {})
+        : undefined
+      const answerId = answerText ? buildDetachedAskUserAnswerMessageId(frame.requestId) : undefined
+      void this._patchDetachedAskUserResolved(
+        pending,
+        frame.requestId,
+        {
+          _resolved: true,
+          _behavior: effectiveBehavior,
+          _settledReason: 'remote',
+          ...(settledAnswers ? { _answers: settledAnswers } : {}),
+        },
+        answerText && answerId ? { id: answerId, text: answerText } : undefined,
+      )
+      if (answerText && answerId) {
+        await this._submitDetachedAskUserAnswer(pending, answerText, frame.requestId, answerId)
       }
       this.log.info('detached ask_user settled', {
         requestId: frame.requestId,
@@ -12825,6 +12959,8 @@ export class Gateway {
       toolName: 'AskUserQuestion',
       inputPreview: JSON.stringify(input).slice(0, 400),
       inputJson: input,
+      expiresAt,
+      detachedAskUser: true,
     })
     this.log.info('engine ask_user posted', {
       requestId,
@@ -12839,6 +12975,7 @@ export class Gateway {
       channel,
       peer,
       expiresAt,
+      agentId: session.agentId,
     })
     this.sendJson(res, 200, buildDetachedAskUserPostedResult(requestId))
   }
@@ -12851,31 +12988,175 @@ export class Gateway {
     channel: string
     peer: { id: string; kind: 'dm' | 'group' }
     expiresAt: number
+    agentId: string
   }): Promise<void> {
-    try {
-      const msg = buildDetachedAskUserPersistMessage(args)
-      const r = await appendServerAuthoredMessage(args.peer.id, args.userId, msg)
-      if (!r.applied) {
-        this.log.warn('detached ask_user tape persist not applied', {
+    const msg = buildDetachedAskUserPersistMessage(args)
+    const sink = getV3MasterSinkOrNull()
+    if (sink) {
+      try {
+        const outcome = await sink.persistOrQueue(buildDetachedAskUserSinkPayload({
           requestId: args.requestId,
-          reason: r.reason,
+          questions: args.questions,
+          sessionKey: args.sessionKey,
+          agentId: args.agentId,
+          sessionId: args.peer.id,
+          channel: args.channel,
+          peer: args.peer,
+          expiresAt: args.expiresAt,
+          ts: msg.ts,
+        }))
+        if (outcome.ok) {
+          this.log.info('detached ask_user persist acked via master sink', {
+            requestId: args.requestId,
+          })
+          return
+        }
+        if ('queued' in outcome && outcome.queued) {
+          this.log.error('detached ask_user persist queued for master-sink retry', {
+            requestId: args.requestId,
+            errorClass: outcome.errorClass,
+          })
+          return
+        }
+        this.log.error('detached ask_user persist dropped by master sink', {
+          requestId: args.requestId,
+          reason: 'droppedReason' in outcome ? outcome.droppedReason : 'dropped',
         })
+      } catch (err) {
+        this.log.error(
+          'detached ask_user persist via master sink failed',
+          { requestId: args.requestId },
+          err as Error,
+        )
       }
+      return
+    }
+    try {
+      const r = await appendServerAuthoredMessageDurable(args.peer.id, args.userId, msg)
+      if (r.applied || r.reason === 'already_exists') return
+      this.log.error('detached ask_user persist not applied', {
+        requestId: args.requestId,
+        reason: r.reason,
+        ...('error' in r ? { error: r.error } : {}),
+      })
     } catch (err) {
-      this.log.warn('detached ask_user tape persist failed', { requestId: args.requestId }, err as Error)
+      this.log.error('detached ask_user persist failed', { requestId: args.requestId }, err as Error)
     }
   }
 
   private async _patchDetachedAskUserResolved(
-    pending: { peer: { id: string }; userId: string },
+    pending: {
+      peer: { id: string; kind?: 'dm' | 'group' }
+      userId: string
+      sessionKey: string
+      channel?: string
+    },
     requestId: string,
     patch: Record<string, unknown>,
+    userAnswer?: { id: string; text: string; ts?: number },
   ): Promise<void> {
-    try {
-      await patchServerAuthoredMessage(pending.peer.id, pending.userId, requestId, patch)
-    } catch (err) {
-      this.log.warn('detached ask_user tape patch failed', { requestId }, err as Error)
+    const behavior = patch._behavior === 'allow' || patch._behavior === 'deny'
+      ? patch._behavior
+      : 'deny'
+    const settledReason =
+      patch._settledReason === 'remote' ||
+      patch._settledReason === 'already_settled' ||
+      patch._settledReason === 'disconnect' ||
+      patch._settledReason === 'timeout' ||
+      patch._settledReason === 'crashed'
+        ? patch._settledReason
+        : 'remote'
+    const answers =
+      patch._answers && typeof patch._answers === 'object' && !Array.isArray(patch._answers)
+        ? (patch._answers as Record<string, string>)
+        : undefined
+    const sink = getV3MasterSinkOrNull()
+    if (sink) {
+      try {
+        const outcome = await sink.persistOrQueue(buildDetachedAskUserResolvedSinkPayload({
+          requestId,
+          agentId: agentIdFromAskUserSessionKey(pending.sessionKey),
+          sessionId: pending.peer.id,
+          sessionKey: pending.sessionKey,
+          behavior,
+          settledReason,
+          answers,
+          userAnswer,
+        }))
+        if (outcome.ok) {
+          this.log.info('detached ask_user resolved persist acked via master sink', { requestId })
+          return
+        }
+        if ('queued' in outcome && outcome.queued) {
+          this.log.error('detached ask_user resolved persist queued for master-sink retry', {
+            requestId,
+            errorClass: outcome.errorClass,
+          })
+          return
+        }
+        this.log.error('detached ask_user resolved persist dropped by master sink', {
+          requestId,
+          reason: 'droppedReason' in outcome ? outcome.droppedReason : 'dropped',
+        })
+      } catch (err) {
+        this.log.error(
+          'detached ask_user resolved persist via master sink failed',
+          { requestId },
+          err as Error,
+        )
+      }
+      return
     }
+    try {
+      const r = await patchServerAuthoredMessage(pending.peer.id, pending.userId, requestId, patch)
+      if (!r.applied) {
+        this.log.error('detached ask_user tape patch not applied', {
+          requestId,
+          reason: r.reason,
+        })
+      }
+    } catch (err) {
+      this.log.error('detached ask_user tape patch failed', { requestId }, err as Error)
+    }
+    if (!userAnswer) return
+    try {
+      const r = await appendServerAuthoredMessageDurable(pending.peer.id, pending.userId, {
+        id: userAnswer.id,
+        role: 'user',
+        text: userAnswer.text,
+        ts: userAnswer.ts ?? Date.now(),
+      })
+      if (r.applied || r.reason === 'already_exists') return
+      this.log.error('detached ask_user answer persist not applied', {
+        requestId,
+        reason: r.reason,
+        ...('error' in r ? { error: r.error } : {}),
+      })
+    } catch (err) {
+      this.log.error('detached ask_user answer persist failed', { requestId }, err as Error)
+    }
+  }
+
+  private async _loadDetachedAskUserCard(
+    sessionId: string,
+    userId: string,
+    requestId: string,
+  ): Promise<Record<string, unknown> | null> {
+    if (getV3MasterSinkOrNull() || readV3MasterSinkConfig()) {
+      return fetchAskUserPermissionCard({ sessionId, requestId })
+    }
+    const sess = await getClientSession(sessionId, userId)
+    const hot = findDetachedAskUserCardInMessages(sess?.messages, requestId)
+    if (hot) return hot
+    let beforeSeq = 0
+    for (let pageNo = 0; pageNo < 16; pageNo++) {
+      const page = await readArchivedMessages(sessionId, userId, beforeSeq, 200)
+      const archived = findDetachedAskUserCardInMessages(page.messages, requestId)
+      if (archived) return archived
+      if (!page.hasMore || page.oldestSeq == null) break
+      beforeSeq = page.oldestSeq
+    }
+    return null
   }
 
   private async _hydrateDetachedAskUserPending(frame: {
@@ -12890,11 +13171,7 @@ export class Gateway {
     if (!isDetachedAskUserRequestId(frame.requestId)) return null
     const userId = typeof frame._userId === 'string' && frame._userId ? frame._userId : 'default'
     try {
-      const sess = await getClientSession(frame.peer.id, userId)
-      const messages = Array.isArray(sess?.messages) ? sess!.messages : []
-      const msg = messages.find((m: any) =>
-        m && (m.requestId === frame.requestId || m.id === frame.requestId) && m.role === 'permission',
-      ) as Record<string, unknown> | undefined
+      const msg = await this._loadDetachedAskUserCard(frame.peer.id, userId, frame.requestId)
       if (!msg) return null
       return pendingFromDetachedAskUserMessage(msg, {
         userId,
@@ -12903,7 +13180,7 @@ export class Gateway {
         peerKey: Gateway.makePeerKey(userId, frame.channel, frame.peer.id),
       })
     } catch (err) {
-      this.log.warn('detached ask_user hydrate failed', { requestId: frame.requestId }, err as Error)
+      this.log.error('detached ask_user hydrate failed', { requestId: frame.requestId }, err as Error)
       return null
     }
   }
@@ -12917,19 +13194,9 @@ export class Gateway {
     },
     text: string,
     requestId: string,
+    clientMessageId: string = buildDetachedAskUserAnswerMessageId(requestId),
   ): Promise<void> {
-    const agentId = pending.sessionKey.split(':')[1] || 'main'
-    const clientMessageId = `ask-ans-${requestId.replace(/[^A-Za-z0-9_-]/g, '').slice(-24)}`
-    try {
-      await appendServerAuthoredMessage(pending.peer.id, pending.userId, {
-        id: clientMessageId,
-        role: 'user',
-        text,
-        ts: Date.now(),
-      })
-    } catch (err) {
-      this.log.warn('detached ask_user answer persist failed', { requestId }, err as Error)
-    }
+    const agentId = agentIdFromAskUserSessionKey(pending.sessionKey)
     await this.dispatchInbound({
       type: 'inbound.message',
       channel: pending.channel,
@@ -16728,7 +16995,7 @@ export { shouldServeInline }
 const KNOWN_ROUTES = [
   '/api/healthz', '/api/doctor', '/api/usage', '/api/usage/events',
   '/api/runs', '/api/sessions', '/api/config', '/api/agents', '/api/search',
-  '/api/cron', '/api/tasks', '/api/tasks-executions', '/api/webhooks',
+  '/api/cron', '/api/delegate/wait', '/api/tasks', '/api/tasks-executions', '/api/webhooks',
   '/api/wechat/pair/start', '/api/wechat/pair/poll', '/api/wechat/pair/cancel',
   '/api/wechat/binding', '/api/wechat/binding/status',
   '/api/auth/session', '/api/auth/logout', '/api/auth/claude/start',

@@ -4,7 +4,7 @@
 import { spawn, type ChildProcessByStdio } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import type { Readable } from 'node:stream'
@@ -40,6 +40,382 @@ const CURSOR_CONTEXT_DIR_PREFIX = 'openclaude-cursor-context-'
 // image copy only for supported dev/fallback environments without that mount.
 const CURSOR_HOTCFG_WRAPPER_BIN = '/run/oc/platform/current/bin/oc-cursor'
 const CURSOR_IMAGE_WRAPPER_BIN = '/usr/local/bin/oc-cursor'
+
+const PENDING_KEEPALIVE_INTERVAL_DEFAULT_MS = 30_000
+const PENDING_KEEPALIVE_INTERVAL_MIN_MS = 5_000
+const PENDING_KEEPALIVE_INTERVAL_MAX_MS = 120_000
+const PENDING_KEEPALIVE_MAX_DEFAULT_MS = 2 * 60 * 60_000
+const PENDING_KEEPALIVE_MAX_MIN_MS = 5 * 60_000
+const PENDING_KEEPALIVE_MAX_MAX_MS = 6 * 60 * 60_000
+const PENDING_KEEPALIVE_STALL_DEFAULT_MS = 10 * 60_000
+const PENDING_KEEPALIVE_STALL_MIN_MS = 2 * 60_000
+const PENDING_KEEPALIVE_STALL_MAX_MS = 60 * 60_000
+const PENDING_KEEPALIVE_MIN_CPU_TICKS_DEFAULT = 2
+const PENDING_KEEPALIVE_MIN_CPU_TICKS_MIN = 1
+const PENDING_KEEPALIVE_MIN_CPU_TICKS_MAX = 50
+const CURSOR_EPHEMERAL_HOME_PREFIX = 'openclaude-cursor.'
+
+export type CursorTranscriptFileStamp = { size: number; mtimeMs: number }
+export type CursorTranscriptFingerprint = { files: Record<string, CursorTranscriptFileStamp> }
+export type CursorPendingKeepaliveProgressSignal = 'transcript' | 'cpu' | 'both' | 'none' | 'init'
+
+export type CursorPendingKeepaliveTestHooks = {
+  now?: () => number
+  intervalMs?: number
+  maxMs?: number
+  stallMs?: number
+  minCpuDeltaTicks?: number
+  /** Injected probes skip /proc and the filesystem. Production never sets these. */
+  readTranscriptFingerprint?: (rootPid: number) => CursorTranscriptFingerprint | null
+  readCpuTicks?: (rootPid: number) => number | null
+}
+
+let pendingKeepaliveTestHooks: CursorPendingKeepaliveTestHooks | null = null
+
+function parseClampedPositiveMs(
+  raw: string | undefined,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  const n = Number(raw)
+  if (!Number.isFinite(n) || n <= 0) return fallback
+  return Math.min(max, Math.max(min, Math.floor(n)))
+}
+
+function parsePendingKeepaliveIntervalMs(
+  raw = process.env.OPENCLAUDE_CURSOR_PENDING_KEEPALIVE_INTERVAL_MS,
+): number {
+  return parseClampedPositiveMs(
+    raw,
+    PENDING_KEEPALIVE_INTERVAL_DEFAULT_MS,
+    PENDING_KEEPALIVE_INTERVAL_MIN_MS,
+    PENDING_KEEPALIVE_INTERVAL_MAX_MS,
+  )
+}
+
+function parsePendingKeepaliveMaxMs(
+  raw = process.env.OPENCLAUDE_CURSOR_PENDING_KEEPALIVE_MAX_MS,
+): number {
+  return parseClampedPositiveMs(
+    raw,
+    PENDING_KEEPALIVE_MAX_DEFAULT_MS,
+    PENDING_KEEPALIVE_MAX_MIN_MS,
+    PENDING_KEEPALIVE_MAX_MAX_MS,
+  )
+}
+
+function parsePendingKeepaliveStallMs(
+  raw = process.env.OPENCLAUDE_CURSOR_PENDING_STALL_MS,
+): number {
+  return parseClampedPositiveMs(
+    raw,
+    PENDING_KEEPALIVE_STALL_DEFAULT_MS,
+    PENDING_KEEPALIVE_STALL_MIN_MS,
+    PENDING_KEEPALIVE_STALL_MAX_MS,
+  )
+}
+
+function parsePendingKeepaliveMinCpuTicks(
+  raw = process.env.OPENCLAUDE_CURSOR_PENDING_KEEPALIVE_MIN_CPU_TICKS,
+): number {
+  return parseClampedPositiveMs(
+    raw,
+    PENDING_KEEPALIVE_MIN_CPU_TICKS_DEFAULT,
+    PENDING_KEEPALIVE_MIN_CPU_TICKS_MIN,
+    PENDING_KEEPALIVE_MIN_CPU_TICKS_MAX,
+  )
+}
+
+function resolvedPendingKeepaliveIntervalMs(): number {
+  return pendingKeepaliveTestHooks?.intervalMs ?? parsePendingKeepaliveIntervalMs()
+}
+
+function resolvedPendingKeepaliveMaxMs(): number {
+  return pendingKeepaliveTestHooks?.maxMs ?? parsePendingKeepaliveMaxMs()
+}
+
+function resolvedPendingKeepaliveStallMs(): number {
+  return pendingKeepaliveTestHooks?.stallMs ?? parsePendingKeepaliveStallMs()
+}
+
+function resolvedPendingKeepaliveMinCpuTicks(): number {
+  return pendingKeepaliveTestHooks?.minCpuDeltaTicks ?? parsePendingKeepaliveMinCpuTicks()
+}
+
+function keepaliveNow(): number {
+  return pendingKeepaliveTestHooks?.now?.() ?? Date.now()
+}
+
+function isPidAlive(pid: number | undefined): boolean {
+  if (typeof pid !== 'number' || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+
+type ProcStatEntry = { pid: number; ppid: number; ticks: number }
+
+/** Parse /proc/<pid>/stat. Fields 14-17 are utime+stime+cutime+cstime (clock ticks). */
+function parseProcStat(raw: string, fallbackPid: number): ProcStatEntry | null {
+  const close = raw.lastIndexOf(')')
+  if (close < 0) return null
+  const pid = Number(raw.slice(0, raw.indexOf(' ')).trim())
+  const rest = raw.slice(close + 2).trim().split(/\s+/)
+  const ppid = Number(rest[1])
+  const utime = Number(rest[11])
+  const stime = Number(rest[12])
+  const cutime = Number(rest[13])
+  const cstime = Number(rest[14])
+  if (![pid, ppid, utime, stime, cutime, cstime].every(Number.isFinite)) return null
+  return {
+    pid: pid > 0 ? pid : fallbackPid,
+    ppid,
+    ticks: utime + stime + cutime + cstime,
+  }
+}
+
+function readProcStatEntry(pid: number): ProcStatEntry | null {
+  try {
+    return parseProcStat(readFileSync(`/proc/${pid}/stat`, 'utf8'), pid)
+  } catch {
+    return null
+  }
+}
+
+function readAllProcStats(): Map<number, ProcStatEntry> {
+  const out = new Map<number, ProcStatEntry>()
+  let names: string[]
+  try {
+    names = readdirSync('/proc')
+  } catch {
+    return out
+  }
+  for (const name of names) {
+    if (!/^[0-9]+$/.test(name)) continue
+    const pid = Number(name)
+    const entry = readProcStatEntry(pid)
+    if (entry) out.set(entry.pid, entry)
+  }
+  return out
+}
+
+/**
+ * Sum CPU ticks for `rootPid` and every descendant via ppid (not pgid).
+ * oc-cursor `setsid` puts the CLI in a different process group, so a pgid
+ * sum would miss the actual agent tree. cutime+cstime covers reaped children
+ * without double-counting live ones. Failures return null.
+ */
+function readProcTreeCpuTicks(rootPid: number): number | null {
+  try {
+    if (!Number.isFinite(rootPid) || rootPid <= 0) return null
+    const stats = readAllProcStats()
+    if (!stats.has(rootPid)) return null
+    const children = new Map<number, number[]>()
+    for (const entry of stats.values()) {
+      const list = children.get(entry.ppid)
+      if (list) list.push(entry.pid)
+      else children.set(entry.ppid, [entry.pid])
+    }
+    let sum = 0
+    const stack = [rootPid]
+    const seen = new Set<number>()
+    while (stack.length > 0) {
+      const pid = stack.pop()!
+      if (seen.has(pid)) continue
+      seen.add(pid)
+      const entry = stats.get(pid)
+      if (!entry) continue
+      sum += entry.ticks
+      const kids = children.get(pid)
+      if (kids) {
+        for (const child of kids) stack.push(child)
+      }
+    }
+    return sum
+  } catch {
+    return null
+  }
+}
+
+function readKeepaliveCpuTicks(rootPid: number): number | null {
+  try {
+    if (pendingKeepaliveTestHooks?.readCpuTicks) {
+      return pendingKeepaliveTestHooks.readCpuTicks(rootPid)
+    }
+    return readProcTreeCpuTicks(rootPid)
+  } catch {
+    return null
+  }
+}
+
+function readProcEnvironValue(pid: number, key: string): string | undefined {
+  try {
+    const raw = readFileSync(`/proc/${pid}/environ`)
+    const prefix = `${key}=`
+    const text = Buffer.isBuffer(raw) ? raw.toString('utf8') : String(raw)
+    for (const part of text.split('\0')) {
+      if (part.startsWith(prefix)) return part.slice(prefix.length)
+    }
+  } catch {
+    /* descendant may have exited */
+  }
+  return undefined
+}
+
+function collectDescendantPids(rootPid: number): number[] {
+  const stats = readAllProcStats()
+  const children = new Map<number, number[]>()
+  for (const entry of stats.values()) {
+    const list = children.get(entry.ppid)
+    if (list) list.push(entry.pid)
+    else children.set(entry.ppid, [entry.pid])
+  }
+  const out: number[] = []
+  const stack = [rootPid]
+  const seen = new Set<number>()
+  while (stack.length > 0) {
+    const pid = stack.pop()!
+    if (seen.has(pid)) continue
+    seen.add(pid)
+    out.push(pid)
+    const kids = children.get(pid)
+    if (kids) {
+      for (const child of kids) stack.push(child)
+    }
+  }
+  return out
+}
+
+function isSafeEphemeralCursorPath(resolved: string): boolean {
+  const parts = resolved.split('/')
+  // Wrapper hardcodes /tmp/openclaude-cursor.XXXXXXXX
+  return parts.length >= 3 && parts[1] === 'tmp' && parts[2].startsWith(CURSOR_EPHEMERAL_HOME_PREFIX)
+}
+
+function isUsableTranscriptsDir(dir: string): boolean {
+  if (!isAbsolute(dir)) return false
+  try {
+    const info = lstatSync(dir)
+    if (info.isSymbolicLink() || !info.isDirectory()) return false
+    const resolved = realpathSync(dir)
+    if (!isSafeEphemeralCursorPath(resolved)) return false
+    if (!resolved.split('/').includes('agent-transcripts')) return false
+    return true
+  } catch {
+    return false
+  }
+}
+
+function findTranscriptsDirUnderHome(home: string): string | null {
+  if (!isAbsolute(home)) return null
+  try {
+    const homeInfo = lstatSync(home)
+    if (homeInfo.isSymbolicLink() || !homeInfo.isDirectory()) return null
+    const resolvedHome = realpathSync(home)
+    if (!isSafeEphemeralCursorPath(resolvedHome)) return null
+    const projects = join(resolvedHome, '.cursor', 'projects')
+    if (!existsSync(projects)) return null
+    const names = readdirSync(projects)
+    for (const name of names) {
+      const candidate = join(projects, name, 'agent-transcripts')
+      if (isUsableTranscriptsDir(candidate)) return candidate
+    }
+  } catch {
+    return null
+  }
+  return null
+}
+
+/** Resolve $HOME/.cursor/projects/<slug>/agent-transcripts from the CLI tree.
+ *  Adapter never sees wrapper mktemp HOME; AGENT_TRANSCRIPTS lives on descendants. */
+function resolveCursorTranscriptsDir(rootPid: number): string | null {
+  try {
+    const pids = collectDescendantPids(rootPid)
+    for (const pid of pids) {
+      const direct = readProcEnvironValue(pid, 'AGENT_TRANSCRIPTS')
+      if (direct && isUsableTranscriptsDir(direct)) return realpathSync(direct)
+    }
+    for (const pid of pids) {
+      const home = readProcEnvironValue(pid, 'HOME')
+      if (!home) continue
+      const found = findTranscriptsDirUnderHome(home)
+      if (found) return found
+    }
+  } catch {
+    return null
+  }
+  return null
+}
+
+function fingerprintTranscriptDir(dir: string): CursorTranscriptFingerprint | null {
+  const files: Record<string, CursorTranscriptFileStamp> = {}
+  const walk = (current: string, rel: string): void => {
+    let entries
+    try {
+      entries = readdirSync(current, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const entry of entries) {
+      if (entry.name === '.' || entry.name === '..') continue
+      const full = join(current, entry.name)
+      const key = rel ? `${rel}/${entry.name}` : entry.name
+      let st
+      try {
+        st = lstatSync(full)
+      } catch {
+        continue
+      }
+      if (st.isSymbolicLink()) continue
+      if (st.isDirectory()) walk(full, key)
+      else if (st.isFile()) files[key] = { size: st.size, mtimeMs: st.mtimeMs }
+    }
+  }
+  try {
+    walk(dir, '')
+    return { files }
+  } catch {
+    return null
+  }
+}
+
+function readKeepaliveTranscriptFingerprint(
+  rootPid: number,
+  cachedDir: { value: string | null },
+): CursorTranscriptFingerprint | null {
+  try {
+    if (pendingKeepaliveTestHooks?.readTranscriptFingerprint) {
+      return pendingKeepaliveTestHooks.readTranscriptFingerprint(rootPid)
+    }
+    let dir = cachedDir.value
+    if (!dir || !isUsableTranscriptsDir(dir)) {
+      dir = resolveCursorTranscriptsDir(rootPid)
+      cachedDir.value = dir
+    }
+    if (!dir) return null
+    return fingerprintTranscriptDir(dir)
+  } catch {
+    return null
+  }
+}
+
+function transcriptFingerprintGrew(
+  prev: CursorTranscriptFingerprint | null,
+  next: CursorTranscriptFingerprint | null,
+): boolean {
+  if (!next) return false
+  if (!prev) return Object.keys(next.files).length > 0
+  for (const [path, stamp] of Object.entries(next.files)) {
+    const old = prev.files[path]
+    if (!old) return true
+    if (stamp.size > old.size || stamp.mtimeMs > old.mtimeMs) return true
+  }
+  return false
+}
 
 function resolveCursorWrapperBin(
   override = process.env.OC_CURSOR_WRAPPER_BIN,
@@ -759,6 +1135,15 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
   private readonly ownedContextDirs = new Set<string>()
   private nativeId: string | null
   lastActivityAt = 0
+  private pendingKeepaliveTimer: ReturnType<typeof setInterval> | null = null
+  /** Log-dedup only: true while the current oldest pending tool is over budget.
+   *  Must not gate timer start/stop or the keepalive decision itself. */
+  private pendingKeepaliveOverBudgetLogged = false
+  private pendingKeepaliveStalledLogged = false
+  private pendingKeepaliveStallSince: number | null = null
+  private lastKeepaliveCpuTicks: number | null = null
+  private lastTranscriptFingerprint: CursorTranscriptFingerprint | null = null
+  private cachedTranscriptsDir: string | null = null
 
   constructor(opts: EngineCreateOpts) {
     super()
@@ -769,6 +1154,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
   }
   start(): Promise<void> { return Promise.resolve() }
   submitTurn(params: TurnParams): EngineTurnRun {
+    this.stopPendingKeepalive()
     let resolve!: (value: TurnSummary | null) => void
     const summary = new Promise<TurnSummary | null>((r) => { resolve = r })
     const ctx: TurnCtx = { params, startedAt: Date.now(), proc: null, assistantText: '', thinkingText: '', assistantSegments: [], thinkingSegments: [], tools: new Map(), pending: new Set(), startedTools: new Map(), stderr: '', terminal: false, procClosed: false, abandoned: false, resolveDrain: null, interrupted: false, error: null, assistantPartialText: '', pendingAssistantText: null, assistantSegmentClosed: false, thinkingSegmentClosed: false, contextDir: null, rawToSafeToolId: new Map(), safeToRawToolId: new Map(), fallbackToolSequence: 0, sessionIdEmitted: false, resolve }
@@ -778,6 +1164,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
       // abandoned it, in which case `active` and `drain` belong to a later turn
       // that this failure says nothing about.
       if (!ctx.abandoned) {
+        this.stopPendingKeepalive()
         this.cleanupContextDir(ctx)
         if (!ctx.terminal) this.finish(ctx, String(err))
         if (this.active === ctx) this.active = null
@@ -914,6 +1301,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         killProcessGroup(proc, 'SIGKILL')
         detachChildStdio(proc)
         try { proc.unref() } catch { /* already detached */ }
+        this.stopPendingKeepalive()
         this.cleanupContextDir(ctx)
         return
       }
@@ -942,6 +1330,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         // An abandoned turn has already been finalized and `active` has moved
         // on; surfacing this would report a later turn as failed.
         if (ctx.abandoned) return
+        this.stopPendingKeepalive()
         this.cleanupContextDir(ctx)
         if (!ctx.terminal) this.finish(ctx, String(err))
         this.emit('error', err)
@@ -951,6 +1340,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         // the turn, in which case `active` belongs to a later turn that this
         // handler must not touch.
         if (ctx.abandoned) return
+        this.stopPendingKeepalive()
         ctx.procClosed = true
         if (buffer.trim()) this.handleLine(ctx, buffer.trim())
         this.flushPendingAssistant(ctx, false)
@@ -1066,9 +1456,10 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     this.flushPendingAssistant(ctx, false)
     this.closeContentSegments(ctx)
     const tool: TurnToolEntry = { toolUseId: id, blockId: id, toolName: name, inputJson: structuredClone(input), inputPreview: textOf(input).slice(0, 500), output: '', completed: false, isError: false, durationMs: 0, ts: Date.now(), arrivedAt: Date.now(), eventOrdinal: ctx.params.nextDurableEventOrdinal?.() }
-    ctx.tools.set(id, tool); ctx.pending.add(id); ctx.startedTools.set(id, Date.now()); ctx.params.toolUseIdToName.set(id, name)
+    ctx.tools.set(id, tool); ctx.pending.add(id); ctx.startedTools.set(id, keepaliveNow()); ctx.params.toolUseIdToName.set(id, name)
     const block: OutboundContentBlock = { kind: 'tool_use', blockId: id, toolName: name, inputJson: structuredClone(input), inputPreview: tool.inputPreview, partial: false }
     ctx.params.onEvent({ kind: 'block', block }); ctx.params.onEvent({ kind: 'tool_use_detected', tool: { name, id, input: input && typeof input === 'object' ? structuredClone(input) as Record<string, any> : {} } })
+    this.ensurePendingKeepalive()
   }
   private toolResult(ctx: TurnCtx, event: CursorEvent): void {
     const rawId = rawToolIdOf(event) || this.nextFallbackToolId(ctx)
@@ -1077,9 +1468,11 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     const tool = ctx.tools.get(id)!; if (tool.completed) return
     const { output, outputJson } = toolOutputOf(event); const isError = toolFailed(event)
     Object.assign(tool, { output, outputJson: structuredClone(outputJson), completed: true, isError, durationMs: Date.now() - (ctx.startedTools.get(id) ?? Date.now()), ts: Date.now() }); ctx.pending.delete(id)
+    if (ctx.pending.size === 0) this.stopPendingKeepalive()
     ctx.params.onEvent({ kind: 'block', block: { kind: 'tool_result', toolUseBlockId: id, toolName: tool.toolName, isError, output, outputJson: structuredClone(outputJson), preview: output.slice(0, 500) } }); ctx.params.onEvent({ kind: 'tool_result_detected', result: { toolUseId: id, toolName: tool.toolName, preview: output.slice(0, 500), isError, durationMs: tool.durationMs, inputPreview: tool.inputPreview } })
   }
   private finish(ctx: TurnCtx, detail: string | null): void {
+    this.stopPendingKeepalive()
     if (ctx.terminal) return; ctx.terminal = true; const cls = detail ? unavailable(detail) : null
     const safeDetail = detail === null ? null : ctx.interrupted ? 'Cursor turn cancelled' : cls === 'auth' ? 'Cursor authentication unavailable' : cls === 'quota' ? 'Cursor quota unavailable' : 'Cursor CLI failed'
     const status: EngineExternalBillingEvent['status'] = cls ? 'unavailable' : detail ? 'error' : 'success'
@@ -1092,6 +1485,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     const u = ctx.usage; ctx.resolve({ usage: { cost: 0, inputTokens: u?.input_tokens ?? 0, outputTokens: u?.output_tokens ?? 0, cacheReadTokens: u?.cache_read_input_tokens ?? 0, cacheCreationTokens: u?.cache_creation_input_tokens ?? 0, totalTokens: u ? Object.values(u).reduce((a, b) => a + (b ?? 0), 0) : 0 }, assistantText: ctx.assistantText, thinkingText: ctx.thinkingText, assistantSegments: ctx.assistantSegments.map((v) => ({ ...v })), thinkingSegments: ctx.thinkingSegments.map((v) => ({ ...v })), tools: [...ctx.tools.values()].map((v) => structuredClone(v)), runtimeEvents: [], stopReason: ctx.interrupted ? 'interrupted' : null, numTurns: 1, isError: !!detail, ...(detail ? { errorKind: 'other' as const, errorClass, errorDetail: safeDetail! } : {}), staleResumeId: false, phantomSignals: { ...EMPTY_SIGNALS } })
   }
   private forceEnd(ctx: TurnCtx): void {
+    this.stopPendingKeepalive()
     if (ctx.terminal) return
     ctx.terminal = true
     ctx.resolve(null)
@@ -1101,7 +1495,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     }
     killProcessGroup(ctx.proc, 'SIGTERM')
   }
-  interrupt(): boolean { const c = this.active; if (!c?.proc || c.proc.killed) return false; c.interrupted = true; killProcessGroup(c.proc, 'SIGINT'); return true }
+  interrupt(): boolean { this.stopPendingKeepalive(); const c = this.active; if (!c?.proc || c.proc.killed) return false; c.interrupted = true; killProcessGroup(c.proc, 'SIGINT'); return true }
   /** Stop has to reach a terminal state even when the CLI escapes us. The
    * wrapper runs the CLI through setsid, so a descendant that outlives the
    * wrapper sits in a session no signal of ours can address while still
@@ -1109,6 +1503,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
    * a deadline on the close barrier: an unbounded wait leaves the turn without
    * a terminal event and the client stuck in "stopping" indefinitely. */
   async shutdown(): Promise<void> {
+    this.stopPendingKeepalive()
     const ctx = this.active
     if (!ctx) return
     if (ctx.procClosed) {
@@ -1169,6 +1564,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     detail: string,
   ): void {
     ctx.abandoned = true
+    this.stopPendingKeepalive()
     if (proc) detachChildStdio(proc)
     this.cleanupContextDir(ctx)
     if (!ctx.terminal) this.finish(ctx, detail)
@@ -1177,6 +1573,156 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     if (this.active === ctx) this.active = null
     if (proc) {
       try { proc.unref() } catch { /* already detached */ }
+    }
+  }
+  private resetPendingKeepaliveObservation(): void {
+    this.lastKeepaliveCpuTicks = null
+    this.lastTranscriptFingerprint = null
+    this.cachedTranscriptsDir = null
+    this.pendingKeepaliveStallSince = null
+    this.pendingKeepaliveStalledLogged = false
+    this.pendingKeepaliveOverBudgetLogged = false
+  }
+  private stopPendingKeepalive(): void {
+    if (this.pendingKeepaliveTimer) {
+      clearInterval(this.pendingKeepaliveTimer)
+      this.pendingKeepaliveTimer = null
+    }
+    this.resetPendingKeepaliveObservation()
+  }
+  private ensurePendingKeepalive(): void {
+    if (this.pendingKeepaliveTimer) return
+    const ctx = this.active
+    if (!ctx || ctx.terminal || ctx.abandoned || ctx.pending.size === 0) return
+    const intervalMs = resolvedPendingKeepaliveIntervalMs()
+    if (intervalMs <= 0) return
+    this.resetPendingKeepaliveObservation()
+    this.pendingKeepaliveTimer = setInterval(() => { this.tickPendingKeepalive() }, intervalMs)
+    this.pendingKeepaliveTimer.unref()
+  }
+  private tickPendingKeepalive(): void {
+    try {
+      const ctx = this.active
+      if (!ctx || ctx.terminal || ctx.abandoned || ctx.pending.size === 0) {
+        this.stopPendingKeepalive()
+        return
+      }
+      const pid = ctx.proc?.pid
+      if (!isPidAlive(pid) || typeof pid !== 'number') {
+        this.stopPendingKeepalive()
+        return
+      }
+      let oldestId: string | null = null
+      let oldestStarted = Infinity
+      for (const id of ctx.pending) {
+        const started = ctx.startedTools.get(id) ?? ctx.startedAt
+        if (started < oldestStarted) {
+          oldestStarted = started
+          oldestId = id
+        }
+      }
+      const now = keepaliveNow()
+      const elapsedMs = now - oldestStarted
+      const maxMs = resolvedPendingKeepaliveMaxMs()
+      const stallWindowMs = resolvedPendingKeepaliveStallMs()
+      const oldestTool = oldestId ? ctx.tools.get(oldestId) : undefined
+      const oldestToolName = oldestTool?.toolName ?? 'unknown'
+      const oldestElapsedSec = Math.round(elapsedMs / 1000)
+      if (elapsedMs > maxMs) {
+        if (!this.pendingKeepaliveOverBudgetLogged) {
+          this.pendingKeepaliveOverBudgetLogged = true
+          log.info('cursor pending-tool keepalive exhausted', {
+            sessionKey: this.opts.sessionKey,
+            pendingCount: ctx.pending.size,
+            oldestToolName,
+            oldestElapsedSec,
+            maxMs,
+          })
+        }
+        return
+      }
+      if (this.pendingKeepaliveOverBudgetLogged) {
+        this.pendingKeepaliveOverBudgetLogged = false
+        log.info('cursor pending-tool keepalive resumed', {
+          sessionKey: this.opts.sessionKey,
+          pendingCount: ctx.pending.size,
+          oldestToolName,
+          oldestElapsedSec,
+          maxMs,
+        })
+      }
+
+      const establishing = this.lastKeepaliveCpuTicks === null && this.lastTranscriptFingerprint === null
+      const cachedDir = { value: this.cachedTranscriptsDir }
+      const fingerprint = readKeepaliveTranscriptFingerprint(pid, cachedDir)
+      this.cachedTranscriptsDir = cachedDir.value
+      const cpuTicks = readKeepaliveCpuTicks(pid)
+      const transcriptGrew = transcriptFingerprintGrew(this.lastTranscriptFingerprint, fingerprint)
+      let cpuDeltaTicks: number | undefined
+      let cpuGrew = false
+      const minCpuDelta = resolvedPendingKeepaliveMinCpuTicks()
+      if (cpuTicks === null) this.lastKeepaliveCpuTicks = null
+      else {
+        if (this.lastKeepaliveCpuTicks !== null) {
+          cpuDeltaTicks = cpuTicks - this.lastKeepaliveCpuTicks
+          cpuGrew = cpuDeltaTicks >= minCpuDelta
+        }
+        this.lastKeepaliveCpuTicks = cpuTicks
+      }
+      this.lastTranscriptFingerprint = fingerprint
+
+      let progressSignal: CursorPendingKeepaliveProgressSignal = 'none'
+      if (establishing) progressSignal = 'init'
+      else if (transcriptGrew && cpuGrew) progressSignal = 'both'
+      else if (transcriptGrew) progressSignal = 'transcript'
+      else if (cpuGrew) progressSignal = 'cpu'
+
+      const progressing = !establishing && (transcriptGrew || cpuGrew)
+      let stallForMs = 0
+      if (progressing) {
+        if (this.pendingKeepaliveStalledLogged) {
+          log.info('cursor pending-tool keepalive recovered', {
+            sessionKey: this.opts.sessionKey,
+            pendingCount: ctx.pending.size,
+            oldestToolName,
+            oldestElapsedSec,
+            progressSignal,
+          })
+        }
+        this.pendingKeepaliveStallSince = null
+        this.pendingKeepaliveStalledLogged = false
+        this.lastActivityAt = Date.now()
+        this.emit('activity')
+      } else if (!establishing) {
+        if (this.pendingKeepaliveStallSince === null) this.pendingKeepaliveStallSince = now
+        stallForMs = now - this.pendingKeepaliveStallSince
+        if (stallForMs >= stallWindowMs && !this.pendingKeepaliveStalledLogged) {
+          this.pendingKeepaliveStalledLogged = true
+          log.info('cursor pending-tool keepalive stalled', {
+            sessionKey: this.opts.sessionKey,
+            pendingCount: ctx.pending.size,
+            oldestToolName,
+            oldestElapsedSec,
+            stallMs: stallWindowMs,
+            stallForMs,
+            progressSignal,
+          })
+        }
+      }
+
+      log.info('cursor pending-tool keepalive', {
+        sessionKey: this.opts.sessionKey,
+        pendingCount: ctx.pending.size,
+        oldestToolName,
+        oldestElapsedSec,
+        progressing,
+        progressSignal,
+        stallForMs: progressing || establishing ? 0 : stallForMs,
+        ...(cpuDeltaTicks !== undefined ? { cpuDeltaTicks } : {}),
+      })
+    } catch {
+      // Keepalive is best-effort. A throw here would become an unhandled
+      // interval exception and take down the gateway process.
     }
   }
   waitForOutputDrain(): Promise<void> { return this.drain }
@@ -1220,6 +1766,25 @@ export const _internals = {
   toolInputOf,
   toolFailed,
   questionSkippedByRuntime,
+  parsePendingKeepaliveIntervalMs,
+  parsePendingKeepaliveMaxMs,
+  parsePendingKeepaliveStallMs,
+  parsePendingKeepaliveMinCpuTicks,
+  PENDING_KEEPALIVE_INTERVAL_DEFAULT_MS,
+  PENDING_KEEPALIVE_INTERVAL_MIN_MS,
+  PENDING_KEEPALIVE_INTERVAL_MAX_MS,
+  PENDING_KEEPALIVE_MAX_DEFAULT_MS,
+  PENDING_KEEPALIVE_MAX_MIN_MS,
+  PENDING_KEEPALIVE_MAX_MAX_MS,
+  PENDING_KEEPALIVE_STALL_DEFAULT_MS,
+  PENDING_KEEPALIVE_STALL_MIN_MS,
+  PENDING_KEEPALIVE_STALL_MAX_MS,
+  PENDING_KEEPALIVE_MIN_CPU_TICKS_DEFAULT,
+  PENDING_KEEPALIVE_MIN_CPU_TICKS_MIN,
+  PENDING_KEEPALIVE_MIN_CPU_TICKS_MAX,
+  setPendingKeepaliveTestHooks(hooks: CursorPendingKeepaliveTestHooks | null): void {
+    pendingKeepaliveTestHooks = hooks
+  },
 }
 
 registerEngine('cursor', (opts) => new CursorAdapter(opts))

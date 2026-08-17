@@ -554,6 +554,26 @@ describe('OutboundPermissionRequest schema', () => {
       false,
     )
   })
+  it('accepts optional expiresAt and detachedAskUser without requiring them', () => {
+    assert.equal(
+      Value.Check(OutboundPermissionRequest, {
+        ...(baseOutboundPermissionRequest() as object),
+        expiresAt: Date.now() + 24 * 60 * 60_000,
+        detachedAskUser: true,
+      }),
+      true,
+    )
+    assert.equal(Value.Check(OutboundPermissionRequest, baseOutboundPermissionRequest()), true)
+  })
+  it('rejects a non-integer expiresAt', () => {
+    assert.equal(
+      Value.Check(OutboundPermissionRequest, {
+        ...(baseOutboundPermissionRequest() as object),
+        expiresAt: 'tomorrow',
+      }),
+      false,
+    )
+  })
 })
 
 describe('OutboundCallUsage schema', () => {

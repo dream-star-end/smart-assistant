@@ -68,6 +68,136 @@ export function buildDetachedAskUserPostedResult(requestId: string): {
   }
 }
 
+export type DetachedAskUserPermissionCard = {
+  requestId: string
+  questions: Array<Record<string, unknown>>
+  sessionKey: string
+  expiresAt: number
+  ts?: number
+  channel?: string
+  peer?: { id: string; kind: 'dm' | 'group' }
+}
+
+/** Wire payload for the container → master v1 sidecar POST (not a billed turn tape). */
+export function buildDetachedAskUserSinkPayload(args: {
+  requestId: string
+  questions: Array<Record<string, unknown>>
+  sessionKey: string
+  agentId: string
+  sessionId: string
+  channel: string
+  peer: { id: string; kind: 'dm' | 'group' }
+  expiresAt: number
+  ts?: number
+  turnIndex?: number
+}): {
+  sessionId: string
+  agentId: string
+  turnIndex: number
+  status: 'completed'
+  text: ''
+  createdAt: number
+  permissionCards: DetachedAskUserPermissionCard[]
+} {
+  const ts = args.ts ?? Date.now()
+  return {
+    sessionId: args.sessionId,
+    agentId: args.agentId,
+    turnIndex: args.turnIndex ?? 0,
+    status: 'completed',
+    text: '',
+    createdAt: ts,
+    permissionCards: [
+      {
+        requestId: args.requestId,
+        questions: args.questions,
+        sessionKey: args.sessionKey,
+        expiresAt: args.expiresAt,
+        ts,
+        channel: args.channel,
+        peer: args.peer,
+      },
+    ],
+  }
+}
+
+export type DetachedAskUserPermissionPatch = {
+  requestId: string
+  behavior: 'allow' | 'deny'
+  settledReason: 'remote' | 'already_settled' | 'disconnect' | 'timeout' | 'crashed'
+  answers?: Record<string, string>
+}
+
+export type DetachedAskUserAnswerMessage = {
+  id: string
+  text: string
+  ts?: number
+}
+
+/** Wire payload to patch a card resolved (+ optional user-answer row) via the same v1 sidecar. */
+export function buildDetachedAskUserResolvedSinkPayload(args: {
+  requestId: string
+  agentId: string
+  sessionId: string
+  sessionKey: string
+  behavior: 'allow' | 'deny'
+  settledReason: 'remote' | 'already_settled' | 'disconnect' | 'timeout' | 'crashed'
+  answers?: Record<string, string>
+  userAnswer?: DetachedAskUserAnswerMessage
+  ts?: number
+  turnIndex?: number
+}): {
+  sessionId: string
+  agentId: string
+  turnIndex: number
+  status: 'completed'
+  text: ''
+  createdAt: number
+  permissionPatches: DetachedAskUserPermissionPatch[]
+  userAnswerMessages?: DetachedAskUserAnswerMessage[]
+} {
+  const ts = args.ts ?? Date.now()
+  return {
+    sessionId: args.sessionId,
+    agentId: args.agentId,
+    turnIndex: args.turnIndex ?? 0,
+    status: 'completed',
+    text: '',
+    createdAt: ts,
+    permissionPatches: [
+      {
+        requestId: args.requestId,
+        behavior: args.behavior,
+        settledReason: args.settledReason,
+        ...(args.answers ? { answers: args.answers } : {}),
+      },
+    ],
+    ...(args.userAnswer ? { userAnswerMessages: [args.userAnswer] } : {}),
+  }
+}
+
+export function agentIdFromAskUserSessionKey(sessionKey: string): string {
+  const agentId = sessionKey.split(':')[1]
+  return agentId && agentId.length > 0 ? agentId : 'main'
+}
+
+export function buildDetachedAskUserAnswerMessageId(requestId: string): string {
+  return `ask-ans-${requestId.replace(/[^A-Za-z0-9_-]/g, '').slice(-24)}`
+}
+
+export function findDetachedAskUserCardInMessages(
+  messages: unknown,
+  requestId: string,
+): Record<string, unknown> | undefined {
+  if (!Array.isArray(messages)) return undefined
+  return messages.find((m: unknown) => {
+    if (!m || typeof m !== 'object' || Array.isArray(m)) return false
+    const row = m as Record<string, unknown>
+    if (row.role !== 'permission') return false
+    return row.requestId === requestId || row.id === requestId
+  }) as Record<string, unknown> | undefined
+}
+
 export function buildDetachedAskUserPersistMessage(args: {
   requestId: string
   questions: Array<Record<string, unknown>>
