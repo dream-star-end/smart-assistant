@@ -79,6 +79,7 @@ async function startRig(opts: {
   loadGoalState?: UserChatBridgeDeps["loadGoalState"];
   persistMasterUserMessage?: UserChatBridgeDeps["persistMasterUserMessage"];
   persistOutboundFrame?: UserChatBridgeDeps["persistOutboundFrame"];
+  outboundPersistFailedSeqTtlMs?: number;
   loadSessionWorkspaceMode?: UserChatBridgeDeps["loadSessionWorkspaceMode"];
   logger?: Logger;
   getFrontendBuildId?: () => string | null;
@@ -118,6 +119,7 @@ async function startRig(opts: {
     loadGoalState: opts.loadGoalState,
     persistMasterUserMessage: opts.persistMasterUserMessage,
     persistOutboundFrame: opts.persistOutboundFrame,
+    outboundPersistFailedSeqTtlMs: opts.outboundPersistFailedSeqTtlMs,
     loadSessionWorkspaceMode: opts.loadSessionWorkspaceMode,
     logger: opts.logger,
     getFrontendBuildId: opts.getFrontendBuildId,
@@ -590,6 +592,129 @@ describe("userChatBridge — durable outbound frame ordering", () => {
       const visible = await nextBusinessFrame(frames);
       assert.equal(visible.frameSeq, 9);
       assert.equal(attempts, 2);
+      ws2.close();
+      await waitClose(ws2);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("a permanent live-frame conflict skips the frame without closing or poisoning later seqs", async () => {
+    const persisted: number[] = [];
+    const portRef = { value: 0 };
+    const rig = await startRig({
+      resolve: async () => ({ host: "127.0.0.1", port: portRef.value, containerId: 79 }),
+      persistOutboundFrame: async (input) => {
+        if (input.frameSeq === 1) {
+          const err = new Error("live frame stream identity conflict") as Error & {
+            liveFramePermanentConflict: boolean;
+          };
+          err.liveFramePermanentConflict = true;
+          throw err;
+        }
+        persisted.push(input.frameSeq);
+      },
+    });
+    portRef.value = rig.containerPort;
+    try {
+      const containerOpen = waitNextContainerSocket(rig);
+      const ws = openClient(rig.gatewayPort, await makeJwt("703"));
+      await new Promise<void>((resolve) => ws.once("open", resolve));
+      const containerWs = await containerOpen;
+      const business: Record<string, unknown>[] = [];
+      let closed: { code: number; reason: string } | null = null;
+      ws.on("message", (data) => {
+        try {
+          const frame = JSON.parse(data.toString()) as Record<string, unknown>;
+          if (typeof frame.type === "string" && !frame.type.startsWith("sys.")) business.push(frame);
+        } catch { /* irrelevant */ }
+      });
+      ws.once("close", (code, reason) => {
+        closed = { code, reason: reason.toString("utf8") };
+      });
+      const first = JSON.stringify({
+        type: "outbound.message",
+        sessionKey: "agent:main:webchat:dm:sess-permanent-skip",
+        frameSeq: 1,
+        peer: { id: "sess-permanent-skip", kind: "dm" },
+        clientMessageId: "cm-permanent-skip",
+        blocks: [{ kind: "text", text: "one" }],
+      });
+      const second = JSON.stringify({
+        type: "outbound.message",
+        sessionKey: "agent:main:webchat:dm:sess-permanent-skip",
+        frameSeq: 2,
+        peer: { id: "sess-permanent-skip", kind: "dm" },
+        clientMessageId: "cm-permanent-skip",
+        blocks: [{ kind: "text", text: "two" }],
+      });
+      containerWs.send(first);
+      containerWs.send(second);
+      await waitFor(() => persisted.includes(2) && business.some((frame) => frame.frameSeq === 2));
+      assert.equal(closed, null);
+      assert.equal(ws.readyState, WebSocket.OPEN);
+      assert.deepEqual(persisted, [2]);
+      assert.deepEqual(business.map((frame) => frame.frameSeq), [2]);
+      ws.close();
+      await waitClose(ws);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("a transient failedSeq poison expires after TTL and lets a later seq persist", async () => {
+    const persisted: number[] = [];
+    let persistCalls = 0;
+    const portRef = { value: 0 };
+    const ttlMs = 50;
+    const rig = await startRig({
+      resolve: async () => ({ host: "127.0.0.1", port: portRef.value, containerId: 80 }),
+      outboundPersistFailedSeqTtlMs: ttlMs,
+      persistOutboundFrame: async (input) => {
+        persistCalls += 1;
+        persisted.push(input.frameSeq);
+        if (persistCalls === 1) throw new Error("db unavailable");
+      },
+    });
+    portRef.value = rig.containerPort;
+    const firstFrame = JSON.stringify({
+      type: "outbound.message",
+      sessionKey: "agent:main:webchat:dm:sess-ttl-heal",
+      frameSeq: 4,
+      peer: { id: "sess-ttl-heal", kind: "dm" },
+      clientMessageId: "cm-ttl-heal",
+      blocks: [{ kind: "text", text: "poison" }],
+    });
+    const laterFrame = JSON.stringify({
+      type: "outbound.message",
+      sessionKey: "agent:main:webchat:dm:sess-ttl-heal",
+      frameSeq: 7,
+      peer: { id: "sess-ttl-heal", kind: "dm" },
+      clientMessageId: "cm-ttl-heal",
+      blocks: [{ kind: "text", text: "healed" }],
+    });
+    try {
+      const firstContainerOpen = waitNextContainerSocket(rig);
+      const ws1 = openClient(rig.gatewayPort, await makeJwt("704"));
+      await new Promise<void>((resolve) => ws1.once("open", resolve));
+      const firstContainer = await firstContainerOpen;
+      const firstClose = waitClose(ws1);
+      firstContainer.send(firstFrame);
+      assert.equal((await firstClose).code, CLOSE_BRIDGE.INTERNAL);
+      assert.deepEqual(persisted, [4]);
+
+      await new Promise<void>((resolve) => setTimeout(resolve, ttlMs + 40));
+
+      const secondContainerOpen = waitNextContainerSocket(rig);
+      const ws2 = openClient(rig.gatewayPort, await makeJwt("704"));
+      await new Promise<void>((resolve) => ws2.once("open", resolve));
+      const secondContainer = await secondContainerOpen;
+      const frames = frameCollector(ws2);
+      secondContainer.send(laterFrame);
+      const visible = await nextBusinessFrame(frames);
+      assert.equal(visible.frameSeq, 7);
+      assert.deepEqual(persisted, [4, 7]);
+      assert.equal(persistCalls, 2);
       ws2.close();
       await waitClose(ws2);
     } finally {

@@ -467,6 +467,15 @@ const DEFAULT_CONTAINER_CONNECT_TIMEOUT_MS = 5_000;
  * fence: a late async preparation result is never allowed to start a turn. */
 const DEFAULT_PROMPT_QUEUE_PREPARATION_TIMEOUT_MS = 20_000;
 
+/**
+ * Transient outbound persist failures poison later sequence numbers so a
+ * reconnect can replay the exact failed seq from the container ring.
+ * Current containers do not replay already-advanced seqs, so a poisoned
+ * namespace would otherwise stick until process restart. After this TTL
+ * the missing seq is skipped and the current frame is allowed through.
+ */
+export const OUTBOUND_PERSIST_FAILED_SEQ_TTL_MS = 15_000;
+
 /** ConnectionRegistry 默认 maxPerUser(沿用 connections.ts 的 3)。 */
 const DEFAULT_MAX_PER_USER = 3;
 
@@ -1022,6 +1031,8 @@ export interface UserChatBridgeDeps {
     frameSeq: number;
     payload: string;
   }) => Promise<void>;
+  /** Internal failed-seq poison TTL; override only for focused tests. */
+  outboundPersistFailedSeqTtlMs?: number;
   /** durable turn dispatch 受理面(RFC-v5-durable-turn-dispatch §2.1)。注入且容器 attest
    * DURABLE_TURN_DISPATCH_CAPABILITY 时,替代 persistMasterUserMessage:单事务幂等 append
    * user 行 + UPSERT dispatch 冲突表裁定(受理即拥有 I1)。未注入 / 无 capability → legacy。 */
@@ -1548,6 +1559,22 @@ export async function isCursorContainerOnSelfHost(
 
 // ---------- 主入口 ----------------------------------------------------------
 
+/**
+ * Duck-type marker for permanent live-frame journal conflicts.
+ *
+ * Contract: persistOutboundFrame (injected; typically persistGatewayLiveFrame)
+ * rejects with `{ liveFramePermanentConflict: true }` for identity / immutable
+ * payload conflicts. This file must not import the db module — check the
+ * flag, never the error message string.
+ */
+function isPermanentLiveFrameConflict(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    (error as { liveFramePermanentConflict?: unknown }).liveFramePermanentConflict === true
+  );
+}
+
 export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHandler {
   // PR2 v1.0.66 — codex 真扣费三件套一致性强校验(Codex BLOCKER 3 修复)。
   // partial 注入(漏一个)在生产里会让 codex 帧 acquire 但不 settle,等于
@@ -1580,6 +1607,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       (deps.promptQueuePreparationTimeoutMs ?? 0) > 0
       ? deps.promptQueuePreparationTimeoutMs!
       : DEFAULT_PROMPT_QUEUE_PREPARATION_TIMEOUT_MS;
+  const outboundPersistFailedSeqTtlMs =
+    Number.isSafeInteger(deps.outboundPersistFailedSeqTtlMs) &&
+      (deps.outboundPersistFailedSeqTtlMs ?? 0) > 0
+      ? deps.outboundPersistFailedSeqTtlMs!
+      : OUTBOUND_PERSIST_FAILED_SEQ_TTL_MS;
   const log = deps.logger;
   const metrics = deps.metrics ?? {};
   const createContainerSocket = deps.createContainerSocket
@@ -1620,7 +1652,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
   // the same container broadcasts duplicate frames through multiple browser
   // bridges.  A failed namespace is poisoned: later sequence numbers are not
   // allowed to leap over the missing durable row.
-  const outboundPersistQueues = new Map<string, { tail: Promise<void>; failedSeq: number | null }>();
+  const outboundPersistQueues = new Map<string, {
+    tail: Promise<void>;
+    failedSeq: number | null;
+    failedAtMs: number | null;
+  }>();
   const enqueuePersistedOutbound = (
     key: string,
     frameSeq: number,
@@ -1629,7 +1665,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
   ): void => {
     let state = outboundPersistQueues.get(key);
     if (!state) {
-      state = { tail: Promise.resolve(), failedSeq: null };
+      state = { tail: Promise.resolve(), failedSeq: null, failedAtMs: null };
       outboundPersistQueues.set(key, state);
     }
     const task = state.tail.then(async () => {
@@ -1637,14 +1673,35 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // own ring.  That exact retry is allowed to heal the namespace; a later
       // sequence must never overtake it.
       if (state!.failedSeq !== null && state!.failedSeq !== frameSeq) {
-        onFailure(new Error(`outbound durability blocked at frame ${state!.failedSeq}`));
-        return;
+        const failedAgeMs = Date.now() - (state!.failedAtMs ?? 0);
+        if (failedAgeMs > outboundPersistFailedSeqTtlMs) {
+          log?.warn("user-chat-bridge: outbound durability poison expired; skipped missing seq", {
+            skippedFailedSeq: state!.failedSeq,
+            frameSeq,
+          });
+          state!.failedSeq = null;
+          state!.failedAtMs = null;
+        } else {
+          onFailure(new Error(`outbound durability blocked at frame ${state!.failedSeq}`));
+          return;
+        }
       }
       try {
         await work();
-        if (state!.failedSeq === frameSeq) state!.failedSeq = null;
+        if (state!.failedSeq === frameSeq) {
+          state!.failedSeq = null;
+          state!.failedAtMs = null;
+        }
       } catch (error) {
+        if (isPermanentLiveFrameConflict(error)) {
+          log?.error("user-chat-bridge: skipping outbound frame after permanent live-stream conflict", {
+            frameSeq,
+            err: (error as Error)?.message ?? String(error),
+          });
+          return;
+        }
         state!.failedSeq = frameSeq;
+        state!.failedAtMs = Date.now();
         onFailure(error);
       }
     });

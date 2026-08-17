@@ -4675,6 +4675,140 @@ describe("durable live turn frame journal", () => {
     assert.deepEqual(secondPage.frames[0]!.payload, JSON.parse(payload2));
     assert.deepEqual(secondPage.streamClientMessageIds, []);
   });
+
+  maybe("legacy stream accepts a later non-null client_message_id without identity conflict", async () => {
+    const sessionId = "s-live-legacy-identity";
+    const userId = "c:911";
+    const clientMessageId = "ask-ans-legacy-1";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const sessionKey = "agent:main:webchat:dm:s-live-legacy-identity";
+    const base = {
+      uid: 911n,
+      sessionId,
+      agentContainerId: 511,
+      sessionKey,
+    };
+    const payloadNull = JSON.stringify({
+      type: "outbound.message",
+      sessionKey,
+      frameSeq: 1,
+      peer: { id: sessionId, kind: "dm" },
+      blocks: [{ kind: "text", text: "server authored" }],
+    });
+    const payloadId = JSON.stringify({
+      type: "outbound.message",
+      sessionKey,
+      frameSeq: 2,
+      peer: { id: sessionId, kind: "dm" },
+      clientMessageId,
+      blocks: [{ kind: "text", text: "user turn" }],
+    });
+    await persistGatewayLiveFrame(pool, {
+      ...base,
+      clientMessageId: null,
+      frameSeq: 1,
+      payload: payloadNull,
+    });
+    await persistGatewayLiveFrame(pool, {
+      ...base,
+      clientMessageId,
+      frameSeq: 2,
+      payload: payloadId,
+    });
+
+    const streams = await pool.query<{ stream_key: string; client_message_id: string | null }>(
+      `SELECT stream_key,client_message_id
+         FROM client_session_live_streams
+        WHERE agent_container_id=$1 AND stream_key LIKE 'legacy:%'`,
+      [base.agentContainerId],
+    );
+    assert.equal(streams.rows.length, 1);
+    assert.equal(streams.rows[0]!.stream_key, `legacy:${base.agentContainerId}:${sessionKey}`);
+    assert.equal(streams.rows[0]!.client_message_id, clientMessageId);
+
+    const page = await readClientSessionLiveFrames(pool, sessionId, userId, 0, 10);
+    assert.ok(page);
+    assert.equal(page.frames.length, 2);
+    assert.ok(page.streamClientMessageIds.includes(clientMessageId));
+
+    const payloadNull2 = JSON.stringify({
+      type: "outbound.message",
+      sessionKey,
+      frameSeq: 3,
+      peer: { id: sessionId, kind: "dm" },
+      blocks: [{ kind: "text", text: "another server frame" }],
+    });
+    await persistGatewayLiveFrame(pool, {
+      ...base,
+      clientMessageId: null,
+      frameSeq: 3,
+      payload: payloadNull2,
+    });
+    const after = await pool.query<{ client_message_id: string | null }>(
+      `SELECT client_message_id FROM client_session_live_streams WHERE stream_key=$1`,
+      [`legacy:${base.agentContainerId}:${sessionKey}`],
+    );
+    assert.equal(after.rows[0]!.client_message_id, clientMessageId);
+  });
+
+  maybe("dispatch stream identity guard still rejects a conflicting agent_container_id", async () => {
+    const sessionId = "s-live-dispatch-identity";
+    const userId = "c:912";
+    const dispatchId = randomUUID();
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    await pool.query(
+      `INSERT INTO turn_dispatches
+         (dispatch_id,user_id,session_id,client_message_id,agent_id,request_hash,
+          billing_request_id,status,owner_id,lease_until)
+       VALUES ($1,912,$2,'cm-dispatch-guard','main',$3,$4,'accepted','test-owner',NOW()+INTERVAL '1 minute')`,
+      [dispatchId, sessionId, "3".repeat(64), `billing-${dispatchId}`],
+    );
+    const sessionKey = "agent:main:webchat:dm:s-live-dispatch-identity";
+    const payload = JSON.stringify({
+      type: "outbound.message",
+      sessionKey,
+      frameSeq: 1,
+      peer: { id: sessionId, kind: "dm" },
+      clientMessageId: "cm-dispatch-guard",
+      blocks: [{ kind: "text", text: "ok" }],
+    });
+    await persistGatewayLiveFrame(pool, {
+      uid: 912n,
+      sessionId,
+      clientMessageId: "cm-dispatch-guard",
+      agentContainerId: 512,
+      sessionKey,
+      frameSeq: 1,
+      payload,
+    });
+    await assert.rejects(
+      persistGatewayLiveFrame(pool, {
+        uid: 912n,
+        sessionId,
+        clientMessageId: "cm-dispatch-guard",
+        agentContainerId: 513,
+        sessionKey,
+        frameSeq: 2,
+        payload: JSON.stringify({
+          type: "outbound.message",
+          sessionKey,
+          frameSeq: 2,
+          peer: { id: sessionId, kind: "dm" },
+          clientMessageId: "cm-dispatch-guard",
+          blocks: [{ kind: "text", text: "conflict" }],
+        }),
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /live frame stream identity conflict/);
+        assert.equal(
+          (error as { liveFramePermanentConflict?: unknown }).liveFramePermanentConflict,
+          true,
+        );
+        return true;
+      },
+    );
+  });
 });
 
 describe("pgSessionsBackend §9 并发(双连接 barrier)", () => {
