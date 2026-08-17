@@ -8,7 +8,12 @@
  * cannot both deliver the tool result *and* start a new turn, and cannot
  * drop the answer either.
  *
- *   waiting ──tryAnswer──► answered_in_window   (HTTP waiter consumes; no dispatchInbound)
+ * Once `answered_in_window`, the HTTP waiter must either write the tool
+ * result or compensate via dispatchInbound. `tryClaimDelivery` is the
+ * one-shot gate so those two outcomes cannot both happen for one requestId.
+ *
+ *   waiting ──tryAnswer──► answered_in_window   (HTTP waiter consumes; no dispatchInbound
+ *                                                unless the response can no longer be written)
  *          └──tryRelease─► released_to_detached (timeout / client abort; later answers start a turn)
  */
 
@@ -48,11 +53,56 @@ export function resolveAskUserWaitMs(raw: unknown): number {
   return Math.max(0, Math.min(ASK_USER_WAIT_MS_MAX, Math.floor(n)))
 }
 
+/**
+ * True when the in-flight HTTP waiter can no longer write a tool result
+ * (client gone, response already finished, or the socket is already dead
+ * even if 'close' has not been dispatched yet).
+ */
+export function askUserHttpUnwritable(
+  req: {
+    destroyed?: boolean
+    aborted?: boolean
+    socket?: { destroyed?: boolean } | null
+  },
+  res: {
+    headersSent?: boolean
+    writableEnded?: boolean
+    destroyed?: boolean
+    writable?: boolean
+    socket?: { destroyed?: boolean } | null
+  },
+): boolean {
+  return Boolean(
+    req.destroyed ||
+    req.aborted ||
+    req.socket?.destroyed ||
+    res.destroyed ||
+    res.headersSent ||
+    res.writableEnded ||
+    res.writable === false ||
+    res.socket?.destroyed,
+  )
+}
+
+/** True when sendJson appears to have finished writing a complete response. */
+export function askUserHttpWriteSucceeded(res: {
+  destroyed?: boolean
+  headersSent?: boolean
+  writableEnded?: boolean
+}): boolean {
+  return Boolean(!res.destroyed && res.headersSent && res.writableEnded)
+}
+
 export class AskUserWaiter {
   private phase: AskUserWaiterPhase = 'waiting'
   private result: AskUserWaiterResult | null = null
   private resolveWait: ((result: AskUserWaiterResult) => void) | null = null
   private timer: ReturnType<typeof setTimeout> | null = null
+  /**
+   * One-shot delivery/compensation claim. Assigned synchronously inside
+   * `tryClaimDelivery` so HTTP write and dispatchInbound cannot both fire.
+   */
+  private deliveryClaimed = false
   private readonly waitPromise: Promise<AskUserWaiterResult>
 
   constructor() {
@@ -63,6 +113,24 @@ export class AskUserWaiter {
 
   getPhase(): AskUserWaiterPhase {
     return this.phase
+  }
+
+  getAnswer(): AskUserWaiterAnswer | null {
+    if (this.result?.status !== 'answered') return null
+    return this.result.answer
+  }
+
+  /**
+   * Claim exclusive right to deliver an in-window answer — either by writing
+   * the HTTP tool result or by compensating with dispatchInbound.
+   * Returns true iff this caller won. Must not await between the check and
+   * the assignment.
+   */
+  tryClaimDelivery(): boolean {
+    if (this.phase !== 'answered_in_window') return false
+    if (this.deliveryClaimed) return false
+    this.deliveryClaimed = true
+    return true
   }
 
   /**

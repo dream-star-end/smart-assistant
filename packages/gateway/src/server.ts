@@ -173,7 +173,13 @@ import {
   isDetachedAskUserRequestId,
   pendingFromDetachedAskUserMessage,
 } from './detachedAskUser.js'
-import { AskUserWaiter, resolveAskUserWaitMs } from './askUserWaiter.js'
+import {
+  AskUserWaiter,
+  askUserHttpUnwritable,
+  askUserHttpWriteSucceeded,
+  resolveAskUserWaitMs,
+  type AskUserWaiterAnswer,
+} from './askUserWaiter.js'
 import { fetchAskUserPermissionCard, getV3MasterSinkOrNull, readV3MasterSinkConfig } from './v3MasterSink.js'
 import {
   filterUserVisibleAgentsForManagement,
@@ -13080,8 +13086,10 @@ export class Gateway {
    * treated as 0 — fully detached, immediate posted. Explicit values are
    * clamped to 55s, under the 60s MCP tools/call wall. On timeout / client
    * abort the waiter releases to the existing detached path (later allow →
-   * dispatchInbound). The HTTP response is always produced by the waiter
-   * timer or a terminal claim — it cannot hang past waitMs.
+   * dispatchInbound). If tryAnswer already won but the HTTP response can no
+   * longer be written, the consumed answer is compensated through that same
+   * dispatchInbound path so it cannot vanish. The HTTP response is always
+   * produced by the waiter timer or a terminal claim — it cannot hang past waitMs.
    */
   private async handleEngineAskUser(
     req: IncomingMessage,
@@ -13194,32 +13202,138 @@ export class Gateway {
       waitMs,
     })
 
+    const pendingForWait = { sessionKey, userId, channel, peer }
     try {
       const remaining = Math.max(0, deadlineAt - Date.now())
       waiter.startTimer(remaining)
       const result = await waiter.wait()
       this._askUserWaiters.delete(requestId)
-      if (clientGone || res.headersSent || res.writableEnded) return
       if (result.status === 'answered') {
-        if (result.answer.behavior === 'deny') {
-          this.sendJson(res, 200, buildDetachedAskUserSkippedResult(requestId))
-        } else {
-          this.sendJson(res, 200, buildDetachedAskUserAnsweredResult({
-            requestId,
-            answers: result.answer.answers,
-            answerText: result.answer.answerText,
-          }))
-        }
+        await this._finishInWindowAskUserWait({
+          req,
+          res,
+          waiter,
+          result,
+          requestId,
+          pending: pendingForWait,
+          clientGone,
+        })
         return
       }
+      if (clientGone || askUserHttpUnwritable(req, res)) return
       this.sendJson(res, 200, buildDetachedAskUserPostedResult(requestId))
     } catch (err) {
       waiter.tryRelease()
       this._askUserWaiters.delete(requestId)
       this.log.error('engine ask_user wait failed', { requestId }, err as Error)
-      if (clientGone || res.headersSent || res.writableEnded) return
+      const answered = waiter.getAnswer()
+      if (waiter.getPhase() === 'answered_in_window' && answered) {
+        await this._finishInWindowAskUserWait({
+          req,
+          res,
+          waiter,
+          result: { status: 'answered', answer: answered },
+          requestId,
+          pending: pendingForWait,
+          clientGone,
+        })
+        return
+      }
+      if (clientGone || askUserHttpUnwritable(req, res)) return
       this.sendJson(res, 200, buildDetachedAskUserPostedResult(requestId))
     }
+  }
+
+  /**
+   * Deliver an in-window ask_user answer over HTTP, or compensate with the
+   * same dispatchInbound path used after timeout. `tryClaimDelivery` is the
+   * synchronous one-shot so HTTP success and compensation cannot both fire.
+   */
+  private async _finishInWindowAskUserWait(args: {
+    req: IncomingMessage
+    res: ServerResponse
+    waiter: AskUserWaiter
+    result: { status: 'answered'; answer: AskUserWaiterAnswer }
+    requestId: string
+    pending: {
+      sessionKey: string
+      userId: string
+      channel: string
+      peer: { id: string; kind: 'dm' | 'group' }
+    }
+    clientGone: boolean
+  }): Promise<void> {
+    const { req, res, waiter, result, requestId, pending, clientGone } = args
+    const answer = result.answer
+    const httpBlocked = clientGone || askUserHttpUnwritable(req, res)
+
+    if (!httpBlocked) {
+      if (!waiter.tryClaimDelivery()) return
+      try {
+        if (answer.behavior === 'deny') {
+          this.sendJson(res, 200, buildDetachedAskUserSkippedResult(requestId))
+        } else {
+          this.sendJson(res, 200, buildDetachedAskUserAnsweredResult({
+            requestId,
+            answers: answer.answers,
+            answerText: answer.answerText,
+          }))
+        }
+        if (askUserHttpWriteSucceeded(res)) return
+      } catch (err) {
+        this.log.warn('in-window ask_user HTTP write failed', { requestId }, err as Error)
+      }
+      if (answer.behavior === 'allow' && answer.answerText) {
+        try {
+          await this._compensateInWindowAskUserAnswer(pending, requestId, answer)
+        } catch (err) {
+          this.log.error('in-window ask_user compensation failed', { requestId }, err as Error)
+        }
+      }
+      return
+    }
+
+    if (answer.behavior === 'allow' && answer.answerText) {
+      if (!waiter.tryClaimDelivery()) return
+      try {
+        await this._compensateInWindowAskUserAnswer(pending, requestId, answer)
+      } catch (err) {
+        this.log.error('in-window ask_user compensation failed', { requestId }, err as Error)
+      }
+      return
+    }
+    waiter.tryClaimDelivery()
+  }
+
+  /**
+   * In-window answer could not be written back to the MCP HTTP caller.
+   * Reuse the timeout-then-answer path: tape user-answer row + dispatchInbound.
+   */
+  private async _compensateInWindowAskUserAnswer(
+    pending: {
+      sessionKey: string
+      userId: string
+      channel: string
+      peer: { id: string; kind: 'dm' | 'group' }
+    },
+    requestId: string,
+    answer: AskUserWaiterAnswer,
+  ): Promise<void> {
+    if (answer.behavior !== 'allow' || !answer.answerText) return
+    const answerId = buildDetachedAskUserAnswerMessageId(requestId)
+    void this._patchDetachedAskUserResolved(
+      pending,
+      requestId,
+      {
+        _resolved: true,
+        _behavior: 'allow',
+        _settledReason: 'remote',
+        ...(answer.answers ? { _answers: answer.answers } : {}),
+      },
+      { id: answerId, text: answer.answerText },
+    )
+    this.log.info('in-window ask_user compensated via new turn', { requestId })
+    await this._submitDetachedAskUserAnswer(pending, answer.answerText, requestId, answerId)
   }
 
   private async _persistDetachedAskUserCard(args: {

@@ -9,6 +9,8 @@ import { describe, it } from 'node:test'
 import {
   ASK_USER_WAIT_MS_MAX,
   AskUserWaiter,
+  askUserHttpUnwritable,
+  askUserHttpWriteSucceeded,
   resolveAskUserWaitMs,
 } from '../askUserWaiter.js'
 
@@ -138,5 +140,46 @@ describe('AskUserWaiter single-flight', () => {
     assert.equal(waiter.getPhase(), 'answered_in_window')
     const result = await waiter.wait()
     assert.equal(result.status, 'answered')
+  })
+})
+
+describe('AskUserWaiter tryClaimDelivery', () => {
+  it('is a one-shot that only succeeds after answered_in_window', () => {
+    const waiter = new AskUserWaiter()
+    assert.equal(waiter.tryClaimDelivery(), false)
+    assert.equal(waiter.tryAnswer({ behavior: 'allow', answerText: 'Vim', answers: { q: 'Vim' } }), true)
+    assert.equal(waiter.tryClaimDelivery(), true)
+    assert.equal(waiter.tryClaimDelivery(), false)
+    assert.equal(waiter.tryClaimDelivery(), false)
+  })
+
+  it('does not claim after release (detached path owns later answers)', () => {
+    const waiter = new AskUserWaiter()
+    assert.equal(waiter.tryRelease(), true)
+    assert.equal(waiter.tryClaimDelivery(), false)
+    assert.equal(waiter.getAnswer(), null)
+  })
+})
+
+describe('askUserHttpUnwritable / askUserHttpWriteSucceeded', () => {
+  it('treats aborted, destroyed, and already-ended responses as unwritable', () => {
+    const idleReq = {}
+    const idleRes = {}
+    assert.equal(askUserHttpUnwritable(idleReq, idleRes), false)
+    assert.equal(askUserHttpUnwritable({ aborted: true }, idleRes), true)
+    assert.equal(askUserHttpUnwritable({ destroyed: true }, idleRes), true)
+    assert.equal(askUserHttpUnwritable({ socket: { destroyed: true } }, idleRes), true)
+    assert.equal(askUserHttpUnwritable(idleReq, { headersSent: true }), true)
+    assert.equal(askUserHttpUnwritable(idleReq, { writableEnded: true }), true)
+    assert.equal(askUserHttpUnwritable(idleReq, { destroyed: true }), true)
+    assert.equal(askUserHttpUnwritable(idleReq, { writable: false }), true)
+    assert.equal(askUserHttpUnwritable(idleReq, { socket: { destroyed: true } }), true)
+  })
+
+  it('treats a completed undestroyed write as success', () => {
+    assert.equal(askUserHttpWriteSucceeded({ headersSent: true, writableEnded: true }), true)
+    assert.equal(askUserHttpWriteSucceeded({ headersSent: true, writableEnded: true, destroyed: true }), false)
+    assert.equal(askUserHttpWriteSucceeded({ headersSent: true, writableEnded: false }), false)
+    assert.equal(askUserHttpWriteSucceeded({ headersSent: false, writableEnded: false }), false)
   })
 })

@@ -102,6 +102,7 @@ async function callAskUser(
   gateway: any,
   body: Record<string, unknown>,
   reqExtra?: EventEmitter,
+  opts?: { throwOnWrite?: boolean },
 ): Promise<{ status: number; body: any; req: EventEmitter; abort: () => void }> {
   const req: any = reqExtra ?? new EventEmitter()
   req.method = 'POST'
@@ -112,16 +113,22 @@ async function callAskUser(
   const res: any = {
     headersSent: false,
     writableEnded: false,
+    destroyed: false,
+    writable: true,
     writeHead: (code: number) => {
+      if (opts?.throwOnWrite) throw new Error('socket hang up')
       status = code
       res.headersSent = true
     },
     end: (chunk?: unknown) => {
+      if (opts?.throwOnWrite) throw new Error('socket hang up')
       raw = String(chunk ?? '')
       res.writableEnded = true
     },
   }
   const abort = () => {
+    req.aborted = true
+    req.destroyed = true
     req.emit('aborted')
     req.emit('close')
   }
@@ -385,5 +392,126 @@ describe('handlePermissionResponse — in-window vs released single-flight', () 
     })
     assert.equal(inboundFrames.length, 0)
     assert.equal(gateway._pendingPermissions.has(requestId), false)
+  })
+})
+
+describe('handleEngineAskUser — in-window delivery compensation', () => {
+  it('in-window allow whose client disconnects after tryAnswer starts a new turn once', async () => {
+    const { gateway, inboundFrames, patches } = makeGateway()
+    const req = new EventEmitter()
+    const pending = callAskUser(gateway, {
+      sessionKey: SESSION_KEY,
+      questions: QUESTIONS,
+      waitMs: 2_000,
+    }, req)
+    await new Promise((r) => setTimeout(r, 20))
+    const requestId = [...gateway._pendingPermissions.keys()][0] as string
+    const waiter = gateway._askUserWaiters.get(requestId)
+    assert.ok(waiter, 'waiter must still be in-flight')
+    const origTryAnswer = waiter.tryAnswer.bind(waiter)
+    waiter.tryAnswer = (answer: unknown) => {
+      const won = origTryAnswer(answer)
+      if (won) {
+        ;(req as any).aborted = true
+        ;(req as any).destroyed = true
+        req.emit('aborted')
+        req.emit('close')
+      }
+      return won
+    }
+    await gateway.handlePermissionResponse({
+      type: 'inbound.permission_response',
+      channel: 'webchat',
+      peer: PEER,
+      requestId,
+      behavior: 'allow',
+      updatedInput: { answers: { [QUESTION]: 'Vim' } },
+    })
+    const r = await pending
+    assert.equal(r.status, 0, 'HTTP tool result must not have been written')
+    assert.equal(inboundFrames.length, 1, 'undeliverable in-window answer must start a new turn')
+    assert.match(String((inboundFrames[0] as { content?: { text?: string } }).content?.text ?? ''), /Vim/)
+    assert.equal(waiter.tryClaimDelivery(), false, 'delivery already claimed by compensation')
+    await gateway._finishInWindowAskUserWait({
+      req,
+      res: { headersSent: false, writableEnded: false, destroyed: true },
+      waiter,
+      result: { status: 'answered', answer: waiter.getAnswer() },
+      requestId,
+      pending: { sessionKey: SESSION_KEY, userId: 'default', channel: 'webchat', peer: PEER },
+      clientGone: true,
+    })
+    assert.equal(inboundFrames.length, 1, 'compensation must be one-shot')
+    assert.ok(patches.some((p) => p.userAnswer), 'compensation persists the user-answer tape row')
+  })
+
+  it('in-window allow whose HTTP write throws starts a new turn once', async () => {
+    const { gateway, inboundFrames } = makeGateway()
+    const pending = callAskUser(gateway, {
+      sessionKey: SESSION_KEY,
+      questions: QUESTIONS,
+      waitMs: 2_000,
+    }, undefined, { throwOnWrite: true })
+    await new Promise((r) => setTimeout(r, 20))
+    const requestId = [...gateway._pendingPermissions.keys()][0] as string
+    await gateway.handlePermissionResponse({
+      type: 'inbound.permission_response',
+      channel: 'webchat',
+      peer: PEER,
+      requestId,
+      behavior: 'allow',
+      updatedInput: { answers: { [QUESTION]: 'VS Code' } },
+    })
+    const r = await pending
+    assert.equal(r.status, 0)
+    assert.equal(inboundFrames.length, 1)
+    assert.match(String((inboundFrames[0] as { content?: { text?: string } }).content?.text ?? ''), /VS Code/)
+    const waiter = new AskUserWaiter()
+    waiter.tryAnswer({ behavior: 'allow', answerText: 'dup', answers: { [QUESTION]: 'dup' } })
+    waiter.tryClaimDelivery()
+    await gateway._finishInWindowAskUserWait({
+      req: {},
+      res: { destroyed: true },
+      waiter,
+      result: { status: 'answered', answer: waiter.getAnswer() },
+      requestId,
+      pending: { sessionKey: SESSION_KEY, userId: 'default', channel: 'webchat', peer: PEER },
+      clientGone: true,
+    })
+    assert.equal(inboundFrames.length, 1)
+  })
+
+  it('in-window deny whose client disconnects after tryAnswer still does not start a turn', async () => {
+    const { gateway, inboundFrames } = makeGateway()
+    const req = new EventEmitter()
+    const pending = callAskUser(gateway, {
+      sessionKey: SESSION_KEY,
+      questions: QUESTIONS,
+      waitMs: 2_000,
+    }, req)
+    await new Promise((r) => setTimeout(r, 20))
+    const requestId = [...gateway._pendingPermissions.keys()][0] as string
+    const waiter = gateway._askUserWaiters.get(requestId)
+    const origTryAnswer = waiter.tryAnswer.bind(waiter)
+    waiter.tryAnswer = (answer: unknown) => {
+      const won = origTryAnswer(answer)
+      if (won) {
+        ;(req as any).aborted = true
+        req.emit('aborted')
+        req.emit('close')
+      }
+      return won
+    }
+    await gateway.handlePermissionResponse({
+      type: 'inbound.permission_response',
+      channel: 'webchat',
+      peer: PEER,
+      requestId,
+      behavior: 'deny',
+      message: 'User skipped the questions',
+    })
+    const r = await pending
+    assert.equal(r.status, 0)
+    assert.equal(inboundFrames.length, 0)
   })
 })
