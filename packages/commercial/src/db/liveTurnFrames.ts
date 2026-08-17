@@ -27,6 +27,22 @@ export interface ClientSessionLiveFramePage {
   hasTapeProjection: boolean;
 }
 
+/**
+ * Permanent live-frame journal conflict: retrying the same seq cannot succeed.
+ *
+ * Contract for injected persistOutboundFrame (userChatBridge must not import
+ * this module): reject with `liveFramePermanentConflict === true`. The bridge
+ * duck-types that flag so a permanent conflict does not poison failedSeq or
+ * close the browser socket with 1011.
+ */
+export class LiveFramePermanentConflictError extends Error {
+  readonly liveFramePermanentConflict = true as const;
+  constructor(message: string) {
+    super(message);
+    this.name = "LiveFramePermanentConflictError";
+  }
+}
+
 function sha256(payload: Buffer): string {
   return createHash("sha256").update(payload).digest("hex");
 }
@@ -85,7 +101,46 @@ export async function persistGatewayLiveFrame(
       ? `dispatch:${dispatch.dispatch_id}:${dispatch.attempt_no}`
       : `legacy:${input.agentContainerId}:${input.sessionKey}`;
 
-    const stream = await client.query(
+    const streamParams = [
+      streamKey,
+      input.sessionId,
+      sessionUserId,
+      input.clientMessageId,
+      dispatch?.dispatch_id ?? null,
+      dispatch?.attempt_no ?? null,
+      input.agentContainerId,
+    ];
+    // Legacy keys are shared by every no-dispatch frame in the session.
+    // Identity is keyed off dispatch===null (not stream_key LIKE 'legacy:%').
+    // Last non-null client_message_id wins so streamClientMessageIds tracks
+    // the in-flight turn; a later NULL frame must not clobber the label.
+    let stream;
+    if (dispatch === null) {
+      stream = await client.query(
+        `INSERT INTO client_session_live_streams
+           (stream_key,session_id,user_id,client_message_id,dispatch_id,attempt_no,
+            agent_container_id,source,projection_source)
+         VALUES (
+           $1,$2,$3,$4,$5::uuid,$6,$7,'gateway',
+           CASE WHEN $5::uuid IS NOT NULL AND EXISTS (
+             SELECT 1 FROM client_session_turn_tapes t
+              WHERE t.dispatch_id=$5::uuid AND t.status='completed' AND t.finalized_at IS NOT NULL
+           ) THEN 'tape' ELSE 'live' END
+         )
+         ON CONFLICT (stream_key) DO UPDATE SET
+           updated_at=NOW(),
+           client_message_id = COALESCE(EXCLUDED.client_message_id, client_session_live_streams.client_message_id)
+         WHERE client_session_live_streams.session_id=EXCLUDED.session_id
+           AND client_session_live_streams.user_id=EXCLUDED.user_id
+           AND client_session_live_streams.dispatch_id IS NOT DISTINCT FROM EXCLUDED.dispatch_id
+           AND client_session_live_streams.attempt_no IS NOT DISTINCT FROM EXCLUDED.attempt_no
+           AND client_session_live_streams.agent_container_id IS NOT DISTINCT FROM EXCLUDED.agent_container_id
+           AND client_session_live_streams.source='gateway'
+         RETURNING stream_key`,
+        streamParams,
+      );
+    } else {
+      stream = await client.query(
       `INSERT INTO client_session_live_streams
          (stream_key,session_id,user_id,client_message_id,dispatch_id,attempt_no,
           agent_container_id,source,projection_source)
@@ -105,18 +160,11 @@ export async function persistGatewayLiveFrame(
          AND client_session_live_streams.agent_container_id IS NOT DISTINCT FROM EXCLUDED.agent_container_id
          AND client_session_live_streams.source='gateway'
        RETURNING stream_key`,
-      [
-        streamKey,
-        input.sessionId,
-        sessionUserId,
-        input.clientMessageId,
-        dispatch?.dispatch_id ?? null,
-        dispatch?.attempt_no ?? null,
-        input.agentContainerId,
-      ],
+      streamParams,
     );
+    }
     if ((stream.rowCount ?? 0) !== 1) {
-      throw new Error("live frame stream identity conflict");
+      throw new LiveFramePermanentConflictError("live frame stream identity conflict");
     }
 
     type StoredGatewayFrame = {
@@ -155,7 +203,7 @@ export async function persistGatewayLiveFrame(
     const existing = await insertOrReadExisting(input.sessionKey);
     if (existing === null || matchesCurrentFrame(existing)) return;
     if (existing.stream_key === streamKey) {
-      throw new Error("live frame immutable payload conflict");
+      throw new LiveFramePermanentConflictError("live frame immutable payload conflict");
     }
 
     // A destroyed gateway session can later reuse the same wire session key
@@ -166,7 +214,7 @@ export async function persistGatewayLiveFrame(
     const storageSessionKey = `v2:${JSON.stringify([input.sessionKey, streamKey])}`;
     const namespacedExisting = await insertOrReadExisting(storageSessionKey);
     if (namespacedExisting !== null && !matchesCurrentFrame(namespacedExisting)) {
-      throw new Error("live frame immutable payload conflict");
+      throw new LiveFramePermanentConflictError("live frame immutable payload conflict");
     }
   });
 }
