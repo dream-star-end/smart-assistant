@@ -217,6 +217,7 @@ import {
 } from './cron.js'
 import { handleTaskboardApi, resolveTaskboardActor, setPatrolExecutionHandler } from './taskboard/http.js'
 import { getTaskboardDb } from './taskboard/db/index.js'
+import { isPatrolSessionKey } from './taskboard/domain.js'
 import { PatrolEngine } from './taskboard/patrol.js'
 import { TaskboardNotifier } from './taskboard/notify.js'
 import { sendV3WechatProactive, readV3WechatProactiveConfig } from './v3WechatProactive.js'
@@ -3868,14 +3869,7 @@ export class Gateway {
       listClientSessions(userId).then((owned) => {
         const ownedIds = new Set(owned.map((s) => s.id))
         // Also include sessions with no matching client session (cron/task sessions) only for default user
-        const filtered = allLive.filter((s) => {
-          // 排除内部委派会话：它们不是用户聊天会话，不能经此 API 泄露（Codex 审）。
-          // key 形如 agent:<id>:delegate:...（第 3 段区分）。
-          const kind = s.sessionKey.split(':')[2] || ''
-          if (kind === 'delegate') return false
-          const peerId = s.sessionKey.split(':')[4] || ''
-          return ownedIds.has(peerId) || (userId === 'default' && !peerId.startsWith('web-'))
-        })
+        const filtered = filterUserVisibleLiveSessions(allLive, ownedIds, userId)
         this.sendJson(res, 200, { sessions: filtered })
       }).catch(() => this.sendJson(res, 200, { sessions: [] }))
       return
@@ -15732,6 +15726,29 @@ export function _earlyRejectErrorFrames(args: {
     _userId: args.userId,
   }
   return [structured, legacyFinal] as const
+}
+
+/**
+ * GET /api/sessions 的 live/内存会话列表过滤。
+ *
+ * 巡检 key 必须走 `isPatrolSessionKey`(CORRECTIONS §1.3/§1.4):kind 段是
+ * `taskboard`,若只排除 `delegate`,default 用户会把 stageId 误当成 peerId 放进
+ * 侧栏。内部委派同样不是用户聊天会话。
+ */
+export function filterUserVisibleLiveSessions<T extends { sessionKey: string }>(
+  sessions: readonly T[],
+  ownedIds: ReadonlySet<string>,
+  userId: string,
+): T[] {
+  return sessions.filter((s) => {
+    if (isPatrolSessionKey(s.sessionKey)) return false
+    // 排除内部委派会话：它们不是用户聊天会话，不能经此 API 泄露（Codex 审）。
+    // key 形如 agent:<id>:delegate:...（第 3 段区分）。
+    const kind = s.sessionKey.split(':')[2] || ''
+    if (kind === 'delegate') return false
+    const peerId = s.sessionKey.split(':')[4] || ''
+    return ownedIds.has(peerId) || (userId === 'default' && !peerId.startsWith('web-'))
+  })
 }
 
 // ── 长会话热尾巴 + 归档 (Agent B §2) — pure helpers(`_` 前缀 test seam)──
