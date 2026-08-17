@@ -512,7 +512,7 @@ for(const e of [
       assert.deepEqual(launched.ambientSecrets, {})
       assert.equal(launched.agentId, 'main')
       assert.equal(launched.sessionKey, 'agent:main:webchat:dm:cursor-test')
-      assert.equal(launched.path, '/usr/local/bin:/usr/bin:/bin')
+      assert.equal(launched.path, '/run/oc/platform/current/bin:/usr/local/bin:/usr/bin:/bin')
       assert.equal(launched.configMode, 0o600)
       assert.equal(launched.tokenMode, 0o600)
       assert.equal(launched.contextMode, 0o700)
@@ -934,9 +934,49 @@ for(const e of [
     const env = _internals.buildCursorSpawnEnv('main', 'agent:main:webchat:dm:test')
     assert.equal(env.OPENCLAUDE_HOME, paths.home)
     assert.equal(env.HOME, undefined)
-    assert.equal(env.PATH, '/usr/local/bin:/usr/bin:/bin')
+    assert.equal(env.PATH, '/run/oc/platform/current/bin:/usr/local/bin:/usr/bin:/bin')
     assert.equal(env.OC_AGENT_ID, 'main')
     assert.equal(env.OC_SESSION_KEY, 'agent:main:webchat:dm:test')
+  })
+
+  test('forwards core-memory embedding env when present and omits missing keys', () => {
+    const keys = [
+      'EMBEDDING_PROVIDER',
+      'EMBEDDING_MODEL',
+      'EMBEDDING_DIMENSIONS',
+      'EMBEDDING_API_KEY',
+      'EMBEDDING_BASE_URL',
+      'EMBEDDING_BATCH_SIZE',
+      'OPENCLAUDE_CORE_MEMORY_LOCAL_SEMANTIC',
+    ] as const
+    const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]))
+    try {
+      for (const key of keys) Reflect.deleteProperty(process.env, key)
+      const missing = _internals.buildCursorSpawnEnv('main', 'agent:main:webchat:dm:test')
+      for (const key of keys) assert.equal(Object.hasOwn(missing, key), false)
+
+      process.env.EMBEDDING_PROVIDER = 'openai'
+      process.env.EMBEDDING_MODEL = 'text-embedding-v4'
+      process.env.EMBEDDING_DIMENSIONS = '1024'
+      process.env.EMBEDDING_API_KEY = 'test-embedding-key'
+      process.env.EMBEDDING_BASE_URL = 'https://example.test/v1'
+      process.env.EMBEDDING_BATCH_SIZE = '10'
+      process.env.OPENCLAUDE_CORE_MEMORY_LOCAL_SEMANTIC = '1'
+      const present = _internals.buildCursorSpawnEnv('main', 'agent:main:webchat:dm:test')
+      assert.equal(present.EMBEDDING_PROVIDER, 'openai')
+      assert.equal(present.EMBEDDING_MODEL, 'text-embedding-v4')
+      assert.equal(present.EMBEDDING_DIMENSIONS, '1024')
+      assert.equal(present.EMBEDDING_API_KEY, 'test-embedding-key')
+      assert.equal(present.EMBEDDING_BASE_URL, 'https://example.test/v1')
+      assert.equal(present.EMBEDDING_BATCH_SIZE, '10')
+      assert.equal(present.OPENCLAUDE_CORE_MEMORY_LOCAL_SEMANTIC, '1')
+
+      process.env.EMBEDDING_API_KEY = '   '
+      const blank = _internals.buildCursorSpawnEnv('main', 'agent:main:webchat:dm:test')
+      assert.equal(Object.hasOwn(blank, 'EMBEDDING_API_KEY'), false)
+    } finally {
+      for (const key of keys) restoreEnv(key, previous[key])
+    }
   })
 
   test('rejects an oversized UTF-8 prompt before spawning the Cursor wrapper', async () => {
