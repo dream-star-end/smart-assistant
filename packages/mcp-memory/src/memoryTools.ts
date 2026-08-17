@@ -39,6 +39,11 @@ import {
   scanMemoryContent,
   paths,
   isManagedAgentRuntime,
+  isMemoryExpired,
+  memoryCalendarDate,
+  parseMemoryFrontmatter,
+  tokenizeCoreMemory,
+  coverageAtLeastHalf,
   readMemoryTurnPolicy,
   reciprocalRankFusion,
   searchSessions,
@@ -136,7 +141,6 @@ const CORE_BM25_B = 0.75
  * strong also uses 50% — kept so a future extra strong constraint can still
  * fall back without reopening the no-match hole.
  */
-const CORE_COVERAGE_NUMERATOR = 2
 const WEAK_LEXICAL_FALLBACK_LIMIT = 3
 const WEAK_LEXICAL_FALLBACK_NOTE =
   'Weak lexical fallback: no match cleared the coverage bar; these top hits may be unrelated — read excerpts before using them.'
@@ -149,14 +153,6 @@ const WEAK_LEXICAL_FALLBACK_NOTE =
  */
 const CORE_RELATIVE_SCORE_RATIO = 0.35
 
-function tokenizeCoreMemory(normalized: string, segmenter: Intl.Segmenter): string[] {
-  const tokens: string[] = []
-  for (const part of segmenter.segment(normalized)) {
-    if (part.isWordLike) tokens.push(part.segment)
-  }
-  return tokens
-}
-
 function bm25Idf(documentCount: number, df: number): number {
   return Math.log(1 + (documentCount - df + 0.5) / (df + 0.5))
 }
@@ -165,10 +161,6 @@ function bm25TermScore(tf: number, docLength: number, avgdl: number, idf: number
   if (tf <= 0) return 0
   const denom = tf + CORE_BM25_K1 * (1 - CORE_BM25_B + CORE_BM25_B * (docLength / avgdl))
   return idf * ((tf * (CORE_BM25_K1 + 1)) / denom)
-}
-
-function coverageAtLeastHalf(matchedCharacters: number, totalTermCharacters: number): boolean {
-  return totalTermCharacters > 0 && matchedCharacters * CORE_COVERAGE_NUMERATOR >= totalTermCharacters
 }
 
 type CoreHit = { score: number; path: string; label: string; size: number; snippet: string; matchedCharacters: number }
@@ -213,25 +205,24 @@ async function memorySearchPolicyError(kind: 'core' | 'deep'): Promise<MemoryToo
   return null
 }
 
-export async function handleCoreSearch(args: {
+export type StrongCoreHit = { path: string; label: string }
+
+function ttlWarn(message: string): void {
+  process.stderr.write(`[memory-ttl] ${message}\n`)
+}
+
+async function loadAndScoreCoreLexical(args: {
   agentId: string
   query: string
-  limit?: number
-  offset?: number
-  /** Test seam for the authenticated master relay; omitted by the CLI. */
-  semanticOptions?: CoreMemorySemanticOptions
-}): Promise<MemoryToolResult> {
-  const denied = await memorySearchPolicyError('core')
-  if (denied) return denied
+  today?: string
+}): Promise<{
+  documents: CoreMemoryDocument[]
+  lexicalHits: CoreHit[]
+  strongLexicalHits: CoreHit[]
+  totalTermCharacters: number
+}> {
   const query = args.query.trim()
-  if (!query) return toolError('core-search requires a non-empty query string')
-  const limit = args.limit ?? 5
-  const offset = args.offset ?? 0
-  if (!Number.isInteger(limit) || limit < 1 || limit > 20)
-    return toolError('core-search --limit must be an integer from 1 to 20')
-  if (!Number.isInteger(offset) || offset < 0)
-    return toolError('core-search --offset must be a non-negative integer')
-
+  const today = args.today ?? memoryCalendarDate()
   const q = query.normalize('NFKC').toLocaleLowerCase()
   const terms = [
     ...new Set([
@@ -256,6 +247,8 @@ export async function handleCoreSearch(args: {
   const segmenter = new Intl.Segmenter('zh', { granularity: 'word' })
   const add = (path: string, label: string, content: string, size: number) => {
     if (!content.trim() || !scanMemoryContent(content).ok) return
+    const { fm } = parseMemoryFrontmatter(content)
+    if (isMemoryExpired(fm.expires, today, ttlWarn, path)) return
     documents.push({ path, label, content, size })
     const normalized = content.normalize('NFKC').toLocaleLowerCase()
     indexed.push({
@@ -345,6 +338,58 @@ export async function handleCoreSearch(args: {
   }
   lexicalHits.sort((a, b) => b.score - a.score || a.path.localeCompare(b.path))
   strongLexicalHits.sort((a, b) => b.score - a.score || a.path.localeCompare(b.path))
+  return { documents, lexicalHits, strongLexicalHits, totalTermCharacters }
+}
+
+/**
+ * Dedup probe for the auto-write path. Reuses the same strong-hit rule as
+ * core-search (phrase match, or matched query-term characters covering at
+ * least half the query via CORE_COVERAGE_NUMERATOR). Expired entries are
+ * already dropped by the loader, so a lapsed auto memory cannot block a new write.
+ */
+export async function hasStrongCoreMemoryHit(args: {
+  agentId: string
+  query: string
+  today?: string
+}): Promise<{ hit: boolean; path?: string; label?: string }> {
+  const query = args.query.trim()
+  if (!query) return { hit: false }
+  const scored = await loadAndScoreCoreLexical({
+    agentId: args.agentId,
+    query,
+    today: args.today,
+  })
+  const top = scored.strongLexicalHits[0]
+  return top ? { hit: true, path: top.path, label: top.label } : { hit: false }
+}
+
+export async function handleCoreSearch(args: {
+  agentId: string
+  query: string
+  limit?: number
+  offset?: number
+  /** Test seam: freeze the TTL calendar day (YYYY-MM-DD). */
+  today?: string
+  /** Test seam for the authenticated master relay; omitted by the CLI. */
+  semanticOptions?: CoreMemorySemanticOptions
+}): Promise<MemoryToolResult> {
+  const denied = await memorySearchPolicyError('core')
+  if (denied) return denied
+  const query = args.query.trim()
+  if (!query) return toolError('core-search requires a non-empty query string')
+  const limit = args.limit ?? 5
+  const offset = args.offset ?? 0
+  if (!Number.isInteger(limit) || limit < 1 || limit > 20)
+    return toolError('core-search --limit must be an integer from 1 to 20')
+  if (!Number.isInteger(offset) || offset < 0)
+    return toolError('core-search --offset must be a non-negative integer')
+
+  const { documents, lexicalHits, strongLexicalHits, totalTermCharacters } =
+    await loadAndScoreCoreLexical({
+      agentId: args.agentId,
+      query,
+      today: args.today,
+    })
 
   // 词法强命中时语义不会改善结果，只作为失手时的 fallback，避免无谓的 embedding 往返。
   const semanticFiles =

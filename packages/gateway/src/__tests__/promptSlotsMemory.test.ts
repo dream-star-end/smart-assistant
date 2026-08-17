@@ -168,6 +168,37 @@ describe('memory retrieval hygiene', () => {
     assertDiskFrozen(before, snapshotDisk(agentId))
   })
 
+  it('readonly injection omits expired index rows and keeps manual rows', async () => {
+    const agentId = 'inject-ttl'
+    const { dir } = agentPaths(agentId)
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(
+      join(dir, 'live.md'),
+      '---\nname: live\ndescription: 仍有效\ntype: project\nexpires: 2026-08-18\n---\nbody\n',
+    )
+    writeFileSync(
+      join(dir, 'dead.md'),
+      '---\nname: dead\ndescription: 已过期钩子\ntype: project\nexpires: 2026-08-17\n---\nbody\n',
+    )
+    writeFileSync(
+      join(dir, 'manual.md'),
+      '---\nname: manual\ndescription: 人工永不过期\ntype: project\n---\nbody\n',
+    )
+    seedIndex(agentId, [
+      '- [live](memory/live.md) — 仍有效',
+      '- [dead](memory/dead.md) — 已过期钩子',
+      '- [manual](memory/manual.md) — 人工永不过期',
+    ])
+    const before = snapshotDisk(agentId)
+    const rendered = await new MemoryDir(agentId).renderForInjectionReadonly(6000, 200, {
+      today: '2026-08-18',
+    })
+    assert.match(rendered ?? '', /仍有效/)
+    assert.match(rendered ?? '', /人工永不过期/)
+    assert.doesNotMatch(rendered ?? '', /已过期钩子/)
+    assertDiskFrozen(before, snapshotDisk(agentId))
+  })
+
   it('readonly MemoryDir path does not create a marker file when index is missing', async () => {
     const agentId = 'readonly-missing'
     const before = snapshotDisk(agentId)

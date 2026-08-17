@@ -11,6 +11,7 @@ const {
   handleArchivalSearch,
   handleCoreSearch,
   handleSessionSearch,
+  hasStrongCoreMemoryHit,
 } = await import('../memoryTools.js')
 const { writeMemoryTurnPolicy, clearMemoryTurnPolicy } = await import('@openclaude/storage')
 
@@ -389,5 +390,61 @@ test('相对分数截断丢掉只共享常见词的长尾', async () => {
   assert.match(result.content[0].text, /^Found 1 safe Core matches/)
   assert.match(result.content[0].text, /gold\.md/)
   assert.doesNotMatch(result.content[0].text, /tail-/)
+})
+
+test('TTL: yesterday expired, today still valid, tomorrow valid, missing/invalid never expire', async () => {
+  const agentId = 'ttl-core'
+  const dir = join(home, 'agents', agentId, 'memory')
+  mkdirSync(dir, { recursive: true })
+  const fm = (file: string, extra: string, body: string) =>
+    writeFileSync(
+      join(dir, file),
+      `---\nname: ${file.replace(/\.md$/, '')}\ndescription: ${body}\ntype: project\n${extra}---\n${body}\n`,
+    )
+  fm('yesterday.md', 'expires: 2026-08-17\n', '昨天过期的鼻炎笔记')
+  fm('today.md', 'expires: 2026-08-18\n', '今天到期仍有效的鼻炎笔记')
+  fm('tomorrow.md', 'expires: 2026-08-19\n', '明天才到期的鼻炎笔记')
+  fm('manual.md', '', '没有 expires 的人工鼻炎笔记')
+  fm('invalid.md', 'expires: not-a-date\n', '非法 expires 的鼻炎笔记')
+
+  const result = await handleCoreSearch({
+    agentId,
+    query: '鼻炎笔记',
+    today: '2026-08-18',
+  })
+  const text = result.content[0].text
+  assert.match(text, /today\.md/)
+  assert.match(text, /tomorrow\.md/)
+  assert.match(text, /manual\.md/)
+  assert.match(text, /invalid\.md/)
+  assert.doesNotMatch(text, /yesterday\.md/)
+})
+
+test('dedup probe skips on strong hit and ignores expired memories', async () => {
+  const agentId = 'ttl-dedup'
+  const dir = join(home, 'agents', agentId, 'memory')
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(
+    join(dir, 'expired.md'),
+    '---\nname: expired\ndescription: 过期的鼻炎笔记\ntype: project\nexpires: 2026-08-17\n---\n过期的鼻炎笔记\n',
+  )
+  const expiredBlocks = await hasStrongCoreMemoryHit({
+    agentId,
+    query: '鼻炎笔记',
+    today: '2026-08-18',
+  })
+  assert.equal(expiredBlocks.hit, false)
+
+  writeFileSync(
+    join(dir, 'live.md'),
+    '---\nname: live\ndescription: 有效的鼻炎笔记\ntype: project\n---\n有效的鼻炎笔记\n',
+  )
+  const live = await hasStrongCoreMemoryHit({
+    agentId,
+    query: '鼻炎笔记',
+    today: '2026-08-18',
+  })
+  assert.equal(live.hit, true)
+  assert.match(live.path ?? '', /live\.md/)
 })
 
