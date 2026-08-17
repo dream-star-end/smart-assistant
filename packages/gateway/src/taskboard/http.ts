@@ -83,7 +83,7 @@ import {
   buildPatrolSessionKey,
 } from './domain.js'
 import { parseEntryCondition } from './entryCondition.js'
-import { getSharedPatrolSlots } from './guardrails.js'
+import { getSharedPatrolSlots, stageLoopCountOnProgress } from './guardrails.js'
 import { TaskboardTransitionDenied, assertTransition } from './stateMachine.js'
 
 export type { TaskboardSettings, TaskboardUsage }
@@ -205,12 +205,29 @@ function resolveActor(req: IncomingMessage, ctx: TaskboardHttpContext): Actor {
   return resolveTaskboardActor(req, ctx)
 }
 
-function actorIdOf(actor: Actor, owner?: string | null): string {
+function actorIdOf(actor: Actor, owner?: string | null, stageAgentId?: string | null): string {
   if (actor === 'human') return HUMAN_ACTOR_ID
   if (actor === 'system') return 'system'
-  if (owner?.trim()) return owner.trim()
-  const envId = process.env.OPENCLAUDE_AGENT_ID
-  return envId ? `agent:${envId}` : 'agent:unknown'
+  const explicit = owner?.trim()
+  if (explicit) {
+    return explicit.startsWith('agent:') || explicit.startsWith('user:')
+      ? explicit
+      : `agent:${explicit}`
+  }
+  const bound = stageAgentId?.trim()
+  if (bound) return bound.startsWith('agent:') ? bound : `agent:${bound}`
+  const envId = (process.env.OPENCLAUDE_AGENT_ID ?? process.env.OC_AGENT_ID ?? '').trim()
+  if (envId) return envId.startsWith('agent:') ? envId : `agent:${envId}`
+  return 'agent:unidentified'
+}
+
+/** 给测试与调用方解析时间线身份;权限仍只看 resolveTaskboardActor,不信 body.actor。 */
+export function resolveTaskboardActorId(
+  actor: Actor,
+  owner?: string | null,
+  stageAgentId?: string | null,
+): string {
+  return actorIdOf(actor, owner, stageAgentId)
 }
 
 // ── T4:手动巡检后台执行(由 patrol.ts 的引擎接手)────────────────────────────
@@ -1091,7 +1108,9 @@ function handleComment(
   const comment = createComment(db, {
     ticketId: ticket.id,
     authorKind,
-    author: asString(body.author) ?? actorIdOf(actor),
+    author:
+      asString(body.author) ??
+      actorIdOf(actor, asString(body.owner), currentStage(db, ticket)?.agentId),
     body: text,
     runId: asNullableString(body.runId) ?? null,
   })
@@ -1138,7 +1157,7 @@ function handleClaim(
   const expectedVersion = requireExpectedVersion(body)
   const stage = currentStage(db, ticket)
   if (!stage) throw new TaskboardValidationError('ticket has no stage')
-  const owner = asString(body.owner) ?? actorIdOf(actor)
+  const owner = asString(body.owner) ?? actorIdOf(actor, null, stage.agentId)
   const held = getActiveLease(db, ticket.id)
   if (held) {
     throw new TaskboardLeaseHeld(ticket.id, held.leaseOwner ?? 'unknown', held.leaseExpiresAt ?? 0)
@@ -1202,7 +1221,28 @@ function handleAdvance(
   const expectedVersion = requireExpectedVersion(body)
   const stage = currentStage(db, ticket)
   if (!stage) throw new TaskboardValidationError('ticket has no stage')
-  const to: TicketStatus = stage.onSuccess === 'wait_human' ? 'waiting_human' : 'ready'
+  const nxt = stage.onSuccess === 'advance' ? nextStage(db, stage) : null
+  let to: TicketStatus
+  let nextStageId = ticket.stageId
+  if (stage.onSuccess === 'wait_human') {
+    to = 'waiting_human'
+  } else if (stage.onSuccess === 'stay') {
+    to = 'ready'
+  } else if (!nxt) {
+    to = stage.autoClose ? 'done' : 'waiting_human'
+  } else if (nxt.kind !== 'ai') {
+    to = 'waiting_human'
+    nextStageId = nxt.id
+  } else {
+    to = 'ready'
+    nextStageId = nxt.id
+  }
+  const stageLoopCount = stageLoopCountOnProgress(
+    ticket.stageLoopCount,
+    ticket.stageId,
+    nextStageId,
+    to,
+  )
   assertTransition({
     from: ticket.status,
     to,
@@ -1210,10 +1250,7 @@ function handleAdvance(
     stageOnSuccess: stage.onSuccess,
     autoClose: stage.autoClose,
   })
-  let nextStageId = ticket.stageId
-  if (stage.onSuccess === 'advance') {
-    nextStageId = nextStage(db, stage)?.id ?? ticket.stageId
-  }
+  const actorId = actorIdOf(actor, asString(body.owner) ?? asString(body.author), stage.agentId)
   const updated = db.transaction(() => {
     const active = getActiveLease(db, ticket.id)
     const runId = asString(body.runId) ?? active?.id ?? null
@@ -1223,7 +1260,7 @@ function handleAdvance(
       createComment(db, {
         ticketId: ticket.id,
         authorKind: actor,
-        author: actorIdOf(actor),
+        author: actorId,
         body: summary,
         runId,
       })
@@ -1231,13 +1268,15 @@ function handleAdvance(
     const next = updateTicket(db, ticket.id, expectedVersion, {
       status: to,
       stageId: nextStageId,
+      stageLoopCount,
+      closedAt: to === 'done' ? Date.now() : undefined,
     })
     recordActivity(
       db,
       ticket.id,
       actor,
-      actorIdOf(actor),
-      'stage_advanced',
+      actorId,
+      nextStageId && nextStageId !== ticket.stageId ? 'stage_advanced' : 'status_changed',
       'status',
       ticket.status,
       to,
@@ -1273,7 +1312,7 @@ function handleBlock(
     db,
     ticket.id,
     actor,
-    actorIdOf(actor),
+    actorIdOf(actor, asString(body.owner), stage?.agentId),
     'status_changed',
     'status',
     ticket.status,
@@ -1510,7 +1549,7 @@ function handlePatrol(
     })
   }
 
-  const owner = actorIdOf(actor)
+  const owner = actorIdOf(actor, asString(body.owner), stage.agentId)
   const result = db.transaction(() => {
     const run = acquireLease(db, ticket.id, stage.id, owner, GUARDRAIL_DEFAULTS.leaseTtlMs, {
       agentId: stage.agentId,

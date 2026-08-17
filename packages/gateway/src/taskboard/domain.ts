@@ -234,7 +234,7 @@ export interface PipelineStage {
   /** 单次执行超时(秒)。必须 <= delegate 45 分钟硬超时。 */
   timeoutSec: number
   maxRetries: number
-  /** 连续失败达到该值 → 自动 patrolEnabled=false 并告警。 */
+  /** 连续失败达到该值 → 熔断(冷却后半开试探,不再永久关掉 patrolEnabled)。 */
   circuitBreakerThreshold: number
   onSuccess: OnSuccessAction
   onFailure: OnFailureAction
@@ -333,8 +333,15 @@ export const GUARDRAIL_DEFAULTS = {
   /** 默认静默时段(本地时区小时)。23:00–08:00 不巡检。 */
   quietHoursStart: 23,
   quietHoursEnd: 8,
-  /** 同一 stage 连续失败达到该值 → 自动停巡检 + 告警。 */
+  /** 同一 stage 连续失败达到该值 → 熔断(半开:冷却后试探一次)。 */
   circuitBreakerThreshold: 3,
+  /**
+   * 熔断冷却(毫秒)。跳闸后这段时间内不派新 run;到期允许 1 次半开试探。
+   * 成功则闭合,失败则重新计时。可用环境变量
+   * OPENCLAUDE_TASKBOARD_CIRCUIT_COOLDOWN_MS 覆盖。默认 10 分钟 ——
+   * 与空转降频同一量级,够上游 4xx/5xx 抖过去,又不让单据隔夜假死。
+   */
+  circuitCooldownMs: 10 * 60 * 1000,
   /** 同一卡在同一 stage 反复循环超过该值 → 强制 blocked。 */
   maxStageLoops: 5,
   /** 单轮 tick 最多启动的 run 数。 */

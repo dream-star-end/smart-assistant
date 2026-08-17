@@ -16,8 +16,10 @@ import {
   checkQuietHours,
   checkStageLoop,
   emitGuardrailAlert,
+  evaluateCircuit,
   nextStageLoopCount,
   settingsFromDefaults,
+  stageLoopCountOnProgress,
 } from '../guardrails.js'
 
 describe('1. 独立并发槽', () => {
@@ -90,12 +92,41 @@ describe('4. 连败熔断', () => {
       assert.equal(trip.alert.outboundId, 'taskboard-fuse:stage-a:2026-08-17')
     }
   })
+
+  it('半开:冷却期内拒绝,到期放行一次,在途试探不再派第二条', () => {
+    const now = Date.parse('2026-08-17T02:00:00.000Z')
+    const base = {
+      consecutiveFailures: 3,
+      threshold: 3,
+      stageId: 'stage-a',
+      lastFailureAt: now,
+      cooldownMs: 60_000,
+    }
+    const open = evaluateCircuit({ ...base, now: now + 30_000 })
+    assert.equal(open.ok, false)
+    if (!open.ok) assert.equal(open.state, 'open')
+
+    const half = evaluateCircuit({ ...base, now: now + 60_000, halfOpenInFlight: false })
+    assert.equal(half.ok, true)
+    assert.equal(half.state, 'half_open')
+
+    const blocked = evaluateCircuit({ ...base, now: now + 60_000, halfOpenInFlight: true })
+    assert.equal(blocked.ok, false)
+    if (!blocked.ok) assert.equal(blocked.state, 'half_open')
+
+    const closed = evaluateCircuit({ ...base, consecutiveFailures: 0, now: now + 60_000 })
+    assert.equal(closed.ok, true)
+    assert.equal(closed.state, 'closed')
+  })
 })
 
 describe('5. 单卡循环检测', () => {
   it('stageLoopCount 达上限 → loop_guard;换 stage 清零', () => {
     assert.equal(nextStageLoopCount(2, true), 3)
     assert.equal(nextStageLoopCount(9, false), 0)
+    assert.equal(stageLoopCountOnProgress(3, 's1', 's2', 'ready'), 0)
+    assert.equal(stageLoopCountOnProgress(3, 's1', 's1', 'ready'), 4)
+    assert.equal(stageLoopCountOnProgress(3, 's1', 's1', 'waiting_human'), 3)
     const ok = checkStageLoop(4, 5, 't1', 's1')
     assert.equal(ok.ok, true)
     const hit = checkStageLoop(5, 5, 't1', 's1')

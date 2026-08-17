@@ -8,6 +8,7 @@ import { describe, it } from 'node:test'
 
 import {
   buildCreateTicketBody,
+  currentAgentRef,
   currentSessionKey,
   handleTaskComment,
   handleTaskCreate,
@@ -150,6 +151,12 @@ describe('每个 task_* 工具正常路径', () => {
     assert.equal(calls[0]!.method, 'POST')
     assert.match(calls[0]!.url, /\/tickets\/OCV5-42\/comment$/)
     assert.equal(calls[0]!.body?.body, '已修')
+    assert.equal(calls[0]!.body?.author, 'agent:main')
+  })
+
+  it('currentAgentRef 缺省回落 agent:unidentified', () => {
+    assert.equal(currentAgentRef({}), 'agent:unidentified')
+    assert.equal(currentAgentRef({ OC_AGENT_ID: 'explorer' }), 'agent:explorer')
   })
 
   it('task_list 成功列出本页', async () => {

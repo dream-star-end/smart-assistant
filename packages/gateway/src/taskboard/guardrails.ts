@@ -9,7 +9,7 @@
 //     1. 独立并发槽     tryAcquireSlot / releaseSlot / getActiveSlots
 //     2. 每日预算       checkDailyBudget
 //     3. 静默时段       checkQuietHours → patrolWindow.isInQuietHours
-//     4. 连败熔断       checkCircuitBreaker
+//     4. 连败熔断       evaluateCircuit / checkCircuitBreaker（半开自愈,不永久关巡检）
 //     5. 单卡循环检测   checkStageLoop
 //     6. 空转降频       IdleBackoffState.record / snapshot(给 shouldPatrol)
 //     7. 全局急停       checkPatrolPaused
@@ -24,7 +24,7 @@
 //     就 +1;换 stage 清零。超过 maxStageLoops → 强制 blocked,actor='system'。
 
 import type { TaskboardSettings, TaskboardUsage } from './db/settings.js'
-import { GUARDRAIL_DEFAULTS, type RunSkipReason } from './domain.js'
+import { GUARDRAIL_DEFAULTS, type RunSkipReason, type TicketStatus } from './domain.js'
 import { isInQuietHours } from './patrolWindow.js'
 
 export type GuardrailAlertKind =
@@ -171,25 +171,97 @@ export function checkQuietHours(
   return { ok: true }
 }
 
-// ── 4. 连败熔断 ─────────────────────────────────────────────────────────────
+// ── 4. 连败熔断(闭路 / 开路 / 半开)─────────────────────────────────────────
 
+export type CircuitState = 'closed' | 'open' | 'half_open'
+
+export interface EvaluateCircuitInput {
+  consecutiveFailures: number
+  threshold: number
+  stageId: string
+  now?: number
+  /** 最近一次失败/超时的完成时刻。缺省视为刚刚失败。 */
+  lastFailureAt?: number | null
+  cooldownMs?: number
+  /** 已有半开试探 run 在跑时,不再派第二条。 */
+  halfOpenInFlight?: boolean
+}
+
+export type CircuitVerdict =
+  | { ok: true; state: CircuitState }
+  | { ok: false; state: CircuitState; skipReason: RunSkipReason; alert?: GuardrailAlert }
+
+export function resolveCircuitCooldownMs(over?: number): number {
+  if (typeof over === 'number' && Number.isFinite(over) && over >= 0) return over
+  const raw = process.env.OPENCLAUDE_TASKBOARD_CIRCUIT_COOLDOWN_MS
+  if (raw) {
+    const n = Number(raw)
+    if (Number.isFinite(n) && n >= 0) return n
+  }
+  return GUARDRAIL_DEFAULTS.circuitCooldownMs
+}
+
+function circuitAlert(
+  stageId: string,
+  consecutiveFailures: number,
+  threshold: number,
+  now: number,
+): GuardrailAlert {
+  return {
+    kind: 'circuit_open',
+    outboundId: `taskboard-fuse:${stageId}:${ymd(now)}`,
+    message: `阶段 ${stageId} 连续失败 ${consecutiveFailures} 次,已达到熔断阈值 ${threshold}。巡检已熔断,冷却后将自动试探恢复。`,
+    stageId,
+  }
+}
+
+/**
+ * 半开熔断:
+ *   closed    连败未达阈值,放行
+ *   open      已跳闸且仍在冷却,拒绝新 run
+ *   half_open 冷却到期:无在途试探则放行恰好 1 次;已有在途试探则继续挡住
+ * 成功一次即闭合(连败计数归零);试探失败则 lastFailureAt 刷新,重新冷却。
+ */
+export function evaluateCircuit(input: EvaluateCircuitInput): CircuitVerdict {
+  const now = input.now ?? Date.now()
+  if (input.consecutiveFailures < input.threshold) {
+    return { ok: true, state: 'closed' }
+  }
+  const cooldownMs = resolveCircuitCooldownMs(input.cooldownMs)
+  const failedAt = input.lastFailureAt ?? now
+  const elapsed = now - failedAt
+  if (elapsed < cooldownMs) {
+    return {
+      ok: false,
+      state: 'open',
+      skipReason: 'circuit_open',
+      alert: circuitAlert(input.stageId, input.consecutiveFailures, input.threshold, now),
+    }
+  }
+  if (input.halfOpenInFlight) {
+    return { ok: false, state: 'half_open', skipReason: 'circuit_open' }
+  }
+  return { ok: true, state: 'half_open' }
+}
+
+/** 阈值判定(无冷却)。保留给只关心「连败是否触顶」的调用方。 */
 export function checkCircuitBreaker(
   consecutiveFailures: number,
   threshold: number,
   stageId: string,
   now = Date.now(),
 ): { ok: true } | { ok: false; skipReason: RunSkipReason; alert: GuardrailAlert } {
-  if (consecutiveFailures < threshold) return { ok: true }
-  return {
-    ok: false,
-    skipReason: 'circuit_open',
-    alert: {
-      kind: 'circuit_open',
-      outboundId: `taskboard-fuse:${stageId}:${ymd(now)}`,
-      message: `阶段 ${stageId} 连续失败 ${consecutiveFailures} 次,已达到熔断阈值 ${threshold},巡检已自动关闭。`,
-      stageId,
-    },
-  }
+  const verdict = evaluateCircuit({
+    consecutiveFailures,
+    threshold,
+    stageId,
+    now,
+    lastFailureAt: now,
+    cooldownMs: Number.POSITIVE_INFINITY,
+    halfOpenInFlight: false,
+  })
+  if (verdict.ok) return { ok: true }
+  return { ok: false, skipReason: verdict.skipReason, alert: verdict.alert! }
 }
 
 // ── 5. 单卡循环检测 ─────────────────────────────────────────────────────────
@@ -217,6 +289,21 @@ export function checkStageLoop(
 /** running→ready 且仍留在同一 stage 时 +1;换 stage 清零。 */
 export function nextStageLoopCount(current: number, stayedOnSameStage: boolean): number {
   return stayedOnSameStage ? current + 1 : 0
+}
+
+/**
+ * 两条推进路径(HTTP advance / 巡检 applySuccess)共用:
+ * 换站清零;留在本站且回到 ready 则 +1;等确认等非 ready 保持原值。
+ */
+export function stageLoopCountOnProgress(
+  currentCount: number,
+  fromStageId: string | null,
+  toStageId: string | null,
+  toStatus: TicketStatus,
+): number {
+  if (toStageId !== fromStageId) return 0
+  if (toStatus === 'ready') return currentCount + 1
+  return currentCount
 }
 
 // ── 6. 空转降频 ─────────────────────────────────────────────────────────────

@@ -213,19 +213,54 @@ export function hasSkippedRunToday(
 }
 
 /** 该 stage 从最近一次成功往回数的连续失败/超时次数(熔断用)。 */
-export function countConsecutiveStageFailures(db: TaskboardDb, stageId: string): number {
+export function countConsecutiveStageFailures(
+  db: TaskboardDb,
+  stageId: string,
+  exceptRunId?: string,
+): number {
   const rows = db
     .prepare(
-      `SELECT status FROM tb_ticket_run
+      `SELECT id, status FROM tb_ticket_run
         WHERE stage_id = ? AND status IN ('succeeded', 'failed', 'timeout')
         ORDER BY created_at DESC
         LIMIT 32`,
     )
-    .all(stageId) as { status: string }[]
+    .all(stageId) as { id: string; status: string }[]
   let n = 0
   for (const row of rows) {
+    if (exceptRunId && row.id === exceptRunId) continue
     if (row.status === 'succeeded') break
     n += 1
   }
   return n
+}
+
+export interface StageCircuitSnapshot {
+  consecutiveFailures: number
+  lastFailureAt: number | null
+  runningCount: number
+}
+
+/** 熔断半开所需的阶段快照:连败数、最近失败时刻、在途 run 数。 */
+export function getStageCircuitSnapshot(db: TaskboardDb, stageId: string): StageCircuitSnapshot {
+  const consecutiveFailures = countConsecutiveStageFailures(db, stageId)
+  const lastFail = db
+    .prepare(
+      `SELECT COALESCE(finished_at, created_at) AS at FROM tb_ticket_run
+        WHERE stage_id = ? AND status IN ('failed', 'timeout')
+        ORDER BY COALESCE(finished_at, created_at) DESC
+        LIMIT 1`,
+    )
+    .get(stageId) as { at: number } | undefined
+  const running = db
+    .prepare(
+      `SELECT COUNT(*) AS n FROM tb_ticket_run
+        WHERE stage_id = ? AND status IN ('queued', 'running')`,
+    )
+    .get(stageId) as { n: number }
+  return {
+    consecutiveFailures,
+    lastFailureAt: lastFail?.at ?? null,
+    runningCount: running.n,
+  }
 }

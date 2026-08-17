@@ -32,7 +32,7 @@ import { getUsageSummary } from '@openclaude/storage'
 import { createActivity } from './db/activity.js'
 import { createComment, listComments } from './db/comments.js'
 import type { TaskboardDb } from './db/index.js'
-import { getStage, listStages, updateStage } from './db/pipelines.js'
+import { getStage, listStages } from './db/pipelines.js'
 import { listRelations } from './db/relations.js'
 import {
   acquireLease,
@@ -49,6 +49,7 @@ import {
   countConsecutiveStageFailures,
   countTicketStageRunsToday,
   getSettings,
+  getStageCircuitSnapshot,
   getUsage,
   hasSkippedRunToday,
   updateSettings,
@@ -73,23 +74,25 @@ import {
   type GuardrailAlertHandler,
   IdleBackoffState,
   type PatrolSlotCounter,
-  checkCircuitBreaker,
   checkDailyBudget,
   checkPatrolPaused,
   checkStageLoop,
   emitGuardrailAlert,
+  evaluateCircuit,
   getSharedPatrolSlots,
   nextStageLoopCount,
   resetSharedPatrolSlots,
+  resolveCircuitCooldownMs,
+  stageLoopCountOnProgress,
 } from './guardrails.js'
 import { type TaskboardNotifyHooks, fireNotify } from './notify.js'
 import { shouldPatrol } from './patrolWindow.js'
 import { renderPrompt } from './promptRender.js'
+import { summarizeRunOutput } from './runOutput.js'
 import { assertTransition } from './stateMachine.js'
 
 const PRIORITY_RANK: Record<TicketPriority, number> = { P0: 0, P1: 1, P2: 2, P3: 3 }
 const TERMINAL = new Set(['done', 'canceled'])
-const SUMMARY_MAX = 400
 
 export interface PatrolDelegateInput {
   agentId: string
@@ -187,6 +190,11 @@ export interface PatrolEngineOptions {
   lookupUsage?: RunUsageLookup
   /** 0 = 不安排延迟回填(测试默认)。生产 500ms 等 usage_log 落盘。 */
   usageBackfillDelayMs?: number
+  /**
+   * 熔断冷却(毫秒)。测试注入短冷却;生产默认 GUARDRAIL_DEFAULTS.circuitCooldownMs,
+   * 可被 OPENCLAUDE_TASKBOARD_CIRCUIT_COOLDOWN_MS 覆盖。
+   */
+  circuitCooldownMs?: number
 }
 
 export interface TickReport {
@@ -215,6 +223,7 @@ export class PatrolEngine {
   private readonly log: (msg: string, extra?: Record<string, unknown>) => void
   private readonly lookupUsage: RunUsageLookup
   private readonly usageBackfillDelayMs: number
+  private readonly circuitCooldownMs: number
   private ticking = false
 
   constructor(opts: PatrolEngineOptions) {
@@ -228,6 +237,7 @@ export class PatrolEngine {
     this.log = opts.log ?? (() => {})
     this.lookupUsage = opts.lookupUsage ?? lookupUsageFromSessionLog
     this.usageBackfillDelayMs = opts.usageBackfillDelayMs ?? DEFAULT_USAGE_BACKFILL_DELAY_MS
+    this.circuitCooldownMs = resolveCircuitCooldownMs(opts.circuitCooldownMs)
   }
 
   /**
@@ -333,16 +343,31 @@ export class PatrolEngine {
       this.idle.markPatrolAttempt(stage.id, at)
 
       const threshold = stage.circuitBreakerThreshold || settings.circuitBreakerThreshold
-      const fails = countConsecutiveStageFailures(db, stage.id)
-      const circuit = checkCircuitBreaker(fails, threshold, stage.id, now)
+      const snap = getStageCircuitSnapshot(db, stage.id)
+      const circuit = evaluateCircuit({
+        consecutiveFailures: snap.consecutiveFailures,
+        threshold,
+        stageId: stage.id,
+        now,
+        lastFailureAt: snap.lastFailureAt,
+        cooldownMs: this.circuitCooldownMs,
+        halfOpenInFlight: snap.runningCount > 0,
+      })
       if (!circuit.ok) {
-        this.tripCircuit(db, stage, circuit.alert)
+        if (circuit.alert) emitGuardrailAlert(this.onAlert, circuit.alert)
         skipped += this.skipReadyTickets(db, stage, 'circuit_open', now)
         continue
       }
 
       const picked = this.collectCandidates(db, stage, settings, now)
       skipped += picked.skipped
+      if (circuit.state === 'half_open' && picked.runnable.length > 1) {
+        const rest = picked.runnable.slice(1)
+        picked.runnable.length = 1
+        for (const extra of rest) {
+          skipped += this.recordSkip(db, extra, stage, 'circuit_open') ? 1 : 0
+        }
+      }
       if (picked.runnable.length === 0) {
         this.idle.recordIdle(stage.id, at)
         continue
@@ -484,7 +509,7 @@ export class PatrolEngine {
       trigger: 'patrol',
       now,
     })
-    const agentId = run.agentId ?? stage.agentId ?? 'unknown'
+    const agentId = run.agentId ?? stage.agentId ?? 'unidentified'
     const sessionKey = buildPatrolSessionKey(agentId, ticket.id, stage.id, run.id)
     const withKey = updateRun(db, run.id, { sessionKey })
     updateTicket(db, ticket.id, ticket.version, { status: 'running' })
@@ -508,7 +533,7 @@ export class PatrolEngine {
     run: TicketRun,
     settings: TaskboardSettings,
   ): Promise<void> {
-    const agentId = run.agentId ?? stage.agentId ?? 'unknown'
+    const agentId = run.agentId ?? stage.agentId ?? 'unidentified'
     const sessionKey = run.sessionKey ?? buildPatrolSessionKey(agentId, ticket.id, stage.id, run.id)
     if (!run.sessionKey) updateRun(db, run.id, { sessionKey })
 
@@ -564,17 +589,22 @@ export class PatrolEngine {
     const timedOut = result.timedOut === true
     const ok = result.ok && !timedOut && !result.error
     const output = result.output ?? ''
-    const summary = summarize(output)
     const status = timedOut ? 'timeout' : ok ? 'succeeded' : 'failed'
     const error = timedOut
       ? (result.error ?? 'delegate timed out')
       : ok
         ? null
         : (result.error ?? 'delegate failed')
+    const digested = summarizeRunOutput(output, { failed: !ok, error })
 
     const sessionKey =
       run.sessionKey ??
-      buildPatrolSessionKey(run.agentId ?? stage.agentId ?? 'unknown', ticket.id, stage.id, run.id)
+      buildPatrolSessionKey(
+        run.agentId ?? stage.agentId ?? 'unidentified',
+        ticket.id,
+        stage.id,
+        run.id,
+      )
     const usage = await this.resolveUsage(sessionKey, result)
 
     try {
@@ -584,7 +614,7 @@ export class PatrolEngine {
     }
     updateRun(db, run.id, {
       status,
-      summary,
+      summary: digested.summary,
       outputMd: output || null,
       error,
       finishedAt: now,
@@ -599,12 +629,16 @@ export class PatrolEngine {
       this.queueUsageBackfill(db, run.id, sessionKey)
     }
 
-    if (summary) {
+    if (digested.commentBody) {
       createComment(db, {
         ticketId: ticket.id,
         authorKind: 'agent',
-        author: run.agentId ? `agent:${run.agentId}` : 'agent:taskboard',
-        body: summary,
+        author: run.agentId
+          ? `agent:${run.agentId}`
+          : stage.agentId
+            ? `agent:${stage.agentId}`
+            : 'agent:taskboard',
+        body: digested.commentBody,
         runId: run.id,
       })
     }
@@ -626,13 +660,35 @@ export class PatrolEngine {
     settings: TaskboardSettings,
     run: TicketRun,
   ): void {
+    this.noteCircuitClose(db, ticket, stage, settings, run)
     const nxt = nextStageOf(db, stage)
     if (stage.onSuccess === 'wait_human') {
-      this.transition(db, ticket, 'waiting_human', 'agent', stage, { stageId: ticket.stageId }, run)
+      this.transition(
+        db,
+        ticket,
+        'waiting_human',
+        'agent',
+        stage,
+        {
+          stageId: ticket.stageId,
+          stageLoopCount: stageLoopCountOnProgress(
+            ticket.stageLoopCount,
+            ticket.stageId,
+            ticket.stageId,
+            'waiting_human',
+          ),
+        },
+        run,
+      )
       return
     }
     if (stage.onSuccess === 'stay') {
-      const loops = nextStageLoopCount(ticket.stageLoopCount, true)
+      const loops = stageLoopCountOnProgress(
+        ticket.stageLoopCount,
+        ticket.stageId,
+        ticket.stageId,
+        'ready',
+      )
       if (!this.guardLoop(db, ticket, stage, settings, loops)) return
       this.transition(db, ticket, 'ready', 'agent', stage, {
         stageId: ticket.stageId,
@@ -644,31 +700,28 @@ export class PatrolEngine {
     // advance
     if (!nxt) {
       if (stage.autoClose) {
-        this.transition(db, ticket, 'done', 'agent', stage, { closedAt: this.nowFn() })
+        this.transition(db, ticket, 'done', 'agent', stage, {
+          closedAt: this.nowFn(),
+          stageLoopCount: ticket.stageLoopCount,
+        })
         return
       }
       this.transition(db, ticket, 'waiting_human', 'agent', stage, {}, run)
       return
     }
-    if (nxt.kind !== 'ai') {
-      this.transition(
-        db,
-        ticket,
-        'waiting_human',
-        'agent',
-        stage,
-        {
-          stageId: nxt.id,
-          stageLoopCount: 0,
-        },
-        run,
-      )
-      return
-    }
-    this.transition(db, ticket, 'ready', 'agent', stage, {
-      stageId: nxt.id,
-      stageLoopCount: 0,
-    })
+    const to: TicketStatus = nxt.kind !== 'ai' ? 'waiting_human' : 'ready'
+    this.transition(
+      db,
+      ticket,
+      to,
+      'agent',
+      stage,
+      {
+        stageId: nxt.id,
+        stageLoopCount: stageLoopCountOnProgress(ticket.stageLoopCount, ticket.stageId, nxt.id, to),
+      },
+      to === 'waiting_human' ? run : undefined,
+    )
   }
 
   private applyFailure(
@@ -680,9 +733,27 @@ export class PatrolEngine {
     run: TicketRun,
   ): void {
     const threshold = stage.circuitBreakerThreshold || settings.circuitBreakerThreshold
-    const fails = countConsecutiveStageFailures(db, stage.id)
-    const circuit = checkCircuitBreaker(fails, threshold, stage.id, this.nowFn())
-    if (!circuit.ok) this.tripCircuit(db, stage, circuit.alert)
+    const snap = getStageCircuitSnapshot(db, stage.id)
+    const circuit = evaluateCircuit({
+      consecutiveFailures: snap.consecutiveFailures,
+      threshold,
+      stageId: stage.id,
+      now: this.nowFn(),
+      lastFailureAt: snap.lastFailureAt,
+      cooldownMs: this.circuitCooldownMs,
+      halfOpenInFlight: false,
+    })
+    if (!circuit.ok && circuit.alert) {
+      this.noteCircuitTrip(
+        db,
+        ticket,
+        stage,
+        circuit.alert,
+        snap.consecutiveFailures,
+        threshold,
+        run,
+      )
+    }
 
     if (stage.onFailure === 'wait_human') {
       this.transition(db, ticket, 'waiting_human', 'agent', stage, {}, run)
@@ -748,11 +819,73 @@ export class PatrolEngine {
     }
   }
 
-  private tripCircuit(db: TaskboardDb, stage: PipelineStage, alert: GuardrailAlert): void {
+  private noteCircuitTrip(
+    db: TaskboardDb,
+    ticket: Ticket,
+    stage: PipelineStage,
+    alert: GuardrailAlert,
+    fails: number,
+    threshold: number,
+    run: TicketRun,
+  ): void {
     emitGuardrailAlert(this.onAlert, alert)
-    if (stage.patrolEnabled) {
-      updateStage(db, stage.id, { patrolEnabled: false })
-    }
+    const isFirstTrip = fails === threshold
+    const isProbeFail = this.isProbeFailure(db, stage.id, run)
+    if (!isFirstTrip && !isProbeFail) return
+    const cooldownMin = Math.max(1, Math.round(this.circuitCooldownMs / 60_000))
+    recordActivity(
+      db,
+      ticket.id,
+      'system',
+      'system',
+      'circuit_opened',
+      'circuit',
+      isProbeFail ? 'half_open' : 'closed',
+      'open',
+    )
+    createComment(db, {
+      ticketId: ticket.id,
+      authorKind: 'system',
+      author: 'system',
+      body: isProbeFail
+        ? `阶段「${stage.name}」熔断试探失败,再次跳闸。将在 ${cooldownMin} 分钟后再次试探。`
+        : `阶段「${stage.name}」连续失败 ${fails} 次,已熔断。${cooldownMin} 分钟后将自动试探一次;成功则恢复巡检,失败则重新计时。`,
+      runId: run.id,
+    })
+  }
+
+  private noteCircuitClose(
+    db: TaskboardDb,
+    ticket: Ticket,
+    stage: PipelineStage,
+    settings: TaskboardSettings,
+    run: TicketRun,
+  ): void {
+    const threshold = stage.circuitBreakerThreshold || settings.circuitBreakerThreshold
+    const failsBefore = countConsecutiveStageFailures(db, stage.id, run.id)
+    if (failsBefore < threshold) return
+    recordActivity(db, ticket.id, 'system', 'system', 'circuit_closed', 'circuit', 'open', 'closed')
+    createComment(db, {
+      ticketId: ticket.id,
+      authorKind: 'system',
+      author: 'system',
+      body: `阶段「${stage.name}」熔断试探成功,巡检已恢复。`,
+      runId: run.id,
+    })
+  }
+
+  private isProbeFailure(db: TaskboardDb, stageId: string, run: TicketRun): boolean {
+    const prev = db
+      .prepare(
+        `SELECT COALESCE(finished_at, created_at) AS at FROM tb_ticket_run
+          WHERE stage_id = ? AND status IN ('failed', 'timeout') AND id != ?
+          ORDER BY COALESCE(finished_at, created_at) DESC
+          LIMIT 1`,
+      )
+      .get(stageId, run.id) as { at: number } | undefined
+    if (!prev) return false
+    const started = run.startedAt ?? this.nowFn()
+    return started - prev.at >= this.circuitCooldownMs
   }
 
   private transition(
@@ -957,17 +1090,6 @@ function latestSettledRun(db: TaskboardDb, ticketId: string, exceptId?: string):
 
 function finiteNumber(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null
-}
-
-function summarize(output: string): string {
-  const trimmed = output.trim()
-  if (!trimmed) return '（无文本产出）'
-  const firstPara = trimmed
-    .split(/\n{2,}/)[0]
-    .replace(/\s+/g, ' ')
-    .trim()
-  if (firstPara.length <= SUMMARY_MAX) return firstPara
-  return `${firstPara.slice(0, SUMMARY_MAX)}…`
 }
 
 function recordActivity(

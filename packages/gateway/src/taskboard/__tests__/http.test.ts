@@ -10,9 +10,16 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, it } from 'node:test'
 import { signJwt } from '../../auth.js'
+import { listComments } from '../db/comments.js'
 import { type TaskboardDb, openTaskboardDb } from '../db/index.js'
 import { listPipelines, listStages } from '../db/pipelines.js'
-import { type TaskboardHttpContext, handleTaskboardApi, resolveTaskboardActor } from '../http.js'
+import { updateTicket } from '../db/tickets.js'
+import {
+  type TaskboardHttpContext,
+  handleTaskboardApi,
+  resolveTaskboardActor,
+  resolveTaskboardActorId,
+} from '../http.js'
 
 const dirs: string[] = []
 
@@ -924,6 +931,116 @@ describe('isDefault 互斥经 HTTP 生效', () => {
         items.find((p) => p.id === (created.body.pipeline as PipelineJson).id)?.isDefault,
         true,
       )
+    })
+    db.close()
+  })
+})
+
+describe('advance 换站清零 stageLoopCount', () => {
+  it('agent 自己 advance 到下一站时 stageLoopCount 归零,作者带上 stage agent', async () => {
+    const db = freshDb()
+    let ident = ''
+    let version = 0
+    let nextStageId = ''
+    await withServer(humanCtx(db), async (base) => {
+      const created = await call(base, 'POST', '/api/board/projects', {
+        key: 'OCV5',
+        name: 'V5 自用',
+      })
+      const projectId = (created.body.project as { id: string }).id
+      const ticketRes = await call(base, 'POST', '/api/board/tickets', {
+        projectId,
+        type: 'feature',
+        title: '换站清零',
+      })
+      assert.equal(ticketRes.status, 201, JSON.stringify(ticketRes.body))
+      const ticket = ticketRes.body.ticket as {
+        identifier: string
+        version: number
+        id: string
+        stageId: string
+        pipelineId: string
+      }
+      ident = ticket.identifier
+      const stages = listStages(db, ticket.pipelineId)
+      nextStageId = stages.find((s) => s.ordinal === 1)?.id ?? ''
+      const bumped = updateTicket(db, ticket.id, ticket.version, { stageLoopCount: 3 })
+      version = bumped.version
+      const ready = await call(base, 'POST', `/api/board/tickets/${ident}/ready`, {
+        expectedVersion: version,
+      })
+      assert.equal(ready.status, 200, JSON.stringify(ready.body))
+      version = (ready.body.ticket as { version: number }).version
+    })
+    await withServer(agentCtx(db), async (base) => {
+      const claimed = await call(base, 'POST', `/api/board/tickets/${ident}/claim`, {
+        expectedVersion: version,
+        owner: 'agent:general-assistant',
+      })
+      assert.equal(claimed.status, 200, JSON.stringify(claimed.body))
+      version = (claimed.body.ticket as { version: number }).version
+      const adv = await call(base, 'POST', `/api/board/tickets/${ident}/advance`, {
+        expectedVersion: version,
+        summary: '澄清完成',
+        owner: 'agent:general-assistant',
+      })
+      assert.equal(adv.status, 200, JSON.stringify(adv.body))
+      const after = adv.body.ticket as {
+        stageLoopCount: number
+        stageId: string
+        status: string
+        id: string
+      }
+      assert.equal(after.stageLoopCount, 0)
+      assert.equal(after.stageId, nextStageId)
+      assert.equal(after.status, 'ready')
+      const comments = listComments(db, after.id)
+      assert.ok(
+        comments.some((c) => c.author === 'agent:general-assistant' && c.body.includes('澄清完成')),
+      )
+    })
+    db.close()
+  })
+})
+
+describe('agent 身份回落', () => {
+  it('resolveTaskboardActorId: 显式 owner / stage / unidentified,不再用 unknown', () => {
+    const prevA = process.env.OPENCLAUDE_AGENT_ID
+    const prevB = process.env.OC_AGENT_ID
+    process.env.OPENCLAUDE_AGENT_ID = ''
+    process.env.OC_AGENT_ID = ''
+    try {
+      assert.equal(resolveTaskboardActorId('human'), 'user:default')
+      assert.equal(resolveTaskboardActorId('agent', 'agent:explorer'), 'agent:explorer')
+      assert.equal(
+        resolveTaskboardActorId('agent', null, 'coding-assistant'),
+        'agent:coding-assistant',
+      )
+      assert.equal(resolveTaskboardActorId('agent'), 'agent:unidentified')
+      assert.notEqual(resolveTaskboardActorId('agent'), 'agent:unknown')
+    } finally {
+      if (prevA !== undefined) process.env.OPENCLAUDE_AGENT_ID = prevA
+      else process.env.OPENCLAUDE_AGENT_ID = ''
+      if (prevB !== undefined) process.env.OC_AGENT_ID = prevB
+      else process.env.OC_AGENT_ID = ''
+    }
+  })
+
+  it('评论不带 author 时用当前 stage 绑定的 agentId', async () => {
+    const db = freshDb()
+    let ident = ''
+    await withServer(humanCtx(db), async (base) => {
+      const seeded = await seedProject(base)
+      ident = seeded.ticket.identifier as string
+    })
+    await withServer(agentCtx(db), async (base) => {
+      const res = await call(base, 'POST', `/api/board/tickets/${ident}/comment`, {
+        body: '定位中',
+      })
+      assert.equal(res.status, 200, JSON.stringify(res.body))
+      const comment = res.body.comment as { author: string }
+      assert.match(comment.author, /^agent:/)
+      assert.notEqual(comment.author, 'agent:unknown')
     })
     db.close()
   })

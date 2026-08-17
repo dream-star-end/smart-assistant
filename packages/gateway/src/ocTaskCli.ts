@@ -234,7 +234,11 @@ function planProject(sub: string | undefined, rest: string[]): TaskCliPlan {
   }
 }
 
-function planTicket(sub: string | undefined, rest: string[]): TaskCliPlan {
+function planTicket(
+  sub: string | undefined,
+  rest: string[],
+  env: NodeJS.ProcessEnv = process.env,
+): TaskCliPlan {
   const { positional, flags } = parseFlags(rest)
   switch (sub) {
     case 'list': {
@@ -314,7 +318,7 @@ function planTicket(sub: string | undefined, rest: string[]): TaskCliPlan {
       if (!id) return usage('ticket claim <idOrIdent> --expected-version N')
       if (!ver.ok) return usage(ver.message)
       const body: Record<string, unknown> = { expectedVersion: ver.value }
-      const owner = optionalFlag(flags, 'owner')
+      const owner = optionalFlag(flags, 'owner') ?? ambientAgentOwner(env)
       if (owner) body.owner = owner
       return request('POST', `/tickets/${encodeSeg(id)}/claim`, { body })
     }
@@ -330,6 +334,8 @@ function planTicket(sub: string | undefined, rest: string[]): TaskCliPlan {
       if (outputMd) body.outputMd = outputMd
       const runId = optionalFlag(flags, 'run-id')
       if (runId) body.runId = runId
+      const owner = ambientAgentOwner(env)
+      if (owner) body.owner = owner
       return request('POST', `/tickets/${encodeSeg(id)}/advance`, { body })
     }
     case 'block': {
@@ -339,9 +345,10 @@ function planTicket(sub: string | undefined, rest: string[]): TaskCliPlan {
       if (!id || !ver.ok || !reason) {
         return usage('ticket block <idOrIdent> --expected-version N --reason TEXT')
       }
-      return request('POST', `/tickets/${encodeSeg(id)}/block`, {
-        body: { expectedVersion: ver.value, reason },
-      })
+      const body: Record<string, unknown> = { expectedVersion: ver.value, reason }
+      const owner = ambientAgentOwner(env)
+      if (owner) body.owner = owner
+      return request('POST', `/tickets/${encodeSeg(id)}/block`, { body })
     }
     case 'comment': {
       const id = positional[0]
@@ -350,6 +357,8 @@ function planTicket(sub: string | undefined, rest: string[]): TaskCliPlan {
       const body: Record<string, unknown> = { body: bodyText }
       const runId = optionalFlag(flags, 'run-id')
       if (runId) body.runId = runId
+      const author = ambientAgentOwner(env)
+      if (author) body.author = author
       return request('POST', `/tickets/${encodeSeg(id)}/comment`, { body })
     }
     default:
@@ -408,14 +417,20 @@ function planRun(sub: string | undefined, rest: string[]): TaskCliPlan {
   }
 }
 
-export function planTaskCommand(argv: string[]): TaskCliPlan {
+export function ambientAgentOwner(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const id = (env.OPENCLAUDE_AGENT_ID ?? env.OC_AGENT_ID ?? '').trim()
+  if (!id) return undefined
+  return id.startsWith('agent:') ? id : `agent:${id}`
+}
+
+export function planTaskCommand(argv: string[], env: NodeJS.ProcessEnv = process.env): TaskCliPlan {
   const [cmd, sub, ...rest] = argv
   if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') return usage()
   switch (cmd) {
     case 'project':
       return planProject(sub, rest)
     case 'ticket':
-      return planTicket(sub, rest)
+      return planTicket(sub, rest, env)
     case 'relation':
       return planRelation(sub, rest)
     case 'run':

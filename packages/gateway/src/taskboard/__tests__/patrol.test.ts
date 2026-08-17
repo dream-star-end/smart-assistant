@@ -10,7 +10,8 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, it } from 'node:test'
-import { createActivity } from '../db/activity.js'
+import { createActivity, listActivities } from '../db/activity.js'
+import { listComments } from '../db/comments.js'
 import { type TaskboardDb, openTaskboardDb } from '../db/index.js'
 import {
   createPipeline,
@@ -78,6 +79,7 @@ function engine(
     usageBackfillDelayMs?: number
     onAlert?: GuardrailAlertHandler
     log?: (msg: string, extra?: Record<string, unknown>) => void
+    circuitCooldownMs?: number
   } = {},
 ): PatrolEngine {
   return new PatrolEngine({
@@ -86,11 +88,11 @@ function engine(
     now: over.now ?? (() => WORK.getTime()),
     slots: over.slots ?? new PatrolSlotCounter(2),
     idle: over.idle ?? new IdleBackoffState(),
-    // 测试禁止打真实 sessions.db;延迟回填默认关掉,避免 setTimeout 挂住进程。
     lookupUsage: over.lookupUsage ?? (async () => null),
     usageBackfillDelayMs: over.usageBackfillDelayMs ?? 0,
     onAlert: over.onAlert,
     log: over.log,
+    circuitCooldownMs: over.circuitCooldownMs,
   })
 }
 
@@ -152,6 +154,7 @@ describe('端到端:需求单无人干预走到 waiting_human', () => {
     assert.equal(afterFirst.status, 'ready')
     const design = stages.find((s) => s.name === '方案设计')
     assert.equal(afterFirst.stageId, design?.id)
+    assert.equal(afterFirst.stageLoopCount, 0)
 
     const second = await eng.tick(WORK)
     assert.equal(second.started, 1, JSON.stringify(second))
@@ -199,31 +202,75 @@ describe('lease 互斥', () => {
 })
 
 describe('失败重试与熔断', () => {
-  it('连续失败达阈值后关掉 stage.patrolEnabled', async () => {
+  it('连续失败达阈值后熔断但保持 patrolEnabled,冷却后半开试探成功则恢复', async () => {
     const db = freshDb()
     const { ticket, stage } = seedReadyAi(db, { circuitBreakerThreshold: 3, onFailure: 'retry' })
     const alerts: string[] = []
-    const eng = new PatrolEngine({
-      getDb: () => db,
-      delegate: failDelegate('定位失败'),
-      now: () => WORK.getTime(),
-      slots: new PatrolSlotCounter(2),
-      idle: new IdleBackoffState(),
-      onAlert: (a) => alerts.push(a.kind),
-      lookupUsage: async () => null,
-      usageBackfillDelayMs: 0,
-    })
-    await eng.tick(WORK)
-    await eng.tick(WORK)
-    const mid = listStages(db, stage.pipelineId).find((s) => s.id === stage.id)
-    assert.equal(mid?.patrolEnabled, true)
-    await eng.tick(WORK)
-    const after = listStages(db, stage.pipelineId).find((s) => s.id === stage.id)
-    assert.equal(after?.patrolEnabled, false)
+    let now = WORK.getTime()
+    let shouldFail = true
+    const eng = engine(
+      db,
+      async () => {
+        if (shouldFail) return { ok: false, output: '', error: '定位失败' }
+        return { ok: true, output: '## 结论\n上游已恢复,本站完成。' }
+      },
+      {
+        now: () => now,
+        circuitCooldownMs: 60_000,
+        onAlert: (a) => alerts.push(a.kind),
+      },
+    )
+    await eng.tick(new Date(now))
+    await eng.tick(new Date(now))
+    await eng.tick(new Date(now))
+    const afterTrip = listStages(db, stage.pipelineId).find((s) => s.id === stage.id)
+    assert.equal(afterTrip?.patrolEnabled, true, '熔断不得永久关掉巡检')
     assert.ok(alerts.includes('circuit_open'))
-    const t = getTicket(db, ticket.id)
-    assert.ok(t)
-    assert.ok(t.status === 'ready' || t.status === 'blocked')
+    const acts = listActivities(db, ticket.id)
+    assert.ok(
+      acts.some((a) => a.action === 'circuit_opened'),
+      '跳闸必须在时间线留痕',
+    )
+    const sysComments = listComments(db, ticket.id).filter((c) => c.authorKind === 'system')
+    assert.ok(sysComments.some((c) => c.body.includes('已熔断')))
+
+    now += 30_000
+    const during = await eng.tick(new Date(now))
+    assert.equal(during.started, 0, '冷却期内不得派新 run')
+
+    shouldFail = false
+    now += 30_000
+    const probe = await eng.tick(new Date(now))
+    assert.equal(probe.started, 1, '冷却到期应半开试探一次')
+    const recovered = getTicket(db, ticket.id)
+    assert.ok(recovered)
+    assert.equal(recovered.status, 'waiting_human')
+    assert.ok(listActivities(db, ticket.id).some((a) => a.action === 'circuit_closed'))
+    db.close()
+  })
+
+  it('半开试探失败则重新冷却,不会连打', async () => {
+    const db = freshDb()
+    const { ticket, stage } = seedReadyAi(db, { circuitBreakerThreshold: 3, onFailure: 'retry' })
+    let now = WORK.getTime()
+    const eng = engine(db, failDelegate('仍然挂'), {
+      now: () => now,
+      circuitCooldownMs: 60_000,
+    })
+    await eng.tick(new Date(now))
+    await eng.tick(new Date(now))
+    await eng.tick(new Date(now))
+    now += 60_000
+    const probe = await eng.tick(new Date(now))
+    assert.equal(probe.started, 1)
+    now += 10_000
+    const stillOpen = await eng.tick(new Date(now))
+    assert.equal(stillOpen.started, 0)
+    assert.equal(
+      listStages(db, stage.pipelineId).find((s) => s.id === stage.id)?.patrolEnabled,
+      true,
+    )
+    assert.ok(getTicket(db, ticket.id))
     db.close()
   })
 })
@@ -451,6 +498,46 @@ describe('每日预算护栏读回填成本', () => {
     assert.ok(alerts.includes('budget_exhausted'))
     assert.equal(getSettings(db).patrolPaused, true)
     assert.equal(getTicket(db, ticket.id)?.status, 'ready')
+    db.close()
+  })
+})
+
+describe('评论落结论而非过程', () => {
+  it('有 ## 结论 时评论只含结论;原文仍在 outputMd', async () => {
+    const db = freshDb()
+    const { ticket } = seedReadyAi(db)
+    const process = '收到，这是需求澄清阶段。我先读任务面板操作规则…'
+    const conclusion = '目标用户:自用维护者。产物: generated/clarification.md'
+    const eng = engine(db, async () => ({
+      ok: true,
+      output: `${process}\n\n## 结论\n${conclusion}\n`,
+    }))
+    await eng.tick(WORK)
+    const run = listRuns(db, { ticketId: ticket.id }).items.find((r) => r.status === 'succeeded')
+    assert.ok(run)
+    assert.match(run.outputMd ?? '', /我先读任务面板/)
+    assert.match(run.summary ?? '', /目标用户/)
+    assert.doesNotMatch(run.summary ?? '', /我先读任务面板/)
+    const comments = listComments(db, ticket.id)
+    const agentComments = comments.filter((c) => c.authorKind === 'agent')
+    assert.ok(agentComments.some((c) => c.body.includes('generated/clarification.md')))
+    assert.ok(agentComments.every((c) => !c.body.includes('我先读任务面板')))
+    assert.ok(agentComments.some((c) => c.author === 'agent:coding-assistant'))
+    db.close()
+  })
+
+  it('失败时同一句 API Error 归并进评论,outputMd 保留原文', async () => {
+    const db = freshDb()
+    const { ticket } = seedReadyAi(db, { onFailure: 'wait_human' })
+    const unit = 'API Error: 502 {"type":"error","error":{"type":"UPSTREAM_ERROR"}}'
+    const eng = engine(db, async () => ({ ok: false, output: unit.repeat(30), error: 'upstream' }))
+    await eng.tick(WORK)
+    const run = listRuns(db, { ticketId: ticket.id }).items.find((r) => r.status === 'failed')
+    assert.ok(run)
+    assert.ok((run.outputMd ?? '').length >= unit.length * 30, '原文不得丢')
+    const comments = listComments(db, ticket.id).filter((c) => c.authorKind === 'agent')
+    assert.ok(comments.some((c) => /同一错误重复/.test(c.body) && /UPSTREAM_ERROR/.test(c.body)))
+    assert.ok((run.summary ?? '').length <= 400)
     db.close()
   })
 })

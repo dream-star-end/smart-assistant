@@ -161,15 +161,10 @@ describe('planTaskCommand', () => {
 
   test('ticket update / claim / advance / block / comment require expectedVersion where needed', () => {
     assert.equal(planTaskCommand(['ticket', 'update', 'OCV5-1']).kind, 'usage')
-    const upd = planTaskCommand([
-      'ticket',
-      'update',
-      'OCV5-1',
-      '--expected-version',
-      '3',
-      '--title',
-      'new',
-    ])
+    const upd = planTaskCommand(
+      ['ticket', 'update', 'OCV5-1', '--expected-version', '3', '--title', 'new'],
+      {},
+    )
     assert.deepEqual(upd, {
       kind: 'request',
       method: 'PATCH',
@@ -177,15 +172,10 @@ describe('planTaskCommand', () => {
       body: { expectedVersion: 3, title: 'new' },
     })
 
-    const claim = planTaskCommand([
-      'ticket',
-      'claim',
-      'OCV5-1',
-      '--expected-version',
-      '3',
-      '--owner',
-      'agent:main',
-    ])
+    const claim = planTaskCommand(
+      ['ticket', 'claim', 'OCV5-1', '--expected-version', '3', '--owner', 'agent:main'],
+      {},
+    )
     assert.deepEqual(claim, {
       kind: 'request',
       method: 'POST',
@@ -193,48 +183,59 @@ describe('planTaskCommand', () => {
       body: { expectedVersion: 3, owner: 'agent:main' },
     })
 
-    const adv = planTaskCommand([
-      'ticket',
-      'advance',
-      'OCV5-1',
-      '--expected-version',
-      '4',
-      '--summary',
-      'fixed',
-    ])
+    const adv = planTaskCommand(
+      ['ticket', 'advance', 'OCV5-1', '--expected-version', '4', '--summary', 'fixed'],
+      {},
+    )
     assert.equal(adv.kind, 'request')
     if (adv.kind === 'request') {
       assert.equal(adv.path, '/tickets/OCV5-1/advance')
       assert.deepEqual(adv.body, { expectedVersion: 4, summary: 'fixed' })
     }
 
-    const block = planTaskCommand([
-      'ticket',
-      'block',
-      'OCV5-1',
-      '--expected-version',
-      '4',
-      '--reason',
-      'blocked by OCV5-7',
-    ])
+    const block = planTaskCommand(
+      ['ticket', 'block', 'OCV5-1', '--expected-version', '4', '--reason', 'blocked by OCV5-7'],
+      {},
+    )
     assert.equal(block.kind, 'request')
     if (block.kind === 'request') {
       assert.equal(block.path, '/tickets/OCV5-1/block')
     }
 
-    const comment = planTaskCommand([
-      'ticket',
-      'comment',
-      'OCV5-1',
-      '--body',
-      'done, please review',
-    ])
+    const comment = planTaskCommand(
+      ['ticket', 'comment', 'OCV5-1', '--body', 'done, please review'],
+      {},
+    )
     assert.deepEqual(comment, {
       kind: 'request',
       method: 'POST',
       path: '/tickets/OCV5-1/comment',
       body: { body: 'done, please review' },
     })
+  })
+
+  test('ambient OPENCLAUDE_AGENT_ID 自动写入 claim/advance/comment 身份', () => {
+    const env = { OPENCLAUDE_AGENT_ID: 'coding-assistant' }
+    const claim = planTaskCommand(['ticket', 'claim', 'OCV5-1', '--expected-version', '3'], env)
+    assert.equal(claim.kind, 'request')
+    if (claim.kind === 'request') {
+      assert.equal((claim.body as Record<string, unknown>).owner, 'agent:coding-assistant')
+    }
+
+    const adv = planTaskCommand(
+      ['ticket', 'advance', 'OCV5-1', '--expected-version', '4', '--summary', 'ok'],
+      env,
+    )
+    assert.equal(adv.kind, 'request')
+    if (adv.kind === 'request') {
+      assert.equal((adv.body as Record<string, unknown>).owner, 'agent:coding-assistant')
+    }
+
+    const comment = planTaskCommand(['ticket', 'comment', 'OCV5-1', '--body', 'done'], env)
+    assert.equal(comment.kind, 'request')
+    if (comment.kind === 'request') {
+      assert.equal((comment.body as Record<string, unknown>).author, 'agent:coding-assistant')
+    }
   })
 
   test('relation add/remove and run list/get', () => {

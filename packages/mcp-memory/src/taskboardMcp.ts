@@ -53,8 +53,9 @@ export function currentSessionKey(env: NodeJS.ProcessEnv = process.env): string 
 }
 
 export function currentAgentRef(env: NodeJS.ProcessEnv = process.env): string {
-  const id = (env.OPENCLAUDE_AGENT_ID ?? '').trim()
-  return id ? `agent:${id}` : 'agent:unknown'
+  const id = (env.OPENCLAUDE_AGENT_ID ?? env.OC_AGENT_ID ?? '').trim()
+  if (id) return id.startsWith('agent:') ? id : `agent:${id}`
+  return 'agent:unidentified'
 }
 
 export interface TaskCreateArgs {
@@ -223,6 +224,7 @@ export async function handleTaskComment(
       body: JSON.stringify({
         body: args.body,
         runId: args.runId ?? null,
+        author: currentAgentRef(env),
       }),
     })
     const data = await readJson(res)

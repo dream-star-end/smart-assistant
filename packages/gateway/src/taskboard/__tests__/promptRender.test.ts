@@ -42,6 +42,7 @@ describe('renderPrompt 占位符', () => {
     assert.match(prompt, /复现结论明确/)
     assert.match(prompt, /本阶段 exit checklist/)
     assert.match(prompt, /产出格式要求/)
+    assert.match(prompt, /## 结论/)
   })
 
   it('未知占位符原样保留,不报错、不留空', () => {
