@@ -217,7 +217,14 @@ export const MessageRenderer = memo(
           </TapeBackedCard>
         );
       case "permission":
-        return <PermissionCard msg={message} onRespond={onRespondPermission} readOnly={readOnly} />;
+        return (
+          <PermissionCard
+            msg={message}
+            onRespond={onRespondPermission}
+            readOnly={readOnly}
+            livePrompt={!readOnly && inActiveTurn && sending}
+          />
+        );
       case "agent-group":
         return <AgentGroupCard msg={message} delegateCost={delegateCost} />;
       case "delegate-progress":

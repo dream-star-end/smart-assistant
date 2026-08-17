@@ -118,6 +118,12 @@ describe("messageSignature 流式防闪签名", () => {
     expect(messageSignature(a, CTX)).not.toBe(messageSignature(b, CTX));
   });
 
+  test("permission _askUserExpiresAt 变化 → 签名变化", () => {
+    const a = mk("permission", { requestId: "r1", _resolved: false });
+    const b = mk("permission", { requestId: "r1", _resolved: false, _askUserExpiresAt: 1 });
+    expect(messageSignature(a, CTX)).not.toBe(messageSignature(b, CTX));
+  });
+
   test("agent-group 子块内容变化经 childSignature 传导到父签名", () => {
     const base = (out: string): ChatMessage =>
       mk("agent-group", {

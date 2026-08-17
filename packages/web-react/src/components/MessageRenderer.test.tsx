@@ -5,7 +5,7 @@ import type { ChatMessage } from "../lib/chat/model";
 import { applyServerIncremental } from "../lib/persist";
 import { messageSignature } from "../lib/chat/render";
 import { MessageList, MessageRenderer } from "./MessageRenderer";
-import type { PermissionRespond } from "./chat/PermissionCard";
+import { resetPermissionAutoOpenMemory, type PermissionRespond } from "./chat/PermissionCard";
 import { ResponseRatingProvider } from "./chat/ResponseRating";
 import type { CardCallbacks } from "./chat/cards";
 import {
@@ -14,7 +14,10 @@ import {
 } from "./tool/__fixtures__/sessionToolTexts";
 import { ChatInteractionContext, ToolCardActionsContext } from "./tool/context";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  resetPermissionAutoOpenMemory();
+});
 
 beforeAll(async () => {
   // MarkdownImpl 是 React.lazy 的重 chunk。全量并行时首次 transform/import 偶尔会耗尽
@@ -527,6 +530,7 @@ describe("permission 审批", () => {
     const onRespond = vi.fn();
     renderMsg(mk("permission", { toolName: "Bash", requestId: "r1", _resolved: false, inputPreview: "ls -la", ts: Date.now() }), {
       onRespond,
+      sending: true,
     });
     // 自动弹出的 modal（Radix portal）含「允许」。
     fireEvent.click(screen.getByRole("button", { name: "允许" }));
@@ -541,6 +545,7 @@ describe("permission 审批", () => {
         requestId: "r-readonly",
         _resolved: false,
         inputPreview: "rm -rf /tmp/example",
+        ts: Date.now(),
       }),
       { onRespond, readOnly: true },
     );
@@ -564,7 +569,7 @@ describe("permission 审批", () => {
           questions: [{ question: "选择颜色？", options: [{ label: "红" }, { label: "蓝" }] }],
         },
       }),
-      { onRespond },
+      { onRespond, sending: true },
     );
     // 自动弹出答题框（modal portal）。
     expect(screen.getByText("选择颜色？")).toBeInTheDocument();
@@ -575,6 +580,28 @@ describe("permission 审批", () => {
     expect(arg.requestId).toBe("r2");
     expect(arg.behavior).toBe("allow");
     expect(arg.updatedInput.answers).toEqual({ "选择颜色？": "红" });
+  });
+
+  test("非 in-flight 历史权限行不自动弹，卡片仍在且可手动打开", () => {
+    const onRespond = vi.fn();
+    renderMsg(
+      mk("permission", {
+        toolName: "AskUserQuestion",
+        ts: Date.now(),
+        requestId: "r-history",
+        _resolved: false,
+        inputJson: {
+          questions: [{ question: "选择颜色？", options: [{ label: "红" }, { label: "蓝" }] }],
+        },
+      }),
+      { onRespond, sending: false, inActiveTurn: true },
+    );
+    expect(screen.getByTestId("permission-card")).toBeInTheDocument();
+    expect(screen.getByText("等待回答…")).toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "回答" }));
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    expect(onRespond).not.toHaveBeenCalled();
   });
 
   test("AskUserQuestion 已提交 → 展示问答摘要", () => {
