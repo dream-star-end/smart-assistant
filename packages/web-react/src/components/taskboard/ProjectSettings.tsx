@@ -2,6 +2,7 @@ import { FolderPlus, Pencil } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { AuthEpochStaleError } from '../../lib/api'
 import {
+  BUILTIN_TEMPLATE_OPTIONS,
   PROJECT_KEY_RE,
   type Project,
   type ProjectCreateInput,
@@ -37,6 +38,9 @@ export function ProjectSettings({
   const [description, setDescription] = useState('')
   const [saving, setSaving] = useState(false)
   const [archived, setArchived] = useState<Project[]>([])
+  const [templateIds, setTemplateIds] = useState<string[]>(() =>
+    BUILTIN_TEMPLATE_OPTIONS.map((t) => t.id),
+  )
 
   const open = mode !== null
 
@@ -50,6 +54,7 @@ export function ProjectSettings({
       setKey('')
       setName('')
       setDescription('')
+      setTemplateIds(BUILTIN_TEMPLATE_OPTIONS.map((t) => t.id))
     }
   }, [mode, current])
 
@@ -85,10 +90,13 @@ export function ProjectSettings({
     }
     setSaving(true)
     try {
+      const allBuiltin = BUILTIN_TEMPLATE_OPTIONS.every((t) => templateIds.includes(t.id))
+      const none = templateIds.length === 0
       const created = await onCreate({
         key: normalized,
         name: title,
         description: description.trim() || null,
+        templateIds: allBuiltin ? undefined : none ? [] : templateIds,
       })
       if (created) close()
     } finally {
@@ -175,7 +183,7 @@ export function ProjectSettings({
             <p className="mt-1 text-caption text-muted">
               {mode === 'edit'
                 ? '前缀创建后不可改。归档项目默认不出现在下拉里。'
-                : '创建后会自动切到该项目，并带上问题单 / 需求单 / 调研 / 杂务四条默认流水线。'}
+                : '创建后会自动切到该项目。可选择要种的流水线模板；默认四条内置线全选，全部取消则不种。'}
             </p>
           </div>
           <Field
@@ -216,6 +224,37 @@ export function ProjectSettings({
               onChange={(e) => setDescription(e.target.value)}
             />
           </Field>
+          {mode === 'create' && (
+            <Field
+              label="流水线模板"
+              hint="默认全选四条内置线。内置模板不能删除，可在「流水线模板」里对已有项目再套用。"
+            >
+              <div className="flex flex-col gap-1.5" data-testid="project-templates">
+                {BUILTIN_TEMPLATE_OPTIONS.map((t) => {
+                  const checked = templateIds.includes(t.id)
+                  return (
+                    <label
+                      key={t.id}
+                      className="flex items-center gap-2 rounded-lg bg-hover px-3 py-2 text-body text-fg"
+                    >
+                      <input
+                        type="checkbox"
+                        data-testid={`project-template-${t.id}`}
+                        checked={checked}
+                        onChange={() => {
+                          setTemplateIds((cur) =>
+                            checked ? cur.filter((id) => id !== t.id) : [...cur, t.id],
+                          )
+                        }}
+                      />
+                      <span className="min-w-0 flex-1 truncate">{t.name}</span>
+                      <span className="text-caption text-faint">内置</span>
+                    </label>
+                  )
+                })}
+              </div>
+            </Field>
+          )}
           <div className="flex flex-wrap gap-1">
             {mode === 'create' ? (
               <Button

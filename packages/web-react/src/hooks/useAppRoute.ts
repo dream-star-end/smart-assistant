@@ -24,7 +24,7 @@ import type { Session } from '../lib/types'
  *   （parsePanelParam）；教程另带稳定 `case` 或兼容旧版的 `topic`。打开/关闭经本 hook replaceState 同步回 query
  *   （面板不压栈，且保留其他无关 query）。
  * - 工作区视图 `chat | board`：board 时路径为 `/board`（与会话路径并列，不是 ?panel=）。
- *   对话 ↔ 任务面板用 pushState（后退回到上一位置）。`?view=board|list|inbox` 与
+ *   对话 ↔ 任务面板用 pushState（后退回到上一位置）。`?view=board|list|inbox|cost|weekly` 与
  *   `?ticket=<identifier>` 走 replaceState，复用「保留无关 query」语义；离开 /board 时清掉。
  * - demo / reset-password 特判不启用（enabled=false，URL 原样保留）。
  */
@@ -39,8 +39,8 @@ export function parseSessionPath(pathname: string): string | null {
 /** 工作区视图：对话主区 vs 任务面板全屏主区。 */
 export type WorkspaceView = 'chat' | 'board'
 
-/** `/board` 三视图。缺省 / 未知值回落看板（`board`），防深链打开不存在的视图。 */
-export type BoardViewParam = 'board' | 'list' | 'inbox'
+/** `/board` 视图。缺省 / 未知值回落看板（`board`），防深链打开不存在的视图。 */
+export type BoardViewParam = 'board' | 'list' | 'inbox' | 'cost' | 'weekly'
 
 /** `/board` → true。只认精确路径，不吃 `/board/` 或子路径。 */
 export function parseBoardPath(pathname: string): boolean {
@@ -60,10 +60,12 @@ export function workspaceWantPath(
   return activeId && !isEmptyDraft ? `/s/${activeId}` : '/'
 }
 
-/** `?view=` → 任务面板三视图（未知值回落看板）。 */
+const BOARD_VIEWS: ReadonlySet<string> = new Set(['board', 'list', 'inbox', 'cost', 'weekly'])
+
+/** `?view=` → 任务面板视图（未知值回落看板）。 */
 export function parseBoardView(sp: URLSearchParams): BoardViewParam {
   const v = sp.get('view')
-  return v === 'list' || v === 'inbox' || v === 'board' ? v : 'board'
+  return v && BOARD_VIEWS.has(v) ? (v as BoardViewParam) : 'board'
 }
 
 /** `?ticket=` → identifier（空/空白当没有）。 */

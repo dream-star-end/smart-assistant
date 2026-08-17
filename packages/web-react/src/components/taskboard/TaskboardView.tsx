@@ -18,10 +18,13 @@ import {
 } from '../ui'
 import { BoardColumns } from './BoardColumns'
 import { BoardSettingsPanel } from './BoardSettingsPanel'
+import { CostStatsView } from './CostStatsView'
 import { ProjectSettings } from './ProjectSettings'
 import { StageSettings } from './StageSettings'
+import { TemplateLibrary } from './TemplateLibrary'
 import { TicketDrawer } from './TicketDrawer'
 import { TicketListView } from './TicketListView'
+import { WeeklyReportView } from './WeeklyReportView'
 import { useTaskboard } from './useTaskboard'
 
 export function TaskboardView({
@@ -247,6 +250,11 @@ export function TaskboardView({
             projectId={board.projectId}
             onChanged={() => void board.reconcile()}
           />
+          <TemplateLibrary
+            auth={auth}
+            projectId={board.projectId}
+            onChanged={() => void board.reconcile()}
+          />
           <BoardSettingsPanel auth={auth} />
           <Button
             type="button"
@@ -275,6 +283,8 @@ export function TaskboardView({
               value: 'inbox',
               label: `待我确认${board.inboxTickets.length ? ` ${board.inboxTickets.length}` : ''}`,
             },
+            { value: 'cost', label: '成本' },
+            { value: 'weekly', label: '周报' },
           ]}
         />
       </div>
@@ -326,6 +336,18 @@ export function TaskboardView({
           icon={Kanban}
           title="还没有项目"
           hint="新建一个项目后即可开始建单。创建时会自动带上四条默认流水线。"
+        />
+      ) : view === 'cost' ? (
+        <CostStatsView
+          auth={auth}
+          projectId={board.projectId}
+          projects={(board.projects ?? []).filter((p) => !p.archivedAt)}
+        />
+      ) : view === 'weekly' ? (
+        <WeeklyReportView
+          auth={auth}
+          projectId={board.projectId}
+          projects={(board.projects ?? []).filter((p) => !p.archivedAt)}
         />
       ) : view === 'board' ? (
         <BoardColumns

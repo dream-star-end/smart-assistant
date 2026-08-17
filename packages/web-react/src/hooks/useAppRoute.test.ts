@@ -118,6 +118,8 @@ describe('任务面板 /board 深链', () => {
     expect(clean.has('view')).toBe(false)
     expect(clean.get('panel')).toBe('help')
     expect(parseBoardView(new URLSearchParams('view=inbox'))).toBe('inbox')
+    expect(parseBoardView(new URLSearchParams('view=cost'))).toBe('cost')
+    expect(parseBoardView(new URLSearchParams('view=weekly'))).toBe('weekly')
     expect(parseBoardView(new URLSearchParams('view=kanban'))).toBe('board')
     expect(parseBoardTicket(new URLSearchParams('ticket=OCV5-42'))).toBe('OCV5-42')
     expect(parseBoardTicket(new URLSearchParams('ticket='))).toBeNull()

@@ -1,4 +1,4 @@
-import { ChevronDown, ChevronUp, Plus, Workflow } from 'lucide-react'
+import { ChevronDown, ChevronUp, GripVertical, Plus, Workflow } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { AuthEpochStaleError } from '../../lib/api'
 import { buildSchedule, cronHuman } from '../../lib/cron'
@@ -39,6 +39,7 @@ import {
   Sheet,
   Switch,
   Textarea,
+  usePrompt,
   useToast,
 } from '../ui'
 
@@ -491,6 +492,7 @@ export function StageSettings({
   onChanged?: () => void
 }) {
   const toast = useToast()
+  const [promptText, promptEl] = usePrompt()
   const [open, setOpen] = useState(false)
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
@@ -505,6 +507,8 @@ export function StageSettings({
   const [newStageKind, setNewStageKind] = useState<StageKind>('human')
   const [rename, setRename] = useState<Record<string, string>>({})
   const [dataGen, setDataGen] = useState(0)
+  const [draggingId, setDraggingId] = useState<string | null>(null)
+  const [dropTargetId, setDropTargetId] = useState<string | null>(null)
   const epoch = useRef(0)
   const mounted = useRef(true)
 
@@ -595,6 +599,20 @@ export function StageSettings({
     }
   }
 
+  const persistStageOrder = async (ordered: PipelineStage[]) => {
+    if (ordered.length === 0) return
+    const tempBase = Math.max(1000, ...ordered.map((s) => s.ordinal)) + 1
+    await runWrite(async () => {
+      for (let i = 0; i < ordered.length; i++) {
+        await taskboardApi.patchStage(auth, ordered[i].id, { ordinal: tempBase + i })
+      }
+      for (let i = 0; i < ordered.length; i++) {
+        await taskboardApi.patchStage(auth, ordered[i].id, { ordinal: i })
+      }
+      toast('已调整阶段顺序', 'success')
+    })
+  }
+
   const moveStage = async (pipelineId: string, stageId: string, dir: -1 | 1) => {
     const bundle = bundles.find((b) => b.pipeline.id === pipelineId)
     if (!bundle) return
@@ -602,14 +620,42 @@ export function StageSettings({
     const i = ordered.findIndex((s) => s.id === stageId)
     const j = i + dir
     if (i < 0 || j < 0 || j >= ordered.length) return
-    const a = ordered[i]
-    const b = ordered[j]
-    const temp = Math.max(...ordered.map((s) => s.ordinal), 0) + 1
+    const next = ordered.slice()
+    const [moved] = next.splice(i, 1)
+    next.splice(j, 0, moved)
+    await persistStageOrder(next)
+  }
+
+  const dropStage = async (pipelineId: string, targetId: string) => {
+    const fromId = draggingId
+    setDropTargetId(null)
+    setDraggingId(null)
+    if (!fromId || fromId === targetId) return
+    const bundle = bundles.find((b) => b.pipeline.id === pipelineId)
+    if (!bundle) return
+    const ordered = [...bundle.stages].sort((a, b) => a.ordinal - b.ordinal)
+    const from = ordered.findIndex((s) => s.id === fromId)
+    const to = ordered.findIndex((s) => s.id === targetId)
+    if (from < 0 || to < 0) return
+    const next = ordered.slice()
+    const [moved] = next.splice(from, 1)
+    next.splice(to, 0, moved)
+    await persistStageOrder(next)
+  }
+
+  const saveAsTemplate = async (pipelineId: string, fallbackName: string) => {
+    const name = await promptText({
+      title: '存为自定义模板',
+      confirmText: '保存',
+      initial: fallbackName,
+      placeholder: '模板名称',
+      maxLength: 80,
+    })
+    if (!name?.trim()) return
+    const trimmed = name.trim()
     await runWrite(async () => {
-      await taskboardApi.patchStage(auth, a.id, { ordinal: temp })
-      await taskboardApi.patchStage(auth, b.id, { ordinal: a.ordinal })
-      await taskboardApi.patchStage(auth, a.id, { ordinal: b.ordinal })
-      toast('已调整阶段顺序', 'success')
+      await taskboardApi.createTemplate(auth, { pipelineId, name: trimmed })
+      toast(`已保存模板「${trimmed}」`, 'success')
     })
   }
 
@@ -727,6 +773,16 @@ export function StageSettings({
             type="button"
             size="sm"
             variant="ghost"
+            data-testid={`pipeline-save-template-${p.id}`}
+            disabled={stages.length === 0 || saving}
+            onClick={() => void saveAsTemplate(p.id, p.name)}
+          >
+            存为模板
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
             data-testid={`pipeline-toggle-${p.id}`}
             aria-expanded={openPipe}
             onClick={() => setExpanded((cur) => (cur === p.id ? null : p.id))}
@@ -741,13 +797,41 @@ export function StageSettings({
             ) : (
               stages.map((stage, idx) => {
                 const editing = editingStageId === stage.id
+                const dragging = draggingId === stage.id
+                const dropTarget = dropTargetId === stage.id && draggingId !== stage.id
                 return (
                   <div
                     key={stage.id}
-                    className="rounded-lg bg-hover px-3 py-2"
+                    className={`rounded-lg bg-hover px-3 py-2 ${dragging ? 'opacity-50' : ''} ${
+                      dropTarget ? 'ring-2 ring-accent' : ''
+                    }`}
                     data-testid={`stage-row-${stage.id}`}
+                    data-dragging={dragging ? 'true' : undefined}
+                    data-drop-target={dropTarget ? 'true' : undefined}
+                    draggable
+                    onDragStart={(e) => {
+                      e.dataTransfer.effectAllowed = 'move'
+                      e.dataTransfer.setData('text/plain', stage.id)
+                      setDraggingId(stage.id)
+                    }}
+                    onDragEnd={() => {
+                      setDraggingId(null)
+                      setDropTargetId(null)
+                    }}
+                    onDragOver={(e) => {
+                      e.preventDefault()
+                      e.dataTransfer.dropEffect = 'move'
+                      if (dropTargetId !== stage.id) setDropTargetId(stage.id)
+                    }}
+                    onDrop={(e) => {
+                      e.preventDefault()
+                      void dropStage(p.id, stage.id)
+                    }}
                   >
                     <div className="flex flex-wrap items-center gap-1">
+                      <span className="inline-flex text-faint" aria-hidden title="拖拽调整顺序">
+                        <GripVertical size={14} />
+                      </span>
                       <span className="w-6 text-caption text-faint">{idx + 1}</span>
                       <span className="min-w-0 flex-1 truncate text-body text-fg">
                         {stage.name}
@@ -869,7 +953,7 @@ export function StageSettings({
           <div>
             <h2 className="text-title font-semibold text-fg">流水线配置</h2>
             <p className="mt-1 text-caption text-muted">
-              按单据类型分组。默认线决定新建该类型单据时走哪条。阶段顺序用上/下移调整。
+              按单据类型分组。默认线决定新建该类型单据时走哪条。阶段顺序可拖拽，也可用上/下移按钮调整。
             </p>
           </div>
           {!projectId ? (
@@ -944,6 +1028,7 @@ export function StageSettings({
           )}
         </div>
       </Sheet>
+      {promptEl}
     </>
   )
 }

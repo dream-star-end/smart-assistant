@@ -340,6 +340,8 @@ export interface ProjectCreateInput {
   description?: string | null
   workspace?: string | null
   labels?: string[]
+  /** 省略 = 种四条内置线；`[]` = 不种；非空 = 按 id 套用。 */
+  templateIds?: string[]
 }
 
 export interface ProjectPatchInput {
@@ -428,6 +430,184 @@ export interface TicketDetail {
   stage?: PipelineStage | null
 }
 
+// ── M4：成本 / 模板 / 周报（与 gateway 响应锁步）────────────────────────────
+
+export const COST_GROUP_BY = ['day', 'project', 'ticket', 'stage'] as const
+export type CostGroupBy = (typeof COST_GROUP_BY)[number]
+
+export const COST_GROUP_BY_LABEL: Record<CostGroupBy, string> = {
+  day: '按日',
+  project: '按项目',
+  ticket: '按单据',
+  stage: '按阶段',
+}
+
+export const COST_COVERAGES = ['full', 'partial', 'unpriced_only', 'none'] as const
+export type CostCoverage = (typeof COST_COVERAGES)[number]
+
+export interface CostSlice {
+  runCount: number
+  tokensIn: number
+  tokensOut: number
+  costUsd: number
+}
+
+export interface CostTotals extends CostSlice {
+  priced: CostSlice
+  unpriced: CostSlice
+  unknownRunCount: number
+  coverage: CostCoverage
+}
+
+export interface CostBucket extends CostTotals {
+  key: string
+  label: string
+  projectId?: string
+  ticketId?: string
+  stageId?: string
+  identifier?: string
+}
+
+export interface CostStatsQuery {
+  from?: string
+  to?: string
+  projectId?: string
+  ticketId?: string
+  stageId?: string
+  groupBy?: CostGroupBy
+  timeZone?: string
+}
+
+export interface CostStatsResult {
+  from: string
+  to: string
+  timeZone: string
+  groupBy: CostGroupBy | null
+  totals: CostTotals
+  buckets: CostBucket[]
+}
+
+export interface WeeklyPeriod {
+  week: string
+  fromYmd: string
+  toYmd: string
+  fromMs: number
+  toMs: number
+  timeZone: string
+}
+
+export interface TicketFlow {
+  created: number
+  completed: number
+  canceled: number
+  waitingHuman: number
+  blockedNow: number
+  statusTransitions: { from: string; to: string; count: number }[]
+}
+
+export interface StageSpend {
+  stageId: string
+  stageName: string
+  runCount: number
+  succeeded: number
+  failed: number
+  timeout: number
+  totalDurationMs: number
+  avgDurationMs: number
+}
+
+export interface BlockedItem {
+  identifier: string
+  title: string
+  blockedReason: string | null
+}
+
+export interface FailedRunItem {
+  runId: string
+  identifier: string
+  stageName: string | null
+  status: string
+  error: string | null
+  createdAt: number
+}
+
+export interface WeeklyReport {
+  period: WeeklyPeriod
+  projectId: string | null
+  flow: TicketFlow
+  stages: StageSpend[]
+  cost: CostTotals
+  blocked: BlockedItem[]
+  failedRuns: FailedRunItem[]
+}
+
+export interface WeeklyReportQuery {
+  week?: string
+  from?: string
+  to?: string
+  projectId?: string
+}
+
+export const TEMPLATE_SOURCES = ['builtin', 'custom'] as const
+export type TemplateSource = (typeof TEMPLATE_SOURCES)[number]
+
+export interface TemplateStageSnapshot {
+  ordinal: number
+  name: string
+  kind: StageKind
+  agentId: string | null
+  promptTemplate: string | null
+  toolsets: string[] | null
+  effort: string | null
+  patrolCron: string | null
+  patrolEnabled: boolean
+  patrolTimezone: string
+  quietHoursStart: number | null
+  quietHoursEnd: number | null
+  maxRunsPerDay: number
+  timeoutSec: number
+  maxRetries: number
+  circuitBreakerThreshold: number
+  onSuccess: OnSuccessAction
+  onFailure: OnFailureAction
+  entryCondition: string | null
+  exitChecklist: string | null
+  requireHumanAck: boolean
+  autoClose: boolean
+}
+
+export interface PipelineTemplate {
+  id: string
+  slug: string
+  name: string
+  ticketType: TicketType | null
+  source: TemplateSource
+  stages: TemplateStageSnapshot[]
+  createdAt: number
+  updatedAt: number
+}
+
+export const BUILTIN_TEMPLATE_OPTIONS: ReadonlyArray<{
+  id: string
+  name: string
+  ticketType: TicketType
+}> = [
+  { id: 'builtin:bug', name: '问题单默认流水线', ticketType: 'bug' },
+  { id: 'builtin:feature', name: '需求单默认流水线', ticketType: 'feature' },
+  { id: 'builtin:spike', name: '调研单默认流水线', ticketType: 'spike' },
+  { id: 'builtin:chore', name: '杂务单默认流水线', ticketType: 'chore' },
+]
+
+export interface ApplyTemplateResult {
+  ok: boolean
+  template: PipelineTemplate
+  pipeline: Pipeline | null
+  createdPipelines: number
+  createdStages: number
+  skippedPipelines: number
+  skippedStages: number
+}
+
 // ── 错误码映射 ─────────────────────────────────────────────────────────────
 
 function extractBodyCode(body: unknown): string | undefined {
@@ -495,6 +675,16 @@ const VALIDATION_ZH: Array<{ test: (msg: string) => boolean; zh: string }> = [
   },
   { test: (m) => /invalid kind/i.test(m), zh: '阶段类型只能是 AI、人工或闸门' },
   { test: (m) => /invalid ticketType/i.test(m), zh: '单据类型无效' },
+  { test: (m) => /cannot delete builtin template/i.test(m), zh: '内置模板不能删除' },
+  {
+    test: (m) => /pipeline has no stages to snapshot/i.test(m),
+    zh: '这条流水线还没有阶段，无法存为模板',
+  },
+  {
+    test: (m) => /slug must not start with builtin/i.test(m),
+    zh: '自定义模板标识不能以 builtin 开头',
+  },
+  { test: (m) => /template slug .+ already exists/i.test(m), zh: '该模板标识已被占用' },
 ]
 
 function rawErrorText(err: unknown): string {
@@ -663,6 +853,58 @@ export function formatDurationMs(ms: number | null | undefined): string | null {
 export function formatRunCostUsd(cost: number | null | undefined): string | null {
   if (cost == null || !Number.isFinite(cost)) return null
   return `$${cost.toFixed(4)}`
+}
+
+/** 千分位，固定英文逗号，避免测试/界面随运行环境 locale 抖动。 */
+export function formatCount(n: number): string {
+  const sign = n < 0 ? '-' : ''
+  const abs = Math.round(Math.abs(n))
+  return sign + String(abs).replace(/\B(?=(\d{3})+(?!\d))/g, ',')
+}
+
+export function formatTokenUsage(tokensIn: number, tokensOut: number): string {
+  const total = tokensIn + tokensOut
+  return `${formatCount(total)} token（入 ${formatCount(tokensIn)} / 出 ${formatCount(tokensOut)}）`
+}
+
+/** partial 覆盖时钉死的提示原文。 */
+export function formatUnpricedNote(unpriced: CostSlice): string {
+  const tokens = unpriced.tokensIn + unpriced.tokensOut
+  return `另有 ${formatCount(unpriced.runCount)} 次共 ${formatCount(tokens)} token 无单价，未计入`
+}
+
+/** unpriced_only 覆盖时钉死的提示原文。绝不能写成 $0。 */
+export const UNPRICED_ONLY_COPY = '本区间全部无单价，仅有 token 数据'
+
+/**
+ * 美元行文案。永远不要在 unpriced_only 下返回 $0。
+ * full 直接给金额；partial 金额后附缺单价说明；none 返回 null。
+ */
+export function formatCostMoneyLine(totals: CostTotals): string | null {
+  if (totals.coverage === 'none') return null
+  if (totals.coverage === 'unpriced_only') return UNPRICED_ONLY_COPY
+  const amount = formatRunCostUsd(totals.costUsd) ?? '$0.0000'
+  if (totals.coverage === 'partial') {
+    return `${amount}（${formatUnpricedNote(totals.unpriced)}）`
+  }
+  return amount
+}
+
+export function emptyCostSlice(): CostSlice {
+  return { runCount: 0, tokensIn: 0, tokensOut: 0, costUsd: 0 }
+}
+
+export function emptyCostTotals(): CostTotals {
+  return {
+    runCount: 0,
+    tokensIn: 0,
+    tokensOut: 0,
+    costUsd: 0,
+    priced: emptyCostSlice(),
+    unpriced: emptyCostSlice(),
+    unknownRunCount: 0,
+    coverage: 'none',
+  }
 }
 
 export function skipReasonLabel(reason: string | null | undefined): string | null {
@@ -991,4 +1233,35 @@ export const taskboardApi = {
 
   patchSettings: (a: AuthSession, body: Partial<TaskboardSettings>) =>
     boardSend<TaskboardSettingsSnapshot & { ok: boolean }>(a, '/api/board/settings', 'PATCH', body),
+
+  getCostStats: (a: AuthSession, query?: CostStatsQuery) =>
+    boardGet<CostStatsResult>(a, `/api/board/stats/cost${qs(query)}`),
+
+  getWeeklyReport: (a: AuthSession, query?: WeeklyReportQuery) =>
+    boardGet<{ report: WeeklyReport }>(a, `/api/board/reports/weekly${qs(query)}`).then(
+      (b) => b.report,
+    ),
+
+  listTemplates: (a: AuthSession) =>
+    boardGet<{ items: PipelineTemplate[] }>(a, '/api/board/templates').then((b) => b.items || []),
+
+  getTemplate: (a: AuthSession, id: string) =>
+    boardGet<{ template: PipelineTemplate }>(
+      a,
+      `/api/board/templates/${encodeURIComponent(id)}`,
+    ).then((b) => b.template),
+
+  createTemplate: (a: AuthSession, body: { pipelineId: string; name?: string; slug?: string }) =>
+    boardSend<{ ok: boolean; template: PipelineTemplate }>(a, '/api/board/templates', 'POST', body),
+
+  deleteTemplate: (a: AuthSession, id: string) =>
+    boardSend<{ ok: boolean }>(a, `/api/board/templates/${encodeURIComponent(id)}`, 'DELETE'),
+
+  applyTemplate: (a: AuthSession, id: string, body: { projectId: string; asDefault?: boolean }) =>
+    boardSend<ApplyTemplateResult>(
+      a,
+      `/api/board/templates/${encodeURIComponent(id)}/apply`,
+      'POST',
+      body,
+    ),
 }
