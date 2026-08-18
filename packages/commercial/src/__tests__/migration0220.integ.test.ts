@@ -85,7 +85,7 @@ describe('0220_cursor_grok_46_high_fast', () => {
     if (db.skipIfUnavailable(t)) return
     await resetAndMigrateBefore('0220')
     await query(`UPDATE model_catalog SET state = 'disabled' WHERE model_id = 'cursor-grok-4.6-high'`)
-    await assert.rejects(query(await loadSql()), /0220 requires active hidden cursor-grok-4.6-high floor/)
+    await assert.rejects(query(await loadSql()), /0220 requires active enabled cursor-grok-4.6-high floor/)
     const after = await query<{ count: string }>(
       `SELECT COUNT(*)::text AS count FROM model_catalog WHERE model_id = $1`,
       [modelId],
@@ -118,5 +118,17 @@ describe('0220_cursor_grok_46_high_fast', () => {
           AND after->>'source' = 'migration:0220'`,
     )
     assert.equal(audit.rows[0]?.count, '2')
+  })
+
+  test('clones a public High floor instead of demanding hidden', async (t) => {
+    if (db.skipIfUnavailable(t)) return
+    await resetAndMigrateBefore('0220')
+    await query(`UPDATE model_pricing SET visibility = 'public' WHERE model_id = 'cursor-grok-4.6-high'`)
+    await query(await loadSql())
+    const row = await query<{ visibility: string }>(
+      `SELECT visibility FROM model_pricing WHERE model_id = $1`,
+      [modelId],
+    )
+    assert.deepEqual(row.rows, [{ visibility: 'public' }])
   })
 })

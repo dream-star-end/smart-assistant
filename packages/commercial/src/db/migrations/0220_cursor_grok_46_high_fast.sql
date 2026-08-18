@@ -1,8 +1,9 @@
 -- 0220_cursor_grok_46_high_fast.sql
--- Add Cursor Grok 4.6 High Fast as a hidden sibling of cursor-grok-4.6-high.
+-- Add Cursor Grok 4.6 High Fast as a sibling of cursor-grok-4.6-high.
 -- Upstream CLI id (pinned 2026.08.11-e8db854 --list-models): cursor-grok-4.6-high-fast.
 -- Same zero-price subscription billing, shared Cursor credential pool, and
--- visibility/env UID gate as the existing High row.
+-- env UID gate as High. Visibility is cloned from High so live public/hidden
+-- drift does not fail the floor.
 --
 -- 0219_deepseek_v4_pro_transition exists on commercial aurora / the pending
 -- selfhost-backmerge worktree but is not on this selfhost tree yet. 0220 avoids
@@ -25,9 +26,8 @@ BEGIN
        AND c.upstream_model_id = 'cursor-grok-4.6-high'
        AND c.state = 'active'
        AND p.enabled IS TRUE
-       AND p.visibility = 'hidden'
   ) THEN
-    RAISE EXCEPTION '0220 requires active hidden cursor-grok-4.6-high floor';
+    RAISE EXCEPTION '0220 requires active enabled cursor-grok-4.6-high floor';
   END IF;
 
   IF EXISTS (
@@ -69,7 +69,7 @@ BEGIN
     'cursor-grok-4.6-high-fast',
     'Cursor Grok 4.6 High Fast',
     input_per_mtok, output_per_mtok, cache_read_per_mtok, cache_write_per_mtok,
-    multiplier, FALSE, sort_order, 'hidden', extra_system_prompt,
+    multiplier, FALSE, sort_order, visibility, extra_system_prompt,
     default_effort, 0
   FROM model_pricing
   WHERE model_id = 'cursor-grok-4.6-high';
@@ -86,11 +86,13 @@ BEGIN
     RAISE EXCEPTION '0220 failed to activate cursor-grok-4.6-high-fast catalog';
   END IF;
 
-  UPDATE model_pricing
+  UPDATE model_pricing AS fast
      SET enabled = TRUE,
-         visibility = 'hidden',
-         lock_version = lock_version + 1
-   WHERE model_id = 'cursor-grok-4.6-high-fast';
+         visibility = high.visibility,
+         lock_version = fast.lock_version + 1
+    FROM model_pricing AS high
+   WHERE fast.model_id = 'cursor-grok-4.6-high-fast'
+     AND high.model_id = 'cursor-grok-4.6-high';
   IF NOT FOUND THEN
     RAISE EXCEPTION '0220 failed to enable cursor-grok-4.6-high-fast pricing';
   END IF;
@@ -163,10 +165,10 @@ BEGIN
      AND c.upstream_model_id = 'cursor-grok-4.6-high-fast'
      AND c.state = 'active'
      AND p.enabled IS TRUE
-     AND p.visibility = 'hidden'
+     AND p.visibility = (SELECT visibility FROM model_pricing WHERE model_id = 'cursor-grok-4.6-high')
      AND p.display_name = 'Cursor Grok 4.6 High Fast';
   IF actual <> 1 THEN
-    RAISE EXCEPTION '0220 expected one active hidden cursor-grok-4.6-high-fast row, got %', actual;
+    RAISE EXCEPTION '0220 expected one active cursor-grok-4.6-high-fast row matching High visibility, got %', actual;
   END IF;
 
   IF present_users = 2 AND (
