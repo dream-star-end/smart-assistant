@@ -5059,6 +5059,8 @@ export async function registerCommercial(
           role: authz.role,
           grantedModelIds: authz.grantedModelIds,
           deniedModelIds: authz.deniedModelIds,
+          userPlanTier: authz.userPlanTier ?? null,
+          orgPlanCode: authz.orgPlanCode ?? null,
         }, modelId);
       }
       // cutover 前 legacy 路径仍从 DB loader 取 role+grants，不再信 JWT role。

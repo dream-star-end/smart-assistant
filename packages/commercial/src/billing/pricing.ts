@@ -23,6 +23,7 @@ import { COST_INDEX_BASELINE_MODEL_ID, costXVsBaseline, modelReasoningPolicy, ST
 import { query } from "../db/queries.js";
 import { loadConfig } from "../config.js";
 import { CATALOG_CHANNEL } from "./modelCatalog.js";
+import { meetsMinPlan } from "./planEntitlement.js";
 
 export type ModelVisibility = "public" | "admin" | "hidden";
 
@@ -70,6 +71,9 @@ export interface ModelPricing {
    */
   default_effort: string | null;
   updated_at: Date;
+  /** Null = no subscription floor. Loaded with min_plan_tier from subscription_plans. */
+  min_plan_code?: string | null;
+  min_plan_tier?: number | null;
 }
 
 /**
@@ -113,6 +117,8 @@ type RawRow = {
   extra_system_prompt: string | null;
   default_effort: string | null;
   updated_at: Date;
+  min_plan_code: string | null;
+  min_plan_tier: string | number | null;
 };
 
 function rowToPricing(r: RawRow): ModelPricing {
@@ -132,6 +138,8 @@ function rowToPricing(r: RawRow): ModelPricing {
     extra_system_prompt: r.extra_system_prompt,
     default_effort: r.default_effort,
     updated_at: r.updated_at,
+    min_plan_code: r.min_plan_code,
+    min_plan_tier: r.min_plan_tier == null || r.min_plan_tier === "" ? null : Number(r.min_plan_tier),
   };
 }
 
@@ -254,8 +262,11 @@ export class PricingCache {
                 SELECT 1 FROM model_catalog c
                  WHERE c.model_id = p.model_id AND c.state = 'active'
               ) AS enabled,
-              p.sort_order, p.visibility, p.extra_system_prompt, p.default_effort, p.updated_at
-         FROM model_pricing p`,
+              p.sort_order, p.visibility, p.extra_system_prompt, p.default_effort, p.updated_at,
+              p.min_plan_code,
+              sp.tier AS min_plan_tier
+         FROM model_pricing p
+         LEFT JOIN subscription_plans sp ON sp.code = p.min_plan_code`,
     );
     const next = new Map<string, ModelPricing>();
     for (const row of r.rows) next.set(row.model_id, rowToPricing(row));
@@ -401,11 +412,19 @@ export class PricingCache {
     role: "user" | "admin";
     grantedModelIds: ReadonlySet<string>;
     deniedModelIds?: ReadonlySet<string>;
+    userPlanTier?: number | null;
+    orgPlanCode?: string | null;
   }): PublicModel[] {
     return [...this.map.values()]
       .filter((p) => {
         if (!p.enabled) return false;
         if (args.deniedModelIds?.has(p.model_id)) return false;
+        if (!meetsMinPlan({
+          minPlanCode: p.min_plan_code,
+          minPlanTier: p.min_plan_tier,
+          userPlanTier: args.userPlanTier,
+          orgPlanCode: args.orgPlanCode,
+        })) return false;
         if (p.visibility === "public") return true;
         if (p.visibility === "admin") {
           return args.role === "admin" || args.grantedModelIds.has(p.model_id);

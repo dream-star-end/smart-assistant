@@ -1297,6 +1297,8 @@ function anonymousModelScope(): UserModelScope {
     uid: 0,
     role: "user",
     grantedModelIds: new Set<string>(),
+    userPlanTier: null,
+    orgPlanCode: null,
   };
 }
 
@@ -1312,6 +1314,8 @@ async function loadPublicModelScope(
       role: authz.role,
       grantedModelIds: authz.grantedModelIds,
       deniedModelIds: authz.deniedModelIds,
+      userPlanTier: authz.userPlanTier ?? null,
+      orgPlanCode: authz.orgPlanCode ?? null,
     };
   }
   const { listGrantsForUser } = await import("../admin/modelGrants.js");
@@ -1320,6 +1324,8 @@ async function loadPublicModelScope(
     uid: claims.sub,
     role: claims.role,
     grantedModelIds: new Set(grants.map((g) => g.model_id)),
+    userPlanTier: null,
+    orgPlanCode: null,
   };
 }
 

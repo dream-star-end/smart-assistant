@@ -101,7 +101,8 @@
     "0220_cursor_grok_46_high_fast",
     "0221_cursor_official_pricing",
     "0222_cursor_family_effort_fast",
-    "0223_official_cny_pricing_and_gpt_1m"
+    "0223_official_cny_pricing_and_gpt_1m",
+    "0224_cost_x_targets_and_max_plan_gate"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

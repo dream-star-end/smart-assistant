@@ -221,6 +221,8 @@ export function makeModelCatalogHandler(deps: ModelCatalogHandlerDeps): ModelCat
       role: authz.role,
       grantedModelIds: authz.grantedModelIds,
       deniedModelIds: authz.deniedModelIds,
+      userPlanTier: authz.userPlanTier ?? null,
+      orgPlanCode: authz.orgPlanCode ?? null,
     };
     const availability = await loadRoutingAvailability();
     const body: WireCatalogResponse = {

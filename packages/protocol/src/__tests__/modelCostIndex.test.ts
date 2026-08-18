@@ -73,4 +73,38 @@ describe('modelCostIndex', () => {
     assert.equal(typeof standard, 'number')
     assert.ok(fast! > standard!)
   })
+
+  test('0224 published fen hits product xN targets', () => {
+    const pro = {
+      inputPerMtok: 450,
+      cacheReadPerMtok: 15,
+      outputPerMtok: 1350,
+      multiplier: 1,
+    }
+    const cases: Array<[string, number, number, number, number, number]> = [
+      ['glm', 453, 84, 1424, 1, 2.0],
+      ['k3-256k', 1219, 122, 6092, 1, 4.0],
+      ['kimi-k3', 2438, 244, 12184, 1, 8.0],
+      ['sol', 1199, 120, 7197, 1, 4.0],
+      ['sol-1m', 2398, 240, 14394, 1, 8.0],
+      ['terra', 600, 60, 3599, 1, 2.0],
+      ['luna', 296, 31, 1776, 1, 1.0],
+      ['flash', 225, 7, 675, 1, 0.5],
+      ['grok', 376, 94, 1127, 1, 2.0],
+      ['grok-fast', 376, 94, 1127, 2, 4.0],
+      ['composer', 264, 106, 1320, 1, 2.0],
+      ['opus', 3047, 305, 15234, 1, 10.0],
+      ['opus-fast', 3047, 305, 15234, 2, 20.0],
+      ['fable', 6098, 610, 30486, 1, 20.0],
+    ]
+    for (const [, input, cache, output, mul, want] of cases) {
+      assert.equal(
+        costXVsBaseline(
+          { inputPerMtok: input, cacheReadPerMtok: cache, outputPerMtok: output, multiplier: mul },
+          pro,
+        ),
+        want,
+      )
+    }
+  })
 })

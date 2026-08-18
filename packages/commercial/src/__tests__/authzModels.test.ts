@@ -240,3 +240,44 @@ describe('canUseModel — enabled=false / 未知模型', () => {
     )
   })
 })
+
+describe('canUseModel — min_plan_code Max floor', () => {
+  const opusMax: ModelPricing = {
+    ...opusPublic,
+    model_id: 'cursor-opus-5-high',
+    min_plan_code: 'max',
+    min_plan_tier: 3,
+  }
+  const pricing = makeCache([opusMax])
+
+  test('public visibility still requires Max', () => {
+    assert.equal(
+      canUseModel(
+        { pricing },
+        { role: 'user', grantedModelIds: empty, modelId: 'cursor-opus-5-high' },
+      ),
+      false,
+    )
+    assert.equal(
+      canUseModel(
+        { pricing },
+        { role: 'admin', grantedModelIds: empty, modelId: 'cursor-opus-5-high', userPlanTier: 2 },
+      ),
+      false,
+    )
+    assert.equal(
+      canUseModel(
+        { pricing },
+        { role: 'user', grantedModelIds: empty, modelId: 'cursor-opus-5-high', userPlanTier: 3 },
+      ),
+      true,
+    )
+    assert.equal(
+      canUseModel(
+        { pricing },
+        { role: 'user', grantedModelIds: empty, modelId: 'cursor-opus-5-high', orgPlanCode: 'org-ultra' },
+      ),
+      true,
+    )
+  })
+})
