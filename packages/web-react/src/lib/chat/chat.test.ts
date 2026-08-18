@@ -45,6 +45,7 @@ import {
   applyTurnUsage,
   normalizeDelegateCards,
   normalizeGoalCards,
+  resetFrameSeqCursor,
   type FrameEffects,
 } from "./reducer";
 import {
@@ -911,6 +912,89 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
     applyOutboundMessage(s, msgFrame({ frameSeq: 1, blocks: [{ kind: "text", text: "A", messageId: "srv-1" }] }));
     applyOutboundMessage(s, msgFrame({ frameSeq: 1, blocks: [{ kind: "text", text: "A", messageId: "srv-1" }] }));
     expect(s.messages.filter((m) => m.role === "assistant")[0].text).toBe("A");
+  });
+
+  test("WS stream then live-frame replay after cursor reset does not double assistant text", () => {
+    const s = sess();
+    s._activeClientMessageId = "m-msy9xr0r-5-9sa2";
+    const chunks = [
+      { frameSeq: 814, text: "那批通知是我已经处理完的门禁…" },
+      { frameSeq: 816, text: "守候进程正常运行，第 3 次轮询…" },
+      { frameSeq: 818, text: "上一条里问你的两件事还等你定：…" },
+    ];
+    const frames = chunks.map((chunk) => msgFrame({
+      frameSeq: chunk.frameSeq,
+      clientMessageId: "m-msy9xr0r-5-9sa2",
+      blocks: [{ kind: "text", text: chunk.text, messageId: "srv-webmsx0zsq1jvn4if-main-t14-s39" }],
+    }));
+    for (const frame of frames) applyOutboundMessage(s, frame);
+    const row = s.messages.find((m) => m.id === "srv-webmsx0zsq1jvn4if-main-t14-s39");
+    expect(row?.text).toBe(chunks.map((c) => c.text).join(""));
+    const once = row!.text;
+
+    // Incident shape after Stop: tape projection keeps the same-id row,
+    // journal hydrate resets the session cursor and clears the stream pointer.
+    row!._source = "server";
+    row!._turnTapeId = "4c767b304d7879767665424a761fac0ded7cd7d604d90c80c079232aab58df0d";
+    resetFrameSeqCursor(s, frames[0]);
+    s._streamingAssistant = null;
+    for (const frame of frames) applyOutboundMessage(s, frame);
+    expect(s.messages.find((m) => m.id === "srv-webmsx0zsq1jvn4if-main-t14-s39")?.text).toBe(once);
+  });
+
+  test("tape snapshot then live-frame replay does not double assistant text", () => {
+    const s = sess();
+    const full = "那批通知是我已经处理完的门禁…守候进程正常运行，第 3 次轮询…上一条里问你的两件事还等你定：…";
+    s.messages.push({
+      id: "srv-webmsx0zsq1jvn4if-main-t14-s39",
+      role: "assistant",
+      text: full,
+      ts: 1,
+      _source: "server",
+      _turnTapeId: "4c767b304d7879767665424a761fac0ded7cd7d604d90c80c079232aab58df0d",
+      _clientMessageId: "m-msy9xr0r-5-9sa2",
+    });
+    for (const chunk of [
+      { frameSeq: 814, text: "那批通知是我已经处理完的门禁…" },
+      { frameSeq: 816, text: "守候进程正常运行，第 3 次轮询…" },
+      { frameSeq: 818, text: "上一条里问你的两件事还等你定：…" },
+    ]) {
+      applyOutboundMessage(s, msgFrame({
+        frameSeq: chunk.frameSeq,
+        clientMessageId: "m-msy9xr0r-5-9sa2",
+        blocks: [{ kind: "text", text: chunk.text, messageId: "srv-webmsx0zsq1jvn4if-main-t14-s39" }],
+      }));
+    }
+    const asst = s.messages.filter((m) => m.id === "srv-webmsx0zsq1jvn4if-main-t14-s39");
+    expect(asst).toHaveLength(1);
+    expect(asst[0].text).toBe(full);
+  });
+
+  test("cursor reset replay of the same live row does not double without tape stamps", () => {
+    const s = sess();
+    applyOutboundMessage(s, msgFrame({ frameSeq: 1, blocks: [{ kind: "text", text: "Hel", messageId: "srv-1" }] }));
+    applyOutboundMessage(s, msgFrame({ frameSeq: 2, blocks: [{ kind: "text", text: "lo", messageId: "srv-1" }] }));
+    expect(s.messages.filter((m) => m.role === "assistant")[0].text).toBe("Hello");
+    resetFrameSeqCursor(s, { sessionKey: "agent:main:webchat:dm:s1" });
+    s._streamingAssistant = null;
+    applyOutboundMessage(s, msgFrame({ frameSeq: 1, blocks: [{ kind: "text", text: "Hel", messageId: "srv-1" }] }));
+    applyOutboundMessage(s, msgFrame({ frameSeq: 2, blocks: [{ kind: "text", text: "lo", messageId: "srv-1" }] }));
+    expect(s.messages.filter((m) => m.role === "assistant")[0].text).toBe("Hello");
+  });
+
+  test("a later frameSeq with the same words is still appended (model really repeated itself)", () => {
+    const s = sess();
+    applyOutboundMessage(s, msgFrame({
+      frameSeq: 1,
+      blocks: [{ kind: "text", text: "守候进程正常运行", messageId: "srv-1" }],
+    }));
+    applyOutboundMessage(s, msgFrame({
+      frameSeq: 2,
+      blocks: [{ kind: "text", text: "守候进程正常运行", messageId: "srv-1" }],
+    }));
+    expect(s.messages.filter((m) => m.role === "assistant")[0].text).toBe(
+      "守候进程正常运行守候进程正常运行",
+    );
   });
 
   test("per-sessionKey cursors are independent (multi-container parallel streams)", () => {

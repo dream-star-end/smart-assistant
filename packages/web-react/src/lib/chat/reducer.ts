@@ -528,6 +528,24 @@ function isImmutableTapeViewportRow(message: ChatMessage): boolean {
   );
 }
 
+/** Tape/server snapshots are complete. Live incrementals must not append onto them. */
+function isFrozenLiveTarget(message: ChatMessage): boolean {
+  if (isImmutableTapeViewportRow(message)) return true;
+  if (typeof message._turnTapeId === "string" && message._turnTapeId.length > 0) return true;
+  return message._source === "server" && (message.text || "").length > 0;
+}
+
+function frameSeqAlreadyApplied(message: ChatMessage, frameSeq?: number): boolean {
+  if (!(typeof frameSeq === "number" && Number.isSafeInteger(frameSeq) && frameSeq > 0)) return false;
+  return message._appliedFrameSeqs?.[frameSeq] === true;
+}
+
+function noteAppliedFrameSeq(message: ChatMessage, frameSeq?: number): void {
+  if (!(typeof frameSeq === "number" && Number.isSafeInteger(frameSeq) && frameSeq > 0)) return;
+  if (!message._appliedFrameSeqs) message._appliedFrameSeqs = {};
+  message._appliedFrameSeqs[frameSeq] = true;
+}
+
 function matchesDelegateProgress(groupMsg: ChatMessage, progress: ChatMessage): boolean {
   if (groupMsg.role !== "agent-group" || !groupMsg._delegate || progress.role !== "delegate-progress") return false;
   if (isImmutableTapeViewportRow(progress)) return false;
@@ -1543,7 +1561,7 @@ export function applyOutboundMessage(
         if (
           b.messageId && sess.messages.some((message) =>
             message.id === b.messageId && message.role === "assistant" &&
-            isImmutableTapeViewportRow(message))
+            isFrozenLiveTarget(message))
         ) continue;
         sess._streamingAssistant = findOrCreateStreamingRow(
           sess.messages,
@@ -1562,6 +1580,8 @@ export function applyOutboundMessage(
       if (frameTurnOwnerId && !sess._streamingAssistant._turnOwnerId) {
         sess._streamingAssistant._turnOwnerId = frameTurnOwnerId;
       }
+      if (frameSeqAlreadyApplied(sess._streamingAssistant, frame.frameSeq)) continue;
+      noteAppliedFrameSeq(sess._streamingAssistant, frame.frameSeq);
       sess._streamingAssistant.text += blockText;
       sess._streamingAssistant.completedAt = Date.now();
     } else if (b.kind === "thinking") {
@@ -1569,7 +1589,7 @@ export function applyOutboundMessage(
         if (
           b.messageId && sess.messages.some((message) =>
             message.id === b.messageId && message.role === "thinking" &&
-            isImmutableTapeViewportRow(message))
+            isFrozenLiveTarget(message))
         ) continue;
         sess._streamingThinking = findOrCreateStreamingRow(
           sess.messages,
@@ -1584,6 +1604,8 @@ export function applyOutboundMessage(
       if (frameTurnOwnerId && !sess._streamingThinking._turnOwnerId) {
         sess._streamingThinking._turnOwnerId = frameTurnOwnerId;
       }
+      if (frameSeqAlreadyApplied(sess._streamingThinking, frame.frameSeq)) continue;
+      noteAppliedFrameSeq(sess._streamingThinking, frame.frameSeq);
       sess._streamingThinking.text += blockText;
       sess._streamingThinking.completedAt = Date.now();
     } else if (b.kind === "plan") {

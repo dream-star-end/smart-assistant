@@ -294,6 +294,12 @@ export type ChatMessage = {
   // ── lossless turn tape 水合标记（v2 tape;server-authored 行携带，前端只读）──
   /** 该行所属的 lossless turn tape id（tape 是一个原子同步单元）。 */
   _turnTapeId?: string;
+  /**
+   * Live text/thinking frameSeqs already appended onto this row.
+   * Survives session-level cursor reset so journal/WS replay cannot
+   * concatenate the same incremental chunks twice. Runtime-only.
+   */
+  _appliedFrameSeqs?: Record<number, true>;
   /** hydration 的 complete-anchor 分支盖章：该 tape 已完整原子落库（同步权威传播的作证前提）。 */
   _turnTapeComplete?: boolean;
   /** 该行在同一 lossless turn tape 内的持久 record ordinal。多个展开行共享 `_orderSeq`，
