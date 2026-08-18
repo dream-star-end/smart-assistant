@@ -5,12 +5,18 @@
 
 # 独立于 runtime-releases。不要跟 /var/lib/openclaude-v5-selfhost/runtime-releases 混用。
 MASTER_RELEASES_ROOT="${MASTER_RELEASES_ROOT:-/opt/openclaude/openclaude-v5-selfhost-releases}"
+MASTER_LIVE_LINK="${MASTER_LIVE_LINK:-/opt/openclaude/openclaude-v5-selfhost-live}"
 MASTER_RELEASE_COMPLETE_SCHEMA_VERSION=2
 MASTER_STAGING="${MASTER_STAGING:-}"
 BUILT_MASTER_RELEASE="${BUILT_MASTER_RELEASE:-}"
 MASTER_DEPS_MODE="${MASTER_DEPS_MODE:-}"
 MASTER_DEPS_ELAPSED_S="${MASTER_DEPS_ELAPSED_S:-}"
 MASTER_FRONTEND_ELAPSED_S="${MASTER_FRONTEND_ELAPSED_S:-}"
+BREAKGLASS_ROOT="${BREAKGLASS_ROOT:-/opt/openclaude/v5-selfhost-breakglass}"
+CUTOVER_GRACE_FILE="${CUTOVER_GRACE_FILE:-/run/openclaude-v5-selfhost/cutover-grace-until}"
+CUTOVER_GRACE_SEC="${CUTOVER_GRACE_SEC:-90}"
+CUTOVER_HAS_MIGRATION="${CUTOVER_HAS_MIGRATION:-0}"
+CUTOVER_MIGRATION_FILES="${CUTOVER_MIGRATION_FILES:-}"
 
 mlog() { echo "$*" >&2; }
 
@@ -196,17 +202,45 @@ write_strong_release_marker_local() { # <release-root> <full-sha> <short-sha> <b
   }
 }
 
+release_dir_is_poisoned() { # <dir>
+  local cand="$1"
+  case "$cand" in
+    *.poisoned) return 0 ;;
+  esac
+  [[ -e "$cand/.poisoned" || -e "${cand}.poisoned" ]]
+}
+
 # stdout 只打印 donor 绝对路径;找不到则 rc=1。日志走 stderr。
+# 禁止用工作树当默认 donor(阶段 1 有毒 rel 就是这样来的);禁止 *.poisoned。
 find_master_release_donor() { # <staging-lock>
-  local staging_lock="$1" cand
+  local staging_lock="$1" cand pinned
   [[ -f "$staging_lock" ]] || return 1
   if [[ "${FORCE_NPM_CI:-0}" == 1 ]]; then
     mlog "  --force-npm-ci:跳过硬链 donor"
     return 1
   fi
+  pinned="${OC_V5_MASTER_DONOR:-}"
+  if [[ -n "$pinned" ]]; then
+    if release_dir_is_poisoned "$pinned"; then
+      mlog "  拒绝有毒 donor pin: $pinned"
+      return 1
+    fi
+    [[ -f "$pinned/.complete" && ! -L "$pinned/.complete" ]] || return 1
+    [[ -d "$pinned/node_modules" && ! -L "$pinned/node_modules" ]] || return 1
+    [[ -f "$pinned/package-lock.json" ]] || return 1
+    if cmp -s "$staging_lock" "$pinned/package-lock.json"; then
+      mlog "  donor=OC_V5_MASTER_DONOR $pinned"
+      printf '%s\n' "$pinned"
+      return 0
+    fi
+    mlog "  OC_V5_MASTER_DONOR lock 不匹配,忽略 $pinned"
+  fi
   if [[ -d "$MASTER_RELEASES_ROOT" ]]; then
     while IFS= read -r cand; do
       [[ -n "$cand" ]] || continue
+      if release_dir_is_poisoned "$cand"; then
+        continue
+      fi
       [[ -f "$cand/.complete" && ! -L "$cand/.complete" ]] || continue
       [[ -d "$cand/node_modules" && ! -L "$cand/node_modules" ]] || continue
       [[ -f "$cand/package-lock.json" ]] || continue
@@ -215,12 +249,14 @@ find_master_release_donor() { # <staging-lock>
         printf '%s\n' "$cand"
         return 0
       fi
-    done < <(find "$MASTER_RELEASES_ROOT" -mindepth 1 -maxdepth 1 -type d -name 'rel-*' -printf '%T@\t%p\n' \
+    done < <(find "$MASTER_RELEASES_ROOT" -mindepth 1 -maxdepth 1 -type d \
+      -name 'rel-*' ! -name '*.poisoned' -printf '%T@\t%p\n' \
       | sort -nr | cut -f2-)
   fi
-  if [[ -d "${REPO_ROOT:-}/node_modules" && -f "${REPO_ROOT:-}/package-lock.json" ]] \
+  if [[ "${OC_V5_ALLOW_WORKTREE_DONOR:-0}" == 1 ]] \
+    && [[ -d "${REPO_ROOT:-}/node_modules" && -f "${REPO_ROOT:-}/package-lock.json" ]] \
     && cmp -s "$staging_lock" "$REPO_ROOT/package-lock.json"; then
-    mlog "  donor=工作树 $REPO_ROOT (只硬链;绝不 chmod 其共享 inode)"
+    mlog "  donor=工作树 $REPO_ROOT (OC_V5_ALLOW_WORKTREE_DONOR=1;绝不 chmod 其共享 inode)"
     printf '%s\n' "$REPO_ROOT"
     return 0
   fi
@@ -403,3 +439,251 @@ cmd_build_master_only() {
   log "  depsMode=$MASTER_DEPS_MODE elapsed=${MASTER_DEPS_ELAPSED_S}s frontend=${MASTER_FRONTEND_ELAPSED_S}s"
   log "✓ build-master-only 完成(未改 unit / 未切 symlink / 未重启)"
 }
+
+# ── 阶段 2 静态门 + 不起 HTTP 的 tsx 自检 ────────────────────────────────
+
+unit_template_working_directory() { # <unit-file>
+  awk -F= '/^WorkingDirectory=/{print $2; exit}' "$1"
+}
+
+assert_unit_templates_live_wd() {
+  local f wd
+  for f in "${UNIT_DIR}/${V5_UNIT}" "${UNIT_DIR}/${V5_EGRESS_UNIT}"; do
+    [[ -f "$f" ]] || die "缺 unit 模板: $f"
+    wd="$(unit_template_working_directory "$f")"
+    [[ "$wd" == *-live ]] || die "unit 模板 $f WorkingDirectory='$wd' 必须以 -live 结尾。禁止改回工作树。"
+    [[ "$wd" == "$MASTER_LIVE_LINK" ]] \
+      || die "unit 模板 $f WorkingDirectory='$wd' 必须等于 $MASTER_LIVE_LINK"
+  done
+}
+
+assert_old_deploy_fail_closed() {
+  die "仓库 master/egress unit 模板已改指 $MASTER_LIVE_LINK。旧 --$MODE 会装 live WD 但仍走 tuple-only+工作树 saga(审计 blocker 2)。已 fail-closed。
+补救: 用 --cutover 完成不可分割翻转;或 --build-master-only 只建不切。禁止 --deploy/--bootstrap 直至 joint saga 合入。"
+}
+
+assert_master_release_static_gate() { # <rel> [expected-full-sha]
+  local rel="$1" expected="${2:-}" marker schema commit built meta art got ver_commit root_uid root_gid root_mode
+  [[ -d "$rel" && ! -L "$rel" ]] || die "静态门: release 不是普通目录: $rel"
+  if release_dir_is_poisoned "$rel"; then
+    die "静态门: 拒绝有毒 release: $rel"
+  fi
+  marker="$rel/.complete"
+  [[ -f "$marker" && ! -L "$marker" ]] || die "静态门: 缺 .complete: $rel"
+  schema="$(jq -er '.schemaVersion' "$marker")"
+  commit="$(jq -er '.sourceCommit' "$marker")"
+  built="$(jq -er '.builtAt' "$marker")"
+  meta="$(jq -er '.metadataSha256' "$marker")"
+  art="$(jq -er '.artifactSha256' "$marker")"
+  [[ "$schema" == "$MASTER_RELEASE_COMPLETE_SCHEMA_VERSION" ]] \
+    || die "静态门: schemaVersion=$schema 期望 $MASTER_RELEASE_COMPLETE_SCHEMA_VERSION"
+  [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || die "静态门: sourceCommit 不是 40 位 hex"
+  [[ "$built" =~ ^[0-9]{8}-[0-9]{6}$ ]] || die "静态门: builtAt 非法: $built"
+  [[ "$meta" =~ ^[0-9a-f]{64}$ && "$art" =~ ^[0-9a-f]{64}$ ]] \
+    || die "静态门: digest 字段非法"
+  if [[ -n "$expected" ]]; then
+    [[ "$commit" == "$expected" ]] || die "静态门: sourceCommit=$commit 与预期 $expected 不一致"
+  fi
+  [[ -d "$rel/node_modules/tsx" ]] || die "静态门: 缺 node_modules/tsx"
+  [[ -f "$rel/packages/web-react/dist/index.html" ]] || die "静态门: 缺 dist/index.html"
+  grep -q 'name="oc-build"' "$rel/packages/web-react/dist/index.html" \
+    || die "静态门: dist/index.html 缺 oc-build"
+  [[ -f "$rel/deploy/v5/release-metadata.json" ]] || die "静态门: 缺 release-metadata.json"
+  [[ -f "$rel/VERSION.json" ]] || die "静态门: 缺 VERSION.json"
+  ver_commit="$(jq -er '.commit | select(type == "string")' "$rel/VERSION.json")"
+  [[ "$commit" == "$ver_commit"* ]] || die "静态门: VERSION.commit=$ver_commit 不是 sourceCommit 前缀"
+  read -r root_uid root_gid root_mode < <(stat -Lc '%u %g %a' -- "$rel")
+  [[ "$root_uid" == 0 && "$root_gid" == 0 && $((8#$root_mode & 8#22)) -eq 0 ]] \
+    || die "静态门: release 根 ownership/mode 不可信 uid=$root_uid gid=$root_gid mode=$root_mode"
+  got="$(release_artifact_digest "$rel")"
+  [[ "$got" == "$art" ]] || die "静态门: artifactSha256 复算不匹配 expected=$art got=$got"
+  mlog "  ✓ 静态门通过 $rel sourceCommit=${commit:0:9} digest=${art:0:12}…"
+}
+
+# 不起 HTTP、不 import gateway/registerCommercial。只证明该树自带的 tsx 能跑,
+# 并对入口文件做 --check(语法/transform,不执行 top-level)。
+assert_master_release_tsx_selfcheck() { # <rel>
+  local rel="$1" out
+  [[ -d "$rel/node_modules/tsx" ]] || die "tsx 自检: 缺 $rel/node_modules/tsx"
+  out="$(cd "$rel" && npx --no-install tsx -e 'console.log("tsx-ok")')"
+  [[ "$out" == "tsx-ok" ]] || die "tsx 自检失败(期望 tsx-ok): $out"
+  ( cd "$rel" && node --import tsx --check packages/cli/src/commands/gateway.ts ) \
+    || die "tsx --check gateway.ts 失败"
+  ( cd "$rel" && node --import tsx --check packages/commercial/src/index.ts ) \
+    || die "tsx --check commercial/src/index.ts 失败"
+  mlog "  ✓ tsx 自检通过(无 HTTP)"
+}
+
+sql_file_has_breaking_ddl() { # <sql-file> → rc 0 = breaking
+  local f="$1"
+  python3 - "$f" <<'PY'
+import re, sys
+path = sys.argv[1]
+text = open(path, encoding="utf-8", errors="replace").read()
+text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
+text = re.sub(r"--.*?$", " ", text, flags=re.M)
+if re.search(r"\bDROP\s+TABLE\b", text, re.I):
+    print("DROP TABLE"); sys.exit(0)
+if re.search(r"\bDROP\s+COLUMN\b", text, re.I):
+    print("DROP COLUMN"); sys.exit(0)
+if re.search(r"\bALTER\b[\s\S]{0,200}\bDROP\b", text, re.I):
+    print("ALTER ... DROP"); sys.exit(0)
+if re.search(r"\bRENAME\s+(TO|COLUMN|TABLE)\b", text, re.I):
+    print("RENAME"); sys.exit(0)
+if re.search(r"\bTRUNCATE\b", text, re.I):
+    print("TRUNCATE"); sys.exit(0)
+sys.exit(1)
+PY
+}
+
+# 显式判定本批次是否含 migration;破坏性 DDL 默认拒绝。
+# 设置 CUTOVER_HAS_MIGRATION / CUTOVER_MIGRATION_FILES。
+gate_cutover_migrations() { # <rel>
+  local rel="$1" from_commit to_commit changed f base hit meta
+  CUTOVER_HAS_MIGRATION=0
+  CUTOVER_MIGRATION_FILES=""
+  to_commit="$(jq -er '.sourceCommit' "$rel/.complete")"
+  if [[ -L "$MASTER_LIVE_LINK" ]]; then
+    from_commit="$(jq -er '.sourceCommit' "$(readlink -f "$MASTER_LIVE_LINK")/.complete" 2>/dev/null || true)"
+  fi
+  if [[ -z "${from_commit:-}" && -f "${REPO_ROOT}/.complete" ]]; then
+    from_commit="$(jq -er '.sourceCommit' "$REPO_ROOT/.complete")"
+  fi
+  if [[ -z "${from_commit:-}" ]]; then
+    from_commit="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+  fi
+  [[ "$from_commit" =~ ^[0-9a-f]{7,40}$ ]] || die "迁移门: from_commit 非法"
+  [[ "$to_commit" =~ ^[0-9a-f]{40}$ ]] || die "迁移门: to_commit 非法"
+  if [[ "$from_commit" == "$to_commit" ]]; then
+    mlog "  迁移门: from==to ($to_commit),无 migration"
+    return 0
+  fi
+  changed="$(git -C "$REPO_ROOT" diff --name-only "$from_commit" "$to_commit" -- '**/migrations/**' || true)"
+  if [[ -z "$changed" ]]; then
+    mlog "  迁移门: $from_commit..$to_commit 无 **/migrations/** 变更"
+    return 0
+  fi
+  CUTOVER_HAS_MIGRATION=1
+  CUTOVER_MIGRATION_FILES="$changed"
+  mlog "  迁移门: HAS_MIGRATION=1 files:"
+  mlog "$changed"
+  meta="$rel/deploy/v5/release-metadata.json"
+  [[ -f "$meta" ]] || die "迁移门: 缺 $meta"
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    case "$f" in
+      packages/commercial/src/db/migrations/*.sql) ;;
+      *)
+        # claude-code-best 等其它 migrations 不走 commercial runner;仍记录但不当 requiredMigrations。
+        mlog "  迁移门: 跳过非 commercial runner 路径 $f"
+        continue
+        ;;
+    esac
+    base="$(basename "$f" .sql)"
+    jq -e --arg n "$base" '.requiredMigrations | index($n) != null' "$meta" >/dev/null \
+      || die "迁移门: $base 未列入 $meta requiredMigrations。拒绝 apply/翻转。"
+    if [[ -f "$rel/$f" ]]; then
+      if hit="$(sql_file_has_breaking_ddl "$rel/$f")"; then
+        if [[ "${OC_V5_ALLOW_BREAKING_MIGRATION:-0}" == 1 ]]; then
+          mlog "  ⚠ 破坏性 DDL 被 OC_V5_ALLOW_BREAKING_MIGRATION=1 放行: $f ($hit)"
+        else
+          die "迁移门: $f 命中破坏性 DDL($hit)。默认拒绝。确要放行设 OC_V5_ALLOW_BREAKING_MIGRATION=1(会写入日志)。"
+        fi
+      fi
+    fi
+  done <<<"$changed"
+  mlog "  ✓ 迁移门: 分类通过(含 migration 时 apply 必须与翻转同一把锁、同一窗口)"
+}
+
+resolve_cutover_release() { # uses CUTOVER_RELEASE / HEAD
+  local head cand
+  head="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+  if [[ -n "${CUTOVER_RELEASE:-}" ]]; then
+    [[ "$CUTOVER_RELEASE" == /* ]] || die "--release 必须是绝对路径"
+    [[ -d "$CUTOVER_RELEASE" && ! -L "$CUTOVER_RELEASE" ]] || die "--release 不是普通目录: $CUTOVER_RELEASE"
+    if release_dir_is_poisoned "$CUTOVER_RELEASE"; then
+      die "拒绝有毒 --release: $CUTOVER_RELEASE"
+    fi
+    printf '%s\n' "$CUTOVER_RELEASE"
+    return 0
+  fi
+  [[ -d "$MASTER_RELEASES_ROOT" ]] || die "无 releases 根: $MASTER_RELEASES_ROOT"
+  cand=""
+  while IFS= read -r cand; do
+    [[ -n "$cand" ]] || continue
+    if release_dir_is_poisoned "$cand"; then
+      continue
+    fi
+    [[ -f "$cand/.complete" ]] || continue
+    if [[ "$(jq -er '.sourceCommit' "$cand/.complete" 2>/dev/null || true)" == "$head" ]]; then
+      printf '%s\n' "$cand"
+      return 0
+    fi
+  done < <(find "$MASTER_RELEASES_ROOT" -mindepth 1 -maxdepth 1 -type d \
+    -name 'rel-*' ! -name '*.poisoned' -printf '%T@\t%p\n' | sort -nr | cut -f2-)
+  die "找不到 sourceCommit==HEAD($head) 的完整 master release。补救: 先 --build-master-only。"
+}
+
+atomic_flip_live_symlink() { # <target-abs-rel>
+  local target="$1" tmp
+  [[ "$target" == "$MASTER_RELEASES_ROOT"/rel-* ]] || die "live 目标不在 releases 根下: $target"
+  [[ -d "$target" && ! -L "$target" ]] || die "live 目标不是普通目录: $target"
+  tmp="${MASTER_LIVE_LINK}.newlink.$$"
+  rm -f -- "$tmp"
+  ln -s -- "$target" "$tmp"
+  mv -T -- "$tmp" "$MASTER_LIVE_LINK"
+}
+
+write_prev_release_file() { # <path-or-none>
+  local val="$1" tmp
+  tmp="$MASTER_RELEASES_ROOT/.prev-release.tmp.$$"
+  mkdir -p -- "$MASTER_RELEASES_ROOT"
+  printf '%s\n' "$val" >"$tmp"
+  mv -f -- "$tmp" "$MASTER_RELEASES_ROOT/.prev-release"
+}
+
+write_cutover_grace() {
+  local until_ts
+  until_ts=$(( $(date +%s) + CUTOVER_GRACE_SEC ))
+  mkdir -p -- "$(dirname -- "$CUTOVER_GRACE_FILE")"
+  printf 'until=%s\n' "$until_ts" >"$CUTOVER_GRACE_FILE"
+}
+
+backup_installed_units_for_cutover() { # stdout: backup dir
+  local ts dest
+  ts="$(date -u +%Y%m%d-%H%M%S)"
+  dest="${BREAKGLASS_ROOT}/unit-backups/pre-cutover-${ts}"
+  mkdir -p -- "$dest"
+  cp -a -- "/etc/systemd/system/${V5_UNIT}" "$dest/"
+  cp -a -- "/etc/systemd/system/${V5_EGRESS_UNIT}" "$dest/"
+  cp -a -- "${UNIT_DIR}/${V5_UNIT}" "$dest/repo-${V5_UNIT}"
+  cp -a -- "${UNIT_DIR}/${V5_EGRESS_UNIT}" "$dest/repo-${V5_EGRESS_UNIT}"
+  printf 'backup=%s\ninstalled_master=%s\ninstalled_egress=%s\n' \
+    "$dest" "/etc/systemd/system/${V5_UNIT}" "/etc/systemd/system/${V5_EGRESS_UNIT}" \
+    >"$dest/MANIFEST.txt"
+  local wd
+  wd="$(unit_template_working_directory "/etc/systemd/system/${V5_UNIT}")"
+  if [[ "$wd" != *-live ]]; then
+    mkdir -p -- "${BREAKGLASS_ROOT}/unit-backups"
+    ln -sfn -- "$dest" "${BREAKGLASS_ROOT}/unit-backups/worktree-current"
+  fi
+  printf '%s\n' "$dest"
+}
+
+dist_oc_build() { # <rel>
+  grep -o 'name="oc-build" content="[0-9a-f]\{8,32\}"' "$1/packages/web-react/dist/index.html" \
+    | grep -o '[0-9a-f]\{8,32\}' | head -1
+}
+
+run_migrations_from_release() { # <rel>
+  local rel="$1" url migration_pgoptions
+  url="$(read_env_db_url)"
+  assert_connected_db "$url"
+  [[ -d "$rel/node_modules" ]] || die "release 无 node_modules,无法跑 migration"
+  migration_pgoptions="${PGOPTIONS:+${PGOPTIONS} }-c openclaude.migration_profile=v5-selfhost"
+  ( cd "$rel" && env PGOPTIONS="$migration_pgoptions" DATABASE_URL="$url" REDIS_URL="$REDIS_URL" \
+      COMMERCIAL_ENABLED=1 COMMERCIAL_AUTO_MIGRATE=1 \
+      npx --no-install tsx packages/commercial/src/db/migrate.ts ) \
+    || die "对着 release 跑 migration 失败。不翻转。不回滚 schema。"
+}
+

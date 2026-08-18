@@ -19,9 +19,14 @@
 #   scripts/deploy-v5-selfhost.sh --deploy
 #   scripts/deploy-v5-selfhost.sh --deploy --allow-dirty --platform-from-head
 #   scripts/deploy-v5-selfhost.sh --build-master-only [--force-npm-ci]
+#   scripts/deploy-v5-selfhost.sh --cutover [--release=/abs/rel-*] [--dry-run]
 #   scripts/deploy-v5-selfhost.sh --smoke
 #   scripts/deploy-v5-selfhost.sh --status
 #   scripts/deploy-v5-selfhost.sh --bootstrap --dry-run
+#
+# --cutover 是不可分割翻转窗口(持锁 → 静态门 → 迁移门 → 备份 unit → 装 live
+# unit → grace 标记 → 原子挂 live symlink → restart egress→master → smoke)。
+# 失败就地回滚。本阶段未授权前只允许 --dry-run。
 #
 # bootstrap 之后的一次性配套(各自幂等,详见脚本内注释):
 #   scripts/selfhost-setup-host-access.sh --uid <admin_uid> --apply   宿主 SSH 通道
@@ -81,6 +86,7 @@ ALLOW_DIRTY=0
 PLATFORM_FROM_HEAD=0
 FORCE_NPM_CI=0
 MODE=""
+CUTOVER_RELEASE=""
 
 # 本实例专属发布锁。禁止复用:
 #   /var/lock/oc-v5-deploy.lock                      V5 商业版生产(deploy-v5.sh / 发布队列 / 自愈)
@@ -336,10 +342,10 @@ acquire_selfhost_deploy_lock() {
 }
 
 # --status/--smoke/--preflight 与 --dry-run 只读/轻量,不加锁,避免被发布堵住。
-# --build-master-only 持锁,避免与别人的 --deploy 撞车。
+# --build-master-only / --cutover 持锁,避免与别人的 --deploy 撞车。
 maybe_acquire_selfhost_deploy_lock() {
   case "$MODE" in
-    deploy|bootstrap|build-master-only)
+    deploy|bootstrap|build-master-only|cutover)
       [[ "$DRY" == 1 ]] && return 0
       acquire_selfhost_deploy_lock
       ;;
@@ -348,21 +354,23 @@ maybe_acquire_selfhost_deploy_lock() {
 
 usage() {
   cat <<'EOF'
-用法: scripts/deploy-v5-selfhost.sh --preflight|--bootstrap|--deploy|--build-master-only|--smoke|--status [--dry-run] [--force-env] [--allow-dirty] [--platform-from-head] [--force-npm-ci]
+用法: scripts/deploy-v5-selfhost.sh --preflight|--bootstrap|--deploy|--build-master-only|--cutover|--smoke|--status [--dry-run] [--force-env] [--allow-dirty] [--platform-from-head] [--force-npm-ci] [--release=PATH]
 
   --preflight           只读硬门(残留/端口/密钥/个人版)。任何一条不满足即非 0 退出
   --bootstrap           首次完整安装(开头跑全套 preflight)
   --deploy              更新代码后重建 release 树、重写四元组、重启服务
   --build-master-only   只建一份不可变 master rel-*(不迁库/不装 unit/不切 symlink/不重启)
+  --cutover             不可分割翻转窗口:静态门+迁移门+备份 unit+装 live+原子 symlink+重启+smoke
   --smoke               只读健康检查(含个人版回归)
   --status              打印当前状态
   --dry-run             与上述组合:打印将执行的命令,不改任何东西
+  --release=PATH        仅配合 --cutover:指定候选 rel-* 绝对路径(默认=sourceCommit 等于 HEAD 的最新完整 release)
   --allow-dirty         仅配合 --deploy:工作区有未提交改动时仍部署(默认拒绝,见 cmd_deploy 脏门)
   --platform-from-head  仅配合 --deploy/--bootstrap:平台 bundle 从 git archive 取已提交的 platform-runtime(默认仍拷工作树)
   --force-env           仅配合 --bootstrap:覆盖已存在的 env 文件
   --force-npm-ci        仅配合 --build-master-only:跳过硬链,在 staging 内冷装(测 H1)
 
-  写路径(--deploy/--bootstrap/--build-master-only,非 dry-run)会在 /run/openclaude-v5-selfhost/deploy.lock 上排队等锁,默认 2400s。
+  写路径(--deploy/--bootstrap/--build-master-only/--cutover,非 dry-run)会在 /run/openclaude-v5-selfhost/deploy.lock 上排队等锁,默认 2400s。
   覆盖: OC_V5_SELFHOST_DEPLOY_LOCK / OC_V5_SELFHOST_DEPLOY_LOCK_WAIT / OC_V5_SELFHOST_DEPLOY_LOCK_POLL
   覆盖路径同样校验(普通文件、root 所有、目录非世界可写、拒绝跟随符号链接)。
 
@@ -374,6 +382,8 @@ usage() {
   scripts/deploy-v5-selfhost.sh --deploy --allow-dirty --platform-from-head
   scripts/deploy-v5-selfhost.sh --build-master-only
   scripts/deploy-v5-selfhost.sh --build-master-only --force-npm-ci
+  scripts/deploy-v5-selfhost.sh --cutover --dry-run
+  scripts/deploy-v5-selfhost.sh --cutover --release=/opt/openclaude/openclaude-v5-selfhost-releases/rel-...
   scripts/deploy-v5-selfhost.sh --smoke
 EOF
 }
@@ -385,7 +395,8 @@ for arg in "$@"; do
     --allow-dirty) ALLOW_DIRTY=1 ;;
     --platform-from-head) PLATFORM_FROM_HEAD=1 ;;
     --force-npm-ci) FORCE_NPM_CI=1 ;;
-    --preflight|--bootstrap|--deploy|--smoke|--status|--build-master-only)
+    --release=*) CUTOVER_RELEASE="${arg#--release=}" ;;
+    --preflight|--bootstrap|--deploy|--smoke|--status|--build-master-only|--cutover)
       [[ -z "$MODE" ]] || die "只能指定一个主模式(已有 --$MODE,又收到 $arg)"
       MODE="${arg#--}"
       ;;
@@ -408,6 +419,8 @@ done
   && die "--platform-from-head 只能与 --deploy 或 --bootstrap 同用"
 [[ "$FORCE_NPM_CI" == 1 && "$MODE" != "build-master-only" ]] \
   && die "--force-npm-ci 只能与 --build-master-only 同用"
+[[ -n "$CUTOVER_RELEASE" && "$MODE" != "cutover" ]] \
+  && die "--release= 只能与 --cutover 同用"
 [[ -f "$MASTER_RELEASE_LIB" ]] || die "缺 master release lib: $MASTER_RELEASE_LIB"
 
 # 锁自测钩子:只加锁再 sleep,不碰发布路径。给并发/超时验证用,生产勿设。
@@ -1026,6 +1039,7 @@ install_unit() {
 
 install_units() {
   log "── 安装 systemd unit ──"
+  assert_unit_templates_live_wd
   install_unit "$UNIT_DIR/$V5_HOSTNET_UNIT"
   install_unit "$UNIT_DIR/$V5_SSHGATE_UNIT"
   install_unit "$UNIT_DIR/$V5_EGRESS_UNIT"
@@ -1293,91 +1307,252 @@ cmd_status() {
   done
 }
 
-# ── bootstrap / deploy ───────────────────────────────────────────────────
+# ── bootstrap / deploy / cutover ─────────────────────────────────────────
 
 cmd_bootstrap() {
-  local pass url
-  log "══ v5 selfhost bootstrap ══"
-  preflight_common
-  if own_instance_present; then
-    log "  ⚠ 检测到本实例 env/unit 已存在 → 视为重跑,跳过「残留必须为空 / 端口必须空闲」硬门(那些是防外来残留,不是防自己)。"
-  else
-    preflight_residue
-    preflight_ports_idle
-  fi
-
-  pass="$(openssl rand -hex 16)"
-  if [[ -f "$V5_ENV" && "$FORCE_ENV" != 1 ]]; then
-    url="$(read_env_db_url)"
-    [[ -n "$url" ]] || die "已有 env 但缺 DATABASE_URL"
-    log "  使用已有 env 的 DATABASE_URL(密码不打印)"
-  else
-    ensure_pg "$pass"
-    url="postgres://${PG_ROLE}:${pass}@127.0.0.1:5432/${PG_DB}"
-  fi
-
-  ensure_node_modules
-  build_frontend
-  run_migrations "$url"
-  enable_registration "$url"
-  write_env_file "$pass"
-  ensure_selfhost_env_keys
-  ensure_model_authority
-  ensure_home_config
-  ensure_worktree_complete
-  cutover_sessions_to_pg "$url"
-  run "mkdir -p '$OC_HOTCFG_RELEASES_ROOT' '$OC_HOTCFG_PLATFORM_ROOT/bundles'"
-  setup_v5_net
-  install_units
-  restart_sshgate
-
-  local sha
-  sha="$(source_commit)"
-  build_runtime_release "$sha"
-  build_platform_bundle "$sha"
-  run "systemctl enable '$V5_EGRESS_UNIT' '$V5_UNIT'"
-  activate_tuple
-  enable_now_services
-  cmd_smoke
-  log "✓ bootstrap 完成"
+  assert_old_deploy_fail_closed
 }
 
 cmd_deploy() {
-  log "══ v5 selfhost deploy ══"
-  preflight_common
-  # 脏工作区门(2026-08-16):master 直接跑本 worktree 源码(unit WorkingDirectory 即
-  # REPO_ROOT),deploy 打包的是「工作区现状」而非某个 commit —— 多会话并行开发时,
-  # 任何一次 deploy/restart 都会把树上未提交的半成品一起带上线(实例:liveTurnFrames.ts
-  # 带类型错误被别的会话差点部署)。门:git status --porcelain 必须为空;确认要带脏
-  # 部署(明白会把未提交改动一并上线)显式加 --allow-dirty。
-  if [[ "$ALLOW_DIRTY" != 1 ]]; then
-    local dirty
-    dirty="$(git -C "$REPO_ROOT" status --porcelain)"
-    if [[ -n "$dirty" ]]; then
-      die "工作区不干净(存在未提交改动),deploy 会把这些半成品一起带上线:
-$dirty
-补救: 提交或 stash 后再 deploy;确要带脏部署(明白风险)加 --allow-dirty。"
+  assert_old_deploy_fail_closed
+}
+
+cutover_clog() {
+  local msg
+  msg="$(date -u +%Y-%m-%dT%H:%M:%SZ) $*"
+  echo "$msg"
+  if [[ -n "${CUTOVER_LOG:-}" ]]; then
+    echo "$msg" >>"$CUTOVER_LOG"
+  fi
+}
+
+cutover_smoke_against_release() { # <rel>
+  local rel="$1" hz i ok=0 html spa_ok=0 expected_build got_build
+  expected_build="$(dist_oc_build "$rel")"
+  [[ -n "$expected_build" ]] || die "smoke: release dist 缺 oc-build"
+  for i in $(seq 1 30); do
+    hz="$(curl -fsS --max-time 5 "http://127.0.0.1:${V5_PORT}/healthz" 2>/dev/null || true)"
+    if echo "$hz" | jq -e '.ok==true and .runtime.controlPlaneEnabled==true and .runtime.leadership.state=="leader"' >/dev/null 2>&1; then
+      ok=1
+      break
+    fi
+    cutover_clog "  /healthz 未收敛,重试 $i/30"
+    sleep 2
+  done
+  [[ "$ok" == 1 ]] || die "cutover smoke 失败: healthz 未收敛 ok+controlPlaneEnabled+leadership=leader"
+  cutover_clog "  ✓ healthz ok + controlPlaneEnabled + leadership=leader"
+  for i in $(seq 1 15); do
+    html="$(curl -fsS --max-time 5 "http://127.0.0.1:${V5_PORT}/" 2>/dev/null || true)"
+    if echo "$html" | grep -q 'name="oc-build"'; then
+      spa_ok=1
+      break
+    fi
+    sleep 2
+  done
+  [[ "$spa_ok" == 1 ]] || die "cutover smoke: GET / 缺 oc-build"
+  got_build="$(echo "$html" | grep -o 'name="oc-build" content="[0-9a-f]\{8,32\}"' | grep -o '[0-9a-f]\{8,32\}' | head -1 || true)"
+  [[ "$got_build" == "$expected_build" ]] \
+    || die "cutover smoke: GET / oc-build=$got_build 不等于 release dist $expected_build"
+  cutover_clog "  ✓ GET / oc-build=$got_build 匹配 release dist"
+  local eg
+  eg="$(curl -fsS --max-time 5 "http://${V5_EGRESS_BIND}:${V5_EGRESS_PORT}/internal/v5/egress-health" 2>/dev/null || true)"
+  echo "$eg" | jq -e '.ok==true' >/dev/null 2>&1 \
+    || die "cutover smoke: egress-health 失败"
+  cutover_clog "  ✓ egress-health ok"
+}
+
+cutover_smoke_healthz_only() {
+  local hz i ok=0 eg
+  for i in $(seq 1 30); do
+    hz="$(curl -fsS --max-time 5 "http://127.0.0.1:${V5_PORT}/healthz" 2>/dev/null || true)"
+    if echo "$hz" | jq -e '.ok==true and .runtime.controlPlaneEnabled==true and .runtime.leadership.state=="leader"' >/dev/null 2>&1; then
+      ok=1
+      break
+    fi
+    sleep 2
+  done
+  [[ "$ok" == 1 ]] || return 1
+  eg="$(curl -fsS --max-time 5 "http://${V5_EGRESS_BIND}:${V5_EGRESS_PORT}/internal/v5/egress-health" 2>/dev/null || true)"
+  echo "$eg" | jq -e '.ok==true' >/dev/null 2>&1
+}
+
+cutover_rollback_inplace() { # <failed-rel> <backup-dir>
+  local backup="$2" prev used_tier2=0
+  cutover_clog "── 就地回滚 ──"
+  prev="$(tr -d '[:space:]' <"$MASTER_RELEASES_ROOT/.prev-release" 2>/dev/null || true)"
+  write_cutover_grace
+  if [[ -n "$prev" && "$prev" != "none" && -d "$prev" ]]; then
+    cutover_clog "  一级: 切 live symlink → $prev"
+    if atomic_flip_live_symlink "$prev"; then
+      used_tier2=0
+    else
+      cutover_clog "  一级 symlink 失败,改走二级"
+      prev=""
+    fi
+  else
+    cutover_clog "  无上一份 release,一级不可用"
+    prev=""
+  fi
+  if [[ -z "$prev" ]]; then
+    used_tier2=1
+    cutover_clog "  二级: 从 $backup 恢复工作树 unit"
+    [[ -d "$backup" ]] || die "回滚二级失败:备份目录不存在 $backup"
+    install -m 0644 "$backup/$V5_UNIT" "/etc/systemd/system/$V5_UNIT"
+    install -m 0644 "$backup/$V5_EGRESS_UNIT" "/etc/systemd/system/$V5_EGRESS_UNIT"
+    systemctl daemon-reload
+  fi
+  eval "$(egress_then_master_restart_cmd)" || true
+  if cutover_smoke_healthz_only; then
+    cutover_clog "  回滚后 healthz/egress 通过 (tier2=$used_tier2)"
+    return 0
+  fi
+  printf 'reason=cutover-rollback-smoke-failed\nwritten=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    >"$MASTER_RELEASES_ROOT/.manual-recovery-required"
+  die "回滚后 smoke 仍失败。已写 $MASTER_RELEASES_ROOT/.manual-recovery-required
+应急: export HOME=/home/agent; export PATH=\"\$HOME/.local/bin:\$PATH\"
+host '/opt/openclaude/v5-selfhost-breakglass/restore-worktree-units.sh'"
+}
+
+cmd_cutover() {
+  local rel head backup prev_val live_now expected_build step
+  mkdir -p /opt/openclaude/tmp
+  if [[ "$DRY" == 1 ]]; then
+    CUTOVER_LOG="/opt/openclaude/tmp/cutover-dry-run-$(date -u +%Y%m%d-%H%M%S).log"
+  else
+    CUTOVER_LOG="/opt/openclaude/tmp/cutover-$(date -u +%Y%m%d-%H%M%S).log"
+  fi
+  : >"$CUTOVER_LOG"
+  cutover_clog "══ v5 selfhost --cutover DRY=$DRY log=$CUTOVER_LOG ══"
+  assert_unit_templates_live_wd
+  head="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+
+  step=1
+  if [[ "$DRY" == 1 ]]; then
+    cutover_clog "STEP $step [dry-run] 持发布锁 $SELFHOST_DEPLOY_LOCK (dry-run 不加锁,避免堵住别人)"
+  else
+    cutover_clog "STEP $step 已持发布锁 $SELFHOST_DEPLOY_LOCK pid=$$"
+  fi
+
+  step=2
+  rel="$(resolve_cutover_release)"
+  cutover_clog "STEP $step 候选 release=$rel"
+  cutover_clog "  跑静态门 + digest 复算 + tsx 自检(只读,dry-run 也跑)"
+  assert_master_release_static_gate "$rel" "$head"
+  assert_master_release_tsx_selfcheck "$rel"
+  expected_build="$(dist_oc_build "$rel")"
+  cutover_clog "  dist oc-build=$expected_build"
+
+  step=3
+  cutover_clog "STEP $step 迁移门"
+  gate_cutover_migrations "$rel"
+  if [[ "$CUTOVER_HAS_MIGRATION" == 1 ]]; then
+    cutover_clog "  HAS_MIGRATION=1 → apply 与翻转必须同一把锁、同一窗口"
+    if [[ "$DRY" == 1 ]]; then
+      cutover_clog "  [dry-run] 对着 $rel 跑 migration runner(失败则不翻转,不回滚 schema)"
+    fi
+  else
+    cutover_clog "  HAS_MIGRATION=0,跳过 apply"
+  fi
+
+  live_now=""
+  if [[ -L "$MASTER_LIVE_LINK" ]]; then
+    live_now="$(readlink -f "$MASTER_LIVE_LINK" || true)"
+  fi
+  if [[ -n "$live_now" ]]; then
+    prev_val="$live_now"
+  else
+    prev_val="none"
+  fi
+
+  step=4
+  cutover_clog "STEP $step 备份当前 master+egress unit"
+  if [[ "$DRY" == 1 ]]; then
+    cutover_clog "  [dry-run] cp /etc/systemd/system/{$V5_UNIT,$V5_EGRESS_UNIT} → $BREAKGLASS_ROOT/unit-backups/pre-cutover-<ts>/"
+    if [[ "$prev_val" == "none" ]]; then
+      cutover_clog "  [dry-run] 写 .prev-release=none (首次无上一份 release,回滚只能靠恢复 unit)"
+    else
+      cutover_clog "  [dry-run] 写 .prev-release=$prev_val"
+    fi
+  else
+    backup="$(backup_installed_units_for_cutover)"
+    cutover_clog "  backup=$backup"
+    write_prev_release_file "$prev_val"
+    cutover_clog "  .prev-release=$prev_val"
+  fi
+
+  step=5
+  cutover_clog "STEP $step 装 live unit 模板 + daemon-reload"
+  if [[ "$DRY" == 1 ]]; then
+    cutover_clog "  [dry-run] install $UNIT_DIR/$V5_UNIT → /etc/systemd/system/$V5_UNIT"
+    cutover_clog "  [dry-run] install $UNIT_DIR/$V5_EGRESS_UNIT → /etc/systemd/system/$V5_EGRESS_UNIT"
+    cutover_clog "  [dry-run] systemctl daemon-reload"
+  else
+    install_unit "$UNIT_DIR/$V5_EGRESS_UNIT"
+    install_unit "$UNIT_DIR/$V5_UNIT"
+    systemctl daemon-reload
+  fi
+
+  step=6
+  cutover_clog "STEP $step 写 cutover grace 标记 $CUTOVER_GRACE_FILE (until=now+${CUTOVER_GRACE_SEC}s)"
+  if [[ "$DRY" == 1 ]]; then
+    cutover_clog "  [dry-run] printf until=<epoch> > $CUTOVER_GRACE_FILE"
+  else
+    write_cutover_grace
+  fi
+
+  if [[ "$CUTOVER_HAS_MIGRATION" == 1 ]]; then
+    cutover_clog "STEP 6b 含 migration: 当场 apply(与下一步翻转同一把锁、同一窗口)"
+    if [[ "$DRY" == 1 ]]; then
+      cutover_clog "  [dry-run] 对着 $rel 跑 migration runner(失败则不翻转,不回滚 schema)"
+    else
+      run_migrations_from_release "$rel"
     fi
   fi
-  [[ -f "$V5_ENV" ]] || die "缺 $V5_ENV,这不是更新路径。补救: 先 --bootstrap。"
-  docker network inspect openclaude-v5-net >/dev/null 2>&1 \
-    || die "openclaude-v5-net 不存在。补救: 先 --bootstrap(不要在 deploy 里建网,以免误伤残留策略)。"
-  ensure_node_modules
-  build_frontend
-  ensure_worktree_complete
-  install_units
-  # env 固定 COMMERCIAL_AUTO_MIGRATE=0,新代码要的表/列没人建。runner 靠
-  # schema_migrations 记账幂等,所以每次 deploy 都跑,且必须赶在切 tuple 重启之前。
-  run_migrations "$(read_env_db_url)"
-  # 老实例升级路径:bootstrap 时还没有这段的实例,在这里补齐 flag 与 catalog admin 角色。
-  ensure_model_authority
-  local sha
-  sha="$(source_commit)"
-  build_runtime_release "$sha"
-  build_platform_bundle "$sha"
-  activate_tuple
-  cmd_smoke
-  log "✓ deploy 完成"
+
+  step=7
+  cutover_clog "STEP $step 原子挂 live symlink $MASTER_LIVE_LINK → $rel"
+  if [[ "$DRY" == 1 ]]; then
+    cutover_clog "  [dry-run] ln -s $rel ${MASTER_LIVE_LINK}.newlink.\$\$ && mv -T ${MASTER_LIVE_LINK}.newlink.\$\$ $MASTER_LIVE_LINK"
+  else
+    atomic_flip_live_symlink "$rel"
+  fi
+
+  step=8
+  cutover_clog "STEP $step 按现有顺序重启(先 egress、等 ${V5_EGRESS_BIND}:${V5_EGRESS_PORT} 可连、再 master)"
+  if [[ "$DRY" == 1 ]]; then
+    cutover_clog "  [dry-run] $(egress_then_master_restart_cmd)"
+  else
+    eval "$(egress_then_master_restart_cmd)" \
+      || { cutover_rollback_inplace "$rel" "${backup:-missing}"; return 1; }
+  fi
+
+  step=9
+  cutover_clog "STEP $step smoke: healthz ok+controlPlaneEnabled+leader; GET / oc-build == $expected_build; egress-health"
+  if [[ "$DRY" == 1 ]]; then
+    cutover_clog "  [dry-run] curl 127.0.0.1:${V5_PORT}/healthz | jq ok+controlPlaneEnabled+leadership=leader"
+    cutover_clog "  [dry-run] curl 127.0.0.1:${V5_PORT}/ 比对 oc-build=$expected_build"
+    cutover_clog "  [dry-run] curl ${V5_EGRESS_BIND}:${V5_EGRESS_PORT}/internal/v5/egress-health"
+  else
+    if ! cutover_smoke_against_release "$rel"; then
+      cutover_rollback_inplace "$rel" "${backup:-missing}"
+      return 1
+    fi
+  fi
+
+  step=10
+  cutover_clog "STEP $step 失败则自己就地回滚(本步仅在失败路径执行)"
+  if [[ "$DRY" == 1 ]]; then
+    cutover_clog "  [dry-run] 一级: 若 .prev-release 合法则 mv -T live 回切 + restart + smoke"
+    cutover_clog "  [dry-run] 二级: 无上一份或一级失败 → 从备份恢复 master+egress unit + daemon-reload + restart"
+    cutover_clog "  [dry-run] 回滚后再失败 → 写 $MASTER_RELEASES_ROOT/.manual-recovery-required 并大声退出"
+  fi
+
+  if [[ "$DRY" == 1 ]]; then
+    cutover_clog "✓ --cutover --dry-run 执行计划结束(未改 unit / 未切 symlink / 未重启 / 未迁库)"
+    cutover_clog "  log=$CUTOVER_LOG"
+    return 0
+  fi
+  cutover_clog "✓ --cutover 完成 live → $rel"
 }
 
 case "$MODE" in
@@ -1385,6 +1560,7 @@ case "$MODE" in
   bootstrap) cmd_bootstrap ;;
   deploy) cmd_deploy ;;
   build-master-only) cmd_build_master_only ;;
+  cutover) cmd_cutover ;;
   smoke) cmd_smoke ;;
   status) cmd_status ;;
   *) die "内部错误:未知 MODE=$MODE" ;;

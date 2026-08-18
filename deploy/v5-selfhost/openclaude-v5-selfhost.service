@@ -1,5 +1,6 @@
 [Unit]
 # v5 本机自用实例 —— 与个人版 openclaude.service 隔离,不触碰 kl-mirror 生产。
+# WorkingDirectory 必须指向 -live symlink(不可变 rel-*),禁止改回 git 工作树。
 Description=OpenClaude Gateway (v5 selfhost)
 After=network.target postgresql.service redis-server.service docker.service openclaude.service
 Wants=postgresql.service redis-server.service docker.service
@@ -7,12 +8,12 @@ Wants=postgresql.service redis-server.service docker.service
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/opt/openclaude/openclaude-v5-selfhost
+WorkingDirectory=/opt/openclaude/openclaude-v5-selfhost-live
 EnvironmentFile=/etc/openclaude/commercial-v5-selfhost.env
 Environment="PATH=/root/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 Environment="OPENCLAUDE_HOME=/root/.openclaude-v5-selfhost"
 Environment="NODE_ENV=production"
-Environment="OC_V3_CCB_BASELINE_DIR=/opt/openclaude/openclaude-v5-selfhost/packages/commercial/agent-sandbox/ccb-baseline"
+Environment="OC_V3_CCB_BASELINE_DIR=/opt/openclaude/openclaude-v5-selfhost-live/packages/commercial/agent-sandbox/ccb-baseline"
 ExecStart=/usr/bin/npx tsx packages/cli/src/index.ts gateway
 Restart=on-failure
 RestartSec=5

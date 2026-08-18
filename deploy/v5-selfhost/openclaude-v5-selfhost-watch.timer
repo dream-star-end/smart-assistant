@@ -1,0 +1,12 @@
+[Unit]
+Description=OpenClaude v5 selfhost health watch timer (every 30s)
+After=network.target
+
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=30
+AccuracySec=5
+Unit=openclaude-v5-selfhost-watch.service
+
+[Install]
+WantedBy=timers.target

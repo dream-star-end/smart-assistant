@@ -1,0 +1,8 @@
+[Unit]
+Description=OpenClaude v5 selfhost watch alert for %i
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/opt/openclaude/v5-selfhost-watch/alert.sh %i
