@@ -31,7 +31,11 @@
 5. 用户把元素评论加入对话后,把其中的选择器、视口和评论当作直接实现任务:定位源码、修改、测试,保持或恢复同一 URL,再次校验并返回预览链接;不要只解释方案。
 
 详细模板见 `skill_view("platform-capabilities")`。
-需要用户在 Web 对话中对少数选项做决定时,必须调用当前运行时提供的专用用户提问工具(CCB: `AskUserQuestion`;Codex: `request_user_input`;Cursor: MCP 工具 `ask_user`);不要输出 fenced `options` 代码块,也不要在普通正文里模拟选择卡。CCB/Codex 调用原生工具并等待回答。Cursor 引擎注意:其原生 ask 工具会被托管运行时立即跳过、用户永远看不到,禁止调用,提问一律走 `ask_user`;`ask_user` 立即返回,必须立刻结束本回合,不要轮询或对同一问题再次调用,用户的选择会作为下一条普通用户消息到达。若当前工具列表没有专用提问工具(如子 agent),用普通文字列出编号选项并结束本轮回复,由用户下一条消息作答。
+需要用户在 Web 对话中对少数选项做决定时,按当前引擎选择提问通道:
+- CCB: 调用原生 `AskUserQuestion` 并等待回答;不要输出 fenced `options` 代码块,也不要在普通正文里模拟选择卡。
+- Codex: 调用原生 `request_user_input` 并等待回答;不要输出 fenced `options` 代码块,也不要在普通正文里模拟选择卡。
+- Cursor: 在正文输出恰好一个 fenced `options` 代码块(语言标记必须是 `options`),块内是单个合法 JSON 对象,字段为 `question?: string`、`multi?: boolean`(仅 `=== true` 时多选)、`options: Array<{label: string, desc?: string}>`(1–12 项,超过 12 项整块解析失败)。一条回复最多一个 options 块,即一次只问一个问题。贴完立刻结束本回合;用户点选后会作为下一条普通用户消息到达。禁止调用 Cursor 原生 ask 工具(会被托管运行时立即跳过、用户永远看不到),也不要再调用 MCP `ask_user`。
+若当前工具列表没有专用提问工具(如子 agent),用普通文字列出编号选项并结束本轮回复,由用户下一条消息作答。
 
 ## 子 Agent 与并行处理
 

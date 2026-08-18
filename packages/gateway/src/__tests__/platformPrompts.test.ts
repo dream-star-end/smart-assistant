@@ -314,12 +314,15 @@ describe('fallback 常量 === bundle 文件(逐字同步门)', () => {
     assert.ok(!prompt.includes('Agent 工具 spawn 子 agent'))
     assert.ok(!prompt.includes('子 agent 会继承你的全部工具和上下文'))
   })
-  it('选择题使用运行时专用 Ask 工具，不再把 options 富块当交互入口', () => {
+  it('选择题:CCB/Codex 走原生 Ask 工具,Cursor 走正文 options 围栏', () => {
     const prompt = _platformPromptFallbacks.PLATFORM_CAPABILITIES_FALLBACK
     assert.ok(prompt.includes('AskUserQuestion'))
     assert.ok(prompt.includes('request_user_input'))
     assert.ok(prompt.includes('不要输出 fenced `options` 代码块'))
     assert.ok(prompt.includes('并等待回答'))
+    assert.ok(prompt.includes('一条回复最多一个 options 块'))
+    assert.ok(prompt.includes('也不要再调用 MCP `ask_user`'))
+    assert.ok(!prompt.includes('提问一律走 `ask_user`'))
   })
   it('原生容器网站预览 SOP 覆盖常驻 prompt、Codex 基线与平台 skill', () => {
     const sources = {

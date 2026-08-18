@@ -1606,10 +1606,15 @@ setInterval(() => {}, 1000);
     }
     assert.equal(_internals.toolNameOf(other as never), 'mcp__openclaude-memory__skill_search')
 
-    // preamble 必须把 ask_user 指认为 cursor 的提问通道。
+    // preamble 必须把正文 options 围栏指认为 cursor 的提问通道,且不再引导 ask_user。
     assert.ok(
+      _internals.CURSOR_PREAMBLE.includes('fenced `options`'),
+      'preamble must point cursor at the inline options fence',
+    )
+    assert.equal(
       _internals.CURSOR_PREAMBLE.includes('`ask_user`'),
-      'preamble must point cursor at the ask_user MCP tool',
+      false,
+      'preamble must not advertise ask_user',
     )
   })
 
