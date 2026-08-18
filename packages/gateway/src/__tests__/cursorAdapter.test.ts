@@ -938,6 +938,23 @@ for(const e of [
     assert.equal(env.PATH, '/run/oc/platform/current/bin:/usr/local/bin:/usr/bin:/bin')
     assert.equal(env.OC_AGENT_ID, 'main')
     assert.equal(env.OC_SESSION_KEY, 'agent:main:webchat:dm:test')
+    assert.equal(env.OPENCLAUDE_DELEGATION_DEPTH, undefined)
+    assert.equal(env.OPENCLAUDE_GATEWAY_TOKEN, undefined)
+  })
+
+  test('attachCursorGatewayRouting injects context file, not gateway bearer or depth', () => {
+    const env = _internals.buildCursorSpawnEnv('main', 'agent:main:webchat:dm:test')
+    _internals.attachCursorGatewayRouting(env, {
+      gatewayPort: 18789,
+      contextFile: '/tmp/openclaude-cursor-context-test/delegate-context',
+    })
+    assert.equal(env.OPENCLAUDE_GATEWAY_PORT, '18789')
+    assert.equal(env.OPENCLAUDE_DELEGATE_CONTEXT_FILE, '/tmp/openclaude-cursor-context-test/delegate-context')
+    assert.equal(env.OPENCLAUDE_ENGINE, 'cursor')
+    assert.equal(env.OPENCLAUDE_GATEWAY_TOKEN_FILE, undefined)
+    assert.equal(env.OPENCLAUDE_GATEWAY_TOKEN, undefined)
+    assert.equal(env.OPENCLAUDE_DELEGATION_DEPTH, undefined)
+    assert.equal(env.OPENCLAUDE_AGENT_ID, undefined)
   })
 
   test('forwards core-memory embedding env when present and omits missing keys', () => {

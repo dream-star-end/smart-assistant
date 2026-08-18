@@ -34,6 +34,26 @@ export function gatewayAuthHeaders(): Record<string, string> {
   }
 }
 
+/** Opaque per-turn caller binding. Identity is inside the token; env must not override it. */
+export const DELEGATE_CONTEXT_HEADER = 'x-openclaude-delegate-context'
+
+export function readDelegateContextTokenFromFile(env: NodeJS.ProcessEnv = process.env): string {
+  const file = env.OPENCLAUDE_DELEGATE_CONTEXT_FILE
+  if (!file) return ''
+  try {
+    return readFileSync(file, 'utf8').trim()
+  } catch {
+    return ''
+  }
+}
+
+export function gatewayDelegateHeaders(env: NodeJS.ProcessEnv = process.env): Record<string, string> {
+  const headers = gatewayAuthHeaders()
+  const token = readDelegateContextTokenFromFile(env)
+  if (token) headers[DELEGATE_CONTEXT_HEADER] = token
+  return headers
+}
+
 /**
  * node:http surfaces the real transport failure on `err.code` (ECONNREFUSED,
  * ECONNRESET, socket timeout…). Fold the code into the message so delegation

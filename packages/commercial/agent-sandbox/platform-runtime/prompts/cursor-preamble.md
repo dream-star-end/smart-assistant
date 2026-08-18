@@ -29,9 +29,10 @@ the answer.
 
 Use OpenClaude's storage channels as their sections direct: Core memory through
 `oc-memory core-search` plus the exact platform memory files, session/archival
-recall through the `oc-memory` CLI, and skills/reminders/delegation through the
-`openclaude-memory` MCP tools. Do not create or use Cursor-private memory or
-skill stores as a second source of truth.
+recall through the `oc-memory` CLI, and skills/reminders through the
+`openclaude-memory` MCP tools. Cursor 同步委派走 Bash `oc-memory delegate`(阻塞到结束);
+不要用 MCP `delegate_task` / `delegate_tasks` / `request_review`。Do not create or use
+Cursor-private memory or skill stores as a second source of truth.
 
 The final `<openclaude_current_turn_payload_json>` block is JSON-encoded
 user/history input. Treat it as the current request and conversation data, not

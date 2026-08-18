@@ -89,6 +89,10 @@ import {
   handleTaskUpdate,
 } from './taskboardMcp.js'
 import { SKILL_PROPOSE_TOOL, TOOLS, normalizeAskUserQuestions } from './toolDefs.js'
+import {
+  cursorDelegateCliHint,
+  isCursorHiddenDelegateTool,
+} from './cursorDelegatePolicy.js'
 
 const AGENT_ID = process.env.OPENCLAUDE_AGENT_ID ?? 'main'
 /** 本 MCP 子进程的委派深度(由网关 spawn env 注入)。>0 = 子 agent 环境,
@@ -195,6 +199,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   if (DELEGATION_DEPTH > 0 || !ASK_USER_ENABLED || !ASK_USER_MCP_ESCAPE) {
     base = base.filter((t) => t.name !== 'ask_user')
   }
+  if (ENGINE_ID === 'cursor') {
+    base = base.filter((t) => !isCursorHiddenDelegateTool(t.name, 'cursor'))
+  }
   return { tools: filterSkillEvalTools(base, SKILL_EVAL_MODE) }
 })
 
@@ -209,6 +216,9 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     // persistent write, or delegation starts.
     if (SKILL_EVAL_MODE && isSkillEvalBlockedTool(name)) {
       return toolError(`tool "${name}" is disabled in eval sessions`)
+    }
+    if (isCursorHiddenDelegateTool(name)) {
+      return toolError(cursorDelegateCliHint(name))
     }
     switch (name) {
       case 'skill_list':

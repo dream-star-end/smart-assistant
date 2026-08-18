@@ -383,6 +383,8 @@ const OC_SURFACES: Record<string, Record<string, Probe>> = {
     'archival-search': memoryProbe(['archival-search'], /archival-search requires/),
     'archival-delete': memoryProbe(['archival-delete'], /archival-delete requires/),
     'delegate-wait': memoryProbe(['delegate-wait'], /delegate-wait requires/),
+    delegate: memoryProbe(['delegate'], /OPENCLAUDE_DELEGATE_CONTEXT_FILE|delegate requires/),
+    'request-review': memoryProbe(['request-review'], /OPENCLAUDE_DELEGATE_CONTEXT_FILE|request-review requires/),
     'memory.retired': memoryProbe(['memory'], /子命令已退役/),
   },
   'oc-minimax': {

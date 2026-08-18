@@ -78,6 +78,10 @@ import {
   classifyDelegateOutputError,
   classifyRunError,
 } from './errorClassify.js'
+import {
+  DELEGATE_CONTEXT_HEADER,
+  verifyDelegateContextToken,
+} from './delegateContext.js'
 import { ContainerPreviewHandler } from './containerPreview.js'
 import {
   PROMPT_QUEUE_DISPATCH_CANCEL_TYPE,
@@ -3576,7 +3580,9 @@ export class Gateway {
     // v3 file proxy: HOST gateway → container /api/file or /api/media via docker bridge
     // bypasses checkHttpAuth if all four conditions hold (see checkBridgeBypass).
     const bridgeVerified = needsAuth ? this.checkBridgeBypass(req, url) : false
-    if (needsAuth && !bridgeVerified && !this.checkHttpAuth(req)) {
+    const delegateAuthedByContext =
+      this._isDelegateHttpPath(url.pathname) && this._hasValidDelegateContext(req)
+    if (needsAuth && !bridgeVerified && !this.checkHttpAuth(req) && !delegateAuthedByContext) {
       res.writeHead(401, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ error: 'unauthorized' }))
       return
@@ -5362,6 +5368,16 @@ export class Gateway {
     )
     const cookieToken = cookies.oc_session || ''
     return authHeader || protoToken || cookieToken
+  }
+
+  private _isDelegateHttpPath(pathname: string): boolean {
+    return pathname === '/api/delegate/wait' || /^\/api\/agents\/[^/]+\/delegate$/.test(pathname)
+  }
+
+  private _hasValidDelegateContext(req: IncomingMessage): boolean {
+    const raw = req.headers[DELEGATE_CONTEXT_HEADER]
+    const token = Array.isArray(raw) ? raw[0] : raw
+    return typeof token === 'string' && verifyDelegateContextToken(token) !== null
   }
 
   private checkHttpAuth(req: IncomingMessage): boolean {
@@ -9982,7 +9998,23 @@ export class Gateway {
     const modelNorm = parseDelegateModel(parsed.model)
     if (!modelNorm.ok) return this.sendError(res, 400, modelNorm.error)
     const depthHeader = req.headers['x-delegation-depth']
-    const depth = depthHeader ? Number.parseInt(String(depthHeader), 10) : 0
+    const contextHeader = req.headers[DELEGATE_CONTEXT_HEADER]
+    const contextRaw = Array.isArray(contextHeader) ? contextHeader[0] : contextHeader
+    const boundContext =
+      typeof contextRaw === 'string' && contextRaw.trim()
+        ? verifyDelegateContextToken(contextRaw)
+        : null
+    if (typeof contextRaw === 'string' && contextRaw.trim() && !boundContext) {
+      return this.sendError(res, 401, 'invalid delegate context')
+    }
+    if (parsed.async === true && !boundContext) {
+      return this.sendError(res, 401, 'async delegate requires delegate context')
+    }
+    const depth = boundContext
+      ? boundContext.depth
+      : depthHeader
+        ? Number.parseInt(String(depthHeader), 10)
+        : 0
     // P2 批次4 — effort 仅接受 low/medium/high(delegate schema enum),其余(含缺省/非法)
     // → undefined,不动子会话默认档位。防御性白名单(body 非 typebox 校验)。
     const effort =
@@ -9994,9 +10026,16 @@ export class Gateway {
     // 委派执行核心与 HTTP req/res 解耦(P2 债C),让 gateway 硬编排 review pass
     // (dispatchInbound)能内部直调同一委派路径拿到结构化结果(verdict/output),
     // 无需伪造 req/res。
-    const parentSessionKey =
-      typeof parsed.parentSessionKey === 'string' ? parsed.parentSessionKey : undefined
-    const sourceAgentId = typeof sourceAgent === 'string' ? sourceAgent : undefined
+    const parentSessionKey = boundContext
+      ? boundContext.sessionKey
+      : typeof parsed.parentSessionKey === 'string'
+        ? parsed.parentSessionKey
+        : undefined
+    const sourceAgentId = boundContext
+      ? boundContext.agentId
+      : typeof sourceAgent === 'string'
+        ? sourceAgent
+        : undefined
     // 同步 preflight:mint/resume/占用必须在任何 await 和创建 async job 之前完成,
     // 这样 running 响应已经带着权威 sessionKey,并发 resume 也能立刻 409。
     const resume = (this._delegateResume ??= new DelegateResumeRegistry()).preflight({
@@ -15612,15 +15651,15 @@ export class Gateway {
         '- 你是队长，也是完成用户任务的第一负责人；从任务拆解、是否委派到最终答复，都由你端到端负责。',
         '- 领域匹配优先于泛泛并行：用户任务明显属于某个已安装成员的领域时，优先把对应部分委派给该成员；多领域任务则拆给对应成员后由你综合。常见路由：代码/调试/测试/重构/代码库 → `coding-assistant`；科研/文献/论文/引用/学术分析 → `research-assistant`；文档/PPT/Excel/PDF/周报/公文/邮件/办公交付 → `office-assistant`。如果对应成员未安装，你可以自己完成或选择最接近的已安装成员。',
         '- 需要多个成员协作的复杂任务：先用 `TodoWrite` 列出一份简明的拆解计划（每一步派给谁、预期产出什么），再照计划委派；简单任务无需列计划，直接做即可。',
-        '- 任务复杂、可拆解 → **首选**用 `delegate_task(goal, agentId, context)` 委派子任务给上面列出的已安装成员组队，拿到各成员结果后你综合成给用户的最终答案；任务简单则直接自己完成。',
-        '- 多个**互相独立、可同时进行**的子任务 → 用 `delegate_tasks`（tasks 列表，单次最多 4 个）一次性并行派发，比逐个 `delegate_task` 更快拿齐结果；若子任务之间有先后依赖（B 要用到 A 的产出），仍用 `delegate_task` 分步串行。',
+        '- 任务复杂、可拆解 → **首选**同步委派给上面列出的已安装成员组队，拿到各成员结果后你综合成给用户的最终答案；任务简单则直接自己完成。CCB/Codex 用 MCP `delegate_task(goal, agentId, context)`；Cursor 用 Bash `oc-memory delegate --goal "..."`（阻塞到结束，不要走 MCP）。',
+        '- 多个**互相独立、可同时进行**的子任务 → CCB/Codex 用 `delegate_tasks`（tasks 列表，单次最多 4 个）；Cursor 在同一回合并发多条 `oc-memory delegate`。若子任务之间有先后依赖（B 要用到 A 的产出），仍串行。',
         '- 按子任务量级选 `effort`：机械/简单子任务填 `low`，常规填 `medium`，攻坚/高难度填 `high`；拿不准就不填（用该成员默认档位），不要把简单活儿也开到 `high` 徒增开销与耗时。',
         '- 成员的大产物（完整代码/长文档/数据文件）会以「文件路径 + 摘要」的形式回传（大产物落在共享目录 `/home/agent/.openclaude/generated/`）；你综合最终答案时，需要完整内容就用 `Read` 按回传的路径读回来，别只凭摘要臆测。',
-        '- 委派**只走 `delegate_task` / `delegate_tasks`**：这是平台唯一的组队/委派通道（有实时进度回传、计费与资源约束）。平台已停用 codex 原生 `Agent`/子进程编排，不存在这样的工具，不要尝试启动；需要拆分的子任务一律用这两个工具，不确定或不适合委派时就自己完成。',
+        '- 委派只走平台通道（有实时进度回传、计费与资源约束）：CCB/Codex 用 MCP `delegate_task` / `delegate_tasks`；Cursor 用 Bash `oc-memory delegate`（MCP `delegate_task` 在 Cursor 上已关闭）。平台已停用 codex 原生 `Agent`/子进程编排，不要尝试启动；不确定或不适合委派时就自己完成。',
         // 队长自主送审(2026-07-07 boss 裁决):审查触发权在队长,prompt 纪律强引导
         // "除明显简单任务外都送审"。平台侧保证 = request_review 通道 + hidden guard
         // 熔断(≤3/turn)+ 团队门;不再有 gateway 硬编排兜底(已整体退役)。
-        '- 质量审查（重要纪律）：写给用户的最终答复**之前**，先用 `request_review(draft)` 把准备提交的完整答复草稿送独立审查员——**草稿只放在工具参数里，不要先写进正文**。除非任务明显简单（单一事实问答、寒暄、无实质交付物），否则都必须送审。拿到 `VERDICT: PASS` 再输出最终答复；`NEEDS_FIX` 就修订草稿后再送审一次（对误报可在修订说明中据理反驳）。审查是内部流程：最终答复不要复述审查意见、不要致歉。送审有每轮次数上限，达到上限时直接输出你当前最优的最终答复。',
+        '- 质量审查（重要纪律）：写给用户的最终答复**之前**，先把准备提交的完整答复草稿送独立审查员——**草稿只放在工具/命令参数里，不要先写进正文**。CCB/Codex 用 MCP `request_review(draft)`；Cursor 用 `oc-memory request-review --draft "..."`。除非任务明显简单（单一事实问答、寒暄、无实质交付物），否则都必须送审。拿到 `VERDICT: PASS` 再输出最终答复；`NEEDS_FIX` 就修订草稿后再送审一次（对误报可在修订说明中据理反驳）。审查是内部流程：最终答复不要复述审查意见、不要致歉。送审有每轮次数上限，达到上限时直接输出你当前最优的最终答复。',
         '',
         '用户任务：',
         '',

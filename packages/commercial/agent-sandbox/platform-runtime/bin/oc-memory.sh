@@ -4,7 +4,7 @@
 # session_search / archival_* 工具 —— 常驻 stdio 传输脆弱(被 console 污染 / 崩溃即死 →
 # codex 死等 turn 被掐),一次性进程无传输可死。memdir 范式后 Core 记忆改为直接 Write/Edit
 # 写 MEMORY.md 索引 + memory/*.md 文件,`memory` 子命令已退役(调用只打印迁移提示)。
-# delegate / cron / skill 工具仍留 MCP。文档见 memory-management baseline skill。
+# cron / skill 仍留 MCP。Cursor 同步委派走本 CLI 的 delegate / request-review / delegate-wait。
 #
 # 快路径:release/image 构建期把 ocMemoryCli.ts 打成 packages/mcp-memory/dist/oc-memory.cjs,
 # 本壳 exec /usr/local/bin/node(镜像自带,约几十 ms)。产物不能放进 platform bundle:

@@ -12,6 +12,11 @@ import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 
 import { DelegateJobStore } from '../delegateJobs.js'
+import {
+  DELEGATE_CONTEXT_HEADER,
+  issueDelegateContextToken,
+  resetDelegateContextKeyForTests,
+} from '../delegateContext.js'
 import { Gateway, PerTurnDelegationGuard } from '../server.js'
 
 const PARENT_KEY = 'agent:main:webchat:dm:wsess-async-delegate'
@@ -84,8 +89,23 @@ async function call(
   method: 'handleDelegateTask' | 'handleDelegateWait',
   body: Record<string, unknown>,
   targetAgentId = 'coding-assistant',
+  headers: Record<string, string> = {},
+  opts: { autoContext?: boolean } = {},
 ): Promise<{ status: number; body: any }> {
-  const req: any = { method: 'POST', headers: {} }
+  const reqHeaders = { ...headers }
+  if (
+    method === 'handleDelegateTask' &&
+    body.async === true &&
+    opts.autoContext !== false &&
+    !reqHeaders[DELEGATE_CONTEXT_HEADER]
+  ) {
+    reqHeaders[DELEGATE_CONTEXT_HEADER] = issueDelegateContextToken({
+      agentId: 'main',
+      sessionKey: PARENT_KEY,
+      depth: 0,
+    })
+  }
+  const req: any = { method: 'POST', headers: reqHeaders }
   gw.readBody = async () => JSON.stringify(body)
   let status = 0
   let raw = ''
@@ -329,5 +349,78 @@ describe('handleDelegateTask model override', () => {
     })
     assert.equal(r.status, 200)
     assert.equal(gw._submitted[0].model, undefined)
+  })
+
+  it('signed context overrides forged sourceAgent/depth/parentSessionKey', async () => {
+    resetDelegateContextKeyForTests()
+    const gw = makeGateway(true)
+    const token = issueDelegateContextToken({
+      agentId: 'main',
+      sessionKey: PARENT_KEY,
+      depth: 2,
+    })
+    const seen: any[] = []
+    const orig = gw._runDelegateTask?.bind(gw)
+    gw._runDelegateTask = async (input: any) => {
+      seen.push(input)
+      return { kind: 'ok', output: 'x', sessionKey: input.sessionKey }
+    }
+    const r = await call(
+      gw,
+      'handleDelegateTask',
+      {
+        goal: 'forged',
+        sourceAgent: 'coding-assistant',
+        parentSessionKey: 'forged-parent',
+        async: true,
+      },
+      'coding-assistant',
+      { [DELEGATE_CONTEXT_HEADER]: token, 'x-delegation-depth': '0' },
+    )
+    assert.equal(r.status, 200)
+    assert.equal(typeof r.body.jobId, 'string')
+    assert.equal(seen.length, 1)
+    assert.equal(seen[0].sourceAgent, 'main')
+    assert.equal(seen[0].depth, 2)
+    assert.equal(seen[0].parentSessionKey, PARENT_KEY)
+    void orig
+  })
+
+  it('async without context is 401 even if the caller could present a bearer', async () => {
+    const gw = makeGateway(true)
+    let ran = 0
+    gw._runDelegateTask = async () => {
+      ran += 1
+      return { kind: 'ok', output: 'x' }
+    }
+    const r = await call(
+      gw,
+      'handleDelegateTask',
+      { goal: 'x', sourceAgent: 'main', parentSessionKey: PARENT_KEY, async: true },
+      'coding-assistant',
+      {},
+      { autoContext: false },
+    )
+    assert.equal(r.status, 401)
+    assert.match(String(r.body.error || r.body), /delegate context/)
+    assert.equal(ran, 0)
+  })
+
+  it('invalid signed context is 401 and does not start a job', async () => {
+    const gw = makeGateway(true)
+    let ran = 0
+    gw._runDelegateTask = async () => {
+      ran += 1
+      return { kind: 'ok', output: 'x' }
+    }
+    const r = await call(
+      gw,
+      'handleDelegateTask',
+      { goal: 'x', sourceAgent: 'main', parentSessionKey: PARENT_KEY, async: true },
+      'coding-assistant',
+      { [DELEGATE_CONTEXT_HEADER]: 'not-a-token' },
+    )
+    assert.equal(r.status, 401)
+    assert.equal(ran, 0)
   })
 })

@@ -44,6 +44,8 @@ test('oc-memory covers help, retired Core, Recall and all Archival operations', 
       'archival-search',
       'archival-delete',
       'delegate-wait',
+      'delegate',
+      'request-review',
     ]) {
       assert.match(result.stdout, new RegExp(command))
     }
@@ -51,6 +53,10 @@ test('oc-memory covers help, retired Core, Recall and all Archival operations', 
     result = await runCli(home, ['delegate-wait'])
     assert.equal(result.code, 1)
     assert.match(result.stderr, /delegate-wait requires at least one/)
+
+    result = await runCli(home, ['delegate'])
+    assert.equal(result.code, 1)
+    assert.match(result.stderr, /OPENCLAUDE_DELEGATE_CONTEXT_FILE/)
 
     result = await runCli(home, ['memory', '--action', 'read'])
     assert.equal(result.code, 2)

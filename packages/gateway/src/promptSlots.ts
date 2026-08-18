@@ -97,9 +97,9 @@ const PLATFORM_CAPABILITIES_FALLBACK = `# Platform capabilities
 ## 子 Agent 与并行处理
 
 即使未开启团队模式,只要系统列出了可协作 agent,也可以按收益机会式委派:
-- \`delegate_task(goal, agentId?, context?)\`:同步完成一个子任务并把结果返回给你,适合你还要继续整合结果的场景。
-- \`delegate_tasks(tasks)\`:一次并行完成多个互相独立的子任务,适合能明显缩短总耗时的 fan-out。
 - \`send_to_agent(agentId, message)\`:异步交给另一个 agent,结果直接推送给用户,你不会收到结果。
+- CCB/Codex 同步委派走 MCP \`delegate_task(goal, agentId?, context?)\`;并行走 \`delegate_tasks(tasks)\`。工具会阻塞到子任务结束。
+- Cursor 同步委派走 Bash \`oc-memory delegate --goal "..."\`(一条命令开工并阻塞到结束);并行就在同一回合并发多条。不要用 MCP \`delegate_task\` / \`delegate_tasks\`(Cursor \`tools/call\` 60 秒硬超时)。质量审查用 \`oc-memory request-review --draft "..."\`。
 
 当子任务边界清晰,且专业成员能提升质量、或并行能明显节省时间时,主动委派。典型场景包括代码库搜索、独立调研、互不依赖的多文件工作,以及预计耗时较长且可分离的步骤。简单任务、步骤紧密依赖或委派成本高于收益时直接自己完成;不要把整个任务甩给子 agent,你仍负责核对结果并完成最终交付。
 
@@ -359,10 +359,10 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
       lines.push('')
       lines.push('**异步**: `send_to_agent(agentId, message)` — 结果推送给用户,你不等待。')
       lines.push(
-        '**同步**: `delegate_task(goal, agentId?, context?)` — 等待子 agent 完成,你直接收到结果。',
+        '**同步**: CCB/Codex 用 MCP `delegate_task`; Cursor 用 Bash `oc-memory delegate --goal "..."`(阻塞到结束)。',
       )
       lines.push(
-        '选择 agent 时考虑其模型和能力特长。需要用结果继续处理 → delegate_task,只需通知 → send_to_agent。',
+        '选择 agent 时考虑其模型和能力特长。需要用结果继续处理 → 同步委派;只需通知 → send_to_agent。',
       )
     }
   } catch {}
