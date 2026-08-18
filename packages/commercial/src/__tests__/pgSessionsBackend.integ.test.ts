@@ -4418,6 +4418,58 @@ describe("durable live turn frame journal", () => {
     assert.equal(second.converged, 0);
   });
 
+  maybe("hides leftover live journals whose client_message_id already has a completed tape", async () => {
+    const sessionId = "s-live-frame-completed-cmid-hide";
+    const userId = "c:926";
+    const sessionKey = "agent:main:webchat:dm:s-live-frame-completed-cmid-hide";
+    const tapeId = "e".repeat(64);
+    const leftoverCmid = "ask-ans-completed-cmid";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    await pool.query(
+      `INSERT INTO client_session_turn_tapes
+         (session_id,user_id,tape_id,agent_id,turn_index,status,turn_key,tape_sha256,
+          total_bytes,part_count,created_at,finalized_at,client_message_id)
+       VALUES ($1,$2,$3,'main',1,'completed',$4,$5,10,1,1,1,$6)`,
+      [sessionId, userId, tapeId, "f".repeat(64), "0".repeat(64), leftoverCmid],
+    );
+    await pool.query(
+      `INSERT INTO client_session_live_streams
+         (stream_key,session_id,user_id,client_message_id,source,projection_source,terminal_status)
+       VALUES ($1,$2,$3,$4,'gateway','live','interrupted')`,
+      [`legacy:26:${sessionKey}`, sessionId, userId, leftoverCmid],
+    );
+    await pool.query(
+      `INSERT INTO client_session_live_frames
+         (stream_key,source,agent_container_id,session_key,frame_seq,payload,payload_sha256)
+       VALUES ($1,'gateway',26,$2,811,$3,$4)`,
+      [
+        `legacy:26:${sessionKey}`,
+        sessionKey,
+        Buffer.from(JSON.stringify({
+          type: "outbound.error",
+          code: "upstream_failed",
+          clientMessageId: leftoverCmid,
+        })),
+        "a".repeat(64),
+      ],
+    );
+    const before = await readClientSessionLiveFrames(pool, sessionId, userId, 0, 10);
+    assert.ok(before);
+    assert.equal(before.frames.length, 0);
+    assert.deepEqual(before.streamClientMessageIds, []);
+    const first = await convergeFinalizedTapeLiveStreams(pool);
+    assert.equal(first.converged, 1);
+    const state = await pool.query(
+      `SELECT projection_source,tape_id FROM client_session_live_streams
+        WHERE session_id=$1 AND user_id=$2`,
+      [sessionId, userId],
+    );
+    assert.equal(state.rows[0]?.projection_source, "tape");
+    assert.equal(state.rows[0]?.tape_id, tapeId);
+    const second = await convergeFinalizedTapeLiveStreams(pool);
+    assert.equal(second.converged, 0);
+  });
+
   maybe("keeps later dispatches and server-authored frames durable after a frame sequence restart", async () => {
     const sessionId = "s-live-frame-sequence-reset";
     const userId = "c:903";

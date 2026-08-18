@@ -2125,7 +2125,36 @@ export function applyCallUsage(sess: ChatSession, frame: OutboundCallUsageWire):
 }
 
 // ═══════════════ outbound.error 双帧（§11）═══════════════
+/**
+ * Leftover live-journal `outbound.error` after a turn (or a later turn) already
+ * completed on tape. Hydrate/replay would otherwise append a phantom red card
+ * at the end of a finished session. Never suppress the active in-flight turn.
+ */
+export function shouldSuppressStaleOutboundError(sess: ChatSession, frame: OutboundErrorWire): boolean {
+  const cmid = typeof frame.clientMessageId === "string" && frame.clientMessageId
+    ? frame.clientMessageId
+    : undefined;
+  if (cmid && sess._activeClientMessageId === cmid) return false;
+  const isCompletedTapeAssistant = (m: ChatSession["messages"][number]) =>
+    m.role === "assistant" && m._turnTapeComplete === true && !m._errorCode;
+  if (cmid && sess.messages.some((m) => m._clientMessageId === cmid && isCompletedTapeAssistant(m))) {
+    return true;
+  }
+  if (sess._sendingInFlight) return false;
+  if (!cmid) {
+    return sess.messages.some(isCompletedTapeAssistant);
+  }
+  const userIdx = sess.messages.findIndex((m) => m.role === "user" && m.id === cmid);
+  if (userIdx < 0) {
+    return sess.messages.some(isCompletedTapeAssistant);
+  }
+  return sess.messages.slice(userIdx + 1).some((m) =>
+    (m.role === "user" && m.id !== cmid) || isCompletedTapeAssistant(m),
+  );
+}
+
 export function applyOutboundError(sess: ChatSession, frame: OutboundErrorWire, effects: FrameEffects = {}): void {
+  if (shouldSuppressStaleOutboundError(sess, frame)) return;
   if (typeof frame.frameSeq === "number" && frame.frameSeq > 0) {
     if (!acceptFrameSeq(sess, frame)) return;
     sess._suppressErrorBubbleAtSeq = frame.frameSeq + 1;

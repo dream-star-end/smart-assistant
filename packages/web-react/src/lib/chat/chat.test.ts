@@ -37,6 +37,7 @@ import {
   applyCostWaived,
   applyLegacyBridgeError,
   applyOutboundError,
+  shouldSuppressStaleOutboundError,
   applyOutboundMessage,
   applyPermissionRequest,
   applyPermissionSettled,
@@ -2853,6 +2854,54 @@ describe("applyOutboundError double-frame suppression (§11)", () => {
       _clientMessageId: older.id,
       _errorDetail: "",
     });
+  });
+
+  test("hydrate leftover outbound.error after a later completed tape → no phantom red card", () => {
+    const s = sess();
+    const older = addMessage(s, "user", "older", { status: "sent", ts: 1 });
+    addMessage(s, "assistant", "older reply", { _clientMessageId: older.id, _turnTapeComplete: true, ts: 2 });
+    const later = addMessage(s, "user", "later", { status: "sent", ts: 3 });
+    addMessage(s, "assistant", "later reply", { _clientMessageId: later.id, _turnTapeComplete: true, ts: 4 });
+    s._sendingInFlight = false;
+    s._activeClientMessageId = undefined;
+    const persistSession = vi.fn();
+    applyOutboundError(s, {
+      type: "outbound.error",
+      sessionKey: "k",
+      channel: "webchat",
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId: older.id,
+      code: "upstream_failed",
+      message: "任务执行暂时中断，你的消息已保留，可直接重试。",
+      detail: "API Error: 502",
+      isFinal: false,
+    } as never, { persistSession });
+    expect(s.messages.filter((m) => m._errorCode)).toHaveLength(0);
+    expect(persistSession).not.toHaveBeenCalled();
+    expect(shouldSuppressStaleOutboundError(s, {
+      type: "outbound.error",
+      clientMessageId: older.id,
+      code: "upstream_failed",
+    } as never)).toBe(true);
+  });
+
+  test("late outbound.error after the same turn's tape completed → no red card", () => {
+    const s = sess();
+    const user = addMessage(s, "user", "hi", { status: "sent", ts: 1 });
+    addMessage(s, "assistant", "done", { _clientMessageId: user.id, _turnTapeComplete: true, ts: 2 });
+    s._sendingInFlight = false;
+    s._activeClientMessageId = undefined;
+    applyOutboundError(s, {
+      type: "outbound.error",
+      sessionKey: "k",
+      channel: "webchat",
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId: user.id,
+      code: "upstream_failed",
+      message: "任务执行暂时中断，你的消息已保留，可直接重试。",
+      isFinal: false,
+    } as never);
+    expect(s.messages.filter((m) => m._errorCode)).toHaveLength(0);
   });
 
   test("legacy bridge error 无 final：本地收尾后立即 persist false", () => {

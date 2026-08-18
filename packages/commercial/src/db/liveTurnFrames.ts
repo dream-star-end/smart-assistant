@@ -255,10 +255,23 @@ export async function readClientSessionLiveFrames(
       client_message_id: string | null;
       projection_source: "live" | "tape";
       retired: boolean;
+      superseded_by_completed_tape: boolean;
       tape_projection_version: string | number;
     }>(
       `SELECT client_message_id,projection_source,
               (provenance ? 'retired_at') AS retired,
+              (
+                client_message_id IS NOT NULL
+                AND EXISTS (
+                  SELECT 1
+                    FROM client_session_turn_tapes t
+                   WHERE t.session_id=client_session_live_streams.session_id
+                     AND t.user_id=client_session_live_streams.user_id
+                     AND t.client_message_id=client_session_live_streams.client_message_id
+                     AND t.status='completed'
+                     AND t.finalized_at IS NOT NULL
+                )
+              ) AS superseded_by_completed_tape,
               COUNT(*) FILTER (WHERE projection_source='tape')
                 OVER ()::text AS tape_projection_version
          FROM client_session_live_streams
@@ -268,7 +281,7 @@ export async function readClientSessionLiveFrames(
     );
     const streamClientMessageIds = [...new Set(
       streams.rows
-        .filter((row) => row.projection_source === "live" && !row.retired)
+        .filter((row) => row.projection_source === "live" && !row.retired && !row.superseded_by_completed_tape)
         .map((row) => row.client_message_id)
         .filter((value): value is string => typeof value === "string" && value.length > 0),
     )];
@@ -301,6 +314,18 @@ export async function readClientSessionLiveFrames(
            ) f
           WHERE s.user_id=$2 AND s.session_id=$1
             AND s.projection_source='live'
+            AND NOT (
+              s.client_message_id IS NOT NULL
+              AND EXISTS (
+                SELECT 1
+                  FROM client_session_turn_tapes t
+                 WHERE t.session_id=s.session_id
+                   AND t.user_id=s.user_id
+                   AND t.client_message_id=s.client_message_id
+                   AND t.status='completed'
+                   AND t.finalized_at IS NOT NULL
+              )
+            )
           ORDER BY f.record_id
           LIMIT $4`,
         [sessionId, userId, cursor, pageSize + 1],
@@ -383,7 +408,7 @@ export async function reconcileLiveStreamWithFinalTape(
  * are never touched.
  */
 export async function convergeFinalizedTapeLiveStreams(pool: Pool): Promise<{ converged: number }> {
-  const result = await pool.query(
+  const byDispatch = await pool.query(
     `UPDATE client_session_live_streams s
         SET projection_source='tape',
             terminal_status=t.status,
@@ -398,7 +423,35 @@ export async function convergeFinalizedTapeLiveStreams(pool: Pool): Promise<{ co
         AND s.source='gateway' AND s.projection_source='live'
       RETURNING s.stream_key`,
   );
-  return { converged: result.rowCount ?? 0 };
+  // Leftover legacy:* journals keep projection_source='live' after their
+  // client_message_id already has a completed tape (no dispatch_id, so the
+  // statement above never sees them). Cold-start hydrate then replays stale
+  // outbound.error onto finished sessions. Flip those rows to tape so the
+  // live read path and prune can treat the tape as authority.
+  const byCompletedCmid = await pool.query(
+    `UPDATE client_session_live_streams s
+        SET projection_source='tape',
+            terminal_status=t.status,
+            tape_id=t.tape_id,
+            tape_sha256=t.tape_sha256,
+            updated_at=NOW()
+       FROM (
+         SELECT DISTINCT ON (session_id, user_id, client_message_id)
+                session_id, user_id, client_message_id, status, tape_id, tape_sha256
+           FROM client_session_turn_tapes
+          WHERE status='completed'
+            AND finalized_at IS NOT NULL
+            AND client_message_id IS NOT NULL
+          ORDER BY session_id, user_id, client_message_id, finalized_at DESC
+       ) t
+      WHERE s.session_id=t.session_id
+        AND s.user_id=t.user_id
+        AND s.client_message_id=t.client_message_id
+        AND s.source='gateway'
+        AND s.projection_source='live'
+      RETURNING s.stream_key`,
+  );
+  return { converged: (byDispatch.rowCount ?? 0) + (byCompletedCmid.rowCount ?? 0) };
 }
 
 export async function importRolloutLiveFrames(
