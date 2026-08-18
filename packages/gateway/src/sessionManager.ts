@@ -722,6 +722,13 @@ export interface AgentSession {
    * 完成前仍留在 sessions map。无票 inbound 取样到此标记则不得沿用其 model。
    */
   _replacing?: boolean
+  /**
+   * Set immediately before a platform-initiated runner.shutdown()
+   * (deploy shutdownAll / destroySession / retireKeepResume / LRU).
+   * handleExit/handleError then persist SERVICE_RESTART (yellow/waived)
+   * instead of RUNNER_CRASHED (red). Unexpected crashes leave this unset.
+   */
+  _plannedTeardown?: "service_restart"
   /** Platform-executed exchanges not yet observed in master history. A
    * transient master-sink failure can durably queue the assistant row while
    * the very next user turn arrives first; this session-local tail keeps that
@@ -1773,6 +1780,20 @@ export class SessionManager {
       return false
     }
     return true
+  }
+
+  private markPlannedServiceRestart(session: AgentSession): void {
+    session._plannedTeardown = "service_restart"
+  }
+
+  /** Deploy/container recycle/SIGTERM → SERVICE_RESTART. Real crash stays RUNNER_CRASHED. */
+  private shouldClassifyExitAsServiceRestart(
+    session: AgentSession,
+    info?: { signal: string | null },
+  ): boolean {
+    if (session._plannedTeardown === "service_restart") return true
+    if (this.isRuntimeRecycleDraining()) return true
+    return info?.signal === "SIGTERM"
   }
 
   /**
@@ -5646,8 +5667,13 @@ export class SessionManager {
         // All unexpected runner failures share one recovery-facing code.  The
         // immutable detail still preserves the concrete transport/process
         // error, while the Master can make one deterministic retry decision.
-        const persistence = requestTerminalPersistence?.('crashed', err.message, 'RUNNER_CRASHED')
-          ?? Promise.resolve()
+        const planned = this.shouldClassifyExitAsServiceRestart(session)
+        const persistence = requestTerminalPersistence?.(
+          planned ? 'interrupted' : 'crashed',
+          err.message,
+          planned ? 'SERVICE_RESTART' : 'RUNNER_CRASHED',
+          planned ? 'no_response' : undefined,
+        ) ?? Promise.resolve()
         this._trackPersistence(persistence)
       }
 
@@ -5682,8 +5708,16 @@ export class SessionManager {
               : info.code
                 ? `子进程异常退出 (code ${info.code})`
                 : '子进程意外退出'
-            const status: 'interrupted' | 'crashed' = info.signal ? 'interrupted' : 'crashed'
-            void (persistTerminalSnapshot?.(status, reason, 'RUNNER_CRASHED') ?? Promise.resolve())
+            const planned = this.shouldClassifyExitAsServiceRestart(session, info)
+            const status: 'interrupted' | 'crashed' =
+              planned || info.signal ? 'interrupted' : 'crashed'
+            void (persistTerminalSnapshot?.(
+              status,
+              reason,
+              planned ? 'SERVICE_RESTART' : 'RUNNER_CRASHED',
+              true,
+              planned ? 'no_response' : undefined,
+            ) ?? Promise.resolve())
               .finally(resolveFlush)
           }, 150)
         })
@@ -5961,6 +5995,7 @@ export class SessionManager {
     if (s) {
       // (跨 turn stdout 路由收在 adapter 内:session 引用被删后 adapter → turn
       //  闭包链整体可 GC,无需再显式卸 'message' listener。)
+      this.markPlannedServiceRestart(s)
       await s.runner.shutdown()
       // A1:底座已停产出,flush 折叠 tail 的 pending 并清定时器/状态(await 持久化链)。
       await this._flushTailFolding(s)
@@ -6000,6 +6035,7 @@ export class SessionManager {
     const s = this.sessions.get(sessionKey)
     if (s) {
       try {
+        this.markPlannedServiceRestart(s)
         await s.runner.shutdown()
       } catch (err) {
         log.warn('retireKeepResume shutdown failed', { sessionKey }, err)
@@ -6059,7 +6095,10 @@ export class SessionManager {
         )
       }
     }
-    await Promise.all([...this.sessions.values()].map((s) => s.runner.shutdown()))
+    await Promise.all([...this.sessions.values()].map((s) => {
+      this.markPlannedServiceRestart(s)
+      return s.runner.shutdown()
+    }))
     await Promise.all(muxReleases.map((fn) => fn()))
     // A1:底座已全部停产出,flush 各 session 折叠 tail 的 pending(其持久化随后被
     // awaitPendingPersistence 一并排空)。
@@ -6128,6 +6167,7 @@ export class SessionManager {
             if (!s) continue
             // 先 await shutdown 完成(SIGTERM+SIGKILL 链走完),再清状态
             try {
+              this.markPlannedServiceRestart(s)
               await s.runner.shutdown()
             } catch {}
             // A1:底座已停产出,flush 折叠 tail 的 pending 并清定时器/状态。

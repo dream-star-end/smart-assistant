@@ -1457,7 +1457,7 @@ describe("crash/interrupt partial persistence", () => {
     }
   });
 
-  test("interrupt(signal)→ status='interrupted'", async () => {
+  test("interrupt(SIGTERM)→ SERVICE_RESTART waived yellow, not RUNNER_CRASHED red", async () => {
     const captured = makeCapturingSink();
     setV3MasterSinkSingleton(captured.sink);
     try {
@@ -1478,9 +1478,66 @@ describe("crash/interrupt partial persistence", () => {
 
       assert.equal(captured.payloads.length, 1);
       assert.equal(captured.payloads[0].status, "interrupted");
-      assert.equal(captured.payloads[0].errorCode, "RUNNER_CRASHED");
+      assert.equal(captured.payloads[0].errorCode, "SERVICE_RESTART");
+      assert.equal(captured.payloads[0].waiveReason, "no_response");
       assert.equal(captured.payloads[0].text, "stopped midway");
       assert.ok(events.some((e) => e.kind === "error" && e.error.includes("SIGTERM")));
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("planned teardown SIGKILL → SERVICE_RESTART", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const events: SessionStreamEvent[] = [];
+      const runner = new FakeCcbRunner((r) => {
+        setImmediate(() => {
+          r.text("killed after grace");
+          r.emitExit({ code: null, signal: "SIGKILL", crashed: true });
+        });
+      });
+      const session = makeSession(runner, {
+        channel: "webchat",
+        userId: "user-1",
+      } as Partial<AgentSession>);
+      session._plannedTeardown = "service_restart";
+
+      await runOneTurn(sm, session, events);
+
+      assert.equal(captured.payloads.length, 1);
+      assert.equal(captured.payloads[0].status, "interrupted");
+      assert.equal(captured.payloads[0].errorCode, "SERVICE_RESTART");
+      assert.equal(captured.payloads[0].waiveReason, "no_response");
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("unplanned SIGKILL stays RUNNER_CRASHED", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const events: SessionStreamEvent[] = [];
+      const runner = new FakeCcbRunner((r) => {
+        setImmediate(() => {
+          r.text("oom");
+          r.emitExit({ code: null, signal: "SIGKILL", crashed: true });
+        });
+      });
+      const session = makeSession(runner, {
+        channel: "webchat",
+        userId: "user-1",
+      } as Partial<AgentSession>);
+
+      await runOneTurn(sm, session, events);
+
+      assert.equal(captured.payloads.length, 1);
+      assert.equal(captured.payloads[0].status, "interrupted");
+      assert.equal(captured.payloads[0].errorCode, "RUNNER_CRASHED");
     } finally {
       setV3MasterSinkSingleton(null);
     }
