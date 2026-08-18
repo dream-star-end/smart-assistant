@@ -57,6 +57,54 @@ describe("OptionsBlock", () => {
     expect(screen.getByText(/此会话中不可交互/)).toBeTruthy();
   });
 
+  it("trailing junk still renders clickable option cards and keeps leftover text", () => {
+    const sendUserText = vi.fn();
+    const leftover = "这四条是刚才三个子任务里 typecheck 命令的回执";
+    const code = single + leftover;
+    render(
+      <ChatInteractionContext.Provider value={{ sendUserText }}>
+        <OptionsBlock code={code} />
+      </ChatInteractionContext.Provider>,
+    );
+    expect(screen.getByText("选一个部署方式?")).toBeTruthy();
+    expect(screen.getByText(leftover)).toBeTruthy();
+    expect(document.querySelector("pre")).toBeNull();
+    fireEvent.click(screen.getByText("灰度发布"));
+    expect(sendUserText).toHaveBeenCalledWith("我选择:灰度发布");
+  });
+
+  it("keeps valid pure JSON click-to-send behavior unchanged", () => {
+    const sendUserText = vi.fn();
+    render(
+      <ChatInteractionContext.Provider value={{ sendUserText }}>
+        <OptionsBlock code={single} />
+      </ChatInteractionContext.Provider>,
+    );
+    expect(screen.queryByText("这四条是刚才三个子任务里 typecheck 命令的回执")).toBeNull();
+    fireEvent.click(screen.getByText("全量发布"));
+    expect(sendUserText).toHaveBeenCalledWith("我选择:全量发布");
+  });
+
+  it("does not truncate a label that contains a closing brace", () => {
+    const sendUserText = vi.fn();
+    const code = JSON.stringify({
+      question: "选哪个?",
+      options: [
+        { label: '含}括号的选项', desc: "desc 里也有 }" },
+        { label: "普通" },
+      ],
+    });
+    render(
+      <ChatInteractionContext.Provider value={{ sendUserText }}>
+        <OptionsBlock code={code} />
+      </ChatInteractionContext.Provider>,
+    );
+    expect(screen.getByText("含}括号的选项")).toBeTruthy();
+    expect(screen.getByText("desc 里也有 }")).toBeTruthy();
+    fireEvent.click(screen.getByText("含}括号的选项"));
+    expect(sendUserText).toHaveBeenCalledWith("我选择:含}括号的选项");
+  });
+
   it("busy disables clicking", () => {
     const sendUserText = vi.fn();
     render(

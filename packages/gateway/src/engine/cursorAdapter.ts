@@ -1518,7 +1518,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
       throw err
     }
   }
-  private emitText(ctx: TurnCtx, kind: 'text' | 'thinking', value: unknown): void {
+  private emitText(ctx: TurnCtx, kind: 'text' | 'thinking', value: unknown, separate = false): void {
     const valueText = textOf(value); if (!valueText) return
     const segments = kind === 'text' ? ctx.assistantSegments : ctx.thinkingSegments
     const segmentClosed = kind === 'text' ? ctx.assistantSegmentClosed : ctx.thinkingSegmentClosed
@@ -1528,10 +1528,15 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
       else ctx.thinkingSegmentClosed = false
     }
     const segment = segments.at(-1)!
-    segment.text += valueText
-    if (kind === 'text') ctx.assistantText += valueText; else ctx.thinkingText += valueText
+    // Complete assistant events (separate=true) need a block boundary so a
+    // closing fence is not glued to the next paragraph. Partial deltas never
+    // pass separate, so intra-message token joins stay byte-identical.
+    const glue = separate && kind === 'text' && segment.text.length > 0 && !segment.text.endsWith('\n') ? '\n\n' : ''
+    const appended = glue + valueText
+    segment.text += appended
+    if (kind === 'text') ctx.assistantText += appended; else ctx.thinkingText += appended
     const messageIdBase = kind === 'text' ? ctx.params.assistantMessageId : ctx.params.thinkingMessageId
-    ctx.params.onEvent({ kind: 'block', block: { kind, text: valueText, ...(messageIdBase ? { messageId: `${messageIdBase}-s${segment.index}` } : {}) } })
+    ctx.params.onEvent({ kind: 'block', block: { kind, text: appended, ...(messageIdBase ? { messageId: `${messageIdBase}-s${segment.index}` } : {}) } })
   }
   private handleLine(ctx: TurnCtx, line: string): void {
     let event: CursorEvent
@@ -1554,7 +1559,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
       const partialDelta = officialNested && typeof event.timestamp_ms === 'number' && event.model_call_id === undefined
       if (partialDelta && value === ctx.assistantPartialText && ctx.assistantPartialText) ctx.pendingAssistantText = value
       else if (partialDelta) { ctx.assistantPartialText += value; this.emitText(ctx, 'text', value) }
-      else { if (value !== ctx.assistantPartialText) this.emitText(ctx, 'text', value); ctx.assistantPartialText = '' }
+      else { if (value !== ctx.assistantPartialText) this.emitText(ctx, 'text', value, true); ctx.assistantPartialText = '' }
       return
     }
     if (type === 'text' || type === 'assistant_delta') { this.emitText(ctx, 'text', event.text ?? event.content ?? event.delta); return }

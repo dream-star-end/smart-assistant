@@ -94,11 +94,46 @@ interface OptionItem {
   desc?: string;
 }
 
+function extractFirstJsonObject(source: string): { json: string; rest: string } | null {
+  const start = source.search(/\S/);
+  if (start < 0 || source[start] !== "{") return null;
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = start; i < source.length; i++) {
+    const ch = source[i]!;
+    if (inString) {
+      if (escape) {
+        escape = false;
+        continue;
+      }
+      if (ch === "\\") {
+        escape = true;
+        continue;
+      }
+      if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === "{") depth += 1;
+    else if (ch === "}") {
+      depth -= 1;
+      if (depth === 0) return { json: source.slice(start, i + 1), rest: source.slice(i + 1) };
+    }
+  }
+  return null;
+}
+
 function parseOptionsBlock(
   code: string,
-): { question?: string; multi: boolean; options: OptionItem[] } | null {
+): { question?: string; multi: boolean; options: OptionItem[]; trailing: string } | null {
   try {
-    const raw = JSON.parse(code) as Record<string, unknown>;
+    const extracted = extractFirstJsonObject(code);
+    if (!extracted) return null;
+    const raw = JSON.parse(extracted.json) as Record<string, unknown>;
     if (!raw || typeof raw !== "object" || !Array.isArray(raw.options)) return null;
     const options: OptionItem[] = [];
     for (const o of raw.options as unknown[]) {
@@ -113,6 +148,7 @@ function parseOptionsBlock(
       question: typeof raw.question === "string" ? raw.question : undefined,
       multi: raw.multi === true,
       options,
+      trailing: extracted.rest.trim() ? extracted.rest.trim() : "",
     };
   } catch {
     return null; // 流式半截 / 非法 JSON → 调用方回退源码
@@ -181,6 +217,7 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
     sendUserText?.(`我选择:${labels.join("、")}`);
   };
   return (
+    <>
     <div className="my-1.5 flex flex-col gap-1.5 rounded-xl border border-border bg-surface p-2.5 not-prose">
       {parsed.question && <p className="px-1 text-[13px] font-medium text-fg">{parsed.question}</p>}
       <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
@@ -234,6 +271,10 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
       )}
       {!readOnly && !sendUserText && <p className="px-1 text-[11px] text-faint">(此会话中不可交互)</p>}
     </div>
+    {parsed.trailing ? (
+      <p className="whitespace-pre-wrap text-[13px] leading-relaxed text-fg">{parsed.trailing}</p>
+    ) : null}
+    </>
   );
 }
 
