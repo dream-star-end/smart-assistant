@@ -165,28 +165,88 @@ describe("OptionsBlock in a multi-question message (group mode)", () => {
     expect(sendUserText).toHaveBeenCalledWith("我选择:轻松");
   });
 
-  it("live streaming: single block click does not send; after live ends it does", () => {
+  it("live streaming single block: clickable, no implicit send, footer submits aggregate text", () => {
     const sendUserText = vi.fn();
-    const ui = (live?: boolean) => (
+    render(
       <ChatInteractionContext.Provider value={{ sendUserText }}>
-        <OptionsGroupProvider live={live}>
+        <OptionsGroupProvider live>
           <OptionsBlock code={single} />
           <OptionsGroupFooter />
         </OptionsGroupProvider>
-      </ChatInteractionContext.Provider>
+      </ChatInteractionContext.Provider>,
     );
-    const { rerender } = render(ui(true));
     const opt = screen.getByText("灰度发布").closest("button") as HTMLButtonElement;
-    expect(opt.disabled).toBe(true);
-    expect(opt.getAttribute("title")).toBe("生成中");
-    expect(screen.getByText("生成中")).toBeTruthy();
+    expect(opt.disabled).toBe(false);
+    expect(opt.getAttribute("title")).toBeNull();
+    expect(screen.queryByText("生成中")).toBeNull();
     fireEvent.click(opt);
     expect(sendUserText).not.toHaveBeenCalled();
-    expect(screen.queryByText("发送选择")).toBeNull();
-    rerender(ui(false));
-    fireEvent.click(screen.getByText("灰度发布"));
-    expect(sendUserText).toHaveBeenCalledWith("我选择:灰度发布");
+    expect(opt.className).toContain("bg-accent-soft");
+    expect(screen.getByText(/已作答/).textContent).toMatch(/1\s*\/\s*1/);
+    const sendBtn = screen.getByText("发送选择") as HTMLButtonElement;
+    expect(sendBtn.disabled).toBe(false);
+    fireEvent.click(sendBtn);
     expect(sendUserText).toHaveBeenCalledTimes(1);
+    const sentText = sendUserText.mock.calls[0][0] as string;
+    expect(sentText).toContain("我的选择:");
+    expect(sentText).toContain("选一个部署方式?:灰度发布");
+    expect(screen.getByText(/已发送全部选择/)).toBeTruthy();
+    fireEvent.click(screen.getByText("全量发布"));
+    expect(sendUserText).toHaveBeenCalledTimes(1);
+  });
+
+  it("live streaming multi-block: at least 1 answer can submit, unanswered marked 未答", () => {
+    const sendUserText = vi.fn();
+    render(
+      <ChatInteractionContext.Provider value={{ sendUserText }}>
+        <OptionsGroupProvider live>
+          <OptionsBlock code={q1} />
+          <OptionsBlock code={q2} />
+          <OptionsGroupFooter />
+        </OptionsGroupProvider>
+      </ChatInteractionContext.Provider>,
+    );
+    const opt = screen.getByText("正式").closest("button") as HTMLButtonElement;
+    expect(opt.disabled).toBe(false);
+    fireEvent.click(opt);
+    expect(sendUserText).not.toHaveBeenCalled();
+    const answered = screen.getByText(/已作答/).textContent ?? "";
+    expect(answered).toContain("1");
+    expect(answered).toContain("2");
+    const sendBtn = screen.getByText("发送选择") as HTMLButtonElement;
+    expect(sendBtn.disabled).toBe(false);
+    fireEvent.click(sendBtn);
+    expect(sendUserText).toHaveBeenCalledTimes(1);
+    const sentText = sendUserText.mock.calls[0][0] as string;
+    expect(sentText).toContain("我的选择:");
+    expect(sentText).toContain("风格?:正式");
+    expect(sentText).toContain("输出?:(未答)");
+    expect(screen.getByText(/已发送全部选择/)).toBeTruthy();
+    fireEvent.click(screen.getByText("轻松"));
+    fireEvent.click(screen.getByText("要点"));
+    expect(sendUserText).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("发送选择")).toBeNull();
+  });
+
+  it("live streaming stays clickable even when session busy", () => {
+    const sendUserText = vi.fn();
+    render(
+      <ChatInteractionContext.Provider value={{ sendUserText, busy: true }}>
+        <OptionsGroupProvider live>
+          <OptionsBlock code={single} />
+          <OptionsGroupFooter />
+        </OptionsGroupProvider>
+      </ChatInteractionContext.Provider>,
+    );
+    const opt = screen.getByText("灰度发布").closest("button") as HTMLButtonElement;
+    expect(opt.disabled).toBe(false);
+    fireEvent.click(opt);
+    expect(sendUserText).not.toHaveBeenCalled();
+    const sendBtn = screen.getByText("发送选择") as HTMLButtonElement;
+    expect(sendBtn.disabled).toBe(false);
+    fireEvent.click(sendBtn);
+    expect(sendUserText).toHaveBeenCalledTimes(1);
+    expect(sendUserText.mock.calls[0][0]).toContain("我的选择:");
   });
 
   it("partial answers can be submitted with 未答 marker and then lock", () => {
