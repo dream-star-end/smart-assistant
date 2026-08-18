@@ -280,6 +280,20 @@ describe("OptionsBlock in a multi-question message (group mode)", () => {
     expect(screen.queryByText("发送选择")).toBeNull();
   });
 
+  it("live with zero registered blocks does not render empty 0/0 footer", () => {
+    const sendUserText = vi.fn();
+    render(
+      <ChatInteractionContext.Provider value={{ sendUserText }}>
+        <OptionsGroupProvider live>
+          <OptionsGroupFooter />
+        </OptionsGroupProvider>
+      </ChatInteractionContext.Provider>,
+    );
+    expect(screen.queryByText("发送选择")).toBeNull();
+    expect(screen.queryByText(/已作答/)).toBeNull();
+    expect(sendUserText).not.toHaveBeenCalled();
+  });
+
   it("non-streaming single block still click-to-sends 我选择:<label> with no footer (regression)", () => {
     const sendUserText = vi.fn();
     render(

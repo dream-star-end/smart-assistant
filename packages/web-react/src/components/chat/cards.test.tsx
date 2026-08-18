@@ -350,6 +350,23 @@ describe("AssistantCard options 多题聚合", () => {
     return "```options\n" + JSON.stringify(payload) + "\n```";
   }
 
+  test("流式正文尚无 options 块时不渲染空页脚", async () => {
+    const sendUserText = vi.fn();
+    render(
+      <ChatInteractionContext.Provider value={{ sendUserText, busy: true }}>
+        <AssistantCard
+          msg={{ id: "a-opt-empty-live", role: "assistant", text: "正在分析部署顺序…", ts: 1 } as ChatMessage}
+          ctx={{ isLast: true, sending: true, inActiveTurn: true }}
+          cb={{}}
+        />
+      </ChatInteractionContext.Provider>,
+    );
+    expect(await screen.findByText("正在分析部署顺序…")).toBeTruthy();
+    expect(screen.queryByText("发送选择")).toBeNull();
+    expect(screen.queryByText(/已作答/)).toBeNull();
+    expect(sendUserText).not.toHaveBeenCalled();
+  });
+
   test("单块保持点击即发,不出现组页脚", async () => {
     const sendUserText = vi.fn();
     const text = fence({

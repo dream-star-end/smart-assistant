@@ -148,8 +148,9 @@ export function OptionsGroupFooter() {
     );
     return `我的选择:\n${lines.join("\n")}`;
   }, [snap]);
-  // 流式期即使只有 1 块也必须出页脚(禁止点击即发);非流式单块不渲染。
-  const showFooter = !!snap && (snap.count >= 2 || snap.live);
+  // 没有已解析的 options 块时不渲染空页脚(避免思考过程出现「已作答 0/0」)。
+  // 流式期只要有 ≥1 块就必须出页脚(禁止点击即发);非流式只在 ≥2 块时出页脚。
+  const showFooter = !!snap && snap.count >= 1 && (snap.live || snap.count >= 2);
   if (!store || !snap || !showFooter || !sendUserText) return null;
   if (snap.sent)
     return <p className="mt-1.5 text-[11.5px] text-faint">已发送全部选择。</p>;
