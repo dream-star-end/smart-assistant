@@ -136,7 +136,7 @@ done
 [ "$#" -gt 0 ] || die "a prompt is required"
 
 case "$model" in
-  ""|cursor-grok-4.6-high|composer-2.5-fast|claude-opus-5-thinking-high|\
+  ""|cursor-grok-4.6-high|cursor-grok-4.6-high-fast|composer-2.5-fast|claude-opus-5-thinking-high|\
   claude-fable-5-thinking-high|cursor-grok-4.5-high) ;;
   *) die "model is not allowlisted" ;;
 esac

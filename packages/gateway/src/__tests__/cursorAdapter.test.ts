@@ -1199,6 +1199,7 @@ console.log(JSON.stringify({type:'result',subtype:'success',is_error:false}));
     const models: Array<[string, string | null]> = [
       ['cursor-auto', null],
       ['cursor-grok-4.6-high', 'cursor-grok-4.6-high'],
+      ['cursor-grok-4.6-high-fast', 'cursor-grok-4.6-high-fast'],
       ['cursor-composer-2.5-fast', 'composer-2.5-fast'],
       ['cursor-opus-5-high', 'claude-opus-5-thinking-high'],
       ['cursor-fable-5-high', 'claude-fable-5-thinking-high'],

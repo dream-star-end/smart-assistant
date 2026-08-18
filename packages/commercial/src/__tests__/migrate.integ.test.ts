@@ -206,6 +206,7 @@ describe("migrate.runMigrations", () => {
       { model_id: "cursor-fable-5-high", upstream_model_id: "claude-fable-5-thinking-high", state: "active", enabled: true, visibility: "hidden" },
       { model_id: "cursor-grok-4.5-high", upstream_model_id: "cursor-grok-4.5-high", state: "active", enabled: true, visibility: "hidden" },
       { model_id: "cursor-grok-4.6-high", upstream_model_id: "cursor-grok-4.6-high", state: "active", enabled: true, visibility: "hidden" },
+      { model_id: "cursor-grok-4.6-high-fast", upstream_model_id: "cursor-grok-4.6-high-fast", state: "active", enabled: true, visibility: "hidden" },
       { model_id: "cursor-opus-5-high", upstream_model_id: "claude-opus-5-thinking-high", state: "active", enabled: true, visibility: "hidden" },
     ]);
   });

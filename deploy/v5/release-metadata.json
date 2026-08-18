@@ -97,7 +97,8 @@
     "0215_deepseek_flash_opencode_canonical",
     "0216_kimi_k3_256k",
     "0217_stage_zai_glm53",
-    "0218_public_zai_glm53"
+    "0218_public_zai_glm53",
+    "0220_cursor_grok_46_high_fast"
   ],
   "capabilities": [
     "sessions-store-pg-v1",
