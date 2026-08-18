@@ -2,13 +2,13 @@ import { Archive, Columns3 } from 'lucide-react'
 import { type DragEvent, type ReactNode, useEffect, useRef, useState } from 'react'
 import type { BoardColumn, Ticket } from '../../lib/taskboard'
 import { cn } from '../../lib/utils'
-import { EmptyState } from '../ui'
+import { Badge, EmptyState } from '../ui'
 import { TicketCard } from './TicketCard'
 import {
   BACKLOG_DROP_ID,
   allowedDropIds,
   dropIdForMove,
-  moveOptionLabel,
+  homeDropId,
   stageIdFromDropId,
 } from './ticketMove'
 
@@ -18,20 +18,48 @@ export function BoardColumns({
   onOpenTicket,
   renderActions,
   onMove,
+  ticketTypeLabel,
 }: {
   columns: BoardColumn[]
   backlogTickets?: Ticket[]
   onOpenTicket?: (ticket: Ticket) => void
   renderActions?: (ticket: Ticket) => ReactNode
   onMove?: (ticket: Ticket, toStageId: string | null) => void
+  ticketTypeLabel?: string
 }) {
   const [dragging, setDragging] = useState<Ticket | null>(null)
   const [hoverDropId, setHoverDropId] = useState<string | null>(null)
+  const overflowCleanup = useRef<(() => void) | null>(null)
+  const [overflow, setOverflow] = useState({ left: false, right: false })
 
   const allowed = dragging ? allowedDropIds(dragging) : null
-  const stageNameById = new Map<string, string>(
-    columns.map((col) => [col.stage.id, col.stage.name]),
-  )
+  const originDropId = dragging ? homeDropId(dragging) : null
+
+  const scrollerRef = (el: HTMLDivElement | null) => {
+    overflowCleanup.current?.()
+    overflowCleanup.current = null
+    if (!el) return
+    const update = () => {
+      const max = el.scrollWidth - el.clientWidth
+      const next = {
+        left: el.scrollLeft > 8,
+        right: max > 8 && el.scrollLeft < max - 8,
+      }
+      setOverflow((prev) => (prev.left === next.left && prev.right === next.right ? prev : next))
+    }
+    update()
+    const raf = requestAnimationFrame(update)
+    el.addEventListener('scroll', update, { passive: true })
+    window.addEventListener('resize', update)
+    const ro = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(update)
+    ro?.observe(el)
+    overflowCleanup.current = () => {
+      cancelAnimationFrame(raf)
+      el.removeEventListener('scroll', update)
+      window.removeEventListener('resize', update)
+      ro?.disconnect()
+    }
+  }
 
   const beginDrag = (ticket: Ticket, e: DragEvent) => {
     const target = e.target as HTMLElement | null
@@ -86,9 +114,6 @@ export function BoardColumns({
       dragging={dragging?.id === ticket.id}
       onDragStart={(e) => beginDrag(ticket, e)}
       onDragEnd={endDrag}
-      moveOptions={ticket.allowedMoves}
-      moveOptionLabel={(m) => moveOptionLabel(m, stageNameById)}
-      onMoveSelect={onMove ? (toStageId) => onMove(ticket, toStageId) : undefined}
     />
   )
 
@@ -102,52 +127,88 @@ export function BoardColumns({
     )
   }
 
+  const overflowing = overflow.left || overflow.right
+
   return (
-    <div className="flex min-h-0 flex-1 gap-3 overflow-x-auto overscroll-x-contain px-4 pb-4">
-      <BoardColumnFrame
-        dropId={BACKLOG_DROP_ID}
-        title="积压"
-        count={backlogTickets.length}
-        variant="backlog"
-        allowed={allowed}
-        hoverDropId={hoverDropId}
-        onDragOver={overColumn}
-        onDrop={dropOnColumn}
-        onDragLeave={leaveColumn}
+    <div className="relative min-h-0 flex-1" data-testid="board-columns-shell">
+      <div
+        ref={scrollerRef}
+        data-testid="board-columns-scroller"
+        data-overflow-left={overflow.left ? 'true' : undefined}
+        data-overflow-right={overflow.right ? 'true' : undefined}
+        aria-label={overflowing ? '看板列，可横向滚动' : '看板列'}
+        className="flex h-full min-h-0 gap-3 overflow-x-auto overscroll-x-contain px-4 pb-4"
       >
-        {backlogTickets.length === 0 && hoverDropId !== BACKLOG_DROP_ID ? (
-          <p className="px-1 py-6 text-center text-meta text-faint">
-            还没有积压单。遗留问题可以先记在这里。
-          </p>
-        ) : (
-          backlogTickets.map(renderCard)
-        )}
-      </BoardColumnFrame>
-      {columns.map((col) => {
-        const dropId = dropIdForMove(col.stage.id)
-        return (
-          <BoardColumnFrame
-            key={col.stage.id}
-            dropId={dropId}
-            stageId={col.stage.id}
-            title={col.stage.name}
-            count={col.tickets.length}
-            variant="stage"
-            kind={col.stage.kind}
-            allowed={allowed}
-            hoverDropId={hoverDropId}
-            onDragOver={overColumn}
-            onDrop={dropOnColumn}
-            onDragLeave={leaveColumn}
-          >
-            {col.tickets.length === 0 && hoverDropId !== dropId ? (
-              <p className="px-1 py-6 text-center text-meta text-faint">这一列还没有单据</p>
-            ) : (
-              col.tickets.map(renderCard)
-            )}
-          </BoardColumnFrame>
-        )
-      })}
+        <BoardColumnFrame
+          dropId={BACKLOG_DROP_ID}
+          title="积压"
+          typeLabel={ticketTypeLabel}
+          count={backlogTickets.length}
+          variant="backlog"
+          allowed={allowed}
+          originDropId={originDropId}
+          hoverDropId={hoverDropId}
+          onDragOver={overColumn}
+          onDrop={dropOnColumn}
+          onDragLeave={leaveColumn}
+        >
+          {backlogTickets.length === 0 && hoverDropId !== BACKLOG_DROP_ID ? (
+            <ColumnEmpty>还没有积压单。遗留问题可以先记在这里。</ColumnEmpty>
+          ) : (
+            backlogTickets.map(renderCard)
+          )}
+        </BoardColumnFrame>
+        {columns.map((col) => {
+          const dropId = dropIdForMove(col.stage.id)
+          return (
+            <BoardColumnFrame
+              key={col.stage.id}
+              dropId={dropId}
+              stageId={col.stage.id}
+              title={col.stage.name}
+              count={col.tickets.length}
+              variant="stage"
+              kind={col.stage.kind}
+              allowed={allowed}
+              originDropId={originDropId}
+              hoverDropId={hoverDropId}
+              onDragOver={overColumn}
+              onDrop={dropOnColumn}
+              onDragLeave={leaveColumn}
+            >
+              {col.tickets.length === 0 && hoverDropId !== dropId ? (
+                <ColumnEmpty>这一列还没有单据</ColumnEmpty>
+              ) : (
+                col.tickets.map(renderCard)
+              )}
+            </BoardColumnFrame>
+          )
+        })}
+      </div>
+      {overflow.left && (
+        <div
+          aria-hidden
+          className="pointer-events-none absolute inset-y-0 left-0 w-8 bg-gradient-to-r from-bg to-transparent"
+        />
+      )}
+      {overflow.right && (
+        <div
+          data-testid="board-overflow-hint"
+          aria-hidden
+          className="pointer-events-none absolute inset-y-0 right-0 w-12 bg-gradient-to-l from-bg to-transparent"
+        />
+      )}
+    </div>
+  )
+}
+
+function ColumnEmpty({ children }: { children: ReactNode }) {
+  return (
+    <div
+      data-testid="column-empty"
+      className="flex min-h-[10rem] flex-1 items-center justify-center rounded-lg border border-dashed border-border bg-hover px-3 py-6"
+    >
+      <p className="text-center text-meta text-faint">{children}</p>
     </div>
   )
 }
@@ -167,10 +228,12 @@ function BoardColumnFrame({
   dropId,
   stageId,
   title,
+  typeLabel,
   count,
   variant,
   kind,
   allowed,
+  originDropId,
   hoverDropId,
   onDragOver,
   onDrop,
@@ -180,10 +243,12 @@ function BoardColumnFrame({
   dropId: string
   stageId?: string
   title: string
+  typeLabel?: string
   count: number
   variant: 'backlog' | 'stage'
   kind?: 'ai' | 'human' | 'gate'
   allowed: Set<string> | null
+  originDropId: string | null
   hoverDropId: string | null
   onDragOver: (dropId: string, e: DragEvent) => void
   onDrop: (dropId: string, e: DragEvent) => void
@@ -192,10 +257,12 @@ function BoardColumnFrame({
 }) {
   const dragDepth = useRef(0)
   const dragging = allowed !== null
-  const canDrop = allowed?.has(dropId) ?? false
-  const forbidden = dragging && !canDrop
+  const isOrigin = originDropId !== null && originDropId === dropId
+  const canDrop = !isOrigin && (allowed?.has(dropId) ?? false)
+  const forbidden = dragging && !isOrigin && !canDrop
   const hover = dragging && canDrop && hoverDropId === dropId
   const backlog = variant === 'backlog'
+  const empty = count === 0
 
   useEffect(() => {
     if (!dragging) dragDepth.current = 0
@@ -228,7 +295,8 @@ function BoardColumnFrame({
       data-testid={backlog ? 'taskboard-backlog-column' : 'taskboard-column'}
       data-stage-id={backlog ? BACKLOG_DROP_ID : stageId}
       data-drop-id={dropId}
-      data-drop-allowed={dragging ? (canDrop ? 'true' : undefined) : undefined}
+      data-drop-allowed={dragging && canDrop ? 'true' : undefined}
+      data-drop-source={isOrigin ? 'true' : undefined}
       data-drop-disabled={forbidden ? 'true' : undefined}
       data-drop-hover={hover ? 'true' : undefined}
       aria-disabled={forbidden || undefined}
@@ -238,30 +306,37 @@ function BoardColumnFrame({
       onDragLeave={handleDragLeave}
       className={cn(
         'flex w-72 shrink-0 flex-col rounded-xl',
-        backlog ? 'border border-dashed border-border bg-hover' : 'border border-transparent bg-bg',
+        backlog || empty
+          ? 'border border-dashed border-border bg-hover'
+          : 'border border-transparent bg-bg',
         dragging && canDrop && 'border-solid border-accent bg-accent-soft',
         hover && 'border-accent ring-2 ring-accent',
         forbidden && 'opacity-40',
       )}
     >
-      <header className="sticky top-0 z-10 flex items-start justify-between gap-2 bg-inherit px-1 py-2">
-        <div className="min-w-0">
-          <h3 className="flex items-center gap-1.5 truncate text-section font-semibold text-fg">
-            {backlog && <Archive size={14} className="shrink-0 text-faint" aria-hidden />}
-            {title}
-          </h3>
-          {backlog && (
-            <p className="mt-0.5 text-caption text-faint">
-              这里的单 AI 不会碰，拖进右边的站才会开工。
-            </p>
+      <header className="sticky top-0 z-10 bg-inherit px-1 py-2">
+        <h3 className="flex min-w-0 items-center gap-1.5 text-section font-semibold text-fg">
+          {backlog && <Archive size={14} className="shrink-0 text-faint" aria-hidden />}
+          <span className="truncate">{title}</span>
+          {typeLabel && (
+            <span data-testid="column-type-filter" className="shrink-0 font-normal text-faint">
+              · {typeLabel}
+            </span>
           )}
-          {!backlog && kind && (
-            <p className="mt-0.5 text-caption text-faint">
-              {kind === 'ai' ? 'AI 站' : kind === 'human' ? '人工站' : '闸门'}
-            </p>
-          )}
-        </div>
-        <span className="shrink-0 pt-0.5 text-caption text-faint">{count}</span>
+          <Badge tone="neutral" size="sm" data-testid="column-count">
+            {count}
+          </Badge>
+        </h3>
+        {backlog && (
+          <p className="mt-0.5 text-caption text-faint">
+            这里的单 AI 不会碰，拖进右边的站才会开工。
+          </p>
+        )}
+        {!backlog && kind && (
+          <p className="mt-0.5 text-caption text-faint">
+            {kind === 'ai' ? 'AI 站' : kind === 'human' ? '人工站' : '闸门'}
+          </p>
+        )}
       </header>
       <div className="flex min-h-[12rem] min-w-0 flex-1 flex-col gap-2 overflow-y-auto pr-0.5">
         {hover && <DropPlaceholder />}

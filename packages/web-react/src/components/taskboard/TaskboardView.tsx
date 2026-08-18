@@ -16,6 +16,8 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
   EmptyState,
   IconButton,
@@ -37,11 +39,13 @@ import { TicketDrawer } from './TicketDrawer'
 import { TicketListView } from './TicketListView'
 import { WeeklyReportView } from './WeeklyReportView'
 import {
+  dropIdForMove,
   formatBlockersMessage,
   formatConfirmSkipMessage,
   formatMoveSuccess,
   formatNoIntentMessage,
   formatRunningRunMessage,
+  moveOptionLabel,
 } from './ticketMove'
 import { useTaskboard } from './useTaskboard'
 
@@ -329,7 +333,7 @@ export function TaskboardView({
   const renderActions = (ticket: Ticket, layout: 'board' | 'full' = 'full') => {
     const busy = board.isPending(ticket.id)
     const items = collectActions(ticket)
-    if (!items.length) return null
+    const moves = ticket.allowedMoves ?? []
     const btn = (action: TicketAction) => (
       <Button
         key={action.testId}
@@ -345,14 +349,17 @@ export function TaskboardView({
       </Button>
     )
     if (layout !== 'board') {
+      if (!items.length) return null
       return <div className="flex flex-wrap gap-1">{items.map(btn)}</div>
     }
     const primary = items.find((a) => a.kind === 'primary')
     const menuItems = items.filter((a) => a !== primary)
+    const showMenu = menuItems.length > 0 || moves.length > 0
+    if (!primary && !showMenu) return null
     return (
       <div className="flex shrink-0 items-center gap-0.5">
         {primary ? btn(primary) : null}
-        {menuItems.length > 0 && (
+        {showMenu && (
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <IconButton
@@ -368,6 +375,22 @@ export function TaskboardView({
               </IconButton>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" onClick={(e) => e.stopPropagation()}>
+              {moves.length > 0 && (
+                <>
+                  <DropdownMenuLabel>移动到…</DropdownMenuLabel>
+                  {moves.map((m) => (
+                    <DropdownMenuItem
+                      key={`${m.action}:${dropIdForMove(m.toStageId)}`}
+                      data-testid="ticket-move-option"
+                      disabled={busy}
+                      onSelect={() => void runMove(ticket, m.toStageId)}
+                    >
+                      {moveOptionLabel(m, stageNameById)}
+                    </DropdownMenuItem>
+                  ))}
+                  {menuItems.length > 0 && <DropdownMenuSeparator />}
+                </>
+              )}
               {menuItems.map((action) => (
                 <DropdownMenuItem
                   key={action.testId}
@@ -422,6 +445,10 @@ export function TaskboardView({
   }
 
   const shownType = board.board?.ticketType || board.ticketType || ''
+  const projectLabel = useMemo(() => {
+    const current = (board.projects ?? []).find((p) => p.id === board.projectId && !p.archivedAt)
+    return current ? `${current.key} ${current.name}` : undefined
+  }, [board.projectId, board.projects])
 
   return (
     <div data-testid="taskboard-root" className="flex h-full min-h-0 flex-col bg-bg">
@@ -453,9 +480,10 @@ export function TaskboardView({
         <div className="ml-auto flex min-w-0 flex-wrap items-center justify-end gap-2">
           <Select
             aria-label="项目"
-            className="w-40"
+            className="w-56 max-w-[16rem]"
             inputSize="sm"
             value={board.projectId ?? ''}
+            title={projectLabel}
             onValueChange={(id) => void board.selectProject(id)}
             options={(board.projects ?? [])
               .filter((p) => !p.archivedAt)
@@ -623,6 +651,7 @@ export function TaskboardView({
         <BoardColumns
           columns={board.board?.columns ?? []}
           backlogTickets={board.board?.backlog?.tickets ?? []}
+          ticketTypeLabel={shownType ? TICKET_TYPE_LABEL[shownType] : undefined}
           onOpenTicket={openTicket}
           renderActions={(ticket) => renderActions(ticket, 'board')}
           onMove={(ticket, toStageId) => void runMove(ticket, toStageId)}

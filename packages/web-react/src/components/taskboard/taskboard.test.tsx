@@ -209,9 +209,10 @@ describe('TicketCard 类型 / 优先级映射', () => {
       </ToastProvider>,
     )
     expect(screen.getByText('OCV5-42')).toBeInTheDocument()
+    expect(screen.getByText('登录 500')).toHaveAttribute('title', '登录 500')
     expect(screen.getByText('需求单')).toBeInTheDocument()
     expect(screen.getByText('P1')).toBeInTheDocument()
-    expect(screen.getByText('research')).toBeInTheDocument()
+    expect(screen.getByText('research')).toHaveAttribute('title', 'research')
     expect(screen.getAllByText('受阻').length).toBeGreaterThan(0)
     expect(screen.getByLabelText('需求单')).toBeInTheDocument()
   })
