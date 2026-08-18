@@ -18,6 +18,7 @@
 #   scripts/deploy-v5-selfhost.sh --bootstrap [--force-env]
 #   scripts/deploy-v5-selfhost.sh --deploy
 #   scripts/deploy-v5-selfhost.sh --deploy --allow-dirty --platform-from-head
+#   scripts/deploy-v5-selfhost.sh --build-master-only [--force-npm-ci]
 #   scripts/deploy-v5-selfhost.sh --smoke
 #   scripts/deploy-v5-selfhost.sh --status
 #   scripts/deploy-v5-selfhost.sh --bootstrap --dry-run
@@ -72,11 +73,13 @@ RUNTIME_LIB="$SCRIPT_DIR/v5-runtime-release-lib.sh"
 # shellcheck source=scripts/v5-runtime-release-lib.sh
 # shellcheck disable=SC1091
 source "$RUNTIME_LIB"
+MASTER_RELEASE_LIB="$SCRIPT_DIR/v5-selfhost-master-release-lib.sh"
 
 DRY=0
 FORCE_ENV=0
 ALLOW_DIRTY=0
 PLATFORM_FROM_HEAD=0
+FORCE_NPM_CI=0
 MODE=""
 
 # 本实例专属发布锁。禁止复用:
@@ -99,6 +102,10 @@ die() {
   exit 1
 }
 
+# shellcheck source=scripts/v5-selfhost-master-release-lib.sh
+# shellcheck disable=SC1091
+source "$MASTER_RELEASE_LIB"
+
 log() { echo "$*"; }
 
 run() {
@@ -119,6 +126,7 @@ cleanup_selfhost_deploy() {
     rm -rf "$PLATFORM_ARCHIVE_TMP"
     PLATFORM_ARCHIVE_TMP=""
   fi
+  cleanup_master_staging
   if [[ "${SELFHOST_DEPLOY_LOCK_HOLDER_OWNED:-0}" == 1 && -n "${SELFHOST_DEPLOY_LOCK_HOLDER:-}" ]]; then
     rm -f "$SELFHOST_DEPLOY_LOCK_HOLDER"
     SELFHOST_DEPLOY_LOCK_HOLDER_OWNED=0
@@ -328,9 +336,10 @@ acquire_selfhost_deploy_lock() {
 }
 
 # --status/--smoke/--preflight 与 --dry-run 只读/轻量,不加锁,避免被发布堵住。
+# --build-master-only 持锁,避免与别人的 --deploy 撞车。
 maybe_acquire_selfhost_deploy_lock() {
   case "$MODE" in
-    deploy|bootstrap)
+    deploy|bootstrap|build-master-only)
       [[ "$DRY" == 1 ]] && return 0
       acquire_selfhost_deploy_lock
       ;;
@@ -339,19 +348,21 @@ maybe_acquire_selfhost_deploy_lock() {
 
 usage() {
   cat <<'EOF'
-用法: scripts/deploy-v5-selfhost.sh --preflight|--bootstrap|--deploy|--smoke|--status [--dry-run] [--force-env] [--allow-dirty] [--platform-from-head]
+用法: scripts/deploy-v5-selfhost.sh --preflight|--bootstrap|--deploy|--build-master-only|--smoke|--status [--dry-run] [--force-env] [--allow-dirty] [--platform-from-head] [--force-npm-ci]
 
   --preflight           只读硬门(残留/端口/密钥/个人版)。任何一条不满足即非 0 退出
   --bootstrap           首次完整安装(开头跑全套 preflight)
   --deploy              更新代码后重建 release 树、重写四元组、重启服务
+  --build-master-only   只建一份不可变 master rel-*(不迁库/不装 unit/不切 symlink/不重启)
   --smoke               只读健康检查(含个人版回归)
   --status              打印当前状态
   --dry-run             与上述组合:打印将执行的命令,不改任何东西
   --allow-dirty         仅配合 --deploy:工作区有未提交改动时仍部署(默认拒绝,见 cmd_deploy 脏门)
   --platform-from-head  仅配合 --deploy/--bootstrap:平台 bundle 从 git archive 取已提交的 platform-runtime(默认仍拷工作树)
   --force-env           仅配合 --bootstrap:覆盖已存在的 env 文件
+  --force-npm-ci        仅配合 --build-master-only:跳过硬链,在 staging 内冷装(测 H1)
 
-  写路径(--deploy/--bootstrap,非 dry-run)会在 /run/openclaude-v5-selfhost/deploy.lock 上排队等锁,默认 2400s。
+  写路径(--deploy/--bootstrap/--build-master-only,非 dry-run)会在 /run/openclaude-v5-selfhost/deploy.lock 上排队等锁,默认 2400s。
   覆盖: OC_V5_SELFHOST_DEPLOY_LOCK / OC_V5_SELFHOST_DEPLOY_LOCK_WAIT / OC_V5_SELFHOST_DEPLOY_LOCK_POLL
   覆盖路径同样校验(普通文件、root 所有、目录非世界可写、拒绝跟随符号链接)。
 
@@ -361,6 +372,8 @@ usage() {
   scripts/deploy-v5-selfhost.sh --bootstrap
   scripts/deploy-v5-selfhost.sh --deploy
   scripts/deploy-v5-selfhost.sh --deploy --allow-dirty --platform-from-head
+  scripts/deploy-v5-selfhost.sh --build-master-only
+  scripts/deploy-v5-selfhost.sh --build-master-only --force-npm-ci
   scripts/deploy-v5-selfhost.sh --smoke
 EOF
 }
@@ -371,7 +384,8 @@ for arg in "$@"; do
     --force-env) FORCE_ENV=1 ;;
     --allow-dirty) ALLOW_DIRTY=1 ;;
     --platform-from-head) PLATFORM_FROM_HEAD=1 ;;
-    --preflight|--bootstrap|--deploy|--smoke|--status)
+    --force-npm-ci) FORCE_NPM_CI=1 ;;
+    --preflight|--bootstrap|--deploy|--smoke|--status|--build-master-only)
       [[ -z "$MODE" ]] || die "只能指定一个主模式(已有 --$MODE,又收到 $arg)"
       MODE="${arg#--}"
       ;;
@@ -392,6 +406,9 @@ done
 [[ "$ALLOW_DIRTY" == 1 && "$MODE" != "deploy" ]] && die "--allow-dirty 只能与 --deploy 同用"
 [[ "$PLATFORM_FROM_HEAD" == 1 && "$MODE" != "deploy" && "$MODE" != "bootstrap" ]] \
   && die "--platform-from-head 只能与 --deploy 或 --bootstrap 同用"
+[[ "$FORCE_NPM_CI" == 1 && "$MODE" != "build-master-only" ]] \
+  && die "--force-npm-ci 只能与 --build-master-only 同用"
+[[ -f "$MASTER_RELEASE_LIB" ]] || die "缺 master release lib: $MASTER_RELEASE_LIB"
 
 # 锁自测钩子:只加锁再 sleep,不碰发布路径。给并发/超时验证用,生产勿设。
 if [[ -n "${OC_V5_SELFHOST_LOCK_SELFTEST_SLEEP:-}" ]]; then
@@ -1367,6 +1384,7 @@ case "$MODE" in
   preflight) cmd_preflight ;;
   bootstrap) cmd_bootstrap ;;
   deploy) cmd_deploy ;;
+  build-master-only) cmd_build_master_only ;;
   smoke) cmd_smoke ;;
   status) cmd_status ;;
   *) die "内部错误:未知 MODE=$MODE" ;;
