@@ -504,6 +504,8 @@ export const DEFAULT_V3_CCB_BASELINE_DIR =
 /** baseline 内部结构 —— 用 POSIX 绝对路径拼 docker Bind */
 export const V3_CCB_BASELINE_AGENTS_MD_REL = "AGENTS.md";
 export const V3_CCB_BASELINE_CLAUDE_MD_REL = "CLAUDE.md";
+export const V3_CCB_BASELINE_AGENTS_ADMIN_MD_REL = "AGENTS.admin.md";
+export const V3_CCB_BASELINE_CLAUDE_ADMIN_MD_REL = "CLAUDE.admin.md";
 export const V3_CCB_BASELINE_SKILLS_DIR_REL = "skills";
 
 /**
@@ -612,8 +614,14 @@ function readCcbBaselineOptionalFromEnv(): boolean {
  *   这样基线的"全有或全无"语义就严格成立 ——
  *   skills/ 下看见的 ≡ manifest 声明的 ≡ 每条都 root owned + mode safe + SKILL.md 合规。
  */
+export type CcbBaselineMountOpts = {
+  /** role=admin 时挂不含租户限制守则的 *.admin.md；缺省/非 admin 仍挂完整守则。 */
+  admin?: boolean;
+};
+
 export function resolveCcbBaselineMounts(
   baselineDir: string,
+  opts?: CcbBaselineMountOpts,
 ): { agentsMdHostPath: string; claudeMdHostPath: string; skillsDirHostPath: string } | null {
   if (typeof baselineDir !== "string" || baselineDir.trim() === "") return null;
   // 必须绝对路径;path.normalize 吞掉尾斜杠、多余 `/` 等等价写法。
@@ -627,9 +635,15 @@ export function resolveCcbBaselineMounts(
     assertBaselineLeaf(abs, "dir", abs);
     const agentsMdPath = pathJoin(abs, V3_CCB_BASELINE_AGENTS_MD_REL);
     const claudeMdPath = pathJoin(abs, V3_CCB_BASELINE_CLAUDE_MD_REL);
+    const agentsAdminMdPath = pathJoin(abs, V3_CCB_BASELINE_AGENTS_ADMIN_MD_REL);
+    const claudeAdminMdPath = pathJoin(abs, V3_CCB_BASELINE_CLAUDE_ADMIN_MD_REL);
     const skillsDirPath = pathJoin(abs, V3_CCB_BASELINE_SKILLS_DIR_REL);
     const agentsReal = assertBaselineLeaf(agentsMdPath, "file", abs);
     const claudeReal = assertBaselineLeaf(claudeMdPath, "file", abs);
+    // 管理员变体与完整守则一起校验:缺一份 → 整个 resolve 失败,避免 admin
+    // 容器静默回落到租户限制守则,或非 admin 容器在缺文件时误挂空路径。
+    const agentsAdminReal = assertBaselineLeaf(agentsAdminMdPath, "file", abs);
+    const claudeAdminReal = assertBaselineLeaf(claudeAdminMdPath, "file", abs);
     // 中间目录 skills/ 必须和根一样被锁死(root owned + 非可写 + 非 symlink)
     const skillsDirReal = assertBaselineLeaf(skillsDirPath, "dir", abs);
 
@@ -692,9 +706,10 @@ export function resolveCcbBaselineMounts(
         assertBaselineLeaf(pathJoin(evalsDir, "evals.json"), "file", abs);
       }
     }
+    const admin = opts?.admin === true;
     return {
-      agentsMdHostPath: agentsReal,
-      claudeMdHostPath: claudeReal,
+      agentsMdHostPath: admin ? agentsAdminReal : agentsReal,
+      claudeMdHostPath: admin ? claudeAdminReal : claudeReal,
       skillsDirHostPath: skillsDirReal,
     };
   } catch {
@@ -2179,6 +2194,25 @@ async function compensateProvisionFailure(
  *     create 用一个空 volume,数据被 GC 静默丢弃。
  *   - docker createVolume 失败 → 整事务 ROLLBACK,row 不留痕,最终一致。
  */
+/**
+ * 容器用户角色。只认 users.role === 'admin'；缺行/查询失败/其它值一律 'user'
+ * (fail-closed:宁可多注入租户守则,也不要在角色不明时摘掉限制)。
+ */
+export async function lookupContainerUserRole(
+  pool: Pool,
+  uid: number,
+): Promise<"user" | "admin"> {
+  try {
+    const r = await pool.query<{ role: string | null }>(
+      "SELECT role FROM users WHERE id = $1::bigint LIMIT 1",
+      [uid],
+    );
+    return r.rows[0]?.role === "admin" ? "admin" : "user";
+  } catch {
+    return "user";
+  }
+}
+
 export async function provisionV3Container(
   deps: V3SupervisorDeps,
   uid: number,
@@ -2192,6 +2226,9 @@ export async function provisionV3Container(
   if (typeof deps.image !== "string" || deps.image.trim() === "") {
     throw new SupervisorError("InvalidArgument", "deps.image (OC_RUNTIME_IMAGE) is required");
   }
+
+  const userRole = await lookupContainerUserRole(deps.pool, uid);
+
 
   // v3→v5 迁移门控:仅 v3 channel 生效。已迁移(migrated)/迁移进行中(migrating)的用户,
   // v3 不得再为其建/重建容器 —— 否则会重新成为该用户卷的写者、破坏卷迁移一致性,或与已在
@@ -2494,6 +2531,7 @@ export async function provisionV3Container(
       `ANTHROPIC_AUTH_TOKEN=${token}`,
       "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1",
       `CLAUDE_CONFIG_DIR=${V3_CONFIG_TMPFS_PATH}`,
+      `OC_USER_ROLE=${userRole}`,
       // **bridge IP trust 旁路只在 v3 supervisor 真正 spawn 容器时注入**:
       //   bridge 经 docker bridge gateway <host bridge .1> 把 ws upgrade 转给
       //   容器 18789/ws,bridge 不持有容器 personal-version accessToken,所以
@@ -2666,7 +2704,16 @@ export async function provisionV3Container(
         syntheticEvalOverlay?.baselineHostPath
         ?? deps.ccbBaselineDir
         ?? readCcbBaselineDirFromEnv();
-      baselineMounts = resolveCcbBaselineMounts(baselineDir);
+      baselineMounts = resolveCcbBaselineMounts(baselineDir, { admin: userRole === "admin" });
+    }
+    if (useRemote && userRole === "admin" && baselineMounts) {
+      // 远端 resolveBaselinePaths 只给默认守则路径;管理员改挂同目录下的 *.admin.md。
+      const root = baselineMounts.skillsDirHostPath.replace(/\/skills$/, "");
+      baselineMounts = {
+        agentsMdHostPath: `${root}/${V3_CCB_BASELINE_AGENTS_ADMIN_MD_REL}`,
+        claudeMdHostPath: `${root}/${V3_CCB_BASELINE_CLAUDE_ADMIN_MD_REL}`,
+        skillsDirHostPath: baselineMounts.skillsDirHostPath,
+      };
     }
     const baselineOptional = readCcbBaselineOptionalFromEnv();
     if (!baselineMounts) {

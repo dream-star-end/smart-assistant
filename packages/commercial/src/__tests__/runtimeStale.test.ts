@@ -577,6 +577,12 @@ describe("V5 synthetic exact-eval overlay container wiring", () => {
     writeFileSync(join(stableBaseline, "CLAUDE.md"), "# test claude\n", {
       mode: 0o644,
     });
+    writeFileSync(join(stableBaseline, "AGENTS.admin.md"), "# test admin agents\n", {
+      mode: 0o644,
+    });
+    writeFileSync(join(stableBaseline, "CLAUDE.admin.md"), "# test admin claude\n", {
+      mode: 0o644,
+    });
     const skillsDir = join(stableBaseline, "skills");
     mkdirSync(skillsDir, { mode: 0o755 });
     for (const name of V3_CCB_BASELINE_SKILL_NAMES) {

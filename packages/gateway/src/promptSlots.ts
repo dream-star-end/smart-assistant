@@ -116,7 +116,9 @@ const PLATFORM_CAPABILITIES_FALLBACK = `# Platform capabilities
 ## 网页/文档提取 · 论文下载 (CLI)
 
 读取公开 URL、网页、PDF、Office 文档 → 用 Bash 调 \`oc-web extract <url>\` / \`oc-web parse <绝对路径>\`;学术论文检索与下载 → \`scansci-pdf <子命令>\`(search/download/citation 等)。细节见 \`skill_view("web-context")\` 与 \`skill_view("scansci-pdf")\`。
+<!-- oc-baseline-restrict:start -->
 安全边界:不要绕过 CAPTCHA、Cloudflare、登录墙或站点反爬;返回 blocked/error 时如实说明受阻,改用官方 API、用户上传文件或用户提供的数据源。输出标明来源 URL/时间/路径,不要把网页抓取当高风险事实的唯一依据。
+<!-- oc-baseline-restrict:end -->
 
 ## 工具效率与失败自愈
 
@@ -160,8 +162,33 @@ export const _platformPromptFallbacks = {
   WECHAT_VISION_HINT_NATIVE,
 }
 
+export const BASELINE_RESTRICT_START = '<!-- oc-baseline-restrict:start -->'
+export const BASELINE_RESTRICT_END = '<!-- oc-baseline-restrict:end -->'
+
+/** 只认显式 admin。缺省 / 非法 / 查询失败一律 user,避免角色不明时摘掉租户守则。 */
+export function resolvePromptUserRole(ctx?: { userRole?: string }): 'user' | 'admin' {
+  if (ctx?.userRole === 'admin') return 'admin'
+  return process.env.OC_USER_ROLE === 'admin' ? 'admin' : 'user'
+}
+
+export function stripBaselineRestrictions(text: string): string {
+  if (!text.includes(BASELINE_RESTRICT_START) && !text.includes(BASELINE_RESTRICT_END)) {
+    return text
+  }
+  const startCount = text.split(BASELINE_RESTRICT_START).length - 1
+  const endCount = text.split(BASELINE_RESTRICT_END).length - 1
+  if (startCount !== endCount || startCount === 0) return text
+  const stripped = text.replace(
+    /<!-- oc-baseline-restrict:start -->[\s\S]*?<!-- oc-baseline-restrict:end -->/g,
+    '',
+  )
+  return stripped.replace(/\n{3,}/g, '\n\n').replace(/[^\S\n]+$/gm, '').trimEnd() + (text.endsWith('\n') ? '\n' : '')
+}
+
 export interface PromptSlotContext {
   agentId: string
+  /** 连接用户角色。缺省读容器 env OC_USER_ROLE。 */
+  userRole?: 'user' | 'admin'
   persona?: string // path to CLAUDE.md / SOUL.md
   provider?: string
   model?: string
@@ -1162,7 +1189,10 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
   const repo = buildRepoSlot(ctx)
   if (repo) slots.push(repo)
 
-  const content = slots.map((s) => s.content).join(SEPARATOR)
+  let content = slots.map((s) => s.content).join(SEPARATOR)
+  if (resolvePromptUserRole(ctx) === 'admin') {
+    content = stripBaselineRestrictions(content)
+  }
   const applied: PromptSlotApplied[] = await Promise.all(
     slots.map(async (s) => {
       const base: PromptSlotApplied = {

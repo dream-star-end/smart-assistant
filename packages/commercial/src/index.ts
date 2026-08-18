@@ -569,6 +569,7 @@ import {
 } from "./ws/directContainerPreview.js";
 import {
   DEFAULT_V3_CCB_BASELINE_DIR,
+  lookupContainerUserRole,
   resolveCcbBaselineMounts,
   makePrewarmContainer,
   makeUidSingleflight,
