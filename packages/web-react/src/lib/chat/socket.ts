@@ -1424,6 +1424,21 @@ export class ChatSocket {
     this.setStatus("已连接", "connected");
   }
 
+  /**
+   * 「正在恢复上一轮」只覆盖仍有 in-flight 且未 connected 的窗口。
+   * 对账/收尾清掉 in-flight 后必须自己收口，不能要求用户刷新。
+   */
+  private dismissStaleRestoreBanner(): void {
+    if (this.statusLabel !== "正在恢复上一轮…") return;
+    if ([...this.sessions.values()].some((session) => session._sendingInFlight)) return;
+    if (this.ws?.readyState === 1) {
+      const [label, cls] = onopenSetInitialStatus(this.offlineQueue.length);
+      this.setStatus(label, cls);
+      return;
+    }
+    if (this.statusCls === "connecting") this.setStatus("连接中…", "connecting");
+  }
+
   /** Remove one exact unacknowledged journal entry. The server's admission
    * ACK or any exact authoritative outbound frame is the only normal path
    * that may clear it before turn terminal. */
@@ -1514,6 +1529,7 @@ export class ChatSocket {
     if (opts.persist !== false) this.deps.persistSession?.(sess.id);
     // stop / 超时 / 错误清 in-flight 后,若有生成中排队的消息 → 顺序发出。
     this.kickQueuedDrainIfIdle();
+    this.dismissStaleRestoreBanner();
   }
 
   // ═══════════════ reducer effects ═══════════════
@@ -1670,10 +1686,16 @@ export class ChatSocket {
           const snapped = this.reconnectInFlightSet;
           this.reconnectInFlightSet = null;
           if (!snapped) return;
-          for (const sessId of snapped) {
-            const s = this.sessions.get(sessId);
-            if (s?._sendingInFlight && this.statusCls !== "connected") this.setStatus("正在恢复上一轮…", "connecting");
+          const stillWaiting = [...snapped].some((sessId) => this.sessions.get(sessId)?._sendingInFlight);
+          if (!stillWaiting) {
+            this.dismissStaleRestoreBanner();
+            if (this.statusCls !== "connected" && this.ws?.readyState === 1) {
+              const [label, cls] = onopenSetInitialStatus(this.offlineQueue.length);
+              this.setStatus(label, cls);
+            }
+            return;
           }
+          if (this.statusCls !== "connected") this.setStatus("正在恢复上一轮…", "connecting");
         }, 30000);
       } else {
         this.reconnectInFlightSet = null;

@@ -6969,6 +6969,102 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
   });
 });
 
+describe("ChatSocket 正在恢复上一轮 banner self-clear", () => {
+  afterEach(() => {
+    FakeWS.instances = [];
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  async function flushStatus(): Promise<void> {
+    await vi.advanceTimersByTimeAsync(300);
+  }
+
+  test("对账清掉 in-flight 后自动收口恢复条，不要求刷新", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    await flushStatus();
+    const session = sock.ensureSession("s1", "main");
+    session._sendingInFlight = true;
+    session._activeClientMessageId = "u-banner";
+    (sock as unknown as { setStatus(label: string, cls: string): void })
+      .setStatus("正在恢复上一轮…", "connecting");
+    await flushStatus();
+    expect(sock.getSnapshot().status).toEqual({ label: "正在恢复上一轮…", cls: "connecting" });
+
+    (sock as unknown as { clearSendingState(sess: typeof session): void }).clearSendingState(session);
+    await flushStatus();
+    expect(session._sendingInFlight).toBe(false);
+    expect(sock.getSnapshot().status).toEqual({ label: "已连接", cls: "connected" });
+    sock.stop();
+  });
+
+  test("重连 30s 安全网只在仍在飞时提示，收尾后自行消失", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    const session = sock.ensureSession("s1", "main");
+    session._sendingInFlight = true;
+    session._activeClientMessageId = "u-wait";
+    ws.open();
+    await flushStatus();
+    (sock as unknown as { setStatus(label: string, cls: string): void })
+      .setStatus("会话续期中…", "connecting");
+    await flushStatus();
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(sock.getSnapshot().status).toEqual({ label: "正在恢复上一轮…", cls: "connecting" });
+
+    (sock as unknown as { clearSendingState(sess: typeof session): void }).clearSendingState(session);
+    await flushStatus();
+    expect(sock.getSnapshot().status).toEqual({ label: "已连接", cls: "connected" });
+    sock.stop();
+  });
+
+  test("30s 到点时若已经收尾，不会再钉上恢复条", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    const session = sock.ensureSession("s1", "main");
+    session._sendingInFlight = true;
+    session._activeClientMessageId = "u-done";
+    ws.open();
+    await flushStatus();
+    (sock as unknown as { setStatus(label: string, cls: string): void })
+      .setStatus("会话续期中…", "connecting");
+    (sock as unknown as { clearSendingState(sess: typeof session): void }).clearSendingState(session);
+    await flushStatus();
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(sock.getSnapshot().status.label).not.toBe("正在恢复上一轮…");
+    expect(sock.getSnapshot().status).toEqual({ label: "已连接", cls: "connected" });
+    sock.stop();
+  });
+
+  test("套接字已断时收口恢复条，不谎称已连接", async () => {
+    vi.useFakeTimers();
+    const sock = makeSocket();
+    const session = sock.ensureSession("s1", "main");
+    session._sendingInFlight = true;
+    session._activeClientMessageId = "u-offline";
+    (sock as unknown as { setStatus(label: string, cls: string): void })
+      .setStatus("正在恢复上一轮…", "connecting");
+    await flushStatus();
+    (sock as unknown as { clearSendingState(sess: typeof session): void }).clearSendingState(session);
+    await flushStatus();
+    expect(sock.getSnapshot().status).toEqual({ label: "连接中…", cls: "connecting" });
+    sock.stop();
+  });
+});
+
 // ═══════════════ 鉴权契约：bearer 子协议（非 ?token= 非 header，§auth）═══════════════
 describe("ChatSocket bearer subprotocol auth (#4)", () => {
   afterEach(() => {
