@@ -20,11 +20,26 @@ function extractMethodBody(source: string, methodName: string): string {
   return source.slice(startIdx, endIdx)
 }
 
-// P2 债C:委派执行核心已从 HTTP 端点 handleDelegateTask 抽到 _runDelegateTask(HTTP 壳
-// 与内部硬编排两调用方共用)。下面的身份/repo 绑定/资源闸结构护栏断言都在核心体里,故提取核心。
-const delegateCore = extractMethodBody(SERVER_TS, '_runDelegateTask')
+// P2 债C:委派执行核心先从 HTTP 端点抽到 _runDelegateTask; 3ad3d58ef 再拆出
+// _runDelegateTaskCore(resume claim 包在薄包装里)。身份/repo 绑定/资源闸护栏都在
+// Core 体里,扫包装会假红。另守包装仍 dispatch 到 Core,避免接线被拆掉。
+const delegateWrapper = extractMethodBody(SERVER_TS, '_runDelegateTask')
+const delegateCore = extractMethodBody(SERVER_TS, '_runDelegateTaskCore')
 const handleStop = extractMethodBody(SERVER_TS, 'handleStop')
 const getOrCreate = extractMethodBody(SESSION_MANAGER_TS, 'getOrCreate')
+
+test('delegate wrapper still dispatches into _runDelegateTaskCore', () => {
+  assert.match(
+    delegateWrapper,
+    /await this\._runDelegateTaskCore\(/,
+    '_runDelegateTask must remain the resume-claim wrapper around _runDelegateTaskCore',
+  )
+  assert.doesNotMatch(
+    delegateWrapper,
+    /this\.sessions\.getOrCreate/,
+    'session spawn belongs in the core, not the resume-claim wrapper',
+  )
+})
 
 test('delegate sessions inherit repo lookup without rewriting delegate peer identity', () => {
   assert.match(
@@ -74,7 +89,7 @@ test('delegate sessions inherit repo lookup without rewriting delegate peer iden
   )
   assert.doesNotMatch(
     delegateCore,
-    /peerId:\s*progressTarget\?\.peerId/,
+    /^\s*peerId:\s*progressTarget\?\.peerId/m,
     'delegate session must not impersonate the parent webchat peerId',
   )
 

@@ -643,7 +643,7 @@ describe('board 响应 allowedMoves / backlog / 默认 ticketType', () => {
     db.close()
   })
 
-  it('未指定 ticketType 时选非终态最多的 type;显式指定仍尊重', async () => {
+  it('未指定 ticketType 且仅有积压时选 backlog 最多的 type;显式指定仍尊重', async () => {
     const db = freshDb()
     await withServer(humanCtx(db), async (base) => {
       const created = await call(base, 'POST', '/api/board/projects', { key: 'OCV5', name: 'V5' })
@@ -668,6 +668,63 @@ describe('board 响应 allowedMoves / backlog / 默认 ticketType', () => {
       assert.equal(forced.body.ticketType, 'bug')
       const bugBacklog = forced.body.backlog as { tickets: TicketJson[] }
       assert.equal(bugBacklog.tickets.length, 0)
+    })
+    db.close()
+  })
+
+  it('用户库场景: bug 2 张 backlog + chore 1 张 backlog + feature 1 张 waiting_human → 默认选 feature', async () => {
+    const db = freshDb()
+    await withServer(humanCtx(db), async (base) => {
+      const created = await call(base, 'POST', '/api/board/projects', { key: 'OCV5', name: 'V5' })
+      const projectId = (created.body.project as { id: string }).id
+      for (const title of ['积压 bug 1', '积压 bug 2']) {
+        const bug = await call(base, 'POST', '/api/board/tickets', {
+          projectId,
+          type: 'bug',
+          title,
+        })
+        assert.equal(bug.status, 201, JSON.stringify(bug.body))
+        assert.equal((bug.body.ticket as TicketJson).status, 'backlog')
+      }
+      const chore = await call(base, 'POST', '/api/board/tickets', {
+        projectId,
+        type: 'chore',
+        title: '积压 chore',
+      })
+      assert.equal(chore.status, 201, JSON.stringify(chore.body))
+      const feat = await call(base, 'POST', '/api/board/tickets', {
+        projectId,
+        type: 'feature',
+        title: '正在跑的需求',
+      })
+      assert.equal(feat.status, 201, JSON.stringify(feat.body))
+      const featTicket = feat.body.ticket as TicketJson
+      const featPipe = listPipelines(db, projectId).find((p) => p.ticketType === 'feature')
+      assert.ok(featPipe)
+      const featStages = listStages(db, featPipe.id)
+      assert.ok(featStages[0])
+      updateTicket(db, featTicket.id, featTicket.version, {
+        status: 'waiting_human',
+        stageId: featStages[0].id,
+        pipelineId: featPipe.id,
+      })
+
+      const auto = await call(base, 'GET', `/api/board/projects/${projectId}/board`)
+      assert.equal(auto.status, 200, JSON.stringify(auto.body))
+      assert.equal(
+        auto.body.ticketType,
+        'feature',
+        `默认应选正在跑的 feature 线，而不是积压更多的 bug 线: ${JSON.stringify({
+          ticketType: auto.body.ticketType,
+          backlog: auto.body.backlog,
+          inbox: auto.body.inbox,
+        })}`,
+      )
+      const inbox = auto.body.inbox as TicketJson[]
+      assert.ok(
+        inbox.some((t) => t.id === featTicket.id && t.status === 'waiting_human'),
+        '正在跑的 feature 单应出现在默认看板 inbox',
+      )
     })
     db.close()
   })
