@@ -200,6 +200,17 @@ describe("oc-* CLI 语义卡 (Bash 特判)", () => {
     expect(toolSummary("mcp__openclaude-memory__task_create", { title: "登录 500" })).toBe("登录 500");
   });
 
+  test("oc-memory delegate 标成委派，不叫记忆", () => {
+    expect(resolveToolMeta("Bash", { command: "oc-memory delegate --goal '修卡片'" }).label).toBe(
+      "委派子任务",
+    );
+    expect(toolSummary("Bash", { command: "oc-memory delegate --goal '修卡片'" })).toBe("修卡片");
+    expect(resolveToolMeta("Bash", { command: "oc-memory core-search 记忆" }).label).toBe("记忆检索");
+    expect(resolveToolMeta("Bash", { command: "oc-memory request-review --draft '草稿'" }).label).toBe(
+      "质量审查",
+    );
+  });
+
   test("oc-browser / oc-market 根据动作提供友好标签和摘要", () => {
     expect(resolveToolMeta("Bash", { command: "oc-browser open https://example.com/a" }).label).toBe(
       "打开网页",

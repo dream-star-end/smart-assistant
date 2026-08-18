@@ -61,6 +61,20 @@ export type DelegateWaitLoopResult = {
 
 const BUSY_LOOP_GUARD_MS = 200
 
+/** Transport blip on one long-poll: keep waiting instead of failing the whole CLI. */
+export function isTransientDelegateWaitError(err: unknown): boolean {
+  const e = err as { code?: string; cause?: { code?: string }; message?: unknown }
+  const code = e?.code || e?.cause?.code
+  const msg = String(e?.message ?? err)
+  return (
+    code === 'ETIMEDOUT' ||
+    code === 'ECONNRESET' ||
+    code === 'EPIPE' ||
+    /delegate client timeout/i.test(msg) ||
+    /socket hang up/i.test(msg)
+  )
+}
+
 export async function runDelegateWaitLoop(opts: {
   jobIds: string[]
   waitOnce: DelegateWaitOnce
@@ -99,8 +113,17 @@ export async function runDelegateWaitLoop(opts: {
     const roundStarted = now()
     const views = await Promise.all(
       [...pending].map(async (jobId) => {
-        const res = await opts.waitOnce(jobId, waitMs)
-        return { jobId, view: interpretDelegateWaitBody(res.statusCode, res.body) }
+        try {
+          const res = await opts.waitOnce(jobId, waitMs)
+          return { jobId, view: interpretDelegateWaitBody(res.statusCode, res.body) }
+        } catch (err) {
+          // One idle long-poll dying (45s client timeout, reset) is not a
+          // failed child. Treat as still running and poll again.
+          if (isTransientDelegateWaitError(err)) {
+            return { jobId, view: { kind: 'running' as const, jobId } }
+          }
+          throw err
+        }
       }),
     )
     for (const { jobId, view } of views) {

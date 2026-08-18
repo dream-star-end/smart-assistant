@@ -207,7 +207,7 @@ async function main(): Promise<void> {
         postJsonToGateway(`${base}/api/delegate/wait`, {
           headers,
           body: JSON.stringify({ jobId, waitMs }),
-          timeoutMs: waitMs + 15_000,
+          timeoutMs: waitMs + 60_000,
         }),
     })
     if (result.stderr) process.stderr.write(result.stderr)
@@ -228,7 +228,7 @@ async function main(): Promise<void> {
         postJsonToGateway(`${base}/api/delegate/wait`, {
           headers,
           body: JSON.stringify({ jobId, waitMs }),
-          timeoutMs: waitMs + 15_000,
+          timeoutMs: waitMs + 60_000,
         }),
     })
     if (result.stderr) process.stderr.write(result.stderr)

@@ -7,7 +7,7 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 
-import { runDelegateWaitLoop } from '../delegateWaitCli.js'
+import { isTransientDelegateWaitError, runDelegateWaitLoop } from '../delegateWaitCli.js'
 
 function doneBody(jobId: string, output: string): string {
   return JSON.stringify({
@@ -99,6 +99,31 @@ describe('runDelegateWaitLoop', () => {
     assert.match(r.stderr, /dlgjob-slow/)
     assert.ok(waitCalls >= 1)
     assert.ok(waitCalls < 10, `busy-spin? waitCalls=${waitCalls}`)
+  })
+
+  it('one long-poll transport timeout → keep waiting, do not fail the CLI', async () => {
+    assert.equal(
+      isTransientDelegateWaitError(Object.assign(new Error('delegate client timeout after 45s'), { code: 'ETIMEDOUT' })),
+      true,
+    )
+    let n = 0
+    const r = await runDelegateWaitLoop({
+      jobIds: ['dlgjob-blip'],
+      pollWaitMs: 20,
+      hardTimeoutMs: 5_000,
+      waitOnce: async (jobId) => {
+        n++
+        if (n === 1) {
+          const err: Error & { code?: string } = new Error('delegate client timeout after 45s')
+          err.code = 'ETIMEDOUT'
+          throw err
+        }
+        return { statusCode: 200, body: doneBody(jobId, '仍在，已完成') }
+      },
+    })
+    assert.equal(r.exitCode, 0, r.stderr)
+    assert.match(r.stdout, /仍在，已完成/)
+    assert.equal(n, 2)
   })
 
   it('missing jobIds → exit 1', async () => {

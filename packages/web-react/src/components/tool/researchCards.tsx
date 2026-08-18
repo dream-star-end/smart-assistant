@@ -1067,7 +1067,46 @@ function stripExternalEnvelope(text: string): string {
     .trim();
 }
 
+function normalizePreviewKey(key: string): string {
+  return key.toLowerCase().replaceAll("_", "").replaceAll(" ", "");
+}
+
+/** Cursor Shell 失败结果：{command, exitCode, stderr, stdout, workingDirectory, signal}。 */
+function isShellResultObject(value: Record<string, unknown>): boolean {
+  const keys = new Set(Object.keys(value).map(normalizePreviewKey));
+  return keys.has("command") && (keys.has("exitcode") || keys.has("stderr") || keys.has("stdout"));
+}
+
+function shellResultMessage(value: Record<string, unknown>): string {
+  for (const key of Object.keys(value)) {
+    if (normalizePreviewKey(key) === "stderr" && typeof value[key] === "string" && value[key].trim()) {
+      return value[key] as string;
+    }
+  }
+  const err = value.error;
+  return typeof err === "string" ? err : "";
+}
+
+function friendlyOcFailureText(raw: string): string {
+  const text = raw.trim();
+  if (/delegate client timeout/i.test(text)) {
+    return "委派还在等待子任务完成，这一轮等待超时了。子任务可能仍在运行。";
+  }
+  if (/active turn policy is missing or expired/i.test(text)) {
+    return "这一轮还不能检索记忆（会话策略未就绪或已过期）。";
+  }
+  return firstParagraph(text);
+}
+
 function FriendlyObjectPreview({ value }: { value: Record<string, unknown> }) {
+  if (isShellResultObject(value)) {
+    const msg = friendlyOcFailureText(shellResultMessage(value));
+    return (
+      <div className="whitespace-pre-wrap break-words text-[13px] leading-relaxed text-fg">
+        {msg || "工具执行失败。"}
+      </div>
+    );
+  }
   const rows = Object.entries(value).slice(0, 6);
   if (rows.length === 0) return <div className="text-xs text-faint">没有返回内容。</div>;
   return (
@@ -1140,10 +1179,10 @@ function GenericOcCard({ cli, tool, error }: { cli: OcCli; tool: ToolLike; error
         <FriendlyObjectPreview value={object} />
       ) : clean ? (
         <div className={cn("whitespace-pre-wrap break-words text-[13px] leading-relaxed", error ? "text-danger" : "text-fg") }>
-          {firstParagraph(clean)}
+          {error ? friendlyOcFailureText(clean) : firstParagraph(clean)}
         </div>
       ) : (
-        <div className="text-xs text-faint">{error ? "工具执行失败，请查看卡片内错误信息。" : "操作已完成。"}</div>
+        <div className="text-xs text-faint">{error ? "工具执行失败。" : "操作已完成。"}</div>
       )}
     </div>
   );

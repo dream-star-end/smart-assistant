@@ -383,6 +383,19 @@ function ocCommandMeta(cli: OcCli, command: string): ToolMeta {
     return labels[op] ? { ...base, label: labels[op] } : base;
   }
   if (cli === "oc-web") return { ...base, label: "提取网页内容" };
+  if (cli === "oc-memory") {
+    const labels: Record<string, string> = {
+      delegate: "委派子任务",
+      "request-review": "质量审查",
+      "delegate-wait": "等待委派",
+      "core-search": "记忆检索",
+      "session-search": "历史检索",
+      "archival-search": "归档检索",
+      "archival-add": "归档写入",
+      "archival-delete": "归档删除",
+    };
+    return labels[op] ? { ...base, label: labels[op] } : base;
+  }
   return base;
 }
 
@@ -410,6 +423,12 @@ function ocCommandSummary(cli: OcCli, command: string): string {
   }
   if (cli === "oc-market") {
     return invocation?.[1]?.replace(/^["']|["']$/g, "") ?? "";
+  }
+  if (cli === "oc-memory" && (op === "delegate" || op === "request-review" || op === "delegate-wait")) {
+    return (commandFlag(command, "goal") || commandFlag(command, "draft") || invocation?.[1] || op).replace(
+      /^["']|["']$/g,
+      "",
+    ).slice(0, 60);
   }
   return "";
 }
