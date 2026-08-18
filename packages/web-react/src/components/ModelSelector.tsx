@@ -1,9 +1,20 @@
 import {
   DEFAULT_CODEX_ENGINE_MODEL,
   DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME,
+  cursorFamilySupportsFast,
+  cursorModelById,
+  type CursorEngineFamilyId,
+  type PlatformReasoningEffort,
 } from "@openclaude/protocol";
 import { AlertTriangle, Check, ChevronDown, Cpu, Users } from "lucide-react";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
+import {
+  availableCursorEfforts,
+  cursorFamilyHasFast,
+  cursorFamilyHasStandard,
+  modelPickerRows,
+  resolveCursorPickerSelection,
+} from "../lib/cursorModelPicker";
 import type { PublicModel } from "../lib/types";
 import { cn } from "../lib/utils";
 import {
@@ -46,22 +57,23 @@ export function teamEngineLabel(models: PublicModel[]): string {
   return m ? modelLabel(m) : DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME;
 }
 
+function triggerLabel(models: PublicModel[], selectedId: string | undefined, loading?: boolean): string {
+  const selected = models.find((m) => m.id === selectedId);
+  if (selected) {
+    const def = cursorModelById(selected.id);
+    return def ? def.familyLabel : modelLabel(selected);
+  }
+  if (loading) return "加载模型…";
+  return models[0] ? modelLabel(models[0]) : "暂无可用模型";
+}
+
 /**
  * 对话模型选择器（Aurora 顶栏）。完全由 GET /api/public/models 的结果驱动，
  * 不持有任何硬编码/demo 模型列表（demo 预览的 fixture 由调用方注入）。选中的 model id
  * 上抛给 App 顶层状态，P4 的 WS inbound.message 据此发送（前端只发 agentId + model，
  * agent→model 的最终权威在后端）。
  *
- * teamEngineActive（团队模式 × main 会话）时后端 bridge 会把实际执行模型强制覆盖为
- * 队长引擎（teamEngineLabel）——此时触发器如实显示实际生效引擎而非用户自选模型，
- * 菜单顶部追加不可选说明态；用户自选模型仍保留选中记忆（团队模式关闭后生效）。
- * 显示诚信原则：用户看到的必须是真的。
- *
- * 思考档位是模型菜单内的二级区块（2026-08-16 移动端回归修复:独立顶栏按钮约占 1/4
- * 宽,把铃铛/钱包/主题图标全挤掉）。选项 = 当前执行模型 supported_efforts ∩ 平台 5
- * 档;状态由 App 顶层持有（per-session 显式选择,null = 跟随模型默认）;effortLevel
- * 是 inbound.message 顶层路由字段,档位变化在下一条消息生效。模型不暴露档位或调用方
- * 未提供回调 → 区块整体不渲染。
+ * Cursor 公开家族在菜单里收成一行，思考档与 Fast 作为独立控件映射回 canonical id。
  */
 export function ModelSelector({
   models,
@@ -77,33 +89,48 @@ export function ModelSelector({
   selectedId?: string;
   onSelect: (id: string) => void;
   loading?: boolean;
-  /** 团队模式已开启且当前会话是 main（队长引擎覆盖生效）。由 App 的 teamMode 单一状态推导。 */
   teamEngineActive?: boolean;
-  /** 当前执行模型支持的思考档位(空/省略 = 模型不暴露档位,菜单不渲染档位区块)。 */
   effortSupported?: readonly string[];
-  /** 当前生效思考档(null/undefined = 跟随模型默认)。 */
   effortActive?: PreferenceEffort | null;
-  /** 选择思考档;null = 跟随模型默认。 */
   onSelectEffort?: (value: PreferenceEffort | null) => void;
 }) {
   const selected = models.find((m) => m.id === selectedId);
-  // 已选模型被降级(且非团队模式覆盖态)→ 菜单顶部提示条建议换模;可用替代 = 下方未降级模型。
+  const selectedCursor = cursorModelById(selectedId);
   const selectedDegraded = selected ? isDegraded(selected) : false;
   const hasAlternatives = models.some(
     (m) => !isDegraded(m) && m.id !== selectedId,
   );
   const engineLabel = teamEngineLabel(models);
-  // 团队态标签拆前缀/主体:移动端只显引擎名(前缀与头部 chip 冗余,Users 图标已表意),
-  // sm+ 恢复"团队模式 · "全称。
-  const baseLabel = selected
-    ? modelLabel(selected)
-    : loading
-      ? "加载模型…"
-      : models[0]
-        ? modelLabel(models[0])
-        : "暂无可用模型";
+  const baseLabel = triggerLabel(models, selectedId, loading);
   const label = teamEngineActive ? engineLabel : baseLabel;
   const disabled = loading || models.length === 0;
+  const rows = modelPickerRows(models);
+  const selectedFamilyRow = rows.find(
+    (row) => row.kind === "cursor-family" && row.row.family === selectedCursor?.family,
+  );
+  const cursorMembers =
+    selectedFamilyRow && selectedFamilyRow.kind === "cursor-family"
+      ? selectedFamilyRow.row.members
+      : [];
+  const cursorEfforts = availableCursorEfforts(cursorMembers);
+  const showCursorEffort = selectedCursor != null && cursorEfforts.length > 0;
+  const showCursorFast =
+    selectedCursor != null &&
+    selectedCursor.family !== "auto" &&
+    cursorFamilySupportsFast(selectedCursor.family) &&
+    cursorMembers.some((member) => cursorModelById(member.id)?.fast);
+  const showPlatformEffort =
+    !selectedCursor &&
+    Boolean(effortSupported && effortSupported.length > 0 && onSelectEffort);
+
+  const selectCursor = (
+    family: CursorEngineFamilyId,
+    members: PublicModel[],
+    next?: { effort?: PlatformReasoningEffort | null; fast?: boolean },
+  ) => {
+    const id = resolveCursorPickerSelection(members, family, selectedId, next);
+    if (id) onSelect(id);
+  };
 
   return (
     <DropdownMenu>
@@ -170,39 +197,139 @@ export function ModelSelector({
             </span>
           </div>
         )}
-        {/* 模型列表独立滚动区:目录会长(15+ 模型),移动端整菜单超屏会把档位区块
-            截在视口外(2026-08-16 实测)——列表 flex-1 内滚,档位区块钉在菜单底部。 */}
         <div className="min-h-0 flex-1 overflow-y-auto">
-        {models.map((m) => {
-          const active = m.id === selectedId;
-          const degraded = isDegraded(m);
-          return (
+          {rows.map((row) => {
+            if (row.kind === "plain") {
+              const m = row.model;
+              const active = m.id === selectedId;
+              const degraded = isDegraded(m);
+              return (
+                <DropdownMenuItem
+                  key={m.id}
+                  data-model-id={m.id}
+                  disabled={degraded}
+                  onSelect={degraded ? undefined : () => onSelect(m.id)}
+                  className="justify-between"
+                >
+                  <span className="truncate">{modelLabel(m)}</span>
+                  <span className="flex shrink-0 items-center gap-1.5">
+                    {degraded && <Badge tone="danger">暂不可用</Badge>}
+                    {active && !degraded && (
+                      <>
+                        {teamEngineActive && (
+                          <span className="text-[11px] text-faint">
+                            团队模式关闭后生效
+                          </span>
+                        )}
+                        <Check size={14} className="shrink-0 text-accent" />
+                      </>
+                    )}
+                  </span>
+                </DropdownMenuItem>
+              );
+            }
+            const familyActive = selectedCursor?.family === row.row.family;
+            const representative =
+              resolveCursorPickerSelection(row.row.members, row.row.family, selectedId) ??
+              row.row.members[0]?.id;
+            const degraded = row.row.members.every(isDegraded);
+            return (
+              <DropdownMenuItem
+                key={row.row.family}
+                data-model-id={representative}
+                data-cursor-family={row.row.family}
+                disabled={degraded}
+                onSelect={
+                  degraded
+                    ? undefined
+                    : () => selectCursor(row.row.family, row.row.members)
+                }
+                className="justify-between"
+              >
+                <span className="truncate">{row.row.label}</span>
+                <span className="flex shrink-0 items-center gap-1.5">
+                  {degraded && <Badge tone="danger">暂不可用</Badge>}
+                  {familyActive && !degraded && (
+                    <>
+                      {teamEngineActive && (
+                        <span className="text-[11px] text-faint">
+                          团队模式关闭后生效
+                        </span>
+                      )}
+                      <Check size={14} className="shrink-0 text-accent" />
+                    </>
+                  )}
+                </span>
+              </DropdownMenuItem>
+            );
+          })}
+        </div>
+        {showCursorEffort && selectedCursor && (
+          <div className="shrink-0">
+            <DropdownMenuSeparator />
+            <DropdownMenuLabel className="flex items-center justify-between">
+              思考档位
+              <span className="text-[11px] font-normal text-faint">
+                {EFFORT_OPTIONS.find((o) => o.value === selectedCursor.effort)?.label ??
+                  selectedCursor.effort ??
+                  "—"}
+              </span>
+            </DropdownMenuLabel>
+            {EFFORT_OPTIONS.filter((o) => cursorEfforts.includes(o.value)).map((o) => (
+              <DropdownMenuItem
+                key={o.value}
+                data-effort={o.value}
+                onSelect={() =>
+                  selectCursor(selectedCursor.family, cursorMembers, { effort: o.value })
+                }
+                className="justify-between"
+              >
+                <span>{o.label}</span>
+                {selectedCursor.effort === o.value && (
+                  <Check size={14} className="shrink-0 text-accent" />
+                )}
+              </DropdownMenuItem>
+            ))}
+          </div>
+        )}
+        {showCursorFast && selectedCursor && (
+          <div className="shrink-0">
+            <DropdownMenuSeparator />
+            <DropdownMenuLabel className="flex items-center justify-between">
+              速度
+              <span className="text-[11px] font-normal text-faint">
+                {selectedCursor.fast ? "Fast" : "标准"}
+              </span>
+            </DropdownMenuLabel>
             <DropdownMenuItem
-              key={m.id}
-              data-model-id={m.id}
-              disabled={degraded}
-              onSelect={degraded ? undefined : () => onSelect(m.id)}
+              data-fast="false"
+              disabled={!cursorFamilyHasStandard(cursorMembers, selectedCursor.effort)}
+              onSelect={() =>
+                selectCursor(selectedCursor.family, cursorMembers, { fast: false })
+              }
               className="justify-between"
             >
-              <span className="truncate">{modelLabel(m)}</span>
-              <span className="flex shrink-0 items-center gap-1.5">
-                {degraded && <Badge tone="danger">暂不可用</Badge>}
-                {active && !degraded && (
-                  <>
-                    {teamEngineActive && (
-                      <span className="text-[11px] text-faint">
-                        团队模式关闭后生效
-                      </span>
-                    )}
-                    <Check size={14} className="shrink-0 text-accent" />
-                  </>
-                )}
-              </span>
+              <span>标准</span>
+              {!selectedCursor.fast && (
+                <Check size={14} className="shrink-0 text-accent" />
+              )}
             </DropdownMenuItem>
-          );
-        })}
-        </div>
-        {effortSupported && effortSupported.length > 0 && onSelectEffort && (
+            <DropdownMenuItem
+              data-fast="true"
+              disabled={!cursorFamilyHasFast(cursorMembers, selectedCursor.effort)}
+              onSelect={() =>
+                selectCursor(selectedCursor.family, cursorMembers, { fast: true })
+              }
+              className="justify-between"
+            >
+              <span>Fast</span>
+              {selectedCursor.fast && (
+                <Check size={14} className="shrink-0 text-accent" />
+              )}
+            </DropdownMenuItem>
+          </div>
+        )}
+        {showPlatformEffort && effortSupported && onSelectEffort && (
           <div className="shrink-0">
             <DropdownMenuSeparator />
             <DropdownMenuLabel className="flex items-center justify-between">

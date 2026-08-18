@@ -87,23 +87,315 @@ export function isGrokEngineModel(modelId: string | null | undefined): boolean {
  * exact value reported by the pinned CLI's `--list-models`, or null for Auto
  * (where the adapter deliberately omits `--model`). User input is never used
  * as a CLI argument.
+ *
+ * Effort and Fast are encoded in the canonical id (Cursor CLI has no separate
+ * `--effort` flag we control). The picker groups by `family` and remaps to a
+ * catalog row; `modelReasoningPolicy` stays empty so inbound.message.effort
+ * is not sent for Cursor turns.
  */
+export type CursorEngineFamilyId =
+  | 'auto'
+  | 'grok-4.6'
+  | 'composer-2.5'
+  | 'opus-5'
+  | 'fable-5'
+  | 'grok-4.5'
+
 export const CURSOR_ENGINE_MODELS = [
-  { id: 'cursor-auto', displayName: 'Cursor Auto', upstreamModel: null },
-  { id: 'cursor-grok-4.6-high', displayName: 'Cursor Grok 4.6 High', upstreamModel: 'cursor-grok-4.6-high' },
-  { id: 'cursor-grok-4.6-high-fast', displayName: 'Cursor Grok 4.6 High Fast', upstreamModel: 'cursor-grok-4.6-high-fast' },
-  { id: 'cursor-composer-2.5-fast', displayName: 'Cursor Composer 2.5 Fast', upstreamModel: 'composer-2.5-fast' },
-  { id: 'cursor-opus-5-high', displayName: 'Cursor Opus 5 High', upstreamModel: 'claude-opus-5-thinking-high' },
-  { id: 'cursor-fable-5-high', displayName: 'Cursor Fable 5 High (Non-ZDR)', upstreamModel: 'claude-fable-5-thinking-high' },
-  { id: 'cursor-grok-4.5-high', displayName: 'Cursor Grok 4.5 High', upstreamModel: 'cursor-grok-4.5-high' },
+  {
+    id: 'cursor-auto',
+    displayName: 'Cursor Auto',
+    upstreamModel: null,
+    family: 'auto',
+    familyLabel: 'Cursor Auto',
+    effort: null,
+    fast: false,
+  },
+  {
+    id: 'cursor-grok-4.6-low',
+    displayName: 'Cursor Grok 4.6 Low',
+    upstreamModel: 'cursor-grok-4.6-low',
+    family: 'grok-4.6',
+    familyLabel: 'Cursor Grok 4.6',
+    effort: 'low',
+    fast: false,
+  },
+  {
+    id: 'cursor-grok-4.6-low-fast',
+    displayName: 'Cursor Grok 4.6 Low Fast',
+    upstreamModel: 'cursor-grok-4.6-low-fast',
+    family: 'grok-4.6',
+    familyLabel: 'Cursor Grok 4.6',
+    effort: 'low',
+    fast: true,
+  },
+  {
+    id: 'cursor-grok-4.6-medium',
+    displayName: 'Cursor Grok 4.6 Medium',
+    upstreamModel: 'cursor-grok-4.6-medium',
+    family: 'grok-4.6',
+    familyLabel: 'Cursor Grok 4.6',
+    effort: 'medium',
+    fast: false,
+  },
+  {
+    id: 'cursor-grok-4.6-medium-fast',
+    displayName: 'Cursor Grok 4.6 Medium Fast',
+    upstreamModel: 'cursor-grok-4.6-medium-fast',
+    family: 'grok-4.6',
+    familyLabel: 'Cursor Grok 4.6',
+    effort: 'medium',
+    fast: true,
+  },
+  {
+    id: 'cursor-grok-4.6-high',
+    displayName: 'Cursor Grok 4.6 High',
+    upstreamModel: 'cursor-grok-4.6-high',
+    family: 'grok-4.6',
+    familyLabel: 'Cursor Grok 4.6',
+    effort: 'high',
+    fast: false,
+  },
+  {
+    id: 'cursor-grok-4.6-high-fast',
+    displayName: 'Cursor Grok 4.6 High Fast',
+    upstreamModel: 'cursor-grok-4.6-high-fast',
+    family: 'grok-4.6',
+    familyLabel: 'Cursor Grok 4.6',
+    effort: 'high',
+    fast: true,
+  },
+  {
+    id: 'cursor-grok-4.6-xhigh',
+    displayName: 'Cursor Grok 4.6 Extra High',
+    upstreamModel: 'cursor-grok-4.6-xhigh',
+    family: 'grok-4.6',
+    familyLabel: 'Cursor Grok 4.6',
+    effort: 'xhigh',
+    fast: false,
+  },
+  {
+    id: 'cursor-grok-4.6-xhigh-fast',
+    displayName: 'Cursor Grok 4.6 Extra High Fast',
+    upstreamModel: 'cursor-grok-4.6-xhigh-fast',
+    family: 'grok-4.6',
+    familyLabel: 'Cursor Grok 4.6',
+    effort: 'xhigh',
+    fast: true,
+  },
+  {
+    id: 'cursor-composer-2.5',
+    displayName: 'Cursor Composer 2.5',
+    upstreamModel: 'composer-2.5',
+    family: 'composer-2.5',
+    familyLabel: 'Cursor Composer 2.5',
+    effort: null,
+    fast: false,
+  },
+  {
+    id: 'cursor-composer-2.5-fast',
+    displayName: 'Cursor Composer 2.5 Fast',
+    upstreamModel: 'composer-2.5-fast',
+    family: 'composer-2.5',
+    familyLabel: 'Cursor Composer 2.5',
+    effort: null,
+    fast: true,
+  },
+  {
+    id: 'cursor-opus-5-low',
+    displayName: 'Cursor Opus 5 Low',
+    upstreamModel: 'claude-opus-5-thinking-low',
+    family: 'opus-5',
+    familyLabel: 'Cursor Opus 5',
+    effort: 'low',
+    fast: false,
+  },
+  {
+    id: 'cursor-opus-5-low-fast',
+    displayName: 'Cursor Opus 5 Low Fast',
+    upstreamModel: 'claude-opus-5-thinking-low-fast',
+    family: 'opus-5',
+    familyLabel: 'Cursor Opus 5',
+    effort: 'low',
+    fast: true,
+  },
+  {
+    id: 'cursor-opus-5-medium',
+    displayName: 'Cursor Opus 5 Medium',
+    upstreamModel: 'claude-opus-5-thinking-medium',
+    family: 'opus-5',
+    familyLabel: 'Cursor Opus 5',
+    effort: 'medium',
+    fast: false,
+  },
+  {
+    id: 'cursor-opus-5-medium-fast',
+    displayName: 'Cursor Opus 5 Medium Fast',
+    upstreamModel: 'claude-opus-5-thinking-medium-fast',
+    family: 'opus-5',
+    familyLabel: 'Cursor Opus 5',
+    effort: 'medium',
+    fast: true,
+  },
+  {
+    id: 'cursor-opus-5-high',
+    displayName: 'Cursor Opus 5 High',
+    upstreamModel: 'claude-opus-5-thinking-high',
+    family: 'opus-5',
+    familyLabel: 'Cursor Opus 5',
+    effort: 'high',
+    fast: false,
+  },
+  {
+    id: 'cursor-opus-5-high-fast',
+    displayName: 'Cursor Opus 5 High Fast',
+    upstreamModel: 'claude-opus-5-thinking-high-fast',
+    family: 'opus-5',
+    familyLabel: 'Cursor Opus 5',
+    effort: 'high',
+    fast: true,
+  },
+  {
+    id: 'cursor-opus-5-xhigh',
+    displayName: 'Cursor Opus 5 Extra High',
+    upstreamModel: 'claude-opus-5-thinking-xhigh',
+    family: 'opus-5',
+    familyLabel: 'Cursor Opus 5',
+    effort: 'xhigh',
+    fast: false,
+  },
+  {
+    id: 'cursor-opus-5-xhigh-fast',
+    displayName: 'Cursor Opus 5 Extra High Fast',
+    upstreamModel: 'claude-opus-5-thinking-xhigh-fast',
+    family: 'opus-5',
+    familyLabel: 'Cursor Opus 5',
+    effort: 'xhigh',
+    fast: true,
+  },
+  {
+    id: 'cursor-opus-5-max',
+    displayName: 'Cursor Opus 5 Max',
+    upstreamModel: 'claude-opus-5-thinking-max',
+    family: 'opus-5',
+    familyLabel: 'Cursor Opus 5',
+    effort: 'max',
+    fast: false,
+  },
+  {
+    id: 'cursor-opus-5-max-fast',
+    displayName: 'Cursor Opus 5 Max Fast',
+    upstreamModel: 'claude-opus-5-thinking-max-fast',
+    family: 'opus-5',
+    familyLabel: 'Cursor Opus 5',
+    effort: 'max',
+    fast: true,
+  },
+  {
+    id: 'cursor-fable-5-low',
+    displayName: 'Cursor Fable 5 Low (Non-ZDR)',
+    upstreamModel: 'claude-fable-5-thinking-low',
+    family: 'fable-5',
+    familyLabel: 'Cursor Fable 5',
+    effort: 'low',
+    fast: false,
+  },
+  {
+    id: 'cursor-fable-5-medium',
+    displayName: 'Cursor Fable 5 Medium (Non-ZDR)',
+    upstreamModel: 'claude-fable-5-thinking-medium',
+    family: 'fable-5',
+    familyLabel: 'Cursor Fable 5',
+    effort: 'medium',
+    fast: false,
+  },
+  {
+    id: 'cursor-fable-5-high',
+    displayName: 'Cursor Fable 5 High (Non-ZDR)',
+    upstreamModel: 'claude-fable-5-thinking-high',
+    family: 'fable-5',
+    familyLabel: 'Cursor Fable 5',
+    effort: 'high',
+    fast: false,
+  },
+  {
+    id: 'cursor-fable-5-xhigh',
+    displayName: 'Cursor Fable 5 Extra High (Non-ZDR)',
+    upstreamModel: 'claude-fable-5-thinking-xhigh',
+    family: 'fable-5',
+    familyLabel: 'Cursor Fable 5',
+    effort: 'xhigh',
+    fast: false,
+  },
+  {
+    id: 'cursor-fable-5-max',
+    displayName: 'Cursor Fable 5 Max (Non-ZDR)',
+    upstreamModel: 'claude-fable-5-thinking-max',
+    family: 'fable-5',
+    familyLabel: 'Cursor Fable 5',
+    effort: 'max',
+    fast: false,
+  },
+  {
+    id: 'cursor-grok-4.5-high',
+    displayName: 'Cursor Grok 4.5 High',
+    upstreamModel: 'cursor-grok-4.5-high',
+    family: 'grok-4.5',
+    familyLabel: 'Cursor Grok 4.5',
+    effort: 'high',
+    fast: false,
+  },
 ] as const
+
 export const CURSOR_ENGINE_MODEL_IDS = CURSOR_ENGINE_MODELS.map((m) => m.id)
 export type CursorEngineModelId = (typeof CURSOR_ENGINE_MODELS)[number]['id']
+export type CursorEngineModel = (typeof CURSOR_ENGINE_MODELS)[number]
 export const DEFAULT_CURSOR_ENGINE_MODEL: CursorEngineModelId = CURSOR_ENGINE_MODELS[0].id
 
 export function isCursorEngineModel(modelId: string | null | undefined): boolean {
   return typeof modelId === 'string' &&
     (CURSOR_ENGINE_MODEL_IDS as readonly string[]).includes(modelId)
+}
+
+export function cursorModelById(modelId: string | null | undefined): CursorEngineModel | undefined {
+  if (typeof modelId !== 'string') return undefined
+  return CURSOR_ENGINE_MODELS.find((model) => model.id === modelId)
+}
+
+export function cursorFamilyDefaultEffort(
+  family: CursorEngineFamilyId,
+): PlatformReasoningEffort | null {
+  if (family === 'auto' || family === 'composer-2.5') return null
+  return 'high'
+}
+
+export function cursorFamilyDefaultFast(family: CursorEngineFamilyId): boolean {
+  return family === 'composer-2.5'
+}
+
+export function cursorFamilySupportsFast(family: CursorEngineFamilyId): boolean {
+  return CURSOR_ENGINE_MODELS.some((model) => model.family === family && model.fast)
+}
+
+export function cursorFamilyEfforts(
+  family: CursorEngineFamilyId,
+): readonly PlatformReasoningEffort[] {
+  const present = new Set(
+    CURSOR_ENGINE_MODELS.filter((model) => model.family === family && model.effort !== null).map(
+      (model) => model.effort,
+    ),
+  )
+  return PLATFORM_REASONING_EFFORTS.filter((effort) => present.has(effort))
+}
+
+export function findCursorEngineModel(
+  family: CursorEngineFamilyId,
+  effort: PlatformReasoningEffort | null,
+  fast: boolean,
+): CursorEngineModel | undefined {
+  return CURSOR_ENGINE_MODELS.find(
+    (model) => model.family === family && model.effort === effort && model.fast === fast,
+  )
 }
 
 /** codex seed agent(id='codex')的固定模型 —— entrypoint desiredCodexAgent 同值。 */
@@ -126,6 +418,9 @@ export interface ModelReasoningPolicy {
  * - 其它可透传模型:统一五档。
  *
  * API、admin 校验、gateway 与前端都必须消费本函数或其 API 投影,不得另抄清单。
+ *
+ * Cursor 思考档编码在 canonical model id 里(见 CURSOR_ENGINE_MODELS.effort/fast),
+ * 不走 inbound.message.effort,故 supported 保持空数组。
  */
 export function modelReasoningPolicy(modelId: string): ModelReasoningPolicy {
   const codex = CODEX_ENGINE_MODELS.find((m) => m.id === modelId)

@@ -6,6 +6,10 @@ import {
   CURSOR_ENGINE_MODEL_IDS,
   DEFAULT_CODEX_ENGINE_MODEL,
   PLATFORM_REASONING_EFFORTS,
+  cursorFamilyDefaultFast,
+  cursorFamilyEfforts,
+  cursorFamilySupportsFast,
+  findCursorEngineModel,
   isCodexEngineModel,
   isCursorEngineModel,
   modelReasoningPolicy,
@@ -46,16 +50,30 @@ describe('GPT-5.6 engine model authority', () => {
 })
 
 describe('Cursor engine model authority', () => {
-  test('uses only the pinned CLI allowlist and excludes GPT/Codex entries', () => {
-    assert.deepEqual(CURSOR_ENGINE_MODELS, [
-      { id: 'cursor-auto', displayName: 'Cursor Auto', upstreamModel: null },
-      { id: 'cursor-grok-4.6-high', displayName: 'Cursor Grok 4.6 High', upstreamModel: 'cursor-grok-4.6-high' },
-      { id: 'cursor-grok-4.6-high-fast', displayName: 'Cursor Grok 4.6 High Fast', upstreamModel: 'cursor-grok-4.6-high-fast' },
-      { id: 'cursor-composer-2.5-fast', displayName: 'Cursor Composer 2.5 Fast', upstreamModel: 'composer-2.5-fast' },
-      { id: 'cursor-opus-5-high', displayName: 'Cursor Opus 5 High', upstreamModel: 'claude-opus-5-thinking-high' },
-      { id: 'cursor-fable-5-high', displayName: 'Cursor Fable 5 High (Non-ZDR)', upstreamModel: 'claude-fable-5-thinking-high' },
-      { id: 'cursor-grok-4.5-high', displayName: 'Cursor Grok 4.5 High', upstreamModel: 'cursor-grok-4.5-high' },
-    ])
+  test('pins CLI families with effort/fast metadata and excludes GPT/Codex entries', () => {
+    assert.equal(CURSOR_ENGINE_MODELS.length, 27)
+    assert.equal(CURSOR_ENGINE_MODELS[0].id, 'cursor-auto')
+    assert.deepEqual(
+      CURSOR_ENGINE_MODELS.find((m) => m.id === 'cursor-grok-4.6-high'),
+      {
+        id: 'cursor-grok-4.6-high',
+        displayName: 'Cursor Grok 4.6 High',
+        upstreamModel: 'cursor-grok-4.6-high',
+        family: 'grok-4.6',
+        familyLabel: 'Cursor Grok 4.6',
+        effort: 'high',
+        fast: false,
+      },
+    )
+    assert.equal(
+      findCursorEngineModel('opus-5', 'high', true)?.upstreamModel,
+      'claude-opus-5-thinking-high-fast',
+    )
+    assert.equal(findCursorEngineModel('composer-2.5', null, false)?.upstreamModel, 'composer-2.5')
+    assert.deepEqual(cursorFamilyEfforts('grok-4.6'), ['low', 'medium', 'high', 'xhigh'])
+    assert.equal(cursorFamilySupportsFast('fable-5'), false)
+    assert.equal(cursorFamilyDefaultFast('composer-2.5'), true)
+    assert.equal(modelReasoningPolicy('cursor-grok-4.6-high').supported.length, 0)
     for (const id of CURSOR_ENGINE_MODEL_IDS) assert.equal(isCursorEngineModel(id), true)
     assert.equal(isCursorEngineModel('gpt-5.6-sol-medium'), false)
     assert.equal(isCursorEngineModel('gpt-5.3-codex'), false)

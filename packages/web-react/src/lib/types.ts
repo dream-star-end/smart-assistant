@@ -536,6 +536,10 @@ export type UsageReportModel = {
   model: string;
   requests: string;
   credits: string;
+  input_tokens: string;
+  output_tokens: string;
+  cache_read_tokens: string;
+  cache_write_tokens: string;
 };
 
 /** 账本收支趋势单桶（credited=入账 / debited=支出，字符串大数）。 */

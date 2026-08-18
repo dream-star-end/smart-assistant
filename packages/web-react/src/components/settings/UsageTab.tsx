@@ -23,6 +23,11 @@ const WINDOWS: { value: UsageReportWindow; label: string }[] = [
   { value: "30d", label: "30 天" },
 ];
 
+const VIEWS: { value: "overview" | "by-model"; label: string }[] = [
+  { value: "overview", label: "总览" },
+  { value: "by-model", label: "按模型" },
+];
+
 /** 安全求和字符串大数（BigInt 精确，非法项跳过）。 */
 function sumBig(...vals: string[]): string {
   let acc = 0n;
@@ -76,6 +81,7 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
   const [hasMore, setHasMore] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [usageReloadTick, setUsageReloadTick] = useState(0);
+  const [usageView, setUsageView] = useState<"overview" | "by-model">("overview");
   /** 展开了组队明细的会话行(session_id 集合)。 */
   const [expandedDelegates, setExpandedDelegates] = useState<ReadonlySet<string>>(
     () => new Set<string>(),
@@ -258,12 +264,18 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
 
   return (
     <div className="flex flex-col">
-      {/* 窗口切换 pill（作用于下面整个图表区） */}
+      {/* 视图 + 窗口切换 pill（作用于下面整个图表区 / 按模型表） */}
       <div className="flex items-center justify-between gap-3 px-5 pt-4">
         <div className="text-[11px] font-medium uppercase tracking-wide text-faint">
-          用量总览 · 近 {REPORT_WINDOW_NOUN[window]}
+          {usageView === "overview" ? "用量总览" : "按模型统计"} · 近 {REPORT_WINDOW_NOUN[window]}
         </div>
-        <div className="overflow-x-auto">
+        <div className="flex min-w-0 items-center gap-2 overflow-x-auto">
+          <Tabs
+            aria-label="用量视图"
+            value={usageView}
+            onValueChange={(v) => setUsageView(v as "overview" | "by-model")}
+            items={VIEWS}
+          />
           <Tabs
             aria-label="统计窗口"
             value={window}
@@ -314,7 +326,45 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
               <Stat label={`输出 token · 近${REPORT_WINDOW_NOUN[window]}`} value={formatCompactCount(rs.output_tokens)} />
             </div>
 
-            {/* 图表区 grid（桌面 2 列，移动堆叠） */}
+            {usageView === "by-model" ? (
+            <div className="px-5 pb-4">
+              {report.models.length === 0 ? (
+                <p className="py-8 text-center text-[12.5px] text-faint">该时段暂无模型用量。</p>
+              ) : (
+                <div className="overflow-x-auto rounded-xl border border-border">
+                  <table className="w-full min-w-[40rem] text-left text-[12.5px]">
+                    <caption className="sr-only">
+                      {`按模型用量，近 ${REPORT_WINDOW_NOUN[window]}`}
+                    </caption>
+                    <thead className="bg-hover text-[11px] font-medium uppercase tracking-wide text-faint">
+                      <tr>
+                        <th className="px-3 py-2">模型</th>
+                        <th className="px-3 py-2 text-right">请求</th>
+                        <th className="px-3 py-2 text-right">输入</th>
+                        <th className="px-3 py-2 text-right">输出</th>
+                        <th className="px-3 py-2 text-right">缓存命中</th>
+                        <th className="px-3 py-2 text-right">缓存写入</th>
+                        <th className="px-3 py-2 text-right">积分</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {report.models.map((model) => (
+                        <tr key={model.model} className="border-t border-border">
+                          <td className="px-3 py-2 font-mono text-fg">{model.model}</td>
+                          <td className="px-3 py-2 text-right tabular-nums">{groupDigits(model.requests)}</td>
+                          <td className="px-3 py-2 text-right tabular-nums">{formatCompactCount(model.input_tokens)}</td>
+                          <td className="px-3 py-2 text-right tabular-nums">{formatCompactCount(model.output_tokens)}</td>
+                          <td className="px-3 py-2 text-right tabular-nums">{formatCompactCount(model.cache_read_tokens)}</td>
+                          <td className="px-3 py-2 text-right tabular-nums">{formatCompactCount(model.cache_write_tokens)}</td>
+                          <td className="px-3 py-2 text-right tabular-nums font-medium">{formatCredits(model.credits)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+            ) : (
             <div className="grid grid-cols-1 gap-3 px-5 pb-4 sm:grid-cols-2">
               <ChartCard
                 title="积分消耗趋势"
@@ -395,6 +445,7 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
                 )}
               </ChartCard>
             </div>
+            )}
           </>
         )
       )}

@@ -138,3 +138,62 @@ describe("ModelSelector provider 健康度降级(0108)", () => {
     expect(screen.queryByRole("note")).toBeNull();
   });
 });
+
+describe("ModelSelector Cursor 家族 + 思考档 + Fast", () => {
+  const CURSOR_MODELS: PublicModel[] = [
+    { id: "cursor-auto", display_name: "Cursor Auto" },
+    { id: "cursor-grok-4.6-high", display_name: "Cursor Grok 4.6 High" },
+    { id: "cursor-grok-4.6-high-fast", display_name: "Cursor Grok 4.6 High Fast" },
+    { id: "cursor-grok-4.6-low", display_name: "Cursor Grok 4.6 Low" },
+    { id: "cursor-grok-4.6-low-fast", display_name: "Cursor Grok 4.6 Low Fast" },
+    { id: "glm-5.2", display_name: "GLM-5.2" },
+    { id: "cursor-fable-5-high", display_name: "Cursor Fable 5 High (Non-ZDR)" },
+  ];
+
+  it("触发器显示家族名而不是 High Fast 组合名", () => {
+    render(
+      <ModelSelector models={CURSOR_MODELS} selectedId="cursor-grok-4.6-high-fast" onSelect={() => {}} />,
+    );
+    const trigger = screen.getByRole("button", { name: "选择对话模型" });
+    expect(trigger.textContent).toContain("Cursor Grok 4.6");
+    expect(trigger.textContent).not.toContain("High Fast");
+  });
+
+  it("菜单按家族收拢，思考档和 Fast 可独立改写 canonical id", async () => {
+    const onSelect = vi.fn();
+    render(
+      <ModelSelector
+        models={CURSOR_MODELS}
+        selectedId="cursor-grok-4.6-high-fast"
+        onSelect={onSelect}
+      />,
+    );
+    openMenu(screen.getByRole("button", { name: "选择对话模型" }));
+    await screen.findAllByRole("menuitem");
+    expect(document.querySelector('[data-cursor-family="grok-4.6"]')).toBeTruthy();
+    expect(screen.getAllByText("Cursor Grok 4.6").length).toBeGreaterThan(0);
+    expect(screen.queryByText("Cursor Grok 4.6 High Fast")).toBeNull();
+
+    const standard = document.querySelector('[data-fast="false"]');
+    expect(standard).toBeTruthy();
+    if (standard) fireEvent.click(standard);
+    expect(onSelect).toHaveBeenCalledWith("cursor-grok-4.6-high");
+
+    onSelect.mockClear();
+    openMenu(screen.getByRole("button", { name: "选择对话模型" }));
+    await screen.findAllByRole("menuitem");
+    const low = document.querySelector('[data-effort="low"]');
+    expect(low).toBeTruthy();
+    if (low) fireEvent.click(low);
+    expect(onSelect).toHaveBeenCalledWith("cursor-grok-4.6-low-fast");
+  });
+
+  it("Fable 没有 Fast 开关", async () => {
+    render(
+      <ModelSelector models={CURSOR_MODELS} selectedId="cursor-fable-5-high" onSelect={() => {}} />,
+    );
+    openMenu(screen.getByRole("button", { name: "选择对话模型" }));
+    await screen.findAllByRole("menuitem");
+    expect(document.querySelector('[data-fast="true"]')).toBeNull();
+  });
+});

@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, test } from 'node:test'
 import { type OpenClaudeConfig, paths } from '@openclaude/storage'
+import { CURSOR_ENGINE_MODELS } from '@openclaude/protocol'
 import {
   CURSOR_MAX_PLATFORM_ENVELOPE_BYTES,
   CURSOR_MAX_PROMPT_ARG_BYTES,
@@ -1196,15 +1197,10 @@ console.log(JSON.stringify({type:'result',subtype:'success',is_error:false}));
     await chmod(fake, 0o755)
     const oldBin = process.env.OC_CURSOR_WRAPPER_BIN
     process.env.OC_CURSOR_WRAPPER_BIN = fake
-    const models: Array<[string, string | null]> = [
-      ['cursor-auto', null],
-      ['cursor-grok-4.6-high', 'cursor-grok-4.6-high'],
-      ['cursor-grok-4.6-high-fast', 'cursor-grok-4.6-high-fast'],
-      ['cursor-composer-2.5-fast', 'composer-2.5-fast'],
-      ['cursor-opus-5-high', 'claude-opus-5-thinking-high'],
-      ['cursor-fable-5-high', 'claude-fable-5-thinking-high'],
-      ['cursor-grok-4.5-high', 'cursor-grok-4.5-high'],
-    ]
+    const models: Array<[string, string | null]> = CURSOR_ENGINE_MODELS.map((model) => [
+      model.id,
+      model.upstreamModel,
+    ])
     try {
       for (const [model] of models) {
         const adapter = new CursorAdapter(opts(dir, model))

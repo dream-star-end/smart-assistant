@@ -136,8 +136,17 @@ done
 [ "$#" -gt 0 ] || die "a prompt is required"
 
 case "$model" in
-  ""|cursor-grok-4.6-high|cursor-grok-4.6-high-fast|composer-2.5-fast|claude-opus-5-thinking-high|\
-  claude-fable-5-thinking-high|cursor-grok-4.5-high) ;;
+  ""|cursor-grok-4.6-low|cursor-grok-4.6-low-fast|cursor-grok-4.6-medium|cursor-grok-4.6-medium-fast|\
+  cursor-grok-4.6-high|cursor-grok-4.6-high-fast|cursor-grok-4.6-xhigh|cursor-grok-4.6-xhigh-fast|\
+  composer-2.5|composer-2.5-fast|\
+  claude-opus-5-thinking-low|claude-opus-5-thinking-low-fast|\
+  claude-opus-5-thinking-medium|claude-opus-5-thinking-medium-fast|\
+  claude-opus-5-thinking-high|claude-opus-5-thinking-high-fast|\
+  claude-opus-5-thinking-xhigh|claude-opus-5-thinking-xhigh-fast|\
+  claude-opus-5-thinking-max|claude-opus-5-thinking-max-fast|\
+  claude-fable-5-thinking-low|claude-fable-5-thinking-medium|claude-fable-5-thinking-high|\
+  claude-fable-5-thinking-xhigh|claude-fable-5-thinking-max|\
+  cursor-grok-4.5-high) ;;
   *) die "model is not allowlisted" ;;
 esac
 
