@@ -10,7 +10,8 @@ Requires=openclaude-v5-selfhost-hostnet.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/bash /opt/openclaude/openclaude-v5-selfhost/deploy/v5-selfhost/sshgate-insert.sh
+# 开机跑固定目录副本(不跟 live rel 变)。每次 --deploy/--cutover 成功后从新 rel 同步。
+ExecStart=/bin/bash /opt/openclaude/v5-selfhost-breakglass/boot/sshgate-insert.sh
 
 [Install]
 WantedBy=multi-user.target

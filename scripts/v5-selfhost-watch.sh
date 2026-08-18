@@ -98,6 +98,8 @@ parse_kv_file() {
 # 活且未过期的发布锁才豁免。死 pid / 过期 started / 无 holder / PID reuse → 不当豁免。
 # 必须同时满足: holder pid 仍活、/proc/pid/stat starttime 与 holder 记录一致、未超 TTL。
 # 不再单靠 fuser pid 存活(PID 号复用会误豁免)。
+# 无 holder 的空 flock = 没人在部署:不当豁免,但不打 WARN(避免 30s 噪音)。
+# 真有 holder 但 pid 死 / starttime 不匹配 / 过期才 WARN。
 lock_is_live_exemption() {
   local lock="$WATCH_LOCK" holder pid started starttime started_epoch now age cur_st
   [[ -f "$lock" && ! -L "$lock" ]] || return 1
@@ -109,6 +111,9 @@ lock_is_live_exemption() {
     pid="$(sed -n 's/^pid=\([0-9][0-9]*\).*/\1/p' "$holder" | head -n1 || true)"
     started="$(sed -n 's/.*started=\([^[:space:]]*\).*/\1/p' "$holder" | head -n1 || true)"
     starttime="$(sed -n 's/.*starttime=\([0-9][0-9]*\).*/\1/p' "$holder" | head -n1 || true)"
+  fi
+  if [[ -z "$pid" ]]; then
+    return 1
   fi
   now="$(watch_now)"
   if [[ -n "$started" ]]; then
@@ -128,8 +133,8 @@ lock_is_live_exemption() {
     wlog "WARN lock 过期 age=${age}s ttl=${WATCH_LOCK_TTL_SEC}s 不当豁免"
     return 1
   fi
-  if [[ -z "$pid" ]] || ! pid_alive "$pid"; then
-    wlog "WARN lock 无活 holder pid 不当豁免 holder_pid=${pid:-none}"
+  if ! pid_alive "$pid"; then
+    wlog "WARN lock 无活 holder pid 不当豁免 holder_pid=$pid"
     return 1
   fi
   if [[ -z "$starttime" ]]; then
@@ -724,6 +729,25 @@ watch_selftest() {
   fi
   echo "PASS 场景10: dry 不写 fail-count/disarm/manual"
   export WATCH_DRY=0
+
+  echo "===== 场景11: 空 flock 无 holder → 不当豁免且不打 WARN ====="
+  rm -f -- "${WATCH_LOCK}.holder"
+  : >"$WATCH_LOCK"
+  write_fail_count 0
+  rm -f -- "$WATCH_DISARM" "$WATCH_MANUAL_RECOVERY"
+  printf 'until=1\n' >"$WATCH_GRACE"
+  export WATCH_STUB_MASTER=fail WATCH_STUB_EGRESS=ok
+  export WATCH_NOW_OVERRIDE=""
+  log_before="$(wc -l <"$WATCH_LOG" | tr -d '[:space:]')"
+  watch_once || true
+  echo "fail_count=$(read_fail_count) (期望>=1,空锁不当豁免)"
+  [[ "$(read_fail_count)" -ge 1 ]] || { echo "FAIL 场景11 空锁被豁免"; return 1; }
+  if tail -n +"$((log_before + 1))" "$WATCH_LOG" | grep -q "WARN lock"; then
+    echo "FAIL 场景11 空锁仍打 WARN"
+    tail -n +"$((log_before + 1))" "$WATCH_LOG"
+    return 1
+  fi
+  echo "PASS 场景11: 空锁无 holder 不打 WARN"
 
   echo "SELFTEST_ALL_PASS"
   echo "log=$WATCH_LOG"

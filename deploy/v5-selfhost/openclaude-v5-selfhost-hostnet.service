@@ -9,7 +9,8 @@ Requires=docker.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/bash /opt/openclaude/openclaude-v5-selfhost/packages/commercial/scripts/setup-host-net.sh v5
+# 开机跑固定目录副本(不跟 live rel 变)。每次 --deploy/--cutover 成功后从新 rel 同步。
+ExecStart=/bin/bash /opt/openclaude/v5-selfhost-breakglass/boot/setup-host-net.sh v5
 
 [Install]
 WantedBy=multi-user.target

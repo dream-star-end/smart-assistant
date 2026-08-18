@@ -121,6 +121,7 @@ die() {
 # shellcheck source=scripts/v5-selfhost-master-release-lib.sh
 # shellcheck disable=SC1091
 source "$MASTER_RELEASE_LIB"
+BOOT_SCRIPT_DIR="${BOOT_SCRIPT_DIR:-${BREAKGLASS_ROOT}/boot}"
 
 log() { echo "$*"; }
 
@@ -847,7 +848,7 @@ ensure_home_config() {
   },
   "auth": {
     "mode": "custom_platform",
-    "claudeCodePath": "${REPO_ROOT}/claude-code-best",
+    "claudeCodePath": "${MASTER_LIVE_LINK}/claude-code-best",
     "claudeCodeEntry": "src/entrypoints/cli.tsx",
     "claudeCodeRuntime": "bun"
   },
@@ -1059,18 +1060,68 @@ install_unit() {
   install -m 0644 "$src" "/etc/systemd/system/$name" || return 1
 }
 
+# 把开机 oneshot 脚本拷到固定目录。ExecStart 不跟 rel-* 变,也不钉 git 工作树。
+sync_boot_scripts_from() {
+  local src="$1" hostnet_src sshgate_src tmp
+  [[ -n "$src" && -d "$src" ]] || die "sync_boot_scripts_from: 缺源目录 $src"
+  hostnet_src="$src/packages/commercial/scripts/setup-host-net.sh"
+  sshgate_src="$src/deploy/v5-selfhost/sshgate-insert.sh"
+  [[ -f "$hostnet_src" && ! -L "$hostnet_src" ]] || die "缺 setup-host-net.sh: $hostnet_src"
+  [[ -f "$sshgate_src" && ! -L "$sshgate_src" ]] || die "缺 sshgate-insert.sh: $sshgate_src"
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] install $hostnet_src + $sshgate_src → $BOOT_SCRIPT_DIR"
+    return 0
+  fi
+  mkdir -p -- "$BOOT_SCRIPT_DIR"
+  tmp="$(mktemp -d -- "$BOOT_SCRIPT_DIR/.staging.XXXXXX")"
+  install -m 0755 "$hostnet_src" "$tmp/setup-host-net.sh"
+  install -m 0755 "$sshgate_src" "$tmp/sshgate-insert.sh"
+  mv -f -- "$tmp/setup-host-net.sh" "$BOOT_SCRIPT_DIR/setup-host-net.sh"
+  mv -f -- "$tmp/sshgate-insert.sh" "$BOOT_SCRIPT_DIR/sshgate-insert.sh"
+  rmdir -- "$tmp"
+  log "  ✓ 已同步开机脚本 → $BOOT_SCRIPT_DIR (from $src)"
+}
+
+# 优先当前 live;尚未翻转时用工作树(仅 bootstrap)。
+sync_boot_scripts_best_effort() {
+  local live_root=""
+  if [[ -L "$MASTER_LIVE_LINK" ]]; then
+    live_root="$(readlink -f "$MASTER_LIVE_LINK" 2>/dev/null || true)"
+  fi
+  if [[ -n "$live_root" && -d "$live_root" ]]; then
+    sync_boot_scripts_from "$live_root"
+  else
+    sync_boot_scripts_from "$REPO_ROOT"
+  fi
+}
+
+assert_aux_execstart_not_worktree() {
+  local u line
+  [[ "$DRY" == 1 ]] && return 0
+  for u in "$V5_HOSTNET_UNIT" "$V5_SSHGATE_UNIT"; do
+    line="$(grep -E '^ExecStart=' "/etc/systemd/system/$u" || true)"
+    [[ -n "$line" ]] || die "aux unit $u 缺 ExecStart"
+    if [[ "$line" == *"/opt/openclaude/openclaude-v5-selfhost/"* && "$line" != *"-live"* ]]; then
+      die "aux unit $u ExecStart 仍钉工作树: $line"
+    fi
+  done
+}
+
 install_aux_units() {
   log "── 安装辅助 systemd unit(hostnet/sshgate/tunnel;master/egress 只从候选 release snapshot 装) ──"
+  sync_boot_scripts_best_effort
   install_unit "$UNIT_DIR/$V5_HOSTNET_UNIT"
   install_unit "$UNIT_DIR/$V5_SSHGATE_UNIT"
   install_unit "$UNIT_DIR/$V5_TUNNEL_UNIT"
   run "systemctl daemon-reload"
   run "systemctl enable '$V5_HOSTNET_UNIT' '$V5_SSHGATE_UNIT'"
+  assert_aux_execstart_not_worktree
 }
 
 install_units() {
   log "── 安装 systemd unit ──"
   assert_unit_templates_live_wd "$UNIT_DIR"
+  sync_boot_scripts_best_effort
   install_unit "$UNIT_DIR/$V5_HOSTNET_UNIT"
   install_unit "$UNIT_DIR/$V5_SSHGATE_UNIT"
   install_unit "$UNIT_DIR/$V5_EGRESS_UNIT"
@@ -1078,6 +1129,7 @@ install_units() {
   install_unit "$UNIT_DIR/$V5_TUNNEL_UNIT"
   run "systemctl daemon-reload"
   run "systemctl enable '$V5_HOSTNET_UNIT' '$V5_SSHGATE_UNIT'"
+  assert_aux_execstart_not_worktree
 }
 
 restart_sshgate() {
@@ -1868,6 +1920,7 @@ cmd_cutover() {
     || die "无法持久化 phase=committed。smoke 已通过,拒绝报告成功(survivor 仍可能误恢复)。"
   cutover_disarm_survivor \
     || die "disarm 失败: committed marker 未确认写入。smoke 已通过,拒绝报告成功。"
+  sync_boot_scripts_from "$rel"
   cutover_clog "✓ --cutover 完成 live → $rel"
 }
 
