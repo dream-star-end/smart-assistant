@@ -36,6 +36,7 @@ import {
 import { thinkingSegments, thinkingSummaryTitle } from "../../lib/thinkingText";
 import { cn, groupDigits } from "../../lib/utils";
 import { Markdown } from "../Markdown";
+import { OptionsGroupFooter, OptionsGroupProvider } from "../optionsGroup";
 import { Alert, Avatar, Badge, Button, IconButton } from "../ui";
 import { ChildBlockView, ProgressivePlainText } from "./AgentGroupCard";
 import { Media } from "./media";
@@ -593,9 +594,15 @@ export function AssistantCard({
               内部串类正文不进这里(bodyText 为空),只由下方红卡按码文案承载;
             - 流式已起但正文尚空 → 本轮活动指示取代裸三点。 */}
         {msg.text && !hasError ? (
-          <ProgressiveMarkdown text={msg.text} live={live} />
+          <OptionsGroupProvider>
+            <ProgressiveMarkdown text={msg.text} live={live} />
+            <OptionsGroupFooter />
+          </OptionsGroupProvider>
         ) : hasError && !isUserCancelled && presentedError?.bodyText ? (
-          <ProgressiveMarkdown text={presentedError.bodyText} />
+          <OptionsGroupProvider>
+            <ProgressiveMarkdown text={presentedError.bodyText} />
+            <OptionsGroupFooter />
+          </OptionsGroupProvider>
         ) : live && !hasError && !ctx.activityInFooter ? (
           ctx.turnActivity ? <TurnActivity info={ctx.turnActivity} /> : <TypingDots />
         ) : null}

@@ -575,13 +575,14 @@ do not claim or call a tool unless it is present in your current tool list.
 
 This hosted run is noninteractive, so the runtime resolves Cursor's native
 ask-question tool instantly as "Questions skipped by the user" — the user
-never sees the prompt and no answer will arrive. Never call the native ask-question tool. To ask the user a multiple-choice question, write exactly
-one fenced \`options\` code block (language tag must be \`options\`) in your
-reply, then end the turn immediately. The block must be a single JSON object
+never sees the prompt and no answer will arrive. Never call the native ask-question tool. To ask the user a multiple-choice question, write
+fenced \`options\` code blocks (language tag must be \`options\`) in your
+reply, then end the turn immediately. Each block must be a single JSON object
 with fields \`question?: string\`, \`multi?: boolean\` (multi-select only when
 exactly \`true\`), and \`options: Array<{label: string, desc?: string}>\`
 (1–12 items; more than 12 makes the whole block fail). One reply may contain
-at most one options block (ask one question at a time). The user's click
+at most 4 options blocks; multiple blocks in the same reply are aggregated
+into a single submission. The user's click
 arrives as your next ordinary user message.
 Subagents have no user-facing UI — decide yourself, or present numbered
 options as plain text and end the turn; the user's next message carries

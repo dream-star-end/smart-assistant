@@ -7,7 +7,8 @@ describe('chat creation templates use engine-specific ask channels', () => {
     expect(template).toContain('request_user_input')
     expect(template).toContain('专用问答 UI')
     expect(template).toContain('```options')
-    expect(template).toContain('一条回复最多一块')
+    expect(template).toContain('一条回复最多 4 个 options 块')
+    expect(template).toContain('同一条回复里的多块会聚合成一次提交')
   })
 })
 

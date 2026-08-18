@@ -2,6 +2,7 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../../lib/chat/model";
+import { ChatInteractionContext } from "../tool/context";
 import { AssistantCard, type CardCallbacks, type RenderCtx, UserCard } from "./cards";
 
 afterEach(cleanup);
@@ -338,5 +339,72 @@ describe("AssistantCard 失败轮部分正文(Codex 审计 R6)", () => {
     expect(screen.getByText("本轮已自动免单")).toBeInTheDocument();
     // 免单红卡:精确「重试」不显(waived → 非可重试)。
     expect(screen.queryByRole("button", { name: "重试" })).toBeNull();
+  });
+});
+
+
+describe("AssistantCard options 多题聚合", () => {
+  const idleCtx: RenderCtx = { isLast: true, sending: false, inActiveTurn: true };
+
+  function fence(payload: object): string {
+    return "```options\n" + JSON.stringify(payload) + "\n```";
+  }
+
+  test("单块保持点击即发,不出现组页脚", async () => {
+    const sendUserText = vi.fn();
+    const text = fence({
+      question: "选一个部署方式?",
+      options: [
+        { label: "灰度发布", desc: "先小流量" },
+        { label: "全量发布" },
+      ],
+    });
+    render(
+      <ChatInteractionContext.Provider value={{ sendUserText }}>
+        <AssistantCard
+          msg={{ id: "a-opt-1", role: "assistant", text, ts: 1 } as ChatMessage}
+          ctx={idleCtx}
+          cb={{}}
+        />
+      </ChatInteractionContext.Provider>,
+    );
+    fireEvent.click(await screen.findByText("灰度发布"));
+    expect(sendUserText).toHaveBeenCalledWith("我选择:灰度发布");
+    expect(sendUserText).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("发送选择")).toBeNull();
+    expect(screen.queryByText(/已作答/)).toBeNull();
+  });
+
+  test("多块点第一题不发送,答完后由页脚聚合成一条消息", async () => {
+    const sendUserText = vi.fn();
+    const text = [
+      fence({ question: "风格?", options: [{ label: "正式" }, { label: "轻松" }] }),
+      fence({
+        question: "输出?",
+        multi: true,
+        options: [{ label: "要点" }, { label: "全文" }],
+      }),
+    ].join("\n\n");
+    render(
+      <ChatInteractionContext.Provider value={{ sendUserText }}>
+        <AssistantCard
+          msg={{ id: "a-opt-2", role: "assistant", text, ts: 1 } as ChatMessage}
+          ctx={idleCtx}
+          cb={{}}
+        />
+      </ChatInteractionContext.Provider>,
+    );
+    fireEvent.click(await screen.findByText("正式"));
+    expect(sendUserText).not.toHaveBeenCalled();
+    const sendBtn = await screen.findByRole("button", { name: "发送选择" });
+    expect(sendBtn).toBeDisabled();
+    fireEvent.click(screen.getByText("要点"));
+    expect(sendBtn).toBeEnabled();
+    fireEvent.click(sendBtn);
+    expect(sendUserText).toHaveBeenCalledTimes(1);
+    const sent = sendUserText.mock.calls[0][0] as string;
+    expect(sent).toContain("我的选择:");
+    expect(sent).toContain("风格?:正式");
+    expect(sent).toContain("输出?:要点");
   });
 });
