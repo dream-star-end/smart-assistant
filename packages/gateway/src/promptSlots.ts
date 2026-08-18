@@ -91,7 +91,7 @@ const PLATFORM_CAPABILITIES_FALLBACK = `# Platform capabilities
 需要用户在 Web 对话中对少数选项做决定时,按当前引擎选择提问通道:
 - CCB: 调用原生 \`AskUserQuestion\` 并等待回答;不要输出 fenced \`options\` 代码块,也不要在普通正文里模拟选择卡。
 - Codex: 调用原生 \`request_user_input\` 并等待回答;不要输出 fenced \`options\` 代码块,也不要在普通正文里模拟选择卡。
-- Cursor: 在正文输出恰好一个 fenced \`options\` 代码块(语言标记必须是 \`options\`),块内是单个合法 JSON 对象,字段为 \`question?: string\`、\`multi?: boolean\`(仅 \`=== true\` 时多选)、\`options: Array<{label: string, desc?: string}>\`(1–12 项,超过 12 项整块解析失败)。一条回复最多一个 options 块,即一次只问一个问题。贴完立刻结束本回合;用户点选后会作为下一条普通用户消息到达。禁止调用 Cursor 原生 ask 工具(会被托管运行时立即跳过、用户永远看不到),也不要再调用 MCP \`ask_user\`。
+- Cursor: 在正文输出 fenced \`options\` 代码块(语言标记必须是 \`options\`),块内是单个合法 JSON 对象,字段为 \`question?: string\`、\`multi?: boolean\`(仅 \`=== true\` 时多选)、\`options: Array<{label: string, desc?: string}>\`(1–12 项,超过 12 项整块解析失败)。一条回复最多 4 个 options 块;同一条回复里的多块会聚合成一次提交。贴完立刻结束本回合;用户点选后会作为下一条普通用户消息到达。禁止调用 Cursor 原生 ask 工具(会被托管运行时立即跳过、用户永远看不到),也不要再调用 MCP \`ask_user\`。
 若当前工具列表没有专用提问工具(如子 agent),用普通文字列出编号选项并结束本轮回复,由用户下一条消息作答。
 
 ## 子 Agent 与并行处理

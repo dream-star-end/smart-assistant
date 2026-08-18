@@ -717,6 +717,11 @@ export interface AgentSession {
    * set this for an engine switch or a lost native id so the fallback replay
    * can announce a rebuild. Do not set it on a successful native resume. */
   _contextRebuildNotice?: 'engine-switch' | 'native-resume-loss'
+  /**
+   * getOrCreate 跨 engine / workspace 替换期间置位:旧 session 在 runner.shutdown()
+   * 完成前仍留在 sessions map。无票 inbound 取样到此标记则不得沿用其 model。
+   */
+  _replacing?: boolean
   /** Platform-executed exchanges not yet observed in master history. A
    * transient master-sink failure can durably queue the assistant row while
    * the very next user turn arrives first; this session-local tail keeps that
@@ -2989,6 +2994,9 @@ export class SessionManager {
             'PROMPT_QUEUE_EXECUTION_INVARIANT: engine switch cannot replace an active queue session',
           )
         }
+        // 旧 session 在 shutdown() 完成前仍留在 map;无票 inbound 不得沿用其 model。
+        // 放在不变量检查之后:检查失败不会留下粘滞 _replacing。
+        existing._replacing = true
         // Same logical client session, but the desired engine changed (model
         // switch across engines, or agent switched between CCB and Codex).
         // Native resume ids are engine-specific, so tear down the old runner

@@ -575,13 +575,14 @@ do not claim or call a tool unless it is present in your current tool list.
 
 This hosted run is noninteractive, so the runtime resolves Cursor's native
 ask-question tool instantly as "Questions skipped by the user" — the user
-never sees the prompt and no answer will arrive. Never call the native ask-question tool. To ask the user a multiple-choice question, write exactly
-one fenced \`options\` code block (language tag must be \`options\`) in your
-reply, then end the turn immediately. The block must be a single JSON object
+never sees the prompt and no answer will arrive. Never call the native ask-question tool. To ask the user a multiple-choice question, write
+fenced \`options\` code blocks (language tag must be \`options\`) in your
+reply, then end the turn immediately. Each block must be a single JSON object
 with fields \`question?: string\`, \`multi?: boolean\` (multi-select only when
 exactly \`true\`), and \`options: Array<{label: string, desc?: string}>\`
 (1–12 items; more than 12 makes the whole block fail). One reply may contain
-at most one options block (ask one question at a time). The user's click
+at most 4 options blocks; multiple blocks in the same reply are aggregated
+into a single submission. The user's click
 arrives as your next ordinary user message.
 Subagents have no user-facing UI — decide yourself, or present numbered
 options as plain text and end the turn; the user's next message carries
@@ -1517,7 +1518,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
       throw err
     }
   }
-  private emitText(ctx: TurnCtx, kind: 'text' | 'thinking', value: unknown): void {
+  private emitText(ctx: TurnCtx, kind: 'text' | 'thinking', value: unknown, separate = false): void {
     const valueText = textOf(value); if (!valueText) return
     const segments = kind === 'text' ? ctx.assistantSegments : ctx.thinkingSegments
     const segmentClosed = kind === 'text' ? ctx.assistantSegmentClosed : ctx.thinkingSegmentClosed
@@ -1527,10 +1528,15 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
       else ctx.thinkingSegmentClosed = false
     }
     const segment = segments.at(-1)!
-    segment.text += valueText
-    if (kind === 'text') ctx.assistantText += valueText; else ctx.thinkingText += valueText
+    // Complete assistant events (separate=true) need a block boundary so a
+    // closing fence is not glued to the next paragraph. Partial deltas never
+    // pass separate, so intra-message token joins stay byte-identical.
+    const glue = separate && kind === 'text' && segment.text.length > 0 && !segment.text.endsWith('\n') ? '\n\n' : ''
+    const appended = glue + valueText
+    segment.text += appended
+    if (kind === 'text') ctx.assistantText += appended; else ctx.thinkingText += appended
     const messageIdBase = kind === 'text' ? ctx.params.assistantMessageId : ctx.params.thinkingMessageId
-    ctx.params.onEvent({ kind: 'block', block: { kind, text: valueText, ...(messageIdBase ? { messageId: `${messageIdBase}-s${segment.index}` } : {}) } })
+    ctx.params.onEvent({ kind: 'block', block: { kind, text: appended, ...(messageIdBase ? { messageId: `${messageIdBase}-s${segment.index}` } : {}) } })
   }
   private handleLine(ctx: TurnCtx, line: string): void {
     let event: CursorEvent
@@ -1553,7 +1559,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
       const partialDelta = officialNested && typeof event.timestamp_ms === 'number' && event.model_call_id === undefined
       if (partialDelta && value === ctx.assistantPartialText && ctx.assistantPartialText) ctx.pendingAssistantText = value
       else if (partialDelta) { ctx.assistantPartialText += value; this.emitText(ctx, 'text', value) }
-      else { if (value !== ctx.assistantPartialText) this.emitText(ctx, 'text', value); ctx.assistantPartialText = '' }
+      else { if (value !== ctx.assistantPartialText) this.emitText(ctx, 'text', value, true); ctx.assistantPartialText = '' }
       return
     }
     if (type === 'text' || type === 'assistant_delta') { this.emitText(ctx, 'text', event.text ?? event.content ?? event.delta); return }

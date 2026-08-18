@@ -629,6 +629,65 @@ export interface LocalExecutionDecision {
   readonly supportsVision: boolean
   /** 非空 = 发生了 codex → 非 codex 降级('synthetic' kind);原模型供透明披露(MAJOR-2)。 */
   readonly downgradedFrom?: string
+  /**
+   * 无票 inbound 试图沿用存活 runner 的 model,但 catalog 不可用/未授权/豁免门未开
+   * 而回退到原阶梯时的说明。成功沿用或冷启动(没有 liveSessionModel)时缺省。
+   */
+  readonly liveSessionFallback?: { readonly from: string; readonly reason: string }
+}
+
+/** 无票 inbound 沿用会话模型失败时的可检索 warn 文案(字段:liveModel/reason/fallbackModel)。 */
+export const TICKETLESS_INBOUND_LIVE_SESSION_FALLBACK_WARN =
+  '无票 inbound 沿用会话模型失败'
+
+/** 无票 inbound 沿用会话模型失败:session 正在 getOrCreate 替换/关闭。 */
+export const TICKETLESS_LIVE_SESSION_REPLACING_REASON = 'session_replacing'
+
+type LiveRunnerSessionView = {
+  runner?: { model?: string }
+  model?: string
+  _replacing?: boolean
+}
+
+function peekLiveRunnerModel(session: LiveRunnerSessionView): string | undefined {
+  const runnerModel = session.runner?.model
+  if (typeof runnerModel === 'string' && runnerModel !== '') return runnerModel
+  const sessionModel = session.model
+  if (typeof sessionModel === 'string' && sessionModel !== '') return sessionModel
+  return undefined
+}
+
+/** session 正在替换/关闭 → 不得沿用其 model。 */
+export function liveSessionReuseSkipReason(
+  session: LiveRunnerSessionView | undefined | null,
+): string | undefined {
+  if (session?._replacing === true) return TICKETLESS_LIVE_SESSION_REPLACING_REASON
+  return undefined
+}
+
+/**
+ * 从内存中的存活 runner 读当前实际在跑的 model。
+ * 优先 runner.model(进程正在用的),其次 session.model。
+ * **不读** client_sessions.model_id(那只是 UI 恢复提示,不是执行权威)。
+ * 命中正在替换/关闭 → undefined(等价冷启动,走原阶梯)。
+ */
+export function readLiveRunnerModel(
+  session: LiveRunnerSessionView | undefined | null,
+): string | undefined {
+  if (!session) return undefined
+  if (liveSessionReuseSkipReason(session) !== undefined) return undefined
+  return peekLiveRunnerModel(session)
+}
+
+/** 存活 runner 的 model 为何不能沿用。undefined = catalog 认为可路由。 */
+export function liveSessionModelUnusableReason(view: LocalCatalogView, raw: string): string | undefined {
+  const canonicalModel = view.canonicalize(raw)
+  const descriptor = view.resolve(canonicalModel)
+  if (descriptor == null) return 'not_in_projection'
+  if (descriptor.available === false) return 'unavailable'
+  if (!view.isRoutable(canonicalModel)) return 'unroutable'
+  if (descriptor.engine === undefined) return 'no_engine'
+  return undefined
 }
 
 /**
@@ -644,10 +703,24 @@ export function decideLocalExecution(args: {
   agent: Pick<AgentDef, 'id' | 'model' | 'provider'>
   /** caller 显式指定的模型(cron 降级模型 / skill-train 模型 / inbound frame.model)。 */
   model?: string
+  /**
+   * 无票 inbound 且该 sessionKey 已有存活 runner 时,runner 当前实际在跑的 model。
+   * 插在 caller model 之后、agent.model 之前:有显式 model 仍以 caller 为准(用户换模型
+   * / 签名票路径不走这里);没有显式 model 时先沿用会话,避免 agent 默认改判引擎。
+   * 该沿用对所有 engine 生效(含 CCB/Codex),是有意的会话连续性,不只是 cursor 专用。
+   */
+  liveSessionModel?: string
+  /**
+   * 无票取样命中正在替换/关闭的 session 时由 caller 传入(如 session_replacing)。
+   * 有值则不把 liveSessionModel 插入候选,但仍打回退 warn。
+   */
+  liveSessionSkipReason?: string
   /** config.defaults.model。 */
   defaultModel?: string | null
   kind: LocalTurnKind
   env?: NodeJS.ProcessEnv
+  /** 沿用会话模型失败并回退时调用(dispatchInbound 接到 this.log.warn)。 */
+  warn?: (message: string, fields?: Record<string, unknown>) => void
 }): LocalExecutionDecision {
   const { view, agent, kind } = args
   const env = args.env ?? process.env
@@ -667,9 +740,51 @@ export function decideLocalExecution(args: {
     )
   }
 
+  const explicitModel = typeof args.model === 'string' && args.model !== '' ? args.model : undefined
+  const forcedSkipReason =
+    typeof args.liveSessionSkipReason === 'string' && args.liveSessionSkipReason !== ''
+      ? args.liveSessionSkipReason
+      : undefined
+  const liveSessionModel =
+    forcedSkipReason === undefined &&
+    typeof args.liveSessionModel === 'string' &&
+    args.liveSessionModel !== ''
+      ? args.liveSessionModel
+      : undefined
+  const ticketlessReuse = explicitModel === undefined
+  let liveSkipReason: string | undefined = forcedSkipReason
+  if (ticketlessReuse && liveSessionModel && liveSkipReason === undefined) {
+    liveSkipReason = liveSessionModelUnusableReason(view, liveSessionModel)
+  }
+
+  const decorate = (decision: LocalExecutionDecision): LocalExecutionDecision => {
+    if (!ticketlessReuse) return decision
+    if (!liveSessionModel && forcedSkipReason === undefined) return decision
+    if (liveSessionModel) {
+      const liveCanonical = view.canonicalize(liveSessionModel)
+      if (decision.canonicalModel === liveCanonical && liveSkipReason === undefined) return decision
+    }
+    const reason =
+      liveSkipReason ??
+      (liveSessionModel !== undefined
+        ? liveSessionModelUnusableReason(view, liveSessionModel)
+        : undefined) ??
+      forcedSkipReason ??
+      'unroutable'
+    args.warn?.(TICKETLESS_INBOUND_LIVE_SESSION_FALLBACK_WARN, {
+      liveModel: liveSessionModel,
+      reason,
+      fallbackModel: decision.canonicalModel,
+    })
+    return { ...decision, liveSessionFallback: { from: liveSessionModel ?? '', reason } }
+  }
+
   // ② 候选阶梯:归一 → 投影可用性 → engine,三件事**全取投影**。
+  // 无票 inbound 把存活 runner 的 model 插在 agent.model 之前;有显式 model 时不插入
+  // (用户换模型 / 带 model 的普通消息行为不变)。
   const candidates = [
-    args.model,
+    explicitModel,
+    ticketlessReuse && liveSessionModel && liveSkipReason === undefined ? liveSessionModel : undefined,
     agent.model,
     args.defaultModel,
     ...EXECUTION_MODEL_FALLBACK_ROUTE,
@@ -681,15 +796,26 @@ export function decideLocalExecution(args: {
     const descriptor = view.resolve(canonicalModel)
     const engine = descriptor?.engine
     if (engine === undefined || descriptor == null) continue
-    if (engine === 'ccb') return { canonicalModel, engine, supportsVision: descriptor.supportsVision }
+    if (engine === 'ccb') return decorate({ canonicalModel, engine, supportsVision: descriptor.supportsVision })
 
     // codex 意图(engine 取自投影,不看 baked)。
     if (kind === 'prewarm' || kind === 'auto_dream') {
-      return { canonicalModel, engine, supportsVision: descriptor.supportsVision }
+      return decorate({ canonicalModel, engine, supportsVision: descriptor.supportsVision })
     }
     if (kind === 'turn') {
       // selfhost 豁免门(OC_SELFHOST_ENGINE_LOCAL_TURNS=1)未开 -> 结构化拒(现状)。
       if (!isEngineLocalTurnExempt(env)) {
+        // 无票沿用的会话模型若是 cursor/codex/grok,生产环境不能本地跑 —— 跳过它
+        // 回退原阶梯(与修之前「直接走 agent 默认」同形),不要把整条 turn 拒掉。
+        const isLiveOnlyCandidate =
+          ticketlessReuse &&
+          liveSessionModel !== undefined &&
+          raw === liveSessionModel &&
+          raw !== agent.model
+        if (isLiveOnlyCandidate) {
+          liveSkipReason = liveSkipReason ?? 'engine_local_turn_not_exempt'
+          continue
+        }
         throw new LocalExecutionRejected(
           'DELEGATE_CODEX_UNSUPPORTED',
           `model '${canonicalModel}' runs on the ${engine} engine, which cannot run on a local ` +
@@ -698,11 +824,25 @@ export function decideLocalExecution(args: {
       }
       // 豁免门开 -> 按投影 engine 放行执行(单租户自用部署接受该 turn 不走 master
       // 计费编排:usage 不结算,仍落 event/usage log 与 durable tape)。
-      return { canonicalModel, engine, supportsVision: descriptor.supportsVision }
+      return decorate({ canonicalModel, engine, supportsVision: descriptor.supportsVision })
     }
-    return downgradeSyntheticCodex(view, canonicalModel, args.defaultModel, env)
+    return decorate(downgradeSyntheticCodex(view, canonicalModel, args.defaultModel, env))
   }
 
+  if (ticketlessReuse && (liveSessionModel || forcedSkipReason)) {
+    const reason =
+      liveSkipReason ??
+      (liveSessionModel !== undefined
+        ? liveSessionModelUnusableReason(view, liveSessionModel)
+        : undefined) ??
+      forcedSkipReason ??
+      'unroutable'
+    args.warn?.(TICKETLESS_INBOUND_LIVE_SESSION_FALLBACK_WARN, {
+      liveModel: liveSessionModel,
+      reason,
+      fallbackModel: '',
+    })
+  }
   throw new LocalExecutionRejected(
     'MODEL_NOT_AVAILABLE',
     `no routable model for agent '${agent.id}' in the current model catalog projection`,
@@ -759,13 +899,22 @@ export async function resolveLocalExecutionIfEnforced(args: {
   agent: Pick<AgentDef, 'id' | 'model' | 'provider'>
   kind: LocalTurnKind
   model?: string
+  liveSessionModel?: string
+  liveSessionSkipReason?: string
+  /** catalog 投影拉完后再取样,缩小「读 runner → await catalog → getOrCreate」窗口。 */
+  resolveLiveSessionModel?: () => string | undefined
+  /** 与 resolveLiveSessionModel 同时、在 catalog 之后取样。 */
+  resolveLiveSessionSkipReason?: () => string | undefined
   defaultModel?: string | null
   env?: NodeJS.ProcessEnv
+  warn?: (message: string, fields?: Record<string, unknown>) => void
 }): Promise<LocalExecutionDecision | undefined> {
   const env = args.env ?? process.env
   if (!isModelAuthorityRequired(env)) return undefined
   const view = await getLocalCatalogView()
-  return decideLocalExecution({ ...args, view, env })
+  const liveSessionModel = args.resolveLiveSessionModel?.() ?? args.liveSessionModel
+  const liveSessionSkipReason = args.resolveLiveSessionSkipReason?.() ?? args.liveSessionSkipReason
+  return decideLocalExecution({ ...args, liveSessionModel, liveSessionSkipReason, view, env })
 }
 
 /** decision → getOrCreate 的执行覆盖入参(flag 未开 → `{}`,展开后零影响)。 */
@@ -14606,7 +14755,18 @@ export class Gateway {
           agent: effectiveAgent,
           kind: 'turn',
           model: safeModel,
+          // 无票且帧上没有合法 model:catalog 拉完后再读存活 runner,沿用其 model/engine。
+          // 有 safeModel(用户换模型 / 普通带 model 消息)时不取样 —— 行为与原来一致。
+          resolveLiveSessionModel:
+            safeModel === undefined
+              ? () => readLiveRunnerModel(this.sessions.getByKey(sessionKey))
+              : undefined,
+          resolveLiveSessionSkipReason:
+            safeModel === undefined
+              ? () => liveSessionReuseSkipReason(this.sessions.getByKey(sessionKey))
+              : undefined,
           defaultModel: this.deps.config.defaults.model,
+          warn: (message, fields) => this.log.warn(message, { sessionKey, ...fields }),
         })
       } catch (err) {
         const mapped = this._mapLocalExecutionError(err)

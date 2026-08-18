@@ -57,6 +57,54 @@ describe("OptionsBlock", () => {
     expect(screen.getByText(/此会话中不可交互/)).toBeTruthy();
   });
 
+  it("trailing junk still renders clickable option cards and keeps leftover text", () => {
+    const sendUserText = vi.fn();
+    const leftover = "这四条是刚才三个子任务里 typecheck 命令的回执";
+    const code = single + leftover;
+    render(
+      <ChatInteractionContext.Provider value={{ sendUserText }}>
+        <OptionsBlock code={code} />
+      </ChatInteractionContext.Provider>,
+    );
+    expect(screen.getByText("选一个部署方式?")).toBeTruthy();
+    expect(screen.getByText(leftover)).toBeTruthy();
+    expect(document.querySelector("pre")).toBeNull();
+    fireEvent.click(screen.getByText("灰度发布"));
+    expect(sendUserText).toHaveBeenCalledWith("我选择:灰度发布");
+  });
+
+  it("keeps valid pure JSON click-to-send behavior unchanged", () => {
+    const sendUserText = vi.fn();
+    render(
+      <ChatInteractionContext.Provider value={{ sendUserText }}>
+        <OptionsBlock code={single} />
+      </ChatInteractionContext.Provider>,
+    );
+    expect(screen.queryByText("这四条是刚才三个子任务里 typecheck 命令的回执")).toBeNull();
+    fireEvent.click(screen.getByText("全量发布"));
+    expect(sendUserText).toHaveBeenCalledWith("我选择:全量发布");
+  });
+
+  it("does not truncate a label that contains a closing brace", () => {
+    const sendUserText = vi.fn();
+    const code = JSON.stringify({
+      question: "选哪个?",
+      options: [
+        { label: '含}括号的选项', desc: "desc 里也有 }" },
+        { label: "普通" },
+      ],
+    });
+    render(
+      <ChatInteractionContext.Provider value={{ sendUserText }}>
+        <OptionsBlock code={code} />
+      </ChatInteractionContext.Provider>,
+    );
+    expect(screen.getByText("含}括号的选项")).toBeTruthy();
+    expect(screen.getByText("desc 里也有 }")).toBeTruthy();
+    fireEvent.click(screen.getByText("含}括号的选项"));
+    expect(sendUserText).toHaveBeenCalledWith("我选择:含}括号的选项");
+  });
+
   it("busy disables clicking", () => {
     const sendUserText = vi.fn();
     render(
@@ -88,10 +136,10 @@ describe("OptionsBlock in a multi-question message (group mode)", () => {
     fireEvent.click(screen.getByText("正式"));
     expect(sendUserText).not.toHaveBeenCalled();
     expect(screen.getByText(/已作答/).textContent).toContain("1");
-    // 发送按钮在答完前禁用
+    // 部分作答即可发(至少 1 题)
     const sendBtn = screen.getByText("发送选择") as HTMLButtonElement;
-    expect(sendBtn.disabled).toBe(true);
-    // 答第二题(多选)后可发
+    expect(sendBtn.disabled).toBe(false);
+    // 答第二题(多选)后仍可发
     fireEvent.click(screen.getByText("要点"));
     expect(sendBtn.disabled).toBe(false);
     fireEvent.click(sendBtn);
@@ -115,6 +163,80 @@ describe("OptionsBlock in a multi-question message (group mode)", () => {
     );
     fireEvent.click(screen.getByText("轻松"));
     expect(sendUserText).toHaveBeenCalledWith("我选择:轻松");
+  });
+
+  it("live streaming: single block click does not send; after live ends it does", () => {
+    const sendUserText = vi.fn();
+    const ui = (live?: boolean) => (
+      <ChatInteractionContext.Provider value={{ sendUserText }}>
+        <OptionsGroupProvider live={live}>
+          <OptionsBlock code={single} />
+          <OptionsGroupFooter />
+        </OptionsGroupProvider>
+      </ChatInteractionContext.Provider>
+    );
+    const { rerender } = render(ui(true));
+    const opt = screen.getByText("灰度发布").closest("button") as HTMLButtonElement;
+    expect(opt.disabled).toBe(true);
+    expect(opt.getAttribute("title")).toBe("生成中");
+    expect(screen.getByText("生成中")).toBeTruthy();
+    fireEvent.click(opt);
+    expect(sendUserText).not.toHaveBeenCalled();
+    expect(screen.queryByText("发送选择")).toBeNull();
+    rerender(ui(false));
+    fireEvent.click(screen.getByText("灰度发布"));
+    expect(sendUserText).toHaveBeenCalledWith("我选择:灰度发布");
+    expect(sendUserText).toHaveBeenCalledTimes(1);
+  });
+
+  it("partial answers can be submitted with 未答 marker and then lock", () => {
+    const sendUserText = vi.fn();
+    render(
+      <ChatInteractionContext.Provider value={{ sendUserText }}>
+        <OptionsGroupProvider>
+          <OptionsBlock code={q1} />
+          <OptionsBlock code={q2} />
+          <OptionsGroupFooter />
+        </OptionsGroupProvider>
+      </ChatInteractionContext.Provider>,
+    );
+    fireEvent.click(screen.getByText("正式"));
+    expect(sendUserText).not.toHaveBeenCalled();
+    const answered = screen.getByText(/已作答/).textContent ?? "";
+    expect(answered).toContain("1");
+    expect(answered).toContain("2");
+    const sendBtn = screen.getByText("发送选择") as HTMLButtonElement;
+    expect(sendBtn.disabled).toBe(false);
+    fireEvent.click(sendBtn);
+    expect(sendUserText).toHaveBeenCalledTimes(1);
+    const sentText = sendUserText.mock.calls[0][0] as string;
+    expect(sentText).toContain("我的选择:");
+    expect(sentText).toContain("风格?:正式");
+    expect(sentText).toContain("输出?:(未答)");
+    expect(screen.getByText(/已发送全部选择/)).toBeTruthy();
+    fireEvent.click(screen.getByText("轻松"));
+    fireEvent.click(screen.getByText("要点"));
+    expect(sendUserText).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("发送选择")).toBeNull();
+  });
+
+  it("non-streaming single block still click-to-sends 我选择:<label> with no footer (regression)", () => {
+    const sendUserText = vi.fn();
+    render(
+      <ChatInteractionContext.Provider value={{ sendUserText }}>
+        <OptionsGroupProvider>
+          <OptionsBlock code={single} />
+          <OptionsGroupFooter />
+        </OptionsGroupProvider>
+      </ChatInteractionContext.Provider>,
+    );
+    fireEvent.click(screen.getByText("灰度发布"));
+    expect(sendUserText).toHaveBeenCalledWith("我选择:灰度发布");
+    expect(sendUserText).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("发送选择")).toBeNull();
+    expect(screen.queryByText(/已作答/)).toBeNull();
+    fireEvent.click(screen.getByText("全量发布"));
+    expect(sendUserText).toHaveBeenCalledTimes(1);
   });
 });
 
