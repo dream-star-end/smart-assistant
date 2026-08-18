@@ -54,6 +54,7 @@ import {
   aggregateDelegateFanoutResults,
   normalizeFanoutTasks,
 } from './delegateFanout.js'
+import { normalizeDelegateAgentId, normalizeDelegateModel } from './delegateArgs.js'
 import {
   formatDelegateFanoutRunning,
   formatDelegateSuccess,
@@ -682,19 +683,26 @@ async function handleSendToAgent(args: { agentId: string; message: string }) {
 
 async function handleDelegateTask(args: {
   agentId?: string
+  model?: string
   goal: string
   context?: string
   effort?: string
   toolsets?: string[]
   resumeSessionKey?: string
 }) {
-  return handleDelegateTaskToAgent(args.agentId || 'main', {
+  const agentNorm = normalizeDelegateAgentId(args.agentId)
+  if (!agentNorm.ok) return toolError(agentNorm.error)
+  const modelNorm = normalizeDelegateModel(args.model)
+  if (!modelNorm.ok) return toolError(modelNorm.error)
+  const agentId = agentNorm.agentId || 'main'
+  return handleDelegateTaskToAgent(agentId, {
     goal: args.goal,
     context: args.context,
     effort: args.effort,
     toolsets: args.toolsets,
     resumeSessionKey: args.resumeSessionKey,
-    label: args.agentId || 'main',
+    model: modelNorm.model,
+    label: agentNorm.agentId || 'main',
   })
 }
 
@@ -721,6 +729,7 @@ async function handleDelegateTasks(args: { tasks?: unknown }) {
           effort: t.effort,
           toolsets: t.toolsets,
           resumeSessionKey: t.resumeSessionKey,
+          model: t.model,
           label,
         })
         // toolOk 返回体无 isError 字段、toolError 有 → 联合类型下按可选属性安全取值。
@@ -864,6 +873,7 @@ async function handleCursorDelegateTasks(tasks: FanoutTask[]) {
           effort: t.effort,
           toolsets: t.toolsets,
           resumeSessionKey: t.resumeSessionKey,
+          model: t.model,
           label,
         })
         if (r.kind === 'running') {
@@ -913,6 +923,7 @@ async function runCursorDelegateToAgent(
     effort?: string
     toolsets?: string[]
     resumeSessionKey?: string
+    model?: string
     label: string
   },
 ): Promise<FormattedDelegateResult> {
@@ -928,6 +939,7 @@ async function runCursorDelegateToAgent(
     goal: args.goal,
     context: args.context,
     ...(args.effort ? { effort: args.effort } : {}),
+    ...(args.model ? { model: args.model } : {}),
     sourceAgent,
     toolsets: args.toolsets,
     async: true,
@@ -964,6 +976,7 @@ async function handleDelegateTaskToAgent(
     effort?: string
     toolsets?: string[]
     resumeSessionKey?: string
+    model?: string
     label: string
   },
 ) {
@@ -995,6 +1008,7 @@ async function handleDelegateTaskToAgent(
           goal: args.goal,
           context: args.context,
           ...(args.effort ? { effort: args.effort } : {}),
+          ...(args.model ? { model: args.model } : {}),
           sourceAgent,
           toolsets: args.toolsets,
           ...(args.resumeSessionKey ? { resumeSessionKey: args.resumeSessionKey } : {}),

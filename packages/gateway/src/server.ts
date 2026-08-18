@@ -271,6 +271,7 @@ import {
   type DelegateJobHttpResult,
 } from './delegateJobs.js'
 import { DelegateResumeRegistry } from './delegateResume.js'
+import { isPlatformAgentId, parseDelegateModel } from './delegateModel.js'
 import { eventBus, createEvent } from './eventBus.js'
 import { startEventPersistence } from './eventPersist.js'
 import { parseByteRange, serveFileFdWithRange } from './httpRange.js'
@@ -1599,6 +1600,8 @@ interface RunDelegateInput {
   /** 覆盖默认 channel 'delegate'。taskboard 传 'taskboard',且不得加入
    *  MASTER_SINK_PERSIST_CHANNELS,否则巡检文本会写进 client_sessions 刷屏。 */
   channel?: string
+  /** 可选:覆盖目标成员默认模型的 catalog 型号。审查委派忽略。 */
+  model?: string
   /** HTTP/MCP 可选续跑:已通过 DelegateResumeRegistry 占用的钥匙。 */
   resumable?: boolean
   /** 本次是否新 mint。早退时要 drop binding,避免占 cap。 */
@@ -4982,7 +4985,7 @@ export class Gateway {
       return
     }
     // ── Synchronous task delegation ──
-    const delegateMatch = url.pathname.match(/^\/api\/agents\/([a-zA-Z0-9_-]+)\/delegate$/)
+    const delegateMatch = url.pathname.match(/^\/api\/agents\/([A-Za-z0-9._:-]+)\/delegate$/)
     if (delegateMatch) {
       this.handleDelegateTask(req, res, delegateMatch[1]).catch((err) =>
         this.sendInternalError(res, err),
@@ -9967,8 +9970,17 @@ export class Gateway {
     } catch {
       return this.sendError(res, 400, 'invalid JSON')
     }
+    if (!isPlatformAgentId(targetAgentId)) {
+      return this.sendError(
+        res,
+        400,
+        'agentId 只能是平台成员 id(如 coding-assistant)。型号请用 body.model,例如 cursor-grok-4.6-high-fast',
+      )
+    }
     const { goal, context, sourceAgent, toolsets } = parsed
     if (!goal) return this.sendError(res, 400, 'goal required')
+    const modelNorm = parseDelegateModel(parsed.model)
+    if (!modelNorm.ok) return this.sendError(res, 400, modelNorm.error)
     const depthHeader = req.headers['x-delegation-depth']
     const depth = depthHeader ? Number.parseInt(String(depthHeader), 10) : 0
     // P2 批次4 — effort 仅接受 low/medium/high(delegate schema enum),其余(含缺省/非法)
@@ -10007,6 +10019,7 @@ export class Gateway {
       streamProgress: parsed.streamProgress === true,
       depth,
       effort,
+      model: modelNorm.model,
       sessionKey: resume.sessionKey,
       resumable: true,
       resumeMinted: resume.minted,
@@ -10296,11 +10309,14 @@ export class Gateway {
     // 让它先去排队等内存名额、等到了再拒,是纯粹的浪费 + 误导性等待。
     // 也因此,这里必然**先于 getOrCreate/createEngine** —— 结构化拒绝时不会有任何 runner
     // 被 spawn(方案 §3 要求的"创建 runner 前拒",测试 ④/⑤ 断言未 spawn)。
+    const requestedModel = isReview ? undefined : input.model
+    const execAgent = requestedModel ? { ...delegatedAgent, model: requestedModel } : delegatedAgent
     let delegateExec: LocalExecutionDecision | undefined
     try {
       delegateExec = await resolveLocalExecutionIfEnforced({
-        agent: delegatedAgent,
+        agent: execAgent,
         kind: 'turn',
+        model: requestedModel,
         defaultModel: this.deps.config.defaults.model,
       })
     } catch (err) {
@@ -10488,9 +10504,12 @@ export class Gateway {
     try {
       session = await this.sessions.getOrCreate({
         sessionKey,
-        agent: delegatedAgent,
+        agent: execAgent,
         // flag 未开 → {}(零变化);flag 开 → catalog 投影的 canonicalModel + engine。
         ...localExecutionOverride(delegateExec),
+        ...(delegateExec || !requestedModel
+          ? {}
+          : { model: requestedModel }),
         channel: input.channel ?? 'delegate',
         peerId: sourceAgent || 'system',
         repoSessionId: progressTarget?.peerId ?? delegateParent?.repoSessionId,
@@ -10659,7 +10678,7 @@ export class Gateway {
       // P2 批次4 — effort 透传:子会话是新建的,首次 submit 的 effortLevel 在 runner
       // spawn 前生效(与顶层会话 safeEffortLevel 同法)。undefined = 不指定 → 成员默认档位。
       input.effort,
-      undefined,
+      delegateExec?.canonicalModel ?? requestedModel,
       undefined,
       undefined,
       undefined,

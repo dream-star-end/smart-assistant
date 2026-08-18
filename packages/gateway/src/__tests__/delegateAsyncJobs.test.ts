@@ -49,16 +49,26 @@ function makeGateway(holdSubmit = false): any {
   gw.sessions = {
     destroySession: async () => {},
     getByKey: () => ({ _teamModeTurn: true, _currentTurnUserText: '测试任务' }),
-    getOrCreate: async () => ({
-      agentId: 'coding-assistant',
-      currentTurnStatus: null,
-      runner: { interrupt: () => {}, sendPermissionResponse: () => {}, on: () => {}, off: () => {} },
-    }),
+    getOrCreate: async (opts: any) => {
+      gw._created = [...(gw._created ?? []), opts]
+      return {
+        agentId: opts?.agent?.id ?? 'coding-assistant',
+        currentTurnStatus: null,
+        runner: { interrupt: () => {}, sendPermissionResponse: () => {}, on: () => {}, off: () => {} },
+      }
+    },
     retireKeepResume: async (key: string) => {
       gw._retiredKeys = [...(gw._retiredKeys ?? []), key]
     },
     forgetResume: () => {},
-    submit: async (_session: unknown, _payload: string, onEvent: (e: any) => void) => {
+    submit: async (
+      _session: unknown,
+      _payload: string,
+      onEvent: (e: any) => void,
+      effort?: string,
+      model?: string,
+    ) => {
+      gw._submitted = [...(gw._submitted ?? []), { effort, model }]
       onEvent({ kind: 'block', block: { kind: 'text', text: '子任务完成' } })
       await gw._holdGate
       onEvent({ kind: 'final', meta: { cost: 0, inputTokens: 1, outputTokens: 1, turn: 1 } })
@@ -267,5 +277,57 @@ describe('handleDelegateTask async + handleDelegateWait', () => {
     })
     assert.equal(again.status, 200)
     assert.equal(again.body.sessionKey, first.body.sessionKey)
+  })
+})
+
+describe('handleDelegateTask model override', () => {
+  it('dotted agentId 返回 JSON 400,指向 model 参数', async () => {
+    const gw = makeGateway(false)
+    const r = await call(
+      gw,
+      'handleDelegateTask',
+      { goal: '测', sourceAgent: 'main', parentSessionKey: PARENT_KEY },
+      'cursor-grok-4.6-high-fast',
+    )
+    assert.equal(r.status, 400)
+    assert.match(String(r.body.error ?? r.body), /model/)
+  })
+
+  it('非法 model 返回 400', async () => {
+    const gw = makeGateway(false)
+    const r = await call(gw, 'handleDelegateTask', {
+      goal: '测',
+      sourceAgent: 'main',
+      parentSessionKey: PARENT_KEY,
+      model: 'not a model',
+    })
+    assert.equal(r.status, 400)
+    assert.match(String(r.body.error ?? r.body), /model 无效/)
+  })
+
+  it('合法 model 传到 getOrCreate 与 submit', async () => {
+    const gw = makeGateway(false)
+    const r = await call(gw, 'handleDelegateTask', {
+      goal: '测 grok',
+      sourceAgent: 'main',
+      parentSessionKey: PARENT_KEY,
+      model: 'cursor-grok-4.6-high-fast',
+    })
+    assert.equal(r.status, 200)
+    assert.equal(r.body.ok, true)
+    assert.equal(gw._created[0].model, 'cursor-grok-4.6-high-fast')
+    assert.equal(gw._created[0].agent.model, 'cursor-grok-4.6-high-fast')
+    assert.equal(gw._submitted[0].model, 'cursor-grok-4.6-high-fast')
+  })
+
+  it('不传 model 时不覆盖成员默认', async () => {
+    const gw = makeGateway(false)
+    const r = await call(gw, 'handleDelegateTask', {
+      goal: '普通',
+      sourceAgent: 'main',
+      parentSessionKey: PARENT_KEY,
+    })
+    assert.equal(r.status, 200)
+    assert.equal(gw._submitted[0].model, undefined)
   })
 })

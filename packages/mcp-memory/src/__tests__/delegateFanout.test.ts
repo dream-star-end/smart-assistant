@@ -32,6 +32,19 @@ describe('normalizeFanoutTasks — 入参校验', () => {
     if (!r.ok) assert.match(r.error, new RegExp(String(MAX_FANOUT_TASKS)))
   })
 
+  it('合法 model 透传;把型号当 agentId 拒绝', () => {
+    const ok = normalizeFanoutTasks([
+      { goal: '测 grok', model: 'cursor-grok-4.6-high-fast' },
+    ])
+    assert.equal(ok.ok, true)
+    if (ok.ok) assert.equal(ok.tasks[0].model, 'cursor-grok-4.6-high-fast')
+    const bad = normalizeFanoutTasks([
+      { goal: '测 grok', agentId: 'cursor-grok-4.6-high-fast' },
+    ])
+    assert.equal(bad.ok, false)
+    if (!bad.ok) assert.match(bad.error, /第 1 个.*model=/)
+  })
+
   it('某项缺 goal → 拒绝并指出第几项', () => {
     const r = normalizeFanoutTasks([{ goal: 'ok' }, { context: '无 goal' }])
     assert.equal(r.ok, false)
@@ -55,6 +68,7 @@ describe('normalizeFanoutTasks — 入参校验', () => {
     assert.equal(r.tasks.length, 2)
     assert.deepEqual(r.tasks[0], {
       agentId: 'coding-assistant',
+      model: undefined,
       goal: '实现 A', // trim
       context: 'ctx',
       effort: 'high',
