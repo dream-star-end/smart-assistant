@@ -49,6 +49,7 @@ export function TicketCard({
   latestRunStatus,
   onOpen,
   actions,
+  compact,
   draggable,
   dragging,
   onDragStart,
@@ -61,6 +62,7 @@ export function TicketCard({
   latestRunStatus?: RunStatus | null
   onOpen?: (ticket: Ticket) => void
   actions?: ReactNode
+  compact?: boolean
   draggable?: boolean
   dragging?: boolean
   onDragStart?: (e: DragEvent<HTMLDivElement>) => void
@@ -80,7 +82,8 @@ export function TicketCard({
       padding="sm"
       interactive={!!onOpen}
       className={cn(
-        'relative flex flex-col gap-2',
+        'relative flex flex-col',
+        compact ? 'gap-1 p-2' : 'gap-2',
         draggable && 'cursor-grab active:cursor-grabbing',
         dragging && 'opacity-50',
       )}
@@ -112,13 +115,14 @@ export function TicketCard({
       <div className="flex items-start gap-2">
         <span
           className={cn(
-            'mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-lg bg-hover',
+            'mt-0.5 flex shrink-0 items-center justify-center rounded-lg bg-hover',
+            compact ? 'size-6' : 'size-7',
             TYPE_ICON_CLASS[ticket.type],
           )}
           title={TICKET_TYPE_LABEL[ticket.type]}
           aria-label={TICKET_TYPE_LABEL[ticket.type]}
         >
-          <Icon size={14} />
+          <Icon size={compact ? 12 : 14} />
         </span>
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-1.5">
@@ -133,15 +137,22 @@ export function TicketCard({
               <span className="size-1.5 shrink-0 rounded-full bg-danger" title="最近执行失败" />
             )}
           </div>
-          <p className="mt-0.5 line-clamp-2 break-words text-body font-medium text-fg">
+          <p
+            className={cn(
+              'mt-0.5 break-words text-body font-medium text-fg',
+              compact ? 'line-clamp-1' : 'line-clamp-2',
+            )}
+          >
             {ticket.title}
           </p>
         </div>
       </div>
       <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-        <Badge tone={TICKET_TYPE_TONE[ticket.type]} size="sm">
-          {TICKET_TYPE_LABEL[ticket.type]}
-        </Badge>
+        {!compact && (
+          <Badge tone={TICKET_TYPE_TONE[ticket.type]} size="sm">
+            {TICKET_TYPE_LABEL[ticket.type]}
+          </Badge>
+        )}
         <Badge tone={TICKET_PRIORITY_TONE[ticket.priority]} size="sm">
           {ticket.priority}
         </Badge>
@@ -152,7 +163,7 @@ export function TicketCard({
       </div>
       {(moves.length > 0 || actions) && (
         <div
-          className="flex min-w-0 flex-wrap items-center gap-1"
+          className={cn('flex min-w-0 items-center gap-1', compact ? 'flex-nowrap' : 'flex-wrap')}
           onClick={(e) => e.stopPropagation()}
           onKeyDown={(e) => e.stopPropagation()}
         >
@@ -160,7 +171,10 @@ export function TicketCard({
             <select
               aria-label="移动到…"
               data-testid="ticket-move-select"
-              className="max-w-full truncate rounded-md border border-border bg-surface px-2 py-1 text-caption text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              className={cn(
+                'truncate rounded-md border border-border bg-surface px-2 py-1 text-caption text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring',
+                compact ? 'min-w-0 flex-1' : 'max-w-full',
+              )}
               defaultValue=""
               onChange={(e) => {
                 const raw = e.target.value

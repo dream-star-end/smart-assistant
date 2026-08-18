@@ -1,5 +1,5 @@
-import { Archive, Kanban, Menu, PanelLeft, PenSquare, Plus } from 'lucide-react'
-import { type ReactNode, useMemo, useState } from 'react'
+import { Archive, Kanban, Menu, MoreHorizontal, PanelLeft, PenSquare, Plus } from 'lucide-react'
+import { useMemo, useState } from 'react'
 import type { BoardViewParam } from '../../hooks/useAppRoute'
 import { useMdViewport } from '../../hooks/useMdViewport'
 import {
@@ -13,6 +13,10 @@ import {
 import type { AuthSession } from '../../lib/types'
 import {
   Button,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
   EmptyState,
   IconButton,
   Input,
@@ -78,6 +82,7 @@ export function TaskboardView({
   const [draftType, setDraftType] = useState<TicketType>('bug')
   const [draftReady, setDraftReady] = useState(false)
   const [reviseOpen, setReviseOpen] = useState(false)
+  const [backlogTypeFilter, setBacklogTypeFilter] = useState<TicketType | ''>('')
 
   const selected = useMemo(() => {
     if (!ticketId) return null
@@ -214,95 +219,177 @@ export function TaskboardView({
     }
   }
 
-  const renderActions = (ticket: Ticket) => {
-    const busy = board.isPending(ticket.id)
-    const btn = (
-      label: string,
-      testId: string,
-      onClick: () => void,
-      variant: 'secondary' | 'danger' | 'ghost' = 'secondary',
-    ) => (
-      <Button
-        key={label}
-        type="button"
-        size="sm"
-        variant={variant}
-        loading={busy}
-        data-testid={testId}
-        aria-label={label}
-        onClick={onClick}
-      >
-        {label}
-      </Button>
-    )
-    const items: ReactNode[] = []
+  type ActionTone = 'secondary' | 'danger' | 'ghost'
+  type TicketAction = {
+    label: string
+    testId: string
+    onClick: () => void
+    variant: ActionTone
+    kind: 'primary' | 'secondary' | 'destructive'
+  }
+
+  const collectActions = (ticket: Ticket): TicketAction[] => {
+    const items: TicketAction[] = []
     if (ticket.status === 'backlog') {
-      items.push(btn('批准开工', 'ticket-ready', () => void promoteTicket(ticket)))
+      items.push({
+        label: '批准开工',
+        testId: 'ticket-ready',
+        onClick: () => void promoteTicket(ticket),
+        variant: 'secondary',
+        kind: 'primary',
+      })
     }
     if (ticket.status === 'waiting_human') {
       items.push(
-        btn('通过', 'inbox-approve', () => void board.runAction(ticket, { kind: 'approve' })),
-        btn(
-          '打回',
-          'inbox-reject',
-          async () => {
-            const reason = await askReason(`打回 ${ticket.identifier}？`, '打回')
-            if (reason) void board.runAction(ticket, { kind: 'reject', reason })
+        {
+          label: '通过',
+          testId: 'inbox-approve',
+          onClick: () => void board.runAction(ticket, { kind: 'approve' }),
+          variant: 'secondary',
+          kind: 'primary',
+        },
+        {
+          label: '打回',
+          testId: 'inbox-reject',
+          onClick: () => {
+            void (async () => {
+              const reason = await askReason(`打回 ${ticket.identifier}？`, '打回')
+              if (reason) void board.runAction(ticket, { kind: 'reject', reason })
+            })()
           },
-          'danger',
-        ),
-        btn(
-          '改需求',
-          'inbox-revise',
-          () => {
+          variant: 'danger',
+          kind: 'destructive',
+        },
+        {
+          label: '改需求',
+          testId: 'inbox-revise',
+          onClick: () => {
             setReviseOpen(true)
             onOpenTicket(ticket.identifier)
           },
-          'ghost',
-        ),
+          variant: 'ghost',
+          kind: 'secondary',
+        },
       )
     }
     if (ticket.status !== 'done' && ticket.status !== 'canceled' && ticket.status !== 'blocked') {
-      items.push(
-        btn(
-          '受阻',
-          'ticket-block',
-          async () => {
+      items.push({
+        label: '受阻',
+        testId: 'ticket-block',
+        onClick: () => {
+          void (async () => {
             const reason = await askReason(`将 ${ticket.identifier} 标为受阻？`, '标记受阻')
             if (reason) void board.runAction(ticket, { kind: 'block', reason })
-          },
-          'ghost',
-        ),
-      )
+          })()
+        },
+        variant: 'ghost',
+        kind: 'secondary',
+      })
     }
     if (ticket.status !== 'done' && ticket.status !== 'canceled') {
       items.push(
-        btn('完成', 'ticket-done', async () => {
-          const ok = await confirm({
-            title: `完成 ${ticket.identifier}？`,
-            body: '完成后不再参与巡检。',
-            confirmText: '完成',
-          })
-          if (ok) void board.runAction(ticket, { kind: 'done' })
-        }),
-        btn(
-          '取消',
-          'ticket-cancel',
-          async () => {
-            const ok = await confirm({
-              title: `取消 ${ticket.identifier}？`,
-              body: '取消后单据进入终态。',
-              confirmText: '取消单据',
-              danger: true,
-            })
-            if (ok) void board.runAction(ticket, { kind: 'cancel' })
+        {
+          label: '完成',
+          testId: 'ticket-done',
+          onClick: () => {
+            void (async () => {
+              const ok = await confirm({
+                title: `完成 ${ticket.identifier}？`,
+                body: '完成后不再参与巡检。',
+                confirmText: '完成',
+              })
+              if (ok) void board.runAction(ticket, { kind: 'done' })
+            })()
           },
-          'danger',
-        ),
+          variant: 'secondary',
+          kind: 'secondary',
+        },
+        {
+          label: '取消',
+          testId: 'ticket-cancel',
+          onClick: () => {
+            void (async () => {
+              const ok = await confirm({
+                title: `取消 ${ticket.identifier}？`,
+                body: '取消后单据进入终态。',
+                confirmText: '取消单据',
+                danger: true,
+              })
+              if (ok) void board.runAction(ticket, { kind: 'cancel' })
+            })()
+          },
+          variant: 'danger',
+          kind: 'destructive',
+        },
       )
     }
-    return items.length ? <div className="flex flex-wrap gap-1">{items}</div> : null
+    return items
   }
+
+  const renderActions = (ticket: Ticket, layout: 'board' | 'full' = 'full') => {
+    const busy = board.isPending(ticket.id)
+    const items = collectActions(ticket)
+    if (!items.length) return null
+    const btn = (action: TicketAction) => (
+      <Button
+        key={action.testId}
+        type="button"
+        size="sm"
+        variant={action.variant}
+        loading={busy}
+        data-testid={action.testId}
+        aria-label={action.label}
+        onClick={action.onClick}
+      >
+        {action.label}
+      </Button>
+    )
+    if (layout !== 'board') {
+      return <div className="flex flex-wrap gap-1">{items.map(btn)}</div>
+    }
+    const primary = items.find((a) => a.kind === 'primary')
+    const menuItems = items.filter((a) => a !== primary)
+    return (
+      <div className="flex shrink-0 items-center gap-0.5">
+        {primary ? btn(primary) : null}
+        {menuItems.length > 0 && (
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <IconButton
+                type="button"
+                size="sm"
+                shape="square"
+                variant="ghost"
+                aria-label="更多操作"
+                data-testid="ticket-more-actions"
+                disabled={busy}
+              >
+                <MoreHorizontal size={14} />
+              </IconButton>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" onClick={(e) => e.stopPropagation()}>
+              {menuItems.map((action) => (
+                <DropdownMenuItem
+                  key={action.testId}
+                  data-testid={action.testId}
+                  destructive={action.variant === 'danger'}
+                  disabled={busy}
+                  onSelect={() => action.onClick()}
+                >
+                  {action.label}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
+        )}
+      </div>
+    )
+  }
+
+  const visibleBacklogTickets = useMemo(() => {
+    if (!backlogTypeFilter) return board.backlogTickets
+    return board.backlogTickets.filter((t) => t.type === backlogTypeFilter)
+  }, [backlogTypeFilter, board.backlogTickets])
 
   const submitCreate = async () => {
     const title = draftTitle.trim()
@@ -537,7 +624,7 @@ export function TaskboardView({
           columns={board.board?.columns ?? []}
           backlogTickets={board.board?.backlog?.tickets ?? []}
           onOpenTicket={openTicket}
-          renderActions={renderActions}
+          renderActions={(ticket) => renderActions(ticket, 'board')}
           onMove={(ticket, toStageId) => void runMove(ticket, toStageId)}
         />
       ) : view === 'list' ? (
@@ -550,23 +637,42 @@ export function TaskboardView({
           renderActions={renderActions}
         />
       ) : view === 'backlog' ? (
-        board.backlogTickets.length === 0 ? (
-          <EmptyState
-            icon={Archive}
-            title="积压是空的"
-            hint="遗留问题可以先记进积压，准备做的时候再批准开工或拖进看板。"
-          />
-        ) : (
-          <TicketListView
-            tickets={board.backlogTickets}
-            query={{ status: 'backlog' }}
-            agents={board.agents}
-            onQueryChange={() => {}}
-            onOpenTicket={openTicket}
-            renderActions={renderActions}
-            hideFilters
-          />
-        )
+        <div className="flex min-h-0 flex-1 flex-col">
+          <div className="flex flex-wrap items-center gap-2 px-4 pb-2">
+            <Select
+              aria-label="积压类型"
+              className="w-36"
+              inputSize="sm"
+              value={backlogTypeFilter}
+              onValueChange={(v) => setBacklogTypeFilter((v as TicketType) || '')}
+              options={[
+                { value: '', label: '全部' },
+                ...TICKET_TYPES.map((t) => ({ value: t, label: TICKET_TYPE_LABEL[t] })),
+              ]}
+            />
+          </div>
+          {visibleBacklogTickets.length === 0 ? (
+            <EmptyState
+              icon={Archive}
+              title={board.backlogTickets.length === 0 ? '积压是空的' : '没有这类积压单'}
+              hint={
+                board.backlogTickets.length === 0
+                  ? '遗留问题可以先记进积压，准备做的时候再批准开工或拖进看板。'
+                  : '换一个类型，或选「全部」看看其它积压单。'
+              }
+            />
+          ) : (
+            <TicketListView
+              tickets={visibleBacklogTickets}
+              query={{ status: 'backlog' }}
+              agents={board.agents}
+              onQueryChange={() => {}}
+              onOpenTicket={openTicket}
+              renderActions={(ticket) => renderActions(ticket, 'full')}
+              hideFilters
+            />
+          )}
+        </div>
       ) : board.inboxTickets.length === 0 ? (
         <EmptyState
           icon={PenSquare}
