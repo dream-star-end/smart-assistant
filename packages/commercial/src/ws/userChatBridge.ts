@@ -90,6 +90,7 @@ import {
   serializeVerificationSponsorshipSnapshot,
 } from "../billing/verificationSponsorship.js";
 import type { TokenUsage } from "../billing/calculator.js";
+import { settleCursorExternalUsage } from "../billing/cursorExternalSettle.js";
 import { recordProductFrictionEvent } from "../productFriction/events.js";
 import { maybeUpdateAccountQuotaCodex } from "../account-pool/quota.js";
 import { OutboundRingBuffer, DEFAULT_RING_CONFIG } from "@openclaude/gateway";
@@ -5947,12 +5948,63 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             const durationMs = typeof external.durationMs === 'number' && Number.isFinite(external.durationMs) && external.durationMs >= 0 ? Math.floor(external.durationMs) : null;
             const usage = isPlainRecord(external.usage) ? external.usage : null;
             if (deps.pgPool && requestId && status && durationMs !== null && external.engine === 'cursor') {
-              void deps.pgPool.query(
-                `UPDATE cursor_external_usage_audit
-                    SET status=$2, terminal_code=$3, duration_ms=$4, reported_usage=$5, completed_at=NOW()
-                  WHERE request_id=$1 AND user_id=$6 AND status='pending'`,
-                [requestId, status, terminalCode, durationMs, usage, uid],
-              ).catch((err) => bridgeLog?.warn('user-chat-bridge: Cursor external audit terminal write failed', { requestId, err }));
+              const pool = deps.pgPool;
+              const pricing = deps.pricing;
+              void (async () => {
+                try {
+                  const updated = await pool.query<{ model_id: string; session_id: string | null }>(
+                    `UPDATE cursor_external_usage_audit
+                        SET status=$2, terminal_code=$3, duration_ms=$4, reported_usage=$5, completed_at=NOW()
+                      WHERE request_id=$1 AND user_id=$6 AND status='pending'
+                    RETURNING model_id, session_id`,
+                    [requestId, status, terminalCode, durationMs, usage, uid],
+                  );
+                  let modelId = updated.rows[0]?.model_id ?? null;
+                  let sessionId = updated.rows[0]?.session_id ?? null;
+                  if (modelId === null) {
+                    const existing = await pool.query<{ model_id: string; session_id: string | null }>(
+                      `SELECT model_id, session_id FROM cursor_external_usage_audit
+                        WHERE request_id=$1 AND user_id=$2`,
+                      [requestId, uid],
+                    );
+                    modelId = existing.rows[0]?.model_id ?? null;
+                    sessionId = existing.rows[0]?.session_id ?? sessionId;
+                  }
+                  if (modelId === null) {
+                    bridgeLog?.warn('user-chat-bridge: Cursor settle skipped, audit model_id missing', { requestId });
+                  } else if (!pricing) {
+                    bridgeLog?.warn('user-chat-bridge: Cursor settle skipped, pricing cache missing', { requestId, modelId });
+                  } else {
+                    const settled = await settleCursorExternalUsage({
+                      pool,
+                      pricing,
+                      userId: uid,
+                      requestId,
+                      modelId,
+                      sessionId,
+                      engineStatus: status,
+                      terminalCode,
+                      usage,
+                    });
+                    if (settled === null) {
+                      bridgeLog?.warn('user-chat-bridge: Cursor settle skipped, model pricing not in cache', { requestId, modelId });
+                    } else if (
+                      settled.debitedCredits !== null &&
+                      settled.debitedCredits > 0n &&
+                      deps.appendCostCredits
+                    ) {
+                      await deps.appendCostCredits(
+                        requestId,
+                        uid.toString(),
+                        settled.debitedCredits.toString(),
+                        sessionId,
+                      );
+                    }
+                  }
+                } catch (err) {
+                  bridgeLog?.warn('user-chat-bridge: Cursor platform settle failed', { requestId, err });
+                }
+              })();
             } else {
               bridgeLog?.warn('user-chat-bridge: malformed Cursor external billing frame dropped');
             }

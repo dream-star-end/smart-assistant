@@ -2410,6 +2410,7 @@ describe("Cursor external authority regression tripwire", () => {
     assert.match(cursorBranch, /isCursorContainerOnSelfHost/);
     assert.match(cursorBranch, /INSERT INTO cursor_external_usage_audit/);
     assert.match(cursorBranch, /peerCapture, modelCapture/);
+    assert.match(source, /settleCursorExternalUsage/);
   });
 
   test("Cursor accepts only an active row on the trusted self host", async () => {

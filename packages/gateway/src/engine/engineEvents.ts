@@ -244,8 +244,8 @@ export interface EngineBillingEvent extends DurableCodexBilling {
 }
 
 /** Subscription-backed engine audit sideband. Token fields are present only
- * when the upstream CLI reported them; they are observations, never a basis
- * for OpenClaude credit debits. */
+ * when the upstream CLI reported them. Master may also settle those
+ * observations onto the platform ledger (selfhost 0221+). */
 export interface EngineExternalBillingEvent {
   requestId: string
   engine: 'cursor'
