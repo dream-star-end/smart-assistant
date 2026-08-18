@@ -50,19 +50,101 @@ export const AGENT_MODEL_AUTO = 'auto'
  * 顺序有产品语义:第一项同时是 codex seed / 团队模式队长默认型号。
  */
 export const CODEX_ENGINE_MODELS = [
-  { id: 'gpt-5.6-sol', displayName: 'GPT-5.6-Sol', defaultReasoningEffort: 'xhigh' },
-  { id: 'gpt-5.6-terra', displayName: 'GPT-5.6-Terra', defaultReasoningEffort: 'xhigh' },
-  { id: 'gpt-5.6-luna', displayName: 'GPT-5.6-Luna', defaultReasoningEffort: 'medium' },
+  { id: 'gpt-5.6-sol', displayName: 'GPT-5.6-Sol', defaultReasoningEffort: 'xhigh', longContext: false },
+  { id: 'gpt-5.6-terra', displayName: 'GPT-5.6-Terra', defaultReasoningEffort: 'xhigh', longContext: false },
+  { id: 'gpt-5.6-luna', displayName: 'GPT-5.6-Luna', defaultReasoningEffort: 'medium', longContext: false },
+  {
+    id: 'gpt-5.6-sol-1m',
+    displayName: 'GPT-5.6-Sol',
+    defaultReasoningEffort: 'xhigh',
+    cliModel: 'gpt-5.6-sol',
+    longContext: true,
+  },
+  {
+    id: 'gpt-5.6-terra-1m',
+    displayName: 'GPT-5.6-Terra',
+    defaultReasoningEffort: 'xhigh',
+    cliModel: 'gpt-5.6-terra',
+    longContext: true,
+  },
+  {
+    id: 'gpt-5.6-luna-1m',
+    displayName: 'GPT-5.6-Luna',
+    defaultReasoningEffort: 'medium',
+    cliModel: 'gpt-5.6-luna',
+    longContext: true,
+  },
 ] as const satisfies readonly {
   id: string
   displayName: string
   defaultReasoningEffort: PlatformReasoningEffort
+  cliModel?: string
+  longContext?: boolean
 }[]
 
 /** codex engine 承接的模型 id 全集(精确字面量,与 registry MODEL_ENGINE_MAP 同源)。 */
 export const CODEX_ENGINE_MODEL_IDS = CODEX_ENGINE_MODELS.map((m) => m.id)
 
 export type CodexEngineModelId = (typeof CODEX_ENGINE_MODELS)[number]['id']
+export type CodexEngineModel = (typeof CODEX_ENGINE_MODELS)[number]
+
+export const CONTEXT_TIER_FAMILIES = [
+  {
+    family: 'gpt-5.6-sol',
+    familyLabel: 'GPT-5.6-Sol',
+    standardId: 'gpt-5.6-sol',
+    longId: 'gpt-5.6-sol-1m',
+  },
+  {
+    family: 'gpt-5.6-terra',
+    familyLabel: 'GPT-5.6-Terra',
+    standardId: 'gpt-5.6-terra',
+    longId: 'gpt-5.6-terra-1m',
+  },
+  {
+    family: 'gpt-5.6-luna',
+    familyLabel: 'GPT-5.6-Luna',
+    standardId: 'gpt-5.6-luna',
+    longId: 'gpt-5.6-luna-1m',
+  },
+  {
+    family: 'kimi-k3',
+    familyLabel: 'Kimi K3',
+    standardId: 'k3-256k',
+    longId: 'kimi-k3',
+  },
+] as const
+
+export type ContextTierFamily = (typeof CONTEXT_TIER_FAMILIES)[number]
+export type ContextTierFamilyId = ContextTierFamily['family']
+
+export function contextFamilyByModelId(
+  modelId: string | null | undefined,
+): ContextTierFamily | undefined {
+  if (typeof modelId !== 'string') return undefined
+  return CONTEXT_TIER_FAMILIES.find(
+    (family) => family.standardId === modelId || family.longId === modelId,
+  )
+}
+
+export function contextFamilyDefaultLong(_family: ContextTierFamilyId): boolean {
+  return false
+}
+
+export function isCodexLongContextModel(modelId: string | null | undefined): boolean {
+  if (typeof modelId !== 'string') return false
+  return CODEX_ENGINE_MODELS.some((model) => model.id === modelId && model.longContext === true)
+}
+
+/** Canonical OpenClaude id → model name Codex CLI / app-server accepts. */
+export function codexTransportModelId(modelId: string | undefined): string | undefined {
+  if (!modelId) return modelId
+  const row = CODEX_ENGINE_MODELS.find((model) => model.id === modelId)
+  if (row && 'cliModel' in row && typeof row.cliModel === 'string' && row.cliModel) {
+    return row.cliModel
+  }
+  return modelId
+}
 
 /** xAI 官方 Grok CLI 的编码产品型号。 */
 export const GROK_ENGINE_MODELS = [
@@ -369,8 +451,8 @@ export function cursorFamilyDefaultEffort(
   return 'high'
 }
 
-export function cursorFamilyDefaultFast(family: CursorEngineFamilyId): boolean {
-  return family === 'composer-2.5'
+export function cursorFamilyDefaultFast(_family: CursorEngineFamilyId): boolean {
+  return false
 }
 
 export function cursorFamilySupportsFast(family: CursorEngineFamilyId): boolean {

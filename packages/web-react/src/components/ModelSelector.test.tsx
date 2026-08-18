@@ -197,3 +197,33 @@ describe("ModelSelector Cursor 家族 + 思考档 + Fast", () => {
     expect(document.querySelector('[data-fast="true"]')).toBeNull();
   });
 });
+
+describe("ModelSelector GPT/Kimi 上下文档", () => {
+  const MODELS: PublicModel[] = [
+    { id: "glm-5.3", display_name: "GLM-5.3", cost_x: 0.5 },
+    { id: "gpt-5.6-sol", display_name: "GPT-5.6-Sol", cost_x: 11.3 },
+    { id: "gpt-5.6-sol-1m", display_name: "GPT-5.6-Sol", cost_x: 22.6 },
+    { id: "k3-256k", display_name: "Kimi K3 256K", cost_x: 1.6 },
+    { id: "kimi-k3", display_name: "Kimi K3", cost_x: 3.2 },
+  ];
+
+  it("触发器显示 GPT 家族名并带 xN", () => {
+    render(<ModelSelector models={MODELS} selectedId="gpt-5.6-sol" onSelect={() => {}} />);
+    const trigger = screen.getByRole("button", { name: "选择对话模型" });
+    expect(trigger.textContent).toContain("GPT-5.6-Sol");
+    expect(trigger.textContent).toContain("x11.3");
+  });
+
+  it("菜单收成 Kimi K3 一行，1M 开关改写 canonical id", async () => {
+    const onSelect = vi.fn();
+    render(<ModelSelector models={MODELS} selectedId="k3-256k" onSelect={onSelect} />);
+    openMenu(screen.getByRole("button", { name: "选择对话模型" }));
+    await screen.findAllByRole("menuitem");
+    expect(document.querySelector('[data-context-family="kimi-k3"]')).toBeTruthy();
+    expect(screen.queryByText("Kimi K3 256K")).toBeNull();
+    const long = document.querySelector('[data-context="1m"]');
+    expect(long).toBeTruthy();
+    if (long) fireEvent.click(long);
+    expect(onSelect).toHaveBeenCalledWith("kimi-k3");
+  });
+});

@@ -19,7 +19,7 @@
  */
 
 import { Client } from "pg";
-import { modelReasoningPolicy, STATIC_KEY_PROVIDERS } from "@openclaude/protocol";
+import { COST_INDEX_BASELINE_MODEL_ID, costXVsBaseline, modelReasoningPolicy, STATIC_KEY_PROVIDERS } from "@openclaude/protocol";
 import { query } from "../db/queries.js";
 import { loadConfig } from "../config.js";
 import { CATALOG_CHANNEL } from "./modelCatalog.js";
@@ -89,6 +89,8 @@ export interface PublicModel {
   multiplier: string;
   /** protocol modelReasoningPolicy 的 API 投影；空数组 = 此模型不支持思考深度。 */
   supported_efforts: string[];
+  /** Blended cost vs DeepSeek V4 Pro, one decimal. Omitted if baseline missing. */
+  cost_x?: number;
   /**
    * 0108 provider 健康度:该模型归属 provider 生效降级时由 /api/models handler 注解 true
    * (**注解不过滤**,前端据此标「暂不可用」+ 禁选)。PricingCache 本身不产出此字段
@@ -337,16 +339,36 @@ export class PricingCache {
     return this.map.size;
   }
 
-  private toPublicModel = (p: ModelPricing): PublicModel => ({
-    id: p.model_id,
-    display_name: p.display_name,
-    input_per_ktok_credits: perKtokCredits(p.input_per_mtok, p.multiplier),
-    output_per_ktok_credits: perKtokCredits(p.output_per_mtok, p.multiplier),
-    cache_read_per_ktok_credits: perKtokCredits(p.cache_read_per_mtok, p.multiplier),
-    cache_write_per_ktok_credits: perKtokCredits(p.cache_write_per_mtok, p.multiplier),
-    multiplier: p.multiplier,
-    supported_efforts: [...modelReasoningPolicy(p.model_id).supported],
-  });
+  private toPublicModel = (p: ModelPricing): PublicModel => {
+    const baseline = this.map.get(COST_INDEX_BASELINE_MODEL_ID);
+    const costX = costXVsBaseline(
+      {
+        inputPerMtok: p.input_per_mtok,
+        cacheReadPerMtok: p.cache_read_per_mtok,
+        outputPerMtok: p.output_per_mtok,
+        multiplier: p.multiplier,
+      },
+      baseline
+        ? {
+            inputPerMtok: baseline.input_per_mtok,
+            cacheReadPerMtok: baseline.cache_read_per_mtok,
+            outputPerMtok: baseline.output_per_mtok,
+            multiplier: baseline.multiplier,
+          }
+        : null,
+    );
+    return {
+      id: p.model_id,
+      display_name: p.display_name,
+      input_per_ktok_credits: perKtokCredits(p.input_per_mtok, p.multiplier),
+      output_per_ktok_credits: perKtokCredits(p.output_per_mtok, p.multiplier),
+      cache_read_per_ktok_credits: perKtokCredits(p.cache_read_per_mtok, p.multiplier),
+      cache_write_per_ktok_credits: perKtokCredits(p.cache_write_per_mtok, p.multiplier),
+      multiplier: p.multiplier,
+      supported_efforts: [...modelReasoningPolicy(p.model_id).supported],
+      ...(costX !== undefined ? { cost_x: costX } : {}),
+    };
+  };
 
   /**
    * 公共可见模型列表(按 sort_order 升序),用于 `/api/public/models` 给匿名访客。

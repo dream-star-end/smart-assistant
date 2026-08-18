@@ -13,6 +13,7 @@
 import { copyFile, mkdir } from 'node:fs/promises'
 import { basename, join } from 'node:path'
 import {
+  isCodexLongContextModel,
   modelReasoningPolicy,
   type PlatformReasoningEffort,
 } from '@openclaude/protocol'
@@ -129,6 +130,17 @@ export function normalizeCodexReasoningEffort(
 export function buildCodexModelCatalogArgs(modelId: string | undefined): string[] {
   if (modelId !== QWEN38_CODEX_MODEL_ID) return []
   return ['-c', `model_catalog_json=${JSON.stringify(QWEN38_CODEX_MODEL_CATALOG)}`]
+}
+
+/** GPT 1M twins: per-spawn window only. Never persist ~/.codex/config.toml. */
+export function buildCodexLongContextArgs(modelId: string | undefined): string[] {
+  if (!isCodexLongContextModel(modelId)) return []
+  return [
+    '-c',
+    'model_context_window=1000000',
+    '-c',
+    'model_auto_compact_token_limit=900000',
+  ]
 }
 
 export function codexReasoningEffortConfig(

@@ -170,6 +170,8 @@ export type PublicModel = {
   id: string;
   /** protocol modelReasoningPolicy 的 API 投影；空数组 = 不支持思考深度。 */
   supported_efforts?: Array<"low" | "medium" | "high" | "xhigh" | "max">;
+  /** Blended cost vs DeepSeek V4 Pro (one decimal), from GET /api/public/models. */
+  cost_x?: number;
   /**
    * 0108 provider 健康度:后端 /api/models 对归属 provider 生效降级的模型注解 true
    * (只注解不过滤)。ModelSelector 据此标「暂不可用」徽记 + 禁选。

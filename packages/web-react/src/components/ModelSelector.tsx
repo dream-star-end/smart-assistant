@@ -1,8 +1,10 @@
 import {
   DEFAULT_CODEX_ENGINE_MODEL,
   DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME,
+  contextFamilyByModelId,
   cursorFamilySupportsFast,
   cursorModelById,
+  type ContextTierFamily,
   type CursorEngineFamilyId,
   type PlatformReasoningEffort,
 } from "@openclaude/protocol";
@@ -10,9 +12,13 @@ import { AlertTriangle, Check, ChevronDown, Cpu, Users } from "lucide-react";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import {
   availableCursorEfforts,
+  contextFamilyHasLong,
+  contextFamilyHasStandard,
   cursorFamilyHasFast,
   cursorFamilyHasStandard,
+  modelCostLabel,
   modelPickerRows,
+  resolveContextPickerSelection,
   resolveCursorPickerSelection,
 } from "../lib/cursorModelPicker";
 import type { PublicModel } from "../lib/types";
@@ -46,6 +52,12 @@ export function modelLabel(m: PublicModel): string {
   return typeof dn === "string" && dn.trim() ? dn : m.id;
 }
 
+function CostMark({ model }: { model?: PublicModel }) {
+  const label = modelCostLabel(model);
+  if (!label) return null;
+  return <span className="text-[11px] font-normal text-faint">{label}</span>;
+}
+
 /**
  * 团队模式队长引擎的展示名。引擎 id 权威 = @openclaude/protocol 的
  * DEFAULT_CODEX_ENGINE_MODEL（与 master bridge teamMode 强制覆盖的常量同源，
@@ -60,8 +72,11 @@ export function teamEngineLabel(models: PublicModel[]): string {
 function triggerLabel(models: PublicModel[], selectedId: string | undefined, loading?: boolean): string {
   const selected = models.find((m) => m.id === selectedId);
   if (selected) {
-    const def = cursorModelById(selected.id);
-    return def ? def.familyLabel : modelLabel(selected);
+    const cursor = cursorModelById(selected.id);
+    if (cursor) return cursor.familyLabel;
+    const context = contextFamilyByModelId(selected.id);
+    if (context) return context.familyLabel;
+    return modelLabel(selected);
   }
   if (loading) return "加载模型…";
   return models[0] ? modelLabel(models[0]) : "暂无可用模型";
@@ -74,6 +89,7 @@ function triggerLabel(models: PublicModel[], selectedId: string | undefined, loa
  * agent→model 的最终权威在后端）。
  *
  * Cursor 公开家族在菜单里收成一行，思考档与 Fast 作为独立控件映射回 canonical id。
+ * GPT / Kimi 收成一行，上下文标准/1M 作为独立控件。
  */
 export function ModelSelector({
   models,
@@ -96,6 +112,7 @@ export function ModelSelector({
 }) {
   const selected = models.find((m) => m.id === selectedId);
   const selectedCursor = cursorModelById(selectedId);
+  const selectedContext = contextFamilyByModelId(selectedId);
   const selectedDegraded = selected ? isDegraded(selected) : false;
   const hasAlternatives = models.some(
     (m) => !isDegraded(m) && m.id !== selectedId,
@@ -119,6 +136,17 @@ export function ModelSelector({
     selectedCursor.family !== "auto" &&
     cursorFamilySupportsFast(selectedCursor.family) &&
     cursorMembers.some((member) => cursorModelById(member.id)?.fast);
+  const selectedContextRow = rows.find(
+    (row) => row.kind === "context-family" && row.row.family === selectedContext?.family,
+  );
+  const contextMembers =
+    selectedContextRow && selectedContextRow.kind === "context-family"
+      ? selectedContextRow.row.members
+      : [];
+  const showContextTier =
+    selectedContext != null &&
+    contextFamilyHasStandard(contextMembers, selectedContext) &&
+    contextFamilyHasLong(contextMembers, selectedContext);
   const showPlatformEffort =
     !selectedCursor &&
     Boolean(effortSupported && effortSupported.length > 0 && onSelectEffort);
@@ -129,6 +157,15 @@ export function ModelSelector({
     next?: { effort?: PlatformReasoningEffort | null; fast?: boolean },
   ) => {
     const id = resolveCursorPickerSelection(members, family, selectedId, next);
+    if (id) onSelect(id);
+  };
+
+  const selectContext = (
+    spec: ContextTierFamily,
+    members: PublicModel[],
+    next?: { longContext?: boolean },
+  ) => {
+    const id = resolveContextPickerSelection(members, spec, selectedId, next);
     if (id) onSelect(id);
   };
 
@@ -158,6 +195,7 @@ export function ModelSelector({
           <span className="max-w-[6.5rem] truncate sm:max-w-[180px]">
             {label}
           </span>
+          {!teamEngineActive && <CostMark model={selected} />}
           <ChevronDown size={14} className="text-faint" />
         </button>
       </DropdownMenuTrigger>
@@ -213,8 +251,47 @@ export function ModelSelector({
                 >
                   <span className="truncate">{modelLabel(m)}</span>
                   <span className="flex shrink-0 items-center gap-1.5">
+                    <CostMark model={m} />
                     {degraded && <Badge tone="danger">暂不可用</Badge>}
                     {active && !degraded && (
+                      <>
+                        {teamEngineActive && (
+                          <span className="text-[11px] text-faint">
+                            团队模式关闭后生效
+                          </span>
+                        )}
+                        <Check size={14} className="shrink-0 text-accent" />
+                      </>
+                    )}
+                  </span>
+                </DropdownMenuItem>
+              );
+            }
+            if (row.kind === "context-family") {
+              const familyActive = selectedContext?.family === row.row.family;
+              const representative =
+                resolveContextPickerSelection(row.row.members, row.row.spec, selectedId) ??
+                row.row.members[0]?.id;
+              const representativeModel = row.row.members.find((item) => item.id === representative);
+              const degraded = row.row.members.every(isDegraded);
+              return (
+                <DropdownMenuItem
+                  key={row.row.family}
+                  data-model-id={representative}
+                  data-context-family={row.row.family}
+                  disabled={degraded}
+                  onSelect={
+                    degraded
+                      ? undefined
+                      : () => selectContext(row.row.spec, row.row.members)
+                  }
+                  className="justify-between"
+                >
+                  <span className="truncate">{row.row.label}</span>
+                  <span className="flex shrink-0 items-center gap-1.5">
+                    <CostMark model={representativeModel} />
+                    {degraded && <Badge tone="danger">暂不可用</Badge>}
+                    {familyActive && !degraded && (
                       <>
                         {teamEngineActive && (
                           <span className="text-[11px] text-faint">
@@ -232,6 +309,7 @@ export function ModelSelector({
             const representative =
               resolveCursorPickerSelection(row.row.members, row.row.family, selectedId) ??
               row.row.members[0]?.id;
+            const representativeModel = row.row.members.find((item) => item.id === representative);
             const degraded = row.row.members.every(isDegraded);
             return (
               <DropdownMenuItem
@@ -248,6 +326,7 @@ export function ModelSelector({
               >
                 <span className="truncate">{row.row.label}</span>
                 <span className="flex shrink-0 items-center gap-1.5">
+                  <CostMark model={representativeModel} />
                   {degraded && <Badge tone="danger">暂不可用</Badge>}
                   {familyActive && !degraded && (
                     <>
@@ -324,6 +403,43 @@ export function ModelSelector({
             >
               <span>Fast</span>
               {selectedCursor.fast && (
+                <Check size={14} className="shrink-0 text-accent" />
+              )}
+            </DropdownMenuItem>
+          </div>
+        )}
+        {showContextTier && selectedContext && selectedContextRow?.kind === "context-family" && (
+          <div className="shrink-0">
+            <DropdownMenuSeparator />
+            <DropdownMenuLabel className="flex items-center justify-between">
+              上下文
+              <span className="text-[11px] font-normal text-faint">
+                {selectedId === selectedContext.longId ? "1M" : "标准"}
+              </span>
+            </DropdownMenuLabel>
+            <DropdownMenuItem
+              data-context="standard"
+              disabled={!contextFamilyHasStandard(contextMembers, selectedContext)}
+              onSelect={() =>
+                selectContext(selectedContextRow.row.spec, contextMembers, { longContext: false })
+              }
+              className="justify-between"
+            >
+              <span>标准</span>
+              {selectedId === selectedContext.standardId && (
+                <Check size={14} className="shrink-0 text-accent" />
+              )}
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              data-context="1m"
+              disabled={!contextFamilyHasLong(contextMembers, selectedContext)}
+              onSelect={() =>
+                selectContext(selectedContextRow.row.spec, contextMembers, { longContext: true })
+              }
+              className="justify-between"
+            >
+              <span>1M（2 倍计费）</span>
+              {selectedId === selectedContext.longId && (
                 <Check size={14} className="shrink-0 text-accent" />
               )}
             </DropdownMenuItem>

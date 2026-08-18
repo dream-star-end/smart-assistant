@@ -11,8 +11,10 @@ import {
   cursorFamilySupportsFast,
   findCursorEngineModel,
   isCodexEngineModel,
+  isCodexLongContextModel,
   isCursorEngineModel,
   modelReasoningPolicy,
+  codexTransportModelId,
 } from '../engineModels.js'
 
 describe('GPT-5.6 engine model authority', () => {
@@ -21,11 +23,19 @@ describe('GPT-5.6 engine model authority', () => {
       'gpt-5.6-sol',
       'gpt-5.6-terra',
       'gpt-5.6-luna',
+      'gpt-5.6-sol-1m',
+      'gpt-5.6-terra-1m',
+      'gpt-5.6-luna-1m',
     ])
     assert.equal(DEFAULT_CODEX_ENGINE_MODEL, 'gpt-5.6-sol')
     for (const id of CODEX_ENGINE_MODEL_IDS) assert.equal(isCodexEngineModel(id), true)
     assert.equal(isCodexEngineModel('gpt-5.5'), false)
     assert.equal(isCodexEngineModel('gpt-5.6-ultra'), false)
+    assert.equal(isCodexLongContextModel('gpt-5.6-sol'), false)
+    assert.equal(isCodexLongContextModel('gpt-5.6-sol-1m'), true)
+    assert.equal(codexTransportModelId('gpt-5.6-sol-1m'), 'gpt-5.6-sol')
+    assert.equal(codexTransportModelId('gpt-5.6-sol'), 'gpt-5.6-sol')
+    assert.equal(modelReasoningPolicy('gpt-5.6-sol-1m').codexModelDefault, 'xhigh')
   })
 
   test('platform effort excludes ultra and preserves per-model defaults', () => {
@@ -72,7 +82,8 @@ describe('Cursor engine model authority', () => {
     assert.equal(findCursorEngineModel('composer-2.5', null, false)?.upstreamModel, 'composer-2.5')
     assert.deepEqual(cursorFamilyEfforts('grok-4.6'), ['low', 'medium', 'high', 'xhigh'])
     assert.equal(cursorFamilySupportsFast('fable-5'), false)
-    assert.equal(cursorFamilyDefaultFast('composer-2.5'), true)
+    assert.equal(cursorFamilyDefaultFast('composer-2.5'), false)
+    assert.equal(cursorFamilyDefaultFast('grok-4.6'), false)
     assert.equal(modelReasoningPolicy('cursor-grok-4.6-high').supported.length, 0)
     for (const id of CURSOR_ENGINE_MODEL_IDS) assert.equal(isCursorEngineModel(id), true)
     assert.equal(isCursorEngineModel('gpt-5.6-sol-medium'), false)

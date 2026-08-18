@@ -3,6 +3,7 @@ import type { PublicModel } from "./types";
 import {
   modelPickerRows,
   pickCursorPublicModel,
+  resolveContextPickerSelection,
   resolveCursorPickerSelection,
 } from "./cursorModelPicker";
 
@@ -53,10 +54,47 @@ describe("cursorModelPicker", () => {
     ).toBe("cursor-opus-5-high-fast");
   });
 
-  it("defaults Composer to Fast when entering the family", () => {
+  it("defaults Composer to standard when entering the family", () => {
     const composer = CURSOR_PUBLIC.filter((m) => m.id.startsWith("cursor-composer-2.5"));
     expect(resolveCursorPickerSelection(composer, "composer-2.5", "glm-5.2")).toBe(
-      "cursor-composer-2.5-fast",
+      "cursor-composer-2.5",
     );
+  });
+});
+
+describe("context family picker", () => {
+  const MODELS: PublicModel[] = [
+    { id: "glm-5.3", display_name: "GLM-5.3" },
+    { id: "gpt-5.6-sol", display_name: "GPT-5.6-Sol" },
+    { id: "gpt-5.6-sol-1m", display_name: "GPT-5.6-Sol" },
+    { id: "k3-256k", display_name: "Kimi K3 256K" },
+    { id: "kimi-k3", display_name: "Kimi K3" },
+  ];
+
+  it("collapses GPT and Kimi context twins into one row each", () => {
+    const rows = modelPickerRows(MODELS);
+    expect(rows.map((row) => (row.kind === "plain" ? row.model.id : row.row.family))).toEqual([
+      "glm-5.3",
+      "gpt-5.6-sol",
+      "kimi-k3",
+    ]);
+  });
+
+  it("defaults GPT/Kimi to the standard window", () => {
+    const gpt = MODELS.filter((m) => m.id.startsWith("gpt-5.6-sol"));
+    const spec = { family: "gpt-5.6-sol", familyLabel: "GPT-5.6-Sol", standardId: "gpt-5.6-sol", longId: "gpt-5.6-sol-1m" } as const;
+    expect(resolveContextPickerSelection(gpt, spec, "glm-5.3")).toBe("gpt-5.6-sol");
+    const kimi = MODELS.filter((m) => m.id === "k3-256k" || m.id === "kimi-k3");
+    const kimiSpec = { family: "kimi-k3", familyLabel: "Kimi K3", standardId: "k3-256k", longId: "kimi-k3" } as const;
+    expect(resolveContextPickerSelection(kimi, kimiSpec, "glm-5.3")).toBe("k3-256k");
+  });
+
+  it("preserves 1M when switching GPT families", () => {
+    const terra: PublicModel[] = [
+      { id: "gpt-5.6-terra", display_name: "GPT-5.6-Terra" },
+      { id: "gpt-5.6-terra-1m", display_name: "GPT-5.6-Terra" },
+    ];
+    const spec = { family: "gpt-5.6-terra", familyLabel: "GPT-5.6-Terra", standardId: "gpt-5.6-terra", longId: "gpt-5.6-terra-1m" } as const;
+    expect(resolveContextPickerSelection(terra, spec, "gpt-5.6-sol-1m")).toBe("gpt-5.6-terra-1m");
   });
 });

@@ -1,8 +1,13 @@
 import {
+  contextFamilyByModelId,
+  contextFamilyDefaultLong,
   cursorFamilyDefaultEffort,
   cursorFamilyDefaultFast,
   cursorFamilyEfforts,
   cursorModelById,
+  formatCostX,
+  type ContextTierFamily,
+  type ContextTierFamilyId,
   type CursorEngineFamilyId,
   type CursorEngineModel,
   type PlatformReasoningEffort,
@@ -15,34 +20,64 @@ export type CursorPickerRow = {
   members: PublicModel[];
 };
 
+export type ContextPickerRow = {
+  family: ContextTierFamilyId;
+  label: string;
+  members: PublicModel[];
+  spec: ContextTierFamily;
+};
+
 export type ModelPickerRow =
   | { kind: "plain"; model: PublicModel }
-  | { kind: "cursor-family"; row: CursorPickerRow };
+  | { kind: "cursor-family"; row: CursorPickerRow }
+  | { kind: "context-family"; row: ContextPickerRow };
 
 export function cursorDefFor(modelId: string | null | undefined): CursorEngineModel | undefined {
   return cursorModelById(modelId);
 }
 
-/** Collapse public Cursor catalog rows into one picker row per family, preserving API order. */
+export function modelCostLabel(model: PublicModel | undefined): string | undefined {
+  const raw = model?.cost_x;
+  return formatCostX(typeof raw === "number" ? raw : undefined);
+}
+
+/** Collapse public Cursor / GPT / Kimi catalog rows into one picker row per family. */
 export function modelPickerRows(models: readonly PublicModel[]): ModelPickerRow[] {
-  const seen = new Set<CursorEngineFamilyId>();
+  const seenCursor = new Set<CursorEngineFamilyId>();
+  const seenContext = new Set<ContextTierFamilyId>();
   const rows: ModelPickerRow[] = [];
   for (const model of models) {
-    const def = cursorModelById(model.id);
-    if (!def) {
-      rows.push({ kind: "plain", model });
+    const cursor = cursorModelById(model.id);
+    if (cursor) {
+      if (seenCursor.has(cursor.family)) continue;
+      seenCursor.add(cursor.family);
+      rows.push({
+        kind: "cursor-family",
+        row: {
+          family: cursor.family,
+          label: cursor.familyLabel,
+          members: models.filter((item) => cursorModelById(item.id)?.family === cursor.family),
+        },
+      });
       continue;
     }
-    if (seen.has(def.family)) continue;
-    seen.add(def.family);
-    rows.push({
-      kind: "cursor-family",
-      row: {
-        family: def.family,
-        label: def.familyLabel,
-        members: models.filter((item) => cursorModelById(item.id)?.family === def.family),
-      },
-    });
+    const context = contextFamilyByModelId(model.id);
+    if (context) {
+      if (seenContext.has(context.family)) continue;
+      seenContext.add(context.family);
+      const ids = new Set<string>([context.standardId, context.longId]);
+      rows.push({
+        kind: "context-family",
+        row: {
+          family: context.family,
+          label: context.familyLabel,
+          spec: context,
+          members: models.filter((item) => ids.has(item.id)),
+        },
+      });
+      continue;
+    }
+    rows.push({ kind: "plain", model });
   }
   return rows;
 }
@@ -134,4 +169,48 @@ export function resolveCursorPickerSelection(
         ? current.fast
         : cursorFamilyDefaultFast(family);
   return pickCursorPublicModel(members, family, effort, fast)?.id;
+}
+
+export function contextFamilyHasLong(members: readonly PublicModel[], spec: ContextTierFamily): boolean {
+  return members.some((model) => model.id === spec.longId);
+}
+
+export function contextFamilyHasStandard(
+  members: readonly PublicModel[],
+  spec: ContextTierFamily,
+): boolean {
+  return members.some((model) => model.id === spec.standardId);
+}
+
+export function pickContextPublicModel(
+  members: readonly PublicModel[],
+  spec: ContextTierFamily,
+  longContext: boolean,
+): PublicModel | undefined {
+  const healthy = (model: PublicModel) => (model as { degraded?: unknown }).degraded !== true;
+  const desiredId = longContext ? spec.longId : spec.standardId;
+  const fallbackId = longContext ? spec.standardId : spec.longId;
+  return (
+    members.find((model) => model.id === desiredId && healthy(model)) ??
+    members.find((model) => model.id === fallbackId && healthy(model)) ??
+    members.find(healthy) ??
+    members.find((model) => model.id === desiredId) ??
+    members[0]
+  );
+}
+
+export function resolveContextPickerSelection(
+  members: readonly PublicModel[],
+  spec: ContextTierFamily,
+  currentId: string | undefined,
+  next?: { longContext?: boolean },
+): string | undefined {
+  const current = contextFamilyByModelId(currentId);
+  const longContext =
+    next && "longContext" in next
+      ? Boolean(next.longContext)
+      : current
+        ? current.longId === currentId
+        : contextFamilyDefaultLong(spec.family);
+  return pickContextPublicModel(members, spec, longContext)?.id;
 }

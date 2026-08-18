@@ -19,6 +19,7 @@ import {
   type GoalStateSnapshot,
   type ToolTerminationReason,
   type TurnTokenUsageSnapshot,
+  codexTransportModelId,
   isToolExitCode,
   turnErrorSemantics,
 } from '@openclaude/protocol'
@@ -28,6 +29,7 @@ import type { RepoSnapshot } from '../sessionRepoWorkspace.js'
 import {
   _sanitizeThreadId,
   buildCodexEnv,
+  buildCodexLongContextArgs,
   buildCodexModelCatalogArgs,
   buildCodexMultiAgentDisableArgs,
   buildCodexProviderConfigArgs,
@@ -1841,6 +1843,7 @@ export class CodexAppServerRunner extends EventEmitter {
     const providerSignature = this.codexRouteSignature()
     const providerArgs = buildCodexProviderConfigArgs(process.env, this.codexRouteConfig)
     const modelCatalogArgs = buildCodexModelCatalogArgs(this.opts.model)
+    const longContextArgs = buildCodexLongContextArgs(this.opts.model)
     const effortArgs = codexReasoningEffortConfig(this.opts.model, this.effortLevel)
     // T3:reasoning summary 与 effort 是同一 provider 的推理配置,co-locate 在这里
     // 一起拼(仅 codex-native/gpt-5.5 官方 OAuth 路径生效,env 可秒关)。让队长思考
@@ -1882,6 +1885,7 @@ export class CodexAppServerRunner extends EventEmitter {
       ...argvOverrides,
       ...providerArgs,
       ...modelCatalogArgs,
+      ...longContextArgs,
       ...effortArgs,
       ...reasoningSummaryArgs,
       ...multiAgentDisableArgs,
@@ -2491,6 +2495,10 @@ export class CodexAppServerRunner extends EventEmitter {
     return normalizeCodexReasoningEffort(this.opts.model, this.effortLevel) ?? undefined
   }
 
+  private codexTransportModel(): string | undefined {
+    return codexTransportModelId(this.opts.model)
+  }
+
   private buildTurnStartParams(prompt: string): Record<string, unknown> {
     const mode = this.conversationMode
     const reasoningEffort = this.codexReasoningEffort()
@@ -2500,7 +2508,7 @@ export class CodexAppServerRunner extends EventEmitter {
       collaborationMode: {
         mode,
         settings: {
-          model: this.opts.model ?? '',
+          model: this.codexTransportModel() ?? '',
           ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
           developer_instructions: mode === 'default' ? CODEX_DEFAULT_MODE_INSTRUCTIONS : null,
         },
@@ -2512,7 +2520,7 @@ export class CodexAppServerRunner extends EventEmitter {
             ? { type: 'readOnly', networkAccess: true }
             : { type: 'dangerFullAccess' },
     }
-    if (this.opts.model) params.model = this.opts.model
+    if (this.codexTransportModel()) params.model = this.codexTransportModel()
     if (this.opts.structuredOutputSchema) params.outputSchema = this.opts.structuredOutputSchema
     return params
   }
@@ -3308,7 +3316,7 @@ export class CodexAppServerRunner extends EventEmitter {
       approvalPolicy: 'never',
       sandbox: this.opts.hermeticNoTools ? 'read-only' : 'danger-full-access',
       cwd: effectiveCwd,
-      ...(this.opts.model ? { model: this.opts.model } : {}),
+      ...(this.codexTransportModel() ? { model: this.codexTransportModel() } : {}),
     })) as { thread?: { id?: string } } | undefined
     const tid = res?.thread?.id
     if (typeof tid !== 'string' || !tid) {
@@ -3543,7 +3551,7 @@ export class CodexAppServerRunner extends EventEmitter {
               approvalPolicy: 'never',
               sandbox: 'danger-full-access',
               cwd: effectiveCwd,
-              ...(this.opts.model ? { model: this.opts.model } : {}),
+              ...(this.codexTransportModel() ? { model: this.codexTransportModel() } : {}),
             })
           } catch (err) {
             // Self-heal "no rollout found for thread id" (-32600). Caused by
