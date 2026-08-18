@@ -528,11 +528,12 @@ function isImmutableTapeViewportRow(message: ChatMessage): boolean {
   );
 }
 
-/** Tape/server snapshots are complete. Live incrementals must not append onto them. */
+/** Only proven-terminal tape/timeline rows are frozen. `_turnTapeId` or
+ * `_source:"server"` alone is not enough: rolling refs and REST/WS overlap
+ * can carry those marks while later live incrementals are still authoritative. */
 function isFrozenLiveTarget(message: ChatMessage): boolean {
   if (isImmutableTapeViewportRow(message)) return true;
-  if (typeof message._turnTapeId === "string" && message._turnTapeId.length > 0) return true;
-  return message._source === "server" && (message.text || "").length > 0;
+  return message._turnTapeComplete === true;
 }
 
 function frameSeqAlreadyApplied(message: ChatMessage, frameSeq?: number): boolean {

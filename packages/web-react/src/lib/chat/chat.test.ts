@@ -936,6 +936,7 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
     // journal hydrate resets the session cursor and clears the stream pointer.
     row!._source = "server";
     row!._turnTapeId = "4c767b304d7879767665424a761fac0ded7cd7d604d90c80c079232aab58df0d";
+    row!._turnTapeComplete = true;
     resetFrameSeqCursor(s, frames[0]);
     s._streamingAssistant = null;
     for (const frame of frames) applyOutboundMessage(s, frame);
@@ -952,6 +953,7 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
       ts: 1,
       _source: "server",
       _turnTapeId: "4c767b304d7879767665424a761fac0ded7cd7d604d90c80c079232aab58df0d",
+      _turnTapeComplete: true,
       _clientMessageId: "m-msy9xr0r-5-9sa2",
     });
     for (const chunk of [
@@ -980,6 +982,33 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
     applyOutboundMessage(s, msgFrame({ frameSeq: 1, blocks: [{ kind: "text", text: "Hel", messageId: "srv-1" }] }));
     applyOutboundMessage(s, msgFrame({ frameSeq: 2, blocks: [{ kind: "text", text: "lo", messageId: "srv-1" }] }));
     expect(s.messages.filter((m) => m.role === "assistant")[0].text).toBe("Hello");
+  });
+
+  test("incomplete tape row with same messageId still accepts later live frames and does not double replay", () => {
+    const s = sess();
+    s._activeClientMessageId = "m-recover";
+    s.messages.push({
+      id: "srv-s1-main-t3-s0",
+      role: "assistant",
+      text: "那批通知是我已经处理完的门禁…",
+      ts: 1,
+      _source: "server",
+      _turnTapeId: "tape-rolling-not-complete",
+      _clientMessageId: "m-recover",
+    });
+    applyOutboundMessage(s, msgFrame({
+      frameSeq: 20,
+      clientMessageId: "m-recover",
+      blocks: [{ kind: "text", text: "守候进程正常运行，第 3 次轮询…", messageId: "srv-s1-main-t3-s0" }],
+    }));
+    const once = "那批通知是我已经处理完的门禁…守候进程正常运行，第 3 次轮询…";
+    expect(s.messages.find((m) => m.id === "srv-s1-main-t3-s0")?.text).toBe(once);
+    applyOutboundMessage(s, msgFrame({
+      frameSeq: 20,
+      clientMessageId: "m-recover",
+      blocks: [{ kind: "text", text: "守候进程正常运行，第 3 次轮询…", messageId: "srv-s1-main-t3-s0" }],
+    }));
+    expect(s.messages.find((m) => m.id === "srv-s1-main-t3-s0")?.text).toBe(once);
   });
 
   test("a later frameSeq with the same words is still appended (model really repeated itself)", () => {
