@@ -17,6 +17,7 @@
 #   scripts/deploy-v5-selfhost.sh --preflight
 #   scripts/deploy-v5-selfhost.sh --bootstrap [--force-env]
 #   scripts/deploy-v5-selfhost.sh --deploy
+#   scripts/deploy-v5-selfhost.sh --deploy --allow-dirty --platform-from-head
 #   scripts/deploy-v5-selfhost.sh --smoke
 #   scripts/deploy-v5-selfhost.sh --status
 #   scripts/deploy-v5-selfhost.sh --bootstrap --dry-run
@@ -75,7 +76,20 @@ source "$RUNTIME_LIB"
 DRY=0
 FORCE_ENV=0
 ALLOW_DIRTY=0
+PLATFORM_FROM_HEAD=0
 MODE=""
+
+# 本实例专属发布锁。禁止复用:
+#   /var/lock/oc-v5-deploy.lock                      V5 商业版生产(deploy-v5.sh / 发布队列 / 自愈)
+#   /run/openclaude-v5/production-mutation.lock      V5 商业版生产 mutation lease
+#   /var/lock/openclaude-v5-deploy.lock              宿主遗留(2026-07-27起),现网脚本已不引用
+#   /var/lock/openclaude-v5-production-mutation.lock 宿主遗留(2026-07-24起),现网脚本已不引用
+SELFHOST_DEPLOY_LOCK="${OC_V5_SELFHOST_DEPLOY_LOCK:-/var/lock/openclaude-v5-selfhost-deploy.lock}"
+SELFHOST_DEPLOY_LOCK_WAIT="${OC_V5_SELFHOST_DEPLOY_LOCK_WAIT:-2400}"
+SELFHOST_DEPLOY_LOCK_POLL="${OC_V5_SELFHOST_DEPLOY_LOCK_POLL:-15}"
+SELFHOST_DEPLOY_LOCK_HOLDER=""
+SELFHOST_DEPLOY_LOCK_HOLDER_OWNED=0
+PLATFORM_ARCHIVE_TMP=""
 
 die() {
   echo "✗ $*" >&2
@@ -97,24 +111,101 @@ own_instance_present() {
   [[ -f "$V5_ENV" ]] || systemctl cat "$V5_UNIT" >/dev/null 2>&1
 }
 
+cleanup_selfhost_deploy() {
+  if [[ -n "${PLATFORM_ARCHIVE_TMP:-}" && -d "$PLATFORM_ARCHIVE_TMP" ]]; then
+    rm -rf "$PLATFORM_ARCHIVE_TMP"
+    PLATFORM_ARCHIVE_TMP=""
+  fi
+  if [[ "${SELFHOST_DEPLOY_LOCK_HOLDER_OWNED:-0}" == 1 && -n "${SELFHOST_DEPLOY_LOCK_HOLDER:-}" ]]; then
+    rm -f "$SELFHOST_DEPLOY_LOCK_HOLDER"
+    SELFHOST_DEPLOY_LOCK_HOLDER_OWNED=0
+  fi
+}
+trap cleanup_selfhost_deploy EXIT
+
+selfhost_lock_holder_info() {
+  local lock="$1" holder pids
+  holder="$(cat "${lock}.holder" 2>/dev/null || true)"
+  pids="$(fuser "$lock" 2>/dev/null | tr -s '[:space:]' ' ' | sed 's/^ //;s/ $//' || true)"
+  printf 'holder=%s fuser_pids=%s' "${holder:-未知}" "${pids:-?}"
+}
+
+# fd 8 排他 flock:进程退出/被杀时内核释放,不手删锁文件。
+# OC_V5_SELFHOST_DEPLOY_LOCK_HELD=1 表示本进程链已持锁(内层跳过,防将来 $0 自调用把自己锁死)。
+acquire_selfhost_deploy_lock() {
+  local lock wait_s interval waited info
+  if [[ "${OC_V5_SELFHOST_DEPLOY_LOCK_HELD:-}" == 1 ]]; then
+    log "  ↻ 本进程链已持 selfhost 发布锁,跳过加锁(可重入)"
+    return 0
+  fi
+  command -v flock >/dev/null 2>&1 || die "缺少 flock。补救: 安装 util-linux。"
+  lock="$SELFHOST_DEPLOY_LOCK"
+  wait_s="$SELFHOST_DEPLOY_LOCK_WAIT"
+  interval="$SELFHOST_DEPLOY_LOCK_POLL"
+  [[ "$wait_s" =~ ^[0-9]+$ ]] || die "OC_V5_SELFHOST_DEPLOY_LOCK_WAIT 必须是非负整数秒(当前=$wait_s)"
+  [[ "$interval" =~ ^[1-9][0-9]*$ ]] || die "OC_V5_SELFHOST_DEPLOY_LOCK_POLL 必须是正整数秒(当前=$interval)"
+  if (( interval > wait_s && wait_s > 0 )); then
+    interval="$wait_s"
+  fi
+  mkdir -p "$(dirname "$lock")"
+  exec 8>"$lock" || die "无法打开锁文件 $lock"
+  if ! flock -n 8; then
+    waited=0
+    while ! flock -n 8; do
+      if (( waited >= wait_s )); then
+        info="$(selfhost_lock_holder_info "$lock")"
+        echo "✗ 等待 selfhost 发布锁超时(${wait_s}s)。锁=$lock $info
+补救: 等对方 --deploy/--bootstrap 结束;若持锁 pid 已死仍超时,查 fuser $lock。不要复用商业版 /var/lock/oc-v5-deploy.lock。" >&2
+        exit 1
+      fi
+      info="$(selfhost_lock_holder_info "$lock")"
+      log "⏳ 排队等 selfhost 发布锁: $info 已等 ${waited}s / ${wait_s}s"
+      sleep "$interval"
+      waited=$((waited + interval))
+    done
+  fi
+  SELFHOST_DEPLOY_LOCK_HOLDER="${lock}.holder"
+  printf 'pid=%s user=%s tree=%s started=%s\n' \
+    "$$" "$(id -un 2>/dev/null || echo ?)" "${REPO_ROOT:-?}" "$(date -Is)" \
+    >"$SELFHOST_DEPLOY_LOCK_HOLDER" || true
+  SELFHOST_DEPLOY_LOCK_HOLDER_OWNED=1
+  export OC_V5_SELFHOST_DEPLOY_LOCK_HELD=1
+  log "  ✓ 已取得 selfhost 发布锁 $lock pid=$$"
+}
+
+# --status/--smoke/--preflight 与 --dry-run 只读/轻量,不加锁,避免被发布堵住。
+maybe_acquire_selfhost_deploy_lock() {
+  case "$MODE" in
+    deploy|bootstrap)
+      [[ "$DRY" == 1 ]] && return 0
+      acquire_selfhost_deploy_lock
+      ;;
+  esac
+}
+
 usage() {
   cat <<'EOF'
-用法: scripts/deploy-v5-selfhost.sh --preflight|--bootstrap|--deploy|--smoke|--status [--dry-run] [--force-env]
+用法: scripts/deploy-v5-selfhost.sh --preflight|--bootstrap|--deploy|--smoke|--status [--dry-run] [--force-env] [--allow-dirty] [--platform-from-head]
 
-  --preflight    只读硬门(残留/端口/密钥/个人版)。任何一条不满足即非 0 退出
-  --bootstrap    首次完整安装(开头跑全套 preflight)
-  --deploy       更新代码后重建 release 树、重写四元组、重启服务
-  --smoke        只读健康检查(含个人版回归)
-  --status       打印当前状态
-  --dry-run      与上述组合:打印将执行的命令,不改任何东西
-  --allow-dirty  仅配合 --deploy:工作区有未提交改动时仍部署(默认拒绝,见 cmd_deploy 脏门)
-  --force-env    仅配合 --bootstrap:覆盖已存在的 env 文件
+  --preflight           只读硬门(残留/端口/密钥/个人版)。任何一条不满足即非 0 退出
+  --bootstrap           首次完整安装(开头跑全套 preflight)
+  --deploy              更新代码后重建 release 树、重写四元组、重启服务
+  --smoke               只读健康检查(含个人版回归)
+  --status              打印当前状态
+  --dry-run             与上述组合:打印将执行的命令,不改任何东西
+  --allow-dirty         仅配合 --deploy:工作区有未提交改动时仍部署(默认拒绝,见 cmd_deploy 脏门)
+  --platform-from-head  仅配合 --deploy/--bootstrap:平台 bundle 从 git archive 取已提交的 platform-runtime(默认仍拷工作树)
+  --force-env           仅配合 --bootstrap:覆盖已存在的 env 文件
+
+  写路径(--deploy/--bootstrap,非 dry-run)会在 /var/lock/openclaude-v5-selfhost-deploy.lock 上排队等锁,默认 2400s。
+  覆盖: OC_V5_SELFHOST_DEPLOY_LOCK / OC_V5_SELFHOST_DEPLOY_LOCK_WAIT / OC_V5_SELFHOST_DEPLOY_LOCK_POLL
 
 示例:
   scripts/deploy-v5-selfhost.sh --preflight
   scripts/deploy-v5-selfhost.sh --bootstrap --dry-run
   scripts/deploy-v5-selfhost.sh --bootstrap
   scripts/deploy-v5-selfhost.sh --deploy
+  scripts/deploy-v5-selfhost.sh --deploy --allow-dirty --platform-from-head
   scripts/deploy-v5-selfhost.sh --smoke
 EOF
 }
@@ -124,6 +215,7 @@ for arg in "$@"; do
     --dry-run) DRY=1 ;;
     --force-env) FORCE_ENV=1 ;;
     --allow-dirty) ALLOW_DIRTY=1 ;;
+    --platform-from-head) PLATFORM_FROM_HEAD=1 ;;
     --preflight|--bootstrap|--deploy|--smoke|--status)
       [[ -z "$MODE" ]] || die "只能指定一个主模式(已有 --$MODE,又收到 $arg)"
       MODE="${arg#--}"
@@ -143,9 +235,24 @@ done
 [[ -n "$MODE" ]] || { usage >&2; exit 2; }
 [[ "$FORCE_ENV" == 1 && "$MODE" != "bootstrap" ]] && die "--force-env 只能与 --bootstrap 同用"
 [[ "$ALLOW_DIRTY" == 1 && "$MODE" != "deploy" ]] && die "--allow-dirty 只能与 --deploy 同用"
+[[ "$PLATFORM_FROM_HEAD" == 1 && "$MODE" != "deploy" && "$MODE" != "bootstrap" ]] \
+  && die "--platform-from-head 只能与 --deploy 或 --bootstrap 同用"
+
+# 锁自测钩子:只加锁再 sleep,不碰发布路径。给并发/超时验证用,生产勿设。
+if [[ -n "${OC_V5_SELFHOST_LOCK_SELFTEST_SLEEP:-}" ]]; then
+  [[ "$OC_V5_SELFHOST_LOCK_SELFTEST_SLEEP" =~ ^[0-9]+$ ]] \
+    || die "OC_V5_SELFHOST_LOCK_SELFTEST_SLEEP 必须是非负整数秒"
+  acquire_selfhost_deploy_lock
+  log "selftest: 持锁 pid=$$ sleep=${OC_V5_SELFHOST_LOCK_SELFTEST_SLEEP}s lock=$SELFHOST_DEPLOY_LOCK"
+  sleep "$OC_V5_SELFHOST_LOCK_SELFTEST_SLEEP"
+  log "selftest: sleep 结束,进程退出后内核释放锁"
+  exit 0
+fi
 
 [[ "$REPO_ROOT" == /opt/openclaude/openclaude-v5-selfhost ]] \
   || die "必须在 /opt/openclaude/openclaude-v5-selfhost 内执行(当前 REPO_ROOT=$REPO_ROOT)。补救: cd 到该 worktree 再跑。"
+
+maybe_acquire_selfhost_deploy_lock
 
 # ── 只读检查 ─────────────────────────────────────────────────────────────
 
@@ -778,20 +885,39 @@ runtime_caps_from_metadata() {
 }
 
 build_platform_bundle() {
-  local sha="$1" nonce staging rev
+  local sha="$1" nonce staging rev src
   log "── build platform bundle ──"
-  [[ -d "$PLATFORM_SRC/prompts" ]] || die "platform-runtime 缺 prompts/"
+  src="$PLATFORM_SRC"
+  if [[ "$PLATFORM_FROM_HEAD" == 1 ]]; then
+    log "  源: git archive $sha (已提交 platform-runtime;忽略工作树脏文件)"
+  else
+    log "  源: 工作树 $PLATFORM_SRC"
+    [[ -d "$PLATFORM_SRC/prompts" ]] || die "platform-runtime 缺 prompts/"
+  fi
   if [[ "$DRY" == 1 ]]; then
-    echo "  [dry-run] cp platform-runtime → bundles/.staging; validatePlatformSeedCli; oc_hotcfg_finalize_bundle"
+    if [[ "$PLATFORM_FROM_HEAD" == 1 ]]; then
+      echo "  [dry-run] git archive $sha platform-runtime → tmp; validatePlatformSeedCli; oc_hotcfg_finalize_bundle"
+    else
+      echo "  [dry-run] cp platform-runtime → bundles/.staging; validatePlatformSeedCli; oc_hotcfg_finalize_bundle"
+    fi
     BUILT_BUNDLE_REV="dryrunbundle0"
     return 0
   fi
+  if [[ "$PLATFORM_FROM_HEAD" == 1 ]]; then
+    PLATFORM_ARCHIVE_TMP="$(mktemp -d -t oc-v5-selfhost-platform.XXXXXX)" \
+      || die "mktemp 平台 bundle 临时目录失败"
+    git -C "$REPO_ROOT" archive --format=tar "$sha" -- packages/commercial/agent-sandbox/platform-runtime \
+      | tar -x -C "$PLATFORM_ARCHIVE_TMP" \
+      || { rm -rf "$PLATFORM_ARCHIVE_TMP"; PLATFORM_ARCHIVE_TMP=""; die "git archive platform-runtime 失败"; }
+    src="$PLATFORM_ARCHIVE_TMP/packages/commercial/agent-sandbox/platform-runtime"
+  fi
+  [[ -d "$src/prompts" ]] || die "platform-runtime 缺 prompts/: $src"
   nonce="$(openssl rand -hex 8)"
   staging="$OC_HOTCFG_PLATFORM_ROOT/bundles/.staging-$nonce"
   mkdir -p "$OC_HOTCFG_PLATFORM_ROOT/bundles"
   rm -rf "$staging"
   mkdir -p "$staging"
-  cp -a "$PLATFORM_SRC/." "$staging/"
+  cp -a "$src/." "$staging/"
   ( cd "$REPO_ROOT" && npx --no-install tsx "$SEED_CLI" "$staging" ) \
     || { rm -rf "$staging"; die "seed 语义校验失败"; }
   rev="$(oc_hotcfg_finalize_bundle "$staging" 1 "$sha")" \
@@ -799,6 +925,10 @@ build_platform_bundle() {
   rev="$(printf '%s' "$rev" | tr -d '[:space:]')"
   [[ "$rev" =~ ^[0-9a-f]{12}$ ]] || die "bundle rev 非法: $rev"
   BUILT_BUNDLE_REV="$rev"
+  if [[ -n "${PLATFORM_ARCHIVE_TMP:-}" ]]; then
+    rm -rf "$PLATFORM_ARCHIVE_TMP"
+    PLATFORM_ARCHIVE_TMP=""
+  fi
   log "  ✓ platform bundle rev=$BUILT_BUNDLE_REV"
 }
 
