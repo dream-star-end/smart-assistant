@@ -2121,22 +2121,27 @@ await check("T41 Codex 密度 token：Composer/ToolCard/Sidebar 在 1440 与 390
     if (!createClass.includes("text-section") || !createClass.includes("border-border") || !createClass.includes("bg-surface")) {
       throw new Error(`新建会话未保持 secondary(${theme}): ${createClass}`);
     }
-    const manageClass = await sidebar.getByRole("button", { name: /管理中心/ }).getAttribute("class") ?? "";
-    if (!manageClass.includes("text-body") || !manageClass.includes("text-muted")) {
-      throw new Error(`管理中心入口权重未下降(${theme}): ${manageClass}`);
+    if (await sidebar.getByRole("button", { name: /管理中心/ }).count() !== 0) {
+      throw new Error(`管理中心仍占侧栏主区(${theme})`);
     }
-    const marketClass = await sidebar.getByRole("button", { name: /^市场/ }).getAttribute("class") ?? "";
-    if (!marketClass.includes("text-body") || !marketClass.includes("text-muted")) {
-      throw new Error(`市场入口权重未下降(${theme}): ${marketClass}`);
+    if (await sidebar.getByRole("button", { name: "打开使用教程" }).count() !== 1) {
+      throw new Error(`底栏教程图标丢失(${theme})`);
     }
-    if (await sidebar.getByRole("button", { name: /使用教程/ }).count() !== 1) {
-      throw new Error(`教程入口丢失(${theme})`);
+    if (await sidebar.getByRole("button", { name: /切换主题/ }).count() !== 1) {
+      throw new Error(`底栏主题开关丢失(${theme})`);
     }
-    if (await sidebar.getByRole("button", { name: /组织/ }).count() !== 1) {
-      throw new Error(`组织入口丢失(${theme})`);
+    await sidebar.getByRole("button", { name: "账号菜单" }).click();
+    const menu = page.getByRole("menu");
+    await menu.waitFor({ state: "visible", timeout: 3000 });
+    for (const label of ["管理中心", "市场", "组织", "管理后台", "视频任务", "设置"]) {
+      if (await menu.getByRole("menuitem", { name: new RegExp(label) }).count() !== 1) {
+        throw new Error(`账号菜单缺少「${label}」(${theme})`);
+      }
     }
-    const adminHref = await sidebar.getByRole("link", { name: /管理后台/ }).getAttribute("href");
+    const adminHref = await menu.getByRole("menuitem", { name: /管理后台/ }).getAttribute("href");
     if (adminHref !== "/admin.html") throw new Error(`管理后台入口丢失或 href 错误(${theme}): ${adminHref}`);
+    await page.keyboard.press("Escape");
+    await menu.waitFor({ state: "hidden", timeout: 3000 });
   }
 
   await page.setViewportSize({ width: 1440, height: 900 });

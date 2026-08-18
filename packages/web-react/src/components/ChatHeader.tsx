@@ -1,6 +1,5 @@
-import { Bell, BookOpen, ChevronDown, Film, Menu, PanelLeft, PenSquare, Users, Wallet } from "lucide-react";
+import { Bell, ChevronDown, Menu, PanelLeft, PenSquare, Users, Wallet } from "lucide-react";
 import { useState } from "react";
-import type { Theme } from "../hooks/useTheme";
 import type { Agent } from "../lib/agents";
 import type { PreferenceEffort } from "../lib/modelPreferences";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
@@ -8,7 +7,6 @@ import { AgentAvatar } from "./AgentAvatar";
 import type { PublicModel } from "../lib/types";
 import { formatCredits } from "../lib/utils";
 import { ModelSelector, teamEngineLabel } from "./ModelSelector";
-import { ThemeToggle } from "./ThemeToggle";
 import { Button, IconButton, Popover, PopoverContent, PopoverTrigger } from "./ui";
 
 export function ChatHeader({
@@ -30,11 +28,7 @@ export function ChatHeader({
   onNew,
   onOpenMobileNav,
   onOpenInbox,
-  onOpenMediaTasks,
-  onOpenTutorial,
   unreadCount,
-  theme,
-  onCycleTheme,
 }: {
   agent: Agent;
   onAgentClick: () => void;
@@ -68,14 +62,8 @@ export function ChatHeader({
   onOpenMobileNav?: () => void;
   /** 打开站内信面板（省略则不渲染铃铛，如 demo / 未登录）。 */
   onOpenInbox?: () => void;
-  /** 打开账号级异步视频任务中心。 */
-  onOpenMediaTasks?: () => void;
-  /** 打开与真实功能联动的教程中心。 */
-  onOpenTutorial?: () => void;
   /** 站内信未读数（>0 显红点，>99 显 99+）。 */
   unreadCount?: number;
-  theme: Theme;
-  onCycleTheme: () => void;
 }) {
   const low = credits != null && (credits.trim().startsWith("-") || /^-?0+$/.test(credits.trim()));
   // 团队模式说明弹层的受控开关：点「关闭团队模式」需要主动收起弹层（chip 随
@@ -166,22 +154,6 @@ export function ChatHeader({
         />
       )}
       <div className="ml-auto flex shrink-0 items-center gap-1.5">
-        {onOpenMediaTasks && (
-          <IconButton data-product-control onClick={onOpenMediaTasks} aria-label="视频任务" title="视频任务" shape="square">
-            <Film size={18} />
-          </IconButton>
-        )}
-        {onOpenTutorial && (
-          <IconButton
-            data-product-control
-            onClick={onOpenTutorial}
-            aria-label="打开使用教程"
-            title="使用教程"
-            shape="square"
-          >
-            <BookOpen size={18} />
-          </IconButton>
-        )}
         {onOpenInbox && (
           <div className="relative">
             <IconButton data-product-feature={PRODUCT_CAPABILITIES.inbox.id} onClick={onOpenInbox} aria-label="站内信" shape="square">
@@ -211,7 +183,6 @@ export function ChatHeader({
             <span className="hidden sm:inline">{formatCredits(credits)}</span>
           </button>
         )}
-        <ThemeToggle theme={theme} onCycle={onCycleTheme} />
       </div>
     </header>
   );

@@ -21,8 +21,6 @@ function renderHeader(extra: Partial<Parameters<typeof ChatHeader>[0]> = {}) {
       models={MODELS}
       selectedModelId="glm-5.2"
       onSelectModel={() => {}}
-      theme="light"
-      onCycleTheme={() => {}}
       {...extra}
     />,
   );

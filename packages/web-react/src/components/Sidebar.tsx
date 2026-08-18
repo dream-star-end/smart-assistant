@@ -1,10 +1,39 @@
-import { BookOpen, Building2, Kanban, LayoutGrid, LogOut, MessageSquareText, PanelLeftClose, Pencil, Plus, Search, ShieldCheck, Sparkles, Store, Trash2 } from "lucide-react";
+import {
+  BookOpen,
+  Building2,
+  Film,
+  Kanban,
+  LayoutGrid,
+  LogOut,
+  MessageSquareText,
+  PanelLeftClose,
+  Pencil,
+  Plus,
+  Search,
+  Settings,
+  ShieldCheck,
+  Sparkles,
+  Store,
+  Trash2,
+} from "lucide-react";
 import { useMemo, useState } from "react";
+import type { Theme } from "../hooks/useTheme";
 import { BRAND } from "../lib/brand";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import type { Session, User } from "../lib/types";
 import { cn, formatCredits, groupLabel } from "../lib/utils";
-import { Avatar, Badge, Button, IconButton } from "./ui";
+import { ThemeToggle } from "./ThemeToggle";
+import {
+  Avatar,
+  Badge,
+  Button,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+  IconButton,
+} from "./ui";
 
 export function Sidebar({
   sessions,
@@ -25,8 +54,11 @@ export function Sidebar({
   onOpenTutorial,
   onOpenOrg,
   onOpenBoard,
+  onOpenMediaTasks,
   boardActive,
   showAdmin,
+  theme,
+  onCycleTheme,
 }: {
   sessions: Session[];
   activeId?: string;
@@ -35,7 +67,7 @@ export function Sidebar({
   credits?: string | null;
   /**
    * Auto‑Dream 待确认建议数（与管理中心「优化」Tab 徽标同源）。>0 时管理中心入口右侧
-   * 用徽章替换静态副标题 —— 这是全面优化在侧栏唯一的曝光位。
+   * 用徽章替换静态副标题 —— 这是全面优化在账号菜单里唯一的曝光位。
    */
   optimizerPending?: number;
   onSelect: (id: string) => void;
@@ -57,10 +89,14 @@ export function Sidebar({
   onOpenOrg?: () => void;
   /** 打开任务面板全屏工作区。省略则不渲染入口（demo）。 */
   onOpenBoard?: () => void;
+  /** 打开账号级异步视频任务中心。 */
+  onOpenMediaTasks?: () => void;
   /** 任务面板当前是否为工作区（选中态）。 */
   boardActive?: boolean;
   /** 平台超管入口。仅 user.role === 'admin' 时为 true，false/省略则不渲染。 */
   showAdmin?: boolean;
+  theme?: Theme;
+  onCycleTheme?: () => void;
 }) {
   const [q, setQ] = useState("");
 
@@ -73,6 +109,39 @@ export function Sidebar({
     }
     return [...map.entries()];
   }, [sessions, q]);
+
+  const hasAccountMenu = Boolean(
+    onOpenManage ||
+      onOpenMarketplace ||
+      onOpenOrg ||
+      showAdmin ||
+      onOpenMediaTasks ||
+      onOpenAccount ||
+      onOpenFeedback ||
+      onLogout,
+  );
+
+  const userChip = (
+    <button
+      type="button"
+      data-product-feature={PRODUCT_CAPABILITIES.billing.id}
+      disabled={!hasAccountMenu}
+      aria-label={hasAccountMenu ? "账号菜单" : undefined}
+      className="flex min-w-0 flex-1 items-center gap-2.5 rounded-lg px-2.5 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg enabled:hover:bg-hover"
+    >
+      <Avatar tone="ink" className="text-body">
+        {(user?.displayName || "U").slice(0, 1).toUpperCase()}
+      </Avatar>
+      <span className="min-w-0 flex-1">
+        <span className="block truncate text-section font-medium text-fg">
+          {user?.displayName || "未登录"}
+        </span>
+        <span className="block truncate text-caption text-faint">
+          {credits != null ? `余额 ${formatCredits(credits)} 积分` : "多模型 · 计量计费"}
+        </span>
+      </span>
+    </button>
+  );
 
   return (
     <aside className="flex h-full w-[268px] shrink-0 flex-col bg-sidebar">
@@ -134,76 +203,6 @@ export function Sidebar({
             className="w-full bg-transparent text-base text-fg outline-none placeholder:text-faint md:text-sm"
           />
         </div>
-
-        {onOpenManage && (
-          <button
-            data-product-feature={PRODUCT_CAPABILITIES.memory.id}
-            onClick={onOpenManage}
-            className="flex items-center gap-2.5 rounded-lg px-3 py-1.5 text-left text-body font-medium text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
-          >
-            <LayoutGrid size={16} className="text-faint" />
-            管理中心
-            {/* 有待办 → 数量信号（Auto‑Dream 的唯一侧栏曝光）；无待办 → 分区速览，
-                文案与实际分区对齐（旧文案「记忆 · 定时 · 技能」漏了插件/文献/优化）。 */}
-            {optimizerPending > 0 ? (
-              <Badge tone="accent" size="sm" className="ml-auto">
-                {optimizerPending > 99 ? "99+" : optimizerPending} 项待确认
-              </Badge>
-            ) : (
-              <span className="ml-auto text-caption text-faint">记忆 · 技能 · 定时 · 插件</span>
-            )}
-          </button>
-        )}
-
-        {onOpenMarketplace && (
-          <button
-            data-product-feature={PRODUCT_CAPABILITIES.marketplace.id}
-            onClick={onOpenMarketplace}
-            className="flex items-center gap-2.5 rounded-lg px-3 py-1.5 text-left text-body font-medium text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
-          >
-            <Store size={16} className="text-faint" />
-            市场
-            {/* 市场品类实为三类，旧文案漏了插件（并列第三类）。 */}
-            <span className="ml-auto text-caption text-faint">技能 · 智能体 · 插件</span>
-          </button>
-        )}
-
-        {onOpenTutorial && (
-          <button
-            type="button"
-            data-product-control
-            onClick={onOpenTutorial}
-            className="flex items-center gap-2.5 rounded-lg px-3 py-1.5 text-left text-body font-medium text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
-          >
-            <BookOpen size={16} className="text-faint" />
-            使用教程
-            <span className="ml-auto text-caption text-faint">边看边用</span>
-          </button>
-        )}
-
-        {onOpenOrg && (
-          <button
-            data-product-feature={PRODUCT_CAPABILITIES.organization.id}
-            onClick={onOpenOrg}
-            className="flex items-center gap-2.5 rounded-lg px-3 py-1.5 text-left text-body font-medium text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
-          >
-            <Building2 size={16} className="text-faint" />
-            组织
-            <span className="ml-auto text-caption text-faint">成员 · 报表 · 发票</span>
-          </button>
-        )}
-
-        {showAdmin && (
-          <a
-            data-product-control
-            href="/admin.html"
-            className="flex items-center gap-2.5 rounded-lg px-3 py-1.5 text-left text-body font-medium text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
-          >
-            <ShieldCheck size={16} className="text-faint" />
-            管理后台
-            <span className="ml-auto text-caption text-faint">平台运维</span>
-          </a>
-        )}
       </div>
 
       <div
@@ -277,47 +276,124 @@ export function Sidebar({
         className="flex items-center gap-1 border-t border-border px-2 pt-2 sidebar-foot-safe-b"
         data-product-entry-scope="sidebar-account"
       >
-        <button
-          data-product-feature={PRODUCT_CAPABILITIES.billing.id}
-          onClick={onOpenAccount}
-          disabled={!onOpenAccount}
-          aria-label="设置"
-          className="flex min-w-0 flex-1 items-center gap-2.5 rounded-lg px-2.5 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg enabled:hover:bg-hover"
-        >
-          <Avatar tone="ink" className="text-body">
-            {(user?.displayName || "U").slice(0, 1).toUpperCase()}
-          </Avatar>
-          <span className="min-w-0 flex-1">
-            <span className="block truncate text-section font-medium text-fg">
-              {user?.displayName || "未登录"}
-            </span>
-            <span className="block truncate text-caption text-faint">
-              {credits != null ? `余额 ${formatCredits(credits)} 积分` : "多模型 · 计量计费"}
-            </span>
-          </span>
-        </button>
-        {onOpenFeedback && (
+        {hasAccountMenu ? (
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>{userChip}</DropdownMenuTrigger>
+            <DropdownMenuContent
+              side="top"
+              align="start"
+              sideOffset={8}
+              className="w-64 p-1.5"
+              data-product-entry-scope="account-menu"
+            >
+              <div className="flex items-center gap-2.5 px-2 py-2">
+                <Avatar tone="ink" className="text-body">
+                  {(user?.displayName || "U").slice(0, 1).toUpperCase()}
+                </Avatar>
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-section font-medium text-fg">
+                    {user?.displayName || "未登录"}
+                  </p>
+                  <p className="truncate text-caption text-faint">
+                    {credits != null ? `${formatCredits(credits)} 积分` : "多模型 · 计量计费"}
+                  </p>
+                </div>
+              </div>
+              <DropdownMenuSeparator />
+              {onOpenManage && (
+                <DropdownMenuItem
+                  data-product-feature={PRODUCT_CAPABILITIES.memory.id}
+                  onSelect={onOpenManage}
+                >
+                  <LayoutGrid size={16} className="shrink-0 text-muted" />
+                  <span className="flex-1">管理中心</span>
+                  {optimizerPending > 0 ? (
+                    <Badge tone="accent" size="sm">
+                      {optimizerPending > 99 ? "99+" : optimizerPending} 项待确认
+                    </Badge>
+                  ) : (
+                    <span className="text-caption text-faint">记忆 · 技能</span>
+                  )}
+                </DropdownMenuItem>
+              )}
+              {onOpenMarketplace && (
+                <DropdownMenuItem
+                  data-product-feature={PRODUCT_CAPABILITIES.marketplace.id}
+                  onSelect={onOpenMarketplace}
+                >
+                  <Store size={16} className="shrink-0 text-muted" />
+                  市场
+                </DropdownMenuItem>
+              )}
+              {onOpenOrg && (
+                <DropdownMenuItem
+                  data-product-feature={PRODUCT_CAPABILITIES.organization.id}
+                  onSelect={onOpenOrg}
+                >
+                  <Building2 size={16} className="shrink-0 text-muted" />
+                  组织
+                </DropdownMenuItem>
+              )}
+              {showAdmin && (
+                <DropdownMenuItem asChild>
+                  <a data-product-control href="/admin.html">
+                    <ShieldCheck size={16} className="shrink-0 text-muted" />
+                    管理后台
+                  </a>
+                </DropdownMenuItem>
+              )}
+              {onOpenMediaTasks && (
+                <DropdownMenuItem data-product-control onSelect={onOpenMediaTasks}>
+                  <Film size={16} className="shrink-0 text-muted" />
+                  视频任务
+                </DropdownMenuItem>
+              )}
+              {(onOpenAccount || onOpenFeedback || onLogout) &&
+                (onOpenManage || onOpenMarketplace || onOpenOrg || showAdmin || onOpenMediaTasks) && (
+                  <DropdownMenuSeparator />
+                )}
+              {onOpenAccount && (
+                <DropdownMenuItem
+                  data-product-feature={PRODUCT_CAPABILITIES.billing.id}
+                  onSelect={onOpenAccount}
+                >
+                  <Settings size={16} className="shrink-0 text-muted" />
+                  设置
+                </DropdownMenuItem>
+              )}
+              {onOpenFeedback && (
+                <DropdownMenuItem
+                  data-product-feature={PRODUCT_CAPABILITIES.feedback.id}
+                  onSelect={onOpenFeedback}
+                >
+                  <MessageSquareText size={16} className="shrink-0 text-muted" />
+                  意见反馈
+                </DropdownMenuItem>
+              )}
+              {onLogout && (
+                <DropdownMenuItem data-product-control destructive onSelect={onLogout}>
+                  <LogOut size={16} className="shrink-0" />
+                  退出登录
+                </DropdownMenuItem>
+              )}
+            </DropdownMenuContent>
+          </DropdownMenu>
+        ) : (
+          userChip
+        )}
+        {onOpenTutorial && (
           <button
             type="button"
-            data-product-feature={PRODUCT_CAPABILITIES.feedback.id}
-            onClick={onOpenFeedback}
-            aria-label="反馈与帮助"
-            title="反馈与帮助"
-            className="flex size-8 shrink-0 items-center justify-center rounded-md text-faint outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg"
-          >
-            <MessageSquareText size={16} />
-          </button>
-        )}
-        {onLogout && (
-          <button
             data-product-control
-            onClick={onLogout}
-            aria-label="退出登录"
+            onClick={onOpenTutorial}
+            aria-label="打开使用教程"
+            title="使用教程"
             className="flex size-8 shrink-0 items-center justify-center rounded-md text-faint outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg"
           >
-            <LogOut size={16} />
+            <BookOpen size={16} />
           </button>
         )}
+        {theme && onCycleTheme && <ThemeToggle theme={theme} onCycle={onCycleTheme} />}
       </div>
     </aside>
   );

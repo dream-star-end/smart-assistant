@@ -31,48 +31,66 @@ function renderSidebar(extra: Partial<Parameters<typeof Sidebar>[0]> = {}) {
   );
 }
 
-describe("Sidebar 管理后台入口（平台超管）", () => {
-  it("showAdmin=true 时渲染指向 /admin.html 的管理后台入口", () => {
+/** radix DropdownMenu Trigger 在 pointerdown 开启(click 不够),jsdom 里直接发。 */
+function openAccountMenu() {
+  fireEvent.pointerDown(screen.getByRole("button", { name: "账号菜单" }), {
+    button: 0,
+    ctrlKey: false,
+    pointerType: "mouse",
+  });
+}
+
+describe("Sidebar 账号菜单（平台超管 / 反馈）", () => {
+  it("showAdmin=true 时账号菜单里渲染指向 /admin.html 的管理后台入口", () => {
     renderSidebar({ showAdmin: true });
-    const link = screen.getByRole("link", { name: /管理后台/ });
+    expect(screen.queryByRole("link", { name: /管理后台/ })).toBeNull();
+    openAccountMenu();
+    const link = screen.getByRole("menuitem", { name: /管理后台/ });
     expect(link).toHaveAttribute("href", "/admin.html");
   });
 
-  it("showAdmin 缺省时不渲染管理后台入口（非 admin / demo 一律隐藏）", () => {
-    renderSidebar();
-    expect(screen.queryByRole("link", { name: /管理后台/ })).toBeNull();
+  it("showAdmin 缺省时账号菜单不出现管理后台入口（非 admin / demo 一律隐藏）", () => {
+    renderSidebar({ onOpenAccount: () => {} });
+    openAccountMenu();
+    expect(screen.queryByRole("menuitem", { name: /管理后台/ })).toBeNull();
   });
 
-  it("showAdmin=false 时不渲染管理后台入口", () => {
-    renderSidebar({ showAdmin: false });
-    expect(screen.queryByRole("link", { name: /管理后台/ })).toBeNull();
+  it("showAdmin=false 时账号菜单不出现管理后台入口", () => {
+    renderSidebar({ onOpenAccount: () => {}, showAdmin: false });
+    openAccountMenu();
+    expect(screen.queryByRole("menuitem", { name: /管理后台/ })).toBeNull();
   });
 
-  it("提供反馈回调时渲染直接入口并触发打开", () => {
+  it("提供反馈回调时在账号菜单里触发打开，底栏不再放反馈图标", () => {
     const onOpenFeedback = vi.fn();
     renderSidebar({ onOpenFeedback });
-    fireEvent.click(screen.getByRole("button", { name: "反馈与帮助" }));
+    expect(screen.queryByRole("button", { name: "反馈与帮助" })).toBeNull();
+    openAccountMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "意见反馈" }));
     expect(onOpenFeedback).toHaveBeenCalledTimes(1);
   });
 
-  it("未提供反馈回调时不显示反馈入口", () => {
-    renderSidebar();
-    expect(screen.queryByRole("button", { name: "反馈与帮助" })).toBeNull();
+  it("未提供反馈回调时账号菜单不显示反馈入口", () => {
+    renderSidebar({ onOpenAccount: () => {} });
+    openAccountMenu();
+    expect(screen.queryByRole("menuitem", { name: "意见反馈" })).toBeNull();
   });
 });
 
 describe("Sidebar 管理中心入口副标题", () => {
   it("无待办时展示与实际分区对齐的速览文案", () => {
     renderSidebar({ onOpenManage: () => {} });
-    const entry = screen.getByRole("button", { name: /管理中心/ });
-    expect(entry).toHaveTextContent("记忆 · 技能 · 定时 · 插件");
+    openAccountMenu();
+    const entry = screen.getByRole("menuitem", { name: /管理中心/ });
+    expect(entry).toHaveTextContent("记忆 · 技能");
   });
 
-  it("有待确认建议时改用数量徽章（Auto‑Dream 在侧栏的唯一曝光）", () => {
+  it("有待确认建议时改用数量徽章（Auto‑Dream 在账号菜单的唯一曝光）", () => {
     renderSidebar({ onOpenManage: () => {}, optimizerPending: 3 });
-    const entry = screen.getByRole("button", { name: /管理中心/ });
+    openAccountMenu();
+    const entry = screen.getByRole("menuitem", { name: /管理中心/ });
     expect(entry).toHaveTextContent("3 项待确认");
-    expect(entry).not.toHaveTextContent("记忆 · 技能 · 定时 · 插件");
+    expect(entry).not.toHaveTextContent("记忆 · 技能");
   });
 });
 
@@ -132,25 +150,60 @@ describe("Sidebar 会话列表", () => {
     expect(idleRow?.querySelector(".bg-accent")).toBeNull();
   });
 
-  it("管理/市场入口权重低于「新建会话」：text-body + text-muted，新建保持 secondary 主按钮", () => {
+  it("管理/市场/组织/后台不再占侧栏主区；点账号菜单才出现，设置与退出也在菜单里", () => {
+    const onOpenAccount = vi.fn();
+    const onLogout = vi.fn();
+    const onOpenMediaTasks = vi.fn();
     renderSidebar({
       onOpenManage: () => {},
       onOpenMarketplace: () => {},
       onOpenTutorial: () => {},
       onOpenOrg: () => {},
+      onOpenMediaTasks,
+      onOpenAccount,
+      onLogout,
       showAdmin: true,
+      theme: "light",
+      onCycleTheme: () => {},
     });
     const create = screen.getByRole("button", { name: "新建会话" });
     expect(create).toHaveClass("text-section");
     expect(create.className).toMatch(/border-border/);
     expect(create.className).toMatch(/bg-surface/);
-    const manage = screen.getByRole("button", { name: /管理中心/ });
-    const market = screen.getByRole("button", { name: /^市场/ });
-    expect(manage).toHaveClass("text-body", "text-muted", "py-1.5");
-    expect(market).toHaveClass("text-body", "text-muted", "py-1.5");
-    expect(screen.getByRole("button", { name: /使用教程/ })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /组织/ })).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: /管理后台/ })).toHaveAttribute("href", "/admin.html");
+
+    expect(screen.queryByRole("button", { name: /管理中心/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^市场/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^组织/ })).toBeNull();
+    expect(screen.queryByRole("link", { name: /管理后台/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: "退出登录" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "反馈与帮助" })).toBeNull();
+
+    expect(screen.getByRole("button", { name: "打开使用教程" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /切换主题/ })).toBeInTheDocument();
+
+    openAccountMenu();
+    expect(screen.getByRole("menuitem", { name: /管理中心/ })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: /^市场/ })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: /^组织/ })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: /管理后台/ })).toHaveAttribute("href", "/admin.html");
+    fireEvent.click(screen.getByRole("menuitem", { name: "视频任务" }));
+    expect(onOpenMediaTasks).toHaveBeenCalledTimes(1);
+
+    openAccountMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "设置" }));
+    expect(onOpenAccount).toHaveBeenCalledTimes(1);
+
+    openAccountMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "退出登录" }));
+    expect(onLogout).toHaveBeenCalledTimes(1);
+  });
+
+  it("点击用户区先弹出账号菜单，而不是直接进入设置", () => {
+    const onOpenAccount = vi.fn();
+    renderSidebar({ onOpenAccount });
+    openAccountMenu();
+    expect(onOpenAccount).not.toHaveBeenCalled();
+    expect(screen.getByRole("menuitem", { name: "设置" })).toBeInTheDocument();
   });
 
   it("点击会话行把该会话 id 上抛（核心导航）", () => {

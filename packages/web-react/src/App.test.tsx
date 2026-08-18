@@ -225,7 +225,11 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     expect(imageByteCache.get(key)).toBeNull()
 
     imageByteCache.set(key, new Blob(['account-b']))
-    fireEvent.click(screen.getByRole('button', { name: '退出登录' }))
+    fireEvent.pointerDown(screen.getByRole('button', { name: '账号菜单' }), {
+      button: 0,
+      pointerType: 'mouse',
+    })
+    fireEvent.click(await screen.findByRole('menuitem', { name: '退出登录' }))
     await waitFor(() => expect(screen.getByRole('button', { name: '登录' })).toBeInTheDocument())
     expect(imageByteCache.get(key)).toBeNull()
   })

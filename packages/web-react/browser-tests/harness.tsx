@@ -1649,7 +1649,11 @@ createRoot(document.getElementById("codex-density-root")!).render(
         onOpenMarketplace={() => {}}
         onOpenTutorial={() => {}}
         onOpenOrg={() => {}}
+        onOpenAccount={() => {}}
+        onOpenMediaTasks={() => {}}
         showAdmin
+        theme="light"
+        onCycleTheme={() => {}}
       />
     </div>
   </StrictMode>,

@@ -126,10 +126,7 @@ function MobileChatPage() {
             window.__mobilePage.navOpens += 1;
           }}
           onOpenInbox={() => {}}
-          onOpenTutorial={() => {}}
           unreadCount={3}
-          theme="dark"
-          onCycleTheme={() => {}}
         />
         <div
           ref={setScroller}

@@ -2292,10 +2292,13 @@ export function App() {
     onDelete: deleteSessionConfirm,
     onLogout: demo ? undefined : logout,
     onOpenManage: demo ? undefined : () => openManage(DEFAULT_MANAGE_TAB),
-    // 侧栏「管理中心」右侧的待办信号（Auto‑Dream 有待确认建议时替换静态副标题）。
+    // 账号菜单「管理中心」右侧的待办信号（Auto‑Dream 有待确认建议时替换静态副标题）。
     optimizerPending: demo ? 0 : optimizer.pendingCount,
     onOpenMarketplace: demo ? undefined : () => openMarketplace("browse"),
     onOpenTutorial: demo ? undefined : () => openTutorial(),
+    onOpenMediaTasks: demo ? undefined : () => setMediaTasksOpen(true),
+    theme,
+    onCycleTheme: cycle,
     // 管理后台入口:仅平台超管(user.role === 'admin')可见,导航到 React 管理后台
     // (web-react 第二 Vite 入口 /admin.html)。非 admin / demo 一律不渲染。
     showAdmin: !demo && user?.role === "admin",
@@ -2307,6 +2310,13 @@ export function App() {
     onOpenBoard: demo ? undefined : () => setBoardOpen(true),
     boardActive: boardOpen,
   };
+  const closeMobileThen = (fn?: () => void) =>
+    fn
+      ? () => {
+          setMobileNavOpen(false);
+          fn();
+        }
+      : undefined;
   return (
     <MediaSignProvider
       sign={demo ? null : signMedia}
@@ -2365,10 +2375,14 @@ export function App() {
                   setMobileNavOpen(false);
                 }
           }
-          onOpenFeedback={() => {
-            setMobileNavOpen(false);
-            openSettings("feedback");
-          }}
+          onOpenAccount={closeMobileThen(sidebarProps.onOpenAccount)}
+          onOpenFeedback={closeMobileThen(sidebarProps.onOpenFeedback)}
+          onOpenManage={closeMobileThen(sidebarProps.onOpenManage)}
+          onOpenMarketplace={closeMobileThen(sidebarProps.onOpenMarketplace)}
+          onOpenTutorial={closeMobileThen(sidebarProps.onOpenTutorial)}
+          onOpenOrg={closeMobileThen(sidebarProps.onOpenOrg)}
+          onOpenMediaTasks={closeMobileThen(sidebarProps.onOpenMediaTasks)}
+          onLogout={closeMobileThen(sidebarProps.onLogout)}
         />
       </Sheet>
 
@@ -2418,11 +2432,7 @@ export function App() {
           onNew={newSession}
           onOpenMobileNav={() => setMobileNavOpen(true)}
           onOpenInbox={demo ? undefined : () => setInboxOpen(true)}
-          onOpenMediaTasks={demo ? undefined : () => setMediaTasksOpen(true)}
-          onOpenTutorial={demo ? undefined : () => openTutorial()}
           unreadCount={inbox.unreadCount}
-          theme={theme}
-          onCycleTheme={cycle}
         />
 
         {!demo && repo.showBanner && repo.selection?.selected && (
