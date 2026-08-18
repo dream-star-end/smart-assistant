@@ -530,7 +530,7 @@ watch_once() {
 }
 
 watch_selftest() {
-  local base rc
+  local base
   base="$(mktemp -d /tmp/v5-selfhost-watch-selftest.XXXXXX)"
   echo "SELFTEST_DIR=$base"
   export WATCH_DRY=1

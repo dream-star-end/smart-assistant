@@ -132,13 +132,66 @@ PY
 
 # 只收紧 nlink==1 的文件 + 子目录。禁止改共享 inode(会污染 donor / 工作树)。
 # tsx 缓存写在 /tmp/tsx-${euid},不写 node_modules,0444 不会让 tsx 起不来。
+# 保留原可执行位:nlink==1 且已有 +x 的文件用 0555,否则后续从该 rel 硬链 donor 时
+# staging 内 tsc/vite 会 Permission denied。
 harden_unique_release_tree() { # <staging-root>
   local root="$1"
   [[ -d "$root" && ! -L "$root" ]] || return 1
   chown 0:0 -- "$root" || return 1
   # 根目录先保持可写,以便随后落 .complete;子目录去写位。
   find "$root" -mindepth 1 -type d -print0 | xargs -0 -r chmod 0555
-  find "$root" -type f -links 1 -print0 | xargs -0 -r chmod 0444
+  find "$root" -type f -links 1 -perm /111 -print0 | xargs -0 -r chmod 0555
+  find "$root" -type f -links 1 ! -perm /111 -print0 | xargs -0 -r chmod 0444
+}
+
+# 从已 harden 的 donor 硬链过来后,tsc/vite 可能是 0444。不能 chmod 共享 inode。
+# 把不可执行的工具链文件拆成 staging 私有副本再 +x,donor 不变。
+break_hardlink_restore_exec() { # <staging>
+  local staging="$1"
+  python3 - "$staging" <<'PY'
+import os
+import shutil
+import stat
+import sys
+
+root = os.path.abspath(sys.argv[1])
+broken = 0
+scan_roots = [os.path.join(root, "node_modules")]
+pkg = os.path.join(root, "packages")
+if os.path.isdir(pkg):
+    for name in os.listdir(pkg):
+        cand = os.path.join(pkg, name, "node_modules")
+        if os.path.isdir(cand):
+            scan_roots.append(cand)
+bin_dirs = []
+for start in scan_roots:
+    for dirpath, dirnames, _filenames in os.walk(start, followlinks=False):
+        if os.path.basename(dirpath) == ".bin":
+            bin_dirs.append(dirpath)
+            dirnames[:] = []
+for bdir in bin_dirs:
+    try:
+        names = os.listdir(bdir)
+    except OSError:
+        continue
+    for name in names:
+        path = os.path.join(bdir, name)
+        try:
+            real = os.path.realpath(path)
+            st = os.stat(real)
+        except OSError:
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            continue
+        if st.st_mode & 0o111:
+            continue
+        tmp = real + ".exectmp.%d" % os.getpid()
+        shutil.copy2(real, tmp)
+        os.chmod(tmp, 0o0555)
+        os.replace(tmp, real)
+        broken += 1
+sys.stderr.write("broke-hardlink-exec=%d bin_dirs=%d\n" % (broken, len(bin_dirs)))
+PY
 }
 
 write_strong_release_marker_local() { # <release-root> <full-sha> <short-sha> <builtAt> <schema>
@@ -350,6 +403,10 @@ build_master_release() {
     fi
     MASTER_DEPS_MODE="hardlink"
     mlog "  lock 未变 → 硬链复用 node_modules ← $donor"
+    if ! break_hardlink_restore_exec "$staging"; then
+      cleanup_master_staging
+      die "拆硬链恢复 staging 可执行位失败(donor=$donor)"
+    fi
   else
     mlog "  lock 变化/无 donor/--force-npm-ci → 在 staging 内 npm ci(绝不写 rel-*)"
     if ! ( cd "$staging" && npm ci --no-audit --no-fund ); then
