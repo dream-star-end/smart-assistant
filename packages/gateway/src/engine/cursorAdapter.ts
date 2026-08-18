@@ -582,7 +582,10 @@ with fields \`question?: string\`, \`multi?: boolean\` (multi-select only when
 exactly \`true\`), and \`options: Array<{label: string, desc?: string}>\`
 (1–12 items; more than 12 makes the whole block fail). One reply may contain
 at most 4 options blocks; multiple blocks in the same reply are aggregated
-into a single submission. The user's click
+into a single submission. The closing fence must be on its own line
+with no characters after it; newline immediately. Do not write prose
+after the options block; after the last options block, end the turn.
+Separate multiple options blocks with a blank line. The user's click
 arrives as your next ordinary user message.
 Subagents have no user-facing UI — decide yourself, or present numbered
 options as plain text and end the turn; the user's next message carries
