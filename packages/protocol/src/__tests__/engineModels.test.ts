@@ -50,6 +50,7 @@ describe('Cursor engine model authority', () => {
     assert.deepEqual(CURSOR_ENGINE_MODELS, [
       { id: 'cursor-auto', displayName: 'Cursor Auto', upstreamModel: null },
       { id: 'cursor-grok-4.6-high', displayName: 'Cursor Grok 4.6 High', upstreamModel: 'cursor-grok-4.6-high' },
+      { id: 'cursor-grok-4.6-high-fast', displayName: 'Cursor Grok 4.6 High Fast', upstreamModel: 'cursor-grok-4.6-high-fast' },
       { id: 'cursor-composer-2.5-fast', displayName: 'Cursor Composer 2.5 Fast', upstreamModel: 'composer-2.5-fast' },
       { id: 'cursor-opus-5-high', displayName: 'Cursor Opus 5 High', upstreamModel: 'claude-opus-5-thinking-high' },
       { id: 'cursor-fable-5-high', displayName: 'Cursor Fable 5 High (Non-ZDR)', upstreamModel: 'claude-fable-5-thinking-high' },

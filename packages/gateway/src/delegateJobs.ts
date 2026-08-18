@@ -57,7 +57,7 @@ export type DelegateJobHttpResult = {
 }
 
 export type DelegateJobWaitView =
-  | { status: 'running'; jobId: string }
+  | { status: 'running'; jobId: string; sessionKey?: string }
   | { status: 'expired'; jobId: string }
   | {
       status: 'done'
@@ -71,6 +71,7 @@ type JobEntry = {
   agentId: string
   createdAt: number
   expiresAt: number
+  sessionKey?: string
   result: DelegateJobHttpResult | null
   waiters: Array<(view: DelegateJobWaitView) => void>
 }
@@ -101,7 +102,10 @@ export class DelegateJobStore {
     this.sleep = opts.sleep ?? defaultSleep
   }
 
-  create(agentId: string): { jobId: string } | { error: 'capacity' } {
+  create(
+    agentId: string,
+    meta?: { sessionKey?: string },
+  ): { jobId: string } | { error: 'capacity' } {
     this.sweep()
     if (this.jobs.size >= this.maxJobs) return { error: 'capacity' }
     const jobId = `dlgjob-${this.now().toString(36)}-${randomBytes(6).toString('hex')}`
@@ -111,6 +115,7 @@ export class DelegateJobStore {
       agentId,
       createdAt,
       expiresAt: createdAt + this.ttlMs,
+      sessionKey: meta?.sessionKey,
       result: null,
       waiters: [],
     })
@@ -143,7 +148,7 @@ export class DelegateJobStore {
         body: job.result.body,
       }
     }
-    return { status: 'running', jobId }
+    return this.runningView(job)
   }
 
   async wait(jobId: string, waitMs: number): Promise<DelegateJobWaitView> {
@@ -182,6 +187,12 @@ export class DelegateJobStore {
         finish(this.get(jobId))
       })
     })
+  }
+
+  private runningView(job: JobEntry): DelegateJobWaitView {
+    return job.sessionKey
+      ? { status: 'running', jobId: job.id, sessionKey: job.sessionKey }
+      : { status: 'running', jobId: job.id }
   }
 
   sweep(now = this.now()): number {

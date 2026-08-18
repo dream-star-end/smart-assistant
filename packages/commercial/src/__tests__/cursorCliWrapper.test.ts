@@ -349,6 +349,18 @@ describe('oc-cursor wrapper', () => {
     }
   })
 
+  test('accepts the Cursor Grok 4.6 High Fast upstream id', () => {
+    const f = fixture()
+    const result = spawnSync(f.wrapper, ['--model', 'cursor-grok-4.6-high-fast', '--', 'hello'], {
+      cwd: f.dir,
+      env: f.env,
+      encoding: 'utf8',
+    })
+    assert.equal(result.status, 0, result.stderr)
+    const argv = readFileSync(join(f.capture, 'argv'), 'utf8')
+    assert.match(argv, /--model\ncursor-grok-4.6-high-fast\n/)
+  })
+
   test('does not assume an undocumented Cursor API-key prefix', () => {
     const f = fixture()
     const key = 'cursor-key.with-punctuation=='

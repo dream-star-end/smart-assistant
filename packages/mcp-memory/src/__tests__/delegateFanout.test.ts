@@ -46,6 +46,7 @@ describe('normalizeFanoutTasks — 入参校验', () => {
         context: 'ctx',
         effort: 'high',
         toolsets: ['browser', 42],
+        resumeSessionKey: '  agent:coding-assistant:delegate:main:1:abcd  ',
       },
       { goal: 'B', effort: 'turbo' }, // 非法 effort → 丢弃
     ])
@@ -58,6 +59,7 @@ describe('normalizeFanoutTasks — 入参校验', () => {
       context: 'ctx',
       effort: 'high',
       toolsets: ['browser'], // 42 被过滤
+      resumeSessionKey: 'agent:coding-assistant:delegate:main:1:abcd',
     })
     assert.equal(r.tasks[1].agentId, undefined)
     assert.equal(r.tasks[1].effort, undefined, '非白名单 effort 丢弃 → 用成员默认档位')

@@ -54,6 +54,10 @@ function makeGateway(holdSubmit = false): any {
       currentTurnStatus: null,
       runner: { interrupt: () => {}, sendPermissionResponse: () => {}, on: () => {}, off: () => {} },
     }),
+    retireKeepResume: async (key: string) => {
+      gw._retiredKeys = [...(gw._retiredKeys ?? []), key]
+    },
+    forgetResume: () => {},
     submit: async (_session: unknown, _payload: string, onEvent: (e: any) => void) => {
       onEvent({ kind: 'block', block: { kind: 'text', text: '子任务完成' } })
       await gw._holdGate
@@ -162,5 +166,106 @@ describe('handleDelegateTask async + handleDelegateWait', () => {
     const r = await call(gw, 'handleDelegateWait', { jobId: 'dlgjob-nope', waitMs: 30 })
     assert.equal(r.status, 404)
     assert.equal(r.body.status, 'expired')
+  })
+
+  it('async start and wait-running share the minted sessionKey', async () => {
+    const gw = makeGateway(true)
+    const r = await call(gw, 'handleDelegateTask', {
+      goal: '慢任务',
+      sourceAgent: 'main',
+      parentSessionKey: PARENT_KEY,
+      async: true,
+    })
+    assert.equal(r.status, 200)
+    assert.equal(typeof r.body.sessionKey, 'string')
+    assert.match(String(r.body.sessionKey), /^agent:coding-assistant:delegate:main:\d+:[0-9a-f]+$/)
+    const still = await call(gw, 'handleDelegateWait', { jobId: r.body.jobId, waitMs: 30 })
+    assert.equal(still.body.sessionKey, r.body.sessionKey)
+    const second = await call(gw, 'handleDelegateTask', {
+      goal: '并发续跑应 409',
+      sourceAgent: 'main',
+      parentSessionKey: PARENT_KEY,
+      resumeSessionKey: r.body.sessionKey,
+      async: true,
+    })
+    assert.equal(second.status, 409)
+    gw._releaseHold()
+  })
+
+  it('wrong parent cannot resume; after complete, matching parent can', async () => {
+    const gw = makeGateway(false)
+    const first = await call(gw, 'handleDelegateTask', {
+      goal: '快任务',
+      sourceAgent: 'main',
+      parentSessionKey: PARENT_KEY,
+    })
+    assert.equal(first.status, 200)
+    assert.equal(typeof first.body.sessionKey, 'string')
+    assert.ok(Array.isArray(gw._retiredKeys) && gw._retiredKeys.includes(first.body.sessionKey))
+    const stolen = await call(gw, 'handleDelegateTask', {
+      goal: '偷钥匙',
+      sourceAgent: 'main',
+      parentSessionKey: 'agent:main:webchat:dm:other',
+      resumeSessionKey: first.body.sessionKey,
+    })
+    assert.equal(stolen.status, 400)
+    const patrol = await call(gw, 'handleDelegateTask', {
+      goal: 'taskboard key',
+      sourceAgent: 'main',
+      parentSessionKey: PARENT_KEY,
+      resumeSessionKey: 'agent:coding-assistant:taskboard:t:s:r',
+    })
+    assert.equal(patrol.status, 400)
+    const again = await call(gw, 'handleDelegateTask', {
+      goal: '复审',
+      sourceAgent: 'main',
+      parentSessionKey: PARENT_KEY,
+      resumeSessionKey: first.body.sessionKey,
+    })
+    assert.equal(again.status, 200)
+    assert.equal(again.body.sessionKey, first.body.sessionKey)
+  })
+
+  it('retireKeepResume throw keeps occupancy while hasLiveSession is still true', async () => {
+    const gw = makeGateway(false)
+    gw.sessions.hasLiveSession = (key: string) => key === gw._heldKey
+    gw.sessions.retireKeepResume = async (key: string) => {
+      gw._heldKey = key
+      throw new Error('shutdown failed')
+    }
+    const first = await call(gw, 'handleDelegateTask', {
+      goal: '快任务',
+      sourceAgent: 'main',
+      parentSessionKey: PARENT_KEY,
+    })
+    assert.equal(first.status, 200)
+    const again = await call(gw, 'handleDelegateTask', {
+      goal: '复审',
+      sourceAgent: 'main',
+      parentSessionKey: PARENT_KEY,
+      resumeSessionKey: first.body.sessionKey,
+    })
+    assert.equal(again.status, 409)
+  })
+
+  it('retireKeepResume throw still releases after the live session is gone', async () => {
+    const gw = makeGateway(false)
+    gw.sessions.retireKeepResume = async () => {
+      throw new Error('shutdown failed')
+    }
+    const first = await call(gw, 'handleDelegateTask', {
+      goal: '快任务',
+      sourceAgent: 'main',
+      parentSessionKey: PARENT_KEY,
+    })
+    assert.equal(first.status, 200)
+    const again = await call(gw, 'handleDelegateTask', {
+      goal: '复审',
+      sourceAgent: 'main',
+      parentSessionKey: PARENT_KEY,
+      resumeSessionKey: first.body.sessionKey,
+    })
+    assert.equal(again.status, 200)
+    assert.equal(again.body.sessionKey, first.body.sessionKey)
   })
 })

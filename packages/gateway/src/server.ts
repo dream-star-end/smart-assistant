@@ -270,6 +270,7 @@ import {
   resolveDelegateWaitMs,
   type DelegateJobHttpResult,
 } from './delegateJobs.js'
+import { DelegateResumeRegistry } from './delegateResume.js'
 import { eventBus, createEvent } from './eventBus.js'
 import { startEventPersistence } from './eventPersist.js'
 import { parseByteRange, serveFileFdWithRange } from './httpRange.js'
@@ -1449,6 +1450,10 @@ interface RunDelegateInput {
   /** 覆盖默认 channel 'delegate'。taskboard 传 'taskboard',且不得加入
    *  MASTER_SINK_PERSIST_CHANNELS,否则巡检文本会写进 client_sessions 刷屏。 */
   channel?: string
+  /** HTTP/MCP 可选续跑:已通过 DelegateResumeRegistry 占用的钥匙。 */
+  resumable?: boolean
+  /** 本次是否新 mint。早退时要 drop binding,避免占 cap。 */
+  resumeMinted?: boolean
 }
 /** `_runDelegateTask` 结果。rejected=闸/校验拒(HTTP 壳映射 4xx/429/503);error=session
  *  创建等意外(映射 500);completed=真正执行完(ok/output/error/timedOut,review 还带 verdict)。 */
@@ -1467,6 +1472,7 @@ type DelegateTaskResult =
       tokensIn?: number | null
       tokensOut?: number | null
       costUsd?: number | null
+      sessionKey?: string
     }
 
 // ── hidden 系统 agent 串行委派熔断 ──────────────────────────────────────────
@@ -9477,6 +9483,8 @@ export class Gateway {
   /** Cursor MCP 60s 上限的异步委派作业句柄。测试脚手架 Object.create 不跑字段
    *  初始化,使用处惰性 ??=。 */
   private _delegateJobs: DelegateJobStore | undefined
+  /** HTTP/MCP delegate 续跑绑定。测试脚手架 Object.create 不跑字段初始化,使用处惰性 ??=。 */
+  private _delegateResume: DelegateResumeRegistry | undefined
 
   /** 内存水位读取的实例挂钩:生产=模块级 readDelegateMemoryPressure(cgroup 文件),
    *  测试直接覆写本方法注入假读数。 */
@@ -9825,17 +9833,34 @@ export class Gateway {
     // 委派执行核心与 HTTP req/res 解耦(P2 债C),让 gateway 硬编排 review pass
     // (dispatchInbound)能内部直调同一委派路径拿到结构化结果(verdict/output),
     // 无需伪造 req/res。
+    const parentSessionKey =
+      typeof parsed.parentSessionKey === 'string' ? parsed.parentSessionKey : undefined
+    const sourceAgentId = typeof sourceAgent === 'string' ? sourceAgent : undefined
+    // 同步 preflight:mint/resume/占用必须在任何 await 和创建 async job 之前完成,
+    // 这样 running 响应已经带着权威 sessionKey,并发 resume 也能立刻 409。
+    const resume = (this._delegateResume ??= new DelegateResumeRegistry()).preflight({
+      resumeSessionKey: parsed.resumeSessionKey,
+      parentSessionKey,
+      targetAgentId,
+      sourceAgent: sourceAgentId || 'system',
+    })
+    this._forgetEvictedDelegateResumes(resume.evictedKeys)
+    if (!resume.ok) {
+      return this.sendError(res, resume.httpStatus, resume.message)
+    }
     const runInput: RunDelegateInput = {
       targetAgentId,
       goal,
       context: typeof context === 'string' ? context : undefined,
-      sourceAgent: typeof sourceAgent === 'string' ? sourceAgent : undefined,
+      sourceAgent: sourceAgentId,
       toolsets,
-      parentSessionKey:
-        typeof parsed.parentSessionKey === 'string' ? parsed.parentSessionKey : undefined,
+      parentSessionKey,
       streamProgress: parsed.streamProgress === true,
       depth,
       effort,
+      sessionKey: resume.sessionKey,
+      resumable: true,
+      resumeMinted: resume.minted,
     }
     // 默认同步:行为与改前完全一致(CCB/Codex 继续堵在 HTTP 上)。仅 `async: true`
     // 才切作业句柄 —— 子任务仍走同一条 _runDelegateTask(idle/hard/祖先活性/深度/并发闸全在)。
@@ -9843,8 +9868,9 @@ export class Gateway {
       const store = (this._delegateJobs ??= new DelegateJobStore({
         ttlMs: resolveDelegateJobTtlMs(),
       }))
-      const created = store.create(targetAgentId)
+      const created = store.create(targetAgentId, { sessionKey: resume.sessionKey })
       if ('error' in created) {
+        this._delegateResume.abort(resume.sessionKey, resume.minted)
         return this.sendError(res, 503, 'too many in-flight delegate jobs')
       }
       const jobId = created.jobId
@@ -9858,7 +9884,12 @@ export class Gateway {
             body: { error: (err as Error)?.message ?? String(err) },
           })
         })
-      return this.sendJson(res, 200, { status: 'running', jobId, agentId: targetAgentId })
+      return this.sendJson(res, 200, {
+        status: 'running',
+        jobId,
+        agentId: targetAgentId,
+        sessionKey: resume.sessionKey,
+      })
     }
     const result = await this._runDelegateTask(runInput)
     const mapped = this._delegateResultToHttp(result, targetAgentId)
@@ -9887,6 +9918,7 @@ export class Gateway {
         agentId: targetAgentId,
         output: result.output,
         error: result.error || undefined,
+        ...(result.sessionKey ? { sessionKey: result.sessionKey } : {}),
       },
     }
   }
@@ -9918,7 +9950,11 @@ export class Gateway {
       })
     }
     if (view.status === 'running') {
-      return this.sendJson(res, 200, { status: 'running', jobId })
+      return this.sendJson(res, 200, {
+        status: 'running',
+        jobId,
+        ...(view.sessionKey ? { sessionKey: view.sessionKey } : {}),
+      })
     }
     return this.sendJson(res, 200, {
       ...view.body,
@@ -9940,7 +9976,66 @@ export class Gateway {
    * `isReview` 语义:走资源闸保留槽 + 免 per-parent 桶(审查不受某父 fan-out 挤占);
    * runLog 打 isReview;完成后从审查输出解析结构化 verdict 一并回带 + 落团队卡。
    */
+  private _forgetEvictedDelegateResumes(keys: string[]): void {
+    for (const key of keys) {
+      try {
+        this.sessions.forgetResume(key)
+      } catch {
+        // stub sessions in tests may omit forgetResume
+      }
+    }
+  }
+
+  private async _completeDelegateResumeClaim(
+    input: RunDelegateInput,
+    sessionSpawned: boolean,
+  ): Promise<void> {
+    if (!input.resumable || !input.sessionKey) return
+    const reg = this._delegateResume
+    if (!reg) return
+    if (!sessionSpawned) {
+      reg.abort(input.sessionKey, input.resumeMinted === true)
+      return
+    }
+    reg.markRetiring(input.sessionKey)
+    try {
+      await this.sessions.retireKeepResume(input.sessionKey)
+    } catch (err) {
+      this.log.warn('delegate session retireKeepResume failed', {
+        sessionKey: input.sessionKey,
+        err: String(err),
+      })
+    }
+    // Occupancy stays until the live session is actually gone. If retire threw
+    // before deleting the map entry, a second resume must still 409.
+    const stillLive =
+      typeof this.sessions.hasLiveSession === 'function' &&
+      this.sessions.hasLiveSession(input.sessionKey)
+    if (stillLive) return
+    reg.release(input.sessionKey)
+  }
+
   private async _runDelegateTask(input: RunDelegateInput): Promise<DelegateTaskResult> {
+    let sessionSpawned = false
+    try {
+      const result = await this._runDelegateTaskCore(input, {
+        onSessionSpawned: () => {
+          sessionSpawned = true
+        },
+      })
+      if (result.kind === 'completed' && input.resumable && input.sessionKey) {
+        return { ...result, sessionKey: input.sessionKey }
+      }
+      return result
+    } finally {
+      await this._completeDelegateResumeClaim(input, sessionSpawned)
+    }
+  }
+
+  private async _runDelegateTaskCore(
+    input: RunDelegateInput,
+    hooks?: { onSessionSpawned?: () => void },
+  ): Promise<DelegateTaskResult> {
     const { targetAgentId, goal, sourceAgent, toolsets, depth } = input
     let context = input.context
     let isReview = input.isReview === true
@@ -10264,6 +10359,7 @@ export class Gateway {
             : {}),
         },
       })
+      hooks?.onSessionSpawned?.()
       session._durableDelegateTranscript = durableTranscript
       session._durableDelegateRuntimeEvents = durableRuntimeEvents
       session._durableDelegateEngineBillings = durableEngineBillings
@@ -10589,18 +10685,17 @@ export class Gateway {
       //(父会话的额度要跨多次 delegate 累计,turn 边界才复位)。
       this._hiddenDelegateGuard.resetForParent(sessionKey)
       this._memberDelegateGuard?.resetForParent(sessionKey)
-      // team-durability — 一次性子会话收尾即销毁:sessionKey 带时间戳永不复用,
-      // warm runner 留着是纯泄漏(2026-07-07 事故:4 个 delegate runner 各挂
-      // mcp-memory+vision 子进程,完成后 45+ 分钟不退,团队模式高频使用会堆
-      // 内存/pids —— v3 同类曾致 spawn EAGAIN)。fire-and-forget:runner.shutdown
-      // 是优雅退出可能耗秒级,不阻塞委派结果回传;destroySession 幂等,失败仅记日志
-      // (容器回收兜底)。嵌套委派在本 turn 内已全部收尾,销毁无悬挂引用。
-      this.sessions.destroySession(sessionKey).catch((err) =>
-        this.log.warn('delegate session destroy failed', {
-          sessionKey,
-          err: String(err),
-        }),
-      )
+      // taskboard / 非 resumable:一次性子会话收尾即销毁(2026-07-07 warm runner 泄漏)。
+      // HTTP/MCP resumable 走外层 _completeDelegateResumeClaim:await retireKeepResume
+      // (杀 runner,保留 resume-map),占用栅栏在退休完成前不释放。
+      if (!input.resumable) {
+        this.sessions.destroySession(sessionKey).catch((err) =>
+          this.log.warn('delegate session destroy failed', {
+            sessionKey,
+            err: String(err),
+          }),
+        )
+      }
     }
 
     eventBus.emit('agent.completed', createEvent('agent.completed', targetAgentId, {

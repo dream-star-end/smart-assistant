@@ -1,12 +1,13 @@
 import { describe, expect, it } from 'vitest'
 import { CHAT_CREATE_TEMPLATES } from './chatCreateTemplates'
 
-describe('chat creation templates use the native Ask UI', () => {
-  it.each(Object.entries(CHAT_CREATE_TEMPLATES))('%s 不再生成 Markdown options 卡', (_kind, template) => {
+describe('chat creation templates use engine-specific ask channels', () => {
+  it.each(Object.entries(CHAT_CREATE_TEMPLATES))('%s 按引擎选择提问通道', (_kind, template) => {
     expect(template).toContain('AskUserQuestion')
     expect(template).toContain('request_user_input')
     expect(template).toContain('专用问答 UI')
-    expect(template).not.toContain('```options')
+    expect(template).toContain('```options')
+    expect(template).toContain('一条回复最多一块')
   })
 })
 

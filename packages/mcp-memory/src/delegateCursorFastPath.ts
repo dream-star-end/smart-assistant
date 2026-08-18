@@ -35,14 +35,22 @@ export function resolveCursorFastWaitMs(env: NodeJS.ProcessEnv = process.env): n
   )
 }
 
-export function formatDelegateSuccess(label: string, output: string): string {
-  return `✅ 委派完成 (agent: ${label})\n\n${output || '(无输出)'}`
+export function formatDelegateSuccess(label: string, output: string, sessionKey?: string): string {
+  const body = `✅ 委派完成 (agent: ${label})\n\n${output || '(无输出)'}`
+  if (!sessionKey) return body
+  return `${body}\n\nsessionKey=${sessionKey}\n下次同一成员续跑请传 resumeSessionKey。`
 }
 
-export function formatDelegateRunning(jobId: string, label: string, goal?: string): string {
+export function formatDelegateRunning(
+  jobId: string,
+  label: string,
+  goal?: string,
+  sessionKey?: string,
+): string {
   const goalBit = goal ? `, goal: ${goal}` : ''
+  const keyBit = sessionKey ? ` sessionKey=${sessionKey}` : ''
   return [
-    `子任务仍在运行 (agent: ${label}${goalBit})。status=running jobId=${jobId}`,
+    `子任务仍在运行 (agent: ${label}${goalBit})。status=running jobId=${jobId}${keyBit}`,
     'Cursor MCP 通道有 60 秒硬超时,不能在本工具里继续等。请立刻用 Bash 阻塞等待结果,不要重复调用 delegate_task,也不要轮询 MCP:',
     `  oc-memory delegate-wait ${jobId}`,
     '该命令会阻塞直到子任务完成或超过平台硬上限,然后把结果打印到 stdout。',
@@ -84,7 +92,7 @@ export function formatDelegateFanoutRunning(items: FanoutCursorItem[]): string {
 }
 
 export type DelegateWaitView =
-  | { kind: 'running'; jobId: string }
+  | { kind: 'running'; jobId: string; sessionKey?: string }
   | { kind: 'expired'; jobId?: string; error: string }
   | { kind: 'result'; httpStatus: number; body: Record<string, unknown> }
   | { kind: 'error'; error: string }
@@ -102,14 +110,20 @@ export function parseJsonObject(raw: string): Record<string, unknown> | null {
 export function interpretDelegateStartBody(
   statusCode: number,
   raw: string,
-): { jobId: string } | { error: string } {
+): { jobId: string; sessionKey?: string } | { error: string } {
   if (statusCode < 200 || statusCode >= 300) {
     return { error: `委派失败: ${raw}` }
   }
   const data = parseJsonObject(raw)
   if (!data) return { error: `委派失败: 无效 JSON: ${raw.slice(0, 200)}` }
   const jobId = typeof data.jobId === 'string' ? data.jobId.trim() : ''
-  if (data.status === 'running' && jobId) return { jobId }
+  const sessionKey =
+    typeof data.sessionKey === 'string' && data.sessionKey.trim()
+      ? data.sessionKey.trim()
+      : undefined
+  if (data.status === 'running' && jobId) {
+    return sessionKey ? { jobId, sessionKey } : { jobId }
+  }
   return { error: `委派失败: 异步作业未返回 jobId: ${raw.slice(0, 200)}` }
 }
 
@@ -136,7 +150,11 @@ export function interpretDelegateWaitBody(
   if (data.status === 'running') {
     const jobId = typeof data.jobId === 'string' ? data.jobId.trim() : ''
     if (!jobId) return { kind: 'error', error: '等待委派结果失败: running 响应缺少 jobId' }
-    return { kind: 'running', jobId }
+    const sessionKey =
+      typeof data.sessionKey === 'string' && data.sessionKey.trim()
+        ? data.sessionKey.trim()
+        : undefined
+    return sessionKey ? { kind: 'running', jobId, sessionKey } : { kind: 'running', jobId }
   }
   if (data.status === 'done') {
     const httpStatus =
@@ -178,7 +196,11 @@ export function formatDelegateHttpResult(
   if (looksLikeDelegateApiError(output)) {
     return { kind: 'error', text: `子 agent 执行出错: ${output}` }
   }
-  return { kind: 'ok', text: formatDelegateSuccess(label, output) }
+  const sessionKey =
+    typeof data.sessionKey === 'string' && data.sessionKey.trim()
+      ? data.sessionKey.trim()
+      : undefined
+  return { kind: 'ok', text: formatDelegateSuccess(label, output, sessionKey) }
 }
 
 export type CursorDelegateTransport = {
@@ -205,10 +227,11 @@ export async function runCursorDelegateFastPath(
   const waited = await opts.transport.wait(start.jobId, opts.fastWaitMs)
   const view = interpretDelegateWaitBody(waited.statusCode, waited.body)
   if (view.kind === 'running') {
+    const sessionKey = start.sessionKey || view.sessionKey
     return {
       kind: 'running',
       jobId: view.jobId,
-      text: formatDelegateRunning(view.jobId, opts.label, opts.goal),
+      text: formatDelegateRunning(view.jobId, opts.label, opts.goal, sessionKey),
     }
   }
   if (view.kind === 'expired') {

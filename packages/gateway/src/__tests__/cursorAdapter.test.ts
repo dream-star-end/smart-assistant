@@ -1199,6 +1199,7 @@ console.log(JSON.stringify({type:'result',subtype:'success',is_error:false}));
     const models: Array<[string, string | null]> = [
       ['cursor-auto', null],
       ['cursor-grok-4.6-high', 'cursor-grok-4.6-high'],
+      ['cursor-grok-4.6-high-fast', 'cursor-grok-4.6-high-fast'],
       ['cursor-composer-2.5-fast', 'composer-2.5-fast'],
       ['cursor-opus-5-high', 'claude-opus-5-thinking-high'],
       ['cursor-fable-5-high', 'claude-fable-5-thinking-high'],
@@ -1605,10 +1606,15 @@ setInterval(() => {}, 1000);
     }
     assert.equal(_internals.toolNameOf(other as never), 'mcp__openclaude-memory__skill_search')
 
-    // preamble 必须把 ask_user 指认为 cursor 的提问通道。
+    // preamble 必须把正文 options 围栏指认为 cursor 的提问通道,且不再引导 ask_user。
     assert.ok(
+      _internals.CURSOR_PREAMBLE.includes('fenced `options`'),
+      'preamble must point cursor at the inline options fence',
+    )
+    assert.equal(
       _internals.CURSOR_PREAMBLE.includes('`ask_user`'),
-      'preamble must point cursor at the ask_user MCP tool',
+      false,
+      'preamble must not advertise ask_user',
     )
   })
 

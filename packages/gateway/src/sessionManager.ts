@@ -5983,6 +5983,51 @@ export class SessionManager {
     try { this.onSessionDestroyed?.(sessionKey) } catch {}
   }
 
+  /**
+   * Stop the warm runner and drop the live session, but keep resume-map so a
+   * later getOrCreate(sessionKey) can native-resume. Awaited by resumable
+   * delegate_task; fire-and-forget destroySession remains the one-shot path.
+   */
+  async retireKeepResume(sessionKey: string): Promise<void> {
+    const s = this.sessions.get(sessionKey)
+    if (s) {
+      try {
+        await s.runner.shutdown()
+      } catch (err) {
+        log.warn('retireKeepResume shutdown failed', { sessionKey }, err)
+      }
+      try {
+        await this._flushTailFolding(s)
+      } catch (err) {
+        log.warn('retireKeepResume flush failed', { sessionKey }, err)
+      }
+      if (s.executionTarget.kind === 'remote' && s.userId) {
+        await this._remoteTargetController
+          ?.releaseMux(sessionKey, s.userId, s.executionTarget.hostId)
+          .catch((err) =>
+            log.warn('retireKeepResume releaseMux failed', { sessionKey, err: String(err) }),
+          )
+      }
+      this.sessions.delete(sessionKey)
+      this._sessionIdToKey.delete(s.peerId)
+    }
+    try { this.onSessionDestroyed?.(sessionKey) } catch {}
+  }
+
+  hasLiveSession(sessionKey: string): boolean {
+    return this.sessions.has(sessionKey)
+  }
+
+  /** Drop resume-map rows for an evicted/expired delegate binding. */
+  forgetResume(sessionKey: string): void {
+    if (!this._resumeMap.has(sessionKey)) return
+    this._resumeMap.delete(sessionKey)
+    this._resumeMapTimestamps.delete(sessionKey)
+    this._resumeMapLastCost.delete(sessionKey)
+    this._resumeMapProvider.delete(sessionKey)
+    this._saveResumeMap()
+  }
+
   async shutdownAll(): Promise<void> {
     // Persist resume map BEFORE killing subprocesses — ensures state survives restart
     // (runner.shutdown() sets shuttingDown=true so the exit handler won't call _saveResumeMap)

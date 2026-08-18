@@ -56,6 +56,7 @@ import {
 } from './delegateFanout.js'
 import {
   formatDelegateFanoutRunning,
+  formatDelegateSuccess,
   resolveCursorFastWaitMs,
   runCursorDelegateFastPath,
   type FanoutCursorItem,
@@ -95,9 +96,11 @@ const DELEGATION_DEPTH = Math.max(
   0,
   Number.parseInt(process.env.OPENCLAUDE_DELEGATION_DEPTH || '0', 10) || 0,
 )
-/** 引擎身份(由网关 spawn env 注入)。ask_user 只挂在 Cursor 上 —— CCB/Codex
- *  各有原生提问工具,必须保持一条机制。未注入时视为非 Cursor,不暴露 ask_user。 */
+/** 引擎身份(由网关 spawn env 注入)。ask_user 定义保留但默认不暴露:
+ *  Cursor 已改走正文 ```options 围栏;仅 OC_ASK_USER_MCP=1 时恢复原 MCP 卡。
+ *  恢复时仍只挂在 Cursor 主会话上 —— CCB/Codex 各有原生提问工具。 */
 const ENGINE_ID = (process.env.OPENCLAUDE_ENGINE || '').trim().toLowerCase()
+const ASK_USER_MCP_ESCAPE = process.env.OC_ASK_USER_MCP === '1'
 const ASK_USER_ENABLED = ENGINE_ID === 'cursor'
 /** Cursor MCP tools/call 有 60s 硬超时:仅该引擎把委派切成作业句柄 + 快路径。
  *  CCB/Codex 继续走同步 /delegate,行为不变。 */
@@ -185,10 +188,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         SKILL_PROPOSE_TOOL,
       ]
     : TOOLS
-  // 子 agent 没有面向用户的交互面:直接不暴露 ask_user(discovery 过滤不是
-  // 授权边界,CallTool 侧还有深度短路兜底)。非 Cursor 引擎各有原生提问工具,
-  // 同样不暴露 —— 每引擎只留一条机制。
-  if (DELEGATION_DEPTH > 0 || !ASK_USER_ENABLED) {
+  // ask_user 默认不暴露(Cursor 已改走正文 ```options 围栏)。仅当
+  // OC_ASK_USER_MCP=1 且本进程是 Cursor 主会话时才恢复暴露。
+  // discovery 过滤不是授权边界,CallTool 侧还有短路兜底。
+  if (DELEGATION_DEPTH > 0 || !ASK_USER_ENABLED || !ASK_USER_MCP_ESCAPE) {
     base = base.filter((t) => t.name !== 'ask_user')
   }
   return { tools: filterSkillEvalTools(base, SKILL_EVAL_MODE) }
@@ -683,12 +686,14 @@ async function handleDelegateTask(args: {
   context?: string
   effort?: string
   toolsets?: string[]
+  resumeSessionKey?: string
 }) {
   return handleDelegateTaskToAgent(args.agentId || 'main', {
     goal: args.goal,
     context: args.context,
     effort: args.effort,
     toolsets: args.toolsets,
+    resumeSessionKey: args.resumeSessionKey,
     label: args.agentId || 'main',
   })
 }
@@ -715,6 +720,7 @@ async function handleDelegateTasks(args: { tasks?: unknown }) {
           context: t.context,
           effort: t.effort,
           toolsets: t.toolsets,
+          resumeSessionKey: t.resumeSessionKey,
           label,
         })
         // toolOk 返回体无 isError 字段、toolError 有 → 联合类型下按可选属性安全取值。
@@ -761,13 +767,16 @@ async function handleDelegateTasks(args: { tasks?: unknown }) {
 const DELEGATE_CLIENT_TIMEOUT_MS = 2 * 60 * 60_000 + 60_000
 
 /**
- * 引擎交互提问桥(仅 Cursor):把选择题 POST 给网关,在 55s 窗口内阻塞等回答;
- * 撞上 Cursor MCP ~60s tools/call 硬墙之前主动降级成 detached 卡片。窗口内
- * 拿到的答案作为本工具返回值,模型继续本回合;超时则问题已展示,立刻结束本
- * 回合,答案走下一条普通用户消息。禁止轮询或对同一问题再次调用。子 agent /
- * 非 Cursor 直接短路。HTTP 失败必须返回「已登记/请结束回合」,不得抛异常。
+ * 引擎交互提问桥(仅 Cursor,且仅 OC_ASK_USER_MCP=1 逃生开关):把选择题 POST
+ * 给网关,在 55s 窗口内阻塞等回答。默认关闭 —— Cursor 已改走正文 ```options
+ * 围栏,避免老提示词模型卡在 MCP 60s 硬超时上。开关打开时保持原行为。
  */
 async function handleAskUser(args: { questions?: unknown } | undefined | null) {
+  if (!ASK_USER_MCP_ESCAPE) {
+    return toolOk(
+      'Cursor 引擎已改为在正文输出 ```options 围栏选项卡提问，请改用该方式并立刻结束本回合',
+    )
+  }
   const questions = normalizeAskUserQuestions(args?.questions)
   if (!questions) {
     return toolError(
@@ -822,7 +831,11 @@ async function handleAskUser(args: { questions?: unknown } | undefined | null) {
  * 团队门(非团队 turn 409 拒绝)与审查任务书包装(用户原始需求取服务端权威快照)。
  * 熔断:hidden guard ≤3 次/turn,超限 429 —— 直接把结构化错误回给队长收敛。
  */
-async function handleRequestReview(args: { draft?: string; revisionNote?: string }) {
+async function handleRequestReview(args: {
+  draft?: string
+  revisionNote?: string
+  resumeSessionKey?: string
+}) {
   const draft = typeof args?.draft === 'string' ? args.draft.trim() : ''
   if (!draft) {
     return toolError('draft 必填:请把准备提交给用户的完整答复草稿放进 draft 参数')
@@ -835,6 +848,8 @@ async function handleRequestReview(args: { draft?: string; revisionNote?: string
     goal: '对队长准备提交给用户的最终答复草稿做独立质量审查,给出结构化裁决。',
     context: draft.slice(0, 16000) + note,
     label: '质量审查',
+    resumeSessionKey:
+      typeof args.resumeSessionKey === 'string' ? args.resumeSessionKey : undefined,
   })
 }
 
@@ -848,6 +863,7 @@ async function handleCursorDelegateTasks(tasks: FanoutTask[]) {
           context: t.context,
           effort: t.effort,
           toolsets: t.toolsets,
+          resumeSessionKey: t.resumeSessionKey,
           label,
         })
         if (r.kind === 'running') {
@@ -896,6 +912,7 @@ async function runCursorDelegateToAgent(
     context?: string
     effort?: string
     toolsets?: string[]
+    resumeSessionKey?: string
     label: string
   },
 ): Promise<FormattedDelegateResult> {
@@ -914,6 +931,7 @@ async function runCursorDelegateToAgent(
     sourceAgent,
     toolsets: args.toolsets,
     async: true,
+    ...(args.resumeSessionKey ? { resumeSessionKey: args.resumeSessionKey } : {}),
     ...(parentSessionKey ? { streamProgress: true, parentSessionKey } : {}),
   })
   const fastWaitMs = resolveCursorFastWaitMs()
@@ -945,6 +963,7 @@ async function handleDelegateTaskToAgent(
     context?: string
     effort?: string
     toolsets?: string[]
+    resumeSessionKey?: string
     label: string
   },
 ) {
@@ -978,6 +997,7 @@ async function handleDelegateTaskToAgent(
           ...(args.effort ? { effort: args.effort } : {}),
           sourceAgent,
           toolsets: args.toolsets,
+          ...(args.resumeSessionKey ? { resumeSessionKey: args.resumeSessionKey } : {}),
           ...(parentSessionKey ? { streamProgress: true, parentSessionKey } : {}),
         }),
         timeoutMs: DELEGATE_CLIENT_TIMEOUT_MS,
@@ -994,7 +1014,11 @@ async function handleDelegateTaskToAgent(
     if (looksLikeDelegateApiError(output)) {
       return toolError(`子 agent 执行出错: ${output}`)
     }
-    return toolOk(`✅ 委派完成 (agent: ${args.label})\n\n${output || '(无输出)'}`)
+    const sessionKey =
+      typeof data.sessionKey === 'string' && data.sessionKey.trim()
+        ? data.sessionKey.trim()
+        : undefined
+    return toolOk(formatDelegateSuccess(args.label, output, sessionKey))
   } catch (err: any) {
     return toolError(`委派失败: ${describeDelegateTransportError(err)}`)
   }
