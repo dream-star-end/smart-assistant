@@ -93,6 +93,7 @@ import type { TokenUsage } from "../billing/calculator.js";
 import { settleCursorExternalUsage } from "../billing/cursorExternalSettle.js";
 import { recordProductFrictionEvent } from "../productFriction/events.js";
 import { maybeUpdateAccountQuotaCodex } from "../account-pool/quota.js";
+import { applyLearnedCursorQuota } from "../account-pool/cursorMaterializer.js";
 import { OutboundRingBuffer, DEFAULT_RING_CONFIG } from "@openclaude/gateway";
 import {
   AUTOMATIC_TURN_RETRY_MAX,
@@ -5969,6 +5970,17 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                     );
                     modelId = existing.rows[0]?.model_id ?? null;
                     sessionId = existing.rows[0]?.session_id ?? sessionId;
+                  }
+                  if (modelId !== null) {
+                    try {
+                      await applyLearnedCursorQuota({
+                        modelId,
+                        terminalCode,
+                        slotResults: external.cursorSlotResults,
+                      });
+                    } catch (learnErr) {
+                      bridgeLog?.warn('user-chat-bridge: Cursor quota-class learn failed', { requestId, err: learnErr });
+                    }
                   }
                   if (modelId === null) {
                     bridgeLog?.warn('user-chat-bridge: Cursor settle skipped, audit model_id missing', { requestId });

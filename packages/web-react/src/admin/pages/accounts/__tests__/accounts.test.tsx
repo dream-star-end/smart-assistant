@@ -51,6 +51,7 @@ const ROW = {
   egress_proxy_pool_label: "tokyo-1",
   egress_host_uuid: null,
   has_refresh_token: true,
+  cursor_quota_class: null,
   created_at: new Date().toISOString(),
   updated_at: new Date().toISOString(),
   today_requests: 20,

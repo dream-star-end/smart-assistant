@@ -30,6 +30,7 @@ import { RecentUsersModal, RefreshHistoryModal } from "./AccountInfoModals";
 import {
   AccountWarningChips,
   CooldownCell,
+  CursorPoolCell,
   LastUsed,
   LifetimeCell,
   QuotaCell,
@@ -175,6 +176,7 @@ export default function AccountsPage() {
         ),
     },
     { key: "group", title: "分组", width: 70, render: (a) => (a.group_id ? <span className="font-mono text-[12px]">#{a.group_id}</span> : <span className="text-faint">—</span>) },
+    { key: "cursor_pool", title: "Cursor 池", width: 120, render: (a) => <CursorPoolCell a={a} /> },
     { key: "q5h", title: "5h%", align: "right", render: (a) => <QuotaCell pct={a.quota_5h_pct} updatedAt={a.quota_updated_at} /> },
     { key: "q5hr", title: "5h 重置", align: "right", render: (a) => <ResetCell resetsAt={a.quota_5h_resets_at} /> },
     { key: "q7d", title: "7d%", align: "right", render: (a) => <QuotaCell pct={a.quota_7d_pct} updatedAt={a.quota_updated_at} /> },

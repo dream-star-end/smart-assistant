@@ -16037,6 +16037,7 @@ export class Gateway {
           ...(e.terminalCode ? { terminalCode: e.terminalCode } : {}),
           durationMs: e.durationMs,
           ...(e.usage ? { usage: e.usage } : {}),
+          ...(e.cursorSlotResults && e.cursorSlotResults.length ? { cursorSlotResults: e.cursorSlotResults } : {}),
         }
         this.deliver(billingFrame, adapter)
       } else if (e.kind === 'error') {

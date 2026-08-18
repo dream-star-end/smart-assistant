@@ -715,6 +715,16 @@ function finalUsageMeta(usage: ReportedUsage | undefined): Record<string, number
     ...(usage.cache_creation_input_tokens !== undefined ? { cacheCreationTokens: usage.cache_creation_input_tokens } : {}),
   }
 }
+function parseCursorSlotResults(text: string): NonNullable<EngineExternalBillingEvent['cursorSlotResults']> {
+  const out: NonNullable<EngineExternalBillingEvent['cursorSlotResults']> = []
+  const re = /^oc-cursor: slot_result (\d+) (ok|fail_auth|fail_quota|fail)$/gm
+  for (const match of text.matchAll(re)) {
+    const slot = Number(match[1])
+    if (!Number.isInteger(slot) || slot < 1) continue
+    out.push({ slot, result: match[2] as 'ok' | 'fail_auth' | 'fail_quota' | 'fail' })
+  }
+  return out
+}
 function unavailable(detail: string): 'auth' | 'quota' | null {
   if (/auth|credential|unauthorized|forbidden|api.?key|not logged in|\b401\b|\b403\b/i.test(detail)) return 'auth'
   if (/quota|rate.?limit|usage limit|subscription|credits? exhausted|\b429\b/i.test(detail)) return 'quota'
@@ -1674,7 +1684,8 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     if (ctx.terminal) return; ctx.terminal = true; const cls = detail ? unavailable(detail) : null
     const safeDetail = detail === null ? null : ctx.interrupted ? 'Cursor turn cancelled' : cls === 'auth' ? 'Cursor authentication unavailable' : cls === 'quota' ? 'Cursor quota unavailable' : 'Cursor CLI failed'
     const status: EngineExternalBillingEvent['status'] = cls ? 'unavailable' : detail ? 'error' : 'success'
-    if (ctx.params.requestId && REQUEST_ID_RE.test(ctx.params.requestId)) this.emit('external_billing', { requestId: ctx.params.requestId, engine: 'cursor', status, durationMs: Date.now() - ctx.startedAt, ...(ctx.usage ? { usage: ctx.usage } : {}), ...(ctx.interrupted ? { terminalCode: 'USER_CANCELLED' } : cls === 'auth' ? { terminalCode: 'AUTH_UNAVAILABLE' } : cls === 'quota' ? { terminalCode: 'QUOTA_UNAVAILABLE' } : detail ? { terminalCode: 'ENGINE_ERROR' } : {}) } satisfies EngineExternalBillingEvent)
+    const slotResults = parseCursorSlotResults(ctx.stderr)
+    if (ctx.params.requestId && REQUEST_ID_RE.test(ctx.params.requestId)) this.emit('external_billing', { requestId: ctx.params.requestId, engine: 'cursor', status, durationMs: Date.now() - ctx.startedAt, ...(ctx.usage ? { usage: ctx.usage } : {}), ...(slotResults.length ? { cursorSlotResults: slotResults } : {}), ...(ctx.interrupted ? { terminalCode: 'USER_CANCELLED' } : cls === 'auth' ? { terminalCode: 'AUTH_UNAVAILABLE' } : cls === 'quota' ? { terminalCode: 'QUOTA_UNAVAILABLE' } : detail ? { terminalCode: 'ENGINE_ERROR' } : {}) } satisfies EngineExternalBillingEvent)
     const errorClass = detail ? classifyRunError(detail).code : undefined
     if (detail) ctx.params.onEvent({ kind: 'error', error: safeDetail!, errorClass, ...(ctx.interrupted ? { errorCode: 'user_cancelled' as const } : {}) })
     if (ctx.usage) ctx.params.onEvent({ kind: 'usage', usage: { inputTokens: ctx.usage.input_tokens ?? 0, outputTokens: ctx.usage.output_tokens ?? 0, cacheReadTokens: ctx.usage.cache_read_input_tokens ?? 0, cacheCreationTokens: ctx.usage.cache_creation_input_tokens ?? 0, totalTokens: Object.values(ctx.usage).reduce((a, b) => a + (b ?? 0), 0) } })

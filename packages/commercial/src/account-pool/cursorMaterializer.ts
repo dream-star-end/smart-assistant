@@ -27,8 +27,17 @@ import {
   createAccount,
   getCursorTokenSnapshot,
   listAccounts,
+  updateAccount,
   type AccountRow,
 } from "./store.js";
+import {
+  CURSOR_QUOTA_CLASS_FILE,
+  asCursorSlotResults,
+  cursorModelFamily,
+  planCursorQuotaUpdates,
+  renderQuotaClassSidecar,
+  type CursorQuotaClass,
+} from "./cursorQuota.js";
 
 const log = rootLogger.child({ subsys: "cursor-auth-sync" });
 
@@ -62,6 +71,7 @@ export function slotFileName(index: number): string {
 /** Written once the account pool owns this auth dir. Distinguishes first-time
  *  import from "admin deleted the last cursor row" (empty pool + leftover files). */
 export const CURSOR_POOL_OWNED_MARKER = ".account-pool-owned";
+export { CURSOR_QUOTA_CLASS_FILE };
 
 export function isCanonicalCursorKeyFile(name: string): boolean {
   if (name === "api-key") return true;
@@ -85,7 +95,7 @@ export interface CursorAuthSyncDeps {
   runtimeChannel?: "v3" | "v5";
 }
 
-function eligibleCursorRows(rows: AccountRow[], now: Date): AccountRow[] {
+export function eligibleCursorRows(rows: AccountRow[], now: Date): AccountRow[] {
   return rows
     .filter((row) => row.provider === "cursor")
     .filter((row) => row.status === "active")
@@ -150,27 +160,38 @@ async function importHostKeysIfEmpty(deps: Required<Pick<CursorAuthSyncDeps, "li
   return imported;
 }
 
-function writeAtomicSlots(authDir: string, keys: string[]): string[] {
+function writeAtomicSlots(
+  authDir: string,
+  slots: Array<{ key: string; quotaClass: CursorQuotaClass }>,
+): string[] {
   mkdirSync(authDir, { recursive: true, mode: 0o700 });
   const staging = join(authDir, ".materializing");
   rmSync(staging, { recursive: true, force: true });
   mkdirSync(staging, { mode: 0o700 });
   const fingerprints: string[] = [];
   try {
-    for (let i = 0; i < keys.length; i += 1) {
+    const sidecarSlots: Array<{ name: string; quotaClass: CursorQuotaClass }> = [];
+    for (let i = 0; i < slots.length; i += 1) {
       const name = slotFileName(i);
       const dest = join(staging, name);
-      writeFileSync(dest, `${keys[i]}\n`, { mode: 0o600, encoding: "utf8" });
+      writeFileSync(dest, `${slots[i].key}\n`, { mode: 0o600, encoding: "utf8" });
       chmodSync(dest, 0o600);
-      fingerprints.push(fingerprintCursorKey(keys[i]));
+      fingerprints.push(fingerprintCursorKey(slots[i].key));
+      sidecarSlots.push({ name, quotaClass: slots[i].quotaClass });
     }
-    for (let i = 0; i < keys.length; i += 1) {
+    writeFileSync(join(staging, CURSOR_QUOTA_CLASS_FILE), renderQuotaClassSidecar(sidecarSlots), {
+      mode: 0o600,
+      encoding: "utf8",
+    });
+    chmodSync(join(staging, CURSOR_QUOTA_CLASS_FILE), 0o600);
+    for (let i = 0; i < slots.length; i += 1) {
       const name = slotFileName(i);
       renameSync(join(staging, name), join(authDir, name));
     }
+    renameSync(join(staging, CURSOR_QUOTA_CLASS_FILE), join(authDir, CURSOR_QUOTA_CLASS_FILE));
+    const expected = new Set(slots.map((_, i) => slotFileName(i)));
     for (const name of readdirSync(authDir)) {
       if (!isCanonicalCursorKeyFile(name)) continue;
-      const expected = new Set(keys.map((_, i) => slotFileName(i)));
       if (!expected.has(name)) unlinkSync(join(authDir, name));
     }
   } finally {
@@ -210,30 +231,34 @@ export async function syncCursorAuthDir(deps?: Partial<CursorAuthSyncDeps>): Pro
     return { imported, written: 0, skipped: "empty-pool-keep-files", fingerprints: [] };
   }
 
-  const keys: string[] = [];
-  const fingerprints: string[] = [];
+  const slots: Array<{ key: string; quotaClass: CursorQuotaClass }> = [];
   try {
     for (const row of rows) {
       const snap = await resolved.getCursorTokenSnapshot(row.id);
       if (!snap?.token) continue;
       const key = normalizeCursorApiKey(snap.token.toString("utf8"));
-      keys.push(key);
-      fingerprints.push(fingerprintCursorKey(key));
+      slots.push({
+        key,
+        quotaClass: row.cursor_quota_class === "other_ok" || row.cursor_quota_class === "cursor_only"
+          ? row.cursor_quota_class
+          : "unknown",
+      });
       snap.token.fill(0);
     }
-    if (keys.length === 0) {
+    if (slots.length === 0) {
       log.warn("cursor account pool rows had no decryptable keys; leaving host files unchanged");
       return { imported, written: 0, skipped: "empty-pool-keep-files", fingerprints: [] };
     }
-    const writtenFp = writeAtomicSlots(resolved.authDir, keys);
+    const writtenFp = writeAtomicSlots(resolved.authDir, slots);
     log.info("materialized cursor account pool onto host auth dir", {
-      written: keys.length,
+      written: slots.length,
       imported,
       fingerprints: writtenFp,
     });
-    return { imported, written: keys.length, skipped: null, fingerprints: writtenFp };
+    return { imported, written: slots.length, skipped: null, fingerprints: writtenFp };
   } finally {
-    keys.length = 0;
+    for (const slot of slots) slot.key = "";
+    slots.length = 0;
   }
 }
 
@@ -275,4 +300,27 @@ export function startCursorAuthSyncActor(opts: { intervalMs?: number } = {}): { 
       }
     },
   };
+}
+
+export async function applyLearnedCursorQuota(opts: {
+  modelId: string | null;
+  terminalCode: string | null;
+  slotResults: unknown;
+}): Promise<number> {
+  const results = asCursorSlotResults(opts.slotResults);
+  if (!opts.modelId || results.length === 0) return 0;
+  const family = cursorModelFamily(opts.modelId);
+  if (family === "cursor_models") return 0;
+  const rows = eligibleCursorRows(await listAccounts({ provider: "cursor", limit: 500 }), new Date());
+  const updates = planCursorQuotaUpdates(
+    rows.map((row) => ({ id: row.id, cursor_quota_class: row.cursor_quota_class })),
+    results,
+    family,
+    opts.terminalCode,
+  );
+  for (const update of updates) {
+    await updateAccount(update.id, { cursor_quota_class: update.to });
+  }
+  if (updates.length > 0) scheduleCursorAuthSync("cursor.quota-learn");
+  return updates.length;
 }

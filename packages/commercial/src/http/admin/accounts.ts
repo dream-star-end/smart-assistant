@@ -111,6 +111,7 @@ function serializeAccount(
     egress_host_uuid: a.egress_host_uuid,
     /** UI 区分 oauth 过期"可自愈(待 lazy refresh)"vs"需人工"的依据。 */
     has_refresh_token: a.has_refresh_token,
+    cursor_quota_class: a.provider === "cursor" ? a.cursor_quota_class : null,
     created_at: a.created_at.toISOString(),
     updated_at: a.updated_at.toISOString(),
   };

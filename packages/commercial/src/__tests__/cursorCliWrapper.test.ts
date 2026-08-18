@@ -105,9 +105,9 @@ printf '%s\\n' '{"type":"result","subtype":"success","usage":{"inputTokens":1,"o
       `cursor_bin=${fakeBin}`,
     )
     .replace('auth_file=/run/oc/cursor-auth/api-key', `auth_file=${auth}`)
-    .replace('/usr/bin/sudo -n /usr/bin/test -f', '/usr/bin/test -f')
-    .replace('/usr/bin/sudo -n /bin/ls', '/bin/ls')
-    .replace('/usr/bin/sudo -n /bin/cat', '/bin/cat')
+    .replaceAll('/usr/bin/sudo -n /usr/bin/test -f', '/usr/bin/test -f')
+    .replaceAll('/usr/bin/sudo -n /bin/ls', '/bin/ls')
+    .replaceAll('/usr/bin/sudo -n /bin/cat', '/bin/cat')
   writeFileSync(wrapper, rewritten, { mode: 0o755 })
   chmodSync(wrapper, 0o755)
   return {
@@ -684,5 +684,61 @@ describe('oc-cursor wrapper', () => {
     assert.equal(result.status, 2)
     assert.match(result.stderr, /Cursor resume requires durable chats directory/)
     assert.equal(existsSync(join(f.capture, 'home')), false)
+  })
+
+  test('Other Models skip cursor_only and emit the full-pool slot_result', () => {
+    const f = fixture()
+    const authDir = dirname(f.auth)
+    writeFileSync(join(authDir, 'api-key.2'), 'crsr_second\n', { mode: 0o600 })
+    writeFileSync(
+      join(authDir, '.quota-class'),
+      '# quota-class v1\napi-key cursor_only\napi-key.2 unknown\n',
+      { mode: 0o600 },
+    )
+    const result = spawnSync(
+      f.wrapper,
+      ['--model', 'claude-opus-5-thinking-high', '--', 'hello world'],
+      { cwd: f.dir, env: f.env, encoding: 'utf8' },
+    )
+    assert.equal(result.status, 0, result.stderr)
+    assert.equal(readFileSync(join(f.capture, 'key'), 'utf8').trim(), 'crsr_second')
+    assert.match(result.stderr, /slot_result 2 ok/)
+    assert.match(readFileSync(join(f.capture, 'argv'), 'utf8'), /hello world/)
+  })
+
+  test('Cursor Models still use a cursor_only primary', () => {
+    const f = fixture()
+    const authDir = dirname(f.auth)
+    writeFileSync(join(authDir, 'api-key.2'), 'crsr_second\n', { mode: 0o600 })
+    writeFileSync(
+      join(authDir, '.quota-class'),
+      '# quota-class v1\napi-key cursor_only\napi-key.2 unknown\n',
+      { mode: 0o600 },
+    )
+    const result = spawnSync(f.wrapper, ['--model', 'cursor-grok-4.6-high', '--', 'hello'], {
+      cwd: f.dir,
+      env: f.env,
+      encoding: 'utf8',
+    })
+    assert.equal(result.status, 0, result.stderr)
+    assert.equal(readFileSync(join(f.capture, 'key'), 'utf8').trim(), 'crsr_dummy')
+    assert.match(result.stderr, /slot_result 1 ok/)
+  })
+
+  test('Other Models die as quota when every slot is cursor_only', () => {
+    const f = fixture()
+    writeFileSync(
+      join(dirname(f.auth), '.quota-class'),
+      '# quota-class v1\napi-key cursor_only\n',
+      { mode: 0o600 },
+    )
+    const result = spawnSync(
+      f.wrapper,
+      ['--model', 'claude-opus-5-thinking-high', '--', 'hello'],
+      { cwd: f.dir, env: f.env, encoding: 'utf8' },
+    )
+    assert.equal(result.status, 2)
+    assert.match(result.stderr, /other-models quota unavailable/)
+    assert.equal(existsSync(join(f.capture, 'key')), false)
   })
 })

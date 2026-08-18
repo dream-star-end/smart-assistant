@@ -258,6 +258,8 @@ export interface EngineExternalBillingEvent {
     cache_read_input_tokens?: number
     cache_creation_input_tokens?: number
   }
+  /** 1-based oc-cursor slot results for passive quota-class learning. */
+  cursorSlotResults?: Array<{ slot: number; result: 'ok' | 'fail_auth' | 'fail_quota' | 'fail' }>
 }
 
 /**

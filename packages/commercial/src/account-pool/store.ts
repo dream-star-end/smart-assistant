@@ -123,6 +123,8 @@ export interface AccountRow {
   runtime_channel: RuntimeChannel;
   created_at: Date;
   updated_at: Date;
+  /** 0226 — Cursor two-pool class. Non-cursor rows stay unknown and are ignored. */
+  cursor_quota_class: import("./cursorQuota.js").CursorQuotaClass;
 }
 
 /**
@@ -272,6 +274,7 @@ export interface UpdateAccountPatch {
   egress_proxy_id?: bigint | string;
   /** Optional group binding. undefined = no change; null = unassign. */
   group_id?: bigint | string | null;
+  cursor_quota_class?: import("./cursorQuota.js").CursorQuotaClass;
 }
 
 export class AccountNotFoundError extends Error {
@@ -312,7 +315,8 @@ const META_COLUMNS = `
   (oauth_refresh_enc IS NOT NULL AND oauth_refresh_nonce IS NOT NULL) AS has_refresh_token,
   runtime_channel,
   created_at,
-  updated_at
+  updated_at,
+  COALESCE(cursor_quota_class, 'unknown') AS cursor_quota_class
 `;
 
 interface RawMetaRow extends QueryResultRow {
@@ -343,6 +347,7 @@ interface RawMetaRow extends QueryResultRow {
   runtime_channel: RuntimeChannel;
   created_at: Date;
   updated_at: Date;
+  cursor_quota_class: string;
 }
 
 interface RawSecretRow extends QueryResultRow {
@@ -408,6 +413,9 @@ function parseMetaRow(row: RawMetaRow): AccountRow {
     runtime_channel: row.runtime_channel,
     created_at: row.created_at,
     updated_at: row.updated_at,
+    cursor_quota_class: (row.cursor_quota_class === "other_ok" || row.cursor_quota_class === "cursor_only")
+      ? row.cursor_quota_class
+      : "unknown",
   };
 }
 
@@ -777,6 +785,12 @@ export async function updateAccount(
   }
   if (patch.group_id !== undefined) {
     push("group_id", patch.group_id === null ? null : String(patch.group_id));
+  }
+  if (patch.cursor_quota_class !== undefined) {
+    if (patch.cursor_quota_class !== "unknown" && patch.cursor_quota_class !== "other_ok" && patch.cursor_quota_class !== "cursor_only") {
+      throw new TypeError(`invalid cursor_quota_class: ${patch.cursor_quota_class}`);
+    }
+    push("cursor_quota_class", patch.cursor_quota_class);
   }
 
   if (patch.egress_proxy_id !== undefined) {

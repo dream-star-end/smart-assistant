@@ -1131,6 +1131,13 @@ export const OutboundExternalEngineBilling = Type.Object({
     input_tokens: Type.Optional(Type.Number()), output_tokens: Type.Optional(Type.Number()),
     cache_read_input_tokens: Type.Optional(Type.Number()), cache_creation_input_tokens: Type.Optional(Type.Number()),
   })),
+  cursorSlotResults: Type.Optional(Type.Array(Type.Object({
+    slot: Type.Integer({ minimum: 1 }),
+    result: Type.Union([
+      Type.Literal('ok'), Type.Literal('fail_auth'),
+      Type.Literal('fail_quota'), Type.Literal('fail'),
+    ]),
+  }))),
   traceId: Type.Optional(TraceIdString),
 })
 export type OutboundExternalEngineBilling = Static<typeof OutboundExternalEngineBilling>

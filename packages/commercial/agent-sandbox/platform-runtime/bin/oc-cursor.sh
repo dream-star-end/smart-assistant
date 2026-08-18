@@ -168,12 +168,77 @@ workspace=$(pwd -P)
 # lifetime; last writer wins under concurrent turns — acceptable, both keys
 # are interchangeable). A single-key account keeps the byte-identical legacy
 # path.
+#
+# Other Models (Opus and the rest) additionally skip slots marked
+# `cursor_only` in `.quota-class`. That sidecar has no secrets. Cursor Models
+# still see every active slot.
 chosen_key_file=$auth_file
 rotation_file=${OC_CURSOR_KEY_ROTATION_FILE:-/tmp/openclaude-cursor-key-rotation}
 rotation_cooldown=600
 rotation_idx=0
 rotation_exp=0
-if [ "$key_count" -gt 1 ]; then
+
+cursor_family=other_models
+case "$model" in
+  ""|auto)
+    cursor_family=cursor_models
+    ;;
+  cursor-grok-4.6-low|cursor-grok-4.6-low-fast|cursor-grok-4.6-medium|cursor-grok-4.6-medium-fast|\
+  cursor-grok-4.6-high|cursor-grok-4.6-high-fast|cursor-grok-4.6-xhigh|cursor-grok-4.6-xhigh-fast|\
+  composer-2.5|composer-2.5-fast|cursor-grok-4.5-high|cursor-grok-4.5-high-fast)
+    cursor_family=cursor_models
+    ;;
+esac
+
+eligible_names=$key_names
+eligible_count=$key_count
+if [ "$cursor_family" = "other_models" ]; then
+  if /usr/bin/sudo -n /usr/bin/test -f "$auth_dir/.quota-class" 2>/dev/null \
+    || /usr/bin/test -f "$auth_dir/.quota-class" 2>/dev/null; then
+    sidecar_text=$(/usr/bin/sudo -n /bin/cat -- "$auth_dir/.quota-class" 2>/dev/null) \
+      || sidecar_text=$(/bin/cat -- "$auth_dir/.quota-class" 2>/dev/null) \
+      || sidecar_text=""
+    eligible_names=""
+    eligible_count=0
+    for key_name in $key_names; do
+      slot_class=unknown
+      while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+          ''|'#'*) continue ;;
+        esac
+        slot_name=${line%% *}
+        slot_cls=${line#"$slot_name"}
+        slot_cls=${slot_cls# }
+        slot_cls=${slot_cls%% *}
+        if [ "$slot_name" = "$key_name" ]; then
+          case "$slot_cls" in
+            unknown|other_ok|cursor_only) slot_class=$slot_cls ;;
+          esac
+        fi
+      done <<SIDECAR
+$sidecar_text
+SIDECAR
+      if [ "$slot_class" = "cursor_only" ]; then
+        continue
+      fi
+      eligible_names="$eligible_names $key_name"
+      eligible_count=$((eligible_count + 1))
+    done
+    if [ "$eligible_count" -eq 0 ]; then
+      die "Cursor other-models quota unavailable"
+    fi
+  fi
+fi
+
+# Filtered Other Models must not keep serving a cursor_only primary.
+if [ "$eligible_count" -ge 1 ]; then
+  for key_name in $eligible_names; do
+    chosen_key_file=$auth_dir/$key_name
+    break
+  done
+fi
+
+if [ "$eligible_count" -gt 1 ]; then
   rotation_state=$(/bin/cat -- "$rotation_file" 2>/dev/null) || rotation_state=""
   rotation_first=${rotation_state%% *}
   rotation_rest=${rotation_state#* }
@@ -186,36 +251,58 @@ if [ "$key_count" -gt 1 ]; then
   esac
   rotation_idx=$rotation_first
   rotation_exp=$rotation_rest
-  if [ "$rotation_idx" -ge "$key_count" ]; then rotation_idx=0; fi
-  # Cooldown elapsed (or legacy single-int state): return to the primary.
+  if [ "$rotation_idx" -ge "$eligible_count" ]; then rotation_idx=0; fi
+  # Cooldown elapsed (or legacy single-int state): return to the primary eligible.
   if [ "$rotation_idx" -gt 0 ] && [ "$(/bin/date +%s)" -ge "$rotation_exp" ]; then
     rotation_idx=0
   fi
   chosen_slot=$((rotation_idx + 1))
   slot_position=0
-  for key_name in $key_names; do
+  for key_name in $eligible_names; do
     slot_position=$((slot_position + 1))
     if [ "$slot_position" -eq "$chosen_slot" ]; then
       chosen_key_file=$auth_dir/$key_name
       break
     fi
   done
-  echo "oc-cursor: using Cursor credential slot $chosen_slot/$key_count" >&2
+  full_slot=0
+  for key_name in $key_names; do
+    full_slot=$((full_slot + 1))
+    if [ "$auth_dir/$key_name" = "$chosen_key_file" ]; then
+      echo "oc-cursor: using Cursor credential slot $full_slot/$key_count" >&2
+      break
+    fi
+  done
 fi
-# Advance the pool past the slot that just failed. No-op for single-key
-# accounts, so their failure path stays byte-identical.
+
+# Advance the eligible pool past the slot that just failed. No-op for
+# single-eligible accounts, so their failure path stays byte-identical.
 rotation_advance() {
-  [ "$key_count" -gt 1 ] || return 0
+  [ "$eligible_count" -gt 1 ] || return 0
   rotation_next=$((rotation_idx + 1))
-  if [ "$rotation_next" -ge "$key_count" ]; then rotation_next=0; fi
+  if [ "$rotation_next" -ge "$eligible_count" ]; then rotation_next=0; fi
   printf '%s %s\n' "$rotation_next" "$(( $(/bin/date +%s) + rotation_cooldown ))" \
     > "$rotation_file" 2>/dev/null || :
 }
+emit_slot_result() {
+  _kind=$1
+  _full=0
+  for key_name in $key_names; do
+    _full=$((_full + 1))
+    if [ "$auth_dir/$key_name" = "$chosen_key_file" ]; then
+      echo "oc-cursor: slot_result $_full $_kind" >&2
+      return 0
+    fi
+  done
+}
+
 if ! api_key=$(/usr/bin/sudo -n /bin/cat -- "$chosen_key_file" 2>/dev/null); then
+  emit_slot_result fail
   rotation_advance
   die "Cursor credential mount is unreadable"
 fi
 if [ -z "$api_key" ]; then
+  emit_slot_result fail
   rotation_advance
   die "Cursor credential is malformed"
 fi
@@ -223,6 +310,7 @@ carriage_return=$(printf '\r')
 case "$api_key" in
   *"
 "*|*"$carriage_return"*)
+    emit_slot_result fail
     rotation_advance
     die "Cursor credential is malformed"
     ;;
@@ -371,7 +459,10 @@ set -e
 # the next turn to the following slot under cooldown. Signal-terminated
 # turns (user Stop) exit through forward_signal and do not touch the state.
 if [ "$status" -ne 0 ]; then
+  emit_slot_result fail
   rotation_advance
+else
+  emit_slot_result ok
 fi
 
 # Shorten the lifetime of the shell copy before EXIT removes the temp HOME.

@@ -73,6 +73,33 @@ describe("syncCursorAuthDir", () => {
     assert.equal(readdirSync(authDir).includes("api-key.bak-20260816"), true);
     assert.equal(result.fingerprints[0], fingerprintCursorKey(KEY_A));
     assert.equal(existsSync(join(authDir, CURSOR_POOL_OWNED_MARKER)), true);
+    assert.match(readFileSync(join(authDir, ".quota-class"), "utf8"), /api-key unknown/);
+    assert.match(readFileSync(join(authDir, ".quota-class"), "utf8"), /api-key\.2 unknown/);
+  });
+
+  test("writes learned cursor_only into the sidecar without secrets", async () => {
+    const authDir = mkdtempSync(join(tmpdir(), "oc-cursor-auth-"));
+    const result = await syncCursorAuthDir({
+      authDir,
+      listAccounts: async () =>
+        [
+          { id: 1n, provider: "cursor", status: "active", cooldown_until: null, cursor_quota_class: "cursor_only" },
+          { id: 2n, provider: "cursor", status: "active", cooldown_until: null, cursor_quota_class: "other_ok" },
+        ] as never,
+      createAccount: async () => {
+        throw new Error("must not import when pool already has rows");
+      },
+      getCursorTokenSnapshot: async (id) => {
+        const key = String(id) === "1" ? KEY_A : KEY_B;
+        return { token: Buffer.from(key, "utf8") } as never;
+      },
+    });
+    assert.equal(result.written, 2);
+    const sidecar = readFileSync(join(authDir, ".quota-class"), "utf8");
+    assert.match(sidecar, /^# quota-class v1\n/);
+    assert.match(sidecar, /api-key cursor_only/);
+    assert.match(sidecar, /api-key\.2 other_ok/);
+    assert.doesNotMatch(sidecar, /crsr_/);
   });
 
   test("after first import, deleting the last pool row does not re-import leftover host files", async () => {
