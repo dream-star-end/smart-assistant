@@ -40,12 +40,13 @@ const OTHER = "__other__";
  *  两处数值必须一致，由 PermissionCard.test.tsx 的契约断言直接读 server.ts 源码锁定
  *  （前端改不动 gateway 常量：那是容器内源码面 / runtime release 轴，见 V5_DEV_PLAYBOOK §4.1）。
  *
- *  ⚠️ 只用来决定「是否自动弹框」，绝不用来禁用手动回答入口 —— 万一本地时钟偏差导致误判，
- *  用户仍须能点「回答」把真正在等的 agent 解锁（fail-safe 方向）。
+ *  ⚠️ TTL 只用来决定「是否过期」：过期卡不再自动弹框。活跃提问在时钟偏差误判时
+ *  仍保留手动「回答」入口（fail-safe）。历史/已结束会话里的过期卡改为只读「已过期」。
  *
  *  Detached Cursor `ask_user` cards (`requestId` 以 `ask-user:` 开头,或
- *  `_detachedAskUser`) 不受这条 30 分钟启发式约束：它们在网关侧活 24 小时,
- *  离开再回来仍应自动弹出并可作答。 */
+ *  `_detachedAskUser`) 的过期上界是 24 小时（或消息上的 `_askUserExpiresAt`）。
+ *  自动弹窗不再用这条 TTL 当「是不是当前活跃提问」的判据 —— 历史未决卡滚进视口
+ *  不得再弹。 */
 export const PENDING_PERMISSION_TTL_MS = 30 * 60_000;
 export const DETACHED_ASK_USER_TTL_MS = 24 * 60 * 60_000;
 
@@ -54,6 +55,29 @@ function isDetachedAskUserCard(msg: ChatMessage): boolean {
     msg._detachedAskUser === true ||
     (typeof msg.requestId === "string" && msg.requestId.startsWith("ask-user:"))
   );
+}
+
+/** Page-session memory of requestIds that already auto-opened a modal.
+ *  Virtuoso unmounts rows that leave the overscan window; useEffect+useState
+ *  reset on remount and would re-popup without this. Module-level Set survives
+ *  remount *and* MessageList remount on session switch (`key={activeId}`),
+ *  and is not persisted (refresh = new page session). */
+const autoOpenedPermissionRequestIds = new Set<string>();
+
+export function resetPermissionAutoOpenMemory(): void {
+  autoOpenedPermissionRequestIds.clear();
+}
+
+/** Prefer the server-carried absolute expiry; fall back to ts + role TTL for
+ *  old rows that never received `_askUserExpiresAt`. */
+export function permissionHasExpired(msg: ChatMessage, now = Date.now()): boolean {
+  const expiresAt = msg._askUserExpiresAt;
+  if (typeof expiresAt === "number" && Number.isFinite(expiresAt) && expiresAt > 0) {
+    return now >= expiresAt;
+  }
+  if (!Number.isFinite(msg.ts)) return false;
+  const ttlMs = isDetachedAskUserCard(msg) ? DETACHED_ASK_USER_TTL_MS : PENDING_PERMISSION_TTL_MS;
+  return now - msg.ts > ttlMs;
 }
 
 function asAskUserQuestion(msg: ChatMessage): AqQuestion[] | null {
@@ -68,11 +92,16 @@ export function PermissionCard({
   msg,
   onRespond,
   readOnly = false,
+  livePrompt = true,
 }: {
   msg: ChatMessage;
   onRespond: PermissionRespond;
   /** 管理端会话查看等只读 surface：保留历史状态，但绝不弹框或提供审批动作。 */
   readOnly?: boolean;
+  /** 当前会话、当前 in-flight turn 里待回答的活提问。历史/已结束会话必须传 false：
+   *  只展示记录，绝不自动弹。默认 true 只为单卡单测保持「活卡挂载即弹」语义；
+   *  列表层（MessageRenderer）始终传入 `inActiveTurn && sending`。 */
+  livePrompt?: boolean;
 }) {
   const questions = useMemo(() => asAskUserQuestion(msg), [msg]);
   const resolved = !!msg._resolved;
@@ -80,26 +109,33 @@ export function PermissionCard({
   const behavior = msg._behavior;
   const [open, setOpen] = useState(false);
 
-  // 孤儿待决卡的判据（见 PENDING_PERMISSION_TTL_MS 注释）。放在渲染期算：msg.ts 恒定，
-  // Date.now() 只在重渲染时前进，跨过阈值会让 effect 再跑一次——那次因 stale=true 不再弹。
-  // Detached ask_user 用 24h TTL：3 小时后换设备回来仍应自动弹出。
-  const ttlMs = isDetachedAskUserCard(msg) ? DETACHED_ASK_USER_TTL_MS : PENDING_PERMISSION_TTL_MS;
-  const stale =
-    !resolved && Number.isFinite(msg.ts) && Date.now() - msg.ts > ttlMs;
+  const expired = !resolved && permissionHasExpired(msg);
+  const canAnswer = !resolved && !pending && !readOnly && (!expired || livePrompt);
 
-  // 待审批 → 挂载即自动弹审批框。真实引擎权限卡超过 30min 视为孤儿(服务端已 sweep)。
-  // Detached ask_user 活在 server tape 上、24h 内仍可作答,不按孤儿处理。
+  // 自动弹窗：仅活提问、且本页会话内每个 requestId 最多一次。
+  // 用 setTimeout(0) 记下「已弹过」，让 React StrictMode 的同步 double-effect
+  // 仍能打开（cleanup 会清掉未触发的 timer）；真正的 Virtuoso 重挂发生在
+  // 用户滚动之后，timer 早已把 requestId 写入 Set。
   useEffect(() => {
-    if (!resolved && !pending && !readOnly && !stale) setOpen(true);
-  }, [resolved, pending, readOnly, stale]);
+    if (!livePrompt || resolved || pending || readOnly || expired) return;
+    const requestId = msg.requestId;
+    if (!requestId || autoOpenedPermissionRequestIds.has(requestId)) return;
+    setOpen(true);
+    const timer = window.setTimeout(() => {
+      autoOpenedPermissionRequestIds.add(requestId);
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [resolved, pending, readOnly, expired, livePrompt, msg.requestId]);
 
   const statusIcon = !resolved ? "⏳" : behavior === "allow" ? "✓" : "✗";
   const statusText = !resolved
     ? pending
       ? "正在提交…"
-      : questions
-        ? "等待回答…"
-        : "等待审批…"
+      : expired
+        ? "已过期"
+        : questions
+          ? "等待回答…"
+          : "等待审批…"
     : behavior === "allow"
       ? questions
         ? "已提交"
@@ -137,8 +173,8 @@ export function PermissionCard({
         </span>
       </div>
 
-      {/* 待审批：内联快捷 + 打开审批框 */}
-      {!resolved && !pending && !readOnly && (
+      {/* 待审批：内联快捷 + 打开审批框。历史未答卡不自动弹，但保留这颗显式按钮。 */}
+      {canAnswer && (
         <div className="flex items-center gap-2 border-t border-border px-3.5 py-2">
           <Button size="sm" variant="accent" shape="pill" onClick={() => setOpen(true)}>
             {questions ? "回答" : "审批"}
@@ -158,6 +194,11 @@ export function PermissionCard({
       {!resolved && readOnly && (
         <div className="border-t border-border px-3.5 py-2 text-[11.5px] text-faint">
           只读查看 · 需由用户在原会话中处理
+        </div>
+      )}
+      {!resolved && !readOnly && expired && !livePrompt && (
+        <div className="border-t border-border px-3.5 py-2 text-[11.5px] text-faint">
+          提问已过期，无法再作答
         </div>
       )}
 
@@ -184,9 +225,7 @@ export function PermissionCard({
       )}
 
       {/* 审批 modal */}
-      {!resolved &&
-        !pending &&
-        !readOnly &&
+      {canAnswer &&
         (questions ? (
           <AskUserQuestionModal
             open={open}

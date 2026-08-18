@@ -10,14 +10,28 @@
  * 修法：超过服务端 TTL 的未决卡视为孤儿，不再自动弹；但手动回答入口必须保留（fail-safe）。
  */
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../../lib/chat/model";
-import { DETACHED_ASK_USER_TTL_MS, PENDING_PERMISSION_TTL_MS, PermissionCard } from "./PermissionCard";
+import {
+  DETACHED_ASK_USER_TTL_MS,
+  PENDING_PERMISSION_TTL_MS,
+  PermissionCard,
+  resetPermissionAutoOpenMemory,
+} from "./PermissionCard";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  resetPermissionAutoOpenMemory();
+});
+
+async function flushAutoOpenMemory(): Promise<void> {
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+}
 
 function askMsg(overrides: Partial<ChatMessage> = {}): ChatMessage {
   return {
@@ -127,6 +141,145 @@ describe("PermissionCard 自动弹框的存活边界", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "回答" }));
     expect(screen.getByRole("dialog")).toBeInTheDocument();
+  });
+});
+
+describe("PermissionCard 自动弹窗：活提问 vs 历史 vs 重挂", () => {
+  test("Virtuoso 重挂同一 requestId 不再自动弹，手动回答仍可用", async () => {
+    const msg = askMsg({ requestId: "req-remount" });
+    const { unmount } = render(<PermissionCard msg={msg} onRespond={vi.fn()} livePrompt />);
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    await flushAutoOpenMemory();
+    unmount();
+
+    render(<PermissionCard msg={msg} onRespond={vi.fn()} livePrompt />);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.getByTestId("permission-card")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "回答" }));
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+  });
+
+  test("历史行 livePrompt=false 永不自动弹，未答仍可点「回答」", () => {
+    render(
+      <PermissionCard
+        msg={askMsg({ requestId: "req-history" })}
+        onRespond={vi.fn()}
+        livePrompt={false}
+      />,
+    );
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.getByText("等待回答…")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "回答" }));
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+  });
+
+  test("活跃提问 livePrompt 仍会自动弹一次", () => {
+    render(
+      <PermissionCard
+        msg={askMsg({ requestId: "req-live-once" })}
+        onRespond={vi.fn()}
+        livePrompt
+      />,
+    );
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+  });
+
+  test("已作答卡展示答案摘要且不弹窗", () => {
+    render(
+      <PermissionCard
+        msg={askMsg({
+          requestId: "req-answered",
+          _resolved: true,
+          _behavior: "allow",
+          _answers: { "多人在线的玩法形态选哪种?": "组队合作割草" },
+        })}
+        onRespond={vi.fn()}
+        livePrompt
+      />,
+    );
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.getByText("→ 组队合作割草")).toBeInTheDocument();
+    expect(screen.getByText("已提交")).toBeInTheDocument();
+  });
+
+  test("不同 requestId 互不影响，各自仍能自动弹一次", async () => {
+    const first = askMsg({ requestId: "req-a" });
+    const { unmount } = render(<PermissionCard msg={first} onRespond={vi.fn()} livePrompt />);
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    await flushAutoOpenMemory();
+    unmount();
+
+    render(<PermissionCard msg={askMsg({ requestId: "req-b" })} onRespond={vi.fn()} livePrompt />);
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+  });
+});
+
+describe("PermissionCard 过期判据 _askUserExpiresAt", () => {
+  test("有 _askUserExpiresAt 且已过期 → 不自动弹，优先于新鲜 ts", () => {
+    render(
+      <PermissionCard
+        msg={askMsg({
+          requestId: "req-exp-abs",
+          ts: Date.now(),
+          _askUserExpiresAt: Date.now() - 1000,
+        })}
+        onRespond={vi.fn()}
+        livePrompt
+      />,
+    );
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.getByText("已过期")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "回答" }));
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+  });
+
+  test("无 _askUserExpiresAt 的旧数据退回 ts+TTL", () => {
+    render(
+      <PermissionCard
+        msg={askMsg({
+          requestId: "req-old-ttl",
+          ts: Date.now() - PENDING_PERMISSION_TTL_MS - 60_000,
+        })}
+        onRespond={vi.fn()}
+        livePrompt
+      />,
+    );
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.getByTestId("permission-card")).toBeInTheDocument();
+  });
+
+  test("_askUserExpiresAt 未到点 → 即使 ts 超过 TTL 也不当过期", () => {
+    render(
+      <PermissionCard
+        msg={askMsg({
+          requestId: "req-exp-future",
+          _detachedAskUser: true,
+          ts: Date.now() - DETACHED_ASK_USER_TTL_MS - 60_000,
+          _askUserExpiresAt: Date.now() + 60_000,
+        })}
+        onRespond={vi.fn()}
+        livePrompt
+      />,
+    );
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+  });
+
+  test("历史过期卡只读展示，不提供作答按钮", () => {
+    render(
+      <PermissionCard
+        msg={askMsg({
+          requestId: "req-hist-exp",
+          ts: Date.now(),
+          _askUserExpiresAt: Date.now() - 1000,
+        })}
+        onRespond={vi.fn()}
+        livePrompt={false}
+      />,
+    );
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.getByText("已过期")).toBeInTheDocument();
+    expect(screen.getByText("提问已过期，无法再作答")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "回答" })).toBeNull();
   });
 });
 

@@ -11,23 +11,35 @@
 //     per-agent 锁,与 gateway(UI PUT)/ mcp-memory 双进程写互斥。
 //   - 幂等懒迁移:老 §-blob 首次被读到时(首行非 marker)拆成文件 + 建索引 + 备份原 blob。
 //   - 读侧对账(reconcileIndex)是权威自愈:索引缺文件补行、行指向不存在文件剔除。
-//   - 注入(renderForInjection)逐行 scanMemoryContent 过滤 + 超 cap 截断——模型直写文件
-//     会绕过写侧校验,读侧扫描才是安全权威兜底。
+//   - 注入有两条路径,语义刻意不同:
+//       renderForInjection          — 带锁 + ensureMigrated + reconcileIndex(会写盘),
+//         给 API/对账/测试用,自愈索引。
+//       renderForInjectionReadonly  — 纯只读,不锁、不写、不对账;prompt 热路径必须走这条,
+//         缺文件/空库/读失败一律 null,漂移(死链/孤儿)原样容忍。
+//     两条都逐行 scanMemoryContent 过滤 + 超 cap 截断。模型直写文件会绕过写侧校验,
+//     读侧扫描才是安全权威兜底。
 
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { basename, join } from 'node:path'
+import {
+  collectIndexContentLines,
+  existingIndexLinesPreserved,
+  isForbiddenAutoMemoryTarget,
+  stampAutoMemoryFrontmatter,
+} from './autoMemoryWrite.js'
 import { acquireKernelFileLock, type KernelFileLock } from './kernelFileLock.js'
+import {
+  MEMORY_FILE_RE,
+  normalizeMemoryEol,
+  parseMemoryFrontmatter,
+} from './memoryFrontmatter.js'
 import { acquireFileLock, scanMemoryContent } from './memoryShared.js'
+import { isMemoryExpired, memoryCalendarDate } from './memoryTtl.js'
 import { paths } from './paths.js'
 
 export const MEMDIR_INDEX_MARKER = '<!-- oc-memdir-index v1 -->'
-
-// 记忆文件名白名单:首字母数字,其后 [A-Za-z0-9_-] 最多 63 个,以 .md 结尾。
-// - 禁止 `.`(除 .md 后缀)→ 备份文件 `MEMORY.md.pre-memdir.bak` 天然不匹配;
-// - 禁止 `/`、`..` → 防路径穿越(与 path.basename 双保险)。
-// API 层与写侧共用此正则拒绝非法名。
-export const MEMORY_FILE_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}\.md$/
+export { MEMORY_FILE_RE, parseMemoryFrontmatter } from './memoryFrontmatter.js'
 
 // 单条记忆的四类语义:user(用户画像,一般走 user.md)/ feedback(纠偏)/
 // project(项目/工作笔记)/ reference(参考资料)。type 只是提示,解析容错时兜底为 project。
@@ -38,9 +50,15 @@ export interface MemoryFileMeta {
   name: string // frontmatter.name,缺失兜底为去后缀文件名
   description: string // frontmatter.description,缺失兜底为正文首个非空行
   type: string // frontmatter.type,缺失兜底为 'project'
+  expires?: string // frontmatter.expires,缺省表示永不过期
+  source?: string // frontmatter.source,auto 写入会盖 source: auto
   mtimeMs: number
   size: number
 }
+
+export type MemoryAutoAddResult =
+  | { ok: true; created: string[] }
+  | { ok: false; error: string; reason: 'exists' | 'forbidden' | 'index_mutated' | 'invalid' }
 
 type WriteResult =
   | { ok: true; version: string }
@@ -81,10 +99,7 @@ function sha16(s: string): string {
   return createHash('sha256').update(s).digest('hex').slice(0, 16)
 }
 
-/** 归一化换行,去掉 \r。frontmatter/索引解析统一按 \n 处理。 */
-function normalizeEol(s: string): string {
-  return s.replace(/\r\n/g, '\n')
-}
+const normalizeEol = normalizeMemoryEol
 
 /** 正文首个非空行(用作 description 兜底)。 */
 function firstNonEmptyLine(body: string): string {
@@ -95,39 +110,8 @@ function firstNonEmptyLine(body: string): string {
   return ''
 }
 
-/**
- * 容错解析 frontmatter。规则:
- *  - 文本必须以 `---` 独占首行开头,且后面有一行 `---` 闭合,才认定有 frontmatter;
- *    否则整段视为正文(容错:模型可能漏写 frontmatter)。
- *  - frontmatter 内按 `key: value` 逐行提取(手写解析,不用 YAML —— 避免 malformed
- *    内容抛异常;key 大小写不敏感,value 去两端引号)。
- */
-function parseFrontmatter(raw: string): { fm: Record<string, string>; body: string } {
-  const lines = normalizeEol(raw).split('\n')
-  if (lines[0]?.trim() !== '---') return { fm: {}, body: normalizeEol(raw) }
-  let end = -1
-  for (let i = 1; i < lines.length; i++) {
-    if (lines[i].trim() === '---') {
-      end = i
-      break
-    }
-  }
-  if (end === -1) return { fm: {}, body: normalizeEol(raw) } // 无闭合 → 容错当正文
-  const fm: Record<string, string> = {}
-  for (let i = 1; i < end; i++) {
-    const m = lines[i].match(/^([A-Za-z_][A-Za-z0-9_-]*)\s*:\s*(.*)$/)
-    if (!m) continue
-    let v = m[2].trim()
-    if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
-      v = v.slice(1, -1)
-    }
-    fm[m[1].toLowerCase()] = v
-  }
-  const body = lines
-    .slice(end + 1)
-    .join('\n')
-    .replace(/^\n+/, '')
-  return { fm, body }
+function ttlWarn(message: string): void {
+  process.stderr.write(`[memory-ttl] ${message}\n`)
 }
 
 /** ascii 化 kebab slug(中文标题会被清空 → 由调用方兜底 'mem')。 */
@@ -429,12 +413,14 @@ export class MemoryDir {
       } catch {
         continue
       }
-      const { fm, body } = parseFrontmatter(raw)
+      const { fm, body } = parseMemoryFrontmatter(raw)
       out.push({
         file: name,
         name: fm.name || name.replace(/\.md$/i, ''),
         description: fm.description || firstNonEmptyLine(body),
         type: fm.type || 'project',
+        ...(fm.expires ? { expires: fm.expires } : {}),
+        ...(fm.source ? { source: fm.source } : {}),
         mtimeMs: st.mtimeMs,
         size: st.size,
       })
@@ -680,6 +666,143 @@ export class MemoryDir {
     }
   }
 
+  /**
+   * ADD-only auto write: create files that do not exist and append index lines.
+   * Existing files are refused. Existing index lines must survive unchanged;
+   * otherwise this write is rolled back. Never calls reconcileIndex (that can
+   * drop or rewrite human-authored rows).
+   *
+   * Invariant: every file that lands on disk is stamped with `source: auto`
+   * and a valid `expires` (default today+30). Callers cannot skip the TTL gate
+   * by omitting frontmatter. See stampAutoMemoryFrontmatter for the write-side
+   * tighten / retrieval-side loosen asymmetry.
+   */
+  async applyAutoAdds(input: {
+    creates: readonly { file: string; content: string }[]
+    /** Test seam: freeze the TTL calendar day (YYYY-MM-DD). */
+    today?: string
+  }): Promise<MemoryAutoAddResult> {
+    const today = input.today ?? memoryCalendarDate()
+    const seen = new Set<string>()
+    const stampedCreates: Array<{ file: string; content: string }> = []
+    for (const row of input.creates) {
+      if (!MEMORY_FILE_RE.test(row.file) || basename(row.file) !== row.file) {
+        return { ok: false, error: `invalid memory file name: ${row.file}`, reason: 'invalid' }
+      }
+      if (isForbiddenAutoMemoryTarget(row.file, this.agentId)) {
+        return { ok: false, error: `auto write refused user.md: ${row.file}`, reason: 'forbidden' }
+      }
+      if (seen.has(row.file)) {
+        return { ok: false, error: `duplicate memory file: ${row.file}`, reason: 'invalid' }
+      }
+      seen.add(row.file)
+      const content = stampAutoMemoryFrontmatter(row.content, today, {
+        warn: ttlWarn,
+        context: row.file,
+        fallbackName: row.file.replace(/\.md$/i, ''),
+      })
+      const scan = scanMemoryContent(content)
+      if (!scan.ok) return { ok: false, error: `rejected: ${scan.reason}`, reason: 'invalid' }
+      stampedCreates.push({ file: row.file, content })
+    }
+    if (seen.size === 0) return { ok: true, created: [] }
+
+    const barrier = await acquireKernelFileLock(
+      paths.agentMemoryBarrier(this.agentId),
+      5_000,
+      'exclusive',
+    )
+    try {
+      return await this.withFileLock(async () => {
+        await this.recoverBatchLocked()
+        await this.ensureMigratedLocked()
+        const accepted: Array<{ file: string; content: string }> = []
+        for (const row of stampedCreates) {
+          const full = join(this.dirPath(), row.file)
+          if (isForbiddenAutoMemoryTarget(full, this.agentId) || full === paths.sharedUserMd) {
+            return {
+              ok: false as const,
+              error: `auto write refused user.md: ${row.file}`,
+              reason: 'forbidden' as const,
+            }
+          }
+          try {
+            await stat(full)
+            return {
+              ok: false as const,
+              error: `auto write refused existing file: ${row.file}`,
+              reason: 'exists' as const,
+            }
+          } catch (err) {
+            if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
+          }
+          accepted.push(row)
+        }
+
+        let indexOriginal = `${MEMDIR_INDEX_MARKER}\n`
+        try {
+          indexOriginal = normalizeEol(await readFile(this.indexPath(), 'utf-8'))
+        } catch {
+          // Missing index: start from the marker only. Do not reconcile.
+        }
+        if (!indexOriginal.startsWith(MEMDIR_INDEX_MARKER)) {
+          indexOriginal = `${MEMDIR_INDEX_MARKER}\n${indexOriginal.replace(/^\n+/, '')}`
+        }
+        const originalLines = collectIndexContentLines(indexOriginal, MEMDIR_INDEX_MARKER)
+        const appended: string[] = []
+        for (const row of accepted) {
+          const { fm, body } = parseMemoryFrontmatter(row.content)
+          appended.push(
+            this.indexRow({
+              file: row.file,
+              name: fm.name || row.file.replace(/\.md$/i, ''),
+              description: fm.description || firstNonEmptyLine(body),
+            }),
+          )
+        }
+        const base = indexOriginal.endsWith('\n') ? indexOriginal : `${indexOriginal}\n`
+        const nextIndex = `${base}${appended.join('\n')}\n`
+        const nextLines = collectIndexContentLines(nextIndex, MEMDIR_INDEX_MARKER)
+        if (!existingIndexLinesPreserved(originalLines, nextLines)) {
+          return {
+            ok: false as const,
+            error: 'auto write refused: existing index lines would change',
+            reason: 'index_mutated' as const,
+          }
+        }
+
+        const written: string[] = []
+        try {
+          for (const row of accepted) {
+            await this.atomicWrite(join(this.dirPath(), row.file), row.content)
+            written.push(row.file)
+          }
+          await this.writeIndexText(nextIndex)
+          const after = collectIndexContentLines(
+            normalizeEol(await readFile(this.indexPath(), 'utf-8')),
+            MEMDIR_INDEX_MARKER,
+          )
+          if (!existingIndexLinesPreserved(originalLines, after)) {
+            throw new Error('index_mutated')
+          }
+          return { ok: true as const, created: written }
+        } catch (err) {
+          for (const file of written) {
+            await rm(join(this.dirPath(), file), { force: true }).catch(() => {})
+          }
+          await this.writeIndexText(indexOriginal).catch(() => {})
+          return {
+            ok: false as const,
+            error: err instanceof Error ? err.message : String(err),
+            reason: 'index_mutated' as const,
+          }
+        }
+      })
+    } finally {
+      await barrier.release().catch(() => {})
+    }
+  }
+
   // ── 索引对账 ────────────────────────────────────────────────────────
 
   /** 公开入口:锁内先 ensureMigrated 再双向对账,返回索引全文。 */
@@ -756,30 +879,104 @@ export class MemoryDir {
   }
 
   /**
-   * 渲染索引供 system prompt 注入:
-   *  ensureMigrated → reconcileIndex → 逐行 scanMemoryContent 过滤(剔注入行)→
-   *  超 maxChars 截断(附提示行)。marker 本身不注入(内部不变量)。
-   *  索引为空(仅 marker、无有效行)→ 返回 null(由 gateway 决定是否仍注入指令段)。
+   * Drop index rows whose target file has a valid `expires` before `today`.
+   * Unreadable / missing files stay (readonly drift tolerance). Invalid
+   * expires stay (fail-open) and emit a warn.
    */
-  async renderForInjection(maxChars: number): Promise<string | null> {
+  private async dropExpiredIndexLines(indexText: string, today: string): Promise<string> {
+    const out: string[] = []
+    for (const line of indexText.split('\n')) {
+      const match = line.match(/\]\(memory\/([^)]+)\)/)
+      if (!match) {
+        out.push(line)
+        continue
+      }
+      const file = match[1]
+      if (!MEMORY_FILE_RE.test(file)) {
+        out.push(line)
+        continue
+      }
+      try {
+        const raw = await readFile(join(this.dirPath(), file), 'utf-8')
+        const { fm } = parseMemoryFrontmatter(raw)
+        if (isMemoryExpired(fm.expires, today, ttlWarn, file)) continue
+      } catch {
+        // Keep dead links / unreadable files. Expiry only applies when we can read.
+      }
+      out.push(line)
+    }
+    return out.join('\n')
+  }
+
+  /**
+   * 把索引文本滤成可注入正文:跳过 marker/空行,逐行 scan,超 cap 按行边界截断。
+   * 两条注入路径共用,保证截断/扫描口径一致。
+   */
+  private formatIndexLinesForInjection(
+    indexText: string,
+    maxChars: number,
+    maxLines: number,
+  ): string | null {
+    const kept: string[] = []
+    for (const line of indexText.split('\n')) {
+      const t = line.trim()
+      if (t === '' || t === MEMDIR_INDEX_MARKER) continue
+      if (!scanMemoryContent(line).ok) continue // 读侧权威扫描:剔除注入行
+      kept.push(line)
+    }
+    if (kept.length === 0) return null
+    const notice = '\n…（索引已截断，用 `oc-memory core-search` 查完整列表）'
+    const lineLimited = kept.length > maxLines ? kept.slice(0, maxLines) : kept
+    let result = lineLimited.join('\n')
+    if (kept.length <= maxLines && result.length <= maxChars) return result
+    const budget = Math.max(0, maxChars - notice.length)
+    return this.truncateAtLine(lineLimited, budget) + notice
+  }
+
+  /**
+   * 渲染索引供 system prompt 注入(带锁自愈路径):
+   *  ensureMigrated → reconcileIndex → 滤行/截断。会写回索引、空库会落 marker。
+   *  **prompt 热路径不要用这个**;生产注入走 renderForInjectionReadonly。
+   *  本方法语义保持给 API/对账/既有测试:调用后磁盘可能变化。
+   *
+   *  默认 200 行 / 由调用方传入的字符上限对齐 Claude Code MEMORY.md
+   *  (200 行或 25 KB,先到为准)。
+   */
+  async renderForInjection(
+    maxChars: number,
+    maxLines = 200,
+    opts?: { today?: string },
+  ): Promise<string | null> {
     return this.withSharedBarrier(async () => {
       await this.ensureMigratedLocked()
       const indexText = await this.reconcileIndexLocked()
-      const kept: string[] = []
-      for (const line of indexText.split('\n')) {
-        const t = line.trim()
-        if (t === '' || t === MEMDIR_INDEX_MARKER) continue
-        if (!scanMemoryContent(line).ok) continue // 读侧权威扫描:剔除注入行
-        kept.push(line)
-      }
-      if (kept.length === 0) return null
-      let result = kept.join('\n')
-      if (result.length > maxChars) {
-        const notice = '\n…（记忆索引较长已截断,按需 Read 对应记忆文件查看完整内容）'
-        const budget = Math.max(0, maxChars - notice.length)
-        result = this.truncateAtLine(kept, budget) + notice
-      }
-      return result
+      const today = opts?.today ?? memoryCalendarDate()
+      const filtered = await this.dropExpiredIndexLines(indexText, today)
+      return this.formatIndexLinesForInjection(filtered, maxChars, maxLines)
     })
+  }
+
+  /**
+   * prompt 热路径专用:纯只读渲染索引。
+   *  - 不取共享屏障 / 文件锁,不 ensureMigrated,不 reconcileIndex,不写盘。
+   *  - 索引文件缺失、为空、仅 marker、有效行全被 scan 剔除 → null。
+   *  - 漂移容忍:死链行照注,memory/ 里的孤儿文件不补进索引(因为根本不对账)。
+   *  - 任何读/解析异常(含并发写撕成半截导致 readFile 抛错)→ null,不抛给调用方。
+   *    MemoryDir 自己的写用 temp+rename,读者看到的是完整旧文件或完整新文件;
+   *    引擎原生 Write/Edit 可能就地覆盖,那时宁可本轮不注入也不能阻塞 turn。
+   */
+  async renderForInjectionReadonly(
+    maxChars: number,
+    maxLines = 200,
+    opts?: { today?: string },
+  ): Promise<string | null> {
+    try {
+      const raw = await readFile(this.indexPath(), 'utf-8')
+      const today = opts?.today ?? memoryCalendarDate()
+      const filtered = await this.dropExpiredIndexLines(normalizeEol(raw), today)
+      return this.formatIndexLinesForInjection(filtered, maxChars, maxLines)
+    } catch {
+      return null
+    }
   }
 }

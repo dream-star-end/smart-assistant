@@ -82,6 +82,17 @@ describe('bridge API allowlist', () => {
       matchCommercialContainerApiProxy('/api/agents/main/skills/foo', 'PUT')?.label,
       '/api/agents/:id/skills/:name',
     )
+    // Cursor MCP ask_user — container agent → Web choice cards. POST only.
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/agents/main/ask-user', 'POST')?.label,
+      '/api/agents/:id/ask-user',
+    )
+    assert.equal(matchCommercialContainerApiProxy('/api/agents/main/ask-user', 'GET'), null)
+    assert.equal(matchCommercialContainerApiProxy('/api/agents/main/ask-user', 'PUT'), null)
+    assert.equal(matchCommercialContainerApiProxy('/api/agents/a/ask-user', 'POST')?.label, '/api/agents/:id/ask-user')
+    assert.equal(matchCommercialContainerApiProxy('/api/agents/main./ask-user', 'POST'), null)
+    assert.equal(matchCommercialContainerApiProxy('/api/agents/ma%2Fin/ask-user', 'POST'), null)
+    assert.equal(matchCommercialContainerApiProxy('/api/agents/main/ask-user/extra', 'POST'), null)
     // User-level shared skill library (agentId-less) — proxied into the user's container.
     assert.equal(matchCommercialContainerApiProxy('/api/skills', 'GET')?.label, '/api/skills')
     assert.equal(

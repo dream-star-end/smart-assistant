@@ -68,6 +68,12 @@ import {
   postJsonToGateway,
   readGatewayToken,
 } from './gatewayClient.js'
+import {
+  askUserHttpTimeoutMs,
+  askUserToolPostedFallback,
+  askUserToolResultFromGateway,
+  remainingAskUserWaitMs,
+} from './askUserClient.js'
 import { type ReminderJobView, formatReminderList } from './reminderFormat.js'
 import { filterSkillEvalTools, isSkillEvalBlockedTool } from './skillEvalToolPolicy.js'
 // Tool 定义(TOOLS / SKILL_PROPOSE_TOOL)抽到 ./toolDefs.ts(纯数据模块,无副作用),
@@ -754,14 +760,12 @@ async function handleDelegateTasks(args: { tasks?: unknown }) {
  */
 const DELEGATE_CLIENT_TIMEOUT_MS = 2 * 60 * 60_000 + 60_000
 
-/** ask_user 已改为非阻塞:网关登记问题后立即 200,本调用必须远低于 Cursor MCP
- *  的 60s tools/call 硬超时。15s 只覆盖登记往返,不再等人作答。 */
-const ASK_USER_POST_TIMEOUT_MS = 15_000
-
 /**
- * 引擎交互提问桥(仅 Cursor):把选择题 POST 给网关后立即返回。网关把选择卡
- * 挂到会话上;用户作答会作为下一条普通用户消息到达。禁止轮询或对同一问题
- * 再次调用。子 agent / 非 Cursor 直接短路。
+ * 引擎交互提问桥(仅 Cursor):把选择题 POST 给网关,在 55s 窗口内阻塞等回答;
+ * 撞上 Cursor MCP ~60s tools/call 硬墙之前主动降级成 detached 卡片。窗口内
+ * 拿到的答案作为本工具返回值,模型继续本回合;超时则问题已展示,立刻结束本
+ * 回合,答案走下一条普通用户消息。禁止轮询或对同一问题再次调用。子 agent /
+ * 非 Cursor 直接短路。HTTP 失败必须返回「已登记/请结束回合」,不得抛异常。
  */
 async function handleAskUser(args: { questions?: unknown } | undefined | null) {
   const questions = normalizeAskUserQuestions(args?.questions)
@@ -786,36 +790,30 @@ async function handleAskUser(args: { questions?: unknown } | undefined | null) {
   }
   const sessionKey = process.env.OPENCLAUDE_SESSION_KEY || ''
   if (!sessionKey) return toolError('ask_user unavailable: no session key in environment')
+  const startedAt = Date.now()
+  const waitMs = remainingAskUserWaitMs(startedAt)
   const gatewayPort = process.env.OPENCLAUDE_GATEWAY_PORT || '18789'
   const gatewayToken = readGatewayToken()
-  const res = await postJsonToGateway(
-    `http://127.0.0.1:${gatewayPort}/api/agents/${encodeURIComponent(AGENT_ID)}/ask-user`,
-    {
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${gatewayToken}`,
-        'x-delegation-depth': String(DELEGATION_DEPTH),
+  try {
+    const res = await postJsonToGateway(
+      `http://127.0.0.1:${gatewayPort}/api/agents/${encodeURIComponent(AGENT_ID)}/ask-user`,
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${gatewayToken}`,
+          'x-delegation-depth': String(DELEGATION_DEPTH),
+        },
+        body: JSON.stringify({ sessionKey, questions, waitMs }),
+        timeoutMs: askUserHttpTimeoutMs(waitMs),
       },
-      body: JSON.stringify({ sessionKey, questions }),
-      timeoutMs: ASK_USER_POST_TIMEOUT_MS,
-    },
-  )
-  if (res.statusCode === 409) {
-    return toolOk(
-      JSON.stringify({
-        status: 'skipped',
-        reason:
-          'no active turn for interactive questions — present numbered options as plain text and end the turn',
-      }),
     )
-  }
-  if (res.statusCode < 200 || res.statusCode >= 300) {
-    return toolError(
-      `ask_user failed (HTTP ${res.statusCode}): ${res.body.slice(0, 300)}`,
+    return askUserToolResultFromGateway(res)
+  } catch (err: any) {
+    process.stderr.write(
+      `[mcp-memory] ask_user gateway call failed: ${describeDelegateTransportError(err)}\n`,
     )
+    return askUserToolPostedFallback()
   }
-  // 网关立即回 {status:'posted',...}:问题已展示,本回合必须结束,答案走下一条用户消息。
-  return toolOk(res.body)
 }
 
 /**

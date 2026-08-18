@@ -3,8 +3,10 @@
 //
 // Two tables:
 //   sessions_meta (id PRIMARY KEY, agent_id, channel, peer_id, started_at, last_at, title)
-//   sessions_fts  (FTS5 virtual): session_id, turn_idx, role, content
-//     — tokenize unicode61 remove_diacritics 2 (Chinese + English tolerant)
+//   sessions_fts  (FTS5 virtual): session_id, turn_idx, role, content, content_fts
+//     — tokenize unicode61 remove_diacritics 2
+//     — content is the original turn text (snippet col 3, loadSessionTurns)
+//     — content_fts is CJK Segmenter words + char bigrams (see ftsQuery.ts)
 //
 // On every result event from subprocessRunner we insert the (user_text,
 // assistant_text) for the turn into sessions_fts. Queries use MATCH and
@@ -33,7 +35,8 @@ import {
   planSpillOverflow,
   type SpillChunkPlan,
 } from './clientSessionsPlan.js'
-import { literalFtsQuery } from './ftsQuery.js'
+import { cjkFtsColumn, literalFtsQuery } from './ftsQuery.js'
+import { migrateSessionsFtsCjk, registerFtsCjkFunctions } from './ftsCjkMigrate.js'
 import { paths } from './paths.js'
 // wechat_bindings 是 master 六表之一,其 SQLite 实现在 wechatBindings.ts(靠近 wechat 专用
 // helper),这里 import 进来组合成完整的 sqliteBackend。函数声明,循环 import 下实例化即就绪。
@@ -70,6 +73,7 @@ export async function getSessionsDb(): Promise<Database.Database> {
   // this aligned with sessionsMigrate.ts.
   db.pragma('busy_timeout = 10000')
   db.pragma('journal_mode = WAL')
+  registerFtsCjkFunctions(db)
   db.exec(`
     CREATE TABLE IF NOT EXISTS sessions_meta (
       id TEXT PRIMARY KEY,
@@ -114,6 +118,7 @@ export async function getSessionsDb(): Promise<Database.Database> {
       turn_idx UNINDEXED,
       role UNINDEXED,
       content,
+      content_fts,
       tokenize = 'unicode61 remove_diacritics 2'
     );
 
@@ -206,6 +211,10 @@ export async function getSessionsDb(): Promise<Database.Database> {
   // Use process.on (not once) so that closeSessionsDb() + reopen still works,
   // but the guard `if (_db)` makes repeated calls idempotent.
   process.on('exit', _onExit)
+
+  // CJK FTS rebuild (idempotent). Existing DBs still have the 4-column
+  // unicode61 schema from CREATE IF NOT EXISTS; this swaps in content_fts.
+  migrateSessionsFtsCjk(db)
 
   // Clean up orphaned FTS records (sessions_fts rows with no matching sessions_meta)
   try {
@@ -1150,10 +1159,10 @@ export async function indexTurn(
 ): Promise<void> {
   const db = await getSessionsDb()
   const stmt = db.prepare(
-    'INSERT INTO sessions_fts (session_id, turn_idx, role, content) VALUES (?, ?, ?, ?)',
+    'INSERT INTO sessions_fts (session_id, turn_idx, role, content, content_fts) VALUES (?, ?, ?, ?, ?)',
   )
-  if (userText) stmt.run(sessionId, turnIdx, 'user', userText)
-  if (assistantText) stmt.run(sessionId, turnIdx, 'assistant', assistantText)
+  if (userText) stmt.run(sessionId, turnIdx, 'user', userText, cjkFtsColumn(userText))
+  if (assistantText) stmt.run(sessionId, turnIdx, 'assistant', assistantText, cjkFtsColumn(assistantText))
 }
 
 // Returns the maximum turn_idx already persisted in the FTS index across

@@ -521,6 +521,16 @@ oc_hotcfg_finalize_release() {
   local ccb_out ccb_key
   ccb_out="$(oc_hotcfg_build_ccb_dist "$staging" "$prev")" || return 1
   bunver="${ccb_out%%$'\t'*}"; ccb_key="${ccb_out##*$'\t'}"
+  # oc-memory CLI:预编译单文件 CJS,沙箱 wrapper 可 exec node 而非 npx+tsx(~7s 冷启动)。
+  # native addon 保持 external,从本 release 的 node_modules 解析。脚本在源树则 fail-loud
+  # (缺产物会静默回落 7s 路径);旧源无脚本则跳过,保持回滚兼容。
+  if [ -f "$staging/packages/mcp-memory/scripts/build-oc-memory-cli.sh" ]; then
+    oc_hotcfg__log "build oc-memory CLI bundle"
+    ( cd "$staging" && bash packages/mcp-memory/scripts/build-oc-memory-cli.sh >&2 ) \
+      || { oc_hotcfg__die "oc-memory CLI bundle failed"; return 1; }
+    [ -s "$staging/packages/mcp-memory/dist/oc-memory.cjs" ] \
+      || { oc_hotcfg__die "oc-memory CLI bundle missing after build"; return 1; }
+  fi
   # 产物阶段敏感扫描(node_modules 可能夹带 .pem 测试夹具 → 只扫源码顶层,node_modules 排除以免误杀依赖自带证书夹具)
   # 说明:敏感扫描针对**源码树被误纳入凭据**,node_modules 里第三方包自带的 *.pem 测试夹具非本仓凭据,
   # 扫描 node_modules 会大量误报;故 release 敏感扫描排除 node_modules(bundle 无 node_modules 不受影响)。

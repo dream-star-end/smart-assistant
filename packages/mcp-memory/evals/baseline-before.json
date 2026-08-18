@@ -1,0 +1,764 @@
+{
+  "protocol": {
+    "fixtureVersion": "2026-08-17.1",
+    "protocolVersion": "1.0.0",
+    "agentId": "eval-core",
+    "limit": 20,
+    "topK": 3,
+    "semanticRanker": "disabled",
+    "sut": "packages/mcp-memory/src/memoryTools.ts#handleCoreSearch"
+  },
+  "corpus": {
+    "files": 15,
+    "memoryFiles": 14,
+    "bytes": 13645,
+    "home": "(removed)"
+  },
+  "metrics": {
+    "precisionAt3": 0.20833333333333334,
+    "mrr": 0.1875,
+    "noMatchAccuracy": 0.5,
+    "avgHits": 6.666666666666667,
+    "avgHitsCap": 6,
+    "latencyMs": {
+      "p50": 345,
+      "p95": 444,
+      "mean": 350.1,
+      "max": 471
+    },
+    "hitCases": 24,
+    "noMatchCases": 6,
+    "casesPassed": 7,
+    "casesTotal": 30
+  },
+  "gates": {
+    "precisionAt3": false,
+    "noMatchAccuracy": false,
+    "avgHits": false
+  },
+  "pass": false,
+  "cases": [
+    {
+      "id": "R01",
+      "query": "V5 商业版 验证流程",
+      "category": "interference",
+      "expectKind": "hit",
+      "gotKind": "hit",
+      "total": 14,
+      "ranked": [
+        "feedback-commercial-verify.md",
+        "release-cedar-q-router.md",
+        "release-semantic-recall.md",
+        "release-billing-meter.md",
+        "helixforge-tpu-ocr-tuning.md",
+        "helixforge-tpu-ocr.md",
+        "helixforge-gpu-capacity.md",
+        "helixforge-tpu-ocr-batch.md",
+        "novapulse-h3-gpu-queue.md",
+        "novapulse-h3-runtime.md",
+        "release-ask-user-card.md",
+        "release-brook-v4-pro.md",
+        "release-client-error.md",
+        "release-glm53-zai.md"
+      ],
+      "top1": "feedback-commercial-verify.md",
+      "pAt3": 0,
+      "mrr": 0,
+      "ok": false,
+      "reasons": [
+        "maxHits 3 exceeded (got 14)"
+      ],
+      "latencyMs": 471
+    },
+    {
+      "id": "R02",
+      "query": "今天天气怎么样",
+      "category": "unrelated",
+      "expectKind": "no_match",
+      "gotKind": "hit",
+      "total": 1,
+      "ranked": [
+        "novapulse-h3-runtime.md"
+      ],
+      "top1": "novapulse-h3-runtime.md",
+      "pAt3": null,
+      "mrr": null,
+      "ok": false,
+      "reasons": [
+        "expected no_match, got Found 1 top1=novapulse-h3-runtime.md"
+      ],
+      "latencyMs": 354
+    },
+    {
+      "id": "R03",
+      "query": "glm 5.3 模型繁忙",
+      "category": "interference",
+      "expectKind": "hit",
+      "gotKind": "hit",
+      "total": 10,
+      "ranked": [
+        "release-glm53-zai.md",
+        "helixforge-tpu-ocr.md",
+        "novapulse-h3-runtime.md",
+        "release-brook-v4-pro.md",
+        "novapulse-h3-gpu-queue.md",
+        "release-cedar-q-router.md",
+        "release-ask-user-card.md",
+        "release-billing-meter.md",
+        "release-client-error.md",
+        "release-semantic-recall.md"
+      ],
+      "top1": "release-glm53-zai.md",
+      "pAt3": 0,
+      "mrr": 0,
+      "ok": false,
+      "reasons": [
+        "maxHits 4 exceeded (got 10)"
+      ],
+      "latencyMs": 376
+    },
+    {
+      "id": "R04",
+      "query": "GLM-5.3 Z.AI 上线 Release A Release B",
+      "category": "interference",
+      "expectKind": "hit",
+      "gotKind": "hit",
+      "total": 10,
+      "ranked": [
+        "release-glm53-zai.md",
+        "novapulse-h3-runtime.md",
+        "release-brook-v4-pro.md",
+        "release-cedar-q-router.md",
+        "release-ask-user-card.md",
+        "release-billing-meter.md",
+        "release-client-error.md",
+        "release-semantic-recall.md",
+        "feedback-commercial-verify.md",
+        "helixforge-tpu-ocr.md"
+      ],
+      "top1": "release-glm53-zai.md",
+      "pAt3": 0,
+      "mrr": 0,
+      "ok": false,
+      "reasons": [
+        "maxHits 4 exceeded (got 10)"
+      ],
+      "latencyMs": 418
+    },
+    {
+      "id": "R05",
+      "query": "dashi-taskboard 任务面板",
+      "category": "unrelated",
+      "expectKind": "no_match",
+      "gotKind": "hit",
+      "total": 5,
+      "ranked": [
+        "novapulse-h3-runtime.md",
+        "novapulse-h3-gpu-queue.md",
+        "release-billing-meter.md",
+        "helixforge-gpu-capacity.md",
+        "helixforge-tpu-ocr-batch.md"
+      ],
+      "top1": "novapulse-h3-runtime.md",
+      "pAt3": null,
+      "mrr": null,
+      "ok": false,
+      "reasons": [
+        "expected no_match, got Found 5 top1=novapulse-h3-runtime.md"
+      ],
+      "latencyMs": 334
+    },
+    {
+      "id": "R06",
+      "query": "记忆功能优化",
+      "category": "fuzzy",
+      "expectKind": "hit",
+      "gotKind": "hit",
+      "total": 9,
+      "ranked": [
+        "release-semantic-recall.md",
+        "feedback-commercial-verify.md",
+        "novapulse-h3-runtime.md",
+        "release-ask-user-card.md",
+        "release-billing-meter.md",
+        "release-brook-v4-pro.md",
+        "release-cedar-q-router.md",
+        "release-client-error.md",
+        "release-glm53-zai.md"
+      ],
+      "top1": "release-semantic-recall.md",
+      "pAt3": 0,
+      "mrr": 0,
+      "ok": false,
+      "reasons": [
+        "maxHits 2 exceeded (got 9)"
+      ],
+      "latencyMs": 444
+    },
+    {
+      "id": "R07",
+      "query": "HelixForge TPU OCR",
+      "category": "fuzzy",
+      "expectKind": "hit",
+      "gotKind": "hit",
+      "total": 10,
+      "ranked": [
+        "helixforge-gpu-capacity.md",
+        "helixforge-tpu-ocr-batch.md",
+        "helixforge-tpu-ocr-tuning.md",
+        "helixforge-tpu-ocr.md",
+        "novapulse-h3-gpu-queue.md",
+        "novapulse-h3-runtime.md",
+        "release-billing-meter.md",
+        "release-client-error.md",
+        "feedback-commercial-verify.md",
+        "release-glm53-zai.md"
+      ],
+      "top1": "helixforge-gpu-capacity.md",
+      "pAt3": 0,
+      "mrr": 0,
+      "ok": false,
+      "reasons": [
+        "maxHits 8 exceeded (got 10)"
+      ],
+      "latencyMs": 342
+    },
+    {
+      "id": "R08",
+      "query": "Opus 管理 Grok 执行",
+      "category": "fuzzy",
+      "expectKind": "hit",
+      "gotKind": "hit",
+      "total": 3,
+      "ranked": [
+        "feedback-commercial-verify.md",
+        "user.md",
+        "release-ask-user-card.md"
+      ],
+      "top1": "feedback-commercial-verify.md",
+      "pAt3": 1,
+      "mrr": 0.5,
+      "ok": false,
+      "reasons": [],
+      "latencyMs": 380
+    },
+    {
+      "id": "E01",
+      "query": "91f3a2c8e017",
+      "category": "exact",
+      "expectKind": "hit",
+      "gotKind": "hit",
+      "total": 1,
+      "ranked": [
+        "release-glm53-zai.md"
+      ],
+      "top1": "release-glm53-zai.md",
+      "pAt3": 1,
+      "mrr": 1,
+      "ok": true,
+      "reasons": [],
+      "latencyMs": 320
+    },
+    {
+      "id": "E02",
+      "query": "bada5510c0de",
+      "category": "exact",
+      "expectKind": "hit",
+      "gotKind": "hit",
+      "total": 1,
+      "ranked": [
+        "release-client-error.md"
+      ],
+      "top1": "release-client-error.md",
+      "pAt3": 1,
+      "mrr": 1,
+      "ok": true,
+      "reasons": [],
+      "latencyMs": 310
+    },
+    {
+      "id": "E03",
+      "query": "Brook-V4 Pro bundle 1842",
+      "category": "exact",
+      "expectKind": "hit",
+      "gotKind": "hit",
+      "total": 14,
+      "ranked": [
+        "release-brook-v4-pro.md",
+        "novapulse-h3-runtime.md",
+        "release-cedar-q-router.md",
+        "release-ask-user-card.md",
+        "release-billing-meter.md",
+        "release-client-error.md",
+        "release-glm53-zai.md",
+        "release-semantic-recall.md",
+        "helixforge-gpu-capacity.md",
+        "helixforge-tpu-ocr-batch.md",
+        "helixforge-tpu-ocr-tuning.md",
+        "helixforge-tpu-ocr.md",
+        "novapulse-h3-gpu-queue.md",
+        "user.md"
+      ],
+      "top1": "release-brook-v4-pro.md",
+      "pAt3": 0,
+      "mrr": 0,
+      "ok": false,
+      "reasons": [
+        "maxHits 3 exceeded (got 14)"
+      ],
+      "latencyMs": 395
+    },
+    {
+      "id": "E04",
+      "query": "RiverOCR 2.11.4",
+      "category": "exact",
+      "expectKind": "hit",
+      "gotKind": "hit",
+      "total": 4,
+      "ranked": [
+        "helixforge-tpu-ocr-tuning.md",
+        "helixforge-tpu-ocr.md",
+        "helixforge-gpu-capacity.md",
+        "helixforge-tpu-ocr-batch.md"
+      ],
+      "top1": "helixforge-tpu-ocr-tuning.md",
+      "pAt3": 0,
+      "mrr": 0,
+      "ok": false,
+      "reasons": [
+        "maxHits 3 exceeded (got 4)"
+      ],
+      "latencyMs": 422
+    },
+    {
+      "id": "E05",
+      "query": "Cedar-Q router",
+      "category": "exact",
+      "expectKind": "hit",
+      "gotKind": "hit",
+      "total": 3,
+      "ranked": [
+        "release-cedar-q-router.md",
+        "novapulse-h3-runtime.md",
+        "release-brook-v4-pro.md"
+      ],
+      "top1": "release-cedar-q-router.md",
+      "pAt3": 0,
+      "mrr": 0,
+      "ok": false,
+      "reasons": [
+        "maxHits 2 exceeded (got 3)"
+      ],
+      "latencyMs": 359
+    },
+    {
+      "id": "E06",
+      "query": "NovaPulse H3 GPU queue",
+      "category": "exact",
+      "expectKind": "hit",
+      "gotKind": "hit",
+      "total": 6,
+      "ranked": [
+        "novapulse-h3-gpu-queue.md",
+        "helixforge-gpu-capacity.md",
+        "helixforge-tpu-ocr-batch.md",
+        "helixforge-tpu-ocr.md",
+        "novapulse-h3-runtime.md",
+        "release-glm53-zai.md"
+      ],
+      "top1": "novapulse-h3-gpu-queue.md",
+      "pAt3": 0,
+      "mrr": 0,
+      "ok": false,
+      "reasons": [
+        "maxHits 3 exceeded (got 6)"
+      ],
+      "latencyMs": 338
+    },
+    {
+      "id": "E07",
+      "query": "ask-user card bundle 2207",
+      "category": "exact",
+      "expectKind": "hit",
+      "gotKind": "hit",
+      "total": 11,
+      "ranked": [
+        "release-ask-user-card.md",
+        "novapulse-h3-runtime.md",
+        "release-client-error.md",
+        "feedback-commercial-verify.md",
+        "helixforge-tpu-ocr-batch.md",
+        "release-billing-meter.md",
+        "release-brook-v4-pro.md",
+        "release-cedar-q-router.md",
+        "release-glm53-zai.md",
+        "release-semantic-recall.md",
+        "user.md"
+      ],
+      "top1": "release-ask-user-card.md",
+      "pAt3": 0,
+      "mrr": 0,
+      "ok": false,
+      "reasons": [
+        "maxHits 3 exceeded (got 11)"
+      ],
+      "latencyMs": 386
+    },
+    {
+      "id": "E08",
+      "query": "0b111109c0de",
+      "category": "exact",
+      "expectKind": "hit",
+      "gotKind": "hit",
+      "total": 1,
+      "ranked": [
+        "release-billing-meter.md"
+      ],
+      "top1": "release-billing-meter.md",
+      "pAt3": 1,
+      "mrr": 1,
+      "ok": true,
+      "reasons": [],
+      "latencyMs": 322
+    },
+    {
+      "id": "F01",
+      "query": "语义记忆召回 上线了吗",
+      "category": "fuzzy",
+      "expectKind": "hit",
+      "gotKind": "hit",
+      "total": 10,
+      "ranked": [
+        "release-semantic-recall.md",
+        "feedback-commercial-verify.md",
+        "helixforge-tpu-ocr-batch.md",
+        "novapulse-h3-runtime.md",
+        "release-ask-user-card.md",
+        "release-billing-meter.md",
+        "release-brook-v4-pro.md",
+        "release-cedar-q-router.md",
+        "release-client-error.md",
+        "release-glm53-zai.md"
+      ],
+      "top1": "release-semantic-recall.md",
+      "pAt3": 0,
+      "mrr": 0,
+      "ok": false,
+      "reasons": [
+        "maxHits 8 exceeded (got 10)"
+      ],
+      "latencyMs": 362
+    },
+    {
+      "id": "F02",
+      "query": "HelixForge TPU OCR 调参笔记",
+      "category": "fuzzy",
+      "expectKind": "hit",
+      "gotKind": "hit",
+      "total": 10,
+      "ranked": [
+        "helixforge-tpu-ocr-tuning.md",
+        "helixforge-tpu-ocr.md",
+        "novapulse-h3-gpu-queue.md",
+        "helixforge-gpu-capacity.md",
+        "helixforge-tpu-ocr-batch.md",
+        "novapulse-h3-runtime.md",
+        "release-billing-meter.md",
+        "release-client-error.md",
+        "release-glm53-zai.md",
+        "feedback-commercial-verify.md"
+      ],
+      "top1": "helixforge-tpu-ocr-tuning.md",
+      "pAt3": 0,
+      "mrr": 0,
+      "ok": false,
+      "reasons": [
+        "maxHits 4 exceeded (got 10)"
+      ],
+      "latencyMs": 361
+    },
+    {
+      "id": "F03",
+      "query": "how we verify commercial risk tiers",
+      "category": "fuzzy",
+      "expectKind": "hit",
+      "gotKind": "hit",
+      "total": 5,
+      "ranked": [
+        "feedback-commercial-verify.md",
+        "helixforge-gpu-capacity.md",
+        "helixforge-tpu-ocr.md",
+        "release-brook-v4-pro.md",
+        "user.md"
+      ],
+      "top1": "feedback-commercial-verify.md",
+      "pAt3": 0,
+      "mrr": 0,
+      "ok": false,
+      "reasons": [
+        "maxHits 3 exceeded (got 5)"
+      ],
+      "latencyMs": 317
+    },
+    {
+      "id": "F04",
+      "query": "who should execute implementation work",
+      "category": "fuzzy",
+      "expectKind": "hit",
+      "gotKind": "hit",
+      "total": 7,
+      "ranked": [
+        "user.md",
+        "feedback-commercial-verify.md",
+        "helixforge-tpu-ocr-batch.md",
+        "helixforge-tpu-ocr.md",
+        "novapulse-h3-gpu-queue.md",
+        "novapulse-h3-runtime.md",
+        "release-ask-user-card.md"
+      ],
+      "top1": "user.md",
+      "pAt3": 0,
+      "mrr": 0,
+      "ok": false,
+      "reasons": [
+        "maxHits 3 exceeded (got 7)"
+      ],
+      "latencyMs": 275
+    },
+    {
+      "id": "F05",
+      "query": "Opus manages Grok executes",
+      "category": "fuzzy",
+      "expectKind": "hit",
+      "gotKind": "hit",
+      "total": 3,
+      "ranked": [
+        "user.md",
+        "feedback-commercial-verify.md",
+        "release-ask-user-card.md"
+      ],
+      "top1": "user.md",
+      "pAt3": 0,
+      "mrr": 0,
+      "ok": false,
+      "reasons": [
+        "maxHits 2 exceeded (got 3)"
+      ],
+      "latencyMs": 256
+    },
+    {
+      "id": "F06",
+      "query": "client error classification",
+      "category": "fuzzy",
+      "expectKind": "hit",
+      "gotKind": "hit",
+      "total": 1,
+      "ranked": [
+        "release-client-error.md"
+      ],
+      "top1": "release-client-error.md",
+      "pAt3": 1,
+      "mrr": 1,
+      "ok": true,
+      "reasons": [],
+      "latencyMs": 283
+    },
+    {
+      "id": "I01",
+      "query": "V5 已上线 功能 优化",
+      "category": "interference",
+      "expectKind": "hit",
+      "gotKind": "hit",
+      "total": 13,
+      "ranked": [
+        "novapulse-h3-runtime.md",
+        "release-ask-user-card.md",
+        "release-billing-meter.md",
+        "release-brook-v4-pro.md",
+        "release-cedar-q-router.md",
+        "release-client-error.md",
+        "release-glm53-zai.md",
+        "release-semantic-recall.md",
+        "feedback-commercial-verify.md",
+        "helixforge-gpu-capacity.md",
+        "helixforge-tpu-ocr-tuning.md",
+        "helixforge-tpu-ocr.md",
+        "novapulse-h3-gpu-queue.md"
+      ],
+      "top1": "novapulse-h3-runtime.md",
+      "pAt3": 0,
+      "mrr": 0,
+      "ok": false,
+      "reasons": [
+        "maxHits 8 exceeded (got 13)"
+      ],
+      "latencyMs": 328
+    },
+    {
+      "id": "I02",
+      "query": "release notes bundle commit",
+      "category": "interference",
+      "expectKind": "hit",
+      "gotKind": "hit",
+      "total": 9,
+      "ranked": [
+        "release-ask-user-card.md",
+        "release-billing-meter.md",
+        "release-brook-v4-pro.md",
+        "release-cedar-q-router.md",
+        "release-client-error.md",
+        "release-glm53-zai.md",
+        "release-semantic-recall.md",
+        "novapulse-h3-runtime.md",
+        "feedback-commercial-verify.md"
+      ],
+      "top1": "release-ask-user-card.md",
+      "pAt3": 0,
+      "mrr": 0,
+      "ok": false,
+      "reasons": [
+        "maxHits 8 exceeded (got 9)"
+      ],
+      "latencyMs": 295
+    },
+    {
+      "id": "I03",
+      "query": "模型 队列 繁忙",
+      "category": "interference",
+      "expectKind": "hit",
+      "gotKind": "hit",
+      "total": 10,
+      "ranked": [
+        "helixforge-tpu-ocr.md",
+        "novapulse-h3-gpu-queue.md",
+        "novapulse-h3-runtime.md",
+        "release-glm53-zai.md",
+        "release-ask-user-card.md",
+        "release-billing-meter.md",
+        "release-brook-v4-pro.md",
+        "release-cedar-q-router.md",
+        "release-client-error.md",
+        "release-semantic-recall.md"
+      ],
+      "top1": "helixforge-tpu-ocr.md",
+      "pAt3": 0,
+      "mrr": 0,
+      "ok": false,
+      "reasons": [
+        "mustNotRank1: helixforge-tpu-ocr.md",
+        "maxHits 4 exceeded (got 10)"
+      ],
+      "latencyMs": 295
+    },
+    {
+      "id": "I04",
+      "query": "production pro bundle",
+      "category": "interference",
+      "expectKind": "hit",
+      "gotKind": "hit",
+      "total": 14,
+      "ranked": [
+        "release-brook-v4-pro.md",
+        "novapulse-h3-runtime.md",
+        "release-ask-user-card.md",
+        "release-billing-meter.md",
+        "release-cedar-q-router.md",
+        "release-client-error.md",
+        "release-glm53-zai.md",
+        "release-semantic-recall.md",
+        "helixforge-gpu-capacity.md",
+        "helixforge-tpu-ocr-batch.md",
+        "helixforge-tpu-ocr-tuning.md",
+        "helixforge-tpu-ocr.md",
+        "novapulse-h3-gpu-queue.md",
+        "user.md"
+      ],
+      "top1": "release-brook-v4-pro.md",
+      "pAt3": 0,
+      "mrr": 0,
+      "ok": false,
+      "reasons": [
+        "maxHits 6 exceeded (got 14)"
+      ],
+      "latencyMs": 379
+    },
+    {
+      "id": "U01",
+      "query": "what is the weather today",
+      "category": "unrelated",
+      "expectKind": "no_match",
+      "gotKind": "hit",
+      "total": 15,
+      "ranked": [
+        "novapulse-h3-runtime.md",
+        "feedback-commercial-verify.md",
+        "helixforge-gpu-capacity.md",
+        "helixforge-tpu-ocr-batch.md",
+        "helixforge-tpu-ocr-tuning.md",
+        "helixforge-tpu-ocr.md",
+        "novapulse-h3-gpu-queue.md",
+        "release-ask-user-card.md",
+        "release-billing-meter.md",
+        "release-brook-v4-pro.md",
+        "release-cedar-q-router.md",
+        "release-client-error.md",
+        "release-semantic-recall.md",
+        "user.md",
+        "release-glm53-zai.md"
+      ],
+      "top1": "novapulse-h3-runtime.md",
+      "pAt3": null,
+      "mrr": null,
+      "ok": false,
+      "reasons": [
+        "expected no_match, got Found 15 top1=novapulse-h3-runtime.md"
+      ],
+      "latencyMs": 345
+    },
+    {
+      "id": "U02",
+      "query": "意大利面 carbonara 怎么做",
+      "category": "unrelated",
+      "expectKind": "no_match",
+      "gotKind": "no_match",
+      "total": 0,
+      "ranked": [],
+      "top1": null,
+      "pAt3": null,
+      "mrr": null,
+      "ok": true,
+      "reasons": [],
+      "latencyMs": 309
+    },
+    {
+      "id": "U03",
+      "query": "600519 贵州茅台 股价",
+      "category": "unrelated",
+      "expectKind": "no_match",
+      "gotKind": "no_match",
+      "total": 0,
+      "ranked": [],
+      "top1": null,
+      "pAt3": null,
+      "mrr": null,
+      "ok": true,
+      "reasons": [],
+      "latencyMs": 363
+    },
+    {
+      "id": "U04",
+      "query": "kubernetes ingress tls rotate",
+      "category": "unrelated",
+      "expectKind": "no_match",
+      "gotKind": "no_match",
+      "total": 0,
+      "ranked": [],
+      "top1": null,
+      "pAt3": null,
+      "mrr": null,
+      "ok": true,
+      "reasons": [],
+      "latencyMs": 364
+    }
+  ]
+}

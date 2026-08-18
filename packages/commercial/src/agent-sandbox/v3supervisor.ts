@@ -73,6 +73,7 @@ import { SupervisorError } from "./types.js";
 import { getCodexTokenSnapshot } from "../account-pool/store.js";
 import { pickCodexAccountForBinding } from "../account-pool/scheduler.js";
 import { buildCodexRelayLocalBaseUrl, readCodexUpstreamBaseUrl } from "../http/internalCodexRelay.js";
+import { appendCoreMemoryEmbeddingEnv } from "./coreMemoryEmbeddingEnv.js";
 import { isPromptQueueV1Enabled } from "../http/internalPromptQueue.js";
 import { skillShadowContainerEnv } from "../http/internalSkillShadow.js";
 import { zeroBuffer } from "../crypto/keys.js";
@@ -2557,6 +2558,9 @@ export async function provisionV3Container(
       env.push("OC_CONTAINER_PREVIEW_ENABLED=1");
     }
     appendCodexRelayEnv(env);
+    // Core-memory local semantic recall: forward master embedding knobs
+    // (skip missing keys) and pin the DashScope batch limit + feature gate.
+    appendCoreMemoryEmbeddingEnv(env);
 
     // 工具失败遥测显式开关透传:仅当 master 进程 env 显式设 OC_TOOL_FAILURE_AUDIT=1
     // 才注入容器(容器侧 v3ToolFailureReporter 与 master 侧 internalToolFailureAudit

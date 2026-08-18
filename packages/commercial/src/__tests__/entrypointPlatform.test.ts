@@ -483,20 +483,35 @@ describe("entrypoint.sh 分流 + entrypoint.ts 关键不变量", () => {
     const src = readFileSync(ENTRYPOINT_TS, "utf8");
     assert.match(src, /const PLATFORM_BIN_DIR = "\/run\/oc\/platform\/current\/bin"/);
     assert.match(src, /const USER_PLATFORM_BIN_DIR = "\/home\/agent\/\.local\/bin"/);
+    assert.match(src, /const SYSTEM_PLATFORM_BIN_DIR = "\/usr\/local\/bin"/);
     assert.match(
       src,
-      /const PLATFORM_LINKED_CLIS = \[\s*"oc-plugin",\s*"oc-ocr",\s*"oc-h3",\s*"oc-video",\s*"oc-cursor",\s*"oc-task",\s*\] as const/,
+      /const PLATFORM_LINKED_CLIS = \[\s*"oc-plugin",\s*"oc-ocr",\s*"oc-h3",\s*"oc-video",\s*"oc-cursor",\s*"oc-task",\s*"oc-memory",\s*\] as const/,
     );
     assert.match(src, /const source = join\(PLATFORM_BIN_DIR, cliName\)/);
     assert.match(src, /const userLink = join\(USER_PLATFORM_BIN_DIR, cliName\)/);
+    assert.match(src, /const systemLink = join\(SYSTEM_PLATFORM_BIN_DIR, cliName\)/);
     assert.match(src, /lstatSync\(userLink\)/);
     assert.match(src, /readlinkSync\(userLink\) !== source/);
     assert.match(src, /symlinkSync\(source, userLink\)/);
+    assert.match(src, /lstatSync\(systemLink\)/);
+    assert.match(src, /decideSystemCliLinkAction\(\{/);
+    assert.match(src, /systemLinkAction === "replace-stale-wrapper"/);
+    assert.match(src, /unlinkSync\(systemLink\)/);
+    assert.match(src, /execFileSync\("\/usr\/bin\/sudo", \["-n", "\/bin\/rm", "--", systemLink\]/);
+    assert.match(src, /symlinkSync\(source, systemLink\)/);
+    assert.match(src, /execFileSync\("\/usr\/bin\/sudo", \["-n", "\/bin\/ln", "-s", "--", source, systemLink\]/);
     assert.match(src, /already exists with an unexpected target; preserved/);
     assert.doesNotMatch(
       src,
       /unlinkSync\(userLink\)/,
       "entrypoint 不得删除用户已有的普通文件、目录或异向链接",
+    );
+    const decideIdx = src.indexOf("decideSystemCliLinkAction({");
+    const unlinkSystemIdx = src.indexOf("unlinkSync(systemLink)");
+    assert.ok(
+      decideIdx > 0 && unlinkSystemIdx > decideIdx,
+      "/usr/local/bin unlink 必须先走 decideSystemCliLinkAction,不得无条件覆盖",
     );
 
     const validateOnlyIdx = src.indexOf('if ((process.env.OC_ENTRYPOINT_VALIDATE_ONLY || "").trim() === "1")');
@@ -792,5 +807,165 @@ describe("R2-M2c/M4 entrypoint.ts validate-only 早退 + 写侧 symlink 逃逸�
     // 旧的裸 writeFileSync(personaPath/skillPath) 不得残留(全走 helper)。
     assert.doesNotMatch(src, /writeFileSync\(personaPath, content/);
     assert.doesNotMatch(src, /writeFileSync\(skillPath, content/);
+  });
+});
+
+describe("stale image oc-memory wrapper fingerprint + system CLI link decision", () => {
+  const OC_MEMORY_SH = join(PLATFORM_RUNTIME, "bin", "oc-memory.sh");
+  // Exact pre-711d69ff9 image-baked wrapper (also the current runtime image COPY).
+  const STALE_IMAGE_WRAPPER = `#!/bin/sh
+# oc-memory — 容器内长期记忆 CLI(Recall + Archival)。薄 wrapper → mcp-memory tsx entry
+# (复用 memoryTools 核心,与旧 MCP handler 同源)。取代常驻 openclaude_memory MCP 里的
+# session_search / archival_* 工具 —— 常驻 stdio 传输脆弱(被 console 污染 / 崩溃即死 →
+# codex 死等 turn 被掐),一次性进程无传输可死。memdir 范式后 Core 记忆改为直接 Write/Edit
+# 写 MEMORY.md 索引 + memory/*.md 文件,\`memory\` 子命令已退役(调用只打印迁移提示)。
+# delegate / cron / skill 工具仍留 MCP。文档见 memory-management baseline skill。
+set -e
+# 单次调用版本自钉(设计 §1.2 R2-M5):readlink -f 穿透 current symlink → rev-pinned bundle 根。
+# 本薄壳无 sibling 引用,SELF_ROOT 仅立"工具单文件独立、禁相对 sibling 裸调用"不变量(测试固化)。
+SELF_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+cd /opt/openclaude
+exec npx --no-install tsx packages/mcp-memory/src/ocMemoryCli.ts "$@"
+`;
+  const DESIRED = "/run/oc/platform/current/bin/oc-memory";
+
+  test("isStaleImageOcMemoryWrapper matches the tsx-only image shell and rejects the bundle fast-path", () => {
+    assert.equal(pb.isStaleImageOcMemoryWrapper(STALE_IMAGE_WRAPPER), true, "known image tsx shell");
+    const current = readFileSync(OC_MEMORY_SH, "utf8");
+    assert.match(current, /oc-memory\.cjs/);
+    assert.equal(pb.isStaleImageOcMemoryWrapper(current), false, "current bundle wrapper is not stale");
+    assert.equal(pb.isStaleImageOcMemoryWrapper("#!/bin/sh\necho hi\n"), false);
+    assert.equal(
+      pb.isStaleImageOcMemoryWrapper(
+        `${STALE_IMAGE_WRAPPER}\nBUNDLE="/opt/openclaude/packages/mcp-memory/dist/oc-memory.cjs"\n`,
+      ),
+      false,
+      "tsx exec + cjs path is the new shell, not the image leftover",
+    );
+  });
+
+  test("decideSystemCliLinkAction only replaces oc-memory when the existing file is the tsx-only wrapper", () => {
+    assert.equal(
+      pb.decideSystemCliLinkAction({
+        cliName: "oc-memory",
+        exists: false,
+        isSymbolicLink: false,
+        isFile: false,
+        linkTarget: null,
+        desiredTarget: DESIRED,
+        fileContent: null,
+      }),
+      "create",
+    );
+    assert.equal(
+      pb.decideSystemCliLinkAction({
+        cliName: "oc-memory",
+        exists: true,
+        isSymbolicLink: true,
+        isFile: false,
+        linkTarget: DESIRED,
+        desiredTarget: DESIRED,
+        fileContent: null,
+      }),
+      "noop",
+    );
+    assert.equal(
+      pb.decideSystemCliLinkAction({
+        cliName: "oc-memory",
+        exists: true,
+        isSymbolicLink: false,
+        isFile: true,
+        linkTarget: null,
+        desiredTarget: DESIRED,
+        fileContent: STALE_IMAGE_WRAPPER,
+      }),
+      "replace-stale-wrapper",
+    );
+    assert.equal(
+      pb.decideSystemCliLinkAction({
+        cliName: "oc-memory",
+        exists: true,
+        isSymbolicLink: false,
+        isFile: true,
+        linkTarget: null,
+        desiredTarget: DESIRED,
+        fileContent: readFileSync(OC_MEMORY_SH, "utf8"),
+      }),
+      "preserve",
+      "future image COPY of the new wrapper must not be unlinked",
+    );
+    assert.equal(
+      pb.decideSystemCliLinkAction({
+        cliName: "oc-plugin",
+        exists: true,
+        isSymbolicLink: false,
+        isFile: true,
+        linkTarget: null,
+        desiredTarget: "/run/oc/platform/current/bin/oc-plugin",
+        fileContent: STALE_IMAGE_WRAPPER,
+      }),
+      "preserve",
+      "stale-wrapper replace is oc-memory only",
+    );
+    assert.equal(
+      pb.decideSystemCliLinkAction({
+        cliName: "oc-memory",
+        exists: true,
+        isSymbolicLink: true,
+        isFile: false,
+        linkTarget: "/usr/bin/evil",
+        desiredTarget: DESIRED,
+        fileContent: null,
+      }),
+      "preserve",
+      "foreign symlink is kept",
+    );
+    assert.equal(
+      pb.decideSystemCliLinkAction({
+        cliName: "oc-memory",
+        exists: true,
+        isSymbolicLink: false,
+        isFile: false,
+        linkTarget: null,
+        desiredTarget: DESIRED,
+        fileContent: STALE_IMAGE_WRAPPER,
+      }),
+      "preserve",
+      "directory (or non-file) at the reserved name is kept",
+    );
+  });
+
+  test("oc-memory.sh is valid sh and /usr/local/bin symlink does not loop through readlink -f", () => {
+    execFileSync("bash", ["-n", OC_MEMORY_SH], { stdio: "pipe" });
+    const dir = mkdtempSync(join(tmpdir(), "oc-memory-link-"));
+    try {
+      const bundleBin = join(dir, "platform", "bin");
+      mkdirSync(bundleBin, { recursive: true });
+      const wrapper = join(bundleBin, "oc-memory");
+      writeFileSync(wrapper, readFileSync(OC_MEMORY_SH));
+      const current = join(dir, "platform", "current");
+      symlinkSync(join(dir, "platform"), current);
+      const systemLink = join(dir, "usr-local-bin", "oc-memory");
+      mkdirSync(dirname(systemLink), { recursive: true });
+      symlinkSync(join(current, "bin", "oc-memory"), systemLink);
+      const resolved = execFileSync("readlink", ["-f", systemLink], { encoding: "utf8" }).trim();
+      assert.equal(resolved, realpathSync(wrapper));
+      assert.notEqual(resolved, systemLink);
+      const selfRoot = execFileSync(
+        "bash",
+        ["-c", 'cd "$(dirname "$(readlink -f "$1")")/.." && pwd', "oc-memory", systemLink],
+        { encoding: "utf8" },
+      ).trim();
+      assert.equal(selfRoot, realpathSync(join(dir, "platform")));
+      const wrapperSrc = readFileSync(OC_MEMORY_SH, "utf8");
+      assert.match(wrapperSrc, /exec \/usr\/local\/bin\/node "\$BUNDLE"/);
+      assert.doesNotMatch(
+        wrapperSrc,
+        /exec .*oc-memory/,
+        "new shell must not re-exec oc-memory (would recurse through the system symlink)",
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

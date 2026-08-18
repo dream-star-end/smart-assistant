@@ -1,7 +1,9 @@
 /**
- * Detached Cursor ask_user: the MCP tool returns immediately, the question
- * lives on the session tape, and the user's choice arrives as a later
- * ordinary user message. Nothing holds a process open.
+ * Cursor ask_user: persist the question on the session tape, wait up to
+ * waitMs (0 when omitted, for legacy clients; explicit values clamped to
+ * 55s, under the 60s MCP tools/call wall) for an in-turn answer, then
+ * degrade to detached. After release, the user's choice arrives as a later
+ * ordinary user message. Nothing holds a process open past waitMs.
  */
 
 export const DETACHED_ASK_USER_TTL_MS = 24 * 60 * 60_000
@@ -64,6 +66,50 @@ export function buildDetachedAskUserPostedResult(requestId: string): {
       'Your questions have been shown to the user in the web UI.',
       'End your turn now. Do not wait, poll, or call ask_user again for the same questions.',
       "The user's answer will arrive as your next ordinary user message.",
+    ].join(' '),
+  }
+}
+
+export function buildDetachedAskUserAnsweredResult(args: {
+  requestId: string
+  answers?: Record<string, string>
+  answerText?: string
+}): {
+  status: 'answered'
+  requestId: string
+  answers?: Record<string, string>
+  message: string
+} {
+  const answerBlock = (args.answerText && args.answerText.trim().length > 0)
+    ? args.answerText.trim()
+    : ''
+  return {
+    status: 'answered',
+    requestId: args.requestId,
+    ...(args.answers ? { answers: args.answers } : {}),
+    message: [
+      'The user already answered these questions in this turn.',
+      'Continue based on their answer below.',
+      'Do not call ask_user again for the same questions.',
+      'Do not wait for a new user message — the answer is this tool result.',
+      answerBlock,
+    ].filter((line) => line.length > 0).join('\n'),
+  }
+}
+
+export function buildDetachedAskUserSkippedResult(requestId: string): {
+  status: 'skipped'
+  requestId: string
+  message: string
+} {
+  return {
+    status: 'skipped',
+    requestId,
+    message: [
+      'The user skipped these questions.',
+      'Continue this turn with the information you already have.',
+      'Do not call ask_user again for the same questions.',
+      'Do not wait for a new user message.',
     ].join(' '),
   }
 }

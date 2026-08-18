@@ -384,6 +384,7 @@ export function messageSignature(
         m._settledReason ?? "",
         m._answers ? Object.keys(m._answers).join(",") : "",
         m.inputJson ? 1 : 0,
+        m._askUserExpiresAt ?? 0,
       ].join("|");
     case "agent-group":
       return [

@@ -167,3 +167,20 @@ test('chunker preserves full content with overlap and no document cap', () => {
     assert.match(fileChunks.at(-1)?.text ?? '', /后段事实/)
   }
 })
+
+test('without master or local opt-in the semantic pass is unavailable', async () => {
+  delete process.env.OPENCLAUDE_V3_MASTER_BASE_URL
+  delete process.env.OPENCLAUDE_V3_CONTAINER_TOKEN
+  delete process.env.OPENCLAUDE_V3_CONTAINER_TOKEN_FILE
+  delete process.env.OPENCLAUDE_CORE_MEMORY_LOCAL_SEMANTIC
+  delete process.env.OPENCLAUDE_CORE_MEMORY_LLM_RERANK
+  const result = await rankCoreMemorySemantically('recall a stored fact', [
+    {
+      path: '/memory/0.md',
+      label: 'Memory 0',
+      size: 20,
+      content: 'generic stored fact number 0',
+    },
+  ])
+  assert.equal(result, null)
+})

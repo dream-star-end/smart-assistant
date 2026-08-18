@@ -628,6 +628,21 @@ const CURSOR_SAFE_ENV_KEYS = [
   'NODE_EXTRA_CA_CERTS',
 ] as const
 
+// Keep in sync with CORE_MEMORY_EMBEDDING_FORWARD_KEYS in
+// packages/commercial/src/agent-sandbox/coreMemoryEmbeddingEnv.ts, plus the two
+// keys that helper always injects. Gateway cannot import commercial
+// (commercial depends on @openclaude/gateway). Not folded into
+// CURSOR_SAFE_ENV_KEYS: that list is locale/TLS inherit, not credentials.
+const CORE_MEMORY_EMBEDDING_SPAWN_KEYS = [
+  'EMBEDDING_PROVIDER',
+  'EMBEDDING_MODEL',
+  'EMBEDDING_DIMENSIONS',
+  'EMBEDDING_API_KEY',
+  'EMBEDDING_BASE_URL',
+  'EMBEDDING_BATCH_SIZE',
+  'OPENCLAUDE_CORE_MEMORY_LOCAL_SEMANTIC',
+] as const
+
 
 type CursorEvent = Record<string, unknown> & { type?: unknown; session_id?: unknown }
 type ReportedUsage = { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number }
@@ -1213,18 +1228,29 @@ function buildCursorMemoryMcpConfig(input: CursorMemoryMcpConfigInput): Record<s
 function buildCursorSpawnEnv(agentId: string, sessionKey: string): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
     // Keep executable resolution deterministic and exclude user-writable PATH
-    // entries. Platform CLIs and the pinned wrapper live under /usr/local/bin.
-    PATH: '/usr/local/bin:/usr/bin:/bin',
+    // entries. Prefer the read-only platform bundle so oc-memory and other
+    // oc-* CLIs pick up hot wrappers; /usr/local/bin is the image fallback.
+    PATH: '/run/oc/platform/current/bin:/usr/local/bin:/usr/bin:/bin',
     OC_AGENT_ID: agentId,
     OC_SESSION_KEY: sessionKey,
     // Rebuild from a clean object, so platform CLIs cannot inherit HOME.
     // Pin OPENCLAUDE_HOME to the storage root explicitly instead of optional
     // passthrough; a missing gateway value must still resolve to the real home.
     OPENCLAUDE_HOME: paths.home,
+    // oc-cursor replaces HOME with /tmp/openclaude-cursor.*. Policy files live
+    // under the storage root; this pin is the lease locator even if a later
+    // wrapper drops OPENCLAUDE_HOME. CCB/Codex do not use this spawn env.
+    OC_MEMORY_POLICY_HOME: paths.home,
   }
   for (const key of CURSOR_SAFE_ENV_KEYS) {
     const value = process.env[key]
     if (value !== undefined) env[key] = value
+  }
+  // PID 1 already has these (sandbox injection), but this rebuilt whitelist
+  // would otherwise drop them and oc-memory core-search fail-closes.
+  for (const key of CORE_MEMORY_EMBEDDING_SPAWN_KEYS) {
+    const value = process.env[key]?.trim()
+    if (value) env[key] = value
   }
   return env
 }

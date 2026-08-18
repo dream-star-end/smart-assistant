@@ -614,17 +614,19 @@ describe('AutoDreamService cadence', () => {
       publicStatus.lastReport?.created.map((row) => row.file),
       ['new-project.md'],
     )
-    assert.deepEqual(
-      publicStatus.lastReport?.updated.map((row) => row.file),
-      ['keep.md'],
+    assert.deepEqual(publicStatus.lastReport?.updated, [])
+    assert.deepEqual(publicStatus.lastReport?.deleted, [])
+    assert.match(
+      await readFile(paths.agentMemoryFile(agentId, 'keep.md'), 'utf8'),
+      /原正文/,
     )
-    assert.deepEqual(publicStatus.lastReport?.deleted, [
-      {
-        file: 'obsolete.md',
-        action: 'deleted',
-        type: 'project',
-      },
-    ])
+    assert.match(
+      await readFile(paths.agentMemoryFile(agentId, 'obsolete.md'), 'utf8'),
+      /旧正文/,
+    )
+    const created = await readFile(paths.agentMemoryFile(agentId, 'new-project.md'), 'utf8')
+    assert.match(created, /source: auto/)
+    assert.match(created, /expires: 2026-08-13/)
     const serialized = JSON.stringify(publicStatus)
     assert.ok(!serialized.includes('private-model-id'))
     assert.ok(!serialized.includes('Private Model Name'))
@@ -748,11 +750,11 @@ describe('AutoDreamService cadence', () => {
     const agentId = 'success-state-retry-agent'
     const now = Date.UTC(2026, 6, 14, 19, 0, 0)
     const statePath = paths.agentAutoDreamState(agentId)
-    const originalApply = MemoryDir.prototype.applyBatchCas
+    const originalApply = MemoryDir.prototype.applyAutoAdds
     let retryLogged = false
     const receipts: Array<{ status: string; summary: string }> = []
 
-    MemoryDir.prototype.applyBatchCas = async function (input) {
+    MemoryDir.prototype.applyAutoAdds = async function (input) {
       const result = await originalApply.call(this, input)
       if (result.ok) {
         // Turn the state-file destination into a directory so the first atomic
@@ -822,7 +824,7 @@ describe('AutoDreamService cadence', () => {
       assert.equal(publicStatus.status, 'success')
       assert.ok(!JSON.stringify(publicStatus).includes('untrusted free-form'))
     } finally {
-      MemoryDir.prototype.applyBatchCas = originalApply
+      MemoryDir.prototype.applyAutoAdds = originalApply
       rmSync(statePath, { recursive: true, force: true })
     }
   })
@@ -924,5 +926,118 @@ describe('Auto-Dream public report projection and receipt', () => {
       deleted: [],
     })
     assert.match(noOp.bodyMd, /没有发现值得长期保存的新信息/)
+  })
+})
+
+describe('auto memory write contract', () => {
+  it('skips a create when Core already has a strong hit', async () => {
+    const agentId = 'dedup-skip-agent'
+    const now = Date.UTC(2026, 7, 18, 12, 0, 0)
+    const logs: Array<{ event: string; fields: Record<string, unknown> }> = []
+    const service = new AutoDreamService({
+      policyClient: {
+        get: async () => ({
+          enabled: true as const,
+          mode: 'legacy_memory_v1' as const,
+          modelId: 'm',
+          modelName: 'M',
+          minIntervalHours: 24,
+          minNewSessions: 1,
+        }),
+      } as never,
+      now: () => now,
+      hasStrongCoreHit: async () => ({ hit: true, path: '/tmp/live.md', label: 'live' }),
+      runModel: async () =>
+        JSON.stringify({
+          upserts: [
+            {
+              file: 'dup.md',
+              name: '鼻炎',
+              description: '鼻炎笔记',
+              type: 'project',
+              body: '又一条鼻炎笔记',
+            },
+          ],
+          deletes: [],
+          summary: 'near duplicate',
+        }),
+      log: (event, fields) => {
+        logs.push({ event, fields })
+      },
+    })
+
+    await service.maybeSchedule({
+      agentId,
+      userId: '42',
+      sessionKey: 'dedup-session',
+      channel: 'webchat',
+      userText: '再记一次鼻炎',
+      assistantText: '好',
+    })
+
+    const publicStatus = await service.getPublicStatus(agentId)
+    assert.equal(publicStatus.status, 'success')
+    assert.deepEqual(publicStatus.lastReport?.created, [])
+    assert.ok(logs.some((row) => row.event === 'auto_memory_write_skipped_strong_hit'))
+    try {
+      await readFile(paths.agentMemoryFile(agentId, 'dup.md'), 'utf8')
+      assert.fail('dup.md should not have been created')
+    } catch (err) {
+      assert.equal((err as NodeJS.ErrnoException).code, 'ENOENT')
+    }
+  })
+
+  it('refuses an automatic user.md write', async () => {
+    const agentId = 'user-md-block-agent'
+    const now = Date.UTC(2026, 7, 18, 12, 0, 0)
+    const logs: string[] = []
+    const service = new AutoDreamService({
+      policyClient: {
+        get: async () => ({
+          enabled: true as const,
+          mode: 'legacy_memory_v1' as const,
+          modelId: 'm',
+          modelName: 'M',
+          minIntervalHours: 24,
+          minNewSessions: 1,
+        }),
+      } as never,
+      now: () => now,
+      hasStrongCoreHit: async () => ({ hit: false }),
+      runModel: async () =>
+        JSON.stringify({
+          upserts: [
+            {
+              file: 'user.md',
+              name: '画像',
+              description: '不该自动写',
+              type: 'user',
+              body: '<!-- oc-user-always:start -->leak<!-- oc-user-always:end -->',
+            },
+          ],
+          deletes: [],
+          summary: 'bad',
+        }),
+      log: (event) => {
+        logs.push(event)
+      },
+    })
+
+    await service.maybeSchedule({
+      agentId,
+      userId: '42',
+      sessionKey: 'user-md-session',
+      channel: 'webchat',
+      userText: '改画像',
+      assistantText: '好',
+    })
+
+    assert.ok(logs.includes('auto_memory_add_only_refuse_user_md'))
+    try {
+      await readFile(paths.agentMemoryFile(agentId, 'user.md'), 'utf8')
+      assert.fail('user.md must not be created by auto path')
+    } catch (err) {
+      assert.equal((err as NodeJS.ErrnoException).code, 'ENOENT')
+    }
   })
 })

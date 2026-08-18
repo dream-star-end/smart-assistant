@@ -10,6 +10,9 @@
   "exports": {
     ".": "./src/index.ts"
   },
+  "scripts": {
+    "build:cli": "bash ./scripts/build-oc-memory-cli.sh"
+  },
   "dependencies": {
     "@openclaude/storage": "*",
     "@modelcontextprotocol/sdk": "^1.0.4",

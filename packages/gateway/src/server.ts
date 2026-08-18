@@ -161,16 +161,25 @@ import {
   DETACHED_ASK_USER_TTL_MS,
   agentIdFromAskUserSessionKey,
   buildDetachedAskUserAnswerMessageId,
+  buildDetachedAskUserAnsweredResult,
   buildDetachedAskUserPersistMessage,
   buildDetachedAskUserPostedResult,
   buildDetachedAskUserResolvedSinkPayload,
   buildDetachedAskUserSinkPayload,
+  buildDetachedAskUserSkippedResult,
   findDetachedAskUserCardInMessages,
   formatAskUserAnswerMessage,
   isDetachedAskUserPending,
   isDetachedAskUserRequestId,
   pendingFromDetachedAskUserMessage,
 } from './detachedAskUser.js'
+import {
+  AskUserWaiter,
+  askUserHttpUnwritable,
+  askUserHttpWriteSucceeded,
+  resolveAskUserWaitMs,
+  type AskUserWaiterAnswer,
+} from './askUserWaiter.js'
 import { fetchAskUserPermissionCard, getV3MasterSinkOrNull, readV3MasterSinkConfig } from './v3MasterSink.js'
 import {
   filterUserVisibleAgentsForManagement,
@@ -1912,9 +1921,16 @@ export class Gateway {
     expiresAt: number
     /** Detached Cursor ask_user card: not a real engine permission. Survives
      *  turn end / disconnect / session eviction; 24h TTL; never auto-denied by
-     *  the 30-minute sweeper. Answer starts a new user turn. */
+     *  the 30-minute sweeper. After the hybrid wait releases (or no waiter is
+     *  holding), an allow starts a new user turn. */
     detachedAskUser?: boolean
   }>()
+  /**
+   * In-flight HTTP waiters for Cursor ask_user. Keyed by requestId. A waiter
+   * exists only while handleEngineAskUser is blocked on waitMs; after
+   * answered_in_window / released_to_detached the entry is deleted.
+   */
+  private _askUserWaiters = new Map<string, AskUserWaiter>()
   /** Max wait for a permission response before the janitor auto-denies.
    *  Matched to the outer CCB turn timeout (30 min) so we don't pre-empt
    *  a slow user while a turn is still live. */
@@ -12717,6 +12733,35 @@ export class Gateway {
         ? formatAskUserAnswerMessage(pending.input, settledAnswers ?? {})
         : undefined
       const answerId = answerText ? buildDetachedAskUserAnswerMessageId(frame.requestId) : undefined
+      const waiter = this._askUserWaiters?.get(frame.requestId)
+      const inWindow = waiter?.tryAnswer({
+        behavior: effectiveBehavior,
+        answers: settledAnswers,
+        answerText,
+      }) === true
+      if (inWindow) {
+        this._askUserWaiters.delete(frame.requestId)
+        // Patch the tape card so the UI renders "already answered". Do not
+        // append a user-answer row or dispatchInbound — the in-flight turn
+        // consumes the answer via the MCP tool result.
+        void this._patchDetachedAskUserResolved(
+          pending,
+          frame.requestId,
+          {
+            _resolved: true,
+            _behavior: effectiveBehavior,
+            _settledReason: 'remote',
+            ...(settledAnswers ? { _answers: settledAnswers } : {}),
+          },
+        )
+        this.log.info('detached ask_user settled', {
+          requestId: frame.requestId,
+          behavior: effectiveBehavior,
+          startedTurn: false,
+          inWindow: true,
+        })
+        return
+      }
       void this._patchDetachedAskUserResolved(
         pending,
         frame.requestId,
@@ -12735,6 +12780,7 @@ export class Gateway {
         requestId: frame.requestId,
         behavior: effectiveBehavior,
         startedTurn: effectiveBehavior === 'allow',
+        inWindow: false,
       })
       return
     }
@@ -13035,9 +13081,15 @@ export class Gateway {
    *  sessions that no longer exist — the runner-response step silently
    *  skips in that case (the subprocess is already gone). */
   /**
-   * Detached Cursor ask_user: register the question, persist it on the session
-   * tape, push the existing permission_request frame, and return immediately.
-   * The model must end its turn; the user's answer arrives as a later user message.
+   * Cursor ask_user: persist the question on the session tape, then wait up
+   * to `waitMs` for an in-turn answer. Omitting waitMs (legacy clients) is
+   * treated as 0 — fully detached, immediate posted. Explicit values are
+   * clamped to 55s, under the 60s MCP tools/call wall. On timeout / client
+   * abort the waiter releases to the existing detached path (later allow →
+   * dispatchInbound). If tryAnswer already won but the HTTP response can no
+   * longer be written, the consumed answer is compensated through that same
+   * dispatchInbound path so it cannot vanish. The HTTP response is always
+   * produced by the waiter timer or a terminal claim — it cannot hang past waitMs.
    */
   private async handleEngineAskUser(
     req: IncomingMessage,
@@ -13074,6 +13126,8 @@ export class Gateway {
       return this.sendError(res, 409, 'no active turn on session')
     }
 
+    const waitMs = resolveAskUserWaitMs(parsed.waitMs)
+    const deadlineAt = Date.now() + waitMs
     const input = { questions }
     const requestId = `ask-user:${randomBytes(16).toString('hex')}`
     const userId = session.userId ?? 'default'
@@ -13084,6 +13138,9 @@ export class Gateway {
     }
     const peerKey = Gateway.makePeerKey(userId, channel, peer.id)
     const expiresAt = Date.now() + Gateway.DETACHED_ASK_USER_TTL_MS
+    if (!this._askUserWaiters) this._askUserWaiters = new Map()
+    const waiter = new AskUserWaiter()
+    this._askUserWaiters.set(requestId, waiter)
     this._pendingPermissions.set(requestId, {
       sessionKey,
       toolName: 'AskUserQuestion',
@@ -13095,6 +13152,37 @@ export class Gateway {
       expiresAt,
       detachedAskUser: true,
     })
+
+    let clientGone = false
+    const releaseOnDisconnect = () => {
+      clientGone = true
+      waiter.tryRelease()
+    }
+    req.on('aborted', releaseOnDisconnect)
+    req.on('close', () => {
+      if (!res.headersSent) releaseOnDisconnect()
+    })
+
+    const persistArgs = {
+      requestId,
+      questions,
+      sessionKey,
+      userId,
+      channel,
+      peer,
+      expiresAt,
+      agentId: session.agentId,
+    }
+    const persistP = this._persistDetachedAskUserCard(persistArgs)
+    const persistBudget = Math.max(0, deadlineAt - Date.now())
+    await Promise.race([
+      persistP,
+      new Promise<void>((resolve) => setTimeout(resolve, persistBudget)),
+    ])
+    // Persist-first: the tape row exists (or we hit the waitMs budget) before
+    // the card is shown, so a later patch cannot beat the insert. The persist
+    // promise keeps running if we raced the deadline.
+    void persistP
     this._sendStampedSessionFrame(sessionKey, peerKey, {
       type: 'outbound.permission_request',
       sessionKey,
@@ -13111,18 +13199,141 @@ export class Gateway {
       requestId,
       sessionKey,
       agentId: session.agentId,
+      waitMs,
     })
-    void this._persistDetachedAskUserCard({
+
+    const pendingForWait = { sessionKey, userId, channel, peer }
+    try {
+      const remaining = Math.max(0, deadlineAt - Date.now())
+      waiter.startTimer(remaining)
+      const result = await waiter.wait()
+      this._askUserWaiters.delete(requestId)
+      if (result.status === 'answered') {
+        await this._finishInWindowAskUserWait({
+          req,
+          res,
+          waiter,
+          result,
+          requestId,
+          pending: pendingForWait,
+          clientGone,
+        })
+        return
+      }
+      if (clientGone || askUserHttpUnwritable(req, res)) return
+      this.sendJson(res, 200, buildDetachedAskUserPostedResult(requestId))
+    } catch (err) {
+      waiter.tryRelease()
+      this._askUserWaiters.delete(requestId)
+      this.log.error('engine ask_user wait failed', { requestId }, err as Error)
+      const answered = waiter.getAnswer()
+      if (waiter.getPhase() === 'answered_in_window' && answered) {
+        await this._finishInWindowAskUserWait({
+          req,
+          res,
+          waiter,
+          result: { status: 'answered', answer: answered },
+          requestId,
+          pending: pendingForWait,
+          clientGone,
+        })
+        return
+      }
+      if (clientGone || askUserHttpUnwritable(req, res)) return
+      this.sendJson(res, 200, buildDetachedAskUserPostedResult(requestId))
+    }
+  }
+
+  /**
+   * Deliver an in-window ask_user answer over HTTP, or compensate with the
+   * same dispatchInbound path used after timeout. `tryClaimDelivery` is the
+   * synchronous one-shot so HTTP success and compensation cannot both fire.
+   */
+  private async _finishInWindowAskUserWait(args: {
+    req: IncomingMessage
+    res: ServerResponse
+    waiter: AskUserWaiter
+    result: { status: 'answered'; answer: AskUserWaiterAnswer }
+    requestId: string
+    pending: {
+      sessionKey: string
+      userId: string
+      channel: string
+      peer: { id: string; kind: 'dm' | 'group' }
+    }
+    clientGone: boolean
+  }): Promise<void> {
+    const { req, res, waiter, result, requestId, pending, clientGone } = args
+    const answer = result.answer
+    const httpBlocked = clientGone || askUserHttpUnwritable(req, res)
+
+    if (!httpBlocked) {
+      if (!waiter.tryClaimDelivery()) return
+      try {
+        if (answer.behavior === 'deny') {
+          this.sendJson(res, 200, buildDetachedAskUserSkippedResult(requestId))
+        } else {
+          this.sendJson(res, 200, buildDetachedAskUserAnsweredResult({
+            requestId,
+            answers: answer.answers,
+            answerText: answer.answerText,
+          }))
+        }
+        if (askUserHttpWriteSucceeded(res)) return
+      } catch (err) {
+        this.log.warn('in-window ask_user HTTP write failed', { requestId }, err as Error)
+      }
+      if (answer.behavior === 'allow' && answer.answerText) {
+        try {
+          await this._compensateInWindowAskUserAnswer(pending, requestId, answer)
+        } catch (err) {
+          this.log.error('in-window ask_user compensation failed', { requestId }, err as Error)
+        }
+      }
+      return
+    }
+
+    if (answer.behavior === 'allow' && answer.answerText) {
+      if (!waiter.tryClaimDelivery()) return
+      try {
+        await this._compensateInWindowAskUserAnswer(pending, requestId, answer)
+      } catch (err) {
+        this.log.error('in-window ask_user compensation failed', { requestId }, err as Error)
+      }
+      return
+    }
+    waiter.tryClaimDelivery()
+  }
+
+  /**
+   * In-window answer could not be written back to the MCP HTTP caller.
+   * Reuse the timeout-then-answer path: tape user-answer row + dispatchInbound.
+   */
+  private async _compensateInWindowAskUserAnswer(
+    pending: {
+      sessionKey: string
+      userId: string
+      channel: string
+      peer: { id: string; kind: 'dm' | 'group' }
+    },
+    requestId: string,
+    answer: AskUserWaiterAnswer,
+  ): Promise<void> {
+    if (answer.behavior !== 'allow' || !answer.answerText) return
+    const answerId = buildDetachedAskUserAnswerMessageId(requestId)
+    void this._patchDetachedAskUserResolved(
+      pending,
       requestId,
-      questions,
-      sessionKey,
-      userId,
-      channel,
-      peer,
-      expiresAt,
-      agentId: session.agentId,
-    })
-    this.sendJson(res, 200, buildDetachedAskUserPostedResult(requestId))
+      {
+        _resolved: true,
+        _behavior: 'allow',
+        _settledReason: 'remote',
+        ...(answer.answers ? { _answers: answer.answers } : {}),
+      },
+      { id: answerId, text: answer.answerText },
+    )
+    this.log.info('in-window ask_user compensated via new turn', { requestId })
+    await this._submitDetachedAskUserAnswer(pending, answer.answerText, requestId, answerId)
   }
 
   private async _persistDetachedAskUserCard(args: {
@@ -13363,9 +13574,10 @@ export class Gateway {
     const pending = this._pendingPermissions.get(requestId)
     if (!pending) return false
     this._pendingPermissions.delete(requestId)
-    // Engine ask_user bridge: unblock the held HTTP caller before anything that
-    // could throw (session lookup / runner forward) so it never hangs to its
-    // own client timeout.
+    // Unblock a held ask_user HTTP waiter (if any) before anything that could
+    // throw, so it never hangs to the 60s MCP tools/call wall.
+    this._askUserWaiters?.get(requestId)?.tryRelease()
+    this._askUserWaiters?.delete(requestId)
     const session = this.sessions.getByKey(pending.sessionKey)
     if (session && !isDetachedAskUserPending(pending)) {
       // sendPermissionResponse swallows its own errors and returns false if
@@ -16469,9 +16681,11 @@ export function _shouldPushTurnInterruptedFinal(
 
 /** Settlement payload handed back to the waiting MCP ask_user HTTP caller. */
 export type EngineAskUserSettlement = {
-  status: 'answered' | 'skipped'
+  status: 'answered' | 'skipped' | 'posted'
   answers?: Record<string, string>
   reason?: string
+  requestId?: string
+  message?: string
 }
 
 /**

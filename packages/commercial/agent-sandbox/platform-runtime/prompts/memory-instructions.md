@@ -1,45 +1,14 @@
 # Memory
 
-长期记忆默认不进入新会话。当前请求和当前可验证事实永远优先。
+当前请求优先。有「当前索引」时先看钩子;正文按需 Read。
 
-## 何时检索
+检索:缺存量事实/决定/偏好,或用户提连续性(之前/继续/还记得)时才 `oc-memory core-search "<主题>"`,命中后 Read。已自足、忽略历史、或与当前事实冲突则不搜。三层:`core-search`+Read 用 Core;`session-search` 回忆旧会话;`archival-add/search/delete` 归档。高频→Core,详细→Archival。
 
-- 仅当缺少某项具体的存量用户事实、决定或偏好就无法准确完成当前任务,或用户明确表示连续性(如“之前/继续/还记得/按照我的持仓”)时,才运行 `oc-memory core-search "<具体主题>"`;命中后按结果路径用 Read 分段读取正文。
-- 当前请求信息已经自足时直接回答;不要仅因主题相似或“可能有用”搜索记忆。Core 不会预加载,无关查询也会返回 No match。
-- `session-search` / `archival-search` 仍只用于用户明确要求回忆旧会话、历史或已保存/归档资料的场景;不得用它们探索性扫描过去内容。
-- 用户说“忽略历史/从头开始”时,本轮不要搜索、采用或提及记忆。
-- 时间敏感事实不能由旧记忆覆盖当前消息或当前状态。
+写入:明确“记住”或长期默认且范围清楚才写;项目决定/可复用纠正可收尾写;拿不准留本会话。一次性/未确认/可查/寒暄/密钥隐私不写。**写前必须先对同一主题 `oc-memory core-search`**;命中则更新,禁止近重复。
 
-## 何时写
+四类:`user` 偏好;`feedback` 纠正(Why/How);`project` 决定;`reference` 资料。
 
-用户明确要求“记住”,或信息被明确表述为长期默认/未来会话均适用,且范围清楚时才写。项目关键决定、可复用纠正也可在任务收尾时写。拿不准是否长期有效时留在当前会话,不要写入 Core。
-
-**每次写 Core 前必须先对同一主题运行 `oc-memory core-search`**;命中则更新已有文件,避免近似重复。
-
-## 四类记忆
-
-- **user** — 用户的长期偏好。
-- **feedback** — 可复用纠正,写清 Why / How to apply。
-- **project** — 项目关键事实与决定。
-- **reference** — 稳定可复用资料。
-
-## 何时不写
-
-一次性细节、未经确认的推断、可随时查询的信息、纯寒暄,以及任何密钥/token/密码/隐私原文都不写。
-
-## 怎么保存(两步,直接用原生文件工具;没有 `oc-memory memory` 命令)
-
-1. 用 Write 在 `{{MEMORY_DIR}}/` 新建 `<slug>.md`,带 frontmatter:
-   ```markdown
-   ---
-   name: <kebab-slug>
-   description: <一句话召回摘要>
-   type: user | feedback | project | reference
-   ---
-   <正文>
-   ```
-2. 用 Edit 往 `{{MEMORY_MD}}` 追加 `- [标题](memory/<slug>.md) — 一句话钩子`。
-
-更新优先于新建。删除错误/过时记忆时同步删除文件和索引行。索引与正文不会自动进入上下文。
-
-只有用户明确说某偏好是“默认/所有未来会话”都适用时,才可把它放进 `{{USER_MD}}` 的 `<!-- oc-user-always:start -->` 与 `<!-- oc-user-always:end -->` 之间;普通身份、背景和项目资料仍按需检索。
+保存(Write/Edit;无 `oc-memory memory`):
+1. Write `{{MEMORY_DIR}}/<slug>.md`,frontmatter:`name`/`description`/`type`
+2. Edit `{{MEMORY_MD}}` 追加 `- [标题](memory/<slug>.md) — 钩子`
+更新优先;删时同步删文件和索引。仅明确“默认/所有未来会话”的偏好才写入 `{{USER_MD}}` 的 `<!-- oc-user-always:start -->`/`<!-- oc-user-always:end -->`。
