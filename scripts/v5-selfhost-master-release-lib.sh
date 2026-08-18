@@ -7,7 +7,11 @@
 MASTER_RELEASES_ROOT="${MASTER_RELEASES_ROOT:-/opt/openclaude/openclaude-v5-selfhost-releases}"
 MASTER_LIVE_LINK="${MASTER_LIVE_LINK:-/opt/openclaude/openclaude-v5-selfhost-live}"
 MASTER_RELEASE_COMPLETE_SCHEMA_VERSION=2
-MASTER_STAGING="${MASTER_STAGING:-}"
+# 内部变量无条件清空,不继承环境。继承的 MASTER_STAGING 曾让 --status 的 EXIT
+# 无边界 rm -rf 任意目录(含 git 工作树 / 仍被 bind 的 release)。
+MASTER_STAGING=""
+MASTER_STAGING_DEV=""
+MASTER_STAGING_INO=""
 BUILT_MASTER_RELEASE="${BUILT_MASTER_RELEASE:-}"
 MASTER_DEPS_MODE="${MASTER_DEPS_MODE:-}"
 MASTER_DEPS_ELAPSED_S="${MASTER_DEPS_ELAPSED_S:-}"
@@ -17,15 +21,95 @@ CUTOVER_GRACE_FILE="${CUTOVER_GRACE_FILE:-/run/openclaude-v5-selfhost/cutover-gr
 CUTOVER_GRACE_SEC="${CUTOVER_GRACE_SEC:-90}"
 CUTOVER_HAS_MIGRATION="${CUTOVER_HAS_MIGRATION:-0}"
 CUTOVER_MIGRATION_FILES="${CUTOVER_MIGRATION_FILES:-}"
+CUTOVER_UNIT_SNAP="${CUTOVER_UNIT_SNAP:-}"
+SURVIVOR_STATE="${SURVIVOR_STATE:-/run/openclaude-v5-selfhost/cutover-survivor.state}"
+SURVIVOR_COMMITTED="${SURVIVOR_COMMITTED:-/run/openclaude-v5-selfhost/cutover-survivor.committed}"
 
 mlog() { echo "$*" >&2; }
 
+# 只允许删除「本进程创建、仍是同一 inode」的 ${MASTER_RELEASES_ROOT}/.staging-*。
+# 任何规范化失败 / 越界 / inode 漂移 → 拒绝 rm。
 cleanup_master_staging() {
-  if [[ -n "${MASTER_STAGING:-}" && -d "$MASTER_STAGING" ]]; then
-    mlog "  清理未完成的 staging: $MASTER_STAGING"
-    rm -rf -- "$MASTER_STAGING"
-    MASTER_STAGING=""
+  local candidate canon root_canon parent parent_dev root_dev st_dev st_ino
+  local live_canon worktree_canon
+  candidate="${MASTER_STAGING:-}"
+  MASTER_STAGING=""
+  if [[ -z "$candidate" ]]; then
+    MASTER_STAGING_DEV=""
+    MASTER_STAGING_INO=""
+    return 0
   fi
+  if [[ ! -d "$candidate" ]]; then
+    MASTER_STAGING_DEV=""
+    MASTER_STAGING_INO=""
+    return 0
+  fi
+  canon="$(readlink -f -- "$candidate" 2>/dev/null || true)"
+  root_canon="$(readlink -f -- "$MASTER_RELEASES_ROOT" 2>/dev/null || true)"
+  if [[ -z "$canon" || -z "$root_canon" || ! -d "$canon" || ! -d "$root_canon" ]]; then
+    mlog "cleanup: 无法规范化 staging/releases root,拒绝 rm candidate=$candidate"
+    MASTER_STAGING_DEV=""
+    MASTER_STAGING_INO=""
+    return 0
+  fi
+  case "$canon" in
+    "${root_canon}"/.staging-*) ;;
+    *)
+      mlog "cleanup: 拒绝 rm 非 ${root_canon}/.staging-* 路径: $canon"
+      MASTER_STAGING_DEV=""
+      MASTER_STAGING_INO=""
+      return 0
+      ;;
+  esac
+  if [[ "$canon" == "$root_canon" ]]; then
+    mlog "cleanup: 拒绝 rm releases root"
+    MASTER_STAGING_DEV=""
+    MASTER_STAGING_INO=""
+    return 0
+  fi
+  live_canon="$(readlink -f -- "$MASTER_LIVE_LINK" 2>/dev/null || true)"
+  worktree_canon="$(readlink -f -- "${REPO_ROOT:-}" 2>/dev/null || true)"
+  if [[ -n "$live_canon" && "$canon" == "$live_canon" ]]; then
+    mlog "cleanup: 拒绝 rm live 目标 $canon"
+    MASTER_STAGING_DEV=""
+    MASTER_STAGING_INO=""
+    return 0
+  fi
+  if [[ -n "$worktree_canon" && "$canon" == "$worktree_canon" ]]; then
+    mlog "cleanup: 拒绝 rm 工作树 $canon"
+    MASTER_STAGING_DEV=""
+    MASTER_STAGING_INO=""
+    return 0
+  fi
+  parent="$(dirname -- "$canon")"
+  if [[ "$parent" != "$root_canon" ]]; then
+    mlog "cleanup: parent=$parent 不是 releases root,拒绝 rm"
+    MASTER_STAGING_DEV=""
+    MASTER_STAGING_INO=""
+    return 0
+  fi
+  parent_dev="$(stat -c '%d' -- "$parent" 2>/dev/null || true)"
+  root_dev="$(stat -c '%d' -- "$root_canon" 2>/dev/null || true)"
+  if [[ -z "$parent_dev" || "$parent_dev" != "$root_dev" ]]; then
+    mlog "cleanup: parent/dev 与 releases root 不一致,拒绝 rm"
+    MASTER_STAGING_DEV=""
+    MASTER_STAGING_INO=""
+    return 0
+  fi
+  st_dev="$(stat -c '%d' -- "$canon" 2>/dev/null || true)"
+  st_ino="$(stat -c '%i' -- "$canon" 2>/dev/null || true)"
+  if [[ -n "${MASTER_STAGING_DEV:-}" && -n "${MASTER_STAGING_INO:-}" ]]; then
+    if [[ "$st_dev" != "$MASTER_STAGING_DEV" || "$st_ino" != "$MASTER_STAGING_INO" ]]; then
+      mlog "cleanup: inode/dev 与创建时不一致,拒绝 rm (now=$st_dev:$st_ino want=$MASTER_STAGING_DEV:$MASTER_STAGING_INO)"
+      MASTER_STAGING_DEV=""
+      MASTER_STAGING_INO=""
+      return 0
+    fi
+  fi
+  mlog "  清理未完成的 staging: $canon"
+  rm -rf -- "$canon"
+  MASTER_STAGING_DEV=""
+  MASTER_STAGING_INO=""
 }
 
 # 商业版 release_artifact_digest 的本地化抄本(无 SSH)。.complete 不计入。
@@ -379,8 +463,12 @@ build_master_release() {
   [[ -d "$MASTER_RELEASES_ROOT" && ! -L "$MASTER_RELEASES_ROOT" ]] \
     || die "MASTER_RELEASES_ROOT 必须是普通目录: $MASTER_RELEASES_ROOT"
 
-  MASTER_STAGING="$staging"
-  mkdir -p -- "$staging"
+  mkdir -p -- "$staging" || die "无法创建 staging $staging"
+  MASTER_STAGING="$(readlink -f -- "$staging")"
+  [[ -n "$MASTER_STAGING" && -d "$MASTER_STAGING" ]] || die "staging 规范化失败: $staging"
+  MASTER_STAGING_DEV="$(stat -c '%d' -- "$MASTER_STAGING")"
+  MASTER_STAGING_INO="$(stat -c '%i' -- "$MASTER_STAGING")"
+  staging="$MASTER_STAGING"
   if ! git -C "$REPO_ROOT" archive --format=tar "$full_sha" | tar -x -C "$staging"; then
     cleanup_master_staging
     die "git archive/解包失败"
@@ -469,6 +557,8 @@ build_master_release() {
     die "mv -T staging→rel 失败"
   fi
   MASTER_STAGING=""
+  MASTER_STAGING_DEV=""
+  MASTER_STAGING_INO=""
   BUILT_MASTER_RELEASE="$reldir"
   mlog "  ✓ master release 就绪: $reldir deps=${MASTER_DEPS_MODE}/${MASTER_DEPS_ELAPSED_S}s frontend=${MASTER_FRONTEND_ELAPSED_S}s"
 }
@@ -503,10 +593,12 @@ unit_template_working_directory() { # <unit-file>
   awk -F= '/^WorkingDirectory=/{print $2; exit}' "$1"
 }
 
-assert_unit_templates_live_wd() {
-  local f wd
-  for f in "${UNIT_DIR}/${V5_UNIT}" "${UNIT_DIR}/${V5_EGRESS_UNIT}"; do
-    [[ -f "$f" ]] || die "缺 unit 模板: $f"
+assert_unit_templates_live_wd() { # <dir-with-unit-files>
+  local dir="${1:-}" f wd
+  [[ -n "$dir" && -d "$dir" ]] \
+    || die "assert_unit_templates_live_wd 必须传入目录(候选 release 内 deploy/v5-selfhost 或 snapshot),禁止默认读工作树"
+  for f in "${dir}/${V5_UNIT}" "${dir}/${V5_EGRESS_UNIT}"; do
+    [[ -f "$f" && ! -L "$f" ]] || die "缺 unit 模板普通文件: $f"
     wd="$(unit_template_working_directory "$f")"
     [[ "$wd" == *-live ]] || die "unit 模板 $f WorkingDirectory='$wd' 必须以 -live 结尾。禁止改回工作树。"
     [[ "$wd" == "$MASTER_LIVE_LINK" ]] \
@@ -600,63 +692,146 @@ sys.exit(1)
 PY
 }
 
+# git object 必须存在;diff 非 0 必须 fail-closed。禁止 || true 把坏 SHA 变成「无 migration」。
+git_migration_name_diff() { # <from-commit> <to-commit>
+  local from="$1" to="$2"
+  [[ "$from" =~ ^[0-9a-f]{7,40}$ ]] || { mlog "迁移门: from 非法"; return 1; }
+  [[ "$to" =~ ^[0-9a-f]{7,40}$ ]] || { mlog "迁移门: to 非法"; return 1; }
+  git -C "$REPO_ROOT" cat-file -e "${from}^{commit}" \
+    || { mlog "迁移门: from 不是存在的 commit: $from"; return 1; }
+  git -C "$REPO_ROOT" cat-file -e "${to}^{commit}" \
+    || { mlog "迁移门: to 不是存在的 commit: $to"; return 1; }
+  git -C "$REPO_ROOT" diff --name-only "$from" "$to" -- '**/migrations/**'
+}
+
+# 只读比对 DB schema_migrations.version 与候选 requiredMigrations。不 apply。
+# stdout: 缺失的 version 名,一行一个。查询失败 → rc 1。
+read_required_migration_gap() { # <rel>
+  local rel="$1" meta applied required
+  meta="$rel/deploy/v5/release-metadata.json"
+  [[ -f "$meta" ]] || { mlog "迁移门: 缺 $meta"; return 1; }
+  required="$(jq -er '.requiredMigrations[]?' "$meta" 2>/dev/null || true)"
+  if ! command -v psql >/dev/null 2>&1; then
+    mlog "迁移门: 缺 psql,无法只读查 schema_migrations"
+    return 1
+  fi
+  if ! applied="$(sudo -u postgres psql -X -d "${PG_DB:-openclaude_v5_selfhost}" -tAc \
+    "SELECT version FROM schema_migrations" 2>/dev/null)"; then
+    mlog "迁移门: 只读查询 schema_migrations 失败(fail-closed)"
+    return 1
+  fi
+  python3 - "$required" "$applied" <<'PY'
+import sys
+required = [x.strip() for x in sys.argv[1].splitlines() if x.strip()]
+applied = set(x.strip() for x in sys.argv[2].splitlines() if x.strip())
+missing = [x for x in required if x not in applied]
+sys.stdout.write("\n".join(missing))
+if missing:
+    sys.stdout.write("\n")
+PY
+}
+
+classify_pending_migration_file() { # <rel> <path-or-basename>
+  local rel="$1" f="$2" base hit meta
+  meta="$rel/deploy/v5/release-metadata.json"
+  case "$f" in
+    packages/commercial/src/db/migrations/*.sql)
+      base="$(basename "$f" .sql)"
+      ;;
+    *.sql)
+      base="$(basename "$f" .sql)"
+      f="packages/commercial/src/db/migrations/${base}.sql"
+      ;;
+    *)
+      if [[ "$f" == *_* && "$f" != */* ]]; then
+        base="$f"
+        f="packages/commercial/src/db/migrations/${base}.sql"
+      else
+        mlog "  迁移门: 跳过非 commercial runner 路径 $f"
+        return 0
+      fi
+      ;;
+  esac
+  jq -e --arg n "$base" '.requiredMigrations | index($n) != null' "$meta" >/dev/null \
+    || die "迁移门: $base 未列入 $meta requiredMigrations。拒绝 apply/翻转。"
+  if [[ -f "$rel/$f" ]]; then
+    if hit="$(sql_file_has_breaking_ddl "$rel/$f")"; then
+      if [[ "${OC_V5_ALLOW_BREAKING_MIGRATION:-0}" == 1 ]]; then
+        mlog "  ⚠ 破坏性 DDL 被 OC_V5_ALLOW_BREAKING_MIGRATION=1 放行: $f ($hit)"
+      else
+        die "迁移门: $f 命中破坏性 DDL($hit)。默认拒绝。确要放行设 OC_V5_ALLOW_BREAKING_MIGRATION=1(会写入日志)。"
+      fi
+    fi
+  fi
+}
+
 # 显式判定本批次是否含 migration;破坏性 DDL 默认拒绝。
+# 权威: DB schema_migrations 与候选 requiredMigrations 的缺口(不依赖工作树 .complete)。
+# git diff 仅在存在 live 运行身份时做,且 fail-closed。
 # 设置 CUTOVER_HAS_MIGRATION / CUTOVER_MIGRATION_FILES。
 gate_cutover_migrations() { # <rel>
-  local rel="$1" from_commit to_commit changed f base hit meta
+  local rel="$1" from_commit to_commit changed f gap live_root
   CUTOVER_HAS_MIGRATION=0
   CUTOVER_MIGRATION_FILES=""
   to_commit="$(jq -er '.sourceCommit' "$rel/.complete")"
-  if [[ -L "$MASTER_LIVE_LINK" ]]; then
-    from_commit="$(jq -er '.sourceCommit' "$(readlink -f "$MASTER_LIVE_LINK")/.complete" 2>/dev/null || true)"
-  fi
-  if [[ -z "${from_commit:-}" && -f "${REPO_ROOT}/.complete" ]]; then
-    from_commit="$(jq -er '.sourceCommit' "$REPO_ROOT/.complete")"
-  fi
-  if [[ -z "${from_commit:-}" ]]; then
-    from_commit="$(git -C "$REPO_ROOT" rev-parse HEAD)"
-  fi
-  [[ "$from_commit" =~ ^[0-9a-f]{7,40}$ ]] || die "迁移门: from_commit 非法"
   [[ "$to_commit" =~ ^[0-9a-f]{40}$ ]] || die "迁移门: to_commit 非法"
-  if [[ "$from_commit" == "$to_commit" ]]; then
-    mlog "  迁移门: from==to ($to_commit),无 migration"
-    return 0
+  git -C "$REPO_ROOT" cat-file -e "${to_commit}^{commit}" \
+    || die "迁移门: to_commit 不是存在的 commit: $to_commit"
+
+  if ! gap="$(read_required_migration_gap "$rel")"; then
+    die "迁移门: requiredMigrations↔schema_migrations 缺口比对失败。fail-closed,不翻转。"
   fi
-  changed="$(git -C "$REPO_ROOT" diff --name-only "$from_commit" "$to_commit" -- '**/migrations/**' || true)"
-  if [[ -z "$changed" ]]; then
-    mlog "  迁移门: $from_commit..$to_commit 无 **/migrations/** 变更"
-    return 0
+  if [[ -n "$gap" ]]; then
+    CUTOVER_HAS_MIGRATION=1
+    CUTOVER_MIGRATION_FILES="$gap"
+    mlog "  迁移门: DB 缺口 HAS_MIGRATION=1 missing:"
+    mlog "$gap"
+    while IFS= read -r f; do
+      [[ -n "$f" ]] || continue
+      classify_pending_migration_file "$rel" "$f"
+    done <<<"$gap"
+  else
+    mlog "  迁移门: requiredMigrations 均已在 schema_migrations"
   fi
-  CUTOVER_HAS_MIGRATION=1
-  CUTOVER_MIGRATION_FILES="$changed"
-  mlog "  迁移门: HAS_MIGRATION=1 files:"
-  mlog "$changed"
-  meta="$rel/deploy/v5/release-metadata.json"
-  [[ -f "$meta" ]] || die "迁移门: 缺 $meta"
-  while IFS= read -r f; do
-    [[ -n "$f" ]] || continue
-    case "$f" in
-      packages/commercial/src/db/migrations/*.sql) ;;
-      *)
-        # claude-code-best 等其它 migrations 不走 commercial runner;仍记录但不当 requiredMigrations。
-        mlog "  迁移门: 跳过非 commercial runner 路径 $f"
-        continue
-        ;;
-    esac
-    base="$(basename "$f" .sql)"
-    jq -e --arg n "$base" '.requiredMigrations | index($n) != null' "$meta" >/dev/null \
-      || die "迁移门: $base 未列入 $meta requiredMigrations。拒绝 apply/翻转。"
-    if [[ -f "$rel/$f" ]]; then
-      if hit="$(sql_file_has_breaking_ddl "$rel/$f")"; then
-        if [[ "${OC_V5_ALLOW_BREAKING_MIGRATION:-0}" == 1 ]]; then
-          mlog "  ⚠ 破坏性 DDL 被 OC_V5_ALLOW_BREAKING_MIGRATION=1 放行: $f ($hit)"
-        else
-          die "迁移门: $f 命中破坏性 DDL($hit)。默认拒绝。确要放行设 OC_V5_ALLOW_BREAKING_MIGRATION=1(会写入日志)。"
-        fi
-      fi
+
+  from_commit=""
+  if [[ -L "$MASTER_LIVE_LINK" ]]; then
+    live_root="$(readlink -f "$MASTER_LIVE_LINK" 2>/dev/null || true)"
+    if [[ -n "$live_root" && -f "$live_root/.complete" ]]; then
+      from_commit="$(jq -er '.sourceCommit' "$live_root/.complete")"
     fi
-  done <<<"$changed"
-  mlog "  ✓ 迁移门: 分类通过(含 migration 时 apply 必须与翻转同一把锁、同一窗口)"
+  fi
+  # 禁止把工作树 .complete 当运行证明。无 live 时只信 DB 缺口。
+  if [[ -n "$from_commit" ]]; then
+    [[ "$from_commit" =~ ^[0-9a-f]{40}$ ]] || die "迁移门: live sourceCommit 非法"
+    git -C "$REPO_ROOT" cat-file -e "${from_commit}^{commit}" \
+      || die "迁移门: live sourceCommit 不是存在的 commit: $from_commit"
+    if ! changed="$(git_migration_name_diff "$from_commit" "$to_commit")"; then
+      die "迁移门: git diff $from_commit..$to_commit 失败。fail-closed,禁止当成无 migration。"
+    fi
+    if [[ -n "$changed" ]]; then
+      CUTOVER_HAS_MIGRATION=1
+      if [[ -n "$CUTOVER_MIGRATION_FILES" ]]; then
+        CUTOVER_MIGRATION_FILES="${CUTOVER_MIGRATION_FILES}"$'\n'"$changed"
+      else
+        CUTOVER_MIGRATION_FILES="$changed"
+      fi
+      mlog "  迁移门: live..候选 git diff 含 **/migrations/**"
+      mlog "$changed"
+      while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
+        classify_pending_migration_file "$rel" "$f"
+      done <<<"$changed"
+    fi
+  else
+    mlog "  迁移门: 无 live 运行身份,不以工作树 .complete 当 from;HAS_MIGRATION 只由 DB 缺口决定"
+  fi
+
+  if [[ "$CUTOVER_HAS_MIGRATION" == 1 ]]; then
+    mlog "  ✓ 迁移门: 分类通过(含 migration 时 apply 必须与翻转同一把锁、同一窗口)"
+  else
+    mlog "  迁移门: HAS_MIGRATION=0"
+  fi
 }
 
 resolve_cutover_release() { # uses CUTOVER_RELEASE / HEAD
@@ -688,50 +863,132 @@ resolve_cutover_release() { # uses CUTOVER_RELEASE / HEAD
   die "找不到 sourceCommit==HEAD($head) 的完整 master release。补救: 先 --build-master-only。"
 }
 
-atomic_flip_live_symlink() { # <target-abs-rel>
+atomic_flip_live_symlink() { # <target-abs-rel>  失败只 return,不 exit
   local target="$1" tmp
-  [[ "$target" == "$MASTER_RELEASES_ROOT"/rel-* ]] || die "live 目标不在 releases 根下: $target"
-  [[ -d "$target" && ! -L "$target" ]] || die "live 目标不是普通目录: $target"
+  [[ "$target" == "$MASTER_RELEASES_ROOT"/rel-* ]] || { mlog "live 目标不在 releases 根下: $target"; return 1; }
+  [[ -d "$target" && ! -L "$target" ]] || { mlog "live 目标不是普通目录: $target"; return 1; }
   tmp="${MASTER_LIVE_LINK}.newlink.$$"
   rm -f -- "$tmp"
-  ln -s -- "$target" "$tmp"
-  mv -T -- "$tmp" "$MASTER_LIVE_LINK"
+  ln -s -- "$target" "$tmp" || return 1
+  if ! mv -T -- "$tmp" "$MASTER_LIVE_LINK"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
 }
 
 write_prev_release_file() { # <path-or-none>
   local val="$1" tmp
   tmp="$MASTER_RELEASES_ROOT/.prev-release.tmp.$$"
-  mkdir -p -- "$MASTER_RELEASES_ROOT"
-  printf '%s\n' "$val" >"$tmp"
-  mv -f -- "$tmp" "$MASTER_RELEASES_ROOT/.prev-release"
+  mkdir -p -- "$MASTER_RELEASES_ROOT" || return 1
+  printf '%s\n' "$val" >"$tmp" || { rm -f -- "$tmp"; return 1; }
+  mv -f -- "$tmp" "$MASTER_RELEASES_ROOT/.prev-release" || { rm -f -- "$tmp"; return 1; }
 }
 
 write_cutover_grace() {
   local until_ts
   until_ts=$(( $(date +%s) + CUTOVER_GRACE_SEC ))
-  mkdir -p -- "$(dirname -- "$CUTOVER_GRACE_FILE")"
-  printf 'until=%s\n' "$until_ts" >"$CUTOVER_GRACE_FILE"
+  mkdir -p -- "$(dirname -- "$CUTOVER_GRACE_FILE")" || return 1
+  printf 'until=%s\n' "$until_ts" >"$CUTOVER_GRACE_FILE" || return 1
 }
 
-backup_installed_units_for_cutover() { # stdout: backup dir
-  local ts dest
-  ts="$(date -u +%Y%m%d-%H%M%S)"
+# 一级回滚目标:canonicalize 真实路径、必须在 releases 根内、复算 strong digest。
+canonicalize_prev_release() { # <raw> → stdout canon
+  local raw="$1" canon root expected got
+  [[ -n "$raw" && "$raw" != "none" && "$raw" != "NONE" ]] || return 1
+  canon="$(readlink -f -- "$raw" 2>/dev/null || true)"
+  [[ -n "$canon" && -d "$canon" && ! -L "$canon" ]] || return 1
+  root="$(readlink -f -- "$MASTER_RELEASES_ROOT" 2>/dev/null || true)"
+  [[ -n "$root" ]] || return 1
+  case "$canon" in
+    "${root}"/rel-*) ;;
+    *)
+      mlog "prev 不在 releases 根内: $canon"
+      return 1
+      ;;
+  esac
+  [[ "$canon" != *.poisoned ]] || return 1
+  [[ -f "$canon/.complete" && ! -L "$canon/.complete" ]] || return 1
+  expected="$(jq -er '.artifactSha256' "$canon/.complete" 2>/dev/null || true)"
+  [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || return 1
+  got="$(release_artifact_digest "$canon")" || return 1
+  [[ "$got" == "$expected" ]] || { mlog "prev digest 复算不匹配 $canon"; return 1; }
+  printf '%s\n' "$canon"
+}
+
+fsync_path() { # <file-or-dir>
+  python3 - "$1" <<'PY'
+import os, sys
+p = sys.argv[1]
+fd = os.open(p, os.O_RDONLY)
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+PY
+}
+
+# 从已过 digest 的候选 release 快照 unit 到 root-owned 临时目录。危险窗口只读这份。
+snapshot_cutover_units_from_release() { # <rel> <out-var>
+  local rel="$1" dest_var="$2" snap src_dir
+  [[ "$dest_var" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
+  src_dir="$rel/deploy/v5-selfhost"
+  [[ -d "$src_dir" ]] || { mlog "候选缺 $src_dir"; return 1; }
+  assert_unit_templates_live_wd "$src_dir"
+  snap="/run/openclaude-v5-selfhost/cutover-unit-snap.$$"
+  rm -rf -- "$snap"
+  mkdir -p -- "$snap" || return 1
+  chmod 0700 -- "$snap" || return 1
+  cp -a -- "$src_dir/${V5_UNIT}" "$snap/" || { rm -rf -- "$snap"; return 1; }
+  cp -a -- "$src_dir/${V5_EGRESS_UNIT}" "$snap/" || { rm -rf -- "$snap"; return 1; }
+  assert_unit_templates_live_wd "$snap"
+  fsync_path "$snap/${V5_UNIT}" || { rm -rf -- "$snap"; return 1; }
+  fsync_path "$snap/${V5_EGRESS_UNIT}" || { rm -rf -- "$snap"; return 1; }
+  CUTOVER_UNIT_SNAP="$snap"
+  printf -v "$dest_var" '%s' "$snap"
+}
+
+# caller-provided 输出变量,不用会清 errexit 的命令替换。
+# 每个写步骤显式检查;校验两份备份都是普通文件、WD=工作树、可解析;
+# 写完并 sync 后才原子更新 worktree-current。
+backup_installed_units_for_cutover() { # <out-var>
+  local dest_var="$1" ts dest wd_m wd_e tmp_link
+  [[ "$dest_var" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
+  ts="$(date -u +%Y%m%d-%H%M%S)" || return 1
   dest="${BREAKGLASS_ROOT}/unit-backups/pre-cutover-${ts}"
-  mkdir -p -- "$dest"
-  cp -a -- "/etc/systemd/system/${V5_UNIT}" "$dest/"
-  cp -a -- "/etc/systemd/system/${V5_EGRESS_UNIT}" "$dest/"
-  cp -a -- "${UNIT_DIR}/${V5_UNIT}" "$dest/repo-${V5_UNIT}"
-  cp -a -- "${UNIT_DIR}/${V5_EGRESS_UNIT}" "$dest/repo-${V5_EGRESS_UNIT}"
+  mkdir -p -- "$dest" || return 1
+  cp -a -- "/etc/systemd/system/${V5_UNIT}" "$dest/" || return 1
+  cp -a -- "/etc/systemd/system/${V5_EGRESS_UNIT}" "$dest/" || return 1
+  if [[ -n "${UNIT_DIR:-}" && -f "${UNIT_DIR}/${V5_UNIT}" ]]; then
+    cp -a -- "${UNIT_DIR}/${V5_UNIT}" "$dest/repo-${V5_UNIT}" || return 1
+    cp -a -- "${UNIT_DIR}/${V5_EGRESS_UNIT}" "$dest/repo-${V5_EGRESS_UNIT}" || return 1
+  fi
+  [[ -f "$dest/${V5_UNIT}" && ! -L "$dest/${V5_UNIT}" ]] || return 1
+  [[ -f "$dest/${V5_EGRESS_UNIT}" && ! -L "$dest/${V5_EGRESS_UNIT}" ]] || return 1
+  [[ "$(stat -c '%s' -- "$dest/${V5_UNIT}")" -gt 0 ]] || return 1
+  [[ "$(stat -c '%s' -- "$dest/${V5_EGRESS_UNIT}")" -gt 0 ]] || return 1
+  wd_m="$(unit_template_working_directory "$dest/${V5_UNIT}")"
+  wd_e="$(unit_template_working_directory "$dest/${V5_EGRESS_UNIT}")"
+  [[ "$wd_m" == /opt/openclaude/openclaude-v5-selfhost ]] \
+    || { mlog "backup master WD='$wd_m' 不是工作树"; return 1; }
+  [[ "$wd_e" == /opt/openclaude/openclaude-v5-selfhost ]] \
+    || { mlog "backup egress WD='$wd_e' 不是工作树"; return 1; }
+  grep -q '^ExecStart=' "$dest/${V5_UNIT}" || return 1
+  grep -q '^ExecStart=' "$dest/${V5_EGRESS_UNIT}" || return 1
   printf 'backup=%s\ninstalled_master=%s\ninstalled_egress=%s\n' \
     "$dest" "/etc/systemd/system/${V5_UNIT}" "/etc/systemd/system/${V5_EGRESS_UNIT}" \
-    >"$dest/MANIFEST.txt"
-  local wd
-  wd="$(unit_template_working_directory "/etc/systemd/system/${V5_UNIT}")"
-  if [[ "$wd" != *-live ]]; then
-    mkdir -p -- "${BREAKGLASS_ROOT}/unit-backups"
-    ln -sfn -- "$dest" "${BREAKGLASS_ROOT}/unit-backups/worktree-current"
-  fi
-  printf '%s\n' "$dest"
+    >"$dest/MANIFEST.txt" || return 1
+  fsync_path "$dest/${V5_UNIT}" || return 1
+  fsync_path "$dest/${V5_EGRESS_UNIT}" || return 1
+  fsync_path "$dest/MANIFEST.txt" || return 1
+  fsync_path "$dest" || return 1
+  mkdir -p -- "${BREAKGLASS_ROOT}/unit-backups" || return 1
+  tmp_link="${BREAKGLASS_ROOT}/unit-backups/worktree-current.new.$$"
+  ln -sfn -- "$dest" "$tmp_link" || return 1
+  mv -Tf -- "$tmp_link" "${BREAKGLASS_ROOT}/unit-backups/worktree-current" || {
+    rm -f -- "$tmp_link"
+    return 1
+  }
+  printf -v "$dest_var" '%s' "$dest"
 }
 
 dist_oc_build() { # <rel>
@@ -739,15 +996,28 @@ dist_oc_build() { # <rel>
     | grep -o '[0-9a-f]\{8,32\}' | head -1
 }
 
-run_migrations_from_release() { # <rel>
+run_migrations_from_release() { # <rel>  失败 return 1,不 exit(调用方走统一补偿)
   local rel="$1" url migration_pgoptions
-  url="$(read_env_db_url)"
-  assert_connected_db "$url"
-  [[ -d "$rel/node_modules" ]] || die "release 无 node_modules,无法跑 migration"
+  url="$(read_env_db_url)" || return 1
+  assert_connected_db "$url" || return 1
+  [[ -d "$rel/node_modules" ]] || { mlog "release 无 node_modules,无法跑 migration"; return 1; }
   migration_pgoptions="${PGOPTIONS:+${PGOPTIONS} }-c openclaude.migration_profile=v5-selfhost"
-  ( cd "$rel" && env PGOPTIONS="$migration_pgoptions" DATABASE_URL="$url" REDIS_URL="$REDIS_URL" \
+  if ! ( cd "$rel" && env PGOPTIONS="$migration_pgoptions" DATABASE_URL="$url" REDIS_URL="$REDIS_URL" \
       COMMERCIAL_ENABLED=1 COMMERCIAL_AUTO_MIGRATE=1 \
-      npx --no-install tsx packages/commercial/src/db/migrate.ts ) \
-    || die "对着 release 跑 migration 失败。不翻转。不回滚 schema。"
+      npx --no-install tsx packages/commercial/src/db/migrate.ts ); then
+    mlog "对着 release 跑 migration 失败。不翻转。不回滚 schema。"
+    return 1
+  fi
+}
+
+cleanup_cutover_unit_snap() {
+  local snap="${CUTOVER_UNIT_SNAP:-}"
+  CUTOVER_UNIT_SNAP=""
+  [[ -n "$snap" ]] || return 0
+  case "$snap" in
+    /run/openclaude-v5-selfhost/cutover-unit-snap.*)
+      rm -rf -- "$snap"
+      ;;
+  esac
 }
 
