@@ -84,7 +84,10 @@ MODE=""
 #   /run/openclaude-v5/production-mutation.lock      V5 商业版生产 mutation lease
 #   /var/lock/openclaude-v5-deploy.lock              宿主遗留(2026-07-27起),现网脚本已不引用
 #   /var/lock/openclaude-v5-production-mutation.lock 宿主遗留(2026-07-24起),现网脚本已不引用
-SELFHOST_DEPLOY_LOCK="${OC_V5_SELFHOST_DEPLOY_LOCK:-/var/lock/openclaude-v5-selfhost-deploy.lock}"
+# 锁目录必须在 /run 下本实例专属路径: /run 为 0755 root:root,非特权用户无法在此创建/替换条目;
+# /run/lock(以及 /var/lock→/run/lock)是 1777,不能再当锁目录。/run 是 tmpfs,每次运行自愈创建。
+SELFHOST_DEPLOY_LOCK_DIR="/run/openclaude-v5-selfhost"
+SELFHOST_DEPLOY_LOCK="${OC_V5_SELFHOST_DEPLOY_LOCK:-${SELFHOST_DEPLOY_LOCK_DIR}/deploy.lock}"
 SELFHOST_DEPLOY_LOCK_WAIT="${OC_V5_SELFHOST_DEPLOY_LOCK_WAIT:-2400}"
 SELFHOST_DEPLOY_LOCK_POLL="${OC_V5_SELFHOST_DEPLOY_LOCK_POLL:-15}"
 SELFHOST_DEPLOY_LOCK_HOLDER=""
@@ -124,16 +127,162 @@ cleanup_selfhost_deploy() {
 trap cleanup_selfhost_deploy EXIT
 
 selfhost_lock_holder_info() {
-  local lock="$1" holder pids
-  holder="$(cat "${lock}.holder" 2>/dev/null || true)"
+  local lock="$1" holder_path holder pids
+  holder_path="${lock}.holder"
+  holder=""
+  # 读 holder 也不跟随符号链接:存在即 -L 则当未知,避免把链接目标内容当持锁者。
+  if [[ -L "$holder_path" ]]; then
+    holder="拒绝读取(holder 是符号链接)"
+  elif [[ -f "$holder_path" ]]; then
+    holder="$(cat "$holder_path" 2>/dev/null || true)"
+  fi
   pids="$(fuser "$lock" 2>/dev/null | tr -s '[:space:]' ' ' | sed 's/^ //;s/ $//' || true)"
   printf 'holder=%s fuser_pids=%s' "${holder:-未知}" "${pids:-?}"
+}
+
+# O_NOFOLLOW 打开/创建锁与 holder。环境变量覆盖的路径也走这里,不因来源跳过。
+# python 用 O_NOFOLLOW|O_DIRECTORY 打开目录、O_NOFOLLOW 打开文件,避免跟随符号链接截断目标。
+selfhost_lock_py() {
+  command -v python3 >/dev/null 2>&1 || die "缺少 python3(锁文件必须以 O_NOFOLLOW 打开)。补救: 安装 python3。"
+  python3 - "$@" <<'PY'
+import errno
+import os
+import stat
+import sys
+
+
+def die(msg):
+    sys.stderr.write("✗ " + msg + "\n")
+    sys.exit(1)
+
+
+def world_writable(st):
+    return bool(st.st_mode & stat.S_IWOTH)
+
+
+def open_dir_nofollow(path):
+    try:
+        return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as e:
+        if e.errno == errno.ELOOP:
+            die("路径是符号链接,拒绝: %s。补救: 锁目录必须是普通目录,不能是链接。" % path)
+        if e.errno == errno.ENOTDIR:
+            die("路径不是目录,拒绝: %s" % path)
+        if e.errno == errno.ENOENT:
+            die("路径不存在: %s" % path)
+        die("无法打开目录 %s: %s" % (path, e))
+
+
+def validate_dir_fd(fd, path, tighten=False):
+    st = os.fstat(fd)
+    if not stat.S_ISDIR(st.st_mode):
+        die("不是目录: %s" % path)
+    if st.st_uid != 0:
+        die("目录 owner 不是 root: %s (uid=%s)。补救: 锁必须放在 root 所有的目录里。" % (path, st.st_uid))
+    if world_writable(st):
+        die(
+            "目录世界可写,拒绝: %s (mode=%04o)。补救: 不要把锁放到 /tmp 或 /run/lock;默认用 /run/openclaude-v5-selfhost。"
+            % (path, st.st_mode & 0o7777)
+        )
+    if tighten:
+        os.fchmod(fd, 0o700)
+        st = os.fstat(fd)
+        if st.st_uid != 0 or world_writable(st) or (st.st_mode & 0o077):
+            die("无法将锁目录收紧为 0700: %s" % path)
+
+
+def prepare(lock_path, canon_dir):
+    if not lock_path.startswith("/") or lock_path != os.path.normpath(lock_path):
+        die("锁路径必须是规范化的绝对路径: %s" % lock_path)
+    if lock_path.endswith("/"):
+        die("锁路径不能是目录: %s" % lock_path)
+    parent = os.path.dirname(lock_path)
+    if parent in ("/", ""):
+        die("拒绝把锁文件放在 / 下: %s" % lock_path)
+    gp = os.path.dirname(parent)
+
+    # 先校验祖父目录:必须已存在、不是符号链接、root 所有、非世界可写。
+    # 不在世界可写目录里 mkdir,否则非特权用户可抢先建同名条目。
+    gp_fd = open_dir_nofollow(gp)
+    try:
+        validate_dir_fd(gp_fd, gp, tighten=False)
+    finally:
+        os.close(gp_fd)
+
+    # os.mkdir 不跟随最后一级符号链接:若该名已是链接则 EEXIST,随后 O_NOFOLLOW 打开会 ELOOP。
+    try:
+        os.mkdir(parent, 0o700)
+    except FileExistsError:
+        pass
+    except OSError as e:
+        die("无法创建锁目录 %s: %s" % (parent, e))
+
+    pfd = open_dir_nofollow(parent)
+    try:
+        validate_dir_fd(pfd, parent, tighten=(parent == canon_dir))
+    finally:
+        os.close(pfd)
+
+    flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+    try:
+        fd = os.open(lock_path, flags, 0o600)
+    except OSError as e:
+        if e.errno == errno.ELOOP:
+            die("锁路径是符号链接,拒绝: %s。补救: 删除该链接;锁必须是普通文件。" % lock_path)
+        if e.errno == errno.EISDIR:
+            die("锁路径是目录,拒绝: %s" % lock_path)
+        die("无法打开锁文件 %s: %s" % (lock_path, e))
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            die("锁路径不是普通文件,拒绝: %s" % lock_path)
+        if st.st_uid != 0:
+            die("锁文件 owner 不是 root: %s (uid=%s)。补救: 删除该文件,让脚本以 root 重建。" % (lock_path, st.st_uid))
+        os.fchmod(fd, 0o600)
+    finally:
+        os.close(fd)
+
+
+def write_holder(path, data):
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+    try:
+        fd = os.open(path, flags, 0o600)
+    except OSError as e:
+        if e.errno == errno.ELOOP:
+            die("holder 路径是符号链接,拒绝: %s。补救: 删除该链接后再发布。" % path)
+        die("无法写入 holder %s: %s" % (path, e))
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            die("holder 不是普通文件,拒绝: %s" % path)
+        if st.st_uid != 0:
+            die("holder owner 不是 root: %s (uid=%s)" % (path, st.st_uid))
+        os.fchmod(fd, 0o600)
+        payload = data.encode("utf-8")
+        written = 0
+        while written < len(payload):
+            n = os.write(fd, payload[written:])
+            if n <= 0:
+                die("写入 holder 不完整: %s" % path)
+            written += n
+    finally:
+        os.close(fd)
+
+
+cmd = sys.argv[1]
+if cmd == "prepare":
+    prepare(sys.argv[2], sys.argv[3])
+elif cmd == "write-holder":
+    write_holder(sys.argv[2], sys.argv[3])
+else:
+    die("内部错误:未知 lock helper 命令 %s" % cmd)
+PY
 }
 
 # fd 8 排他 flock:进程退出/被杀时内核释放,不手删锁文件。
 # OC_V5_SELFHOST_DEPLOY_LOCK_HELD=1 表示本进程链已持锁(内层跳过,防将来 $0 自调用把自己锁死)。
 acquire_selfhost_deploy_lock() {
-  local lock wait_s interval waited info
+  local lock wait_s interval waited info holder_line
   if [[ "${OC_V5_SELFHOST_DEPLOY_LOCK_HELD:-}" == 1 ]]; then
     log "  ↻ 本进程链已持 selfhost 发布锁,跳过加锁(可重入)"
     return 0
@@ -147,8 +296,13 @@ acquire_selfhost_deploy_lock() {
   if (( interval > wait_s && wait_s > 0 )); then
     interval="$wait_s"
   fi
-  mkdir -p "$(dirname "$lock")"
-  exec 8>"$lock" || die "无法打开锁文件 $lock"
+  # 默认路径与 OC_V5_SELFHOST_DEPLOY_LOCK 覆盖都走同一套校验,不跳过。
+  selfhost_lock_py prepare "$lock" "$SELFHOST_DEPLOY_LOCK_DIR"
+  # bash 再 lstat 一次:python 关 fd 到 exec 之间若被换成链接则中止(0700 目录下仅 root 能换)。
+  [[ -L "$lock" ]] && die "锁路径是符号链接,拒绝: $lock"
+  [[ -f "$lock" ]] || die "锁路径不是普通文件,拒绝: $lock"
+  # <> 不截断已有内容;锁文件本身不承载业务数据,避免 exec 8> 跟随链接截断目标。
+  exec 8<>"$lock" || die "无法打开锁文件 $lock"
   if ! flock -n 8; then
     waited=0
     while ! flock -n 8; do
@@ -165,9 +319,9 @@ acquire_selfhost_deploy_lock() {
     done
   fi
   SELFHOST_DEPLOY_LOCK_HOLDER="${lock}.holder"
-  printf 'pid=%s user=%s tree=%s started=%s\n' \
-    "$$" "$(id -un 2>/dev/null || echo ?)" "${REPO_ROOT:-?}" "$(date -Is)" \
-    >"$SELFHOST_DEPLOY_LOCK_HOLDER" || true
+  holder_line="$(printf 'pid=%s user=%s tree=%s started=%s\n' \
+    "$$" "$(id -un 2>/dev/null || echo ?)" "${REPO_ROOT:-?}" "$(date -Is)")"
+  selfhost_lock_py write-holder "$SELFHOST_DEPLOY_LOCK_HOLDER" "$holder_line"
   SELFHOST_DEPLOY_LOCK_HOLDER_OWNED=1
   export OC_V5_SELFHOST_DEPLOY_LOCK_HELD=1
   log "  ✓ 已取得 selfhost 发布锁 $lock pid=$$"
@@ -197,8 +351,9 @@ usage() {
   --platform-from-head  仅配合 --deploy/--bootstrap:平台 bundle 从 git archive 取已提交的 platform-runtime(默认仍拷工作树)
   --force-env           仅配合 --bootstrap:覆盖已存在的 env 文件
 
-  写路径(--deploy/--bootstrap,非 dry-run)会在 /var/lock/openclaude-v5-selfhost-deploy.lock 上排队等锁,默认 2400s。
+  写路径(--deploy/--bootstrap,非 dry-run)会在 /run/openclaude-v5-selfhost/deploy.lock 上排队等锁,默认 2400s。
   覆盖: OC_V5_SELFHOST_DEPLOY_LOCK / OC_V5_SELFHOST_DEPLOY_LOCK_WAIT / OC_V5_SELFHOST_DEPLOY_LOCK_POLL
+  覆盖路径同样校验(普通文件、root 所有、目录非世界可写、拒绝跟随符号链接)。
 
 示例:
   scripts/deploy-v5-selfhost.sh --preflight
