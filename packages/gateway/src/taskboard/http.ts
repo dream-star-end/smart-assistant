@@ -48,7 +48,15 @@ import {
   updateProject,
 } from './db/projects.js'
 import { addRelation, listRelations, removeRelation } from './db/relations.js'
-import { acquireLease, getActiveLease, getRun, insertRun, listRuns, updateRun } from './db/runs.js'
+import {
+  acquireLease,
+  getActiveLease,
+  getRun,
+  insertRun,
+  listRuns,
+  releaseLease,
+  updateRun,
+} from './db/runs.js'
 import { seedDefaultPipelines } from './db/seed.js'
 import {
   type TaskboardSettings,
@@ -65,7 +73,13 @@ import {
   getTemplate,
   listTemplates,
 } from './db/templates.js'
-import { createTicket, getTicketByIdOrIdentifier, listTickets, updateTicket } from './db/tickets.js'
+import {
+  countNonTerminalTicketsByType,
+  createTicket,
+  getTicketByIdOrIdentifier,
+  listTickets,
+  updateTicket,
+} from './db/tickets.js'
 import { buildWeeklyReport, currentWeekPeriod, periodFromIsoWeek } from './db/weeklyReport.js'
 import {
   type Actor,
@@ -94,7 +108,16 @@ import {
 } from './domain.js'
 import { parseEntryCondition } from './entryCondition.js'
 import { getSharedPatrolSlots, stageLoopCountOnProgress } from './guardrails.js'
+import {
+  type AllowedMove,
+  type MoveStageRef,
+  formatMoveComment,
+  interpretMove,
+  listAllowedMoves,
+  publicStageRef,
+} from './moveIntent.js'
 import { zonedYmd } from './notify.js'
+import { hasOpenBlockers, listOpenBlockers } from './patrol.js'
 import { TaskboardTransitionDenied, assertTransition } from './stateMachine.js'
 
 export type { TaskboardSettings, TaskboardUsage }
@@ -121,6 +144,7 @@ const TICKET_ACTIONS = [
   'cancel',
   'comment',
   'patrol',
+  'move',
 ] as const
 type TicketAction = (typeof TICKET_ACTIONS)[number]
 
@@ -293,6 +317,18 @@ class InvalidJsonError extends Error {
   constructor() {
     super('invalid JSON')
     this.name = 'InvalidJsonError'
+  }
+}
+
+class TaskboardMoveDenied extends Error {
+  override readonly name = 'TaskboardMoveDenied'
+  constructor(
+    readonly httpStatus: number,
+    readonly code: string,
+    message: string,
+    readonly detail: Record<string, unknown> = {},
+  ) {
+    super(message)
   }
 }
 
@@ -492,6 +528,14 @@ function mapHttpError(res: ServerResponse, err: unknown): boolean {
     sendError(res, 403, 'forbidden', { code: 'forbidden' })
     return true
   }
+  if (err instanceof TaskboardMoveDenied) {
+    sendJson(res, err.httpStatus, {
+      error: err.message,
+      code: err.code,
+      detail: err.detail,
+    })
+    return true
+  }
   if (err instanceof TaskboardVersionConflict) {
     sendError(res, 409, err.message, {
       code: 'version_conflict',
@@ -685,7 +729,7 @@ async function dispatch(
   if (stageItem) {
     const id = decodeURIComponent(stageItem[1])
     if (method === 'GET') return handleGetStage(res, db, id)
-    if (method === 'PATCH') return handlePatchStage(res, await readJsonBody(req), db, id)
+    if (method === 'PATCH') return handlePatchStage(res, await readJsonBody(req), db, id, actor)
     return sendError(res, 405, 'method not allowed')
   }
 
@@ -832,31 +876,75 @@ function handleProjectBoard(res: ServerResponse, url: URL, db: TaskboardDb, idOr
   const project = resolveProject(db, idOrKey)
   if (!project) throw new TaskboardNotFound('project', idOrKey)
   const requested = url.searchParams.get('ticketType')
-  let ticketType: TicketType = 'bug'
+  let ticketType: TicketType
   if (requested) {
     if (!(TICKET_TYPES as readonly string[]).includes(requested)) {
       throw new TaskboardValidationError(`invalid ticketType: ${requested}`)
     }
     ticketType = requested as TicketType
   } else {
-    const first = listPipelines(db, project.id).find((p) => p.isDefault && p.ticketType)
-    if (first?.ticketType) ticketType = first.ticketType
+    ticketType = pickDefaultTicketType(db, project.id)
   }
   const pipeline = getDefaultPipeline(db, project.id, ticketType)
   if (!pipeline) throw new TaskboardNotFound('pipeline', `${project.id}:${ticketType}`)
   const stages = listStages(db, pipeline.id)
-  const listed = listTickets(db, { projectId: project.id, limit: 200, offset: 0 })
-  const inbox = listed.items.filter((t) => t.status === 'waiting_human')
+  const listed = listTickets(db, { projectId: project.id, type: ticketType, limit: 200, offset: 0 })
+  const ofType = listed.items
+  const stageRefs = stages.map(toMoveStageRef)
+  const decorate = (ticket: Ticket) => decorateTicketMoves(db, ticket, stageRefs)
+  const inbox = ofType.filter((t) => t.status === 'waiting_human').map(decorate)
+  const backlogTickets = ofType.filter((t) => t.status === 'backlog').map(decorate)
   sendJson(res, 200, {
     project,
     pipeline,
     ticketType,
     columns: stages.map((stage) => ({
       stage,
-      tickets: listed.items.filter((t) => t.stageId === stage.id),
+      tickets: ofType.filter((t) => t.stageId === stage.id && t.status !== 'backlog').map(decorate),
     })),
     inbox,
+    backlog: { tickets: backlogTickets },
   })
+}
+
+/** 未指定 type 时选非终态票最多的 type;全空则退回项目第一条流水线的 type。 */
+function pickDefaultTicketType(db: TaskboardDb, projectId: string): TicketType {
+  const counts = countNonTerminalTicketsByType(db, projectId)
+  const pipes = listPipelines(db, projectId)
+  let best: TicketType | null = null
+  let bestN = 0
+  for (const pipe of pipes) {
+    if (!pipe.ticketType) continue
+    const n = counts[pipe.ticketType] ?? 0
+    if (n > bestN) {
+      best = pipe.ticketType
+      bestN = n
+    }
+  }
+  if (best && bestN > 0) return best
+  const first = pipes.find((p) => p.ticketType)
+  return first?.ticketType ?? 'bug'
+}
+
+function toMoveStageRef(stage: PipelineStage): MoveStageRef {
+  return { id: stage.id, name: stage.name, kind: stage.kind, ordinal: stage.ordinal }
+}
+
+function decorateTicketMoves(
+  db: TaskboardDb,
+  ticket: Ticket,
+  stages: readonly MoveStageRef[],
+): Ticket & { allowedMoves: AllowedMove[] } {
+  return {
+    ...ticket,
+    allowedMoves: listAllowedMoves({
+      status: ticket.status,
+      stageId: ticket.stageId,
+      pipelineId: ticket.pipelineId,
+      stages,
+      hasOpenBlockers: hasOpenBlockers(db, ticket.id),
+    }),
+  }
 }
 
 // ── Ticket ──────────────────────────────────────────────────────────────────
@@ -941,11 +1029,28 @@ function handleCreateTicket(
     throw new TaskboardValidationError(`invalid source: ${sourceRaw}`)
   }
 
+  // 默认 backlog:人没批准 AI 不许碰。显式 status=ready 仅 human 可「直接开工」。
+  const statusRaw = asString(body.status)
+  let status: TicketStatus | undefined
+  if (statusRaw) {
+    if (statusRaw !== 'backlog' && statusRaw !== 'ready') {
+      throw new TaskboardValidationError('status must be backlog or ready')
+    }
+    if (statusRaw === 'ready' && actor !== 'human') {
+      throw new TaskboardTransitionDenied(
+        'actor_denied',
+        '直接开工只有人能做，AI 不能把新建单据标为待执行。',
+      )
+    }
+    status = statusRaw
+  }
+
   const ticket = createTicket(db, {
     projectId: project.id,
     type,
     title,
     body: asString(body.body) ?? '',
+    status,
     priority: (priorityRaw as TicketPriority | undefined) ?? 'P2',
     severity: (severityRaw as TicketSeverity | null | undefined) ?? null,
     labels: asStringArray(body.labels) ?? [],
@@ -1145,7 +1250,291 @@ function handleTicketAction(
   else if (action === 'approve') handleApprove(res, body, db, actor, ticket)
   else if (action === 'reject') handleReject(res, body, db, actor, ticket)
   else if (action === 'done') handleDone(res, body, db, actor, ticket)
+  else if (action === 'move') handleMove(res, body, db, actor, ticket)
   else handleCancel(res, body, db, actor, ticket)
+}
+
+/**
+ * 拖动落库。actor 必须是人;动作由 interpretMove 命名,解析不出就拒。
+ * 意图落两处:评论(进 {{comments}}) + tb_ticket_activity。
+ */
+function handleMove(
+  res: ServerResponse,
+  body: Record<string, unknown>,
+  db: TaskboardDb,
+  actor: Actor,
+  ticket: Ticket,
+): void {
+  if (actor !== 'human') {
+    sendError(res, 403, 'forbidden', { code: 'forbidden' })
+    return
+  }
+  const expectedVersion = requireExpectedVersion(body)
+  if (expectedVersion !== ticket.version) {
+    throw new TaskboardVersionConflict(ticket.id, expectedVersion, ticket.version)
+  }
+
+  const toStageRaw = body.toStageId
+  if (toStageRaw !== null && toStageRaw !== undefined && typeof toStageRaw !== 'string') {
+    throw new TaskboardValidationError('toStageId must be a string or null')
+  }
+  const toStageId = toStageRaw === undefined ? null : (toStageRaw as string | null)
+  const reason = asString(body.reason) ?? null
+  const confirmSkippedStages = asBoolean(body.confirmSkippedStages) ?? false
+  const cancelRunningRun = asBoolean(body.cancelRunningRun) ?? false
+
+  if (toStageId) {
+    const target = getStage(db, toStageId)
+    if (!target) throw new TaskboardNotFound('stage', toStageId)
+    if (ticket.pipelineId && target.pipelineId !== ticket.pipelineId) {
+      throw new TaskboardMoveDenied(
+        422,
+        'stage_pipeline_mismatch',
+        '目标阶段不属于该单据当前流水线。',
+        { toStageId, pipelineId: ticket.pipelineId, stagePipelineId: target.pipelineId },
+      )
+    }
+  }
+
+  if (!ticket.pipelineId) {
+    throw new TaskboardMoveDenied(422, 'no_interpretable_intent', '单据未挂流水线,无法解析拖动。', {
+      why: 'no_pipeline',
+    })
+  }
+  const stages = listStages(db, ticket.pipelineId).map(toMoveStageRef)
+  const parsed = interpretMove({
+    status: ticket.status,
+    stageId: ticket.stageId,
+    pipelineId: ticket.pipelineId,
+    toStageId,
+    stages,
+  })
+  if (!parsed.ok) {
+    throw new TaskboardMoveDenied(
+      422,
+      parsed.code,
+      parsed.why,
+      parsed.detail ?? { why: parsed.why },
+    )
+  }
+  const intent = parsed.intent
+
+  if (intent.action === 'noop') {
+    sendJson(res, 200, {
+      ticket,
+      move: {
+        action: 'noop',
+        label: intent.label,
+        fromStageId: intent.fromStageId,
+        toStageId: intent.toStageId,
+        skippedStages: [],
+        abandonedStage: null,
+        commentId: null,
+      },
+    })
+    return
+  }
+
+  const activeRun = getActiveLease(db, ticket.id)
+  if (ticket.status === 'running' && !cancelRunningRun) {
+    throw new TaskboardMoveDenied(
+      409,
+      'running_run_active',
+      '单据正在执行,移动前必须取消当前 run。',
+      {
+        runId: activeRun?.id ?? null,
+      },
+    )
+  }
+
+  const blockers = listOpenBlockers(db, ticket.id)
+  const movingForward = intent.action === 'skip_forward' || intent.action === 'ack_advance'
+  if (ticket.status === 'blocked' && blockers.length > 0 && movingForward) {
+    throw new TaskboardMoveDenied(
+      422,
+      'blocked_dependency',
+      '存在未解除的阻塞依赖,不能往后续站移动。',
+      {
+        blockers: blockers.map((b) => ({
+          id: b.id,
+          identifier: b.identifier,
+          title: b.title,
+          status: b.status,
+        })),
+      },
+    )
+  }
+
+  if (intent.requiresConfirm && !confirmSkippedStages) {
+    throw new TaskboardMoveDenied(
+      422,
+      'confirm_required',
+      intent.abandonedStage
+        ? '这次拖动会放弃当前站的工作，需要 confirmSkippedStages=true 确认。'
+        : '这次拖动会跳过中间站,需要 confirmSkippedStages=true 确认。',
+      {
+        action: intent.action,
+        skippedStages: intent.skippedStages.map((s) => publicStageRef(s)),
+        abandonedStage: publicStageRef(intent.abandonedStage),
+      },
+    )
+  }
+  if (intent.requiresReason && !reason?.trim()) {
+    throw new TaskboardMoveDenied(
+      422,
+      'reason_required',
+      '打回必须填写理由,目标站 agent 要能读到要改什么。',
+      {
+        action: intent.action,
+      },
+    )
+  }
+
+  const actorId = actorIdOf(actor)
+  const fromStage = currentStage(db, ticket)
+  const toStage = intent.toStageId ? getStage(db, intent.toStageId) : null
+  const result = db.transaction(() => {
+    if (ticket.status === 'running' && cancelRunningRun) {
+      cancelActiveRunForMove(db, ticket)
+    }
+
+    let updated: Ticket
+    if (intent.action === 'ack_advance') {
+      updated = applyHumanAckAdvance(db, ticket, expectedVersion, actor, actorId)
+    } else {
+      if (intent.toStatus !== ticket.status) {
+        assertTransition({
+          from: ticket.status,
+          to: intent.toStatus,
+          actor,
+          autoClose: fromStage?.autoClose,
+          stageOnSuccess: fromStage?.onSuccess,
+        })
+      }
+      const nextStageId = intent.action === 'return_to_backlog' ? ticket.stageId : intent.toStageId
+      const stageLoopCount = stageLoopCountOnProgress(
+        ticket.stageLoopCount,
+        ticket.stageId,
+        nextStageId,
+        intent.toStatus,
+      )
+      updated = updateTicket(db, ticket.id, expectedVersion, {
+        status: intent.toStatus,
+        stageId: nextStageId,
+        stageLoopCount,
+        closedAt:
+          ticket.status === 'done' || ticket.status === 'canceled' || intent.toStatus === 'backlog'
+            ? null
+            : undefined,
+        blockedReason: intent.action === 'return_to_backlog' ? null : undefined,
+      })
+    }
+
+    const comment = createComment(db, {
+      ticketId: ticket.id,
+      authorKind: 'human',
+      author: actorId,
+      body: formatMoveComment({
+        action: intent.action,
+        label: intent.label,
+        fromStageName: fromStage?.name ?? null,
+        toStageName: toStage?.name ?? null,
+        toBacklog: intent.action === 'return_to_backlog',
+        reason,
+        skippedStages: intent.skippedStages,
+        abandonedStage: intent.abandonedStage,
+      }),
+    })
+    createActivity(db, {
+      ticketId: ticket.id,
+      actor: 'human',
+      actorId,
+      action: `move:${intent.action}`,
+      field: 'stage',
+      fromValue: ticket.stageId,
+      toValue: intent.toStageId,
+    })
+    if (intent.action !== 'ack_advance' && updated.status !== ticket.status) {
+      recordActivity(
+        db,
+        ticket.id,
+        'human',
+        actorId,
+        'status_changed',
+        'status',
+        ticket.status,
+        updated.status,
+      )
+    }
+    return { ticket: updated, commentId: comment.id }
+  })()
+
+  sendJson(res, 200, {
+    ticket: result.ticket,
+    move: {
+      action: intent.action,
+      label: intent.label,
+      fromStageId: intent.fromStageId,
+      toStageId: intent.toStageId,
+      skippedStages: intent.skippedStages.map((s) => publicStageRef(s)),
+      abandonedStage: publicStageRef(intent.abandonedStage),
+      commentId: result.commentId,
+    },
+  })
+}
+
+/** 与 POST …/approve 非关单路径同一套:下一站 + status=ready。 */
+function applyHumanAckAdvance(
+  db: TaskboardDb,
+  ticket: Ticket,
+  expectedVersion: number,
+  actor: Actor,
+  actorId: string,
+): Ticket {
+  const stage = currentStage(db, ticket)
+  const nxt = stage ? nextStage(db, stage) : null
+  assertTransition({
+    from: ticket.status,
+    to: 'ready',
+    actor,
+    autoClose: stage?.autoClose,
+  })
+  const nextStageId = nxt?.id ?? ticket.stageId
+  const stageLoopCount = stageLoopCountOnProgress(
+    ticket.stageLoopCount,
+    ticket.stageId,
+    nextStageId,
+    'ready',
+  )
+  const updated = updateTicket(db, ticket.id, expectedVersion, {
+    status: 'ready',
+    stageId: nextStageId,
+    stageLoopCount,
+  })
+  recordActivity(
+    db,
+    ticket.id,
+    actor,
+    actorId,
+    nextStageId && nextStageId !== ticket.stageId ? 'stage_advanced' : 'status_changed',
+    'status',
+    ticket.status,
+    'ready',
+  )
+  return updated
+}
+
+function cancelActiveRunForMove(db: TaskboardDb, ticket: Ticket): void {
+  const run = getActiveLease(db, ticket.id)
+  if (!run) return
+  releaseLease(db, run.id)
+  const now = Date.now()
+  updateRun(db, run.id, {
+    status: 'failed',
+    error: 'canceled_by_human_move',
+    finishedAt: now,
+    durationMs: run.startedAt != null ? now - run.startedAt : null,
+  })
 }
 
 function handleComment(
@@ -1416,20 +1805,7 @@ function handleApprove(
     actor,
     autoClose: stage?.autoClose,
   })
-  const updated = updateTicket(db, ticket.id, expectedVersion, {
-    status: 'ready',
-    stageId: nxt?.id ?? ticket.stageId,
-  })
-  recordActivity(
-    db,
-    ticket.id,
-    actor,
-    actorIdOf(actor),
-    'status_changed',
-    'status',
-    ticket.status,
-    'ready',
-  )
+  const updated = applyHumanAckAdvance(db, ticket, expectedVersion, actor, actorIdOf(actor))
   sendJson(res, 200, { ok: true, ticket: updated })
 }
 
@@ -1707,6 +2083,26 @@ function hasPatrolCron(cron: string | null | undefined): boolean {
   return typeof cron === 'string' && cron.trim() !== ''
 }
 
+/** 巡检/熔断/超时等运维字段,以及会改写后续审查约束的内容字段:只许人改,agent 走 PATCH 带这些 key 一律 403。 */
+const STAGE_OPS_FIELDS = [
+  'patrolCron',
+  'patrolEnabled',
+  'patrolTimezone',
+  'quietHoursStart',
+  'quietHoursEnd',
+  'maxRunsPerDay',
+  'timeoutSec',
+  'maxRetries',
+  'circuitBreakerThreshold',
+  'autoClose',
+  'promptTemplate',
+  'toolsets',
+] as const
+
+function stagePatchTouchesOps(body: Record<string, unknown>): boolean {
+  return STAGE_OPS_FIELDS.some((key) => Object.hasOwn(body, key))
+}
+
 function validateStageWrite(input: {
   kind?: StageKind
   agentId?: string | null
@@ -1820,9 +2216,14 @@ function handlePatchStage(
   body: Record<string, unknown>,
   db: TaskboardDb,
   id: string,
+  actor: Actor,
 ): void {
   const existing = getStage(db, id)
   if (!existing) throw new TaskboardNotFound('stage', id)
+  if (actor !== 'human' && stagePatchTouchesOps(body)) {
+    sendError(res, 403, 'forbidden', { code: 'forbidden' })
+    return
+  }
   const kind = (asString(body.kind) as StageKind | undefined) ?? existing.kind
   const agentId =
     body.agentId === undefined ? existing.agentId : (asNullableString(body.agentId) ?? null)

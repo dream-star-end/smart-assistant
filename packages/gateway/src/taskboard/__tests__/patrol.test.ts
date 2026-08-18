@@ -586,6 +586,28 @@ describe('sessionKey 形状', () => {
   })
 })
 
+describe('backlog 不被巡检捞走', () => {
+  it('status=backlog 的票即使挂在 patrolEnabled 的 ai 站也不会被 tick 认领', async () => {
+    const db = freshDb()
+    const { ticket, stage } = seedReadyAi(db)
+    updateTicket(db, ticket.id, ticket.version, { status: 'backlog' })
+    let ran = 0
+    const eng = engine(db, async () => {
+      ran += 1
+      return { ok: true, output: 'should not run' }
+    })
+    const report = await eng.tick(WORK)
+    assert.equal(ran, 0, 'backlog 票绝不能进 delegate')
+    assert.equal(report.started, 0)
+    const after = getTicket(db, ticket.id)
+    assert.equal(after?.status, 'backlog')
+    assert.equal(after?.stageId, stage.id)
+    const runs = listRuns(db, { ticketId: ticket.id }).items
+    assert.equal(runs.length, 0)
+    db.close()
+  })
+})
+
 function seedReadyAi(
   db: TaskboardDb,
   stageOver: {

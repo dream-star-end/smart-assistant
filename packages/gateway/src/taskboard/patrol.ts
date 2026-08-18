@@ -1051,14 +1051,19 @@ function nextStageOf(db: TaskboardDb, stage: PipelineStage): PipelineStage | nul
 }
 
 /** A blocks B ⇒ from=A to=B。B 在 A 未终态时被挡住。 */
-export function hasOpenBlockers(db: TaskboardDb, ticketId: string): boolean {
+export function listOpenBlockers(db: TaskboardDb, ticketId: string): Ticket[] {
   const rels = listRelations(db, ticketId)
+  const out: Ticket[] = []
   for (const rel of rels) {
     if (rel.kind !== 'blocks' || rel.toTicketId !== ticketId) continue
     const blocker = getTicket(db, rel.fromTicketId)
-    if (blocker && !TERMINAL.has(blocker.status)) return true
+    if (blocker && !TERMINAL.has(blocker.status)) out.push(blocker)
   }
-  return false
+  return out
+}
+
+export function hasOpenBlockers(db: TaskboardDb, ticketId: string): boolean {
+  return listOpenBlockers(db, ticketId).length > 0
 }
 
 function entrySatisfied(db: TaskboardDb, ticket: Ticket, stage: PipelineStage): boolean {

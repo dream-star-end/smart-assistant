@@ -14,8 +14,9 @@
 //      流水线被改序后会静默失效。
 //   3. 同状态自转一律拒绝。状态转移是审计事件;字段 PATCH / 续 lease 不走这里,
 //      放行自转会让前端「这张卡能做什么」出现假动作,也掩盖客户端重复提交。
-//   4. 终态(done/canceled)不可转出,唯一出口是人显式重开 → ready。canceled 与
-//      done 对称:人都可能手滑关错单,重开比再新建一张能保住 identifier 与时间线。
+//   4. 终态(done/canceled)不可转出,唯一出口是人显式重开 → ready(AI 站)或
+//      waiting_human(human 站)。canceled 与 done 对称:人都可能手滑关错单,
+//      重开比再新建一张能保住 identifier 与时间线。
 //   5. agent 的 running→ready 必须 stageOnSuccess ∈ {advance, stay}:
 //      advance = 推进下一站后回到待认领;stay = 留在本站等下一轮巡检。
 //      wait_human 只能走 running→waiting_human,不许借 ready 绕过确认门。
@@ -115,6 +116,7 @@ export const TRANSITION_TABLE: readonly TransitionRule[] = [
     label: '开始执行',
     requireLeaseForAgent: true,
   },
+  { from: 'ready', to: 'waiting_human', actors: ['human'], label: '改为待确认' },
   { from: 'ready', to: 'blocked', actors: ['human', 'system'], label: '标记受阻' },
   { from: 'ready', to: 'backlog', actors: ['human'], label: '撤回批准' },
   closeRule('ready'),
@@ -140,6 +142,7 @@ export const TRANSITION_TABLE: readonly TransitionRule[] = [
     label: '回到待执行',
     requireOnSuccess: ['advance', 'stay'],
   },
+  { from: 'running', to: 'backlog', actors: ['human'], label: '退回立项' },
   closeRule('running'),
   cancelRule('running'),
 
@@ -158,9 +161,11 @@ export const TRANSITION_TABLE: readonly TransitionRule[] = [
   closeRule('blocked'),
   cancelRule('blocked'),
 
-  // 终态重开:仅 human,且只回到 ready(重新排队等认领,不直接 running)
+  // 终态重开:仅 human。AI 站回到 ready;human 站回到 waiting_human。
   { from: 'done', to: 'ready', actors: ['human'], label: '重开' },
+  { from: 'done', to: 'waiting_human', actors: ['human'], label: '重开' },
   { from: 'canceled', to: 'ready', actors: ['human'], label: '重开' },
+  { from: 'canceled', to: 'waiting_human', actors: ['human'], label: '重开' },
 ]
 
 const RULE_INDEX = new Map<string, TransitionRule>()
@@ -185,7 +190,7 @@ function actorDeniedReason(from: TicketStatus, to: TicketStatus, actor: Actor): 
   if (to === 'canceled') {
     return '取消单据只有人能做。'
   }
-  if ((from === 'done' || from === 'canceled') && to === 'ready') {
+  if ((from === 'done' || from === 'canceled') && (to === 'ready' || to === 'waiting_human')) {
     return '重开已关闭的单据只有人能做。'
   }
   if (from === 'ready' && to === 'running' && actor === 'system') {

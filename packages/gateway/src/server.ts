@@ -4938,7 +4938,7 @@ export class Gateway {
       url.pathname.match(/^\/api\/board\/tickets\/([^/]+)$/) ||
       url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/(ready|claim|advance)$/) ||
       url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/(block|approve|reject)$/) ||
-      url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/(done|cancel|comment|patrol)$/) ||
+      url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/(done|cancel|comment|patrol|move)$/) ||
       url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/runs$/) ||
       url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/relations$/) ||
       url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/comments$/) ||

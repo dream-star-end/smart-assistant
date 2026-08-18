@@ -160,6 +160,7 @@ describe('bridge API allowlist', () => {
       'cancel',
       'comment',
       'patrol',
+      'move',
     ]) {
       assert.equal(
         matchCommercialContainerApiProxy(`/api/board/tickets/OCV5-1/${action}`, 'POST')?.label,

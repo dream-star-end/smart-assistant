@@ -17,6 +17,7 @@ const DEFAULT_ALLOWS = new Set<string>([
   'human:backlog>done',
   'human:backlog>canceled',
   'human:ready>running',
+  'human:ready>waiting_human',
   'human:ready>blocked',
   'human:ready>backlog',
   'human:ready>done',
@@ -24,6 +25,7 @@ const DEFAULT_ALLOWS = new Set<string>([
   'human:running>waiting_human',
   'human:running>blocked',
   'human:running>ready',
+  'human:running>backlog',
   'human:running>done',
   'human:running>canceled',
   'human:waiting_human>ready',
@@ -38,7 +40,9 @@ const DEFAULT_ALLOWS = new Set<string>([
   'human:blocked>done',
   'human:blocked>canceled',
   'human:done>ready',
+  'human:done>waiting_human',
   'human:canceled>ready',
+  'human:canceled>waiting_human',
   // agent:默认上下文只剩执行中的两条(认领/推进/关单都要额外条件)
   'agent:running>waiting_human',
   'agent:running>blocked',
@@ -171,12 +175,13 @@ describe('gated 转移', () => {
 })
 
 describe('终态与自转', () => {
-  it('done/canceled 不能转到非 ready,人重开只能 ready', () => {
+  it('done/canceled 人重开只能 ready 或 waiting_human,agent 不能转出', () => {
+    const reopenTo = new Set<TicketStatus>(['ready', 'waiting_human'])
     for (const from of ['done', 'canceled'] as const) {
       for (const to of TICKET_STATUSES) {
         if (to === from) continue
         const human = canTransition({ from, to, actor: 'human' })
-        if (to === 'ready') assert.equal(human.ok, true)
+        if (reopenTo.has(to)) assert.equal(human.ok, true)
         else {
           assert.equal(human.ok, false)
           if (!human.ok) assert.equal(human.code, 'terminal_locked')

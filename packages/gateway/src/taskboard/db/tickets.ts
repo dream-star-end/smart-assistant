@@ -322,6 +322,28 @@ export function listTickets(
 }
 
 /**
+ * 项目内非终态票据按 type 计数。看板未指定 ticketType 时选「积压最多的类型」。
+ */
+export function countNonTerminalTicketsByType(
+  db: TaskboardDb,
+  projectId: string,
+): Record<TicketType, number> {
+  const counts: Record<TicketType, number> = { bug: 0, feature: 0, spike: 0, chore: 0 }
+  const rows = db
+    .prepare(
+      `SELECT type, COUNT(*) AS n FROM tb_ticket
+        WHERE project_id = ?
+          AND status NOT IN ('done', 'canceled')
+        GROUP BY type`,
+    )
+    .all(projectId) as { type: TicketType; n: number }[]
+  for (const row of rows) {
+    if (row.type in counts) counts[row.type] = row.n
+  }
+  return counts
+}
+
+/**
  * 带乐观锁的写。expectedVersion 必须等于当前 version,否则抛
  * TaskboardVersionConflict。成功后 version+1。
  */
