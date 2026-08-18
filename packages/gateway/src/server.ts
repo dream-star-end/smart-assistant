@@ -4930,6 +4930,9 @@ export class Gateway {
       url.pathname === '/api/board/pipelines' ||
       url.pathname === '/api/board/agents' ||
       url.pathname === '/api/board/settings' ||
+      url.pathname === '/api/board/stats/cost' ||
+      url.pathname === '/api/board/templates' ||
+      url.pathname === '/api/board/reports/weekly' ||
       url.pathname.match(/^\/api\/board\/projects\/([^/]+)$/) ||
       url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/board$/) ||
       url.pathname.match(/^\/api\/board\/tickets\/([^/]+)$/) ||
@@ -4945,7 +4948,9 @@ export class Gateway {
       url.pathname.match(/^\/api\/board\/pipelines\/([^/]+)\/stages$/) ||
       url.pathname.match(/^\/api\/board\/stages\/([^/]+)$/) ||
       url.pathname.match(/^\/api\/board\/runs\/([^/]+)$/) ||
-      url.pathname.match(/^\/api\/board\/relations\/([^/]+)$/)
+      url.pathname.match(/^\/api\/board\/relations\/([^/]+)$/) ||
+      url.pathname.match(/^\/api\/board\/templates\/([^/]+)$/) ||
+      url.pathname.match(/^\/api\/board\/templates\/([^/]+)\/apply$/)
     ) {
       handleTaskboardApi(req, res, {
         resolveActor: (r) =>
@@ -17415,6 +17420,7 @@ const KNOWN_ROUTES = [
   '/api/runs', '/api/sessions', '/api/config', '/api/agents', '/api/search',
   '/api/cron', '/api/board', '/api/board/projects', '/api/board/tickets',
   '/api/board/pipelines', '/api/board/agents', '/api/board/settings',
+  '/api/board/stats/cost', '/api/board/templates', '/api/board/reports/weekly',
   '/api/delegate/wait', '/api/tasks', '/api/tasks-executions', '/api/webhooks',
   '/api/wechat/pair/start', '/api/wechat/pair/poll', '/api/wechat/pair/cancel',
   '/api/wechat/binding', '/api/wechat/binding/status',
@@ -17443,6 +17449,8 @@ function normalizePath(p: string): string {
     .replace(/\/api\/board\/stages\/[^/]+/, '/api/board/stages/:id')
     .replace(/\/api\/board\/runs\/[^/]+/, '/api/board/runs/:id')
     .replace(/\/api\/board\/relations\/[^/]+/, '/api/board/relations/:id')
+    .replace(/\/api\/board\/templates\/[^/]+\/apply/, '/api/board/templates/:id/apply')
+    .replace(/\/api\/board\/templates\/[^/]+/, '/api/board/templates/:id')
     .replace(/\/api\/tasks\/[a-zA-Z0-9_-]+/, '/api/tasks/:id')
     .replace(/\/api\/webhooks\/[a-zA-Z0-9_-]+/, '/api/webhooks/:id')
     .replace(/\/api\/media\/.+/, '/api/media/:file')

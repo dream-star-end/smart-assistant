@@ -364,6 +364,36 @@ export const BRIDGE_API_ALLOWLIST: readonly BridgeApiAllowRule[] = [
     methods: M('GET', 'PATCH'),
     proxyFromCommercial: true,
   },
+  {
+    label: '/api/board/stats/cost',
+    re: /^\/api\/board\/stats\/cost$/,
+    methods: M('GET'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/templates',
+    re: /^\/api\/board\/templates$/,
+    methods: M('GET', 'POST'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/templates/:id',
+    re: /^\/api\/board\/templates\/[^/]+$/,
+    methods: M('GET', 'DELETE'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/templates/:id/apply',
+    re: /^\/api\/board\/templates\/[^/]+\/apply$/,
+    methods: M('POST'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/reports/weekly',
+    re: /^\/api\/board\/reports\/weekly$/,
+    methods: M('GET'),
+    proxyFromCommercial: true,
+  },
 
   {
     label: '/api/tasks',

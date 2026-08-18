@@ -243,6 +243,34 @@ describe('bridge API allowlist', () => {
       matchCommercialContainerApiProxy('/api/board/settings', 'PATCH')?.label,
       '/api/board/settings',
     )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/stats/cost', 'GET')?.label,
+      '/api/board/stats/cost',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/templates', 'GET')?.label,
+      '/api/board/templates',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/templates', 'POST')?.label,
+      '/api/board/templates',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/templates/builtin:bug', 'GET')?.label,
+      '/api/board/templates/:id',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/templates/builtin:bug', 'DELETE')?.label,
+      '/api/board/templates/:id',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/templates/builtin:bug/apply', 'POST')?.label,
+      '/api/board/templates/:id/apply',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/reports/weekly', 'GET')?.label,
+      '/api/board/reports/weekly',
+    )
     assert.equal(matchCommercialContainerApiProxy('/api/tasks', 'POST')?.label, '/api/tasks')
     assert.equal(
       matchCommercialContainerApiProxy('/api/tasks/task_1', 'POST')?.label,
