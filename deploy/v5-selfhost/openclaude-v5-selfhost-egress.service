@@ -1,8 +1,8 @@
 [Unit]
 # WorkingDirectory 必须指向 -live symlink,与 master 共用同一份不可变 release。
 Description=OpenClaude v5 Selfhost Egress Proxy (LLM upstream plane)
-After=network.target postgresql.service redis-server.service docker.service
-Wants=postgresql.service redis-server.service docker.service
+After=network.target postgresql.service redis-server.service docker.service openclaude-v5-selfhost-boot-guard.service
+Wants=postgresql.service redis-server.service docker.service openclaude-v5-selfhost-boot-guard.service
 
 [Service]
 Type=simple

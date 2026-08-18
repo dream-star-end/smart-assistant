@@ -372,6 +372,22 @@ find_master_release_donor() { # <staging-lock>
     fi
     mlog "  OC_V5_MASTER_DONOR lock 不匹配,忽略 $pinned"
   fi
+  # 优先上一份合法 live(绝不用工作树、绝不用 .poisoned)。
+  if [[ -L "$MASTER_LIVE_LINK" ]]; then
+    cand="$(readlink -f -- "$MASTER_LIVE_LINK" 2>/dev/null || true)"
+    if [[ -n "$cand" ]] && ! release_dir_is_poisoned "$cand" \
+      && [[ -f "$cand/.complete" && ! -L "$cand/.complete" ]] \
+      && [[ -d "$cand/node_modules" && ! -L "$cand/node_modules" ]] \
+      && [[ -f "$cand/package-lock.json" ]] \
+      && cmp -s "$staging_lock" "$cand/package-lock.json"; then
+      mlog "  donor=live $cand"
+      printf '%s\n' "$cand"
+      return 0
+    fi
+    if [[ -n "$cand" ]]; then
+      mlog "  live donor 不可用(缺 .complete / lock 不匹配 / poisoned),继续找其它完整 release"
+    fi
+  fi
   if [[ -d "$MASTER_RELEASES_ROOT" ]]; then
     while IFS= read -r cand; do
       [[ -n "$cand" ]] || continue
@@ -710,7 +726,14 @@ read_required_migration_gap() { # <rel>
   local rel="$1" meta applied required
   meta="$rel/deploy/v5/release-metadata.json"
   [[ -f "$meta" ]] || { mlog "迁移门: 缺 $meta"; return 1; }
-  required="$(jq -er '.requiredMigrations[]?' "$meta" 2>/dev/null || true)"
+  if ! jq -e '.requiredMigrations | type == "array"' "$meta" >/dev/null 2>&1; then
+    mlog "迁移门: requiredMigrations 不是数组(或字段缺失)。fail-closed。"
+    return 1
+  fi
+  required="$(jq -er '.requiredMigrations[]' "$meta")" || {
+    mlog "迁移门: 读取 requiredMigrations 失败"
+    return 1
+  }
   if ! command -v psql >/dev/null 2>&1; then
     mlog "迁移门: 缺 psql,无法只读查 schema_migrations"
     return 1
@@ -947,11 +970,37 @@ snapshot_cutover_units_from_release() { # <rel> <out-var>
   printf -v "$dest_var" '%s' "$snap"
 }
 
+# 解析已验证的工作树 unit 备份(二级回滚目标)。不更新任何指针。
+resolve_worktree_unit_backup() {
+  local cur real wd_m wd_e
+  cur="${BREAKGLASS_ROOT}/unit-backups/worktree-current"
+  if [[ -L "$cur" ]]; then
+    real="$(readlink -f -- "$cur" 2>/dev/null || true)"
+  elif [[ -d "$cur" && ! -L "$cur" ]]; then
+    real="$cur"
+  else
+    return 1
+  fi
+  [[ -n "$real" && -d "$real" && ! -L "$real" ]] || return 1
+  [[ -f "$real/${V5_UNIT}" && ! -L "$real/${V5_UNIT}" ]] || return 1
+  [[ -f "$real/${V5_EGRESS_UNIT}" && ! -L "$real/${V5_EGRESS_UNIT}" ]] || return 1
+  [[ "$(stat -c '%s' -- "$real/${V5_UNIT}")" -gt 0 ]] || return 1
+  [[ "$(stat -c '%s' -- "$real/${V5_EGRESS_UNIT}")" -gt 0 ]] || return 1
+  wd_m="$(unit_template_working_directory "$real/${V5_UNIT}")"
+  wd_e="$(unit_template_working_directory "$real/${V5_EGRESS_UNIT}")"
+  [[ "$wd_m" == /opt/openclaude/openclaude-v5-selfhost ]] || return 1
+  [[ "$wd_e" == /opt/openclaude/openclaude-v5-selfhost ]] || return 1
+  grep -q '^ExecStart=' "$real/${V5_UNIT}" || return 1
+  grep -q '^ExecStart=' "$real/${V5_EGRESS_UNIT}" || return 1
+  printf '%s\n' "$real"
+}
+
 # caller-provided 输出变量,不用会清 errexit 的命令替换。
-# 每个写步骤显式检查;校验两份备份都是普通文件、WD=工作树、可解析;
-# 写完并 sync 后才原子更新 worktree-current。
+# 每个写步骤显式检查。首次(installed WD=工作树):校验后原子更新 worktree-current。
+# 后续(installed WD=live):只写 forensics 快照,不覆盖 worktree-current;
+# dest_var 返回已有的工作树备份,供二级回滚使用。
 backup_installed_units_for_cutover() { # <out-var>
-  local dest_var="$1" ts dest wd_m wd_e tmp_link
+  local dest_var="$1" ts dest wd_m wd_e tmp_link wt
   [[ "$dest_var" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
   ts="$(date -u +%Y%m%d-%H%M%S)" || return 1
   dest="${BREAKGLASS_ROOT}/unit-backups/pre-cutover-${ts}"
@@ -968,27 +1017,42 @@ backup_installed_units_for_cutover() { # <out-var>
   [[ "$(stat -c '%s' -- "$dest/${V5_EGRESS_UNIT}")" -gt 0 ]] || return 1
   wd_m="$(unit_template_working_directory "$dest/${V5_UNIT}")"
   wd_e="$(unit_template_working_directory "$dest/${V5_EGRESS_UNIT}")"
-  [[ "$wd_m" == /opt/openclaude/openclaude-v5-selfhost ]] \
-    || { mlog "backup master WD='$wd_m' 不是工作树"; return 1; }
-  [[ "$wd_e" == /opt/openclaude/openclaude-v5-selfhost ]] \
-    || { mlog "backup egress WD='$wd_e' 不是工作树"; return 1; }
   grep -q '^ExecStart=' "$dest/${V5_UNIT}" || return 1
   grep -q '^ExecStart=' "$dest/${V5_EGRESS_UNIT}" || return 1
-  printf 'backup=%s\ninstalled_master=%s\ninstalled_egress=%s\n' \
+  printf 'backup=%s\ninstalled_master=%s\ninstalled_egress=%s\nwd_master=%s\nwd_egress=%s\n' \
     "$dest" "/etc/systemd/system/${V5_UNIT}" "/etc/systemd/system/${V5_EGRESS_UNIT}" \
+    "$wd_m" "$wd_e" \
     >"$dest/MANIFEST.txt" || return 1
   fsync_path "$dest/${V5_UNIT}" || return 1
   fsync_path "$dest/${V5_EGRESS_UNIT}" || return 1
   fsync_path "$dest/MANIFEST.txt" || return 1
   fsync_path "$dest" || return 1
   mkdir -p -- "${BREAKGLASS_ROOT}/unit-backups" || return 1
-  tmp_link="${BREAKGLASS_ROOT}/unit-backups/worktree-current.new.$$"
-  ln -sfn -- "$dest" "$tmp_link" || return 1
-  mv -Tf -- "$tmp_link" "${BREAKGLASS_ROOT}/unit-backups/worktree-current" || {
-    rm -f -- "$tmp_link"
-    return 1
-  }
-  printf -v "$dest_var" '%s' "$dest"
+
+  if [[ "$wd_m" == /opt/openclaude/openclaude-v5-selfhost \
+     && "$wd_e" == /opt/openclaude/openclaude-v5-selfhost ]]; then
+    tmp_link="${BREAKGLASS_ROOT}/unit-backups/worktree-current.new.$$"
+    ln -sfn -- "$dest" "$tmp_link" || return 1
+    mv -Tf -- "$tmp_link" "${BREAKGLASS_ROOT}/unit-backups/worktree-current" || {
+      rm -f -- "$tmp_link"
+      return 1
+    }
+    printf -v "$dest_var" '%s' "$dest"
+    return 0
+  fi
+
+  if [[ "$wd_m" == "$MASTER_LIVE_LINK" && "$wd_e" == "$MASTER_LIVE_LINK" ]]; then
+    wt="$(resolve_worktree_unit_backup)" || {
+      mlog "当前 unit 已是 live WD,但 worktree-current 缺失或不是工作树备份。二级回滚不可用。"
+      return 1
+    }
+    mlog "  当前 unit 已是 live WD;forensics=$dest;二级回滚仍用工作树备份 $wt(不覆盖 worktree-current)"
+    printf -v "$dest_var" '%s' "$wt"
+    return 0
+  fi
+
+  mlog "backup: installed WD 既不是工作树也不是 live master='$wd_m' egress='$wd_e'"
+  return 1
 }
 
 dist_oc_build() { # <rel>

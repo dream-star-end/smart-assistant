@@ -15,7 +15,7 @@
 #
 # 用法:
 #   scripts/deploy-v5-selfhost.sh --preflight
-#   scripts/deploy-v5-selfhost.sh --bootstrap [--force-env]
+#   scripts/deploy-v5-selfhost.sh --bootstrap [--force-env]   # 仅首次安装;已有 live 请用 --deploy
 #   scripts/deploy-v5-selfhost.sh --deploy
 #   scripts/deploy-v5-selfhost.sh --deploy --allow-dirty --platform-from-head
 #   scripts/deploy-v5-selfhost.sh --build-master-only [--force-npm-ci]
@@ -24,10 +24,16 @@
 #   scripts/deploy-v5-selfhost.sh --status
 #   scripts/deploy-v5-selfhost.sh --bootstrap --dry-run
 #
-# --cutover 是不可分割翻转窗口(持锁 → 静态门 → 迁移门 → 备份 unit → 武装
-# survivor → 从候选 snapshot 装 live unit → grace → 原子 symlink → restart
-# → smoke)。失败走统一补偿。本阶段未授权前只允许 --dry-run。
-# --deploy/--bootstrap 已 fail-closed,不是可执行发布命令。
+# --deploy = 构建不可变 master release + 容器制品,再走与 --cutover 同一套
+# 翻转状态机(统一补偿 / 两级回滚 / phase-aware survivor / 候选内 snapshot unit)。
+# 不要另写一套并行翻转逻辑。--cutover 仍是「已有 rel-*、只翻转」的手动逃生入口。
+#
+# 脏工作树三面语义(2026-08-18 根治后):
+#   master live     : 永远 git archive HEAD,脏文件不会进线上进程
+#   runtime-release : 永远 git archive HEAD,给 agent 容器 bind
+#   platform bundle : 默认拷工作树(可能带脏);--platform-from-head 则 archive
+# 默认仍拒脏,避免 platform 半成品进全员容器。别人的未提交文件挡路时:
+#   --allow-dirty --platform-from-head  (master/runtime/platform 三面都干净)
 #
 # bootstrap 之后的一次性配套(各自幂等,详见脚本内注释):
 #   scripts/selfhost-setup-host-access.sh --uid <admin_uid> --apply   宿主 SSH 通道
@@ -88,6 +94,9 @@ PLATFORM_FROM_HEAD=0
 FORCE_NPM_CI=0
 MODE=""
 CUTOVER_RELEASE=""
+DEPLOY_BUILT_RELEASE=""
+CUTOVER_JOINT=0
+CUTOVER_TUPLE_BUNDLE=""
 
 # 本实例专属发布锁。禁止复用:
 #   /var/lock/oc-v5-deploy.lock                      V5 商业版生产(deploy-v5.sh / 发布队列 / 自愈)
@@ -298,7 +307,7 @@ PY
 # fd 8 排他 flock:进程退出/被杀时内核释放,不手删锁文件。
 # OC_V5_SELFHOST_DEPLOY_LOCK_HELD=1 表示本进程链已持锁(内层跳过,防将来 $0 自调用把自己锁死)。
 acquire_selfhost_deploy_lock() {
-  local lock wait_s interval waited info holder_line
+  local lock wait_s interval waited info holder_line starttime
   if [[ "${OC_V5_SELFHOST_DEPLOY_LOCK_HELD:-}" == 1 ]]; then
     log "  ↻ 本进程链已持 selfhost 发布锁,跳过加锁(可重入)"
     return 0
@@ -335,8 +344,13 @@ acquire_selfhost_deploy_lock() {
     done
   fi
   SELFHOST_DEPLOY_LOCK_HOLDER="${lock}.holder"
-  holder_line="$(printf 'pid=%s user=%s tree=%s started=%s\n' \
-    "$$" "$(id -un 2>/dev/null || echo ?)" "${REPO_ROOT:-?}" "$(date -Is)")"
+  starttime="$(python3 -c 'import os,sys
+p="/proc/%d/stat"%os.getpid()
+t=open(p).read(); rest=t[t.rfind(")")+2:].split(); print(rest[19])')" \
+    || die "无法读取 /proc/$$/stat starttime(看护靠它防 PID reuse)"
+  [[ "$starttime" =~ ^[0-9]+$ ]] || die "starttime 非法: $starttime"
+  holder_line="$(printf 'pid=%s user=%s tree=%s started=%s starttime=%s\n' \
+    "$$" "$(id -un 2>/dev/null || echo ?)" "${REPO_ROOT:-?}" "$(date -Is)" "$starttime")"
   selfhost_lock_py write-holder "$SELFHOST_DEPLOY_LOCK_HOLDER" "$holder_line"
   SELFHOST_DEPLOY_LOCK_HOLDER_OWNED=1
   export OC_V5_SELFHOST_DEPLOY_LOCK_HELD=1
@@ -358,31 +372,40 @@ usage() {
   cat <<'EOF'
 用法: scripts/deploy-v5-selfhost.sh --preflight|--bootstrap|--deploy|--build-master-only|--cutover|--smoke|--status [--dry-run] [--force-env] [--allow-dirty] [--platform-from-head] [--force-npm-ci] [--release=PATH]
 
+日常发布(另一位 agent 请看这里):
+  scripts/deploy-v5-selfhost.sh --deploy
+  scripts/deploy-v5-selfhost.sh --deploy --allow-dirty --platform-from-head
+
   --preflight           只读硬门(残留/端口/密钥/个人版)。任何一条不满足即非 0 退出
-  --bootstrap           已 fail-closed。旧首次安装入口;unit 模板已改指 -live 后禁止再跑
-  --deploy              已 fail-closed。旧 tuple-only+工作树 saga;请改用 --cutover / --build-master-only
+  --bootstrap           仅首次安装。本机已有 live symlink / env 时请改用 --deploy
+  --deploy              常规发布:构建不可变 master release(staging 内 vite)+容器制品,再走 --cutover 同一套翻转状态机
   --build-master-only   只建一份不可变 master rel-*(不迁库/不装 unit/不切 symlink/不重启)
-  --cutover             不可分割翻转窗口:静态门+迁移门+备份+survivor+从候选装 unit+symlink+重启+smoke
-  --smoke               只读健康检查(含个人版回归)
-  --status              打印当前状态
+  --cutover             手动逃生:已有 rel-* 时只做翻转(静态门+迁移门+备份+survivor+装 unit+symlink+重启+smoke)
+  --smoke               只读健康检查(含个人版回归;live 存在时比对 release dist oc-build)
+  --status              打印当前状态(含 live / .prev-release / 四元组)
   --dry-run             与上述组合:打印将执行的命令,不改任何东西
   --release=PATH        仅配合 --cutover:指定候选 rel-* 绝对路径(默认=sourceCommit 等于 HEAD 的最新完整 release)
-  --allow-dirty         仅配合 --deploy:工作区有未提交改动时仍部署(默认拒绝,见 cmd_deploy 脏门)
+  --allow-dirty         仅配合 --deploy:工作区有未提交改动时仍部署(默认拒绝,防脏 platform 进全员容器)
   --platform-from-head  仅配合 --deploy/--bootstrap:平台 bundle 从 git archive 取已提交的 platform-runtime(默认仍拷工作树)
   --force-env           仅配合 --bootstrap:覆盖已存在的 env 文件
-  --force-npm-ci        仅配合 --build-master-only:跳过硬链,在 staging 内冷装(测 H1)
+  --force-npm-ci        配合 --build-master-only 或 --deploy:跳过硬链,在 staging 内冷装
+
+脏工作树三面:
+  master live     = git archive HEAD → 脏文件不会上线
+  runtime-release = git archive HEAD → 脏文件不会进容器 bind
+  platform bundle = 默认拷工作树(可能带脏);加 --platform-from-head 则干净
+  别人在树上改文件时推荐: --deploy --allow-dirty --platform-from-head
 
   写路径(--deploy/--bootstrap/--build-master-only/--cutover,非 dry-run)会在 /run/openclaude-v5-selfhost/deploy.lock 上排队等锁,默认 2400s。
   覆盖: OC_V5_SELFHOST_DEPLOY_LOCK / OC_V5_SELFHOST_DEPLOY_LOCK_WAIT / OC_V5_SELFHOST_DEPLOY_LOCK_POLL
   覆盖路径同样校验(普通文件、root 所有、目录非世界可写、拒绝跟随符号链接)。
 
 示例:
-  scripts/deploy-v5-selfhost.sh --preflight
+  scripts/deploy-v5-selfhost.sh --deploy
+  scripts/deploy-v5-selfhost.sh --deploy --allow-dirty --platform-from-head
   scripts/deploy-v5-selfhost.sh --build-master-only
-  scripts/deploy-v5-selfhost.sh --build-master-only --force-npm-ci
   scripts/deploy-v5-selfhost.sh --cutover --dry-run
   scripts/deploy-v5-selfhost.sh --cutover --release=/opt/openclaude/openclaude-v5-selfhost-releases/rel-...
-  # --deploy / --bootstrap 会立即 fail-closed,不要当发布入口。
   scripts/deploy-v5-selfhost.sh --smoke
 EOF
 }
@@ -416,8 +439,8 @@ done
 [[ "$ALLOW_DIRTY" == 1 && "$MODE" != "deploy" ]] && die "--allow-dirty 只能与 --deploy 同用"
 [[ "$PLATFORM_FROM_HEAD" == 1 && "$MODE" != "deploy" && "$MODE" != "bootstrap" ]] \
   && die "--platform-from-head 只能与 --deploy 或 --bootstrap 同用"
-[[ "$FORCE_NPM_CI" == 1 && "$MODE" != "build-master-only" ]] \
-  && die "--force-npm-ci 只能与 --build-master-only 同用"
+[[ "$FORCE_NPM_CI" == 1 && "$MODE" != "build-master-only" && "$MODE" != "deploy" ]] \
+  && die "--force-npm-ci 只能与 --build-master-only 或 --deploy 同用"
 [[ -n "$CUTOVER_RELEASE" && "$MODE" != "cutover" ]] \
   && die "--release= 只能与 --cutover 同用"
 [[ -f "$MASTER_RELEASE_LIB" ]] || die "缺 master release lib: $MASTER_RELEASE_LIB"
@@ -1036,6 +1059,15 @@ install_unit() {
   install -m 0644 "$src" "/etc/systemd/system/$name" || return 1
 }
 
+install_aux_units() {
+  log "── 安装辅助 systemd unit(hostnet/sshgate/tunnel;master/egress 只从候选 release snapshot 装) ──"
+  install_unit "$UNIT_DIR/$V5_HOSTNET_UNIT"
+  install_unit "$UNIT_DIR/$V5_SSHGATE_UNIT"
+  install_unit "$UNIT_DIR/$V5_TUNNEL_UNIT"
+  run "systemctl daemon-reload"
+  run "systemctl enable '$V5_HOSTNET_UNIT' '$V5_SSHGATE_UNIT'"
+}
+
 install_units() {
   log "── 安装 systemd unit ──"
   assert_unit_templates_live_wd "$UNIT_DIR"
@@ -1189,6 +1221,33 @@ activate_tuple() {
   log "  ✓ tuple 已原子写入 $V5_ENV"
 }
 
+# joint: 四元组 + masterRelease=候选 rel 绝对路径 + transitionKind=joint。
+# 失败只 return,由 cutover 统一补偿(symlink/unit 两级)。不 die。
+activate_tuple_joint() { # <master-rel> <prev-master-or-none>
+  local master_rel="$1" prev_master="$2" image_id bundle_val restart_cmd smoke_cmd prev_arg
+  image_id="${RUNTIME_IMAGE_ID:-}"
+  bundle_val="${CUTOVER_TUPLE_BUNDLE:-$OC_HOTCFG_PLATFORM_ROOT/bundles/$BUILT_BUNDLE_REV}"
+  [[ -n "$image_id" ]] || { cutover_clog "joint: 缺 RUNTIME_IMAGE_ID"; return 1; }
+  [[ -n "$BUILT_RUNTIME_RELEASE" ]] || { cutover_clog "joint: 缺 BUILT_RUNTIME_RELEASE"; return 1; }
+  [[ -n "$BUILT_BUNDLE_REV" ]] || { cutover_clog "joint: 缺 BUILT_BUNDLE_REV"; return 1; }
+  restart_cmd="$(egress_then_master_restart_cmd)"
+  smoke_cmd="cutover_smoke_against_release $(printf '%q' "$master_rel")"
+  prev_arg="$prev_master"
+  if [[ "$prev_arg" == "none" || "$prev_arg" == "NONE" ]]; then
+    prev_arg=""
+  fi
+  cutover_clog "  oc_hotcfg_activate_saga transitionKind=joint masterRelease=$master_rel prev=${prev_arg:-<empty>}"
+  mkdir -p "$(dirname "$OC_HOTCFG_HISTORY")"
+  oc_hotcfg_activate_saga \
+    "$V5_ENV" "$OC_HOTCFG_PLATFORM_ROOT" "$BUILT_BUNDLE_REV" "$OC_HOTCFG_HISTORY" \
+    "$RUNTIME_IMAGE" "$image_id" "$BUILT_RUNTIME_RELEASE" "$bundle_val" \
+    "$restart_cmd" "$smoke_cmd" \
+    "" "" "$master_rel" "$prev_arg" \
+    "" "" "" "joint" \
+    || { cutover_clog "joint activate_saga 失败(lib 已尝试回滚 env/current)"; return 1; }
+  cutover_clog "  ✓ joint tuple 已写入 $V5_ENV masterRelease=$master_rel"
+}
+
 enable_now_services() {
   log "── enable --now egress + master(egress 先就绪,理由见 egress_then_master_restart_cmd)──"
   run "systemctl enable '$V5_EGRESS_UNIT' '$V5_UNIT'"
@@ -1233,9 +1292,20 @@ cmd_smoke() {
   最近响应: ${hz:-<empty>}
   说明: V5 channel 走 leader lease(不是只看 OC_CONTROL_PLANE_LEADER);0135 seed desired_leader_slot=A,本实例 OC_SLOT 默认 A。补救: 查 journalctl 是否拒启,以及 deploy_state / leader_lease 行。"
   log "  ✓ /healthz 200 + controlPlaneEnabled + leadership.state=leader"
-  [[ -f "$REPO_ROOT/packages/web-react/dist/index.html" ]] \
-    || die "缺 packages/web-react/dist/index.html。master 从此路径 serve SPA。补救: 重跑 --deploy 以构建前端。"
-  local html spa_ok=0
+  local dist_html="" live_root=""
+  if [[ -L "$MASTER_LIVE_LINK" ]]; then
+    live_root="$(readlink -f "$MASTER_LIVE_LINK" 2>/dev/null || true)"
+    if [[ -n "$live_root" && -f "$live_root/packages/web-react/dist/index.html" ]]; then
+      dist_html="$live_root/packages/web-react/dist/index.html"
+    fi
+  fi
+  if [[ -z "$dist_html" ]]; then
+    dist_html="$REPO_ROOT/packages/web-react/dist/index.html"
+  fi
+  [[ -f "$dist_html" ]] \
+    || die "缺 SPA dist/index.html($dist_html)。master 从 live release 的 packages/web-react/dist serve。补救: 重跑 --deploy。"
+  local html spa_ok=0 expected_build got_build
+  expected_build="$(grep -o 'name="oc-build" content="[0-9a-f]\{8,32\}"' "$dist_html" | grep -o '[0-9a-f]\{8,32\}' | head -1 || true)"
   for i in $(seq 1 15); do
     html="$(curl -fsS --max-time 5 "http://127.0.0.1:${V5_PORT}/" 2>/dev/null || true)"
     if echo "$html" | grep -q 'name="oc-build"'; then
@@ -1247,7 +1317,11 @@ cmd_smoke() {
   done
   [[ "$spa_ok" == 1 ]] \
     || die "GET / 不是 SPA index.html(缺 oc-build meta)。补救: 确认 OC_RUNTIME_CHANNEL=v5 且 dist 已构建后 restart master。"
-  log "  ✓ GET / 返回 SPA index.html(含 oc-build)"
+  got_build="$(echo "$html" | grep -o 'name="oc-build" content="[0-9a-f]\{8,32\}"' | grep -o '[0-9a-f]\{8,32\}' | head -1 || true)"
+  if [[ -n "$expected_build" && -n "$got_build" && "$got_build" != "$expected_build" ]]; then
+    die "GET / oc-build=$got_build 不等于 ${dist_html} 的 $expected_build。补救: 确认 live 指向本次 release 后 restart master。"
+  fi
+  log "  ✓ GET / 返回 SPA index.html(oc-build=${got_build:-present} src=${dist_html})"
   assert_ssh_rule_before_drop
   assert_personal_alive
   log "  ✓ 个人版 $PERSONAL_UNIT 仍 active 且 :$PERSONAL_PORT 仍 200"
@@ -1255,9 +1329,22 @@ cmd_smoke() {
 }
 
 cmd_status() {
+  local live_now prev_now
   log "══ selfhost status ══"
   log "  worktree: $REPO_ROOT"
   log "  HEAD: $(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo '?')"
+  if [[ -L "$MASTER_LIVE_LINK" ]]; then
+    live_now="$(readlink -f "$MASTER_LIVE_LINK" 2>/dev/null || echo dangling)"
+    log "  live: $MASTER_LIVE_LINK → $live_now"
+  else
+    log "  live: MISSING $MASTER_LIVE_LINK"
+  fi
+  if [[ -f "$MASTER_RELEASES_ROOT/.prev-release" ]]; then
+    prev_now="$(tr -d '[:space:]' <"$MASTER_RELEASES_ROOT/.prev-release")"
+    log "  prev: $prev_now"
+  else
+    log "  prev: MISSING"
+  fi
   log "  env: $V5_ENV $([ -f "$V5_ENV" ] && echo present || echo MISSING) mode=$(stat -c %a "$V5_ENV" 2>/dev/null || echo -)"
   if [[ -f "$V5_ENV" ]]; then
     log "  OC_RUNTIME_IMAGE=$(oc_hotcfg_env_get "$V5_ENV" OC_RUNTIME_IMAGE)"
@@ -1309,11 +1396,87 @@ cmd_status() {
 # ── bootstrap / deploy / cutover ─────────────────────────────────────────
 
 cmd_bootstrap() {
-  assert_old_deploy_fail_closed
+  log "══ v5 selfhost bootstrap ══"
+  if [[ -L "$MASTER_LIVE_LINK" ]] || own_instance_present; then
+    die "本实例已经安装(env/unit 或 live symlink 存在)。--bootstrap 只用于首次从零安装。
+日常发布请用:
+  scripts/deploy-v5-selfhost.sh --deploy
+  scripts/deploy-v5-selfhost.sh --deploy --allow-dirty --platform-from-head
+手动逃生(已有 rel-* 只翻转):
+  scripts/deploy-v5-selfhost.sh --cutover --release=/abs/rel-*
+应急把 unit 装回工作树:
+  /opt/openclaude/v5-selfhost-breakglass/restore-worktree-units.sh
+说明: master 现在跑 /opt/openclaude/openclaude-v5-selfhost-live → 不可变 rel-*;
+工作树 $REPO_ROOT 只用来改代码,重启不会再吃未提交 TS。"
+  fi
+  die "首次安装路径尚未在本轮合入(本机已是 live 实例,不会走到这里)。若你在全新机器上:
+1) 确认没有 $V5_ENV / $V5_UNIT / $MASTER_LIVE_LINK
+2) 联系维护者跑带 joint 的首次 bootstrap,或先手工写 env/网再 --deploy。"
+}
+
+explain_dirty_semantics() {
+  log "── 脏工作树三面语义 ──"
+  log "  master live     : git archive HEAD → 脏文件不会进线上进程 cwd"
+  log "  runtime-release : git archive HEAD → 脏文件不会进容器 bind"
+  if [[ "$PLATFORM_FROM_HEAD" == 1 ]]; then
+    log "  platform bundle : --platform-from-head → 也从已提交树 archive,不带脏"
+  else
+    log "  platform bundle : 默认拷工作树 → 未提交的 platform-runtime 会进全员容器"
+    log "                    要干净请加 --platform-from-head"
+  fi
 }
 
 cmd_deploy() {
-  assert_old_deploy_fail_closed
+  local sha dirty
+  log "══ v5 selfhost --deploy(不可变 master + 容器制品 + joint 翻转) ══"
+  log "流程: 构建 master release(staging vite) → runtime-release → platform bundle"
+  log "      → 复用 --cutover 同一套状态机翻转(survivor / 两级回滚 / 候选 snapshot unit)"
+  log "      前端不再吃工作树;masterRelease/transitionKind 记新 live rel-*"
+  preflight_common
+  explain_dirty_semantics
+  dirty="$(git -C "$REPO_ROOT" status --porcelain)"
+  if [[ -n "$dirty" && "$ALLOW_DIRTY" != 1 ]]; then
+    die "工作区不干净。master/runtime 虽来自 git archive、不受这些脏文件污染,
+但默认 platform bundle 仍拷工作树,脏的 platform-runtime 会进全员容器:
+$dirty
+补救:
+  提交后再 --deploy
+  或 --deploy --allow-dirty --platform-from-head   # 三面都走已提交树(推荐,别人也在改时)
+  或 --deploy --allow-dirty                        # 允许脏 platform(明白风险)"
+  fi
+  if [[ -n "$dirty" ]]; then
+    log "  ⚠ 工作区有未提交改动(--allow-dirty)。它们不会进入 master live / runtime-release。"
+    if [[ "$PLATFORM_FROM_HEAD" != 1 ]]; then
+      log "  ⚠ platform bundle 将带这些脏文件。建议下次加 --platform-from-head。"
+    fi
+    log "$dirty"
+  fi
+  [[ -f "$V5_ENV" ]] || die "缺 $V5_ENV,这不是更新路径。补救: 首次安装走 --bootstrap;本机已有实例则检查 env 是否被挪走。"
+  docker network inspect openclaude-v5-net >/dev/null 2>&1 \
+    || die "openclaude-v5-net 不存在。补救: 不要在 --deploy 里建网;确认 bootstrap 做过或手工恢复该网。"
+  [[ -L "$MASTER_LIVE_LINK" ]] \
+    || die "缺 live symlink $MASTER_LIVE_LINK。本 --deploy 假定首次翻转已完成。
+补救: --cutover --release=<已有 rel-*> 完成首次翻转,或跑应急 restore-worktree-units.sh。"
+
+  ensure_node_modules
+  install_aux_units
+  ensure_model_authority
+  sha="$(source_commit)"
+  log "── HEAD=$sha 构建三面制品(失败则 live 不动) ──"
+  build_master_release
+  [[ -n "$BUILT_MASTER_RELEASE" ]] || die "build_master_release 未设置 BUILT_MASTER_RELEASE"
+  if [[ "$DRY" != 1 ]]; then
+    [[ -f "$BUILT_MASTER_RELEASE/.complete" ]] || die "缺 .complete: $BUILT_MASTER_RELEASE"
+    log "  ✓ master release=$BUILT_MASTER_RELEASE donor 优先 live,不吃工作树/.poisoned"
+  fi
+  build_runtime_release "$sha"
+  build_platform_bundle "$sha"
+  CUTOVER_TUPLE_BUNDLE="$OC_HOTCFG_PLATFORM_ROOT/bundles/$BUILT_BUNDLE_REV"
+  DEPLOY_BUILT_RELEASE="$BUILT_MASTER_RELEASE"
+  CUTOVER_JOINT=1
+  log "── 进入 --cutover 翻转窗口(同一套状态机,不是第二份逻辑) release=$DEPLOY_BUILT_RELEASE ──"
+  cmd_cutover
+  log "✓ --deploy 完成 live → $DEPLOY_BUILT_RELEASE"
 }
 
 cutover_clog() {
@@ -1494,7 +1657,7 @@ cmd_cutover() {
     CUTOVER_LOG="/opt/openclaude/tmp/cutover-$(date -u +%Y%m%d-%H%M%S).log"
   fi
   : >"$CUTOVER_LOG"
-  cutover_clog "══ v5 selfhost --cutover DRY=$DRY log=$CUTOVER_LOG ══"
+  cutover_clog "══ v5 selfhost --cutover DRY=$DRY JOINT=${CUTOVER_JOINT:-0} log=$CUTOVER_LOG ══"
   head="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 
   step=1
@@ -1505,7 +1668,12 @@ cmd_cutover() {
   fi
 
   step=2
-  rel="$(resolve_cutover_release)"
+  if [[ -n "${DEPLOY_BUILT_RELEASE:-}" ]]; then
+    rel="$DEPLOY_BUILT_RELEASE"
+    cutover_clog "STEP $step 候选来自本次 --deploy 刚构建的 master release"
+  else
+    rel="$(resolve_cutover_release)"
+  fi
   CUTOVER_REL="$rel"
   cutover_clog "STEP $step 候选 release=$rel"
   cutover_clog "  跑静态门 + digest 复算 + tsx 自检(只读,dry-run 也跑)"
@@ -1640,29 +1808,44 @@ cmd_cutover() {
   fi
 
   step=8
-  cutover_clog "STEP $step 按现有顺序重启(先 egress、等 ${V5_EGRESS_BIND}:${V5_EGRESS_PORT} 可连、再 master)"
-  if [[ "$DRY" == 1 ]]; then
-    cutover_clog "  [dry-run] $(egress_then_master_restart_cmd)"
-  else
-    if ! eval "$(egress_then_master_restart_cmd)"; then
-      cutover_compensate "restart"
-      return 1
+  if [[ "${CUTOVER_JOINT:-0}" == 1 ]]; then
+    cutover_clog "STEP $step joint: oc_hotcfg_activate_saga 写四元组 + restart + smoke(transitionKind=joint masterRelease=$rel)"
+    if [[ "$DRY" == 1 ]]; then
+      cutover_clog "  [dry-run] activate_saga joint image=$RUNTIME_IMAGE release=$BUILT_RUNTIME_RELEASE bundle=$CUTOVER_TUPLE_BUNDLE master=$rel prev=$prev_val"
+      cutover_clog "  [dry-run] smoke 含 healthz + GET / oc-build == $expected_build + egress-health"
+    else
+      if ! activate_tuple_joint "$rel" "$prev_val"; then
+        cutover_compensate "joint-activate"
+        return 1
+      fi
+      cutover_persist_phase_or_compensate "restarted" "restarted" || return 1
+      cutover_persist_phase_or_compensate "smoked" "smoked" || return 1
     fi
-    cutover_persist_phase_or_compensate "restarted" "restarted" || return 1
-  fi
+  else
+    cutover_clog "STEP $step 按现有顺序重启(先 egress、等 ${V5_EGRESS_BIND}:${V5_EGRESS_PORT} 可连、再 master)"
+    if [[ "$DRY" == 1 ]]; then
+      cutover_clog "  [dry-run] $(egress_then_master_restart_cmd)"
+    else
+      if ! eval "$(egress_then_master_restart_cmd)"; then
+        cutover_compensate "restart"
+        return 1
+      fi
+      cutover_persist_phase_or_compensate "restarted" "restarted" || return 1
+    fi
 
-  step=9
-  cutover_clog "STEP $step smoke: healthz ok+controlPlaneEnabled+leader; GET / oc-build == $expected_build; egress-health"
-  if [[ "$DRY" == 1 ]]; then
-    cutover_clog "  [dry-run] curl 127.0.0.1:${V5_PORT}/healthz | jq ok+controlPlaneEnabled+leadership=leader"
-    cutover_clog "  [dry-run] curl 127.0.0.1:${V5_PORT}/ 比对 oc-build=$expected_build"
-    cutover_clog "  [dry-run] curl ${V5_EGRESS_BIND}:${V5_EGRESS_PORT}/internal/v5/egress-health"
-  else
-    if ! cutover_smoke_against_release "$rel"; then
-      cutover_compensate "smoke"
-      return 1
+    step=9
+    cutover_clog "STEP $step smoke: healthz ok+controlPlaneEnabled+leader; GET / oc-build == $expected_build; egress-health"
+    if [[ "$DRY" == 1 ]]; then
+      cutover_clog "  [dry-run] curl 127.0.0.1:${V5_PORT}/healthz | jq ok+controlPlaneEnabled+leadership=leader"
+      cutover_clog "  [dry-run] curl 127.0.0.1:${V5_PORT}/ 比对 oc-build=$expected_build"
+      cutover_clog "  [dry-run] curl ${V5_EGRESS_BIND}:${V5_EGRESS_PORT}/internal/v5/egress-health"
+    else
+      if ! cutover_smoke_against_release "$rel"; then
+        cutover_compensate "smoke"
+        return 1
+      fi
+      cutover_persist_phase_or_compensate "smoked" "smoked" || return 1
     fi
-    cutover_persist_phase_or_compensate "smoked" "smoked" || return 1
   fi
 
   step=10

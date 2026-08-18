@@ -67,6 +67,20 @@ pid_alive() {
   [[ -d "/proc/${pid}" ]]
 }
 
+# /proc/<pid>/stat 第 22 字段(starttime,时钟滴答)。comm 可含空格/括号,必须从最后一个 ) 往后数。
+proc_starttime() {
+  local pid="$1"
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ -r "/proc/${pid}/stat" ]] || return 1
+  python3 -c 'import sys
+p="/proc/%s/stat"%sys.argv[1]
+t=open(p).read(); rest=t[t.rfind(")")+2:].split()
+if len(rest)<20:
+    raise SystemExit(1)
+print(rest[19])' "$pid"
+}
+
+
 parse_kv_file() {
   local file="$1" key="$2" line
   [[ -f "$file" && ! -L "$file" ]] || return 1
@@ -81,18 +95,21 @@ parse_kv_file() {
   return 1
 }
 
-# 活且未过期的发布锁才豁免。死 pid / 过期 started / 无 holder → 不当豁免。
+# 活且未过期的发布锁才豁免。死 pid / 过期 started / 无 holder / PID reuse → 不当豁免。
+# 必须同时满足: holder pid 仍活、/proc/pid/stat starttime 与 holder 记录一致、未超 TTL。
+# 不再单靠 fuser pid 存活(PID 号复用会误豁免)。
 lock_is_live_exemption() {
-  local lock="$WATCH_LOCK" holder pid started started_epoch now age fuser_pids
+  local lock="$WATCH_LOCK" holder pid started starttime started_epoch now age cur_st
   [[ -f "$lock" && ! -L "$lock" ]] || return 1
   holder="${lock}.holder"
   pid=""
   started=""
+  starttime=""
   if [[ -f "$holder" && ! -L "$holder" ]]; then
     pid="$(sed -n 's/^pid=\([0-9][0-9]*\).*/\1/p' "$holder" | head -n1 || true)"
     started="$(sed -n 's/.*started=\([^[:space:]]*\).*/\1/p' "$holder" | head -n1 || true)"
+    starttime="$(sed -n 's/.*starttime=\([0-9][0-9]*\).*/\1/p' "$holder" | head -n1 || true)"
   fi
-  fuser_pids="$(fuser "$lock" 2>/dev/null | tr -s '[:space:]' ' ' | sed 's/^ //;s/ $//' || true)"
   now="$(watch_now)"
   if [[ -n "$started" ]]; then
     started_epoch="$(date -d "$started" +%s 2>/dev/null || echo "")"
@@ -111,19 +128,20 @@ lock_is_live_exemption() {
     wlog "WARN lock 过期 age=${age}s ttl=${WATCH_LOCK_TTL_SEC}s 不当豁免"
     return 1
   fi
-  if [[ -n "$pid" ]] && pid_alive "$pid"; then
-    return 0
+  if [[ -z "$pid" ]] || ! pid_alive "$pid"; then
+    wlog "WARN lock 无活 holder pid 不当豁免 holder_pid=${pid:-none}"
+    return 1
   fi
-  if [[ -n "$fuser_pids" ]]; then
-    local p
-    for p in $fuser_pids; do
-      if pid_alive "$p"; then
-        return 0
-      fi
-    done
+  if [[ -z "$starttime" ]]; then
+    wlog "WARN lock holder 无 starttime,不当豁免(防 PID reuse)"
+    return 1
   fi
-  wlog "WARN lock 无活 pid 不当豁免 holder_pid=${pid:-none} fuser=${fuser_pids:-none}"
-  return 1
+  cur_st="$(proc_starttime "$pid" || true)"
+  if [[ -z "$cur_st" || "$cur_st" != "$starttime" ]]; then
+    wlog "WARN lock PID reuse: holder_pid=$pid holder_starttime=$starttime proc_starttime=${cur_st:-none} 不当豁免"
+    return 1
+  fi
+  return 0
 }
 
 maint_is_live_exemption() {
@@ -133,15 +151,19 @@ maint_is_live_exemption() {
   owner="$(parse_kv_file "$WATCH_MAINT" owner || true)"
   now="$(watch_now)"
   if [[ ! "$until_ts" =~ ^[0-9]+$ ]] || (( now >= until_ts )); then
-    wlog "WARN 维护标记过期或无 until=,忽略并删除 $WATCH_MAINT"
-    if [[ "$WATCH_SKIP_ACTIONS" != 1 ]]; then
+    wlog "WARN 维护标记过期或无 until=,忽略 $WATCH_MAINT"
+    if is_true_dry; then
+      wlog "[dry] 不删除过期维护标记"
+    elif [[ "$WATCH_SKIP_ACTIONS" != 1 ]]; then
       rm -f -- "$WATCH_MAINT"
     fi
     return 1
   fi
   if [[ -n "$owner" ]] && ! pid_alive "$owner"; then
-    wlog "WARN 维护标记 owner=$owner 已死,忽略并删除"
-    if [[ "$WATCH_SKIP_ACTIONS" != 1 ]]; then
+    wlog "WARN 维护标记 owner=$owner 已死,忽略"
+    if is_true_dry; then
+      wlog "[dry] 不删除死 owner 维护标记"
+    elif [[ "$WATCH_SKIP_ACTIONS" != 1 ]]; then
       rm -f -- "$WATCH_MAINT"
     fi
     return 1
@@ -167,6 +189,10 @@ read_fail_count() {
 
 write_fail_count() {
   local n="$1" dir
+  if is_true_dry; then
+    wlog "[dry] 不写 fail-count would=$n"
+    return 0
+  fi
   dir="$(dirname -- "$WATCH_FAIL_COUNT")"
   mkdir -p -- "$dir"
   printf '%s\n' "$n" >"$WATCH_FAIL_COUNT"
@@ -219,8 +245,11 @@ dep_is_active() {
 }
 
 # schema/env/外部依赖 → fail-loud,禁止自动回切。
+# HTTP body 为空(进程在监听前 crash)时,改扫 journal + 日志尾,避免把 schema/env
+# 事故误判成「普通 release 故障」而回切。
 classify_fail_loud() {
-  local body="${WATCH_LAST_MASTER_BODY:-$WATCH_STUB_MASTER_BODY}"
+  local body="${WATCH_LAST_MASTER_BODY:-${WATCH_STUB_MASTER_BODY:-}}"
+  local haystack journal logfile_tail
   if ! dep_is_active postgresql.service "$WATCH_STUB_PG"; then
     printf '%s\n' "external-pg"
     return 0
@@ -233,6 +262,16 @@ classify_fail_loud() {
     printf '%s\n' "external-docker"
     return 0
   fi
+  haystack="$body"
+  if [[ -z "$body" ]]; then
+    journal="${WATCH_STUB_JOURNAL:-}"
+    logfile_tail="${WATCH_STUB_LOGTAIL:-}"
+    if [[ -z "${WATCH_STUB_MASTER:-}" && -z "${WATCH_STUB_JOURNAL:-}" ]]; then
+      journal="$(journalctl -u "$WATCH_MASTER_UNIT" -n 80 --no-pager -o cat 2>/dev/null || true)"
+      logfile_tail="$(tail -n 80 /var/log/openclaude-v5-selfhost.log 2>/dev/null || true)"
+    fi
+    haystack="${journal}"$'\n'"${logfile_tail}"
+  fi
   if [[ -n "$body" ]]; then
     if echo "$body" | jq -e '.deps.pg? | tostring | test("ok"; "i") | not' >/dev/null 2>&1; then
       if echo "$body" | jq -e 'has("deps")' >/dev/null 2>&1; then
@@ -244,11 +283,13 @@ classify_fail_loud() {
         fi
       fi
     fi
-    if echo "$body" | grep -Eiq 'schema_migrations|cannot find type|column .* does not exist|relation .* does not exist|migration'; then
+  fi
+  if [[ -n "$haystack" ]]; then
+    if echo "$haystack" | grep -Eiq 'schema_migrations|cannot find type|column .* does not exist|relation .* does not exist|migration'; then
       printf '%s\n' "schema"
       return 0
     fi
-    if echo "$body" | grep -Eiq 'DATABASE_URL|JWT_SECRET|OPENCLAUDE_KMS|env .* missing|EACCES.*commercial-v5-selfhost.env'; then
+    if echo "$haystack" | grep -Eiq 'DATABASE_URL|JWT_SECRET|OPENCLAUDE_KMS|env .* missing|EACCES.*commercial-v5-selfhost.env'; then
       printf '%s\n' "env"
       return 0
     fi
@@ -262,10 +303,24 @@ classify_fail_loud() {
 
 write_manual_recovery() {
   local reason="$1"
+  if is_true_dry; then
+    wlog "[dry] 不写 manual-recovery reason=$reason"
+    return 0
+  fi
   mkdir -p -- "$(dirname -- "$WATCH_MANUAL_RECOVERY")"
   printf 'until=%s\nreason=%s\nwritten=%s\n' "$(watch_now)" "$reason" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     >"$WATCH_MANUAL_RECOVERY"
   wlog "FAIL-LOUD 已写 $WATCH_MANUAL_RECOVERY reason=$reason"
+}
+
+write_disarm() {
+  local reason="$1"
+  if is_true_dry; then
+    wlog "[dry] 不写 disarm reason=$reason"
+    return 0
+  fi
+  mkdir -p -- "$(dirname -- "$WATCH_DISARM")"
+  printf 'reason=%s\n' "$reason" >"$WATCH_DISARM"
 }
 
 release_artifact_digest_watch() {
@@ -366,6 +421,7 @@ PY
 
 prev_release_is_valid() {
   local prev marker expected got root
+  [[ -f "${WATCH_RELEASES_ROOT}/.prev-release" && ! -L "${WATCH_RELEASES_ROOT}/.prev-release" ]] || return 1
   prev="$(tr -d '[:space:]' <"${WATCH_RELEASES_ROOT}/.prev-release" 2>/dev/null || true)"
   [[ -n "$prev" && "$prev" != "none" && "$prev" != "NONE" ]] || return 1
   case "$prev" in
@@ -476,8 +532,7 @@ watch_once() {
   if loud="$(classify_fail_loud)"; then
     wlog "FAIL-LOUD class=$loud 不自动回切"
     write_manual_recovery "$loud"
-    mkdir -p -- "$(dirname -- "$WATCH_DISARM")"
-    printf 'reason=%s\n' "$loud" >"$WATCH_DISARM"
+    write_disarm "$loud"
     return 0
   fi
 
@@ -523,8 +578,7 @@ watch_once() {
   fi
 
   write_manual_recovery "tier1+tier2-failed"
-  mkdir -p -- "$(dirname -- "$WATCH_DISARM")"
-  printf 'reason=tier1+tier2-failed\n' >"$WATCH_DISARM"
+  write_disarm "tier1+tier2-failed"
   wlog "两级兜底仍红,已 disarm。需要人工跑应急恢复脚本。"
   return 1
 }
@@ -533,7 +587,8 @@ watch_selftest() {
   local base
   base="$(mktemp -d /tmp/v5-selfhost-watch-selftest.XXXXXX)"
   echo "SELFTEST_DIR=$base"
-  export WATCH_DRY=1
+  # dry 不再写 fail-count/disarm;selftest 用假目录 + SKIP_ACTIONS,允许写状态。
+  export WATCH_DRY=0
   export WATCH_SKIP_ACTIONS=1
   export WATCH_LOG="$base/watch.log"
   export WATCH_RUN_DIR="$base/run"
@@ -575,7 +630,7 @@ watch_selftest() {
   echo "PASS 场景2: 过期锁不当豁免"
 
   echo "===== 场景3: 活锁未过期 → 退出不清健康 ====="
-  printf 'pid=%s user=root tree=/x started=%s\n' "$$" "$(date -Is)" >"${WATCH_LOCK}.holder"
+  printf 'pid=%s user=root tree=/x started=%s starttime=%s\n' "$$" "$(date -Is)" "$(proc_starttime "$$")" >"${WATCH_LOCK}.holder"
   export WATCH_NOW_OVERRIDE=""
   write_fail_count 0
   watch_once
@@ -624,6 +679,51 @@ watch_selftest() {
   watch_once
   [[ "$(read_fail_count)" == 0 ]] || { echo "FAIL 场景7"; return 1; }
   echo "PASS 场景7: grace until 绝对时间生效"
+
+  echo "===== 场景8: 空 body + journal schema 关键字 → fail-loud 不回切 ====="
+  printf 'until=1\n' >"$WATCH_GRACE"
+  write_fail_count 0
+  rm -f -- "$WATCH_DISARM" "$WATCH_MANUAL_RECOVERY"
+  export WATCH_STUB_MASTER=fail WATCH_STUB_EGRESS=ok
+  export WATCH_STUB_MASTER_BODY=""
+  export WATCH_STUB_JOURNAL="error: relation users does not exist"
+  unset WATCH_STUB_FAIL_LOUD
+  watch_once || true
+  [[ -f "$WATCH_MANUAL_RECOVERY" ]] || { echo "FAIL 场景8 未写 manual-recovery"; return 1; }
+  grep -q 'schema' "$WATCH_MANUAL_RECOVERY" || { echo "FAIL 场景8 reason 不是 schema"; return 1; }
+  echo "PASS 场景8: 空 body 扫 journal 识别 schema"
+  unset WATCH_STUB_JOURNAL WATCH_STUB_MASTER_BODY
+
+  echo "===== 场景9: PID reuse(活 pid + 错误 starttime)不当豁免 ====="
+  write_fail_count 0
+  rm -f -- "$WATCH_DISARM" "$WATCH_MANUAL_RECOVERY"
+  printf 'pid=1 user=root tree=/x started=%s starttime=1\n' "$(date -Is)" >"${WATCH_LOCK}.holder"
+  export WATCH_NOW_OVERRIDE=""
+  export WATCH_STUB_MASTER=fail WATCH_STUB_EGRESS=ok
+  watch_once || true
+  echo "fail_count=$(read_fail_count) (期望>=1,init pid 复用不豁免)"
+  [[ "$(read_fail_count)" -ge 1 ]] || { echo "FAIL 场景9"; return 1; }
+  echo "PASS 场景9: PID reuse 不当豁免"
+  export WATCH_NOW_OVERRIDE=1000000000
+  rm -f -- "${WATCH_LOCK}.holder"
+
+  echo "===== 场景10: dry 模式不写 fail-count ====="
+  export WATCH_DRY=1
+  write_fail_count 0
+  printf 'until=1\n' >"$WATCH_GRACE"
+  export WATCH_STUB_MASTER=fail WATCH_STUB_EGRESS=fail
+  rm -f -- "$WATCH_FAIL_COUNT" "$WATCH_DISARM" "$WATCH_MANUAL_RECOVERY"
+  watch_once || true
+  if [[ -f "$WATCH_FAIL_COUNT" ]]; then
+    echo "FAIL 场景10 dry 仍写了 fail-count"
+    return 1
+  fi
+  if [[ -f "$WATCH_DISARM" || -f "$WATCH_MANUAL_RECOVERY" ]]; then
+    echo "FAIL 场景10 dry 仍写了 disarm/manual"
+    return 1
+  fi
+  echo "PASS 场景10: dry 不写 fail-count/disarm/manual"
+  export WATCH_DRY=0
 
   echo "SELFTEST_ALL_PASS"
   echo "log=$WATCH_LOG"

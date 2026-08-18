@@ -2,8 +2,8 @@
 # v5 本机自用实例 —— 与个人版 openclaude.service 隔离,不触碰 kl-mirror 生产。
 # WorkingDirectory 必须指向 -live symlink(不可变 rel-*),禁止改回 git 工作树。
 Description=OpenClaude Gateway (v5 selfhost)
-After=network.target postgresql.service redis-server.service docker.service openclaude.service
-Wants=postgresql.service redis-server.service docker.service
+After=network.target postgresql.service redis-server.service docker.service openclaude.service openclaude-v5-selfhost-boot-guard.service
+Wants=postgresql.service redis-server.service docker.service openclaude-v5-selfhost-boot-guard.service
 
 [Service]
 Type=simple
