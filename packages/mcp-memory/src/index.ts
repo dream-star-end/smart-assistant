@@ -56,6 +56,7 @@ import {
 } from './delegateFanout.js'
 import {
   formatDelegateFanoutRunning,
+  formatDelegateSuccess,
   resolveCursorFastWaitMs,
   runCursorDelegateFastPath,
   type FanoutCursorItem,
@@ -683,12 +684,14 @@ async function handleDelegateTask(args: {
   context?: string
   effort?: string
   toolsets?: string[]
+  resumeSessionKey?: string
 }) {
   return handleDelegateTaskToAgent(args.agentId || 'main', {
     goal: args.goal,
     context: args.context,
     effort: args.effort,
     toolsets: args.toolsets,
+    resumeSessionKey: args.resumeSessionKey,
     label: args.agentId || 'main',
   })
 }
@@ -715,6 +718,7 @@ async function handleDelegateTasks(args: { tasks?: unknown }) {
           context: t.context,
           effort: t.effort,
           toolsets: t.toolsets,
+          resumeSessionKey: t.resumeSessionKey,
           label,
         })
         // toolOk 返回体无 isError 字段、toolError 有 → 联合类型下按可选属性安全取值。
@@ -822,7 +826,11 @@ async function handleAskUser(args: { questions?: unknown } | undefined | null) {
  * 团队门(非团队 turn 409 拒绝)与审查任务书包装(用户原始需求取服务端权威快照)。
  * 熔断:hidden guard ≤3 次/turn,超限 429 —— 直接把结构化错误回给队长收敛。
  */
-async function handleRequestReview(args: { draft?: string; revisionNote?: string }) {
+async function handleRequestReview(args: {
+  draft?: string
+  revisionNote?: string
+  resumeSessionKey?: string
+}) {
   const draft = typeof args?.draft === 'string' ? args.draft.trim() : ''
   if (!draft) {
     return toolError('draft 必填:请把准备提交给用户的完整答复草稿放进 draft 参数')
@@ -835,6 +843,8 @@ async function handleRequestReview(args: { draft?: string; revisionNote?: string
     goal: '对队长准备提交给用户的最终答复草稿做独立质量审查,给出结构化裁决。',
     context: draft.slice(0, 16000) + note,
     label: '质量审查',
+    resumeSessionKey:
+      typeof args.resumeSessionKey === 'string' ? args.resumeSessionKey : undefined,
   })
 }
 
@@ -848,6 +858,7 @@ async function handleCursorDelegateTasks(tasks: FanoutTask[]) {
           context: t.context,
           effort: t.effort,
           toolsets: t.toolsets,
+          resumeSessionKey: t.resumeSessionKey,
           label,
         })
         if (r.kind === 'running') {
@@ -896,6 +907,7 @@ async function runCursorDelegateToAgent(
     context?: string
     effort?: string
     toolsets?: string[]
+    resumeSessionKey?: string
     label: string
   },
 ): Promise<FormattedDelegateResult> {
@@ -914,6 +926,7 @@ async function runCursorDelegateToAgent(
     sourceAgent,
     toolsets: args.toolsets,
     async: true,
+    ...(args.resumeSessionKey ? { resumeSessionKey: args.resumeSessionKey } : {}),
     ...(parentSessionKey ? { streamProgress: true, parentSessionKey } : {}),
   })
   const fastWaitMs = resolveCursorFastWaitMs()
@@ -945,6 +958,7 @@ async function handleDelegateTaskToAgent(
     context?: string
     effort?: string
     toolsets?: string[]
+    resumeSessionKey?: string
     label: string
   },
 ) {
@@ -978,6 +992,7 @@ async function handleDelegateTaskToAgent(
           ...(args.effort ? { effort: args.effort } : {}),
           sourceAgent,
           toolsets: args.toolsets,
+          ...(args.resumeSessionKey ? { resumeSessionKey: args.resumeSessionKey } : {}),
           ...(parentSessionKey ? { streamProgress: true, parentSessionKey } : {}),
         }),
         timeoutMs: DELEGATE_CLIENT_TIMEOUT_MS,
@@ -994,7 +1009,11 @@ async function handleDelegateTaskToAgent(
     if (looksLikeDelegateApiError(output)) {
       return toolError(`子 agent 执行出错: ${output}`)
     }
-    return toolOk(`✅ 委派完成 (agent: ${args.label})\n\n${output || '(无输出)'}`)
+    const sessionKey =
+      typeof data.sessionKey === 'string' && data.sessionKey.trim()
+        ? data.sessionKey.trim()
+        : undefined
+    return toolOk(formatDelegateSuccess(args.label, output, sessionKey))
   } catch (err: any) {
     return toolError(`委派失败: ${describeDelegateTransportError(err)}`)
   }

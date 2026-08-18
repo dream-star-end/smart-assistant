@@ -217,6 +217,9 @@ export const TOOLS = [
       '因此本工具的返回是「摘要/路径」,不是完整产物 —— 需要完整内容时用 Read 读回传路径。',
       '',
       '限制: 最大递归深度 3 层,最大并发 5 个,单个队长每 turn 委派次数有上限(超限会返回可读错误,请先整合已有结果再决定是否继续)。',
+      '',
+      '默认每次新开会话。工具结果会回传 sessionKey;下一轮要对同一成员续跑时传入 resumeSessionKey。',
+      '进行中不要重复 resume,改用 oc-memory delegate-wait。',
     ].join('\n'),
     inputSchema: {
       type: 'object',
@@ -235,6 +238,11 @@ export const TOOLS = [
           items: { type: 'string' },
           description:
             '可选:为子 agent 额外授予的平台工具集名(目前仅 "browser";网页提取/论文下载已是常驻 CLI——oc-web / scansci-pdf,无需工具集)。通常无需手动指定 —— 系统会按任务目标自动挂载;只能授予平台已配置的工具集,无法越权,填错或填不存在的名字会被忽略而非报错。',
+        },
+        resumeSessionKey: {
+          type: 'string',
+          description:
+            '可选:续跑上一轮同成员委派。值必须是该工具上次返回的 sessionKey;缺省仍新开会话。',
         },
       },
       required: ['goal'],
@@ -277,6 +285,10 @@ export const TOOLS = [
                 items: { type: 'string' },
                 description: '可选:为该子 agent 额外授予的平台工具集名(同 delegate_task)。',
               },
+              resumeSessionKey: {
+                type: 'string',
+                description: '可选:续跑该子任务上一轮 sessionKey(同 delegate_task)。',
+              },
             },
             required: ['goal'],
           },
@@ -307,6 +319,11 @@ export const TOOLS = [
         revisionNote: {
           type: 'string',
           description: '可选:二次送审时说明你针对上轮审查意见做了什么修订/反驳了哪些误报。',
+        },
+        resumeSessionKey: {
+          type: 'string',
+          description:
+            '可选:续跑上一轮 hidden-reviewer。值必须是上次 request_review 返回的 sessionKey。',
         },
       },
       required: ['draft'],

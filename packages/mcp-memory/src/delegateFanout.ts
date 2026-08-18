@@ -13,6 +13,7 @@ export interface FanoutTask {
   context?: string
   effort?: string
   toolsets?: string[]
+  resumeSessionKey?: string
 }
 
 /** 一次 fan-out 中单个子任务的执行结果(供聚合)。 */
@@ -66,12 +67,17 @@ export function normalizeFanoutTasks(
       item && Array.isArray(item.toolsets)
         ? item.toolsets.filter((x): x is string => typeof x === 'string')
         : undefined
+    const resumeSessionKey =
+      item && typeof item.resumeSessionKey === 'string' && item.resumeSessionKey.trim()
+        ? item.resumeSessionKey.trim()
+        : undefined
     tasks.push({
       agentId: item && typeof item.agentId === 'string' ? item.agentId : undefined,
       goal,
       context: item && typeof item.context === 'string' ? item.context : undefined,
       effort,
       toolsets: toolsets && toolsets.length > 0 ? toolsets : undefined,
+      resumeSessionKey,
     })
   }
   return { ok: true, tasks }
