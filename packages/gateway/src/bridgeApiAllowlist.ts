@@ -113,6 +113,14 @@ export const BRIDGE_API_ALLOWLIST: readonly BridgeApiAllowRule[] = [
     methods: M('GET', 'PUT', 'DELETE'),
     proxyFromCommercial: true,
   },
+  {
+    // Cursor MCP `ask_user` 在容器内运行,经 bridge 把提问卡推到 Web。
+    // handler 仅 POST;sessionKey 必须命中本容器会话且 session.agentId === :id。
+    label: '/api/agents/:id/ask-user',
+    re: /^\/api\/agents\/[a-zA-Z0-9_-]+\/ask-user$/,
+    methods: M('POST'),
+    proxyFromCommercial: true,
+  },
   // User-level shared skill library (agentId-less). Proxied to the user's own
   // container, where it operates on that user's shared/legacy skill volume.
   {
