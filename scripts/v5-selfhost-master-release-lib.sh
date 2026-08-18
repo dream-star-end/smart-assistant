@@ -564,10 +564,17 @@ assert_master_release_tsx_selfcheck() { # <rel>
   [[ -d "$rel/node_modules/tsx" ]] || die "tsx 自检: 缺 $rel/node_modules/tsx"
   out="$(cd "$rel" && npx --no-install tsx -e 'console.log("tsx-ok")')"
   [[ "$out" == "tsx-ok" ]] || die "tsx 自检失败(期望 tsx-ok): $out"
-  ( cd "$rel" && node --import tsx --check packages/cli/src/commands/gateway.ts ) \
-    || die "tsx --check gateway.ts 失败"
-  ( cd "$rel" && node --import tsx --check packages/commercial/src/index.ts ) \
-    || die "tsx --check commercial/src/index.ts 失败"
+  # 只 transform、不 import 入口(cli/src/index.ts 会 parseAsync, commercial 会连 PG)。
+  # node --import tsx --check 在 Node 20 对 .ts 报 ERR_UNKNOWN_FILE_EXTENSION,不用。
+  out="$(cd "$rel" && npx --no-install tsx -e '
+import { readFileSync } from "node:fs";
+import { transformSync } from "esbuild";
+for (const f of ["packages/cli/src/commands/gateway.ts", "packages/commercial/src/index.ts"]) {
+  transformSync(readFileSync(f, "utf8"), { loader: "ts", format: "esm", target: "es2022" });
+}
+console.log("transform-ok");
+')"
+  [[ "$out" == "transform-ok" ]] || die "tsx transform 自检失败: $out"
   mlog "  ✓ tsx 自检通过(无 HTTP)"
 }
 
