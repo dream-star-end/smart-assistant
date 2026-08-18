@@ -1381,28 +1381,42 @@ cutover_smoke_healthz_only() {
   echo "$eg" | jq -e '.ok==true' >/dev/null 2>&1
 }
 
+cutover_survivor_script() {
+  printf '%s\n' "${CUTOVER_SURVIVOR_SCRIPT:-/opt/openclaude/v5-selfhost-breakglass/cutover-survivor.sh}"
+}
+
+# phase 必须在覆盖第一个 unit 之前落盘;写失败不得 || true 吞掉。
 cutover_persist_phase() {
-  local phase="$1"
+  local phase="$1" state script
   CUTOVER_PHASE="$phase"
-  if [[ -f "${SURVIVOR_STATE:-/run/openclaude-v5-selfhost/cutover-survivor.state}" ]]; then
-    if grep -q '^phase=' "${SURVIVOR_STATE:-/run/openclaude-v5-selfhost/cutover-survivor.state}" 2>/dev/null; then
-      sed -i "s/^phase=.*/phase=${phase}/" "${SURVIVOR_STATE:-/run/openclaude-v5-selfhost/cutover-survivor.state}" || true
-    fi
+  state="${SURVIVOR_STATE:-/run/openclaude-v5-selfhost/cutover-survivor.state}"
+  [[ -f "$state" && ! -L "$state" ]] || return 0
+  script="$(cutover_survivor_script)"
+  [[ -x "$script" ]] || { cutover_clog "缺 survivor 脚本 $script,无法持久化 phase=$phase"; return 1; }
+  SURVIVOR_STATE="$state" bash "$script" --set-phase "$phase"
+}
+
+cutover_persist_phase_or_compensate() { # <phase> <reason>
+  local phase="$1" reason="$2"
+  if ! cutover_persist_phase "$phase"; then
+    cutover_compensate "persist-phase-${reason}"
+    return 1
   fi
 }
 
 cutover_arm_survivor() { # <backup-dir>
   local backup="$1" script
-  script="/opt/openclaude/v5-selfhost-breakglass/cutover-survivor.sh"
+  script="$(cutover_survivor_script)"
   [[ -x "$script" ]] || { cutover_clog "缺 survivor 脚本 $script"; return 1; }
   CUTOVER_SURVIVOR_ARMED=1
   bash "$script" --arm "$$" "$backup" || return 1
 }
 
 cutover_disarm_survivor() {
-  local script="/opt/openclaude/v5-selfhost-breakglass/cutover-survivor.sh"
+  local script
+  script="$(cutover_survivor_script)"
   if [[ "${CUTOVER_SURVIVOR_ARMED:-0}" == 1 && -x "$script" ]]; then
-    bash "$script" --disarm || true
+    bash "$script" --disarm || return 1
   fi
   CUTOVER_SURVIVOR_ARMED=0
 }
@@ -1460,7 +1474,7 @@ cutover_compensate() { # <reason>
     return 1
   fi
   cutover_rollback_inplace "${CUTOVER_REL:-}" "${CUTOVER_BACKUP:-missing}"
-  cutover_disarm_survivor
+  cutover_disarm_survivor || cutover_clog "补偿后 disarm 失败(不掩盖补偿失败)"
   return 1
 }
 
@@ -1557,8 +1571,11 @@ cmd_cutover() {
   if [[ "$DRY" != 1 ]]; then
     cutover_arm_survivor "$backup" \
       || die "武装 survivor 失败。尚未覆盖 unit。"
+    # phase=mutated 必须在覆盖第一个 unit 之前 durable 落盘。
+    # 失败则拒绝进入 mutation:survivor 仍为 armed,健康绿不会误回切。
+    cutover_persist_phase "mutated" \
+      || die "无法持久化 phase=mutated。尚未覆盖 unit。"
     CUTOVER_MUTATED=1
-    cutover_persist_phase "mutated"
   fi
 
   step=5
@@ -1572,17 +1589,17 @@ cmd_cutover() {
       cutover_compensate "install-egress-unit"
       return 1
     fi
-    cutover_persist_phase "units-partial"
+    cutover_persist_phase_or_compensate "units-partial" "units-partial" || return 1
     if ! install_unit "$unit_snap/$V5_UNIT"; then
       cutover_compensate "install-master-unit"
       return 1
     fi
-    cutover_persist_phase "units-installed"
+    cutover_persist_phase_or_compensate "units-installed" "units-installed" || return 1
     if ! systemctl daemon-reload; then
       cutover_compensate "daemon-reload"
       return 1
     fi
-    cutover_persist_phase "reloaded"
+    cutover_persist_phase_or_compensate "reloaded" "reloaded" || return 1
   fi
 
   step=6
@@ -1594,7 +1611,7 @@ cmd_cutover() {
       cutover_compensate "write-grace"
       return 1
     fi
-    cutover_persist_phase "grace"
+    cutover_persist_phase_or_compensate "grace" "grace" || return 1
   fi
 
   if [[ "$CUTOVER_HAS_MIGRATION" == 1 ]]; then
@@ -1606,7 +1623,7 @@ cmd_cutover() {
         cutover_compensate "migration-apply"
         return 1
       fi
-      cutover_persist_phase "migrated"
+      cutover_persist_phase_or_compensate "migrated" "migrated" || return 1
     fi
   fi
 
@@ -1619,7 +1636,7 @@ cmd_cutover() {
       cutover_compensate "symlink-flip"
       return 1
     fi
-    cutover_persist_phase "symlink-flipped"
+    cutover_persist_phase_or_compensate "symlink-flipped" "symlink-flipped" || return 1
   fi
 
   step=8
@@ -1631,7 +1648,7 @@ cmd_cutover() {
       cutover_compensate "restart"
       return 1
     fi
-    cutover_persist_phase "restarted"
+    cutover_persist_phase_or_compensate "restarted" "restarted" || return 1
   fi
 
   step=9
@@ -1645,17 +1662,18 @@ cmd_cutover() {
       cutover_compensate "smoke"
       return 1
     fi
-    cutover_persist_phase "smoked"
+    cutover_persist_phase_or_compensate "smoked" "smoked" || return 1
   fi
 
   step=10
   cutover_clog "STEP $step 失败则走统一补偿(本步仅在失败路径执行)"
   if [[ "$DRY" == 1 ]]; then
-    cutover_clog "  [dry-run] 覆盖 unit 前: 武装独立 systemd-run survivor + 持久化 phase/backup"
+    cutover_clog "  [dry-run] 覆盖 unit 前: 武装独立 systemd-run survivor + 先落盘 phase=mutated"
+    cutover_clog "  [dry-run] survivor: 未 smoked/committed 的 mutation phase 在 executor 消失时即使健康绿也二级恢复"
     cutover_clog "  [dry-run] 一级: canonicalize prev + 路径在 releases 根 + 复算 digest; restart/smoke 任一失败立刻降二级"
     cutover_clog "  [dry-run] 二级: 应急脚本原子恢复备份 unit + daemon-reload + restart + 复合健康硬门"
     cutover_clog "  [dry-run] 回滚后再失败 → 写 $MASTER_RELEASES_ROOT/.manual-recovery-required 并大声退出"
-    cutover_clog "  [dry-run] 成功提交后解除 survivor"
+    cutover_clog "  [dry-run] 成功路径 --disarm 必须确认 durable committed marker;失败不报告 cutover 成功"
   fi
 
   if [[ "$DRY" == 1 ]]; then
@@ -1663,8 +1681,10 @@ cmd_cutover() {
     cutover_clog "  log=$CUTOVER_LOG"
     return 0
   fi
-  cutover_persist_phase "committed"
-  cutover_disarm_survivor
+  cutover_persist_phase "committed" \
+    || die "无法持久化 phase=committed。smoke 已通过,拒绝报告成功(survivor 仍可能误恢复)。"
+  cutover_disarm_survivor \
+    || die "disarm 失败: committed marker 未确认写入。smoke 已通过,拒绝报告成功。"
   cutover_clog "✓ --cutover 完成 live → $rel"
 }
 
