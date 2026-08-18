@@ -176,6 +176,60 @@ export interface Ticket {
   createdAt: number
   updatedAt: number
   closedAt: number | null
+  /** board 接口装饰；列表接口可能没有。合法落点一律以它为准，前端不重算。 */
+  allowedMoves?: AllowedMove[]
+}
+
+export const MOVE_ACTIONS = [
+  'promote',
+  'promote_at_stage',
+  'ack_advance',
+  'skip_forward',
+  'send_back',
+  'return_to_backlog',
+  'reopen',
+] as const
+export type MoveAction = (typeof MOVE_ACTIONS)[number]
+
+export interface AllowedMove {
+  toStageId: string | null
+  action: MoveAction
+  label: string
+  requiresReason: boolean
+  requiresConfirm: boolean
+  warning?: string
+  skippedStages?: Array<{ id: string; name: string; kind: StageKind }>
+  abandonedStage?: { id: string; name: string; kind: StageKind }
+}
+
+export interface TicketMoveInput {
+  toStageId: string | null
+  expectedVersion: number
+  reason?: string
+  confirmSkippedStages?: boolean
+  cancelRunningRun?: boolean
+}
+
+export interface TicketMoveInfo {
+  action: MoveAction | 'noop'
+  label: string
+  fromStageId: string | null
+  toStageId: string | null
+  skippedStages?: Array<{ id: string; name: string; kind: StageKind }>
+  abandonedStage?: { id: string; name: string; kind: StageKind } | null
+  commentId?: string | null
+}
+
+export interface TicketMoveResult {
+  ticket: Ticket
+  move: TicketMoveInfo
+}
+
+export interface MoveBlocker {
+  id: string
+  identifier: string
+  title: string
+  status: TicketStatus
 }
 
 export interface Pipeline {
@@ -281,6 +335,8 @@ export interface BoardSnapshot {
   ticketType: TicketType
   columns: BoardColumn[]
   inbox: Ticket[]
+  /** 当前 ticketType 的积压票，不在 columns 里。 */
+  backlog: { tickets: Ticket[] }
 }
 
 export interface BoardAgent {
@@ -319,6 +375,8 @@ export interface TicketCreateInput {
   startDate?: number | null
   pipelineId?: string | null
   stageId?: string | null
+  /** 省略 = 服务端默认 backlog；human 可传 ready 直接开工。 */
+  status?: 'backlog' | 'ready'
 }
 
 export interface TicketPatchInput {
@@ -628,7 +686,10 @@ export function boardErrorCode(err: unknown): string | undefined {
 
 export function isVersionConflict(err: unknown): boolean {
   if (!(err instanceof ApiError)) return false
-  return err.status === 409 || boardErrorCode(err) === 'version_conflict'
+  const code = boardErrorCode(err)
+  // /move 的 409 还可能是 running_run_active，有明确 code 时只认 version_conflict。
+  if (code) return code === 'version_conflict'
+  return err.status === 409
 }
 
 export function isLeaseHeld(err: unknown): boolean {
@@ -644,6 +705,23 @@ export function isForbidden(err: unknown): boolean {
 export function isConcurrencyFull(err: unknown): boolean {
   if (!(err instanceof ApiError)) return false
   return err.status === 429 || boardErrorCode(err) === 'concurrency_full'
+}
+
+/** gateway `/move` 信封 `{ error, code, detail? }` 的 detail。 */
+export function boardErrorDetail(err: unknown): Record<string, unknown> | undefined {
+  if (!(err instanceof ApiError) || !err.body || typeof err.body !== 'object') return undefined
+  const rec = err.body as Record<string, unknown>
+  if (rec.detail && typeof rec.detail === 'object' && !Array.isArray(rec.detail)) {
+    return rec.detail as Record<string, unknown>
+  }
+  return undefined
+}
+
+export function boardErrorWhy(err: unknown): string | undefined {
+  const detail = boardErrorDetail(err)
+  if (typeof detail?.why === 'string' && detail.why.trim()) return detail.why
+  if (err instanceof ApiError && err.message.trim()) return err.message
+  return undefined
 }
 
 const VALIDATION_ZH: Array<{ test: (msg: string) => boolean; zh: string }> = [
@@ -1190,6 +1268,9 @@ export const taskboardApi = {
       expectedVersion,
       reason: reason ?? null,
     }),
+
+  moveTicket: (a: AuthSession, idOrIdent: string, body: TicketMoveInput) =>
+    boardSend<TicketMoveResult>(a, ticketActionPath(idOrIdent, 'move'), 'POST', body),
 
   comment: (
     a: AuthSession,

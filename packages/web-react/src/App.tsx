@@ -64,6 +64,7 @@ import {
   type PanelParam,
   parseBoardView,
   parseBoardTicket,
+  parseBoardTicketType,
   parsePanelParam,
   parseSessionPath,
   parseTutorialCase,
@@ -251,6 +252,9 @@ export function App() {
   );
   const [boardTicketId, setBoardTicketId] = useState<string | null>(() =>
     routingEnabled ? parseBoardTicket(params) : null,
+  );
+  const [boardTicketType, setBoardTicketType] = useState(() =>
+    routingEnabled ? parseBoardTicketType(params) : null,
   );
   // 视图态：home=营销首页,app=登录页/工作区。启动静默续期成功（useAuth onBootAuthed）
   // 直接置 app,失败停在 home。
@@ -2121,10 +2125,12 @@ export function App() {
     workspace: boardOpen ? "board" : "chat",
     boardView,
     boardTicket: boardTicketId,
+    boardTicketType,
     onPopWorkspace: (ws) => setBoardOpen(ws === "board"),
-    onPopBoardParams: (nextView, ticket) => {
+    onPopBoardParams: (nextView, ticket, ticketType) => {
       setBoardView(nextView);
       setBoardTicketId(ticket);
+      setBoardTicketType(ticketType);
     },
   });
 
@@ -2373,8 +2379,10 @@ export function App() {
               auth={auth}
               view={boardView}
               ticketId={boardTicketId}
+              ticketType={boardTicketType}
               onViewChange={setBoardView}
               onOpenTicket={setBoardTicketId}
+              onTicketTypeChange={setBoardTicketType}
               onOpenMobileNav={() => setMobileNavOpen(true)}
               sidebarCollapsed={collapsed}
               onExpandSidebar={() => setCollapsed(false)}

@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react'
 import { type ProductFeatureId, isProductFeatureId } from '../lib/productCapabilities'
+import { TICKET_TYPES, type TicketType } from '../lib/taskboard'
 import { type TutorialCaseId, parseTutorialCaseId } from '../lib/tutorialCaseCatalog'
 import type { Session } from '../lib/types'
 
@@ -24,8 +25,8 @@ import type { Session } from '../lib/types'
  *   （parsePanelParam）；教程另带稳定 `case` 或兼容旧版的 `topic`。打开/关闭经本 hook replaceState 同步回 query
  *   （面板不压栈，且保留其他无关 query）。
  * - 工作区视图 `chat | board`：board 时路径为 `/board`（与会话路径并列，不是 ?panel=）。
- *   对话 ↔ 任务面板用 pushState（后退回到上一位置）。`?view=board|list|inbox|cost|weekly` 与
- *   `?ticket=<identifier>` 走 replaceState，复用「保留无关 query」语义；离开 /board 时清掉。
+ *   对话 ↔ 任务面板用 pushState（后退回到上一位置）。`?view=board|list|inbox|cost|weekly|backlog`、
+ *   `?ticket=<identifier>` 与 `?ticketType=bug|feature|spike|chore` 走 replaceState，复用「保留无关 query」语义；离开 /board 时清掉。
  * - demo / reset-password 特判不启用（enabled=false，URL 原样保留）。
  */
 export type PanelParam = 'settings' | 'market' | 'manage' | 'org' | 'help'
@@ -40,7 +41,7 @@ export function parseSessionPath(pathname: string): string | null {
 export type WorkspaceView = 'chat' | 'board'
 
 /** `/board` 视图。缺省 / 未知值回落看板（`board`），防深链打开不存在的视图。 */
-export type BoardViewParam = 'board' | 'list' | 'inbox' | 'cost' | 'weekly'
+export type BoardViewParam = 'board' | 'list' | 'inbox' | 'backlog' | 'cost' | 'weekly'
 
 /** `/board` → true。只认精确路径，不吃 `/board/` 或子路径。 */
 export function parseBoardPath(pathname: string): boolean {
@@ -60,7 +61,15 @@ export function workspaceWantPath(
   return activeId && !isEmptyDraft ? `/s/${activeId}` : '/'
 }
 
-const BOARD_VIEWS: ReadonlySet<string> = new Set(['board', 'list', 'inbox', 'cost', 'weekly'])
+const BOARD_VIEWS: ReadonlySet<string> = new Set([
+  'board',
+  'list',
+  'inbox',
+  'backlog',
+  'cost',
+  'weekly',
+])
+const BOARD_TICKET_TYPES: ReadonlySet<string> = new Set(TICKET_TYPES)
 
 /** `?view=` → 任务面板视图（未知值回落看板）。 */
 export function parseBoardView(sp: URLSearchParams): BoardViewParam {
@@ -74,20 +83,30 @@ export function parseBoardTicket(sp: URLSearchParams): string | null {
   return t ? t : null
 }
 
+/** `?ticketType=` → 看板流水线类型（未知值当没有，让后端挑默认）。 */
+export function parseBoardTicketType(sp: URLSearchParams): TicketType | null {
+  const v = sp.get('ticketType')
+  return v && BOARD_TICKET_TYPES.has(v) ? (v as TicketType) : null
+}
+
 /**
- * 保留其他 query（含 `?panel=`）；`view`/`ticket` 只在 board 工作区出现。
- * 默认看板省略 `view=board`，保持 `/board` 干净。离开 board 时两者都清理。
+ * 保留其他 query（含 `?panel=`）；`view`/`ticket`/`ticketType` 只在 board 工作区出现。
+ * 默认看板省略 `view=board`，未选类型省略 `ticketType`（由后端挑非终态最多的 type）。
+ * 离开 board 时三者都清理。
  */
 export function withBoardParams(
   input: URLSearchParams,
   view: BoardViewParam | null,
   ticket?: string | null,
+  ticketType?: TicketType | null,
 ): URLSearchParams {
   const next = new URLSearchParams(input)
   if (view && view !== 'board') next.set('view', view)
   else next.delete('view')
   if (view && ticket) next.set('ticket', ticket)
   else next.delete('ticket')
+  if (view && ticketType) next.set('ticketType', ticketType)
+  else next.delete('ticketType')
   return next
 }
 
@@ -188,10 +207,16 @@ export type UseAppRouteOptions = {
   boardView?: BoardViewParam
   /** board 工作区打开的单据 identifier（镜像到 `?ticket=`）。 */
   boardTicket?: string | null
+  /** board 工作区的单据类型（镜像到 `?ticketType=`；null = 让后端挑默认）。 */
+  boardTicketType?: TicketType | null
   /** popstate 反灌工作区（`/board` ↔ `/` `/s/<id>`）。 */
   onPopWorkspace?: (workspace: WorkspaceView) => void
-  /** popstate 反灌 board 的 view/ticket。 */
-  onPopBoardParams?: (view: BoardViewParam, ticket: string | null) => void
+  /** popstate 反灌 board 的 view/ticket/ticketType。 */
+  onPopBoardParams?: (
+    view: BoardViewParam,
+    ticket: string | null,
+    ticketType: TicketType | null,
+  ) => void
 }
 
 export function useAppRoute(opts: UseAppRouteOptions): void {
@@ -226,7 +251,11 @@ export function useAppRoute(opts: UseAppRouteOptions): void {
       } else if (parseBoardPath(location.pathname)) {
         // /board 是并列工作区，不能当未知路径掉进空分支（主区会仍停在对话）。
         cbRef.current.onPopWorkspace?.('board')
-        cbRef.current.onPopBoardParams?.(parseBoardView(query), parseBoardTicket(query))
+        cbRef.current.onPopBoardParams?.(
+          parseBoardView(query),
+          parseBoardTicket(query),
+          parseBoardTicketType(query),
+        )
       } else if (location.pathname === '/') {
         cbRef.current.onPopWorkspace?.('chat')
         cbRef.current.onPopToRoot()
@@ -305,9 +334,9 @@ export function useAppRoute(opts: UseAppRouteOptions): void {
     history.replaceState({}, '', location.pathname + (q ? `?${q}` : '') + location.hash)
   }, [enabled, activePanel, activeTopic, activeCase])
 
-  // board → ?view= / ?ticket=（replaceState；离开 /board 时清参数）。与 withPanelParams
-  // 一样只改自己的键，campaign / panel 等无关 query 原样保留。
-  const { boardView, boardTicket } = opts
+  // board → ?view= / ?ticket= / ?ticketType=（replaceState；离开 /board 时清参数）。
+  // 与 withPanelParams 一样只改自己的键，campaign / panel 等无关 query 原样保留。
+  const { boardView, boardTicket, boardTicketType } = opts
   useEffect(() => {
     if (!enabled) return
     const current = new URLSearchParams(location.search)
@@ -315,9 +344,10 @@ export function useAppRoute(opts: UseAppRouteOptions): void {
       current,
       workspace === 'board' ? (boardView ?? 'board') : null,
       workspace === 'board' ? boardTicket : null,
+      workspace === 'board' ? boardTicketType : null,
     )
     const q = next.toString()
     if (q === current.toString()) return
     history.replaceState({}, '', location.pathname + (q ? `?${q}` : '') + location.hash)
-  }, [enabled, workspace, boardView, boardTicket])
+  }, [enabled, workspace, boardView, boardTicket, boardTicketType])
 }

@@ -9,7 +9,11 @@ import {
   type Ticket,
   type TicketCreateInput,
   type TicketListQuery,
+  type TicketMoveInput,
+  type TicketMoveResult,
   type TicketType,
+  boardErrorCode,
+  boardErrorDetail,
   isVersionConflict,
   taskboardApi,
   taskboardErrorMessage,
@@ -44,15 +48,20 @@ function optimisticStatus(action: TicketAction): Ticket['status'] | undefined {
   }
 }
 
-export function useTaskboard(auth: AuthSession | null, enabled: boolean) {
+export function useTaskboard(
+  auth: AuthSession | null,
+  enabled: boolean,
+  ticketTypeFromUrl?: TicketType | null,
+) {
   const toast = useToast()
   const [projects, setProjects] = useState<Project[] | null>(null)
   const [tickets, setTickets] = useState<Ticket[] | null>(null)
   const [board, setBoard] = useState<BoardSnapshot | null>(null)
   const [agents, setAgents] = useState<BoardAgent[]>([])
   const [projectId, setProjectId] = useState<string | null>(null)
-  const [ticketType, setTicketType] = useState<TicketType | ''>('')
+  const [ticketType, setTicketType] = useState<TicketType | ''>(ticketTypeFromUrl ?? '')
   const [listQuery, setListQuery] = useState<TicketListQuery>({})
+  const [backlogTickets, setBacklogTickets] = useState<Ticket[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [pending, setPending] = useState<string[]>([])
@@ -65,6 +74,7 @@ export function useTaskboard(auth: AuthSession | null, enabled: boolean) {
   projectIdRef.current = projectId
   const ticketTypeRef = useRef(ticketType)
   ticketTypeRef.current = ticketType
+  const explicitType = useRef(!!ticketTypeFromUrl)
   const mounted = useRef(true)
   const epoch = useRef(0)
 
@@ -94,6 +104,7 @@ export function useTaskboard(auth: AuthSession | null, enabled: boolean) {
   const patchTicket = useCallback(
     (id: string, patch: Partial<Ticket>) => {
       commitTickets((cur) => cur?.map((t) => (t.id === id ? { ...t, ...patch } : t)) ?? cur)
+      setBacklogTickets((cur) => cur.map((t) => (t.id === id ? { ...t, ...patch } : t)))
       commitBoard((cur) => {
         if (!cur) return cur
         const mapCol = (tickets: Ticket[]) =>
@@ -102,6 +113,7 @@ export function useTaskboard(auth: AuthSession | null, enabled: boolean) {
           ...cur,
           columns: cur.columns.map((c) => ({ ...c, tickets: mapCol(c.tickets) })),
           inbox: mapCol(cur.inbox),
+          backlog: { tickets: mapCol(cur.backlog?.tickets ?? []) },
         }
       })
     },
@@ -110,32 +122,77 @@ export function useTaskboard(auth: AuthSession | null, enabled: boolean) {
 
   const replaceTicket = useCallback(
     (fresh: Ticket) => {
-      commitTickets((cur) => cur?.map((t) => (t.id === fresh.id ? fresh : t)) ?? cur)
+      commitTickets((cur) => {
+        if (!cur) return [fresh]
+        if (cur.some((t) => t.id === fresh.id)) {
+          return cur.map((t) => (t.id === fresh.id ? fresh : t))
+        }
+        return [fresh, ...cur]
+      })
+      setBacklogTickets((cur) => {
+        const without = cur.filter((t) => t.id !== fresh.id)
+        return fresh.status === 'backlog' ? [fresh, ...without] : without
+      })
       commitBoard((cur) => {
         if (!cur) return cur
         const swap = (list: Ticket[]) => list.map((t) => (t.id === fresh.id ? fresh : t))
+        const without = (list: Ticket[]) => list.filter((t) => t.id !== fresh.id)
+        const has = (list: Ticket[]) => list.some((t) => t.id === fresh.id)
+        const backlogList = cur.backlog?.tickets ?? []
         return {
           ...cur,
           columns: cur.columns.map((c) => ({
             ...c,
             tickets:
-              c.stage.id === fresh.stageId
-                ? swap(c.tickets).some((t) => t.id === fresh.id)
+              fresh.status !== 'backlog' && c.stage.id === fresh.stageId
+                ? has(swap(c.tickets))
                   ? swap(c.tickets)
-                  : [...c.tickets.filter((t) => t.id !== fresh.id), fresh]
-                : c.tickets.filter((t) => t.id !== fresh.id),
+                  : [...without(c.tickets), fresh]
+                : without(c.tickets),
           })),
           inbox:
             fresh.status === 'waiting_human'
-              ? swap(cur.inbox).some((t) => t.id === fresh.id)
+              ? has(swap(cur.inbox))
                 ? swap(cur.inbox)
-                : [...cur.inbox.filter((t) => t.id !== fresh.id), fresh]
-              : cur.inbox.filter((t) => t.id !== fresh.id),
+                : [...without(cur.inbox), fresh]
+              : without(cur.inbox),
+          backlog: {
+            tickets:
+              fresh.status === 'backlog'
+                ? has(swap(backlogList))
+                  ? swap(backlogList)
+                  : [fresh, ...without(backlogList)]
+                : without(backlogList),
+          },
         }
       })
     },
     [commitBoard, commitTickets],
   )
+
+  const boardQueryType = useCallback((): TicketType | undefined => {
+    return explicitType.current ? ticketTypeRef.current || undefined : undefined
+  }, [])
+
+  const applyBoardSnap = useCallback((snap: BoardSnapshot) => {
+    setBoard({
+      ...snap,
+      backlog: snap.backlog ?? { tickets: [] },
+    })
+    if (!explicitType.current && snap.ticketType) {
+      setTicketType(snap.ticketType)
+      ticketTypeRef.current = snap.ticketType
+    }
+  }, [])
+
+  const fetchBacklog = useCallback(async (a: NonNullable<AuthSession>, pid: string) => {
+    const page = await taskboardApi.listTickets(a, {
+      projectId: pid,
+      status: 'backlog',
+      limit: 200,
+    })
+    return page.items
+  }, [])
 
   const reconcile = useCallback(async () => {
     const a = authRef.current
@@ -156,14 +213,20 @@ export function useTaskboard(auth: AuthSession | null, enabled: boolean) {
       }
       const pid = projectIdRef.current || freshProjects[0]?.id
       if (pid) {
-        const snap = await taskboardApi.getProjectBoard(a, pid, ticketTypeRef.current || undefined)
-        if (mounted.current && epoch.current === ticket) setBoard(snap)
+        const [snap, backlog] = await Promise.all([
+          taskboardApi.getProjectBoard(a, pid, boardQueryType()),
+          fetchBacklog(a, pid).catch(() => [] as Ticket[]),
+        ])
+        if (mounted.current && epoch.current === ticket) {
+          applyBoardSnap(snap)
+          setBacklogTickets(backlog)
+        }
       }
     } catch (e) {
       if (e instanceof AuthEpochStaleError) return
       /* 后台对账失败静默，保留乐观值 */
     }
-  }, [])
+  }, [applyBoardSnap, boardQueryType, fetchBacklog])
 
   const loadInitial = useCallback(async () => {
     const a = authRef.current
@@ -185,8 +248,14 @@ export function useTaskboard(auth: AuthSession | null, enabled: boolean) {
       if (first) {
         setProjectId(first.id)
         try {
-          const snap = await taskboardApi.getProjectBoard(a, first.id)
-          if (mounted.current) setBoard(snap)
+          const [snap, backlog] = await Promise.all([
+            taskboardApi.getProjectBoard(a, first.id, boardQueryType()),
+            fetchBacklog(a, first.id).catch(() => [] as Ticket[]),
+          ])
+          if (mounted.current) {
+            applyBoardSnap(snap)
+            setBacklogTickets(backlog)
+          }
         } catch (e) {
           if (!(e instanceof AuthEpochStaleError) && mounted.current) {
             setBoard(null)
@@ -199,7 +268,7 @@ export function useTaskboard(auth: AuthSession | null, enabled: boolean) {
     } finally {
       if (mounted.current) setLoading(false)
     }
-  }, [])
+  }, [applyBoardSnap, boardQueryType, fetchBacklog])
 
   useEffect(() => {
     if (!enabled || !auth) {
@@ -207,6 +276,7 @@ export function useTaskboard(auth: AuthSession | null, enabled: boolean) {
       setTickets(null)
       setProjects(null)
       setBoard(null)
+      setBacklogTickets([])
       setLoading(false)
       return
     }
@@ -233,19 +303,47 @@ export function useTaskboard(auth: AuthSession | null, enabled: boolean) {
       if (type !== undefined) {
         setTicketType(type)
         ticketTypeRef.current = type
+        explicitType.current = !!type
       }
       const a = authRef.current
       if (!a) return
       const gate = (epoch.current += 1)
       try {
-        const snap = await taskboardApi.getProjectBoard(a, id, type || undefined)
-        if (mounted.current && epoch.current === gate) setBoard(snap)
+        const queryType = type !== undefined ? type || undefined : boardQueryType()
+        const [snap, backlog] = await Promise.all([
+          taskboardApi.getProjectBoard(a, id, queryType),
+          fetchBacklog(a, id).catch(() => [] as Ticket[]),
+        ])
+        if (mounted.current && epoch.current === gate) {
+          applyBoardSnap(snap)
+          setBacklogTickets(backlog)
+        }
       } catch (e) {
         if (e instanceof AuthEpochStaleError) return
         toast(taskboardErrorMessage(e, '加载看板失败'), 'error')
       }
     },
-    [toast],
+    [applyBoardSnap, boardQueryType, fetchBacklog, toast],
+  )
+
+  const selectTicketType = useCallback(
+    async (type: TicketType) => {
+      explicitType.current = true
+      setTicketType(type)
+      ticketTypeRef.current = type
+      const a = authRef.current
+      const pid = projectIdRef.current
+      if (!a || !pid) return
+      const gate = (epoch.current += 1)
+      try {
+        const snap = await taskboardApi.getProjectBoard(a, pid, type)
+        if (mounted.current && epoch.current === gate) applyBoardSnap(snap)
+      } catch (e) {
+        if (e instanceof AuthEpochStaleError) return
+        toast(taskboardErrorMessage(e, '加载看板失败'), 'error')
+      }
+    },
+    [applyBoardSnap, toast],
   )
 
   const applyListQuery = useCallback(
@@ -370,6 +468,9 @@ export function useTaskboard(auth: AuthSession | null, enabled: boolean) {
       try {
         const out = await taskboardApi.createTicket(a, input)
         commitTickets((cur) => (cur ? [out.ticket, ...cur] : [out.ticket]))
+        if (out.ticket.status === 'backlog') {
+          setBacklogTickets((cur) => [out.ticket, ...cur.filter((t) => t.id !== out.ticket.id)])
+        }
         toast(`已创建 ${out.ticket.identifier}`, 'success')
         void reconcile()
         return out.ticket
@@ -447,6 +548,48 @@ export function useTaskboard(auth: AuthSession | null, enabled: boolean) {
     [markPending, patchTicket, reconcile, replaceTicket, toast],
   )
 
+  const moveTicket = useCallback(
+    async (
+      ticket: Ticket,
+      input: Omit<TicketMoveInput, 'expectedVersion'>,
+    ): Promise<
+      | { ok: true; result: TicketMoveResult }
+      | { ok: false; code: string; error: unknown; detail?: Record<string, unknown> }
+    > => {
+      const a = authRef.current
+      if (!a) return { ok: false, code: 'unavailable', error: new Error('unauthenticated') }
+      markPending(ticket.id, true)
+      try {
+        const out = await taskboardApi.moveTicket(a, ticket.id, {
+          ...input,
+          expectedVersion: ticket.version,
+        })
+        replaceTicket(out.ticket)
+        void reconcile()
+        return { ok: true, result: out }
+      } catch (e) {
+        if (e instanceof AuthEpochStaleError) {
+          return { ok: false, code: 'stale', error: e }
+        }
+        const code = boardErrorCode(e) ?? 'unknown'
+        if (code === 'version_conflict') {
+          void reconcile()
+          return { ok: false, code: 'version_conflict', error: e, detail: boardErrorDetail(e) }
+        }
+        return { ok: false, code, error: e, detail: boardErrorDetail(e) }
+      } finally {
+        if (mounted.current) markPending(ticket.id, false)
+      }
+    },
+    [markPending, reconcile, replaceTicket],
+  )
+
+  useEffect(() => {
+    if (!enabled || !ticketTypeFromUrl) return
+    if (explicitType.current && ticketTypeRef.current === ticketTypeFromUrl) return
+    void selectTicketType(ticketTypeFromUrl)
+  }, [enabled, selectTicketType, ticketTypeFromUrl])
+
   const inboxTickets = (tickets ?? []).filter((t) => t.status === 'waiting_human')
 
   return {
@@ -461,7 +604,9 @@ export function useTaskboard(auth: AuthSession | null, enabled: boolean) {
     error,
     pending,
     inboxTickets,
+    backlogTickets,
     selectProject,
+    selectTicketType,
     setTicketType,
     applyListQuery,
     createProject,
@@ -470,6 +615,7 @@ export function useTaskboard(auth: AuthSession | null, enabled: boolean) {
     unarchiveProject,
     createTicket,
     runAction,
+    moveTicket,
     replaceTicket,
     reconcile,
     refresh: loadInitial,

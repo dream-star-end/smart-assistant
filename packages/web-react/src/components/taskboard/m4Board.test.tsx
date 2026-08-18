@@ -413,6 +413,7 @@ describe('流水线模板', () => {
       ticketType: 'bug',
       columns: [],
       inbox: [],
+      backlog: { tickets: [] },
     })
     const createProject = vi.spyOn(taskboardApi, 'createProject').mockResolvedValue({
       ok: true,

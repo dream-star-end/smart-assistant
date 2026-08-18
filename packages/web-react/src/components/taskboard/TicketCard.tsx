@@ -1,7 +1,8 @@
 import { Bug, FlaskConical, Sparkles, Wrench } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
-import type { ReactNode } from 'react'
+import type { DragEvent, ReactNode } from 'react'
 import {
+  type AllowedMove,
   type RunStatus,
   TICKET_PRIORITY_TONE,
   TICKET_STATUS_LABEL,
@@ -15,6 +16,7 @@ import {
 } from '../../lib/taskboard'
 import { cn } from '../../lib/utils'
 import { Badge, Card } from '../ui'
+import { dropIdForMove, stageIdFromDropId } from './ticketMove'
 
 const TYPE_ICON: Record<TicketType, LucideIcon> = {
   bug: Bug,
@@ -47,23 +49,46 @@ export function TicketCard({
   latestRunStatus,
   onOpen,
   actions,
+  draggable,
+  dragging,
+  onDragStart,
+  onDragEnd,
+  moveOptions,
+  moveOptionLabel,
+  onMoveSelect,
 }: {
   ticket: Ticket
   latestRunStatus?: RunStatus | null
   onOpen?: (ticket: Ticket) => void
   actions?: ReactNode
+  draggable?: boolean
+  dragging?: boolean
+  onDragStart?: (e: DragEvent<HTMLDivElement>) => void
+  onDragEnd?: (e: DragEvent<HTMLDivElement>) => void
+  moveOptions?: AllowedMove[]
+  moveOptionLabel?: (move: AllowedMove) => string
+  onMoveSelect?: (toStageId: string | null) => void
 }) {
   const Icon = TYPE_ICON[ticket.type]
   const runHint = latestRunHint(ticket.status, latestRunStatus)
   const agent = assigneeLabel(ticket.assignee)
+  const moves = moveOptions ?? ticket.allowedMoves ?? []
   return (
     <Card
       data-testid="ticket-card"
+      data-ticket-id={ticket.id}
       padding="sm"
       interactive={!!onOpen}
-      className="relative flex flex-col gap-2"
+      className={cn(
+        'relative flex flex-col gap-2',
+        draggable && 'cursor-grab active:cursor-grabbing',
+        dragging && 'opacity-50',
+      )}
       role={onOpen ? 'button' : undefined}
       tabIndex={onOpen ? 0 : undefined}
+      draggable={draggable}
+      onDragStart={onDragStart}
+      onDragEnd={onDragEnd}
       onClick={onOpen ? () => onOpen(ticket) : undefined}
       onKeyDown={
         onOpen
@@ -108,10 +133,12 @@ export function TicketCard({
               <span className="size-1.5 shrink-0 rounded-full bg-danger" title="最近执行失败" />
             )}
           </div>
-          <p className="mt-0.5 line-clamp-2 text-body font-medium text-fg">{ticket.title}</p>
+          <p className="mt-0.5 line-clamp-2 break-words text-body font-medium text-fg">
+            {ticket.title}
+          </p>
         </div>
       </div>
-      <div className="flex flex-wrap items-center gap-1.5">
+      <div className="flex min-w-0 flex-wrap items-center gap-1.5">
         <Badge tone={TICKET_TYPE_TONE[ticket.type]} size="sm">
           {TICKET_TYPE_LABEL[ticket.type]}
         </Badge>
@@ -121,14 +148,40 @@ export function TicketCard({
         <Badge tone={ticket.status === 'blocked' ? 'danger' : 'neutral'} size="sm">
           {TICKET_STATUS_LABEL[ticket.status]}
         </Badge>
-        {agent && <span className="truncate text-caption text-muted">{agent}</span>}
+        {agent && <span className="min-w-0 truncate text-caption text-muted">{agent}</span>}
       </div>
-      {actions && (
+      {(moves.length > 0 || actions) && (
         <div
-          className="flex flex-wrap gap-1"
+          className="flex min-w-0 flex-wrap items-center gap-1"
           onClick={(e) => e.stopPropagation()}
           onKeyDown={(e) => e.stopPropagation()}
         >
+          {moves.length > 0 && onMoveSelect && (
+            <select
+              aria-label="移动到…"
+              data-testid="ticket-move-select"
+              className="max-w-full truncate rounded-md border border-border bg-surface px-2 py-1 text-caption text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              defaultValue=""
+              onChange={(e) => {
+                const raw = e.target.value
+                e.target.value = ''
+                if (!raw) return
+                onMoveSelect(stageIdFromDropId(raw))
+              }}
+            >
+              <option value="" disabled>
+                移动到…
+              </option>
+              {moves.map((m) => (
+                <option
+                  key={`${m.action}:${dropIdForMove(m.toStageId)}`}
+                  value={dropIdForMove(m.toStageId)}
+                >
+                  {moveOptionLabel ? moveOptionLabel(m) : m.label}
+                </option>
+              ))}
+            </select>
+          )}
           {actions}
         </div>
       )}

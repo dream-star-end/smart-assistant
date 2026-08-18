@@ -280,6 +280,7 @@ describe('useTaskboard 乐观更新', () => {
       },
       ticketType: 'bug',
       columns: [],
+      backlog: { tickets: [] },
       inbox: [waiting],
     })
     vi.spyOn(taskboardApi, 'approve').mockRejectedValue(
@@ -666,6 +667,7 @@ describe('TaskboardView 来源会话不把 key 当 id', () => {
       ticketType: 'bug',
       columns: [],
       inbox: [ticket],
+      backlog: { tickets: [] },
     })
     mockDrawerApis(ticket)
     const onOpenSession = vi.fn()
@@ -782,6 +784,7 @@ function mockEmptyBoard() {
     ticketType: 'bug',
     columns: [],
     inbox: [],
+    backlog: { tickets: [] },
   })
 }
 

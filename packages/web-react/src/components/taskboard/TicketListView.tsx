@@ -23,6 +23,7 @@ export function TicketListView({
   onQueryChange,
   onOpenTicket,
   renderActions,
+  hideFilters = false,
 }: {
   tickets: Ticket[]
   query: TicketListQuery
@@ -30,6 +31,7 @@ export function TicketListView({
   onQueryChange: (next: TicketListQuery) => void
   onOpenTicket?: (ticket: Ticket) => void
   renderActions?: (ticket: Ticket) => ReactNode
+  hideFilters?: boolean
 }) {
   const agentOptions = [
     { value: '', label: '全部执行者' },
@@ -37,65 +39,71 @@ export function TicketListView({
   ]
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-3 px-4 pb-4">
-      <div className="flex flex-wrap items-end gap-2">
-        <Select
-          aria-label="按类型筛选"
-          className="w-36"
-          inputSize="sm"
-          value={query.type ?? ''}
-          onValueChange={(type) => onQueryChange({ ...query, type: type || undefined })}
-          options={[
-            { value: '', label: '全部类型' },
-            ...TICKET_TYPES.map((t) => ({ value: t, label: TICKET_TYPE_LABEL[t] })),
-          ]}
-        />
-        <Select
-          aria-label="按优先级筛选"
-          className="w-32"
-          inputSize="sm"
-          value={query.priority ?? ''}
-          onValueChange={(priority) => onQueryChange({ ...query, priority: priority || undefined })}
-          options={[
-            { value: '', label: '全部优先级' },
-            ...TICKET_PRIORITIES.map((p) => ({ value: p, label: p })),
-          ]}
-        />
-        <Select
-          aria-label="按状态筛选"
-          className="w-36"
-          inputSize="sm"
-          value={query.status ?? ''}
-          onValueChange={(status) => onQueryChange({ ...query, status: status || undefined })}
-          options={[
-            { value: '', label: '全部状态' },
-            ...TICKET_STATUSES.map((s) => ({ value: s, label: TICKET_STATUS_LABEL[s] })),
-          ]}
-        />
-        <Select
-          aria-label="按执行者筛选"
-          className="w-40"
-          inputSize="sm"
-          value={query.assignee ?? ''}
-          onValueChange={(assignee) => onQueryChange({ ...query, assignee: assignee || undefined })}
-          options={agentOptions}
-        />
-        <Input
-          aria-label="按标签筛选"
-          inputSize="sm"
-          className="w-36"
-          placeholder="标签"
-          value={query.label ?? ''}
-          onChange={(e) => onQueryChange({ ...query, label: e.target.value || undefined })}
-        />
-        <Input
-          aria-label="搜索单据"
-          inputSize="sm"
-          className="min-w-[12rem] flex-1"
-          placeholder="搜索标题 / 编号"
-          value={query.q ?? ''}
-          onChange={(e) => onQueryChange({ ...query, q: e.target.value || undefined })}
-        />
-      </div>
+      {hideFilters ? null : (
+        <div className="flex flex-wrap items-end gap-2">
+          <Select
+            aria-label="按类型筛选"
+            className="w-36"
+            inputSize="sm"
+            value={query.type ?? ''}
+            onValueChange={(type) => onQueryChange({ ...query, type: type || undefined })}
+            options={[
+              { value: '', label: '全部类型' },
+              ...TICKET_TYPES.map((t) => ({ value: t, label: TICKET_TYPE_LABEL[t] })),
+            ]}
+          />
+          <Select
+            aria-label="按优先级筛选"
+            className="w-32"
+            inputSize="sm"
+            value={query.priority ?? ''}
+            onValueChange={(priority) =>
+              onQueryChange({ ...query, priority: priority || undefined })
+            }
+            options={[
+              { value: '', label: '全部优先级' },
+              ...TICKET_PRIORITIES.map((p) => ({ value: p, label: p })),
+            ]}
+          />
+          <Select
+            aria-label="按状态筛选"
+            className="w-36"
+            inputSize="sm"
+            value={query.status ?? ''}
+            onValueChange={(status) => onQueryChange({ ...query, status: status || undefined })}
+            options={[
+              { value: '', label: '全部状态' },
+              ...TICKET_STATUSES.map((s) => ({ value: s, label: TICKET_STATUS_LABEL[s] })),
+            ]}
+          />
+          <Select
+            aria-label="按执行者筛选"
+            className="w-40"
+            inputSize="sm"
+            value={query.assignee ?? ''}
+            onValueChange={(assignee) =>
+              onQueryChange({ ...query, assignee: assignee || undefined })
+            }
+            options={agentOptions}
+          />
+          <Input
+            aria-label="按标签筛选"
+            inputSize="sm"
+            className="w-36"
+            placeholder="标签"
+            value={query.label ?? ''}
+            onChange={(e) => onQueryChange({ ...query, label: e.target.value || undefined })}
+          />
+          <Input
+            aria-label="搜索单据"
+            inputSize="sm"
+            className="min-w-[12rem] flex-1"
+            placeholder="搜索标题 / 编号"
+            value={query.q ?? ''}
+            onChange={(e) => onQueryChange({ ...query, q: e.target.value || undefined })}
+          />
+        </div>
+      )}
       {tickets.length === 0 ? (
         <EmptyState
           icon={ListFilter}

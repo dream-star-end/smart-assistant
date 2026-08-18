@@ -3,6 +3,7 @@ import { PRODUCT_CAPABILITIES } from '../lib/productCapabilities'
 import {
   parseBoardPath,
   parseBoardTicket,
+  parseBoardTicketType,
   parseBoardView,
   parsePanelParam,
   parseTutorialCase,
@@ -50,9 +51,7 @@ describe('教程 URL 深链', () => {
     )
     expect(parseTutorialCase(both)).toBe('research-bike-demand')
     expect(parseTutorialTopic(both)).toBeNull()
-    expect(
-      parseTutorialCase(new URLSearchParams('panel=help&case=unknown-case')),
-    ).toBeNull()
+    expect(parseTutorialCase(new URLSearchParams('panel=help&case=unknown-case'))).toBeNull()
 
     const caseLink = withPanelParams(
       new URLSearchParams('campaign=summer&topic=chat-basics'),
@@ -64,11 +63,7 @@ describe('教程 URL 深链', () => {
     expect(caseLink.get('case')).toBe('coding-swe-bench-fix')
     expect(caseLink.has('topic')).toBe(false)
 
-    const legacy = withPanelParams(
-      caseLink,
-      'help',
-      PRODUCT_CAPABILITIES.github.id,
-    )
+    const legacy = withPanelParams(caseLink, 'help', PRODUCT_CAPABILITIES.github.id)
     expect(legacy.get('topic')).toBe('github-repository')
     expect(legacy.has('case')).toBe(false)
   })
@@ -120,8 +115,26 @@ describe('任务面板 /board 深链', () => {
     expect(parseBoardView(new URLSearchParams('view=inbox'))).toBe('inbox')
     expect(parseBoardView(new URLSearchParams('view=cost'))).toBe('cost')
     expect(parseBoardView(new URLSearchParams('view=weekly'))).toBe('weekly')
+    expect(parseBoardView(new URLSearchParams('view=backlog'))).toBe('backlog')
     expect(parseBoardView(new URLSearchParams('view=kanban'))).toBe('board')
     expect(parseBoardTicket(new URLSearchParams('ticket=OCV5-42'))).toBe('OCV5-42')
     expect(parseBoardTicket(new URLSearchParams('ticket='))).toBeNull()
+  })
+
+  it('ticketType 只接受四类单据；未选则省略，离开 board 时清掉', () => {
+    const source = new URLSearchParams('campaign=summer&panel=help')
+    const withType = withBoardParams(source, 'board', null, 'feature')
+    expect(withType.get('campaign')).toBe('summer')
+    expect(withType.get('panel')).toBe('help')
+    expect(withType.has('view')).toBe(false)
+    expect(withType.get('ticketType')).toBe('feature')
+
+    const left = withBoardParams(withType, null, null, 'feature')
+    expect(left.get('campaign')).toBe('summer')
+    expect(left.has('ticketType')).toBe(false)
+
+    expect(parseBoardTicketType(new URLSearchParams('ticketType=feature'))).toBe('feature')
+    expect(parseBoardTicketType(new URLSearchParams('ticketType=kanban'))).toBeNull()
+    expect(parseBoardTicketType(new URLSearchParams())).toBeNull()
   })
 })
