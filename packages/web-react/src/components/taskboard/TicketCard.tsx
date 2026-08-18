@@ -2,7 +2,6 @@ import { Bug, FlaskConical, Sparkles, Wrench } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
 import type { DragEvent, ReactNode } from 'react'
 import {
-  type AllowedMove,
   type RunStatus,
   TICKET_PRIORITY_TONE,
   TICKET_STATUS_LABEL,
@@ -16,7 +15,6 @@ import {
 } from '../../lib/taskboard'
 import { cn } from '../../lib/utils'
 import { Badge, Card } from '../ui'
-import { dropIdForMove, stageIdFromDropId } from './ticketMove'
 
 const TYPE_ICON: Record<TicketType, LucideIcon> = {
   bug: Bug,
@@ -54,9 +52,6 @@ export function TicketCard({
   dragging,
   onDragStart,
   onDragEnd,
-  moveOptions,
-  moveOptionLabel,
-  onMoveSelect,
 }: {
   ticket: Ticket
   latestRunStatus?: RunStatus | null
@@ -67,14 +62,10 @@ export function TicketCard({
   dragging?: boolean
   onDragStart?: (e: DragEvent<HTMLDivElement>) => void
   onDragEnd?: (e: DragEvent<HTMLDivElement>) => void
-  moveOptions?: AllowedMove[]
-  moveOptionLabel?: (move: AllowedMove) => string
-  onMoveSelect?: (toStageId: string | null) => void
 }) {
   const Icon = TYPE_ICON[ticket.type]
   const runHint = latestRunHint(ticket.status, latestRunStatus)
   const agent = assigneeLabel(ticket.assignee)
-  const moves = moveOptions ?? ticket.allowedMoves ?? []
   return (
     <Card
       data-testid="ticket-card"
@@ -138,6 +129,7 @@ export function TicketCard({
             )}
           </div>
           <p
+            title={ticket.title}
             className={cn(
               'mt-0.5 break-words text-body font-medium text-fg',
               compact ? 'line-clamp-1' : 'line-clamp-2',
@@ -147,58 +139,44 @@ export function TicketCard({
           </p>
         </div>
       </div>
-      <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-        {!compact && (
-          <Badge tone={TICKET_TYPE_TONE[ticket.type]} size="sm">
-            {TICKET_TYPE_LABEL[ticket.type]}
-          </Badge>
-        )}
-        <Badge tone={TICKET_PRIORITY_TONE[ticket.priority]} size="sm">
-          {ticket.priority}
-        </Badge>
-        <Badge tone={ticket.status === 'blocked' ? 'danger' : 'neutral'} size="sm">
-          {TICKET_STATUS_LABEL[ticket.status]}
-        </Badge>
-        {agent && <span className="min-w-0 truncate text-caption text-muted">{agent}</span>}
-      </div>
-      {(moves.length > 0 || actions) && (
-        <div
-          className={cn('flex min-w-0 items-center gap-1', compact ? 'flex-nowrap' : 'flex-wrap')}
-          onClick={(e) => e.stopPropagation()}
-          onKeyDown={(e) => e.stopPropagation()}
-        >
-          {moves.length > 0 && onMoveSelect && (
-            <select
-              aria-label="移动到…"
-              data-testid="ticket-move-select"
-              className={cn(
-                'truncate rounded-md border border-border bg-surface px-2 py-1 text-caption text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring',
-                compact ? 'min-w-0 flex-1' : 'max-w-full',
-              )}
-              defaultValue=""
-              onChange={(e) => {
-                const raw = e.target.value
-                e.target.value = ''
-                if (!raw) return
-                onMoveSelect(stageIdFromDropId(raw))
-              }}
-            >
-              <option value="" disabled>
-                移动到…
-              </option>
-              {moves.map((m) => (
-                <option
-                  key={`${m.action}:${dropIdForMove(m.toStageId)}`}
-                  value={dropIdForMove(m.toStageId)}
-                >
-                  {moveOptionLabel ? moveOptionLabel(m) : m.label}
-                </option>
-              ))}
-            </select>
+      <div className="flex min-w-0 items-center gap-1.5">
+        <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden">
+          {!compact && (
+            <Badge tone={TICKET_TYPE_TONE[ticket.type]} size="sm">
+              {TICKET_TYPE_LABEL[ticket.type]}
+            </Badge>
           )}
-          {actions}
+          <Badge tone={TICKET_PRIORITY_TONE[ticket.priority]} size="sm">
+            {ticket.priority}
+          </Badge>
+          <Badge
+            tone={ticket.status === 'blocked' ? 'danger' : 'neutral'}
+            size="sm"
+            className="max-w-[6rem] truncate"
+            title={TICKET_STATUS_LABEL[ticket.status]}
+          >
+            {TICKET_STATUS_LABEL[ticket.status]}
+          </Badge>
+          {agent && (
+            <span
+              data-testid="ticket-assignee"
+              className="min-w-0 truncate text-caption text-muted"
+              title={agent}
+            >
+              {agent}
+            </span>
+          )}
         </div>
-      )}
+        {actions ? (
+          <div
+            className="flex shrink-0 items-center gap-0.5"
+            onClick={(e) => e.stopPropagation()}
+            onKeyDown={(e) => e.stopPropagation()}
+          >
+            {actions}
+          </div>
+        ) : null}
+      </div>
     </Card>
   )
 }

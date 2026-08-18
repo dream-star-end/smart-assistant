@@ -14,6 +14,11 @@ export function allowedDropIds(ticket: Ticket): Set<string> {
   return new Set((ticket.allowedMoves ?? []).map((m) => dropIdForMove(m.toStageId)))
 }
 
+/** 单据当前所在列。拖动时这列是「原地」而不是非法目标。 */
+export function homeDropId(ticket: Ticket): string {
+  return ticket.stageId == null ? BACKLOG_DROP_ID : dropIdForMove(ticket.stageId)
+}
+
 export function moveForDestination(
   ticket: Ticket,
   toStageId: string | null,

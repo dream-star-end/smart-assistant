@@ -496,8 +496,12 @@ describe('积压列与有条件拖动', () => {
       cols.find((el) => el.getAttribute('data-stage-id') === id) as HTMLElement
     expect(col('s1')).toHaveAttribute('data-drop-allowed', 'true')
     expect(col('s1')).not.toHaveAttribute('data-drop-disabled')
+    expect(col('s2')).toHaveAttribute('data-drop-source', 'true')
+    expect(col('s2')).not.toHaveAttribute('data-drop-disabled')
+    expect(col('s2')).not.toHaveAttribute('aria-disabled')
     expect(col('s3')).toHaveAttribute('data-drop-disabled', 'true')
     expect(col('s3')).toHaveAttribute('aria-disabled', 'true')
+    expect(col('s3')).not.toHaveAttribute('data-drop-source')
     expect(screen.getByTestId('taskboard-backlog-column')).toHaveAttribute(
       'data-drop-allowed',
       'true',
@@ -534,9 +538,21 @@ describe('积压列与有条件拖动', () => {
       move: { action: 'promote', label: '批准开工', fromStageId: null, toStageId: 's1' },
     })
     renderBoard()
-    const select = await screen.findByLabelText('移动到…')
+    const cardEl = await screen.findByTestId('ticket-card')
+    expect(within(cardEl).queryByLabelText('移动到…')).not.toBeInTheDocument()
+    expect(within(cardEl).queryByTestId('ticket-move-select')).not.toBeInTheDocument()
+
+    const more = within(cardEl).getByTestId('ticket-more-actions')
+    expect(more).toHaveAttribute('aria-label', '更多操作')
+    more.focus()
+    expect(more).toHaveFocus()
     await act(async () => {
-      fireEvent.change(select, { target: { value: 's1' } })
+      fireEvent.keyDown(more, { key: 'Enter' })
+    })
+    const moveItem = await screen.findByRole('menuitem', { name: /批准开工 · 复现确认/ })
+    moveItem.focus()
+    await act(async () => {
+      fireEvent.keyDown(moveItem, { key: 'Enter' })
     })
     await waitFor(() => {
       expect(moveTicket).toHaveBeenCalledWith(
@@ -655,21 +671,25 @@ describe('其余移动错误码', () => {
         }),
       )
     renderBoard()
-    const select = await screen.findByLabelText('移动到…')
-    await act(async () => {
-      fireEvent.change(select, { target: { value: 's1' } })
-    })
+    const pickMove = async () => {
+      const more = await screen.findByTestId('ticket-more-actions')
+      await act(async () => {
+        more.focus()
+        fireEvent.keyDown(more, { key: 'Enter' })
+      })
+      const item = await screen.findByRole('menuitem', { name: /批准开工 · 复现确认/ })
+      await act(async () => {
+        fireEvent.keyDown(item, { key: 'Enter' })
+      })
+    }
+    await pickMove()
     expect(await screen.findByText(/这次拖动没有可解释的语义/)).toBeInTheDocument()
     expect(screen.getByText(/unmapped_drag/)).toBeInTheDocument()
 
-    await act(async () => {
-      fireEvent.change(select, { target: { value: 's1' } })
-    })
+    await pickMove()
     expect(await screen.findByText('依赖未解除：OCV5-1')).toBeInTheDocument()
 
-    await act(async () => {
-      fireEvent.change(select, { target: { value: 's1' } })
-    })
+    await pickMove()
     expect(await screen.findByText('当前身份无权执行此操作')).toBeInTheDocument()
     expect(moveTicket).toHaveBeenCalledTimes(3)
   })
@@ -767,22 +787,24 @@ describe('看板卡片操作收整', () => {
     expect(within(cardEl).queryByRole('button', { name: '打回' })).not.toBeInTheDocument()
     expect(within(cardEl).queryByTestId('ticket-cancel')).not.toBeInTheDocument()
     expect(within(cardEl).queryByTestId('ticket-done')).not.toBeInTheDocument()
+    expect(within(cardEl).queryByLabelText('移动到…')).not.toBeInTheDocument()
+    expect(within(cardEl).queryByTestId('ticket-move-select')).not.toBeInTheDocument()
+    expect(within(cardEl).queryByRole('combobox', { name: '移动到…' })).not.toBeInTheDocument()
 
-    const moveSelect = within(cardEl).getByLabelText('移动到…')
-    expect(moveSelect).toBeInTheDocument()
-
-    fireEvent.pointerDown(within(cardEl).getByTestId('ticket-more-actions'), {
-      button: 0,
-      ctrlKey: false,
-      pointerType: 'mouse',
+    const more = within(cardEl).getByTestId('ticket-more-actions')
+    more.focus()
+    await act(async () => {
+      fireEvent.keyDown(more, { key: 'Enter' })
     })
     expect(await screen.findByRole('menuitem', { name: '取消' })).toBeInTheDocument()
     expect(screen.getByRole('menuitem', { name: '打回' })).toBeInTheDocument()
     expect(screen.getByRole('menuitem', { name: '完成' })).toBeInTheDocument()
     expect(screen.getByTestId('ticket-cancel')).toBeInTheDocument()
-
+    const moveItem = screen.getByRole('menuitem', { name: /打回重做 · 复现确认/ })
+    expect(moveItem).toHaveAttribute('data-testid', 'ticket-move-option')
+    moveItem.focus()
     await act(async () => {
-      fireEvent.change(moveSelect, { target: { value: 's1' } })
+      fireEvent.keyDown(moveItem, { key: 'Enter' })
     })
     await waitFor(() => {
       expect(moveTicket).toHaveBeenCalledWith(
@@ -836,5 +858,86 @@ describe('积压 tab 类型筛选', () => {
     })
     expect(screen.getByText('没有这类积压单')).toBeInTheDocument()
     expect(screen.queryByText('积压需求')).not.toBeInTheDocument()
+  })
+})
+
+describe('看板列头与卡片一级收整', () => {
+  test('列头计数紧跟列名，积压列头带当前类型，空列有容器，标题有全文 title，一级没有移动下拉', async () => {
+    const leftover = sampleTicket({
+      allowedMoves: [move({ toStageId: 's1', action: 'promote', label: '批准开工' })],
+    })
+    stubBoard({
+      backlog: [leftover],
+      ticketType: 'bug',
+      columns: [
+        { stage: s1, tickets: [] },
+        { stage: s2, tickets: [] },
+        { stage: s3, tickets: [] },
+      ],
+    })
+    renderBoard()
+    const backlog = await screen.findByTestId('taskboard-backlog-column')
+    const heading = within(backlog).getByRole('heading', { level: 3 })
+    expect(heading).toHaveTextContent('积压')
+    expect(within(heading).getByTestId('column-type-filter')).toHaveTextContent('· 问题单')
+    const count = within(heading).getByTestId('column-count')
+    expect(count).toHaveTextContent('1')
+    expect(heading).toContainElement(count)
+
+    const empty = column('s1')
+    const emptyBox = within(empty).getByTestId('column-empty')
+    expect(emptyBox).toHaveTextContent('这一列还没有单据')
+    expect(emptyBox.className).toMatch(/border-dashed/)
+    expect(within(empty).getByRole('heading', { level: 3 })).toContainElement(
+      within(empty).getByTestId('column-count'),
+    )
+
+    const card = screen.getByTestId('ticket-card')
+    expect(within(card).queryByLabelText('移动到…')).not.toBeInTheDocument()
+    expect(within(card).queryByRole('combobox', { name: '移动到…' })).not.toBeInTheDocument()
+    expect(screen.getByText('登录 500')).toHaveAttribute('title', '登录 500')
+    await waitFor(() => {
+      expect(screen.getByLabelText('项目')).toHaveAttribute('title', 'OCV5 V5 自用')
+    })
+  })
+})
+
+describe('拖动源列与非法列', () => {
+  test('源列保持中性，非法目标列才带禁用标记', async () => {
+    const card = sampleTicket({
+      id: 't-src',
+      status: 'ready',
+      stageId: 's1',
+      title: '源列中性',
+      allowedMoves: [move({ toStageId: 's2', action: 'skip_forward', label: '推进' })],
+    })
+    stubBoard({
+      columns: [
+        { stage: s1, tickets: [card] },
+        { stage: s2, tickets: [] },
+        { stage: s3, tickets: [] },
+      ],
+    })
+    renderBoard()
+    expect(await screen.findByText('源列中性')).toBeInTheDocument()
+    fireEvent.dragStart(screen.getByTestId('ticket-card'), { dataTransfer: fakeDt() })
+
+    const source = column('s1')
+    const legal = column('s2')
+    const illegal = column('s3')
+    expect(source).toHaveAttribute('data-drop-source', 'true')
+    expect(source).not.toHaveAttribute('data-drop-disabled')
+    expect(source).not.toHaveAttribute('data-drop-allowed')
+    expect(source).not.toHaveAttribute('aria-disabled')
+    expect(legal).toHaveAttribute('data-drop-allowed', 'true')
+    expect(legal).not.toHaveAttribute('data-drop-disabled')
+    expect(legal).not.toHaveAttribute('data-drop-source')
+    expect(illegal).toHaveAttribute('data-drop-disabled', 'true')
+    expect(illegal).toHaveAttribute('aria-disabled', 'true')
+    expect(illegal).not.toHaveAttribute('data-drop-source')
+    expect(screen.getByTestId('taskboard-backlog-column')).toHaveAttribute(
+      'data-drop-disabled',
+      'true',
+    )
   })
 })
