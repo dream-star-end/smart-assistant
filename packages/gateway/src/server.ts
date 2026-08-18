@@ -640,26 +640,43 @@ export interface LocalExecutionDecision {
 export const TICKETLESS_INBOUND_LIVE_SESSION_FALLBACK_WARN =
   '无票 inbound 沿用会话模型失败'
 
-/**
- * 从内存中的存活 runner 读当前实际在跑的 model。
- * 优先 runner.model(进程正在用的),其次 session.model。
- * **不读** client_sessions.model_id(那只是 UI 恢复提示,不是执行权威)。
- */
-export function readLiveRunnerModel(
-  session:
-    | {
-        runner?: { model?: string }
-        model?: string
-      }
-    | undefined
-    | null,
-): string | undefined {
-  if (!session) return undefined
+/** 无票 inbound 沿用会话模型失败:session 正在 getOrCreate 替换/关闭。 */
+export const TICKETLESS_LIVE_SESSION_REPLACING_REASON = 'session_replacing'
+
+type LiveRunnerSessionView = {
+  runner?: { model?: string }
+  model?: string
+  _replacing?: boolean
+}
+
+function peekLiveRunnerModel(session: LiveRunnerSessionView): string | undefined {
   const runnerModel = session.runner?.model
   if (typeof runnerModel === 'string' && runnerModel !== '') return runnerModel
   const sessionModel = session.model
   if (typeof sessionModel === 'string' && sessionModel !== '') return sessionModel
   return undefined
+}
+
+/** session 正在替换/关闭 → 不得沿用其 model。 */
+export function liveSessionReuseSkipReason(
+  session: LiveRunnerSessionView | undefined | null,
+): string | undefined {
+  if (session?._replacing === true) return TICKETLESS_LIVE_SESSION_REPLACING_REASON
+  return undefined
+}
+
+/**
+ * 从内存中的存活 runner 读当前实际在跑的 model。
+ * 优先 runner.model(进程正在用的),其次 session.model。
+ * **不读** client_sessions.model_id(那只是 UI 恢复提示,不是执行权威)。
+ * 命中正在替换/关闭 → undefined(等价冷启动,走原阶梯)。
+ */
+export function readLiveRunnerModel(
+  session: LiveRunnerSessionView | undefined | null,
+): string | undefined {
+  if (!session) return undefined
+  if (liveSessionReuseSkipReason(session) !== undefined) return undefined
+  return peekLiveRunnerModel(session)
 }
 
 /** 存活 runner 的 model 为何不能沿用。undefined = catalog 认为可路由。 */
@@ -690,8 +707,14 @@ export function decideLocalExecution(args: {
    * 无票 inbound 且该 sessionKey 已有存活 runner 时,runner 当前实际在跑的 model。
    * 插在 caller model 之后、agent.model 之前:有显式 model 仍以 caller 为准(用户换模型
    * / 签名票路径不走这里);没有显式 model 时先沿用会话,避免 agent 默认改判引擎。
+   * 该沿用对所有 engine 生效(含 CCB/Codex),是有意的会话连续性,不只是 cursor 专用。
    */
   liveSessionModel?: string
+  /**
+   * 无票取样命中正在替换/关闭的 session 时由 caller 传入(如 session_replacing)。
+   * 有值则不把 liveSessionModel 插入候选,但仍打回退 warn。
+   */
+  liveSessionSkipReason?: string
   /** config.defaults.model。 */
   defaultModel?: string | null
   kind: LocalTurnKind
@@ -718,28 +741,42 @@ export function decideLocalExecution(args: {
   }
 
   const explicitModel = typeof args.model === 'string' && args.model !== '' ? args.model : undefined
+  const forcedSkipReason =
+    typeof args.liveSessionSkipReason === 'string' && args.liveSessionSkipReason !== ''
+      ? args.liveSessionSkipReason
+      : undefined
   const liveSessionModel =
-    typeof args.liveSessionModel === 'string' && args.liveSessionModel !== ''
+    forcedSkipReason === undefined &&
+    typeof args.liveSessionModel === 'string' &&
+    args.liveSessionModel !== ''
       ? args.liveSessionModel
       : undefined
   const ticketlessReuse = explicitModel === undefined
-  let liveSkipReason: string | undefined
-  if (ticketlessReuse && liveSessionModel) {
+  let liveSkipReason: string | undefined = forcedSkipReason
+  if (ticketlessReuse && liveSessionModel && liveSkipReason === undefined) {
     liveSkipReason = liveSessionModelUnusableReason(view, liveSessionModel)
   }
 
   const decorate = (decision: LocalExecutionDecision): LocalExecutionDecision => {
-    if (!ticketlessReuse || !liveSessionModel) return decision
-    const liveCanonical = view.canonicalize(liveSessionModel)
-    if (decision.canonicalModel === liveCanonical && liveSkipReason === undefined) return decision
+    if (!ticketlessReuse) return decision
+    if (!liveSessionModel && forcedSkipReason === undefined) return decision
+    if (liveSessionModel) {
+      const liveCanonical = view.canonicalize(liveSessionModel)
+      if (decision.canonicalModel === liveCanonical && liveSkipReason === undefined) return decision
+    }
     const reason =
-      liveSkipReason ?? liveSessionModelUnusableReason(view, liveSessionModel) ?? 'unroutable'
+      liveSkipReason ??
+      (liveSessionModel !== undefined
+        ? liveSessionModelUnusableReason(view, liveSessionModel)
+        : undefined) ??
+      forcedSkipReason ??
+      'unroutable'
     args.warn?.(TICKETLESS_INBOUND_LIVE_SESSION_FALLBACK_WARN, {
       liveModel: liveSessionModel,
       reason,
       fallbackModel: decision.canonicalModel,
     })
-    return { ...decision, liveSessionFallback: { from: liveSessionModel, reason } }
+    return { ...decision, liveSessionFallback: { from: liveSessionModel ?? '', reason } }
   }
 
   // ② 候选阶梯:归一 → 投影可用性 → engine,三件事**全取投影**。
@@ -792,9 +829,14 @@ export function decideLocalExecution(args: {
     return decorate(downgradeSyntheticCodex(view, canonicalModel, args.defaultModel, env))
   }
 
-  if (ticketlessReuse && liveSessionModel) {
+  if (ticketlessReuse && (liveSessionModel || forcedSkipReason)) {
     const reason =
-      liveSkipReason ?? liveSessionModelUnusableReason(view, liveSessionModel) ?? 'unroutable'
+      liveSkipReason ??
+      (liveSessionModel !== undefined
+        ? liveSessionModelUnusableReason(view, liveSessionModel)
+        : undefined) ??
+      forcedSkipReason ??
+      'unroutable'
     args.warn?.(TICKETLESS_INBOUND_LIVE_SESSION_FALLBACK_WARN, {
       liveModel: liveSessionModel,
       reason,
@@ -858,8 +900,11 @@ export async function resolveLocalExecutionIfEnforced(args: {
   kind: LocalTurnKind
   model?: string
   liveSessionModel?: string
+  liveSessionSkipReason?: string
   /** catalog 投影拉完后再取样,缩小「读 runner → await catalog → getOrCreate」窗口。 */
   resolveLiveSessionModel?: () => string | undefined
+  /** 与 resolveLiveSessionModel 同时、在 catalog 之后取样。 */
+  resolveLiveSessionSkipReason?: () => string | undefined
   defaultModel?: string | null
   env?: NodeJS.ProcessEnv
   warn?: (message: string, fields?: Record<string, unknown>) => void
@@ -868,7 +913,8 @@ export async function resolveLocalExecutionIfEnforced(args: {
   if (!isModelAuthorityRequired(env)) return undefined
   const view = await getLocalCatalogView()
   const liveSessionModel = args.resolveLiveSessionModel?.() ?? args.liveSessionModel
-  return decideLocalExecution({ ...args, liveSessionModel, view, env })
+  const liveSessionSkipReason = args.resolveLiveSessionSkipReason?.() ?? args.liveSessionSkipReason
+  return decideLocalExecution({ ...args, liveSessionModel, liveSessionSkipReason, view, env })
 }
 
 /** decision → getOrCreate 的执行覆盖入参(flag 未开 → `{}`,展开后零影响)。 */
@@ -13756,7 +13802,6 @@ export class Gateway {
     clientMessageId: string = buildDetachedAskUserAnswerMessageId(requestId),
   ): Promise<void> {
     const agentId = agentIdFromAskUserSessionKey(pending.sessionKey)
-    const liveModel = readLiveRunnerModel(this.sessions.getByKey(pending.sessionKey))
     await this.dispatchInbound({
       type: 'inbound.message',
       channel: pending.channel,
@@ -13766,9 +13811,6 @@ export class Gateway {
       ts: Date.now(),
       idempotencyKey: `ask-user-answer:${requestId}`,
       clientMessageId,
-      // 合成帧本身带上原会话 model(不改协议类型,调用方已是 `as any`)。
-      // 即使上面的无票兜底没命中,只要该 model 在 ALLOWED_INBOUND_MODELS 里也不会跳引擎。
-      ...(liveModel !== undefined ? { model: liveModel } : {}),
       _userId: pending.userId,
     } as any)
   }
@@ -14718,6 +14760,10 @@ export class Gateway {
           resolveLiveSessionModel:
             safeModel === undefined
               ? () => readLiveRunnerModel(this.sessions.getByKey(sessionKey))
+              : undefined,
+          resolveLiveSessionSkipReason:
+            safeModel === undefined
+              ? () => liveSessionReuseSkipReason(this.sessions.getByKey(sessionKey))
               : undefined,
           defaultModel: this.deps.config.defaults.model,
           warn: (message, fields) => this.log.warn(message, { sessionKey, ...fields }),

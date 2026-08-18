@@ -22,10 +22,13 @@ import {
   parseCatalogResponse,
 } from '../modelCatalogClient.js'
 import {
+  Gateway,
   TICKETLESS_INBOUND_LIVE_SESSION_FALLBACK_WARN,
+  TICKETLESS_LIVE_SESSION_REPLACING_REASON,
   decideLocalExecution,
   localExecutionOverride,
   liveSessionModelUnusableReason,
+  liveSessionReuseSkipReason,
   readLiveRunnerModel,
   resolveLocalExecutionIfEnforced,
 } from '../server.js'
@@ -105,6 +108,13 @@ describe('readLiveRunnerModel', () => {
     )
     assert.equal(readLiveRunnerModel({ runner: { model: '' }, model: 'cursor-grok-4.6-high' }), 'cursor-grok-4.6-high')
     assert.equal(readLiveRunnerModel({ model: 'cursor-auto' }), 'cursor-auto')
+  })
+
+  test('_replacing 中的 session 不得沿用 → undefined', () => {
+    const replacing = { runner: { model: 'cursor-auto' }, model: 'cursor-auto', _replacing: true }
+    assert.equal(readLiveRunnerModel(replacing), undefined)
+    assert.equal(liveSessionReuseSkipReason(replacing), TICKETLESS_LIVE_SESSION_REPLACING_REASON)
+    assert.equal(liveSessionReuseSkipReason({ runner: { model: 'cursor-auto' } }), undefined)
   })
 })
 
@@ -347,5 +357,149 @@ describe('resolveLocalExecutionIfEnforced 在 catalog 之后取样存活 runner'
     assert.deepEqual(order, ['view', 'live'])
     assert.equal(d?.canonicalModel, 'cursor-auto')
     assert.equal(d?.engine, 'cursor')
+  })
+})
+
+describe('正在替换/关闭的 session 不得沿用', () => {
+  test('liveSessionSkipReason=session_replacing → 走原阶梯 + warn', () => {
+    const warns: Array<{ msg: string; fields?: Record<string, unknown> }> = []
+    const replacing = { runner: { model: 'cursor-auto' }, model: 'cursor-auto', _replacing: true }
+    assert.equal(readLiveRunnerModel(replacing), undefined)
+    const d = decideLocalExecution({
+      view: catalogView(),
+      agent: MAIN,
+      liveSessionModel: 'cursor-auto',
+      liveSessionSkipReason: liveSessionReuseSkipReason(replacing),
+      defaultModel: 'glm-5.2',
+      kind: 'turn',
+      env: EXEMPT,
+      warn: (msg, fields) => {
+        warns.push({ msg, fields })
+      },
+    })
+    assert.equal(d.canonicalModel, 'glm-5.2')
+    assert.equal(d.engine, 'ccb')
+    assert.deepEqual(d.liveSessionFallback, { from: '', reason: TICKETLESS_LIVE_SESSION_REPLACING_REASON })
+    assert.equal(warns.length, 1)
+    assert.equal(warns[0]?.msg, TICKETLESS_INBOUND_LIVE_SESSION_FALLBACK_WARN)
+    assert.equal(warns[0]?.fields?.reason, TICKETLESS_LIVE_SESSION_REPLACING_REASON)
+    assert.equal(warns[0]?.fields?.fallbackModel, 'glm-5.2')
+  })
+
+  test('catalog 之后取样到 _replacing → 不沿用 + warn reason 正确', async () => {
+    const warns: Array<{ msg: string; fields?: Record<string, unknown> }> = []
+    const order: string[] = []
+    const replacing = { runner: { model: 'cursor-auto' }, _replacing: true }
+    _setModelCatalogClientForTests({
+      getRoutingView: async () => {
+        order.push('view')
+        return catalogView()
+      },
+    } as unknown as ModelCatalogClient)
+    const d = await resolveLocalExecutionIfEnforced({
+      agent: MAIN,
+      kind: 'turn',
+      defaultModel: 'glm-5.2',
+      env: { ...ON, OC_SELFHOST_ENGINE_LOCAL_TURNS: '1' },
+      resolveLiveSessionModel: () => {
+        order.push('live')
+        return readLiveRunnerModel(replacing)
+      },
+      resolveLiveSessionSkipReason: () => {
+        order.push('skip')
+        return liveSessionReuseSkipReason(replacing)
+      },
+      warn: (msg, fields) => {
+        warns.push({ msg, fields })
+      },
+    })
+    assert.deepEqual(order, ['view', 'live', 'skip'])
+    assert.equal(d?.canonicalModel, 'glm-5.2')
+    assert.equal(d?.engine, 'ccb')
+    assert.equal(d?.liveSessionFallback?.reason, TICKETLESS_LIVE_SESSION_REPLACING_REASON)
+    assert.equal(warns[0]?.fields?.reason, TICKETLESS_LIVE_SESSION_REPLACING_REASON)
+  })
+
+  test('getOrCreate 跨引擎替换时在 shutdown 前就置 _replacing', async () => {
+    const prevAuth = process.env.OC_MODEL_AUTHORITY
+    process.env.OC_MODEL_AUTHORITY = '1'
+    const key = 'agent:main:webchat:dm:ticketless-replacing'
+    const sm = new SessionManager(makeConfig())
+    try {
+      const first = await sm.getOrCreate({
+        sessionKey: key,
+        agent: { id: 'main', model: 'glm-5.2' } as AgentDef,
+        channel: 'webchat',
+        peerId: 'ticketless-replacing',
+        model: 'cursor-auto',
+        executionAuthority: {
+          canonicalModel: 'cursor-auto',
+          engine: 'cursor',
+          source: 'local_catalog',
+        },
+      })
+      let sawReplacing = false
+      const orig = first.runner.shutdown.bind(first.runner)
+      first.runner.shutdown = async () => {
+        sawReplacing = first._replacing === true
+        await orig()
+      }
+      await sm.getOrCreate({
+        sessionKey: key,
+        agent: { id: 'main', model: 'glm-5.2' } as AgentDef,
+        channel: 'webchat',
+        peerId: 'ticketless-replacing',
+        model: 'glm-5.2',
+        executionAuthority: {
+          canonicalModel: 'glm-5.2',
+          engine: 'ccb',
+          source: 'local_catalog',
+        },
+      })
+      assert.equal(sawReplacing, true, 'shutdown 被调用时旧 session 必须已标 _replacing')
+    } finally {
+      if (prevAuth === undefined) Reflect.deleteProperty(process.env, 'OC_MODEL_AUTHORITY')
+      else process.env.OC_MODEL_AUTHORITY = prevAuth
+    }
+  })
+})
+
+describe('detached ask 合成帧不再带 model', () => {
+  test('_submitDetachedAskUserAnswer 合成帧只有 text,不带 model', async () => {
+    const inboundFrames: unknown[] = []
+    const gateway = Object.create(Gateway.prototype) as {
+      dispatchInbound: (frame: unknown) => Promise<void>
+      _submitDetachedAskUserAnswer: (
+        pending: {
+          sessionKey: string
+          userId: string
+          channel: string
+          peer: { id: string; kind: 'dm' | 'group' }
+        },
+        text: string,
+        requestId: string,
+      ) => Promise<void>
+    }
+    gateway.dispatchInbound = async (frame: unknown) => {
+      inboundFrames.push(frame)
+    }
+    await gateway._submitDetachedAskUserAnswer(
+      {
+        sessionKey: 'agent:main:webchat:dm:ticketless-ask',
+        userId: 'default',
+        channel: 'webchat',
+        peer: { id: 'ticketless-ask', kind: 'dm' },
+      },
+      'Vim',
+      'ask-user:ticketless-1',
+    )
+    assert.equal(inboundFrames.length, 1)
+    const frame = inboundFrames[0] as Record<string, unknown>
+    assert.equal(frame.type, 'inbound.message')
+    assert.deepEqual(frame.content, { text: 'Vim' })
+    assert.equal('model' in frame, false, '合成帧不得再带显式 model')
+    assert.equal(frame.channel, 'webchat')
+    assert.equal(frame.agentId, 'main')
+    assert.equal(frame._userId, 'default')
   })
 })
