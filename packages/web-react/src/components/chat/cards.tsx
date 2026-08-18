@@ -594,7 +594,7 @@ export function AssistantCard({
               内部串类正文不进这里(bodyText 为空),只由下方红卡按码文案承载;
             - 流式已起但正文尚空 → 本轮活动指示取代裸三点。 */}
         {msg.text && !hasError ? (
-          <OptionsGroupProvider>
+          <OptionsGroupProvider live={live}>
             <ProgressiveMarkdown text={msg.text} live={live} />
             <OptionsGroupFooter />
           </OptionsGroupProvider>

@@ -144,11 +144,13 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
 
   // 同消息多题 → 聚合模式:点选只记录,由 GroupFooter 统一发送(修 boss 实测:
   // 点第一题即发送、其余题作废)。单题(或无分组)保持点击即发/块内确认。
+  // live 期间即使目前只注册到 1 块也不走点击即发:后继 options 的 JSON 可能还是半截。
+  const streaming = groupSnap?.live === true;
   const grouped = !!group && (groupSnap?.count ?? 0) >= 2;
   const groupEntry = groupSnap?.entries.find((e) => e.key === blockKey);
   const sent = grouped ? (groupSnap?.sent ?? false) : sentLocal !== null;
   const sentText = grouped ? (groupEntry?.labels.join("、") ?? null) : sentLocal;
-  const interactive = !readOnly && !!sendUserText && !sent;
+  const interactive = !readOnly && !!sendUserText && !sent && !streaming;
 
   const report = (labels: string[]) => group?.setAnswer(blockKey, labels);
 
@@ -189,6 +191,7 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
               key={`${i}-${o.label}`}
               type="button"
               disabled={!interactive || !!busy}
+              title={streaming ? "生成中" : undefined}
               onClick={() => choose(i)}
               className={
                 "flex items-start gap-2 rounded-lg border px-3 py-2 text-left transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring " +
@@ -225,8 +228,9 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
         </button>
       )}
       {sent && sentText && <p className="px-1 text-[11.5px] text-faint">已选择:{sentText}</p>}
+      {streaming && !sent && <p className="px-1 text-[11.5px] text-faint">生成中</p>}
       {grouped && !sent && (groupEntry?.labels.length ?? 0) > 0 && (
-        <p className="px-1 text-[11.5px] text-faint">已选:{groupEntry?.labels.join("、")}(答完全部问题后统一发送)</p>
+        <p className="px-1 text-[11.5px] text-faint">已选:{groupEntry?.labels.join("、")}(可在下方发送选择)</p>
       )}
       {!readOnly && !sendUserText && <p className="px-1 text-[11px] text-faint">(此会话中不可交互)</p>}
     </div>
