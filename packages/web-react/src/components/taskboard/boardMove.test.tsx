@@ -1,5 +1,5 @@
 import '@testing-library/jest-dom/vitest'
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import type { ComponentProps } from 'react'
 import { afterEach, describe, expect, test, vi } from 'vitest'
 import { ApiError } from '../../lib/api'
@@ -691,5 +691,150 @@ describe('移动文案', () => {
     expect(formatNoIntentMessage('目标阶段不属于该单据当前流水线。')).toContain(
       '这次拖动没有可解释的语义',
     )
+  })
+})
+
+describe('拖动落点占位', () => {
+  test('合法列出现占位，离开或拖到非法列后消失', async () => {
+    const card = sampleTicket({
+      id: 't-ph',
+      status: 'waiting_human',
+      stageId: 's2',
+      title: '只能打回',
+      allowedMoves: [
+        move({ toStageId: 's1', action: 'send_back', label: '打回重做', requiresReason: true }),
+        move({ toStageId: null, action: 'return_to_backlog', label: '退回积压' }),
+      ],
+    })
+    stubBoard({
+      columns: [
+        { stage: s1, tickets: [] },
+        { stage: s2, tickets: [card] },
+        { stage: s3, tickets: [] },
+      ],
+    })
+    renderBoard()
+    expect(await screen.findByText('只能打回')).toBeInTheDocument()
+    expect(screen.queryByTestId('drop-placeholder')).not.toBeInTheDocument()
+
+    const dt = fakeDt()
+    fireEvent.dragStart(screen.getByTestId('ticket-card'), { dataTransfer: dt })
+    const legal = column('s1')
+    const illegal = column('s3')
+
+    fireEvent.dragOver(legal, { dataTransfer: dt })
+    const ph = await screen.findByTestId('drop-placeholder')
+    expect(ph).toHaveAttribute('data-drop-placeholder', 'true')
+    expect(legal.querySelector('[data-drop-placeholder]')).toBeTruthy()
+    expect(illegal.querySelector('[data-drop-placeholder]')).toBeFalsy()
+
+    fireEvent.dragOver(illegal, { dataTransfer: dt })
+    expect(screen.queryByTestId('drop-placeholder')).not.toBeInTheDocument()
+
+    fireEvent.dragOver(legal, { dataTransfer: dt })
+    expect(await screen.findByTestId('drop-placeholder')).toBeInTheDocument()
+    fireEvent.dragLeave(legal, { relatedTarget: document.body, dataTransfer: dt })
+    expect(screen.queryByTestId('drop-placeholder')).not.toBeInTheDocument()
+  })
+})
+
+describe('看板卡片操作收整', () => {
+  test('破坏性动作不在看板卡一级，菜单里可达；「移动到…」仍可用', async () => {
+    const card = sampleTicket({
+      id: 't-wh',
+      status: 'waiting_human',
+      stageId: 's2',
+      title: '等人确认',
+      allowedMoves: [
+        move({ toStageId: 's1', action: 'send_back', label: '打回重做', requiresReason: true }),
+      ],
+    })
+    stubBoard({
+      columns: [
+        { stage: s1, tickets: [] },
+        { stage: s2, tickets: [card] },
+        { stage: s3, tickets: [] },
+      ],
+    })
+    const moveTicket = vi.spyOn(taskboardApi, 'moveTicket').mockResolvedValue({
+      ticket: { ...card, stageId: 's1', version: 4 },
+      move: { action: 'send_back', label: '打回重做', fromStageId: 's2', toStageId: 's1' },
+    })
+    renderBoard()
+    const cardEl = await screen.findByTestId('ticket-card')
+    expect(within(cardEl).getByRole('button', { name: '通过' })).toBeInTheDocument()
+    expect(within(cardEl).queryByRole('button', { name: '取消' })).not.toBeInTheDocument()
+    expect(within(cardEl).queryByRole('button', { name: '打回' })).not.toBeInTheDocument()
+    expect(within(cardEl).queryByTestId('ticket-cancel')).not.toBeInTheDocument()
+    expect(within(cardEl).queryByTestId('ticket-done')).not.toBeInTheDocument()
+
+    const moveSelect = within(cardEl).getByLabelText('移动到…')
+    expect(moveSelect).toBeInTheDocument()
+
+    fireEvent.pointerDown(within(cardEl).getByTestId('ticket-more-actions'), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: 'mouse',
+    })
+    expect(await screen.findByRole('menuitem', { name: '取消' })).toBeInTheDocument()
+    expect(screen.getByRole('menuitem', { name: '打回' })).toBeInTheDocument()
+    expect(screen.getByRole('menuitem', { name: '完成' })).toBeInTheDocument()
+    expect(screen.getByTestId('ticket-cancel')).toBeInTheDocument()
+
+    await act(async () => {
+      fireEvent.change(moveSelect, { target: { value: 's1' } })
+    })
+    await waitFor(() => {
+      expect(moveTicket).toHaveBeenCalledWith(
+        auth,
+        't-wh',
+        expect.objectContaining({ toStageId: 's1', expectedVersion: 3 }),
+      )
+    })
+  })
+})
+
+describe('积压 tab 类型筛选', () => {
+  test('切换类型后列表内容随之变化', async () => {
+    stubBoard({
+      backlog: [
+        sampleTicket({
+          id: 'b1',
+          identifier: 'OCV5-1',
+          type: 'bug',
+          title: '积压问题',
+          status: 'backlog',
+        }),
+        sampleTicket({
+          id: 'f1',
+          identifier: 'OCV5-2',
+          type: 'feature',
+          title: '积压需求',
+          status: 'backlog',
+        }),
+      ],
+      ticketType: 'bug',
+    })
+    renderBoard({ view: 'backlog' })
+    expect(await screen.findByText('积压问题')).toBeInTheDocument()
+    expect(screen.getByText('积压需求')).toBeInTheDocument()
+    const filter = screen.getByLabelText('积压类型')
+    expect(filter).toHaveValue('')
+    expect(filter).toHaveTextContent('问题单')
+    expect(filter).toHaveTextContent('需求单')
+    expect(filter).toHaveTextContent('调研单')
+    expect(filter).toHaveTextContent('杂务单')
+
+    await act(async () => {
+      fireEvent.change(filter, { target: { value: 'feature' } })
+    })
+    expect(screen.getByText('积压需求')).toBeInTheDocument()
+    expect(screen.queryByText('积压问题')).not.toBeInTheDocument()
+
+    await act(async () => {
+      fireEvent.change(filter, { target: { value: 'spike' } })
+    })
+    expect(screen.getByText('没有这类积压单')).toBeInTheDocument()
+    expect(screen.queryByText('积压需求')).not.toBeInTheDocument()
   })
 })

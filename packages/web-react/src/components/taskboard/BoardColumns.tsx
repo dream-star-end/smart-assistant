@@ -1,5 +1,5 @@
 import { Archive, Columns3 } from 'lucide-react'
-import { type DragEvent, type ReactNode, useState } from 'react'
+import { type DragEvent, type ReactNode, useEffect, useRef, useState } from 'react'
 import type { BoardColumn, Ticket } from '../../lib/taskboard'
 import { cn } from '../../lib/utils'
 import { EmptyState } from '../ui'
@@ -62,6 +62,10 @@ export function BoardColumns({
     }
   }
 
+  const leaveColumn = (dropId: string) => {
+    setHoverDropId((cur) => (cur === dropId ? null : cur))
+  }
+
   const dropOnColumn = (dropId: string, e: DragEvent) => {
     e.preventDefault()
     const ticket = dragging
@@ -75,6 +79,7 @@ export function BoardColumns({
     <TicketCard
       key={ticket.id}
       ticket={ticket}
+      compact
       onOpen={onOpenTicket}
       actions={renderActions?.(ticket)}
       draggable={!!onMove && (ticket.allowedMoves?.length ?? 0) > 0}
@@ -108,11 +113,9 @@ export function BoardColumns({
         hoverDropId={hoverDropId}
         onDragOver={overColumn}
         onDrop={dropOnColumn}
-        onDragLeave={() => {
-          if (hoverDropId === BACKLOG_DROP_ID) setHoverDropId(null)
-        }}
+        onDragLeave={leaveColumn}
       >
-        {backlogTickets.length === 0 ? (
+        {backlogTickets.length === 0 && hoverDropId !== BACKLOG_DROP_ID ? (
           <p className="px-1 py-6 text-center text-meta text-faint">
             还没有积压单。遗留问题可以先记在这里。
           </p>
@@ -135,11 +138,9 @@ export function BoardColumns({
             hoverDropId={hoverDropId}
             onDragOver={overColumn}
             onDrop={dropOnColumn}
-            onDragLeave={() => {
-              if (hoverDropId === dropId) setHoverDropId(null)
-            }}
+            onDragLeave={leaveColumn}
           >
-            {col.tickets.length === 0 ? (
+            {col.tickets.length === 0 && hoverDropId !== dropId ? (
               <p className="px-1 py-6 text-center text-meta text-faint">这一列还没有单据</p>
             ) : (
               col.tickets.map(renderCard)
@@ -148,6 +149,17 @@ export function BoardColumns({
         )
       })}
     </div>
+  )
+}
+
+function DropPlaceholder() {
+  return (
+    <div
+      data-testid="drop-placeholder"
+      data-drop-placeholder="true"
+      aria-hidden
+      className="pointer-events-none h-9 shrink-0 rounded-lg border-2 border-dashed border-accent bg-accent-soft"
+    />
   )
 }
 
@@ -175,14 +187,42 @@ function BoardColumnFrame({
   hoverDropId: string | null
   onDragOver: (dropId: string, e: DragEvent) => void
   onDrop: (dropId: string, e: DragEvent) => void
-  onDragLeave: () => void
+  onDragLeave: (dropId: string) => void
   children: ReactNode
 }) {
+  const dragDepth = useRef(0)
   const dragging = allowed !== null
   const canDrop = allowed?.has(dropId) ?? false
   const forbidden = dragging && !canDrop
   const hover = dragging && canDrop && hoverDropId === dropId
   const backlog = variant === 'backlog'
+
+  useEffect(() => {
+    if (!dragging) dragDepth.current = 0
+  }, [dragging])
+
+  const handleDragEnter = (e: DragEvent<HTMLElement>) => {
+    dragDepth.current += 1
+    onDragOver(dropId, e)
+  }
+
+  const handleDragLeave = (e: DragEvent<HTMLElement>) => {
+    dragDepth.current -= 1
+    if (dragDepth.current > 0) return
+    dragDepth.current = 0
+    const related = e.relatedTarget
+    if (related instanceof Node && e.currentTarget.contains(related)) {
+      dragDepth.current = 1
+      return
+    }
+    onDragLeave(dropId)
+  }
+
+  const handleDrop = (e: DragEvent<HTMLElement>) => {
+    dragDepth.current = 0
+    onDrop(dropId, e)
+  }
+
   return (
     <section
       data-testid={backlog ? 'taskboard-backlog-column' : 'taskboard-column'}
@@ -192,9 +232,10 @@ function BoardColumnFrame({
       data-drop-disabled={forbidden ? 'true' : undefined}
       data-drop-hover={hover ? 'true' : undefined}
       aria-disabled={forbidden || undefined}
+      onDragEnter={handleDragEnter}
       onDragOver={(e) => onDragOver(dropId, e)}
-      onDrop={(e) => onDrop(dropId, e)}
-      onDragLeave={onDragLeave}
+      onDrop={handleDrop}
+      onDragLeave={handleDragLeave}
       className={cn(
         'flex w-72 shrink-0 flex-col rounded-xl',
         backlog ? 'border border-dashed border-border bg-hover' : 'border border-transparent bg-bg',
@@ -223,6 +264,7 @@ function BoardColumnFrame({
         <span className="shrink-0 pt-0.5 text-caption text-faint">{count}</span>
       </header>
       <div className="flex min-h-[12rem] min-w-0 flex-1 flex-col gap-2 overflow-y-auto pr-0.5">
+        {hover && <DropPlaceholder />}
         {children}
       </div>
     </section>

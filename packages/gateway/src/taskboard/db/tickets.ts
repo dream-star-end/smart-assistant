@@ -321,26 +321,39 @@ export function listTickets(
   return { items: rows.map(mapTicket), total }
 }
 
+function emptyTypeCounts(): Record<TicketType, number> {
+  return { bug: 0, feature: 0, spike: 0, chore: 0 }
+}
+
 /**
- * 项目内非终态票据按 type 计数。看板未指定 ticketType 时选「积压最多的类型」。
+ * 看板未指定 ticketType 时的选线计票。
+ * inPipeline = 非终态且非 backlog（真正在流水线里跑着的票）。
+ * backlog 不参与首选（积压跨线展示、不应决定默认选哪条线）；仅当所有 type 的 inPipeline 都为 0 时作退路。
  */
-export function countNonTerminalTicketsByType(
+export function countTicketsByTypeForBoardDefault(
   db: TaskboardDb,
   projectId: string,
-): Record<TicketType, number> {
-  const counts: Record<TicketType, number> = { bug: 0, feature: 0, spike: 0, chore: 0 }
+): { inPipeline: Record<TicketType, number>; backlog: Record<TicketType, number> } {
+  const inPipeline = emptyTypeCounts()
+  const backlog = emptyTypeCounts()
   const rows = db
     .prepare(
-      `SELECT type, COUNT(*) AS n FROM tb_ticket
+      `SELECT type,
+              SUM(CASE WHEN status != 'backlog' THEN 1 ELSE 0 END) AS in_pipeline,
+              SUM(CASE WHEN status = 'backlog' THEN 1 ELSE 0 END) AS backlog
+         FROM tb_ticket
         WHERE project_id = ?
           AND status NOT IN ('done', 'canceled')
         GROUP BY type`,
     )
-    .all(projectId) as { type: TicketType; n: number }[]
+    .all(projectId) as { type: TicketType; in_pipeline: number; backlog: number }[]
   for (const row of rows) {
-    if (row.type in counts) counts[row.type] = row.n
+    if (row.type in inPipeline) {
+      inPipeline[row.type] = Number(row.in_pipeline) || 0
+      backlog[row.type] = Number(row.backlog) || 0
+    }
   }
-  return counts
+  return { inPipeline, backlog }
 }
 
 /**

@@ -74,7 +74,7 @@ import {
   listTemplates,
 } from './db/templates.js'
 import {
-  countNonTerminalTicketsByType,
+  countTicketsByTypeForBoardDefault,
   createTicket,
   getTicketByIdOrIdentifier,
   listTickets,
@@ -907,23 +907,32 @@ function handleProjectBoard(res: ServerResponse, url: URL, db: TaskboardDb, idOr
   })
 }
 
-/** 未指定 type 时选非终态票最多的 type;全空则退回项目第一条流水线的 type。 */
+/**
+ * 未指定 type 时的选线优先级:
+ * 1. 流水线内非终态且非 backlog 票最多的 type（真正在跑的票）
+ * 2. 若该项全为 0 → backlog 票最多的 type
+ * 3. 仍并列或全为 0 → listPipelines 第一条带 type 的流水线
+ * 并列时保留流水线遍历顺序（与旧实现一样用 n > bestN，先出现的赢）。
+ */
 function pickDefaultTicketType(db: TaskboardDb, projectId: string): TicketType {
-  const counts = countNonTerminalTicketsByType(db, projectId)
+  const { inPipeline, backlog } = countTicketsByTypeForBoardDefault(db, projectId)
   const pipes = listPipelines(db, projectId)
-  let best: TicketType | null = null
-  let bestN = 0
-  for (const pipe of pipes) {
-    if (!pipe.ticketType) continue
-    const n = counts[pipe.ticketType] ?? 0
-    if (n > bestN) {
-      best = pipe.ticketType
-      bestN = n
+  const pickMax = (counts: Record<TicketType, number>): TicketType | null => {
+    let best: TicketType | null = null
+    let bestN = 0
+    for (const pipe of pipes) {
+      if (!pipe.ticketType) continue
+      const n = counts[pipe.ticketType] ?? 0
+      if (n > bestN) {
+        best = pipe.ticketType
+        bestN = n
+      }
     }
+    return bestN > 0 ? best : null
   }
-  if (best && bestN > 0) return best
-  const first = pipes.find((p) => p.ticketType)
-  return first?.ticketType ?? 'bug'
+  return (
+    pickMax(inPipeline) ?? pickMax(backlog) ?? pipes.find((p) => p.ticketType)?.ticketType ?? 'bug'
+  )
 }
 
 function toMoveStageRef(stage: PipelineStage): MoveStageRef {
