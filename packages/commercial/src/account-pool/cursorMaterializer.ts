@@ -1,0 +1,278 @@
+/**
+ * Materialize Cursor account-pool rows onto the root-only host auth directory
+ * that oc-cursor already consumes (`api-key`, `api-key.<N>`).
+ *
+ * The database is the source of truth (same store as CCB / Codex). The file
+ * pool stays the injection path so CURSOR_API_KEY never enters Docker Env.
+ * Values are never logged — only sha256[:16] fingerprints.
+ */
+import { createHash } from "node:crypto";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { join } from "node:path";
+
+import { rootLogger } from "../logging/logger.js";
+import { getRuntimeChannel } from "../runtimeChannel.js";
+import {
+  createAccount,
+  getCursorTokenSnapshot,
+  listAccounts,
+  type AccountRow,
+} from "./store.js";
+
+const log = rootLogger.child({ subsys: "cursor-auth-sync" });
+
+export const CURSOR_API_KEY_RE = /^crsr_[A-Za-z0-9]{20,128}$/;
+
+export function normalizeCursorApiKey(raw: string): string {
+  const key = raw.trim();
+  if (!CURSOR_API_KEY_RE.test(key)) {
+    throw new RangeError("invalid_cursor_api_key");
+  }
+  return key;
+}
+
+export function fingerprintCursorKey(key: string): string {
+  return createHash("sha256").update(`${key}\n`, "utf8").digest("hex").slice(0, 16);
+}
+
+export function cursorAuthDirFromEnv(env: NodeJS.ProcessEnv = process.env): string | null {
+  const dir = env.OC_V5_CURSOR_AUTH_DIR?.trim() ?? "";
+  if (!dir || !dir.startsWith("/")) return null;
+  return dir.replace(/(?<!^)\/+$/, "");
+}
+
+export function slotFileName(index: number): string {
+  if (!Number.isInteger(index) || index < 0) {
+    throw new RangeError("invalid_cursor_slot_index");
+  }
+  return index === 0 ? "api-key" : `api-key.${index + 1}`;
+}
+
+/** Written once the account pool owns this auth dir. Distinguishes first-time
+ *  import from "admin deleted the last cursor row" (empty pool + leftover files). */
+export const CURSOR_POOL_OWNED_MARKER = ".account-pool-owned";
+
+export function isCanonicalCursorKeyFile(name: string): boolean {
+  if (name === "api-key") return true;
+  const matched = /^api-key\.([1-9][0-9]*)$/.exec(name);
+  return matched !== null && Number(matched[1]) >= 2;
+}
+
+export interface CursorAuthSyncResult {
+  imported: number;
+  written: number;
+  skipped: "no-auth-dir" | "empty-pool-keep-files" | null;
+  fingerprints: string[];
+}
+
+export interface CursorAuthSyncDeps {
+  listAccounts: typeof listAccounts;
+  getCursorTokenSnapshot: typeof getCursorTokenSnapshot;
+  createAccount: typeof createAccount;
+  authDir: string | null;
+  now?: () => Date;
+  runtimeChannel?: "v3" | "v5";
+}
+
+function eligibleCursorRows(rows: AccountRow[], now: Date): AccountRow[] {
+  return rows
+    .filter((row) => row.provider === "cursor")
+    .filter((row) => row.status === "active")
+    .filter((row) => row.cooldown_until == null || row.cooldown_until.getTime() <= now.getTime())
+    .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+}
+
+function readHostKeyFiles(authDir: string): Array<{ name: string; key: string }> {
+  if (!existsSync(authDir)) return [];
+  const names = readdirSync(authDir).filter(isCanonicalCursorKeyFile).sort((a, b) => {
+    if (a === "api-key") return -1;
+    if (b === "api-key") return 1;
+    return a.localeCompare(b, "en", { numeric: true });
+  });
+  const out: Array<{ name: string; key: string }> = [];
+  for (const name of names) {
+    const path = join(authDir, name);
+    try {
+      const st = statSync(path);
+      if (!st.isFile()) continue;
+      const raw = readFileSync(path, "utf8").replace(/\r?\n$/, "");
+      out.push({ name, key: normalizeCursorApiKey(raw) });
+    } catch {
+      // Skip unreadable / malformed leftovers; never log the value.
+    }
+  }
+  return out;
+}
+
+function hasPoolOwnershipMarker(authDir: string): boolean {
+  return existsSync(join(authDir, CURSOR_POOL_OWNED_MARKER));
+}
+
+function writePoolOwnershipMarker(authDir: string): void {
+  writeFileSync(join(authDir, CURSOR_POOL_OWNED_MARKER), "1\n", { mode: 0o600 });
+  try {
+    chmodSync(join(authDir, CURSOR_POOL_OWNED_MARKER), 0o600);
+  } catch {
+    // Best-effort; the file is non-secret and ignored by oc-cursor.
+  }
+}
+
+async function importHostKeysIfEmpty(deps: Required<Pick<CursorAuthSyncDeps, "listAccounts" | "createAccount" | "authDir" | "runtimeChannel">>): Promise<number> {
+  const existing = await deps.listAccounts({ provider: "cursor" });
+  if (existing.length > 0 || !deps.authDir) return 0;
+  if (hasPoolOwnershipMarker(deps.authDir)) return 0;
+  const files = readHostKeyFiles(deps.authDir);
+  let imported = 0;
+  for (const file of files) {
+    const fp = fingerprintCursorKey(file.key);
+    await deps.createAccount({
+      provider: "cursor",
+      label: `Cursor ${file.name} (${fp})`,
+      plan: "max",
+      token: file.key,
+      runtime_channel: deps.runtimeChannel,
+      egress_proxy_id: null,
+    });
+    imported += 1;
+    log.info("imported host Cursor key into account pool", { slot: file.name, fingerprint: fp });
+  }
+  return imported;
+}
+
+function writeAtomicSlots(authDir: string, keys: string[]): string[] {
+  mkdirSync(authDir, { recursive: true, mode: 0o700 });
+  const staging = join(authDir, ".materializing");
+  rmSync(staging, { recursive: true, force: true });
+  mkdirSync(staging, { mode: 0o700 });
+  const fingerprints: string[] = [];
+  try {
+    for (let i = 0; i < keys.length; i += 1) {
+      const name = slotFileName(i);
+      const dest = join(staging, name);
+      writeFileSync(dest, `${keys[i]}\n`, { mode: 0o600, encoding: "utf8" });
+      chmodSync(dest, 0o600);
+      fingerprints.push(fingerprintCursorKey(keys[i]));
+    }
+    for (let i = 0; i < keys.length; i += 1) {
+      const name = slotFileName(i);
+      renameSync(join(staging, name), join(authDir, name));
+    }
+    for (const name of readdirSync(authDir)) {
+      if (!isCanonicalCursorKeyFile(name)) continue;
+      const expected = new Set(keys.map((_, i) => slotFileName(i)));
+      if (!expected.has(name)) unlinkSync(join(authDir, name));
+    }
+  } finally {
+    rmSync(staging, { recursive: true, force: true });
+  }
+  return fingerprints;
+}
+
+export async function syncCursorAuthDir(deps?: Partial<CursorAuthSyncDeps>): Promise<CursorAuthSyncResult> {
+  const resolved: CursorAuthSyncDeps = {
+    listAccounts,
+    getCursorTokenSnapshot,
+    createAccount,
+    authDir: cursorAuthDirFromEnv(),
+    now: () => new Date(),
+    runtimeChannel: getRuntimeChannel(),
+    ...deps,
+  };
+  if (!resolved.authDir) {
+    return { imported: 0, written: 0, skipped: "no-auth-dir", fingerprints: [] };
+  }
+
+  const before = await resolved.listAccounts({ provider: "cursor" });
+  const imported = await importHostKeysIfEmpty({
+    listAccounts: resolved.listAccounts,
+    createAccount: resolved.createAccount,
+    authDir: resolved.authDir,
+    runtimeChannel: resolved.runtimeChannel ?? getRuntimeChannel(),
+  });
+  if (imported > 0 || before.length > 0) {
+    writePoolOwnershipMarker(resolved.authDir);
+  }
+
+  const rows = eligibleCursorRows(await resolved.listAccounts({ provider: "cursor" }), (resolved.now ?? (() => new Date()))());
+  if (rows.length === 0) {
+    log.warn("cursor account pool has no active keys; leaving host files unchanged");
+    return { imported, written: 0, skipped: "empty-pool-keep-files", fingerprints: [] };
+  }
+
+  const keys: string[] = [];
+  const fingerprints: string[] = [];
+  try {
+    for (const row of rows) {
+      const snap = await resolved.getCursorTokenSnapshot(row.id);
+      if (!snap?.token) continue;
+      const key = normalizeCursorApiKey(snap.token.toString("utf8"));
+      keys.push(key);
+      fingerprints.push(fingerprintCursorKey(key));
+      snap.token.fill(0);
+    }
+    if (keys.length === 0) {
+      log.warn("cursor account pool rows had no decryptable keys; leaving host files unchanged");
+      return { imported, written: 0, skipped: "empty-pool-keep-files", fingerprints: [] };
+    }
+    const writtenFp = writeAtomicSlots(resolved.authDir, keys);
+    log.info("materialized cursor account pool onto host auth dir", {
+      written: keys.length,
+      imported,
+      fingerprints: writtenFp,
+    });
+    return { imported, written: keys.length, skipped: null, fingerprints: writtenFp };
+  } finally {
+    keys.length = 0;
+  }
+}
+
+let syncTimer: NodeJS.Timeout | null = null;
+let syncInFlight: Promise<void> | null = null;
+
+export function scheduleCursorAuthSync(reason: string): void {
+  if (!cursorAuthDirFromEnv()) return;
+  if (syncTimer) clearTimeout(syncTimer);
+  syncTimer = setTimeout(() => {
+    syncTimer = null;
+    if (syncInFlight) return;
+    syncInFlight = syncCursorAuthDir()
+      .then(() => undefined)
+      .catch((err) => {
+        log.warn("cursor auth sync failed", {
+          reason,
+          errorClass: err instanceof Error ? err.name : typeof err,
+          message: err instanceof Error ? err.message : String(err),
+        });
+      })
+      .finally(() => {
+        syncInFlight = null;
+      });
+  }, 250);
+}
+
+export function startCursorAuthSyncActor(opts: { intervalMs?: number } = {}): { stop: () => void } {
+  const intervalMs = opts.intervalMs && opts.intervalMs >= 1000 ? opts.intervalMs : 60_000;
+  scheduleCursorAuthSync("boot");
+  const timer = setInterval(() => scheduleCursorAuthSync("tick"), intervalMs);
+  timer.unref?.();
+  return {
+    stop: () => {
+      clearInterval(timer);
+      if (syncTimer) {
+        clearTimeout(syncTimer);
+        syncTimer = null;
+      }
+    },
+  };
+}

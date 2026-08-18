@@ -159,10 +159,10 @@ export async function handleAdminListAccounts(
   let providerFilter: AccountRow["provider"] | undefined;
   if (providerRaw === null || providerRaw === "" || providerRaw === "all") {
     providerFilter = undefined;
-  } else if (providerRaw === "claude" || providerRaw === "codex" || providerRaw === "grok") {
+  } else if (providerRaw === "claude" || providerRaw === "codex" || providerRaw === "grok" || providerRaw === "cursor") {
     providerFilter = providerRaw;
   } else {
-    throw new HttpError(400, "VALIDATION", "provider must be claude/codex/grok/all");
+    throw new HttpError(400, "VALIDATION", "provider must be claude/codex/grok/cursor/all");
   }
   const limit = parsePositiveInt(sp.get("limit"), "limit", 500);
   const offset = parseNonNegativeInt(sp.get("offset"), "offset");
@@ -339,19 +339,19 @@ export async function handleAdminCreateAccount(
   // 强制要求 oauth_refresh_token(refresh actor 60s tick 依赖)。
   let provider: AdminCreateAccountInput["provider"];
   if (b.provider !== undefined) {
-    if (b.provider === "claude" || b.provider === "codex" || b.provider === "grok") provider = b.provider;
-    else throw new HttpError(400, "VALIDATION", "provider must be 'claude', 'codex', or 'grok'");
+    if (b.provider === "claude" || b.provider === "codex" || b.provider === "grok" || b.provider === "cursor") provider = b.provider;
+    else throw new HttpError(400, "VALIDATION", "provider must be 'claude', 'codex', 'grok', or 'cursor'");
   }
   // 0055: 拒绝 legacy raw egress_proxy 字段。所有出口必须通过 egress_proxies 池
-  // (egress_proxy_id),raw text 列已 CHECK NULL 锁死。
+  // (egress_proxy_id),raw text 列已 CHECK NULL 锁死。cursor 不走 egress。
   if (b.egress_proxy !== undefined) {
     throw new HttpError(400, "VALIDATION", "legacy_egress_proxy_not_allowed");
   }
-  // egress_proxy_id 创建时必填,具体存在性由 admin 层兜底校验
-  if (b.egress_proxy_id === undefined || b.egress_proxy_id === null || b.egress_proxy_id === "") {
+  const isCursor = provider === "cursor";
+  if (!isCursor && (b.egress_proxy_id === undefined || b.egress_proxy_id === null || b.egress_proxy_id === "")) {
     throw new HttpError(400, "VALIDATION", "egress_proxy_id is required");
   }
-  if (typeof b.egress_proxy_id !== "string" && typeof b.egress_proxy_id !== "number") {
+  if (!isCursor && typeof b.egress_proxy_id !== "string" && typeof b.egress_proxy_id !== "number") {
     throw new HttpError(400, "VALIDATION", "egress_proxy_id must be string or number");
   }
 
@@ -359,7 +359,7 @@ export async function handleAdminCreateAccount(
     label: b.label,
     plan: b.plan as AdminCreateAccountInput["plan"],
     oauth_token: b.oauth_token,
-    egress_proxy_id: String(b.egress_proxy_id),
+    ...(isCursor ? {} : { egress_proxy_id: String(b.egress_proxy_id) }),
     ...(provider !== undefined ? { provider } : {}),
   };
   if (b.group_id !== undefined) {

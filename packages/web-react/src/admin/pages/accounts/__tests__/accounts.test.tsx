@@ -82,6 +82,9 @@ describe("AccountsPage", () => {
   test("渲染 KPI + 账号行,列表带 status 参数拉取", async () => {
     renderPage(<AccountsPage />);
     expect(await screen.findByText("acct-tokyo")).toBeTruthy();
+    expect(screen.getByText("CCB")).toBeTruthy();
+    expect(screen.getByText("Cursor")).toBeTruthy();
+    expect(screen.getByText("Codex")).toBeTruthy();
     // KPI:可用 / 冷却
     expect(screen.getByText("8 / 1")).toBeTruthy();
     // 总账号
@@ -119,5 +122,31 @@ describe("AccountsPage", () => {
       expect(adminGet.mock.calls.some((c) => c[0] === "/egress-proxies")).toBe(true);
       expect(adminGet.mock.calls.some((c) => c[0] === "/account-groups")).toBe(true);
     });
+  });
+
+  test("按 Cursor / CCB / Codex 分组展示", async () => {
+    adminGet.mockImplementation((path: string) => {
+      if (path === "/accounts") {
+        return Promise.resolve({
+          rows: [
+            { ...ROW, id: "1", provider: "cursor", label: "cursor-slot-1" },
+            { ...ROW, id: "7", provider: "claude", label: "acct-tokyo" },
+            { ...ROW, id: "9", provider: "codex", label: "codex-main" },
+          ],
+        });
+      }
+      if (path === "/accounts/stats") return Promise.resolve(STATS);
+      if (path === "/stats/account-pool") {
+        return Promise.resolve({ total: 0, active: 0, cooldown: 0, disabled: 0, banned: 0, avg_health: 0, today_success_rate: 1 });
+      }
+      return Promise.resolve({ rows: [] });
+    });
+    renderPage(<AccountsPage />);
+    expect(await screen.findByText("cursor-slot-1")).toBeTruthy();
+    expect(screen.getByText("acct-tokyo")).toBeTruthy();
+    expect(screen.getByText("codex-main")).toBeTruthy();
+    expect(screen.getByText("Cursor 订阅 API Key 池 · 1 条")).toBeTruthy();
+    expect(screen.getByText("Claude Code 官方账号池 · 1 条")).toBeTruthy();
+    expect(screen.getByText("Codex 官方账号池 · 1 条")).toBeTruthy();
   });
 });

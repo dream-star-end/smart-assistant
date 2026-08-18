@@ -130,6 +130,7 @@ import {
   startCooldownRecoveryActor,
   type CooldownRecoveryActorHandle,
 } from "./account-pool/cooldownRecoveryActor.js";
+import { startCursorAuthSyncActor } from "./account-pool/cursorMaterializer.js";
 import {
   DEFAULT_V3_CODEX_CONTAINER_DIR,
   V3_CONTAINER_PORT,
@@ -5291,6 +5292,21 @@ export async function registerCommercial(
         const raw = Number(process.env.COMMERCIAL_COOLDOWN_RECOVERY_INTERVAL_MS);
         const intervalMs = Number.isFinite(raw) && raw >= 1000 ? raw : 5 * 60_000;
         const h = trackScheduler("cooldownRecovery", "shared", startCooldownRecoveryActor({ tracker: healthTracker, intervalMs }));
+        return { stop: () => h.stop() };
+      },
+    });
+  }
+
+  // Cursor account-pool → host auth-dir materializer. No-ops when
+  // OC_V5_CURSOR_AUTH_DIR is unset (commercial hosts without a local key dir).
+  if (process.env.COMMERCIAL_CURSOR_AUTH_SYNC_DISABLED !== "1") {
+    leaderBundle.add({
+      name: "cursorAuthSync",
+      domain: "v5-owned",
+      start: () => {
+        const raw = Number(process.env.COMMERCIAL_CURSOR_AUTH_SYNC_INTERVAL_MS);
+        const intervalMs = Number.isFinite(raw) && raw >= 1000 ? raw : 60_000;
+        const h = trackScheduler("cursorAuthSync", "v5-owned", startCursorAuthSyncActor({ intervalMs }));
         return { stop: () => h.stop() };
       },
     });
