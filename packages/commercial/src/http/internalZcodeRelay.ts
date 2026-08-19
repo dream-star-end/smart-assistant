@@ -19,6 +19,7 @@ import {
 
 export { ZCODE_RELAY_PREFIX };
 export const ZCODE_OFFICIAL_UPSTREAM = "https://api.z.ai/api/anthropic/v1/messages";
+export const ZCODE_ANTHROPIC_VERSION = "2023-06-01";
 const TOKEN_RE = /^[0-9a-f]{64}$/;
 const HOP = new Set([
   "connection",
@@ -76,6 +77,12 @@ function forceUpstreamModel(raw: Buffer): Buffer {
   return Buffer.from(JSON.stringify(body), "utf8");
 }
 
+function headerValue(value: string | string[] | undefined): string | undefined {
+  if (typeof value === "string" && value.trim()) return value.trim();
+  if (Array.isArray(value) && typeof value[0] === "string" && value[0].trim()) return value[0].trim();
+  return undefined;
+}
+
 export function makeZcodeRelayHandler(deps: {
   identityRepo: ContainerIdentityRepo;
   codingPlanKey: string;
@@ -107,7 +114,7 @@ export function makeZcodeRelayHandler(deps: {
       error(res, 405, "METHOD_NOT_ALLOWED", requestId);
       return;
     }
-    const route = resolveZcodeRelayRoute({
+    const route = await resolveZcodeRelayRoute({
       token: match[1]!,
       containerId: identity.containerId,
       userId: BigInt(identity.userId),
@@ -125,10 +132,13 @@ export function makeZcodeRelayHandler(deps: {
     try {
       const rawBody = await readLimited(req, 2 * 1024 * 1024);
       const body = forceUpstreamModel(rawBody);
+      const anthropicVersion = headerValue(req.headers["anthropic-version"]) ?? ZCODE_ANTHROPIC_VERSION;
       const upstream = await (deps.requestFn ?? request)(ZCODE_OFFICIAL_UPSTREAM, {
         method: "POST",
         headers: {
+          "x-api-key": key,
           authorization: `Bearer ${key}`,
+          "anthropic-version": anthropicVersion,
           "content-type": "application/json",
           accept: typeof req.headers.accept === "string" ? req.headers.accept : "application/json",
         },

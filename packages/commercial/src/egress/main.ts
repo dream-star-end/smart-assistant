@@ -55,6 +55,7 @@ import { CODEX_TOKEN_REFRESH_PATH } from "../http/internalCodexTokenRefresh.js";
 import { CODEX_RELAY_PREFIX } from "../http/internalCodexRelay.js";
 import { GROK_RELAY_PREFIX, makeGrokRelayHandler } from "../http/internalGrokRelay.js";
 import { ZCODE_RELAY_PREFIX, makeZcodeRelayHandler } from "../http/internalZcodeRelay.js";
+import { configureZcodeRelayKv, createIoredisZcodeRelayKv } from "../billing/zcodeRouteContext.js";
 import {
   buildCodexRelayHandler,
   buildCodexTokenRefreshHandler,
@@ -127,6 +128,7 @@ export async function startEgress(): Promise<void> {
     maxRetriesPerRequest: 3,
     enableReadyCheck: true,
   });
+  configureZcodeRelayKv(createIoredisZcodeRelayKv(redis));
   const pricing = new PricingCache();
   try {
     await pricing.load();

@@ -1111,9 +1111,9 @@ export interface UserChatBridgeDeps {
     userId: bigint;
     requestId: string;
     modelId: string;
-  }) => { token: string; baseUrl: string };
+  }) => Promise<{ token: string; baseUrl: string }>;
   /** Drop a minted ZCode relay token after the turn settles or aborts. */
-  expireZcodeRoute?: (token: string) => void;
+  expireZcodeRoute?: (token: string) => void | Promise<void>;
   /**
    * Trusted UUID of the compute host running this bridge. Cursor credentials
    * are mounted only by that host's local supervisor, so Cursor dispatch must
@@ -4980,7 +4980,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             }
             let minted: { token: string; baseUrl: string };
             try {
-              minted = deps.mintZcodeRoute({
+              minted = await deps.mintZcodeRoute({
                 containerId: cid,
                 userId: uid,
                 requestId,

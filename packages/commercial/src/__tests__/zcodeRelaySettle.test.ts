@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import {
   _resetZcodeRelayRoutesForTests,
+  configureZcodeRelayKv,
   expireZcodeRelayRoute,
   mintZcodeRelayRoute,
   resolveZcodeRelayRoute,
@@ -11,9 +12,9 @@ import { evaluateGlm53ZaiSwitch } from "../admin/zcodeCanonicalSwitch.js";
 import { CatalogConflictError } from "../admin/modelCatalogOps.js";
 
 describe("zcode relay routes", () => {
-  test("binds token to container/user/request/model and rejects mismatches", () => {
+  test("binds token to container/user/request/model and rejects mismatches", async () => {
     _resetZcodeRelayRoutesForTests();
-    const minted = mintZcodeRelayRoute({
+    const minted = await mintZcodeRelayRoute({
       containerId: 9,
       userId: 3,
       requestId: "a".repeat(32),
@@ -27,16 +28,16 @@ describe("zcode relay routes", () => {
       `http://127.0.0.1:18791/internal/v5/zcode-relay/route/${minted.token}`,
     );
     assert.equal(
-      resolveZcodeRelayRoute({
+      (await resolveZcodeRelayRoute({
         token: minted.token,
         containerId: 9,
         userId: 3,
         nowMs: 1_000,
-      })?.requestId,
+      }))?.requestId,
       "a".repeat(32),
     );
     assert.equal(
-      resolveZcodeRelayRoute({
+      await resolveZcodeRelayRoute({
         token: minted.token,
         containerId: 8,
         userId: 3,
@@ -44,9 +45,9 @@ describe("zcode relay routes", () => {
       }),
       null,
     );
-    expireZcodeRelayRoute(minted.token);
+    await expireZcodeRelayRoute(minted.token);
     assert.equal(
-      resolveZcodeRelayRoute({
+      await resolveZcodeRelayRoute({
         token: minted.token,
         containerId: 9,
         userId: 3,
@@ -56,9 +57,9 @@ describe("zcode relay routes", () => {
     );
   });
 
-  test("refuses user-supplied upstream ids", () => {
+  test("refuses user-supplied upstream ids", async () => {
     _resetZcodeRelayRoutesForTests();
-    assert.throws(
+    await assert.rejects(
       () =>
         mintZcodeRelayRoute({
           containerId: 1,
@@ -69,6 +70,41 @@ describe("zcode relay routes", () => {
         }),
       /not allowlisted/,
     );
+  });
+
+  test("shared KV remains visible after a process-local map reset", async () => {
+    _resetZcodeRelayRoutesForTests();
+    const data = new Map<string, string>();
+    configureZcodeRelayKv({
+      get: async (key) => data.get(key) ?? null,
+      set: async (key, value) => {
+        data.set(key, value);
+      },
+      del: async (key) => {
+        data.delete(key);
+      },
+    });
+    const minted = await mintZcodeRelayRoute({
+      containerId: 9,
+      userId: 3,
+      requestId: "c".repeat(32),
+      modelId: "zcode-experimental",
+      relayPort: 18789,
+      nowMs: 1_000,
+    });
+    assert.equal(data.size, 1);
+    for (const key of data.keys()) {
+      assert.match(key, /^oc:v5:zcode-relay:[0-9a-f]{64}$/);
+      assert.doesNotMatch(key, new RegExp(minted.token));
+    }
+    const isolated = await resolveZcodeRelayRoute({
+      token: minted.token,
+      containerId: 9,
+      userId: 3,
+      nowMs: 1_000,
+    });
+    assert.equal(isolated?.requestId, "c".repeat(32));
+    assert.equal(isolated?.modelId, "zcode-experimental");
   });
 });
 

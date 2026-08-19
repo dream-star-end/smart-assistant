@@ -268,7 +268,12 @@ import {
   makeZcodeRelayHandler,
   type ZcodeRelayHandler,
 } from "./http/internalZcodeRelay.js";
-import { mintZcodeRelayRoute, expireZcodeRelayRoute } from "./billing/zcodeRouteContext.js";
+import {
+  mintZcodeRelayRoute,
+  expireZcodeRelayRoute,
+  configureZcodeRelayKv,
+  createIoredisZcodeRelayKv,
+} from "./billing/zcodeRouteContext.js";
 import {
   SKILL_EMBED_PREFIX,
   makeSkillEmbedHandler,
@@ -1371,6 +1376,7 @@ export async function registerCommercial(
     maxRetriesPerRequest: 3,
     enableReadyCheck: true,
   });
+  configureZcodeRelayKv(createIoredisZcodeRelayKv(redis));
 
   // 预热 dummy hash:第一次登录无影响
   await warmupLoginDummyHash();
@@ -5159,7 +5165,9 @@ export async function registerCommercial(
         modelId,
         relayPort: V3_CONTAINER_PORT,
       }),
-    expireZcodeRoute: (token) => expireZcodeRelayRoute(token),
+    expireZcodeRoute: async (token) => {
+      await expireZcodeRelayRoute(token);
+    },
     releaseGrokRouteLease: async (accountId, slotId) => {
       // Expire durable authority before freeing the local mirror. If PG is
       // unavailable the slot remains occupied and the immutable terminal frame
