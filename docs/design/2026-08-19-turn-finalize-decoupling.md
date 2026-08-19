@@ -10,6 +10,42 @@
 ---
 
 
+## rev3（完整 diff 审 8 条 blocker，2026-08-19）
+
+偏离以本节为准。
+
+### B1 HTTP 不再跑 Phase B
+`finalizeLosslessTurnTape(..., { materialize: false })` 是 HTTP 唯一入口。Phase A 成功即 200 + settlementHandoff。物化只走 worker / `materialize:true`（测试与作业）。Phase B 57014 不得再变成 finalize HTTP 503。
+
+### B2 settlement 不可变 + 校验后领取
+Phase A 持久化 `settlement_hash`。replay 哈希不一致 → conflict。settlement job 先 `held/awaiting_materialization`；Phase B 校验 engineBillings / hash 后 `settlement_verified_at` 并 release。claim SQL join 已验证 tape。handler 只用 job.payload。
+
+### B3 held 晚到 tape 禁止 HTTP 同步结算
+Phase A 传播 `settlementHeld` / `dispatchLateTape`。HTTP 在 handoff 或 held 时跳过 settleCodexBilling / applyTurnWaiver。
+
+### B4 财务 job 不静默终止
+热重试 30 次后改为 1h 冷重试（仍 queued，可 CAS `requeueFailedSettlementJob`）。`scripts/ops/repair-visible-turn.ts` 走 Phase A 权威入口。
+
+### B5 engine-context 与浏览器同一扇门
+`getEngineContextMessages` 用 `recordsPublished`；visible 但未物化时消费 stub/visible_head，不抛 missing。
+
+### B6 sweeper 代做 Phase A + tapeless 可读
+parts 齐：`commitVisibleTape` → 同一 Phase A。tapeless：聚合 live 正文写入 dispatch.visible_head **并**投影进 `client_sessions.messages`。热读空时 GET/timeline 仍可见。
+
+### B7 单事务 fence+visible+terminal
+`SELECT FOR UPDATE` 后同事务写 fence / visible_head / 会话投影 / `casToTerminal`。扫描改为所有仍 open 的 dispatch（含已有 visible_at）。
+
+### B8 共享 canonical anchor + 按 tapeId 换 stub
+`losslessBillingAnchorId` 覆盖 assistant / tool / agent-group；runtime-only Phase A 用 prefix，Phase B 按 `_turnTapeId` 原子替换 stub。
+
+### Suggestions
+- 前端 `applyServerMessages` 消费 `openDispatch` 恢复「回复中」。
+- 0229：jobs FK ON DELETE CASCADE；`settlement_hash` / `settlement_verified_at`。
+- `scripts/ops/repair-visible-turn.ts` 默认 dry-run。
+- `clipVisibleText` 一次 UTF-8 buffer 截断。
+
+---
+
 ## rev2（方案审计 6 条 blocker，2026-08-19）
 
 本文档与实现按下列修法对齐。**偏离 rev1 处以此节为准。**
