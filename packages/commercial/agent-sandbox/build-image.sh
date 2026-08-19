@@ -40,6 +40,16 @@ set -euo pipefail
 # 否则会 bun-rebuild v3 生产树的 claude-code-best/dist(现网文件改动)。默认仍 v3,行为不变。
 PERSONAL_SRC="${PERSONAL_SRC:-/opt/openclaude/openclaude}"
 SANDBOX_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"  # 本脚本所在目录(agent-sandbox/)
+# Persistent selfhost runtime profile (audited, not a one-off shell export).
+# Present in this tree → subsequent builds keep ZCode/Grok/Cursor/Codex pins.
+SELHOST_BUILD_ENV="$(cd "$SANDBOX_DIR/../.." && pwd)/deploy/v5-selfhost/runtime-build.env"
+if [ -f "$SELHOST_BUILD_ENV" ]; then
+  echo "[build-image] sourcing persistent profile $SELHOST_BUILD_ENV"
+  set -a
+  # shellcheck disable=SC1090
+  . "$SELHOST_BUILD_ENV"
+  set +a
+fi
 BUILD_CTX="/tmp/oc-runtime-build"
 IMAGE_REPO="openclaude/openclaude-runtime"
 # tar 输出目录(仅 GC drill 用 env 覆盖到假树,生产恒默认值)
@@ -66,6 +76,7 @@ TAR_PATH="${IMAGE_OUT_DIR}/openclaude-runtime-${TAG}.tar.gz"
 CODEX_VERSION="0.144.0"
 CURSOR_AGENT_VERSION="2026.08.11-e8db854"
 CURSOR_AGENT_SHA256="bfff4bf6f4e9dd30c1d0ef0a70b6077b074015dd2948e4c50685d53afdcfce5a"
+ZCODE_CLI_VERSION="${OC_ZCODE_CLI_VERSION:-0.16.3}"
 
 # The image tag is a deployment handle and may be chosen before the final source commit.
 # Bind the image to the exact staged source independently so activation can reject a stale
@@ -91,6 +102,7 @@ echo "[build-image] tag=$TAG"
 echo "[build-image] image=$IMAGE_FULL"
 echo "[build-image] source_commit=$SOURCE_COMMIT codex=$CODEX_VERSION"
 echo "[build-image] cursor_agent=$CURSOR_AGENT_VERSION"
+echo "[build-image] zcode_cli=$ZCODE_CLI_VERSION include_zcode=${OC_INCLUDE_ZCODE:-0}"
 echo "[build-image] tar=$TAR_PATH"
 
 # ───────────────────────────────────────────────
@@ -420,12 +432,16 @@ docker build \
   --label "oc.runtime.include_cursor=${OC_INCLUDE_CURSOR:-0}" \
   --label "oc.runtime.include_codex=${OC_INCLUDE_CODEX:-1}" \
   --label "oc.runtime.include_grok=${OC_INCLUDE_GROK:-0}" \
+  --label "oc.runtime.include_zcode=${OC_INCLUDE_ZCODE:-0}" \
+  --label "oc.runtime.zcode_cli_version=$ZCODE_CLI_VERSION" \
   --label "oc.runtime.embed_source=${OC_EMBED_SOURCE:-1}" \
   --build-arg "OC_INCLUDE_CODEX=${OC_INCLUDE_CODEX:-1}" \
   --build-arg "OC_CURSOR_AGENT_VERSION=$CURSOR_AGENT_VERSION" \
   --build-arg "OC_CURSOR_AGENT_SHA256=$CURSOR_AGENT_SHA256" \
   --build-arg "OC_INCLUDE_CURSOR=${OC_INCLUDE_CURSOR:-0}" \
   --build-arg "OC_INCLUDE_GROK=${OC_INCLUDE_GROK:-0}" \
+  --build-arg "OC_INCLUDE_ZCODE=${OC_INCLUDE_ZCODE:-0}" \
+  --build-arg "OC_ZCODE_CLI_VERSION=$ZCODE_CLI_VERSION" \
   --build-arg "OC_EMBED_SOURCE=${OC_EMBED_SOURCE:-1}" \
   -f "$BUILD_CTX/Dockerfile.openclaude-runtime" \
   -t "$IMAGE_FULL" \

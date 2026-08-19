@@ -65,6 +65,9 @@ PG_ROLE="oc_v5_selfhost"
 # catalog mutation 专用低权角色。必须与 PG_ROLE 不同名,否则 master 开 model authority 拒启。
 CATALOG_ADMIN_ROLE="${PG_ROLE}_catalog_admin"
 REDIS_URL="redis://127.0.0.1:6379/3"
+# Runtime image pin. Rebuild with:
+#   packages/commercial/agent-sandbox/build-image.sh v5-zcode-<12sha>-slim
+# which auto-sources deploy/v5-selfhost/runtime-build.env (OC_INCLUDE_ZCODE=1).
 RUNTIME_IMAGE="openclaude/openclaude-runtime:v5-grok-21e30788a613-slim"
 SECRETS_ENV="/etc/openclaude/secrets.env"
 PERSONAL_UNIT="openclaude.service"

@@ -57,6 +57,33 @@ describe('oc-zcode wrapper', () => {
     assert.match(text, /zai-coding-plan\/glm-5.3/)
   })
 
+  test('selfhost runtime build profile persistently includes ZCode 0.16.3', () => {
+    const profile = readFileSync(
+      path.resolve(process.cwd(), 'deploy/v5-selfhost/runtime-build.env'),
+      'utf8',
+    )
+    const build = readFileSync(
+      path.resolve(process.cwd(), 'packages/commercial/agent-sandbox/build-image.sh'),
+      'utf8',
+    )
+    const dockerfile = readFileSync(
+      path.resolve(process.cwd(), 'packages/commercial/agent-sandbox/Dockerfile.openclaude-runtime'),
+      'utf8',
+    )
+    assert.match(profile, /^OC_INCLUDE_ZCODE=1$/m)
+    assert.match(profile, /^OC_ZCODE_CLI_VERSION=0\.16\.3$/m)
+    assert.match(profile, /^OC_INCLUDE_GROK=1$/m)
+    assert.match(profile, /^OC_INCLUDE_CURSOR=1$/m)
+    assert.match(profile, /^OC_EMBED_SOURCE=0$/m)
+    assert.match(build, /deploy\/v5-selfhost\/runtime-build\.env/)
+    assert.match(build, /oc\.runtime\.include_zcode=\$\{OC_INCLUDE_ZCODE:-0\}/)
+    assert.match(build, /OC_INCLUDE_ZCODE=\$\{OC_INCLUDE_ZCODE:-0\}/)
+    assert.match(dockerfile, /ARG OC_INCLUDE_ZCODE=0/)
+    assert.match(dockerfile, /OC_ZCODE_CLI_VERSION=0\.16\.3/)
+    assert.match(dockerfile, /4eb1c759aa1dba923045c8cd8bc3ac0354e99f6be3c7fab3624372c1df940e62/)
+    assert.match(dockerfile, /--appimage-extract/)
+  })
+
   test('executes the fake CLI with locked flags and does not print the secret', async () => {
     const dir = await mkdtemp(path.join(tmpdir(), 'oc-zcode-wrapper-'))
     const fake = path.join(dir, 'fake-zcode.cjs')
