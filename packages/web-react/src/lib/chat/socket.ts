@@ -3080,8 +3080,13 @@ export class ChatSocket {
     if (typeof maxSeq === "number" && (s._maxSeq === undefined || maxSeq > s._maxSeq)) {
       s._maxSeq = maxSeq;
     }
-    s._streamingAssistant = null;
-    s._streamingThinking = null;
+    const preserveStreaming = !!s._sendingInFlight && typeof s._activeClientMessageId === "string" &&
+      !msgs.some((message) =>
+        message && (message as { _clientMessageId?: unknown })._clientMessageId === s._activeClientMessageId);
+    if (!preserveStreaming) {
+      s._streamingAssistant = null;
+      s._streamingThinking = null;
+    }
     s._blockIdToMsgId = new Map();
     s._agentGroups = new Map();
     rebuildIndexes(s);
@@ -3260,12 +3265,20 @@ export class ChatSocket {
       const noLiveOwner = !activeCmid || !currentLiveOwners.has(activeCmid);
       const emptyInFlightBubble = !!sess?._sendingInFlight && noLiveOwner &&
         (sess ? this.turnAssistantIsEmpty(sess) : true);
+      // P0: an in-flight cmid still owned by live-frames must not be wiped by
+      // applyTapeProjection (historical tapeProjectionVersion>0 used to clear
+      // _streamingAssistant). Empty-bubble cutover still hydrates tape.
+      const preserveInFlightLive = !!sess?._sendingInFlight && !!activeCmid &&
+        currentLiveOwners.has(activeCmid);
       if (
-        versionAdvanced ||
-        tapeProjectionAppeared ||
-        liveOwnerProjectedToTape ||
-        degraded ||
-        (sawTapeProjection && emptyInFlightBubble)
+        !preserveInFlightLive &&
+        (
+          versionAdvanced ||
+          tapeProjectionAppeared ||
+          liveOwnerProjectedToTape ||
+          degraded ||
+          (sawTapeProjection && emptyInFlightBubble)
+        )
       ) {
         try {
           await applyTapeProjection();
@@ -3364,16 +3377,27 @@ export class ChatSocket {
         resetFrameSeqCursor(sess, { sessionKey });
       }
       const owners = new Set(resetClientMessageIds);
+      const preserveStreamingPointer = !!sess._sendingInFlight &&
+        typeof sess._activeClientMessageId === "string" &&
+        owners.has(sess._activeClientMessageId);
       sess.messages = sess.messages.filter((message) => {
         if (message.role === "user") return true;
         if (message._source === "server" || !!message._turnTapeId) return true;
+        // Keep the live streaming object; still drop other local rows for this
+        // cmid so retired-stream hydrates can purge a stale cache copy.
+        if (preserveStreamingPointer && message === sess._streamingAssistant) return true;
         return !(
           (typeof message._turnOwnerId === "string" && owners.has(message._turnOwnerId)) ||
           (typeof message._clientMessageId === "string" && owners.has(message._clientMessageId))
         );
       });
-      sess._streamingAssistant = null;
-      sess._streamingThinking = null;
+      // P0: a still-in-flight owner must keep streaming pointers. Initial
+      // journal hydrate resets owner ids (including the live cmid) and used to
+      // wipe _streamingAssistant even when applyTapeProjection was skipped.
+      if (!preserveStreamingPointer) {
+        sess._streamingAssistant = null;
+        sess._streamingThinking = null;
+      }
       sess._blockIdToMsgId = new Map();
       sess._agentGroups = new Map();
       rebuildIndexes(sess);

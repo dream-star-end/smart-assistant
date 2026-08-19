@@ -1615,6 +1615,15 @@ export interface ClientSession {
   // 值是 `_orderSeq` 水位。旧行/无归档 → 0。
   archivedCount?: number
   archivedThroughSeq?: number
+  /** In-flight durable dispatch for this session, if any (rev2 P0). */
+  openDispatch?: {
+    dispatchId: string
+    clientMessageId: string
+    status: string
+    acceptedAt: number | null
+    lastFrameAt: number | null
+    model?: string
+  }
 }
 
 /**
