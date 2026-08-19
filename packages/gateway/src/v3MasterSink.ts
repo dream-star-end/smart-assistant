@@ -413,7 +413,10 @@ export function buildLosslessTurnTapeRequests(
 export function* iterateLosslessTurnTapeParts(
   tape: ReturnType<typeof buildLosslessTurnTapeRequests>,
 ): Generator<LosslessTurnTapePartRequest> {
-  const { action: _action, ...base } = tape.finalize
+  // settlement belongs only on action=finalize. Spreading it onto parts
+  // trips master's LosslessTapePartSchema.strict() → 400 INVALID_TURN_TAPE_PART
+  // and withholds user-chat isFinal until ACK.
+  const { action: _action, settlement: _settlement, ...base } = tape.finalize
   for (let partIndex = 0; partIndex < tape.finalize.partCount; partIndex++) {
     const bytes = tape.canonical.subarray(
       partIndex * LOSSLESS_TURN_TAPE_PART_BYTES,

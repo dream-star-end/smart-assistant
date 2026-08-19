@@ -243,6 +243,24 @@ describe("lossless v2 turn tape", () => {
     assert.equal(canonical.waiveReason, "platform_authority_expired");
     assert.equal(canonical.usage.model, "kimi-k3-ark");
   });
+
+  test("part envelopes never carry finalize.settlement; finalize keeps it", () => {
+    const tape = buildLosslessTurnTapeRequests({
+      ...PAYLOAD,
+      createdAt: 123,
+      turnKey: "e".repeat(64),
+      dispatchId: "3e0a2b52-9d31-4c8f-9b6e-000000000002",
+      attemptNo: 1,
+    });
+    assert.equal("settlement" in tape.finalize, true);
+    assert.equal(typeof tape.finalize.settlement, "object");
+    const parts = [...iterateLosslessTurnTapeParts(tape)];
+    assert.ok(parts.length >= 1);
+    for (const part of parts) {
+      assert.equal("settlement" in part, false);
+      assert.equal(part.action, "part");
+    }
+  });
 });
 
 describe("readV3MasterSinkConfig", () => {

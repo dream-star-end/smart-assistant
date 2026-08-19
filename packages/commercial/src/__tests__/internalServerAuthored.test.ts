@@ -227,6 +227,63 @@ describe("internalServerAuthored handler — lossless v2 multipart", () => {
     assert.equal(JSON.parse(finalRes.rec.body).recordCount, 1);
   });
 
+  test("rejects a part that still carries finalize.settlement; accepts the stripped part", async () => {
+    const bytes = Buffer.from("hi", "utf8");
+    const sha = createHash("sha256").update(bytes).digest("hex");
+    const turnKey = "a".repeat(64);
+    const tapeId = "b".repeat(64);
+    const staged: Buffer[] = [];
+    const handler = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: fakeStorage(async () => ({ applied: true })),
+      losslessTurnTapeStorage: {
+        async stageLosslessTurnTapePart(_userId, _body, payload) {
+          staged.push(Buffer.from(payload));
+          return { applied: "stored" };
+        },
+        async finalizeLosslessTurnTape() {
+          return { applied: "finalized", recordCount: 1, engineBillings: [] };
+        },
+      },
+    });
+    const part: LosslessTurnTapePartRequest = {
+      protocolVersion: LOSSLESS_TURN_TAPE_VERSION,
+      action: "part",
+      sessionId: "web-test1",
+      agentId: "main",
+      turnIndex: 1,
+      status: "completed",
+      turnKey,
+      tapeId,
+      tapeSha256: sha,
+      totalBytes: bytes.length,
+      partCount: 1,
+      partIndex: 0,
+      partSha256: sha,
+      data: bytes.toString("base64"),
+      createdAt: 1_783_944_000_000,
+    };
+    const polluted = {
+      ...part,
+      settlement: {
+        billingAnchorId: "anchor-1",
+        engineBillings: [],
+        text: "",
+        ts: 1_783_944_000_000,
+      },
+    };
+    const bad = makeRes();
+    await handler(makeReq({ body: JSON.stringify(polluted), auth: `Bearer ${VALID_TOKEN}` }), bad.res, CTX);
+    assert.equal(bad.rec.status, 400);
+    assert.equal(JSON.parse(bad.rec.body).error.code, "INVALID_TURN_TAPE_PART");
+    assert.equal(staged.length, 0);
+
+    const ok = makeRes();
+    await handler(makeReq({ body: JSON.stringify(part), auth: `Bearer ${VALID_TOKEN}` }), ok.res, CTX);
+    assert.equal(ok.rec.status, 200);
+    assert.equal(staged.length, 1);
+  });
+
   test("does not ACK a finalized paid tape until durable Codex billing settles", async () => {
     const billing = {
       requestId: "c".repeat(32),
