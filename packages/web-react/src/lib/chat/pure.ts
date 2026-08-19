@@ -343,7 +343,7 @@ export function classifyEmptyTurn(p: {
 export const AUTO_CONTINUE_PROMPT = "请基于刚才的思考,继续输出完整的正文回答。";
 export const AUTO_CONTINUE_DISPLAY = "↻ 自动续写";
 export const INTERRUPTED_CONTINUE_PROMPT =
-  "继续完成刚才因临时异常中断的任务。以本会话中已经生成并持久化的思考、工具结果和部分回答为依据，从断点继续；不要重新执行已经完成的步骤，不要重复已经输出的内容。若外部写操作的结果仍不明确，不得重复提交，先核对状态或向用户说明。";
+  "继续完成刚才因临时异常中断的任务。以本会话中已经生成并持久化的思考、工具结果和部分回答为依据，从断点继续。这是一条断点续接指令，不是重放原始请求：不要重新执行已经完成的步骤，不要重复已经输出的内容。若中断前有外部写操作或部署操作，先查询其当前可观察状态（如 release 指针、进程、日志、健康检查或目标资源）并据此继续。只有在无法通过查询区分成功或失败、且重复执行可能造成不可逆后果时，才明确说明具体无法确认的操作和风险，并仅询问完成任务所必需的决定；不要泛泛要求用户再说“继续”。";
 export const INTERRUPTED_CONTINUE_DISPLAY = "↻ 从断点继续";
 export const AUTOMATIC_RECOVERY_CHECKPOINT_DISPLAY = "↻ 自动从断点继续";
 export const AUTOMATIC_RECOVERY_REPLAY_DISPLAY = "↻ 自动重试";

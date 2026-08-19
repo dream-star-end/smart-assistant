@@ -286,6 +286,38 @@ export type InterruptedContinuationTarget = {
   max?: number;
 };
 
+/** Human feedback for a server-authoritative recovery rejection. Keep the
+ * optimistic child disposable, but never make the user's click look inert. */
+export function recoverySkippedNotice(reason?: string): string {
+  switch (reason) {
+    case "source_not_latest":
+      return "未从断点继续：会话已有更新，原任务仍已保留。请在最新消息后再试。";
+    case "source_not_recoverable":
+    case "source_tape_completed":
+      return "未从断点继续：服务端没有确认到可恢复的中断断点，原任务仍已保留。";
+    case "completed_replay_forbidden":
+    case "automatic_replay_not_proven":
+    case "source_not_safely_replayable":
+      return "没有重放原请求：服务端无法证明它尚未执行。原任务仍已保留，可从已保存的断点继续。";
+    case "source_tape_malformed":
+    case "recovery_mode_mismatch":
+    case "automatic_checkpoint_unsafe":
+      return "未从断点继续：服务端校验断点记录失败，原任务仍已保留。请刷新后再试。";
+    case "automatic_retry_exhausted":
+      return "自动恢复已达到次数上限，原任务仍已保留。请在错误卡上手动重试。";
+    case "capability_unavailable":
+      return "暂时无法从断点继续：当前服务版本不支持这次恢复。原任务仍已保留，请刷新后再试。";
+    case "invalid_lineage":
+    case "identity_mismatch":
+    case "identity_reused":
+    case "automatic_lineage_mismatch":
+    case "automatic_attempt_mismatch":
+      return "未从断点继续：这次恢复请求已经过期或与当前会话不一致。原任务仍已保留，请刷新后再试。";
+    default:
+      return "未从断点继续：服务端安全校验未通过。原任务仍已保留，请刷新后再试。";
+  }
+}
+
 function baseTurnRecoveryTarget(
   messages: ChatMessage[],
   error: ChatMessage,
@@ -318,8 +350,9 @@ function recoveryIdentityAlreadyExists(
     message.id === identity.clientMessageId || message._idem === identity.idempotencyKey);
 }
 
-/** Manual fallback for a durable interrupted turn. It stays visible when an
- * unresolved external side effect blocks automatic recovery. */
+/** Manual fallback for a durable interrupted turn. It remains available
+ * when the Master is unavailable, automatic attempts are exhausted, or the
+ * user explicitly chooses to resume now. */
 export function interruptedContinuationTarget(
   messages: ChatMessage[],
   error: ChatMessage,
@@ -341,8 +374,9 @@ export function interruptedContinuationTarget(
   };
 }
 
-/** Automatic recovery is deliberately stricter than the manual CTA: every
- * hop rechecks exact durable rows and advances one shared 1..10 lineage. */
+/** Automatic recovery rechecks exact durable rows and advances one shared
+ * 1..10 lineage. Original-request replay remains strict; checkpoint continuation
+ * resumes context and verifies uncertain effects instead of repeating them. */
 export function automaticTurnRecoveryTarget(
   messages: ChatMessage[],
   error: ChatMessage,
@@ -361,7 +395,17 @@ export function automaticTurnRecoveryTarget(
   );
   const assessment = assessTurnRecoveryTape(durableRows);
   const mode = assessment.mode;
-  if (!assessment.checkpointSafe) return undefined;
+  // A completed header with a recoverable terminal error is the legacy
+  // contradiction repaired by this path: checkpoint continuation resumes the
+  // persisted context and verifies uncertain external state. Other unsafe
+  // finalized states retain their existing manual-only fallback.
+  const completedTape = durableRows.some(
+    (message) => message._turnTapeProcess === true && message._dispatchOutcome === "completed",
+  );
+  if (
+    !assessment.checkpointSafe &&
+    (mode !== "checkpoint" || !completedTape)
+  ) return undefined;
   if (
     mode === "replay" &&
     (base.user._userPayloadDeferred === true || !preciseRetryEligible(base.user))
@@ -2206,6 +2250,10 @@ export class ChatSocket {
         [sourceClientMessageId]: true,
       };
     }
+    this.transientNotices.set(sessId, {
+      text: recoverySkippedNotice(frame.recoverySkippedReason),
+      ts: Date.now(),
+    });
     const userIndex = sess.messages.findIndex((message) =>
       message.role === "user" &&
       message.id === clientMessageId &&
@@ -2213,6 +2261,7 @@ export class ChatSocket {
       !!message._recoveryOfClientMessageId);
     if (userIndex < 0) {
       this.deps.persistSession?.(sessId);
+      this.scheduleNotify();
       return sourceClientMessageId !== undefined;
     }
     this.finishDispatch(sessId, clientMessageId);

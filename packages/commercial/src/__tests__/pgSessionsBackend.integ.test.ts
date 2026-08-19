@@ -5329,6 +5329,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     automaticRecovery?: boolean;
     inlineError?: boolean;
     record?: MessageLike;
+    records?: MessageLike[];
     tapeStatus?: "completed" | "crashed" | "interrupted";
     waiveReason?: "idle_timeout" | "turn_limit" | null;
   }): Promise<void> {
@@ -5386,29 +5387,50 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
         args.waiveReason ?? null,
       ],
     );
-    const record = args.record ?? {
+    let records: MessageLike[] = args.records ?? [args.record ?? {
       id: `thinking-${args.sourceClientMessageId}`,
       role: "thinking",
       text: "durable process",
       ts: 2,
       _clientMessageId: args.sourceClientMessageId,
-    };
-    const payload = Buffer.from(JSON.stringify(record), "utf8");
-    await pool.query(
-      `INSERT INTO client_session_turn_tape_records
-         (session_id,user_id,tape_id,msg_id,ordinal,role,ts,content_sha256,payload)
-       VALUES ($1,$2,$3,$4,0,$5,$6,$7,$8)`,
-      [
-        args.sessionId,
-        CUSER,
-        tapeId,
-        record.id,
-        record.role,
-        record.ts,
-        sha256(payload),
-        payload,
-      ],
-    );
+    }];
+    if (
+      args.inlineError !== false &&
+      !records.some((record) =>
+        record.role === "assistant" && typeof record._errorCode === "string")
+    ) {
+      records = [
+        ...records,
+        {
+          id: `terminal-${args.sourceClientMessageId}`,
+          role: "assistant",
+          text: "temporary upstream failure",
+          ts: 3,
+          _clientMessageId: args.sourceClientMessageId,
+          _errorCode: "upstream_failed",
+        },
+      ];
+    }
+    for (let ordinal = 0; ordinal < records.length; ordinal++) {
+      const record = records[ordinal]!;
+      const payload = Buffer.from(JSON.stringify(record), "utf8");
+      await pool.query(
+        `INSERT INTO client_session_turn_tape_records
+           (session_id,user_id,tape_id,msg_id,ordinal,role,ts,content_sha256,payload)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+        [
+          args.sessionId,
+          CUSER,
+          tapeId,
+          record.id,
+          ordinal,
+          record.role,
+          record.ts,
+          sha256(payload),
+          payload,
+        ],
+      );
+    }
   }
 
   maybe("lossless anchor recovery trusts interrupted tape waiver without hot error metadata", async () => {
@@ -5846,7 +5868,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     );
   });
 
-  maybe("automatic recovery revalidates authoritative tape actions and leaves unsafe checkpoints manual", async () => {
+  maybe("checkpoint continuation admits uncertain durable actions and never replays them", async () => {
     const cases: Array<{ suffix: string; record: MessageLike }> = [
       {
         suffix: "incomplete-tool",
@@ -5891,22 +5913,34 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
       },
     ];
     for (const testCase of cases) {
-      const sessionId = `s-dd-recovery-unsafe-${testCase.suffix}`;
-      const sourceClientMessageId = `cm-dd-recovery-unsafe-${testCase.suffix}`;
+      const sessionId = `s-dd-recovery-uncertain-${testCase.suffix}`;
+      const sourceClientMessageId = `cm-dd-recovery-uncertain-${testCase.suffix}`;
       await seedRecoverableSource({
         sessionId,
         sourceClientMessageId,
-        record: testCase.record,
+        inlineError: false,
+        tapeStatus: "completed",
+        records: [
+          testCase.record,
+          {
+            id: `terminal-${testCase.suffix}`,
+            role: "assistant",
+            text: "temporary upstream failure",
+            ts: 3,
+            _clientMessageId: sourceClientMessageId,
+            _errorCode: "upstream_failed",
+          },
+        ],
       });
       const identity = turnRecoveryIdentity(sessionId, sourceClientMessageId);
-      const recoveryInput = admitInput({
+      const recovered = await backend.admitUserTurn(admitInput({
         sessionId,
         clientMessageId: identity.clientMessageId,
         billingRequestId: `brq-${identity.clientMessageId}`,
         message: {
           id: identity.clientMessageId,
           role: "user",
-          text: "checkpoint",
+          text: "checkpoint — verify state before any write",
           ts: 3,
         } as MessageLike & { id: string },
         recovery: {
@@ -5917,64 +5951,33 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
           attempt: 1,
           max: 10,
         },
-      });
-      assert.deepEqual(await backend.admitUserTurn(recoveryInput), {
-        kind: "recovery_conflict",
-        reason: "automatic_checkpoint_unsafe",
-      });
+      }));
+      assert.equal(recovered.kind, "admitted", testCase.suffix);
       const stored = await backend.getClientSession(sessionId, CUSER);
       assert.equal(
-        (stored!.messages as MessageLike[]).some((message) => message.id === identity.clientMessageId),
-        false,
+        (stored!.messages as MessageLike[]).some((message) =>
+          message.id === identity.clientMessageId &&
+          message._recoveryMode === "checkpoint" &&
+          message._automaticRecovery === true),
+        true,
+        testCase.suffix,
       );
       const dispatch = await pool.query(
         "SELECT 1 FROM turn_dispatches WHERE user_id=$1 AND session_id=$2 AND client_message_id=$3",
         [UID, sessionId, identity.clientMessageId],
       );
-      assert.equal(dispatch.rowCount, 0);
+      assert.equal(dispatch.rowCount, 1, testCase.suffix);
     }
-
-    const manualSessionId = "s-dd-recovery-unsafe-manual";
-    const manualSourceId = "cm-dd-recovery-unsafe-manual";
-    await seedRecoverableSource({
-      sessionId: manualSessionId,
-      sourceClientMessageId: manualSourceId,
-      record: {
-        id: "tool-manual",
-        role: "tool",
-        text: "",
-        ts: 2,
-        _completed: true,
-        outputJson: { outcome: "unknown" },
-      },
-    });
-    const manualIdentity = turnRecoveryIdentity(manualSessionId, manualSourceId);
-    const manual = await backend.admitUserTurn(admitInput({
-      sessionId: manualSessionId,
-      clientMessageId: manualIdentity.clientMessageId,
-      billingRequestId: `brq-${manualIdentity.clientMessageId}`,
-      message: {
-        id: manualIdentity.clientMessageId,
-        role: "user",
-        text: "manual checkpoint",
-        ts: 3,
-      } as MessageLike & { id: string },
-      recovery: {
-        sourceClientMessageId: manualSourceId,
-        mode: "checkpoint",
-        automatic: false,
-      },
-    }));
-    assert.equal(manual.kind, "admitted");
   });
 
-  maybe("completed source tape cannot be contradicted by a recovery frame", async () => {
-    const sessionId = "s-dd-recovery-completed";
-    const sourceClientMessageId = "cm-dd-recovery-completed-source";
+  maybe("completed tape without a terminal recoverable record remains non-recoverable", async () => {
+    const sessionId = "s-dd-recovery-completed-clean";
+    const sourceClientMessageId = "cm-dd-recovery-completed-clean-source";
     await seedRecoverableSource({
       sessionId,
       sourceClientMessageId,
       tapeStatus: "completed",
+      inlineError: false,
     });
     const identity = turnRecoveryIdentity(sessionId, sourceClientMessageId);
     assert.deepEqual(await backend.admitUserTurn(admitInput({
@@ -5997,8 +6000,156 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
       },
     })), {
       kind: "recovery_conflict",
-      reason: "source_tape_completed",
+      reason: "source_not_recoverable",
     });
+  });
+
+  maybe("completed tape with terminal recoverable error accepts manual checkpoint continuation", async () => {
+    const sessionId = "s-dd-recovery-completed-error";
+    const sourceClientMessageId = "cm-dd-recovery-completed-error-source";
+    await seedRecoverableSource({
+      sessionId,
+      sourceClientMessageId,
+      inlineError: false,
+      tapeStatus: "completed",
+      records: [
+        {
+          id: "thinking-completed-error",
+          role: "thinking",
+          text: "deployment started",
+          ts: 2,
+          _clientMessageId: sourceClientMessageId,
+        },
+        {
+          id: "terminal-completed-error",
+          role: "assistant",
+          text: "temporary upstream failure",
+          ts: 3,
+          _clientMessageId: sourceClientMessageId,
+          _errorCode: "upstream_failed",
+        },
+      ],
+    });
+    const identity = turnRecoveryIdentity(sessionId, sourceClientMessageId);
+    const recovered = await backend.admitUserTurn(admitInput({
+      sessionId,
+      clientMessageId: identity.clientMessageId,
+      billingRequestId: `brq-${identity.clientMessageId}`,
+      message: {
+        id: identity.clientMessageId,
+        role: "user",
+        text: "checkpoint continuation",
+        ts: 4,
+      } as MessageLike & { id: string },
+      recovery: {
+        sourceClientMessageId,
+        mode: "checkpoint",
+        automatic: false,
+      },
+    }));
+    assert.equal(recovered.kind, "admitted");
+  });
+
+  maybe("completed recoverable tape never authorizes replay of the original write request", async () => {
+    const sessionId = "s-dd-recovery-completed-replay";
+    const sourceClientMessageId = "cm-dd-recovery-completed-replay-source";
+    await seedRecoverableSource({
+      sessionId,
+      sourceClientMessageId,
+      inlineError: false,
+      tapeStatus: "completed",
+      records: [{
+        id: "terminal-completed-replay",
+        role: "assistant",
+        text: "temporary upstream failure",
+        ts: 2,
+        _clientMessageId: sourceClientMessageId,
+        _errorCode: "upstream_failed",
+      }],
+    });
+    const identity = turnRecoveryIdentity(sessionId, sourceClientMessageId);
+    assert.deepEqual(await backend.admitUserTurn(admitInput({
+      sessionId,
+      clientMessageId: identity.clientMessageId,
+      billingRequestId: `brq-${identity.clientMessageId}`,
+      message: {
+        id: identity.clientMessageId,
+        role: "user",
+        text: "original external write",
+        ts: 3,
+      } as MessageLike & { id: string },
+      recovery: {
+        sourceClientMessageId,
+        mode: "replay",
+        automatic: true,
+        rootClientMessageId: sourceClientMessageId,
+        attempt: 1,
+        max: 10,
+      },
+    })), {
+      kind: "recovery_conflict",
+      reason: "completed_replay_forbidden",
+    });
+  });
+
+  maybe("finalize schedules completed-error checkpoint despite uncertain Bash outcome", async () => {
+    const sessionId = "s-dd-recovery-completed-auto";
+    const sourceClientMessageId = "cm-dd-recovery-completed-auto-source";
+    const sourceAdmission = await backend.admitUserTurn(admitInput({
+      sessionId,
+      clientMessageId: sourceClientMessageId,
+      billingRequestId: `brq-${sourceClientMessageId}`,
+      message: {
+        id: sourceClientMessageId,
+        role: "user",
+        text: "deploy",
+        ts: 1,
+        _routing: { model: "gpt-5.6-sol", effortLevel: null, teamMode: false },
+      } as MessageLike & { id: string },
+    }));
+    assert.equal(sourceAdmission.kind, "admitted");
+    const tape = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 1,
+      status: "completed",
+      turnKey: "c".repeat(64),
+      clientMessageId: sourceClientMessageId,
+      text: "temporary upstream failure",
+      thinkingText: "deployment started",
+      tools: [{
+        blockId: "deploy-uncertain",
+        toolName: "Bash",
+        inputJson: { command: "deploy.sh --release current" },
+        output: "",
+        completed: false,
+      }],
+      errorCode: "upstream_failed",
+      createdAt: 1_783_950_100_000,
+      usage: { inputTokens: 1, outputTokens: 1 },
+    });
+    await stageAndFinalize(CUSER, tape);
+    const jobs = await pool.query<{
+      recovery_mode: string;
+      error_code: string;
+      semantic_recovery_attempt: number;
+      request_json: Record<string, unknown>;
+    }>(
+      `SELECT recovery_mode,error_code,semantic_recovery_attempt,request_json
+         FROM turn_recovery_jobs
+        WHERE user_id=$1 AND session_id=$2 AND source_client_message_id=$3`,
+      [UID, sessionId, sourceClientMessageId],
+    );
+    assert.equal(jobs.rowCount, 1);
+    assert.equal(jobs.rows[0]!.recovery_mode, "checkpoint");
+    assert.equal(jobs.rows[0]!.error_code, "upstream_failed");
+    assert.equal(jobs.rows[0]!.semantic_recovery_attempt, 1);
+    const request = jobs.rows[0]!.request_json as {
+      content?: { text?: string; recovery?: { mode?: string } };
+    };
+    assert.equal(request.content?.recovery?.mode, "checkpoint");
+    assert.match(request.content?.text ?? "", /先查询其当前可观察状态/);
+    assert.doesNotMatch(request.content?.text ?? "", /deploy\.sh/);
   });
 
   maybe("verified not-accepted source can replay exactly without inventing a tape", async () => {
