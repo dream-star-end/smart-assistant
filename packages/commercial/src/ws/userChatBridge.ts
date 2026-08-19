@@ -144,6 +144,7 @@ import {
   casAdmittedToAccepted,
   casToManualReconcile,
   casToTerminal,
+  getDispatchByLogicalKey,
   heartbeatLease,
   DISPATCH_LEASE_TTL_MS,
   DISPATCH_LEASE_HEARTBEAT_MS,
@@ -271,6 +272,11 @@ export const CLOSE_BRIDGE = {
  *
  * 导出供 index.ts 装配 createTunnelContainerSocket 时复用,避免两处 magic number 漂移。 */
 export const DEFAULT_MAX_FRAME_BYTES = 448 * 1024 * 1024;
+
+/** 单条 hello 最多查这么多在飞候选。peers 数组来自客户端,无此上限可把 PG 打满。 */
+const HELLO_TERMINAL_NOTIFY_MAX_CANDIDATES = 8;
+/** clientMessageId 长度硬顶。先挡住无界字符串(单帧上限 448 MiB),再跑格式校验。 */
+const HELLO_TERMINAL_NOTIFY_MAX_CLIENT_MESSAGE_ID_LEN = 200;
 
 export const PROMPT_QUEUE_DISPATCH_REQUEST_TYPE = "outbound.prompt_queue.dispatch_request";
 export const PROMPT_QUEUE_DISPATCH_RESULT_TYPE = "outbound.prompt_queue.dispatch_result";
@@ -1565,6 +1571,14 @@ type OutboundPersistQueueState = {
   failedSeq: number | null;
 };
 
+function isPermanentLiveFrameConflict(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    (error as { liveFramePermanentConflict?: unknown }).liveFramePermanentConflict === true
+  );
+}
+
 /**
  * Serializes durable outbound writes per container/session namespace.
  *
@@ -1597,6 +1611,7 @@ export class _OutboundPersistQueueCoordinator {
     frameSeq: number,
     work: () => Promise<void>,
     onFailure: (error: unknown) => void,
+    onPermanentConflict?: (error: unknown) => void,
   ): void {
     let state = this.queues.get(key);
     if (!state) {
@@ -1615,6 +1630,14 @@ export class _OutboundPersistQueueCoordinator {
         await work();
         if (state!.failedSeq === frameSeq) state!.failedSeq = null;
       } catch (error) {
+        if (isPermanentLiveFrameConflict(error)) {
+          // An exact retry can turn a prior transient failure into a proven
+          // permanent conflict. Retire only that same-sequence barrier; a
+          // barrier for any other missing sequence must remain strict.
+          if (state!.failedSeq === frameSeq) state!.failedSeq = null;
+          onPermanentConflict?.(error);
+          return;
+        }
         state!.failedSeq = frameSeq;
         onFailure(error);
       }
@@ -4313,14 +4336,43 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             }
             const cidStr = containerId.toString();
             const uidStr = uid.toString();
+            // 前端只在发送态未清且 id 合法时携带 inFlightClientMessageId。
+            // 这里只收集候选,查询必须等 hello 转发之后再跑。
+            const terminalNotifyCandidates: Array<{ peerId: string; clientMessageId: string }> = [];
+            const terminalNotifySeen = new Set<string>();
             for (const p of visiblePeers) {
               if (typeof p !== "object" || p === null) continue;
               const peer = p as {
                 peerId?: unknown;
                 agentId?: unknown;
                 lastFrameSeq?: unknown;
+                inFlight?: unknown;
+                inFlightClientMessageId?: unknown;
               };
               if (typeof peer.peerId !== "string") continue;
+              const inFlightId = peer.inFlightClientMessageId;
+              // peers 来自客户端。协议规定 inFlightClientMessageId 仅在
+              // inFlight===true 时携带,且为短 uuid;不校验就会被无界字符串/
+              // 重复项放大成并行 PG 查询。
+              if (
+                peer.inFlight === true &&
+                typeof inFlightId === "string" &&
+                inFlightId !== "" &&
+                inFlightId.length <= HELLO_TERMINAL_NOTIFY_MAX_CLIENT_MESSAGE_ID_LEN &&
+                isClientMessageId(inFlightId)
+              ) {
+                const dedupeKey = `${peer.peerId}\0${inFlightId}`;
+                if (
+                  !terminalNotifySeen.has(dedupeKey) &&
+                  terminalNotifyCandidates.length < HELLO_TERMINAL_NOTIFY_MAX_CANDIDATES
+                ) {
+                  terminalNotifySeen.add(dedupeKey);
+                  terminalNotifyCandidates.push({
+                    peerId: peer.peerId,
+                    clientMessageId: inFlightId,
+                  });
+                }
+              }
               const aid =
                 typeof peer.agentId === "string" && peer.agentId !== ""
                   ? peer.agentId
@@ -4370,6 +4422,65 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             if (lastHelloPeerIds === null) lastHelloPeerIds = helloPeerIds;
             else for (const id of helloPeerIds) lastHelloPeerIds.add(id);
             tryAutoRebindFlush();
+            // 容器重建后内存环 _recentTerminalRing 为空,只能发 turn_state_unknown
+            // (isFinal:false),前端明确不清发送态;容器进程又拿不到 master PG。
+            // hello 必经本桥且宿主有 PG,终态回落只能在这里补。
+            //
+            // 绝不能挡在 hello 转发前面:容器靠这条 hello 把 containerWs 登记进
+            // clientsByPeer,链路一个字节都不能动。所以只 spawn 浮动 promise,
+            // 先 await 让出同步栈,等 fall through 到 forwardInboundFrame 之后再查 PG。
+            if (terminalNotifyCandidates.length > 0 && deps.pgPool) {
+              const pgPool = deps.pgPool;
+              void (async () => {
+                try {
+                  await Promise.resolve();
+                  for (const { peerId, clientMessageId } of terminalNotifyCandidates) {
+                    // 查询前也要看连接:断开后结果没人收,继续查只会空烧 PG。
+                    if (userWs.readyState !== WebSocket.OPEN) break;
+                    const row = await getDispatchByLogicalKey(pgPool, {
+                      userId: uid,
+                      sessionId: peerId,
+                      clientMessageId,
+                    });
+                    if (row === null || row.status !== "terminal") continue;
+                    let reconcile: "turn_completed" | "interrupted" | null = null;
+                    if (row.outcome === "completed") {
+                      reconcile = "turn_completed";
+                    } else if (row.outcome === "interrupted" || row.outcome === "crashed") {
+                      // 前端 reducer 只认这两个字面量。不要模仿容器的 turn_interrupted,
+                      // 也不要带 interrupted:'service_restart'(会触发自动恢复)。
+                      reconcile = "interrupted";
+                    }
+                    // not_accepted / executed_error / 其它 / null → 什么都不发:
+                    // 失败态交给现有 fail-visible 通道,避免和失败卡打架。
+                    if (reconcile === null) continue;
+                    // 只打本条 hello 所在的 userWs,不用 broadcastToUser —
+                    // 同 uid 其它标签页未必卡在这一轮,广播会误清它们的发送态。
+                    if (userWs.readyState !== WebSocket.OPEN) continue;
+                    try {
+                      userWs.send(JSON.stringify({
+                        type: "outbound.message",
+                        channel: "webchat",
+                        peer: { id: peerId, kind: "dm" },
+                        clientMessageId,
+                        blocks: [],
+                        isFinal: true,
+                        meta: { reconcile, clientMessageId },
+                        ts: Date.now(),
+                      }));
+                      bridgeLog?.info("user-chat-bridge: hello terminal dispatch fallback sent", {
+                        uid: uidStr,
+                        sessionId: peerId,
+                        clientMessageId,
+                        reconcile,
+                      });
+                    } catch { /* 发不出就静默降级 */ }
+                  }
+                } catch {
+                  // 任何失败都只能静默:hello 处理绝不能因回落抛错。
+                }
+              })().catch(() => {});
+            }
             // Fall through to forwardInboundFrame below.
           }
           if (
@@ -7013,6 +7124,16 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               err: (error as Error)?.message ?? String(error),
             });
             try { userWs.close(CLOSE_BRIDGE.INTERNAL, "output persistence unavailable"); } catch { /* */ }
+          },
+          (error) => {
+            bridgeLog?.error("user-chat-bridge: skipping outbound frame after permanent live-stream conflict", {
+              sessionId: stamped.sessionId,
+              clientMessageId: stamped.clientMessageId,
+              containerId,
+              sessionKey: stamped.sessionKey,
+              frameSeq: stamped.frameSeq,
+              err: (error as Error)?.message ?? String(error),
+            });
           },
         );
         return;

@@ -49,6 +49,7 @@
     "check:tutorials": "tsx scripts/check-v5-tutorials.ts",
     "check:ci-parity": "tsx scripts/check-ci-parity.ts",
     "check:v5:incidents": "tsx scripts/check-v5-incident-regressions.ts",
+    "check:v5:regression-contracts": "tsx scripts/check-v5-regression-contracts.ts --prove",
     "check:v5:e2e-selectors": "tsx scripts/check-v5-e2e-selectors.ts",
     "tutorials:accept": "tsx scripts/check-v5-tutorials.ts accept",
     "tutorials:media": "tsx scripts/generate-v5-tutorial-media.ts",
@@ -56,7 +57,7 @@
     "test": "npm run test:protocol && npm run test:channels && npm run test:gateway && npm run test:storage && npm run test:commercial",
     "migrate:commercial": "tsx packages/commercial/src/db/migrate.ts",
     "typecheck": "tsc --build && npm run typecheck --workspace packages/web-react",
-    "check:v5": "npm run check:ci-parity && npm run check:v5:incidents && npm run check:v5:e2e-selectors && npm run check:tutorials && npm run lint:scheduler-wiring && npm run lint:agent-containers-sql && npm run lint:integ-tiers && npm run typecheck && npm run test:v5:ops && npm run test:protocol && npm run test:channels && npm run test:gateway && npm run test:mcp-memory && npm run test:storage && npm run test:web-react && npm run test:browser && npm run test:commercial:unit:gate && npm run test:commercial:integ:shard -- pr",
+    "check:v5": "npm run check:ci-parity && npm run check:v5:incidents && npm run check:v5:regression-contracts && npm run check:v5:e2e-selectors && npm run check:tutorials && npm run lint:scheduler-wiring && npm run lint:agent-containers-sql && npm run lint:integ-tiers && npm run typecheck && npm run test:v5:ops && npm run test:protocol && npm run test:channels && npm run test:gateway && npm run test:mcp-memory && npm run test:storage && npm run test:web-react && npm run test:browser && npm run test:commercial:unit:gate && npm run test:commercial:integ:shard -- pr",
     "typecheck:clean": "tsc --build --clean",
     "typecheck:watch": "tsc --build --watch",
     "check": "npm run lint && npm run lint:agent-containers-sql && npm run lint:scheduler-wiring && npm run lint:undefined-refs && npm run lint:integ-tiers && npm run typecheck && npm run test"

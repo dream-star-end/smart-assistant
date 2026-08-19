@@ -33,6 +33,21 @@ function sha256(payload: Buffer): string {
   return createHash("sha256").update(payload).digest("hex");
 }
 
+/**
+ * Retrying the same live-frame journal write cannot resolve an identity or
+ * immutable-payload conflict. The bridge duck-types this exact flag so these
+ * permanent conflicts do not poison the outbound ordering barrier or close
+ * the browser socket.
+ */
+export class LiveFramePermanentConflictError extends Error {
+  readonly liveFramePermanentConflict = true as const;
+
+  constructor(message: string) {
+    super(message);
+    this.name = "LiveFramePermanentConflictError";
+  }
+}
+
 async function withTx<T>(
   pool: Pool,
   fn: (client: PoolClient) => Promise<T>,
@@ -159,7 +174,7 @@ export async function persistGatewayLiveFrame(
       ],
     );
     if ((stream.rowCount ?? 0) !== 1) {
-      throw new Error("live frame stream identity conflict");
+      throw new LiveFramePermanentConflictError("live frame stream identity conflict");
     }
 
     type StoredGatewayFrame = {
@@ -198,7 +213,7 @@ export async function persistGatewayLiveFrame(
     const existing = await insertOrReadExisting(input.sessionKey);
     if (existing === null || matchesCurrentFrame(existing)) return;
     if (existing.stream_key === streamKey) {
-      throw new Error("live frame immutable payload conflict");
+      throw new LiveFramePermanentConflictError("live frame immutable payload conflict");
     }
 
     // A destroyed gateway session can later reuse the same wire session key
@@ -209,7 +224,7 @@ export async function persistGatewayLiveFrame(
     const storageSessionKey = `v2:${JSON.stringify([input.sessionKey, streamKey])}`;
     const namespacedExisting = await insertOrReadExisting(storageSessionKey);
     if (namespacedExisting !== null && !matchesCurrentFrame(namespacedExisting)) {
-      throw new Error("live frame immutable payload conflict");
+      throw new LiveFramePermanentConflictError("live frame immutable payload conflict");
     }
   }));
 }

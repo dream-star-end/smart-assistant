@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "contracts": [
+    {
+      "id": "REG-20260817-OUTBOUND-DURABILITY-PERMANENT-CONFLICT",
+      "incident": "INC-20260810-LIVE-FRAME-SEQUENCE-RESET",
+      "path": "packages/commercial/src/__tests__/regression-contracts/outboundDurabilityPermanentConflict.contract.test.ts",
+      "assertion": "REG-20260817: permanent live-frame conflict never closes the browser or poisons later frames",
+      "sha256": "d4aaab92a25349bb41de15abf27bce51f9bc6dbdbef36b9a5ebc993682bb0fb6",
+      "negativeControl": {
+        "path": "packages/commercial/src/ws/userChatBridge.ts",
+        "from": "function isPermanentLiveFrameConflict(error: unknown): boolean {\n  return (\n    typeof error === \"object\" &&\n    error !== null &&\n    (error as { liveFramePermanentConflict?: unknown }).liveFramePermanentConflict === true\n  );\n}",
+        "to": "function isPermanentLiveFrameConflict(_error: unknown): boolean {\n  return false;\n}"
+      }
+    }
+  ]
+}

@@ -83,6 +83,9 @@ async function startRig(opts: {
   loadSessionWorkspaceMode?: UserChatBridgeDeps["loadSessionWorkspaceMode"];
   logger?: Logger;
   getFrontendBuildId?: () => string | null;
+  pgPool?: UserChatBridgeDeps["pgPool"];
+  preCheckRedis?: UserChatBridgeDeps["preCheckRedis"];
+  pricing?: UserChatBridgeDeps["pricing"];
 } = {}): Promise<TestRig> {
   // 1) mock 容器 ws server
   const containerSeen: Array<{ data: string | Buffer; isBinary: boolean }> = [];
@@ -122,6 +125,9 @@ async function startRig(opts: {
     loadSessionWorkspaceMode: opts.loadSessionWorkspaceMode,
     logger: opts.logger,
     getFrontendBuildId: opts.getFrontendBuildId,
+    pgPool: opts.pgPool,
+    preCheckRedis: opts.preCheckRedis,
+    pricing: opts.pricing,
   });
 
   // 3) gateway HTTP server,只挂 bridge upgrade
@@ -561,6 +567,57 @@ describe("userChatBridge — durable outbound frame ordering", () => {
     assert.deepEqual(queues.snapshotForTest(), { queues: 0, consumerKeys: 0, consumers: 0 });
   });
 
+  test("a permanent exact retry retires only the same-sequence transient poison", async () => {
+    const queues = new _OutboundPersistQueueCoordinator();
+    const key = "706:82:agent:main:webchat:dm:sess-permanent-exact-retry";
+    const attempted: number[] = [];
+    const failures: string[] = [];
+    const permanentConflicts: string[] = [];
+    queues.retain(key);
+
+    queues.enqueue(
+      key,
+      5,
+      async () => {
+        attempted.push(5);
+        throw new Error("transient write failure");
+      },
+      (error) => failures.push((error as Error).message),
+    );
+    await queues.drain();
+
+    queues.enqueue(
+      key,
+      5,
+      async () => {
+        attempted.push(5);
+        const error = new Error("live frame immutable payload conflict") as Error & {
+          liveFramePermanentConflict: boolean;
+        };
+        error.liveFramePermanentConflict = true;
+        throw error;
+      },
+      (error) => failures.push((error as Error).message),
+      (error) => permanentConflicts.push((error as Error).message),
+    );
+    await queues.drain();
+
+    queues.enqueue(
+      key,
+      6,
+      async () => { attempted.push(6); },
+      (error) => failures.push((error as Error).message),
+    );
+    await queues.drain();
+
+    assert.deepEqual(attempted, [5, 5, 6]);
+    assert.deepEqual(failures, ["transient write failure"]);
+    assert.deepEqual(permanentConflicts, ["live frame immutable payload conflict"]);
+    assert.deepEqual(queues.snapshotForTest(), { queues: 0, consumerKeys: 1, consumers: 1 });
+    queues.release(key);
+    assert.deepEqual(queues.snapshotForTest(), { queues: 0, consumerKeys: 0, consumers: 0 });
+  });
+
   test("a detached late-frame failure cannot poison a later sequence", async () => {
     const queues = new _OutboundPersistQueueCoordinator();
     const key = "705:81:agent:main:webchat:dm:sess-detached-late";
@@ -582,6 +639,62 @@ describe("userChatBridge — durable outbound frame ordering", () => {
     await queues.drain();
     assert.deepEqual(attempted, [4, 5]);
     assert.deepEqual(queues.snapshotForTest(), { queues: 0, consumerKeys: 0, consumers: 0 });
+  });
+
+  test("a permanent live-frame conflict skips one frame without closing or poisoning later seqs", async () => {
+    const persisted: number[] = [];
+    const portRef = { value: 0 };
+    const rig = await startRig({
+      resolve: async () => ({ host: "127.0.0.1", port: portRef.value, containerId: 83 }),
+      persistOutboundFrame: async (input) => {
+        if (input.frameSeq === 1) {
+          const error = new Error("live frame immutable payload conflict") as Error & {
+            liveFramePermanentConflict: boolean;
+          };
+          error.liveFramePermanentConflict = true;
+          throw error;
+        }
+        persisted.push(input.frameSeq);
+      },
+    });
+    portRef.value = rig.containerPort;
+    try {
+      const containerOpen = waitNextContainerSocket(rig);
+      const ws = openClient(rig.gatewayPort, await makeJwt("707"));
+      await new Promise<void>((resolve) => ws.once("open", resolve));
+      const containerWs = await containerOpen;
+      const business: Record<string, unknown>[] = [];
+      let closed: { code: number; reason: string } | null = null;
+      ws.on("message", (data) => {
+        try {
+          const frame = JSON.parse(data.toString()) as Record<string, unknown>;
+          if (typeof frame.type === "string" && !frame.type.startsWith("sys.")) business.push(frame);
+        } catch { /* irrelevant */ }
+      });
+      ws.once("close", (code, reason) => {
+        closed = { code, reason: reason.toString("utf8") };
+      });
+      const frame = (frameSeq: number, text: string): string => JSON.stringify({
+        type: "outbound.message",
+        sessionKey: "agent:main:webchat:dm:sess-permanent-skip",
+        frameSeq,
+        peer: { id: "sess-permanent-skip", kind: "dm" },
+        clientMessageId: "cm-permanent-skip",
+        blocks: [{ kind: "text", text }],
+      });
+      containerWs.send(frame(1, "one"));
+      containerWs.send(frame(2, "two"));
+
+      await waitFor(() => persisted.includes(2) && business.some((entry) => entry.frameSeq === 2));
+      assert.equal(closed, null);
+      assert.equal(ws.readyState, WebSocket.OPEN);
+      assert.deepEqual(persisted, [2]);
+      assert.deepEqual(business.map((entry) => entry.frameSeq), [2]);
+      ws.close();
+      await waitClose(ws);
+    } finally {
+      await stopRig(rig);
+    }
   });
 
   test("commits exact stamped frames serially before either becomes browser-visible", async () => {
@@ -2284,6 +2397,575 @@ describe("userChatBridge — Phase 0.4 ring replay", () => {
       ws2.close();
       await waitClose(ws2);
     } finally {
+      await stopRig(rig);
+    }
+  });
+});
+
+// ──────────── hello 终态回落(容器重建后 PG 补 isFinal) ────────────
+//
+// 容器侧 autoResumeFromHello 只查进程内存环,重建后为空,只能发
+// turn_state_unknown(isFinal:false),前端不清发送态。宿主桥有 PG,
+// 在 hello 转发之后按 inFlightClientMessageId 查 turn_dispatches,
+// 终态时给本条 userWs 补一帧。
+
+function rawDispatchRow(input: {
+  userId: string;
+  sessionId: string;
+  clientMessageId: string;
+  status: string;
+  outcome: string | null;
+}): Record<string, unknown> {
+  return {
+    dispatch_id: "d-hello-terminal",
+    user_id: input.userId,
+    session_id: input.sessionId,
+    client_message_id: input.clientMessageId,
+    agent_id: "main",
+    model: null,
+    request_hash: "hash",
+    billing_request_id: "bill",
+    attempt_no: 1,
+    status: input.status,
+    outcome: input.outcome,
+    failure_code: null,
+    conflict_reason: null,
+    resolution: null,
+    resolved_at: null,
+    client_notified: false,
+    owner_id: null,
+    lease_epoch: "1",
+    lease_until: null,
+    anchor_seq: null,
+    admitted_at: new Date(),
+    accepted_at: null,
+    terminal_at: input.status === "terminal" ? new Date() : null,
+    last_attempt_at: null,
+  };
+}
+
+function helloTerminalBillingTrio(opts: {
+  row?: Record<string, unknown> | null;
+  lookups?: unknown[][];
+  beforeTurnDispatchLookup?: () => Promise<void>;
+}): Pick<UserChatBridgeDeps, "pgPool" | "preCheckRedis" | "pricing"> {
+  const lookups = opts.lookups ?? [];
+  return {
+    pgPool: {
+      query: async (sql: unknown, params?: unknown[]) => {
+        const text = typeof sql === "string"
+          ? sql
+          : String((sql as { text?: unknown })?.text ?? "");
+        if (/SELECT status FROM users WHERE id/.test(text)) {
+          return { rows: [{ status: "active" }], rowCount: 1 };
+        }
+        if (/FROM turn_dispatches/.test(text) && /client_message_id/.test(text)) {
+          if (opts.beforeTurnDispatchLookup) await opts.beforeTurnDispatchLookup();
+          lookups.push(params ?? []);
+          return opts.row
+            ? { rows: [opts.row], rowCount: 1 }
+            : { rows: [], rowCount: 0 };
+        }
+        return { rows: [], rowCount: 0 };
+      },
+    } as UserChatBridgeDeps["pgPool"],
+    preCheckRedis: {
+      async atomicReserve() {
+        return { ok: true as const, locked: 0n, needed: 0n };
+      },
+      async releaseReservation() {
+        return true;
+      },
+    } as UserChatBridgeDeps["preCheckRedis"],
+    pricing: {
+      get() { return null; },
+    } as unknown as UserChatBridgeDeps["pricing"],
+  };
+}
+
+async function waitHelloForwarded(
+  rig: TestRig,
+  helloFrame: string,
+  timeoutMs = 1000,
+): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const t0 = Date.now();
+    const poll = () => {
+      const seen = rig.containerSeen.some((m) => {
+        const s = typeof m.data === "string" ? m.data : m.data.toString("utf8");
+        return s === helloFrame;
+      });
+      if (seen) return resolve();
+      if (Date.now() - t0 > timeoutMs) return reject(new Error("hello 未转发到容器"));
+      setTimeout(poll, 20);
+    };
+    poll();
+  });
+}
+
+describe("userChatBridge — hello terminal dispatch fallback", () => {
+  async function openHelloRig(opts: {
+    uid: string;
+    containerId: number;
+    row?: Record<string, unknown> | null;
+    lookups?: unknown[][];
+    beforeTurnDispatchLookup?: () => Promise<void>;
+  }): Promise<{
+    rig: TestRig;
+    ws: WebSocket;
+    lookups: unknown[][];
+  }> {
+    const lookups = opts.lookups ?? [];
+    const trio = helloTerminalBillingTrio({
+      row: opts.row,
+      lookups,
+      beforeTurnDispatchLookup: opts.beforeTurnDispatchLookup,
+    });
+    const portRef = { p: 0 };
+    const rig = await startRig({
+      resolve: async () => ({
+        host: "127.0.0.1", port: portRef.p, containerId: opts.containerId,
+      }),
+      ...trio,
+    });
+    portRef.p = rig.containerPort;
+    const containerOpen = waitNextContainerSocket(rig);
+    const token = await makeJwt(opts.uid);
+    const ws = openClient(rig.gatewayPort, token);
+    await new Promise<void>((r) => ws.once("open", () => r()));
+    await containerOpen;
+    return { rig, ws, lookups };
+  }
+
+  test("hello + inFlight + terminal/completed → 本条 userWs 收到 turn_completed", async () => {
+    const uid = "801";
+    const peerId = "peerCompleted";
+    const clientMessageId = "cm-completed";
+    const { rig, ws } = await openHelloRig({
+      uid,
+      containerId: 801,
+      row: rawDispatchRow({
+        userId: uid,
+        sessionId: peerId,
+        clientMessageId,
+        status: "terminal",
+        outcome: "completed",
+      }),
+    });
+    try {
+      const fc = frameCollector(ws);
+      const helloFrame = JSON.stringify({
+        type: "inbound.hello",
+        peers: [{
+          peerId,
+          agentId: "main",
+          lastFrameSeq: 0,
+          inFlight: true,
+          inFlightClientMessageId: clientMessageId,
+        }],
+      });
+      ws.send(helloFrame);
+      await waitHelloForwarded(rig, helloFrame);
+      const frame = await nextBusinessFrame(fc);
+      assert.equal(frame.type, "outbound.message");
+      assert.equal(frame.isFinal, true);
+      assert.equal((frame.meta as { reconcile?: unknown })?.reconcile, "turn_completed");
+      assert.equal(frame.clientMessageId, clientMessageId);
+      assert.equal((frame.meta as { clientMessageId?: unknown })?.clientMessageId, clientMessageId);
+      assert.deepEqual(frame.peer, { id: peerId, kind: "dm" });
+      assert.deepEqual(frame.blocks, []);
+      assert.equal(frame.channel, "webchat");
+    } finally {
+      ws.close();
+      await waitClose(ws);
+      await stopRig(rig);
+    }
+  });
+
+  test("hello + inFlight + terminal/interrupted → meta.reconcile==='interrupted'", async () => {
+    const uid = "802";
+    const peerId = "peerInterrupted";
+    const clientMessageId = "cm-interrupted";
+    const { rig, ws } = await openHelloRig({
+      uid,
+      containerId: 802,
+      row: rawDispatchRow({
+        userId: uid,
+        sessionId: peerId,
+        clientMessageId,
+        status: "terminal",
+        outcome: "interrupted",
+      }),
+    });
+    try {
+      const fc = frameCollector(ws);
+      const helloFrame = JSON.stringify({
+        type: "inbound.hello",
+        peers: [{
+          peerId,
+          agentId: "main",
+          lastFrameSeq: 0,
+          inFlight: true,
+          inFlightClientMessageId: clientMessageId,
+        }],
+      });
+      ws.send(helloFrame);
+      await waitHelloForwarded(rig, helloFrame);
+      const frame = await nextBusinessFrame(fc);
+      assert.equal(frame.isFinal, true);
+      assert.equal((frame.meta as { reconcile?: unknown })?.reconcile, "interrupted");
+      assert.equal(frame.clientMessageId, clientMessageId);
+    } finally {
+      ws.close();
+      await waitClose(ws);
+      await stopRig(rig);
+    }
+  });
+
+  test("hello + inFlight + terminal/executed_error → 不发补帧", async () => {
+    const uid = "803";
+    const peerId = "peerExecErr";
+    const clientMessageId = "cm-exec-error";
+    const { rig, ws } = await openHelloRig({
+      uid,
+      containerId: 803,
+      row: rawDispatchRow({
+        userId: uid,
+        sessionId: peerId,
+        clientMessageId,
+        status: "terminal",
+        outcome: "executed_error",
+      }),
+    });
+    try {
+      const fc = frameCollector(ws);
+      const helloFrame = JSON.stringify({
+        type: "inbound.hello",
+        peers: [{
+          peerId,
+          agentId: "main",
+          lastFrameSeq: 0,
+          inFlight: true,
+          inFlightClientMessageId: clientMessageId,
+        }],
+      });
+      ws.send(helloFrame);
+      await waitHelloForwarded(rig, helloFrame);
+      const got = await Promise.race([
+        nextBusinessFrame(fc),
+        new Promise<null>((r) => setTimeout(() => r(null), 250)),
+      ]);
+      assert.equal(got, null, `executed_error 不得发补帧(收到 ${JSON.stringify(got)})`);
+    } finally {
+      ws.close();
+      await waitClose(ws);
+      await stopRig(rig);
+    }
+  });
+
+  test("hello + inFlight + 非 terminal(accepted) → 不发补帧", async () => {
+    const uid = "804";
+    const peerId = "peerAccepted";
+    const clientMessageId = "cm-accepted";
+    const { rig, ws } = await openHelloRig({
+      uid,
+      containerId: 804,
+      row: rawDispatchRow({
+        userId: uid,
+        sessionId: peerId,
+        clientMessageId,
+        status: "accepted",
+        outcome: null,
+      }),
+    });
+    try {
+      const fc = frameCollector(ws);
+      const helloFrame = JSON.stringify({
+        type: "inbound.hello",
+        peers: [{
+          peerId,
+          agentId: "main",
+          lastFrameSeq: 0,
+          inFlight: true,
+          inFlightClientMessageId: clientMessageId,
+        }],
+      });
+      ws.send(helloFrame);
+      await waitHelloForwarded(rig, helloFrame);
+      const got = await Promise.race([
+        nextBusinessFrame(fc),
+        new Promise<null>((r) => setTimeout(() => r(null), 250)),
+      ]);
+      assert.equal(got, null, `非 terminal 不得发补帧(收到 ${JSON.stringify(got)})`);
+    } finally {
+      ws.close();
+      await waitClose(ws);
+      await stopRig(rig);
+    }
+  });
+
+  test("hello 没有 inFlightClientMessageId → 不查 PG、不发帧", async () => {
+    const lookups: unknown[][] = [];
+    const uid = "805";
+    const { rig, ws } = await openHelloRig({
+      uid,
+      containerId: 805,
+      row: rawDispatchRow({
+        userId: uid,
+        sessionId: "peerNoInflight",
+        clientMessageId: "cm-should-not-lookup",
+        status: "terminal",
+        outcome: "completed",
+      }),
+      lookups,
+    });
+    try {
+      const fc = frameCollector(ws);
+      const helloFrame = JSON.stringify({
+        type: "inbound.hello",
+        peers: [{ peerId: "peerNoInflight", agentId: "main", lastFrameSeq: 0, inFlight: true }],
+      });
+      const lookupsBefore = lookups.length;
+      ws.send(helloFrame);
+      await waitHelloForwarded(rig, helloFrame);
+      const got = await Promise.race([
+        nextBusinessFrame(fc),
+        new Promise<null>((r) => setTimeout(() => r(null), 250)),
+      ]);
+      assert.equal(got, null, `无 inFlight 不得发补帧(收到 ${JSON.stringify(got)})`);
+      assert.equal(lookups.length, lookupsBefore, "无 inFlightClientMessageId 不得查 turn_dispatches");
+    } finally {
+      ws.close();
+      await waitClose(ws);
+      await stopRig(rig);
+    }
+  });
+
+  test("hello 仍照常转发给容器(补帧不得改变转发时机与内容)", async () => {
+    const uid = "806";
+    const peerId = "peerForward";
+    const clientMessageId = "cm-forward";
+    const { rig, ws } = await openHelloRig({
+      uid,
+      containerId: 806,
+      row: rawDispatchRow({
+        userId: uid,
+        sessionId: peerId,
+        clientMessageId,
+        status: "terminal",
+        outcome: "completed",
+      }),
+    });
+    try {
+      const helloFrame = JSON.stringify({
+        type: "inbound.hello",
+        peers: [{
+          peerId,
+          agentId: "main",
+          lastFrameSeq: 0,
+          inFlight: true,
+          inFlightClientMessageId: clientMessageId,
+          resumeActiveTurnCandidateMessageIds: ["m-queued", "m-running"],
+        }],
+      });
+      ws.send(helloFrame);
+      await waitHelloForwarded(rig, helloFrame);
+      const containerSawHello = rig.containerSeen.find((m) => {
+        const s = typeof m.data === "string" ? m.data : m.data.toString("utf8");
+        return s === helloFrame;
+      });
+      assert.ok(containerSawHello,
+        "hello 必须 byte-exact 透传到容器(container's autoResumeFromHello 要登记 containerWs)");
+    } finally {
+      ws.close();
+      await waitClose(ws);
+      await stopRig(rig);
+    }
+  });
+
+  test("hello 带 12 个互异候选 → PG 查询次数不超过 8", async () => {
+    const lookups: unknown[][] = [];
+    const uid = "807";
+    const { rig, ws } = await openHelloRig({
+      uid,
+      containerId: 807,
+      row: rawDispatchRow({
+        userId: uid,
+        sessionId: "peerCap0",
+        clientMessageId: "cm-cap-0",
+        status: "terminal",
+        outcome: "completed",
+      }),
+      lookups,
+    });
+    try {
+      const peers = Array.from({ length: 12 }, (_, i) => ({
+        peerId: `peerCap${i}`,
+        agentId: "main",
+        lastFrameSeq: 0,
+        inFlight: true,
+        inFlightClientMessageId: `cm-cap-${i}`,
+      }));
+      const helloFrame = JSON.stringify({ type: "inbound.hello", peers });
+      const lookupsBefore = lookups.length;
+      ws.send(helloFrame);
+      await waitHelloForwarded(rig, helloFrame);
+      const deadline = Date.now() + 1000;
+      while (lookups.length - lookupsBefore < 8 && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      await new Promise((r) => setTimeout(r, 80));
+      const queried = lookups.length - lookupsBefore;
+      assert.ok(queried <= 8, `超限候选不得再查 PG(实际 ${queried})`);
+      assert.equal(queried, 8, "12 个合法互异候选应查满上限 8");
+    } finally {
+      ws.close();
+      await waitClose(ws);
+      await stopRig(rig);
+    }
+  });
+
+  test("hello 带 5 个完全相同的 (peerId, clientMessageId) → 只查 1 次", async () => {
+    const lookups: unknown[][] = [];
+    const uid = "808";
+    const peerId = "peerDup";
+    const clientMessageId = "cm-dup";
+    const { rig, ws } = await openHelloRig({
+      uid,
+      containerId: 808,
+      row: rawDispatchRow({
+        userId: uid,
+        sessionId: peerId,
+        clientMessageId,
+        status: "terminal",
+        outcome: "completed",
+      }),
+      lookups,
+    });
+    try {
+      const peer = {
+        peerId,
+        agentId: "main",
+        lastFrameSeq: 0,
+        inFlight: true,
+        inFlightClientMessageId: clientMessageId,
+      };
+      const helloFrame = JSON.stringify({
+        type: "inbound.hello",
+        peers: [peer, peer, peer, peer, peer],
+      });
+      const lookupsBefore = lookups.length;
+      ws.send(helloFrame);
+      await waitHelloForwarded(rig, helloFrame);
+      const deadline = Date.now() + 1000;
+      while (lookups.length - lookupsBefore < 1 && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      await new Promise((r) => setTimeout(r, 80));
+      assert.equal(lookups.length - lookupsBefore, 1, "同一 (peer, id) 只应查一次");
+    } finally {
+      ws.close();
+      await waitClose(ws);
+      await stopRig(rig);
+    }
+  });
+
+  test("hello + 超长 clientMessageId(>200) → 不查 PG、不发帧", async () => {
+    const lookups: unknown[][] = [];
+    const uid = "809";
+    const peerId = "peerLongId";
+    const clientMessageId = "a".repeat(201);
+    const { rig, ws } = await openHelloRig({
+      uid,
+      containerId: 809,
+      row: rawDispatchRow({
+        userId: uid,
+        sessionId: peerId,
+        clientMessageId,
+        status: "terminal",
+        outcome: "completed",
+      }),
+      lookups,
+    });
+    try {
+      const fc = frameCollector(ws);
+      const helloFrame = JSON.stringify({
+        type: "inbound.hello",
+        peers: [{
+          peerId,
+          agentId: "main",
+          lastFrameSeq: 0,
+          inFlight: true,
+          inFlightClientMessageId: clientMessageId,
+        }],
+      });
+      const lookupsBefore = lookups.length;
+      ws.send(helloFrame);
+      await waitHelloForwarded(rig, helloFrame);
+      const got = await Promise.race([
+        nextBusinessFrame(fc),
+        new Promise<null>((r) => setTimeout(() => r(null), 250)),
+      ]);
+      assert.equal(got, null, `超长 id 不得发补帧(收到 ${JSON.stringify(got)})`);
+      assert.equal(lookups.length, lookupsBefore, "超长 clientMessageId 不得查 turn_dispatches");
+    } finally {
+      ws.close();
+      await waitClose(ws);
+      await stopRig(rig);
+    }
+  });
+
+  test("hello 发出后立刻 close → 断开后不再继续查询", async () => {
+    const lookups: unknown[][] = [];
+    const uid = "810";
+    let releaseLookup: () => void = () => {};
+    const lookupGate = new Promise<void>((r) => { releaseLookup = r; });
+    let firstEntered!: () => void;
+    const firstLookupEntered = new Promise<void>((r) => { firstEntered = r; });
+    const { rig, ws } = await openHelloRig({
+      uid,
+      containerId: 810,
+      row: rawDispatchRow({
+        userId: uid,
+        sessionId: "peerClose0",
+        clientMessageId: "cm-close-0",
+        status: "terminal",
+        outcome: "completed",
+      }),
+      lookups,
+      beforeTurnDispatchLookup: async () => {
+        firstEntered();
+        await lookupGate;
+      },
+    });
+    try {
+      const fc = frameCollector(ws);
+      const peers = [0, 1, 2].map((i) => ({
+        peerId: `peerClose${i}`,
+        agentId: "main",
+        lastFrameSeq: 0,
+        inFlight: true,
+        inFlightClientMessageId: `cm-close-${i}`,
+      }));
+      const helloFrame = JSON.stringify({ type: "inbound.hello", peers });
+      ws.send(helloFrame);
+      await waitHelloForwarded(rig, helloFrame);
+      await Promise.race([
+        firstLookupEntered,
+        new Promise((_, reject) => setTimeout(() => reject(new Error("未进入 PG 查询门闩")), 1000)),
+      ]);
+      ws.close();
+      await waitClose(ws);
+      releaseLookup();
+      await new Promise((r) => setTimeout(r, 150));
+      assert.equal(lookups.length, 1, "断开后不得继续查后续候选");
+      const got = await Promise.race([
+        nextBusinessFrame(fc),
+        new Promise<null>((r) => setTimeout(() => r(null), 150)),
+      ]);
+      assert.equal(got, null, `断开后不得发补帧(收到 ${JSON.stringify(got)})`);
+    } finally {
+      releaseLookup();
       await stopRig(rig);
     }
   });
