@@ -118,6 +118,9 @@ describe("0227 pre-cutover migration", () => {
     assert.match(sql, /zcode-experimental/);
     assert.match(sql, /1000000/);
     assert.match(sql, /zcode-glm53-cutover/);
+    assert.match(sql, /INSERT INTO model_catalog[\s\S]*staged/);
+    assert.doesNotMatch(sql, /INSERT INTO model_catalog[\s\S]*disabled/i);
+    assert.match(sql, /INSERT INTO model_pricing[\s\S]*FALSE[\s\S]*hidden/);
     assert.doesNotMatch(sql, /UPDATE\s+model_catalog[\s\S]*glm-5\.3-zai/i);
     assert.doesNotMatch(sql, /engine\s*=\s*'zcode'[\s\S]*glm-5\.3-zai/);
   });

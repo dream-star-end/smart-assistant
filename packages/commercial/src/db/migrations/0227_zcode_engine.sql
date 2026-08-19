@@ -2,7 +2,9 @@
 -- NOT an official standalone CLI. The real Coding Plan key never enters
 -- catalog tables, user containers, or yolo-inheritable env.
 -- This migration only expands the engine CHECK, creates the canary audit
--- table, and inserts hidden disabled zcode-experimental.
+-- table, and inserts hidden staged zcode-experimental (fn_model_catalog_guard
+-- requires new catalog rows to be born staged; pricing stays enabled=false
+-- visibility=hidden so the canary is not publicly routable).
 -- Do NOT switch public glm-5.3-zai here. Post-deploy cutover is the audited
 -- admin path POST /api/admin/model-catalog/zcode-glm53-cutover.
 DO $$ DECLARE c RECORD; BEGIN
@@ -24,7 +26,7 @@ INSERT INTO model_catalog(
   1000000,
   '{"supports_vision":false,"reasoning":{"supported":[],"codex_model_default":null},"ccb":{"capability_zero":false,"supports_thinking":false}}'::jsonb,
   1,
-  'disabled'
+  'staged'
 );
 
 INSERT INTO model_pricing(
