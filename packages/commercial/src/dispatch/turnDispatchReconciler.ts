@@ -27,6 +27,9 @@ import {
 import { advanceClientTimelineIdentityInTransaction } from '../db/pgSessionsBackend.js'
 import type { ContainerCallResult, DispatchIdentity } from './containerDispatchClient.js'
 import {
+  classifyVisibleOrphan,
+} from './visibleOrphan.js'
+import {
   casAdmittedToRejecting,
   casRejectingToAccepted,
   casToManualReconcile,
@@ -181,7 +184,12 @@ export interface TurnDispatchReconcilerDeps {
    * 让前端立即拉回 turn_dispatches 状态,不必等下次 hello/sync。published≠delivered
    * 是现实:失败/离线一律无害吞掉(状态已持久,下次进会话/sync 必达)。
    */
-  nudgeClient?: (uid: bigint, sessionId: string, clientMessageId: string) => void
+  nudgeClient?: (
+    uid: bigint,
+    sessionId: string,
+    clientMessageId: string,
+    reconcile?: 'turn_completed' | 'interrupted' | 'turn_state_unknown',
+  ) => void
   stuckThresholdMs?: number
   rejectMinAgeMs?: number
   limit?: number
@@ -212,6 +220,8 @@ export interface ReconcileTickCounts {
   alerts: number
   /** ⓪ 会话墓碑/行亡 → 自动结案(manual_reconcile(session_deleted)+ 机器 resolution)。 */
   sessionGoneClosed: number
+  /** rev2 closeVisibleOrphans: visible fallback / interrupt / fence. */
+  visibleOrphans: number
 }
 
 /**
@@ -233,6 +243,7 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
     notified: 0,
     alerts: 0,
     sessionGoneClosed: 0,
+    visibleOrphans: 0,
   }
 
   // ── ⓪ open ∧ 租约过期 ∧ 会话墓碑/行亡 → 自动结案(session_deleted)────────
@@ -404,6 +415,9 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
     // running/queued/recovery_pending → 继续等,不动。
   }
 
+  // ── closeVisibleOrphans (rev2 B4): tapeless fallback + fence + late tape ──
+  counts.visibleOrphans = await closeVisibleOrphans(deps, now(), limit)
+
   // ── open>7d 只读告警(永不 GC)─────────────────────────────────────────────
   const openAged = await scanOpenAged(deps.pool, { ageMs: DISPATCH_OPEN_ALERT_AGE_MS, limit, now: now() })
   for (const row of openAged) {
@@ -412,6 +426,119 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
   }
 
   return counts
+}
+
+
+async function closeVisibleOrphans(
+  deps: TurnDispatchReconcilerDeps,
+  nowMs: number,
+  limit: number,
+): Promise<number> {
+  const rows = await deps.pool.query<{
+    dispatch_id: string
+    user_id: string
+    session_id: string
+    client_message_id: string
+    status: string
+    admitted_at: Date
+    accepted_at: Date | null
+    tape_visible_at: string | null
+    tape_part_count: number | null
+    tape_id: string | null
+    tape_parts_rows: string
+    last_frame_at: Date | null
+    container_running: boolean
+  }>(
+    `SELECT -- closeVisibleOrphans
+            d.dispatch_id, d.user_id::text AS user_id, d.session_id, d.client_message_id,
+            d.status, d.admitted_at, d.accepted_at,
+            t.visible_at::text AS tape_visible_at,
+            t.part_count AS tape_part_count,
+            t.tape_id,
+            COALESCE((
+              SELECT count(*)::text FROM client_session_turn_tape_parts p
+               WHERE t.tape_id IS NOT NULL
+                 AND p.session_id = t.session_id
+                 AND p.user_id = t.user_id
+                 AND p.tape_id = t.tape_id
+            ), '0') AS tape_parts_rows,
+            (
+              SELECT MAX(f.created_at)
+                FROM client_session_live_streams s
+                JOIN client_session_live_frames f ON f.stream_key = s.stream_key
+               WHERE s.dispatch_id = d.dispatch_id
+            ) AS last_frame_at,
+            EXISTS (
+              SELECT 1 FROM agent_containers ac
+               WHERE ac.user_id = d.user_id AND ac.state = 'active'
+            ) AS container_running
+       FROM turn_dispatches d
+       LEFT JOIN client_session_turn_tapes t ON t.dispatch_id = d.dispatch_id
+      WHERE d.status IN ('admitted','accepted')
+        AND d.visible_at IS NULL
+        AND t.visible_at IS NULL
+      ORDER BY d.admitted_at
+      LIMIT $1`,
+    [limit],
+  )
+  let closed = 0
+  for (const row of rows.rows) {
+    const action = classifyVisibleOrphan({
+      tapeVisibleAt: row.tape_visible_at === null ? null : Number(row.tape_visible_at),
+      tapePartCount: row.tape_part_count,
+      tapePartsRows: Number(row.tape_parts_rows ?? '0'),
+      lastFrameAtMs: row.last_frame_at ? row.last_frame_at.getTime() : null,
+      acceptedOrAdmittedAtMs: (row.accepted_at ?? row.admitted_at).getTime(),
+      containerRunning: row.container_running === true,
+      nowMs,
+    })
+    if (action === 'skip' || action === 'converge_only') continue
+    const outcome = action === 'complete_from_frames' ? 'completed' : 'interrupted'
+    if (action === 'fence_hard_cap') {
+      await deps.pool.query(
+        `UPDATE turn_dispatches SET producer_fenced_at=COALESCE(producer_fenced_at, NOW())
+          WHERE dispatch_id=$1::uuid AND producer_fenced_at IS NULL`,
+        [row.dispatch_id],
+      )
+    }
+    const text = action === 'complete_from_frames'
+      ? 'turn completed (visible fallback)'
+      : 'turn interrupted (visible fallback)'
+    await deps.pool.query(
+      `UPDATE turn_dispatches
+          SET visible_head=$2::jsonb, visible_at=$3
+        WHERE dispatch_id=$1::uuid AND visible_at IS NULL`,
+      [
+        row.dispatch_id,
+        JSON.stringify({
+          role: 'assistant',
+          text,
+          ts: nowMs,
+          messageId: `visible-fallback:${row.dispatch_id}`,
+          clientMessageId: row.client_message_id,
+        }),
+        nowMs,
+      ],
+    )
+    const terminal = await casToTerminal(deps.pool, {
+      dispatchId: row.dispatch_id,
+      outcome,
+      fromStatuses: ['admitted', 'accepted', 'rejecting'],
+    })
+    if (!terminal) continue
+    closed++
+    try {
+      deps.nudgeClient?.(
+        BigInt(row.user_id),
+        row.session_id,
+        row.client_message_id,
+        outcome === 'completed' ? 'turn_completed' : 'interrupted',
+      )
+    } catch {
+      /* best-effort */
+    }
+  }
+  return closed
 }
 
 /** A verified user-visible status is a new durable timeline identity attached
@@ -858,6 +985,7 @@ export function startTurnDispatchReconciler(
     notified: 0,
     alerts: 0,
     sessionGoneClosed: 0,
+    visibleOrphans: 0,
   }
 
   async function runOneTick(): Promise<ReconcileTickCounts> {
