@@ -4137,7 +4137,7 @@ describe("ChatSocket interrupted continuation", () => {
       sessId,
       async (after) => {
         initialAfter.push(after);
-        return after === "0" || after === "tail"
+        return after === "0"
           ? {
               frames: [record("1", 1, [{ kind: "thinking", text: "visible thought" }])],
               nextCursor: "1",
@@ -4155,7 +4155,7 @@ describe("ChatSocket interrupted continuation", () => {
       },
       async () => {},
     );
-    expect(initialAfter).toEqual(["tail", "1"]);
+    expect(initialAfter).toEqual(["0", "1"]);
     expect(session.messages.find((message) => message.id === "stale-before-cursor")).toBeUndefined();
 
     const incrementalAfter: string[] = [];
@@ -4246,7 +4246,7 @@ describe("ChatSocket interrupted continuation", () => {
       sessId,
       async (after) => {
         requests.push(after);
-        return after === "0" || after === "tail"
+        return after === "0"
           ? {
               frames: [
                 record("1", oldStream, oldClientMessageId, 998, [{
@@ -4276,7 +4276,7 @@ describe("ChatSocket interrupted continuation", () => {
       async () => {},
     );
 
-    expect(requests).toEqual(["tail", "4"]);
+    expect(requests).toEqual(["0", "4"]);
     expect(session._lastFrameSeqByKey?.[sessionKey]).toBe(2);
     expect(session.messages.some((message) =>
       message.role === "thinking" && message.text === "OLD_GENERATION_PROCESS"
@@ -4489,7 +4489,7 @@ describe("ChatSocket interrupted continuation", () => {
       sessId,
       async (after) => {
         retryAfter.push(after);
-        return after === "0" || after === "tail"
+        return after === "0"
           ? {
               frames: [record("1", 1, "first exact delta")], nextCursor: "1", hasMore: true,
               streamClientMessageIds: [clientMessageId], hasTapeProjection: false,
@@ -4615,7 +4615,7 @@ describe("ChatSocket interrupted continuation", () => {
       await sock.hydrateDurableLiveFrameJournal(
         sessId,
         async (after) => ({
-          frames: after === "0" || after === "tail"
+          frames: after === "0"
             ? [{
                 recordId: "1",
                 streamKey: "dispatch:77777777-7777-4777-8777-777777777777:1",
@@ -4633,7 +4633,7 @@ describe("ChatSocket interrupted continuation", () => {
                 },
               }]
             : [],
-          nextCursor: after === "0" || after === "tail" ? "1" : null,
+          nextCursor: after === "0" ? "1" : null,
           hasMore: false,
           streamClientMessageIds: [],
           hasTapeProjection: true,

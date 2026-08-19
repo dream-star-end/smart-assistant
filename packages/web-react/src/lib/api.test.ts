@@ -1149,7 +1149,28 @@ test('getSessionLiveFrames passes an AbortSignal and honors timeoutMs', async ()
   )
 })
 
-test('getSessionLiveFrames first shot seeks the tail page', async () => {
+test('getSessionLiveFrames first shot pages forward from after=0', async () => {
+  const fetchMock = vi.fn(async () =>
+    ok({
+      frames: [],
+      nextCursor: null,
+      hasMore: false,
+      hasMoreBefore: false,
+      streamClientMessageIds: [],
+      hasTapeProjection: false,
+    }),
+  )
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+  const { session } = makeSession('tok-live-frames-first')
+  await api.getSessionLiveFrames(session, 'web-session-1')
+  expect(String(fetchMock.mock.calls[0]?.[0])).toBe(
+    '/api/sessions/web-session-1/live-frames?after=0&limit=200',
+  )
+  expect(String(fetchMock.mock.calls[0]?.[0])).not.toContain('seek=tail')
+  expect(String(fetchMock.mock.calls[0]?.[0])).not.toContain('after=tail')
+})
+
+test('getSessionLiveFrames explicit after=tail still maps to seek=tail', async () => {
   const fetchMock = vi.fn(async () =>
     ok({
       frames: [],

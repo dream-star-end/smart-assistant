@@ -31,11 +31,8 @@ export interface ClientSessionLiveFramePage {
   tapeProjectionVersion: number;
 }
 
-/** First-open / oversized current-dispatch fallback: return the last page. */
-export const LIVE_FRAME_HOT_TAIL_COUNT = 200;
-export const LIVE_FRAME_HOT_TAIL_BYTES = 256 * 1024;
-
 export type ReadClientSessionLiveFramesOptions = {
+  /** Opt-in last-page read. after=0 still pages forward unless this is set. */
   seekTail?: boolean;
 };
 
@@ -341,27 +338,9 @@ export async function readClientSessionLiveFrames(
     // taped old live journals. Only the current accepted/admitted/rejecting
     // dispatch's dispatch:<id>:% stream. No in-flight dispatch → empty page;
     // the browser already has history from GET /api/sessions tape.
-    const stats = (
-      await client.query<{ n: string; bytes: string }>(
-        `SELECT COUNT(*)::text AS n,
-                COALESCE(SUM(octet_length(fr.payload)),0)::text AS bytes
-           FROM client_session_live_streams s
-           JOIN client_session_live_frames fr ON fr.stream_key=s.stream_key
-          WHERE s.user_id=$2 AND s.session_id=$1
-            AND ${OPEN_DISPATCH_STREAM_SQL}`,
-        [sessionId, userId],
-      )
-    ).rows[0];
-    const hotCount = Number.parseInt(stats?.n ?? "0", 10) || 0;
-    const hotBytes = Number.parseInt(stats?.bytes ?? "0", 10) || 0;
-    const seekTail = wantTail
-      || (
-        cursor === 0
-        && (
-          hotCount > LIVE_FRAME_HOT_TAIL_COUNT
-          || hotBytes > LIVE_FRAME_HOT_TAIL_BYTES
-        )
-      );
+    // after=0 pages that dispatch forward from the stream head. seekTail is
+    // opt-in only; a raw tail page is not a renderable snapshot.
+    const seekTail = wantTail;
 
     const rows = (
       await client.query<{

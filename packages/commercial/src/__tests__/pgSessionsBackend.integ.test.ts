@@ -5075,7 +5075,7 @@ describe("durable live turn frame journal", () => {
     assert.equal(leftoverRows.rowCount, 1, "leftover frames stay in the table");
   });
 
-  maybe("seek=tail and oversized after=0 live-frames return only the last page with hasMoreBefore", async () => {
+  maybe("seek=tail returns last page; oversized after=0 pages forward from the head", async () => {
     const userId = "c:943";
     const sessionId = "s-live-frames-tail-hasMoreBefore";
     const dispatchId = randomUUID();
@@ -5142,12 +5142,12 @@ describe("durable live turn frame journal", () => {
     );
     const oversized = await readClientSessionLiveFrames(pool, sessionId, userId, 0, 10);
     assert.ok(oversized);
-    assert.equal(oversized.frames.length, 10, "after=0 on a large current dispatch seeks the tail");
-    assert.equal(oversized.hasMore, false);
-    assert.equal(oversized.hasMoreBefore, true);
+    assert.equal(oversized.frames.length, 10, "after=0 on a large current dispatch pages from the head");
+    assert.equal(oversized.hasMore, true);
+    assert.equal(oversized.hasMoreBefore, false);
     assert.deepEqual(
       oversized.frames.map((frame) => (frame.payload as { blocks: Array<{ text: string }> }).blocks[0]!.text),
-      Array.from({ length: 10 }, (_, i) => `token-${201 + i}`),
+      Array.from({ length: 10 }, (_, i) => `token-${1 + i}`),
     );
   });
 

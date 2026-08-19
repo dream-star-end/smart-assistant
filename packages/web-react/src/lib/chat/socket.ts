@@ -161,8 +161,9 @@ export const EMPTY_JOURNAL_POLL_DELAYS_MS = [1000, 2000, 5000, 10_000] as const;
  * 30s wall clock covers a slow first page without silent infinite paging. */
 export const LIVE_JOURNAL_MAX_PAGES = 24;
 export const LIVE_JOURNAL_MAX_MS = 30_000;
-/** First hydrate request seeks the current dispatch tail, not after=0. */
-export const LIVE_JOURNAL_OPEN_CURSOR = "tail";
+/** First-screen hydrate pages the current dispatch forward from after=0.
+ * Do not seek tail: a raw tail page is not a renderable snapshot. */
+export const LIVE_JOURNAL_OPEN_CURSOR = "0";
 
 export type LiveJournalObservation = {
   frameCount: number;
