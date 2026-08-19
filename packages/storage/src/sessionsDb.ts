@@ -4336,6 +4336,8 @@ export interface ClientSessionLiveFramePage {
   }>
   nextCursor: string | null
   hasMore: boolean
+  /** Earlier frames exist on the current open dispatch (tail/seek page). */
+  hasMoreBefore: boolean
   streamClientMessageIds: string[]
   hasTapeProjection: boolean
   /** Monotonic count of tape-projected streams in this read's snapshot; lets
@@ -4496,13 +4498,14 @@ async function _sqliteReadClientSessionLiveFrames(
   userId: string,
   _afterRecordId = 0,
   _limit = 200,
+  _options?: { seekTail?: boolean },
 ): Promise<ClientSessionLiveFramePage | null> {
   const db = await getSessionsDb()
   const row = db.prepare(
     'SELECT 1 FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL',
   ).get(sessId, userId)
   return row
-    ? { frames: [], nextCursor: null, hasMore: false, streamClientMessageIds: [], hasTapeProjection: false, tapeProjectionVersion: 0 }
+    ? { frames: [], nextCursor: null, hasMore: false, hasMoreBefore: false, streamClientMessageIds: [], hasTapeProjection: false, tapeProjectionVersion: 0 }
     : null
 }
 

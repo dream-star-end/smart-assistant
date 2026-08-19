@@ -356,3 +356,54 @@ describe('资源闸有界排队 — 语义边界', () => {
     assert.ok(reads > 2)
   })
 })
+
+
+
+// ── leftover live journal 根治: emitProgress 盖父轮 cmid ────────────────────
+
+describe('emitProgress stamps parent webchat clientMessageId', () => {
+  it('出站进度帧带父轮 _runningClientMessageId', async () => {
+    const gw = makeGateway()
+    const parent = gw.sessions.getByKey(PARENT_KEY)
+    parent._runningClientMessageId = 'parent-cmid-running'
+    const r = await delegate(gw, 'coding-assistant', taskBody({ streamProgress: true }))
+    assert.equal(r.status, 200)
+    const outs = gw.delivered.filter((o: any) =>
+      (o.blocks || []).some((b: any) => b?.kind === 'delegate_progress'),
+    )
+    assert.ok(outs.length > 0, '必须发出 delegate_progress 出站帧')
+    for (const out of outs) {
+      assert.equal(out.clientMessageId, 'parent-cmid-running')
+    }
+  })
+
+  it('无 _runningClientMessageId 时回退 _currentDispatch.clientMessageId', async () => {
+    const gw = makeGateway()
+    const parent = gw.sessions.getByKey(PARENT_KEY)
+    parent._currentDispatch = { clientMessageId: 'parent-cmid-dispatch' }
+    const r = await delegate(gw, 'coding-assistant', taskBody({ streamProgress: true }))
+    assert.equal(r.status, 200)
+    const outs = gw.delivered.filter((o: any) =>
+      (o.blocks || []).some((b: any) => b?.kind === 'delegate_progress'),
+    )
+    assert.ok(outs.length > 0)
+    for (const out of outs) {
+      assert.equal(out.clientMessageId, 'parent-cmid-dispatch')
+    }
+  })
+
+  it('非法 cmid 不写入 clientMessageId', async () => {
+    const gw = makeGateway()
+    const parent = gw.sessions.getByKey(PARENT_KEY)
+    parent._runningClientMessageId = 'cm:user:large'
+    const r = await delegate(gw, 'coding-assistant', taskBody({ streamProgress: true }))
+    assert.equal(r.status, 200)
+    const outs = gw.delivered.filter((o: any) =>
+      (o.blocks || []).some((b: any) => b?.kind === 'delegate_progress'),
+    )
+    assert.ok(outs.length > 0)
+    for (const out of outs) {
+      assert.equal(out.clientMessageId, undefined)
+    }
+  })
+})

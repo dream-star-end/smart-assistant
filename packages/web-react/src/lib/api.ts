@@ -1691,7 +1691,16 @@ export const api = {
     limit = 200,
     opts?: { signal?: AbortSignal; timeoutMs?: number },
   ): Promise<DurableLiveFramePage> => {
-    const params = new URLSearchParams({ after, limit: String(limit) });
+    const params = new URLSearchParams();
+    // First shot uses after=0 (LIVE_JOURNAL_OPEN_CURSOR). seek=tail is
+    // opt-in only — do not send it as the open-session default.
+    if (after === "tail") {
+      params.set("seek", "tail");
+      params.set("limit", String(limit));
+    } else {
+      params.set("after", after);
+      params.set("limit", String(limit));
+    }
     const timeoutMs = opts?.timeoutMs ?? LIVE_FRAMES_REQUEST_TIMEOUT_MS;
     const controller = new AbortController();
     const timeout = setTimeout(
