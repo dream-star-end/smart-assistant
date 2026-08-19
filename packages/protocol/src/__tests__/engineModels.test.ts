@@ -97,12 +97,15 @@ describe('Cursor engine model authority', () => {
 })
 
 describe('ZCode experimental engine model authority', () => {
-  test('keeps canonical id separate from the 0.15.0 config upstream id', () => {
+  test('keeps canonical id separate from the 0.16.3 config upstream id', () => {
     assert.deepEqual(ZCODE_ENGINE_MODEL_IDS, ['zcode-experimental'])
     assert.equal(isZcodeEngineModel('zcode-experimental'), true)
     assert.equal(isZcodeEngineModel('zai/glm-5.1'), false)
+    assert.equal(isZcodeEngineModel('zai-coding-plan/glm-5.3'), false)
     assert.equal(isZcodeEngineModel('glm-5.3-zai'), false)
-    assert.equal(zcodeTransportModelId('zcode-experimental'), 'zai/glm-5.1')
+    assert.equal(zcodeTransportModelId('zcode-experimental'), 'zai-coding-plan/glm-5.3')
+    assert.equal(zcodeTransportModelId('glm-5.3-zai'), 'zai-coding-plan/glm-5.3')
+    assert.equal(zcodeTransportModelId('zai-coding-plan/glm-5.3'), undefined)
     assert.equal(ZCODE_HOSTED_PERMISSION_MODE, 'yolo')
     assert.equal(modelReasoningPolicy('zcode-experimental').supported.length, 0)
   })

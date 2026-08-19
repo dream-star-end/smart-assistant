@@ -52,6 +52,7 @@ import { createEngine, resolveEngine } from './engine/registry.js'
 import { isEngineLocalTurnExempt, isModelAuthorityRequired } from './modelAuthority.js'
 import type { CodexProviderConfigOverride } from './engine/codexShared.js'
 import type { GrokRouteOverride } from './engine/grokAdapter.js'
+import type { ZcodeRouteOverride } from './engine/zcodeAdapter.js'
 import { eventBus, createEvent } from './eventBus.js'
 import { createLogger } from './logger.js'
 import {
@@ -3324,6 +3325,8 @@ export class SessionManager {
       codexRoute?: CodexProviderConfigOverride | null
       /** Grok CLI receives only this one-turn opaque loopback relay route. */
       grokRoute?: GrokRouteOverride | null
+      /** ZCode CLI receives only this one-turn opaque loopback Anthropic relay. */
+      zcodeRoute?: ZcodeRouteOverride | null
       /** Master-authored platform goal snapshot for this exact turn. null
        * explicitly clears stale engine state; omission is for legacy callers. */
       platformGoal?: GoalStateSnapshot | null
@@ -3517,6 +3520,10 @@ export class SessionManager {
       const maybeSetGrokRoute = (session.runner as any).setGrokRoute
       if (typeof maybeSetGrokRoute === 'function') {
         maybeSetGrokRoute.call(session.runner, opts?.grokRoute ?? null)
+      }
+      const maybeSetZcodeRoute = (session.runner as any).setZcodeRoute
+      if (typeof maybeSetZcodeRoute === 'function') {
+        maybeSetZcodeRoute.call(session.runner, opts?.zcodeRoute ?? null)
       }
       // effort + model 应用都必须在本 turn 真正启动**之前**完成,且必须在 prev 之后:
       //   - prev 之前:可能中断别人的 in-flight turn

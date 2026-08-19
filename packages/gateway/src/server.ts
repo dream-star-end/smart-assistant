@@ -332,6 +332,11 @@ import {
   V5_GROK_RELAY_PREFIX,
 } from './v5GrokRelay.js'
 import {
+  handleV5ZcodeRelayLocal,
+  readV5ZcodeRelayConfig,
+  V5_ZCODE_RELAY_PREFIX,
+} from './v5ZcodeRelay.js'
+import {
   handleV3MarketplaceRelayLocal,
   readV3MarketplaceRelayConfig,
   V3_MARKETPLACE_LOCAL_RELAY_PREFIX,
@@ -1195,6 +1200,46 @@ export function _buildSafeGrokRouteOverride(args: {
   try {
     const parsed = new URL(route.baseUrl)
     const expectedPath = `${V5_GROK_RELAY_PREFIX}/route/${route.routeToken}/v1`
+    if (
+      parsed.protocol !== 'http:' ||
+      parsed.hostname !== '127.0.0.1' ||
+      Number(parsed.port || '80') !== args.officialRelayPort ||
+      parsed.pathname !== expectedPath ||
+      parsed.search ||
+      parsed.hash
+    ) return null
+  } catch {
+    return null
+  }
+  return { baseUrl: route.baseUrl, routeToken: route.routeToken }
+}
+
+/** Validate the master-owned opaque route consumed by the ZCode adapter.
+ * Anthropic SDK appends /v1 itself, so the minted baseUrl must NOT include /v1.
+ */
+export function _buildSafeZcodeRouteOverride(args: {
+  agent: { id: string; provider?: string; runnerKind?: string }
+  model?: string
+  rawRoute: unknown
+  officialRelayPort: number
+  authority?: { canonicalModel: string; engine: 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode' }
+}): { baseUrl: string; routeToken: string } | null {
+  if (!args.rawRoute || typeof args.rawRoute !== 'object' || Array.isArray(args.rawRoute)) return null
+  let engineId: string
+  try {
+    engineId = resolveEngine(args.model, args.agent as never, args.authority)
+  } catch {
+    return null
+  }
+  if (engineId !== 'zcode') return null
+  const route = args.rawRoute as Record<string, unknown>
+  if (Object.keys(route).sort().join(',') !== 'baseUrl,routeToken') return null
+  if (typeof route.routeToken !== 'string' || !/^[0-9a-f]{64}$/.test(route.routeToken)) return null
+  if (typeof route.baseUrl !== 'string' || route.baseUrl.length > 512) return null
+  if (!Number.isInteger(args.officialRelayPort) || args.officialRelayPort <= 0 || args.officialRelayPort > 65535) return null
+  try {
+    const parsed = new URL(route.baseUrl)
+    const expectedPath = `${V5_ZCODE_RELAY_PREFIX}/route/${route.routeToken}`
     if (
       parsed.protocol !== 'http:' ||
       parsed.hostname !== '127.0.0.1' ||
@@ -3463,6 +3508,23 @@ export class Gateway {
         this.log.error('v5 grok local relay crashed', undefined, err)
         if (!res.headersSent) {
           try { this.sendJson(res, 500, { error: { code: 'INTERNAL', message: 'grok relay crashed' } }) } catch {}
+        } else {
+          try { res.end() } catch {}
+        }
+      })
+      return
+    }
+
+    if (url.pathname === V5_ZCODE_RELAY_PREFIX || url.pathname.startsWith(`${V5_ZCODE_RELAY_PREFIX}/`)) {
+      const relayCfg = readV5ZcodeRelayConfig(process.env)
+      if (!relayCfg) {
+        this.sendJson(res, 404, { error: { code: 'ZCODE_RELAY_NOT_CONFIGURED', message: 'zcode relay not configured' } })
+        return
+      }
+      handleV5ZcodeRelayLocal(req, res, relayCfg).catch((err) => {
+        this.log.error('v5 zcode local relay crashed', undefined, err)
+        if (!res.headersSent) {
+          try { this.sendJson(res, 500, { error: { code: 'INTERNAL', message: 'zcode relay crashed' } }) } catch {}
         } else {
           try { res.end() } catch {}
         }
@@ -14788,6 +14850,20 @@ export class Gateway {
           }
         : {}),
     })
+    const safeZcodeRoute = _buildSafeZcodeRouteOverride({
+      agent,
+      model: safeModelForRouting,
+      rawRoute: (frame as any).__oc_zcode_route,
+      officialRelayPort: this.deps.config.gateway.port,
+      ...(turnAuthority !== undefined
+        ? {
+            authority: {
+              canonicalModel: turnAuthority.canonicalModel,
+              engine: turnAuthority.engine,
+            },
+          }
+        : {}),
+    })
 
     const baseToolsets = agent.toolsets ?? this.deps.config.defaults.toolsets
     let effectiveToolsets = mergeOnDemandToolsets(
@@ -16124,6 +16200,7 @@ export class Gateway {
       historicalMessages: masterHistoricalMessages,
       codexRoute: safeCodexRoute,
       grokRoute: safeGrokRoute,
+      zcodeRoute: safeZcodeRoute,
       ...(automaticRetryState ? { automaticRetryState } : {}),
       // DispatchTurnContext(uid/…)→ sessionManager 逻辑键形状(userId/…)。
       ...(turnDispatchContext

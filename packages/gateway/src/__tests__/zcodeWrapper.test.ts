@@ -1,5 +1,5 @@
 /**
- * Locks the experimental oc-zcode wrapper to the live 0.15.0 hosted contract.
+ * Locks the experimental oc-zcode wrapper to the live 0.16.3 hosted contract.
  *
  * Run: npx tsx --test packages/gateway/src/__tests__/zcodeWrapper.test.ts
  */
@@ -38,18 +38,23 @@ function runWrapper(args: string[], env: NodeJS.ProcessEnv): Promise<{
 }
 
 describe('oc-zcode wrapper', () => {
-  test('script pins yolo, root-only auth, and never echoes the key', () => {
+  test('script pins yolo, loopback relay, and never echoes the token', () => {
     const text = readFileSync(WRAPPER, 'utf8')
     assert.match(text, /hosted permission mode is locked to yolo/)
-    assert.match(text, /\/run\/oc\/zcode-auth\/api-key/)
+    assert.match(text, /internal\/v5\/zcode-relay\/route/)
+    assert.doesNotMatch(text, /sudo -n \/bin\/cat -- "\$auth_file"/)
     assert.match(text, /< \/dev\/null/)
     assert.doesNotMatch(text, /echo "\$api_key"/)
     assert.match(text, /experimental community/)
     assert.match(text, /test hook requires OC_ZCODE_TEST_BIN and OC_ZCODE_TEST_AUTH_FILE together/)
-    assert.match(text, /stat -c '%u %a'/)
     assert.match(text, /unset ZCODE_API_KEY/)
     assert.match(text, /unset ZAI_API_KEY/)
-    assert.match(text, /provider\.<id>\.options\.apiKey/)
+    assert.match(text, /unset OC_ZCODE_RELAY_TOKEN/)
+    assert.match(text, /unset ZAI_CODING_PLAN_KEY/)
+    assert.match(text, /unset OPENCLAUDE_V3_CONTAINER_TOKEN/)
+    assert.match(text, /test auth must not use the production credential path/)
+    assert.match(text, /\\"kind\\":\\"anthropic\\"/)
+    assert.match(text, /zai-coding-plan\/glm-5.3/)
   })
 
   test('executes the fake CLI with locked flags and does not print the secret', async () => {
@@ -70,7 +75,10 @@ fs.writeFileSync(process.env.FAKE_ZCODE_CAPTURE, JSON.stringify({
     HOME: process.env.HOME,
     ZCODE_API_KEY: process.env.ZCODE_API_KEY,
     ZAI_API_KEY: process.env.ZAI_API_KEY,
+    ZAI_CODING_PLAN_KEY: process.env.ZAI_CODING_PLAN_KEY,
     ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
+    OC_ZCODE_RELAY_TOKEN: process.env.OC_ZCODE_RELAY_TOKEN,
+    OPENCLAUDE_V3_CONTAINER_TOKEN: process.env.OPENCLAUDE_V3_CONTAINER_TOKEN,
   },
   config: JSON.parse(fs.readFileSync(cfgPath, 'utf8')),
   configMode: st.mode & 0o777,
@@ -85,7 +93,10 @@ process.stdout.write(JSON.stringify({ sessionId: 'sess_w', response: 'wrapped', 
           PATH: process.env.PATH,
           OC_ZCODE_TEST_BIN: fake,
           OC_ZCODE_TEST_AUTH_FILE: auth,
-          OC_ZCODE_UPSTREAM_MODEL: 'zai/glm-5.1',
+          OC_ZCODE_UPSTREAM_MODEL: 'zai-coding-plan/glm-5.3',
+          OC_ZCODE_RELAY_BASE_URL: 'http://127.0.0.1:18791/internal/v5/zcode-relay/route/ab',
+          ZAI_CODING_PLAN_KEY: 'must-not-inherit',
+          OPENCLAUDE_V3_CONTAINER_TOKEN: 'must-not-inherit',
           FAKE_ZCODE_CAPTURE: capture,
         },
       )
@@ -95,17 +106,25 @@ process.stdout.write(JSON.stringify({ sessionId: 'sess_w', response: 'wrapped', 
       const captured = JSON.parse(await readFile(capture, 'utf8')) as {
         argv: string[]
         env: Record<string, string | undefined>
-        config: { provider: { zai: { options: { apiKey: string } } } }
+        config: {
+          model: { main: string }
+          provider: { 'zai-coding-plan': { kind: string; options: { apiKey: string; baseURL: string } } }
+        }
         configMode: number
       }
       assert.equal(captured.argv[captured.argv.indexOf('--mode') + 1], 'yolo')
       assert.ok(captured.argv.includes('--json'))
-      assert.equal(captured.env.ZCODE_MODEL, 'zai/glm-5.1')
+      assert.equal(captured.env.ZCODE_MODEL, 'zai-coding-plan/glm-5.3')
       assert.match(String(captured.env.HOME), /openclaude-zcode\./)
       assert.equal(captured.env.ZCODE_API_KEY, undefined)
       assert.equal(captured.env.ZAI_API_KEY, undefined)
       assert.equal(captured.env.ANTHROPIC_API_KEY, undefined)
-      assert.equal(captured.config.provider.zai.options.apiKey, 'super-secret-zcode-key')
+      assert.equal(captured.env.OC_ZCODE_RELAY_TOKEN, undefined)
+      assert.equal(captured.env.ZAI_CODING_PLAN_KEY, undefined)
+      assert.equal(captured.env.OPENCLAUDE_V3_CONTAINER_TOKEN, undefined)
+      assert.equal(captured.config.model.main, 'zai-coding-plan/glm-5.3')
+      assert.equal(captured.config.provider['zai-coding-plan'].kind, 'anthropic')
+      assert.equal(captured.config.provider['zai-coding-plan'].options.apiKey, 'super-secret-zcode-key')
       assert.equal(captured.configMode, 0o600)
     } finally {
       await rm(dir, { recursive: true, force: true })
@@ -132,6 +151,17 @@ process.stdout.write(JSON.stringify({ sessionId: 'sess_w', response: 'wrapped', 
       )
       assert.notEqual(force.code, 0)
       assert.match(force.stderr, /managed by OpenClaude/)
+      const oldUpstream = await runWrapper(
+        ['--prompt', 'x', '--json', '--mode', 'yolo', '--no-color', '--cwd', dir],
+        {
+          PATH: process.env.PATH,
+          OC_ZCODE_TEST_BIN: fake,
+          OC_ZCODE_TEST_AUTH_FILE: auth,
+          OC_ZCODE_UPSTREAM_MODEL: 'zai/glm-5.1',
+        },
+      )
+      assert.notEqual(oldUpstream.code, 0)
+      assert.match(oldUpstream.stderr, /not allowlisted/)
     } finally {
       await rm(dir, { recursive: true, force: true })
     }

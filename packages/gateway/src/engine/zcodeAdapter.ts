@@ -1,7 +1,7 @@
 /**
- * Experimental community ZCode CLI adapter (zcode.cjs 0.15.0).
- * Not an official standalone CLI. Adapter never reads or logs credentials;
- * auth is supplied only by the root-only oc-zcode wrapper / test fake.
+ * Experimental community ZCode CLI adapter (zcode.cjs 0.16.3).
+ * Not an official standalone CLI. Adapter never reads or logs the Coding Plan
+ * key; hosted turns receive a short-lived loopback relay URL + opaque token.
  */
 import { EventEmitter } from 'node:events'
 import { spawn, type ChildProcessByStdio } from 'node:child_process'
@@ -9,7 +9,6 @@ import { existsSync, readFileSync } from 'node:fs'
 import type { Readable } from 'node:stream'
 import {
   ZCODE_HOSTED_PERMISSION_MODE,
-  isZcodeEngineModel,
   zcodeTransportModelId,
   type GoalStateSnapshot,
 } from '@openclaude/protocol'
@@ -50,7 +49,12 @@ const ZCODE_SHUTDOWN_FINAL_DRAIN_DEFAULT_MS = 3_000
 const EMPTY_SIGNALS: PhantomSignals = { apiState: 'unknown', skipReason: null }
 const ZCODE_HOTCFG_WRAPPER_BIN = '/run/oc/platform/current/bin/oc-zcode'
 const ZCODE_IMAGE_WRAPPER_BIN = '/usr/local/bin/oc-zcode'
-const ZCODE_IMAGE_BIN = '/opt/zcode-cli/versions/0.15.0/zcode.cjs'
+const ZCODE_IMAGE_BIN = '/opt/zcode-cli/versions/0.16.3/zcode.cjs'
+
+export interface ZcodeRouteOverride {
+  baseUrl: string
+  routeToken: string
+}
 
 export const ZCODE_MAX_PROMPT_ARG_BYTES = 96 * 1024
 
@@ -84,6 +88,7 @@ interface ZcodeTurnContext {
     outputTokens: number
     cacheReadTokens: number
     cacheWriteTokens: number
+    reasoningTokens: number
     totalTokens: number
   }
 }
@@ -112,13 +117,15 @@ function parseUsage(raw: unknown): ZcodeTurnContext['lastUsage'] {
   const outputTokens = safeCount(usage.outputTokens ?? usage.output_tokens)
   const cacheReadTokens = safeCount(usage.cacheReadTokens ?? usage.cache_read_tokens ?? usage.cacheReadInputTokens)
   const cacheWriteTokens = safeCount(usage.cacheWriteTokens ?? usage.cache_write_tokens ?? usage.cacheCreationInputTokens)
+  const reasoningTokens = safeCount(usage.reasoningTokens ?? usage.reasoning_tokens)
   const reportedTotal = safeCount(usage.totalTokens ?? usage.total_tokens)
   return {
     inputTokens,
     outputTokens,
     cacheReadTokens,
     cacheWriteTokens,
-    totalTokens: reportedTotal || inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens,
+    reasoningTokens,
+    totalTokens: reportedTotal || inputTokens + outputTokens,
   }
 }
 
@@ -196,6 +203,11 @@ function validateZcodeJsonResult(raw: unknown): ZcodeJsonResult {
   if (!isNonNegInt(outputTokens)) throw new Error('usage.outputTokens must be a non-negative integer')
   if (!isNonNegInt(cacheReadTokens)) throw new Error('usage.cacheReadTokens must be a non-negative integer')
   if (!isNonNegInt(cacheWriteTokens)) throw new Error('usage.cacheWriteTokens must be a non-negative integer')
+  for (const optional of ['reasoningTokens', 'totalTokens', 'modelRequestCount'] as const) {
+    if (usage[optional] !== undefined && !isNonNegInt(usage[optional])) {
+      throw new Error(`usage.${optional} must be a non-negative integer`)
+    }
+  }
   if (!obj.projection || typeof obj.projection !== 'object' || Array.isArray(obj.projection)) {
     throw new Error('projection must be an object')
   }
@@ -206,8 +218,8 @@ function validateZcodeJsonResult(raw: unknown): ZcodeJsonResult {
   for (const key of ['turnCount', 'totalTokenCount', 'contextUsed', 'contextWindow'] as const) {
     if (!isNonNegInt(projection[key])) throw new Error(`projection.${key} must be a non-negative integer`)
   }
-  const usageTotal = inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens
-  if (!Number.isSafeInteger(usageTotal) || usageTotal !== projection.totalTokenCount) {
+  const reportedTotal = isNonNegInt(usage.totalTokens) ? usage.totalTokens : inputTokens + outputTokens
+  if (reportedTotal !== projection.totalTokenCount) {
     throw new Error('usage totals must match projection.totalTokenCount')
   }
   optionalString(obj, 'traceId')
@@ -252,6 +264,7 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
   private currentModel: string | undefined
   private currentToolsets: string[] | undefined
   private target: ExecutionTarget = { kind: 'local' }
+  private route: ZcodeRouteOverride | null = null
   private drain: Promise<void> = Promise.resolve()
   lastActivityAt = 0
 
@@ -270,7 +283,7 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
 
   setModel(model: string | undefined): void { this.currentModel = model }
   get model(): string | undefined { return this.currentModel }
-  setEffortLevel(_level: string | undefined): void { /* 0.15.0 has no effort flag */ }
+  setEffortLevel(_level: string | undefined): void { /* 0.16.3 hosted path has no effort flag */ }
   get effortLevel(): string | undefined { return undefined }
   setTraceId(_traceId: string | undefined): void {}
   async setGoalState(_goal: GoalStateSnapshot | null): Promise<void> {}
@@ -279,6 +292,11 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
   get toolsets(): string[] | undefined { return this.currentToolsets }
   setExecutionTarget(target: ExecutionTarget): void { this.target = target }
   get executionTarget(): ExecutionTarget { return this.target }
+  setZcodeRoute(route: ZcodeRouteOverride | null | undefined): void {
+    this.route = route && typeof route.baseUrl === 'string' && typeof route.routeToken === 'string'
+      ? { baseUrl: route.baseUrl, routeToken: route.routeToken }
+      : null
+  }
   sendPermissionResponse(_requestId: string, _response: unknown): boolean { return false }
   getPartialSnapshot(): PartialSnapshot { return snapshotOf(this.active) }
   get pendingToolCalls(): number { return 0 }
@@ -326,12 +344,9 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
 
   private resolveUpstream(): string {
     const canonical = this.currentModel
-    if (!isZcodeEngineModel(canonical)) {
-      throw new Error('ZCODE_MODEL_REJECTED: canonical model is not the experimental ZCode allowlist')
-    }
     const upstream = zcodeTransportModelId(canonical)
-    if (!upstream || upstream === canonical) {
-      throw new Error('ZCODE_UPSTREAM_MISSING: signed canonical id has no community CLI upstream mapping')
+    if (!upstream) {
+      throw new Error('ZCODE_MODEL_REJECTED: canonical model is not a ZCode allowlist id')
     }
     return upstream
   }
@@ -368,6 +383,10 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
       if (snapshot?.status === 'ready' && snapshot.workspaceDir) cwd = snapshot.workspaceDir
     }
     const prompt = await this.composePrompt(ctx.params, cwd)
+    const usingWrapper = !process.env.OC_ZCODE_CLI_BIN
+    if (usingWrapper && !this.route) {
+      throw new Error('ZCODE_RELAY_MISSING: hosted zcode turns require an opaque relay route')
+    }
     const bin = resolveZcodeBin()
     const args = [
       '--prompt', prompt,
@@ -382,6 +401,10 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
       HOME: process.env.HOME,
       TERM: 'dumb',
       OC_ZCODE_UPSTREAM_MODEL: upstream,
+      ...(this.route ? {
+        OC_ZCODE_RELAY_BASE_URL: this.route.baseUrl,
+        OC_ZCODE_RELAY_TOKEN: this.route.routeToken,
+      } : {}),
       ...(process.env.OPENCLAUDE_HOME ? { OPENCLAUDE_HOME: process.env.OPENCLAUDE_HOME } : {}),
     }
     const proc = spawn(bin, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], detached: true })

@@ -1,5 +1,5 @@
-Community experimental ZCode CLI 0.15.0 help (sanitized live probe, 2026-08-19).
-Source: official desktop AppImage 3.2.2 resources/glm/zcode.cjs --help
+Community experimental ZCode CLI 0.16.3 help (sanitized live probe, 2026-08-19).
+Source: official desktop AppImage 3.7.7 resources/glm/zcode.cjs --help
 NOT an official standalone CLI product. npm `zcode` / `zcode-cli` 0.0.1 are stubs.
 
 Commands:
@@ -26,6 +26,10 @@ Options:
   --no-color       Disable ANSI colors
   --verbose        Print extra diagnostic detail
 
+Help also lists --settings, --max-turns, and --permission-mode, but live
+0.16.3 parseArgs rejects those as Unknown option. Hosted path uses only
+real flags: --prompt --mode --json --cwd --no-color [--resume].
+
 Modes (bundle literals):
   build  Ask before each file changes.
   edit   Edit selected files or relevant workspace files automatically.
@@ -34,3 +38,5 @@ Modes (bundle literals):
 
 No --model flag. Model is config model.main or env ZCODE_MODEL=provider/model.
 Hosted lock: --mode yolo (only unattended all-tools mode).
+Provider pin: zai-coding-plan kind=anthropic model=glm-5.3.
+Usage 0.16.3: totalTokens === inputTokens + outputTokens (cacheRead is not additive).

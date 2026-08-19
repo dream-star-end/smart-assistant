@@ -1,7 +1,10 @@
--- Experimental community ZCode CLI engine (bundled zcode.cjs 0.15.0).
--- NOT an official standalone CLI. Credentials remain an owner-scoped
--- root-only host mount and are intentionally absent from every table.
--- Catalog row is staged+disabled+hidden and must not be enabled or made public.
+-- Experimental community ZCode CLI engine (bundled zcode.cjs 0.16.3).
+-- NOT an official standalone CLI. The real Coding Plan key never enters
+-- catalog tables, user containers, or yolo-inheritable env.
+-- This migration only expands the engine CHECK, creates the canary audit
+-- table, and inserts hidden disabled zcode-experimental.
+-- Do NOT switch public glm-5.3-zai here. Post-deploy cutover is the audited
+-- admin path POST /api/admin/model-catalog/zcode-glm53-cutover.
 DO $$ DECLARE c RECORD; BEGIN
   FOR c IN SELECT conname FROM pg_constraint WHERE conrelid='model_catalog'::regclass AND contype='c' AND pg_get_constraintdef(oid) LIKE '%engine%' AND pg_get_constraintdef(oid) LIKE '%ccb%' LOOP
     EXECUTE format('ALTER TABLE model_catalog DROP CONSTRAINT %I', c.conname);
@@ -17,8 +20,8 @@ INSERT INTO model_catalog(
   'zcode-experimental',
   'zcode',
   'zcode',
-  'zai/glm-5.1',
-  128000,
+  'glm-5.3',
+  1000000,
   '{"supports_vision":false,"reasoning":{"supported":[],"codex_model_default":null},"ccb":{"capability_zero":false,"supports_thinking":false}}'::jsonb,
   1,
   'disabled'
@@ -58,4 +61,4 @@ CREATE TABLE zcode_external_usage_audit (
 CREATE INDEX idx_zcode_external_usage_user_created ON zcode_external_usage_audit(user_id, created_at DESC);
 
 COMMENT ON TABLE zcode_external_usage_audit IS
-  'Audit-only token observations for the experimental community ZCode CLI. No invented token rates.';
+  'Audit-only token observations for the experimental community ZCode CLI canary. Public glm-5.3-zai settles via catalog prices after an audited engine switch; this table stays canary-only.';

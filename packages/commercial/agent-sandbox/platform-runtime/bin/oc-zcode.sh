@@ -1,14 +1,9 @@
 #!/bin/sh
-# oc-zcode — experimental community ZCode CLI launcher (zcode.cjs 0.15.0).
+# oc-zcode — experimental community ZCode CLI launcher (zcode.cjs 0.16.3).
 #
-# This is NOT an official standalone CLI. Credentials stay in a root-only
-# mount and never enter Docker Env, the image, argv, or logs. The hosted
-# permission mode is locked to `yolo` (the only 0.15.0 unattended all-tools
-# mode). There is no stdin ask path.
-#
-# Test hooks (OC_ZCODE_TEST_*) are hard-isolated from the production path:
-# any test variable forces a complete test bin + test auth pair and never
-# touches /run/oc/zcode-auth or sudo.
+# This is NOT an official standalone CLI. The real Coding Plan key never
+# enters this wrapper, argv, logs, or yolo child env. Hosted turns receive
+# a short-lived loopback relay URL + opaque token from OpenClaude.
 set -eu
 
 die() {
@@ -50,12 +45,11 @@ if [ "$test_mode" -eq 1 ]; then
   node_bin=$test_node
   auth_file=$test_auth
 else
-  [ -x /usr/bin/sudo ] || die "runtime image is missing /usr/bin/sudo"
-  zcode_cjs=/opt/zcode-cli/versions/0.15.0/zcode.cjs
+  zcode_cjs=/opt/zcode-cli/versions/0.16.3/zcode.cjs
   node_bin=/usr/local/bin/node
-  auth_file=/run/oc/zcode-auth/api-key
+  auth_file=""
   [ -f "$zcode_cjs" ] || die "experimental community CLI is not installed"
-  [ -x "$node_bin" ] || die "node 22 is required to run zcode.cjs 0.15.0"
+  [ -x "$node_bin" ] || die "node 22 is required to run zcode.cjs 0.16.3"
 fi
 
 prompt=""
@@ -114,7 +108,7 @@ while [ "$#" -gt 0 ]; do
       usage
       exit 0
       ;;
-    --model|--model=*|--force|--login|--logout|--no-browser|-c|--continue|--attach|--attach=*)
+    --model|--model=*|--force|--login|--logout|--no-browser|-c|--continue|--attach|--attach=*|--settings|--settings=*|--max-turns|--max-turns=*|--permission-mode|--permission-mode=*)
       die "authentication, model, attach and interactive controls are managed by OpenClaude"
       ;;
     -*)
@@ -141,30 +135,33 @@ if [ -n "$resume" ]; then
   esac
 fi
 
-upstream=${OC_ZCODE_UPSTREAM_MODEL:-zai/glm-5.1}
+upstream=${OC_ZCODE_UPSTREAM_MODEL:-zai-coding-plan/glm-5.3}
 case "$upstream" in
-  zai/glm-5.1) ;;
+  zai-coding-plan/glm-5.3) ;;
   *) die "upstream model is not allowlisted" ;;
 esac
 provider=${upstream%%/*}
 
+relay_base=${OC_ZCODE_RELAY_BASE_URL:-}
+relay_token=${OC_ZCODE_RELAY_TOKEN:-}
+
 if [ "$test_mode" -eq 1 ]; then
   [ -f "$auth_file" ] || die "test credential file is missing"
-  api_key=$(/bin/cat -- "$auth_file")
+  api_key=$(tr -d '\r\n' < "$auth_file")
+  [ -n "$relay_base" ] || relay_base="http://127.0.0.1:9/internal/v5/zcode-relay/route/test"
 else
-  /usr/bin/sudo -n /usr/bin/test -f "$auth_file" 2>/dev/null \
-    || die "ZCode CLI is not enabled for this account"
-  meta=$(/usr/bin/sudo -n /usr/bin/stat -c '%u %a' -- "$auth_file") \
-    || die "ZCode credential mount is unreadable"
-  owner=${meta%% *}
-  mode_bits=${meta##* }
-  [ "$owner" = "0" ] || die "ZCode credential owner is not root"
-  case "$mode_bits" in
-    400|600|0400|0600) ;;
-    *) die "ZCode credential mode must be 0400 or 0600" ;;
+  [ -n "$relay_base" ] || die "ZCode relay is not configured"
+  [ -n "$relay_token" ] || die "ZCode relay is not configured"
+  case "$relay_token" in
+    *[!0-9a-f]*|"" ) die "ZCode relay token is malformed" ;;
   esac
-  api_key=$(/usr/bin/sudo -n /bin/cat -- "$auth_file") \
-    || die "ZCode credential mount is unreadable"
+  token_len=$(printf '%s' "$relay_token" | wc -c)
+  [ "$token_len" -eq 64 ] || die "ZCode relay token is malformed"
+  case "$relay_base" in
+    http://127.0.0.1:*/internal/v5/zcode-relay/route/*) ;;
+    *) die "ZCode relay URL is not an internal loopback route" ;;
+  esac
+  api_key=$relay_token
 fi
 [ -n "$api_key" ] || die "ZCode credential is malformed"
 carriage_return=$(printf '\r')
@@ -209,9 +206,9 @@ trap 'forward_signal TERM 143' TERM
 
 /bin/mkdir -p -m 0700 -- "$zcode_home/.zcode/cli" \
   || die "cannot create ephemeral ZCode config directory"
-# 0.15.0 reads provider.<id>.options.apiKey from isolated HOME config.
-# Never export the key into yolo or its tool children.
-printf '%s\n' "{\"model\":{\"main\":\"$upstream\"},\"provider\":{\"$provider\":{\"options\":{\"apiKey\":\"$api_key\"}}}}" \
+# 0.16.3 requires provider.kind. apiKey is the opaque relay token, never the
+# Coding Plan key. Unset inheritable env before yolo exec.
+printf '%s\n' "{\"model\":{\"main\":\"$upstream\"},\"provider\":{\"$provider\":{\"kind\":\"anthropic\",\"name\":\"Z.AI Coding Plan\",\"options\":{\"apiKeyRequired\":true,\"baseURL\":\"$relay_base\",\"apiKey\":\"$api_key\"}}}}" \
   > "$zcode_home/.zcode/cli/config.json"
 /bin/chmod 0600 -- "$zcode_home/.zcode/cli/config.json"
 api_key=""
@@ -236,7 +233,11 @@ if [ -n "$storage_dir" ]; then
 fi
 unset ZCODE_API_KEY
 unset ZAI_API_KEY
+unset ZAI_CODING_PLAN_KEY
 unset ANTHROPIC_API_KEY
+unset ANTHROPIC_AUTH_TOKEN
+unset OC_ZCODE_RELAY_TOKEN
+unset OPENCLAUDE_V3_CONTAINER_TOKEN
 export HOME="$zcode_home"
 export ZCODE_MODEL="$upstream"
 set +e

@@ -1,5 +1,5 @@
 /**
- * Experimental community ZCode CLI adapter — official 0.15.0 contract,
+ * Experimental community ZCode CLI adapter — official 0.16.3 contract,
  * no network credentials.
  *
  * Run: npx tsx --test packages/gateway/src/__tests__/zcodeAdapter.test.ts
@@ -72,8 +72,8 @@ describe('ZcodeAdapter', () => {
     )
   })
 
-  test('keeps the live 0.15.0 doctor/processName fixture experimental', () => {
-    assert.equal(doctorFixture.cli.version, '0.15.0')
+  test('keeps the live 0.16.3 doctor/processName fixture experimental', () => {
+    assert.equal(doctorFixture.cli.version, '0.16.3')
     assert.equal(doctorFixture.cli.processName, 'zcode-cli')
     assert.equal(ZCODE_HOSTED_PERMISSION_MODE, 'yolo')
   })
@@ -90,9 +90,12 @@ fs.writeFileSync(path.join(__dirname, 'capture.json'), JSON.stringify({
   argv: process.argv.slice(2),
   env: {
     OC_ZCODE_UPSTREAM_MODEL: process.env.OC_ZCODE_UPSTREAM_MODEL,
+    OC_ZCODE_RELAY_BASE_URL: process.env.OC_ZCODE_RELAY_BASE_URL,
+    OC_ZCODE_RELAY_TOKEN: process.env.OC_ZCODE_RELAY_TOKEN,
     ZCODE_API_KEY: process.env.ZCODE_API_KEY,
     OPENCLAUDE_V3_CONTAINER_TOKEN: process.env.OPENCLAUDE_V3_CONTAINER_TOKEN,
     ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
+    ZAI_CODING_PLAN_KEY: process.env.ZAI_CODING_PLAN_KEY,
   },
 }))
 process.stdout.write(${JSON.stringify(`${JSON.stringify(successFixture)}\n`)})
@@ -101,9 +104,11 @@ process.stdout.write(${JSON.stringify(`${JSON.stringify(successFixture)}\n`)})
     const previousBin = process.env.OC_ZCODE_CLI_BIN
     const previousToken = process.env.OPENCLAUDE_V3_CONTAINER_TOKEN
     const previousKey = process.env.ZCODE_API_KEY
+    const previousZai = process.env.ZAI_CODING_PLAN_KEY
     process.env.OC_ZCODE_CLI_BIN = fake
     process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = 'must-not-leak'
     process.env.ZCODE_API_KEY = 'must-not-read'
+    process.env.ZAI_CODING_PLAN_KEY = 'must-not-read'
     try {
       const adapter = new ZcodeAdapter(createOpts(dir))
       const events: EngineEvent[] = []
@@ -143,14 +148,16 @@ process.stdout.write(${JSON.stringify(`${JSON.stringify(successFixture)}\n`)})
       assert.ok(captured.argv.includes('--no-color'))
       assert.equal(captured.argv[captured.argv.indexOf('--cwd') + 1], dir)
       assert.equal(captured.argv[captured.argv.indexOf('--resume') + 1], 'sess_prior')
-      assert.equal(captured.env.OC_ZCODE_UPSTREAM_MODEL, 'zai/glm-5.1')
+      assert.equal(captured.env.OC_ZCODE_UPSTREAM_MODEL, 'zai-coding-plan/glm-5.3')
       assert.equal(captured.env.ZCODE_API_KEY, undefined)
       assert.equal(captured.env.OPENCLAUDE_V3_CONTAINER_TOKEN, undefined)
       assert.equal(captured.env.ANTHROPIC_API_KEY, undefined)
+      assert.equal(captured.env.ZAI_CODING_PLAN_KEY, undefined)
     } finally {
       restoreEnv('OC_ZCODE_CLI_BIN', previousBin)
       restoreEnv('OPENCLAUDE_V3_CONTAINER_TOKEN', previousToken)
       restoreEnv('ZCODE_API_KEY', previousKey)
+      restoreEnv('ZAI_CODING_PLAN_KEY', previousZai)
       await rm(dir, { recursive: true, force: true })
     }
   })
@@ -194,8 +201,54 @@ process.exit(1)
     }
   })
 
-  test('rejects a non-allowlisted canonical model before spawn', async () => {
-    const adapter = new ZcodeAdapter(createOpts(tmpdir(), 'glm-5.3-zai'))
+  test('maps public glm-5.3-zai and hidden canary to the pinned CLI upstream', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-zcode-canonical-'))
+    const fake = path.join(dir, 'fake-zcode.cjs')
+    const capture = path.join(dir, 'capture.json')
+    await writeFile(path.join(dir, 'persona.md'), 'persona-line')
+    await writeFile(fake, `#!/usr/bin/env node
+const fs = require('node:fs')
+const path = require('node:path')
+fs.writeFileSync(path.join(__dirname, 'capture.json'), JSON.stringify({
+  env: {
+    OC_ZCODE_UPSTREAM_MODEL: process.env.OC_ZCODE_UPSTREAM_MODEL,
+    OC_ZCODE_RELAY_BASE_URL: process.env.OC_ZCODE_RELAY_BASE_URL,
+    OC_ZCODE_RELAY_TOKEN: process.env.OC_ZCODE_RELAY_TOKEN,
+  },
+}))
+process.stdout.write(${JSON.stringify(`${JSON.stringify(successFixture)}\n`)})
+`)
+    await chmod(fake, 0o755)
+    const previousBin = process.env.OC_ZCODE_CLI_BIN
+    process.env.OC_ZCODE_CLI_BIN = fake
+    try {
+      const adapter = new ZcodeAdapter(createOpts(dir, 'glm-5.3-zai'))
+      adapter.setZcodeRoute({
+        baseUrl: 'http://127.0.0.1:18791/internal/v5/zcode-relay/route/' + 'a'.repeat(64),
+        routeToken: 'a'.repeat(64),
+      })
+      adapter.on('error', () => {})
+      const run = adapter.submitTurn({
+        input: 'ok',
+        requestId: REQUEST_ID,
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run.submitted
+      const summary = await run.summary
+      assert.equal(summary?.isError, false)
+      const captured = JSON.parse(await readFile(capture, 'utf8')) as { env: Record<string, string | undefined> }
+      assert.equal(captured.env.OC_ZCODE_UPSTREAM_MODEL, 'zai-coding-plan/glm-5.3')
+      assert.equal(captured.env.OC_ZCODE_RELAY_TOKEN, 'a'.repeat(64))
+    } finally {
+      restoreEnv('OC_ZCODE_CLI_BIN', previousBin)
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('rejects a user-supplied upstream id and hosted turns without a relay route', async () => {
+    const adapter = new ZcodeAdapter(createOpts(tmpdir(), 'zai-coding-plan/glm-5.3'))
     adapter.on('error', () => {})
     const run = adapter.submitTurn({
       input: 'must not run',
@@ -205,6 +258,23 @@ process.exit(1)
       toolUseIdToName: new Map(),
     })
     await assert.rejects(run.submitted, /ZCODE_MODEL_REJECTED/)
+
+    const previousBin = process.env.OC_ZCODE_CLI_BIN
+    restoreEnv('OC_ZCODE_CLI_BIN', undefined)
+    try {
+      const hosted = new ZcodeAdapter(createOpts(tmpdir(), 'zcode-experimental'))
+      hosted.on('error', () => {})
+      const hostedRun = hosted.submitTurn({
+        input: 'must not run',
+        requestId: REQUEST_ID,
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await assert.rejects(hostedRun.submitted, /ZCODE_RELAY_MISSING/)
+    } finally {
+      restoreEnv('OC_ZCODE_CLI_BIN', previousBin)
+    }
   })
 
   test('stdout parser accepts only the live fixture object and rejects counterexamples', () => {
@@ -256,7 +326,7 @@ process.exit(1)
     assert.throws(
       () => _internals.parseJsonResult(JSON.stringify({
         ...successFixture,
-        usage: { ...successFixture.usage, outputTokens: 99 },
+        usage: { ...successFixture.usage, totalTokens: 99 },
       })),
       /usage totals must match projection.totalTokenCount/,
     )
