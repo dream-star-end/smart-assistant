@@ -60,6 +60,7 @@ import {
   LOSSLESS_TURN_TAPE_LEGACY_AGENT_ID,
   LOSSLESS_TURN_TAPE_PART_BYTES,
   LOSSLESS_TURN_TAPE_VERSION,
+  losslessBillingAnchorId,
   type DurableAgentGroup,
   type DurableCodexBilling,
   type LosslessTurnTapeFinalizeRequest,
@@ -381,7 +382,28 @@ export function buildLosslessTurnTapeRequests(
       ? { dispatchId: payload.dispatchId, attemptNo: payload.attemptNo }
       : {}),
   } as const
-  return { finalize: { ...base, action: 'finalize' }, canonical }
+  const engineBillings: DurableCodexBilling[] = [
+    ...(payload.engineBilling ? [payload.engineBilling] : []),
+    ...(payload.agentGroups ?? []).flatMap((group) =>
+      Array.isArray(group.engineBillings) ? group.engineBillings : []),
+  ]
+  const billingAnchorId = losslessBillingAnchorId({
+    sessionId: payload.sessionId,
+    agentId: payload.agentId,
+    turnIndex: payload.turnIndex,
+    assistantSegments: payload.assistantSegments,
+    text: payload.text,
+    errorCode: typeof payload.errorCode === 'string' ? payload.errorCode : undefined,
+  })
+  const settlement = {
+    billingAnchorId,
+    ...(payload.engineBilling?.requestId ? { requestId: payload.engineBilling.requestId } : {}),
+    engineBillings,
+    text: payload.text,
+    ts: createdAt,
+    ...(typeof payload.errorCode === 'string' ? { errorCode: payload.errorCode } : {}),
+  }
+  return { finalize: { ...base, action: 'finalize', settlement }, canonical }
 }
 
 /** Yield one base64 envelope at a time. Production never retains an array of
@@ -408,7 +430,7 @@ export function* iterateLosslessTurnTapeParts(
 async function postLosslessTurnTapeEnvelope(
   envelope: LosslessTurnTapePartRequest | LosslessTurnTapeFinalizeRequest,
   deps: AttemptSendDeps,
-): Promise<void> {
+): Promise<{ settlementHandoff?: boolean }> {
   const fetcher = deps.fetcher ?? undiciRequest
   const isFinalize = envelope.action === 'finalize'
   const controller = isFinalize ? null : new AbortController()
@@ -447,7 +469,14 @@ async function postLosslessTurnTapeEnvelope(
     // Status remains authoritative when an error response body cannot be read.
   }
   const status = res.statusCode
-  if (status >= 200 && status < 300) return
+  if (status >= 200 && status < 300) {
+    try {
+      const parsed = JSON.parse(bodyText) as { settlementHandoff?: unknown }
+      return parsed.settlementHandoff === true ? { settlementHandoff: true } : {}
+    } catch {
+      return {}
+    }
+  }
   if (status === 404) {
     throw new V3SinkError(`session_not_found: ${truncateForLog(bodyText)}`, 'session_missing', status)
   }
@@ -592,12 +621,12 @@ async function postServerAuthoredJson(body: unknown, deps: AttemptSendDeps): Pro
 export async function attemptSendLossless(
   payload: V3MasterSinkWirePayload & { agentId: string },
   deps: AttemptSendDeps,
-): Promise<void> {
+): Promise<{ settlementHandoff?: boolean }> {
   const tape = buildLosslessTurnTapeRequests(payload, deps.now)
   for (const part of iterateLosslessTurnTapeParts(tape)) {
     await postLosslessTurnTapeEnvelope(part, deps)
   }
-  await postLosslessTurnTapeEnvelope(tape.finalize, deps)
+  return postLosslessTurnTapeEnvelope(tape.finalize, deps)
 }
 
 /**
@@ -612,7 +641,7 @@ export async function attemptSendLossless(
 export async function attemptSend(
   payload: V3MasterSinkWirePayload,
   deps: AttemptSendDeps,
-): Promise<void> {
+): Promise<{ settlementHandoff?: boolean }> {
   if (isPermissionSidecarPayload(payload)) {
     if (!payload.agentId) {
       throw new V3SinkError('permission sidecar requires agentId', 'transient')
@@ -621,12 +650,12 @@ export async function attemptSend(
       buildPermissionSidecarV1Body(payload as V3MasterSinkWirePayload & { agentId: string }),
       deps,
     )
-    return
+    return {}
   }
   const upgraded: V3MasterSinkWirePayload & { agentId: string } = payload.agentId
     ? payload as V3MasterSinkWirePayload & { agentId: string }
     : { ...payload, agentId: LOSSLESS_TURN_TAPE_LEGACY_AGENT_ID }
-  await attemptSendLossless(upgraded, deps)
+  return attemptSendLossless(upgraded, deps)
 }
 
 async function readBoundedBody(
@@ -709,7 +738,10 @@ export interface MakeV3MasterSinkDeps {
   config: V3MasterSinkConfig
   retryQueue: V3MasterRetryQueue
   /** Override only for tests. */
-  attemptSendImpl?: typeof attemptSend
+  attemptSendImpl?: (
+    payload: V3MasterSinkWirePayload,
+    deps: AttemptSendDeps,
+  ) => Promise<{ settlementHandoff?: boolean } | void | undefined>
   now?: () => number
   /** RFC-v5-durable-turn-dispatch §3 inbox hooks (best-effort). */
   inboxHooks?: V3DispatchInboxHooks
@@ -751,8 +783,12 @@ export function makeV3MasterSink(deps: MakeV3MasterSinkDeps): V3MasterSink {
   const now = deps.now ?? (() => Date.now())
   const hooks = deps.inboxHooks
 
-  const attemptOnce = (payload: V3MasterSinkWirePayload): Promise<void> => {
-    if (deps.attemptSendImpl) return deps.attemptSendImpl(payload, { config: deps.config })
+  const attemptOnce = async (
+    payload: V3MasterSinkWirePayload,
+  ): Promise<{ settlementHandoff?: boolean }> => {
+    if (deps.attemptSendImpl) {
+      return (await deps.attemptSendImpl(payload, { config: deps.config })) ?? {}
+    }
     return attemptSend(payload, { config: deps.config })
   }
 
@@ -849,7 +885,12 @@ export function makeV3MasterSink(deps: MakeV3MasterSinkDeps): V3MasterSink {
     }
   }
 
-  return { persistOrQueue, attemptOnce }
+  return {
+    persistOrQueue,
+    attemptOnce: async (payload) => {
+      await attemptOnce(payload)
+    },
+  }
 }
 
 // ─── module-level singleton (set at startup, read at turn-end) ──────────

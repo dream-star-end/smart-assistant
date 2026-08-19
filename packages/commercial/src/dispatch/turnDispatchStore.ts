@@ -57,6 +57,9 @@ export interface TurnDispatchRow {
   acceptedAt: Date | null
   terminalAt: Date | null
   lastAttemptAt: Date | null
+  visibleHead?: unknown | null
+  visibleAt?: number | null
+  producerFencedAt?: Date | null
 }
 
 const DISPATCH_COLUMNS = `
@@ -64,7 +67,7 @@ const DISPATCH_COLUMNS = `
   request_hash, billing_request_id, attempt_no, status, outcome, failure_code,
   conflict_reason, resolution, resolved_at, client_notified, owner_id,
   lease_epoch, lease_until, anchor_seq, admitted_at, accepted_at, terminal_at,
-  last_attempt_at`
+  last_attempt_at, visible_head, visible_at, producer_fenced_at`
 
 /** join 场景用(scanOpenSessionGone):client_sessions 与 turn_dispatches 同名列须限定表别名 d。 */
 const DISPATCH_COLUMNS_QUALIFIED = DISPATCH_COLUMNS.split(',')
@@ -96,6 +99,9 @@ interface RawDispatchRow {
   accepted_at: Date | null
   terminal_at: Date | null
   last_attempt_at: Date | null
+  visible_head: unknown | null
+  visible_at: string | null
+  producer_fenced_at: Date | null
 }
 
 function mapRow(r: RawDispatchRow): TurnDispatchRow {
@@ -124,6 +130,9 @@ function mapRow(r: RawDispatchRow): TurnDispatchRow {
     acceptedAt: r.accepted_at,
     terminalAt: r.terminal_at,
     lastAttemptAt: r.last_attempt_at,
+    visibleHead: r.visible_head ?? null,
+    visibleAt: r.visible_at === null || r.visible_at === undefined ? null : Number(r.visible_at),
+    producerFencedAt: r.producer_fenced_at ?? null,
   }
 }
 

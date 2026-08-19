@@ -2217,6 +2217,14 @@ const LosslessTapePartSchema = LosslessTapeBaseSchema.extend({
 
 const LosslessTapeFinalizeSchema = LosslessTapeBaseSchema.extend({
   action: z.literal("finalize"),
+  settlement: z.object({
+    billingAnchorId: z.string().min(1).max(256),
+    requestId: z.string().min(1).max(256).optional(),
+    engineBillings: z.array(z.record(z.string(), z.unknown())).default([]),
+    text: z.string(),
+    ts: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+    errorCode: z.string().min(1).max(256).optional(),
+  }).strict().optional(),
 }).strict();
 
 function isLosslessTurnTapeWireBody(raw: unknown): boolean {
@@ -2400,45 +2408,51 @@ async function handleLosslessTurnTapeRequest(args: {
           dedupe_key: `${EVENTS.OPS_INCIDENT_OPENED}:late_tape:${body.tapeId}`,
         }).catch(() => {});
       }
+      const settlementHandoff = result.settlementHandoff === true
+        || (result.engineBillings.length === 0 && body.waiveReason === undefined);
       if (result.engineBillings.length > 0) {
         if (!args.settleCodexBilling) {
-          sendJsonError(
-            args.res,
-            503,
-            "TURN_TAPE_BILLING_UNAVAILABLE",
-            "durable codex billing settlement unavailable",
-            args.requestId,
-          );
-          return;
-        }
-        try {
-          for (const billing of result.engineBillings) {
-            await args.settleCodexBilling(args.numericUserId, billing);
+          if (!settlementHandoff) {
+            sendJsonError(
+              args.res,
+              503,
+              "TURN_TAPE_BILLING_UNAVAILABLE",
+              "durable codex billing settlement unavailable",
+              args.requestId,
+            );
+            return;
           }
-        } catch (err) {
-          args.userLog.error("lossless_turn_tape_billing_settle_failed", {
-            tapeId: body.tapeId,
-            err: err as Error,
-          });
-          // Tape+final usage are already immutable. A 503 deliberately keeps
-          // the container's fsynced queue entry so idempotent finalize retries
-          // until every billing journal reaches a terminal state.
-          sendJsonError(
-            args.res,
-            503,
-            "TURN_TAPE_BILLING_PENDING",
-            "durable codex billing settlement pending",
-            args.requestId,
-          );
-          return;
+        } else {
+          try {
+            for (const billing of result.engineBillings) {
+              await args.settleCodexBilling(args.numericUserId, billing);
+            }
+          } catch (err) {
+            args.userLog.error("lossless_turn_tape_billing_settle_failed", {
+              tapeId: body.tapeId,
+              err: err as Error,
+            });
+            if (!settlementHandoff) {
+              sendJsonError(
+                args.res,
+                503,
+                "TURN_TAPE_BILLING_PENDING",
+                "durable codex billing settlement pending",
+                args.requestId,
+              );
+              return;
+            }
+          }
         }
       }
       let waiverResult: TurnWaiverResult | undefined;
       if (body.waiveReason !== undefined) {
         if (!args.applyTurnWaiver) {
-          sendJsonError(args.res, 503, "TURN_WAIVER_UNAVAILABLE", "exact turn waiver unavailable", args.requestId);
-          return;
-        }
+          if (!settlementHandoff) {
+            sendJsonError(args.res, 503, "TURN_WAIVER_UNAVAILABLE", "exact turn waiver unavailable", args.requestId);
+            return;
+          }
+        } else {
         try {
           waiverResult = await args.applyTurnWaiver({
             userId: args.numericUserId,
@@ -2453,15 +2467,16 @@ async function handleLosslessTurnTapeRequest(args: {
             reason: body.waiveReason,
             err: err as Error,
           });
-          // Keep the container's fsynced finalizer queued. The pending marker
-          // already fences new debits; retry completes refund + receipt.
-          sendJsonError(args.res, 503, "TURN_WAIVER_PENDING", "exact refund and receipt pending", args.requestId);
-          return;
+          if (!settlementHandoff) {
+            sendJsonError(args.res, 503, "TURN_WAIVER_PENDING", "exact refund and receipt pending", args.requestId);
+            return;
+          }
+        }
         }
         // ACK-loss retries re-enter this block after refund+receipt committed;
         // only the applying transaction emits the best-effort live projection.
         // The durable targeted inbox receipt remains the source of truth.
-        if (waiverResult.newlyApplied) {
+        if (waiverResult?.newlyApplied) {
           try {
             args.broadcastToUser?.(args.numericUserId, {
               type: "outbound.cost_waived",
@@ -2485,6 +2500,7 @@ async function handleLosslessTurnTapeRequest(args: {
         ok: true,
         idempotent: result.applied === "idempotent",
         recordCount: result.recordCount,
+        ...(settlementHandoff ? { settlementHandoff: true } : {}),
         ...(waiverResult
           ? {
               waived: true,

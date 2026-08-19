@@ -65,11 +65,25 @@ import {
   turnRecoveryAttemptIdentity,
   turnRecoveryIdentity,
   parseSessionWorkspaceMode,
+  losslessBillingAnchorId,
   type DurableCodexBilling,
   type LosslessTurnTapeFinalizeRequest,
   type LosslessTurnTapePartRequest,
   type SessionWorkspaceMode,
 } from "@openclaude/protocol";
+import {
+  enqueueMaterializationJob,
+  enqueueSettlementJob,
+  holdSettlementJobsForTape,
+} from "./turnTapeJobs.js";
+import {
+  isTransientTapeError,
+  recordsPublished,
+  settlementEngineBillings,
+  visibleHeadFallback,
+  visibleHeadFromSettlement,
+  type VisibleHead,
+} from "./visibleFinalize.js";
 import {
   type AppendCostCreditsResult,
   type AppendForRequestResult,
@@ -822,6 +836,14 @@ const PROBE_EXPECTED_COLUMNS: ReadonlyArray<[string, string, string]> = [
   ["client_session_turn_tapes", "logical_record_count", "integer"],
   ["client_session_turn_tapes", "record_payload_bytes", "bigint"],
   ["client_session_turn_tapes", "model_record_count", "integer"],
+  ["client_session_turn_tapes", "visible_at", "bigint"],
+  ["client_session_turn_tapes", "visible_head", "jsonb"],
+  ["client_session_turn_tapes", "materialization_status", "text"],
+  ["turn_dispatches", "visible_head", "jsonb"],
+  ["turn_dispatches", "visible_at", "bigint"],
+  ["turn_dispatches", "producer_fenced_at", "timestamp with time zone"],
+  ["turn_tape_materialization_jobs", "job_id", "uuid"],
+  ["turn_tape_settlement_jobs", "job_id", "uuid"],
   ["client_session_turn_tape_parts", "payload", "bytea"],
   ["client_session_turn_tape_records", "payload", "bytea"],
   ["client_session_turn_tape_records", "visible_payload", "bytea"],
@@ -881,6 +903,7 @@ export type LosslessTurnTapeFinalizeResult =
        * (internalServer finalize handler)据此发一条告警交人工核对(已告知用户失败却又产出计费内容)。
        */
       dispatchLateTape?: boolean;
+      settlementHandoff?: boolean;
     }
   | { applied: "session_not_found" | "session_deleted" | "incomplete" };
 
@@ -952,6 +975,24 @@ async function convergeDispatchOnFinalize(
     `SELECT 1 FROM turn_dispatches WHERE dispatch_id=$1::uuid FOR UPDATE`,
     [dispatchId],
   );
+  const fenced = await client.query<{ producer_fenced_at: Date | null }>(
+    `SELECT producer_fenced_at FROM turn_dispatches WHERE dispatch_id=$1::uuid`,
+    [dispatchId],
+  );
+  if (fenced.rows[0]?.producer_fenced_at) {
+    await client.query(
+      `UPDATE turn_tape_settlement_jobs
+          SET status='held', last_error='late_tape_after_fence', updated_at=NOW()
+        WHERE dispatch_id=$1::uuid AND status IN ('queued','leased','failed')`,
+      [dispatchId],
+    );
+    const held = await casToManualReconcile(client, {
+      dispatchId,
+      conflictReason: "late_tape_after_fence",
+      fromStatuses: ["admitted", "accepted", "rejecting", "terminal"],
+    });
+    return { lateTape: held !== null, removedVisibleStatus: false };
+  }
   const converged = await casToTerminal(client, {
     dispatchId,
     outcome,
@@ -1852,6 +1893,10 @@ interface DirectTapeHeader {
   status: string;
   turnKey: string;
   clientMessageId: string | null;
+  materializationStatus: string | null;
+  finalizedAt: string | null;
+  visibleAt: string | null;
+  visibleHead: VisibleHead | null;
 }
 
 const PRIVATE_TAPE_ROOT_FIELDS = new Set([
@@ -2102,7 +2147,9 @@ type PreparedModelSidecar = {
 };
 
 function sameLosslessTurnTapeHeader(
-  tape: LosslessTurnTapeHeaderRow,
+  tape: Pick<LosslessTurnTapeHeaderRow,
+    "agent_id" | "turn_index" | "status" | "turn_key" | "tape_sha256" |
+    "total_bytes" | "part_count" | "created_at" | "waive_reason">,
   request: LosslessTurnTapeFinalizeRequest,
 ): boolean {
   return tape.agent_id === request.agentId &&
@@ -2598,6 +2645,11 @@ async function claimLosslessTurnTapeStorageFormat(
 
 export const LOSSLESS_TURN_RECORD_STAGE_BATCH_SIZE = 128;
 
+let afterLosslessStageBatch: (() => Promise<void> | void) | null = null;
+export function _setAfterLosslessStageBatch(hook: (() => Promise<void> | void) | null): void {
+  afterLosslessStageBatch = hook;
+}
+
 export function _losslessTurnRecordStageBatches(
   recordCount: number,
   exactOrdinals: ReadonlySet<number>,
@@ -2644,6 +2696,7 @@ async function stagePreparedLosslessTurnRecords(
         throw new Error("lossless turn tape finalize header conflict");
       }
       if (tape.finalized_at !== null) return "finalized";
+      await client.query("SET LOCAL statement_timeout = '120s'");
       if (tape.record_storage_format !== prepared.recordStorageFormat) {
         throw new Error("lossless turn tape materialization format changed during staging");
       }
@@ -2866,6 +2919,7 @@ async function stagePreparedLosslessTurnRecords(
       return "staged";
     });
     if (staged !== "staged") return;
+    if (afterLosslessStageBatch) await afterLosslessStageBatch();
   }
 }
 
@@ -2994,16 +3048,22 @@ async function readDirectTapeHeaders(
       status: string;
       turn_key: string;
       client_message_id: string | null;
+      materialization_status: string | null;
+      finalized_at: string | null;
+      visible_at: string | null;
+      visible_head: VisibleHead | null;
     }>(
       `SELECT t.tape_id, t.tape_sha256, t.billing_anchor_id, t.status, t.turn_key,
               COALESCE(t.client_message_id, d.client_message_id) AS client_message_id,
               t.record_payload_bytes::text AS payload_bytes,
               t.physical_record_count::text AS physical_count,
-              t.logical_record_count::text AS logical_count
+              t.logical_record_count::text AS logical_count,
+              t.materialization_status, t.finalized_at::text, t.visible_at::text, t.visible_head
          FROM client_session_turn_tapes t
          LEFT JOIN turn_dispatches d ON d.dispatch_id=t.dispatch_id
         WHERE t.session_id=$1 AND t.user_id=$2 AND t.tape_id=ANY($3::text[])
-          AND t.finalized_at IS NOT NULL AND t.billing_anchor_id IS NOT NULL`,
+          AND (t.visible_at IS NOT NULL OR t.finalized_at IS NOT NULL)
+          AND t.billing_anchor_id IS NOT NULL`,
       [sessionId, userId, tapeIds],
     )
   ).rows;
@@ -3077,6 +3137,10 @@ async function readDirectTapeHeaders(
         status: row.status,
         turnKey: row.turn_key,
         clientMessageId: row.client_message_id,
+        materializationStatus: (row as { materialization_status?: string | null }).materialization_status ?? null,
+        finalizedAt: (row as { finalized_at?: string | null }).finalized_at ?? null,
+        visibleAt: (row as { visible_at?: string | null }).visible_at ?? null,
+        visibleHead: ((row as { visible_head?: VisibleHead | null }).visible_head ?? null),
       },
     ]),
   );
@@ -3403,6 +3467,28 @@ async function hydrateTurnTapeMessages(
     if (!header) throw new Error(`[pgSessions] finalized lossless turn tape missing: ${tapeId}`);
     if (header.tapeSha256 !== tapeSha256) {
       throw new Error(`[pgSessions] lossless turn tape aggregate hash mismatch: ${tapeId}`);
+    }
+    if (!recordsPublished({
+      materializationStatus: header.materializationStatus,
+      finalizedAt: header.finalizedAt,
+    })) {
+      const head = header.visibleHead;
+      const message: MessageLike = {
+        id: head?.messageId ?? header.billingAnchorId,
+        role: "assistant",
+        text: typeof head?.text === "string" ? head.text : "",
+        ts: typeof head?.ts === "number" ? head.ts : (typeof anchor.ts === "number" ? anchor.ts : 0),
+        status: header.status,
+        _source: "server",
+        _turnTapeId: header.tapeId,
+        _turnTapeSha256: header.tapeSha256,
+        _turnTapeComplete: true,
+        _turnKey: header.turnKey,
+        ...(header.clientMessageId ? { _clientMessageId: header.clientMessageId } : {}),
+        ...(typeof anchor._seq === "number" ? { _seq: anchor._seq } : {}),
+        ...(typeof anchor._orderSeq === "number" ? { _orderSeq: anchor._orderSeq } : {}),
+      };
+      return [message];
     }
     const expectedPhysical = anchor._turnTapePhysicalRecordCount ?? anchor._turnTapeRecordCount;
     if (
@@ -4422,7 +4508,7 @@ async function hasCompletedClientTurnImpl(
       `SELECT EXISTS (
          SELECT 1 FROM client_session_turn_tapes
           WHERE session_id=$1 AND user_id=$2 AND client_message_id=$3
-            AND status='completed' AND finalized_at IS NOT NULL
+            AND status='completed' AND (visible_at IS NOT NULL OR finalized_at IS NOT NULL)
        ) AS present`,
       [sessionId, userId, clientMessageId],
     )
@@ -4623,6 +4709,9 @@ type UnifiedTimelineTapeHeader = {
   status: string;
   turnKey: string;
   clientMessageId: string | null;
+  materializationStatus: string | null;
+  finalizedAt: string | null;
+  visibleHead: VisibleHead | null;
 };
 
 type UnifiedTimelineTapeHead = DirectTapePageHead & {
@@ -4782,11 +4871,13 @@ async function readUnifiedTimelineTapeHeaders(
       client_message_id: string | null;
     }>(
       `SELECT t.tape_id,t.tape_sha256,t.billing_anchor_id,t.status,t.turn_key,
-              COALESCE(t.client_message_id,d.client_message_id) AS client_message_id
+              COALESCE(t.client_message_id,d.client_message_id) AS client_message_id,
+              t.materialization_status, t.finalized_at::text, t.visible_head
          FROM client_session_turn_tapes t
          LEFT JOIN turn_dispatches d ON d.dispatch_id=t.dispatch_id
         WHERE t.session_id=$1 AND t.user_id=$2 AND t.tape_id=ANY($3::text[])
-          AND t.finalized_at IS NOT NULL AND t.billing_anchor_id IS NOT NULL`,
+          AND (t.visible_at IS NOT NULL OR t.finalized_at IS NOT NULL)
+          AND t.billing_anchor_id IS NOT NULL`,
       [sessionId, userId, tapeIds],
     )
   ).rows;
@@ -4797,6 +4888,9 @@ async function readUnifiedTimelineTapeHeaders(
     status: row.status,
     turnKey: row.turn_key,
     clientMessageId: row.client_message_id,
+    materializationStatus: (row as { materialization_status?: string | null }).materialization_status ?? null,
+    finalizedAt: (row as { finalized_at?: string | null }).finalized_at ?? null,
+    visibleHead: ((row as { visible_head?: VisibleHead | null }).visible_head ?? null),
   }]));
 }
 
@@ -5409,7 +5503,20 @@ async function readClientTimelinePageImpl(
             throw new Error(`[pgSessions] unified timeline tape hash mismatch: ${anchor._turnTapeId}`);
           }
           const upperOrdinal = beforeByTape.get(header.tapeId) ?? 2_147_483_647;
-          const heads = headsByTape.get(header.tapeId) ?? [];
+          const recordsReady = recordsPublished({
+            materializationStatus: header.materializationStatus,
+            finalizedAt: header.finalizedAt,
+          });
+          const heads = recordsReady ? (headsByTape.get(header.tapeId) ?? []) : [{
+            tape_id: header.tapeId,
+            msg_id: header.visibleHead?.messageId ?? header.billingAnchorId,
+            ordinal: 0,
+            role: "assistant",
+            ts: String(header.visibleHead?.ts ?? 0),
+            content_sha256: "0".repeat(64),
+            payload_bytes: "0",
+            visible_content_sha256: null,
+          }];
           let oldestSelectedOrdinal: number | null = null;
           for (const head of heads) {
             const payloadBytes = bigIntNum(head.payload_bytes, "turn tape timeline payload bytes");
@@ -5495,7 +5602,30 @@ async function readClientTimelinePageImpl(
     for (const unit of [...selected].reverse()) {
       if (unit.kind === "tape") {
         const records = tapeMessages.get(`${unit.header.tapeId}\0${unit.head.ordinal}`);
-        if (!records) throw new Error(`[pgSessions] unified timeline hydrated group missing: ${unit.header.tapeId}\0${unit.head.ordinal}`);
+        if (!records) {
+          if (!recordsPublished({
+            materializationStatus: unit.header.materializationStatus,
+            finalizedAt: unit.header.finalizedAt,
+          })) {
+            chronological.push({
+              id: unit.header.visibleHead?.messageId ?? unit.header.billingAnchorId,
+              role: "assistant",
+              text: unit.header.visibleHead?.text ?? "",
+              ts: unit.header.visibleHead?.ts ?? 0,
+              status: unit.header.status,
+              _source: "server",
+              _turnTapeId: unit.header.tapeId,
+              _turnTapeSha256: unit.header.tapeSha256,
+              _turnTapeComplete: true,
+              _turnKey: unit.header.turnKey,
+              _orderSeq: unit.orderSeq,
+              _timelineRecord: true,
+              ...(unit.header.clientMessageId ? { _clientMessageId: unit.header.clientMessageId } : {}),
+            });
+            continue;
+          }
+          throw new Error(`[pgSessions] unified timeline hydrated group missing: ${unit.header.tapeId}\0${unit.head.ordinal}`);
+        }
         chronological.push(...records);
         continue;
       }
@@ -6007,6 +6137,270 @@ async function readUserMessagePayloadImpl(
  * 构造 master 会话权威的 PG backend。返回对象结构化满足 `ClientSessionsBackend`,
  * 由 registerCommercial 注入。方法内闭包持有 pool。
  */
+
+async function commitVisibleLosslessTurnPhaseA(
+  pool: Pool,
+  userId: string,
+  request: LosslessTurnTapeFinalizeRequest,
+): Promise<LosslessTurnTapeFinalizeResult> {
+  const billingUserId = /^c:[1-9][0-9]*$/.test(userId)
+    ? numericCommercialUserId(userId)
+    : null;
+  return withTx(pool, async (client) => {
+    await lockTurnPersistenceKeys(client, userId, [request.turnKey]);
+    if (billingUserId !== null) {
+      await lockTurnBillingKeys(client, billingUserId, [request.turnKey]);
+    }
+    const session = (
+      await client.query<SessionWriteRow>(
+        `SELECT messages, next_seq, deleted_at, archived_through_seq, archived_count
+           FROM client_sessions WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+        [request.sessionId, userId],
+      )
+    ).rows[0];
+    if (!session) return { applied: "session_not_found" };
+    if (session.deleted_at !== null) return { applied: "session_deleted" };
+    const tape = (
+      await client.query<{
+        agent_id: string;
+        turn_index: number;
+        status: string;
+        turn_key: string;
+        tape_sha256: string;
+        total_bytes: string;
+        part_count: number;
+        created_at: string;
+        waive_reason: string | null;
+        visible_at: string | null;
+        finalized_at: string | null;
+        engine_billings: unknown;
+        billing_anchor_id: string | null;
+        dispatch_id: string | null;
+      }>(
+        `SELECT agent_id,turn_index,status,turn_key,tape_sha256,total_bytes,part_count,created_at,
+                waive_reason,visible_at::text,finalized_at::text,engine_billings,billing_anchor_id,dispatch_id
+           FROM client_session_turn_tapes
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
+          FOR UPDATE`,
+        [request.sessionId, userId, request.tapeId],
+      )
+    ).rows[0];
+    if (!tape) return { applied: "incomplete" };
+    if (!sameLosslessTurnTapeHeader(tape, request)) {
+      throw new Error("lossless turn tape finalize header conflict");
+    }
+    const settlement = request.settlement;
+    const engineBillings = settlement
+      ? settlementEngineBillings(settlement)
+      : (Array.isArray(tape.engine_billings)
+        ? structuredClone(tape.engine_billings) as DurableCodexBilling[]
+        : []);
+    const billingAnchorId = settlement?.billingAnchorId
+      ?? tape.billing_anchor_id
+      ?? losslessBillingAnchorId({
+        sessionId: request.sessionId,
+        agentId: request.agentId,
+        turnIndex: request.turnIndex,
+        text: settlement?.text,
+      });
+    let clientMessageId: string | null = null;
+    if (tape.dispatch_id !== null) {
+      clientMessageId = (
+        await client.query<{ client_message_id: string }>(
+          "SELECT client_message_id FROM turn_dispatches WHERE dispatch_id=$1",
+          [tape.dispatch_id],
+        )
+      ).rows[0]?.client_message_id ?? null;
+    }
+    const fenced = tape.dispatch_id
+      ? (
+          await client.query<{ producer_fenced_at: Date | null }>(
+            "SELECT producer_fenced_at FROM turn_dispatches WHERE dispatch_id=$1::uuid",
+            [tape.dispatch_id],
+          )
+        ).rows[0]?.producer_fenced_at
+      : null;
+    if (tape.visible_at !== null) {
+      if (request.waiveReason !== undefined && billingUserId !== null) {
+        await ensurePendingTurnWaiverInTransaction(client, {
+          userId: billingUserId,
+          turnKey: request.turnKey,
+          reason: request.waiveReason,
+        });
+      }
+      return {
+        applied: tape.finalized_at !== null ? "idempotent" : "finalized",
+        recordCount: 0,
+        engineBillings,
+        settlementHandoff: true,
+      };
+    }
+    const head = settlement
+      ? visibleHeadFromSettlement(request, settlement, clientMessageId)
+      : visibleHeadFallback(request, "", clientMessageId);
+    await client.query(
+      `UPDATE client_session_turn_tapes
+          SET visible_at=$1, visible_head=$2::jsonb,
+              billing_anchor_id=COALESCE(billing_anchor_id,$3),
+              engine_billings=CASE WHEN $4::jsonb <> '[]'::jsonb THEN $4::jsonb ELSE engine_billings END,
+              client_message_id=COALESCE(client_message_id,$5)
+        WHERE session_id=$6 AND user_id=$7 AND tape_id=$8`,
+      [
+        Date.now(),
+        JSON.stringify(head),
+        billingAnchorId,
+        JSON.stringify(engineBillings),
+        clientMessageId,
+        request.sessionId,
+        userId,
+        request.tapeId,
+      ],
+    );
+    let existingMessages: MessageLike[];
+    try {
+      const parsed = JSON.parse(session.messages);
+      if (!Array.isArray(parsed)) throw new Error("not array");
+      existingMessages = parsed as MessageLike[];
+    } catch {
+      throw new Error("lossless turn tape target session row malformed");
+    }
+    const stubRecord = { id: billingAnchorId, role: "assistant" as const, ts: head.ts, text: head.text };
+    const anchors = [tapeAnchor(stubRecord as never, request.tapeId, request.tapeSha256, 1, 1, undefined, [])];
+    const recordIds = new Set([billingAnchorId]);
+    existingMessages = existingMessages.filter(
+      (message) => typeof message?.id !== "string" || !recordIds.has(message.id),
+    );
+    const plan = planAppendServerAuthoredBatch(
+      existingMessages,
+      anchors,
+      typeof session.next_seq === "number" && session.next_seq > 0 ? session.next_seq : 1,
+      bigIntNumOr(session.archived_through_seq, 0),
+    );
+    if (plan.kind === "write") {
+      const nowMs = Date.now();
+      const archivedDelta = await execPgSpillPlan(
+        client,
+        request.sessionId,
+        userId,
+        plan.chunksToInsert,
+        plan.idsToInsert,
+        nowMs,
+      );
+      const archivedCount = bigIntNumOr(session.archived_count, 0) + archivedDelta;
+      await client.query(
+        `UPDATE client_sessions SET
+           messages=$1, message_count=$2, last_at=$3,
+           updated_at=GREATEST(updated_at + 1, ${CLOCK_MS_SQL}),
+           next_seq=$4, archived_through_seq=$5, archived_count=$6,
+           history_revision=history_revision + 1,
+           timeline_generation=timeline_generation + 1
+         WHERE id=$7 AND user_id=$8 AND deleted_at IS NULL`,
+        [
+          plan.finalJson,
+          plan.tail.length + archivedCount,
+          nowMs,
+          plan.nextSeq,
+          plan.archivedThroughSeq,
+          archivedCount,
+          request.sessionId,
+          userId,
+        ],
+      );
+    }
+    await enqueueMaterializationJob(client, {
+      sessionId: request.sessionId,
+      userId,
+      tapeId: request.tapeId,
+      dispatchId: tape.dispatch_id,
+    });
+    if (engineBillings.length > 0) {
+      await enqueueSettlementJob(client, {
+        sessionId: request.sessionId,
+        userId,
+        tapeId: request.tapeId,
+        dispatchId: tape.dispatch_id,
+        kind: "billing",
+        payload: { engineBillings },
+        billingAnchorId,
+        requestId: settlement?.requestId ?? engineBillings[0]?.requestId,
+        held: !!fenced,
+      });
+    }
+    if (request.waiveReason !== undefined && billingUserId !== null) {
+      await ensurePendingTurnWaiverInTransaction(client, {
+        userId: billingUserId,
+        turnKey: request.turnKey,
+        reason: request.waiveReason,
+      });
+      await enqueueSettlementJob(client, {
+        sessionId: request.sessionId,
+        userId,
+        tapeId: request.tapeId,
+        dispatchId: tape.dispatch_id,
+        kind: "waiver",
+        payload: { reason: request.waiveReason, turnKey: request.turnKey },
+        billingAnchorId,
+        held: !!fenced,
+      });
+    }
+    if (tape.dispatch_id !== null) {
+      await convergeDispatchOnFinalize(client, tape.dispatch_id, tape.status);
+    }
+    return {
+      applied: "finalized",
+      recordCount: 0,
+      engineBillings,
+      settlementHandoff: true,
+    };
+  });
+}
+
+
+async function readOpenDispatchForSession(
+  queryable: Pool | PoolClient,
+  sessionId: string,
+  userId: string,
+): Promise<{ openDispatch?: ClientSession["openDispatch"] }> {
+  const uidMatch = /^c:([1-9][0-9]*)$/.exec(userId);
+  if (!uidMatch) return {};
+  const row = (
+    await queryable.query<{
+      dispatch_id: string;
+      client_message_id: string;
+      status: string;
+      accepted_at: Date | null;
+      last_attempt_at: Date | null;
+      model: string | null;
+      last_frame_at: Date | null;
+    }>(
+      `SELECT d.dispatch_id, d.client_message_id, d.status, d.accepted_at, d.last_attempt_at, d.model,
+              (
+                SELECT MAX(f.created_at)
+                  FROM client_session_live_streams s
+                  JOIN client_session_live_frames f ON f.stream_key=s.stream_key
+                 WHERE s.dispatch_id=d.dispatch_id
+              ) AS last_frame_at
+         FROM turn_dispatches d
+        WHERE d.user_id=$1::bigint AND d.session_id=$2
+          AND d.status IN ('admitted','accepted','rejecting')
+        ORDER BY d.admitted_at DESC
+        LIMIT 1`,
+      [uidMatch[1], sessionId],
+    )
+  ).rows[0];
+  if (!row) return {};
+  return {
+    openDispatch: {
+      dispatchId: row.dispatch_id,
+      clientMessageId: row.client_message_id,
+      status: row.status,
+      acceptedAt: row.accepted_at ? row.accepted_at.getTime() : null,
+      lastFrameAt: (row.last_frame_at ?? row.last_attempt_at)?.getTime() ?? null,
+      ...(row.model ? { model: row.model } : {}),
+    },
+  };
+}
+
 export function createPgSessionsBackend(
   pool: Pool,
   options: PgSessionsBackendOptions,
@@ -6507,12 +6901,14 @@ export function createPgSessionsBackend(
       const res = await pool.query<{
         tape_found: boolean;
         finalized_at: string | null;
+        visible_at: string | null;
         tape_status: string | null;
         dispatch_lease_active: boolean;
       }>(
         `SELECT
            (tape.tape_id IS NOT NULL) AS tape_found,
            tape.finalized_at,
+           tape.visible_at,
            tape.status AS tape_status,
            COALESCE(
              dispatch.status IN ('admitted','accepted')
@@ -6521,10 +6917,10 @@ export function createPgSessionsBackend(
            ) AS dispatch_lease_active
          FROM (VALUES (1)) AS singleton(n)
          LEFT JOIN LATERAL (
-           SELECT tape_id, finalized_at, status
+           SELECT tape_id, finalized_at, visible_at, status
              FROM client_session_turn_tapes
             WHERE user_id = $1 AND dispatch_id = $3 AND attempt_no = $4
-            ORDER BY (finalized_at IS NOT NULL) DESC
+            ORDER BY (visible_at IS NOT NULL OR finalized_at IS NOT NULL) DESC
             LIMIT 1
          ) AS tape ON TRUE
          LEFT JOIN LATERAL (
@@ -6545,7 +6941,7 @@ export function createPgSessionsBackend(
         return { state: "none", status: null, dispatchLeaseActive };
       }
       return {
-        state: row.finalized_at !== null ? "finalized" : "partial",
+        state: row.visible_at !== null || row.finalized_at !== null ? "finalized" : "partial",
         status: row.tape_status ?? null,
         dispatchLeaseActive,
       };
@@ -6693,6 +7089,13 @@ export function createPgSessionsBackend(
         userId,
         request,
       );
+      let phaseA: LosslessTurnTapeFinalizeResult | null = null;
+      if (readyForPreparation) {
+        phaseA = await commitVisibleLosslessTurnPhaseA(pool, userId, request);
+        if (phaseA.applied === "session_not_found" || phaseA.applied === "session_deleted" || phaseA.applied === "incomplete") {
+          return phaseA;
+        }
+      }
       let prepared: PreparedLosslessTurnTape | null = null;
       let preparedModelRecordCount = 0;
       let releaseFinalizeAdmission: (() => void) | null = null;
@@ -6727,6 +7130,9 @@ export function createPgSessionsBackend(
         } catch (err) {
           releaseFinalizeAdmission?.();
           releaseFinalizeAdmission = null;
+          if (phaseA && phaseA.applied === "finalized" && isTransientTapeError(err)) {
+            return { ...phaseA, settlementHandoff: true };
+          }
           throw err;
         }
       }
@@ -6802,11 +7208,13 @@ export function createPgSessionsBackend(
             dispatch_id: string | null;
             attempt_no: number | null;
             client_message_id: string | null;
+            visible_at: string | null;
           }>(
             `SELECT tape_id,agent_id,turn_index,status,turn_key,tape_sha256,
                     total_bytes, part_count, created_at, waive_reason, finalized_at,
                     record_storage_format,engine_billings,
-                    billing_anchor_id,dispatch_id,attempt_no,client_message_id
+                    billing_anchor_id,dispatch_id,attempt_no,client_message_id,
+                    visible_at::text
                FROM client_session_turn_tapes
               WHERE session_id=$1 AND user_id=$2 AND tape_id=ANY($3::text[])
               ORDER BY tape_id FOR UPDATE`,
@@ -6912,11 +7320,25 @@ export function createPgSessionsBackend(
             applied: "idempotent",
             recordCount: Number(count.rows[0]?.count ?? 0),
             engineBillings: structuredClone(tape.engine_billings) as DurableCodexBilling[],
+            ...(request.waiveReason !== undefined || (Array.isArray(tape.engine_billings) && tape.engine_billings.length > 0)
+              ? { settlementHandoff: true }
+              : {}),
             ...(replayLate ? { dispatchLateTape: true } : {}),
-          };
-        }
+          };        }
 
-        if (!prepared) return { applied: "incomplete" };
+        if (!prepared) {
+          if (tape.visible_at !== null || (phaseA && phaseA.applied === "finalized")) {
+            return {
+              applied: "finalized",
+              recordCount: 0,
+              engineBillings: Array.isArray(tape.engine_billings)
+                ? structuredClone(tape.engine_billings) as DurableCodexBilling[]
+                : [],
+              settlementHandoff: true,
+            };
+          }
+          return { applied: "incomplete" };
+        }
         if (tape.record_storage_format !== prepared.recordStorageFormat) {
           throw new Error("lossless turn tape materialization format changed before publication");
         }
@@ -7304,7 +7726,11 @@ export function createPgSessionsBackend(
         await client.query(
           `UPDATE client_session_turn_tapes
               SET billing_anchor_id=$1, usage=$2, parent_turn_key=$3,
-                  engine_billings=$4, finalized_at=$5, record_storage_format=$6,
+                  engine_billings=$4, finalized_at=$5,
+                  visible_at=COALESCE(visible_at,$5),
+                  materialization_status='complete',
+                  materialization_error=NULL,
+                  record_storage_format=$6,
                   goal_id=$7::uuid, goal_state_revision=$8, goal_tokens_used=$9,
                   client_message_id=$10, continuation_of_turn_key=$11,
                   physical_record_count=$12, logical_record_count=$13,
@@ -7380,9 +7806,11 @@ export function createPgSessionsBackend(
           applied: "finalized",
           recordCount: turn.records.length,
           engineBillings: turn.engineBillings.map((billing) => structuredClone(billing)),
+          ...(turn.engineBillings.length > 0 || request.waiveReason !== undefined
+            ? { settlementHandoff: true }
+            : {}),
           ...(dispatchLate ? { dispatchLateTape: true } : {}),
-        };
-            });
+        };            });
             break;
           } catch (error) {
             if (error instanceof TurnTapeRecoveryLockUpgrade && lockAttempt === 0) {
@@ -7431,6 +7859,9 @@ export function createPgSessionsBackend(
               "server_authored_turn_anchor_map",
               "turn_tape_cost_components",
               "turn_tape_recovery_links",
+              "turn_dispatches",
+              "turn_tape_materialization_jobs",
+              "turn_tape_settlement_jobs",
               "session_goals",
               "wechat_bindings",
             ],
@@ -8429,6 +8860,7 @@ export function createPgSessionsBackend(
           // 实际合计为准，读尽后不会留下“还有 N 条”的幽灵按钮。
           archivedCount: bigIntNum(row.archived_count, "archived chunk message count"),
           archivedThroughSeq: archivedThroughOrderSeq,
+          ...(await readOpenDispatchForSession(queryable, row.id, row.user_id)),
         };
       };
       return options.view === "timeline"

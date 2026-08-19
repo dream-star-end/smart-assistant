@@ -87,6 +87,15 @@ export interface LosslessTurnTapePartRequest {
   attemptNo?: number
 }
 
+export interface LosslessTurnTapeSettlement {
+  billingAnchorId: string
+  requestId?: string
+  engineBillings: DurableCodexBilling[]
+  text: string
+  ts: number
+  errorCode?: string
+}
+
 export interface LosslessTurnTapeFinalizeRequest {
   protocolVersion: typeof LOSSLESS_TURN_TAPE_VERSION
   action: 'finalize'
@@ -107,6 +116,32 @@ export interface LosslessTurnTapeFinalizeRequest {
   /** 同 part:dispatch 身份(master 收敛以 tape header 存量为准,finalize 携带仅为对称冗余)。 */
   dispatchId?: string
   attemptNo?: number
+  /**
+   * Compact billing/visible envelope from the same tape builder identity
+   * (docs/design/2026-08-19-turn-finalize-decoupling.md rev2 B1).
+   */
+  settlement?: LosslessTurnTapeSettlement
+}
+
+/** Record id namespace used by materializeLosslessTurn. */
+export function losslessRecordPrefix(sessionId: string, agentId: string, turnIndex: number): string {
+  const idPart = agentId === LOSSLESS_TURN_TAPE_LEGACY_AGENT_ID ? sessionId : `${sessionId}-${agentId}`
+  return `srv-${idPart}-t${turnIndex}`
+}
+
+/** Canonical billing-anchor record id matching materializeLosslessTurn. */
+export function losslessBillingAnchorId(input: {
+  sessionId: string
+  agentId: string
+  turnIndex: number
+  assistantSegments?: Array<{ index: number }>
+  text?: string
+  errorCode?: string
+}): string {
+  const prefix = losslessRecordPrefix(input.sessionId, input.agentId, input.turnIndex)
+  const segs = input.assistantSegments
+  if (segs && segs.length > 0) return `${prefix}-s${segs[segs.length - 1]!.index}`
+  return prefix
 }
 
 export type LosslessTurnTapeRequest =
