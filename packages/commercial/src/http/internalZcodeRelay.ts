@@ -5,6 +5,8 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { pipeline } from "node:stream/promises";
 import { request } from "undici";
+import type { Dispatcher } from "undici";
+import { directEgressDispatcher } from "../account-pool/egressDispatcher.js";
 import {
   ContainerIdentityError,
   verifyContainerIdentity,
@@ -87,6 +89,8 @@ export function makeZcodeRelayHandler(deps: {
   identityRepo: ContainerIdentityRepo;
   codingPlanKey: string;
   requestFn?: typeof request;
+  /** Test override. Production uses the same singleton as STATIC_PROVIDER_META.zai. */
+  dispatcher?: Dispatcher;
 }): ZcodeRelayHandler {
   return async (req, res, ctx) => {
     setSecurityHeaders(res);
@@ -133,6 +137,10 @@ export function makeZcodeRelayHandler(deps: {
       const rawBody = await readLimited(req, 2 * 1024 * 1024);
       const body = forceUpstreamModel(rawBody);
       const anthropicVersion = headerValue(req.headers["anthropic-version"]) ?? ZCODE_ANTHROPIC_VERSION;
+      // Match STATIC_PROVIDER_META.zai.egress="direct": do not inherit the
+      // process-global EnvHttpProxyAgent (Japanese sing-box). api.z.ai via
+      // that proxy ECONNRESETs; empty catch mapped it to 503.
+      const dispatcher = deps.dispatcher ?? directEgressDispatcher();
       const upstream = await (deps.requestFn ?? request)(ZCODE_OFFICIAL_UPSTREAM, {
         method: "POST",
         headers: {
@@ -143,6 +151,7 @@ export function makeZcodeRelayHandler(deps: {
           accept: typeof req.headers.accept === "string" ? req.headers.accept : "application/json",
         },
         body,
+        dispatcher,
       });
       res.statusCode = upstream.statusCode;
       for (const [rawKey, rawValue] of Object.entries(upstream.headers)) {
