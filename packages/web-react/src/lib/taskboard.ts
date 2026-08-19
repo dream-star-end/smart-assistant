@@ -97,8 +97,8 @@ export const STAGE_EFFORT_LABEL: Record<StageEffort, string> = {
   max: '最高',
 }
 
-/** 与 gateway `DELEGATE_HARD_TIMEOUT_SEC` / `handlePatchStage` 上限锁步。 */
-export const DELEGATE_HARD_TIMEOUT_SEC = 45 * 60
+/** 与 gateway `DELEGATE_IDLE_TIMEOUT_MAX_SEC` / stage 校验锁步。 */
+export const DELEGATE_IDLE_TIMEOUT_MAX_SEC = 45 * 60
 
 /** 与 gateway `PROJECT_KEY_RE` 锁步：2–12 位大写字母或数字，且以字母开头。 */
 export const PROJECT_KEY_RE = /^[A-Z][A-Z0-9]{1,11}$/
@@ -749,7 +749,7 @@ const VALIDATION_ZH: Array<{ test: (msg: string) => boolean; zh: string }> = [
   },
   {
     test: (m) => /timeoutSec must be/i.test(m),
-    zh: `超时不能超过 ${DELEGATE_HARD_TIMEOUT_SEC} 秒（45 分钟）`,
+    zh: `无活动超时不能超过 ${DELEGATE_IDLE_TIMEOUT_MAX_SEC} 秒（45 分钟）`,
   },
   { test: (m) => /invalid kind/i.test(m), zh: '阶段类型只能是 AI、人工或闸门' },
   { test: (m) => /invalid ticketType/i.test(m), zh: '单据类型无效' },

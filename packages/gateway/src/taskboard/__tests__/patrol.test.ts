@@ -22,7 +22,7 @@ import {
 } from '../db/pipelines.js'
 import { createProject } from '../db/projects.js'
 import { addRelation } from '../db/relations.js'
-import { acquireLease, listRuns } from '../db/runs.js'
+import { acquireLease, getRun, listRuns, reapExpiredLeases } from '../db/runs.js'
 import { seedDefaultPipelines } from '../db/seed.js'
 import { getSettings, getUsage, updateSettings } from '../db/settings.js'
 import { createTicket, getTicket, updateTicket } from '../db/tickets.js'
@@ -80,6 +80,8 @@ function engine(
     onAlert?: GuardrailAlertHandler
     log?: (msg: string, extra?: Record<string, unknown>) => void
     circuitCooldownMs?: number
+    leaseTtlMs?: number
+    leaseRenewIntervalMs?: number
   } = {},
 ): PatrolEngine {
   return new PatrolEngine({
@@ -93,6 +95,8 @@ function engine(
     onAlert: over.onAlert,
     log: over.log,
     circuitCooldownMs: over.circuitCooldownMs,
+    leaseTtlMs: over.leaseTtlMs,
+    leaseRenewIntervalMs: over.leaseRenewIntervalMs,
   })
 }
 
@@ -197,6 +201,112 @@ describe('lease 互斥', () => {
     await eng.tick(WORK)
     const skippedAgain = listRuns(db, { ticketId: ticket.id, status: 'skipped' }).items
     assert.equal(skippedAgain.filter((r) => r.skipReason === 'lease_held').length, 1)
+    db.close()
+  })
+
+  it('活跃长 run 周期续租，不会因初始 TTL 到点被 reaper 回收', async () => {
+    const db = freshDb()
+    const { ticket } = seedReadyAi(db)
+    let now = WORK.getTime()
+    let started!: () => void
+    let finish!: () => void
+    const didStart = new Promise<void>((resolve) => { started = resolve })
+    const delegated = new Promise<void>((resolve) => { finish = resolve })
+    const eng = engine(
+      db,
+      async () => {
+        started()
+        await delegated
+        return { ok: true, output: '长任务完成' }
+      },
+      { now: () => now, leaseTtlMs: 100, leaseRenewIntervalMs: 10 },
+    )
+    const pending = eng.tick(new Date(now))
+    await didStart
+    now += 80
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    now += 80
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    assert.equal(reapExpiredLeases(db, now).length, 0)
+    finish()
+    await pending
+    assert.ok(listRuns(db, { ticketId: ticket.id }).items.some((r) => r.status === 'succeeded'))
+    db.close()
+  })
+
+  it('旧 worker lease 过期后即使返回成功，也不能覆盖新 run 或推进 ticket', async () => {
+    const db = freshDb()
+    const { ticket, stage } = seedReadyAi(db)
+    let now = WORK.getTime()
+    let started!: () => void
+    let finish!: () => void
+    const didStart = new Promise<void>((resolve) => { started = resolve })
+    const delegated = new Promise<void>((resolve) => { finish = resolve })
+    const eng = engine(
+      db,
+      async () => {
+        started()
+        await delegated
+        return { ok: true, output: '过期 worker 的迟到成功' }
+      },
+      { now: () => now, leaseTtlMs: 1_000, leaseRenewIntervalMs: 500 },
+    )
+    const pending = eng.tick(new Date(now))
+    await didStart
+    const oldRun = listRuns(db, { ticketId: ticket.id, status: 'running' }).items[0]
+    assert.ok(oldRun)
+    now += 1_001
+    assert.equal(reapExpiredLeases(db, now).length, 1)
+    const newer = acquireLease(db, ticket.id, stage.id, 'agent:new-owner', 10_000, {
+      agentId: stage.agentId,
+      trigger: 'manual',
+      now,
+    })
+    finish()
+    await pending
+    assert.equal(getRun(db, oldRun.id)?.status, 'timeout')
+    assert.equal(getRun(db, newer.id)?.status, 'running')
+    assert.equal(getTicket(db, ticket.id)?.status, 'running')
+    assert.equal(listComments(db, ticket.id).some((c) => c.runId === oldRun.id), false)
+    db.close()
+  })
+
+  it('usage 异步查询期间仍续租，结算使用查询完成后的当前时间', async () => {
+    const db = freshDb()
+    const { ticket } = seedReadyAi(db)
+    let now = WORK.getTime()
+    let lookupStarted!: () => void
+    let finishLookup!: () => void
+    const didStartLookup = new Promise<void>((resolve) => { lookupStarted = resolve })
+    const lookupGate = new Promise<void>((resolve) => { finishLookup = resolve })
+    const eng = engine(
+      db,
+      async () => ({ ok: true, output: 'delegate 已完成，等待 usage' }),
+      {
+        now: () => now,
+        leaseTtlMs: 100,
+        leaseRenewIntervalMs: 10,
+        lookupUsage: async () => {
+          lookupStarted()
+          await lookupGate
+          return { tokensIn: 1, tokensOut: 1, costUsd: 0 }
+        },
+      },
+    )
+    const pending = eng.tick(new Date(now))
+    await didStartLookup
+    const run = listRuns(db, { ticketId: ticket.id, status: 'running' }).items[0]
+    assert.ok(run)
+    const initialExpiry = run.leaseExpiresAt ?? 0
+    now += 80
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    assert.ok(
+      (getRun(db, run.id)?.leaseExpiresAt ?? 0) > initialExpiry,
+      'renew timer must remain active while usage lookup is pending',
+    )
+    finishLookup()
+    await pending
+    assert.equal(getRun(db, run.id)?.status, 'succeeded')
     db.close()
   })
 })

@@ -6,9 +6,8 @@
 //   2. 若仍有未过期 lease → TaskboardLeaseHeld;
 //   3. 否则插入 status=running 的 run 并写入 lease。
 //
-// TTL 默认 GUARDRAIL_DEFAULTS.leaseTtlMs = 50 分钟,必须长于 delegate 的
-// 45 分钟硬超时(CORRECTIONS §2.2):否则 run 还在跑,下一轮 tick 就会把
-// 同一张卡再认领一遍,双跑。
+// TTL 默认 GUARDRAIL_DEFAULTS.leaseTtlMs = 50 分钟。PatrolEngine 对活跃 run
+// 周期续租；进程崩溃/失去 owner 后停止续租，下一轮 tick 才能安全回收。
 //
 // 本 DAO **不改** ticket.status —— 那是 stateMachine 的职责。这里只保证
 // 「同一 ticket 同一时刻最多一个未过期 lease」。
@@ -104,6 +103,18 @@ export interface UpdateRunPatch {
   summary?: string | null
   outputMd?: string | null
   error?: string | null
+}
+
+export interface SettleLeaseRunPatch {
+  status: 'succeeded' | 'failed' | 'timeout'
+  summary: string | null
+  outputMd: string | null
+  error: string | null
+  finishedAt: number
+  durationMs: number | null
+  tokensIn: number | null
+  tokensOut: number | null
+  costUsd: number | null
 }
 
 export interface RunListQuery {
@@ -325,6 +336,63 @@ export function acquireLease(
     })
   })
   return run.immediate()
+}
+
+/**
+ * Extend an active lease only while the same owner still holds an unexpired
+ * run. An expired worker cannot revive itself in the gap before the reaper.
+ */
+export function renewLease(
+  db: TaskboardDb,
+  runId: string,
+  owner: string,
+  ttlMs: number = GUARDRAIL_DEFAULTS.leaseTtlMs,
+  now: number = nowMs(),
+): TicketRun | null {
+  const result = db.prepare(
+    `UPDATE tb_ticket_run
+        SET lease_expires_at = @expiresAt
+      WHERE id = @runId
+        AND lease_owner = @owner
+        AND lease_expires_at IS NOT NULL
+        AND lease_expires_at > @now
+        AND status IN ${ACTIVE_LEASE_STATUSES}`,
+  ).run({ runId, owner, now, expiresAt: now + ttlMs })
+  return result.changes === 1 ? getRun(db, runId) : null
+}
+
+/**
+ * Fenced terminal write. Call inside the same SQLite transaction that applies
+ * ticket/comment side effects; a stale worker gets null and must discard its
+ * result without touching the ticket now owned by a newer run.
+ */
+export function settleLeaseRun(
+  db: TaskboardDb,
+  runId: string,
+  owner: string,
+  patch: SettleLeaseRunPatch,
+  now: number = nowMs(),
+): TicketRun | null {
+  const result = db.prepare(
+    `UPDATE tb_ticket_run SET
+       status = @status,
+       summary = @summary,
+       output_md = @outputMd,
+       error = @error,
+       finished_at = @finishedAt,
+       duration_ms = @durationMs,
+       tokens_in = @tokensIn,
+       tokens_out = @tokensOut,
+       cost_usd = @costUsd,
+       lease_owner = NULL,
+       lease_expires_at = NULL
+     WHERE id = @runId
+       AND lease_owner = @owner
+       AND lease_expires_at IS NOT NULL
+       AND lease_expires_at > @now
+       AND status IN ${ACTIVE_LEASE_STATUSES}`,
+  ).run({ runId, owner, now, ...patch })
+  return result.changes === 1 ? getRun(db, runId) : null
 }
 
 /** 清掉 run 上的 lease。不改 status;调用方随后 updateRun 写终态。 */

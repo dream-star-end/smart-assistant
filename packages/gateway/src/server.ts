@@ -1660,6 +1660,8 @@ interface RunDelegateInput {
   /** 覆盖默认 channel 'delegate'。taskboard 传 'taskboard',且不得加入
    *  MASTER_SINK_PERSIST_CHANNELS,否则巡检文本会写进 client_sessions 刷屏。 */
   channel?: string
+  /** 可选的本次无活动超时。只按真实 child activity 续租,不是总运行时长上限。 */
+  idleTimeoutMs?: number
   /** 可选:覆盖目标成员默认模型的 catalog 型号。审查委派忽略。 */
   model?: string
   /** HTTP/MCP 可选续跑:已通过 DelegateResumeRegistry 占用的钥匙。 */
@@ -1727,7 +1729,7 @@ export class PerTurnDelegationGuard {
 
   constructor(
     private readonly limit = MAX_HIDDEN_DELEGATIONS_PER_TURN,
-    /** 远大于 delegate hard timeout 上限(2h)和现实单 turn 时长,只兜内存/锁死。 */
+    /** 与平台 12h logical-turn 安全窗口对齐，只兜计数 Map 泄漏/永久锁死。 */
     private readonly staleMs = 12 * 60 * 60_000,
   ) {}
 
@@ -10749,6 +10751,10 @@ export class Gateway {
     const durableRuntimeEvents: DurableRuntimeEvent[] = []
     const durableEngineBillings: DurableCodexBilling[] = []
     const durableGoalUsageRecords: DurableGoalUsageRecord[] = []
+    let lastChildActivityAt = Date.now()
+    const markChildActivity = () => {
+      lastChildActivityAt = Date.now()
+    }
     let session: AgentSession
     let detachAncestorActivity: (() => void) | undefined
     try {
@@ -10785,8 +10791,10 @@ export class Gateway {
       session._platformGoal = delegateParent?.platformGoal
         ? structuredClone(delegateParent.platformGoal)
         : null
-      const handleChildActivity = () =>
+      const handleChildActivity = () => {
+        markChildActivity()
         this._markDelegateAncestorActivity(delegateParent?.sessionKey)
+      }
       session.runner.on?.('activity', handleChildActivity)
       detachAncestorActivity = () => session.runner.off?.('activity', handleChildActivity)
       // 回填本委派的进度卡 runId:子委派追溯到**一级**委派时复用它,把嵌套进度挂回同一张卡。
@@ -10848,12 +10856,7 @@ export class Gateway {
     // 非 review / 解析不出 → undefined(编排据 undefined 走降级放行)。
     let verdict: ReviewVerdict | undefined
     let ownGoalUsageRecord: DurableGoalUsageRecord | undefined
-    const timeoutConfig = resolveDelegateTimeoutConfig()
-    const startedAt = Date.now()
-    let lastChildActivityAt = startedAt
-    const markChildActivity = () => {
-      lastChildActivityAt = Date.now()
-    }
+    const timeoutConfig = resolveDelegateTimeoutConfig(process.env, input.idleTimeoutMs)
     let timeoutTimer: NodeJS.Timeout | null = null
     const clearTimeoutTimer = () => {
       if (timeoutTimer) clearInterval(timeoutTimer)
@@ -10863,7 +10866,6 @@ export class Gateway {
       timeoutTimer = setInterval(() => {
         const reason = getDelegateTimeoutReason(
           Date.now(),
-          startedAt,
           lastChildActivityAt,
           timeoutConfig,
         )
@@ -11227,6 +11229,7 @@ export class Gateway {
       effort: input.effort ?? undefined,
       sessionKey: input.sessionKey,
       channel: 'taskboard',
+      idleTimeoutMs: input.timeoutSec * 1_000,
     })
     if (result.kind === 'rejected') {
       return { ok: false, output: '', error: result.message }

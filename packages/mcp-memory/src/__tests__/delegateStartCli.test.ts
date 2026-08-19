@@ -52,7 +52,6 @@ describe('delegateStartCli', () => {
       args: { agentId: 'auditor', goal: '审' },
       contextToken: 'tok',
       pollWaitMs: 20,
-      hardTimeoutMs: 1_000,
       start: async (agentId, body, token) => {
         starts += 1
         assert.equal(agentId, 'auditor')

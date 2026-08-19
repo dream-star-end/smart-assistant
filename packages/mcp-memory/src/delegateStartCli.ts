@@ -34,7 +34,7 @@ export function readDelegateContextToken(
   if (!file) {
     return {
       ok: false,
-      error: `${DELEGATE_CONTEXT_FILE_ENV} missing: Cursor 同步委派必须带网关签发的上下文文件，禁止用环境变量伪造 agent/session/depth`,
+      error: `${DELEGATE_CONTEXT_FILE_ENV} missing:异步委派必须带网关签发的上下文文件，禁止用环境变量伪造 agent/session/depth`,
     }
   }
   try {
@@ -86,7 +86,6 @@ export async function runDelegateStartAndWait(opts: {
   start: DelegateStartOnce
   waitOnce: DelegateWaitOnce
   pollWaitMs: number
-  hardTimeoutMs: number
 }): Promise<DelegateWaitLoopResult> {
   const started = await opts.start(
     opts.args.agentId,
@@ -101,7 +100,6 @@ export async function runDelegateStartAndWait(opts: {
     jobIds: [start.jobId],
     waitOnce: opts.waitOnce,
     pollWaitMs: opts.pollWaitMs,
-    hardTimeoutMs: opts.hardTimeoutMs,
   })
 }
 

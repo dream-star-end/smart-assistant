@@ -200,11 +200,12 @@ export const TOOLS = [
       required: ['agentId', 'message'],
     },
   },
-  // ── Synchronous task delegation ──
+  // ── Async job-backed task delegation ──
   {
     name: 'delegate_task',
     description: [
-      '将单个任务委派给另一个 agent 并等待结果返回。与 send_to_agent 不同,这是同步操作 — 你会直接收到子 agent 的执行结果。',
+      '将单个任务委派给另一个 agent，并先短时等待结果。与 send_to_agent 不同，作业结果仍回到当前队长。',
+      '若短等窗口内未完成，本工具会返回 jobId；必须立刻用 Bash 执行 `oc-memory delegate-wait <jobId>` 阻塞取回结果。',
       '',
       '适用场景:',
       '- 需要专业 agent 处理后你还要继续用结果的场景',
@@ -219,7 +220,7 @@ export const TOOLS = [
       '限制: 最大递归深度 3 层,最大并发 5 个,单个队长每 turn 委派次数有上限(超限会返回可读错误,请先整合已有结果再决定是否继续)。',
       '',
       '默认每次新开会话。工具结果会回传 sessionKey;下一轮要对同一成员续跑时传入 resumeSessionKey。',
-      '进行中不要重复 resume,改用 oc-memory delegate-wait。',
+      '进行中不要重复 resume，也不要重复调用本工具；只用返回的 jobId 等待。',
     ].join('\n'),
     inputSchema: {
       type: 'object',
@@ -261,8 +262,9 @@ export const TOOLS = [
   {
     name: 'delegate_tasks',
     description: [
-      '一次把多个**互相独立**的子任务并行委派给成员并等待全部返回(fan-out)。',
+      '一次把多个**互相独立**的子任务并行委派给成员并短时等待(fan-out)。',
       '各子任务并发执行、互不依赖,单个失败不影响其余(每项独立标注 ✅/❌)。',
+      '仍在运行的任务会返回 jobId 列表；按返回指令用一条 `oc-memory delegate-wait ...` 阻塞取回全部结果。',
       '',
       '仅用于「彼此独立、可同时进行」的子任务;有先后依赖(B 需要 A 的产出)时,',
       '请分步用 `delegate_task` 串行委派,不要塞进本工具。单次最多 4 个并行子任务。',

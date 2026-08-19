@@ -22,7 +22,7 @@
 //   那不是「这张卡被拒绝」,是「这轮根本没巡这站」。
 //
 // 坑:
-//   - lease TTL 必须 > 45min 硬超时(用 GUARDRAIL_DEFAULTS.leaseTtlMs=50min)。
+//   - 活跃 run 周期续 lease；续租/收尾都带 owner+未过期 fencing，旧 worker 不得回写。
 //   - 状态转移一律 assertTransition,actor 用 agent;熔断/循环/回收用 system。
 //   - 并发槽是本模块的 PatrolSlotCounter,与 delegate 全局 4 槽无关。
 //   - tick 里的 timer 由 server.ts 持有并 unref/clearInterval;本文件不自己
@@ -41,7 +41,8 @@ import {
   insertRun,
   listRuns,
   reapExpiredLeases,
-  releaseLease,
+  renewLease,
+  settleLeaseRun,
   updateRun,
 } from './db/runs.js'
 import {
@@ -195,6 +196,9 @@ export interface PatrolEngineOptions {
    * 可被 OPENCLAUDE_TASKBOARD_CIRCUIT_COOLDOWN_MS 覆盖。
    */
   circuitCooldownMs?: number
+  /** 测试可缩短；生产默认 50min，并由下项周期续租。 */
+  leaseTtlMs?: number
+  leaseRenewIntervalMs?: number
 }
 
 export interface TickReport {
@@ -224,6 +228,8 @@ export class PatrolEngine {
   private readonly lookupUsage: RunUsageLookup
   private readonly usageBackfillDelayMs: number
   private readonly circuitCooldownMs: number
+  private readonly leaseTtlMs: number
+  private readonly leaseRenewIntervalMs: number
   private ticking = false
 
   constructor(opts: PatrolEngineOptions) {
@@ -238,6 +244,14 @@ export class PatrolEngine {
     this.lookupUsage = opts.lookupUsage ?? lookupUsageFromSessionLog
     this.usageBackfillDelayMs = opts.usageBackfillDelayMs ?? DEFAULT_USAGE_BACKFILL_DELAY_MS
     this.circuitCooldownMs = resolveCircuitCooldownMs(opts.circuitCooldownMs)
+    this.leaseTtlMs = Math.max(1, opts.leaseTtlMs ?? GUARDRAIL_DEFAULTS.leaseTtlMs)
+    this.leaseRenewIntervalMs = Math.max(
+      1,
+      Math.min(
+        opts.leaseRenewIntervalMs ?? GUARDRAIL_DEFAULTS.leaseRenewIntervalMs,
+        Math.max(1, Math.floor(this.leaseTtlMs / 2)),
+      ),
+    )
   }
 
   /**
@@ -504,7 +518,7 @@ export class PatrolEngine {
       hasLease: true,
       autoClose: stage.autoClose,
     })
-    const run = acquireLease(db, ticket.id, stage.id, owner, GUARDRAIL_DEFAULTS.leaseTtlMs, {
+    const run = acquireLease(db, ticket.id, stage.id, owner, this.leaseTtlMs, {
       agentId: stage.agentId,
       trigger: 'patrol',
       now,
@@ -536,6 +550,7 @@ export class PatrolEngine {
     const agentId = run.agentId ?? stage.agentId ?? 'unidentified'
     const sessionKey = run.sessionKey ?? buildPatrolSessionKey(agentId, ticket.id, stage.id, run.id)
     if (!run.sessionKey) updateRun(db, run.id, { sessionKey })
+    const owner = run.leaseOwner
 
     const comments = listComments(db, ticket.id, { limit: 200, offset: 0 })
     const lastRun = latestSettledRun(db, ticket.id, run.id)
@@ -557,24 +572,45 @@ export class PatrolEngine {
       return
     }
 
-    let result: PatrolDelegateResult
+    let leaseLost = !owner
+    const renewTimer = owner
+      ? setInterval(() => {
+          try {
+            if (!renewLease(db, run.id, owner, this.leaseTtlMs, this.nowFn())) {
+              leaseLost = true
+              this.log('taskboard lease renewal lost', { runId: run.id, owner })
+            }
+          } catch (err) {
+            leaseLost = true
+            this.log('taskboard lease renewal failed', { runId: run.id, owner, err: String(err) })
+          }
+        }, this.leaseRenewIntervalMs)
+      : null
+    renewTimer?.unref?.()
+
     try {
-      result = await this.delegate({
-        agentId,
-        goal: prompt,
-        toolsets: stage.toolsets,
-        effort: stage.effort,
-        sessionKey,
-        timeoutSec: stage.timeoutSec,
-      })
-    } catch (err) {
-      result = {
-        ok: false,
-        output: '',
-        error: err instanceof Error ? err.message : String(err),
+      let result: PatrolDelegateResult
+      try {
+        result = await this.delegate({
+          agentId,
+          goal: prompt,
+          toolsets: stage.toolsets,
+          effort: stage.effort,
+          sessionKey,
+          timeoutSec: stage.timeoutSec,
+        })
+      } catch (err) {
+        result = {
+          ok: false,
+          output: '',
+          error: err instanceof Error ? err.message : String(err),
+        }
       }
+      if (leaseLost) return
+      await this.finishRun(db, ticket, stage, run, settings, result)
+    } finally {
+      if (renewTimer) clearInterval(renewTimer)
     }
-    await this.finishRun(db, ticket, stage, run, settings, result)
   }
 
   private async finishRun(
@@ -585,7 +621,6 @@ export class PatrolEngine {
     settings: TaskboardSettings,
     result: PatrolDelegateResult,
   ): Promise<void> {
-    const now = this.nowFn()
     const timedOut = result.timedOut === true
     const ok = result.ok && !timedOut && !result.error
     const output = result.output ?? ''
@@ -606,51 +641,61 @@ export class PatrolEngine {
         run.id,
       )
     const usage = await this.resolveUsage(sessionKey, result)
-
-    try {
-      releaseLease(db, run.id)
-    } catch {
-      /* 已过期或已释放 */
-    }
-    updateRun(db, run.id, {
-      status,
-      summary: digested.summary,
-      outputMd: output || null,
-      error,
-      finishedAt: now,
-      durationMs: run.startedAt != null ? now - run.startedAt : null,
-      tokensIn: usage.tokensIn,
-      tokensOut: usage.tokensOut,
-      costUsd: usage.costUsd,
-      leaseOwner: null,
-      leaseExpiresAt: null,
-    })
-    if (!isRunUsageComplete(usage)) {
-      this.queueUsageBackfill(db, run.id, sessionKey)
+    // `resolveUsage` is asynchronous and may span multiple lease windows.
+    // Fence against the actual commit instant, never the pre-await timestamp.
+    const now = this.nowFn()
+    const owner = run.leaseOwner
+    if (!owner) {
+      this.log('taskboard stale result discarded:run has no lease owner', { runId: run.id })
+      return
     }
 
-    if (digested.commentBody) {
-      createComment(db, {
-        ticketId: ticket.id,
-        authorKind: 'agent',
-        author: run.agentId
-          ? `agent:${run.agentId}`
-          : stage.agentId
-            ? `agent:${stage.agentId}`
-            : 'agent:taskboard',
-        body: digested.commentBody,
-        runId: run.id,
-      })
-    }
+    const settled = db.transaction(() => {
+      const fenced = settleLeaseRun(
+        db,
+        run.id,
+        owner,
+        {
+          status,
+          summary: digested.summary,
+          outputMd: output || null,
+          error,
+          finishedAt: now,
+          durationMs: run.startedAt != null ? now - run.startedAt : null,
+          tokensIn: usage.tokensIn,
+          tokensOut: usage.tokensOut,
+          costUsd: usage.costUsd,
+        },
+        now,
+      )
+      if (!fenced) return false
 
-    const current = getTicket(db, ticket.id)
-    if (!current || current.status !== 'running') return
+      if (digested.commentBody) {
+        createComment(db, {
+          ticketId: ticket.id,
+          authorKind: 'agent',
+          author: run.agentId
+            ? `agent:${run.agentId}`
+            : stage.agentId
+              ? `agent:${stage.agentId}`
+              : 'agent:taskboard',
+          body: digested.commentBody,
+          runId: run.id,
+        })
+      }
 
-    if (ok) {
-      this.applySuccess(db, current, stage, settings, run)
-    } else {
-      this.applyFailure(db, current, stage, settings, error ?? 'failed', run)
+      const current = getTicket(db, ticket.id)
+      if (!current || current.status !== 'running') return true
+      if (ok) this.applySuccess(db, current, stage, settings, run)
+      else this.applyFailure(db, current, stage, settings, error ?? 'failed', run)
+      return true
+    }).immediate()
+
+    if (!settled) {
+      this.log('taskboard stale result discarded:fence lost', { runId: run.id, owner })
+      return
     }
+    if (!isRunUsageComplete(usage)) this.queueUsageBackfill(db, run.id, sessionKey)
   }
 
   private applySuccess(

@@ -1,5 +1,5 @@
 /**
- * oc-memory delegate-wait loop: long-poll until all jobs finish / hard cap / TTL.
+ * oc-memory delegate-wait loop: long-poll until all jobs finish or expire.
  * Short constants; fake waitOnce, no real 45s.
  *
  * Run: npx tsx --test packages/mcp-memory/src/__tests__/delegateWaitCli.test.ts
@@ -26,7 +26,6 @@ describe('runDelegateWaitLoop', () => {
     const r = await runDelegateWaitLoop({
       jobIds: ['dlgjob-1'],
       pollWaitMs: 20,
-      hardTimeoutMs: 5_000,
       waitOnce: async (jobId) => {
         calls.push(jobId)
         n++
@@ -46,7 +45,6 @@ describe('runDelegateWaitLoop', () => {
     const r = await runDelegateWaitLoop({
       jobIds: ['dlgjob-a', 'dlgjob-b'],
       pollWaitMs: 20,
-      hardTimeoutMs: 5_000,
       waitOnce: async (jobId) => {
         remaining.delete(jobId)
         return { statusCode: 200, body: doneBody(jobId, `out-${jobId}`) }
@@ -63,7 +61,6 @@ describe('runDelegateWaitLoop', () => {
     const r = await runDelegateWaitLoop({
       jobIds: ['dlgjob-gone'],
       pollWaitMs: 20,
-      hardTimeoutMs: 5_000,
       waitOnce: async (jobId) => ({
         statusCode: 404,
         body: JSON.stringify({
@@ -77,28 +74,23 @@ describe('runDelegateWaitLoop', () => {
     assert.match(r.stdout, /expired/)
   })
 
-  it('hard timeout while still running → exit 2, no busy-spin', async () => {
-    let now = 0
+  it('keeps waiting through repeated running views until the job completes', async () => {
     let waitCalls = 0
     const r = await runDelegateWaitLoop({
       jobIds: ['dlgjob-slow'],
       pollWaitMs: 30,
-      hardTimeoutMs: 80,
-      now: () => now,
-      sleep: async (ms) => {
-        now += ms
-      },
+      sleep: async () => {},
       waitOnce: async (jobId) => {
         waitCalls++
-        now += 30
+        if (waitCalls === 4) {
+          return { statusCode: 200, body: doneBody(jobId, '长任务完成') }
+        }
         return { statusCode: 200, body: JSON.stringify({ status: 'running', jobId }) }
       },
     })
-    assert.equal(r.exitCode, 2)
-    assert.match(r.stderr, /timed out/)
-    assert.match(r.stderr, /dlgjob-slow/)
-    assert.ok(waitCalls >= 1)
-    assert.ok(waitCalls < 10, `busy-spin? waitCalls=${waitCalls}`)
+    assert.equal(r.exitCode, 0, r.stderr)
+    assert.match(r.stdout, /长任务完成/)
+    assert.equal(waitCalls, 4)
   })
 
   it('one long-poll transport timeout → keep waiting, do not fail the CLI', async () => {
@@ -110,7 +102,6 @@ describe('runDelegateWaitLoop', () => {
     const r = await runDelegateWaitLoop({
       jobIds: ['dlgjob-blip'],
       pollWaitMs: 20,
-      hardTimeoutMs: 5_000,
       waitOnce: async (jobId) => {
         n++
         if (n === 1) {
@@ -130,7 +121,6 @@ describe('runDelegateWaitLoop', () => {
     const r = await runDelegateWaitLoop({
       jobIds: ['  '],
       pollWaitMs: 20,
-      hardTimeoutMs: 100,
       waitOnce: async () => ({ statusCode: 500, body: '{}' }),
     })
     assert.equal(r.exitCode, 1)

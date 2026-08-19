@@ -26,6 +26,7 @@ import { resolveMcpMemoryEntry } from './mcpMemoryEntry.js'
 import type { ExecutionTarget } from './remoteTarget.js'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 import { type TerminalBackend, createBackend } from './terminalBackend.js'
+import { issueDelegateContextToken } from './delegateContext.js'
 
 const runnerLog = createLogger({ module: 'subprocessRunner' })
 
@@ -860,6 +861,8 @@ export class SubprocessRunner extends EventEmitter {
   /** True once we force-killed due to stderr overflow; prevents double-kill. */
   private overflowKilled = false
   private sessionDir: string | null = null
+  /** Stable path inherited by MCP + Bash; contents are re-minted every turn. */
+  private delegateContextFile: string | null = null
   private platformGoal: GoalStateSnapshot | null = null
   /** Timestamp of last stdout activity — used for liveness detection */
   public lastActivityAt: number = Date.now()
@@ -1143,6 +1146,9 @@ export class SubprocessRunner extends EventEmitter {
           ...providerEnv,
           OPENCLAUDE_SESSION_KEY: this.opts.sessionKey,
           OPENCLAUDE_AGENT_ID: this.opts.agentId,
+          ...(this.delegateContextFile
+            ? { OPENCLAUDE_DELEGATE_CONTEXT_FILE: this.delegateContextFile }
+            : {}),
           // Per-session effort level (xhigh / max from chat-mode pills, or
           // undefined to let CCB use its model-default — Opus 4.7 → high).
           // Empty string deletes any inherited CLAUDE_CODE_EFFORT_LEVEL so a
@@ -1525,6 +1531,7 @@ export class SubprocessRunner extends EventEmitter {
 
     if (!this.proc) await this.start()
     if (!this.proc) throw new Error('failed to start CCB subprocess')
+    this.refreshDelegateContext()
     const content =
       typeof userTextOrBlocks === 'string'
         ? [{ type: 'text', text: userTextOrBlocks }]
@@ -1741,6 +1748,17 @@ export class SubprocessRunner extends EventEmitter {
       // set it; codex side passes empty-string default).
       const mcpEntry = resolveMcpMemoryEntry(this.opts.config.auth.claudeCodePath)
       if (mcpEntry) {
+        const delegateContextFile = resolve(sessionDir, 'delegate-context')
+        writeFileSync(
+          delegateContextFile,
+          `${issueDelegateContextToken({
+            agentId: this.opts.agentId,
+            sessionKey: this.opts.sessionKey,
+            depth: this.opts.delegationDepth ?? 0,
+          })}\n`,
+          { mode: 0o600 },
+        )
+        this.delegateContextFile = delegateContextFile
         mcpServers['openclaude-memory'] = {
           type: 'stdio',
           command: 'npx',
@@ -1758,6 +1776,7 @@ export class SubprocessRunner extends EventEmitter {
             OPENCLAUDE_SESSION_KEY: this.opts.sessionKey,
             OPENCLAUDE_GATEWAY_PORT: String(this.opts.config.gateway.port),
             OPENCLAUDE_GATEWAY_TOKEN: this.opts.config.gateway.accessToken,
+            OPENCLAUDE_DELEGATE_CONTEXT_FILE: delegateContextFile,
             OPENCLAUDE_DELEGATION_DEPTH: String(this.opts.delegationDepth ?? 0),
             ...(process.env.OPENCLAUDE_BASELINE_SKILLS_DIR
               ? {
@@ -1889,6 +1908,21 @@ export class SubprocessRunner extends EventEmitter {
       try { rmSync(this.sessionDir, { recursive: true, force: true }) } catch {}
       this.sessionDir = null
     }
+    this.delegateContextFile = null
+  }
+
+  /** Refresh caller binding at the actual turn boundary, not process spawn. */
+  private refreshDelegateContext(): void {
+    if (!this.delegateContextFile) return
+    writeFileSync(
+      this.delegateContextFile,
+      `${issueDelegateContextToken({
+        agentId: this.opts.agentId,
+        sessionKey: this.opts.sessionKey,
+        depth: this.opts.delegationDepth ?? 0,
+      })}\n`,
+      { mode: 0o600 },
+    )
   }
 
   /** Forward a fully-drained child exit only while that exact child still owns

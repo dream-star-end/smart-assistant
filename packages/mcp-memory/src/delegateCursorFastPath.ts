@@ -1,12 +1,12 @@
 /**
- * Cursor-engine delegate fast path: start the gateway job asynchronously, wait
- * up to ~45s (under the CLI's 60s MCP tools/call hard timeout), and if the
- * child is still running return a jobId plus Bash instructions for
+ * Shared delegate fast path (originally introduced for Cursor): start the
+ * gateway job asynchronously, wait up to ~45s, and if the child is still
+ * running return a jobId plus Bash instructions for
  * `oc-memory delegate-wait`.
  *
  * Pure enough to unit-test with fake HTTP; index.ts only supplies POST/wait.
- * Non-cursor engines never import this path (gated in index.ts on
- * OPENCLAUDE_ENGINE === 'cursor').
+ * Every engine uses this path so Codex/CCB MCP call deadlines are never
+ * mistaken for the lifetime of a healthy child job.
  */
 import type { FanoutItemResult } from './delegateFanout.js'
 
@@ -51,9 +51,9 @@ export function formatDelegateRunning(
   const keyBit = sessionKey ? ` sessionKey=${sessionKey}` : ''
   return [
     `子任务仍在运行 (agent: ${label}${goalBit})。status=running jobId=${jobId}${keyBit}`,
-    'Cursor MCP 通道有 60 秒硬超时,不能在本工具里继续等。请立刻用 Bash 阻塞等待结果,不要重复调用 delegate_task,也不要轮询 MCP:',
+    '本次 MCP 调用只负责启动并短等；子任务会继续运行。请立刻用 Bash 阻塞等待结果,不要重复调用 delegate_task,也不要轮询 MCP:',
     `  oc-memory delegate-wait ${jobId}`,
-    '该命令会阻塞直到子任务完成或超过平台硬上限,然后把结果打印到 stdout。',
+    '该命令会阻塞直到子任务完成、无活动超时或网关重启导致句柄失效,然后把结果打印到 stdout。',
   ].join('\n')
 }
 
@@ -66,7 +66,7 @@ export function formatDelegateFanoutRunning(items: FanoutCursorItem[]): string {
   const running = items.filter((it) => it.running && it.jobId)
   const done = items.filter((it) => !it.running)
   const jobIds = running.map((it) => it.jobId).filter((id): id is string => Boolean(id))
-  const header = `并行委派 ${items.length} 个子任务: ${done.length} 已完成 / ${running.length} 仍在运行(Cursor MCP 60 秒硬超时,不能在本工具里继续等)。`
+  const header = `并行委派 ${items.length} 个子任务: ${done.length} 已完成 / ${running.length} 仍在运行(本次 MCP 调用已返回作业句柄)。`
   const doneSections = done.map((it, i) => {
     const mark = it.isError ? '❌' : '✅'
     const goalPreview = it.goal.length > 60 ? `${it.goal.slice(0, 60)}…` : it.goal

@@ -52,12 +52,9 @@ export const MODEL_AUTHORITY_EGRESS_CAPABILITY = 'model_authority_v1-egress'
 export const AUTHORITY_TTL_MS = 120_000
 
 /**
- * turn lease 有效期 = 平台最大 turn 窗口 + grace(R4-M1)。
- *
- * 45min 对齐 gateway `delegateTimeout.ts` DEFAULT_HARD_TIMEOUT_MS(团队/delegate 硬上限),
- * +5min grace 覆盖收尾/结算。**耦合警告**:若把 OPENCLAUDE_DELEGATE_HARD_TIMEOUT_MS 调高,
- * 必须同步抬高签发侧 lease ttl(signAuthorityBundle 的 leaseTtlMs 参数),否则长 turn 的
- * 后续上游请求会被 lease 过期误伤 —— 这正是 R4-M1 要消除的那类误伤。
+ * turn lease 是 50min 的滚动签名窗口，不是 turn/delegate 总运行时长。
+ * 活跃长 turn 在 30min 时续签；平台绝对安全上限由下方
+ * AUTHORITY_TURN_MAX_LIFETIME_MS 单独定义。常量名为 wire 兼容保留。
  */
 export const PLATFORM_MAX_TURN_MS = 45 * 60_000
 export const TURN_LEASE_GRACE_MS = 5 * 60_000
@@ -66,8 +63,8 @@ export const TURN_LEASE_TTL_MS = PLATFORM_MAX_TURN_MS + TURN_LEASE_GRACE_MS
 /**
  * bridge turn 的绝对寿命上限。lease 本身仍保持 50min 的短滚动窗口；活跃长任务由
  * master 在每次续签时把 `expiresAt` 向后滚动，但永远不能越过 durable journal 的
- * turn 起点加 `AUTHORITY_TURN_MAX_LIFETIME_MS`。gateway 对同一逻辑 turn 起点执行硬终止，
- * 因此签发与执行不会再次出现「票据先过期、任务仍被允许继续」的双口径。起点不进
+ * turn 起点加 `AUTHORITY_TURN_MAX_LIFETIME_MS`。gateway 对同一逻辑 turn 起点执行平台级
+ * 安全终止；delegate 自身没有 45min 墙钟截止线。起点不进
  * lease wire，避免破坏仍在滚动运行的严格 v1 reader。
  */
 export const AUTHORITY_TURN_MAX_LIFETIME_MS = 12 * 60 * 60_000

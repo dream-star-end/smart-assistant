@@ -1,7 +1,7 @@
 /**
- * `oc-memory delegate-wait` — long-poll the gateway until every jobId finishes
- * or the hard cap is hit. Blocks on `/api/delegate/wait` (tens of seconds per
- * round); never busy-spins.
+ * `oc-memory delegate-wait` — long-poll the gateway until every jobId reaches
+ * a terminal state. Blocks on `/api/delegate/wait` (tens of seconds per round)
+ * and never converts healthy elapsed wall time into failure.
  */
 import {
   formatDelegateHttpResult,
@@ -12,10 +12,6 @@ import {
 export const DEFAULT_DELEGATE_WAIT_POLL_MS = 30_000
 export const MIN_DELEGATE_WAIT_POLL_MS = 250
 export const MAX_DELEGATE_WAIT_POLL_MS = 55_000
-
-export const DEFAULT_DELEGATE_WAIT_HARD_MS = 2 * 60 * 60_000 + 60_000
-export const MIN_DELEGATE_WAIT_HARD_MS = 60_000
-export const MAX_DELEGATE_WAIT_HARD_MS = DEFAULT_DELEGATE_WAIT_HARD_MS
 
 function normalizeMs(
   raw: string | undefined,
@@ -35,16 +31,6 @@ export function resolveDelegateWaitPollMs(env: NodeJS.ProcessEnv = process.env):
     DEFAULT_DELEGATE_WAIT_POLL_MS,
     MIN_DELEGATE_WAIT_POLL_MS,
     MAX_DELEGATE_WAIT_POLL_MS,
-  )
-}
-
-/** Overall CLI cap. Default 2h+60s (outlasts gateway hard clamp); env `OPENCLAUDE_DELEGATE_WAIT_HARD_MS` clamped to 1min..2h+60s. */
-export function resolveDelegateWaitHardMs(env: NodeJS.ProcessEnv = process.env): number {
-  return normalizeMs(
-    env.OPENCLAUDE_DELEGATE_WAIT_HARD_MS,
-    DEFAULT_DELEGATE_WAIT_HARD_MS,
-    MIN_DELEGATE_WAIT_HARD_MS,
-    MAX_DELEGATE_WAIT_HARD_MS,
   )
 }
 
@@ -79,11 +65,8 @@ export async function runDelegateWaitLoop(opts: {
   jobIds: string[]
   waitOnce: DelegateWaitOnce
   pollWaitMs: number
-  hardTimeoutMs: number
-  now?: () => number
   sleep?: (ms: number) => Promise<void>
 }): Promise<DelegateWaitLoopResult> {
-  const now = opts.now ?? Date.now
   const sleep =
     opts.sleep ??
     ((ms: number) =>
@@ -96,21 +79,10 @@ export async function runDelegateWaitLoop(opts: {
   }
   const pending = new Set(unique)
   const results = new Map<string, FormattedDelegateResult>()
-  const startedAt = now()
 
   while (pending.size > 0) {
-    const elapsed = now() - startedAt
-    if (elapsed >= opts.hardTimeoutMs) {
-      const leftover = [...pending].join(', ')
-      return {
-        exitCode: 2,
-        stdout: formatCollected(unique, results),
-        stderr: `delegate-wait timed out after ${Math.round(opts.hardTimeoutMs / 1000)}s; still running: ${leftover}\n`,
-      }
-    }
-    const remaining = opts.hardTimeoutMs - elapsed
-    const waitMs = Math.max(1, Math.min(opts.pollWaitMs, remaining))
-    const roundStarted = now()
+    const waitMs = opts.pollWaitMs
+    const roundStarted = Date.now()
     const views = await Promise.all(
       [...pending].map(async (jobId) => {
         try {
@@ -140,9 +112,9 @@ export async function runDelegateWaitLoop(opts: {
       results.set(jobId, formatDelegateHttpResult(view.httpStatus, view.body, jobId))
     }
     if (pending.size === 0) break
-    const roundElapsed = now() - roundStarted
+    const roundElapsed = Date.now() - roundStarted
     if (roundElapsed < BUSY_LOOP_GUARD_MS) {
-      await sleep(Math.min(1_000, remaining))
+      await sleep(1_000)
     }
   }
 

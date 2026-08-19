@@ -2,12 +2,17 @@ import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 
 import {
+  DELEGATE_CONTEXT_TTL_MS,
   issueDelegateContextToken,
   resetDelegateContextKeyForTests,
   verifyDelegateContextToken,
 } from '../delegateContext.js'
 
 describe('delegateContext token', () => {
+  it('covers the platform 12h turn lifetime plus settlement grace', () => {
+    assert.equal(DELEGATE_CONTEXT_TTL_MS, 12 * 60 * 60_000 + 5 * 60_000)
+  })
+
   it('round-trips agentId/sessionKey/depth', () => {
     const token = issueDelegateContextToken({
       agentId: 'main',

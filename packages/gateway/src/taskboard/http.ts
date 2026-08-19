@@ -127,8 +127,8 @@ export type { TaskboardSettings, TaskboardUsage }
 /** 与 commercial `containerApiProxy` body 上限对齐,超限 413 而不是崩。 */
 export const TASKBOARD_MAX_BODY_BYTES = 512 * 1024
 
-/** delegate 硬超时 45 分钟(秒)。stage.timeoutSec 不得超过此值。 */
-const DELEGATE_HARD_TIMEOUT_SEC = 45 * 60
+/** 单次 run 允许配置的最大无活动窗口；活跃 run 没有 45 分钟墙钟上限。 */
+const DELEGATE_IDLE_TIMEOUT_MAX_SEC = 45 * 60
 
 const USER_ID = 'default'
 const HUMAN_ACTOR_ID = `user:${USER_ID}`
@@ -2137,8 +2137,8 @@ function validateStageWrite(input: {
     const parsed = parseEntryCondition(input.entryCondition)
     if (!parsed.ok) throw new TaskboardValidationError(parsed.error)
   }
-  if (input.timeoutSec != null && input.timeoutSec > DELEGATE_HARD_TIMEOUT_SEC) {
-    throw new TaskboardValidationError(`timeoutSec must be <= ${DELEGATE_HARD_TIMEOUT_SEC}`)
+  if (input.timeoutSec != null && input.timeoutSec > DELEGATE_IDLE_TIMEOUT_MAX_SEC) {
+    throw new TaskboardValidationError(`timeoutSec must be <= ${DELEGATE_IDLE_TIMEOUT_MAX_SEC}`)
   }
 }
 
