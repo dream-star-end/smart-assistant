@@ -394,6 +394,7 @@ export class CcbMessageParser {
   private onEvent: (e: SessionStreamEvent) => void
   private onToolUse?: (tool: DetectedToolUse) => void
   private onToolResult?: (result: DetectedToolResult) => void
+  private onNativeCompactionSummary?: (summaryText: string) => void
   /** F5 — 每观测到一个 **Bash** tool_use(**含子 agent**,parentToolUseId 与否都触发)
    *  就回调一次,仅供归属登记(tool_use_id → 发起 turn),不触发任何 host bridge。
    *  与 onToolUse(主 agent-only、驱动 CronCreate/委派等桥接)分离,避免子 agent 工具
@@ -438,6 +439,7 @@ export class CcbMessageParser {
     onEvent: (e: SessionStreamEvent) => void
     onToolUse?: (tool: DetectedToolUse) => void
     onToolResult?: (result: DetectedToolResult) => void
+    onNativeCompactionSummary?: (summaryText: string) => void
     /** F5 — 见字段级注释:所有 Bash tool_use(含子 agent)的归属登记回调。 */
     onBashToolObserved?: (toolUseId: string) => void
     onPostFinalRuntimeEvent?: (
@@ -478,6 +480,7 @@ export class CcbMessageParser {
     }
     this.onToolUse = opts.onToolUse
     this.onToolResult = opts.onToolResult
+    this.onNativeCompactionSummary = opts.onNativeCompactionSummary
     this.onBashToolObserved = opts.onBashToolObserved
     this.onPostFinalRuntimeEvent = opts.onPostFinalRuntimeEvent
     this.onFinish = opts.onFinish
@@ -1220,6 +1223,15 @@ export class CcbMessageParser {
 
   private _handleUser(msg: SdkMessage, parentToolUseId?: string): void {
     const content = (msg as any).message?.content
+    if (
+      typeof content === 'string' &&
+      (msg as any).isSynthetic === true &&
+      (msg as any).isReplay === false &&
+      content.startsWith('This session is being continued from a previous conversation')
+    ) {
+      this.onNativeCompactionSummary?.(content.trim())
+      return
+    }
     if (!Array.isArray(content)) return
     for (const c of content) {
       if (c?.type === 'tool_result') {

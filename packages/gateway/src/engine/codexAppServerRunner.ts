@@ -20,10 +20,11 @@ export function _codexMemoryTurnEnv(
   }
 }
 import { EventEmitter } from 'node:events'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { createReadStream, lstatSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { isAbsolute, join, resolve } from 'node:path'
+import { createInterface } from 'node:readline'
 import {
   AUTOMATIC_TURN_RETRY_MAX,
   type CallTokenUsageSnapshot,
@@ -55,12 +56,49 @@ import { V3_CODEX_RELAY_PREFIX } from '../v3CodexRelay.js'
 import { issueDelegateContextToken } from '../delegateContext.js'
 import { createLogger } from '../logger.js'
 import { type ClassifiedErrorCode, classifyRunError } from '../errorClassify.js'
-import type { AutomaticRetryState, CollabAgentPolicy } from './engineAdapter.js'
+import type { AutomaticRetryState, CollabAgentPolicy, NativeModelHandoffArtifact } from './engineAdapter.js'
 
 const log = createLogger({ module: 'codexAppServerRunner' })
 
 const RUNNER_SHUTDOWN_GRACE_DEFAULT_MS = 3_000
 const RUNNER_SHUTDOWN_FINAL_DRAIN_DEFAULT_MS = 3_000
+
+const NATIVE_COMPACTION_TIMEOUT_MS = 15 * 60_000
+const CODEX_ROLLOUT_MAX_BYTES = 256 * 1024 * 1024
+
+export async function readLatestCodexNativeHandoff(
+  rolloutPath: string,
+  compactStartedAt: number,
+): Promise<NativeModelHandoffArtifact> {
+  if (!isAbsolute(rolloutPath)) throw new Error('CODEX_COMPACTION_PATH_INVALID')
+  const canonical = realpathSync(rolloutPath)
+  if (canonical !== resolve(rolloutPath)) throw new Error('CODEX_COMPACTION_PATH_INVALID')
+  const info = lstatSync(canonical)
+  if (!info.isFile() || info.isSymbolicLink() || info.size > CODEX_ROLLOUT_MAX_BYTES) {
+    throw new Error('CODEX_COMPACTION_PATH_INVALID')
+  }
+  let latest: { timestamp: number; message: string } | null = null
+  const lines = createInterface({
+    input: createReadStream(canonical, { encoding: 'utf8' }),
+    crlfDelay: Infinity,
+  })
+  for await (const line of lines) {
+    if (!line.includes('"type":"compacted"')) continue
+    let parsed: unknown
+    try { parsed = JSON.parse(line) } catch { continue }
+    if (!parsed || typeof parsed !== 'object') continue
+    const row = parsed as Record<string, unknown>
+    if (row.type !== 'compacted' || !row.payload || typeof row.payload !== 'object') continue
+    const ts = typeof row.timestamp === 'string' ? Date.parse(row.timestamp) : Number.NaN
+    if (!Number.isFinite(ts) || ts + 5_000 < compactStartedAt) continue
+    const payload = row.payload as Record<string, unknown>
+    const message = typeof payload.message === 'string' ? payload.message.trim() : ''
+    if (!message || !Array.isArray(payload.replacement_history)) continue
+    if (!latest || ts >= latest.timestamp) latest = { timestamp: ts, message }
+  }
+  if (!latest) throw new Error('CODEX_NATIVE_COMPACTION_NOT_EXPORTED')
+  return { summaryText: latest.message, source: 'codex', compactStartedAt }
+}
 
 // ── turn/start 窄路径自动重试(turn-retry 批,2026-07-18)──────────────────
 // 只重试 **turn/start 请求本身被拒**的窄路径(app-server 明确 JSON-RPC application
@@ -1031,6 +1069,12 @@ export class CodexAppServerRunner extends EventEmitter {
   /** Promise wired into `turn/completed` notification handling. Set by runTurn
    *  before sending `turn/start`, resolved by handleNotification on
    *  `turn/completed` for the matching turnId. */
+  private pendingNativeCompaction: {
+    startedAt: number
+    resolve: () => void
+    reject: (error: Error) => void
+    timer: NodeJS.Timeout
+  } | null = null
   private currentTurnCompleter: {
     resolve: (turn: {
       status?: string
@@ -1468,6 +1512,53 @@ export class CodexAppServerRunner extends EventEmitter {
     this.pendingUserInputIdsByRpc.clear()
   }
 
+  async compactForHandoff(): Promise<NativeModelHandoffArtifact> {
+    if (!this.proc || !this.attached || !this.threadId) {
+      throw new Error('CODEX_NATIVE_COMPACTION_SESSION_NOT_READY')
+    }
+    if (this.processing || this.currentTurnCompleter || this.pendingNativeCompaction) {
+      throw new Error('CODEX_NATIVE_COMPACTION_BUSY')
+    }
+    const compactStartedAt = Date.now()
+    const completed = new Promise<void>((resolvePromise, rejectPromise) => {
+      const timer = setTimeout(() => {
+        if (this.pendingNativeCompaction?.startedAt !== compactStartedAt) return
+        this.pendingNativeCompaction = null
+        rejectPromise(new Error('CODEX_NATIVE_COMPACTION_TIMEOUT'))
+      }, NATIVE_COMPACTION_TIMEOUT_MS)
+      timer.unref?.()
+      this.pendingNativeCompaction = {
+        startedAt: compactStartedAt,
+        resolve: resolvePromise,
+        reject: rejectPromise,
+        timer,
+      }
+    })
+    try {
+      await this.sendRequest('thread/compact/start', { threadId: this.threadId })
+      await completed
+      const result = await this.sendRequest('thread/read', {
+        threadId: this.threadId,
+        includeTurns: false,
+      }) as { thread?: { path?: unknown } }
+      const rolloutPath = result.thread?.path
+      if (typeof rolloutPath !== 'string' || !rolloutPath) {
+        throw new Error('CODEX_NATIVE_COMPACTION_PATH_MISSING')
+      }
+      return await readLatestCodexNativeHandoff(rolloutPath, compactStartedAt)
+    } catch (error) {
+      this.clearPendingNativeCompaction(compactStartedAt)
+      throw error
+    }
+  }
+
+  private clearPendingNativeCompaction(compactStartedAt: number): void {
+    const pending = this.pendingNativeCompaction
+    if (!pending || pending.startedAt !== compactStartedAt) return
+    this.pendingNativeCompaction = null
+    clearTimeout(pending.timer)
+  }
+
   interrupt(): boolean {
     // 审计 R8:退避窗口内 activeTurnId 为 null 但有重试待发 —— 中断退避,runTurn 的
     // backoff sleep 立即以「已中断」返回,走 USER_CANCELLED 终态并清 retrying 状态帧。
@@ -1687,6 +1778,12 @@ export class CodexAppServerRunner extends EventEmitter {
     const pendingQueue = this.queue
     this.queue = []
     for (const q of pendingQueue) q.reject(new Error('CodexAppServerRunner shutdown'))
+    if (this.pendingNativeCompaction) {
+      const pending = this.pendingNativeCompaction
+      this.pendingNativeCompaction = null
+      clearTimeout(pending.timer)
+      pending.reject(new Error('CODEX_NATIVE_COMPACTION_INTERRUPTED'))
+    }
     // Resolve app-server reverse requests while stdin is still writable. This
     // mirrors a browser deny and prevents requestUserInput from surviving a
     // transient runner recycle in either pending map.
@@ -2568,6 +2665,19 @@ export class CodexAppServerRunner extends EventEmitter {
     if (!params || typeof params !== 'object') return
     const p = params as Record<string, unknown>
     const turnId = typeof p.turnId === 'string' ? p.turnId : undefined
+
+    if (
+      this.pendingNativeCompaction &&
+      method === 'item/completed' &&
+      _isContextCompactionItem(p.item) &&
+      (typeof p.threadId !== 'string' || p.threadId === this.threadId)
+    ) {
+      const pending = this.pendingNativeCompaction
+      this.pendingNativeCompaction = null
+      clearTimeout(pending.timer)
+      pending.resolve()
+      return
+    }
 
     // Codex exposes auto-compaction as a ThreadItem (`contextCompaction`).
     // In the app-server protocol it may belong to a short internal turn whose

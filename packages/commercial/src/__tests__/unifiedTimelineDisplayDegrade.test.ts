@@ -11,6 +11,16 @@ const FIRST_SENTENCE = "全文可见头：";
 const USER_ID = "c:1";
 const SESSION_ID = "webdisplay01";
 
+type TimelineMessage = Record<string, unknown> & {
+  id?: string;
+  role?: string;
+  text?: string;
+  _displayDegraded?: boolean;
+  _displayDegradeReason?: string;
+  _timelineUnitKey?: string;
+};
+type TimelineSession = Record<string, unknown> & { messages: TimelineMessage[] };
+
 function sha256(bytes: Buffer): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
@@ -77,7 +87,7 @@ function fakePool(handlers: Array<[string, unknown]>): Pool {
 async function getTimeline(handlers: Array<[string, unknown]>) {
   resetTapeDisplayDegradeLogForTests();
   const backend = createPgSessionsBackend(fakePool(handlers), { expectedGeneration: 0 });
-  return backend.getClientSession(SESSION_ID, USER_ID, { view: "timeline" });
+  return await backend.getClientSession(SESSION_ID, USER_ID, { view: "timeline" }) as TimelineSession | null;
 }
 
 async function readPage(

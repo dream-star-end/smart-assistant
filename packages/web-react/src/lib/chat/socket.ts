@@ -113,6 +113,7 @@ import type {
   OutboundTurnUsageWire,
   OutboundCallUsageWire,
   OutboundControlReceiptWire,
+  OutboundModelSwitchPreparedWire,
   OutboundWire,
   GoalSnapshotWire,
   RepoBindErrorWire,
@@ -690,6 +691,15 @@ export class ChatSocket {
   private controlPumpScheduled = false;
   private readonly controlPersistRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
+  private readonly abandonedModelSwitches = new Map<string, string>();
+  private readonly pendingModelSwitches = new Map<string, {
+    sessId: string;
+    targetModel: string;
+    resolve: (switchId: string) => void;
+    reject: (error: Error) => void;
+    timer: ReturnType<typeof setTimeout>;
+  }>();
+
   // ── GitHub 仓库绑定待确认队列 ──
   // PUT 成功后试发 inbound.control.session_repo_bind;若 WS 未就绪/未投递,在 onopen(hello 之后)
   // 与 sys.relay_ready 时 flush 兜底。收到匹配/更新版本的 status/bind_error 帧即清。
@@ -858,6 +868,7 @@ export class ChatSocket {
     }
     if (this.boundBillingPaid) window.removeEventListener("openclaude:billing-paid", this.boundBillingPaid);
     if (this.boundModelFixed) window.removeEventListener("openclaude:model-policy-fixed", this.boundModelFixed);
+    this.rejectPendingModelSwitches("连接已断开，未切换模型", true);
     this.clearReconnectTimers();
     if (this.keepAliveTimer) clearInterval(this.keepAliveTimer);
     if (this.reconnectInFlightTimer) clearTimeout(this.reconnectInFlightTimer);
@@ -1520,6 +1531,10 @@ export class ChatSocket {
     this.dispatchSlots.set(sessId, clientMessageId);
     const user = sess.messages.find((message) => message.role === "user" && message.id === clientMessageId);
     if (user) user.status = "sent";
+    if (
+      user?._routing?.modelSwitchId &&
+      sess._preparedModelSwitch?.id === user._routing.modelSwitchId
+    ) sess._preparedModelSwitch = undefined;
     if (!sess._sendingInFlight) {
       this.clearTransientNotice(sess.id);
       sess._streamingAssistant = null;
@@ -1754,6 +1769,7 @@ export class ChatSocket {
       } catch {
         /* ignore */
       }
+      this.flushAbandonedModelSwitches()
 
       // hello 发完(peer 已注册)后补发积压的仓库绑定(reconnect 兜底,见 pendingRepoBind)。
       this.flushAllRepoBinds();
@@ -1846,6 +1862,7 @@ export class ChatSocket {
         this.pendingPing = null;
       }
       if (this.ws !== ws) return; // stale socket
+      this.rejectPendingModelSwitches("连接已断开，未切换模型", false);
       this.relayReady = false; // 连接关闭:relay 失效,待下次 sys.relay_ready
       this.masterOwnsAutomaticRecovery = false;
       this.resetControlsForReplay();
@@ -2143,6 +2160,16 @@ export class ChatSocket {
             this.clearAutoContinueInFlight(frame.idempotencyKey);
           }
         }
+        return;
+      }
+      case "outbound.model_switch.prepared": {
+        const frame = f as OutboundModelSwitchPreparedWire;
+        const pending = this.pendingModelSwitches.get(frame.requestId);
+        if (!pending || pending.sessId !== frame.sessionKey || pending.targetModel !== frame.targetModel) return;
+        this.pendingModelSwitches.delete(frame.requestId);
+        clearTimeout(pending.timer);
+        if (frame.status === "completed") pending.resolve(frame.requestId);
+        else pending.reject(new Error(frame.message || frame.errorCode || "上下文压缩失败"));
         return;
       }
       case "outbound.control.receipt": {
@@ -2616,11 +2643,60 @@ export class ChatSocket {
   /** 会话级模型选择(纯元数据,与 renameSession 同构):改内存 _selectedModelId + notify →
    *  persist sig 变化,IndexedDB 随之落地。服务端 canonical 由调用方经 PATCH 同步。
    *  会话尚不存在(新会话未发首条消息)→ no-op:首发时 sendMessage 会定格 + 建行 PUT 携带。*/
-  setSessionModel(sessId: string, modelId: string): void {
+  setSessionModel(sessId: string, modelId: string, modelSwitchId?: string): void {
     const s = this.sessions.get(sessId);
-    if (!s || s._selectedModelId === modelId) return;
+    if (!s) return;
+    const changed = s._selectedModelId !== modelId;
     s._selectedModelId = modelId;
-    this.scheduleNotify();
+    s._preparedModelSwitch = modelSwitchId ? { id: modelSwitchId, targetModel: modelId } : undefined;
+    if (changed || modelSwitchId) this.scheduleNotify();
+  }
+
+  private cancelPreparedModelSwitch(requestId: string, sessionKey: string): void {
+    const sent = this.safeWsSend(JSON.stringify({
+      type: "control.session.cancel_model_switch",
+      sessionKey,
+      requestId,
+    }));
+    if (sent) this.abandonedModelSwitches.delete(requestId);
+    else this.abandonedModelSwitches.set(requestId, sessionKey);
+  }
+
+  private flushAbandonedModelSwitches(): void {
+    for (const [requestId, sessionKey] of this.abandonedModelSwitches) {
+      this.cancelPreparedModelSwitch(requestId, sessionKey);
+    }
+  }
+
+  private rejectPendingModelSwitches(message: string, canSendCancellation: boolean): void {
+    for (const [id, pending] of this.pendingModelSwitches) {
+      clearTimeout(pending.timer);
+      if (canSendCancellation) this.cancelPreparedModelSwitch(id, pending.sessId);
+      else this.abandonedModelSwitches.set(id, pending.sessId);
+      pending.reject(new Error(message));
+      this.pendingModelSwitches.delete(id);
+    }
+  }
+
+  prepareModelSwitch(sessId: string, sourceModel: string, targetModel: string): Promise<string> {
+    const sess = this.sessions.get(sessId);
+    if (!sess) return Promise.reject(new Error("会话不存在"));
+    const requestId = `model-switch:${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 10)}`;
+    if (!this.safeWsSend(JSON.stringify({
+      type: "control.session.prepare_model_switch",
+      sessionKey: safeSessionKeyForAgent(sessId, sess.agentId),
+      requestId,
+      sourceModel,
+      targetModel,
+    }))) return Promise.reject(new Error("当前未连接，无法压缩上下文"));
+    return new Promise<string>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingModelSwitches.delete(requestId);
+        this.cancelPreparedModelSwitch(requestId, safeSessionKeyForAgent(sessId, sess.agentId));
+        reject(new Error("上下文压缩超时，仍保留原模型"));
+      }, 16 * 60_000);
+      this.pendingModelSwitches.set(requestId, { sessId: safeSessionKeyForAgent(sessId, sess.agentId), targetModel, resolve, reject, timer });
+    });
   }
 
   removeSession(sessId: string): void {
@@ -2777,6 +2853,7 @@ export class ChatSocket {
       _agentSwitchedAt: typeof s._agentSwitchedAt === "number" ? s._agentSwitchedAt : s._agentSwitchedAt ?? undefined,
       ...(s._lastRouting ? { _lastRouting: { ...s._lastRouting } } : {}),
       ...(s._selectedModelId ? { _selectedModelId: s._selectedModelId } : {}),
+      ...(s._preparedModelSwitch ? { _preparedModelSwitch: { ...s._preparedModelSwitch } } : {}),
     };
   }
 
@@ -2864,6 +2941,11 @@ export class ChatSocket {
     if (typeof stored._selectedModelId === "string" && stored._selectedModelId) {
       s._selectedModelId = stored._selectedModelId;
     }
+    if (
+      stored._preparedModelSwitch &&
+      typeof stored._preparedModelSwitch.id === "string" &&
+      typeof stored._preparedModelSwitch.targetModel === "string"
+    ) s._preparedModelSwitch = { ...stored._preparedModelSwitch };
     for (const pending of storedPending) {
       this.offlineQueue.push({
         sessId: stored.id,
@@ -3775,7 +3857,15 @@ export class ChatSocket {
     void this.ensureServerSessionOnce(sess, p.agentId);
     // 路由字段快照:合成续写(服务重启/空轮)复用同一路由,保证桥的 codex 分类
     // (server requestId 注入/preCheck)与被中断 turn 一致。
-    const routing = { model: p.model, teamMode: !!p.teamMode, effortLevel: p.effortLevel ?? null };
+    const preparedSwitch = p.model && sess._preparedModelSwitch?.targetModel === p.model
+      ? sess._preparedModelSwitch
+      : undefined;
+    const routing = {
+      model: p.model,
+      ...(preparedSwitch ? { modelSwitchId: preparedSwitch.id } : {}),
+      teamMode: !!p.teamMode,
+      effortLevel: p.effortLevel ?? null,
+    };
     sess._lastRouting = routing;
     const media = p.media && p.media.length > 0 ? p.media : undefined;
     // 出站帧 + 跨设备持久化剥离 localSrc:它是本机乐观渲染用的 blob: URL,换设备/刷新即失效,
@@ -3806,6 +3896,7 @@ export class ChatSocket {
       ...(p.replyTo ? { replyToId: p.replyTo.messageId } : {}),
       ...(p.effortLevel !== undefined ? { effortLevel: p.effortLevel } : {}),
       ...(p.model ? { model: p.model } : {}),
+      ...(preparedSwitch ? { modelSwitchId: preparedSwitch.id } : {}),
       // 团队模式(v5 轻量组队):只在开启时带上顶层 teamMode flag;后端仅 main 队长消费。
       ...(p.teamMode ? { teamMode: true } : {}),
       ts: Date.now(),
@@ -3986,6 +4077,7 @@ export class ChatSocket {
         ? { effortLevel: routing.effortLevel as InboundMessage["effortLevel"] }
         : {}),
       ...(routing.model ? { model: routing.model } : {}),
+      ...(routing.modelSwitchId ? { modelSwitchId: routing.modelSwitchId } : {}),
       ...(routing.teamMode ? { teamMode: true } : {}),
       ts: Date.now(),
       clientMessageId: target.clientMessageId,
@@ -4163,6 +4255,7 @@ export class ChatSocket {
         ? { effortLevel: routing.effortLevel as InboundMessage["effortLevel"] }
         : {}),
       ...(routing?.model ? { model: routing.model } : {}),
+      ...(routing?.modelSwitchId ? { modelSwitchId: routing.modelSwitchId } : {}),
       ...(routing?.teamMode ? { teamMode: true } : {}),
       ts: Date.now(),
     };

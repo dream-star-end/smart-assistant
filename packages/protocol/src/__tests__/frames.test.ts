@@ -22,6 +22,9 @@ import {
   OutboundMessage,
   OutboundPermissionRequest,
   OutboundControlReceipt,
+  ControlCancelModelSwitch,
+  ControlPrepareModelSwitch,
+  OutboundModelSwitchPrepared,
   OutboundTurnStatus,
   isClientMessageId,
   isControlId,
@@ -654,5 +657,25 @@ describe('OutboundTurnStatus schema', () => {
   })
   it('old compacting frame without detail still matches', () => {
     assert.equal(Value.Check(OutboundTurnStatus, { ...base, status: 'compacting' }), true)
+  })
+})
+
+
+
+describe('native model switch control schema', () => {
+  it('accepts prepared switch controls and first-turn generation ids', () => {
+    const requestId = 'model-switch:test:1'
+    assert.equal(Value.Check(ControlCancelModelSwitch, {
+      type: 'control.session.cancel_model_switch', sessionKey: 'agent:main:webchat:dm:p1', requestId,
+    }), true)
+    assert.equal(Value.Check(ControlPrepareModelSwitch, {
+      type: 'control.session.prepare_model_switch', sessionKey: 'agent:main:webchat:dm:p1',
+      requestId, sourceModel: 'glm-5.3', targetModel: 'gpt-5.6-sol',
+    }), true)
+    assert.equal(Value.Check(InboundMessage, { ...(baseInbound() as Record<string, unknown>), model: 'gpt-5.6-sol', modelSwitchId: requestId }), true)
+    assert.equal(Value.Check(OutboundModelSwitchPrepared, {
+      type: 'outbound.model_switch.prepared', requestId, sessionKey: 'agent:main:webchat:dm:p1',
+      sourceModel: 'glm-5.3', targetModel: 'gpt-5.6-sol', status: 'completed',
+    }), true)
   })
 })

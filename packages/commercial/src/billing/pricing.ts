@@ -93,6 +93,10 @@ export interface PublicModel {
   multiplier: string;
   /** protocol modelReasoningPolicy 的 API 投影；空数组 = 此模型不支持思考深度。 */
   supported_efforts: string[];
+  /** Catalog execution metadata used only for model-switch UX preflight. */
+  engine?: string;
+  context_window?: number | null;
+  supports_vision?: boolean;
   /** Blended cost vs DeepSeek V4 Pro, one decimal. Omitted if baseline missing. */
   cost_x?: number;
   /**

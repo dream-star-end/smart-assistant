@@ -312,6 +312,8 @@ export interface TurnSummary {
   stopReason: string | null
   numTurns: number | null
   isError: boolean
+  /** Source-engine native compact text, captured only for an explicit compact turn. */
+  nativeCompactionSummary?: string
   /** 错误分类。'auth' 触发 sessionManager 的 token-refresh + 回滚重试路径。
    *  错误字符串是底座私有知识(CCB: AUTH_KEYWORDS_RE / AUTH_ERROR_PREFIX_RE),
    *  分类逻辑下沉在各 adapter 内。 */

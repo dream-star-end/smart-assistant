@@ -136,6 +136,7 @@ import {
 } from "./lib/modelPreferences";
 import { DEMO_MESSAGES, DEMO_MODELS, DEMO_SESSIONS, DEMO_USER, demoReply } from "./lib/demo";
 import type { Message, PublicConfig, PublicModel, Session, SessionLastOutcome, ToolCard } from "./lib/types";
+import { modelSwitchCompactionReason } from "./lib/modelSwitch";
 
 // 首屏瘦身:营销首页 + 设置/管理/市场/组织/教程中心按需异步加载,移出 entry chunk。
 // 命名导出 → default 适配。渲染点各自套 LazyBoundary（= chunk 加载失败兜底 + Suspense：
@@ -295,6 +296,7 @@ export function App() {
   const [modelPrefs, setModelPrefs] = useState<PrefsView>({});
   const [preferenceEffort, setPreferenceEffort] = useState<PreferenceEffort | undefined>();
   const [modelsLoading, setModelsLoading] = useState(false);
+  const [modelSwitchPreparing, setModelSwitchPreparing] = useState(false);
   const [chatError, setChatError] = useState<ChatError | null>(null);
   const [imageAnnotationSource, setImageAnnotationSource] = useState<ImageAnnotationSource | null>(null);
   const [containerPreviewUrl, setContainerPreviewUrl] = useState<string | null>(null);
@@ -598,17 +600,63 @@ export function App() {
   // server-wins 盖回,重选即重试;服务端从未有值(NULL=从未显式选择,无"清除"流)则缺席
   // 不表态,本地意图保留 —— 两种失败面都可自愈。新会话行未建 404 同吞,由建行 PUT/建行后
   // 收敛 PATCH 落地。无活动会话(空会话态)仅更新选择器,作为下一会话意图。
+  const activeModelSwitchSessionRef = useRef(activeId);
+  activeModelSwitchSessionRef.current = activeId;
   const selectModel = useCallback(
-    (id: string) => {
-      setModelId(id);
-      if (demo) return;
+    async (id: string) => {
+      if (id === modelId || modelSwitchPreparing) return;
       const sid = activeId;
-      if (!sid) return;
-      setSessions((c) => c.map((s) => (s.id === sid ? { ...s, modelId: id } : s)));
-      sockRef.current?.setSessionModel(sid, id);
-      queueModelPatch(sid, id);
+      const commit = (modelSwitchId?: string) => {
+        if (activeModelSwitchSessionRef.current === sid) setModelId(id);
+        if (demo) return;
+        if (!sid) return;
+        setSessions((c) => c.map((s) => (s.id === sid ? { ...s, modelId: id } : s)));
+        sockRef.current?.setSessionModel(sid, id, modelSwitchId);
+        queueModelPatch(sid, id);
+      };
+      if (demo || !activeId) {
+        commit();
+        return;
+      }
+      const currentMessages = sockRef.current?.getMessages(activeId) ?? [];
+      const hasContent = (sessions.find((session) => session.id === activeId)?.messageCount ?? 0) > 0 ||
+        currentMessages.some((message) =>
+          message.role === "user" || message.role === "assistant" ||
+          message.role === "tool" || message.role === "agent-group");
+      const reason = modelSwitchCompactionReason(models, modelId, id, hasContent);
+      if (!reason || !modelId) {
+        commit();
+        return;
+      }
+      const details = [
+        reason.visionDowngrade
+          ? "目标模型不支持当前会话的多模态上下文，图片等内容将转换为文字交接。"
+          : null,
+        reason.contextDowngrade
+          ? "目标模型的上下文窗口更短，需要先压缩当前会话。"
+          : null,
+      ].filter((detail): detail is string => detail !== null);
+      const confirmed = await confirmDialog({
+        title: "压缩上下文后切换模型？",
+        body: <div className="space-y-2 text-sm text-muted">
+          {details.map((detail) => <p key={detail}>{detail}</p>)}
+          <p>系统会使用当前模型的原生压缩能力生成交接内容；原始会话记录不会删除。</p>
+        </div>,
+        confirmText: "压缩并切换",
+      });
+      if (!confirmed) return;
+      setModelSwitchPreparing(true);
+      try {
+        const switchId = await sockRef.current?.prepareModelSwitch(activeId, modelId, id);
+        if (!switchId) throw new Error("模型切换准备失败");
+        commit(switchId);
+      } catch (error) {
+        toast(error instanceof Error ? error.message : "上下文压缩失败，仍保留原模型", "error");
+      } finally {
+        setModelSwitchPreparing(false);
+      }
     },
-    [demo, activeId, setSessions, queueModelPatch],
+    [demo, activeId, modelId, modelSwitchPreparing, models, sessions, setSessions, queueModelPatch, confirmDialog, toast],
   );
   // 回填给 useAuth 的 chat 域收尾（onClearAuth/onLoginSuccess 经 sessionsResetRef 调用）。
   sessionsResetRef.current = resetSessionList;
@@ -2531,7 +2579,7 @@ export function App() {
           models={models}
           selectedModelId={modelId}
           onSelectModel={selectModel}
-          modelsLoading={modelsLoading}
+          modelsLoading={modelsLoading || modelSwitchPreparing}
           effortSupported={effortSupported}
           effortActive={effortActive}
           onSelectEffort={demo ? undefined : setSessionEffort}

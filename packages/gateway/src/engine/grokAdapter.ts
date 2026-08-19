@@ -6,9 +6,9 @@
 import { EventEmitter } from 'node:events'
 import { spawn, type ChildProcessByStdio } from 'node:child_process'
 import type { Readable } from 'node:stream'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import type { GoalStateSnapshot, OutboundContentBlock } from '@openclaude/protocol'
 import type { OpenClaudeConfig } from '@openclaude/storage'
 import type { ExecutionTarget } from '../remoteTarget.js'
@@ -16,6 +16,7 @@ import type {
   EngineAdapter,
   EngineCapabilities,
   EngineTurnRun,
+  NativeModelHandoffArtifact,
   TurnParams,
 } from './engineAdapter.js'
 import type {
@@ -39,6 +40,64 @@ const GROK_SHUTDOWN_GRACE_DEFAULT_MS = 3_000
 const GROK_SHUTDOWN_FINAL_DRAIN_DEFAULT_MS = 3_000
 const GROK_UPSTREAM_MODEL = 'grok-4.6'
 const ROUTE_TOKEN_RE = /^[0-9a-f]{64}$/
+
+const GROK_SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+const GROK_CHECKPOINT_MAX_BYTES = 32 * 1024 * 1024
+const GROK_SUMMARY_PREFIX = 'This session is being continued from a previous conversation'
+
+function findNativeSummaryCarrier(value: unknown, depth = 0): string | null {
+  if (depth > 16) return null
+  if (typeof value === 'string') {
+    const text = value.trim()
+    return text.startsWith(GROK_SUMMARY_PREFIX) ? text : null
+  }
+  if (Array.isArray(value)) {
+    for (let index = value.length - 1; index >= 0; index -= 1) {
+      const found = findNativeSummaryCarrier(value[index], depth + 1)
+      if (found) return found
+    }
+    return null
+  }
+  if (!value || typeof value !== 'object') return null
+  for (const child of Object.values(value as Record<string, unknown>)) {
+    const found = findNativeSummaryCarrier(child, depth + 1)
+    if (found) return found
+  }
+  return null
+}
+
+export async function readLatestGrokNativeHandoff(
+  grokHome: string,
+  sessionId: string,
+  compactStartedAt: number,
+): Promise<NativeModelHandoffArtifact> {
+  if (!GROK_SESSION_ID_RE.test(sessionId)) throw new Error('GROK_COMPACTION_SESSION_INVALID')
+  const sessionsRoot = realpathSync(join(grokHome, 'sessions'))
+  let latest: { mtimeMs: number; summaryText: string } | null = null
+  for (const group of readdirSync(sessionsRoot, { withFileTypes: true })) {
+    if (!group.isDirectory() || group.isSymbolicLink()) continue
+    const checkpointDir = resolve(sessionsRoot, group.name, sessionId, 'compaction_checkpoints')
+    if (!checkpointDir.startsWith(`${sessionsRoot}/`) || !existsSync(checkpointDir)) continue
+    const canonicalDir = realpathSync(checkpointDir)
+    if (canonicalDir !== checkpointDir) continue
+    for (const entry of readdirSync(canonicalDir, { withFileTypes: true })) {
+      if (!entry.isFile() || entry.isSymbolicLink() || !entry.name.endsWith('.json')) continue
+      const file = resolve(canonicalDir, entry.name)
+      const info = lstatSync(file)
+      if (!info.isFile() || info.isSymbolicLink() || info.size > GROK_CHECKPOINT_MAX_BYTES) continue
+      if (info.mtimeMs + 5_000 < compactStartedAt) continue
+      let parsed: unknown
+      try { parsed = JSON.parse(readFileSync(file, 'utf8')) } catch { continue }
+      const row = parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : null
+      if (!row || row.schema_version !== 1 || !Array.isArray(row.compacted_history)) continue
+      const summaryText = findNativeSummaryCarrier(row.compacted_history)
+      if (!summaryText) continue
+      if (!latest || info.mtimeMs >= latest.mtimeMs) latest = { mtimeMs: info.mtimeMs, summaryText }
+    }
+  }
+  if (!latest) throw new Error('GROK_NATIVE_COMPACTION_NOT_EXPORTED')
+  return { summaryText: latest.summaryText, source: 'grok', compactStartedAt }
+}
 const EMPTY_SIGNALS: Readonly<PhantomSignals> = Object.freeze({
   apiState: 'unknown',
   skipReason: null,
@@ -692,6 +751,11 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
   }
 
   waitForOutputDrain(): Promise<void> { return this.drain }
+  readCompactionHandoffSince(compactStartedAt: number): Promise<NativeModelHandoffArtifact> {
+    if (!this.nativeId) return Promise.reject(new Error('GROK_COMPACTION_SESSION_NOT_READY'))
+    return readLatestGrokNativeHandoff(this.prepareGrokHome(), this.nativeId, compactStartedAt)
+  }
+
   get nativeSessionId(): string | null { return this.nativeId }
   clearSessionId(): void { this.nativeId = null }
   setModel(model: string | undefined): void { this.currentModel = model }

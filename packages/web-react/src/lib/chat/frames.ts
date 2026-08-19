@@ -108,6 +108,17 @@ export type OutboundActiveTurnReplayStartWire = OutboundActiveTurnReplayStart;
 export type OutboundTurnStatusWire = OutboundTurnStatus & WireRuntimeFields;
 export type OutboundTurnUsageWire = OutboundTurnUsage & WireRuntimeFields;
 export type OutboundCallUsageWire = OutboundCallUsage & WireRuntimeFields;
+export type OutboundModelSwitchPreparedWire = {
+  type: "outbound.model_switch.prepared";
+  requestId: string;
+  sessionKey: string;
+  sourceModel: string;
+  targetModel: string;
+  status: "completed" | "failed";
+  errorCode?: string;
+  message?: string;
+} & WireRuntimeFields;
+
 export type OutboundControlReceiptWire = {
   type: "outbound.control.receipt";
   controlId: string;
@@ -278,6 +289,7 @@ export type OutboundWire =
   | OutboundTurnUsageWire
   | OutboundCallUsageWire
   | OutboundControlReceiptWire
+  | OutboundModelSwitchPreparedWire
   | PromptQueueSnapshot
   | LegacyBridgeErrorWire
   | CostChargedWire

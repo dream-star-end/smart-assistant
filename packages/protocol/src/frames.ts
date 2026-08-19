@@ -230,6 +230,9 @@ export const InboundMessage = Type.Object({
   // 实际接收方(gateway server.ts)会按静态 allowlist 过滤,无效 model 静默
   // 丢弃 —— 防止用户 prefs 里残留 admin 已 disable 的 model 把 CCB 启不起来。
   model: Type.Optional(Type.String()),
+  /** Server-issued generation binding a prepared native model handoff to the
+   * first turn on the selected target model. */
+  modelSwitchId: Type.Optional(ControlId),
   // 团队模式(v5 轻量组队):main 队长收到此 flag 的 turn 会被鼓励按任务复杂度自主
   // delegate_task 给已安装 agent 组队,简单任务自己答。turn 级、可中途切,只对 main 生效。
   teamMode: Type.Optional(Type.Boolean()),
@@ -416,6 +419,7 @@ export const PromptQueueItem = Type.Object({
   requestedExecution: Type.Object({
     agentId: Type.String({ minLength: 1 }),
     model: Type.Optional(Type.String()),
+    modelSwitchId: Type.Optional(ControlId),
     effortLevel: Type.Optional(Type.Union([Type.String(), Type.Null()])),
     teamMode: Type.Optional(Type.Boolean()),
   }),
@@ -1330,7 +1334,36 @@ export const ControlCompact = Type.Object({
   type: Type.Literal('control.session.compact'),
   sessionKey: Type.String(),
 })
-export const ControlFrame = Type.Union([ControlListSessions, ControlHealth, ControlCompact])
+export const ControlCancelModelSwitch = Type.Object({
+  type: Type.Literal('control.session.cancel_model_switch'),
+  sessionKey: Type.String(),
+  requestId: ControlId,
+})
+export const ControlPrepareModelSwitch = Type.Object({
+  type: Type.Literal('control.session.prepare_model_switch'),
+  sessionKey: Type.String(),
+  requestId: ControlId,
+  sourceModel: Type.String({ minLength: 1 }),
+  targetModel: Type.String({ minLength: 1 }),
+})
+export const OutboundModelSwitchPrepared = Type.Object({
+  type: Type.Literal('outbound.model_switch.prepared'),
+  requestId: ControlId,
+  sessionKey: Type.String(),
+  sourceModel: Type.String(),
+  targetModel: Type.String(),
+  status: Type.Union([Type.Literal('completed'), Type.Literal('failed')]),
+  errorCode: Type.Optional(Type.String()),
+  message: Type.Optional(Type.String()),
+})
+export type OutboundModelSwitchPrepared = Static<typeof OutboundModelSwitchPrepared>
+export const ControlFrame = Type.Union([
+  ControlListSessions,
+  ControlHealth,
+  ControlCompact,
+  ControlCancelModelSwitch,
+  ControlPrepareModelSwitch,
+])
 export type ControlFrame = Static<typeof ControlFrame>
 
 // ───────────────────────────────────────────────
@@ -1344,6 +1377,7 @@ export const AnyFrame = Type.Union([
   OutboundPermissionRequest,
   OutboundPermissionSettled,
   OutboundControlReceipt,
+  OutboundModelSwitchPrepared,
   OutboundResumeFailed,
   OutboundActiveTurnReplayStart,
   OutboundError,

@@ -450,7 +450,7 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     expect(screen.queryByText(/对话传输将在后续版本接入/)).not.toBeInTheDocument()
     // 关键不变量：无 SSE /api/chat、无 v4-trial 端点（对话走 WS，不走这些 REST）。
     const chatLike = fetchMock.mock.calls.filter(([url]) =>
-      /\/api\/chat|\/api\/v4/.test(String(url)),
+      /\/api\/chat(?:[/?#]|$)|\/api\/v4/.test(String(url)),
     )
     expect(chatLike.length).toBe(0)
   })

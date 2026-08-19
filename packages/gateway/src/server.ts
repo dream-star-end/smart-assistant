@@ -12728,6 +12728,65 @@ export class Gateway {
         this._outboundRing.clear(sessionKey)
         outboundRingSizeBytes.value = this._outboundRing.totalBytes()
         this.log.info('reset destroyed session', { sessionKey })
+      } else if ((frame as any).type === 'control.session.cancel_model_switch') {
+        const sessionKey = (frame as any).sessionKey
+        const requestId = (frame as any).requestId
+        if (
+          typeof sessionKey !== 'string' ||
+          typeof requestId !== 'string' ||
+          !/^[A-Za-z0-9:_-]{8,128}$/.test(requestId)
+        ) return
+        const session = this.sessions.getByKey(sessionKey)
+        if (!session || session.userId !== this.getWsUserId(ws)) return
+        this.sessions.cancelModelSwitch(session, requestId)
+      } else if ((frame as any).type === 'control.session.prepare_model_switch') {
+        const sessionKey = (frame as any).sessionKey
+        const requestId = (frame as any).requestId
+        const sourceModel = (frame as any).sourceModel
+        const targetModel = (frame as any).targetModel
+        if (
+          typeof sessionKey !== 'string' ||
+          typeof requestId !== 'string' ||
+          typeof sourceModel !== 'string' ||
+          typeof targetModel !== 'string' ||
+          !ALLOWED_INBOUND_MODELS.has(sourceModel) ||
+          !ALLOWED_INBOUND_MODELS.has(targetModel)
+        ) return
+        const session = this.sessions.getByKey(sessionKey)
+        const ownsSession = session?.userId === this.getWsUserId(ws)
+        const reply = (payload: Record<string, unknown>) => ws.send(JSON.stringify({
+          type: 'outbound.model_switch.prepared',
+          requestId,
+          sessionKey,
+          targetModel,
+          ts: Date.now(),
+          ...payload,
+        }))
+        if (!session || !ownsSession) {
+          reply({ sourceModel: '', status: 'failed', errorCode: 'SESSION_NOT_FOUND', message: '会话尚未运行，无法压缩' })
+          return
+        }
+        try {
+          const prepared = await this.sessions.prepareModelSwitch(
+            session,
+            sourceModel,
+            targetModel,
+            requestId,
+          )
+          reply({ ...prepared, status: 'completed' })
+        } catch (err) {
+          const code = err instanceof Error ? err.message : 'MODEL_SWITCH_PREPARE_FAILED'
+          reply({
+            sourceModel: session.model ?? session.runner.model ?? '',
+            status: 'failed',
+            errorCode: code,
+            message: code === 'MODEL_SWITCH_SESSION_BUSY'
+              ? '当前回复尚未结束，请稍后再切换模型'
+              : code === 'MODEL_SWITCH_SOURCE_CHANGED'
+                ? '会话当前模型已变化，请刷新后重试'
+                : '上下文压缩失败，仍保留原模型',
+          })
+        }
       } else if ((frame as any).type === 'control.session.compact') {
         // Compact: send a compaction request to the agent as a user message
         const sessionKey = (frame as any).sessionKey
@@ -14958,6 +15017,11 @@ export class Gateway {
     //   allowlist 抽到文件顶部 export 便于 unit test + 后续加模型集中改一处。
     // 已在 inferAgentForModel 路由前算过(safeModelForRouting),此处复用避免重复。
     const safeModel: string | undefined = safeModelForRouting
+    const _frameModelSwitchId = (frame as any).modelSwitchId
+    const safeModelSwitchId: string | undefined =
+      typeof _frameModelSwitchId === 'string' && /^[A-Za-z0-9:_-]{8,128}$/.test(_frameModelSwitchId)
+        ? _frameModelSwitchId
+        : undefined
 
     const _frameConversationMode = (frame as any).conversationMode
     const safeConversationMode: 'default' | 'plan' | undefined =
@@ -15122,6 +15186,7 @@ export class Gateway {
       // 触发 engine teardown + compact transcript preamble;同 engine 内的模型
       // 切换仍由 submit() 的 setModel + shutdown 处理。
       model: safeModel,
+      ...(safeModelSwitchId ? { modelSwitchId: safeModelSwitchId } : {}),
       // 无 envelope 的本地 inbound:catalog 投影就是本 turn 的权威(canonicalModel + engine)。
       // flag 未开 → localExec 恒 undefined → 展开为 {},行为零变化。
       ...localExecutionOverride(localExec),
@@ -16373,6 +16438,7 @@ export class Gateway {
       grokRoute: safeGrokRoute,
       zcodeRoute: safeZcodeRoute,
       ...(automaticRetryState ? { automaticRetryState } : {}),
+      ...(safeModelSwitchId ? { modelSwitchId: safeModelSwitchId } : {}),
       // DispatchTurnContext(uid/…)→ sessionManager 逻辑键形状(userId/…)。
       ...(turnDispatchContext
         ? {

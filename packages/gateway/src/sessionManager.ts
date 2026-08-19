@@ -401,6 +401,41 @@ export function buildHistoricalContextPrompt(
   ].join('\n')
 }
 
+function buildNativeModelHandoffContext(summaryText: string): string {
+  return [
+    '<openclaude_native_model_handoff>',
+    'The previous source model compacted this populated session for the selected target model. Treat the following native handoff as prior conversation context. Do not restate it unless needed.',
+    summaryText,
+    '</openclaude_native_model_handoff>',
+  ].join('\n')
+}
+
+export function buildNativeModelHandoffPrompt(summaryText: string, currentUserText: string): string {
+  return [
+    buildNativeModelHandoffContext(summaryText),
+    '',
+    '<current_user_message>',
+    currentUserText,
+    '</current_user_message>',
+  ].join('\n')
+}
+
+export function buildNativeModelHandoffPayload(
+  summaryText: string,
+  currentUserInput: string | Array<{ type: string; [key: string]: unknown }>,
+): string | Array<{ type: string; [key: string]: unknown }> {
+  if (typeof currentUserInput === 'string') {
+    return buildNativeModelHandoffPrompt(summaryText, currentUserInput)
+  }
+  return [
+    { type: 'text', text: buildNativeModelHandoffContext(summaryText) },
+    ...currentUserInput,
+  ]
+}
+
+const NATIVE_MODEL_HANDOFF_MAX_CHARS = 256_000
+const NATIVE_MODEL_SWITCH_TTL_MS = 30 * 60_000
+
 export function shouldAttemptHistoricalContextInjection(opts: {
   alreadyInjected?: boolean
   lastInjectedKey?: string | null
@@ -680,6 +715,19 @@ export interface AgentSession {
   currentAssistantBuf?: string
   // Model name for cost attribution
   model?: string
+  /** Native-compaction transition fences every old-model submit until the
+   * exact target model + generation consumes the prepared handoff. */
+  _modelSwitchTransition?: {
+    id: string
+    sourceModel: string
+    targetModel: string
+    sourceEngine: string
+    state: 'preparing' | 'prepared' | 'consuming'
+    summaryText?: string
+    summaryInjected?: boolean
+    expiresAt?: number
+  }
+  _lastNativeCompactionSummary?: string
   // CCB CronCreate bridge: maps tool_use_id/content_key → gateway cron job ID
   _cronBridgeMap?: Map<string, string>
   /** Set by onFinish when the CCB result row signals a stale --resume session
@@ -2868,6 +2916,8 @@ export class SessionManager {
      * agent 默认。新建 session 时缺省回落 agent.model。
      */
     model?: string
+    /** Exact generation returned by control.session.prepare_model_switch. */
+    modelSwitchId?: string
     /**
      * **master 的执行权威**(docs/V5_MODEL_AUTHORITY_PLAN.md §2/§3)。两个来源:
      *   - `source:'bridge_signed'`:server.ts dispatchInbound 从验签通过的 inbound
@@ -2994,6 +3044,30 @@ export class SessionManager {
       requireAuthority: isModelAuthorityRequired(),
     })
     const existing = this.sessions.get(opts.sessionKey)
+    if (existing?._modelSwitchTransition) {
+      const transition = existing._modelSwitchTransition
+      if (
+        transition.state === 'prepared' &&
+        transition.expiresAt !== undefined &&
+        Date.now() >= transition.expiresAt
+      ) {
+        if (executionModel === transition.sourceModel && opts.modelSwitchId === undefined) {
+          existing._modelSwitchTransition = undefined
+        } else {
+          throw new Error('MODEL_SWITCH_EXPIRED')
+        }
+      }
+    }
+    if (existing?._modelSwitchTransition) {
+      const transition = existing._modelSwitchTransition
+      const matchesPreparedTarget =
+        transition.state === 'prepared' &&
+        transition.targetModel === executionModel &&
+        opts.modelSwitchId === transition.id
+      if (!matchesPreparedTarget) {
+        throw new Error('MODEL_SWITCH_IN_PROGRESS')
+      }
+    }
     const previousEngine =
       existing?.providerTag ??
       SessionManager.normalizeEngineTag(this._resumeMapProvider.get(opts.sessionKey))
@@ -3178,6 +3252,9 @@ export class SessionManager {
       _lastCcbCumulativeCost: this._lastCostFor(opts.sessionKey, engineId) ?? 0,
       // 与 runner 同一份白名单收敛结果(见上方 executionModel 注释)。
       model: executionModel,
+      ...(existing?._modelSwitchTransition
+        ? { _modelSwitchTransition: existing._modelSwitchTransition }
+        : {}),
       toolUseIdToName: new Map(),
       executionTarget: { kind: 'local' },
       // Phase 5 G.0 → M1a:固化 engine 路由信息(字段名保留 providerTag),
@@ -3281,6 +3358,77 @@ export class SessionManager {
     return session
   }
 
+  async prepareModelSwitch(
+    session: AgentSession,
+    expectedSourceModel: string,
+    targetModel: string,
+    switchId: string,
+  ): Promise<{ sourceModel: string; targetModel: string }> {
+    if (!/^[A-Za-z0-9:_-]{8,128}$/.test(switchId)) throw new Error('MODEL_SWITCH_ID_INVALID')
+    if ((session._activeTurnCount ?? 0) > 0 || (session._activeClientTurnCount ?? 0) > 0) {
+      throw new Error('MODEL_SWITCH_SESSION_BUSY')
+    }
+    const sourceModel = session.model ?? session.runner.model
+    if (!sourceModel) throw new Error('MODEL_SWITCH_SOURCE_UNKNOWN')
+    if (sourceModel !== expectedSourceModel) throw new Error('MODEL_SWITCH_SOURCE_CHANGED')
+    if (sourceModel === targetModel) return { sourceModel, targetModel }
+    if (session._modelSwitchTransition?.state === 'preparing') {
+      throw new Error('MODEL_SWITCH_ALREADY_PREPARING')
+    }
+    const transition: NonNullable<AgentSession['_modelSwitchTransition']> = {
+      id: switchId,
+      sourceModel,
+      targetModel,
+      sourceEngine: session.providerTag,
+      state: 'preparing',
+    }
+    session._modelSwitchTransition = transition
+    try {
+      let artifact
+      if (session.runner.compactForHandoff) {
+        artifact = await session.runner.compactForHandoff()
+      } else if (session.providerTag === 'ccb' || session.providerTag === 'grok') {
+        const compactStartedAt = Date.now()
+        session._lastNativeCompactionSummary = undefined
+        await this.submit(
+          session,
+          '/compact preserve the user goal, decisions, constraints, current work, files, errors, and next steps',
+          () => {},
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          { modelSwitchInternal: switchId },
+        )
+        artifact = session.providerTag === 'grok'
+          ? await session.runner.readCompactionHandoffSince?.(compactStartedAt)
+          : session._lastNativeCompactionSummary
+            ? { summaryText: session._lastNativeCompactionSummary, source: 'ccb' as const, compactStartedAt }
+            : undefined
+      }
+      if (!artifact?.summaryText?.trim()) throw new Error('MODEL_SWITCH_NATIVE_COMPACTION_UNAVAILABLE')
+      if (artifact.summaryText.length > NATIVE_MODEL_HANDOFF_MAX_CHARS) {
+        throw new Error('MODEL_SWITCH_NATIVE_COMPACTION_TOO_LARGE')
+      }
+      if (session._modelSwitchTransition !== transition) throw new Error('MODEL_SWITCH_SUPERSEDED')
+      transition.summaryText = artifact.summaryText.trim()
+      transition.expiresAt = Date.now() + NATIVE_MODEL_SWITCH_TTL_MS
+      transition.state = 'prepared'
+      return { sourceModel, targetModel }
+    } catch (error) {
+      if (session._modelSwitchTransition === transition) session._modelSwitchTransition = undefined
+      throw error
+    }
+  }
+
+  cancelModelSwitch(session: AgentSession, switchId: string): boolean {
+    const transition = session._modelSwitchTransition
+    if (!transition || transition.id !== switchId || transition.state === 'consuming') return false
+    session._modelSwitchTransition = undefined
+    return true
+  }
+
   async submit(
     session: AgentSession,
     userTextOrBlocks: string | Array<{ type: string; [key: string]: unknown }>,
@@ -3376,6 +3524,10 @@ export class SessionManager {
       queueExecutionFence?: PromptQueueExecutionFence
       /** Shared browser/master/gateway automatic retry lineage. */
       automaticRetryState?: AutomaticRetryState
+      /** Exact prepared-switch generation carried by the first target turn. */
+      modelSwitchId?: string
+      /** Native compact command authored by prepareModelSwitch itself. */
+      modelSwitchInternal?: string
     },
   ): Promise<void> {
     if (this.isRuntimeRecycleDraining()) throw new RuntimeRecycleDrainingError()
@@ -3413,7 +3565,8 @@ export class SessionManager {
       // selfhost 豁免门(OC_SELFHOST_ENGINE_LOCAL_TURNS=1):单租户自用部署显式接受
       // 无 bridge 计费编排的 engine-reported turn(与 decideLocalExecution 真值表同源,
       // 语义/代价见 modelAuthority.isEngineLocalTurnExempt)。生产不设 -> fail-closed 不变。
-      !isEngineLocalTurnExempt()
+      !isEngineLocalTurnExempt() &&
+      opts?.modelSwitchInternal === undefined
     ) {
       log.error('codex turn rejected: missing/malformed server-owned requestId (billing guard)', {
         sessionKey: session.sessionKey,
@@ -3429,6 +3582,34 @@ export class SessionManager {
       })
       return
     }
+    let transition = session._modelSwitchTransition
+    if (
+      transition?.state === 'prepared' &&
+      transition.expiresAt !== undefined &&
+      Date.now() >= transition.expiresAt
+    ) {
+      if (model === transition.sourceModel && opts?.modelSwitchId === undefined) {
+        session._modelSwitchTransition = undefined
+        transition = undefined
+      } else {
+        throw new Error('MODEL_SWITCH_EXPIRED')
+      }
+    }
+    const internalSwitchCompact =
+      transition !== undefined && opts?.modelSwitchInternal === transition.id
+    let consumingModelSwitch = false
+    if (transition && !internalSwitchCompact) {
+      if (
+        transition.state !== 'prepared' ||
+        model !== transition.targetModel ||
+        opts?.modelSwitchId !== transition.id
+      ) {
+        throw new Error('MODEL_SWITCH_IN_PROGRESS')
+      }
+      transition.state = 'consuming'
+      consumingModelSwitch = true
+    }
+
     // 闭包捕获:即便后面再有 submit 也不会改这个常量
     const desiredEffort: string | undefined =
       effortLevel === null ? undefined : effortLevel
@@ -3721,7 +3902,23 @@ export class SessionManager {
         session._contextRebuildNotice = 'native-resume-loss'
         providerResumeId = undefined
       }
+      const nativeHandoff =
+        consumingModelSwitch &&
+        transition &&
+        transition.sourceEngine !== session.providerTag &&
+        transition.summaryText &&
+        transition.summaryInjected !== true
+          ? transition
+          : null
+      if (nativeHandoff) {
+        runnerPayload = buildNativeModelHandoffPayload(nativeHandoff.summaryText!, userTextOrBlocks)
+        nativeHandoff.summaryInjected = true
+        session._historicalContextInjected = true
+        session._historicalContextInjectedKey = `native-switch:${nativeHandoff.id}`
+        session._contextRebuildNotice = undefined
+      }
       if (
+        !nativeHandoff &&
         shouldAttemptHistoricalContextInjection({
           alreadyInjected: session._historicalContextInjected,
           lastInjectedKey: session._historicalContextInjectedKey,
@@ -3859,8 +4056,9 @@ export class SessionManager {
         opts?.dispatchContext,
         opts?.queueLifecycle,
         logicalTurnAbort.signal,
-        contextOverflowRetryInputs,
+        consumingModelSwitch ? [] : contextOverflowRetryInputs,
         opts?.automaticRetryState,
+        consumingModelSwitch ? transition : undefined,
       )
       try {
         await Promise.race([
@@ -3930,6 +4128,15 @@ export class SessionManager {
         throw err
       }
     } finally {
+      if (
+        consumingModelSwitch &&
+        transition &&
+        session._modelSwitchTransition === transition &&
+        transition.state === 'consuming'
+      ) {
+        transition.state = 'prepared'
+        transition.summaryInjected = false
+      }
       await memoryTurnPolicyLease?.stop().catch((err) => {
         log.warn('memory turn policy cleanup failed', { sessionKey: session.sessionKey, err: String(err) })
       })
@@ -4019,6 +4226,7 @@ export class SessionManager {
      * Used only after a real Codex context-window rejection. */
     contextOverflowRetryInputs: string[] = [],
     automaticRetryState?: AutomaticRetryState,
+    modelSwitchTransition?: AgentSession['_modelSwitchTransition'],
   ): Promise<void> {
     const retryState: AutomaticRetryState = automaticRetryState ?? {
       rootClientMessageId: clientMessageId ?? session.sessionKey,
@@ -4211,6 +4419,7 @@ export class SessionManager {
           canRetry(),
           attemptOrdinal,
           retryState,
+          modelSwitchTransition,
         )
         return // success
       } catch (err: any) {
@@ -4397,6 +4606,7 @@ export class SessionManager {
     /** Zero-based retry attempt; names call ids so frozen attempts never collide. */
     attemptOrdinal = 0,
     automaticRetryState?: AutomaticRetryState,
+    modelSwitchTransition?: AgentSession['_modelSwitchTransition'],
   ): Promise<void> {
     const { runner } = session
     const turnStartTime = Date.now()
@@ -4983,6 +5193,16 @@ export class SessionManager {
       const finalizeTurn = async (result: TurnSummary | null): Promise<void> => {
           if (terminalPersistenceClaim === 'partial') return
           detach()
+          if (result?.nativeCompactionSummary) {
+            session._lastNativeCompactionSummary = result.nativeCompactionSummary
+          }
+          if (modelSwitchTransition && session._modelSwitchTransition === modelSwitchTransition) {
+            if (result && !result.isError) session._modelSwitchTransition = undefined
+            else {
+              modelSwitchTransition.state = 'prepared'
+              modelSwitchTransition.summaryInjected = false
+            }
+          }
           let persistenceAcknowledged = true
           let terminalErrorForClient: string | undefined
           let terminalErrorCodeForClient: 'user_cancelled' | undefined

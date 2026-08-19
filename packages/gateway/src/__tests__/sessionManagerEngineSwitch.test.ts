@@ -19,7 +19,12 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { SessionManager, type AgentSession } from "../sessionManager.js";
+import {
+  buildNativeModelHandoffPayload,
+  buildNativeModelHandoffPrompt,
+  SessionManager,
+  type AgentSession,
+} from "../sessionManager.js";
 // side-effect:注册 'ccb' / 'codex' factory。
 import "../engine/ccbAdapter.js";
 import "../engine/codexAdapter.js";
@@ -344,5 +349,65 @@ describe("Cursor resume workspace path uses the pinned agent cwd", () => {
       await rm(pinned, { recursive: true, force: true });
       await rm(defaultWs, { recursive: true, force: true });
     }
+  });
+});
+
+
+describe("prepared native model handoff fencing", () => {
+  test("requires the exact switch generation before replacing engines", async () => {
+    const { sm } = makeSm();
+    const source = await sm.getOrCreate({
+      sessionKey: KEY, agent: mainAgent, channel: "webchat", peerId: "switch-peer", model: "glm-5.2",
+    });
+    source._modelSwitchTransition = {
+      id: "model-switch:test:1", sourceModel: "glm-5.2", targetModel: "gpt-5.6-sol",
+      sourceEngine: "ccb", state: "prepared", summaryText: "native summary",
+    };
+    await assert.rejects(() => sm.getOrCreate({
+      sessionKey: KEY, agent: mainAgent, channel: "webchat", peerId: "switch-peer", model: "gpt-5.6-sol",
+    }), /MODEL_SWITCH_IN_PROGRESS/);
+    const target = await sm.getOrCreate({
+      sessionKey: KEY, agent: mainAgent, channel: "webchat", peerId: "switch-peer", model: "gpt-5.6-sol",
+      modelSwitchId: "model-switch:test:1",
+    });
+    assert.equal(target.providerTag, "codex");
+    assert.equal(target._modelSwitchTransition?.summaryText, "native summary");
+  });
+
+  test("cancels only the exact abandoned generation and lets the source model continue", async () => {
+    const { sm } = makeSm();
+    const source = await sm.getOrCreate({
+      sessionKey: KEY, agent: mainAgent, channel: "webchat", peerId: "switch-peer", model: "glm-5.2",
+    });
+    source._modelSwitchTransition = {
+      id: "model-switch:test:cancel", sourceModel: "glm-5.2", targetModel: "gpt-5.6-sol",
+      sourceEngine: "ccb", state: "prepared", summaryText: "native summary", expiresAt: Date.now() + 60_000,
+    };
+    assert.equal(sm.cancelModelSwitch(source, "model-switch:test:wrong"), false);
+    assert.ok(source._modelSwitchTransition);
+    assert.equal(sm.cancelModelSwitch(source, "model-switch:test:cancel"), true);
+    assert.equal(source._modelSwitchTransition, undefined);
+
+    source._modelSwitchTransition = {
+      id: "model-switch:test:expired", sourceModel: "glm-5.2", targetModel: "gpt-5.6-sol",
+      sourceEngine: "ccb", state: "prepared", summaryText: "native summary", expiresAt: Date.now() - 1,
+    };
+    const resumed = await sm.getOrCreate({
+      sessionKey: KEY, agent: mainAgent, channel: "webchat", peerId: "switch-peer", model: "glm-5.2",
+    });
+    assert.equal(resumed, source);
+    assert.equal(resumed._modelSwitchTransition, undefined);
+  });
+
+  test("builds an isolated target prompt from native handoff plus current user input", () => {
+    const prompt = buildNativeModelHandoffPrompt("native summary", "continue");
+    assert.match(prompt, /<openclaude_native_model_handoff>/);
+    assert.match(prompt, /native summary/);
+    assert.match(prompt, /<current_user_message>\ncontinue/);
+    const image = { type: "image", source: { type: "url", url: "https://example.test/a.png" } };
+    const payload = buildNativeModelHandoffPayload("native summary", [image]);
+    assert.ok(Array.isArray(payload));
+    assert.match(String(payload[0]?.text), /native summary/);
+    assert.deepEqual(payload[1], image);
   });
 });

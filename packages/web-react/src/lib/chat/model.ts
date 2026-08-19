@@ -43,6 +43,7 @@ export function isRetryingTurnStatus(
 /** A user turn's immutable model/team/reasoning selection, reused by retry. */
 export type ChatRoutingSnapshot = {
   model?: string;
+  modelSwitchId?: string;
   teamMode?: boolean;
   effortLevel?: string | null;
 };
@@ -641,6 +642,9 @@ export type ChatSession = {
   /** Set once the advisory 500-credit line is reached; UI keeps it live until turn cleanup. */
   _turnCostReminderCredits?: string;
   _tokenUsage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number };
+
+  /** Prepared native handoff generation, consumed by the first target-model turn. */
+  _preparedModelSwitch?: { id: string; targetModel: string };
 
   // ── 节流渲染 rAF 标记（render 层用）──
   _streamRafPending?: boolean;

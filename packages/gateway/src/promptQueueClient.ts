@@ -51,6 +51,7 @@ export interface PromptQueueDetail {
   requestedExecution: {
     agentId: string
     model?: string
+    modelSwitchId?: string
     effortLevel?: string | null
     teamMode?: boolean
   }
@@ -471,10 +472,14 @@ function assertOwner(value: unknown, expected: PromptQueueWireOwner, userId: str
 
 function assertRequestedExecution(value: unknown, agentId: string): void {
   const execution = record(value, 'requestedExecution')
-  assertOnlyKeys(execution, ['agentId', 'model', 'effortLevel', 'teamMode'], 'requestedExecution')
+  assertOnlyKeys(execution, ['agentId', 'model', 'modelSwitchId', 'effortLevel', 'teamMode'], 'requestedExecution')
   if (execution.agentId !== agentId) invalidResponse('requestedExecution.agentId mismatch')
   if (execution.model !== undefined && typeof execution.model !== 'string')
     invalidResponse('requestedExecution.model invalid')
+  if (execution.modelSwitchId !== undefined && (
+    typeof execution.modelSwitchId !== 'string' ||
+    !/^[A-Za-z0-9:_-]{8,128}$/.test(execution.modelSwitchId)
+  )) invalidResponse('requestedExecution.modelSwitchId invalid')
   if (
     execution.effortLevel !== undefined &&
     execution.effortLevel !== null &&
