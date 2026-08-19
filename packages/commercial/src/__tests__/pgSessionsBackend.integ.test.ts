@@ -3722,7 +3722,15 @@ describe("durable live turn frame journal", () => {
     await persistGatewayLiveFrame(pool, { ...base, frameSeq: 2, payload: payload2 });
     await assert.rejects(
       persistGatewayLiveFrame(pool, { ...base, frameSeq: 2, payload: `${payload2} ` }),
-      /immutable payload conflict/,
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /immutable payload conflict/);
+        assert.equal(
+          (error as { liveFramePermanentConflict?: unknown }).liveFramePermanentConflict,
+          true,
+        );
+        return true;
+      },
     );
 
     const first = await readClientSessionLiveFrames(pool, sessionId, userId, 0, 1);
@@ -3840,7 +3848,15 @@ describe("durable live turn frame journal", () => {
         frameSeq: 2,
         payload: JSON.stringify({ type: "outbound.message", sessionKey, frameSeq: 2 }),
       }),
-      /live frame stream identity conflict/,
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /live frame stream identity conflict/);
+        assert.equal(
+          (error as { liveFramePermanentConflict?: unknown }).liveFramePermanentConflict,
+          true,
+        );
+        return true;
+      },
       "session_id drift must remain rejected",
     );
 
