@@ -561,6 +561,57 @@ describe("userChatBridge — durable outbound frame ordering", () => {
     assert.deepEqual(queues.snapshotForTest(), { queues: 0, consumerKeys: 0, consumers: 0 });
   });
 
+  test("a permanent exact retry retires only the same-sequence transient poison", async () => {
+    const queues = new _OutboundPersistQueueCoordinator();
+    const key = "706:82:agent:main:webchat:dm:sess-permanent-exact-retry";
+    const attempted: number[] = [];
+    const failures: string[] = [];
+    const permanentConflicts: string[] = [];
+    queues.retain(key);
+
+    queues.enqueue(
+      key,
+      5,
+      async () => {
+        attempted.push(5);
+        throw new Error("transient write failure");
+      },
+      (error) => failures.push((error as Error).message),
+    );
+    await queues.drain();
+
+    queues.enqueue(
+      key,
+      5,
+      async () => {
+        attempted.push(5);
+        const error = new Error("live frame immutable payload conflict") as Error & {
+          liveFramePermanentConflict: boolean;
+        };
+        error.liveFramePermanentConflict = true;
+        throw error;
+      },
+      (error) => failures.push((error as Error).message),
+      (error) => permanentConflicts.push((error as Error).message),
+    );
+    await queues.drain();
+
+    queues.enqueue(
+      key,
+      6,
+      async () => { attempted.push(6); },
+      (error) => failures.push((error as Error).message),
+    );
+    await queues.drain();
+
+    assert.deepEqual(attempted, [5, 5, 6]);
+    assert.deepEqual(failures, ["transient write failure"]);
+    assert.deepEqual(permanentConflicts, ["live frame immutable payload conflict"]);
+    assert.deepEqual(queues.snapshotForTest(), { queues: 0, consumerKeys: 1, consumers: 1 });
+    queues.release(key);
+    assert.deepEqual(queues.snapshotForTest(), { queues: 0, consumerKeys: 0, consumers: 0 });
+  });
+
   test("a detached late-frame failure cannot poison a later sequence", async () => {
     const queues = new _OutboundPersistQueueCoordinator();
     const key = "705:81:agent:main:webchat:dm:sess-detached-late";
@@ -582,6 +633,62 @@ describe("userChatBridge — durable outbound frame ordering", () => {
     await queues.drain();
     assert.deepEqual(attempted, [4, 5]);
     assert.deepEqual(queues.snapshotForTest(), { queues: 0, consumerKeys: 0, consumers: 0 });
+  });
+
+  test("a permanent live-frame conflict skips one frame without closing or poisoning later seqs", async () => {
+    const persisted: number[] = [];
+    const portRef = { value: 0 };
+    const rig = await startRig({
+      resolve: async () => ({ host: "127.0.0.1", port: portRef.value, containerId: 83 }),
+      persistOutboundFrame: async (input) => {
+        if (input.frameSeq === 1) {
+          const error = new Error("live frame immutable payload conflict") as Error & {
+            liveFramePermanentConflict: boolean;
+          };
+          error.liveFramePermanentConflict = true;
+          throw error;
+        }
+        persisted.push(input.frameSeq);
+      },
+    });
+    portRef.value = rig.containerPort;
+    try {
+      const containerOpen = waitNextContainerSocket(rig);
+      const ws = openClient(rig.gatewayPort, await makeJwt("707"));
+      await new Promise<void>((resolve) => ws.once("open", resolve));
+      const containerWs = await containerOpen;
+      const business: Record<string, unknown>[] = [];
+      let closed: { code: number; reason: string } | null = null;
+      ws.on("message", (data) => {
+        try {
+          const frame = JSON.parse(data.toString()) as Record<string, unknown>;
+          if (typeof frame.type === "string" && !frame.type.startsWith("sys.")) business.push(frame);
+        } catch { /* irrelevant */ }
+      });
+      ws.once("close", (code, reason) => {
+        closed = { code, reason: reason.toString("utf8") };
+      });
+      const frame = (frameSeq: number, text: string): string => JSON.stringify({
+        type: "outbound.message",
+        sessionKey: "agent:main:webchat:dm:sess-permanent-skip",
+        frameSeq,
+        peer: { id: "sess-permanent-skip", kind: "dm" },
+        clientMessageId: "cm-permanent-skip",
+        blocks: [{ kind: "text", text }],
+      });
+      containerWs.send(frame(1, "one"));
+      containerWs.send(frame(2, "two"));
+
+      await waitFor(() => persisted.includes(2) && business.some((entry) => entry.frameSeq === 2));
+      assert.equal(closed, null);
+      assert.equal(ws.readyState, WebSocket.OPEN);
+      assert.deepEqual(persisted, [2]);
+      assert.deepEqual(business.map((entry) => entry.frameSeq), [2]);
+      ws.close();
+      await waitClose(ws);
+    } finally {
+      await stopRig(rig);
+    }
   });
 
   test("commits exact stamped frames serially before either becomes browser-visible", async () => {

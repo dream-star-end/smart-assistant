@@ -1553,6 +1553,14 @@ type OutboundPersistQueueState = {
   failedSeq: number | null;
 };
 
+function isPermanentLiveFrameConflict(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    (error as { liveFramePermanentConflict?: unknown }).liveFramePermanentConflict === true
+  );
+}
+
 /**
  * Serializes durable outbound writes per container/session namespace.
  *
@@ -1585,6 +1593,7 @@ export class _OutboundPersistQueueCoordinator {
     frameSeq: number,
     work: () => Promise<void>,
     onFailure: (error: unknown) => void,
+    onPermanentConflict?: (error: unknown) => void,
   ): void {
     let state = this.queues.get(key);
     if (!state) {
@@ -1603,6 +1612,14 @@ export class _OutboundPersistQueueCoordinator {
         await work();
         if (state!.failedSeq === frameSeq) state!.failedSeq = null;
       } catch (error) {
+        if (isPermanentLiveFrameConflict(error)) {
+          // An exact retry can turn a prior transient failure into a proven
+          // permanent conflict. Retire only that same-sequence barrier; a
+          // barrier for any other missing sequence must remain strict.
+          if (state!.failedSeq === frameSeq) state!.failedSeq = null;
+          onPermanentConflict?.(error);
+          return;
+        }
         state!.failedSeq = frameSeq;
         onFailure(error);
       }
@@ -6876,6 +6893,16 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               err: (error as Error)?.message ?? String(error),
             });
             try { userWs.close(CLOSE_BRIDGE.INTERNAL, "output persistence unavailable"); } catch { /* */ }
+          },
+          (error) => {
+            bridgeLog?.error("user-chat-bridge: skipping outbound frame after permanent live-stream conflict", {
+              sessionId: stamped.sessionId,
+              clientMessageId: stamped.clientMessageId,
+              containerId,
+              sessionKey: stamped.sessionKey,
+              frameSeq: stamped.frameSeq,
+              err: (error as Error)?.message ?? String(error),
+            });
           },
         );
         return;
