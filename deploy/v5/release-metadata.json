@@ -104,7 +104,8 @@
     "0223_official_cny_pricing_and_gpt_1m",
     "0224_cost_x_targets_and_max_plan_gate",
     "0225_cursor_account_pool",
-    "0226_cursor_quota_class"
+    "0226_cursor_quota_class",
+    "0227_zcode_engine"
   ],
   "capabilities": [
     "sessions-store-pg-v1",
