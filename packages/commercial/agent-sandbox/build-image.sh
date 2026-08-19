@@ -42,7 +42,8 @@ PERSONAL_SRC="${PERSONAL_SRC:-/opt/openclaude/openclaude}"
 SANDBOX_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"  # 本脚本所在目录(agent-sandbox/)
 # Persistent selfhost runtime profile (audited, not a one-off shell export).
 # Present in this tree → subsequent builds keep ZCode/Grok/Cursor/Codex pins.
-SELHOST_BUILD_ENV="$(cd "$SANDBOX_DIR/../.." && pwd)/deploy/v5-selfhost/runtime-build.env"
+# agent-sandbox -> commercial -> packages -> repo root (three levels, not two).
+SELHOST_BUILD_ENV="$(cd "$SANDBOX_DIR/../../.." && pwd)/deploy/v5-selfhost/runtime-build.env"
 if [ -f "$SELHOST_BUILD_ENV" ]; then
   echo "[build-image] sourcing persistent profile $SELHOST_BUILD_ENV"
   set -a

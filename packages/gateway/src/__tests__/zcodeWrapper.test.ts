@@ -75,6 +75,7 @@ describe('oc-zcode wrapper', () => {
     assert.match(profile, /^OC_INCLUDE_GROK=1$/m)
     assert.match(profile, /^OC_INCLUDE_CURSOR=1$/m)
     assert.match(profile, /^OC_EMBED_SOURCE=0$/m)
+    assert.match(build, /SANDBOX_DIR\/\.\.\/\.\.\/\.\./)
     assert.match(build, /deploy\/v5-selfhost\/runtime-build\.env/)
     assert.match(build, /oc\.runtime\.include_zcode=\$\{OC_INCLUDE_ZCODE:-0\}/)
     assert.match(build, /OC_INCLUDE_ZCODE=\$\{OC_INCLUDE_ZCODE:-0\}/)
