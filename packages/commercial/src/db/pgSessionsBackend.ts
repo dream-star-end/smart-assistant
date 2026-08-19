@@ -2657,7 +2657,10 @@ export async function _prepareLosslessTurnTapeOutsideLocks(
   ) {
     throw new Error("lossless turn tape envelope/payload identity mismatch");
   }
-  const visible = turn.records.map((item, ordinal) => {
+  const visible: UserVisiblePhysicalPayload[] = [];
+  for (let ordinal = 0; ordinal < turn.records.length; ordinal++) {
+    await yieldLosslessTapeWork();
+    const item = turn.records[ordinal]!;
     const payload = userVisiblePhysicalPayload({
       tape_id: request.tapeId,
       tape_sha256: request.tapeSha256,
@@ -2677,8 +2680,8 @@ export async function _prepareLosslessTurnTapeOutsideLocks(
     // visible_payload is BYTEA, not jsonb. Keep exact JSON (including \u0000)
     // so timeline/exact reads match original record bytes. jsonb columns are
     // sanitized at bind time; the 0232 trigger lazy-sanitizes agent-group casts.
-    return payload;
-  });
+    visible.push(payload);
+  }
   return {
     turn,
     visible,
@@ -2743,6 +2746,10 @@ async function claimLosslessTurnTapeStorageFormat(
 }
 
 export const LOSSLESS_TURN_RECORD_STAGE_BATCH_SIZE = 128;
+
+function yieldLosslessTapeWork(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
 
 let afterLosslessStageBatch: (() => Promise<void> | void) | null = null;
 export function _setAfterLosslessStageBatch(hook: (() => Promise<void> | void) | null): void {
@@ -2809,6 +2816,7 @@ export async function _stagePreparedLosslessTurnRecords(
       }
 
       for (const ordinal of batch) {
+      await yieldLosslessTapeWork();
       const item = prepared.turn.records[ordinal]!;
       const visible = prepared.visible[ordinal]!;
       const expectedModels = preparedModelSidecarsForOrdinal(ordinal, item.id, visible);
@@ -3096,6 +3104,7 @@ async function readExactPreparedLosslessTurnOrdinals(
 
   const exact = new Set<number>();
   for (let ordinal = 0; ordinal < prepared.turn.records.length; ordinal++) {
+    await yieldLosslessTapeWork();
     const item = prepared.turn.records[ordinal]!;
     const visible = prepared.visible[ordinal]!;
     const record = recordsByOrdinal.get(ordinal);
