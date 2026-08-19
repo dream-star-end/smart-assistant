@@ -96,6 +96,7 @@ const MIGRATION_0202 = path.resolve(here, "../db/migrations/0202_turn_recovery_c
 const MIGRATION_0228 = path.resolve(here, "../db/migrations/0228_turn_visible_finalize.sql");
 const MIGRATION_0229 = path.resolve(here, "../db/migrations/0229_turn_finalize_integrity.sql");
 const MIGRATION_0230 = path.resolve(here, "../db/migrations/0230_chat_projects.sql");
+const MIGRATION_0231 = path.resolve(here, "../db/migrations/0231_turn_tape_materialization_resilience.sql");
 
 let pool: Pool;
 let backend: PgSessionsBackend;
@@ -227,6 +228,7 @@ before(async () => {
   await pool.query(await readFile(MIGRATION_0228, { encoding: "utf8" }));
   await pool.query(await readFile(MIGRATION_0229, { encoding: "utf8" }));
   await pool.query(await readFile(MIGRATION_0230, { encoding: "utf8" }));
+  await pool.query(await readFile(MIGRATION_0231, { encoding: "utf8" }));
   await pool.query(`
     CREATE TABLE admin_audit (
       id BIGSERIAL PRIMARY KEY,
@@ -7267,6 +7269,82 @@ function browserVisibleTimeline(messages: MessageLike[]): MessageLike[] {
 }
 
 describe("pgSessionsBackend direct turn timeline", () => {
+  maybe("format-3 agent-group preserves escaped NUL without weakening format-2 guard", async () => {
+    const previousBatching = process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING;
+    process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING = "1";
+    try {
+      const sessionId = "s-agent-group-escaped-nul";
+      const userId = "u-agent-group-escaped-nul";
+      const exactChildText = "CHILD-BEFORE\u0000CHILD-AFTER";
+      await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+      const tape = directTape(sessionId, "6".repeat(64), {
+        text: "NUL child complete",
+        agentGroups: [{
+          runId: "dlg-nul",
+          agentId: "reviewer",
+          goal: "preserve exact child output",
+          status: "ok",
+          resultSummary: exactChildText,
+          transcript: [{ kind: "text", text: exactChildText }],
+          completedAt: 1_783_944_000_010,
+        }],
+      });
+      for (const part of tape.parts) {
+        await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+      }
+      const formatBefore = (
+        await pool.query<{ record_storage_format: number }>(
+          `SELECT record_storage_format FROM client_session_turn_tapes
+            WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+          [sessionId, userId, tape.finalize.tapeId],
+        )
+      ).rows[0]!.record_storage_format;
+      assert.equal(formatBefore, 2);
+
+      const legacyPayload = Buffer.from(JSON.stringify({
+        id: "legacy-nul",
+        role: "agent-group",
+        text: exactChildText,
+        engineBillings: [],
+      }));
+      await assert.rejects(
+        pool.query(
+          `INSERT INTO client_session_turn_tape_records
+             (session_id,user_id,tape_id,msg_id,ordinal,role,ts,content_sha256,payload)
+           VALUES ($1,$2,$3,'legacy-nul',999,'agent-group',1,$4,$5)`,
+          [sessionId, userId, tape.finalize.tapeId, sha256(legacyPayload), legacyPayload],
+        ),
+        /unsupported Unicode escape sequence/,
+      );
+
+      await stageAndFinalize(userId, tape);
+      const formatAfter = (
+        await pool.query<{ record_storage_format: number }>(
+          `SELECT record_storage_format FROM client_session_turn_tapes
+            WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+          [sessionId, userId, tape.finalize.tapeId],
+        )
+      ).rows[0]!.record_storage_format;
+      assert.equal(formatAfter, 3);
+      const group = (
+        await pool.query<{ raw: string }>(
+          `SELECT convert_from(payload,'UTF8') AS raw
+             FROM client_session_turn_tape_records
+            WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND role='agent-group'`,
+          [sessionId, userId, tape.finalize.tapeId],
+        )
+      ).rows[0]!;
+      assert.equal(JSON.parse(group.raw).resultSummary, exactChildText);
+      assert.match(group.raw, /\\u0000/);
+    } finally {
+      if (previousBatching === undefined) {
+        delete process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING;
+      } else {
+        process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING = previousBatching;
+      }
+    }
+  });
+
   maybe("actual NUL finalizes and backfills PostgreSQL model sidecars without changing exact tape bytes", async () => {
     const sessionId = "s-direct-nul-model-sidecar";
     const userId = "u-direct-nul-model-sidecar";
@@ -8538,6 +8616,14 @@ describe("rev2 visible finalize decoupling", () => {
     }, { materialize: false });
     assert.equal(visible.applied, "finalized");
     assert.equal(visible.settlementHandoff, true);
+    const timelineBeforeMaterialization = await backend.getClientSession(
+      sessionId,
+      userId,
+      { view: "timeline" },
+    );
+    const visibleAssistant = (timelineBeforeMaterialization!.messages as MessageLike[])
+      .find((message) => message.role === "assistant");
+    assert.equal(visibleAssistant?.text, "phase a only");
     const parts = Number((
       await pool.query<{ n: string }>(
         `SELECT count(*)::text AS n FROM client_session_turn_tape_parts
@@ -8578,6 +8664,77 @@ describe("rev2 visible finalize decoupling", () => {
     const hydrated = await backend.getClientSession(sessionId, userId);
     const assistant = (hydrated!.messages as MessageLike[]).find((m) => m.role === "assistant");
     assert.equal(assistant?.text, "phase a only");
+  });
+
+  maybe("duplicate Phase A does not hot-reactivate a failed materialization job", async () => {
+    const sessionId = "s-rev3-failed-job-cold";
+    const userId = "c:1";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const tape = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 11,
+      status: "completed",
+      turnKey: "f".repeat(64),
+      text: "visible while cold",
+      createdAt: 1_700_000_400_000,
+    });
+    for (const part of tape.parts) {
+      await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+    }
+    const settlement = {
+      billingAnchorId: `srv-${sessionId}-main-t11`,
+      engineBillings: [],
+      text: "visible while cold",
+      ts: 1_700_000_400_000,
+    };
+    await backend.finalizeLosslessTurnTape(userId, {
+      ...tape.finalize,
+      settlement,
+    }, { materialize: false });
+    await pool.query(
+      `UPDATE turn_tape_materialization_jobs
+          SET status='failed', attempt=8,
+              next_attempt_at=NOW()+INTERVAL '1 hour',
+              last_error='permanent poison'
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+      [sessionId, userId, tape.finalize.tapeId],
+    );
+    const before = (
+      await pool.query<{ status: string; attempt: number; next_attempt_at: string }>(
+        `SELECT status,attempt,next_attempt_at::text
+           FROM turn_tape_materialization_jobs
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+        [sessionId, userId, tape.finalize.tapeId],
+      )
+    ).rows[0]!;
+    await backend.finalizeLosslessTurnTape(userId, {
+      ...tape.finalize,
+      settlement,
+    }, { materialize: false });
+    const after = (
+      await pool.query<{
+        status: string;
+        attempt: number;
+        next_attempt_at: string;
+        last_error: string;
+      }>(
+        `SELECT status,attempt,next_attempt_at::text,last_error
+           FROM turn_tape_materialization_jobs
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+        [sessionId, userId, tape.finalize.tapeId],
+      )
+    ).rows[0]!;
+    assert.equal(after.status, "failed");
+    assert.equal(after.attempt, before.attempt);
+    assert.equal(after.next_attempt_at, before.next_attempt_at);
+    assert.equal(after.last_error, "permanent poison");
+    const timeline = await backend.getClientSession(sessionId, userId, { view: "timeline" });
+    assert.equal(
+      (timeline!.messages as MessageLike[])
+        .find((message) => message.role === "assistant")?.text,
+      "visible while cold",
+    );
   });
 
   maybe("visible + failed materialization still builds the next engine context", async () => {

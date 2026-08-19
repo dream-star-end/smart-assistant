@@ -59,12 +59,12 @@ export async function enqueueMaterializationJob(
      VALUES ($1,$2,$3,$4::uuid)
      ON CONFLICT (session_id, user_id, tape_id) DO UPDATE SET
        status = CASE
-         WHEN turn_tape_materialization_jobs.status = 'complete'
+         WHEN turn_tape_materialization_jobs.status IN ('complete','failed')
            THEN turn_tape_materialization_jobs.status
          ELSE 'queued'
        END,
        next_attempt_at = CASE
-         WHEN turn_tape_materialization_jobs.status = 'complete'
+         WHEN turn_tape_materialization_jobs.status IN ('complete','failed')
            THEN turn_tape_materialization_jobs.next_attempt_at
          ELSE LEAST(turn_tape_materialization_jobs.next_attempt_at, NOW())
        END,

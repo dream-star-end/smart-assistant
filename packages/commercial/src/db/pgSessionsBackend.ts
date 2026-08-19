@@ -5309,6 +5309,10 @@ async function hydrateUnifiedTimelineTapeUnits(
   const billingHeads = await readDirectTapeVisibleHeads(client, sessionId, userId, tapeIds);
   const billingByTape = new Map(billingHeads.map((head) => [head.tape_id, head]));
   const planned = units.filter((unit) =>
+    recordsPublished({
+      materializationStatus: unit.header.materializationStatus,
+      finalizedAt: unit.header.finalizedAt,
+    }) &&
     !deferUnifiedTimelinePayload(
       unit.head.role,
       bigIntNum(unit.head.payload_bytes, "turn tape timeline payload bytes"),
@@ -5338,6 +5342,12 @@ async function hydrateUnifiedTimelineTapeUnits(
 
   for (const unit of units) {
     const { anchor, header, head } = unit;
+    if (!recordsPublished({
+      materializationStatus: header.materializationStatus,
+      finalizedAt: header.finalizedAt,
+    })) {
+      continue;
+    }
     const physicalKey = `${header.tapeId}\0${head.ordinal}`;
     const payloadBytes = bigIntNum(head.payload_bytes, "turn tape timeline payload bytes");
     const billing = billingByTape.get(header.tapeId);
