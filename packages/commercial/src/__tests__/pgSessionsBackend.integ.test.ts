@@ -93,6 +93,7 @@ const MIGRATION_0198 = path.resolve(here, "../db/migrations/0198_client_session_
 const MIGRATION_0201 = path.resolve(here, "../db/migrations/0201_durable_live_turn_frames.sql");
 const MIGRATION_0202 = path.resolve(here, "../db/migrations/0202_turn_recovery_control.sql");
 const MIGRATION_0228 = path.resolve(here, "../db/migrations/0228_turn_visible_finalize.sql");
+const MIGRATION_0229 = path.resolve(here, "../db/migrations/0229_turn_finalize_integrity.sql");
 
 let pool: Pool;
 let backend: PgSessionsBackend;
@@ -222,6 +223,7 @@ before(async () => {
   await pool.query(await readFile(MIGRATION_0201, { encoding: "utf8" }));
   await pool.query(await readFile(MIGRATION_0202, { encoding: "utf8" }));
   await pool.query(await readFile(MIGRATION_0228, { encoding: "utf8" }));
+  await pool.query(await readFile(MIGRATION_0229, { encoding: "utf8" }));
   await pool.query(`
     CREATE TABLE admin_audit (
       id BIGSERIAL PRIMARY KEY,
@@ -8381,5 +8383,137 @@ describe("rev2 visible finalize decoupling", () => {
     const still = await backend.getClientSession(sessionId, userId);
     const stillAssistant = (still!.messages as MessageLike[]).find((m) => m.role === "assistant");
     assert.ok(typeof stillAssistant?.text === "string" && stillAssistant.text.length > 0);
+  });
+
+  maybe("Phase A only does not run Phase B even when materialize later 57014s", async () => {
+    const sessionId = "s-rev3-http-phase-a";
+    const userId = "c:1";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const tape = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 8,
+      status: "completed",
+      turnKey: "c".repeat(64),
+      text: "phase a only",
+      createdAt: 1_700_000_100_000,
+    });
+    for (const part of tape.parts) {
+      await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+    }
+    const visible = await backend.finalizeLosslessTurnTape(userId, tape.finalize, { materialize: false });
+    assert.equal(visible.applied, "finalized");
+    assert.equal(visible.settlementHandoff, true);
+    const parts = Number((
+      await pool.query<{ n: string }>(
+        `SELECT count(*)::text AS n FROM client_session_turn_tape_parts
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+        [sessionId, userId, tape.finalize.tapeId],
+      )
+    ).rows[0]?.n ?? "0");
+    assert.ok(parts > 0);
+    _setAfterLosslessStageBatch(() => {
+      const err = new Error("statement timeout");
+      (err as { code?: string }).code = "57014";
+      throw err;
+    });
+    try {
+      const second = await backend.finalizeLosslessTurnTape(userId, tape.finalize);
+      assert.equal(second.applied, "finalized");
+    } catch (err) {
+      assert.match(String((err as Error).message ?? err), /statement timeout|57014|pending|killed/i);
+    } finally {
+      _setAfterLosslessStageBatch(null);
+    }
+    const partsAfter = Number((
+      await pool.query<{ n: string }>(
+        `SELECT count(*)::text AS n FROM client_session_turn_tape_parts
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+        [sessionId, userId, tape.finalize.tapeId],
+      )
+    ).rows[0]?.n ?? "0");
+    assert.equal(partsAfter, parts);
+    const mat = (
+      await pool.query<{ materialization_status: string }>(
+        `SELECT materialization_status FROM client_session_turn_tapes
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+        [sessionId, userId, tape.finalize.tapeId],
+      )
+    ).rows[0];
+    assert.notEqual(mat?.materialization_status, "complete");
+    const hydrated = await backend.getClientSession(sessionId, userId);
+    const assistant = (hydrated!.messages as MessageLike[]).find((m) => m.role === "assistant");
+    assert.equal(assistant?.text, "phase a only");
+  });
+
+  maybe("visible + failed materialization still builds the next engine context", async () => {
+    const sessionId = "s-rev3-engine-visible";
+    const userId = "c:1";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const tape = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 9,
+      status: "completed",
+      turnKey: "d".repeat(64),
+      text: "visible context",
+      createdAt: 1_700_000_200_000,
+    });
+    for (const part of tape.parts) {
+      await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+    }
+    await backend.finalizeLosslessTurnTape(userId, tape.finalize, { materialize: false });
+    await pool.query(
+      `UPDATE client_session_turn_tapes
+          SET materialization_status='failed', materialization_attempts=8
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+      [sessionId, userId, tape.finalize.tapeId],
+    );
+    const context = await backend.getEngineContextMessages(sessionId, userId);
+    assert.ok(Array.isArray(context));
+    const texts = context.map((message) => `${message.role}:${String(message.text ?? "")}`);
+    assert.ok(
+      texts.some((row) => row.includes("visible")),
+      `engine context missing visible stub: ${JSON.stringify(texts)}`,
+    );
+  });
+
+  maybe("tool-only tape uses one canonical billing anchor", async () => {
+    const sessionId = "s-rev3-tool-only";
+    const userId = "c:1";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const tape = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 10,
+      status: "completed",
+      turnKey: "e".repeat(64),
+      text: "",
+      createdAt: 1_700_000_300_000,
+      tools: [{
+        blockId: "only-tool",
+        toolName: "Bash",
+        inputJson: { command: "true" },
+        output: "ok",
+        completed: true,
+      }],
+    });
+    for (const part of tape.parts) {
+      await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+    }
+    const visible = await backend.finalizeLosslessTurnTape(userId, {
+      ...tape.finalize,
+      settlement: {
+        billingAnchorId: `srv-${sessionId}-main-t10-tool-only-tool`,
+        engineBillings: [],
+        text: "",
+        ts: 1_700_000_300_000,
+      },
+    }, { materialize: false });
+    assert.equal(visible.applied, "finalized");
+    await backend.finalizeLosslessTurnTape(userId, tape.finalize);
+    const hydrated = await backend.getClientSession(sessionId, userId);
+    const assistants = (hydrated!.messages as MessageLike[]).filter((m) => m._turnTapeId === tape.finalize.tapeId);
+    assert.equal(assistants.length, 1);
   });
 });
