@@ -4570,16 +4570,19 @@ export class Gateway {
       }
       const afterRaw = url.searchParams.get('after')
       const limitRaw = url.searchParams.get('limit')
+      const seekRaw = url.searchParams.get('seek')
       const after = afterRaw === null ? 0 : Number(afterRaw)
       const limit = limitRaw === null ? 200 : Number(limitRaw)
+      const seekTail = seekRaw === 'tail'
       if (
         !Number.isSafeInteger(after) || after < 0 ||
-        !Number.isSafeInteger(limit) || limit < 1 || limit > 500
+        !Number.isSafeInteger(limit) || limit < 1 || limit > 500 ||
+        (seekRaw !== null && seekRaw !== 'tail')
       ) {
         this.sendJson(res, 400, { error: 'invalid live frame cursor' })
         return
       }
-      readClientSessionLiveFrames(sessId, userId, after, limit)
+      readClientSessionLiveFrames(sessId, userId, after, limit, { seekTail })
         .then((page) => page
           ? this.sendJson(res, 200, page)
           : this.sendJson(res, 404, { error: 'not found' }))
@@ -14264,6 +14267,15 @@ export class Gateway {
           if (replay.sent.length > 0) {
             outboundRingReplayHitTotal.inc()
             for (const f of replay.sent) {
+              try {
+                const parsed = JSON.parse(f.data) as { type?: unknown; clientMessageId?: unknown }
+                if (
+                  !isClientMessageId(parsed.clientMessageId)
+                  && (parsed.type === 'outbound.message' || parsed.type === 'outbound.error')
+                ) {
+                  continue
+                }
+              } catch { /* non-JSON ring payload still delivered */ }
               try { ws.send(f.data) } catch { break }
             }
             this.log.info('resume replay served', {

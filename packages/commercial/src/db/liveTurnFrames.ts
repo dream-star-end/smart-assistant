@@ -23,11 +23,31 @@ export interface ClientSessionLiveFramePage {
   frames: ClientSessionLiveFrame[];
   nextCursor: string | null;
   hasMore: boolean;
+  /** True when this page starts after earlier frames on the current open dispatch. */
+  hasMoreBefore: boolean;
   streamClientMessageIds: string[];
   hasTapeProjection: boolean;
   /** tape 投影版本水位(tape 投影流计数,单调递增)。见 readClientSessionLiveFrames。 */
   tapeProjectionVersion: number;
 }
+
+/** First-open / oversized current-dispatch fallback: return the last page. */
+export const LIVE_FRAME_HOT_TAIL_COUNT = 200;
+export const LIVE_FRAME_HOT_TAIL_BYTES = 256 * 1024;
+
+export type ReadClientSessionLiveFramesOptions = {
+  seekTail?: boolean;
+};
+
+/** Hot GET live-frames only reads live streams of in-flight dispatches. */
+const OPEN_DISPATCH_STREAM_SQL = `s.projection_source='live'
+            AND EXISTS (
+              SELECT 1
+                FROM turn_dispatches d
+               WHERE d.session_id=s.session_id
+                 AND d.status IN ('accepted','admitted','rejecting')
+                 AND s.stream_key LIKE 'dispatch:' || d.dispatch_id::text || ':%'
+            )`;
 
 function sha256(payload: Buffer): string {
   return createHash("sha256").update(payload).digest("hex");
@@ -256,9 +276,11 @@ export async function readClientSessionLiveFrames(
   userId: string,
   afterRecordId = 0,
   limit = 200,
+  options?: ReadClientSessionLiveFramesOptions,
 ): Promise<ClientSessionLiveFramePage | null> {
   const cursor = Number.isSafeInteger(afterRecordId) && afterRecordId >= 0 ? afterRecordId : 0;
   const pageSize = Number.isSafeInteger(limit) ? Math.max(1, Math.min(500, limit)) : 200;
+  const wantTail = options?.seekTail === true;
   return withTx(pool, async (client) => {
     const session = await client.query(
       "SELECT 1 FROM client_sessions WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL",
@@ -272,6 +294,7 @@ export async function readClientSessionLiveFrames(
       retired: boolean;
       superseded_by_completed_tape: boolean;
       tape_projection_version: string | number;
+      open_dispatch: boolean;
     }>(
       `SELECT client_message_id,projection_source,
               (provenance ? 'retired_at') AS retired,
@@ -288,7 +311,15 @@ export async function readClientSessionLiveFrames(
                 )
               ) AS superseded_by_completed_tape,
               COUNT(*) FILTER (WHERE projection_source='tape')
-                OVER ()::text AS tape_projection_version
+                OVER ()::text AS tape_projection_version,
+              EXISTS (
+                SELECT 1
+                  FROM turn_dispatches d
+                 WHERE d.session_id=client_session_live_streams.session_id
+                   AND d.status IN ('accepted','admitted','rejecting')
+                   AND client_session_live_streams.stream_key
+                     LIKE 'dispatch:' || d.dispatch_id::text || ':%'
+              ) AS open_dispatch
          FROM client_session_live_streams
         WHERE session_id=$1 AND user_id=$2
         ORDER BY created_at,stream_key`,
@@ -296,19 +327,42 @@ export async function readClientSessionLiveFrames(
     );
     const streamClientMessageIds = [...new Set(
       streams.rows
-        .filter((row) => row.projection_source === "live" && !row.retired && !row.superseded_by_completed_tape)
+        .filter((row) =>
+          row.projection_source === "live"
+          && !row.retired
+          && !row.superseded_by_completed_tape
+          && row.open_dispatch
+        )
         .map((row) => row.client_message_id)
         .filter((value): value is string => typeof value === "string" && value.length > 0),
     )];
 
-    // Drive from the session's live stream_key set (idx_live_stream_session_projection)
-    // then LATERAL-page each key via idx_live_frame_stream_order. The previous
-    // frames-first join let a generic plan pick client_session_live_frames_pkey
-    // with Index Cond (record_id > $cursor) and walk the table; zero matching
-    // rows was the slowest case.
-    // Retired streams stay in this frame query: retirement only means "not in
-    // flight" (dropped from streamClientMessageIds). Many dead streams have no
-    // tape and no canonical messages — these frames are the only copy.
+    // Hot path never reads leftover legacy:*, tapeless cmid-less streams, or
+    // taped old live journals. Only the current accepted/admitted/rejecting
+    // dispatch's dispatch:<id>:% stream. No in-flight dispatch → empty page;
+    // the browser already has history from GET /api/sessions tape.
+    const stats = (
+      await client.query<{ n: string; bytes: string }>(
+        `SELECT COUNT(*)::text AS n,
+                COALESCE(SUM(octet_length(fr.payload)),0)::text AS bytes
+           FROM client_session_live_streams s
+           JOIN client_session_live_frames fr ON fr.stream_key=s.stream_key
+          WHERE s.user_id=$2 AND s.session_id=$1
+            AND ${OPEN_DISPATCH_STREAM_SQL}`,
+        [sessionId, userId],
+      )
+    ).rows[0];
+    const hotCount = Number.parseInt(stats?.n ?? "0", 10) || 0;
+    const hotBytes = Number.parseInt(stats?.bytes ?? "0", 10) || 0;
+    const seekTail = wantTail
+      || (
+        cursor === 0
+        && (
+          hotCount > LIVE_FRAME_HOT_TAIL_COUNT
+          || hotBytes > LIVE_FRAME_HOT_TAIL_BYTES
+        )
+      );
+
     const rows = (
       await client.query<{
         record_id: string;
@@ -317,47 +371,63 @@ export async function readClientSessionLiveFrames(
         client_message_id: string | null;
         payload: Buffer;
       }>(
-        `SELECT f.record_id::text,f.stream_key,f.source,s.client_message_id,f.payload
-           FROM client_session_live_streams s
-           CROSS JOIN LATERAL (
-             SELECT fr.record_id,fr.stream_key,fr.source,fr.payload
-               FROM client_session_live_frames fr
-              WHERE fr.stream_key=s.stream_key
-                AND fr.record_id>$3::bigint
-              ORDER BY fr.record_id
-              LIMIT $4
-           ) f
-          WHERE s.user_id=$2 AND s.session_id=$1
-            AND s.projection_source='live'
-            AND NOT (
-              s.client_message_id IS NOT NULL
-              AND EXISTS (
-                SELECT 1
-                  FROM client_session_turn_tapes t
-                 WHERE t.session_id=s.session_id
-                   AND t.user_id=s.user_id
-                   AND t.client_message_id=s.client_message_id
-                   AND t.status='completed'
-                   AND t.finalized_at IS NOT NULL
-              )
-            )
-            AND NOT (
-              s.stream_key LIKE 'legacy:%'
-              AND s.client_message_id IS NULL
-              AND NOT EXISTS (
-                SELECT 1
-                  FROM turn_dispatches d
-                 WHERE d.session_id=s.session_id
-                   AND d.status IN ('accepted','admitted','rejecting')
-              )
-            )
-          ORDER BY f.record_id
-          LIMIT $4`,
-        [sessionId, userId, cursor, pageSize + 1],
+        seekTail
+          ? `SELECT record_id::text,stream_key,source,client_message_id,payload
+               FROM (
+                 SELECT f.record_id,f.stream_key,f.source,s.client_message_id,f.payload
+                   FROM client_session_live_streams s
+                   JOIN client_session_live_frames f ON f.stream_key=s.stream_key
+                  WHERE s.user_id=$2 AND s.session_id=$1
+                    AND ${OPEN_DISPATCH_STREAM_SQL}
+                  ORDER BY f.record_id DESC
+                  LIMIT $3
+               ) tail
+              ORDER BY record_id`
+          : `SELECT f.record_id::text,f.stream_key,f.source,s.client_message_id,f.payload
+               FROM client_session_live_streams s
+               CROSS JOIN LATERAL (
+                 SELECT fr.record_id,fr.stream_key,fr.source,fr.payload
+                   FROM client_session_live_frames fr
+                  WHERE fr.stream_key=s.stream_key
+                    AND fr.record_id>$3::bigint
+                  ORDER BY fr.record_id
+                  LIMIT $4
+               ) f
+              WHERE s.user_id=$2 AND s.session_id=$1
+                AND ${OPEN_DISPATCH_STREAM_SQL}
+              ORDER BY f.record_id
+              LIMIT $4`,
+        seekTail
+          ? [sessionId, userId, pageSize + 1]
+          : [sessionId, userId, cursor, pageSize + 1],
       )
     ).rows;
-    const hasMore = rows.length > pageSize;
-    const page = hasMore ? rows.slice(0, pageSize) : rows;
+    let hasMore = false;
+    let hasMoreBefore = false;
+    let page = rows;
+    if (seekTail) {
+      hasMore = false;
+      if (rows.length > pageSize) {
+        hasMoreBefore = true;
+        page = rows.slice(1);
+      }
+    } else {
+      hasMore = rows.length > pageSize;
+      page = hasMore ? rows.slice(0, pageSize) : rows;
+      if (cursor > 0) {
+        const older = await client.query(
+          `SELECT 1
+             FROM client_session_live_streams s
+             JOIN client_session_live_frames fr ON fr.stream_key=s.stream_key
+            WHERE s.user_id=$2 AND s.session_id=$1
+              AND ${OPEN_DISPATCH_STREAM_SQL}
+              AND fr.record_id<=$3::bigint
+            LIMIT 1`,
+          [sessionId, userId, cursor],
+        );
+        hasMoreBefore = (older.rowCount ?? 0) > 0;
+      }
+    }
     const frames = page.map((row): ClientSessionLiveFrame => {
       let parsed: unknown;
       try {
@@ -381,6 +451,7 @@ export async function readClientSessionLiveFrames(
     return {
       frames,
       hasMore,
+      hasMoreBefore,
       nextCursor: frames.length > 0 ? frames[frames.length - 1]!.recordId : null,
       streamClientMessageIds,
       hasTapeProjection: streams.rows.some((row) => row.projection_source === "tape"),
@@ -650,11 +721,9 @@ export async function pruneProjectedLiveFrames(
  * (no DDL — aurora already occupies 0219; a new column would force a 0220
  * gap and a migrate-before-code deploy order).
  *
- * Retirement is "no longer the in-flight owner", not "content is gone".
- * The read path still returns retired streams' frames (often the only copy:
- * no tape, no canonical messages). It only drops them from
- * streamClientMessageIds, which is what the client uses to decide a turn
- * is still flying.
+ * Retirement is hygiene, not the open-session hot path. GET live-frames now
+ * only returns the current in-flight dispatch:* stream; retired leftover and
+ * terminal live journals stay in the table (no prune) for cold audit.
  *
  * Eligible, all required:
  *   - source='gateway' (never rollout_import)

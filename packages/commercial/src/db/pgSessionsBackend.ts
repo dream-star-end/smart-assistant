@@ -8672,6 +8672,7 @@ export function createPgSessionsBackend(
       userId: string,
       afterRecordId = 0,
       limit = 200,
+      options?: { seekTail?: boolean },
     ) {
       return readDurableClientSessionLiveFrames(
         pool,
@@ -8679,6 +8680,7 @@ export function createPgSessionsBackend(
         userId,
         afterRecordId,
         limit,
+        options,
       );
     },
 

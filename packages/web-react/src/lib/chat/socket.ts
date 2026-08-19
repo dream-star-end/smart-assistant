@@ -161,6 +161,8 @@ export const EMPTY_JOURNAL_POLL_DELAYS_MS = [1000, 2000, 5000, 10_000] as const;
  * 30s wall clock covers a slow first page without silent infinite paging. */
 export const LIVE_JOURNAL_MAX_PAGES = 24;
 export const LIVE_JOURNAL_MAX_MS = 30_000;
+/** First hydrate request seeks the current dispatch tail, not after=0. */
+export const LIVE_JOURNAL_OPEN_CURSOR = "tail";
 
 export type LiveJournalObservation = {
   frameCount: number;
@@ -3139,7 +3141,7 @@ export class ChatSocket {
     return this.runDurableLiveFrameHydration(sessId, async () => {
       const checkpoint = this.durableLiveJournalCheckpoints.get(sessId);
       const initial = checkpoint === undefined;
-      let cursor = checkpoint?.cursor ?? "0";
+      let cursor = checkpoint?.cursor ?? LIVE_JOURNAL_OPEN_CURSOR;
       const previousLiveOwners = checkpoint?.liveClientMessageIds ?? new Set<string>();
       let currentLiveOwners = new Set(previousLiveOwners);
       // Reset owners ≠ live owners. streamClientMessageIds is the in-flight
@@ -3210,6 +3212,7 @@ export class ChatSocket {
             throw new Error("live frame page missing cursor");
           }
           if (page.nextCursor) cursor = page.nextCursor;
+          else if (cursor === LIVE_JOURNAL_OPEN_CURSOR) cursor = "0";
           if (!page.hasMore) break;
         }
       };

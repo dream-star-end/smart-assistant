@@ -343,6 +343,8 @@ export type DurableLiveFramePage = {
   frames: DurableLiveFrame[];
   nextCursor: string | null;
   hasMore: boolean;
+  /** Earlier frames exist on the current open dispatch. Old backends omit this. */
+  hasMoreBefore?: boolean;
   streamClientMessageIds: string[];
   hasTapeProjection: boolean;
   /** 服务端 tape 投影版本水位(tape 投影流计数,单调递增)。旧后端不带该字段

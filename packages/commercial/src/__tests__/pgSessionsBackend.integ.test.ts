@@ -3822,8 +3822,9 @@ describe("durable live turn frame journal", () => {
     }]);
     const page = await readClientSessionLiveFrames(pool, sessionId, userId, 0, 10);
     assert.ok(page);
-    assert.deepEqual(page.frames.map((frame) => (frame.payload as { frameSeq: number }).frameSeq), [1, 2, 3]);
-    assert.deepEqual(page.streamClientMessageIds, ["m-legacy-shift-later"]);
+    assert.deepEqual(page.frames, [], "legacy streams never enter the hot live-frames path");
+    assert.deepEqual(page.streamClientMessageIds, []);
+    assert.equal(page.hasMoreBefore, false);
   });
 
   maybe("legacy relaxation preserves every strict stream identity guard independently", async () => {
@@ -4018,8 +4019,8 @@ describe("durable live turn frame journal", () => {
     });
     const live = await readClientSessionLiveFrames(pool, sessionId, userId, 0, 10);
     assert.ok(live);
-    assert.equal(live.frames.length, 1);
-    assert.deepEqual(live.streamClientMessageIds, [clientMessageId]);
+    assert.equal(live.frames.length, 0, "terminal dispatch is not on the hot path");
+    assert.deepEqual(live.streamClientMessageIds, []);
 
     const client = await pool.connect();
     try {
@@ -4591,7 +4592,7 @@ describe("durable live turn frame journal", () => {
     assert.ok(page);
     assert.deepEqual(
       page.frames.map((frame) => frame.payload),
-      [JSON.parse(firstPayload), JSON.parse(secondPayload), JSON.parse(serverAuthoredPayload)],
+      [JSON.parse(firstPayload), JSON.parse(secondPayload)],
     );
     assert.deepEqual(page.streamClientMessageIds, ["cm-reset-first", "cm-reset-second"]);
   });
@@ -4634,8 +4635,8 @@ describe("durable live turn frame journal", () => {
     );
     const page = await readClientSessionLiveFrames(pool, sessionId, userId, 0, 10);
     assert.ok(page);
-    assert.equal(page.frames.length, 2);
-    assert.deepEqual(page.frames.map((frame) => frame.payload), payloads.map((value) => JSON.parse(value)));
+    assert.equal(page.frames.length, 0, "terminal rollout import is not on the hot live-frames path");
+    assert.deepEqual(page.streamClientMessageIds, []);
 
     await pool.query("DELETE FROM client_sessions WHERE id=$1 AND user_id=$2", [sessionId, userId]);
     const rows = await pool.query("SELECT 1 FROM client_session_live_frames");
@@ -4855,11 +4856,7 @@ describe("durable live turn frame journal", () => {
 
     const deadPage = await readClientSessionLiveFrames(pool, dead.sessionId, userId, 0, 10);
     assert.ok(deadPage);
-    assert.equal(deadPage.frames.length, 1, "retired streams still project their frames");
-    assert.equal(
-      (deadPage.frames[0]!.payload as { blocks: Array<{ text: string }> }).blocks[0]!.text,
-      dead.sessionId,
-    );
+    assert.equal(deadPage.frames.length, 0, "terminal dispatch is not on the hot path");
     assert.deepEqual(deadPage.streamClientMessageIds, []);
     assert.equal(deadPage.hasTapeProjection, false);
     assert.equal(deadPage.tapeProjectionVersion, 0);
@@ -4889,8 +4886,8 @@ describe("durable live turn frame journal", () => {
 
     const rolloutPage = await readClientSessionLiveFrames(pool, rolloutSessionId, userId, 0, 10);
     assert.ok(rolloutPage);
-    assert.equal(rolloutPage.frames.length, 1);
-    assert.deepEqual(rolloutPage.streamClientMessageIds, ["cm-retire-import"]);
+    assert.equal(rolloutPage.frames.length, 0, "terminal rollout is not on the hot path");
+    assert.deepEqual(rolloutPage.streamClientMessageIds, []);
   });
   maybe("retired dead stream with content frames still pages those frames but drops streamClientMessageIds", async () => {
     const sessionId = "s-retire-keeps-content-frames";
@@ -4937,39 +4934,27 @@ describe("durable live turn frame journal", () => {
 
     const before = await readClientSessionLiveFrames(pool, sessionId, userId, 0, 10);
     assert.ok(before);
-    assert.equal(before.frames.length, 2);
-    assert.deepEqual(before.streamClientMessageIds, [clientMessageId]);
+    assert.equal(before.frames.length, 0, "manual_reconcile is not an open dispatch");
+    assert.deepEqual(before.streamClientMessageIds, []);
 
     assert.equal((await retireDeadLiveStreams(pool, { minAgeMs: 60 * 60 * 1000 })).retired, 1);
 
     const after = await readClientSessionLiveFrames(pool, sessionId, userId, 0, 10);
     assert.ok(after);
-    assert.equal(after.frames.length, 2);
-    assert.deepEqual(
-      after.frames.map((frame) => frame.payload),
-      [JSON.parse(payload1), JSON.parse(payload2)],
-    );
+    assert.equal(after.frames.length, 0);
     assert.deepEqual(after.streamClientMessageIds, []);
     assert.equal(after.hasTapeProjection, false);
     assert.equal(after.tapeProjectionVersion, 0);
-    const firstPage = await readClientSessionLiveFrames(pool, sessionId, userId, 0, 1);
-    assert.ok(firstPage);
-    assert.equal(firstPage.frames.length, 1);
-    assert.equal(firstPage.hasMore, true);
-    const secondPage = await readClientSessionLiveFrames(
-      pool,
-      sessionId,
-      userId,
-      Number(firstPage.nextCursor),
-      1,
+    const kept = await pool.query(
+      `SELECT 1 FROM client_session_live_frames f
+         JOIN client_session_live_streams s ON s.stream_key=f.stream_key
+        WHERE s.session_id=$1`,
+      [sessionId],
     );
-    assert.ok(secondPage);
-    assert.equal(secondPage.frames.length, 1);
-    assert.deepEqual(secondPage.frames[0]!.payload, JSON.parse(payload2));
-    assert.deepEqual(secondPage.streamClientMessageIds, []);
+    assert.equal(kept.rowCount, 2, "retire must keep frames for forensics");
   });
 
-  maybe("returns leftover live journals while a session dispatch is in flight and hides null-cmid leftover when none are", async () => {
+  maybe("hides leftover live journals even while a session dispatch is in flight and when none are", async () => {
     const userId = "c:940";
     const inflight = {
       sessionId: "s-leftover-read-inflight",
@@ -5007,11 +4992,15 @@ describe("durable live turn frame journal", () => {
 
     const inflightPage = await readClientSessionLiveFrames(pool, inflight.sessionId, userId, 0, 10);
     assert.ok(inflightPage);
-    assert.equal(inflightPage.frames.length, 1, "in-flight leftover must still hydrate");
-    assert.equal(
-      (inflightPage.frames[0]!.payload as { blocks: Array<{ text: string }> }).blocks[0]!.text,
-      inflight.sessionId,
+    assert.equal(inflightPage.frames.length, 0, "in-flight leftover must not hydrate");
+    assert.deepEqual(inflightPage.streamClientMessageIds, []);
+    const inflightRows = await pool.query(
+      `SELECT 1 FROM client_session_live_frames f
+         JOIN client_session_live_streams s ON s.stream_key=f.stream_key
+        WHERE s.session_id=$1`,
+      [inflight.sessionId],
     );
+    assert.equal(inflightRows.rowCount, 1, "hide must not delete leftover frames");
 
     const idlePage = await readClientSessionLiveFrames(pool, idle.sessionId, userId, 0, 10);
     assert.ok(idlePage);
@@ -5023,6 +5012,143 @@ describe("durable live turn frame journal", () => {
       [idle.sessionId],
     );
     assert.equal(idleRows.rowCount, 1, "hide must not delete leftover frames");
+  });
+
+  maybe("returns current open dispatch live-frames and hides leftover on the same session", async () => {
+    const userId = "c:942";
+    const sessionId = "s-leftover-open-dispatch-frames";
+    const dispatchId = randomUUID();
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    await pool.query(
+      `INSERT INTO turn_dispatches
+         (dispatch_id,user_id,session_id,client_message_id,agent_id,request_hash,
+          billing_request_id,status,owner_id,lease_until)
+       VALUES ($1,942,$2,'cm-open-dispatch','main',$3,$4,'accepted','test-owner',NOW()+INTERVAL '1 minute')`,
+      [dispatchId, sessionId, "a2".repeat(32), `billing-${dispatchId}`],
+    );
+    const sessionKey = `agent:main:webchat:dm:${sessionId}`;
+    await persistGatewayLiveFrame(pool, {
+      uid: 942n,
+      sessionId,
+      clientMessageId: "cm-open-dispatch",
+      agentContainerId: 543,
+      sessionKey,
+      frameSeq: 1,
+      payload: JSON.stringify({
+        type: "outbound.message",
+        sessionKey,
+        frameSeq: 1,
+        peer: { id: sessionId, kind: "dm" },
+        clientMessageId: "cm-open-dispatch",
+        blocks: [{ kind: "thinking", text: "current dispatch" }],
+      }),
+    });
+    await persistGatewayLiveFrame(pool, {
+      uid: 942n,
+      sessionId,
+      clientMessageId: null,
+      agentContainerId: 544,
+      sessionKey,
+      frameSeq: 2,
+      payload: JSON.stringify({
+        type: "outbound.message",
+        sessionKey,
+        frameSeq: 2,
+        peer: { id: sessionId, kind: "dm" },
+        blocks: [{ kind: "delegate_progress", phase: "start", text: "leftover" }],
+      }),
+    });
+    const page = await readClientSessionLiveFrames(pool, sessionId, userId, 0, 10);
+    assert.ok(page);
+    assert.equal(page.frames.length, 1, "current dispatch frames still hydrate");
+    assert.equal(page.frames[0]!.streamKey, `dispatch:${dispatchId}:1`);
+    assert.equal(
+      (page.frames[0]!.payload as { blocks: Array<{ text: string }> }).blocks[0]!.text,
+      "current dispatch",
+    );
+    assert.deepEqual(page.streamClientMessageIds, ["cm-open-dispatch"]);
+    assert.equal(page.hasMoreBefore, false);
+    const leftoverRows = await pool.query(
+      `SELECT 1 FROM client_session_live_frames WHERE stream_key LIKE 'legacy:%' AND session_key=$1`,
+      [sessionKey],
+    );
+    assert.equal(leftoverRows.rowCount, 1, "leftover frames stay in the table");
+  });
+
+  maybe("seek=tail and oversized after=0 live-frames return only the last page with hasMoreBefore", async () => {
+    const userId = "c:943";
+    const sessionId = "s-live-frames-tail-hasMoreBefore";
+    const dispatchId = randomUUID();
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    await pool.query(
+      `INSERT INTO turn_dispatches
+         (dispatch_id,user_id,session_id,client_message_id,agent_id,request_hash,
+          billing_request_id,status,owner_id,lease_until)
+       VALUES ($1,943,$2,'cm-tail','main',$3,$4,'accepted','test-owner',NOW()+INTERVAL '1 minute')`,
+      [dispatchId, sessionId, "a3".repeat(32), `billing-${dispatchId}`],
+    );
+    const sessionKey = `agent:main:webchat:dm:${sessionId}`;
+    const persist = async (frameSeq: number, text: string) => {
+      await persistGatewayLiveFrame(pool, {
+        uid: 943n,
+        sessionId,
+        clientMessageId: "cm-tail",
+        agentContainerId: 545,
+        sessionKey,
+        frameSeq,
+        payload: JSON.stringify({
+          type: "outbound.message",
+          sessionKey,
+          frameSeq,
+          peer: { id: sessionId, kind: "dm" },
+          clientMessageId: "cm-tail",
+          blocks: [{ kind: "text", text }],
+        }),
+      });
+    };
+    for (let seq = 1; seq <= 5; seq += 1) await persist(seq, `token-${seq}`);
+
+    const tail = await readClientSessionLiveFrames(pool, sessionId, userId, 0, 2, { seekTail: true });
+    assert.ok(tail);
+    assert.equal(tail.frames.length, 2);
+    assert.deepEqual(
+      tail.frames.map((frame) => (frame.payload as { blocks: Array<{ text: string }> }).blocks[0]!.text),
+      ["token-4", "token-5"],
+    );
+    assert.equal(tail.hasMore, false);
+    assert.equal(tail.hasMoreBefore, true);
+    assert.deepEqual(tail.streamClientMessageIds, ["cm-tail"]);
+
+    const streamKey = `dispatch:${dispatchId}:1`;
+    const values: string[] = [];
+    const params: Array<string | number> = [streamKey, sessionKey];
+    for (let seq = 6; seq <= 210; seq += 1) {
+      const payload = JSON.stringify({
+        type: "outbound.message",
+        sessionKey,
+        frameSeq: seq,
+        peer: { id: sessionId, kind: "dm" },
+        clientMessageId: "cm-tail",
+        blocks: [{ kind: "text", text: `token-${seq}` }],
+      });
+      values.push(`($1,'gateway',545,$2,${seq},convert_to($${params.length + 1},'UTF8'),$${params.length + 2})`);
+      params.push(payload, seq.toString(16).padStart(64, "0"));
+    }
+    await pool.query(
+      `INSERT INTO client_session_live_frames
+         (stream_key,source,agent_container_id,session_key,frame_seq,payload,payload_sha256)
+       VALUES ${values.join(",")}`,
+      params,
+    );
+    const oversized = await readClientSessionLiveFrames(pool, sessionId, userId, 0, 10);
+    assert.ok(oversized);
+    assert.equal(oversized.frames.length, 10, "after=0 on a large current dispatch seeks the tail");
+    assert.equal(oversized.hasMore, false);
+    assert.equal(oversized.hasMoreBefore, true);
+    assert.deepEqual(
+      oversized.frames.map((frame) => (frame.payload as { blocks: Array<{ text: string }> }).blocks[0]!.text),
+      Array.from({ length: 10 }, (_, i) => `token-${201 + i}`),
+    );
   });
 
   maybe("retireDeadLiveStreams immediately retires null-cmid leftover with no in-flight dispatch and keeps frames", async () => {

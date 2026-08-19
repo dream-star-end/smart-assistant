@@ -200,6 +200,21 @@ const CONTROL_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
 const isControlId = (value: unknown): value is string =>
   typeof value === "string" && CONTROL_ID_RE.test(value);
 
+/** Leftover live-journal frames (no cmid) stay durable but never ride the hot WS. */
+export function isLeftoverHotWsFrame(wire: { type?: unknown; clientMessageId?: unknown }): boolean {
+  if (isClientMessageId(wire.clientMessageId)) return false;
+  return wire.type === "outbound.message" || wire.type === "outbound.error";
+}
+
+function parseLeftoverHotWsPayload(data: string): boolean {
+  try {
+    const parsed = JSON.parse(data) as { type?: unknown; clientMessageId?: unknown };
+    return isLeftoverHotWsFrame(parsed);
+  } catch {
+    return false;
+  }
+}
+
 /** Strictly recognize a server-completed image-edit envelope before bypassing
  * ordinary Codex precheck/journal plumbing. A loose `imageEdit` presence
  * check would let malformed client frames evade normal chat billing.
@@ -4403,6 +4418,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               const replay = outboundRing.peekReplay(storeKey, cursor);
               if (replay.ok) {
                 for (const f of replay.sent) {
+                  if (parseLeftoverHotWsPayload(f.data)) continue;
                   try { userWs.send(f.data); } catch { break; }
                 }
               }
@@ -7141,6 +7157,15 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         }
       }
       const forwardCommittedFrame = (): void => {
+        if (
+          durableStampedFrame !== null
+          && durableStampedFrame.clientMessageId === null
+          && parseLeftoverHotWsPayload(durableStampedFrame.payload)
+        ) {
+          // Persist already ran (or was skipped). Leftover never enters the
+          // hot browser subscription — same contract as GET live-frames.
+          return;
+        }
         if (durableStampedFrame !== null) {
           outboundRing.storeStamped(
             durableStampedFrame.storeKey,
