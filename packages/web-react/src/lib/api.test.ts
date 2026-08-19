@@ -1150,7 +1150,7 @@ test('getSessionLiveFrames passes an AbortSignal and honors timeoutMs', async ()
 })
 
 test('getSessionLiveFrames first shot pages forward from after=0', async () => {
-  const fetchMock = vi.fn(async () =>
+  const fetchMock = vi.fn(async (_url: string) =>
     ok({
       frames: [],
       nextCursor: null,
@@ -1171,7 +1171,7 @@ test('getSessionLiveFrames first shot pages forward from after=0', async () => {
 })
 
 test('getSessionLiveFrames explicit after=tail still maps to seek=tail', async () => {
-  const fetchMock = vi.fn(async () =>
+  const fetchMock = vi.fn(async (_url: string) =>
     ok({
       frames: [],
       nextCursor: null,
