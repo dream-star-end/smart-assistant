@@ -75,10 +75,12 @@ import {
   enqueueMaterializationJob,
   enqueueSettlementJob,
   holdSettlementJobsForTape,
+  releaseSettlementJobsAfterVerify,
 } from "./turnTapeJobs.js";
 import {
   isTransientTapeError,
   recordsPublished,
+  settlementAuthorityHash,
   settlementEngineBillings,
   visibleHeadFallback,
   visibleHeadFromSettlement,
@@ -131,6 +133,7 @@ import {
   computeGoalTokensUsed,
   isLosslessRuntimeBatchingEnabled,
   materializeLosslessTurn,
+  parseLosslessTurnPayload,
   type LosslessTurnRecord,
   type LosslessTurnPayload,
 } from "../http/losslessTurnTape.js";
@@ -839,6 +842,7 @@ const PROBE_EXPECTED_COLUMNS: ReadonlyArray<[string, string, string]> = [
   ["client_session_turn_tapes", "visible_at", "bigint"],
   ["client_session_turn_tapes", "visible_head", "jsonb"],
   ["client_session_turn_tapes", "materialization_status", "text"],
+  ["client_session_turn_tapes", "settlement_hash", "text"],
   ["turn_dispatches", "visible_head", "jsonb"],
   ["turn_dispatches", "visible_at", "bigint"],
   ["turn_dispatches", "producer_fenced_at", "timestamp with time zone"],
@@ -904,6 +908,7 @@ export type LosslessTurnTapeFinalizeResult =
        */
       dispatchLateTape?: boolean;
       settlementHandoff?: boolean;
+      settlementHeld?: boolean;
     }
   | { applied: "session_not_found" | "session_deleted" | "incomplete" };
 
@@ -947,6 +952,13 @@ export function _losslessFinalizeSingleflightKey(
     request.waiveReason ?? null,
     request.dispatchId ?? null,
     request.attemptNo ?? null,
+    request.settlement
+      ? settlementAuthorityHash({
+          billingAnchorId: request.settlement.billingAnchorId,
+          requestId: request.settlement.requestId,
+          engineBillings: request.settlement.engineBillings,
+        })
+      : null,
   ]);
 }
 
@@ -1044,6 +1056,7 @@ export interface LosslessTurnTapeStorage {
   finalizeLosslessTurnTape(
     userId: string,
     request: LosslessTurnTapeFinalizeRequest,
+    options?: { materialize?: boolean },
   ): Promise<LosslessTurnTapeFinalizeResult>;
 }
 
@@ -4047,28 +4060,39 @@ async function computeFiniteEngineContextMessages(
     );
   };
 
-  const processCompleteTape = async (anchor: MessageLike): Promise<void> => {
+  const processCompleteTape = async (anchor: MessageLike): Promise<boolean> => {
     const tapeId = anchor._turnTapeId as string;
-    if (processedCompleteTapes.has(tapeId)) return;
+    if (processedCompleteTapes.has(tapeId)) return true;
     processedCompleteTapes.add(tapeId);
     const meta = (
       await pool.query<{
         tape_sha256: string;
         billing_anchor_id: string | null;
         model_record_count: number;
+        materialization_status: string | null;
+        finalized_at: string | null;
       }>(
-        `SELECT tape_sha256,model_record_count,billing_anchor_id
+        `SELECT tape_sha256,model_record_count,billing_anchor_id,
+                materialization_status, finalized_at::text
            FROM client_session_turn_tapes
           WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
-            AND finalized_at IS NOT NULL AND billing_anchor_id IS NOT NULL`,
+            AND (visible_at IS NOT NULL OR finalized_at IS NOT NULL)
+            AND billing_anchor_id IS NOT NULL`,
         [sessionId, userId, tapeId],
       )
     ).rows[0];
     if (!meta) throw new Error(`[pgSessions] finalized lossless turn tape missing: ${tapeId}`);
+    if (!recordsPublished({
+      materializationStatus: meta.materialization_status,
+      finalizedAt: meta.finalized_at,
+    })) {
+      processedCompleteTapes.delete(tapeId);
+      return false;
+    }
     if (meta.tape_sha256 !== anchor._turnTapeSha256) {
       throw new Error(`[pgSessions] lossless turn tape aggregate hash mismatch: ${tapeId}`);
     }
-    if (meta.model_record_count === 0) return;
+    if (meta.model_record_count === 0) return true;
     const appendTapeModelRow = async (row: FiniteTapeModelRow): Promise<void> => {
       if (excluded(row.msg_id, row.client_message_id ?? undefined)) return;
       const keyParams = [
@@ -4246,7 +4270,7 @@ async function computeFiniteEngineContextMessages(
           [sessionId, userId, tapeId],
         );
       }
-      return;
+      return true;
     }
 
     let beforePhysical: number | null = null;
@@ -4272,13 +4296,14 @@ async function computeFiniteEngineContextMessages(
         beforePhysical = row.physical_ordinal;
         beforeLogical = row.logical_ordinal;
         await appendTapeModelRow(row);
-        if (state.stopped) return;
+        if (state.stopped) return true;
       }
       if (page.length < 128) break;
     }
     if (!state.stopped && visited !== meta.model_record_count) {
       throw new Error(`[pgSessions] model tape record count mismatch: ${tapeId}`);
     }
+    return true;
   };
 
   const processMessages = async (messages: MessageLike[]): Promise<void> => {
@@ -4289,8 +4314,8 @@ async function computeFiniteEngineContextMessages(
         typeof message._turnTapeId === "string" &&
         typeof message._turnTapeSha256 === "string"
       ) {
-        await processCompleteTape(message);
-        continue;
+        const consumed = await processCompleteTape(message);
+        if (consumed) continue;
       }
       if (
         message._turnTapeComplete !== true &&
@@ -6138,7 +6163,31 @@ async function readUserMessagePayloadImpl(
  * 由 registerCommercial 注入。方法内闭包持有 pool。
  */
 
-async function commitVisibleLosslessTurnPhaseA(
+
+async function readVisibleTextFromTapeParts(
+  queryable: Pool | PoolClient,
+  userId: string,
+  request: LosslessTurnTapeFinalizeRequest,
+): Promise<string> {
+  const parts = (
+    await queryable.query<{ payload: Buffer }>(
+      `SELECT payload FROM client_session_turn_tape_parts
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
+        ORDER BY part_index ASC`,
+      [request.sessionId, userId, request.tapeId],
+    )
+  ).rows;
+  if (parts.length === 0) return "";
+  try {
+    const canonical = Buffer.concat(parts.map((part) => Buffer.from(part.payload)));
+    const body = parseLosslessTurnPayload(JSON.parse(canonical.toString("utf8")));
+    return typeof body.text === "string" ? body.text : "";
+  } catch {
+    return "";
+  }
+}
+
+export async function commitVisibleLosslessTurnPhaseA(
   pool: Pool,
   userId: string,
   request: LosslessTurnTapeFinalizeRequest,
@@ -6175,10 +6224,12 @@ async function commitVisibleLosslessTurnPhaseA(
         finalized_at: string | null;
         engine_billings: unknown;
         billing_anchor_id: string | null;
+        settlement_hash: string | null;
         dispatch_id: string | null;
       }>(
         `SELECT agent_id,turn_index,status,turn_key,tape_sha256,total_bytes,part_count,created_at,
-                waive_reason,visible_at::text,finalized_at::text,engine_billings,billing_anchor_id,dispatch_id
+                waive_reason,visible_at::text,finalized_at::text,engine_billings,billing_anchor_id,
+                settlement_hash,dispatch_id
            FROM client_session_turn_tapes
           WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
           FOR UPDATE`,
@@ -6202,7 +6253,18 @@ async function commitVisibleLosslessTurnPhaseA(
         agentId: request.agentId,
         turnIndex: request.turnIndex,
         text: settlement?.text,
+        errorCode: settlement?.errorCode,
       });
+    const incomingHash = settlement
+      ? settlementAuthorityHash({
+          billingAnchorId,
+          requestId: settlement.requestId,
+          engineBillings,
+        })
+      : tape.settlement_hash;
+    if (tape.settlement_hash && incomingHash && tape.settlement_hash !== incomingHash) {
+      throw new Error("lossless turn tape settlement conflict");
+    }
     let clientMessageId: string | null = null;
     if (tape.dispatch_id !== null) {
       clientMessageId = (
@@ -6228,29 +6290,40 @@ async function commitVisibleLosslessTurnPhaseA(
           reason: request.waiveReason,
         });
       }
+      let replayLate = false;
+      if (tape.dispatch_id !== null) {
+        const convergence = await convergeDispatchOnFinalize(client, tape.dispatch_id, tape.status);
+        replayLate = convergence.lateTape;
+      }
       return {
         applied: tape.finalized_at !== null ? "idempotent" : "finalized",
         recordCount: 0,
         engineBillings,
         settlementHandoff: true,
+        ...(replayLate ? { dispatchLateTape: true, settlementHeld: true } : {}),
       };
     }
+    const visibleText = settlement
+      ? (settlement.text ?? "")
+      : await readVisibleTextFromTapeParts(client, userId, request);
     const head = settlement
       ? visibleHeadFromSettlement(request, settlement, clientMessageId)
-      : visibleHeadFallback(request, "", clientMessageId);
+      : visibleHeadFallback(request, visibleText, clientMessageId);
     await client.query(
       `UPDATE client_session_turn_tapes
           SET visible_at=$1, visible_head=$2::jsonb,
               billing_anchor_id=COALESCE(billing_anchor_id,$3),
               engine_billings=CASE WHEN $4::jsonb <> '[]'::jsonb THEN $4::jsonb ELSE engine_billings END,
+              settlement_hash=COALESCE(settlement_hash,$6),
               client_message_id=COALESCE(client_message_id,$5)
-        WHERE session_id=$6 AND user_id=$7 AND tape_id=$8`,
+        WHERE session_id=$7 AND user_id=$8 AND tape_id=$9`,
       [
         Date.now(),
         JSON.stringify(head),
         billingAnchorId,
         JSON.stringify(engineBillings),
         clientMessageId,
+        incomingHash,
         request.sessionId,
         userId,
         request.tapeId,
@@ -6265,7 +6338,10 @@ async function commitVisibleLosslessTurnPhaseA(
       throw new Error("lossless turn tape target session row malformed");
     }
     const stubRecord = { id: billingAnchorId, role: "assistant" as const, ts: head.ts, text: head.text };
-    const anchors = [tapeAnchor(stubRecord as never, request.tapeId, request.tapeSha256, 1, 1, undefined, [])];
+    const anchors = [{
+      ...tapeAnchor(stubRecord as never, request.tapeId, request.tapeSha256, 1, 1, undefined, []),
+      text: head.text,
+    }];
     const recordIds = new Set([billingAnchorId]);
     existingMessages = existingMessages.filter(
       (message) => typeof message?.id !== "string" || !recordIds.has(message.id),
@@ -6313,6 +6389,7 @@ async function commitVisibleLosslessTurnPhaseA(
       tapeId: request.tapeId,
       dispatchId: tape.dispatch_id,
     });
+    const holdReason = fenced ? "late_tape_after_fence" : "awaiting_materialization";
     if (engineBillings.length > 0) {
       await enqueueSettlementJob(client, {
         sessionId: request.sessionId,
@@ -6323,7 +6400,9 @@ async function commitVisibleLosslessTurnPhaseA(
         payload: { engineBillings },
         billingAnchorId,
         requestId: settlement?.requestId ?? engineBillings[0]?.requestId,
-        held: !!fenced,
+        settlementHash: incomingHash,
+        held: true,
+        holdReason,
       });
     }
     if (request.waiveReason !== undefined && billingUserId !== null) {
@@ -6340,17 +6419,23 @@ async function commitVisibleLosslessTurnPhaseA(
         kind: "waiver",
         payload: { reason: request.waiveReason, turnKey: request.turnKey },
         billingAnchorId,
-        held: !!fenced,
+        settlementHash: incomingHash,
+        held: true,
+        holdReason,
       });
     }
+    let lateTape = false;
     if (tape.dispatch_id !== null) {
-      await convergeDispatchOnFinalize(client, tape.dispatch_id, tape.status);
+      const convergence = await convergeDispatchOnFinalize(client, tape.dispatch_id, tape.status);
+      lateTape = convergence.lateTape;
     }
     return {
       applied: "finalized",
       recordCount: 0,
       engineBillings,
       settlementHandoff: true,
+      ...(lateTape || fenced ? { settlementHeld: true } : {}),
+      ...(lateTape ? { dispatchLateTape: true } : {}),
     };
   });
 }
@@ -7067,6 +7152,7 @@ export function createPgSessionsBackend(
     async finalizeLosslessTurnTape(
       userId: string,
       request: LosslessTurnTapeFinalizeRequest,
+      finalizeOptions?: { materialize?: boolean },
     ): Promise<LosslessTurnTapeFinalizeResult> {
       const flight = finalizeSingleflight(
         _losslessFinalizeSingleflightKey(userId, request),
@@ -7095,6 +7181,9 @@ export function createPgSessionsBackend(
         if (phaseA.applied === "session_not_found" || phaseA.applied === "session_deleted" || phaseA.applied === "incomplete") {
           return phaseA;
         }
+      }
+      if (finalizeOptions?.materialize === false) {
+        return phaseA ?? { applied: "incomplete" };
       }
       let prepared: PreparedLosslessTurnTape | null = null;
       let preparedModelRecordCount = 0;
@@ -7209,12 +7298,13 @@ export function createPgSessionsBackend(
             attempt_no: number | null;
             client_message_id: string | null;
             visible_at: string | null;
+            settlement_hash: string | null;
           }>(
             `SELECT tape_id,agent_id,turn_index,status,turn_key,tape_sha256,
                     total_bytes, part_count, created_at, waive_reason, finalized_at,
                     record_storage_format,engine_billings,
                     billing_anchor_id,dispatch_id,attempt_no,client_message_id,
-                    visible_at::text
+                    visible_at::text, settlement_hash
                FROM client_session_turn_tapes
               WHERE session_id=$1 AND user_id=$2 AND tape_id=ANY($3::text[])
               ORDER BY tape_id FOR UPDATE`,
@@ -7343,7 +7433,25 @@ export function createPgSessionsBackend(
           throw new Error("lossless turn tape materialization format changed before publication");
         }
         const turn = prepared.turn;
-
+        const persistedBillings = Array.isArray(tape.engine_billings) ? tape.engine_billings : [];
+        if (persistedBillings.length > 0) {
+          const persistedHash = settlementAuthorityHash({
+            billingAnchorId: String(tape.billing_anchor_id ?? turn.billingAnchorId),
+            requestId: request.settlement?.requestId ?? turn.engineBillings[0]?.requestId,
+            engineBillings: persistedBillings,
+          });
+          const canonicalHash = settlementAuthorityHash({
+            billingAnchorId: turn.billingAnchorId,
+            requestId: turn.engineBillings[0]?.requestId,
+            engineBillings: turn.engineBillings,
+          });
+          if (tape.settlement_hash && tape.settlement_hash !== persistedHash && tape.settlement_hash !== canonicalHash) {
+            throw new Error("lossless turn tape settlement hash mismatch");
+          }
+          if (JSON.stringify(persistedBillings) !== JSON.stringify(turn.engineBillings)) {
+            throw new Error("lossless turn tape engineBillings mismatch");
+          }
+        }
         // Parts are immutable once staged. Recheck only their manifest while
         // holding the tape row lock; source-part BYTEA concatenation,
         // JSON.parse and user-visible/model materialization already happened
@@ -7620,7 +7728,9 @@ export function createPgSessionsBackend(
         const preUpgradeMessages = existingMessages;
         const recordIds = new Set(allRecordIds);
         existingMessages = existingMessages.filter(
-          (message) => typeof message?.id !== "string" || !recordIds.has(message.id),
+          (message) =>
+            message?._turnTapeId !== request.tapeId &&
+            (typeof message?.id !== "string" || !recordIds.has(message.id)),
         );
         const plan = planAppendServerAuthoredBatch(
           existingMessages,
@@ -7729,6 +7839,7 @@ export function createPgSessionsBackend(
                   engine_billings=$4, finalized_at=$5,
                   visible_at=COALESCE(visible_at,$5),
                   materialization_status='complete',
+                  settlement_verified_at=COALESCE(settlement_verified_at, NOW()),
                   materialization_error=NULL,
                   record_storage_format=$6,
                   goal_id=$7::uuid, goal_state_revision=$8, goal_tokens_used=$9,
@@ -7791,6 +7902,13 @@ export function createPgSessionsBackend(
             );
           }
         }
+        if (!dispatchLate) {
+          await releaseSettlementJobsAfterVerify(client, {
+            sessionId: request.sessionId,
+            userId,
+            tapeId: request.tapeId,
+          });
+        }
         if (billingUserId !== null && !turn.payload.continuationOfTurnKey) {
           await scheduleAutomaticRecoveryForFinalizedTurn(client, {
             uid: billingUserId,
@@ -7809,7 +7927,7 @@ export function createPgSessionsBackend(
           ...(turn.engineBillings.length > 0 || request.waiveReason !== undefined
             ? { settlementHandoff: true }
             : {}),
-          ...(dispatchLate ? { dispatchLateTape: true } : {}),
+          ...(dispatchLate ? { dispatchLateTape: true, settlementHeld: true } : {}),
         };            });
             break;
           } catch (error) {

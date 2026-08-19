@@ -2364,7 +2364,7 @@ async function handleLosslessTurnTapeRequest(args: {
       return;
     }
     try {
-      const result = await args.storage.finalizeLosslessTurnTape(args.userId, body);
+      const result = await args.storage.finalizeLosslessTurnTape(args.userId, body, { materialize: false });
       if (result.applied === "session_not_found") {
         sendJsonError(args.res, 404, "SESSION_NOT_FOUND", "no client_sessions row for sessionId+userId", args.requestId);
         return;
@@ -2409,8 +2409,10 @@ async function handleLosslessTurnTapeRequest(args: {
         }).catch(() => {});
       }
       const settlementHandoff = result.settlementHandoff === true
+        || result.settlementHeld === true
         || (result.engineBillings.length === 0 && body.waiveReason === undefined);
-      if (result.engineBillings.length > 0) {
+      const skipSyncSettle = result.settlementHandoff === true || result.settlementHeld === true;
+      if (!skipSyncSettle && result.engineBillings.length > 0) {
         if (!args.settleCodexBilling) {
           if (!settlementHandoff) {
             sendJsonError(
@@ -2446,7 +2448,7 @@ async function handleLosslessTurnTapeRequest(args: {
         }
       }
       let waiverResult: TurnWaiverResult | undefined;
-      if (body.waiveReason !== undefined) {
+      if (!skipSyncSettle && body.waiveReason !== undefined) {
         if (!args.applyTurnWaiver) {
           if (!settlementHandoff) {
             sendJsonError(args.res, 503, "TURN_WAIVER_UNAVAILABLE", "exact turn waiver unavailable", args.requestId);

@@ -1,6 +1,7 @@
 /**
- * Visible-head helpers for lossless turn finalize decoupling (design rev2).
+ * Visible-head helpers for lossless turn finalize decoupling (design rev2/rev3).
  */
+import { createHash } from "node:crypto";
 import type { DurableCodexBilling, LosslessTurnTapeFinalizeRequest } from "@openclaude/protocol";
 import {
   losslessBillingAnchorId,
@@ -32,13 +33,23 @@ export function recordsPublished(input: {
 }
 
 export function clipVisibleText(text: string): { text: string; truncated: boolean } {
-  const bytes = Buffer.byteLength(text, "utf8");
-  if (bytes <= VISIBLE_HEAD_TEXT_MAX_BYTES) return { text, truncated: false };
-  let out = text;
-  while (Buffer.byteLength(out, "utf8") > VISIBLE_HEAD_TEXT_MAX_BYTES) {
-    out = out.slice(0, Math.floor(out.length * 0.95));
-  }
-  return { text: out, truncated: true };
+  const buf = Buffer.from(text, "utf8");
+  if (buf.length <= VISIBLE_HEAD_TEXT_MAX_BYTES) return { text, truncated: false };
+  let end = VISIBLE_HEAD_TEXT_MAX_BYTES;
+  while (end > 0 && (buf[end] & 0xc0) === 0x80) end -= 1;
+  return { text: buf.subarray(0, end).toString("utf8"), truncated: true };
+}
+
+export function settlementAuthorityHash(input: {
+  billingAnchorId: string;
+  requestId?: string | null;
+  engineBillings: unknown;
+}): string {
+  return createHash("sha256").update(JSON.stringify({
+    billingAnchorId: input.billingAnchorId,
+    requestId: input.requestId ?? null,
+    engineBillings: input.engineBillings ?? [],
+  })).digest("hex");
 }
 
 export function visibleHeadFromSettlement(

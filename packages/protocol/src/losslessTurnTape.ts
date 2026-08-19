@@ -137,10 +137,19 @@ export function losslessBillingAnchorId(input: {
   assistantSegments?: Array<{ index: number }>
   text?: string
   errorCode?: string
+  tools?: Array<{ blockId: string }>
+  agentGroups?: Array<{ runId: string }>
+  structuredBlocks?: Array<{ kind: string; blockId?: string; platformGoalId?: string }>
+  runtimeEvents?: Array<{ ordinal: number }>
 }): string {
   const prefix = losslessRecordPrefix(input.sessionId, input.agentId, input.turnIndex)
   const segs = input.assistantSegments
   if (segs && segs.length > 0) return `${prefix}-s${segs[segs.length - 1]!.index}`
+  if ((input.text && input.text.length > 0) || input.errorCode) return prefix
+  const groups = input.agentGroups ?? []
+  if (groups.length > 0) return `${prefix}-agentgroup-${groups[groups.length - 1]!.runId}`
+  const tools = input.tools ?? []
+  if (tools.length > 0) return `${prefix}-tool-${tools[tools.length - 1]!.blockId}`
   return prefix
 }
 

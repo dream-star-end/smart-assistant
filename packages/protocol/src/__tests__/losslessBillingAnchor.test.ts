@@ -32,4 +32,34 @@ describe("losslessBillingAnchorId", () => {
       "srv-sess-1-t2",
     );
   });
+  test("tool-only and delegate-only match materialize record ids", () => {
+    assert.equal(
+      losslessBillingAnchorId({
+        sessionId: "sess-1",
+        agentId: "main",
+        turnIndex: 5,
+        tools: [{ blockId: "tool-a" }, { blockId: "tool-b" }],
+      }),
+      "srv-sess-1-main-t5-tool-tool-b",
+    );
+    assert.equal(
+      losslessBillingAnchorId({
+        sessionId: "sess-1",
+        agentId: "main",
+        turnIndex: 5,
+        agentGroups: [{ runId: "run-1" }],
+      }),
+      "srv-sess-1-main-t5-agentgroup-run-1",
+    );
+    assert.equal(
+      losslessBillingAnchorId({
+        sessionId: "sess-1",
+        agentId: "main",
+        turnIndex: 5,
+        runtimeEvents: [{ ordinal: 3 }],
+      }),
+      "srv-sess-1-main-t5",
+    );
+  });
+
 });

@@ -394,6 +394,8 @@ export function buildLosslessTurnTapeRequests(
     assistantSegments: payload.assistantSegments,
     text: payload.text,
     errorCode: typeof payload.errorCode === 'string' ? payload.errorCode : undefined,
+    tools: payload.tools,
+    agentGroups: payload.agentGroups,
   })
   const settlement = {
     billingAnchorId,

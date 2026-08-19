@@ -414,6 +414,7 @@ import {
 } from "@openclaude/storage";
 import {
   createPgSessionsBackend,
+  commitVisibleLosslessTurnPhaseA,
   _setAfterLosslessStageBatch,
   type DispatchAdmissionBackend,
   startSessionsGcSweeper,
@@ -5674,6 +5675,45 @@ export async function registerCommercial(
             } catch {
               /* best-effort */
             }
+          },
+          commitVisibleTape: async (input: { userId: string; sessionId: string; tapeId: string }) => {
+            const header = await getPool().query<{
+              agent_id: string;
+              turn_index: number;
+              status: "completed" | "interrupted" | "crashed";
+              turn_key: string;
+              tape_sha256: string;
+              total_bytes: string;
+              part_count: number;
+              created_at: string;
+              waive_reason: string | null;
+              dispatch_id: string | null;
+              attempt_no: number | null;
+            }>(
+              `SELECT agent_id, turn_index, status, turn_key, tape_sha256, total_bytes::text,
+                      part_count, created_at::text, waive_reason, dispatch_id::text, attempt_no
+                 FROM client_session_turn_tapes
+                WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+              [input.sessionId, input.userId, input.tapeId],
+            );
+            const row = header.rows[0];
+            if (!row) throw new Error("visible tape header missing");
+            await commitVisibleLosslessTurnPhaseA(getPool(), input.userId, {
+              protocolVersion: 2,
+              action: "finalize",
+              sessionId: input.sessionId,
+              agentId: row.agent_id,
+              turnIndex: row.turn_index,
+              status: row.status,
+              turnKey: row.turn_key,
+              tapeId: input.tapeId,
+              tapeSha256: row.tape_sha256,
+              totalBytes: Number(row.total_bytes),
+              partCount: row.part_count,
+              createdAt: Number(row.created_at),
+              ...(row.waive_reason ? { waiveReason: row.waive_reason as "idle_timeout" } : {}),
+              ...(row.dispatch_id ? { dispatchId: row.dispatch_id, attemptNo: row.attempt_no ?? 1 } : {}),
+            });
           },
         };
         const h = trackScheduler("turnDispatchReconciler", "shared", startTurnDispatchReconciler({
