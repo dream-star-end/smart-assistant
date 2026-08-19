@@ -106,13 +106,16 @@ describe("TurnActivity（激活 computeTypingLabel 死代码：阶段反馈接�
     expect(screen.getByLabelText("生成中").textContent).toContain("深度思考中");
   });
 
-  test("progressHint 在仍有新帧时展示真实进度", () => {
+  test("progressHint 在仍有新帧时展示中文动作，不回显工具名/路径", () => {
     renderTA({
       startedAt: Date.now() - 10_000,
       lastFrameAt: Date.now() - 1_000,
       progressHint: "Read foo.ts",
     });
-    expect(screen.getByLabelText("生成中").textContent).toContain("Read foo.ts");
+    const t = screen.getByLabelText("生成中").textContent ?? "";
+    expect(t).toContain("读取文件");
+    expect(t).not.toContain("Read");
+    expect(t).not.toContain("foo.ts");
   });
 
   test("卡住时 leftover progressHint 不掩盖无新数据", () => {

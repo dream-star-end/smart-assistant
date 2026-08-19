@@ -15,6 +15,7 @@ import {
   type TurnErrorCode,
   turnErrorSemantics,
 } from "@openclaude/protocol";
+import { formatLiveActivityAction } from "./liveActivityLabel";
 import type {
   OutboundContentBlock,
   OutboundMessageWire,
@@ -427,7 +428,7 @@ export function computeTypingLabel(p: {
     const sil = Math.round(silenceMs / 1000);
     return { text: `${name} 深度思考中 (${secs}s · ${sil}s 无新数据)`, cls: "stale-warn" };
   }
-  const progress = progressHint.trim();
+  const progress = formatLiveActivityAction(progressHint);
   if (progress) {
     const cls = silenceMs >= STALE_GENERATING_MS ? "generating" : "";
     if (secs >= 5) return { text: `${name} ${progress} (${secs}s)${hint}`, cls };

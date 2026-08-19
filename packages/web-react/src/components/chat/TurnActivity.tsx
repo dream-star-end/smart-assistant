@@ -31,7 +31,7 @@ export type TurnActivityInfo = {
   startedAt: number | null;
   /** 最近一帧到达时刻（_lastFrameAt），用于静默时长升级文案。 */
   lastFrameAt?: number;
-  /** Cursor Task 等无 stdout 推进时的一句进度；卡住时由 silenceMs 盖过。 */
+  /** Cursor keepalive working-detail；展示前会收成中文动作标签，卡住时由 silenceMs 盖过。 */
   progressHint?: string;
   /** turn 非流式阶段态(判别联合,单一权威 model.ts TurnStatusState):
    *  'compacting' → 「正在压缩上下文」;{kind:'retrying'} → 统一自动重试文案。 */

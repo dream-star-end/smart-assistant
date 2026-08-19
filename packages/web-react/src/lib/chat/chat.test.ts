@@ -513,14 +513,16 @@ describe("applyTurnStatus retrying 判别联合", () => {
 });
 
 describe("computeTypingLabel progressHint vs stall", () => {
-  test("progressHint 在 silence 低于 warn 时展示真实进度", () => {
+  test("progressHint 在 silence 低于 warn 时展示中文动作，不回显工具名/路径", () => {
     const out = computeTypingLabel({
       name: "助手",
       secs: 20,
       silenceMs: 5_000,
       progressHint: "Read foo.ts",
     });
-    expect(out.text).toContain("Read foo.ts");
+    expect(out.text).toContain("读取文件");
+    expect(out.text).not.toContain("Read");
+    expect(out.text).not.toContain("foo.ts");
     expect(out.text).not.toContain("无新数据");
   });
 
@@ -533,6 +535,20 @@ describe("computeTypingLabel progressHint vs stall", () => {
     });
     expect(out.text).toContain("无新数据");
     expect(out.text).not.toContain("Read foo.ts");
+    expect(out.text).not.toContain("读取文件");
+  });
+
+  test("Cursor StrReplace working-detail 活动行只显示写入文件", () => {
+    const out = computeTypingLabel({
+      name: "全能助手",
+      secs: 1385,
+      silenceMs: 1_000,
+      progressHint:
+        "StrReplace /home/agent/work/display-hardening/packages/commercial/src/db/pgSessionsBackend.ts",
+    });
+    expect(out.text).toContain("全能助手 写入文件 (1385s)");
+    expect(out.text).not.toContain("StrReplace");
+    expect(out.text).not.toContain("/home/");
   });
 });
 
