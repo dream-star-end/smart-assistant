@@ -109,7 +109,8 @@
     "0228_turn_visible_finalize",
     "0229_turn_finalize_integrity",
     "0230_chat_projects",
-    "0231_turn_tape_materialization_resilience"
+    "0231_turn_tape_materialization_resilience",
+    "0232_agent_group_jsonb_unicode_sanitize"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

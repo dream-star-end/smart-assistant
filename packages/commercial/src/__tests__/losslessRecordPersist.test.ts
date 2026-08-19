@@ -39,6 +39,14 @@ function canonicalTurn() {
       durationMs: 1,
       ts: CREATED_AT,
     }],
+    agentGroups: [{
+      runId: "run-nul-1",
+      agentId: "child",
+      goal: "inspect SQLite format 3\u0000page",
+      completedAt: CREATED_AT,
+      status: "ok" as const,
+      resultSummary: "SQLite format 3\u0000page",
+    }],
   };
 }
 
@@ -58,8 +66,19 @@ function headerRow(part: Buffer, tapeSha: string) {
   };
 }
 
-function fakePool(part: Buffer, tapeSha: string, inserts: Array<{ payload: Buffer; contentSha256: string }>): Pool {
+function fakePool(
+  part: Buffer,
+  tapeSha: string,
+  inserts: Array<{ role: string; payload: Buffer; contentSha256: string }>,
+  sqls: string[],
+): Pool {
   const query = async (sql: string, params: unknown[] = []) => {
+    sqls.push(sql);
+    if (sql.includes("session_replication_role")) {
+      throw Object.assign(new Error("permission denied to set parameter \"session_replication_role\""), {
+        code: "42501",
+      });
+    }
     if (/^BEGIN/i.test(sql) || sql === "COMMIT" || sql === "ROLLBACK" || sql.startsWith("SET LOCAL")) {
       return { rows: [], rowCount: 0 };
     }
@@ -67,12 +86,21 @@ function fakePool(part: Buffer, tapeSha: string, inserts: Array<{ payload: Buffe
       return { rows: [headerRow(part, tapeSha)] };
     }
     if (sql.includes("FROM client_session_turn_tape_parts")) {
+      if (sql.includes("octet_length(payload)")) {
+        return {
+          rows: [{
+            part_index: 0,
+            part_sha256: sha256(part),
+            payload_bytes: String(part.length),
+          }],
+        };
+      }
       return { rows: [{ part_sha256: sha256(part), payload: part }] };
     }
     if (sql.includes("INSERT INTO client_session_turn_tape_records")) {
       const contentSha256 = String(params[7]);
       const payload = Buffer.from(params[8] as Buffer);
-      inserts.push({ payload, contentSha256 });
+      inserts.push({ role: String(params[5]), payload, contentSha256 });
       return {
         rows: [{
           msg_id: params[3],
@@ -100,8 +128,9 @@ test("materializing a part with \\u0000 keeps original record BYTEA and hash", a
   assert.equal(part.includes(0), false);
   assert.ok(part.includes(Buffer.from("\\u0000", "utf8")));
   const tapeSha = sha256(part);
-  const inserts: Array<{ payload: Buffer; contentSha256: string }> = [];
-  const pool = fakePool(part, tapeSha, inserts);
+  const inserts: Array<{ role: string; payload: Buffer; contentSha256: string }> = [];
+  const sqls: string[] = [];
+  const pool = fakePool(part, tapeSha, inserts, sqls);
   const request = {
     protocolVersion: LOSSLESS_TURN_TAPE_VERSION,
     action: "finalize" as const,
@@ -125,13 +154,33 @@ test("materializing a part with \\u0000 keeps original record BYTEA and hash", a
   const parsedOriginal = JSON.parse(tool.payloadBytes.toString("utf8")) as { output?: string };
   assert.equal(parsedOriginal.output?.includes("\u0000"), true);
 
+  const group = prepared.turn.records.find((record) => record.role === "agent-group");
+  assert.ok(group);
+  assert.ok(group.payloadBytes.includes(Buffer.from("\\u0000", "utf8")));
+  assert.equal(group.payloadSha256, sha256(group.payloadBytes));
+  const parsedGroup = JSON.parse(group.payloadBytes.toString("utf8")) as {
+    _delegateGoal?: string;
+    resultSummary?: string;
+  };
+  assert.equal(parsedGroup._delegateGoal?.includes("\u0000"), true);
+
   const visible = prepared.visible[prepared.turn.records.indexOf(tool)]!;
   assert.equal(visible.bytes.includes(Buffer.from("\\u0000", "utf8")), false);
   assert.equal(visible.bytes.includes(0), false);
+  const visibleGroup = prepared.visible[prepared.turn.records.indexOf(group)]!;
+  assert.equal(visibleGroup.bytes.includes(Buffer.from("\\u0000", "utf8")), false);
 
   await _stagePreparedLosslessTurnRecords(pool, USER_ID, request, prepared);
-  const written = inserts.find((row) => row.payload.equals(tool.payloadBytes));
-  assert.ok(written, "record INSERT must persist the part-derived original payload");
-  assert.equal(written.contentSha256, tool.payloadSha256);
-  assert.equal(written.contentSha256, sha256(tool.payloadBytes));
+  assert.equal(sqls.some((sql) => sql.includes("session_replication_role")), false);
+
+  const writtenTool = inserts.find((row) => row.payload.equals(tool.payloadBytes));
+  assert.ok(writtenTool, "record INSERT must persist the part-derived original tool payload");
+  assert.equal(writtenTool.contentSha256, tool.payloadSha256);
+  assert.equal(writtenTool.contentSha256, sha256(tool.payloadBytes));
+
+  const writtenGroup = inserts.find((row) => row.role === "agent-group");
+  assert.ok(writtenGroup, "agent-group record INSERT must succeed");
+  assert.ok(writtenGroup.payload.equals(group.payloadBytes), "agent-group payload BYTEA must match parts");
+  assert.equal(writtenGroup.contentSha256, group.payloadSha256);
+  assert.equal(writtenGroup.contentSha256, sha256(group.payloadBytes));
 });

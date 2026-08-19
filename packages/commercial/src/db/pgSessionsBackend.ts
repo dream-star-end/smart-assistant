@@ -2804,14 +2804,9 @@ export async function _stagePreparedLosslessTurnRecords(
       }
       if (tape.finalized_at !== null) return "finalized";
       await client.query("SET LOCAL statement_timeout = '120s'");
-      // Keep original record BYTEA even when the agent-group BEFORE trigger
-      // would jsonb-parse NEW.payload (U+0000 is legal in BYTEA, not jsonb).
+      // Keep original record BYTEA. The 0232 trigger sanitizes jsonb-illegal
+      // unicode escapes (or skips canonicalize) instead of failing INSERT.
       // Application already rejects trigger rewrites of payload/hash.
-      try {
-        await client.query("SET LOCAL session_replication_role = replica");
-      } catch {
-        /* replica role is superuser-only on some installs; tool BYTEA still inserts */
-      }
       if (tape.record_storage_format !== prepared.recordStorageFormat) {
         throw new Error("lossless turn tape materialization format changed during staging");
       }
