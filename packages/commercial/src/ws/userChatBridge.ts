@@ -91,6 +91,12 @@ import {
 } from "../billing/verificationSponsorship.js";
 import type { TokenUsage } from "../billing/calculator.js";
 import { settleCursorExternalUsage } from "../billing/cursorExternalSettle.js";
+import {
+  closePendingZcodeAudits,
+  closeZcodeAudit,
+  insertPendingZcodeAudit,
+  zcodeCleanupTerminal,
+} from "../billing/zcodeExternalAudit.js";
 import { recordProductFrictionEvent } from "../productFriction/events.js";
 import { maybeUpdateAccountQuotaCodex } from "../account-pool/quota.js";
 import { applyLearnedCursorQuota } from "../account-pool/cursorMaterializer.js";
@@ -107,6 +113,7 @@ import {
   isCodexEngineModel,
   isGrokEngineModel,
   isCursorEngineModel,
+  isZcodeEngineModel,
   isClientMessageId,
   formatMessageReplyPrompt,
   modelHistorySemanticRole,
@@ -3008,6 +3015,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     //   drainCause: 进入 drain 时的 trigger cause(稳定保留,避免 mutable cause 干扰)
     //   userDetached: 守 detachUserSide 幂等(drain 入口 + finalCleanup 都跑)
     const inflightCodexTurns = new Map<string, CodexTurnSnapshot>();
+    const pendingZcodeRequestIds = new Set<string>();
     // P0 修复(2026-07-03)— 跨桥 settle 的同步去重簿记:同 requestId 的 duplicate
     // billing 帧在 journal 回查/settle 在途期间直接丢弃(与主路径 Map.delete 先行
     // 的单次门控同构)。跨进程/跨桥并发仍由 journal CAS + usage_records UNIQUE 兜底。
@@ -3997,6 +4005,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       let authorityModelForFrame: string | null = null;
       let isCodexInboundFrame = false;
       let isCursorInboundFrame = false;
+      let isZcodeInboundFrame = false;
       let isAnnotatedImageInboundFrame = false;
       // Session-scoped Codex admission key. Outbound terminal frames match this
       // peer plus clientMessageId; missing peer falls back to a bridge-local
@@ -4530,11 +4539,16 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 : (isCodexEngineModel(effectiveModel) || isGrokEngineModel(effectiveModel));
             isCursorInboundFrame =
               authorityOn && authorityModelForFrame !== null
-                ? (authorityDeps?.catalog.peek()?.isExternalBillingModel(authorityModelForFrame) ??
+                ? (authorityDeps?.catalog.peek()?.isCursorModel(authorityModelForFrame) ??
                    isCursorEngineModel(effectiveModel))
                 : isCursorEngineModel(effectiveModel);
+            isZcodeInboundFrame =
+              authorityOn && authorityModelForFrame !== null
+                ? (authorityDeps?.catalog.peek()?.isZcodeModel(authorityModelForFrame) ??
+                   isZcodeEngineModel(effectiveModel))
+                : isZcodeEngineModel(effectiveModel);
             // 提取 peer.id(用于 session-scoped admission 与 outbound 终态匹配)。
-            if (isCodexInboundFrame || isCursorInboundFrame) {
+            if (isCodexInboundFrame || isCursorInboundFrame || isZcodeInboundFrame) {
               const peerObj = (parsed as { peer?: { id?: unknown } }).peer;
               const peerIdRaw = peerObj && typeof peerObj === "object" ? peerObj.id : undefined;
               inboundPeerIdForFrame = typeof peerIdRaw === "string" ? peerIdRaw : null;
@@ -4732,6 +4746,68 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             failDispatchPreForward(dispatchRecord, 'cursor_external_admission_failed');
             rejectPromptQueueDispatch('CURSOR_UNAVAILABLE');
             if (!cleaned && userWs.readyState === WebSocket.OPEN) sendErrorFrame(userWs, 'CURSOR_UNAVAILABLE', 'Cursor is temporarily unavailable');
+          }
+        })();
+        return;
+      }
+      if (isZcodeInboundFrame && containerId !== undefined) {
+        const parsedCapture = inboundParsedFrame;
+        const traceCapture = turnTraceIdForFrame;
+        const logCapture = turnLogForFrame;
+        const authorityModelCapture = authorityModelForFrame;
+        const modelCapture = effectiveModelForFrame;
+        const peerCapture = inboundPeerIdForFrame;
+        const cid = containerId;
+        void (async () => {
+          let dispatchRecord: AdmittedDispatch | undefined;
+          try {
+            if (!deps.pgPool || parsedCapture === null || traceCapture === null || typeof modelCapture !== "string" || !isZcodeEngineModel(modelCapture)) {
+              rejectPromptQueueDispatch('ZCODE_UNAVAILABLE');
+              sendErrorFrame(userWs, 'ZCODE_UNAVAILABLE', 'ZCode is unavailable for this account');
+              return;
+            }
+            const zcodeModelId = modelCapture;
+            const enriched = await attachMasterTurnState(parsedCapture, logCapture, traceCapture, !isPromptQueueDispatch, rejectPromptQueueDispatch, authorityModelCapture, recoveryJob);
+            if (enriched === null) return;
+            dispatchRecord = lookupAdmittedDispatch(enriched);
+            let authorityExec: ResolvedTurnExecution | null = null;
+            if (authorityOn) {
+              // resolveAuthorityExecOrReject's legacy boolean means "non-CCB"
+              // (not literally Codex); ZCode is therefore classified true.
+              authorityExec = await resolveAuthorityExecOrReject({ model: authorityModelCapture, classifiedCodex: true, log: logCapture, onReject: rejectPromptQueueDispatch });
+              if (
+                authorityExec === null
+                || authorityExec.engine !== 'zcode'
+                || authorityExec.canonicalModel !== zcodeModelId
+              ) {
+                failDispatchPreForward(dispatchRecord, 'zcode_authority_rejected');
+                return;
+              }
+            }
+            const requestId = dispatchRecord ? dispatchRecord.billingRequestId : ensureRequestIdServerSide();
+            await insertPendingZcodeAudit(deps.pgPool, {
+              requestId,
+              userId: uid,
+              containerId: cid,
+              sessionId: peerCapture,
+              modelId: zcodeModelId,
+            });
+            pendingZcodeRequestIds.add(requestId);
+            let authorityFields: Record<string, unknown> = {};
+            if (authorityExec !== null) {
+              const sealed = await sealAuthorityFieldsOrReject({ exec: authorityExec, billingRequestId: requestId, log: logCapture, onReject: rejectPromptQueueDispatch });
+              if (sealed === null) { failDispatchPreForward(dispatchRecord, 'zcode_authority_seal_rejected'); return; }
+              authorityFields = sealed;
+            }
+            const forwarded = { ...enriched, requestId, traceId: traceCapture, ...authorityFields, ...dispatchAuthorityField(dispatchRecord) };
+            const encoded = JSON.stringify(forwarded); const len = Buffer.byteLength(encoded);
+            if (len > maxFrameBytes) { failDispatchPreForward(dispatchRecord, 'ERR_FRAME_TOO_BIG'); rejectPromptQueueDispatch('ERR_FRAME_TOO_BIG'); return; }
+            await forwardPreparedFrame(Buffer.from(encoded, 'utf8'), false, len);
+          } catch (err) {
+            logCapture?.error('user-chat-bridge: ZCode external admission failed', { err });
+            failDispatchPreForward(dispatchRecord, 'zcode_external_admission_failed');
+            rejectPromptQueueDispatch('ZCODE_UNAVAILABLE');
+            if (!cleaned && userWs.readyState === WebSocket.OPEN) sendErrorFrame(userWs, 'ZCODE_UNAVAILABLE', 'ZCode is temporarily unavailable');
           }
         })();
         return;
@@ -5948,7 +6024,19 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             const terminalCode = external.terminalCode === 'USER_CANCELLED' || external.terminalCode === 'AUTH_UNAVAILABLE' || external.terminalCode === 'QUOTA_UNAVAILABLE' || external.terminalCode === 'ENGINE_ERROR' ? external.terminalCode : null;
             const durationMs = typeof external.durationMs === 'number' && Number.isFinite(external.durationMs) && external.durationMs >= 0 ? Math.floor(external.durationMs) : null;
             const usage = isPlainRecord(external.usage) ? external.usage : null;
-            if (deps.pgPool && requestId && status && durationMs !== null && external.engine === 'cursor') {
+            if (deps.pgPool && requestId && status && durationMs !== null && external.engine === 'zcode') {
+              pendingZcodeRequestIds.delete(requestId);
+              void closeZcodeAudit(deps.pgPool, {
+                requestId,
+                userId: uid,
+                status,
+                terminalCode,
+                durationMs,
+                usage,
+              }).catch((err) => {
+                bridgeLog?.warn('user-chat-bridge: ZCode audit close failed', { requestId, err });
+              });
+            } else if (deps.pgPool && requestId && status && durationMs !== null && external.engine === 'cursor') {
               const pool = deps.pgPool;
               const pricing = deps.pricing;
               void (async () => {
@@ -6018,7 +6106,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 }
               })();
             } else {
-              bridgeLog?.warn('user-chat-bridge: malformed Cursor external billing frame dropped');
+              bridgeLog?.warn('user-chat-bridge: malformed external engine billing frame dropped');
             }
             return;
           }
@@ -7784,6 +7872,19 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         });
       }
       inflightCodexTurns.clear();
+      if (deps.pgPool && pendingZcodeRequestIds.size > 0) {
+        const leftover = [...pendingZcodeRequestIds];
+        pendingZcodeRequestIds.clear();
+        void closePendingZcodeAudits(deps.pgPool, {
+          userId: uid,
+          requestIds: leftover,
+          terminalCode: zcodeCleanupTerminal(finalCause),
+        }).catch((err) => {
+          bridgeLog?.warn('user-chat-bridge: ZCode pending audit close failed', { err });
+        });
+      } else {
+        pendingZcodeRequestIds.clear();
+      }
       // durable dispatch 本地簿记清空(权威在 turn_dispatches;reconciler 兜底 open 行)。
       admittedDispatches.clear();
 

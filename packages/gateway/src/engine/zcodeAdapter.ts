@@ -157,21 +157,80 @@ function unavailable(detail: string): 'auth' | 'quota' | null {
   return null
 }
 
+function isNonNegInt(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+}
+
+function requireString(obj: Record<string, unknown>, key: string): string {
+  const value = obj[key]
+  if (typeof value !== 'string') throw new Error(`${key} must be a string`)
+  return value
+}
+
+function optionalString(obj: Record<string, unknown>, key: string): string | undefined {
+  const value = obj[key]
+  if (value === undefined) return undefined
+  if (typeof value !== 'string') throw new Error(`${key} must be a string`)
+  return value
+}
+
+function validateZcodeJsonResult(raw: unknown): ZcodeJsonResult {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error('stdout must be a single JSON object')
+  }
+  const obj = raw as Record<string, unknown>
+  if (Object.keys(obj).length === 0) throw new Error('stdout object is empty')
+  const sessionId = requireString(obj, 'sessionId')
+  if (!sessionId.startsWith('sess_')) throw new Error('sessionId must be a sess_… value')
+  const response = requireString(obj, 'response')
+  if (!isNonNegInt(obj.eventCount)) throw new Error('eventCount must be a non-negative integer')
+  if (obj.usage !== undefined) {
+    if (!obj.usage || typeof obj.usage !== 'object' || Array.isArray(obj.usage)) {
+      throw new Error('usage must be an object')
+    }
+    const usage = obj.usage as Record<string, unknown>
+    for (const key of [
+      'inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens',
+      'input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_write_tokens',
+    ]) {
+      if (usage[key] !== undefined && !isNonNegInt(usage[key])) {
+        throw new Error(`usage.${key} must be a non-negative integer`)
+      }
+    }
+  }
+  if (!obj.projection || typeof obj.projection !== 'object' || Array.isArray(obj.projection)) {
+    throw new Error('projection must be an object')
+  }
+  const projection = obj.projection as Record<string, unknown>
+  if (typeof projection.status !== 'string' || projection.status.length === 0) {
+    throw new Error('projection.status must be a non-empty string')
+  }
+  for (const key of ['turnCount', 'totalTokenCount', 'contextUsed', 'contextWindow'] as const) {
+    if (!isNonNegInt(projection[key])) throw new Error(`projection.${key} must be a non-negative integer`)
+  }
+  optionalString(obj, 'traceId')
+  optionalString(obj, 'turnId')
+  return {
+    sessionId,
+    response,
+    usage: obj.usage,
+    eventCount: obj.eventCount,
+    projection: obj.projection,
+    ...(obj.traceId !== undefined ? { traceId: obj.traceId } : {}),
+    ...(obj.turnId !== undefined ? { turnId: obj.turnId } : {}),
+  }
+}
+
 function parseJsonResult(stdout: string): ZcodeJsonResult {
   const trimmed = stdout.trim()
   if (!trimmed) throw new Error('empty stdout')
+  let parsed: unknown
   try {
-    return JSON.parse(trimmed) as ZcodeJsonResult
+    parsed = JSON.parse(trimmed)
   } catch {
-    const lines = trimmed.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
-    for (let i = lines.length - 1; i >= 0; i--) {
-      try {
-        const parsed = JSON.parse(lines[i]!) as ZcodeJsonResult
-        if (parsed && typeof parsed === 'object') return parsed
-      } catch { /* keep scanning */ }
-    }
-    throw new Error('not json')
+    throw new Error('stdout is not a single JSON object')
   }
+  return validateZcodeJsonResult(parsed)
 }
 
 export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
@@ -350,17 +409,32 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
       this.emit('error', err)
     })
     proc.once('close', (code, signal) => {
-      if (ctx.abandoned) return
-      ctx.procClosed = true
-      ctx.resolveDrain?.()
-      ctx.resolveDrain = null
-      const crashed = !ctx.interrupted && code !== 0
-      if (!ctx.terminal) {
-        if (code === 0) this.finishSuccess(ctx)
-        else this.finishError(ctx, ctx.stderr.trim() || `zcode exited with code ${String(code)}`)
+      try {
+        if (ctx.abandoned) return
+        ctx.procClosed = true
+        ctx.resolveDrain?.()
+        ctx.resolveDrain = null
+        const crashed = !ctx.interrupted && code !== 0
+        if (!ctx.terminal) {
+          if (code === 0 && /(?:^|\n)\s*Error\b/.test(ctx.stderr)) {
+            this.finishError(ctx, ctx.stderr.trim() || 'CLI reported Error on stderr')
+          } else if (code === 0) {
+            this.finishSuccess(ctx)
+          } else {
+            this.finishError(ctx, ctx.stderr.trim() || `zcode exited with code ${String(code)}`)
+          }
+        }
+        this.emit('exit', { code, signal, crashed })
+      } catch (err) {
+        if (!ctx.terminal) {
+          this.finishError(ctx, err instanceof Error ? err.message : String(err))
+        }
+        try {
+          this.emit('exit', { code, signal, crashed: true })
+        } catch { /* close must never throw into the gateway */ }
+      } finally {
+        if (this.active === ctx) this.active = null
       }
-      this.emit('exit', { code, signal, crashed })
-      if (this.active === ctx) this.active = null
     })
   }
 
@@ -374,15 +448,13 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
       this.finishError(ctx, 'headless JSON stdout was not a machine-readable object')
       return
     }
-    const sessionId = typeof parsed.sessionId === 'string' && parsed.sessionId.startsWith('sess_')
-      ? parsed.sessionId
-      : (typeof parsed.sessionId === 'string' ? parsed.sessionId : null)
+    const sessionId = typeof parsed.sessionId === 'string' ? parsed.sessionId : null
     if (sessionId) {
       this.nativeId = sessionId
       this.emit('session_id', sessionId)
     }
     ctx.lastUsage = parseUsage(parsed.usage)
-    const response = asText(parsed.response)
+    const response = typeof parsed.response === 'string' ? parsed.response : asText(parsed.response)
     ctx.assistantText = response
     if (response) {
       ctx.assistantSegments.push({
@@ -552,6 +624,7 @@ export const _internals = {
   resolveZcodeBin,
   unavailable,
   parseJsonResult,
+  validateZcodeJsonResult,
   ZCODE_HOTCFG_WRAPPER_BIN,
   ZCODE_IMAGE_WRAPPER_BIN,
 }

@@ -45,6 +45,11 @@ describe('oc-zcode wrapper', () => {
     assert.match(text, /< \/dev\/null/)
     assert.doesNotMatch(text, /echo "\$api_key"/)
     assert.match(text, /experimental community/)
+    assert.match(text, /test hook requires OC_ZCODE_TEST_BIN and OC_ZCODE_TEST_AUTH_FILE together/)
+    assert.match(text, /stat -c '%u %a'/)
+    assert.match(text, /unset ZCODE_API_KEY/)
+    assert.match(text, /unset ZAI_API_KEY/)
+    assert.match(text, /provider\.<id>\.options\.apiKey/)
   })
 
   test('executes the fake CLI with locked flags and does not print the secret', async () => {
@@ -55,9 +60,20 @@ describe('oc-zcode wrapper', () => {
     await writeFile(auth, 'super-secret-zcode-key\n')
     await writeFile(fake, `#!/usr/bin/env node
 const fs = require('node:fs')
+const path = require('node:path')
+const cfgPath = path.join(process.env.HOME, '.zcode/cli/config.json')
+const st = fs.statSync(cfgPath)
 fs.writeFileSync(process.env.FAKE_ZCODE_CAPTURE, JSON.stringify({
   argv: process.argv.slice(2),
-  env: { ZCODE_MODEL: process.env.ZCODE_MODEL, HOME: process.env.HOME },
+  env: {
+    ZCODE_MODEL: process.env.ZCODE_MODEL,
+    HOME: process.env.HOME,
+    ZCODE_API_KEY: process.env.ZCODE_API_KEY,
+    ZAI_API_KEY: process.env.ZAI_API_KEY,
+    ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
+  },
+  config: JSON.parse(fs.readFileSync(cfgPath, 'utf8')),
+  configMode: st.mode & 0o777,
 }))
 process.stdout.write(JSON.stringify({ sessionId: 'sess_w', response: 'wrapped', eventCount: 0 }) + '\\n')
 `)
@@ -76,11 +92,21 @@ process.stdout.write(JSON.stringify({ sessionId: 'sess_w', response: 'wrapped', 
       assert.equal(result.code, 0, result.stderr)
       assert.equal(result.stderr.includes('super-secret-zcode-key'), false)
       assert.match(result.stdout, /sess_w/)
-      const captured = JSON.parse(await readFile(capture, 'utf8')) as { argv: string[]; env: Record<string, string> }
+      const captured = JSON.parse(await readFile(capture, 'utf8')) as {
+        argv: string[]
+        env: Record<string, string | undefined>
+        config: { provider: { zai: { options: { apiKey: string } } } }
+        configMode: number
+      }
       assert.equal(captured.argv[captured.argv.indexOf('--mode') + 1], 'yolo')
       assert.ok(captured.argv.includes('--json'))
       assert.equal(captured.env.ZCODE_MODEL, 'zai/glm-5.1')
-      assert.match(captured.env.HOME, /openclaude-zcode\./)
+      assert.match(String(captured.env.HOME), /openclaude-zcode\./)
+      assert.equal(captured.env.ZCODE_API_KEY, undefined)
+      assert.equal(captured.env.ZAI_API_KEY, undefined)
+      assert.equal(captured.env.ANTHROPIC_API_KEY, undefined)
+      assert.equal(captured.config.provider.zai.options.apiKey, 'super-secret-zcode-key')
+      assert.equal(captured.configMode, 0o600)
     } finally {
       await rm(dir, { recursive: true, force: true })
     }
@@ -106,6 +132,47 @@ process.stdout.write(JSON.stringify({ sessionId: 'sess_w', response: 'wrapped', 
       )
       assert.notEqual(force.code, 0)
       assert.match(force.stderr, /managed by OpenClaude/)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('any OC_ZCODE_TEST_* without the matching pair never reads production auth', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-zcode-wrapper-partial-'))
+    const fake = path.join(dir, 'fake-zcode.cjs')
+    const marker = path.join(dir, 'sudo-ran')
+    const sudo = path.join(dir, 'sudo')
+    await writeFile(fake, '#!/usr/bin/env node\nprocess.exit(0)\n')
+    await chmod(fake, 0o755)
+    await writeFile(sudo, `#!/bin/sh\necho ran >> "${marker}"\nexit 0\n`)
+    await chmod(sudo, 0o755)
+    try {
+      const onlyBin = await runWrapper(
+        ['--prompt', 'x', '--json', '--mode', 'yolo', '--no-color', '--cwd', dir],
+        { PATH: `${dir}:${process.env.PATH}`, OC_ZCODE_TEST_BIN: fake },
+      )
+      assert.notEqual(onlyBin.code, 0)
+      assert.match(onlyBin.stderr, /together/)
+      assert.equal(onlyBin.stderr.includes('/run/oc/zcode-auth'), false)
+
+      const onlyAuth = await runWrapper(
+        ['--prompt', 'x', '--json', '--mode', 'yolo', '--no-color', '--cwd', dir],
+        { PATH: `${dir}:${process.env.PATH}`, OC_ZCODE_TEST_AUTH_FILE: path.join(dir, 'api-key') },
+      )
+      assert.notEqual(onlyAuth.code, 0)
+      assert.match(onlyAuth.stderr, /together/)
+
+      const prodPath = await runWrapper(
+        ['--prompt', 'x', '--json', '--mode', 'yolo', '--no-color', '--cwd', dir],
+        {
+          PATH: `${dir}:${process.env.PATH}`,
+          OC_ZCODE_TEST_BIN: fake,
+          OC_ZCODE_TEST_AUTH_FILE: '/run/oc/zcode-auth/api-key',
+        },
+      )
+      assert.notEqual(prodPath.code, 0)
+      assert.match(prodPath.stderr, /production credential path/)
+      assert.equal(await readFile(marker, 'utf8').catch(() => ''), '')
     } finally {
       await rm(dir, { recursive: true, force: true })
     }

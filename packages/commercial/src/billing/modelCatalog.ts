@@ -452,8 +452,15 @@ export class ModelCatalogSnapshot {
   }
 
   isExternalBillingModel(modelId: string): boolean {
-    return this.activeByModel.get(this.aliasToCanonical(modelId))?.engine === "cursor"
-      || this.activeByModel.get(this.aliasToCanonical(modelId))?.engine === "zcode";
+    return this.isCursorModel(modelId) || this.isZcodeModel(modelId);
+  }
+
+  isCursorModel(modelId: string): boolean {
+    return this.activeByModel.get(this.aliasToCanonical(modelId))?.engine === "cursor";
+  }
+
+  isZcodeModel(modelId: string): boolean {
+    return this.activeByModel.get(this.aliasToCanonical(modelId))?.engine === "zcode";
   }
 
   /**

@@ -428,6 +428,32 @@ describe('modelAuthority — 验签 + gateway 断言全集', () => {
     expectReject(() => consumer.consume(frame, conn), 'billing_request_mismatch')
   })
 
+  test('ZCode authority:engine=zcode 验签消费后保持实验引擎描述符并绑定 billingRequestId', () => {
+    const key = makeKey('mak1_zcode')
+    const consumer = makeConsumer(key)
+    const conn = consumer.newConnection()
+    const billingRequestId = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    const frame = mintFrame(key, {
+      connectionChallenge: conn.challenge,
+      canonicalModel: 'zcode-experimental',
+      engine: 'zcode',
+      billingRequestId,
+    })
+    frame.requestId = billingRequestId
+
+    const d = consumer.consume(frame, conn)
+    assert.equal(d.canonicalModel, 'zcode-experimental')
+    assert.equal(d.engine, 'zcode')
+    assert.equal(d.billingRequestId, billingRequestId)
+    assert.equal(
+      resolveEngine('zcode-experimental', { id: 'main' } as never, {
+        canonicalModel: d.canonicalModel,
+        engine: d.engine,
+      }),
+      'zcode',
+    )
+  })
+
   test('Cursor billingRequestId 必须与 external audit 的 frame.requestId 精确绑定', () => {
     const key = makeKey('mak1_cursor')
     const consumer = makeConsumer(key)
@@ -436,6 +462,20 @@ describe('modelAuthority — 验签 + gateway 断言全集', () => {
       connectionChallenge: conn.challenge,
       canonicalModel: 'cursor-auto',
       engine: 'cursor',
+      billingRequestId: '0123456789abcdef0123456789abcdef',
+    })
+    frame.requestId = 'fedcba9876543210fedcba9876543210'
+    expectReject(() => consumer.consume(frame, conn), 'billing_request_mismatch')
+  })
+
+  test('ZCode billingRequestId 必须与 signed frame.requestId 精确绑定', () => {
+    const key = makeKey('mak1_zcode')
+    const consumer = makeConsumer(key)
+    const conn = consumer.newConnection()
+    const frame = mintFrame(key, {
+      connectionChallenge: conn.challenge,
+      canonicalModel: 'zcode-experimental',
+      engine: 'zcode',
       billingRequestId: '0123456789abcdef0123456789abcdef',
     })
     frame.requestId = 'fedcba9876543210fedcba9876543210'

@@ -481,7 +481,7 @@ export class ModelAuthorityConsumer {
         `frame.model=${String(frameModel)} != authority.canonicalModel=${payload.canonicalModel}`,
       )
     }
-    if (payload.engine === 'codex' || payload.engine === 'grok' || payload.engine === 'cursor') {
+    if (payload.engine === 'codex' || payload.engine === 'grok' || payload.engine === 'cursor' || payload.engine === 'zcode') {
       const frameRequestId = typeof frame.requestId === 'string' ? frame.requestId : undefined
       if (
         typeof payload.billingRequestId !== 'string' ||

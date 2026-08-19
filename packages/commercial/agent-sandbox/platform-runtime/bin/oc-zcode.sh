@@ -5,6 +5,10 @@
 # mount and never enter Docker Env, the image, argv, or logs. The hosted
 # permission mode is locked to `yolo` (the only 0.15.0 unattended all-tools
 # mode). There is no stdin ask path.
+#
+# Test hooks (OC_ZCODE_TEST_*) are hard-isolated from the production path:
+# any test variable forces a complete test bin + test auth pair and never
+# touches /run/oc/zcode-auth or sudo.
 set -eu
 
 die() {
@@ -26,21 +30,30 @@ for required_tool in /usr/bin/test /bin/cat /usr/bin/mktemp /bin/rm /bin/mkdir \
   [ -x "$required_tool" ] || die "runtime image is missing $required_tool"
 done
 
-zcode_cjs=/opt/zcode-cli/versions/0.15.0/zcode.cjs
-node_bin=/usr/local/bin/node
-auth_file=/run/oc/zcode-auth/api-key
-if [ -n "${OC_ZCODE_TEST_BIN:-}" ]; then
-  zcode_cjs=$OC_ZCODE_TEST_BIN
-  node_bin=""
-fi
-if [ -n "${OC_ZCODE_TEST_AUTH_FILE:-}" ]; then
-  auth_file=$OC_ZCODE_TEST_AUTH_FILE
-fi
-if [ -n "${OC_ZCODE_TEST_NODE:-}" ]; then
-  node_bin=$OC_ZCODE_TEST_NODE
+test_bin=${OC_ZCODE_TEST_BIN:-}
+test_auth=${OC_ZCODE_TEST_AUTH_FILE:-}
+test_node=${OC_ZCODE_TEST_NODE:-}
+test_mode=0
+if [ -n "$test_bin" ] || [ -n "$test_auth" ] || [ -n "$test_node" ]; then
+  test_mode=1
 fi
 
-if [ -z "${OC_ZCODE_TEST_BIN:-}" ]; then
+if [ "$test_mode" -eq 1 ]; then
+  [ -n "$test_bin" ] && [ -n "$test_auth" ] \
+    || die "test hook requires OC_ZCODE_TEST_BIN and OC_ZCODE_TEST_AUTH_FILE together"
+  case "$test_auth" in
+    /run/oc/zcode-auth|/run/oc/zcode-auth/*)
+      die "test auth must not use the production credential path"
+      ;;
+  esac
+  zcode_cjs=$test_bin
+  node_bin=$test_node
+  auth_file=$test_auth
+else
+  [ -x /usr/bin/sudo ] || die "runtime image is missing /usr/bin/sudo"
+  zcode_cjs=/opt/zcode-cli/versions/0.15.0/zcode.cjs
+  node_bin=/usr/local/bin/node
+  auth_file=/run/oc/zcode-auth/api-key
   [ -f "$zcode_cjs" ] || die "experimental community CLI is not installed"
   [ -x "$node_bin" ] || die "node 22 is required to run zcode.cjs 0.15.0"
 fi
@@ -133,21 +146,32 @@ case "$upstream" in
   zai/glm-5.1) ;;
   *) die "upstream model is not allowlisted" ;;
 esac
+provider=${upstream%%/*}
 
-if [ -n "${OC_ZCODE_TEST_AUTH_FILE:-}" ]; then
+if [ "$test_mode" -eq 1 ]; then
   [ -f "$auth_file" ] || die "test credential file is missing"
   api_key=$(/bin/cat -- "$auth_file")
 else
   /usr/bin/sudo -n /usr/bin/test -f "$auth_file" 2>/dev/null \
     || die "ZCode CLI is not enabled for this account"
+  meta=$(/usr/bin/sudo -n /usr/bin/stat -c '%u %a' -- "$auth_file") \
+    || die "ZCode credential mount is unreadable"
+  owner=${meta%% *}
+  mode_bits=${meta##* }
+  [ "$owner" = "0" ] || die "ZCode credential owner is not root"
+  case "$mode_bits" in
+    400|600|0400|0600) ;;
+    *) die "ZCode credential mode must be 0400 or 0600" ;;
+  esac
   api_key=$(/usr/bin/sudo -n /bin/cat -- "$auth_file") \
     || die "ZCode credential mount is unreadable"
 fi
 [ -n "$api_key" ] || die "ZCode credential is malformed"
 carriage_return=$(printf '\r')
+backtick=$(printf '\140')
 case "$api_key" in
   *"
-"*|*"$carriage_return"*)
+"*|*"$carriage_return"*|*\"*|*"\\"*|*"\$"*|*"$backtick"*)
     die "ZCode credential is malformed"
     ;;
 esac
@@ -185,10 +209,12 @@ trap 'forward_signal TERM 143' TERM
 
 /bin/mkdir -p -m 0700 -- "$zcode_home/.zcode/cli" \
   || die "cannot create ephemeral ZCode config directory"
-# Key stays in env only. File config carries the provider/model pair required
-# by 0.15.0 (`model.main`); do not write the secret into config.json.
-printf '%s\n' "{\"model\":{\"main\":\"$upstream\"}}" > "$zcode_home/.zcode/cli/config.json"
+# 0.15.0 reads provider.<id>.options.apiKey from isolated HOME config.
+# Never export the key into yolo or its tool children.
+printf '%s\n' "{\"model\":{\"main\":\"$upstream\"},\"provider\":{\"$provider\":{\"options\":{\"apiKey\":\"$api_key\"}}}}" \
+  > "$zcode_home/.zcode/cli/config.json"
 /bin/chmod 0600 -- "$zcode_home/.zcode/cli/config.json"
+api_key=""
 
 storage_dir=""
 oc_home=${OPENCLAUDE_HOME:-}
@@ -208,16 +234,15 @@ set -- --prompt "$prompt" --json --mode yolo --no-color --cwd "$cwd"
 if [ -n "$storage_dir" ]; then
   export ZCODE_STORAGE_DIR="$storage_dir"
 fi
+unset ZCODE_API_KEY
+unset ZAI_API_KEY
+unset ANTHROPIC_API_KEY
+export HOME="$zcode_home"
+export ZCODE_MODEL="$upstream"
 set +e
 if [ -n "$node_bin" ]; then
-  HOME="$zcode_home" \
-  ZCODE_API_KEY="$api_key" \
-  ZCODE_MODEL="$upstream" \
   /usr/bin/setsid "$node_bin" "$zcode_cjs" "$@" < /dev/null &
 else
-  HOME="$zcode_home" \
-  ZCODE_API_KEY="$api_key" \
-  ZCODE_MODEL="$upstream" \
   /usr/bin/setsid "$zcode_cjs" "$@" < /dev/null &
 fi
 child_pid=$!
@@ -225,5 +250,4 @@ wait "$child_pid"
 status=$?
 set -e
 
-api_key=""
 exit "$status"

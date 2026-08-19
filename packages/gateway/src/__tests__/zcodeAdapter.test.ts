@@ -200,4 +200,101 @@ process.exit(1)
     })
     await assert.rejects(run.submitted, /ZCODE_MODEL_REJECTED/)
   })
+
+  test('stdout parser accepts only the live fixture object and rejects counterexamples', () => {
+    const parsed = _internals.parseJsonResult(JSON.stringify(successFixture))
+    assert.equal(parsed.sessionId, 'sess_live_fixture_001')
+    assert.equal(parsed.eventCount, 3)
+    assert.throws(() => _internals.parseJsonResult('null'), /single JSON object/)
+    assert.throws(() => _internals.parseJsonResult('{}'), /empty/)
+    assert.throws(() => _internals.parseJsonResult('1'), /single JSON object/)
+    assert.throws(() => _internals.parseJsonResult('"x"'), /single JSON object/)
+    assert.throws(() => _internals.parseJsonResult('[]'), /single JSON object/)
+    assert.throws(
+      () => _internals.parseJsonResult(`${JSON.stringify(successFixture)}\n${JSON.stringify(successFixture)}`),
+      /single JSON object/,
+    )
+    assert.throws(
+      () => _internals.parseJsonResult(`prefix ${JSON.stringify(successFixture)}`),
+      /single JSON object/,
+    )
+    assert.throws(
+      () => _internals.parseJsonResult(JSON.stringify({ ...successFixture, sessionId: 'not-a-session' })),
+      /sess_/,
+    )
+    assert.throws(
+      () => _internals.parseJsonResult(JSON.stringify({ sessionId: 'sess_x', response: 'ok', eventCount: 0 })),
+      /projection/,
+    )
+  })
+
+  test('exit 0 with Error on stderr or invalid stdout becomes one captured failure', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-zcode-parse-'))
+    const cases: Array<{ name: string; script: string }> = [
+      {
+        name: 'empty-object',
+        script: `#!/usr/bin/env node
+process.stdout.write('{}\\n')
+`,
+      },
+      {
+        name: 'null',
+        script: `#!/usr/bin/env node
+process.stdout.write('null\\n')
+`,
+      },
+      {
+        name: 'mixed',
+        script: `#!/usr/bin/env node
+process.stdout.write('ok\\n{"sessionId":"sess_x","response":"ok","eventCount":1}\\n')
+`,
+      },
+      {
+        name: 'stderr-error',
+        script: `#!/usr/bin/env node
+process.stderr.write('Error: leaked exception after a fake success\\n')
+process.stdout.write(${JSON.stringify(`${JSON.stringify(successFixture)}\n`)})
+`,
+      },
+    ]
+    const previousBin = process.env.OC_ZCODE_CLI_BIN
+    try {
+      for (const item of cases) {
+        const fake = path.join(dir, `${item.name}.cjs`)
+        await writeFile(fake, item.script)
+        await chmod(fake, 0o755)
+        process.env.OC_ZCODE_CLI_BIN = fake
+        const adapter = new ZcodeAdapter(createOpts(dir))
+        const events: EngineEvent[] = []
+        const billing: EngineExternalBillingEvent[] = []
+        const uncaught: unknown[] = []
+        const onUncaught = (err: unknown) => { uncaught.push(err) }
+        process.on('uncaughtException', onUncaught)
+        adapter.on('external_billing', (event: EngineExternalBillingEvent) => billing.push(event))
+        adapter.on('error', () => {})
+        try {
+          const run = adapter.submitTurn({
+            input: 'must fail closed',
+            requestId: REQUEST_ID,
+            onEvent: (event) => events.push(event),
+            sessionTotals: { totalCostUSD: 0, turns: 0 },
+            toolUseIdToName: new Map(),
+          })
+          await run.submitted
+          const summary = await run.summary
+          assert.ok(summary, item.name)
+          assert.equal(summary.isError, true, item.name)
+          assert.equal(events.filter((event) => event.kind === 'error').length, 1, item.name)
+          assert.equal(events.at(-1)?.kind, 'final', item.name)
+          assert.equal(billing[0]?.status === 'error' || billing[0]?.status === 'unavailable', true, item.name)
+          assert.equal(uncaught.length, 0, item.name)
+        } finally {
+          process.off('uncaughtException', onUncaught)
+        }
+      }
+    } finally {
+      restoreEnv('OC_ZCODE_CLI_BIN', previousBin)
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
 })
