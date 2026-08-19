@@ -165,10 +165,10 @@ test("materializing a part with \\u0000 keeps original record BYTEA and hash", a
   assert.equal(parsedGroup._delegateGoal?.includes("\u0000"), true);
 
   const visible = prepared.visible[prepared.turn.records.indexOf(tool)]!;
-  assert.equal(visible.bytes.includes(Buffer.from("\\u0000", "utf8")), false);
+  assert.ok(visible.bytes.includes(Buffer.from("\\u0000", "utf8")), "visible BYTEA keeps JSON \\u0000 escapes");
   assert.equal(visible.bytes.includes(0), false);
   const visibleGroup = prepared.visible[prepared.turn.records.indexOf(group)]!;
-  assert.equal(visibleGroup.bytes.includes(Buffer.from("\\u0000", "utf8")), false);
+  assert.ok(visibleGroup.bytes.includes(Buffer.from("\\u0000", "utf8")));
 
   await _stagePreparedLosslessTurnRecords(pool, USER_ID, request, prepared);
   assert.equal(sqls.some((sql) => sql.includes("session_replication_role")), false);

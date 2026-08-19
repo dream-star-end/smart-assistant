@@ -85,7 +85,6 @@ import {
   phaseAVisibleHeadText,
   pickTapeDisplayFallbackText,
   recordsPublished,
-  sanitizeJsonBytesForPgJsonb,
   sanitizeValueForPgJsonb,
   settlementAuthorityHash,
   settlementEngineBillings,
@@ -2645,8 +2644,9 @@ export async function _prepareLosslessTurnTapeOutsideLocks(
     runtimeBatching: recordStorageFormat === 3,
   });
   // Record payload BYTEA + content_sha256 stay the part-derived original.
-  // PostgreSQL jsonb rejects \u0000 / unpaired surrogates; only derived
-  // visible_payload / sidecar TEXT / jsonb binds may be rewritten.
+  // visible_payload is also BYTEA and stays exact (timeline must round-trip
+  // JSON \u0000). PostgreSQL jsonb rejects \u0000 / unpaired surrogates;
+  // only jsonb binds and sidecar TEXT may be rewritten.
   if (
     turn.payload.sessionId !== request.sessionId ||
     turn.payload.agentId !== request.agentId ||
@@ -2674,13 +2674,10 @@ export async function _prepareLosslessTurnTapeOutsideLocks(
     if (!payload) {
       throw new Error(`[pgSessions] lossless tape record is not a JSON object: ${item.id}`);
     }
-    const sanitizedVisible = sanitizeJsonBytesForPgJsonb(payload.bytes);
-    if (!sanitizedVisible.changed) return payload;
-    return {
-      ...payload,
-      bytes: sanitizedVisible.bytes,
-      contentSha256: sha256Bytes(sanitizedVisible.bytes),
-    };
+    // visible_payload is BYTEA, not jsonb. Keep exact JSON (including \u0000)
+    // so timeline/exact reads match original record bytes. jsonb columns are
+    // sanitized at bind time; the 0232 trigger lazy-sanitizes agent-group casts.
+    return payload;
   });
   return {
     turn,
