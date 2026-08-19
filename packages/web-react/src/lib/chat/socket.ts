@@ -2954,6 +2954,11 @@ export class ChatSocket {
       timelineSnapshotMaxSeq?: number;
       /** Legacy backend fallback: invalidate hydrated history on every full read. */
       invalidateHistoryCache?: boolean;
+      openDispatch?: {
+        dispatchId: string;
+        clientMessageId: string;
+        status: string;
+      };
     },
   ): void {
     const s = this.ensureSession(sessId, agentId || this.deps.defaultAgentId || "main");
@@ -2991,6 +2996,11 @@ export class ChatSocket {
     // 会话级模型选择镜像:载荷已过版本护栏(未被证明过期)才应用,server-wins;
     // 缺省 = 服务端无值,保留本地(与侧栏 listSessions 合并同语义)。
     if (typeof archive?.modelId === "string" && archive.modelId) s._selectedModelId = archive.modelId;
+    const openDispatch = archive?.openDispatch;
+    if (openDispatch?.clientMessageId && !s._sendingInFlight) {
+      s._sendingInFlight = true;
+      s._activeClientMessageId = openDispatch.clientMessageId;
+    }
     // 终态收敛:先从载荷推导「已收尾 turn → 终态类别」。verified failure status、
     // 持久化 error 卡、真 tape 生成行都在此被识别,合并后 convergeTerminalTurns 显式清发送态 +
     // 落 user 行终态,不再依赖「completion-evidence 恰好命中」的巧合路径。

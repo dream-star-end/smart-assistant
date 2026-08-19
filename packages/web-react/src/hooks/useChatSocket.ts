@@ -138,6 +138,11 @@ export type UseChatSocket = {
     timelineHasMore?: boolean;
     timelineSnapshotMaxSeq?: number;
     invalidateHistoryCache?: boolean;
+    openDispatch?: {
+      dispatchId: string;
+      clientMessageId: string;
+      status: string;
+    };
   }) => void;
   /** Replay an immutable page from the master-side live-frame journal. */
   applyDurableLiveFrames: (
@@ -369,6 +374,7 @@ export function useChatSocket(opts: {
                 timelineHasMore: detail.timelineHasMore,
                 timelineSnapshotMaxSeq: detail.timelineSnapshotMaxSeq,
                 invalidateHistoryCache: detail._historyRevisionUnsupported === true,
+                openDispatch: detail.openDispatch,
               },
             );
           }
@@ -689,6 +695,7 @@ export function useChatSocket(opts: {
         timelineHasMore: p.timelineHasMore,
         timelineSnapshotMaxSeq: p.timelineSnapshotMaxSeq,
         invalidateHistoryCache: p.invalidateHistoryCache,
+        openDispatch: p.openDispatch,
       });
       persistRef.current(p.sessId); // 合并后落地（含推进的 _maxSeq 游标 + 归档水位/计数）
     },

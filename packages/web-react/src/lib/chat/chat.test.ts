@@ -7932,3 +7932,21 @@ describe("applyPermissionSettled — frameSeq exemption + requestId idempotency"
     expect(card._behavior).toBe("allow");
   });
 });
+
+
+describe("openDispatch hydrate restores in-flight", () => {
+  test("GET session openDispatch sets sending state when no live frames", () => {
+    const sock = makeSocket();
+    sock.applyServerMessages("s-open", "main", [], true, 0, {
+      openDispatch: {
+        dispatchId: "d1",
+        clientMessageId: "m-open-1",
+        status: "accepted",
+      },
+    });
+    const session = sock.sessions.get("s-open")!;
+    expect(session._sendingInFlight).toBe(true);
+    expect(session._activeClientMessageId).toBe("m-open-1");
+    sock.stop();
+  });
+});

@@ -279,6 +279,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
           timelineHasMore: detail.timelineHasMore,
           timelineSnapshotMaxSeq: detail.timelineSnapshotMaxSeq,
           invalidateHistoryCache: detail._historyRevisionUnsupported === true,
+          openDispatch: detail.openDispatch,
         });
         // Canonical GET is enough to dismiss the history skeleton. Journal
         // hydrate is a background fill — awaiting it used to pin
