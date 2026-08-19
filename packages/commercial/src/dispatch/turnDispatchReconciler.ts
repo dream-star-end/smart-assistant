@@ -199,6 +199,12 @@ export interface TurnDispatchReconcilerDeps {
    * 默认查 journal.ctx.gatewayExitedAt。
    */
   listCarrierDeadDispatchIds?: () => Promise<string[]>
+  /** Parts-complete branch: same Phase A entry as HTTP finalize. */
+  commitVisibleTape?: (input: {
+    userId: string
+    sessionId: string
+    tapeId: string
+  }) => Promise<void>
 }
 
 function idOf(row: TurnDispatchRow): DispatchIdentity {
@@ -429,6 +435,81 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
 }
 
 
+async function aggregateDispatchLiveText(pool: import('pg').Pool, dispatchId: string): Promise<string> {
+  const frames = await pool.query<{ payload: Buffer }>(
+    `SELECT f.payload
+       FROM client_session_live_streams s
+       JOIN client_session_live_frames f ON f.stream_key=s.stream_key
+      WHERE s.dispatch_id=$1::uuid
+      ORDER BY f.created_at`,
+    [dispatchId],
+  )
+  const chunks: string[] = []
+  for (const row of frames.rows) {
+    try {
+      const parsed = JSON.parse(row.payload.toString('utf8')) as {
+        type?: string
+        blocks?: Array<{ kind?: string; text?: string }>
+        text?: string
+      }
+      if (parsed.type && parsed.type !== 'outbound.message') continue
+      if (typeof parsed.text === 'string' && parsed.text) chunks.push(parsed.text)
+      for (const block of parsed.blocks ?? []) {
+        if (block.kind === 'text' && typeof block.text === 'string') chunks.push(block.text)
+      }
+    } catch {
+      /* ignore malformed frame */
+    }
+  }
+  return chunks.join('')
+}
+
+async function projectTapelessVisibleToSession(
+  client: { query: import('pg').Pool['query'] },
+  input: {
+    sessionId: string
+    userId: string
+    dispatchId: string
+    clientMessageId: string
+    text: string
+    nowMs: number
+  },
+): Promise<void> {
+  const session = await client.query<{ messages: string; next_seq: number | null }>(
+    `SELECT messages, next_seq FROM client_sessions
+      WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL FOR UPDATE`,
+    [input.sessionId, input.userId],
+  )
+  const row = session.rows[0]
+  if (!row) return
+  let messages: Array<Record<string, unknown>> = []
+  try {
+    const parsed = JSON.parse(row.messages)
+    if (Array.isArray(parsed)) messages = parsed as Array<Record<string, unknown>>
+  } catch {
+    return
+  }
+  const id = `visible-fallback:${input.dispatchId}`
+  if (messages.some((message) => message.id === id)) return
+  messages.push({
+    id,
+    role: 'assistant',
+    text: input.text,
+    ts: input.nowMs,
+    _source: 'server',
+    _clientMessageId: input.clientMessageId,
+  })
+  await client.query(
+    `UPDATE client_sessions
+        SET messages=$3, message_count=COALESCE(archived_count,0)+$4,
+            last_at=$5, updated_at=GREATEST(updated_at+1, $5),
+            history_revision=history_revision+1,
+            timeline_generation=timeline_generation+1
+      WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL`,
+    [input.sessionId, input.userId, JSON.stringify(messages), messages.length, input.nowMs],
+  )
+}
+
 async function closeVisibleOrphans(
   deps: TurnDispatchReconcilerDeps,
   nowMs: number,
@@ -475,8 +556,6 @@ async function closeVisibleOrphans(
        FROM turn_dispatches d
        LEFT JOIN client_session_turn_tapes t ON t.dispatch_id = d.dispatch_id
       WHERE d.status IN ('admitted','accepted')
-        AND d.visible_at IS NULL
-        AND t.visible_at IS NULL
       ORDER BY d.admitted_at
       LIMIT $1`,
     [limit],
@@ -492,39 +571,77 @@ async function closeVisibleOrphans(
       containerRunning: row.container_running === true,
       nowMs,
     })
-    if (action === 'skip' || action === 'converge_only') continue
-    const outcome = action === 'complete_from_frames' ? 'completed' : 'interrupted'
-    if (action === 'fence_hard_cap') {
-      await deps.pool.query(
-        `UPDATE turn_dispatches SET producer_fenced_at=COALESCE(producer_fenced_at, NOW())
-          WHERE dispatch_id=$1::uuid AND producer_fenced_at IS NULL`,
+    if (action === 'skip') continue
+    const outcome = action === 'complete_from_frames' || action === 'converge_only'
+      ? 'completed'
+      : 'interrupted'
+    if (action === 'complete_from_frames' && row.tape_id && deps.commitVisibleTape) {
+      try {
+        await deps.commitVisibleTape({
+          userId: `c:${row.user_id}`,
+          sessionId: row.session_id,
+          tapeId: row.tape_id,
+        })
+      } catch {
+        /* Phase A retry next tick */
+      }
+    }
+    const aggregated = await aggregateDispatchLiveText(deps.pool, row.dispatch_id)
+    const text = aggregated
+      || (action === 'complete_from_frames'
+        ? 'turn completed (visible fallback)'
+        : 'turn interrupted (visible fallback)')
+    const client = await deps.pool.connect()
+    let terminal = null
+    try {
+      await client.query('BEGIN')
+      await client.query(
+        `SELECT 1 FROM turn_dispatches WHERE dispatch_id=$1::uuid FOR UPDATE`,
         [row.dispatch_id],
       )
-    }
-    const text = action === 'complete_from_frames'
-      ? 'turn completed (visible fallback)'
-      : 'turn interrupted (visible fallback)'
-    await deps.pool.query(
-      `UPDATE turn_dispatches
-          SET visible_head=$2::jsonb, visible_at=$3
-        WHERE dispatch_id=$1::uuid AND visible_at IS NULL`,
-      [
-        row.dispatch_id,
-        JSON.stringify({
-          role: 'assistant',
-          text,
-          ts: nowMs,
-          messageId: `visible-fallback:${row.dispatch_id}`,
-          clientMessageId: row.client_message_id,
-        }),
+      if (action === 'fence_hard_cap') {
+        await client.query(
+          `UPDATE turn_dispatches SET producer_fenced_at=COALESCE(producer_fenced_at, NOW())
+            WHERE dispatch_id=$1::uuid AND producer_fenced_at IS NULL`,
+          [row.dispatch_id],
+        )
+      }
+      await client.query(
+        `UPDATE turn_dispatches
+            SET visible_head=$2::jsonb, visible_at=COALESCE(visible_at,$3)
+          WHERE dispatch_id=$1::uuid`,
+        [
+          row.dispatch_id,
+          JSON.stringify({
+            role: 'assistant',
+            text,
+            ts: nowMs,
+            messageId: `visible-fallback:${row.dispatch_id}`,
+            clientMessageId: row.client_message_id,
+          }),
+          nowMs,
+        ],
+      )
+      await projectTapelessVisibleToSession(client, {
+        sessionId: row.session_id,
+        userId: `c:${row.user_id}`,
+        dispatchId: row.dispatch_id,
+        clientMessageId: row.client_message_id,
+        text,
         nowMs,
-      ],
-    )
-    const terminal = await casToTerminal(deps.pool, {
-      dispatchId: row.dispatch_id,
-      outcome,
-      fromStatuses: ['admitted', 'accepted', 'rejecting'],
-    })
+      })
+      terminal = await casToTerminal(client, {
+        dispatchId: row.dispatch_id,
+        outcome,
+        fromStatuses: ['admitted', 'accepted', 'rejecting'],
+      })
+      await client.query('COMMIT')
+    } catch (err) {
+      try { await client.query('ROLLBACK') } catch { /* ignore */ }
+      throw err
+    } finally {
+      client.release()
+    }
     if (!terminal) continue
     closed++
     try {
