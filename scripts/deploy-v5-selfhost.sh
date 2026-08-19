@@ -68,7 +68,7 @@ REDIS_URL="redis://127.0.0.1:6379/3"
 # Runtime image pin. Rebuild with:
 #   packages/commercial/agent-sandbox/build-image.sh v5-zcode-<12sha>-slim
 # which auto-sources deploy/v5-selfhost/runtime-build.env (OC_INCLUDE_ZCODE=1).
-RUNTIME_IMAGE="openclaude/openclaude-runtime:v5-grok-21e30788a613-slim"
+RUNTIME_IMAGE="openclaude/openclaude-runtime:v5-zcode-42fe21361628-slim"
 SECRETS_ENV="/etc/openclaude/secrets.env"
 PERSONAL_UNIT="openclaude.service"
 PERSONAL_PORT="18789"
