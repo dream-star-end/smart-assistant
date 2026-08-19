@@ -29,7 +29,7 @@ import {
   isRedundantRuntimeEnvelope,
   isTurnStatusSuppressedByTape,
   messageKind,
-  messageSignature,
+  safeMessageSignature,
 } from "../lib/chat/render";
 import { sanitizeChatMessages } from "../lib/chat/sanitizeChatMessages";
 import {
@@ -539,7 +539,7 @@ function DeferredTapeRecordCard({
           const final = isLast && index === records.length - 1;
           const recordIsFinalAssistant = turnFinalAssistant === true &&
             hydratedRecord.role === "assistant" && index === records.length - 1;
-          const recordSig = messageSignature(hydratedRecord, {
+          const recordSig = safeMessageSignature(hydratedRecord, {
             isLast: final,
             sending,
             turnFinalAssistant: recordIsFinalAssistant,
@@ -771,7 +771,7 @@ function coalesceTeam(
           sig: members
             .map(
               (mm, k) =>
-                `${messageSignature(mm, { isLast: false, sending })}|c:${costFor(memberIdx[k], mm) ?? ""}|du:${tokenUsageSignature(delegateTokenUsage(mm))}`,
+                `${safeMessageSignature(mm, { isLast: false, sending })}|c:${costFor(memberIdx[k], mm) ?? ""}|du:${tokenUsageSignature(delegateTokenUsage(mm))}`,
             )
             .join("||"),
           delegateCosts,
@@ -826,7 +826,7 @@ function coalesceTeam(
       // 组 sig = 各成员签名拼接(仅末条按 groupIsLast 参与 isLast;文本 + 流式态都编进,
       // 后到成员/流式完成时 memo 正常重渲防漏渲)。key 用首条成员 id → 流式追加成员时稳定不重挂。
       const sig = members
-        .map((mm, k) => messageSignature(mm, { isLast: groupIsLast && k === members.length - 1, sending }))
+        .map((mm, k) => safeMessageSignature(mm, { isLast: groupIsLast && k === members.length - 1, sending }))
         .join("||");
       const thinkingUsage = groupedCallTokenUsage(members.map((member) => member._callUsage));
       items.push({
@@ -1251,13 +1251,28 @@ export function MessageList({
     const turnFinalAssistant = ratingFinal[it.idx] ?? false;
     const failurePresentedBelow =
       it.m.role === "user" && presentedErrorTurnIds.has(it.m.id);
-    const rowSig = `${messageSignature(it.m, {
-      isLast: it.isLast,
-      sending,
-      turnFinalAssistant,
-    })}|tu:${tokenUsageSignature(it.tokenUsage)}|du:${tokenUsageSignature(delegateTokenUsage(it.m))}|pe:${failurePresentedBelow ? 1 : 0}`;
+    const rowId = it.m._timelineUnitKey ?? it.m.id;
+    let rowSig: string;
+    try {
+      rowSig = `${safeMessageSignature(it.m, {
+        isLast: it.isLast,
+        sending,
+        turnFinalAssistant,
+      })}|tu:${tokenUsageSignature(it.tokenUsage)}|du:${tokenUsageSignature(delegateTokenUsage(it.m))}|pe:${failurePresentedBelow ? 1 : 0}`;
+    } catch {
+      return (
+        <MessageBoundary messageId={rowId} sig={`corrupt-row|${rowId}`}>
+          <div
+            className="flex items-center gap-2 rounded-lg border border-border bg-surface px-3.5 py-2 text-[12.5px] text-muted"
+            data-testid="corrupt-message-placeholder"
+          >
+            此条消息数据结构异常，已跳过渲染
+          </div>
+        </MessageBoundary>
+      );
+    }
     return (
-      <MessageBoundary messageId={it.m._timelineUnitKey ?? it.m.id} sig={rowSig}>
+      <MessageBoundary messageId={rowId} sig={rowSig}>
         <MessageRenderer
           message={it.m}
           sig={rowSig}

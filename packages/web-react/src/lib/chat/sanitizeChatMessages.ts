@@ -59,6 +59,30 @@ export function isRenderableChatMessage(value: unknown): value is ChatMessage {
     && Number.isFinite(message.ts);
 }
 
+function isPlanStep(value: unknown): value is { step: string; status: string } {
+  return !!value
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && typeof (value as { step?: unknown }).step === "string"
+    && typeof (value as { status?: unknown }).status === "string";
+}
+
+function nestedFieldsRenderable(message: ChatMessage): boolean {
+  switch (message.role) {
+    case "plan":
+      return message.steps === undefined || (Array.isArray(message.steps) && message.steps.every(isPlanStep));
+    case "delegate-progress":
+      return message.entries === undefined
+        || (Array.isArray(message.entries) && message.entries.every((entry) => !!entry && typeof entry === "object"));
+    case "agent-group":
+      return message.childBlocks === undefined
+        || (Array.isArray(message.childBlocks)
+          && message.childBlocks.every((block) => !!block && typeof block === "object"));
+    default:
+      return true;
+  }
+}
+
 /** Normalize one history/socket batch before filter/aggregate/signature work.
  * Bad items become stable-id error placeholders so neighbors still render. */
 export function sanitizeChatMessages(
@@ -67,7 +91,12 @@ export function sanitizeChatMessages(
 ): ChatMessage[] {
   if (!Array.isArray(messages)) return [];
   return messages.map((raw, index) => {
-    if (isRenderableChatMessage(raw)) return raw;
+    if (isRenderableChatMessage(raw)) {
+      if (!nestedFieldsRenderable(raw)) {
+        return asCorruptPlaceholder(sessionId, index, raw, "malformed");
+      }
+      return raw;
+    }
     if (raw && typeof raw === "object" && typeof (raw as { id?: unknown }).id === "string"
       && ((raw as { id: string }).id.length > 0)) {
       const message = raw as ChatMessage;
@@ -76,6 +105,9 @@ export function sanitizeChatMessages(
       }
       if (typeof message.ts !== "number" || !Number.isFinite(message.ts)) {
         return { ...message, ts: 0 };
+      }
+      if (!nestedFieldsRenderable(message)) {
+        return asCorruptPlaceholder(sessionId, index, raw, "malformed");
       }
       return message;
     }

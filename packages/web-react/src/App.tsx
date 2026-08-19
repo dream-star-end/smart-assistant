@@ -2639,6 +2639,7 @@ export function App() {
             // 消费者，随 ratings 变更穿透 MessageRenderer 的 sig-memo 重渲（无需改渲染签名）。
             <ResponseRatingProvider value={ratingCtx}>
               <SessionTimelineBoundary
+                resetKey={activeId ?? "none"}
                 onRetry={activeId ? () => retryHistory(activeId) : undefined}
               >
                 {historyError && wsMessages.length > 0 && (

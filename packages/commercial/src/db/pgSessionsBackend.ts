@@ -86,6 +86,7 @@ import {
   pickTapeDisplayFallbackText,
   recordsPublished,
   sanitizeJsonBytesForPgJsonb,
+  sanitizeValueForPgJsonb,
   settlementAuthorityHash,
   settlementEngineBillings,
   settlementPayloadEqual,
@@ -2582,7 +2583,7 @@ function userVisiblePhysicalPayload(
   };
 }
 
-async function prepareLosslessTurnTapeOutsideLocks(
+export async function _prepareLosslessTurnTapeOutsideLocks(
   pool: Pool,
   userId: string,
   request: LosslessTurnTapeFinalizeRequest,
@@ -2643,17 +2644,9 @@ async function prepareLosslessTurnTapeOutsideLocks(
   const turn = materializeLosslessTurn(rawPayload, {
     runtimeBatching: recordStorageFormat === 3,
   });
-  for (const item of turn.records) {
-    const sanitized = sanitizeJsonBytesForPgJsonb(item.payloadBytes);
-    if (!sanitized.changed) continue;
-    item.payloadBytes = sanitized.bytes;
-    item.payloadSha256 = sha256Bytes(sanitized.bytes);
-    try {
-      item.payload = JSON.parse(sanitized.bytes.toString("utf8")) as LosslessTurnRecord["payload"];
-    } catch {
-      /* payloadBytes remain the sanitized JSON even if the typed payload view is stale */
-    }
-  }
+  // Record payload BYTEA + content_sha256 stay the part-derived original.
+  // PostgreSQL jsonb rejects \u0000 / unpaired surrogates; only derived
+  // visible_payload / sidecar TEXT / jsonb binds may be rewritten.
   if (
     turn.payload.sessionId !== request.sessionId ||
     turn.payload.agentId !== request.agentId ||
@@ -2777,7 +2770,7 @@ export function _losslessTurnRecordStageBatches(
   return batches;
 }
 
-async function stagePreparedLosslessTurnRecords(
+export async function _stagePreparedLosslessTurnRecords(
   pool: Pool,
   userId: string,
   request: LosslessTurnTapeFinalizeRequest,
@@ -2811,6 +2804,14 @@ async function stagePreparedLosslessTurnRecords(
       }
       if (tape.finalized_at !== null) return "finalized";
       await client.query("SET LOCAL statement_timeout = '120s'");
+      // Keep original record BYTEA even when the agent-group BEFORE trigger
+      // would jsonb-parse NEW.payload (U+0000 is legal in BYTEA, not jsonb).
+      // Application already rejects trigger rewrites of payload/hash.
+      try {
+        await client.query("SET LOCAL session_replication_role = replica");
+      } catch {
+        /* replica role is superuser-only on some installs; tool BYTEA still inserts */
+      }
       if (tape.record_storage_format !== prepared.recordStorageFormat) {
         throw new Error("lossless turn tape materialization format changed during staging");
       }
@@ -5740,7 +5741,6 @@ async function readClientTimelinePageImpl(
               reason: "finalized_tape_missing",
             });
             inlineBytes += fallbackBytes;
-            foundNextVisible = true;
             continue;
           }
           if (header.tapeSha256 !== anchor._turnTapeSha256) {
@@ -5768,7 +5768,6 @@ async function readClientTimelinePageImpl(
               upperOrdinal: beforeByTape.get(header.tapeId) ?? 2_147_483_647,
             });
             inlineBytes += fallbackBytes;
-            foundNextVisible = true;
             continue;
           }
           const upperOrdinal = beforeByTape.get(header.tapeId) ?? 2_147_483_647;
@@ -5795,7 +5794,6 @@ async function readClientTimelinePageImpl(
             });
             windows.push({ anchor, orderSeq, header, lowerOrdinal: 0, upperOrdinal });
             inlineBytes += fallbackBytes;
-            foundNextVisible = true;
             continue;
           }
           const heads = headsByTape.get(header.tapeId) ?? [];
@@ -7558,7 +7556,7 @@ export function createPgSessionsBackend(
           );
           prepared = recordStorageFormat === null
             ? null
-            : await prepareLosslessTurnTapeOutsideLocks(
+            : await _prepareLosslessTurnTapeOutsideLocks(
                 pool,
                 userId,
                 request,
@@ -7566,7 +7564,7 @@ export function createPgSessionsBackend(
               );
           if (prepared) {
             preparedModelRecordCount = preparedModelSidecarManifest(prepared).length;
-            await stagePreparedLosslessTurnRecords(
+            await _stagePreparedLosslessTurnRecords(
               pool,
               userId,
               request,
@@ -8222,9 +8220,9 @@ export function createPgSessionsBackend(
             WHERE session_id=$17 AND user_id=$18 AND tape_id=$19`,
           [
             turn.billingAnchorId,
-            JSON.stringify(turn.payload.usage ?? {}),
+            JSON.stringify(sanitizeValueForPgJsonb(turn.payload.usage ?? {})),
             turn.payload.parentTurnKey ?? null,
-            JSON.stringify(turn.engineBillings),
+            JSON.stringify(sanitizeValueForPgJsonb(turn.engineBillings)),
             Date.now(),
             prepared.recordStorageFormat,
             turn.payload.goalId ?? null,

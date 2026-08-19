@@ -13,8 +13,9 @@
  *   npx tsx scripts/ops/requeue-failed-tape-jobs.ts --plan-tapes
  *   npx tsx scripts/ops/requeue-failed-tape-jobs.ts --tape <id> --execute --allow-production
  *
- * Uses DATABASE_URL / COMMERCIAL_DATABASE_URL. Refuses production database
- * openclaude_v5_selfhost unless --allow-production is also set.
+ * Uses DATABASE_URL / COMMERCIAL_DATABASE_URL. Refuses a production target
+ * (db name, connection host, or env-file source) unless --allow-production
+ * is also set for --execute.
  */
 import pg from "pg";
 import {
@@ -46,10 +47,18 @@ export type RequeueDecision =
     }
   | { tapeId: string; action: "manual_reconcile"; reason: string; detail?: Record<string, unknown> };
 
+export type TapeCompositeIdentity = {
+  sessionId: string;
+  userId: string;
+  tapeId: string;
+};
+
 export type TapeJobSnapshot = {
   tapeId: string;
   sessionId: string;
   userId: string;
+  turnKey: string | null;
+  waiveReason: string | null;
   materializationStatus: string | null;
   materializationError: string | null;
   settlementVerifiedAt: string | null;
@@ -76,12 +85,14 @@ export function parseRequeueArgs(argv: string[]): {
   allowProduction: boolean;
   planTapes: boolean;
   sessionId?: string;
+  userId?: string;
 } {
   const tapes: string[] = [];
   let execute = false;
   let allowProduction = false;
   let planTapes = false;
   let sessionId: string | undefined;
+  let userId: string | undefined;
   for (let i = 0; i < argv.length; i++) {
     const token = argv[i]!;
     if (token === "--execute" || token === "--apply") execute = true;
@@ -91,9 +102,42 @@ export function parseRequeueArgs(argv: string[]): {
       tapes.push(argv[++i]!);
     } else if (token === "--session" && argv[i + 1]) {
       sessionId = argv[++i];
+    } else if (token === "--user" && argv[i + 1]) {
+      userId = argv[++i];
     }
   }
-  return { tapes, execute, allowProduction, planTapes, sessionId };
+  return { tapes, execute, allowProduction, planTapes, sessionId, userId };
+}
+
+/** Production is more than an exact database name: env-file source and host count. */
+export function isProductionDatabaseTarget(input: {
+  currentDatabase: string;
+  connectionString?: string;
+  envFile?: string;
+}): boolean {
+  const db = input.currentDatabase ?? "";
+  const url = input.connectionString ?? "";
+  const envFile = input.envFile
+    ?? process.env.OPENCLAUDE_ENV_FILE
+    ?? process.env.OPENCLAUDE_COMMERCIAL_ENV_FILE
+    ?? "";
+  let host = "";
+  try {
+    host = new URL(url.replace(/^postgres(?:ql)?:/i, "http:")).hostname;
+  } catch {
+    host = "";
+  }
+  const nameHit = db === "openclaude_v5_selfhost"
+    || /(?:^|[_/])openclaude_v5_selfhost(?:$|[_/])/i.test(db)
+    || /openclaude_v5_selfhost/i.test(url);
+  const envHit = envFile.includes("commercial-v5-selfhost.env")
+    || envFile.includes("/etc/openclaude/");
+  const hostHit = host === "127.0.0.1"
+    || host === "localhost"
+    || host.endsWith(".internal")
+    || host === "postgres"
+    || host === "db";
+  return nameHit || envHit || (hostHit && /selfhost/i.test(`${db} ${url} ${envFile}`));
 }
 
 export function jobAuthorityFromSettlement(job: TapeJobSnapshot["settlementJobs"][number]): {
@@ -115,7 +159,7 @@ export function jobAuthorityFromSettlement(job: TapeJobSnapshot["settlementJobs"
 
 export function settlementJobMatchesTapeAuthority(
   job: TapeJobSnapshot["settlementJobs"][number],
-  tape: Pick<TapeJobSnapshot, "billingAnchorId" | "requestId" | "engineBillings">,
+  tape: Pick<TapeJobSnapshot, "billingAnchorId" | "requestId" | "engineBillings" | "turnKey" | "waiveReason">,
 ): boolean {
   const jobAuth = jobAuthorityFromSettlement(job);
   const tapeAuth = {
@@ -126,7 +170,14 @@ export function settlementJobMatchesTapeAuthority(
   if (job.kind === "billing") {
     return settlementPayloadEqual(jobAuth, tapeAuth);
   }
-  return jobAuth.billingAnchorId === tape.billingAnchorId;
+  const payload = job.payload && typeof job.payload === "object" && !Array.isArray(job.payload)
+    ? job.payload as Record<string, unknown>
+    : {};
+  const reason = typeof payload.reason === "string" ? payload.reason : null;
+  const turnKey = typeof payload.turnKey === "string" ? payload.turnKey : null;
+  return jobAuth.billingAnchorId === tape.billingAnchorId
+    && reason === (tape.waiveReason ?? null)
+    && turnKey === (tape.turnKey ?? null);
 }
 
 export function planTapeRequeue(snapshot: TapeJobSnapshot): RequeueDecision[] {
@@ -215,42 +266,49 @@ export function planTapeRequeue(snapshot: TapeJobSnapshot): RequeueDecision[] {
       kind: job.kind,
     });
   }
+  if (out.some((decision) => decision.action === "manual_reconcile")) {
+    return out.map((decision) =>
+      decision.action === "requeue_settlement"
+        ? {
+            tapeId: snapshot.tapeId,
+            action: "skip" as const,
+            reason: "sibling_manual_reconcile",
+            detail: { kind: decision.kind },
+          }
+        : decision,
+    );
+  }
   return out;
 }
 
 export async function loadTapeJobSnapshot(
   q: Queryable,
-  tapeId: string,
+  identity: TapeCompositeIdentity,
+  options: { forUpdate?: boolean } = {},
 ): Promise<TapeJobSnapshot | null> {
+  const lock = options.forUpdate ? " FOR UPDATE" : "";
   const tape = (
     await q.query<{
       tape_id: string;
       session_id: string;
       user_id: string;
+      turn_key: string | null;
+      waive_reason: string | null;
       materialization_status: string | null;
       materialization_error: string | null;
       settlement_verified_at: string | null;
       billing_anchor_id: string | null;
-      request_id: string | null;
       engine_billings: unknown;
       settlement_hash: string | null;
     }>(
-      `SELECT t.tape_id, t.session_id, t.user_id,
+      `SELECT t.tape_id, t.session_id, t.user_id, t.turn_key, t.waive_reason,
               t.materialization_status, t.materialization_error,
               t.settlement_verified_at::text, t.billing_anchor_id,
               t.settlement_hash,
-              t.engine_billings,
-              (
-                SELECT j.request_id
-                  FROM turn_tape_settlement_jobs j
-                 WHERE j.session_id=t.session_id AND j.user_id=t.user_id AND j.tape_id=t.tape_id
-                   AND j.kind='billing'
-                 LIMIT 1
-              ) AS request_id
+              t.engine_billings
          FROM client_session_turn_tapes t
-        WHERE t.tape_id=$1
-        LIMIT 1`,
-      [tapeId],
+        WHERE t.session_id=$1 AND t.user_id=$2 AND t.tape_id=$3${lock}`,
+      [identity.sessionId, identity.userId, identity.tapeId],
     )
   ).rows[0];
   if (!tape) return null;
@@ -259,8 +317,7 @@ export async function loadTapeJobSnapshot(
     await q.query<{ job_id: string; status: string; last_error: string | null }>(
       `SELECT job_id::text, status, last_error
          FROM turn_tape_materialization_jobs
-        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
-        LIMIT 1`,
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3${lock}`,
       [tape.session_id, tape.user_id, tape.tape_id],
     )
   ).rows[0] ?? null;
@@ -280,7 +337,7 @@ export async function loadTapeJobSnapshot(
               payload, settlement_hash
          FROM turn_tape_settlement_jobs
         WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
-        ORDER BY kind`,
+        ORDER BY kind${lock}`,
       [tape.session_id, tape.user_id, tape.tape_id],
     )
   ).rows;
@@ -289,11 +346,13 @@ export async function loadTapeJobSnapshot(
     tapeId: tape.tape_id,
     sessionId: tape.session_id,
     userId: tape.user_id,
+    turnKey: tape.turn_key,
+    waiveReason: tape.waive_reason,
     materializationStatus: tape.materialization_status,
     materializationError: tape.materialization_error,
     settlementVerifiedAt: tape.settlement_verified_at,
     billingAnchorId: tape.billing_anchor_id,
-    requestId: tape.request_id,
+    requestId: settlements.find((job) => job.kind === "billing")?.request_id ?? null,
     engineBillings: tape.engine_billings,
     settlementHash: tape.settlement_hash,
     matJob: mat
@@ -310,6 +369,57 @@ export async function loadTapeJobSnapshot(
       settlementHash: job.settlement_hash,
     })),
   };
+}
+
+/** Resolve tape_id to the full primary key. Never LIMIT 1 on tape_id alone. */
+export async function resolveTapeIdentities(
+  q: Queryable,
+  tapeIds: string[],
+  hint: { sessionId?: string; userId?: string } = {},
+): Promise<Array<TapeCompositeIdentity | { tapeId: string; unresolved: true }>> {
+  const out: Array<TapeCompositeIdentity | { tapeId: string; unresolved: true }> = [];
+  for (const tapeId of tapeIds) {
+    if (hint.sessionId && hint.userId) {
+      out.push({ sessionId: hint.sessionId, userId: hint.userId, tapeId });
+      continue;
+    }
+    const rows = (
+      await q.query<{ session_id: string; user_id: string; tape_id: string }>(
+        `SELECT session_id, user_id, tape_id
+           FROM client_session_turn_tapes
+          WHERE tape_id=$1
+            AND ($2::text IS NULL OR session_id=$2)
+            AND ($3::text IS NULL OR user_id=$3)`,
+        [tapeId, hint.sessionId ?? null, hint.userId ?? null],
+      )
+    ).rows;
+    if (rows.length === 0) {
+      out.push({ tapeId, unresolved: true });
+      continue;
+    }
+    if (rows.length > 1) {
+      throw new Error(
+        `tape_id ${tapeId} matches ${rows.length} rows; pass --session and --user for the composite primary key`,
+      );
+    }
+    out.push({
+      sessionId: rows[0]!.session_id,
+      userId: rows[0]!.user_id,
+      tapeId: rows[0]!.tape_id,
+    });
+  }
+  return out;
+}
+
+export async function executeTapeRequeueInTransaction(
+  q: Queryable,
+  identity: TapeCompositeIdentity,
+): Promise<Array<RequeueDecision & { rowCount?: number }>> {
+  const snapshot = await loadTapeJobSnapshot(q, identity, { forUpdate: true });
+  if (!snapshot) {
+    return [{ tapeId: identity.tapeId, action: "skip", reason: "tape_not_found" }];
+  }
+  return applyTapeRequeue(q, planTapeRequeue(snapshot));
 }
 
 export async function applyTapeRequeue(
@@ -367,52 +477,80 @@ async function main(): Promise<void> {
   try {
     const db = await pool.query<{ current_database: string }>("SELECT current_database()");
     const dbName = db.rows[0]?.current_database ?? "";
-    if (dbName === "openclaude_v5_selfhost" && !allowProductionFlag(args.allowProduction, args.execute)) {
-      console.error(`refusing production database ${dbName} (pass --allow-production to override)`);
+    const production = isProductionDatabaseTarget({
+      currentDatabase: dbName,
+      connectionString: url,
+      envFile: process.env.OPENCLAUDE_ENV_FILE ?? process.env.OPENCLAUDE_COMMERCIAL_ENV_FILE,
+    });
+    if (production && !allowProductionFlag(args.allowProduction, args.execute)) {
+      console.error(`refusing production database target ${dbName} (pass --allow-production to override)`);
       process.exit(3);
     }
-    const ids = [...tapes];
+    const identities: TapeCompositeIdentity[] = [];
+    const report: unknown[] = [];
     if (args.planTapes) {
-      const extra = await pool.query<{ tape_id: string }>(
-        `SELECT tape_id FROM client_session_turn_tapes
+      const extra = await pool.query<{ session_id: string; user_id: string; tape_id: string }>(
+        `SELECT session_id, user_id, tape_id FROM client_session_turn_tapes
           WHERE session_id=ANY($1::text[])
             AND (
               materialization_status IN ('failed','pending','running')
               OR materialization_error IS NOT NULL
             )
-          ORDER BY session_id, created_at`,
+          ORDER BY session_id, user_id, created_at`,
         [PLAN_SESSIONS],
       );
-      for (const row of extra.rows) ids.push(row.tape_id);
+      for (const row of extra.rows) {
+        identities.push({ sessionId: row.session_id, userId: row.user_id, tapeId: row.tape_id });
+      }
     }
     if (args.sessionId) {
-      const extra = await pool.query<{ tape_id: string }>(
-        `SELECT tape_id FROM client_session_turn_tapes
+      const extra = await pool.query<{ session_id: string; user_id: string; tape_id: string }>(
+        `SELECT session_id, user_id, tape_id FROM client_session_turn_tapes
           WHERE session_id=$1
+            AND ($2::text IS NULL OR user_id=$2)
             AND (
               materialization_status IN ('failed','pending','running')
               OR materialization_error IS NOT NULL
             )
-          ORDER BY created_at`,
-        [args.sessionId],
+          ORDER BY user_id, created_at`,
+        [args.sessionId, args.userId ?? null],
       );
-      for (const row of extra.rows) ids.push(row.tape_id);
+      for (const row of extra.rows) {
+        identities.push({ sessionId: row.session_id, userId: row.user_id, tapeId: row.tape_id });
+      }
     }
-    const unique = [...new Set(ids.filter((id) => id.length > 0))];
-    const report: unknown[] = [];
-    for (const tapeId of unique) {
-      const snapshot = await loadTapeJobSnapshot(pool, tapeId);
-      if (!snapshot) {
-        report.push({ tapeId, action: "skip", reason: "tape_not_found" });
+    const resolved = await resolveTapeIdentities(pool, tapes, {
+      sessionId: args.sessionId,
+      userId: args.userId,
+    });
+    for (const item of resolved) {
+      if ("unresolved" in item) {
+        report.push({ tapeId: item.tapeId, action: "skip", reason: "tape_not_found" });
         continue;
       }
-      const decisions = planTapeRequeue(snapshot);
+      identities.push(item);
+    }
+    const unique = [
+      ...new Map(
+        identities.map((identity) => [
+          `${identity.sessionId}\0${identity.userId}\0${identity.tapeId}`,
+          identity,
+        ]),
+      ).values(),
+    ];
+    for (const identity of unique) {
       if (!args.execute) {
+        const snapshot = await loadTapeJobSnapshot(pool, identity);
+        if (!snapshot) {
+          report.push({ tapeId: identity.tapeId, action: "skip", reason: "tape_not_found" });
+          continue;
+        }
         report.push({
-          tapeId,
+          tapeId: identity.tapeId,
           dryRun: true,
           snapshot: {
             sessionId: snapshot.sessionId,
+            userId: snapshot.userId,
             materializationStatus: snapshot.materializationStatus,
             materializationError: snapshot.materializationError,
             settlementVerifiedAt: snapshot.settlementVerifiedAt,
@@ -423,16 +561,16 @@ async function main(): Promise<void> {
               lastError: job.lastError,
             })),
           },
-          decisions,
+          decisions: planTapeRequeue(snapshot),
         });
         continue;
       }
       const client = await pool.connect();
       try {
         await client.query("BEGIN");
-        const applied = await applyTapeRequeue(client, decisions);
+        const applied = await executeTapeRequeueInTransaction(client, identity);
         await client.query("COMMIT");
-        report.push({ tapeId, dryRun: false, applied });
+        report.push({ tapeId: identity.tapeId, dryRun: false, applied });
       } catch (error) {
         await client.query("ROLLBACK").catch(() => undefined);
         throw error;
@@ -443,7 +581,7 @@ async function main(): Promise<void> {
     console.log(JSON.stringify({
       dryRun: !args.execute,
       database: dbName,
-      tapes: unique,
+      tapes: unique.map((identity) => identity.tapeId),
       report,
     }, null, 2));
     if (!args.execute) {

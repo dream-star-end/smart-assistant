@@ -1,7 +1,7 @@
 import { AlertTriangle } from "lucide-react";
 import { Component, type ErrorInfo, type ReactNode } from "react";
 
-type Props = { children: ReactNode; onRetry?: () => void };
+type Props = { children: ReactNode; onRetry?: () => void; resetKey?: string };
 type State = { failed: boolean };
 
 /** Last-resort list boundary. Per-message MessageBoundary still owns single-row faults. */
@@ -14,6 +14,12 @@ export class SessionTimelineBoundary extends Component<Props, State> {
 
   componentDidCatch(error: unknown, info: ErrorInfo) {
     console.error("[SessionTimelineBoundary] 会话时间线渲染失败", error, info.componentStack);
+  }
+
+  componentDidUpdate(prevProps: Props) {
+    if (this.props.resetKey !== prevProps.resetKey && this.state.failed) {
+      this.setState({ failed: false });
+    }
   }
 
   render() {

@@ -80,6 +80,66 @@ async function getTimeline(handlers: Array<[string, unknown]>) {
   return backend.getClientSession(SESSION_ID, USER_ID, { view: "timeline" });
 }
 
+async function readPage(
+  handlers: Array<[string, unknown]>,
+  cursor: Parameters<ReturnType<typeof createPgSessionsBackend>["readClientTimelinePage"]>[2] = null,
+  limit = 1,
+) {
+  resetTapeDisplayDegradeLogForTests();
+  const backend = createPgSessionsBackend(fakePool(handlers), { expectedGeneration: 0 });
+  return backend.readClientTimelinePage(SESSION_ID, USER_ID, cursor, limit);
+}
+
+function pagingMessages() {
+  const hidden = Array.from({ length: 8 }, (_, i) => ({
+    id: `rt-${i}`,
+    role: "runtime-event",
+    text: "hidden-runtime",
+    ts: 110 + i,
+    _seq: 2 + i,
+    _orderSeq: 2 + i,
+  }));
+  return [
+    {
+      id: "user-old",
+      role: "user",
+      text: "更旧的用户消息，分页必须还能翻到",
+      ts: 1,
+      _seq: 1,
+      _orderSeq: 1,
+    },
+    ...hidden,
+    {
+      id: "tape-anchor",
+      role: "assistant",
+      text: FIRST_SENTENCE,
+      ts: 200,
+      _seq: 20,
+      _orderSeq: 20,
+      _turnTapeComplete: true,
+      _turnTapeId: "tape-failed",
+      _turnTapeSha256: TAPE_SHA,
+    },
+  ];
+}
+
+function pagingHandlers(): Array<[string, unknown]> {
+  const messages = pagingMessages();
+  return [
+    ["SELECT messages,archived_through_seq,history_revision,timeline_generation", {
+      rows: [{
+        messages: JSON.stringify(messages),
+        archived_through_seq: 0,
+        history_revision: "1",
+        timeline_generation: "1",
+      }],
+    }],
+    ["t.materialization_status, t.finalized_at::text, t.visible_head", { rows: [] }],
+    ["WITH requested(tape_id,before_ordinal)", { rows: [] }],
+    ["WITH selected(tape_id,ordinal)", { rows: [] }],
+  ];
+}
+
 function baseHandlers(over: {
   headerRows?: unknown[];
   headRows?: unknown[];
@@ -292,4 +352,22 @@ test("tape hash mismatch degrades to visible_head without throwing", async () =>
   }));
   assert.equal(got?.messages.find((m) => m.role === "assistant")?.text, FULL_TEXT);
   assert.equal(got?.messages.find((m) => m.role === "assistant")?._displayDegradeReason, "tape_hash_mismatch");
+});
+
+test("fallback tape plus hidden runtime-events still pages to older messages", async () => {
+  const handlers = pagingHandlers();
+  const first = await readPage(handlers, null, 1);
+  assert.ok(first);
+  assert.equal(first.hasMore, true);
+  assert.ok(first.nextCursor);
+  assert.equal(
+    first.messages.some((m) => m.role === "assistant" && m._displayDegraded === true),
+    true,
+  );
+  assert.equal(first.messages.some((m) => m.id === "user-old"), false);
+
+  const second = await readPage(handlers, first.nextCursor, 1);
+  assert.ok(second);
+  assert.equal(second.messages.some((m) => m.id === "user-old"), true);
+  assert.equal(second.messages.find((m) => m.id === "user-old")?.text, "更旧的用户消息，分页必须还能翻到");
 });
