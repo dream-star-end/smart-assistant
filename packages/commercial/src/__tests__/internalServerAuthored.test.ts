@@ -227,21 +227,23 @@ describe("internalServerAuthored handler — lossless v2 multipart", () => {
     assert.equal(JSON.parse(finalRes.rec.body).recordCount, 1);
   });
 
-  test("rejects a part that still carries finalize.settlement; accepts the stripped part", async () => {
-    const bytes = Buffer.from("hi", "utf8");
+  test("accepts and discards legacy settlement on part while keeping the part schema strict", async () => {
+    const bytes = Buffer.from("legacy-part", "utf8");
     const sha = createHash("sha256").update(bytes).digest("hex");
-    const turnKey = "a".repeat(64);
-    const tapeId = "b".repeat(64);
-    const staged: Buffer[] = [];
+    let staged = 0;
+    let finalized = 0;
     const handler = makeServerAuthoredHandler({
       identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
       storage: fakeStorage(async () => ({ applied: true })),
       losslessTurnTapeStorage: {
-        async stageLosslessTurnTapePart(_userId, _body, payload) {
-          staged.push(Buffer.from(payload));
+        async stageLosslessTurnTapePart(_userId, body, payload) {
+          staged++;
+          assert.ok(!("settlement" in body));
+          assert.deepEqual(payload, bytes);
           return { applied: "stored" };
         },
         async finalizeLosslessTurnTape() {
+          finalized++;
           return { applied: "finalized", recordCount: 1, engineBillings: [] };
         },
       },
@@ -253,8 +255,8 @@ describe("internalServerAuthored handler — lossless v2 multipart", () => {
       agentId: "main",
       turnIndex: 1,
       status: "completed",
-      turnKey,
-      tapeId,
+      turnKey: "a".repeat(64),
+      tapeId: "b".repeat(64),
       tapeSha256: sha,
       totalBytes: bytes.length,
       partCount: 1,
@@ -263,25 +265,40 @@ describe("internalServerAuthored handler — lossless v2 multipart", () => {
       data: bytes.toString("base64"),
       createdAt: 1_783_944_000_000,
     };
-    const polluted = {
-      ...part,
-      settlement: {
-        billingAnchorId: "anchor-1",
-        engineBillings: [],
-        text: "",
-        ts: 1_783_944_000_000,
-      },
+    const settlement = {
+      billingAnchorId: "srv-web-test1-main-t1-s0",
+      requestId: "request-legacy-part",
+      engineBillings: [],
+      text: "already-rendered answer",
+      ts: part.createdAt,
     };
-    const bad = makeRes();
-    await handler(makeReq({ body: JSON.stringify(polluted), auth: `Bearer ${VALID_TOKEN}` }), bad.res, CTX);
-    assert.equal(bad.rec.status, 400);
-    assert.equal(JSON.parse(bad.rec.body).error.code, "INVALID_TURN_TAPE_PART");
-    assert.equal(staged.length, 0);
 
-    const ok = makeRes();
-    await handler(makeReq({ body: JSON.stringify(part), auth: `Bearer ${VALID_TOKEN}` }), ok.res, CTX);
-    assert.equal(ok.rec.status, 200);
-    assert.equal(staged.length, 1);
+    const accepted = makeRes();
+    await handler(
+      makeReq({
+        body: JSON.stringify({ ...part, settlement }),
+        auth: `Bearer ${VALID_TOKEN}`,
+      }),
+      accepted.res,
+      CTX,
+    );
+    assert.equal(accepted.rec.status, 200);
+    assert.equal(staged, 1);
+    assert.equal(finalized, 0);
+
+    const rejected = makeRes();
+    await handler(
+      makeReq({
+        body: JSON.stringify({ ...part, settlement, unexpectedPartField: true }),
+        auth: `Bearer ${VALID_TOKEN}`,
+      }),
+      rejected.res,
+      CTX,
+    );
+    assert.equal(rejected.rec.status, 400);
+    assert.equal(JSON.parse(rejected.rec.body).error.code, "INVALID_TURN_TAPE_PART");
+    assert.equal(staged, 1);
+    assert.equal(finalized, 0);
   });
 
   test("does not ACK a finalized paid tape until durable Codex billing settles", async () => {

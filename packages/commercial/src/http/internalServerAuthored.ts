@@ -2208,23 +2208,29 @@ const LosslessTapeBaseSchema = z.object({
   attemptNo: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
 });
 
+const LosslessTapeSettlementSchema = z.object({
+  billingAnchorId: z.string().min(1).max(256),
+  requestId: z.string().min(1).max(256).optional(),
+  engineBillings: z.array(z.record(z.string(), z.unknown())).default([]),
+  text: z.string(),
+  ts: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  errorCode: z.string().min(1).max(256).optional(),
+}).strict();
+
 const LosslessTapePartSchema = LosslessTapeBaseSchema.extend({
   action: z.literal("part"),
   partIndex: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
   partSha256: z.string().regex(LOSSLESS_TURN_TAPE_SHA256_RE),
   data: z.string().min(1),
+  // Rolling compatibility for gateways that accidentally copied the finalize-only
+  // settlement object onto each part. It is strictly validated and discarded below;
+  // only the finalize action may hand settlement authority to storage/billing.
+  settlement: LosslessTapeSettlementSchema.optional(),
 }).strict();
 
 const LosslessTapeFinalizeSchema = LosslessTapeBaseSchema.extend({
   action: z.literal("finalize"),
-  settlement: z.object({
-    billingAnchorId: z.string().min(1).max(256),
-    requestId: z.string().min(1).max(256).optional(),
-    engineBillings: z.array(z.record(z.string(), z.unknown())).default([]),
-    text: z.string(),
-    ts: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
-    errorCode: z.string().min(1).max(256).optional(),
-  }).strict().optional(),
+  settlement: LosslessTapeSettlementSchema.optional(),
 }).strict();
 
 function isLosslessTurnTapeWireBody(raw: unknown): boolean {
@@ -2296,7 +2302,8 @@ async function handleLosslessTurnTapeRequest(args: {
       sendJsonError(args.res, 400, "INVALID_TURN_TAPE_PART", "turn tape part schema rejected", args.requestId);
       return;
     }
-    const body = parsed.data as LosslessTurnTapePartRequest;
+    const { settlement: _ignoredFinalizeOnlySettlement, ...partData } = parsed.data;
+    const body = partData as LosslessTurnTapePartRequest;
     if (
       body.partCount !== Math.ceil(body.totalBytes / LOSSLESS_TURN_TAPE_PART_BYTES)
       || body.partIndex >= body.partCount
