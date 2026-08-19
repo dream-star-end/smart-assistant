@@ -36,8 +36,11 @@ import {
   cursorModelFamily,
   planCursorQuotaUpdates,
   renderQuotaClassSidecar,
+  uniqueCursorAccountIdFromSlotResults,
   type CursorQuotaClass,
 } from "./cursorQuota.js";
+
+export { uniqueCursorAccountIdFromSlotResults };
 
 const log = rootLogger.child({ subsys: "cursor-auth-sync" });
 
@@ -300,6 +303,16 @@ export function startCursorAuthSyncActor(opts: { intervalMs?: number } = {}): { 
       }
     },
   };
+}
+
+export async function resolveUsedCursorAccountId(
+  slotResults: unknown,
+  now: Date = new Date(),
+): Promise<bigint | null> {
+  const results = asCursorSlotResults(slotResults);
+  if (results.length === 0) return null;
+  const rows = eligibleCursorRows(await listAccounts({ provider: "cursor", limit: 500 }), now);
+  return uniqueCursorAccountIdFromSlotResults(rows, results);
 }
 
 export async function applyLearnedCursorQuota(opts: {

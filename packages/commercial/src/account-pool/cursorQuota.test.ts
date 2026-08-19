@@ -5,11 +5,13 @@ import {
   asCursorSlotResults,
   coerceSlotFail,
   cursorModelFamily,
+  cursorRowForSlot,
   nextCursorQuotaClass,
   parseCursorSlotResults,
   parseQuotaClassSidecar,
   planCursorQuotaUpdates,
   renderQuotaClassSidecar,
+  uniqueCursorAccountIdFromSlotResults,
 } from "./cursorQuota.js";
 
 describe("cursorQuota", () => {
@@ -42,6 +44,21 @@ describe("cursorQuota", () => {
     assert.deepEqual(asCursorSlotResults([{ slot: 2, result: "ok" }, { slot: 0, result: "ok" }, "x"]), [
       { slot: 2, result: "ok" },
     ]);
+  });
+
+  test("maps a unique 1-based slot to the eligible account id and refuses to guess", () => {
+    const rows = [{ id: 3n }, { id: 5n }, { id: 6n }];
+    assert.equal(cursorRowForSlot(rows, 2)?.id, 5n);
+    assert.equal(uniqueCursorAccountIdFromSlotResults(rows, [{ slot: 2, result: "ok" }]), 5n);
+    assert.equal(uniqueCursorAccountIdFromSlotResults(rows, [{ slot: 1, result: "fail" }]), 3n);
+    assert.equal(uniqueCursorAccountIdFromSlotResults(rows, [{ slot: 2, result: "ok" }, { slot: 2, result: "ok" }]), 5n);
+    assert.equal(uniqueCursorAccountIdFromSlotResults(rows, []), null);
+    assert.equal(uniqueCursorAccountIdFromSlotResults(rows, null), null);
+    assert.equal(uniqueCursorAccountIdFromSlotResults(rows, [{ slot: 9, result: "ok" }]), null);
+    assert.equal(
+      uniqueCursorAccountIdFromSlotResults(rows, [{ slot: 1, result: "fail_auth" }, { slot: 3, result: "ok" }]),
+      null,
+    );
   });
 
   test("parses wrapper slot_result lines only", () => {

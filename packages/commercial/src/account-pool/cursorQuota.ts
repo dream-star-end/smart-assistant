@@ -73,6 +73,33 @@ export function asCursorSlotResults(raw: unknown): CursorSlotResult[] {
   return out;
 }
 
+/** 1-based oc-cursor slot → eligible row (id-ascending materializer order). */
+export function cursorRowForSlot<T>(rows: readonly T[], slot: number): T | undefined {
+  if (!Number.isInteger(slot) || slot < 1) return undefined;
+  return rows[slot - 1];
+}
+
+/**
+ * Map wrapper slotResults onto eligible cursor rows.
+ * Returns the account id only when every reported slot lands on the same row.
+ * Missing results, out-of-range slots, or multiple distinct accounts → null.
+ */
+export function uniqueCursorAccountIdFromSlotResults(
+  rows: ReadonlyArray<{ id: bigint }>,
+  slotResults: unknown,
+): bigint | null {
+  const results = asCursorSlotResults(slotResults);
+  if (results.length === 0) return null;
+  let found: bigint | null = null;
+  for (const item of results) {
+    const row = cursorRowForSlot(rows, item.slot);
+    if (!row) return null;
+    if (found === null) found = row.id;
+    else if (found !== row.id) return null;
+  }
+  return found;
+}
+
 export function planCursorQuotaUpdates(
   rows: Array<{ id: bigint; cursor_quota_class: CursorQuotaClass }>,
   results: CursorSlotResult[],
@@ -82,7 +109,7 @@ export function planCursorQuotaUpdates(
   if (family === "cursor_models" || results.length === 0) return [];
   const planned = new Map<string, { id: bigint; from: CursorQuotaClass; to: CursorQuotaClass }>();
   for (const item of results) {
-    const row = rows[item.slot - 1];
+    const row = cursorRowForSlot(rows, item.slot);
     if (!row) continue;
     const kind = coerceSlotFail(item.result, terminalCode);
     const next = nextCursorQuotaClass(row.cursor_quota_class, kind, family);

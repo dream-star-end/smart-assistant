@@ -105,7 +105,7 @@ import {
 } from "../billing/zcodeExternalAudit.js";
 import { recordProductFrictionEvent } from "../productFriction/events.js";
 import { maybeUpdateAccountQuotaCodex } from "../account-pool/quota.js";
-import { applyLearnedCursorQuota } from "../account-pool/cursorMaterializer.js";
+import { applyLearnedCursorQuota, resolveUsedCursorAccountId } from "../account-pool/cursorMaterializer.js";
 import { OutboundRingBuffer, DEFAULT_RING_CONFIG } from "@openclaude/gateway";
 import {
   AUTOMATIC_TURN_RETRY_MAX,
@@ -6320,6 +6320,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                     modelId = existing.rows[0]?.model_id ?? null;
                     sessionId = existing.rows[0]?.session_id ?? sessionId;
                   }
+                  let cursorAccountId: bigint | null = null;
+                  try {
+                    cursorAccountId = await resolveUsedCursorAccountId(external.cursorSlotResults);
+                  } catch (resolveErr) {
+                    bridgeLog?.warn('user-chat-bridge: Cursor account attribution failed', { requestId, err: resolveErr });
+                  }
                   if (modelId !== null) {
                     try {
                       await applyLearnedCursorQuota({
@@ -6346,6 +6352,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                       engineStatus: status,
                       terminalCode,
                       usage,
+                      accountId: cursorAccountId,
                     });
                     if (settled === null) {
                       bridgeLog?.warn('user-chat-bridge: Cursor settle skipped, model pricing not in cache', { requestId, modelId });

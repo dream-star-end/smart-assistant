@@ -59,6 +59,30 @@ export function planCursorExternalSettle(args: {
   return { settleStatus, costCredits, snapshotJson };
 }
 
+async function bumpCursorAccountUsageCounts(
+  pool: Pool,
+  accountId: bigint,
+  success: boolean,
+): Promise<void> {
+  // Stats-only. Do NOT call health.onSuccess/onFailure: those mutate
+  // health_score / last_error / status / cooldown and can drop a key from
+  // the cursor materializer whitelist.
+  await pool.query(
+    success
+      ? `UPDATE claude_accounts
+            SET success_count = success_count + 1,
+                last_used_at = NOW(),
+                updated_at = NOW()
+          WHERE id = $1 AND provider = 'cursor'`
+      : `UPDATE claude_accounts
+            SET fail_count = fail_count + 1,
+                last_used_at = NOW(),
+                updated_at = NOW()
+          WHERE id = $1 AND provider = 'cursor'`,
+    [accountId.toString()],
+  );
+}
+
 export async function settleCursorExternalUsage(args: {
   pool: Pool;
   pricing: PricingCache;
@@ -69,6 +93,8 @@ export async function settleCursorExternalUsage(args: {
   engineStatus: CursorEngineStatus;
   terminalCode?: string | null;
   usage: unknown;
+  /** Eligible cursor pool row actually used this turn; null if unknown. */
+  accountId?: bigint | null;
 }): Promise<SettleResult | null> {
   const pricing = args.pricing.get(args.modelId);
   if (pricing === null) return null;
@@ -79,9 +105,10 @@ export async function settleCursorExternalUsage(args: {
     pricing,
     terminalCode: args.terminalCode ?? null,
   });
-  return settleUsageAndLedger(args.pool, {
+  const accountId = args.accountId ?? null;
+  const settled = await settleUsageAndLedger(args.pool, {
     userId: args.userId,
-    accountId: null,
+    accountId,
     requestId: args.requestId,
     model: args.modelId,
     usage,
@@ -90,4 +117,12 @@ export async function settleCursorExternalUsage(args: {
     status: plan.settleStatus,
     sessionId: args.sessionId,
   });
+  if (accountId !== null) {
+    try {
+      await bumpCursorAccountUsageCounts(args.pool, accountId, plan.settleStatus === "success");
+    } catch {
+      // usage_records.account_id already committed; counts are best-effort.
+    }
+  }
+  return settled;
 }
