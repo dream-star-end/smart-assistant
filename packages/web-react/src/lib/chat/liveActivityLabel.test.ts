@@ -3,6 +3,7 @@ import {
   LIVE_ACTIVITY_FALLBACK,
   LIVE_ACTIVITY_LABELS,
   formatLiveActivityAction,
+  mappedLiveActivityLabel,
 } from "./liveActivityLabel";
 
 describe("formatLiveActivityAction（活动行只显示中文动作，不堆工具名/路径/参数）", () => {
@@ -86,5 +87,13 @@ describe("formatLiveActivityAction（活动行只显示中文动作，不堆工�
       expect(LIVE_ACTIVITY_LABELS as readonly string[]).toContain(label);
       expect(label).not.toMatch(/StrReplace|Bash|TaskUpdate|\//);
     }
+  });
+
+  test("mappedLiveActivityLabel 只映射裸工具名", () => {
+    expect(mappedLiveActivityLabel("StrReplace")).toBe("写入文件");
+    expect(mappedLiveActivityLabel("TaskUpdate")).toBe("更新任务");
+    expect(mappedLiveActivityLabel("Task")).toBe("运行子任务");
+    expect(mappedLiveActivityLabel("Frobnicate")).toBeNull();
+    expect(mappedLiveActivityLabel("CallMcpTool")).toBeNull();
   });
 });

@@ -101,6 +101,11 @@ function labelForToken(token: string): LiveActivityLabel | null {
   return TOOL_ACTIVITY_LABEL[key] ?? null;
 }
 
+/** Map a bare tool name to a category label. Unknown names return null (unlike formatLiveActivityAction). */
+export function mappedLiveActivityLabel(toolName: string): LiveActivityLabel | null {
+  return labelForToken(toolName);
+}
+
 /**
  * Collapse a working-detail / progress hint to a category action label.
  * Empty input stays empty so the typing row can fall through to 「思考中」.

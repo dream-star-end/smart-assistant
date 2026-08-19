@@ -573,6 +573,46 @@ export function clampStr(s: string, max: number): string {
   return s.length > max ? s.slice(0, max) + "…" : s;
 }
 
+const INTERNAL_SUBTASK_MARKERS =
+  /(?:^|\n)\s*(?:description|prompt|subagentType|subagent_type)\s*[:=]|\/(?:home|opt|root|usr)\/|HOME=|uid=\d|You are |\bOpenClaude\b|subagentType\s*[:=]/i;
+
+const EXTRA_OPAQUE_ARG_TOOLS = new Set([
+  "callmcptool",
+  "call_mcp_tool",
+  "getmcptools",
+  "get_mcp_tools",
+  "fetchmcpresource",
+  "fetch_mcp_resource",
+]);
+
+/** True when a title looks like an internal prompt, command, path, or JSON dump. */
+export function looksLikeInternalToolPrompt(text: string): boolean {
+  const s = text.trim();
+  if (!s) return true;
+  if (/[\r\n]/.test(s)) return true;
+  if (s.length > 80) return true;
+  if (s.startsWith("{") || s.startsWith("[")) return true;
+  return INTERNAL_SUBTASK_MARKERS.test(s);
+}
+
+/** Short user-facing Task/Agent title. Never falls back to the raw `prompt`. */
+export function safeSubtaskDescription(input: Record<string, unknown> | null | undefined): string {
+  const desc = asStr(input?.description).replace(/\s+/g, " ").trim();
+  if (!desc || looksLikeInternalToolPrompt(desc)) return "";
+  return clampStr(desc, 60);
+}
+
+/** Cursor Task-shaped input that would otherwise dump prompt + subagentType JSON. */
+export function isInternalSubtaskInput(input: Record<string, unknown> | null | undefined): boolean {
+  if (!input) return false;
+  if (!asStr(input.prompt)) return false;
+  return "subagentType" in input || "subagent_type" in input || !!asStr(input.description);
+}
+
+export function isOpaqueArgToolName(name: string): boolean {
+  return EXTRA_OPAQUE_ARG_TOOLS.has(name.trim().replace(/-/g, "_").toLowerCase());
+}
+
 // ── legacy Bash 包装剥离(展示层兜底)─────────────────────────────────────────
 //
 // 权威剥壳在后端 runner 的发射时刻(gateway codexAppServerRunner.stripShellWrapper,

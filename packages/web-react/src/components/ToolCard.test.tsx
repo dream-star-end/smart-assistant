@@ -1134,6 +1134,143 @@ describe("subAgentActivity 卡(含存量孤儿形状)", () => {
   });
 });
 
+describe("Task / Agent 子任务卡不回显 prompt 与 JSON 参数", () => {
+  const internalPrompt = [
+    "You are running inside OpenClaude",
+    "uid=3 HOME=/home/agent",
+    "host 'cmd'",
+    "/opt/openclaude/openclaude-v5-selfhost",
+    "目标: 实现会话显示层根治修复",
+  ].join("\n");
+
+  test("展开体只保留短标题，不含 prompt / subagentType / 路径", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "Task",
+          inputJson: {
+            description: "实现会话显示层根治修复",
+            prompt: internalPrompt,
+            subagentType: { unspecified: {} },
+          },
+          _completed: false,
+        }}
+      />,
+    );
+    expect(screen.getByText("子任务")).toBeInTheDocument();
+    expect(screen.getByText("运行中")).toBeInTheDocument();
+    expect(screen.getAllByText("实现会话显示层根治修复").length).toBeGreaterThanOrEqual(1);
+    const text = document.body.textContent || "";
+    expect(text).not.toContain("You are running inside OpenClaude");
+    expect(text).not.toContain("subagentType");
+    expect(text).not.toContain("unspecified");
+    expect(text).not.toContain("/opt/openclaude");
+    expect(text).not.toContain("HOME=");
+    expect(text).not.toContain("uid=3");
+    expect(text).not.toContain("host 'cmd'");
+  });
+
+  test("失败结果仍可展开查看，且不泄漏内部 prompt", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "Task",
+          inputJson: {
+            description: "调研登录流程",
+            prompt: "INTERNAL_PROMPT_MARKER /home/agent/secret.env",
+            subagentType: { unspecified: {} },
+          },
+          output: "子任务失败: 模型超时",
+          error: true,
+          _completed: true,
+        }}
+      />,
+    );
+    expect(screen.getByText("失败")).toBeInTheDocument();
+    expect(screen.getByText(/子任务失败: 模型超时/)).toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("INTERNAL_PROMPT_MARKER");
+  });
+
+  test("折叠交互仍可用", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "Agent",
+          inputJson: { description: "调研登录流程", prompt: "secret-agent-prompt" },
+          output: "最终结论：根因在 reducer",
+          _completed: true,
+        }}
+      />,
+    );
+    expect(screen.queryByText("最终结论：根因在 reducer")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByText("最终结论：根因在 reducer")).toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("secret-agent-prompt");
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.queryByText("最终结论：根因在 reducer")).not.toBeInTheDocument();
+  });
+});
+
+describe("GenericBody 对 Cursor 原始 args 走活动行标签，不删结果", () => {
+  test("TaskUpdate 不回显 JSON 参数，仍显示输出", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "TaskUpdate",
+          inputJson: { id: "OCV5-1", body: "secret-update-payload", merge: true },
+          output: "updated",
+          _completed: true,
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getAllByText("更新任务").length).toBeGreaterThanOrEqual(1);
+    expect(screen.queryByText("运行子任务")).not.toBeInTheDocument();
+    expect(screen.getByText("updated")).toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("secret-update-payload");
+    expect(document.body.textContent).not.toContain("OCV5-1");
+  });
+
+  test("StrReplace 不回显绝对路径和 diff 参数；Write 结果卡仍保留路径", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "StrReplace",
+          inputJson: {
+            path: "/home/agent/work/display-hardening/packages/commercial/src/db/pgSessionsBackend.ts",
+            old_string: "OLD_SNIPPET_MARKER",
+            new_string: "NEW_SNIPPET_MARKER",
+          },
+          output: "ok",
+          _completed: true,
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getAllByText("写入文件").length).toBeGreaterThanOrEqual(1);
+    expect(document.body.textContent).not.toContain("pgSessionsBackend.ts");
+    expect(document.body.textContent).not.toContain("OLD_SNIPPET_MARKER");
+    expect(screen.getByText("ok")).toBeInTheDocument();
+  });
+
+  test("Write 真正的结果卡仍显示内容，不改成纯动作标签", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "Write",
+          inputJson: { file_path: "/tmp/openclaude/demo.ts", content: "export const x = 1;" },
+          output: "wrote file",
+          _completed: true,
+        }}
+      />,
+    );
+    expect(screen.getByText("写入文件")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button"));
+    expect(document.querySelector("pre")?.textContent).toContain("export const x = 1;");
+    expect(screen.getByText("wrote file")).toBeInTheDocument();
+  });
+});
+
 describe("codex 通用卡 KvList 噪音字段", () => {
   test("appContext/error/null durationMs 不进 KvList,业务字段保留", () => {
     render(

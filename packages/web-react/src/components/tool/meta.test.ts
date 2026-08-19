@@ -446,3 +446,38 @@ describe("subAgentActivity meta + 存量孤儿归一化", () => {
     expect(d.name).toBe("Bash");
   });
 });
+
+describe("子任务摘要不回退到 prompt", () => {
+  test("Task 只用安全 description，不用 prompt", () => {
+    expect(
+      toolSummary("Task", {
+        description: "实现会话显示层根治修复",
+        prompt: "You are running inside OpenClaude\n/opt/secret",
+      }),
+    ).toBe("实现会话显示层根治修复");
+    expect(
+      toolSummary("Agent", {
+        prompt: "You are a coding assistant at /home/agent",
+        subagentType: { unspecified: {} },
+      }),
+    ).toBe("");
+  });
+
+  test("Cursor 未登记工具名走活动行中文标签", () => {
+    expect(resolveToolMeta("StrReplace").label).toBe("写入文件");
+    expect(resolveToolMeta("TaskUpdate").label).toBe("更新任务");
+    expect(resolveToolMeta("AwaitShell").label).toBe("执行 Shell");
+    expect(resolveToolMeta("Frobnicate").label).toBe("Frobnicate");
+  });
+
+  test("delegate_task 不再把内部 prompt 当摘要", () => {
+    expect(
+      toolSummary("delegate_task", {
+        agentId: "coder",
+        goal: "You are running inside OpenClaude\nuid=3",
+        prompt: "FULL_INTERNAL_PROMPT",
+      }),
+    ).toBe("→ coder");
+    expect(toolSummary("delegate_task", { agentId: "coder", goal: "修显示层" })).toBe("→ coder 修显示层");
+  });
+});

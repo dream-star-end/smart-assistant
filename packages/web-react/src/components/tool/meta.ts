@@ -44,7 +44,8 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { agentDisplayName } from "../chat/agentNames";
-import { asArr, asStr, detectShellFileWrites, parseCodexTypeName, shortPath, stripShellWrapperForDisplay } from "./format";
+import { mappedLiveActivityLabel } from "../../lib/chat/liveActivityLabel";
+import { asArr, asStr, detectShellFileWrites, parseCodexTypeName, safeSubtaskDescription, shortPath, stripShellWrapperForDisplay } from "./format";
 
 /** 工具卡图标底色语义(对齐设计稿 aurora-conversation-cards 的 .tic.tn-* 分色)。 */
 export type ToolTone = "accent" | "success" | "info" | "warning" | "neutral";
@@ -473,6 +474,8 @@ export function resolveToolMeta(
     if (srvMeta) return { icon: srvMeta.icon, label: `${srvMeta.label}: ${opLabel}`, tone: srvMeta.tone };
     return { icon: Wrench, label: opLabel, tone: "neutral" };
   }
+  const mapped = mappedLiveActivityLabel(name);
+  if (mapped) return { icon: Wrench, label: mapped, tone: "neutral" };
   return { icon: Wrench, label: name, tone: "neutral" };
 }
 
@@ -528,16 +531,17 @@ export function toolSummary(name: string, input: Record<string, unknown> | null)
       return shortPath(input.notebook_path);
     case "Task":
     case "Agent":
-      return (asStr(input.description) || asStr(input.prompt)).slice(0, 60);
+      return safeSubtaskDescription(input);
     case "Skill":
       return asStr(input.skill) || asStr(input.name);
-    case "delegate_task":
+    case "delegate_task": {
       // 委派目标经系统 agent 映射转显示名(hidden-reviewer 等管理 API 隐藏的 agent 无 displayName)。
-      return `${input.agentId ? `→ ${agentDisplayName(asStr(input.agentId))} ` : ""}${(
-        asStr(input.goal) ||
-        asStr(input.message) ||
-        asStr(input.prompt)
-      ).slice(0, 60)}`;
+      const target = input.agentId ? `→ ${agentDisplayName(asStr(input.agentId))} ` : "";
+      const title = safeSubtaskDescription({
+        description: asStr(input.goal) || asStr(input.message),
+      });
+      return `${target}${title}`.trim();
+    }
     case "AskUserQuestion": {
       const qs = asArr(input.questions);
       const first = qs[0] && typeof qs[0] === "object"
@@ -595,7 +599,10 @@ function mcpSummary(server: string, op: string, input: Record<string, unknown>):
     if (op === "delegate_task" || op === "send_to_agent") {
       // 同 toolSummary 的 delegate_task:系统 agent(如 hidden-reviewer)显示映射名而非裸 id。
       const tgt = input.agentId ? `→ ${agentDisplayName(asStr(input.agentId))} ` : "";
-      return `${tgt}${(asStr(input.goal) || asStr(input.message) || asStr(input.prompt)).slice(0, 60)}`;
+      const title = safeSubtaskDescription({
+        description: asStr(input.goal) || asStr(input.message),
+      });
+      return `${tgt}${title}`.trim();
     }
     if (op === "skill_view" || op === "skill_delete" || op === "skill_save") return asStr(input.name);
     if (op === "skill_search") return asStr(input.query);

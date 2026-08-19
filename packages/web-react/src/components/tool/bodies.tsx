@@ -15,14 +15,18 @@ import { renderSkillListCard, renderSkillSearchCard, renderSkillViewCard } from 
 import { renderDelegateFanoutCard } from "./delegateFanoutCard";
 import { renderMcpResourcesCard } from "./mcpResourceCards";
 import { useToolCardActions } from "./context";
+import { formatLiveActivityAction, mappedLiveActivityLabel } from "../../lib/chat/liveActivityLabel";
 import {
   asArr,
   asStr,
   clampStr,
   detectShellFileWrites,
   formatValue,
+  isInternalSubtaskInput,
+  isOpaqueArgToolName,
   isSafeHttpUrl,
   parseCodexTypeName,
+  safeSubtaskDescription,
   shortPath,
   stripShellWrapperForDisplay,
   type ToolLike,
@@ -818,17 +822,9 @@ function MemoryBody({ op, input, tool }: BodyProps & { op: string }) {
     body = card ?? <KvList obj={input} />;
     suppressOutput = !!card;
   } else if (op === "delegate_task" || op === "send_to_agent") {
-    body = (
-      <KvList
-        obj={{
-          agent: input?.agentId,
-          goal: input?.goal,
-          message: input?.message,
-          prompt: input?.prompt,
-          context: input?.context,
-        }}
-      />
-    );
+    const title =
+      safeSubtaskDescription({ description: asStr(input?.goal) || asStr(input?.message) }) || "运行子任务";
+    body = <div className="mt-1.5 text-xs text-muted">{title}</div>;
   } else {
     body = <KvList obj={input} />;
   }
@@ -1034,10 +1030,30 @@ function ScanSciBody({ op, input, tool }: BodyProps & { op: string }) {
   );
 }
 
-function GenericBody({ input, tool }: BodyProps) {
+function TaskBody({ input, tool }: BodyProps) {
+  const title = safeSubtaskDescription(input) || "运行子任务";
   return (
     <>
-      {input && typeof input === "object" && <KvList obj={input} />}
+      <div className="mt-1.5 text-xs text-muted">{title}</div>
+      <OutputBlock output={tool.output} />
+    </>
+  );
+}
+
+function GenericBody({ name, input, tool }: BodyProps & { name: string }) {
+  const mapped = mappedLiveActivityLabel(name);
+  const hideArgs = !!mapped || isOpaqueArgToolName(name) || isInternalSubtaskInput(input);
+  const isSubtask = isInternalSubtaskInput(input) || /^(task|agent)$/i.test(name);
+  const summary = isSubtask
+    ? safeSubtaskDescription(input) || "运行子任务"
+    : mapped || formatLiveActivityAction(name) || "执行操作";
+  return (
+    <>
+      {hideArgs ? (
+        <div className="mt-1.5 text-xs text-muted">{summary}</div>
+      ) : (
+        input && typeof input === "object" && <KvList obj={input} />
+      )}
       <OutputBlock output={tool.output} />
     </>
   );
@@ -1067,6 +1083,11 @@ export function ToolBody({ name, input, tool }: { name: string; input: Input; to
       return <WebFetchBody input={input} tool={tool} />;
     case "WebSearch":
       return <WebSearchBody input={input} tool={tool} />;
+    case "Task":
+    case "Agent":
+    case "TaskOutput":
+    case "TaskStop":
+      return <TaskBody input={input} tool={tool} />;
   }
   const codexType = parseCodexTypeName(name);
   if (codexType) return <CodexBody type={codexType} input={input} tool={tool} />;
@@ -1084,5 +1105,5 @@ export function ToolBody({ name, input, tool }: { name: string; input: Input; to
       if (card) return card;
     }
   }
-  return <GenericBody input={input} tool={tool} />;
+  return <GenericBody name={name} input={input} tool={tool} />;
 }
