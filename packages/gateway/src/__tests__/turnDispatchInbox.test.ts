@@ -250,6 +250,11 @@ describe('reconcile 身份对账 ring(§4 决策表输入)', () => {
     recordRecentTerminal(session, 'cm-c', 'crashed')
     // completed → turn_completed 分支
     assert.equal(lookupRecentTerminal(session, 'cm-a'), 'completed')
+    assert.equal(
+      lookupRecentTerminal(session, 'cm-a', { masterAuthoritative: true }),
+      undefined,
+      'commercial container must defer finality to master PG',
+    )
     // 中断类 → interrupted 分支
     assert.equal(lookupRecentTerminal(session, 'cm-b'), 'interrupted')
     assert.equal(lookupRecentTerminal(session, 'cm-c'), 'crashed')

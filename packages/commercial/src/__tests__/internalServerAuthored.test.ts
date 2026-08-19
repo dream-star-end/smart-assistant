@@ -38,6 +38,7 @@ import {
   LOSSLESS_TURN_TAPE_VERSION,
   type LosslessTurnTapeFinalizeRequest,
   type LosslessTurnTapePartRequest,
+  type LosslessTurnTapeVisibleRequest,
 } from "@openclaude/protocol";
 
 // ─── tiny test fixtures ─────────────────────────────────────────────────
@@ -299,6 +300,72 @@ describe("internalServerAuthored handler — lossless v2 multipart", () => {
     assert.equal(JSON.parse(rejected.rec.body).error.code, "INVALID_TURN_TAPE_PART");
     assert.equal(staged, 1);
     assert.equal(finalized, 0);
+  });
+
+  test("visible action commits and broadcasts authoritative final before any part", async () => {
+    const broadcasts: Array<{ uid: bigint; payload: Record<string, unknown> }> = [];
+    let staged = 0;
+    const handler = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: fakeStorage(async () => ({ applied: true })),
+      losslessTurnTapeStorage: {
+        async commitVisibleLosslessTurnTape(_userId, body) {
+          assert.equal(body.action, "visible");
+          return {
+            applied: "finalized",
+            recordCount: 0,
+            engineBillings: [],
+            settlementHandoff: true,
+            newlyVisible: true,
+            clientMessageId: "cm-visible-1",
+          };
+        },
+        async stageLosslessTurnTapePart() {
+          staged++;
+          return { applied: "stored" };
+        },
+        async finalizeLosslessTurnTape() {
+          return { applied: "finalized", recordCount: 0, engineBillings: [] };
+        },
+      },
+      broadcastToUser(uid, payload) {
+        broadcasts.push({ uid, payload });
+      },
+    });
+    const body: LosslessTurnTapeVisibleRequest = {
+      protocolVersion: LOSSLESS_TURN_TAPE_VERSION,
+      action: "visible",
+      sessionId: "web-test1",
+      agentId: "main",
+      turnIndex: 1,
+      status: "completed",
+      turnKey: "a".repeat(64),
+      tapeId: "b".repeat(64),
+      tapeSha256: "c".repeat(64),
+      totalBytes: 2,
+      partCount: 1,
+      createdAt: 1_783_944_000_000,
+      dispatchId: "3e0a2b52-9d31-4c8f-9b6e-000000000010",
+      attemptNo: 1,
+      settlement: {
+        billingAnchorId: "srv-web-test1-main-t1",
+        engineBillings: [],
+        text: "visible answer",
+        ts: 1_783_944_000_000,
+      },
+    };
+    const out = makeRes();
+    await handler(makeReq({ body: JSON.stringify(body), auth: `Bearer ${VALID_TOKEN}` }), out.res, CTX);
+    assert.equal(out.rec.status, 200);
+    assert.equal(staged, 0, "visible commit must not depend on multipart staging");
+    assert.equal(broadcasts.length, 1);
+    assert.equal(broadcasts[0]!.uid, 42n);
+    assert.equal(broadcasts[0]!.payload.isFinal, true);
+    assert.equal(
+      (broadcasts[0]!.payload.meta as { reconcile?: string }).reconcile,
+      "turn_completed",
+    );
+    assert.equal(broadcasts[0]!.payload.clientMessageId, "cm-visible-1");
   });
 
   test("does not ACK a finalized paid tape until durable Codex billing settles", async () => {

@@ -866,7 +866,13 @@ export function recordRecentTerminal(
 export function lookupRecentTerminal(
   session: AgentSession,
   clientMessageId: string,
+  options: { masterAuthoritative?: boolean } = {},
 ): 'completed' | 'interrupted' | 'crashed' | undefined {
+  // Commercial/V5 finality belongs to master PG. The container ring only
+  // knows the engine ended; it cannot prove visible_at committed. Returning
+  // unknown makes the host bridge perform the authoritative PG reconcile and
+  // prevents a synthetic completed frame from erasing an unpersisted answer.
+  if (options.masterAuthoritative) return undefined
   return session._recentTerminalRing?.find((e) => e.clientMessageId === clientMessageId)?.outcome
 }
 

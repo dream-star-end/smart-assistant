@@ -15,6 +15,8 @@ export const LOSSLESS_TURN_TAPE_CAPABILITY = 'lossless-turn-tape-v2' as const
  * an older master can parse v2 tapes but cannot hydrate this storage format. */
 export const LOSSLESS_TURN_TAPE_RUNTIME_BATCH_CAPABILITY = 'lossless-turn-runtime-batch-v1' as const
 export const LOSSLESS_TURN_TAPE_PART_BYTES = 192 * 1024
+/** Compact visible envelope budget; full text remains in canonical parts. */
+export const LOSSLESS_TURN_TAPE_VISIBLE_TEXT_BYTES = 128 * 1024
 export const LOSSLESS_TURN_TAPE_SHA256_RE = /^[0-9a-f]{64}$/
 /** Reserved envelope identity used only when upgrading a pre-agentId v1
  * retry entry to the v2 tape protocol. Materialization maps it back to the
@@ -93,7 +95,35 @@ export interface LosslessTurnTapeSettlement {
   engineBillings: DurableCodexBilling[]
   text: string
   ts: number
+  /** Visible head is clipped; canonical multipart bytes still contain the full text. */
+  truncated?: boolean
   errorCode?: string
+}
+
+/**
+ * Small, independently acknowledged visibility commit. It deliberately
+ * precedes multipart upload so a broken/slow part path cannot make a completed
+ * answer disappear. Master commits the visible head + terminal dispatch from
+ * this envelope; parts/finalize remain the lossless audit/materialization path.
+ */
+export interface LosslessTurnTapeVisibleRequest {
+  protocolVersion: typeof LOSSLESS_TURN_TAPE_VERSION
+  action: 'visible'
+  sessionId: string
+  agentId: string
+  turnIndex: number
+  status: 'completed' | 'interrupted' | 'crashed'
+  waiveReason?: TurnWaiveReason
+  model?: string
+  turnKey: string
+  tapeId: string
+  tapeSha256: string
+  totalBytes: number
+  partCount: number
+  createdAt: number
+  dispatchId?: string
+  attemptNo?: number
+  settlement: LosslessTurnTapeSettlement
 }
 
 export interface LosslessTurnTapeFinalizeRequest {
@@ -156,5 +186,6 @@ export function losslessBillingAnchorId(input: {
 }
 
 export type LosslessTurnTapeRequest =
+  | LosslessTurnTapeVisibleRequest
   | LosslessTurnTapePartRequest
   | LosslessTurnTapeFinalizeRequest

@@ -87,8 +87,11 @@ function decodeCapturedTape(captures: Capture[]): {
   payload: Record<string, any>;
 } {
   const envelopes = captures.map((capture) => JSON.parse(capture.body) as Record<string, any>);
+  const visibles = envelopes.filter((envelope) => envelope.action === "visible");
   const parts = envelopes.filter((envelope) => envelope.action === "part");
   const finalizes = envelopes.filter((envelope) => envelope.action === "finalize");
+  assert.equal(visibles.length, 1);
+  assert.equal(envelopes[0]?.action, "visible", "visible commit must precede every multipart part");
   assert.equal(finalizes.length, 1);
   assert.equal(parts.length, finalizes[0]!.partCount);
   parts.sort((a, b) => a.partIndex - b.partIndex);
@@ -197,6 +200,7 @@ describe("lossless v2 turn tape", () => {
       [...iterateLosslessTurnTapeParts(first)],
       [...iterateLosslessTurnTapeParts(second)],
     );
+    assert.deepEqual(first.visible, second.visible);
     assert.deepEqual(first.finalize, second.finalize);
   });
 
@@ -214,6 +218,8 @@ describe("lossless v2 turn tape", () => {
       assert.equal(part.dispatchId, "3e0a2b52-9d31-4c8f-9b6e-000000000001");
       assert.equal(part.attemptNo, 2);
     }
+    assert.equal(withDispatch.visible.dispatchId, "3e0a2b52-9d31-4c8f-9b6e-000000000001");
+    assert.equal(withDispatch.visible.attemptNo, 2);
     assert.equal(withDispatch.finalize.dispatchId, "3e0a2b52-9d31-4c8f-9b6e-000000000001");
     assert.equal(withDispatch.finalize.attemptNo, 2);
     // 身份是信封元数据,canonical 本体语义不因信封补齐而改(payload 自身字段决定 canonical)。
@@ -222,6 +228,7 @@ describe("lossless v2 turn tape", () => {
     // legacy(无身份)payload:信封不得出现 undefined 字段污染既有形状。
     const legacy = buildLosslessTurnTapeRequests({ ...PAYLOAD, createdAt: 123, turnKey: "d".repeat(64) });
     assert.ok(!("dispatchId" in [...iterateLosslessTurnTapeParts(legacy)][0]!));
+    assert.ok(!("dispatchId" in legacy.visible));
     assert.ok(!("dispatchId" in legacy.finalize));
   });
 
@@ -232,6 +239,8 @@ describe("lossless v2 turn tape", () => {
       waiveReason: "platform_authority_expired",
       usage: { model: "kimi-k3-ark" },
     });
+    assert.equal(tape.visible.waiveReason, "platform_authority_expired");
+    assert.equal(tape.visible.model, "kimi-k3-ark");
     assert.equal(tape.finalize.waiveReason, "platform_authority_expired");
     assert.equal(tape.finalize.model, "kimi-k3-ark");
     assert.ok([...iterateLosslessTurnTapeParts(tape)].every(
@@ -252,6 +261,8 @@ describe("lossless v2 turn tape", () => {
       dispatchId: "3e0a2b52-9d31-4c8f-9b6e-000000000002",
       attemptNo: 1,
     });
+    assert.equal("settlement" in tape.visible, true);
+    assert.equal(typeof tape.visible.settlement, "object");
     assert.equal("settlement" in tape.finalize, true);
     assert.equal(typeof tape.finalize.settlement, "object");
     const parts = [...iterateLosslessTurnTapeParts(tape)];
@@ -279,7 +290,7 @@ describe("readV3MasterSinkConfig", () => {
 });
 
 describe("attemptSend — multipart upload", () => {
-  test("uploads every part then finalize with no semantic cap", async () => {
+  test("commits visible before every part, then uploads every part and finalize", async () => {
     const { fetcher, captures } = makeFetcher({ status: 200, body: '{"ok":true}' });
     const payload: V3MasterSinkPayload = {
       ...PAYLOAD,
@@ -316,6 +327,11 @@ describe("attemptSend — multipart upload", () => {
     assert.equal(decoded.envelopes.at(-1)!.action, "finalize");
     assert.equal(decoded.payload.text, payload.text);
     assert.equal(decoded.payload.thinkingText, payload.thinkingText);
+    const visible = decoded.envelopes[0]!;
+    assert.equal(visible.action, "visible");
+    assert.equal(visible.settlement.truncated, true);
+    assert.ok(Buffer.byteLength(visible.settlement.text, "utf8") <= 128 * 1024);
+    assert.ok(Buffer.byteLength(captures[0]!.body, "utf8") < 192 * 1024);
     assert.deepEqual(decoded.payload.tools, payload.tools);
     assert.deepEqual(decoded.payload.agentGroups, payload.agentGroups);
   });

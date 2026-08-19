@@ -2,7 +2,11 @@
  * Visible-head helpers for lossless turn finalize decoupling (design rev2/rev3).
  */
 import { createHash } from "node:crypto";
-import type { DurableCodexBilling, LosslessTurnTapeFinalizeRequest } from "@openclaude/protocol";
+import type {
+  DurableCodexBilling,
+  LosslessTurnTapeFinalizeRequest,
+  LosslessTurnTapeVisibleRequest,
+} from "@openclaude/protocol";
 import {
   losslessBillingAnchorId,
   type LosslessTurnTapeSettlement,
@@ -53,7 +57,7 @@ export function settlementAuthorityHash(input: {
 }
 
 export function visibleHeadFromSettlement(
-  request: LosslessTurnTapeFinalizeRequest,
+  request: LosslessTurnTapeFinalizeRequest | LosslessTurnTapeVisibleRequest,
   settlement: LosslessTurnTapeSettlement,
   clientMessageId?: string | null,
 ): VisibleHead {
@@ -65,12 +69,12 @@ export function visibleHeadFromSettlement(
     messageId: settlement.billingAnchorId,
     ...(clientMessageId ? { clientMessageId } : {}),
     errorCode: settlement.errorCode ?? null,
-    ...(clipped.truncated ? { truncated: true } : {}),
+    ...(settlement.truncated || clipped.truncated ? { truncated: true } : {}),
   };
 }
 
 export function visibleHeadFallback(
-  request: LosslessTurnTapeFinalizeRequest,
+  request: LosslessTurnTapeFinalizeRequest | LosslessTurnTapeVisibleRequest,
   text: string,
   clientMessageId?: string | null,
 ): VisibleHead {

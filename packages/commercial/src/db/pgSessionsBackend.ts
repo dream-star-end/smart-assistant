@@ -69,6 +69,7 @@ import {
   type DurableCodexBilling,
   type LosslessTurnTapeFinalizeRequest,
   type LosslessTurnTapePartRequest,
+  type LosslessTurnTapeVisibleRequest,
   type SessionWorkspaceMode,
 } from "@openclaude/protocol";
 import {
@@ -973,6 +974,10 @@ export type LosslessTurnTapeFinalizeResult =
       dispatchLateTape?: boolean;
       settlementHandoff?: boolean;
       settlementHeld?: boolean;
+      /** True only for the transaction that first published visible_at. */
+      newlyVisible?: boolean;
+      /** Exact browser turn identity; present for durable webchat dispatches. */
+      clientMessageId?: string;
     }
   | { applied: "session_not_found" | "session_deleted" | "incomplete" };
 
@@ -1110,6 +1115,10 @@ async function convergeDispatchOnFinalize(
 }
 
 export interface LosslessTurnTapeStorage {
+  commitVisibleLosslessTurnTape?(
+    userId: string,
+    request: LosslessTurnTapeVisibleRequest,
+  ): Promise<LosslessTurnTapeFinalizeResult>;
   stageLosslessTurnTapePart(
     userId: string,
     request: LosslessTurnTapePartRequest,
@@ -2227,7 +2236,7 @@ function sameLosslessTurnTapeHeader(
   tape: Pick<LosslessTurnTapeHeaderRow,
     "agent_id" | "turn_index" | "status" | "turn_key" | "tape_sha256" |
     "total_bytes" | "part_count" | "created_at" | "waive_reason">,
-  request: LosslessTurnTapeFinalizeRequest,
+  request: LosslessTurnTapeFinalizeRequest | LosslessTurnTapeVisibleRequest,
 ): boolean {
   return tape.agent_id === request.agentId &&
     tape.turn_index === request.turnIndex &&
@@ -6280,7 +6289,8 @@ async function readBoundedLiveFrameText(
 export async function commitVisibleLosslessTurnPhaseA(
   pool: Pool,
   userId: string,
-  request: LosslessTurnTapeFinalizeRequest,
+  request: LosslessTurnTapeFinalizeRequest | LosslessTurnTapeVisibleRequest,
+  options: { enqueueMaterialization?: boolean } = {},
 ): Promise<LosslessTurnTapeFinalizeResult> {
   const billingUserId = /^c:[1-9][0-9]*$/.test(userId)
     ? numericCommercialUserId(userId)
@@ -6310,6 +6320,34 @@ export async function commitVisibleLosslessTurnPhaseA(
     ).rows[0];
     if (!session) return { applied: "session_not_found" };
     if (session.deleted_at !== null) return { applied: "session_deleted" };
+    if ((request.dispatchId === undefined) !== (request.attemptNo === undefined)) {
+      throw new Error("lossless turn tape dispatch identity is incomplete");
+    }
+    // A small visibility header is durable before the first multipart part.
+    // ON CONFLICT is followed by a full immutable-header comparison below.
+    await client.query(
+      `INSERT INTO client_session_turn_tapes
+         (session_id,user_id,tape_id,agent_id,turn_index,status,turn_key,tape_sha256,
+          total_bytes,part_count,created_at,waive_reason,dispatch_id,attempt_no)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+       ON CONFLICT (session_id,user_id,tape_id) DO NOTHING`,
+      [
+        request.sessionId,
+        userId,
+        request.tapeId,
+        request.agentId,
+        request.turnIndex,
+        request.status,
+        request.turnKey,
+        request.tapeSha256,
+        request.totalBytes,
+        request.partCount,
+        request.createdAt,
+        request.waiveReason ?? null,
+        request.dispatchId ?? null,
+        request.attemptNo ?? null,
+      ],
+    );
     const tape = (
       await client.query<{
         agent_id: string;
@@ -6327,10 +6365,11 @@ export async function commitVisibleLosslessTurnPhaseA(
         billing_anchor_id: string | null;
         settlement_hash: string | null;
         dispatch_id: string | null;
+        attempt_no: number | null;
       }>(
         `SELECT agent_id,turn_index,status,turn_key,tape_sha256,total_bytes,part_count,created_at,
                 waive_reason,visible_at::text,finalized_at::text,engine_billings,billing_anchor_id,
-                settlement_hash,dispatch_id
+                settlement_hash,dispatch_id,attempt_no
            FROM client_session_turn_tapes
           WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
           FOR UPDATE`,
@@ -6340,6 +6379,13 @@ export async function commitVisibleLosslessTurnPhaseA(
     if (!tape) return { applied: "incomplete" };
     if (!sameLosslessTurnTapeHeader(tape, request)) {
       throw new Error("lossless turn tape finalize header conflict");
+    }
+    if (
+      request.dispatchId !== undefined && (
+        tape.dispatch_id !== request.dispatchId || tape.attempt_no !== request.attemptNo
+      )
+    ) {
+      throw new Error("lossless turn tape dispatch identity conflict");
     }
     const settlement = request.settlement;
     const engineBillings = settlement
@@ -6396,11 +6442,20 @@ export async function commitVisibleLosslessTurnPhaseA(
         const convergence = await convergeDispatchOnFinalize(client, tape.dispatch_id, tape.status);
         replayLate = convergence.lateTape;
       }
+      if (options.enqueueMaterialization !== false && tape.finalized_at === null) {
+        await enqueueMaterializationJob(client, {
+          sessionId: request.sessionId,
+          userId,
+          tapeId: request.tapeId,
+          dispatchId: tape.dispatch_id,
+        });
+      }
       return {
         applied: tape.finalized_at !== null ? "idempotent" : "finalized",
         recordCount: 0,
         engineBillings,
         settlementHandoff: true,
+        ...(clientMessageId ? { clientMessageId } : {}),
         ...(replayLate ? { dispatchLateTape: true, settlementHeld: true } : {}),
       };
     }
@@ -6489,12 +6544,14 @@ export async function commitVisibleLosslessTurnPhaseA(
         ],
       );
     }
-    await enqueueMaterializationJob(client, {
-      sessionId: request.sessionId,
-      userId,
-      tapeId: request.tapeId,
-      dispatchId: tape.dispatch_id,
-    });
+    if (options.enqueueMaterialization !== false) {
+      await enqueueMaterializationJob(client, {
+        sessionId: request.sessionId,
+        userId,
+        tapeId: request.tapeId,
+        dispatchId: tape.dispatch_id,
+      });
+    }
     const holdReason = fenced ? "late_tape_after_fence" : "awaiting_materialization";
     if (engineBillings.length > 0) {
       await enqueueSettlementJob(client, {
@@ -6540,6 +6597,8 @@ export async function commitVisibleLosslessTurnPhaseA(
       recordCount: 0,
       engineBillings,
       settlementHandoff: true,
+      newlyVisible: true,
+      ...(clientMessageId ? { clientMessageId } : {}),
       ...(lateTape || fenced ? { settlementHeld: true } : {}),
       ...(lateTape ? { dispatchLateTape: true } : {}),
     };
@@ -6600,6 +6659,15 @@ export function createPgSessionsBackend(
   const finalizeSingleflight = _createFinalizeSingleflight<LosslessTurnTapeFinalizeResult>();
 
   const backend: PgSessionsBackend = {
+    async commitVisibleLosslessTurnTape(
+      userId: string,
+      request: LosslessTurnTapeVisibleRequest,
+    ): Promise<LosslessTurnTapeFinalizeResult> {
+      return commitVisibleLosslessTurnPhaseA(pool, userId, request, {
+        enqueueMaterialization: false,
+      });
+    },
+
     async admitUserTurn(input: AdmitUserTurnInput): Promise<AdmitUserTurnResult> {
       try {
         return await withTx(pool, async (client): Promise<AdmitUserTurnResult> => {

@@ -59,12 +59,14 @@ import { createHash } from 'node:crypto'
 import {
   LOSSLESS_TURN_TAPE_LEGACY_AGENT_ID,
   LOSSLESS_TURN_TAPE_PART_BYTES,
+  LOSSLESS_TURN_TAPE_VISIBLE_TEXT_BYTES,
   LOSSLESS_TURN_TAPE_VERSION,
   losslessBillingAnchorId,
   type DurableAgentGroup,
   type DurableCodexBilling,
   type LosslessTurnTapeFinalizeRequest,
   type LosslessTurnTapePartRequest,
+  type LosslessTurnTapeVisibleRequest,
   type TurnWaiveReason,
 } from '@openclaude/protocol'
 
@@ -345,6 +347,16 @@ export function serializeLosslessTurnPayload(value: unknown): Buffer {
   return Buffer.from(json, 'utf8')
 }
 
+function clipVisibleSettlementText(text: string): { text: string; truncated: boolean } {
+  const bytes = Buffer.from(text, 'utf8')
+  if (bytes.length <= LOSSLESS_TURN_TAPE_VISIBLE_TEXT_BYTES) {
+    return { text, truncated: false }
+  }
+  let end = LOSSLESS_TURN_TAPE_VISIBLE_TEXT_BYTES
+  while (end > 0 && (bytes[end] & 0xc0) === 0x80) end -= 1
+  return { text: bytes.subarray(0, end).toString('utf8'), truncated: true }
+}
+
 export function deriveLosslessTurnKey(payload: V3MasterSinkWirePayload): string {
   if (payload.turnKey && /^[0-9a-f]{64}$/.test(payload.turnKey)) return payload.turnKey
   return sha256(`oc-turn-v2\0${payload.sessionId}\0${payload.agentId ?? 'legacy'}\0${payload.turnIndex}`)
@@ -353,7 +365,7 @@ export function deriveLosslessTurnKey(payload: V3MasterSinkWirePayload): string 
 export function buildLosslessTurnTapeRequests(
   payload: V3MasterSinkWirePayload & { agentId: string },
   now: () => number = Date.now,
-): { finalize: LosslessTurnTapeFinalizeRequest; canonical: Buffer } {
+): { visible: LosslessTurnTapeVisibleRequest; finalize: LosslessTurnTapeFinalizeRequest; canonical: Buffer } {
   const createdAt = payload.createdAt ?? now()
   const turnKey = deriveLosslessTurnKey(payload)
   const canonical = serializeLosslessTurnPayload({ ...payload, createdAt, turnKey })
@@ -397,15 +409,21 @@ export function buildLosslessTurnTapeRequests(
     tools: payload.tools,
     agentGroups: payload.agentGroups,
   })
+  const visibleText = clipVisibleSettlementText(payload.text)
   const settlement = {
     billingAnchorId,
     ...(payload.engineBilling?.requestId ? { requestId: payload.engineBilling.requestId } : {}),
     engineBillings,
-    text: payload.text,
+    text: visibleText.text,
     ts: createdAt,
+    ...(visibleText.truncated ? { truncated: true } : {}),
     ...(typeof payload.errorCode === 'string' ? { errorCode: payload.errorCode } : {}),
   }
-  return { finalize: { ...base, action: 'finalize', settlement }, canonical }
+  return {
+    visible: { ...base, action: 'visible', settlement },
+    finalize: { ...base, action: 'finalize', settlement },
+    canonical,
+  }
 }
 
 /** Yield one base64 envelope at a time. Production never retains an array of
@@ -433,7 +451,7 @@ export function* iterateLosslessTurnTapeParts(
 }
 
 async function postLosslessTurnTapeEnvelope(
-  envelope: LosslessTurnTapePartRequest | LosslessTurnTapeFinalizeRequest,
+  envelope: LosslessTurnTapePartRequest | LosslessTurnTapeVisibleRequest | LosslessTurnTapeFinalizeRequest,
   deps: AttemptSendDeps,
 ): Promise<{ settlementHandoff?: boolean }> {
   const fetcher = deps.fetcher ?? undiciRequest
@@ -628,10 +646,18 @@ export async function attemptSendLossless(
   deps: AttemptSendDeps,
 ): Promise<{ settlementHandoff?: boolean }> {
   const tape = buildLosslessTurnTapeRequests(payload, deps.now)
+  // Visibility is a separate, compact Phase A. It must ACK before the first
+  // large part is attempted: strict-schema drift, a slow upload, or a process
+  // replacement can delay audit materialization, but can no longer erase the
+  // already completed answer from REST/refresh.
+  const visibleAck = await postLosslessTurnTapeEnvelope(tape.visible, deps)
   for (const part of iterateLosslessTurnTapeParts(tape)) {
     await postLosslessTurnTapeEnvelope(part, deps)
   }
-  return postLosslessTurnTapeEnvelope(tape.finalize, deps)
+  const finalizeAck = await postLosslessTurnTapeEnvelope(tape.finalize, deps)
+  return visibleAck.settlementHandoff || finalizeAck.settlementHandoff
+    ? { settlementHandoff: true }
+    : {}
 }
 
 /**

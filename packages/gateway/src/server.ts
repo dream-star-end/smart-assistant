@@ -14503,7 +14503,9 @@ export class Gateway {
         if (session._runningClientMessageId === inFlightCmid) {
           // no-op:该 turn 仍在飞,前端会收到重播的流式帧。
         } else {
-          const outcome = lookupRecentTerminal(session, inFlightCmid)
+          const outcome = lookupRecentTerminal(session, inFlightCmid, {
+            masterAuthoritative: readV3MasterSinkConfig() !== null,
+          })
           // 合成帧一律携带 clientMessageId(reducer 按 exact id 归属;绝不误清别的 user 行)。
           const basePeer = { id: peerId, kind: 'dm' as const }
           try {

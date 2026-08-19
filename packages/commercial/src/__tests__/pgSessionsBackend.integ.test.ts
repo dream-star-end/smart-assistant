@@ -6968,6 +6968,89 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     assert.ok(!live.some((r) => r.dispatchId === d2.dispatchId), "活会话的 dispatch 不得被会话亡臂误伤");
   });
 
+  maybe("visible precommit closes display before the first multipart part", async () => {
+    const sessionId = "s-dd-visible-precommit";
+    const clientMessageId = "cm-dd-visible-precommit";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId: CUSER }));
+    const admit = await backend.admitUserTurn(
+      admitInput({ sessionId, clientMessageId }),
+    );
+    assert.equal(admit.kind, "admitted");
+    const d = (admit as { dispatch: { dispatchId: string } }).dispatch;
+    const tape = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 11,
+      status: "completed",
+      turnKey: "7".repeat(64),
+      text: "visible before any part",
+      createdAt: 1_783_950_050_000,
+    });
+    assert.ok(backend.commitVisibleLosslessTurnTape);
+    const visible = await backend.commitVisibleLosslessTurnTape(CUSER, {
+      ...tape.finalize,
+      action: "visible",
+      dispatchId: d.dispatchId,
+      attemptNo: 1,
+      settlement: {
+        billingAnchorId: `srv-${sessionId}-main-t11`,
+        engineBillings: [],
+        text: "visible before any part",
+        ts: 1_783_950_050_000,
+      },
+    });
+    assert.equal(visible.applied, "finalized");
+    assert.equal(visible.newlyVisible, true);
+    assert.equal(visible.clientMessageId, clientMessageId);
+
+    const partCount = Number((await pool.query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM client_session_turn_tape_parts
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+      [sessionId, CUSER, tape.finalize.tapeId],
+    )).rows[0]!.n);
+    assert.equal(partCount, 0, "display commit must not read or stage multipart bytes");
+    const materializationJobs = Number((await pool.query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM turn_tape_materialization_jobs
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+      [sessionId, CUSER, tape.finalize.tapeId],
+    )).rows[0]!.n);
+    assert.equal(materializationJobs, 0, "materialization waits until every part is staged");
+
+    const hydrated = await backend.getClientSession(sessionId, CUSER);
+    assert.equal(
+      (hydrated!.messages as MessageLike[]).find((m) => m.role === "assistant")?.text,
+      "visible before any part",
+    );
+    const dispatch = await getDispatch(pool, d.dispatchId);
+    assert.equal(dispatch!.status, "terminal");
+    assert.equal(dispatch!.outcome, "completed");
+
+    for (const part of tape.parts) {
+      await backend.stageLosslessTurnTapePart(CUSER, part.request, part.bytes, {
+        dispatchId: d.dispatchId,
+        attemptNo: 1,
+      });
+    }
+    const afterParts = await backend.finalizeLosslessTurnTape(CUSER, {
+      ...tape.finalize,
+      dispatchId: d.dispatchId,
+      attemptNo: 1,
+      settlement: {
+        billingAnchorId: `srv-${sessionId}-main-t11`,
+        engineBillings: [],
+        text: "visible before any part",
+        ts: 1_783_950_050_000,
+      },
+    }, { materialize: false });
+    assert.equal(afterParts.applied, "finalized");
+    const jobsAfterParts = Number((await pool.query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM turn_tape_materialization_jobs
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+      [sessionId, CUSER, tape.finalize.tapeId],
+    )).rows[0]!.n);
+    assert.equal(jobsAfterParts, 1, "parts-ready finalize hands the tape to Phase B");
+  });
+
   maybe("finalize 收敛(§2.4):tape header 带 dispatch 身份 → dispatch terminal(outcome=tape.status)", async () => {
     await backend.upsertClientSession(mkSession({ id: "s-dd-conv-2", userId: CUSER }));
     const admit = await backend.admitUserTurn(

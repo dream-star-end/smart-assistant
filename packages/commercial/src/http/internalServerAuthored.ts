@@ -68,6 +68,7 @@ import {
   type DurableCodexBilling,
   type LosslessTurnTapeFinalizeRequest,
   type LosslessTurnTapePartRequest,
+  type LosslessTurnTapeVisibleRequest,
   type TurnWaiveReason,
 } from "@openclaude/protocol";
 import type { DispatchAdmissionBackend, LosslessTurnTapeStorage } from "../db/pgSessionsBackend.js";
@@ -2214,6 +2215,7 @@ const LosslessTapeSettlementSchema = z.object({
   engineBillings: z.array(z.record(z.string(), z.unknown())).default([]),
   text: z.string(),
   ts: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  truncated: z.boolean().optional(),
   errorCode: z.string().min(1).max(256).optional(),
 }).strict();
 
@@ -2224,8 +2226,13 @@ const LosslessTapePartSchema = LosslessTapeBaseSchema.extend({
   data: z.string().min(1),
   // Rolling compatibility for gateways that accidentally copied the finalize-only
   // settlement object onto each part. It is strictly validated and discarded below;
-  // only the finalize action may hand settlement authority to storage/billing.
+  // only visible/finalize may hand settlement authority to storage/billing.
   settlement: LosslessTapeSettlementSchema.optional(),
+}).strict();
+
+const LosslessTapeVisibleSchema = LosslessTapeBaseSchema.extend({
+  action: z.literal("visible"),
+  settlement: LosslessTapeSettlementSchema,
 }).strict();
 
 const LosslessTapeFinalizeSchema = LosslessTapeBaseSchema.extend({
@@ -2295,6 +2302,77 @@ async function handleLosslessTurnTapeRequest(args: {
     return;
   }
   const action = (args.raw as Record<string, unknown>).action;
+  if (action === "visible") {
+    const parsed = LosslessTapeVisibleSchema.safeParse(args.raw);
+    if (!parsed.success) {
+      args.metric("reject_bad_body");
+      sendJsonError(args.res, 400, "INVALID_TURN_TAPE_VISIBLE", "turn tape visible schema rejected", args.requestId);
+      return;
+    }
+    if (!args.storage.commitVisibleLosslessTurnTape) {
+      sendJsonError(args.res, 503, "TURN_TAPE_VISIBLE_UNAVAILABLE", "visible commit store unavailable", args.requestId);
+      return;
+    }
+    const body = parsed.data as unknown as LosslessTurnTapeVisibleRequest;
+    if (body.partCount !== Math.ceil(body.totalBytes / LOSSLESS_TURN_TAPE_PART_BYTES)) {
+      args.metric("reject_bad_body");
+      sendJsonError(args.res, 400, "INVALID_TURN_TAPE_LAYOUT", "turn tape visible layout rejected", args.requestId);
+      return;
+    }
+    try {
+      const result = await args.storage.commitVisibleLosslessTurnTape(args.userId, body);
+      if (result.applied === "session_not_found") {
+        sendJsonError(args.res, 404, "SESSION_NOT_FOUND", "no client_sessions row for sessionId+userId", args.requestId);
+        return;
+      }
+      if (result.applied === "session_deleted") {
+        sendJsonError(args.res, 410, "SESSION_DELETED", "client_sessions row is soft-deleted", args.requestId);
+        return;
+      }
+      if (result.applied !== "finalized" && result.applied !== "idempotent") {
+        throw new Error("visible commit failed to create immutable tape header");
+      }
+      if (result.newlyVisible && result.clientMessageId && !result.dispatchLateTape) {
+        args.broadcastToUser?.(args.numericUserId, {
+          type: "outbound.message",
+          channel: "webchat",
+          peer: { id: body.sessionId, kind: "dm" },
+          agentId: body.agentId,
+          clientMessageId: result.clientMessageId,
+          blocks: [],
+          isFinal: true,
+          meta: {
+            reconcile: body.status === "completed" ? "turn_completed" : "interrupted",
+            clientMessageId: result.clientMessageId,
+          },
+          ts: Date.now(),
+        });
+      }
+      args.metric(result.applied === "idempotent" ? "deduped" : "ok", "assistant");
+      sendJsonOk(args.res, 200, {
+        ok: true,
+        idempotent: result.applied === "idempotent",
+        visible: true,
+        settlementHandoff: true,
+      }, args.requestId);
+      return;
+    } catch (err) {
+      const transient = isTransientTurnTapeStorageError(err);
+      args.userLog.error("lossless_turn_tape_visible_failed", {
+        tapeId: body.tapeId,
+        transient,
+        err: err as Error,
+      });
+      sendJsonError(
+        args.res,
+        transient ? 503 : 409,
+        transient ? "TURN_TAPE_RETRYABLE" : "TURN_TAPE_CONFLICT",
+        transient ? "turn tape visible storage transient failure" : "turn tape visible immutable conflict",
+        args.requestId,
+      );
+      return;
+    }
+  }
   if (action === "part") {
     const parsed = LosslessTapePartSchema.safeParse(args.raw);
     if (!parsed.success) {
@@ -2503,6 +2581,22 @@ async function handleLosslessTurnTapeRequest(args: {
             });
           }
         }
+      }
+      if (result.newlyVisible && result.clientMessageId && !result.dispatchLateTape) {
+        args.broadcastToUser?.(args.numericUserId, {
+          type: "outbound.message",
+          channel: "webchat",
+          peer: { id: body.sessionId, kind: "dm" },
+          agentId: body.agentId,
+          clientMessageId: result.clientMessageId,
+          blocks: [],
+          isFinal: true,
+          meta: {
+            reconcile: body.status === "completed" ? "turn_completed" : "interrupted",
+            clientMessageId: result.clientMessageId,
+          },
+          ts: Date.now(),
+        });
       }
       args.metric(result.applied === "idempotent" ? "deduped" : "ok", "assistant");
       sendJsonOk(args.res, 200, {

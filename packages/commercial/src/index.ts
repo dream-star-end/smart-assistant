@@ -430,6 +430,7 @@ import { makeContainerDispatchClient } from "./dispatch/containerDispatchClient.
 import {
   resolveDispatchStuckThresholdMs,
   startTurnDispatchReconciler,
+  buildTurnDispatchReconcileFrame,
   runShutdownDispatchHandoff,
   DEFAULT_SHUTDOWN_HANDOFF_BUDGET_MS,
 } from "./dispatch/turnDispatchReconciler.js";
@@ -5667,19 +5668,11 @@ export async function registerCommercial(
             reconcile?: "turn_completed" | "interrupted" | "turn_state_unknown",
           ) => {
             try {
-              userChatBridge.broadcastToUser(uid, {
-                type: "outbound.message",
-                channel: "webchat",
-                peer: { id: sessionId, kind: "dm" },
+              userChatBridge.broadcastToUser(uid, buildTurnDispatchReconcileFrame({
+                sessionId,
                 clientMessageId,
-                isFinal: false,
-                meta: {
-                  reconcile: reconcile === "interrupted" || reconcile === "turn_completed"
-                    ? reconcile
-                    : "turn_state_unknown",
-                },
-                ts: Date.now(),
-              });
+                reconcile,
+              }));
             } catch {
               /* best-effort */
             }

@@ -10,6 +10,7 @@ import { describe, test } from 'node:test'
 import type { Pool } from 'pg'
 import {
   assessDispatchBilling,
+  buildTurnDispatchReconcileFrame,
   DEFAULT_ACCEPTED_STUCK_FLOOR_MS,
   expireAdmittedLeasesOnShutdown,
   MAX_ACCEPTED_STUCK_MS,
@@ -163,6 +164,32 @@ const noContainer = {
   rejectIfAbsent: async (): Promise<ContainerCallResult> => ({ kind: 'unreachable', detail: 'test' }),
   getDispatchState: async (): Promise<ContainerCallResult> => ({ kind: 'unreachable', detail: 'test' }),
 }
+
+describe('authoritative reconcile frame', () => {
+  test('terminal reconcile is final and exact-id; unknown stays non-final', () => {
+    const completed = buildTurnDispatchReconcileFrame({
+      sessionId: 'sess-0001',
+      clientMessageId: 'cm-1',
+      reconcile: 'turn_completed',
+    })
+    assert.equal(completed.isFinal, true)
+    assert.equal(completed.clientMessageId, 'cm-1')
+    assert.deepEqual(completed.meta, {
+      reconcile: 'turn_completed',
+      clientMessageId: 'cm-1',
+    })
+
+    const unknown = buildTurnDispatchReconcileFrame({
+      sessionId: 'sess-0001',
+      clientMessageId: 'cm-1',
+    })
+    assert.equal(unknown.isFinal, false)
+    assert.deepEqual(unknown.meta, {
+      reconcile: 'turn_state_unknown',
+      clientMessageId: 'cm-1',
+    })
+  })
+})
 
 describe('resolveDispatchStuckThresholdMs', () => {
   test('floor = max(codexMax*2, 90min); env only raises', () => {

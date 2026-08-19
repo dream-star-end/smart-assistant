@@ -51,6 +51,27 @@ import {
 
 export const DEFAULT_RECONCILE_INTERVAL_MS = 30_000
 export const MIN_INTERVAL_MS = 5_000
+
+export function buildTurnDispatchReconcileFrame(input: {
+  sessionId: string
+  clientMessageId: string
+  reconcile?: 'turn_completed' | 'interrupted' | 'turn_state_unknown'
+}): Record<string, unknown> {
+  const terminal = input.reconcile === 'turn_completed' || input.reconcile === 'interrupted'
+  return {
+    type: 'outbound.message',
+    channel: 'webchat',
+    peer: { id: input.sessionId, kind: 'dm' },
+    clientMessageId: input.clientMessageId,
+    isFinal: terminal,
+    meta: {
+      reconcile: terminal ? input.reconcile : 'turn_state_unknown',
+      clientMessageId: input.clientMessageId,
+    },
+    ts: Date.now(),
+  }
+}
+
 export const DEFAULT_LIMIT = 50
 
 let visibleOrphanScanOffset = 0
