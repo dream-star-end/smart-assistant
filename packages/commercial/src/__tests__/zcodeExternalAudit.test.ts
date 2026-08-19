@@ -15,14 +15,21 @@ import {
 } from "../billing/modelCatalog.js";
 import {
   ZCODE_AUDIT_MODEL_ID,
+  abortInsertedZcodeAudit,
+  applyZcodeFinalizeOutcome,
   closePendingZcodeAudits,
   closeZcodeAudit,
+  closeZcodeAuditWithRetry,
   insertPendingZcodeAudit,
+  reconcileStaleZcodeAudits,
+  rememberZcodePending,
+  zcodeAdmissionAbortTerminal,
   zcodeCleanupTerminal,
 } from "../billing/zcodeExternalAudit.js";
 import { parseCatalogResponse } from "@openclaude/gateway";
 
 const REQUEST_ID = "a".repeat(32);
+const instantClock = { sleep: async () => {} };
 
 function entry(
   over: Partial<ModelCatalogEntry> & Pick<ModelCatalogEntry, "entryId" | "modelId">,
@@ -82,7 +89,7 @@ function enabledZcodeSnapshot(): ModelCatalogSnapshot {
   });
 }
 
-function fakePool(handler: (sql: string, params: unknown[]) => { rowCount?: number; rows?: unknown[] }): Pool {
+function fakePool(handler: (sql: string, params: unknown[]) => { rowCount?: number; rows?: unknown[] } | Promise<{ rowCount?: number; rows?: unknown[] }>): Pool {
   return {
     query: async (sql: string, params: unknown[]) => handler(sql, params),
   } as unknown as Pool;
@@ -171,32 +178,145 @@ describe("zcode external audit helpers", () => {
       status: "success",
       terminalCode: null,
       durationMs: 12,
-      usage: { input_tokens: 3 },
+      usage: { inputTokens: 3 },
     });
-    assert.equal(closed, true);
+    assert.equal(closed, "closed");
     assert.match(calls[0]!.sql, /INSERT INTO zcode_external_usage_audit/);
     assert.match(calls[1]!.sql, /UPDATE zcode_external_usage_audit/);
+    assert.match(calls[1]!.sql, /status='pending'/);
     assert.doesNotMatch(calls.map((c) => c.sql).join("\n"), /cursor_external_usage_audit|settleCursor/);
     assert.deepEqual(calls[0]!.params, [REQUEST_ID, 4n, 88, "peer-1", ZCODE_AUDIT_MODEL_ID]);
     assert.equal(calls[1]!.params[1], "success");
   });
 
-  test("cancel/exception closes leftover pending rows", async () => {
+  test("seal null / frame too big / send throw abort pending immediately", async () => {
+    for (const step of ["seal_rejected", "frame_too_big", "send_failed"] as const) {
+      const pending = new Set<string>();
+      rememberZcodePending(pending, REQUEST_ID);
+      let updates = 0;
+      const pool = fakePool((sql) => {
+        if (sql.includes("UPDATE")) {
+          updates += 1;
+          return { rowCount: 1, rows: [] };
+        }
+        return { rowCount: 0, rows: [] };
+      });
+      const outcome = await abortInsertedZcodeAudit(pool, {
+        requestId: REQUEST_ID,
+        userId: 4n,
+        pending,
+        terminalCode: zcodeAdmissionAbortTerminal(step),
+        clock: instantClock,
+      });
+      assert.equal(outcome, "closed", step);
+      assert.equal(updates, 1, step);
+      assert.equal(pending.has(REQUEST_ID), false, step);
+    }
+  });
+
+  test("terminal UPDATE first failure then retry success only then drops the id", async () => {
+    const pending = new Set<string>([REQUEST_ID]);
+    let updates = 0;
+    const pool = fakePool((sql) => {
+      if (!sql.includes("UPDATE")) return { rowCount: 0, rows: [] };
+      updates += 1;
+      if (updates === 1) throw new Error("db down");
+      return { rowCount: 1, rows: [] };
+    });
+    const first = await closeZcodeAudit(pool, {
+      requestId: REQUEST_ID,
+      userId: 4n,
+      status: "success",
+      terminalCode: null,
+      durationMs: 4,
+      usage: null,
+    }).catch(() => "failed" as const);
+    assert.equal(first, "failed");
+    assert.equal(pending.has(REQUEST_ID), true);
+
+    const outcome = await closeZcodeAuditWithRetry(pool, {
+      requestId: REQUEST_ID,
+      userId: 4n,
+      status: "success",
+      terminalCode: null,
+      durationMs: 4,
+      usage: null,
+    }, instantClock);
+    applyZcodeFinalizeOutcome(pending, REQUEST_ID, outcome);
+    assert.equal(outcome, "closed");
+    assert.equal(pending.has(REQUEST_ID), false);
+    assert.ok(updates >= 2);
+  });
+
+  test("cleanup does not clear ids when the first DB close fails", async () => {
+    const pending = new Set<string>([REQUEST_ID]);
+    let updates = 0;
+    const pool = fakePool((sql) => {
+      if (!sql.includes("UPDATE")) return { rowCount: 0, rows: [{ status: "pending", user_id: 4n }] };
+      updates += 1;
+      if (updates === 1) throw new Error("db down");
+      return { rowCount: 1, rows: [] };
+    });
+    const closed = await closePendingZcodeAudits(pool, {
+      userId: 4n,
+      requestIds: [...pending],
+      terminalCode: zcodeCleanupTerminal("container_error"),
+      pending,
+      clock: instantClock,
+    });
+    assert.deepEqual(closed, [REQUEST_ID]);
+    assert.equal(pending.has(REQUEST_ID), false);
+    assert.ok(updates >= 2);
+  });
+
+  test("duplicate terminal is fail-closed idempotent and unknown stays pending", async () => {
+    const pending = new Set<string>([REQUEST_ID]);
+    const dupPool = fakePool((sql) => {
+      if (sql.includes("UPDATE")) return { rowCount: 0, rows: [] };
+      return { rowCount: 1, rows: [{ status: "success", user_id: 4n }] };
+    });
+    const dup = await closeZcodeAudit(dupPool, {
+      requestId: REQUEST_ID,
+      userId: 4n,
+      status: "success",
+      terminalCode: null,
+      durationMs: 1,
+      usage: null,
+    });
+    applyZcodeFinalizeOutcome(pending, REQUEST_ID, dup);
+    assert.equal(dup, "already_terminal");
+    assert.equal(pending.has(REQUEST_ID), false);
+
+    const unknownPending = new Set<string>([REQUEST_ID]);
+    const unknownPool = fakePool((sql) => {
+      if (sql.includes("UPDATE")) return { rowCount: 0, rows: [] };
+      return { rowCount: 0, rows: [] };
+    });
+    const unknown = await closeZcodeAudit(unknownPool, {
+      requestId: REQUEST_ID,
+      userId: 4n,
+      status: "error",
+      terminalCode: "ENGINE_ERROR",
+      durationMs: 0,
+      usage: null,
+    });
+    applyZcodeFinalizeOutcome(unknownPending, REQUEST_ID, unknown);
+    assert.equal(unknown, "unknown");
+    assert.equal(unknownPending.has(REQUEST_ID), true);
+  });
+
+  test("stale pending recovery uses created_at and only marks failed audit", async () => {
     const calls: Array<{ sql: string; params: unknown[] }> = [];
     const pool = fakePool((sql, params) => {
       calls.push({ sql, params });
-      return { rowCount: 1, rows: [] };
+      return { rowCount: 1, rows: [{ request_id: REQUEST_ID }] };
     });
-    const n = await closePendingZcodeAudits(pool, {
-      userId: 4n,
-      requestIds: [REQUEST_ID, "not-a-request"],
-      terminalCode: zcodeCleanupTerminal("client_close"),
-    });
-    assert.equal(n, 1);
-    assert.match(calls[0]!.sql, /UPDATE zcode_external_usage_audit/);
-    assert.equal(calls[0]!.params[2], "USER_CANCELLED");
-    assert.deepEqual(calls[0]!.params[1], [REQUEST_ID]);
-    assert.equal(zcodeCleanupTerminal("container_error"), "ENGINE_ERROR");
+    const closed = await reconcileStaleZcodeAudits(pool, { staleAfterMs: 1_800_000, limit: 20 });
+    assert.deepEqual(closed, [REQUEST_ID]);
+    assert.match(calls[0]!.sql, /created_at < NOW\(\)/);
+    assert.match(calls[0]!.sql, /status='pending'/);
+    assert.match(calls[0]!.sql, /ENGINE_ERROR/);
+    assert.doesNotMatch(calls[0]!.sql, /settleCursor|credits/);
   });
 
   test("rejects a non-allowlisted model id before touching SQL", async () => {
@@ -220,15 +340,18 @@ describe("zcode external audit helpers", () => {
 });
 
 describe("ZCode bridge source tripwire", () => {
-  test("hosted ZCode has an independent admission/audit branch and does not reuse Cursor gates", async () => {
+  test("hosted ZCode has an independent admission/audit branch and does not leak pending", async () => {
     const source = await readFile(new URL("../ws/userChatBridge.ts", import.meta.url), "utf8");
     const start = source.indexOf("if (isZcodeInboundFrame && containerId !== undefined)");
     const end = source.indexOf("if (\n        isCodexInboundFrame &&", start);
     assert.notEqual(start, -1, "missing independent ZCode inbound IIFE");
-    const zcodeBranch = source.slice(start, end === -1 ? start + 2500 : end);
+    const zcodeBranch = source.slice(start, end === -1 ? start + 3500 : end);
     assert.match(zcodeBranch, /isZcodeEngineModel\(modelCapture\)/);
     assert.match(zcodeBranch, /authorityExec\.engine !== 'zcode'/);
     assert.match(zcodeBranch, /insertPendingZcodeAudit/);
+    assert.match(zcodeBranch, /abortInsertedZcodeAudit/);
+    assert.match(zcodeBranch, /seal_rejected|zcode_authority_seal_rejected/);
+    assert.match(zcodeBranch, /ERR_FRAME_TOO_BIG/);
     assert.match(zcodeBranch, /ZCODE_UNAVAILABLE/);
     assert.doesNotMatch(zcodeBranch, /isCursorCredentialMember/);
     assert.doesNotMatch(zcodeBranch, /isCursorContainerOnSelfHost/);
@@ -236,8 +359,14 @@ describe("ZCode bridge source tripwire", () => {
     assert.doesNotMatch(zcodeBranch, /settleCursorExternalUsage/);
     assert.match(source, /isZcodeModel\(authorityModelForFrame\)/);
     assert.match(source, /isCursorModel\(authorityModelForFrame\)/);
-    assert.match(source, /closeZcodeAudit/);
-    assert.match(source, /closePendingZcodeAudits/);
+    assert.match(source, /closeZcodeAuditWithRetry/);
+    assert.match(source, /applyZcodeFinalizeOutcome/);
+    assert.match(source, /reconcileStaleZcodeAudits/);
     assert.match(source, /external\.engine === 'zcode'/);
+    assert.doesNotMatch(source, /pendingZcodeRequestIds\.delete\(requestId\)/);
+    assert.doesNotMatch(
+      source.slice(source.indexOf("if (deps.pgPool && pendingZcodeRequestIds.size > 0)")),
+      /pendingZcodeRequestIds\.clear\(\)/,
+    );
   });
 });

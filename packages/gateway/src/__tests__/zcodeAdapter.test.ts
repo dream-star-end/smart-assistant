@@ -19,7 +19,13 @@ import type { EngineCreateOpts } from '../engine/registry.js'
 
 const successFixture = JSON.parse(
   readFileSync(new URL('./fixtures/zcode/success.json', import.meta.url), 'utf8'),
-) as { sessionId: string; response: string; usage: { inputTokens: number; outputTokens: number } }
+) as {
+  sessionId: string
+  response: string
+  usage: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number }
+  eventCount: number
+  projection: { status: string; turnCount: number; totalTokenCount: number; contextUsed: number; contextWindow: number }
+}
 const doctorFixture = JSON.parse(
   readFileSync(new URL('./fixtures/zcode/doctor.json', import.meta.url), 'utf8'),
 ) as { cli: { version: string; processName: string } }
@@ -223,8 +229,36 @@ process.exit(1)
       /sess_/,
     )
     assert.throws(
-      () => _internals.parseJsonResult(JSON.stringify({ sessionId: 'sess_x', response: 'ok', eventCount: 0 })),
+      () => _internals.parseJsonResult(JSON.stringify({
+        sessionId: 'sess_x',
+        response: 'ok',
+        eventCount: 0,
+        usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      })),
       /projection/,
+    )
+    const withoutUsage = { ...successFixture } as Record<string, unknown>
+    delete withoutUsage.usage
+    assert.throws(() => _internals.parseJsonResult(JSON.stringify(withoutUsage)), /usage must be an object/)
+    assert.throws(
+      () => _internals.parseJsonResult(JSON.stringify({ ...successFixture, usage: {} })),
+      /usage.inputTokens/,
+    )
+    for (const bad of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, '12', Number.MAX_SAFE_INTEGER + 1]) {
+      assert.throws(
+        () => _internals.parseJsonResult(JSON.stringify({
+          ...successFixture,
+          usage: { ...successFixture.usage, inputTokens: bad },
+        })),
+        /usage.inputTokens/,
+      )
+    }
+    assert.throws(
+      () => _internals.parseJsonResult(JSON.stringify({
+        ...successFixture,
+        usage: { ...successFixture.usage, outputTokens: 99 },
+      })),
+      /usage totals must match projection.totalTokenCount/,
     )
   })
 
@@ -247,6 +281,17 @@ process.stdout.write('null\\n')
         name: 'mixed',
         script: `#!/usr/bin/env node
 process.stdout.write('ok\\n{"sessionId":"sess_x","response":"ok","eventCount":1}\\n')
+`,
+      },
+      {
+        name: 'missing-usage',
+        script: `#!/usr/bin/env node
+process.stdout.write(${JSON.stringify(`${JSON.stringify({
+          sessionId: 'sess_x',
+          response: 'ok',
+          eventCount: 1,
+          projection: { status: 'idle', turnCount: 1, totalTokenCount: 0, contextUsed: 0, contextWindow: 1 },
+        })}\n`)})
 `,
       },
       {

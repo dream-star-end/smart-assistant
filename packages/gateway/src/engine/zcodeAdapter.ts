@@ -184,20 +184,18 @@ function validateZcodeJsonResult(raw: unknown): ZcodeJsonResult {
   if (!sessionId.startsWith('sess_')) throw new Error('sessionId must be a sess_… value')
   const response = requireString(obj, 'response')
   if (!isNonNegInt(obj.eventCount)) throw new Error('eventCount must be a non-negative integer')
-  if (obj.usage !== undefined) {
-    if (!obj.usage || typeof obj.usage !== 'object' || Array.isArray(obj.usage)) {
-      throw new Error('usage must be an object')
-    }
-    const usage = obj.usage as Record<string, unknown>
-    for (const key of [
-      'inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens',
-      'input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_write_tokens',
-    ]) {
-      if (usage[key] !== undefined && !isNonNegInt(usage[key])) {
-        throw new Error(`usage.${key} must be a non-negative integer`)
-      }
-    }
+  if (!obj.usage || typeof obj.usage !== 'object' || Array.isArray(obj.usage)) {
+    throw new Error('usage must be an object')
   }
+  const usage = obj.usage as Record<string, unknown>
+  const inputTokens = usage.inputTokens
+  const outputTokens = usage.outputTokens
+  const cacheReadTokens = usage.cacheReadTokens
+  const cacheWriteTokens = usage.cacheWriteTokens
+  if (!isNonNegInt(inputTokens)) throw new Error('usage.inputTokens must be a non-negative integer')
+  if (!isNonNegInt(outputTokens)) throw new Error('usage.outputTokens must be a non-negative integer')
+  if (!isNonNegInt(cacheReadTokens)) throw new Error('usage.cacheReadTokens must be a non-negative integer')
+  if (!isNonNegInt(cacheWriteTokens)) throw new Error('usage.cacheWriteTokens must be a non-negative integer')
   if (!obj.projection || typeof obj.projection !== 'object' || Array.isArray(obj.projection)) {
     throw new Error('projection must be an object')
   }
@@ -207,6 +205,10 @@ function validateZcodeJsonResult(raw: unknown): ZcodeJsonResult {
   }
   for (const key of ['turnCount', 'totalTokenCount', 'contextUsed', 'contextWindow'] as const) {
     if (!isNonNegInt(projection[key])) throw new Error(`projection.${key} must be a non-negative integer`)
+  }
+  const usageTotal = inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens
+  if (!Number.isSafeInteger(usageTotal) || usageTotal !== projection.totalTokenCount) {
+    throw new Error('usage totals must match projection.totalTokenCount')
   }
   optionalString(obj, 'traceId')
   optionalString(obj, 'turnId')

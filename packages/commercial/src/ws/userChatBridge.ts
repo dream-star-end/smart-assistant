@@ -92,9 +92,14 @@ import {
 import type { TokenUsage } from "../billing/calculator.js";
 import { settleCursorExternalUsage } from "../billing/cursorExternalSettle.js";
 import {
+  abortInsertedZcodeAudit,
+  applyZcodeFinalizeOutcome,
   closePendingZcodeAudits,
-  closeZcodeAudit,
+  closeZcodeAuditWithRetry,
   insertPendingZcodeAudit,
+  reconcileStaleZcodeAudits,
+  rememberZcodePending,
+  zcodeAdmissionAbortTerminal,
   zcodeCleanupTerminal,
 } from "../billing/zcodeExternalAudit.js";
 import { recordProductFrictionEvent } from "../productFriction/events.js";
@@ -1696,6 +1701,21 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     void work.catch((err) => {
       log?.error("user-chat-bridge: prompt queue compensation failed", { err });
     }).finally(() => pendingPromptQueueCompensations.delete(work));
+  };
+  const pendingZcodeAuditWork = new Set<Promise<void>>();
+  const trackZcodeAuditWork = (work: Promise<void>): void => {
+    pendingZcodeAuditWork.add(work);
+    void work.catch((err) => {
+      log?.warn("user-chat-bridge: ZCode audit work failed", { err });
+    }).finally(() => pendingZcodeAuditWork.delete(work));
+  };
+  let zcodeStaleReconcileStarted = false;
+  const ensureZcodeStaleReconcile = (): void => {
+    if (zcodeStaleReconcileStarted || !deps.pgPool) return;
+    zcodeStaleReconcileStarted = true;
+    trackZcodeAuditWork(
+      reconcileStaleZcodeAudits(deps.pgPool).then(() => undefined),
+    );
   };
 
   /**
@@ -4760,6 +4780,19 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         const cid = containerId;
         void (async () => {
           let dispatchRecord: AdmittedDispatch | undefined;
+          let insertedRequestId: string | null = null;
+          const abortInserted = (step: "seal_rejected" | "frame_too_big" | "send_failed"): Promise<void> => {
+            if (!deps.pgPool || insertedRequestId === null) return Promise.resolve();
+            const requestId = insertedRequestId;
+            const work = abortInsertedZcodeAudit(deps.pgPool, {
+              requestId,
+              userId: uid,
+              pending: pendingZcodeRequestIds,
+              terminalCode: zcodeAdmissionAbortTerminal(step),
+            }).then(() => undefined);
+            trackZcodeAuditWork(work);
+            return work;
+          };
           try {
             if (!deps.pgPool || parsedCapture === null || traceCapture === null || typeof modelCapture !== "string" || !isZcodeEngineModel(modelCapture)) {
               rejectPromptQueueDispatch('ZCODE_UNAVAILABLE');
@@ -4792,21 +4825,33 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               sessionId: peerCapture,
               modelId: zcodeModelId,
             });
-            pendingZcodeRequestIds.add(requestId);
+            rememberZcodePending(pendingZcodeRequestIds, requestId);
+            insertedRequestId = requestId;
+            ensureZcodeStaleReconcile();
             let authorityFields: Record<string, unknown> = {};
             if (authorityExec !== null) {
               const sealed = await sealAuthorityFieldsOrReject({ exec: authorityExec, billingRequestId: requestId, log: logCapture, onReject: rejectPromptQueueDispatch });
-              if (sealed === null) { failDispatchPreForward(dispatchRecord, 'zcode_authority_seal_rejected'); return; }
+              if (sealed === null) {
+                failDispatchPreForward(dispatchRecord, 'zcode_authority_seal_rejected');
+                await abortInserted("seal_rejected");
+                return;
+              }
               authorityFields = sealed;
             }
             const forwarded = { ...enriched, requestId, traceId: traceCapture, ...authorityFields, ...dispatchAuthorityField(dispatchRecord) };
             const encoded = JSON.stringify(forwarded); const len = Buffer.byteLength(encoded);
-            if (len > maxFrameBytes) { failDispatchPreForward(dispatchRecord, 'ERR_FRAME_TOO_BIG'); rejectPromptQueueDispatch('ERR_FRAME_TOO_BIG'); return; }
+            if (len > maxFrameBytes) {
+              failDispatchPreForward(dispatchRecord, 'ERR_FRAME_TOO_BIG');
+              rejectPromptQueueDispatch('ERR_FRAME_TOO_BIG');
+              await abortInserted("frame_too_big");
+              return;
+            }
             await forwardPreparedFrame(Buffer.from(encoded, 'utf8'), false, len);
           } catch (err) {
             logCapture?.error('user-chat-bridge: ZCode external admission failed', { err });
             failDispatchPreForward(dispatchRecord, 'zcode_external_admission_failed');
             rejectPromptQueueDispatch('ZCODE_UNAVAILABLE');
+            await abortInserted("send_failed");
             if (!cleaned && userWs.readyState === WebSocket.OPEN) sendErrorFrame(userWs, 'ZCODE_UNAVAILABLE', 'ZCode is temporarily unavailable');
           }
         })();
@@ -6025,17 +6070,21 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             const durationMs = typeof external.durationMs === 'number' && Number.isFinite(external.durationMs) && external.durationMs >= 0 ? Math.floor(external.durationMs) : null;
             const usage = isPlainRecord(external.usage) ? external.usage : null;
             if (deps.pgPool && requestId && status && durationMs !== null && external.engine === 'zcode') {
-              pendingZcodeRequestIds.delete(requestId);
-              void closeZcodeAudit(deps.pgPool, {
-                requestId,
-                userId: uid,
-                status,
-                terminalCode,
-                durationMs,
-                usage,
-              }).catch((err) => {
-                bridgeLog?.warn('user-chat-bridge: ZCode audit close failed', { requestId, err });
-              });
+              const pool = deps.pgPool;
+              trackZcodeAuditWork((async () => {
+                const outcome = await closeZcodeAuditWithRetry(pool, {
+                  requestId,
+                  userId: uid,
+                  status,
+                  terminalCode,
+                  durationMs,
+                  usage,
+                });
+                applyZcodeFinalizeOutcome(pendingZcodeRequestIds, requestId, outcome);
+                if (outcome === "unknown" || outcome === "failed") {
+                  bridgeLog?.warn("user-chat-bridge: ZCode audit close fail-closed", { requestId, outcome });
+                }
+              })());
             } else if (deps.pgPool && requestId && status && durationMs !== null && external.engine === 'cursor') {
               const pool = deps.pgPool;
               const pricing = deps.pricing;
@@ -7873,17 +7922,16 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       }
       inflightCodexTurns.clear();
       if (deps.pgPool && pendingZcodeRequestIds.size > 0) {
+        ensureZcodeStaleReconcile();
         const leftover = [...pendingZcodeRequestIds];
-        pendingZcodeRequestIds.clear();
-        void closePendingZcodeAudits(deps.pgPool, {
-          userId: uid,
-          requestIds: leftover,
-          terminalCode: zcodeCleanupTerminal(finalCause),
-        }).catch((err) => {
-          bridgeLog?.warn('user-chat-bridge: ZCode pending audit close failed', { err });
-        });
-      } else {
-        pendingZcodeRequestIds.clear();
+        trackZcodeAuditWork(
+          closePendingZcodeAudits(deps.pgPool, {
+            userId: uid,
+            requestIds: leftover,
+            terminalCode: zcodeCleanupTerminal(finalCause),
+            pending: pendingZcodeRequestIds,
+          }).then(() => undefined),
+        );
       }
       // durable dispatch 本地簿记清空(权威在 turn_dispatches;reconciler 兜底 open 行)。
       admittedDispatches.clear();
@@ -7942,8 +7990,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     await new Promise<void>((resolve) => {
       try { wss.close(() => resolve()); } catch { resolve(); }
     });
-    while (pendingPromptQueueCompensations.size > 0) {
-      await Promise.allSettled([...pendingPromptQueueCompensations]);
+    while (pendingPromptQueueCompensations.size > 0 || pendingZcodeAuditWork.size > 0) {
+      await Promise.allSettled([
+        ...pendingPromptQueueCompensations,
+        ...pendingZcodeAuditWork,
+      ]);
     }
   }
 
