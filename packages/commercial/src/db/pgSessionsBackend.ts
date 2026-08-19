@@ -1190,7 +1190,7 @@ function sha256Bytes(bytes: Buffer): string {
 }
 
 const AUTOMATIC_RECOVERY_CONTINUE_PROMPT =
-  "继续完成刚才因临时异常中断的任务。以本会话中已经生成并持久化的思考、工具结果和部分回答为依据，从断点继续；不要重新执行已经完成的步骤，不要重复已经输出的内容。若外部写操作的结果仍不明确，不得重复提交，先核对状态或向用户说明。";
+  "继续完成刚才因临时异常中断的任务。以本会话中已经生成并持久化的思考、工具结果和部分回答为依据，从断点继续。这是一条断点续接指令，不是重放原始请求：不要重新执行已经完成的步骤，不要重复已经输出的内容。若中断前有外部写操作或部署操作，先查询其当前可观察状态（如 release 指针、进程、日志、健康检查或目标资源）并据此继续。只有在无法通过查询区分成功或失败、且重复执行可能造成不可逆后果时，才明确说明具体无法确认的操作和风险，并仅询问完成任务所必需的决定；不要泛泛要求用户再说“继续”。";
 
 // Kept byte-for-byte aligned with protocol's exported pre-execution policy.
 // This commercial copy is intentional during the rolling workspace window:
@@ -1202,6 +1202,22 @@ const PRE_EXECUTION_RECOVERY_CODES = new Set([
 ]);
 function recoveryWithoutCheckpointIsProven(code: string): boolean {
   return PRE_EXECUTION_RECOVERY_CODES.has(normalizeTurnErrorCode(code));
+}
+
+/** The last assistant record is the semantic terminal surface. An earlier
+ * error followed by a later answer is not a failed turn, while trailing tool
+ * or runtime audit rows do not erase a terminal assistant error. */
+function terminalTurnRecordErrorCode(records: readonly unknown[]): string {
+  for (let index = records.length - 1; index >= 0; index--) {
+    const record = records[index];
+    if (!record || typeof record !== "object" || Array.isArray(record)) continue;
+    const message = record as MessageLike;
+    if (message.role !== "assistant") continue;
+    return typeof message._errorCode === "string"
+      ? normalizeTurnErrorCode(message._errorCode)
+      : "";
+  }
+  return "";
 }
 
 async function hydrateRecoverySourceUser(
@@ -1283,11 +1299,19 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
     clientMessageId,
     outcome: input.turn.payload.status,
   });
+  const status = input.turn.payload.status;
+  const terminalRecordErrorCode = terminalTurnRecordErrorCode(
+    input.turn.records.map((record) => record.payload),
+  );
+  const completedWithRecoverableError = status === "completed" &&
+    supportsAutomaticTurnRecovery(terminalRecordErrorCode);
   if (
-    input.turn.payload.status !== "crashed" &&
-    input.turn.payload.status !== "interrupted"
+    status !== "crashed" &&
+    status !== "interrupted" &&
+    !completedWithRecoverableError
   ) return;
-  const errorCode = input.turn.payload.errorCode ?? input.turn.payload.waiveReason ?? "";
+  const errorCode = terminalRecordErrorCode ||
+    input.turn.payload.errorCode || input.turn.payload.waiveReason || "";
   if (!supportsAutomaticTurnRecovery(errorCode)) return;
 
   const latestUser = [...input.currentMessages].reverse()
@@ -1307,10 +1331,24 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
   const assessment = assessTurnRecoveryTape(
     input.turn.records.map((record) => record.payload),
   );
-  if (!assessment.checkpointSafe) return;
+  // A checkpoint continuation resumes the native session with the exact
+  // persisted process; it never replays the original request. Even an
+  // uncertain external effect is therefore resumable: the continuation
+  // prompt requires observable-state verification before any repeated write.
+  // Exact replay remains fail-closed and is never inferred from a completed
+  // tape whose header contradicts its terminal error record.
+  if (status === "completed" && assessment.mode !== "checkpoint") return;
+  if (
+    assessment.mode === "checkpoint" &&
+    !assessment.checkpointSafe &&
+    status !== "completed"
+  ) return;
   if (
     assessment.mode === "replay" &&
-    !recoveryWithoutCheckpointIsProven(errorCode)
+    (
+      !assessment.checkpointSafe ||
+      !recoveryWithoutCheckpointIsProven(errorCode)
+    )
   ) return;
   const mode = assessment.mode;
   const rootClientMessageId = isClientMessageId(source._automaticRecoveryRootClientMessageId)
@@ -6081,7 +6119,7 @@ export function createPgSessionsBackend(
               }
             }
             const sourceIndex = current.lastIndexOf(latestUser);
-            const recoverableTapeError = current.slice(sourceIndex + 1).some((item) =>
+            const recoverableHotTapeError = current.slice(sourceIndex + 1).some((item) =>
               item?.role === "assistant" &&
               item._clientMessageId === input.recovery?.sourceClientMessageId &&
               supportsAutomaticTurnRecovery(String(item._errorCode ?? "")));
@@ -6111,21 +6149,8 @@ export function createPgSessionsBackend(
                 ],
               )
             ).rows[0];
-            const recoverableFinalizedWaiver =
-              (finalized?.status === "crashed" || finalized?.status === "interrupted") &&
-              supportsAutomaticTurnRecovery(finalized.waive_reason ?? "");
-            if (
-              !recoverableTapeError &&
-              !supportsAutomaticTurnRecovery(dispatchFailure?.failure_code ?? "") &&
-              !recoverableFinalizedWaiver
-            ) {
-              return { kind: "recovery_conflict", reason: "source_not_recoverable" };
-            }
             let authoritativeRetryAttempt = automaticSourceAttempt;
             if (finalized) {
-              if (finalized.status !== "crashed" && finalized.status !== "interrupted") {
-                return { kind: "recovery_conflict", reason: "source_tape_completed" };
-              }
               const recordRows = (
                 await client.query<{ payload: Buffer }>(
                   `SELECT payload
@@ -6148,39 +6173,61 @@ export function createPgSessionsBackend(
                 return { kind: "recovery_conflict", reason: "source_tape_malformed" };
               }
               const assessment = assessTurnRecoveryTape(records);
-              const terminalError = [...records].reverse().find((record) =>
-                !!record && typeof record === "object" && !Array.isArray(record) &&
-                typeof (record as MessageLike)._errorCode === "string"
-              ) as MessageLike | undefined;
-              const terminalErrorCode = typeof terminalError?._errorCode === "string"
-                ? terminalError._errorCode
-                : "";
+              const terminalErrorCode = terminalTurnRecordErrorCode(records);
+              const finalizedErrorCode = terminalErrorCode ||
+                (finalized.status === "crashed" || finalized.status === "interrupted"
+                  ? finalized.waive_reason ?? ""
+                  : "");
+              if (!supportsAutomaticTurnRecovery(finalizedErrorCode)) {
+                return { kind: "recovery_conflict", reason: "source_not_recoverable" };
+              }
+              if (
+                finalized.status === "completed" &&
+                assessment.mode !== "checkpoint"
+              ) {
+                return { kind: "recovery_conflict", reason: "completed_replay_forbidden" };
+              }
+              if (assessment.mode !== input.recovery.mode) {
+                return { kind: "recovery_conflict", reason: "recovery_mode_mismatch" };
+              }
+              if (
+                input.recovery.automatic &&
+                assessment.mode === "checkpoint" &&
+                !assessment.checkpointSafe &&
+                finalized.status !== "completed"
+              ) {
+                return { kind: "recovery_conflict", reason: "automatic_checkpoint_unsafe" };
+              }
+              if (
+                assessment.mode === "replay" &&
+                (
+                  !assessment.checkpointSafe ||
+                  !recoveryWithoutCheckpointIsProven(finalizedErrorCode)
+                )
+              ) {
+                return { kind: "recovery_conflict", reason: "automatic_replay_not_proven" };
+              }
               if (input.recovery.automatic) {
                 authoritativeRetryAttempt = Math.max(
                   authoritativeRetryAttempt,
                   maxAutomaticTurnRetryAttempt(records, automaticRoot),
                 );
               }
-              if (assessment.mode !== input.recovery.mode) {
-                return { kind: "recovery_conflict", reason: "recovery_mode_mismatch" };
-              }
-              if (input.recovery.automatic && !assessment.checkpointSafe) {
-                return { kind: "recovery_conflict", reason: "automatic_checkpoint_unsafe" };
+            } else {
+              const dispatchErrorCode = dispatchFailure?.failure_code ?? "";
+              if (
+                !recoverableHotTapeError &&
+                !supportsAutomaticTurnRecovery(dispatchErrorCode)
+              ) {
+                return { kind: "recovery_conflict", reason: "source_not_recoverable" };
               }
               if (
-                input.recovery.automatic &&
-                assessment.mode === "replay" &&
-                !recoveryWithoutCheckpointIsProven(
-                  terminalErrorCode || finalized.waive_reason || "",
-                )
+                input.recovery.mode !== "replay" ||
+                dispatchFailure?.outcome !== "not_accepted" ||
+                !recoveryWithoutCheckpointIsProven(dispatchErrorCode)
               ) {
-                return { kind: "recovery_conflict", reason: "automatic_replay_not_proven" };
+                return { kind: "recovery_conflict", reason: "source_not_safely_replayable" };
               }
-            } else if (
-              input.recovery.mode !== "replay" ||
-              dispatchFailure?.outcome !== "not_accepted"
-            ) {
-              return { kind: "recovery_conflict", reason: "source_not_safely_replayable" };
             }
             if (
               input.recovery.automatic &&
@@ -6394,9 +6441,9 @@ export function createPgSessionsBackend(
           } catch {
             return false;
           }
-          const recordError = [...records].reverse().find(
-            (record) => typeof record.payload._errorCode === "string",
-          )?.payload._errorCode;
+          const recordError = terminalTurnRecordErrorCode(
+            records.map((record) => record.payload),
+          );
           await scheduleAutomaticRecoveryForFinalizedTurn(client, {
             uid: userId,
             sessionUserId,
