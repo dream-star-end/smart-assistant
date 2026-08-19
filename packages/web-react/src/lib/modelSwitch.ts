@@ -18,7 +18,10 @@ export function modelSwitchCompactionReason(
   const visionDowngrade = source.supports_vision === true && target.supports_vision === false
   const sourceWindow = typeof source.context_window === 'number' ? source.context_window : null
   const targetWindow = typeof target.context_window === 'number' ? target.context_window : null
+  const explicitLongToStandardVariant =
+    sourceModelId.endsWith('-1m') && sourceModelId.slice(0, -3) === targetModelId
   const contextDowngrade =
-    sourceWindow !== null && targetWindow !== null && sourceWindow > targetWindow
+    explicitLongToStandardVariant ||
+    (sourceWindow !== null && targetWindow !== null && sourceWindow > targetWindow)
   return visionDowngrade || contextDowngrade ? { visionDowngrade, contextDowngrade } : null
 }
