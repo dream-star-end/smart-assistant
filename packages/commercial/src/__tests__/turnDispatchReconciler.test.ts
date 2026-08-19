@@ -17,6 +17,7 @@ import {
   runReconcileTick,
   runShutdownDispatchHandoff,
   loadGatewayExitDispatchIds,
+  _resetVisibleOrphanScanOffset,
 } from '../dispatch/turnDispatchReconciler.js'
 import { PERMANENT_CODEX_WAIVER_PREFIX } from '../billing/codexFinalizer.js'
 import type { ContainerCallResult } from '../dispatch/containerDispatchClient.js'
@@ -62,6 +63,7 @@ interface Canned {
   openAged?: Raw[]
   openSessionGone?: Raw[]
   visibleOrphans?: Raw[]
+  casToTerminalMiss?: boolean
 }
 
 function makeFakePool(canned: Canned) {
@@ -69,22 +71,54 @@ function makeFakePool(canned: Canned) {
   // accepted 扫描的 SQL 时间参数捕获(Codex R1 MAJOR 回归锁:扫描下限必须是
   // ACCEPTED_UNREACHABLE_ALERT_MS 而非 stuckMs,否则求证瘫痪要等 90min+ 才首告)。
   const acceptedScanCutoffs: Date[] = []
+  let txDepth = 0
+  let txBuf: string[] = []
+  const recordWrite = (s: string) => {
+    if (txDepth > 0) txBuf.push(s)
+    else writes.push(s)
+  }
   // 单点路由:pool.query 与事务 client.query 共用。B8 的 terminal-未通知分支走
   // pool.connect() 单事务(SELECT … FOR UPDATE 锁行 → 重验 → 财务联查 → visible/manual),
   // 故 fake 必须提供 connect() + 事务 client。
   const route = (sql: string, params?: unknown[]) => {
     const s = sql.replace(/\s+/g, ' ')
-    // 事务控制帧。
-    if (s === 'BEGIN' || s === 'COMMIT' || s === 'ROLLBACK') return { rows: [], rowCount: 0 }
+    if (s === 'BEGIN') {
+      txDepth += 1
+      txBuf = []
+      return { rows: [], rowCount: 0 }
+    }
+    if (s === 'COMMIT') {
+      writes.push(...txBuf)
+      writes.push('COMMIT')
+      txDepth = 0
+      txBuf = []
+      return { rows: [], rowCount: 0 }
+    }
+    if (s === 'ROLLBACK') {
+      writes.push('ROLLBACK')
+      txDepth = 0
+      txBuf = []
+      return { rows: [], rowCount: 0 }
+    }
+    if (s.includes('-- closeVisibleOrphans lock')) {
+      const id = params?.[0]
+      const orphan = (canned.visibleOrphans ?? []).find((row) => row.dispatch_id === id)
+        ?? canned.visibleOrphans?.[0]
+      if (!orphan) return { rows: [], rowCount: 0 }
+      return { rows: [{ status: orphan.status }], rowCount: 1 }
+    }
     // 行锁读(getDispatchForUpdate):返回锁定的 terminal 行,重验通过。
     if (s.includes('FROM turn_dispatches') && s.includes('FOR UPDATE')) {
       return { rows: [rawRow()], rowCount: 1 }
     }
     if (s.startsWith('UPDATE') || s.startsWith('INSERT')) {
-      writes.push(s)
+      recordWrite(s)
       if (s.includes('client_notified = TRUE')) return { rows: [], rowCount: 1 }
       if (s.includes("status = 'manual_reconcile'")) return { rows: [rawRow({ status: 'manual_reconcile', conflict_reason: 'x' })], rowCount: 1 }
-      if (s.includes("status = 'terminal'")) return { rows: [rawRow({ status: 'terminal', outcome: 'not_accepted', terminal_at: new Date() })], rowCount: 1 }
+      if (s.includes("status = 'terminal'")) {
+        if (canned.casToTerminalMiss) return { rows: [], rowCount: 0 }
+        return { rows: [rawRow({ status: 'terminal', outcome: 'not_accepted', terminal_at: new Date() })], rowCount: 1 }
+      }
       if (s.includes("status = 'accepted'")) return { rows: [rawRow({ status: 'accepted' })], rowCount: 1 }
       if (s.includes("status = 'rejecting'")) return { rows: [rawRow({ status: 'rejecting' })], rowCount: 1 }
       return { rows: [], rowCount: 1 }
@@ -769,8 +803,10 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
     }
   }
 
-  test('parts-complete quiet → visible fallback completed (代收口)', async () => {
+  test('parts-complete quiet → Phase A only, no fallback projection', async () => {
+    _resetVisibleOrphanScanOffset()
     const nudges: string[] = []
+    const commits: string[] = []
     const pool = makeFakePool({
       visibleOrphans: [orphanRow({
         tape_id: 'tape-complete',
@@ -784,13 +820,73 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
       container: noContainer,
       now: () => nowMs,
       listCarrierDeadDispatchIds: async () => [],
+      commitVisibleTape: async (input) => {
+        commits.push(input.tapeId)
+      },
       nudgeClient: (_uid, _sid, _cmid, reconcile) => {
         if (reconcile) nudges.push(reconcile)
       },
     })
     assert.equal(counts.visibleOrphans, 1)
-    assert.ok(pool.writes.some((sql) => sql.includes('visible_head')))
-    assert.ok(pool.writes.some((sql) => sql.includes("status = 'terminal'")))
+    assert.deepEqual(commits, ['tape-complete'])
+    assert.ok(!pool.writes.some((sql) => sql.includes('visible-fallback') || sql.includes('visible_head')))
+    assert.ok(!pool.writes.some((sql) => sql.includes("status = 'terminal'")))
     assert.deepEqual(nudges, ['turn_completed'])
+  })
+
+  test('Phase A failure keeps dispatch open, skips fallback, retries next tick', async () => {
+    _resetVisibleOrphanScanOffset()
+    let attempts = 0
+    const pool = makeFakePool({
+      visibleOrphans: [orphanRow({
+        tape_id: 'tape-fail-a',
+        tape_part_count: 3,
+        tape_parts_rows: '3',
+        last_frame_at: new Date(nowMs - PARTS_COMPLETE_QUIET_MS),
+      })],
+    })
+    const deps = {
+      pool: pool as unknown as Pool,
+      container: noContainer,
+      now: () => nowMs,
+      listCarrierDeadDispatchIds: async () => [],
+      commitVisibleTape: async () => {
+        attempts += 1
+        if (attempts === 1) throw new Error('phase a failed')
+      },
+    }
+    const first = await runReconcileTick(deps)
+    assert.equal(first.visibleOrphans, 0)
+    assert.equal(attempts, 1)
+    assert.ok(!pool.writes.some((sql) => sql.includes('visible-fallback') || sql.includes('visible_head')))
+    assert.ok(!pool.writes.some((sql) => sql.includes("status = 'terminal'")))
+    assert.ok(!pool.writes.includes('COMMIT'))
+    const second = await runReconcileTick(deps)
+    assert.equal(second.visibleOrphans, 1)
+    assert.equal(attempts, 2)
+  })
+
+  test('CAS miss rolls back so fallback projection does not commit', async () => {
+    _resetVisibleOrphanScanOffset()
+    const pool = makeFakePool({
+      visibleOrphans: [orphanRow({
+        tape_id: null,
+        tape_part_count: null,
+        tape_parts_rows: '0',
+        last_frame_at: new Date(nowMs - 20 * 60_000),
+        container_running: false,
+      })],
+      casToTerminalMiss: true,
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: noContainer,
+      now: () => nowMs,
+      listCarrierDeadDispatchIds: async () => [],
+    })
+    assert.equal(counts.visibleOrphans, 0)
+    assert.ok(pool.writes.includes('ROLLBACK'))
+    assert.ok(!pool.writes.includes('COMMIT'))
+    assert.ok(!pool.writes.some((sql) => sql.includes('visible-fallback') || sql.includes('visible_head')))
   })
 })

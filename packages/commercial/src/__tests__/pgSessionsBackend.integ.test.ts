@@ -33,6 +33,7 @@ import {
   createPgSessionsBackend,
   startSessionsGcSweeper,
   _setAfterLosslessStageBatch,
+  _setPhaseASqlObserver,
   LOSSLESS_TURN_RECORD_STAGE_BATCH_SIZE,
   type PgSessionsBackend,
 } from "../db/pgSessionsBackend.js";
@@ -8401,7 +8402,15 @@ describe("rev2 visible finalize decoupling", () => {
     for (const part of tape.parts) {
       await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
     }
-    const visible = await backend.finalizeLosslessTurnTape(userId, tape.finalize, { materialize: false });
+    const visible = await backend.finalizeLosslessTurnTape(userId, {
+      ...tape.finalize,
+      settlement: {
+        billingAnchorId: `srv-${sessionId}-main-t8`,
+        engineBillings: [],
+        text: "phase a only",
+        ts: 1_700_000_100_000,
+      },
+    }, { materialize: false });
     assert.equal(visible.applied, "finalized");
     assert.equal(visible.settlementHandoff, true);
     const parts = Number((
@@ -8462,7 +8471,15 @@ describe("rev2 visible finalize decoupling", () => {
     for (const part of tape.parts) {
       await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
     }
-    await backend.finalizeLosslessTurnTape(userId, tape.finalize, { materialize: false });
+    await backend.finalizeLosslessTurnTape(userId, {
+      ...tape.finalize,
+      settlement: {
+        billingAnchorId: `srv-${sessionId}-main-t9`,
+        engineBillings: [],
+        text: "visible context",
+        ts: 1_700_000_200_000,
+      },
+    }, { materialize: false });
     await pool.query(
       `UPDATE client_session_turn_tapes
           SET materialization_status='failed', materialization_attempts=8
@@ -8515,5 +8532,106 @@ describe("rev2 visible finalize decoupling", () => {
     const hydrated = await backend.getClientSession(sessionId, userId);
     const assistants = (hydrated!.messages as MessageLike[]).filter((m) => m._turnTapeId === tape.finalize.tapeId);
     assert.equal(assistants.length, 1);
+  });
+
+  maybe("legacy finalize without settlement does not scan tape parts on HTTP Phase A", async () => {
+    const sessionId = "s-rev4-http-no-parts";
+    const userId = "c:1";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const tape = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 11,
+      status: "completed",
+      turnKey: "f".repeat(64),
+      text: "must not load parts",
+      createdAt: 1_700_000_400_000,
+    });
+    for (const part of tape.parts) {
+      await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+    }
+    let partPayloadReads = 0;
+    _setPhaseASqlObserver((sql) => {
+      if (/client_session_turn_tape_parts/i.test(sql) && /\bpayload\b/i.test(sql)) {
+        partPayloadReads += 1;
+      }
+    });
+    try {
+      const result = await backend.finalizeLosslessTurnTape(userId, tape.finalize, { materialize: false });
+      assert.equal(result.applied, "finalized");
+      assert.equal(partPayloadReads, 0);
+    } finally {
+      _setPhaseASqlObserver(null);
+    }
+  });
+
+  maybe("wrong billingAnchorId with matching billings is rejected before verify", async () => {
+    const sessionId = "s-rev4-anchor-mismatch";
+    const userId = "c:1";
+    const turnKey = "9".repeat(64);
+    const requestId = "1".repeat(32);
+    const engineBilling = {
+      requestId,
+      turnKey,
+      engineSessionId: `oceng-${"2".repeat(48)}`,
+      status: "success" as const,
+      durationMs: 5,
+    };
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const tape = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 12,
+      status: "completed",
+      turnKey,
+      requestId,
+      text: "paid answer",
+      createdAt: 1_700_000_500_000,
+      engineBilling,
+    });
+    for (const part of tape.parts) {
+      await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+    }
+    const canonicalAnchor = `srv-${sessionId}-main-t12`;
+    await backend.finalizeLosslessTurnTape(userId, {
+      ...tape.finalize,
+      settlement: {
+        billingAnchorId: `${canonicalAnchor}-WRONG`,
+        requestId,
+        engineBillings: [engineBilling],
+        text: "paid answer",
+        ts: 1_700_000_500_000,
+      },
+    }, { materialize: false });
+    await assert.rejects(
+      () => backend.finalizeLosslessTurnTape(userId, {
+        ...tape.finalize,
+        settlement: {
+          billingAnchorId: `${canonicalAnchor}-WRONG`,
+          requestId,
+          engineBillings: [engineBilling],
+          text: "paid answer",
+          ts: 1_700_000_500_000,
+        },
+      }),
+      /billingAnchorId mismatch/,
+    );
+    const header = (
+      await pool.query<{ settlement_verified_at: string | null }>(
+        `SELECT settlement_verified_at::text FROM client_session_turn_tapes
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+        [sessionId, userId, tape.finalize.tapeId],
+      )
+    ).rows[0];
+    assert.equal(header?.settlement_verified_at, null);
+    const jobs = (
+      await pool.query<{ status: string }>(
+        `SELECT status FROM turn_tape_settlement_jobs
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+        [sessionId, userId, tape.finalize.tapeId],
+      )
+    ).rows;
+    assert.ok(jobs.length > 0);
+    assert.ok(jobs.every((job) => job.status === "held"));
   });
 });

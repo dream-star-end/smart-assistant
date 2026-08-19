@@ -58,7 +58,7 @@ describe("losslessBillingAnchorId", () => {
         turnIndex: 5,
         runtimeEvents: [{ ordinal: 3 }],
       }),
-      "srv-sess-1-main-t5",
+      "srv-sess-1-main-t5-runtime-3",
     );
   });
 
