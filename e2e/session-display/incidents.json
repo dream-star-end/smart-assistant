@@ -1149,7 +1149,9 @@
       "symptom": "同一容器会话销毁后重新连接时，Gateway 帧序号从 1 重新开始并撞上另一 dispatch 或无 dispatch 的服务端定时任务历史持久化身份，导致持久化失败关闭用户共享 WebSocket，页面持续断线重连。",
       "rootFixCommit": "6d2c930c",
       "coverageCommits": [
-        "bab6c8c6"
+        "bab6c8c6",
+        "54014c3d",
+        "d76aae91"
       ],
       "regressions": [
         {
@@ -1161,6 +1163,11 @@
           "layer": "live-e2e",
           "path": "e2e/session-display/tests/03-reconnect-inflight.spec.ts",
           "assertion": "断线重连:回复到达或明确失败,绝不永久静默"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/regression-contracts/outboundDurabilityPermanentConflict.contract.test.ts",
+          "assertion": "REG-20260817: permanent live-frame conflict never closes the browser or poisons later frames"
         }
       ]
     },
