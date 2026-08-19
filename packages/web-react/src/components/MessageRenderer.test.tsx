@@ -1365,6 +1365,24 @@ describe("MessageList 归档显式分页(§4/§5)", () => {
     expect(screen.getByText("恢复后的真实过程")).toBeInTheDocument();
   });
 
+  test("缺 id 的坏消息只变成占位，前后正常消息仍渲染", () => {
+    render(
+      <MessageList
+        messages={[
+          mk("user", { id: "u-ok", text: "正常用户问题" }),
+          { role: "assistant", text: "缺 id 的坏行", ts: 2 } as unknown as ChatMessage,
+          mk("assistant", { id: "a-ok", text: "正常助手回复" }),
+        ]}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+      />,
+    );
+    expect(screen.getByText("正常用户问题")).toBeInTheDocument();
+    expect(screen.getByText("正常助手回复")).toBeInTheDocument();
+    expect(screen.getByText("此条消息缺少 id，已跳过渲染")).toBeInTheDocument();
+  });
+
   test("生产滚动容器尚未绑定时不先挂载整个超长会话", () => {
     render(
       <MessageList

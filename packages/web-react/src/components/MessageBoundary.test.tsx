@@ -73,4 +73,25 @@ describe("MessageBoundary per-message 错误边界", () => {
     expect(screen.queryByText("此条消息渲染失败")).toBeNull();
     err.mockRestore();
   });
+
+  test("深层畸形 plan steps:[null] 只占位该条,相邻消息正常渲染", () => {
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    render(
+      <MessageList
+        messages={[
+          mk("good-1", "user", "前一条消息"),
+          { id: "plan-bad", role: "plan", text: "坏计划", ts: 1, steps: [null] } as unknown as ChatMessage,
+          mk("good-2", "assistant", "后一条消息"),
+        ]}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+      />,
+    );
+    expect(screen.getByText("前一条消息")).toBeInTheDocument();
+    expect(screen.getByText("后一条消息")).toBeInTheDocument();
+    expect(screen.getByText("此条消息数据结构异常，已跳过渲染")).toBeInTheDocument();
+    expect(screen.queryByText("坏计划")).toBeNull();
+    err.mockRestore();
+  });
 });

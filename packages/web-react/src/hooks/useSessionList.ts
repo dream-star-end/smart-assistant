@@ -141,6 +141,11 @@ export type UseSessionList = {
   serverListSettled: boolean;
   /** 当前活动会话的 canonical history 请求仍在途。用于避免慢响应期间误显空会话。 */
   historyLoading: boolean;
+  /** GET 失败且按 sessionId+token 隔离。404 不算失败。 */
+  historyError: { sessionId: string; token: number; message: string } | null;
+  /** 直接重拉当前会话历史，不走 selectSession（同 activeId 会提前返回）。 */
+  retryHistory: (id: string) => void;
+  loadHistory: (id: string, opts?: { force?: boolean }) => Promise<void>;
 };
 
 /**
@@ -174,6 +179,9 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
   const [historyLoadingTokens, setHistoryLoadingTokens] = useState<Map<string, number>>(
     () => new Map(),
   );
+  const [historyErrorBySession, setHistoryErrorBySession] = useState<
+    Map<string, { token: number; message: string }>
+  >(() => new Map());
   const historyFetchedAtRef = useRef<Map<string, number>>(new Map());
   // 登录后是否已自动选中"上次会话"（仅做一次：避免覆盖用户随后的显式新建/切换/删除）。
   const autoSelectedRef = useRef(false);
@@ -245,12 +253,13 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
   // 按需拉取单会话 server canonical 历史并合并进 WS service（server-wins / id 幂等）。
   // 经稳定 sockRef 调用历史方法，避免依赖每帧重建的 chat 引用。
   const loadHistory = useCallback(
-    async (id: string) => {
+    async (id: string, opts?: { force?: boolean }) => {
       const owner = userIdRef.current;
       if (!auth || !owner) return;
-      if (historyFetchingRef.current.has(id)) return; // 并发中：不重入
+      if (!opts?.force && historyFetchingRef.current.has(id)) return; // 并发中：不重入
       const lastAt = historyFetchedAtRef.current.get(id) ?? 0;
-      if (Date.now() - lastAt < HISTORY_REFETCH_COOLDOWN_MS) return; // 短时重复：不重拉
+      if (!opts?.force && Date.now() - lastAt < HISTORY_REFETCH_COOLDOWN_MS) return; // 短时重复：不重拉
+      if (opts?.force && historyFetchingRef.current.has(id)) return;
       const requestToken = ++historyRequestTokenRef.current;
       historyFetchingRef.current.set(id, requestToken);
       setHistoryLoadingTokens((current) => {
@@ -353,6 +362,13 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
           );
         }
         historyFetchedAtRef.current.set(id, Date.now());
+        setHistoryErrorBySession((current) => {
+          const existing = current.get(id);
+          if (!existing || existing.token > requestToken) return current;
+          const next = new Map(current);
+          next.delete(id);
+          return next;
+        });
       } catch (e) {
         // 404 = 本地新建/未同步会话，无 server 历史（正常）：打冷却戳，避免每次重选都空打 404，
         // 但仍非永久（会话后续被 server 持久化后，冷却过去可正常增量拉到）。其他错误不打戳 →
@@ -361,7 +377,25 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
           e instanceof ApiError &&
           e.status === 404 &&
           historyFetchingRef.current.get(id) === requestToken
-        ) historyFetchedAtRef.current.set(id, Date.now());
+        ) {
+          historyFetchedAtRef.current.set(id, Date.now());
+          setHistoryErrorBySession((current) => {
+            const existing = current.get(id);
+            if (!existing || existing.token > requestToken) return current;
+            const next = new Map(current);
+            next.delete(id);
+            return next;
+          });
+        } else if (historyFetchingRef.current.get(id) === requestToken) {
+          const message = e instanceof ApiError
+            ? (e.message || `加载失败 (${e.status})`)
+            : e instanceof Error ? e.message : "加载失败";
+          setHistoryErrorBySession((current) => {
+            const next = new Map(current);
+            next.set(id, { token: requestToken, message });
+            return next;
+          });
+        }
       } finally {
         if (historyFetchingRef.current.get(id) === requestToken) {
           historyFetchingRef.current.delete(id);
@@ -376,6 +410,14 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     },
     // modelPayloadFresh 为稳定 useCallback([]),入 deps 仅为满足 lint,不改重建时机。
     [auth, agentId, modelPayloadFresh],
+  );
+
+  const retryHistory = useCallback(
+    (id: string) => {
+      historyFetchedAtRef.current.delete(id);
+      void loadHistory(id, { force: true });
+    },
+    [loadHistory],
   );
 
   const selectSession = useCallback(
@@ -563,6 +605,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     historyFetchedAtRef.current.clear();
     historyFetchingRef.current.clear();
     setHistoryLoadingTokens(new Map());
+    setHistoryErrorBySession(new Map());
     modelSyncRef.current.clear();
     autoSelectedRef.current = false; // 下次登录重新自动选中最近会话
     setSessions([]);
@@ -587,5 +630,16 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     reset,
     serverListSettled,
     historyLoading: activeId !== undefined && historyLoadingTokens.has(activeId),
+    historyError: activeId
+      ? (() => {
+          const row = historyErrorBySession.get(activeId);
+          if (!row) return null;
+          const loadingToken = historyLoadingTokens.get(activeId);
+          if (loadingToken !== undefined && loadingToken > row.token) return null;
+          return { sessionId: activeId, token: row.token, message: row.message };
+        })()
+      : null,
+    retryHistory,
+    loadHistory,
   };
 }

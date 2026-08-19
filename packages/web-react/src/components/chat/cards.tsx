@@ -835,7 +835,10 @@ export function PlanCard({
   msg: ChatMessage;
   tokenUsage?: DisplayTokenUsage;
 }) {
-  const steps = msg.steps ?? [];
+  const steps = (msg.steps ?? []).filter(
+    (s): s is { step: string; status: "pending" | "inProgress" | "completed" } =>
+      !!s && typeof s === "object" && typeof s.step === "string" && typeof s.status === "string",
+  );
   return (
     <div className="rounded-lg border border-border bg-surface animate-in">
       <div className="flex items-center gap-2 border-b border-border px-3.5 py-2.5">

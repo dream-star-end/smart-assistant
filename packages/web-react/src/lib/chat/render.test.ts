@@ -11,6 +11,7 @@ import {
   messageKind,
   messageSignature,
   reviewVerdictBadge,
+  safeMessageSignature,
   stripMarkdown,
 } from "./render";
 
@@ -74,6 +75,12 @@ describe("messageSignature 流式防闪签名", () => {
   test("内容不变 → 签名稳定（memo 跳过重渲）", () => {
     const m = mk("assistant", { text: "hello" });
     expect(messageSignature(m, CTX)).toBe(messageSignature(m, CTX));
+  });
+
+  test("plan steps:[null] does not throw; safeMessageSignature returns a string", () => {
+    const m = mk("plan", { text: "计划", steps: [null] as unknown as ChatMessage["steps"] });
+    expect(() => messageSignature(m, CTX)).not.toThrow();
+    expect(safeMessageSignature(m, CTX)).toContain("plan");
   });
 
   test("assistant 文本增量 → 签名变化（触发重渲）", () => {

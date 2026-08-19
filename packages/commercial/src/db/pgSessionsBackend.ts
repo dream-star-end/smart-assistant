@@ -80,14 +80,19 @@ import {
 } from "./turnTapeJobs.js";
 import {
   assertSettlementMatchesCanonical,
+  classifyUnifiedTimelineIntegrityError,
   isTransientTapeError,
   phaseAVisibleHeadText,
+  pickTapeDisplayFallbackText,
   recordsPublished,
+  sanitizeValueForPgJsonb,
   settlementAuthorityHash,
   settlementEngineBillings,
   settlementPayloadEqual,
   visibleHeadFallback,
   visibleHeadFromSettlement,
+  warnTapeDisplayDegrade,
+  type TapeDisplayDegradeReason,
   type VisibleHead,
 } from "./visibleFinalize.js";
 import {
@@ -2577,7 +2582,7 @@ function userVisiblePhysicalPayload(
   };
 }
 
-async function prepareLosslessTurnTapeOutsideLocks(
+export async function _prepareLosslessTurnTapeOutsideLocks(
   pool: Pool,
   userId: string,
   request: LosslessTurnTapeFinalizeRequest,
@@ -2638,6 +2643,10 @@ async function prepareLosslessTurnTapeOutsideLocks(
   const turn = materializeLosslessTurn(rawPayload, {
     runtimeBatching: recordStorageFormat === 3,
   });
+  // Record payload BYTEA + content_sha256 stay the part-derived original.
+  // visible_payload is also BYTEA and stays exact (timeline must round-trip
+  // JSON \u0000). PostgreSQL jsonb rejects \u0000 / unpaired surrogates;
+  // only jsonb binds and sidecar TEXT may be rewritten.
   if (
     turn.payload.sessionId !== request.sessionId ||
     turn.payload.agentId !== request.agentId ||
@@ -2665,6 +2674,9 @@ async function prepareLosslessTurnTapeOutsideLocks(
     if (!payload) {
       throw new Error(`[pgSessions] lossless tape record is not a JSON object: ${item.id}`);
     }
+    // visible_payload is BYTEA, not jsonb. Keep exact JSON (including \u0000)
+    // so timeline/exact reads match original record bytes. jsonb columns are
+    // sanitized at bind time; the 0232 trigger lazy-sanitizes agent-group casts.
     return payload;
   });
   return {
@@ -2755,7 +2767,7 @@ export function _losslessTurnRecordStageBatches(
   return batches;
 }
 
-async function stagePreparedLosslessTurnRecords(
+export async function _stagePreparedLosslessTurnRecords(
   pool: Pool,
   userId: string,
   request: LosslessTurnTapeFinalizeRequest,
@@ -2789,6 +2801,9 @@ async function stagePreparedLosslessTurnRecords(
       }
       if (tape.finalized_at !== null) return "finalized";
       await client.query("SET LOCAL statement_timeout = '120s'");
+      // Keep original record BYTEA. The 0232 trigger sanitizes jsonb-illegal
+      // unicode escapes (or skips canonicalize) instead of failing INSERT.
+      // Application already rejects trigger rewrites of payload/hash.
       if (tape.record_storage_format !== prepared.recordStorageFormat) {
         throw new Error("lossless turn tape materialization format changed during staging");
       }
@@ -4834,6 +4849,13 @@ type UnifiedTimelineSelectedUnit =
       orderSeq: number;
       header: UnifiedTimelineTapeHeader;
       head: UnifiedTimelineTapeHead;
+    }
+  | {
+      kind: "tape-fallback";
+      anchor: MessageLike;
+      orderSeq: number;
+      header: UnifiedTimelineTapeHeader | null;
+      reason: TapeDisplayDegradeReason;
     };
 
 type UnifiedTimelineStatusRow = {
@@ -5202,7 +5224,15 @@ async function readUnifiedTimelineBashTailAuxiliaries(
         window.header.tapeSha256,
         window.header.billingAnchorId,
         selectedHeads,
-      );
+      ).catch((error: unknown) => {
+        warnTapeDisplayDegrade({
+          sessionId,
+          tapeId: window.header.tapeId,
+          reason: classifyUnifiedTimelineIntegrityError(error),
+          detail: error instanceof Error ? error.message : String(error),
+        });
+        return [] as MessageLike[];
+      });
       const headByOrdinal = new Map(selectedHeads.map((head) => [head.ordinal, head]));
       for (const message of hydrated) {
         const ordinal = typeof message._recordOrdinal === "number" ? message._recordOrdinal : -1;
@@ -5297,6 +5327,68 @@ function unifiedTimelineTerminalAuxiliary(window: UnifiedTimelineTapeWindow): Me
   };
 }
 
+function unifiedTimelineTapeFallbackMessages(
+  sessionId: string,
+  unit: {
+    tapeId: string;
+    orderSeq: number;
+    reason: TapeDisplayDegradeReason;
+    header: UnifiedTimelineTapeHeader | null;
+    anchor: MessageLike;
+    detail?: string;
+  },
+): MessageLike[] {
+  const picked = pickTapeDisplayFallbackText({
+    visibleHead: unit.header?.visibleHead,
+    anchorText: unit.anchor.text,
+  });
+  const reason: TapeDisplayDegradeReason = !unit.header
+    ? (unit.reason === "finalized_tape_missing" ? "header_missing" : unit.reason)
+    : (picked.source === "placeholder" && !unit.header.visibleHead ? "visible_head_missing" : unit.reason);
+  warnTapeDisplayDegrade({
+    sessionId,
+    tapeId: unit.tapeId,
+    reason,
+    detail: unit.detail,
+  });
+  const head = unit.header?.visibleHead;
+  const id = (typeof head?.messageId === "string" && head.messageId.length > 0
+    ? head.messageId
+    : null)
+    ?? unit.header?.billingAnchorId
+    ?? (typeof unit.anchor.id === "string" ? unit.anchor.id : `tape-degraded:${unit.tapeId}`);
+  const ts = typeof head?.ts === "number" && Number.isFinite(head.ts)
+    ? head.ts
+    : (typeof unit.anchor.ts === "number" && Number.isFinite(unit.anchor.ts) ? unit.anchor.ts : 0);
+  return [{
+    id,
+    role: "assistant",
+    text: picked.text,
+    ts,
+    status: unit.header?.status ?? (typeof unit.anchor.status === "string" ? unit.anchor.status : "completed"),
+    _source: "server",
+    _turnTapeId: unit.tapeId,
+    _turnTapeSha256: unit.header?.tapeSha256
+      ?? (typeof unit.anchor._turnTapeSha256 === "string" ? unit.anchor._turnTapeSha256 : undefined),
+    _turnTapeComplete: true,
+    _turnKey: unit.header?.turnKey
+      ?? (typeof unit.anchor._turnKey === "string" ? unit.anchor._turnKey : undefined),
+    _orderSeq: unit.orderSeq,
+    _timelineRecord: true,
+    _timelineUnitKey: `tape-fallback:${unit.tapeId}`,
+    _displayDegraded: true,
+    _displayDegradeReason: reason,
+    _dispatchOutcome: unit.header?.status,
+    ...(typeof unit.anchor._seq === "number" ? { _seq: unit.anchor._seq } : {}),
+    ...(unit.header?.clientMessageId
+      ? { _clientMessageId: unit.header.clientMessageId }
+      : (typeof unit.anchor._clientMessageId === "string"
+        ? { _clientMessageId: unit.anchor._clientMessageId }
+        : {})),
+    ...(typeof head?.errorCode === "string" ? { _errorCode: head.errorCode } : {}),
+  }];
+}
+
 async function hydrateUnifiedTimelineTapeUnits(
   client: PoolClient,
   sessionId: string,
@@ -5349,6 +5441,7 @@ async function hydrateUnifiedTimelineTapeUnits(
       continue;
     }
     const physicalKey = `${header.tapeId}\0${head.ordinal}`;
+    try {
     const payloadBytes = bigIntNum(head.payload_bytes, "turn tape timeline payload bytes");
     const billing = billingByTape.get(header.tapeId);
     const isBillingAnchor = head.msg_id === header.billingAnchorId;
@@ -5458,6 +5551,16 @@ async function hydrateUnifiedTimelineTapeUnits(
       _timelineUnitKey: timelineTapeKey(header.tapeId, head.ordinal, logicalIndex, record.id),
     }));
     result.set(physicalKey, logicalRecords);
+    } catch (error) {
+      result.set(physicalKey, unifiedTimelineTapeFallbackMessages(sessionId, {
+        tapeId: header.tapeId,
+        orderSeq: unit.orderSeq,
+        reason: classifyUnifiedTimelineIntegrityError(error),
+        header,
+        anchor,
+        detail: error instanceof Error ? error.message : String(error),
+      }));
+    }
   }
   return result;
 }
@@ -5612,25 +5715,80 @@ async function readClientTimelinePageImpl(
           typeof anchor._turnTapeSha256 === "string"
         ) {
           const header = headers.get(anchor._turnTapeId);
-          if (!header) throw new Error(`[pgSessions] unified timeline finalized tape missing: ${anchor._turnTapeId}`);
+          if (!header) {
+            const fallbackBytes = Buffer.byteLength(String(anchor.text ?? ""), "utf8");
+            if (
+              selected.length >= cappedLimit ||
+              (selected.length > 0 && inlineBytes + fallbackBytes > TAPE_RECORD_PAGE_RAW_QUANTUM_BYTES)
+            ) {
+              foundNextVisible = true;
+              hasMore = true;
+              break outerLoop;
+            }
+            selected.push({
+              kind: "tape-fallback",
+              anchor,
+              orderSeq,
+              header: null,
+              reason: "finalized_tape_missing",
+            });
+            inlineBytes += fallbackBytes;
+            continue;
+          }
           if (header.tapeSha256 !== anchor._turnTapeSha256) {
-            throw new Error(`[pgSessions] unified timeline tape hash mismatch: ${anchor._turnTapeId}`);
+            const fallbackBytes = Buffer.byteLength(header.visibleHead?.text ?? String(anchor.text ?? ""), "utf8");
+            if (
+              selected.length >= cappedLimit ||
+              (selected.length > 0 && inlineBytes + fallbackBytes > TAPE_RECORD_PAGE_RAW_QUANTUM_BYTES)
+            ) {
+              foundNextVisible = true;
+              hasMore = true;
+              break outerLoop;
+            }
+            selected.push({
+              kind: "tape-fallback",
+              anchor,
+              orderSeq,
+              header,
+              reason: "tape_hash_mismatch",
+            });
+            windows.push({
+              anchor,
+              orderSeq,
+              header,
+              lowerOrdinal: 0,
+              upperOrdinal: beforeByTape.get(header.tapeId) ?? 2_147_483_647,
+            });
+            inlineBytes += fallbackBytes;
+            continue;
           }
           const upperOrdinal = beforeByTape.get(header.tapeId) ?? 2_147_483_647;
           const recordsReady = recordsPublished({
             materializationStatus: header.materializationStatus,
             finalizedAt: header.finalizedAt,
           });
-          const heads = recordsReady ? (headsByTape.get(header.tapeId) ?? []) : [{
-            tape_id: header.tapeId,
-            msg_id: header.visibleHead?.messageId ?? header.billingAnchorId,
-            ordinal: 0,
-            role: "assistant",
-            ts: String(header.visibleHead?.ts ?? 0),
-            content_sha256: "0".repeat(64),
-            payload_bytes: "0",
-            visible_content_sha256: null,
-          }];
+          if (!recordsReady) {
+            const fallbackBytes = Buffer.byteLength(header.visibleHead?.text ?? String(anchor.text ?? ""), "utf8");
+            if (
+              selected.length >= cappedLimit ||
+              (selected.length > 0 && inlineBytes + fallbackBytes > TAPE_RECORD_PAGE_RAW_QUANTUM_BYTES)
+            ) {
+              foundNextVisible = true;
+              hasMore = true;
+              break outerLoop;
+            }
+            selected.push({
+              kind: "tape-fallback",
+              anchor,
+              orderSeq,
+              header,
+              reason: "records_unpublished",
+            });
+            windows.push({ anchor, orderSeq, header, lowerOrdinal: 0, upperOrdinal });
+            inlineBytes += fallbackBytes;
+            continue;
+          }
+          const heads = headsByTape.get(header.tapeId) ?? [];
           let oldestSelectedOrdinal: number | null = null;
           for (const head of heads) {
             const payloadBytes = bigIntNum(head.payload_bytes, "turn tape timeline payload bytes");
@@ -5714,31 +5872,27 @@ async function readClientTimelinePageImpl(
 
     const chronological: MessageLike[] = [];
     for (const unit of [...selected].reverse()) {
+      if (unit.kind === "tape-fallback") {
+        chronological.push(...unifiedTimelineTapeFallbackMessages(sessionId, {
+          tapeId: unit.header?.tapeId ?? String(unit.anchor._turnTapeId),
+          orderSeq: unit.orderSeq,
+          reason: unit.reason,
+          header: unit.header,
+          anchor: unit.anchor,
+        }));
+        continue;
+      }
       if (unit.kind === "tape") {
         const records = tapeMessages.get(`${unit.header.tapeId}\0${unit.head.ordinal}`);
         if (!records) {
-          if (!recordsPublished({
-            materializationStatus: unit.header.materializationStatus,
-            finalizedAt: unit.header.finalizedAt,
-          })) {
-            chronological.push({
-              id: unit.header.visibleHead?.messageId ?? unit.header.billingAnchorId,
-              role: "assistant",
-              text: unit.header.visibleHead?.text ?? "",
-              ts: unit.header.visibleHead?.ts ?? 0,
-              status: unit.header.status,
-              _source: "server",
-              _turnTapeId: unit.header.tapeId,
-              _turnTapeSha256: unit.header.tapeSha256,
-              _turnTapeComplete: true,
-              _turnKey: unit.header.turnKey,
-              _orderSeq: unit.orderSeq,
-              _timelineRecord: true,
-              ...(unit.header.clientMessageId ? { _clientMessageId: unit.header.clientMessageId } : {}),
-            });
-            continue;
-          }
-          throw new Error(`[pgSessions] unified timeline hydrated group missing: ${unit.header.tapeId}\0${unit.head.ordinal}`);
+          chronological.push(...unifiedTimelineTapeFallbackMessages(sessionId, {
+            tapeId: unit.header.tapeId,
+            orderSeq: unit.orderSeq,
+            reason: "hydrated_group_missing",
+            header: unit.header,
+            anchor: unit.anchor,
+          }));
+          continue;
         }
         chronological.push(...records);
         continue;
@@ -5749,7 +5903,18 @@ async function readClientTimelinePageImpl(
         typeof unit.anchor._turnTapeId === "string" &&
         typeof unit.anchor._turnTapeSha256 === "string"
       ) {
-        outerMessages = await hydrateTurnTapeMessages(client, sessionId, userId, [unit.anchor], { view: "exact" });
+        try {
+          outerMessages = await hydrateTurnTapeMessages(client, sessionId, userId, [unit.anchor], { view: "exact" });
+        } catch (error) {
+          outerMessages = unifiedTimelineTapeFallbackMessages(sessionId, {
+            tapeId: String(unit.anchor._turnTapeId),
+            orderSeq: unit.orderSeq,
+            reason: classifyUnifiedTimelineIntegrityError(error),
+            header: null,
+            anchor: unit.anchor,
+            detail: error instanceof Error ? error.message : String(error),
+          });
+        }
       }
       for (let index = 0; index < outerMessages.length; index++) {
         const message = outerMessages[index]!;
@@ -7383,7 +7548,7 @@ export function createPgSessionsBackend(
           );
           prepared = recordStorageFormat === null
             ? null
-            : await prepareLosslessTurnTapeOutsideLocks(
+            : await _prepareLosslessTurnTapeOutsideLocks(
                 pool,
                 userId,
                 request,
@@ -7391,7 +7556,7 @@ export function createPgSessionsBackend(
               );
           if (prepared) {
             preparedModelRecordCount = preparedModelSidecarManifest(prepared).length;
-            await stagePreparedLosslessTurnRecords(
+            await _stagePreparedLosslessTurnRecords(
               pool,
               userId,
               request,
@@ -8047,9 +8212,9 @@ export function createPgSessionsBackend(
             WHERE session_id=$17 AND user_id=$18 AND tape_id=$19`,
           [
             turn.billingAnchorId,
-            JSON.stringify(turn.payload.usage ?? {}),
+            JSON.stringify(sanitizeValueForPgJsonb(turn.payload.usage ?? {})),
             turn.payload.parentTurnKey ?? null,
-            JSON.stringify(turn.engineBillings),
+            JSON.stringify(sanitizeValueForPgJsonb(turn.engineBillings)),
             Date.now(),
             prepared.recordStorageFormat,
             turn.payload.goalId ?? null,

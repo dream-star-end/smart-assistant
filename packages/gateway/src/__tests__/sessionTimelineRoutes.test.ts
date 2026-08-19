@@ -35,6 +35,22 @@ test('browser history uses one opaque unified timeline route', () => {
   assert.doesNotMatch(timelineRoute, /_turnTapeProcess|projection|listTurnTapeRecords/)
 })
 
+test('session GET failures log message+stack+sessionId and return requestId', () => {
+  assert.match(source, /private sendSessionReadFailure\(/)
+  assert.match(source, /this\.log\.error\('session read failed', \{ sessionId, requestId, publicError \}, err\)/)
+  assert.match(source, /this\.sendJson\(res, 500, \{ error: publicError, requestId \}\)/)
+  assert.match(routes, /this\.sendSessionReadFailure\(res, error, sessId, 'timeline read failed'\)/)
+  assert.match(routes, /this\.sendSessionReadFailure\(res, error, sessId, 'get failed'\)/)
+  assert.equal(
+    (routes.match(/this\.sendSessionReadFailure\(res, error, sessId, 'get failed'\)/g) ?? []).length,
+    2,
+  )
+  assert.doesNotMatch(
+    routes.slice(routes.indexOf('const timelineMatch'), routes.indexOf('const archiveMatch')),
+    /\.catch\(\(\) => this\.sendJson\(res, 500/,
+  )
+})
+
 test('user payload routes cover canonical 128-char ids and legacy colon ids', () => {
   assert.equal(isPersistedClientMessageId('a'.repeat(128)), true)
   assert.equal(isPersistedClientMessageId('cm:user:large'), true)

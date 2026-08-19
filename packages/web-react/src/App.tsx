@@ -24,6 +24,8 @@ import { extractLatestTodos, PinnedTaskTracker } from "./components/chat/PinnedT
 import { deriveActivePlanStep, type TurnActivityInfo } from "./components/chat/TurnActivity";
 import { EmptyState } from "./components/EmptyState";
 import { type ChatError, ErrorBanner } from "./components/ErrorBanner";
+import { SessionTimelineBoundary } from "./components/SessionTimelineBoundary";
+import { sessionHistorySurface } from "./lib/chat/historyLoadState";
 import { UpdateBanner } from "./components/UpdateBanner";
 import { GithubRepoModal } from "./components/github/GithubRepoModal";
 import { RepoStatusBanner } from "./components/github/RepoStatusBanner";
@@ -504,6 +506,8 @@ export function App() {
     reset: resetSessionList,
     serverListSettled,
     historyLoading,
+    historyError,
+    retryHistory,
   } = useSessionList({
     demo,
     auth,
@@ -2356,6 +2360,14 @@ export function App() {
       graceExpired: historyGraceExpired,
       capExpired: historyCapExpired,
     });
+  const historySurface = sessionHistorySurface({
+    gated,
+    loadingHistory,
+    hasMessages: demo ? messages.length > 0 : wsMessages.length > 0,
+    sending: demo ? busy : wsSending,
+    knownNonEmpty: (activeMeta?.messageCount ?? 0) > 0,
+    historyError: !demo && historyError !== null,
+  });
 
   // 统一真实时间线分页：仅显式按钮加载，滚动绝不发请求。
   // demo / 无选中会话时不下发(MessageList 退化为纯本地翻页)。
@@ -2561,10 +2573,33 @@ export function App() {
               onRetry={gate.check}
               onTopUp={() => openSettings()}
             />
-          ) : loadingHistory ? (
+          ) : loadingHistory || historySurface === "skeleton" ? (
             // 冷会话历史拉取期：消息形骨架占位，避免「空白 → 突然填满」的突变。
             <MessageListSkeleton />
-          ) : showEmpty ? (
+          ) : historySurface === "error" ? (
+            <div
+              className="mx-auto flex max-w-3xl flex-col gap-3 px-5 py-12"
+              data-testid="session-history-error"
+            >
+              <Alert
+                tone="danger"
+                title="会话加载失败"
+                action={
+                  activeId ? (
+                    <button
+                      type="button"
+                      className="rounded-full bg-hover px-3 py-1.5 text-xs text-fg"
+                      onClick={() => retryHistory(activeId)}
+                    >
+                      重试
+                    </button>
+                  ) : undefined
+                }
+              >
+                {historyError?.message || "加载失败，请重试。不会把已有会话显示成空白欢迎页。"}
+              </Alert>
+            </div>
+          ) : showEmpty || historySurface === "empty" ? (
             <EmptyState
               agent={agent}
               onPrefill={(text) => setComposerPrefill({ text, nonce: Date.now() })}
@@ -2603,22 +2638,47 @@ export function App() {
             // ResponseRatingProvider 下发逐条评价态：AssistantCard 内的评价卡作为 Context
             // 消费者，随 ratings 变更穿透 MessageRenderer 的 sig-memo 重渲（无需改渲染签名）。
             <ResponseRatingProvider value={ratingCtx}>
-              <MessageList
-                key={activeId}
-                messages={wsMessages}
-                sending={wsSending}
-                liveTurnUsage={activeSess?._liveTurnUsage}
-                turnActivity={turnActivity}
-                transientNotice={transientNotice}
-                historyLoading={historyLoading}
-                journalDegraded={activeSess?._liveJournalDegraded === true}
-                onRetryJournal={activeId ? () => { void chat.retryLiveJournalHydration(activeId); } : undefined}
-                archive={messageListArchive}
-                cb={cardCallbacks}
-                onRespondPermission={onRespondPermission}
-                scrollParent={chatScrollParent}
-                historyGeneration={`${activeId ?? "none"}::${activeSess?._timelineGeneration ?? "legacy"}`}
-              />
+              <SessionTimelineBoundary
+                resetKey={activeId ?? "none"}
+                onRetry={activeId ? () => retryHistory(activeId) : undefined}
+              >
+                {historyError && wsMessages.length > 0 && (
+                  <div className="mx-auto mb-2 max-w-3xl px-5 pt-4" data-testid="session-history-error-banner">
+                    <Alert
+                      tone="danger"
+                      title="会话加载失败"
+                      action={
+                        <button
+                          type="button"
+                          className="rounded-full bg-hover px-3 py-1.5 text-xs text-fg"
+                          onClick={() => activeId && retryHistory(activeId)}
+                        >
+                          重试
+                        </button>
+                      }
+                    >
+                      {historyError.message}
+                    </Alert>
+                  </div>
+                )}
+                <MessageList
+                  key={activeId}
+                  messages={wsMessages}
+                  sending={wsSending}
+                  liveTurnUsage={activeSess?._liveTurnUsage}
+                  turnActivity={turnActivity}
+                  transientNotice={transientNotice}
+                  historyLoading={historyLoading}
+                  journalDegraded={activeSess?._liveJournalDegraded === true}
+                  onRetryJournal={activeId ? () => { void chat.retryLiveJournalHydration(activeId); } : undefined}
+                  archive={messageListArchive}
+                  cb={cardCallbacks}
+                  onRespondPermission={onRespondPermission}
+                  scrollParent={chatScrollParent}
+                  historyGeneration={`${activeId ?? "none"}::${activeSess?._timelineGeneration ?? "legacy"}`}
+                  sessionId={activeId}
+                />
+              </SessionTimelineBoundary>
             </ResponseRatingProvider>
           )}
         </div>

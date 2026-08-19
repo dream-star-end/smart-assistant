@@ -357,6 +357,12 @@ export type ChatMessage = {
   _historyPageKey?: string;
   /** Opaque cursor that produced this older in-memory page. */
   _historyPageLoadedFrom?: string;
+  /** Per-tape display degrade (visible_head/anchor fallback). */
+  _displayDegraded?: boolean;
+  _displayDegradeReason?: string;
+  /** Sanitizer placeholder for a structurally invalid history/socket row. */
+  _corruptPlaceholder?: boolean;
+  _corruptReason?: "missing-id" | "malformed";
 
   // ── 过程控制的本地展开态（仅会话内存，不写回 server）──
   /** 已开始显示真实 Agent 过程。 */

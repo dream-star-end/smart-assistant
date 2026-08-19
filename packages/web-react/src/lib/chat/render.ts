@@ -358,7 +358,12 @@ export function messageSignature(
         head,
         textSig(m.text),
         m.explanation ? m.explanation.length : 0,
-        (m.steps ?? []).map((s) => `${s.status}:${s.step.length}`).join(","),
+        (Array.isArray(m.steps) ? m.steps : []).map((s) => {
+          if (!s || typeof s !== "object") return "invalid";
+          const status = typeof s.status === "string" ? s.status : "";
+          const step = typeof s.step === "string" ? s.step : "";
+          return `${status}:${step.length}`;
+        }).join(","),
         m._partial ? 1 : 0,
       ].join("|");
     case "goal":
@@ -427,6 +432,19 @@ export function messageSignature(
       ].join("|");
     default:
       return [head, textSig(m.text)].join("|");
+  }
+}
+
+/** Signature used by list coalescing / per-row memo. Never throws: one malformed
+ * nested field must not blank the rest of the timeline. */
+export function safeMessageSignature(
+  m: ChatMessage,
+  ctx: { isLast: boolean; sending: boolean; turnFinalAssistant?: boolean },
+): string {
+  try {
+    return messageSignature(m, ctx);
+  } catch {
+    return `corrupt|${m.role}|${typeof m.id === "string" ? m.id : ""}`;
   }
 }
 

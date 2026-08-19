@@ -29,8 +29,9 @@ import {
   isRedundantRuntimeEnvelope,
   isTurnStatusSuppressedByTape,
   messageKind,
-  messageSignature,
+  safeMessageSignature,
 } from "../lib/chat/render";
+import { sanitizeChatMessages } from "../lib/chat/sanitizeChatMessages";
 import {
   AssistantCard,
   type CardCallbacks,
@@ -538,7 +539,7 @@ function DeferredTapeRecordCard({
           const final = isLast && index === records.length - 1;
           const recordIsFinalAssistant = turnFinalAssistant === true &&
             hydratedRecord.role === "assistant" && index === records.length - 1;
-          const recordSig = messageSignature(hydratedRecord, {
+          const recordSig = safeMessageSignature(hydratedRecord, {
             isLast: final,
             sending,
             turnFinalAssistant: recordIsFinalAssistant,
@@ -770,7 +771,7 @@ function coalesceTeam(
           sig: members
             .map(
               (mm, k) =>
-                `${messageSignature(mm, { isLast: false, sending })}|c:${costFor(memberIdx[k], mm) ?? ""}|du:${tokenUsageSignature(delegateTokenUsage(mm))}`,
+                `${safeMessageSignature(mm, { isLast: false, sending })}|c:${costFor(memberIdx[k], mm) ?? ""}|du:${tokenUsageSignature(delegateTokenUsage(mm))}`,
             )
             .join("||"),
           delegateCosts,
@@ -825,7 +826,7 @@ function coalesceTeam(
       // 组 sig = 各成员签名拼接(仅末条按 groupIsLast 参与 isLast;文本 + 流式态都编进,
       // 后到成员/流式完成时 memo 正常重渲防漏渲)。key 用首条成员 id → 流式追加成员时稳定不重挂。
       const sig = members
-        .map((mm, k) => messageSignature(mm, { isLast: groupIsLast && k === members.length - 1, sending }))
+        .map((mm, k) => safeMessageSignature(mm, { isLast: groupIsLast && k === members.length - 1, sending }))
         .join("||");
       const thinkingUsage = groupedCallTokenUsage(members.map((member) => member._callUsage));
       items.push({
@@ -920,6 +921,7 @@ export function MessageList({
   readOnly = false,
   scrollParent,
   historyGeneration = "legacy",
+  sessionId,
 }: {
   messages: ChatMessage[];
   sending: boolean;
@@ -944,6 +946,7 @@ export function MessageList({
   scrollParent?: HTMLElement | null;
   /** Server history revision. A new revision gets a fresh paging intent owner. */
   historyGeneration?: number | string;
+  sessionId?: string;
 }) {
   const pagingOwnerRef = useRef<{
     generation: string;
@@ -1076,20 +1079,22 @@ export function MessageList({
   // Drop legacy substitute rows from an old IndexedDB cache and duplicate
   // engine transport envelopes. The latter remain byte-complete in the tape;
   // their canonical immutable Agent blocks are the user-facing timeline.
-  const resolvedDispatchTurnIds = collectResolvedDispatchTurnIds(messages);
+  const safeMessages = sanitizeChatMessages(messages, sessionId);
+  const resolvedDispatchTurnIds = collectResolvedDispatchTurnIds(safeMessages);
   // Automatic recovery rows remain in memory/IndexedDB/PG as exact lineage,
   // but are transport controls rather than another user utterance. While a
   // child exists, its source terminal card is likewise an intermediate state;
   // only the final exhausted/unsafe error remains visible.
   const automaticallyRecoveredSourceIds = new Set(
-    messages
+    safeMessages
       .filter((message) => message.role === "user" && message._automaticRecovery === true)
       .map((message) => message._recoveryOfClientMessageId)
       .filter((id): id is string => typeof id === "string" && id.length > 0),
   );
-  const renderableMessages = messages.filter(
+  const renderableMessages = safeMessages.filter(
     (m) =>
       !(m as ChatMessage & { _historyProjection?: unknown })._historyProjection &&
+      typeof m.id === "string" &&
       !m.id.startsWith("projection-") &&
       !m.id.startsWith("oc-dispatch-err:") &&
       m._turnTapeProcess !== true &&
@@ -1111,7 +1116,7 @@ export function MessageList({
       .map((message) => message.id),
   );
   const automaticRecoveryParents = new Map(
-    messages
+    safeMessages
       .filter(
         (message) =>
           message.role === "user" &&
@@ -1147,7 +1152,7 @@ export function MessageList({
     ? Math.max(
         0,
         (archive?.archivedCount ?? 0) - loadedArchivedMetrics(
-          messages,
+          safeMessages,
           archive?.archivedThroughSeq ?? 0,
         ).anchors,
       )
@@ -1246,13 +1251,28 @@ export function MessageList({
     const turnFinalAssistant = ratingFinal[it.idx] ?? false;
     const failurePresentedBelow =
       it.m.role === "user" && presentedErrorTurnIds.has(it.m.id);
-    const rowSig = `${messageSignature(it.m, {
-      isLast: it.isLast,
-      sending,
-      turnFinalAssistant,
-    })}|tu:${tokenUsageSignature(it.tokenUsage)}|du:${tokenUsageSignature(delegateTokenUsage(it.m))}|pe:${failurePresentedBelow ? 1 : 0}`;
+    const rowId = it.m._timelineUnitKey ?? it.m.id;
+    let rowSig: string;
+    try {
+      rowSig = `${safeMessageSignature(it.m, {
+        isLast: it.isLast,
+        sending,
+        turnFinalAssistant,
+      })}|tu:${tokenUsageSignature(it.tokenUsage)}|du:${tokenUsageSignature(delegateTokenUsage(it.m))}|pe:${failurePresentedBelow ? 1 : 0}`;
+    } catch {
+      return (
+        <MessageBoundary messageId={rowId} sig={`corrupt-row|${rowId}`}>
+          <div
+            className="flex items-center gap-2 rounded-lg border border-border bg-surface px-3.5 py-2 text-[12.5px] text-muted"
+            data-testid="corrupt-message-placeholder"
+          >
+            此条消息数据结构异常，已跳过渲染
+          </div>
+        </MessageBoundary>
+      );
+    }
     return (
-      <MessageBoundary messageId={it.m._timelineUnitKey ?? it.m.id} sig={rowSig}>
+      <MessageBoundary messageId={rowId} sig={rowSig}>
         <MessageRenderer
           message={it.m}
           sig={rowSig}

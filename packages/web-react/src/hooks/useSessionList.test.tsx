@@ -1,6 +1,6 @@
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { type Mock, afterEach, describe, expect, test, vi } from "vitest";
-import { api } from "../lib/api";
+import { api, ApiError } from "../lib/api";
 import { createMemoryAuthSession } from "../lib/authSession";
 import type { SessionDetail, User } from "../lib/types";
 import type { UseChatSocket } from "./useChatSocket";
@@ -398,6 +398,79 @@ describe("useSessionList history loading fence", () => {
     await waitFor(() => expect(result.current.historyLoading).toBe(false));
     expect(hydrateDurableLiveFrameJournal).toHaveBeenCalledTimes(1);
     expect(socket.mergeServerHistory).toHaveBeenCalledTimes(1);
+  });
+
+  test("GET 5xx 且侧栏 messageCount>0 记 historyError，retryHistory 不走 selectSession", async () => {
+    vi.spyOn(api, "listSessions").mockResolvedValue([
+      {
+        id: "webhistory5xx",
+        title: "非空会话",
+        agentId: "main",
+        updatedAt: 2_000,
+        lastAt: 2_000,
+        messageCount: 4,
+      },
+    ] as never);
+    const getSession = vi.spyOn(api, "getSession").mockRejectedValue(
+      new ApiError({ status: 500, message: "get failed" }),
+    );
+    const auth = createMemoryAuthSession(() => {}, "token");
+    const user: User = { id: "u1", displayName: "User", roles: ["user"] };
+    const socket = {
+      storedMaxSeq: () => 0,
+      storedHistoryRevision: () => 1,
+      mergeServerHistory: vi.fn(),
+    } as unknown as UseChatSocket;
+    const { result } = renderHook(() => useSessionList({
+      demo: false,
+      auth,
+      authSession: auth,
+      user,
+      agentId: "main",
+      sockRef: { current: socket },
+      confirmDialog: async () => true,
+      promptText: async () => null,
+      clearChatError: () => {},
+      onNewSessionReset: () => {},
+      onActiveSessionDeleted: () => {},
+    }));
+    await waitFor(() => expect(result.current.sessions.some((s) => s.id === "webhistory5xx")).toBe(true));
+    act(() => result.current.selectSession("webhistory5xx"));
+    await waitFor(() => expect(result.current.historyError?.sessionId).toBe("webhistory5xx"));
+    expect(result.current.historyError?.message).toMatch(/get failed|加载失败/);
+    const activeBefore = result.current.activeId;
+    getSession.mockRejectedValueOnce(new ApiError({ status: 500, message: "get failed again" }));
+    act(() => result.current.retryHistory("webhistory5xx"));
+    await waitFor(() => expect(getSession.mock.calls.length).toBeGreaterThanOrEqual(2));
+    expect(result.current.activeId).toBe(activeBefore);
+  });
+
+  test("GET 404 不当成 historyError", async () => {
+    vi.spyOn(api, "listSessions").mockResolvedValue([]);
+    vi.spyOn(api, "getSession").mockRejectedValue(new ApiError({ status: 404, message: "not found" }));
+    const auth = createMemoryAuthSession(() => {}, "token");
+    const user: User = { id: "u1", displayName: "User", roles: ["user"] };
+    const socket = {
+      storedMaxSeq: () => 0,
+      storedHistoryRevision: () => 1,
+      mergeServerHistory: vi.fn(),
+    } as unknown as UseChatSocket;
+    const { result } = renderHook(() => useSessionList({
+      demo: false,
+      auth,
+      authSession: auth,
+      user,
+      agentId: "main",
+      sockRef: { current: socket },
+      confirmDialog: async () => true,
+      promptText: async () => null,
+      clearChatError: () => {},
+      onNewSessionReset: () => {},
+      onActiveSessionDeleted: () => {},
+    }));
+    act(() => result.current.selectSession("weblocalnew1"));
+    await waitFor(() => expect(result.current.historyLoading).toBe(false));
+    expect(result.current.historyError).toBeNull();
   });
 });
 
