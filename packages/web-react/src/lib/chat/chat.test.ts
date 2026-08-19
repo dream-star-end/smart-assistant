@@ -1398,6 +1398,168 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
     expect(u.status).toBe("read"); // 标 read
   });
 
+  // leftover child-mirror: 父轮已 isFinal 后涌来的纯 delegate_progress 不得把父会话
+  // 重新点亮成「正在生成」，新卡必须落在终态答复前（调用点），不能再 append 到会话末尾。
+  test("progress-only 帧在父轮收尾后不复活发送态，卡片插在终态答复前", () => {
+    const s = sess();
+    const onLiveFrame = vi.fn();
+    const u = addMessage(s, "user", "把计费搞起来", { id: "u-parent", status: "sent" });
+    s._activeClientMessageId = u.id;
+    s._sendingInFlight = true;
+    applyOutboundMessage(s, msgFrame({
+      frameSeq: 1,
+      clientMessageId: u.id,
+      blocks: [{ kind: "text", text: "技术点\\n- GPT 1M", messageId: "srv-final-answer" }],
+    }));
+    applyOutboundMessage(s, msgFrame({
+      frameSeq: 2,
+      clientMessageId: u.id,
+      isFinal: true,
+      blocks: [],
+      meta: { stopReason: "end_turn" },
+    }));
+    expect(s._sendingInFlight).toBe(false);
+    const next = addMessage(s, "user", "下一条", { status: "sent" });
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 3,
+        blocks: [{
+          kind: "delegate_progress",
+          runId: "dlg-late",
+          agentId: "auditor",
+          phase: "start",
+          goal: "审 diff",
+          text: "开始委派给 auditor",
+        }],
+      }),
+      { onLiveFrame },
+    );
+    expect(s._sendingInFlight).toBe(false);
+    expect(s._replyingToMsgId).toBeFalsy();
+    expect(next.status).toBe("sent");
+    expect(onLiveFrame).not.toHaveBeenCalled();
+    const roles = s.messages.map((m) => m.role);
+    const cardAt = roles.lastIndexOf("delegate-progress");
+    const answerAt = roles.indexOf("assistant");
+    expect(cardAt).toBeGreaterThan(-1);
+    expect(answerAt).toBeGreaterThan(-1);
+    expect(cardAt).toBeLessThan(answerAt);
+  });
+
+  test("progress-only 帧不重复创建已有 tape/server 委派卡", () => {
+    const s = sess();
+    addMessage(s, "user", "审一下", { id: "u-tape", status: "replied" });
+    addMessage(s, "delegate-progress", "委派子任务", {
+      runId: "dlg-tape",
+      agentId: "auditor",
+      _source: "server",
+      _completed: true,
+      summary: "已完成",
+    });
+    addMessage(s, "assistant", "结论写完了", { _source: "server" });
+    s._sendingInFlight = false;
+    applyOutboundMessage(s, msgFrame({
+      frameSeq: 9,
+      blocks: [{
+        kind: "delegate_progress",
+        runId: "dlg-tape",
+        agentId: "auditor",
+        phase: "done",
+        text: "我先核对未提交 diff",
+      }],
+    }));
+    expect(s.messages.filter((m) => m.role === "delegate-progress")).toHaveLength(1);
+    expect(s._sendingInFlight).toBe(false);
+    expect(s.messages.map((m) => m.role)).toEqual(["user", "delegate-progress", "assistant"]);
+  });
+
+  test("混合帧(progress + text)行为不变:仍复活发送态", () => {
+    const s = sess();
+    const onLiveFrame = vi.fn();
+    const u = addMessage(s, "user", "继续", { status: "sent" });
+    s._sendingInFlight = false;
+    s._replyingToMsgId = null;
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 1,
+        blocks: [
+          { kind: "delegate_progress", runId: "dlg-mix", agentId: "auditor", phase: "text", text: "审" },
+          { kind: "text", text: "父轮还在写", messageId: "srv-mix" },
+        ],
+      }),
+      { onLiveFrame },
+    );
+    expect(s._sendingInFlight).toBe(true);
+    expect(onLiveFrame).toHaveBeenCalledWith(s);
+    expect(u.status).toBe("read");
+  });
+
+  test("活跃轮首帧 progress-only 时卡片保持在新 user 行之后（不跨到上一轮答复前）", () => {
+    const s = sess();
+    addMessage(s, "user", "上一轮问题", { id: "u-prev", status: "replied" });
+    addMessage(s, "assistant", "上一轮答复正文", { id: "a-prev" });
+    const uNew = addMessage(s, "user", "新一轮请立刻委派", { id: "u-new", status: "sent" });
+    s._sendingInFlight = true;
+    s._activeClientMessageId = uNew.id;
+    s._streamingAssistant = null;
+    s._replyingToMsgId = null;
+    applyOutboundMessage(s, msgFrame({
+      frameSeq: 1,
+      clientMessageId: uNew.id,
+      blocks: [{
+        kind: "delegate_progress",
+        runId: "dlg-active",
+        agentId: "auditor",
+        phase: "start",
+        goal: "审 diff",
+        text: "开始委派给 auditor",
+      }],
+    }));
+    expect(s.messages.map((m) => m.role)).toEqual([
+      "user",
+      "assistant",
+      "user",
+      "delegate-progress",
+    ]);
+    expect(s.messages[3]?.runId).toBe("dlg-active");
+    expect(s.messages.findIndex((m) => m.id === uNew.id)).toBe(2);
+  });
+
+  test("活跃轮首帧 progress-only 仍绑 reply tracker 并标 user read", () => {
+    const s = sess();
+    const onLiveFrame = vi.fn();
+    addMessage(s, "user", "上一轮问题", { id: "u-prev", status: "replied" });
+    addMessage(s, "assistant", "上一轮答复正文", { id: "a-prev" });
+    const uNew = addMessage(s, "user", "新一轮请立刻委派", { id: "u-new", status: "sent" });
+    s._sendingInFlight = true;
+    s._activeClientMessageId = uNew.id;
+    s._streamingAssistant = null;
+    s._replyingToMsgId = null;
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 1,
+        clientMessageId: uNew.id,
+        blocks: [{
+          kind: "delegate_progress",
+          runId: "dlg-active-b",
+          agentId: "auditor",
+          phase: "start",
+          goal: "审 diff",
+          text: "开始委派给 auditor",
+        }],
+      }),
+      { onLiveFrame },
+    );
+    expect(s._sendingInFlight).toBe(true);
+    expect(s._replyingToMsgId).toBe(uNew.id);
+    expect(uNew.status).toBe("read");
+    expect(onLiveFrame).toHaveBeenCalledWith(s);
+  });
+
+
   // C2:采用引擎 messageId(srv- 前缀)的 live 生成行也应被盖上当前活跃轮的 _clientMessageId,
   // 否则 finalize 后无法按 _clientMessageId 精确去重(与 server 分段副本并存重复渲染)。
   test("采用引擎 messageId(srv-*)的 live assistant 行也盖 _clientMessageId", () => {
