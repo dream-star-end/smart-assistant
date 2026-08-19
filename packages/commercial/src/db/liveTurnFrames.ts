@@ -341,6 +341,16 @@ export async function readClientSessionLiveFrames(
                    AND t.finalized_at IS NOT NULL
               )
             )
+            AND NOT (
+              s.stream_key LIKE 'legacy:%'
+              AND s.client_message_id IS NULL
+              AND NOT EXISTS (
+                SELECT 1
+                  FROM turn_dispatches d
+                 WHERE d.session_id=s.session_id
+                   AND d.status IN ('accepted','admitted','rejecting')
+              )
+            )
           ORDER BY f.record_id
           LIMIT $4`,
         [sessionId, userId, cursor, pageSize + 1],
@@ -664,7 +674,7 @@ export async function retireDeadLiveStreams(
     DEFAULT_RETIRE_MIN_AGE_MS,
     365 * 24 * 60 * 60 * 1000,
   );
-  const result = await pool.query<{ stream_key: string }>(
+  const aged = await pool.query<{ stream_key: string }>(
     `UPDATE client_session_live_streams s
         SET provenance = s.provenance || jsonb_build_object('retired_at', NOW()::text),
             terminal_status = COALESCE(
@@ -695,5 +705,24 @@ export async function retireDeadLiveStreams(
       RETURNING s.stream_key`,
     [minAgeMs],
   );
-  return { retired: result.rowCount ?? 0 };
+  // Leftover legacy journals (no cmid, no dispatch) never converge. Retire
+  // them immediately when the session has no in-flight dispatch — do not
+  // wait for the scheduler minAge floor.
+  const leftover = await pool.query<{ stream_key: string }>(
+    `UPDATE client_session_live_streams s
+        SET provenance = s.provenance || jsonb_build_object('retired_at', NOW()::text)
+      WHERE s.client_message_id IS NULL
+        AND s.dispatch_id IS NULL
+        AND s.source='gateway'
+        AND s.projection_source='live'
+        AND NOT (s.provenance ? 'retired_at')
+        AND NOT EXISTS (
+          SELECT 1 FROM turn_dispatches d
+           WHERE d.session_id=s.session_id
+             AND d.status IN ('accepted','admitted','rejecting')
+        )
+      RETURNING s.stream_key`,
+  );
+  return { retired: (aged.rowCount ?? 0) + (leftover.rowCount ?? 0) };
 }
+

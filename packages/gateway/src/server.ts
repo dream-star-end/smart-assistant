@@ -10479,6 +10479,13 @@ export class Gateway {
     const nestLabel = nestedProgress
       ? [...(progressRouting?.ancestorAgentPath ?? []), targetAgentId].join('↳')
       : ''
+    // Capture webchat-ancestor cmid at closure creation. Leftover live
+    // journals are minted when delegate_progress is persisted without a
+    // clientMessageId; persist must not guess the in-flight cmid.
+    const parentCmid = progressTarget
+      ? this.sessions.getByKey(progressTarget.sessionKey)?._runningClientMessageId
+        ?? this.sessions.getByKey(progressTarget.sessionKey)?._currentDispatch?.clientMessageId
+      : undefined
     const emitProgress = (block: DelegateProgressBlock | null) => {
       if (!progressTarget || !block) return
       // 嵌套:把本委派的原始进度帧统一重写成「挂到一级卡上的带层级前缀非终态文本行」
@@ -10496,6 +10503,7 @@ export class Gateway {
         sessionKey: progressTarget.sessionKey,
         channel: progressTarget.channel,
         peer: { id: progressTarget.peerId, kind: 'dm' as const },
+        ...(isClientMessageId(parentCmid) ? { clientMessageId: parentCmid } : {}),
         blocks: [outBlock as any],
         isFinal: false,
         _userId: progressTarget.userId,

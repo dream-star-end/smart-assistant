@@ -4835,9 +4835,23 @@ describe("durable live turn frame journal", () => {
     );
 
     const first = await retireDeadLiveStreams(pool, { minAgeMs: 60 * 60 * 1000 });
-    assert.equal(first.retired, 1);
+    assert.ok(first.retired >= 2, `expected dead + leftover retire, got ${first.retired}`);
     const second = await retireDeadLiveStreams(pool, { minAgeMs: 60 * 60 * 1000 });
     assert.equal(second.retired, 0);
+    const retiredFlags = Object.fromEntries(
+      (
+        await pool.query<{ session_id: string; retired: boolean }>(
+          `SELECT session_id,(provenance ? 'retired_at') AS retired
+             FROM client_session_live_streams
+            WHERE session_id=ANY($1::text[])`,
+          [[dead.sessionId, accepted.sessionId, freshLegacySessionId, rolloutSessionId]],
+        )
+      ).rows.map((row) => [row.session_id, row.retired]),
+    );
+    assert.equal(retiredFlags[dead.sessionId], true);
+    assert.equal(retiredFlags[freshLegacySessionId], true, "null-cmid leftover retires immediately");
+    assert.equal(retiredFlags[accepted.sessionId], false);
+    assert.equal(retiredFlags[rolloutSessionId], false);
 
     const deadPage = await readClientSessionLiveFrames(pool, dead.sessionId, userId, 0, 10);
     assert.ok(deadPage);
@@ -4864,7 +4878,14 @@ describe("durable live turn frame journal", () => {
 
     const freshPage = await readClientSessionLiveFrames(pool, freshLegacySessionId, userId, 0, 10);
     assert.ok(freshPage);
-    assert.equal(freshPage.frames.length, 1);
+    assert.equal(freshPage.frames.length, 0, "idle leftover without cmid is hidden from hydrate");
+    const leftoverKept = await pool.query(
+      `SELECT 1 FROM client_session_live_frames f
+         JOIN client_session_live_streams s ON s.stream_key=f.stream_key
+        WHERE s.session_id=$1`,
+      [freshLegacySessionId],
+    );
+    assert.equal(leftoverKept.rowCount, 1, "hide/retire must keep leftover frames");
 
     const rolloutPage = await readClientSessionLiveFrames(pool, rolloutSessionId, userId, 0, 10);
     assert.ok(rolloutPage);
@@ -4946,6 +4967,115 @@ describe("durable live turn frame journal", () => {
     assert.equal(secondPage.frames.length, 1);
     assert.deepEqual(secondPage.frames[0]!.payload, JSON.parse(payload2));
     assert.deepEqual(secondPage.streamClientMessageIds, []);
+  });
+
+  maybe("returns leftover live journals while a session dispatch is in flight and hides null-cmid leftover when none are", async () => {
+    const userId = "c:940";
+    const inflight = {
+      sessionId: "s-leftover-read-inflight",
+      dispatchId: randomUUID(),
+    };
+    const idle = { sessionId: "s-leftover-read-idle" };
+    await backend.upsertClientSession(mkSession({ id: inflight.sessionId, userId }));
+    await backend.upsertClientSession(mkSession({ id: idle.sessionId, userId }));
+    await pool.query(
+      `INSERT INTO turn_dispatches
+         (dispatch_id,user_id,session_id,client_message_id,agent_id,request_hash,
+          billing_request_id,status,owner_id,lease_until)
+       VALUES ($1,940,$2,'cm-leftover-inflight','main',$3,$4,'accepted','test-owner',NOW()+INTERVAL '1 minute')`,
+      [inflight.dispatchId, inflight.sessionId, "a1".repeat(32), `billing-${inflight.dispatchId}`],
+    );
+    const persistLeftover = async (sessionId: string, containerId: number) => {
+      await persistGatewayLiveFrame(pool, {
+        uid: 940n,
+        sessionId,
+        clientMessageId: null,
+        agentContainerId: containerId,
+        sessionKey: `agent:main:webchat:dm:${sessionId}`,
+        frameSeq: 1,
+        payload: JSON.stringify({
+          type: "outbound.message",
+          sessionKey: `agent:main:webchat:dm:${sessionId}`,
+          frameSeq: 1,
+          peer: { id: sessionId, kind: "dm" },
+          blocks: [{ kind: "delegate_progress", phase: "start", text: sessionId }],
+        }),
+      });
+    };
+    await persistLeftover(inflight.sessionId, 540);
+    await persistLeftover(idle.sessionId, 541);
+
+    const inflightPage = await readClientSessionLiveFrames(pool, inflight.sessionId, userId, 0, 10);
+    assert.ok(inflightPage);
+    assert.equal(inflightPage.frames.length, 1, "in-flight leftover must still hydrate");
+    assert.equal(
+      (inflightPage.frames[0]!.payload as { blocks: Array<{ text: string }> }).blocks[0]!.text,
+      inflight.sessionId,
+    );
+
+    const idlePage = await readClientSessionLiveFrames(pool, idle.sessionId, userId, 0, 10);
+    assert.ok(idlePage);
+    assert.equal(idlePage.frames.length, 0, "idle leftover without cmid must not hydrate");
+    const idleRows = await pool.query(
+      `SELECT 1 FROM client_session_live_frames f
+         JOIN client_session_live_streams s ON s.stream_key=f.stream_key
+        WHERE s.session_id=$1`,
+      [idle.sessionId],
+    );
+    assert.equal(idleRows.rowCount, 1, "hide must not delete leftover frames");
+  });
+
+  maybe("retireDeadLiveStreams immediately retires null-cmid leftover with no in-flight dispatch and keeps frames", async () => {
+    const sessionId = "s-leftover-retire-now";
+    const userId = "c:941";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    await persistGatewayLiveFrame(pool, {
+      uid: 941n,
+      sessionId,
+      clientMessageId: null,
+      agentContainerId: 542,
+      sessionKey: `agent:main:webchat:dm:${sessionId}`,
+      frameSeq: 1,
+      payload: JSON.stringify({
+        type: "outbound.message",
+        sessionKey: `agent:main:webchat:dm:${sessionId}`,
+        frameSeq: 1,
+        peer: { id: sessionId, kind: "dm" },
+        blocks: [{ kind: "delegate_progress", phase: "start", text: "leftover" }],
+      }),
+    });
+    const before = await pool.query<{ retired: boolean }>(
+      `SELECT (provenance ? 'retired_at') AS retired
+         FROM client_session_live_streams
+        WHERE session_id=$1 AND user_id=$2`,
+      [sessionId, userId],
+    );
+    assert.equal(before.rows[0]?.retired, false);
+    // leftover is brand new — aged path (2h / 1h minAge) must not be what retires it
+    const first = await retireDeadLiveStreams(pool, { minAgeMs: 60 * 60 * 1000 });
+    assert.ok(first.retired >= 1);
+    const state = await pool.query<{ retired: boolean }>(
+      `SELECT (provenance ? 'retired_at') AS retired
+         FROM client_session_live_streams
+        WHERE session_id=$1 AND user_id=$2`,
+      [sessionId, userId],
+    );
+    assert.equal(state.rows[0]?.retired, true);
+    const frames = await pool.query(
+      `SELECT 1 FROM client_session_live_frames f
+         JOIN client_session_live_streams s ON s.stream_key=f.stream_key
+        WHERE s.session_id=$1`,
+      [sessionId],
+    );
+    assert.equal(frames.rowCount, 1, "retire must keep leftover frames in table");
+    await retireDeadLiveStreams(pool, { minAgeMs: 60 * 60 * 1000 });
+    const state2 = await pool.query<{ retired: boolean }>(
+      `SELECT (provenance ? 'retired_at') AS retired
+         FROM client_session_live_streams
+        WHERE session_id=$1 AND user_id=$2`,
+      [sessionId, userId],
+    );
+    assert.equal(state2.rows[0]?.retired, true);
   });
 });
 
