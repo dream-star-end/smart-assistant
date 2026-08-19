@@ -227,24 +227,55 @@ export ANTHROPIC_BASE_URL="$anthropic_base"
 api_key=""
 anthropic_base=""
 
-storage_dir=""
+# Durable CLI session store (sess_* files). Ephemeral HOME holds only the
+# per-spawn config.json + opaque relay token and is deleted on EXIT.
+# Hosted containers often have OPENCLAUDE_HOME empty; still pin storage to
+# the per-user volume. Never follow a path we do not own, and never put
+# secrets in this directory.
+orig_home=${HOME:-}
+
+try_storage_root() {
+  dir=$1
+  case "$dir" in
+    /*) ;;
+    *) return 1 ;;
+  esac
+  case "$dir" in
+    */..|*/../*|../*|..) return 1 ;;
+  esac
+  [ -d "$dir" ] || return 1
+  [ ! -L "$dir" ] || return 1
+  owner=$(/usr/bin/stat -c '%u' -- "$dir") || return 1
+  me=$(/usr/bin/id -u)
+  [ "$owner" = "$me" ]
+}
+
+storage_root=""
 oc_home=${OPENCLAUDE_HOME:-}
-case "$oc_home" in
-  /*)
-    if [ -d "$oc_home" ]; then
-      storage_dir="$oc_home/zcode-cli"
-      /bin/mkdir -p -m 0700 -- "$storage_dir" \
-        || die "cannot create durable ZCode storage directory"
-    fi
-    ;;
-esac
+if try_storage_root "$oc_home"; then
+  storage_root=$oc_home
+elif [ "$test_mode" -eq 0 ] && try_storage_root /home/agent/.openclaude; then
+  storage_root=/home/agent/.openclaude
+elif [ "$test_mode" -eq 1 ] && try_storage_root "${orig_home}/.openclaude"; then
+  storage_root="${orig_home}/.openclaude"
+fi
+
+storage_dir=""
+if [ -n "$storage_root" ]; then
+  storage_dir="$storage_root/zcode-cli"
+  /bin/mkdir -p -m 0700 -- "$storage_dir" \
+    || die "cannot create durable ZCode storage directory"
+  /bin/chmod 0700 -- "$storage_dir" \
+    || die "cannot secure durable ZCode storage directory"
+  try_storage_root "$storage_dir" \
+    || die "durable ZCode storage directory is invalid"
+  export ZCODE_STORAGE_DIR="$storage_dir"
+elif [ "$test_mode" -eq 0 ]; then
+  die "durable ZCode storage is unavailable"
+fi
 
 set -- --prompt "$prompt" --json --mode yolo --no-color --cwd "$cwd"
 [ -z "$resume" ] || set -- "$@" --resume "$resume"
-
-if [ -n "$storage_dir" ]; then
-  export ZCODE_STORAGE_DIR="$storage_dir"
-fi
 unset ZCODE_API_KEY
 unset ZAI_API_KEY
 unset ZAI_CODING_PLAN_KEY

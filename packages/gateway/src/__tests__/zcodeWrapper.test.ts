@@ -4,7 +4,7 @@
  * Run: npx tsx --test packages/gateway/src/__tests__/zcodeWrapper.test.ts
  */
 import assert from 'node:assert/strict'
-import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -61,6 +61,13 @@ describe('oc-zcode wrapper', () => {
     assert.match(text, /test auth must not use the production credential path/)
     assert.match(text, /\\"kind\\":\\"anthropic\\"/)
     assert.match(text, /zai-coding-plan\/glm-5.3/)
+    assert.match(text, /\/home\/agent\/\.openclaude/)
+    assert.match(text, /try_storage_root/)
+    assert.match(text, /stat -c '%u'/)
+    assert.match(text, /\/bin\/rm -rf -- "\$zcode_home"/)
+    assert.doesNotMatch(text, /rm -rf -- "\$storage_dir"/)
+    assert.doesNotMatch(text, /rm -rf -- "\$ZCODE_STORAGE_DIR"/)
+    assert.match(text, /durable ZCode storage is unavailable/)
   })
 
   test('selfhost runtime build profile persistently includes ZCode 0.16.3', () => {
@@ -298,6 +305,154 @@ process.stdout.write(JSON.stringify({ sessionId: 'sess_w', response: 'wrapped', 
       assert.notEqual(prodPath.code, 0)
       assert.match(prodPath.stderr, /production credential path/)
       assert.equal(await readFile(marker, 'utf8').catch(() => ''), '')
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('empty OPENCLAUDE_HOME still uses durable storage under the caller home contract', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-zcode-wrapper-empty-home-'))
+    const agentHome = path.join(dir, 'agent-home')
+    const ocHome = path.join(agentHome, '.openclaude')
+    const fake = path.join(dir, 'fake-zcode.cjs')
+    const auth = path.join(dir, 'api-key')
+    const capture = path.join(dir, 'capture.json')
+    await writeFile(auth, 'super-secret-zcode-key\n')
+    await mkdir(ocHome, { recursive: true, mode: 0o700 })
+    await writeFile(fake, `#!/usr/bin/env node
+const fs = require('node:fs')
+fs.writeFileSync(process.env.FAKE_ZCODE_CAPTURE, JSON.stringify({
+  storage: process.env.ZCODE_STORAGE_DIR || null,
+  home: process.env.HOME || null,
+  anthropic: process.env.ANTHROPIC_API_KEY || null,
+}))
+process.stdout.write(JSON.stringify({ sessionId: 'sess_w', response: 'wrapped', eventCount: 0 }) + '\\n')
+`)
+    await chmod(fake, 0o755)
+    try {
+      const result = await runWrapper(
+        ['--prompt', 'hello', '--json', '--mode', 'yolo', '--no-color', '--cwd', dir],
+        {
+          PATH: process.env.PATH,
+          HOME: agentHome,
+          OPENCLAUDE_HOME: '',
+          OC_ZCODE_TEST_BIN: fake,
+          OC_ZCODE_TEST_AUTH_FILE: auth,
+          FAKE_ZCODE_CAPTURE: capture,
+        },
+      )
+      assert.equal(result.code, 0, result.stderr)
+      const captured = JSON.parse(await readFile(capture, 'utf8')) as {
+        storage: string | null
+        home: string | null
+        anthropic: string | null
+      }
+      assert.equal(captured.storage, path.join(ocHome, 'zcode-cli'))
+      assert.match(String(captured.home), /openclaude-zcode\./)
+      assert.notEqual(captured.home, agentHome)
+      assert.equal(captured.anthropic, 'super-secret-zcode-key')
+      const listing = await readdir(path.join(ocHome, 'zcode-cli'))
+      assert.equal(listing.some((name) => name.toLowerCase().includes('secret') || name.includes('key')), false)
+      const st = await stat(path.join(ocHome, 'zcode-cli'))
+      assert.equal(st.mode & 0o777, 0o700)
+      assert.equal(result.stderr.includes('super-secret-zcode-key'), false)
+      assert.equal(result.stdout.includes('super-secret-zcode-key'), false)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('two spawns share durable storage and r2 resume sees the r1 session marker', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-zcode-wrapper-share-'))
+    const ocHome = path.join(dir, 'oc-home')
+    const fake = path.join(dir, 'fake-zcode.cjs')
+    const auth = path.join(dir, 'api-key')
+    const capture1 = path.join(dir, 'capture1.json')
+    const capture2 = path.join(dir, 'capture2.json')
+    await writeFile(auth, 'super-secret-zcode-key\n')
+    await mkdir(ocHome, { recursive: true, mode: 0o700 })
+    await writeFile(fake, `#!/usr/bin/env node
+const fs = require('node:fs')
+const path = require('node:path')
+const store = process.env.ZCODE_STORAGE_DIR
+if (!store) {
+  process.stderr.write('missing ZCODE_STORAGE_DIR\\n')
+  process.exit(1)
+}
+const marker = path.join(store, 'sess_shared.json')
+const resumeAt = process.argv.indexOf('--resume')
+const capture = process.env.FAKE_ZCODE_CAPTURE
+if (resumeAt >= 0) {
+  if (!fs.existsSync(marker)) {
+    process.stderr.write('Session not found: ' + process.argv[resumeAt + 1] + '\\n')
+    process.exit(1)
+  }
+  const prior = JSON.parse(fs.readFileSync(marker, 'utf8'))
+  fs.writeFileSync(capture, JSON.stringify({
+    storage: store,
+    home: process.env.HOME,
+    resume: process.argv[resumeAt + 1],
+    prior,
+    secretInStore: fs.readdirSync(store).join(','),
+  }))
+} else {
+  fs.mkdirSync(store, { recursive: true })
+  fs.writeFileSync(marker, JSON.stringify({ sessionId: 'sess_shared', turn: 1 }))
+  fs.writeFileSync(capture, JSON.stringify({
+    storage: store,
+    home: process.env.HOME,
+    resume: null,
+    secretInStore: fs.readdirSync(store).join(','),
+  }))
+}
+process.stdout.write(JSON.stringify({ sessionId: 'sess_shared', response: 'ok', eventCount: 0 }) + '\\n')
+`)
+    await chmod(fake, 0o755)
+    const baseEnv = {
+      PATH: process.env.PATH,
+      OPENCLAUDE_HOME: ocHome,
+      OC_ZCODE_TEST_BIN: fake,
+      OC_ZCODE_TEST_AUTH_FILE: auth,
+    }
+    try {
+      const r1 = await runWrapper(
+        ['--prompt', 'round-1', '--json', '--mode', 'yolo', '--no-color', '--cwd', dir],
+        { ...baseEnv, FAKE_ZCODE_CAPTURE: capture1 },
+      )
+      assert.equal(r1.code, 0, r1.stderr)
+      const r2 = await runWrapper(
+        ['--prompt', 'round-2', '--json', '--mode', 'yolo', '--no-color', '--cwd', dir, '--resume', 'sess_shared'],
+        { ...baseEnv, FAKE_ZCODE_CAPTURE: capture2 },
+      )
+      assert.equal(r2.code, 0, r2.stderr)
+      const c1 = JSON.parse(await readFile(capture1, 'utf8')) as {
+        storage: string
+        home: string
+        resume: string | null
+        secretInStore: string
+      }
+      const c2 = JSON.parse(await readFile(capture2, 'utf8')) as {
+        storage: string
+        home: string
+        resume: string | null
+        prior: { sessionId: string; turn: number }
+        secretInStore: string
+      }
+      assert.equal(c1.storage, path.join(ocHome, 'zcode-cli'))
+      assert.equal(c2.storage, c1.storage)
+      assert.notEqual(c1.home, c2.home)
+      assert.match(c1.home, /openclaude-zcode\./)
+      assert.match(c2.home, /openclaude-zcode\./)
+      assert.equal(c1.resume, null)
+      assert.equal(c2.resume, 'sess_shared')
+      assert.equal(c2.prior.sessionId, 'sess_shared')
+      assert.equal(c1.secretInStore.includes('super-secret'), false)
+      assert.equal(c2.secretInStore.includes('super-secret'), false)
+      assert.equal(c1.secretInStore.includes('api-key'), false)
+      const durable = await readFile(path.join(ocHome, 'zcode-cli', 'sess_shared.json'), 'utf8')
+      assert.equal(durable.includes('super-secret-zcode-key'), false)
+      assert.equal(r1.stderr.includes('super-secret-zcode-key'), false)
+      assert.equal(r2.stdout.includes('super-secret-zcode-key'), false)
     } finally {
       await rm(dir, { recursive: true, force: true })
     }

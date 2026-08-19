@@ -91,6 +91,8 @@ interface ZcodeTurnContext {
     reasoningTokens: number
     totalTokens: number
   }
+  spawnedWithResume: boolean
+  staleResumeRetried: boolean
 }
 
 function asText(value: unknown): string {
@@ -162,6 +164,16 @@ function unavailable(detail: string): 'auth' | 'quota' | null {
   if (/model config is missing|auth|credential|unauthorized|forbidden|api.?key|not logged in|\b401\b|\b403\b/i.test(detail)) return 'auth'
   if (/quota|rate.?limit|usage limit|subscription|credits? exhausted|\b429\b/i.test(detail)) return 'quota'
   return null
+}
+
+/** CLI 0.16.3 missing-session / stale --resume only. Generic CLI failed
+ *  and coerced upstream_failed must not match. */
+function isZcodeStaleResumeError(detail: string): boolean {
+  if (!detail) return false
+  return (
+    /Session not found:\s*sess_[A-Za-z0-9_-]+/i.test(detail) ||
+    /Persisted child session not found:\s*sess_[A-Za-z0-9_-]+/i.test(detail)
+  )
 }
 
 function isNonNegInt(value: unknown): value is number {
@@ -322,6 +334,8 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
       resolveDrain: null,
       resolveSummary,
       lastUsage: parseUsage({}),
+      spawnedWithResume: false,
+      staleResumeRetried: false,
     }
     this.active = ctx
     this.lastActivityAt = Date.now()
@@ -395,6 +409,7 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
       '--no-color',
       '--cwd', cwd,
     ]
+    ctx.spawnedWithResume = Boolean(this.nativeId)
     if (this.nativeId) args.push('--resume', this.nativeId)
     const env: NodeJS.ProcessEnv = {
       PATH: '/run/oc/platform/current/bin:/usr/local/bin:/usr/bin:/bin',
@@ -436,6 +451,28 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
     proc.once('close', (code, signal) => {
       try {
         if (ctx.abandoned) return
+        const stderrText = ctx.stderr.trim()
+        const stale = isZcodeStaleResumeError(stderrText)
+        if (
+          !ctx.terminal &&
+          !ctx.interrupted &&
+          ctx.spawnedWithResume &&
+          !ctx.staleResumeRetried &&
+          stale
+        ) {
+          ctx.staleResumeRetried = true
+          this.nativeId = null
+          ctx.stdout = ''
+          ctx.stderr = ''
+          ctx.proc = null
+          ctx.procClosed = false
+          void this.spawnTurn(ctx).catch((err) => {
+            if (ctx.abandoned) return
+            this.finishError(ctx, String(err))
+            this.emit('error', err instanceof Error ? err : new Error(String(err)))
+          })
+          return
+        }
         ctx.procClosed = true
         ctx.resolveDrain?.()
         ctx.resolveDrain = null
@@ -458,7 +495,7 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
           this.emit('exit', { code, signal, crashed: true })
         } catch { /* close must never throw into the gateway */ }
       } finally {
-        if (this.active === ctx) this.active = null
+        if (this.active === ctx && (ctx.terminal || ctx.procClosed)) this.active = null
       }
     })
   }
@@ -560,7 +597,7 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
       numTurns: 1,
       isError,
       ...(isError ? { errorKind: 'other' as const, errorClass, errorDetail: safeDetail ?? ctx.errorDetail! } : {}),
-      staleResumeId: false,
+      staleResumeId: Boolean(isError && !ctx.interrupted && isZcodeStaleResumeError(ctx.errorDetail ?? '')),
       phantomSignals: { ...EMPTY_SIGNALS },
     })
   }
@@ -648,6 +685,7 @@ registerEngine('zcode', (opts) => new ZcodeAdapter(opts))
 export const _internals = {
   resolveZcodeBin,
   unavailable,
+  isZcodeStaleResumeError,
   parseJsonResult,
   validateZcodeJsonResult,
   ZCODE_HOTCFG_WRAPPER_BIN,

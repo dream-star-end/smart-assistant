@@ -412,4 +412,196 @@ process.stdout.write(${JSON.stringify(`${JSON.stringify(successFixture)}\n`)})
       await rm(dir, { recursive: true, force: true })
     }
   })
+
+  test('isZcodeStaleResumeError matches only explicit missing-session CLI text', () => {
+    assert.equal(_internals.isZcodeStaleResumeError('Session not found: sess_deadbeef'), true)
+    assert.equal(_internals.isZcodeStaleResumeError('Persisted child session not found: sess_deadbeef'), true)
+    assert.equal(_internals.isZcodeStaleResumeError('Error: Session not found: sess_abc-def'), true)
+    assert.equal(_internals.isZcodeStaleResumeError('CLI failed'), false)
+    assert.equal(_internals.isZcodeStaleResumeError('upstream_failed'), false)
+    assert.equal(_internals.isZcodeStaleResumeError('ECONNRESET from relay'), false)
+    assert.equal(_internals.isZcodeStaleResumeError('Session not found: other-id'), false)
+    assert.equal(_internals.isZcodeStaleResumeError('No conversation found with session ID: sess_x'), false)
+    assert.equal(_internals.isZcodeStaleResumeError(''), false)
+  })
+
+  test('explicit stale resume evicts via staleResumeId and retries once as a fresh session', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-zcode-stale-retry-'))
+    const fake = path.join(dir, 'fake-zcode.cjs')
+    const count = path.join(dir, 'count')
+    const captures = path.join(dir, 'argv.json')
+    await writeFile(path.join(dir, 'persona.md'), 'persona-line')
+    await writeFile(fake, `#!/usr/bin/env node
+const fs = require('node:fs')
+const path = require('node:path')
+const countFile = path.join(__dirname, 'count')
+const argvFile = path.join(__dirname, 'argv.json')
+const n = Number(fs.existsSync(countFile) ? fs.readFileSync(countFile, 'utf8') : '0') + 1
+fs.writeFileSync(countFile, String(n))
+const argv = process.argv.slice(2)
+const prev = fs.existsSync(argvFile) ? JSON.parse(fs.readFileSync(argvFile, 'utf8')) : []
+prev.push({ n, argv })
+fs.writeFileSync(argvFile, JSON.stringify(prev))
+if (argv.includes('--resume')) {
+  process.stderr.write('Session not found: sess_prior\\n')
+  process.exit(1)
+}
+process.stdout.write(${JSON.stringify(`${JSON.stringify(successFixture)}\n`)})
+`)
+    await chmod(fake, 0o755)
+    const previousBin = process.env.OC_ZCODE_CLI_BIN
+    process.env.OC_ZCODE_CLI_BIN = fake
+    try {
+      const adapter = new ZcodeAdapter(createOpts(dir))
+      adapter.on('error', () => {})
+      const run = adapter.submitTurn({
+        input: 'resume please',
+        requestId: REQUEST_ID,
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run.submitted
+      const summary = await run.summary
+      assert.equal(summary?.isError, false)
+      assert.equal(summary?.staleResumeId, false)
+      assert.equal(adapter.nativeSessionId, 'sess_live_fixture_001')
+      assert.equal(await readFile(count, 'utf8'), '2')
+      const spawned = JSON.parse(await readFile(captures, 'utf8')) as Array<{ n: number; argv: string[] }>
+      assert.equal(spawned[0]?.argv[spawned[0].argv.indexOf('--resume') + 1], 'sess_prior')
+      assert.equal(spawned[1]?.argv.includes('--resume'), false)
+    } finally {
+      restoreEnv('OC_ZCODE_CLI_BIN', previousBin)
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('explicit stale resume without a successful retry sets staleResumeId', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-zcode-stale-keep-'))
+    const fake = path.join(dir, 'fake-zcode.cjs')
+    const count = path.join(dir, 'count')
+    await writeFile(path.join(dir, 'persona.md'), 'persona-line')
+    await writeFile(fake, `#!/usr/bin/env node
+const fs = require('node:fs')
+const path = require('node:path')
+const countFile = path.join(__dirname, 'count')
+const n = Number(fs.existsSync(countFile) ? fs.readFileSync(countFile, 'utf8') : '0') + 1
+fs.writeFileSync(countFile, String(n))
+process.stderr.write('Session not found: sess_prior\\n')
+process.exit(1)
+`)
+    await chmod(fake, 0o755)
+    const previousBin = process.env.OC_ZCODE_CLI_BIN
+    process.env.OC_ZCODE_CLI_BIN = fake
+    try {
+      const adapter = new ZcodeAdapter(createOpts(dir))
+      adapter.on('error', () => {})
+      const run = adapter.submitTurn({
+        input: 'still missing',
+        requestId: REQUEST_ID,
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run.submitted
+      const summary = await run.summary
+      assert.equal(summary?.isError, true)
+      assert.equal(summary?.staleResumeId, true)
+      assert.equal(await readFile(count, 'utf8'), '2')
+    } finally {
+      restoreEnv('OC_ZCODE_CLI_BIN', previousBin)
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('generic CLI / upstream errors do not look like stale resume and do not retry', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-zcode-generic-fail-'))
+    const fake = path.join(dir, 'fake-zcode.cjs')
+    const count = path.join(dir, 'count')
+    await writeFile(path.join(dir, 'persona.md'), 'persona-line')
+    await writeFile(fake, `#!/usr/bin/env node
+const fs = require('node:fs')
+const path = require('node:path')
+const countFile = path.join(__dirname, 'count')
+const n = Number(fs.existsSync(countFile) ? fs.readFileSync(countFile, 'utf8') : '0') + 1
+fs.writeFileSync(countFile, String(n))
+process.stderr.write('ECONNRESET from relay\\n')
+process.exit(1)
+`)
+    await chmod(fake, 0o755)
+    const previousBin = process.env.OC_ZCODE_CLI_BIN
+    process.env.OC_ZCODE_CLI_BIN = fake
+    try {
+      const adapter = new ZcodeAdapter(createOpts(dir))
+      adapter.on('error', () => {})
+      const run = adapter.submitTurn({
+        input: 'relay down',
+        requestId: REQUEST_ID,
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run.submitted
+      const summary = await run.summary
+      assert.equal(summary?.isError, true)
+      assert.equal(summary?.staleResumeId, false)
+      assert.equal(summary?.errorDetail, 'CLI failed')
+      assert.equal(await readFile(count, 'utf8'), '1')
+    } finally {
+      restoreEnv('OC_ZCODE_CLI_BIN', previousBin)
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('second submitTurn resumes the native sess_* from the first success', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-zcode-r2-resume-'))
+    const fake = path.join(dir, 'fake-zcode.cjs')
+    const captures = path.join(dir, 'argv.json')
+    await writeFile(path.join(dir, 'persona.md'), 'persona-line')
+    await writeFile(fake, `#!/usr/bin/env node
+const fs = require('node:fs')
+const path = require('node:path')
+const argvFile = path.join(__dirname, 'argv.json')
+const argv = process.argv.slice(2)
+const prev = fs.existsSync(argvFile) ? JSON.parse(fs.readFileSync(argvFile, 'utf8')) : []
+prev.push(argv)
+fs.writeFileSync(argvFile, JSON.stringify(prev))
+process.stdout.write(${JSON.stringify(`${JSON.stringify(successFixture)}\n`)})
+`)
+    await chmod(fake, 0o755)
+    const previousBin = process.env.OC_ZCODE_CLI_BIN
+    process.env.OC_ZCODE_CLI_BIN = fake
+    try {
+      const adapter = new ZcodeAdapter({ ...createOpts(dir), resumeSessionId: undefined })
+      adapter.on('error', () => {})
+      const run1 = adapter.submitTurn({
+        input: 'round-1',
+        requestId: REQUEST_ID,
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run1.submitted
+      const s1 = await run1.summary
+      assert.equal(s1?.isError, false)
+      assert.equal(adapter.nativeSessionId, 'sess_live_fixture_001')
+      const run2 = adapter.submitTurn({
+        input: 'round-2',
+        requestId: REQUEST_ID,
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 1 },
+        toolUseIdToName: new Map(),
+      })
+      await run2.submitted
+      const s2 = await run2.summary
+      assert.equal(s2?.isError, false)
+      assert.equal(s2?.staleResumeId, false)
+      const spawned = JSON.parse(await readFile(captures, 'utf8')) as string[][]
+      assert.equal(spawned[0]?.includes('--resume'), false)
+      assert.equal(spawned[1]?.[spawned[1].indexOf('--resume') + 1], 'sess_live_fixture_001')
+    } finally {
+      restoreEnv('OC_ZCODE_CLI_BIN', previousBin)
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
 })
