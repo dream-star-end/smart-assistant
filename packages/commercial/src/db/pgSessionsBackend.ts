@@ -85,6 +85,7 @@ import {
   recordsPublished,
   settlementAuthorityHash,
   settlementEngineBillings,
+  settlementPayloadEqual,
   visibleHeadFallback,
   visibleHeadFromSettlement,
   type VisibleHead,
@@ -7608,9 +7609,13 @@ export function createPgSessionsBackend(
         }
         const turn = prepared.turn;
         const persistedBillings = Array.isArray(tape.engine_billings) ? tape.engine_billings : [];
-        assertSettlementMatchesCanonical({
+        const canonicalRequestId = turn.engineBillings[0]?.requestId ?? turn.payload.requestId ?? null;
+        const persistedRequestId = (persistedBillings as DurableCodexBilling[])[0]?.requestId
+          ?? turn.payload.requestId
+          ?? null;
+        const canonicalSettlementHash = assertSettlementMatchesCanonical({
           canonicalAnchorId: turn.billingAnchorId,
-          canonicalRequestId: turn.engineBillings[0]?.requestId ?? turn.payload.requestId ?? null,
+          canonicalRequestId,
           canonicalBillings: turn.engineBillings,
           envelope: request.settlement
             ? {
@@ -7620,11 +7625,19 @@ export function createPgSessionsBackend(
               }
             : null,
           persistedHash: tape.settlement_hash,
+          persistedAuthority: tape.settlement_hash && tape.billing_anchor_id
+            ? {
+                billingAnchorId: tape.billing_anchor_id,
+                requestId: persistedRequestId,
+                engineBillings: persistedBillings,
+              }
+            : null,
         });
-        if (persistedBillings.length > 0) {
-          if (JSON.stringify(persistedBillings) !== JSON.stringify(turn.engineBillings)) {
-            throw new Error("lossless turn tape engineBillings mismatch");
-          }
+        if (
+          persistedBillings.length > 0 &&
+          !settlementPayloadEqual(persistedBillings, turn.engineBillings)
+        ) {
+          throw new Error("lossless turn tape engineBillings mismatch");
         }
         // Parts are immutable once staged. Recheck only their manifest while
         // holding the tape row lock; source-part BYTEA concatenation,
@@ -8019,8 +8032,9 @@ export function createPgSessionsBackend(
                   goal_id=$7::uuid, goal_state_revision=$8, goal_tokens_used=$9,
                   client_message_id=$10, continuation_of_turn_key=$11,
                   physical_record_count=$12, logical_record_count=$13,
-                  record_payload_bytes=$14, model_record_count=$15
-            WHERE session_id=$16 AND user_id=$17 AND tape_id=$18`,
+                  record_payload_bytes=$14, model_record_count=$15,
+                  settlement_hash=CASE WHEN settlement_hash IS NULL THEN NULL ELSE $16 END
+            WHERE session_id=$17 AND user_id=$18 AND tape_id=$19`,
           [
             turn.billingAnchorId,
             JSON.stringify(turn.payload.usage ?? {}),
@@ -8037,11 +8051,21 @@ export function createPgSessionsBackend(
             turn.logicalRecordCount,
             prepared.recordPayloadBytes,
             modelRecordCount,
+            canonicalSettlementHash,
             request.sessionId,
             userId,
             request.tapeId,
           ],
         );
+        if (tape.settlement_hash !== null && tape.settlement_hash !== canonicalSettlementHash) {
+          await client.query(
+            `UPDATE turn_tape_settlement_jobs
+                SET settlement_hash=$4, updated_at=NOW()
+              WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
+                AND settlement_hash IS DISTINCT FROM $4`,
+            [request.sessionId, userId, request.tapeId, canonicalSettlementHash],
+          );
+        }
         goalUsageChanged = await bumpGoalUsageSnapshotForTape(client, request.sessionId, userId, request.tapeId);
         // 原始分片(parts)一律随 finalize 清除:records 才是脱敏后的持久权威,parts 保存
         // 的是脱敏前 payload,留下即隐私面偏差 + 双份存储(2026-07-16 巡检批;此前只在

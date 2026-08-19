@@ -44,12 +44,29 @@ export function clipVisibleText(text: string): { text: string; truncated: boolea
   return { text: buf.subarray(0, end).toString("utf8"), truncated: true };
 }
 
+function stableJson(value: unknown): string {
+  const encoded = JSON.stringify(value, (_key, current) => {
+    if (!current || typeof current !== "object" || Array.isArray(current)) return current;
+    const sorted: Record<string, unknown> = {};
+    for (const key of Object.keys(current as Record<string, unknown>).sort()) {
+      sorted[key] = (current as Record<string, unknown>)[key];
+    }
+    return sorted;
+  });
+  if (encoded === undefined) throw new Error("settlement authority is not JSON serializable");
+  return encoded;
+}
+
+export function settlementPayloadEqual(left: unknown, right: unknown): boolean {
+  return stableJson(left) === stableJson(right);
+}
+
 export function settlementAuthorityHash(input: {
   billingAnchorId: string;
   requestId?: string | null;
   engineBillings: unknown;
 }): string {
-  return createHash("sha256").update(JSON.stringify({
+  return createHash("sha256").update(stableJson({
     billingAnchorId: input.billingAnchorId,
     requestId: input.requestId ?? null,
     engineBillings: input.engineBillings ?? [],
@@ -122,6 +139,12 @@ export function assertSettlementMatchesCanonical(input: {
     engineBillings: unknown;
   } | null;
   persistedHash?: string | null;
+  /** Structured Phase-A authority. Only used to upgrade the pre-stable-hash rollout. */
+  persistedAuthority?: {
+    billingAnchorId: string;
+    requestId?: string | null;
+    engineBillings: unknown;
+  } | null;
 }): string {
   const canonicalHash = settlementAuthorityHash({
     billingAnchorId: input.canonicalAnchorId,
@@ -147,7 +170,12 @@ export function assertSettlementMatchesCanonical(input: {
     }
   }
   if (input.persistedHash && input.persistedHash !== canonicalHash) {
-    throw new Error("lossless turn tape settlement hash mismatch");
+    const persistedAuthorityHash = input.persistedAuthority
+      ? settlementAuthorityHash(input.persistedAuthority)
+      : null;
+    if (persistedAuthorityHash !== canonicalHash) {
+      throw new Error("lossless turn tape settlement hash mismatch");
+    }
   }
   return canonicalHash;
 }

@@ -8690,6 +8690,97 @@ describe("rev2 visible finalize decoupling", () => {
     }
   });
 
+  maybe("legacy order-sensitive settlement hash upgrades after semantic authority verification", async () => {
+    const sessionId = "s-rev4-stable-settlement-hash";
+    const userId = "c:1";
+    const turnKey = "8".repeat(64);
+    const requestId = "3".repeat(32);
+    const engineBilling = {
+      requestId,
+      turnKey,
+      engineSessionId: `oceng-${"4".repeat(48)}`,
+      status: "success" as const,
+      durationMs: 7,
+      usage: { input_tokens: 11, output_tokens: 5 },
+    };
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const tape = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 13,
+      status: "completed",
+      turnKey,
+      requestId,
+      text: "stable settlement",
+      createdAt: 1_700_000_600_000,
+      engineBilling,
+    });
+    for (const part of tape.parts) {
+      await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+    }
+    const billingAnchorId = `srv-${sessionId}-main-t13`;
+    const settlementBillings = [{
+      status: "success" as const,
+      usage: { output_tokens: 5, input_tokens: 11 },
+      durationMs: 7,
+      engineSessionId: `oceng-${"4".repeat(48)}`,
+      turnKey,
+      requestId,
+    }];
+    const visible = await backend.finalizeLosslessTurnTape(userId, {
+      ...tape.finalize,
+      settlement: {
+        billingAnchorId,
+        requestId,
+        engineBillings: settlementBillings,
+        text: "stable settlement",
+        ts: 1_700_000_600_000,
+      },
+    }, { materialize: false });
+    assert.equal(visible.applied, "finalized");
+    const legacyHash = createHash("sha256").update(JSON.stringify({
+      billingAnchorId,
+      requestId,
+      engineBillings: settlementBillings,
+    })).digest("hex");
+    await pool.query(
+      `UPDATE client_session_turn_tapes SET settlement_hash=$4
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+      [sessionId, userId, tape.finalize.tapeId, legacyHash],
+    );
+    await pool.query(
+      `UPDATE turn_tape_settlement_jobs SET settlement_hash=$4
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+      [sessionId, userId, tape.finalize.tapeId, legacyHash],
+    );
+    const materialized = await backend.finalizeLosslessTurnTape(userId, tape.finalize);
+    assert.equal(materialized.applied, "finalized");
+    const repaired = (
+      await pool.query<{
+        settlement_hash: string;
+        settlement_verified_at: string | null;
+        materialization_status: string;
+      }>(
+        `SELECT settlement_hash, settlement_verified_at::text, materialization_status
+           FROM client_session_turn_tapes
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+        [sessionId, userId, tape.finalize.tapeId],
+      )
+    ).rows[0]!;
+    assert.notEqual(repaired.settlement_hash, legacyHash);
+    assert.ok(repaired.settlement_verified_at);
+    assert.equal(repaired.materialization_status, "complete");
+    const jobHash = (
+      await pool.query<{ settlement_hash: string; status: string }>(
+        `SELECT settlement_hash,status FROM turn_tape_settlement_jobs
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+        [sessionId, userId, tape.finalize.tapeId],
+      )
+    ).rows[0]!;
+    assert.equal(jobHash.settlement_hash, repaired.settlement_hash);
+    assert.equal(jobHash.status, "queued");
+  });
+
   maybe("wrong billingAnchorId with matching billings is rejected before verify", async () => {
     const sessionId = "s-rev4-anchor-mismatch";
     const userId = "c:1";

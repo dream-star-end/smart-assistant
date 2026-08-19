@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { describe, test } from "node:test";
 import {
   assertSettlementMatchesCanonical,
   clipVisibleText,
   phaseAVisibleHeadText,
   settlementAuthorityHash,
+  settlementPayloadEqual,
   VISIBLE_HEAD_TEXT_MAX_BYTES,
 } from "../db/visibleFinalize.js";
 
@@ -37,6 +39,16 @@ describe("settlementAuthorityHash", () => {
     });
     assert.equal(a, b);
     assert.notEqual(a, c);
+  });
+
+  test("ignores object key insertion order recursively", () => {
+    const left = [{ requestId: "r1", usage: { output_tokens: 2, input_tokens: 1 }, status: "success" }];
+    const right = [{ status: "success", usage: { input_tokens: 1, output_tokens: 2 }, requestId: "r1" }];
+    assert.equal(settlementPayloadEqual(left, right), true);
+    assert.equal(
+      settlementAuthorityHash({ billingAnchorId: "a", requestId: "r1", engineBillings: left }),
+      settlementAuthorityHash({ billingAnchorId: "a", requestId: "r1", engineBillings: right }),
+    );
   });
 });
 
@@ -84,6 +96,45 @@ describe("assertSettlementMatchesCanonical", () => {
       /billingAnchorId mismatch/,
     );
   });
+  test("legacy order-sensitive hash is upgraded only when structured authority matches", () => {
+    const legacyBillings = [{ model: "x", requestId: "1".repeat(32) }];
+    const legacyHash = createHash("sha256").update(JSON.stringify({
+      billingAnchorId: canonical.canonicalAnchorId,
+      requestId: canonical.canonicalRequestId,
+      engineBillings: legacyBillings,
+    })).digest("hex");
+    const stableHash = settlementAuthorityHash({
+      billingAnchorId: canonical.canonicalAnchorId,
+      requestId: canonical.canonicalRequestId,
+      engineBillings: billings,
+    });
+    assert.notEqual(legacyHash, stableHash);
+    assert.equal(
+      assertSettlementMatchesCanonical({
+        ...canonical,
+        persistedHash: legacyHash,
+        persistedAuthority: {
+          billingAnchorId: canonical.canonicalAnchorId,
+          requestId: canonical.canonicalRequestId,
+          engineBillings: legacyBillings,
+        },
+      }),
+      stableHash,
+    );
+    assert.throws(
+      () => assertSettlementMatchesCanonical({
+        ...canonical,
+        persistedHash: legacyHash,
+        persistedAuthority: {
+          billingAnchorId: canonical.canonicalAnchorId,
+          requestId: "wrong",
+          engineBillings: legacyBillings,
+        },
+      }),
+      /settlement hash mismatch/,
+    );
+  });
+
   test("matching envelope and persisted hash equal to canonical is accepted", () => {
     const hash = settlementAuthorityHash({
       billingAnchorId: canonical.canonicalAnchorId,
