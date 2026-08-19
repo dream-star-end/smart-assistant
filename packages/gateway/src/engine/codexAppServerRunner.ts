@@ -5,8 +5,19 @@ let _spawnFn: typeof spawn = spawn
 export function __setCodexAppServerSpawnForTests(fn: typeof spawn | null): void {
   _spawnFn = fn ?? spawn
 }
-export function _codexMemoryTurnEnv(agentId: string, sessionKey: string): Record<string, string> {
-  return { OC_AGENT_ID: agentId, OC_SESSION_KEY: sessionKey }
+export function _codexMemoryTurnEnv(
+  agentId: string,
+  sessionKey: string,
+  routing?: { gatewayPort?: number; contextFile?: string | null },
+): Record<string, string> {
+  return {
+    OC_AGENT_ID: agentId,
+    OC_SESSION_KEY: sessionKey,
+    ...(routing?.gatewayPort ? { OPENCLAUDE_GATEWAY_PORT: String(routing.gatewayPort) } : {}),
+    ...(routing?.contextFile
+      ? { OPENCLAUDE_DELEGATE_CONTEXT_FILE: routing.contextFile }
+      : {}),
+  }
 }
 import { EventEmitter } from 'node:events'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
@@ -41,6 +52,7 @@ import {
   normalizeCodexReasoningEffort,
 } from './codexShared.js'
 import { V3_CODEX_RELAY_PREFIX } from '../v3CodexRelay.js'
+import { issueDelegateContextToken } from '../delegateContext.js'
 import { createLogger } from '../logger.js'
 import { type ClassifiedErrorCode, classifyRunError } from '../errorClassify.js'
 import type { AutomaticRetryState, CollabAgentPolicy } from './engineAdapter.js'
@@ -1555,6 +1567,11 @@ export class CodexAppServerRunner extends EventEmitter {
       if (overrides.tokenFile && overrides.tokenContent !== null) {
         writeFileSync(overrides.tokenFile, overrides.tokenContent, { mode: 0o600 })
       }
+      if (overrides.delegateContextFile && overrides.delegateContextContent !== null) {
+        writeFileSync(overrides.delegateContextFile, overrides.delegateContextContent, {
+          mode: 0o600,
+        })
+      }
       if (overrides.visionTokenFile && overrides.visionTokenContent !== null) {
         writeFileSync(overrides.visionTokenFile, overrides.visionTokenContent, { mode: 0o600 })
       }
@@ -1569,6 +1586,22 @@ export class CodexAppServerRunner extends EventEmitter {
       }
       throw err
     }
+  }
+
+  /** The app-server process is long-lived, so re-mint the caller binding for
+   * every logical turn while keeping the inherited file path stable. */
+  private refreshDelegateContext(): void {
+    const file = this.cachedOverrides?.delegateContextFile
+    if (!file) return
+    writeFileSync(
+      file,
+      `${issueDelegateContextToken({
+        agentId: this.opts.agentId,
+        sessionKey: this.opts.sessionKey,
+        depth: this.opts.delegationDepth ?? 0,
+      })}\n`,
+      { mode: 0o600 },
+    )
   }
 
   /** Cleanup helper shared by `shutdown()` and the proc close handler so
@@ -1909,7 +1942,13 @@ export class CodexAppServerRunner extends EventEmitter {
       // 用**非 OPENCLAUDE_ 前缀**的 OC_AGENT_ID 显式注入(不被 scrub):agent-id 不是密钥
       // (模型本就从 persona/SOUL 知道自己是谁),暴露给 codex shell 零敏感。旧 MCP 是靠
       // mcp_servers.X.env 显式注入 agent-id 才没这问题;CLI 走 ambient env 需本行补齐。
-      env: { ...buildCodexEnv(), ..._codexMemoryTurnEnv(this.opts.agentId, this.opts.sessionKey) },
+      env: {
+        ...buildCodexEnv(),
+        ..._codexMemoryTurnEnv(this.opts.agentId, this.opts.sessionKey, {
+          gatewayPort: this.opts.config?.gateway.port,
+          contextFile: this.cachedOverrides?.delegateContextFile,
+        }),
+      },
     }) as ChildProcessWithoutNullStreams
     this.proc = proc
     this.outputDrainPromise = new Promise<void>((resolve) => {
@@ -3533,6 +3572,7 @@ export class CodexAppServerRunner extends EventEmitter {
       // queued turn's policy before the actual turn/start notifications arrive.
       this.currentCollabAgentPolicy = collabAgentPolicy
       await this.ensureSpawned(repoSnap, effectiveCwd)
+      this.refreshDelegateContext()
 
       // Each fresh app-server proc must explicitly attach a thread before
       // turn/start. `attached` is per-proc (cleared on close/error), so this

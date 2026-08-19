@@ -179,12 +179,20 @@ describe('handleDelegateTask async + handleDelegateWait', () => {
     assert.equal(waited.body.httpStatus, 200)
   })
 
-  it('TTL expiry: wait on an expired job returns 404 expired', async () => {
+  it('TTL starts after completion: running survives, retained result later expires', async () => {
     const gw = makeGateway(false)
     let now = 1_000
     gw._delegateJobs = new DelegateJobStore({ ttlMs: 50, now: () => now })
     const created = gw._delegateJobs.create('coding-assistant')
     now = 1_100
+    const running = await call(gw, 'handleDelegateWait', { jobId: created.jobId, waitMs: 30 })
+    assert.equal(running.status, 200)
+    assert.equal(running.body.status, 'running')
+    gw._delegateJobs.complete(created.jobId, {
+      httpStatus: 200,
+      body: { ok: true, output: 'done' },
+    })
+    now = 1_151
     const r = await call(gw, 'handleDelegateWait', { jobId: created.jobId, waitMs: 30 })
     assert.equal(r.status, 404)
     assert.equal(r.body.status, 'expired')

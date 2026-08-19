@@ -9,9 +9,19 @@
  * a new identity.
  */
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
+import {
+  AUTHORITY_TURN_MAX_LIFETIME_MS,
+  TURN_LEASE_GRACE_MS,
+} from '@openclaude/protocol'
 
 export const DELEGATE_CONTEXT_HEADER = 'x-openclaude-delegate-context'
-export const DELEGATE_CONTEXT_TTL_MS = 8 * 60 * 60_000
+/**
+ * Refreshed at every engine turn boundary. It must outlive the complete
+ * platform turn plus settlement grace, otherwise an active 8h+ async delegate
+ * can finish successfully but its captain can no longer retrieve the result.
+ */
+export const DELEGATE_CONTEXT_TTL_MS =
+  AUTHORITY_TURN_MAX_LIFETIME_MS + TURN_LEASE_GRACE_MS
 
 export type DelegateContextClaims = {
   v: 1

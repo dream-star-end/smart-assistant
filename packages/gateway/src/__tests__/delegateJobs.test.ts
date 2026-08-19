@@ -1,6 +1,5 @@
 /**
- * Delegate job handles + long-poll wait. Uses short constants / a fake clock;
- * does not wait real 45s/2h.
+ * Delegate job handles + long-poll wait. Uses short constants / a fake clock.
  *
  * Run: npx tsx --test packages/gateway/src/__tests__/delegateJobs.test.ts
  */
@@ -66,7 +65,7 @@ describe('DelegateJobStore', () => {
     store.close()
   })
 
-  it('TTL expiry: get/wait after the fake clock advances past ttl', async () => {
+  it('running jobs survive TTL; completed results expire TTL after completion', async () => {
     let now = 1_000
     const store = new DelegateJobStore({ ttlMs: 100, now: () => now })
     const created = store.create('coding-assistant')
@@ -74,16 +73,16 @@ describe('DelegateJobStore', () => {
     const jobId = created.jobId
     assert.equal(store.get(jobId).status, 'running')
     now = 1_101
+    assert.deepEqual(store.get(jobId), { status: 'running', jobId })
+    store.complete(jobId, { httpStatus: 200, body: doneBody })
+    assert.equal(store.get(jobId).status, 'done')
+    now = 1_202
     assert.deepEqual(store.get(jobId), { status: 'expired', jobId })
     assert.equal(store.size(), 0)
-    const waitView = await store.wait(jobId, 30)
-    assert.deepEqual(waitView, { status: 'expired', jobId })
-    store.complete(jobId, { httpStatus: 200, body: doneBody })
-    assert.deepEqual(store.get(jobId), { status: 'expired', jobId })
     store.close()
   })
 
-  it('notifies an in-flight waiter when TTL expires', async () => {
+  it('does not expire or wake an in-flight waiter merely because runtime exceeds TTL', async () => {
     let now = 1_000
     let wakeSleep: (() => void) | undefined
     const store = new DelegateJobStore({
@@ -98,14 +97,10 @@ describe('DelegateJobStore', () => {
     assert.ok('jobId' in created)
     const pending = store.wait(created.jobId, 5_000)
     now = 1_100
-    const view = await Promise.race([
-      pending,
-      (async () => {
-        store.sweep(now)
-        return pending
-      })(),
-    ])
-    assert.equal(view.status, 'expired')
+    assert.equal(store.sweep(now), 0)
+    store.complete(created.jobId, { httpStatus: 200, body: doneBody })
+    const view = await pending
+    assert.equal(view.status, 'done')
     wakeSleep?.()
     store.close()
   })

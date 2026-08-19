@@ -33,6 +33,7 @@
 import { createHash } from 'node:crypto'
 import { resolve } from 'node:path'
 import { createLogger } from './logger.js'
+import { issueDelegateContextToken } from './delegateContext.js'
 import { modelHintAppliedTotal } from './metrics.js'
 import { buildPromptContext } from './promptSlots.js'
 import { getPlatformPrompt } from './platformPrompts.js'
@@ -302,6 +303,10 @@ export interface CodexLaunchOverrides {
   /** Token content the caller must writeFile to tokenFile (mode 0600).
    *  Null when tokenFile is null. */
   tokenContent: string | null
+  /** Caller-bound async delegate credential. MCP and Codex Bash share only
+   * this path; the signed contents are refreshed at each turn boundary. */
+  delegateContextFile: string | null
+  delegateContextContent: string | null
   /** Optional v3 container token file for openclaude-vision MCP refresh. */
   visionTokenFile: string | null
   /** Token content the caller must writeFile to visionTokenFile (mode 0600). */
@@ -412,6 +417,8 @@ export async function buildCodexLaunchOverrides(
   const mcpEntry = resolveMcpMemoryEntry(ctx.claudeCodePath)
   let tokenFile: string | null = null
   let tokenContent: string | null = null
+  let delegateContextFile: string | null = null
+  let delegateContextContent: string | null = null
   if (mcpEntry) {
     // v3 hardening: the gateway token NEVER lands in argv. Instead, we point
     // mcp-memory at a 0600 file via OPENCLAUDE_GATEWAY_TOKEN_FILE; the caller
@@ -420,12 +427,19 @@ export async function buildCodexLaunchOverrides(
     // file path, which is not sensitive (mkdtemp'd sessionDir, also visible).
     tokenFile = resolve(ctx.sessionDir, 'gateway-token')
     tokenContent = ctx.gatewayToken
+    delegateContextFile = resolve(ctx.sessionDir, 'delegate-context')
+    delegateContextContent = `${issueDelegateContextToken({
+      agentId: ctx.agentId,
+      sessionKey: ctx.sessionKey ?? `agent:${ctx.agentId}:codex:unbound`,
+      depth: ctx.delegationDepth ?? 0,
+    })}\n`
     const mcpEnv: Record<string, string> = {
       OPENCLAUDE_AGENT_ID: ctx.agentId,
       OPENCLAUDE_HOME: ctx.openclaudeHome ?? process.env.OPENCLAUDE_HOME ?? '',
       ...(ctx.sessionKey ? { OPENCLAUDE_SESSION_KEY: ctx.sessionKey } : {}),
       OPENCLAUDE_GATEWAY_PORT: String(ctx.gatewayPort),
       OPENCLAUDE_GATEWAY_TOKEN_FILE: tokenFile,
+      OPENCLAUDE_DELEGATE_CONTEXT_FILE: delegateContextFile,
       OPENCLAUDE_DELEGATION_DEPTH: String(ctx.delegationDepth ?? 0),
       ...(process.env.OPENCLAUDE_BASELINE_SKILLS_DIR
         ? { OPENCLAUDE_BASELINE_SKILLS_DIR: process.env.OPENCLAUDE_BASELINE_SKILLS_DIR }
@@ -450,6 +464,8 @@ export async function buildCodexLaunchOverrides(
     instructionsContent,
     tokenFile,
     tokenContent,
+    delegateContextFile,
+    delegateContextContent,
     // vision MCP retired → oc-vision CLI (baseline skill); no vision token is
     // written on the codex path anymore. Fields kept on the interface (always
     // null) until the codex vision-token plumbing is fully removed.

@@ -4,7 +4,7 @@ import { AuthEpochStaleError } from '../../lib/api'
 import { buildSchedule, cronHuman } from '../../lib/cron'
 import {
   type BoardAgent,
-  DELEGATE_HARD_TIMEOUT_SEC,
+  DELEGATE_IDLE_TIMEOUT_MAX_SEC,
   ON_FAILURE_ACTIONS,
   ON_FAILURE_LABEL,
   ON_SUCCESS_ACTIONS,
@@ -146,8 +146,8 @@ function buildStagePatch(draft: StageDraft): { patch: StagePatchInput; error: st
   if (!Number.isInteger(timeoutSec) || timeoutSec < 1) {
     return { patch: {}, error: '超时须为正整数秒' }
   }
-  if (timeoutSec > DELEGATE_HARD_TIMEOUT_SEC) {
-    return { patch: {}, error: `超时不能超过 ${DELEGATE_HARD_TIMEOUT_SEC} 秒（45 分钟）` }
+  if (timeoutSec > DELEGATE_IDLE_TIMEOUT_MAX_SEC) {
+    return { patch: {}, error: `无活动超时不能超过 ${DELEGATE_IDLE_TIMEOUT_MAX_SEC} 秒（45 分钟）` }
   }
   const maxRunsPerDay = Number(draft.maxRunsPerDay)
   if (!Number.isInteger(maxRunsPerDay) || maxRunsPerDay < 1) {
@@ -335,14 +335,14 @@ function StageEditor({
         />
       </div>
       <Field
-        label="单次超时（秒）"
-        hint={`上限 ${DELEGATE_HARD_TIMEOUT_SEC} 秒（45 分钟，delegate 硬超时）`}
+        label="无活动超时（秒）"
+        hint={`连续无输出达到该值才中断；活跃任务不受 45 分钟总时长限制。上限 ${DELEGATE_IDLE_TIMEOUT_MAX_SEC} 秒`}
       >
         <Input
           aria-label="单次超时"
           type="number"
           min={1}
-          max={DELEGATE_HARD_TIMEOUT_SEC}
+          max={DELEGATE_IDLE_TIMEOUT_MAX_SEC}
           inputSize="sm"
           value={draft.timeoutSec}
           onChange={(e) => setDraft((d) => ({ ...d, timeoutSec: e.target.value }))}

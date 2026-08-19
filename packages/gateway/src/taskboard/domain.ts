@@ -231,7 +231,7 @@ export interface PipelineStage {
   quietHoursEnd: number | null
   /** 该阶段每卡每日执行上限。 */
   maxRunsPerDay: number
-  /** 单次执行超时(秒)。必须 <= delegate 45 分钟硬超时。 */
+  /** 连续无活动超时(秒)。真实输出/工具活动会续租，不是总执行时长。 */
   timeoutSec: number
   maxRetries: number
   /** 连续失败达到该值 → 熔断(冷却后半开试探,不再永久关掉 patrolEnabled)。 */
@@ -264,7 +264,7 @@ export interface TicketRun {
   sessionKey: string | null
   status: RunStatus
   skipReason: RunSkipReason | null
-  /** 防重入。必须长于 delegate 45 分钟硬超时(建议 50 分钟)。 */
+  /** 防重入租约；长 run 由 PatrolEngine 周期续租。 */
   leaseOwner: string | null
   leaseExpiresAt: number | null
   startedAt: number | null
@@ -348,9 +348,11 @@ export const GUARDRAIL_DEFAULTS = {
   maxRunsPerTick: 2,
   /** tick 间隔(毫秒)。 */
   tickIntervalMs: 60_000,
-  /** lease 时长(毫秒)。必须 > delegate 45 分钟硬超时。 */
+  /** lease 时长(毫秒)。活跃 run 会在到期前续租；进程崩溃后自然回收。 */
   leaseTtlMs: 50 * 60 * 1000,
-  /** 单次 run 默认超时(秒)。 */
+  /** lease 续租间隔(毫秒)。 */
+  leaseRenewIntervalMs: 10 * 60 * 1000,
+  /** 单次 run 默认连续无活动超时(秒)。 */
   defaultTimeoutSec: 40 * 60,
   /** 某 stage 连续空转轮数达到该值 → 降频。 */
   idleBackoffAfterTicks: 10,

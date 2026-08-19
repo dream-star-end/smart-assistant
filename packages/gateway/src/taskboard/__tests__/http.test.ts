@@ -725,7 +725,7 @@ describe('stage 写路径校验', () => {
     db.close()
   })
 
-  it('timeoutSec 超过 delegate 硬超时 2700 → 400;2700 边界可通过', async () => {
+  it('无活动 timeoutSec 超过 2700 → 400;2700 边界可通过', async () => {
     const db = freshDb()
     await withServer(humanCtx(db), async (base) => {
       const projectId = await createProjectOnly(base)

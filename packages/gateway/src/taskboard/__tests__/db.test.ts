@@ -31,7 +31,14 @@ import {
 import { createPipeline, getPipeline, updatePipeline } from '../db/pipelines.js'
 import { archiveProject, createProject, getProject, updateProject } from '../db/projects.js'
 import { addRelation, listRelations } from '../db/relations.js'
-import { acquireLease, getActiveLease, reapExpiredLeases, releaseLease } from '../db/runs.js'
+import {
+  acquireLease,
+  getActiveLease,
+  reapExpiredLeases,
+  releaseLease,
+  renewLease,
+  settleLeaseRun,
+} from '../db/runs.js'
 import {
   createTicket,
   getTicket,
@@ -317,6 +324,38 @@ describe('lease', () => {
     const second = acquireLease(db, t.id, 'stage-b', 'owner-b', 5_000, { now: now + 6_000 })
     assert.equal(second.leaseOwner, 'owner-b')
     assert.notEqual(second.id, first.id)
+    db.close()
+  })
+
+  it('续租与终态写都带 owner+未过期 fencing,旧 worker 不能复活或回写', () => {
+    const { db } = freshDb()
+    const p = createProject(db, { key: 'OCV5', name: 'V5' })
+    const t = createTicket(db, { projectId: p.id, type: 'bug', title: 'x', reporter: 'u' })
+    const now = 1_000_000
+    const run = acquireLease(db, t.id, 'stage-a', 'owner-a', 5_000, { now })
+    assert.equal(renewLease(db, run.id, 'wrong-owner', 5_000, now + 1_000), null)
+    assert.equal(renewLease(db, run.id, 'owner-a', 5_000, now + 1_000)?.leaseExpiresAt, now + 6_000)
+    assert.equal(renewLease(db, run.id, 'owner-a', 5_000, now + 7_000), null)
+    assert.equal(
+      settleLeaseRun(
+        db,
+        run.id,
+        'owner-a',
+        {
+          status: 'succeeded',
+          summary: 'stale',
+          outputMd: 'stale',
+          error: null,
+          finishedAt: now + 7_000,
+          durationMs: 7_000,
+          tokensIn: 1,
+          tokensOut: 1,
+          costUsd: 0,
+        },
+        now + 7_000,
+      ),
+      null,
+    )
     db.close()
   })
 })

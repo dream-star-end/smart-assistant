@@ -30,7 +30,6 @@ import { afterEach, beforeEach, describe, it } from 'node:test'
  *      memory state into codex's private store.
  */
 import { _internals, resolveMcpMemoryEntry } from '../codexLaunchOverrides.js'
-import { resolveDelegateTimeoutConfig } from '../delegateTimeout.js'
 
 const { tomlValue, CODEX_PREAMBLE, codexMcpToolTimeoutSec } = _internals
 
@@ -325,15 +324,12 @@ describe('buildCodexLaunchOverrides', () => {
     }
   })
 
-  it('extends codex MCP tool timeout so long delegate_task calls can finish', async () => {
+  it('keeps a bounded Codex MCP call window; long delegates return async handles', async () => {
     assert.equal(codexMcpToolTimeoutSec({}), 3600)
     assert.equal(codexMcpToolTimeoutSec({ OPENCLAUDE_CODEX_MCP_TOOL_TIMEOUT_SEC: '900' }), 900)
     assert.equal(codexMcpToolTimeoutSec({ OPENCLAUDE_CODEX_MCP_TOOL_TIMEOUT_SEC: '5' }), 60)
     assert.equal(codexMcpToolTimeoutSec({ OPENCLAUDE_CODEX_MCP_TOOL_TIMEOUT_SEC: '99999' }), 7200)
-    assert.ok(
-      codexMcpToolTimeoutSec({}) * 1000 > resolveDelegateTimeoutConfig({}).hardTimeoutMs,
-      'default Codex MCP tool timeout must exceed gateway delegate hard timeout so gateway returns structured errors before MCP aborts',
-    )
+    assert.ok(codexMcpToolTimeoutSec({}) >= 60)
 
     await withEnv({ OPENCLAUDE_CODEX_MCP_TOOL_TIMEOUT_SEC: '900' }, async () => {
       const { buildCodexLaunchOverrides } = await import('../codexLaunchOverrides.js')
@@ -384,6 +380,10 @@ describe('buildCodexLaunchOverrides', () => {
       assert.ok(
         envKey.includes('agent:test-agent:webchat:dm:sess_123'),
         `env must carry the exact parent session key; got: ${envKey}`,
+      )
+      assert.ok(
+        envKey.includes('OPENCLAUDE_DELEGATE_CONTEXT_FILE'),
+        `async delegate calls must carry a signed caller binding; got: ${envKey}`,
       )
       // Hard invariant: NO override value may contain the token literal.
       assert.ok(
@@ -457,8 +457,13 @@ describe('buildCodexLaunchOverrides', () => {
         s.startsWith('mcp_servers.openclaude_memory.env='),
       )
       assert.ok(envKey?.includes(out.tokenFile), 'env override must reference exact tokenFile path')
+      assert.ok(out.delegateContextFile?.startsWith(dir))
+      assert.match(out.delegateContextContent ?? '', /\./)
+      assert.ok(envKey?.includes(out.delegateContextFile ?? 'missing-context-file'))
     } else {
       assert.equal(out.tokenContent, null, 'tokenContent must mirror tokenFile null-ness')
+      assert.equal(out.delegateContextFile, null)
+      assert.equal(out.delegateContextContent, null)
     }
   })
 

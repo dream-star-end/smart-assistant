@@ -324,7 +324,6 @@ describe('handleDelegateTask — server-authored 团队卡 buffering (P2 债A)',
   it('真实 timeout race 会等 interrupt 后 submit 收口再物化完整 transcript', async () => {
     const realNow = Date.now
     const oldIdle = process.env.OPENCLAUDE_DELEGATE_IDLE_TIMEOUT_MS
-    const oldHard = process.env.OPENCLAUDE_DELEGATE_HARD_TIMEOUT_MS
     const oldCheck = process.env.OPENCLAUDE_DELEGATE_CHECK_INTERVAL_MS
     let now = realNow()
     let emit: ((event: any) => void) | undefined
@@ -334,7 +333,6 @@ describe('handleDelegateTask — server-authored 团队卡 buffering (P2 债A)',
     try {
       Date.now = () => now
       process.env.OPENCLAUDE_DELEGATE_IDLE_TIMEOUT_MS = '60000'
-      process.env.OPENCLAUDE_DELEGATE_HARD_TIMEOUT_MS = '300000'
       process.env.OPENCLAUDE_DELEGATE_CHECK_INTERVAL_MS = '1000'
       const { gw, buffered } = makeGateway({
         submit: async (_s, _p, onEvent) => {
@@ -365,8 +363,6 @@ describe('handleDelegateTask — server-authored 团队卡 buffering (P2 债A)',
       Date.now = realNow
       if (oldIdle === undefined) delete process.env.OPENCLAUDE_DELEGATE_IDLE_TIMEOUT_MS
       else process.env.OPENCLAUDE_DELEGATE_IDLE_TIMEOUT_MS = oldIdle
-      if (oldHard === undefined) delete process.env.OPENCLAUDE_DELEGATE_HARD_TIMEOUT_MS
-      else process.env.OPENCLAUDE_DELEGATE_HARD_TIMEOUT_MS = oldHard
       if (oldCheck === undefined) delete process.env.OPENCLAUDE_DELEGATE_CHECK_INTERVAL_MS
       else process.env.OPENCLAUDE_DELEGATE_CHECK_INTERVAL_MS = oldCheck
     }
@@ -375,7 +371,6 @@ describe('handleDelegateTask — server-authored 团队卡 buffering (P2 债A)',
   it('timeout 强停后等待真实 stdout drain，再物化 drain 边界内的全部帧', async () => {
     const realNow = Date.now
     const oldIdle = process.env.OPENCLAUDE_DELEGATE_IDLE_TIMEOUT_MS
-    const oldHard = process.env.OPENCLAUDE_DELEGATE_HARD_TIMEOUT_MS
     const oldCheck = process.env.OPENCLAUDE_DELEGATE_CHECK_INTERVAL_MS
     const oldDrain = process.env.OPENCLAUDE_DELEGATE_INTERRUPT_DRAIN_MS
     const oldShutdown = process.env.OPENCLAUDE_DELEGATE_SHUTDOWN_WAIT_MS
@@ -388,7 +383,6 @@ describe('handleDelegateTask — server-authored 团队卡 buffering (P2 债A)',
     try {
       Date.now = () => now
       process.env.OPENCLAUDE_DELEGATE_IDLE_TIMEOUT_MS = '60000'
-      process.env.OPENCLAUDE_DELEGATE_HARD_TIMEOUT_MS = '300000'
       process.env.OPENCLAUDE_DELEGATE_CHECK_INTERVAL_MS = '1'
       process.env.OPENCLAUDE_DELEGATE_INTERRUPT_DRAIN_MS = '5'
       process.env.OPENCLAUDE_DELEGATE_SHUTDOWN_WAIT_MS = '5'
@@ -431,7 +425,6 @@ describe('handleDelegateTask — server-authored 团队卡 buffering (P2 债A)',
       Date.now = realNow
       for (const [key, value] of [
         ['OPENCLAUDE_DELEGATE_IDLE_TIMEOUT_MS', oldIdle],
-        ['OPENCLAUDE_DELEGATE_HARD_TIMEOUT_MS', oldHard],
         ['OPENCLAUDE_DELEGATE_CHECK_INTERVAL_MS', oldCheck],
         ['OPENCLAUDE_DELEGATE_INTERRUPT_DRAIN_MS', oldDrain],
         ['OPENCLAUDE_DELEGATE_SHUTDOWN_WAIT_MS', oldShutdown],

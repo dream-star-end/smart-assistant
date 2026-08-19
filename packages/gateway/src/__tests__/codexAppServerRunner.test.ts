@@ -32,6 +32,18 @@ it('injects non-scrubbed Codex memory turn identity', () => {
     OC_AGENT_ID: 'research',
     OC_SESSION_KEY: 'web-session-1',
   })
+  assert.deepEqual(
+    _codexMemoryTurnEnv('research', 'web-session-1', {
+      gatewayPort: 18789,
+      contextFile: '/tmp/delegate-context',
+    }),
+    {
+      OC_AGENT_ID: 'research',
+      OC_SESSION_KEY: 'web-session-1',
+      OPENCLAUDE_GATEWAY_PORT: '18789',
+      OPENCLAUDE_DELEGATE_CONTEXT_FILE: '/tmp/delegate-context',
+    },
+  )
 })
 
 // ── helpers ─────────────────────────────────────────────────────────────────

@@ -49,7 +49,6 @@ import {
 } from '@openclaude/storage'
 
 import {
-  type FanoutItemResult,
   type FanoutTask,
   aggregateDelegateFanoutResults,
   normalizeFanoutTasks,
@@ -57,7 +56,6 @@ import {
 import { normalizeDelegateAgentId, normalizeDelegateModel } from './delegateArgs.js'
 import {
   formatDelegateFanoutRunning,
-  formatDelegateSuccess,
   resolveCursorFastWaitMs,
   runCursorDelegateFastPath,
   type FanoutCursorItem,
@@ -65,7 +63,7 @@ import {
 } from './delegateCursorFastPath.js'
 import {
   describeDelegateTransportError,
-  gatewayAuthHeaders,
+  gatewayDelegateHeaders,
   gatewayBaseUrl,
   postJsonToGateway,
   readGatewayToken,
@@ -107,9 +105,6 @@ const DELEGATION_DEPTH = Math.max(
 const ENGINE_ID = (process.env.OPENCLAUDE_ENGINE || '').trim().toLowerCase()
 const ASK_USER_MCP_ESCAPE = process.env.OC_ASK_USER_MCP === '1'
 const ASK_USER_ENABLED = ENGINE_ID === 'cursor'
-/** Cursor MCP tools/call 有 60s 硬超时:仅该引擎把委派切成作业句柄 + 快路径。
- *  CCB/Codex 继续走同步 /delegate,行为不变。 */
-const CURSOR_DELEGATE_ENABLED = ENGINE_ID === 'cursor'
 
 function buildSkillStore(): SkillStore {
   // Overlay (single wiring in @openclaude/storage): platform baseline (ro env)
@@ -675,7 +670,7 @@ async function handleSendToAgent(args: { agentId: string; message: string }) {
           message: args.message,
           sourceAgent,
         }),
-        timeoutMs: DELEGATE_CLIENT_TIMEOUT_MS,
+        timeoutMs: AGENT_MESSAGE_CLIENT_TIMEOUT_MS,
       },
     )
     if (res.statusCode < 200 || res.statusCode >= 300) {
@@ -727,63 +722,17 @@ async function handleDelegateTask(args: {
 async function handleDelegateTasks(args: { tasks?: unknown }) {
   const normalized = normalizeFanoutTasks(args?.tasks)
   if (!normalized.ok) return toolError(normalized.error)
-  if (CURSOR_DELEGATE_ENABLED) return handleCursorDelegateTasks(normalized.tasks)
-  const tasks = normalized.tasks
-  const items = await Promise.all(
-    tasks.map(async (t): Promise<FanoutItemResult> => {
-      const label = t.agentId || 'main'
-      try {
-        const r = await handleDelegateTaskToAgent(label, {
-          goal: t.goal,
-          context: t.context,
-          effort: t.effort,
-          toolsets: t.toolsets,
-          resumeSessionKey: t.resumeSessionKey,
-          model: t.model,
-          label,
-        })
-        // toolOk 返回体无 isError 字段、toolError 有 → 联合类型下按可选属性安全取值。
-        return {
-          label,
-          goal: t.goal,
-          isError: (r as { isError?: boolean }).isError === true,
-          text: r.content?.[0]?.text ?? '(无输出)',
-        }
-      } catch (err: any) {
-        // 兜底:handleDelegateTaskToAgent 已自带 try/catch(理论到不了这里),
-        // 仍隔离单项异常,避免一个子任务的意外把整个 fan-out 拖垮。
-        return {
-          label,
-          goal: t.goal,
-          isError: true,
-          text: `委派失败: ${describeDelegateTransportError(err)}`,
-        }
-      }
-    }),
-  )
-  return toolOk(aggregateDelegateFanoutResults(items))
+  return handleAsyncDelegateTasks(normalized.tasks)
 }
 
 // (v5 ccb-only:handleAskGpt55Codex 已移除 —— 无 codex agent。)
 
 /**
- * The captain's HTTP client must wait strictly longer than the gateway's
- * authoritative delegate lifetime. The gateway runs the child up to its hard
- * timeout — delegateTimeout.ts clamps that to at most 2h — and ALWAYS sends an
- * HTTP response (on completion / idle timeout / hard timeout). It only writes
- * that response after the child finishes; progress streams over a separate WS,
- * so nothing flows on this socket until the very end. The original code used
- * global fetch, whose undici default 5min headersTimeout aborted any non-trivial
- * delegation mid-run → "委派失败: fetch failed", while the orphaned child kept
- * burning tokens.
- *
- * The gateway is the single authority on delegate lifetime; the client only has
- * to outlast the gateway's maximum possible hold time. Since that ceiling is a
- * fixed 2h (delegateTimeout.ts hard-timeout clamp), wait 2h + a margin — this
- * never re-splits the two sides regardless of any OPENCLAUDE_DELEGATE_HARD_*
- * env tuning (the gateway can never exceed its own clamp).
+ * send_to_agent is a separate long callback endpoint. Delegate tools no longer
+ * use one long HTTP request: every engine starts an async job, waits briefly,
+ * then returns a resumable job handle before its MCP tools/call deadline.
  */
-const DELEGATE_CLIENT_TIMEOUT_MS = 2 * 60 * 60_000 + 60_000
+const AGENT_MESSAGE_CLIENT_TIMEOUT_MS = 2 * 60 * 60_000 + 60_000
 
 /**
  * 引擎交互提问桥(仅 Cursor,且仅 OC_ASK_USER_MCP=1 逃生开关):把选择题 POST
@@ -872,12 +821,12 @@ async function handleRequestReview(args: {
   })
 }
 
-async function handleCursorDelegateTasks(tasks: FanoutTask[]) {
+async function handleAsyncDelegateTasks(tasks: FanoutTask[]) {
   const items = await Promise.all(
     tasks.map(async (t): Promise<FanoutCursorItem> => {
       const label = t.agentId || 'main'
       try {
-        const r = await runCursorDelegateToAgent(label, {
+        const r = await runAsyncDelegateToAgent(label, {
           goal: t.goal,
           context: t.context,
           effort: t.effort,
@@ -925,7 +874,7 @@ async function handleCursorDelegateTasks(tasks: FanoutTask[]) {
   )
 }
 
-async function runCursorDelegateToAgent(
+async function runAsyncDelegateToAgent(
   targetAgent: string,
   args: {
     goal: string
@@ -941,7 +890,7 @@ async function runCursorDelegateToAgent(
   const parentSessionKey = process.env.OPENCLAUDE_SESSION_KEY || ''
   const currentDepth = Number.parseInt(process.env.OPENCLAUDE_DELEGATION_DEPTH || '0', 10)
   const headers = {
-    ...gatewayAuthHeaders(),
+    ...gatewayDelegateHeaders(),
     'x-delegation-depth': String(currentDepth),
   }
   const base = gatewayBaseUrl()
@@ -990,68 +939,13 @@ async function handleDelegateTaskToAgent(
     label: string
   },
 ) {
-  if (CURSOR_DELEGATE_ENABLED) {
-    try {
-      const r = await runCursorDelegateToAgent(targetAgent, args)
-      if (r.kind === 'error') return toolError(r.text)
-      return toolOk(r.text)
-    } catch (err: any) {
-      return toolError(`委派失败: ${describeDelegateTransportError(err)}`)
-    }
-  }
-  const gatewayPort = process.env.OPENCLAUDE_GATEWAY_PORT || '18789'
-  const gatewayToken = readGatewayToken()
-  const sourceAgent = process.env.OPENCLAUDE_AGENT_ID || 'unknown'
-  const parentSessionKey = process.env.OPENCLAUDE_SESSION_KEY || ''
   try {
-    // Pass delegation depth so gateway can enforce recursion limit
-    const currentDepth = Number.parseInt(process.env.OPENCLAUDE_DELEGATION_DEPTH || '0', 10)
-    const res = await postJsonToGateway(
-      `http://127.0.0.1:${gatewayPort}/api/agents/${encodeURIComponent(targetAgent)}/delegate`,
-      {
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${gatewayToken}`,
-          'x-delegation-depth': String(currentDepth),
-        },
-        body: JSON.stringify({
-          goal: args.goal,
-          context: args.context,
-          ...(args.effort ? { effort: args.effort } : {}),
-          ...(args.model ? { model: args.model } : {}),
-          sourceAgent,
-          toolsets: args.toolsets,
-          ...(args.resumeSessionKey ? { resumeSessionKey: args.resumeSessionKey } : {}),
-          ...(parentSessionKey ? { streamProgress: true, parentSessionKey } : {}),
-        }),
-        timeoutMs: DELEGATE_CLIENT_TIMEOUT_MS,
-      },
-    )
-    if (res.statusCode < 200 || res.statusCode >= 300) {
-      return toolError(`委派失败: ${res.body}`)
-    }
-    const data = JSON.parse(res.body) as any
-    if (data.error || data.ok === false) {
-      return toolError(`子 agent 执行出错: ${data.error || data.output || 'unknown error'}`)
-    }
-    const output = data.output || ''
-    if (looksLikeDelegateApiError(output)) {
-      return toolError(`子 agent 执行出错: ${output}`)
-    }
-    const sessionKey =
-      typeof data.sessionKey === 'string' && data.sessionKey.trim()
-        ? data.sessionKey.trim()
-        : undefined
-    return toolOk(formatDelegateSuccess(args.label, output, sessionKey))
+    const r = await runAsyncDelegateToAgent(targetAgent, args)
+    if (r.kind === 'error') return toolError(r.text)
+    return toolOk(r.text)
   } catch (err: any) {
     return toolError(`委派失败: ${describeDelegateTransportError(err)}`)
   }
-}
-
-function looksLikeDelegateApiError(raw: unknown): boolean {
-  const s = String(raw ?? '').trim()
-  if (!s) return false
-  return /^API Error:\s*(?:\d{3}\b|\{)/i.test(s)
 }
 
 // ── 定时任务工具族共用:gateway /api/cron 客户端 ────────────────────────────

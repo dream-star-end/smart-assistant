@@ -39,7 +39,6 @@ import {
 } from './memoryTools.js'
 import { gatewayAuthHeaders, gatewayBaseUrl, gatewayDelegateHeaders, postJsonToGateway } from './gatewayClient.js'
 import {
-  resolveDelegateWaitHardMs,
   resolveDelegateWaitPollMs,
   runDelegateWaitLoop,
 } from './delegateWaitCli.js'
@@ -196,7 +195,6 @@ async function main(): Promise<void> {
       args,
       contextToken: ctxTok.token,
       pollWaitMs,
-      hardTimeoutMs: resolveDelegateWaitHardMs(),
       start: (agentId, body) =>
         postJsonToGateway(`${base}/api/agents/${encodeURIComponent(agentId)}/delegate`, {
           headers,
@@ -223,7 +221,6 @@ async function main(): Promise<void> {
     const result = await runDelegateWaitLoop({
       jobIds: positional,
       pollWaitMs: resolveDelegateWaitPollMs(),
-      hardTimeoutMs: resolveDelegateWaitHardMs(),
       waitOnce: (jobId, waitMs) =>
         postJsonToGateway(`${base}/api/delegate/wait`, {
           headers,

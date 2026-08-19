@@ -1,11 +1,11 @@
 /**
  * In-memory delegate job handles + long-poll wait.
  *
- * Cursor's official Agent CLI hard-times-out MCP `tools/call` at 60s. Sync
- * `/delegate` is unchanged (CCB/Codex keep waiting on the HTTP socket). When a
- * caller sets `async: true`, the gateway parks the child run behind a jobId and
- * the caller long-polls `POST /api/delegate/wait`. Results live in process
- * memory with a TTL matching the delegate hard-timeout clamp (2h).
+ * Every engine starts delegation with `async: true`: MCP calls only wait a
+ * short fast-path window, while the gateway parks the child behind a jobId and
+ * the caller long-polls `POST /api/delegate/wait`. Running jobs do not expire:
+ * the delegate idle watchdog owns liveness. The TTL starts only after a result
+ * is available, so a legitimate long run cannot lose its retrieval handle.
  */
 
 import { randomBytes } from 'node:crypto'
@@ -70,7 +70,7 @@ type JobEntry = {
   id: string
   agentId: string
   createdAt: number
-  expiresAt: number
+  expiresAt: number | null
   sessionKey?: string
   result: DelegateJobHttpResult | null
   waiters: Array<(view: DelegateJobWaitView) => void>
@@ -114,7 +114,7 @@ export class DelegateJobStore {
       id: jobId,
       agentId,
       createdAt,
-      expiresAt: createdAt + this.ttlMs,
+      expiresAt: null,
       sessionKey: meta?.sessionKey,
       result: null,
       waiters: [],
@@ -126,6 +126,7 @@ export class DelegateJobStore {
     const job = this.jobs.get(jobId)
     if (!job || job.result) return
     job.result = result
+    job.expiresAt = this.now() + this.ttlMs
     const view: DelegateJobWaitView = {
       status: 'done',
       jobId,
@@ -198,7 +199,7 @@ export class DelegateJobStore {
   sweep(now = this.now()): number {
     let removed = 0
     for (const [id, job] of this.jobs) {
-      if (job.expiresAt > now) continue
+      if (!job.result || job.expiresAt === null || job.expiresAt > now) continue
       const waiters = job.waiters.splice(0)
       for (const w of waiters) w({ status: 'expired', jobId: id })
       this.jobs.delete(id)

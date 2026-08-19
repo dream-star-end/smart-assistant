@@ -493,7 +493,7 @@ export function pickIdleTimeoutMs(
  *
  * 判定看的是「距上次活动」而不是会话墙钟时长。`submit()` 把 `lastUsedAt` /
  * `runner.lastActivityAt` 打到 turn 起点,stdout 与 CCB telemetry 持续刷新
- * `lastActivityAt`(见本文件 liveness 注释)。巡检 delegate 硬超时 45min 期间
+ * `lastActivityAt`(见本文件 liveness 注释)。巡检 delegate 活跃期间
  * 只要还在产出就不会被 30min 空闲窗杀掉;真静默会先被 15min turn idle
  * watchdog 收掉,本判定只负责事后把死会话从内存里清掉,避免当成长聊会话
  * 留 2 小时。
