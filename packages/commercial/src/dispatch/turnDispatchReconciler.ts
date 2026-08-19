@@ -52,6 +52,13 @@ import {
 export const DEFAULT_RECONCILE_INTERVAL_MS = 30_000
 export const MIN_INTERVAL_MS = 5_000
 export const DEFAULT_LIMIT = 50
+
+let visibleOrphanScanOffset = 0
+
+/** Test-only: reset closeVisibleOrphans OFFSET cursor. */
+export function _resetVisibleOrphanScanOffset(): void {
+  visibleOrphanScanOffset = 0
+}
 export const DEFAULT_CODEX_SESSION_MAX_MS = 600_000
 /** accepted stuck 阈值 floor = max(codexMax*2, 90min);env 只允许向上夹(更保守)。 */
 export const DEFAULT_ACCEPTED_STUCK_FLOOR_MS = 90 * 60 * 1000
@@ -510,12 +517,91 @@ async function projectTapelessVisibleToSession(
   )
 }
 
+async function finalizeOrphanDispatch(input: {
+  deps: TurnDispatchReconcilerDeps
+  row: {
+    dispatch_id: string
+    user_id: string
+    session_id: string
+    client_message_id: string
+  }
+  outcome: 'completed' | 'interrupted'
+  nowMs: number
+  fence: boolean
+  projectFallback: boolean
+  fallbackText: string
+}): Promise<boolean> {
+  const client = await input.deps.pool.connect()
+  try {
+    await client.query('BEGIN')
+    const locked = await client.query<{ status: string }>(
+      `SELECT status FROM turn_dispatches WHERE dispatch_id=$1::uuid FOR UPDATE -- closeVisibleOrphans lock`,
+      [input.row.dispatch_id],
+    )
+    const status = locked.rows[0]?.status
+    if (status !== 'admitted' && status !== 'accepted' && status !== 'rejecting') {
+      await client.query('ROLLBACK')
+      return false
+    }
+    if (input.fence) {
+      await client.query(
+        `UPDATE turn_dispatches SET producer_fenced_at=COALESCE(producer_fenced_at, NOW())
+          WHERE dispatch_id=$1::uuid AND producer_fenced_at IS NULL`,
+        [input.row.dispatch_id],
+      )
+    }
+    if (input.projectFallback) {
+      await client.query(
+        `UPDATE turn_dispatches
+            SET visible_head=$2::jsonb, visible_at=COALESCE(visible_at,$3)
+          WHERE dispatch_id=$1::uuid`,
+        [
+          input.row.dispatch_id,
+          JSON.stringify({
+            role: 'assistant',
+            text: input.fallbackText,
+            ts: input.nowMs,
+            messageId: `visible-fallback:${input.row.dispatch_id}`,
+            clientMessageId: input.row.client_message_id,
+          }),
+          input.nowMs,
+        ],
+      )
+      await projectTapelessVisibleToSession(client, {
+        sessionId: input.row.session_id,
+        userId: `c:${input.row.user_id}`,
+        dispatchId: input.row.dispatch_id,
+        clientMessageId: input.row.client_message_id,
+        text: input.fallbackText,
+        nowMs: input.nowMs,
+      })
+    }
+    const terminal = await casToTerminal(client, {
+      dispatchId: input.row.dispatch_id,
+      outcome: input.outcome,
+      fromStatuses: ['admitted', 'accepted', 'rejecting'],
+    })
+    if (!terminal) {
+      await client.query('ROLLBACK')
+      return false
+    }
+    await client.query('COMMIT')
+    return true
+  } catch (err) {
+    try { await client.query('ROLLBACK') } catch { /* ignore */ }
+    throw err
+  } finally {
+    client.release()
+  }
+}
+
 async function closeVisibleOrphans(
   deps: TurnDispatchReconcilerDeps,
   nowMs: number,
   limit: number,
 ): Promise<number> {
-  const rows = await deps.pool.query<{
+  const scanLimit = Math.min(200, Math.max(limit * 4, limit))
+  const queryVisible = async (offset: number) => deps.pool.query<{
     dispatch_id: string
     user_id: string
     session_id: string
@@ -556,10 +642,17 @@ async function closeVisibleOrphans(
        FROM turn_dispatches d
        LEFT JOIN client_session_turn_tapes t ON t.dispatch_id = d.dispatch_id
       WHERE d.status IN ('admitted','accepted')
-      ORDER BY d.admitted_at
-      LIMIT $1`,
-    [limit],
+      ORDER BY d.admitted_at, d.dispatch_id
+      OFFSET $2 LIMIT $1`,
+    [scanLimit, offset],
   )
+  let rows = await queryVisible(visibleOrphanScanOffset)
+  if (rows.rows.length === 0 && visibleOrphanScanOffset > 0) {
+    visibleOrphanScanOffset = 0
+    rows = await queryVisible(0)
+  }
+  if (rows.rows.length < scanLimit) visibleOrphanScanOffset = 0
+  else visibleOrphanScanOffset += rows.rows.length
   let closed = 0
   for (const row of rows.rows) {
     const action = classifyVisibleOrphan({
@@ -572,77 +665,55 @@ async function closeVisibleOrphans(
       nowMs,
     })
     if (action === 'skip') continue
+    const hasTape = typeof row.tape_id === 'string' && row.tape_id.length > 0
     const outcome = action === 'complete_from_frames' || action === 'converge_only'
-      ? 'completed'
-      : 'interrupted'
-    if (action === 'complete_from_frames' && row.tape_id && deps.commitVisibleTape) {
+      ? 'completed' as const
+      : 'interrupted' as const
+    if (hasTape && action === 'complete_from_frames') {
+      const tapeId = row.tape_id
+      if (!tapeId || !deps.commitVisibleTape) continue
       try {
         await deps.commitVisibleTape({
           userId: `c:${row.user_id}`,
           sessionId: row.session_id,
-          tapeId: row.tape_id,
+          tapeId,
         })
       } catch {
-        /* Phase A retry next tick */
+        continue
       }
+      closed++
+      try {
+        deps.nudgeClient?.(
+          BigInt(row.user_id),
+          row.session_id,
+          row.client_message_id,
+          'turn_completed',
+        )
+      } catch {
+        /* best-effort */
+      }
+      continue
     }
-    const aggregated = await aggregateDispatchLiveText(deps.pool, row.dispatch_id)
+    const projectFallback = !hasTape
+    if (hasTape && !projectFallback && action !== 'converge_only'
+      && action !== 'interrupt_tapeless' && action !== 'fence_hard_cap') {
+      continue
+    }
+    const aggregated = projectFallback ? await aggregateDispatchLiveText(deps.pool, row.dispatch_id) : ''
     const text = aggregated
-      || (action === 'complete_from_frames'
+      || (outcome === 'completed'
         ? 'turn completed (visible fallback)'
         : 'turn interrupted (visible fallback)')
-    const client = await deps.pool.connect()
-    let terminal = null
-    try {
-      await client.query('BEGIN')
-      await client.query(
-        `SELECT 1 FROM turn_dispatches WHERE dispatch_id=$1::uuid FOR UPDATE`,
-        [row.dispatch_id],
-      )
-      if (action === 'fence_hard_cap') {
-        await client.query(
-          `UPDATE turn_dispatches SET producer_fenced_at=COALESCE(producer_fenced_at, NOW())
-            WHERE dispatch_id=$1::uuid AND producer_fenced_at IS NULL`,
-          [row.dispatch_id],
-        )
-      }
-      await client.query(
-        `UPDATE turn_dispatches
-            SET visible_head=$2::jsonb, visible_at=COALESCE(visible_at,$3)
-          WHERE dispatch_id=$1::uuid`,
-        [
-          row.dispatch_id,
-          JSON.stringify({
-            role: 'assistant',
-            text,
-            ts: nowMs,
-            messageId: `visible-fallback:${row.dispatch_id}`,
-            clientMessageId: row.client_message_id,
-          }),
-          nowMs,
-        ],
-      )
-      await projectTapelessVisibleToSession(client, {
-        sessionId: row.session_id,
-        userId: `c:${row.user_id}`,
-        dispatchId: row.dispatch_id,
-        clientMessageId: row.client_message_id,
-        text,
-        nowMs,
-      })
-      terminal = await casToTerminal(client, {
-        dispatchId: row.dispatch_id,
-        outcome,
-        fromStatuses: ['admitted', 'accepted', 'rejecting'],
-      })
-      await client.query('COMMIT')
-    } catch (err) {
-      try { await client.query('ROLLBACK') } catch { /* ignore */ }
-      throw err
-    } finally {
-      client.release()
-    }
-    if (!terminal) continue
+    const ok = await finalizeOrphanDispatch({
+      deps,
+      row,
+      outcome,
+      nowMs,
+      fence: action === 'fence_hard_cap',
+      projectFallback,
+      fallbackText: text,
+    })
+    if (!ok) continue
     closed++
     try {
       deps.nudgeClient?.(
