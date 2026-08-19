@@ -107,7 +107,8 @@
     "0226_cursor_quota_class",
     "0227_zcode_engine",
     "0228_turn_visible_finalize",
-    "0229_turn_finalize_integrity"
+    "0229_turn_finalize_integrity",
+    "0230_chat_projects"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

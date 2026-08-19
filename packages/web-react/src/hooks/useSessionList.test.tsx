@@ -400,3 +400,65 @@ describe("useSessionList history loading fence", () => {
     expect(socket.mergeServerHistory).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("useSessionList 置顶 / 项目归属 / 终态字段", () => {
+  test("listSessions 的 pinned / projectId / lastOutcome 会进入侧栏 Session（不再丢弃）", async () => {
+    vi.spyOn(api, "listSessions").mockResolvedValue([
+      {
+        id: "webpinned01",
+        title: "钉住的会话",
+        agentId: "coder",
+        pinned: true,
+        projectId: "p-work",
+        runState: "idle",
+        lastOutcome: "completed",
+        lastErrorCode: null,
+        createdAt: 1,
+        lastAt: 2_000,
+        updatedAt: 2_000,
+        messageCount: 4,
+      },
+    ] as never);
+    vi.spyOn(api, "getSession").mockResolvedValue(detail("webpinned01"));
+    const auth = createMemoryAuthSession(() => {}, "token");
+    const user: User = { id: "u1", displayName: "User", roles: ["user"] };
+    const { result } = renderHook(() =>
+      useSessionList({
+        demo: false,
+        auth,
+        authSession: auth,
+        user,
+        agentId: "main",
+        sockRef: { current: { storedMaxSeq: () => 0, storedHistoryRevision: () => 1, mergeServerHistory: vi.fn() } as never },
+        confirmDialog: async () => false,
+        promptText: async () => null,
+        clearChatError: () => {},
+        onNewSessionReset: () => {},
+        onActiveSessionDeleted: () => {},
+      }),
+    );
+    await waitFor(() => expect(result.current.sessions.length).toBe(1));
+    const s = result.current.sessions[0];
+    expect(s.pinned).toBe(true);
+    expect(s.projectId).toBe("p-work");
+    expect(s.agentId).toBe("coder");
+    expect(s.lastOutcome).toBe("completed");
+    expect(s.runState).toBe("idle");
+  });
+
+  test("togglePinSession 乐观更新并 PATCH meta；失败回滚", async () => {
+    vi.spyOn(api, "listSessions").mockResolvedValue([
+      { id: "webkeepme001", title: "保留的会话", agentId: "main", pinned: false, updatedAt: 2_000, lastAt: 2_000, messageCount: 1 },
+    ] as never);
+    vi.spyOn(api, "getSession").mockResolvedValue(detail("webkeepme001"));
+    const patch = vi.spyOn(api, "patchSessionMeta").mockRejectedValue(new Error("boom"));
+    const { result } = await renderSessionList({ confirmResult: false, promptResult: null });
+    const target = result.current.sessions[0];
+    expect(target.pinned).toBe(false);
+    await act(async () => {
+      await result.current.togglePinSession(target);
+    });
+    expect(patch).toHaveBeenCalledWith(expect.anything(), "webkeepme001", { pinned: true });
+    expect(result.current.sessions[0].pinned).toBe(false);
+  });
+});

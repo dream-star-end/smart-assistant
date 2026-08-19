@@ -60,8 +60,10 @@ import type {
   Preferences,
   PublicConfig,
   PublicModel,
+  PatchSessionMetaInput,
   PutSessionInput,
   PutSessionResult,
+  ChatProject,
   RefreshOutcome,
   RefreshResult,
   RegisterResult,
@@ -1865,20 +1867,30 @@ export const api = {
     ),
 
   /**
-   * 会话重命名（PATCH /api/sessions/:id，Bearer，元数据专用）。不走 putSession 的
-   * 整 blob 替换语义：rename 不携带 messages，骑 PUT 要么 409 要么丢消息。
+   * 会话元数据 PATCH（title / projectId / pinned）。当前打 PATCH /api/sessions/:id；
+   * 后端若换成 PATCH /api/sessions/:id/meta，只改这一处。
    */
-  patchSessionTitle: (a: AuthSession, id: string, title: string): Promise<{ ok: true; updatedAt: number }> =>
+  patchSessionMeta: (
+    a: AuthSession,
+    id: string,
+    patch: PatchSessionMetaInput,
+  ): Promise<{ ok: true; updatedAt: number }> =>
     jsonOrThrow<{ ok: true; updatedAt: number }>(
       callWithRefresh(a, (t) =>
         fetch(`/api/sessions/${encodeURIComponent(id)}`, {
           method: "PATCH",
           credentials: "include",
           headers: bearerHeaders(t, true),
-          body: JSON.stringify({ title }),
+          body: JSON.stringify(patch),
         }),
       ),
     ),
+
+  /**
+   * 会话重命名。走 patchSessionMeta，后端换 /meta 端点时不必再改这里。
+   */
+  patchSessionTitle: (a: AuthSession, id: string, title: string): Promise<{ ok: true; updatedAt: number }> =>
+    api.patchSessionMeta(a, id, { title }),
 
   /**
    * 会话级模型选择持久化（PATCH /api/sessions/:id，Bearer，元数据专用，与 rename 同款）。
@@ -1937,6 +1949,57 @@ export const api = {
     jsonOrThrow<{ ok: true }>(
       callWithRefresh(a, (t) =>
         fetch(`/api/sessions/${encodeURIComponent(id)}`, {
+          method: "DELETE",
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ).then(() => undefined),
+
+  // ── 聊天项目（侧栏 Projects；契约并行开发中，路径按 /api/chat-projects）──
+
+  listChatProjects: (a: AuthSession): Promise<ChatProject[]> =>
+    jsonOrThrow<{ projects: ChatProject[] }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/chat-projects", { credentials: "include", headers: bearerHeaders(t) }),
+      ),
+    ).then((b) => b.projects || []),
+
+  createChatProject: (
+    a: AuthSession,
+    input: { name: string; instructions?: string; color?: string },
+  ): Promise<ChatProject> =>
+    jsonOrThrow<{ project: ChatProject }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/chat-projects", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(input),
+        }),
+      ),
+    ).then((b) => b.project),
+
+  patchChatProject: (
+    a: AuthSession,
+    id: string,
+    patch: { name?: string; instructions?: string | null; color?: string | null; sortOrder?: number },
+  ): Promise<ChatProject> =>
+    jsonOrThrow<{ project: ChatProject }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/chat-projects/${encodeURIComponent(id)}`, {
+          method: "PATCH",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(patch),
+        }),
+      ),
+    ).then((b) => b.project),
+
+  deleteChatProject: (a: AuthSession, id: string): Promise<void> =>
+    jsonOrThrow<{ ok: true }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/chat-projects/${encodeURIComponent(id)}`, {
           method: "DELETE",
           credentials: "include",
           headers: bearerHeaders(t),

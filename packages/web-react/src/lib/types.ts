@@ -58,9 +58,19 @@ export type OrgMembershipBrief = {
 
 /**
  * 会话。v5 的会话历史权威源是 WS user-chat-bridge（hello/peer + master 侧持久化），
- * REST 不再提供 chat session CRUD。本期（P2）会话仅为本地脚手架占位，
- * 真实 WS 会话装载在 P4 接入。
+ * REST 列表走 GET /api/sessions/list（SessionMeta → Session）。
  */
+/** 会话最近一轮的运行态（listSessions 兜底；本 tab 发送中以 isSending 为准）。 */
+export type SessionRunState = "running" | "idle";
+
+/** 会话最近一轮终态。null = 从未跑过 turn，侧栏不显示状态点。 */
+export type SessionLastOutcome =
+  | "completed"
+  | "interrupted"
+  | "crashed"
+  | "not_accepted"
+  | "executed_error";
+
 export type Session = {
   id: string;
   title: string;
@@ -70,6 +80,33 @@ export type Session = {
   /** 会话级模型选择(per-session 持久化;缺省 = 未显式选择 → 选择器回落 default_model)。
    *  来源:本地选择写通 / IndexedDB 注水 / listSessions server-wins;App 切会话据此恢复选择器。 */
   modelId?: string;
+  /** 置顶。listSessions.pinned；metaToSession 以前丢了，侧栏「置顶」分组依赖它。 */
+  pinned?: boolean;
+  agentId?: string;
+  /** 归属的聊天项目；null/缺省 = 未分组。 */
+  projectId?: string | null;
+  runState?: SessionRunState;
+  lastOutcome?: SessionLastOutcome | null;
+  lastErrorCode?: string | null;
+};
+
+/** GET /api/chat-projects → { projects: ChatProject[] } */
+export type ChatProject = {
+  id: string;
+  name: string;
+  instructions?: string | null;
+  color?: string | null;
+  sortOrder: number;
+  createdAt: number;
+  updatedAt: number;
+  sessionCount: number;
+};
+
+/** PATCH /api/sessions/:id 元数据（title / 归属 / 置顶）。后端若换成 /meta，只改 api.patchSessionMeta。 */
+export type PatchSessionMetaInput = {
+  title?: string;
+  projectId?: string | null;
+  pinned?: boolean;
 };
 
 export type Message = {
@@ -283,6 +320,10 @@ export type SessionMeta = {
   updatedAt: number;
   /** 会话级模型选择(服务端 client_sessions.model_id;缺省 = 该会话从未显式选过)。 */
   modelId?: string;
+  projectId?: string | null;
+  runState?: SessionRunState;
+  lastOutcome?: SessionLastOutcome | null;
+  lastErrorCode?: string | null;
 };
 
 /**

@@ -12,6 +12,7 @@
 // assistant_text) for the turn into sessions_fts. Queries use MATCH and
 // group hits by session_id to return top-N unique sessions.
 
+import { randomUUID } from 'node:crypto'
 import { appendFile, readFile, rename, writeFile } from 'node:fs/promises'
 import { mkdir } from 'node:fs/promises'
 import { dirname } from 'node:path'
@@ -321,6 +322,34 @@ export async function getSessionsDb(): Promise<Database.Database> {
       db.exec("ALTER TABLE client_sessions ADD COLUMN model_id TEXT DEFAULT NULL")
     }
   } catch { /* table just created with column already */ }
+  // Migration: chat_projects + client_sessions.project_id —— 侧栏会话的项目层级。
+  // 与看板 tb_project / /api/board/projects 无关。不建硬外键;删项目时只把其下会话
+  // project_id 置 NULL,绝不级联删会话。PG 侧对应迁移 0230_chat_projects。
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS chat_projects (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      instructions TEXT,
+      color TEXT,
+      sort_order INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      deleted_at INTEGER DEFAULT NULL
+    );
+  `)
+  try {
+    const cols = db.pragma('table_info(client_sessions)') as Array<{ name: string }>
+    if (!cols.some(c => c.name === 'project_id')) {
+      db.exec('ALTER TABLE client_sessions ADD COLUMN project_id TEXT DEFAULT NULL')
+    }
+  } catch { /* table just created with column already */ }
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_chat_projects_user_deleted
+      ON chat_projects(user_id, deleted_at);
+    CREATE INDEX IF NOT EXISTS idx_client_sessions_user_project
+      ON client_sessions(user_id, project_id);
+  `)
 
   // ── 长会话热尾巴 + 归档(spill/archive)──
   //
@@ -1689,6 +1718,14 @@ export function decodeClientTimelineCursor(raw: string): ClientTimelineCursor | 
   }
 }
 
+export type ClientSessionRunState = 'running' | 'idle'
+export type ClientSessionLastOutcome =
+  | 'completed'
+  | 'interrupted'
+  | 'crashed'
+  | 'not_accepted'
+  | 'executed_error'
+
 export interface ClientSessionMeta {
   id: string
   agentId: string
@@ -1700,6 +1737,92 @@ export interface ClientSessionMeta {
   updatedAt: number
   /** 会话级模型选择(见 {@link ClientSession.modelId};列表回带供切会话即时恢复选择器)。 */
   modelId?: string
+  /** 所属聊天项目;未分组为 null。 */
+  projectId: string | null
+  /** running = 该会话存在非终态 turn dispatch。 */
+  runState: ClientSessionRunState
+  /** 最近一条终态 dispatch 的 outcome;从未跑过 turn 为 null。 */
+  lastOutcome: ClientSessionLastOutcome | null
+  /** 最近终态的错误码(如 SERVICE_RESTART);inbox 无此列时为 null。 */
+  lastErrorCode: string | null
+}
+
+export const CHAT_PROJECT_NAME_MAX = 60
+export const CHAT_PROJECT_INSTRUCTIONS_MAX = 4000
+export const CHAT_PROJECT_COLOR_MAX = 24
+export const CHAT_PROJECT_PER_USER_LIMIT = 100
+
+export type ChatProject = {
+  id: string
+  name: string
+  instructions: string | null
+  color: string | null
+  sortOrder: number
+  createdAt: number
+  updatedAt: number
+  sessionCount: number
+}
+
+export type ChatProjectCreateError = 'limit_exceeded' | 'invalid_name' | 'invalid_instructions' | 'invalid_color'
+export type ChatProjectUpdateError = 'not_found' | 'invalid_name' | 'invalid_instructions' | 'invalid_color' | 'invalid_sort_order'
+export type ChatProjectDeleteError = 'not_found'
+
+export type ChatProjectCreateResult =
+  | { ok: true; project: ChatProject }
+  | { ok: false; error: ChatProjectCreateError }
+export type ChatProjectUpdateResult =
+  | { ok: true; project: ChatProject }
+  | { ok: false; error: ChatProjectUpdateError }
+export type ChatProjectDeleteResult =
+  | { ok: true }
+  | { ok: false; error: ChatProjectDeleteError }
+
+export type ClientSessionMetaPatch = {
+  title?: string
+  modelId?: string
+  projectId?: string | null
+  pinned?: boolean
+}
+
+export type PatchClientSessionMetaResult =
+  | { ok: true; updatedAt: number }
+  | { ok: false; error: 'not_found' | 'project_not_found' }
+
+export function parseChatProjectName(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const name = value.trim()
+  return name.length >= 1 && name.length <= CHAT_PROJECT_NAME_MAX ? name : null
+}
+
+/** undefined = 未提供;null = 合法清空;invalid 由调用方映射 400。 */
+export function parseChatProjectOptionalText(
+  value: unknown,
+  maxLen: number,
+): { present: false } | { present: true; value: string | null } | { invalid: true } {
+  if (value === undefined) return { present: false }
+  if (value === null) return { present: true, value: null }
+  if (typeof value !== 'string') return { invalid: true }
+  const trimmed = value.trim()
+  if (trimmed.length > maxLen) return { invalid: true }
+  return { present: true, value: trimmed.length === 0 ? null : trimmed }
+}
+
+export function parseChatProjectSortOrder(value: unknown): number | null {
+  if (typeof value !== 'number' || !Number.isInteger(value) || !Number.isSafeInteger(value)) return null
+  return value
+}
+
+export function mapClientSessionLastOutcome(raw: unknown): ClientSessionLastOutcome | null {
+  switch (raw) {
+    case 'completed':
+    case 'interrupted':
+    case 'crashed':
+    case 'not_accepted':
+    case 'executed_error':
+      return raw
+    default:
+      return null
+  }
 }
 
 export interface ClientSessionLifecycleRef {
@@ -4107,14 +4230,40 @@ export async function replayMsgOutbox(): Promise<{
 
 async function _sqliteListClientSessions(userId: string): Promise<ClientSessionMeta[]> {
   const db = await getSessionsDb()
+  // runState / lastOutcome 从 turn_dispatch_inbox 一条 SQL 派生(禁止 N+1)。
+  // JOIN 只按 session_id:inbox.user_id 是裸 uid,client_sessions.user_id 是 `c:<uid>`。
   const rows = db.prepare(`
-    SELECT id, agent_id, title, pinned, created_at, last_at, updated_at,
-           message_count as msg_count, model_id
-    FROM client_sessions WHERE user_id = ? AND deleted_at IS NULL ORDER BY last_at DESC
+    SELECT cs.id, cs.agent_id, cs.title, cs.pinned, cs.created_at, cs.last_at, cs.updated_at,
+           cs.message_count as msg_count, cs.model_id, cs.project_id,
+           CASE WHEN open_d.session_id IS NOT NULL THEN 'running' ELSE 'idle' END AS run_state,
+           last_d.outcome AS last_outcome
+    FROM client_sessions cs
+    LEFT JOIN (
+      SELECT session_id FROM turn_dispatch_inbox
+       WHERE state NOT IN ('terminal', 'rejected')
+       GROUP BY session_id
+    ) open_d ON open_d.session_id = cs.id
+    LEFT JOIN (
+      SELECT session_id, outcome FROM (
+        SELECT session_id, outcome,
+               ROW_NUMBER() OVER (
+                 PARTITION BY session_id
+                 ORDER BY updated_at DESC, client_message_id DESC
+               ) AS rn
+          FROM turn_dispatch_inbox
+         WHERE state IN ('terminal', 'rejected')
+      ) ranked
+      WHERE rn = 1
+    ) last_d ON last_d.session_id = cs.id
+    WHERE cs.user_id = ? AND cs.deleted_at IS NULL
+    ORDER BY cs.last_at DESC
   `).all(userId) as Array<{
     id: string; agent_id: string; title: string; pinned: number;
     created_at: number; last_at: number; updated_at: number; msg_count: number
     model_id: string | null
+    project_id: string | null
+    run_state: string
+    last_outcome: string | null
   }>
   return rows.map(r => ({
     id: r.id,
@@ -4125,6 +4274,10 @@ async function _sqliteListClientSessions(userId: string): Promise<ClientSessionM
     lastAt: r.last_at,
     messageCount: r.msg_count,
     updatedAt: r.updated_at,
+    projectId: r.project_id ?? null,
+    runState: r.run_state === 'running' ? 'running' : 'idle',
+    lastOutcome: mapClientSessionLastOutcome(r.last_outcome),
+    lastErrorCode: null,
     ...(r.model_id ? { modelId: r.model_id } : {}),
   }))
 }
@@ -4852,6 +5005,226 @@ async function _sqliteSetClientSessionModel(id: string, userId: string, modelId:
   return { ok: !!row, updatedAt: row ? row.updated_at : now }
 }
 
+type ChatProjectDbRow = {
+  id: string
+  name: string
+  instructions: string | null
+  color: string | null
+  sort_order: number
+  created_at: number
+  updated_at: number
+  session_count: number
+}
+
+function _mapChatProjectRow(r: ChatProjectDbRow): ChatProject {
+  return {
+    id: r.id,
+    name: r.name,
+    instructions: r.instructions,
+    color: r.color,
+    sortOrder: r.sort_order,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+    sessionCount: r.session_count,
+  }
+}
+
+const CHAT_PROJECT_SELECT = `
+  SELECT p.id, p.name, p.instructions, p.color, p.sort_order, p.created_at, p.updated_at,
+         COALESCE(c.cnt, 0) AS session_count
+    FROM chat_projects p
+    LEFT JOIN (
+      SELECT project_id, COUNT(*) AS cnt
+        FROM client_sessions
+       WHERE user_id = ? AND deleted_at IS NULL AND project_id IS NOT NULL
+       GROUP BY project_id
+    ) c ON c.project_id = p.id
+`
+
+function _sqliteReadChatProject(
+  db: Database.Database,
+  userId: string,
+  id: string,
+): ChatProject | null {
+  const row = db.prepare(
+    `${CHAT_PROJECT_SELECT} WHERE p.id = ? AND p.user_id = ? AND p.deleted_at IS NULL`,
+  ).get(userId, id, userId) as ChatProjectDbRow | undefined
+  return row ? _mapChatProjectRow(row) : null
+}
+
+async function _sqliteListChatProjects(userId: string): Promise<ChatProject[]> {
+  const db = await getSessionsDb()
+  const rows = db.prepare(
+    `${CHAT_PROJECT_SELECT}
+      WHERE p.user_id = ? AND p.deleted_at IS NULL
+      ORDER BY p.sort_order ASC, p.created_at ASC`,
+  ).all(userId, userId) as ChatProjectDbRow[]
+  return rows.map(_mapChatProjectRow)
+}
+
+async function _sqliteCreateChatProject(
+  userId: string,
+  input: { name?: unknown; instructions?: unknown; color?: unknown },
+): Promise<ChatProjectCreateResult> {
+  const name = parseChatProjectName(input.name)
+  if (!name) return { ok: false, error: 'invalid_name' }
+  const instructions = parseChatProjectOptionalText(input.instructions, CHAT_PROJECT_INSTRUCTIONS_MAX)
+  if ('invalid' in instructions) return { ok: false, error: 'invalid_instructions' }
+  const color = parseChatProjectOptionalText(input.color, CHAT_PROJECT_COLOR_MAX)
+  if ('invalid' in color) return { ok: false, error: 'invalid_color' }
+
+  const db = await getSessionsDb()
+  const now = Date.now()
+  const id = randomUUID()
+  const txn = db.transaction((): ChatProjectCreateResult => {
+    const countRow = db.prepare(
+      'SELECT COUNT(*) AS n FROM chat_projects WHERE user_id = ? AND deleted_at IS NULL',
+    ).get(userId) as { n: number }
+    if (countRow.n >= CHAT_PROJECT_PER_USER_LIMIT) return { ok: false, error: 'limit_exceeded' }
+    db.prepare(`
+      INSERT INTO chat_projects
+        (id, user_id, name, instructions, color, sort_order, created_at, updated_at, deleted_at)
+      VALUES (?, ?, ?, ?, ?, COALESCE((
+        SELECT MAX(sort_order) + 1 FROM chat_projects WHERE user_id = ? AND deleted_at IS NULL
+      ), 0), ?, ?, NULL)
+    `).run(
+      id,
+      userId,
+      name,
+      instructions.present ? instructions.value : null,
+      color.present ? color.value : null,
+      userId,
+      now,
+      now,
+    )
+    const project = _sqliteReadChatProject(db, userId, id)
+    if (!project) throw new Error('chat project insert vanished')
+    return { ok: true, project }
+  })
+  return txn()
+}
+
+async function _sqliteUpdateChatProject(
+  userId: string,
+  id: string,
+  input: { name?: unknown; instructions?: unknown; color?: unknown; sortOrder?: unknown },
+): Promise<ChatProjectUpdateResult> {
+  const sets: string[] = ['updated_at = MAX(updated_at + 1, ?)']
+  const params: unknown[] = [Date.now()]
+  if (input.name !== undefined) {
+    const name = parseChatProjectName(input.name)
+    if (!name) return { ok: false, error: 'invalid_name' }
+    sets.push('name = ?')
+    params.push(name)
+  }
+  if (input.instructions !== undefined) {
+    const instructions = parseChatProjectOptionalText(input.instructions, CHAT_PROJECT_INSTRUCTIONS_MAX)
+    if ('invalid' in instructions || !instructions.present) return { ok: false, error: 'invalid_instructions' }
+    sets.push('instructions = ?')
+    params.push(instructions.value)
+  }
+  if (input.color !== undefined) {
+    const color = parseChatProjectOptionalText(input.color, CHAT_PROJECT_COLOR_MAX)
+    if ('invalid' in color || !color.present) return { ok: false, error: 'invalid_color' }
+    sets.push('color = ?')
+    params.push(color.value)
+  }
+  if (input.sortOrder !== undefined) {
+    const sortOrder = parseChatProjectSortOrder(input.sortOrder)
+    if (sortOrder === null) return { ok: false, error: 'invalid_sort_order' }
+    sets.push('sort_order = ?')
+    params.push(sortOrder)
+  }
+  if (sets.length === 1) {
+    const existing = await _sqliteGetChatProjectForUser(userId, id)
+    return existing ? { ok: true, project: existing } : { ok: false, error: 'not_found' }
+  }
+  const db = await getSessionsDb()
+  const txn = db.transaction((): ChatProjectUpdateResult => {
+    const res = db.prepare(
+      `UPDATE chat_projects SET ${sets.join(', ')}
+        WHERE id = ? AND user_id = ? AND deleted_at IS NULL`,
+    ).run(...params, id, userId)
+    if (res.changes === 0) return { ok: false, error: 'not_found' }
+    const project = _sqliteReadChatProject(db, userId, id)
+    if (!project) return { ok: false, error: 'not_found' }
+    return { ok: true, project }
+  })
+  return txn()
+}
+
+async function _sqliteGetChatProjectForUser(userId: string, id: string): Promise<ChatProject | null> {
+  const db = await getSessionsDb()
+  return _sqliteReadChatProject(db, userId, id)
+}
+
+async function _sqliteDeleteChatProject(userId: string, id: string): Promise<ChatProjectDeleteResult> {
+  const db = await getSessionsDb()
+  const now = Date.now()
+  const txn = db.transaction((): ChatProjectDeleteResult => {
+    const res = db.prepare(
+      `UPDATE chat_projects
+          SET deleted_at = ?, updated_at = MAX(updated_at + 1, ?)
+        WHERE id = ? AND user_id = ? AND deleted_at IS NULL`,
+    ).run(now, now, id, userId)
+    if (res.changes === 0) return { ok: false, error: 'not_found' }
+    db.prepare(
+      `UPDATE client_sessions
+          SET project_id = NULL, updated_at = MAX(updated_at + 1, ?)
+        WHERE user_id = ? AND project_id = ? AND deleted_at IS NULL`,
+    ).run(now, userId, id)
+    return { ok: true }
+  })
+  return txn()
+}
+
+async function _sqlitePatchClientSessionMeta(
+  id: string,
+  userId: string,
+  patch: ClientSessionMetaPatch,
+): Promise<PatchClientSessionMetaResult> {
+  const db = await getSessionsDb()
+  const now = Date.now()
+  const txn = db.transaction((): PatchClientSessionMetaResult => {
+    const ownedSession = db.prepare(
+      'SELECT 1 AS ok FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL',
+    ).get(id, userId) as { ok: number } | undefined
+    if (!ownedSession) return { ok: false, error: 'not_found' }
+    if (patch.projectId !== undefined && patch.projectId !== null) {
+      const owned = db.prepare(
+        'SELECT 1 AS ok FROM chat_projects WHERE id = ? AND user_id = ? AND deleted_at IS NULL',
+      ).get(patch.projectId, userId) as { ok: number } | undefined
+      if (!owned) return { ok: false, error: 'project_not_found' }
+    }
+    const sets: string[] = ['updated_at = MAX(updated_at + 1, ?)']
+    const params: unknown[] = [now]
+    if (patch.title !== undefined) {
+      sets.push('title = ?')
+      params.push(patch.title)
+    }
+    if (patch.modelId !== undefined) {
+      sets.push('model_id = ?')
+      params.push(patch.modelId)
+    }
+    if (patch.projectId !== undefined) {
+      sets.push('project_id = ?')
+      params.push(patch.projectId)
+    }
+    if (patch.pinned !== undefined) {
+      sets.push('pinned = ?')
+      params.push(patch.pinned ? 1 : 0)
+    }
+    const row = db.prepare(
+      `UPDATE client_sessions SET ${sets.join(', ')}
+        WHERE id = ? AND user_id = ? AND deleted_at IS NULL
+        RETURNING updated_at`,
+    ).get(...params, id, userId) as { updated_at: number } | undefined
+    if (!row) return { ok: false, error: 'not_found' }
+    return { ok: true, updatedAt: row.updated_at }
+  })
+  return txn()
+}
+
 /**
  * Advance the browser-history revision after an external durable authority changes
  * what the direct timeline reads (for example, a verified turn-dispatch status).
@@ -5103,6 +5476,11 @@ const sqliteBackend = {
   deleteClientSession: _sqliteDeleteClientSession,
   renameClientSession: _sqliteRenameClientSession,
   setClientSessionModel: _sqliteSetClientSessionModel,
+  patchClientSessionMeta: _sqlitePatchClientSessionMeta,
+  listChatProjects: _sqliteListChatProjects,
+  createChatProject: _sqliteCreateChatProject,
+  updateChatProject: _sqliteUpdateChatProject,
+  deleteChatProject: _sqliteDeleteChatProject,
   bumpClientSessionHistoryRevision: _sqliteBumpClientSessionHistoryRevision,
   listUnclaimedSessions: _sqliteListUnclaimedSessions,
   allMasterWsessRows: _sqliteAllMasterWsessRows,
@@ -5241,6 +5619,21 @@ export const renameClientSession: ClientSessionsBackend['renameClientSession'] =
 
 export const setClientSessionModel: ClientSessionsBackend['setClientSessionModel'] =
   (...args) => getActiveBackend().setClientSessionModel(...args)
+
+export const patchClientSessionMeta: ClientSessionsBackend['patchClientSessionMeta'] =
+  (...args) => getActiveBackend().patchClientSessionMeta(...args)
+
+export const listChatProjects: ClientSessionsBackend['listChatProjects'] =
+  (...args) => getActiveBackend().listChatProjects(...args)
+
+export const createChatProject: ClientSessionsBackend['createChatProject'] =
+  (...args) => getActiveBackend().createChatProject(...args)
+
+export const updateChatProject: ClientSessionsBackend['updateChatProject'] =
+  (...args) => getActiveBackend().updateChatProject(...args)
+
+export const deleteChatProject: ClientSessionsBackend['deleteChatProject'] =
+  (...args) => getActiveBackend().deleteChatProject(...args)
 
 export const bumpClientSessionHistoryRevision: ClientSessionsBackend['bumpClientSessionHistoryRevision'] =
   (...args) => getActiveBackend().bumpClientSessionHistoryRevision(...args)

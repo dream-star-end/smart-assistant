@@ -95,6 +95,7 @@ const MIGRATION_0201 = path.resolve(here, "../db/migrations/0201_durable_live_tu
 const MIGRATION_0202 = path.resolve(here, "../db/migrations/0202_turn_recovery_control.sql");
 const MIGRATION_0228 = path.resolve(here, "../db/migrations/0228_turn_visible_finalize.sql");
 const MIGRATION_0229 = path.resolve(here, "../db/migrations/0229_turn_finalize_integrity.sql");
+const MIGRATION_0230 = path.resolve(here, "../db/migrations/0230_chat_projects.sql");
 
 let pool: Pool;
 let backend: PgSessionsBackend;
@@ -225,6 +226,7 @@ before(async () => {
   await pool.query(await readFile(MIGRATION_0202, { encoding: "utf8" }));
   await pool.query(await readFile(MIGRATION_0228, { encoding: "utf8" }));
   await pool.query(await readFile(MIGRATION_0229, { encoding: "utf8" }));
+  await pool.query(await readFile(MIGRATION_0230, { encoding: "utf8" }));
   await pool.query(`
     CREATE TABLE admin_audit (
       id BIGSERIAL PRIMARY KEY,
@@ -713,6 +715,46 @@ describe("pgSessionsBackend contract", () => {
     const none = await backend.getClientSession("s-nomodel", "u-1");
     assert.ok(none);
     assert.equal("modelId" in none!, false);
+  });
+
+  maybe("chat_projects CRUD + 删项目只解绑会话 + list 派生 runState", async () => {
+    await backend.upsertClientSession(mkSession({ id: "s-proj-1" }));
+    const created = await backend.createChatProject("u-1", { name: "  工作  ", color: "blue" });
+    assert.equal(created.ok, true);
+    if (!created.ok) return;
+    assert.equal(created.project.name, "工作");
+    assert.equal(created.project.color, "blue");
+    assert.equal(created.project.sessionCount, 0);
+
+    const other = await backend.updateChatProject("u-other", created.project.id, { name: "hack" });
+    assert.equal(other.ok, false);
+    if (!other.ok) assert.equal(other.error, "not_found");
+
+    const patched = await backend.patchClientSessionMeta("s-proj-1", "u-1", {
+      projectId: created.project.id,
+      pinned: true,
+    });
+    assert.equal(patched.ok, true);
+    const listed = await backend.listChatProjects("u-1");
+    assert.equal(listed.find((p) => p.id === created.project.id)?.sessionCount, 1);
+
+    const meta = (await backend.listClientSessions("u-1")).find((s) => s.id === "s-proj-1");
+    assert.equal(meta?.projectId, created.project.id);
+    assert.equal(meta?.pinned, true);
+    assert.equal(meta?.runState, "idle");
+    assert.equal(meta?.lastOutcome, null);
+
+    const missingProj = await backend.patchClientSessionMeta("s-proj-1", "u-1", { projectId: "no-such-project-id" });
+    assert.equal(missingProj.ok, false);
+    if (!missingProj.ok) assert.equal(missingProj.error, "project_not_found");
+
+    const del = await backend.deleteChatProject("u-1", created.project.id);
+    assert.equal(del.ok, true);
+    const after = await backend.getClientSession("s-proj-1", "u-1");
+    assert.ok(after, "删除项目不得级联删会话");
+    const meta2 = (await backend.listClientSessions("u-1")).find((s) => s.id === "s-proj-1");
+    assert.equal(meta2?.projectId, null);
+    assert.equal((await backend.listChatProjects("u-1")).length, 0);
   });
 
   maybe("appendForRequest 先到 → map 记录 + 幂等 already_exists", async () => {

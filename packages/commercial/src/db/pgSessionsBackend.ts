@@ -40,7 +40,7 @@
 //     Number()+MAX_SAFE_INTEGER 断言;**不改全局 type parser**(不影响 commercial 其它模块)。
 
 import type { Pool, PoolClient } from "pg";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { freemem } from "node:os";
 import { getHeapStatistics } from "node:v8";
 import { gzipSync, gunzipSync } from "node:zlib";
@@ -91,10 +91,15 @@ import {
 import {
   type AppendCostCreditsResult,
   type AppendForRequestResult,
+  type ChatProject,
+  type ChatProjectCreateResult,
+  type ChatProjectDeleteResult,
+  type ChatProjectUpdateResult,
   type ClientSession,
   type ClientSessionLifecycle,
   type ClientSessionLifecycleRef,
   type ClientSessionMeta,
+  type ClientSessionMetaPatch,
   type ClientSessionPartial,
   type ClientSessionReadOptions,
   type ClientTimelineCursor,
@@ -102,6 +107,9 @@ import {
   ClientTimelineCursorStaleError,
   type ClientSessionsBackend,
   type DelegatePendingRow,
+  CHAT_PROJECT_COLOR_MAX,
+  CHAT_PROJECT_INSTRUCTIONS_MAX,
+  CHAT_PROJECT_PER_USER_LIMIT,
   compareMessagesByOrder,
   deriveArchivedOrderSeqsForRead,
   deriveOrderSeqsForRead,
@@ -110,11 +118,16 @@ import {
   MAX_SESSION_BYTES,
   hasInvisibleHistoryMutation,
   hasInvisibleMessageRemoval,
+  mapClientSessionLastOutcome,
   type MessageLike,
   mergePreservingServerAuthored,
   normalizeAndAssignOrderSeqs,
   normalizeAndAssignSeqs,
   _warnSeqAnomaly,
+  parseChatProjectName,
+  parseChatProjectOptionalText,
+  parseChatProjectSortOrder,
+  type PatchClientSessionMetaResult,
   planAppendServerAuthored,
   planAppendServerAuthoredBatch,
   planCostPatch,
@@ -420,6 +433,56 @@ const FINALIZED_TAPE_PARTS_DELETE_MS = 48 * 60 * 60_000;
 // 普通 UPDATE 时用裸列)。第三个 GREATEST 参数(客户端 requested)只 upsert 用,append/patch
 // 路径无客户端值 → 用两参形态。
 const CLOCK_MS_SQL = "(floor(EXTRACT(EPOCH FROM clock_timestamp())*1000))::BIGINT";
+
+const PG_CHAT_PROJECT_SELECT = `
+  SELECT p.id, p.name, p.instructions, p.color, p.sort_order, p.created_at, p.updated_at,
+         COALESCE(c.cnt, 0)::text AS session_count
+    FROM chat_projects p
+    LEFT JOIN (
+      SELECT project_id, COUNT(*) AS cnt
+        FROM client_sessions
+       WHERE user_id = $1 AND deleted_at IS NULL AND project_id IS NOT NULL
+       GROUP BY project_id
+    ) c ON c.project_id = p.id
+`;
+
+type PgChatProjectRow = {
+  id: string;
+  name: string;
+  instructions: string | null;
+  color: string | null;
+  sort_order: number;
+  created_at: string;
+  updated_at: string;
+  session_count: string;
+};
+
+function mapPgChatProjectRow(r: PgChatProjectRow): ChatProject {
+  return {
+    id: r.id,
+    name: r.name,
+    instructions: r.instructions,
+    color: r.color,
+    sortOrder: r.sort_order,
+    createdAt: bigIntNum(r.created_at, "created_at"),
+    updatedAt: bigIntNum(r.updated_at, "updated_at"),
+    sessionCount: Number(r.session_count) || 0,
+  };
+}
+
+async function readPgChatProject(
+  queryable: Pick<Pool | PoolClient, "query">,
+  userId: string,
+  id: string,
+): Promise<ChatProject | null> {
+  const row = (
+    await queryable.query<PgChatProjectRow>(
+      `${PG_CHAT_PROJECT_SELECT} WHERE p.id = $2 AND p.user_id = $3 AND p.deleted_at IS NULL`,
+      [userId, id, userId],
+    )
+  ).rows[0];
+  return row ? mapPgChatProjectRow(row) : null;
+}
 
 /** Publish a new browser-timeline identity on the caller's existing
  * transaction. Dispatch reconciliation uses this seam so its verified status
@@ -8907,6 +8970,9 @@ export function createPgSessionsBackend(
 
     // ── 读路径(无事务;单/多语句纯读,与 SQLite 一致不开显式事务)────────────────
     async listClientSessions(userId: string): Promise<ClientSessionMeta[]> {
+      // runState / lastOutcome / lastErrorCode 从 turn_dispatches 一条 SQL 派生。
+      // inbox 在容器 SQLite;master 权威是 turn_dispatches(status/outcome/failure_code)。
+      const dispatchUid = /^c:([1-9][0-9]*)$/.exec(userId)?.[1] ?? "-1";
       const rows = (
         await pool.query<{
           id: string;
@@ -8918,10 +8984,38 @@ export function createPgSessionsBackend(
           updated_at: string;
           msg_count: number;
           model_id: string | null;
+          project_id: string | null;
+          run_state: string;
+          last_outcome: string | null;
+          last_error_code: string | null;
         }>(
-          `SELECT id, agent_id, title, pinned, created_at, last_at, updated_at, message_count AS msg_count, model_id
-             FROM client_sessions WHERE user_id = $1 AND deleted_at IS NULL ORDER BY last_at DESC`,
-          [userId],
+          `SELECT cs.id, cs.agent_id, cs.title, cs.pinned, cs.created_at, cs.last_at, cs.updated_at,
+                  cs.message_count AS msg_count, cs.model_id, cs.project_id,
+                  CASE WHEN open_d.session_id IS NOT NULL THEN 'running' ELSE 'idle' END AS run_state,
+                  last_d.outcome AS last_outcome,
+                  last_d.failure_code AS last_error_code
+             FROM client_sessions cs
+             LEFT JOIN (
+               SELECT session_id FROM turn_dispatches
+                WHERE user_id = $2
+                  AND status IN ('admitted', 'accepted', 'rejecting')
+                GROUP BY session_id
+             ) open_d ON open_d.session_id = cs.id
+             LEFT JOIN (
+               SELECT session_id, outcome, failure_code FROM (
+                 SELECT session_id, outcome, failure_code,
+                        ROW_NUMBER() OVER (
+                          PARTITION BY session_id
+                          ORDER BY terminal_at DESC NULLS LAST, admitted_at DESC, dispatch_id DESC
+                        ) AS rn
+                   FROM turn_dispatches
+                  WHERE user_id = $2 AND status = 'terminal'
+               ) ranked
+               WHERE rn = 1
+             ) last_d ON last_d.session_id = cs.id
+            WHERE cs.user_id = $1 AND cs.deleted_at IS NULL
+            ORDER BY cs.last_at DESC`,
+          [userId, dispatchUid],
         )
       ).rows;
       return rows.map((r) => ({
@@ -8933,6 +9027,10 @@ export function createPgSessionsBackend(
         lastAt: bigIntNum(r.last_at, "last_at"),
         messageCount: r.msg_count,
         updatedAt: bigIntNum(r.updated_at, "updated_at"),
+        projectId: r.project_id ?? null,
+        runState: r.run_state === "running" ? "running" : "idle",
+        lastOutcome: mapClientSessionLastOutcome(r.last_outcome),
+        lastErrorCode: r.last_error_code ?? null,
         ...(r.model_id ? { modelId: r.model_id } : {}),
       }));
     },
@@ -9425,6 +9523,194 @@ export function createPgSessionsBackend(
         )
       ).rows[0];
       return { ok: !!row, updatedAt: row ? bigIntNum(row.updated_at, "updated_at") : now };
+    },
+
+    async patchClientSessionMeta(
+      id: string,
+      userId: string,
+      patch: ClientSessionMetaPatch,
+    ): Promise<PatchClientSessionMetaResult> {
+      return withTx(pool, async (client) => {
+        const ownedSession = (
+          await client.query(
+            "SELECT 1 FROM client_sessions WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
+            [id, userId],
+          )
+        ).rows[0];
+        if (!ownedSession) return { ok: false, error: "not_found" };
+        if (patch.projectId !== undefined && patch.projectId !== null) {
+          const owned = (
+            await client.query(
+              "SELECT 1 FROM chat_projects WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
+              [patch.projectId, userId],
+            )
+          ).rows[0];
+          if (!owned) return { ok: false, error: "project_not_found" };
+        }
+        const sets: string[] = [`updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})`];
+        const params: unknown[] = [];
+        let n = 1;
+        if (patch.title !== undefined) {
+          sets.push(`title = $${n++}`);
+          params.push(patch.title);
+        }
+        if (patch.modelId !== undefined) {
+          sets.push(`model_id = $${n++}`);
+          params.push(patch.modelId);
+        }
+        if (patch.projectId !== undefined) {
+          sets.push(`project_id = $${n++}`);
+          params.push(patch.projectId);
+        }
+        if (patch.pinned !== undefined) {
+          sets.push(`pinned = $${n++}`);
+          params.push(patch.pinned ? 1 : 0);
+        }
+        params.push(id, userId);
+        const row = (
+          await client.query<{ updated_at: string }>(
+            `UPDATE client_sessions SET ${sets.join(", ")}
+              WHERE id = $${n++} AND user_id = $${n} AND deleted_at IS NULL
+              RETURNING updated_at`,
+            params,
+          )
+        ).rows[0];
+        if (!row) return { ok: false, error: "not_found" };
+        return { ok: true, updatedAt: bigIntNum(row.updated_at, "updated_at") };
+      });
+    },
+
+    async listChatProjects(userId: string): Promise<ChatProject[]> {
+      const rows = (
+        await pool.query<{
+          id: string;
+          name: string;
+          instructions: string | null;
+          color: string | null;
+          sort_order: number;
+          created_at: string;
+          updated_at: string;
+          session_count: string;
+        }>(
+          `${PG_CHAT_PROJECT_SELECT}
+            WHERE p.user_id = $2 AND p.deleted_at IS NULL
+            ORDER BY p.sort_order ASC, p.created_at ASC`,
+          [userId, userId],
+        )
+      ).rows;
+      return rows.map(mapPgChatProjectRow);
+    },
+
+    async createChatProject(
+      userId: string,
+      input: { name?: unknown; instructions?: unknown; color?: unknown },
+    ): Promise<ChatProjectCreateResult> {
+      const name = parseChatProjectName(input.name);
+      if (!name) return { ok: false, error: "invalid_name" };
+      const instructions = parseChatProjectOptionalText(input.instructions, CHAT_PROJECT_INSTRUCTIONS_MAX);
+      if ("invalid" in instructions) return { ok: false, error: "invalid_instructions" };
+      const color = parseChatProjectOptionalText(input.color, CHAT_PROJECT_COLOR_MAX);
+      if ("invalid" in color) return { ok: false, error: "invalid_color" };
+      const id = randomUUID();
+      return withTx(pool, async (client) => {
+        const countRow = (
+          await client.query<{ n: string }>(
+            "SELECT COUNT(*)::text AS n FROM chat_projects WHERE user_id = $1 AND deleted_at IS NULL",
+            [userId],
+          )
+        ).rows[0];
+        if (Number(countRow?.n ?? 0) >= CHAT_PROJECT_PER_USER_LIMIT) {
+          return { ok: false, error: "limit_exceeded" };
+        }
+        await client.query(
+          `INSERT INTO chat_projects
+             (id, user_id, name, instructions, color, sort_order, created_at, updated_at, deleted_at)
+           VALUES ($1, $2, $3, $4, $5, COALESCE((
+             SELECT MAX(sort_order) + 1 FROM chat_projects WHERE user_id = $2 AND deleted_at IS NULL
+           ), 0), ${CLOCK_MS_SQL}, ${CLOCK_MS_SQL}, NULL)`,
+          [
+            id,
+            userId,
+            name,
+            instructions.present ? instructions.value : null,
+            color.present ? color.value : null,
+          ],
+        );
+        const project = await readPgChatProject(client, userId, id);
+        if (!project) throw new Error("chat project insert vanished");
+        return { ok: true, project };
+      });
+    },
+
+    async updateChatProject(
+      userId: string,
+      id: string,
+      input: { name?: unknown; instructions?: unknown; color?: unknown; sortOrder?: unknown },
+    ): Promise<ChatProjectUpdateResult> {
+      const sets: string[] = [`updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})`];
+      const params: unknown[] = [];
+      let n = 1;
+      if (input.name !== undefined) {
+        const name = parseChatProjectName(input.name);
+        if (!name) return { ok: false, error: "invalid_name" };
+        sets.push(`name = $${n++}`);
+        params.push(name);
+      }
+      if (input.instructions !== undefined) {
+        const instructions = parseChatProjectOptionalText(input.instructions, CHAT_PROJECT_INSTRUCTIONS_MAX);
+        if ("invalid" in instructions || !instructions.present) return { ok: false, error: "invalid_instructions" };
+        sets.push(`instructions = $${n++}`);
+        params.push(instructions.value);
+      }
+      if (input.color !== undefined) {
+        const color = parseChatProjectOptionalText(input.color, CHAT_PROJECT_COLOR_MAX);
+        if ("invalid" in color || !color.present) return { ok: false, error: "invalid_color" };
+        sets.push(`color = $${n++}`);
+        params.push(color.value);
+      }
+      if (input.sortOrder !== undefined) {
+        const sortOrder = parseChatProjectSortOrder(input.sortOrder);
+        if (sortOrder === null) return { ok: false, error: "invalid_sort_order" };
+        sets.push(`sort_order = $${n++}`);
+        params.push(sortOrder);
+      }
+      if (sets.length === 1) {
+        const existing = await readPgChatProject(pool, userId, id);
+        return existing ? { ok: true, project: existing } : { ok: false, error: "not_found" };
+      }
+      return withTx(pool, async (client) => {
+        params.push(id, userId);
+        const res = await client.query(
+          `UPDATE chat_projects SET ${sets.join(", ")}
+            WHERE id = $${n++} AND user_id = $${n} AND deleted_at IS NULL`,
+          params,
+        );
+        if ((res.rowCount ?? 0) === 0) return { ok: false, error: "not_found" };
+        const project = await readPgChatProject(client, userId, id);
+        if (!project) return { ok: false, error: "not_found" };
+        return { ok: true, project };
+      });
+    },
+
+    async deleteChatProject(userId: string, id: string): Promise<ChatProjectDeleteResult> {
+      return withTx(pool, async (client) => {
+        const res = await client.query(
+          `UPDATE chat_projects
+              SET deleted_at = ${CLOCK_MS_SQL},
+                  updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
+            WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
+          [id, userId],
+        );
+        if ((res.rowCount ?? 0) === 0) return { ok: false, error: "not_found" };
+        await client.query(
+          `UPDATE client_sessions
+              SET project_id = NULL,
+                  updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
+            WHERE user_id = $1 AND project_id = $2 AND deleted_at IS NULL`,
+          [userId, id],
+        );
+        return { ok: true };
+      });
     },
 
     async bumpClientSessionHistoryRevision(id: string, userId: string): Promise<boolean> {

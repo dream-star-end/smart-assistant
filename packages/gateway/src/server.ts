@@ -154,8 +154,16 @@ import {
   appendServerAuthoredMessageDurable,
   patchServerAuthoredMessage,
   deleteClientSession,
-  renameClientSession,
-  setClientSessionModel,
+  patchClientSessionMeta,
+  listChatProjects,
+  createChatProject,
+  updateChatProject,
+  deleteChatProject,
+  parseChatProjectName,
+  parseChatProjectOptionalText,
+  parseChatProjectSortOrder,
+  CHAT_PROJECT_COLOR_MAX,
+  CHAT_PROJECT_INSTRUCTIONS_MAX,
   recordAutoDreamSuccessfulSession,
   listUnclaimedSessions,
   claimSession,
@@ -4153,6 +4161,121 @@ export class Gateway {
         .catch(() => this.sendJson(res, 500, { error: 'list failed' }))
       return
     }
+    // 侧栏聊天项目(与 /api/board/projects 看板无关)。浏览器直打 gateway,与 /api/sessions/list 同平面。
+    if (url.pathname === '/api/chat-projects') {
+      const userId = this.getUserId(req)
+      if (req.method === 'GET') {
+        listChatProjects(userId)
+          .then((projects) => this.sendJson(res, 200, { projects }))
+          .catch(() => this.sendJson(res, 500, { error: 'list failed' }))
+        return
+      }
+      if (req.method === 'POST') {
+        ;(async () => {
+          let data: { name?: unknown; instructions?: unknown; color?: unknown }
+          try {
+            data = JSON.parse(await this.readBody(req, 16 * 1024))
+          } catch {
+            this.sendJson(res, 400, { error: 'invalid JSON' })
+            return
+          }
+          if (parseChatProjectName(data.name) === null) {
+            this.sendJson(res, 400, { error: 'name required (1-60 chars)' })
+            return
+          }
+          const instructions = parseChatProjectOptionalText(data.instructions, CHAT_PROJECT_INSTRUCTIONS_MAX)
+          if ('invalid' in instructions) {
+            this.sendJson(res, 400, { error: 'instructions invalid (max 4000 chars)' })
+            return
+          }
+          const color = parseChatProjectOptionalText(data.color, CHAT_PROJECT_COLOR_MAX)
+          if ('invalid' in color) {
+            this.sendJson(res, 400, { error: 'color invalid (max 24 chars)' })
+            return
+          }
+          const result = await createChatProject(userId, data)
+          if (!result.ok) {
+            if (result.error === 'limit_exceeded') {
+              this.sendJson(res, 400, { error: 'project limit exceeded (max 100)' })
+              return
+            }
+            this.sendJson(res, 400, { error: result.error.replace(/_/g, ' ') })
+            return
+          }
+          this.sendJson(res, 200, { project: result.project })
+        })().catch(() => this.sendJson(res, 500, { error: 'create failed' }))
+        return
+      }
+      this.sendJson(res, 405, { error: 'method not allowed' })
+      return
+    }
+    const chatProjectMatch = url.pathname.match(/^\/api\/chat-projects\/([a-zA-Z0-9_-]{8,64})$/)
+    if (chatProjectMatch) {
+      const projectId = chatProjectMatch[1]
+      const userId = this.getUserId(req)
+      if (req.method === 'PATCH') {
+        ;(async () => {
+          let data: { name?: unknown; instructions?: unknown; color?: unknown; sortOrder?: unknown }
+          try {
+            data = JSON.parse(await this.readBody(req, 16 * 1024))
+          } catch {
+            this.sendJson(res, 400, { error: 'invalid JSON' })
+            return
+          }
+          const hasName = data.name !== undefined
+          const hasInstructions = data.instructions !== undefined
+          const hasColor = data.color !== undefined
+          const hasSort = data.sortOrder !== undefined
+          if (!hasName && !hasInstructions && !hasColor && !hasSort) {
+            this.sendJson(res, 400, { error: 'name, instructions, color or sortOrder required' })
+            return
+          }
+          if (hasName && parseChatProjectName(data.name) === null) {
+            this.sendJson(res, 400, { error: 'name required (1-60 chars)' })
+            return
+          }
+          if (hasInstructions) {
+            const instructions = parseChatProjectOptionalText(data.instructions, CHAT_PROJECT_INSTRUCTIONS_MAX)
+            if ('invalid' in instructions) {
+              this.sendJson(res, 400, { error: 'instructions invalid (max 4000 chars)' })
+              return
+            }
+          }
+          if (hasColor) {
+            const color = parseChatProjectOptionalText(data.color, CHAT_PROJECT_COLOR_MAX)
+            if ('invalid' in color) {
+              this.sendJson(res, 400, { error: 'color invalid (max 24 chars)' })
+              return
+            }
+          }
+          if (hasSort && parseChatProjectSortOrder(data.sortOrder) === null) {
+            this.sendJson(res, 400, { error: 'sortOrder must be an integer' })
+            return
+          }
+          const result = await updateChatProject(userId, projectId, data)
+          if (!result.ok) {
+            if (result.error === 'not_found') {
+              this.sendJson(res, 404, { error: 'not found' })
+              return
+            }
+            this.sendJson(res, 400, { error: result.error.replace(/_/g, ' ') })
+            return
+          }
+          this.sendJson(res, 200, { project: result.project })
+        })().catch(() => this.sendJson(res, 500, { error: 'patch failed' }))
+        return
+      }
+      if (req.method === 'DELETE') {
+        deleteChatProject(userId, projectId)
+          .then((result) => result.ok
+            ? this.sendJson(res, 200, { ok: true })
+            : this.sendJson(res, 404, { error: 'not found' }))
+          .catch(() => this.sendJson(res, 500, { error: 'delete failed' }))
+        return
+      }
+      this.sendJson(res, 405, { error: 'method not allowed' })
+      return
+    }
     // ── Session migration (must be before clientSessMatch regex which would capture "unclaimed"/"claim") ──
     if (url.pathname === '/api/sessions/unclaimed' && req.method === 'GET') {
       listUnclaimedSessions()
@@ -4729,13 +4852,12 @@ export class Gateway {
         return
       }
       if (req.method === 'PATCH') {
-        // 元数据专用更新(title / modelId,至少携带其一)。不走 PUT 的"整 blob 替换 + 乐观
-        // 并发"语义:元数据不携带 messages,骑 PUT 要么 409 要么把未随带的客户端消息 merge 掉。
-        // modelId = 会话级模型选择(UI 恢复提示,非执行权威;执行仍走每 turn 帧字段 + bridge
-        // authz)。仅做形态校验,不查 catalog —— 前端恢复时会校验"仍可见且健康"否则回落默认,
-        // 服务端查 catalog 只会引入无收益的耦合(模型下架后历史值也需要能安全存在)。
+        // 元数据专用更新(title / modelId / projectId / pinned,至少携带其一)。不走 PUT 的
+        // "整 blob 替换 + 乐观并发"语义:元数据不携带 messages。
+        // modelId = 会话级模型选择(UI 恢复提示,非执行权威)。
+        // projectId = 侧栏聊天项目归属(null = 移出项目)。
         ;(async () => {
-          let data: { title?: unknown; modelId?: unknown }
+          let data: { title?: unknown; modelId?: unknown; projectId?: unknown; pinned?: unknown }
           try {
             data = JSON.parse(await this.readBody(req, 16 * 1024))
           } catch {
@@ -4744,8 +4866,10 @@ export class Gateway {
           }
           const hasTitle = data.title !== undefined
           const hasModel = data.modelId !== undefined
-          if (!hasTitle && !hasModel) {
-            this.sendJson(res, 400, { error: 'title or modelId required' })
+          const hasProject = data.projectId !== undefined
+          const hasPinned = data.pinned !== undefined
+          if (!hasTitle && !hasModel && !hasProject && !hasPinned) {
+            this.sendJson(res, 400, { error: 'title, modelId, projectId or pinned required' })
             return
           }
           const title = typeof data.title === 'string' ? data.title.trim() : ''
@@ -4758,25 +4882,36 @@ export class Gateway {
             this.sendJson(res, 400, { error: 'modelId invalid (1-120 chars, [A-Za-z0-9._:-])' })
             return
           }
-          // 两字段独立单列 UPDATE(现实调用方一次只改一个;都带时顺序执行,updatedAt 取末次)。
-          let updatedAt = 0
-          if (hasTitle) {
-            const r = await renameClientSession(sessId, userId, title)
-            if (!r.ok) {
-              this.sendJson(res, 404, { error: 'not found' })
+          if (hasProject && data.projectId !== null && typeof data.projectId !== 'string') {
+            this.sendJson(res, 400, { error: 'projectId must be a string or null' })
+            return
+          }
+          const projectId = hasProject
+            ? (data.projectId === null ? null : String(data.projectId).trim())
+            : undefined
+          if (hasProject && projectId !== null && projectId !== undefined && (projectId.length < 8 || projectId.length > 64)) {
+            this.sendJson(res, 400, { error: 'projectId invalid' })
+            return
+          }
+          if (hasPinned && typeof data.pinned !== 'boolean') {
+            this.sendJson(res, 400, { error: 'pinned must be a boolean' })
+            return
+          }
+          const result = await patchClientSessionMeta(sessId, userId, {
+            ...(hasTitle ? { title } : {}),
+            ...(hasModel ? { modelId } : {}),
+            ...(hasProject ? { projectId: projectId ?? null } : {}),
+            ...(hasPinned ? { pinned: data.pinned as boolean } : {}),
+          })
+          if (!result.ok) {
+            if (result.error === 'project_not_found') {
+              this.sendJson(res, 404, { error: 'project not found' })
               return
             }
-            updatedAt = r.updatedAt
+            this.sendJson(res, 404, { error: 'not found' })
+            return
           }
-          if (hasModel) {
-            const r = await setClientSessionModel(sessId, userId, modelId)
-            if (!r.ok) {
-              this.sendJson(res, 404, { error: 'not found' })
-              return
-            }
-            updatedAt = r.updatedAt
-          }
-          this.sendJson(res, 200, { ok: true, updatedAt })
+          this.sendJson(res, 200, { ok: true, updatedAt: result.updatedAt })
         })().catch(() => this.sendJson(res, 500, { error: 'patch failed' }))
         return
       }
@@ -17831,7 +17966,7 @@ export { shouldServeInline }
 /** Known route prefixes for metrics normalization (avoids high-cardinality labels). */
 const KNOWN_ROUTES = [
   '/api/healthz', '/api/doctor', '/api/usage', '/api/usage/events',
-  '/api/runs', '/api/sessions', '/api/config', '/api/agents', '/api/search',
+  '/api/runs', '/api/sessions', '/api/chat-projects', '/api/config', '/api/agents', '/api/search',
   '/api/cron', '/api/board', '/api/board/projects', '/api/board/tickets',
   '/api/board/pipelines', '/api/board/agents', '/api/board/settings',
   '/api/board/stats/cost', '/api/board/templates', '/api/board/reports/weekly',
@@ -17854,6 +17989,7 @@ function normalizePath(p: string): string {
     .replace(/\/api\/agents\/[a-zA-Z0-9_-]+\/([a-z]+)/, '/api/agents/:id/$1')
     .replace(/\/api\/agents\/[a-zA-Z0-9_-]+/, '/api/agents/:id')
     .replace(/\/api\/cron\/[a-zA-Z0-9_-]+/, '/api/cron/:id')
+    .replace(/\/api\/chat-projects\/[a-zA-Z0-9_-]+/, '/api/chat-projects/:id')
     .replace(/\/api\/board\/projects\/[^/]+\/board/, '/api/board/projects/:id/board')
     .replace(/\/api\/board\/projects\/[^/]+/, '/api/board/projects/:id')
     .replace(/\/api\/board\/tickets\/[^/]+\/[a-z_]+/, '/api/board/tickets/:id/:action')

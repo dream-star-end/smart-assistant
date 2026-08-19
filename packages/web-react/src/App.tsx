@@ -73,6 +73,7 @@ import {
 } from "./hooks/useAppRoute";
 import { useAuth } from "./hooks/useAuth";
 import { genWsSessionId, useSessionList } from "./hooks/useSessionList";
+import { useChatProjects } from "./hooks/useChatProjects";
 import { type UseChatSocket, useChatSocket } from "./hooks/useChatSocket";
 import { useInbox } from "./hooks/useInbox";
 import { useOptimizerPending } from "./hooks/useOptimizerPending";
@@ -100,6 +101,7 @@ import {
   isExpensiveTurn,
 } from "./lib/implicitFeedback";
 import { CONTINUE_PROMPT } from "./lib/chat/render";
+import { deriveLiveTerminalFromMessages } from "./lib/sessionStatus";
 import { deriveConnBanner } from "./lib/chat/pure";
 import { useDelayedConnBanner } from "./hooks/useDelayedConnBanner";
 import { incidentStore } from "./lib/incidentStore";
@@ -131,7 +133,7 @@ import {
   resolveSessionModel,
 } from "./lib/modelPreferences";
 import { DEMO_MESSAGES, DEMO_MODELS, DEMO_SESSIONS, DEMO_USER, demoReply } from "./lib/demo";
-import type { Message, PublicConfig, PublicModel, Session, ToolCard } from "./lib/types";
+import type { Message, PublicConfig, PublicModel, Session, SessionLastOutcome, ToolCard } from "./lib/types";
 
 // 首屏瘦身:营销首页 + 设置/管理/市场/组织/教程中心按需异步加载,移出 entry chunk。
 // 命名导出 → default 适配。渲染点各自套 LazyBoundary（= chunk 加载失败兜底 + Suspense：
@@ -496,6 +498,9 @@ export function App() {
     onHydrated,
     renameSessionPrompt,
     deleteSessionConfirm,
+    togglePinSession,
+    moveSessionToProject,
+    applySessionTerminal,
     reset: resetSessionList,
     serverListSettled,
     historyLoading,
@@ -529,6 +534,34 @@ export function App() {
     },
     // URL 深链恢复未决：暂停自动选中（URL 指定 > 最近会话）。
     holdAutoSelect: pendingRouteSession !== null,
+  });
+
+  const {
+    projects,
+    collapsedIds: collapsedProjectIds,
+    toggleCollapsed: toggleProjectCollapsed,
+    createProjectPrompt,
+    renameProjectPrompt,
+    deleteProjectConfirm,
+  } = useChatProjects({
+    demo,
+    auth,
+    authSession: authRef.current,
+    userId: user?.id,
+    promptText,
+    confirmDialog,
+    onUngroupProjectSessions: (projectId) => {
+      let moved: string[] = [];
+      setSessions((c) => {
+        moved = c.filter((s) => s.projectId === projectId).map((s) => s.id);
+        return c.map((s) => (s.projectId === projectId ? { ...s, projectId: null } : s));
+      });
+      return moved;
+    },
+    onRestoreProjectSessions: (projectId, sessionIds) => {
+      const ids = new Set(sessionIds);
+      setSessions((c) => c.map((s) => (ids.has(s.id) ? { ...s, projectId } : s)));
+    },
   });
 
   // ── per-session 模型选择(会话间互不影响,持久化恢复)────────────────────────
@@ -1378,6 +1411,64 @@ export function App() {
   const wsSending = !demo && chat.isSending(activeId);
   // 统一“本轮进行中”信号：demo 用本地 busy，非 demo 用 WS in-flight。
   const sending = demo ? busy : wsSending;
+
+  const sendingIdsRef = useRef(new Set<string>());
+  const liveTerminalsRef = useRef(
+    new Map<string, { lastOutcome: SessionLastOutcome; lastErrorCode: string | null }>(),
+  );
+  const liveTerminals = useMemo(() => {
+    void chat.version;
+    if (demo) return liveTerminalsRef.current;
+    const now = new Set(sessions.filter((s) => chat.isSending(s.id)).map((s) => s.id));
+    for (const id of now) liveTerminalsRef.current.delete(id);
+    for (const id of sendingIdsRef.current) {
+      if (!now.has(id)) {
+        const t = deriveLiveTerminalFromMessages(chat.getSession(id)?.messages);
+        if (t) liveTerminalsRef.current.set(id, t);
+      }
+    }
+    sendingIdsRef.current = now;
+    return new Map(liveTerminalsRef.current);
+  }, [demo, chat, sessions]);
+  useEffect(() => {
+    for (const [id, t] of liveTerminals) applySessionTerminal(id, t);
+  }, [liveTerminals, applySessionTerminal]);
+
+  const liveTerminal = useCallback(
+    (id: string) => liveTerminals.get(id),
+    [liveTerminals],
+  );
+
+  useEffect(() => {
+    const isEditable = (el: EventTarget | null) => {
+      if (!(el instanceof HTMLElement)) return false;
+      const tag = el.tagName;
+      return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || el.isContentEditable;
+    };
+    const onKey = (e: KeyboardEvent) => {
+      const mod = e.metaKey || e.ctrlKey;
+      if (!mod) return;
+      if (e.key === "k" || e.key === "K") {
+        if (e.shiftKey || isEditable(e.target)) return;
+        e.preventDefault();
+        setCollapsed(false);
+        setMobileNavOpen(true);
+        window.setTimeout(() => {
+          const nodes = [...document.querySelectorAll<HTMLInputElement>("[data-sidebar-search]")];
+          const visible = nodes.find((el) => el.getClientRects().length > 0) ?? nodes[0];
+          visible?.focus();
+        }, 0);
+        return;
+      }
+      if ((e.key === "o" || e.key === "O") && e.shiftKey) {
+        if (isEditable(e.target)) return;
+        e.preventDefault();
+        newSession();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [newSession]);
 
   // 当前选中会话（对账/本轮活动指示的数据源）。告知 WS service 供 S1 对账无条件优先拉它。
   const activeSess = !demo && activeId ? chat.getSession(activeId) : undefined;
@@ -2290,6 +2381,17 @@ export function App() {
     onNew: newSession,
     onRename: renameSessionPrompt,
     onDelete: deleteSessionConfirm,
+    onTogglePin: togglePinSession,
+    onMoveToProject: moveSessionToProject,
+    projects,
+    collapsedProjectIds,
+    onToggleProjectCollapsed: toggleProjectCollapsed,
+    onCreateProject: createProjectPrompt,
+    onRenameProject: renameProjectPrompt,
+    onDeleteProject: deleteProjectConfirm,
+    isSending: (id: string) => !demo && chat.isSending(id),
+    liveTerminal,
+    socketVersion: chat.version,
     onLogout: demo ? undefined : logout,
     onOpenManage: demo ? undefined : () => openManage(DEFAULT_MANAGE_TAB),
     // 账号菜单「管理中心」右侧的待办信号（Auto‑Dream 有待确认建议时替换静态副标题）。

@@ -1,7 +1,7 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
-import type { Session, User } from "../lib/types";
+import type { ChatProject, Session, User } from "../lib/types";
 import { Sidebar } from "./Sidebar";
 
 afterEach(() => {
@@ -38,6 +38,15 @@ function openAccountMenu() {
     ctrlKey: false,
     pointerType: "mouse",
   });
+}
+
+function openSessionMenu(title: string) {
+  const row = screen.getByRole("button", { name: title }).closest("div");
+  const more = Array.from(row!.querySelectorAll("button")).find(
+    (b) => b.getAttribute("aria-label") === "更多",
+  );
+  expect(more).toBeTruthy();
+  fireEvent.pointerDown(more!, { button: 0, ctrlKey: false, pointerType: "mouse" });
 }
 
 describe("Sidebar 账号菜单（平台超管 / 反馈）", () => {
@@ -218,17 +227,10 @@ describe("Sidebar 会话列表", () => {
     const onRename = vi.fn();
     const onSelect = vi.fn();
     renderSidebar({ sessions: listSessions, onRename, onSelect });
-    // 每行一个「重命名」，按可见标题定位到 Beta 那一行的操作区。
-    const betaRow = screen.getByRole("button", { name: "Beta 上线检查" }).closest("div");
-    expect(betaRow).not.toBeNull();
-    const renameBtn = Array.from(betaRow!.querySelectorAll("button")).find(
-      (b) => b.getAttribute("aria-label") === "重命名",
-    );
-    expect(renameBtn).toBeTruthy();
-    fireEvent.click(renameBtn!);
+    openSessionMenu("Beta 上线检查");
+    fireEvent.click(screen.getByRole("menuitem", { name: "重命名" }));
     expect(onRename).toHaveBeenCalledTimes(1);
     expect(onRename.mock.calls[0][0].id).toBe("s-beta");
-    // 误触发切换会话会把用户从当前会话踢走(操作区在行内，必须 stopPropagation)。
     expect(onSelect).not.toHaveBeenCalled();
   });
 
@@ -236,12 +238,8 @@ describe("Sidebar 会话列表", () => {
     const onDelete = vi.fn();
     const onSelect = vi.fn();
     renderSidebar({ sessions: listSessions, onDelete, onSelect });
-    const alphaRow = screen.getByRole("button", { name: "季度复盘 Alpha" }).closest("div");
-    const deleteBtn = Array.from(alphaRow!.querySelectorAll("button")).find(
-      (b) => b.getAttribute("aria-label") === "删除",
-    );
-    expect(deleteBtn).toBeTruthy();
-    fireEvent.click(deleteBtn!);
+    openSessionMenu("季度复盘 Alpha");
+    fireEvent.click(screen.getByRole("menuitem", { name: "删除" }));
     expect(onDelete).toHaveBeenCalledTimes(1);
     expect(onDelete.mock.calls[0][0].id).toBe("s-alpha");
     expect(onSelect).not.toHaveBeenCalled();
@@ -265,7 +263,7 @@ describe("Sidebar 会话列表", () => {
     fireEvent.change(screen.getByPlaceholderText("搜索会话"), {
       target: { value: "不存在的关键词" },
     });
-    expect(screen.getByText("暂无会话")).toBeInTheDocument();
+    expect(screen.getByText("没有匹配的会话")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Beta 上线检查" })).toBeNull();
   });
 
@@ -296,5 +294,213 @@ describe("Sidebar 任务面板入口", () => {
   it("省略 onOpenBoard 时不渲染入口（demo）", () => {
     renderSidebar();
     expect(screen.queryByRole("button", { name: /任务面板/ })).toBeNull();
+  });
+});
+
+function project(over: Partial<ChatProject> & { id: string; name: string }): ChatProject {
+  return {
+    sortOrder: 0,
+    createdAt: 1,
+    updatedAt: 1,
+    sessionCount: 0,
+    ...over,
+  };
+}
+
+function dragData() {
+  const store: Record<string, string> = {};
+  const types: string[] = [];
+  return {
+    types,
+    dropEffect: "move",
+    effectAllowed: "move",
+    setData(type: string, value: string) {
+      store[type] = value;
+      if (!types.includes(type)) types.push(type);
+    },
+    getData(type: string) {
+      return store[type] ?? "";
+    },
+  };
+}
+
+describe("Sidebar 项目分组", () => {
+  const projects = [project({ id: "p-work", name: "工作", sessionCount: 1 })];
+  const projectSessions: Session[] = [
+    session({ id: "s-in", title: "项目里的会话", projectId: "p-work" }),
+    session({ id: "s-out", title: "未分组会话" }),
+  ];
+
+  it("项目在上、未分组按时间分组在下；展开后缩进显示项目会话且不套时间分组", () => {
+    renderSidebar({
+      sessions: projectSessions,
+      projects,
+      collapsedProjectIds: new Set(),
+      onToggleProjectCollapsed: () => {},
+      onCreateProject: () => {},
+    });
+    expect(screen.getByText("项目")).toBeInTheDocument();
+    expect(screen.getByText("工作")).toBeInTheDocument();
+    expect(screen.getByText("1")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "项目里的会话" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "未分组会话" })).toBeInTheDocument();
+    expect(screen.getByText("今天")).toBeInTheDocument();
+    const workBtn = screen.getByRole("button", { name: /工作/ });
+    expect(workBtn).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("折叠项目后隐藏其下会话，并回调 toggle", () => {
+    const onToggle = vi.fn();
+    const { rerender } = renderSidebar({
+      sessions: projectSessions,
+      projects,
+      collapsedProjectIds: new Set(),
+      onToggleProjectCollapsed: onToggle,
+      onCreateProject: () => {},
+    });
+    fireEvent.click(screen.getByRole("button", { name: /工作/ }));
+    expect(onToggle).toHaveBeenCalledWith("p-work");
+
+    rerender(
+      <Sidebar
+        sessions={projectSessions}
+        user={user}
+        onSelect={() => {}}
+        onNew={() => {}}
+        onRename={() => {}}
+        onDelete={() => {}}
+        projects={projects}
+        collapsedProjectIds={new Set(["p-work"])}
+        onToggleProjectCollapsed={onToggle}
+        onCreateProject={() => {}}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "项目里的会话" })).toBeNull();
+    expect(screen.getByRole("button", { name: /工作/ })).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("搜索时跨项目平铺匹配，不显示项目层级", () => {
+    renderSidebar({
+      sessions: projectSessions,
+      projects,
+      collapsedProjectIds: new Set(),
+      onToggleProjectCollapsed: () => {},
+      onCreateProject: () => {},
+    });
+    fireEvent.change(screen.getByPlaceholderText("搜索会话"), { target: { value: "项目里" } });
+    expect(screen.getByRole("button", { name: "项目里的会话" })).toBeInTheDocument();
+    expect(screen.queryByText("项目")).toBeNull();
+    expect(screen.queryByRole("button", { name: /工作/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: "未分组会话" })).toBeNull();
+  });
+
+  it("把会话拖到项目行上放下即归属该项目", () => {
+    const onMoveToProject = vi.fn();
+    renderSidebar({
+      sessions: projectSessions,
+      projects,
+      collapsedProjectIds: new Set(),
+      onToggleProjectCollapsed: () => {},
+      onCreateProject: () => {},
+      onMoveToProject,
+    });
+    const dt = dragData();
+    const row = screen.getByRole("button", { name: "未分组会话" }).closest("div")!;
+    fireEvent.dragStart(row, { dataTransfer: dt });
+    const projectRow = screen.getByRole("button", { name: /工作/ }).closest("div")!;
+    fireEvent.dragOver(projectRow, { dataTransfer: dt });
+    fireEvent.drop(projectRow, { dataTransfer: dt });
+    expect(onMoveToProject).toHaveBeenCalledTimes(1);
+    expect(onMoveToProject.mock.calls[0][0].id).toBe("s-out");
+    expect(onMoveToProject.mock.calls[0][1]).toBe("p-work");
+  });
+
+  it("会话更多菜单可以把会话移到项目", async () => {
+    const onMoveToProject = vi.fn();
+    renderSidebar({
+      sessions: projectSessions,
+      projects,
+      collapsedProjectIds: new Set(),
+      onToggleProjectCollapsed: () => {},
+      onCreateProject: () => {},
+      onMoveToProject,
+    });
+    openSessionMenu("未分组会话");
+    const sub = screen.getByRole("menuitem", { name: "移动到项目" });
+    fireEvent.focus(sub);
+    fireEvent.keyDown(sub, { key: "ArrowRight" });
+    await waitFor(() => expect(screen.getByRole("menuitem", { name: "工作" })).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("menuitem", { name: "工作" }));
+    expect(onMoveToProject).toHaveBeenCalledTimes(1);
+    expect(onMoveToProject.mock.calls[0][0].id).toBe("s-out");
+    expect(onMoveToProject.mock.calls[0][1]).toBe("p-work");
+  });
+
+  it("项目为空时给出克制提示", () => {
+    renderSidebar({
+      sessions: [],
+      projects: [],
+      onCreateProject: () => {},
+    });
+    expect(screen.getByText("还没有项目")).toBeInTheDocument();
+    expect(screen.getByText("暂无会话")).toBeInTheDocument();
+  });
+});
+
+describe("Sidebar 会话状态点", () => {
+  it("四态：运行中闪绿、完成/中断常亮绿、异常红、服务重启琥珀", () => {
+    renderSidebar({
+      sessions: [
+        session({ id: "s-run", title: "正在跑", runState: "running" }),
+        session({ id: "s-ok", title: "已跑完", lastOutcome: "completed" }),
+        session({ id: "s-stop", title: "用户停了", lastOutcome: "interrupted" }),
+        session({ id: "s-err", title: "崩了", lastOutcome: "crashed" }),
+        session({ id: "s-rst", title: "被重启", lastOutcome: "crashed", lastErrorCode: "SERVICE_RESTART" }),
+        session({ id: "s-new", title: "从没跑过", lastOutcome: null }),
+      ],
+      isSending: (id) => id === "s-run",
+    });
+    expect(screen.getByRole("img", { name: "运行中" })).toHaveClass("bg-success", "oc-session-running");
+    expect(screen.getByRole("img", { name: "已完成" })).toHaveClass("bg-success");
+    expect(screen.getByRole("img", { name: "已中断" })).toHaveClass("bg-success");
+    expect(screen.getByRole("img", { name: "出错" })).toHaveClass("bg-danger");
+    expect(screen.getByRole("img", { name: "服务重启中断，可继续" })).toHaveClass("bg-warning");
+    expect(screen.queryByRole("img", { name: "从没跑过" })).toBeNull();
+    const idleRow = screen.getByRole("button", { name: "从没跑过" }).closest("div")!;
+    expect(idleRow.querySelector("[role=img]")).toBeNull();
+  });
+
+  it("本 tab isSending 立刻覆盖列表 idle，显示运行中", () => {
+    renderSidebar({
+      sessions: [session({ id: "s1", title: "刚发出去", runState: "idle", lastOutcome: "completed" })],
+      isSending: () => true,
+    });
+    expect(screen.getByRole("img", { name: "运行中" })).toBeInTheDocument();
+  });
+});
+
+describe("Sidebar 置顶", () => {
+  it("置顶会话集中显示在最上方「置顶」分组，不再出现在时间分组里", () => {
+    const old = new Date(Date.now() - 90 * 86400000).toISOString();
+    renderSidebar({
+      sessions: [
+        session({ id: "s-pin", title: "钉住的", pinned: true, updatedAt: old }),
+        session({ id: "s-today", title: "今天的" }),
+      ],
+      onTogglePin: () => {},
+    });
+    expect(screen.getByText("置顶")).toBeInTheDocument();
+    expect(screen.getByText("今天")).toBeInTheDocument();
+    const pinHeading = screen.getByText("置顶");
+    const todayHeading = screen.getByText("今天");
+    expect(
+      pinHeading.compareDocumentPosition(screen.getByRole("button", { name: "钉住的" })) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      pinHeading.compareDocumentPosition(todayHeading) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    openSessionMenu("钉住的");
+    expect(screen.getByRole("menuitem", { name: /取消置顶/ })).toBeInTheDocument();
   });
 });

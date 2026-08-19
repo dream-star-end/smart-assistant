@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useToast } from "../components/ui";
 import { ApiError, api } from "../lib/api";
 import type { ChatMessage } from "../lib/chat/model";
 import { DEMO_SESSIONS } from "../lib/demo";
 import type { StoredSession } from "../lib/persist";
-import type { AuthSession, Session, SessionMeta, User } from "../lib/types";
+import type { AuthSession, Session, SessionLastOutcome, SessionMeta, User } from "../lib/types";
 import type { UseChatSocket } from "./useChatSocket";
 
 /** 历史重拉冷却（S2）：同会话此窗口内只拉一次；过后允许增量重拉（sinceSeq + server-wins 幂等）。*/
@@ -21,6 +22,10 @@ function makeLocalSession(title: string, ownerUserId: string): Session {
     ownerUserId,
     updatedAt: new Date().toISOString(),
     messageCount: 0,
+    pinned: false,
+    projectId: null,
+    runState: "idle",
+    lastOutcome: null,
   };
 }
 
@@ -45,8 +50,14 @@ function metaToSession(m: SessionMeta, ownerUserId: string): Session {
     ownerUserId,
     updatedAt: new Date(m.updatedAt ?? m.lastAt ?? Date.now()).toISOString(),
     messageCount: m.messageCount ?? 0,
+    pinned: m.pinned === true,
+    projectId: m.projectId ?? null,
+    runState: m.runState === "running" ? "running" : "idle",
+    lastOutcome: m.lastOutcome ?? null,
+    lastErrorCode: m.lastErrorCode ?? null,
     // 服务端无值(该会话从未显式选过/PATCH 尚未落地)= 键缺席,server-wins 合并不清掉本地意图。
     ...(m.modelId ? { modelId: m.modelId } : {}),
+    ...(m.agentId ? { agentId: m.agentId } : {}),
   };
 }
 
@@ -118,6 +129,12 @@ export type UseSessionList = {
   onHydrated: (stored: StoredSession[]) => void;
   renameSessionPrompt: (s: Session) => Promise<void>;
   deleteSessionConfirm: (s: Session) => Promise<void>;
+  togglePinSession: (s: Session) => Promise<void>;
+  moveSessionToProject: (s: Session, projectId: string | null) => Promise<void>;
+  applySessionTerminal: (
+    sessId: string,
+    terminal: { lastOutcome: SessionLastOutcome; lastErrorCode: string | null } | null,
+  ) => void;
   /** 登出/登录时的整体重置：清列表与选中、清已拉历史标记、允许重新自动选中最近会话。 */
   reset: () => void;
   /** listSessions 已落定（成功或失败）：URL 深链恢复据此判定"会话确实不存在"。 */
@@ -141,6 +158,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
   // 依赖（保持 selectSession/newSession 依赖面与拆分前一致；useChatSocket persistRef 同款）。
   const cbRef = useRef(opts);
   cbRef.current = opts;
+  const toast = useToast();
 
   const [sessions, setSessions] = useState<Session[]>(demo ? DEMO_SESSIONS : []);
   const [activeId, setActiveId] = useState<string | undefined>(
@@ -488,6 +506,58 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     }
   };
 
+  const patchSessionMetaOptimistic = async (
+    s: Session,
+    patch: { pinned?: boolean; projectId?: string | null },
+    next: Session,
+  ) => {
+    setSessions((c) => c.map((x) => (x.id === s.id ? next : x)));
+    if (demo) return;
+    try {
+      await api.patchSessionMeta(cbRef.current.authSession, s.id, patch);
+    } catch (e) {
+      setSessions((c) => c.map((x) => (x.id === s.id ? s : x)));
+      console.warn("patchSessionMeta failed", e);
+      toast("操作失败，已恢复", "error");
+    }
+  };
+
+  const togglePinSession = async (s: Session) => {
+    const pinned = !s.pinned;
+    await patchSessionMetaOptimistic(s, { pinned }, { ...s, pinned });
+  };
+
+  const moveSessionToProject = async (s: Session, projectId: string | null) => {
+    if ((s.projectId ?? null) === projectId) return;
+    await patchSessionMetaOptimistic(s, { projectId }, { ...s, projectId });
+  };
+
+  const applySessionTerminal = useCallback(
+    (
+      sessId: string,
+      terminal: { lastOutcome: SessionLastOutcome; lastErrorCode: string | null } | null,
+    ) => {
+      setSessions((c) =>
+        c.map((x) => {
+          if (x.id !== sessId) return x;
+          const nextOutcome = terminal ? terminal.lastOutcome : x.lastOutcome;
+          const nextCode = terminal ? terminal.lastErrorCode : x.lastErrorCode;
+          if (x.runState === "idle" && x.lastOutcome === nextOutcome && x.lastErrorCode === nextCode) {
+            return x;
+          }
+          return {
+            ...x,
+            runState: "idle" as const,
+            ...(terminal
+              ? { lastOutcome: terminal.lastOutcome, lastErrorCode: terminal.lastErrorCode }
+              : {}),
+          };
+        }),
+      );
+    },
+    [],
+  );
+
   // 登出/登录时的整体重置（App 的 useAuth onClearAuth/onLoginSuccess 经 ref 回填调用）。
   const reset = useCallback(() => {
     historyFetchedAtRef.current.clear();
@@ -511,6 +581,9 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     onHydrated,
     renameSessionPrompt,
     deleteSessionConfirm,
+    togglePinSession,
+    moveSessionToProject,
+    applySessionTerminal,
     reset,
     serverListSettled,
     historyLoading: activeId !== undefined && historyLoadingTokens.has(activeId),
