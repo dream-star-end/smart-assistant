@@ -5,7 +5,7 @@ import { SessionTimelineBoundary } from "./SessionTimelineBoundary";
 
 afterEach(cleanup);
 
-function Boom() {
+function Boom(): never {
   throw new Error("timeline boom");
 }
 
