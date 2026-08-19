@@ -61,6 +61,7 @@ interface Canned {
   acceptedStuck?: Raw[]
   openAged?: Raw[]
   openSessionGone?: Raw[]
+  visibleOrphans?: Raw[]
 }
 
 function makeFakePool(canned: Canned) {
@@ -96,8 +97,13 @@ function makeFakePool(canned: Canned) {
       if (params?.[0] instanceof Date) acceptedScanCutoffs.push(params[0] as Date)
       return { rows: canned.acceptedStuck ?? [], rowCount: (canned.acceptedStuck ?? []).length }
     }
+    // rev2 closeVisibleOrphans must win before session-gone: its SQL joins
+    // client_session_turn_tapes (substring of client_sessions).
+    if (s.includes('-- closeVisibleOrphans')) {
+      return { rows: canned.visibleOrphans ?? [], rowCount: (canned.visibleOrphans ?? []).length }
+    }
     // ⓪ scanOpenSessionGone(LEFT JOIN)必须先于 openAged 路由:两者都含 status IN (open 三态)。
-    if (s.includes('LEFT JOIN client_sessions')) return { rows: canned.openSessionGone ?? [], rowCount: (canned.openSessionGone ?? []).length }
+    if (s.includes('LEFT JOIN client_sessions s')) return { rows: canned.openSessionGone ?? [], rowCount: (canned.openSessionGone ?? []).length }
     if (s.includes("status IN ('admitted', 'accepted', 'rejecting')")) return { rows: canned.openAged ?? [], rowCount: (canned.openAged ?? []).length }
     return { rows: [], rowCount: 0 }
   }
@@ -736,5 +742,55 @@ describe('carrier-dead 语义:多 journal 且标记不在 billing_request_id 那
       },
     })
     assert.equal(counts.rejectedTerminal, 1, '标记在 request_id≠billing_request_id 的行上必须仍能走快路径')
+  })
+})
+
+
+describe('closeVisibleOrphans (rev2 B4)', () => {
+  const PARTS_COMPLETE_QUIET_MS = 2 * 60_000
+  const nowMs = 1_700_000_000_000
+
+  function orphanRow(over: Partial<Raw> = {}): Raw {
+    return {
+      dispatch_id: 'd-vis-1',
+      user_id: '42',
+      session_id: 'sess-vis',
+      client_message_id: 'cm-vis',
+      status: 'accepted',
+      admitted_at: new Date(nowMs - 10 * 60_000),
+      accepted_at: new Date(nowMs - 10 * 60_000),
+      tape_visible_at: null,
+      tape_part_count: null,
+      tape_id: null,
+      tape_parts_rows: '0',
+      last_frame_at: new Date(nowMs - 10 * 60_000),
+      container_running: false,
+      ...over,
+    }
+  }
+
+  test('parts-complete quiet → visible fallback completed (代收口)', async () => {
+    const nudges: string[] = []
+    const pool = makeFakePool({
+      visibleOrphans: [orphanRow({
+        tape_id: 'tape-complete',
+        tape_part_count: 12,
+        tape_parts_rows: '12',
+        last_frame_at: new Date(nowMs - PARTS_COMPLETE_QUIET_MS),
+      })],
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: noContainer,
+      now: () => nowMs,
+      listCarrierDeadDispatchIds: async () => [],
+      nudgeClient: (_uid, _sid, _cmid, reconcile) => {
+        if (reconcile) nudges.push(reconcile)
+      },
+    })
+    assert.equal(counts.visibleOrphans, 1)
+    assert.ok(pool.writes.some((sql) => sql.includes('visible_head')))
+    assert.ok(pool.writes.some((sql) => sql.includes("status = 'terminal'")))
+    assert.deepEqual(nudges, ['turn_completed'])
   })
 })

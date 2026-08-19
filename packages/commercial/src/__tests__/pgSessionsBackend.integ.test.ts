@@ -32,6 +32,8 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   createPgSessionsBackend,
   startSessionsGcSweeper,
+  _setAfterLosslessStageBatch,
+  LOSSLESS_TURN_RECORD_STAGE_BATCH_SIZE,
   type PgSessionsBackend,
 } from "../db/pgSessionsBackend.js";
 import {
@@ -90,6 +92,7 @@ const MIGRATION_0196 = path.resolve(here, "../db/migrations/0196_client_session_
 const MIGRATION_0198 = path.resolve(here, "../db/migrations/0198_client_session_workspace_default.sql");
 const MIGRATION_0201 = path.resolve(here, "../db/migrations/0201_durable_live_turn_frames.sql");
 const MIGRATION_0202 = path.resolve(here, "../db/migrations/0202_turn_recovery_control.sql");
+const MIGRATION_0228 = path.resolve(here, "../db/migrations/0228_turn_visible_finalize.sql");
 
 let pool: Pool;
 let backend: PgSessionsBackend;
@@ -218,6 +221,7 @@ before(async () => {
   await pool.query(await readFile(MIGRATION_0196, { encoding: "utf8" }));
   await pool.query(await readFile(MIGRATION_0201, { encoding: "utf8" }));
   await pool.query(await readFile(MIGRATION_0202, { encoding: "utf8" }));
+  await pool.query(await readFile(MIGRATION_0228, { encoding: "utf8" }));
   await pool.query(`
     CREATE TABLE admin_audit (
       id BIGSERIAL PRIMARY KEY,
@@ -8259,5 +8263,123 @@ describe("pgSessionsBackend direct turn timeline", () => {
       backend.getClientSession(sessionId, userId),
       /hash mismatch|JSON invalid|Unexpected end/i,
     );
+  });
+});
+
+
+describe("rev2 visible finalize decoupling", () => {
+  maybe("first part keeps terminal status so old equality upload can continue", async () => {
+    const sessionId = "s-rev2-status-eq";
+    const userId = "c:1";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const tape = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 1,
+      status: "completed",
+      turnKey: "a".repeat(64),
+      text: "status equality still works",
+      createdAt: 1_700_000_000_000,
+    });
+    const first = tape.parts[0]!;
+    await backend.stageLosslessTurnTapePart(userId, first.request, first.bytes);
+    const header = (
+      await pool.query<{ status: string }>(
+        `SELECT status FROM client_session_turn_tapes
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+        [sessionId, userId, tape.finalize.tapeId],
+      )
+    ).rows[0]!;
+    assert.equal(header.status, "completed");
+    for (const part of tape.parts.slice(1)) {
+      await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+    }
+    const result = await backend.finalizeLosslessTurnTape(userId, tape.finalize);
+    assert.equal(result.applied, "finalized");
+    const hydrated = await backend.getClientSession(sessionId, userId);
+    const assistant = (hydrated!.messages as MessageLike[]).find((m) => m.role === "assistant");
+    assert.equal(assistant?.text, "status equality still works");
+  });
+
+  maybe("engine complete is visible even if materialization is killed every batch and later fails", async () => {
+    const sessionId = "s-rev2-kill-batch";
+    const userId = "c:1";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const runtimeEvents = Array.from({ length: LOSSLESS_TURN_RECORD_STAGE_BATCH_SIZE + 5 }, (_, index) => ({
+      ordinal: index + 1,
+      observedAt: 1_700_000_000_000 + index,
+      source: "gateway",
+      payload: { type: "batch-boundary", index },
+    }));
+    const tape = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 3,
+      status: "completed",
+      turnKey: "b".repeat(64),
+      text: "visible before records",
+      createdAt: 1_700_000_000_100,
+      runtimeEvents,
+    });
+    for (const part of tape.parts) {
+      await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+    }
+    const partsBefore = Number((
+      await pool.query<{ n: string }>(
+        `SELECT count(*)::text AS n FROM client_session_turn_tape_parts
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+        [sessionId, userId, tape.finalize.tapeId],
+      )
+    ).rows[0]?.n ?? "0");
+    assert.ok(partsBefore > 0);
+    _setAfterLosslessStageBatch(() => {
+      throw new Error("materialization killed");
+    });
+    let first: Awaited<ReturnType<typeof backend.finalizeLosslessTurnTape>>;
+    try {
+      first = await backend.finalizeLosslessTurnTape(userId, {
+        ...tape.finalize,
+        settlement: {
+          billingAnchorId: `srv-${sessionId}-main-t3`,
+          engineBillings: [],
+          text: "visible before records",
+          ts: 1_700_000_000_100,
+        },
+      });
+    } finally {
+      _setAfterLosslessStageBatch(null);
+    }
+    assert.equal(first.applied, "finalized");
+    const partsAfterKill = Number((
+      await pool.query<{ n: string }>(
+        `SELECT count(*)::text AS n FROM client_session_turn_tape_parts
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+        [sessionId, userId, tape.finalize.tapeId],
+      )
+    ).rows[0]?.n ?? "0");
+    assert.equal(partsAfterKill, partsBefore);
+    const visible = await backend.getClientSession(sessionId, userId);
+    const assistant = (visible!.messages as MessageLike[]).find((m) => m.role === "assistant");
+    assert.equal(assistant?.text, "visible before records");
+    const resumed = await backend.finalizeLosslessTurnTape(userId, tape.finalize);
+    assert.equal(resumed.applied, "finalized");
+    assert.ok(resumed.recordCount > 1);
+    const partsFinal = Number((
+      await pool.query<{ n: string }>(
+        `SELECT count(*)::text AS n FROM client_session_turn_tape_parts
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+        [sessionId, userId, tape.finalize.tapeId],
+      )
+    ).rows[0]?.n ?? "0");
+    assert.equal(partsFinal, 0);
+    await pool.query(
+      `UPDATE client_session_turn_tapes
+          SET materialization_status='failed', materialization_attempts=8
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+      [sessionId, userId, tape.finalize.tapeId],
+    );
+    const still = await backend.getClientSession(sessionId, userId);
+    const stillAssistant = (still!.messages as MessageLike[]).find((m) => m.role === "assistant");
+    assert.ok(typeof stillAssistant?.text === "string" && stillAssistant.text.length > 0);
   });
 });

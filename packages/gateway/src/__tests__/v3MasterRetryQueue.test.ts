@@ -21,6 +21,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 import {
+  FINALIZE_RETRY_CAP_AFTER_HANDOFF,
   makeV3MasterRetryQueue,
   type V3MasterRetryEntry,
 } from "../v3MasterRetryQueue.js";
@@ -701,6 +702,62 @@ describe("kick — single-flight", () => {
     // The single entry was drained in the first pass; subsequent kicks
     // would no-op (dir empty). totalCalls must be 1.
     assert.equal(totalCalls, 1);
+  });
+});
+
+describe("drainOnce — settlement handoff retry cap (rev2 B1)", () => {
+  test("does not cap before settlementHandoff even at high attempts", async () => {
+    const q = makeV3MasterRetryQueue({
+      dir,
+      attemptSend: async () => {
+        throw new V3SinkError("TURN_TAPE_RETRYABLE", "transient", 503);
+      },
+    });
+    await writeEntryDirect({
+      ...entry(),
+      attempts: FINALIZE_RETRY_CAP_AFTER_HANDOFF + 5,
+    });
+    const stats = await q.drainOnce();
+    assert.equal(stats.retried, 1);
+    assert.equal(stats.fatalDropped, 0);
+    const files = await listJsonFiles();
+    assert.equal(files.length, 1);
+  });
+
+  test("caps non-financial retries after settlementHandoff at 30", async () => {
+    const q = makeV3MasterRetryQueue({
+      dir,
+      attemptSend: async () => {
+        throw new V3SinkError("TURN_TAPE_RETRYABLE", "transient", 503);
+      },
+    });
+    await writeEntryDirect({
+      ...entry(),
+      settlementHandoff: true,
+      attempts: FINALIZE_RETRY_CAP_AFTER_HANDOFF - 1,
+    });
+    const stats = await q.drainOnce();
+    assert.equal(stats.fatalDropped, 1);
+    const names = await readdir(dir);
+    assert.ok(names.some((n) => n.includes("quarantine-retry_cap_after_settlement_handoff")));
+  });
+
+  test("never caps TURN_TAPE_BILLING_PENDING even after handoff", async () => {
+    const q = makeV3MasterRetryQueue({
+      dir,
+      attemptSend: async () => {
+        throw new V3SinkError("TURN_TAPE_BILLING_PENDING", "transient", 503);
+      },
+    });
+    await writeEntryDirect({
+      ...entry(),
+      settlementHandoff: true,
+      attempts: FINALIZE_RETRY_CAP_AFTER_HANDOFF + 8,
+    });
+    const stats = await q.drainOnce();
+    assert.equal(stats.fatalDropped, 0);
+    assert.equal(stats.retried, 1);
+    assert.equal((await listJsonFiles()).length, 1);
   });
 });
 

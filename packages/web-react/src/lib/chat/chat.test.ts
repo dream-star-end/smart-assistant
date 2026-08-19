@@ -4563,6 +4563,69 @@ describe("ChatSocket interrupted continuation", () => {
     sock.stop();
   });
 
+  test("in-flight live owner is not wiped by historical tapeProjectionVersion", async () => {
+    const sock = makeSocket();
+    const sessId = "s-inflight-live-owner";
+    const clientMessageId = "cm-inflight-live";
+    const session = sock.ensureSession(sessId, "main");
+    session._sendingInFlight = true;
+    session._activeClientMessageId = clientMessageId;
+    session._streamingAssistant = {
+      id: "stream-1",
+      role: "assistant",
+      text: "partial live text",
+      ts: 1,
+    } as ChatMessage;
+    const applyTapeProjection = vi.fn(async () => {
+      sock.applyServerMessages(sessId, "main", [{
+        id: "hist-1",
+        role: "assistant",
+        text: "historical tape",
+        ts: 0,
+        _source: "server",
+      } as ChatMessage], true, 1);
+    });
+    await sock.hydrateDurableLiveFrameJournal(
+      sessId,
+      async () => ({
+        frames: [],
+        nextCursor: null,
+        hasMore: false,
+        streamClientMessageIds: [clientMessageId],
+        hasTapeProjection: true,
+        tapeProjectionVersion: 4,
+      }),
+      applyTapeProjection,
+    );
+    expect(applyTapeProjection).not.toHaveBeenCalled();
+    expect(session._streamingAssistant?.text).toBe("partial live text");
+    expect(session._sendingInFlight).toBe(true);
+    sock.stop();
+  });
+
+  test("applyServerMessages keeps streaming when in-flight cmid is absent from REST msgs", () => {
+    const sock = makeSocket();
+    const sessId = "s-preserve-stream";
+    const session = sock.ensureSession(sessId, "main");
+    session._sendingInFlight = true;
+    session._activeClientMessageId = "cm-live";
+    session._streamingAssistant = {
+      id: "stream-1",
+      role: "assistant",
+      text: "live",
+      ts: 1,
+    } as ChatMessage;
+    sock.applyServerMessages(sessId, "main", [{
+      id: "hist",
+      role: "assistant",
+      text: "old",
+      ts: 0,
+      _source: "server",
+    } as ChatMessage], true, 1);
+    expect(session._streamingAssistant?.text).toBe("live");
+    sock.stop();
+  });
+
   test("journal hydrate stops paging at the page cap and marks degraded retry", async () => {
     const sock = makeSocket();
     sock.ensureSession("s1", "main");

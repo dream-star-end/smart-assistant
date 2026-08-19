@@ -14,8 +14,7 @@ const db = useDedicatedTestDatabase("cursor_quota_0226_test");
 
 describe("0226 cursor quota class", () => {
   test("adds cursor_quota_class with unknown default and a closed check", async () => {
-    await db.withClient(async () => {
-      await resetAndMigrateBefore("0226_cursor_quota_class");
+          await resetAndMigrateBefore("0226_cursor_quota_class");
 
       const col = await query<{ column_default: string | null; is_nullable: string }>(
         `SELECT column_default, is_nullable
@@ -46,6 +45,5 @@ describe("0226 cursor quota class", () => {
         ),
         /cursor_quota_class|check/i,
       );
-    });
   });
 });

@@ -14,8 +14,7 @@ const db = useDedicatedTestDatabase("cursor_pool_0225_test");
 
 describe("0225 cursor account pool", () => {
   test("adds cursor provider, default group, and allows cursor rows without egress", async () => {
-    await db.withClient(async () => {
-      await resetAndMigrateBefore("0225_cursor_account_pool");
+          await resetAndMigrateBefore("0225_cursor_account_pool");
 
       const providers = await query<{ consrc: string }>(
         `SELECT pg_get_constraintdef(oid) AS consrc
@@ -62,6 +61,5 @@ describe("0225 cursor account pool", () => {
         ),
         /egress|violates check/i,
       );
-    });
   });
 });
