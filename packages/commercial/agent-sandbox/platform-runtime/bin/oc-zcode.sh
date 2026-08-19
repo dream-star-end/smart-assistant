@@ -206,12 +206,26 @@ trap 'forward_signal TERM 143' TERM
 
 /bin/mkdir -p -m 0700 -- "$zcode_home/.zcode/cli" \
   || die "cannot create ephemeral ZCode config directory"
-# 0.16.3 requires provider.kind. apiKey is the opaque relay token, never the
-# Coding Plan key. Unset inheritable env before yolo exec.
-printf '%s\n' "{\"model\":{\"main\":\"$upstream\"},\"provider\":{\"$provider\":{\"kind\":\"anthropic\",\"name\":\"Z.AI Coding Plan\",\"options\":{\"apiKeyRequired\":true,\"baseURL\":\"$relay_base\",\"apiKey\":\"$api_key\"}}}}" \
+# 0.16.3 xCt copies provider.options.baseURL/apiKey onto the model ref.
+# loadOptionalSetting prefers that config string over ANTHROPIC_BASE_URL, and
+# the Anthropic SDK posts ${baseURL}/messages. Egress only matches
+# .../route/<token>/v1/messages, so both config and env must already end in /v1.
+# Values are the opaque loopback relay token/URL, never the Coding Plan key.
+anthropic_base=$relay_base
+while [ -n "$anthropic_base" ] && [ "$anthropic_base" != "${anthropic_base%/}" ]; do
+  anthropic_base=${anthropic_base%/}
+done
+case "$anthropic_base" in
+  */v1) ;;
+  *) anthropic_base="$anthropic_base/v1" ;;
+esac
+printf '%s\n' "{\"model\":{\"main\":\"$upstream\"},\"provider\":{\"$provider\":{\"kind\":\"anthropic\",\"name\":\"Z.AI Coding Plan\",\"options\":{\"apiKeyRequired\":true,\"baseURL\":\"$anthropic_base\",\"apiKey\":\"$api_key\"}}}}" \
   > "$zcode_home/.zcode/cli/config.json"
 /bin/chmod 0600 -- "$zcode_home/.zcode/cli/config.json"
+export ANTHROPIC_API_KEY="$api_key"
+export ANTHROPIC_BASE_URL="$anthropic_base"
 api_key=""
+anthropic_base=""
 
 storage_dir=""
 oc_home=${OPENCLAUDE_HOME:-}
@@ -234,7 +248,6 @@ fi
 unset ZCODE_API_KEY
 unset ZAI_API_KEY
 unset ZAI_CODING_PLAN_KEY
-unset ANTHROPIC_API_KEY
 unset ANTHROPIC_AUTH_TOKEN
 unset OC_ZCODE_RELAY_TOKEN
 unset OPENCLAUDE_V3_CONTAINER_TOKEN

@@ -51,7 +51,13 @@ describe('oc-zcode wrapper', () => {
     assert.match(text, /unset ZAI_API_KEY/)
     assert.match(text, /unset OC_ZCODE_RELAY_TOKEN/)
     assert.match(text, /unset ZAI_CODING_PLAN_KEY/)
+    assert.match(text, /unset ANTHROPIC_AUTH_TOKEN/)
     assert.match(text, /unset OPENCLAUDE_V3_CONTAINER_TOKEN/)
+    assert.match(text, /export ANTHROPIC_API_KEY=/)
+    assert.match(text, /export ANTHROPIC_BASE_URL=/)
+    assert.doesNotMatch(text, /unset ANTHROPIC_API_KEY/)
+    assert.match(text, /baseURL\\":\\"\$anthropic_base\\"/)
+    assert.doesNotMatch(text, /baseURL\\":\\"\$relay_base\\"/)
     assert.match(text, /test auth must not use the production credential path/)
     assert.match(text, /\\"kind\\":\\"anthropic\\"/)
     assert.match(text, /zai-coding-plan\/glm-5.3/)
@@ -105,6 +111,8 @@ fs.writeFileSync(process.env.FAKE_ZCODE_CAPTURE, JSON.stringify({
     ZAI_API_KEY: process.env.ZAI_API_KEY,
     ZAI_CODING_PLAN_KEY: process.env.ZAI_CODING_PLAN_KEY,
     ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
+    ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL,
+    ANTHROPIC_AUTH_TOKEN: process.env.ANTHROPIC_AUTH_TOKEN,
     OC_ZCODE_RELAY_TOKEN: process.env.OC_ZCODE_RELAY_TOKEN,
     OPENCLAUDE_V3_CONTAINER_TOKEN: process.env.OPENCLAUDE_V3_CONTAINER_TOKEN,
   },
@@ -123,6 +131,7 @@ process.stdout.write(JSON.stringify({ sessionId: 'sess_w', response: 'wrapped', 
           OC_ZCODE_TEST_AUTH_FILE: auth,
           OC_ZCODE_UPSTREAM_MODEL: 'zai-coding-plan/glm-5.3',
           OC_ZCODE_RELAY_BASE_URL: 'http://127.0.0.1:18791/internal/v5/zcode-relay/route/ab',
+          ANTHROPIC_BASE_URL: 'https://api.anthropic.com/v1',
           ZAI_CODING_PLAN_KEY: 'must-not-inherit',
           OPENCLAUDE_V3_CONTAINER_TOKEN: 'must-not-inherit',
           FAKE_ZCODE_CAPTURE: capture,
@@ -146,14 +155,72 @@ process.stdout.write(JSON.stringify({ sessionId: 'sess_w', response: 'wrapped', 
       assert.match(String(captured.env.HOME), /openclaude-zcode\./)
       assert.equal(captured.env.ZCODE_API_KEY, undefined)
       assert.equal(captured.env.ZAI_API_KEY, undefined)
-      assert.equal(captured.env.ANTHROPIC_API_KEY, undefined)
+      assert.equal(captured.env.ANTHROPIC_API_KEY, 'super-secret-zcode-key')
+      assert.equal(
+        captured.env.ANTHROPIC_BASE_URL,
+        'http://127.0.0.1:18791/internal/v5/zcode-relay/route/ab/v1',
+      )
+      assert.equal(captured.env.ANTHROPIC_AUTH_TOKEN, undefined)
       assert.equal(captured.env.OC_ZCODE_RELAY_TOKEN, undefined)
       assert.equal(captured.env.ZAI_CODING_PLAN_KEY, undefined)
       assert.equal(captured.env.OPENCLAUDE_V3_CONTAINER_TOKEN, undefined)
       assert.equal(captured.config.model.main, 'zai-coding-plan/glm-5.3')
       assert.equal(captured.config.provider['zai-coding-plan'].kind, 'anthropic')
       assert.equal(captured.config.provider['zai-coding-plan'].options.apiKey, 'super-secret-zcode-key')
+      assert.equal(
+        captured.config.provider['zai-coding-plan'].options.baseURL,
+        'http://127.0.0.1:18791/internal/v5/zcode-relay/route/ab/v1',
+      )
       assert.equal(captured.configMode, 0o600)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('does not double /v1 when the minted relay base already includes it', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-zcode-wrapper-v1-'))
+    const fake = path.join(dir, 'fake-zcode.cjs')
+    const auth = path.join(dir, 'api-key')
+    const capture = path.join(dir, 'capture.json')
+    await writeFile(auth, 'super-secret-zcode-key\n')
+    await writeFile(fake, `#!/usr/bin/env node
+const fs = require('node:fs')
+const path = require('node:path')
+const cfgPath = path.join(process.env.HOME, '.zcode/cli/config.json')
+fs.writeFileSync(process.env.FAKE_ZCODE_CAPTURE, JSON.stringify({
+  env: {
+    ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
+    ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL,
+  },
+  config: JSON.parse(fs.readFileSync(cfgPath, 'utf8')),
+}))
+process.stdout.write(JSON.stringify({ sessionId: 'sess_w', response: 'wrapped', eventCount: 0 }) + '\\n')
+`)
+    await chmod(fake, 0o755)
+    try {
+      const result = await runWrapper(
+        ['--prompt', 'hello', '--json', '--mode', 'yolo', '--no-color', '--cwd', dir],
+        {
+          PATH: process.env.PATH,
+          OC_ZCODE_TEST_BIN: fake,
+          OC_ZCODE_TEST_AUTH_FILE: auth,
+          OC_ZCODE_RELAY_BASE_URL: 'http://127.0.0.1:18791/internal/v5/zcode-relay/route/ab/v1',
+          FAKE_ZCODE_CAPTURE: capture,
+        },
+      )
+      assert.equal(result.code, 0, result.stderr)
+      const captured = JSON.parse(await readFile(capture, 'utf8')) as {
+        env: Record<string, string | undefined>
+        config: { provider: { 'zai-coding-plan': { options: { baseURL: string } } } }
+      }
+      assert.equal(
+        captured.env.ANTHROPIC_BASE_URL,
+        'http://127.0.0.1:18791/internal/v5/zcode-relay/route/ab/v1',
+      )
+      assert.equal(
+        captured.config.provider['zai-coding-plan'].options.baseURL,
+        'http://127.0.0.1:18791/internal/v5/zcode-relay/route/ab/v1',
+      )
     } finally {
       await rm(dir, { recursive: true, force: true })
     }
