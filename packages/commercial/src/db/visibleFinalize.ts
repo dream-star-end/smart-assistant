@@ -99,6 +99,55 @@ export function settlementEngineBillings(
   return settlement.engineBillings.map((row) => structuredClone(row));
 }
 
+export function phaseAVisibleHeadText(input: {
+  hasSettlement: boolean;
+  settlementText?: string;
+  liveFrameText?: string;
+}): string {
+  const raw = input.hasSettlement ? (input.settlementText ?? "") : (input.liveFrameText ?? "");
+  return clipVisibleText(raw).text;
+}
+
+export function assertSettlementMatchesCanonical(input: {
+  canonicalAnchorId: string;
+  canonicalRequestId?: string | null;
+  canonicalBillings: unknown;
+  envelope?: {
+    billingAnchorId: string;
+    requestId?: string | null;
+    engineBillings: unknown;
+  } | null;
+  persistedHash?: string | null;
+}): string {
+  const canonicalHash = settlementAuthorityHash({
+    billingAnchorId: input.canonicalAnchorId,
+    requestId: input.canonicalRequestId,
+    engineBillings: input.canonicalBillings,
+  });
+  if (input.envelope) {
+    if (input.envelope.billingAnchorId !== input.canonicalAnchorId) {
+      throw new Error("lossless turn tape billingAnchorId mismatch");
+    }
+    const envelopeRequestId = input.envelope.requestId ?? null;
+    const canonicalRequestId = input.canonicalRequestId ?? null;
+    if (envelopeRequestId !== canonicalRequestId) {
+      throw new Error("lossless turn tape settlement requestId mismatch");
+    }
+    const envelopeHash = settlementAuthorityHash({
+      billingAnchorId: input.envelope.billingAnchorId,
+      requestId: input.envelope.requestId,
+      engineBillings: input.envelope.engineBillings,
+    });
+    if (envelopeHash !== canonicalHash) {
+      throw new Error("lossless turn tape settlement envelope/canonical mismatch");
+    }
+  }
+  if (input.persistedHash && input.persistedHash !== canonicalHash) {
+    throw new Error("lossless turn tape settlement hash mismatch");
+  }
+  return canonicalHash;
+}
+
 export function isTransientTapeError(err: unknown): boolean {
   if (err && typeof err === "object" && (err as { retryable?: unknown }).retryable === true) {
     return true;

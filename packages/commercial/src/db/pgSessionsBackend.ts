@@ -78,7 +78,9 @@ import {
   releaseSettlementJobsAfterVerify,
 } from "./turnTapeJobs.js";
 import {
+  assertSettlementMatchesCanonical,
   isTransientTapeError,
+  phaseAVisibleHeadText,
   recordsPublished,
   settlementAuthorityHash,
   settlementEngineBillings,
@@ -133,7 +135,6 @@ import {
   computeGoalTokensUsed,
   isLosslessRuntimeBatchingEnabled,
   materializeLosslessTurn,
-  parseLosslessTurnPayload,
   type LosslessTurnRecord,
   type LosslessTurnPayload,
 } from "../http/losslessTurnTape.js";
@@ -2661,6 +2662,11 @@ export const LOSSLESS_TURN_RECORD_STAGE_BATCH_SIZE = 128;
 let afterLosslessStageBatch: (() => Promise<void> | void) | null = null;
 export function _setAfterLosslessStageBatch(hook: (() => Promise<void> | void) | null): void {
   afterLosslessStageBatch = hook;
+}
+
+let phaseASqlObserver: ((sql: string) => void) | null = null;
+export function _setPhaseASqlObserver(observer: ((sql: string) => void) | null): void {
+  phaseASqlObserver = observer;
 }
 
 export function _losslessTurnRecordStageBatches(
@@ -6164,24 +6170,45 @@ async function readUserMessagePayloadImpl(
  */
 
 
-async function readVisibleTextFromTapeParts(
+const PHASE_A_LIVE_FRAME_LIMIT = 16;
+const PHASE_A_LIVE_FRAME_MAX_BYTES = 64 * 1024;
+
+async function readBoundedLiveFrameText(
   queryable: Pool | PoolClient,
-  userId: string,
-  request: LosslessTurnTapeFinalizeRequest,
+  dispatchId: string | null,
 ): Promise<string> {
-  const parts = (
-    await queryable.query<{ payload: Buffer }>(
-      `SELECT payload FROM client_session_turn_tape_parts
-        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
-        ORDER BY part_index ASC`,
-      [request.sessionId, userId, request.tapeId],
-    )
-  ).rows;
-  if (parts.length === 0) return "";
+  if (!dispatchId) return "";
   try {
-    const canonical = Buffer.concat(parts.map((part) => Buffer.from(part.payload)));
-    const body = parseLosslessTurnPayload(JSON.parse(canonical.toString("utf8")));
-    return typeof body.text === "string" ? body.text : "";
+    const frames = await queryable.query<{ payload: Buffer }>(
+      `SELECT payload FROM (
+         SELECT f.payload, f.created_at
+           FROM client_session_live_streams s
+           JOIN client_session_live_frames f ON f.stream_key=s.stream_key
+          WHERE s.dispatch_id=$1::uuid
+            AND octet_length(f.payload) <= $2
+          ORDER BY f.created_at DESC
+          LIMIT $3
+       ) q ORDER BY created_at ASC`,
+      [dispatchId, PHASE_A_LIVE_FRAME_MAX_BYTES, PHASE_A_LIVE_FRAME_LIMIT],
+    );
+    const chunks: string[] = [];
+    for (const row of frames.rows) {
+      try {
+        const parsed = JSON.parse(row.payload.toString("utf8")) as {
+          type?: string;
+          blocks?: Array<{ kind?: string; text?: string }>;
+          text?: string;
+        };
+        if (parsed.type && parsed.type !== "outbound.message") continue;
+        if (typeof parsed.text === "string" && parsed.text) chunks.push(parsed.text);
+        for (const block of parsed.blocks ?? []) {
+          if (block.kind === "text" && typeof block.text === "string") chunks.push(block.text);
+        }
+      } catch {
+        /* ignore malformed frame */
+      }
+    }
+    return chunks.join("");
   } catch {
     return "";
   }
@@ -6195,7 +6222,18 @@ export async function commitVisibleLosslessTurnPhaseA(
   const billingUserId = /^c:[1-9][0-9]*$/.test(userId)
     ? numericCommercialUserId(userId)
     : null;
-  return withTx(pool, async (client) => {
+  return withTx(pool, async (rawClient) => {
+    const client = new Proxy(rawClient, {
+      get(target, prop, receiver) {
+        if (prop === "query") {
+          return (sql: unknown, ...rest: unknown[]) => {
+            if (typeof sql === "string") phaseASqlObserver?.(sql);
+            return target.query(sql as never, ...(rest as never[]));
+          };
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    }) as PoolClient;
     await lockTurnPersistenceKeys(client, userId, [request.turnKey]);
     if (billingUserId !== null) {
       await lockTurnBillingKeys(client, billingUserId, [request.turnKey]);
@@ -6303,9 +6341,14 @@ export async function commitVisibleLosslessTurnPhaseA(
         ...(replayLate ? { dispatchLateTape: true, settlementHeld: true } : {}),
       };
     }
-    const visibleText = settlement
-      ? (settlement.text ?? "")
-      : await readVisibleTextFromTapeParts(client, userId, request);
+    const liveFrameText = settlement
+      ? ""
+      : await readBoundedLiveFrameText(client, tape.dispatch_id);
+    const visibleText = phaseAVisibleHeadText({
+      hasSettlement: Boolean(settlement),
+      settlementText: settlement?.text,
+      liveFrameText,
+    });
     const head = settlement
       ? visibleHeadFromSettlement(request, settlement, clientMessageId)
       : visibleHeadFallback(request, visibleText, clientMessageId);
@@ -7434,20 +7477,20 @@ export function createPgSessionsBackend(
         }
         const turn = prepared.turn;
         const persistedBillings = Array.isArray(tape.engine_billings) ? tape.engine_billings : [];
+        assertSettlementMatchesCanonical({
+          canonicalAnchorId: turn.billingAnchorId,
+          canonicalRequestId: turn.engineBillings[0]?.requestId ?? turn.payload.requestId ?? null,
+          canonicalBillings: turn.engineBillings,
+          envelope: request.settlement
+            ? {
+                billingAnchorId: request.settlement.billingAnchorId,
+                requestId: request.settlement.requestId,
+                engineBillings: settlementEngineBillings(request.settlement),
+              }
+            : null,
+          persistedHash: tape.settlement_hash,
+        });
         if (persistedBillings.length > 0) {
-          const persistedHash = settlementAuthorityHash({
-            billingAnchorId: String(tape.billing_anchor_id ?? turn.billingAnchorId),
-            requestId: request.settlement?.requestId ?? turn.engineBillings[0]?.requestId,
-            engineBillings: persistedBillings,
-          });
-          const canonicalHash = settlementAuthorityHash({
-            billingAnchorId: turn.billingAnchorId,
-            requestId: turn.engineBillings[0]?.requestId,
-            engineBillings: turn.engineBillings,
-          });
-          if (tape.settlement_hash && tape.settlement_hash !== persistedHash && tape.settlement_hash !== canonicalHash) {
-            throw new Error("lossless turn tape settlement hash mismatch");
-          }
           if (JSON.stringify(persistedBillings) !== JSON.stringify(turn.engineBillings)) {
             throw new Error("lossless turn tape engineBillings mismatch");
           }

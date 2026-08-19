@@ -150,6 +150,8 @@ export function losslessBillingAnchorId(input: {
   if (groups.length > 0) return `${prefix}-agentgroup-${groups[groups.length - 1]!.runId}`
   const tools = input.tools ?? []
   if (tools.length > 0) return `${prefix}-tool-${tools[tools.length - 1]!.blockId}`
+  const runtime = input.runtimeEvents ?? []
+  if (runtime.length > 0) return `${prefix}-runtime-${runtime[runtime.length - 1]!.ordinal}`
   return prefix
 }
 
