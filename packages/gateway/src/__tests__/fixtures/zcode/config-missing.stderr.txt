@@ -1,0 +1,1 @@
+Error: Model config is missing. Create ~/.zcode/cli/config.json with an explicit model provider before running ZCode.

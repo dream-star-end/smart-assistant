@@ -3095,6 +3095,24 @@ describe("Cursor external authority regression tripwire", () => {
     assert.match(source, /settleCursorExternalUsage/);
   });
 
+  test("ZCode uses an independent admission/audit branch and does not reuse Cursor gates", async () => {
+    const source = await readFile(new URL("../ws/userChatBridge.ts", import.meta.url), "utf8");
+    const start = source.indexOf("if (isZcodeInboundFrame && containerId !== undefined)");
+    const end = source.indexOf("if (\n        isCodexInboundFrame &&", start);
+    assert.notEqual(start, -1);
+    const zcodeBranch = source.slice(start, end);
+    assert.match(zcodeBranch, /insertPendingZcodeAudit/);
+    assert.match(zcodeBranch, /authorityExec\.engine !== 'zcode'/);
+    assert.match(zcodeBranch, /isZcodeEngineModel\(modelCapture\)/);
+    assert.doesNotMatch(zcodeBranch, /isCursorCredentialMember/);
+    assert.doesNotMatch(zcodeBranch, /isCursorContainerOnSelfHost/);
+    assert.doesNotMatch(zcodeBranch, /settleCursorExternalUsage/);
+    assert.match(source, /closeZcodeAudit/);
+    assert.match(source, /closePendingZcodeAudits/);
+    assert.match(source, /isCursorModel\(authorityModelForFrame\)/);
+    assert.match(source, /isZcodeModel\(authorityModelForFrame\)/);
+  });
+
   test("Cursor accepts only an active row on the trusted self host", async () => {
     const selfHostId = "bc99292f-7337-4552-aa8b-756f68f3b449";
     let storedHostId = selfHostId;

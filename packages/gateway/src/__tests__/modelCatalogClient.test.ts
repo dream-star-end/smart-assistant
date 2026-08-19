@@ -314,6 +314,35 @@ describe('modelCatalogClient — provider availability routing refresh', () => {
     assert.equal(legacy.availabilityRevision, 'legacy')
     assert.equal(legacy.isRoutable('glm-5.2'), true)
   })
+
+  test('runtime validator accepts zcode engine rows and rejects unknown engines', () => {
+    const view = parseCatalogResponse({
+      ...CATALOG_BODY,
+      models: [
+        ...CATALOG_BODY.models,
+        {
+          model_id: 'zcode-experimental',
+          display_name: 'ZCode Experimental',
+          engine: 'zcode',
+          provider_id: 'zcode',
+          context_window: 128000,
+          supported_efforts: [],
+          supports_vision: false,
+          capability_zero: false,
+          supports_thinking: false,
+          default_effort: null,
+        },
+      ],
+    })
+    assert.equal(view.models.some((model) => model.engine === 'zcode' && model.modelId === 'zcode-experimental'), true)
+    assert.throws(
+      () => parseCatalogResponse({
+        ...CATALOG_BODY,
+        models: [{ ...CATALOG_BODY.models[0], engine: 'nope' }],
+      }),
+      /catalog row shape invalid/,
+    )
+  })
 })
 
 describe('modelCatalogClient — LKG + epoch 协议', () => {

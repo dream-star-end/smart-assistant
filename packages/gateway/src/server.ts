@@ -54,6 +54,7 @@ import {
   CODEX_ENGINE_MODEL_IDS,
   GROK_ENGINE_MODEL_IDS,
   CURSOR_ENGINE_MODEL_IDS,
+  ZCODE_ENGINE_MODEL_IDS,
   PLATFORM_REASONING_EFFORTS,
   AGENT_MODEL_AUTO,
   MAX_ATTACHMENTS_PER_MESSAGE,
@@ -61,6 +62,7 @@ import {
   isCodexEngineModel,
   isGrokEngineModel,
   isCursorEngineModel,
+  isZcodeEngineModel,
   isClientMessageId,
   isPersistedClientMessageId,
   formatMessageReplyPrompt,
@@ -330,6 +332,11 @@ import {
   V5_GROK_RELAY_PREFIX,
 } from './v5GrokRelay.js'
 import {
+  handleV5ZcodeRelayLocal,
+  readV5ZcodeRelayConfig,
+  V5_ZCODE_RELAY_PREFIX,
+} from './v5ZcodeRelay.js'
+import {
   handleV3MarketplaceRelayLocal,
   readV3MarketplaceRelayConfig,
   V3_MARKETPLACE_LOCAL_RELAY_PREFIX,
@@ -486,6 +493,7 @@ export const ALLOWED_INBOUND_MODELS = new Set<string>([
   ...CODEX_ENGINE_MODEL_IDS,
   ...GROK_ENGINE_MODEL_IDS,
   ...CURSOR_ENGINE_MODEL_IDS,
+  ...ZCODE_ENGINE_MODEL_IDS,
   ...STATIC_KEY_INBOUND_MODEL_IDS,
 ])
 
@@ -575,12 +583,12 @@ export function resolveSyntheticTurnModel(
   // 硬 pin 的 codex-native:model 替换无效(见 registry.resolveEngine),保持 fail-closed。
   if (agent.provider === 'codex-native') return undefined
   const effective = resolveExecutionModel(agent.model, defaultModel)
-  if (!isCodexEngineModel(effective) && !isGrokEngineModel(effective) && !isCursorEngineModel(effective)) return undefined
+  if (!isCodexEngineModel(effective) && !isGrokEngineModel(effective) && !isCursorEngineModel(effective) && !isZcodeEngineModel(effective)) return undefined
   const raw = process.env.OPENCLAUDE_SYNTHETIC_TURN_MODEL?.trim()
   // env 兜底自身必须**非 codex 且在入站白名单内**,否则忽略回默认 —— 防"把 bug 换个门再引入"
   // (例如误配成 gpt-5.5 又绕回 codex,或配一个会被 resolveExecutionModel 收敛掉的下线模型)。
   const candidate =
-    raw && ALLOWED_INBOUND_MODELS.has(raw) && !isCodexEngineModel(raw) && !isGrokEngineModel(raw) && !isCursorEngineModel(raw)
+    raw && ALLOWED_INBOUND_MODELS.has(raw) && !isCodexEngineModel(raw) && !isGrokEngineModel(raw) && !isCursorEngineModel(raw) && !isZcodeEngineModel(raw)
       ? raw
       : SYNTHETIC_TURN_NON_CODEX_MODEL_DEFAULT
   // ── routable 自检(MAJOR-1)──────────────────────────────────────────────
@@ -630,7 +638,7 @@ export interface LocalExecutionDecision {
   /** catalog 归一后的 canonical model id(alias 已解析)。 */
   readonly canonicalModel: string
   /** 取自投影的 engine(不查 baked MODEL_ENGINE_MAP)。 */
-  readonly engine: 'ccb' | 'codex' | 'grok' | 'cursor'
+  readonly engine: 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode'
   readonly supportsVision: boolean
   /** 非空 = 发生了 codex → 非 codex 降级('synthetic' kind);原模型供透明披露(MAJOR-2)。 */
   readonly downgradedFrom?: string
@@ -927,7 +935,7 @@ export function localExecutionOverride(decision: LocalExecutionDecision | undefi
   model?: string
   executionAuthority?: {
     canonicalModel: string
-    engine: 'ccb' | 'codex' | 'grok' | 'cursor'
+    engine: 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode'
     source: 'local_catalog'
   }
 } {
@@ -1091,7 +1099,7 @@ export function _buildSafeCodexRouteOverride(args: {
    *  base_url 指回本进程的 /internal/v3/codex-relay handler。 */
   officialRelayPort: number
   /** master 签名的执行权威(有则 engine 判定只认它,见 registry.resolveEngine)。 */
-  authority?: { canonicalModel: string; engine: 'ccb' | 'codex' | 'grok' | 'cursor' }
+  authority?: { canonicalModel: string; engine: 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode' }
 }): CodexProviderConfigOverride | null {
   if (!args.rawRoute || typeof args.rawRoute !== 'object' || Array.isArray(args.rawRoute)) {
     return null
@@ -1174,7 +1182,7 @@ export function _buildSafeGrokRouteOverride(args: {
   model?: string
   rawRoute: unknown
   officialRelayPort: number
-  authority?: { canonicalModel: string; engine: 'ccb' | 'codex' | 'grok' | 'cursor' }
+  authority?: { canonicalModel: string; engine: 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode' }
 }): { baseUrl: string; routeToken: string } | null {
   if (!args.rawRoute || typeof args.rawRoute !== 'object' || Array.isArray(args.rawRoute)) return null
   let engineId: string
@@ -1192,6 +1200,46 @@ export function _buildSafeGrokRouteOverride(args: {
   try {
     const parsed = new URL(route.baseUrl)
     const expectedPath = `${V5_GROK_RELAY_PREFIX}/route/${route.routeToken}/v1`
+    if (
+      parsed.protocol !== 'http:' ||
+      parsed.hostname !== '127.0.0.1' ||
+      Number(parsed.port || '80') !== args.officialRelayPort ||
+      parsed.pathname !== expectedPath ||
+      parsed.search ||
+      parsed.hash
+    ) return null
+  } catch {
+    return null
+  }
+  return { baseUrl: route.baseUrl, routeToken: route.routeToken }
+}
+
+/** Validate the master-owned opaque route consumed by the ZCode adapter.
+ * Anthropic SDK appends /v1 itself, so the minted baseUrl must NOT include /v1.
+ */
+export function _buildSafeZcodeRouteOverride(args: {
+  agent: { id: string; provider?: string; runnerKind?: string }
+  model?: string
+  rawRoute: unknown
+  officialRelayPort: number
+  authority?: { canonicalModel: string; engine: 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode' }
+}): { baseUrl: string; routeToken: string } | null {
+  if (!args.rawRoute || typeof args.rawRoute !== 'object' || Array.isArray(args.rawRoute)) return null
+  let engineId: string
+  try {
+    engineId = resolveEngine(args.model, args.agent as never, args.authority)
+  } catch {
+    return null
+  }
+  if (engineId !== 'zcode') return null
+  const route = args.rawRoute as Record<string, unknown>
+  if (Object.keys(route).sort().join(',') !== 'baseUrl,routeToken') return null
+  if (typeof route.routeToken !== 'string' || !/^[0-9a-f]{64}$/.test(route.routeToken)) return null
+  if (typeof route.baseUrl !== 'string' || route.baseUrl.length > 512) return null
+  if (!Number.isInteger(args.officialRelayPort) || args.officialRelayPort <= 0 || args.officialRelayPort > 65535) return null
+  try {
+    const parsed = new URL(route.baseUrl)
+    const expectedPath = `${V5_ZCODE_RELAY_PREFIX}/route/${route.routeToken}`
     if (
       parsed.protocol !== 'http:' ||
       parsed.hostname !== '127.0.0.1' ||
@@ -3460,6 +3508,23 @@ export class Gateway {
         this.log.error('v5 grok local relay crashed', undefined, err)
         if (!res.headersSent) {
           try { this.sendJson(res, 500, { error: { code: 'INTERNAL', message: 'grok relay crashed' } }) } catch {}
+        } else {
+          try { res.end() } catch {}
+        }
+      })
+      return
+    }
+
+    if (url.pathname === V5_ZCODE_RELAY_PREFIX || url.pathname.startsWith(`${V5_ZCODE_RELAY_PREFIX}/`)) {
+      const relayCfg = readV5ZcodeRelayConfig(process.env)
+      if (!relayCfg) {
+        this.sendJson(res, 404, { error: { code: 'ZCODE_RELAY_NOT_CONFIGURED', message: 'zcode relay not configured' } })
+        return
+      }
+      handleV5ZcodeRelayLocal(req, res, relayCfg).catch((err) => {
+        this.log.error('v5 zcode local relay crashed', undefined, err)
+        if (!res.headersSent) {
+          try { this.sendJson(res, 500, { error: { code: 'INTERNAL', message: 'zcode relay crashed' } }) } catch {}
         } else {
           try { res.end() } catch {}
         }
@@ -14785,6 +14850,20 @@ export class Gateway {
           }
         : {}),
     })
+    const safeZcodeRoute = _buildSafeZcodeRouteOverride({
+      agent,
+      model: safeModelForRouting,
+      rawRoute: (frame as any).__oc_zcode_route,
+      officialRelayPort: this.deps.config.gateway.port,
+      ...(turnAuthority !== undefined
+        ? {
+            authority: {
+              canonicalModel: turnAuthority.canonicalModel,
+              engine: turnAuthority.engine,
+            },
+          }
+        : {}),
+    })
 
     const baseToolsets = agent.toolsets ?? this.deps.config.defaults.toolsets
     let effectiveToolsets = mergeOnDemandToolsets(
@@ -16121,6 +16200,7 @@ export class Gateway {
       historicalMessages: masterHistoricalMessages,
       codexRoute: safeCodexRoute,
       grokRoute: safeGrokRoute,
+      zcodeRoute: safeZcodeRoute,
       ...(automaticRetryState ? { automaticRetryState } : {}),
       // DispatchTurnContext(uid/…)→ sessionManager 逻辑键形状(userId/…)。
       ...(turnDispatchContext

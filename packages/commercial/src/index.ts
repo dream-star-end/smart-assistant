@@ -263,6 +263,12 @@ import {
   type GrokRelayHandler,
 } from "./http/internalGrokRelay.js";
 import {
+  ZCODE_RELAY_PREFIX,
+  makeZcodeRelayHandler,
+  type ZcodeRelayHandler,
+} from "./http/internalZcodeRelay.js";
+import { mintZcodeRelayRoute, expireZcodeRelayRoute } from "./billing/zcodeRouteContext.js";
+import {
   SKILL_EMBED_PREFIX,
   makeSkillEmbedHandler,
   type SkillEmbedHandler,
@@ -2041,6 +2047,10 @@ export async function registerCommercial(
           return true;
         },
       });
+      const zcodeRelayHandler: ZcodeRelayHandler = makeZcodeRelayHandler({
+        identityRepo,
+        codingPlanKey: cfg.ZAI_CODING_PLAN_KEY ?? "",
+      });
       // /internal/v3/skill-embed — 容器内 mcp-memory 语义 skill_search 回源 master。
       // master 持 SKILL_EMBEDDING_API_KEY/DASHSCOPE_API_KEY(只在 master env,不注入容器),
       // 同款 verifyContainerIdentity 双因子鉴权;向量跨租户 PG 缓存,fail-closed 回落关键词。
@@ -2341,6 +2351,9 @@ export async function registerCommercial(
         }
         if (path === GROK_RELAY_PREFIX || path.startsWith(`${GROK_RELAY_PREFIX}/`)) {
           return grokRelayHandler(req, res, ctx);
+        }
+        if (path === ZCODE_RELAY_PREFIX || path.startsWith(`${ZCODE_RELAY_PREFIX}/`)) {
+          return zcodeRelayHandler(req, res, ctx);
         }
         if (path === SKILL_EMBED_PREFIX) {
           return skillEmbedHandler(req, res, ctx);
@@ -5133,6 +5146,15 @@ export async function registerCommercial(
     expireCodexRoute: async (token) => {
       await Promise.all([expireCodexRouteContext(token), expireGrokRouteContext(token)]);
     },
+    mintZcodeRoute: ({ containerId, userId, requestId, modelId }) =>
+      mintZcodeRelayRoute({
+        containerId,
+        userId,
+        requestId,
+        modelId,
+        relayPort: V3_CONTAINER_PORT,
+      }),
+    expireZcodeRoute: (token) => expireZcodeRelayRoute(token),
     releaseGrokRouteLease: async (accountId, slotId) => {
       // Expire durable authority before freeing the local mirror. If PG is
       // unavailable the slot remains occupied and the immutable terminal frame

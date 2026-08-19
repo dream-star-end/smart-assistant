@@ -4,6 +4,8 @@
  *   GET    /api/admin/model-catalog                 列表(staged/active/disabled/retired + alias + 有无价格行)
  *   POST   /api/admin/model-catalog                 建 staged 行
  *   POST   /api/admin/model-catalog/switch          版本切换(fn_model_switch_version 单事务)
+ *   POST   /api/admin/model-catalog/zcode-glm53-cutover   glm-5.3-zai ccb→zcode (lock_version)
+ *   POST   /api/admin/model-catalog/zcode-glm53-rollback  glm-5.3-zai zcode→ccb (lock_version)
  *   POST   /api/admin/model-catalog/:id/activate    staged|disabled → active(服务端四条语义校验)
  *   POST   /api/admin/model-catalog/:id/disable     active → disabled
  *
@@ -32,6 +34,7 @@ import {
   listCatalog,
   switchVersion,
 } from "../../admin/modelCatalogOps.js";
+import { switchGlm53ZaiEngine } from "../../admin/zcodeCanonicalSwitch.js";
 import type { CommercialHttpDeps, RequestContext } from "../handlers.js";
 import { translateRangeError } from "./_shared.js";
 
@@ -146,6 +149,12 @@ export async function handleAdminModelCatalogAction(
     if (tail === "switch") {
       const out = await switchVersion(body, requireLockVersion(body), opsCtx);
       sendJson(res, 200, { entry_id: out.entry_id });
+      return;
+    }
+    if (tail === "zcode-glm53-cutover" || tail === "zcode-glm53-rollback") {
+      const direction = tail === "zcode-glm53-cutover" ? "ccb-to-zcode" : "zcode-to-ccb";
+      const out = await switchGlm53ZaiEngine(direction, requireLockVersion(body), opsCtx);
+      sendJson(res, 200, { entry_id: out.entry_id, engine: out.engine, model_id: "glm-5.3-zai" });
       return;
     }
     const m = /^([0-9]+)\/(activate|disable)$/.exec(tail);

@@ -54,6 +54,7 @@ import { rootLogger } from "../logging/logger.js";
 import { CODEX_TOKEN_REFRESH_PATH } from "../http/internalCodexTokenRefresh.js";
 import { CODEX_RELAY_PREFIX } from "../http/internalCodexRelay.js";
 import { GROK_RELAY_PREFIX, makeGrokRelayHandler } from "../http/internalGrokRelay.js";
+import { ZCODE_RELAY_PREFIX, makeZcodeRelayHandler } from "../http/internalZcodeRelay.js";
 import {
   buildCodexRelayHandler,
   buildCodexTokenRefreshHandler,
@@ -294,6 +295,10 @@ export async function startEgress(): Promise<void> {
     },
   });
   const grokRelayHandler = makeGrokRelayHandler({ identityRepo });
+  const zcodeRelayHandler = makeZcodeRelayHandler({
+    identityRepo,
+    codingPlanKey: cfg.ZAI_CODING_PLAN_KEY ?? "",
+  });
 
   const forward = makeForwarder({ controlBaseUrl });
 
@@ -354,6 +359,21 @@ export async function startEgress(): Promise<void> {
         grokRelayHandler(req, res, { hostUuid: selfHostUuid, boundIp: peerIp }),
       ).catch((err) => {
         log.error("grok_relay_handler_threw", { err: (err as Error).message });
+        if (!res.headersSent) {
+          res.statusCode = 500;
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify({ error: { code: "INTERNAL", message: "egress handler error" } }));
+        } else {
+          try { res.destroy(); } catch { /* */ }
+        }
+      });
+      return;
+    }
+    if (path === ZCODE_RELAY_PREFIX || path.startsWith(`${ZCODE_RELAY_PREFIX}/`)) {
+      Promise.resolve(
+        zcodeRelayHandler(req, res, { hostUuid: selfHostUuid, boundIp: peerIp }),
+      ).catch((err) => {
+        log.error("zcode_relay_handler_threw", { err: (err as Error).message });
         if (!res.headersSent) {
           res.statusCode = 500;
           res.setHeader("Content-Type", "application/json");

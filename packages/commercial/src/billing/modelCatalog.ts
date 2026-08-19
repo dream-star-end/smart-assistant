@@ -46,7 +46,7 @@ import { meetsMinPlan } from "./planEntitlement.js";
 // 类型
 // ─────────────────────────────────────────────────────────────────────────────
 
-export type ModelEngine = "ccb" | "codex" | "grok" | "cursor";
+export type ModelEngine = "ccb" | "codex" | "grok" | "cursor" | "zcode";
 export type ModelCatalogState = "staged" | "active" | "disabled" | "retired";
 
 /**
@@ -452,7 +452,15 @@ export class ModelCatalogSnapshot {
   }
 
   isExternalBillingModel(modelId: string): boolean {
+    return this.isCursorModel(modelId) || this.isZcodeModel(modelId);
+  }
+
+  isCursorModel(modelId: string): boolean {
     return this.activeByModel.get(this.aliasToCanonical(modelId))?.engine === "cursor";
+  }
+
+  isZcodeModel(modelId: string): boolean {
+    return this.activeByModel.get(this.aliasToCanonical(modelId))?.engine === "zcode";
   }
 
   /**

@@ -163,6 +163,54 @@ export function isGrokEngineModel(modelId: string | null | undefined): boolean {
 }
 
 /**
+ * Experimental community ZCode CLI engine (bundled `zcode.cjs` 0.16.3 from
+ * official desktop AppImage 3.7.7). Not an official standalone CLI product.
+ * `id` is the hidden canary. Public `glm-5.3-zai` stays a catalog row and is
+ * only mapped here for CLI transport after an audited engine switch.
+ * `upstreamModel` is the provider/model string 0.16.3 accepts via config
+ * `model.main` (no `--model` flag). User-supplied upstream ids are rejected.
+ */
+export const ZCODE_CLI_UPSTREAM_MODEL = 'zai-coding-plan/glm-5.3'
+export const ZCODE_ENGINE_MODELS = [
+  {
+    id: 'zcode-experimental',
+    displayName: 'ZCode Experimental',
+    upstreamModel: ZCODE_CLI_UPSTREAM_MODEL,
+    experimental: true,
+    communityCliVersion: '0.16.3',
+  },
+] as const
+
+export const ZCODE_ENGINE_MODEL_IDS = ZCODE_ENGINE_MODELS.map((m) => m.id)
+export type ZcodeEngineModelId = (typeof ZCODE_ENGINE_MODELS)[number]['id']
+export const DEFAULT_ZCODE_ENGINE_MODEL: ZcodeEngineModelId = ZCODE_ENGINE_MODELS[0].id
+/** Canonical ids that may be mapped to the pinned CLI upstream. Public
+ * `glm-5.3-zai` is intentionally absent from ZCODE_ENGINE_MODEL_IDS so the
+ * pre-cutover catalog engine (ccb) still wins. */
+export const ZCODE_TRANSPORT_CANONICAL_IDS = [
+  'zcode-experimental',
+  'glm-5.3-zai',
+] as const
+/** Headless permission mode locked from live 0.16.3 help: build/plan ask; edit
+ * has no command execution; yolo is the only unattended all-tools mode. */
+export const ZCODE_HOSTED_PERMISSION_MODE = 'yolo' as const
+
+export function isZcodeEngineModel(modelId: string | null | undefined): boolean {
+  return (
+    typeof modelId === 'string' &&
+    (ZCODE_ENGINE_MODEL_IDS as readonly string[]).includes(modelId)
+  )
+}
+
+export function zcodeTransportModelId(modelId: string | undefined): string | undefined {
+  if (!modelId) return undefined
+  if ((ZCODE_TRANSPORT_CANONICAL_IDS as readonly string[]).includes(modelId)) {
+    return ZCODE_CLI_UPSTREAM_MODEL
+  }
+  return undefined
+}
+
+/**
  * Pinned official Cursor Agent CLI model allowlist.
  *
  * `id` is the OpenClaude-facing canonical model. `upstreamModel` is either the
@@ -521,6 +569,10 @@ export function modelReasoningPolicy(modelId: string): ModelReasoningPolicy {
   }
 
   if (isCursorEngineModel(modelId)) {
+    return { supported: [], codexModelDefault: null }
+  }
+
+  if (isZcodeEngineModel(modelId)) {
     return { supported: [], codexModelDefault: null }
   }
 
