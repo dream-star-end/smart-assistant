@@ -2710,8 +2710,8 @@ export class ChatSocket {
       message._turnTapeProcess === true ||
       typeof message._turnTapeProcessLoadedFrom === "string" ||
       typeof message._historyPageLoadedFrom === "string" ||
-      message.id.startsWith("projection-") ||
-      message.id.startsWith("oc-dispatch-err:") ||
+      (typeof message.id === "string" && message.id.startsWith("projection-")) ||
+      (typeof message.id === "string" && message.id.startsWith("oc-dispatch-err:")) ||
       !!(message as ChatMessage & { _historyProjection?: unknown })._historyProjection;
     let messages = s.messages.some(shouldStrip)
       ? s.messages.filter((message) => !shouldStrip(message))
@@ -2798,8 +2798,8 @@ export class ChatSocket {
     s.messages = Array.isArray(stored.messages)
       ? stored.messages
         .filter((message) =>
-          !message.id.startsWith("projection-") &&
-          !message.id.startsWith("oc-dispatch-err:") &&
+          !(typeof message.id === "string" && message.id.startsWith("projection-")) &&
+          !(typeof message.id === "string" && message.id.startsWith("oc-dispatch-err:")) &&
           message._timelineRecord !== true &&
           message._turnTapeProcess !== true &&
           typeof message._historyPageLoadedFrom !== "string" &&

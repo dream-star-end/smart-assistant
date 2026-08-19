@@ -3,8 +3,13 @@ import { createHash } from "node:crypto";
 import { describe, test } from "node:test";
 import {
   assertSettlementMatchesCanonical,
+  classifyUnifiedTimelineIntegrityError,
   clipVisibleText,
   phaseAVisibleHeadText,
+  pickTapeDisplayFallbackText,
+  resetTapeDisplayDegradeLogForTests,
+  sanitizeJsonBytesForPgJsonb,
+  sanitizeValueForPgJsonb,
   settlementAuthorityHash,
   settlementPayloadEqual,
   VISIBLE_HEAD_TEXT_MAX_BYTES,
@@ -153,5 +158,64 @@ describe("assertSettlementMatchesCanonical", () => {
       }),
       hash,
     );
+  });
+});
+
+describe("tape display degrade helpers", () => {
+  test("classify maps hydrate-chain integrity errors", () => {
+    assert.equal(
+      classifyUnifiedTimelineIntegrityError(new Error("[pgSessions] unified timeline tape record missing: t\\00")),
+      "record_missing",
+    );
+    assert.equal(
+      classifyUnifiedTimelineIntegrityError(new Error("[pgSessions] unified timeline visible payload hash mismatch: t")),
+      "visible_payload_hash_mismatch",
+    );
+    assert.equal(
+      classifyUnifiedTimelineIntegrityError(new Error("[pgSessions] unified timeline record malformed: t")),
+      "record_malformed",
+    );
+    assert.equal(
+      classifyUnifiedTimelineIntegrityError(new Error("[pgSessions] unified timeline record JSON invalid: t: not object")),
+      "record_json_invalid",
+    );
+    assert.equal(
+      classifyUnifiedTimelineIntegrityError(new Error("[pgSessions] unified timeline hydrated group missing")),
+      "hydrated_group_missing",
+    );
+    assert.equal(
+      classifyUnifiedTimelineIntegrityError(new Error("[pgSessions] unified timeline finalized tape missing: t")),
+      "finalized_tape_missing",
+    );
+    assert.equal(
+      classifyUnifiedTimelineIntegrityError(new Error("[pgSessions] unified timeline tape hash mismatch: t")),
+      "tape_hash_mismatch",
+    );
+  });
+
+  test("fallback prefers visible_head, then anchor, then placeholder", () => {
+    assert.deepEqual(
+      pickTapeDisplayFallbackText({ visibleHead: { text: "full visible head" }, anchorText: "first sentence" }),
+      { text: "full visible head", source: "visible_head" },
+    );
+    assert.deepEqual(
+      pickTapeDisplayFallbackText({ visibleHead: { text: "" }, anchorText: "anchor body" }),
+      { text: "anchor body", source: "anchor" },
+    );
+    assert.equal(pickTapeDisplayFallbackText({}).source, "placeholder");
+  });
+
+  test("sanitizeJsonBytesForPgJsonb strips NUL and unpaired surrogates", () => {
+    resetTapeDisplayDegradeLogForTests();
+    const sqliteDump = { tool: "Read", dump: "SQLite format 3\u0000page" };
+    const raw = Buffer.from(JSON.stringify(sqliteDump), "utf8");
+    const sanitized = sanitizeJsonBytesForPgJsonb(raw);
+    assert.equal(sanitized.changed, true);
+    assert.equal(sanitized.bytes.includes(0), false);
+    const parsed = JSON.parse(sanitized.bytes.toString("utf8")) as { dump: string };
+    assert.equal(parsed.dump.includes("\u0000"), false);
+    assert.equal(parsed.dump.includes("\uFFFD"), true);
+    const lone = sanitizeValueForPgJsonb("ok\uD800end");
+    assert.equal(lone, "ok\uFFFDend");
   });
 });

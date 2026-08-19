@@ -4649,11 +4649,11 @@ export class Gateway {
             snapshotMaxSeq: page.snapshotMaxSeq,
           })
         })
-        .catch((error) => {
+        .catch((error: unknown) => {
           if (error instanceof ClientTimelineCursorStaleError) {
             this.sendJson(res, 409, { error: 'timeline cursor stale', code: 'TIMELINE_CURSOR_STALE' })
           } else {
-            this.sendJson(res, 500, { error: 'timeline read failed' })
+            this.sendSessionReadFailure(res, error, sessId, 'timeline read failed')
           }
         })
       return
@@ -4742,7 +4742,7 @@ export class Gateway {
                 ? encodeClientTimelineCursor(s.timelineCursor)
                 : null,
             }) : this.sendJson(res, 404, { error: 'not found' }))
-            .catch(() => this.sendJson(res, 500, { error: 'get failed' }))
+            .catch((error: unknown) => this.sendSessionReadFailure(res, error, sessId, 'get failed'))
         } else {
           getClientSession(sessId, userId, { view: 'timeline' })
             .then((s) => {
@@ -4776,7 +4776,7 @@ export class Gateway {
                   : null,
               })
             })
-            .catch(() => this.sendJson(res, 500, { error: 'get failed' }))
+            .catch((error: unknown) => this.sendSessionReadFailure(res, error, sessId, 'get failed'))
         }
         return
       }
@@ -6617,6 +6617,17 @@ export class Gateway {
   private sendJson(res: ServerResponse, code: number, body: unknown): void {
     res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' })
     res.end(JSON.stringify(body))
+  }
+  private sendSessionReadFailure(
+    res: ServerResponse,
+    error: unknown,
+    sessionId: string,
+    publicError: string,
+  ): void {
+    const requestId = randomBytes(8).toString('hex')
+    const err = error instanceof Error ? error : new Error(String(error))
+    this.log.error('session read failed', { sessionId, requestId, publicError }, err)
+    this.sendJson(res, 500, { error: publicError, requestId })
   }
   private sendError(res: ServerResponse, code: number, message: string): void {
     this.sendJson(res, code, { error: message })

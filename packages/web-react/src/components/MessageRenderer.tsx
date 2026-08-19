@@ -31,6 +31,7 @@ import {
   messageKind,
   messageSignature,
 } from "../lib/chat/render";
+import { sanitizeChatMessages } from "../lib/chat/sanitizeChatMessages";
 import {
   AssistantCard,
   type CardCallbacks,
@@ -920,6 +921,7 @@ export function MessageList({
   readOnly = false,
   scrollParent,
   historyGeneration = "legacy",
+  sessionId,
 }: {
   messages: ChatMessage[];
   sending: boolean;
@@ -944,6 +946,7 @@ export function MessageList({
   scrollParent?: HTMLElement | null;
   /** Server history revision. A new revision gets a fresh paging intent owner. */
   historyGeneration?: number | string;
+  sessionId?: string;
 }) {
   const pagingOwnerRef = useRef<{
     generation: string;
@@ -1076,20 +1079,22 @@ export function MessageList({
   // Drop legacy substitute rows from an old IndexedDB cache and duplicate
   // engine transport envelopes. The latter remain byte-complete in the tape;
   // their canonical immutable Agent blocks are the user-facing timeline.
-  const resolvedDispatchTurnIds = collectResolvedDispatchTurnIds(messages);
+  const safeMessages = sanitizeChatMessages(messages, sessionId);
+  const resolvedDispatchTurnIds = collectResolvedDispatchTurnIds(safeMessages);
   // Automatic recovery rows remain in memory/IndexedDB/PG as exact lineage,
   // but are transport controls rather than another user utterance. While a
   // child exists, its source terminal card is likewise an intermediate state;
   // only the final exhausted/unsafe error remains visible.
   const automaticallyRecoveredSourceIds = new Set(
-    messages
+    safeMessages
       .filter((message) => message.role === "user" && message._automaticRecovery === true)
       .map((message) => message._recoveryOfClientMessageId)
       .filter((id): id is string => typeof id === "string" && id.length > 0),
   );
-  const renderableMessages = messages.filter(
+  const renderableMessages = safeMessages.filter(
     (m) =>
       !(m as ChatMessage & { _historyProjection?: unknown })._historyProjection &&
+      typeof m.id === "string" &&
       !m.id.startsWith("projection-") &&
       !m.id.startsWith("oc-dispatch-err:") &&
       m._turnTapeProcess !== true &&
@@ -1111,7 +1116,7 @@ export function MessageList({
       .map((message) => message.id),
   );
   const automaticRecoveryParents = new Map(
-    messages
+    safeMessages
       .filter(
         (message) =>
           message.role === "user" &&
@@ -1147,7 +1152,7 @@ export function MessageList({
     ? Math.max(
         0,
         (archive?.archivedCount ?? 0) - loadedArchivedMetrics(
-          messages,
+          safeMessages,
           archive?.archivedThroughSeq ?? 0,
         ).anchors,
       )
