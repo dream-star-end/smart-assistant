@@ -2,15 +2,26 @@
 -- agent-group canonicalize trigger.
 --
 -- order-dependency: 0231_turn_tape_materialization_resilience
--- (0231 lives on feat/v5-selfhost; this branch diverged at 0230. 0232 must
--- apply after that CREATE OR REPLACE so we do not leave format-3 skip as the
--- last writer. Dictionary order 0231_* < 0232_*.)
+-- (0231 and 0232 apply in dictionary order on the same branch after rebase.
+-- 0232 CREATE OR REPLACE must follow 0231 so the format-3 skip is not left
+-- as the last writer. Dictionary order 0231_* < 0232_*.)
+--
+-- Lazy sanitize: first cast the original UTF-8 payload to jsonb. Only if that
+-- cast fails do we run sanitize_json_text_for_jsonb (plpgsql; near-quadratic
+-- on payloads with many backslashes because each strpos(substr(src, i), ...)
+-- copies the remaining text) and retry. Sanitize stays off the hot path for
+-- the vast majority of legal rows.
+--
+-- Never rewrite a sanitized payload: B2 requires original record BYTEA and
+-- content_sha256 to be immutable. If body came from sanitize, skip billing
+-- canonicalize rewrite (RAISE WARNING + RETURN NEW). Canonicalize may rewrite
+-- payload/hash only when body was parsed from unsanitized original bytes.
 --
 -- Additive. CREATE OR REPLACE FUNCTION only: no DROP TABLE/TRIGGER, no ALTER.
 -- JSON.stringify emits \u0000 for NUL bytes (e.g. SQLite dumps). PostgreSQL
 -- jsonb rejects \u0000 and unpaired surrogates (SQLSTATE 22P05), which aborted
 -- tape materialization. Replica-role bypass cannot run as a LOGIN role and
--- would disable every origin trigger; sanitize + EXCEPTION instead.
+-- would disable every origin trigger; lazy sanitize + EXCEPTION instead.
 --
 -- Backslash parity: a \uXXXX is a real JSON escape only when the number of
 -- consecutive backslashes immediately before "uXXXX" is odd. \\u0000 is a
@@ -110,14 +121,16 @@ $fn$;
 COMMENT ON FUNCTION sanitize_json_text_for_jsonb(text) IS
   'Rewrite JSON text so jsonb will accept it: replace \u0000 and unpaired surrogates with \ufffd, honoring odd/even backslash runs.';
 
--- Keep format-3 bytes untouched (0231_turn_tape_materialization_resilience), then
--- sanitize before jsonb cast, then skip canonicalize rather than fail INSERT.
+-- Keep format-3 bytes untouched (0231_turn_tape_materialization_resilience).
+-- Lazy-cast original payload; sanitize only after jsonb rejects it. Never
+-- write sanitized bytes back onto NEW.payload / content_sha256.
 CREATE OR REPLACE FUNCTION canonicalize_legacy_lossless_agent_group()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
 DECLARE
   body JSONB;
   canonical JSONB;
   payload_text TEXT;
+  sanitized_used BOOLEAN := false;
 BEGIN
   IF NEW.role<>'agent-group' THEN RETURN NEW; END IF;
   BEGIN
@@ -131,8 +144,20 @@ BEGIN
     ) THEN
       RETURN NEW;
     END IF;
-    payload_text := sanitize_json_text_for_jsonb(convert_from(NEW.payload, 'UTF8'));
-    body := payload_text::jsonb;
+    payload_text := convert_from(NEW.payload, 'UTF8');
+    sanitized_used := false;
+    BEGIN
+      body := payload_text::jsonb;
+    EXCEPTION WHEN others THEN
+      BEGIN
+        body := sanitize_json_text_for_jsonb(payload_text)::jsonb;
+        sanitized_used := true;
+      EXCEPTION WHEN others THEN
+        RAISE WARNING 'canonicalize_legacy_lossless_agent_group skipped session_id=% tape_id=% msg_id=% sqlstate=% sqlerrm=%',
+          NEW.session_id, NEW.tape_id, NEW.msg_id, SQLSTATE, SQLERRM;
+        RETURN NEW;
+      END;
+    END;
     IF jsonb_typeof(body->'engineBillings') IS DISTINCT FROM 'array' THEN RETURN NEW; END IF;
     IF NOT EXISTS (
       SELECT 1 FROM pg_proc WHERE proname = 'oc_0151_canonicalize_billing_array'
@@ -141,6 +166,12 @@ BEGIN
     END IF;
     canonical := oc_0151_canonicalize_billing_array(body->'engineBillings');
     IF canonical IS NOT DISTINCT FROM body->'engineBillings' THEN RETURN NEW; END IF;
+
+    IF sanitized_used THEN
+      RAISE WARNING 'canonicalize_legacy_lossless_agent_group skipped billing canonicalize because payload contains jsonb-illegal escapes session_id=% tape_id=% msg_id=%',
+        NEW.session_id, NEW.tape_id, NEW.msg_id;
+      RETURN NEW;
+    END IF;
 
     body := jsonb_set(body, '{engineBillings}', canonical);
     NEW.payload := convert_to(body::text, 'UTF8');
@@ -152,3 +183,4 @@ BEGIN
     RETURN NEW;
   END;
 END $$;
+

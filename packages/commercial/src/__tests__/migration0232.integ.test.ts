@@ -24,6 +24,7 @@ const MIGRATION = path.resolve(
 
 let pool: Pool;
 let pgAvailable = false;
+let migrationSql = "";
 
 function sha256(bytes: Buffer): string {
   return createHash("sha256").update(bytes).digest("hex");
@@ -99,9 +100,9 @@ before(async () => {
     BEFORE INSERT OR UPDATE OF payload, role ON client_session_turn_tape_records
     FOR EACH ROW EXECUTE FUNCTION canonicalize_legacy_lossless_agent_group();
   `);
-  const sql = await readFile(MIGRATION, "utf8");
-  await pool.query(sql);
-  await pool.query(sql);
+  migrationSql = await readFile(MIGRATION, "utf8");
+  await pool.query(migrationSql);
+  await pool.query(migrationSql);
 });
 
 after(async () => {
@@ -127,6 +128,9 @@ async function seedTape(tapeId: string, format = 2): Promise<void> {
   );
 }
 
+const LEGACY_BILLING_JSON =
+  '{"engineBillings":[{"requestId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","status":"error","errorReason":"DO_NOT_KEEP"}],"runId":"legacy"}';
+
 describe("0232_agent_group_jsonb_unicode_sanitize", () => {
   maybe("sanitize_json_text_for_jsonb matches the odd/even backslash spec", async () => {
     const cases: Array<[string, string]> = [
@@ -147,6 +151,48 @@ describe("0232_agent_group_jsonb_unicode_sanitize", () => {
         )
       ).rows[0]!;
       assert.equal(row.out, expected, input);
+    }
+  });
+
+  maybe("legal payload is jsonb-cast without calling sanitize_json_text_for_jsonb", async () => {
+    const tapeId = "tape-lazy";
+    await seedTape(tapeId);
+    await pool.query(`
+      CREATE OR REPLACE FUNCTION sanitize_json_text_for_jsonb(src text)
+      RETURNS text LANGUAGE plpgsql IMMUTABLE STRICT AS $fn$
+      BEGIN
+        RAISE EXCEPTION 'sanitize_should_not_run';
+      END;
+      $fn$;
+    `);
+    try {
+      const raw = Buffer.from(LEGACY_BILLING_JSON, "utf8");
+      await pool.query(
+        `INSERT INTO client_session_turn_tape_records(
+           session_id,user_id,tape_id,msg_id,role,content_sha256,payload
+         ) VALUES ('session-0232','c:1',$1,'group','agent-group',$2,$3)`,
+        [tapeId, sha256(raw), raw],
+      );
+      const row = (
+        await pool.query<{
+          body: Record<string, unknown>;
+          content_sha256: string;
+          actual_sha256: string;
+        }>(
+          `SELECT convert_from(payload,'UTF8')::jsonb AS body,content_sha256,
+                  encode(public.digest(payload,'sha256'),'hex') AS actual_sha256
+             FROM client_session_turn_tape_records
+            WHERE session_id='session-0232' AND user_id='c:1' AND tape_id=$1`,
+          [tapeId],
+        )
+      ).rows[0]!;
+      const billings = row.body.engineBillings as Array<Record<string, unknown>>;
+      assert.equal(billings[0]!.terminalCode, "CODEX_ERROR");
+      assert.equal("errorReason" in billings[0]!, false);
+      assert.equal(row.content_sha256, row.actual_sha256);
+      assert.notEqual(row.content_sha256, sha256(raw));
+    } finally {
+      await pool.query(migrationSql);
     }
   });
 
@@ -187,10 +233,7 @@ describe("0232_agent_group_jsonb_unicode_sanitize", () => {
   maybe("still scrubs a legacy billing array when JSON is legal", async () => {
     const tapeId = "tape-legacy";
     await seedTape(tapeId);
-    const raw = Buffer.from(
-      '{"engineBillings":[{"requestId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","status":"error","errorReason":"DO_NOT_KEEP"}],"runId":"legacy"}',
-      "utf8",
-    );
+    const raw = Buffer.from(LEGACY_BILLING_JSON, "utf8");
     await pool.query(
       `INSERT INTO client_session_turn_tape_records(
          session_id,user_id,tape_id,msg_id,role,content_sha256,payload
@@ -216,6 +259,39 @@ describe("0232_agent_group_jsonb_unicode_sanitize", () => {
     assert.equal(row.content_sha256, row.actual_sha256);
   });
 
+  maybe("sanitized payload with billing canonicalize need is not rewritten", async () => {
+    const tapeId = "tape-nul-billing";
+    await seedTape(tapeId);
+    const raw = Buffer.from(
+      '{"engineBillings":[{"requestId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","status":"error","errorReason":"DO_NOT_KEEP"}],"runId":"legacy\\u0000"}',
+      "utf8",
+    );
+    const inserted = (
+      await pool.query<{ payload: Buffer; content_sha256: string }>(
+        `INSERT INTO client_session_turn_tape_records(
+           session_id,user_id,tape_id,msg_id,role,content_sha256,payload
+         ) VALUES ('session-0232','c:1',$1,'group','agent-group',$2,$3)
+         RETURNING payload,content_sha256`,
+        [tapeId, sha256(raw), raw],
+      )
+    ).rows[0]!;
+    assert.deepEqual(inserted.payload, raw);
+    assert.equal(inserted.content_sha256, sha256(raw));
+    const stored = (
+      await pool.query<{ payload: Buffer; content_sha256: string; raw: string }>(
+        `SELECT payload,content_sha256,convert_from(payload,'UTF8') AS raw
+           FROM client_session_turn_tape_records
+          WHERE session_id='session-0232' AND user_id='c:1' AND tape_id=$1`,
+        [tapeId],
+      )
+    ).rows[0]!;
+    assert.deepEqual(stored.payload, raw);
+    assert.equal(stored.content_sha256, sha256(raw));
+    assert.match(stored.raw, /\\u0000/);
+    assert.match(stored.raw, /DO_NOT_KEEP/);
+    assert.doesNotMatch(stored.raw, /CODEX_ERROR/);
+  });
+
   maybe("format-3 tapes skip canonicalize even with a legacy billing array", async () => {
     const tapeId = "tape-fmt3";
     await seedTape(tapeId, 3);
@@ -235,3 +311,4 @@ describe("0232_agent_group_jsonb_unicode_sanitize", () => {
     assert.deepEqual(inserted.payload, raw);
   });
 });
+
