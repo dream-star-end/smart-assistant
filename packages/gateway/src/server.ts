@@ -54,6 +54,7 @@ import {
   CODEX_ENGINE_MODEL_IDS,
   GROK_ENGINE_MODEL_IDS,
   CURSOR_ENGINE_MODEL_IDS,
+  ZCODE_ENGINE_MODEL_IDS,
   PLATFORM_REASONING_EFFORTS,
   AGENT_MODEL_AUTO,
   MAX_ATTACHMENTS_PER_MESSAGE,
@@ -61,6 +62,7 @@ import {
   isCodexEngineModel,
   isGrokEngineModel,
   isCursorEngineModel,
+  isZcodeEngineModel,
   isClientMessageId,
   isPersistedClientMessageId,
   formatMessageReplyPrompt,
@@ -486,6 +488,7 @@ export const ALLOWED_INBOUND_MODELS = new Set<string>([
   ...CODEX_ENGINE_MODEL_IDS,
   ...GROK_ENGINE_MODEL_IDS,
   ...CURSOR_ENGINE_MODEL_IDS,
+  ...ZCODE_ENGINE_MODEL_IDS,
   ...STATIC_KEY_INBOUND_MODEL_IDS,
 ])
 
@@ -575,12 +578,12 @@ export function resolveSyntheticTurnModel(
   // 硬 pin 的 codex-native:model 替换无效(见 registry.resolveEngine),保持 fail-closed。
   if (agent.provider === 'codex-native') return undefined
   const effective = resolveExecutionModel(agent.model, defaultModel)
-  if (!isCodexEngineModel(effective) && !isGrokEngineModel(effective) && !isCursorEngineModel(effective)) return undefined
+  if (!isCodexEngineModel(effective) && !isGrokEngineModel(effective) && !isCursorEngineModel(effective) && !isZcodeEngineModel(effective)) return undefined
   const raw = process.env.OPENCLAUDE_SYNTHETIC_TURN_MODEL?.trim()
   // env 兜底自身必须**非 codex 且在入站白名单内**,否则忽略回默认 —— 防"把 bug 换个门再引入"
   // (例如误配成 gpt-5.5 又绕回 codex,或配一个会被 resolveExecutionModel 收敛掉的下线模型)。
   const candidate =
-    raw && ALLOWED_INBOUND_MODELS.has(raw) && !isCodexEngineModel(raw) && !isGrokEngineModel(raw) && !isCursorEngineModel(raw)
+    raw && ALLOWED_INBOUND_MODELS.has(raw) && !isCodexEngineModel(raw) && !isGrokEngineModel(raw) && !isCursorEngineModel(raw) && !isZcodeEngineModel(raw)
       ? raw
       : SYNTHETIC_TURN_NON_CODEX_MODEL_DEFAULT
   // ── routable 自检(MAJOR-1)──────────────────────────────────────────────
@@ -630,7 +633,7 @@ export interface LocalExecutionDecision {
   /** catalog 归一后的 canonical model id(alias 已解析)。 */
   readonly canonicalModel: string
   /** 取自投影的 engine(不查 baked MODEL_ENGINE_MAP)。 */
-  readonly engine: 'ccb' | 'codex' | 'grok' | 'cursor'
+  readonly engine: 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode'
   readonly supportsVision: boolean
   /** 非空 = 发生了 codex → 非 codex 降级('synthetic' kind);原模型供透明披露(MAJOR-2)。 */
   readonly downgradedFrom?: string
@@ -927,7 +930,7 @@ export function localExecutionOverride(decision: LocalExecutionDecision | undefi
   model?: string
   executionAuthority?: {
     canonicalModel: string
-    engine: 'ccb' | 'codex' | 'grok' | 'cursor'
+    engine: 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode'
     source: 'local_catalog'
   }
 } {
@@ -1091,7 +1094,7 @@ export function _buildSafeCodexRouteOverride(args: {
    *  base_url 指回本进程的 /internal/v3/codex-relay handler。 */
   officialRelayPort: number
   /** master 签名的执行权威(有则 engine 判定只认它,见 registry.resolveEngine)。 */
-  authority?: { canonicalModel: string; engine: 'ccb' | 'codex' | 'grok' | 'cursor' }
+  authority?: { canonicalModel: string; engine: 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode' }
 }): CodexProviderConfigOverride | null {
   if (!args.rawRoute || typeof args.rawRoute !== 'object' || Array.isArray(args.rawRoute)) {
     return null
@@ -1174,7 +1177,7 @@ export function _buildSafeGrokRouteOverride(args: {
   model?: string
   rawRoute: unknown
   officialRelayPort: number
-  authority?: { canonicalModel: string; engine: 'ccb' | 'codex' | 'grok' | 'cursor' }
+  authority?: { canonicalModel: string; engine: 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode' }
 }): { baseUrl: string; routeToken: string } | null {
   if (!args.rawRoute || typeof args.rawRoute !== 'object' || Array.isArray(args.rawRoute)) return null
   let engineId: string

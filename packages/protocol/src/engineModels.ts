@@ -163,6 +163,42 @@ export function isGrokEngineModel(modelId: string | null | undefined): boolean {
 }
 
 /**
+ * Experimental community ZCode CLI engine (bundled `zcode.cjs` 0.15.0 from
+ * official desktop AppImage 3.2.2). Not an official standalone CLI product.
+ * `id` is the OpenClaude canonical model; `upstreamModel` is the provider/model
+ * string the 0.15.0 binary accepts via config `model.main` (no `--model` flag).
+ */
+export const ZCODE_ENGINE_MODELS = [
+  {
+    id: 'zcode-experimental',
+    displayName: 'ZCode Experimental',
+    upstreamModel: 'zai/glm-5.1',
+    experimental: true,
+    communityCliVersion: '0.15.0',
+  },
+] as const
+
+export const ZCODE_ENGINE_MODEL_IDS = ZCODE_ENGINE_MODELS.map((m) => m.id)
+export type ZcodeEngineModelId = (typeof ZCODE_ENGINE_MODELS)[number]['id']
+export const DEFAULT_ZCODE_ENGINE_MODEL: ZcodeEngineModelId = ZCODE_ENGINE_MODELS[0].id
+/** Headless permission mode locked from live 0.15.0 help: build/plan ask; edit
+ * has no command execution; yolo is the only unattended all-tools mode. */
+export const ZCODE_HOSTED_PERMISSION_MODE = 'yolo' as const
+
+export function isZcodeEngineModel(modelId: string | null | undefined): boolean {
+  return (
+    typeof modelId === 'string' &&
+    (ZCODE_ENGINE_MODEL_IDS as readonly string[]).includes(modelId)
+  )
+}
+
+export function zcodeTransportModelId(modelId: string | undefined): string | undefined {
+  if (!modelId) return modelId
+  const row = ZCODE_ENGINE_MODELS.find((model) => model.id === modelId)
+  return row?.upstreamModel ?? modelId
+}
+
+/**
  * Pinned official Cursor Agent CLI model allowlist.
  *
  * `id` is the OpenClaude-facing canonical model. `upstreamModel` is either the
@@ -521,6 +557,10 @@ export function modelReasoningPolicy(modelId: string): ModelReasoningPolicy {
   }
 
   if (isCursorEngineModel(modelId)) {
+    return { supported: [], codexModelDefault: null }
+  }
+
+  if (isZcodeEngineModel(modelId)) {
     return { supported: [], codexModelDefault: null }
   }
 

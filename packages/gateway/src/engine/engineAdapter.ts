@@ -36,7 +36,7 @@ export interface EngineCapabilities {
    *  'engine-reported' = runner 上报 billing 帧 → master bridge settle(codex)。 */
   billingMode: 'proxy' | 'engine-reported' | 'external'
   supportsEffort: boolean
-  resumeKind: 'ccb-session' | 'codex-thread' | 'grok-session' | 'cursor-session'
+  resumeKind: 'ccb-session' | 'codex-thread' | 'grok-session' | 'cursor-session' | 'zcode-session'
   needsServerRequestId: boolean
   /** Native engines retain provider-owned state across turns. Stateless
    * engines must receive a bounded master-history replay on every turn. */

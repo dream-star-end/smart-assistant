@@ -30,6 +30,7 @@ import './engine/ccbAdapter.js'
 import './engine/codexAdapter.js'
 import './engine/grokAdapter.js'
 import { cursorResumeStoreExists } from './engine/cursorAdapter.js'
+import './engine/zcodeAdapter.js'
 import type {
   AutomaticRetryState,
   CollabAgentPolicy,
@@ -477,7 +478,8 @@ export function pickIdleTimeoutMs(
     engineId === 'ccb' ||
     engineId === 'codex' ||
     engineId === 'grok' ||
-    engineId === 'cursor'
+    engineId === 'cursor' ||
+    engineId === 'zcode'
   ) {
     return IDLE_TIMEOUT_TOOL_MS
   }
@@ -2665,6 +2667,7 @@ export class SessionManager {
     if (tag === 'codex-native' || tag === 'codex') return 'codex'
     if (tag === 'grok') return 'grok'
     if (tag === 'cursor') return 'cursor'
+    if (tag === 'zcode') return 'zcode'
     return SessionManager.CCB_PROVIDER_TAG
   }
 
@@ -2877,7 +2880,7 @@ export class SessionManager {
      */
     executionAuthority?: {
       canonicalModel: string
-      engine: 'ccb' | 'codex' | 'grok' | 'cursor'
+      engine: 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode'
       source?: 'bridge_signed' | 'local_catalog'
     }
     /**
