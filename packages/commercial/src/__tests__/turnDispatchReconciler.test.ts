@@ -647,6 +647,52 @@ describe('carrier-death fast path (accepted)', () => {
     assert.ok(!pool.writeParams.some((p) => p[2] === 'RESULT_RECOVERY_PENDING'))
   })
 
+  test('recovery_pending 且无停机证据 → 不写 SERVICE_RESTART', async () => {
+    const pool = makeFakePool({
+      acceptedStuck: [rawRow({ status: 'accepted', accepted_at: new Date() })],
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: {
+        ...noContainer,
+        getDispatchState: async (): Promise<ContainerCallResult> => ({
+          kind: 'ok',
+          state: 'recovery_pending',
+        }),
+      },
+    })
+    assert.equal(counts.visibleFailures, 0)
+    assert.equal(counts.rejectedTerminal, 0)
+    assert.equal(counts.manualReconcile, 0)
+    assert.ok(!pool.writes.some((w) => w.includes("status = 'terminal'")))
+    assert.ok(!pool.writeParams.some((p) => p[2] === 'SERVICE_RESTART'))
+    assert.ok(!pool.writeParams.some((p) => p[2] === 'RESULT_RECOVERY_PENDING'))
+  })
+
+  test('recovery_pending 且有 shutdown_ctx → 收口成 SERVICE_RESTART', async () => {
+    const pool = makeFakePool({
+      acceptedStuck: [rawRow({
+        status: 'accepted',
+        accepted_at: new Date(),
+        shutdown_ctx: { gatewayExitedAt: '2026-08-20T00:00:00.000Z' },
+      })],
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: {
+        ...noContainer,
+        getDispatchState: async (): Promise<ContainerCallResult> => ({
+          kind: 'ok',
+          state: 'recovery_pending',
+        }),
+      },
+    })
+    assert.equal(counts.visibleFailures, 1)
+    assert.equal(counts.rejectedTerminal, 0)
+    assert.ok(pool.writeParams.some((p) => p[1] === 'executed_error' && p[2] === 'SERVICE_RESTART'))
+    assert.ok(!pool.writeParams.some((p) => p[2] === 'RESULT_RECOVERY_PENDING'))
+  })
+
   test('accepted + 停机证据 + 容器 running → 不动', async () => {
     const pool = makeFakePool({
       acceptedStuck: [rawRow({ status: 'accepted', accepted_at: new Date() })],

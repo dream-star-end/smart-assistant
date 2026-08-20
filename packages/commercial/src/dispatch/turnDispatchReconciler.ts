@@ -415,15 +415,19 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
       continue
     }
     if (res.state === 'recovery_pending') {
-      // 容器已离开 running 进入恢复协议(非 live)。尽快 sentinel,迟到真 tape 可覆盖。
-      const closed = await closeAcceptedAsServiceRestart(deps, row, now())
-      if (closed) {
-        counts.visibleFailures++
-        counts.notified++
-        await clearExitMark(deps, row)
-        try {
-          deps.nudgeClient?.(row.userId, row.sessionId, row.clientMessageId)
-        } catch { /* status is durable; live nudge is best-effort */ }
+      // 只有停机证据才允许 SERVICE_RESTART。无证据的 recovery_pending 可能是
+      // 真崩溃(RUNNER_CRASHED / ENGINE_FAULT)；写成 SERVICE_RESTART 会让侧栏
+      // 画出「可恢复的琥珀点」。无证据时保持既有等待 / 90min stuck 门。
+      if (hasDeadEvidence) {
+        const closed = await closeAcceptedAsServiceRestart(deps, row, now())
+        if (closed) {
+          counts.visibleFailures++
+          counts.notified++
+          await clearExitMark(deps, row)
+          try {
+            deps.nudgeClient?.(row.userId, row.sessionId, row.clientMessageId)
+          } catch { /* status is durable; live nudge is best-effort */ }
+        }
       }
       continue
     }
