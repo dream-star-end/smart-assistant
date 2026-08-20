@@ -89,6 +89,7 @@ CREATE TABLE tutorial_case_specs (
   collected_at       TIMESTAMPTZ NOT NULL,
   frozen_prompt      TEXT NOT NULL CHECK (char_length(frozen_prompt) BETWEEN 20 AND 20000),
   frozen_materials   JSONB NOT NULL,
+  frozen_materials_sha256 TEXT NOT NULL CHECK (frozen_materials_sha256 ~ '^[a-f0-9]{64}$'),
   auth_scope         TEXT NOT NULL CHECK (auth_scope IN ('synthetic_eval')),
   rubric             JSONB NOT NULL,
   created_by         BIGINT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,

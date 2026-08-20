@@ -2,7 +2,9 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import {
   TutorialEvalError,
+  DEFAULT_EVAL_LEASE_MS,
   evaluateTutorialRubric,
+  hashTutorialMaterials,
   validateCaseSpecPayload,
 } from '../tutorials/tutorialEval.js'
 
@@ -36,4 +38,9 @@ test('case spec requires source URL, collection time, frozen materials and machi
   )
   assert.equal(evaluateTutorialRubric(good.rubric, '结果 R2=0.90').passed, true)
   assert.equal(evaluateTutorialRubric(good.rubric, '结果不达标').passed, false)
+  assert.equal(DEFAULT_EVAL_LEASE_MS, 45 * 60 * 1000)
+  assert.equal(
+    hashTutorialMaterials({ items: [{ b: 2, a: 1 }] }),
+    hashTutorialMaterials({ items: [{ a: 1, b: 2 }] }),
+  )
 })

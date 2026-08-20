@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { query, tx, type QueryRunner } from '../db/queries.js'
 
 export const TUTORIAL_COMPASS_GROK_MODEL = 'cursor-grok-4.6-high'
@@ -13,7 +14,9 @@ export const EVAL_JOB_STATUSES = [
 ] as const
 export type EvalJobStatus = (typeof EVAL_JOB_STATUSES)[number]
 
-export const DEFAULT_EVAL_LEASE_MS = 15 * 60 * 1000
+// Agent runner hard timeout is 31 minutes. The lease must stay strictly above
+// it so another worker cannot reclaim and duplicate the same paid turn.
+export const DEFAULT_EVAL_LEASE_MS = 45 * 60 * 1000
 
 export class TutorialEvalError extends Error {
   constructor(
@@ -44,6 +47,23 @@ function iso(value: Date | string | null): string | null {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+export function canonicalTutorialMaterials(value: unknown): string {
+  const normalize = (entry: unknown): unknown => {
+    if (Array.isArray(entry)) return entry.map(normalize)
+    if (!entry || typeof entry !== 'object') return entry
+    return Object.fromEntries(
+      Object.entries(entry as Record<string, unknown>)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, child]) => [key, normalize(child)]),
+    )
+  }
+  return JSON.stringify(normalize(value))
+}
+
+export function hashTutorialMaterials(value: unknown): string {
+  return createHash('sha256').update(canonicalTutorialMaterials(value)).digest('hex')
 }
 
 export function validateCaseSpecPayload(draft: CaseSpecDraft): void {
@@ -125,8 +145,8 @@ export async function insertCaseSpec(
     const result = await query<{ id: string; public_id: string }>(
       `INSERT INTO tutorial_case_specs
          (public_id, title, source_url, source_platform, collected_at, frozen_prompt,
-          frozen_materials, auth_scope, rubric, created_by)
-       VALUES ($1, $2, $3, $4, $5::timestamptz, $6, $7::jsonb, $8, $9::jsonb, $10::bigint)
+          frozen_materials, frozen_materials_sha256, auth_scope, rubric, created_by)
+       VALUES ($1, $2, $3, $4, $5::timestamptz, $6, $7::jsonb, $8, $9, $10::jsonb, $11::bigint)
        RETURNING id::text AS id, public_id`,
       [
         draft.publicId,
@@ -136,6 +156,7 @@ export async function insertCaseSpec(
         draft.collectedAt,
         draft.frozenPrompt,
         JSON.stringify(draft.frozenMaterials),
+        hashTutorialMaterials(draft.frozenMaterials),
         draft.authScope,
         JSON.stringify(draft.rubric),
         createdBy,
@@ -161,12 +182,14 @@ export async function listCaseSpecs(): Promise<Array<Record<string, unknown>>> {
     collected_at: Date | string
     frozen_prompt: string
     frozen_materials: unknown
+    frozen_materials_sha256: string
     auth_scope: string
     rubric: unknown
     created_at: Date | string
   }>(
     `SELECT id::text AS id, public_id, title, source_url, source_platform, collected_at,
-            frozen_prompt, frozen_materials, auth_scope, rubric, created_at
+            frozen_prompt, frozen_materials, frozen_materials_sha256,
+            auth_scope, rubric, created_at
        FROM tutorial_case_specs
       ORDER BY created_at DESC, id DESC`,
   )
@@ -179,6 +202,7 @@ export async function listCaseSpecs(): Promise<Array<Record<string, unknown>>> {
     collectedAt: iso(row.collected_at),
     frozenPrompt: row.frozen_prompt,
     frozenMaterials: row.frozen_materials,
+    frozenMaterialsSha256: row.frozen_materials_sha256,
     authScope: row.auth_scope,
     rubric: row.rubric,
     createdAt: iso(row.created_at),
@@ -231,6 +255,7 @@ export type ClaimedEvalJob = {
     collectedAt: string
     frozenPrompt: string
     frozenMaterials: unknown
+    frozenMaterialsSha256: string
     rubric: unknown
     createdBy: string
   }
@@ -288,11 +313,12 @@ export async function claimEvalJob(args: {
       collected_at: Date | string
       frozen_prompt: string
       frozen_materials: unknown
+      frozen_materials_sha256: string
       rubric: unknown
       created_by: string
     }>(
       `SELECT public_id, title, source_url, source_platform, collected_at, frozen_prompt,
-              frozen_materials, rubric, created_by::text AS created_by
+              frozen_materials, frozen_materials_sha256, rubric, created_by::text AS created_by
          FROM tutorial_case_specs
         WHERE id = $1::bigint`,
       [row.spec_id],
@@ -329,6 +355,7 @@ export async function claimEvalJob(args: {
         collectedAt: iso(spec.collected_at)!,
         frozenPrompt: spec.frozen_prompt,
         frozenMaterials: spec.frozen_materials,
+        frozenMaterialsSha256: spec.frozen_materials_sha256,
         rubric: spec.rubric,
         createdBy: spec.created_by,
       },

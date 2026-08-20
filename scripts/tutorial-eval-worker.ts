@@ -6,11 +6,13 @@ import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import {
   buildCompassDelegatePrompt,
+  canonicalTutorialMaterials,
   claimCompassJob,
   claimEvalJob,
   evaluateTutorialRubric,
   finishCompassJob,
   finishEvalJob,
+  hashTutorialMaterials,
   recoverExpiredEvalLeases,
   stageEvalPublication,
 } from '../packages/commercial/src/tutorials/tutorialEval.ts'
@@ -83,6 +85,17 @@ async function ensurePublicationApproved(id: string, reviewerUserId: string): Pr
 
 function runAgentTurn(job: NonNullable<Awaited<ReturnType<typeof claimEvalJob>>>) {
   const runner = fileURLToPath(new URL('./tutorial-eval-agent-turn.mjs', import.meta.url))
+  const materialsJson = canonicalTutorialMaterials(job.spec.frozenMaterials)
+  if (hashTutorialMaterials(job.spec.frozenMaterials) !== job.spec.frozenMaterialsSha256) {
+    throw new Error('frozen materials hash mismatch')
+  }
+  const executionPrompt = [
+    job.spec.frozenPrompt,
+    '',
+    `冻结材料 SHA-256：${job.spec.frozenMaterialsSha256}`,
+    '冻结材料（必须作为本轮唯一授权材料清单）：',
+    materialsJson,
+  ].join('\n')
   const result = spawnSync(
     process.execPath,
     ['--experimental-websocket', runner],
@@ -90,7 +103,7 @@ function runAgentTurn(job: NonNullable<Awaited<ReturnType<typeof claimEvalJob>>>
       input: JSON.stringify({
         uid: Number(job.evalUserId),
         caseId: job.spec.publicId,
-        prompt: job.spec.frozenPrompt,
+        prompt: executionPrompt,
         model: arg('model') ?? 'glm-5.3-zai',
         agentId: arg('agent') ?? 'main',
         baseUrl: arg('base-url') ?? 'http://127.0.0.1:18790',
