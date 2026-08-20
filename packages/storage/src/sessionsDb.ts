@@ -2130,10 +2130,6 @@ export type MarkClientSessionReadResult =
   | { ok: true; updated: number }
   | { ok: false; error: 'not_found' }
 
-export type MigrateClientSessionsUnreadResult =
-  | { ok: true; updated: number }
-  | { ok: false; error: 'invalid_ids' | 'ids_limit' }
-
 export type SearchClientSessionsOpts = {
   q: string
   limit?: number
@@ -6464,24 +6460,6 @@ async function _sqliteMarkAllClientSessionsRead(userId: string): Promise<{ updat
   return { updated: res.changes }
 }
 
-async function _sqliteMigrateClientSessionsUnread(
-  userId: string,
-  ids: unknown,
-): Promise<MigrateClientSessionsUnreadResult> {
-  if (!Array.isArray(ids)) return { ok: false, error: 'invalid_ids' }
-  if (ids.length > SESSION_BATCH_IDS_MAX) return { ok: false, error: 'ids_limit' }
-  const sessionIds = ids.filter((id): id is string => typeof id === 'string' && id.length > 0)
-  if (sessionIds.length !== ids.length) return { ok: false, error: 'invalid_ids' }
-  if (sessionIds.length === 0) return { ok: true, updated: 0 }
-  const db = await getSessionsDb()
-  const res = db.prepare(
-    `UPDATE client_sessions SET last_read_at = 0
-      WHERE user_id = ? AND deleted_at IS NULL
-        AND id IN (${sessionIds.map(() => '?').join(',')})`,
-  ).run(userId, ...sessionIds)
-  return { ok: true, updated: res.changes }
-}
-
 function _sqliteDeleteClientSessionSync(
   db: Database.Database,
   id: string,
@@ -6755,7 +6733,6 @@ const sqliteBackend = {
   batchClientSessions: _sqliteBatchClientSessions,
   markClientSessionRead: _sqliteMarkClientSessionRead,
   markAllClientSessionsRead: _sqliteMarkAllClientSessionsRead,
-  migrateClientSessionsUnread: _sqliteMigrateClientSessionsUnread,
   getSessionProjectInstructions: _sqliteGetSessionProjectInstructions,
   listChatProjects: _sqliteListChatProjects,
   createChatProject: _sqliteCreateChatProject,
@@ -6919,9 +6896,6 @@ export const markClientSessionRead: ClientSessionsBackend['markClientSessionRead
 
 export const markAllClientSessionsRead: ClientSessionsBackend['markAllClientSessionsRead'] =
   (...args) => getActiveBackend().markAllClientSessionsRead(...args)
-
-export const migrateClientSessionsUnread: ClientSessionsBackend['migrateClientSessionsUnread'] =
-  (...args) => getActiveBackend().migrateClientSessionsUnread(...args)
 
 export const getSessionProjectInstructions: ClientSessionsBackend['getSessionProjectInstructions'] =
   (...args) => getActiveBackend().getSessionProjectInstructions(...args)

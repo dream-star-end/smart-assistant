@@ -35,15 +35,13 @@ describe("0240 client_sessions.last_read_at", () => {
     assert.match(sqliteSrc, /last_read_at INTEGER DEFAULT NULL/);
   });
 
-  test("两条 backend 覆盖 markRead / readAll / migrate,list SQL 派生 unread", () => {
-    for (const method of [
-      "markClientSessionRead",
-      "markAllClientSessionsRead",
-      "migrateClientSessionsUnread",
-    ]) {
+  test("两条 backend 覆盖 markRead / readAll,list SQL 派生 unread;无 unread-migrate", () => {
+    for (const method of ["markClientSessionRead", "markAllClientSessionsRead"]) {
       assert.ok(backendSrc.includes(`async ${method}(`), `PG 缺 ${method}`);
       assert.ok(sqliteSrc.includes(`${method}:`), `sqliteBackend 缺 ${method}`);
     }
+    assert.doesNotMatch(backendSrc, /migrateClientSessionsUnread/);
+    assert.doesNotMatch(sqliteSrc, /migrateClientSessionsUnread/);
     const pgList = backendSrc.slice(
       backendSrc.indexOf("async listClientSessions"),
       backendSrc.indexOf("async listClientSessions") + 5500,

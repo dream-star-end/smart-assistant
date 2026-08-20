@@ -116,7 +116,6 @@ import {
   type BatchClientSessionsInput,
   type BatchClientSessionsResult,
   type MarkClientSessionReadResult,
-  type MigrateClientSessionsUnreadResult,
   type ClientSessionMeta,
   type ClientSessionMetaPatch,
   type ListClientSessionsOpts,
@@ -10494,23 +10493,6 @@ export function createPgSessionsBackend(
         [userId],
       );
       return { updated: res.rowCount ?? 0 };
-    },
-
-    async migrateClientSessionsUnread(
-      userId: string,
-      ids: unknown,
-    ): Promise<MigrateClientSessionsUnreadResult> {
-      if (!Array.isArray(ids)) return { ok: false, error: "invalid_ids" };
-      if (ids.length > SESSION_BATCH_IDS_MAX) return { ok: false, error: "ids_limit" };
-      const sessionIds = ids.filter((id): id is string => typeof id === "string" && id.length > 0);
-      if (sessionIds.length !== ids.length) return { ok: false, error: "invalid_ids" };
-      if (sessionIds.length === 0) return { ok: true, updated: 0 };
-      const res = await pool.query(
-        `UPDATE client_sessions SET last_read_at = 0
-          WHERE user_id = $1 AND deleted_at IS NULL AND id = ANY($2::text[])`,
-        [userId, sessionIds],
-      );
-      return { ok: true, updated: res.rowCount ?? 0 };
     },
 
     async listChatProjects(userId: string): Promise<ChatProject[]> {

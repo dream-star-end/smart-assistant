@@ -1,5 +1,5 @@
 /**
- * 0240 last_read_at:list 派生 unread、POST read / read-all / unread-migrate、存量回填、跨 user 隔离。
+ * 0240/0241 last_read_at:list 派生 unread、POST read / read-all、存量回填、跨 user 隔离。
  *
  * Run: REQUIRE_TEST_DB=1 bash scripts/test-mutex.sh commercial \
  *   'npx tsx --test --test-force-exit packages/commercial/src/__tests__/sessionUnread.integ.test.ts'
@@ -184,7 +184,7 @@ describe("0240 client_sessions.last_read_at unread", () => {
     assert.equal((await backend.listClientSessions(USER_A)).sessions.find((s) => s.id === sidSec)?.unread, false);
   });
 
-  test("unread-migrate 把指定 id 变回未读;read-all 全清;search 带 unread", async (t) => {
+  test("search 带 unread;read-all 全清;跨 user 隔离", async (t) => {
     if (db.skipIfUnavailable(t)) return;
     const sid = "webunreada3";
     assert.equal(
@@ -197,11 +197,6 @@ describe("0240 client_sessions.last_read_at unread", () => {
       outcome: "interrupted",
       terminalAtMs: Date.now(),
     });
-    assert.equal((await backend.markClientSessionRead(USER_A, sid)).ok, true);
-    assert.equal((await backend.listClientSessions(USER_A)).sessions.find((s) => s.id === sid)?.unread, false);
-
-    const migrated = await backend.migrateClientSessionsUnread(USER_A, [sid]);
-    assert.equal(migrated.ok, true);
     assert.equal((await backend.listClientSessions(USER_A)).sessions.find((s) => s.id === sid)?.unread, true);
 
     const hits = await backend.searchClientSessions(USER_A, { q: "migrate-me" });
@@ -209,9 +204,8 @@ describe("0240 client_sessions.last_read_at unread", () => {
     assert.ok(hit);
     assert.equal(hit.unread, true);
 
-    const otherMigrate = await backend.migrateClientSessionsUnread(USER_B, [sid]);
-    assert.equal(otherMigrate.ok, true);
-    assert.equal(otherMigrate.updated, 0);
+    const stolen = await backend.markAllClientSessionsRead(USER_B);
+    assert.equal(stolen.updated, 0);
     assert.equal((await backend.listClientSessions(USER_A)).sessions.find((s) => s.id === sid)?.unread, true);
 
     const all = await backend.markAllClientSessionsRead(USER_A);

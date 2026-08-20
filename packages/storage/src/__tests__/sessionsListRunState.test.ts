@@ -21,7 +21,6 @@ const {
   listClientSessions,
   markAllClientSessionsRead,
   markClientSessionRead,
-  migrateClientSessionsUnread,
   recordTurnDispatchRunning,
   searchClientSessions,
   upsertClientSession,
@@ -185,7 +184,7 @@ describe('listClientSessions runState/lastOutcome', () => {
     assert.equal(meta?.unread, false)
   })
 
-  it('search 命中带 unread;migrate 把指定 id 变回未读;read-all 全清', async () => {
+  it('search 命中带 unread;read-all 全清', async () => {
     await upsertClientSession({ ...session('web-hit'), title: 'alpha unread', lastAt: Date.now() })
     await admit('web-hit', 'cm-h', 'd-h')
     await casTurnDispatchState({
@@ -196,12 +195,6 @@ describe('listClientSessions runState/lastOutcome', () => {
       toState: 'terminal',
       outcome: 'interrupted',
     })
-    const marked = await markClientSessionRead(USER, 'web-hit')
-    assert.equal(marked.ok, true)
-    assert.equal((await listClientSessions(USER)).sessions.find((s) => s.id === 'web-hit')?.unread, false)
-
-    const migrated = await migrateClientSessionsUnread(USER, ['web-hit'])
-    assert.equal(migrated.ok, true)
     assert.equal((await listClientSessions(USER)).sessions.find((s) => s.id === 'web-hit')?.unread, true)
 
     const hits = await searchClientSessions(USER, { q: 'alpha' })
