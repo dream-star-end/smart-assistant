@@ -10533,6 +10533,16 @@ export function createPgSessionsBackend(
           parsed.value.containerPath,
         );
         if (dup) return { ok: true, asset: dup };
+        // 同一 (user_id, project_id) 桶的 count+INSERT 必须串行:默认 READ COMMITTED
+        // 下无行锁,并发事务都会读到 count<500 再各自写入 → 上限被突破。
+        // pg_advisory_xact_lock 随 COMMIT/ROLLBACK 自动释放;不用会话级
+        // pg_advisory_lock(连接归还池后锁会泄漏)。
+        // NULL project_id(未分组)用 coalesce($2,'') 编码:真实 chat_projects.id 是 UUID
+        // (解析还拒绝 <8 字符),空串不会与真实 id 撞,故不会误锁其它项目。
+        await client.query(
+          "SELECT pg_advisory_xact_lock(hashtext($1 || ':' || coalesce($2, '')))",
+          [`oc_proj_asset:${userId}`, projectId],
+        );
         if ((await pgCountProjectAssets(client, userId, projectId)) >= PROJECT_ASSET_PER_PROJECT_LIMIT) {
           return { ok: false, error: "limit_exceeded" };
         }
@@ -10606,6 +10616,12 @@ export function createPgSessionsBackend(
             return { ok: false, error: "project_not_found" };
           }
           if (nextProjectId.value !== existing.projectId) {
+            // 跨项目移动走同一份 500 上限;锁目标桶,键编码与 createProjectAsset 相同
+            // (含 NULL 未分组 → coalesce 空串,不与 UUID 撞)。xact lock,随事务释放。
+            await client.query(
+              "SELECT pg_advisory_xact_lock(hashtext($1 || ':' || coalesce($2, '')))",
+              [`oc_proj_asset:${userId}`, nextProjectId.value],
+            );
             if ((await pgCountProjectAssets(client, userId, nextProjectId.value)) >= PROJECT_ASSET_PER_PROJECT_LIMIT) {
               return { ok: false, error: "limit_exceeded" };
             }

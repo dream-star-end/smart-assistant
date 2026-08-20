@@ -49,4 +49,27 @@ describe('project_assets PG/SQLite 契约对齐', () => {
     assert.match(sqliteSrc, /绝不(写\/)?删磁盘文件|软删只标 deleted_at,绝不 unlink/)
     assert.match(backendSrc, /绝不(写\/)?删磁盘文件|软删只标 deleted_at,绝不 unlink/)
   })
+
+  test('create/update 在计数前取事务级 advisory lock,防 READ COMMITTED 突破 500 上限', () => {
+    const createSrc = extractMethod(backendSrc, 'createProjectAsset', 'updateProjectAsset')
+    const updateSrc = extractMethod(backendSrc, 'updateProjectAsset', 'deleteProjectAsset')
+    for (const [name, src] of [
+      ['createProjectAsset', createSrc],
+      ['updateProjectAsset', updateSrc],
+    ] as const) {
+      const lockAt = src.indexOf('pg_advisory_xact_lock')
+      const countAt = src.indexOf('pgCountProjectAssets')
+      assert.ok(lockAt >= 0, `${name} 缺 pg_advisory_xact_lock`)
+      assert.ok(countAt >= 0, `${name} 缺 pgCountProjectAssets`)
+      assert.ok(lockAt < countAt, `${name} 必须在计数之前取 xact lock`)
+    }
+  })
 })
+
+function extractMethod(src: string, name: string, nextName: string): string {
+  const start = src.indexOf(`async ${name}(`)
+  const end = src.indexOf(`async ${nextName}(`, start + 1)
+  assert.ok(start >= 0, `missing ${name}`)
+  assert.ok(end > start, `missing successor ${nextName}`)
+  return src.slice(start, end)
+}
