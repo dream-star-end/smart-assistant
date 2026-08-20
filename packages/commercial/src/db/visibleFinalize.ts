@@ -182,6 +182,7 @@ export function assertSettlementMatchesCanonical(input: {
 
 export type TapeDisplayDegradeReason =
   | "records_unpublished"
+  | "records_failed"
   | "finalized_tape_missing"
   | "tape_hash_mismatch"
   | "record_missing"

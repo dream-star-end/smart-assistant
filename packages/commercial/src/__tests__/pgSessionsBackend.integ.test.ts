@@ -8715,6 +8715,86 @@ describe("rev2 visible finalize decoupling", () => {
     assert.equal(assistant?.text, "phase a only");
   });
 
+  maybe("Phase B exact-record publication advances timeline identity exactly once", async () => {
+    const sessionId = "s-rev3-phase-b-identity";
+    const userId = "c:1";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const tape = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 12,
+      status: "completed",
+      turnKey: "1".repeat(64),
+      text: "phase b exact answer",
+      createdAt: 1_700_000_500_000,
+      tools: [{
+        blockId: "phase-b-tool",
+        toolName: "Bash",
+        inputJson: { command: "printf exact" },
+        output: "exact",
+        completed: true,
+      }],
+    });
+    for (const part of tape.parts) {
+      await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+    }
+    const visible = await backend.finalizeLosslessTurnTape(userId, {
+      ...tape.finalize,
+      settlement: {
+        billingAnchorId: `srv-${sessionId}-main-t12`,
+        engineBillings: [],
+        text: "phase b exact answer",
+        ts: 1_700_000_500_000,
+      },
+    }, { materialize: false });
+    assert.equal(visible.applied, "finalized");
+    const before = (
+      await pool.query<{ history_revision: string; timeline_generation: string }>(
+        `SELECT history_revision::text,timeline_generation::text
+           FROM client_sessions WHERE id=$1 AND user_id=$2`,
+        [sessionId, userId],
+      )
+    ).rows[0]!;
+    const fallback = await backend.getClientSession(sessionId, userId, { view: "timeline" });
+    assert.equal(
+      (fallback!.messages as MessageLike[]).find((message) => message.role === "assistant")
+        ?._displayDegradeReason,
+      "records_unpublished",
+    );
+
+    const materialized = await backend.finalizeLosslessTurnTape(userId, tape.finalize);
+    assert.equal(materialized.applied, "finalized");
+    assert.ok(materialized.recordCount > 1);
+    const after = (
+      await pool.query<{ history_revision: string; timeline_generation: string }>(
+        `SELECT history_revision::text,timeline_generation::text
+           FROM client_sessions WHERE id=$1 AND user_id=$2`,
+        [sessionId, userId],
+      )
+    ).rows[0]!;
+    assert.equal(BigInt(after.history_revision), BigInt(before.history_revision) + 1n);
+    assert.equal(BigInt(after.timeline_generation), BigInt(before.timeline_generation) + 1n);
+    const exact = await backend.getClientSession(sessionId, userId, { view: "timeline" });
+    assert.ok((exact!.messages as MessageLike[]).some((message) => message.role === "tool"));
+    assert.equal(
+      (exact!.messages as MessageLike[]).some(
+        (message) => message._displayDegradeReason === "records_unpublished",
+      ),
+      false,
+    );
+
+    const replay = await backend.finalizeLosslessTurnTape(userId, tape.finalize);
+    assert.equal(replay.applied, "idempotent");
+    const afterReplay = (
+      await pool.query<{ history_revision: string; timeline_generation: string }>(
+        `SELECT history_revision::text,timeline_generation::text
+           FROM client_sessions WHERE id=$1 AND user_id=$2`,
+        [sessionId, userId],
+      )
+    ).rows[0]!;
+    assert.deepEqual(afterReplay, after);
+  });
+
   maybe("duplicate Phase A does not hot-reactivate a failed materialization job", async () => {
     const sessionId = "s-rev3-failed-job-cold";
     const userId = "c:1";

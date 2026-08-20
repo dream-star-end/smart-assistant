@@ -197,7 +197,7 @@ test("unpublished failed tape GET 200 returns visible_head full text", async () 
   assert.equal(assistant.length, 1);
   assert.equal(assistant[0]?.text, FULL_TEXT);
   assert.equal(assistant[0]?._displayDegraded, true);
-  assert.equal(assistant[0]?._displayDegradeReason, "records_unpublished");
+  assert.equal(assistant[0]?._displayDegradeReason, "records_failed");
   assert.equal(got!.messages.some((m) => m.text === FIRST_SENTENCE && m.role === "assistant"), false);
 });
 

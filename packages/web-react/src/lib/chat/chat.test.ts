@@ -54,6 +54,7 @@ import {
   EMPTY_JOURNAL_POLL_DELAYS_MS,
   LIVE_JOURNAL_MAX_PAGES,
   RESTORE_RECONCILE_MAX_ATTEMPTS,
+  UNPUBLISHED_TAPE_RETRY_MAX_MS,
   automaticTurnRecoveryTarget,
   exactUserReplayPayload,
   interruptedContinuationIdentity,
@@ -3851,6 +3852,205 @@ function makeSocket(overrides: Partial<ChatSocketDeps> = {}) {
     ...overrides,
   });
 }
+
+function unpublishedTimeline(sessionId: string): ChatMessage[] {
+  const clientMessageId = `u-${sessionId}`;
+  return [
+    {
+      id: clientMessageId,
+      role: "user",
+      text: "question",
+      ts: 1,
+      status: "sent",
+      _source: "server",
+      _seq: 1,
+      _orderSeq: 1,
+      _timelineRecord: true,
+      _timelineUnitKey: `outer:${sessionId}:1`,
+    },
+    {
+      id: `answer-${sessionId}`,
+      role: "assistant",
+      text: "final answer",
+      ts: 5,
+      _source: "server",
+      _seq: 2,
+      _orderSeq: 2,
+      _clientMessageId: clientMessageId,
+      _turnTapeId: `tape-${sessionId}`,
+      _turnTapeSha256: "a".repeat(64),
+      _turnTapeComplete: true,
+      _dispatchOutcome: "completed",
+      _timelineRecord: true,
+      _timelineUnitKey: `tape-fallback:tape-${sessionId}`,
+      _displayDegraded: true,
+      _displayDegradeReason: "records_unpublished",
+    },
+  ] as ChatMessage[];
+}
+
+function exactTimeline(sessionId: string): ChatMessage[] {
+  const clientMessageId = `u-${sessionId}`;
+  const common = {
+    _source: "server" as const,
+    _seq: 2,
+    _orderSeq: 2,
+    _clientMessageId: clientMessageId,
+    _turnTapeId: `tape-${sessionId}`,
+    _turnTapeSha256: "a".repeat(64),
+    _turnTapeComplete: true,
+    _dispatchOutcome: "completed",
+    _timelineRecord: true,
+  };
+  return [
+    unpublishedTimeline(sessionId)[0]!,
+    { id: `thinking-${sessionId}`, role: "thinking", text: "reasoning", ts: 2,
+      ...common, _turnTapeOrdinal: 1, _timelineUnitKey: `tape:${sessionId}:1` },
+    { id: `tool-${sessionId}`, role: "tool", text: "", toolName: "Bash", output: "ok", ts: 3,
+      ...common, _turnTapeOrdinal: 2, _timelineUnitKey: `tape:${sessionId}:2` },
+    { id: `plan-${sessionId}`, role: "plan", text: "plan", ts: 4,
+      ...common, _turnTapeOrdinal: 3, _timelineUnitKey: `tape:${sessionId}:3` },
+    { id: `answer-${sessionId}`, role: "assistant", text: "final answer", ts: 5,
+      ...common, _turnTapeOrdinal: 4, _timelineUnitKey: `tape:${sessionId}:4` },
+  ] as ChatMessage[];
+}
+
+describe("Phase-A final-only tape projection retry", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  test("materialization taking more than two minutes still converges to every exact semantic row", async () => {
+    vi.useFakeTimers();
+    const sessionId = "s-unpublished-long";
+    const startedAt = Date.now();
+    let sock!: ChatSocket;
+    const syncSession = vi.fn<NonNullable<ChatSocketDeps["syncSession"]>>(async (_id, context) => {
+      expect(context?.tapeProjectionOnly).toBe(true);
+      if (Date.now() - startedAt < 3 * 60_000) return false;
+      if (!context?.isCurrent?.()) return false;
+      sock.applyServerMessages(sessionId, "main", exactTimeline(sessionId), true, 2, {
+        serverUpdatedAt: 3,
+        historyRevision: 2,
+        timelineGeneration: 3,
+      });
+      return true;
+    });
+    sock = makeSocket({ syncSession });
+    sock.ensureSession(sessionId, "main");
+    sock.applyServerMessages(sessionId, "main", unpublishedTimeline(sessionId), true, 2, {
+      serverUpdatedAt: 2,
+      historyRevision: 1,
+      timelineGeneration: 2,
+    });
+
+    await vi.advanceTimersByTimeAsync(3 * 60_000 + 2_000);
+    expect(syncSession.mock.calls.length).toBeGreaterThan(5);
+    expect(sock.sessions.get(sessionId)?.messages.map((message) => message.role)).toEqual([
+      "user", "thinking", "tool", "plan", "assistant",
+    ]);
+    await vi.advanceTimersByTimeAsync(60_000);
+    const completedCalls = syncSession.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(syncSession).toHaveBeenCalledTimes(completedCalls);
+    sock.stop();
+  });
+
+  test("repeated fallback applies share one timer and one in-flight sync", async () => {
+    vi.useFakeTimers();
+    const sessionId = "s-unpublished-singleflight";
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    const syncSession = vi.fn(async () => pending);
+    const sock = makeSocket({ syncSession });
+    sock.ensureSession(sessionId, "main");
+    const apply = () => sock.applyServerMessages(
+      sessionId,
+      "main",
+      unpublishedTimeline(sessionId),
+      true,
+      2,
+      { serverUpdatedAt: 2, historyRevision: 1, timelineGeneration: 2 },
+    );
+    apply();
+    apply();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(syncSession).toHaveBeenCalledTimes(1);
+    apply();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(syncSession).toHaveBeenCalledTimes(1);
+    release();
+    await Promise.resolve();
+    await Promise.resolve();
+    sock.stop();
+  });
+
+  test.each(["stop", "remove", "reset"] as const)(
+    "%s invalidates a deferred projection read before it can revive content",
+    async (action) => {
+      vi.useFakeTimers();
+      const sessionId = `s-unpublished-${action}`;
+      let release!: () => void;
+      const pending = new Promise<void>((resolve) => { release = resolve; });
+      let sock!: ChatSocket;
+      const syncSession = vi.fn<NonNullable<ChatSocketDeps["syncSession"]>>(async (_id, context) => {
+        await pending;
+        if (context?.isCurrent?.()) {
+          sock.applyServerMessages(sessionId, "main", exactTimeline(sessionId), true, 2, {
+            serverUpdatedAt: 3,
+            historyRevision: 2,
+            timelineGeneration: 3,
+          });
+        }
+      });
+      sock = makeSocket({ syncSession });
+      sock.ensureSession(sessionId, "main");
+      sock.applyServerMessages(sessionId, "main", unpublishedTimeline(sessionId), true, 2, {
+        serverUpdatedAt: 2,
+        historyRevision: 1,
+        timelineGeneration: 2,
+      });
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(syncSession).toHaveBeenCalledTimes(1);
+      if (action === "stop") sock.stop();
+      else if (action === "remove") sock.removeSession(sessionId);
+      else sock.resetSessions();
+      release();
+      await Promise.resolve();
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(UNPUBLISHED_TAPE_RETRY_MAX_MS);
+      expect(syncSession).toHaveBeenCalledTimes(1);
+      const current = sock.sessions.get(sessionId);
+      if (action === "stop") {
+        expect(current?.messages.some((message) => message.role === "thinking")).toBe(false);
+      } else {
+        expect(current).toBeUndefined();
+      }
+      sock.stop();
+    },
+  );
+
+  test("permanent materialization failure never starts unpublished polling", async () => {
+    vi.useFakeTimers();
+    const sessionId = "s-materialization-failed";
+    const syncSession = vi.fn();
+    const sock = makeSocket({ syncSession });
+    sock.ensureSession(sessionId, "main");
+    const failed = unpublishedTimeline(sessionId).map((message) =>
+      message.role === "assistant"
+        ? { ...message, _displayDegradeReason: "records_failed" }
+        : message,
+    );
+    sock.applyServerMessages(sessionId, "main", failed, true, 2, {
+      serverUpdatedAt: 2,
+      historyRevision: 1,
+      timelineGeneration: 2,
+    });
+    await vi.advanceTimersByTimeAsync(UNPUBLISHED_TAPE_RETRY_MAX_MS);
+    expect(syncSession).not.toHaveBeenCalled();
+    sock.stop();
+  });
+});
 
 describe("ChatSocket interrupted continuation", () => {
   afterEach(() => {
