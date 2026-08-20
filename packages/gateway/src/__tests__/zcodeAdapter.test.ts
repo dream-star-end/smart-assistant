@@ -12,7 +12,7 @@ import { describe, test } from 'node:test'
 
 import { ZCODE_HOSTED_PERMISSION_MODE } from '@openclaude/protocol'
 import type { OpenClaudeConfig } from '@openclaude/storage'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { ZcodeAdapter, _internals } from '../engine/zcodeAdapter.js'
 import type { EngineEvent, EngineExternalBillingEvent } from '../engine/engineEvents.js'
 import type { EngineCreateOpts } from '../engine/registry.js'
@@ -158,6 +158,100 @@ process.stdout.write(${JSON.stringify(`${JSON.stringify(successFixture)}\n`)})
       restoreEnv('OPENCLAUDE_V3_CONTAINER_TOKEN', previousToken)
       restoreEnv('ZCODE_API_KEY', previousKey)
       restoreEnv('ZAI_CODING_PLAN_KEY', previousZai)
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('projects ZCode hook tools, wires real MCP config, and removes per-turn credentials', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-zcode-platform-adapter-'))
+    const fake = path.join(dir, 'fake-zcode.cjs')
+    const capture = path.join(dir, 'capture.json')
+    const hookCollector = path.resolve(
+      process.cwd(),
+      'packages/commercial/agent-sandbox/platform-runtime/bin/oc-zcode-hook',
+    )
+    await writeFile(path.join(dir, 'persona.md'), 'persona-line')
+    await writeFile(fake, `#!/usr/bin/env node
+const fs = require('node:fs')
+const path = require('node:path')
+const { spawnSync } = require('node:child_process')
+const configPath = process.env.OC_ZCODE_PLATFORM_CONFIG_FILE
+const config = JSON.parse(fs.readFileSync(configPath, 'utf8'))
+const hook = config.hooks.events.PreToolUse[0].hooks[0]
+const common = {
+  sessionId: 'sess_live_fixture_001',
+  toolCallId: 'call_hook_1',
+  toolName: 'Bash',
+  toolInput: { command: 'printf ok', description: 'probe' },
+  timestamp: new Date().toISOString(),
+}
+for (const event of [
+  { ...common, hookEventName: 'PreToolUse' },
+  { ...common, hookEventName: 'PostToolUse', toolResponse: { stdout: 'ok', exitCode: 0 }, toolResultPreview: 'ok' },
+  { ...common, hookEventName: 'PreToolUse', sessionId: 'sess_child', toolCallId: 'call_child', toolName: 'Read' },
+]) {
+  const result = spawnSync(hook.command, hook.args, { input: JSON.stringify(event), encoding: 'utf8' })
+  if (result.status !== 0 || result.stdout.trim() !== '{}') process.exit(9)
+}
+fs.writeFileSync(${JSON.stringify(capture)}, JSON.stringify({
+  contextDir: path.dirname(configPath),
+  configHasBearer: fs.readFileSync(configPath, 'utf8').includes('adapter-secret-bearer'),
+  hasMcp: Boolean(config.mcp?.servers?.openclaude_memory),
+  tokenFile: config.mcp?.servers?.openclaude_memory?.env?.OPENCLAUDE_GATEWAY_TOKEN_FILE,
+}))
+process.stdout.write(${JSON.stringify(`${JSON.stringify(successFixture)}\n`)})
+`)
+    await chmod(fake, 0o755)
+    const previousBin = process.env.OC_ZCODE_CLI_BIN
+    const previousHook = process.env.OC_ZCODE_HOOK_COLLECTOR_BIN
+    const previousAllow = process.env.OC_ZCODE_TEST_ALLOW_UNTRUSTED_HOOK
+    const previousNode = process.env.OC_ZCODE_TEST_NODE_BIN
+    process.env.OC_ZCODE_CLI_BIN = fake
+    process.env.OC_ZCODE_HOOK_COLLECTOR_BIN = hookCollector
+    process.env.OC_ZCODE_TEST_ALLOW_UNTRUSTED_HOOK = '1'
+    process.env.OC_ZCODE_TEST_NODE_BIN = process.execPath
+    try {
+      const opts = createOpts(dir)
+      opts.config.gateway.accessToken = 'adapter-secret-bearer'
+      opts.config.gateway.port = 18789
+      const adapter = new ZcodeAdapter(opts)
+      adapter.clearSessionId()
+      const events: EngineEvent[] = []
+      adapter.on('error', () => {})
+      const run = adapter.submitTurn({
+        input: 'use a tool',
+        requestId: REQUEST_ID,
+        onEvent: (event) => events.push(event),
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run.submitted
+      const summary = await run.summary
+      await adapter.waitForOutputDrain()
+      assert.ok(summary)
+      assert.equal(summary.tools.length, 1)
+      assert.equal(summary.tools[0]?.toolName, 'Bash')
+      assert.equal(summary.tools[0]?.completed, true)
+      assert.equal(summary.tools[0]?.output.includes('ok'), true)
+      assert.ok(events.some((event) => event.kind === 'tool_use_detected'))
+      assert.ok(events.some((event) => event.kind === 'tool_result_detected'))
+      assert.equal(events.filter((event) => event.kind === 'block' && event.block.kind === 'tool_use').length, 1)
+      assert.equal(events.filter((event) => event.kind === 'block' && event.block.kind === 'tool_result').length, 1)
+      const captured = JSON.parse(await readFile(capture, 'utf8')) as {
+        contextDir: string
+        configHasBearer: boolean
+        hasMcp: boolean
+        tokenFile: string
+      }
+      assert.equal(captured.configHasBearer, false)
+      assert.equal(captured.hasMcp, true)
+      assert.equal(existsSync(captured.contextDir), false)
+      assert.equal(existsSync(captured.tokenFile), false)
+    } finally {
+      restoreEnv('OC_ZCODE_CLI_BIN', previousBin)
+      restoreEnv('OC_ZCODE_HOOK_COLLECTOR_BIN', previousHook)
+      restoreEnv('OC_ZCODE_TEST_ALLOW_UNTRUSTED_HOOK', previousAllow)
+      restoreEnv('OC_ZCODE_TEST_NODE_BIN', previousNode)
       await rm(dir, { recursive: true, force: true })
     }
   })

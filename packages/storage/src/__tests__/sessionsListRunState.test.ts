@@ -21,7 +21,6 @@ const {
   listClientSessions,
   markAllClientSessionsRead,
   markClientSessionRead,
-  migrateClientSessionsUnread,
   recordTurnDispatchRunning,
   searchClientSessions,
   upsertClientSession,
@@ -185,7 +184,7 @@ describe('listClientSessions runState/lastOutcome', () => {
     assert.equal(meta?.unread, false)
   })
 
-  it('search 命中带 unread;migrate 把指定 id 变回未读;read-all 全清', async () => {
+  it('search 命中带 unread;read-all 全清', async () => {
     await upsertClientSession({ ...session('web-hit'), title: 'alpha unread', lastAt: Date.now() })
     await admit('web-hit', 'cm-h', 'd-h')
     await casTurnDispatchState({
@@ -196,12 +195,6 @@ describe('listClientSessions runState/lastOutcome', () => {
       toState: 'terminal',
       outcome: 'interrupted',
     })
-    const marked = await markClientSessionRead(USER, 'web-hit')
-    assert.equal(marked.ok, true)
-    assert.equal((await listClientSessions(USER)).sessions.find((s) => s.id === 'web-hit')?.unread, false)
-
-    const migrated = await migrateClientSessionsUnread(USER, ['web-hit'])
-    assert.equal(migrated.ok, true)
     assert.equal((await listClientSessions(USER)).sessions.find((s) => s.id === 'web-hit')?.unread, true)
 
     const hits = await searchClientSessions(USER, { q: 'alpha' })
@@ -212,5 +205,47 @@ describe('listClientSessions runState/lastOutcome', () => {
     const all = await markAllClientSessionsRead(USER)
     assert.ok(all.updated >= 1)
     assert.equal((await listClientSessions(USER)).sessions.find((s) => s.id === 'web-hit')?.unread, false)
+  })
+
+  it('last_at 早于终态的 0240 回填仍未读;抬水位后已读;秒级 last_read_at 换算后已读', async () => {
+    const db = await getSessionsDb()
+    const sid = 'web-gap'
+    await upsertClientSession(session(sid))
+    await admit(sid, 'cm-g', 'd-g')
+    await casTurnDispatchState({
+      userId: INBOX_UID,
+      sessionId: sid,
+      clientMessageId: 'cm-g',
+      fromStates: ['queued'],
+      toState: 'terminal',
+      outcome: 'completed',
+    })
+    const term = db.prepare(
+      'SELECT updated_at FROM turn_dispatch_inbox WHERE session_id = ?',
+    ).get(sid) as { updated_at: number }
+    db.prepare('UPDATE client_sessions SET last_at = ?, last_read_at = ? WHERE id = ?')
+      .run(term.updated_at - 7, term.updated_at - 7, sid)
+    assert.equal((await listClientSessions(USER)).sessions.find((s) => s.id === sid)?.unread, true)
+
+    db.exec(`
+      UPDATE client_sessions
+         SET last_read_at = MAX(
+               COALESCE(last_read_at, 0),
+               COALESCE((
+                 SELECT MAX(updated_at) FROM turn_dispatch_inbox
+                  WHERE session_id = client_sessions.id
+                    AND state IN ('terminal', 'rejected')
+               ), 0)
+             )
+    `)
+    assert.equal((await listClientSessions(USER)).sessions.find((s) => s.id === sid)?.unread, false)
+
+    const exactMs = 1_700_000_000_000
+    db.prepare('UPDATE turn_dispatch_inbox SET updated_at = ? WHERE session_id = ?').run(exactMs, sid)
+    db.prepare('UPDATE client_sessions SET last_read_at = ? WHERE id = ?').run(exactMs / 1000, sid)
+    assert.equal((await listClientSessions(USER)).sessions.find((s) => s.id === sid)?.unread, false)
+
+    db.prepare('UPDATE client_sessions SET last_read_at = 0 WHERE id = ?').run(sid)
+    assert.equal((await listClientSessions(USER)).sessions.find((s) => s.id === sid)?.unread, true)
   })
 })

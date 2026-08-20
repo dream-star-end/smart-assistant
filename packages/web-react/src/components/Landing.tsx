@@ -1,275 +1,328 @@
 import {
   ArrowRight,
+  BrainCircuit,
   Building2,
   Check,
-  Layers,
-  MessageSquareText,
-  Plus,
+  CircleCheckBig,
+  Clock3,
+  FileCheck2,
+  Globe2,
+  Layers3,
+  Network,
   Puzzle,
   ReceiptText,
-  Shield,
+  Route,
+  ShieldCheck,
   Sparkles,
   Users,
-  X,
+  Workflow,
   Zap,
-} from "lucide-react";
-import { useEffect, useState } from "react";
-import type { Theme } from "../hooks/useTheme";
-import { AGENTS } from "../lib/agents";
-import { AgentAvatar } from "./AgentAvatar";
-import { api } from "../lib/api";
-import { BRAND } from "../lib/brand";
-import { minSeatPriceYuan } from "../lib/orgBilling";
-import { cn } from "../lib/utils";
-import { DemoShowcase } from "./landing/DemoShowcase";
-import { Tutorials } from "./landing/Tutorials";
-import { ThemeToggle } from "./ThemeToggle";
-import { Button, buttonVariants } from "./ui";
+} from 'lucide-react'
+import { useEffect, useState } from 'react'
+import type { Theme } from '../hooks/useTheme'
+import { AGENTS } from '../lib/agents'
+import { api } from '../lib/api'
+import { BRAND } from '../lib/brand'
+import { minSeatPriceYuan } from '../lib/orgBilling'
+import { AgentAvatar } from './AgentAvatar'
+import { DemoShowcase } from './landing/DemoShowcase'
+import { ThemeToggle } from './ThemeToggle'
+import { Button, buttonVariants } from './ui'
 
-function Logo() {
+function BrandMark({ className = 'size-9' }: { className?: string }) {
   return (
-    <div className="flex items-center gap-2.5">
-      <span className="flex size-9 items-center justify-center rounded-xl bg-grad-cta text-white shadow-sm">
-        <Sparkles size={18} />
-      </span>
-      <span className="text-[19px] font-semibold tracking-tight">{BRAND.name}</span>
-    </div>
-  );
+    <span
+      aria-hidden
+      className={`${className} grid shrink-0 place-items-center rounded-[11px] bg-[#c7ff64] text-[19px] font-black leading-none text-[#0a0b09] shadow-[0_0_30px_rgba(199,255,100,0.16)]`}
+    >
+      从
+    </span>
+  )
 }
 
-/** 差异化对比：普通 AI 聊天给建议，Aurora 把活儿干完。左右两列逐行对照。 */
-const COMPARE = {
-  chat: {
-    title: "普通 AI 聊天",
-    rows: [
-      "给一段文字建议，活儿还得你自己干",
-      "大文件贴不进去，更别说跑分析、出图表",
-      "关掉窗口就忘了你是谁",
-      "能力固定，专业活儿只能凑合",
-    ],
-  },
-  aurora: {
-    title: "Aurora 全能助手",
-    rows: [
-      "自己拆任务、跑代码、查资料，把整件事干完",
-      "直接读 Excel / PDF / 图片，交回图表、PPT 和报告",
-      "记住你的身份、偏好与项目，下次自动接上",
-      "AI 市场按需加装专家智能体与技能，越用越强",
-    ],
-  },
-};
+function Logo({ compact = false }: { compact?: boolean }) {
+  return (
+    <div className="flex items-center gap-2.5" aria-label={BRAND.name}>
+      <BrandMark className={compact ? 'size-8' : 'size-9'} />
+      <span className="text-[19px] font-semibold tracking-[-0.04em] text-[#f5f4ed]">
+        {BRAND.name}
+      </span>
+    </div>
+  )
+}
 
-/** FAQ：把新用户最常见的犹豫点讲明白（信任信号 + 降低上手心理门槛）。 */
-const FAQS = [
+const WORKFLOW_STEPS = [
   {
-    q: "免费版怎么算？",
-    a: "注册即享每月 300 积分，够日常轻度使用；积分按实际消耗计费，不够用时可在应用内升级。",
+    n: '01',
+    icon: BrainCircuit,
+    title: '理解目标',
+    body: '读懂背景、材料、限制和你真正想要的结果。',
+  },
+  { n: '02', icon: Route, title: '拆解计划', body: '把复杂任务拆成可执行步骤，明确依赖与验收。' },
+  {
+    n: '03',
+    icon: Network,
+    title: '调度执行',
+    body: '调用合适的模型、智能体、工具与浏览器持续推进。',
   },
   {
-    q: "需要会写提示词吗？",
-    a: "不用。像跟同事说话一样描述需求就行，它会自己拆解、执行、交付；不知道说什么，照抄上手区的示例第一句即可。",
+    n: '04',
+    icon: FileCheck2,
+    title: '交付成果',
+    body: '返回能继续编辑、分享和使用的文件、代码与结论。',
   },
-  {
-    q: "我上传的文件安全吗？",
-    a: "文件只存放在你的专属工作空间、仅用于完成你交代的任务，可随时删除。",
-  },
-  {
-    q: "和普通 AI 聊天有什么区别？",
-    a: "普通聊天给你一段建议；它把活儿干完 —— 自己跑代码、查资料、做文件，最后交回能直接用的成果。",
-  },
-];
+] as const
 
-
-/** 企业/团队版卖点(§17.1)——四条,与「席位共享积分池 / 成员角色 / 报表发票 / 自助开通」对齐。 */
-const ENTERPRISE_SELLING = [
-  {
-    icon: Layers,
-    title: "席位共享积分池",
-    body: "按席位订阅，团队共享一个积分池；闲置席位的额度自动汇集，人人够用、不浪费。",
-  },
+const CAPABILITIES = [
   {
     icon: Users,
-    title: "成员与角色管理",
-    body: "邀请成员、分配管理员与财务角色，按人设月度用量限额，团队用量一处掌控。",
+    eyebrow: 'MULTI-AGENT',
+    title: '一个人发令，整支团队协作',
+    body: '研究、写作、设计、开发等专业智能体按需协同。你只对目标负责，从简负责组织过程。',
+    tags: ['自动拆分', '并行执行', '结果汇总'],
   },
   {
-    icon: ReceiptText,
-    title: "组织报表与发票",
-    body: "用量按成员 / 模型拆解成报表，发票抬头一次填好，按订单自助申请开票。",
+    icon: Workflow,
+    eyebrow: 'LONG-RUNNING',
+    title: '长任务不中断，回来继续推进',
+    body: '计划、进度、工具记录和阶段成果持续保存。任务不是一次性聊天，而是一条能恢复的工作流。',
+    tags: ['持续任务', '断点恢复', '过程透明'],
+  },
+  {
+    icon: FileCheck2,
+    eyebrow: 'REAL OUTPUTS',
+    title: '不止回答，直接交付成品',
+    body: '读 PDF、Excel、图片与网页，最终交回文档、表格、演示、图表、代码和可复用的项目资产。',
+    tags: ['真实文件', '可下载', '可继续修改'],
+  },
+] as const
+
+const SCENARIOS = [
+  {
+    icon: Globe2,
+    label: '调研与决策',
+    prompt: '调研这个行业过去 30 天的新变化，给我一份有来源、能汇报的结论。',
+    outputs: ['证据地图', '研究报告', '引用来源'],
+    accent: '#79d8ff',
+  },
+  {
+    icon: Layers3,
+    label: '数据与办公',
+    prompt: '分析这份经营表，找出异常、解释原因，并整理成 Excel 和汇报 PPT。',
+    outputs: ['清洗表格', '可视化图表', '演示文稿'],
+    accent: '#c7ff64',
   },
   {
     icon: Zap,
-    title: "自助开通即用",
-    body: "在线选档、按席位下单、扫码即开通，无需对接销售，几分钟拉起团队。",
+    label: '开发与交付',
+    prompt: '接入我的仓库，重构首页，跑完测试和构建，把可以验收的版本交给我。',
+    outputs: ['代码改动', '测试证据', '运行预览'],
+    accent: '#f6c66a',
   },
-] as const;
+] as const
 
-/**
- * 企业/团队版区块(§17.1)。锚点价经公开端点 GET /api/subscription/plans?scope=org 拉取,
- * 取最低每席价展示「¥N/席起」;拉不到 → 静态兜底文案(不硬编码全价)。右侧一个**虚构示意**
- * 的团队用量迷你条形(数据显式标注"示意",非真实用量)。CTA「创建组织」→ onCreateOrg(深链
- * /?panel=org 等价)。
- */
+const FAQS = [
+  {
+    q: '从简和普通 AI 聊天有什么不同？',
+    a: '普通聊天通常停在回答；从简会围绕目标建立计划、调用工具、持续执行，并交付可直接使用的成果。',
+  },
+  {
+    q: '需要学习提示词或配置模型吗？',
+    a: '不用。像给同事派活一样说清目标、材料和交付格式即可；从简会为任务选择合适的执行方式。',
+  },
+  {
+    q: '可以处理文件和长期项目吗？',
+    a: '可以。支持文档、表格、图片、代码与网页等材料，也会持续保存项目上下文、任务进度与产出物。',
+  },
+  {
+    q: '我的数据如何管理？',
+    a: '文件与任务资料进入你的专属工作空间，仅用于完成已授权的任务；你可以随时查看和删除。',
+  },
+] as const
+
+const ENTERPRISE_SELLING = [
+  { icon: Layers3, title: '共享积分池', body: '团队统一额度，闲置资源自动共享。' },
+  { icon: Users, title: '成员与角色', body: '按成员设置角色、权限和月度限额。' },
+  { icon: ReceiptText, title: '用量与发票', body: '按成员、模型查看报表并自助开票。' },
+  { icon: ShieldCheck, title: '组织级管理', body: '任务、资产和协作过程在组织内沉淀。' },
+] as const
+
 function EnterpriseSection({ onCreateOrg }: { onCreateOrg: () => void }) {
-  const [anchor, setAnchor] = useState<string | null>(null);
+  const [anchor, setAnchor] = useState<string | null>(null)
+
   useEffect(() => {
-    let alive = true;
+    let alive = true
     api
       .listOrgPlansPublic()
       .then((plans) => {
-        if (!alive) return;
-        const yuan = minSeatPriceYuan(plans);
-        if (yuan) setAnchor(`¥${yuan}/席起`);
+        if (!alive) return
+        const yuan = minSeatPriceYuan(plans)
+        if (yuan) setAnchor(`¥${yuan}/席起`)
       })
       .catch(() => {
-        /* 公开端点不可用:保持 null,下方静态兜底文案 */
-      });
+        // 公开档位不可用时使用下方静态锚点，不阻断营销首页。
+      })
     return () => {
-      alive = false;
-    };
-  }, []);
+      alive = false
+    }
+  }, [])
 
-  // 虚构示意数据(非真实用量;组织积分池 + 三名成员的用量占比,含"财务"角色与"近限额"两种态)。
-  const demoPoolUsedPct = 64;
-  const demoMembers = [
-    { name: "成员 A", credits: "6,400", pct: 64, delegate: true, note: null },
-    { name: "成员 B", credits: "4,100", pct: 41, delegate: false, note: null },
-    { name: "成员 C", credits: "2,300 / 2,500", pct: 92, delegate: false, note: "接近月度限额" },
-  ] as const;
+  const members = [
+    { name: '市场研究', role: '调研智能体', value: 78 },
+    { name: '产品方案', role: '产品智能体', value: 62 },
+    { name: '交付检查', role: '审查智能体', value: 46 },
+  ] as const
 
   return (
-    <section id="enterprise" className="border-t border-border bg-sidebar/40">
-      <div className="mx-auto max-w-6xl px-5 py-20">
-        <div className="mb-12 text-center">
-          <div className="mb-4 inline-flex items-center gap-2 rounded-full border border-border bg-surface px-3.5 py-1.5 text-[13px] text-muted shadow-sm">
-            <Building2 size={14} className="text-accent" />
-            企业 / 团队版
-          </div>
-          <h2 className="text-[32px] font-bold tracking-tight md:text-[40px]">团队一起用，积分池共享不浪费</h2>
-          <p className="mx-auto mt-3 max-w-2xl text-[16px] text-muted">
-            按席位订阅企业套餐，团队共享一个积分池；成员、角色、限额一处管理，用量报表与发票开票自助搞定。
+    <section id="enterprise" className="congjian-section border-y border-white/8 bg-[#0d0f0c]">
+      <div className="mx-auto grid max-w-6xl gap-12 px-5 py-24 lg:grid-cols-[0.9fr_1.1fr] lg:items-center">
+        <div>
+          <span className="congjian-kicker">
+            <Building2 size={14} /> 团队与企业
+          </span>
+          <h2 className="mt-5 max-w-xl text-[34px] font-semibold leading-[1.12] tracking-[-0.045em] text-[#f5f4ed] md:text-[48px]">
+            一个人用得顺手，
+            <br />
+            一支团队也用得清楚。
+          </h2>
+          <p className="mt-5 max-w-xl text-[16px] leading-7 text-[#aeb1a8]">
+            共享额度、成员角色、用量限额、组织资产与报表放在同一处。团队把 AI
+            用进日常工作，也始终保有边界和秩序。
           </p>
-        </div>
 
-        <div className="grid grid-cols-1 items-stretch gap-6 lg:grid-cols-2">
-          {/* 卖点 2×2 */}
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-            {ENTERPRISE_SELLING.map((s) => {
-              const Icon = s.icon;
+          <div className="mt-8 grid gap-3 sm:grid-cols-2">
+            {ENTERPRISE_SELLING.map((item) => {
+              const Icon = item.icon
               return (
-                <div key={s.title} className="rounded-xl border border-border bg-surface p-5">
-                  <span className="mb-3 flex size-9 items-center justify-center rounded-xl bg-accent-soft text-accent">
-                    <Icon size={18} />
-                  </span>
-                  <div className="text-[15.5px] font-semibold">{s.title}</div>
-                  <p className="mt-1.5 text-[13.5px] leading-relaxed text-muted">{s.body}</p>
+                <div
+                  key={item.title}
+                  className="rounded-2xl border border-white/8 bg-white/[0.025] p-4"
+                >
+                  <Icon size={17} className="text-[#c7ff64]" />
+                  <div className="mt-3 text-[14px] font-semibold text-[#f5f4ed]">{item.title}</div>
+                  <p className="mt-1 text-[12.5px] leading-5 text-[#858a80]">{item.body}</p>
                 </div>
-              );
+              )
             })}
           </div>
 
-          {/* 虚构示意:团队用量迷你条形 */}
-          <div className="flex flex-col rounded-2xl border border-border bg-surface p-6 shadow-sm">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-1.5 text-[13px] font-medium text-fg">
-                <Layers size={15} className="text-accent" /> 团队用量
+          <div className="mt-8 flex flex-wrap items-center gap-4">
+            <Button variant="primary" shape="pill" size="lg" onClick={onCreateOrg}>
+              创建组织 <ArrowRight size={16} />
+            </Button>
+            <span className="text-[14px] text-[#8e9388]">
+              <strong className="mr-1.5 text-[18px] font-semibold text-[#f5f4ed]">
+                {anchor ?? '¥88/席起'}
+              </strong>
+              随需加席
+            </span>
+          </div>
+        </div>
+
+        <div className="congjian-shell overflow-hidden rounded-[28px] border border-white/10 bg-[#111410] p-3 shadow-[0_32px_100px_rgba(0,0,0,0.42)]">
+          <div className="rounded-[20px] border border-white/8 bg-[#0a0c09] p-5 sm:p-6">
+            <div className="flex items-center justify-between gap-4">
+              <div>
+                <div className="text-[12px] font-medium uppercase tracking-[0.16em] text-[#747a70]">
+                  Team workspace
+                </div>
+                <h3 className="mt-1 text-[18px] font-semibold text-[#f5f4ed]">
+                  增长项目 · 智能体协作
+                </h3>
               </div>
-              <span className="rounded-full bg-hover px-2 py-0.5 text-[11px] font-medium text-faint">
-                示意数据
+              <span className="rounded-full border border-[#c7ff64]/25 bg-[#c7ff64]/10 px-2.5 py-1 text-[11px] font-medium text-[#c7ff64]">
+                3 个任务运行中
               </span>
             </div>
 
-            {/* 组织积分池 */}
-            <div className="mt-4">
-              <div className="flex items-center justify-between text-[12.5px]">
-                <span className="text-muted">组织积分池</span>
-                <span className="tabular-nums text-fg">
-                  12,800<span className="text-faint"> / 20,000</span>
-                </span>
-              </div>
-              <div className="mt-1.5 h-2 overflow-hidden rounded-full bg-hover" aria-hidden>
-                <div className="h-full rounded-full bg-grad-cta" style={{ width: `${demoPoolUsedPct}%` }} />
-              </div>
-            </div>
-
-            {/* 成员迷你条形 */}
-            <div className="mt-5 flex flex-col gap-3">
-              {demoMembers.map((m) => (
-                <div key={m.name}>
-                  <div className="flex items-center justify-between text-[12px]">
-                    <span className="flex items-center gap-1.5 text-muted">
-                      {m.name}
-                      {m.delegate && (
-                        <span className="rounded-full bg-accent-soft px-1.5 py-0.5 text-[10px] font-medium text-accent">
-                          财务
+            <div className="mt-6 space-y-3">
+              {members.map((member) => (
+                <div
+                  key={member.name}
+                  className="rounded-2xl border border-white/8 bg-white/[0.025] p-4"
+                >
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="flex min-w-0 items-center gap-3">
+                      <span className="grid size-9 shrink-0 place-items-center rounded-xl bg-white/[0.06] text-[#c7ff64]">
+                        <Sparkles size={15} />
+                      </span>
+                      <span className="min-w-0">
+                        <span className="block truncate text-[13.5px] font-medium text-[#f5f4ed]">
+                          {member.name}
                         </span>
-                      )}
-                    </span>
-                    <span className={cn("tabular-nums", m.note ? "text-faint" : "text-fg")}>
-                      {m.credits}
-                    </span>
+                        <span className="block truncate text-[11.5px] text-[#777d73]">
+                          {member.role}
+                        </span>
+                      </span>
+                    </div>
+                    <span className="text-[12px] tabular-nums text-[#8f948a]">{member.value}%</span>
                   </div>
-                  <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-hover" aria-hidden>
+                  <div
+                    className="mt-3 h-1.5 overflow-hidden rounded-full bg-white/[0.06]"
+                    aria-hidden
+                  >
                     <div
-                      className={cn("h-full rounded-full", m.note ? "bg-faint/60" : "bg-accent")}
-                      style={{ width: `${m.pct}%` }}
+                      className="h-full rounded-full bg-[#c7ff64]"
+                      style={{ width: `${member.value}%` }}
                     />
                   </div>
-                  {m.note && <p className="mt-1 text-[10.5px] text-faint">{m.note}</p>}
                 </div>
               ))}
             </div>
 
-            <p className="mt-auto pt-5 text-[11px] text-faint">以上为示意数据，非真实用量。</p>
+            <div className="mt-4 flex items-center gap-2 rounded-xl border border-white/8 bg-white/[0.025] px-3.5 py-3 text-[12px] text-[#8f948a]">
+              <CircleCheckBig size={15} className="text-[#c7ff64]" />
+              任务过程、成果和用量都在组织内持续沉淀
+            </div>
           </div>
-        </div>
-
-        {/* 锚点价 + CTA */}
-        <div className="mt-10 flex flex-col items-center justify-center gap-3 text-center">
-          <div className="text-[14px] text-muted">
-            <span className="text-[18px] font-semibold text-fg">{anchor ?? "¥88/席起"}</span>
-            <span className="ml-2 text-faint">团队规模随需加席，闲置额度不浪费</span>
-          </div>
-          <Button variant="primary" shape="pill" size="lg" onClick={onCreateOrg} className="shadow-float">
-            <Building2 size={17} /> 创建组织
-          </Button>
         </div>
       </div>
     </section>
-  );
+  )
 }
 
-export function Landing({
-  onStart,
-  onLogin,
-  onCreateOrg,
-  theme,
-  onCycleTheme,
-}: {
-  onStart: () => void;
-  onLogin: () => void;
-  /** 「创建组织」CTA:进入 org 创建深链(未登录先 AuthGate)。 */
-  onCreateOrg: () => void;
-  theme: Theme;
-  onCycleTheme: () => void;
+export function Landing(props: {
+  onStart: () => void
+  onLogin: () => void
+  onCreateOrg: () => void
+  theme: Theme
+  onCycleTheme: () => void
 }) {
+  const { onStart, onLogin, onCreateOrg, theme, onCycleTheme } = props
+
   return (
-    <div className="h-full overflow-y-auto bg-bg text-fg">
-      {/* Nav */}
-      <header className="landing-safe-t sticky top-0 z-30 border-b border-border/60 bg-bg/80 backdrop-blur-xl">
-        {/* 窄屏(华为折叠外屏 / 320 小屏)收紧内边距,避免 nav 溢出 8px。 */}
-        <div className="mx-auto flex h-16 max-w-6xl items-center justify-between px-4 sm:px-5">
+    <div className="congjian-landing h-full overflow-y-auto bg-[#090a08] text-[#f5f4ed]">
+      <header className="landing-safe-t sticky top-0 z-40 border-b border-white/8 bg-[#090a08]/82 backdrop-blur-2xl">
+        <div className="mx-auto flex h-[68px] max-w-6xl items-center justify-between px-4 sm:px-5">
           <Logo />
-          <nav className="hidden items-center gap-7 text-[14.5px] text-muted md:flex">
-            <a href="#demo" className="transition-colors hover:text-fg">演示</a>
-            <a href="#agents" className="transition-colors hover:text-fg">智能体</a>
-            <a href="#tutorials" className="transition-colors hover:text-fg">快速上手</a>
-            <a href="#enterprise" className="transition-colors hover:text-fg">企业版</a>
-            <a href="#faq" className="transition-colors hover:text-fg">常见问题</a>
+          <nav
+            className="hidden items-center gap-7 text-[13.5px] text-[#9da197] md:flex"
+            aria-label="首页导航"
+          >
+            <a href="#demo" className="transition-colors hover:text-white">
+              产品演示
+            </a>
+            <a href="#capabilities" className="transition-colors hover:text-white">
+              核心能力
+            </a>
+            <a href="#scenarios" className="transition-colors hover:text-white">
+              工作场景
+            </a>
+            <a href="#agents" className="transition-colors hover:text-white">
+              智能体
+            </a>
+            <a href="#enterprise" className="transition-colors hover:text-white">
+              团队版
+            </a>
           </nav>
           <div className="flex shrink-0 items-center gap-1.5">
             <ThemeToggle theme={theme} onCycle={onCycleTheme} />
-            <Button variant="ghost" shape="pill" onClick={onLogin} className="text-muted">
+            <Button
+              variant="ghost"
+              shape="pill"
+              onClick={onLogin}
+              className="text-[#b7bbb2] hover:bg-white/8 hover:text-white"
+            >
               登录
             </Button>
             <Button variant="primary" shape="pill" onClick={onStart}>
@@ -279,240 +332,386 @@ export function Landing({
         </div>
       </header>
 
-      {/* Hero */}
-      <section className="relative overflow-hidden">
-        <div
-          aria-hidden
-          className="pointer-events-none absolute inset-0"
-          style={{
-            background:
-              "radial-gradient(50% 40% at 50% 0%, color-mix(in srgb, var(--accent) 18%, transparent), transparent 70%)",
-          }}
-        />
-        <div className="relative mx-auto max-w-4xl px-5 pb-10 pt-20 text-center md:pt-28">
-          <div className="mb-6 inline-flex items-center gap-2 rounded-full border border-border bg-surface px-3.5 py-1.5 text-[13px] text-muted shadow-sm animate-in">
-            <span className="size-1.5 rounded-full bg-accent" />
-            {BRAND.company} · 会干活的 AI 助手
-          </div>
-          <h1 className="mx-auto max-w-3xl text-balance text-[40px] font-bold leading-[1.1] tracking-tight md:text-[60px] animate-in">
-            把活儿交给它
-            <br className="hidden sm:block" />
-            <span className="bg-gradient-to-r from-accent to-info bg-clip-text text-transparent">
-              拿回能直接用的成果
+      <main>
+        <section className="congjian-grid relative overflow-hidden border-b border-white/8">
+          <div aria-hidden className="congjian-hero-glow pointer-events-none absolute inset-0" />
+          <div className="relative mx-auto max-w-6xl px-5 pb-12 pt-20 text-center sm:pt-28 md:pb-16">
+            <span className="congjian-kicker animate-in">
+              <span className="size-1.5 rounded-full bg-[#c7ff64] shadow-[0_0_12px_#c7ff64]" />
+              全能 Agent 工作台 · 多模型协作
             </span>
-          </h1>
-          <p className="mx-auto mt-6 max-w-2xl text-[17px] leading-relaxed text-muted animate-in">
-            读文件、联网调研、写代码、跑分析 —— 像给同事派活一样吩咐一句，它自己把整件事干完：交回做好的图表、PPT、Excel、报告，和已经推送的代码。
-          </p>
-          <div className="mt-9 flex flex-col items-center justify-center gap-3 sm:flex-row animate-in">
-            <Button variant="primary" shape="pill" size="lg" onClick={onStart} className="group shadow-float">
+            <h1 className="mx-auto mt-7 max-w-5xl text-balance text-[52px] font-semibold leading-[0.98] tracking-[-0.065em] text-[#f5f4ed] sm:text-[68px] md:text-[92px] animate-in">
+              让复杂，<span className="congjian-hero-word">从简。</span>
+            </h1>
+            <p className="mx-auto mt-7 max-w-3xl text-pretty text-[17px] leading-7 text-[#aeb1a8] md:text-[19px] md:leading-8 animate-in">
+              你只管说清目标。从简会拆解任务、调动合适的模型与智能体、调用工具持续执行，直到交付真正能用的文档、表格、演示、代码和结果。
+            </p>
+            <div className="mt-9 flex flex-col items-center justify-center gap-3 sm:flex-row animate-in">
+              <Button
+                variant="primary"
+                shape="pill"
+                size="lg"
+                onClick={onStart}
+                className="group min-w-[172px]"
+              >
+                开始使用从简
+                <ArrowRight
+                  size={17}
+                  className="transition-transform group-hover:translate-x-0.5"
+                />
+              </Button>
+              <a
+                href="#demo"
+                className={buttonVariants({ variant: 'secondary', shape: 'pill', size: 'lg' })}
+              >
+                看一个真实任务
+              </a>
+            </div>
+            <div className="mx-auto mt-8 flex max-w-3xl flex-wrap items-center justify-center gap-x-6 gap-y-2 text-[12.5px] text-[#747970]">
+              {['多模型按任务切换', '智能体协同执行', '过程持续可追踪', '成果直接可使用'].map(
+                (item) => (
+                  <span key={item} className="inline-flex items-center gap-1.5">
+                    <Check size={13} className="text-[#c7ff64]" /> {item}
+                  </span>
+                ),
+              )}
+            </div>
+          </div>
+
+          <div
+            id="demo"
+            className="relative mx-auto max-w-6xl scroll-mt-24 px-3 pb-20 sm:px-5 md:pb-28"
+          >
+            <div className="mb-4 flex items-center justify-between px-2 text-[11.5px] uppercase tracking-[0.16em] text-[#777d73]">
+              <span>Product workspace</span>
+              <span className="inline-flex items-center gap-1.5 normal-case tracking-normal">
+                <span className="size-1.5 rounded-full bg-[#c7ff64]" /> 产品能力演示
+              </span>
+            </div>
+            <div className="congjian-shell rounded-[28px] border border-white/12 bg-[#10120f] p-2.5 shadow-[0_48px_140px_rgba(0,0,0,0.55)] sm:p-4">
+              <div className="mb-3 flex items-center gap-1.5 px-1.5 pt-0.5" aria-hidden>
+                <span className="size-2.5 rounded-full bg-[#ff6b66]" />
+                <span className="size-2.5 rounded-full bg-[#f6c65c]" />
+                <span className="size-2.5 rounded-full bg-[#72d277]" />
+                <span className="ml-3 h-5 flex-1 rounded-md border border-white/6 bg-white/[0.025]" />
+              </div>
+              <DemoShowcase onTry={onStart} initialScenarioId="analysis" />
+            </div>
+          </div>
+        </section>
+
+        <section className="congjian-section border-b border-white/8 bg-[#0c0e0b]">
+          <div className="mx-auto max-w-6xl px-5 py-24">
+            <div className="grid gap-12 lg:grid-cols-[0.8fr_1.2fr] lg:items-end">
+              <div>
+                <span className="congjian-kicker">
+                  <Workflow size={14} /> 工作方式
+                </span>
+                <h2 className="mt-5 text-[34px] font-semibold leading-[1.1] tracking-[-0.045em] md:text-[50px]">
+                  你给目标，
+                  <br />
+                  从简负责过程。
+                </h2>
+              </div>
+              <p className="max-w-2xl text-[16px] leading-7 text-[#9da197] lg:justify-self-end">
+                不需要先研究模型、提示词和工作流。每一个任务都沿着同一条清晰路径推进：理解、计划、执行、交付；你随时能看到它做到哪一步。
+              </p>
+            </div>
+
+            <div className="mt-14 grid gap-px overflow-hidden rounded-[24px] border border-white/8 bg-white/8 md:grid-cols-4">
+              {WORKFLOW_STEPS.map((step) => {
+                const Icon = step.icon
+                return (
+                  <div key={step.n} className="relative bg-[#10120f] p-6 md:min-h-[220px]">
+                    <div className="flex items-center justify-between">
+                      <span className="font-mono text-[11px] tracking-[0.14em] text-[#777d73]">
+                        {step.n}
+                      </span>
+                      <Icon size={19} className="text-[#c7ff64]" />
+                    </div>
+                    <h3 className="mt-14 text-[18px] font-semibold">{step.title}</h3>
+                    <p className="mt-2 text-[13.5px] leading-6 text-[#858a80]">{step.body}</p>
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        </section>
+
+        <section id="capabilities" className="congjian-section border-b border-white/8">
+          <div className="mx-auto max-w-6xl px-5 py-24">
+            <div className="max-w-3xl">
+              <span className="congjian-kicker">
+                <Sparkles size={14} /> 核心能力
+              </span>
+              <h2 className="mt-5 text-[34px] font-semibold leading-[1.1] tracking-[-0.045em] md:text-[50px]">
+                不是“问一句，答一句”。
+                <br />
+                而是把一件事做完。
+              </h2>
+            </div>
+
+            <div className="mt-14 grid gap-4 lg:grid-cols-3">
+              {CAPABILITIES.map((capability, index) => {
+                const Icon = capability.icon
+                return (
+                  <article
+                    key={capability.title}
+                    className={`group relative overflow-hidden rounded-[24px] border border-white/9 bg-[#111310] p-6 transition-transform duration-300 hover:-translate-y-1 ${index === 1 ? 'lg:translate-y-8 lg:hover:translate-y-7' : ''}`}
+                  >
+                    <div
+                      aria-hidden
+                      className="absolute -right-14 -top-14 size-36 rounded-full bg-[#c7ff64]/5 blur-3xl"
+                    />
+                    <div className="flex items-center justify-between">
+                      <span className="font-mono text-[10.5px] tracking-[0.15em] text-[#777d73]">
+                        {capability.eyebrow}
+                      </span>
+                      <span className="grid size-10 place-items-center rounded-xl border border-white/8 bg-white/[0.035] text-[#c7ff64]">
+                        <Icon size={19} />
+                      </span>
+                    </div>
+                    <h3 className="mt-16 text-[22px] font-semibold leading-[1.2] tracking-[-0.025em]">
+                      {capability.title}
+                    </h3>
+                    <p className="mt-3 text-[14px] leading-6 text-[#93988f]">{capability.body}</p>
+                    <div className="mt-7 flex flex-wrap gap-2">
+                      {capability.tags.map((tag) => (
+                        <span
+                          key={tag}
+                          className="rounded-full border border-white/8 bg-white/[0.025] px-2.5 py-1 text-[11px] text-[#858a80]"
+                        >
+                          {tag}
+                        </span>
+                      ))}
+                    </div>
+                  </article>
+                )
+              })}
+            </div>
+          </div>
+        </section>
+
+        <section id="scenarios" className="congjian-section border-b border-white/8 bg-[#0d0f0c]">
+          <div className="mx-auto max-w-6xl px-5 py-24">
+            <div className="text-center">
+              <span className="congjian-kicker">
+                <Zap size={14} /> 工作场景
+              </span>
+              <h2 className="mx-auto mt-5 max-w-3xl text-[34px] font-semibold leading-[1.1] tracking-[-0.045em] md:text-[50px]">
+                把真实工作，直接交出去。
+              </h2>
+              <p className="mx-auto mt-4 max-w-2xl text-[16px] leading-7 text-[#999e95]">
+                从一句自然语言开始，跨越调研、分析、创作和开发，最终停在一份可以验收的成果上。
+              </p>
+            </div>
+
+            <div className="mt-14 grid gap-4 lg:grid-cols-3">
+              {SCENARIOS.map((scenario) => {
+                const Icon = scenario.icon
+                return (
+                  <button
+                    key={scenario.label}
+                    type="button"
+                    onClick={onStart}
+                    className="group flex min-h-[330px] flex-col rounded-[24px] border border-white/9 bg-[#111310] p-6 text-left outline-none transition-[transform,border-color] duration-300 hover:-translate-y-1 hover:border-white/18 focus-visible:ring-2 focus-visible:ring-[#c7ff64]"
+                  >
+                    <span
+                      className="grid size-11 place-items-center rounded-2xl border border-white/8 bg-white/[0.035]"
+                      style={{ color: scenario.accent }}
+                    >
+                      <Icon size={20} />
+                    </span>
+                    <span
+                      className="mt-6 text-[13px] font-semibold"
+                      style={{ color: scenario.accent }}
+                    >
+                      {scenario.label}
+                    </span>
+                    <span className="mt-3 block text-[18px] leading-8 text-[#e5e5de]">
+                      “{scenario.prompt}”
+                    </span>
+                    <span className="mt-auto pt-8">
+                      <span className="mb-3 block text-[10.5px] uppercase tracking-[0.14em] text-[#777d73]">
+                        Deliverables
+                      </span>
+                      <span className="flex flex-wrap gap-2">
+                        {scenario.outputs.map((output) => (
+                          <span
+                            key={output}
+                            className="rounded-full border border-white/8 bg-white/[0.025] px-2.5 py-1 text-[11px] text-[#91968d]"
+                          >
+                            {output}
+                          </span>
+                        ))}
+                      </span>
+                    </span>
+                    <span className="mt-5 inline-flex items-center gap-1.5 text-[12px] font-medium text-[#c7ff64]">
+                      用我的任务试试{' '}
+                      <ArrowRight
+                        size={13}
+                        className="transition-transform group-hover:translate-x-0.5"
+                      />
+                    </span>
+                  </button>
+                )
+              })}
+            </div>
+          </div>
+        </section>
+
+        <section id="agents" className="congjian-section border-b border-white/8">
+          <div className="mx-auto max-w-6xl px-5 py-24">
+            <div className="grid gap-12 lg:grid-cols-[0.85fr_1.15fr] lg:items-center">
+              <div>
+                <span className="congjian-kicker">
+                  <Puzzle size={14} /> 智能体与技能
+                </span>
+                <h2 className="mt-5 text-[34px] font-semibold leading-[1.1] tracking-[-0.045em] md:text-[50px]">
+                  一个入口，
+                  <br />
+                  调动整支 AI 团队。
+                </h2>
+                <p className="mt-5 max-w-xl text-[16px] leading-7 text-[#999e95]">
+                  默认从一位全能助手开始。遇到专业任务，再从市场安装智能体与技能；每一种能力都围绕同一个目标协同，而不是散落在不同工具里。
+                </p>
+                <Button
+                  variant="secondary"
+                  shape="pill"
+                  size="lg"
+                  onClick={onStart}
+                  className="mt-8"
+                >
+                  浏览智能体市场 <ArrowRight size={16} />
+                </Button>
+              </div>
+
+              <div className="grid gap-3 sm:grid-cols-2">
+                {AGENTS.slice(0, 4).map((agent, index) => (
+                  <button
+                    key={agent.id}
+                    type="button"
+                    onClick={onStart}
+                    className={`group rounded-[22px] border p-5 text-left outline-none transition-[transform,border-color,background-color] duration-300 hover:-translate-y-1 focus-visible:ring-2 focus-visible:ring-[#c7ff64] ${index === 0 ? 'border-[#c7ff64]/25 bg-[#c7ff64]/8' : 'border-white/9 bg-[#111310] hover:border-white/18'}`}
+                  >
+                    <div className="flex items-start justify-between gap-4">
+                      <AgentAvatar agent={agent} className="size-11 rounded-[14px]" iconSize={21} />
+                      <span className="rounded-full border border-white/8 px-2 py-0.5 text-[10px] text-[#777d73]">
+                        {index === 0 ? '默认配备' : '市场安装'}
+                      </span>
+                    </div>
+                    <div className="mt-6 text-[17px] font-semibold">{agent.name}</div>
+                    <div className="mt-1 text-[12px] font-medium text-[#c7ff64]">
+                      {agent.tagline}
+                    </div>
+                    <p className="mt-2 line-clamp-3 text-[13px] leading-5 text-[#8e9389]">
+                      {agent.description}
+                    </p>
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <EnterpriseSection onCreateOrg={onCreateOrg} />
+
+        <section id="faq" className="congjian-section border-b border-white/8">
+          <div className="mx-auto max-w-6xl px-5 py-24">
+            <div className="grid gap-12 lg:grid-cols-[0.7fr_1.3fr]">
+              <div>
+                <span className="congjian-kicker">
+                  <Clock3 size={14} /> 常见问题
+                </span>
+                <h2 className="mt-5 text-[34px] font-semibold leading-[1.1] tracking-[-0.045em] md:text-[46px]">
+                  开始之前，
+                  <br />
+                  你可能想知道。
+                </h2>
+              </div>
+              <div className="divide-y divide-white/8 border-y border-white/8">
+                {FAQS.map((faq) => (
+                  <details key={faq.q} className="group py-5 open:pb-6">
+                    <summary className="flex cursor-pointer list-none items-center justify-between gap-5 text-[15px] font-medium text-[#e7e7e0] outline-none focus-visible:ring-2 focus-visible:ring-[#c7ff64]">
+                      {faq.q}
+                      <span className="grid size-7 shrink-0 place-items-center rounded-full border border-white/10 text-[#8f948a] transition-transform group-open:rotate-45">
+                        +
+                      </span>
+                    </summary>
+                    <p className="max-w-2xl pr-12 pt-3 text-[13.5px] leading-6 text-[#8f948a]">
+                      {faq.a}
+                    </p>
+                  </details>
+                ))}
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section className="congjian-grid relative overflow-hidden">
+          <div aria-hidden className="congjian-cta-glow pointer-events-none absolute inset-0" />
+          <div className="relative mx-auto max-w-5xl px-5 py-28 text-center md:py-36">
+            <BrandMark className="mx-auto size-14" />
+            <h2 className="mt-7 text-[42px] font-semibold leading-[1.02] tracking-[-0.055em] md:text-[68px]">
+              现在，把复杂交给从简。
+            </h2>
+            <p className="mx-auto mt-5 max-w-xl text-[16px] leading-7 text-[#9da197]">
+              从一个真实任务开始。无需配置模型，也无需先学会如何使用 AI。
+            </p>
+            <Button
+              variant="primary"
+              shape="pill"
+              size="lg"
+              onClick={onStart}
+              className="mt-8 group"
+            >
               免费开始使用
               <ArrowRight size={17} className="transition-transform group-hover:translate-x-0.5" />
             </Button>
-            <a
-              href="#demo"
-              className={cn(buttonVariants({ variant: "secondary", shape: "pill", size: "lg" }))}
-            >
-              看看它能做什么
-            </a>
           </div>
-          <p className="mt-5 text-[13px] text-faint">免费版每月 300 积分</p>
-        </div>
+        </section>
+      </main>
 
-        {/* 动态演示 —— 左对话右成果的工作台，让「交付成果」看得见 */}
-        <div id="demo" className="relative mx-auto max-w-5xl scroll-mt-20 px-5 pb-14">
-          <DemoShowcase onTry={onStart} />
-        </div>
-      </section>
-
-      {/* 差异化对比：不是又一个聊天机器人 */}
-      <section id="compare" className="border-y border-border bg-sidebar/50">
-        <div className="mx-auto max-w-6xl px-5 py-20">
-          <div className="mb-12 text-center">
-            <h2 className="text-[32px] font-bold tracking-tight md:text-[40px]">不是又一个聊天机器人</h2>
-            <p className="mx-auto mt-3 max-w-xl text-[16px] text-muted">
-              普通 AI 给你一段建议；它像同事一样把活儿干完 —— 而且越用越好用，越用越懂你。
-            </p>
-          </div>
-          <div className="mx-auto grid max-w-4xl grid-cols-1 gap-5 md:grid-cols-2">
-            {/* 普通 AI 聊天 */}
-            <div className="rounded-2xl border border-border bg-surface p-7">
-              <div className="mb-5 flex items-center gap-2.5">
-                <span className="flex size-9 items-center justify-center rounded-xl bg-hover text-faint">
-                  <MessageSquareText size={18} />
-                </span>
-                <h3 className="text-[17px] font-semibold text-muted">{COMPARE.chat.title}</h3>
-              </div>
-              <ul className="space-y-3.5">
-                {COMPARE.chat.rows.map((r) => (
-                  <li key={r} className="flex items-start gap-2.5 text-[14.5px] leading-relaxed text-faint">
-                    <X size={16} className="mt-1 shrink-0" />
-                    {r}
-                  </li>
-                ))}
-              </ul>
-            </div>
-            {/* Aurora */}
-            <div className="relative rounded-2xl border border-accent/40 bg-surface p-7 shadow-[var(--shadow-float)] ring-1 ring-accent/20">
-              <div className="mb-5 flex items-center gap-2.5">
-                <span className="flex size-9 items-center justify-center rounded-xl bg-grad-cta text-white">
-                  <Sparkles size={18} />
-                </span>
-                <h3 className="text-[17px] font-semibold">{COMPARE.aurora.title}</h3>
-              </div>
-              <ul className="space-y-3.5">
-                {COMPARE.aurora.rows.map((r) => (
-                  <li key={r} className="flex items-start gap-2.5 text-[14.5px] leading-relaxed text-fg">
-                    <Check size={16} className="mt-1 shrink-0 text-accent" />
-                    {r}
-                  </li>
-                ))}
-              </ul>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      {/* Agents —— v5 纯市场:默认只配「全能助手」,其余是市场按需加装的示例(非预置 roster)。 */}
-      <section id="agents" className="mx-auto max-w-6xl px-5 py-20">
-        <div className="mb-12 text-center">
-          <h2 className="text-[32px] font-bold tracking-tight md:text-[40px]">一个全能助手起步，市场按需生长</h2>
-          <p className="mx-auto mt-3 max-w-2xl text-[16px] text-muted">
-            默认只配「全能助手」—— 写作、编程、研究、分析张口就用。需要更专业时，从 AI 市场一键加装专家智能体与技能，能力随需求生长。
-          </p>
-        </div>
-
-        {/* 默认配备:全能助手(唯一预置) */}
-        <button
-          onClick={onStart}
-          className="group mb-10 flex w-full items-start gap-5 rounded-2xl border border-accent/40 bg-accent-soft p-6 text-left outline-none transition-[transform,box-shadow,border-color] duration-200 ease-standard hover:-translate-y-0.5 hover:shadow-float focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg"
-        >
-          <AgentAvatar
-            agent={AGENTS[0]}
-            className="size-14 shrink-0 rounded-2xl shadow-sm"
-            iconSize={26}
-          />
-          <span className="min-w-0 flex-1">
-            <span className="flex flex-wrap items-center gap-2">
-              <span className="text-[19px] font-bold">{AGENTS[0].name}</span>
-              <span className="rounded-full bg-accent px-2 py-0.5 text-[11px] font-semibold text-white">
-                默认配备 · 即开即用
-              </span>
-            </span>
-            <span className="mt-1.5 block text-[14.5px] leading-relaxed text-muted">
-              {AGENTS[0].description}
-            </span>
-          </span>
-          <ArrowRight
-            size={20}
-            className="mt-1 shrink-0 text-accent transition-transform group-hover:translate-x-0.5"
-          />
-        </button>
-
-        {/* 市场:专业智能体(示例,陆续上新) —— 明确"从市场安装",不是预置 */}
-        <div className="mb-4 flex items-center justify-between gap-3">
-          <div className="flex items-center gap-2 text-[14px] font-semibold text-muted">
-            <Puzzle size={16} className="text-accent" />
-            AI 市场 · 专业智能体（示例，陆续上新）
-          </div>
-          <button
-            type="button"
-            onClick={onStart}
-            className="inline-flex items-center gap-1 text-[13.5px] font-medium text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring"
-          >
-            浏览 AI 市场 <ArrowRight size={14} />
-          </button>
-        </div>
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {AGENTS.slice(1).map((a) => (
-            <button
-              key={a.id}
-              onClick={onStart}
-              className="group relative flex flex-col items-start rounded-xl border border-border bg-surface p-5 text-left outline-none transition-[transform,box-shadow,border-color] duration-200 ease-standard hover:-translate-y-0.5 hover:border-border-strong hover:shadow-float focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg"
-            >
-              <span className="absolute right-3 top-3 inline-flex items-center gap-1 rounded-full border border-border bg-hover px-2 py-0.5 text-[10.5px] font-medium text-muted">
-                <Plus size={11} /> 市场安装
-              </span>
-              <AgentAvatar agent={a} className="mb-4 size-11 rounded-xl shadow-sm" iconSize={21} />
-              <span className="text-[16.5px] font-semibold">{a.name}</span>
-              <span className="mt-0.5 text-[13px] font-medium text-accent">{a.tagline}</span>
-              <span className="mt-2 text-[14px] leading-relaxed text-muted">{a.description}</span>
-            </button>
-          ))}
-        </div>
-      </section>
-
-      {/* Tutorials —— 每个功能配套使用示例 */}
-      <Tutorials />
-
-      {/* 企业 / 团队版 —— 个人价值讲清后,向"团队规模化"升级叙事(席位池/成员管理/报表发票) */}
-      <EnterpriseSection onCreateOrg={onCreateOrg} />
-
-      {/* FAQ —— 把注册前最常见的犹豫点讲明白 */}
-      <section id="faq" className="border-t border-border bg-sidebar/40">
-        <div className="mx-auto max-w-6xl px-5 py-20">
-          <div className="mb-12 text-center">
-            <h2 className="text-[32px] font-bold tracking-tight md:text-[40px]">常见问题</h2>
-            <p className="mx-auto mt-3 max-w-xl text-[16px] text-muted">还有疑问？注册后随时问它自己。</p>
-          </div>
-          <div className="mx-auto grid max-w-4xl grid-cols-1 gap-4 md:grid-cols-2">
-            {FAQS.map((f) => (
-              <div key={f.q} className="rounded-2xl border border-border bg-surface p-6">
-                <h3 className="text-[16px] font-semibold">{f.q}</h3>
-                <p className="mt-2 text-[14px] leading-relaxed text-muted">{f.a}</p>
-              </div>
-            ))}
-          </div>
-        </div>
-      </section>
-
-      {/* CTA */}
-      <section className="mx-auto max-w-6xl px-5 py-20">
-        <div className="relative overflow-hidden rounded-3xl border border-border bg-gradient-to-br from-accent/10 to-info/5 px-6 py-14 text-center">
-          <div className="mx-auto mb-5 flex size-12 items-center justify-center rounded-2xl bg-grad-cta text-white shadow-float">
-            <Shield size={24} />
-          </div>
-          <h2 className="text-[28px] font-bold tracking-tight md:text-[36px]">现在就开始，越用越懂你</h2>
-          <p className="mx-auto mt-3 max-w-md text-[15.5px] text-muted">免费注册，从全能助手起步，按需从 AI 市场加装更多能力。</p>
-          <Button variant="primary" shape="pill" size="lg" onClick={onStart} className="mt-7 shadow-float">
-            免费开始使用
-            <ArrowRight size={17} />
-          </Button>
-        </div>
-      </section>
-
-      {/* Footer */}
-      <footer className="border-t border-border bg-sidebar/40">
+      <footer className="border-t border-white/8 bg-[#080907]">
         <div className="mx-auto max-w-6xl px-5 py-10">
-          <div className="flex flex-col items-start justify-between gap-6 md:flex-row">
+          <div className="flex flex-col justify-between gap-8 md:flex-row md:items-start">
             <div>
-              <Logo />
-              <p className="mt-3 max-w-xs text-[13.5px] leading-relaxed text-muted">{BRAND.intro}</p>
+              <Logo compact />
+              <p className="mt-4 max-w-sm text-[13px] leading-6 text-[#777d73]">{BRAND.intro}</p>
             </div>
-            <div className="flex gap-14 text-[13.5px]">
+            <div className="flex flex-wrap gap-x-12 gap-y-5 text-[12.5px]">
               <div className="flex flex-col gap-2.5">
-                <span className="font-medium text-fg">产品</span>
-                <a href="#demo" className="text-muted hover:text-fg">演示</a>
-                <a href="#agents" className="text-muted hover:text-fg">智能体</a>
-                <a href="#tutorials" className="text-muted hover:text-fg">快速上手</a>
-                <a href="#enterprise" className="text-muted hover:text-fg">企业版</a>
-                <a href="#faq" className="text-muted hover:text-fg">常见问题</a>
+                <span className="font-medium text-[#d8d9d2]">产品</span>
+                <a href="#demo" className="text-[#777d73] hover:text-white">
+                  产品演示
+                </a>
+                <a href="#capabilities" className="text-[#777d73] hover:text-white">
+                  核心能力
+                </a>
+                <a href="#enterprise" className="text-[#777d73] hover:text-white">
+                  团队版
+                </a>
               </div>
               <div className="flex flex-col gap-2.5">
-                <span className="font-medium text-fg">关于</span>
-                <span className="text-muted">{BRAND.companyShort}</span>
-                <span className="text-muted">联系合作</span>
-                <a href="/terms" className="text-muted hover:text-fg">用户协议</a>
-                <a href="/privacy" className="text-muted hover:text-fg">隐私政策</a>
+                <span className="font-medium text-[#d8d9d2]">条款</span>
+                <a href="/terms" className="text-[#777d73] hover:text-white">
+                  用户协议
+                </a>
+                <a href="/privacy" className="text-[#777d73] hover:text-white">
+                  隐私政策
+                </a>
+                <span className="text-[#777d73]">联系合作</span>
               </div>
             </div>
           </div>
-          <div className="mt-9 flex flex-col gap-1.5 border-t border-border pt-6 text-[12.5px] text-faint">
-            <span>© {BRAND.year} {BRAND.company} 版权所有</span>
+          <div className="mt-10 flex flex-col justify-between gap-2 border-t border-white/8 pt-6 text-[11.5px] text-[#777d73] sm:flex-row">
+            <span>
+              © {BRAND.year} {BRAND.company} 版权所有
+            </span>
             <span>{BRAND.icp}</span>
           </div>
         </div>
       </footer>
     </div>
-  );
+  )
 }

@@ -56,18 +56,6 @@ function readPermission(): NotificationPermission | "unsupported" {
   }
 }
 
-function readLegacyUnread(userId: string | null): string[] | null {
-  try {
-    const raw = localStorage.getItem(unreadSessionsStorageKey(userId));
-    if (!raw) return null;
-    const parsed: unknown = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return parsed.filter((x): x is string => typeof x === "string");
-  } catch {
-    return [];
-  }
-}
-
 function clearLegacyUnread(userId: string | null): void {
   try {
     localStorage.removeItem(unreadSessionsStorageKey(userId));
@@ -134,7 +122,7 @@ function fireNotification(session: UnreadSessionInput): void {
 
 /**
  * 侧栏未读：服务端 `unread` 为权威；本地 Set 只做乐观更新。
- * 打开会话 POST mark-read；旧 localStorage 未读集合只合并一次。
+ * 打开会话 POST mark-read。旧 localStorage 未读 key 只删除、不回填服务端。
  */
 export function useUnreadSessions(args: {
   sessions: UnreadSessionInput[];
@@ -144,9 +132,7 @@ export function useUnreadSessions(args: {
 }): UnreadState {
   const { sessions, activeId, userId, auth } = args;
 
-  const [unreadIds, setUnreadIds] = useState<Set<string>>(
-    () => new Set(readLegacyUnread(userId) ?? []),
-  );
+  const [unreadIds, setUnreadIds] = useState<Set<string>>(() => new Set());
   const [notifyPermission, setNotifyPermission] = useState<NotificationPermission | "unsupported">(
     readPermission,
   );
@@ -165,7 +151,6 @@ export function useUnreadSessions(args: {
   authRef.current = auth ?? null;
   const optimisticReadRef = useRef(new Set<string>());
   const optimisticUnreadRef = useRef(new Set<string>());
-  const migratedRef = useRef(false);
 
   const rebuildUnread = useCallback((list: UnreadSessionInput[]) => {
     const next = new Set<string>();
@@ -184,39 +169,14 @@ export function useUnreadSessions(args: {
 
   useEffect(() => {
     optimisticReadRef.current = new Set();
-    optimisticUnreadRef.current = new Set(readLegacyUnread(userId) ?? []);
-    migratedRef.current = false;
+    optimisticUnreadRef.current = new Set();
     prevRef.current = null;
-    setUnreadIds(new Set(optimisticUnreadRef.current));
+    setUnreadIds(new Set());
+    clearLegacyUnread(userId);
     const perm = readPermission();
     setNotifyPermission(perm);
     setNotifyEnabledState(perm === "granted" && readNotifyEnabled(userId));
   }, [userId]);
-
-  useEffect(() => {
-    if (migratedRef.current) return;
-    const a = authRef.current;
-    const uid = userIdRef.current;
-    const legacy = readLegacyUnread(uid);
-    if (!a || legacy === null) {
-      if (legacy === null) migratedRef.current = true;
-      return;
-    }
-    migratedRef.current = true;
-    if (legacy.length === 0) {
-      clearLegacyUnread(uid);
-      return;
-    }
-    for (const id of legacy) optimisticUnreadRef.current.add(id);
-    void api
-      .migrateUnreadSessions(a, legacy)
-      .then(() => {
-        clearLegacyUnread(uid);
-      })
-      .catch(() => {
-        migratedRef.current = false;
-      });
-  }, [auth, userId]);
 
   const markRead = useCallback((sessionId: string) => {
     optimisticReadRef.current.add(sessionId);

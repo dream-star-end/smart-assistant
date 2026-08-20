@@ -358,9 +358,18 @@ export async function buildCodexLaunchOverrides(
   // concerns — keeping it here means promptSlots stays clean and the codex
   // adapter can evolve without touching the slot pipeline.
   // vision retired from the codex MCP path → oc-vision CLI (baseline skill),
-  // same as web-context/browser. No MCP tool is injected on the codex path now;
-  // mcp-memory below is the only remaining codex-side MCP server.
-  const availableMcpTools: string[] = []
+  // same as web-context/browser. mcp-memory below is the only remaining
+  // codex-side MCP server, so the prompt must advertise it iff the entry that
+  // will actually be registered resolves.
+  const mcpEntry = resolveMcpMemoryEntry(ctx.claudeCodePath)
+  const availableMcpTools = mcpEntry
+    ? [
+        'skill_search', 'skill_list', 'skill_view', 'skill_save', 'skill_delete',
+        'create_reminder', 'list_reminders', 'update_reminder', 'delete_reminder',
+        'send_to_agent', 'delegate_task', 'delegate_tasks', 'request_review',
+        'task_create', 'task_update', 'task_comment', 'task_list', 'task_get',
+      ]
+    : []
   const platformResult = await buildPromptContext({
     agentId: ctx.agentId,
     ...(ctx.sessionKey ? { sessionKey: ctx.sessionKey } : {}),
@@ -424,7 +433,6 @@ export async function buildCodexLaunchOverrides(
   // instructions file so the agent has identity/persona/skills metadata
   // even without the memory tool. Mirrors subprocessRunner's
   // `if (mcpEntry) {...}` else-warn behaviour.
-  const mcpEntry = resolveMcpMemoryEntry(ctx.claudeCodePath)
   let tokenFile: string | null = null
   let tokenContent: string | null = null
   let delegateContextFile: string | null = null

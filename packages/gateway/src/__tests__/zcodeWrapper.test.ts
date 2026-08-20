@@ -203,6 +203,59 @@ process.stdout.write(JSON.stringify({ sessionId: 'sess_w', response: 'wrapped', 
     }
   })
 
+  test('merges only managed MCP/hooks keys while provider credentials remain wrapper-owned', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-zcode-wrapper-platform-'))
+    const context = await mkdtemp(path.join(tmpdir(), 'oc-zcode-context-'))
+    const fake = path.join(dir, 'fake-zcode.cjs')
+    const auth = path.join(dir, 'api-key')
+    const capture = path.join(dir, 'capture.json')
+    const platform = path.join(context, 'platform-config.json')
+    await chmod(context, 0o700)
+    await writeFile(auth, 'relay-secret\n', { mode: 0o600 })
+    await writeFile(platform, JSON.stringify({
+      features: { mcp: true },
+      mcp: { servers: { probe: { type: 'stdio', command: '/bin/true' } } },
+      hooks: { enabled: true, events: {} },
+    }), { mode: 0o600 })
+    await writeFile(fake, `#!/usr/bin/env node
+const fs = require('node:fs')
+const path = require('node:path')
+const cfg = JSON.parse(fs.readFileSync(path.join(process.env.HOME, '.zcode/cli/config.json'), 'utf8'))
+fs.writeFileSync(${JSON.stringify(capture)}, JSON.stringify(cfg))
+process.stdout.write(JSON.stringify({ sessionId: 'sess_platform', response: 'ok', eventCount: 0 }) + '\\n')
+`)
+    await chmod(fake, 0o755)
+    try {
+      const result = await runWrapper(
+        ['--prompt', 'hello', '--json', '--mode', 'yolo', '--no-color', '--cwd', dir],
+        {
+          PATH: process.env.PATH,
+          HOME: dir,
+          OC_ZCODE_TEST_BIN: fake,
+          OC_ZCODE_TEST_NODE: process.execPath,
+          OC_ZCODE_TEST_AUTH_FILE: auth,
+          OC_ZCODE_PLATFORM_CONFIG_FILE: platform,
+          OC_ZCODE_RELAY_BASE_URL: 'http://127.0.0.1:18791/internal/v5/zcode-relay/route/test',
+          FAKE_ZCODE_CAPTURE: capture,
+        },
+      )
+      assert.equal(result.code, 0, result.stderr)
+      const cfg = JSON.parse(await readFile(capture, 'utf8')) as any
+      assert.equal(cfg.features.mcp, true)
+      assert.equal(cfg.mcp.servers.probe.command, '/bin/true')
+      assert.equal(cfg.hooks.enabled, true)
+      assert.equal(cfg.model.main, 'zai-coding-plan/glm-5.3')
+      assert.equal(cfg.provider['zai-coding-plan'].options.apiKey, 'relay-secret')
+      assert.equal(
+        cfg.provider['zai-coding-plan'].options.baseURL,
+        'http://127.0.0.1:18791/internal/v5/zcode-relay/route/test/v1',
+      )
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+      await rm(context, { recursive: true, force: true })
+    }
+  })
+
   test('does not double /v1 when the minted relay base already includes it', async () => {
     const dir = await mkdtemp(path.join(tmpdir(), 'oc-zcode-wrapper-v1-'))
     const fake = path.join(dir, 'fake-zcode.cjs')

@@ -175,7 +175,7 @@ describe('Aurora v5 skeleton — landing (de-branded)', () => {
     vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
     render(<App />)
     // 启动续期 401 落定后 Landing 才出现(splash → Landing)。
-    expect((await screen.findAllByText('Aurora')).length).toBeGreaterThan(0)
+    expect((await screen.findAllByText('从简')).length).toBeGreaterThan(0)
     expect(document.body.textContent).not.toContain('乾元')
     expect(document.body.textContent).not.toContain('易经')
   })
@@ -1012,7 +1012,7 @@ describe('Aurora v5 — P7 最小路由', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /用我的材料开始.*登录后试用/ }))
     await waitFor(() =>
-      expect(screen.getByRole('heading', { name: '欢迎使用 Aurora' })).toBeInTheDocument(),
+      expect(screen.getByRole('heading', { name: '欢迎使用 从简' })).toBeInTheDocument(),
     )
     expect(window.location.search).toContain('campaign=docs')
     expect(window.location.search).not.toContain('panel=help')

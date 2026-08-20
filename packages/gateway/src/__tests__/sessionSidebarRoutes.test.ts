@@ -19,7 +19,6 @@ describe('sessions sidebar 网关接线', () => {
     assert.ok(serverSrc.includes("url.pathname === '/api/sessions/batch'"))
     assert.ok(serverSrc.includes("url.pathname === '/api/sessions/list'"))
     assert.ok(serverSrc.includes("url.pathname === '/api/sessions/read-all'"))
-    assert.ok(serverSrc.includes("url.pathname === '/api/sessions/unread-migrate'"))
     assert.ok(
       serverSrc.includes('url.pathname.match(/^\\/api\\/sessions\\/([a-zA-Z0-9_-]{8,50})\\/read$/)'),
       'POST /api/sessions/:id/read 必须用 pathname.match 字面量,否则 containerRouteInventory 扫不到会线上 404',
@@ -28,7 +27,8 @@ describe('sessions sidebar 网关接线', () => {
     assert.match(serverSrc, /batchClientSessions\(/)
     assert.match(serverSrc, /markClientSessionRead\(/)
     assert.match(serverSrc, /markAllClientSessionsRead\(/)
-    assert.match(serverSrc, /migrateClientSessionsUnread\(/)
+    assert.doesNotMatch(serverSrc, /unread-migrate/)
+    assert.doesNotMatch(serverSrc, /migrateClientSessionsUnread/)
   })
 
   it('KNOWN_ROUTES 含新路径,不进 BRIDGE_API_ALLOWLIST', () => {
@@ -36,7 +36,6 @@ describe('sessions sidebar 网关接线', () => {
     assert.ok(serverSrc.includes("'/api/sessions/batch'"))
     assert.ok(serverSrc.includes("'/api/sessions/list'"))
     assert.ok(serverSrc.includes("'/api/sessions/read-all'"))
-    assert.ok(serverSrc.includes("'/api/sessions/unread-migrate'"))
     assert.ok(
       serverSrc.includes("'/api/sessions/:id/read'") || serverSrc.includes('/api/sessions/:id/read'),
       'normalizePath 必须把 /api/sessions/:id/read 规整掉',

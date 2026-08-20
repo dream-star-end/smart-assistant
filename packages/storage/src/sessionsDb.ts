@@ -671,6 +671,27 @@ export async function getSessionsDb(): Promise<Database.Database> {
     CREATE INDEX IF NOT EXISTS idx_tdi_open ON turn_dispatch_inbox(state)
       WHERE state NOT IN ('terminal','rejected');
   `)
+  // 0241: last_at 通常比 inbox.updated_at（终态时刻,epoch ms）早数毫秒,0240 回填后
+  // 仍 terminal > last_read_at。一次性抬到 max(inbox.updated_at)。user_version 作门,
+  // 禁止每次 open 都重跑（会把真正的新终态未读清掉）。必须在 inbox 建表之后。
+  try {
+    const uvRow = db.pragma('user_version') as Array<{ user_version: number }>
+    const uv = Number(uvRow[0]?.user_version ?? 0)
+    if (uv < 241) {
+      db.exec(`
+        UPDATE client_sessions
+           SET last_read_at = MAX(
+                 COALESCE(last_read_at, 0),
+                 COALESCE((
+                   SELECT MAX(updated_at) FROM turn_dispatch_inbox
+                    WHERE session_id = client_sessions.id
+                      AND state IN ('terminal', 'rejected')
+                 ), 0)
+               )
+      `)
+      db.pragma('user_version = 241')
+    }
+  } catch { /* 水位抬升失败不挡开库;下次 open 再试 */ }
 
   // 旧重量级团队模式(team_runs / team_delegations)已整套删除:schema 不再声明,
   // 存量本地 DB 里已建的表留着无害(不写 DROP TABLE,不迁移)。
@@ -2051,6 +2072,18 @@ export const CLIENT_SESSION_UNREAD_OUTCOMES = [
 ] as const
 
 const UNREAD_OUTCOME_SQL = CLIENT_SESSION_UNREAD_OUTCOMES.map((o) => `'${o}'`).join(',')
+/** last_read_at / inbox.updated_at / PG terminal_at 比较一律用 epoch milliseconds。
+ *  小于此阈值的值视为 unix seconds（防御混单位行），再 ×1000。
+ *  1e11 ms ≈ 1973-03-03；2026 年 unix seconds ≈ 1.7e9，unix ms ≈ 1.7e12。 */
+export const LAST_READ_AT_EPOCH_MS_FLOOR = 100_000_000_000
+
+/** 把 last_read_at（或同类水位列）规范成 epoch ms。0/NULL → 0（从未打开）。 */
+export function lastReadAtWatermarkMsSql(col = 'cs.last_read_at'): string {
+  return `(CASE WHEN COALESCE(${col}, 0) <= 0 THEN 0 WHEN ${col} < ${LAST_READ_AT_EPOCH_MS_FLOOR} THEN (${col} * 1000) ELSE ${col} END)`
+}
+
+const LAST_READ_AT_MS_SQL = lastReadAtWatermarkMsSql('cs.last_read_at')
+const LAST_D_TERMINAL_MS_SQL = lastReadAtWatermarkMsSql('last_d.terminal_at')
 export const LAST_MESSAGE_PREVIEW_MAX = 80
 // 侧栏预览只从 messages 数组尾部往前看这么多条。线上 assistant 不带 text(正文在
 // turn tape),最后一条几乎总是占位 stub;一轮对话里 user + 若干 assistant/tool/thinking
@@ -2096,10 +2129,6 @@ export type SessionSearchHit = {
 export type MarkClientSessionReadResult =
   | { ok: true; updated: number }
   | { ok: false; error: 'not_found' }
-
-export type MigrateClientSessionsUnreadResult =
-  | { ok: true; updated: number }
-  | { ok: false; error: 'invalid_ids' | 'ids_limit' }
 
 export type SearchClientSessionsOpts = {
   q: string
@@ -4888,7 +4917,7 @@ async function _sqliteListClientSessions(
            CASE WHEN open_d.session_id IS NOT NULL THEN 'running' ELSE 'idle' END AS run_state,
            last_d.outcome AS last_outcome,
            CASE WHEN last_d.outcome IN (${UNREAD_OUTCOME_SQL})
-                 AND COALESCE(last_d.terminal_at, 0) > COALESCE(cs.last_read_at, 0)
+                 AND ${LAST_D_TERMINAL_MS_SQL} > ${LAST_READ_AT_MS_SQL}
                 THEN 1 ELSE 0 END AS unread
     FROM client_sessions cs
     LEFT JOIN (
@@ -6194,7 +6223,7 @@ function _sqliteUnreadBySessionIds(
   const rows = db.prepare(`
     SELECT cs.id,
            CASE WHEN last_d.outcome IN (${UNREAD_OUTCOME_SQL})
-                 AND COALESCE(last_d.terminal_at, 0) > COALESCE(cs.last_read_at, 0)
+                 AND ${LAST_D_TERMINAL_MS_SQL} > ${LAST_READ_AT_MS_SQL}
                 THEN 1 ELSE 0 END AS unread
       FROM client_sessions cs
       LEFT JOIN (
@@ -6412,7 +6441,7 @@ async function _sqliteMarkClientSessionRead(
   sessionId: string,
 ): Promise<MarkClientSessionReadResult> {
   const db = await getSessionsDb()
-  const now = Date.now()
+  const now = Date.now() // epoch milliseconds; must match inbox.updated_at / list compare
   const res = db.prepare(
     `UPDATE client_sessions SET last_read_at = ?
       WHERE user_id = ? AND id = ? AND deleted_at IS NULL`,
@@ -6429,24 +6458,6 @@ async function _sqliteMarkAllClientSessionsRead(userId: string): Promise<{ updat
       WHERE user_id = ? AND deleted_at IS NULL`,
   ).run(now, userId)
   return { updated: res.changes }
-}
-
-async function _sqliteMigrateClientSessionsUnread(
-  userId: string,
-  ids: unknown,
-): Promise<MigrateClientSessionsUnreadResult> {
-  if (!Array.isArray(ids)) return { ok: false, error: 'invalid_ids' }
-  if (ids.length > SESSION_BATCH_IDS_MAX) return { ok: false, error: 'ids_limit' }
-  const sessionIds = ids.filter((id): id is string => typeof id === 'string' && id.length > 0)
-  if (sessionIds.length !== ids.length) return { ok: false, error: 'invalid_ids' }
-  if (sessionIds.length === 0) return { ok: true, updated: 0 }
-  const db = await getSessionsDb()
-  const res = db.prepare(
-    `UPDATE client_sessions SET last_read_at = 0
-      WHERE user_id = ? AND deleted_at IS NULL
-        AND id IN (${sessionIds.map(() => '?').join(',')})`,
-  ).run(userId, ...sessionIds)
-  return { ok: true, updated: res.changes }
 }
 
 function _sqliteDeleteClientSessionSync(
@@ -6722,7 +6733,6 @@ const sqliteBackend = {
   batchClientSessions: _sqliteBatchClientSessions,
   markClientSessionRead: _sqliteMarkClientSessionRead,
   markAllClientSessionsRead: _sqliteMarkAllClientSessionsRead,
-  migrateClientSessionsUnread: _sqliteMigrateClientSessionsUnread,
   getSessionProjectInstructions: _sqliteGetSessionProjectInstructions,
   listChatProjects: _sqliteListChatProjects,
   createChatProject: _sqliteCreateChatProject,
@@ -6886,9 +6896,6 @@ export const markClientSessionRead: ClientSessionsBackend['markClientSessionRead
 
 export const markAllClientSessionsRead: ClientSessionsBackend['markAllClientSessionsRead'] =
   (...args) => getActiveBackend().markAllClientSessionsRead(...args)
-
-export const migrateClientSessionsUnread: ClientSessionsBackend['migrateClientSessionsUnread'] =
-  (...args) => getActiveBackend().migrateClientSessionsUnread(...args)
 
 export const getSessionProjectInstructions: ClientSessionsBackend['getSessionProjectInstructions'] =
   (...args) => getActiveBackend().getSessionProjectInstructions(...args)

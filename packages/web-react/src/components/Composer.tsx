@@ -63,7 +63,7 @@ export function Composer({
   stopping,
   onStop,
   disabled,
-  placeholder = "给 OpenClaude 发消息…",
+  placeholder = "给从简发消息…",
   onUpload,
   getVoiceToken,
   prefill,
@@ -302,7 +302,7 @@ export function Composer({
           <div className="mx-3.5 mt-3 flex items-start gap-2 rounded-xl bg-hover px-3 py-2 text-left">
             <div className="min-w-0 flex-1 border-l-2 border-accent/60 pl-2.5">
               <div className="mb-0.5 text-[11px] font-medium text-muted">
-                正在引用 {replyTo.role === "assistant" ? "OpenClaude" : "你"}
+                正在引用 {replyTo.role === "assistant" ? "从简" : "你"}
               </div>
               <div className="line-clamp-2 whitespace-pre-wrap break-words text-[12.5px] leading-5 text-fg/75">
                 {replyTo.text}

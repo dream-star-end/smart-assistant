@@ -161,7 +161,6 @@ import {
   batchClientSessions,
   markClientSessionRead,
   markAllClientSessionsRead,
-  migrateClientSessionsUnread,
   parseSessionBatchInput,
   parseIncludeArchivedFlag,
   parseOptionalPositiveInt,
@@ -4278,29 +4277,6 @@ export class Gateway {
       markAllClientSessionsRead(userId)
         .then((out) => this.sendJson(res, 200, { ok: true, updated: out.updated }))
         .catch(() => this.sendJson(res, 500, { error: 'read-all failed' }))
-      return
-    }
-    if (url.pathname === '/api/sessions/unread-migrate' && req.method === 'POST') {
-      const userId = this.getUserId(req)
-      ;(async () => {
-        let data: { ids?: unknown }
-        try {
-          data = JSON.parse(await this.readBody(req, 64 * 1024))
-        } catch {
-          this.sendJson(res, 400, { error: 'invalid JSON' })
-          return
-        }
-        const result = await migrateClientSessionsUnread(userId, data.ids)
-        if (!result.ok) {
-          if (result.error === 'ids_limit') {
-            this.sendJson(res, 400, { error: 'ids limit exceeded (max 200)' })
-            return
-          }
-          this.sendJson(res, 400, { error: 'ids required (string array)' })
-          return
-        }
-        this.sendJson(res, 200, { ok: true, updated: result.updated })
-      })().catch(() => this.sendJson(res, 500, { error: 'unread migrate failed' }))
       return
     }
     // 侧栏聊天项目(与 /api/board/projects 看板无关)。浏览器直打 gateway,与 /api/sessions/list 同平面。
@@ -18428,7 +18404,7 @@ export { shouldServeInline }
 const KNOWN_ROUTES = [
   '/api/healthz', '/api/doctor', '/api/usage', '/api/usage/events',
   '/api/runs', '/api/sessions', '/api/sessions/list', '/api/sessions/search', '/api/sessions/batch',
-  '/api/sessions/read-all', '/api/sessions/unread-migrate',
+  '/api/sessions/read-all',
   '/api/chat-projects', '/api/project-assets', '/api/config', '/api/agents', '/api/search',
   '/api/cron', '/api/board', '/api/board/projects', '/api/board/tickets',
   '/api/board/pipelines', '/api/board/agents', '/api/board/settings',
