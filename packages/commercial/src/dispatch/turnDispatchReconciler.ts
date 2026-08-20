@@ -398,12 +398,16 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
       continue
     }
     if (res.state === 'terminal' && res.outcome === 'crashed') {
-      // The container durably proves its execution process ended, but it does
-      // not prove that a fully staged result can never arrive later. Persist a
-      // typed dispatch status only; never occupy or replace the immutable tape
-      // namespace. A late real finalize moves this row out of terminal and the
-      // direct timeline naturally removes the status.
-      const closed = await closeAcceptedAsServiceRestart(deps, row, now())
+      // 容器只证明执行进程结束,不证明原因。有停机证据才允许 SERVICE_RESTART;
+      // 无证据回到 RESULT_RECOVERY_PENDING(第 1 批前 sentinel)。真实重启 tape
+      // 自带 errorCode:'SERVICE_RESTART',由 converge 透传到 failure_code,reconciler
+      // 不替它猜——猜会把 RUNNER_CRASHED / ENGINE_FAULT 画成可恢复琥珀点。
+      const closed = await closeAcceptedAsExecutedError(
+        deps,
+        row,
+        now(),
+        hasDeadEvidence ? 'SERVICE_RESTART' : 'RESULT_RECOVERY_PENDING',
+      )
       if (closed) {
         counts.visibleFailures++
         counts.notified++
@@ -1041,10 +1045,11 @@ function alertWarn(
 }
 
 
-async function closeAcceptedAsServiceRestart(
+async function closeAcceptedAsExecutedError(
   deps: TurnDispatchReconcilerDeps,
   row: TurnDispatchRow,
   nowMs: number,
+  failureCode: 'SERVICE_RESTART' | 'RESULT_RECOVERY_PENDING',
 ): Promise<TurnDispatchRow | null> {
   const client = await deps.pool.connect()
   let terminal: TurnDispatchRow | null = null
@@ -1053,7 +1058,7 @@ async function closeAcceptedAsServiceRestart(
     terminal = await casToTerminal(client, {
       dispatchId: row.dispatchId,
       outcome: 'executed_error',
-      failureCode: 'SERVICE_RESTART',
+      failureCode,
       clientNotified: true,
       fromStatuses: ['accepted'],
       now: nowMs,
@@ -1067,6 +1072,14 @@ async function closeAcceptedAsServiceRestart(
     client.release()
   }
   return terminal
+}
+
+async function closeAcceptedAsServiceRestart(
+  deps: TurnDispatchReconcilerDeps,
+  row: TurnDispatchRow,
+  nowMs: number,
+): Promise<TurnDispatchRow | null> {
+  return closeAcceptedAsExecutedError(deps, row, nowMs, 'SERVICE_RESTART')
 }
 
 async function resolveCarrierDeadDispatchIds(

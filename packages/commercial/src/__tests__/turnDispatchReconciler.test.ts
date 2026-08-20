@@ -540,8 +540,8 @@ describe('accepted-stuck branch (B2: container rejected tombstone)', () => {
     assert.equal(nudged, 1)
     assert.ok(pool.writes.some((w) =>
       w.includes("status = 'terminal'") && w.includes('failure_code = $3')))
-    assert.ok(pool.writeParams.some((p) => p[2] === 'SERVICE_RESTART'))
-    assert.ok(!pool.writeParams.some((p) => p[2] === 'RESULT_RECOVERY_PENDING'))
+    assert.ok(pool.writeParams.some((p) => p[2] === 'RESULT_RECOVERY_PENDING'))
+    assert.ok(!pool.writeParams.some((p) => p[2] === 'SERVICE_RESTART'))
     assert.ok(pool.writes.some((w) =>
       w.includes('history_revision = history_revision + 1') &&
       w.includes('timeline_generation = timeline_generation + 1')))
@@ -644,6 +644,50 @@ describe('carrier-death fast path (accepted)', () => {
     assert.equal(counts.rejectedTerminal, 0)
     assert.ok(pool.writeParams.some((p) => p[1] === 'executed_error' && p[2] === 'SERVICE_RESTART'))
     assert.ok(!pool.writeParams.some((p) => p[1] === 'not_accepted' || p[2] === 'DISPATCH_NOT_ACCEPTED'))
+    assert.ok(!pool.writeParams.some((p) => p[2] === 'RESULT_RECOVERY_PENDING'))
+  })
+
+  test('terminal+crashed 且无停机证据 → 不写 SERVICE_RESTART', async () => {
+    const pool = makeFakePool({
+      acceptedStuck: [rawRow({ status: 'accepted', accepted_at: new Date() })],
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: {
+        ...noContainer,
+        getDispatchState: async (): Promise<ContainerCallResult> => ({
+          kind: 'ok',
+          state: 'terminal',
+          outcome: 'crashed',
+        }),
+      },
+    })
+    assert.equal(counts.visibleFailures, 1)
+    assert.ok(pool.writeParams.some((p) => p[1] === 'executed_error' && p[2] === 'RESULT_RECOVERY_PENDING'))
+    assert.ok(!pool.writeParams.some((p) => p[2] === 'SERVICE_RESTART'))
+  })
+
+  test('terminal+crashed 且有 shutdown_ctx → 收口成 SERVICE_RESTART', async () => {
+    const pool = makeFakePool({
+      acceptedStuck: [rawRow({
+        status: 'accepted',
+        accepted_at: new Date(),
+        shutdown_ctx: { gatewayExitedAt: '2026-08-20T00:00:00.000Z' },
+      })],
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: {
+        ...noContainer,
+        getDispatchState: async (): Promise<ContainerCallResult> => ({
+          kind: 'ok',
+          state: 'terminal',
+          outcome: 'crashed',
+        }),
+      },
+    })
+    assert.equal(counts.visibleFailures, 1)
+    assert.ok(pool.writeParams.some((p) => p[1] === 'executed_error' && p[2] === 'SERVICE_RESTART'))
     assert.ok(!pool.writeParams.some((p) => p[2] === 'RESULT_RECOVERY_PENDING'))
   })
 
