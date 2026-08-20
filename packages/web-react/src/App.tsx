@@ -48,6 +48,7 @@ import {
   restoreVisibleVirtualRowAnchor,
   type VisibleVirtualRowAnchor,
 } from "./components/chat/archivePaging";
+import { createStickToBottomController } from "./components/chat/stickToBottom";
 import { turnFinalAssistantFlags } from "./components/chat/turnSegment";
 import type { CardCallbacks, FeedbackContext } from "./components/chat/cards";
 import { MessageFeedbackDialog } from "./components/chat/MessageFeedbackDialog";
@@ -2075,15 +2076,26 @@ export function App() {
   //     (快照单调版本号,与本仓"version 才是变更权威"的约定一致)。
   //  2. 旧实现无条件劫持:用户上翻回看历史也被拽回底部。改为 near-bottom 粘滞 ——
   //     只有用户本就贴底(<80px)时才跟随;上翻即解除,拉回底部自动恢复。
-  const stickToBottomRef = useRef(true);
+  //  3. 卡片高度晚长不能当成用户离底:跟随意图只由真实输入更新,内容 ResizeObserver
+  //     在 following=true 时二次贴底(见 MessageList)。
+  const stick = useRef(createStickToBottomController()).current;
+  const stickToBottomRef = stick.following;
   const scrollToChatBottom = useCallback(() => {
     const el = scrollRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
+    if (el) stick.scrollToBottom(el);
+  }, [stick]);
+  const cancelArchiveCorrection = useCallback(() => {
+    const anchor = archiveScrollAnchorRef.current;
+    if (anchor) anchor.cancelled = true;
   }, []);
+  const markUserChatScroll = useCallback(() => {
+    stick.markUserIntent();
+    cancelArchiveCorrection();
+  }, [stick, cancelArchiveCorrection]);
   const onChatScroll = useCallback(() => {
     const el = scrollRef.current;
     if (!el) return;
-    stickToBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    stick.onScroll(el);
     const anchor = archiveScrollAnchorRef.current;
     if (
       anchor && !anchor.cancelled && !anchor.restoring &&
@@ -2092,14 +2104,10 @@ export function App() {
       // 用户已经离开点击位置：响应仍须等 DOM 提交后释放 FIFO，但不再把视口拉回旧坐标。
       anchor.cancelled = true;
     }
-  }, [settleArchiveAnchor]);
-  const cancelArchiveCorrection = useCallback(() => {
-    const anchor = archiveScrollAnchorRef.current;
-    if (anchor) anchor.cancelled = true;
-  }, []);
+  }, [settleArchiveAnchor, stick]);
   // 切会话:重置粘滞并瞬时跳底(历史回看从底部开始);同时清归档按钮子态与视口锚点。
   useLayoutEffect(() => {
-    stickToBottomRef.current = true;
+    stick.reset();
     scrollToChatBottom();
     setArchiveLoading(false);
     setArchiveError(false);
@@ -2109,7 +2117,7 @@ export function App() {
       archiveRequestTokenRef.current += 1;
       settleArchiveAnchor();
     };
-  }, [activeId, scrollToChatBottom, settleArchiveAnchor]);
+  }, [activeId, scrollToChatBottom, settleArchiveAnchor, stick]);
   // 内容变更跟随:demo 走 messages/streamText,真实路径走 version/wsSending。
   // 流式期间高频触发,用瞬时赋值而非 smooth(60fps 下排队的平滑动画反而卡顿)。
   // layout 阶段贴底,避免普通 DOM 时间线先画出旧顶部再跳到底部。
@@ -2122,6 +2130,7 @@ export function App() {
   // 该行恢复到原位置；底部仍在增长的实时 Agent 响应不会污染这次校正。
   const onLoadOlderHistory = useCallback(async () => {
     if (demo || !activeId) return;
+    stick.following.current = false;
     settleArchiveAnchor();
     const token = ++archiveRequestTokenRef.current;
     const el = scrollRef.current;
@@ -2171,7 +2180,7 @@ export function App() {
     // Keep the shared history FIFO occupied until this request's DOM insertion
     // has either been anchored or deliberately cancelled by user navigation.
     await anchorSettled;
-  }, [demo, activeId, chat, settleArchiveAnchor]);
+  }, [demo, activeId, chat, settleArchiveAnchor, stick]);
   // 对应归档响应完成且前插行渲染后(paint 前)才校正 scrollTop。请求在途时的 tape/live
   // 增长没有 ready token，不能冒领这个锚点。
   useLayoutEffect(() => {
@@ -2694,10 +2703,10 @@ export function App() {
         <div
           ref={bindChatScroll}
           onScroll={onChatScroll}
-          onWheel={cancelArchiveCorrection}
-          onTouchStart={cancelArchiveCorrection}
-          onPointerDown={cancelArchiveCorrection}
-          onKeyDown={cancelArchiveCorrection}
+          onWheel={markUserChatScroll}
+          onTouchStart={markUserChatScroll}
+          onPointerDown={markUserChatScroll}
+          onKeyDown={markUserChatScroll}
           className="chat-scroll-area min-h-0 flex-1 overflow-y-auto overflow-x-hidden"
         >
           {gated ? (
@@ -2811,6 +2820,7 @@ export function App() {
                   scrollParent={chatScrollParent}
                   historyGeneration={`${activeId ?? "none"}::${activeSess?._timelineGeneration ?? "legacy"}`}
                   sessionId={activeId}
+                  followBottomRef={stickToBottomRef}
                 />
               </SessionTimelineBoundary>
             </ResponseRatingProvider>

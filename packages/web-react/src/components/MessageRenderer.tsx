@@ -905,6 +905,7 @@ export function MessageList({
   scrollParent,
   historyGeneration = "legacy",
   sessionId,
+  followBottomRef,
 }: {
   messages: ChatMessage[];
   sending: boolean;
@@ -930,6 +931,13 @@ export function MessageList({
   /** Server history revision. A new revision gets a fresh paging intent owner. */
   historyGeneration?: number | string;
   sessionId?: string;
+  /**
+   * App stick-to-bottom intent. When true, content-height growth (late card
+   * layout, streaming) re-snaps the scroller to the end. Window expand sets
+   * this false and holds a preserve lock so ResizeObserver cannot yank to
+   * bottom while correctedScrollTop runs.
+   */
+  followBottomRef?: { current: boolean };
 }) {
   const pagingOwnerRef = useRef<{
     generation: string;
@@ -950,7 +958,27 @@ export function MessageList({
   const itemCountRef = useRef(0);
   const startOverrideRef = useRef<number | null>(null);
   const pendingExpandCorrectionRef = useRef<{ height: number; top: number } | null>(null);
+  const viewportPreserveLockRef = useRef(false);
+  const listRootRef = useRef<HTMLDivElement | null>(null);
   const didSnapToBottomRef = useRef(false);
+  const followBottomRefBox = useRef(followBottomRef);
+  followBottomRefBox.current = followBottomRef;
+  const beginViewportPreserve = () => {
+    viewportPreserveLockRef.current = true;
+    const follow = followBottomRefBox.current;
+    if (follow) follow.current = false;
+  };
+  const endViewportPreserve = () => {
+    if (typeof requestAnimationFrame !== "function") {
+      viewportPreserveLockRef.current = false;
+      return;
+    }
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        viewportPreserveLockRef.current = false;
+      });
+    });
+  };
   const sessionIdRef = useRef(sessionId);
   if (sessionIdRef.current !== sessionId) {
     sessionIdRef.current = sessionId;
@@ -1059,6 +1087,7 @@ export function MessageList({
       const total = itemCountRef.current;
       const current = startOverrideRef.current ?? defaultTailStart(total);
       if (current <= 0) return;
+      beginViewportPreserve();
       pendingExpandCorrectionRef.current = {
         height: scroller.scrollHeight,
         top: scroller.scrollTop,
@@ -1191,6 +1220,7 @@ export function MessageList({
     const total = itemCountRef.current;
     const current = startOverrideRef.current ?? defaultTailStart(total);
     if (current <= 0) return;
+    beginViewportPreserve();
     if (el) {
       pendingExpandCorrectionRef.current = {
         height: el.scrollHeight,
@@ -1206,7 +1236,22 @@ export function MessageList({
     if (!pending || !el) return;
     pendingExpandCorrectionRef.current = null;
     el.scrollTop = correctedScrollTop(pending.height, el.scrollHeight, pending.top);
+    endViewportPreserve();
   }, [windowVersion, scrollParent]);
+  useLayoutEffect(() => {
+    const scroller = scrollParent;
+    const root = listRootRef.current;
+    if (!scroller || !root || !followBottomRef) return;
+    if (typeof ResizeObserver === "undefined") return;
+    const follow = () => {
+      if (viewportPreserveLockRef.current) return;
+      if (!followBottomRef.current) return;
+      scroller.scrollTop = scroller.scrollHeight;
+    };
+    const observer = new ResizeObserver(follow);
+    observer.observe(root);
+    return () => observer.disconnect();
+  }, [scrollParent, followBottomRef, windowVersion, messages.length]);
   useLayoutEffect(() => {
     const el = scrollParent;
     if (!el || didSnapToBottomRef.current) return;
@@ -1398,7 +1443,11 @@ export function MessageList({
   }
 
   return (
-    <div className="mx-auto flex max-w-3xl flex-col gap-4 px-5 py-8" data-testid="timeline-short-list">
+    <div
+      ref={listRootRef}
+      className="mx-auto max-w-3xl space-y-4 px-5 py-8"
+      data-testid="timeline-short-list"
+    >
       {historyControl}
       {visibleItems.map((item) => (
         <div

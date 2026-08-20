@@ -2082,6 +2082,135 @@ describe("长时间线普通 DOM 分页与活跃状态稳定性", () => {
     scroller.remove();
   });
 
+  test("首开内容高度晚长时跟随底部", () => {
+    const observers: ResizeObserverCallback[] = [];
+    vi.stubGlobal("ResizeObserver", class {
+      constructor(cb: ResizeObserverCallback) {
+        observers.push(cb);
+      }
+      observe() {}
+      disconnect() {}
+      unobserve() {}
+    });
+    const followBottomRef = { current: true };
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    Object.defineProperty(scroller, "clientHeight", { configurable: true, value: 200 });
+    let height = 500;
+    Object.defineProperty(scroller, "scrollHeight", { configurable: true, get: () => height });
+    scroller.scrollTop = 300;
+    const rows = Array.from({ length: 90 }, (_, index) =>
+      mk("user", { id: "late-grow-" + index, text: "晚长记录 " + index, status: "sent" }),
+    );
+    render(
+      <MessageList
+        messages={rows}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+        followBottomRef={followBottomRef}
+      />,
+      { container: scroller },
+    );
+    expect(observers.length).toBeGreaterThan(0);
+    height = 900;
+    act(() => {
+      for (const cb of observers) cb([] as unknown as ResizeObserverEntry[], {} as ResizeObserver);
+    });
+    expect(followBottomRef.current).toBe(true);
+    expect(scroller.scrollTop).toBe(900);
+    vi.unstubAllGlobals();
+    scroller.remove();
+  });
+
+  test("上滚后内容再长不拉回底部", () => {
+    const observers: ResizeObserverCallback[] = [];
+    vi.stubGlobal("ResizeObserver", class {
+      constructor(cb: ResizeObserverCallback) {
+        observers.push(cb);
+      }
+      observe() {}
+      disconnect() {}
+      unobserve() {}
+    });
+    const followBottomRef = { current: true };
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    Object.defineProperty(scroller, "clientHeight", { configurable: true, value: 200 });
+    let height = 800;
+    Object.defineProperty(scroller, "scrollHeight", { configurable: true, get: () => height });
+    scroller.scrollTop = 600;
+    const rows = Array.from({ length: 90 }, (_, index) =>
+      mk("user", { id: "stay-up-" + index, text: "上滚记录 " + index, status: "sent" }),
+    );
+    render(
+      <MessageList
+        messages={rows}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+        followBottomRef={followBottomRef}
+      />,
+      { container: scroller },
+    );
+    followBottomRef.current = false;
+    scroller.scrollTop = 40;
+    height = 1400;
+    act(() => {
+      for (const cb of observers) cb([] as unknown as ResizeObserverEntry[], {} as ResizeObserver);
+    });
+    expect(scroller.scrollTop).toBe(40);
+    vi.unstubAllGlobals();
+    scroller.remove();
+  });
+
+  test("向上扩窗口时 ResizeObserver 不把视口拽到底部", async () => {
+    const observers: ResizeObserverCallback[] = [];
+    vi.stubGlobal("ResizeObserver", class {
+      constructor(cb: ResizeObserverCallback) {
+        observers.push(cb);
+      }
+      observe() {}
+      disconnect() {}
+      unobserve() {}
+    });
+    const followBottomRef = { current: true };
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    Object.defineProperty(scroller, "clientHeight", { configurable: true, value: 200 });
+    let height = 1000;
+    Object.defineProperty(scroller, "scrollHeight", { configurable: true, get: () => height });
+    scroller.scrollTop = 0;
+    const rows = Array.from({ length: 220 }, (_, index) =>
+      mk("user", { id: "preserve-row-" + index, text: "驻留记录 " + index, status: "sent" }),
+    );
+    render(
+      <MessageList
+        messages={rows}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+        followBottomRef={followBottomRef}
+      />,
+      { container: scroller },
+    );
+    fireEvent.click(screen.getByRole("button", { name: /查看更早历史记录/ }));
+    await act(async () => {});
+    expect(followBottomRef.current).toBe(false);
+    const topBeforeGrow = scroller.scrollTop;
+    height = 1800;
+    act(() => {
+      for (const cb of observers) cb([] as unknown as ResizeObserverEntry[], {} as ResizeObserver);
+    });
+    expect(scroller.scrollTop).toBe(topBeforeGrow);
+    expect(scroller.scrollTop).not.toBe(height);
+    vi.unstubAllGlobals();
+    scroller.remove();
+  });
+
   test("live→tape generation 变化不重挂活动 Footer，滚动身份保持", async () => {
     const scroller = document.createElement("div");
     document.body.appendChild(scroller);

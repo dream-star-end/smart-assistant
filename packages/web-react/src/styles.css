@@ -225,10 +225,13 @@ body {
   /* Timeline rows stay motion-stable: entrance animation would flash when a
      tail window expands or live→tape reconciles in place. */
   .chat-virtual-item .animate-in { animation: none; }
-  /* Skip layout/paint for off-screen cards; `auto` remembers last measured height. */
+  /* Skip layout/paint for off-screen cards. `auto` remembers last measured height.
+     200px is closer to typical tool/thinking cards than 120px, cutting the
+     reveal-time layout jump on a fully expanded transcript. Do not add
+     `contain: content` here: tool menus and popovers overflow the row. */
   .chat-timeline-row {
     content-visibility: auto;
-    contain-intrinsic-size: auto 120px;
+    contain-intrinsic-size: auto 200px;
   }
   /* ── iOS 安全区(刘海/灵动岛/Home 指示条 + 横屏侧刘海),配合 index.html viewport-fit=cover。
      无安全区的设备(安卓/桌面)env() 回退 0px,零影响。各类按"叠加在原内边距之上"用 calc。── */
