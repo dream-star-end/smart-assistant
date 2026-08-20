@@ -4838,6 +4838,9 @@ export class SessionManager {
             toolName: tr.toolName,
             durationMs: tr.durationMs,
             isError: tr.isError,
+            ...(session._currentTurnTraceId
+              ? { traceId: session._currentTurnTraceId }
+              : {}),
             inputPreview: tr.inputPreview,
             outputPreview: tr.preview ? tr.preview.slice(0, 500) : undefined,
             ...(tr.exitCode !== undefined ? { exitCode: tr.exitCode } : {}),
@@ -5837,6 +5840,9 @@ export class SessionManager {
               },
               toolCalls: turnToolCallCount,
               durationMs: turnDurationMs,
+              ...(session._currentTurnTraceId
+                ? { traceId: session._currentTurnTraceId }
+                : {}),
               // PR2 v1.0.66 — codex-native turn 把 server-owned requestId 透到这里,
               // 让 event_log / 异步 audit 能关联到 inflightCodexTurns 行。其它路径 undefined。
               ...(requestId ? { requestId } : {}),

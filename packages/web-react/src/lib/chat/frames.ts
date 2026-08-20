@@ -314,6 +314,8 @@ export type InboundHelloWire = {
   type: "inbound.hello";
   channel: "webchat";
   automaticRecoveryOwner: "master-v1";
+  /** Actual DOM oc-build running in this browser tab. */
+  clientBuild?: string;
   peers: Array<{
     peerId: string;
     agentId: string;

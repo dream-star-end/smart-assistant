@@ -112,7 +112,8 @@
     "0231_turn_tape_materialization_resilience",
     "0232_agent_group_jsonb_unicode_sanitize",
     "0233_client_session_list_archived_at",
-    "0234_all_model_prices_half"
+    "0234_all_model_prices_half",
+    "0235_telemetry_iteration_closure"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

@@ -69,6 +69,7 @@ import {
 import { V3_AGENT_GID, V3_AGENT_UID } from "../agent-sandbox/constants.js";
 import { CostEventSink } from "./costEventSink.js";
 import { makeForwarder } from "./forwarder.js";
+import { shutdownDurableMetricRollups } from "../admin/durableMetricRollups.js";
 
 const log = rootLogger.child({ subsys: "egressMain" });
 
@@ -76,6 +77,7 @@ const log = rootLogger.child({ subsys: "egressMain" });
 const EGRESS_DRAIN_MS = Number(process.env.EGRESS_DRAIN_MS ?? 30 * 60_000);
 
 export async function startEgress(): Promise<void> {
+  process.env.OC_EGRESS_PROCESS = "1";
   // D3④:进程实例标识 —— 优先 systemd invocation id(每次 (re)start 变化),否则随机
   // UUID。finalize 门槛用它区分"队列自然排空"与"egress 中途重启计数归零假绿"。
   const processStartId = process.env.INVOCATION_ID ?? randomUUID();
@@ -442,7 +444,12 @@ export async function startEgress(): Promise<void> {
     console.log(`[egress] SIGTERM — draining in-flight streams (max ${EGRESS_DRAIN_MS}ms)…`);
     // close() 停接新连接,已建立连接(在飞流)自然完结;到 drain 上限强制退出。
     server.close(() => {
-      void costSink.flush().finally(() => process.exit(0));
+      void (async () => {
+        try { await costSink.flush(); } finally {
+          try { await shutdownDurableMetricRollups(); } catch { /* best-effort */ }
+          process.exit(0);
+        }
+      })();
     });
     setTimeout(() => {
       // eslint-disable-next-line no-console

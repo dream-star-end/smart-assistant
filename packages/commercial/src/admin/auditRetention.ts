@@ -63,6 +63,11 @@ export const AUDIT_RETENTION_POLICIES: readonly RetentionPolicy[] = [
   { table: "skill_retrieval_shadow_events", column: "created_at", days: 30 },
   { table: "prompt_queue_mutations", column: "created_at", days: 30 },
   { table: "product_friction_events", column: "updated_at", days: 30 },
+  { table: "turn_runtime_observations", column: "observed_at", days: 90 },
+  { table: "turn_upstream_performance", column: "observed_at", days: 90 },
+  { table: "telemetry_metric_rollups", column: "bucket_start", days: 180 },
+  { table: "response_rating_nudges", column: "updated_at", days: 180 },
+  { table: "telemetry_readiness_evidence", column: "created_at", days: 180 },
   { table: "image_generation_attempts", column: "started_at", days: 30, predicate: "outcome<>'pending'" },
   { table: "selfheal_wecom_inbound_dedupe", column: "received_at", days: 90 },
   // P1#11:连接器写账本 90 天终态 retention 统一收口到这里(connectorSweeper 只做

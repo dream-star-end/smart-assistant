@@ -10,12 +10,14 @@
  */
 
 import { createHash, randomBytes } from 'node:crypto'
+import { readFileSync } from 'node:fs'
 import { mkdir, open, readFile, readdir, rename, unlink } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
 import {
   type ToolCalledEvent,
+  type TurnCompletedEvent,
   type ToolFailureErrorClass,
   type ToolFailureKind,
   type ToolTerminationReason,
@@ -29,6 +31,7 @@ const log = createLogger({ module: 'v3ToolFailureReporter' })
 
 export const TOOL_FAILURE_AUDIT_PATH = '/internal/v3/agent-audit/tool-failure'
 export const TOOL_CALL_ROLLUP_PATH = '/internal/v3/agent-audit/tool-rollup'
+export const TURN_OBSERVATION_PATH = '/internal/v3/turn-observation'
 export const TOOL_AUDIT_SCHEMA_HEADER = 'x-openclaude-tool-audit-schema'
 
 const MAX_FIELD_CHARS = 512
@@ -47,6 +50,7 @@ const MAX_QUEUE_ENTRIES = 500
 const QUEUE_OVERFLOW_WARN_INTERVAL_MS = 60_000
 const FAILURE_QUEUE_PREFIX = 'failure-'
 const ROLLUP_QUEUE_PREFIX = 'rollup-'
+const TURN_QUEUE_PREFIX = 'turn-'
 
 /**
  * 遥测显式开关 env(与 master 侧 internalToolFailureAudit 路由门控同名,双端一致)。
@@ -113,10 +117,30 @@ export interface ToolFailureReportPayloadV3 {
   timestamp: number
 }
 
+export interface ToolFailureReportPayloadV4 extends Omit<ToolFailureReportPayloadV3, 'schemaVersion'> {
+  schemaVersion: 4
+  traceId?: string
+}
+
 export type ToolFailureReportPayload =
   | ToolFailureReportPayloadV1
   | ToolFailureReportPayloadV2
   | ToolFailureReportPayloadV3
+  | ToolFailureReportPayloadV4
+
+export interface TurnObservationPayload {
+  schemaVersion: 1
+  eventId: string
+  sessionKey: string
+  agentId: string
+  traceId?: string
+  model?: string
+  durationMs: number
+  toolCalls: number
+  runtimeSourceCommit?: string
+  runtimeBootHash?: string
+  timestamp: number
+}
 
 export interface ToolCallRollupCount {
   agentId: string
@@ -125,10 +149,12 @@ export interface ToolCallRollupCount {
   errorClass: ToolFailureErrorClass | 'none'
   failureKind: ToolFailureKind | 'none'
   count: number
+  totalDurationMs: number
+  maxDurationMs: number
 }
 
 export interface ToolCallRollupPayload {
-  schemaVersion: 1
+  schemaVersion: 2
   reportId: string
   reporterRunId: string
   sequence: number
@@ -139,8 +165,8 @@ export interface ToolCallRollupPayload {
 
 interface ToolReportQueueEntry {
   schemaVersion: 1 | 2
-  kind?: 'failure' | 'rollup'
-  payload: ToolFailureReportPayload | ToolCallRollupPayload
+  kind?: 'failure' | 'rollup' | 'turn'
+  payload: ToolFailureReportPayload | ToolCallRollupPayload | TurnObservationPayload
   firstSeenAt: number
   attempts: number
   lastErrorAt?: number
@@ -183,7 +209,7 @@ export function defaultToolFailureQueueDir(): string {
   return join(home, 'tool-failure-report.d')
 }
 
-type QueueKind = 'failure' | 'rollup'
+type QueueKind = 'failure' | 'rollup' | 'turn'
 
 function cap(value: string, max: number): string {
   return value.length <= max ? value : `${value.slice(0, Math.max(0, max - 12))}…[truncated]`
@@ -204,7 +230,7 @@ function sha256Preview(value: string | undefined): string | undefined {
 
 export function buildToolFailureReportPayload(
   ev: ToolCalledEvent,
-): ToolFailureReportPayloadV3 | null {
+): ToolFailureReportPayloadV4 | null {
   if (!ev.isError) return null
   const classification = classifyToolFailure({
     outputPreview: ev.outputPreview,
@@ -212,7 +238,7 @@ export function buildToolFailureReportPayload(
     terminationReason: ev.terminationReason,
   })
   return {
-    schemaVersion: 3,
+    schemaVersion: 4,
     eventId: safeString(ev.id, createHash('sha256').update(JSON.stringify(ev)).digest('hex'), 128),
     sessionKey: safeString(ev.sessionKey, 'unknown', 512),
     agentId: safeString(ev.agentId, 'unknown', 128),
@@ -223,10 +249,16 @@ export function buildToolFailureReportPayload(
     outputHash: sha256Preview(ev.outputPreview),
     errorClass: classification.errorClass,
     failureKind: classification.failureKind,
+    ...(ev.traceId && /^[0-9a-f]{32}$/.test(ev.traceId) ? { traceId: ev.traceId } : {}),
     ...(ev.exitCode !== undefined ? { exitCode: ev.exitCode } : {}),
     ...(ev.terminationReason !== undefined ? { terminationReason: ev.terminationReason } : {}),
     timestamp: Number.isFinite(ev.timestamp) ? Math.max(0, Math.trunc(ev.timestamp)) : Date.now(),
   }
+}
+
+function v3Projection(payload: ToolFailureReportPayloadV4): ToolFailureReportPayloadV3 {
+  const { traceId: _traceId, ...v3 } = payload
+  return { ...v3, schemaVersion: 3 }
 }
 
 function v2Projection(payload: ToolFailureReportPayloadV3): ToolFailureReportPayloadV2 {
@@ -252,6 +284,12 @@ function v2Projection(payload: ToolFailureReportPayloadV3): ToolFailureReportPay
 }
 
 let schemaFallbackWarned = false
+
+function advertisedToolAuditSchema(res: Response): number {
+  const raw = res.headers.get(TOOL_AUDIT_SCHEMA_HEADER)
+  const value = raw === null ? 0 : Number(raw)
+  return Number.isInteger(value) && value >= 0 ? value : 0
+}
 
 function retryableStatus(status: number, rollup = false): boolean {
   return (
@@ -293,22 +331,38 @@ export async function sendToolFailureReport(
     let res = await postReport(TOOL_FAILURE_AUDIT_PATH, payload, cfg, fetchImpl, controller.signal)
     if (res.ok) return
     if (
-      payload.schemaVersion === 3 &&
+      (payload.schemaVersion === 4 || payload.schemaVersion === 3) &&
       res.status === 400 &&
-      res.headers.get(TOOL_AUDIT_SCHEMA_HEADER) === null
+      advertisedToolAuditSchema(res) < payload.schemaVersion
     ) {
       if (!schemaFallbackWarned) {
         schemaFallbackWarned = true
-        log.warn('tool failure audit master lacks schema v3; falling back to v2')
+        log.warn('tool failure audit master lacks current schema; falling back')
       }
+      const fallback = payload.schemaVersion === 4
+        ? v3Projection(payload)
+        : v2Projection(payload)
       res = await postReport(
         TOOL_FAILURE_AUDIT_PATH,
-        v2Projection(payload),
+        fallback,
         cfg,
         fetchImpl,
         controller.signal,
       )
       if (res.ok) return
+      if (
+        payload.schemaVersion === 4 && res.status === 400
+        && advertisedToolAuditSchema(res) < fallback.schemaVersion
+      ) {
+        res = await postReport(
+          TOOL_FAILURE_AUDIT_PATH,
+          fallback.schemaVersion === 3 ? v2Projection(fallback) : fallback,
+          cfg,
+          fetchImpl,
+          controller.signal,
+        )
+        if (res.ok) return
+      }
     }
     throw new ToolFailureReportError(
       `tool failure audit returned HTTP ${res.status}`,
@@ -333,8 +387,17 @@ export async function sendToolCallRollup(
   const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? ATTEMPT_TIMEOUT_MS)
   const fetchImpl = opts.fetchImpl ?? fetch
   try {
-    const res = await postReport(TOOL_CALL_ROLLUP_PATH, payload, cfg, fetchImpl, controller.signal)
+    let res = await postReport(TOOL_CALL_ROLLUP_PATH, payload, cfg, fetchImpl, controller.signal)
     if (res.ok) return
+    if (res.status === 400) {
+      const legacy = {
+        ...payload,
+        schemaVersion: 1,
+        counts: payload.counts.map(({ totalDurationMs: _total, maxDurationMs: _max, ...count }) => count),
+      }
+      res = await postReport(TOOL_CALL_ROLLUP_PATH, legacy, cfg, fetchImpl, controller.signal)
+      if (res.ok) return
+    }
     throw new ToolFailureReportError(
       `tool call rollup returned HTTP ${res.status}`,
       retryableStatus(res.status, true),
@@ -346,6 +409,69 @@ export async function sendToolCallRollup(
     throw new ToolFailureReportError(message, true)
   } finally {
     clearTimeout(timer)
+  }
+}
+
+export async function sendTurnObservation(
+  payload: TurnObservationPayload,
+  cfg: ToolFailureReportConfig,
+  opts: { fetchImpl?: FetchLike; timeoutMs?: number } = {},
+): Promise<void> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? ATTEMPT_TIMEOUT_MS)
+  const fetchImpl = opts.fetchImpl ?? fetch
+  try {
+    const res = await postReport(TURN_OBSERVATION_PATH, payload, cfg, fetchImpl, controller.signal)
+    if (res.ok) return
+    throw new ToolFailureReportError(
+      `turn observation returned HTTP ${res.status}`,
+      retryableStatus(res.status, true),
+      res.status,
+    )
+  } catch (err) {
+    if (err instanceof ToolFailureReportError) throw err
+    throw new ToolFailureReportError(err instanceof Error ? err.message : String(err), true)
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+let runtimeIdentityCache: { sourceCommit?: string; bootHash?: string } | null = null
+function runtimeIdentity(): { sourceCommit?: string; bootHash?: string } {
+  if (runtimeIdentityCache) return runtimeIdentityCache
+  try {
+    const raw = JSON.parse(readFileSync('/opt/openclaude/MANIFEST.json', 'utf8')) as {
+      sourceCommit?: unknown
+      bootHash?: unknown
+    }
+    runtimeIdentityCache = {
+      ...(typeof raw.sourceCommit === 'string' && /^[0-9a-f]{40}$/.test(raw.sourceCommit)
+        ? { sourceCommit: raw.sourceCommit }
+        : {}),
+      ...(typeof raw.bootHash === 'string' && /^[0-9a-f]{12,64}$/.test(raw.bootHash)
+        ? { bootHash: raw.bootHash }
+        : {}),
+    }
+  } catch {
+    runtimeIdentityCache = {}
+  }
+  return runtimeIdentityCache
+}
+
+export function buildTurnObservationPayload(ev: TurnCompletedEvent): TurnObservationPayload {
+  const runtime = runtimeIdentity()
+  return {
+    schemaVersion: 1,
+    eventId: safeString(ev.id, createHash('sha256').update(JSON.stringify(ev)).digest('hex'), 128),
+    sessionKey: safeString(ev.sessionKey, 'unknown', 512),
+    agentId: safeString(ev.agentId, 'unknown', 128),
+    ...(ev.traceId && /^[0-9a-f]{32}$/.test(ev.traceId) ? { traceId: ev.traceId } : {}),
+    ...(ev.usage.model ? { model: safeString(ev.usage.model, 'unknown', 128) } : {}),
+    durationMs: Number.isFinite(ev.durationMs) ? Math.max(0, Math.trunc(ev.durationMs)) : 0,
+    toolCalls: Number.isFinite(ev.toolCalls) ? Math.max(0, Math.trunc(ev.toolCalls)) : 0,
+    ...(runtime.sourceCommit ? { runtimeSourceCommit: runtime.sourceCommit } : {}),
+    ...(runtime.bootHash ? { runtimeBootHash: runtime.bootHash } : {}),
+    timestamp: Number.isFinite(ev.timestamp) ? Math.max(0, Math.trunc(ev.timestamp)) : Date.now(),
   }
 }
 
@@ -361,6 +487,7 @@ export interface ToolFailureReporter {
 export function makeToolFailureReporter(deps: {
   config: ToolFailureReportConfig
   queueDir?: string
+  turnQueueDir?: string
   eventBus?: EventBusLike
   fetchImpl?: FetchLike
   now?: () => number
@@ -373,6 +500,10 @@ export function makeToolFailureReporter(deps: {
   reporterRunId?: string
 }): ToolFailureReporter {
   const dir = deps.queueDir ?? defaultToolFailureQueueDir()
+  // Keep the new queue outside the directory scanned by rolling-back runtimes.
+  // Old reporters ignore the subdirectory, so they cannot misclassify and
+  // delete turn observations they do not understand.
+  const turnDir = deps.turnQueueDir ?? join(dir, 'turn-observation')
   const now = deps.now ?? (() => Date.now())
   const bus = deps.eventBus ?? eventBus
   const drainIntervalMs = deps.drainIntervalMs ?? DRAIN_INTERVAL_MS
@@ -406,16 +537,23 @@ export function makeToolFailureReporter(deps: {
   const rollupCounts = new Map<string, ToolCallRollupCount>()
 
   async function ensureDir(): Promise<void> {
-    await mkdir(dir, { recursive: true })
+    await Promise.all([
+      mkdir(dir, { recursive: true }),
+      mkdir(turnDir, { recursive: true }),
+    ])
+  }
+
+  function queueDirFor(kind: QueueKind): string {
+    return kind === 'turn' ? turnDir : dir
   }
 
   function filename(kind: QueueKind): string {
-    const prefix = kind === 'rollup' ? ROLLUP_QUEUE_PREFIX : FAILURE_QUEUE_PREFIX
+    const prefix = kind === 'rollup' ? ROLLUP_QUEUE_PREFIX : kind === 'turn' ? TURN_QUEUE_PREFIX : FAILURE_QUEUE_PREFIX
     return `${prefix}${now()}-${randomBytes(8).toString('hex')}.json`
   }
 
   function fileKind(file: string): QueueKind {
-    return file.startsWith(ROLLUP_QUEUE_PREFIX) ? 'rollup' : 'failure'
+    return file.startsWith(ROLLUP_QUEUE_PREFIX) ? 'rollup' : file.startsWith(TURN_QUEUE_PREFIX) ? 'turn' : 'failure'
   }
 
   async function atomicWriteJson(filepath: string, data: unknown): Promise<void> {
@@ -458,18 +596,19 @@ export function makeToolFailureReporter(deps: {
 
   async function enqueue(
     kind: QueueKind,
-    payload: ToolFailureReportPayload | ToolCallRollupPayload,
+    payload: ToolFailureReportPayload | ToolCallRollupPayload | TurnObservationPayload,
   ): Promise<void> {
     await ensureDir()
     // 条数上限:超限先丢最旧(文件名前缀是毫秒时间戳,字典序≈时间序),再写新条目;
     // warn 限频,避免 master 长期不可达 + 工具失败风暴时日志刷屏。
     const cap = kind === 'rollup' ? maxRollupQueueEntries : maxQueueEntries
-    const existing = (await readdir(dir))
+    const targetDir = queueDirFor(kind)
+    const existing = (await readdir(targetDir))
       .filter((f) => f.endsWith('.json') && fileKind(f) === kind)
       .sort()
     if (existing.length >= cap) {
       const overflow = existing.slice(0, existing.length - cap + 1)
-      await Promise.all(overflow.map((f) => unlink(join(dir, f)).catch(() => {})))
+      await Promise.all(overflow.map((f) => unlink(join(targetDir, f)).catch(() => {})))
       if (now() - lastOverflowWarnAt >= QUEUE_OVERFLOW_WARN_INTERVAL_MS) {
         lastOverflowWarnAt = now()
         log.warn('tool failure queue over capacity: dropped oldest entries', {
@@ -479,7 +618,7 @@ export function makeToolFailureReporter(deps: {
         })
       }
     }
-    await atomicWriteJson(join(dir, filename(kind)), {
+    await atomicWriteJson(join(targetDir, filename(kind)), {
       schemaVersion: kind === 'rollup' ? 2 : 1,
       kind,
       payload,
@@ -500,6 +639,8 @@ export function makeToolFailureReporter(deps: {
         errorClass: 'none',
         failureKind: 'none',
         count: 1,
+        totalDurationMs: Math.max(0, Math.trunc(ev.durationMs)),
+        maxDurationMs: Math.max(0, Math.trunc(ev.durationMs)),
       }
     }
     const failure = classifyToolFailure({
@@ -514,6 +655,8 @@ export function makeToolFailureReporter(deps: {
       errorClass: failure.errorClass,
       failureKind: failure.failureKind,
       count: 1,
+      totalDurationMs: Math.max(0, Math.trunc(ev.durationMs)),
+      maxDurationMs: Math.max(0, Math.trunc(ev.durationMs)),
     }
   }
 
@@ -526,7 +669,11 @@ export function makeToolFailureReporter(deps: {
       count.failureKind,
     ])
     const existing = rollupCounts.get(key)
-    if (existing) existing.count += count.count
+    if (existing) {
+      existing.count += count.count
+      existing.totalDurationMs += count.totalDurationMs
+      existing.maxDurationMs = Math.max(existing.maxDurationMs, count.maxDurationMs)
+    }
     else rollupCounts.set(key, { ...count })
   }
 
@@ -554,12 +701,28 @@ export function makeToolFailureReporter(deps: {
           target = { counts: [], dimensions: new Set() }
           batches.push(target)
         }
-        target.counts.push({ ...count, count: Math.min(remaining, maxRollupCount) })
+        const take = Math.min(remaining, maxRollupCount)
+        const allocatedDuration = remaining === take
+          ? count.totalDurationMs
+          : Math.floor((count.totalDurationMs * take) / count.count)
+        target.counts.push({
+          ...count,
+          count: take,
+          totalDurationMs: allocatedDuration,
+        })
+        count.totalDurationMs -= allocatedDuration
+        count.count -= take
         target.dimensions.add(dimension)
-        remaining -= maxRollupCount
+        remaining -= take
       }
     }
     return batches.map((batch) => batch.counts)
+  }
+
+  function enqueueTurn(payload: TurnObservationPayload): void {
+    enqueueChain = enqueueChain.then(() => enqueue('turn', payload)).catch((err) => {
+      log.warn('failed to enqueue turn observation', { eventId: payload.eventId }, err)
+    })
   }
 
   function enqueueFailure(payload: ToolFailureReportPayload): void {
@@ -586,7 +749,7 @@ export function makeToolFailureReporter(deps: {
         const batch = batches[index]
         const sequence = rollupSequence + 1
         const payload: ToolCallRollupPayload = {
-          schemaVersion: 1,
+          schemaVersion: 2,
           reportId: randomBytes(16).toString('hex'),
           reporterRunId,
           sequence,
@@ -613,6 +776,10 @@ export function makeToolFailureReporter(deps: {
     })
     rollupFlushChain = task.catch(() => {})
     return task
+  }
+
+  function onTurnCompleted(ev: TurnCompletedEvent): void {
+    enqueueTurn(buildTurnObservationPayload(ev))
   }
 
   function onToolCalled(ev: ToolCalledEvent): void {
@@ -656,14 +823,20 @@ export function makeToolFailureReporter(deps: {
   }> {
     await ensureDir()
     const stats = { considered: 0, sent: 0, retried: 0, dropped: 0 }
-    const files = (await readdir(dir))
-      .filter((f) => f.endsWith('.json'))
-      .sort((a, b) => {
-        const kindOrder = Number(fileKind(a) !== 'rollup') - Number(fileKind(b) !== 'rollup')
-        return kindOrder !== 0 ? kindOrder : a.localeCompare(b)
+    const files = (await Promise.all([
+      readdir(dir).then((names) => names
+        .filter((file) => file.endsWith('.json') && fileKind(file) !== 'turn')
+        .map((file) => ({ dir, file }))),
+      readdir(turnDir).then((names) => names
+        .filter((file) => file.endsWith('.json') && fileKind(file) === 'turn')
+        .map((file) => ({ dir: turnDir, file }))),
+    ])).flat().sort((a, b) => {
+        const kindOrder = Number(fileKind(a.file) !== 'rollup') - Number(fileKind(b.file) !== 'rollup')
+        return kindOrder !== 0 ? kindOrder : a.file.localeCompare(b.file)
       })
-    for (const file of files) {
-      const filepath = join(dir, file)
+    for (const queued of files) {
+      const { file } = queued
+      const filepath = join(queued.dir, file)
       let entry: ToolReportQueueEntry
       try {
         entry = JSON.parse(await readFile(filepath, 'utf8')) as ToolReportQueueEntry
@@ -688,6 +861,10 @@ export function makeToolFailureReporter(deps: {
         const kind = entry.kind ?? fileKind(file)
         if (kind === 'rollup') {
           await sendToolCallRollup(entry.payload as ToolCallRollupPayload, deps.config, {
+            fetchImpl: deps.fetchImpl,
+          })
+        } else if (kind === 'turn') {
+          await sendTurnObservation(entry.payload as TurnObservationPayload, deps.config, {
             fetchImpl: deps.fetchImpl,
           })
         } else {
@@ -724,7 +901,9 @@ export function makeToolFailureReporter(deps: {
   async function pendingCount(): Promise<number> {
     try {
       await ensureDir()
-      return (await readdir(dir)).filter((f) => f.endsWith('.json')).length
+      const [toolFiles, turnFiles] = await Promise.all([readdir(dir), readdir(turnDir)])
+      return toolFiles.filter((f) => f.endsWith('.json') && fileKind(f) !== 'turn').length
+        + turnFiles.filter((f) => f.endsWith('.json') && fileKind(f) === 'turn').length
     } catch {
       return 0
     }
@@ -734,6 +913,7 @@ export function makeToolFailureReporter(deps: {
     if (!started) return
     started = false
     bus.off('tool.called', onToolCalled)
+    bus.off('turn.completed', onTurnCompleted)
     if (drainTimer) clearInterval(drainTimer)
     if (rollupTimer) clearInterval(rollupTimer)
     if (drainKickTimer) clearTimeout(drainKickTimer)
@@ -779,6 +959,9 @@ export function makeToolFailureReporter(deps: {
     start() {
       if (started) return
       started = true
+      // Register turn first so minimal single-listener test doubles still exercise
+      // the historical tool path; the production EventEmitter keeps both listeners.
+      bus.on('turn.completed', onTurnCompleted)
       bus.on('tool.called', onToolCalled)
       drainTimer = setInterval(kick, drainIntervalMs)
       drainTimer.unref?.()

@@ -2608,6 +2608,15 @@ export async function provisionV3Container(
     if (process.env.OC_TOOL_FAILURE_AUDIT === "1") {
       env.push("OC_TOOL_FAILURE_AUDIT=1");
     }
+    for (const key of [
+      "OC_LOCAL_OBSERVABILITY_RETENTION",
+      "OC_LOCAL_EVENT_RETENTION_DAYS",
+      "OC_LOCAL_USAGE_RETENTION_DAYS",
+      "OC_REDACT_TOOL_EVENT_PREVIEWS",
+    ] as const) {
+      const value = process.env[key];
+      if (value && /^[0-9]+$/.test(value)) env.push(`${key}=${value}`);
+    }
 
     // 市场技能使用信号门控透传:与 tool-failure 相反 = **默认开**(低敏产品质量信号,
     // 只记 slug/agent/trace 不记内容)。master 未显式设 → 恒注入 '1';仅当 master 显式

@@ -1594,6 +1594,36 @@ export async function insertUsageLog(entry: UsageLogEntry): Promise<void> {
   `).run(entry)
 }
 
+export async function pruneLocalObservability(input: {
+  eventBeforeMs: number;
+  usageBeforeMs: number;
+}): Promise<{ previewsScrubbed: number; eventsDeleted: number; usageDeleted: number }> {
+  const db = await getSessionsDb()
+  const run = db.transaction(() => {
+    // Commercial telemetry stores hashes/aggregates only. Scrub previews from
+    // rows written by earlier runtimes immediately, including recent rows that
+    // are still inside the raw-event retention window.
+    const previews = db.prepare(`
+      UPDATE event_log
+         SET payload = json_remove(payload, '$.inputPreview', '$.outputPreview')
+       WHERE type = 'tool.called'
+         AND json_valid(payload) = 1
+         AND (
+           json_type(payload, '$.inputPreview') IS NOT NULL
+           OR json_type(payload, '$.outputPreview') IS NOT NULL
+         )
+    `).run()
+    const events = db.prepare('DELETE FROM event_log WHERE timestamp < ?').run(input.eventBeforeMs)
+    const usage = db.prepare('DELETE FROM usage_log WHERE timestamp < ?').run(input.usageBeforeMs)
+    return {
+      previewsScrubbed: Number(previews.changes),
+      eventsDeleted: Number(events.changes),
+      usageDeleted: Number(usage.changes),
+    }
+  })
+  return run()
+}
+
 export interface UsageSummary {
   totalCostUsd: number
   totalInputTokens: number

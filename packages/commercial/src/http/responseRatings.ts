@@ -28,7 +28,9 @@ import {
 import {
   isImplicitRating,
   listSessionRatings,
+  listSessionRatingNudges,
   upsertResponseRating,
+  upsertResponseRatingNudge,
 } from "../responseRatings.js";
 
 const RATING_VALUES = new Set(["up", "down"]);
@@ -96,6 +98,26 @@ export async function handlePostResponseRating(
     throw new HttpError(400, "VALIDATION", "invalid body");
   }
 
+  const nudgeAction = body.nudgeAction;
+  if (nudgeAction === "expose" || nudgeAction === "dismiss") {
+    const messageId = clampStr(body.messageId, MAX_MESSAGE_ID);
+    const sampleBucket = Number(body.sampleBucket);
+    if (!messageId || !Number.isInteger(sampleBucket) || sampleBucket < 0 || sampleBucket > 9) {
+      throw new HttpError(400, "VALIDATION", "invalid rating nudge body");
+    }
+    const nudge = await upsertResponseRatingNudge({
+      userId: user.id,
+      messageId,
+      sessionId: clampStr(body.sessionId, MAX_SESSION_ID),
+      traceId: clampStr(body.traceId, MAX_TRACE_ID),
+      clientBuild: clampStr(body.clientBuild, 64),
+      sampleBucket,
+      action: nudgeAction,
+    });
+    sendJson(res, 200, { ok: true, ...nudge });
+    return;
+  }
+
   const rating = typeof body.rating === "string" ? body.rating : "";
   if (!RATING_VALUES.has(rating)) {
     throw new HttpError(400, "VALIDATION", "rating must be 'up' or 'down'", {
@@ -157,10 +179,14 @@ export async function handleGetResponseRatings(
   const sessionId = sessionIdRaw ? sessionIdRaw.trim() : "";
   // 无 sessionId(会话尚未物化)→ 返回空表,前端无已评状态可恢复,不视作错误。
   if (!sessionId) {
-    sendJson(res, 200, { ratings: {} });
+    sendJson(res, 200, { ratings: {}, nudges: {} });
     return;
   }
 
-  const ratings = await listSessionRatings(user.id, sessionId.slice(0, MAX_SESSION_ID));
-  sendJson(res, 200, { ratings });
+  const safeSessionId = sessionId.slice(0, MAX_SESSION_ID);
+  const [ratings, nudges] = await Promise.all([
+    listSessionRatings(user.id, safeSessionId),
+    listSessionRatingNudges(user.id, safeSessionId),
+  ]);
+  sendJson(res, 200, { ratings, nudges });
 }
