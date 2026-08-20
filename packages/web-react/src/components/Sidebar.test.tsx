@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import type { ChatProject, Session, User } from "../lib/types";
 import { Sidebar } from "./Sidebar";
-import { SESSION_ROW_HEIGHT, SESSION_ROW_HEIGHT_PREVIEW, DEFAULT_PROJECT_ID, PROJECT_ROW_HEIGHT } from "./sidebar/constants";
+import { SESSION_ROW_HEIGHT, DEFAULT_PROJECT_ID, PROJECT_ROW_HEIGHT } from "./sidebar/constants";
 import { flattenSidebarItems } from "./sidebar/flattenItems";
 import { HighlightedText } from "./sidebar/highlight";
 
@@ -276,7 +276,7 @@ describe("Sidebar 会话列表", () => {
         session({ id: "s-old", title: "很久以前的会话", updatedAt: old }),
       ],
     });
-    expect(screen.getByRole("button", { name: /default/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /未分类/ })).toBeInTheDocument();
     expect(screen.queryByText("今天")).toBeNull();
     expect(screen.queryByText("更早")).toBeNull();
     expect(
@@ -291,7 +291,7 @@ describe("Sidebar 任务面板入口", () => {
   it("传入 onOpenBoard 时渲染入口，并用 data-product-control 标注", () => {
     const onOpenBoard = vi.fn();
     renderSidebar({ onOpenBoard, boardActive: true });
-    const btn = screen.getByRole("button", { name: /任务面板/ });
+    const btn = screen.getByRole("button", { name: /任务/ });
     expect(btn).toHaveAttribute("data-product-control");
     expect(btn).toHaveAttribute("aria-current", "true");
     fireEvent.click(btn);
@@ -300,7 +300,7 @@ describe("Sidebar 任务面板入口", () => {
 
   it("省略 onOpenBoard 时不渲染入口（demo）", () => {
     renderSidebar();
-    expect(screen.queryByRole("button", { name: /任务面板/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /任务/ })).toBeNull();
   });
 });
 
@@ -352,7 +352,7 @@ describe("Sidebar 项目分组", () => {
     expect(screen.getByRole("button", { name: "未分组会话" })).toBeInTheDocument();
     expect(screen.queryByText("今天")).toBeNull();
     const workBtn = screen.getByRole("button", { name: /工作/ });
-    const defaultBtn = screen.getByRole("button", { name: /default/ });
+    const defaultBtn = screen.getByRole("button", { name: /未分类/ });
     expect(workBtn).toHaveAttribute("aria-expanded", "true");
     expect(
       workBtn.compareDocumentPosition(defaultBtn) & Node.DOCUMENT_POSITION_FOLLOWING,
@@ -401,7 +401,7 @@ describe("Sidebar 项目分组", () => {
     expect(screen.getByRole("button", { name: "项目里的会话" })).toBeInTheDocument();
     expect(screen.queryByText("项目")).toBeNull();
     expect(screen.queryByRole("button", { name: /工作/ })).toBeNull();
-    expect(screen.queryByRole("button", { name: /default/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /未分类/ })).toBeNull();
     expect(screen.queryByRole("button", { name: "未分组会话" })).toBeNull();
   });
 
@@ -458,9 +458,9 @@ describe("Sidebar 项目分组", () => {
       onReorderProjects: () => {},
     });
     expect(screen.queryByText("还没有项目")).toBeNull();
-    expect(screen.getByRole("button", { name: /default/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /未分类/ })).toBeInTheDocument();
     expect(screen.getByText("暂无会话")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "项目 default 更多" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "项目 未分类 更多" })).toBeNull();
     expect(screen.queryByRole("menuitem", { name: "重命名" })).toBeNull();
     expect(screen.queryByRole("menuitem", { name: "删除" })).toBeNull();
   });
@@ -477,7 +477,7 @@ describe("Sidebar 项目分组", () => {
       onOpenProjectAssets,
       onReorderProjects: () => {},
     });
-    fireEvent.pointerDown(screen.getByRole("button", { name: "项目 default 更多" }), {
+    fireEvent.pointerDown(screen.getByRole("button", { name: "项目 未分类 更多" }), {
       button: 0,
       ctrlKey: false,
       pointerType: "mouse",
@@ -501,7 +501,7 @@ describe("Sidebar 项目分组", () => {
       onToggleProjectCollapsed: onToggle,
       onCreateProject: () => {},
     });
-    fireEvent.click(screen.getByRole("button", { name: /default/ }));
+    fireEvent.click(screen.getByRole("button", { name: /未分类/ }));
     expect(onToggle).toHaveBeenCalledWith(DEFAULT_PROJECT_ID);
   });
 
@@ -518,7 +518,7 @@ describe("Sidebar 项目分组", () => {
     const dt = dragData();
     const row = screen.getByRole("button", { name: "项目里的会话" }).closest("div")!;
     fireEvent.dragStart(row, { dataTransfer: dt });
-    const defaultRow = screen.getByRole("button", { name: /default/ }).closest("div")!;
+    const defaultRow = screen.getByRole("button", { name: /未分类/ }).closest("div")!;
     fireEvent.dragOver(defaultRow, { dataTransfer: dt });
     fireEvent.drop(defaultRow, { dataTransfer: dt });
     expect(onMoveToProject).toHaveBeenCalledTimes(1);
@@ -629,7 +629,7 @@ describe("Sidebar 置顶", () => {
     });
     expect(screen.getByText("置顶")).toBeInTheDocument();
     const pinHeading = screen.getByText("置顶");
-    const defaultBtn = screen.getByRole("button", { name: /default/ });
+    const defaultBtn = screen.getByRole("button", { name: /未分类/ });
     expect(
       pinHeading.compareDocumentPosition(screen.getByRole("button", { name: "钉住的" })) &
         Node.DOCUMENT_POSITION_FOLLOWING,
@@ -648,7 +648,6 @@ describe("Sidebar 虚拟列表拍平", () => {
     const collapsed = flattenSidebarItems({
       searching: false,
       showProjects: true,
-      showPreview: false,
       pinned: [],
       projects: [proj],
       projectSessions: new Map([["p-work", [inProj]]]),
@@ -672,7 +671,6 @@ describe("Sidebar 虚拟列表拍平", () => {
     const defaultClosed = flattenSidebarItems({
       searching: false,
       showProjects: true,
-      showPreview: false,
       pinned: [],
       projects: [proj],
       projectSessions: new Map([["p-work", [inProj]]]),
@@ -691,7 +689,6 @@ describe("Sidebar 虚拟列表拍平", () => {
     const open = flattenSidebarItems({
       searching: false,
       showProjects: true,
-      showPreview: false,
       pinned: [],
       projects: [proj],
       projectSessions: new Map([["p-work", [inProj]]]),
@@ -722,7 +719,6 @@ describe("Sidebar 虚拟列表拍平", () => {
     const collapsed = flattenSidebarItems({
       searching: false,
       showProjects: true,
-      showPreview: false,
       pinned: [],
       projects: [proj],
       projectSessions: new Map([["p-work", [runA, runB, idle]]]),
@@ -748,7 +744,6 @@ describe("Sidebar 虚拟列表拍平", () => {
     const expanded = flattenSidebarItems({
       searching: false,
       showProjects: true,
-      showPreview: false,
       pinned: [],
       projects: [proj],
       projectSessions: new Map([["p-work", [runA, runB, idle]]]),
@@ -776,7 +771,6 @@ describe("Sidebar 虚拟列表拍平", () => {
     const items = flattenSidebarItems({
       searching: true,
       showProjects: true,
-      showPreview: false,
       pinned: [],
       projects: [project({ id: "p-work", name: "工作" })],
       projectSessions: new Map(),
@@ -792,12 +786,11 @@ describe("Sidebar 虚拟列表拍平", () => {
     expect(items.find((i) => i.kind === "header")?.label).toBe("搜索结果");
   });
 
-  it("统一摘要开关下所有会话行同高", () => {
+  it("后端即使带摘要，会话行仍保持单行高度", () => {
     const s = session({ id: "s1", title: "有摘要", lastMessagePreview: "hello" });
     const items = flattenSidebarItems({
       searching: false,
       showProjects: false,
-      showPreview: true,
       pinned: [],
       projects: [],
       projectSessions: new Map(),
@@ -810,7 +803,7 @@ describe("Sidebar 虚拟列表拍平", () => {
       localEmpty: false,
     });
     const rows = items.filter((i) => i.kind === "session");
-    expect(rows.every((r) => r.height === SESSION_ROW_HEIGHT_PREVIEW)).toBe(true);
+    expect(rows.every((r) => r.height === SESSION_ROW_HEIGHT)).toBe(true);
   });
 
   it("超过阈值且能读到视口高度时只挂载窗口内的会话", () => {
@@ -878,7 +871,7 @@ describe("Sidebar 归档与批量", () => {
     expect(onBatch).toHaveBeenCalledWith(["s-beta"], "archive", undefined);
   });
 
-  it("搜索框旁常驻「多选」，不依赖行 hover，移动端也能进多选", () => {
+  it("会话标题栏常驻「多选」，不依赖行 hover，移动端也能进多选", () => {
     const onBatch = vi.fn();
     renderSidebar({ sessions: listSessions, onBatch });
     const entry = screen.getByRole("button", { name: "多选" });
@@ -898,65 +891,70 @@ describe("Sidebar 归档与批量", () => {
   });
 });
 
-describe("Sidebar 紧凑时长与摘要", () => {
-  it("有摘要时作为第二行；标题旁不再显示模型徽标", () => {
+describe("Sidebar 会话累计用时与单行布局", () => {
+  it("不显示最新消息摘要；右侧展示 createdAt → lastAt 的累计用时", () => {
+    const endAt = Date.now() - 5 * 60_000;
+    const createdAt = endAt - 10 * 60_000;
     renderSidebar({
       sessions: [
         session({
           id: "s-m",
           title: "带模型",
           modelId: "vendor/cool-model-v2",
-          lastAt: Date.now() - 5 * 60_000,
+          createdAt,
+          lastAt: endAt,
           lastMessagePreview: "最后一句话写在这里",
         }),
       ],
     });
     expect(screen.queryByText("Cool Model")).toBeNull();
     expect(screen.queryByText(/cool-model/i)).toBeNull();
-    expect(screen.getByText("5m")).toBeInTheDocument();
-    expect(screen.getByText("最后一句话写在这里")).toBeInTheDocument();
+    expect(screen.queryByText("最后一句话写在这里")).toBeNull();
+    const duration = screen
+      .getByRole("button", { name: "带模型" })
+      .closest("div")!
+      .querySelector("[data-session-duration]");
+    expect(duration).toHaveTextContent("10m");
+    expect(duration).toHaveAttribute("title", expect.stringContaining("→"));
   });
 
-  it("时长格式 <1m / 分 / 小时 / 天", () => {
+  it("累计用时按分 / 小时 / 天展示，不再表示距今多久", () => {
+    const endAt = Date.now() - 7 * 24 * 60 * 60_000;
+    renderSidebar({
+      sessions: [
+        session({ id: "s-sec", title: "不足一分钟", createdAt: endAt - 10_000, lastAt: endAt }),
+        session({ id: "s-min", title: "五分钟", createdAt: endAt - 5 * 60_000, lastAt: endAt }),
+        session({ id: "s-hr", title: "两小时", createdAt: endAt - 2 * 60 * 60_000, lastAt: endAt }),
+        session({ id: "s-day", title: "三天", createdAt: endAt - 3 * 24 * 60 * 60_000, lastAt: endAt }),
+      ],
+    });
+    const duration = (title: string) =>
+      screen.getByRole("button", { name: title }).closest("div")!.querySelector("[data-session-duration]");
+    expect(duration("不足一分钟")).toHaveTextContent("1m");
+    expect(duration("五分钟")).toHaveTextContent("5m");
+    expect(duration("两小时")).toHaveTextContent("2h");
+    expect(duration("三天")).toHaveTextContent("3d");
+  });
+
+  it("运行中的会话从会话创建时刻累计到现在", () => {
     const now = Date.now();
     renderSidebar({
       sessions: [
-        session({ id: "s-sec", title: "刚更新", lastAt: now - 10_000 }),
-        session({ id: "s-min", title: "五分钟前", lastAt: now - 5 * 60_000 }),
-        session({ id: "s-hr", title: "两小时前", lastAt: now - 2 * 60 * 60_000 }),
-        session({ id: "s-day", title: "三天前", lastAt: now - 3 * 24 * 60 * 60_000 }),
+        session({
+          id: "s-running-duration",
+          title: "正在运行",
+          createdAt: now - 2 * 60 * 60_000,
+          lastAt: now - 60 * 60_000,
+          runState: "running",
+        }),
       ],
     });
-    const age = (title: string) =>
-      screen.getByRole("button", { name: title }).closest("div")!.querySelector("[data-session-age]");
-    expect(age("刚更新")).toHaveTextContent("1m");
-    expect(age("五分钟前")).toHaveTextContent("5m");
-    expect(age("两小时前")).toHaveTextContent("2h");
-    expect(age("三天前")).toHaveTextContent("3d");
-  });
-
-  it("所有会话都没有 lastMessagePreview 时不渲染空白摘要行", () => {
-    renderSidebar({ sessions: listSessions });
-    const btn = screen.getByRole("button", { name: "季度复盘 Alpha" });
-    expect(btn.querySelectorAll("span")).toHaveLength(1);
-    const items = flattenSidebarItems({
-      searching: false,
-      showProjects: false,
-      showPreview: false,
-      pinned: [],
-      projects: [],
-      projectSessions: new Map(),
-      sessions: listSessions,
-      ungroupedGroups: [["今天", listSessions]],
-      archived: [],
-      archivedExpanded: false,
-      searchHits: [],
-      searchRemote: "idle",
-      localEmpty: false,
-    });
-    expect(items.filter((i) => i.kind === "session").every((r) => r.height === SESSION_ROW_HEIGHT)).toBe(
-      true,
-    );
+    const duration = screen
+      .getByRole("button", { name: "正在运行" })
+      .closest("div")!
+      .querySelector("[data-session-duration]");
+    expect(duration).toHaveTextContent("2h");
+    expect(duration).toHaveAttribute("title", expect.stringContaining("现在"));
   });
 });
 
@@ -1125,7 +1123,7 @@ describe("Sidebar 运行中置顶", () => {
       onToggleProjectCollapsed: () => {},
       onCreateProject: () => {},
     });
-    expect(projectNamesInList()).toEqual(["乙", "甲", "default"]);
+    expect(projectNamesInList()).toEqual(["乙", "甲", "未分类"]);
     expect(sessionTitlesInList()).toEqual(["乙的运行", "甲的空闲", "default 运行"]);
   });
 
@@ -1183,7 +1181,7 @@ describe("Sidebar 运行中置顶", () => {
       onToggleProjectCollapsed: () => {},
       onCreateProject: () => {},
     });
-    const btn = screen.getByRole("button", { name: /default/ });
+    const btn = screen.getByRole("button", { name: /未分类/ });
     expect(btn.querySelector("[data-project-running='1']")).not.toBeNull();
     expect(btn.querySelector("[role='img']")).toHaveAccessibleName("运行中");
     expect(screen.queryByRole("button", { name: "default 跑" })).toBeNull();

@@ -47,7 +47,7 @@ import {
   DEFAULT_PROJECT_ID,
   PROJECT_DRAG_TYPE,
   SEARCH_DEBOUNCE_MS,
-  SIDEBAR_AGE_TICK_MS,
+  SIDEBAR_DURATION_TICK_MS,
   VIRTUALIZE_THRESHOLD,
 } from "./sidebar/constants";
 import { type FlatItem, flattenSidebarItems } from "./sidebar/flattenItems";
@@ -128,8 +128,6 @@ export type SidebarProps = {
   loadingArchived?: boolean;
   onSearchMessages?: (q: string, signal: AbortSignal) => Promise<SessionSearchHit[]>;
   virtualizeThreshold?: number;
-  /** 本 tab 正在跑的会话的本轮开始时刻；缺省则行内时长回落 lastAt。 */
-  runStartedAt?: (id: string) => number | undefined;
 };
 
 export function Sidebar({
@@ -184,7 +182,6 @@ export function Sidebar({
   loadingArchived,
   onSearchMessages,
   virtualizeThreshold = VIRTUALIZE_THRESHOLD,
-  runStartedAt,
 }: SidebarProps) {
   const [q, setQ] = useState("");
   const [now, setNow] = useState(() => Date.now());
@@ -210,7 +207,7 @@ export function Sidebar({
   }, [sessions, isSending, liveTerminal, socketVersion]);
 
   useEffect(() => {
-    const t = window.setInterval(() => setNow(Date.now()), SIDEBAR_AGE_TICK_MS);
+    const t = window.setInterval(() => setNow(Date.now()), SIDEBAR_DURATION_TICK_MS);
     return () => window.clearInterval(t);
   }, []);
 
@@ -274,11 +271,6 @@ export function Sidebar({
     return list.length ? ([["", list]] as [string, Session[]][]) : [];
   }, [filtered, pinnedIds, searching, runningIds]);
 
-  const showPreview = useMemo(
-    () => sessions.some((s) => Boolean(s.lastMessagePreview?.trim())),
-    [sessions],
-  );
-
   useEffect(() => {
     const needle = q.trim();
     if (!needle || !onSearchMessages) {
@@ -321,7 +313,6 @@ export function Sidebar({
       flattenSidebarItems({
         searching,
         showProjects,
-        showPreview,
         pinned,
         projects: displayProjects,
         projectSessions,
@@ -339,7 +330,6 @@ export function Sidebar({
     [
       searching,
       showProjects,
-      showPreview,
       pinned,
       displayProjects,
       projectSessions,
@@ -464,7 +454,6 @@ export function Sidebar({
           indent={item.indent}
           isSending={isSending}
           liveTerminal={liveTerminal}
-          runStartedAt={runStartedAt}
           now={now}
           onSelect={onSelect}
           onRename={onRename}
@@ -474,7 +463,6 @@ export function Sidebar({
           onArchive={onArchive}
           onMarkRead={onMarkRead}
           unread={unreadIds?.has(s.id)}
-          showPreview={showPreview}
           multiSelect={multiSelect}
           selected={selectedIds.has(s.id)}
           onToggleSelected={onToggleSelected}
@@ -652,32 +640,35 @@ export function Sidebar({
               <span aria-hidden className="absolute inset-y-1 left-0 w-0.5 rounded-full bg-accent" />
             )}
             <Kanban size={16} className="text-faint" />
-            任务面板
-            <span className="ml-auto text-caption text-faint">看板 · 待确认</span>
+            任务
+            <span className="ml-auto text-caption font-normal text-faint">看板</span>
           </button>
         )}
 
-        <div className="flex items-center gap-2">
-          <div className="flex min-w-0 flex-1 items-center gap-2 rounded-xl bg-hover px-3 py-2 transition-shadow focus-within:ring-2 focus-within:ring-ring">
-            <Search size={15} className="text-faint" />
-            <input
-              data-product-feature={PRODUCT_CAPABILITIES.sessions.id}
-              data-sidebar-search
-              value={q}
-              onChange={(e) => setQ(e.target.value)}
-              placeholder="搜索会话"
-              className="w-full bg-transparent text-base text-fg outline-none placeholder:text-faint md:text-sm"
-            />
-          </div>
+        <div className="flex items-center gap-2 px-1.5 pt-1 text-caption font-medium text-faint">
+          <MessageSquareText size={14} className="shrink-0" />
+          <span>会话</span>
           {onBatch && !multiSelect && (
             <button
               type="button"
               onClick={() => setMultiSelect(true)}
-              className="shrink-0 rounded-md px-1.5 py-2 text-caption text-faint outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+              className="ml-auto shrink-0 rounded-md px-1.5 py-1 text-caption font-normal text-faint outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
             >
               多选
             </button>
           )}
+        </div>
+
+        <div className="flex min-w-0 items-center gap-2 rounded-lg bg-hover px-3 py-2 transition-shadow focus-within:ring-2 focus-within:ring-ring">
+          <Search size={15} className="shrink-0 text-faint" />
+          <input
+            data-product-feature={PRODUCT_CAPABILITIES.sessions.id}
+            data-sidebar-search
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            placeholder="搜索会话"
+            className="w-full min-w-0 bg-transparent text-base text-fg outline-none placeholder:text-faint md:text-sm"
+          />
         </div>
       </div>
 

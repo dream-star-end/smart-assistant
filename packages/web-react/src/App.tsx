@@ -2525,10 +2525,6 @@ export function App() {
     onDeleteProject: deleteProjectConfirm,
     isSending: (id: string) => !demo && chat.isSending(id),
     liveTerminal,
-    runStartedAt: (id: string) => {
-      const t = chat.getSession(id)?._turnStartedAt;
-      return typeof t === "number" && t > 0 ? t : undefined;
-    },
     socketVersion: chat.version,
     onLogout: demo ? undefined : logout,
     onOpenManage: demo ? undefined : () => openManage(DEFAULT_MANAGE_TAB),
