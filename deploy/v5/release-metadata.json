@@ -115,7 +115,8 @@
     "0234_all_model_prices_half",
     "0235_telemetry_iteration_closure",
     "0236_memory_usage_observability",
-    "0237_project_assets"
+    "0237_project_assets",
+    "0238_long_context_price_15x"
   ],
   "capabilities": [
     "sessions-store-pg-v1",
