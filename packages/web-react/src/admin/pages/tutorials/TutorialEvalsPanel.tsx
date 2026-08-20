@@ -21,6 +21,7 @@ const JOB_STATUS: Record<string, { label: string; tone: "neutral" | "warning" | 
   failed: { label: "失败", tone: "danger" },
   passed: { label: "评测通过", tone: "success" },
   compass_pending: { label: "罗盘待生成", tone: "warning" },
+  compass_running: { label: "Grok 分析中", tone: "info" },
   compass_ready: { label: "罗盘已就绪", tone: "info" },
   completed: { label: "已完成", tone: "success" },
 };
@@ -40,6 +41,7 @@ export function TutorialEvalsPanel() {
   const [frozenPrompt, setFrozenPrompt] = useState("");
   const [materialsJson, setMaterialsJson] = useState(DEFAULT_TUTORIAL_EVAL_MATERIALS_JSON);
   const [rubricJson, setRubricJson] = useState(DEFAULT_TUTORIAL_EVAL_RUBRIC_JSON);
+  const [evalUserId, setEvalUserId] = useState('247');
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -108,7 +110,7 @@ export function TutorialEvalsPanel() {
     setBusy(true);
     setError(null);
     try {
-      await api.enqueueTutorialEvalJob(adminSession, specId);
+      await api.enqueueTutorialEvalJob(adminSession, specId, { evalUserId: evalUserId.trim() });
       await refresh();
     } catch (cause) {
       setError(apiErrorMessage(cause, "排队评测失败"));
@@ -202,6 +204,16 @@ export function TutorialEvalsPanel() {
           </Button>
         </div>
       </form>
+
+      <div className="mt-5 max-w-xs">
+        <Field label="隔离测试账号 UID" hint="只允许 synthetic_canary / e2e 账号" required>
+          <Input
+            value={evalUserId}
+            inputMode="numeric"
+            onChange={(event) => setEvalUserId(event.target.value)}
+          />
+        </Field>
+      </div>
 
       <div className="mt-8 grid gap-6 lg:grid-cols-2">
         <div>

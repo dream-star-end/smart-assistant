@@ -206,7 +206,7 @@ describe('tutorial snapshots HTTP', () => {
     const user = await createUser('user@example.com', 'user')
     const admin = await createUser('admin@example.com', 'admin')
     const html = Buffer.from('<div>hello</div>').toString('base64')
-    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).toString('base64')
+    const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII='
     stubOwnedTimeline(user.id, cleanMessages)
     const created = await request('/api/tutorials/snapshots', {
       method: 'POST',
@@ -217,8 +217,18 @@ describe('tutorial snapshots HTTP', () => {
         category: 'coding',
         sourceSessionId: SESSION_ID,
         selectedArtifacts: [
-          { name: 'demo.html', mimeType: 'text/html', contentBase64: html },
-          { name: 'shot.png', mimeType: 'image/png', contentBase64: png },
+          {
+            name: 'demo.html',
+            mimeType: 'text/html',
+            contentBase64: html,
+            sourcePath: '/home/agent/.openclaude/generated/demo.html',
+          },
+          {
+            name: 'shot.png',
+            mimeType: 'image/png',
+            contentBase64: png,
+            sourcePath: '/home/agent/.openclaude/generated/shot.png',
+          },
         ],
       },
     })

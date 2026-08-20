@@ -1275,6 +1275,7 @@ export type TutorialSnapshotArtifactDraft = {
   name: string;
   mimeType: string;
   contentBase64: string;
+  sourcePath: string;
 };
 
 export type TutorialSnapshotDraft = {
@@ -1342,6 +1343,7 @@ export type TutorialEvalJobStatus =
   | "completed"
   | "passed"
   | "compass_pending"
+  | "compass_running"
   | "compass_ready";
 
 export type TutorialEvalJob = {

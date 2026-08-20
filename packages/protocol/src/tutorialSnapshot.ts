@@ -6,6 +6,25 @@ export const PUBLIC_TUTORIAL_MESSAGE_FIELDS = [
   'text',
   'ts',
   '_media',
+  'toolName',
+  'inputPreview',
+  'inputJson',
+  'output',
+  'outputJson',
+  'error',
+  '_completed',
+  'steps',
+  'explanation',
+  'goalStatus',
+  'tokenBudget',
+  'tokensUsed',
+  'timeUsedSeconds',
+  'childBlocks',
+  'startTime',
+  '_duration',
+  '_resultPreview',
+  '_isError',
+  '_delegateStatus',
 ] as const
 
 export type PublicTutorialMessageField = (typeof PUBLIC_TUTORIAL_MESSAGE_FIELDS)[number]
@@ -43,6 +62,9 @@ export const PUBLIC_REPLAY_PRIVATE_FIELD_NAMES: ReadonlySet<string> = new Set([
   'ipaddress',
   'password',
   'secret',
+  'apikey',
+  'clientsecret',
+  'bearertoken',
   'accesstoken',
   'refreshtoken',
   'sessiontoken',
@@ -71,6 +93,8 @@ export const PUBLIC_REPLAY_PRIVATE_FIELD_NAMES: ReadonlySet<string> = new Set([
 
 export type TutorialLeakRule =
   | 'secret_token'
+  | 'credential_label'
+  | 'high_entropy_secret'
   | 'private_key'
   | 'email'
   | 'phone'
@@ -87,6 +111,8 @@ export type TutorialLeakRule =
   | 'unparseable_artifact'
   | 'svg_embed_forbidden'
   | 'unknown_binary'
+  | 'mime_mismatch'
+  | 'metadata_unsupported'
   | 'network_api'
   | 'html_navigation'
 

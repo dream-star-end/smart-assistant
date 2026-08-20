@@ -120,9 +120,9 @@ describe("artifact mime/size guards", () => {
     expect(isAllowedTutorialArtifactMime("text/markdown")).toBe(true);
     expect(isAllowedTutorialArtifactMime("application/json")).toBe(true);
     expect(isAllowedTutorialArtifactMime("image/png")).toBe(true);
-    expect(isAllowedTutorialArtifactMime("video/webm")).toBe(true);
-    expect(isAllowedTutorialArtifactMime("audio/mpeg")).toBe(true);
-    expect(isAllowedTutorialArtifactMime("application/pdf")).toBe(true);
+    expect(isAllowedTutorialArtifactMime("video/webm")).toBe(false);
+    expect(isAllowedTutorialArtifactMime("audio/mpeg")).toBe(false);
+    expect(isAllowedTutorialArtifactMime("application/pdf")).toBe(false);
     expect(isAllowedTutorialArtifactMime("image/svg+xml")).toBe(false);
     expect(tutorialArtifactGuardError("image/svg+xml", 10)).toBe("svg");
     expect(inferTutorialArtifactMime({ name: "chart.svg", mime: null })).toBe("image/svg+xml");
@@ -225,7 +225,7 @@ describe("eval JSON parsers", () => {
     expect(parseTutorialEvalMaterialsJson('{"items":[]}')).toEqual({ items: [] });
     expect(() => parseTutorialEvalMaterialsJson('"zip"')).toThrow(/items/);
     expect(parseTutorialEvalRubricJson(JSON.stringify({
-      checks: [{ id: "c1", method: "manual", passCriterion: "可见结论" }],
+      checks: [{ id: "c1", method: "contains", passCriterion: "可见结论" }],
     })).checks).toHaveLength(1);
     expect(() => parseTutorialEvalRubricJson('{"checks":[]}')).toThrow(/非空/);
   });

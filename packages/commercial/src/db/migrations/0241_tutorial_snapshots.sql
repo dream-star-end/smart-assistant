@@ -104,7 +104,7 @@ CREATE TABLE tutorial_eval_jobs (
   status             TEXT NOT NULL DEFAULT 'queued'
                      CHECK (status IN (
                        'queued', 'running', 'passed', 'failed',
-                       'compass_pending', 'compass_ready'
+                       'compass_pending', 'compass_running', 'compass_ready'
                      )),
   attempt            INTEGER NOT NULL DEFAULT 0 CHECK (attempt >= 0 AND attempt <= 32),
   lease_expires_at   TIMESTAMPTZ,
@@ -124,7 +124,7 @@ CREATE INDEX idx_tutorial_eval_jobs_claim
 
 CREATE TABLE tutorial_compass_notes (
   id                 BIGSERIAL PRIMARY KEY,
-  eval_job_id        BIGINT NOT NULL REFERENCES tutorial_eval_jobs(id) ON DELETE CASCADE,
+  eval_job_id        BIGINT NOT NULL UNIQUE REFERENCES tutorial_eval_jobs(id) ON DELETE CASCADE,
   cluster_key        TEXT NOT NULL CHECK (char_length(cluster_key) BETWEEN 2 AND 80),
   severity           TEXT NOT NULL CHECK (severity IN ('P0', 'P1', 'P2')),
   summary            TEXT NOT NULL CHECK (char_length(summary) BETWEEN 8 AND 4000),

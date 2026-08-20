@@ -108,3 +108,30 @@ test('numeric auth uid maps to c: tenant key and PG open dispatch blocks export 
   )
   assert.deepEqual(seen, ['open:sess-open01:3'])
 })
+
+test('durable tool, plan, goal and agent-group public structures are projected intact', () => {
+  const projected = projectDurableMessagesForSnapshot([
+    {
+      id: 'tool', role: 'tool', text: 'Bash', ts: 1, toolName: 'Bash',
+      inputJson: { command: 'pwd' }, output: 'ok', _completed: true,
+      _turnKey: 'private',
+    },
+    {
+      id: 'plan', role: 'plan', text: '计划', ts: 2,
+      steps: [{ step: '运行测试', status: 'completed' }], explanation: '按顺序执行',
+    },
+    {
+      id: 'goal', role: 'goal', text: '交付', ts: 3,
+      goalStatus: 'complete', tokenBudget: 1000,
+    },
+    {
+      id: 'group', role: 'agent-group', text: '队员完成', ts: 4,
+      childBlocks: [{ kind: 'text', text: '结果' }], _delegateStatus: 'ok',
+    },
+  ])
+  assert.equal(projected[0]?.toolName, 'Bash')
+  assert.deepEqual(projected[1]?.steps, [{ step: '运行测试', status: 'completed' }])
+  assert.equal(projected[2]?.goalStatus, 'complete')
+  assert.deepEqual(projected[3]?.childBlocks, [{ kind: 'text', text: '结果' }])
+  assert.equal(projected[0]?._turnKey, undefined)
+})

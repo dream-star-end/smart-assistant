@@ -230,7 +230,7 @@ export async function submitSnapshotTutorial(
     messages: projected,
     selectedArtifacts: args.selectedArtifacts,
   })
-  if (!sanitized.ok) {
+  if (sanitized.ok === false) {
     throw new CommunityTutorialError('LEAKS_FOUND', '会话快照未通过安全扫描', sanitized.leakReport)
   }
   const trimmedGuide = args.bodyMarkdown?.trim() ?? ''

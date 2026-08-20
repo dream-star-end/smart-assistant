@@ -113,7 +113,12 @@ export function PublishFromSessionDialog({
         });
         if (guard) throw new Error(tutorialArtifactGuardMessage(guard));
       }
-      const packed: Array<{ name: string; mimeType: string; contentBase64: string }> = [];
+      const packed: Array<{
+        name: string;
+        mimeType: string;
+        contentBase64: string;
+        sourcePath: string;
+      }> = [];
       let packedBytes = 0;
       for (const asset of chosen) {
         const path = mediaSignPathForAsset(asset);
@@ -132,6 +137,7 @@ export function PublishFromSessionDialog({
           name: asset.name,
           mimeType: mime,
           contentBase64: await blobToBase64(blob),
+          sourcePath: path,
         });
         packedBytes += blob.size;
       }
@@ -255,7 +261,7 @@ export function PublishFromSessionDialog({
         <section>
           <h3 className="text-section font-semibold text-fg">会话成果</h3>
           <p className="mt-1 text-meta text-muted">
-            仅列出当前会话的 output 成果，默认全不勾选。SVG 禁止；单件 8MB、合计 32MB。
+            仅列出当前会话的 output 成果，默认全不勾选。当前支持文本、HTML 与会自动剥离元数据的 PNG/WebP；单件 8MB、合计 32MB。
           </p>
           {assetError && (
             <Alert tone="warning" className="mt-3">

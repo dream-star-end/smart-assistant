@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { TutorialEvalError, validateCaseSpecPayload } from '../tutorials/tutorialEval.js'
+import {
+  TutorialEvalError,
+  evaluateTutorialRubric,
+  validateCaseSpecPayload,
+} from '../tutorials/tutorialEval.js'
 
 test('case spec requires source URL, collection time, frozen materials and machine rubric', () => {
   const good = {
@@ -13,7 +17,7 @@ test('case spec requires source URL, collection time, frozen materials and machi
     frozenMaterials: { items: [{ name: 'hour.csv', sha256: 'a'.repeat(64) }] },
     authScope: 'synthetic_eval' as const,
     rubric: {
-      checks: [{ id: 'r2', method: 'metric', passCriterion: 'test R2 >= 0.85' }],
+      checks: [{ id: 'r2', method: 'contains', passCriterion: 'R2=0.90' }],
     },
   }
   validateCaseSpecPayload(good)
@@ -30,4 +34,6 @@ test('case spec requires source URL, collection time, frozen materials and machi
     () => validateCaseSpecPayload({ ...good, frozenMaterials: { items: 'nope' } }),
     (error: unknown) => error instanceof TutorialEvalError && error.code === 'BAD_SPEC',
   )
+  assert.equal(evaluateTutorialRubric(good.rubric, '结果 R2=0.90').passed, true)
+  assert.equal(evaluateTutorialRubric(good.rubric, '结果不达标').passed, false)
 })

@@ -154,9 +154,30 @@ function allowlistFromBrowserMessages(browserMessages: unknown): Set<string> | n
 export function projectDurableMessagesForSnapshot(
   durable: TutorialTimelineMessage[],
   browserMessages?: unknown,
-): Array<{ id: string; role: string; text: string; ts: number }> {
+): Array<Record<string, unknown>> {
   const allow = allowlistFromBrowserMessages(browserMessages)
-  const projected: Array<{ id: string; role: string; text: string; ts: number }> = []
+  const projected: Array<Record<string, unknown>> = []
+  const richFieldsByRole: Record<string, readonly string[]> = {
+    tool: [
+      'toolName',
+      'inputPreview',
+      'inputJson',
+      'output',
+      'outputJson',
+      'error',
+      '_completed',
+    ],
+    plan: ['explanation', 'steps'],
+    goal: ['goalStatus', 'tokenBudget', 'tokensUsed', 'timeUsedSeconds'],
+    'agent-group': [
+      'startTime',
+      'childBlocks',
+      '_duration',
+      '_resultPreview',
+      '_isError',
+      '_delegateStatus',
+    ],
+  }
   for (const message of durable) {
     const id = typeof message.id === 'string' ? message.id : ''
     if (!id) continue
@@ -169,7 +190,11 @@ export function projectDurableMessagesForSnapshot(
           ? message.content
           : ''
     const ts = typeof message.ts === 'number' && Number.isFinite(message.ts) ? message.ts : 0
-    projected.push({ id, role, text, ts })
+    const row: Record<string, unknown> = { id, role, text, ts }
+    for (const key of richFieldsByRole[role] ?? []) {
+      if (message[key] !== undefined) row[key] = message[key]
+    }
+    projected.push(row)
   }
   if (projected.length > SNAPSHOT_MAX_MESSAGES) {
     throw new TutorialTimelineError(

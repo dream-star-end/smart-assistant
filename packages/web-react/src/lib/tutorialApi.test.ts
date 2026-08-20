@@ -88,7 +88,7 @@ test("admin tutorial evals specs/jobs/compass/record use /api/admin/tutorials pr
     rubric: { pass: true },
   });
   await api.listTutorialEvalJobs(a);
-  await api.enqueueTutorialEvalJob(a, "spec-1");
+  await api.enqueueTutorialEvalJob(a, "spec-1", { evalUserId: "247" });
   await api.listTutorialEvalCompass(a);
   await api.recordTutorialEvalResult(a, { jobId: "job-1", result: "failed" });
   const urls = fetchMock.mock.calls.map((call) => String(call[0]));

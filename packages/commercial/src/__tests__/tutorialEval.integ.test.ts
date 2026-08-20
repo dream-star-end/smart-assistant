@@ -12,7 +12,9 @@ import {
   handleAdminTutorialControlPost,
 } from '../tutorials/tutorialEvalRoutes.js'
 import {
+  claimCompassJob,
   claimEvalJob,
+  finishCompassJob,
   finishEvalJob,
   recoverExpiredEvalLeases,
 } from '../tutorials/tutorialEval.js'
@@ -57,12 +59,16 @@ beforeEach(async () => {
   ])
 })
 
-async function createUser(email: string, role: 'user' | 'admin') {
+async function createUser(
+  email: string,
+  role: 'user' | 'admin',
+  signalTrafficClass = role === 'admin' ? 'internal_admin' : 'production_user',
+) {
   const result = await query<{ id: string }>(
-    `INSERT INTO users(email, password_hash, credits, role, status, display_name)
-     VALUES ($1, 'argon2$stub', 0, $2, 'active', $3)
+    `INSERT INTO users(email, password_hash, credits, role, status, display_name, signal_traffic_class)
+     VALUES ($1, 'argon2$stub', 0, $2, 'active', $3, $4)
      RETURNING id::text AS id`,
-    [email, role, role === 'admin' ? '管理员' : '投稿用户'],
+    [email, role, role === 'admin' ? '管理员' : '投稿用户', signalTrafficClass],
   )
   const id = result.rows[0]!.id
   return { id, token: (await signAccess({ sub: id, role }, JWT_SECRET)).token }
@@ -88,7 +94,7 @@ const specBody = {
   frozenPrompt: '使用冻结输入完成回归，交付报告、图表与可复跑工程。',
   frozenMaterials: { items: [{ name: 'hour.csv', sha256: 'ab'.repeat(32) }] },
   rubric: {
-    checks: [{ id: 'r2', method: 'metric', passCriterion: 'test R2 >= 0.85' }],
+    checks: [{ id: 'r2', method: 'contains', passCriterion: 'R2=0.90' }],
   },
 }
 
@@ -97,6 +103,7 @@ describe('tutorial eval control plane', () => {
     if (db.skipIfUnavailable(t)) return
     const user = await createUser('user@example.com', 'user')
     const admin = await createUser('admin@example.com', 'admin')
+    const evalUser = await createUser('eval@example.com', 'user', 'e2e')
     assert.equal(
       (await request('/api/admin/tutorials/case-specs', { method: 'POST', token: user.token, body: specBody }))
         .status,
@@ -109,18 +116,19 @@ describe('tutorial eval control plane', () => {
     })
     assert.equal(created.status, 201)
     const specId = ((await created.json()) as { spec: { id: string } }).spec.id
-    const first = await request('/api/admin/tutorials/eval-jobs', {
-      method: 'POST',
-      token: admin.token,
-      body: { specId, idempotencyKey: 'eval-key-12345678' },
-    })
-    const second = await request('/api/admin/tutorials/eval-jobs', {
-      method: 'POST',
-      token: admin.token,
-      body: { specId, idempotencyKey: 'eval-key-12345678' },
-    })
-    assert.equal(first.status, 201)
-    assert.equal(second.status, 200)
+    const [first, second] = await Promise.all([
+      request('/api/admin/tutorials/eval-jobs', {
+        method: 'POST',
+        token: admin.token,
+        body: { specId, idempotencyKey: 'eval-key-12345678', evalUserId: evalUser.id },
+      }),
+      request('/api/admin/tutorials/eval-jobs', {
+        method: 'POST',
+        token: admin.token,
+        body: { specId, idempotencyKey: 'eval-key-12345678', evalUserId: evalUser.id },
+      }),
+    ])
+    assert.deepEqual([first.status, second.status].sort(), [200, 201])
     const firstId = ((await first.json()) as { job: { id: string } }).job.id
     const secondId = ((await second.json()) as { job: { id: string } }).job.id
     assert.equal(firstId, secondId)
@@ -132,6 +140,7 @@ describe('tutorial eval control plane', () => {
   test('claim uses fencing; wrong token cannot finish; expired lease is recoverable', async (t) => {
     if (db.skipIfUnavailable(t)) return
     const admin = await createUser('admin@example.com', 'admin')
+    const evalUser = await createUser('eval@example.com', 'user', 'synthetic_canary')
     const created = await request('/api/admin/tutorials/case-specs', {
       method: 'POST',
       token: admin.token,
@@ -141,12 +150,14 @@ describe('tutorial eval control plane', () => {
     const job = await request('/api/admin/tutorials/eval-jobs', {
       method: 'POST',
       token: admin.token,
-      body: { specId, idempotencyKey: 'eval-lease-12345678' },
+      body: { specId, idempotencyKey: 'eval-lease-12345678', evalUserId: evalUser.id },
     })
     const jobId = ((await job.json()) as { job: { id: string } }).job.id
     const claimed = await claimEvalJob({ ownerId: 'worker-a', leaseMs: 60_000 })
     assert.ok(claimed)
     assert.equal(claimed!.id, jobId)
+    assert.equal(claimed!.evalUserId, evalUser.id)
+    assert.equal(claimed!.spec.frozenPrompt, specBody.frozenPrompt)
     await assert.rejects(() =>
       finishEvalJob({
         jobId,
@@ -162,6 +173,25 @@ describe('tutorial eval control plane', () => {
       evidence: { checks: [{ id: 'r2', passed: false }] },
     })
     assert.equal(finished.status, 'compass_pending')
+    const compassClaim = await claimCompassJob({ ownerId: 'grok-worker', leaseMs: 60_000 })
+    assert.equal(compassClaim?.id, jobId)
+    await assert.rejects(() =>
+      finishCompassJob({
+        jobId,
+        fencingToken: 'wrong',
+        clusterKey: 'r2-miss',
+        severity: 'P1',
+        summary: '冻结评测未达到门槛。',
+      }),
+    )
+    await finishCompassJob({
+      jobId,
+      fencingToken: compassClaim!.fencingToken,
+      clusterKey: 'r2-miss',
+      severity: 'P1',
+      summary: '冻结评测未达到门槛，需要改进。',
+      grokModel: 'cursor-grok-4.6-high',
+    })
     const note = await request('/api/admin/tutorials/compass', {
       method: 'POST',
       token: admin.token,
@@ -180,7 +210,7 @@ describe('tutorial eval control plane', () => {
     const job2 = await request('/api/admin/tutorials/eval-jobs', {
       method: 'POST',
       token: admin.token,
-      body: { specId, idempotencyKey: 'eval-recover-12345678' },
+      body: { specId, idempotencyKey: 'eval-recover-12345678', evalUserId: evalUser.id },
     })
     const job2Id = ((await job2.json()) as { job: { id: string } }).job.id
     await claimEvalJob({ ownerId: 'worker-b', leaseMs: 1 })

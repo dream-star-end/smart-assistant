@@ -40,12 +40,8 @@ const ALLOWED_EXACT_MIME = new Set([
   "text/markdown",
   "text/html",
   "application/json",
-  "application/pdf",
   "image/png",
-  "image/jpeg",
-  "image/jpg",
   "image/webp",
-  "image/gif",
 ]);
 
 const BANNED_MIME = new Set(["image/svg+xml", "image/svg", "text/xml+svg"]);
@@ -170,8 +166,8 @@ export const DEFAULT_TUTORIAL_EVAL_RUBRIC_JSON = `{
   "checks": [
     {
       "id": "reproducible-output",
-      "method": "compare_artifact",
-      "passCriterion": "评测输出覆盖冻结材料要求的关键结论，且未使用未授权数据。"
+      "method": "contains",
+      "passCriterion": "结论"
     }
   ]
 }`;
@@ -204,7 +200,9 @@ export function parseTutorialEvalRubricJson(raw: string): { checks: Array<Record
     if (!check || typeof check !== "object") throw new Error(`rubric.checks[${index}] 无效`);
     const row = check as { id?: unknown; method?: unknown; passCriterion?: unknown };
     if (typeof row.id !== "string" || !row.id.trim()) throw new Error(`rubric.checks[${index}].id 必填`);
-    if (typeof row.method !== "string" || !row.method.trim()) throw new Error(`rubric.checks[${index}].method 必填`);
+    if (!['contains', 'regex', 'min_length'].includes(String(row.method))) {
+      throw new Error(`rubric.checks[${index}].method 必须是 contains / regex / min_length`);
+    }
     if (typeof row.passCriterion !== "string" || !row.passCriterion.trim()) {
       throw new Error(`rubric.checks[${index}].passCriterion 必填`);
     }
@@ -238,7 +236,6 @@ export function isAllowedTutorialArtifactMime(mime: string): boolean {
   const normalized = mime.trim().toLowerCase().split(";")[0]!.trim();
   if (!normalized || isBannedTutorialMime(normalized)) return false;
   if (ALLOWED_EXACT_MIME.has(normalized)) return true;
-  if (normalized.startsWith("video/") || normalized.startsWith("audio/")) return true;
   return false;
 }
 
@@ -264,7 +261,7 @@ export function tutorialArtifactGuardMessage(error: TutorialArtifactGuardError):
     case "svg":
       return "SVG 不可作为教程成果发布。";
     case "type":
-      return "只允许 text/markdown/json/html、图片（png/jpeg/webp/gif）、音视频和 PDF。";
+      return "当前只允许 text/markdown/json/html 与可去除元数据的 PNG/WebP 图片。";
     case "too-large":
       return `单件成果不能超过 ${Math.round(MAX_TUTORIAL_ARTIFACT_BYTES / (1024 * 1024))} MB。`;
     case "total-too-large":

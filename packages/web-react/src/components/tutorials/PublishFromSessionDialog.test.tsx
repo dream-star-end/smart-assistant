@@ -42,7 +42,7 @@ function asset(partial: Partial<ProjectAsset> & Pick<ProjectAsset, 'id' | 'name'
     source: 'output',
     sessionId: 'sess-1',
     url: `/out/${partial.name}`,
-    containerPath: `/out/${partial.name}`,
+    containerPath: `/home/agent/.openclaude/generated/${partial.name}`,
     mime: 'text/plain',
     sizeBytes: 12,
     excerpt: null,
@@ -59,15 +59,15 @@ beforeEach(() => {
     asset({ id: 'svg', name: 'chart.svg', mime: 'image/svg+xml', sizeBytes: 40 }),
     asset({
       id: 'huge',
-      name: 'video.mp4',
-      mime: 'video/mp4',
+      name: 'huge.png',
+      mime: 'image/png',
       sizeBytes: MAX_TUTORIAL_ARTIFACT_BYTES + 1,
     }),
     asset({ id: 'upload', name: 'notes.txt', source: 'upload', mime: 'text/plain' }),
     asset({ id: 'other', name: 'other.md', sessionId: 'sess-2', mime: 'text/markdown' }),
   ])
   vi.spyOn(api, 'mediaSign').mockResolvedValue({
-    urls: { '/out/report.md': '/api/media-signed?k=1' },
+    urls: { '/home/agent/.openclaude/generated/report.md': '/api/media-signed?k=1' },
     expMs: 60_000,
   })
   vi.spyOn(api, 'fetchSignedMedia').mockResolvedValue(new Blob(['# report'], { type: 'text/markdown' }))
@@ -125,6 +125,37 @@ describe('PublishFromSessionDialog', () => {
     expect(onSubmitted).toHaveBeenCalledWith({ strippedRoles: ['system'] })
   })
 
+  it('勾选成果时携带权威源路径供服务端精确改写', async () => {
+    render(
+      <PublishFromSessionDialog
+        open
+        onOpenChange={() => {}}
+        auth={auth}
+        sessionId="sess-1"
+        sessionTitle="公开数据分析"
+        messages={messages}
+        onSubmitted={() => {}}
+      />,
+    )
+    fireEvent.click(await screen.findByLabelText('勾选成果 report.md'))
+    fireEvent.change(screen.getByLabelText(/摘要/), {
+      target: { value: '把一次真实会话变成可复查的教程快照。' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: '提交快照审核' }))
+    await waitFor(() => expect(api.submitTutorialSnapshot).toHaveBeenCalledTimes(1))
+    expect(api.submitTutorialSnapshot).toHaveBeenCalledWith(
+      auth,
+      expect.objectContaining({
+        selectedArtifacts: [
+          expect.objectContaining({
+            name: 'report.md',
+            sourcePath: '/home/agent/.openclaude/generated/report.md',
+          }),
+        ],
+      }),
+    )
+  })
+
   it('勾选 SVG 或超大文件时前端拦截', async () => {
     render(
       <PublishFromSessionDialog
@@ -142,8 +173,8 @@ describe('PublishFromSessionDialog', () => {
     expect(screen.getByText('SVG 不可作为教程成果发布。')).toBeInTheDocument()
     expect(screen.getByLabelText('勾选成果 chart.svg')).not.toBeChecked()
 
-    fireEvent.click(screen.getByLabelText('勾选成果 video.mp4'))
+    fireEvent.click(screen.getByLabelText('勾选成果 huge.png'))
     expect(screen.getByText(/单件成果不能超过/)).toBeInTheDocument()
-    expect(screen.getByLabelText('勾选成果 video.mp4')).not.toBeChecked()
+    expect(screen.getByLabelText('勾选成果 huge.png')).not.toBeChecked()
   })
 })
