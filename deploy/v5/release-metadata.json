@@ -120,7 +120,8 @@
     "0239_turn_dispatch_shutdown_ctx",
     "0240_client_session_last_read_at",
     "0241_raise_last_read_watermark",
-    "0242_zcode_platform_capabilities"
+    "0242_zcode_platform_capabilities",
+    "0243_live_unit_checkpoints"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

@@ -5,12 +5,16 @@ import * as assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 
 import {
+  LIVE_UNITS_CHECKPOINT_MAX_BYTES,
   LIVE_UNITS_FIRST_PACK_MAX_BYTES,
+  assembleLiveUnitsFromState,
   assembleLiveUnitsPage,
   choosePayloadRefSource,
   continueReduceLiveFrames,
   fallbackLiveUnitsPage,
+  foldLiveUnitStateForCheckpoint,
   isLiveUnitsEnabled,
+  parseLiveUnitCheckpoint,
   reduceLiveFrames,
   serveLiveUnits,
   type LiveFrameInput,
@@ -378,5 +382,126 @@ describe('stable unit ids and payloadRef tape fallback', () => {
     assert.equal(choosePayloadRefSource({ livePayload: { ok: 1 }, tapePayload: { ok: 2 } })?.source, 'live')
     assert.equal(choosePayloadRefSource({ livePayload: null, tapePayload: { ok: 2 } })?.source, 'tape')
     assert.equal(choosePayloadRefSource({ livePayload: null, tapePayload: null }), null)
+  })
+})
+
+describe('PR3 checkpoint fold is full state, serving-only K/preview', () => {
+  it('hit+catch-up equals full reduce, including cross-window tool_result', () => {
+    const frames: LiveFrameInput[] = []
+    frames.push(frame('1', 1, {
+      kind: 'delegate_progress',
+      runId: 'dlg-x',
+      phase: 'start',
+      goal: 'cross',
+    }))
+    for (let i = 0; i < 25; i++) {
+      frames.push(frame(String(i + 2), i + 2, {
+        kind: 'delegate_progress',
+        runId: 'dlg-x',
+        phase: 'tool',
+        block: {
+          kind: 'tool_use',
+          blockId: `tu-${i}`,
+          toolName: 'Read',
+          inputPreview: `p${i}`,
+        },
+      }))
+    }
+    const prefix = reduceLiveFrames(frames)
+    assert.equal(prefix.ok, true)
+    if (!prefix.ok) return
+    const folded = foldLiveUnitStateForCheckpoint(prefix.state)
+    assert.ok(folded)
+    const parsed = parseLiveUnitCheckpoint(JSON.parse(folded.json))
+    assert.ok(parsed)
+    assert.equal(parsed.units[0]?.children?.length, 25)
+
+    const resultFrame = frame('99', 99, {
+      kind: 'delegate_progress',
+      runId: 'dlg-x',
+      phase: 'tool',
+      block: {
+        kind: 'tool_result',
+        toolUseBlockId: 'tu-0',
+        output: 'RESULT-FROM-OUTSIDE-WINDOW',
+      },
+    })
+    const continued = continueReduceLiveFrames(parsed, [resultFrame])
+    assert.equal(continued.ok, true)
+    if (!continued.ok) return
+    const full = reduceLiveFrames([...frames, resultFrame])
+    assert.equal(full.ok, true)
+    if (!full.ok) return
+    const joined = continued.state.units[0]?.children?.find((c) => c.blockId === 'tu-0')
+    const joinedFull = full.state.units[0]?.children?.find((c) => c.blockId === 'tu-0')
+    assert.equal(joined?.output, 'RESULT-FROM-OUTSIDE-WINDOW')
+    assert.equal(joinedFull?.output, 'RESULT-FROM-OUTSIDE-WINDOW')
+    assert.equal(continued.state.units[0]?.children?.length, full.state.units[0]?.children?.length)
+    assert.equal(continued.state.throughFrameSeq, full.state.throughFrameSeq)
+
+    const fromState = assembleLiveUnitsFromState(parsed, META, { n: 20, k: 20 }, [resultFrame])
+    const fullPage = assembleLiveUnitsPage([...frames, resultFrame], META, { n: 20, k: 20 })
+    assert.equal(fromState.resume?.frameSeq, fullPage.resume?.frameSeq)
+    assert.equal(fromState.degraded, false)
+  })
+
+  it('payloadRef-izes oversized fields but keeps every child (no K window)', () => {
+    const huge = kb(200)
+    const frames = [
+      frame('1', 1, {
+        kind: 'delegate_progress',
+        runId: 'dlg-big',
+        phase: 'start',
+        goal: 'big',
+      }),
+      frame('2', 2, {
+        kind: 'delegate_progress',
+        runId: 'dlg-big',
+        phase: 'tool',
+        block: {
+          kind: 'tool_result',
+          toolUseBlockId: 'tu-1',
+          blockId: 'tu-1:result',
+          toolName: 'Read',
+          output: huge,
+        },
+      }),
+    ]
+    const reduced = reduceLiveFrames(frames)
+    assert.equal(reduced.ok, true)
+    if (!reduced.ok) return
+    assert.equal(reduced.state.units[0]?.children?.[0]?.output, huge)
+    const folded = foldLiveUnitStateForCheckpoint(reduced.state)
+    assert.ok(folded)
+    assert.ok(folded.json.length < huge.length)
+    const child = folded.state.units[0]?.children?.[0]
+    assert.ok(child)
+    assert.notEqual(child.output, huge)
+    assert.ok(typeof child.preview === 'string' && child.preview.length > 0)
+    assert.ok(child.payloadRef)
+    assert.equal(folded.state.units[0]?.children?.length, reduced.state.units[0]?.children?.length)
+  })
+
+  it('epoch mismatch and corrupt JSON fail closed to rebuild', () => {
+    const reduced = reduceLiveFrames([frame('1', 1, { kind: 'thinking', text: 'x' })])
+    assert.equal(reduced.ok, true)
+    if (!reduced.ok) return
+    const folded = foldLiveUnitStateForCheckpoint(reduced.state)
+    assert.ok(folded)
+    const parsed = JSON.parse(folded.json) as { reducerEpoch: string }
+    parsed.reducerEpoch = '999'
+    assert.equal(parseLiveUnitCheckpoint(parsed), null)
+    assert.equal(parseLiveUnitCheckpoint({ reducerEpoch: '1', units: 'nope' }), null)
+    assert.equal(parseLiveUnitCheckpoint(null), null)
+    assert.equal(parseLiveUnitCheckpoint({}), null)
+  })
+
+  it('skips writes when even ref-folded JSON exceeds the hard cap', () => {
+    const reduced = reduceLiveFrames([frame('1', 1, { kind: 'thinking', text: 'tiny' })])
+    assert.equal(reduced.ok, true)
+    if (!reduced.ok) return
+    const skipped = foldLiveUnitStateForCheckpoint(reduced.state, { maxBytes: 8 })
+    assert.equal(skipped, null)
+    assert.ok(LIVE_UNITS_CHECKPOINT_MAX_BYTES >= 1024 * 1024)
   })
 })

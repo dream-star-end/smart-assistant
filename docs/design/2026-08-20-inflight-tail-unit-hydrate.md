@@ -1,7 +1,7 @@
 # 在飞轮尾部优先水合（Tail Unit Hydrate）
 
 - 日期：2026-08-20
-- 状态：方案审 FAIL 已闭合（B1/B2/B3 冻结）→ 修订 + 实施（PR1+PR2，无 checkpoint）
+- 状态：方案审 FAIL 已闭合（B1/B2/B3 冻结）→ 修订 + 实施（PR1+PR2 已上线 `ee356e4c8`；PR3 checkpoint 因 11k 帧现算 4.2s 未进 1.5s TTFU）
 - 环境：新个人版 V5 自用（uid=3，`openclaude-v5-selfhost`）
 - 工作树：`/opt/openclaude/worktrees/v5-selfhost-inflight-tail-hydrate`（分支 `feat/v5-selfhost-inflight-tail-hydrate`；文档 `docs/design/2026-08-20-inflight-tail-unit-hydrate.md`）
 - 产品方向（老板拍板）：点开会话默认先只加载**最后一个 agent 响应**的最新约 20 条**可渲染内容**（无论该轮是否在跑）；用户上滑再向上懒加载更早内容。
@@ -40,7 +40,7 @@
 - before 分页：单元稳定 `id`；open 组卡只出现在首包，before 页跳过仍 open 的组卡；客户端 prepend 再按 ID 去重。
 - `payloadRef` 懒加载：`GET /live-frames/payload?recordId=&sha256=` 先读 live frame，剪枝后按 `content_sha256` 回落到 tape。`choosePayloadRefSource` 锁 live→tape 顺序。
 
-**本修订不做 checkpoint（原 PR3）**：先发布 PR1+PR2 现算路径。若真机手机视口 TTFU ≥1.5s 再上 checkpoint；checkpoint 必须存完整折叠态（B2），迁移号 fetch 后领。
+**本修订已做 checkpoint（PR3）**：v1 现算 11k 帧首包 4.2s，未进手机 TTFU。`client_session_live_unit_checkpoints` 存完整折叠态；>64KB 字段 payloadRef 化；硬顶 8MB 超限跳过写入。K/preview 仍只在 serving。写路径 200ms/50 帧 debounce，不在 `persistGatewayLiveFrame` 事务内 reduce。
 - 环境：新个人版 V5 自用（uid=3，`openclaude-v5-selfhost`，live `rel-3e7b3216a` / sourceCommit `3e7b3216a`）
 - 工作树：`/opt/openclaude/worktrees/v5-selfhost-inflight-tail-hydrate`（分支 `feat/v5-selfhost-inflight-tail-hydrate`；文档 `docs/design/2026-08-20-inflight-tail-unit-hydrate.md`）
 - 产品方向（老板拍板）：点开会话默认先只加载**最后一个 agent 响应**的最新约 20 条**可渲染内容**（无论该轮是否在跑）；用户上滑再向上懒加载更早内容。
