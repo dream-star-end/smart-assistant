@@ -1,11 +1,20 @@
 import { createHash } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
 import {
-  assembleLiveUnitsPage,
+  assembleLiveUnitsFromState,
+  continueReduceLiveFrames,
+  fallbackLiveUnitsPage,
+  reduceLiveFrames,
   type LiveFrameInput,
   type LiveUnitsPage,
   type ServeLiveUnitsOptions,
 } from "@openclaude/protocol";
+import {
+  deleteLiveUnitCheckpoints,
+  loadOpenDispatchLiveUnitCheckpoint,
+  scheduleLiveUnitCheckpoint,
+  upsertLiveUnitCheckpoint,
+} from "./liveUnitCheckpoints.js";
 
 export interface PersistGatewayLiveFrameInput {
   uid: bigint;
@@ -110,7 +119,7 @@ export async function persistGatewayLiveFrame(
   const payloadSha256 = sha256(payload);
   const sessionUserId = `c:${input.uid.toString()}`;
 
-  await retryOnSerializationFailure(() => withTx(pool, async (client) => {
+  const persisted = await retryOnSerializationFailure(() => withTx(pool, async (client) => {
     // Lock the dispatch row BEFORE reading tape state, in a SEPARATE statement:
     // finalizeLosslessTurnTape takes the same row lock (see
     // convergeDispatchOnFinalize), and READ COMMITTED takes a per-statement
@@ -234,7 +243,9 @@ export async function persistGatewayLiveFrame(
       Buffer.from(existing.payload).equals(payload);
 
     const existing = await insertOrReadExisting(input.sessionKey);
-    if (existing === null || matchesCurrentFrame(existing)) return;
+    if (existing === null || matchesCurrentFrame(existing)) {
+      return { streamKey, live: finalizedTape == null };
+    }
     if (existing.stream_key === streamKey) {
       throw new LiveFramePermanentConflictError("live frame immutable payload conflict");
     }
@@ -249,7 +260,16 @@ export async function persistGatewayLiveFrame(
     if (namespacedExisting !== null && !matchesCurrentFrame(namespacedExisting)) {
       throw new LiveFramePermanentConflictError("live frame immutable payload conflict");
     }
+    return { streamKey, live: finalizedTape == null };
   }));
+  // Reduce is a derived cache. Never await it on the persist stack; never run
+  // it inside the frame transaction. Failures must not surface to the caller.
+  scheduleLiveUnitCheckpoint(pool, {
+    sessionId: input.sessionId,
+    userId: sessionUserId,
+    streamKey: persisted.streamKey,
+    live: persisted.live,
+  });
 }
 
 /**
@@ -260,11 +280,10 @@ export async function persistGatewayLiveFrame(
  * statement in the frame transaction is idempotent (ON CONFLICT / FOR UPDATE
  * re-read). All other errors propagate untouched.
  */
-async function retryOnSerializationFailure(fn: () => Promise<void>): Promise<void> {
+async function retryOnSerializationFailure<T>(fn: () => Promise<T>): Promise<T> {
   for (let attempt = 1; ; attempt += 1) {
     try {
-      await fn();
-      return;
+      return await fn();
     } catch (error) {
       const code = (error as { code?: string } | null)?.code;
       if ((code !== "40P01" && code !== "40001") || attempt >= 3) throw error;
@@ -566,8 +585,15 @@ export async function readClientSessionLiveUnits(
     const meta = await readOpenDispatchStreamMeta(client, sessionId, userId);
     if (!meta) return null;
     if (meta.streamClientMessageIds.length === 0) {
-      return { meta, frames: [] as LiveFrameInput[] };
+      return { meta, frames: [] as LiveFrameInput[], checkpoint: null as Awaited<ReturnType<typeof loadOpenDispatchLiveUnitCheckpoint>> };
     }
+    const checkpoint = await loadOpenDispatchLiveUnitCheckpoint(
+      client,
+      sessionId,
+      userId,
+      OPEN_DISPATCH_STREAM_SQL,
+    );
+    const afterRecordId = checkpoint ? checkpoint.state.throughRecordId : "0";
     const rows = (
       await client.query<{
         record_id: string;
@@ -581,16 +607,17 @@ export async function readClientSessionLiveUnits(
            JOIN client_session_live_frames f ON f.stream_key=s.stream_key
           WHERE s.user_id=$2 AND s.session_id=$1
             AND ${OPEN_DISPATCH_STREAM_SQL}
+            AND f.record_id>$3::bigint
           ORDER BY f.record_id`,
-        [sessionId, userId],
+        [sessionId, userId, afterRecordId],
       )
     ).rows;
-    return { meta, frames: rows.map(parseLiveFrameRow) };
+    return { meta, frames: rows.map(parseLiveFrameRow), checkpoint };
   }, "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
   if (!snapshot) return null;
   const lastRecordId = snapshot.frames.length > 0
     ? snapshot.frames[snapshot.frames.length - 1]!.recordId
-    : "0";
+    : snapshot.checkpoint?.state.throughRecordId ?? "0";
   const catchUp = await withTx(pool, async (client) => {
     if (snapshot.meta.streamClientMessageIds.length === 0) return [] as LiveFrameInput[];
     const rows = (
@@ -613,7 +640,32 @@ export async function readClientSessionLiveUnits(
     ).rows;
     return rows.map(parseLiveFrameRow);
   }, "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
-  return assembleLiveUnitsPage(snapshot.frames, snapshot.meta, options ?? {}, catchUp);
+
+  const opts = options ?? {};
+  const reduced = snapshot.checkpoint
+    ? continueReduceLiveFrames(snapshot.checkpoint.state, snapshot.frames, opts)
+    : reduceLiveFrames(snapshot.frames, opts);
+  if (!reduced.ok) return fallbackLiveUnitsPage(snapshot.meta);
+  const page = assembleLiveUnitsFromState(reduced.state, snapshot.meta, opts, catchUp);
+  if (page.degraded === false) {
+    const forCache = catchUp.length === 0
+      ? reduced
+      : continueReduceLiveFrames(reduced.state, catchUp, opts);
+    const streamKey = snapshot.checkpoint?.streamKey
+      ?? snapshot.frames[0]?.streamKey
+      ?? catchUp[0]?.streamKey;
+    if (forCache.ok && streamKey) {
+      void upsertLiveUnitCheckpoint(pool, {
+        streamKey,
+        sessionId,
+        userId,
+        state: forCache.state,
+      }).catch(() => {
+        /* cache only */
+      });
+    }
+  }
+  return page;
 }
 
 export async function readLiveOrTapeFramePayload(
@@ -692,6 +744,13 @@ export async function reconcileLiveStreamWithFinalTape(
       WHERE dispatch_id=$1::uuid AND source='gateway'`,
     [input.dispatchId, input.status, input.tapeId, input.tapeSha256],
   );
+  await deleteLiveUnitCheckpoints(client, (
+    await client.query<{ stream_key: string }>(
+      `SELECT stream_key FROM client_session_live_streams
+        WHERE dispatch_id=$1::uuid AND source='gateway'`,
+      [input.dispatchId],
+    )
+  ).rows.map((row) => row.stream_key));
 }
 
 /**
@@ -751,6 +810,11 @@ export async function convergeFinalizedTapeLiveStreams(pool: Pool): Promise<{ co
         AND s.projection_source='live'
       RETURNING s.stream_key`,
   );
+  const keys = [
+    ...byDispatch.rows.map((row: { stream_key: string }) => row.stream_key),
+    ...byCompletedCmid.rows.map((row: { stream_key: string }) => row.stream_key),
+  ];
+  if (keys.length > 0) await deleteLiveUnitCheckpoints(pool, keys);
   return { converged: (byDispatch.rowCount ?? 0) + (byCompletedCmid.rowCount ?? 0) };
 }
 
@@ -913,6 +977,9 @@ export async function pruneProjectedLiveFrames(
     if (count === 0) break;
     deletedFrames += count;
     for (const row of result.rows) touched.add(row.stream_key);
+  }
+  if (touched.size > 0) {
+    await deleteLiveUnitCheckpoints(pool, [...touched]);
   }
   return { deletedFrames, prunedStreams: touched.size };
 }

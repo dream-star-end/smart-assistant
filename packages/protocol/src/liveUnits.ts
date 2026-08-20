@@ -16,6 +16,13 @@ export const LIVE_UNITS_FIRST_PACK_MAX_BYTES = 512 * 1024
 /** Hard cap for a single reduce pass. Exceeding this yields degraded=fallback
  * with no resume cursor (B1). Default 5s; 6.5k frames measured ~1s. */
 export const LIVE_UNITS_REDUCE_DEADLINE_MS = 5_000
+/**
+ * Checkpoint stores the full fold (every child). Fields larger than the serving
+ * preview cap are stored as preview+payloadRef so a 10MB run does not land a
+ * 10MB jsonb row. Structure stays complete (B2). If the ref-folded JSON still
+ * exceeds this cap, the write is skipped (cache miss → live reduce).
+ */
+export const LIVE_UNITS_CHECKPOINT_MAX_BYTES = 8 * 1024 * 1024
 
 export type LiveUnitsDegraded = 'fallback'
 
@@ -832,10 +839,85 @@ export function assembleLiveUnitsPage(
 ): LiveUnitsPage {
   const reduced = reduceLiveFrames(frames, opts)
   if (!reduced.ok) return fallbackLiveUnitsPage(meta)
-  if (catchUpFrames.length === 0) return serveLiveUnits(reduced.state, meta, opts)
-  const continued = continueReduceLiveFrames(reduced.state, catchUpFrames, opts)
+  return assembleLiveUnitsFromState(reduced.state, meta, opts, catchUpFrames)
+}
+
+export function assembleLiveUnitsFromState(
+  state: LiveUnitState,
+  meta: {
+    streamClientMessageIds: string[]
+    openDispatch: boolean
+    hasTapeProjection: boolean
+    tapeProjectionVersion: number
+  },
+  opts: ReduceLiveFramesOptions & ServeLiveUnitsOptions = {},
+  catchUpFrames: LiveFrameInput[] = [],
+): LiveUnitsPage {
+  if (catchUpFrames.length === 0) return serveLiveUnits(state, meta, opts)
+  const continued = continueReduceLiveFrames(state, catchUpFrames, opts)
   if (!continued.ok) return fallbackLiveUnitsPage(meta)
   return serveLiveUnits(continued.state, meta, opts)
+}
+
+const UNIT_KINDS = new Set<LiveUnitKind>(['thinking', 'text', 'tool', 'plan', 'agent_group'])
+
+/**
+ * B2: keep every unit and every child. Serving-only K/N windows are NOT applied.
+ * Oversized payload fields become preview+payloadRef (same 64KB cap as serving).
+ * Returns null when even the ref-folded JSON exceeds LIVE_UNITS_CHECKPOINT_MAX_BYTES.
+ */
+export function foldLiveUnitStateForCheckpoint(
+  state: LiveUnitState,
+  opts: { previewMax?: number; maxBytes?: number } = {},
+): { json: string; state: LiveUnitState } | null {
+  const previewMax = opts.previewMax ?? LIVE_UNITS_BLOCK_PREVIEW_MAX
+  const maxBytes = opts.maxBytes ?? LIVE_UNITS_CHECKPOINT_MAX_BYTES
+  const folded: LiveUnitState = {
+    units: state.units.map((unit) => {
+      const copy = cloneUnit(unit)
+      applyPreviewToUnit(copy, previewMax)
+      return copy
+    }),
+    throughFrameSeq: state.throughFrameSeq,
+    throughRecordId: state.throughRecordId,
+    sessionKey: state.sessionKey,
+    reducerEpoch: state.reducerEpoch || LIVE_UNITS_REDUCER_EPOCH,
+  }
+  const json = JSON.stringify(folded)
+  if (json.length > maxBytes) return null
+  return { json, state: folded }
+}
+
+export function parseLiveUnitCheckpoint(
+  raw: unknown,
+  expectedEpoch: string = LIVE_UNITS_REDUCER_EPOCH,
+): LiveUnitState | null {
+  if (raw == null || typeof raw !== 'object') return null
+  const obj = raw as Record<string, unknown>
+  if (obj.reducerEpoch !== expectedEpoch) return null
+  if (!Array.isArray(obj.units)) return null
+  if (typeof obj.throughFrameSeq !== 'number' || !Number.isFinite(obj.throughFrameSeq)) return null
+  if (typeof obj.throughRecordId !== 'string' || obj.throughRecordId.length === 0) return null
+  const units: LiveUnit[] = []
+  for (const item of obj.units) {
+    if (!item || typeof item !== 'object') return null
+    const unit = item as LiveUnit
+    if (typeof unit.id !== 'string' || unit.id.length === 0) return null
+    if (!UNIT_KINDS.has(unit.kind)) return null
+    if (typeof unit.seqFirst !== 'number' || typeof unit.seqLast !== 'number') return null
+    if (typeof unit.recordIdFirst !== 'string' || typeof unit.recordIdLast !== 'string') return null
+    units.push({
+      ...unit,
+      children: Array.isArray(unit.children) ? unit.children.map((c) => ({ ...c })) : unit.children,
+    })
+  }
+  return {
+    units,
+    throughFrameSeq: obj.throughFrameSeq,
+    throughRecordId: obj.throughRecordId,
+    sessionKey: typeof obj.sessionKey === 'string' ? obj.sessionKey : undefined,
+    reducerEpoch: expectedEpoch,
+  }
 }
 
 /** Resolve a truncated payload: live frame first, then tape by sha256 after prune. */

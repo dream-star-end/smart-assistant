@@ -2744,6 +2744,7 @@ export function App() {
           onScroll={onChatScroll}
           onWheel={markUserChatScroll}
           onTouchStart={markUserChatScroll}
+          onTouchMove={markUserChatScroll}
           onPointerDown={markUserChatScroll}
           onKeyDown={markUserChatScroll}
           className="chat-scroll-area min-h-0 flex-1 overflow-y-auto overflow-x-hidden"

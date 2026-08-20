@@ -33,4 +33,19 @@ describe("stickToBottom", () => {
     stick.onScroll(el);
     expect(stick.following.current).toBe(true);
   });
+
+  test("移动端首次上滑优先于尚未消费的程序化贴底事件", () => {
+    const stick = createStickToBottomController();
+    const el = scroller({ scrollHeight: 1000, scrollTop: 920, clientHeight: 80 });
+    stick.scrollToBottom(el);
+    const bottom = el.scrollTop;
+
+    // Mobile browsers may coalesce the programmatic scroll event with the
+    // first tiny touch scroll. Even inside the 80px resume threshold, moving
+    // away from the bottom is explicit user intent and must stop following.
+    stick.markUserIntent();
+    el.scrollTop = bottom - 8;
+    stick.onScroll(el);
+    expect(stick.following.current).toBe(false);
+  });
 });
