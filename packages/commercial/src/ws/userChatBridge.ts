@@ -95,7 +95,10 @@ import {
 } from "../billing/verificationSponsorship.js";
 import type { TokenUsage } from "../billing/calculator.js";
 import { settleCursorExternalUsage } from "../billing/cursorExternalSettle.js";
-import { settleZcodeCatalogUsage } from "../billing/zcodeCatalogSettle.js";
+import {
+  publishZcodeCatalogSettle,
+  settleZcodeCatalogUsage,
+} from "../billing/zcodeCatalogSettle.js";
 import {
   abortInsertedZcodeAudit,
   applyZcodeFinalizeOutcome,
@@ -3092,7 +3095,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     //   userDetached: 守 detachUserSide 幂等(drain 入口 + finalCleanup 都跑)
     const inflightCodexTurns = new Map<string, CodexTurnSnapshot>();
     const pendingZcodeRequestIds = new Set<string>();
-    const pendingZcodeRelays = new Map<string, { token: string; modelId: string; sessionId: string | null }>();
+    const pendingZcodeRelays = new Map<string, {
+      token: string;
+      modelId: string;
+      sessionId: string | null;
+      traceId: string;
+    }>();
     // P0 修复(2026-07-03)— 跨桥 settle 的同步去重簿记:同 requestId 的 duplicate
     // billing 帧在 journal 回查/settle 在途期间直接丢弃(与主路径 Map.delete 先行
     // 的单次门控同构)。跨进程/跨桥并发仍由 journal CAS + usage_records UNIQUE 兜底。
@@ -5011,7 +5019,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               sendErrorFrame(userWs, 'ZCODE_UNAVAILABLE', 'ZCode is temporarily unavailable');
               return;
             }
-            pendingZcodeRelays.set(requestId, { token: minted.token, modelId: zcodeModelId, sessionId: peerCapture });
+            pendingZcodeRelays.set(requestId, {
+              token: minted.token,
+              modelId: zcodeModelId,
+              sessionId: peerCapture,
+              traceId: traceCapture,
+            });
             insertedRequestId = requestId;
             if (canary) {
               await insertPendingZcodeAudit(deps.pgPool, {
@@ -6303,7 +6316,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 const canaryTerminal = outcome === "closed" || outcome === "already_terminal";
                 if (!canaryTerminal && pricing && (relay?.modelId === "glm-5.3-zai" || outcome === "unknown")) {
                   try {
-                    await settleZcodeCatalogUsage({
+                    const settled = await settleZcodeCatalogUsage({
                       pool,
                       pricing,
                       userId: uid,
@@ -6314,6 +6327,26 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                       terminalCode,
                       usage,
                     });
+                    if (settled === null) {
+                      bridgeLog?.warn("user-chat-bridge: ZCode catalog settle skipped, pricing missing", { requestId });
+                    } else {
+                      await publishZcodeCatalogSettle({
+                        settled,
+                        requestId,
+                        userId: uid.toString(),
+                        modelId: "glm-5.3-zai",
+                        sessionId: relay?.sessionId ?? null,
+                        traceId: relay?.traceId ?? null,
+                        persist: deps.appendCostCredits,
+                        publish: (event) => { broadcastToUser(uid, event); },
+                        onPersistError: (err) => {
+                          bridgeLog?.warn("user-chat-bridge: ZCode persist costCredits threw", {
+                            requestId,
+                            err,
+                          });
+                        },
+                      });
+                    }
                   } catch (err) {
                     bridgeLog?.warn("user-chat-bridge: ZCode catalog settle failed", { requestId, err });
                   }

@@ -5,7 +5,7 @@
  * Run: npx tsx --test packages/gateway/src/__tests__/zcodeAdapter.test.ts
  */
 import assert from 'node:assert/strict'
-import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, test } from 'node:test'
@@ -186,9 +186,9 @@ const common = {
   timestamp: new Date().toISOString(),
 }
 for (const event of [
+  { ...common, hookEventName: 'PreToolUse', sessionId: 'sess_child', toolCallId: 'call_child', toolName: 'Read' },
   { ...common, hookEventName: 'PreToolUse' },
   { ...common, hookEventName: 'PostToolUse', toolResponse: { stdout: 'ok', exitCode: 0 }, toolResultPreview: 'ok' },
-  { ...common, hookEventName: 'PreToolUse', sessionId: 'sess_child', toolCallId: 'call_child', toolName: 'Read' },
 ]) {
   const result = spawnSync(hook.command, hook.args, { input: JSON.stringify(event), encoding: 'utf8' })
   if (result.status !== 0 || result.stdout.trim() !== '{}') process.exit(9)
@@ -252,6 +252,108 @@ process.stdout.write(${JSON.stringify(`${JSON.stringify(successFixture)}\n`)})
       restoreEnv('OC_ZCODE_HOOK_COLLECTOR_BIN', previousHook)
       restoreEnv('OC_ZCODE_TEST_ALLOW_UNTRUSTED_HOOK', previousAllow)
       restoreEnv('OC_ZCODE_TEST_NODE_BIN', previousNode)
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('streams resumed SQLite reasoning/text before final and does not replay the final response', async (t) => {
+    try {
+      await import('node:sqlite')
+    } catch {
+      t.skip('node:sqlite requires Node 22')
+      return
+    }
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-zcode-stream-'))
+    const home = path.join(dir, 'home')
+    const databaseDir = path.join(home, 'zcode-cli', 'cli', 'db')
+    const databaseFile = path.join(databaseDir, 'db.sqlite')
+    const fake = path.join(dir, 'fake-zcode-stream.cjs')
+    await mkdir(databaseDir, { recursive: true })
+    await writeFile(path.join(dir, 'persona.md'), 'persona-line')
+    const { DatabaseSync } = await import('node:sqlite')
+    const seed = new DatabaseSync(databaseFile)
+    seed.exec([
+      'CREATE TABLE message(id TEXT, session_id TEXT, time_created INTEGER, data TEXT, sequence INTEGER)',
+      'CREATE TABLE part(id TEXT, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT, sequence INTEGER)',
+    ].join(';'))
+    seed.close()
+    await writeFile(fake, [
+      '#!/usr/bin/env node',
+      "const path = require('node:path')",
+      "const { DatabaseSync } = require('node:sqlite')",
+      "const db = new DatabaseSync(path.join(process.env.OPENCLAUDE_HOME, 'zcode-cli', 'cli', 'db', 'db.sqlite'))",
+      'const now = Date.now()',
+      "db.prepare('INSERT INTO message VALUES(?,?,?,?,?)').run('msg_live','sess_prior',now,JSON.stringify({role:'assistant'}),0)",
+      "db.prepare('INSERT INTO part VALUES(?,?,?,?,?,?)').run('reason_live','msg_live','sess_prior',now,JSON.stringify({type:'reasoning',text:'先',time:{start:now}}),0)",
+      "db.prepare('INSERT INTO part VALUES(?,?,?,?,?,?)').run('text_live_a','msg_live','sess_prior',now+1,JSON.stringify({type:'text',text:'答',time:{start:now+1}}),1)",
+      "db.prepare('INSERT INTO part VALUES(?,?,?,?,?,?)').run('text_live_b','msg_live','sess_prior',now+2,JSON.stringify({type:'text',text:'案',time:{start:now+2}}),2)",
+      "setTimeout(() => db.prepare('UPDATE part SET data=? WHERE id=?').run(JSON.stringify({type:'reasoning',text:'先思考',time:{start:now}}),'reason_live'), 250)",
+      "setTimeout(() => { process.stdout.write(JSON.stringify({sessionId:'sess_prior',response:'答案完成',usage:{inputTokens:12,outputTokens:4,cacheReadTokens:0,cacheWriteTokens:0},eventCount:3,projection:{status:'idle',turnCount:1,totalTokenCount:16,contextUsed:16,contextWindow:1000}})+'\\n'); db.close() }, 2000)",
+    ].join('\n'))
+    await chmod(fake, 0o755)
+    const previousBin = process.env.OC_ZCODE_CLI_BIN
+    const previousHome = process.env.OPENCLAUDE_HOME
+    process.env.OC_ZCODE_CLI_BIN = fake
+    process.env.OPENCLAUDE_HOME = home
+    try {
+      const adapter = new ZcodeAdapter(createOpts(dir))
+      const events: EngineEvent[] = []
+      adapter.on('error', () => {})
+      const run = adapter.submitTurn({
+        input: 'stream it',
+        requestId: REQUEST_ID,
+        assistantMessageId: 'answer-base',
+        thinkingMessageId: 'thinking-base',
+        onEvent: (event) => events.push(event),
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run.submitted
+      const deadline = Date.now() + 1_500
+      while (
+        Date.now() < deadline &&
+        !(
+          events
+            .filter((event) => event.kind === 'block' && event.block.kind === 'text')
+            .map((event) => event.kind === 'block' && event.block.kind === 'text' ? event.block.text : '')
+            .join('') === '答案' &&
+          events
+            .filter((event) => event.kind === 'block' && event.block.kind === 'thinking')
+            .map((event) => event.kind === 'block' && event.block.kind === 'thinking' ? event.block.text : '')
+            .join('') === '先思考'
+        )
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 50))
+      }
+      assert.equal(events.some((event) => event.kind === 'final'), false)
+      assert.equal(
+        events
+          .filter((event) => event.kind === 'block' && event.block.kind === 'thinking')
+          .map((event) => event.kind === 'block' && event.block.kind === 'thinking' ? event.block.text : '')
+          .join(''),
+        '先思考',
+      )
+      assert.equal(
+        events
+          .filter((event) => event.kind === 'block' && event.block.kind === 'text')
+          .map((event) => event.kind === 'block' && event.block.kind === 'text' ? event.block.text : '')
+          .join(''),
+        '答案',
+      )
+      const summary = await run.summary
+      assert.equal(summary?.thinkingText, '先思考')
+      assert.equal(summary?.assistantText, '答案完成')
+      assert.equal(
+        events
+          .filter((event) => event.kind === 'block' && event.block.kind === 'text')
+          .map((event) => event.kind === 'block' && event.block.kind === 'text' ? event.block.text : '')
+          .join(''),
+        '答案完成',
+      )
+      assert.equal(events.at(-1)?.kind, 'final')
+    } finally {
+      restoreEnv('OC_ZCODE_CLI_BIN', previousBin)
+      restoreEnv('OPENCLAUDE_HOME', previousHome)
       await rm(dir, { recursive: true, force: true })
     }
   })
@@ -372,6 +474,10 @@ process.stdout.write(${JSON.stringify(`${JSON.stringify(successFixture)}\n`)})
   })
 
   test('stdout parser accepts only the live fixture object and rejects counterexamples', () => {
+    assert.equal(_internals.suffixPrefixOverlap('AB', 'ABC'), 2)
+    assert.equal(_internals.suffixPrefixOverlap('prefix-AB', 'ABC'), 2)
+    assert.equal(_internals.suffixPrefixOverlap('ABC', 'ABC'), 3)
+    assert.equal(_internals.suffixPrefixOverlap('left', 'right'), 0)
     const parsed = _internals.parseJsonResult(JSON.stringify(successFixture))
     assert.equal(parsed.sessionId, 'sess_live_fixture_001')
     assert.equal(parsed.eventCount, 3)

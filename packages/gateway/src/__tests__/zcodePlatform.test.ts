@@ -17,6 +17,7 @@ import { describe, test } from 'node:test'
 import {
   cleanupZcodePlatformArtifacts,
   createZcodePlatformArtifacts,
+  readZcodeContentSnapshot,
   readZcodeReasoningParts,
 } from '../engine/zcodePlatform.js'
 
@@ -162,6 +163,14 @@ describe('zcode platform artifacts', () => {
         JSON.stringify({ type: 'reasoning', text: 'reasoning-visible', time: { start: now } }),
         0,
       )
+      db.prepare('INSERT INTO part VALUES(?,?,?,?,?,?)').run(
+        'part_text',
+        'msg_a',
+        'sess_current',
+        now + 1,
+        JSON.stringify({ type: 'text', text: 'answer-visible', time: { start: now + 1 } }),
+        1,
+      )
     } finally {
       db.close()
     }
@@ -176,6 +185,25 @@ describe('zcode platform artifacts', () => {
       assert.equal(parts[0]?.text, 'reasoning-visible')
       assert.equal(typeof parts[0]?.ts, 'number')
       assert.equal(parts[0]?.truncated, false)
+      assert.deepEqual(
+        readZcodeContentSnapshot({
+          databaseFile: dbPath,
+          sessionId: 'sess_current',
+          startedAt: boundary,
+        }).parts.map((part) => [part.id, part.kind, part.text]),
+        [
+          ['part_reason', 'reasoning', 'reasoning-visible'],
+          ['part_text', 'text', 'answer-visible'],
+        ],
+      )
+      assert.deepEqual(
+        readZcodeContentSnapshot({
+          databaseFile: dbPath,
+          sessionId: 'not-a-session',
+          startedAt: boundary,
+        }),
+        { available: false, parts: [] },
+      )
       assert.deepEqual(
         readZcodeReasoningParts({
           databaseFile: `${dbPath}.missing`,

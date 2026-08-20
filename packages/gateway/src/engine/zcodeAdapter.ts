@@ -31,7 +31,8 @@ import { buildPromptContext } from '../promptSlots.js'
 import {
   cleanupZcodePlatformArtifacts,
   createZcodePlatformArtifacts,
-  readZcodeReasoningParts,
+  readZcodeContentSnapshot,
+  type ZcodeContentPart,
   type ZcodePlatformArtifacts,
 } from './zcodePlatform.js'
 
@@ -40,8 +41,12 @@ const REQUEST_ID_RE = /^[0-9a-f]{32}$/
 const ZCODE_SHUTDOWN_GRACE_DEFAULT_MS = 3_000
 const ZCODE_SHUTDOWN_FINAL_DRAIN_DEFAULT_MS = 3_000
 const ZCODE_HOOK_POLL_MS = 100
+const ZCODE_CONTENT_POLL_MS = 200
+const ZCODE_FINAL_CONTENT_DRAIN_ATTEMPTS = 4
+const ZCODE_FINAL_CONTENT_DRAIN_DELAY_MS = 25
 const ZCODE_HOOK_MAX_JOURNAL_BYTES = 16 * 1024 * 1024
 const ZCODE_THINKING_MAX_CHARS = 256 * 1024
+const ZCODE_ASSISTANT_MAX_CHARS = 4 * 1024 * 1024
 const EMPTY_SIGNALS: PhantomSignals = { apiState: 'unknown', skipReason: null }
 const ZCODE_HOTCFG_WRAPPER_BIN = '/run/oc/platform/current/bin/oc-zcode'
 const ZCODE_IMAGE_WRAPPER_BIN = '/usr/local/bin/oc-zcode'
@@ -96,8 +101,15 @@ interface ZcodeTurnContext {
   hookOffset: number
   hookCarry: string
   hookTimer: NodeJS.Timeout | null
-  reasoningPartIds: Set<string>
-  hookSessionId: string | null
+  contentTimer: NodeJS.Timeout | null
+  zcodeSessionId: string | null
+  contentParts: Map<string, {
+    kind: ZcodeContentPart['kind']
+    segmentIndex: number
+    liveText: string
+    drifted: boolean
+  }>
+  pendingHookRecords: Map<string, ZcodeHookRecord[]>
 }
 
 function asText(value: unknown): string {
@@ -331,6 +343,33 @@ function eventTimestamp(value: string): number {
   return Number.isFinite(parsed) ? parsed : Date.now()
 }
 
+function suffixPrefixOverlap(existing: string, incoming: string): number {
+  if (!existing || !incoming) return 0
+  const lps = new Uint32Array(incoming.length)
+  for (let i = 1, matched = 0; i < incoming.length;) {
+    if (incoming.charCodeAt(i) === incoming.charCodeAt(matched)) {
+      lps[i++] = ++matched
+    } else if (matched > 0) {
+      matched = lps[matched - 1] ?? 0
+    } else {
+      lps[i++] = 0
+    }
+  }
+  let matched = 0
+  const start = Math.max(0, existing.length - incoming.length)
+  for (let i = start; i < existing.length; i++) {
+    const code = existing.charCodeAt(i)
+    while (matched > 0 && code !== incoming.charCodeAt(matched)) {
+      matched = lps[matched - 1] ?? 0
+    }
+    if (code === incoming.charCodeAt(matched)) matched++
+    if (matched === incoming.length && i + 1 < existing.length) {
+      matched = lps[matched - 1] ?? 0
+    }
+  }
+  return matched
+}
+
 export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
   readonly engineId = 'zcode'
   readonly capabilities: EngineCapabilities = {
@@ -417,8 +456,10 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
       hookOffset: 0,
       hookCarry: '',
       hookTimer: null,
-      reasoningPartIds: new Set(),
-      hookSessionId: null,
+      contentTimer: null,
+      zcodeSessionId: null,
+      contentParts: new Map(),
+      pendingHookRecords: new Map(),
     }
     this.active = ctx
     this.lastActivityAt = Date.now()
@@ -485,11 +526,16 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
       clearInterval(ctx.hookTimer)
       ctx.hookTimer = null
     }
+    if (ctx.contentTimer) {
+      clearInterval(ctx.contentTimer)
+      ctx.contentTimer = null
+    }
     cleanupZcodePlatformArtifacts(ctx.artifacts)
     ctx.artifacts = null
     ctx.hookOffset = 0
     ctx.hookCarry = ''
-    ctx.hookSessionId = null
+    ctx.zcodeSessionId = null
+    ctx.pendingHookRecords.clear()
   }
 
   private startHookDrain(ctx: ZcodeTurnContext): void {
@@ -498,6 +544,14 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
       try { this.drainHookJournal(ctx) } catch { /* observability must not affect the turn */ }
     }, ZCODE_HOOK_POLL_MS)
     ctx.hookTimer.unref()
+  }
+
+  private startContentDrain(ctx: ZcodeTurnContext): void {
+    if (!ctx.artifacts?.databaseFile || ctx.contentTimer) return
+    ctx.contentTimer = setInterval(() => {
+      try { this.drainContentSnapshot(ctx) } catch { /* observability must not affect the turn */ }
+    }, ZCODE_CONTENT_POLL_MS)
+    ctx.contentTimer.unref()
   }
 
   private drainHookJournal(ctx: ZcodeTurnContext): void {
@@ -529,33 +583,96 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
     }
   }
 
-  private emitNewReasoning(ctx: ZcodeTurnContext, sessionId: string): void {
-    const databaseFile = ctx.artifacts?.databaseFile
-    if (!databaseFile || ctx.thinkingText.length >= ZCODE_THINKING_MAX_CHARS) return
-    const parts = readZcodeReasoningParts({ databaseFile, sessionId, startedAt: ctx.startedAt })
-    for (const part of parts) {
-      if (ctx.reasoningPartIds.has(part.id)) continue
-      ctx.reasoningPartIds.add(part.id)
-      const remaining = ZCODE_THINKING_MAX_CHARS - ctx.thinkingText.length
-      if (remaining <= 0) break
-      const text = part.text.slice(0, remaining)
-      if (!text) continue
-      ctx.thinkingText += text
-      const segment: SegmentRecord = {
-        index: ctx.thinkingSegments.length,
+  private emitContentDelta(
+    ctx: ZcodeTurnContext,
+    part: ZcodeContentPart,
+    delta: string,
+    segmentIndex: number,
+  ): void {
+    if (!delta) return
+    this.lastActivityAt = Date.now()
+    this.emit('activity')
+    const kind = part.kind === 'reasoning' ? 'thinking' : 'text'
+    const messageIdBase = part.kind === 'reasoning'
+      ? ctx.params.thinkingMessageId
+      : ctx.params.assistantMessageId
+    ctx.params.onEvent({
+      kind: 'block',
+      block: {
+        kind,
+        text: delta,
+        ...(messageIdBase ? { messageId: `${messageIdBase}-s${segmentIndex}` } : {}),
+      },
+    })
+  }
+
+  private refreshAggregates(ctx: ZcodeTurnContext): void {
+    ctx.thinkingText = ctx.thinkingSegments.map((segment) => segment.text).join('')
+    ctx.assistantText = ctx.assistantSegments.map((segment) => segment.text).join('')
+  }
+
+  private acceptContentPart(ctx: ZcodeTurnContext, part: ZcodeContentPart): void {
+    const segments = part.kind === 'reasoning' ? ctx.thinkingSegments : ctx.assistantSegments
+    const maxChars = part.kind === 'reasoning' ? ZCODE_THINKING_MAX_CHARS : ZCODE_ASSISTANT_MAX_CHARS
+    let state = ctx.contentParts.get(part.id)
+    if (!state) {
+      const used = segments.reduce((sum, segment) => sum + segment.text.length, 0)
+      const text = part.text.slice(0, Math.max(0, maxChars - used))
+      if (!text) return
+      const segmentIndex = segments.length
+      segments.push({
+        index: segmentIndex,
         text,
         ts: part.ts,
         eventOrdinal: ctx.params.nextDurableEventOrdinal?.(),
-      }
-      ctx.thinkingSegments.push(segment)
-      ctx.params.onEvent({
-        kind: 'block',
-        block: {
-          kind: 'thinking',
-          text,
-          ...(ctx.params.thinkingMessageId ? { messageId: ctx.params.thinkingMessageId } : {}),
-        },
       })
+      state = { kind: part.kind, segmentIndex, liveText: text, drifted: false }
+      ctx.contentParts.set(part.id, state)
+      this.refreshAggregates(ctx)
+      this.emitContentDelta(ctx, part, text, segmentIndex)
+      return
+    }
+    if (state.kind !== part.kind) return
+    const segment = segments[state.segmentIndex]
+    if (!segment) return
+    const otherUsed = segments.reduce(
+      (sum, current, index) => sum + (index === state!.segmentIndex ? 0 : current.text.length),
+      0,
+    )
+    const text = part.text.slice(0, Math.max(0, maxChars - otherUsed))
+    if (!text.startsWith(state.liveText)) {
+      state.drifted = true
+      segment.text = text
+      this.refreshAggregates(ctx)
+      return
+    }
+    segment.text = text
+    this.refreshAggregates(ctx)
+    if (state.drifted) return
+    const delta = text.slice(state.liveText.length)
+    state.liveText = text
+    this.emitContentDelta(ctx, part, delta, state.segmentIndex)
+  }
+
+  private drainContentSnapshot(ctx: ZcodeTurnContext): string | null {
+    const databaseFile = ctx.artifacts?.databaseFile
+    const sessionId = ctx.zcodeSessionId
+    if (!databaseFile || !sessionId) return null
+    const snapshot = readZcodeContentSnapshot({ databaseFile, sessionId, startedAt: ctx.startedAt })
+    if (!snapshot.available) return null
+    for (const part of snapshot.parts) this.acceptContentPart(ctx, part)
+    return JSON.stringify(snapshot.parts.map((part) => [part.id, part.kind, part.text]))
+  }
+
+  private async drainContentStable(ctx: ZcodeTurnContext): Promise<void> {
+    let previous: string | null = null
+    for (let attempt = 0; attempt < ZCODE_FINAL_CONTENT_DRAIN_ATTEMPTS; attempt++) {
+      const current = this.drainContentSnapshot(ctx)
+      if (current !== null && current === previous) return
+      previous = current
+      if (attempt + 1 < ZCODE_FINAL_CONTENT_DRAIN_ATTEMPTS) {
+        await new Promise<void>((resolve) => setTimeout(resolve, ZCODE_FINAL_CONTENT_DRAIN_DELAY_MS))
+      }
     }
   }
 
@@ -644,17 +761,34 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
     })
   }
 
-  private acceptHookRecord(ctx: ZcodeTurnContext, record: ZcodeHookRecord): void {
-    if (record.sessionId) {
-      if (!ctx.hookSessionId) ctx.hookSessionId = record.sessionId
-      else if (ctx.hookSessionId !== record.sessionId) return
-    }
+  private applyHookRecord(ctx: ZcodeTurnContext, record: ZcodeHookRecord): void {
     if (record.hookEventName === 'PreToolUse') {
-      if (record.sessionId) this.emitNewReasoning(ctx, record.sessionId)
+      this.drainContentSnapshot(ctx)
       this.ensureToolStart(ctx, record)
       return
     }
     this.completeTool(ctx, record)
+  }
+
+  private bindZcodeSession(ctx: ZcodeTurnContext, sessionId: string): void {
+    if (!sessionId.startsWith('sess_')) return
+    if (ctx.zcodeSessionId && ctx.zcodeSessionId !== sessionId) return
+    ctx.zcodeSessionId = sessionId
+    const pending = ctx.pendingHookRecords.get(sessionId) ?? []
+    ctx.pendingHookRecords.clear()
+    for (const record of pending) this.applyHookRecord(ctx, record)
+  }
+
+  private acceptHookRecord(ctx: ZcodeTurnContext, record: ZcodeHookRecord): void {
+    if (!record.sessionId) return
+    if (!ctx.zcodeSessionId) {
+      const pending = ctx.pendingHookRecords.get(record.sessionId) ?? []
+      pending.push(record)
+      ctx.pendingHookRecords.set(record.sessionId, pending)
+      return
+    }
+    if (ctx.zcodeSessionId !== record.sessionId) return
+    this.applyHookRecord(ctx, record)
   }
 
   private async spawnTurn(ctx: ZcodeTurnContext): Promise<void> {
@@ -703,6 +837,7 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
       '--cwd', cwd,
     ]
     ctx.spawnedWithResume = Boolean(this.nativeId)
+    ctx.zcodeSessionId = this.nativeId
     if (this.nativeId) args.push('--resume', this.nativeId)
     const env: NodeJS.ProcessEnv = {
       PATH: '/run/oc/platform/current/bin:/usr/local/bin:/usr/bin:/bin',
@@ -721,6 +856,7 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
     const proc = spawn(bin, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], detached: true })
     ctx.proc = proc
     this.startHookDrain(ctx)
+    this.startContentDrain(ctx)
     if (ctx.abandoned) {
       killProcessGroup(proc, 'SIGKILL')
       detachChildStdio(proc)
@@ -747,64 +883,68 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
       this.emit('error', err)
     })
     proc.once('close', (code, signal) => {
-      let retrying = false
-      try {
-        if (ctx.abandoned) return
-        this.drainHookJournal(ctx)
-        const stderrText = ctx.stderr.trim()
-        const stale = isZcodeStaleResumeError(stderrText)
-        if (
-          !ctx.terminal &&
-          !ctx.interrupted &&
-          ctx.spawnedWithResume &&
-          !ctx.staleResumeRetried &&
-          stale
-        ) {
-          retrying = true
-          ctx.staleResumeRetried = true
-          this.nativeId = null
-          ctx.stdout = ''
-          ctx.stderr = ''
-          ctx.proc = null
-          ctx.procClosed = false
-          this.cleanupArtifacts(ctx)
-          void this.spawnTurn(ctx).catch((err) => {
-            if (ctx.abandoned) return
-            this.finishError(ctx, String(err))
-            this.cleanupArtifacts(ctx)
-            this.emit('error', err instanceof Error ? err : new Error(String(err)))
-          })
-          return
-        }
-        ctx.procClosed = true
-        ctx.resolveDrain?.()
-        ctx.resolveDrain = null
-        const crashed = !ctx.interrupted && code !== 0
-        if (!ctx.terminal) {
-          if (code === 0 && /(?:^|\n)\s*Error\b/.test(ctx.stderr)) {
-            this.finishError(ctx, ctx.stderr.trim() || 'CLI reported Error on stderr')
-          } else if (code === 0) {
-            this.finishSuccess(ctx)
-          } else {
-            this.finishError(ctx, ctx.stderr.trim() || `zcode exited with code ${String(code)}`)
-          }
-        }
-        this.emit('exit', { code, signal, crashed })
-      } catch (err) {
-        if (!ctx.terminal) {
-          this.finishError(ctx, err instanceof Error ? err.message : String(err))
-        }
+      void (async () => {
+        let retrying = false
         try {
-          this.emit('exit', { code, signal, crashed: true })
-        } catch { /* close must never throw into the gateway */ }
-      } finally {
-        if (!retrying) this.cleanupArtifacts(ctx)
-        if (this.active === ctx && (ctx.terminal || ctx.procClosed)) this.active = null
-      }
+          if (ctx.abandoned) return
+          this.drainHookJournal(ctx)
+          const stderrText = ctx.stderr.trim()
+          const stale = isZcodeStaleResumeError(stderrText)
+          if (
+            !ctx.terminal &&
+            !ctx.interrupted &&
+            ctx.spawnedWithResume &&
+            !ctx.staleResumeRetried &&
+            stale
+          ) {
+            retrying = true
+            ctx.staleResumeRetried = true
+            this.nativeId = null
+            ctx.stdout = ''
+            ctx.stderr = ''
+            ctx.proc = null
+            ctx.procClosed = false
+            this.cleanupArtifacts(ctx)
+            void this.spawnTurn(ctx).catch((err) => {
+              if (ctx.abandoned) return
+              this.finishError(ctx, String(err))
+              this.cleanupArtifacts(ctx)
+              this.emit('error', err instanceof Error ? err : new Error(String(err)))
+            })
+            return
+          }
+          ctx.procClosed = true
+          ctx.resolveDrain?.()
+          ctx.resolveDrain = null
+          const crashed = !ctx.interrupted && code !== 0
+          if (!ctx.terminal) {
+            if (code === 0 && /(?:^|\n)\s*Error\b/.test(ctx.stderr)) {
+              await this.drainContentStable(ctx)
+              this.finishError(ctx, ctx.stderr.trim() || 'CLI reported Error on stderr')
+            } else if (code === 0) {
+              await this.finishSuccess(ctx)
+            } else {
+              await this.drainContentStable(ctx)
+              this.finishError(ctx, ctx.stderr.trim() || `zcode exited with code ${String(code)}`)
+            }
+          }
+          this.emit('exit', { code, signal, crashed })
+        } catch (err) {
+          if (!ctx.terminal) {
+            this.finishError(ctx, err instanceof Error ? err.message : String(err))
+          }
+          try {
+            this.emit('exit', { code, signal, crashed: true })
+          } catch { /* close must never throw into the gateway */ }
+        } finally {
+          if (!retrying) this.cleanupArtifacts(ctx)
+          if (this.active === ctx && (ctx.terminal || ctx.procClosed)) this.active = null
+        }
+      })()
     })
   }
 
-  private finishSuccess(ctx: ZcodeTurnContext): void {
+  private async finishSuccess(ctx: ZcodeTurnContext): Promise<void> {
     if (ctx.terminal) return
     let parsed: ZcodeJsonResult
     try {
@@ -816,25 +956,56 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
     }
     const sessionId = typeof parsed.sessionId === 'string' ? parsed.sessionId : null
     if (sessionId) {
+      if (ctx.zcodeSessionId && ctx.zcodeSessionId !== sessionId) {
+        if (ctx.contentParts.size > 0 || ctx.tools.size > 0) {
+          this.finishError(ctx, 'ZCODE_SESSION_MISMATCH')
+          return
+        }
+        ctx.zcodeSessionId = null
+      }
       this.nativeId = sessionId
       this.emit('session_id', sessionId)
-      if (!ctx.hookSessionId) ctx.hookSessionId = sessionId
-      if (ctx.hookSessionId === sessionId) this.emitNewReasoning(ctx, sessionId)
+      this.bindZcodeSession(ctx, sessionId)
+      await this.drainContentStable(ctx)
     }
     ctx.lastUsage = parseUsage(parsed.usage)
     const response = typeof parsed.response === 'string' ? parsed.response : asText(parsed.response)
-    ctx.assistantText = response
     if (response) {
-      ctx.assistantSegments.push({
-        index: 0,
-        text: response,
-        ts: Date.now(),
-        eventOrdinal: ctx.params.nextDurableEventOrdinal?.(),
-      })
-      ctx.params.onEvent({
-        kind: 'block',
-        block: { kind: 'text', text: response, ...(ctx.params.assistantMessageId ? { messageId: ctx.params.assistantMessageId } : {}) },
-      })
+      const overlap = suffixPrefixOverlap(ctx.assistantText, response)
+      const delta = response.slice(overlap)
+      const last = ctx.assistantSegments.at(-1)
+      if (delta && last && overlap > 0) {
+        last.text += delta
+        ctx.params.onEvent({
+          kind: 'block',
+          block: {
+            kind: 'text',
+            text: delta,
+            ...(ctx.params.assistantMessageId
+              ? { messageId: `${ctx.params.assistantMessageId}-s${last.index}` }
+              : {}),
+          },
+        })
+      } else if (delta) {
+        const index = ctx.assistantSegments.length
+        ctx.assistantSegments.push({
+          index,
+          text: delta,
+          ts: Date.now(),
+          eventOrdinal: ctx.params.nextDurableEventOrdinal?.(),
+        })
+        ctx.params.onEvent({
+          kind: 'block',
+          block: {
+            kind: 'text',
+            text: delta,
+            ...(ctx.params.assistantMessageId
+              ? { messageId: `${ctx.params.assistantMessageId}-s${index}` }
+              : {}),
+          },
+        })
+      }
+      this.refreshAggregates(ctx)
     }
     ctx.params.onEvent({
       kind: 'usage',
@@ -1000,6 +1171,7 @@ export const _internals = {
   parseJsonResult,
   validateZcodeJsonResult,
   parseHookRecord,
+  suffixPrefixOverlap,
   ZCODE_HOTCFG_WRAPPER_BIN,
   ZCODE_IMAGE_WRAPPER_BIN,
 }

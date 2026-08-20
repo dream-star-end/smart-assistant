@@ -222,6 +222,15 @@ export interface ZcodeReasoningPart {
   truncated: boolean
 }
 
+export interface ZcodeContentPart extends ZcodeReasoningPart {
+  kind: 'reasoning' | 'text'
+}
+
+export interface ZcodeContentSnapshot {
+  available: boolean
+  parts: ZcodeContentPart[]
+}
+
 type DatabaseSyncCtor = new (
   path: string,
   options?: { open?: boolean; readOnly?: boolean; timeout?: number },
@@ -252,74 +261,74 @@ function jsonObject(value: unknown): Record<string, unknown> | null {
   }
 }
 
-export function readZcodeReasoningParts(input: {
+export function readZcodeContentSnapshot(input: {
   databaseFile: string
   sessionId: string
   startedAt: number
-}): ZcodeReasoningPart[] {
+}): ZcodeContentSnapshot {
   const Ctor = databaseCtor()
-  if (!Ctor || !input.sessionId.startsWith('sess_')) return []
+  if (!Ctor || !input.sessionId.startsWith('sess_')) return { available: false, parts: [] }
   try {
     const st = lstatSync(input.databaseFile)
-    if (!st.isFile() || st.isSymbolicLink()) return []
+    if (!st.isFile() || st.isSymbolicLink()) return { available: false, parts: [] }
   } catch {
-    return []
+    return { available: false, parts: [] }
   }
   let db: InstanceType<DatabaseSyncCtor> | null = null
   try {
     db = new Ctor(input.databaseFile, { open: true, readOnly: true, timeout: 0 })
     db.exec('PRAGMA busy_timeout=0')
-    const messages = db
+    const rows = db
       .prepare(
-        `SELECT id, time_created, data
-         FROM message
-        WHERE session_id = ? AND time_created >= ?
-        ORDER BY time_created ASC, sequence ASC
-        LIMIT 32`,
+        `SELECT p.id,
+                p.time_created,
+                p.sequence AS part_sequence,
+                p.data AS part_data,
+                m.time_created AS message_time_created,
+                m.sequence AS message_sequence,
+                m.data AS message_data
+           FROM part p
+           JOIN message m
+             ON m.id = p.message_id
+            AND m.session_id = p.session_id
+          WHERE p.session_id = ?
+            AND m.time_created >= ?
+          ORDER BY m.time_created ASC,
+                   m.sequence ASC,
+                   p.time_created ASC,
+                   p.sequence ASC
+          LIMIT 1024`,
       )
       .all(input.sessionId, Math.max(0, input.startedAt)) as Array<Record<string, unknown>>
-    const assistantIds: string[] = []
-    for (const row of messages) {
-      const data = jsonObject(row.data)
-      if (data?.role === 'assistant' && typeof row.id === 'string') assistantIds.push(row.id)
+    const out: ZcodeContentPart[] = []
+    for (const row of rows) {
+      const message = jsonObject(row.message_data)
+      const data = jsonObject(row.part_data)
+      if (message?.role !== 'assistant') continue
+      if (data?.type !== 'reasoning' && data?.type !== 'text') continue
+      if (typeof data.text !== 'string' || !data.text || typeof row.id !== 'string') continue
+      const rawText = data.text
+      const truncated = rawText.length > MAX_REASONING_PART_CHARS
+      const time =
+        data.time && typeof data.time === 'object' && !Array.isArray(data.time)
+          ? (data.time as Record<string, unknown>)
+          : null
+      out.push({
+        id: row.id,
+        kind: data.type,
+        text: truncated ? rawText.slice(0, MAX_REASONING_PART_CHARS) : rawText,
+        ts:
+          typeof time?.start === 'number'
+            ? time.start
+            : typeof row.time_created === 'number'
+              ? row.time_created
+              : Date.now(),
+        truncated,
+      })
     }
-    const out: ZcodeReasoningPart[] = []
-    for (const messageId of assistantIds) {
-      const parts = db
-        .prepare(
-          `SELECT id, time_created, sequence, data
-           FROM part
-          WHERE session_id = ? AND message_id = ?
-          ORDER BY time_created ASC, sequence ASC
-          LIMIT 256`,
-        )
-        .all(input.sessionId, messageId) as Array<Record<string, unknown>>
-      for (const row of parts) {
-        const data = jsonObject(row.data)
-        if (data?.type !== 'reasoning' || typeof data.text !== 'string' || !data.text) continue
-        if (typeof row.id !== 'string') continue
-        const rawText = data.text
-        const truncated = rawText.length > MAX_REASONING_PART_CHARS
-        const time =
-          data.time && typeof data.time === 'object' && !Array.isArray(data.time)
-            ? (data.time as Record<string, unknown>)
-            : null
-        out.push({
-          id: row.id,
-          text: truncated ? rawText.slice(0, MAX_REASONING_PART_CHARS) : rawText,
-          ts:
-            typeof time?.start === 'number'
-              ? time.start
-              : typeof row.time_created === 'number'
-                ? row.time_created
-                : Date.now(),
-          truncated,
-        })
-      }
-    }
-    return out
+    return { available: true, parts: out }
   } catch {
-    return []
+    return { available: false, parts: [] }
   } finally {
     try {
       db?.close()
@@ -327,6 +336,16 @@ export function readZcodeReasoningParts(input: {
       /* fail-soft read sidecar */
     }
   }
+}
+
+export function readZcodeReasoningParts(input: {
+  databaseFile: string
+  sessionId: string
+  startedAt: number
+}): ZcodeReasoningPart[] {
+  return readZcodeContentSnapshot(input).parts
+    .filter((part) => part.kind === 'reasoning')
+    .map(({ kind: _kind, ...part }) => part)
 }
 
 export const _zcodePlatformInternals = {

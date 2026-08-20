@@ -7,7 +7,11 @@ import {
   mintZcodeRelayRoute,
   resolveZcodeRelayRoute,
 } from "../billing/zcodeRouteContext.js";
-import { mapZcodeReportedUsage, planZcodeCatalogSettle } from "../billing/zcodeCatalogSettle.js";
+import {
+  mapZcodeReportedUsage,
+  planZcodeCatalogSettle,
+  publishZcodeCatalogSettle,
+} from "../billing/zcodeCatalogSettle.js";
 import {
   evaluateGlm53ZaiSwitch,
   glm53ZaiCapabilityProfileForEngine,
@@ -147,6 +151,82 @@ describe("zcode catalog settle", () => {
     });
     assert.equal(failed.settleStatus, "error");
     assert.equal(failed.costCredits, 0n);
+  });
+
+  test("folds the actual debit and publishes one exact cost event", async () => {
+    const persisted: unknown[][] = [];
+    const published: unknown[] = [];
+    await publishZcodeCatalogSettle({
+      settled: {
+        usageId: 1n,
+        ledgerId: 2n,
+        clamped: false,
+        debitedCredits: 24n,
+        attributionCredits: 24n,
+        balanceAfter: 900n,
+      },
+      requestId: "a".repeat(32),
+      userId: "3",
+      modelId: "glm-5.3-zai",
+      sessionId: "web-session",
+      traceId: "trace-1",
+      persist: async (...args) => { persisted.push(args); },
+      publish: (event) => { published.push(event); },
+    });
+    assert.deepEqual(persisted, [["a".repeat(32), "3", "24", "web-session"]]);
+    assert.deepEqual(published, [{
+      type: "outbound.cost_charged",
+      requestId: "a".repeat(32),
+      model: "glm-5.3-zai",
+      sessionId: "web-session",
+      costCredits: "24",
+      balanceAfter: "900",
+      traceId: "trace-1",
+    }]);
+  });
+
+  test("persist failure is fail-soft and zero debit never publishes a charge", async () => {
+    const published: unknown[] = [];
+    const errors: unknown[] = [];
+    await publishZcodeCatalogSettle({
+      settled: {
+        usageId: 1n,
+        ledgerId: 2n,
+        clamped: false,
+        debitedCredits: 7n,
+        attributionCredits: 7n,
+        balanceAfter: null,
+      },
+      requestId: "b".repeat(32),
+      userId: "3",
+      modelId: "glm-5.3-zai",
+      sessionId: "web-session",
+      traceId: null,
+      persist: async () => { throw new Error("disk unavailable"); },
+      publish: (event) => { published.push(event); },
+      onPersistError: (error) => { errors.push(error); },
+    });
+    assert.equal(errors.length, 1);
+    assert.equal(published.length, 1);
+
+    published.length = 0;
+    await publishZcodeCatalogSettle({
+      settled: {
+        usageId: 2n,
+        ledgerId: null,
+        clamped: false,
+        debitedCredits: null,
+        attributionCredits: 0n,
+        balanceAfter: null,
+      },
+      requestId: "c".repeat(32),
+      userId: "3",
+      modelId: "glm-5.3-zai",
+      sessionId: "web-session",
+      traceId: null,
+      publish: (event) => { published.push(event); },
+    });
+    assert.deepEqual(published, []);
   });
 });
 

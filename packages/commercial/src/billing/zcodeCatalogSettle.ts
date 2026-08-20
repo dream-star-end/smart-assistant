@@ -9,6 +9,16 @@ import { settleUsageAndLedger, type SettleResult } from "./proxyBilling.js";
 
 export type ZcodeEngineStatus = "success" | "error" | "unavailable";
 
+export interface ZcodeCostChargedEvent {
+  type: "outbound.cost_charged";
+  requestId: string;
+  model: string;
+  sessionId: string | null;
+  costCredits: string;
+  balanceAfter?: string;
+  traceId?: string;
+}
+
 function asTokens(value: unknown): number {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return 0;
   return Math.floor(value);
@@ -56,6 +66,53 @@ export function planZcodeCatalogSettle(args: {
       : {}),
   });
   return { settleStatus, costCredits, snapshotJson };
+}
+
+export async function publishZcodeCatalogSettle(args: {
+  settled: SettleResult;
+  requestId: string;
+  userId: string;
+  modelId: string;
+  sessionId: string | null;
+  traceId: string | null;
+  persist?: (
+    requestId: string,
+    userId: string,
+    costCredits: string,
+    sessionId?: string | null,
+  ) => Promise<unknown>;
+  publish: (event: ZcodeCostChargedEvent) => void;
+  onPersistError?: (error: unknown) => void;
+}): Promise<void> {
+  const persistCredits = args.settled.attributionCredits !== null
+    ? args.settled.attributionCredits
+    : args.settled.debitedCredits !== null && args.settled.debitedCredits > 0n
+      ? args.settled.debitedCredits
+      : null;
+  if (persistCredits !== null && args.persist) {
+    try {
+      await args.persist(
+        args.requestId,
+        args.userId,
+        persistCredits.toString(),
+        args.sessionId,
+      );
+    } catch (error) {
+      args.onPersistError?.(error);
+    }
+  }
+  if (args.settled.debitedCredits === null || args.settled.debitedCredits <= 0n) return;
+  args.publish({
+    type: "outbound.cost_charged",
+    requestId: args.requestId,
+    model: args.modelId,
+    sessionId: args.sessionId,
+    costCredits: args.settled.debitedCredits.toString(),
+    ...(args.settled.balanceAfter !== null
+      ? { balanceAfter: args.settled.balanceAfter.toString() }
+      : {}),
+    ...(args.traceId ? { traceId: args.traceId } : {}),
+  });
 }
 
 export async function settleZcodeCatalogUsage(args: {
