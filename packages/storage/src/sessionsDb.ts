@@ -350,6 +350,23 @@ export async function getSessionsDb(): Promise<Database.Database> {
     CREATE INDEX IF NOT EXISTS idx_client_sessions_user_project
       ON client_sessions(user_id, project_id);
   `)
+  // Migration: client_sessions.archived_at —— 侧栏「归档会话」(整会话从默认列表隐藏)。
+  // 与消息热尾巴 spill 的 archived_through_seq / archived_count 无关,不撞名。
+  // PG 侧对应迁移 0233_client_session_list_archived_at。
+  try {
+    const cols = db.pragma('table_info(client_sessions)') as Array<{ name: string }>
+    if (!cols.some(c => c.name === 'archived_at')) {
+      db.exec('ALTER TABLE client_sessions ADD COLUMN archived_at INTEGER DEFAULT NULL')
+    }
+  } catch { /* table just created with column already */ }
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_client_sessions_user_list
+      ON client_sessions(user_id, last_at DESC)
+      WHERE deleted_at IS NULL;
+    CREATE INDEX IF NOT EXISTS idx_client_sessions_user_list_active
+      ON client_sessions(user_id, last_at DESC)
+      WHERE deleted_at IS NULL AND archived_at IS NULL;
+  `)
 
   // ── 长会话热尾巴 + 归档(spill/archive)──
   //
@@ -1745,6 +1762,10 @@ export interface ClientSessionMeta {
   lastOutcome: ClientSessionLastOutcome | null
   /** 最近终态的错误码(如 SERVICE_RESTART);inbox 无此列时为 null。 */
   lastErrorCode: string | null
+  /** 侧栏归档(整会话);与消息 spill 水位无关。 */
+  archived: boolean
+  /** 最后一条消息的纯文本前 80 字;无消息则不带。 */
+  lastMessagePreview?: string
 }
 
 export const CHAT_PROJECT_NAME_MAX = 60
@@ -1782,6 +1803,165 @@ export type ClientSessionMetaPatch = {
   modelId?: string
   projectId?: string | null
   pinned?: boolean
+  archived?: boolean
+}
+
+export const SESSION_SEARCH_Q_MAX = 200
+export const SESSION_SEARCH_LIMIT_DEFAULT = 30
+export const SESSION_SEARCH_LIMIT_MAX = 50
+export const SESSION_LIST_LIMIT_MAX = 200
+export const SESSION_BATCH_IDS_MAX = 200
+export const LAST_MESSAGE_PREVIEW_MAX = 80
+export const SEARCH_SNIPPET_MAX = 160
+export const SEARCH_SNIPPET_RADIUS = 40
+export const PROJECT_INSTRUCTIONS_INJECT_MAX = 4000
+// 搜索 JSON 展开候选上限:TEXT LIKE/ILIKE 先收窄后按 last_at DESC 取最近 N 条再 json_each /
+// json_array_elements。结果上限 50;80 给 title+message 合并排名留余量。极端账号(数十 MB
+// tape、上百会话)不能把一次搜索变成对该用户全部行做 JSON 解析。
+export const SESSION_SEARCH_JSON_CANDIDATE_MAX = 80
+// 单条 messages TEXT 超过此字节数则不做 JSON 展开:只按 TEXT 命中给出一条 kind=message
+// 与截断 snippet。2MB = 热尾巴 spill 目标(SESSION_TAIL_TARGET_BYTES);历史上 67MB/90MB
+// 物化拖垮进程,对这些行 json_array_elements / json_each 会压住数据库数秒。
+export const SESSION_SEARCH_JSON_EXPAND_MAX_BYTES = 2 * 1024 * 1024
+
+export type ListClientSessionsOpts = {
+  includeArchived?: boolean
+  /** 不传 = 全量(老客户端);传入则上限 200。 */
+  limit?: number
+  /** 上一页最后一项的 lastAt(毫秒,不含该点)。 */
+  before?: number
+}
+
+export type ListClientSessionsResult = {
+  sessions: ClientSessionMeta[]
+  nextCursor?: number
+}
+
+export type SessionSearchKind = 'title' | 'message'
+
+export type SessionSearchHit = {
+  sessionId: string
+  title: string
+  projectId: string | null
+  snippet: string
+  matchedAt: number
+  kind: SessionSearchKind
+}
+
+export type SearchClientSessionsOpts = {
+  q: string
+  limit?: number
+  includeArchived?: boolean
+}
+
+export type SearchClientSessionsResult = {
+  results: SessionSearchHit[]
+}
+
+export type BatchClientSessionsAction = 'archive' | 'unarchive' | 'delete' | 'move'
+
+export type BatchClientSessionsInput = {
+  ids?: unknown
+  action?: unknown
+  projectId?: unknown
+}
+
+export type BatchClientSessionsResult =
+  | { ok: true; updated: number; skipped: number }
+  | { ok: false; error: 'invalid_ids' | 'invalid_action' | 'ids_limit' | 'project_not_found' }
+
+/** 去掉破坏提示结构的控制字符,截断到注入上限。 */
+export function sanitizeProjectInstructions(raw: string): string {
+  const cleaned = raw.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '')
+  return cleaned.length > PROJECT_INSTRUCTIONS_INJECT_MAX
+    ? cleaned.slice(0, PROJECT_INSTRUCTIONS_INJECT_MAX)
+    : cleaned
+}
+
+/** 侧栏预览/搜索 snippet:去代码块、图片、HTML、换行,压空白。 */
+export function toPlainSessionText(raw: string): string {
+  return raw
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+export function toLastMessagePreview(raw: string | null | undefined): string | undefined {
+  if (!raw) return undefined
+  const plain = toPlainSessionText(raw)
+  if (!plain) return undefined
+  return plain.length > LAST_MESSAGE_PREVIEW_MAX ? plain.slice(0, LAST_MESSAGE_PREVIEW_MAX) : plain
+}
+
+export function buildSearchSnippet(haystack: string, q: string): string {
+  const plain = toPlainSessionText(haystack)
+  if (!plain) return ''
+  const needle = q.trim()
+  const lower = plain.toLowerCase()
+  const idx = needle ? lower.indexOf(needle.toLowerCase()) : 0
+  const start = idx < 0 ? 0 : Math.max(0, idx - SEARCH_SNIPPET_RADIUS)
+  const end = idx < 0
+    ? Math.min(plain.length, SEARCH_SNIPPET_MAX)
+    : Math.min(plain.length, idx + needle.length + SEARCH_SNIPPET_RADIUS)
+  let slice = plain.slice(start, end)
+  if (start > 0) slice = `…${slice}`
+  if (end < plain.length) slice = `${slice}…`
+  return slice.length > SEARCH_SNIPPET_MAX ? slice.slice(0, SEARCH_SNIPPET_MAX) : slice
+}
+
+/** LIKE/ILIKE 通配符转义;调用方配合 ESCAPE '\'。 */
+export function escapeLikePattern(q: string): string {
+  return q.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_')
+}
+
+export function parseOptionalPositiveInt(raw: string | null, fallback: number, max: number): number {
+  if (raw === null || raw === '') return fallback
+  const n = Number(raw)
+  if (!Number.isFinite(n) || n <= 0) return fallback
+  return Math.min(max, Math.floor(n))
+}
+
+export function parseIncludeArchivedFlag(raw: string | null): boolean {
+  return raw === '1' || raw === 'true'
+}
+
+export function parseSessionBatchInput(input: BatchClientSessionsInput): BatchClientSessionsResult | {
+  ids: string[]
+  action: BatchClientSessionsAction
+  projectId?: string | null
+} {
+  if (!Array.isArray(input.ids)) return { ok: false, error: 'invalid_ids' }
+  if (input.ids.length > SESSION_BATCH_IDS_MAX) return { ok: false, error: 'ids_limit' }
+  const ids: string[] = []
+  const seen = new Set<string>()
+  for (const raw of input.ids) {
+    if (typeof raw !== 'string') return { ok: false, error: 'invalid_ids' }
+    const id = raw.trim()
+    if (id.length < 1 || id.length > 64) return { ok: false, error: 'invalid_ids' }
+    if (seen.has(id)) continue
+    seen.add(id)
+    ids.push(id)
+  }
+  if (input.action !== 'archive' && input.action !== 'unarchive' && input.action !== 'delete' && input.action !== 'move') {
+    return { ok: false, error: 'invalid_action' }
+  }
+  if (input.action === 'move') {
+    if (input.projectId !== undefined && input.projectId !== null && typeof input.projectId !== 'string') {
+      return { ok: false, error: 'invalid_action' }
+    }
+    const projectId = input.projectId === undefined || input.projectId === null
+      ? null
+      : input.projectId.trim()
+    if (projectId !== null && (projectId.length < 8 || projectId.length > 64)) {
+      return { ok: false, error: 'invalid_action' }
+    }
+    return { ids, action: 'move', projectId }
+  }
+  return { ids, action: input.action }
 }
 
 export type PatchClientSessionMetaResult =
@@ -4228,13 +4408,71 @@ export async function replayMsgOutbox(): Promise<{
   return { processed, applied, dropped, requeued, malformed }
 }
 
-async function _sqliteListClientSessions(userId: string): Promise<ClientSessionMeta[]> {
+const SQLITE_LAST_PREVIEW_SQL = `
+  CASE
+    WHEN json_array_length(cs.messages) > 0 THEN
+      substr(COALESCE(json_extract(cs.messages, '$[' || (json_array_length(cs.messages) - 1) || '].text'), ''), 1, 240)
+    ELSE NULL
+  END`
+
+function _mapClientSessionMetaRow(r: {
+  id: string; agent_id: string; title: string; pinned: number
+  created_at: number; last_at: number; updated_at: number; msg_count: number
+  model_id: string | null
+  project_id: string | null
+  run_state: string
+  last_outcome: string | null
+  archived_at: number | null
+  last_preview_raw: string | null
+}): ClientSessionMeta {
+  const preview = toLastMessagePreview(r.last_preview_raw)
+  return {
+    id: r.id,
+    agentId: r.agent_id,
+    title: r.title,
+    pinned: r.pinned === 1,
+    createdAt: r.created_at,
+    lastAt: r.last_at,
+    messageCount: r.msg_count,
+    updatedAt: r.updated_at,
+    projectId: r.project_id ?? null,
+    runState: r.run_state === 'running' ? 'running' : 'idle',
+    lastOutcome: mapClientSessionLastOutcome(r.last_outcome),
+    lastErrorCode: null,
+    archived: r.archived_at != null,
+    ...(preview ? { lastMessagePreview: preview } : {}),
+    ...(r.model_id ? { modelId: r.model_id } : {}),
+  }
+}
+
+async function _sqliteListClientSessions(
+  userId: string,
+  opts: ListClientSessionsOpts = {},
+): Promise<ListClientSessionsResult> {
   const db = await getSessionsDb()
+  const includeArchived = opts.includeArchived === true
+  const before = typeof opts.before === 'number' && Number.isFinite(opts.before) && opts.before > 0
+    ? Math.floor(opts.before)
+    : undefined
+  const limit = typeof opts.limit === 'number' && Number.isFinite(opts.limit) && opts.limit > 0
+    ? Math.min(SESSION_LIST_LIMIT_MAX, Math.floor(opts.limit))
+    : undefined
   // runState / lastOutcome 从 turn_dispatch_inbox 一条 SQL 派生(禁止 N+1)。
   // JOIN 只按 session_id:inbox.user_id 是裸 uid,client_sessions.user_id 是 `c:<uid>`。
+  // last_preview_raw 在 SQL 侧截最后一条 .text 前 240 字,不把 messages blob 拉进 Node。
+  const params: unknown[] = [userId]
+  let where = 'cs.user_id = ? AND cs.deleted_at IS NULL'
+  if (!includeArchived) where += ' AND cs.archived_at IS NULL'
+  if (before !== undefined) {
+    where += ' AND cs.last_at < ?'
+    params.push(before)
+  }
+  const limitSql = limit !== undefined ? ' LIMIT ?' : ''
+  if (limit !== undefined) params.push(limit + 1)
   const rows = db.prepare(`
     SELECT cs.id, cs.agent_id, cs.title, cs.pinned, cs.created_at, cs.last_at, cs.updated_at,
-           cs.message_count as msg_count, cs.model_id, cs.project_id,
+           cs.message_count as msg_count, cs.model_id, cs.project_id, cs.archived_at,
+           ${SQLITE_LAST_PREVIEW_SQL} AS last_preview_raw,
            CASE WHEN open_d.session_id IS NOT NULL THEN 'running' ELSE 'idle' END AS run_state,
            last_d.outcome AS last_outcome
     FROM client_sessions cs
@@ -4255,31 +4493,29 @@ async function _sqliteListClientSessions(userId: string): Promise<ClientSessionM
       ) ranked
       WHERE rn = 1
     ) last_d ON last_d.session_id = cs.id
-    WHERE cs.user_id = ? AND cs.deleted_at IS NULL
-    ORDER BY cs.last_at DESC
-  `).all(userId) as Array<{
+    WHERE ${where}
+    ORDER BY cs.last_at DESC${limitSql}
+  `).all(...params) as Array<{
     id: string; agent_id: string; title: string; pinned: number;
     created_at: number; last_at: number; updated_at: number; msg_count: number
     model_id: string | null
     project_id: string | null
     run_state: string
     last_outcome: string | null
+    archived_at: number | null
+    last_preview_raw: string | null
   }>
-  return rows.map(r => ({
-    id: r.id,
-    agentId: r.agent_id,
-    title: r.title,
-    pinned: r.pinned === 1,
-    createdAt: r.created_at,
-    lastAt: r.last_at,
-    messageCount: r.msg_count,
-    updatedAt: r.updated_at,
-    projectId: r.project_id ?? null,
-    runState: r.run_state === 'running' ? 'running' : 'idle',
-    lastOutcome: mapClientSessionLastOutcome(r.last_outcome),
-    lastErrorCode: null,
-    ...(r.model_id ? { modelId: r.model_id } : {}),
-  }))
+  let nextCursor: number | undefined
+  let sliced = rows
+  if (limit !== undefined && rows.length > limit) {
+    sliced = rows.slice(0, limit)
+    const last = sliced[sliced.length - 1]
+    if (last) nextCursor = last.last_at
+  }
+  return {
+    sessions: sliced.map(_mapClientSessionMetaRow),
+    ...(nextCursor !== undefined ? { nextCursor } : {}),
+  }
 }
 
 async function _sqliteGetClientSession(
@@ -5214,6 +5450,10 @@ async function _sqlitePatchClientSessionMeta(
       sets.push('pinned = ?')
       params.push(patch.pinned ? 1 : 0)
     }
+    if (patch.archived !== undefined) {
+      sets.push('archived_at = ?')
+      params.push(patch.archived ? now : null)
+    }
     const row = db.prepare(
       `UPDATE client_sessions SET ${sets.join(', ')}
         WHERE id = ? AND user_id = ? AND deleted_at IS NULL
@@ -5223,6 +5463,234 @@ async function _sqlitePatchClientSessionMeta(
     return { ok: true, updatedAt: row.updated_at }
   })
   return txn()
+}
+
+async function _sqliteGetSessionProjectInstructions(sessionId: string): Promise<string | null> {
+  const db = await getSessionsDb()
+  const row = db.prepare(`
+    SELECT p.instructions
+      FROM client_sessions cs
+      JOIN chat_projects p ON p.id = cs.project_id AND p.user_id = cs.user_id
+     WHERE cs.id = ? AND cs.deleted_at IS NULL AND p.deleted_at IS NULL
+  `).get(sessionId) as { instructions: string | null } | undefined
+  if (!row?.instructions) return null
+  const cleaned = sanitizeProjectInstructions(row.instructions).trim()
+  return cleaned.length > 0 ? cleaned : null
+}
+
+export function rankSessionSearchHits(hits: SessionSearchHit[], limit: number): SessionSearchHit[] {
+  const best = new Map<string, SessionSearchHit>()
+  for (const hit of hits) {
+    const prev = best.get(hit.sessionId)
+    if (!prev || hit.matchedAt > prev.matchedAt || (hit.matchedAt === prev.matchedAt && hit.kind === 'message')) {
+      best.set(hit.sessionId, hit)
+    }
+  }
+  return [...best.values()].sort((a, b) => b.matchedAt - a.matchedAt).slice(0, limit)
+}
+
+async function _sqliteSearchClientSessions(
+  userId: string,
+  opts: SearchClientSessionsOpts,
+): Promise<SearchClientSessionsResult> {
+  const q = opts.q.trim()
+  if (!q) return { results: [] }
+  const limit = typeof opts.limit === 'number' && Number.isFinite(opts.limit) && opts.limit > 0
+    ? Math.min(SESSION_SEARCH_LIMIT_MAX, Math.floor(opts.limit))
+    : SESSION_SEARCH_LIMIT_DEFAULT
+  const includeArchived = opts.includeArchived === true
+  const like = `%${escapeLikePattern(q)}%`
+  const db = await getSessionsDb()
+  const archiveSql = includeArchived ? '' : ' AND cs.archived_at IS NULL'
+  const candMax = SESSION_SEARCH_JSON_CANDIDATE_MAX
+  const expandMax = SESSION_SEARCH_JSON_EXPAND_MAX_BYTES
+  const titleRows = db.prepare(`
+    SELECT id, title, project_id, last_at
+      FROM client_sessions cs
+     WHERE cs.user_id = ? AND cs.deleted_at IS NULL${archiveSql}
+       AND cs.title LIKE ? ESCAPE '\\'
+  `).all(userId, like) as Array<{ id: string; title: string; project_id: string | null; last_at: number }>
+  // 两段式:TEXT LIKE 收窄 → 最近 N 条 → 小行才 json_each。不把 messages blob 拉进 Node,也不对未命中行做 JSON.parse。
+  const msgRows = db.prepare(`
+    SELECT cs.id, cs.title, cs.project_id,
+           COALESCE(json_extract(j.value, '$.ts'), cs.last_at) AS matched_at,
+           substr(COALESCE(json_extract(j.value, '$.text'), ''), 1, 400) AS msg_text
+      FROM (
+        SELECT id, title, project_id, last_at, messages
+          FROM client_sessions cs
+         WHERE cs.user_id = ? AND cs.deleted_at IS NULL${archiveSql}
+           AND cs.messages LIKE ? ESCAPE '\\'
+           AND length(CAST(cs.messages AS BLOB)) <= ?
+         ORDER BY cs.last_at DESC
+         LIMIT ?
+      ) cs, json_each(cs.messages) j
+     WHERE json_extract(j.value, '$.text') LIKE ? ESCAPE '\\'
+  `).all(userId, like, expandMax, candMax, like) as Array<{
+    id: string; title: string; project_id: string | null; matched_at: number; msg_text: string
+  }>
+  const oversizedMsgRows = db.prepare(`
+    SELECT id, title, project_id, last_at AS matched_at,
+           substr(messages, max(1, instr(lower(messages), lower(?)) - 80), 400) AS msg_text
+      FROM client_sessions cs
+     WHERE cs.user_id = ? AND cs.deleted_at IS NULL${archiveSql}
+       AND cs.messages LIKE ? ESCAPE '\\'
+       AND length(CAST(cs.messages AS BLOB)) > ?
+     ORDER BY last_at DESC
+     LIMIT ?
+  `).all(q, userId, like, expandMax, candMax) as Array<{
+    id: string; title: string; project_id: string | null; matched_at: number; msg_text: string
+  }>
+  const chunkRows = db.prepare(`
+    SELECT cs.id, cs.title, cs.project_id,
+           COALESCE(json_extract(j.value, '$.ts'), cs.last_at) AS matched_at,
+           substr(COALESCE(json_extract(j.value, '$.text'), ''), 1, 400) AS msg_text
+      FROM (
+        SELECT cs.id, cs.title, cs.project_id, cs.last_at, ch.messages
+          FROM client_session_archive_chunks ch
+          JOIN client_sessions cs ON cs.id = ch.session_id AND cs.user_id = ch.user_id
+         WHERE cs.user_id = ? AND cs.deleted_at IS NULL${archiveSql}
+           AND ch.messages LIKE ? ESCAPE '\\'
+           AND length(CAST(ch.messages AS BLOB)) <= ?
+         ORDER BY cs.last_at DESC
+         LIMIT ?
+      ) cs, json_each(cs.messages) j
+     WHERE json_extract(j.value, '$.text') LIKE ? ESCAPE '\\'
+  `).all(userId, like, expandMax, candMax, like) as Array<{
+    id: string; title: string; project_id: string | null; matched_at: number; msg_text: string
+  }>
+  const oversizedChunkRows = db.prepare(`
+    SELECT cs.id, cs.title, cs.project_id, cs.last_at AS matched_at,
+           substr(ch.messages, max(1, instr(lower(ch.messages), lower(?)) - 80), 400) AS msg_text
+      FROM client_session_archive_chunks ch
+      JOIN client_sessions cs ON cs.id = ch.session_id AND cs.user_id = ch.user_id
+     WHERE cs.user_id = ? AND cs.deleted_at IS NULL${archiveSql}
+       AND ch.messages LIKE ? ESCAPE '\\'
+       AND length(CAST(ch.messages AS BLOB)) > ?
+     ORDER BY cs.last_at DESC
+     LIMIT ?
+  `).all(q, userId, like, expandMax, candMax) as Array<{
+    id: string; title: string; project_id: string | null; matched_at: number; msg_text: string
+  }>
+  const hits: SessionSearchHit[] = [
+    ...titleRows.map((r) => ({
+      sessionId: r.id,
+      title: r.title,
+      projectId: r.project_id ?? null,
+      snippet: buildSearchSnippet(r.title, q),
+      matchedAt: r.last_at,
+      kind: 'title' as const,
+    })),
+    ...msgRows.map((r) => ({
+      sessionId: r.id,
+      title: r.title,
+      projectId: r.project_id ?? null,
+      snippet: buildSearchSnippet(r.msg_text, q),
+      matchedAt: Number(r.matched_at) || 0,
+      kind: 'message' as const,
+    })),
+        ...chunkRows.map((r) => ({
+      sessionId: r.id,
+      title: r.title,
+      projectId: r.project_id ?? null,
+      snippet: buildSearchSnippet(r.msg_text, q),
+      matchedAt: Number(r.matched_at) || 0,
+      kind: 'message' as const,
+    })),
+    ...oversizedMsgRows.map((r) => ({
+      sessionId: r.id,
+      title: r.title,
+      projectId: r.project_id ?? null,
+      snippet: buildSearchSnippet(r.msg_text, q),
+      matchedAt: Number(r.matched_at) || 0,
+      kind: 'message' as const,
+    })),
+    ...oversizedChunkRows.map((r) => ({
+      sessionId: r.id,
+      title: r.title,
+      projectId: r.project_id ?? null,
+      snippet: buildSearchSnippet(r.msg_text, q),
+      matchedAt: Number(r.matched_at) || 0,
+      kind: 'message' as const,
+    })),
+  ]
+  return { results: rankSessionSearchHits(hits, limit) }
+}
+
+async function _sqliteBatchClientSessions(
+  userId: string,
+  input: BatchClientSessionsInput,
+): Promise<BatchClientSessionsResult> {
+  const parsed = parseSessionBatchInput(input)
+  if ('ok' in parsed) return parsed
+  const { ids, action } = parsed
+  if (ids.length === 0) return { ok: true, updated: 0, skipped: 0 }
+  const db = await getSessionsDb()
+  const now = Date.now()
+  return db.transaction((): BatchClientSessionsResult => {
+    if (action === 'move' && parsed.projectId) {
+      const owned = db.prepare(
+        'SELECT 1 AS ok FROM chat_projects WHERE id = ? AND user_id = ? AND deleted_at IS NULL',
+      ).get(parsed.projectId, userId) as { ok: number } | undefined
+      if (!owned) return { ok: false, error: 'project_not_found' }
+    }
+    const ownedRows = db.prepare(
+      `SELECT id FROM client_sessions
+        WHERE user_id = ? AND deleted_at IS NULL
+          AND id IN (${ids.map(() => '?').join(',')})`,
+    ).all(userId, ...ids) as Array<{ id: string }>
+    const owned = new Set(ownedRows.map((r) => r.id))
+    const skipped = ids.length - owned.size
+    const targetIds = ids.filter((id) => owned.has(id))
+    if (targetIds.length === 0) return { ok: true, updated: 0, skipped }
+    let updated = 0
+    if (action === 'delete') {
+      for (const id of targetIds) {
+        if (_sqliteDeleteClientSessionSync(db, id, userId, now)) updated++
+      }
+    } else if (action === 'archive') {
+      const res = db.prepare(
+        `UPDATE client_sessions
+            SET archived_at = COALESCE(archived_at, ?), updated_at = MAX(updated_at + 1, ?)
+          WHERE user_id = ? AND deleted_at IS NULL AND archived_at IS NULL
+            AND id IN (${targetIds.map(() => '?').join(',')})`,
+      ).run(now, now, userId, ...targetIds)
+      updated = res.changes
+    } else if (action === 'unarchive') {
+      const res = db.prepare(
+        `UPDATE client_sessions
+            SET archived_at = NULL, updated_at = MAX(updated_at + 1, ?)
+          WHERE user_id = ? AND deleted_at IS NULL AND archived_at IS NOT NULL
+            AND id IN (${targetIds.map(() => '?').join(',')})`,
+      ).run(now, userId, ...targetIds)
+      updated = res.changes
+    } else {
+      const res = db.prepare(
+        `UPDATE client_sessions
+            SET project_id = ?, updated_at = MAX(updated_at + 1, ?)
+          WHERE user_id = ? AND deleted_at IS NULL
+            AND id IN (${targetIds.map(() => '?').join(',')})`,
+      ).run(parsed.projectId ?? null, now, userId, ...targetIds)
+      updated = res.changes
+    }
+    return { ok: true, updated, skipped }
+  })()
+}
+
+function _sqliteDeleteClientSessionSync(
+  db: Database.Database,
+  id: string,
+  userId: string,
+  now: number,
+): boolean {
+  const result = db.prepare(
+    "UPDATE client_sessions SET deleted_at = ?, updated_at = MAX(updated_at + 1, ?), messages = '[]', message_count = 0 WHERE id = ? AND user_id = ? AND deleted_at IS NULL",
+  ).run(now, now, id, userId)
+  if (result.changes === 0) return false
+  db.prepare('DELETE FROM client_session_archive_chunks WHERE session_id = ?').run(id)
+  db.prepare('DELETE FROM client_session_archived_ids WHERE session_id = ?').run(id)
+  db.prepare('DELETE FROM pending_usage_patches WHERE parent_session_id = ?').run(id)
+  db.prepare('DELETE FROM turn_dispatch_inbox WHERE session_id = ?').run(id)
+  return true
 }
 
 /**
@@ -5477,6 +5945,9 @@ const sqliteBackend = {
   renameClientSession: _sqliteRenameClientSession,
   setClientSessionModel: _sqliteSetClientSessionModel,
   patchClientSessionMeta: _sqlitePatchClientSessionMeta,
+  searchClientSessions: _sqliteSearchClientSessions,
+  batchClientSessions: _sqliteBatchClientSessions,
+  getSessionProjectInstructions: _sqliteGetSessionProjectInstructions,
   listChatProjects: _sqliteListChatProjects,
   createChatProject: _sqliteCreateChatProject,
   updateChatProject: _sqliteUpdateChatProject,
@@ -5622,6 +6093,15 @@ export const setClientSessionModel: ClientSessionsBackend['setClientSessionModel
 
 export const patchClientSessionMeta: ClientSessionsBackend['patchClientSessionMeta'] =
   (...args) => getActiveBackend().patchClientSessionMeta(...args)
+
+export const searchClientSessions: ClientSessionsBackend['searchClientSessions'] =
+  (...args) => getActiveBackend().searchClientSessions(...args)
+
+export const batchClientSessions: ClientSessionsBackend['batchClientSessions'] =
+  (...args) => getActiveBackend().batchClientSessions(...args)
+
+export const getSessionProjectInstructions: ClientSessionsBackend['getSessionProjectInstructions'] =
+  (...args) => getActiveBackend().getSessionProjectInstructions(...args)
 
 export const listChatProjects: ClientSessionsBackend['listChatProjects'] =
   (...args) => getActiveBackend().listChatProjects(...args)

@@ -67,7 +67,7 @@ describe('client_sessions.model_id(会话级模型选择)', () => {
     assert.equal(got?.modelId, 'kimi-k3')
 
     const list = await listClientSessions(USER)
-    assert.equal(list.find((s) => s.id === 'sess-model-1')?.modelId, 'kimi-k3')
+    assert.equal(list.sessions.find((s) => s.id === 'sess-model-1')?.modelId, 'kimi-k3')
 
     const partial = await getClientSessionPartial('sess-model-1', USER, 0)
     assert.equal(partial?.modelId, 'kimi-k3')
@@ -78,7 +78,7 @@ describe('client_sessions.model_id(会话级模型选择)', () => {
     const got = await getClientSession('sess-model-none', USER)
     assert.ok(got)
     assert.equal('modelId' in got, false)
-    const meta = (await listClientSessions(USER)).find((s) => s.id === 'sess-model-none')
+    const meta = (await listClientSessions(USER)).sessions.find((s) => s.id === 'sess-model-none')
     assert.ok(meta)
     assert.equal('modelId' in meta, false)
   })

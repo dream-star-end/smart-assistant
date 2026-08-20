@@ -155,6 +155,15 @@ import {
   patchServerAuthoredMessage,
   deleteClientSession,
   patchClientSessionMeta,
+  searchClientSessions,
+  batchClientSessions,
+  parseSessionBatchInput,
+  parseIncludeArchivedFlag,
+  parseOptionalPositiveInt,
+  SESSION_SEARCH_Q_MAX,
+  SESSION_SEARCH_LIMIT_DEFAULT,
+  SESSION_SEARCH_LIMIT_MAX,
+  SESSION_LIST_LIMIT_MAX,
   listChatProjects,
   createChatProject,
   updateChatProject,
@@ -4148,7 +4157,7 @@ export class Gateway {
       const allLive = this.sessions.list()
       // For multi-user: only show sessions whose peerId belongs to this user
       listClientSessions(userId).then((owned) => {
-        const ownedIds = new Set(owned.map((s) => s.id))
+        const ownedIds = new Set(owned.sessions.map((s) => s.id))
         // Also include sessions with no matching client session (cron/task sessions) only for default user
         const filtered = filterUserVisibleLiveSessions(allLive, ownedIds, userId)
         this.sendJson(res, 200, { sessions: filtered })
@@ -4158,9 +4167,87 @@ export class Gateway {
     // ── Client session sync (cross-device, multi-user) ──
     if (url.pathname === '/api/sessions/list' && req.method === 'GET') {
       const userId = this.getUserId(req)
-      listClientSessions(userId)
-        .then((list) => this.sendJson(res, 200, { sessions: list }))
+      const includeArchived = parseIncludeArchivedFlag(url.searchParams.get('includeArchived'))
+      const limitRaw = url.searchParams.get('limit')
+      const beforeRaw = url.searchParams.get('before')
+      let limit: number | undefined
+      let before: number | undefined
+      if (limitRaw !== null && limitRaw !== '') {
+        const n = Number(limitRaw)
+        if (!Number.isFinite(n) || n <= 0) {
+          this.sendJson(res, 400, { error: 'limit must be a positive integer' })
+          return
+        }
+        limit = Math.min(SESSION_LIST_LIMIT_MAX, Math.floor(n))
+      }
+      if (beforeRaw !== null && beforeRaw !== '') {
+        const n = Number(beforeRaw)
+        if (!Number.isFinite(n) || n <= 0) {
+          this.sendJson(res, 400, { error: 'before must be a positive millisecond timestamp' })
+          return
+        }
+        before = Math.floor(n)
+      }
+      listClientSessions(userId, { includeArchived, limit, before })
+        .then((list) => this.sendJson(res, 200, {
+          sessions: list.sessions,
+          ...(list.nextCursor !== undefined ? { nextCursor: list.nextCursor } : {}),
+        }))
         .catch(() => this.sendJson(res, 500, { error: 'list failed' }))
+      return
+    }
+    if (url.pathname === '/api/sessions/search' && req.method === 'GET') {
+      const userId = this.getUserId(req)
+      const q = (url.searchParams.get('q') ?? '').trim()
+      if (q.length > SESSION_SEARCH_Q_MAX) {
+        this.sendJson(res, 400, { error: `q too long (max ${SESSION_SEARCH_Q_MAX} chars)` })
+        return
+      }
+      const limit = parseOptionalPositiveInt(
+        url.searchParams.get('limit'),
+        SESSION_SEARCH_LIMIT_DEFAULT,
+        SESSION_SEARCH_LIMIT_MAX,
+      )
+      const includeArchived = parseIncludeArchivedFlag(url.searchParams.get('includeArchived'))
+      searchClientSessions(userId, { q, limit, includeArchived })
+        .then((out) => this.sendJson(res, 200, out))
+        .catch(() => this.sendJson(res, 500, { error: 'search failed' }))
+      return
+    }
+    if (url.pathname === '/api/sessions/batch' && req.method === 'POST') {
+      const userId = this.getUserId(req)
+      ;(async () => {
+        let data: { ids?: unknown; action?: unknown; projectId?: unknown }
+        try {
+          data = JSON.parse(await this.readBody(req, 64 * 1024))
+        } catch {
+          this.sendJson(res, 400, { error: 'invalid JSON' })
+          return
+        }
+        const parsed = parseSessionBatchInput(data)
+        if ('ok' in parsed && parsed.ok === false) {
+          if (parsed.error === 'ids_limit') {
+            this.sendJson(res, 400, { error: 'ids limit exceeded (max 200)' })
+            return
+          }
+          if (parsed.error === 'invalid_action') {
+            this.sendJson(res, 400, { error: 'action must be archive, unarchive, delete or move' })
+            return
+          }
+          this.sendJson(res, 400, { error: 'ids required (string array)' })
+          return
+        }
+        const result = await batchClientSessions(userId, data)
+        if (!result.ok) {
+          if (result.error === 'project_not_found') {
+            this.sendJson(res, 404, { error: 'project not found' })
+            return
+          }
+          this.sendJson(res, 400, { error: result.error.replace(/_/g, ' ') })
+          return
+        }
+        this.sendJson(res, 200, result)
+      })().catch(() => this.sendJson(res, 500, { error: 'batch failed' }))
       return
     }
     // 侧栏聊天项目(与 /api/board/projects 看板无关)。浏览器直打 gateway,与 /api/sessions/list 同平面。
@@ -4854,12 +4941,13 @@ export class Gateway {
         return
       }
       if (req.method === 'PATCH') {
-        // 元数据专用更新(title / modelId / projectId / pinned,至少携带其一)。不走 PUT 的
+        // 元数据专用更新(title / modelId / projectId / pinned / archived,至少携带其一)。不走 PUT 的
         // "整 blob 替换 + 乐观并发"语义:元数据不携带 messages。
         // modelId = 会话级模型选择(UI 恢复提示,非执行权威)。
         // projectId = 侧栏聊天项目归属(null = 移出项目)。
+        // archived = 侧栏整会话归档(与消息 spill 水位无关)。
         ;(async () => {
-          let data: { title?: unknown; modelId?: unknown; projectId?: unknown; pinned?: unknown }
+          let data: { title?: unknown; modelId?: unknown; projectId?: unknown; pinned?: unknown; archived?: unknown }
           try {
             data = JSON.parse(await this.readBody(req, 16 * 1024))
           } catch {
@@ -4870,8 +4958,9 @@ export class Gateway {
           const hasModel = data.modelId !== undefined
           const hasProject = data.projectId !== undefined
           const hasPinned = data.pinned !== undefined
-          if (!hasTitle && !hasModel && !hasProject && !hasPinned) {
-            this.sendJson(res, 400, { error: 'title, modelId, projectId or pinned required' })
+          const hasArchived = data.archived !== undefined
+          if (!hasTitle && !hasModel && !hasProject && !hasPinned && !hasArchived) {
+            this.sendJson(res, 400, { error: 'title, modelId, projectId, pinned or archived required' })
             return
           }
           const title = typeof data.title === 'string' ? data.title.trim() : ''
@@ -4899,11 +4988,16 @@ export class Gateway {
             this.sendJson(res, 400, { error: 'pinned must be a boolean' })
             return
           }
+          if (hasArchived && typeof data.archived !== 'boolean') {
+            this.sendJson(res, 400, { error: 'archived must be a boolean' })
+            return
+          }
           const result = await patchClientSessionMeta(sessId, userId, {
             ...(hasTitle ? { title } : {}),
             ...(hasModel ? { modelId } : {}),
             ...(hasProject ? { projectId: projectId ?? null } : {}),
             ...(hasPinned ? { pinned: data.pinned as boolean } : {}),
+            ...(hasArchived ? { archived: data.archived as boolean } : {}),
           })
           if (!result.ok) {
             if (result.error === 'project_not_found') {
@@ -18048,7 +18142,8 @@ export { shouldServeInline }
 /** Known route prefixes for metrics normalization (avoids high-cardinality labels). */
 const KNOWN_ROUTES = [
   '/api/healthz', '/api/doctor', '/api/usage', '/api/usage/events',
-  '/api/runs', '/api/sessions', '/api/chat-projects', '/api/config', '/api/agents', '/api/search',
+  '/api/runs', '/api/sessions', '/api/sessions/list', '/api/sessions/search', '/api/sessions/batch',
+  '/api/chat-projects', '/api/config', '/api/agents', '/api/search',
   '/api/cron', '/api/board', '/api/board/projects', '/api/board/tickets',
   '/api/board/pipelines', '/api/board/agents', '/api/board/settings',
   '/api/board/stats/cost', '/api/board/templates', '/api/board/reports/weekly',

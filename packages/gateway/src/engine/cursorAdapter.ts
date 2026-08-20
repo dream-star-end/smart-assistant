@@ -1426,6 +1426,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         availableMcpTools: mcpEntry ? [...OPENCLAUDE_MEMORY_MCP_TOOLS] : [],
         skillEvalExclude: this.opts.skillEvalExclude,
         skillEvalDraft: this.opts.skillEvalDraft,
+        sessionId: this.opts.sessionId,
       })
       const prompt = renderCursorPrompt(
         platformResult.content,

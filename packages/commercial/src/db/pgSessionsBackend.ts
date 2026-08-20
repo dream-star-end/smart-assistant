@@ -105,8 +105,14 @@ import {
   type ClientSession,
   type ClientSessionLifecycle,
   type ClientSessionLifecycleRef,
+  type BatchClientSessionsInput,
+  type BatchClientSessionsResult,
   type ClientSessionMeta,
   type ClientSessionMetaPatch,
+  type ListClientSessionsOpts,
+  type ListClientSessionsResult,
+  type SearchClientSessionsOpts,
+  type SearchClientSessionsResult,
   type ClientSessionPartial,
   type ClientSessionReadOptions,
   type ClientTimelineCursor,
@@ -131,10 +137,21 @@ import {
   normalizeAndAssignOrderSeqs,
   normalizeAndAssignSeqs,
   _warnSeqAnomaly,
+  buildSearchSnippet,
+  escapeLikePattern,
   parseChatProjectName,
   parseChatProjectOptionalText,
   parseChatProjectSortOrder,
+  parseSessionBatchInput,
   type PatchClientSessionMetaResult,
+  rankSessionSearchHits,
+  sanitizeProjectInstructions,
+  SESSION_LIST_LIMIT_MAX,
+  SESSION_SEARCH_JSON_CANDIDATE_MAX,
+  SESSION_SEARCH_JSON_EXPAND_MAX_BYTES,
+  SESSION_SEARCH_LIMIT_DEFAULT,
+  SESSION_SEARCH_LIMIT_MAX,
+  toLastMessagePreview,
   planAppendServerAuthored,
   planAppendServerAuthoredBatch,
   planCostPatch,
@@ -882,6 +899,7 @@ const PROBE_EXPECTED_COLUMNS: ReadonlyArray<[string, string, string]> = [
   ["client_sessions", "pinned", "smallint"],
   ["client_sessions", "next_seq", "integer"],
   ["client_sessions", "archived_through_seq", "integer"],
+  ["client_sessions", "archived_at", "bigint"],
   ["client_sessions", "history_revision", "bigint"],
   ["client_sessions", "timeline_generation", "bigint"],
   ["client_session_archive_chunks", "session_id", "text"],
@@ -9267,10 +9285,28 @@ export function createPgSessionsBackend(
     },
 
     // ── 读路径(无事务;单/多语句纯读,与 SQLite 一致不开显式事务)────────────────
-    async listClientSessions(userId: string): Promise<ClientSessionMeta[]> {
+    async listClientSessions(
+      userId: string,
+      opts: ListClientSessionsOpts = {},
+    ): Promise<ListClientSessionsResult> {
       // runState / lastOutcome / lastErrorCode 从 turn_dispatches 一条 SQL 派生。
       // inbox 在容器 SQLite;master 权威是 turn_dispatches(status/outcome/failure_code)。
       const dispatchUid = /^c:([1-9][0-9]*)$/.exec(userId)?.[1] ?? "-1";
+      const includeArchived = opts.includeArchived === true;
+      const before = typeof opts.before === "number" && Number.isFinite(opts.before) && opts.before > 0
+        ? Math.floor(opts.before)
+        : undefined;
+      const limit = typeof opts.limit === "number" && Number.isFinite(opts.limit) && opts.limit > 0
+        ? Math.min(SESSION_LIST_LIMIT_MAX, Math.floor(opts.limit))
+        : undefined;
+      const params: unknown[] = [userId, dispatchUid];
+      let where = "cs.user_id = $1 AND cs.deleted_at IS NULL";
+      if (!includeArchived) where += " AND cs.archived_at IS NULL";
+      if (before !== undefined) {
+        params.push(before);
+        where += ` AND cs.last_at < $${params.length}`;
+      }
+      const limitSql = limit !== undefined ? ` LIMIT ${limit + 1}` : "";
       const rows = (
         await pool.query<{
           id: string;
@@ -9283,12 +9319,17 @@ export function createPgSessionsBackend(
           msg_count: number;
           model_id: string | null;
           project_id: string | null;
+          archived_at: string | null;
+          last_preview_raw: string | null;
           run_state: string;
           last_outcome: string | null;
           last_error_code: string | null;
         }>(
           `SELECT cs.id, cs.agent_id, cs.title, cs.pinned, cs.created_at, cs.last_at, cs.updated_at,
-                  cs.message_count AS msg_count, cs.model_id, cs.project_id,
+                  cs.message_count AS msg_count, cs.model_id, cs.project_id, cs.archived_at,
+                  CASE WHEN cs.message_count > 0
+                       THEN LEFT(COALESCE(cs.messages::json -> -1 ->> 'text', ''), 240)
+                       ELSE NULL END AS last_preview_raw,
                   CASE WHEN open_d.session_id IS NOT NULL THEN 'running' ELSE 'idle' END AS run_state,
                   last_d.outcome AS last_outcome,
                   last_d.failure_code AS last_error_code
@@ -9311,26 +9352,41 @@ export function createPgSessionsBackend(
                ) ranked
                WHERE rn = 1
              ) last_d ON last_d.session_id = cs.id
-            WHERE cs.user_id = $1 AND cs.deleted_at IS NULL
-            ORDER BY cs.last_at DESC`,
-          [userId, dispatchUid],
+            WHERE ${where}
+            ORDER BY cs.last_at DESC${limitSql}`,
+          params,
         )
       ).rows;
-      return rows.map((r) => ({
-        id: r.id,
-        agentId: r.agent_id,
-        title: r.title,
-        pinned: r.pinned === 1,
-        createdAt: bigIntNum(r.created_at, "created_at"),
-        lastAt: bigIntNum(r.last_at, "last_at"),
-        messageCount: r.msg_count,
-        updatedAt: bigIntNum(r.updated_at, "updated_at"),
-        projectId: r.project_id ?? null,
-        runState: r.run_state === "running" ? "running" : "idle",
-        lastOutcome: mapClientSessionLastOutcome(r.last_outcome),
-        lastErrorCode: r.last_error_code ?? null,
-        ...(r.model_id ? { modelId: r.model_id } : {}),
-      }));
+      let sliced = rows;
+      let nextCursor: number | undefined;
+      if (limit !== undefined && rows.length > limit) {
+        sliced = rows.slice(0, limit);
+        const last = sliced[sliced.length - 1];
+        if (last) nextCursor = bigIntNum(last.last_at, "last_at");
+      }
+      return {
+        sessions: sliced.map((r) => {
+          const preview = toLastMessagePreview(r.last_preview_raw);
+          return {
+            id: r.id,
+            agentId: r.agent_id,
+            title: r.title,
+            pinned: r.pinned === 1,
+            createdAt: bigIntNum(r.created_at, "created_at"),
+            lastAt: bigIntNum(r.last_at, "last_at"),
+            messageCount: r.msg_count,
+            updatedAt: bigIntNum(r.updated_at, "updated_at"),
+            projectId: r.project_id ?? null,
+            runState: r.run_state === "running" ? "running" : "idle",
+            lastOutcome: mapClientSessionLastOutcome(r.last_outcome),
+            lastErrorCode: r.last_error_code ?? null,
+            archived: r.archived_at != null,
+            ...(preview ? { lastMessagePreview: preview } : {}),
+            ...(r.model_id ? { modelId: r.model_id } : {}),
+          };
+        }),
+        ...(nextCursor !== undefined ? { nextCursor } : {}),
+      };
     },
 
     async getClientSession(
@@ -9864,6 +9920,10 @@ export function createPgSessionsBackend(
           sets.push(`pinned = $${n++}`);
           params.push(patch.pinned ? 1 : 0);
         }
+        if (patch.archived !== undefined) {
+          sets.push(`archived_at = $${n++}`);
+          params.push(patch.archived ? Date.now() : null);
+        }
         params.push(id, userId);
         const row = (
           await client.query<{ updated_at: string }>(
@@ -9875,6 +9935,237 @@ export function createPgSessionsBackend(
         ).rows[0];
         if (!row) return { ok: false, error: "not_found" };
         return { ok: true, updatedAt: bigIntNum(row.updated_at, "updated_at") };
+      });
+    },
+
+    async getSessionProjectInstructions(sessionId: string): Promise<string | null> {
+      const row = (
+        await pool.query<{ instructions: string | null }>(
+          `SELECT p.instructions
+             FROM client_sessions cs
+             JOIN chat_projects p ON p.id = cs.project_id AND p.user_id = cs.user_id
+            WHERE cs.id = $1 AND cs.deleted_at IS NULL AND p.deleted_at IS NULL`,
+          [sessionId],
+        )
+      ).rows[0];
+      if (!row?.instructions) return null;
+      const cleaned = sanitizeProjectInstructions(row.instructions).trim();
+      return cleaned.length > 0 ? cleaned : null;
+    },
+
+    async searchClientSessions(
+      userId: string,
+      opts: SearchClientSessionsOpts,
+    ): Promise<SearchClientSessionsResult> {
+      const q = opts.q.trim();
+      if (!q) return { results: [] };
+      const limit = typeof opts.limit === "number" && Number.isFinite(opts.limit) && opts.limit > 0
+        ? Math.min(SESSION_SEARCH_LIMIT_MAX, Math.floor(opts.limit))
+        : SESSION_SEARCH_LIMIT_DEFAULT;
+      const includeArchived = opts.includeArchived === true;
+      const like = `%${escapeLikePattern(q)}%`;
+      const archiveSql = includeArchived ? "" : " AND cs.archived_at IS NULL";
+      const candMax = SESSION_SEARCH_JSON_CANDIDATE_MAX;
+      const expandMax = SESSION_SEARCH_JSON_EXPAND_MAX_BYTES;
+      const titleRows = (
+        await pool.query<{
+          id: string;
+          title: string;
+          project_id: string | null;
+          last_at: string;
+        }>(
+          `SELECT id, title, project_id, last_at
+             FROM client_sessions cs
+            WHERE cs.user_id = $1 AND cs.deleted_at IS NULL${archiveSql}
+              AND cs.title ILIKE $2 ESCAPE '\\'`,
+          [userId, like],
+        )
+      ).rows;
+      // 正文在 client_sessions.messages(TEXT JSON) 与 spill 的
+      // client_session_archive_chunks.messages。两段式:先 TEXT ILIKE 收窄(不解析 JSON),
+      // 按 last_at DESC 取最近 N 条候选;octet_length > 2MB 的行只出一条 TEXT snippet,
+      // 不对 67MB/90MB 级 tape 做 json_array_elements。
+      const msgRows = (
+        await pool.query<{
+          id: string;
+          title: string;
+          project_id: string | null;
+          matched_at: string;
+          msg_text: string;
+        }>(
+          `WITH text_hits AS (
+             SELECT cs.id, cs.title, cs.project_id, cs.last_at, cs.messages,
+                    octet_length(cs.messages) AS msg_bytes
+               FROM client_sessions cs
+              WHERE cs.user_id = $1 AND cs.deleted_at IS NULL${archiveSql}
+                AND cs.messages ILIKE $2 ESCAPE '\\'
+              ORDER BY cs.last_at DESC
+              LIMIT $3
+           )
+           SELECT c.id, c.title, c.project_id,
+                  COALESCE((elem->>'ts')::bigint, c.last_at)::text AS matched_at,
+                  LEFT(COALESCE(elem->>'text', ''), 400) AS msg_text
+             FROM text_hits c
+             CROSS JOIN LATERAL json_array_elements(
+               CASE WHEN left(c.messages, 1) = '[' THEN c.messages::json ELSE '[]'::json END
+             ) elem
+            WHERE c.msg_bytes <= $4
+              AND elem->>'text' ILIKE $2 ESCAPE '\\'
+           UNION ALL
+           SELECT c.id, c.title, c.project_id,
+                  c.last_at::text AS matched_at,
+                  substring(c.messages FROM GREATEST(1, strpos(lower(c.messages), lower($5)) - 80) FOR 400) AS msg_text
+             FROM text_hits c
+            WHERE c.msg_bytes > $4`,
+          [userId, like, candMax, expandMax, q],
+        )
+      ).rows;
+      const chunkRows = (
+        await pool.query<{
+          id: string;
+          title: string;
+          project_id: string | null;
+          matched_at: string;
+          msg_text: string;
+        }>(
+          `WITH text_hits AS (
+             SELECT cs.id, cs.title, cs.project_id, cs.last_at, ch.messages,
+                    octet_length(ch.messages) AS msg_bytes
+               FROM client_session_archive_chunks ch
+               JOIN client_sessions cs ON cs.id = ch.session_id AND cs.user_id = ch.user_id
+              WHERE cs.user_id = $1 AND cs.deleted_at IS NULL${archiveSql}
+                AND ch.messages ILIKE $2 ESCAPE '\\'
+              ORDER BY cs.last_at DESC
+              LIMIT $3
+           )
+           SELECT c.id, c.title, c.project_id,
+                  COALESCE((elem->>'ts')::bigint, c.last_at)::text AS matched_at,
+                  LEFT(COALESCE(elem->>'text', ''), 400) AS msg_text
+             FROM text_hits c
+             CROSS JOIN LATERAL json_array_elements(
+               CASE WHEN left(c.messages, 1) = '[' THEN c.messages::json ELSE '[]'::json END
+             ) elem
+            WHERE c.msg_bytes <= $4
+              AND elem->>'text' ILIKE $2 ESCAPE '\\'
+           UNION ALL
+           SELECT c.id, c.title, c.project_id,
+                  c.last_at::text AS matched_at,
+                  substring(c.messages FROM GREATEST(1, strpos(lower(c.messages), lower($5)) - 80) FOR 400) AS msg_text
+             FROM text_hits c
+            WHERE c.msg_bytes > $4`,
+          [userId, like, candMax, expandMax, q],
+        )
+      ).rows;
+      const hits = [
+        ...titleRows.map((r) => ({
+          sessionId: r.id,
+          title: r.title,
+          projectId: r.project_id ?? null,
+          snippet: buildSearchSnippet(r.title, q),
+          matchedAt: bigIntNum(r.last_at, "last_at"),
+          kind: "title" as const,
+        })),
+        ...msgRows.map((r) => ({
+          sessionId: r.id,
+          title: r.title,
+          projectId: r.project_id ?? null,
+          snippet: buildSearchSnippet(r.msg_text, q),
+          matchedAt: bigIntNum(r.matched_at, "matched_at"),
+          kind: "message" as const,
+        })),
+        ...chunkRows.map((r) => ({
+          sessionId: r.id,
+          title: r.title,
+          projectId: r.project_id ?? null,
+          snippet: buildSearchSnippet(r.msg_text, q),
+          matchedAt: bigIntNum(r.matched_at, "matched_at"),
+          kind: "message" as const,
+        })),
+      ];
+      return { results: rankSessionSearchHits(hits, limit) };
+    },
+
+    async batchClientSessions(
+      userId: string,
+      input: BatchClientSessionsInput,
+    ): Promise<BatchClientSessionsResult> {
+      const parsed = parseSessionBatchInput(input);
+      if ("ok" in parsed) return parsed;
+      const { ids, action } = parsed;
+      if (ids.length === 0) return { ok: true, updated: 0, skipped: 0 };
+      return withTx(pool, async (client): Promise<BatchClientSessionsResult> => {
+        if (action === "move" && parsed.projectId) {
+          const owned = (
+            await client.query(
+              "SELECT 1 FROM chat_projects WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
+              [parsed.projectId, userId],
+            )
+          ).rows[0];
+          if (!owned) return { ok: false, error: "project_not_found" };
+        }
+        const ownedRows = (
+          await client.query<{ id: string }>(
+            `SELECT id FROM client_sessions
+              WHERE user_id = $1 AND deleted_at IS NULL AND id = ANY($2::text[])`,
+            [userId, ids],
+          )
+        ).rows;
+        const owned = new Set(ownedRows.map((r) => r.id));
+        const skipped = ids.length - owned.size;
+        const targetIds = ids.filter((id) => owned.has(id));
+        if (targetIds.length === 0) return { ok: true, updated: 0, skipped };
+        let updated = 0;
+        if (action === "delete") {
+          for (const id of targetIds) {
+            const result = await client.query(
+              `UPDATE client_sessions
+                  SET deleted_at = ${CLOCK_MS_SQL},
+                      updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL}),
+                      messages = '[]', message_count = 0
+                WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
+              [id, userId],
+            );
+            if ((result.rowCount ?? 0) === 0) continue;
+            await client.query("DELETE FROM client_session_user_payloads WHERE session_id=$1 AND user_id=$2", [id, userId]);
+            await client.query("DELETE FROM client_session_archive_chunks WHERE session_id = $1", [id]);
+            await client.query("DELETE FROM client_session_archived_ids WHERE session_id = $1", [id]);
+            await client.query("DELETE FROM turn_tape_recovery_links WHERE session_id = $1", [id]);
+            await client.query("DELETE FROM client_session_turn_tapes WHERE session_id = $1", [id]);
+            await client.query("DELETE FROM pending_usage_patches WHERE parent_session_id = $1", [id]);
+            updated++;
+          }
+        } else if (action === "archive") {
+          const res = await client.query(
+            `UPDATE client_sessions
+                SET archived_at = COALESCE(archived_at, ${CLOCK_MS_SQL}),
+                    updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
+              WHERE user_id = $1 AND deleted_at IS NULL AND archived_at IS NULL
+                AND id = ANY($2::text[])`,
+            [userId, targetIds],
+          );
+          updated = res.rowCount ?? 0;
+        } else if (action === "unarchive") {
+          const res = await client.query(
+            `UPDATE client_sessions
+                SET archived_at = NULL,
+                    updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
+              WHERE user_id = $1 AND deleted_at IS NULL AND archived_at IS NOT NULL
+                AND id = ANY($2::text[])`,
+            [userId, targetIds],
+          );
+          updated = res.rowCount ?? 0;
+        } else {
+          const res = await client.query(
+            `UPDATE client_sessions
+                SET project_id = $1,
+                    updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
+              WHERE user_id = $2 AND deleted_at IS NULL
+                AND id = ANY($3::text[])`,
+            [parsed.projectId ?? null, userId, targetIds],
+          );
+          updated = res.rowCount ?? 0;
+        }
+        return { ok: true, updated, skipped };
       });
     },
 

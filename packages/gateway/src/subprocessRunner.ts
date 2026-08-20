@@ -1692,6 +1692,7 @@ export class SubprocessRunner extends EventEmitter {
         repoSnapshot,
         skillEvalExclude: this.opts.skillEvalExclude,
         skillEvalDraft: this.opts.skillEvalDraft,
+        sessionId: this.opts.sessionId,
       })
       const goalPrompt = renderCcbGoalPrompt(this.platformGoal)
       const mergedPrompt = [promptResult.content, goalPrompt].filter(Boolean).join('\n\n')

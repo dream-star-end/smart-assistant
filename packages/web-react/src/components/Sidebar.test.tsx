@@ -3,6 +3,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import type { ChatProject, Session, User } from "../lib/types";
 import { Sidebar } from "./Sidebar";
+import { SESSION_ROW_HEIGHT, SESSION_ROW_HEIGHT_PREVIEW } from "./sidebar/constants";
+import { flattenSidebarItems } from "./sidebar/flattenItems";
+import { HighlightedText } from "./sidebar/highlight";
+import { modelShortLabel } from "./sidebar/modelShortLabel";
 
 afterEach(() => {
   cleanup();
@@ -144,14 +148,12 @@ describe("Sidebar 会话列表", () => {
     );
   });
 
-  it("活跃会话行有左侧 accent 竖条，且桌面行用 py-1.5；非活跃行无竖条、圆角同为 rounded-md", () => {
+  it("活跃会话行有左侧 accent 竖条；非活跃行无竖条、圆角同为 rounded-md", () => {
     renderSidebar({ sessions: listSessions, activeId: "s-beta" });
     const activeBtn = screen.getByRole("button", { name: "Beta 上线检查" });
     const activeRow = activeBtn.closest("div");
     expect(activeRow).toHaveClass("rounded-md", "bg-active");
     expect(activeRow?.querySelector(".bg-accent")).not.toBeNull();
-    expect(activeBtn).toHaveClass("py-1.5");
-    expect(activeBtn.className).toContain("[@media(hover:none)]:py-2");
 
     const idleBtn = screen.getByRole("button", { name: "季度复盘 Alpha" });
     const idleRow = idleBtn.closest("div");
@@ -504,3 +506,272 @@ describe("Sidebar 置顶", () => {
     expect(screen.getByRole("menuitem", { name: /取消置顶/ })).toBeInTheDocument();
   });
 });
+
+describe("Sidebar 虚拟列表拍平", () => {
+  it("折叠项目后拍平结果不含其下会话，展开则含且带 indent", () => {
+    const proj = project({ id: "p-work", name: "工作" });
+    const inProj = session({ id: "s-in", title: "项目里的会话", projectId: "p-work" });
+    const out = session({ id: "s-out", title: "未分组会话" });
+    const collapsed = flattenSidebarItems({
+      searching: false,
+      showProjects: true,
+      showPreview: false,
+      pinned: [],
+      projects: [proj],
+      projectSessions: new Map([["p-work", [inProj]]]),
+      sessions: [inProj, out],
+      ungroupedGroups: [["今天", [out]]],
+      collapsedProjectIds: new Set(["p-work"]),
+      archived: [],
+      archivedExpanded: false,
+      searchHits: [],
+      searchRemote: "idle",
+      localEmpty: false,
+    });
+    expect(collapsed.some((i) => i.kind === "session" && i.session.id === "s-in")).toBe(false);
+    expect(collapsed.some((i) => i.kind === "project" && i.collapsed)).toBe(true);
+
+    const open = flattenSidebarItems({
+      searching: false,
+      showProjects: true,
+      showPreview: false,
+      pinned: [],
+      projects: [proj],
+      projectSessions: new Map([["p-work", [inProj]]]),
+      sessions: [inProj, out],
+      ungroupedGroups: [["今天", [out]]],
+      collapsedProjectIds: new Set(),
+      archived: [],
+      archivedExpanded: false,
+      searchHits: [],
+      searchRemote: "idle",
+      localEmpty: false,
+    });
+    const child = open.find((i) => i.kind === "session" && i.session.id === "s-in");
+    expect(child).toMatchObject({ kind: "session", indent: true, height: SESSION_ROW_HEIGHT });
+    expect(open[0]?.kind).not.toBe("session");
+  });
+
+  it("置顶分组在项目与时间分组之前；搜索时不拍项目行", () => {
+    const pin = session({ id: "s-pin", title: "钉住的", pinned: true });
+    const items = flattenSidebarItems({
+      searching: true,
+      showProjects: true,
+      showPreview: false,
+      pinned: [],
+      projects: [project({ id: "p-work", name: "工作" })],
+      projectSessions: new Map(),
+      sessions: [pin],
+      ungroupedGroups: [["搜索结果", [pin]]],
+      archived: [],
+      archivedExpanded: false,
+      searchHits: [],
+      searchRemote: "idle",
+      localEmpty: false,
+    });
+    expect(items.some((i) => i.kind === "project")).toBe(false);
+    expect(items.find((i) => i.kind === "header")?.label).toBe("搜索结果");
+  });
+
+  it("统一摘要开关下所有会话行同高", () => {
+    const s = session({ id: "s1", title: "有摘要", lastMessagePreview: "hello" });
+    const items = flattenSidebarItems({
+      searching: false,
+      showProjects: false,
+      showPreview: true,
+      pinned: [],
+      projects: [],
+      projectSessions: new Map(),
+      sessions: [s],
+      ungroupedGroups: [["今天", [s]]],
+      archived: [],
+      archivedExpanded: false,
+      searchHits: [],
+      searchRemote: "idle",
+      localEmpty: false,
+    });
+    const rows = items.filter((i) => i.kind === "session");
+    expect(rows.every((r) => r.height === SESSION_ROW_HEIGHT_PREVIEW)).toBe(true);
+  });
+
+  it("超过阈值且能读到视口高度时只挂载窗口内的会话", () => {
+    const many = Array.from({ length: 40 }, (_, i) =>
+      session({ id: `s-${i}`, title: `长列表会话 ${i}` }),
+    );
+    const proto = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "clientHeight");
+    Object.defineProperty(HTMLElement.prototype, "clientHeight", {
+      configurable: true,
+      get() {
+        return 180;
+      },
+    });
+    try {
+      renderSidebar({ sessions: many, virtualizeThreshold: 8 });
+      const list = document.querySelector("[data-sidebar-list]");
+      expect(list).toHaveAttribute("data-virtualized", "true");
+      expect(screen.queryByRole("button", { name: "长列表会话 39" })).toBeNull();
+      expect(screen.getByRole("button", { name: "长列表会话 0" })).toBeInTheDocument();
+    } finally {
+      if (proto) Object.defineProperty(HTMLElement.prototype, "clientHeight", proto);
+      else delete (HTMLElement.prototype as { clientHeight?: number }).clientHeight;
+    }
+  });
+});
+
+describe("Sidebar 归档与批量", () => {
+  it("默认不显示已归档会话，展开「已归档」后出现", () => {
+    const onLoadArchived = vi.fn();
+    renderSidebar({
+      sessions: [
+        session({ id: "s-live", title: "进行中" }),
+        session({ id: "s-arc", title: "已收进箱底", archived: true }),
+      ],
+      onLoadArchived,
+    });
+    expect(screen.getByRole("button", { name: "进行中" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "已收进箱底" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /已归档/ }));
+    expect(onLoadArchived).toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "已收进箱底" })).toBeInTheDocument();
+  });
+
+  it("会话更多菜单可归档，也可进入多选并批量操作", () => {
+    const onArchive = vi.fn();
+    const onBatch = vi.fn();
+    renderSidebar({
+      sessions: listSessions,
+      onArchive,
+      onBatch,
+    });
+    openSessionMenu("季度复盘 Alpha");
+    fireEvent.click(screen.getByRole("menuitem", { name: "归档" }));
+    expect(onArchive).toHaveBeenCalledTimes(1);
+    expect(onArchive.mock.calls[0][0].id).toBe("s-alpha");
+
+    openSessionMenu("Beta 上线检查");
+    fireEvent.click(screen.getByRole("menuitem", { name: "多选" }));
+    expect(screen.getByTestId("sidebar-batch-bar")).toHaveTextContent("已选 1 条");
+    fireEvent.click(screen.getByRole("button", { name: "归档" }));
+    expect(onBatch).toHaveBeenCalledWith(["s-beta"], "archive", undefined);
+  });
+});
+
+describe("Sidebar 模型徽标与摘要", () => {
+  it("有 modelId 时显示短标签，有摘要时作为第二行", () => {
+    renderSidebar({
+      sessions: [
+        session({
+          id: "s-m",
+          title: "带模型",
+          modelId: "vendor/cool-model-v2",
+          lastMessagePreview: "最后一句话写在这里",
+        }),
+      ],
+      models: [{ id: "vendor/cool-model-v2", display_name: "Cool Model" }],
+    });
+    expect(screen.getByText("Cool Model")).toBeInTheDocument();
+    expect(screen.getByText("最后一句话写在这里")).toBeInTheDocument();
+  });
+
+  it("modelShortLabel 回落 id 可读片段，不臆造映射表", () => {
+    expect(modelShortLabel("acme/foo-bar")).toBe("foo-bar");
+  });
+});
+
+describe("Sidebar 服务端搜索三态", () => {
+  it("本地标题过滤立即生效，防抖后展示消息命中并高亮 snippet", async () => {
+    const onSearchMessages = vi.fn(async () => [
+      {
+        sessionId: "s-hit",
+        title: "命中会话",
+        snippet: "包含关键词 beta 的一段",
+        matchedAt: 1,
+        kind: "message" as const,
+      },
+    ]);
+    renderSidebar({ sessions: listSessions, onSearchMessages });
+    fireEvent.change(screen.getByPlaceholderText("搜索会话"), { target: { value: "beta" } });
+    expect(screen.getByRole("button", { name: "Beta 上线检查" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "季度复盘 Alpha" })).toBeNull();
+    expect(screen.getByText("正在搜索消息…")).toBeInTheDocument();
+    await waitFor(() => expect(onSearchMessages).toHaveBeenCalled());
+    expect(screen.getByText("消息内容匹配")).toBeInTheDocument();
+    expect(screen.getByText("命中会话")).toBeInTheDocument();
+    const mark = screen.getByText("beta");
+    expect(mark.tagName).toBe("MARK");
+  });
+
+  it("请求失败给出克制提示", async () => {
+    const onSearchMessages = vi.fn(async () => {
+      throw new Error("boom");
+    });
+    renderSidebar({ sessions: listSessions, onSearchMessages });
+    fireEvent.change(screen.getByPlaceholderText("搜索会话"), { target: { value: "zzz-none" } });
+    await waitFor(() => expect(screen.getByText("消息搜索失败")).toBeInTheDocument());
+  });
+
+  it("后续输入会 abort 上一次搜索", async () => {
+    const seen: AbortSignal[] = [];
+    const onSearchMessages = vi.fn(async (_q: string, signal: AbortSignal) => {
+      seen.push(signal);
+      await new Promise((r) => setTimeout(r, 80));
+      return [];
+    });
+    renderSidebar({ sessions: listSessions, onSearchMessages });
+    fireEvent.change(screen.getByPlaceholderText("搜索会话"), { target: { value: "al" } });
+    await waitFor(() => expect(onSearchMessages).toHaveBeenCalledTimes(1));
+    fireEvent.change(screen.getByPlaceholderText("搜索会话"), { target: { value: "alpha" } });
+    expect(seen[0]?.aborted).toBe(true);
+  });
+});
+
+describe("Sidebar 未读", () => {
+  it("未读会话标题加粗、行尾圆点，点击时 markRead", () => {
+    const onMarkRead = vi.fn();
+    const onSelect = vi.fn();
+    renderSidebar({
+      sessions: listSessions,
+      unreadIds: new Set(["s-alpha"]),
+      onMarkRead,
+      onSelect,
+    });
+    const btn = screen.getByRole("button", { name: "季度复盘 Alpha" });
+    expect(btn.querySelector(".font-semibold")).not.toBeNull();
+    expect(screen.getByRole("img", { name: "未读" })).toBeInTheDocument();
+    fireEvent.click(btn);
+    expect(onMarkRead).toHaveBeenCalledWith("s-alpha");
+    expect(onSelect).toHaveBeenCalledWith("s-alpha");
+  });
+});
+
+describe("Sidebar 项目排序", () => {
+  it("项目更多菜单上移/下移回调 orderedIds", () => {
+    const onReorderProjects = vi.fn();
+    const projects = [
+      project({ id: "p-a", name: "甲", sortOrder: 0 }),
+      project({ id: "p-b", name: "乙", sortOrder: 1 }),
+    ];
+    renderSidebar({
+      sessions: [],
+      projects,
+      onCreateProject: () => {},
+      onReorderProjects,
+    });
+    fireEvent.pointerDown(screen.getByRole("button", { name: "项目 甲 更多" }), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    fireEvent.click(screen.getByRole("menuitem", { name: "下移" }));
+    expect(onReorderProjects).toHaveBeenCalledWith(["p-b", "p-a"]);
+  });
+});
+
+describe("HighlightedText", () => {
+  it("不高亮时不使用 innerHTML", () => {
+    const { container } = render(<HighlightedText text={"a <b> x"} query="b" />);
+    expect(container.innerHTML).not.toContain("<b>");
+    expect(container.querySelector("mark")?.textContent).toBe("b");
+  });
+});
+

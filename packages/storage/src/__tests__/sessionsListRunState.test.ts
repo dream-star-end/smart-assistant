@@ -64,7 +64,7 @@ describe('listClientSessions runState/lastOutcome', () => {
 
   it('从未跑过 turn → idle + lastOutcome null', async () => {
     await upsertClientSession(session('web-idle'))
-    const meta = (await listClientSessions(USER)).find((s) => s.id === 'web-idle')
+    const meta = (await listClientSessions(USER)).sessions.find((s) => s.id === 'web-idle')
     assert.ok(meta)
     assert.equal(meta.runState, 'idle')
     assert.equal(meta.lastOutcome, null)
@@ -75,7 +75,7 @@ describe('listClientSessions runState/lastOutcome', () => {
   it('queued/running 非终态 → running;终态 completed → idle + lastOutcome', async () => {
     await upsertClientSession(session('web-run'))
     await admit('web-run', 'cm-1', 'd-1')
-    let meta = (await listClientSessions(USER)).find((s) => s.id === 'web-run')
+    let meta = (await listClientSessions(USER)).sessions.find((s) => s.id === 'web-run')
     assert.equal(meta?.runState, 'running')
     assert.equal(meta?.lastOutcome, null)
 
@@ -89,7 +89,7 @@ describe('listClientSessions runState/lastOutcome', () => {
       requestId: 'req-1',
       createdAt: 1,
     })
-    meta = (await listClientSessions(USER)).find((s) => s.id === 'web-run')
+    meta = (await listClientSessions(USER)).sessions.find((s) => s.id === 'web-run')
     assert.equal(meta?.runState, 'running')
 
     const terminal = await casTurnDispatchState({
@@ -101,7 +101,7 @@ describe('listClientSessions runState/lastOutcome', () => {
       outcome: 'completed',
     })
     assert.equal(terminal?.outcome, 'completed')
-    meta = (await listClientSessions(USER)).find((s) => s.id === 'web-run')
+    meta = (await listClientSessions(USER)).sessions.find((s) => s.id === 'web-run')
     assert.equal(meta?.runState, 'idle')
     assert.equal(meta?.lastOutcome, 'completed')
   })
@@ -128,12 +128,12 @@ describe('listClientSessions runState/lastOutcome', () => {
       outcome: 'crashed',
       now: 2000,
     })
-    let meta = (await listClientSessions(USER)).find((s) => s.id === 'web-mix')
+    let meta = (await listClientSessions(USER)).sessions.find((s) => s.id === 'web-mix')
     assert.equal(meta?.runState, 'idle')
     assert.equal(meta?.lastOutcome, 'crashed')
 
     await admit('web-mix', 'cm-open', 'd-open')
-    meta = (await listClientSessions(USER)).find((s) => s.id === 'web-mix')
+    meta = (await listClientSessions(USER)).sessions.find((s) => s.id === 'web-mix')
     assert.equal(meta?.runState, 'running')
     assert.equal(meta?.lastOutcome, 'crashed')
   })
@@ -149,7 +149,7 @@ describe('listClientSessions runState/lastOutcome', () => {
       toState: 'rejected',
       outcome: 'not_accepted',
     })
-    const meta = (await listClientSessions(USER)).find((s) => s.id === 'web-rej')
+    const meta = (await listClientSessions(USER)).sessions.find((s) => s.id === 'web-rej')
     assert.equal(meta?.runState, 'idle')
     assert.equal(meta?.lastOutcome, 'not_accepted')
   })

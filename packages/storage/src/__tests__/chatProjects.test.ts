@@ -117,14 +117,14 @@ describe('chat_projects CRUD', () => {
     await upsertClientSession(baseSession('sess-keep'))
     const linked = await patchClientSessionMeta('sess-keep', USER, { projectId: created.project.id })
     assert.equal(linked.ok, true)
-    assert.equal((await listClientSessions(USER)).find((s) => s.id === 'sess-keep')?.projectId, created.project.id)
+    assert.equal((await listClientSessions(USER)).sessions.find((s) => s.id === 'sess-keep')?.projectId, created.project.id)
 
     const del = await deleteChatProject(USER, created.project.id)
     assert.equal(del.ok, true)
     assert.equal((await listChatProjects(USER)).length, 0)
     const session = await getClientSession('sess-keep', USER)
     assert.ok(session, '会话必须还在')
-    assert.equal((await listClientSessions(USER)).find((s) => s.id === 'sess-keep')?.projectId, null)
+    assert.equal((await listClientSessions(USER)).sessions.find((s) => s.id === 'sess-keep')?.projectId, null)
   })
 
   it('会话 PATCH projectId:null 移出;不存在/他人项目 → project_not_found', async () => {
@@ -144,13 +144,13 @@ describe('chat_projects CRUD', () => {
 
     const ok = await patchClientSessionMeta('sess-move', USER, { projectId: mine.project.id, pinned: true })
     assert.equal(ok.ok, true)
-    const meta = (await listClientSessions(USER)).find((s) => s.id === 'sess-move')
+    const meta = (await listClientSessions(USER)).sessions.find((s) => s.id === 'sess-move')
     assert.equal(meta?.projectId, mine.project.id)
     assert.equal(meta?.pinned, true)
 
     const ungroup = await patchClientSessionMeta('sess-move', USER, { projectId: null })
     assert.equal(ungroup.ok, true)
-    assert.equal((await listClientSessions(USER)).find((s) => s.id === 'sess-move')?.projectId, null)
+    assert.equal((await listClientSessions(USER)).sessions.find((s) => s.id === 'sess-move')?.projectId, null)
   })
 
   it('他人会话 PATCH 失败;每用户上限 100', async () => {

@@ -110,7 +110,8 @@
     "0229_turn_finalize_integrity",
     "0230_chat_projects",
     "0231_turn_tape_materialization_resilience",
-    "0232_agent_group_jsonb_unicode_sanitize"
+    "0232_agent_group_jsonb_unicode_sanitize",
+    "0233_client_session_list_archived_at"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

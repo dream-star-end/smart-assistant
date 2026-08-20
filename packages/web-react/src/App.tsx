@@ -59,6 +59,7 @@ import {
 import { MediaSignProvider } from "./components/chat/media";
 import { ChatInteractionContext, ToolCardActionsContext } from "./components/tool/context";
 import { Sidebar } from "./components/Sidebar";
+import { ProjectSettingsDialog } from "./components/ProjectSettingsDialog";
 import { Alert, Sheet, Spinner, useConfirm, usePrompt } from "./components/ui";
 import { useAgentGate } from "./hooks/useAgentGate";
 import {
@@ -76,6 +77,8 @@ import {
 import { useAuth } from "./hooks/useAuth";
 import { genWsSessionId, useSessionList } from "./hooks/useSessionList";
 import { useChatProjects } from "./hooks/useChatProjects";
+import { useUnreadSessions } from "./hooks/useUnreadSessions";
+import { useSidebarWidth } from "./hooks/useSidebarWidth";
 import { type UseChatSocket, useChatSocket } from "./hooks/useChatSocket";
 import { useInbox } from "./hooks/useInbox";
 import { useOptimizerPending } from "./hooks/useOptimizerPending";
@@ -135,7 +138,7 @@ import {
   resolveSessionModel,
 } from "./lib/modelPreferences";
 import { DEMO_MESSAGES, DEMO_MODELS, DEMO_SESSIONS, DEMO_USER, demoReply } from "./lib/demo";
-import type { Message, PublicConfig, PublicModel, Session, SessionLastOutcome, ToolCard } from "./lib/types";
+import type { ChatProject, Message, PublicConfig, PublicModel, Session, SessionLastOutcome, ToolCard } from "./lib/types";
 import { modelSwitchCompactionReason } from "./lib/modelSwitch";
 
 // 首屏瘦身:营销首页 + 设置/管理/市场/组织/教程中心按需异步加载,移出 entry chunk。
@@ -504,6 +507,14 @@ export function App() {
     deleteSessionConfirm,
     togglePinSession,
     moveSessionToProject,
+    toggleArchiveSession,
+    batchUpdateSessions,
+    loadMoreSessions,
+    hasMoreSessions,
+    loadingMoreSessions,
+    loadArchivedSessions,
+    loadingArchived,
+    searchSessionMessages,
     applySessionTerminal,
     reset: resetSessionList,
     serverListSettled,
@@ -549,6 +560,8 @@ export function App() {
     createProjectPrompt,
     renameProjectPrompt,
     deleteProjectConfirm,
+    updateProject,
+    reorderProjects,
   } = useChatProjects({
     demo,
     auth,
@@ -569,6 +582,14 @@ export function App() {
       setSessions((c) => c.map((s) => (ids.has(s.id) ? { ...s, projectId } : s)));
     },
   });
+
+  const unreadSessions = useUnreadSessions({
+    sessions,
+    activeId: activeId ?? null,
+    userId: user?.id ?? null,
+  });
+  const sidebarWidth = useSidebarWidth();
+  const [projectSettings, setProjectSettings] = useState<ChatProject | null>(null);
 
   // ── per-session 模型选择(会话间互不影响,持久化恢复)────────────────────────
   //
@@ -2471,6 +2492,22 @@ export function App() {
         : () => openOrg(),
     onOpenBoard: demo ? undefined : () => setBoardOpen(true),
     boardActive: boardOpen,
+    unreadIds: unreadSessions.unreadIds,
+    onMarkRead: unreadSessions.markRead,
+    onOpenProjectSettings: (p: ChatProject) => setProjectSettings(p),
+    onReorderProjects: reorderProjects,
+    width: sidebarWidth.width,
+    onResizeStart: sidebarWidth.onResizeStart,
+    resizing: sidebarWidth.resizing,
+    models,
+    onArchive: toggleArchiveSession,
+    onBatch: batchUpdateSessions,
+    onLoadMore: loadMoreSessions,
+    hasMore: hasMoreSessions,
+    loadingMore: loadingMoreSessions,
+    onLoadArchived: loadArchivedSessions,
+    loadingArchived,
+    onSearchMessages: searchSessionMessages,
   };
   const closeMobileThen = (fn?: () => void) =>
     fn
@@ -2545,6 +2582,9 @@ export function App() {
           onOpenOrg={closeMobileThen(sidebarProps.onOpenOrg)}
           onOpenMediaTasks={closeMobileThen(sidebarProps.onOpenMediaTasks)}
           onLogout={closeMobileThen(sidebarProps.onLogout)}
+          width={undefined}
+          onResizeStart={undefined}
+          resizing={false}
         />
       </Sheet>
 
@@ -2573,6 +2613,7 @@ export function App() {
           </LazyBoundary>
         ) : (
         <>
+        <div className="relative">
         <ChatHeader
           agent={agent}
           onAgentClick={() => setPickerOpen(true)}
@@ -2596,6 +2637,19 @@ export function App() {
           onOpenInbox={demo ? undefined : () => setInboxOpen(true)}
           unreadCount={inbox.unreadCount}
         />
+        {unreadSessions.unreadIds.size > 0 && (
+          <span
+            data-testid="session-unread-badge"
+            className={
+              collapsed
+                ? "pointer-events-none absolute left-8 top-2 hidden h-4 min-w-4 items-center justify-center rounded-full bg-accent px-1 text-[10px] font-medium text-accent-fg md:flex"
+                : "pointer-events-none absolute left-8 top-2 flex h-4 min-w-4 items-center justify-center rounded-full bg-accent px-1 text-[10px] font-medium text-accent-fg md:hidden"
+            }
+          >
+            {unreadSessions.unreadIds.size > 99 ? "99+" : unreadSessions.unreadIds.size}
+          </span>
+        )}
+        </div>
 
         {!demo && repo.showBanner && repo.selection?.selected && (
           <RepoStatusBanner
@@ -2867,6 +2921,16 @@ export function App() {
           }}
         />
       )}
+
+      <ProjectSettingsDialog
+        project={projectSettings}
+        open={projectSettings !== null}
+        onClose={() => setProjectSettings(null)}
+        onSave={async (patch) => {
+          if (!projectSettings) return;
+          await updateProject(projectSettings.id, patch);
+        }}
+      />
 
       <InboxDialog
         open={inboxOpen}

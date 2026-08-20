@@ -1,17 +1,15 @@
 import {
+  Archive,
   BookOpen,
   Building2,
   ChevronDown,
   ChevronRight,
   Film,
-  Folder,
   Kanban,
   LayoutGrid,
   LogOut,
   MessageSquareText,
-  MoreHorizontal,
   PanelLeftClose,
-  Pin,
   Plus,
   Search,
   Settings,
@@ -19,13 +17,19 @@ import {
   Sparkles,
   Store,
 } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState, useSyncExternalStore, type PointerEvent as ReactPointerEvent } from "react";
 import type { Theme } from "../hooks/useTheme";
 import { BRAND } from "../lib/brand";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
-import type { ChatProject, Session, User } from "../lib/types";
+import type {
+  ChatProject,
+  PublicModel,
+  Session,
+  SessionBatchAction,
+  SessionSearchHit,
+  User,
+} from "../lib/types";
 import { cn, formatCredits, groupLabel } from "../lib/utils";
-import { SessionStatusDot } from "./SessionStatusDot";
 import { ThemeToggle } from "./ThemeToggle";
 import {
   Avatar,
@@ -35,18 +39,87 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuSeparator,
-  DropdownMenuSub,
-  DropdownMenuSubContent,
-  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
   IconButton,
 } from "./ui";
-
-const SESSION_DRAG_TYPE = "application/x-openclaude-session-id";
+import { BatchBar } from "./sidebar/BatchBar";
+import { PROJECT_DRAG_TYPE, SEARCH_DEBOUNCE_MS, VIRTUALIZE_THRESHOLD } from "./sidebar/constants";
+import { type FlatItem, flattenSidebarItems } from "./sidebar/flattenItems";
+import { HighlightedText } from "./sidebar/highlight";
+import { ProjectRow } from "./sidebar/ProjectRow";
+import { SessionRow } from "./sidebar/SessionRow";
+import { VirtualList } from "./sidebar/VirtualList";
 
 function byUpdatedDesc(a: Session, b: Session): number {
   return a.updatedAt < b.updatedAt ? 1 : a.updatedAt > b.updatedAt ? -1 : 0;
 }
+
+function useCoarsePointer(): boolean {
+  return useSyncExternalStore(
+    (onChange) => {
+      if (typeof window.matchMedia !== "function") return () => {};
+      const mq = window.matchMedia("(hover: none)");
+      mq.addEventListener("change", onChange);
+      return () => mq.removeEventListener("change", onChange);
+    },
+    () => typeof window.matchMedia === "function" && window.matchMedia("(hover: none)").matches,
+    () => false,
+  );
+}
+
+export type SidebarProps = {
+  sessions: Session[];
+  activeId?: string;
+  user: User | null;
+  credits?: string | null;
+  optimizerPending?: number;
+  onSelect: (id: string) => void;
+  onNew: () => void;
+  onRename: (s: Session) => void;
+  onDelete: (s: Session) => void;
+  onTogglePin?: (s: Session) => void;
+  onMoveToProject?: (s: Session, projectId: string | null) => void;
+  projects?: ChatProject[];
+  collapsedProjectIds?: Set<string>;
+  onToggleProjectCollapsed?: (id: string) => void;
+  onCreateProject?: () => void;
+  onRenameProject?: (p: ChatProject) => void;
+  onDeleteProject?: (p: ChatProject) => void;
+  isSending?: (id: string) => boolean;
+  liveTerminal?: (id: string) => { lastOutcome?: string | null; lastErrorCode?: string | null } | undefined;
+  socketVersion?: number;
+  onCollapse?: () => void;
+  onLogout?: () => void;
+  onOpenAccount?: () => void;
+  onOpenFeedback?: () => void;
+  onOpenManage?: () => void;
+  onOpenMarketplace?: () => void;
+  onOpenTutorial?: () => void;
+  onOpenOrg?: () => void;
+  onOpenBoard?: () => void;
+  onOpenMediaTasks?: () => void;
+  boardActive?: boolean;
+  showAdmin?: boolean;
+  theme?: Theme;
+  onCycleTheme?: () => void;
+  unreadIds?: Set<string>;
+  onMarkRead?: (id: string) => void;
+  onOpenProjectSettings?: (p: ChatProject) => void;
+  onReorderProjects?: (orderedIds: string[]) => void;
+  width?: number;
+  onResizeStart?: (e: ReactPointerEvent) => void;
+  resizing?: boolean;
+  models?: PublicModel[];
+  onArchive?: (s: Session) => void;
+  onBatch?: (ids: string[], action: SessionBatchAction, projectId?: string | null) => void;
+  onLoadMore?: () => void;
+  hasMore?: boolean;
+  loadingMore?: boolean;
+  onLoadArchived?: () => void;
+  loadingArchived?: boolean;
+  onSearchMessages?: (q: string, signal: AbortSignal) => Promise<SessionSearchHit[]>;
+  virtualizeThreshold?: number;
+};
 
 export function Sidebar({
   sessions,
@@ -83,67 +156,61 @@ export function Sidebar({
   showAdmin,
   theme,
   onCycleTheme,
-}: {
-  sessions: Session[];
-  activeId?: string;
-  user: User | null;
-  /** 账户余额（积分字符串大数，来自 /api/me）。null 时退化为通用文案。 */
-  credits?: string | null;
-  /**
-   * Auto‑Dream 待确认建议数（与管理中心「优化」Tab 徽标同源）。>0 时管理中心入口右侧
-   * 用徽章替换静态副标题 —— 这是全面优化在账号菜单里唯一的曝光位。
-   */
-  optimizerPending?: number;
-  onSelect: (id: string) => void;
-  onNew: () => void;
-  onRename: (s: Session) => void;
-  onDelete: (s: Session) => void;
-  onTogglePin?: (s: Session) => void;
-  onMoveToProject?: (s: Session, projectId: string | null) => void;
-  projects?: ChatProject[];
-  collapsedProjectIds?: Set<string>;
-  onToggleProjectCollapsed?: (id: string) => void;
-  onCreateProject?: () => void;
-  onRenameProject?: (p: ChatProject) => void;
-  onDeleteProject?: (p: ChatProject) => void;
-  isSending?: (id: string) => boolean;
-  liveTerminal?: (id: string) => { lastOutcome?: string | null; lastErrorCode?: string | null } | undefined;
-  /** chat.version：触发状态点随本 tab 发送态重渲。 */
-  socketVersion?: number;
-  onCollapse?: () => void;
-  onLogout?: () => void;
-  onOpenAccount?: () => void;
-  /** 打开设置中心的反馈分区。省略则不渲染入口（demo）。 */
-  onOpenFeedback?: () => void;
-  /** 打开管理中心（记忆/技能/定时/插件/文献/优化）。省略则不渲染入口（demo）。 */
-  onOpenManage?: () => void;
-  /** 打开 AI 市场（技能/智能体/插件）。省略则不渲染入口（demo）。 */
-  onOpenMarketplace?: () => void;
-  /** 打开使用教程。省略则不渲染入口（demo）。 */
-  onOpenTutorial?: () => void;
-  /** 打开组织中心（企业版）。仅 org owner/admin 提供，省略则不渲染入口。 */
-  onOpenOrg?: () => void;
-  /** 打开任务面板全屏工作区。省略则不渲染入口（demo）。 */
-  onOpenBoard?: () => void;
-  /** 打开账号级异步视频任务中心。 */
-  onOpenMediaTasks?: () => void;
-  /** 任务面板当前是否为工作区（选中态）。 */
-  boardActive?: boolean;
-  /** 平台超管入口。仅 user.role === 'admin' 时为 true，false/省略则不渲染。 */
-  showAdmin?: boolean;
-  theme?: Theme;
-  onCycleTheme?: () => void;
-}) {
+  unreadIds,
+  onMarkRead,
+  onOpenProjectSettings,
+  onReorderProjects,
+  width,
+  onResizeStart,
+  resizing,
+  models,
+  onArchive,
+  onBatch,
+  onLoadMore,
+  hasMore,
+  loadingMore,
+  onLoadArchived,
+  loadingArchived,
+  onSearchMessages,
+  virtualizeThreshold = VIRTUALIZE_THRESHOLD,
+}: SidebarProps) {
   const [q, setQ] = useState("");
   const [dragOverProjectId, setDragOverProjectId] = useState<string | null>(null);
+  const [archivedExpanded, setArchivedExpanded] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
+  const [multiSelect, setMultiSelect] = useState(false);
+  const [orderOverride, setOrderOverride] = useState<string[] | null>(null);
+  const [searchHits, setSearchHits] = useState<SessionSearchHit[]>([]);
+  const [searchRemote, setSearchRemote] = useState<"idle" | "loading" | "empty" | "error">("idle");
+  const coarse = useCoarsePointer();
   const searching = q.trim().length > 0;
   const showProjects = Array.isArray(projects) && Boolean(onCreateProject);
 
+  const orderedProjects = useMemo(() => {
+    const list = projects ?? [];
+    if (!orderOverride) return list;
+    const map = new Map(list.map((p) => [p.id, p]));
+    const out: ChatProject[] = [];
+    for (const id of orderOverride) {
+      const p = map.get(id);
+      if (p) out.push(p);
+    }
+    for (const p of list) if (!orderOverride.includes(p.id)) out.push(p);
+    return out;
+  }, [projects, orderOverride]);
+
+  const activeSessions = useMemo(() => sessions.filter((s) => !s.archived), [sessions]);
+  const archivedSessions = useMemo(
+    () => sessions.filter((s) => s.archived).sort(byUpdatedDesc),
+    [sessions],
+  );
+
   const filtered = useMemo(() => {
     const needle = q.trim().toLowerCase();
-    if (!needle) return sessions;
-    return sessions.filter((s) => (s.title || "新对话").toLowerCase().includes(needle));
-  }, [sessions, q]);
+    const pool = searching ? sessions.filter((s) => !s.archived || archivedExpanded) : activeSessions;
+    if (!needle) return pool;
+    return pool.filter((s) => (s.title || "新对话").toLowerCase().includes(needle));
+  }, [activeSessions, sessions, q, searching, archivedExpanded]);
 
   const pinned = useMemo(
     () => (searching ? [] : filtered.filter((s) => s.pinned).sort(byUpdatedDesc)),
@@ -181,7 +248,110 @@ export function Sidebar({
     return [...map.entries()];
   }, [filtered, pinnedIds, searching]);
 
+  const showPreview = useMemo(
+    () => sessions.some((s) => Boolean(s.lastMessagePreview)),
+    [sessions],
+  );
+
+  useEffect(() => {
+    const needle = q.trim();
+    if (!needle || !onSearchMessages) {
+      setSearchHits([]);
+      setSearchRemote("idle");
+      return;
+    }
+    setSearchRemote("loading");
+    const ac = new AbortController();
+    const timer = window.setTimeout(() => {
+      void onSearchMessages(needle, ac.signal)
+        .then((hits) => {
+          if (ac.signal.aborted) return;
+          setSearchHits(hits);
+          setSearchRemote(hits.length === 0 ? "empty" : "idle");
+        })
+        .catch((e: unknown) => {
+          if (ac.signal.aborted) return;
+          if (e instanceof DOMException && e.name === "AbortError") return;
+          setSearchHits([]);
+          setSearchRemote("error");
+        });
+    }, SEARCH_DEBOUNCE_MS);
+    return () => {
+      window.clearTimeout(timer);
+      ac.abort();
+    };
+  }, [q, onSearchMessages]);
+
   void socketVersion;
+
+  const flatItems = useMemo(
+    () =>
+      flattenSidebarItems({
+        searching,
+        showProjects,
+        showPreview,
+        pinned,
+        projects: orderedProjects,
+        projectSessions,
+        sessions: activeSessions,
+        ungroupedGroups,
+        collapsedProjectIds,
+        archived: archivedSessions,
+        archivedExpanded,
+        archivedLoading: loadingArchived,
+        searchHits,
+        searchRemote,
+        localEmpty: filtered.length === 0,
+      }),
+    [
+      searching,
+      showProjects,
+      showPreview,
+      pinned,
+      orderedProjects,
+      projectSessions,
+      activeSessions,
+      ungroupedGroups,
+      collapsedProjectIds,
+      archivedSessions,
+      archivedExpanded,
+      loadingArchived,
+      searchHits,
+      searchRemote,
+      filtered.length,
+    ],
+  );
+
+  const emitReorder = (ids: string[]) => {
+    setOrderOverride(ids);
+    onReorderProjects?.(ids);
+  };
+
+  const moveProject = (id: string, dir: -1 | 1) => {
+    const ids = orderedProjects.map((p) => p.id);
+    const i = ids.indexOf(id);
+    const j = i + dir;
+    if (i < 0 || j < 0 || j >= ids.length) return;
+    const next = ids.slice();
+    const [row] = next.splice(i, 1);
+    next.splice(j, 0, row);
+    emitReorder(next);
+  };
+
+  const onToggleSelected = (id: string) => {
+    setSelectedIds((cur) => {
+      const next = new Set(cur);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+    setMultiSelect(true);
+  };
+
+  const clearMulti = () => {
+    setSelectedIds(new Set());
+    setMultiSelect(false);
+  };
 
   const hasAccountMenu = Boolean(
     onOpenManage ||
@@ -216,8 +386,182 @@ export function Sidebar({
     </button>
   );
 
+  const renderFlat = (item: FlatItem) => {
+    if (item.kind === "header") {
+      return (
+        <div className="flex h-full items-end px-3 pb-1 text-caption font-medium uppercase tracking-wide text-faint">
+          {item.label}
+          {item.label === "项目" && onCreateProject && (
+            <IconButton
+              aria-label="新建项目"
+              variant="muted"
+              size="xs"
+              shape="square"
+              className="ml-auto"
+              onClick={onCreateProject}
+            >
+              <Plus size={13} />
+            </IconButton>
+          )}
+        </div>
+      );
+    }
+    if (item.kind === "hint") {
+      const emptyCenter = item.text === "暂无会话" || item.text === "没有匹配的会话";
+      return (
+        <p
+          className={cn(
+            "flex h-full items-center px-3 text-body text-faint",
+            emptyCenter && "justify-center py-6",
+            item.text === "消息搜索失败" && "text-danger",
+          )}
+        >
+          {item.text}
+        </p>
+      );
+    }
+    if (item.kind === "session") {
+      const s = item.session;
+      return (
+        <SessionRow
+          session={s}
+          active={s.id === activeId}
+          projects={orderedProjects}
+          indent={item.indent}
+          isSending={isSending}
+          liveTerminal={liveTerminal}
+          onSelect={onSelect}
+          onRename={onRename}
+          onDelete={onDelete}
+          onTogglePin={onTogglePin}
+          onMoveToProject={onMoveToProject}
+          onArchive={onArchive}
+          onMarkRead={onMarkRead}
+          unread={unreadIds?.has(s.id)}
+          models={models}
+          showPreview={showPreview}
+          multiSelect={multiSelect}
+          selected={selectedIds.has(s.id)}
+          onToggleSelected={onToggleSelected}
+          onEnterMultiSelect={(id) => {
+            setMultiSelect(true);
+            setSelectedIds((cur) => new Set(cur).add(id));
+          }}
+          allowDrag={!coarse}
+        />
+      );
+    }
+    if (item.kind === "project") {
+      const p = item.project;
+      const idx = orderedProjects.findIndex((x) => x.id === p.id);
+      return (
+        <ProjectRow
+          project={p}
+          count={item.count}
+          collapsed={item.collapsed}
+          dropActive={dragOverProjectId === p.id}
+          allowDrag={!coarse && Boolean(onReorderProjects)}
+          showMoveInMenu={Boolean(onReorderProjects)}
+          canMoveUp={idx > 0}
+          canMoveDown={idx >= 0 && idx < orderedProjects.length - 1}
+          onToggle={onToggleProjectCollapsed}
+          onRename={onRenameProject}
+          onDelete={onDeleteProject}
+          onOpenSettings={onOpenProjectSettings}
+          onMoveUp={() => moveProject(p.id, -1)}
+          onMoveDown={() => moveProject(p.id, 1)}
+          onDragOverSession={() => setDragOverProjectId(p.id)}
+          onDragLeave={() => setDragOverProjectId((cur) => (cur === p.id ? null : cur))}
+          onDropSessionId={(id) => {
+            setDragOverProjectId(null);
+            const sess = sessions.find((x) => x.id === id);
+            if (sess && onMoveToProject) onMoveToProject(sess, p.id);
+          }}
+          onProjectDragStart={(e) => {
+            e.dataTransfer.setData(PROJECT_DRAG_TYPE, p.id);
+            e.dataTransfer.effectAllowed = "move";
+          }}
+          onProjectDrop={(e) => {
+            const from = e.dataTransfer.getData(PROJECT_DRAG_TYPE);
+            if (!from || from === p.id) return;
+            const ids = orderedProjects.map((x) => x.id);
+            const fromI = ids.indexOf(from);
+            const toI = ids.indexOf(p.id);
+            if (fromI < 0 || toI < 0) return;
+            const next = ids.slice();
+            const [row] = next.splice(fromI, 1);
+            next.splice(toI, 0, row);
+            emitReorder(next);
+          }}
+        />
+      );
+    }
+    if (item.kind === "searchHit") {
+      const hit = item.hit;
+      return (
+        <button
+          type="button"
+          onClick={() => {
+            onMarkRead?.(hit.sessionId);
+            onSelect(hit.sessionId);
+          }}
+          className="flex h-full w-full min-w-0 flex-col justify-center rounded-md px-3 text-left text-section text-muted outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          <span className="truncate">{hit.title || "新对话"}</span>
+          <span className="truncate text-caption text-faint">
+            <HighlightedText text={hit.snippet} query={q} />
+          </span>
+        </button>
+      );
+    }
+    if (item.kind === "archivedToggle") {
+      return (
+        <button
+          type="button"
+          aria-expanded={item.expanded}
+          onClick={() => {
+            const next = !archivedExpanded;
+            setArchivedExpanded(next);
+            if (next) onLoadArchived?.();
+          }}
+          className="flex h-full w-full items-center gap-1.5 rounded-md px-2 text-left text-section text-muted outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          {item.expanded ? (
+            <ChevronDown size={14} className="shrink-0 text-faint" />
+          ) : (
+            <ChevronRight size={14} className="shrink-0 text-faint" />
+          )}
+          <Archive size={14} className="shrink-0 text-faint" />
+          <span className="min-w-0 flex-1 truncate">已归档</span>
+          <span className="shrink-0 text-caption text-faint">{item.count}</span>
+        </button>
+      );
+    }
+    return null;
+  };
+
   return (
-    <aside className="flex h-full w-[268px] shrink-0 flex-col bg-sidebar">
+    <aside
+      className={cn(
+        "relative flex h-full shrink-0 flex-col bg-sidebar",
+        width == null && "w-[268px]",
+        resizing && "select-none",
+      )}
+      style={width != null ? { width } : undefined}
+    >
+      {onResizeStart && (
+        <div
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="调整侧栏宽度"
+          data-testid="sidebar-resize-handle"
+          onPointerDown={onResizeStart}
+          className={cn(
+            "absolute inset-y-0 right-0 z-10 hidden w-1 cursor-col-resize touch-none md:block",
+            resizing && "bg-accent/40",
+          )}
+        />
+      )}
       <div className="flex flex-col gap-2 p-3" data-product-entry-scope="sidebar-primary">
         <div className="flex items-center justify-between px-1.5 pb-1">
           <div className="flex items-center gap-2">
@@ -272,184 +616,33 @@ export function Sidebar({
             value={q}
             onChange={(e) => setQ(e.target.value)}
             placeholder="搜索会话"
-            // 表单控件红线：窄屏必须 ≥16px。侧栏在移动端是抽屉，13.5px 的搜索框一聚焦
-            // 就会被 iOS Safari 放大整页且不回弹；桌面段 md:text-sm 保持原视觉密度。
             className="w-full bg-transparent text-base text-fg outline-none placeholder:text-faint md:text-sm"
           />
         </div>
       </div>
 
-      <div
+      {multiSelect && selectedIds.size > 0 && onBatch && (
+        <BatchBar
+          count={selectedIds.size}
+          projects={orderedProjects}
+          onAction={(action, projectId) => {
+            onBatch([...selectedIds], action, projectId);
+            clearMulti();
+          }}
+          onCancel={clearMulti}
+        />
+      )}
+
+      <VirtualList
+        items={flatItems}
+        threshold={virtualizeThreshold}
+        onEndReached={hasMore && !searching ? onLoadMore : undefined}
+        renderItem={renderFlat}
         className="no-scrollbar flex-1 overflow-y-auto px-2 pb-3"
-        data-product-feature={PRODUCT_CAPABILITIES.sessions.id}
-      >
-        {sessions.length === 0 && !searching && (!showProjects || (projects?.length ?? 0) === 0) && (
-          <p className="px-3 py-6 text-center text-body text-faint">暂无会话</p>
-        )}
-        {searching && filtered.length === 0 && (
-          <p className="px-3 py-6 text-center text-body text-faint">没有匹配的会话</p>
-        )}
-
-        {pinned.length > 0 && (
-          <SessionGroup
-            label="置顶"
-            items={pinned}
-            activeId={activeId}
-            projects={projects ?? []}
-            isSending={isSending}
-            liveTerminal={liveTerminal}
-            onSelect={onSelect}
-            onRename={onRename}
-            onDelete={onDelete}
-            onTogglePin={onTogglePin}
-            onMoveToProject={onMoveToProject}
-          />
-        )}
-
-        {showProjects && !searching && (
-          <div className="mb-1">
-            <div className="flex items-center gap-1 px-2 pb-1 pt-3">
-              <div className="min-w-0 flex-1 truncate px-1 text-caption font-medium uppercase tracking-wide text-faint">
-                项目
-              </div>
-              {onCreateProject && (
-                <IconButton
-                  aria-label="新建项目"
-                  variant="muted"
-                  size="xs"
-                  shape="square"
-                  onClick={onCreateProject}
-                >
-                  <Plus size={13} />
-                </IconButton>
-              )}
-            </div>
-            {(projects?.length ?? 0) === 0 && (
-              <p className="px-3 py-2 text-caption text-faint">还没有项目</p>
-            )}
-            {projects?.map((p) => {
-              const items = projectSessions.get(p.id) ?? [];
-              const count = sessions.filter((s) => s.projectId === p.id).length;
-              const collapsed = collapsedProjectIds?.has(p.id) ?? false;
-              const dropActive = dragOverProjectId === p.id;
-              return (
-                <div key={p.id} className="mb-0.5">
-                  <div
-                    onDragOver={(e) => {
-                      if (![...e.dataTransfer.types].includes(SESSION_DRAG_TYPE)) return;
-                      e.preventDefault();
-                      setDragOverProjectId(p.id);
-                    }}
-                    onDragLeave={() => {
-                      setDragOverProjectId((cur) => (cur === p.id ? null : cur));
-                    }}
-                    onDrop={(e) => {
-                      e.preventDefault();
-                      setDragOverProjectId(null);
-                      const id = e.dataTransfer.getData(SESSION_DRAG_TYPE);
-                      const sess = sessions.find((x) => x.id === id);
-                      if (sess && onMoveToProject) onMoveToProject(sess, p.id);
-                    }}
-                    className={cn(
-                      "group relative flex items-center gap-0.5 rounded-md pr-1 text-section transition-colors",
-                      dropActive ? "bg-accent-soft text-fg ring-1 ring-accent/40" : "text-muted hover:bg-hover hover:text-fg",
-                    )}
-                  >
-                    <button
-                      type="button"
-                      onClick={() => onToggleProjectCollapsed?.(p.id)}
-                      aria-expanded={!collapsed}
-                      className="flex min-w-0 flex-1 items-center gap-1.5 rounded-md px-2 py-1.5 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                    >
-                      {collapsed ? (
-                        <ChevronRight size={14} className="shrink-0 text-faint" />
-                      ) : (
-                        <ChevronDown size={14} className="shrink-0 text-faint" />
-                      )}
-                      <Folder size={14} className="shrink-0 text-faint" />
-                      <span className="min-w-0 flex-1 truncate">{p.name}</span>
-                      <span className="shrink-0 text-caption text-faint">{count}</span>
-                    </button>
-                    {(onRenameProject || onDeleteProject) && (
-                      <DropdownMenu>
-                        <DropdownMenuTrigger asChild>
-                          <IconButton
-                            aria-label={`项目 ${p.name} 更多`}
-                            variant="muted"
-                            size="xs"
-                            shape="square"
-                            className="opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 data-[state=open]:opacity-100 [@media(hover:none)]:opacity-100"
-                          >
-                            <MoreHorizontal size={13} />
-                          </IconButton>
-                        </DropdownMenuTrigger>
-                        <DropdownMenuContent align="end" className="w-44">
-                          {onRenameProject && (
-                            <DropdownMenuItem onSelect={() => onRenameProject(p)}>重命名</DropdownMenuItem>
-                          )}
-                          {onDeleteProject && (
-                            <DropdownMenuItem destructive onSelect={() => onDeleteProject(p)}>
-                              删除
-                            </DropdownMenuItem>
-                          )}
-                        </DropdownMenuContent>
-                      </DropdownMenu>
-                    )}
-                  </div>
-                  {!collapsed && (
-                    <div className="ml-3 border-l border-border pl-1">
-                      {items.length === 0 && (
-                        <p className="px-3 py-2 text-caption text-faint">暂无会话</p>
-                      )}
-                      {items.map((s) => (
-                        <SessionRow
-                          key={s.id}
-                          session={s}
-                          active={s.id === activeId}
-                          projects={projects ?? []}
-                          indent
-                          isSending={isSending}
-                          liveTerminal={liveTerminal}
-                          onSelect={onSelect}
-                          onRename={onRename}
-                          onDelete={onDelete}
-                          onTogglePin={onTogglePin}
-                          onMoveToProject={onMoveToProject}
-                        />
-                      ))}
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        )}
-
-        {!searching &&
-          sessions.length > 0 &&
-          ungroupedGroups.length === 0 &&
-          pinned.length === 0 &&
-          showProjects && (
-            <p className="px-3 py-4 text-center text-caption text-faint">没有未分组的会话</p>
-          )}
-
-        {ungroupedGroups.map(([label, items]) => (
-          <SessionGroup
-            key={label}
-            label={searching ? undefined : label}
-            items={items}
-            activeId={activeId}
-            projects={projects ?? []}
-            isSending={isSending}
-            liveTerminal={liveTerminal}
-            onSelect={onSelect}
-            onRename={onRename}
-            onDelete={onDelete}
-            onTogglePin={onTogglePin}
-            onMoveToProject={onMoveToProject}
-          />
-        ))}
-      </div>
+      />
+      {loadingMore && (
+        <p className="px-3 pb-2 text-center text-caption text-faint">加载更多…</p>
+      )}
 
       <div
         className="flex items-center gap-1 border-t border-border px-2 pt-2 sidebar-foot-safe-b"
@@ -575,170 +768,5 @@ export function Sidebar({
         {theme && onCycleTheme && <ThemeToggle theme={theme} onCycle={onCycleTheme} />}
       </div>
     </aside>
-  );
-}
-
-function SessionGroup({
-  label,
-  items,
-  activeId,
-  projects,
-  isSending,
-  liveTerminal,
-  onSelect,
-  onRename,
-  onDelete,
-  onTogglePin,
-  onMoveToProject,
-}: {
-  label?: string;
-  items: Session[];
-  activeId?: string;
-  projects: ChatProject[];
-  isSending?: (id: string) => boolean;
-  liveTerminal?: (id: string) => { lastOutcome?: string | null; lastErrorCode?: string | null } | undefined;
-  onSelect: (id: string) => void;
-  onRename: (s: Session) => void;
-  onDelete: (s: Session) => void;
-  onTogglePin?: (s: Session) => void;
-  onMoveToProject?: (s: Session, projectId: string | null) => void;
-}) {
-  return (
-    <div className="mb-1">
-      {label && (
-        <div className="px-3 pb-1 pt-3 text-caption font-medium uppercase tracking-wide text-faint">
-          {label}
-        </div>
-      )}
-      {items.map((s) => (
-        <SessionRow
-          key={s.id}
-          session={s}
-          active={s.id === activeId}
-          projects={projects}
-          isSending={isSending}
-          liveTerminal={liveTerminal}
-          onSelect={onSelect}
-          onRename={onRename}
-          onDelete={onDelete}
-          onTogglePin={onTogglePin}
-          onMoveToProject={onMoveToProject}
-        />
-      ))}
-    </div>
-  );
-}
-
-function SessionRow({
-  session: s,
-  active,
-  projects,
-  indent,
-  isSending,
-  liveTerminal,
-  onSelect,
-  onRename,
-  onDelete,
-  onTogglePin,
-  onMoveToProject,
-}: {
-  session: Session;
-  active: boolean;
-  projects: ChatProject[];
-  indent?: boolean;
-  isSending?: (id: string) => boolean;
-  liveTerminal?: (id: string) => { lastOutcome?: string | null; lastErrorCode?: string | null } | undefined;
-  onSelect: (id: string) => void;
-  onRename: (s: Session) => void;
-  onDelete: (s: Session) => void;
-  onTogglePin?: (s: Session) => void;
-  onMoveToProject?: (s: Session, projectId: string | null) => void;
-}) {
-  const live = liveTerminal?.(s.id);
-  const sending = Boolean(isSending?.(s.id));
-  const running = sending || (s.runState === "running" && !live);
-  return (
-    // 会话行键盘可达:选中区是真 <button>(Tab 聚焦 + Enter/Space 激活 + aria-current),
-    // 操作区 group-focus-within 显形。嵌套按钮非法,故行容器保持 div。
-    <div
-      draggable={Boolean(onMoveToProject)}
-      onDragStart={(e) => {
-        e.dataTransfer.setData(SESSION_DRAG_TYPE, s.id);
-        e.dataTransfer.effectAllowed = "move";
-      }}
-      className={cn(
-        "group relative flex items-center gap-1 rounded-md pr-1 text-section transition-colors",
-        indent && "pl-1",
-        active ? "bg-active text-fg" : "text-muted hover:bg-hover hover:text-fg",
-      )}
-    >
-      {active && (
-        <span aria-hidden className="absolute inset-y-1 left-0 w-0.5 rounded-full bg-accent" />
-      )}
-      <button
-        type="button"
-        onClick={() => onSelect(s.id)}
-        aria-current={active ? "true" : undefined}
-        className="min-w-0 flex-1 truncate rounded-md px-3 py-1.5 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:py-2"
-      >
-        {s.title || "新对话"}
-      </button>
-      <SessionStatusDot
-        running={running}
-        lastOutcome={live?.lastOutcome ?? s.lastOutcome}
-        lastErrorCode={live?.lastErrorCode ?? s.lastErrorCode}
-      />
-      <DropdownMenu>
-        <DropdownMenuTrigger asChild>
-          <IconButton
-            aria-label="更多"
-            variant="muted"
-            size="xs"
-            shape="square"
-            className="opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100 data-[state=open]:opacity-100 [@media(hover:none)]:opacity-100"
-          >
-            <MoreHorizontal size={13} />
-          </IconButton>
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="w-44" onCloseAutoFocus={(e) => e.preventDefault()}>
-          <DropdownMenuItem onSelect={() => onRename(s)}>重命名</DropdownMenuItem>
-          {onTogglePin && (
-            <DropdownMenuItem onSelect={() => onTogglePin(s)}>
-              <Pin size={14} className="shrink-0 text-muted" />
-              {s.pinned ? "取消置顶" : "置顶"}
-            </DropdownMenuItem>
-          )}
-          {onMoveToProject && (
-            <DropdownMenuSub>
-              <DropdownMenuSubTrigger>移动到项目</DropdownMenuSubTrigger>
-              <DropdownMenuSubContent className="w-44">
-                {projects.length === 0 && (
-                  <DropdownMenuItem disabled>还没有项目</DropdownMenuItem>
-                )}
-                {projects.map((p) => (
-                  <DropdownMenuItem
-                    key={p.id}
-                    disabled={s.projectId === p.id}
-                    onSelect={() => onMoveToProject(s, p.id)}
-                  >
-                    {p.name}
-                  </DropdownMenuItem>
-                ))}
-                {s.projectId && (
-                  <>
-                    <DropdownMenuSeparator />
-                    <DropdownMenuItem onSelect={() => onMoveToProject(s, null)}>移出项目</DropdownMenuItem>
-                  </>
-                )}
-              </DropdownMenuSubContent>
-            </DropdownMenuSub>
-          )}
-          <DropdownMenuSeparator />
-          <DropdownMenuItem destructive onSelect={() => onDelete(s)}>
-            删除
-          </DropdownMenuItem>
-        </DropdownMenuContent>
-      </DropdownMenu>
-    </div>
   );
 }

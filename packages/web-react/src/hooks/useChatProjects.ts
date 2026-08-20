@@ -54,6 +54,11 @@ export type UseChatProjects = {
   createProjectPrompt: () => Promise<void>;
   renameProjectPrompt: (p: ChatProject) => Promise<void>;
   deleteProjectConfirm: (p: ChatProject) => Promise<void>;
+  updateProject: (
+    id: string,
+    patch: { name?: string; color?: string | null; instructions?: string | null },
+  ) => Promise<void>;
+  reorderProjects: (orderedIds: string[]) => Promise<void>;
 };
 
 /**
@@ -183,6 +188,67 @@ export function useChatProjects(opts: UseChatProjectsOptions): UseChatProjects {
     [demo, projects, toast],
   );
 
+  const updateProject = useCallback(
+    async (
+      id: string,
+      patch: { name?: string; color?: string | null; instructions?: string | null },
+    ) => {
+      let snapshot: ChatProject[] = [];
+      setProjects((c) => {
+        snapshot = c;
+        return c.map((p) => (p.id === id ? { ...p, ...patch, updatedAt: Date.now() } : p));
+      });
+      if (demo || !cbRef.current.auth) return;
+      try {
+        const updated = await api.patchChatProject(cbRef.current.authSession, id, patch);
+        setProjects((c) => c.map((x) => (x.id === id ? { ...x, ...updated } : x)));
+      } catch (e) {
+        setProjects(snapshot);
+        console.warn("patchChatProject failed", e);
+        toast("更新项目失败，已恢复", "error");
+        throw e;
+      }
+    },
+    [demo, toast],
+  );
+
+  const reorderProjects = useCallback(
+    async (orderedIds: string[]) => {
+      const snapshot = projects;
+      const byId = new Map(snapshot.map((p) => [p.id, p]));
+      const seen = new Set<string>();
+      const next: ChatProject[] = [];
+      for (const id of orderedIds) {
+        const p = byId.get(id);
+        if (!p || seen.has(id)) continue;
+        seen.add(id);
+        next.push({ ...p, sortOrder: seen.size - 1, updatedAt: Date.now() });
+      }
+      for (const p of snapshot) {
+        if (!seen.has(p.id)) next.push(p);
+      }
+      setProjects(next);
+      if (demo || !cbRef.current.auth) return;
+      const ids = [...seen];
+      try {
+        await Promise.all(
+          ids.map((id, i) => api.patchChatProject(cbRef.current.authSession, id, { sortOrder: i })),
+        );
+      } catch (e) {
+        setProjects(snapshot);
+        void Promise.allSettled(
+          snapshot.map((p) =>
+            api.patchChatProject(cbRef.current.authSession, p.id, { sortOrder: p.sortOrder }),
+          ),
+        );
+        console.warn("reorderChatProjects failed", e);
+        toast("调整项目顺序失败，已恢复", "error");
+        throw e;
+      }
+    },
+    [demo, projects, toast],
+  );
+
   return {
     projects,
     collapsedIds,
@@ -190,5 +256,7 @@ export function useChatProjects(opts: UseChatProjectsOptions): UseChatProjects {
     createProjectPrompt,
     renameProjectPrompt,
     deleteProjectConfirm,
+    updateProject,
+    reorderProjects,
   };
 }

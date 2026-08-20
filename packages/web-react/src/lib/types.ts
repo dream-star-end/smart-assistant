@@ -88,6 +88,12 @@ export type Session = {
   runState?: SessionRunState;
   lastOutcome?: SessionLastOutcome | null;
   lastErrorCode?: string | null;
+  /** 已归档。默认列表不展示；侧栏「已归档」分组展开后可见。 */
+  archived?: boolean;
+  /** 最后一条消息纯文本前 80 字（listSessions 新字段；缺省则会话行不占摘要位）。 */
+  lastMessagePreview?: string;
+  /** 服务端 lastAt（epoch ms）。分页游标 `before=` 用它；缺省则回落 Date.parse(updatedAt)。 */
+  lastAt?: number;
 };
 
 /** GET /api/chat-projects → { projects: ChatProject[] } */
@@ -102,11 +108,54 @@ export type ChatProject = {
   sessionCount: number;
 };
 
-/** PATCH /api/sessions/:id 元数据（title / 归属 / 置顶）。后端若换成 /meta，只改 api.patchSessionMeta。 */
+/** PATCH /api/sessions/:id 元数据（title / 归属 / 置顶 / 归档）。后端若换成 /meta，只改 api.patchSessionMeta。 */
 export type PatchSessionMetaInput = {
   title?: string;
   projectId?: string | null;
   pinned?: boolean;
+  archived?: boolean;
+};
+
+/** GET /api/sessions/list 可选分页。不传时后端行为与全量列表一致。 */
+export type SessionListQuery = {
+  limit?: number;
+  /** 上一页最老一条的 lastAt（毫秒）。 */
+  before?: number;
+  includeArchived?: boolean;
+};
+
+/** GET /api/sessions/list 分页信封。无参请求也可能带 nextCursor（新后端）。 */
+export type SessionListPage = {
+  sessions: SessionMeta[];
+  nextCursor?: number;
+};
+
+/** GET /api/sessions/search 单条命中。 */
+export type SessionSearchHit = {
+  sessionId: string;
+  title: string;
+  projectId?: string | null;
+  snippet: string;
+  matchedAt: number;
+  kind: "title" | "message";
+};
+
+export type SessionSearchResponse = {
+  results: SessionSearchHit[];
+};
+
+export type SessionBatchAction = "archive" | "unarchive" | "delete" | "move";
+
+/** POST /api/sessions/batch */
+export type SessionBatchInput = {
+  ids: string[];
+  action: SessionBatchAction;
+  projectId?: string | null;
+};
+
+export type SessionBatchResult = {
+  ok: true;
+  updated: number;
 };
 
 export type Message = {
@@ -328,6 +377,8 @@ export type SessionMeta = {
   runState?: SessionRunState;
   lastOutcome?: SessionLastOutcome | null;
   lastErrorCode?: string | null;
+  archived?: boolean;
+  lastMessagePreview?: string;
 };
 
 /**

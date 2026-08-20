@@ -4,7 +4,15 @@ import { ApiError, api } from "../lib/api";
 import type { ChatMessage } from "../lib/chat/model";
 import { DEMO_SESSIONS } from "../lib/demo";
 import type { StoredSession } from "../lib/persist";
-import type { AuthSession, Session, SessionLastOutcome, SessionMeta, User } from "../lib/types";
+import type {
+  AuthSession,
+  Session,
+  SessionBatchAction,
+  SessionLastOutcome,
+  SessionMeta,
+  SessionSearchHit,
+  User,
+} from "../lib/types";
 import type { UseChatSocket } from "./useChatSocket";
 
 /** 历史重拉冷却（S2）：同会话此窗口内只拉一次；过后允许增量重拉（sinceSeq + server-wins 幂等）。*/
@@ -55,10 +63,27 @@ function metaToSession(m: SessionMeta, ownerUserId: string): Session {
     runState: m.runState === "running" ? "running" : "idle",
     lastOutcome: m.lastOutcome ?? null,
     lastErrorCode: m.lastErrorCode ?? null,
+    archived: m.archived === true,
+    lastAt: m.lastAt,
     // 服务端无值(该会话从未显式选过/PATCH 尚未落地)= 键缺席,server-wins 合并不清掉本地意图。
     ...(m.modelId ? { modelId: m.modelId } : {}),
     ...(m.agentId ? { agentId: m.agentId } : {}),
+    ...(m.lastMessagePreview ? { lastMessagePreview: m.lastMessagePreview } : {}),
   };
+}
+
+/** 分页游标：优先服务端 lastAt，否则从 updatedAt 解析。 */
+export function sessionCursorAt(s: Session): number {
+  if (typeof s.lastAt === "number" && Number.isFinite(s.lastAt)) return s.lastAt;
+  const n = Date.parse(s.updatedAt);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function isAbortError(e: unknown): boolean {
+  return (
+    (e instanceof DOMException && e.name === "AbortError") ||
+    (e instanceof Error && e.name === "AbortError")
+  );
 }
 
 /**
@@ -131,6 +156,22 @@ export type UseSessionList = {
   deleteSessionConfirm: (s: Session) => Promise<void>;
   togglePinSession: (s: Session) => Promise<void>;
   moveSessionToProject: (s: Session, projectId: string | null) => Promise<void>;
+  toggleArchiveSession: (s: Session) => Promise<void>;
+  /** 批量归档 / 取消归档 / 删除 / 移动。删除会二次确认并写明条数。 */
+  batchUpdateSessions: (
+    ids: string[],
+    action: SessionBatchAction,
+    projectId?: string | null,
+  ) => Promise<void>;
+  /** 滚到底部：`before=<最老一条 lastAt>` 追加去重。没有 nextCursor 则停。 */
+  loadMoreSessions: () => Promise<void>;
+  hasMoreSessions: boolean;
+  loadingMoreSessions: boolean;
+  /** 展开「已归档」时用 includeArchived=1 拉取并合并。 */
+  loadArchivedSessions: () => Promise<void>;
+  loadingArchived: boolean;
+  /** 服务端全文搜索（消息命中）。调用方负责防抖与 AbortController。 */
+  searchSessionMessages: (q: string, signal: AbortSignal) => Promise<SessionSearchHit[]>;
   applySessionTerminal: (
     sessId: string,
     terminal: { lastOutcome: SessionLastOutcome; lastErrorCode: string | null } | null,
@@ -453,6 +494,12 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
 
   // listSessions 是否已落定（成功或失败都算）：URL 深链恢复用它判定"等无可等"。
   const [serverListSettled, setServerListSettled] = useState(false);
+  const [hasMoreSessions, setHasMoreSessions] = useState(true);
+  const [loadingMoreSessions, setLoadingMoreSessions] = useState(false);
+  const [loadingArchived, setLoadingArchived] = useState(false);
+  const nextCursorRef = useRef<number | undefined>(undefined);
+  const loadMoreInflightRef = useRef(false);
+  const archivedFetchedRef = useRef(false);
 
   // 历史会话列表：登录后用 listSessions 填侧栏（server canonical 元数据 server-wins）。
   // 失败保留本地（IndexedDB 注水）会话，不阻断。
@@ -474,6 +521,9 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
           return s;
         });
         setSessions((cur) => upsertSessions(cur, server, true));
+        // 无参首屏不带 nextCursor；允许滚到底后试探一页。空列表则停。
+        nextCursorRef.current = undefined;
+        setHasMoreSessions(server.length > 0);
       })
       .catch(() => {
         /* 列表失败：保留本地会话，不打断工作区 */
@@ -550,7 +600,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
 
   const patchSessionMetaOptimistic = async (
     s: Session,
-    patch: { pinned?: boolean; projectId?: string | null },
+    patch: { pinned?: boolean; projectId?: string | null; archived?: boolean },
     next: Session,
   ) => {
     setSessions((c) => c.map((x) => (x.id === s.id ? next : x)));
@@ -572,6 +622,167 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
   const moveSessionToProject = async (s: Session, projectId: string | null) => {
     if ((s.projectId ?? null) === projectId) return;
     await patchSessionMetaOptimistic(s, { projectId }, { ...s, projectId });
+  };
+
+  const toggleArchiveSession = async (s: Session) => {
+    const archived = !s.archived;
+    await patchSessionMetaOptimistic(s, { archived }, { ...s, archived });
+  };
+
+  const forgetSessionLocal = (id: string) => {
+    historyFetchedAtRef.current.delete(id);
+    historyFetchingRef.current.delete(id);
+    setHistoryLoadingTokens((current) => {
+      if (!current.has(id)) return current;
+      const next = new Map(current);
+      next.delete(id);
+      return next;
+    });
+    modelSyncRef.current.delete(id);
+    cbRef.current.onDeleteSession?.(id);
+    if (!demo) {
+      cbRef.current.sockRef.current?.removeSession(id);
+      cbRef.current.sockRef.current?.removePersisted(id);
+    }
+  };
+
+  const batchUpdateSessions = async (
+    ids: string[],
+    action: SessionBatchAction,
+    projectId?: string | null,
+  ) => {
+    const unique = [...new Set(ids)].filter(Boolean);
+    if (unique.length === 0) return;
+    if (action === "delete") {
+      const ok = await cbRef.current.confirmDialog({
+        title: `删除 ${unique.length} 条会话?`,
+        body: `将删除 ${unique.length} 条会话的本地与云端记录，不可恢复。`,
+        confirmText: "删除",
+        danger: true,
+      });
+      if (!ok) return;
+    }
+    const snapshot = sessions.filter((s) => unique.includes(s.id));
+    if (snapshot.length === 0) return;
+    const idSet = new Set(unique);
+    const deletedActive = action === "delete" && Boolean(activeId && idSet.has(activeId));
+    setSessions((c) => {
+      if (action === "delete") return c.filter((s) => !idSet.has(s.id));
+      return c.map((s) => {
+        if (!idSet.has(s.id)) return s;
+        if (action === "archive") return { ...s, archived: true };
+        if (action === "unarchive") return { ...s, archived: false };
+        if (action === "move") return { ...s, projectId: projectId ?? null };
+        return s;
+      });
+    });
+    if (deletedActive) {
+      setActiveId(undefined);
+      cbRef.current.onActiveSessionDeleted();
+    }
+    if (demo) {
+      if (action === "delete") for (const id of unique) forgetSessionLocal(id);
+      return;
+    }
+    try {
+      await api.batchSessions(cbRef.current.authSession, {
+        ids: unique,
+        action,
+        ...(action === "move" ? { projectId: projectId ?? null } : {}),
+      });
+      if (action === "delete") for (const id of unique) forgetSessionLocal(id);
+    } catch (e) {
+      setSessions((c) => {
+        const map = new Map(c.map((s) => [s.id, s]));
+        for (const s of snapshot) map.set(s.id, s);
+        return [...map.values()].sort((a, b) =>
+          a.updatedAt < b.updatedAt ? 1 : a.updatedAt > b.updatedAt ? -1 : 0,
+        );
+      });
+      console.warn("batchSessions failed", e);
+      toast("操作失败，已恢复", "error");
+    }
+  };
+
+  const loadMoreSessions = async () => {
+    if (demo || !auth || !user || loadMoreInflightRef.current || !hasMoreSessions) return;
+    const live = sessions.filter((s) => !s.archived);
+    const oldest = live.length
+      ? Math.min(...live.map(sessionCursorAt))
+      : nextCursorRef.current;
+    if (oldest == null || oldest <= 0) {
+      setHasMoreSessions(false);
+      return;
+    }
+    loadMoreInflightRef.current = true;
+    setLoadingMoreSessions(true);
+    try {
+      const page = await api.listSessionsPage(cbRef.current.authSession, {
+        limit: 50,
+        before: nextCursorRef.current ?? oldest,
+      });
+      const incoming = page.sessions.map((m) => {
+        const s = metaToSession(m, user.id);
+        if (s.modelId !== undefined && !modelPayloadFresh(m.id, m.updatedAt)) {
+          const { modelId: _stale, ...rest } = s;
+          return rest;
+        }
+        return s;
+      });
+      setSessions((cur) => upsertSessions(cur, incoming, true));
+      nextCursorRef.current = page.nextCursor;
+      setHasMoreSessions(page.nextCursor != null && incoming.length > 0);
+    } catch (e) {
+      console.warn("listSessionsPage failed", e);
+      setHasMoreSessions(false);
+    } finally {
+      loadMoreInflightRef.current = false;
+      setLoadingMoreSessions(false);
+    }
+  };
+
+  const loadArchivedSessions = async () => {
+    if (demo || !auth || !user || archivedFetchedRef.current) return;
+    archivedFetchedRef.current = true;
+    setLoadingArchived(true);
+    try {
+      const page = await api.listSessionsPage(cbRef.current.authSession, {
+        includeArchived: true,
+      });
+      const incoming = page.sessions.map((m) => {
+        const s = metaToSession(m, user.id);
+        if (s.modelId !== undefined && !modelPayloadFresh(m.id, m.updatedAt)) {
+          const { modelId: _stale, ...rest } = s;
+          return rest;
+        }
+        return s;
+      });
+      setSessions((cur) => upsertSessions(cur, incoming, true));
+    } catch (e) {
+      archivedFetchedRef.current = false;
+      console.warn("loadArchivedSessions failed", e);
+      toast("无法加载已归档会话", "error");
+    } finally {
+      setLoadingArchived(false);
+    }
+  };
+
+  const searchSessionMessages = async (
+    q: string,
+    signal: AbortSignal,
+  ): Promise<SessionSearchHit[]> => {
+    if (demo || !auth || !q.trim()) return [];
+    try {
+      const res = await api.searchSessions(cbRef.current.authSession, q.trim(), {
+        limit: 30,
+        includeArchived: false,
+        signal,
+      });
+      return res.results.filter((hit) => hit.kind === "message");
+    } catch (e) {
+      if (isAbortError(e) || signal.aborted) return [];
+      throw e;
+    }
   };
 
   const applySessionTerminal = useCallback(
@@ -608,6 +819,11 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     setHistoryErrorBySession(new Map());
     modelSyncRef.current.clear();
     autoSelectedRef.current = false; // 下次登录重新自动选中最近会话
+    nextCursorRef.current = undefined;
+    archivedFetchedRef.current = false;
+    setHasMoreSessions(true);
+    setLoadingMoreSessions(false);
+    setLoadingArchived(false);
     setSessions([]);
     setActiveId(undefined);
     setServerListSettled(false); // 重新登录后 listSessions 重新落定
@@ -626,6 +842,14 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     deleteSessionConfirm,
     togglePinSession,
     moveSessionToProject,
+    toggleArchiveSession,
+    batchUpdateSessions,
+    loadMoreSessions,
+    hasMoreSessions,
+    loadingMoreSessions,
+    loadArchivedSessions,
+    loadingArchived,
+    searchSessionMessages,
     applySessionTerminal,
     reset,
     serverListSettled,

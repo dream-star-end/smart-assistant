@@ -697,7 +697,7 @@ describe("pgSessionsBackend contract", () => {
     await backend.upsertClientSession(mkSession({ modelId: "kimi-k3" }));
     const got = await backend.getClientSession("s-1", "u-1");
     assert.equal(got?.modelId, "kimi-k3");
-    assert.equal((await backend.listClientSessions("u-1")).find((s) => s.id === "s-1")?.modelId, "kimi-k3");
+    assert.equal((await backend.listClientSessions("u-1")).sessions.find((s) => s.id === "s-1")?.modelId, "kimi-k3");
     assert.equal((await backend.getClientSessionPartial("s-1", "u-1", 0))?.modelId, "kimi-k3");
 
     // 全量 PUT 未携带 → COALESCE 保留(SQLite 侧同语义,见 storage sessionsClientModel.test)
@@ -740,7 +740,7 @@ describe("pgSessionsBackend contract", () => {
     const listed = await backend.listChatProjects("u-1");
     assert.equal(listed.find((p) => p.id === created.project.id)?.sessionCount, 1);
 
-    const meta = (await backend.listClientSessions("u-1")).find((s) => s.id === "s-proj-1");
+    const meta = (await backend.listClientSessions("u-1")).sessions.find((s) => s.id === "s-proj-1");
     assert.equal(meta?.projectId, created.project.id);
     assert.equal(meta?.pinned, true);
     assert.equal(meta?.runState, "idle");
@@ -754,7 +754,7 @@ describe("pgSessionsBackend contract", () => {
     assert.equal(del.ok, true);
     const after = await backend.getClientSession("s-proj-1", "u-1");
     assert.ok(after, "删除项目不得级联删会话");
-    const meta2 = (await backend.listClientSessions("u-1")).find((s) => s.id === "s-proj-1");
+    const meta2 = (await backend.listClientSessions("u-1")).sessions.find((s) => s.id === "s-proj-1");
     assert.equal(meta2?.projectId, null);
     assert.equal((await backend.listChatProjects("u-1")).length, 0);
   });

@@ -282,6 +282,8 @@ export interface CodexLaunchOverridesContext {
    *  从系统提示中就知道当前绑定到哪个项目;非 ready / null 时 REPO slot 不输出。
    *  无 sessionId 注入(legacy 路径)的 caller 直接传 undefined。 */
   repoSnapshot?: RepoSnapshot | null
+  /** 当前 client session id,用于注入 PROJECT 项目指令 slot。 */
+  sessionId?: string
 }
 
 export interface CodexLaunchOverrides {
@@ -364,6 +366,7 @@ export async function buildCodexLaunchOverrides(
     // codex 路径补齐,让 codex 子进程也看到 REPO slot(系统提示里的仓库元信息)。
     repoSnapshot: ctx.repoSnapshot ?? undefined,
     availableMcpTools,
+    sessionId: ctx.sessionId,
   })
   // preamble 从 platform bundle 取(商业版真热),env 未设(个人版)回落 CODEX_PREAMBLE 常量。
   const preamble = getPlatformPrompt('codex-preamble', CODEX_PREAMBLE)

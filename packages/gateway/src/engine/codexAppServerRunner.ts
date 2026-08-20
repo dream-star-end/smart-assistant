@@ -1652,6 +1652,7 @@ export class CodexAppServerRunner extends EventEmitter {
         // Phase 5:把 turn 顶部的 snapshot 一路透传到 buildPromptContext 的 REPO slot,
         // 让 codex 系统提示中带上仓库元信息(parity with SubprocessRunner)。
         repoSnapshot: repoSnap,
+        sessionId: this.opts.sessionId,
       })
       writeFileSync(overrides.instructionsFile, overrides.instructionsContent, 'utf8')
       // v3 hardening — see codexRunner.ts for rationale (token never in argv).

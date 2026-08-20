@@ -377,6 +377,7 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
         availableMcpTools: mcpEntry ? [...OPENCLAUDE_MEMORY_MCP_TOOLS] : [],
         skillEvalExclude: this.opts.skillEvalExclude,
         skillEvalDraft: this.opts.skillEvalDraft,
+        sessionId: typeof this.opts.sessionId === 'string' ? this.opts.sessionId : undefined,
       })
       return platform.content ? `${platform.content}\n\n${input}` : input
     } catch {

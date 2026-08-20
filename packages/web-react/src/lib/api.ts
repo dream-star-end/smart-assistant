@@ -61,6 +61,11 @@ import type {
   PublicConfig,
   PublicModel,
   PatchSessionMetaInput,
+  SessionBatchInput,
+  SessionBatchResult,
+  SessionListPage,
+  SessionListQuery,
+  SessionSearchResponse,
   PutSessionInput,
   PutSessionResult,
   ChatProject,
@@ -1609,13 +1614,69 @@ export const api = {
 
   // ── 会话历史（权威源 = gateway，camelCase wire；走 Bearer + callWithRefresh） ──
 
-  /** 列出我的会话（GET /api/sessions/list，Bearer）。无 messages 的元数据列表。 */
+  /** 列出我的会话（GET /api/sessions/list，Bearer）。无 messages 的元数据列表。
+   *  无参时与历史行为一致（返回数组，忽略 nextCursor），供既有调用方 / App 测试桩继续工作。 */
   listSessions: (a: AuthSession): Promise<SessionMeta[]> =>
-    jsonOrThrow<{ sessions: SessionMeta[] }>(
+    api.listSessionsPage(a).then((page) => page.sessions),
+
+  /**
+   * 会话列表分页（GET /api/sessions/list?limit=&before=&includeArchived=1）。
+   * 不传 query 时后端行为与全量列表一致；有 nextCursor 则可继续用 before 拉下一页。
+   */
+  listSessionsPage: (a: AuthSession, query?: SessionListQuery): Promise<SessionListPage> => {
+    const params = new URLSearchParams();
+    if (query?.limit != null) params.set("limit", String(query.limit));
+    if (query?.before != null) params.set("before", String(query.before));
+    if (query?.includeArchived) params.set("includeArchived", "1");
+    const qs = params.toString();
+    return jsonOrThrow<{ sessions: SessionMeta[]; nextCursor?: number }>(
       callWithRefresh(a, (t) =>
-        fetch("/api/sessions/list", { credentials: "include", headers: bearerHeaders(t) }),
+        fetch(`/api/sessions/list${qs ? `?${qs}` : ""}`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
       ),
-    ).then((b) => b.sessions || []),
+    ).then((b) => ({ sessions: b.sessions || [], nextCursor: b.nextCursor }));
+  },
+
+  /**
+   * 全文搜索会话（GET /api/sessions/search?q=&limit=30&includeArchived=0）。
+   * signal 用于输入变更取消在途请求。
+   */
+  searchSessions: (
+    a: AuthSession,
+    q: string,
+    opts?: { limit?: number; includeArchived?: boolean; signal?: AbortSignal },
+  ): Promise<SessionSearchResponse> => {
+    const params = new URLSearchParams();
+    params.set("q", q);
+    params.set("limit", String(opts?.limit ?? 30));
+    params.set("includeArchived", opts?.includeArchived ? "1" : "0");
+    return jsonOrThrow<SessionSearchResponse>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/sessions/search?${params.toString()}`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+          signal: opts?.signal,
+        }),
+      ),
+    ).then((b) => ({ results: Array.isArray(b.results) ? b.results : [] }));
+  },
+
+  /**
+   * 批量归档 / 取消归档 / 删除 / 移动项目（POST /api/sessions/batch）。
+   */
+  batchSessions: (a: AuthSession, body: SessionBatchInput): Promise<SessionBatchResult> =>
+    jsonOrThrow<SessionBatchResult>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/sessions/batch", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(body),
+        }),
+      ),
+    ),
 
   /**
    * 取单个会话（GET /api/sessions/:id，Bearer）。
