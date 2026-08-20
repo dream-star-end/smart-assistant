@@ -1,4 +1,4 @@
--- 0243_tutorial_snapshots.sql
+-- 0244_tutorial_snapshots.sql
 -- 社区教程兼容演进：Markdown 投稿保留；新增会话快照、内容寻址 blob、
 -- 作者撤回/管理员下架、以及 admin-only 案例评测/罗盘。
 -- 公开 blob 只在仍被 status='approved' 的 publication 引用时可见。
