@@ -72,6 +72,7 @@ import {
   parsePanelParam,
   parseSessionPath,
   parseTutorialCase,
+  parseTutorialCommunity,
   parseTutorialTopic,
   preferredBoardView,
   useAppRoute,
@@ -245,8 +246,9 @@ export function App() {
   // URL 深链（会话 /s/<id> + 面板 ?panel=），此后 URL 是状态的 replaceState 单向镜像。
   const routingEnabled = !demo && !resetToken;
   const bootPanel = routingEnabled ? parsePanelParam(params) : null;
+  const bootTutorialCommunity = routingEnabled ? parseTutorialCommunity(params) : null;
   const bootTutorialCase = routingEnabled ? parseTutorialCase(params) : null;
-  const bootTutorialTopic = routingEnabled && !bootTutorialCase
+  const bootTutorialTopic = routingEnabled && !bootTutorialCase && !bootTutorialCommunity
     ? parseTutorialTopic(params)
     : null;
   // 会话深链恢复未决标记：resolve 前 useSessionList 暂停"自动选中上次会话"
@@ -327,6 +329,7 @@ export function App() {
   const [tutorialOpen, setTutorialOpen] = useState(bootPanel === "help");
   const [tutorialTopic, setTutorialTopic] = useState<ProductFeatureId | null>(bootTutorialTopic);
   const [tutorialCase, setTutorialCase] = useState<TutorialCaseId | null>(bootTutorialCase);
+  const [tutorialCommunity, setTutorialCommunity] = useState<string | null>(bootTutorialCommunity);
   const [marketplaceTab, setMarketplaceTab] = useState<MarketplaceTab>("browse");
   const [marketplaceBrowseKind, setMarketplaceBrowseKind] = useState<MarketplaceKind>("skill");
   // 「在对话中创建」技能/智能体:关市场 → 新会话 → Composer 预填引导模板(用户改后发送)。
@@ -446,6 +449,7 @@ export function App() {
       setTutorialOpen(keepPublicTutorial);
       setTutorialCase(keepPublicTutorial ? parseTutorialCase(publicQuery) : null);
       setTutorialTopic(keepPublicTutorial ? parseTutorialTopic(publicQuery) : null);
+      setTutorialCommunity(keepPublicTutorial ? parseTutorialCommunity(publicQuery) : null);
       setView("home");
     },
     // 登出前清本 user 的 IndexedDB 命名空间（隐私，类比 P5 媒体缓存按 authKey 失效）。
@@ -1117,6 +1121,7 @@ export function App() {
     setOrgOpen(false);
     setTutorialTopic(id ?? null);
     setTutorialCase(null);
+    setTutorialCommunity(null);
     setTutorialOpen(true);
   }, []);
 
@@ -2316,7 +2321,8 @@ export function App() {
     activePanel,
     activeTopic: tutorialOpen ? tutorialTopic : null,
     activeCase: tutorialOpen ? tutorialCase : null,
-    onPopPanel: (panel, topic, caseId) => {
+    activeCommunity: tutorialOpen ? tutorialCommunity : null,
+    onPopPanel: (panel, topic, caseId, communityId) => {
       setSettingsOpen(panel === "settings");
       setMarketplaceOpen(panel === "market");
       setManageOpen(panel === "manage");
@@ -2325,6 +2331,11 @@ export function App() {
       if (panel === "help") {
         setTutorialTopic(topic);
         setTutorialCase(caseId);
+        setTutorialCommunity(communityId);
+      } else {
+        setTutorialTopic(null);
+        setTutorialCase(null);
+        setTutorialCommunity(null);
       }
     },
     workspace: boardOpen ? "board" : "chat",
@@ -2382,27 +2393,49 @@ export function App() {
               open={tutorialOpen}
               topicId={tutorialTopic}
               caseId={tutorialCase}
+              communityId={tutorialCommunity}
               onTopicChange={(id) => {
                 setTutorialTopic(id);
                 setTutorialCase(null);
+                setTutorialCommunity(null);
               }}
               onCaseChange={(id) => {
                 setTutorialCase(id);
                 setTutorialTopic(null);
+                setTutorialCommunity(null);
               }}
               onShowCaseGallery={() => {
                 setTutorialCase(null);
                 setTutorialTopic(null);
+                setTutorialCommunity(null);
+              }}
+              onCommunityChange={(id) => {
+                setTutorialCommunity(id);
+                if (id) {
+                  setTutorialTopic(null);
+                  setTutorialCase(null);
+                }
               }}
               caseActionLabel="登录后试用"
               onRunCase={runTutorialCase}
               auth={auth}
               onRequireLogin={() => {
                 setTutorialOpen(false);
+                setTutorialCommunity(null);
                 setAuthMode("login");
                 setView("app");
               }}
-              onClose={() => setTutorialOpen(false)}
+              activeSessionId={activeId ?? null}
+              sessionMessages={wsMessages}
+              sending={sending}
+              sessionTitle={
+                activeSess?.title ?? sessions.find((session) => session.id === activeId)?.title ?? ""
+              }
+              sessionProjectId={sessions.find((session) => session.id === activeId)?.projectId ?? null}
+              onClose={() => {
+                setTutorialOpen(false);
+                setTutorialCommunity(null);
+              }}
               actionState={() => ({
                 enabled: true,
                 label: "登录后试用",
@@ -3119,22 +3152,46 @@ export function App() {
             open={tutorialOpen}
             topicId={tutorialTopic}
             caseId={tutorialCase}
+            communityId={tutorialCommunity}
             onTopicChange={(id) => {
               setTutorialTopic(id);
               setTutorialCase(null);
+              setTutorialCommunity(null);
             }}
             onCaseChange={(id) => {
               setTutorialCase(id);
               setTutorialTopic(null);
+              setTutorialCommunity(null);
             }}
             onShowCaseGallery={() => {
               setTutorialCase(null);
               setTutorialTopic(null);
+              setTutorialCommunity(null);
+            }}
+            onCommunityChange={(id) => {
+              setTutorialCommunity(id);
+              if (id) {
+                setTutorialTopic(null);
+                setTutorialCase(null);
+              }
             }}
             caseActionLabel="带着指令去对话"
             onRunCase={runTutorialCase}
             auth={auth}
-            onClose={() => setTutorialOpen(false)}
+            onRequireLogin={() => {
+              setAuthMode("login");
+            }}
+            activeSessionId={activeId ?? null}
+            sessionMessages={wsMessages}
+            sending={sending}
+            sessionTitle={
+              activeSess?.title ?? sessions.find((session) => session.id === activeId)?.title ?? ""
+            }
+            sessionProjectId={sessions.find((session) => session.id === activeId)?.projectId ?? null}
+            onClose={() => {
+              setTutorialOpen(false);
+              setTutorialCommunity(null);
+            }}
             actionState={(feature) => resolveTutorialAction(feature, tutorialActionContext)}
             onRunAction={runTutorialAction}
           />

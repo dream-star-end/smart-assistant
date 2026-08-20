@@ -137,6 +137,8 @@ export const ADMIN_AUDIT_ACTIONS = {
   "marketplace.skill.revoke": { kind: "write", mode: "best-effort" },
   "marketplace.skill.featured": { kind: "write", mode: "best-effort" },
   "tutorial.review": { kind: "write", mode: "best-effort" },
+  "tutorial.takedown": { kind: "write", mode: "best-effort" },
+  "tutorial.eval": { kind: "write", mode: "best-effort" },
 
   // ── 连接器平台 OAuth App(平台自有 client 凭据 provisioning)────────
   // 这是 clientProvisioning='platform' 的**信任闸**:有没有这一行,决定用户能不能用平台

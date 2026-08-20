@@ -1071,4 +1071,50 @@ describe('Aurora v5 — P7 最小路由', () => {
       rectSpy.mockRestore()
     }
   })
+
+  test('教程工作室深链：?panel=help&community= 打开详情，popstate 关闭 help 清 community', async () => {
+    window.history.replaceState({}, '', '/?campaign=docs&panel=help&community=tut-7')
+    const base = routedFetchTwoSessions()
+    fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url)
+      if (/\/api\/tutorials\/tut-7(?:\?|$)/.test(u) || u.endsWith('/api/tutorials/tut-7')) {
+        return okJson({
+          tutorial: {
+            id: 'tut-7',
+            title: '公开会话快照教程',
+            summary: '深链详情',
+            category: 'general',
+            authorName: '作者',
+            publishedAt: '2026-08-20T00:00:00.000Z',
+            bodyMarkdown: '说明正文',
+            kind: 'markdown',
+          },
+        })
+      }
+      if (u.includes('/api/tutorials')) {
+        return okJson({ tutorials: [], nextCursor: null })
+      }
+      return (base as unknown as (url: string, init?: RequestInit) => Promise<unknown>)(url, init)
+    }) as unknown as FetchMock
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(<App />)
+    await waitFor(
+      () => expect(screen.getByRole('heading', { name: '公开会话快照教程' })).toBeInTheDocument(),
+      { timeout: 5000 },
+    )
+    expect(window.location.search).toContain('community=tut-7')
+    expect(window.location.search).toContain('panel=help')
+    expect(window.location.search).toContain('campaign=docs')
+
+    await act(async () => {
+      window.history.replaceState({}, '', '/?campaign=docs')
+      window.dispatchEvent(new PopStateEvent('popstate'))
+    })
+    await waitFor(() =>
+      expect(screen.queryByRole('heading', { name: '公开会话快照教程' })).not.toBeInTheDocument(),
+    )
+    expect(window.location.search).not.toContain('community=')
+    expect(window.location.search).not.toContain('panel=help')
+  })
 })

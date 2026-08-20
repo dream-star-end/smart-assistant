@@ -139,11 +139,20 @@ export function parsePanelParam(sp: URLSearchParams): PanelParam | null {
     : null
 }
 
+const COMMUNITY_TUTORIAL_ID_RE = /^[A-Za-z0-9_-]{1,64}$/
+
+/** `?panel=help&community=` → 公开教程 id；非 help / 非法 id 返回 null。 */
+export function parseTutorialCommunity(sp: URLSearchParams): string | null {
+  if (parsePanelParam(sp) !== 'help') return null
+  const id = sp.get('community')?.trim() ?? ''
+  return COMMUNITY_TUTORIAL_ID_RE.test(id) ? id : null
+}
+
 /** `?panel=help&topic=` → 稳定教程 id；非 help / 未知 id 返回 null。 */
 export function parseTutorialTopic(sp: URLSearchParams): ProductFeatureId | null {
   if (parsePanelParam(sp) !== 'help') return null
-  // case 与 topic 同时出现时，案例优先；这样复制过的新链接不会被旧参数抢走。
-  if (parseTutorialCase(sp)) return null
+  // community / case / topic 互斥；community 与 case 都优先于旧 topic。
+  if (parseTutorialCommunity(sp) || parseTutorialCase(sp)) return null
   const topic = sp.get('topic')
   return isProductFeatureId(topic) ? topic : null
 }
@@ -151,28 +160,37 @@ export function parseTutorialTopic(sp: URLSearchParams): ProductFeatureId | null
 /** `?panel=help&case=` → 稳定案例 id；非 help / 未知 id 返回 null。 */
 export function parseTutorialCase(sp: URLSearchParams): TutorialCaseId | null {
   if (parsePanelParam(sp) !== 'help') return null
+  if (parseTutorialCommunity(sp)) return null
   return parseTutorialCaseId(sp.get('case'))
 }
 
-/** 保留其他 query；case/topic 互斥；无选择即案例总览；离开 help 时两者都清理。 */
+/** 保留其他 query；community/case/topic 互斥；无选择即案例总览；离开 help 时三者都清理。 */
 export function withPanelParams(
   input: URLSearchParams,
   panel: PanelParam | null,
   topic?: ProductFeatureId | null,
   caseId?: TutorialCaseId | null,
+  communityId?: string | null,
 ): URLSearchParams {
   const next = new URLSearchParams(input)
   if (panel) next.set('panel', panel)
   else next.delete('panel')
-  if (panel === 'help' && caseId) {
+  if (panel === 'help' && communityId) {
+    next.set('community', communityId)
+    next.delete('case')
+    next.delete('topic')
+  } else if (panel === 'help' && caseId) {
     next.set('case', caseId)
     next.delete('topic')
+    next.delete('community')
   } else if (panel === 'help' && topic) {
     next.set('topic', topic)
     next.delete('case')
+    next.delete('community')
   } else {
     next.delete('case')
     next.delete('topic')
+    next.delete('community')
   }
   return next
 }
@@ -185,12 +203,14 @@ export function tutorialHref(
   locationLike: { pathname: string; search: string; hash: string },
   topic?: ProductFeatureId | null,
   caseId?: TutorialCaseId | null,
+  communityId?: string | null,
 ): string {
   const query = withPanelParams(
     new URLSearchParams(locationLike.search),
     'help',
     topic,
     caseId,
+    communityId,
   ).toString()
   return `${locationLike.pathname}${query ? `?${query}` : ''}${locationLike.hash}`
 }
@@ -216,11 +236,14 @@ export type UseAppRouteOptions = {
   activeTopic?: ProductFeatureId | null
   /** help 打开时的案例；功能教程/案例总览为 null。 */
   activeCase?: TutorialCaseId | null
+  /** help 打开时的社区教程公开 id；与 case/topic 互斥。 */
+  activeCommunity?: string | null
   /** popstate 反灌面板/query（外部 help 深链恢复时使用）。 */
   onPopPanel?: (
     panel: PanelParam | null,
     topic: ProductFeatureId | null,
     caseId: TutorialCaseId | null,
+    communityId: string | null,
   ) => void
   /** 当前工作区。缺省 chat，保持旧调用方零改动。 */
   workspace?: WorkspaceView
@@ -242,7 +265,7 @@ export type UseAppRouteOptions = {
 
 export function useAppRoute(opts: UseAppRouteOptions): void {
   const { enabled, inWorkspace, activeId, sessions, serverListSettled, pendingSessionId } = opts
-  const { activePanel, activeTopic, activeCase } = opts
+  const { activePanel, activeTopic, activeCase, activeCommunity } = opts
   // 回调/最新值经 ref 镜像（App 每渲染传新闭包；popstate 监听只挂一次仍读最新）。
   const cbRef = useRef(opts)
   cbRef.current = opts
@@ -258,6 +281,7 @@ export function useAppRoute(opts: UseAppRouteOptions): void {
         parsePanelParam(query),
         parseTutorialTopic(query),
         parseTutorialCase(query),
+        parseTutorialCommunity(query),
       )
       const id = parseSessionPath(location.pathname)
       if (id) {
@@ -349,11 +373,11 @@ export function useAppRoute(opts: UseAppRouteOptions): void {
   useEffect(() => {
     if (!enabled) return
     const current = new URLSearchParams(location.search)
-    const next = withPanelParams(current, activePanel, activeTopic, activeCase)
+    const next = withPanelParams(current, activePanel, activeTopic, activeCase, activeCommunity)
     const q = next.toString()
     if (q === current.toString()) return
     history.replaceState({}, '', location.pathname + (q ? `?${q}` : '') + location.hash)
-  }, [enabled, activePanel, activeTopic, activeCase])
+  }, [enabled, activePanel, activeTopic, activeCase, activeCommunity])
 
   // board → ?view= / ?ticket= / ?ticketType=（replaceState；离开 /board 时清参数）。
   // 与 withPanelParams 一样只改自己的键，campaign / panel 等无关 query 原样保留。

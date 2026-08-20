@@ -7,6 +7,7 @@ import {
   parseBoardView,
   parsePanelParam,
   parseTutorialCase,
+  parseTutorialCommunity,
   parseTutorialTopic,
   preferredBoardView,
   tutorialHref,
@@ -37,6 +38,7 @@ describe('教程 URL 深链', () => {
     expect(settings.get('campaign')).toBe('summer')
     expect(settings.get('panel')).toBe('settings')
     expect(settings.has('topic')).toBe(false)
+    expect(settings.has('community')).toBe(false)
   })
 
   it('help 未给选择时保持案例总览，不再强制跳到功能教程', () => {
@@ -44,6 +46,7 @@ describe('教程 URL 深链', () => {
     expect(value.get('panel')).toBe('help')
     expect(value.has('topic')).toBe(false)
     expect(value.has('case')).toBe(false)
+    expect(value.has('community')).toBe(false)
   })
 
   it('案例深链只接受稳定 id，并与旧 topic 互斥且案例优先', () => {
@@ -81,6 +84,37 @@ describe('教程 URL 深链', () => {
     expect(tutorialHref(source, PRODUCT_CAPABILITIES.github.id)).toBe(
       '/s/keep-session?campaign=summer&invite=abc&panel=help&topic=github-repository#result',
     )
+    expect(tutorialHref(source, null, null, 'tut-7')).toBe(
+      '/s/keep-session?campaign=summer&invite=abc&panel=help&community=tut-7#result',
+    )
+  })
+
+  it('community 深链只接受安全 id，并与 case/topic 互斥且 community 优先', () => {
+    const mixed = new URLSearchParams(
+      'campaign=summer&panel=help&topic=chat-basics&case=research-bike-demand&community=tut-7',
+    )
+    expect(parseTutorialCommunity(mixed)).toBe('tut-7')
+    expect(parseTutorialCase(mixed)).toBeNull()
+    expect(parseTutorialTopic(mixed)).toBeNull()
+    expect(parseTutorialCommunity(new URLSearchParams('panel=help&community=bad/id'))).toBeNull()
+    expect(parseTutorialCommunity(new URLSearchParams('panel=settings&community=tut-7'))).toBeNull()
+
+    const communityLink = withPanelParams(
+      new URLSearchParams('campaign=summer&topic=chat-basics&case=research-bike-demand'),
+      'help',
+      null,
+      null,
+      'tut-7',
+    )
+    expect(communityLink.get('campaign')).toBe('summer')
+    expect(communityLink.get('community')).toBe('tut-7')
+    expect(communityLink.has('topic')).toBe(false)
+    expect(communityLink.has('case')).toBe(false)
+
+    const closed = withPanelParams(communityLink, null)
+    expect(closed.has('panel')).toBe(false)
+    expect(closed.has('community')).toBe(false)
+    expect(closed.get('campaign')).toBe('summer')
   })
 })
 

@@ -26,6 +26,9 @@ beforeEach(() => {
     nextCursor: null,
   })
   vi.spyOn(api, 'adminReviewCommunityTutorial').mockResolvedValue({ ok: true })
+  vi.spyOn(api, 'listTutorialEvalSpecs').mockResolvedValue({ specs: [], nextCursor: null })
+  vi.spyOn(api, 'listTutorialEvalJobs').mockResolvedValue({ jobs: [], nextCursor: null })
+  vi.spyOn(api, 'listTutorialEvalCompass').mockResolvedValue({ items: [], nextCursor: null })
 })
 
 afterEach(() => {
@@ -52,6 +55,25 @@ describe('TutorialReviewPage', () => {
       ),
     )
     expect(await screen.findByText('教程审核队列已清空')).toBeInTheDocument()
+  })
+
+  it('会话快照投稿显示 badge 和清单统计，不当纯 Markdown 审', async () => {
+    vi.mocked(api.adminPendingCommunityTutorials).mockResolvedValue({
+      tutorials: [
+        {
+          ...pending,
+          id: 'snap-pending',
+          title: '快照待审',
+          kind: 'snapshot',
+          snapshot: { messageCount: 12, pages: [{ sha256: 'p1' }, { sha256: 'p2' }] },
+          artifacts: [{ sha256: 'a1', name: 'out.png', mime: 'image/png', bytes: 8 }],
+        },
+      ],
+      nextCursor: null,
+    })
+    render(<TutorialReviewPage />)
+    expect(await screen.findByText('会话快照')).toBeInTheDocument()
+    expect(screen.getByText(/清单 12 条消息 · 2 页 · 1 件成果/)).toBeInTheDocument()
   })
 
   it('拒绝必须先填写审核意见，并将理由提交给后端', async () => {

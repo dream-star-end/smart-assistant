@@ -1167,10 +1167,65 @@ export type SkillDetail = SkillSummary & {
   files?: string[];
 };
 
-// ── 社区共建教程 ─────────────────────────────────────────────────────────
+// ── 教程工作室（公开目录仍走 /api/tutorials；快照/评测字段集中于此便于对齐） ─
 
 export type CommunityTutorialCategory = "research" | "coding" | "general";
-export type CommunityTutorialStatus = "pending" | "approved" | "rejected" | "withdrawn";
+export type CommunityTutorialStatus =
+  | "pending"
+  | "approved"
+  | "rejected"
+  | "withdrawn"
+  | "draft"
+  | "takedown";
+export type TutorialKind = "markdown" | "snapshot";
+
+/** 公开快照轨迹：inline 脱敏消息、分页清单，或公开 blob ref。 */
+export type TutorialSnapshotPageRef = {
+  role?: string;
+  sha256: string;
+  bytes?: number;
+  messageCount?: number;
+};
+
+export type TutorialSnapshotPayload = {
+  schemaVersion?: number;
+  sanitizerVersion?: string;
+  messageCount?: number;
+  messages?: unknown[];
+  manifest?: unknown;
+  inlinePages?: unknown;
+  pages?: TutorialSnapshotPageRef[];
+  artifacts?: Array<{
+    title?: string;
+    name?: string;
+    role?: string;
+    sha256: string;
+    bytes?: number;
+    mimeType?: string;
+    mime?: string;
+  }>;
+  publicRef?: string | null;
+};
+
+export type TutorialBlobRef = {
+  sha256: string;
+  role: string;
+  kind: string;
+  mime: string;
+  bytes: number;
+};
+
+export type TutorialArtifact = {
+  sha256: string;
+  name: string;
+  mime: string;
+  bytes: number;
+  role?: string | null;
+  kind?: string | null;
+  embedUrl?: string | null;
+  downloadUrl?: string | null;
+  interactive?: boolean;
+};
 
 export type CommunityTutorialSummary = {
   id: string;
@@ -1179,10 +1234,14 @@ export type CommunityTutorialSummary = {
   category: CommunityTutorialCategory;
   authorName: string;
   publishedAt: string;
+  kind?: TutorialKind;
 };
 
 export type CommunityTutorialDetail = CommunityTutorialSummary & {
   bodyMarkdown: string;
+  snapshot?: TutorialSnapshotPayload | null;
+  artifacts?: TutorialArtifact[];
+  refs?: TutorialBlobRef[];
 };
 
 export type CommunityTutorialMine = {
@@ -1196,6 +1255,9 @@ export type CommunityTutorialMine = {
   createdAt: string;
   reviewedAt: string | null;
   publishedAt: string | null;
+  kind?: TutorialKind;
+  snapshot?: TutorialSnapshotPayload | null;
+  artifacts?: TutorialArtifact[];
 };
 
 export type CommunityTutorialPending = CommunityTutorialMine & {
@@ -1209,9 +1271,114 @@ export type CommunityTutorialDraft = {
   bodyMarkdown: string;
 };
 
+export type TutorialSnapshotArtifactDraft = {
+  name: string;
+  mimeType: string;
+  contentBase64: string;
+};
+
+export type TutorialSnapshotDraft = {
+  sourceSessionId: string;
+  title: string;
+  summary: string;
+  category: CommunityTutorialCategory;
+  bodyMarkdown: string;
+  selectedArtifacts: TutorialSnapshotArtifactDraft[];
+};
+
+export type TutorialLeak = {
+  rule: string;
+  field: string;
+};
+
+export type TutorialLeakReport = {
+  leaks?: TutorialLeak[];
+  strippedRoles?: string[];
+  findings?: Array<{ type?: string; code?: string; message: string }>;
+  notes?: string[];
+};
+
+export type TutorialSnapshotSubmitResult = {
+  tutorial: { id: string; status: "pending" | "draft"; createdAt: string; kind?: TutorialKind; sanitizerVersion?: string };
+  leakReport?: TutorialLeakReport | null;
+};
+
 export type CommunityTutorialPage<T> = {
   tutorials: T[];
   nextCursor: string | null;
+};
+
+export type TutorialEvalSpec = {
+  id: string;
+  publicId?: string;
+  title?: string;
+  sourcePlatform: string;
+  sourceUrl: string;
+  collectedAt: string;
+  frozenPrompt?: string;
+  materials?: string;
+  frozenMaterials?: unknown;
+  authScope: string;
+  rubricJson?: unknown;
+  rubric?: unknown;
+  createdAt: string;
+};
+
+export type TutorialEvalSpecDraft = {
+  publicId: string;
+  title: string;
+  sourcePlatform: string;
+  sourceUrl: string;
+  collectedAt: string;
+  frozenPrompt: string;
+  frozenMaterials: { items: unknown[] };
+  rubric: { checks: unknown[] } | unknown;
+};
+
+export type TutorialEvalJobStatus =
+  | "queued"
+  | "running"
+  | "failed"
+  | "completed"
+  | "passed"
+  | "compass_pending"
+  | "compass_ready";
+
+export type TutorialEvalJob = {
+  id: string;
+  specId: string;
+  status: TutorialEvalJobStatus;
+  publicationId?: string | null;
+  result?: string | null;
+  error?: string | null;
+  createdAt: string;
+  updatedAt?: string;
+  completedAt?: string | null;
+  created?: boolean;
+};
+
+export type TutorialEvalCompassItem = {
+  id: string;
+  cluster?: string;
+  clusterKey?: string;
+  severity: string;
+  summary: string;
+  fix?: string;
+  reusableFix?: string | null;
+  jobId?: string | null;
+  evalJobId?: string | null;
+};
+
+export type TutorialEvalRecordInput = {
+  jobId: string;
+  result?: "passed" | "failed";
+  evidence?: unknown;
+  status?: TutorialEvalJobStatus;
+  cluster?: string;
+  severity?: string;
+  summary?: string;
+  fix?: string;
+  notes?: string;
 };
 
 // ── AI 市场（marketplace，见 packages/commercial/src/marketplace） ──────────

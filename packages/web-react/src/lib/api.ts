@@ -12,6 +12,13 @@ import type {
   CommunityTutorialPage,
   CommunityTutorialPending,
   CommunityTutorialSummary,
+  TutorialEvalCompassItem,
+  TutorialEvalJob,
+  TutorialEvalRecordInput,
+  TutorialEvalSpec,
+  TutorialEvalSpecDraft,
+  TutorialSnapshotDraft,
+  TutorialSnapshotSubmitResult,
   CronCreateInput,
   CronJob,
   GithubBranch,
@@ -3069,7 +3076,7 @@ export const api = {
       ),
     ),
 
-  // ── 社区共建教程 ───────────────────────────────────────────────────────
+  // ── 教程工作室（公开目录 / 快照 / 管理评测） ────────────────────────────
 
   listCommunityTutorials: (opts?: {
     cursor?: string | null;
@@ -3104,6 +3111,21 @@ export const api = {
         }),
       ),
     ).then((result) => result.tutorial),
+
+  submitTutorialSnapshot: (a: AuthSession, draft: TutorialSnapshotDraft) =>
+    jsonOrThrow<TutorialSnapshotSubmitResult>(
+      callWithRefresh(a, (token) =>
+        fetch("/api/tutorials/snapshots", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(token, true),
+          body: JSON.stringify(draft),
+        }),
+      ),
+    ).then((result) => ({
+      tutorial: { ...result.tutorial, kind: result.tutorial.kind ?? "snapshot" },
+      leakReport: result.leakReport ?? null,
+    })),
 
   listMyCommunityTutorials: (a: AuthSession, cursor?: string | null) =>
     jsonOrThrow<CommunityTutorialPage<CommunityTutorialMine>>(
@@ -3150,6 +3172,87 @@ export const api = {
           credentials: "include",
           headers: bearerHeaders(token, true),
           body: JSON.stringify({ decision, note }),
+        }),
+      ),
+    ),
+
+  listTutorialEvalSpecs: (a: AuthSession, cursor?: string | null) =>
+    jsonOrThrow<{ specs: TutorialEvalSpec[]; nextCursor?: string | null }>(
+      callWithRefresh(a, (token) =>
+        fetch(
+          `/api/admin/tutorials/case-specs${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`,
+          { credentials: "include", headers: bearerHeaders(token) },
+        ),
+      ),
+    ),
+
+  createTutorialEvalSpec: (a: AuthSession, draft: TutorialEvalSpecDraft) =>
+    jsonOrThrow<{ spec: TutorialEvalSpec }>(
+      callWithRefresh(a, (token) =>
+        fetch("/api/admin/tutorials/case-specs", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(token, true),
+          body: JSON.stringify(draft),
+        }),
+      ),
+    ).then((result) => result.spec),
+
+  listTutorialEvalJobs: (a: AuthSession, cursor?: string | null) =>
+    jsonOrThrow<{ jobs: TutorialEvalJob[]; nextCursor?: string | null }>(
+      callWithRefresh(a, (token) =>
+        fetch(
+          `/api/admin/tutorials/eval-jobs${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`,
+          { credentials: "include", headers: bearerHeaders(token) },
+        ),
+      ),
+    ),
+
+  enqueueTutorialEvalJob: (
+    a: AuthSession,
+    specId: string,
+    extra?: { idempotencyKey?: string; publicationId?: string | null; evalUserId?: string | null },
+  ) =>
+    jsonOrThrow<{ job: TutorialEvalJob }>(
+      callWithRefresh(a, (token) =>
+        fetch("/api/admin/tutorials/eval-jobs", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(token, true),
+          body: JSON.stringify({
+            specId,
+            idempotencyKey: extra?.idempotencyKey ?? `eval-${specId}-${Date.now()}`,
+            publicationId: extra?.publicationId,
+            evalUserId: extra?.evalUserId,
+          }),
+        }),
+      ),
+    ).then((result) => result.job),
+
+  listTutorialEvalCompass: (a: AuthSession, cursor?: string | null) =>
+    jsonOrThrow<{ items?: TutorialEvalCompassItem[]; notes?: TutorialEvalCompassItem[]; nextCursor?: string | null }>(
+      callWithRefresh(a, (token) =>
+        fetch(
+          `/api/admin/tutorials/compass${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`,
+          { credentials: "include", headers: bearerHeaders(token) },
+        ),
+      ),
+    ).then((result) => ({
+      items: result.items ?? result.notes ?? [],
+      nextCursor: result.nextCursor ?? null,
+    })),
+
+  recordTutorialEvalResult: (a: AuthSession, input: TutorialEvalRecordInput) =>
+    jsonOrThrow<{ ok?: boolean; job?: TutorialEvalJob }>(
+      callWithRefresh(a, (token) =>
+        fetch(`/api/admin/tutorials/eval-jobs/${encodeURIComponent(input.jobId)}/evidence`, {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(token, true),
+          body: JSON.stringify({
+            result: input.result ?? (input.status === "failed" ? "failed" : "passed"),
+            evidence: input.evidence ?? { notes: input.notes, summary: input.summary },
+          }),
         }),
       ),
     ),
