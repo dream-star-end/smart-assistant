@@ -232,6 +232,48 @@ export interface PromptSlot {
   content: string
 }
 
+const PLATFORM_MCP_TOOL_NAMES = [
+  'skill_search',
+  'skill_list',
+  'skill_view',
+  'skill_save',
+  'skill_delete',
+  'create_reminder',
+  'list_reminders',
+  'update_reminder',
+  'delete_reminder',
+  'send_to_agent',
+  'delegate_task',
+  'delegate_tasks',
+  'request_review',
+  'task_create',
+  'task_update',
+  'task_comment',
+  'task_list',
+  'task_get',
+] as const
+
+function hasMcpTool(ctx: Pick<PromptSlotContext, 'availableMcpTools'>, name: string): boolean {
+  // undefined is the legacy/test caller contract: availability is unknown, so
+  // preserve the historical prompt. Production adapters pass an exact array.
+  return ctx.availableMcpTools === undefined || ctx.availableMcpTools.includes(name)
+}
+
+function sanitizeUnavailableMcpClaims(
+  content: string,
+  availableMcpTools: string[] | undefined,
+): string {
+  if (availableMcpTools === undefined) return content
+  const available = new Set(availableMcpTools)
+  let out = content
+  for (const tool of PLATFORM_MCP_TOOL_NAMES) {
+    if (available.has(tool)) continue
+    const escaped = tool.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    out = out.replace(new RegExp(`\\b${escaped}\\b(?:\\([^\\n\\r]*?\\))?`, 'g'), '（当前未注册）')
+  }
+  return out
+}
+
 // ── 记忆注入预算(注入侧唯一权威,与存储写侧解耦)──
 //
 // memdir 范式下存储层不再有「Core 记忆字符硬预算」:每条记忆一个文件、MEMORY.md 只存
@@ -603,17 +645,25 @@ export async function buildSkillsSlot(ctx: PromptSlotContext): Promise<PromptSlo
     return a.name.localeCompare(b.name)
   })
   const top = sorted.slice(0, 15)
+  const canSearchSkills = hasMcpTool(ctx, 'skill_search') && hasMcpTool(ctx, 'skill_view')
   const lines = [
     `# Skills (${skillList.length})`,
     '',
-    '可用 `skill_search(query)` 查找相关 skill,再用 `skill_view(name)` 加载完整指令:',
+    canSearchSkills
+      ? '可用 `skill_search(query)` 查找相关 skill,再用 `skill_view(name)` 加载完整指令:'
+      : '以下仅为本轮已注入的技能摘要;技能检索函数未注册,不要尝试调用。',
   ]
   for (const s of top) {
     const source = s.source === 'platform' ? 'platform' : 'user'
     lines.push(`- **${s.name}** [${source}] — ${s.description}`)
   }
-  if (skillList.length > 15)
-    lines.push(`- ... 还有 ${skillList.length - 15} 个 (用 skill_search/skill_list 查看全部)`)
+  if (skillList.length > 15) {
+    lines.push(
+      canSearchSkills
+        ? `- ... 还有 ${skillList.length - 15} 个 (用 skill_search/skill_list 查看全部)`
+        : `- ... 还有 ${skillList.length - 15} 个未在摘要中展开`,
+    )
+  }
   return { name: 'SKILLS', content: lines.join('\n') }
 }
 
@@ -664,15 +714,25 @@ export const _memoryInternals = {
   MEMORY_INDEX_INJECT_MAX_LINES,
 }
 
-export function buildToolsSlot(): PromptSlot {
-  return {
-    name: 'TOOLS',
-    content: [
-      '# 学习系统',
-      '',
-      '## 记忆工具',
-      '',
-      '`oc-memory core-search` / `session-search` / `archival-add|search|delete`(Bash)。规则见上方 `# Memory`;详情 `skill_view("memory-management")`。',
+export function buildToolsSlot(
+  ctx: Pick<PromptSlotContext, 'availableMcpTools'> = {},
+): PromptSlot {
+  const lines = [
+    '# 学习系统',
+    '',
+    '## 记忆工具',
+    '',
+    hasMcpTool(ctx, 'skill_view')
+      ? '`oc-memory core-search` / `session-search` / `archival-add|search|delete`(Bash)。规则见上方 `# Memory`;详情 `skill_view("memory-management")`。'
+      : '`oc-memory core-search` / `session-search` / `archival-add|search|delete`(Bash)。规则见上方 `# Memory`。',
+  ]
+  if (
+    hasMcpTool(ctx, 'create_reminder')
+    && hasMcpTool(ctx, 'list_reminders')
+    && hasMcpTool(ctx, 'update_reminder')
+    && hasMcpTool(ctx, 'delete_reminder')
+  ) {
+    lines.push(
       '',
       '## 定时任务',
       '',
@@ -681,6 +741,15 @@ export function buildToolsSlot(): PromptSlot {
       '快速用法: `create_reminder(schedule="分 时 日 月 周", message="内容", oneshot=true)`;到点执行的任务(非播报提醒)加 `kind="task"`。',
       '查看/修改/删除: `list_reminders()` / `update_reminder(id, ...)` / `delete_reminder(id)`。这套工具与网页「管理中心 → 定时任务」是同一份数据,用户在页面上建的任务你也能看到。',
       '详细指南见 `skill_view("scheduled-tasks")`。',
+    )
+  }
+  if (
+    hasMcpTool(ctx, 'skill_search')
+    && hasMcpTool(ctx, 'skill_list')
+    && hasMcpTool(ctx, 'skill_view')
+    && hasMcpTool(ctx, 'skill_save')
+  ) {
+    lines.push(
       '',
       '## 技能自生成',
       '',
@@ -692,25 +761,31 @@ export function buildToolsSlot(): PromptSlot {
       '',
       '创建/更新 skill 时保持泛化,不要把一次性用户隐私、token、短期路径、无复用价值的流水账写进去。',
       '结构与评测规范见 `skill_view("skill-authoring")`:原则进 SKILL.md(<500行),稳定知识进 references/,重复动作进 scripts/,素材进 assets/,验收用例进 evals/evals.json。',
-      '',
-      '## 联网检索纪律',
-      '',
-      '需要外部/实时事实(新闻、行情、政策、网页、文献、统计数字)时,**先真的去检索**,不要凭记忆直接作答。可用: `WebSearch`(联网搜索)、`WebFetch`(抓取单页并提炼)、Bash 里的 `oc-web extract <url>`(整页/文档转 Markdown)。',
-      '- **中文主题优先中文检索**;命中结果必须标注来源 URL 与数据时间。',
-      '- 一条路径失败就换另一条(搜索↔抓取)、换关键词或换语言再试。',
-      '- **检索全部失败/返回不相关或空结果时,如实告诉用户"未能检索到可靠来源"**,并说明已尝试的路径。此时若要给出判断,必须显式标注"以下为基于既有知识的粗略判断,未经联网核实",**严禁**把记忆里的数字/统计/时效性结论当作已核实的调研结果输出,更不得伪造来源或编造链接。宁可少答、诚实标注,也不要用幻觉冒充调研。',
-      '',
-      '## 工具失败自恢复',
-      '',
-      '仅在工具已经返回失败后按错误类型恢复;不要为每个任务预检环境、自动安装依赖或修改网关/沙箱配置。',
-      '- 不要原样重复同一个失败调用。先读错误,改变方法或参数后最多重试一次。',
-      '- 命令退出码 127:先用 `command -v <命令>` 确认是否存在;优先改用平台原生工具、正确命令名或已安装替代品,不要静默安装软件。',
-      '- Read/Edit 失败:先重新 Read 或 Glob 确认最新路径/内容,再基于最新内容重试一次,不要拿旧文本反复 Edit。',
-      '- 长任务超时:在工具允许时拆小步骤,或改为后台执行并轮询已有任务;不要盲目重复同一超时调用。',
-      '- 权限拒绝:不要绕过沙箱、提权或放宽权限;改用允许的目录/工具,仍不可行就明确说明限制。',
-      '',
-      '你是一个持久化、自进化的 agent。主动使用这些工具让自己越来越好。',
-    ].join('\n'),
+    )
+  }
+  lines.push(
+    '',
+    '## 联网检索纪律',
+    '',
+    '需要外部/实时事实(新闻、行情、政策、网页、文献、统计数字)时,**先真的去检索**,不要凭记忆直接作答。可用: `WebSearch`(联网搜索)、`WebFetch`(抓取单页并提炼)、Bash 里的 `oc-web extract <url>`(整页/文档转 Markdown)。',
+    '- **中文主题优先中文检索**;命中结果必须标注来源 URL 与数据时间。',
+    '- 一条路径失败就换另一条(搜索↔抓取)、换关键词或换语言再试。',
+    '- **检索全部失败/返回不相关或空结果时,如实告诉用户"未能检索到可靠来源"**,并说明已尝试的路径。此时若要给出判断,必须显式标注"以下为基于既有知识的粗略判断,未经联网核实",**严禁**把记忆里的数字/统计/时效性结论当作已核实的调研结果输出,更不得伪造来源或编造链接。宁可少答、诚实标注,也不要用幻觉冒充调研。',
+    '',
+    '## 工具失败自恢复',
+    '',
+    '仅在工具已经返回失败后按错误类型恢复;不要为每个任务预检环境、自动安装依赖或修改网关/沙箱配置。',
+    '- 不要原样重复同一个失败调用。先读错误,改变方法或参数后最多重试一次。',
+    '- 命令退出码 127:先用 `command -v <命令>` 确认是否存在;优先改用平台原生工具、正确命令名或已安装替代品,不要静默安装软件。',
+    '- Read/Edit 失败:先重新 Read 或 Glob 确认最新路径/内容,再基于最新内容重试一次,不要拿旧文本反复 Edit。',
+    '- 长任务超时:在工具允许时拆小步骤,或改为后台执行并轮询已有任务;不要盲目重复同一超时调用。',
+    '- 权限拒绝:不要绕过沙箱、提权或放宽权限;改用允许的目录/工具,仍不可行就明确说明限制。',
+    '',
+    '你是一个持久化、自进化的 agent。主动使用这些工具让自己越来越好。',
+  )
+  return {
+    name: 'TOOLS',
+    content: lines.join('\n'),
   }
 }
 
@@ -1309,7 +1384,7 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
   const memory = await buildMemorySlot(ctx)
   slots.push(memory)
 
-  const tools = buildToolsSlot()
+  const tools = buildToolsSlot(ctx)
   slots.push(tools)
 
   // Layer 4: per-model 行为补丁。位于 TOOLS 之后、RESEARCH 之前 —
@@ -1344,12 +1419,16 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
   const repo = buildRepoSlot(ctx)
   if (repo) slots.push(repo)
 
-  let content = slots.map((s) => s.content).join(SEPARATOR)
+  const effectiveSlots = slots.map((slot) => ({
+    ...slot,
+    content: sanitizeUnavailableMcpClaims(slot.content, ctx.availableMcpTools),
+  }))
+  let content = effectiveSlots.map((s) => s.content).join(SEPARATOR)
   if (resolvePromptUserRole(ctx) === 'admin') {
     content = stripBaselineRestrictions(content)
   }
   const applied: PromptSlotApplied[] = await Promise.all(
-    slots.map(async (s) => {
+    effectiveSlots.map(async (s) => {
       const base: PromptSlotApplied = {
         name: s.name,
         bytes: Buffer.byteLength(s.content, 'utf-8'),

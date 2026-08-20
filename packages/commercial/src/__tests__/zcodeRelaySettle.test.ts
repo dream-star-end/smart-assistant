@@ -8,7 +8,11 @@ import {
   resolveZcodeRelayRoute,
 } from "../billing/zcodeRouteContext.js";
 import { mapZcodeReportedUsage, planZcodeCatalogSettle } from "../billing/zcodeCatalogSettle.js";
-import { evaluateGlm53ZaiSwitch } from "../admin/zcodeCanonicalSwitch.js";
+import {
+  evaluateGlm53ZaiSwitch,
+  glm53ZaiCapabilityProfileForEngine,
+  glm53ZaiSupportedEfforts,
+} from "../admin/zcodeCanonicalSwitch.js";
 import { CatalogConflictError } from "../admin/modelCatalogOps.js";
 
 describe("zcode relay routes", () => {
@@ -169,7 +173,11 @@ describe("glm-5.3-zai engine switch", () => {
     provider_id: "zai",
     upstream_model_id: "glm-5.3",
     context_window: 1000000,
-    capability_profile: {},
+    capability_profile: {
+      supports_vision: false,
+      reasoning: { supported: ["high", "max"], codex_model_default: null },
+      ccb: { capability_zero: true, supports_thinking: true },
+    },
     capability_schema_version: 1,
     state: "active",
     lock_version: 4,
@@ -194,5 +202,38 @@ describe("glm-5.3-zai engine switch", () => {
       () => evaluateGlm53ZaiSwitch({ ...live, upstream_model_id: "zai/glm-5.1" }, "ccb-to-zcode", 4),
       /upstream/,
     );
+  });
+  test("engine-specific profile removes the fake ZCode effort knob and restores it on CCB rollback", () => {
+    const zcode = glm53ZaiCapabilityProfileForEngine(live.capability_profile, "zcode");
+    assert.deepEqual(glm53ZaiSupportedEfforts(zcode), []);
+    assert.deepEqual(
+      glm53ZaiSupportedEfforts(glm53ZaiCapabilityProfileForEngine(zcode, "ccb")),
+      ["high", "max"],
+    );
+    assert.throws(() => glm53ZaiCapabilityProfileForEngine({}, "zcode"), /reasoning/);
+  });
+});
+
+describe("0242 zcode capability versioning", () => {
+  test("uses immutable version switches for forward and guarded rollback", async () => {
+    const { readFile } = await import("node:fs/promises");
+    const forward = await readFile(
+      new URL("../db/migrations/0242_zcode_platform_capabilities.sql", import.meta.url),
+      "utf8",
+    );
+    const rollback = await readFile(
+      new URL("../db/manual/0242_zcode_platform_capabilities_rollback.sql", import.meta.url),
+      "utf8",
+    );
+    assert.match(forward, /fn_model_switch_version/);
+    assert.match(forward, /engine='ccb'.*provider_id='zai'/s);
+    assert.match(forward, /reasoning,supported.*\["high","max"\]/s);
+    assert.match(forward, /postcondition failed/);
+    assert.doesNotMatch(forward, /UPDATE\s+model_catalog/i);
+    assert.match(rollback, /openclaude\.expected_lock_version/);
+    assert.match(rollback, /v_live\.lock_version <> v_expected/);
+    assert.match(rollback, /fn_model_switch_version/);
+    assert.match(rollback, /postcondition failed/);
+    assert.doesNotMatch(rollback, /UPDATE\s+model_catalog/i);
   });
 });

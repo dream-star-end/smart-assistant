@@ -219,13 +219,70 @@ case "$anthropic_base" in
   */v1) ;;
   *) anthropic_base="$anthropic_base/v1" ;;
 esac
-printf '%s\n' "{\"model\":{\"main\":\"$upstream\"},\"provider\":{\"$provider\":{\"kind\":\"anthropic\",\"name\":\"Z.AI Coding Plan\",\"options\":{\"apiKeyRequired\":true,\"baseURL\":\"$anthropic_base\",\"apiKey\":\"$api_key\"}}}}" \
-  > "$zcode_home/.zcode/cli/config.json"
+platform_config=${OC_ZCODE_PLATFORM_CONFIG_FILE:-}
+if [ -n "$platform_config" ]; then
+  [ -n "$node_bin" ] && [ -x "$node_bin" ] \
+    || die "node is required for managed ZCode platform config"
+  case "$platform_config" in
+    /tmp/oc-zcode-context-*/platform-config.json) ;;
+    *) die "managed ZCode platform config path is invalid" ;;
+  esac
+  [ -f "$platform_config" ] && [ ! -L "$platform_config" ] \
+    || die "managed ZCode platform config is invalid"
+  platform_parent=${platform_config%/*}
+  [ -d "$platform_parent" ] && [ ! -L "$platform_parent" ] \
+    || die "managed ZCode platform config parent is invalid"
+  me=$(/usr/bin/id -u)
+  [ "$(/usr/bin/stat -c '%u' -- "$platform_config")" = "$me" ] \
+    && [ "$(/usr/bin/stat -c '%a' -- "$platform_config")" = "600" ] \
+    && [ "$(/usr/bin/stat -c '%u' -- "$platform_parent")" = "$me" ] \
+    && [ "$(/usr/bin/stat -c '%a' -- "$platform_parent")" = "700" ] \
+    || die "managed ZCode platform config permissions are invalid"
+  export OC_ZCODE_CONFIG_BASE_FILE="$platform_config"
+  export OC_ZCODE_CONFIG_UPSTREAM="$upstream"
+  export OC_ZCODE_CONFIG_PROVIDER="$provider"
+  export OC_ZCODE_CONFIG_BASE_URL="$anthropic_base"
+  export OC_ZCODE_CONFIG_API_KEY="$api_key"
+  "$node_bin" - "$zcode_home/.zcode/cli/config.json" <<'NODE'
+'use strict'
+const fs = require('node:fs')
+const out = process.argv[2]
+const allowed = new Set(['features', 'mcp', 'hooks'])
+const base = JSON.parse(fs.readFileSync(process.env.OC_ZCODE_CONFIG_BASE_FILE, 'utf8'))
+if (!base || typeof base !== 'object' || Array.isArray(base)) throw new Error('platform config must be an object')
+for (const key of Object.keys(base)) {
+  if (!allowed.has(key)) throw new Error(`platform config key is not allowed: ${key}`)
+}
+const provider = process.env.OC_ZCODE_CONFIG_PROVIDER
+const upstream = process.env.OC_ZCODE_CONFIG_UPSTREAM
+const baseURL = process.env.OC_ZCODE_CONFIG_BASE_URL
+const apiKey = process.env.OC_ZCODE_CONFIG_API_KEY
+if (!provider || !upstream || !baseURL || !apiKey) throw new Error('managed provider config is incomplete')
+const config = {
+  ...base,
+  model: { main: upstream },
+  provider: {
+    [provider]: {
+      kind: 'anthropic',
+      name: 'Z.AI Coding Plan',
+      options: { apiKeyRequired: true, baseURL, apiKey },
+    },
+  },
+}
+fs.writeFileSync(out, `${JSON.stringify(config)}\n`, { encoding: 'utf8', mode: 0o600 })
+NODE
+  unset OC_ZCODE_CONFIG_BASE_FILE OC_ZCODE_CONFIG_UPSTREAM OC_ZCODE_CONFIG_PROVIDER
+  unset OC_ZCODE_CONFIG_BASE_URL OC_ZCODE_CONFIG_API_KEY
+else
+  printf '%s\n' "{\"model\":{\"main\":\"$upstream\"},\"provider\":{\"$provider\":{\"kind\":\"anthropic\",\"name\":\"Z.AI Coding Plan\",\"options\":{\"apiKeyRequired\":true,\"baseURL\":\"$anthropic_base\",\"apiKey\":\"$api_key\"}}}}" \
+    > "$zcode_home/.zcode/cli/config.json"
+fi
 /bin/chmod 0600 -- "$zcode_home/.zcode/cli/config.json"
 export ANTHROPIC_API_KEY="$api_key"
 export ANTHROPIC_BASE_URL="$anthropic_base"
 api_key=""
 anthropic_base=""
+unset OC_ZCODE_PLATFORM_CONFIG_FILE
 
 # Durable CLI store. 0.16.3 --resume reads sqlite at
 # config.storage.sessionDbPath (ZCODE_SESSION_DB_PATH / ZCODE_SESSION_DB),

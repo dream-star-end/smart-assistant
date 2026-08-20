@@ -19,6 +19,42 @@ export type Glm53ZaiLiveRow = {
   lock_version: number;
 };
 
+function asRecord(value: unknown, label: string): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new CatalogConflictError(`${label} must be an object`);
+  }
+  return value as Record<string, unknown>;
+}
+
+export function glm53ZaiCapabilityProfileForEngine(
+  liveProfile: unknown,
+  engine: "ccb" | "zcode",
+): Record<string, unknown> {
+  const profile = asRecord(liveProfile, "glm-5.3-zai capability_profile");
+  const reasoning = asRecord(profile.reasoning, "glm-5.3-zai capability_profile.reasoning");
+  asRecord(profile.ccb, "glm-5.3-zai capability_profile.ccb");
+  return {
+    ...profile,
+    reasoning: {
+      ...reasoning,
+      // ZCode 0.16.3's Anthropic transport emits reasoning parts but has no
+      // per-turn effort control. Advertising high/max would create a UI knob
+      // that the adapter must ignore. CCB rollback restores the proven pair.
+      supported: engine === "zcode" ? [] : ["high", "max"],
+      codex_model_default: null,
+    },
+  };
+}
+
+export function glm53ZaiSupportedEfforts(profile: unknown): string[] {
+  const root = asRecord(profile, "glm-5.3-zai capability_profile");
+  const reasoning = asRecord(root.reasoning, "glm-5.3-zai capability_profile.reasoning");
+  if (!Array.isArray(reasoning.supported) || !reasoning.supported.every((v) => typeof v === "string")) {
+    throw new CatalogConflictError("glm-5.3-zai capability_profile.reasoning.supported must be strings");
+  }
+  return [...reasoning.supported];
+}
+
 async function loadLive(): Promise<Glm53ZaiLiveRow> {
   const r = await query<Glm53ZaiLiveRow>(
     `SELECT entry_id::text AS entry_id, engine, provider_id, upstream_model_id,
@@ -73,6 +109,7 @@ export async function switchGlm53ZaiEngine(
 ): Promise<{ entry_id: string; engine: "ccb" | "zcode" }> {
   const live = await loadLive();
   const next = evaluateGlm53ZaiSwitch(live, direction, expectedLockVersion);
+  const targetProfile = glm53ZaiCapabilityProfileForEngine(live.capability_profile, next.engine);
   const out = await switchVersion(
     {
       model_id: GLM53_ZAI_MODEL_ID,
@@ -80,7 +117,7 @@ export async function switchGlm53ZaiEngine(
       provider_id: next.provider_id,
       upstream_model_id: "glm-5.3",
       context_window: 1000000,
-      capability_profile: live.capability_profile,
+      capability_profile: targetProfile,
       capability_schema_version: live.capability_schema_version,
     },
     expectedLockVersion,
@@ -91,6 +128,8 @@ export async function switchGlm53ZaiEngine(
     after.engine !== next.engine
     || after.provider_id !== next.provider_id
     || after.upstream_model_id !== "glm-5.3"
+    || JSON.stringify(glm53ZaiSupportedEfforts(after.capability_profile))
+      !== JSON.stringify(next.engine === "zcode" ? [] : ["high", "max"])
   ) {
     throw new CatalogConflictError("postcondition failed: glm-5.3-zai engine switch did not land");
   }
