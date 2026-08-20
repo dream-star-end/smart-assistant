@@ -222,10 +222,14 @@ body {
   .no-scrollbar::-webkit-scrollbar { display: none; }
   .no-scrollbar { scrollbar-width: none; }
   .chat-scroll-area { overflow-anchor: none; }
-  /* Virtual rows legitimately unmount/remount while scrolling. Replaying the
-     entrance animation on every remount looks like content flicker and also
-     perturbs measured row geometry, so timeline cards stay motion-stable. */
+  /* Timeline rows stay motion-stable: entrance animation would flash when a
+     tail window expands or live→tape reconciles in place. */
   .chat-virtual-item .animate-in { animation: none; }
+  /* Skip layout/paint for off-screen cards; `auto` remembers last measured height. */
+  .chat-timeline-row {
+    content-visibility: auto;
+    contain-intrinsic-size: auto 120px;
+  }
   /* ── iOS 安全区(刘海/灵动岛/Home 指示条 + 横屏侧刘海),配合 index.html viewport-fit=cover。
      无安全区的设备(安卓/桌面)env() 回退 0px,零影响。各类按"叠加在原内边距之上"用 calc。── */
   .safe-px { padding-left: env(safe-area-inset-left, 0px); padding-right: env(safe-area-inset-right, 0px); }

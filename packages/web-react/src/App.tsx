@@ -2098,7 +2098,7 @@ export function App() {
     if (anchor) anchor.cancelled = true;
   }, []);
   // 切会话:重置粘滞并瞬时跳底(历史回看从底部开始);同时清归档按钮子态与视口锚点。
-  useEffect(() => {
+  useLayoutEffect(() => {
     stickToBottomRef.current = true;
     scrollToChatBottom();
     setArchiveLoading(false);
@@ -2112,7 +2112,8 @@ export function App() {
   }, [activeId, scrollToChatBottom, settleArchiveAnchor]);
   // 内容变更跟随:demo 走 messages/streamText,真实路径走 version/wsSending。
   // 流式期间高频触发,用瞬时赋值而非 smooth(60fps 下排队的平滑动画反而卡顿)。
-  useEffect(() => {
+  // layout 阶段贴底,避免普通 DOM 时间线先画出旧顶部再跳到底部。
+  useLayoutEffect(() => {
     if (!stickToBottomRef.current) return;
     scrollToChatBottom();
   }, [messages, streamText, chat.version, wsSending, scrollToChatBottom]);

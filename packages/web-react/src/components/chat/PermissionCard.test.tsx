@@ -145,7 +145,7 @@ describe("PermissionCard 自动弹框的存活边界", () => {
 });
 
 describe("PermissionCard 自动弹窗：活提问 vs 历史 vs 重挂", () => {
-  test("Virtuoso 重挂同一 requestId 不再自动弹，手动回答仍可用", async () => {
+  test("列表行重挂同一 requestId 不再自动弹，手动回答仍可用", async () => {
     const msg = askMsg({ requestId: "req-remount" });
     const { unmount } = render(<PermissionCard msg={msg} onRespond={vi.fn()} livePrompt />);
     expect(screen.getByRole("dialog")).toBeInTheDocument();

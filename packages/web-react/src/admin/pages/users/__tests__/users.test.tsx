@@ -9,22 +9,6 @@ vi.mock('chart.js/auto', () => ({
   },
 }))
 
-// jsdom has no layout engine, so render the virtual list's logical items while
-// keeping production on react-virtuoso's real viewport implementation.
-vi.mock('react-virtuoso', async () => {
-  const React = await import('react')
-  return {
-    VirtuosoMockContext: React.createContext(null),
-    Virtuoso: ({ data = [], itemContent, components = {}, context }: any) => React.createElement(
-      React.Fragment,
-      null,
-      components.Header ? React.createElement(components.Header, { context }) : null,
-      ...data.map((item: unknown, index: number) => itemContent(index, item)),
-      components.Footer ? React.createElement(components.Footer, { context }) : null,
-    ),
-  }
-})
-
 vi.mock('../../../lib/adminApi', () => ({
   ApiError: class ApiError extends Error {},
   adminGet: vi.fn(),

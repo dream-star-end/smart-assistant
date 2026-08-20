@@ -10,7 +10,7 @@ function Boom(): never {
 }
 
 describe("SessionTimelineBoundary", () => {
-  test("React #185 只自动重挂一次，瞬时 Virtuoso 生命周期故障不留下失败卡", async () => {
+  test("React #185 只自动重挂一次，瞬时渲染循环不留下失败卡", async () => {
     const err = vi.spyOn(console, "error").mockImplementation(() => {});
     let allowRecovery = false;
     const onRetry = vi.fn(() => {

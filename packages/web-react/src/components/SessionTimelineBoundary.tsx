@@ -27,10 +27,9 @@ export class SessionTimelineBoundary extends Component<Props, State> {
       code: isUpdateDepthError(error) ? "REACT_UPDATE_DEPTH_185" : "TIMELINE_RENDER_ERROR",
       sessionId: this.props.resetKey,
     });
-    // Virtuoso #185 is a renderer lifecycle loop, not corrupt conversation data. Once the
-    // offending tree is unmounted by this boundary, one deferred remount is safe and avoids
-    // leaving the user on a permanent fatal card after background/foreground restoration.
-    // Persistent faults stop after this single attempt and keep the ordinary manual Retry.
+    // React #185 used to come from the virtualizer lifecycle. One deferred remount
+    // remains safe if a future renderer loop appears; persistent faults stop after
+    // this single attempt and keep the ordinary manual Retry.
     if (!isUpdateDepthError(error) || this.state.autoRetryUsed) return;
     this.setState({ autoRetryUsed: true });
     this.autoRetryTimer = window.setTimeout(() => {

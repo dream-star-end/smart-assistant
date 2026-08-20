@@ -58,10 +58,9 @@ function isDetachedAskUserCard(msg: ChatMessage): boolean {
 }
 
 /** Page-session memory of requestIds that already auto-opened a modal.
- *  Virtuoso unmounts rows that leave the overscan window; useEffect+useState
- *  reset on remount and would re-popup without this. Module-level Set survives
- *  remount *and* MessageList remount on session switch (`key={activeId}`),
- *  and is not persisted (refresh = new page session). */
+ *  Timeline rows can still remount across session switches (`key={activeId}`);
+ *  useEffect+useState would re-popup without this. Module-level Set survives
+ *  remount and is not persisted (refresh = new page session). */
 const autoOpenedPermissionRequestIds = new Set<string>();
 
 export function resetPermissionAutoOpenMemory(): void {
@@ -114,8 +113,7 @@ export function PermissionCard({
 
   // 自动弹窗：仅活提问、且本页会话内每个 requestId 最多一次。
   // 用 setTimeout(0) 记下「已弹过」，让 React StrictMode 的同步 double-effect
-  // 仍能打开（cleanup 会清掉未触发的 timer）；真正的 Virtuoso 重挂发生在
-  // 用户滚动之后，timer 早已把 requestId 写入 Set。
+  // 仍能打开（cleanup 会清掉未触发的 timer）。
   useEffect(() => {
     if (!livePrompt || resolved || pending || readOnly || expired) return;
     const requestId = msg.requestId;

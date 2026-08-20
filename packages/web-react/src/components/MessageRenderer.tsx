@@ -5,7 +5,7 @@
  * 经 messageSignature 做 memo —— reducer 就地 mutation（同对象引用）下，React.memo 浅比较
  * 会漏渲，故以「内容签名」为比较键：变才渲、不变则稳定（复刻现网 keyed-reconcile 防闪）。
  *
- * MessageList：把会话消息流渲成虚拟卡片列表 + 流式 typing 指示 + 向上历史分页。
+ * MessageList：把会话消息流渲成普通 DOM 卡片列表 + 流式 typing 指示 + 向上历史分页。
  * 上层（App）只需把 WS 引擎产出的 ChatMessage[] 与回调传进来。
  */
 import { Info, Sparkles } from "lucide-react";
@@ -14,10 +14,10 @@ import {
   type ReactNode,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
 } from "react";
-import { Virtuoso, VirtuosoMockContext, type Components } from "react-virtuoso";
 import type {
   ChatMessage,
   LiveTurnTokenUsageSnapshot,
@@ -50,7 +50,7 @@ import { PermissionCard, type PermissionRespond } from "./chat/PermissionCard";
 import { ToolCardSlot } from "./chat/toolCardSlot";
 import { TurnActivity, type TurnActivityInfo } from "./chat/TurnActivity";
 import { currentTurnStartIndex, turnFinalAssistantFlags } from "./chat/turnSegment";
-import { loadedArchivedMetrics } from "./chat/archivePaging";
+import { correctedScrollTop, loadedArchivedMetrics } from "./chat/archivePaging";
 import { JournalHydrationRetry, PartialHistorySkeleton } from "./chat/HistorySkeleton";
 import { MessageBoundary } from "./MessageBoundary";
 import { asStr, resolveToolInput } from "./tool/format";
@@ -853,95 +853,22 @@ function coalesceTeam(
   return items;
 }
 
-// React Virtuoso uses firstItemIndex as a coordinate when items are prepended.
-// Keep a very large internal origin so every older page can move left without
-// imposing a user-visible history limit.
-const TIMELINE_VIRTUAL_INDEX_ORIGIN = Math.floor(Number.MAX_SAFE_INTEGER / 4);
+// Ordinary DOM timeline. First paint mounts only the newest tail so a 600-row
+// session does not commit every card before the first frame. Scrolling near the
+// top reveals already-resident rows; server history still uses the explicit
+// hasMore / loadOlder button (scroll never issues a network page).
+export const TIMELINE_INITIAL_TAIL_ITEMS = 80;
+const TIMELINE_WINDOW_EXPAND_ITEMS = 80;
+const TIMELINE_EXPAND_NEAR_TOP_PX = 160;
 
-// A short/new conversation gains nothing from a measurement graph. Keeping it as ordinary DOM
-// also removes react-virtuoso from the optimistic empty -> first-user-row transition, where rapid
-// session creation/reconciliation can otherwise re-enter its optional-prop publisher (React #185).
-// A normal server timeline page contains 100 rows, so established/archived conversations still
-// enter the virtualized path before DOM size becomes material.
-const TIMELINE_VIRTUALIZE_MIN_ITEMS = 80;
-
-/**
- * Browser suspension invalidates react-virtuoso's ResizeObserver/scroll-root graph even when
- * the logical timeline is unchanged. Returning from a hidden tab also starts REST/journal
- * reconciliation, so keeping the pre-suspension instance can make its optional-prop bus feed
- * React until error #185. Advance exactly once per real hidden→visible/BFCache restore; ordinary
- * focus events (composer/dialog focus churn) must not remount the timeline.
- */
-function useForegroundLifecycleEpoch(): number {
-  const [epoch, setEpoch] = useState(0);
-  const wasHiddenRef = useRef(
-    typeof document !== "undefined" && document.visibilityState === "hidden",
-  );
-  const lastAdvanceAtRef = useRef(0);
-
-  useEffect(() => {
-    const advance = () => {
-      const now = Date.now();
-      if (now - lastAdvanceAtRef.current < 250) return;
-      lastAdvanceAtRef.current = now;
-      setEpoch((value) => value + 1);
-    };
-    const onVisibility = () => {
-      if (document.visibilityState === "hidden") {
-        wasHiddenRef.current = true;
-        return;
-      }
-      if (!wasHiddenRef.current) return;
-      wasHiddenRef.current = false;
-      advance();
-    };
-    const onPageShow = (event: PageTransitionEvent) => {
-      if (!event.persisted) return;
-      wasHiddenRef.current = false;
-      advance();
-    };
-    document.addEventListener("visibilitychange", onVisibility);
-    window.addEventListener("pageshow", onPageShow);
-    return () => {
-      document.removeEventListener("visibilitychange", onVisibility);
-      window.removeEventListener("pageshow", onPageShow);
-    };
-  }, []);
-
-  return epoch;
+function defaultTailStart(length: number): number {
+  return Math.max(0, length - TIMELINE_INITIAL_TAIL_ITEMS);
 }
-
-type VirtualItem = RenderItem;
-
-type TimelineVirtuosoContext = {
-  header: ReactNode;
-  footer: ReactNode;
-};
-
-function TimelineVirtuosoHeader({ context }: { context: TimelineVirtuosoContext }) {
-  return <>{context.header}</>;
-}
-
-function TimelineVirtuosoFooter({ context }: { context: TimelineVirtuosoContext }) {
-  return <>{context.footer}</>;
-}
-
-// Component identities must stay constant. Inline Header/Footer functions make
-// react-virtuoso remount the footer on every stream delta, which was one source
-// of the user-visible "思考中" flash even when the row markup itself was stable.
-const TIMELINE_VIRTUOSO_COMPONENTS: Components<VirtualItem, TimelineVirtuosoContext> = {
-  Header: TimelineVirtuosoHeader,
-  Footer: TimelineVirtuosoFooter,
-};
 
 function renderItemKey(item: RenderItem): string {
   return item.kind === "single"
     ? (item.m._timelineUnitKey ?? item.m.id)
     : item.members[0]?._timelineUnitKey ?? item.members[0]?.id ?? item.kind;
-}
-
-function renderItemMessages(item: RenderItem): ChatMessage[] {
-  return item.kind === "single" ? [item.m] : item.members;
 }
 
 /**
@@ -998,7 +925,7 @@ export function MessageList({
   onRespondPermission: PermissionRespond;
   /** 管理端等只读 surface；默认 false，用户端行为不变。 */
   readOnly?: boolean;
-  /** Existing chat scroller. When present, only viewport-adjacent rows mount. */
+  /** Existing chat scroller. When present, first paint mounts the newest tail. */
   scrollParent?: HTMLElement | null;
   /** Server history revision. A new revision gets a fresh paging intent owner. */
   historyGeneration?: number | string;
@@ -1016,10 +943,20 @@ export function MessageList({
     };
   }
   const processPaging = pagingOwnerRef.current.controller;
-  const foregroundEpoch = useForegroundLifecycleEpoch();
   const [archiveQueued, setArchiveQueued] = useState(false);
   const archiveQueuedRef = useRef(false);
   const archiveQueueTokenRef = useRef(0);
+  const [windowVersion, setWindowVersion] = useState(0);
+  const itemCountRef = useRef(0);
+  const startOverrideRef = useRef<number | null>(null);
+  const pendingExpandCorrectionRef = useRef<{ height: number; top: number } | null>(null);
+  const didSnapToBottomRef = useRef(false);
+  const sessionIdRef = useRef(sessionId);
+  if (sessionIdRef.current !== sessionId) {
+    sessionIdRef.current = sessionId;
+    startOverrideRef.current = null;
+    didSnapToBottomRef.current = false;
+  }
 
   useEffect(() => {
     archiveQueueTokenRef.current += 1;
@@ -1117,6 +1054,19 @@ export function MessageList({
     window.addEventListener("pointercancel", endPointer);
     window.addEventListener("blur", onWindowBlur);
     scroller.addEventListener("scroll", onScroll, { passive: true });
+    const onExpandNearTop = () => {
+      if (scroller.scrollTop > TIMELINE_EXPAND_NEAR_TOP_PX) return;
+      const total = itemCountRef.current;
+      const current = startOverrideRef.current ?? defaultTailStart(total);
+      if (current <= 0) return;
+      pendingExpandCorrectionRef.current = {
+        height: scroller.scrollHeight,
+        top: scroller.scrollTop,
+      };
+      startOverrideRef.current = Math.max(0, current - TIMELINE_WINDOW_EXPAND_ITEMS);
+      setWindowVersion((value) => value + 1);
+    };
+    scroller.addEventListener("scroll", onExpandNearTop, { passive: true });
     return () => {
       if (touchIdleTimer !== null) window.clearTimeout(touchIdleTimer);
       scroller.removeEventListener("wheel", onWheel);
@@ -1130,6 +1080,7 @@ export function MessageList({
       window.removeEventListener("pointercancel", endPointer);
       window.removeEventListener("blur", onWindowBlur);
       scroller.removeEventListener("scroll", onScroll);
+      scroller.removeEventListener("scroll", onExpandNearTop);
     };
   }, [processPaging, scrollParent]);
 
@@ -1235,51 +1186,59 @@ export function MessageList({
       setArchiveQueued(false);
     });
   }, [archive, hasOlderHistory, pagingGeneration, processPaging]);
+  const expandLocalWindow = useCallback(() => {
+    const el = scrollParent;
+    const total = itemCountRef.current;
+    const current = startOverrideRef.current ?? defaultTailStart(total);
+    if (current <= 0) return;
+    if (el) {
+      pendingExpandCorrectionRef.current = {
+        height: el.scrollHeight,
+        top: el.scrollTop,
+      };
+    }
+    startOverrideRef.current = Math.max(0, current - TIMELINE_WINDOW_EXPAND_ITEMS);
+    setWindowVersion((value) => value + 1);
+  }, [scrollParent]);
+  useLayoutEffect(() => {
+    const pending = pendingExpandCorrectionRef.current;
+    const el = scrollParent;
+    if (!pending || !el) return;
+    pendingExpandCorrectionRef.current = null;
+    el.scrollTop = correctedScrollTop(pending.height, el.scrollHeight, pending.top);
+  }, [windowVersion, scrollParent]);
+  useLayoutEffect(() => {
+    const el = scrollParent;
+    if (!el || didSnapToBottomRef.current) return;
+    if (itemCountRef.current === 0) return;
+    didSnapToBottomRef.current = true;
+    el.scrollTop = el.scrollHeight;
+  }, [scrollParent, windowVersion, messages.length, sessionId]);
   // 当前活跃段起点(最后一条 user 消息之后)——TodoWrite/plan 的 HUD 抑制只作用于该段,
   // 与 PinnedTaskTracker 的任务源提取共用 turnSegment.ts 同一判定。
   const turnStart = currentTurnStartIndex(renderableMessages);
-  // Virtuoso 的内部测量图只能跨同一条逻辑 turn 复用。新 optimistic user 行会在
-  // server timelineGeneration 前进之前先到达；若仍沿用上一轮实例，数百行会话在
-  // idle→sending 的原子替换中可触发 react-virtuoso prop bus 的 React #185 循环。
-  // sending=false 也单列 idle epoch，保证完成收口先重建；随后 generation 前进再以
-  // 服务端身份/顺序 epoch 收口。持续流式帧的 user id 不变，不会每帧重挂。
-  const activeTurnId = sending && turnStart > 0
-    ? renderableMessages[turnStart - 1]?.id ?? "active"
-    : sending ? "active" : "idle";
-  const virtualizerEpoch = `${pagingGeneration}::${activeTurnId}::fg${foregroundEpoch}`;
   // 每条消息是否为「所在轮末条 assistant 正文」(评价反馈行唯一可见位)。按全量 messages 下标对齐,
   // 单一权威在 turnSegment.ts(与 turnStart / coalesceTeam 同源的 user=轮边界判定,不另造第二套)。
   const ratingFinal = turnFinalAssistantFlags(renderableMessages);
   const renderItems = coalesceTeam(renderableMessages, 0, sending, liveTurnUsage);
-  // One genuine timeline record is one Virtuoso item. Grouping a whole server
-  // page into a tall virtual row makes prepend measurements unstable: the old
-  // anchor row changes height and the viewport jumps. Virtuoso itself limits
-  // mounted DOM to the viewport, so keeping records separate adds no content
-  // cap and preserves exact per-record identity while paging backwards.
-  const virtualItems: VirtualItem[] = renderItems;
+  itemCountRef.current = renderItems.length;
   const itemKey = renderItemKey;
-  // Give every already-loaded archive item a stable virtual coordinate. When
-  // another archive page is prepended, firstItemIndex decreases by exactly the
-  // number of new virtual items, so Virtuoso keeps the old viewport mounted.
-  // A mixed boundary item is deliberately excluded: it replaces the previous
-  // first tail item rather than adding another virtual row.
-  let archivedVirtualPrefixItems = 0;
-  if (archive) {
-    for (const item of virtualItems) {
-      const itemMessages = renderItemMessages(item);
-      if (
-        itemMessages.length === 0 ||
-        !itemMessages.every((message) => typeof message._historyPageLoadedFrom === "string")
-      ) break;
-      archivedVirtualPrefixItems += 1;
-    }
+  // Production scroll surfaces freeze a start index on first content so streaming
+  // appends cannot unmount a row the user has scrolled up to read. Tests and
+  // other non-scroll surfaces keep the full tree.
+  if (scrollParent && renderItems.length > 0 && startOverrideRef.current === null) {
+    startOverrideRef.current = defaultTailStart(renderItems.length);
   }
-  const firstItemIndex = TIMELINE_VIRTUAL_INDEX_ORIGIN - archivedVirtualPrefixItems;
-  const showHistoryBoundary = hasOlderHistory || renderableMessages.some(
+  const windowStart = !scrollParent || renderItems.length === 0
+    ? 0
+    : Math.min(
+      startOverrideRef.current ?? defaultTailStart(renderItems.length),
+      defaultTailStart(renderItems.length),
+    );
+  const visibleItems = renderItems.slice(windowStart);
+  const showHistoryBoundary = hasOlderHistory || windowStart > 0 || renderableMessages.some(
     (message) => typeof message._historyPageLoadedFrom === "string",
   );
-  const shouldVirtualizeTimeline =
-    renderableMessages.length >= TIMELINE_VIRTUALIZE_MIN_ITEMS || showHistoryBoundary;
 
   const renderItem = (it: RenderItem) => {
     if (it.kind === "single" && it.m._genPlaceholder) {
@@ -1363,28 +1322,30 @@ export function MessageList({
       </MessageBoundary>
     );
   };
-  const renderVirtualItem = renderItem;
-  const historyControl = archive && showHistoryBoundary ? (
+  const canRevealOlder = windowStart > 0 || hasOlderHistory;
+  const historyControl = showHistoryBoundary ? (
     <div
       className="mx-auto flex max-w-3xl justify-center px-5 pb-4 pt-8"
       data-testid="history-page-loader"
     >
       <button
         type="button"
-        onClick={hasOlderHistory ? requestOlderArchive : undefined}
-        disabled={!hasOlderHistory || archive.loading || archiveQueued}
-        aria-busy={hasOlderHistory && (archive.loading || archiveQueued)}
+        onClick={windowStart > 0 ? expandLocalWindow : hasOlderHistory ? requestOlderArchive : undefined}
+        disabled={!canRevealOlder || Boolean(archive?.loading) || archiveQueued}
+        aria-busy={hasOlderHistory && windowStart === 0 && (Boolean(archive?.loading) || archiveQueued)}
         className="mx-auto inline-flex items-center gap-1.5 rounded-full bg-hover px-3 py-1 text-xs text-muted transition-colors hover:text-fg disabled:cursor-default disabled:opacity-60 [@media(hover:none)]:min-h-11 [@media(hover:none)]:py-2.5"
       >
-        {!hasOlderHistory
+        {!canRevealOlder
           ? "已到最早记录"
-          : archive.loading || archiveQueued
+          : windowStart === 0 && (archive?.loading || archiveQueued)
           ? <><Spinner size={12} /> 加载中…</>
-          : archive.error
+          : windowStart === 0 && archive?.error
             ? <span className="text-danger">加载失败，点击重试</span>
-            : legacyArchivedRemaining > 0
-              ? `查看更早历史记录（还有 ${legacyArchivedRemaining} 条）`
-              : "查看更早历史记录"}
+            : windowStart > 0
+              ? `查看更早历史记录（还有 ${windowStart} 条）`
+              : legacyArchivedRemaining > 0
+                ? `查看更早历史记录（还有 ${legacyArchivedRemaining} 条）`
+                : "查看更早历史记录"}
       </button>
     </div>
   ) : null;
@@ -1417,9 +1378,8 @@ export function MessageList({
   );
 
   // App/admin pass an explicit null during the callback-ref's first commit.
-  // Mounting the non-virtual fallback in that one frame would still build the
-  // entire long transcript before Virtuoso can take over. Omitted/undefined
-  // remains the lightweight test/non-scroll surface contract.
+  // Do not mount the transcript in that frame; omitted/undefined remains the
+  // lightweight test/non-scroll surface contract.
   if (scrollParent === null) {
     return (
       <div className="mx-auto flex max-w-3xl items-center justify-center px-5 py-8 text-muted" role="status">
@@ -1429,75 +1389,24 @@ export function MessageList({
     );
   }
 
-  // react-virtuoso does not mount Header/Footer while data is empty. A cold
-  // mobile tab can therefore have a real history request or active turn yet
-  // show a completely blank transcript. Render the same footer directly
-  // until the first canonical row arrives, then hand over to Virtuoso.
-  if (scrollParent && virtualItems.length === 0 && (
+  // Empty data must still show loading/activity chrome. A cold mobile tab can
+  // have a real history request or active turn with no canonical row yet.
+  if (scrollParent && visibleItems.length === 0 && (
     sending || historyLoading || transientNotice || (journalDegraded && onRetryJournal)
   )) {
     return <div className="mx-auto max-w-3xl px-5 py-8">{footer}</div>;
   }
 
-  if (scrollParent && !shouldVirtualizeTimeline) {
-    return (
-      <div className="mx-auto flex max-w-3xl flex-col gap-4 px-5 py-8" data-testid="timeline-short-list">
-        {historyControl}
-        {virtualItems.map((item) => (
-          <div key={itemKey(item)} data-chat-virtual-key={itemKey(item)}>
-            {renderVirtualItem(item)}
-          </div>
-        ))}
-        {footer}
-      </div>
-    );
-  }
-
-  if (scrollParent) {
-    const virtualList = (
-      <Virtuoso
-        // Reset at both server timeline generations and local logical-turn boundaries.
-        // Same-turn stream deltas retain the instance; incompatible measurement graphs do not.
-        key={virtualizerEpoch}
-        customScrollParent={scrollParent}
-        data={virtualItems}
-        firstItemIndex={firstItemIndex}
-        context={{ header: historyControl, footer }}
-        computeItemKey={(_index, item) => itemKey(item)}
-        itemContent={(_index, item) => (
-          <div
-            className="chat-virtual-item mx-auto max-w-3xl px-5 pb-4"
-            data-chat-virtual-key={itemKey(item)}
-          >
-            {renderVirtualItem(item)}
-          </div>
-        )}
-        initialTopMostItemIndex={Math.max(0, virtualItems.length - 1)}
-        increaseViewportBy={{ top: 800, bottom: 1200 }}
-        overscan={400}
-        followOutput={false}
-        components={TIMELINE_VIRTUOSO_COMPONENTS}
-      />
-    );
-    // jsdom has no layout engine, so Virtuoso cannot infer a viewport from the
-    // real scroll parent during App integration tests. Its official mock
-    // context supplies dimensions while preserving the same virtualized data,
-    // keying and initial-tail behavior. Vite removes this branch from builds.
-    return import.meta.env.MODE === "test" ? (
-      <VirtuosoMockContext.Provider value={{ viewportHeight: 768, itemHeight: 96 }}>
-        {virtualList}
-      </VirtuosoMockContext.Provider>
-    ) : virtualList;
-  }
-
-  // Tests/non-scroll surfaces keep a simple tree; production chat uses the
-  // virtualized branch above.
   return (
-    <div className="mx-auto flex max-w-3xl flex-col gap-4 px-5 py-8">
+    <div className="mx-auto flex max-w-3xl flex-col gap-4 px-5 py-8" data-testid="timeline-short-list">
       {historyControl}
-      {virtualItems.map((item) => (
-        <div key={itemKey(item)} data-chat-virtual-key={itemKey(item)}>
-          {renderVirtualItem(item)}
+      {visibleItems.map((item) => (
+        <div
+          key={itemKey(item)}
+          className="chat-virtual-item chat-timeline-row"
+          data-chat-virtual-key={itemKey(item)}
+        >
+          {renderItem(item)}
         </div>
       ))}
       {footer}

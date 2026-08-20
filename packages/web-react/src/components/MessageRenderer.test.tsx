@@ -4,7 +4,7 @@ import { afterEach, beforeAll, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../lib/chat/model";
 import { applyServerIncremental } from "../lib/persist";
 import { messageSignature } from "../lib/chat/render";
-import { MessageList, MessageRenderer } from "./MessageRenderer";
+import { MessageList, MessageRenderer, TIMELINE_INITIAL_TAIL_ITEMS } from "./MessageRenderer";
 import { resetPermissionAutoOpenMemory, type PermissionRespond } from "./chat/PermissionCard";
 import { ResponseRatingProvider } from "./chat/ResponseRating";
 import type { CardCallbacks } from "./chat/cards";
@@ -1266,7 +1266,7 @@ describe("MessageList 归档显式分页(§4/§5)", () => {
     return Array.from({ length: n }, (_, i) => mk("user", { id: `u${i}`, text: `m${i}` }));
   }
 
-  test("已加载的 130 条热尾全部属于数据模型，DOM 有界由生产虚拟列表负责", () => {
+  test("已加载的 130 条热尾全部属于数据模型，非滚动面渲染完整列表", () => {
     renderList(users(130), { archivedCount: 500, archivedThroughSeq: 5 });
     expect(screen.getByText("m0")).toBeInTheDocument();
     expect(screen.getByText("m129")).toBeInTheDocument();
@@ -1629,7 +1629,7 @@ describe("MessageList 归档显式分页(§4/§5)", () => {
     await waitFor(() => expect(onLoadOlder).toHaveBeenCalledTimes(1));
   });
 
-  test("生产虚拟滚动到顶部也不请求归档，只有点击按钮才请求", async () => {
+  test("生产滚动到顶部也不请求归档，只有点击按钮才请求", async () => {
     const onLoadOlder = vi.fn();
     const scroller = document.createElement("div");
     scroller.className = "chat-scroll-area";
@@ -1814,7 +1814,7 @@ describe("连续 thinking 行渲染层合并(codex 空正文标题卡)", () => {
   });
 });
 
-describe("长时间线虚拟分页与活跃状态稳定性", () => {
+describe("长时间线普通 DOM 分页与活跃状态稳定性", () => {
   const processRow = (
     id: string,
     pageKey: string,
@@ -1831,7 +1831,7 @@ describe("长时间线虚拟分页与活跃状态稳定性", () => {
     _turnTapeProcessPageKey: pageKey,
   } as ChatMessage);
 
-  test("每条真实记录各占一个虚拟项，不按物理页合并成巨型滚动项", () => {
+  test("每条真实记录各占一个列表项，不按物理页合并成巨型滚动项", () => {
     const pageA = Array.from({ length: 70 }, (_, index) => processRow(`a-${index}`, "page-a", index));
     const pageB = Array.from({ length: 35 }, (_, index) => processRow(`b-${index}`, "page-b", 100 + index));
     const { container } = render(
@@ -1916,7 +1916,7 @@ describe("长时间线虚拟分页与活跃状态稳定性", () => {
     expect(screen.getByLabelText("正在加载会话内容")).toBeInTheDocument();
   });
 
-  test("新会话首条 optimistic 行走短列表，不把 Virtuoso 带入创建期生命周期", () => {
+  test("新会话首条 optimistic 行走普通 DOM 短列表", () => {
     const scroller = document.createElement("div");
     document.body.appendChild(scroller);
     render(
@@ -1939,7 +1939,7 @@ describe("长时间线虚拟分页与活跃状态稳定性", () => {
     scroller.remove();
   });
 
-  test("生产 Virtuoso Footer 组件身份稳定，stream delta 不重挂活动 DOM", async () => {
+  test("生产 Footer 组件身份稳定，stream delta 不重挂活动 DOM", async () => {
     const scroller = document.createElement("div");
     document.body.append(scroller);
     const history = Array.from({ length: 90 }, (_, index) =>
@@ -1963,7 +1963,8 @@ describe("长时间线虚拟分页与活跃状态稳定性", () => {
       />,
       { container: scroller },
     );
-    expect(screen.getByTestId("virtuoso-item-list")).toBeInTheDocument();
+    expect(screen.getByTestId("timeline-short-list")).toBeInTheDocument();
+    expect(screen.queryByTestId("virtuoso-item-list")).toBeNull();
     const status = await screen.findByLabelText("生成中");
 
     view.rerender(
@@ -1977,9 +1978,111 @@ describe("长时间线虚拟分页与活跃状态稳定性", () => {
       />,
     );
     expect(await screen.findByLabelText("生成中")).toBe(status);
+    scroller.remove();
   });
 
-  test("timeline generation 变化会重建 Virtuoso，避免 live→tape 复用旧测量图", async () => {
+  test("滚动容器首屏只挂最新一段，不把整段长会话一次性提交进 DOM", () => {
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    const rows = Array.from({ length: 220 }, (_, index) =>
+      mk("user", { id: "window-row-" + index, text: "历史记录 " + index, status: "sent" }),
+    );
+    render(
+      <MessageList
+        messages={rows}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+      />,
+      { container: scroller },
+    );
+    expect(scroller.querySelectorAll("[data-chat-virtual-key]")).toHaveLength(TIMELINE_INITIAL_TAIL_ITEMS);
+    expect(screen.getByText("历史记录 219")).toBeInTheDocument();
+    expect(screen.queryByText("历史记录 0")).toBeNull();
+    expect(screen.getByRole("button", { name: /查看更早历史记录（还有 140 条）/ })).toBeInTheDocument();
+    scroller.remove();
+  });
+
+  test("流式追加不卸掉已挂载窗口顶部的行", () => {
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    const rows = Array.from({ length: 220 }, (_, index) =>
+      mk("user", { id: "append-row-" + index, text: "追加记录 " + index, status: "sent" }),
+    );
+    const view = render(
+      <MessageList
+        messages={rows}
+        sending
+        turnActivity={{ startedAt: Date.now(), agentName: "助手" }}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+      />,
+      { container: scroller },
+    );
+    expect(screen.getByText("追加记录 140")).toBeInTheDocument();
+    expect(screen.queryByText("追加记录 139")).toBeNull();
+
+    view.rerender(
+      <MessageList
+        messages={[
+          ...rows,
+          mk("user", { id: "append-row-220", text: "追加记录 220", status: "sending" }),
+        ]}
+        sending
+        turnActivity={{ startedAt: Date.now(), agentName: "助手" }}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+      />,
+    );
+    expect(screen.getByText("追加记录 140")).toBeInTheDocument();
+    expect(screen.getByText("追加记录 220")).toBeInTheDocument();
+    expect(screen.queryByText("追加记录 139")).toBeNull();
+    scroller.remove();
+  });
+
+  test("上滚或点击按钮揭示已驻留更早行，且不发历史网络请求", async () => {
+    const onLoadOlder = vi.fn();
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    const rows = Array.from({ length: 220 }, (_, index) =>
+      mk("user", { id: "expand-row-" + index, text: "驻留记录 " + index, status: "sent" }),
+    );
+    render(
+      <MessageList
+        messages={rows}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+        archive={{
+          hasMore: true,
+          loading: false,
+          error: false,
+          onLoadOlder,
+        }}
+      />,
+      { container: scroller },
+    );
+    expect(scroller.querySelectorAll("[data-chat-virtual-key]")).toHaveLength(TIMELINE_INITIAL_TAIL_ITEMS);
+    scroller.scrollTop = 0;
+    fireEvent.scroll(scroller);
+    await act(async () => {});
+    expect(onLoadOlder).not.toHaveBeenCalled();
+    const afterScroll = scroller.querySelectorAll("[data-chat-virtual-key]").length;
+    expect(afterScroll).toBeGreaterThan(TIMELINE_INITIAL_TAIL_ITEMS);
+    expect(afterScroll).toBeLessThan(rows.length);
+
+    fireEvent.click(screen.getByRole("button", { name: /查看更早历史记录/ }));
+    await act(async () => {});
+    expect(onLoadOlder).not.toHaveBeenCalled();
+    expect(scroller.querySelectorAll("[data-chat-virtual-key]").length).toBeGreaterThan(afterScroll);
+    scroller.remove();
+  });
+
+  test("live→tape generation 变化不重挂活动 Footer，滚动身份保持", async () => {
     const scroller = document.createElement("div");
     document.body.appendChild(scroller);
     const user = mk("user", { id: "generation-user", text: "问题", status: "sent" });
@@ -2015,11 +2118,13 @@ describe("长时间线虚拟分页与活跃状态稳定性", () => {
       />,
     );
 
-    expect(await screen.findByLabelText("生成中")).not.toBe(before);
+    expect(await screen.findByLabelText("生成中")).toBe(before);
+    expect(screen.getByTestId("timeline-short-list")).toBeInTheDocument();
+    expect(screen.queryByTestId("virtuoso-item-list")).toBeNull();
     scroller.remove();
   });
 
-  test("同一 generation 的新 turn 会重建 Virtuoso，避免 optimistic start 复用旧测量图", async () => {
+  test("同一 generation 的新 turn 不重挂活动 Footer，乐观用户行立即可见", async () => {
     const scroller = document.createElement("div");
     document.body.appendChild(scroller);
     const activeRows = Array.from({ length: 220 }, (_, index) =>
@@ -2054,11 +2159,12 @@ describe("长时间线虚拟分页与活跃状态稳定性", () => {
       />,
     );
 
-    expect(await screen.findByLabelText("生成中")).not.toBe(before);
+    expect(await screen.findByLabelText("生成中")).toBe(before);
+    expect(screen.getByText("新问题")).toBeInTheDocument();
     scroller.remove();
   });
 
-  test("后台恢复会重建 Virtuoso，避免复用挂起前的 observer/测量图", async () => {
+  test("后台恢复不重挂时间线，hidden→visible 后活动 Footer 身份保持", async () => {
     const scroller = document.createElement("div");
     document.body.appendChild(scroller);
     const rows = Array.from({ length: 220 }, (_, index) =>
@@ -2090,7 +2196,8 @@ describe("长时间线虚拟分页与活跃状态稳定性", () => {
     visibility.value = "visible";
     fireEvent(document, new Event("visibilitychange"));
 
-    expect(await screen.findByLabelText("生成中")).not.toBe(before);
+    expect(await screen.findByLabelText("生成中")).toBe(before);
+    expect(screen.queryByTestId("timeline-fatal-error")).toBeNull();
     visibilitySpy.mockRestore();
     view.unmount();
     scroller.remove();
