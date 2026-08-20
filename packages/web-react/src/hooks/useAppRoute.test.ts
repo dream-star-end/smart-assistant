@@ -8,6 +8,7 @@ import {
   parsePanelParam,
   parseTutorialCase,
   parseTutorialTopic,
+  preferredBoardView,
   tutorialHref,
   withBoardParams,
   withPanelParams,
@@ -108,15 +109,21 @@ describe('任务面板 /board 深链', () => {
     expect(left.has('ticket')).toBe(false)
   })
 
-  it('默认看板省略 view=board；未知 view 回落看板', () => {
+  it('默认看板省略 view=board；移动/桌面默认值由设备偏好决定', () => {
     const clean = withBoardParams(new URLSearchParams('panel=help'), 'board', null)
     expect(clean.has('view')).toBe(false)
     expect(clean.get('panel')).toBe('help')
-    expect(parseBoardView(new URLSearchParams('view=inbox'))).toBe('inbox')
+    expect(preferredBoardView(false)).toBe('list')
+    expect(preferredBoardView(true)).toBe('board')
+    expect(parseBoardView(new URLSearchParams(), preferredBoardView(false))).toBe('list')
+    expect(parseBoardView(new URLSearchParams(), preferredBoardView(true))).toBe('board')
+    expect(parseBoardView(new URLSearchParams('view=inbox'))).toBe('list')
     expect(parseBoardView(new URLSearchParams('view=cost'))).toBe('cost')
     expect(parseBoardView(new URLSearchParams('view=weekly'))).toBe('weekly')
-    expect(parseBoardView(new URLSearchParams('view=backlog'))).toBe('backlog')
+    expect(parseBoardView(new URLSearchParams('view=backlog'))).toBe('list')
     expect(parseBoardView(new URLSearchParams('view=kanban'))).toBe('board')
+    expect(withBoardParams(new URLSearchParams(), 'inbox').get('view')).toBe('list')
+    expect(withBoardParams(new URLSearchParams(), 'backlog').get('view')).toBe('list')
     expect(parseBoardTicket(new URLSearchParams('ticket=OCV5-42'))).toBe('OCV5-42')
     expect(parseBoardTicket(new URLSearchParams('ticket='))).toBeNull()
   })

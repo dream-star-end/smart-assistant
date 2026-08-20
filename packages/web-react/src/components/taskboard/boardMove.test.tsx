@@ -589,8 +589,8 @@ describe('积压列与有条件拖动', () => {
   })
 })
 
-describe('积压 tab 与新建单据', () => {
-  test('积压 tab 列出跨类型积压并走 /move 批准开工', async () => {
+describe('旧积压视图兼容与新建单据', () => {
+  test('旧积压视图归到任务入口，仍可列出跨类型积压并批准开工', async () => {
     const leftover = sampleTicket({
       id: 't-feat',
       identifier: 'OCV5-9',
@@ -604,7 +604,11 @@ describe('积压 tab 与新建单据', () => {
       move: { action: 'promote', label: '批准开工', fromStageId: null, toStageId: 's1' },
     })
     renderBoard({ view: 'backlog' })
-    expect(await screen.findByRole('tab', { name: /积压 1/ })).toBeInTheDocument()
+    expect(await screen.findByRole('tab', { name: '任务' })).toHaveAttribute(
+      'aria-selected',
+      'true',
+    )
+    expect(screen.queryByRole('tab', { name: /积压/ })).not.toBeInTheDocument()
     expect(screen.getByText('遗留需求')).toBeInTheDocument()
     await act(async () => {
       fireEvent.click(screen.getByTestId('ticket-ready'))
