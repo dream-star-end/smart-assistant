@@ -108,7 +108,7 @@ describe('listClientSessions 归档/分页/预览', () => {
     assert.equal(page2.nextCursor, undefined)
   })
 
-  it('lastMessagePreview 取最后一条纯文本前 80 字;空消息不带', async () => {
+  it('lastMessagePreview 取最后一条有非空 text 的消息;空消息不带', async () => {
     await upsertClientSession(sess('web-empty'))
     await upsertClientSession(sess('web-msg', {
       messages: [
@@ -116,11 +116,38 @@ describe('listClientSessions 归档/分页/预览', () => {
         { id: 'm2', role: 'assistant', text: '最后一条 **答案**\n换行', ts: 2 },
       ],
     }))
+    await upsertClientSession(sess('web-tape', {
+      lastAt: Date.now() + 1,
+      messages: [
+        { id: 'm1', role: 'user', text: '用户最近一次说的话', ts: 1, _seq: 1 },
+        {
+          id: 'm2',
+          role: 'assistant',
+          ts: 2,
+          _source: 'cursor',
+          _turnTapeId: 'tape-1',
+          _turnTapeSha256: 'abc',
+          _seq: 2,
+          _orderSeq: 2,
+        },
+      ],
+    }))
+    await upsertClientSession(sess('web-stubs-only', {
+      lastAt: Date.now() + 2,
+      messages: [
+        { id: 'a1', role: 'assistant', ts: 1, _turnTapeId: 't1', _seq: 1 },
+        { id: 'a2', role: 'assistant', ts: 2, _turnTapeId: 't2', _seq: 2 },
+      ],
+    }))
     const list = await listClientSessions(USER)
     const empty = list.sessions.find((s) => s.id === 'web-empty')
     const msg = list.sessions.find((s) => s.id === 'web-msg')
+    const tape = list.sessions.find((s) => s.id === 'web-tape')
+    const stubs = list.sessions.find((s) => s.id === 'web-stubs-only')
     assert.equal('lastMessagePreview' in (empty ?? {}), false)
     assert.equal(msg?.lastMessagePreview, '最后一条 **答案** 换行')
+    assert.equal(tape?.lastMessagePreview, '用户最近一次说的话')
+    assert.equal('lastMessagePreview' in (stubs ?? {}), false)
   })
 })
 

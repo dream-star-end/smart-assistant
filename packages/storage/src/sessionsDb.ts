@@ -1812,6 +1812,10 @@ export const SESSION_SEARCH_LIMIT_MAX = 50
 export const SESSION_LIST_LIMIT_MAX = 200
 export const SESSION_BATCH_IDS_MAX = 200
 export const LAST_MESSAGE_PREVIEW_MAX = 80
+// 侧栏预览只从 messages 数组尾部往前看这么多条。线上 assistant 不带 text(正文在
+// turn tape),最后一条几乎总是占位 stub;一轮对话里 user + 若干 assistant/tool/thinking
+// stub 远小于 20,再往前是更早轮次,不适合当预览。超长数组不从头扫。
+export const LAST_MESSAGE_PREVIEW_TAIL_MAX = 20
 export const SEARCH_SNIPPET_MAX = 160
 export const SEARCH_SNIPPET_RADIUS = 40
 export const PROJECT_INSTRUCTIONS_INJECT_MAX = 4000
@@ -4410,9 +4414,15 @@ export async function replayMsgOutbox(): Promise<{
 
 const SQLITE_LAST_PREVIEW_SQL = `
   CASE
-    WHEN json_array_length(cs.messages) > 0 THEN
-      substr(COALESCE(json_extract(cs.messages, '$[' || (json_array_length(cs.messages) - 1) || '].text'), ''), 1, 240)
-    ELSE NULL
+    WHEN length(CAST(cs.messages AS BLOB)) > ${SESSION_SEARCH_JSON_EXPAND_MAX_BYTES} THEN NULL
+    ELSE (
+      SELECT substr(trim(COALESCE(json_extract(j.value, '$.text'), '')), 1, 240)
+        FROM json_each(cs.messages) j
+       WHERE CAST(j.key AS INTEGER) >= json_array_length(cs.messages) - ${LAST_MESSAGE_PREVIEW_TAIL_MAX}
+         AND length(trim(COALESCE(json_extract(j.value, '$.text'), ''))) > 0
+       ORDER BY CAST(j.key AS INTEGER) DESC
+       LIMIT 1
+    )
   END`
 
 function _mapClientSessionMetaRow(r: {
@@ -4459,7 +4469,8 @@ async function _sqliteListClientSessions(
     : undefined
   // runState / lastOutcome 从 turn_dispatch_inbox 一条 SQL 派生(禁止 N+1)。
   // JOIN 只按 session_id:inbox.user_id 是裸 uid,client_sessions.user_id 是 `c:<uid>`。
-  // last_preview_raw 在 SQL 侧截最后一条 .text 前 240 字,不把 messages blob 拉进 Node。
+  // last_preview_raw:SQL 侧从数组尾部最多 20 条里取最近一条非空 .text(线上 assistant
+  // 无 text,实际即最近 user 话);>2MB 行不展开。不把 messages blob 拉进 Node。
   const params: unknown[] = [userId]
   let where = 'cs.user_id = ? AND cs.deleted_at IS NULL'
   if (!includeArchived) where += ' AND cs.archived_at IS NULL'

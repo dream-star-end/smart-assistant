@@ -146,6 +146,7 @@ import {
   type PatchClientSessionMetaResult,
   rankSessionSearchHits,
   sanitizeProjectInstructions,
+  LAST_MESSAGE_PREVIEW_TAIL_MAX,
   SESSION_LIST_LIMIT_MAX,
   SESSION_SEARCH_JSON_CANDIDATE_MAX,
   SESSION_SEARCH_JSON_EXPAND_MAX_BYTES,
@@ -9291,6 +9292,8 @@ export function createPgSessionsBackend(
     ): Promise<ListClientSessionsResult> {
       // runState / lastOutcome / lastErrorCode 从 turn_dispatches 一条 SQL 派生。
       // inbox 在容器 SQLite;master 权威是 turn_dispatches(status/outcome/failure_code)。
+      // last_preview_raw:数组尾部最多 20 条里最近非空 .text(线上 assistant 无 text);
+      // octet_length > 2MB 不展开,不把 messages blob 拉进 Node。
       const dispatchUid = /^c:([1-9][0-9]*)$/.exec(userId)?.[1] ?? "-1";
       const includeArchived = opts.includeArchived === true;
       const before = typeof opts.before === "number" && Number.isFinite(opts.before) && opts.before > 0
@@ -9327,9 +9330,20 @@ export function createPgSessionsBackend(
         }>(
           `SELECT cs.id, cs.agent_id, cs.title, cs.pinned, cs.created_at, cs.last_at, cs.updated_at,
                   cs.message_count AS msg_count, cs.model_id, cs.project_id, cs.archived_at,
-                  CASE WHEN cs.message_count > 0
-                       THEN LEFT(COALESCE(cs.messages::json -> -1 ->> 'text', ''), 240)
-                       ELSE NULL END AS last_preview_raw,
+                  CASE WHEN octet_length(cs.messages) > ${SESSION_SEARCH_JSON_EXPAND_MAX_BYTES}
+                            OR left(COALESCE(cs.messages, ''), 1) <> '[' THEN NULL
+                       ELSE (
+                         SELECT LEFT(txt, 240)
+                           FROM (
+                             SELECT btrim(elem->>'text') AS txt
+                               FROM json_array_elements(cs.messages::json)
+                                    WITH ORDINALITY AS t(elem, n)
+                              ORDER BY n DESC
+                              LIMIT ${LAST_MESSAGE_PREVIEW_TAIL_MAX}
+                           ) tail
+                          WHERE txt IS NOT NULL AND length(txt) > 0
+                          LIMIT 1
+                       ) END AS last_preview_raw,
                   CASE WHEN open_d.session_id IS NOT NULL THEN 'running' ELSE 'idle' END AS run_state,
                   last_d.outcome AS last_outcome,
                   last_d.failure_code AS last_error_code
