@@ -227,8 +227,10 @@ export ANTHROPIC_BASE_URL="$anthropic_base"
 api_key=""
 anthropic_base=""
 
-# Durable CLI session store (sess_* files). Ephemeral HOME holds only the
-# per-spawn config.json + opaque relay token and is deleted on EXIT.
+# Durable CLI store. 0.16.3 --resume reads sqlite at
+# config.storage.sessionDbPath (ZCODE_SESSION_DB_PATH / ZCODE_SESSION_DB),
+# NOT ZCODE_STORAGE_DIR. Ephemeral HOME holds only the per-spawn
+# config.json + opaque relay token and is deleted on EXIT.
 # Hosted containers often have OPENCLAUDE_HOME empty; still pin storage to
 # the per-user volume. Never follow a path we do not own, and never put
 # secrets in this directory.
@@ -270,6 +272,23 @@ if [ -n "$storage_root" ]; then
   try_storage_root "$storage_dir" \
     || die "durable ZCode storage directory is invalid"
   export ZCODE_STORAGE_DIR="$storage_dir"
+  session_db_dir="$storage_dir/cli/db"
+  case "$session_db_dir" in
+    */..|*/../*|../*|..) die "durable ZCode session database directory is invalid" ;;
+  esac
+  /bin/mkdir -p -m 0700 -- "$storage_dir/cli" "$session_db_dir" \
+    || die "cannot create durable ZCode session database directory"
+  /bin/chmod 0700 -- "$storage_dir/cli" "$session_db_dir" \
+    || die "cannot secure durable ZCode session database directory"
+  try_storage_root "$storage_dir/cli" \
+    || die "durable ZCode session database directory is invalid"
+  try_storage_root "$session_db_dir" \
+    || die "durable ZCode session database directory is invalid"
+  session_db_path="$session_db_dir/db.sqlite"
+  if [ -L "$session_db_path" ]; then
+    die "durable ZCode session database is invalid"
+  fi
+  export ZCODE_SESSION_DB_PATH="$session_db_path"
 elif [ "$test_mode" -eq 0 ]; then
   die "durable ZCode storage is unavailable"
 fi
@@ -282,6 +301,7 @@ unset ZAI_CODING_PLAN_KEY
 unset ANTHROPIC_AUTH_TOKEN
 unset OC_ZCODE_RELAY_TOKEN
 unset OPENCLAUDE_V3_CONTAINER_TOKEN
+unset ZCODE_SESSION_DB
 export HOME="$zcode_home"
 export ZCODE_MODEL="$upstream"
 set +e

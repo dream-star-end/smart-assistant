@@ -9,14 +9,15 @@ import { spawn } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, test } from 'node:test'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
+import { DatabaseSync } from 'node:sqlite'
 
 const WRAPPER = path.resolve(
   process.cwd(),
   'packages/commercial/agent-sandbox/platform-runtime/bin/oc-zcode.sh',
 )
 
-function runWrapper(args: string[], env: NodeJS.ProcessEnv): Promise<{
+function runWrapper(args: string[], env: NodeJS.ProcessEnv, timeoutMs = 0): Promise<{
   code: number
   stdout: string
   stderr: string
@@ -28,12 +29,23 @@ function runWrapper(args: string[], env: NodeJS.ProcessEnv): Promise<{
     })
     let stdout = ''
     let stderr = ''
+    const timer = timeoutMs > 0
+      ? setTimeout(() => {
+          try { child.kill('SIGKILL') } catch { /* already exited */ }
+        }, timeoutMs)
+      : null
     child.stdout.setEncoding('utf8')
     child.stderr.setEncoding('utf8')
     child.stdout.on('data', (chunk: string) => { stdout += chunk })
     child.stderr.on('data', (chunk: string) => { stderr += chunk })
-    child.on('error', reject)
-    child.on('close', (code) => resolve({ code: code ?? 1, stdout, stderr }))
+    child.on('error', (err) => {
+      if (timer) clearTimeout(timer)
+      reject(err)
+    })
+    child.on('close', (code) => {
+      if (timer) clearTimeout(timer)
+      resolve({ code: code ?? 1, stdout, stderr })
+    })
   })
 }
 
@@ -68,6 +80,13 @@ describe('oc-zcode wrapper', () => {
     assert.doesNotMatch(text, /rm -rf -- "\$storage_dir"/)
     assert.doesNotMatch(text, /rm -rf -- "\$ZCODE_STORAGE_DIR"/)
     assert.match(text, /durable ZCode storage is unavailable/)
+    assert.match(text, /ZCODE_SESSION_DB_PATH/)
+    assert.match(text, /session_db_dir="\$storage_dir\/cli\/db"/)
+    assert.match(text, /session_db_path="\$session_db_dir\/db\.sqlite"/)
+    assert.match(text, /unset ZCODE_SESSION_DB/)
+    assert.doesNotMatch(text, /unset ZCODE_SESSION_DB_PATH/)
+    assert.doesNotMatch(text, /rm -rf -- "\$session_db/)
+    assert.doesNotMatch(text, /rm -rf -- "\$ZCODE_SESSION_DB_PATH"/)
   })
 
   test('selfhost runtime build profile persistently includes ZCode 0.16.3', () => {
@@ -323,6 +342,8 @@ process.stdout.write(JSON.stringify({ sessionId: 'sess_w', response: 'wrapped', 
 const fs = require('node:fs')
 fs.writeFileSync(process.env.FAKE_ZCODE_CAPTURE, JSON.stringify({
   storage: process.env.ZCODE_STORAGE_DIR || null,
+  sessionDb: process.env.ZCODE_SESSION_DB_PATH || null,
+  sessionDbAlias: process.env.ZCODE_SESSION_DB || null,
   home: process.env.HOME || null,
   anthropic: process.env.ANTHROPIC_API_KEY || null,
 }))
@@ -344,10 +365,14 @@ process.stdout.write(JSON.stringify({ sessionId: 'sess_w', response: 'wrapped', 
       assert.equal(result.code, 0, result.stderr)
       const captured = JSON.parse(await readFile(capture, 'utf8')) as {
         storage: string | null
+        sessionDb: string | null
+        sessionDbAlias: string | null
         home: string | null
         anthropic: string | null
       }
       assert.equal(captured.storage, path.join(ocHome, 'zcode-cli'))
+      assert.equal(captured.sessionDb, path.join(ocHome, 'zcode-cli', 'cli', 'db', 'db.sqlite'))
+      assert.equal(captured.sessionDbAlias, null)
       assert.match(String(captured.home), /openclaude-zcode\./)
       assert.notEqual(captured.home, agentHome)
       assert.equal(captured.anthropic, 'super-secret-zcode-key')
@@ -355,6 +380,10 @@ process.stdout.write(JSON.stringify({ sessionId: 'sess_w', response: 'wrapped', 
       assert.equal(listing.some((name) => name.toLowerCase().includes('secret') || name.includes('key')), false)
       const st = await stat(path.join(ocHome, 'zcode-cli'))
       assert.equal(st.mode & 0o777, 0o700)
+      const dbDir = path.join(ocHome, 'zcode-cli', 'cli', 'db')
+      const dbDirSt = await stat(dbDir)
+      assert.equal(dbDirSt.isDirectory(), true)
+      assert.equal(dbDirSt.mode & 0o777, 0o700)
       assert.equal(result.stderr.includes('super-secret-zcode-key'), false)
       assert.equal(result.stdout.includes('super-secret-zcode-key'), false)
     } finally {
@@ -375,8 +404,13 @@ process.stdout.write(JSON.stringify({ sessionId: 'sess_w', response: 'wrapped', 
 const fs = require('node:fs')
 const path = require('node:path')
 const store = process.env.ZCODE_STORAGE_DIR
+const sessionDb = process.env.ZCODE_SESSION_DB_PATH
 if (!store) {
   process.stderr.write('missing ZCODE_STORAGE_DIR\\n')
+  process.exit(1)
+}
+if (!sessionDb || !sessionDb.endsWith('/cli/db/db.sqlite') || !sessionDb.startsWith(store + '/')) {
+  process.stderr.write('missing ZCODE_SESSION_DB_PATH\\n')
   process.exit(1)
 }
 const marker = path.join(store, 'sess_shared.json')
@@ -390,6 +424,7 @@ if (resumeAt >= 0) {
   const prior = JSON.parse(fs.readFileSync(marker, 'utf8'))
   fs.writeFileSync(capture, JSON.stringify({
     storage: store,
+    sessionDb,
     home: process.env.HOME,
     resume: process.argv[resumeAt + 1],
     prior,
@@ -400,6 +435,7 @@ if (resumeAt >= 0) {
   fs.writeFileSync(marker, JSON.stringify({ sessionId: 'sess_shared', turn: 1 }))
   fs.writeFileSync(capture, JSON.stringify({
     storage: store,
+    sessionDb,
     home: process.env.HOME,
     resume: null,
     secretInStore: fs.readdirSync(store).join(','),
@@ -427,12 +463,14 @@ process.stdout.write(JSON.stringify({ sessionId: 'sess_shared', response: 'ok', 
       assert.equal(r2.code, 0, r2.stderr)
       const c1 = JSON.parse(await readFile(capture1, 'utf8')) as {
         storage: string
+        sessionDb: string
         home: string
         resume: string | null
         secretInStore: string
       }
       const c2 = JSON.parse(await readFile(capture2, 'utf8')) as {
         storage: string
+        sessionDb: string
         home: string
         resume: string | null
         prior: { sessionId: string; turn: number }
@@ -440,6 +478,8 @@ process.stdout.write(JSON.stringify({ sessionId: 'sess_shared', response: 'ok', 
       }
       assert.equal(c1.storage, path.join(ocHome, 'zcode-cli'))
       assert.equal(c2.storage, c1.storage)
+      assert.equal(c1.sessionDb, path.join(ocHome, 'zcode-cli', 'cli', 'db', 'db.sqlite'))
+      assert.equal(c2.sessionDb, c1.sessionDb)
       assert.notEqual(c1.home, c2.home)
       assert.match(c1.home, /openclaude-zcode\./)
       assert.match(c2.home, /openclaude-zcode\./)
@@ -457,4 +497,133 @@ process.stdout.write(JSON.stringify({ sessionId: 'sess_shared', response: 'ok', 
       await rm(dir, { recursive: true, force: true })
     }
   })
+
+  const REAL_ZCODE_CJS = '/opt/zcode-cli/versions/0.16.3/zcode.cjs'
+  const REAL_NODE = '/usr/local/bin/node'
+
+  function runRealCli(
+    args: string[],
+    env: NodeJS.ProcessEnv,
+    timeoutMs: number,
+  ): Promise<{ code: number; stdout: string; stderr: string }> {
+    return new Promise((resolve, reject) => {
+      const child = spawn(REAL_NODE, [REAL_ZCODE_CJS, ...args], {
+        env,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+      let stdout = ''
+      let stderr = ''
+      const timer = setTimeout(() => {
+        try { child.kill('SIGKILL') } catch { /* already exited */ }
+      }, timeoutMs)
+      child.stdout.setEncoding('utf8')
+      child.stderr.setEncoding('utf8')
+      child.stdout.on('data', (chunk: string) => { stdout += chunk })
+      child.stderr.on('data', (chunk: string) => { stderr += chunk })
+      child.on('error', (err) => {
+        clearTimeout(timer)
+        reject(err)
+      })
+      child.on('close', (code) => {
+        clearTimeout(timer)
+        resolve({ code: code ?? 1, stdout, stderr })
+      })
+    })
+  }
+
+  test(
+    'real CLI 0.16.3 --resume reads sqlite from ZCODE_SESSION_DB_PATH across two ephemeral HOMEs',
+    { skip: !existsSync(REAL_ZCODE_CJS) || !existsSync(REAL_NODE) },
+    async () => {
+      const dir = await mkdtemp(path.join(tmpdir(), 'oc-zcode-real-sqlite-'))
+      const home1 = path.join(dir, 'home1')
+      const home2 = path.join(dir, 'home2')
+      const store = path.join(dir, 'store')
+      const cwd = path.join(dir, 'cwd')
+      const sessionId = 'sess_aaaaaaa1-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+      const sessionDb = path.join(store, 'cli', 'db', 'db.sqlite')
+      const dummyKey = 'diag-not-a-real-key'
+      const config = JSON.stringify({
+        model: { main: 'zai-coding-plan/glm-5.3' },
+        provider: {
+          'zai-coding-plan': {
+            kind: 'anthropic',
+            name: 'diag',
+            options: {
+              apiKeyRequired: true,
+              baseURL: 'http://127.0.0.1:9/v1',
+              apiKey: dummyKey,
+            },
+          },
+        },
+      })
+      await mkdir(path.join(home1, '.zcode', 'cli'), { recursive: true, mode: 0o700 })
+      await mkdir(path.join(home2, '.zcode', 'cli'), { recursive: true, mode: 0o700 })
+      await mkdir(path.join(store, 'cli', 'db'), { recursive: true, mode: 0o700 })
+      await mkdir(cwd, { recursive: true })
+      await writeFile(path.join(home1, '.zcode', 'cli', 'config.json'), config, { mode: 0o600 })
+      await writeFile(path.join(home2, '.zcode', 'cli', 'config.json'), config, { mode: 0o600 })
+      const cliEnv = (home: string): NodeJS.ProcessEnv => ({
+        PATH: process.env.PATH,
+        HOME: home,
+        ZCODE_STORAGE_DIR: store,
+        ZCODE_SESSION_DB_PATH: sessionDb,
+      })
+      try {
+        const r1 = await runRealCli(
+          ['--prompt', 'round-1', '--json', '--mode', 'yolo', '--no-color', '--cwd', cwd, '--resume', sessionId],
+          cliEnv(home1),
+          20_000,
+        )
+        assert.match(r1.stderr, /Session not found:\s*sess_aaaaaaa1-bbbb-4ccc-8ddd-eeeeeeeeeeee/)
+        assert.equal(existsSync(sessionDb), true)
+        assert.equal(existsSync(path.join(home1, '.zcode', 'cli', 'db', 'db.sqlite')), false)
+
+        const db = new DatabaseSync(sessionDb)
+        try {
+          const now = Date.now()
+          db.prepare(`
+            insert into session (
+              id, project_id, workspace_id, parent_id, trace_id, task_type, slug, directory, path,
+              title, title_source, title_message_id, version, share_url, revert, permission,
+              time_created, time_updated, time_title_updated, time_compacting, time_archived
+            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).run(
+            sessionId, 'proj_diag', null, null, null, 'interactive', 'diag', cwd, null,
+            'diag', 'first_input', null, '1', null, null, null,
+            now, now, now, null, null,
+          )
+          const countRow = db.prepare('select count(*) as n from session where id = ?').get(sessionId) as { n: number }
+          assert.equal(countRow.n, 1)
+        } finally {
+          db.close()
+        }
+
+        await rm(home1, { recursive: true, force: true })
+        const r2 = await runRealCli(
+          ['--prompt', 'round-2', '--json', '--mode', 'yolo', '--no-color', '--cwd', cwd, '--resume', sessionId],
+          cliEnv(home2),
+          20_000,
+        )
+        assert.doesNotMatch(r2.stderr, /Session not found:\s*sess_/)
+        assert.equal(existsSync(path.join(home2, '.zcode', 'cli', 'db', 'db.sqlite')), false)
+        const db2 = new DatabaseSync(sessionDb)
+        try {
+          const row = db2.prepare('select id, directory from session where id = ?').get(sessionId) as
+            | { id: string; directory: string }
+            | undefined
+          assert.equal(row?.id, sessionId)
+          assert.equal(row?.directory, cwd)
+        } finally {
+          db2.close()
+        }
+        const sqliteBytes = await readFile(sessionDb)
+        assert.equal(sqliteBytes.includes(Buffer.from(dummyKey)), false)
+        assert.equal(r1.stderr.includes(dummyKey), false)
+        assert.equal(r2.stderr.includes(dummyKey), false)
+      } finally {
+        await rm(dir, { recursive: true, force: true })
+      }
+    },
+  )
 })
