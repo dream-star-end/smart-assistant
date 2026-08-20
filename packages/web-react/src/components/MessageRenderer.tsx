@@ -923,6 +923,9 @@ export type MessageListArchive = {
   error: boolean;
   /** 拉更早一页归档(App 接线 loadOlderHistory + 前插后视口保持)。 */
   onLoadOlder: () => void | Promise<void>;
+  /** Hot live-unit window still has earlier units than the first pack. */
+  liveHasMoreBefore?: boolean;
+  onLoadOlderLiveUnits?: () => void | Promise<void>;
 };
 
 export function MessageList({
@@ -1285,6 +1288,29 @@ export function MessageList({
       setArchiveQueued(false);
     });
   }, [archive, hasOlderHistory, pagingGeneration, processPaging]);
+  const liveHasMore = archive?.liveHasMoreBefore === true;
+  const requestOlderLiveUnits = useCallback(() => {
+    if (!archive?.onLoadOlderLiveUnits || !liveHasMore || archive.loading || archiveQueuedRef.current) {
+      return;
+    }
+    archiveQueuedRef.current = true;
+    setArchiveQueued(true);
+    const token = ++archiveQueueTokenRef.current;
+    const el = scrollParent;
+    beginViewportPreserve();
+    if (el) {
+      pendingExpandCorrectionRef.current = {
+        height: el.scrollHeight,
+        top: el.scrollTop,
+      };
+    }
+    void Promise.resolve(archive.onLoadOlderLiveUnits()).finally(() => {
+      if (archiveQueueTokenRef.current !== token) return;
+      archiveQueuedRef.current = false;
+      setArchiveQueued(false);
+      setWindowVersion((value) => value + 1);
+    });
+  }, [archive, liveHasMore, scrollParent, beginViewportPreserve]);
   const expandLocalWindow = useCallback(() => {
     const el = scrollParent;
     const total = itemCountRef.current;
@@ -1371,7 +1397,7 @@ export function MessageList({
     }
   }
   const paintedItems = visibleItems.slice(paintStart, paintEnd);
-  const showHistoryBoundary = hasOlderHistory || windowStart > 0 || renderableMessages.some(
+  const showHistoryBoundary = hasOlderHistory || liveHasMore || windowStart > 0 || renderableMessages.some(
     (message) => typeof message._historyPageLoadedFrom === "string",
   );
 
@@ -1457,7 +1483,7 @@ export function MessageList({
       </MessageBoundary>
     );
   };
-  const canRevealOlder = windowStart > 0 || hasOlderHistory;
+  const canRevealOlder = windowStart > 0 || hasOlderHistory || liveHasMore;
   const historyControl = showHistoryBoundary ? (
     <div
       className="mx-auto flex max-w-3xl justify-center px-5 pb-4 pt-8"
@@ -1465,7 +1491,7 @@ export function MessageList({
     >
       <button
         type="button"
-        onClick={windowStart > 0 ? expandLocalWindow : hasOlderHistory ? requestOlderArchive : undefined}
+        onClick={windowStart > 0 ? expandLocalWindow : liveHasMore ? requestOlderLiveUnits : hasOlderHistory ? requestOlderArchive : undefined}
         disabled={!canRevealOlder || Boolean(archive?.loading) || archiveQueued}
         aria-busy={hasOlderHistory && windowStart === 0 && (Boolean(archive?.loading) || archiveQueued)}
         className="mx-auto inline-flex items-center gap-1.5 rounded-full bg-hover px-3 py-1 text-xs text-muted transition-colors hover:text-fg disabled:cursor-default disabled:opacity-60 [@media(hover:none)]:min-h-11 [@media(hover:none)]:py-2.5"

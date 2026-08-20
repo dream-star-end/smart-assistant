@@ -7,7 +7,6 @@ import {
   PROJECT_ROW_HEIGHT,
   SEARCH_HIT_HEIGHT,
   SESSION_ROW_HEIGHT,
-  SESSION_ROW_HEIGHT_PREVIEW,
 } from "./constants";
 
 export type FlatItem =
@@ -29,7 +28,6 @@ export type FlatItem =
 export type FlattenInput = {
   searching: boolean;
   showProjects: boolean;
-  showPreview: boolean;
   pinned: Session[];
   projects: ChatProject[];
   projectSessions: Map<string, Session[]>;
@@ -65,14 +63,13 @@ function runningIn(list: Session[], isRunning?: (s: Session) => boolean): number
 }
 
 export function flattenSidebarItems(input: FlattenInput): FlatItem[] {
-  const sessionH = input.showPreview ? SESSION_ROW_HEIGHT_PREVIEW : SESSION_ROW_HEIGHT;
   const items: FlatItem[] = [];
 
   if (input.searching) {
     for (const [label, list] of input.ungroupedGroups) {
       if (label) items.push({ kind: "header", key: `h-${label}`, label, height: GROUP_HEADER_HEIGHT });
       for (const s of list) {
-        items.push({ kind: "session", key: `s-${s.id}`, session: s, height: sessionH });
+        items.push({ kind: "session", key: `s-${s.id}`, session: s, height: SESSION_ROW_HEIGHT });
       }
     }
     if (input.searchRemote === "loading") {
@@ -107,7 +104,7 @@ export function flattenSidebarItems(input: FlattenInput): FlatItem[] {
   if (input.pinned.length > 0) {
     items.push({ kind: "header", key: "h-pinned", label: "置顶", height: GROUP_HEADER_HEIGHT });
     for (const s of input.pinned) {
-      items.push({ kind: "session", key: `s-${s.id}`, session: s, height: sessionH });
+      items.push({ kind: "session", key: `s-${s.id}`, session: s, height: SESSION_ROW_HEIGHT });
     }
   }
 
@@ -131,7 +128,7 @@ export function flattenSidebarItems(input: FlattenInput): FlatItem[] {
           items.push({ kind: "hint", key: `p-empty-${p.id}`, text: "暂无会话", height: HINT_ROW_HEIGHT });
         }
         for (const s of kids) {
-          items.push({ kind: "session", key: `s-${s.id}`, session: s, indent: true, height: sessionH });
+          items.push({ kind: "session", key: `s-${s.id}`, session: s, indent: true, height: SESSION_ROW_HEIGHT });
         }
       }
     }
@@ -158,7 +155,7 @@ export function flattenSidebarItems(input: FlattenInput): FlatItem[] {
       });
     }
     for (const s of defaultKids) {
-      items.push({ kind: "session", key: `s-${s.id}`, session: s, indent: true, height: sessionH });
+      items.push({ kind: "session", key: `s-${s.id}`, session: s, indent: true, height: SESSION_ROW_HEIGHT });
     }
   }
 
@@ -176,7 +173,7 @@ export function flattenSidebarItems(input: FlattenInput): FlatItem[] {
       items.push({ kind: "hint", key: "archived-empty", text: "没有已归档的会话", height: HINT_ROW_HEIGHT });
     }
     for (const s of input.archived) {
-      items.push({ kind: "session", key: `s-${s.id}`, session: s, height: sessionH });
+      items.push({ kind: "session", key: `s-${s.id}`, session: s, height: SESSION_ROW_HEIGHT });
     }
   }
 

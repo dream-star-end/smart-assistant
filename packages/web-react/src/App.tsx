@@ -1625,6 +1625,14 @@ export function App() {
       progressHint: activeSess._turnProgressHint,
       turnStatus: activeSess._turnStatus ?? null,
       recoveryStatus: activeSess._recoveryStatus ?? null,
+      hasVisibleProcess: activeSess._liveUnitsPackApplied === true ||
+        wsMessages.some((m) =>
+          m._liveUnit === true ||
+          m.role === "thinking" ||
+          m.role === "tool" ||
+          m.role === "agent-group" ||
+          m.role === "plan",
+        ),
       coldStart: !!activeSess._isFirstTurnAfterReady,
       agentName: agent.name || "助手",
       leaderStep: teamLeaderActive ? deriveActivePlanStep(extractLatestTodos(wsMessages)) : null,
@@ -2521,6 +2529,10 @@ export function App() {
           loading: archiveLoading,
           error: archiveError,
           onLoadOlder: onLoadOlderHistory,
+          liveHasMoreBefore: activeSess?._liveUnitsHasMoreBefore === true,
+          onLoadOlderLiveUnits: async () => {
+            await chat.loadOlderLiveUnits(activeId);
+          },
         }
       : undefined;
 
@@ -2546,10 +2558,6 @@ export function App() {
     onDeleteProject: deleteProjectConfirm,
     isSending: (id: string) => !demo && chat.isSending(id),
     liveTerminal,
-    runStartedAt: (id: string) => {
-      const t = chat.getSession(id)?._turnStartedAt;
-      return typeof t === "number" && t > 0 ? t : undefined;
-    },
     socketVersion: chat.version,
     onLogout: demo ? undefined : logout,
     onOpenManage: demo ? undefined : () => openManage(DEFAULT_MANAGE_TAB),

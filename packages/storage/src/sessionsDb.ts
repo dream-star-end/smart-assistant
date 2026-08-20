@@ -26,6 +26,7 @@ import {
   modelHistorySemanticText,
   MODEL_HISTORY_EXACT_SUFFIX_MARKER,
   resolveModelHistoryContextWindow,
+  type LiveUnitsPage,
 } from '@openclaude/protocol'
 import Database from 'better-sqlite3'
 // 引擎中立的写路径决策层(RFC D6b);与本文件构成运行时环(见 clientSessionsPlan.ts 顶注)。
@@ -5352,6 +5353,53 @@ async function _sqliteReadClientSessionLiveFrames(
     : null
 }
 
+/** Personal/container SQLite has no commercial master live-frame journal. */
+async function _sqliteReadClientSessionLiveUnits(
+  sessId: string,
+  userId: string,
+  _options?: {
+    n?: number
+    k?: number
+    before?: string | null
+    group?: string | null
+    nestedBefore?: string | null
+    deadlineMs?: number
+    maxBytes?: number
+  },
+): Promise<LiveUnitsPage | null> {
+  const db = await getSessionsDb()
+  const row = db.prepare(
+    'SELECT 1 FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL',
+  ).get(sessId, userId)
+  return row
+    ? {
+      view: 'units',
+      units: [],
+      n: 20,
+      hasMoreBefore: false,
+      beforeCursor: null,
+      streamClientMessageIds: [],
+      openDispatch: false,
+      hasTapeProjection: false,
+      tapeProjectionVersion: 0,
+      reducerEpoch: '1',
+      degraded: false,
+    }
+    : null
+}
+
+async function _sqliteReadLiveOrTapeFramePayload(
+  sessId: string,
+  userId: string,
+  _ref: { recordId?: string | null; sha256?: string | null },
+): Promise<{ source: 'live' | 'tape'; payload: unknown; sha256?: string } | null> {
+  const db = await getSessionsDb()
+  const row = db.prepare(
+    'SELECT 1 FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL',
+  ).get(sessId, userId)
+  return row ? null : null
+}
+
 /** Personal/container SQLite keeps no gateway live-frame journal, so there is
  * nothing to converge. */
 async function _sqliteConvergeFinalizedTapeLiveStreams(): Promise<{ converged: number }> {
@@ -6717,6 +6765,8 @@ const sqliteBackend = {
   getClientSessionPartial: _sqliteGetClientSessionPartial,
   readArchivedMessages: _sqliteReadArchivedMessages,
   readClientSessionLiveFrames: _sqliteReadClientSessionLiveFrames,
+  readClientSessionLiveUnits: _sqliteReadClientSessionLiveUnits,
+  readLiveOrTapeFramePayload: _sqliteReadLiveOrTapeFramePayload,
   convergeFinalizedTapeLiveStreams: _sqliteConvergeFinalizedTapeLiveStreams,
   readClientTimelinePage: _sqliteReadClientTimelinePage,
   getEngineContextMessages: _sqliteGetEngineContextMessages,
@@ -6848,6 +6898,12 @@ export const readArchivedMessages: ClientSessionsBackend['readArchivedMessages']
 
 export const readClientSessionLiveFrames: ClientSessionsBackend['readClientSessionLiveFrames'] =
   (...args) => getActiveBackend().readClientSessionLiveFrames(...args)
+
+export const readClientSessionLiveUnits: ClientSessionsBackend['readClientSessionLiveUnits'] =
+  (...args) => getActiveBackend().readClientSessionLiveUnits(...args)
+
+export const readLiveOrTapeFramePayload: ClientSessionsBackend['readLiveOrTapeFramePayload'] =
+  (...args) => getActiveBackend().readLiveOrTapeFramePayload(...args)
 
 export const convergeFinalizedTapeLiveStreams: ClientSessionsBackend['convergeFinalizedTapeLiveStreams'] =
   (...args) => getActiveBackend().convergeFinalizedTapeLiveStreams(...args)

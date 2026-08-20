@@ -535,7 +535,7 @@ describe("useSessionList 置顶 / 项目归属 / 终态字段", () => {
     expect(result.current.sessions[0].pinned).toBe(false);
   });
 
-  test("listSessions 的 archived / lastMessagePreview / lastAt 进入侧栏 Session", async () => {
+  test("listSessions 的 archived / lastMessagePreview / createdAt / lastAt 进入侧栏 Session", async () => {
     vi.spyOn(api, "listSessions").mockResolvedValue([
       {
         id: "webarchive01",
@@ -571,6 +571,7 @@ describe("useSessionList 置顶 / 项目归属 / 终态字段", () => {
     await waitFor(() => expect(result.current.sessions.length).toBe(1));
     expect(result.current.sessions[0].archived).toBe(true);
     expect(result.current.sessions[0].lastMessagePreview).toBe("最后一句");
+    expect(result.current.sessions[0].createdAt).toBe(1);
     expect(result.current.sessions[0].lastAt).toBe(3_000);
   });
 

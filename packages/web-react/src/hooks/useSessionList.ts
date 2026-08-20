@@ -26,11 +26,14 @@ export function genWsSessionId(): string {
 }
 
 function makeLocalSession(title: string, ownerUserId: string): Session {
+  const now = Date.now();
   return {
-    id: `local-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    id: `local-${now}-${Math.random().toString(36).slice(2, 8)}`,
     title: title || "新对话",
     ownerUserId,
-    updatedAt: new Date().toISOString(),
+    createdAt: now,
+    lastAt: now,
+    updatedAt: new Date(now).toISOString(),
     messageCount: 0,
     pinned: false,
     projectId: null,
@@ -45,6 +48,8 @@ function storedToSession(s: StoredSession, ownerUserId: string): Session {
     id: s.id,
     title: s.title || "新对话",
     ownerUserId,
+    createdAt: s.createdAt,
+    lastAt: s.lastAt,
     updatedAt: new Date(s.updatedAt ?? s.lastAt ?? Date.now()).toISOString(),
     messageCount: Array.isArray(s.messages) ? s.messages.length : 0,
     // modelId 无值时不落键:upsertSessions 的 spread 合并按"键缺席=不表态"保留另一侧的值。
@@ -58,6 +63,7 @@ function metaToSession(m: SessionMeta, ownerUserId: string): Session {
     id: m.id,
     title: m.title || "新对话",
     ownerUserId,
+    createdAt: m.createdAt,
     updatedAt: new Date(m.updatedAt ?? m.lastAt ?? Date.now()).toISOString(),
     messageCount: m.messageCount ?? 0,
     pinned: m.pinned === true,
@@ -389,6 +395,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
                   invalidateHistoryCache: tapeDetail._historyRevisionUnsupported === true,
                 });
               },
+              (query) => api.getSessionLiveUnits(cbRef.current.authSession, id, { n: 20, ...query }),
             )
             .catch(() => {
               /* hydrate degrades internally; a thrown first page must not resurrect the skeleton */

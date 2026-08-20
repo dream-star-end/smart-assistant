@@ -43,6 +43,12 @@ import {
   resetReplyTracker,
   shouldApplyGoalSnapshot,
 } from "./model";
+import {
+  isDurableFramesPage,
+  isLiveUnitsPage,
+  liveUnitToMessage,
+  prependLiveUnitMessages,
+} from "./liveUnitsHydrate";
 import { repairPostFinalProcessOrder } from "./order";
 import {
   isDispatchLostCode,
@@ -1282,11 +1288,15 @@ export class ChatSocket {
           ? this.nextSuccessfulReconcileDelayMs(sessId)
           : Math.min(30_000, 1000 * (2 ** Math.min(attempt - 1, 5)));
         if (current._recoveryStatus?.kind !== "stopping") {
-          current._recoveryStatus = {
-            kind: "retrying",
-            attempt,
-            ...(synced === true ? {} : { errorCode: "sync_failed" }),
-          };
+          if (current._liveUnitsPackApplied) {
+            current._recoveryStatus = { kind: "resumed" };
+          } else {
+            current._recoveryStatus = {
+              kind: "retrying",
+              attempt,
+              ...(synced === true ? {} : { errorCode: "sync_failed" }),
+            };
+          }
         }
         this.deps.persistSession?.(sessId);
         this.scheduleNotify();
@@ -1406,6 +1416,20 @@ export class ChatSocket {
     const journalEmpty = !obs || obs.frameCount === 0;
     const hasVisible = this.sessionHasVisibleTurnBody(sess);
 
+    if (sess._liveUnitsPackApplied) {
+      const hasProcess = sess.messages.some((message) => {
+        if (!message._liveUnit && message.role !== "agent-group" && message.role !== "thinking" && message.role !== "tool" && message.role !== "plan") {
+          return false;
+        }
+        if (cmid && message._clientMessageId && message._clientMessageId !== cmid && message._turnOwnerId !== cmid) {
+          return false;
+        }
+        return true;
+      });
+      if (hasProcess || liveOwner) {
+        return { clearSending: !liveOwner, kind: liveOwner ? "resumed" : "completed" };
+      }
+    }
     // 对账成功且服务端已有可见正文,且当前 turn 已不是 live owner。
     if (hasVisible && !liveOwner) {
       return { clearSending: true, kind: "completed" };
@@ -3271,6 +3295,7 @@ export class ChatSocket {
     sessId: string,
     fetchPage: (after: string) => Promise<DurableLiveFramePage>,
     applyTapeProjection: () => Promise<void>,
+    fetchUnits?: (query?: { before?: string | null }) => Promise<unknown>,
   ): Promise<void> {
     return this.runDurableLiveFrameHydration(sessId, async () => {
       const checkpoint = this.durableLiveJournalCheckpoints.get(sessId);
@@ -3352,17 +3377,104 @@ export class ChatSocket {
       };
 
       if (initial) {
-        const stagedFrames: DurableLiveFrame[] = [];
-        await readPages(stagedFrames);
-        this.applyDurableLiveFrames(
-          sessId,
-          stagedFrames,
-          [...resetOwnerIds],
-          lastDurableFrameSeqBySessionKey,
-        );
-        if (!degraded) {
-          // Close snapshot→reset races while stamped WS frames remain buffered.
-          await readPages(null);
+        let usedUnits = false;
+        if (fetchUnits) {
+          try {
+            const raw = await fetchUnits();
+            if (isLiveUnitsPage(raw) && raw.degraded === "fallback") {
+              usedUnits = false;
+            } else if (isLiveUnitsPage(raw)) {
+              usedUnits = true;
+              currentLiveOwners = new Set(raw.streamClientMessageIds);
+              for (const id of currentLiveOwners) resetOwnerIds.add(id);
+              for (const unit of raw.units) {
+                if (unit.clientMessageId) resetOwnerIds.add(unit.clientMessageId);
+              }
+              sawTapeProjection ||= raw.hasTapeProjection === true;
+              if (typeof raw.tapeProjectionVersion === "number") {
+                maxTapeProjectionVersion = Math.max(
+                  maxTapeProjectionVersion ?? 0,
+                  raw.tapeProjectionVersion,
+                );
+              }
+              this.applyLiveUnits(sessId, raw.units, [...resetOwnerIds], raw.resume);
+              if (raw.resume) {
+                cursor = raw.resume.recordId;
+                const sessionKey = raw.resume.sessionKey;
+                if (sessionKey) {
+                  lastDurableFrameSeqBySessionKey.set(sessionKey, {
+                    frameSeq: raw.resume.frameSeq,
+                    consumedAuthoritativeResetEpoch:
+                      this.authoritativeFrameSeqResetEpochBySessionKey.get(sessionKey) ?? 0,
+                  });
+                }
+              }
+              frameCount = Math.max(frameCount, raw.throughFrameSeq ?? raw.units.length);
+              const sessForUnits = this.sessions.get(sessId);
+              if (sessForUnits) {
+                sessForUnits._liveUnitsPackApplied = true;
+                sessForUnits._liveUnitsHasMoreBefore = raw.hasMoreBefore;
+                sessForUnits._liveUnitsBeforeCursor = raw.beforeCursor;
+                if (sessForUnits._recoveryStatus?.kind !== "stopping") {
+                  sessForUnits._recoveryStatus = { kind: "resumed" };
+                }
+              }
+              // Catch-up is mandatory: WS does not replay frames persisted
+              // before subscribe. Resume was minted only after the server
+              // reached the true tail; this extra after=recordId page closes
+              // the REST→WS gap.
+              if (raw.resume && !degraded) {
+                await readPages(null);
+              }
+            } else if (isDurableFramesPage(raw)) {
+              const firstPage = raw as DurableLiveFramePage;
+              sawTapeProjection ||= firstPage.hasTapeProjection === true;
+              if (typeof firstPage.tapeProjectionVersion === "number") {
+                maxTapeProjectionVersion = Math.max(
+                  maxTapeProjectionVersion ?? 0,
+                  firstPage.tapeProjectionVersion,
+                );
+              }
+              currentLiveOwners = new Set(firstPage.streamClientMessageIds);
+              for (const id of currentLiveOwners) resetOwnerIds.add(id);
+              const stagedFrames: DurableLiveFrame[] = [...firstPage.frames];
+              for (const frame of stagedFrames) {
+                if (typeof frame.clientMessageId === "string" && frame.clientMessageId) {
+                  resetOwnerIds.add(frame.clientMessageId);
+                }
+              }
+              frameCount += stagedFrames.length;
+              if (firstPage.nextCursor) cursor = firstPage.nextCursor;
+              if (firstPage.hasMore) await readPages(stagedFrames);
+              this.applyDurableLiveFrames(
+                sessId,
+                stagedFrames,
+                [...resetOwnerIds],
+                lastDurableFrameSeqBySessionKey,
+              );
+              if (!degraded) await readPages(null);
+              usedUnits = true;
+            }
+          } catch (error) {
+            if (isLiveJournalAbort(error)) {
+              degraded = true;
+            } else {
+              usedUnits = false;
+            }
+          }
+        }
+        if (!usedUnits) {
+          const stagedFrames: DurableLiveFrame[] = [];
+          await readPages(stagedFrames);
+          this.applyDurableLiveFrames(
+            sessId,
+            stagedFrames,
+            [...resetOwnerIds],
+            lastDurableFrameSeqBySessionKey,
+          );
+          if (!degraded) {
+            await readPages(null);
+          }
         }
       } else {
         await readPages(null);
@@ -3549,6 +3661,62 @@ export class ChatSocket {
     });
     this.durableHydrationTails.set(sessId, tracked);
     return tracked;
+  }
+
+  applyLiveUnits(
+    sessId: string,
+    units: import("@openclaude/protocol").LiveUnit[],
+    resetClientMessageIds: string[] = [],
+    resume?: { sessionKey: string; frameSeq: number; recordId: string },
+  ): void {
+    const sess = this.sessions.get(sessId);
+    if (!sess) return;
+    if (resetClientMessageIds.length > 0) {
+      const owners = new Set(resetClientMessageIds);
+      const preserveStreamingPointer = !!sess._sendingInFlight &&
+        typeof sess._activeClientMessageId === "string" &&
+        owners.has(sess._activeClientMessageId);
+      sess.messages = sess.messages.filter((message) => {
+        if (message.role === "user") return true;
+        if (message._source === "server" || !!message._turnTapeId) return true;
+        if (preserveStreamingPointer && message === sess._streamingAssistant) return true;
+        return !(
+          (typeof message._turnOwnerId === "string" && owners.has(message._turnOwnerId)) ||
+          (typeof message._clientMessageId === "string" && owners.has(message._clientMessageId))
+        );
+      });
+      if (!preserveStreamingPointer) {
+        sess._streamingAssistant = null;
+        sess._streamingThinking = null;
+      }
+      sess._blockIdToMsgId = new Map();
+      sess._agentGroups = new Map();
+      rebuildIndexes(sess);
+    }
+    const mapped = units.map(liveUnitToMessage);
+    sess.messages = prependLiveUnitMessages(sess.messages, mapped);
+    if (resume?.sessionKey && resume.frameSeq > 0) {
+      if (!sess._lastFrameSeqByKey || typeof sess._lastFrameSeqByKey !== "object") {
+        sess._lastFrameSeqByKey = {};
+      }
+      sess._lastFrameSeqByKey[resume.sessionKey] = resume.frameSeq;
+      sess._lastFrameSeq = Math.max(sess._lastFrameSeq || 0, resume.frameSeq);
+    }
+    rebuildIndexes(sess);
+    normalizeDelegateCards(sess);
+    normalizeGoalCards(sess);
+    sess.messages = repairPostFinalProcessOrder(sess.messages);
+    this.deps.persistSession?.(sessId);
+    this.scheduleNotify();
+  }
+
+  prependLiveUnits(sessId: string, units: import("@openclaude/protocol").LiveUnit[]): void {
+    const sess = this.sessions.get(sessId);
+    if (!sess) return;
+    sess.messages = prependLiveUnitMessages(sess.messages, units.map(liveUnitToMessage));
+    rebuildIndexes(sess);
+    this.deps.persistSession?.(sessId);
+    this.scheduleNotify();
   }
 
   /**

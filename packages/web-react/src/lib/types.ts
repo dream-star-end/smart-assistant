@@ -75,6 +75,8 @@ export type Session = {
   id: string;
   title: string;
   ownerUserId: string;
+  /** 会话创建时刻（epoch ms）；侧栏整段用时的起点。 */
+  createdAt?: number;
   updatedAt: string;
   messageCount: number;
   /** 会话级模型选择(per-session 持久化;缺省 = 未显式选择 → 选择器回落 default_model)。

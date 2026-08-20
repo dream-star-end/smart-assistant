@@ -128,4 +128,12 @@ describe("TurnActivity（激活 computeTypingLabel 死代码：阶段反馈接�
     expect(t).toContain("深度思考中");
     expect(t).not.toContain("Read foo.ts");
   });
+
+  test("units 首包后 retrying 不再显示正在恢复实时内容", () => {
+    renderTA({
+      recoveryStatus: { kind: "retrying", attempt: 2 },
+      hasVisibleProcess: true,
+    });
+    expect(screen.queryByText("正在恢复实时内容…")).not.toBeInTheDocument();
+  });
 });

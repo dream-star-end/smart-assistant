@@ -17,7 +17,7 @@ import {
 } from "../ui";
 import { MoreHorizontal } from "lucide-react";
 import { SESSION_DRAG_TYPE } from "./constants";
-import { formatCompactAge, sessionAgeTimestamp } from "./compactAge";
+import { formatCompactDuration, sessionDurationWindow } from "./compactDuration";
 
 export function SessionRow({
   session: s,
@@ -26,7 +26,6 @@ export function SessionRow({
   indent,
   isSending,
   liveTerminal,
-  runStartedAt,
   now,
   onSelect,
   onRename,
@@ -36,7 +35,6 @@ export function SessionRow({
   onArchive,
   onMarkRead,
   unread,
-  showPreview,
   multiSelect,
   selected,
   onToggleSelected,
@@ -49,7 +47,6 @@ export function SessionRow({
   indent?: boolean;
   isSending?: (id: string) => boolean;
   liveTerminal?: (id: string) => { lastOutcome?: string | null; lastErrorCode?: string | null } | undefined;
-  runStartedAt?: (id: string) => number | undefined;
   now: number;
   onSelect: (id: string) => void;
   onRename: (s: Session) => void;
@@ -59,7 +56,6 @@ export function SessionRow({
   onArchive?: (s: Session) => void;
   onMarkRead?: (id: string) => void;
   unread?: boolean;
-  showPreview: boolean;
   multiSelect: boolean;
   selected: boolean;
   onToggleSelected: (id: string) => void;
@@ -69,9 +65,11 @@ export function SessionRow({
   const live = liveTerminal?.(s.id);
   const running = isSidebarSessionRunning(s, { isSending, liveTerminal });
   const title = s.title || "新对话";
-  const ageAt = sessionAgeTimestamp(s, running, runStartedAt?.(s.id));
-  const ageText = ageAt != null ? formatCompactAge(ageAt, now) : "";
-  const ageTitle = ageAt != null ? formatDate(ageAt, "datetime") : undefined;
+  const duration = sessionDurationWindow(s, running, now);
+  const durationText = duration ? formatCompactDuration(duration.endAt - duration.startAt) : "";
+  const durationTitle = duration
+    ? `${formatDate(duration.startAt, "datetime")} → ${running ? "现在" : formatDate(duration.endAt, "datetime")}`
+    : undefined;
 
   return (
     <div
@@ -118,22 +116,17 @@ export function SessionRow({
         }}
         aria-current={active ? "true" : undefined}
         aria-label={title}
-        className="flex h-full min-w-0 flex-1 flex-col justify-center rounded-md px-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        className="flex h-full min-w-0 flex-1 items-center rounded-md px-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring"
       >
         <span className={cn("truncate", unread && "font-semibold text-fg")}>{title}</span>
-        {showPreview && (
-          <span aria-hidden className="truncate text-caption text-faint">
-            {s.lastMessagePreview?.trim() || "\u00a0"}
-          </span>
-        )}
       </button>
-      {ageText && (
+      {durationText && (
         <span
-          title={ageTitle}
-          data-session-age
+          title={durationTitle}
+          data-session-duration
           className="shrink-0 tabular-nums text-[11px] text-faint"
         >
-          {ageText}
+          {durationText}
         </span>
       )}
       <DropdownMenu>

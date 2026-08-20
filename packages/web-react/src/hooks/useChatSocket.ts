@@ -3,6 +3,7 @@ import type { MessageReplyQuote } from "@openclaude/protocol";
 import { ApiError, api } from "../lib/api";
 import { reportClientFriction } from "../lib/clientFriction";
 import type { ChatMessage, ChatSession } from "../lib/chat/model";
+import { isLiveUnitsPage } from "../lib/chat/liveUnitsHydrate";
 import { ChatSocket, type ChatSnapshot } from "../lib/chat/socket";
 import { DeferredPayloadQueue } from "../lib/chat/deferredPayloadQueue";
 import { parseTapeRecordPayload, type TapePayloadExpectation } from "../lib/chat/tapePayload";
@@ -161,6 +162,7 @@ export type UseChatSocket = {
     sessId: string,
     fetchPage: (after: string) => Promise<DurableLiveFramePage>,
     applyTapeProjection: () => Promise<void>,
+    fetchUnits?: (query?: { before?: string | null }) => Promise<unknown>,
   ) => Promise<void>;
   /** Re-run background journal hydrate after a page/time-cap degrade. */
   retryLiveJournalHydration: (sessId: string) => Promise<void>;
@@ -172,6 +174,9 @@ export type UseChatSocket = {
    * 显式点击加载：从统一真实时间线拉一页更早记录并常驻本页内存。
    */
   loadOlderHistory: (
+    sessId: string | undefined,
+  ) => Promise<{ ok: boolean; loaded: number; hasMore: boolean; error?: boolean }>;
+  loadOlderLiveUnits: (
     sessId: string | undefined,
   ) => Promise<{ ok: boolean; loaded: number; hasMore: boolean; error?: boolean }>;
   /** 按需读取、校验并在 worker 中解析一条超大 immutable record。 */
@@ -424,6 +429,7 @@ export function useChatSocket(opts: {
                 },
               );
             },
+            (query) => api.getSessionLiveUnits(a, sessId, { n: 20, ...query }),
           );
           if (!isCurrent()) return false;
           sess._liveStreamBroken = false;
@@ -734,8 +740,8 @@ export function useChatSocket(opts: {
     [socket],
   );
   const hydrateDurableLiveFrameJournal = useCallback<UseChatSocket["hydrateDurableLiveFrameJournal"]>(
-    (sessId, fetchPage, applyTapeProjection) =>
-      socket.hydrateDurableLiveFrameJournal(sessId, fetchPage, applyTapeProjection),
+    (sessId, fetchPage, applyTapeProjection, fetchUnits) =>
+      socket.hydrateDurableLiveFrameJournal(sessId, fetchPage, applyTapeProjection, fetchUnits),
     [socket],
   );
   const retryLiveJournalHydration = useCallback<UseChatSocket["retryLiveJournalHydration"]>(
@@ -769,6 +775,7 @@ export function useChatSocket(opts: {
             },
           );
         },
+        (query) => api.getSessionLiveUnits(a, sessId, { n: 20, ...query }),
       );
     },
     [socket],
@@ -824,6 +831,35 @@ export function useChatSocket(opts: {
         return { ok: false, loaded: 0, hasMore: true, error: true }; // 失败:保留"可重试",hasMore 不封死
       } finally {
         olderHistoryFetchingRef.current.delete(sessId);
+      }
+    },
+    [socket],
+  );
+  const loadOlderLiveUnits = useCallback<UseChatSocket["loadOlderLiveUnits"]>(
+    async (sessId) => {
+      const a = authRef.current;
+      if (!a || !sessId) return { ok: false, loaded: 0, hasMore: false };
+      const session = socket.sessions.get(sessId);
+      const before = session?._liveUnitsBeforeCursor;
+      if (!session || session._liveUnitsHasMoreBefore !== true || !before) {
+        return { ok: true, loaded: 0, hasMore: false };
+      }
+      try {
+        const raw = await api.getSessionLiveUnits(a, sessId, { n: 20, before });
+        if (!isLiveUnitsPage(raw) || raw.degraded === "fallback") {
+          return { ok: false, loaded: 0, hasMore: true, error: true };
+        }
+        const beforeCount = session.messages.length;
+        socket.prependLiveUnits(sessId, raw.units);
+        const current = socket.sessions.get(sessId);
+        if (current) {
+          current._liveUnitsHasMoreBefore = raw.hasMoreBefore;
+          current._liveUnitsBeforeCursor = raw.beforeCursor;
+        }
+        const loaded = Math.max(0, (socket.sessions.get(sessId)?.messages.length ?? beforeCount) - beforeCount);
+        return { ok: true, loaded, hasMore: raw.hasMoreBefore };
+      } catch {
+        return { ok: false, loaded: 0, hasMore: true, error: true };
       }
     },
     [socket],
@@ -1022,6 +1058,7 @@ export function useChatSocket(opts: {
       storedMaxSeq,
       storedHistoryRevision,
       loadOlderHistory,
+      loadOlderLiveUnits,
       fetchTapeRecordPayload,
       peekTapeRecordPayload,
       fetchUserMessagePayload,
@@ -1059,6 +1096,7 @@ export function useChatSocket(opts: {
       storedMaxSeq,
       storedHistoryRevision,
       loadOlderHistory,
+      loadOlderLiveUnits,
       fetchTapeRecordPayload,
       peekTapeRecordPayload,
       fetchUserMessagePayload,

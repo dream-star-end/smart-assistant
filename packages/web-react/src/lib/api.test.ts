@@ -1205,3 +1205,27 @@ test('getSessionLiveFrames times out a hung request', async () => {
   await vi.advanceTimersByTimeAsync(25)
   await expectation
 })
+
+test('getSessionLiveUnits sends view=units', async () => {
+  const fetchMock = vi.fn(async (_url: string) =>
+    ok({
+      view: 'units',
+      units: [],
+      n: 20,
+      hasMoreBefore: false,
+      beforeCursor: null,
+      streamClientMessageIds: [],
+      openDispatch: false,
+      hasTapeProjection: false,
+      tapeProjectionVersion: 0,
+      reducerEpoch: '1',
+      degraded: false,
+    }),
+  )
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+  const { session } = makeSession('tok-live-units')
+  await api.getSessionLiveUnits(session, 'web-session-1', { n: 20 })
+  expect(String(fetchMock.mock.calls[0]?.[0])).toBe(
+    '/api/sessions/web-session-1/live-frames?view=units&n=20',
+  )
+})

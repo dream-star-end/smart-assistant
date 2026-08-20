@@ -218,6 +218,8 @@ import {
 import { settleStopControlsForTurn } from "../dispatch/turnControlStore.js";
 import {
   readClientSessionLiveFrames as readDurableClientSessionLiveFrames,
+  readClientSessionLiveUnits as readDurableClientSessionLiveUnits,
+  readLiveOrTapeFramePayload as readDurableLiveOrTapeFramePayload,
   reconcileLiveStreamWithFinalTape,
   convergeFinalizedTapeLiveStreams,
 } from "./liveTurnFrames.js";
@@ -10024,6 +10026,30 @@ export function createPgSessionsBackend(
         limit,
         options,
       );
+    },
+
+    async readClientSessionLiveUnits(
+      sessionId: string,
+      userId: string,
+      options?: {
+        n?: number
+        k?: number
+        before?: string | null
+        group?: string | null
+        nestedBefore?: string | null
+        deadlineMs?: number
+        maxBytes?: number
+      },
+    ) {
+      return readDurableClientSessionLiveUnits(pool, sessionId, userId, options);
+    },
+
+    async readLiveOrTapeFramePayload(
+      sessionId: string,
+      userId: string,
+      ref: { recordId?: string | null; sha256?: string | null },
+    ) {
+      return readDurableLiveOrTapeFramePayload(pool, sessionId, userId, ref);
     },
 
     async convergeFinalizedTapeLiveStreams() {

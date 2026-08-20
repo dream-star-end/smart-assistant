@@ -69,6 +69,7 @@ import {
   normalizeMessageReplyQuote,
   shouldServeInline,
   stripDispatchAuthorityField,
+  isLiveUnitsEnabled,
   type PromptQueueMutationFrame,
 } from '@openclaude/protocol'
 
@@ -144,6 +145,8 @@ import {
   getClientSessionPartial,
   readArchivedMessages,
   readClientSessionLiveFrames,
+  readClientSessionLiveUnits,
+  readLiveOrTapeFramePayload,
   readClientTimelinePage,
   encodeClientTimelineCursor,
   decodeClientTimelineCursor,
@@ -4987,12 +4990,52 @@ export class Gateway {
     // Exact browser-visible process frames, committed by the commercial
     // master before live WS delivery.  This is cursor-paged with no total cap;
     // personal/container SQLite returns an empty page.
+    const liveFramePayloadMatch = url.pathname.match(/^\/api\/sessions\/([a-zA-Z0-9_-]{8,50})\/live-frames\/payload$/)
+    if (liveFramePayloadMatch) {
+      const sessId = liveFramePayloadMatch[1]
+      const userId = this.getUserId(req)
+      if (req.method !== 'GET') {
+        this.sendJson(res, 405, { error: 'method not allowed' })
+        return
+      }
+      const recordId = url.searchParams.get('recordId')
+      const sha256 = url.searchParams.get('sha256')
+      readLiveOrTapeFramePayload(sessId, userId, { recordId, sha256 })
+        .then((row) => row
+          ? this.sendJson(res, 200, row)
+          : this.sendJson(res, 404, { error: 'not found' }))
+        .catch(() => this.sendJson(res, 500, { error: 'live frame payload read failed' }))
+      return
+    }
     const liveFramesMatch = url.pathname.match(/^\/api\/sessions\/([a-zA-Z0-9_-]{8,50})\/live-frames$/)
     if (liveFramesMatch) {
       const sessId = liveFramesMatch[1]
       const userId = this.getUserId(req)
       if (req.method !== 'GET') {
         this.sendJson(res, 405, { error: 'method not allowed' })
+        return
+      }
+      const view = url.searchParams.get('view')
+      if (view === 'units' && isLiveUnitsEnabled()) {
+        const nRaw = url.searchParams.get('n')
+        const n = nRaw === null ? 20 : Number(nRaw)
+        if (!Number.isSafeInteger(n) || n < 1 || n > 80) {
+          this.sendJson(res, 400, { error: 'invalid live units window' })
+          return
+        }
+        const before = url.searchParams.get('before')
+        const group = url.searchParams.get('group')
+        const nestedBefore = url.searchParams.get('nestedBefore')
+        readClientSessionLiveUnits(sessId, userId, {
+          n,
+          before,
+          group,
+          nestedBefore,
+        })
+          .then((page) => page
+            ? this.sendJson(res, 200, page)
+            : this.sendJson(res, 404, { error: 'not found' }))
+          .catch(() => this.sendJson(res, 500, { error: 'live units read failed' }))
         return
       }
       const afterRaw = url.searchParams.get('after')

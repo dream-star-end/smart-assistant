@@ -2110,8 +2110,22 @@ await check("T41 Codex 密度 token：Composer/ToolCard/Sidebar 在 1440 与 390
     const sidebar = page.locator("#codex-density-root");
     const active = sidebar.getByRole("button", { name: "密度验收活跃会话" });
     await active.waitFor({ state: "visible", timeout: 3000 });
-    const accent = await active.evaluate((btn) => Boolean(btn.closest("div")?.querySelector(".bg-accent")));
-    if (!accent) throw new Error(`活跃会话缺少 accent 竖条(${theme})`);
+    const activeState = await active.evaluate((btn) => {
+      const row = btn.closest("div");
+      const duration = row?.querySelector("[data-session-duration]");
+      return {
+        hasAccent: Boolean(row?.querySelector(".bg-accent")),
+        durationText: duration?.textContent ?? "",
+        durationTitle: duration?.getAttribute("title") ?? "",
+      };
+    });
+    if (!activeState.hasAccent) throw new Error(`活跃会话缺少 accent 竖条(${theme})`);
+    if (activeState.durationText !== "8m" || !activeState.durationTitle.includes("→")) {
+      throw new Error(`会话累计用时未按 createdAt → lastAt 展示(${theme}): ${JSON.stringify(activeState)}`);
+    }
+    if (await sidebar.getByText("浏览器契约：摘要不应显示", { exact: true }).count() !== 0) {
+      throw new Error(`会话行仍显示最新消息摘要(${theme})`);
+    }
     const idleAccent = await sidebar.getByRole("button", { name: "密度验收空闲会话" }).evaluate(
       (btn) => Boolean(btn.closest("div")?.querySelector(".bg-accent")),
     );
