@@ -28,6 +28,7 @@ import type {
   SessionSearchHit,
   User,
 } from "../lib/types";
+import { isSidebarSessionRunning } from "../lib/sessionStatus";
 import { cn, formatCredits } from "../lib/utils";
 import { ThemeToggle } from "./ThemeToggle";
 import {
@@ -52,12 +53,14 @@ import {
 import { type FlatItem, flattenSidebarItems } from "./sidebar/flattenItems";
 import { HighlightedText } from "./sidebar/highlight";
 import { ProjectRow } from "./sidebar/ProjectRow";
+import {
+  compareByUpdatedDesc,
+  compareSessionsRunningThenUpdated,
+  partitionProjectsRunningFirst,
+  sortSessionsRunningThenUpdated,
+} from "./sidebar/runningOrder";
 import { SessionRow } from "./sidebar/SessionRow";
 import { VirtualList } from "./sidebar/VirtualList";
-
-function byUpdatedDesc(a: Session, b: Session): number {
-  return a.updatedAt < b.updatedAt ? 1 : a.updatedAt > b.updatedAt ? -1 : 0;
-}
 
 function useCoarsePointer(): boolean {
   return useSyncExternalStore(
@@ -193,6 +196,16 @@ export function Sidebar({
   const searching = q.trim().length > 0;
   const showProjects = Array.isArray(projects) && Boolean(onCreateProject);
 
+  const runningIds = useMemo(() => {
+    void socketVersion;
+    const ids = new Set<string>();
+    for (const s of sessions) {
+      if (s.archived) continue;
+      if (isSidebarSessionRunning(s, { isSending, liveTerminal })) ids.add(s.id);
+    }
+    return ids;
+  }, [sessions, isSending, liveTerminal, socketVersion]);
+
   useEffect(() => {
     const t = window.setInterval(() => setNow(Date.now()), SIDEBAR_AGE_TICK_MS);
     return () => window.clearInterval(t);
@@ -213,7 +226,7 @@ export function Sidebar({
 
   const activeSessions = useMemo(() => sessions.filter((s) => !s.archived), [sessions]);
   const archivedSessions = useMemo(
-    () => sessions.filter((s) => s.archived).sort(byUpdatedDesc),
+    () => sessions.filter((s) => s.archived).sort(compareByUpdatedDesc),
     [sessions],
   );
 
@@ -225,8 +238,8 @@ export function Sidebar({
   }, [activeSessions, sessions, q, searching, archivedExpanded]);
 
   const pinned = useMemo(
-    () => (searching ? [] : filtered.filter((s) => s.pinned).sort(byUpdatedDesc)),
-    [filtered, searching],
+    () => (searching ? [] : sortSessionsRunningThenUpdated(filtered.filter((s) => s.pinned), runningIds)),
+    [filtered, searching, runningIds],
   );
   const pinnedIds = useMemo(() => new Set(pinned.map((s) => s.id)), [pinned]);
 
@@ -239,23 +252,24 @@ export function Sidebar({
       list.push(s);
       map.set(s.projectId, list);
     }
-    for (const list of map.values()) list.sort(byUpdatedDesc);
+    for (const list of map.values()) list.sort((a, b) => compareSessionsRunningThenUpdated(a, b, runningIds));
     return map;
-  }, [filtered, pinnedIds, searching]);
+  }, [filtered, pinnedIds, searching, runningIds]);
 
   const ungroupedGroups = useMemo(() => {
     if (searching) {
       const items = filtered.slice().sort((a, b) => {
         if (!!a.pinned !== !!b.pinned) return a.pinned ? -1 : 1;
-        return byUpdatedDesc(a, b);
+        return compareSessionsRunningThenUpdated(a, b, runningIds);
       });
       return items.length ? ([["搜索结果", items]] as [string, Session[]][]) : [];
     }
-    const list = filtered
-      .filter((s) => !pinnedIds.has(s.id) && !s.projectId)
-      .sort(byUpdatedDesc);
+    const list = sortSessionsRunningThenUpdated(
+      filtered.filter((s) => !pinnedIds.has(s.id) && !s.projectId),
+      runningIds,
+    );
     return list.length ? ([["", list]] as [string, Session[]][]) : [];
-  }, [filtered, pinnedIds, searching]);
+  }, [filtered, pinnedIds, searching, runningIds]);
 
   const showPreview = useMemo(
     () => sessions.some((s) => Boolean(s.lastMessagePreview?.trim())),
@@ -291,7 +305,13 @@ export function Sidebar({
     };
   }, [q, onSearchMessages]);
 
-  void socketVersion;
+  const displayProjects = useMemo(
+    () =>
+      partitionProjectsRunningFirst(orderedProjects, (id) =>
+        (projectSessions.get(id) ?? []).some((s) => runningIds.has(s.id)),
+      ),
+    [orderedProjects, projectSessions, runningIds],
+  );
 
   const flatItems = useMemo(
     () =>
@@ -300,7 +320,7 @@ export function Sidebar({
         showProjects,
         showPreview,
         pinned,
-        projects: orderedProjects,
+        projects: displayProjects,
         projectSessions,
         sessions: activeSessions,
         ungroupedGroups,
@@ -311,13 +331,14 @@ export function Sidebar({
         searchHits,
         searchRemote,
         localEmpty: filtered.length === 0,
+        isRunning: (s) => runningIds.has(s.id),
       }),
     [
       searching,
       showProjects,
       showPreview,
       pinned,
-      orderedProjects,
+      displayProjects,
       projectSessions,
       activeSessions,
       ungroupedGroups,
@@ -328,6 +349,7 @@ export function Sidebar({
       searchHits,
       searchRemote,
       filtered.length,
+      runningIds,
     ],
   );
 
@@ -470,6 +492,7 @@ export function Sidebar({
           project={p}
           count={item.count}
           collapsed={item.collapsed}
+          runningCount={item.runningCount}
           dropActive={dragOverProjectId === p.id}
           allowDrag={!isDefault && !coarse && Boolean(onReorderProjects)}
           showMoveInMenu={!isDefault && Boolean(onReorderProjects)}

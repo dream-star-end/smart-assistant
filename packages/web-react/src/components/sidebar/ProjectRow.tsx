@@ -2,6 +2,7 @@ import { ChevronDown, ChevronRight, Folder, MoreHorizontal } from "lucide-react"
 import type { DragEvent } from "react";
 import type { ChatProject } from "../../lib/types";
 import { cn } from "../../lib/utils";
+import { SessionStatusDot } from "../SessionStatusDot";
 import { PROJECT_COLORS } from "../ProjectSettingsDialog";
 import {
   DropdownMenu,
@@ -17,6 +18,7 @@ export function ProjectRow({
   project: p,
   count,
   collapsed,
+  runningCount = 0,
   dropActive,
   allowDrag,
   showMoveInMenu,
@@ -39,6 +41,8 @@ export function ProjectRow({
   project: ChatProject;
   count: number;
   collapsed: boolean;
+  /** 折叠时组内运行中数量；展开不展示，避免与会话行蓝点重复。 */
+  runningCount?: number;
   dropActive: boolean;
   allowDrag: boolean;
   showMoveInMenu: boolean;
@@ -112,6 +116,17 @@ export function ProjectRow({
           );
         })()}
         <span className="min-w-0 flex-1 truncate">{p.name}</span>
+        {collapsed && runningCount > 0 && (
+          <span
+            data-project-running={runningCount}
+            title={`${runningCount} 个运行中`}
+            aria-label={`${runningCount} 个运行中`}
+            className="flex shrink-0 items-center gap-1"
+          >
+            <SessionStatusDot running />
+            <span className="tabular-nums text-caption text-fg">{runningCount}</span>
+          </span>
+        )}
         <span className="shrink-0 text-caption text-faint">{count}</span>
       </button>
       {canMutate && (onRename || onDelete || onOpenSettings || showMoveInMenu) && (

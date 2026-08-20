@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { deriveLiveTerminalFromMessages, resolveSessionStatus, resolveSidebarDot } from "./sessionStatus";
+import {
+  deriveLiveTerminalFromMessages,
+  isSidebarSessionRunning,
+  resolveSessionStatus,
+  resolveSidebarDot,
+} from "./sessionStatus";
 
 describe("resolveSessionStatus", () => {
   it("运行中优先于任何终态（本 tab 正在发送必须立刻闪绿）", () => {
@@ -47,6 +52,33 @@ describe("resolveSessionStatus", () => {
         lastErrorCode: "rate_limited",
       }),
     ).toBe("completed");
+  });
+});
+
+describe("isSidebarSessionRunning", () => {
+  it("本 tab isSending 优先于列表 idle", () => {
+    expect(isSidebarSessionRunning({ id: "s1", runState: "idle" }, { isSending: () => true })).toBe(true);
+  });
+
+  it("runState=running 且没有本 tab 终态 → running", () => {
+    expect(isSidebarSessionRunning({ id: "s1", runState: "running" })).toBe(true);
+    expect(isSidebarSessionRunning({ id: "s1", runState: "running" }, { liveTerminal: () => undefined })).toBe(
+      true,
+    );
+  });
+
+  it("本 tab 已落入终态则不再当 running（即使列表仍 running）", () => {
+    expect(
+      isSidebarSessionRunning(
+        { id: "s1", runState: "running" },
+        { liveTerminal: () => ({ lastOutcome: "completed" }) },
+      ),
+    ).toBe(false);
+  });
+
+  it("idle 且未发送 → 非 running", () => {
+    expect(isSidebarSessionRunning({ id: "s1", runState: "idle" })).toBe(false);
+    expect(isSidebarSessionRunning({ id: "s1" })).toBe(false);
   });
 });
 

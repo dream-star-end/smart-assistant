@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import type { ChatProject, Session, User } from "../lib/types";
 import { Sidebar } from "./Sidebar";
-import { SESSION_ROW_HEIGHT, SESSION_ROW_HEIGHT_PREVIEW, DEFAULT_PROJECT_ID } from "./sidebar/constants";
+import { SESSION_ROW_HEIGHT, SESSION_ROW_HEIGHT_PREVIEW, DEFAULT_PROJECT_ID, PROJECT_ROW_HEIGHT } from "./sidebar/constants";
 import { flattenSidebarItems } from "./sidebar/flattenItems";
 import { HighlightedText } from "./sidebar/highlight";
 
@@ -686,6 +686,64 @@ describe("Sidebar 虚拟列表拍平", () => {
     expect(projectIds).toEqual(["p-work", DEFAULT_PROJECT_ID]);
   });
 
+  it("折叠项目行带 runningCount，行高仍是项目行高；展开会话不重复出现", () => {
+    const proj = project({ id: "p-work", name: "工作" });
+    const runA = session({ id: "s-run-a", title: "跑着 A", projectId: "p-work", runState: "running" });
+    const runB = session({ id: "s-run-b", title: "跑着 B", projectId: "p-work", runState: "running" });
+    const idle = session({ id: "s-idle", title: "空闲", projectId: "p-work" });
+    const isRunning = (s: Session) => s.runState === "running";
+    const collapsed = flattenSidebarItems({
+      searching: false,
+      showProjects: true,
+      showPreview: false,
+      pinned: [],
+      projects: [proj],
+      projectSessions: new Map([["p-work", [runA, runB, idle]]]),
+      sessions: [runA, runB, idle],
+      ungroupedGroups: [],
+      collapsedProjectIds: new Set(["p-work"]),
+      archived: [],
+      archivedExpanded: false,
+      searchHits: [],
+      searchRemote: "idle",
+      localEmpty: false,
+      isRunning,
+    });
+    const row = collapsed.find((i) => i.kind === "project" && i.project.id === "p-work");
+    expect(row).toMatchObject({
+      kind: "project",
+      collapsed: true,
+      runningCount: 2,
+      height: PROJECT_ROW_HEIGHT,
+    });
+    expect(collapsed.some((i) => i.kind === "session")).toBe(false);
+
+    const expanded = flattenSidebarItems({
+      searching: false,
+      showProjects: true,
+      showPreview: false,
+      pinned: [],
+      projects: [proj],
+      projectSessions: new Map([["p-work", [runA, runB, idle]]]),
+      sessions: [runA, runB, idle],
+      ungroupedGroups: [],
+      collapsedProjectIds: new Set(),
+      archived: [],
+      archivedExpanded: false,
+      searchHits: [],
+      searchRemote: "idle",
+      localEmpty: false,
+      isRunning,
+    });
+    const openRow = expanded.find((i) => i.kind === "project" && i.project.id === "p-work");
+    expect(openRow).toMatchObject({ kind: "project", collapsed: false, runningCount: 2 });
+    const sessionIds = expanded.filter((i) => i.kind === "session").map((i) =>
+      i.kind === "session" ? i.session.id : "",
+    );
+    expect(sessionIds).toEqual(["s-run-a", "s-run-b", "s-idle"]);
+  });
+
+
   it("置顶分组在项目与时间分组之前；搜索时不拍项目行", () => {
     const pin = session({ id: "s-pin", title: "钉住的", pinned: true });
     const items = flattenSidebarItems({
@@ -966,6 +1024,189 @@ describe("Sidebar 项目排序", () => {
     expect(onReorderProjects).toHaveBeenCalledWith(["p-b", "p-a"]);
   });
 });
+
+function sessionTitlesInList(): string[] {
+  return [...document.querySelectorAll("[data-flat-kind='session']")].map((row) => {
+    const btn = row.querySelector("button[aria-label]");
+    return btn?.getAttribute("aria-label") ?? "";
+  });
+}
+
+function projectNamesInList(): string[] {
+  return [...document.querySelectorAll("[data-flat-kind='project']")].map((row) => {
+    const name = row.querySelector("button span.min-w-0");
+    return name?.textContent?.trim() ?? "";
+  });
+}
+
+function iso(hour: number): string {
+  return new Date(Date.UTC(2026, 7, 20, hour)).toISOString();
+}
+
+describe("Sidebar 运行中置顶", () => {
+  it("组内运行中排最前，多个运行中仍按更新时间倒序，空闲保持时间倒序", () => {
+    renderSidebar({
+      sessions: [
+        session({ id: "idle-new", title: "最新空闲", updatedAt: iso(12) }),
+        session({ id: "run-old", title: "较早运行", updatedAt: iso(10), runState: "running" }),
+        session({ id: "idle-old", title: "更早空闲", updatedAt: iso(9) }),
+        session({ id: "run-new", title: "较新运行", updatedAt: iso(11), runState: "running" }),
+      ],
+    });
+    expect(sessionTitlesInList()).toEqual(["较新运行", "较早运行", "最新空闲", "更早空闲"]);
+    expect(screen.getAllByRole("button", { name: "较新运行" })).toHaveLength(1);
+  });
+
+  it("置顶组同样：运行中置顶，跑完后回落到按时间该在的位置", () => {
+    const sessions = [
+      session({ id: "pin-idle", title: "钉住的新", pinned: true, updatedAt: iso(12) }),
+      session({ id: "pin-run", title: "钉住的跑", pinned: true, updatedAt: iso(10), runState: "running" }),
+    ];
+    const { rerender } = renderSidebar({ sessions, onTogglePin: () => {} });
+    expect(sessionTitlesInList()).toEqual(["钉住的跑", "钉住的新"]);
+
+    rerender(
+      <Sidebar
+        sessions={[
+          session({ id: "pin-idle", title: "钉住的新", pinned: true, updatedAt: iso(12) }),
+          session({ id: "pin-run", title: "钉住的跑", pinned: true, updatedAt: iso(10), runState: "idle" }),
+        ]}
+        user={user}
+        onSelect={() => {}}
+        onNew={() => {}}
+        onRename={() => {}}
+        onDelete={() => {}}
+        onTogglePin={() => {}}
+      />,
+    );
+    expect(sessionTitlesInList()).toEqual(["钉住的新", "钉住的跑"]);
+  });
+
+  it("含运行会话的真实项目上浮，default 即使有运行中也仍在所有真实项目之后", () => {
+    const projects = [
+      project({ id: "p-a", name: "甲", sortOrder: 0 }),
+      project({ id: "p-b", name: "乙", sortOrder: 1 }),
+    ];
+    renderSidebar({
+      sessions: [
+        session({ id: "s-a", title: "甲的空闲", projectId: "p-a", updatedAt: iso(12) }),
+        session({ id: "s-b", title: "乙的运行", projectId: "p-b", updatedAt: iso(8), runState: "running" }),
+        session({ id: "s-d", title: "default 运行", updatedAt: iso(20), runState: "running" }),
+      ],
+      projects,
+      collapsedProjectIds: new Set(),
+      onToggleProjectCollapsed: () => {},
+      onCreateProject: () => {},
+    });
+    expect(projectNamesInList()).toEqual(["乙", "甲", "default"]);
+    expect(sessionTitlesInList()).toEqual(["乙的运行", "甲的空闲", "default 运行"]);
+  });
+
+  it("折叠项目行显示同款闪烁蓝点与运行中数量；展开后提示消失、会话点仍在", () => {
+    const projects = [project({ id: "p-work", name: "工作", sessionCount: 3 })];
+    const sessions = [
+      session({ id: "s-run-a", title: "跑着 A", projectId: "p-work", updatedAt: iso(11), runState: "running" }),
+      session({ id: "s-run-b", title: "跑着 B", projectId: "p-work", updatedAt: iso(10), runState: "running" }),
+      session({ id: "s-idle", title: "空闲", projectId: "p-work", updatedAt: iso(12) }),
+    ];
+    const { rerender } = renderSidebar({
+      sessions,
+      projects,
+      collapsedProjectIds: new Set(["p-work"]),
+      onToggleProjectCollapsed: () => {},
+      onCreateProject: () => {},
+    });
+    expect(screen.queryByRole("button", { name: "跑着 A" })).toBeNull();
+    const collapsedBtn = screen.getByRole("button", { name: /工作/ });
+    expect(collapsedBtn.querySelector("[data-project-running='2']")).not.toBeNull();
+    expect(collapsedBtn.querySelector("[data-project-running='2']")).toHaveTextContent("2");
+    const collapsedDot = collapsedBtn.querySelector("[role='img']");
+    expect(collapsedDot).toHaveAccessibleName("运行中");
+    expect(collapsedDot).toHaveClass("bg-info", "oc-session-running");
+
+    rerender(
+      <Sidebar
+        sessions={sessions}
+        user={user}
+        onSelect={() => {}}
+        onNew={() => {}}
+        onRename={() => {}}
+        onDelete={() => {}}
+        projects={projects}
+        collapsedProjectIds={new Set()}
+        onToggleProjectCollapsed={() => {}}
+        onCreateProject={() => {}}
+      />,
+    );
+    const expandedBtn = screen.getByRole("button", { name: /工作/ });
+    expect(expandedBtn.querySelector("[data-project-running]")).toBeNull();
+    expect(screen.getByRole("button", { name: "跑着 A" })).toBeInTheDocument();
+    expect(leadImgs("跑着 A")[0]).toHaveClass("bg-info", "oc-session-running");
+    expect(sessionTitlesInList()).toEqual(["跑着 A", "跑着 B", "空闲"]);
+  });
+
+  it("折叠的 default 组有运行中时同样给出蓝点与数量", () => {
+    renderSidebar({
+      sessions: [
+        session({ id: "s-run", title: "default 跑", runState: "running" }),
+        session({ id: "s-idle", title: "default 闲" }),
+      ],
+      projects: [],
+      collapsedProjectIds: new Set([DEFAULT_PROJECT_ID]),
+      onToggleProjectCollapsed: () => {},
+      onCreateProject: () => {},
+    });
+    const btn = screen.getByRole("button", { name: /default/ });
+    expect(btn.querySelector("[data-project-running='1']")).not.toBeNull();
+    expect(btn.querySelector("[role='img']")).toHaveAccessibleName("运行中");
+    expect(screen.queryByRole("button", { name: "default 跑" })).toBeNull();
+  });
+
+  it("会话结束后回落到按更新时间该在的位置；isSending 变化立刻重排", () => {
+    const olderRunning = session({
+      id: "s-old",
+      title: "较早那条",
+      updatedAt: iso(10),
+      runState: "running",
+    });
+    const newerIdle = session({ id: "s-new", title: "较新空闲", updatedAt: iso(12) });
+    const { rerender } = renderSidebar({ sessions: [olderRunning, newerIdle] });
+    expect(sessionTitlesInList()).toEqual(["较早那条", "较新空闲"]);
+
+    rerender(
+      <Sidebar
+        sessions={[
+          { ...olderRunning, runState: "idle", lastOutcome: "completed" },
+          newerIdle,
+        ]}
+        user={user}
+        onSelect={() => {}}
+        onNew={() => {}}
+        onRename={() => {}}
+        onDelete={() => {}}
+      />,
+    );
+    expect(sessionTitlesInList()).toEqual(["较新空闲", "较早那条"]);
+
+    rerender(
+      <Sidebar
+        sessions={[
+          { ...olderRunning, runState: "idle", lastOutcome: "completed" },
+          newerIdle,
+        ]}
+        user={user}
+        onSelect={() => {}}
+        onNew={() => {}}
+        onRename={() => {}}
+        onDelete={() => {}}
+        isSending={(id) => id === "s-old"}
+        socketVersion={2}
+      />,
+    );
+    expect(sessionTitlesInList()).toEqual(["较早那条", "较新空闲"]);
+  });
+});
+
 
 describe("HighlightedText", () => {
   it("不高亮时不使用 innerHTML", () => {

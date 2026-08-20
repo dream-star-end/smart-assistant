@@ -47,6 +47,19 @@ export const SIDEBAR_DOT_LABELS: Record<Exclude<SidebarDotKind, "none">, string>
   service_restart: "服务重启中断，可继续",
 };
 
+/** 与 SessionRow 同一套 running 判据：本 tab isSending 优先；否则 runState=running 且没有本 tab 终态。 */
+export function isSidebarSessionRunning(
+  session: { id: string; runState?: string | null },
+  ctx?: {
+    isSending?: (id: string) => boolean;
+    liveTerminal?: (id: string) => unknown;
+  },
+): boolean {
+  const sending = Boolean(ctx?.isSending?.(session.id));
+  const live = ctx?.liveTerminal?.(session.id);
+  return sending || (session.runState === "running" && !live);
+}
+
 export function resolveSidebarDot(input: SessionStatusInput, unread?: boolean): SidebarDotKind {
   const kind = resolveSessionStatus(input);
   if (kind === "running") return "running";

@@ -1,5 +1,6 @@
 import { Archive, Pin } from "lucide-react";
 import type { ChatProject, Session } from "../../lib/types";
+import { isSidebarSessionRunning } from "../../lib/sessionStatus";
 import { cn } from "../../lib/utils";
 import { SessionStatusDot } from "../SessionStatusDot";
 import { formatDate } from "../ui/TimeAgo";
@@ -66,8 +67,7 @@ export function SessionRow({
   allowDrag: boolean;
 }) {
   const live = liveTerminal?.(s.id);
-  const sending = Boolean(isSending?.(s.id));
-  const running = sending || (s.runState === "running" && !live);
+  const running = isSidebarSessionRunning(s, { isSending, liveTerminal });
   const title = s.title || "新对话";
   const ageAt = sessionAgeTimestamp(s, running, runStartedAt?.(s.id));
   const ageText = ageAt != null ? formatCompactAge(ageAt, now) : "";

@@ -13,7 +13,15 @@ import {
 export type FlatItem =
   | { kind: "header"; key: string; label: string; height: number }
   | { kind: "session"; key: string; session: Session; indent?: boolean; height: number }
-  | { kind: "project"; key: string; project: ChatProject; count: number; collapsed: boolean; height: number }
+  | {
+      kind: "project";
+      key: string;
+      project: ChatProject;
+      count: number;
+      collapsed: boolean;
+      runningCount: number;
+      height: number;
+    }
   | { kind: "hint"; key: string; text: string; height: number }
   | { kind: "searchHit"; key: string; hit: SessionSearchHit; height: number }
   | { kind: "archivedToggle"; key: string; count: number; expanded: boolean; height: number };
@@ -34,6 +42,8 @@ export type FlattenInput = {
   searchHits: SessionSearchHit[];
   searchRemote: "idle" | "loading" | "empty" | "error";
   localEmpty: boolean;
+  /** 组内运行中计数（折叠项目行提示）；缺省视为 0。排序在调用方完成。 */
+  isRunning?: (s: Session) => boolean;
 };
 
 function virtualDefaultProject(count: number): ChatProject {
@@ -45,6 +55,13 @@ function virtualDefaultProject(count: number): ChatProject {
     updatedAt: 0,
     sessionCount: count,
   };
+}
+
+function runningIn(list: Session[], isRunning?: (s: Session) => boolean): number {
+  if (!isRunning || list.length === 0) return 0;
+  let n = 0;
+  for (const s of list) if (isRunning(s)) n += 1;
+  return n;
 }
 
 export function flattenSidebarItems(input: FlattenInput): FlatItem[] {
@@ -100,7 +117,15 @@ export function flattenSidebarItems(input: FlattenInput): FlatItem[] {
       const kids = input.projectSessions.get(p.id) ?? [];
       const count = input.sessions.filter((s) => s.projectId === p.id && !s.archived).length;
       const collapsed = input.collapsedProjectIds?.has(p.id) ?? false;
-      items.push({ kind: "project", key: `p-${p.id}`, project: p, count, collapsed, height: PROJECT_ROW_HEIGHT });
+      items.push({
+        kind: "project",
+        key: `p-${p.id}`,
+        project: p,
+        count,
+        collapsed,
+        runningCount: runningIn(kids, input.isRunning),
+        height: PROJECT_ROW_HEIGHT,
+      });
       if (!collapsed) {
         if (kids.length === 0) {
           items.push({ kind: "hint", key: `p-empty-${p.id}`, text: "暂无会话", height: HINT_ROW_HEIGHT });
@@ -120,6 +145,7 @@ export function flattenSidebarItems(input: FlattenInput): FlatItem[] {
     project: virtualDefaultProject(defaultKids.length),
     count: defaultKids.length,
     collapsed: defaultCollapsed,
+    runningCount: runningIn(defaultKids, input.isRunning),
     height: PROJECT_ROW_HEIGHT,
   });
   if (!defaultCollapsed) {
