@@ -817,6 +817,13 @@ export async function jsonOrThrow<T>(p: Promise<Response> | Response): Promise<T
   return body;
 }
 
+/** 资产写接口回 `{ asset }`，早期契约回裸对象；两种都收。 */
+function unwrapProjectAsset(
+  body: { asset?: ProjectAsset } & Partial<ProjectAsset>,
+): ProjectAsset {
+  return (body.asset ?? body) as ProjectAsset;
+}
+
 /**
  * 企业席位订单下单响应 → OrgPayResult。与批次 F issueOrderQr 同形：
  * `{ ok, data: { order_no, qrcode_url, mobile_url, amount_cents, credits, expires_at } }`。
@@ -2087,7 +2094,7 @@ export const api = {
       ),
     ).then(() => undefined),
 
-  // ── 项目资产（侧栏项目下聚合上传资料 + 会话产出；契约并行开发中）──
+  // ── 项目资产（侧栏项目下聚合上传资料 + 会话产出）──
 
   /**
    * 列出某项目的资产。`projectId` 省略 / null → `?projectId=none`（未分组 / default 组）。
@@ -2105,7 +2112,7 @@ export const api = {
   },
 
   createProjectAsset: (a: AuthSession, input: CreateProjectAssetInput): Promise<ProjectAsset> =>
-    jsonOrThrow<ProjectAsset>(
+    jsonOrThrow<{ asset?: ProjectAsset } & Partial<ProjectAsset>>(
       callWithRefresh(a, (t) =>
         fetch("/api/project-assets", {
           method: "POST",
@@ -2114,14 +2121,14 @@ export const api = {
           body: JSON.stringify(input),
         }),
       ),
-    ),
+    ).then(unwrapProjectAsset),
 
   patchProjectAsset: (
     a: AuthSession,
     assetId: string,
     patch: PatchProjectAssetInput,
   ): Promise<ProjectAsset> =>
-    jsonOrThrow<ProjectAsset>(
+    jsonOrThrow<{ asset?: ProjectAsset } & Partial<ProjectAsset>>(
       callWithRefresh(a, (t) =>
         fetch(`/api/project-assets/${encodeURIComponent(assetId)}`, {
           method: "PATCH",
@@ -2130,7 +2137,7 @@ export const api = {
           body: JSON.stringify(patch),
         }),
       ),
-    ),
+    ).then(unwrapProjectAsset),
 
   /** DELETE 约定 204 / 空体；200+JSON 也收。 */
   deleteProjectAsset: (a: AuthSession, assetId: string): Promise<void> =>
