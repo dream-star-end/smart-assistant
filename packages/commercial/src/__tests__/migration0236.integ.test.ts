@@ -14,6 +14,13 @@ describe('0236 memory usage observability', () => {
        VALUES ('memory-usage-0236@example.test',TRUE,'x','user',1000,'active')
        RETURNING id::text`,
     )
+    const container = await query<{ id: string }>(
+      `INSERT INTO agent_containers(user_id,secret_hash,state,runtime_channel)
+       VALUES ($1,decode(repeat('aa', 32), 'hex'),'active','v5')
+       RETURNING id::text`,
+      [user.rows[0]!.id],
+    )
+    const containerId = Number(container.rows[0]!.id)
     const deps = {
       identityRepo: {} as never,
       queryRunner: {
@@ -26,7 +33,7 @@ describe('0236 memory usage observability', () => {
       },
     }
     const timestamp = Date.now()
-    const inserted = await insertMemoryUsageEvents(deps, Number(user.rows[0]!.id), 1, [
+    const inserted = await insertMemoryUsageEvents(deps, Number(user.rows[0]!.id), containerId, [
       {
         schemaVersion: 1,
         eventId: 'mem-0236-1',
