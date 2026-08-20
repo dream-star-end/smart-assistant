@@ -1,5 +1,14 @@
-import { Archive, Kanban, Menu, MoreHorizontal, PanelLeft, PenSquare, Plus } from 'lucide-react'
-import { useMemo, useState } from 'react'
+import {
+  Archive,
+  Kanban,
+  List,
+  Menu,
+  MoreHorizontal,
+  PanelLeft,
+  PenSquare,
+  Plus,
+} from 'lucide-react'
+import { useEffect, useMemo, useState } from 'react'
 import type { BoardViewParam } from '../../hooks/useAppRoute'
 import { useMdViewport } from '../../hooks/useMdViewport'
 import {
@@ -88,6 +97,13 @@ export function TaskboardView({
   const [draftReady, setDraftReady] = useState(false)
   const [reviseOpen, setReviseOpen] = useState(false)
   const [backlogTypeFilter, setBacklogTypeFilter] = useState<TicketType | ''>('')
+  const [lastTaskView, setLastTaskView] = useState<'board' | 'list'>(
+    view === 'list' ? 'list' : 'board',
+  )
+
+  useEffect(() => {
+    if (view === 'board' || view === 'list') setLastTaskView(view)
+  }, [view])
 
   const selected = useMemo(() => {
     if (!ticketId) return null
@@ -446,6 +462,17 @@ export function TaskboardView({
   }
 
   const shownType = board.board?.ticketType || board.ticketType || ''
+  const taskView = view === 'board' || view === 'list'
+  const sectionView = taskView ? 'tasks' : view
+
+  const switchSection = (next: string) => {
+    onViewChange(next === 'tasks' ? lastTaskView : (next as BoardViewParam))
+  }
+
+  const toggleTaskView = () => {
+    onViewChange(view === 'board' ? 'list' : 'board')
+  }
+
   const projectLabel = useMemo(() => {
     const current = (board.projects ?? []).find((p) => p.id === board.projectId && !p.archivedAt)
     return current ? `${current.key} ${current.name}` : undefined
@@ -614,16 +641,15 @@ export function TaskboardView({
         </Button>
       </header>
 
-      <div className="flex flex-wrap items-center gap-3 px-4 pb-2">
+      <div className="flex flex-wrap items-center gap-2 px-4 pb-2">
         <Tabs
-          value={view}
-          onValueChange={(v) => onViewChange(v as BoardViewParam)}
+          value={sectionView}
+          onValueChange={switchSection}
           layout="scroll"
-          idBase="taskboard"
-          aria-label="任务面板视图"
+          idBase="taskboard-section"
+          aria-label="任务面板功能"
           items={[
-            { value: 'board', label: '看板' },
-            { value: 'list', label: '列表' },
+            { value: 'tasks', label: '任务' },
             {
               value: 'inbox',
               label: `待我确认${board.inboxTickets.length ? ` ${board.inboxTickets.length}` : ''}`,
@@ -636,16 +662,32 @@ export function TaskboardView({
             { value: 'weekly', label: '周报' },
           ]}
         />
-        {view === 'board' && (
-          <Select
-            aria-label="看板类型"
-            className="ml-auto w-36"
-            inputSize="sm"
-            value={shownType}
-            onValueChange={(v) => switchTicketType(v as TicketType)}
-            options={TICKET_TYPES.map((t) => ({ value: t, label: TICKET_TYPE_LABEL[t] }))}
-            placeholder="单据类型"
-          />
+        {taskView && (
+          <div className="ml-auto flex items-center gap-2">
+            <Button
+              type="button"
+              size="sm"
+              variant="ghost"
+              data-testid="taskboard-layout-toggle"
+              aria-label={view === 'board' ? '切换到列表展示' : '切换到看板展示'}
+              title={view === 'board' ? '切换到列表展示' : '切换到看板展示'}
+              onClick={toggleTaskView}
+            >
+              {view === 'board' ? <List size={15} /> : <Kanban size={15} />}
+              {view === 'board' ? '列表' : '看板'}
+            </Button>
+            {view === 'board' && (
+              <Select
+                aria-label="看板类型"
+                className="w-36"
+                inputSize="sm"
+                value={shownType}
+                onValueChange={(v) => switchTicketType(v as TicketType)}
+                options={TICKET_TYPES.map((t) => ({ value: t, label: TICKET_TYPE_LABEL[t] }))}
+                placeholder="单据类型"
+              />
+            )}
+          </div>
         )}
       </div>
 
