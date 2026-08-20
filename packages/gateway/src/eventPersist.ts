@@ -4,7 +4,7 @@
  *
  * Call `startEventPersistence()` once during gateway boot.
  */
-import { insertEvent, insertUsageLog, pruneLocalObservability } from '@openclaude/storage'
+import { insertEvent, insertUsageLog, pruneLocalObservability, pruneMemoryUsage } from '@openclaude/storage'
 import type { GatewayEvent, TurnCompletedEvent, CostRecordedEvent } from '@openclaude/protocol'
 import { eventBus } from './eventBus.js'
 import { createLogger } from './logger.js'
@@ -43,6 +43,13 @@ function startRetention(): void {
         log.info('local observability retention sweep', stats)
       }
     }).catch((err) => log.warn('local observability retention sweep failed', {}, err))
+    void pruneMemoryUsage(
+      now - retentionDays('OC_LOCAL_MEMORY_USAGE_RETENTION_DAYS', 30) * DAY_MS,
+    ).then((stats) => {
+      if (stats.eventsDeleted || stats.turnsDeleted) {
+        log.info('local memory usage retention sweep', stats)
+      }
+    }).catch((err) => log.warn('local memory usage retention sweep failed', {}, err))
   }
   sweep()
   const timer = setInterval(sweep, DAY_MS)

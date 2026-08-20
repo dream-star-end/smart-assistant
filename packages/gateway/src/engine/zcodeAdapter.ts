@@ -371,6 +371,7 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
     try {
       const platform = await buildPromptContext({
         agentId: this.opts.agentId,
+        sessionKey: this.opts.sessionKey,
         persona: this.opts.persona,
         provider: 'zcode',
         model: this.currentModel,

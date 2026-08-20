@@ -26,7 +26,12 @@
  * 由 OPENCLAUDE_HOME 决定(容器内 = /home/agent/.openclaude;未设时 paths.ts 回落
  * homedir()/.openclaude,容器内两者同路径)。
  */
-import { paths } from '@openclaude/storage'
+import {
+  paths,
+  recordMemoryUsageEvent,
+  type MemoryUsageOperation,
+  type MemoryUsageType,
+} from '@openclaude/storage'
 import {
   createMemoryToolsContext,
   drainPendingEmbeds,
@@ -134,6 +139,49 @@ function emit(res: MemoryToolResult): never {
   process.exit(0)
 }
 
+async function observeMemoryResult(input: {
+  agentId: string
+  operation: MemoryUsageOperation
+  memoryType: MemoryUsageType
+  query?: string
+  startedAt: number
+  result: MemoryToolResult
+}): Promise<void> {
+  const telemetry = input.result.telemetry ?? {
+    outcome: input.result.isError ? 'error' as const : 'success' as const,
+  }
+  try {
+    await recordMemoryUsageEvent({
+      agentId: input.agentId,
+      sessionKey: process.env.OPENCLAUDE_SESSION_KEY || process.env.OC_SESSION_KEY || null,
+      operation: input.operation,
+      memoryType: input.memoryType,
+      outcome: telemetry.outcome,
+      policyReason: telemetry.policyReason,
+      retrievalMode: telemetry.retrievalMode,
+      resultCount: telemetry.resultCount,
+      latencyMs: Date.now() - input.startedAt,
+      query: input.query,
+      topMatchKey: telemetry.topMatchKey,
+    })
+  } catch {
+    // Observability is fail-open: a locked/corrupt telemetry table must never
+    // change the memory command's result or exit status.
+  }
+}
+
+async function observeAndEmit(input: {
+  agentId: string
+  operation: MemoryUsageOperation
+  memoryType: MemoryUsageType
+  query?: string
+  startedAt: number
+  result: MemoryToolResult
+}): Promise<never> {
+  await observeMemoryResult(input)
+  return emit(input.result)
+}
+
 async function main(): Promise<void> {
   const [cmd, ...rest] = process.argv.slice(2)
   if (!cmd || cmd === '--help' || cmd === '-h' || cmd === 'help') {
@@ -235,12 +283,21 @@ async function main(): Promise<void> {
   if (cmd === 'core-search') {
     const query = positional[0]
     if (!query) fail('core-search requires a "<query>" positional argument')
-    emit(await handleCoreSearch({
+    const startedAt = Date.now()
+    const result = await handleCoreSearch({
       agentId,
       query,
       limit: parseLimit(flags.limit),
       offset: parseOffset(flags.offset),
-    }))
+    })
+    await observeAndEmit({
+      agentId,
+      operation: 'core_search',
+      memoryType: 'core',
+      query,
+      startedAt,
+      result,
+    })
   }
 
   const ctx = await createMemoryToolsContext(agentId)
@@ -249,6 +306,7 @@ async function main(): Promise<void> {
     case 'session-search': {
       const query = positional[0]
       if (!query) fail('session-search requires a "<query>" positional argument')
+      const startedAt = Date.now()
       const summarize = flags.summarize !== undefined && flags.summarize !== 'false'
       const res = await handleSessionSearch(ctx, {
         query,
@@ -256,30 +314,59 @@ async function main(): Promise<void> {
         agentId: flags['agent-id'],
         summarize,
       })
-      emit(res)
+      await observeAndEmit({
+        agentId,
+        operation: 'session_search',
+        memoryType: 'recall',
+        query,
+        startedAt,
+        result: res,
+      })
       break
     }
     case 'archival-add': {
       const content = positional[0]
       if (!content) fail('archival-add requires a "<text>" positional argument')
+      const startedAt = Date.now()
       const res = await handleArchivalAdd(ctx, { content, tags: flags.tags })
       await drainPendingEmbeds(ctx)
-      emit(res)
+      await observeAndEmit({
+        agentId,
+        operation: 'archival_add',
+        memoryType: 'archival',
+        startedAt,
+        result: res,
+      })
       break
     }
     case 'archival-search': {
       const query = positional[0]
       if (!query) fail('archival-search requires a "<query>" positional argument')
+      const startedAt = Date.now()
       const res = await handleArchivalSearch(ctx, { query, limit: parseLimit(flags.limit) })
-      emit(res)
+      await observeAndEmit({
+        agentId,
+        operation: 'archival_search',
+        memoryType: 'archival',
+        query,
+        startedAt,
+        result: res,
+      })
       break
     }
     case 'archival-delete': {
       const id = positional[0]
       if (!id) fail('archival-delete requires an <id> positional argument')
+      const startedAt = Date.now()
       const res = await handleArchivalDelete(ctx, { id })
       await drainPendingEmbeds(ctx)
-      emit(res)
+      await observeAndEmit({
+        agentId,
+        operation: 'archival_delete',
+        memoryType: 'archival',
+        startedAt,
+        result: res,
+      })
       break
     }
     default:

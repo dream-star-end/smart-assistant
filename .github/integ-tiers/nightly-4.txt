@@ -39,3 +39,4 @@ packages/commercial/src/__tests__/migration0226.integ.test.ts
 packages/commercial/src/__tests__/migration0232.integ.test.ts
 packages/commercial/src/__tests__/migration0234.integ.test.ts
 packages/commercial/src/__tests__/migration0235.integ.test.ts
+packages/commercial/src/__tests__/migration0236.integ.test.ts

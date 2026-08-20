@@ -883,6 +883,38 @@ export type MemoryIndexResponse = {
   version?: string;
 };
 
+export type MemoryUsageDashboard = {
+  window: { days: number; from: string; to: string };
+  totals: {
+    events: number;
+    sessions: number;
+    hits: number;
+    noMatch: number;
+    errors: number;
+    denied: number;
+    freshnessGaps: number;
+  };
+  byOperation: Array<{
+    operation: string;
+    memoryType: string;
+    events: number;
+    sessions: number;
+    hits: number;
+    noMatch: number;
+    p50Ms: number;
+    p95Ms: number;
+  }>;
+  recentSessions: Array<{
+    sessionKey: string;
+    title: string;
+    lastAt: number;
+    events: number;
+    searches: number;
+    writes: number;
+    freshnessGaps: number;
+  }>;
+};
+
 /** GET .../memory/files/:file 响应：正文 + 乐观锁 version（sha256 前 16 位）。 */
 export type MemoryFileContent = { content: string; version: string };
 

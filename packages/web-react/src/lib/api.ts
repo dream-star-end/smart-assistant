@@ -51,6 +51,7 @@ import type {
   MemoryConflict,
   PutMemoryResult,
   MemoryIndexResponse,
+  MemoryUsageDashboard,
   AutoDreamReportResponse,
   AutoDreamOptimizerState,
   MemoryFileContent,
@@ -2440,6 +2441,17 @@ export const api = {
           credentials: "include",
           headers: bearerHeaders(t),
         }),
+      ),
+    ),
+
+  /** 逐会话记忆使用统计（精确事件，不解析工具文本；days=1..90）。 */
+  getMemoryUsage: (a: AuthSession, agentId: string, days = 30) =>
+    jsonOrThrow<MemoryUsageDashboard>(
+      callWithRefresh(a, (t) =>
+        fetch(
+          `/api/agents/${encodeURIComponent(agentId)}/memory/usage?days=${Math.max(1, Math.min(90, Math.floor(days)))}`,
+          { credentials: "include", headers: bearerHeaders(t) },
+        ),
       ),
     ),
 

@@ -79,6 +79,15 @@ describe('memory retrieval hygiene', () => {
     const out = renderMemoryInstructions({ memoryDir: '/m', memoryMd: '/MEMORY.md', userMd: '/user.md' })
     assert.match(out, /core-search/)
     assert.doesNotMatch(out, /## 当前索引/)
+    assert.match(out, /记忆只提供历史线索/)
+    assert.match(out, /当前证据与记忆冲突时永远以当前证据为准/)
+  })
+
+  it('locks the freshness contract without forcing historical-only questions to probe live state', () => {
+    const out = renderMemoryInstructions({ memoryDir: '/m', memoryMd: '/MEMORY.md', userMd: '/user.md' })
+    assert.match(out, /当前核验\(来源\+时间\)/)
+    assert.match(out, /仅为历史记录,当前未核实/)
+    assert.match(out, /用户只问历史原因、既有偏好或明确要求不核验时,不要制造无意义探活/)
   })
 
   it('injects a populated index into the memory slot without writing disk', async () => {

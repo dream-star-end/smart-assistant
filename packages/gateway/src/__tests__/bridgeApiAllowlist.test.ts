@@ -45,6 +45,11 @@ describe('bridge API allowlist', () => {
       '/api/agents/:id/memory/:target',
     )
     assert.equal(
+      matchCommercialContainerApiProxy('/api/agents/main/memory/usage', 'GET')?.label,
+      '/api/agents/:id/memory/usage',
+    )
+    assert.equal(matchCommercialContainerApiProxy('/api/agents/main/memory/usage', 'POST'), null)
+    assert.equal(
       matchCommercialContainerApiProxy('/api/agents/main/auto-dream-report', 'GET')?.label,
       '/api/agents/:id/auto-dream-report',
     )

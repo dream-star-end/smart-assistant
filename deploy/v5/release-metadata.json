@@ -113,7 +113,8 @@
     "0232_agent_group_jsonb_unicode_sanitize",
     "0233_client_session_list_archived_at",
     "0234_all_model_prices_half",
-    "0235_telemetry_iteration_closure"
+    "0235_telemetry_iteration_closure",
+    "0236_memory_usage_observability"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

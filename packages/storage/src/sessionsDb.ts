@@ -148,6 +148,52 @@ export async function getSessionsDb(): Promise<Database.Database> {
       tool_calls INTEGER NOT NULL DEFAULT 0,
       timestamp INTEGER NOT NULL
     );
+
+    -- Exact, privacy-minimized memory operations. Unlike tool.called previews,
+    -- these rows are written at the memory implementation boundary and remain
+    -- attributable even when one Bash invocation wraps multiple CLI calls.
+    CREATE TABLE IF NOT EXISTS memory_usage_events (
+      event_id TEXT PRIMARY KEY,
+      timestamp INTEGER NOT NULL,
+      agent_id TEXT NOT NULL,
+      session_key TEXT,
+      turn_index INTEGER,
+      operation TEXT NOT NULL,
+      memory_type TEXT NOT NULL,
+      outcome TEXT NOT NULL,
+      policy_reason TEXT,
+      retrieval_mode TEXT,
+      result_count INTEGER,
+      latency_ms INTEGER NOT NULL DEFAULT 0,
+      query_hash TEXT,
+      query_chars INTEGER,
+      top_match_hash TEXT,
+      metadata_json TEXT NOT NULL DEFAULT '{}',
+      freshness_gap INTEGER,
+      reported_at INTEGER
+    );
+
+    -- Shadow freshness contract, one row per logical turn. It deliberately
+    -- stores only an intent class and booleans, never the user prompt.
+    CREATE TABLE IF NOT EXISTS memory_turn_context (
+      session_key TEXT NOT NULL,
+      turn_index INTEGER NOT NULL,
+      agent_id TEXT NOT NULL,
+      current_fact_intent INTEGER NOT NULL DEFAULT 0,
+      intent_kind TEXT,
+      evidence_seen INTEGER NOT NULL DEFAULT 0,
+      memory_used INTEGER NOT NULL DEFAULT 0,
+      soft_reminder_active INTEGER NOT NULL DEFAULT 0,
+      freshness_gap INTEGER,
+      created_at INTEGER NOT NULL,
+      completed_at INTEGER,
+      PRIMARY KEY(session_key, turn_index)
+    );
+
+    CREATE TABLE IF NOT EXISTS memory_usage_kv (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
   `)
 
   // ── Schema migrations (run BEFORE index creation) ──
@@ -193,6 +239,10 @@ export async function getSessionsDb(): Promise<Database.Database> {
     CREATE INDEX IF NOT EXISTS idx_event_log_peer ON event_log(peer_id);
     CREATE INDEX IF NOT EXISTS idx_usage_log_agent_ts ON usage_log(agent_id, timestamp);
     CREATE INDEX IF NOT EXISTS idx_usage_log_session ON usage_log(session_id);
+    CREATE INDEX IF NOT EXISTS idx_memory_usage_agent_ts ON memory_usage_events(agent_id, timestamp);
+    CREATE INDEX IF NOT EXISTS idx_memory_usage_session_turn ON memory_usage_events(session_key, turn_index);
+    CREATE INDEX IF NOT EXISTS idx_memory_usage_pending ON memory_usage_events(reported_at, timestamp);
+    CREATE INDEX IF NOT EXISTS idx_memory_turn_context_agent_ts ON memory_turn_context(agent_id, created_at);
   `)
 
   // Periodic WAL checkpoint to prevent unbounded WAL growth

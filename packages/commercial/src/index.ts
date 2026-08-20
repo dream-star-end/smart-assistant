@@ -333,6 +333,10 @@ import {
   makeTurnObservationHandler,
 } from "./http/internalTurnObservation.js";
 import {
+  MEMORY_USAGE_PATH,
+  makeMemoryUsageHandler,
+} from "./http/internalMemoryUsage.js";
+import {
   SKILL_USAGE_PATH,
   isSkillUsageEnabled,
   makeSkillUsageHandler,
@@ -2140,6 +2144,12 @@ export async function registerCommercial(
       const turnObservationHandler = isToolFailureAuditEnabled()
         ? makeTurnObservationHandler({ identityRepo, queryRunner: getPool() })
         : null;
+      // Privacy-minimized memory operation stream. Always registered when the
+      // runtime has a container identity channel; no raw query/session/body is accepted.
+      const memoryUsageHandler = makeMemoryUsageHandler({
+        identityRepo,
+        queryRunner: getPool(),
+      });
       // /internal/v3/marketplace/skill-usage — 容器 gateway skillUsageReporter 批量上报
       // 「hub 技能被使用」的低敏信号(slug/agent/trace,不记内容)。user_id 由
       // verifyContainerIdentity 推导,不信容器传入;写入 marketplace_skill_usage_events 供
@@ -2405,6 +2415,9 @@ export async function registerCommercial(
         }
         if (turnObservationHandler && path === TURN_OBSERVATION_PATH) {
           return turnObservationHandler(req, res, ctx);
+        }
+        if (path === MEMORY_USAGE_PATH) {
+          return memoryUsageHandler(req, res, ctx);
         }
         if (skillUsageHandler && path === SKILL_USAGE_PATH) {
           return skillUsageHandler(req, res, ctx);

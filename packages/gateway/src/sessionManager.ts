@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { rename, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import {
   type AgentDef,
   type OpenClaudeConfig,
@@ -18,6 +18,7 @@ import {
   readMemoryTurnPolicy,
   recordTurnDispatchRunning,
   reserveTurnIndex,
+  recordMemoryUsageEvent,
   paths,
   type KernelFileLock,
   upsertSessionMeta,
@@ -54,6 +55,7 @@ import type { CodexProviderConfigOverride } from './engine/codexShared.js'
 import type { GrokRouteOverride } from './engine/grokAdapter.js'
 import type { ZcodeRouteOverride } from './engine/zcodeAdapter.js'
 import { eventBus, createEvent } from './eventBus.js'
+import { beginMemoryTurnTracking } from './memoryTurnObserver.js'
 import { createLogger } from './logger.js'
 import {
   deriveLosslessTurnKey,
@@ -4269,6 +4271,20 @@ export class SessionManager {
       legacySessionIds:
         legacyId && legacyId !== session.sessionKey ? [legacyId] : [],
     })
+    const memoryObservationText = typeof userTextOrBlocks === 'string'
+      ? userTextOrBlocks
+      : userTextOrBlocks
+          .flatMap((block) => typeof block.text === 'string' ? [block.text] : [])
+          .join('\n')
+    await beginMemoryTurnTracking({
+      sessionKey: session.sessionKey,
+      turnIndex: projectedTurnIndex,
+      agentId: session.agentId,
+      userText: memoryObservationText,
+    }).catch((err) => log.warn('memory turn observation start failed', {
+      sessionKey: session.sessionKey,
+      turnIndex: projectedTurnIndex,
+    }, err))
     // CcbMessageParser increments this reference on a real result. Seed it to
     // the slot immediately before the reservation so the result lands exactly
     // on projectedTurnIndex; partial/crash persistence uses the same slot.
@@ -4613,6 +4629,7 @@ export class SessionManager {
     let turnToolCallCount = 0
     let turnBlockCount = 0
     let turnPermissionCount = 0
+    const memoryReadTargets = new Map<string, string>()
     // Plan/goal blocks are paid structured model output but are not contained
     // in assistantText/thinkingText/tool snapshots. Keep every update (not
     // merely the last card projection) so a disconnected browser is never the
@@ -4794,6 +4811,21 @@ export class SessionManager {
         if (e.kind === 'tool_use_detected') {
           const tool = e.tool
           turnToolCallCount++
+          if (tool.name === 'Read') {
+            const toolInput = tool.input as unknown as Record<string, unknown>
+            const rawPath = typeof toolInput.file_path === 'string'
+              ? toolInput.file_path
+              : typeof toolInput.path === 'string'
+                ? toolInput.path
+                : null
+            if (rawPath) {
+              const memoryRoot = resolve(paths.agentMemoryDir(session.agentId))
+              const target = resolve(rawPath)
+              if (target.startsWith(`${memoryRoot}/`) && target.endsWith('.md')) {
+                memoryReadTargets.set(tool.id, target)
+              }
+            }
+          }
           // Bridge CCB CronCreate/CronDelete via EventBus
           if (tool.name === 'CronCreate') {
             const gatewayJobId = `ccb-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
@@ -4817,6 +4849,20 @@ export class SessionManager {
         }
         if (e.kind === 'tool_result_detected') {
           const tr = e.result
+          const memoryTarget = memoryReadTargets.get(tr.toolUseId)
+          memoryReadTargets.delete(tr.toolUseId)
+          if (memoryTarget && !tr.isError) {
+            void recordMemoryUsageEvent({
+              agentId: session.agentId,
+              sessionKey: session.sessionKey,
+              turnIndex: session.turns + 1,
+              operation: 'core_read',
+              memoryType: 'core',
+              outcome: 'success',
+              topMatchKey: memoryTarget,
+              metadata: { source: 'native_read_tool' },
+            }).catch(() => {})
+          }
           if (tr.toolName === 'CronCreate' && !tr.isError && session._cronBridgeMap) {
             const pendingKey = `_pending:${tr.toolUseId}`
             const gatewayJobId = session._cronBridgeMap.get(pendingKey)

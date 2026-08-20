@@ -1419,6 +1419,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
       const mcpEntry = resolveMcpMemoryEntry(this.opts.config.auth.claudeCodePath)
       const platformResult = await buildPromptContext({
         agentId: this.opts.agentId,
+        sessionKey: this.opts.sessionKey,
         persona: this.opts.persona,
         provider: 'cursor',
         model: this.currentModel,

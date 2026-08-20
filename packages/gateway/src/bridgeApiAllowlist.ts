@@ -68,6 +68,14 @@ export const BRIDGE_API_ALLOWLIST: readonly BridgeApiAllowRule[] = [
     proxyFromCommercial: true,
   },
   {
+    // Privacy-minimized per-user usage dashboard. The container handler only
+    // returns counters, latency percentiles and the caller's own session titles.
+    label: '/api/agents/:id/memory/usage',
+    re: /^\/api\/agents\/[A-Za-z0-9_-]+\/memory\/usage$/,
+    methods: M('GET'),
+    proxyFromCommercial: true,
+  },
+  {
     // memdir 单条记忆文件 CRUD。:file 用 [^/]+(容器 handler 再过 basename+MEMORY_FILE_RE
     // 双保险,拒 `..`/非法名),桥门不比 handler 更松。操作用户自己容器卷内的记忆文件,故 proxy。
     label: '/api/agents/:id/memory/files/:file',

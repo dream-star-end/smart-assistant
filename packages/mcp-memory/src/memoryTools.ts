@@ -58,13 +58,24 @@ import {
 export interface MemoryToolResult {
   content: Array<{ type: 'text'; text: string }>
   isError?: boolean
+  /** Privacy-minimized observability metadata; never rendered to the model. */
+  telemetry?: {
+    outcome: 'hit' | 'no_match' | 'success' | 'denied' | 'error' | 'skipped'
+    policyReason?: string
+    retrievalMode?: 'lexical' | 'semantic' | 'hybrid' | 'bm25' | 'none'
+    resultCount?: number
+    topMatchKey?: string
+  }
 }
 
-export function toolOk(msg: string): MemoryToolResult {
-  return { content: [{ type: 'text', text: msg }] }
+export function toolOk(msg: string, telemetry?: MemoryToolResult['telemetry']): MemoryToolResult {
+  return { content: [{ type: 'text', text: msg }], ...(telemetry ? { telemetry } : {}) }
 }
-export function toolError(msg: string): MemoryToolResult {
-  return { content: [{ type: 'text', text: `error: ${msg}` }], isError: true }
+export function toolError(
+  msg: string,
+  telemetry: MemoryToolResult['telemetry'] = { outcome: 'error' },
+): MemoryToolResult {
+  return { content: [{ type: 'text', text: `error: ${msg}` }], isError: true, telemetry }
 }
 
 /**
@@ -189,17 +200,27 @@ async function memorySearchPolicyError(kind: 'core' | 'deep'): Promise<MemoryToo
   if (!isManagedAgentRuntime()) return null
   const sessionKey =
     process.env.OPENCLAUDE_SESSION_KEY?.trim() || process.env.OC_SESSION_KEY?.trim()
-  if (!sessionKey) return toolError('memory search is unavailable without an active turn policy')
+  if (!sessionKey) return toolError('memory search is unavailable without an active turn policy', {
+    outcome: 'denied',
+    policyReason: 'missing_session',
+  })
   const policy = await readMemoryTurnPolicy(sessionKey)
-  if (!policy) return toolError('memory search is unavailable because the active turn policy is missing or expired')
+  if (!policy) return toolError('memory search is unavailable because the active turn policy is missing or expired', {
+    outcome: 'denied',
+    policyReason: 'missing_or_expired',
+  })
   if (!policy.allowed)
-    return toolError(`memory search is disabled for this turn (${policy.reason}); answer from the current request`)
+    return toolError(`memory search is disabled for this turn (${policy.reason}); answer from the current request`, {
+      outcome: 'denied',
+      policyReason: policy.reason,
+    })
   if (
     kind === 'deep' &&
     (policy.reason === 'on_demand_core' || policy.reason === 'inherited_parent_core')
   ) {
     return toolError(
       `session and archival search require explicit continuity or stored-material intent (${policy.reason})`,
+      { outcome: 'denied', policyReason: policy.reason },
     )
   }
   return null
@@ -442,10 +463,21 @@ export async function handleCoreSearch(args: {
     })
   }
   const page = hits.slice(offset, offset + limit)
-  if (hits.length === 0) return toolOk(`No safe Core memories match "${query}".`)
+  const retrievalMode = semanticFiles === null ? 'lexical' : 'semantic'
+  if (hits.length === 0) return toolOk(`No safe Core memories match "${query}".`, {
+    outcome: 'no_match',
+    retrievalMode,
+    resultCount: 0,
+  })
   if (!page.length)
     return toolOk(
       `Found ${hits.length} safe Core matches for "${query}", but offset ${offset} is past the last result.`,
+      {
+        outcome: 'hit',
+        retrievalMode,
+        resultCount: hits.length,
+        topMatchKey: hits[0]?.path,
+      },
     )
   const lines = [`Found ${hits.length} safe Core matches for "${query}". Showing ${offset + 1}-${offset + page.length}:`]
   if (weakLexicalFallback) lines.push(WEAK_LEXICAL_FALLBACK_NOTE)
@@ -456,7 +488,12 @@ export async function handleCoreSearch(args: {
   if (offset + page.length < hits.length)
     lines.push(`More matches available: rerun with --offset ${offset + page.length}.`)
   lines.push('Excerpts are bounded; use Read with offset/limit on the path for complete content.')
-  return toolOk(lines.join('\n'))
+  return toolOk(lines.join('\n'), {
+    outcome: 'hit',
+    retrievalMode,
+    resultCount: hits.length,
+    topMatchKey: hits[0]?.path,
+  })
 }
 
 // ── memory (Core) 已退役 ──
@@ -491,7 +528,11 @@ export async function handleSessionSearch(
 
   if (hits.length === 0) {
     const scope = args.agentId ? ` (agent: ${args.agentId})` : ''
-    return { content: [{ type: 'text', text: `No past sessions match "${args.query}"${scope}.` }] }
+    return toolOk(`No past sessions match "${args.query}"${scope}.`, {
+      outcome: 'no_match',
+      retrievalMode: ctx.embeddingProvider ? 'hybrid' : 'bm25',
+      resultCount: 0,
+    })
   }
   const scope = args.agentId ? ` (agent: ${args.agentId})` : ''
   const mode = ctx.embeddingProvider ? 'hybrid' : 'BM25'
@@ -522,7 +563,12 @@ export async function handleSessionSearch(
       lines.push('')
     }
   }
-  return { content: [{ type: 'text', text: lines.join('\n') }] }
+  return toolOk(lines.join('\n'), {
+    outcome: 'hit',
+    retrievalMode: ctx.embeddingProvider ? 'hybrid' : 'bm25',
+    resultCount: hits.length,
+    topMatchKey: hits[0]?.sessionId,
+  })
 }
 
 // ── archival_add (Archival: unlimited FTS5-searchable long-term store) ──
@@ -564,7 +610,12 @@ export async function handleArchivalAdd(
   }
 
   const count = await archivalCount(ctx.agentId)
-  return toolOk(`Stored in archival memory (id=${id}). Total entries: ${count}`)
+  return toolOk(`Stored in archival memory (id=${id}). Total entries: ${count}`, {
+    outcome: 'success',
+    retrievalMode: 'none',
+    resultCount: 1,
+    topMatchKey: id,
+  })
 }
 
 // ── archival_search (Archival: hybrid BM25 + vector + RRF) ──
@@ -579,7 +630,11 @@ export async function handleArchivalSearch(
   }
   const limit = args.limit ?? 5
   const results = await hybridArchivalSearch(ctx.agentId, args.query, ctx.embeddingProvider, limit)
-  if (results.length === 0) return toolOk(`No archival entries match "${args.query}".`)
+  if (results.length === 0) return toolOk(`No archival entries match "${args.query}".`, {
+    outcome: 'no_match',
+    retrievalMode: ctx.embeddingProvider ? 'hybrid' : 'bm25',
+    resultCount: 0,
+  })
 
   // Track access for lifecycle (non-blocking)
   recordAccess(results.map((r) => r.id)).catch(() => {})
@@ -592,7 +647,12 @@ export async function handleArchivalSearch(
     const rankInfo = ranks.length > 0 ? ` [${ranks.join(', ')}]` : ''
     return `[${i + 1}] id=${r.id} tags=${r.tags || '(none)'}${rankInfo}\n${r.content}`
   })
-  return toolOk(`Found ${results.length} archival entries (${mode}):\n\n${lines.join('\n\n---\n\n')}`)
+  return toolOk(`Found ${results.length} archival entries (${mode}):\n\n${lines.join('\n\n---\n\n')}`, {
+    outcome: 'hit',
+    retrievalMode: ctx.embeddingProvider ? 'hybrid' : 'bm25',
+    resultCount: results.length,
+    topMatchKey: results[0]?.id,
+  })
 }
 
 // ── archival_delete ──
@@ -619,5 +679,10 @@ export async function handleArchivalDelete(
       process.stderr.write(`[oc-memory] vector delete failed for ${args.id}: ${err?.message}\n`)
     }
   }
-  return toolOk(`Deleted archival entry ${args.id}.`)
+  return toolOk(`Deleted archival entry ${args.id}.`, {
+    outcome: 'success',
+    retrievalMode: 'none',
+    resultCount: 1,
+    topMatchKey: args.id,
+  })
 }

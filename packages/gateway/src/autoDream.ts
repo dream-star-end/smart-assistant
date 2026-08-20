@@ -18,6 +18,7 @@ import {
   scanAutoDreamSuccessfulSessions,
   scanMemoryContent,
   stampAutoMemoryFrontmatter,
+  recordMemoryUsageEvent,
 } from '@openclaude/storage'
 
 import { type AutoDreamPolicy, AutoDreamPolicyClient } from './autoDreamPolicy.js'
@@ -511,7 +512,13 @@ export class AutoDreamService {
       let applyError: unknown = null
       let appliedCreates: ProposalUpsert[] = []
       try {
-        const planned = await this.planAddOnlyCreates(trigger.agentId, proposal, memory, today)
+        const planned = await this.planAddOnlyCreates(
+          trigger.agentId,
+          trigger.sessionKey,
+          proposal,
+          memory,
+          today,
+        )
         const result = await memdir.applyAutoAdds({
           creates: planned.map((row) => ({ file: row.file, content: row.content })),
           today,
@@ -519,6 +526,15 @@ export class AutoDreamService {
         if (!result.ok)
           throw new Error(`AUTO_DREAM_MEMORY_ADD_ONLY_FAILED:${result.reason}:${result.error}`)
         appliedCreates = planned.filter((row) => result.created.includes(row.file))
+        await Promise.all(appliedCreates.map((row) => recordMemoryUsageEvent({
+          agentId: trigger.agentId,
+          sessionKey: trigger.sessionKey,
+          operation: 'auto_add',
+          memoryType: 'core',
+          outcome: 'success',
+          topMatchKey: row.file,
+          metadata: { source: 'auto_dream' },
+        }).catch(() => {})))
       } catch (err) {
         applyError = err
       }
@@ -619,21 +635,49 @@ export class AutoDreamService {
 
   private async planAddOnlyCreates(
     agentId: string,
+    sessionKey: string,
     proposal: Proposal,
     memory: MemorySnapshot,
     today: string,
   ): Promise<ProposalUpsert[]> {
     for (const file of proposal.deletes) {
       this.log('auto_memory_add_only_refuse_delete', { agentId, file })
+      await recordMemoryUsageEvent({
+        agentId,
+        sessionKey,
+        operation: 'auto_refuse',
+        memoryType: 'core',
+        outcome: 'skipped',
+        topMatchKey: file,
+        metadata: { reason: 'delete_forbidden' },
+      }).catch(() => {})
     }
     const creates: ProposalUpsert[] = []
     for (const row of proposal.upserts) {
       if (isForbiddenAutoMemoryTarget(row.file, agentId)) {
         this.log('auto_memory_add_only_refuse_user_md', { agentId, file: row.file })
+        await recordMemoryUsageEvent({
+          agentId,
+          sessionKey,
+          operation: 'auto_refuse',
+          memoryType: 'core',
+          outcome: 'skipped',
+          topMatchKey: row.file,
+          metadata: { reason: 'forbidden_target' },
+        }).catch(() => {})
         continue
       }
       if (memory.versions.has(row.file)) {
         this.log('auto_memory_add_only_refuse_exists', { agentId, file: row.file })
+        await recordMemoryUsageEvent({
+          agentId,
+          sessionKey,
+          operation: 'auto_refuse',
+          memoryType: 'core',
+          outcome: 'skipped',
+          topMatchKey: row.file,
+          metadata: { reason: 'exists' },
+        }).catch(() => {})
         continue
       }
       const topic = `${row.name} ${row.description}`.trim()
@@ -646,6 +690,16 @@ export class AutoDreamService {
           path: strong.path,
           reason: 'strong_hit',
         })
+        await recordMemoryUsageEvent({
+          agentId,
+          sessionKey,
+          operation: 'auto_skip',
+          memoryType: 'core',
+          outcome: 'skipped',
+          query: topic,
+          topMatchKey: strong.path ?? row.file,
+          metadata: { reason: 'strong_hit' },
+        }).catch(() => {})
         continue
       }
       creates.push({

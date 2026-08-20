@@ -132,6 +132,8 @@ import {
   loadSessionUsage,
   listAutoDreamAuditSessions,
   listAutoDreamSuccessfulSessionsBetween,
+  getMemoryUsageDashboard,
+  recordMemoryUsageEvent,
   syncMarketplaceHub,
   writeAgentsConfig,
   writeConfig,
@@ -297,6 +299,8 @@ import { DelegateResumeRegistry } from './delegateResume.js'
 import { isPlatformAgentId, parseDelegateModel } from './delegateModel.js'
 import { eventBus, createEvent } from './eventBus.js'
 import { startEventPersistence } from './eventPersist.js'
+import { startMemoryTurnObserver } from './memoryTurnObserver.js'
+import { startMemoryUsageReporter } from './memoryUsageReporter.js'
 import { parseByteRange, serveFileFdWithRange } from './httpRange.js'
 import { createLogger, type Logger } from './logger.js'
 import {
@@ -2863,6 +2867,11 @@ export class Gateway {
     // Start event persistence (writes all events to SQLite event_log)
     startEventPersistence()
 
+    // Exact memory usage + current-fact freshness shadow. Fail-open observers
+    // never alter turn execution or user-visible memory results.
+    startMemoryTurnObserver()
+    startMemoryUsageReporter()
+
     // Start metrics collection (eventBus → prometheus counters)
     startMetricsCollection()
 
@@ -5071,6 +5080,15 @@ export class Gateway {
     if (memoryMatch) {
       this.handleMemory(req, res, memoryMatch[1], memoryMatch[2] as 'memory' | 'user').catch(
         (err) => this.sendInternalError(res, err),
+      )
+      return
+    }
+    const memoryUsageMatch = url.pathname.match(
+      /^\/api\/agents\/([a-zA-Z0-9_-]+)\/memory\/usage$/,
+    )
+    if (memoryUsageMatch) {
+      this.handleMemoryUsage(req, res, memoryUsageMatch[1], url).catch((err) =>
+        this.sendInternalError(res, err),
       )
       return
     }
@@ -7843,6 +7861,13 @@ export class Gateway {
         const body = await this.readJsonBody<{ text?: string; version?: string }>(req)
         const r = await writeUserProfile(body.text ?? '', body.version)
         if (r.ok) {
+          await recordMemoryUsageEvent({
+            agentId,
+            operation: 'profile_write',
+            memoryType: 'profile',
+            outcome: 'success',
+            metadata: { source: 'ui' },
+          }).catch(() => {})
           const { text, version } = await readUserProfile()
           this.sendJson(res, 200, {
             ok: true,
@@ -7892,6 +7917,19 @@ export class Gateway {
       return this.sendError(res, 410, 'memory index is auto-managed; edit memory/<file> instead')
     }
     this.sendError(res, 405, 'method not allowed')
+  }
+
+  private async handleMemoryUsage(
+    req: IncomingMessage,
+    res: ServerResponse,
+    agentId: string,
+    url: URL,
+  ): Promise<void> {
+    if (isHiddenSystemAgentId(agentId)) return this.sendError(res, 404, 'agent not found')
+    if (req.method !== 'GET') return this.sendError(res, 405, 'method not allowed')
+    const rawDays = Number(url.searchParams.get('days') ?? '30')
+    const days = Number.isInteger(rawDays) ? Math.max(1, Math.min(90, rawDays)) : 30
+    this.sendJson(res, 200, await getMemoryUsageDashboard({ agentId, days }))
   }
 
   // GET /api/agents/:id/auto-dream-report → sanitized latest result/progress.
@@ -7981,8 +8019,17 @@ export class Gateway {
     }
     if (req.method === 'PUT') {
       const body = await this.readJsonBody<{ content?: string; version?: string }>(req)
+      const existed = Boolean(await md.read(safe))
       const r = await md.write(safe, body.content ?? '', body.version)
       if (r.ok) {
+        await recordMemoryUsageEvent({
+          agentId,
+          operation: existed ? 'core_update' : 'core_write',
+          memoryType: 'core',
+          outcome: 'success',
+          topMatchKey: safe,
+          metadata: { source: 'ui' },
+        }).catch(() => {})
         this.sendJson(res, 200, { ok: true, file: safe, version: r.version })
         return
       }
@@ -7998,6 +8045,14 @@ export class Gateway {
     if (req.method === 'DELETE') {
       const removed = await md.remove(safe)
       if (!removed) return this.sendError(res, 404, 'memory file not found')
+      await recordMemoryUsageEvent({
+        agentId,
+        operation: 'core_delete',
+        memoryType: 'core',
+        outcome: 'success',
+        topMatchKey: safe,
+        metadata: { source: 'ui' },
+      }).catch(() => {})
       this.sendJson(res, 200, { ok: true, file: safe })
       return
     }

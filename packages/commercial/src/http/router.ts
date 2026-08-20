@@ -420,7 +420,7 @@ const BLOCKED_FOR_USER_RULES: readonly BlockedForUserRule[] = [
   // (单条记忆文件 CRUD),与 memory/user 同属 host singleton,必须一并拦死;文件名段
   // 放宽到任意非斜杠段(拦截面宁宽勿漏,文件名合法性校验是容器 gateway 的事)。
   {
-    re: /^\/api\/agents\/[^/]+\/memory\/(memory|user|files\/[^/]+)$/,
+    re: /^\/api\/agents\/[^/]+\/memory\/(memory|user|usage|files\/[^/]+)$/,
     label: '/api/agents/:id/memory/*',
   },
   // Auto-Dream Optimizer 读写用户容器内的审计/建议状态并可应用已确认的变更。

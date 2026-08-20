@@ -1680,6 +1680,7 @@ export class SubprocessRunner extends EventEmitter {
     try {
       const promptResult = await buildPromptContext({
         agentId: this.opts.agentId,
+        sessionKey: this.opts.sessionKey,
         persona: this.opts.persona,
         provider: effectiveProvider,
         model: this.opts.model,
