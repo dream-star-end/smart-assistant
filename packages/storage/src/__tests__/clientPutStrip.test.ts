@@ -84,6 +84,27 @@ describe('_stripClientPutMessage allow-list (T1, T2)', () => {
     })
   })
 
+  it('preserves durable recovery lineage fields on user rows', () => {
+    const cleaned = _stripClientPutMessage({
+      id: 'm-recovery',
+      role: 'user',
+      text: '↻ 从断点继续',
+      ts: 1,
+      _recoveryOfClientMessageId: 'u-source',
+      _recoveryMode: 'checkpoint',
+      _automaticRecovery: false,
+      _isAutoRetry: true,
+    })
+    assert.equal(cleaned?._recoveryOfClientMessageId, 'u-source')
+    assert.equal(cleaned?._recoveryMode, 'checkpoint')
+    assert.equal(cleaned?._automaticRecovery, false)
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(cleaned ?? {}, '_isAutoRetry'),
+      false,
+      'client-only _isAutoRetry stays stripped',
+    )
+  })
+
   it('preserves _media / _modelText / _teamRun (client-persistent private fields)', () => {
     const cleaned = _stripClientPutMessage({
       id: 'm-1',

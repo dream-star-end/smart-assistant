@@ -86,6 +86,7 @@ import {
   RECONNECT_RECONCILE_GRACE_MS,
   SAFE_WS_BUFFER_BYTES,
   safeSessionKeyForAgent,
+  isRecoveryControlUserTurn,
   shouldAutoContinueEmptyTurn,
   SYNC_DEBOUNCE_MS,
   THINKING_SAFETY_MS,
@@ -2314,10 +2315,7 @@ export class ChatSocket {
       ts: Date.now(),
     });
     const userIndex = sess.messages.findIndex((message) =>
-      message.role === "user" &&
-      message.id === clientMessageId &&
-      message._isAutoRetry === true &&
-      !!message._recoveryOfClientMessageId);
+      message.id === clientMessageId && isRecoveryControlUserTurn(message));
     if (userIndex < 0) {
       this.deps.persistSession?.(sessId);
       this.scheduleNotify();

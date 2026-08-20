@@ -718,6 +718,84 @@ describe("MessageList 失败轮单一错误出口", () => {
     fireEvent.click(retries[0]);
     expect(onRetrySend).toHaveBeenCalledWith(recoveryChild);
   });
+
+  test("手动恢复子行不渲染，只靠血缘字段也能隐藏", () => {
+    const recoveryChild = mk("user", {
+      id: "u-manual-recovery-child",
+      text: "MANUAL_RECOVERY_CONTROL_ROW_SHOULD_HIDE",
+      _recoveryOfClientMessageId: failedUser.id,
+      _recoveryMode: "checkpoint",
+      _automaticRecovery: false,
+    });
+    render(
+      <MessageList
+        messages={[failedUser, recoveryChild]}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+      />,
+    );
+    expect(screen.getByText("你是什么模型")).toBeInTheDocument();
+    expect(screen.queryByText("MANUAL_RECOVERY_CONTROL_ROW_SHOULD_HIDE")).toBeNull();
+  });
+
+  test("刷新后丢失 _isAutoRetry 时，仅 _recoveryOfClientMessageId 的恢复子行仍不渲染", () => {
+    render(
+      <MessageList
+        messages={[
+          failedUser,
+          mk("user", {
+            id: "u-lineage-only-recovery",
+            text: "LINEAGE_ONLY_RECOVERY_ROW_SHOULD_HIDE",
+            _recoveryOfClientMessageId: failedUser.id,
+          }),
+        ]}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+      />,
+    );
+    expect(screen.getByText("你是什么模型")).toBeInTheDocument();
+    expect(screen.queryByText("LINEAGE_ONLY_RECOVERY_ROW_SHOULD_HIDE")).toBeNull();
+  });
+
+  test("被手动恢复的源错误卡不再显示，恢复轮自身最终错误仍显示", () => {
+    const recoveryChild = mk("user", {
+      id: "u-manual-recovery-failed",
+      text: "MANUAL_RECOVERY_CONTROL_ROW_SHOULD_HIDE",
+      _recoveryOfClientMessageId: failedUser.id,
+      _recoveryMode: "replay",
+      _automaticRecovery: false,
+    });
+    render(
+      <MessageList
+        messages={[
+          failedUser,
+          mk("assistant", {
+            id: "a-source-error-after-manual",
+            text: "SOURCE_ERROR_SHOULD_HIDE_AFTER_MANUAL_RECOVERY",
+            _clientMessageId: failedUser.id,
+            _errorCode: "model_capacity",
+          }),
+          recoveryChild,
+          mk("assistant", {
+            id: "a-manual-recovery-final-error",
+            text: "RECOVERY_ROUND_FINAL_ERROR_SHOULD_SHOW",
+            _clientMessageId: recoveryChild.id,
+            _errorCode: "codex_route_unavailable",
+          }),
+        ]}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+      />,
+    );
+    expect(screen.getByText("你是什么模型")).toBeInTheDocument();
+    expect(screen.queryByText("MANUAL_RECOVERY_CONTROL_ROW_SHOULD_HIDE")).toBeNull();
+    expect(screen.queryByText("SOURCE_ERROR_SHOULD_HIDE_AFTER_MANUAL_RECOVERY")).toBeNull();
+    expect(screen.getByText("RECOVERY_ROUND_FINAL_ERROR_SHOULD_SHOW")).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("模型服务暂时不可用");
+  });
 });
 
 describe("MessageList 每张调用卡 token 实时展示", () => {

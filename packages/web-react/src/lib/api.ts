@@ -2058,6 +2058,9 @@ export const api = {
       _routing?: unknown;
       _sendAttempt?: number;
       _isAutoRetry?: boolean;
+      _recoveryOfClientMessageId?: string;
+      _recoveryMode?: "checkpoint" | "replay";
+      _automaticRecovery?: boolean;
       _idem?: string;
     },
   ): Promise<void> =>

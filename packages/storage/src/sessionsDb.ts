@@ -2666,6 +2666,9 @@ const CLIENT_PUT_ALLOWED_FIELDS: ReadonlySet<string> = new Set<string>([
   // _teamRun 有意保留:它只是客户端消息上的 opaque 展示元数据(legacy packages/web
   // 仍写入),与已删除的服务端 team_run 子系统无关,server 不解释。
   '_media', '_modelText', '_teamRun',
+  // Durable recovery lineage. Client-only `_isAutoRetry` is intentionally
+  // omitted; render/hide after refresh depends on these persisted fields.
+  '_recoveryOfClientMessageId', '_recoveryMode', '_automaticRecovery',
   // Detached ask_user permission cards (server-authored; must survive client PUT).
   'requestId', 'inputPreview', 'inputJson',
   '_resolved', '_behavior', '_settledReason', '_answers', '_detachedAskUser',

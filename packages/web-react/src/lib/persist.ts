@@ -1237,6 +1237,20 @@ function mergeLocalClientFields(
       ...(localMsg._automaticRecoveryAttempted === true
         ? { _automaticRecoveryAttempted: true }
         : {}),
+      ...((typeof serverMsg._recoveryOfClientMessageId !== "string" ||
+        serverMsg._recoveryOfClientMessageId.length === 0) &&
+      typeof localMsg._recoveryOfClientMessageId === "string" &&
+      localMsg._recoveryOfClientMessageId.length > 0
+        ? { _recoveryOfClientMessageId: localMsg._recoveryOfClientMessageId }
+        : {}),
+      ...(serverMsg._recoveryMode === undefined &&
+      (localMsg._recoveryMode === "checkpoint" || localMsg._recoveryMode === "replay")
+        ? { _recoveryMode: localMsg._recoveryMode }
+        : {}),
+      ...(serverMsg._automaticRecovery === undefined &&
+      typeof localMsg._automaticRecovery === "boolean"
+        ? { _automaticRecovery: localMsg._automaticRecovery }
+        : {}),
     };
     return Object.keys(localFields).length > 0 ? { ...serverMsg, ...localFields } : serverMsg;
   }
@@ -1601,6 +1615,7 @@ export class SessionStore {
         const displayText = payload.content.displayText ?? payload.content.text ?? "";
         const attemptMatch = /:(\d+)$/.exec(payload.idempotencyKey);
         const attempt = attemptMatch ? Number(attemptMatch[1]) : 0;
+        const recovery = payload.content.recovery;
         return {
           id: item.msgId,
           role: "user",
@@ -1612,6 +1627,13 @@ export class SessionStore {
           ...(payload.content.imageEdit && media ? { _retryMedia: media } : {}),
           ...(payload.content.imageEdit ? { _imageEdit: payload.content.imageEdit } : {}),
           ...(payload.content.replyTo ? { _replyTo: payload.content.replyTo } : {}),
+          ...(recovery
+            ? {
+                _recoveryOfClientMessageId: recovery.sourceClientMessageId,
+                _recoveryMode: recovery.mode,
+                _automaticRecovery: recovery.automatic,
+              }
+            : {}),
           _routing: {
             model: payload.model,
             teamMode: payload.teamMode === true,

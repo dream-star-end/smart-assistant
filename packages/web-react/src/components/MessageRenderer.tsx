@@ -31,6 +31,7 @@ import {
   messageKind,
   safeMessageSignature,
 } from "../lib/chat/render";
+import { isRecoveryControlUserTurn } from "../lib/chat/pure";
 import { sanitizeChatMessages } from "../lib/chat/sanitizeChatMessages";
 import {
   AssistantCard,
@@ -902,6 +903,10 @@ function renderItemKey(item: RenderItem): string {
     : item.members[0]?._timelineUnitKey ?? item.members[0]?.id ?? item.kind;
 }
 
+function isNonEmptyId(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
 /**
  * Unified timeline paging context. Loading is an explicit-button action;
  * scrolling only navigates already resident records.
@@ -1184,15 +1189,16 @@ export function MessageList({
   // their canonical immutable Agent blocks are the user-facing timeline.
   const safeMessages = sanitizeChatMessages(messages, sessionId);
   const resolvedDispatchTurnIds = collectResolvedDispatchTurnIds(safeMessages);
-  // Automatic recovery rows remain in memory/IndexedDB/PG as exact lineage,
-  // but are transport controls rather than another user utterance. While a
-  // child exists, its source terminal card is likewise an intermediate state;
-  // only the final exhausted/unsafe error remains visible.
-  const automaticallyRecoveredSourceIds = new Set(
+  // Recovery child user turns remain in memory/IndexedDB/PG as exact lineage,
+  // but are transport controls rather than another user utterance. Automatic
+  // and manual children are both hidden. While a child exists, its source
+  // terminal card is likewise an intermediate state; only the final
+  // exhausted/unsafe error remains visible.
+  const recoveredSourceIds = new Set(
     safeMessages
-      .filter((message) => message.role === "user" && message._automaticRecovery === true)
+      .filter(isRecoveryControlUserTurn)
       .map((message) => message._recoveryOfClientMessageId)
-      .filter((id): id is string => typeof id === "string" && id.length > 0),
+      .filter(isNonEmptyId),
   );
   const renderableMessages = safeMessages.filter(
     (m) =>
@@ -1203,12 +1209,12 @@ export function MessageList({
       m._turnTapeProcess !== true &&
       m._timelineAuxiliary === undefined &&
       m.role !== "runtime-event" &&
-      !(m.role === "user" && m._isAutoRetry === true && m._automaticRecovery === true) &&
+      !isRecoveryControlUserTurn(m) &&
       !(
         m.role === "assistant" &&
         !!m._errorCode &&
         typeof m._clientMessageId === "string" &&
-        automaticallyRecoveredSourceIds.has(m._clientMessageId)
+        recoveredSourceIds.has(m._clientMessageId)
       ) &&
       !isRedundantRuntimeEnvelope(m) &&
       !isTurnStatusSuppressedByTape(m, resolvedDispatchTurnIds),
@@ -1218,14 +1224,12 @@ export function MessageList({
       .filter((message) => message.role === "user")
       .map((message) => message.id),
   );
-  const automaticRecoveryParents = new Map(
+  const recoveryParents = new Map(
     safeMessages
       .filter(
         (message) =>
-          message.role === "user" &&
-          message._automaticRecovery === true &&
-          typeof message._recoveryOfClientMessageId === "string" &&
-          message._recoveryOfClientMessageId.length > 0,
+          isRecoveryControlUserTurn(message) &&
+          isNonEmptyId(message._recoveryOfClientMessageId),
       )
       .map((message) => [message.id, message._recoveryOfClientMessageId as string]),
   );
@@ -1234,7 +1238,7 @@ export function MessageList({
     const visited = new Set<string>();
     while (!visibleUserIds.has(current) && !visited.has(current)) {
       visited.add(current);
-      const parent = automaticRecoveryParents.get(current);
+      const parent = recoveryParents.get(current);
       if (!parent) break;
       current = parent;
     }

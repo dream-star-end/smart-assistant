@@ -362,6 +362,47 @@ export function isAutoContinueMsg(m: {
   );
 }
 
+/** Fields that identify a recovery/auto-retry child user turn. Distinct from
+ * `isAutoContinueMsg`, which also matches empty-turn continuations by prompt
+ * text for the empty-turn cap. */
+export type RecoveryControlUserTurn = {
+  id?: string;
+  role?: string;
+  text?: string;
+  _isAutoRetry?: boolean;
+  _automaticRecovery?: boolean;
+  _recoveryOfClientMessageId?: string;
+  _recoveryMode?: string;
+};
+
+function isNonEmptyId(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+/** Recovery child user turns are transport controls, not utterances.
+ * Prefer persisted lineage (`_recoveryOfClientMessageId` / `_recoveryMode`);
+ * `_isAutoRetry` remains a sufficient in-memory signal, including the older
+ * `_isAutoRetry && _automaticRecovery` pair, but is not required. */
+export function isRecoveryControlUserTurn(
+  message: RecoveryControlUserTurn | null | undefined,
+): boolean {
+  if (!message || message.role !== "user") return false;
+  if (isNonEmptyId(message._recoveryOfClientMessageId)) return true;
+  if (message._recoveryMode === "checkpoint" || message._recoveryMode === "replay") return true;
+  return message._isAutoRetry === true;
+}
+
+/** Walk newest-first to the last user utterance that is not a recovery control row. */
+export function lastRealUserTurn<T extends RecoveryControlUserTurn>(
+  messages: readonly T[],
+): T | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (message.role === "user" && !isRecoveryControlUserTurn(message)) return message;
+  }
+  return undefined;
+}
+
 /**
  * 是否对空轮自动续写（vs 仅提示）。仅 `end_turn`；每原始 turn 至多一次
  * （target 本身是 auto-continue / 已跟随一条 auto-continue user 都拒）。

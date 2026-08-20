@@ -441,6 +441,47 @@ describe("persist — 历史合并纯函数", () => {
     });
   });
 
+  test("user server echo 单调保留恢复血缘，不覆盖 server 真值", () => {
+    const local = [
+      {
+        id: "u-recovery",
+        role: "user",
+        text: "local",
+        ts: 1,
+        _recoveryOfClientMessageId: "u-source",
+        _recoveryMode: "checkpoint",
+        _automaticRecovery: false,
+      } satisfies ChatMessage,
+    ];
+    const incoming = [
+      { id: "u-recovery", role: "user", text: "server", ts: 1, _source: "server" } satisfies ChatMessage,
+    ];
+
+    const [merged] = applyServerIncremental(local, incoming);
+
+    expect(merged.text).toBe("server");
+    expect(merged._recoveryOfClientMessageId).toBe("u-source");
+    expect(merged._recoveryMode).toBe("checkpoint");
+    expect(merged._automaticRecovery).toBe(false);
+
+    const [serverWins] = applyServerIncremental(
+      local,
+      [{
+        id: "u-recovery",
+        role: "user",
+        text: "server-lineage",
+        ts: 1,
+        _source: "server",
+        _recoveryOfClientMessageId: "u-server-source",
+        _recoveryMode: "replay",
+        _automaticRecovery: true,
+      } satisfies ChatMessage],
+    );
+    expect(serverWins._recoveryOfClientMessageId).toBe("u-server-source");
+    expect(serverWins._recoveryMode).toBe("replay");
+    expect(serverWins._automaticRecovery).toBe(true);
+  });
+
   test("applyServerIncremental: 空增量返回原数组引用", () => {
     const local = [msg("a")];
     expect(applyServerIncremental(local, [])).toBe(local);
@@ -1567,6 +1608,31 @@ describe("persist — SessionStore（注入内存 IDB round-trip）", () => {
         text: "exact",
         status: "queued",
       }],
+    });
+  });
+
+  test("journal-only crash window restores durable recovery lineage on the reconstructed user row", async () => {
+    const store = new SessionStore("journal-recovery", fakeIDBFactory());
+    const item = pending("s-recovery", "u-recovery-child");
+    item.payload.content = {
+      text: "Continue from the exact checkpoint. Do not restart the whole task.",
+      displayText: "↻ 从断点继续",
+      recovery: {
+        sourceClientMessageId: "u-source",
+        mode: "checkpoint",
+        automatic: false,
+      },
+    };
+    await store.putPendingDispatch("s-recovery", item);
+    const hydrated = await store.getAllForHydration();
+    expect(hydrated[0]?.messages[0]).toMatchObject({
+      id: "u-recovery-child",
+      role: "user",
+      text: "↻ 从断点继续",
+      status: "queued",
+      _recoveryOfClientMessageId: "u-source",
+      _recoveryMode: "checkpoint",
+      _automaticRecovery: false,
     });
   });
 

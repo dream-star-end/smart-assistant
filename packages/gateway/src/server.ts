@@ -4630,6 +4630,9 @@ export class Gateway {
           _routing?: unknown
           _sendAttempt?: unknown
           _isAutoRetry?: unknown
+          _recoveryOfClientMessageId?: unknown
+          _recoveryMode?: unknown
+          _automaticRecovery?: unknown
           _idem?: unknown
         }
         try {
@@ -4675,6 +4678,13 @@ export class Gateway {
             ? { _sendAttempt: data._sendAttempt }
             : {}),
           ...(typeof data._isAutoRetry === 'boolean' ? { _isAutoRetry: data._isAutoRetry } : {}),
+          ...(isPersistedClientMessageId(data._recoveryOfClientMessageId)
+            ? { _recoveryOfClientMessageId: data._recoveryOfClientMessageId }
+            : {}),
+          ...(data._recoveryMode === 'checkpoint' || data._recoveryMode === 'replay'
+            ? { _recoveryMode: data._recoveryMode }
+            : {}),
+          ...(typeof data._automaticRecovery === 'boolean' ? { _automaticRecovery: data._automaticRecovery } : {}),
           ...(typeof data._idem === 'string' ? { _idem: data._idem } : {}),
         }
         const r = await appendServerAuthoredMessage(sessId, userId, msg)

@@ -18,6 +18,8 @@ import {
   parsePartialJson,
   safeBridgeErrorDetail,
   shouldAutoContinueEmptyTurn,
+  isRecoveryControlUserTurn,
+  lastRealUserTurn,
   computeTypingLabel,
   STALE_WARN_MS,
 } from "./pure";
@@ -178,6 +180,47 @@ describe("classifyEmptyTurn / shouldAutoContinueEmptyTurn", () => {
       { id: "u2", role: "user", _isAutoRetry: true },
     ];
     expect(shouldAutoContinueEmptyTurn({ messages: withAuto, targetMsgId: "u1", stopReason: "end_turn" })).toBe(false);
+  });
+});
+
+describe("isRecoveryControlUserTurn / lastRealUserTurn", () => {
+  test("lineage-only recovery child is a control row even after _isAutoRetry is lost", () => {
+    expect(isRecoveryControlUserTurn({
+      role: "user",
+      _recoveryOfClientMessageId: "u-real",
+    })).toBe(true);
+    expect(isRecoveryControlUserTurn({
+      role: "user",
+      _recoveryMode: "checkpoint",
+    })).toBe(true);
+    expect(isRecoveryControlUserTurn({
+      role: "user",
+      _isAutoRetry: true,
+    })).toBe(true);
+    expect(isRecoveryControlUserTurn({
+      role: "user",
+      text: "真实提问",
+    })).toBe(false);
+    expect(isRecoveryControlUserTurn({
+      role: "assistant",
+      _recoveryOfClientMessageId: "u-real",
+    })).toBe(false);
+  });
+
+  test("regenerate walks past a lineage-only recovery child to the real user question", () => {
+    const real = { id: "u-real", role: "user" as const, text: "原始提问" };
+    const child = {
+      id: "u-child",
+      role: "user" as const,
+      text: "↻ 从断点继续",
+      _recoveryOfClientMessageId: "u-real",
+    };
+    expect(lastRealUserTurn([real, child])?.id).toBe("u-real");
+    expect(lastRealUserTurn([real, child])?.text).toBe("原始提问");
+    expect(lastRealUserTurn([
+      real,
+      { id: "u-legacy", role: "user" as const, text: "↻ 自动重试", _isAutoRetry: true },
+    ])?.id).toBe("u-real");
   });
 });
 
@@ -5181,6 +5224,64 @@ describe("ChatSocket interrupted continuation", () => {
     expect(sentRecoveries()).toBe(1);
     expect(sock.toStored("s-auto-checkpoint")?.messages[0]._automaticRecoveryAttempted).toBe(true);
     expect(sock.toStored("s-auto-checkpoint")?._automaticRecoveryDecisions?.["u-auto-checkpoint"]).toBe(true);
+    sock.stop();
+  });
+
+  test("recoverySkipped removes a lineage-only child after _isAutoRetry is lost and leaves the source error visible", async () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket({ syncSession: async () => {} });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    const session = sock.ensureSession("s-lineage-skip", "main");
+    const sourceUser: ChatMessage = {
+      id: "u-lineage-skip",
+      role: "user",
+      text: "long task",
+      ts: 1,
+      status: "error",
+      _source: "server",
+    };
+    const sourceError: ChatMessage = {
+      id: "error-lineage-skip",
+      role: "assistant",
+      text: "SOURCE_ERROR_SHOULD_REAPPEAR",
+      ts: 2,
+      _source: "server",
+      _clientMessageId: "u-lineage-skip",
+      _errorCode: "model_capacity",
+    };
+    const recoveryChild: ChatMessage = {
+      id: "u-lineage-skip-child",
+      role: "user",
+      text: "↻ 自动从断点继续",
+      ts: 3,
+      _source: "server",
+      _recoveryOfClientMessageId: "u-lineage-skip",
+    };
+    session.messages.push(sourceUser, sourceError, recoveryChild);
+
+    ws.onmessage?.({
+      data: JSON.stringify({
+        type: "outbound.ack",
+        recoverySkipped: true,
+        recoverySkippedReason: "source_not_latest",
+        sourceClientMessageId: "u-lineage-skip",
+        peer: { id: "s-lineage-skip", kind: "dm" },
+        clientMessageId: "u-lineage-skip-child",
+      }),
+    });
+
+    expect(session.messages.map((message) => message.id)).toEqual([
+      "u-lineage-skip",
+      "error-lineage-skip",
+    ]);
+    expect(session.messages.some((message) => message._recoveryOfClientMessageId)).toBe(false);
+    expect(session.messages.find((message) => message.id === "error-lineage-skip")).toMatchObject({
+      _errorCode: "model_capacity",
+      text: "SOURCE_ERROR_SHOULD_REAPPEAR",
+      _clientMessageId: "u-lineage-skip",
+    });
     sock.stop();
   });
 

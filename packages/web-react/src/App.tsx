@@ -110,7 +110,7 @@ import {
 } from "./lib/implicitFeedback";
 import { CONTINUE_PROMPT } from "./lib/chat/render";
 import { deriveLiveTerminalFromMessages } from "./lib/sessionStatus";
-import { deriveConnBanner } from "./lib/chat/pure";
+import { deriveConnBanner, lastRealUserTurn } from "./lib/chat/pure";
 import { useDelayedConnBanner } from "./hooks/useDelayedConnBanner";
 import { incidentStore } from "./lib/incidentStore";
 import {
@@ -1058,21 +1058,18 @@ export function App() {
     }
     // 保真重发:_modelText 是"含附件的完整模型可见文本"(权威,regen 专用字段),text 只是
     // 显示文案;media 一并透传 —— 此前只回发显示文本,带附件的提问 regen 后附件全丢。
+    // 跳过恢复/续跑控制行:那是系统续接指令,不是用户的真实提问。判定走持久血缘,
+    // 不依赖会在 refresh / server-wins 中丢失的 `_isAutoRetry`。
     const src = sockRef.current?.getMessages(activeId) ?? [];
-    for (let i = src.length - 1; i >= 0; i--) {
-      const m = src[i];
-      // 跳过 auto-continue/auto-retry 行:那是系统续跑文案,不是用户的真实提问。
-      if (m.role === "user" && !m._isAutoRetry) {
-        const exact = await loadExactUserMessage(m);
-        if (!exact) {
-          toast("原始消息加载失败，请重试", "error");
-          return;
-        }
-        const replay = exactUserReplayPayload(exact);
-        await send(replay.text, replay.media, replay.imageEdit, replay.displayText);
-        return;
-      }
+    const m = lastRealUserTurn(src);
+    if (!m) return;
+    const exact = await loadExactUserMessage(m);
+    if (!exact) {
+      toast("原始消息加载失败，请重试", "error");
+      return;
     }
+    const replay = exactUserReplayPayload(exact);
+    await send(replay.text, replay.media, replay.imageEdit, replay.displayText);
   }, [demo, messages, activeId, send, loadExactUserMessage, toast]);
 
   // 打开设置中心并顺带刷新余额（顶栏 pill / 侧栏 / AgentGate 充值入口统一走此）。
