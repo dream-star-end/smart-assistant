@@ -343,9 +343,18 @@ export function useChatSocket(opts: {
         if (!socket) return false;
         const sess = socket.sessions.get(sessId);
         if (!sess) return false;
+        const authEpoch = a.snapshot().epoch;
+        const isCurrent = (): boolean =>
+          authRef.current === a &&
+          a.snapshot().epoch === authEpoch &&
+          socketRef.current === socket &&
+          socket.sessions.get(sessId) === sess &&
+          (context?.isCurrent?.() ?? true);
+        if (!isCurrent()) return false;
         try {
           const sinceSeq = typeof sess._maxSeq === "number" && sess._maxSeq > 0 ? sess._maxSeq : 0;
           const detail = await api.getSession(a, sessId, sinceSeq, sess._historyRevision);
+          if (!isCurrent()) return false;
           const serverMsgs = Array.isArray(detail.messages) ? (detail.messages as ChatMessage[]) : null;
           const revisionRepair =
             typeof detail.historyRevision === "number" &&
@@ -379,6 +388,11 @@ export function useChatSocket(opts: {
               },
             );
           }
+          if (context?.tapeProjectionOnly === true) {
+            if (!isCurrent()) return false;
+            persistRef.current(sessId);
+            return true;
+          }
           // The shared ChatSocket checkpoint performs one cold exact rebuild, then
           // every history/reconcile caller appends only records after its cursor.
           await socket.hydrateDurableLiveFrameJournal(
@@ -389,6 +403,7 @@ export function useChatSocket(opts: {
               // A full read after an observed live-owner cutover closes the
               // detail→journal race without substituting a summary or truncation.
               const tapeDetail = await api.getSession(a, sessId, 0);
+              if (!isCurrent()) return;
               socket.applyServerMessages(
                 sessId,
                 tapeDetail.agentId || sess.agentId,
@@ -410,6 +425,7 @@ export function useChatSocket(opts: {
               );
             },
           );
+          if (!isCurrent()) return false;
           sess._liveStreamBroken = false;
           persistRef.current(sessId); // server-wins 合并后落地新 tape + 游标
           return true;

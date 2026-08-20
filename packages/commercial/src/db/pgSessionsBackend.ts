@@ -5832,7 +5832,9 @@ async function readClientTimelinePageImpl(
               anchor,
               orderSeq,
               header,
-              reason: "records_unpublished",
+              reason: header.materializationStatus === "failed"
+                ? "records_failed"
+                : "records_unpublished",
             });
             windows.push({ anchor, orderSeq, header, lowerOrdinal: 0, upperOrdinal });
             inlineBytes += fallbackBytes;
@@ -7698,13 +7700,14 @@ export function createPgSessionsBackend(
             attempt_no: number | null;
             client_message_id: string | null;
             visible_at: string | null;
+            materialization_status: string;
             settlement_hash: string | null;
           }>(
             `SELECT tape_id,agent_id,turn_index,status,turn_key,tape_sha256,
                     total_bytes, part_count, created_at, waive_reason, finalized_at,
                     record_storage_format,engine_billings,
                     billing_anchor_id,dispatch_id,attempt_no,client_message_id,
-                    visible_at::text, settlement_hash
+                    visible_at::text, materialization_status, settlement_hash
                FROM client_session_turn_tapes
               WHERE session_id=$1 AND user_id=$2 AND tape_id=ANY($3::text[])
               ORDER BY tape_id FOR UPDATE`,
@@ -7721,6 +7724,8 @@ export function createPgSessionsBackend(
         if (!sameLosslessTurnTapeHeader(tape, request)) {
           throw new Error("lossless turn tape finalize header conflict");
         }
+        const publishesVisiblePhaseARecords =
+          tape.visible_at !== null && tape.materialization_status !== "complete";
         const recoverySourceTape = recoveryLink
           ? tapeById.get(recoveryLink.source_tape_id)
           : undefined;
@@ -8151,6 +8156,7 @@ export function createPgSessionsBackend(
           bigIntNumOr(session.archived_through_seq, 0),
         );
         if (plan.kind === "oversized") throw new Error("lossless turn tape anchor tail unexpectedly oversized");
+        let phaseBIdentityAdvanced = false;
         if (plan.kind === "write") {
           const nowMs = Date.now();
           const archivedDelta = await execPgSpillPlan(
@@ -8162,10 +8168,18 @@ export function createPgSessionsBackend(
             nowMs,
           );
           const archivedCount = bigIntNumOr(session.archived_count, 0) + archivedDelta;
-          const timelineGenerationDelta = hasInvisibleMessageRemoval(
+          const removedInvisibleMessage = hasInvisibleMessageRemoval(
             preUpgradeMessages,
             existingMessages,
-          ) ? 1 : 0;
+          );
+          const historyRevisionDelta =
+            publishesVisiblePhaseARecords ||
+            hasInvisibleMessageRemoval(preUpgradeMessages, plan.tail) ||
+            archivedDelta > 0
+              ? 1
+              : 0;
+          const timelineGenerationDelta =
+            publishesVisiblePhaseARecords || removedInvisibleMessage ? 1 : 0;
           await client.query(
             `UPDATE client_sessions SET
                messages=$1, message_count=$2, last_at=$3,
@@ -8183,9 +8197,19 @@ export function createPgSessionsBackend(
               archivedCount,
               request.sessionId,
               userId,
-              hasInvisibleMessageRemoval(preUpgradeMessages, plan.tail) || archivedDelta > 0 ? 1 : 0,
+              historyRevisionDelta,
               timelineGenerationDelta,
             ],
+          );
+          phaseBIdentityAdvanced = publishesVisiblePhaseARecords;
+        }
+        if (publishesVisiblePhaseARecords && !phaseBIdentityAdvanced) {
+          // Defensive no-write path: exact records still replaced a visible
+          // fallback even if the hot anchor happened to be byte-identical.
+          await advanceClientTimelineIdentityInTransaction(
+            client,
+            request.sessionId,
+            userId,
           );
         }
 

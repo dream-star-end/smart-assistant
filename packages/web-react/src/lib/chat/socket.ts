@@ -165,6 +165,11 @@ export const LIVE_JOURNAL_MAX_MS = 30_000;
 /** First-screen hydrate pages the current dispatch forward from after=0.
  * Do not seek tail: a raw tail page is not a renderable snapshot. */
 export const LIVE_JOURNAL_OPEN_CURSOR = "0";
+/** A Phase-A tape can expose only its final-answer fallback while Phase B is
+ * still materializing exact records. Poll quickly first, then sparsely; the
+ * hard lifetime covers the server's full recoverable materialization backoff. */
+export const UNPUBLISHED_TAPE_RETRY_DELAYS_MS = [1000, 2000, 4000, 8000, 16_000, 30_000] as const;
+export const UNPUBLISHED_TAPE_RETRY_MAX_MS = 15 * 60_000;
 
 export type LiveJournalObservation = {
   frameCount: number;
@@ -192,7 +197,13 @@ export type ChatSocketDeps = {
   /** resume_failed / 重连 reconcile：强制 REST 全量 sync（最终权威源）。*/
   syncSession?: (
     sessId: string,
-    context?: { clientMessageId?: string },
+    context?: {
+      clientMessageId?: string;
+      /** Caller-owned lifecycle fence for delayed reconciliation reads. */
+      isCurrent?: () => boolean;
+      /** Phase-B projection healing does not replay a terminal live journal. */
+      tapeProjectionOnly?: boolean;
+    },
   ) => Promise<boolean | void> | boolean | void;
   /** Every successful WS open (initial or reconnect) refreshes the selected
    * and in-flight sessions from the PG GoalState REST authority. Live goal
@@ -598,6 +609,8 @@ export class ChatSocket {
   private wsAuthRefreshInFlight = false;
   private wsAuthRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private authEpoch = 0;
+  /** Invalidates every delayed async callback on stop/reset. */
+  private lifecycleEpoch = 0;
 
   // ── ping watchdog（§6）──
   private pingNonce = 0;
@@ -659,6 +672,17 @@ export class ChatSocket {
   private readonly lastLiveJournalObservation = new Map<string, LiveJournalObservation>();
   private readonly reconcileStartedAt = new Map<string, number>();
   private readonly emptyJournalBackoffIndex = new Map<string, number>();
+  /** Phase-A final-only projections retry until exact Phase-B records publish,
+   * a permanent failure is reported, or the bounded page-lifetime expires. */
+  private readonly unpublishedTapeRetries = new Map<string, {
+    session: ChatSession;
+    lifecycleEpoch: number;
+    token: symbol;
+    startedAt: number;
+    attempt: number;
+    timer: ReturnType<typeof setTimeout> | null;
+    inFlight: boolean;
+  }>();
   /** Exact active-turn candidate sets already attempted on the current WS.
    * History can arrive after the initial shell hello; each new candidate set
    * gets one targeted registration hello, then waits for a reconnect before
@@ -853,6 +877,7 @@ export class ChatSocket {
   stop(): void {
     this.started = false;
     this.authEpoch++;
+    this.lifecycleEpoch++;
     this.cancelWsAuthRecovery();
     // Active close bypasses the socket onclose path below (`this.ws` is
     // cleared first). Make every physically-sent but unadmitted turn replayable
@@ -891,6 +916,10 @@ export class ChatSocket {
     this.emptyJournalBackoffIndex.clear();
     this.lastLiveJournalObservation.clear();
     this.durableLiveJournalCheckpoints.clear();
+    for (const state of this.unpublishedTapeRetries.values()) {
+      if (state.timer) clearTimeout(state.timer);
+    }
+    this.unpublishedTapeRetries.clear();
     for (const t of this.controlPersistRetryTimers.values()) clearTimeout(t);
     this.controlPersistRetryTimers.clear();
     const ws = this.ws;
@@ -2717,6 +2746,7 @@ export class ChatSocket {
       void this.deps.deletePendingControl?.(sessId, item.controlId).catch(() => {});
     }
     this.clearContinuousReconcile(sessId);
+    this.clearUnpublishedTapeRetry(sessId);
     this.durableLiveJournalCheckpoints.delete(sessId);
     const safeId = String(sessId).replace(/[^a-zA-Z0-9_-]/g, "_");
     const suffix = `:webchat:dm:${safeId}`;
@@ -2740,6 +2770,7 @@ export class ChatSocket {
    * service 跨登出存活，若不清，换号后旧会话残留内存。调用前 WS 应已 stop（无活跃 turn）。
    */
   resetSessions(): void {
+    this.lifecycleEpoch++;
     // Set/Map 无条件清(即使 sessions 已空也可能有残留 ensured/inflight,Codex 审 LOW)。
     this.serverSessionEnsured.clear();
     this.serverSessionInflight.clear();
@@ -2757,6 +2788,10 @@ export class ChatSocket {
     this.reconcileClientMessageIds.clear();
     this.durableLiveJournalCheckpoints.clear();
     this.authoritativeFrameSeqResetEpochBySessionKey.clear();
+    for (const state of this.unpublishedTapeRetries.values()) {
+      if (state.timer) clearTimeout(state.timer);
+    }
+    this.unpublishedTapeRetries.clear();
     for (const timer of this.controlPersistRetryTimers.values()) clearTimeout(timer);
     this.controlPersistRetryTimers.clear();
     this.activeReplayAttemptKeys.clear();
@@ -3191,6 +3226,7 @@ export class ChatSocket {
     expireGenPlaceholdersAgainstServerRows(s);
     // 终态收敛(RFC §5 M5):载荷自证已收尾的 turn → 清发送态 + 落 user 行终态(显式,不巧合)。
     this.convergeTerminalTurns(s, terminalTurns);
+    this.reconcileUnpublishedTapeRetry(sessId);
     this.scheduleNotify();
     const tailRecoverableError = [...s.messages].reverse().find((message) =>
       message.role === "assistant" &&
@@ -3405,6 +3441,82 @@ export class ChatSocket {
         lastDurableFrameSeqBySessionKey,
       });
     });
+  }
+
+  private clearUnpublishedTapeRetry(sessId: string): void {
+    const state = this.unpublishedTapeRetries.get(sessId);
+    if (!state) return;
+    if (state.timer) clearTimeout(state.timer);
+    this.unpublishedTapeRetries.delete(sessId);
+  }
+
+  private reconcileUnpublishedTapeRetry(sessId: string): void {
+    const session = this.sessions.get(sessId);
+    const pending = session?.messages.some(
+      (message) => message._displayDegradeReason === "records_unpublished",
+    ) === true;
+    if (!session || !pending || !this.deps.syncSession) {
+      this.clearUnpublishedTapeRetry(sessId);
+      return;
+    }
+    let state = this.unpublishedTapeRetries.get(sessId);
+    if (
+      state &&
+      (state.session !== session || state.lifecycleEpoch !== this.lifecycleEpoch)
+    ) {
+      this.clearUnpublishedTapeRetry(sessId);
+      state = undefined;
+    }
+    if (!state) {
+      state = {
+        session,
+        lifecycleEpoch: this.lifecycleEpoch,
+        token: Symbol(`unpublished-tape:${sessId}`),
+        startedAt: Date.now(),
+        attempt: 0,
+        timer: null,
+        inFlight: false,
+      };
+      this.unpublishedTapeRetries.set(sessId, state);
+    }
+    if (state.timer || state.inFlight) return;
+    const elapsed = Date.now() - state.startedAt;
+    if (elapsed >= UNPUBLISHED_TAPE_RETRY_MAX_MS) {
+      this.clearUnpublishedTapeRetry(sessId);
+      return;
+    }
+    const delay = UNPUBLISHED_TAPE_RETRY_DELAYS_MS[
+      Math.min(state.attempt, UNPUBLISHED_TAPE_RETRY_DELAYS_MS.length - 1)
+    ]!;
+    const expected = state;
+    const expectedToken = state.token;
+    const isCurrent = (): boolean =>
+      this.lifecycleEpoch === expected.lifecycleEpoch &&
+      this.sessions.get(sessId) === expected.session &&
+      this.unpublishedTapeRetries.get(sessId) === expected &&
+      expected.token === expectedToken;
+    state.timer = setTimeout(() => {
+      expected.timer = null;
+      if (!isCurrent()) return;
+      if (!expected.session.messages.some(
+        (message) => message._displayDegradeReason === "records_unpublished",
+      )) {
+        this.clearUnpublishedTapeRetry(sessId);
+        return;
+      }
+      expected.inFlight = true;
+      void Promise.resolve(this.deps.syncSession!(sessId, {
+        isCurrent,
+        tapeProjectionOnly: true,
+      }))
+        .catch(() => undefined)
+        .finally(() => {
+          if (!isCurrent()) return;
+          expected.inFlight = false;
+          expected.attempt += 1;
+          this.reconcileUnpublishedTapeRetry(sessId);
+        });
+    }, Math.min(delay, UNPUBLISHED_TAPE_RETRY_MAX_MS - elapsed));
   }
 
   /** Serialize one session's REST journal rebuild and hold overlapping stamped
