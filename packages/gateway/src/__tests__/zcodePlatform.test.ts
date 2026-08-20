@@ -23,7 +23,7 @@ import {
 const require = createRequire(import.meta.url)
 const HOOK = path.resolve(
   process.cwd(),
-  'packages/commercial/agent-sandbox/platform-runtime/bin/oc-zcode-hook.cjs',
+  'packages/commercial/agent-sandbox/platform-runtime/bin/oc-zcode-hook',
 )
 
 function restore(name: string, value: string | undefined): void {
@@ -90,7 +90,10 @@ describe('zcode platform artifacts', () => {
         toolResultPreview: 'ok',
         timestamp: new Date().toISOString(),
       })
-      const out = spawnSync(process.execPath, [HOOK, journal], { input, encoding: 'utf8' })
+      const out = spawnSync(process.execPath, ['--experimental-default-type=module', HOOK, journal], {
+        input,
+        encoding: 'utf8',
+      })
       assert.equal(out.status, 0)
       assert.equal(out.stdout.trim(), '{}')
       assert.equal(out.stderr, '')
@@ -99,7 +102,7 @@ describe('zcode platform artifacts', () => {
       assert.equal(row.toolName, 'Bash')
       assert.deepEqual(row.toolResponse, { stdout: 'ok', exitCode: 0 })
 
-      const invalid = spawnSync(process.execPath, [HOOK, '/tmp/not-a-zcode-context/events'], {
+      const invalid = spawnSync(process.execPath, ['--experimental-default-type=module', HOOK, '/tmp/not-a-zcode-context/events'], {
         input,
         encoding: 'utf8',
       })

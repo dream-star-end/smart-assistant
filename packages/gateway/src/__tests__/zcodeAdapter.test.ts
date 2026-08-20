@@ -168,7 +168,7 @@ process.stdout.write(${JSON.stringify(`${JSON.stringify(successFixture)}\n`)})
     const capture = path.join(dir, 'capture.json')
     const hookCollector = path.resolve(
       process.cwd(),
-      'packages/commercial/agent-sandbox/platform-runtime/bin/oc-zcode-hook.cjs',
+      'packages/commercial/agent-sandbox/platform-runtime/bin/oc-zcode-hook',
     )
     await writeFile(path.join(dir, 'persona.md'), 'persona-line')
     await writeFile(fake, `#!/usr/bin/env node

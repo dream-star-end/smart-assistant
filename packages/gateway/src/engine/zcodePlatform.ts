@@ -29,7 +29,7 @@ export const ZCODE_MEMORY_MCP_TOOLS = [
 ] as const
 
 const CONTEXT_PREFIX = join(tmpdir(), 'oc-zcode-context-')
-const HOT_HOOK_COLLECTOR = '/run/oc/platform/current/bin/oc-zcode-hook.cjs'
+const HOT_HOOK_COLLECTOR = '/run/oc/platform/current/bin/oc-zcode-hook'
 const MAX_REASONING_PART_CHARS = 64 * 1024
 const require = createRequire(import.meta.url)
 
@@ -164,7 +164,7 @@ export function createZcodePlatformArtifacts(
           {
             type: 'process',
             command: hookNode,
-            args: [hookCollector, hookJournalFile],
+            args: ['--experimental-default-type=module', hookCollector, hookJournalFile],
             timeoutMs: 3_000,
           },
         ],

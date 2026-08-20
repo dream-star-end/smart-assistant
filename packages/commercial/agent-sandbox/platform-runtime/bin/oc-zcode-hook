@@ -5,8 +5,8 @@
 // every failure is swallowed and stdout always returns a valid empty hook
 // response so collection can never block or alter the tool being observed.
 
-const fs = require('node:fs')
-const path = require('node:path')
+import fs from 'node:fs'
+import path from 'node:path'
 
 const MAX_STDIN_BYTES = 2 * 1024 * 1024
 const MAX_INPUT_CHARS = 64 * 1024
