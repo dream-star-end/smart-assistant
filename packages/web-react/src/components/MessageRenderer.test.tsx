@@ -1951,6 +1951,46 @@ describe("长时间线虚拟分页与活跃状态稳定性", () => {
     );
     expect(await screen.findByLabelText("生成中")).toBe(status);
   });
+
+  test("timeline generation 变化会重建 Virtuoso，避免 live→tape 复用旧测量图", async () => {
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    const user = mk("user", { id: "generation-user", text: "问题", status: "sent" });
+    const activeRows = [
+      user,
+      ...Array.from({ length: 220 }, (_, index) =>
+        mk("thinking", { id: "live-row-" + index, text: "实时记录 " + index }),
+      ),
+    ];
+    const view = render(
+      <MessageList
+        messages={activeRows}
+        sending
+        turnActivity={{ startedAt: Date.now(), agentName: "助手" }}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+        historyGeneration="generation-4"
+      />,
+      { container: scroller },
+    );
+    const before = await screen.findByLabelText("生成中");
+
+    view.rerender(
+      <MessageList
+        messages={activeRows}
+        sending
+        turnActivity={{ startedAt: Date.now(), agentName: "助手" }}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+        historyGeneration="generation-5"
+      />,
+    );
+
+    expect(await screen.findByLabelText("生成中")).not.toBe(before);
+    scroller.remove();
+  });
 });
 
 describe("context_rebuilt system 提示行(§3.3/§5,复用 SystemCard 灰字样式)", () => {

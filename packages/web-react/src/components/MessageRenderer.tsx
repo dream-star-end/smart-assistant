@@ -1376,6 +1376,12 @@ export function MessageList({
   if (scrollParent) {
     const virtualList = (
       <Virtuoso
+        // timelineGeneration advances when live rows are replaced by a new immutable
+        // tape identity/order. Reusing Virtuoso's old measurement graph across that
+        // atomic projection swap can feed its prop bus until React trips update-depth
+        // error #185. A generation is already the server-owned cursor epoch, so it is
+        // also the correct lifetime boundary for the virtualizer instance.
+        key={pagingGeneration}
         customScrollParent={scrollParent}
         data={virtualItems}
         firstItemIndex={firstItemIndex}
