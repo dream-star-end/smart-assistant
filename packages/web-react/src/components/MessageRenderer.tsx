@@ -1184,6 +1184,15 @@ export function MessageList({
   // 当前活跃段起点(最后一条 user 消息之后)——TodoWrite/plan 的 HUD 抑制只作用于该段,
   // 与 PinnedTaskTracker 的任务源提取共用 turnSegment.ts 同一判定。
   const turnStart = currentTurnStartIndex(renderableMessages);
+  // Virtuoso 的内部测量图只能跨同一条逻辑 turn 复用。新 optimistic user 行会在
+  // server timelineGeneration 前进之前先到达；若仍沿用上一轮实例，数百行会话在
+  // idle→sending 的原子替换中可触发 react-virtuoso prop bus 的 React #185 循环。
+  // sending=false 也单列 idle epoch，保证完成收口先重建；随后 generation 前进再以
+  // 服务端身份/顺序 epoch 收口。持续流式帧的 user id 不变，不会每帧重挂。
+  const activeTurnId = sending && turnStart > 0
+    ? renderableMessages[turnStart - 1]?.id ?? "active"
+    : sending ? "active" : "idle";
+  const virtualizerEpoch = `${pagingGeneration}::${activeTurnId}`;
   // 每条消息是否为「所在轮末条 assistant 正文」(评价反馈行唯一可见位)。按全量 messages 下标对齐,
   // 单一权威在 turnSegment.ts(与 turnStart / coalesceTeam 同源的 user=轮边界判定,不另造第二套)。
   const ratingFinal = turnFinalAssistantFlags(renderableMessages);
@@ -1376,12 +1385,9 @@ export function MessageList({
   if (scrollParent) {
     const virtualList = (
       <Virtuoso
-        // timelineGeneration advances when live rows are replaced by a new immutable
-        // tape identity/order. Reusing Virtuoso's old measurement graph across that
-        // atomic projection swap can feed its prop bus until React trips update-depth
-        // error #185. A generation is already the server-owned cursor epoch, so it is
-        // also the correct lifetime boundary for the virtualizer instance.
-        key={pagingGeneration}
+        // Reset at both server timeline generations and local logical-turn boundaries.
+        // Same-turn stream deltas retain the instance; incompatible measurement graphs do not.
+        key={virtualizerEpoch}
         customScrollParent={scrollParent}
         data={virtualItems}
         firstItemIndex={firstItemIndex}

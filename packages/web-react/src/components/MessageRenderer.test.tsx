@@ -1991,6 +1991,45 @@ describe("长时间线虚拟分页与活跃状态稳定性", () => {
     expect(await screen.findByLabelText("生成中")).not.toBe(before);
     scroller.remove();
   });
+
+  test("同一 generation 的新 turn 会重建 Virtuoso，避免 optimistic start 复用旧测量图", async () => {
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    const activeRows = Array.from({ length: 220 }, (_, index) =>
+      mk("user", { id: "active-row-" + index, text: "历史记录 " + index, status: "sent" }),
+    );
+    const view = render(
+      <MessageList
+        messages={activeRows}
+        sending
+        turnActivity={{ startedAt: Date.now(), agentName: "助手" }}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+        historyGeneration="generation-7"
+      />,
+      { container: scroller },
+    );
+    const before = await screen.findByLabelText("生成中");
+
+    view.rerender(
+      <MessageList
+        messages={[
+          ...activeRows,
+          mk("user", { id: "new-active-turn", text: "新问题", status: "sending" }),
+        ]}
+        sending
+        turnActivity={{ startedAt: Date.now(), agentName: "助手" }}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+        historyGeneration="generation-7"
+      />,
+    );
+
+    expect(await screen.findByLabelText("生成中")).not.toBe(before);
+    scroller.remove();
+  });
 });
 
 describe("context_rebuilt system 提示行(§3.3/§5,复用 SystemCard 灰字样式)", () => {
