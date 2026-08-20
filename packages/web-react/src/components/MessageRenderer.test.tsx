@@ -1916,9 +1916,34 @@ describe("长时间线虚拟分页与活跃状态稳定性", () => {
     expect(screen.getByLabelText("正在加载会话内容")).toBeInTheDocument();
   });
 
+  test("新会话首条 optimistic 行走短列表，不把 Virtuoso 带入创建期生命周期", () => {
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    render(
+      <MessageList
+        messages={[mk("user", { id: "new-session-user", text: "第一条消息", status: "sending" })]}
+        sending
+        turnActivity={{ startedAt: Date.now(), agentName: "助手" }}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+      />,
+      { container: scroller },
+    );
+
+    expect(screen.getByTestId("timeline-short-list")).toBeInTheDocument();
+    expect(screen.getByText("第一条消息")).toBeInTheDocument();
+    expect(screen.getByLabelText("生成中")).toBeInTheDocument();
+    expect(screen.queryByTestId("virtuoso-item-list")).toBeNull();
+    scroller.remove();
+  });
+
   test("生产 Virtuoso Footer 组件身份稳定，stream delta 不重挂活动 DOM", async () => {
     const scroller = document.createElement("div");
     document.body.append(scroller);
+    const history = Array.from({ length: 90 }, (_, index) =>
+      mk("user", { id: "virtual-history-" + index, text: "历史记录 " + index, status: "sent" }),
+    );
     const user = mk("user", { id: "virtual-user", text: "问题", status: "sent" });
     const tool = mk("tool", {
       id: "virtual-tool",
@@ -1928,7 +1953,7 @@ describe("长时间线虚拟分页与活跃状态稳定性", () => {
     });
     const view = render(
       <MessageList
-        messages={[user, tool]}
+        messages={[...history, user, tool]}
         sending
         turnActivity={{ startedAt: Date.now(), agentName: "助手" }}
         cb={{}}
@@ -1937,11 +1962,12 @@ describe("长时间线虚拟分页与活跃状态稳定性", () => {
       />,
       { container: scroller },
     );
+    expect(screen.getByTestId("virtuoso-item-list")).toBeInTheDocument();
     const status = await screen.findByLabelText("生成中");
 
     view.rerender(
       <MessageList
-        messages={[user, tool, mk("thinking", { id: "virtual-thinking", text: "真实思考" })]}
+        messages={[...history, user, tool, mk("thinking", { id: "virtual-thinking", text: "真实思考" })]}
         sending
         turnActivity={{ startedAt: Date.now(), agentName: "助手" }}
         cb={{}}

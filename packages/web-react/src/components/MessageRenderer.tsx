@@ -858,6 +858,13 @@ function coalesceTeam(
 // imposing a user-visible history limit.
 const TIMELINE_VIRTUAL_INDEX_ORIGIN = Math.floor(Number.MAX_SAFE_INTEGER / 4);
 
+// A short/new conversation gains nothing from a measurement graph. Keeping it as ordinary DOM
+// also removes react-virtuoso from the optimistic empty -> first-user-row transition, where rapid
+// session creation/reconciliation can otherwise re-enter its optional-prop publisher (React #185).
+// A normal server timeline page contains 100 rows, so established/archived conversations still
+// enter the virtualized path before DOM size becomes material.
+const TIMELINE_VIRTUALIZE_MIN_ITEMS = 80;
+
 /**
  * Browser suspension invalidates react-virtuoso's ResizeObserver/scroll-root graph even when
  * the logical timeline is unchanged. Returning from a hidden tab also starts REST/journal
@@ -1271,6 +1278,9 @@ export function MessageList({
   const showHistoryBoundary = hasOlderHistory || renderableMessages.some(
     (message) => typeof message._historyPageLoadedFrom === "string",
   );
+  const shouldVirtualizeTimeline =
+    renderableMessages.length >= TIMELINE_VIRTUALIZE_MIN_ITEMS || showHistoryBoundary;
+
   const renderItem = (it: RenderItem) => {
     if (it.kind === "single" && it.m._genPlaceholder) {
       const gp = it.m._genPlaceholder;
@@ -1427,6 +1437,20 @@ export function MessageList({
     sending || historyLoading || transientNotice || (journalDegraded && onRetryJournal)
   )) {
     return <div className="mx-auto max-w-3xl px-5 py-8">{footer}</div>;
+  }
+
+  if (scrollParent && !shouldVirtualizeTimeline) {
+    return (
+      <div className="mx-auto flex max-w-3xl flex-col gap-4 px-5 py-8" data-testid="timeline-short-list">
+        {historyControl}
+        {virtualItems.map((item) => (
+          <div key={itemKey(item)} data-chat-virtual-key={itemKey(item)}>
+            {renderVirtualItem(item)}
+          </div>
+        ))}
+        {footer}
+      </div>
+    );
   }
 
   if (scrollParent) {
