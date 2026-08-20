@@ -555,6 +555,18 @@ describe('master tape-state lease fence', () => {
       { state: 'unreachable' },
       '滚动窗口老 master 缺 lease 证据不得被当作 none negative proof',
     )
+    assert.deepEqual(
+      await queryMasterTapeState('d-lease-wire', 1, {
+        env,
+        fetcher: fetcher({
+          state: 'none',
+          status: null,
+          dispatchLeaseActive: true,
+          gatewayShutdownEvidence: true,
+        }),
+      }),
+      { state: 'none', dispatchLeaseActive: true, gatewayShutdownEvidence: true },
+    )
   })
 
   test('none+活 lease 延后 synthetic;lease 失活后的下一轮正常收敛', async () => {
@@ -605,6 +617,44 @@ describe('master tape-state lease fence', () => {
       'sink_staged',
     )
     assert.equal(staged, 1, 'lease 失活后按既有确定性 none 分支收敛')
+  })
+
+  test('none+活 lease+停机证据 → 仍可合成 SERVICE_RESTART', async () => {
+    await insertQueuedTurnDispatch({
+      userId: 'u1',
+      sessionId: 'web-lease-shutdown',
+      clientMessageId: 'cm-lease-shutdown',
+      dispatchId: 'd-lease-shutdown',
+      attemptNo: 1,
+      payloadHash: 'h',
+    })
+    await recordTurnDispatchRunning({
+      userId: 'u1',
+      sessionId: 'web-lease-shutdown',
+      clientMessageId: 'cm-lease-shutdown',
+      agentId: 'main',
+      turnIndex: 1,
+      turnKey: 'tk-lease-shutdown',
+      requestId: null,
+      createdAt: 1,
+    })
+    let staged = 0
+    const stats = await recoverTurnDispatchInboxOnBoot({
+      retryQueueHasDispatch: async () => false,
+      queryMasterTapeState: async (dispatchId: string): Promise<MasterTapeStateResult> =>
+        dispatchId === 'd-lease-shutdown'
+          ? { state: 'none', dispatchLeaseActive: true, gatewayShutdownEvidence: true }
+          : { state: 'unreachable' },
+      stageSyntheticCrashedTape: async (row: { dispatchId: string }) => {
+        if (row.dispatchId === 'd-lease-shutdown') staged++
+      },
+    })
+    assert.equal(
+      (await getTurnDispatchByLogicalKey('u1', 'web-lease-shutdown', 'cm-lease-shutdown'))?.state,
+      'sink_staged',
+    )
+    assert.equal(staged, 1, '有停机证据时即使 lease 仍显示活也合成')
+    assert.equal(stats.leaseDeferred, 0)
   })
 
   test('直接注入 none 但缺 lease 字段也保持 recovery_pending', async () => {

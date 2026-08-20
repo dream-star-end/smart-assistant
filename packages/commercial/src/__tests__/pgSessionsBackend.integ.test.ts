@@ -97,6 +97,7 @@ const MIGRATION_0228 = path.resolve(here, "../db/migrations/0228_turn_visible_fi
 const MIGRATION_0229 = path.resolve(here, "../db/migrations/0229_turn_finalize_integrity.sql");
 const MIGRATION_0230 = path.resolve(here, "../db/migrations/0230_chat_projects.sql");
 const MIGRATION_0231 = path.resolve(here, "../db/migrations/0231_turn_tape_materialization_resilience.sql");
+const MIGRATION_0239 = path.resolve(here, "../db/migrations/0239_turn_dispatch_shutdown_ctx.sql");
 
 let pool: Pool;
 let backend: PgSessionsBackend;
@@ -229,6 +230,7 @@ before(async () => {
   await pool.query(await readFile(MIGRATION_0229, { encoding: "utf8" }));
   await pool.query(await readFile(MIGRATION_0230, { encoding: "utf8" }));
   await pool.query(await readFile(MIGRATION_0231, { encoding: "utf8" }));
+  await pool.query(await readFile(MIGRATION_0239, { encoding: "utf8" }));
   await pool.query(`
     CREATE TABLE admin_audit (
       id BIGSERIAL PRIMARY KEY,
@@ -6826,15 +6828,15 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     }).dispatch;
 
     const fresh = await backend.getTurnTapeStateByDispatch(CUSER, dispatch.dispatchId, 1);
-    assert.deepEqual(fresh, { state: "none", status: null, dispatchLeaseActive: true });
+    assert.deepEqual(fresh, { state: "none", status: null, dispatchLeaseActive: true, gatewayShutdownEvidence: false });
     assert.deepEqual(
       await backend.getTurnTapeStateByDispatch("c:8", dispatch.dispatchId, 1),
-      { state: "none", status: null, dispatchLeaseActive: false },
+      { state: "none", status: null, dispatchLeaseActive: false, gatewayShutdownEvidence: false },
       "错误租户不能观察 lease",
     );
     assert.deepEqual(
       await backend.getTurnTapeStateByDispatch(CUSER, dispatch.dispatchId, 2),
-      { state: "none", status: null, dispatchLeaseActive: false },
+      { state: "none", status: null, dispatchLeaseActive: false, gatewayShutdownEvidence: false },
       "attemptNo 必须同样参与 lease scope",
     );
 
@@ -6878,6 +6880,19 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
         .dispatchLeaseActive,
       false,
       "rejecting 不属于 lease-active open execution set",
+    );
+
+    await pool.query(
+      `UPDATE turn_dispatches
+          SET shutdown_ctx = jsonb_build_object('gatewayExitedAt', '2026-08-20T00:00:00.000Z')
+        WHERE dispatch_id = $1`,
+      [dispatch.dispatchId],
+    );
+    assert.equal(
+      (await backend.getTurnTapeStateByDispatch(CUSER, dispatch.dispatchId, 1))
+        .gatewayShutdownEvidence,
+      true,
+      "dispatch 级停机证据必须出现在 tape-state 快照里",
     );
   });
 
@@ -7122,7 +7137,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
       const row = await getDispatch(pool, d.dispatchId);
       assert.equal(row!.status, "terminal");
       assert.equal(row!.outcome, tapeStatus);
-      assert.equal(row!.failureCode, null);
+      assert.equal(row!.failureCode, tapeStatus === "completed" ? null : tapeStatus);
       assert.equal(row!.clientNotified, false);
       const after = await backend.getClientSession(sessionId, CUSER, { view: "timeline" });
       assert.ok(!after!.messages.some((m) => (m as MessageLike)._turnStatusRecord === true));
@@ -7131,6 +7146,91 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
       assert.equal(finalRecord?._timelineRecord, true);
     });
   }
+
+  maybe("crashed finalize 把 settlement.errorCode=SERVICE_RESTART 写入 failure_code", async () => {
+    const sessionId = "s-dd-sr-finalize";
+    const clientMessageId = "cm-dd-sr-finalize";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId: CUSER }));
+    const admit = await backend.admitUserTurn(admitInput({ sessionId, clientMessageId }));
+    assert.equal(admit.kind, "admitted");
+    const d = (admit as { dispatch: { dispatchId: string } }).dispatch;
+    const tape = buildTape({
+      sessionId, agentId: "main", turnIndex: 1, status: "crashed",
+      turnKey: "c".repeat(64), text: "", createdAt: 1_783_950_160_000,
+    });
+    assert.ok(backend.commitVisibleLosslessTurnTape);
+    const visible = await backend.commitVisibleLosslessTurnTape(CUSER, {
+      ...tape.finalize,
+      action: "visible",
+      dispatchId: d.dispatchId,
+      attemptNo: 1,
+      settlement: {
+        billingAnchorId: `srv-${sessionId}-main-t1`,
+        engineBillings: [],
+        text: "",
+        ts: 1_783_950_160_000,
+        errorCode: "SERVICE_RESTART",
+      },
+    });
+    assert.equal(visible.applied, "finalized");
+    const row = await getDispatch(pool, d.dispatchId);
+    assert.equal(row!.status, "terminal");
+    assert.equal(row!.outcome, "crashed");
+    assert.equal(row!.failureCode, "SERVICE_RESTART");
+  });
+
+  maybe("SERVICE_RESTART sentinel + late completed 清 failure_code; late crash 写真实码", async () => {
+    for (const [tapeStatus, expectedCode] of [
+      ["completed", null],
+      ["crashed", "ENGINE_FAULT"],
+    ] as const) {
+      const suffix = tapeStatus.slice(0, 4);
+      const sessionId = `s-dd-sr-late-${suffix}`;
+      const clientMessageId = `cm-dd-sr-late-${suffix}`;
+      await backend.upsertClientSession(mkSession({ id: sessionId, userId: CUSER }));
+      const admit = await backend.admitUserTurn(admitInput({ sessionId, clientMessageId }));
+      assert.equal(admit.kind, "admitted");
+      const d = (admit as { dispatch: { dispatchId: string } }).dispatch;
+      assert.ok(await casToTerminal(pool, {
+        dispatchId: d.dispatchId,
+        outcome: "executed_error",
+        failureCode: "SERVICE_RESTART",
+        clientNotified: true,
+      }));
+      const tape = buildTape({
+        sessionId,
+        agentId: "main",
+        turnIndex: 1,
+        status: tapeStatus,
+        turnKey: createHash("sha256").update(`sr-${tapeStatus}`).digest("hex"),
+        text: `late ${tapeStatus}`,
+        createdAt: 1_783_950_170_000,
+      });
+      for (const part of tape.parts) {
+        await backend.stageLosslessTurnTapePart(CUSER, part.request, part.bytes, {
+          dispatchId: d.dispatchId,
+          attemptNo: 1,
+        });
+      }
+      const finalize = tapeStatus === "crashed"
+        ? {
+            ...tape.finalize,
+            settlement: {
+              billingAnchorId: `srv-${sessionId}-main-t1`,
+              engineBillings: [],
+              text: `late ${tapeStatus}`,
+              ts: 1_783_950_170_000,
+              errorCode: "ENGINE_FAULT",
+            },
+          }
+        : tape.finalize;
+      assert.equal((await backend.finalizeLosslessTurnTape(CUSER, finalize)).applied, "finalized");
+      const row = await getDispatch(pool, d.dispatchId);
+      assert.equal(row!.status, "terminal");
+      assert.equal(row!.outcome, tapeStatus);
+      assert.equal(row!.failureCode, expectedCode);
+    }
+  });
 
   maybe("late tape(§7.9):verified failure → true tape finalize moves dispatch to manual and timeline shows only truth", async () => {
     await backend.upsertClientSession(mkSession({ id: "s-dd-late-3", userId: CUSER }));

@@ -20,6 +20,7 @@ import {
   loadGatewayExitDispatchIds,
   _resetVisibleOrphanScanOffset,
 } from '../dispatch/turnDispatchReconciler.js'
+import { markOpenDispatchShutdownEvidence } from '../dispatch/turnDispatchStore.js'
 import { PERMANENT_CODEX_WAIVER_PREFIX } from '../billing/codexFinalizer.js'
 import type { ContainerCallResult } from '../dispatch/containerDispatchClient.js'
 import { permanentCodexWaiverReason } from '../billing/codexFinalizer.js'
@@ -69,6 +70,7 @@ interface Canned {
 
 function makeFakePool(canned: Canned) {
   const writes: string[] = []
+  const writeParams: unknown[][] = []
   // accepted 扫描的 SQL 时间参数捕获(Codex R1 MAJOR 回归锁:扫描下限必须是
   // ACCEPTED_UNREACHABLE_ALERT_MS 而非 stuckMs,否则求证瘫痪要等 90min+ 才首告)。
   const acceptedScanCutoffs: Date[] = []
@@ -114,6 +116,7 @@ function makeFakePool(canned: Canned) {
     }
     if (s.startsWith('UPDATE') || s.startsWith('INSERT')) {
       recordWrite(s)
+      writeParams.push(params ?? [])
       if (s.includes('client_notified = TRUE')) return { rows: [], rowCount: 1 }
       if (s.includes("status = 'manual_reconcile'")) return { rows: [rawRow({ status: 'manual_reconcile', conflict_reason: 'x' })], rowCount: 1 }
       if (s.includes("status = 'terminal'")) {
@@ -155,6 +158,7 @@ function makeFakePool(canned: Canned) {
       }
     },
     writes,
+    writeParams,
     acceptedScanCutoffs,
   }
   return pool
@@ -536,6 +540,8 @@ describe('accepted-stuck branch (B2: container rejected tombstone)', () => {
     assert.equal(nudged, 1)
     assert.ok(pool.writes.some((w) =>
       w.includes("status = 'terminal'") && w.includes('failure_code = $3')))
+    assert.ok(pool.writeParams.some((p) => p[2] === 'SERVICE_RESTART'))
+    assert.ok(!pool.writeParams.some((p) => p[2] === 'RESULT_RECOVERY_PENDING'))
     assert.ok(pool.writes.some((w) =>
       w.includes('history_revision = history_revision + 1') &&
       w.includes('timeline_generation = timeline_generation + 1')))
@@ -623,6 +629,41 @@ describe('carrier-death fast path (accepted)', () => {
     assert.equal(counts.rejectedTerminal, 0)
     assert.equal(counts.manualReconcile, 0)
     assert.ok(!pool.writes.some((w) => w.includes("status = 'terminal'")))
+  })
+
+  test('accepted + 停机证据 + 容器不可达 → 收口成 SERVICE_RESTART', async () => {
+    const pool = makeFakePool({
+      acceptedStuck: [rawRow({ status: 'accepted', accepted_at: new Date() })],
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: noContainer,
+      listCarrierDeadDispatchIds: async () => ['d-1'],
+    })
+    assert.equal(counts.visibleFailures, 1)
+    assert.equal(counts.rejectedTerminal, 0)
+    assert.ok(pool.writeParams.some((p) => p[1] === 'executed_error' && p[2] === 'SERVICE_RESTART'))
+    assert.ok(!pool.writeParams.some((p) => p[1] === 'not_accepted' || p[2] === 'DISPATCH_NOT_ACCEPTED'))
+    assert.ok(!pool.writeParams.some((p) => p[2] === 'RESULT_RECOVERY_PENDING'))
+  })
+
+  test('accepted + 停机证据 + 容器 running → 不动', async () => {
+    const pool = makeFakePool({
+      acceptedStuck: [rawRow({ status: 'accepted', accepted_at: new Date() })],
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: {
+        ...noContainer,
+        getDispatchState: async (): Promise<ContainerCallResult> => ({ kind: 'ok', state: 'running' }),
+      },
+      listCarrierDeadDispatchIds: async () => ['d-1'],
+    })
+    assert.equal(counts.visibleFailures, 0)
+    assert.equal(counts.rejectedTerminal, 0)
+    assert.equal(counts.manualReconcile, 0)
+    assert.ok(!pool.writes.some((w) => w.includes("status = 'terminal'")))
+    assert.ok(!pool.writeParams.some((p) => p[2] === 'SERVICE_RESTART'))
   })
 
   test('幼龄 admitted + 租约过期 + 进程退出证据 → 进入 reject-if-absent', async () => {
@@ -736,6 +777,25 @@ describe('runShutdownDispatchHandoff', () => {
     assert.equal(n, 4)
     assert.match(writes[0]!, /status = 'admitted'/)
     assert.match(writes[0]!, /lease_until > \$1/)
+  })
+
+  test('markOpenDispatchShutdownEvidence 打 open 三态且不碰 lease', async () => {
+    const writes: string[] = []
+    const pool = {
+      async query(sql: string) {
+        writes.push(sql.replace(/\s+/g, ' '))
+        return { rows: [], rowCount: 3 }
+      },
+    }
+    const n = await markOpenDispatchShutdownEvidence(pool as unknown as Pool, {
+      now: new Date('2026-08-20T00:00:00.000Z'),
+      reason: 'process_shutdown',
+    })
+    assert.equal(n, 3)
+    assert.match(writes[0]!, /status IN \('admitted','accepted','rejecting'\)/)
+    assert.match(writes[0]!, /shutdown_ctx/)
+    assert.doesNotMatch(writes[0]!, /lease_until/)
+    assert.doesNotMatch(writes[0]!, /status = 'terminal'/)
   })
 })
 

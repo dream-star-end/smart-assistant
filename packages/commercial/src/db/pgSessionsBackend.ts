@@ -1093,6 +1093,7 @@ const PROBE_EXPECTED_COLUMNS: ReadonlyArray<[string, string, string]> = [
   ["turn_dispatches", "visible_head", "jsonb"],
   ["turn_dispatches", "visible_at", "bigint"],
   ["turn_dispatches", "producer_fenced_at", "timestamp with time zone"],
+  ["turn_dispatches", "shutdown_ctx", "jsonb"],
   ["turn_tape_materialization_jobs", "job_id", "uuid"],
   ["turn_tape_settlement_jobs", "job_id", "uuid"],
   ["client_session_turn_tape_parts", "payload", "bytea"],
@@ -1221,14 +1222,34 @@ export function _losslessFinalizeSingleflightKey(
  *   - 已 terminal(completed 等)/ manual_reconcile → 幂等 no-op。
  * CAS-first(原子);仅失败后读一次判 late tape(此时行已终态,读值稳定)。
  */
+function errorCodeFromVisibleHead(head: unknown): string | null {
+  if (!head || typeof head !== "object") return null;
+  const code = (head as { errorCode?: unknown }).errorCode;
+  return typeof code === "string" && code.length > 0 ? code : null;
+}
+
+function failureCodeForTapeOutcome(
+  tapeStatus: string,
+  errorCode?: string | null,
+): string | null {
+  const outcome =
+    tapeStatus === "completed" ? "completed" :
+    tapeStatus === "interrupted" ? "interrupted" : "crashed";
+  if (outcome === "completed") return null;
+  if (typeof errorCode === "string" && errorCode.length > 0) return errorCode;
+  return outcome;
+}
+
 async function convergeDispatchOnFinalize(
   client: PoolClient,
   dispatchId: string,
   tapeStatus: string,
+  failureCode?: string | null,
 ): Promise<{ lateTape: boolean; removedVisibleStatus: boolean }> {
   const outcome =
     tapeStatus === "completed" ? "completed" :
     tapeStatus === "interrupted" ? "interrupted" : "crashed";
+  const nextFailureCode = failureCodeForTapeOutcome(tapeStatus, failureCode);
   // Serialize against persistGatewayLiveFrame on the dispatch row (it takes
   // the same FOR UPDATE before deciding projection_source). Without this,
   // a frame write interleaved between our reconcile and its stream INSERT
@@ -1259,26 +1280,28 @@ async function convergeDispatchOnFinalize(
   const converged = await casToTerminal(client, {
     dispatchId,
     outcome,
+    failureCode: nextFailureCode,
     fromStatuses: ["admitted", "accepted", "rejecting"],
   });
   if (converged !== null) return { lateTape: false, removedVisibleStatus: false };
   const d = await getDispatch(client, dispatchId);
   if (
     d && d.status === "terminal" && d.outcome === "executed_error" &&
-    d.failureCode === "RESULT_RECOVERY_PENDING"
+    (d.failureCode === "RESULT_RECOVERY_PENDING" || d.failureCode === "SERVICE_RESTART")
   ) {
     // The reconciler's recovery sentinel is explicitly provisional: it says
     // the executor ended before a complete tape was visible. A later verified
     // finalize is the stronger authority. Replace only that exact sentinel;
     // other executed_error outcomes remain immutable and reviewable.
+    // completed 才允许清 failure_code;真崩溃必须写下真实码,不许残留 SERVICE_RESTART。
     await client.query(
       `UPDATE turn_dispatches
-          SET outcome=$2, failure_code=NULL, client_notified=FALSE,
+          SET outcome=$2, failure_code=$3, client_notified=FALSE,
               terminal_at=clock_timestamp()
         WHERE dispatch_id=$1 AND status='terminal'
           AND outcome='executed_error'
-          AND failure_code='RESULT_RECOVERY_PENDING'`,
-      [dispatchId, outcome],
+          AND failure_code IN ('RESULT_RECOVERY_PENDING','SERVICE_RESTART')`,
+      [dispatchId, outcome, nextFailureCode],
     );
     return { lateTape: false, removedVisibleStatus: d.clientNotified };
   }
@@ -1390,6 +1413,8 @@ export interface TurnTapeStateResult {
   status: string | null;
   /** Same-snapshot secondary fence for gateway recovery when state=none. */
   dispatchLeaseActive: boolean;
+  /** Dispatch-level master shutdown evidence; none+true may synthesize even if lease looks live. */
+  gatewayShutdownEvidence: boolean;
 }
 
 export interface DispatchAdmissionBackend {
@@ -6751,10 +6776,11 @@ export async function commitVisibleLosslessTurnPhaseA(
         settlement_hash: string | null;
         dispatch_id: string | null;
         attempt_no: number | null;
+        visible_head: unknown;
       }>(
         `SELECT agent_id,turn_index,status,turn_key,tape_sha256,total_bytes,part_count,created_at,
                 waive_reason,visible_at::text,finalized_at::text,engine_billings,billing_anchor_id,
-                settlement_hash,dispatch_id,attempt_no
+                settlement_hash,dispatch_id,attempt_no,visible_head
            FROM client_session_turn_tapes
           WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
           FOR UPDATE`,
@@ -6824,7 +6850,12 @@ export async function commitVisibleLosslessTurnPhaseA(
       }
       let replayLate = false;
       if (tape.dispatch_id !== null) {
-        const convergence = await convergeDispatchOnFinalize(client, tape.dispatch_id, tape.status);
+        const convergence = await convergeDispatchOnFinalize(
+          client,
+          tape.dispatch_id,
+          tape.status,
+          request.settlement?.errorCode ?? errorCodeFromVisibleHead(tape.visible_head),
+        );
         replayLate = convergence.lateTape;
       }
       if (options.enqueueMaterialization !== false && tape.finalized_at === null) {
@@ -6974,7 +7005,12 @@ export async function commitVisibleLosslessTurnPhaseA(
     }
     let lateTape = false;
     if (tape.dispatch_id !== null) {
-      const convergence = await convergeDispatchOnFinalize(client, tape.dispatch_id, tape.status);
+      const convergence = await convergeDispatchOnFinalize(
+        client,
+        tape.dispatch_id,
+        tape.status,
+        request.settlement?.errorCode ?? head.errorCode,
+      );
       lateTape = convergence.lateTape;
     }
     return {
@@ -7540,7 +7576,7 @@ export function createPgSessionsBackend(
       attemptNo: number,
     ): Promise<TurnTapeStateResult> {
       const uidMatch = /^c:([1-9][0-9]*)$/.exec(userId);
-      if (!uidMatch) return { state: "none", status: null, dispatchLeaseActive: false };
+      if (!uidMatch) return { state: "none", status: null, dispatchLeaseActive: false, gatewayShutdownEvidence: false };
       const dispatchUserId = uidMatch[1]!;
       const res = await pool.query<{
         tape_found: boolean;
@@ -7548,6 +7584,7 @@ export function createPgSessionsBackend(
         visible_at: string | null;
         tape_status: string | null;
         dispatch_lease_active: boolean;
+        gateway_shutdown_evidence: boolean;
       }>(
         `SELECT
            (tape.tape_id IS NOT NULL) AS tape_found,
@@ -7558,7 +7595,8 @@ export function createPgSessionsBackend(
              dispatch.status IN ('admitted','accepted')
                AND dispatch.lease_until > statement_timestamp(),
              FALSE
-           ) AS dispatch_lease_active
+           ) AS dispatch_lease_active,
+           COALESCE(dispatch.shutdown_ctx->>$5, '') <> '' AS gateway_shutdown_evidence
          FROM (VALUES (1)) AS singleton(n)
          LEFT JOIN LATERAL (
            SELECT tape_id, finalized_at, visible_at, status
@@ -7568,12 +7606,12 @@ export function createPgSessionsBackend(
             LIMIT 1
          ) AS tape ON TRUE
          LEFT JOIN LATERAL (
-           SELECT status, lease_until
+           SELECT status, lease_until, shutdown_ctx
              FROM turn_dispatches
             WHERE user_id = $2 AND dispatch_id = $3 AND attempt_no = $4
             LIMIT 1
          ) AS dispatch ON TRUE`,
-        [userId, dispatchUserId, dispatchId, attemptNo],
+        [userId, dispatchUserId, dispatchId, attemptNo, "gatewayExitedAt"],
       );
       // singleton guarantees one row. Tape and lease evidence come from this
       // one PostgreSQL statement snapshot: a separate read could observe
@@ -7581,13 +7619,15 @@ export function createPgSessionsBackend(
       // a false SERVICE_RESTART tape.
       const row = res.rows[0]!;
       const dispatchLeaseActive = row.dispatch_lease_active === true;
+      const gatewayShutdownEvidence = row.gateway_shutdown_evidence === true;
       if (!row.tape_found) {
-        return { state: "none", status: null, dispatchLeaseActive };
+        return { state: "none", status: null, dispatchLeaseActive, gatewayShutdownEvidence };
       }
       return {
         state: row.visible_at !== null || row.finalized_at !== null ? "finalized" : "partial",
         status: row.tape_status ?? null,
         dispatchLeaseActive,
+        gatewayShutdownEvidence,
       };
     },
 
@@ -7859,12 +7899,13 @@ export function createPgSessionsBackend(
             visible_at: string | null;
             materialization_status: string;
             settlement_hash: string | null;
+            visible_head: unknown;
           }>(
             `SELECT tape_id,agent_id,turn_index,status,turn_key,tape_sha256,
                     total_bytes, part_count, created_at, waive_reason, finalized_at,
                     record_storage_format,engine_billings,
                     billing_anchor_id,dispatch_id,attempt_no,client_message_id,
-                    visible_at::text, materialization_status, settlement_hash
+                    visible_at::text, materialization_status, settlement_hash, visible_head
                FROM client_session_turn_tapes
               WHERE session_id=$1 AND user_id=$2 AND tape_id=ANY($3::text[])
               ORDER BY tape_id FOR UPDATE`,
@@ -7947,7 +7988,12 @@ export function createPgSessionsBackend(
           // 幂等 replay 分支同样收敛 dispatch(不依赖 parts):首轮 finalize 若已收敛,CAS no-op。
           let replayLate = false;
           if (tape.dispatch_id !== null) {
-            const convergence = await convergeDispatchOnFinalize(client, tape.dispatch_id, tape.status);
+            const convergence = await convergeDispatchOnFinalize(
+              client,
+              tape.dispatch_id,
+              tape.status,
+              request.settlement?.errorCode ?? errorCodeFromVisibleHead(tape.visible_head),
+            );
             replayLate = convergence.lateTape;
             await reconcileLiveStreamWithFinalTape(client, {
               dispatchId: tape.dispatch_id,
@@ -8486,7 +8532,12 @@ export function createPgSessionsBackend(
         // 或迟到 tape 转 manual_reconcile。浏览器直接读 tape/dispatch，不再写任何影子内容表。
         let dispatchLate = false;
         if (tape.dispatch_id !== null) {
-          const convergence = await convergeDispatchOnFinalize(client, tape.dispatch_id, tape.status);
+          const convergence = await convergeDispatchOnFinalize(
+            client,
+            tape.dispatch_id,
+            tape.status,
+            request.settlement?.errorCode ?? errorCodeFromVisibleHead(tape.visible_head),
+          );
           dispatchLate = convergence.lateTape;
           await reconcileLiveStreamWithFinalTape(client, {
             dispatchId: tape.dispatch_id,

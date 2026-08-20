@@ -2787,6 +2787,7 @@ export function makeTurnTapeStateHandler(deps: TurnTapeStateHandlerDeps): Server
         state: result.state,
         status: result.status,
         dispatchLeaseActive: result.dispatchLeaseActive,
+        gatewayShutdownEvidence: result.gatewayShutdownEvidence === true,
       }, requestId);
     } catch (err) {
       log.error("turn_tape_state_read_failed", { dispatchId, attemptNo, err: err as Error });
