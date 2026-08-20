@@ -861,7 +861,7 @@ export const TIMELINE_INITIAL_TAIL_ITEMS = 80;
 const TIMELINE_WINDOW_EXPAND_ITEMS = 80;
 const TIMELINE_EXPAND_NEAR_TOP_PX = 160;
 const PAINT_ESTIMATE_PX = 200;
-const PAINT_OVERSCAN = 20;
+const PAINT_OVERSCAN = 28;
 const PAINT_MIN_ITEMS = 36;
 const PAINT_ENABLE_ITEMS = 160;
 const PAINT_ENABLE_VIEWPORT_PX = 360;
@@ -1161,9 +1161,11 @@ export function MessageList({
         el.clientHeight,
         followBottomRefBox.current?.current === true,
       );
-      setPaintRange((prev) => (
-        prev.start === next.start && prev.end === next.end ? prev : next
-      ));
+      setPaintRange((prev) => {
+        if (prev.start === next.start && prev.end === next.end) return prev;
+        if (Math.abs(prev.start - next.start) < 8 && Math.abs(prev.end - next.end) < 8) return prev;
+        return next;
+      });
     };
     const onScroll = () => {
       if (raf) return;
@@ -1346,7 +1348,9 @@ export function MessageList({
     );
   const visibleItems = renderItems.slice(windowStart);
   visibleCountRef.current = visibleItems.length;
-  const paintOn = paintWindowEnabled(scrollParent, visibleItems.length);
+  const paintOn = paintWindowEnabled(scrollParent, visibleItems.length)
+    && !archive?.loading
+    && !archiveQueued;
   let paintStart = 0;
   let paintEnd = visibleItems.length;
   if (paintOn && scrollParent) {
