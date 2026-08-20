@@ -1,5 +1,6 @@
 import { AlertTriangle } from "lucide-react";
 import { Component, type ErrorInfo, type ReactNode } from "react";
+import { reportClientFriction } from "../lib/clientFriction";
 
 type Props = { children: ReactNode; onRetry?: () => void; resetKey?: string };
 type State = { failed: boolean; autoRetryUsed: boolean };
@@ -20,6 +21,12 @@ export class SessionTimelineBoundary extends Component<Props, State> {
 
   componentDidCatch(error: unknown, info: ErrorInfo) {
     console.error("[SessionTimelineBoundary] 会话时间线渲染失败", error, info.componentStack);
+    reportClientFriction({
+      surface: "chat",
+      stage: "timeline_render",
+      code: isUpdateDepthError(error) ? "REACT_UPDATE_DEPTH_185" : "TIMELINE_RENDER_ERROR",
+      sessionId: this.props.resetKey,
+    });
     // Virtuoso #185 is a renderer lifecycle loop, not corrupt conversation data. Once the
     // offending tree is unmounted by this boundary, one deferred remount is safe and avoids
     // leaving the user on a permanent fatal card after background/foreground restoration.
