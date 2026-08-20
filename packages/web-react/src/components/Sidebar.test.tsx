@@ -3,10 +3,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import type { ChatProject, Session, User } from "../lib/types";
 import { Sidebar } from "./Sidebar";
-import { SESSION_ROW_HEIGHT, SESSION_ROW_HEIGHT_PREVIEW } from "./sidebar/constants";
+import { SESSION_ROW_HEIGHT, SESSION_ROW_HEIGHT_PREVIEW, DEFAULT_PROJECT_ID } from "./sidebar/constants";
 import { flattenSidebarItems } from "./sidebar/flattenItems";
 import { HighlightedText } from "./sidebar/highlight";
-import { modelShortLabel } from "./sidebar/modelShortLabel";
 
 afterEach(() => {
   cleanup();
@@ -269,7 +268,7 @@ describe("Sidebar 会话列表", () => {
     expect(screen.queryByRole("button", { name: "Beta 上线检查" })).toBeNull();
   });
 
-  it("按更新时间分组展示（今天 / 更早各自成组）", () => {
+  it("无项目会话落入 default，组内按时间倒序平铺（不再套今天/昨天）", () => {
     const old = new Date(Date.now() - 90 * 86400000).toISOString();
     renderSidebar({
       sessions: [
@@ -277,8 +276,14 @@ describe("Sidebar 会话列表", () => {
         session({ id: "s-old", title: "很久以前的会话", updatedAt: old }),
       ],
     });
-    expect(screen.getByText("今天")).toBeInTheDocument();
-    expect(screen.getByText("更早")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /default/ })).toBeInTheDocument();
+    expect(screen.queryByText("今天")).toBeNull();
+    expect(screen.queryByText("更早")).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "今天的会话" }).compareDocumentPosition(
+        screen.getByRole("button", { name: "很久以前的会话" }),
+      ) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
   });
 });
 
@@ -333,7 +338,7 @@ describe("Sidebar 项目分组", () => {
     session({ id: "s-out", title: "未分组会话" }),
   ];
 
-  it("项目在上、未分组按时间分组在下；展开后缩进显示项目会话且不套时间分组", () => {
+  it("真实项目在前、default 固定在后；未分组会话在 default 下且不套时间分组", () => {
     renderSidebar({
       sessions: projectSessions,
       projects,
@@ -343,12 +348,15 @@ describe("Sidebar 项目分组", () => {
     });
     expect(screen.getByText("项目")).toBeInTheDocument();
     expect(screen.getByText("工作")).toBeInTheDocument();
-    expect(screen.getByText("1")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "项目里的会话" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "未分组会话" })).toBeInTheDocument();
-    expect(screen.getByText("今天")).toBeInTheDocument();
+    expect(screen.queryByText("今天")).toBeNull();
     const workBtn = screen.getByRole("button", { name: /工作/ });
+    const defaultBtn = screen.getByRole("button", { name: /default/ });
     expect(workBtn).toHaveAttribute("aria-expanded", "true");
+    expect(
+      workBtn.compareDocumentPosition(defaultBtn) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
   });
 
   it("折叠项目后隐藏其下会话，并回调 toggle", () => {
@@ -393,6 +401,7 @@ describe("Sidebar 项目分组", () => {
     expect(screen.getByRole("button", { name: "项目里的会话" })).toBeInTheDocument();
     expect(screen.queryByText("项目")).toBeNull();
     expect(screen.queryByRole("button", { name: /工作/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /default/ })).toBeNull();
     expect(screen.queryByRole("button", { name: "未分组会话" })).toBeNull();
   });
 
@@ -438,38 +447,138 @@ describe("Sidebar 项目分组", () => {
     expect(onMoveToProject.mock.calls[0][1]).toBe("p-work");
   });
 
-  it("项目为空时给出克制提示", () => {
+  it("无真实项目时仍渲染 default；default 不可重命名、删除、改色或排序", () => {
     renderSidebar({
       sessions: [],
       projects: [],
       onCreateProject: () => {},
+      onRenameProject: () => {},
+      onDeleteProject: () => {},
+      onOpenProjectSettings: () => {},
+      onReorderProjects: () => {},
     });
-    expect(screen.getByText("还没有项目")).toBeInTheDocument();
+    expect(screen.queryByText("还没有项目")).toBeNull();
+    expect(screen.getByRole("button", { name: /default/ })).toBeInTheDocument();
     expect(screen.getByText("暂无会话")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "项目 default 更多" })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "重命名" })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "删除" })).toBeNull();
+  });
+
+  it("default 可折叠，toggle 走与真实项目相同的 collapsedProjectIds 通道", () => {
+    const onToggle = vi.fn();
+    renderSidebar({
+      sessions: [session({ id: "s-out", title: "未分组会话" })],
+      projects: [],
+      collapsedProjectIds: new Set(),
+      onToggleProjectCollapsed: onToggle,
+      onCreateProject: () => {},
+    });
+    fireEvent.click(screen.getByRole("button", { name: /default/ }));
+    expect(onToggle).toHaveBeenCalledWith(DEFAULT_PROJECT_ID);
+  });
+
+  it("拖到 default 行即移出项目（projectId 为 null）", () => {
+    const onMoveToProject = vi.fn();
+    renderSidebar({
+      sessions: projectSessions,
+      projects,
+      collapsedProjectIds: new Set(),
+      onToggleProjectCollapsed: () => {},
+      onCreateProject: () => {},
+      onMoveToProject,
+    });
+    const dt = dragData();
+    const row = screen.getByRole("button", { name: "项目里的会话" }).closest("div")!;
+    fireEvent.dragStart(row, { dataTransfer: dt });
+    const defaultRow = screen.getByRole("button", { name: /default/ }).closest("div")!;
+    fireEvent.dragOver(defaultRow, { dataTransfer: dt });
+    fireEvent.drop(defaultRow, { dataTransfer: dt });
+    expect(onMoveToProject).toHaveBeenCalledTimes(1);
+    expect(onMoveToProject.mock.calls[0][0].id).toBe("s-in");
+    expect(onMoveToProject.mock.calls[0][1]).toBeNull();
   });
 });
 
+function leadImgs(title: string): HTMLElement[] {
+  const btn = screen.getByRole("button", { name: title });
+  const row = btn.closest("div")!;
+  return Array.from(row.querySelectorAll("[role=img]"));
+}
+
 describe("Sidebar 会话状态点", () => {
-  it("四态：运行中闪绿、完成/中断常亮绿、异常红、服务重启琥珀", () => {
+  it("四种状态各自渲染唯一一个点且位置在标题左；已读完成不占可见点", () => {
     renderSidebar({
       sessions: [
         session({ id: "s-run", title: "正在跑", runState: "running" }),
         session({ id: "s-ok", title: "已跑完", lastOutcome: "completed" }),
-        session({ id: "s-stop", title: "用户停了", lastOutcome: "interrupted" }),
+        session({ id: "s-unread", title: "未读完成", lastOutcome: "completed" }),
         session({ id: "s-err", title: "崩了", lastOutcome: "crashed" }),
         session({ id: "s-rst", title: "被重启", lastOutcome: "crashed", lastErrorCode: "SERVICE_RESTART" }),
         session({ id: "s-new", title: "从没跑过", lastOutcome: null }),
       ],
+      unreadIds: new Set(["s-unread", "s-err"]),
       isSending: (id) => id === "s-run",
     });
-    expect(screen.getByRole("img", { name: "运行中" })).toHaveClass("bg-success", "oc-session-running");
-    expect(screen.getByRole("img", { name: "已完成" })).toHaveClass("bg-success");
-    expect(screen.getByRole("img", { name: "已中断" })).toHaveClass("bg-success");
-    expect(screen.getByRole("img", { name: "出错" })).toHaveClass("bg-danger");
-    expect(screen.getByRole("img", { name: "服务重启中断，可继续" })).toHaveClass("bg-warning");
-    expect(screen.queryByRole("img", { name: "从没跑过" })).toBeNull();
+
+    const runImgs = leadImgs("正在跑");
+    expect(runImgs).toHaveLength(1);
+    expect(runImgs[0]).toHaveClass("bg-info", "oc-session-running");
+    expect(runImgs[0]).toHaveAccessibleName("运行中");
+    expect(
+      runImgs[0]!.compareDocumentPosition(screen.getByRole("button", { name: "正在跑" })) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+
+    expect(leadImgs("已跑完")).toHaveLength(0);
+    expect(screen.queryByRole("img", { name: "已完成" })).toBeNull();
+    expect(screen.queryByRole("img", { name: "已中断" })).toBeNull();
+
+    const unreadImgs = leadImgs("未读完成");
+    expect(unreadImgs).toHaveLength(1);
+    expect(unreadImgs[0]).toHaveClass("bg-success");
+    expect(unreadImgs[0]).toHaveAccessibleName("未读");
+    expect(screen.getAllByRole("img", { name: "未读" })).toHaveLength(1);
+
+    const errImgs = leadImgs("崩了");
+    expect(errImgs).toHaveLength(1);
+    expect(errImgs[0]).toHaveClass("bg-danger");
+    expect(errImgs[0]).toHaveAccessibleName("出错");
+
+    const rstImgs = leadImgs("被重启");
+    expect(rstImgs).toHaveLength(1);
+    expect(rstImgs[0]).toHaveClass("bg-warning");
+    expect(rstImgs[0]).toHaveAccessibleName("服务重启中断，可继续");
+
     const idleRow = screen.getByRole("button", { name: "从没跑过" }).closest("div")!;
+    expect(idleRow.querySelector("[data-session-lead]")).not.toBeNull();
     expect(idleRow.querySelector("[role=img]")).toBeNull();
+  });
+
+  it("已读后绿点立即消失；红点不因已读消失", () => {
+    const sessions = [
+      session({ id: "s-unread", title: "未读完成", lastOutcome: "completed" }),
+      session({ id: "s-err", title: "崩了", lastOutcome: "crashed" }),
+    ];
+    const { rerender } = renderSidebar({
+      sessions,
+      unreadIds: new Set(["s-unread", "s-err"]),
+    });
+    expect(screen.getByRole("img", { name: "未读" })).toBeInTheDocument();
+    expect(screen.getByRole("img", { name: "出错" })).toBeInTheDocument();
+    rerender(
+      <Sidebar
+        sessions={sessions}
+        user={user}
+        onSelect={() => {}}
+        onNew={() => {}}
+        onRename={() => {}}
+        onDelete={() => {}}
+        unreadIds={new Set()}
+      />,
+    );
+    expect(screen.queryByRole("img", { name: "未读" })).toBeNull();
+    expect(screen.getByRole("img", { name: "出错" })).toBeInTheDocument();
   });
 
   it("本 tab isSending 立刻覆盖列表 idle，显示运行中", () => {
@@ -482,7 +591,7 @@ describe("Sidebar 会话状态点", () => {
 });
 
 describe("Sidebar 置顶", () => {
-  it("置顶会话集中显示在最上方「置顶」分组，不再出现在时间分组里", () => {
+  it("置顶会话集中显示在最上方「置顶」分组，不进入 default", () => {
     const old = new Date(Date.now() - 90 * 86400000).toISOString();
     renderSidebar({
       sessions: [
@@ -492,16 +601,13 @@ describe("Sidebar 置顶", () => {
       onTogglePin: () => {},
     });
     expect(screen.getByText("置顶")).toBeInTheDocument();
-    expect(screen.getByText("今天")).toBeInTheDocument();
     const pinHeading = screen.getByText("置顶");
-    const todayHeading = screen.getByText("今天");
+    const defaultBtn = screen.getByRole("button", { name: /default/ });
     expect(
       pinHeading.compareDocumentPosition(screen.getByRole("button", { name: "钉住的" })) &
         Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
-    expect(
-      pinHeading.compareDocumentPosition(todayHeading) & Node.DOCUMENT_POSITION_FOLLOWING,
-    ).toBeTruthy();
+    expect(pinHeading.compareDocumentPosition(defaultBtn) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     openSessionMenu("钉住的");
     expect(screen.getByRole("menuitem", { name: /取消置顶/ })).toBeInTheDocument();
   });
@@ -529,7 +635,31 @@ describe("Sidebar 虚拟列表拍平", () => {
       localEmpty: false,
     });
     expect(collapsed.some((i) => i.kind === "session" && i.session.id === "s-in")).toBe(false);
-    expect(collapsed.some((i) => i.kind === "project" && i.collapsed)).toBe(true);
+    expect(collapsed.some((i) => i.kind === "project" && i.collapsed && i.project.id === "p-work")).toBe(
+      true,
+    );
+    expect(collapsed.some((i) => i.kind === "project" && i.project.id === DEFAULT_PROJECT_ID)).toBe(true);
+    expect(collapsed.some((i) => i.kind === "header" && i.label === "今天")).toBe(false);
+    expect(collapsed.some((i) => i.kind === "session" && i.session.id === "s-out")).toBe(true);
+
+    const defaultClosed = flattenSidebarItems({
+      searching: false,
+      showProjects: true,
+      showPreview: false,
+      pinned: [],
+      projects: [proj],
+      projectSessions: new Map([["p-work", [inProj]]]),
+      sessions: [inProj, out],
+      ungroupedGroups: [["今天", [out]]],
+      collapsedProjectIds: new Set([DEFAULT_PROJECT_ID]),
+      archived: [],
+      archivedExpanded: false,
+      searchHits: [],
+      searchRemote: "idle",
+      localEmpty: false,
+    });
+    expect(defaultClosed.some((i) => i.kind === "session" && i.session.id === "s-out")).toBe(false);
+    expect(defaultClosed.some((i) => i.kind === "session" && i.session.id === "s-in")).toBe(true);
 
     const open = flattenSidebarItems({
       searching: false,
@@ -550,6 +680,10 @@ describe("Sidebar 虚拟列表拍平", () => {
     const child = open.find((i) => i.kind === "session" && i.session.id === "s-in");
     expect(child).toMatchObject({ kind: "session", indent: true, height: SESSION_ROW_HEIGHT });
     expect(open[0]?.kind).not.toBe("session");
+    const projectIds = open.filter((i) => i.kind === "project").map((i) =>
+      i.kind === "project" ? i.project.id : "",
+    );
+    expect(projectIds).toEqual(["p-work", DEFAULT_PROJECT_ID]);
   });
 
   it("置顶分组在项目与时间分组之前；搜索时不拍项目行", () => {
@@ -670,27 +804,50 @@ describe("Sidebar 归档与批量", () => {
     fireEvent.click(screen.getByLabelText("选择 Beta 上线检查"));
     expect(screen.getByTestId("sidebar-batch-bar")).toHaveTextContent("已选 1 条");
   });
+
+  it("非多选模式会话行完全不出现复选框", () => {
+    renderSidebar({ sessions: listSessions, onBatch: () => {} });
+    expect(screen.queryByLabelText("选择 季度复盘 Alpha")).toBeNull();
+    expect(screen.queryByLabelText("选择 Beta 上线检查")).toBeNull();
+    expect(screen.queryByRole("checkbox")).toBeNull();
+  });
 });
 
-describe("Sidebar 模型徽标与摘要", () => {
-  it("有 modelId 时显示短标签，有摘要时作为第二行", () => {
+describe("Sidebar 紧凑时长与摘要", () => {
+  it("有摘要时作为第二行；标题旁不再显示模型徽标", () => {
     renderSidebar({
       sessions: [
         session({
           id: "s-m",
           title: "带模型",
           modelId: "vendor/cool-model-v2",
+          lastAt: Date.now() - 5 * 60_000,
           lastMessagePreview: "最后一句话写在这里",
         }),
       ],
-      models: [{ id: "vendor/cool-model-v2", display_name: "Cool Model" }],
     });
-    expect(screen.getByText("Cool Model")).toBeInTheDocument();
+    expect(screen.queryByText("Cool Model")).toBeNull();
+    expect(screen.queryByText(/cool-model/i)).toBeNull();
+    expect(screen.getByText("5m")).toBeInTheDocument();
     expect(screen.getByText("最后一句话写在这里")).toBeInTheDocument();
   });
 
-  it("modelShortLabel 回落 id 可读片段，不臆造映射表", () => {
-    expect(modelShortLabel("acme/foo-bar")).toBe("foo-bar");
+  it("时长格式 <1m / 分 / 小时 / 天", () => {
+    const now = Date.now();
+    renderSidebar({
+      sessions: [
+        session({ id: "s-sec", title: "刚更新", lastAt: now - 10_000 }),
+        session({ id: "s-min", title: "五分钟前", lastAt: now - 5 * 60_000 }),
+        session({ id: "s-hr", title: "两小时前", lastAt: now - 2 * 60 * 60_000 }),
+        session({ id: "s-day", title: "三天前", lastAt: now - 3 * 24 * 60 * 60_000 }),
+      ],
+    });
+    const age = (title: string) =>
+      screen.getByRole("button", { name: title }).closest("div")!.querySelector("[data-session-age]");
+    expect(age("刚更新")).toHaveTextContent("1m");
+    expect(age("五分钟前")).toHaveTextContent("5m");
+    expect(age("两小时前")).toHaveTextContent("2h");
+    expect(age("三天前")).toHaveTextContent("3d");
   });
 
   it("所有会话都没有 lastMessagePreview 时不渲染空白摘要行", () => {
@@ -766,7 +923,7 @@ describe("Sidebar 服务端搜索三态", () => {
 });
 
 describe("Sidebar 未读", () => {
-  it("未读会话标题加粗、行尾圆点，点击时 markRead", () => {
+  it("未读会话标题加粗、标题左侧唯一绿点，点击时 markRead", () => {
     const onMarkRead = vi.fn();
     const onSelect = vi.fn();
     renderSidebar({
@@ -777,7 +934,10 @@ describe("Sidebar 未读", () => {
     });
     const btn = screen.getByRole("button", { name: "季度复盘 Alpha" });
     expect(btn.querySelector(".font-semibold")).not.toBeNull();
-    expect(screen.getByRole("img", { name: "未读" })).toBeInTheDocument();
+    const dots = leadImgs("季度复盘 Alpha");
+    expect(dots).toHaveLength(1);
+    expect(dots[0]).toHaveAccessibleName("未读");
+    expect(dots[0]!.compareDocumentPosition(btn) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     fireEvent.click(btn);
     expect(onMarkRead).toHaveBeenCalledWith("s-alpha");
     expect(onSelect).toHaveBeenCalledWith("s-alpha");

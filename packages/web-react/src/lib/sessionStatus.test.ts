@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { deriveLiveTerminalFromMessages, resolveSessionStatus } from "./sessionStatus";
+import { deriveLiveTerminalFromMessages, resolveSessionStatus, resolveSidebarDot } from "./sessionStatus";
 
 describe("resolveSessionStatus", () => {
   it("运行中优先于任何终态（本 tab 正在发送必须立刻闪绿）", () => {
@@ -47,6 +47,34 @@ describe("resolveSessionStatus", () => {
         lastErrorCode: "rate_limited",
       }),
     ).toBe("completed");
+  });
+});
+
+describe("resolveSidebarDot", () => {
+  it("运行中始终是闪烁蓝点，盖过未读与终态", () => {
+    expect(resolveSidebarDot({ running: true, lastOutcome: "completed" }, true)).toBe("running");
+  });
+
+  it("异常结束是红点，已读也不消失", () => {
+    expect(resolveSidebarDot({ lastOutcome: "crashed" }, false)).toBe("error");
+    expect(resolveSidebarDot({ lastOutcome: "executed_error" }, true)).toBe("error");
+    expect(resolveSidebarDot({ lastOutcome: "not_accepted" })).toBe("error");
+  });
+
+  it("service_restart 保持琥珀，不染红、不因已读消失", () => {
+    expect(
+      resolveSidebarDot({ lastOutcome: "crashed", lastErrorCode: "SERVICE_RESTART" }, false),
+    ).toBe("service_restart");
+    expect(
+      resolveSidebarDot({ lastOutcome: "crashed", lastErrorCode: "SERVICE_RESTART" }, true),
+    ).toBe("service_restart");
+  });
+
+  it("正常结束仅未读时出绿点，已读不显示", () => {
+    expect(resolveSidebarDot({ lastOutcome: "completed" }, true)).toBe("unread");
+    expect(resolveSidebarDot({ lastOutcome: "interrupted" }, true)).toBe("unread");
+    expect(resolveSidebarDot({ lastOutcome: "completed" }, false)).toBe("none");
+    expect(resolveSidebarDot({ lastOutcome: "interrupted" })).toBe("none");
   });
 });
 

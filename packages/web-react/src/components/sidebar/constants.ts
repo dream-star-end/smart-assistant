@@ -17,3 +17,10 @@ export const PROJECT_DRAG_TYPE = "application/x-openclaude-project-id";
 
 export const PAGE_SIZE = 50;
 export const SEARCH_DEBOUNCE_MS = 250;
+
+/** 前端虚拟分组：无 projectId 的会话归入此组。不写入数据库。 */
+export const DEFAULT_PROJECT_ID = "__oc_virtual_default__";
+export const DEFAULT_PROJECT_NAME = "default";
+
+/** 侧栏时长统一刷新间隔。不要每秒重渲整个列表。 */
+export const SIDEBAR_AGE_TICK_MS = 30_000;

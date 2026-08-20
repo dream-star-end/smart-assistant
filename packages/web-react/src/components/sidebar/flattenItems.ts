@@ -1,5 +1,7 @@
 import type { ChatProject, Session, SessionSearchHit } from "../../lib/types";
 import {
+  DEFAULT_PROJECT_ID,
+  DEFAULT_PROJECT_NAME,
   GROUP_HEADER_HEIGHT,
   HINT_ROW_HEIGHT,
   PROJECT_ROW_HEIGHT,
@@ -33,6 +35,17 @@ export type FlattenInput = {
   searchRemote: "idle" | "loading" | "empty" | "error";
   localEmpty: boolean;
 };
+
+function virtualDefaultProject(count: number): ChatProject {
+  return {
+    id: DEFAULT_PROJECT_ID,
+    name: DEFAULT_PROJECT_NAME,
+    sortOrder: Number.MAX_SAFE_INTEGER,
+    createdAt: 0,
+    updatedAt: 0,
+    sessionCount: count,
+  };
+}
 
 export function flattenSidebarItems(input: FlattenInput): FlatItem[] {
   const sessionH = input.showPreview ? SESSION_ROW_HEIGHT_PREVIEW : SESSION_ROW_HEIGHT;
@@ -74,14 +87,6 @@ export function flattenSidebarItems(input: FlattenInput): FlatItem[] {
     return items;
   }
 
-  if (
-    input.sessions.length === 0 &&
-    input.archived.length === 0 &&
-    (!input.showProjects || input.projects.length === 0)
-  ) {
-    items.push({ kind: "hint", key: "empty-sessions", text: "暂无会话", height: HINT_ROW_HEIGHT + 28 });
-  }
-
   if (input.pinned.length > 0) {
     items.push({ kind: "header", key: "h-pinned", label: "置顶", height: GROUP_HEADER_HEIGHT });
     for (const s of input.pinned) {
@@ -91,9 +96,6 @@ export function flattenSidebarItems(input: FlattenInput): FlatItem[] {
 
   if (input.showProjects) {
     items.push({ kind: "header", key: "h-projects", label: "项目", height: GROUP_HEADER_HEIGHT });
-    if (input.projects.length === 0) {
-      items.push({ kind: "hint", key: "projects-empty", text: "还没有项目", height: HINT_ROW_HEIGHT });
-    }
     for (const p of input.projects) {
       const kids = input.projectSessions.get(p.id) ?? [];
       const count = input.sessions.filter((s) => s.projectId === p.id && !s.archived).length;
@@ -110,24 +112,27 @@ export function flattenSidebarItems(input: FlattenInput): FlatItem[] {
     }
   }
 
-  if (
-    input.sessions.some((s) => !s.archived) &&
-    input.ungroupedGroups.length === 0 &&
-    input.pinned.length === 0 &&
-    input.showProjects
-  ) {
-    items.push({
-      kind: "hint",
-      key: "no-ungrouped",
-      text: "没有未分组的会话",
-      height: HINT_ROW_HEIGHT,
-    });
-  }
-
-  for (const [label, list] of input.ungroupedGroups) {
-    if (label) items.push({ kind: "header", key: `h-${label}`, label, height: GROUP_HEADER_HEIGHT });
-    for (const s of list) {
-      items.push({ kind: "session", key: `s-${s.id}`, session: s, height: sessionH });
+  const defaultKids = input.ungroupedGroups.flatMap(([, list]) => list);
+  const defaultCollapsed = input.collapsedProjectIds?.has(DEFAULT_PROJECT_ID) ?? false;
+  items.push({
+    kind: "project",
+    key: `p-${DEFAULT_PROJECT_ID}`,
+    project: virtualDefaultProject(defaultKids.length),
+    count: defaultKids.length,
+    collapsed: defaultCollapsed,
+    height: PROJECT_ROW_HEIGHT,
+  });
+  if (!defaultCollapsed) {
+    if (defaultKids.length === 0) {
+      items.push({
+        kind: "hint",
+        key: `p-empty-${DEFAULT_PROJECT_ID}`,
+        text: "暂无会话",
+        height: HINT_ROW_HEIGHT,
+      });
+    }
+    for (const s of defaultKids) {
+      items.push({ kind: "session", key: `s-${s.id}`, session: s, indent: true, height: sessionH });
     }
   }
 

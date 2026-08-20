@@ -295,7 +295,7 @@ body {
     border-radius: 9999px;
     animation: oc-rating-nudge 1.4s ease-in-out 2;
   }
-  /* 侧栏「运行中」状态点呼吸。reduce 偏好下本块不生效 → 常亮绿点。 */
+  /* 侧栏「运行中」状态点呼吸。reduce 偏好下本块不生效 → 常亮 accent 点。 */
   @keyframes oc-session-running {
     0%, 100% { opacity: 1; }
     50% { opacity: 0.28; }

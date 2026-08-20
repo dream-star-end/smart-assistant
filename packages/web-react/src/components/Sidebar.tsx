@@ -23,13 +23,12 @@ import { BRAND } from "../lib/brand";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import type {
   ChatProject,
-  PublicModel,
   Session,
   SessionBatchAction,
   SessionSearchHit,
   User,
 } from "../lib/types";
-import { cn, formatCredits, groupLabel } from "../lib/utils";
+import { cn, formatCredits } from "../lib/utils";
 import { ThemeToggle } from "./ThemeToggle";
 import {
   Avatar,
@@ -43,7 +42,13 @@ import {
   IconButton,
 } from "./ui";
 import { BatchBar } from "./sidebar/BatchBar";
-import { PROJECT_DRAG_TYPE, SEARCH_DEBOUNCE_MS, VIRTUALIZE_THRESHOLD } from "./sidebar/constants";
+import {
+  DEFAULT_PROJECT_ID,
+  PROJECT_DRAG_TYPE,
+  SEARCH_DEBOUNCE_MS,
+  SIDEBAR_AGE_TICK_MS,
+  VIRTUALIZE_THRESHOLD,
+} from "./sidebar/constants";
 import { type FlatItem, flattenSidebarItems } from "./sidebar/flattenItems";
 import { HighlightedText } from "./sidebar/highlight";
 import { ProjectRow } from "./sidebar/ProjectRow";
@@ -109,7 +114,6 @@ export type SidebarProps = {
   width?: number;
   onResizeStart?: (e: ReactPointerEvent) => void;
   resizing?: boolean;
-  models?: PublicModel[];
   onArchive?: (s: Session) => void;
   onBatch?: (ids: string[], action: SessionBatchAction, projectId?: string | null) => void;
   onLoadMore?: () => void;
@@ -119,6 +123,8 @@ export type SidebarProps = {
   loadingArchived?: boolean;
   onSearchMessages?: (q: string, signal: AbortSignal) => Promise<SessionSearchHit[]>;
   virtualizeThreshold?: number;
+  /** 本 tab 正在跑的会话的本轮开始时刻；缺省则行内时长回落 lastAt。 */
+  runStartedAt?: (id: string) => number | undefined;
 };
 
 export function Sidebar({
@@ -163,7 +169,6 @@ export function Sidebar({
   width,
   onResizeStart,
   resizing,
-  models,
   onArchive,
   onBatch,
   onLoadMore,
@@ -173,8 +178,10 @@ export function Sidebar({
   loadingArchived,
   onSearchMessages,
   virtualizeThreshold = VIRTUALIZE_THRESHOLD,
+  runStartedAt,
 }: SidebarProps) {
   const [q, setQ] = useState("");
+  const [now, setNow] = useState(() => Date.now());
   const [dragOverProjectId, setDragOverProjectId] = useState<string | null>(null);
   const [archivedExpanded, setArchivedExpanded] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
@@ -185,6 +192,11 @@ export function Sidebar({
   const coarse = useCoarsePointer();
   const searching = q.trim().length > 0;
   const showProjects = Array.isArray(projects) && Boolean(onCreateProject);
+
+  useEffect(() => {
+    const t = window.setInterval(() => setNow(Date.now()), SIDEBAR_AGE_TICK_MS);
+    return () => window.clearInterval(t);
+  }, []);
 
   const orderedProjects = useMemo(() => {
     const list = projects ?? [];
@@ -239,13 +251,10 @@ export function Sidebar({
       });
       return items.length ? ([["搜索结果", items]] as [string, Session[]][]) : [];
     }
-    const map = new Map<string, Session[]>();
-    for (const s of filtered) {
-      if (pinnedIds.has(s.id) || s.projectId) continue;
-      const k = groupLabel(s.updatedAt);
-      (map.get(k) || map.set(k, []).get(k)!).push(s);
-    }
-    return [...map.entries()];
+    const list = filtered
+      .filter((s) => !pinnedIds.has(s.id) && !s.projectId)
+      .sort(byUpdatedDesc);
+    return list.length ? ([["", list]] as [string, Session[]][]) : [];
   }, [filtered, pinnedIds, searching]);
 
   const showPreview = useMemo(
@@ -430,6 +439,8 @@ export function Sidebar({
           indent={item.indent}
           isSending={isSending}
           liveTerminal={liveTerminal}
+          runStartedAt={runStartedAt}
+          now={now}
           onSelect={onSelect}
           onRename={onRename}
           onDelete={onDelete}
@@ -438,7 +449,6 @@ export function Sidebar({
           onArchive={onArchive}
           onMarkRead={onMarkRead}
           unread={unreadIds?.has(s.id)}
-          models={models}
           showPreview={showPreview}
           multiSelect={multiSelect}
           selected={selectedIds.has(s.id)}
@@ -453,6 +463,7 @@ export function Sidebar({
     }
     if (item.kind === "project") {
       const p = item.project;
+      const isDefault = p.id === DEFAULT_PROJECT_ID;
       const idx = orderedProjects.findIndex((x) => x.id === p.id);
       return (
         <ProjectRow
@@ -460,14 +471,15 @@ export function Sidebar({
           count={item.count}
           collapsed={item.collapsed}
           dropActive={dragOverProjectId === p.id}
-          allowDrag={!coarse && Boolean(onReorderProjects)}
-          showMoveInMenu={Boolean(onReorderProjects)}
-          canMoveUp={idx > 0}
-          canMoveDown={idx >= 0 && idx < orderedProjects.length - 1}
+          allowDrag={!isDefault && !coarse && Boolean(onReorderProjects)}
+          showMoveInMenu={!isDefault && Boolean(onReorderProjects)}
+          canMoveUp={!isDefault && idx > 0}
+          canMoveDown={!isDefault && idx >= 0 && idx < orderedProjects.length - 1}
+          immutable={isDefault}
           onToggle={onToggleProjectCollapsed}
-          onRename={onRenameProject}
-          onDelete={onDeleteProject}
-          onOpenSettings={onOpenProjectSettings}
+          onRename={isDefault ? undefined : onRenameProject}
+          onDelete={isDefault ? undefined : onDeleteProject}
+          onOpenSettings={isDefault ? undefined : onOpenProjectSettings}
           onMoveUp={() => moveProject(p.id, -1)}
           onMoveDown={() => moveProject(p.id, 1)}
           onDragOverSession={() => setDragOverProjectId(p.id)}
@@ -475,7 +487,7 @@ export function Sidebar({
           onDropSessionId={(id) => {
             setDragOverProjectId(null);
             const sess = sessions.find((x) => x.id === id);
-            if (sess && onMoveToProject) onMoveToProject(sess, p.id);
+            if (sess && onMoveToProject) onMoveToProject(sess, isDefault ? null : p.id);
           }}
           onProjectDragStart={(e) => {
             e.dataTransfer.setData(PROJECT_DRAG_TYPE, p.id);
@@ -483,7 +495,7 @@ export function Sidebar({
           }}
           onProjectDrop={(e) => {
             const from = e.dataTransfer.getData(PROJECT_DRAG_TYPE);
-            if (!from || from === p.id) return;
+            if (!from || from === p.id || from === DEFAULT_PROJECT_ID) return;
             const ids = orderedProjects.map((x) => x.id);
             const fromI = ids.indexOf(from);
             const toI = ids.indexOf(p.id);

@@ -37,6 +37,25 @@ export const SESSION_STATUS_LABELS: Record<Exclude<SessionStatusKind, "none">, s
   service_restart: "服务重启中断，可继续",
 };
 
+/** 侧栏行首唯一状态点。completed/interrupted 只在未读时出绿点；error / service_restart 不因已读消失。 */
+export type SidebarDotKind = "running" | "unread" | "error" | "service_restart" | "none";
+
+export const SIDEBAR_DOT_LABELS: Record<Exclude<SidebarDotKind, "none">, string> = {
+  running: "运行中",
+  unread: "未读",
+  error: "出错",
+  service_restart: "服务重启中断，可继续",
+};
+
+export function resolveSidebarDot(input: SessionStatusInput, unread?: boolean): SidebarDotKind {
+  const kind = resolveSessionStatus(input);
+  if (kind === "running") return "running";
+  if (kind === "error") return "error";
+  if (kind === "service_restart") return "service_restart";
+  if (unread) return "unread";
+  return "none";
+}
+
 export function resolveSessionStatus(input: SessionStatusInput): SessionStatusKind {
   if (input.running) return "running";
   const code = normalizeTurnErrorCode(input.lastErrorCode);

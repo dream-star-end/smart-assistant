@@ -22,6 +22,7 @@ export function ProjectRow({
   showMoveInMenu,
   canMoveUp,
   canMoveDown,
+  immutable,
   onToggle,
   onRename,
   onDelete,
@@ -43,6 +44,8 @@ export function ProjectRow({
   showMoveInMenu: boolean;
   canMoveUp: boolean;
   canMoveDown: boolean;
+  /** 虚拟 default 分组：可折叠、可接收会话，不可改名/删除/改色/拖拽排序。 */
+  immutable?: boolean;
   onToggle?: (id: string) => void;
   onRename?: (p: ChatProject) => void;
   onDelete?: (p: ChatProject) => void;
@@ -56,10 +59,11 @@ export function ProjectRow({
   onProjectDragOver?: (e: DragEvent) => void;
   onProjectDrop?: (e: DragEvent) => void;
 }) {
+  const canMutate = !immutable;
   return (
     <div
-      draggable={allowDrag}
-      onDragStart={onProjectDragStart}
+      draggable={canMutate && allowDrag}
+      onDragStart={canMutate ? onProjectDragStart : undefined}
       onDragOver={(e) => {
         const types = [...e.dataTransfer.types];
         if (types.includes(SESSION_DRAG_TYPE)) {
@@ -67,7 +71,7 @@ export function ProjectRow({
           onDragOverSession(e);
           return;
         }
-        if (allowDrag && types.includes(PROJECT_DRAG_TYPE)) {
+        if (canMutate && allowDrag && types.includes(PROJECT_DRAG_TYPE)) {
           e.preventDefault();
           onProjectDragOver?.(e);
         }
@@ -80,7 +84,7 @@ export function ProjectRow({
           onDropSessionId(sid);
           return;
         }
-        onProjectDrop?.(e);
+        if (canMutate) onProjectDrop?.(e);
       }}
       style={{ height: "100%" }}
       className={cn(
@@ -100,7 +104,7 @@ export function ProjectRow({
           <ChevronDown size={14} className="shrink-0 text-faint" />
         )}
         {(() => {
-          const swatch = PROJECT_COLORS.find((c) => c.key === p.color);
+          const swatch = !immutable && PROJECT_COLORS.find((c) => c.key === p.color);
           return swatch ? (
             <span aria-hidden className={cn("size-2.5 shrink-0 rounded-full", swatch.dotClass)} />
           ) : (
@@ -110,7 +114,7 @@ export function ProjectRow({
         <span className="min-w-0 flex-1 truncate">{p.name}</span>
         <span className="shrink-0 text-caption text-faint">{count}</span>
       </button>
-      {(onRename || onDelete || onOpenSettings || showMoveInMenu) && (
+      {canMutate && (onRename || onDelete || onOpenSettings || showMoveInMenu) && (
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <IconButton

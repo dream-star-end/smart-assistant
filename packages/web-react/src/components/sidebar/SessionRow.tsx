@@ -1,7 +1,8 @@
 import { Archive, Pin } from "lucide-react";
-import type { ChatProject, PublicModel, Session } from "../../lib/types";
+import type { ChatProject, Session } from "../../lib/types";
 import { cn } from "../../lib/utils";
 import { SessionStatusDot } from "../SessionStatusDot";
+import { formatDate } from "../ui/TimeAgo";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -15,7 +16,7 @@ import {
 } from "../ui";
 import { MoreHorizontal } from "lucide-react";
 import { SESSION_DRAG_TYPE } from "./constants";
-import { modelShortLabel } from "./modelShortLabel";
+import { formatCompactAge, sessionAgeTimestamp } from "./compactAge";
 
 export function SessionRow({
   session: s,
@@ -24,6 +25,8 @@ export function SessionRow({
   indent,
   isSending,
   liveTerminal,
+  runStartedAt,
+  now,
   onSelect,
   onRename,
   onDelete,
@@ -32,7 +35,6 @@ export function SessionRow({
   onArchive,
   onMarkRead,
   unread,
-  models,
   showPreview,
   multiSelect,
   selected,
@@ -46,6 +48,8 @@ export function SessionRow({
   indent?: boolean;
   isSending?: (id: string) => boolean;
   liveTerminal?: (id: string) => { lastOutcome?: string | null; lastErrorCode?: string | null } | undefined;
+  runStartedAt?: (id: string) => number | undefined;
+  now: number;
   onSelect: (id: string) => void;
   onRename: (s: Session) => void;
   onDelete: (s: Session) => void;
@@ -54,7 +58,6 @@ export function SessionRow({
   onArchive?: (s: Session) => void;
   onMarkRead?: (id: string) => void;
   unread?: boolean;
-  models?: PublicModel[];
   showPreview: boolean;
   multiSelect: boolean;
   selected: boolean;
@@ -66,7 +69,9 @@ export function SessionRow({
   const sending = Boolean(isSending?.(s.id));
   const running = sending || (s.runState === "running" && !live);
   const title = s.title || "新对话";
-  const shortModel = s.modelId ? modelShortLabel(s.modelId, models) : "";
+  const ageAt = sessionAgeTimestamp(s, running, runStartedAt?.(s.id));
+  const ageText = ageAt != null ? formatCompactAge(ageAt, now) : "";
+  const ageTitle = ageAt != null ? formatDate(ageAt, "datetime") : undefined;
 
   return (
     <div
@@ -85,22 +90,26 @@ export function SessionRow({
       {active && (
         <span aria-hidden className="absolute inset-y-1 left-0 w-0.5 rounded-full bg-accent" />
       )}
-      <label
-        className={cn(
-          "flex shrink-0 items-center pl-1",
-          multiSelect
-            ? "opacity-100"
-            : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 [@media(hover:none)]:hidden",
-        )}
-      >
-        <input
-          type="checkbox"
-          checked={selected}
-          onChange={() => onToggleSelected(s.id)}
-          aria-label={`选择 ${title}`}
-          className="size-3.5 accent-accent"
-        />
-      </label>
+      {multiSelect ? (
+        <label className="flex h-full min-h-11 min-w-11 shrink-0 items-center justify-center">
+          <input
+            type="checkbox"
+            checked={selected}
+            onChange={() => onToggleSelected(s.id)}
+            aria-label={`选择 ${title}`}
+            className="size-3.5 accent-accent"
+          />
+        </label>
+      ) : (
+        <span data-session-lead className="flex size-3.5 shrink-0 items-center justify-center">
+          <SessionStatusDot
+            running={running}
+            lastOutcome={live?.lastOutcome ?? s.lastOutcome}
+            lastErrorCode={live?.lastErrorCode ?? s.lastErrorCode}
+            unread={unread}
+          />
+        </span>
+      )}
       <button
         type="button"
         onClick={() => {
@@ -118,26 +127,14 @@ export function SessionRow({
           </span>
         )}
       </button>
-      {shortModel && (
+      {ageText && (
         <span
-          title={s.modelId}
-          className="hidden max-w-[4.5rem] shrink-0 truncate text-[11px] text-faint md:inline"
+          title={ageTitle}
+          data-session-age
+          className="shrink-0 tabular-nums text-[11px] text-faint"
         >
-          {shortModel}
+          {ageText}
         </span>
-      )}
-      <SessionStatusDot
-        running={running}
-        lastOutcome={live?.lastOutcome ?? s.lastOutcome}
-        lastErrorCode={live?.lastErrorCode ?? s.lastErrorCode}
-      />
-      {unread && (
-        <span
-          role="img"
-          aria-label="未读"
-          title="未读"
-          className="inline-block size-1.5 shrink-0 rounded-full bg-accent"
-        />
       )}
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
