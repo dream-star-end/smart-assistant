@@ -55,6 +55,7 @@ import {
   incrAnthropicProxyReject,
 } from "../../admin/metrics.js";
 import { recordProviderHealthSample } from "./providerHealthSink.js";
+import { recordUpstreamPerformance } from "../../ws/turnPerformance.js";
 import { findRouteProviderForModel } from "@openclaude/protocol";
 import {
   clearProviderQuotaBlock,
@@ -400,6 +401,18 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
       observeAnthropicProxyTtft(body.model, (result.firstByteAtMs - fetchStartMs) / 1000);
     }
     observeAnthropicProxyStreamDuration(body.model, (streamEndMs - fetchStartMs) / 1000);
+    recordUpstreamPerformance(
+      pgPool,
+      (message, fields) => userLog.warn(message, fields),
+      {
+        requestId,
+        userId: uid,
+        model: body.model,
+        ttftMs: result.firstByteAtMs === null ? null : result.firstByteAtMs - fetchStartMs,
+        streamMs: streamEndMs - fetchStartMs,
+        outcome: result.error === null ? "success" : "error",
+      },
+    );
     try {
       res.end();
     } catch {
@@ -516,6 +529,18 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
       recordProviderHealthSample(body.model, "timeout"); // fetch 抛错:超时/DNS/socket = provider 不可达
     }
     incrAnthropicProxySettle("aborted");
+    recordUpstreamPerformance(
+      pgPool,
+      (message, fields) => userLog.warn(message, fields),
+      {
+        requestId,
+        userId: uid,
+        model: body.model,
+        ttftMs: null,
+        streamMs: null,
+        outcome: isClientAbort(err) ? "aborted" : "error",
+      },
+    );
     // 字节是否已 flush 决定怎么发错误
     if (!res.headersSent) {
       sendJsonError(res, 500, "INTERNAL", "internal error", requestId);

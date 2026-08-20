@@ -4,7 +4,7 @@
  *
  * Call `startEventPersistence()` once during gateway boot.
  */
-import { insertEvent, insertUsageLog } from '@openclaude/storage'
+import { insertEvent, insertUsageLog, pruneLocalObservability } from '@openclaude/storage'
 import type { GatewayEvent, TurnCompletedEvent, CostRecordedEvent } from '@openclaude/protocol'
 import { eventBus } from './eventBus.js'
 import { createLogger } from './logger.js'
@@ -13,6 +13,41 @@ const log = createLogger({ module: 'eventPersist' })
 
 /** User-facing channels — internal session types (cron, webhook, task, delegation) are excluded. */
 const USER_CHANNELS = new Set(['webchat', 'telegram', 'wechat', 'feishu', 'openai'])
+
+const DAY_MS = 24 * 60 * 60 * 1000
+let retentionStarted = false
+
+function retentionDays(name: string, fallback: number): number {
+  const value = Number(process.env[name] ?? fallback)
+  return Number.isInteger(value) && value >= 1 && value <= 3650 ? value : fallback
+}
+
+export function serializeEventForPersistence(ev: GatewayEvent): string {
+  if (ev.type !== 'tool.called' || process.env.OC_REDACT_TOOL_EVENT_PREVIEWS !== '1') {
+    return JSON.stringify(ev)
+  }
+  const { inputPreview: _input, outputPreview: _output, ...safe } = ev
+  return JSON.stringify(safe)
+}
+
+function startRetention(): void {
+  if (retentionStarted || process.env.OC_LOCAL_OBSERVABILITY_RETENTION !== '1') return
+  retentionStarted = true
+  const sweep = () => {
+    const now = Date.now()
+    void pruneLocalObservability({
+      eventBeforeMs: now - retentionDays('OC_LOCAL_EVENT_RETENTION_DAYS', 30) * DAY_MS,
+      usageBeforeMs: now - retentionDays('OC_LOCAL_USAGE_RETENTION_DAYS', 365) * DAY_MS,
+    }).then((stats) => {
+      if (stats.previewsScrubbed || stats.eventsDeleted || stats.usageDeleted) {
+        log.info('local observability retention sweep', stats)
+      }
+    }).catch((err) => log.warn('local observability retention sweep failed', {}, err))
+  }
+  sweep()
+  const timer = setInterval(sweep, DAY_MS)
+  timer.unref?.()
+}
 
 /**
  * Extract peerId and channel from a sessionKey.
@@ -32,6 +67,7 @@ function extractPeerFromSessionKey(sk?: string): { peerId?: string; channel?: st
 }
 
 export function startEventPersistence(): void {
+  startRetention()
   eventBus.on('*', (ev: GatewayEvent) => {
     // Extract peer/channel from sessionKey for audit trail
     const { peerId, channel } = extractPeerFromSessionKey(ev.sessionKey)
@@ -44,7 +80,7 @@ export function startEventPersistence(): void {
       agentId: ev.agentId,
       sessionKey: ev.sessionKey,
       schemaVersion: ev.schemaVersion,
-      payload: JSON.stringify(ev),
+      payload: serializeEventForPersistence(ev),
       peerId,
       channel,
     }).catch((err) => {

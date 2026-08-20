@@ -2468,6 +2468,8 @@ export class ChatSocket {
         type: "inbound.hello",
         channel: "webchat",
         automaticRecoveryOwner: "master-v1",
+        clientBuild:
+          document.querySelector<HTMLMetaElement>('meta[name="oc-build"]')?.content || undefined,
         peers,
       }),
       attemptKeys,

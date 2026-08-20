@@ -7,7 +7,7 @@
  * 语义边界见迁移 0121 头注释:与 feedback(自由文本问题上报)语义不同,勿混用。
  */
 
-import { query } from "./db/queries.js";
+import { query, tx, type QueryRunner } from "./db/queries.js";
 import { incrImplicitRatingOverridden } from "./admin/metrics.js";
 import type { SignalTrafficClass } from "./analytics/signalTraffic.js";
 
@@ -48,11 +48,15 @@ export function isImplicitRating(tags: string[]): boolean {
  */
 export async function upsertResponseRating(input: UpsertResponseRatingInput): Promise<void> {
   const incomingImplicit = isImplicitRating(input.tags);
-  const traceId = await resolveResponseRatingTrace(input);
-  // existing CTE 在 upsert 之前对同一 (user,message) 读旧行的隐式态(语句快照 → 读到的是
-  // 旧值,看不到 upserted 的写入);upserted 保持原 INSERT..ON CONFLICT 语义不变,
-  // RETURNING 1 让 did_write 反映"确有写入"(隐式来件命中显式行时 WHERE 为假 → 0 行 → false)。
-  const r = await query<{ was_implicit: boolean | null; did_write: boolean }>(
+  const row = await tx(async (client) => {
+    await client.query(
+      "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+      [`response-rating:${input.userId}:${input.messageId}`],
+    );
+    const attribution = await resolveResponseRatingAttribution(input, client);
+    // The second statement gets a fresh READ COMMITTED snapshot after the lock,
+    // serializing rating-vs-exposure races across tabs/devices.
+    const r = await query<{ was_implicit: boolean | null; did_write: boolean }>(
     `WITH existing AS (
        SELECT ($10 = ANY(tags)) AS was_implicit
          FROM response_rating
@@ -60,8 +64,8 @@ export async function upsertResponseRating(input: UpsertResponseRatingInput): Pr
      ),
      upserted AS (
        INSERT INTO response_rating
-         (user_id, session_id, message_id, trace_id, model, rating, tags, comment)
-       VALUES ($1::bigint, $2, $3, $4, $5, $6, $7::text[], $8)
+         (user_id,session_id,message_id,trace_id,model,rating,tags,comment,dispatch_id)
+       VALUES ($1::bigint,$2,$3,$4,$5,$6,$7::text[],$8,$11)
        ON CONFLICT (user_id, message_id) DO UPDATE
          SET rating     = EXCLUDED.rating,
              tags       = EXCLUDED.tags,
@@ -69,8 +73,15 @@ export async function upsertResponseRating(input: UpsertResponseRatingInput): Pr
              model      = EXCLUDED.model,
              trace_id   = EXCLUDED.trace_id,
              session_id = EXCLUDED.session_id,
+             dispatch_id = COALESCE(EXCLUDED.dispatch_id,response_rating.dispatch_id),
              updated_at = NOW()
          WHERE NOT $9::boolean OR $10 = ANY(response_rating.tags)
+       RETURNING 1
+     ), nudge_updated AS (
+       UPDATE response_rating_nudges
+          SET state='rated',rated_at=COALESCE(rated_at,NOW()),updated_at=NOW()
+        WHERE user_id=$1::bigint AND message_id=$3
+          AND NOT $9::boolean AND EXISTS (SELECT 1 FROM upserted)
        RETURNING 1
      )
      SELECT (SELECT was_implicit FROM existing) AS was_implicit,
@@ -79,30 +90,34 @@ export async function upsertResponseRating(input: UpsertResponseRatingInput): Pr
       input.userId,
       input.sessionId,
       input.messageId,
-      traceId,
+      attribution.traceId,
       input.model,
       input.rating,
       input.tags, // node-pg 把 JS string[] 序列化为 PG text[] 字面量
       input.comment,
       incomingImplicit,
       IMPLICIT_RATING_TAG,
+      attribution.dispatchId,
     ],
-  );
+      client,
+    );
+    return r.rows[0];
+  });
   // E7 误伤率活体指标:显式来件(incomingImplicit=false)覆盖了原本 implicit 的行 →
   // 用户主动纠正了一次隐式误判(误伤),打点。隐式来件不计(它压根不能覆盖显式)。
-  const row = r.rows[0];
   if (!incomingImplicit && row?.did_write === true && row.was_implicit === true) {
     incrImplicitRatingOverridden();
   }
 }
 
-async function resolveResponseRatingTrace(
+async function resolveResponseRatingAttribution(
   input: Pick<
     UpsertResponseRatingInput,
     "userId" | "sessionId" | "messageId" | "traceId"
   >,
-): Promise<string | null> {
-  const result = await query<{ trace_id: string }>(
+  runner?: QueryRunner,
+): Promise<{ traceId: string | null; dispatchId: string | null }> {
+  const result = await query<{ trace_id: string; dispatch_id: string | null }>(
     `WITH candidates AS (
        SELECT t.trace_id, 0 AS priority
          FROM turn_traces t
@@ -122,15 +137,19 @@ async function resolveResponseRatingTrace(
           AND r.session_id=$2
           AND r.msg_id=$3
      )
-     SELECT c.trace_id
+     SELECT c.trace_id,t.dispatch_id
        FROM candidates c
        JOIN turn_traces t ON t.trace_id=c.trace_id AND t.user_id=$1::bigint
       WHERE c.trace_id IS NOT NULL
       ORDER BY c.priority
       LIMIT 1`,
     [input.userId, input.sessionId, input.messageId, input.traceId],
+    runner,
   );
-  return result.rows[0]?.trace_id ?? null;
+  return {
+    traceId: result.rows[0]?.trace_id ?? null,
+    dispatchId: result.rows[0]?.dispatch_id ?? null,
+  };
 }
 
 // ─── 用户侧:按会话回读该用户所有评分(前端"已评状态"恢复)──────────────
@@ -159,6 +178,74 @@ export async function listSessionRatings(
     out[row.message_id] = { rating: row.rating, tags: row.tags ?? [] };
   }
   return out;
+}
+
+export type ResponseRatingNudgeState = "exposed" | "rated" | "dismissed";
+
+export async function upsertResponseRatingNudge(input: {
+  userId: string;
+  messageId: string;
+  sessionId: string | null;
+  traceId: string | null;
+  clientBuild: string | null;
+  sampleBucket: number;
+  action: "expose" | "dismiss";
+}): Promise<{ state: ResponseRatingNudgeState; newlyExposed: boolean }> {
+  return tx(async (client) => {
+    await client.query(
+      "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+      [`response-rating:${input.userId}:${input.messageId}`],
+    );
+    const attribution = await resolveResponseRatingAttribution(input, client);
+    if (input.action === "expose") {
+      const inserted = await query<{ state: ResponseRatingNudgeState }>(
+      `INSERT INTO response_rating_nudges
+         (user_id,message_id,session_id,trace_id,dispatch_id,state,sample_bucket,
+          client_build,exposed_at,updated_at)
+       SELECT $1::bigint,$2,$3,$4,$5,'exposed',$6,$7,NOW(),NOW()
+        WHERE NOT EXISTS (
+          SELECT 1 FROM response_rating WHERE user_id=$1::bigint AND message_id=$2
+        )
+       ON CONFLICT (user_id,message_id) DO NOTHING
+       RETURNING state`,
+        [input.userId,input.messageId,input.sessionId,attribution.traceId,
+          attribution.dispatchId,input.sampleBucket,input.clientBuild],
+        client,
+      );
+      if (inserted.rows[0]) return { state: inserted.rows[0].state, newlyExposed: true };
+    } else {
+      await query(
+      `UPDATE response_rating_nudges
+          SET state=CASE WHEN state='exposed' THEN 'dismissed' ELSE state END,
+              dismissed_at=CASE
+                WHEN state='exposed' THEN COALESCE(dismissed_at,NOW()) ELSE dismissed_at
+              END,
+              updated_at=NOW()
+        WHERE user_id=$1::bigint AND message_id=$2`,
+        [input.userId,input.messageId],
+        client,
+      );
+    }
+    const existing = await query<{ state: ResponseRatingNudgeState }>(
+    `SELECT state FROM response_rating_nudges
+      WHERE user_id=$1::bigint AND message_id=$2`,
+      [input.userId,input.messageId],
+      client,
+    );
+    return { state: existing.rows[0]?.state ?? "dismissed", newlyExposed: false };
+  });
+}
+
+export async function listSessionRatingNudges(
+  userId: string,
+  sessionId: string,
+): Promise<Record<string, ResponseRatingNudgeState>> {
+  const result = await query<{ message_id: string; state: ResponseRatingNudgeState }>(
+    `SELECT message_id,state FROM response_rating_nudges
+      WHERE user_id=$1::bigint AND session_id=$2`,
+    [userId, sessionId],
+  );
+  return Object.fromEntries(result.rows.map((row) => [row.message_id, row.state]));
 }
 
 // ─── admin 侧:按模型 + 时间窗好评率统计 ─────────────────────────────

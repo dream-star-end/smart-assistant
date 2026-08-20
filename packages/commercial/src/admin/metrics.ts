@@ -22,7 +22,7 @@
  *
  * v3 cold-start observability:
  *   - container_ensure_duration_seconds{kind}              histogram (cold=provision, warm=reuse)
- *   - ws_bridge_ttft_seconds{kind}                         histogram (first user→container frame to first container→user frame)
+ *   - ws_bridge_ttft_seconds{kind}                         histogram (first user frame to first user-visible outbound.message block)
  *
  * ### 设计取舍
  *   - 不引 `prom-client`:依赖小 + 我们只要十几个系列,手搓可控(2I-2 加 Histogram 类)
@@ -40,6 +40,10 @@
 
 import type { Pool } from "pg";
 import { query } from "../db/queries.js";
+import {
+  durableMetricDroppedSeriesTotal,
+  observeDurableHistogram,
+} from "./durableMetricRollups.js";
 
 // ─── label normalization ─────────────────────────────────────────────
 
@@ -456,7 +460,7 @@ export const containerEnsureDuration = new Histogram(
 export const wsBridgeTtft = new Histogram(
   {
     name: "ws_bridge_ttft_seconds",
-    help: "First user frame to first container frame in user-chat-bridge (seconds), labeled by kind from endpoint.coldStart. Note: kind=warm does not strictly mean the user did not experience a cold start (provision+readiness retry can mislabel; trade-off accepted).",
+    help: "First user frame to first user-visible outbound.message block in user-chat-bridge (seconds), labeled by kind from endpoint.coldStart. ACK/status/billing/attestation frames are excluded.",
     labelNames: ["kind"], // cold | warm
   },
   TTFT_BRIDGE_BUCKETS,
@@ -517,10 +521,17 @@ export function incrV3SinkPersist(
 
 export function observeAnthropicProxyTtft(model: string, seconds: number): void {
   anthropicProxyTtft.observe({ model: shortModel(model) }, seconds);
+  observeDurableHistogram("anthropic_proxy_ttft_seconds", model, TTFT_BUCKETS, seconds);
 }
 
 export function observeAnthropicProxyStreamDuration(model: string, seconds: number): void {
   anthropicProxyStreamDuration.observe({ model: shortModel(model) }, seconds);
+  observeDurableHistogram(
+    "anthropic_proxy_stream_duration_seconds",
+    model,
+    STREAM_DURATION_BUCKETS,
+    seconds,
+  );
 }
 
 export type SettleKind = "final" | "partial" | "aborted";
@@ -622,10 +633,17 @@ export type ColdWarmKind = "cold" | "warm";
 
 export function observeContainerEnsureDuration(kind: ColdWarmKind, seconds: number): void {
   containerEnsureDuration.observe({ kind }, seconds);
+  observeDurableHistogram(
+    "container_ensure_duration_seconds",
+    kind,
+    COLDSTART_BUCKETS,
+    seconds,
+  );
 }
 
 export function observeWsBridgeTtft(kind: ColdWarmKind, seconds: number): void {
   wsBridgeTtft.observe({ kind }, seconds);
+  observeDurableHistogram("ws_bridge_ttft_seconds", kind, TTFT_BRIDGE_BUCKETS, seconds);
 }
 
 /**
@@ -743,6 +761,9 @@ export async function renderPrometheus(deps: CollectDeps = {}): Promise<string> 
   containerEnsureDuration.render(out);
   wsBridgeTtft.render(out);
   v3SinkPersist.render(out);
+  out.push("# HELP telemetry_rollup_dropped_series_total Durable metric observations dropped by the per-bucket series cap");
+  out.push("# TYPE telemetry_rollup_dropped_series_total counter");
+  out.push("telemetry_rollup_dropped_series_total " + durableMetricDroppedSeriesTotal());
   // gauges 走 collector
   accountPoolHealth.render(out);
   agentRunning.render(out);

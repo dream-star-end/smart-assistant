@@ -104,6 +104,7 @@ import {
   findStopTarget,
   type ImplicitTarget,
   isExpensiveTurn,
+  ratingNudgeBucket,
 } from "./lib/implicitFeedback";
 import { CONTINUE_PROMPT } from "./lib/chat/render";
 import { deriveLiveTerminalFromMessages } from "./lib/sessionStatus";
@@ -1696,6 +1697,7 @@ export function App() {
   // 每条 AssistantCard 底部的 ResponseRatingCard。切会话/加载后由 GET 回读已评态填充（见下方
   // effect）；提交时乐观同步更新 + 静默 POST（维护期 503 / 限流 / 网络失败一律吞，不打断）。
   const [sessionRatings, setSessionRatings] = useState<Map<string, RatingEntry>>(() => new Map());
+  const [sessionNudges, setSessionNudges] = useState<Map<string, 'exposed' | 'rated' | 'dismissed'>>(() => new Map());
   // 隐式负反馈上报去重：本会话运行内已隐式上报过的 messageId（切会话时清），防同一条重复 POST。
   const implicitReportedRef = useRef<Set<string>>(new Set());
   // 方案 a：高成本 turn 完成后对评分行做一次性脉冲高亮（4s）。nudgeId 经 ratingCtx 下发；
@@ -1719,6 +1721,11 @@ export function App() {
         const prevEntry = next.get(input.messageId);
         const tags = input.tags ?? (prevEntry?.rating === input.rating ? prevEntry.tags : []);
         next.set(input.messageId, { rating: input.rating, tags });
+        return next;
+      });
+      setSessionNudges((prev) => {
+        const next = new Map(prev);
+        if (next.has(input.messageId)) next.set(input.messageId, "rated");
         return next;
       });
       void api
@@ -1948,6 +1955,7 @@ export function App() {
   const ratingsEnabled = !demo && !!user;
   useEffect(() => {
     setSessionRatings(new Map());
+    setSessionNudges(new Map());
     // 切会话：清隐式上报去重集 + 收起任何未散的评分脉冲高亮（旧 nudgeId 属上个会话）。
     implicitReportedRef.current = new Set();
     setRatingNudgeId(null);
@@ -1959,15 +1967,16 @@ export function App() {
     let cancelled = false;
     api
       .getSessionRatings(authRef.current, activeId)
-      .then((map) => {
+      .then((snapshot) => {
         if (cancelled) return;
         const next = new Map<string, RatingEntry>();
-        for (const [mid, v] of Object.entries(map)) {
+        for (const [mid, v] of Object.entries(snapshot.ratings)) {
           if (v && (v.rating === "up" || v.rating === "down")) {
             next.set(mid, { rating: v.rating, tags: Array.isArray(v.tags) ? v.tags : [] });
           }
         }
         setSessionRatings(next);
+        setSessionNudges(new Map(Object.entries(snapshot.nudges)));
       })
       .catch(() => {
         /* 静默:503 维护 / 网络失败——无已评高亮,不影响新评。*/
@@ -2007,26 +2016,48 @@ export function App() {
     }
     if (demo || !activeId) return;
     const msgs = sockRef.current?.getMessages(activeId) ?? [];
-    if (!isExpensiveTurn(msgs)) return;
+    const expensive = isExpensiveTurn(msgs);
     // 轮末条 assistant 正文 = 评价行唯一落点（turnFinalAssistantFlags 最后一个 true）。
     const flags = turnFinalAssistantFlags(msgs);
     let idx = -1;
     for (let i = flags.length - 1; i >= 0; i--) {
-      if (flags[i]) {
-        idx = i;
-        break;
-      }
+      if (flags[i]) { idx = i; break; }
     }
     if (idx < 0) return;
-    const id = msgs[idx]?.id;
-    if (!id || sessionRatings.has(id)) return; // 已显式评过 → 不打扰
-    if (nudgeTimerRef.current) clearTimeout(nudgeTimerRef.current);
-    setRatingNudgeId(id);
-    nudgeTimerRef.current = setTimeout(() => {
-      setRatingNudgeId(null);
-      nudgeTimerRef.current = null;
-    }, 4000);
-  }, [sending, demo, activeId, sessionRatings]);
+    const message = msgs[idx];
+    const id = message?.id;
+    if (!id || sessionRatings.has(id) || sessionNudges.has(id)) return;
+    const sampleBucket = ratingNudgeBucket(id);
+    if (!expensive && sampleBucket !== 0) return;
+    const traceId = message?.usage?.traceId ?? undefined;
+    const clientBuild = document.querySelector<HTMLMetaElement>('meta[name="oc-build"]')?.content || undefined;
+    void api.submitResponseRatingNudge(authRef.current, {
+      messageId: id,
+      sessionId: activeId,
+      traceId,
+      clientBuild,
+      sampleBucket,
+      nudgeAction: "expose",
+    }).then((result) => {
+      if (!result.newlyExposed || result.state !== "exposed") return;
+      setSessionNudges((prev) => new Map(prev).set(id, "exposed"));
+      if (nudgeTimerRef.current) clearTimeout(nudgeTimerRef.current);
+      setRatingNudgeId(id);
+      nudgeTimerRef.current = setTimeout(() => {
+        setRatingNudgeId(null);
+        nudgeTimerRef.current = null;
+        setSessionNudges((prev) => new Map(prev).set(id, "dismissed"));
+        void api.submitResponseRatingNudge(authRef.current, {
+          messageId: id,
+          sessionId: activeId,
+          traceId,
+          clientBuild,
+          sampleBucket,
+          nudgeAction: "dismiss",
+        }).catch(() => {});
+      }, 4000);
+    }).catch(() => {});
+  }, [sending, demo, activeId, sessionRatings, sessionNudges]);
 
   // 卸载兜底：清未散的脉冲定时器，防泄漏。
   useEffect(

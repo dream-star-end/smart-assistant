@@ -816,6 +816,14 @@ OC_PREHEAT_DISABLED=1
 OC_IMAGE_DISTRIBUTE_DISABLED=1
 OC_MIGRATION_RECONCILER_DISABLED=1
 OC_HEALTH_POLLER_DISABLED=1
+# Privacy-safe continuous-iteration telemetry. No raw prompt/tool output leaves the container.
+OC_TOOL_FAILURE_AUDIT=1
+OC_SKILL_SHADOW_SAMPLE_RATE=0.1
+OC_DURABLE_METRIC_ROLLUPS=1
+OC_LOCAL_OBSERVABILITY_RETENTION=1
+OC_LOCAL_EVENT_RETENTION_DAYS=30
+OC_LOCAL_USAGE_RETENTION_DAYS=365
+OC_REDACT_TOOL_EVENT_PREVIEWS=1
 EOF
   append_provider_keys "$tmp"
   mkdir -p "$(dirname "$V5_ENV")"
@@ -894,7 +902,14 @@ ensure_selfhost_env_keys() {
   ensure_env_kv "$V5_ENV" OC_PLATFORM_ROOT "$OC_HOTCFG_PLATFORM_ROOT"
   ensure_env_kv "$V5_ENV" OC_RUNTIME_RELEASES_ROOT "$OC_HOTCFG_RELEASES_ROOT"
   ensure_env_kv "$V5_ENV" OC_SESSIONS_STORE pg
-  log "  ✓ OC_PLATFORM_ROOT / OC_RUNTIME_RELEASES_ROOT / OC_SESSIONS_STORE=pg"
+  ensure_env_kv "$V5_ENV" OC_TOOL_FAILURE_AUDIT 1
+  ensure_env_kv "$V5_ENV" OC_SKILL_SHADOW_SAMPLE_RATE 0.1
+  ensure_env_kv "$V5_ENV" OC_DURABLE_METRIC_ROLLUPS 1
+  ensure_env_kv "$V5_ENV" OC_LOCAL_OBSERVABILITY_RETENTION 1
+  ensure_env_kv "$V5_ENV" OC_LOCAL_EVENT_RETENTION_DAYS 30
+  ensure_env_kv "$V5_ENV" OC_LOCAL_USAGE_RETENTION_DAYS 365
+  ensure_env_kv "$V5_ENV" OC_REDACT_TOOL_EVENT_PREVIEWS 1
+  log "  ✓ 制品根 / PG sessions / privacy-safe telemetry keys"
 }
 
 ensure_worktree_complete() {
@@ -1507,6 +1522,7 @@ $dirty
     log "$dirty"
   fi
   [[ -f "$V5_ENV" ]] || die "缺 $V5_ENV,这不是更新路径。补救: 首次安装走 --bootstrap;本机已有实例则检查 env 是否被挪走。"
+  ensure_selfhost_env_keys
   docker network inspect openclaude-v5-net >/dev/null 2>&1 \
     || die "openclaude-v5-net 不存在。补救: 不要在 --deploy 里建网;确认 bootstrap 做过或手工恢复该网。"
   [[ -L "$MASTER_LIVE_LINK" ]] \

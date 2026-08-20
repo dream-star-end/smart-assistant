@@ -20,6 +20,16 @@ import { currentTurnStartIndex } from "../components/chat/turnSegment";
 /** 命中的隐式反馈目标:评价行所在的 messageId + best-effort per-turn traceId（可空）。 */
 export type ImplicitTarget = { messageId: string; traceId: string | null };
 
+/** Stable 10-way sampling. Same response id gets the same bucket on every device. */
+export function ratingNudgeBucket(messageId: string): number {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < messageId.length; i += 1) {
+    hash ^= messageId.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0) % 10;
+}
+
 /** 改写重发窗口:超过则视为"新问题"而非"对上一轮不满"。 */
 const REWRITE_WINDOW_MS = 5 * 60 * 1000;
 /** 秒停过滤窗口:发出后极短时间内 Stop 多为手滑/误触,不采集。 */

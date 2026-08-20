@@ -47,6 +47,10 @@ import { verifyAccess, JwtError, type AccessClaims } from "../auth/jwt.js";
 import { ConnectionRegistry, type Conn } from "./connections.js";
 import type { Logger } from "../logging/logger.js";
 import { recordTurnTrace, updateTurnTraceDispatch } from "./turnTraces.js";
+import {
+  extractFirstVisibleAttribution,
+  recordTurnFirstVisible,
+} from "./turnPerformance.js";
 import { GoalStateError } from "../goal/goalStateService.js";
 import { isInMaintenance } from "../middleware/maintenanceMode.js";
 import type { NodeAgentTarget } from "../compute-pool/nodeAgentClient.js";
@@ -2354,7 +2358,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
   function startBridge(
     userWs: WebSocket,
     uid: bigint,
-    endpoint: { host: string; port: number; coldStart?: boolean },
+    endpoint: { host: string; port: number; coldStart?: boolean; bundleRev?: string },
     earlyMessages: Array<{ data: RawData; isBinary: boolean; receivedAtMs: number }>,
     /**
      * 可选 agent_containers.id。来自 ResolveContainerEndpoint;v3 supervisor
@@ -2456,11 +2460,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     // - 守卫 firstUserFrameAtMs !== null 是防御"容器在用户发帧前主动 push"导致负值
     let firstUserFrameAtMs: number | null = null;
     let firstContainerFrameAtMs: number | null = null;
+    const firstVisibleTraceIds = new Set<string>();
     const ttftKind: "cold" | "warm" = endpoint.coldStart === true ? "cold" : "warm";
     // plan v3 review v1 §F4 follow-up:per-bridge 最后一次"用户主动声明"的 modelId。
     // 用于在没带 model 字段的后续帧上仍然能用对应 model 校验 grants(防在飞会话
     // 被撤销后还能继续发字)。null = 本桥还没收过任何带 model 的帧。
     let lastSeenModelId: string | null = null;
+    let clientBuildForConnection: string | null = null;
     // 周期 refresh modelChecker 的定时器;cleanup() 务必清掉。
     let modelCheckerRefreshTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -3930,6 +3936,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       ingress: "browser" | "prompt_queue" | "recovery" = "browser",
       dispatchRequest?: PromptQueueDispatchRequest,
       recoveryJob?: ClaimedRecoveryJob,
+      receivedAtMs = Date.now(),
     ): void => {
       const isPromptQueueDispatch = ingress === "prompt_queue";
       let promptQueueResolved = false;
@@ -4351,6 +4358,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           ) {
             const helloPeers = (parsed as { peers?: unknown }).peers;
             const peers = Array.isArray(helloPeers) ? helloPeers : [];
+            const rawClientBuild = (parsed as { clientBuild?: unknown }).clientBuild;
+            if (typeof rawClientBuild === "string" && /^[0-9a-f]{8,32}$/.test(rawClientBuild)) {
+              clientBuildForConnection = rawClientBuild;
+            }
             const visiblePeers = peers.filter((p) => {
               if (typeof p !== "object" || p === null) return true;
               return (p as { agentId?: unknown }).agentId !== HIDDEN_REVIEWER_AGENT_ID;
@@ -4725,6 +4736,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             //   - 合法 → 进 log
             //   - 非法且 raw !== undefined → 只记 issue 不带 raw(MAJOR 2 防 log injection)
             //     且从 forward 给容器的 frame 中 **strip 掉**(防 raw 进入下游 logger)
+            if (firstUserFrameAtMs === null) firstUserFrameAtMs = receivedAtMs;
             turnTraceIdForFrame = newTraceId();
             const rawClientTrace = (parsed as { clientTraceId?: unknown }).clientTraceId;
             const clientHint = parseTraceIdCandidate(rawClientTrace);
@@ -4826,6 +4838,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   sessionKey: traceSessionKey,
                   agentId: effectiveFrameAgentId,
                   model: effectiveModelForFrame,
+                  bundleRev: endpoint.bundleRev ?? null,
+                  clientBuild: clientBuildForConnection,
                 },
               );
             }
@@ -6148,8 +6162,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       if (passthroughForward instanceof Promise) void passthroughForward;
     };
 
-    const onUserMessage = (data: RawData, isBinary: boolean): void => {
-      executeAdmittedTurn(data, isBinary, "browser");
+    const onUserMessage = (
+      data: RawData,
+      isBinary: boolean,
+      receivedAtMs = Date.now(),
+    ): void => {
+      executeAdmittedTurn(data, isBinary, "browser", undefined, undefined, receivedAtMs);
     };
 
     /**
@@ -6169,7 +6187,6 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
      * 立刻判定(同步上下文),已在调用本函数前完成。本函数只关心"放行后的物理转发"。
      */
     function forwardInboundFrame(data: RawData, isBinary: boolean, len: number): boolean {
-      if (firstUserFrameAtMs === null) firstUserFrameAtMs = Date.now();
       if (markActivity && containerId !== undefined) {
         const now = Date.now();
         if (now - lastActivityRefreshAt >= ACTIVITY_REFRESH_INTERVAL_MS) {
@@ -6593,13 +6610,6 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         }
         return;
       }
-      // Bridge TTFT 终点:首个 container→user 帧。
-      // 守卫 firstUserFrameAtMs !== null 防御容器在用户发帧前主动 push(理论不发生,
-      // 但保险 — 否则会算负值/无意义观测)。oversize 拒绝路径已 return,不会走到这。
-      if (firstContainerFrameAtMs === null && firstUserFrameAtMs !== null) {
-        firstContainerFrameAtMs = Date.now();
-        metrics.onTtft?.(uid, ttftKind, (firstContainerFrameAtMs - firstUserFrameAtMs) / 1000);
-      }
       // PR2 v1.0.66 — outbound.codex_billing 是 container→master 内部侧信道,
       // **绝不**透传给用户浏览器(用户不可见 billing,且帧含内部计费字段)。
       //
@@ -7013,6 +7023,22 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             // 不 return — status 帧继续走透传路径让前端 UI 看到状态变化
           }
         }
+      }
+      // Engine-neutral first-visible boundary: ignore ACK/status/billing/attestation and
+      // stop the clock only when an outbound.message contains a user-visible block.
+      const firstVisible = extractFirstVisibleAttribution(parsedMasterFrameCandidate);
+      if (firstVisible && !firstVisibleTraceIds.has(firstVisible.traceId)) {
+        if (firstVisibleTraceIds.size >= 512) firstVisibleTraceIds.clear();
+        firstVisibleTraceIds.add(firstVisible.traceId);
+        if (firstContainerFrameAtMs === null && firstUserFrameAtMs !== null) {
+          firstContainerFrameAtMs = Date.now();
+          metrics.onTtft?.(uid, ttftKind, (firstContainerFrameAtMs - firstUserFrameAtMs) / 1000);
+        }
+        recordTurnFirstVisible(
+          deps.pgPool,
+          (message, fields) => bridgeLog?.warn(message, fields),
+          firstVisible,
+        );
       }
       // Phase 0.4 — bridge ring write for stamped outbound frames.
       //
@@ -7450,11 +7476,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     // 把"upgrade 期间早到的帧"先 emit 一遍 → 走正常 onUserMessage 流程。
     // TTFT 起点用第一条早到帧的 receivedAtMs(更准 — 用户发帧瞬间,而不是 replay 瞬间);
     // 后续帧 onUserMessage 内部的 firstUserFrameAtMs !== null 守卫会跳过覆盖。
-    if (earlyMessages.length > 0 && firstUserFrameAtMs === null) {
-      firstUserFrameAtMs = earlyMessages[0]!.receivedAtMs;
-    }
     for (const m of earlyMessages) {
-      onUserMessage(m.data, m.isBinary);
+      onUserMessage(m.data, m.isBinary, m.receivedAtMs);
     }
 
     // ---------- cleanup 状态机(PR2 v1.0.66 drain refactor) ----------

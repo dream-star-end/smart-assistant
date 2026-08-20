@@ -523,6 +523,21 @@ export type ResponseRatingInput = {
 /** 会话已评回读结果：messageId → {rating, tags}（不含 comment）。 */
 export type SessionRatingsMap = Record<string, { rating: "up" | "down"; tags: string[] }>;
 
+export type RatingNudgeState = "exposed" | "rated" | "dismissed";
+export type SessionRatingSnapshot = {
+  ratings: SessionRatingsMap;
+  nudges: Record<string, RatingNudgeState>;
+};
+
+export type ResponseRatingNudgeInput = {
+  messageId: string;
+  sessionId?: string;
+  traceId?: string;
+  clientBuild?: string;
+  sampleBucket: number;
+  nudgeAction: "expose" | "dismiss";
+};
+
 /** 自由文本反馈：设置页与消息级入口用判别联合隔离各自允许发送的上下文。 */
 export type FeedbackCategory = "bug" | "feature" | "ux" | "other";
 
@@ -4323,15 +4338,30 @@ export const api = {
    * `{ [messageId]: {rating, tags} }`（无则 `{}`，不含 comment）。仅用于重开会话时标
    * 「已评」高亮、避免重复采集。失败/503 由调用方兜底为空。
    */
-  getSessionRatings: (a: AuthSession, sessionId: string): Promise<SessionRatingsMap> =>
-    jsonOrThrow<{ ratings?: SessionRatingsMap }>(
+  submitResponseRatingNudge: (
+    a: AuthSession,
+    input: ResponseRatingNudgeInput,
+  ): Promise<{ state: RatingNudgeState; newlyExposed: boolean }> =>
+    jsonOrThrow<{ ok: true; state: RatingNudgeState; newlyExposed: boolean }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/response-rating", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(input),
+        }),
+      ),
+    ).then((body) => ({ state: body.state, newlyExposed: body.newlyExposed })),
+
+  getSessionRatings: (a: AuthSession, sessionId: string): Promise<SessionRatingSnapshot> =>
+    jsonOrThrow<{ ratings?: SessionRatingsMap; nudges?: Record<string, RatingNudgeState> }>(
       callWithRefresh(a, (t) =>
         fetch(`/api/response-rating?sessionId=${encodeURIComponent(sessionId)}`, {
           credentials: "include",
           headers: bearerHeaders(t),
         }),
       ),
-    ).then((b) => b.ratings || {}),
+    ).then((b) => ({ ratings: b.ratings || {}, nudges: b.nudges || {} })),
 
   // ── 对话传输（P4 已接入：WS user-chat-bridge） ────────────────────────
   //

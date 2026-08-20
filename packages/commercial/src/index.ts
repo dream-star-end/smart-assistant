@@ -329,6 +329,10 @@ import {
   type ToolFailureAuditHandler,
 } from "./http/internalToolFailureAudit.js";
 import {
+  TURN_OBSERVATION_PATH,
+  makeTurnObservationHandler,
+} from "./http/internalTurnObservation.js";
+import {
   SKILL_USAGE_PATH,
   isSkillUsageEnabled,
   makeSkillUsageHandler,
@@ -619,6 +623,7 @@ import {
   observeWsBridgeSessionDuration,
   observeWsBridgeTtft,
 } from "./admin/metrics.js";
+import { shutdownDurableMetricRollups } from "./admin/durableMetricRollups.js";
 import { loadOrCreateBridgeSecret, DEFAULT_BRIDGE_SECRET_PATH } from "./bridgeSecret.js";
 import { setRemoteMuxDeps } from "./remoteHosts/sshMux.js";
 import { RemoteHostError } from "./remoteHosts/service.js";
@@ -2132,6 +2137,9 @@ export async function registerCommercial(
             queryRunner: getPool(),
           })
         : null;
+      const turnObservationHandler = isToolFailureAuditEnabled()
+        ? makeTurnObservationHandler({ identityRepo, queryRunner: getPool() })
+        : null;
       // /internal/v3/marketplace/skill-usage — 容器 gateway skillUsageReporter 批量上报
       // 「hub 技能被使用」的低敏信号(slug/agent/trace,不记内容)。user_id 由
       // verifyContainerIdentity 推导,不信容器传入;写入 marketplace_skill_usage_events 供
@@ -2394,6 +2402,9 @@ export async function registerCommercial(
         }
         if (toolCallRollupHandler && path === TOOL_CALL_ROLLUP_PATH) {
           return toolCallRollupHandler(req, res, ctx);
+        }
+        if (turnObservationHandler && path === TURN_OBSERVATION_PATH) {
+          return turnObservationHandler(req, res, ctx);
         }
         if (skillUsageHandler && path === SKILL_USAGE_PATH) {
           return skillUsageHandler(req, res, ctx);
@@ -6265,6 +6276,7 @@ export async function registerCommercial(
       try { await pricing.shutdown(); } catch { /* ignore */ }
       try { await redis.quit(); } catch { /* ignore */ }
       await closeModelCatalogAdminPool();
+      try { await shutdownDurableMetricRollups(); } catch { /* best-effort; absolute snapshots retry safely */ }
       await closePool();
     },
     /** V3 2H 测试 / /healthz 探测用:内部代理实际监听地址(undefined = 未启用)。 */
