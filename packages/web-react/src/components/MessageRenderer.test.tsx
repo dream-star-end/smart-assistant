@@ -2211,6 +2211,37 @@ describe("长时间线普通 DOM 分页与活跃状态稳定性", () => {
     scroller.remove();
   });
 
+  test("视口足够高且窗口≥160 时只绘制附近行，数据窗口计数仍完整", async () => {
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    Object.defineProperty(scroller, "clientHeight", { configurable: true, value: 600 });
+    scroller.scrollTop = 0;
+    const rows = Array.from({ length: 220 }, (_, index) =>
+      mk("user", { id: "paint-row-" + index, text: "绘制记录 " + index, status: "sent" }),
+    );
+    render(
+      <MessageList
+        messages={rows}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+      />,
+      { container: scroller },
+    );
+    fireEvent.click(screen.getByRole("button", { name: /查看更早历史记录/ }));
+    await act(async () => {});
+    fireEvent.click(screen.getByRole("button", { name: /查看更早历史记录/ }));
+    await act(async () => {});
+    const list = screen.getByTestId("timeline-short-list");
+    expect(list.getAttribute("data-timeline-window-count")).toBe("220");
+    const painted = Number(list.getAttribute("data-timeline-paint-count"));
+    expect(painted).toBeGreaterThanOrEqual(36);
+    expect(painted).toBeLessThan(220);
+    expect(scroller.querySelector("[data-testid=timeline-paint-spacer-bottom]")).toBeTruthy();
+    scroller.remove();
+  });
+
   test("live→tape generation 变化不重挂活动 Footer，滚动身份保持", async () => {
     const scroller = document.createElement("div");
     document.body.appendChild(scroller);

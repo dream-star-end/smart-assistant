@@ -860,9 +860,40 @@ function coalesceTeam(
 export const TIMELINE_INITIAL_TAIL_ITEMS = 80;
 const TIMELINE_WINDOW_EXPAND_ITEMS = 80;
 const TIMELINE_EXPAND_NEAR_TOP_PX = 160;
+const PAINT_ESTIMATE_PX = 200;
+const PAINT_OVERSCAN = 20;
+const PAINT_MIN_ITEMS = 36;
+const PAINT_ENABLE_ITEMS = 160;
+const PAINT_ENABLE_VIEWPORT_PX = 360;
 
 function defaultTailStart(length: number): number {
   return Math.max(0, length - TIMELINE_INITIAL_TAIL_ITEMS);
+}
+
+function paintWindowEnabled(scroller: HTMLElement | null | undefined, count: number): boolean {
+  return Boolean(
+    scroller &&
+    scroller.clientHeight >= PAINT_ENABLE_VIEWPORT_PX &&
+    count >= PAINT_ENABLE_ITEMS,
+  );
+}
+
+function computePaintRange(
+  count: number,
+  scrollTop: number,
+  clientHeight: number,
+  followBottom: boolean,
+): { start: number; end: number } {
+  const visible = Math.max(
+    PAINT_MIN_ITEMS,
+    Math.ceil(clientHeight / PAINT_ESTIMATE_PX) + PAINT_OVERSCAN * 2,
+  );
+  if (followBottom) {
+    return { start: Math.max(0, count - visible), end: count };
+  }
+  const start = Math.max(0, Math.floor(scrollTop / PAINT_ESTIMATE_PX) - PAINT_OVERSCAN);
+  const end = Math.min(count, Math.max(start + PAINT_MIN_ITEMS, start + visible));
+  return { start, end };
 }
 
 function renderItemKey(item: RenderItem): string {
@@ -955,7 +986,9 @@ export function MessageList({
   const archiveQueuedRef = useRef(false);
   const archiveQueueTokenRef = useRef(0);
   const [windowVersion, setWindowVersion] = useState(0);
+  const [paintRange, setPaintRange] = useState({ start: 0, end: TIMELINE_INITIAL_TAIL_ITEMS });
   const itemCountRef = useRef(0);
+  const visibleCountRef = useRef(0);
   const startOverrideRef = useRef<number | null>(null);
   const pendingExpandCorrectionRef = useRef<{ height: number; top: number } | null>(null);
   const viewportPreserveLockRef = useRef(false);
@@ -984,6 +1017,7 @@ export function MessageList({
     sessionIdRef.current = sessionId;
     startOverrideRef.current = null;
     didSnapToBottomRef.current = false;
+    viewportPreserveLockRef.current = false;
   }
 
   useEffect(() => {
@@ -1112,6 +1146,36 @@ export function MessageList({
       scroller.removeEventListener("scroll", onExpandNearTop);
     };
   }, [processPaging, scrollParent]);
+
+  useEffect(() => {
+    const el = scrollParent;
+    if (!el) return;
+    let raf = 0;
+    const update = () => {
+      raf = 0;
+      const count = visibleCountRef.current;
+      if (!paintWindowEnabled(el, count)) return;
+      const next = computePaintRange(
+        count,
+        el.scrollTop,
+        el.clientHeight,
+        followBottomRefBox.current?.current === true,
+      );
+      setPaintRange((prev) => (
+        prev.start === next.start && prev.end === next.end ? prev : next
+      ));
+    };
+    const onScroll = () => {
+      if (raf) return;
+      raf = requestAnimationFrame(update);
+    };
+    el.addEventListener("scroll", onScroll, { passive: true });
+    update();
+    return () => {
+      el.removeEventListener("scroll", onScroll);
+      if (raf) cancelAnimationFrame(raf);
+    };
+  }, [scrollParent, windowVersion, sessionId]);
 
   // Drop legacy substitute rows from an old IndexedDB cache and duplicate
   // engine transport envelopes. The latter remain byte-complete in the tape;
@@ -1281,6 +1345,24 @@ export function MessageList({
       defaultTailStart(renderItems.length),
     );
   const visibleItems = renderItems.slice(windowStart);
+  visibleCountRef.current = visibleItems.length;
+  const paintOn = paintWindowEnabled(scrollParent, visibleItems.length);
+  let paintStart = 0;
+  let paintEnd = visibleItems.length;
+  if (paintOn && scrollParent) {
+    if (followBottomRef?.current) {
+      const vis = Math.max(
+        PAINT_MIN_ITEMS,
+        Math.ceil(scrollParent.clientHeight / PAINT_ESTIMATE_PX) + PAINT_OVERSCAN * 2,
+      );
+      paintStart = Math.max(0, visibleItems.length - vis);
+      paintEnd = visibleItems.length;
+    } else {
+      paintStart = Math.min(paintRange.start, Math.max(0, visibleItems.length - PAINT_MIN_ITEMS));
+      paintEnd = Math.min(visibleItems.length, Math.max(paintRange.end, paintStart + PAINT_MIN_ITEMS));
+    }
+  }
+  const paintedItems = visibleItems.slice(paintStart, paintEnd);
   const showHistoryBoundary = hasOlderHistory || windowStart > 0 || renderableMessages.some(
     (message) => typeof message._historyPageLoadedFrom === "string",
   );
@@ -1447,9 +1529,18 @@ export function MessageList({
       ref={listRootRef}
       className="mx-auto max-w-3xl space-y-4 px-5 py-8"
       data-testid="timeline-short-list"
+      data-timeline-window-count={visibleItems.length}
+      data-timeline-paint-count={paintedItems.length}
     >
       {historyControl}
-      {visibleItems.map((item) => (
+      {paintStart > 0 ? (
+        <div
+          aria-hidden
+          data-testid="timeline-paint-spacer-top"
+          style={{ height: paintStart * PAINT_ESTIMATE_PX }}
+        />
+      ) : null}
+      {paintedItems.map((item) => (
         <div
           key={itemKey(item)}
           className="chat-virtual-item chat-timeline-row"
@@ -1458,6 +1549,13 @@ export function MessageList({
           {renderItem(item)}
         </div>
       ))}
+      {paintEnd < visibleItems.length ? (
+        <div
+          aria-hidden
+          data-testid="timeline-paint-spacer-bottom"
+          style={{ height: (visibleItems.length - paintEnd) * PAINT_ESTIMATE_PX }}
+        />
+      ) : null}
       {footer}
     </div>
   );
