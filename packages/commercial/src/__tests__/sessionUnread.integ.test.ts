@@ -64,18 +64,18 @@ async function insertTerminal(opts: {
   );
 }
 
-before(async () => {
-  if (!db.available) return;
-  pool = getPool() as unknown as Pool;
-  backend = createPgSessionsBackend(pool, { expectedGeneration: 1 });
-});
-
-beforeEach(async () => {
-  if (!db.available) return;
-  await pool.query("TRUNCATE turn_dispatches, client_sessions CASCADE");
-});
-
 describe("0240 client_sessions.last_read_at unread", () => {
+  before(async () => {
+    if (!db.available) return;
+    pool = getPool() as unknown as Pool;
+    backend = createPgSessionsBackend(pool, { expectedGeneration: 1 });
+  });
+
+  beforeEach(async () => {
+    if (!db.available) return;
+    await pool.query("TRUNCATE turn_dispatches, client_sessions CASCADE");
+  });
+
   test("终态后 list unread=true;POST read 后 false;跨 user 隔离", async (t) => {
     if (db.skipIfUnavailable(t)) return;
     const sid = "webunreada1";

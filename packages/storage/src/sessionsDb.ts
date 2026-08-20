@@ -6295,7 +6295,7 @@ async function _sqliteSearchClientSessions(
   `).all(q, userId, like, expandMax, candMax) as Array<{
     id: string; title: string; project_id: string | null; matched_at: number; msg_text: string
   }>
-  const hits: SessionSearchHit[] = [
+  const hits: Array<Omit<SessionSearchHit, 'unread'>> = [
     ...titleRows.map((r) => ({
       sessionId: r.id,
       title: r.title,
