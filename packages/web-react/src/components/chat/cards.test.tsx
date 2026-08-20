@@ -106,7 +106,7 @@ describe("消息引用动作与已发送引用块", () => {
       },
     });
     render(<UserCard msg={message} cb={{ onQuote }} />);
-    expect(screen.getByText("OpenClaude")).toBeInTheDocument();
+    expect(screen.getByText("从简")).toBeInTheDocument();
     const quoteText = screen.getByText("不会在数据层截断的完整历史回答");
     expect(quoteText).toHaveClass("line-clamp-2");
     fireEvent.click(screen.getByRole("button", { name: "引用" }));

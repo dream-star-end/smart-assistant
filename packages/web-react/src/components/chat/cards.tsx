@@ -352,7 +352,7 @@ function ReplyQuoteBlock({
       data-testid="message-reply-quote"
     >
       <div className="mb-0.5 text-[11px] font-medium">
-        {role === "assistant" ? "OpenClaude" : "你"}
+        {role === "assistant" ? "从简" : "你"}
       </div>
       <div className="line-clamp-2 whitespace-pre-wrap break-words text-[12.5px] leading-5">
         {text}
