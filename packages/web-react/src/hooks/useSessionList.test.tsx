@@ -647,6 +647,17 @@ describe("useSessionList 置顶 / 项目归属 / 终态字段", () => {
     expect(result.current.hasMoreSessions).toBe(false);
   });
 
+  test("首屏不拉 includeArchived；loadArchivedSessions 才带该参数", async () => {
+    const page = vi.spyOn(api, "listSessionsPage").mockResolvedValue({ sessions: [] });
+    const { result } = await renderSessionList({ confirmResult: false, promptResult: null });
+    expect(page).not.toHaveBeenCalled();
+    await act(async () => {
+      await result.current.loadArchivedSessions();
+    });
+    expect(page).toHaveBeenCalledTimes(1);
+    expect(page.mock.calls[0][1]).toEqual({ includeArchived: true });
+  });
+
   test("searchSessionMessages 只回 message 命中，AbortError 当空数组", async () => {
     vi.spyOn(api, "searchSessions").mockResolvedValue({
       results: [

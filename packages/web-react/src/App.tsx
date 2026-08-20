@@ -2613,7 +2613,6 @@ export function App() {
           </LazyBoundary>
         ) : (
         <>
-        <div className="relative">
         <ChatHeader
           agent={agent}
           onAgentClick={() => setPickerOpen(true)}
@@ -2636,20 +2635,8 @@ export function App() {
           onOpenMobileNav={() => setMobileNavOpen(true)}
           onOpenInbox={demo ? undefined : () => setInboxOpen(true)}
           unreadCount={inbox.unreadCount}
+          sessionUnreadCount={unreadSessions.unreadIds.size}
         />
-        {unreadSessions.unreadIds.size > 0 && (
-          <span
-            data-testid="session-unread-badge"
-            className={
-              collapsed
-                ? "pointer-events-none absolute left-8 top-2 hidden h-4 min-w-4 items-center justify-center rounded-full bg-accent px-1 text-[10px] font-medium text-accent-fg md:flex"
-                : "pointer-events-none absolute left-8 top-2 flex h-4 min-w-4 items-center justify-center rounded-full bg-accent px-1 text-[10px] font-medium text-accent-fg md:hidden"
-            }
-          >
-            {unreadSessions.unreadIds.size > 99 ? "99+" : unreadSessions.unreadIds.size}
-          </span>
-        )}
-        </div>
 
         {!demo && repo.showBanner && repo.selection?.selected && (
           <RepoStatusBanner

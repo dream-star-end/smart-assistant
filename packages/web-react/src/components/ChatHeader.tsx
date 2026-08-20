@@ -29,6 +29,7 @@ export function ChatHeader({
   onOpenMobileNav,
   onOpenInbox,
   unreadCount,
+  sessionUnreadCount,
 }: {
   agent: Agent;
   onAgentClick: () => void;
@@ -64,6 +65,8 @@ export function ChatHeader({
   onOpenInbox?: () => void;
   /** 站内信未读数（>0 显红点，>99 显 99+）。 */
   unreadCount?: number;
+  /** 会话未读数（侧栏折叠/移动抽屉入口角标）。与站内信 unreadCount 并存、语义不同。 */
+  sessionUnreadCount?: number;
 }) {
   const low = credits != null && (credits.trim().startsWith("-") || /^-?0+$/.test(credits.trim()));
   // 团队模式说明弹层的受控开关：点「关闭团队模式」需要主动收起弹层（chip 随
@@ -77,16 +80,22 @@ export function ChatHeader({
     >
       {/* 移动端汉堡：窄屏始终可见，打开侧栏抽屉。 */}
       {onOpenMobileNav && (
-        <IconButton data-product-control onClick={onOpenMobileNav} aria-label="打开菜单" shape="square" className="md:hidden">
-          <Menu size={18} />
-        </IconButton>
+        <div className="relative md:hidden">
+          <IconButton data-product-control onClick={onOpenMobileNav} aria-label="打开菜单" shape="square">
+            <Menu size={18} />
+          </IconButton>
+          <HeaderCountBadge count={sessionUnreadCount} testId="session-unread-badge" />
+        </div>
       )}
       {/* 桌面折叠态：展开 + 新建（仅 md+，移动端用抽屉）。 */}
       {sidebarCollapsed && (
         <div className="hidden items-center gap-1 md:flex">
-          <IconButton data-product-control onClick={onExpandSidebar} aria-label="展开侧栏" shape="square">
-            <PanelLeft size={18} />
-          </IconButton>
+          <div className="relative">
+            <IconButton data-product-control onClick={onExpandSidebar} aria-label="展开侧栏" shape="square">
+              <PanelLeft size={18} />
+            </IconButton>
+            <HeaderCountBadge count={sessionUnreadCount} testId="session-unread-badge" />
+          </div>
           <IconButton data-product-feature={PRODUCT_CAPABILITIES.chatBasics.id} onClick={onNew} aria-label="新建会话" shape="square">
             <PenSquare size={18} />
           </IconButton>
@@ -159,11 +168,7 @@ export function ChatHeader({
             <IconButton data-product-feature={PRODUCT_CAPABILITIES.inbox.id} onClick={onOpenInbox} aria-label="站内信" shape="square">
               <Bell size={18} />
             </IconButton>
-            {!!unreadCount && unreadCount > 0 && (
-              <span className="pointer-events-none absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-danger px-1 text-[10px] font-semibold leading-none text-white tabular-nums">
-                {unreadCount > 99 ? "99+" : unreadCount}
-              </span>
-            )}
+            <HeaderCountBadge count={unreadCount} />
           </div>
         )}
         {credits != null && (
@@ -185,5 +190,18 @@ export function ChatHeader({
         )}
       </div>
     </header>
+  );
+}
+
+/** 顶栏角标：站内信与会话未读共用同一套尺寸/色。count 缺省或 ≤0 不占位。 */
+function HeaderCountBadge({ count, testId }: { count?: number; testId?: string }) {
+  if (!count || count <= 0) return null;
+  return (
+    <span
+      data-testid={testId}
+      className="pointer-events-none absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-danger px-1 text-[10px] font-semibold leading-none text-white tabular-nums"
+    >
+      {count > 99 ? "99+" : count}
+    </span>
   );
 }

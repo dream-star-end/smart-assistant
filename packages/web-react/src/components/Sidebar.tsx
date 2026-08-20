@@ -249,7 +249,7 @@ export function Sidebar({
   }, [filtered, pinnedIds, searching]);
 
   const showPreview = useMemo(
-    () => sessions.some((s) => Boolean(s.lastMessagePreview)),
+    () => sessions.some((s) => Boolean(s.lastMessagePreview?.trim())),
     [sessions],
   );
 
@@ -608,24 +608,36 @@ export function Sidebar({
           </button>
         )}
 
-        <div className="flex items-center gap-2 rounded-xl bg-hover px-3 py-2 transition-shadow focus-within:ring-2 focus-within:ring-ring">
-          <Search size={15} className="text-faint" />
-          <input
-            data-product-feature={PRODUCT_CAPABILITIES.sessions.id}
-            data-sidebar-search
-            value={q}
-            onChange={(e) => setQ(e.target.value)}
-            placeholder="搜索会话"
-            className="w-full bg-transparent text-base text-fg outline-none placeholder:text-faint md:text-sm"
-          />
+        <div className="flex items-center gap-2">
+          <div className="flex min-w-0 flex-1 items-center gap-2 rounded-xl bg-hover px-3 py-2 transition-shadow focus-within:ring-2 focus-within:ring-ring">
+            <Search size={15} className="text-faint" />
+            <input
+              data-product-feature={PRODUCT_CAPABILITIES.sessions.id}
+              data-sidebar-search
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+              placeholder="搜索会话"
+              className="w-full bg-transparent text-base text-fg outline-none placeholder:text-faint md:text-sm"
+            />
+          </div>
+          {onBatch && !multiSelect && (
+            <button
+              type="button"
+              onClick={() => setMultiSelect(true)}
+              className="shrink-0 rounded-md px-1.5 py-2 text-caption text-faint outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+            >
+              多选
+            </button>
+          )}
         </div>
       </div>
 
-      {multiSelect && selectedIds.size > 0 && onBatch && (
+      {multiSelect && onBatch && (
         <BatchBar
           count={selectedIds.size}
           projects={orderedProjects}
           onAction={(action, projectId) => {
+            if (selectedIds.size === 0) return;
             onBatch([...selectedIds], action, projectId);
             clearMulti();
           }}

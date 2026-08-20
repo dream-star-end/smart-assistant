@@ -114,7 +114,7 @@ export function SessionRow({
         <span className={cn("truncate", unread && "font-semibold text-fg")}>{title}</span>
         {showPreview && (
           <span aria-hidden className="truncate text-caption text-faint">
-            {s.lastMessagePreview || "\u00a0"}
+            {s.lastMessagePreview?.trim() || "\u00a0"}
           </span>
         )}
       </button>

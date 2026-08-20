@@ -630,8 +630,12 @@ describe("Sidebar 归档与批量", () => {
     });
     expect(screen.getByRole("button", { name: "进行中" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "已收进箱底" })).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: /已归档/ }));
-    expect(onLoadArchived).toHaveBeenCalled();
+    const toggle = screen.getByRole("button", { name: /已归档/ });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(onLoadArchived).not.toHaveBeenCalled();
+    fireEvent.click(toggle);
+    expect(onLoadArchived).toHaveBeenCalledTimes(1);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByRole("button", { name: "已收进箱底" })).toBeInTheDocument();
   });
 
@@ -654,6 +658,18 @@ describe("Sidebar 归档与批量", () => {
     fireEvent.click(screen.getByRole("button", { name: "归档" }));
     expect(onBatch).toHaveBeenCalledWith(["s-beta"], "archive", undefined);
   });
+
+  it("搜索框旁常驻「多选」，不依赖行 hover，移动端也能进多选", () => {
+    const onBatch = vi.fn();
+    renderSidebar({ sessions: listSessions, onBatch });
+    const entry = screen.getByRole("button", { name: "多选" });
+    expect(entry).toBeVisible();
+    fireEvent.click(entry);
+    expect(screen.getByTestId("sidebar-batch-bar")).toHaveTextContent("已选 0 条");
+    expect(screen.getByLabelText("选择 季度复盘 Alpha")).toBeInTheDocument();
+    fireEvent.click(screen.getByLabelText("选择 Beta 上线检查"));
+    expect(screen.getByTestId("sidebar-batch-bar")).toHaveTextContent("已选 1 条");
+  });
 });
 
 describe("Sidebar 模型徽标与摘要", () => {
@@ -675,6 +691,30 @@ describe("Sidebar 模型徽标与摘要", () => {
 
   it("modelShortLabel 回落 id 可读片段，不臆造映射表", () => {
     expect(modelShortLabel("acme/foo-bar")).toBe("foo-bar");
+  });
+
+  it("所有会话都没有 lastMessagePreview 时不渲染空白摘要行", () => {
+    renderSidebar({ sessions: listSessions });
+    const btn = screen.getByRole("button", { name: "季度复盘 Alpha" });
+    expect(btn.querySelectorAll("span")).toHaveLength(1);
+    const items = flattenSidebarItems({
+      searching: false,
+      showProjects: false,
+      showPreview: false,
+      pinned: [],
+      projects: [],
+      projectSessions: new Map(),
+      sessions: listSessions,
+      ungroupedGroups: [["今天", listSessions]],
+      archived: [],
+      archivedExpanded: false,
+      searchHits: [],
+      searchRemote: "idle",
+      localEmpty: false,
+    });
+    expect(items.filter((i) => i.kind === "session").every((r) => r.height === SESSION_ROW_HEIGHT)).toBe(
+      true,
+    );
   });
 });
 

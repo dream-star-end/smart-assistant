@@ -24,12 +24,12 @@ export function BatchBar({
       data-testid="sidebar-batch-bar"
     >
       <span className="mr-1 font-medium text-fg">已选 {count} 条</span>
-      <Button type="button" variant="ghost" size="sm" onClick={() => onAction("archive")}>
+      <Button type="button" variant="ghost" size="sm" disabled={count === 0} onClick={() => onAction("archive")}>
         归档
       </Button>
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
-          <Button type="button" variant="ghost" size="sm">
+          <Button type="button" variant="ghost" size="sm" disabled={count === 0}>
             移动到项目
           </Button>
         </DropdownMenuTrigger>
@@ -43,7 +43,7 @@ export function BatchBar({
           <DropdownMenuItem onSelect={() => onAction("move", null)}>移出项目</DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
-      <Button type="button" variant="ghost" size="sm" onClick={() => onAction("delete")}>
+      <Button type="button" variant="ghost" size="sm" disabled={count === 0} onClick={() => onAction("delete")}>
         删除
       </Button>
       <Button type="button" variant="ghost" size="sm" className="ml-auto" onClick={onCancel}>
