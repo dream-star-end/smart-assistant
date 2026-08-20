@@ -14,7 +14,7 @@ import {
   latestRunHint,
 } from '../../lib/taskboard'
 import { cn } from '../../lib/utils'
-import { Badge, Card } from '../ui'
+import { Badge, Card, TimeAgo } from '../ui'
 
 const TYPE_ICON: Record<TicketType, LucideIcon> = {
   bug: Bug,
@@ -48,6 +48,7 @@ export function TicketCard({
   onOpen,
   actions,
   compact,
+  showUpdatedAt = false,
   draggable,
   dragging,
   onDragStart,
@@ -58,6 +59,7 @@ export function TicketCard({
   onOpen?: (ticket: Ticket) => void
   actions?: ReactNode
   compact?: boolean
+  showUpdatedAt?: boolean
   draggable?: boolean
   dragging?: boolean
   onDragStart?: (e: DragEvent<HTMLDivElement>) => void
@@ -165,6 +167,13 @@ export function TicketCard({
             >
               {agent}
             </span>
+          )}
+          {showUpdatedAt && (
+            <TimeAgo
+              value={ticket.updatedAt}
+              format="short"
+              className="ml-auto shrink-0 text-caption text-faint"
+            />
           )}
         </div>
         {actions ? (

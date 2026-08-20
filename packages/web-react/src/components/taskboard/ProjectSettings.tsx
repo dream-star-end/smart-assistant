@@ -1,4 +1,4 @@
-import { FolderPlus, Pencil } from 'lucide-react'
+import { FolderCog, FolderPlus, Pencil } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { AuthEpochStaleError } from '../../lib/api'
 import {
@@ -22,6 +22,7 @@ export function ProjectSettings({
   onPatch,
   onArchive,
   onUnarchive,
+  compact = false,
 }: {
   auth: AuthSession
   current: Project | null
@@ -29,6 +30,7 @@ export function ProjectSettings({
   onPatch: (id: string, input: ProjectPatchInput) => Promise<Project | null>
   onArchive: (id: string) => Promise<boolean>
   onUnarchive: (id: string) => Promise<boolean>
+  compact?: boolean
 }) {
   const toast = useToast()
   const [confirm, confirmEl] = useConfirm()
@@ -143,25 +145,39 @@ export function ProjectSettings({
 
   return (
     <>
-      <Button
-        type="button"
-        size="sm"
-        variant="secondary"
-        data-testid="project-create-open"
-        onClick={() => setMode('create')}
-      >
-        <FolderPlus size={14} />
-        新建项目
-      </Button>
-      {current && (
+      {compact ? (
         <IconButton
-          data-testid="project-edit-open"
-          aria-label="编辑项目"
+          data-testid={current ? 'project-edit-open' : 'project-create-open'}
+          aria-label={current ? '管理项目' : '新建项目'}
+          title={current ? '管理项目' : '新建项目'}
           shape="square"
-          onClick={() => setMode('edit')}
+          onClick={() => setMode(current ? 'edit' : 'create')}
         >
-          <Pencil size={16} />
+          <FolderCog size={16} />
         </IconButton>
+      ) : (
+        <>
+          <Button
+            type="button"
+            size="sm"
+            variant="secondary"
+            data-testid="project-create-open"
+            onClick={() => setMode('create')}
+          >
+            <FolderPlus size={14} />
+            新建项目
+          </Button>
+          {current && (
+            <IconButton
+              data-testid="project-edit-open"
+              aria-label="编辑项目"
+              shape="square"
+              onClick={() => setMode('edit')}
+            >
+              <Pencil size={16} />
+            </IconButton>
+          )}
+        </>
       )}
       <Sheet
         open={open}
@@ -177,9 +193,22 @@ export function ProjectSettings({
           className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-4"
         >
           <div>
-            <h2 className="text-title font-semibold text-fg">
-              {mode === 'edit' ? '编辑项目' : '新建项目'}
-            </h2>
+            <div className="flex items-center justify-between gap-3">
+              <h2 className="text-title font-semibold text-fg">
+                {mode === 'edit' ? '编辑项目' : '新建项目'}
+              </h2>
+              {compact && mode === 'edit' && (
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="secondary"
+                  onClick={() => setMode('create')}
+                >
+                  <FolderPlus size={14} />
+                  新建项目
+                </Button>
+              )}
+            </div>
             <p className="mt-1 text-caption text-muted">
               {mode === 'edit'
                 ? '前缀创建后不可改。归档项目默认不出现在下拉里。'

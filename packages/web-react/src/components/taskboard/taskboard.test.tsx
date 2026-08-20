@@ -31,6 +31,7 @@ import { StageSettings } from './StageSettings'
 import { TaskboardView } from './TaskboardView'
 import { TicketCard, ticketPriorityTone, ticketTypeIconClass } from './TicketCard'
 import { TicketDrawer } from './TicketDrawer'
+import { TicketListView } from './TicketListView'
 import { useTaskboard } from './useTaskboard'
 
 afterEach(() => {
@@ -101,6 +102,32 @@ describe('workspaceWantPath', () => {
     expect(workspaceWantPath('chat', 'sess-1', false)).toBe('/s/sess-1')
     expect(workspaceWantPath('chat', 'draft', true)).toBe('/')
     expect(workspaceWantPath('chat', undefined, false)).toBe('/')
+  })
+})
+
+describe('任务列表移动端布局', () => {
+  test('默认用卡片展示并收起高级筛选，可一键清除但保留搜索词', () => {
+    const onQueryChange = vi.fn()
+    render(
+      <TooltipProvider>
+        <TicketListView
+          tickets={[sampleTicket()]}
+          query={{ q: '登录', type: 'bug', priority: 'P0' }}
+          onQueryChange={onQueryChange}
+          onOpenTicket={() => {}}
+        />
+      </TooltipProvider>,
+    )
+
+    expect(screen.getByTestId('ticket-list-cards')).toBeInTheDocument()
+    expect(screen.queryByTestId('ticket-list-advanced-filters')).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: '筛选 2' }))
+    expect(screen.getByTestId('ticket-list-advanced-filters')).toBeInTheDocument()
+    expect(screen.getByLabelText('按优先级筛选')).toHaveDisplayValue('P0 紧急')
+
+    fireEvent.click(screen.getByRole('button', { name: '清除筛选' }))
+    expect(onQueryChange).toHaveBeenCalledWith({ q: '登录' })
   })
 })
 
@@ -857,9 +884,11 @@ describe('项目管理', () => {
     mockEmptyBoard()
     renderBoard()
     const select = await screen.findByLabelText('项目')
-    const values = [...(select as HTMLSelectElement).options].map((o) => o.value)
-    expect(values).toContain('p1')
-    expect(values).not.toContain('p-arch')
+    await waitFor(() => {
+      const values = [...(select as HTMLSelectElement).options].map((o) => o.value)
+      expect(values).toContain('p1')
+      expect(values).not.toContain('p-arch')
+    })
   })
 })
 

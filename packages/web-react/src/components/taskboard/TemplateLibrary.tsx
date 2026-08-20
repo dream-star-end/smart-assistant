@@ -14,6 +14,7 @@ import {
   Button,
   Card,
   EmptyState,
+  IconButton,
   ListSkeleton,
   Sheet,
   Switch,
@@ -29,10 +30,12 @@ export function TemplateLibrary({
   auth,
   projectId,
   onChanged,
+  compact = false,
 }: {
   auth: AuthSession
   projectId: string | null
   onChanged?: () => void
+  compact?: boolean
 }) {
   const toast = useToast()
   const [confirm, confirmEl] = useConfirm()
@@ -118,16 +121,29 @@ export function TemplateLibrary({
 
   return (
     <>
-      <Button
-        type="button"
-        size="sm"
-        variant="secondary"
-        data-testid="template-library-open"
-        onClick={() => setOpen(true)}
-      >
-        <Library size={14} />
-        流水线模板
-      </Button>
+      {compact ? (
+        <IconButton
+          type="button"
+          shape="square"
+          data-testid="template-library-open"
+          aria-label="流水线模板"
+          title="流水线模板"
+          onClick={() => setOpen(true)}
+        >
+          <Library size={16} />
+        </IconButton>
+      ) : (
+        <Button
+          type="button"
+          size="sm"
+          variant="secondary"
+          data-testid="template-library-open"
+          onClick={() => setOpen(true)}
+        >
+          <Library size={14} />
+          流水线模板
+        </Button>
+      )}
       <Sheet
         open={open}
         onOpenChange={setOpen}

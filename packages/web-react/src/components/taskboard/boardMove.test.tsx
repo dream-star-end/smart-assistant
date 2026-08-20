@@ -197,6 +197,30 @@ function stubBoard(input: {
   return { getBoard }
 }
 
+describe('移动端阶段导航', () => {
+  test('阶段胶囊展示计数，点击后把目标列滚到视口', async () => {
+    stubBoard({
+      backlog: [sampleTicket()],
+      columns: [
+        { stage: s1, tickets: [] },
+        { stage: s2, tickets: [sampleTicket({ id: 't2', stageId: 's2', status: 'ready' })] },
+      ],
+    })
+    renderBoard()
+
+    const nav = await screen.findByTestId('board-mobile-stage-nav')
+    expect(within(nav).getByRole('button', { name: '查看积压，1条单据' })).toBeInTheDocument()
+    const target = within(nav).getByRole('button', { name: '查看定位根因，1条单据' })
+    const scroller = screen.getByTestId('board-columns-scroller')
+    const scrollTo = vi.fn()
+    Object.defineProperty(scroller, 'scrollTo', { configurable: true, value: scrollTo })
+
+    fireEvent.click(target)
+
+    expect(scrollTo).toHaveBeenCalledWith(expect.objectContaining({ behavior: 'smooth' }))
+  })
+})
+
 describe('积压列与有条件拖动', () => {
   test('渲染固定积压列；积压卡拖到第一站触发 promote', async () => {
     const card = sampleTicket({

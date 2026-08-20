@@ -30,7 +30,9 @@ export function BoardColumns({
   const [dragging, setDragging] = useState<Ticket | null>(null)
   const [hoverDropId, setHoverDropId] = useState<string | null>(null)
   const overflowCleanup = useRef<(() => void) | null>(null)
+  const scroller = useRef<HTMLDivElement | null>(null)
   const [overflow, setOverflow] = useState({ left: false, right: false })
+  const [activeDropId, setActiveDropId] = useState(BACKLOG_DROP_ID)
 
   const allowed = dragging ? allowedDropIds(dragging) : null
   const originDropId = dragging ? homeDropId(dragging) : null
@@ -38,6 +40,7 @@ export function BoardColumns({
   const scrollerRef = (el: HTMLDivElement | null) => {
     overflowCleanup.current?.()
     overflowCleanup.current = null
+    scroller.current = el
     if (!el) return
     const update = () => {
       const max = el.scrollWidth - el.clientWidth
@@ -46,6 +49,17 @@ export function BoardColumns({
         right: max > 8 && el.scrollLeft < max - 8,
       }
       setOverflow((prev) => (prev.left === next.left && prev.right === next.right ? prev : next))
+      const center = el.scrollLeft + el.clientWidth / 2
+      const frames = Array.from(el.children).filter(
+        (node): node is HTMLElement => node instanceof HTMLElement && !!node.dataset.dropId,
+      )
+      const nearest = frames.reduce<HTMLElement | null>((best, frame) => {
+        if (!best) return frame
+        const distance = Math.abs(frame.offsetLeft + frame.offsetWidth / 2 - center)
+        const bestDistance = Math.abs(best.offsetLeft + best.offsetWidth / 2 - center)
+        return distance < bestDistance ? frame : best
+      }, null)
+      if (nearest?.dataset.dropId) setActiveDropId(nearest.dataset.dropId)
     }
     update()
     const raf = requestAnimationFrame(update)
@@ -76,6 +90,19 @@ export function BoardColumns({
   const endDrag = () => {
     setDragging(null)
     setHoverDropId(null)
+  }
+
+  const jumpToColumn = (dropId: string) => {
+    const el = scroller.current
+    if (!el) return
+    const frame = Array.from(el.children).find(
+      (node): node is HTMLElement => node instanceof HTMLElement && node.dataset.dropId === dropId,
+    )
+    if (!frame) return
+    setActiveDropId(dropId)
+    const left = Math.max(0, frame.offsetLeft - 16)
+    if (typeof el.scrollTo === 'function') el.scrollTo({ left, behavior: 'smooth' })
+    else el.scrollLeft = left
   }
 
   const overColumn = (dropId: string, e: DragEvent) => {
@@ -128,16 +155,51 @@ export function BoardColumns({
   }
 
   const overflowing = overflow.left || overflow.right
+  const navItems = [
+    { id: BACKLOG_DROP_ID, label: '积压', count: backlogTickets.length },
+    ...columns.map((col) => ({
+      id: dropIdForMove(col.stage.id),
+      label: col.stage.name,
+      count: col.tickets.length,
+    })),
+  ]
 
   return (
-    <div className="relative min-h-0 flex-1" data-testid="board-columns-shell">
+    <div className="relative flex min-h-0 flex-1 flex-col" data-testid="board-columns-shell">
+      <nav
+        aria-label="看板阶段"
+        data-testid="board-mobile-stage-nav"
+        className="no-scrollbar flex shrink-0 gap-1.5 overflow-x-auto px-4 pb-2 md:hidden"
+      >
+        {navItems.map((item) => {
+          const active = activeDropId === item.id
+          return (
+            <button
+              key={item.id}
+              type="button"
+              aria-current={active ? 'page' : undefined}
+              aria-label={`查看${item.label}，${item.count}条单据`}
+              className={cn(
+                'inline-flex min-h-9 shrink-0 items-center gap-1 rounded-full border px-3 text-caption font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring',
+                active
+                  ? 'border-accent bg-accent-soft text-accent'
+                  : 'border-border bg-surface text-muted',
+              )}
+              onClick={() => jumpToColumn(item.id)}
+            >
+              <span>{item.label}</span>
+              <span className="text-faint">{item.count}</span>
+            </button>
+          )
+        })}
+      </nav>
       <div
         ref={scrollerRef}
         data-testid="board-columns-scroller"
         data-overflow-left={overflow.left ? 'true' : undefined}
         data-overflow-right={overflow.right ? 'true' : undefined}
         aria-label={overflowing ? '看板列，可横向滚动' : '看板列'}
-        className="flex h-full min-h-0 gap-3 overflow-x-auto overscroll-x-contain px-4 pb-4"
+        className="flex min-h-0 flex-1 snap-x snap-mandatory gap-3 overflow-x-auto overscroll-x-contain px-4 pb-4 md:snap-none"
       >
         <BoardColumnFrame
           dropId={BACKLOG_DROP_ID}
@@ -305,7 +367,7 @@ function BoardColumnFrame({
       onDrop={handleDrop}
       onDragLeave={handleDragLeave}
       className={cn(
-        'flex w-72 shrink-0 flex-col rounded-xl',
+        'flex w-[calc(100vw-2rem)] max-w-[20rem] shrink-0 snap-start flex-col rounded-xl md:w-72 md:max-w-none md:snap-none',
         backlog || empty
           ? 'border border-dashed border-border bg-hover'
           : 'border border-transparent bg-bg',

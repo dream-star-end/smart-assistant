@@ -33,6 +33,7 @@ import {
   Card,
   EmptyState,
   Field,
+  IconButton,
   Input,
   ListSkeleton,
   Select,
@@ -486,10 +487,12 @@ export function StageSettings({
   auth,
   projectId,
   onChanged,
+  compact = false,
 }: {
   auth: AuthSession
   projectId: string | null
   onChanged?: () => void
+  compact?: boolean
 }) {
   const toast = useToast()
   const [promptText, promptEl] = usePrompt()
@@ -928,17 +931,31 @@ export function StageSettings({
 
   return (
     <>
-      <Button
-        type="button"
-        size="sm"
-        variant="secondary"
-        data-testid="stage-settings-open"
-        disabled={!projectId}
-        onClick={() => setOpen(true)}
-      >
-        <Workflow size={14} />
-        流水线配置
-      </Button>
+      {compact ? (
+        <IconButton
+          type="button"
+          shape="square"
+          data-testid="stage-settings-open"
+          aria-label="流水线配置"
+          title="流水线配置"
+          disabled={!projectId}
+          onClick={() => setOpen(true)}
+        >
+          <Workflow size={16} />
+        </IconButton>
+      ) : (
+        <Button
+          type="button"
+          size="sm"
+          variant="secondary"
+          data-testid="stage-settings-open"
+          disabled={!projectId}
+          onClick={() => setOpen(true)}
+        >
+          <Workflow size={14} />
+          流水线配置
+        </Button>
+      )}
       <Sheet
         open={open}
         onOpenChange={setOpen}
