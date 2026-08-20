@@ -287,11 +287,10 @@ export function makeMemoryUsageHandler(deps: MemoryUsageHandlerDeps) {
       )
       return send(res, 200, { ok: true, inserted }, requestId)
     } catch (err) {
-      log.error(
-        'memory usage insert failed',
-        { events: events.length },
-        err instanceof Error ? err : undefined,
-      )
+      log.error('memory usage insert failed', {
+        events: events.length,
+        err: err instanceof Error ? err.message : String(err),
+      })
       return send(res, 500, { error: { code: 'INTERNAL' } }, requestId)
     }
   }

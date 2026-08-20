@@ -17,8 +17,11 @@ describe('0236 memory usage observability', () => {
     const deps = {
       identityRepo: {} as never,
       queryRunner: {
-        async query<Row>(sql: string, params?: readonly unknown[]) {
-          return await query<Row>(sql, params)
+        async query<Row = unknown>(sql: string, params?: readonly unknown[]) {
+          return (await query(sql, params)) as unknown as {
+            rows: Row[]
+            rowCount: number | null
+          }
         },
       },
     }
