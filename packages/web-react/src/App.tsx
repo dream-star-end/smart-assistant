@@ -592,6 +592,7 @@ export function App() {
   });
   const sidebarWidth = useSidebarWidth();
   const [projectSettings, setProjectSettings] = useState<ChatProject | null>(null);
+  const [ungroupedAssetsOpen, setUngroupedAssetsOpen] = useState(false);
 
   // ── per-session 模型选择(会话间互不影响,持久化恢复)────────────────────────
   //
@@ -2530,7 +2531,14 @@ export function App() {
     boardActive: boardOpen,
     unreadIds: unreadSessions.unreadIds,
     onMarkRead: unreadSessions.markRead,
-    onOpenProjectSettings: (p: ChatProject) => setProjectSettings(p),
+    onOpenProjectSettings: (p: ChatProject) => {
+      setUngroupedAssetsOpen(false);
+      setProjectSettings(p);
+    },
+    onOpenProjectAssets: () => {
+      setProjectSettings(null);
+      setUngroupedAssetsOpen(true);
+    },
     onReorderProjects: reorderProjects,
     width: sidebarWidth.width,
     onResizeStart: sidebarWidth.onResizeStart,
@@ -2947,11 +2955,25 @@ export function App() {
 
       <ProjectSettingsDialog
         project={projectSettings}
-        open={projectSettings !== null}
-        onClose={() => setProjectSettings(null)}
+        assetsOnly={ungroupedAssetsOpen}
+        open={projectSettings !== null || ungroupedAssetsOpen}
+        onClose={() => {
+          setProjectSettings(null);
+          setUngroupedAssetsOpen(false);
+        }}
         onSave={async (patch) => {
           if (!projectSettings) return;
           await updateProject(projectSettings.id, patch);
+        }}
+        demo={demo}
+        auth={auth}
+        authSession={authRef.current}
+        sessions={sessions}
+        onOpenSession={(sessionId) => {
+          setProjectSettings(null);
+          setUngroupedAssetsOpen(false);
+          setBoardOpen(false);
+          selectSession(sessionId);
         }}
       />
 

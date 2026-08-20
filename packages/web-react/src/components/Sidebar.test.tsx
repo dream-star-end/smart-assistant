@@ -465,6 +465,33 @@ describe("Sidebar 项目分组", () => {
     expect(screen.queryByRole("menuitem", { name: "删除" })).toBeNull();
   });
 
+  it("default 组菜单只有「项目资产」一项", async () => {
+    const onOpenProjectAssets = vi.fn();
+    renderSidebar({
+      sessions: [],
+      projects: [],
+      onCreateProject: () => {},
+      onRenameProject: () => {},
+      onDeleteProject: () => {},
+      onOpenProjectSettings: () => {},
+      onOpenProjectAssets,
+      onReorderProjects: () => {},
+    });
+    fireEvent.pointerDown(screen.getByRole("button", { name: "项目 default 更多" }), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    await waitFor(() => expect(screen.getByRole("menuitem", { name: "项目资产" })).toBeInTheDocument());
+    expect(screen.queryByRole("menuitem", { name: "项目设置" })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "重命名" })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "删除" })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "上移" })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "下移" })).toBeNull();
+    fireEvent.click(screen.getByRole("menuitem", { name: "项目资产" }));
+    expect(onOpenProjectAssets).toHaveBeenCalledWith(null);
+  });
+
   it("default 可折叠，toggle 走与真实项目相同的 collapsedProjectIds 通道", () => {
     const onToggle = vi.fn();
     renderSidebar({

@@ -108,6 +108,47 @@ export type ChatProject = {
   sessionCount: number;
 };
 
+/**
+ * 聊天项目资产（用户上传的参考资料 + 会话产出物）。
+ * GET /api/project-assets → `{ assets: ProjectAsset[] }`；POST/PATCH 直接回 `ProjectAsset`。
+ * `projectId === null` 表示未分组（侧栏虚拟 default 组）。
+ */
+export type ProjectAsset = {
+  id: string;
+  projectId: string | null;
+  source: "upload" | "output";
+  sessionId: string | null;
+  name: string;
+  url: string | null;
+  containerPath: string | null;
+  mime: string | null;
+  sizeBytes: number | null;
+  excerpt: string | null;
+  pinned: boolean;
+  createdAt: number;
+  updatedAt: number;
+};
+
+/** POST /api/project-assets 请求体。`size` 对应资源字节数（响应字段是 `sizeBytes`）。 */
+export type CreateProjectAssetInput = {
+  projectId?: string | null;
+  source: "upload" | "output";
+  sessionId?: string;
+  name: string;
+  url?: string;
+  containerPath?: string;
+  mime?: string;
+  size?: number;
+  digest?: string;
+};
+
+/** PATCH /api/project-assets/:assetId */
+export type PatchProjectAssetInput = {
+  pinned?: boolean;
+  name?: string;
+  projectId?: string | null;
+};
+
 /** PATCH /api/sessions/:id 元数据（title / 归属 / 置顶 / 归档）。后端若换成 /meta，只改 api.patchSessionMeta。 */
 export type PatchSessionMetaInput = {
   title?: string;

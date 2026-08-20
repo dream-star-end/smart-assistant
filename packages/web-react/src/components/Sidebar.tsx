@@ -113,6 +113,8 @@ export type SidebarProps = {
   unreadIds?: Set<string>;
   onMarkRead?: (id: string) => void;
   onOpenProjectSettings?: (p: ChatProject) => void;
+  /** 打开某项目的资产面板；default 组传 null。 */
+  onOpenProjectAssets?: (projectId: string | null) => void;
   onReorderProjects?: (orderedIds: string[]) => void;
   width?: number;
   onResizeStart?: (e: ReactPointerEvent) => void;
@@ -168,6 +170,7 @@ export function Sidebar({
   unreadIds,
   onMarkRead,
   onOpenProjectSettings,
+  onOpenProjectAssets,
   onReorderProjects,
   width,
   onResizeStart,
@@ -503,6 +506,7 @@ export function Sidebar({
           onRename={isDefault ? undefined : onRenameProject}
           onDelete={isDefault ? undefined : onDeleteProject}
           onOpenSettings={isDefault ? undefined : onOpenProjectSettings}
+          onOpenAssets={isDefault && onOpenProjectAssets ? () => onOpenProjectAssets(null) : undefined}
           onMoveUp={() => moveProject(p.id, -1)}
           onMoveDown={() => moveProject(p.id, 1)}
           onDragOverSession={() => setDragOverProjectId(p.id)}

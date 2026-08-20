@@ -70,6 +70,9 @@ import type {
   PutSessionInput,
   PutSessionResult,
   ChatProject,
+  CreateProjectAssetInput,
+  PatchProjectAssetInput,
+  ProjectAsset,
   RefreshOutcome,
   RefreshResult,
   RegisterResult,
@@ -2083,6 +2086,68 @@ export const api = {
         }),
       ),
     ).then(() => undefined),
+
+  // ── 项目资产（侧栏项目下聚合上传资料 + 会话产出；契约并行开发中）──
+
+  /**
+   * 列出某项目的资产。`projectId` 省略 / null → `?projectId=none`（未分组 / default 组）。
+   */
+  listProjectAssets: (a: AuthSession, projectId?: string | null): Promise<ProjectAsset[]> => {
+    const q =
+      projectId == null || projectId === ""
+        ? "projectId=none"
+        : `projectId=${encodeURIComponent(projectId)}`;
+    return jsonOrThrow<{ assets: ProjectAsset[] }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/project-assets?${q}`, { credentials: "include", headers: bearerHeaders(t) }),
+      ),
+    ).then((b) => b.assets || []);
+  },
+
+  createProjectAsset: (a: AuthSession, input: CreateProjectAssetInput): Promise<ProjectAsset> =>
+    jsonOrThrow<ProjectAsset>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/project-assets", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(input),
+        }),
+      ),
+    ),
+
+  patchProjectAsset: (
+    a: AuthSession,
+    assetId: string,
+    patch: PatchProjectAssetInput,
+  ): Promise<ProjectAsset> =>
+    jsonOrThrow<ProjectAsset>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/project-assets/${encodeURIComponent(assetId)}`, {
+          method: "PATCH",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(patch),
+        }),
+      ),
+    ),
+
+  /** DELETE 约定 204 / 空体；200+JSON 也收。 */
+  deleteProjectAsset: (a: AuthSession, assetId: string): Promise<void> =>
+    callWithRefresh(a, (t) =>
+      fetch(`/api/project-assets/${encodeURIComponent(assetId)}`, {
+        method: "DELETE",
+        credentials: "include",
+        headers: bearerHeaders(t),
+      }),
+    ).then(async (res) => {
+      if (res.status === 204 || res.status === 205) {
+        assertAuthResponseCurrent(res);
+        return undefined;
+      }
+      await jsonOrThrow(res);
+      return undefined;
+    }),
 
   // ── 文件上传（gateway /api/uploads，Bearer；写入用户容器工作区，返回内容寻址 URL） ──
 

@@ -2,7 +2,10 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ComponentProps } from "react";
 import { afterEach, describe, expect, test, vi } from "vitest";
+import { api } from "../lib/api";
+import { createMemoryAuthSession } from "../lib/authSession";
 import type { ChatProject } from "../lib/types";
+import { ToastProvider, TooltipProvider } from "./ui";
 import { PROJECT_COLORS, ProjectSettingsDialog } from "./ProjectSettingsDialog";
 
 afterEach(() => {
@@ -26,16 +29,23 @@ function renderDialog(
 ) {
   const onClose = overrides.onClose ?? vi.fn();
   const onSave = overrides.onSave ?? vi.fn().mockResolvedValue(undefined);
+  const auth = overrides.authSession ?? createMemoryAuthSession(() => {}, "tok");
   render(
-    <ProjectSettingsDialog
-      open
-      project={project}
-      onClose={onClose}
-      onSave={onSave}
-      {...overrides}
-    />,
+    <ToastProvider>
+      <TooltipProvider>
+        <ProjectSettingsDialog
+          open
+          project={project}
+          onClose={onClose}
+          onSave={onSave}
+          auth={auth}
+          authSession={auth}
+          {...overrides}
+        />
+      </TooltipProvider>
+    </ToastProvider>,
   );
-  return { onClose, onSave };
+  return { onClose, onSave, auth };
 }
 
 describe("ProjectSettingsDialog", () => {
@@ -89,5 +99,28 @@ describe("ProjectSettingsDialog", () => {
     expect(screen.getByRole("dialog")).toBeTruthy();
     fireEvent.keyDown(document, { key: "Escape" });
     await waitFor(() => expect(onClose).toHaveBeenCalled());
+  });
+
+  test("设置 / 资产 tab 切换，保存行为不回归", async () => {
+    vi.spyOn(api, "listProjectAssets").mockResolvedValue([]);
+    const { onSave, auth } = renderDialog();
+    expect(screen.getByRole("tab", { name: "设置" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByLabelText("自定义指令")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "保存" })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("tab", { name: "资产" }));
+    await waitFor(() => expect(screen.getByRole("tab", { name: "资产" })).toHaveAttribute("aria-selected", "true"));
+    expect(screen.getByRole("button", { name: "上传参考资料" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "保存" })).toBeNull();
+    expect(api.listProjectAssets).toHaveBeenCalledWith(auth, "p1");
+
+    fireEvent.click(screen.getByRole("tab", { name: "设置" }));
+    await waitFor(() => expect(screen.getByLabelText("自定义指令")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    await waitFor(() =>
+      expect(onSave).toHaveBeenCalledWith(
+        expect.objectContaining({ name: "调研", color: "accent", instructions: "用中文回答" }),
+      ),
+    );
   });
 });

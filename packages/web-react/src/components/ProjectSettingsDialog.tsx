@@ -1,11 +1,19 @@
 import { useEffect, useId, useRef, useState, type ReactElement } from "react";
 import { apiErrorMessage } from "../lib/api";
-import type { ChatProject } from "../lib/types";
+import type { AuthSession, ChatProject, Session } from "../lib/types";
 import { cn } from "../lib/utils";
-import { Alert, Button, Field, Input, Modal, Textarea } from "./ui";
+import { ProjectAssetsPanel } from "./ProjectAssetsPanel";
+import { Alert, Button, Field, Input, Modal, Tabs, Textarea } from "./ui";
 
 const NAME_MAX = 60;
 const INSTRUCTIONS_MAX = 4000;
+
+const SETTINGS_TABS = [
+  { value: "settings", label: "设置" },
+  { value: "assets", label: "资产" },
+] as const;
+
+type DialogTab = (typeof SETTINGS_TABS)[number]["value"];
 
 /** 项目色板：key 写入 ChatProject.color，dotClass 用设计 token 背景色。 */
 export const PROJECT_COLORS: { key: string; label: string; dotClass: string }[] = [
@@ -22,16 +30,35 @@ export const PROJECT_COLORS: { key: string; label: string; dotClass: string }[] 
 export function ProjectSettingsDialog(props: {
   open: boolean;
   project: ChatProject | null;
+  /** default 组：只显示资产面板，projectId 传 null。 */
+  assetsOnly?: boolean;
   onClose: () => void;
   onSave: (patch: {
     name?: string;
     color?: string | null;
     instructions?: string | null;
   }) => Promise<void>;
+  demo?: boolean;
+  auth?: AuthSession | null;
+  authSession?: AuthSession;
+  sessions?: Pick<Session, "id" | "title">[];
+  onOpenSession?: (sessionId: string) => void;
 }): ReactElement | null {
-  const { open, project, onClose, onSave } = props;
+  const {
+    open,
+    project,
+    assetsOnly = false,
+    onClose,
+    onSave,
+    demo = false,
+    auth = null,
+    authSession,
+    sessions,
+    onOpenSession,
+  } = props;
   const titleId = useId();
   const nameRef = useRef<HTMLInputElement>(null);
+  const [tab, setTab] = useState<DialogTab>("settings");
   const [name, setName] = useState("");
   const [color, setColor] = useState<string | null>(null);
   const [instructions, setInstructions] = useState("");
@@ -39,27 +66,32 @@ export function ProjectSettingsDialog(props: {
   const [error, setError] = useState("");
 
   useEffect(() => {
-    if (!open || !project) return;
-    setName(project.name);
-    setColor(project.color ?? null);
-    setInstructions(project.instructions ?? "");
+    if (!open) return;
+    setTab(assetsOnly ? "assets" : "settings");
     setError("");
     setSaving(false);
-  }, [open, project]);
+    if (project) {
+      setName(project.name);
+      setColor(project.color ?? null);
+      setInstructions(project.instructions ?? "");
+    }
+  }, [open, project, assetsOnly]);
 
-  if (!project) return null;
+  if (!assetsOnly && !project) return null;
 
+  const activeTab: DialogTab = assetsOnly ? "assets" : tab;
   const nameTrim = name.trim();
   const nameInvalid = nameTrim.length < 1 || nameTrim.length > NAME_MAX;
   const instructionsOver = instructions.length > INSTRUCTIONS_MAX;
   const canSave = !nameInvalid && !instructionsOver && !saving;
+  const showSettings = !assetsOnly && activeTab === "settings";
 
   const handleOpenChange = (next: boolean) => {
     if (!next && !saving) onClose();
   };
 
   const handleSave = async () => {
-    if (!canSave) return;
+    if (!canSave || assetsOnly) return;
     setSaving(true);
     setError("");
     try {
@@ -79,105 +111,144 @@ export function ProjectSettingsDialog(props: {
     <Modal
       open={open}
       onOpenChange={handleOpenChange}
-      title={<span id={titleId}>项目设置</span>}
-      description="项目指令会在该项目下的会话里作为额外偏好生效，不会覆盖平台规则。"
-      size="md"
+      title={<span id={titleId}>{assetsOnly ? "项目资产" : "项目设置"}</span>}
+      description={
+        assetsOnly
+          ? "未分组会话的上传资料与产出物。"
+          : activeTab === "assets"
+            ? "聚合本项目下的上传资料与会话产出。"
+            : "项目指令会在该项目下的会话里作为额外偏好生效，不会覆盖平台规则。"
+      }
+      size="lg"
+      fixedHeight
+      mobile="sheet"
       onOpenAutoFocus={(e) => {
+        if (assetsOnly || activeTab === "assets") return;
         e.preventDefault();
         nameRef.current?.focus();
       }}
+      toolbar={
+        assetsOnly ? undefined : (
+          <Tabs
+            value={activeTab}
+            onValueChange={(v) => setTab(v as DialogTab)}
+            items={[...SETTINGS_TABS]}
+            idBase="project-settings"
+            aria-label="项目设置分区"
+          />
+        )
+      }
       footer={
-        <>
-          <Button variant="secondary" onClick={onClose} disabled={saving}>
-            取消
-          </Button>
-          <Button variant="primary" onClick={() => void handleSave()} disabled={!canSave} loading={saving}>
-            保存
-          </Button>
-        </>
+        showSettings ? (
+          <>
+            <Button variant="secondary" onClick={onClose} disabled={saving}>
+              取消
+            </Button>
+            <Button variant="primary" onClick={() => void handleSave()} disabled={!canSave} loading={saving}>
+              保存
+            </Button>
+          </>
+        ) : undefined
       }
     >
-      <div className="flex flex-col gap-4">
-        <Field
-          label="名称"
-          required
-          error={
-            name.length > 0 && nameInvalid
-              ? `名称需为 1–${NAME_MAX} 个字`
-              : undefined
-          }
-        >
-          <Input
-            ref={nameRef}
-            value={name}
-            maxLength={NAME_MAX + 8}
-            onChange={(e) => setName(e.target.value)}
-            autoComplete="off"
-          />
-        </Field>
+      {showSettings ? (
+        <div id="project-settings-panel-settings" role="tabpanel" className="flex flex-col gap-4">
+          <Field
+            label="名称"
+            required
+            error={
+              name.length > 0 && nameInvalid
+                ? `名称需为 1–${NAME_MAX} 个字`
+                : undefined
+            }
+          >
+            <Input
+              ref={nameRef}
+              value={name}
+              maxLength={NAME_MAX + 8}
+              onChange={(e) => setName(e.target.value)}
+              autoComplete="off"
+            />
+          </Field>
 
-        <Field label="颜色" hint="可选。无颜色时侧栏只显示名称。">
-          <div role="radiogroup" aria-label="项目颜色" className="flex flex-wrap items-center gap-2">
-            <button
-              type="button"
-              role="radio"
-              aria-checked={color === null}
-              aria-label="无颜色"
-              onClick={() => setColor(null)}
-              className={cn(
-                "flex size-8 items-center justify-center rounded-full border outline-none transition-shadow focus-visible:ring-2 focus-visible:ring-ring",
-                color === null ? "border-accent ring-2 ring-ring" : "border-border-control hover:border-border-strong",
-              )}
-            >
-              <span className="size-4 rounded-full border border-dashed border-border-strong bg-surface" />
-            </button>
-            {PROJECT_COLORS.map((c) => (
+          <Field label="颜色" hint="可选。无颜色时侧栏只显示名称。">
+            <div role="radiogroup" aria-label="项目颜色" className="flex flex-wrap items-center gap-2">
               <button
-                key={c.key}
                 type="button"
                 role="radio"
-                aria-checked={color === c.key}
-                aria-label={c.label}
-                title={c.label}
-                onClick={() => setColor(c.key)}
+                aria-checked={color === null}
+                aria-label="无颜色"
+                onClick={() => setColor(null)}
                 className={cn(
                   "flex size-8 items-center justify-center rounded-full border outline-none transition-shadow focus-visible:ring-2 focus-visible:ring-ring",
-                  color === c.key ? "border-accent ring-2 ring-ring" : "border-transparent hover:border-border-strong",
+                  color === null ? "border-accent ring-2 ring-ring" : "border-border-control hover:border-border-strong",
                 )}
               >
-                <span className={cn("size-5 rounded-full", c.dotClass)} />
+                <span className="size-4 rounded-full border border-dashed border-border-strong bg-surface" />
               </button>
-            ))}
-          </div>
-        </Field>
+              {PROJECT_COLORS.map((c) => (
+                <button
+                  key={c.key}
+                  type="button"
+                  role="radio"
+                  aria-checked={color === c.key}
+                  aria-label={c.label}
+                  title={c.label}
+                  onClick={() => setColor(c.key)}
+                  className={cn(
+                    "flex size-8 items-center justify-center rounded-full border outline-none transition-shadow focus-visible:ring-2 focus-visible:ring-ring",
+                    color === c.key ? "border-accent ring-2 ring-ring" : "border-transparent hover:border-border-strong",
+                  )}
+                >
+                  <span className={cn("size-5 rounded-full", c.dotClass)} />
+                </button>
+              ))}
+            </div>
+          </Field>
 
-        <Field
-          label="自定义指令"
-          hint="写入后，该项目下新建与已有会话都会带上这段偏好；平台安全与产品规则始终优先。"
-          error={instructionsOver ? `最多 ${INSTRUCTIONS_MAX} 字` : undefined}
-        >
-          <Textarea
-            value={instructions}
-            rows={6}
-            onChange={(e) => setInstructions(e.target.value)}
-            aria-label="自定义指令"
+          <Field
+            label="自定义指令"
+            hint="写入后，该项目下新建与已有会话都会带上这段偏好；平台安全与产品规则始终优先。"
+            error={instructionsOver ? `最多 ${INSTRUCTIONS_MAX} 字` : undefined}
+          >
+            <Textarea
+              value={instructions}
+              rows={6}
+              onChange={(e) => setInstructions(e.target.value)}
+              aria-label="自定义指令"
+            />
+          </Field>
+          <p
+            className={cn(
+              "text-caption tabular-nums",
+              instructionsOver ? "text-danger" : "text-faint",
+            )}
+          >
+            {instructions.length} / {INSTRUCTIONS_MAX}
+          </p>
+
+          {error ? (
+            <Alert tone="danger" density="compact">
+              {error}
+            </Alert>
+          ) : null}
+        </div>
+      ) : authSession ? (
+        <div id="project-settings-panel-assets" role="tabpanel">
+          <ProjectAssetsPanel
+            projectId={assetsOnly ? null : (project?.id ?? null)}
+            demo={demo}
+            auth={auth}
+            authSession={authSession}
+            sessions={sessions}
+            onOpenSession={onOpenSession}
           />
-        </Field>
-        <p
-          className={cn(
-            "text-caption tabular-nums",
-            instructionsOver ? "text-danger" : "text-faint",
-          )}
-        >
-          {instructions.length} / {INSTRUCTIONS_MAX}
-        </p>
-
-        {error ? (
-          <Alert tone="danger" density="compact">
-            {error}
-          </Alert>
-        ) : null}
-      </div>
+        </div>
+      ) : (
+        <Alert tone="warning" density="compact">
+          登录后才能管理项目资产。
+        </Alert>
+      )}
     </Modal>
   );
 }

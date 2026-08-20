@@ -29,6 +29,7 @@ export function ProjectRow({
   onRename,
   onDelete,
   onOpenSettings,
+  onOpenAssets,
   onMoveUp,
   onMoveDown,
   onDragOverSession,
@@ -54,6 +55,8 @@ export function ProjectRow({
   onRename?: (p: ChatProject) => void;
   onDelete?: (p: ChatProject) => void;
   onOpenSettings?: (p: ChatProject) => void;
+  /** 虚拟 default 组专用：菜单只含「项目资产」。 */
+  onOpenAssets?: (p: ChatProject) => void;
   onMoveUp?: () => void;
   onMoveDown?: () => void;
   onDragOverSession: (e: DragEvent) => void;
@@ -64,6 +67,9 @@ export function ProjectRow({
   onProjectDrop?: (e: DragEvent) => void;
 }) {
   const canMutate = !immutable;
+  const showMutateMenu = canMutate && Boolean(onRename || onDelete || onOpenSettings || showMoveInMenu);
+  const showAssetsOnlyMenu = Boolean(immutable && onOpenAssets);
+  const showMenu = showMutateMenu || showAssetsOnlyMenu;
   return (
     <div
       draggable={canMutate && allowDrag}
@@ -129,7 +135,7 @@ export function ProjectRow({
         )}
         <span className="shrink-0 text-caption text-faint">{count}</span>
       </button>
-      {canMutate && (onRename || onDelete || onOpenSettings || showMoveInMenu) && (
+      {showMenu && (
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <IconButton
@@ -143,6 +149,14 @@ export function ProjectRow({
             </IconButton>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end" className="w-44">
+            {showAssetsOnlyMenu && (
+              <DropdownMenuItem
+                className="[@media(hover:none)]:min-h-11"
+                onSelect={() => onOpenAssets?.(p)}
+              >
+                项目资产
+              </DropdownMenuItem>
+            )}
             {onOpenSettings && (
               <DropdownMenuItem onSelect={() => onOpenSettings(p)}>项目设置</DropdownMenuItem>
             )}
