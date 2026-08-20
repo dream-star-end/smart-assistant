@@ -17,6 +17,8 @@ import type { UseChatSocket } from "./useChatSocket";
 
 /** 历史重拉冷却（S2）：同会话此窗口内只拉一次；过后允许增量重拉（sinceSeq + server-wins 幂等）。*/
 const HISTORY_REFETCH_COOLDOWN_MS = 5000;
+/** 侧栏列表刷新：对齐站内信，可见标签 60s 一轮。 */
+const LIST_POLL_MS = 60_000;
 
 /** WS 会话 id（peer.id）：须匹配后端 `[A-Za-z0-9_-]{8,50}`。*/
 export function genWsSessionId(): string {
@@ -64,6 +66,7 @@ function metaToSession(m: SessionMeta, ownerUserId: string): Session {
     lastOutcome: m.lastOutcome ?? null,
     lastErrorCode: m.lastErrorCode ?? null,
     archived: m.archived === true,
+    unread: m.unread === true,
     lastAt: m.lastAt,
     // 服务端无值(该会话从未显式选过/PATCH 尚未落地)= 键缺席,server-wins 合并不清掉本地意图。
     ...(m.modelId ? { modelId: m.modelId } : {}),
@@ -318,10 +321,8 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
           sinceHistoryRevision,
         );
         // await 期间换号、reset 或删除会话 → 丢弃旧响应，绝不污染当前会话/IndexedDB。
-        if (
-          userIdRef.current !== owner ||
-          historyFetchingRef.current.get(id) !== requestToken
-        ) return;
+        if (userIdRef.current !== owner || historyFetchingRef.current.get(id) !== requestToken)
+          return;
         const msgs = Array.isArray(detail.messages) ? (detail.messages as ChatMessage[]) : [];
         // 会话模型陈旧载荷拦截:pending 意图存续/低于已确认写水位的 detail,其 modelId
         // 不应用(消息合并照常 —— socket 有自己的版本护栏)。
@@ -362,44 +363,45 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
         }
         const liveSocket = cbRef.current.sockRef.current;
         if (liveSocket?.hydrateDurableLiveFrameJournal) {
-          void liveSocket.hydrateDurableLiveFrameJournal(
-            id,
-            (after) => api.getSessionLiveFrames(
-              cbRef.current.authSession,
+          void liveSocket
+            .hydrateDurableLiveFrameJournal(
               id,
-              after,
-              500,
-            ),
-            async () => {
-              const tapeDetail = await api.getSession(cbRef.current.authSession, id, 0);
-              liveSocket.mergeServerHistory({
-                sessId: id,
-                agentId: tapeDetail.agentId || agentId,
-                messages: Array.isArray(tapeDetail.messages) ? tapeDetail.messages as ChatMessage[] : [],
-                full: !tapeDetail.isPartial,
-                maxSeq: tapeDetail.maxSeq,
-                archivedThroughSeq: tapeDetail.archivedThroughSeq,
-                archivedCount: tapeDetail.archivedCount,
-                serverUpdatedAt: tapeDetail.updatedAt,
-                modelId: tapeDetail.modelId,
-                historyRevision: tapeDetail.historyRevision,
-                timelineGeneration: tapeDetail.timelineGeneration,
-                timelineCursor: tapeDetail.timelineCursor,
-                timelineHasMore: tapeDetail.timelineHasMore,
-                timelineSnapshotMaxSeq: tapeDetail.timelineSnapshotMaxSeq,
-                invalidateHistoryCache: tapeDetail._historyRevisionUnsupported === true,
-              });
-            },
-          ).catch(() => {
-            /* hydrate degrades internally; a thrown first page must not resurrect the skeleton */
-          });
+              (after) => api.getSessionLiveFrames(cbRef.current.authSession, id, after, 500),
+              async () => {
+                const tapeDetail = await api.getSession(cbRef.current.authSession, id, 0);
+                liveSocket.mergeServerHistory({
+                  sessId: id,
+                  agentId: tapeDetail.agentId || agentId,
+                  messages: Array.isArray(tapeDetail.messages)
+                    ? (tapeDetail.messages as ChatMessage[])
+                    : [],
+                  full: !tapeDetail.isPartial,
+                  maxSeq: tapeDetail.maxSeq,
+                  archivedThroughSeq: tapeDetail.archivedThroughSeq,
+                  archivedCount: tapeDetail.archivedCount,
+                  serverUpdatedAt: tapeDetail.updatedAt,
+                  modelId: tapeDetail.modelId,
+                  historyRevision: tapeDetail.historyRevision,
+                  timelineGeneration: tapeDetail.timelineGeneration,
+                  timelineCursor: tapeDetail.timelineCursor,
+                  timelineHasMore: tapeDetail.timelineHasMore,
+                  timelineSnapshotMaxSeq: tapeDetail.timelineSnapshotMaxSeq,
+                  invalidateHistoryCache: tapeDetail._historyRevisionUnsupported === true,
+                });
+              },
+            )
+            .catch(() => {
+              /* hydrate degrades internally; a thrown first page must not resurrect the skeleton */
+            });
         }
         // 会话级模型选择的侧栏回填:detail 比 boot 时的 listSessions 新(他设备刚改过),
         // 不回填则 App 恢复选择器仍读侧栏旧值。server-wins,detail 无值不清本地
         // (服务端 NULL 只表示"从未显式选择",不存在"清除"流,缺席=不表态)。
         if (freshModelId) {
           setSessions((c) =>
-            c.map((s) => (s.id === id && s.modelId !== freshModelId ? { ...s, modelId: freshModelId } : s)),
+            c.map((s) =>
+              s.id === id && s.modelId !== freshModelId ? { ...s, modelId: freshModelId } : s,
+            ),
           );
         }
         historyFetchedAtRef.current.set(id, Date.now());
@@ -428,9 +430,12 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
             return next;
           });
         } else if (historyFetchingRef.current.get(id) === requestToken) {
-          const message = e instanceof ApiError
-            ? (e.message || `加载失败 (${e.status})`)
-            : e instanceof Error ? e.message : "加载失败";
+          const message =
+            e instanceof ApiError
+              ? e.message || `加载失败 (${e.status})`
+              : e instanceof Error
+                ? e.message
+                : "加载失败";
           setHistoryErrorBySession((current) => {
             const next = new Map(current);
             next.set(id, { token: requestToken, message });
@@ -500,41 +505,81 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
   const nextCursorRef = useRef<number | undefined>(undefined);
   const loadMoreInflightRef = useRef(false);
   const archivedFetchedRef = useRef(false);
+  const listRefreshInflightRef = useRef(false);
+
+  const mapListMetas = useCallback(
+    (metas: SessionMeta[]): Session[] => {
+      if (!user) return [];
+      return metas.map((m) => {
+        const s = metaToSession(m, user.id);
+        if (s.modelId !== undefined && !modelPayloadFresh(m.id, m.updatedAt)) {
+          const { modelId: _stale, ...rest } = s;
+          return rest;
+        }
+        return s;
+      });
+    },
+    [user, modelPayloadFresh],
+  );
+
+  const refreshSessionList = useCallback(
+    async (opts?: { initial?: boolean; cancelled?: () => boolean }) => {
+      if (demo || !auth || !user) return;
+      if (listRefreshInflightRef.current && !opts?.initial) return;
+      listRefreshInflightRef.current = true;
+      try {
+        const metas = await api.listSessions(cbRef.current.authSession);
+        if (opts?.cancelled?.()) return;
+        const server = mapListMetas(metas);
+        setSessions((cur) => upsertSessions(cur, server, true));
+        if (opts?.initial) {
+          nextCursorRef.current = undefined;
+          setHasMoreSessions(server.length > 0);
+        }
+      } catch {
+        /* 列表失败：保留本地会话，不打断工作区 */
+      } finally {
+        listRefreshInflightRef.current = false;
+      }
+    },
+    [demo, auth, user, mapListMetas],
+  );
 
   // 历史会话列表：登录后用 listSessions 填侧栏（server canonical 元数据 server-wins）。
   // 失败保留本地（IndexedDB 注水）会话，不阻断。
   useEffect(() => {
     if (demo || !auth || !user) return;
     let cancelled = false;
-    api
-      .listSessions(cbRef.current.authSession)
-      .then((metas) => {
-        if (cancelled) return;
-        const server = metas.map((m) => {
-          const s = metaToSession(m, user.id);
-          // 会话模型陈旧载荷拦截(与 loadHistory 同款):pending 意图存续/低于已确认写水位
-          // → 剥掉其 modelId 键(键缺席=不表态,合并保留本地新选择),其余元数据照常 server-wins。
-          if (s.modelId !== undefined && !modelPayloadFresh(m.id, m.updatedAt)) {
-            const { modelId: _stale, ...rest } = s;
-            return rest;
-          }
-          return s;
-        });
-        setSessions((cur) => upsertSessions(cur, server, true));
-        // 无参首屏不带 nextCursor；允许滚到底后试探一页。空列表则停。
-        nextCursorRef.current = undefined;
-        setHasMoreSessions(server.length > 0);
-      })
-      .catch(() => {
-        /* 列表失败：保留本地会话，不打断工作区 */
-      })
-      .finally(() => {
-        if (!cancelled) setServerListSettled(true);
-      });
+    refreshSessionList({ initial: true, cancelled: () => cancelled }).finally(() => {
+      if (!cancelled) setServerListSettled(true);
+    });
     return () => {
       cancelled = true;
     };
-  }, [demo, auth, user, modelPayloadFresh]);
+  }, [demo, auth, user, refreshSessionList]);
+
+  // 可见标签 60s 轮询 + 切回前台/窗口 focus 立即重拉。hidden 不打；未登录/demo 不拉。
+  // upsertSessions union 保住已 loadMore 的行，不重置分页游标。
+  useEffect(() => {
+    if (demo || !auth || !user) return;
+    const tick = () => {
+      if (document.visibilityState === "visible") void refreshSessionList();
+    };
+    const timer = window.setInterval(tick, LIST_POLL_MS);
+    const onVis = () => {
+      if (document.visibilityState === "visible") void refreshSessionList();
+    };
+    const onFocus = () => {
+      void refreshSessionList();
+    };
+    document.addEventListener("visibilitychange", onVis);
+    window.addEventListener("focus", onFocus);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVis);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [demo, auth, user, refreshSessionList]);
 
   // 登录后自动恢复"上次会话"：侧栏（IndexedDB 注水 / listSessions）填好且用户尚未选任何会话时，
   // 选中最近一条（sessions 已按 updatedAt 倒序，[0]=最近）。仅做一次（autoSelectedRef）——
@@ -707,9 +752,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
   const loadMoreSessions = async () => {
     if (demo || !auth || !user || loadMoreInflightRef.current || !hasMoreSessions) return;
     const live = sessions.filter((s) => !s.archived);
-    const oldest = live.length
-      ? Math.min(...live.map(sessionCursorAt))
-      : nextCursorRef.current;
+    const oldest = live.length ? Math.min(...live.map(sessionCursorAt)) : nextCursorRef.current;
     if (oldest == null || oldest <= 0) {
       setHasMoreSessions(false);
       return;
@@ -795,14 +838,22 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
           if (x.id !== sessId) return x;
           const nextOutcome = terminal ? terminal.lastOutcome : x.lastOutcome;
           const nextCode = terminal ? terminal.lastErrorCode : x.lastErrorCode;
-          if (x.runState === "idle" && x.lastOutcome === nextOutcome && x.lastErrorCode === nextCode) {
+          if (
+            x.runState === "idle" &&
+            x.lastOutcome === nextOutcome &&
+            x.lastErrorCode === nextCode
+          ) {
             return x;
           }
           return {
             ...x,
             runState: "idle" as const,
             ...(terminal
-              ? { lastOutcome: terminal.lastOutcome, lastErrorCode: terminal.lastErrorCode }
+              ? {
+                  lastOutcome: terminal.lastOutcome,
+                  lastErrorCode: terminal.lastErrorCode,
+                  unread: true,
+                }
               : {}),
           };
         }),

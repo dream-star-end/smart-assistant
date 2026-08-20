@@ -544,9 +544,19 @@ export function Sidebar({
             onMarkRead?.(hit.sessionId);
             onSelect(hit.sessionId);
           }}
-          className="flex h-full w-full min-w-0 flex-col justify-center rounded-md px-3 text-left text-section text-muted outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+          className={
+            unreadIds?.has(hit.sessionId) || hit.unread
+              ? "flex h-full w-full min-w-0 flex-col justify-center rounded-md px-3 text-left text-section text-fg outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring"
+              : "flex h-full w-full min-w-0 flex-col justify-center rounded-md px-3 text-left text-section text-muted outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+          }
         >
-          <span className="truncate">{hit.title || "新对话"}</span>
+          <span
+            className={
+              unreadIds?.has(hit.sessionId) || hit.unread ? "truncate font-semibold" : "truncate"
+            }
+          >
+            {hit.title || "新对话"}
+          </span>
           <span className="truncate text-caption text-faint">
             <HighlightedText text={hit.snippet} query={q} />
           </span>

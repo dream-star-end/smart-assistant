@@ -115,6 +115,8 @@ import {
   type ClientSessionLifecycleRef,
   type BatchClientSessionsInput,
   type BatchClientSessionsResult,
+  type MarkClientSessionReadResult,
+  type MigrateClientSessionsUnreadResult,
   type ClientSessionMeta,
   type ClientSessionMetaPatch,
   type ListClientSessionsOpts,
@@ -162,6 +164,8 @@ import {
   rankSessionSearchHits,
   sanitizeProjectInstructions,
   LAST_MESSAGE_PREVIEW_TAIL_MAX,
+  CLIENT_SESSION_UNREAD_OUTCOMES,
+  SESSION_BATCH_IDS_MAX,
   SESSION_LIST_LIMIT_MAX,
   SESSION_SEARCH_JSON_CANDIDATE_MAX,
   SESSION_SEARCH_JSON_EXPAND_MAX_BYTES,
@@ -473,6 +477,45 @@ const FINALIZED_TAPE_PARTS_DELETE_MS = 48 * 60 * 60_000;
 // 普通 UPDATE 时用裸列)。第三个 GREATEST 参数(客户端 requested)只 upsert 用,append/patch
 // 路径无客户端值 → 用两参形态。
 const CLOCK_MS_SQL = "(floor(EXTRACT(EPOCH FROM clock_timestamp())*1000))::BIGINT";
+const UNREAD_OUTCOME_SQL = CLIENT_SESSION_UNREAD_OUTCOMES.map((o) => `'${o}'`).join(",");
+const LAST_D_TERMINAL_MS_SQL = "(floor(EXTRACT(EPOCH FROM last_d.terminal_at)*1000))::BIGINT";
+
+function dispatchUidForList(userId: string): string {
+  return /^c:([1-9][0-9]*)$/.exec(userId)?.[1] ?? "-1";
+}
+
+async function pgUnreadBySessionIds(
+  pool: Pool,
+  userId: string,
+  ids: string[],
+): Promise<Map<string, boolean>> {
+  const unread = new Map<string, boolean>();
+  if (ids.length === 0) return unread;
+  const rows = (
+    await pool.query<{ id: string; unread: boolean }>(
+      `SELECT cs.id,
+              (last_d.outcome IN (${UNREAD_OUTCOME_SQL})
+               AND ${LAST_D_TERMINAL_MS_SQL} > COALESCE(cs.last_read_at, 0)) AS unread
+         FROM client_sessions cs
+         LEFT JOIN (
+           SELECT session_id, outcome, terminal_at FROM (
+             SELECT session_id, outcome, terminal_at,
+                    ROW_NUMBER() OVER (
+                      PARTITION BY session_id
+                      ORDER BY terminal_at DESC NULLS LAST, admitted_at DESC, dispatch_id DESC
+                    ) AS rn
+               FROM turn_dispatches
+              WHERE user_id = $2 AND status = 'terminal'
+           ) ranked
+           WHERE rn = 1
+         ) last_d ON last_d.session_id = cs.id
+        WHERE cs.user_id = $1 AND cs.deleted_at IS NULL AND cs.id = ANY($3::text[])`,
+      [userId, dispatchUidForList(userId), ids],
+    )
+  ).rows;
+  for (const r of rows) unread.set(r.id, r.unread === true);
+  return unread;
+}
 
 const PG_CHAT_PROJECT_SELECT = `
   SELECT p.id, p.name, p.instructions, p.color, p.sort_order, p.created_at, p.updated_at,
@@ -1058,6 +1101,7 @@ const PROBE_EXPECTED_COLUMNS: ReadonlyArray<[string, string, string]> = [
   ["client_sessions", "next_seq", "integer"],
   ["client_sessions", "archived_through_seq", "integer"],
   ["client_sessions", "archived_at", "bigint"],
+  ["client_sessions", "last_read_at", "bigint"],
   ["client_sessions", "history_revision", "bigint"],
   ["client_sessions", "timeline_generation", "bigint"],
   ["client_session_archive_chunks", "session_id", "text"],
@@ -9526,7 +9570,7 @@ export function createPgSessionsBackend(
       // inbox 在容器 SQLite;master 权威是 turn_dispatches(status/outcome/failure_code)。
       // last_preview_raw:数组尾部最多 20 条里最近非空 .text(线上 assistant 无 text);
       // octet_length > 2MB 不展开,不把 messages blob 拉进 Node。
-      const dispatchUid = /^c:([1-9][0-9]*)$/.exec(userId)?.[1] ?? "-1";
+      const dispatchUid = dispatchUidForList(userId);
       const includeArchived = opts.includeArchived === true;
       const before = typeof opts.before === "number" && Number.isFinite(opts.before) && opts.before > 0
         ? Math.floor(opts.before)
@@ -9559,6 +9603,7 @@ export function createPgSessionsBackend(
           run_state: string;
           last_outcome: string | null;
           last_error_code: string | null;
+          unread: boolean;
         }>(
           `SELECT cs.id, cs.agent_id, cs.title, cs.pinned, cs.created_at, cs.last_at, cs.updated_at,
                   cs.message_count AS msg_count, cs.model_id, cs.project_id, cs.archived_at,
@@ -9578,7 +9623,9 @@ export function createPgSessionsBackend(
                        ) END AS last_preview_raw,
                   CASE WHEN open_d.session_id IS NOT NULL THEN 'running' ELSE 'idle' END AS run_state,
                   last_d.outcome AS last_outcome,
-                  last_d.failure_code AS last_error_code
+                  last_d.failure_code AS last_error_code,
+                  (last_d.outcome IN (${UNREAD_OUTCOME_SQL})
+                   AND ${LAST_D_TERMINAL_MS_SQL} > COALESCE(cs.last_read_at, 0)) AS unread
              FROM client_sessions cs
              LEFT JOIN (
                SELECT session_id FROM turn_dispatches
@@ -9587,8 +9634,8 @@ export function createPgSessionsBackend(
                 GROUP BY session_id
              ) open_d ON open_d.session_id = cs.id
              LEFT JOIN (
-               SELECT session_id, outcome, failure_code FROM (
-                 SELECT session_id, outcome, failure_code,
+               SELECT session_id, outcome, failure_code, terminal_at FROM (
+                 SELECT session_id, outcome, failure_code, terminal_at,
                         ROW_NUMBER() OVER (
                           PARTITION BY session_id
                           ORDER BY terminal_at DESC NULLS LAST, admitted_at DESC, dispatch_id DESC
@@ -9626,6 +9673,7 @@ export function createPgSessionsBackend(
             runState: r.run_state === "running" ? "running" : "idle",
             lastOutcome: mapClientSessionLastOutcome(r.last_outcome),
             lastErrorCode: r.last_error_code ?? null,
+            unread: r.unread === true,
             archived: r.archived_at != null,
             ...(preview ? { lastMessagePreview: preview } : {}),
             ...(r.model_id ? { modelId: r.model_id } : {}),
@@ -10328,7 +10376,15 @@ export function createPgSessionsBackend(
           kind: "message" as const,
         })),
       ];
-      return { results: rankSessionSearchHits(hits, limit) };
+      const ranked = rankSessionSearchHits(hits, limit);
+      const unreadMap = await pgUnreadBySessionIds(
+        pool,
+        userId,
+        ranked.map((h) => h.sessionId),
+      );
+      return {
+        results: ranked.map((h) => ({ ...h, unread: unreadMap.get(h.sessionId) === true })),
+      };
     },
 
     async batchClientSessions(
@@ -10413,6 +10469,43 @@ export function createPgSessionsBackend(
         }
         return { ok: true, updated, skipped };
       });
+    },
+
+    async markClientSessionRead(userId: string, sessionId: string): Promise<MarkClientSessionReadResult> {
+      const res = await pool.query(
+        `UPDATE client_sessions SET last_read_at = ${CLOCK_MS_SQL}
+          WHERE user_id = $1 AND id = $2 AND deleted_at IS NULL`,
+        [userId, sessionId],
+      );
+      const updated = res.rowCount ?? 0;
+      if (updated === 0) return { ok: false, error: "not_found" };
+      return { ok: true, updated };
+    },
+
+    async markAllClientSessionsRead(userId: string): Promise<{ updated: number }> {
+      const res = await pool.query(
+        `UPDATE client_sessions SET last_read_at = ${CLOCK_MS_SQL}
+          WHERE user_id = $1 AND deleted_at IS NULL`,
+        [userId],
+      );
+      return { updated: res.rowCount ?? 0 };
+    },
+
+    async migrateClientSessionsUnread(
+      userId: string,
+      ids: unknown,
+    ): Promise<MigrateClientSessionsUnreadResult> {
+      if (!Array.isArray(ids)) return { ok: false, error: "invalid_ids" };
+      if (ids.length > SESSION_BATCH_IDS_MAX) return { ok: false, error: "ids_limit" };
+      const sessionIds = ids.filter((id): id is string => typeof id === "string" && id.length > 0);
+      if (sessionIds.length !== ids.length) return { ok: false, error: "invalid_ids" };
+      if (sessionIds.length === 0) return { ok: true, updated: 0 };
+      const res = await pool.query(
+        `UPDATE client_sessions SET last_read_at = 0
+          WHERE user_id = $1 AND deleted_at IS NULL AND id = ANY($2::text[])`,
+        [userId, sessionIds],
+      );
+      return { ok: true, updated: res.rowCount ?? 0 };
     },
 
     async listChatProjects(userId: string): Promise<ChatProject[]> {

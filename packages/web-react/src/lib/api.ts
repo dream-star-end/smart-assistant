@@ -1705,6 +1705,47 @@ export const api = {
     ),
 
   /**
+   * 打开会话标已读（POST /api/sessions/:id/read）。不挂 GET :id，避免预取/搜索误标。
+   */
+  markSessionRead: (a: AuthSession, id: string): Promise<{ ok: true; updated: number }> =>
+    jsonOrThrow<{ ok: true; updated: number }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/sessions/${encodeURIComponent(id)}/read`, {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+        }),
+      ),
+    ),
+
+  /** 全部标已读（POST /api/sessions/read-all）。 */
+  markAllSessionsRead: (a: AuthSession): Promise<{ ok: true; updated: number }> =>
+    jsonOrThrow<{ ok: true; updated: number }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/sessions/read-all", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+        }),
+      ),
+    ),
+
+  /**
+   * 一次性把浏览器 localStorage 未读集合迁到服务端（POST /api/sessions/unread-migrate）。
+   */
+  migrateUnreadSessions: (a: AuthSession, ids: string[]): Promise<{ ok: true; updated: number }> =>
+    jsonOrThrow<{ ok: true; updated: number }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/sessions/unread-migrate", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({ ids }),
+        }),
+      ),
+    ),
+
+  /**
    * 取单个会话（GET /api/sessions/:id，Bearer）。
    * sinceSeq>0 且 revision 匹配 → 增量同步；缺失/不匹配由后端降级全量。
    * 不存在 → 404（经 ApiError 抛）。id 形态须匹配后端 `[A-Za-z0-9_-]{8,50}`。

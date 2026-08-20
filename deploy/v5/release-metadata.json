@@ -117,7 +117,8 @@
     "0236_memory_usage_observability",
     "0237_project_assets",
     "0238_long_context_price_15x",
-    "0239_turn_dispatch_shutdown_ctx"
+    "0239_turn_dispatch_shutdown_ctx",
+    "0240_client_session_last_read_at"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

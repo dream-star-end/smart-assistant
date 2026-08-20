@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { api } from "../lib/api";
 import { resolveSessionStatus } from "../lib/sessionStatus";
+import type { AuthSession } from "../lib/types";
 
-const MAX_UNREAD = 200;
 const TERMINAL_OUTCOMES = new Set([
   "completed",
   "interrupted",
@@ -24,6 +25,7 @@ export type UnreadSessionInput = {
   runState?: string;
   lastOutcome?: string | null;
   lastErrorCode?: string | null;
+  unread?: boolean;
 };
 
 export type UnreadState = {
@@ -54,26 +56,23 @@ function readPermission(): NotificationPermission | "unsupported" {
   }
 }
 
-function readUnread(userId: string | null): Set<string> {
+function readLegacyUnread(userId: string | null): string[] | null {
   try {
     const raw = localStorage.getItem(unreadSessionsStorageKey(userId));
-    if (!raw) return new Set();
+    if (!raw) return null;
     const parsed: unknown = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return new Set();
-    return new Set(parsed.filter((x): x is string => typeof x === "string").slice(-MAX_UNREAD));
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((x): x is string => typeof x === "string");
   } catch {
-    return new Set();
+    return [];
   }
 }
 
-function writeUnread(userId: string | null, ids: Set<string>): void {
+function clearLegacyUnread(userId: string | null): void {
   try {
-    localStorage.setItem(
-      unreadSessionsStorageKey(userId),
-      JSON.stringify([...ids].slice(-MAX_UNREAD)),
-    );
+    localStorage.removeItem(unreadSessionsStorageKey(userId));
   } catch {
-    /* private mode / quota */
+    /* private mode */
   }
 }
 
@@ -109,12 +108,6 @@ function becameTerminal(prev: Snap, curr: UnreadSessionInput): boolean {
   return Boolean(next && next !== terminalOutcome(prev.lastOutcome));
 }
 
-function addUnread(cur: Set<string>, id: string): Set<string> {
-  const arr = [...cur].filter((x) => x !== id);
-  arr.push(id);
-  return new Set(arr.slice(-MAX_UNREAD));
-}
-
 function notifyBody(session: UnreadSessionInput): string {
   const kind = resolveSessionStatus({
     running: isRunning(session.runState),
@@ -140,16 +133,20 @@ function fireNotification(session: UnreadSessionInput): void {
 }
 
 /**
- * 侧栏未读：运行中→终态且非当前会话则标未读；按用户持久化；桌面通知仅由用户手势开启。
+ * 侧栏未读：服务端 `unread` 为权威；本地 Set 只做乐观更新。
+ * 打开会话 POST mark-read；旧 localStorage 未读集合只合并一次。
  */
 export function useUnreadSessions(args: {
   sessions: UnreadSessionInput[];
   activeId: string | null;
   userId: string | null;
+  auth?: AuthSession | null;
 }): UnreadState {
-  const { sessions, activeId, userId } = args;
+  const { sessions, activeId, userId, auth } = args;
 
-  const [unreadIds, setUnreadIds] = useState<Set<string>>(() => readUnread(userId));
+  const [unreadIds, setUnreadIds] = useState<Set<string>>(
+    () => new Set(readLegacyUnread(userId) ?? []),
+  );
   const [notifyPermission, setNotifyPermission] = useState<NotificationPermission | "unsupported">(
     readPermission,
   );
@@ -164,40 +161,98 @@ export function useUnreadSessions(args: {
   notifyEnabledRef.current = notifyEnabled;
   const userIdRef = useRef(userId);
   userIdRef.current = userId;
+  const authRef = useRef(auth ?? null);
+  authRef.current = auth ?? null;
+  const optimisticReadRef = useRef(new Set<string>());
+  const optimisticUnreadRef = useRef(new Set<string>());
+  const migratedRef = useRef(false);
+
+  const rebuildUnread = useCallback((list: UnreadSessionInput[]) => {
+    const next = new Set<string>();
+    for (const s of list) {
+      if (optimisticReadRef.current.has(s.id)) continue;
+      if (s.unread === true || optimisticUnreadRef.current.has(s.id)) next.add(s.id);
+    }
+    for (const id of optimisticUnreadRef.current) {
+      if (!optimisticReadRef.current.has(id)) next.add(id);
+    }
+    for (const s of list) {
+      if (s.unread === false) optimisticReadRef.current.delete(s.id);
+    }
+    setUnreadIds(next);
+  }, []);
 
   useEffect(() => {
-    setUnreadIds(readUnread(userId));
+    optimisticReadRef.current = new Set();
+    optimisticUnreadRef.current = new Set(readLegacyUnread(userId) ?? []);
+    migratedRef.current = false;
+    prevRef.current = null;
+    setUnreadIds(new Set(optimisticUnreadRef.current));
     const perm = readPermission();
     setNotifyPermission(perm);
     setNotifyEnabledState(perm === "granted" && readNotifyEnabled(userId));
-    prevRef.current = null;
   }, [userId]);
 
-  const persistUnread = useCallback((next: Set<string>) => {
-    writeUnread(userIdRef.current, next);
-  }, []);
+  useEffect(() => {
+    if (migratedRef.current) return;
+    const a = authRef.current;
+    const uid = userIdRef.current;
+    const legacy = readLegacyUnread(uid);
+    if (!a || legacy === null) {
+      if (legacy === null) migratedRef.current = true;
+      return;
+    }
+    migratedRef.current = true;
+    if (legacy.length === 0) {
+      clearLegacyUnread(uid);
+      return;
+    }
+    for (const id of legacy) optimisticUnreadRef.current.add(id);
+    void api
+      .migrateUnreadSessions(a, legacy)
+      .then(() => {
+        clearLegacyUnread(uid);
+      })
+      .catch(() => {
+        migratedRef.current = false;
+      });
+  }, [auth, userId]);
 
-  const markRead = useCallback(
-    (sessionId: string) => {
+  const markRead = useCallback((sessionId: string) => {
+    optimisticReadRef.current.add(sessionId);
+    optimisticUnreadRef.current.delete(sessionId);
+    setUnreadIds((cur) => {
+      if (!cur.has(sessionId)) return cur;
+      const next = new Set(cur);
+      next.delete(sessionId);
+      return next;
+    });
+    const a = authRef.current;
+    if (!a) return;
+    void api.markSessionRead(a, sessionId).catch(() => {
+      optimisticReadRef.current.delete(sessionId);
       setUnreadIds((cur) => {
-        if (!cur.has(sessionId)) return cur;
+        if (cur.has(sessionId)) return cur;
         const next = new Set(cur);
-        next.delete(sessionId);
-        persistUnread(next);
+        next.add(sessionId);
         return next;
       });
-    },
-    [persistUnread],
-  );
+    });
+  }, []);
 
   const markAllRead = useCallback(() => {
     setUnreadIds((cur) => {
+      for (const id of cur) optimisticReadRef.current.add(id);
+      optimisticUnreadRef.current.clear();
       if (cur.size === 0) return cur;
-      const next = new Set<string>();
-      persistUnread(next);
-      return next;
+      return new Set<string>();
     });
-  }, [persistUnread]);
+    const a = authRef.current;
+    if (!a) return;
+    void api.markAllSessionsRead(a).catch(() => {
+      /* 下次 list 刷新盖回 */
+    });
+  }, []);
 
   useEffect(() => {
     if (!activeId) return;
@@ -223,16 +278,13 @@ export function useUnreadSessions(args: {
         toMark.push(s);
       }
       if (toMark.length > 0) {
-        setUnreadIds((cur) => {
-          let next = cur;
-          for (const s of toMark) {
-            if (s.id === activeIdRef.current) continue;
-            next = addUnread(next, s.id);
+        for (const s of toMark) {
+          if (s.id === activeIdRef.current) {
+            markRead(s.id);
+            continue;
           }
-          if (next === cur) return cur;
-          persistUnread(next);
-          return next;
-        });
+          optimisticUnreadRef.current.add(s.id);
+        }
         for (const s of toMark) {
           const viewing =
             typeof document !== "undefined" && !document.hidden && s.id === activeIdRef.current;
@@ -241,8 +293,15 @@ export function useUnreadSessions(args: {
       }
     }
 
+    const active = activeIdRef.current;
+    if (active) {
+      const row = sessions.find((s) => s.id === active);
+      if (row?.unread === true) markRead(active);
+    }
+
+    rebuildUnread(sessions);
     prevRef.current = nextSnap;
-  }, [sessions, persistUnread]);
+  }, [sessions, markRead, rebuildUnread]);
 
   const setNotifyEnabled = useCallback(async (on: boolean) => {
     if (!on) {

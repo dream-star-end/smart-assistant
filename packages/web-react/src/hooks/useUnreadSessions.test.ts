@@ -1,5 +1,7 @@
-import { act, cleanup, renderHook } from "@testing-library/react";
+import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
+import { api } from "../lib/api";
+import { createMemoryAuthSession } from "../lib/authSession";
 import {
   unreadNotifyStorageKey,
   unreadSessionsStorageKey,
@@ -18,6 +20,7 @@ type Args = {
   sessions: UnreadSessionInput[];
   activeId: string | null;
   userId: string | null;
+  auth?: ReturnType<typeof createMemoryAuthSession> | null;
 };
 
 function hook(initial: Args) {
@@ -25,7 +28,7 @@ function hook(initial: Args) {
 }
 
 describe("useUnreadSessions", () => {
-  test("running→terminal 标未读", () => {
+  test("running→terminal 标未读（乐观，不写 localStorage 权威）", () => {
     const { result, rerender } = hook({
       sessions: [{ id: "s1", title: "调研", runState: "running" }],
       activeId: "other",
@@ -37,21 +40,39 @@ describe("useUnreadSessions", () => {
       userId: "u1",
     });
     expect(result.current.unreadIds.has("s1")).toBe(true);
-    expect(JSON.parse(localStorage.getItem(unreadSessionsStorageKey("u1")) || "[]")).toContain("s1");
+    expect(localStorage.getItem(unreadSessionsStorageKey("u1"))).toBeNull();
   });
 
-  test("当前会话不标未读", () => {
+  test("服务端 unread 为权威", () => {
+    const { result } = hook({
+      sessions: [
+        { id: "s1", title: "A", unread: true, lastOutcome: "completed" },
+        { id: "s2", title: "B", unread: false, lastOutcome: "completed" },
+      ],
+      activeId: null,
+      userId: "u1",
+    });
+    expect(result.current.unreadIds.has("s1")).toBe(true);
+    expect(result.current.unreadIds.has("s2")).toBe(false);
+  });
+
+  test("当前会话不标未读，并 POST mark-read", async () => {
+    const auth = createMemoryAuthSession(() => {}, "token");
+    const mark = vi.spyOn(api, "markSessionRead").mockResolvedValue({ ok: true, updated: 1 });
     const { result, rerender } = hook({
       sessions: [{ id: "s1", title: "当前", runState: "running" }],
       activeId: "s1",
       userId: "u1",
+      auth,
     });
     rerender({
       sessions: [{ id: "s1", title: "当前", runState: "idle", lastOutcome: "crashed" }],
       activeId: "s1",
       userId: "u1",
+      auth,
     });
     expect(result.current.unreadIds.has("s1")).toBe(false);
+    await waitFor(() => expect(mark).toHaveBeenCalled());
   });
 
   test("activeId 切换清未读", () => {
@@ -74,11 +95,34 @@ describe("useUnreadSessions", () => {
     expect(result.current.unreadIds.has("s1")).toBe(false);
   });
 
-  test("持久化读回", () => {
+  test("首登合并一次 localStorage 后删除 key，之后不再当权威", async () => {
+    const auth = createMemoryAuthSession(() => {}, "token");
+    const migrate = vi
+      .spyOn(api, "migrateUnreadSessions")
+      .mockResolvedValue({ ok: true, updated: 2 });
     localStorage.setItem(unreadSessionsStorageKey("u1"), JSON.stringify(["kept", "also"]));
-    const { result } = hook({ sessions: [], activeId: null, userId: "u1" });
+    const { result, rerender } = hook({
+      sessions: [],
+      activeId: null,
+      userId: "u1",
+      auth,
+    });
     expect(result.current.unreadIds.has("kept")).toBe(true);
     expect(result.current.unreadIds.has("also")).toBe(true);
+    await waitFor(() => expect(migrate).toHaveBeenCalledTimes(1));
+    expect(migrate).toHaveBeenCalledWith(auth, ["kept", "also"]);
+    await waitFor(() => expect(localStorage.getItem(unreadSessionsStorageKey("u1"))).toBeNull());
+
+    localStorage.setItem(unreadSessionsStorageKey("u1"), JSON.stringify(["ghost"]));
+    rerender({
+      sessions: [{ id: "s-server", title: "S", unread: true }],
+      activeId: null,
+      userId: "u1",
+      auth,
+    });
+    expect(result.current.unreadIds.has("ghost")).toBe(false);
+    expect(result.current.unreadIds.has("s-server")).toBe(true);
+    expect(migrate).toHaveBeenCalledTimes(1);
   });
 
   test("无 Notification 环境不崩", async () => {

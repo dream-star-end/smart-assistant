@@ -590,6 +590,7 @@ export function App() {
     sessions,
     activeId: activeId ?? null,
     userId: user?.id ?? null,
+    auth: demo ? null : auth,
   });
   const sidebarWidth = useSidebarWidth();
   const [projectSettings, setProjectSettings] = useState<ChatProject | null>(null);

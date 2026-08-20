@@ -19,7 +19,11 @@ const {
   getSessionsDb,
   insertQueuedTurnDispatch,
   listClientSessions,
+  markAllClientSessionsRead,
+  markClientSessionRead,
+  migrateClientSessionsUnread,
   recordTurnDispatchRunning,
+  searchClientSessions,
   upsertClientSession,
 } = await import('../sessionsDb.js')
 
@@ -152,5 +156,61 @@ describe('listClientSessions runState/lastOutcome', () => {
     const meta = (await listClientSessions(USER)).sessions.find((s) => s.id === 'web-rej')
     assert.equal(meta?.runState, 'idle')
     assert.equal(meta?.lastOutcome, 'not_accepted')
+  })
+
+  it('last_read_at 列存在;终态后 unread=true;markRead 后 false', async () => {
+    const db = await getSessionsDb()
+    const cols = db.pragma('table_info(client_sessions)') as Array<{ name: string }>
+    assert.ok(cols.some((c) => c.name === 'last_read_at'))
+
+    await upsertClientSession(session('web-unread'))
+    let meta = (await listClientSessions(USER)).sessions.find((s) => s.id === 'web-unread')
+    assert.equal(meta?.unread, false)
+
+    await admit('web-unread', 'cm-u', 'd-u')
+    await casTurnDispatchState({
+      userId: INBOX_UID,
+      sessionId: 'web-unread',
+      clientMessageId: 'cm-u',
+      fromStates: ['queued'],
+      toState: 'terminal',
+      outcome: 'completed',
+    })
+    meta = (await listClientSessions(USER)).sessions.find((s) => s.id === 'web-unread')
+    assert.equal(meta?.unread, true)
+
+    const marked = await markClientSessionRead(USER, 'web-unread')
+    assert.equal(marked.ok, true)
+    meta = (await listClientSessions(USER)).sessions.find((s) => s.id === 'web-unread')
+    assert.equal(meta?.unread, false)
+  })
+
+  it('search 命中带 unread;migrate 把指定 id 变回未读;read-all 全清', async () => {
+    await upsertClientSession({ ...session('web-hit'), title: 'alpha unread', lastAt: Date.now() })
+    await admit('web-hit', 'cm-h', 'd-h')
+    await casTurnDispatchState({
+      userId: INBOX_UID,
+      sessionId: 'web-hit',
+      clientMessageId: 'cm-h',
+      fromStates: ['queued'],
+      toState: 'terminal',
+      outcome: 'interrupted',
+    })
+    const marked = await markClientSessionRead(USER, 'web-hit')
+    assert.equal(marked.ok, true)
+    assert.equal((await listClientSessions(USER)).sessions.find((s) => s.id === 'web-hit')?.unread, false)
+
+    const migrated = await migrateClientSessionsUnread(USER, ['web-hit'])
+    assert.equal(migrated.ok, true)
+    assert.equal((await listClientSessions(USER)).sessions.find((s) => s.id === 'web-hit')?.unread, true)
+
+    const hits = await searchClientSessions(USER, { q: 'alpha' })
+    const hit = hits.results.find((h) => h.sessionId === 'web-hit')
+    assert.ok(hit)
+    assert.equal(hit.unread, true)
+
+    const all = await markAllClientSessionsRead(USER)
+    assert.ok(all.updated >= 1)
+    assert.equal((await listClientSessions(USER)).sessions.find((s) => s.id === 'web-hit')?.unread, false)
   })
 })

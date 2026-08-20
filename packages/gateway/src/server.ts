@@ -159,6 +159,9 @@ import {
   patchClientSessionMeta,
   searchClientSessions,
   batchClientSessions,
+  markClientSessionRead,
+  markAllClientSessionsRead,
+  migrateClientSessionsUnread,
   parseSessionBatchInput,
   parseIncludeArchivedFlag,
   parseOptionalPositiveInt,
@@ -4270,6 +4273,36 @@ export class Gateway {
       })().catch(() => this.sendJson(res, 500, { error: 'batch failed' }))
       return
     }
+    if (url.pathname === '/api/sessions/read-all' && req.method === 'POST') {
+      const userId = this.getUserId(req)
+      markAllClientSessionsRead(userId)
+        .then((out) => this.sendJson(res, 200, { ok: true, updated: out.updated }))
+        .catch(() => this.sendJson(res, 500, { error: 'read-all failed' }))
+      return
+    }
+    if (url.pathname === '/api/sessions/unread-migrate' && req.method === 'POST') {
+      const userId = this.getUserId(req)
+      ;(async () => {
+        let data: { ids?: unknown }
+        try {
+          data = JSON.parse(await this.readBody(req, 64 * 1024))
+        } catch {
+          this.sendJson(res, 400, { error: 'invalid JSON' })
+          return
+        }
+        const result = await migrateClientSessionsUnread(userId, data.ids)
+        if (!result.ok) {
+          if (result.error === 'ids_limit') {
+            this.sendJson(res, 400, { error: 'ids limit exceeded (max 200)' })
+            return
+          }
+          this.sendJson(res, 400, { error: 'ids required (string array)' })
+          return
+        }
+        this.sendJson(res, 200, { ok: true, updated: result.updated })
+      })().catch(() => this.sendJson(res, 500, { error: 'unread migrate failed' }))
+      return
+    }
     // 侧栏聊天项目(与 /api/board/projects 看板无关)。浏览器直打 gateway,与 /api/sessions/list 同平面。
     if (url.pathname === '/api/chat-projects') {
       const userId = this.getUserId(req)
@@ -4944,6 +4977,25 @@ export class Gateway {
       readArchivedMessages(sessId, userId, beforeSeq, limit, { view: 'timeline' })
         .then((r) => this.sendJson(res, 200, r))
         .catch(() => this.sendJson(res, 500, { error: 'archive read failed' }))
+      return
+    }
+    const sessionReadMatch = url.pathname.match(/^\/api\/sessions\/([a-zA-Z0-9_-]{8,50})\/read$/)
+    if (sessionReadMatch) {
+      const sessId = sessionReadMatch[1]
+      const userId = this.getUserId(req)
+      if (req.method !== 'POST') {
+        this.sendJson(res, 405, { error: 'method not allowed' })
+        return
+      }
+      markClientSessionRead(userId, sessId)
+        .then((result) => {
+          if (!result.ok) {
+            this.sendJson(res, 404, { error: 'not found' })
+            return
+          }
+          this.sendJson(res, 200, { ok: true, updated: result.updated })
+        })
+        .catch(() => this.sendJson(res, 500, { error: 'mark read failed' }))
       return
     }
     // Exact browser-visible process frames, committed by the commercial
@@ -18366,6 +18418,7 @@ export { shouldServeInline }
 const KNOWN_ROUTES = [
   '/api/healthz', '/api/doctor', '/api/usage', '/api/usage/events',
   '/api/runs', '/api/sessions', '/api/sessions/list', '/api/sessions/search', '/api/sessions/batch',
+  '/api/sessions/read-all', '/api/sessions/unread-migrate',
   '/api/chat-projects', '/api/project-assets', '/api/config', '/api/agents', '/api/search',
   '/api/cron', '/api/board', '/api/board/projects', '/api/board/tickets',
   '/api/board/pipelines', '/api/board/agents', '/api/board/settings',
@@ -18384,6 +18437,7 @@ function normalizePath(p: string): string {
   if (KNOWN_ROUTES.includes(p)) return p
   // Dynamic API routes — normalize IDs
   const normalized = p
+    .replace(/\/api\/sessions\/[a-zA-Z0-9_-]+\/read$/, '/api/sessions/:id/read')
     .replace(/\/api\/agents\/[a-zA-Z0-9_-]+\/skills\/[a-z0-9-]+/, '/api/agents/:id/skills/:name')
     .replace(/\/api\/skills\/[a-z0-9-]+/, '/api/skills/:name')
     .replace(/\/api\/agents\/[a-zA-Z0-9_-]+\/([a-z]+)/, '/api/agents/:id/$1')

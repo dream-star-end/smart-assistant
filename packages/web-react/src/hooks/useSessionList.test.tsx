@@ -673,4 +673,67 @@ describe("useSessionList 置顶 / 项目归属 / 终态字段", () => {
     const aborted = await result.current.searchSessionMessages("foo", new AbortController().signal);
     expect(aborted).toEqual([]);
   });
+
+  test("hidden→visible 触发 listSessions，hidden 不轮询", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const { result } = await renderSessionList({ confirmResult: false, promptResult: null });
+      expect(result.current.sessions.length).toBe(2);
+      const list = api.listSessions as unknown as Mock;
+      const afterBoot = list.mock.calls.length;
+      Object.defineProperty(document, "visibilityState", {
+        configurable: true,
+        get: () => "hidden",
+      });
+      await act(async () => {
+        vi.advanceTimersByTime(60_000);
+      });
+      expect(list.mock.calls.length).toBe(afterBoot);
+      Object.defineProperty(document, "visibilityState", {
+        configurable: true,
+        get: () => "visible",
+      });
+      await act(async () => {
+        document.dispatchEvent(new Event("visibilitychange"));
+      });
+      expect(list.mock.calls.length).toBeGreaterThan(afterBoot);
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(document, "visibilityState", {
+        configurable: true,
+        get: () => "visible",
+      });
+    }
+  });
+
+  test("visibility 重拉不丢已 loadMore 的行", async () => {
+    const page = vi.spyOn(api, "listSessionsPage").mockResolvedValue({
+      sessions: [
+        {
+          id: "webolder0001",
+          title: "更早的一页",
+          agentId: "main",
+          pinned: false,
+          createdAt: 1,
+          lastAt: 1_000,
+          updatedAt: 1_000,
+          messageCount: 1,
+        },
+      ],
+    });
+    const { result } = await renderSessionList({ confirmResult: false, promptResult: null });
+    await act(async () => {
+      await result.current.loadMoreSessions();
+    });
+    expect(page).toHaveBeenCalled();
+    expect(result.current.sessions.map((s) => s.id)).toEqual(
+      expect.arrayContaining(["webkeepme001", "webdropme001", "webolder0001"]),
+    );
+    await act(async () => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    expect(result.current.sessions.map((s) => s.id)).toEqual(
+      expect.arrayContaining(["webkeepme001", "webdropme001", "webolder0001"]),
+    );
+  });
 });

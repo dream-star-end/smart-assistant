@@ -90,6 +90,8 @@ export type Session = {
   lastErrorCode?: string | null;
   /** 已归档。默认列表不展示；侧栏「已归档」分组展开后可见。 */
   archived?: boolean;
+  /** 服务端派生：有终态未看。绿点是否画出仍由 resolveSidebarDot 决定。 */
+  unread?: boolean;
   /** 最后一条消息纯文本前 80 字（listSessions 新字段；缺省则会话行不占摘要位）。 */
   lastMessagePreview?: string;
   /** 服务端 lastAt（epoch ms）。分页游标 `before=` 用它；缺省则回落 Date.parse(updatedAt)。 */
@@ -179,6 +181,7 @@ export type SessionSearchHit = {
   snippet: string;
   matchedAt: number;
   kind: "title" | "message";
+  unread?: boolean;
 };
 
 export type SessionSearchResponse = {
@@ -419,6 +422,7 @@ export type SessionMeta = {
   lastOutcome?: SessionLastOutcome | null;
   lastErrorCode?: string | null;
   archived?: boolean;
+  unread?: boolean;
   lastMessagePreview?: string;
 };
 

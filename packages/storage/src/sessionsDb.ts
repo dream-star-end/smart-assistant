@@ -443,6 +443,16 @@ export async function getSessionsDb(): Promise<Database.Database> {
       db.exec('ALTER TABLE client_sessions ADD COLUMN archived_at INTEGER DEFAULT NULL')
     }
   } catch { /* table just created with column already */ }
+  // Migration: client_sessions.last_read_at —— 侧栏「未读的完成」服务端权威。
+  // 打开会话才 bump;终态不写本列。存量回填成已读,避免上线后侧栏全绿。
+  // PG 侧对应迁移 0240_client_session_last_read_at。
+  try {
+    const cols = db.pragma('table_info(client_sessions)') as Array<{ name: string }>
+    if (!cols.some(c => c.name === 'last_read_at')) {
+      db.exec('ALTER TABLE client_sessions ADD COLUMN last_read_at INTEGER DEFAULT NULL')
+      db.exec('UPDATE client_sessions SET last_read_at = last_at WHERE last_read_at IS NULL')
+    }
+  } catch { /* table just created with column already */ }
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_client_sessions_user_list
       ON client_sessions(user_id, last_at DESC)
@@ -1878,6 +1888,8 @@ export interface ClientSessionMeta {
   lastErrorCode: string | null
   /** 侧栏归档(整会话);与消息 spill 水位无关。 */
   archived: boolean
+  /** 有终态未看(含 crash)。绿点是否画仍由前端 resolveSidebarDot 决定。 */
+  unread: boolean
   /** 最后一条消息的纯文本前 80 字;无消息则不带。 */
   lastMessagePreview?: string
 }
@@ -2028,6 +2040,17 @@ export const SESSION_SEARCH_LIMIT_DEFAULT = 30
 export const SESSION_SEARCH_LIMIT_MAX = 50
 export const SESSION_LIST_LIMIT_MAX = 200
 export const SESSION_BATCH_IDS_MAX = 200
+
+/** list/search 派生 unread 时认定的终态 outcome(与前端 TERMINAL_OUTCOMES 对齐)。 */
+export const CLIENT_SESSION_UNREAD_OUTCOMES = [
+  'completed',
+  'interrupted',
+  'crashed',
+  'not_accepted',
+  'executed_error',
+] as const
+
+const UNREAD_OUTCOME_SQL = CLIENT_SESSION_UNREAD_OUTCOMES.map((o) => `'${o}'`).join(',')
 export const LAST_MESSAGE_PREVIEW_MAX = 80
 // 侧栏预览只从 messages 数组尾部往前看这么多条。线上 assistant 不带 text(正文在
 // turn tape),最后一条几乎总是占位 stub;一轮对话里 user + 若干 assistant/tool/thinking
@@ -2067,7 +2090,16 @@ export type SessionSearchHit = {
   snippet: string
   matchedAt: number
   kind: SessionSearchKind
+  unread: boolean
 }
+
+export type MarkClientSessionReadResult =
+  | { ok: true; updated: number }
+  | { ok: false; error: 'not_found' }
+
+export type MigrateClientSessionsUnreadResult =
+  | { ok: true; updated: number }
+  | { ok: false; error: 'invalid_ids' | 'ids_limit' }
 
 export type SearchClientSessionsOpts = {
   q: string
@@ -4798,6 +4830,7 @@ function _mapClientSessionMetaRow(r: {
   last_outcome: string | null
   archived_at: number | null
   last_preview_raw: string | null
+  unread: number
 }): ClientSessionMeta {
   const preview = toLastMessagePreview(r.last_preview_raw)
   return {
@@ -4814,6 +4847,7 @@ function _mapClientSessionMetaRow(r: {
     lastOutcome: mapClientSessionLastOutcome(r.last_outcome),
     lastErrorCode: null,
     archived: r.archived_at != null,
+    unread: r.unread === 1,
     ...(preview ? { lastMessagePreview: preview } : {}),
     ...(r.model_id ? { modelId: r.model_id } : {}),
   }
@@ -4849,7 +4883,10 @@ async function _sqliteListClientSessions(
            cs.message_count as msg_count, cs.model_id, cs.project_id, cs.archived_at,
            ${SQLITE_LAST_PREVIEW_SQL} AS last_preview_raw,
            CASE WHEN open_d.session_id IS NOT NULL THEN 'running' ELSE 'idle' END AS run_state,
-           last_d.outcome AS last_outcome
+           last_d.outcome AS last_outcome,
+           CASE WHEN last_d.outcome IN (${UNREAD_OUTCOME_SQL})
+                 AND COALESCE(last_d.terminal_at, 0) > COALESCE(cs.last_read_at, 0)
+                THEN 1 ELSE 0 END AS unread
     FROM client_sessions cs
     LEFT JOIN (
       SELECT session_id FROM turn_dispatch_inbox
@@ -4857,8 +4894,8 @@ async function _sqliteListClientSessions(
        GROUP BY session_id
     ) open_d ON open_d.session_id = cs.id
     LEFT JOIN (
-      SELECT session_id, outcome FROM (
-        SELECT session_id, outcome,
+      SELECT session_id, outcome, terminal_at FROM (
+        SELECT session_id, outcome, updated_at AS terminal_at,
                ROW_NUMBER() OVER (
                  PARTITION BY session_id
                  ORDER BY updated_at DESC, client_message_id DESC
@@ -4879,6 +4916,7 @@ async function _sqliteListClientSessions(
     last_outcome: string | null
     archived_at: number | null
     last_preview_raw: string | null
+    unread: number
   }>
   let nextCursor: number | undefined
   let sliced = rows
@@ -6129,8 +6167,11 @@ async function _sqliteListPinnedProjectAssetsForSession(sessionId: string): Prom
   return rows.map(_mapProjectAssetRow)
 }
 
-export function rankSessionSearchHits(hits: SessionSearchHit[], limit: number): SessionSearchHit[] {
-  const best = new Map<string, SessionSearchHit>()
+export function rankSessionSearchHits<T extends { sessionId: string; matchedAt: number; kind: SessionSearchKind }>(
+  hits: T[],
+  limit: number,
+): T[] {
+  const best = new Map<string, T>()
   for (const hit of hits) {
     const prev = best.get(hit.sessionId)
     if (!prev || hit.matchedAt > prev.matchedAt || (hit.matchedAt === prev.matchedAt && hit.kind === 'message')) {
@@ -6138,6 +6179,38 @@ export function rankSessionSearchHits(hits: SessionSearchHit[], limit: number): 
     }
   }
   return [...best.values()].sort((a, b) => b.matchedAt - a.matchedAt).slice(0, limit)
+}
+
+function _sqliteUnreadBySessionIds(
+  db: Database.Database,
+  userId: string,
+  ids: string[],
+): Map<string, boolean> {
+  const unread = new Map<string, boolean>()
+  if (ids.length === 0) return unread
+  const rows = db.prepare(`
+    SELECT cs.id,
+           CASE WHEN last_d.outcome IN (${UNREAD_OUTCOME_SQL})
+                 AND COALESCE(last_d.terminal_at, 0) > COALESCE(cs.last_read_at, 0)
+                THEN 1 ELSE 0 END AS unread
+      FROM client_sessions cs
+      LEFT JOIN (
+        SELECT session_id, outcome, terminal_at FROM (
+          SELECT session_id, outcome, updated_at AS terminal_at,
+                 ROW_NUMBER() OVER (
+                   PARTITION BY session_id
+                   ORDER BY updated_at DESC, client_message_id DESC
+                 ) AS rn
+            FROM turn_dispatch_inbox
+           WHERE state IN ('terminal', 'rejected')
+        ) ranked
+        WHERE rn = 1
+      ) last_d ON last_d.session_id = cs.id
+     WHERE cs.user_id = ? AND cs.deleted_at IS NULL
+       AND cs.id IN (${ids.map(() => '?').join(',')})
+  `).all(userId, ...ids) as Array<{ id: string; unread: number }>
+  for (const r of rows) unread.set(r.id, r.unread === 1)
+  return unread
 }
 
 async function _sqliteSearchClientSessions(
@@ -6264,7 +6337,11 @@ async function _sqliteSearchClientSessions(
       kind: 'message' as const,
     })),
   ]
-  return { results: rankSessionSearchHits(hits, limit) }
+  const ranked = rankSessionSearchHits(hits, limit)
+  const unreadMap = _sqliteUnreadBySessionIds(db, userId, ranked.map((h) => h.sessionId))
+  return {
+    results: ranked.map((h) => ({ ...h, unread: unreadMap.get(h.sessionId) === true })),
+  }
 }
 
 async function _sqliteBatchClientSessions(
@@ -6325,6 +6402,48 @@ async function _sqliteBatchClientSessions(
     }
     return { ok: true, updated, skipped }
   })()
+}
+
+async function _sqliteMarkClientSessionRead(
+  userId: string,
+  sessionId: string,
+): Promise<MarkClientSessionReadResult> {
+  const db = await getSessionsDb()
+  const now = Date.now()
+  const res = db.prepare(
+    `UPDATE client_sessions SET last_read_at = ?
+      WHERE user_id = ? AND id = ? AND deleted_at IS NULL`,
+  ).run(now, userId, sessionId)
+  if (res.changes === 0) return { ok: false, error: 'not_found' }
+  return { ok: true, updated: res.changes }
+}
+
+async function _sqliteMarkAllClientSessionsRead(userId: string): Promise<{ updated: number }> {
+  const db = await getSessionsDb()
+  const now = Date.now()
+  const res = db.prepare(
+    `UPDATE client_sessions SET last_read_at = ?
+      WHERE user_id = ? AND deleted_at IS NULL`,
+  ).run(now, userId)
+  return { updated: res.changes }
+}
+
+async function _sqliteMigrateClientSessionsUnread(
+  userId: string,
+  ids: unknown,
+): Promise<MigrateClientSessionsUnreadResult> {
+  if (!Array.isArray(ids)) return { ok: false, error: 'invalid_ids' }
+  if (ids.length > SESSION_BATCH_IDS_MAX) return { ok: false, error: 'ids_limit' }
+  const sessionIds = ids.filter((id): id is string => typeof id === 'string' && id.length > 0)
+  if (sessionIds.length !== ids.length) return { ok: false, error: 'invalid_ids' }
+  if (sessionIds.length === 0) return { ok: true, updated: 0 }
+  const db = await getSessionsDb()
+  const res = db.prepare(
+    `UPDATE client_sessions SET last_read_at = 0
+      WHERE user_id = ? AND deleted_at IS NULL
+        AND id IN (${sessionIds.map(() => '?').join(',')})`,
+  ).run(userId, ...sessionIds)
+  return { ok: true, updated: res.changes }
 }
 
 function _sqliteDeleteClientSessionSync(
@@ -6598,6 +6717,9 @@ const sqliteBackend = {
   patchClientSessionMeta: _sqlitePatchClientSessionMeta,
   searchClientSessions: _sqliteSearchClientSessions,
   batchClientSessions: _sqliteBatchClientSessions,
+  markClientSessionRead: _sqliteMarkClientSessionRead,
+  markAllClientSessionsRead: _sqliteMarkAllClientSessionsRead,
+  migrateClientSessionsUnread: _sqliteMigrateClientSessionsUnread,
   getSessionProjectInstructions: _sqliteGetSessionProjectInstructions,
   listChatProjects: _sqliteListChatProjects,
   createChatProject: _sqliteCreateChatProject,
@@ -6755,6 +6877,15 @@ export const searchClientSessions: ClientSessionsBackend['searchClientSessions']
 
 export const batchClientSessions: ClientSessionsBackend['batchClientSessions'] =
   (...args) => getActiveBackend().batchClientSessions(...args)
+
+export const markClientSessionRead: ClientSessionsBackend['markClientSessionRead'] =
+  (...args) => getActiveBackend().markClientSessionRead(...args)
+
+export const markAllClientSessionsRead: ClientSessionsBackend['markAllClientSessionsRead'] =
+  (...args) => getActiveBackend().markAllClientSessionsRead(...args)
+
+export const migrateClientSessionsUnread: ClientSessionsBackend['migrateClientSessionsUnread'] =
+  (...args) => getActiveBackend().migrateClientSessionsUnread(...args)
 
 export const getSessionProjectInstructions: ClientSessionsBackend['getSessionProjectInstructions'] =
   (...args) => getActiveBackend().getSessionProjectInstructions(...args)
