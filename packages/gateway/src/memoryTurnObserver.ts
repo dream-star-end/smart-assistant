@@ -59,6 +59,11 @@ export async function beginMemoryTurnTracking(input: {
     softReminderActive: true,
   })
   activeSnapshots.set(key(input.sessionKey, input.turnIndex), snapshot)
+  while (activeSnapshots.size > 512) {
+    const oldest = activeSnapshots.keys().next().value
+    if (typeof oldest !== 'string') break
+    activeSnapshots.delete(oldest)
+  }
   // A non-empty Core library is visible through the per-runner MEMORY slot.
   // Record turn visibility explicitly so a model that answers from the injected
   // index without calling core-search still participates in freshness-gap shadowing.

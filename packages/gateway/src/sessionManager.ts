@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { rename, writeFile } from 'node:fs/promises'
-import { join, resolve } from 'node:path'
+import { join, resolve as resolvePath } from 'node:path'
 import {
   type AgentDef,
   type OpenClaudeConfig,
@@ -4819,8 +4819,8 @@ export class SessionManager {
                 ? toolInput.path
                 : null
             if (rawPath) {
-              const memoryRoot = resolve(paths.agentMemoryDir(session.agentId))
-              const target = resolve(rawPath)
+              const memoryRoot = resolvePath(paths.agentMemoryDir(session.agentId))
+              const target = resolvePath(rawPath)
               if (target.startsWith(`${memoryRoot}/`) && target.endsWith('.md')) {
                 memoryReadTargets.set(tool.id, target)
               }

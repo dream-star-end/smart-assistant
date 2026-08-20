@@ -77,6 +77,9 @@ const DYNAMIC_INTENT_RULES: ReadonlyArray<{ kind: string; re: RegExp }> = [
   { kind: 'direct_status', re: /(?:healthz|systemd|release|runtime|线上|现网|运行中)/i },
 ]
 
+let privacyKeyValue: string | null = null
+let privacyKeyLoading: Promise<string> | null = null
+
 export function classifyCurrentFactIntent(text: string): { current: boolean; kind: string | null } {
   const normalized = text.normalize('NFKC').replace(/\s+/g, ' ').slice(0, 8_000)
   for (const rule of DYNAMIC_INTENT_RULES) {
@@ -86,17 +89,27 @@ export function classifyCurrentFactIntent(text: string): { current: boolean; kin
 }
 
 async function privacyKey(): Promise<string> {
-  const db = await getSessionsDb()
-  const row = db.prepare("SELECT value FROM memory_usage_kv WHERE key='hmac_key'").get() as
-    | { value: string }
-    | undefined
-  if (row?.value && /^[0-9a-f]{64}$/.test(row.value)) return row.value
-  const value = randomBytes(32).toString('hex')
-  db.prepare("INSERT OR IGNORE INTO memory_usage_kv(key,value) VALUES ('hmac_key',?)").run(value)
-  const stored = db.prepare("SELECT value FROM memory_usage_kv WHERE key='hmac_key'").get() as {
-    value: string
+  if (privacyKeyValue) return privacyKeyValue
+  if (privacyKeyLoading) return await privacyKeyLoading
+  privacyKeyLoading = (async () => {
+    const db = await getSessionsDb()
+    const row = db.prepare("SELECT value FROM memory_usage_kv WHERE key='hmac_key'").get() as
+      | { value: string }
+      | undefined
+    if (row?.value && /^[0-9a-f]{64}$/.test(row.value)) return row.value
+    const value = randomBytes(32).toString('hex')
+    db.prepare("INSERT OR IGNORE INTO memory_usage_kv(key,value) VALUES ('hmac_key',?)").run(value)
+    const stored = db.prepare("SELECT value FROM memory_usage_kv WHERE key='hmac_key'").get() as {
+      value: string
+    }
+    return stored.value
+  })()
+  try {
+    privacyKeyValue = await privacyKeyLoading
+    return privacyKeyValue
+  } finally {
+    privacyKeyLoading = null
   }
-  return stored.value
 }
 
 async function privateHash(value: string | null | undefined): Promise<string | null> {
@@ -269,6 +282,27 @@ async function rowsWithPrivateSessionHash(
 
 export async function listPendingMemoryUsageEvents(limit = 100): Promise<MemoryUsageEventRow[]> {
   const db = await getSessionsDb()
+  const staleBefore = Date.now() - 2 * 60 * 60 * 1000
+  db.transaction(() => {
+    db.prepare(`
+      UPDATE memory_turn_context
+         SET completed_at=?,
+             freshness_gap=CASE
+               WHEN current_fact_intent=1 AND memory_used=1 AND evidence_seen=0 THEN 1
+               ELSE 0
+             END
+       WHERE completed_at IS NULL AND created_at < ?
+    `).run(Date.now(), staleBefore)
+    db.prepare(`
+      UPDATE memory_usage_events
+         SET freshness_gap=(
+           SELECT freshness_gap FROM memory_turn_context c
+            WHERE c.session_key=memory_usage_events.session_key
+              AND c.turn_index=memory_usage_events.turn_index
+         )
+       WHERE reported_at IS NULL AND timestamp < ?
+    `).run(staleBefore)
+  })()
   const rows = db
     .prepare(`
     SELECT e.* FROM memory_usage_events e
