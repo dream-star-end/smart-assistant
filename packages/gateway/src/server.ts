@@ -175,6 +175,16 @@ import {
   parseChatProjectSortOrder,
   CHAT_PROJECT_COLOR_MAX,
   CHAT_PROJECT_INSTRUCTIONS_MAX,
+  listProjectAssets,
+  createProjectAsset,
+  updateProjectAsset,
+  deleteProjectAsset,
+  parseProjectAssetName,
+  parseProjectAssetSource,
+  parseProjectAssetUrl,
+  parseProjectAssetOptionalContainerPath,
+  parseProjectAssetProjectId,
+  PROJECT_ASSET_PER_PROJECT_LIMIT,
   recordAutoDreamSuccessfulSession,
   listUnclaimedSessions,
   claimSession,
@@ -276,6 +286,7 @@ import { sendV3QqProactive, readV3QqProactiveConfig } from './v3QqProactive.js'
 import { postInboxMessage, postInboxMessageDurable } from './v3InboxPost.js'
 import { postInboxAlert } from './v3InboxAlert.js'
 import { parseDocument } from './documentParser.js'
+import { tryExtractProjectAssetExcerpt } from './projectAssetCollector.js'
 import {
   makeDelegateProgressBlock,
   makeDelegateUsageProgressBlock,
@@ -4365,6 +4376,163 @@ export class Gateway {
       }
       if (req.method === 'DELETE') {
         deleteChatProject(userId, projectId)
+          .then((result) => result.ok
+            ? this.sendJson(res, 200, { ok: true })
+            : this.sendJson(res, 404, { error: 'not found' }))
+          .catch(() => this.sendJson(res, 500, { error: 'delete failed' }))
+        return
+      }
+      this.sendJson(res, 405, { error: 'method not allowed' })
+      return
+    }
+    // 聊天项目资产(上传参考资料 + 会话产出物索引)。浏览器直打 gateway,与 /api/chat-projects 同平面。
+    if (url.pathname === '/api/project-assets') {
+      const userId = this.getUserId(req)
+      if (req.method === 'GET') {
+        const rawProjectId = url.searchParams.get('projectId')
+        const projectId = rawProjectId === null || rawProjectId === '' || rawProjectId === 'none'
+          ? null
+          : rawProjectId
+        if (projectId !== null && (projectId.length < 8 || projectId.length > 64)) {
+          this.sendJson(res, 400, { error: 'invalid projectId' })
+          return
+        }
+        listProjectAssets(userId, { projectId })
+          .then((assets) => this.sendJson(res, 200, { assets }))
+          .catch(() => this.sendJson(res, 500, { error: 'list failed' }))
+        return
+      }
+      if (req.method === 'POST') {
+        ;(async () => {
+          let data: {
+            projectId?: unknown
+            source?: unknown
+            sessionId?: unknown
+            name?: unknown
+            url?: unknown
+            containerPath?: unknown
+            mime?: unknown
+            size?: unknown
+            digest?: unknown
+          }
+          try {
+            data = JSON.parse(await this.readBody(req, 16 * 1024))
+          } catch {
+            this.sendJson(res, 400, { error: 'invalid JSON' })
+            return
+          }
+          if (parseProjectAssetName(data.name) === null) {
+            this.sendJson(res, 400, { error: 'name required (1-200 chars)' })
+            return
+          }
+          if (parseProjectAssetSource(data.source) === null) {
+            this.sendJson(res, 400, { error: "source must be 'upload' or 'output'" })
+            return
+          }
+          const urlField = parseProjectAssetUrl(data.url)
+          if ('invalid' in urlField) {
+            this.sendJson(res, 400, { error: 'invalid url' })
+            return
+          }
+          const containerPath = parseProjectAssetOptionalContainerPath(data.containerPath)
+          if ('invalid' in containerPath) {
+            this.sendJson(res, 400, { error: 'invalid containerPath' })
+            return
+          }
+          if (!urlField.present && !containerPath.present) {
+            this.sendJson(res, 400, { error: 'url or containerPath required' })
+            return
+          }
+          let excerpt: string | null = null
+          try {
+            excerpt = await tryExtractProjectAssetExcerpt({
+              source: typeof data.source === 'string' ? data.source : '',
+              mime: typeof data.mime === 'string' ? data.mime : null,
+              url: urlField.present ? urlField.value : null,
+              containerPath: containerPath.present ? containerPath.value : null,
+              name: typeof data.name === 'string' ? data.name : null,
+            })
+          } catch {
+            excerpt = null
+          }
+          const result = await createProjectAsset(userId, { ...data, excerpt })
+          if (!result.ok) {
+            if (result.error === 'limit_exceeded') {
+              this.sendJson(res, 400, { error: `asset limit exceeded (max ${PROJECT_ASSET_PER_PROJECT_LIMIT})` })
+              return
+            }
+            if (result.error === 'project_not_found') {
+              this.sendJson(res, 404, { error: 'project not found' })
+              return
+            }
+            this.sendJson(res, 400, { error: result.error.replace(/_/g, ' ') })
+            return
+          }
+          this.sendJson(res, 200, { asset: result.asset })
+        })().catch(() => this.sendJson(res, 500, { error: 'create failed' }))
+        return
+      }
+      this.sendJson(res, 405, { error: 'method not allowed' })
+      return
+    }
+    const projectAssetMatch = url.pathname.match(/^\/api\/project-assets\/([a-zA-Z0-9_-]{8,64})$/)
+    if (projectAssetMatch) {
+      const assetId = projectAssetMatch[1]
+      const userId = this.getUserId(req)
+      if (req.method === 'PATCH') {
+        ;(async () => {
+          let data: { pinned?: unknown; name?: unknown; projectId?: unknown }
+          try {
+            data = JSON.parse(await this.readBody(req, 16 * 1024))
+          } catch {
+            this.sendJson(res, 400, { error: 'invalid JSON' })
+            return
+          }
+          const hasPinned = data.pinned !== undefined
+          const hasName = data.name !== undefined
+          const hasProject = data.projectId !== undefined
+          if (!hasPinned && !hasName && !hasProject) {
+            this.sendJson(res, 400, { error: 'pinned, name or projectId required' })
+            return
+          }
+          if (hasName && parseProjectAssetName(data.name) === null) {
+            this.sendJson(res, 400, { error: 'name required (1-200 chars)' })
+            return
+          }
+          if (hasPinned && typeof data.pinned !== 'boolean') {
+            this.sendJson(res, 400, { error: 'pinned must be boolean' })
+            return
+          }
+          if (hasProject) {
+            const projectId = parseProjectAssetProjectId(data.projectId)
+            if ('invalid' in projectId) {
+              this.sendJson(res, 400, { error: 'invalid projectId' })
+              return
+            }
+          }
+          const result = await updateProjectAsset(userId, assetId, data)
+          if (!result.ok) {
+            if (result.error === 'not_found') {
+              this.sendJson(res, 404, { error: 'not found' })
+              return
+            }
+            if (result.error === 'project_not_found') {
+              this.sendJson(res, 404, { error: 'project not found' })
+              return
+            }
+            if (result.error === 'limit_exceeded') {
+              this.sendJson(res, 400, { error: `asset limit exceeded (max ${PROJECT_ASSET_PER_PROJECT_LIMIT})` })
+              return
+            }
+            this.sendJson(res, 400, { error: result.error.replace(/_/g, ' ') })
+            return
+          }
+          this.sendJson(res, 200, { asset: result.asset })
+        })().catch(() => this.sendJson(res, 500, { error: 'patch failed' }))
+        return
+      }
+      if (req.method === 'DELETE') {
+        deleteProjectAsset(userId, assetId)
           .then((result) => result.ok
             ? this.sendJson(res, 200, { ok: true })
             : this.sendJson(res, 404, { error: 'not found' }))
@@ -18198,7 +18366,7 @@ export { shouldServeInline }
 const KNOWN_ROUTES = [
   '/api/healthz', '/api/doctor', '/api/usage', '/api/usage/events',
   '/api/runs', '/api/sessions', '/api/sessions/list', '/api/sessions/search', '/api/sessions/batch',
-  '/api/chat-projects', '/api/config', '/api/agents', '/api/search',
+  '/api/chat-projects', '/api/project-assets', '/api/config', '/api/agents', '/api/search',
   '/api/cron', '/api/board', '/api/board/projects', '/api/board/tickets',
   '/api/board/pipelines', '/api/board/agents', '/api/board/settings',
   '/api/board/stats/cost', '/api/board/templates', '/api/board/reports/weekly',
@@ -18222,6 +18390,7 @@ function normalizePath(p: string): string {
     .replace(/\/api\/agents\/[a-zA-Z0-9_-]+/, '/api/agents/:id')
     .replace(/\/api\/cron\/[a-zA-Z0-9_-]+/, '/api/cron/:id')
     .replace(/\/api\/chat-projects\/[a-zA-Z0-9_-]+/, '/api/chat-projects/:id')
+    .replace(/\/api\/project-assets\/[a-zA-Z0-9_-]+/, '/api/project-assets/:id')
     .replace(/\/api\/board\/projects\/[^/]+\/board/, '/api/board/projects/:id/board')
     .replace(/\/api\/board\/projects\/[^/]+/, '/api/board/projects/:id')
     .replace(/\/api\/board\/tickets\/[^/]+\/[a-z_]+/, '/api/board/tickets/:id/:action')

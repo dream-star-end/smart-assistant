@@ -57,6 +57,7 @@ import type { ZcodeRouteOverride } from './engine/zcodeAdapter.js'
 import { eventBus, createEvent } from './eventBus.js'
 import { beginMemoryTurnTracking } from './memoryTurnObserver.js'
 import { createLogger } from './logger.js'
+import { collectSessionOutputAssets } from './projectAssetCollector.js'
 import {
   deriveLosslessTurnKey,
   getV3MasterSinkOrNull,
@@ -581,6 +582,26 @@ function waitForRetryDelay(ms: number, signal: AbortSignal | undefined): Promise
  * master 端 WHERE id=? AND user_id=? 永远命不中,落 outbox 死信浪费 IO,故不放行。
  */
 const MASTER_SINK_PERSIST_CHANNELS: ReadonlySet<string> = new Set(['webchat', 'wechat'])
+
+function scheduleSessionOutputAssetCollection(opts: {
+  userId: string | undefined
+  sessionId: string
+  assistantText: string
+  sessionKey: string
+  traceId?: string
+}): void {
+  if (!opts.userId || !opts.assistantText) return
+  void collectSessionOutputAssets({
+    userId: opts.userId,
+    sessionId: opts.sessionId,
+    assistantText: opts.assistantText,
+  }).catch((err) => {
+    log.warn('collectSessionOutputAssets failed', {
+      sessionKey: opts.sessionKey,
+      ...(opts.traceId ? { traceId: opts.traceId } : {}),
+    }, err)
+  })
+}
 
 // 一个 sessionKey 对应一个 EngineAdapter(CCB = CcbAdapter 组合 SubprocessRunner)
 // + 一把 Mutex(同 session 串行)。跨 session 完全并行。
@@ -2415,6 +2436,13 @@ export class SessionManager {
         },
       })
       this._trackPersistence(persistence)
+      scheduleSessionOutputAssetCollection({
+        userId: session.userId,
+        sessionId: session.peerId,
+        assistantText: args.assistantText,
+        sessionKey: session.sessionKey,
+        traceId: args.traceId,
+      })
       const messageId = `srv-${session.peerId}-${session.agentId}-t${turnIndex}`
       const createdAt = Date.now()
       // Preserve the paid exchange in the next provider context even while
@@ -5098,6 +5126,13 @@ export class SessionManager {
             if (MASTER_SINK_PERSIST_CHANNELS.has(session.channel)) {
               const turnIndex = prevTurns + 1
               session.turns = Math.max(session.turns, turnIndex)
+              scheduleSessionOutputAssetCollection({
+                userId: session.userId,
+                sessionId: session.peerId,
+                assistantText: partialAssistant.text,
+                sessionKey: session.sessionKey,
+                ...(traceId ? { traceId } : {}),
+              })
               persistenceAcknowledged = await persistServerAuthoredTurn({
                 sessionKey: session.sessionKey,
                 peerId: session.peerId,
@@ -5773,6 +5808,13 @@ export class SessionManager {
               const assistantText = completedAssistant.text
               const thinkingText = completedThinking.text
               const turnIndex = session.turns
+              scheduleSessionOutputAssetCollection({
+                userId: session.userId,
+                sessionId: peerId,
+                assistantText,
+                sessionKey: session.sessionKey,
+                ...(traceId ? { traceId } : {}),
+              })
               // Phase 0.4 P1-3 (tightened): use `session.userId` directly when
               // we have it — this lets `appendServerAuthoredMessageDurable`
               // route `session_not_found` into the outbox instead of silently

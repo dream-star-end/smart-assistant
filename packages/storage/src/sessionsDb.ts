@@ -400,6 +400,40 @@ export async function getSessionsDb(): Promise<Database.Database> {
     CREATE INDEX IF NOT EXISTS idx_client_sessions_user_project
       ON client_sessions(user_id, project_id);
   `)
+  // Migration: project_assets —— 聊天项目资产层(用户上传参考资料 + 会话产出物索引)。
+  // 软删只删索引行,绝不删磁盘文件:文件是 sha256 内容寻址的,可能被别的消息/资产共用。
+  // PG 侧对应迁移 0237_project_assets。
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS project_assets (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      project_id TEXT,
+      source TEXT NOT NULL CHECK (source IN ('upload', 'output')),
+      session_id TEXT,
+      name TEXT NOT NULL,
+      url TEXT,
+      container_path TEXT,
+      mime TEXT,
+      size_bytes INTEGER,
+      digest TEXT,
+      excerpt TEXT,
+      pinned INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      deleted_at INTEGER DEFAULT NULL,
+      CHECK (
+        (url IS NOT NULL AND length(url) > 0)
+        OR (container_path IS NOT NULL AND length(container_path) > 0)
+      )
+    );
+    CREATE INDEX IF NOT EXISTS idx_project_assets_user_project_created
+      ON project_assets(user_id, project_id, deleted_at, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_project_assets_user_project_pinned
+      ON project_assets(user_id, project_id, pinned)
+      WHERE deleted_at IS NULL AND pinned = 1;
+    CREATE INDEX IF NOT EXISTS idx_project_assets_user_digest
+      ON project_assets(user_id, digest);
+  `)
   // Migration: client_sessions.archived_at —— 侧栏「归档会话」(整会话从默认列表隐藏)。
   // 与消息热尾巴 spill 的 archived_through_seq / archived_count 无关,不撞名。
   // PG 侧对应迁移 0233_client_session_list_archived_at。
@@ -1878,6 +1912,109 @@ export type ChatProjectDeleteResult =
   | { ok: true }
   | { ok: false; error: ChatProjectDeleteError }
 
+export const PROJECT_ASSET_NAME_MAX = 200
+export const PROJECT_ASSET_EXCERPT_MAX = 2000
+export const PROJECT_ASSET_MIME_MAX = 128
+export const PROJECT_ASSET_SESSION_ID_MAX = 128
+export const PROJECT_ASSET_PER_PROJECT_LIMIT = 500
+export const PROJECT_ASSET_LIST_LIMIT_DEFAULT = 200
+export const PROJECT_ASSET_LIST_LIMIT_MAX = 500
+export const PROJECT_ASSET_PINNED_INJECT_MAX = 20
+export const PROJECT_ASSET_URL_RE = /^\/api\/media\/[0-9a-f]{64}\.[A-Za-z0-9]{1,32}$/
+export const PROJECT_ASSET_CONTAINER_PREFIXES = [
+  '/home/agent/.openclaude/uploads/',
+  '/home/agent/.openclaude/generated/',
+] as const
+export const PROJECT_ASSET_CONTROL_CHARS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g
+
+export type ProjectAssetSource = 'upload' | 'output'
+
+export type ProjectAsset = {
+  id: string
+  projectId: string | null
+  source: ProjectAssetSource
+  sessionId: string | null
+  name: string
+  url: string | null
+  containerPath: string | null
+  mime: string | null
+  sizeBytes: number | null
+  digest: string | null
+  excerpt: string | null
+  pinned: boolean
+  createdAt: number
+  updatedAt: number
+}
+
+export type ProjectAssetCreateError =
+  | 'limit_exceeded'
+  | 'invalid_name'
+  | 'invalid_source'
+  | 'invalid_url'
+  | 'invalid_container_path'
+  | 'invalid_locator'
+  | 'invalid_digest'
+  | 'invalid_mime'
+  | 'invalid_size'
+  | 'invalid_session'
+  | 'project_not_found'
+export type ProjectAssetUpdateError =
+  | 'not_found'
+  | 'invalid_name'
+  | 'project_not_found'
+  | 'limit_exceeded'
+export type ProjectAssetDeleteError = 'not_found'
+
+export type ProjectAssetCreateResult =
+  | { ok: true; asset: ProjectAsset }
+  | { ok: false; error: ProjectAssetCreateError }
+export type ProjectAssetUpdateResult =
+  | { ok: true; asset: ProjectAsset }
+  | { ok: false; error: ProjectAssetUpdateError }
+export type ProjectAssetDeleteResult =
+  | { ok: true }
+  | { ok: false; error: ProjectAssetDeleteError }
+
+export type ListProjectAssetsOpts = {
+  projectId: string | null
+  limit?: number
+}
+
+export type ProjectAssetCreateInput = {
+  projectId?: unknown
+  source?: unknown
+  sessionId?: unknown
+  name?: unknown
+  url?: unknown
+  containerPath?: unknown
+  mime?: unknown
+  size?: unknown
+  digest?: unknown
+  excerpt?: unknown
+  pinned?: unknown
+}
+
+export type ProjectAssetUpdateInput = {
+  pinned?: unknown
+  name?: unknown
+  projectId?: unknown
+}
+
+export type ParsedProjectAssetCreate = {
+  projectIdPresent: boolean
+  projectId: string | null
+  source: ProjectAssetSource
+  sessionId: string | null
+  name: string
+  url: string | null
+  containerPath: string | null
+  mime: string | null
+  sizeBytes: number | null
+  digest: string | null
+  excerpt: string | null
+  pinned: boolean
+}
+
 export type ClientSessionMetaPatch = {
   title?: string
   modelId?: string
@@ -2074,6 +2211,153 @@ export function parseChatProjectOptionalText(
 export function parseChatProjectSortOrder(value: unknown): number | null {
   if (typeof value !== 'number' || !Number.isInteger(value) || !Number.isSafeInteger(value)) return null
   return value
+}
+
+export function stripProjectAssetControlChars(raw: string): string {
+  return raw.replace(PROJECT_ASSET_CONTROL_CHARS, '')
+}
+
+export function parseProjectAssetName(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const name = stripProjectAssetControlChars(value).trim()
+  return name.length >= 1 && name.length <= PROJECT_ASSET_NAME_MAX ? name : null
+}
+
+export function parseProjectAssetSource(value: unknown): ProjectAssetSource | null {
+  return value === 'upload' || value === 'output' ? value : null
+}
+
+export function parseProjectAssetUrl(value: unknown): { present: false } | { present: true; value: string } | { invalid: true } {
+  if (value === undefined || value === null) return { present: false }
+  if (typeof value !== 'string') return { invalid: true }
+  const url = value.trim()
+  if (url.length === 0) return { present: false }
+  return PROJECT_ASSET_URL_RE.test(url) ? { present: true, value: url } : { invalid: true }
+}
+
+export function parseProjectAssetContainerPath(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const path = value.trim()
+  if (!path || path.includes('..') || stripProjectAssetControlChars(path) !== path || /\s/.test(path)) {
+    return null
+  }
+  const matched = PROJECT_ASSET_CONTAINER_PREFIXES.some((prefix) => {
+    if (!path.startsWith(prefix)) return false
+    const rest = path.slice(prefix.length)
+    return rest.length > 0 && !rest.includes('..')
+  })
+  return matched ? path : null
+}
+
+export function parseProjectAssetOptionalContainerPath(
+  value: unknown,
+): { present: false } | { present: true; value: string } | { invalid: true } {
+  if (value === undefined || value === null) return { present: false }
+  if (typeof value !== 'string') return { invalid: true }
+  if (value.trim().length === 0) return { present: false }
+  const parsed = parseProjectAssetContainerPath(value)
+  return parsed ? { present: true, value: parsed } : { invalid: true }
+}
+
+export function parseProjectAssetDigest(value: unknown): { present: false } | { present: true; value: string } | { invalid: true } {
+  if (value === undefined || value === null) return { present: false }
+  if (typeof value !== 'string') return { invalid: true }
+  const digest = value.trim().toLowerCase()
+  if (digest.length === 0) return { present: false }
+  return /^[0-9a-f]{64}$/.test(digest) ? { present: true, value: digest } : { invalid: true }
+}
+
+export function parseProjectAssetMime(value: unknown): { present: false } | { present: true; value: string } | { invalid: true } {
+  if (value === undefined || value === null) return { present: false }
+  if (typeof value !== 'string') return { invalid: true }
+  const mime = stripProjectAssetControlChars(value).trim()
+  if (mime.length === 0) return { present: false }
+  if (mime.length > PROJECT_ASSET_MIME_MAX || mime.includes('\n') || mime.includes('\r')) return { invalid: true }
+  return { present: true, value: mime }
+}
+
+export function parseProjectAssetSize(value: unknown): { present: false } | { present: true; value: number } | { invalid: true } {
+  if (value === undefined || value === null) return { present: false }
+  if (typeof value !== 'number' || !Number.isInteger(value) || !Number.isSafeInteger(value) || value < 0) {
+    return { invalid: true }
+  }
+  return { present: true, value }
+}
+
+export function parseProjectAssetSessionId(value: unknown): { present: false } | { present: true; value: string } | { invalid: true } {
+  if (value === undefined || value === null) return { present: false }
+  if (typeof value !== 'string') return { invalid: true }
+  const id = stripProjectAssetControlChars(value).trim()
+  if (id.length === 0) return { present: false }
+  if (id.length > PROJECT_ASSET_SESSION_ID_MAX || id.includes('..') || /\s/.test(id)) return { invalid: true }
+  return { present: true, value: id }
+}
+
+export function parseProjectAssetProjectId(value: unknown): { present: false } | { present: true; value: string | null } | { invalid: true } {
+  if (value === undefined) return { present: false }
+  if (value === null) return { present: true, value: null }
+  if (typeof value !== 'string') return { invalid: true }
+  const id = value.trim()
+  if (id.length === 0 || id === 'none') return { present: true, value: null }
+  if (id.length < 8 || id.length > 64) return { invalid: true }
+  return { present: true, value: id }
+}
+
+export function parseProjectAssetExcerpt(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const excerpt = stripProjectAssetControlChars(value).trim()
+  if (!excerpt) return null
+  return excerpt.length > PROJECT_ASSET_EXCERPT_MAX ? excerpt.slice(0, PROJECT_ASSET_EXCERPT_MAX) : excerpt
+}
+
+export function digestFromProjectAssetUrl(url: string): string | null {
+  const m = url.match(/^\/api\/media\/([0-9a-f]{64})\./)
+  return m ? m[1] : null
+}
+
+export function parseProjectAssetCreateInput(
+  input: ProjectAssetCreateInput,
+): { ok: true; value: ParsedProjectAssetCreate } | { ok: false; error: ProjectAssetCreateError } {
+  const name = parseProjectAssetName(input.name)
+  if (!name) return { ok: false, error: 'invalid_name' }
+  const source = parseProjectAssetSource(input.source)
+  if (!source) return { ok: false, error: 'invalid_source' }
+  const projectId = parseProjectAssetProjectId(input.projectId)
+  if ('invalid' in projectId) return { ok: false, error: 'project_not_found' }
+  const url = parseProjectAssetUrl(input.url)
+  if ('invalid' in url) return { ok: false, error: 'invalid_url' }
+  const containerPath = parseProjectAssetOptionalContainerPath(input.containerPath)
+  if ('invalid' in containerPath) return { ok: false, error: 'invalid_container_path' }
+  const urlValue = url.present ? url.value : null
+  const containerValue = containerPath.present ? containerPath.value : null
+  if (!urlValue && !containerValue) return { ok: false, error: 'invalid_locator' }
+  const digest = parseProjectAssetDigest(input.digest)
+  if ('invalid' in digest) return { ok: false, error: 'invalid_digest' }
+  const mime = parseProjectAssetMime(input.mime)
+  if ('invalid' in mime) return { ok: false, error: 'invalid_mime' }
+  const size = parseProjectAssetSize(input.size)
+  if ('invalid' in size) return { ok: false, error: 'invalid_size' }
+  const sessionId = parseProjectAssetSessionId(input.sessionId)
+  if ('invalid' in sessionId) return { ok: false, error: 'invalid_session' }
+  let digestValue = digest.present ? digest.value : null
+  if (!digestValue && urlValue) digestValue = digestFromProjectAssetUrl(urlValue)
+  return {
+    ok: true,
+    value: {
+      projectIdPresent: projectId.present,
+      projectId: projectId.present ? projectId.value : null,
+      source,
+      sessionId: sessionId.present ? sessionId.value : null,
+      name,
+      url: urlValue,
+      containerPath: containerValue,
+      mime: mime.present ? mime.value : null,
+      sizeBytes: size.present ? size.value : null,
+      digest: digestValue,
+      excerpt: parseProjectAssetExcerpt(input.excerpt),
+      pinned: input.pinned === true,
+    },
+  }
 }
 
 export function mapClientSessionLastOutcome(raw: unknown): ClientSessionLastOutcome | null {
@@ -5569,6 +5853,282 @@ async function _sqliteGetSessionProjectInstructions(sessionId: string): Promise<
   return cleaned.length > 0 ? cleaned : null
 }
 
+type ProjectAssetDbRow = {
+  id: string
+  project_id: string | null
+  source: string
+  session_id: string | null
+  name: string
+  url: string | null
+  container_path: string | null
+  mime: string | null
+  size_bytes: number | null
+  digest: string | null
+  excerpt: string | null
+  pinned: number | boolean
+  created_at: number
+  updated_at: number
+}
+
+const PROJECT_ASSET_SELECT = `
+  SELECT id, project_id, source, session_id, name, url, container_path, mime,
+         size_bytes, digest, excerpt, pinned, created_at, updated_at
+    FROM project_assets
+`
+
+function _mapProjectAssetRow(r: ProjectAssetDbRow): ProjectAsset {
+  return {
+    id: r.id,
+    projectId: r.project_id ?? null,
+    source: r.source === 'output' ? 'output' : 'upload',
+    sessionId: r.session_id ?? null,
+    name: r.name,
+    url: r.url ?? null,
+    containerPath: r.container_path ?? null,
+    mime: r.mime ?? null,
+    sizeBytes: r.size_bytes ?? null,
+    digest: r.digest ?? null,
+    excerpt: r.excerpt ?? null,
+    pinned: r.pinned === 1 || r.pinned === true,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  }
+}
+
+function _sqliteReadProjectAsset(
+  db: Database.Database,
+  userId: string,
+  id: string,
+): ProjectAsset | null {
+  const row = db.prepare(
+    `${PROJECT_ASSET_SELECT} WHERE id = ? AND user_id = ? AND deleted_at IS NULL`,
+  ).get(id, userId) as ProjectAssetDbRow | undefined
+  return row ? _mapProjectAssetRow(row) : null
+}
+
+function _sqliteOwnedChatProjectExists(
+  db: Database.Database,
+  userId: string,
+  projectId: string,
+): boolean {
+  const row = db.prepare(
+    'SELECT 1 AS ok FROM chat_projects WHERE id = ? AND user_id = ? AND deleted_at IS NULL',
+  ).get(projectId, userId) as { ok: number } | undefined
+  return !!row
+}
+
+function _sqliteCountProjectAssets(
+  db: Database.Database,
+  userId: string,
+  projectId: string | null,
+): number {
+  const row = db.prepare(
+    'SELECT COUNT(*) AS n FROM project_assets WHERE user_id = ? AND deleted_at IS NULL AND project_id IS ?',
+  ).get(userId, projectId) as { n: number }
+  return row.n
+}
+
+function _sqliteFindDuplicateAsset(
+  db: Database.Database,
+  userId: string,
+  projectId: string | null,
+  source: ProjectAssetSource,
+  digest: string | null,
+  containerPath: string | null,
+): ProjectAsset | null {
+  if (digest) {
+    const row = db.prepare(
+      `${PROJECT_ASSET_SELECT}
+        WHERE user_id = ? AND deleted_at IS NULL AND source = ? AND project_id IS ? AND digest = ?
+        LIMIT 1`,
+    ).get(userId, source, projectId, digest) as ProjectAssetDbRow | undefined
+    return row ? _mapProjectAssetRow(row) : null
+  }
+  if (containerPath) {
+    const row = db.prepare(
+      `${PROJECT_ASSET_SELECT}
+        WHERE user_id = ? AND deleted_at IS NULL AND source = ? AND project_id IS ? AND container_path = ?
+        LIMIT 1`,
+    ).get(userId, source, projectId, containerPath) as ProjectAssetDbRow | undefined
+    return row ? _mapProjectAssetRow(row) : null
+  }
+  return null
+}
+
+function _sqliteResolveAssetProjectId(
+  db: Database.Database,
+  userId: string,
+  parsed: ParsedProjectAssetCreate,
+): { ok: true; projectId: string | null } | { ok: false; error: ProjectAssetCreateError } {
+  let projectId = parsed.projectIdPresent ? parsed.projectId : null
+  if (!parsed.projectIdPresent && parsed.sessionId) {
+    const sess = db.prepare(
+      'SELECT user_id, project_id FROM client_sessions WHERE id = ? AND deleted_at IS NULL',
+    ).get(parsed.sessionId) as { user_id: string; project_id: string | null } | undefined
+    if (sess?.user_id === userId) projectId = sess.project_id ?? null
+  }
+  if (projectId !== null && !_sqliteOwnedChatProjectExists(db, userId, projectId)) {
+    return { ok: false, error: 'project_not_found' }
+  }
+  return { ok: true, projectId }
+}
+
+async function _sqliteListProjectAssets(
+  userId: string,
+  opts: ListProjectAssetsOpts,
+): Promise<ProjectAsset[]> {
+  const limit = typeof opts.limit === 'number' && Number.isFinite(opts.limit) && opts.limit > 0
+    ? Math.min(PROJECT_ASSET_LIST_LIMIT_MAX, Math.floor(opts.limit))
+    : PROJECT_ASSET_LIST_LIMIT_DEFAULT
+  const db = await getSessionsDb()
+  const rows = db.prepare(
+    `${PROJECT_ASSET_SELECT}
+      WHERE user_id = ? AND deleted_at IS NULL AND project_id IS ?
+      ORDER BY created_at DESC
+      LIMIT ?`,
+  ).all(userId, opts.projectId, limit) as ProjectAssetDbRow[]
+  return rows.map(_mapProjectAssetRow)
+}
+
+async function _sqliteCreateProjectAsset(
+  userId: string,
+  input: ProjectAssetCreateInput,
+): Promise<ProjectAssetCreateResult> {
+  const parsed = parseProjectAssetCreateInput(input)
+  if (!parsed.ok) return parsed
+  const db = await getSessionsDb()
+  const now = Date.now()
+  const id = randomUUID()
+  const txn = db.transaction((): ProjectAssetCreateResult => {
+    const resolved = _sqliteResolveAssetProjectId(db, userId, parsed.value)
+    if (!resolved.ok) return resolved
+    const { projectId } = resolved
+    const dup = _sqliteFindDuplicateAsset(
+      db,
+      userId,
+      projectId,
+      parsed.value.source,
+      parsed.value.digest,
+      parsed.value.containerPath,
+    )
+    if (dup) return { ok: true, asset: dup }
+    if (_sqliteCountProjectAssets(db, userId, projectId) >= PROJECT_ASSET_PER_PROJECT_LIMIT) {
+      return { ok: false, error: 'limit_exceeded' }
+    }
+    // 只插索引行,绝不写/删磁盘文件(内容寻址,可能被其它消息/资产共用)。
+    db.prepare(`
+      INSERT INTO project_assets (
+        id, user_id, project_id, source, session_id, name, url, container_path,
+        mime, size_bytes, digest, excerpt, pinned, created_at, updated_at, deleted_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+    `).run(
+      id,
+      userId,
+      projectId,
+      parsed.value.source,
+      parsed.value.sessionId,
+      parsed.value.name,
+      parsed.value.url,
+      parsed.value.containerPath,
+      parsed.value.mime,
+      parsed.value.sizeBytes,
+      parsed.value.digest,
+      parsed.value.excerpt,
+      parsed.value.pinned ? 1 : 0,
+      now,
+      now,
+    )
+    const asset = _sqliteReadProjectAsset(db, userId, id)
+    if (!asset) throw new Error('project asset insert vanished')
+    return { ok: true, asset }
+  })
+  return txn()
+}
+
+async function _sqliteUpdateProjectAsset(
+  userId: string,
+  assetId: string,
+  patch: ProjectAssetUpdateInput,
+): Promise<ProjectAssetUpdateResult> {
+  const sets: string[] = ['updated_at = MAX(updated_at + 1, ?)']
+  const params: unknown[] = [Date.now()]
+  let nextProjectId: { present: true; value: string | null } | undefined
+  if (patch.name !== undefined) {
+    const name = parseProjectAssetName(patch.name)
+    if (!name) return { ok: false, error: 'invalid_name' }
+    sets.push('name = ?')
+    params.push(name)
+  }
+  if (patch.pinned !== undefined) {
+    if (typeof patch.pinned !== 'boolean') return { ok: false, error: 'invalid_name' }
+    sets.push('pinned = ?')
+    params.push(patch.pinned ? 1 : 0)
+  }
+  if (patch.projectId !== undefined) {
+    const parsed = parseProjectAssetProjectId(patch.projectId)
+    if ('invalid' in parsed) return { ok: false, error: 'project_not_found' }
+    nextProjectId = { present: true, value: parsed.present ? parsed.value : null }
+    sets.push('project_id = ?')
+    params.push(nextProjectId.value)
+  }
+  if (sets.length === 1) {
+    const db = await getSessionsDb()
+    const existing = _sqliteReadProjectAsset(db, userId, assetId)
+    return existing ? { ok: true, asset: existing } : { ok: false, error: 'not_found' }
+  }
+  const db = await getSessionsDb()
+  const txn = db.transaction((): ProjectAssetUpdateResult => {
+    const existing = _sqliteReadProjectAsset(db, userId, assetId)
+    if (!existing) return { ok: false, error: 'not_found' }
+    if (nextProjectId) {
+      if (nextProjectId.value !== null && !_sqliteOwnedChatProjectExists(db, userId, nextProjectId.value)) {
+        return { ok: false, error: 'project_not_found' }
+      }
+      if (nextProjectId.value !== existing.projectId) {
+        if (_sqliteCountProjectAssets(db, userId, nextProjectId.value) >= PROJECT_ASSET_PER_PROJECT_LIMIT) {
+          return { ok: false, error: 'limit_exceeded' }
+        }
+      }
+    }
+    const res = db.prepare(
+      `UPDATE project_assets SET ${sets.join(', ')}
+        WHERE id = ? AND user_id = ? AND deleted_at IS NULL`,
+    ).run(...params, assetId, userId)
+    if (res.changes === 0) return { ok: false, error: 'not_found' }
+    const asset = _sqliteReadProjectAsset(db, userId, assetId)
+    if (!asset) return { ok: false, error: 'not_found' }
+    return { ok: true, asset }
+  })
+  return txn()
+}
+
+async function _sqliteDeleteProjectAsset(userId: string, assetId: string): Promise<ProjectAssetDeleteResult> {
+  const db = await getSessionsDb()
+  const now = Date.now()
+  // 软删只标 deleted_at,绝不 unlink 磁盘文件。
+  const res = db.prepare(
+    `UPDATE project_assets
+        SET deleted_at = ?, updated_at = MAX(updated_at + 1, ?)
+      WHERE id = ? AND user_id = ? AND deleted_at IS NULL`,
+  ).run(now, now, assetId, userId)
+  return res.changes === 0 ? { ok: false, error: 'not_found' } : { ok: true }
+}
+
+async function _sqliteListPinnedProjectAssetsForSession(sessionId: string): Promise<ProjectAsset[]> {
+  const db = await getSessionsDb()
+  const sess = db.prepare(
+    'SELECT user_id, project_id FROM client_sessions WHERE id = ? AND deleted_at IS NULL',
+  ).get(sessionId) as { user_id: string; project_id: string | null } | undefined
+  if (!sess) return []
+  const rows = db.prepare(
+    `${PROJECT_ASSET_SELECT}
+      WHERE user_id = ? AND deleted_at IS NULL AND pinned = 1 AND project_id IS ?
+      ORDER BY created_at DESC
+      LIMIT ?`,
+  ).all(sess.user_id, sess.project_id ?? null, PROJECT_ASSET_PINNED_INJECT_MAX) as ProjectAssetDbRow[]
+  return rows.map(_mapProjectAssetRow)
+}
+
 export function rankSessionSearchHits(hits: SessionSearchHit[], limit: number): SessionSearchHit[] {
   const best = new Map<string, SessionSearchHit>()
   for (const hit of hits) {
@@ -6043,6 +6603,11 @@ const sqliteBackend = {
   createChatProject: _sqliteCreateChatProject,
   updateChatProject: _sqliteUpdateChatProject,
   deleteChatProject: _sqliteDeleteChatProject,
+  listProjectAssets: _sqliteListProjectAssets,
+  createProjectAsset: _sqliteCreateProjectAsset,
+  updateProjectAsset: _sqliteUpdateProjectAsset,
+  deleteProjectAsset: _sqliteDeleteProjectAsset,
+  listPinnedProjectAssetsForSession: _sqliteListPinnedProjectAssetsForSession,
   bumpClientSessionHistoryRevision: _sqliteBumpClientSessionHistoryRevision,
   listUnclaimedSessions: _sqliteListUnclaimedSessions,
   allMasterWsessRows: _sqliteAllMasterWsessRows,
@@ -6205,6 +6770,21 @@ export const updateChatProject: ClientSessionsBackend['updateChatProject'] =
 
 export const deleteChatProject: ClientSessionsBackend['deleteChatProject'] =
   (...args) => getActiveBackend().deleteChatProject(...args)
+
+export const listProjectAssets: ClientSessionsBackend['listProjectAssets'] =
+  (...args) => getActiveBackend().listProjectAssets(...args)
+
+export const createProjectAsset: ClientSessionsBackend['createProjectAsset'] =
+  (...args) => getActiveBackend().createProjectAsset(...args)
+
+export const updateProjectAsset: ClientSessionsBackend['updateProjectAsset'] =
+  (...args) => getActiveBackend().updateProjectAsset(...args)
+
+export const deleteProjectAsset: ClientSessionsBackend['deleteProjectAsset'] =
+  (...args) => getActiveBackend().deleteProjectAsset(...args)
+
+export const listPinnedProjectAssetsForSession: ClientSessionsBackend['listPinnedProjectAssetsForSession'] =
+  (...args) => getActiveBackend().listPinnedProjectAssetsForSession(...args)
 
 export const bumpClientSessionHistoryRevision: ClientSessionsBackend['bumpClientSessionHistoryRevision'] =
   (...args) => getActiveBackend().bumpClientSessionHistoryRevision(...args)

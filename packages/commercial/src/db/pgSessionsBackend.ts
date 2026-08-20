@@ -102,6 +102,14 @@ import {
   type ChatProjectCreateResult,
   type ChatProjectDeleteResult,
   type ChatProjectUpdateResult,
+  type ProjectAsset,
+  type ProjectAssetCreateInput,
+  type ProjectAssetCreateResult,
+  type ProjectAssetDeleteResult,
+  type ProjectAssetUpdateInput,
+  type ProjectAssetUpdateResult,
+  type ListProjectAssetsOpts,
+  type ParsedProjectAssetCreate,
   type ClientSession,
   type ClientSessionLifecycle,
   type ClientSessionLifecycleRef,
@@ -123,6 +131,10 @@ import {
   CHAT_PROJECT_COLOR_MAX,
   CHAT_PROJECT_INSTRUCTIONS_MAX,
   CHAT_PROJECT_PER_USER_LIMIT,
+  PROJECT_ASSET_LIST_LIMIT_DEFAULT,
+  PROJECT_ASSET_LIST_LIMIT_MAX,
+  PROJECT_ASSET_PER_PROJECT_LIMIT,
+  PROJECT_ASSET_PINNED_INJECT_MAX,
   compareMessagesByOrder,
   deriveArchivedOrderSeqsForRead,
   deriveOrderSeqsForRead,
@@ -142,6 +154,9 @@ import {
   parseChatProjectName,
   parseChatProjectOptionalText,
   parseChatProjectSortOrder,
+  parseProjectAssetCreateInput,
+  parseProjectAssetName,
+  parseProjectAssetProjectId,
   parseSessionBatchInput,
   type PatchClientSessionMetaResult,
   rankSessionSearchHits,
@@ -507,6 +522,148 @@ async function readPgChatProject(
     )
   ).rows[0];
   return row ? mapPgChatProjectRow(row) : null;
+}
+
+const PG_PROJECT_ASSET_SELECT = `
+  SELECT id, project_id, source, session_id, name, url, container_path, mime,
+         size_bytes::text AS size_bytes, digest, excerpt, pinned,
+         created_at::text AS created_at, updated_at::text AS updated_at
+    FROM project_assets
+`;
+
+type PgProjectAssetRow = {
+  id: string;
+  project_id: string | null;
+  source: string;
+  session_id: string | null;
+  name: string;
+  url: string | null;
+  container_path: string | null;
+  mime: string | null;
+  size_bytes: string | null;
+  digest: string | null;
+  excerpt: string | null;
+  pinned: boolean | number | string;
+  created_at: string;
+  updated_at: string;
+};
+
+function mapPgProjectAssetRow(r: PgProjectAssetRow): ProjectAsset {
+  return {
+    id: r.id,
+    projectId: r.project_id ?? null,
+    source: r.source === "output" ? "output" : "upload",
+    sessionId: r.session_id ?? null,
+    name: r.name,
+    url: r.url ?? null,
+    containerPath: r.container_path ?? null,
+    mime: r.mime ?? null,
+    sizeBytes: r.size_bytes == null ? null : bigIntNum(r.size_bytes, "size_bytes"),
+    digest: r.digest ?? null,
+    excerpt: r.excerpt ?? null,
+    pinned: r.pinned === true || r.pinned === 1 || r.pinned === "t",
+    createdAt: bigIntNum(r.created_at, "created_at"),
+    updatedAt: bigIntNum(r.updated_at, "updated_at"),
+  };
+}
+
+async function readPgProjectAsset(
+  queryable: Pick<Pool | PoolClient, "query">,
+  userId: string,
+  id: string,
+): Promise<ProjectAsset | null> {
+  const row = (
+    await queryable.query<PgProjectAssetRow>(
+      `${PG_PROJECT_ASSET_SELECT} WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
+      [id, userId],
+    )
+  ).rows[0];
+  return row ? mapPgProjectAssetRow(row) : null;
+}
+
+async function pgOwnedChatProjectExists(
+  queryable: Pick<Pool | PoolClient, "query">,
+  userId: string,
+  projectId: string,
+): Promise<boolean> {
+  const row = (
+    await queryable.query(
+      "SELECT 1 FROM chat_projects WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
+      [projectId, userId],
+    )
+  ).rows[0];
+  return !!row;
+}
+
+async function pgCountProjectAssets(
+  queryable: Pick<Pool | PoolClient, "query">,
+  userId: string,
+  projectId: string | null,
+): Promise<number> {
+  const row = (
+    await queryable.query<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM project_assets
+        WHERE user_id = $1 AND deleted_at IS NULL AND project_id IS NOT DISTINCT FROM $2`,
+      [userId, projectId],
+    )
+  ).rows[0];
+  return Number(row?.n ?? 0);
+}
+
+async function pgFindDuplicateAsset(
+  queryable: Pick<Pool | PoolClient, "query">,
+  userId: string,
+  projectId: string | null,
+  source: ParsedProjectAssetCreate["source"],
+  digest: string | null,
+  containerPath: string | null,
+): Promise<ProjectAsset | null> {
+  if (digest) {
+    const row = (
+      await queryable.query<PgProjectAssetRow>(
+        `${PG_PROJECT_ASSET_SELECT}
+          WHERE user_id = $1 AND deleted_at IS NULL AND source = $2
+            AND project_id IS NOT DISTINCT FROM $3 AND digest = $4
+          LIMIT 1`,
+        [userId, source, projectId, digest],
+      )
+    ).rows[0];
+    return row ? mapPgProjectAssetRow(row) : null;
+  }
+  if (containerPath) {
+    const row = (
+      await queryable.query<PgProjectAssetRow>(
+        `${PG_PROJECT_ASSET_SELECT}
+          WHERE user_id = $1 AND deleted_at IS NULL AND source = $2
+            AND project_id IS NOT DISTINCT FROM $3 AND container_path = $4
+          LIMIT 1`,
+        [userId, source, projectId, containerPath],
+      )
+    ).rows[0];
+    return row ? mapPgProjectAssetRow(row) : null;
+  }
+  return null;
+}
+
+async function pgResolveAssetProjectId(
+  queryable: Pick<Pool | PoolClient, "query">,
+  userId: string,
+  parsed: ParsedProjectAssetCreate,
+): Promise<{ ok: true; projectId: string | null } | { ok: false; error: "project_not_found" }> {
+  let projectId = parsed.projectIdPresent ? parsed.projectId : null;
+  if (!parsed.projectIdPresent && parsed.sessionId) {
+    const sess = (
+      await queryable.query<{ user_id: string; project_id: string | null }>(
+        "SELECT user_id, project_id FROM client_sessions WHERE id = $1 AND deleted_at IS NULL",
+        [parsed.sessionId],
+      )
+    ).rows[0];
+    if (sess?.user_id === userId) projectId = sess.project_id ?? null;
+  }
+  if (projectId !== null && !(await pgOwnedChatProjectExists(queryable, userId, projectId))) {
+    return { ok: false, error: "project_not_found" };
+  }
+  return { ok: true, projectId };
 }
 
 /** Publish a new browser-timeline identity on the caller's existing
@@ -10338,6 +10495,166 @@ export function createPgSessionsBackend(
         );
         return { ok: true };
       });
+    },
+
+    async listProjectAssets(userId: string, opts: ListProjectAssetsOpts): Promise<ProjectAsset[]> {
+      const limit = typeof opts.limit === "number" && Number.isFinite(opts.limit) && opts.limit > 0
+        ? Math.min(PROJECT_ASSET_LIST_LIMIT_MAX, Math.floor(opts.limit))
+        : PROJECT_ASSET_LIST_LIMIT_DEFAULT;
+      const rows = (
+        await pool.query<PgProjectAssetRow>(
+          `${PG_PROJECT_ASSET_SELECT}
+            WHERE user_id = $1 AND deleted_at IS NULL AND project_id IS NOT DISTINCT FROM $2
+            ORDER BY created_at DESC
+            LIMIT $3`,
+          [userId, opts.projectId, limit],
+        )
+      ).rows;
+      return rows.map(mapPgProjectAssetRow);
+    },
+
+    async createProjectAsset(
+      userId: string,
+      input: ProjectAssetCreateInput,
+    ): Promise<ProjectAssetCreateResult> {
+      const parsed = parseProjectAssetCreateInput(input);
+      if (!parsed.ok) return parsed;
+      const id = randomUUID();
+      return withTx(pool, async (client) => {
+        const resolved = await pgResolveAssetProjectId(client, userId, parsed.value);
+        if (!resolved.ok) return resolved;
+        const { projectId } = resolved;
+        const dup = await pgFindDuplicateAsset(
+          client,
+          userId,
+          projectId,
+          parsed.value.source,
+          parsed.value.digest,
+          parsed.value.containerPath,
+        );
+        if (dup) return { ok: true, asset: dup };
+        if ((await pgCountProjectAssets(client, userId, projectId)) >= PROJECT_ASSET_PER_PROJECT_LIMIT) {
+          return { ok: false, error: "limit_exceeded" };
+        }
+        // 只插索引行,绝不写/删磁盘文件(内容寻址,可能被其它消息/资产共用)。
+        await client.query(
+          `INSERT INTO project_assets (
+             id, user_id, project_id, source, session_id, name, url, container_path,
+             mime, size_bytes, digest, excerpt, pinned, created_at, updated_at, deleted_at
+           ) VALUES (
+             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+             ${CLOCK_MS_SQL}, ${CLOCK_MS_SQL}, NULL
+           )`,
+          [
+            id,
+            userId,
+            projectId,
+            parsed.value.source,
+            parsed.value.sessionId,
+            parsed.value.name,
+            parsed.value.url,
+            parsed.value.containerPath,
+            parsed.value.mime,
+            parsed.value.sizeBytes,
+            parsed.value.digest,
+            parsed.value.excerpt,
+            parsed.value.pinned,
+          ],
+        );
+        const asset = await readPgProjectAsset(client, userId, id);
+        if (!asset) throw new Error("project asset insert vanished");
+        return { ok: true, asset };
+      });
+    },
+
+    async updateProjectAsset(
+      userId: string,
+      assetId: string,
+      patch: ProjectAssetUpdateInput,
+    ): Promise<ProjectAssetUpdateResult> {
+      const sets: string[] = [`updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})`];
+      const params: unknown[] = [];
+      let n = 1;
+      let nextProjectId: { present: true; value: string | null } | undefined;
+      if (patch.name !== undefined) {
+        const name = parseProjectAssetName(patch.name);
+        if (!name) return { ok: false, error: "invalid_name" };
+        sets.push(`name = $${n++}`);
+        params.push(name);
+      }
+      if (patch.pinned !== undefined) {
+        if (typeof patch.pinned !== "boolean") return { ok: false, error: "invalid_name" };
+        sets.push(`pinned = $${n++}`);
+        params.push(patch.pinned);
+      }
+      if (patch.projectId !== undefined) {
+        const parsed = parseProjectAssetProjectId(patch.projectId);
+        if ("invalid" in parsed) return { ok: false, error: "project_not_found" };
+        nextProjectId = { present: true, value: parsed.present ? parsed.value : null };
+        sets.push(`project_id = $${n++}`);
+        params.push(nextProjectId.value);
+      }
+      if (sets.length === 1) {
+        const existing = await readPgProjectAsset(pool, userId, assetId);
+        return existing ? { ok: true, asset: existing } : { ok: false, error: "not_found" };
+      }
+      return withTx(pool, async (client) => {
+        const existing = await readPgProjectAsset(client, userId, assetId);
+        if (!existing) return { ok: false, error: "not_found" };
+        if (nextProjectId) {
+          if (nextProjectId.value !== null && !(await pgOwnedChatProjectExists(client, userId, nextProjectId.value))) {
+            return { ok: false, error: "project_not_found" };
+          }
+          if (nextProjectId.value !== existing.projectId) {
+            if ((await pgCountProjectAssets(client, userId, nextProjectId.value)) >= PROJECT_ASSET_PER_PROJECT_LIMIT) {
+              return { ok: false, error: "limit_exceeded" };
+            }
+          }
+        }
+        params.push(assetId, userId);
+        const res = await client.query(
+          `UPDATE project_assets SET ${sets.join(", ")}
+            WHERE id = $${n++} AND user_id = $${n} AND deleted_at IS NULL`,
+          params,
+        );
+        if ((res.rowCount ?? 0) === 0) return { ok: false, error: "not_found" };
+        const asset = await readPgProjectAsset(client, userId, assetId);
+        if (!asset) return { ok: false, error: "not_found" };
+        return { ok: true, asset };
+      });
+    },
+
+    async deleteProjectAsset(userId: string, assetId: string): Promise<ProjectAssetDeleteResult> {
+      // 软删只标 deleted_at,绝不 unlink 磁盘文件。
+      const res = await pool.query(
+        `UPDATE project_assets
+            SET deleted_at = ${CLOCK_MS_SQL},
+                updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
+          WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
+        [assetId, userId],
+      );
+      return (res.rowCount ?? 0) === 0 ? { ok: false, error: "not_found" } : { ok: true };
+    },
+
+    async listPinnedProjectAssetsForSession(sessionId: string): Promise<ProjectAsset[]> {
+      const sess = (
+        await pool.query<{ user_id: string; project_id: string | null }>(
+          "SELECT user_id, project_id FROM client_sessions WHERE id = $1 AND deleted_at IS NULL",
+          [sessionId],
+        )
+      ).rows[0];
+      if (!sess) return [];
+      const rows = (
+        await pool.query<PgProjectAssetRow>(
+          `${PG_PROJECT_ASSET_SELECT}
+            WHERE user_id = $1 AND deleted_at IS NULL AND pinned IS TRUE
+              AND project_id IS NOT DISTINCT FROM $2
+            ORDER BY created_at DESC
+            LIMIT $3`,
+          [sess.user_id, sess.project_id ?? null, PROJECT_ASSET_PINNED_INJECT_MAX],
+        )
+      ).rows;
+      return rows.map(mapPgProjectAssetRow);
     },
 
     async bumpClientSessionHistoryRevision(id: string, userId: string): Promise<boolean> {
