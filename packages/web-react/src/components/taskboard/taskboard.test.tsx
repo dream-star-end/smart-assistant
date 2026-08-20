@@ -834,6 +834,39 @@ function renderBoard(over: Partial<ComponentProps<typeof TaskboardView>> = {}) {
   )
 }
 
+describe('任务展示模式切换', () => {
+  test('看板和列表收口为同一个任务入口，按钮一键切换展示', async () => {
+    vi.spyOn(taskboardApi, 'listProjects').mockResolvedValue([sampleProject()])
+    mockEmptyBoard()
+    const onViewChange = vi.fn()
+    renderBoard({ onViewChange })
+
+    expect(await screen.findByRole('tab', { name: '任务' })).toHaveAttribute(
+      'aria-selected',
+      'true',
+    )
+    expect(screen.queryByRole('tab', { name: '看板' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('tab', { name: '列表' })).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: '切换到列表展示' }))
+    expect(onViewChange).toHaveBeenCalledWith('list')
+  })
+
+  test('列表深链仍落在任务入口，并提供切回看板的按钮', async () => {
+    vi.spyOn(taskboardApi, 'listProjects').mockResolvedValue([sampleProject()])
+    mockEmptyBoard()
+    const onViewChange = vi.fn()
+    renderBoard({ view: 'list', onViewChange })
+
+    expect(await screen.findByRole('tab', { name: '任务' })).toHaveAttribute(
+      'aria-selected',
+      'true',
+    )
+    fireEvent.click(screen.getByRole('button', { name: '切换到看板展示' }))
+    expect(onViewChange).toHaveBeenCalledWith('board')
+  })
+})
+
 describe('项目管理', () => {
   test('空库时能通过界面建项目并自动切过去', async () => {
     let stored: ReturnType<typeof sampleProject>[] = []
