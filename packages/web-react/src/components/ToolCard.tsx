@@ -32,7 +32,7 @@ import { Badge, Spinner } from "./ui";
 
 export type { ToolLike } from "./tool/format";
 
-// 图标底色按工具语义分色(对齐设计稿 .tic.tn-*);error 单独走红。
+// 图标底色按工具语义分色(对齐设计稿 .tic.tn-*)。
 const TONE_TILE: Record<string, string> = {
   accent: "bg-accent-soft text-accent",
   success: "bg-success-soft text-success",
@@ -62,17 +62,19 @@ export function ToolCard({
   // 这些明确形状应进入用户可见状态，而不是显示绿色完成。
   const reportedError = name === "Bash" && /^#{1,6}\s*Error\b/m.test(outputText);
   const isBlocked = name === "Bash" && /(?:^|\n)oc-web:\s*blocked:/i.test(outputText);
-  const isError = !!renderTool.error || reportedError;
+  const hasError = !!renderTool.error || reportedError;
   // 历史 tape 是不可变真记录：turn 已中断时，未完成 tool 代表被取消，而不是仍在运行。
   const isInterruptedHistorical =
     !completed && renderTool._timelineRecord === true && renderTool._dispatchOutcome === "interrupted";
   // 取消(如 Codex item status 'cancelled')是中性终态:≠ 失败(不红)、≠ 运行中(不转圈)。
-  const isCancelled = !isError && (!!renderTool.cancelled || isInterruptedHistorical);
-  const isRunning = !completed && !isError && !isBlocked && !isCancelled;
+  const isCancelled = !hasError && (!!renderTool.cancelled || isInterruptedHistorical);
+  const isRunning = !completed && !hasError && !isBlocked && !isCancelled;
+  // 单次工具异常属于助手内部执行过程：保留真实 error 数据和可展开详情，但前台
+  // 不用红色「失败」抢占用户注意力。助手通常会自行换路径继续，表头只中性标记已结束。
   const statusLabel = isRunning
     ? "运行中"
-    : isError
-      ? "失败"
+    : hasError
+      ? "已结束"
       : isBlocked
         ? "受阻"
         : isCancelled
@@ -81,13 +83,13 @@ export function ToolCard({
 
   const hasInput = !!input && Object.keys(input).length > 0;
   const hasOutput = !!renderTool.output || !!renderTool.bashTail;
-  const hasBody = hasInput || hasOutput || isError || isBlocked;
+  const hasBody = hasInput || hasOutput || hasError || isBlocked;
 
   // 运行中（流式）默认展开以便边流边看 diff/输出；历史（挂载即完成）默认折叠。
   // 初值只在挂载求一次，之后用户手动 toggle 为权威（依赖稳定 key 保持实例）。
   // 状态只决定首次挂载；之后用户的展开选择始终为权威，流式状态迁移不强制跳动。
   const isConfirmation = outputText.includes('"confirmation_required"');
-  const [open, setOpen] = useState(() => isRunning || isError || isBlocked || isConfirmation);
+  const [open, setOpen] = useState(() => isRunning || isBlocked || isConfirmation);
 
   return (
     <div
@@ -95,13 +97,11 @@ export function ToolCard({
         // 不带外边距——间距交由容器（MessageList 的 gap / AgentGroupCard 的 space-y）统一控制，
         // 避免 margin 与父级 gap 叠加导致卡片间距过大（boss 反馈"卡片间距好大"的根因之一）。
         "overflow-hidden rounded-md border bg-surface shadow-[0_1px_2px_rgba(0,0,0,0.025)] transition-colors",
-        isError
-          ? "border-danger/30"
-          : isBlocked
-            ? "border-warning/35"
-            : isRunning
-              ? "border-accent/25"
-              : "border-border hover:border-border-strong",
+        isBlocked
+          ? "border-warning/35"
+          : isRunning
+            ? "border-accent/25"
+            : "border-border hover:border-border-strong",
       )}
     >
       <button
@@ -116,7 +116,7 @@ export function ToolCard({
         <span
           className={cn(
             "flex size-7 shrink-0 items-center justify-center rounded-lg",
-            isError ? "bg-danger-soft text-danger" : TONE_TILE[meta.tone ?? "accent"],
+            TONE_TILE[meta.tone ?? "accent"],
           )}
         >
           <Icon size={14} />
@@ -133,8 +133,8 @@ export function ToolCard({
           {isRunning && <span className="sr-only">{statusLabel}</span>}
           {isRunning ? (
             <Spinner size={13} className="text-accent" />
-          ) : isError ? (
-            <Badge tone="danger">失败</Badge>
+          ) : hasError ? (
+            <Badge tone="neutral">已结束</Badge>
           ) : isBlocked ? (
             <Badge tone="warning">受阻</Badge>
           ) : isCancelled ? (

@@ -164,7 +164,11 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
       />,
     );
     expect(screen.getByText("写入文件")).toBeInTheDocument();
-    expect(screen.getByText("失败")).toBeInTheDocument();
+    expect(screen.getByText("已结束")).toBeInTheDocument();
+    expect(screen.queryByText("失败")).not.toBeInTheDocument();
+    // 工具异常属于内部过程，表头中性收口且默认不把错误详情推到前台。
+    expect(screen.queryByText("写入文件命令失败")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button"));
     expect(screen.getByText("写入文件命令失败")).toBeInTheDocument();
     expect(document.querySelector("pre")?.textContent).toContain("Permission denied");
     cleanup();
@@ -218,13 +222,20 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
     expect(screen.getByText("+ ba")).toBeInTheDocument();
   });
 
-  test("错误态：失败 Badge", () => {
-    render(
+  test("错误态：前台中性收口，真实详情仍可展开", () => {
+    const { container } = render(
       <ToolCard
         message={{ toolName: "Write", inputJson: { file_path: "/a" }, error: true, _completed: true, output: "denied" }}
       />,
     );
-    expect(screen.getByText("失败")).toBeInTheDocument();
+    expect(screen.getByText("已结束")).toBeInTheDocument();
+    expect(screen.queryByText("失败")).not.toBeInTheDocument();
+    expect(container.querySelector(".border-danger\\/30")).not.toBeInTheDocument();
+    expect(container.querySelector(".bg-danger-soft")).not.toBeInTheDocument();
+    expect(screen.queryByText("denied")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByText("denied")).toBeInTheDocument();
   });
 
   test("TodoWrite 勾选列表 + done/total 摘要", () => {
@@ -511,7 +522,9 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
       />,
     );
     expect(screen.getByText("网页提取")).toBeInTheDocument();
-    expect(screen.getByText("失败")).toBeInTheDocument();
+    expect(screen.getByText("已结束")).toBeInTheDocument();
+    expect(screen.queryByText(/Invalid IP address/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button"));
     expect(screen.getByText("url")).toBeInTheDocument();
     expect(screen.getAllByText("https://example.com").length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText(/Invalid IP address/)).toBeInTheDocument();
@@ -712,6 +725,9 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
       />,
     );
     expect(screen.getByText("生成图片")).toBeInTheDocument();
+    expect(screen.getByText("已结束")).toBeInTheDocument();
+    expect(screen.queryByText(/imageGeneration failed: quota exceeded/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button"));
     expect(screen.getByText(/imageGeneration failed: quota exceeded/)).toBeInTheDocument();
     const text = document.body.textContent || "";
     expect(text).not.toContain("ig_error");
@@ -895,6 +911,10 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
         }}
       />,
     );
+    expect(screen.getByText("已结束")).toBeInTheDocument();
+    expect(screen.queryByText(title)).not.toBeInTheDocument();
+    expect(document.body.textContent || "").not.toContain(output);
+    fireEvent.click(screen.getByRole("button"));
     expect(screen.getByText(title)).toBeInTheDocument();
     expect(document.body.textContent || "").toContain(output);
     if (misleading) expect(document.body.textContent || "").not.toContain(misleading);
@@ -1186,7 +1206,9 @@ describe("Task / Agent 子任务卡不回显 prompt 与 JSON 参数", () => {
         }}
       />,
     );
-    expect(screen.getByText("失败")).toBeInTheDocument();
+    expect(screen.getByText("已结束")).toBeInTheDocument();
+    expect(screen.queryByText(/子任务失败: 模型超时/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button"));
     expect(screen.getByText(/子任务失败: 模型超时/)).toBeInTheDocument();
     expect(document.body.textContent).not.toContain("INTERNAL_PROMPT_MARKER");
   });
