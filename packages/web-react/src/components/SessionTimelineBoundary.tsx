@@ -2,11 +2,17 @@ import { AlertTriangle } from "lucide-react";
 import { Component, type ErrorInfo, type ReactNode } from "react";
 
 type Props = { children: ReactNode; onRetry?: () => void; resetKey?: string };
-type State = { failed: boolean };
+type State = { failed: boolean; autoRetryUsed: boolean };
+
+function isUpdateDepthError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return message.includes("Minified React error #185") || message.includes("Maximum update depth");
+}
 
 /** Last-resort list boundary. Per-message MessageBoundary still owns single-row faults. */
 export class SessionTimelineBoundary extends Component<Props, State> {
-  state: State = { failed: false };
+  state: State = { failed: false, autoRetryUsed: false };
+  private autoRetryTimer: number | null = null;
 
   static getDerivedStateFromError(): Partial<State> {
     return { failed: true };
@@ -14,12 +20,27 @@ export class SessionTimelineBoundary extends Component<Props, State> {
 
   componentDidCatch(error: unknown, info: ErrorInfo) {
     console.error("[SessionTimelineBoundary] 会话时间线渲染失败", error, info.componentStack);
+    // Virtuoso #185 is a renderer lifecycle loop, not corrupt conversation data. Once the
+    // offending tree is unmounted by this boundary, one deferred remount is safe and avoids
+    // leaving the user on a permanent fatal card after background/foreground restoration.
+    // Persistent faults stop after this single attempt and keep the ordinary manual Retry.
+    if (!isUpdateDepthError(error) || this.state.autoRetryUsed) return;
+    this.setState({ autoRetryUsed: true });
+    this.autoRetryTimer = window.setTimeout(() => {
+      this.autoRetryTimer = null;
+      this.props.onRetry?.();
+      this.setState({ failed: false });
+    }, 0);
   }
 
   componentDidUpdate(prevProps: Props) {
-    if (this.props.resetKey !== prevProps.resetKey && this.state.failed) {
-      this.setState({ failed: false });
+    if (this.props.resetKey !== prevProps.resetKey && (this.state.failed || this.state.autoRetryUsed)) {
+      this.setState({ failed: false, autoRetryUsed: false });
     }
+  }
+
+  componentWillUnmount() {
+    if (this.autoRetryTimer !== null) window.clearTimeout(this.autoRetryTimer);
   }
 
   render() {
