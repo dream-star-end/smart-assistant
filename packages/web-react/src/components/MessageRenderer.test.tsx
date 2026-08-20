@@ -2030,6 +2030,44 @@ describe("长时间线虚拟分页与活跃状态稳定性", () => {
     expect(await screen.findByLabelText("生成中")).not.toBe(before);
     scroller.remove();
   });
+
+  test("后台恢复会重建 Virtuoso，避免复用挂起前的 observer/测量图", async () => {
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    const rows = Array.from({ length: 220 }, (_, index) =>
+      mk("user", { id: "foreground-row-" + index, text: "历史记录 " + index, status: "sent" }),
+    );
+    const visibility = { value: "visible" as DocumentVisibilityState };
+    const visibilitySpy = vi.spyOn(document, "visibilityState", "get")
+      .mockImplementation(() => visibility.value);
+    const view = render(
+      <MessageList
+        messages={rows}
+        sending
+        turnActivity={{ startedAt: Date.now(), agentName: "助手" }}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+        historyGeneration="generation-7"
+      />,
+      { container: scroller },
+    );
+    const before = await screen.findByLabelText("生成中");
+
+    fireEvent(window, new Event("focus"));
+    fireEvent(document, new Event("visibilitychange"));
+    expect(await screen.findByLabelText("生成中")).toBe(before);
+
+    visibility.value = "hidden";
+    fireEvent(document, new Event("visibilitychange"));
+    visibility.value = "visible";
+    fireEvent(document, new Event("visibilitychange"));
+
+    expect(await screen.findByLabelText("生成中")).not.toBe(before);
+    visibilitySpy.mockRestore();
+    view.unmount();
+    scroller.remove();
+  });
 });
 
 describe("context_rebuilt system 提示行(§3.3/§5,复用 SystemCard 灰字样式)", () => {

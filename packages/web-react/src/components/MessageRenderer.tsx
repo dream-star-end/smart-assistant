@@ -858,6 +858,52 @@ function coalesceTeam(
 // imposing a user-visible history limit.
 const TIMELINE_VIRTUAL_INDEX_ORIGIN = Math.floor(Number.MAX_SAFE_INTEGER / 4);
 
+/**
+ * Browser suspension invalidates react-virtuoso's ResizeObserver/scroll-root graph even when
+ * the logical timeline is unchanged. Returning from a hidden tab also starts REST/journal
+ * reconciliation, so keeping the pre-suspension instance can make its optional-prop bus feed
+ * React until error #185. Advance exactly once per real hidden→visible/BFCache restore; ordinary
+ * focus events (composer/dialog focus churn) must not remount the timeline.
+ */
+function useForegroundLifecycleEpoch(): number {
+  const [epoch, setEpoch] = useState(0);
+  const wasHiddenRef = useRef(
+    typeof document !== "undefined" && document.visibilityState === "hidden",
+  );
+  const lastAdvanceAtRef = useRef(0);
+
+  useEffect(() => {
+    const advance = () => {
+      const now = Date.now();
+      if (now - lastAdvanceAtRef.current < 250) return;
+      lastAdvanceAtRef.current = now;
+      setEpoch((value) => value + 1);
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") {
+        wasHiddenRef.current = true;
+        return;
+      }
+      if (!wasHiddenRef.current) return;
+      wasHiddenRef.current = false;
+      advance();
+    };
+    const onPageShow = (event: PageTransitionEvent) => {
+      if (!event.persisted) return;
+      wasHiddenRef.current = false;
+      advance();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("pageshow", onPageShow);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("pageshow", onPageShow);
+    };
+  }, []);
+
+  return epoch;
+}
+
 type VirtualItem = RenderItem;
 
 type TimelineVirtuosoContext = {
@@ -963,6 +1009,7 @@ export function MessageList({
     };
   }
   const processPaging = pagingOwnerRef.current.controller;
+  const foregroundEpoch = useForegroundLifecycleEpoch();
   const [archiveQueued, setArchiveQueued] = useState(false);
   const archiveQueuedRef = useRef(false);
   const archiveQueueTokenRef = useRef(0);
@@ -1192,7 +1239,7 @@ export function MessageList({
   const activeTurnId = sending && turnStart > 0
     ? renderableMessages[turnStart - 1]?.id ?? "active"
     : sending ? "active" : "idle";
-  const virtualizerEpoch = `${pagingGeneration}::${activeTurnId}`;
+  const virtualizerEpoch = `${pagingGeneration}::${activeTurnId}::fg${foregroundEpoch}`;
   // 每条消息是否为「所在轮末条 assistant 正文」(评价反馈行唯一可见位)。按全量 messages 下标对齐,
   // 单一权威在 turnSegment.ts(与 turnStart / coalesceTeam 同源的 user=轮边界判定,不另造第二套)。
   const ratingFinal = turnFinalAssistantFlags(renderableMessages);
