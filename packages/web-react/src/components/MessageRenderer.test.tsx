@@ -1934,6 +1934,7 @@ describe("长时间线虚拟分页与活跃状态稳定性", () => {
     expect(screen.getByTestId("timeline-short-list")).toBeInTheDocument();
     expect(screen.getByText("第一条消息")).toBeInTheDocument();
     expect(screen.getByLabelText("生成中")).toBeInTheDocument();
+    expect(screen.getByTestId("turn-activity-footer").parentElement).toHaveClass("w-full");
     expect(screen.queryByTestId("virtuoso-item-list")).toBeNull();
     scroller.remove();
   });

@@ -1389,7 +1389,7 @@ export function MessageList({
     </div>
   ) : null;
   const footer = (
-    <div className="mx-auto flex max-w-3xl flex-col gap-4 px-5 pb-8 pt-4">
+    <div className="mx-auto flex w-full max-w-3xl flex-col gap-4 px-5 pb-8 pt-4">
       <div data-testid="turn-activity-footer">
         {sending && (
           <div className="flex gap-4">
