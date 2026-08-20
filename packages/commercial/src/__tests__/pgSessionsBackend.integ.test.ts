@@ -100,6 +100,7 @@ const MIGRATION_0231 = path.resolve(here, "../db/migrations/0231_turn_tape_mater
 const MIGRATION_0233 = path.resolve(here, "../db/migrations/0233_client_session_list_archived_at.sql");
 const MIGRATION_0239 = path.resolve(here, "../db/migrations/0239_turn_dispatch_shutdown_ctx.sql");
 const MIGRATION_0240 = path.resolve(here, "../db/migrations/0240_client_session_last_read_at.sql");
+const MIGRATION_0241 = path.resolve(here, "../db/migrations/0241_raise_last_read_watermark.sql");
 
 let pool: Pool;
 let backend: PgSessionsBackend;
@@ -235,6 +236,7 @@ before(async () => {
   await pool.query(await readFile(MIGRATION_0233, { encoding: "utf8" }));
   await pool.query(await readFile(MIGRATION_0239, { encoding: "utf8" }));
   await pool.query(await readFile(MIGRATION_0240, { encoding: "utf8" }));
+  await pool.query(await readFile(MIGRATION_0241, { encoding: "utf8" }));
   await pool.query(`
     CREATE TABLE admin_audit (
       id BIGSERIAL PRIMARY KEY,

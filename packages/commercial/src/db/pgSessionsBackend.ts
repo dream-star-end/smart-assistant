@@ -165,6 +165,7 @@ import {
   sanitizeProjectInstructions,
   LAST_MESSAGE_PREVIEW_TAIL_MAX,
   CLIENT_SESSION_UNREAD_OUTCOMES,
+  lastReadAtWatermarkMsSql,
   SESSION_BATCH_IDS_MAX,
   SESSION_LIST_LIMIT_MAX,
   SESSION_SEARCH_JSON_CANDIDATE_MAX,
@@ -478,7 +479,10 @@ const FINALIZED_TAPE_PARTS_DELETE_MS = 48 * 60 * 60_000;
 // 路径无客户端值 → 用两参形态。
 const CLOCK_MS_SQL = "(floor(EXTRACT(EPOCH FROM clock_timestamp())*1000))::BIGINT";
 const UNREAD_OUTCOME_SQL = CLIENT_SESSION_UNREAD_OUTCOMES.map((o) => `'${o}'`).join(",");
+// terminal_at 是 timestamptz → epoch milliseconds。last_read_at 写入同样是 epoch ms
+//（CLOCK_MS_SQL）。混入 unix seconds 的行由 lastReadAtWatermarkMsSql 放大 1000。
 const LAST_D_TERMINAL_MS_SQL = "(floor(EXTRACT(EPOCH FROM last_d.terminal_at)*1000))::BIGINT";
+const LAST_READ_AT_MS_SQL = lastReadAtWatermarkMsSql("cs.last_read_at");
 
 function dispatchUidForList(userId: string): string {
   return /^c:([1-9][0-9]*)$/.exec(userId)?.[1] ?? "-1";
@@ -495,7 +499,7 @@ async function pgUnreadBySessionIds(
     await pool.query<{ id: string; unread: boolean }>(
       `SELECT cs.id,
               (last_d.outcome IN (${UNREAD_OUTCOME_SQL})
-               AND ${LAST_D_TERMINAL_MS_SQL} > COALESCE(cs.last_read_at, 0)) AS unread
+               AND ${LAST_D_TERMINAL_MS_SQL} > ${LAST_READ_AT_MS_SQL}) AS unread
          FROM client_sessions cs
          LEFT JOIN (
            SELECT session_id, outcome, terminal_at FROM (
@@ -9625,7 +9629,7 @@ export function createPgSessionsBackend(
                   last_d.outcome AS last_outcome,
                   last_d.failure_code AS last_error_code,
                   (last_d.outcome IN (${UNREAD_OUTCOME_SQL})
-                   AND ${LAST_D_TERMINAL_MS_SQL} > COALESCE(cs.last_read_at, 0)) AS unread
+                   AND ${LAST_D_TERMINAL_MS_SQL} > ${LAST_READ_AT_MS_SQL}) AS unread
              FROM client_sessions cs
              LEFT JOIN (
                SELECT session_id FROM turn_dispatches
@@ -10472,6 +10476,7 @@ export function createPgSessionsBackend(
     },
 
     async markClientSessionRead(userId: string, sessionId: string): Promise<MarkClientSessionReadResult> {
+      // last_read_at 单位 = epoch milliseconds（与 CLOCK_MS_SQL / terminal_at 派生相同）。
       const res = await pool.query(
         `UPDATE client_sessions SET last_read_at = ${CLOCK_MS_SQL}
           WHERE user_id = $1 AND id = $2 AND deleted_at IS NULL`,
