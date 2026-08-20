@@ -45,13 +45,18 @@ function mapChild(child: LiveChildBlock): ChildBlock {
   };
 }
 
+function engineMessageId(unit: LiveUnit): string | undefined {
+  const extra = unit as LiveUnit & { messageId?: string };
+  return typeof extra.messageId === "string" && extra.messageId ? extra.messageId : undefined;
+}
+
 export function liveUnitToMessage(unit: LiveUnit): ChatMessage {
   const role = roleFor(unit.kind);
   const text = unit.kind === "tool"
     ? (unit.toolName || "")
     : (unit.text || unit.goal || "");
   return {
-    id: unit.id,
+    id: engineMessageId(unit) || unit.id,
     role,
     text,
     ts: Date.now(),
@@ -69,7 +74,7 @@ export function liveUnitToMessage(unit: LiveUnit): ChatMessage {
     ...(unit.error ? { error: true } : {}),
     ...(unit.runId ? { _delegateRunId: unit.runId, runId: unit.runId } : {}),
     ...(unit.agentId ? { _delegateAgentId: unit.agentId, agentId: unit.agentId } : {}),
-    ...(unit.goal ? { goal: unit.goal, _delegate: true } : {}),
+    ...(unit.goal ? { goal: unit.goal, _delegate: true, _delegateGoal: unit.goal } : {}),
     ...(unit.kind === "agent_group" ? {
       childBlocks: (unit.children ?? []).map(mapChild),
       _completed: !!unit.completed,
@@ -90,4 +95,24 @@ export function prependLiveUnitMessages(
   const insertAt = messages.findIndex((m) => m._liveUnit === true);
   if (insertAt < 0) return [...messages, ...fresh];
   return [...messages.slice(0, insertAt), ...fresh, ...messages.slice(insertAt)];
+}
+
+/** Restore WS continuation pointers so the next delta appends the hydrated row. */
+export function restoreLiveUnitStreamingState(
+  sess: {
+    messages: ChatMessage[];
+    _streamingThinking?: ChatMessage | null;
+    _streamingAssistant?: ChatMessage | null;
+  },
+  units: LiveUnit[],
+): void {
+  for (const unit of units) {
+    if (!unit.open) continue;
+    if (unit.kind !== "thinking" && unit.kind !== "text") continue;
+    const id = engineMessageId(unit) || unit.id;
+    const row = sess.messages.find((m) => m.id === id);
+    if (!row) continue;
+    if (unit.kind === "thinking") sess._streamingThinking = row;
+    if (unit.kind === "text") sess._streamingAssistant = row;
+  }
 }

@@ -534,3 +534,206 @@ describe('PR3 checkpoint fold is full state, serving-only K/preview', () => {
     assert.ok(LIVE_UNITS_CHECKPOINT_MAX_BYTES >= 1024 * 1024)
   })
 })
+
+describe('BL1 delegate_task folds into one agent_group (web reducer parity)', () => {
+  it('tool_use → delegate_progress → tool_result is one agent_group and zero extra tool cards', () => {
+    const frames = [
+      frame('1', 1, {
+        kind: 'tool_use',
+        blockId: 'tool-bl1',
+        toolName: 'delegate_task',
+        inputJson: { agentId: 'hidden-reviewer', goal: '审查草稿' },
+      }),
+      frame('2', 2, {
+        kind: 'delegate_progress',
+        runId: 'dlg-bl1',
+        agentId: 'hidden-reviewer',
+        goal: '审查草稿',
+        phase: 'start',
+      }),
+      frame('3', 3, {
+        kind: 'delegate_progress',
+        runId: 'dlg-bl1',
+        phase: 'text',
+        block: { kind: 'text', text: 'child output' },
+      }),
+      frame('4', 4, {
+        kind: 'tool_result',
+        toolUseBlockId: 'tool-bl1',
+        output: 'PASS',
+      }),
+    ]
+    const reduced = reduceLiveFrames(frames)
+    assert.equal(reduced.ok, true)
+    if (!reduced.ok) return
+    const kinds = reduced.state.units.map((u) => u.kind)
+    assert.deepEqual(kinds, ['agent_group'])
+    const group = reduced.state.units[0]!
+    assert.equal(group.blockId, 'tool-bl1')
+    assert.equal(group.runId, 'dlg-bl1')
+    assert.equal(group.completed, true)
+    assert.equal(group.open, false)
+    assert.equal(group.output, 'PASS')
+    assert.ok(group.children?.some((c) => c.kind === 'text' && c.text === 'child output'))
+    assert.equal(reduced.state.units.filter((u) => u.kind === 'tool').length, 0)
+  })
+
+  it('fan-out delegate_tasks stays a tool card; each child run is its own group', () => {
+    const frames = [
+      frame('1', 1, {
+        kind: 'tool_use',
+        blockId: 'fanout-1',
+        toolName: 'mcp__openclaude-memory__delegate_tasks',
+        inputJson: { tasks: [{ agentId: 'a', goal: 'one' }, { agentId: 'b', goal: 'two' }] },
+      }),
+      frame('2', 2, {
+        kind: 'delegate_progress',
+        runId: 'run-a',
+        agentId: 'a',
+        goal: 'one',
+        phase: 'start',
+      }),
+      frame('3', 3, {
+        kind: 'delegate_progress',
+        runId: 'run-b',
+        agentId: 'b',
+        goal: 'two',
+        phase: 'start',
+      }),
+    ]
+    const reduced = reduceLiveFrames(frames)
+    assert.equal(reduced.ok, true)
+    if (!reduced.ok) return
+    const kinds = reduced.state.units.map((u) => u.kind)
+    assert.deepEqual(kinds, ['tool', 'agent_group', 'agent_group'])
+    assert.equal(reduced.state.units[0]?.blockId, 'fanout-1')
+  })
+})
+
+describe('BL2 open thinking identity survives catch-up', () => {
+  it('catch-up thinking delta continues the open unit keyed by messageId', () => {
+    const prefix = reduceLiveFrames([
+      frame('1', 1, { kind: 'thinking', text: 'aaa', messageId: 'srv-think-1' }),
+    ])
+    assert.equal(prefix.ok, true)
+    if (!prefix.ok) return
+    assert.equal(prefix.state.units[0]?.messageId, 'srv-think-1')
+    const continued = continueReduceLiveFrames(prefix.state, [
+      frame('2', 2, { kind: 'thinking', text: 'bbb', messageId: 'srv-think-1' }),
+    ])
+    assert.equal(continued.ok, true)
+    if (!continued.ok) return
+    assert.equal(continued.state.units.length, 1)
+    assert.equal(continued.state.units[0]?.text, 'aaabbb')
+    assert.equal(continued.state.units[0]?.messageId, 'srv-think-1')
+  })
+})
+
+describe('BL3 checkpoint keeps full cumulative thinking', () => {
+  it('long cumulative thinking survives checkpoint hit + catch-up equal to a full reduce', () => {
+    const frames = Array.from({ length: 20 }, (_, i) =>
+      frame(String(i + 1), i + 1, {
+        kind: 'thinking',
+        text: 'T'.repeat(30),
+        messageId: 'srv-long-think',
+      }),
+    )
+    const prefix = reduceLiveFrames(frames.slice(0, 10))
+    assert.equal(prefix.ok, true)
+    if (!prefix.ok) return
+    assert.ok((prefix.state.units[0]?.text || '').length > 256)
+    const folded = foldLiveUnitStateForCheckpoint(prefix.state)
+    assert.ok(folded)
+    assert.equal(folded.state.units[0]?.text, prefix.state.units[0]?.text)
+    const parsed = parseLiveUnitCheckpoint(JSON.parse(folded.json))
+    assert.ok(parsed)
+    const continued = continueReduceLiveFrames(parsed, frames.slice(10))
+    assert.equal(continued.ok, true)
+    if (!continued.ok) return
+    const full = reduceLiveFrames(frames)
+    assert.equal(full.ok, true)
+    if (!full.ok) return
+    assert.equal(continued.state.units[0]?.text, full.state.units[0]?.text)
+    assert.equal(continued.state.units[0]?.text, 'T'.repeat(600))
+  })
+
+  it('8MB checkpoint cap is UTF-8 bytes not JS string length', () => {
+    const reduced = reduceLiveFrames([
+      frame('1', 1, { kind: 'thinking', text: '你'.repeat(50) }),
+    ])
+    assert.equal(reduced.ok, true)
+    if (!reduced.ok) return
+    const uncapped = foldLiveUnitStateForCheckpoint(reduced.state, { maxBytes: 1e9 })
+    assert.ok(uncapped)
+    const jsLen = uncapped.json.length
+    const utf8 = Buffer.byteLength(uncapped.json, 'utf8')
+    assert.ok(utf8 > jsLen, `utf8 ${utf8} should exceed JS length ${jsLen}`)
+    const skipped = foldLiveUnitStateForCheckpoint(reduced.state, { maxBytes: jsLen })
+    assert.equal(skipped, null)
+  })
+})
+
+describe('BL4 first-pack budget includes goal and falls back when exhausted', () => {
+  it('5 open groups × 150KB goal fit the 512KB budget or explicit fallback', () => {
+    const blob = kb(150)
+    const frames: LiveFrameInput[] = []
+    for (let g = 0; g < 5; g++) {
+      frames.push(frame(String(g + 1), g + 1, {
+        kind: 'delegate_progress',
+        runId: `dlg-goal-${g}`,
+        agentId: `agent-${g}`,
+        phase: 'start',
+        goal: blob,
+      }))
+    }
+    const page = assembleLiveUnitsPage(frames, META, {
+      n: 20,
+      k: 20,
+      maxBytes: LIVE_UNITS_FIRST_PACK_MAX_BYTES,
+    })
+    const bytes = Buffer.byteLength(JSON.stringify(page), 'utf8')
+    if (page.degraded === 'fallback') {
+      assert.equal(page.resume, undefined)
+      assert.equal(page.units.length, 0)
+    } else {
+      assert.ok(bytes <= LIVE_UNITS_FIRST_PACK_MAX_BYTES, `first pack ${bytes} exceeded 512KB`)
+      assert.equal(page.degraded, false)
+      assert.equal(page.units.filter((u) => u.kind === 'agent_group' && u.open).length, 5)
+    }
+  })
+
+  it('budget trim drops the oldest non-open unit first', () => {
+    const frames: LiveFrameInput[] = [
+      frame('g', 1, {
+        kind: 'delegate_progress',
+        runId: 'dlg-keep',
+        phase: 'start',
+        goal: 'open chrome',
+      }),
+    ]
+    for (let i = 0; i < 6; i++) {
+      frames.push(frame(String(10 + i), 10 + i, {
+        kind: 'tool_use',
+        blockId: `old-${i}`,
+        toolName: 'Bash',
+        inputPreview: kb(2),
+      }))
+    }
+    const page = assembleLiveUnitsPage(frames, META, { n: 20, k: 20, maxBytes: 8 * 1024, previewMax: 256 })
+    if (page.degraded === 'fallback') {
+      assert.equal(page.resume, undefined)
+      return
+    }
+    const rest = page.units.filter((u) => !(u.open && u.kind === 'agent_group'))
+    assert.ok(page.units.some((u) => u.runId === 'dlg-keep' && u.open))
+    if (rest.length > 0 && rest.length < 6) {
+      const maxKept = Math.max(...rest.map((u) => u.seqFirst))
+      const minKept = Math.min(...rest.map((u) => u.seqFirst))
+      assert.equal(maxKept, 15)
+      assert.ok(minKept > 10, `dropped newest instead of oldest; kept seqs ${rest.map((u) => u.seqFirst).join(',')}`)
+      assert.equal(page.hasMoreBefore, true)
+    } else {
+      assert.ok(rest.length < 6, 'expected budget to drop at least one parent tool')
+    }
+  })
+})

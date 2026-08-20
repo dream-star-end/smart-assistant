@@ -48,6 +48,7 @@ import {
   isLiveUnitsPage,
   liveUnitToMessage,
   prependLiveUnitMessages,
+  restoreLiveUnitStreamingState,
 } from "./liveUnitsHydrate";
 import { repairPostFinalProcessOrder } from "./order";
 import {
@@ -3695,6 +3696,7 @@ export class ChatSocket {
     }
     const mapped = units.map(liveUnitToMessage);
     sess.messages = prependLiveUnitMessages(sess.messages, mapped);
+    restoreLiveUnitStreamingState(sess, units);
     if (resume?.sessionKey && resume.frameSeq > 0) {
       if (!sess._lastFrameSeqByKey || typeof sess._lastFrameSeqByKey !== "object") {
         sess._lastFrameSeqByKey = {};

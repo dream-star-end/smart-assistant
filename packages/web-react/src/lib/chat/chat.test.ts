@@ -71,6 +71,7 @@ import type {
   OutboundPermissionSettledWire,
 } from "./frames";
 import { childSignature, messageSignature } from "./render";
+import { reduceLiveFrames, type LiveFrameInput } from "@openclaude/protocol";
 
 // ─── helpers ──────────────────────────────────────────────────────────
 function sess(id = "s1", agentId = "main") {
@@ -5058,6 +5059,93 @@ describe("ChatSocket interrupted continuation", () => {
     }]);
     expect(session.messages.filter((m) => m.id === "tool:1:a")).toHaveLength(1);
     expect(session.messages.some((m) => m.id === "tool:2:b")).toBe(true);
+    sock.stop();
+  });
+
+  test("BL1 liveUnits fold matches web reducer parent cards for delegate_task", () => {
+    const blocks: Record<string, unknown>[] = [
+      {
+        kind: "tool_use",
+        toolName: "delegate_task",
+        blockId: "tool-bl1",
+        partial: false,
+        inputJson: { agentId: "hidden-reviewer", goal: "审查草稿" },
+      },
+      {
+        kind: "delegate_progress",
+        runId: "dlg-bl1",
+        agentId: "hidden-reviewer",
+        goal: "审查草稿",
+        phase: "start",
+      },
+      {
+        kind: "delegate_progress",
+        runId: "dlg-bl1",
+        phase: "text",
+        block: { kind: "text", text: "child output" },
+      },
+      {
+        kind: "tool_result",
+        toolUseBlockId: "tool-bl1",
+        output: "PASS",
+      },
+    ];
+    const s = sess();
+    for (let i = 0; i < blocks.length; i++) {
+      applyOutboundMessage(s, msgFrame({ frameSeq: i + 1, blocks: [blocks[i]] }));
+    }
+    const frames: LiveFrameInput[] = blocks.map((block, i) => ({
+      recordId: String(i + 1),
+      streamKey: "dispatch:00000000-0000-4000-8000-000000000001:1",
+      clientMessageId: "cm-1",
+      payload: {
+        type: "outbound.message",
+        sessionKey: "agent:main:webchat:dm:s1",
+        frameSeq: i + 1,
+        blocks: [block],
+      },
+    }));
+    const reduced = reduceLiveFrames(frames);
+    expect(reduced.ok).toBe(true);
+    if (!reduced.ok) return;
+    const webParents = s.messages.filter((m) => m.role !== "user");
+    expect(webParents.filter((m) => m.role === "agent-group")).toHaveLength(1);
+    expect(webParents.filter((m) => m.role === "tool")).toHaveLength(0);
+    expect(reduced.state.units.filter((u) => u.kind === "agent_group")).toHaveLength(1);
+    expect(reduced.state.units.filter((u) => u.kind === "tool")).toHaveLength(0);
+    expect(reduced.state.units.length).toBe(webParents.length);
+  });
+
+  test("BL2 view=units open thinking continues the same row on the next WS delta", () => {
+    const sock = makeSocket();
+    const sessId = "s-bl2-think";
+    const clientMessageId = "cm-bl2";
+    const session = sock.ensureSession(sessId, "main");
+    session._sendingInFlight = true;
+    session._activeClientMessageId = clientMessageId;
+    sock.applyLiveUnits(sessId, [{
+      id: "thinking:1:cm-bl2",
+      kind: "thinking",
+      messageId: "srv-think-1",
+      seqFirst: 1,
+      seqLast: 2,
+      recordIdFirst: "10",
+      recordIdLast: "11",
+      open: true,
+      clientMessageId,
+      text: "aaa",
+    }], [clientMessageId]);
+    const before = session.messages.filter((m) => m.role === "thinking");
+    expect(before).toHaveLength(1);
+    expect(before[0]?.id).toBe("srv-think-1");
+    applyOutboundMessage(session, msgFrame({
+      frameSeq: 12,
+      blocks: [{ kind: "thinking", text: "bbb", messageId: "srv-think-1" }],
+    }));
+    const after = session.messages.filter((m) => m.role === "thinking");
+    expect(after).toHaveLength(1);
+    expect(after[0]?.id).toBe("srv-think-1");
+    expect(after[0]?.text).toBe("aaabbb");
     sock.stop();
   });
 

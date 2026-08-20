@@ -7,7 +7,7 @@
  * reduce state always keeps every child and full payloads).
  */
 
-export const LIVE_UNITS_REDUCER_EPOCH = '1'
+export const LIVE_UNITS_REDUCER_EPOCH = '2'
 export const LIVE_UNITS_DEFAULT_N = 20
 export const LIVE_UNITS_MAX_N = 80
 export const LIVE_UNITS_DEFAULT_K = 20
@@ -17,11 +17,10 @@ export const LIVE_UNITS_FIRST_PACK_MAX_BYTES = 512 * 1024
  * with no resume cursor (B1). Default 5s; 6.5k frames measured ~1s. */
 export const LIVE_UNITS_REDUCE_DEADLINE_MS = 5_000
 /**
- * Checkpoint stores the full fold (every child). Serving still uses the 64KB
- * preview cap; checkpoint itself keeps only a short stub + payloadRef so an
- * 11k-frame / ~10MB run fits in jsonb. Structure stays complete (B2). If the
- * ref-folded JSON still exceeds LIVE_UNITS_CHECKPOINT_MAX_BYTES, skip the write
- * (cache miss → live reduce).
+ * Checkpoint stores the full fold (every child). Stub+payloadRef is only for
+ * fields recoverable from a single frame (complete tool_result output / inputJson).
+ * Cumulative thinking/text is stored in full. If the JSON still exceeds
+ * LIVE_UNITS_CHECKPOINT_MAX_BYTES (UTF-8), skip the write (cache miss → live reduce).
  */
 export const LIVE_UNITS_CHECKPOINT_PREVIEW_MAX = 256
 export const LIVE_UNITS_CHECKPOINT_MAX_BYTES = 8 * 1024 * 1024
@@ -65,6 +64,8 @@ export type LiveUnit = {
   open: boolean
   clientMessageId: string | null
   sessionKey?: string
+  /** Engine streaming identity (`block.messageId`). Hydration must reuse this. */
+  messageId?: string
   text?: string
   toolName?: string
   blockId?: string
@@ -151,6 +152,86 @@ function str(value: unknown): string {
 
 function num(value: unknown): number | null {
   return typeof value === 'number' && Number.isSafeInteger(value) ? value : null
+}
+
+function parseJsonObject(value: unknown): Record<string, unknown> | null {
+  if (value && typeof value === 'object' && !Array.isArray(value)) return value as Record<string, unknown>
+  if (typeof value !== 'string' || !value.trim().startsWith('{')) return null
+  try {
+    const parsed = JSON.parse(value) as unknown
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null
+  } catch {
+    return null
+  }
+}
+
+function normalizeMcpServerName(raw: string): string {
+  return raw.replace(/_/g, '-')
+}
+
+function parseMcpToolName(name?: string): { server: string; op: string } | null {
+  if (!name || !name.startsWith('mcp__')) return null
+  const rest = name.slice(5)
+  const idx = rest.indexOf('__')
+  if (idx < 0) return { server: normalizeMcpServerName(rest), op: '' }
+  return { server: normalizeMcpServerName(rest.slice(0, idx)), op: rest.slice(idx + 2) }
+}
+
+function parseCodexTypeName(name?: string): string {
+  if (!name) return ''
+  if (name.startsWith('codex:') || name.startsWith('Codex:')) return name.slice(6)
+  return ''
+}
+
+function goalKey(raw: string): string {
+  return raw.replace(/\r\n?/g, '\n').trim().slice(0, 1024)
+}
+
+/** Align with web reducer `parseDelegateToolInfo` (singular delegate_task only). */
+function parseDelegateToolInfo(
+  toolName: string,
+  inputJson: unknown,
+  inputPreview: string,
+): { agentId: string; goalRaw: string } | null {
+  const name = toolName || ''
+  const input = parseJsonObject(inputJson) ?? parseJsonObject(inputPreview) ?? {}
+  const fromArgs = (args: Record<string, unknown>) => ({
+    agentId: str(args.agentId) || 'main',
+    goalRaw: str(args.goal),
+  })
+  const mcp = parseMcpToolName(name)
+  if (mcp?.server === 'openclaude-memory' && mcp.op === 'delegate_task') return fromArgs(input)
+  if (/(?:^|_)delegate_task$/.test(name) && parseCodexTypeName(name) !== 'mcpToolCall') {
+    return fromArgs(input)
+  }
+  if (parseCodexTypeName(name) !== 'mcpToolCall') return null
+  const server = normalizeMcpServerName(str(input.server) || str(input.serverName))
+  const op = str(input.tool) || str(input.toolName) || str(input.name)
+  if (server !== 'openclaude-memory' || op !== 'delegate_task') return null
+  const rawArgs = input.arguments ?? input.args ?? input.params
+  return fromArgs(parseJsonObject(rawArgs) ?? {})
+}
+
+function bindDelegateRunToGroup(
+  units: MutableUnit[],
+  block: Record<string, unknown>,
+  runId: string,
+): MutableUnit | null {
+  const agentId = str(block.agentId)
+  const goal = goalKey(str(block.goal))
+  if (!agentId || !goal) return null
+  const candidates = units.filter((u) =>
+    u.kind === 'agent_group' &&
+    !u.runId &&
+    (u.agentId || '') === agentId &&
+    goalKey(u.goal || '') === goal,
+  )
+  if (candidates.length !== 1) return null
+  const unit = candidates[0]!
+  unit.runId = runId
+  return unit
 }
 
 function utf8Bytes(text: string): number {
@@ -323,9 +404,12 @@ function seedReduceMaps(units: MutableUnit[]): {
   const groups = new Map<string, MutableUnit>()
   for (const unit of units) {
     if ((unit.kind === 'thinking' || unit.kind === 'text') && unit.open) {
+      if (unit.messageId) openThinking.set(`${unit.kind}:${unit.messageId}`, unit)
       openThinking.set(`${unit.kind}:${unit.clientMessageId || 'default'}`, unit)
     }
-    if (unit.kind === 'tool' && unit.blockId) tools.set(unit.blockId, unit)
+    if ((unit.kind === 'tool' || unit.kind === 'agent_group') && unit.blockId) {
+      tools.set(unit.blockId, unit)
+    }
     if (unit.kind === 'agent_group' && unit.runId) groups.set(unit.runId, unit)
   }
   return { openThinking, tools, groups }
@@ -373,7 +457,8 @@ function reduceLiveFramesOnto(
     const cmid = frame.clientMessageId
 
     if (kind === 'thinking' || kind === 'text') {
-      const key = `${kind}:${str(block.messageId) || cmid || 'default'}`
+      const messageId = str(block.messageId) || undefined
+      const key = `${kind}:${messageId || cmid || 'default'}`
       let unit = openThinking.get(key)
       const last = units[units.length - 1]
       if (!unit || unit !== last || unit.kind !== kind) {
@@ -388,15 +473,18 @@ function reduceLiveFramesOnto(
           clientMessageId: cmid,
           sessionKey: meta.sessionKey,
           text: str(block.text),
+          ...(messageId ? { messageId } : {}),
           payloadRef: meta.ref,
         }
         units.push(unit)
         openThinking.set(key, unit)
+        if (cmid && messageId) openThinking.set(`${kind}:${cmid}`, unit)
       } else {
         unit.text = (unit.text || '') + str(block.text)
         unit.seqLast = meta.seq
         unit.recordIdLast = frame.recordId
         unit.payloadRef = meta.ref
+        if (messageId && !unit.messageId) unit.messageId = messageId
       }
       continue
     }
@@ -404,6 +492,42 @@ function reduceLiveFramesOnto(
 
     if (kind === 'tool_use') {
       const blockId = str(block.blockId) || `tool:${meta.seq}`
+      const toolName = str(block.toolName) || 'unknown'
+      const delegate = parseDelegateToolInfo(toolName, block.inputJson, str(block.inputPreview))
+      if (delegate) {
+        let unit = tools.get(blockId)
+        if (!unit) {
+          unit = {
+            id: unitId('agent_group', blockId, meta.seq),
+            kind: 'agent_group',
+            seqFirst: meta.seq,
+            seqLast: meta.seq,
+            recordIdFirst: frame.recordId,
+            recordIdLast: frame.recordId,
+            open: true,
+            clientMessageId: cmid,
+            sessionKey: meta.sessionKey,
+            blockId,
+            toolName,
+            agentId: delegate.agentId,
+            goal: delegate.goalRaw,
+            children: [],
+            completed: false,
+            payloadRef: meta.ref,
+          }
+          units.push(unit)
+          tools.set(blockId, unit)
+        } else {
+          if (block.inputJson !== undefined && block.inputJson !== null) unit.inputJson = block.inputJson
+          if (str(block.toolName)) unit.toolName = str(block.toolName)
+          if (delegate.goalRaw && !unit.goal) unit.goal = delegate.goalRaw
+          if (delegate.agentId && !unit.agentId) unit.agentId = delegate.agentId
+          unit.seqLast = meta.seq
+          unit.recordIdLast = frame.recordId
+          unit.payloadRef = meta.ref
+        }
+        continue
+      }
       let unit = tools.get(blockId)
       if (!unit) {
         unit = {
@@ -417,7 +541,7 @@ function reduceLiveFramesOnto(
           clientMessageId: cmid,
           sessionKey: meta.sessionKey,
           blockId,
-          toolName: str(block.toolName) || 'unknown',
+          toolName,
           inputJson: block.inputJson ?? null,
           text: str(block.inputPreview),
           payloadRef: meta.ref,
@@ -465,6 +589,7 @@ function reduceLiveFramesOnto(
         if (block.outputJson !== undefined) unit.outputJson = block.outputJson
         unit.error = !!block.isError
         unit.open = false
+        if (unit.kind === 'agent_group') unit.completed = true
         unit.seqLast = meta.seq
         unit.recordIdLast = frame.recordId
         unit.payloadRef = meta.ref
@@ -492,6 +617,10 @@ function reduceLiveFramesOnto(
     if (kind === 'delegate_progress') {
       const runId = str(block.runId) || `run:${meta.seq}`
       let unit = groups.get(runId)
+      if (!unit) {
+        unit = bindDelegateRunToGroup(units, block, runId) ?? undefined
+        if (unit) groups.set(runId, unit)
+      }
       if (!unit) {
         unit = {
           id: unitId('agent_group', runId, meta.seq),
@@ -553,7 +682,7 @@ function fieldSize(unit: LiveUnit): number {
 
 function truncateField(
   holder: { [key: string]: unknown },
-  key: 'output' | 'outputJson' | 'inputJson' | 'text',
+  key: 'output' | 'outputJson' | 'inputJson' | 'text' | 'goal',
   previewMax: number,
 ): boolean {
   const value = holder[key]
@@ -577,12 +706,33 @@ function applyPreviewToUnit(unit: LiveUnit, previewMax: number): boolean {
     unit.text = (unit.text || '').slice(0, previewMax)
     changed = true
   }
+  if (typeof unit.goal === 'string' && unit.goal.length > previewMax) {
+    unit.goal = previewText(unit.goal, previewMax)
+    changed = true
+  }
   for (const child of unit.children ?? []) {
     if (truncateField(child as unknown as Record<string, unknown>, 'output', previewMax)) changed = true
     if (truncateField(child as unknown as Record<string, unknown>, 'outputJson', previewMax)) changed = true
     if (truncateField(child as unknown as Record<string, unknown>, 'inputJson', previewMax)) changed = true
   }
   return changed
+}
+
+/** Checkpoint stubs: single-source payloads only. Never truncate cumulative thinking/text. */
+function applyCheckpointStubsToUnit(unit: LiveUnit, previewMax: number): void {
+  if (unit.kind !== 'thinking' && unit.kind !== 'text') {
+    truncateField(unit as unknown as Record<string, unknown>, 'output', previewMax)
+    truncateField(unit as unknown as Record<string, unknown>, 'outputJson', previewMax)
+    truncateField(unit as unknown as Record<string, unknown>, 'inputJson', previewMax)
+    if (unit.kind === 'tool') {
+      truncateField(unit as unknown as Record<string, unknown>, 'text', previewMax)
+    }
+  }
+  for (const child of unit.children ?? []) {
+    truncateField(child as unknown as Record<string, unknown>, 'output', previewMax)
+    truncateField(child as unknown as Record<string, unknown>, 'outputJson', previewMax)
+    truncateField(child as unknown as Record<string, unknown>, 'inputJson', previewMax)
+  }
 }
 
 function selectFirstPack(units: LiveUnit[], n: number): { pack: LiveUnit[]; hasMoreBefore: boolean; beforeCursor: string | null } {
@@ -634,12 +784,13 @@ function enforceBudget(pack: LiveUnit[], opts: {
   previewMax: number
   k: number
   keepOpenChrome: boolean
-}): LiveUnit[] {
+}): { units: LiveUnit[]; droppedNonOpen: boolean; restMinSeq: number | null } {
   let k = opts.k
   let current = pack.map((u) => sliceGroupChildren(u, k))
   const over = () => jsonSize(current) > opts.maxBytes
+  let droppedNonOpen = false
 
-  const degradeLargestPayloads = () => {
+  const degradeLargestPayloads = (previewMax: number) => {
     let changed = false
     const scored = current
       .flatMap((unit, ui) => {
@@ -656,14 +807,14 @@ function enforceBudget(pack: LiveUnit[], opts: {
       if (!over()) break
       const unit = current[row.ui]!
       if (row.ci === null) {
-        if (applyPreviewToUnit(unit, opts.previewMax)) changed = true
+        if (applyPreviewToUnit(unit, previewMax)) changed = true
       } else {
         const child = unit.children?.[row.ci]
         if (child) {
           const before = jsonSize(child)
-          truncateField(child as unknown as Record<string, unknown>, 'output', opts.previewMax)
-          truncateField(child as unknown as Record<string, unknown>, 'outputJson', opts.previewMax)
-          truncateField(child as unknown as Record<string, unknown>, 'inputJson', opts.previewMax)
+          truncateField(child as unknown as Record<string, unknown>, 'output', previewMax)
+          truncateField(child as unknown as Record<string, unknown>, 'outputJson', previewMax)
+          truncateField(child as unknown as Record<string, unknown>, 'inputJson', previewMax)
           if (jsonSize(child) < before) changed = true
         }
       }
@@ -671,7 +822,7 @@ function enforceBudget(pack: LiveUnit[], opts: {
     return changed
   }
 
-  degradeLargestPayloads()
+  degradeLargestPayloads(opts.previewMax)
   while (over() && k > 1) {
     k = Math.max(1, Math.floor(k / 2))
     current = pack.map((u) => {
@@ -684,7 +835,8 @@ function enforceBudget(pack: LiveUnit[], opts: {
     const open = current.filter((u) => u.open && u.kind === 'agent_group')
     const rest = current.filter((u) => !(u.open && u.kind === 'agent_group'))
     while (over() && rest.length > 0) {
-      rest.pop()
+      rest.shift()
+      droppedNonOpen = true
       current = [...rest, ...open].sort((a, b) => a.seqFirst - b.seqFirst || a.id.localeCompare(b.id))
     }
     if (over() && opts.keepOpenChrome) {
@@ -696,9 +848,20 @@ function enforceBudget(pack: LiveUnit[], opts: {
         applyPreviewToUnit(chrome, opts.previewMax)
         return chrome
       })
+      let preview = opts.previewMax
+      while (over() && preview > 256) {
+        preview = Math.max(256, Math.floor(preview / 2))
+        current = current.map((u) => {
+          const copy = cloneUnit(u)
+          applyPreviewToUnit(copy, preview)
+          return copy
+        })
+      }
     }
   }
-  return current
+  const restNow = current.filter((u) => !(u.open && u.kind === 'agent_group'))
+  const restMinSeq = restNow.length > 0 ? Math.min(...restNow.map((u) => u.seqFirst)) : null
+  return { units: current, droppedNonOpen, restMinSeq }
 }
 
 export function serveLiveUnits(
@@ -743,12 +906,25 @@ export function serveLiveUnits(
 
   const unitBudget = Math.max(1024, maxBytes - 4096)
   const budgeted = opts.group
-    ? selected.pack.map((u) => {
-      const copy = cloneUnit(u)
-      applyPreviewToUnit(copy, previewMax)
-      return copy
-    })
+    ? {
+      units: selected.pack.map((u) => {
+        const copy = cloneUnit(u)
+        applyPreviewToUnit(copy, previewMax)
+        return copy
+      }),
+      droppedNonOpen: false,
+      restMinSeq: null as number | null,
+    }
     : enforceBudget(selected.pack, { maxBytes: unitBudget, previewMax, k, keepOpenChrome: true })
+
+  let hasMoreBefore = selected.hasMoreBefore
+  let beforeCursor = selected.beforeCursor
+  if (budgeted.droppedNonOpen) {
+    hasMoreBefore = true
+    beforeCursor = budgeted.restMinSeq != null
+      ? `u:${budgeted.restMinSeq}`
+      : `u:${state.throughFrameSeq + 1}`
+  }
 
   const resume: LiveUnitsResume | undefined = state.throughRecordId !== '0'
     ? {
@@ -760,10 +936,10 @@ export function serveLiveUnits(
 
   const page: LiveUnitsPage = {
     view: 'units',
-    units: budgeted,
+    units: budgeted.units,
     n,
-    hasMoreBefore: selected.hasMoreBefore,
-    beforeCursor: selected.beforeCursor,
+    hasMoreBefore,
+    beforeCursor,
     streamClientMessageIds: meta.streamClientMessageIds,
     openDispatch: meta.openDispatch,
     hasTapeProjection: meta.hasTapeProjection,
@@ -772,13 +948,8 @@ export function serveLiveUnits(
     degraded: false,
     ...(resume ? { resume, throughFrameSeq: state.throughFrameSeq } : {}),
   }
-  if (jsonSize(page) > maxBytes && !opts.group) {
-    page.units = enforceBudget(selected.pack, {
-      maxBytes: Math.max(1024, maxBytes - 4096),
-      previewMax,
-      k,
-      keepOpenChrome: true,
-    })
+  if (!opts.group && jsonSize(page) > maxBytes) {
+    return fallbackLiveUnitsPage(meta)
   }
   return page
 }
@@ -865,8 +1036,8 @@ const UNIT_KINDS = new Set<LiveUnitKind>(['thinking', 'text', 'tool', 'plan', 'a
 
 /**
  * B2: keep every unit and every child. Serving-only K/N windows are NOT applied.
- * Oversized payload fields become a short stub + payloadRef (not the 64KB
- * serving preview). Returns null when even that JSON exceeds the 8MB cap.
+ * Single-source oversized fields become a short stub + payloadRef. Cumulative
+ * thinking/text is stored in full. Returns null when UTF-8 JSON exceeds 8MB.
  */
 export function foldLiveUnitStateForCheckpoint(
   state: LiveUnitState,
@@ -877,7 +1048,7 @@ export function foldLiveUnitStateForCheckpoint(
   const folded: LiveUnitState = {
     units: state.units.map((unit) => {
       const copy = cloneUnit(unit)
-      applyPreviewToUnit(copy, previewMax)
+      applyCheckpointStubsToUnit(copy, previewMax)
       return copy
     }),
     throughFrameSeq: state.throughFrameSeq,
@@ -886,7 +1057,7 @@ export function foldLiveUnitStateForCheckpoint(
     reducerEpoch: state.reducerEpoch || LIVE_UNITS_REDUCER_EPOCH,
   }
   const json = JSON.stringify(folded)
-  if (json.length > maxBytes) return null
+  if (utf8Bytes(json) > maxBytes) return null
   return { json, state: folded }
 }
 
