@@ -655,13 +655,16 @@ export async function readClientSessionLiveUnits(
       ?? snapshot.frames[0]?.streamKey
       ?? catchUp[0]?.streamKey;
     if (forCache.ok && streamKey) {
-      void upsertLiveUnitCheckpoint(pool, {
-        streamKey,
-        sessionId,
-        userId,
-        state: forCache.state,
-      }).catch(() => {
-        /* cache only */
+      const cacheState = forCache.state;
+      setImmediate(() => {
+        void upsertLiveUnitCheckpoint(pool, {
+          streamKey,
+          sessionId,
+          userId,
+          state: cacheState,
+        }).catch(() => {
+          /* cache only — never block the GET stack on fold/stringify */
+        });
       });
     }
   }

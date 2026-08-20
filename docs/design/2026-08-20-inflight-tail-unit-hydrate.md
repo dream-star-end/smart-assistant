@@ -40,7 +40,7 @@
 - before 分页：单元稳定 `id`；open 组卡只出现在首包，before 页跳过仍 open 的组卡；客户端 prepend 再按 ID 去重。
 - `payloadRef` 懒加载：`GET /live-frames/payload?recordId=&sha256=` 先读 live frame，剪枝后按 `content_sha256` 回落到 tape。`choosePayloadRefSource` 锁 live→tape 顺序。
 
-**本修订已做 checkpoint（PR3）**：v1 现算 11k 帧首包 4.2s，未进手机 TTFU。`client_session_live_unit_checkpoints` 存完整折叠态；>64KB 字段 payloadRef 化；硬顶 8MB 超限跳过写入。K/preview 仍只在 serving。写路径 200ms/50 帧 debounce，不在 `persistGatewayLiveFrame` 事务内 reduce。
+**本修订已做 checkpoint（PR3）**：v1 现算 11k 帧首包 4.2s，未进手机 TTFU。`client_session_live_unit_checkpoints` 存完整折叠态；checkpoint 字段用 256B stub+payloadRef（serving 仍 64KB）；硬顶 8MB 超限跳过写入。K/preview 仍只在 serving。写路径 200ms/50 帧 debounce，不在 `persistGatewayLiveFrame` 事务内 reduce。
 - 环境：新个人版 V5 自用（uid=3，`openclaude-v5-selfhost`，live `rel-3e7b3216a` / sourceCommit `3e7b3216a`）
 - 工作树：`/opt/openclaude/worktrees/v5-selfhost-inflight-tail-hydrate`（分支 `feat/v5-selfhost-inflight-tail-hydrate`；文档 `docs/design/2026-08-20-inflight-tail-unit-hydrate.md`）
 - 产品方向（老板拍板）：点开会话默认先只加载**最后一个 agent 响应**的最新约 20 条**可渲染内容**（无论该轮是否在跑）；用户上滑再向上懒加载更早内容。
@@ -253,7 +253,7 @@ first_pack = uniq(tail ∪ open)  再按 seq_first 排序
 **写路径（若做 checkpoint）**
 
 - 不在 `persistGatewayLiveFrame` 的同一事务里做 reduce。
-- `units_jsonb` 必须是完整折叠态（全部子块、完整 payload 或 payloadRef）。K/preview 禁止写入 checkpoint。
+- `units_jsonb` 必须是完整折叠态（全部子块、完整 payload 或 payloadRef）。K/preview 禁止写入 checkpoint。超大字段在 checkpoint 里只保留 256B stub + payloadRef，避免 64KB×N 子块撑破 8MB 行。
 - 与帧的关系：checkpoint 是派生缓存。丢了就现算。不参与计费、不参与 tape hash。
 - `reducer_epoch`：共享归并函数的 semver；升级则忽略旧 checkpoint。
 

@@ -17,11 +17,13 @@ export const LIVE_UNITS_FIRST_PACK_MAX_BYTES = 512 * 1024
  * with no resume cursor (B1). Default 5s; 6.5k frames measured ~1s. */
 export const LIVE_UNITS_REDUCE_DEADLINE_MS = 5_000
 /**
- * Checkpoint stores the full fold (every child). Fields larger than the serving
- * preview cap are stored as preview+payloadRef so a 10MB run does not land a
- * 10MB jsonb row. Structure stays complete (B2). If the ref-folded JSON still
- * exceeds this cap, the write is skipped (cache miss → live reduce).
+ * Checkpoint stores the full fold (every child). Serving still uses the 64KB
+ * preview cap; checkpoint itself keeps only a short stub + payloadRef so an
+ * 11k-frame / ~10MB run fits in jsonb. Structure stays complete (B2). If the
+ * ref-folded JSON still exceeds LIVE_UNITS_CHECKPOINT_MAX_BYTES, skip the write
+ * (cache miss → live reduce).
  */
+export const LIVE_UNITS_CHECKPOINT_PREVIEW_MAX = 256
 export const LIVE_UNITS_CHECKPOINT_MAX_BYTES = 8 * 1024 * 1024
 
 export type LiveUnitsDegraded = 'fallback'
@@ -863,14 +865,14 @@ const UNIT_KINDS = new Set<LiveUnitKind>(['thinking', 'text', 'tool', 'plan', 'a
 
 /**
  * B2: keep every unit and every child. Serving-only K/N windows are NOT applied.
- * Oversized payload fields become preview+payloadRef (same 64KB cap as serving).
- * Returns null when even the ref-folded JSON exceeds LIVE_UNITS_CHECKPOINT_MAX_BYTES.
+ * Oversized payload fields become a short stub + payloadRef (not the 64KB
+ * serving preview). Returns null when even that JSON exceeds the 8MB cap.
  */
 export function foldLiveUnitStateForCheckpoint(
   state: LiveUnitState,
   opts: { previewMax?: number; maxBytes?: number } = {},
 ): { json: string; state: LiveUnitState } | null {
-  const previewMax = opts.previewMax ?? LIVE_UNITS_BLOCK_PREVIEW_MAX
+  const previewMax = opts.previewMax ?? LIVE_UNITS_CHECKPOINT_PREVIEW_MAX
   const maxBytes = opts.maxBytes ?? LIVE_UNITS_CHECKPOINT_MAX_BYTES
   const folded: LiveUnitState = {
     units: state.units.map((unit) => {

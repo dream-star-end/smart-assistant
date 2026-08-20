@@ -482,6 +482,35 @@ describe('PR3 checkpoint fold is full state, serving-only K/preview', () => {
     assert.equal(folded.state.units[0]?.children?.length, reduced.state.units[0]?.children?.length)
   })
 
+  it('keeps every child of a large fold under the 8MB cap via short payloadRef stubs', () => {
+    const frames: LiveFrameInput[] = [
+      frame('1', 1, { kind: 'delegate_progress', runId: 'dlg-many', phase: 'start', goal: 'many' }),
+    ]
+    for (let i = 0; i < 80; i++) {
+      frames.push(frame(String(i + 2), i + 2, {
+        kind: 'delegate_progress',
+        runId: 'dlg-many',
+        phase: 'tool',
+        block: {
+          kind: 'tool_result',
+          toolUseBlockId: `tu-${i}`,
+          blockId: `tu-${i}:result`,
+          toolName: 'Read',
+          output: kb(8),
+        },
+      }))
+    }
+    const reduced = reduceLiveFrames(frames)
+    assert.equal(reduced.ok, true)
+    if (!reduced.ok) return
+    assert.equal(reduced.state.units[0]?.children?.length, 80)
+    const folded = foldLiveUnitStateForCheckpoint(reduced.state)
+    assert.ok(folded)
+    assert.ok(folded.json.length < LIVE_UNITS_CHECKPOINT_MAX_BYTES)
+    assert.equal(folded.state.units[0]?.children?.length, 80)
+    assert.ok(folded.state.units[0]?.children?.every((c) => c.payloadRef))
+  })
+
   it('epoch mismatch and corrupt JSON fail closed to rebuild', () => {
     const reduced = reduceLiveFrames([frame('1', 1, { kind: 'thinking', text: 'x' })])
     assert.equal(reduced.ok, true)
