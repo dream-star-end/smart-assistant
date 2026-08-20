@@ -859,6 +859,28 @@ describe("MessageList 每张调用卡 token 实时展示", () => {
     expect(screen.getByText("111")).toBeInTheDocument();
     expect(screen.getByText("333")).toBeInTheDocument();
   });
+
+  test("旧缓存缺 targetIds/callId 的调用用量不会炸掉整条会话", () => {
+    const legacy = mk("tool", {
+      id: "legacy-call-usage",
+      toolName: "Bash",
+      inputJson: { command: "pwd" },
+      _completed: true,
+      _callUsage: {
+        usage: { totalTokens: 42 },
+      } as unknown as ChatMessage["_callUsage"],
+    });
+    render(
+      <MessageList
+        messages={[legacy, mk("assistant", { id: "legacy-call-answer", text: "正常回答" })]}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+      />,
+    );
+    expect(screen.getByText("正常回答")).toBeInTheDocument();
+    expect(screen.getByText("42")).toBeInTheDocument();
+  });
 });
 
 describe("MessageList coalesceTeam 聚合(零回归关键路径)", () => {
@@ -874,6 +896,17 @@ describe("MessageList coalesceTeam 聚合(零回归关键路径)", () => {
   test("连续 ≥2 条 agent-group → 聚成团队面板", () => {
     renderList([g("g1", "任务A"), g("g2", "任务B")]);
     expect(screen.getByText("团队协作 · 2 个智能体")).toBeInTheDocument();
+  });
+
+  test("旧缓存把 usage.delegates 存成对象时跳过成本聚合而不炸整条会话", () => {
+    renderList([
+      mk("assistant", {
+        id: "legacy-delegates",
+        text: "旧缓存回答仍应显示",
+        usage: { delegates: { reviewer: "3", length: 1 } } as unknown as ChatMessage["usage"],
+      }),
+    ]);
+    expect(screen.getByText("旧缓存回答仍应显示")).toBeInTheDocument();
   });
 
   test("单条 agent-group → 退化回 AgentGroupCard,不出团队面板", () => {
@@ -1862,6 +1895,25 @@ describe("长时间线虚拟分页与活跃状态稳定性", () => {
     );
     expect(screen.getAllByLabelText("生成中")).toHaveLength(1);
     expect(screen.getByLabelText("生成中")).toBe(status);
+  });
+
+  test("移动端冷会话首条记录未到时仍显示加载/活动状态，不留整屏空白", () => {
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    render(
+      <MessageList
+        messages={[]}
+        sending
+        historyLoading
+        turnActivity={{ startedAt: Date.now(), agentName: "助手" }}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+      />,
+      { container: scroller },
+    );
+    expect(screen.getByLabelText("生成中")).toBeInTheDocument();
+    expect(screen.getByLabelText("正在加载会话内容")).toBeInTheDocument();
   });
 
   test("生产 Virtuoso Footer 组件身份稳定，stream delta 不重挂活动 DOM", async () => {

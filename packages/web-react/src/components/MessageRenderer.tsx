@@ -709,9 +709,12 @@ function coalesceTeam(
   const delegateCostByAnchor = new Map<number, Record<string, string>>();
   for (let i = 0; i < total; i++) {
     const mm = messages[i];
-    if (mm?.role !== "assistant" || !mm.usage?.delegates?.length) continue;
+    const delegates = mm?.role === "assistant" && Array.isArray(mm.usage?.delegates)
+      ? mm.usage.delegates
+      : [];
+    if (delegates.length === 0) continue;
     const rec = delegateCostByAnchor.get(anchorOf[i]) ?? {};
-    for (const d of mm.usage.delegates) {
+    for (const d of delegates) {
       // 同 turn 若多条助手行都带 delegates,后者(最终答复行)胜。
       if (d && typeof d.agentId === "string" && typeof d.costCredits === "string") {
         rec[d.agentId] = d.costCredits;
@@ -1358,6 +1361,16 @@ export function MessageList({
         <span className="ml-2 text-xs">正在准备会话…</span>
       </div>
     );
+  }
+
+  // react-virtuoso does not mount Header/Footer while data is empty. A cold
+  // mobile tab can therefore have a real history request or active turn yet
+  // show a completely blank transcript. Render the same footer directly
+  // until the first canonical row arrives, then hand over to Virtuoso.
+  if (scrollParent && virtualItems.length === 0 && (
+    sending || historyLoading || transientNotice || (journalDegraded && onRetryJournal)
+  )) {
+    return <div className="mx-auto max-w-3xl px-5 py-8">{footer}</div>;
   }
 
   if (scrollParent) {

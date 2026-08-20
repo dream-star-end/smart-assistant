@@ -1716,6 +1716,25 @@ function mergeExactUsage(msg: MessageLike, enrich: ExactUsageEnrichment, isBilli
   return { ...msg, usage: { ...base, ...exactCostUsage, ...exactWaiverUsage, ...exactDelegateUsage } };
 }
 
+/** Timeline rows are rebuilt from immutable tape payloads, while a legacy
+ * cost event can arrive after finalize without a turnKey and patch only the
+ * small hot anchor. Exact hydration has always merged that anchor usage; the
+ * unified/deferred browser paths must use the same base before authoritative
+ * cost components override it, otherwise refresh drops a settled cost badge. */
+function mergeBillingAnchorUsage(
+  msg: MessageLike,
+  anchor: MessageLike,
+  isBillingAnchor: boolean,
+): MessageLike {
+  if (!isBillingAnchor || !anchor.usage || typeof anchor.usage !== "object" || Array.isArray(anchor.usage)) {
+    return msg;
+  }
+  const base = msg.usage && typeof msg.usage === "object" && !Array.isArray(msg.usage)
+    ? msg.usage as Record<string, unknown>
+    : {};
+  return { ...msg, usage: { ...base, ...(anchor.usage as Record<string, unknown>) } };
+}
+
 /** 内容水合(不含可变计费叠加):hash 校验 + 解析 + _turnTape 作证标记 + 基础 usage
  *  ({...recordUsage,...anchorUsage});随后在其上叠加 cost/waiver/delegate。 */
 function hydrateTapeRecordContent(
@@ -3676,6 +3695,7 @@ async function hydrateTurnTapeMessages(
           if (typeof anchor._orderSeq === "number") deferred._orderSeq = anchor._orderSeq;
           deferred.status = header.status;
           deferred._turnKey = header.turnKey;
+          deferred = mergeBillingAnchorUsage(deferred, anchor, head.msg_id === head.billing_anchor_id);
           deferred = mergeExactUsage(
             deferred,
             {
@@ -5469,6 +5489,7 @@ async function hydrateUnifiedTimelineTapeUnits(
         { ...head, content_sha256: head.visible_content_sha256 ?? undefined },
         payloadBytes,
       );
+      deferred = mergeBillingAnchorUsage(deferred, anchor, isBillingAnchor);
       deferred = mergeExactUsage(deferred, enrichment, isBillingAnchor);
       logicalRecords = [deferred];
     } else {
@@ -5517,6 +5538,7 @@ async function hydrateUnifiedTimelineTapeUnits(
         ...(typeof anchor._seq === "number" ? { _seq: anchor._seq } : {}),
         _orderSeq: unit.orderSeq,
       };
+      hydrated = mergeBillingAnchorUsage(hydrated, anchor, isBillingAnchor);
       hydrated = mergeExactUsage(hydrated, enrichment, isBillingAnchor);
       logicalRecords = expandHydratedRuntimeBatch(
         hydrated,

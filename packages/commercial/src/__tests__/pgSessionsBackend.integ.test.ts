@@ -7269,6 +7269,55 @@ function browserVisibleTimeline(messages: MessageLike[]): MessageLike[] {
 }
 
 describe("pgSessionsBackend direct turn timeline", () => {
+  maybe("timeline keeps a late legacy cost patched only onto the finalized tape anchor", async () => {
+    const sessionId = "s-direct-legacy-cost";
+    const userId = "u-direct-legacy-cost";
+    const requestId = "req-direct-legacy-cost";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const tape = directTape(sessionId, "4".repeat(64), {
+      text: "带晚到积分的最终回答",
+    });
+    await stageAndFinalize(userId, tape);
+    const anchor = (
+      await pool.query<{ billing_anchor_id: string }>(
+        `SELECT billing_anchor_id FROM client_session_turn_tapes
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+        [sessionId, userId, tape.finalize.tapeId],
+      )
+    ).rows[0]!;
+    await pool.query(
+      `INSERT INTO server_authored_request_map
+         (request_id,user_id,session_id,msg_id,written_at)
+       VALUES ($1,$2,$3,$4,$5)`,
+      [requestId, userId, sessionId, anchor.billing_anchor_id, Date.now()],
+    );
+
+    assert.deepEqual(
+      await backend.appendCostCredits(requestId, userId, "386", sessionId),
+      { applied: "patched" },
+    );
+    assert.equal(
+      (await pool.query(
+        "SELECT 1 FROM turn_tape_cost_components WHERE request_id=$1 AND user_id=$2",
+        [requestId, userId],
+      )).rowCount,
+      0,
+      "legacy request-map path intentionally has no exact turn component",
+    );
+
+    const timeline = await backend.getClientSession(sessionId, userId, { view: "timeline" });
+    const answer = (timeline!.messages as MessageLike[]).find((message) =>
+      message.role === "assistant" && message.text === "带晚到积分的最终回答"
+    );
+    assert.equal((answer?.usage as Record<string, unknown> | undefined)?.costCredits, "386");
+
+    const page = await backend.readClientTimelinePage(sessionId, userId, null, 20);
+    const pagedAnswer = page!.messages.find((message) =>
+      message.role === "assistant" && message.text === "带晚到积分的最终回答"
+    );
+    assert.equal((pagedAnswer?.usage as Record<string, unknown> | undefined)?.costCredits, "386");
+  });
+
   maybe("format-3 agent-group preserves escaped NUL without weakening format-2 guard", async () => {
     const previousBatching = process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING;
     process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING = "1";
