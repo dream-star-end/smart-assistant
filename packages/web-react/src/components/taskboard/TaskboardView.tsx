@@ -24,6 +24,7 @@ import {
   Input,
   ListSkeleton,
   Select,
+  Sheet,
   Tabs,
   useConfirm,
   usePrompt,
@@ -450,37 +451,123 @@ export function TaskboardView({
     return current ? `${current.key} ${current.name}` : undefined
   }, [board.projectId, board.projects])
 
+  const renderCreateForm = (mobile: boolean) => (
+    <div
+      data-testid="ticket-create-form"
+      className={
+        mobile
+          ? 'flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-4'
+          : 'mx-4 mb-3 flex flex-wrap items-end gap-3 rounded-xl border border-border bg-surface p-3'
+      }
+    >
+      {mobile && (
+        <div>
+          <h2 className="text-title font-semibold text-fg">新建单据</h2>
+          <p className="mt-1 text-caption text-muted">
+            先记入积压最稳妥；确定要马上处理时再选直接开工。
+          </p>
+        </div>
+      )}
+      <Select
+        aria-label="单据类型"
+        className={mobile ? 'w-full' : 'w-32'}
+        inputSize="sm"
+        value={draftType}
+        onValueChange={(v) => setDraftType(v as TicketType)}
+        options={TICKET_TYPES.map((t) => ({ value: t, label: TICKET_TYPE_LABEL[t] }))}
+      />
+      <Input
+        aria-label="单据标题"
+        inputSize="sm"
+        className={mobile ? 'w-full' : 'min-w-[12rem] flex-1'}
+        placeholder="一句话说明要解决什么"
+        value={draftTitle}
+        onChange={(e) => setDraftTitle(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') void submitCreate()
+        }}
+      />
+      <fieldset className="flex flex-col gap-1">
+        <legend className="text-caption text-muted">下一步</legend>
+        <div className="flex flex-wrap gap-3">
+          <label className="inline-flex min-h-9 items-center gap-1.5 text-body text-fg">
+            <input
+              type="radio"
+              name="ticket-create-status"
+              value="backlog"
+              aria-label="记为积压"
+              checked={!draftReady}
+              onChange={() => setDraftReady(false)}
+            />
+            先放积压
+          </label>
+          <label className="inline-flex min-h-9 items-center gap-1.5 text-body text-fg">
+            <input
+              type="radio"
+              name="ticket-create-status"
+              value="ready"
+              aria-label="直接开工"
+              checked={draftReady}
+              onChange={() => setDraftReady(true)}
+            />
+            直接开工
+          </label>
+        </div>
+        <p className="text-caption text-faint">
+          积压里的单 AI 不会处理；直接开工会进入流水线第一站。
+        </p>
+      </fieldset>
+      <div className={mobile ? 'mt-auto flex gap-2' : 'flex gap-2'}>
+        <Button
+          type="button"
+          size="sm"
+          aria-label="创建"
+          className={mobile ? 'flex-1' : undefined}
+          onClick={() => void submitCreate()}
+        >
+          创建单据
+        </Button>
+        <Button type="button" size="sm" variant="ghost" onClick={() => setCreating(false)}>
+          取消
+        </Button>
+      </div>
+    </div>
+  )
+
   return (
     <div data-testid="taskboard-root" className="flex h-full min-h-0 flex-col bg-bg">
-      <header className="flex h-14 shrink-0 items-center gap-2 px-3 pb-2.5 header-safe-t">
-        <IconButton
-          data-product-control
-          onClick={onOpenMobileNav}
-          aria-label="打开菜单"
-          shape="square"
-          className="md:hidden"
-        >
-          <Menu size={18} />
-        </IconButton>
-        {sidebarCollapsed && (
+      <header className="flex shrink-0 flex-wrap items-center gap-2 border-b border-border px-3 pb-2.5 header-safe-t md:h-14 md:flex-nowrap md:border-b-0">
+        <div className="order-1 flex min-w-0 items-center gap-2">
           <IconButton
             data-product-control
-            onClick={onExpandSidebar}
-            aria-label="展开侧栏"
+            onClick={onOpenMobileNav}
+            aria-label="打开菜单"
             shape="square"
-            className="hidden md:inline-flex"
+            className="md:hidden"
           >
-            <PanelLeft size={18} />
+            <Menu size={18} />
           </IconButton>
-        )}
-        <div className="flex min-w-0 items-center gap-2">
-          <Kanban size={16} className="text-faint" />
+          {sidebarCollapsed && (
+            <IconButton
+              data-product-control
+              onClick={onExpandSidebar}
+              aria-label="展开侧栏"
+              shape="square"
+              className="hidden md:inline-flex"
+            >
+              <PanelLeft size={18} />
+            </IconButton>
+          )}
+          <Kanban size={16} className="shrink-0 text-faint" />
           <h1 className="truncate text-title font-semibold">任务面板</h1>
         </div>
-        <div className="ml-auto flex min-w-0 flex-wrap items-center justify-end gap-2">
+        <div
+          data-testid="taskboard-responsive-toolbar"
+          className="order-3 flex w-full min-w-0 items-center gap-2 md:order-2 md:ml-auto md:w-auto"
+        >
           <Select
             aria-label="项目"
-            className="w-56 max-w-[16rem]"
+            className="min-w-0 flex-1 md:w-56 md:max-w-[16rem] md:flex-none"
             inputSize="sm"
             value={board.projectId ?? ''}
             title={projectLabel}
@@ -497,29 +584,34 @@ export function TaskboardView({
             onPatch={(id, input) => board.patchProject(id, input)}
             onArchive={(id) => board.archiveProject(id)}
             onUnarchive={(id) => board.unarchiveProject(id).then((p) => !!p)}
+            compact={!desktop}
           />
           <StageSettings
             auth={auth}
             projectId={board.projectId}
             onChanged={() => void board.reconcile()}
+            compact={!desktop}
           />
           <TemplateLibrary
             auth={auth}
             projectId={board.projectId}
             onChanged={() => void board.reconcile()}
+            compact={!desktop}
           />
           <BoardSettingsPanel auth={auth} />
-          <Button
-            type="button"
-            size="sm"
-            variant="secondary"
-            disabled={!board.projectId}
-            onClick={() => setCreating((v) => !v)}
-          >
-            <Plus size={14} />
-            新建单据
-          </Button>
         </div>
+        <Button
+          type="button"
+          size="sm"
+          variant="secondary"
+          className="order-2 ml-auto shrink-0 md:order-3 md:ml-0"
+          disabled={!board.projectId}
+          aria-expanded={creating}
+          onClick={() => setCreating((v) => !v)}
+        >
+          <Plus size={14} />
+          新建单据
+        </Button>
       </header>
 
       <div className="flex flex-wrap items-center gap-3 px-4 pb-2">
@@ -557,62 +649,7 @@ export function TaskboardView({
         )}
       </div>
 
-      {creating && (
-        <div className="mx-4 mb-3 flex flex-wrap items-end gap-3 rounded-xl border border-border bg-surface p-3">
-          <Select
-            aria-label="单据类型"
-            className="w-32"
-            inputSize="sm"
-            value={draftType}
-            onValueChange={(v) => setDraftType(v as TicketType)}
-            options={TICKET_TYPES.map((t) => ({ value: t, label: TICKET_TYPE_LABEL[t] }))}
-          />
-          <Input
-            aria-label="单据标题"
-            inputSize="sm"
-            className="min-w-[12rem] flex-1"
-            placeholder="一句话标题"
-            value={draftTitle}
-            onChange={(e) => setDraftTitle(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') void submitCreate()
-            }}
-          />
-          <fieldset className="flex flex-col gap-1">
-            <legend className="text-caption text-muted">入队方式</legend>
-            <div className="flex flex-wrap gap-3">
-              <label className="inline-flex items-center gap-1.5 text-body text-fg">
-                <input
-                  type="radio"
-                  name="ticket-create-status"
-                  value="backlog"
-                  aria-label="记为积压"
-                  checked={!draftReady}
-                  onChange={() => setDraftReady(false)}
-                />
-                记为积压
-              </label>
-              <label className="inline-flex items-center gap-1.5 text-body text-fg">
-                <input
-                  type="radio"
-                  name="ticket-create-status"
-                  value="ready"
-                  aria-label="直接开工"
-                  checked={draftReady}
-                  onChange={() => setDraftReady(true)}
-                />
-                直接开工
-              </label>
-            </div>
-            <p className="text-caption text-faint">
-              积压里的单 AI 不会碰；直接开工会进入流水线第一站。
-            </p>
-          </fieldset>
-          <Button type="button" size="sm" onClick={() => void submitCreate()}>
-            创建
-          </Button>
-        </div>
-      )}
+      {creating && desktop && renderCreateForm(false)}
 
       {board.loading && !board.tickets ? (
         <div className="px-4">
@@ -663,7 +700,7 @@ export function TaskboardView({
           agents={board.agents}
           onQueryChange={(q) => void board.applyListQuery(q)}
           onOpenTicket={openTicket}
-          renderActions={renderActions}
+          renderActions={(ticket) => renderActions(ticket, 'board')}
         />
       ) : view === 'backlog' ? (
         <div className="flex min-h-0 flex-1 flex-col">
@@ -697,7 +734,7 @@ export function TaskboardView({
               agents={board.agents}
               onQueryChange={() => {}}
               onOpenTicket={openTicket}
-              renderActions={(ticket) => renderActions(ticket, 'full')}
+              renderActions={(ticket) => renderActions(ticket, 'board')}
               hideFilters
             />
           )}
@@ -715,8 +752,21 @@ export function TaskboardView({
           agents={board.agents}
           onQueryChange={() => {}}
           onOpenTicket={openTicket}
-          renderActions={renderActions}
+          renderActions={(ticket) => renderActions(ticket, 'board')}
         />
+      )}
+
+      {!desktop && (
+        <Sheet
+          open={creating}
+          onOpenChange={(next) => {
+            if (!next) setCreating(false)
+          }}
+          side="bottom"
+          srTitle="新建单据"
+        >
+          {renderCreateForm(true)}
+        </Sheet>
       )}
 
       <TicketDrawer
@@ -729,7 +779,7 @@ export function TaskboardView({
         stages={board.board?.columns.map((c) => c.stage) ?? []}
         sessionIds={sessionIds}
         startEditing={reviseOpen}
-        actions={selected ? renderActions(selected) : null}
+        actions={selected ? renderActions(selected, desktop ? 'full' : 'board') : null}
         onClose={() => {
           setReviseOpen(false)
           onOpenTicket(null)
