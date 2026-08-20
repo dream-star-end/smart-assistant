@@ -25,16 +25,16 @@
       "mediaKey": "billing-usage",
       "mediaVersion": 2,
       "registryHash": "7df12d4762b37530312c1a0af52a058e29e2c362d9600d5deb8a741100037930",
-      "sourceHash": "05175d6d2c73b091c8c85ca08067ee23b1d8dbed5e2b2d5cfe1aa05f20a93865"
+      "sourceHash": "71638006bcb2345a01607dea624179993f2e631faf9c23886c85b76040cea799"
     },
     "chat-basics": {
-      "contentHash": "4a484f6cd607e93404f941f86ba41da22a19ead32b0312f6ced61a4ab530a28d",
-      "contentVersion": 3,
+      "contentHash": "75bda5c7637ca627776fec812a7a21b1410572d6a394132a75d412bc994a4995",
+      "contentVersion": 4,
       "mediaHash": "0cc612d377280f73f9fcc131c43e8ebde31ec42226e82a8745b0cb6534649779",
       "mediaKey": "chat-basics",
       "mediaVersion": 3,
       "registryHash": "343b05739f30ffb4df16583570adcf768ad03a8f0df19d80097465aec77dc35f",
-      "sourceHash": "c8cbea5cc040d5ad09a04bdfb2ce52f37fa3cb422e8d5909324433af29a2fd48"
+      "sourceHash": "4bd795cd8c21599a33a2abb1327f2621ba8f184e4e443e39aa8e22fb65345bec"
     },
     "connectors": {
       "contentHash": "3273aeac669b33e701c19aad3473ab19adc5e6f0db455d0a975ea2927b0d3b48",
@@ -61,7 +61,7 @@
       "mediaKey": "feedback-support",
       "mediaVersion": 2,
       "registryHash": "06b635f667df212565e73986d193397de5a01db705957c6db54e919c567701ca",
-      "sourceHash": "547ce6e1fd5322bc2ffa296417f04c88822e6eb16bd48827dc91f2351175439c"
+      "sourceHash": "7d8559b7ec7de0c73e28832a2a6e3bc48abb2f0a9f00d517b497ac6ab9a9a15e"
     },
     "files-media": {
       "contentHash": "fe18dee5d554d68a75ea19a409461d893a715a4b918056751b6faa6d94d9cfc5",
@@ -106,7 +106,7 @@
       "mediaKey": "marketplace-discovery",
       "mediaVersion": 2,
       "registryHash": "3683e9974a0d66165d7669357b196eec3e0466ced48f8f4ba8c93e582803ddc8",
-      "sourceHash": "0782aa4c740c92049d2436f3b69b5718becba4d3a7ab483da9135e6af0ababde"
+      "sourceHash": "34903999ba1478228b2f7b82ff8a90fa62cc90f8c7a36f40dd65c72af0ce2bd7"
     },
     "marketplace-publishing": {
       "contentHash": "061da931977e26ad137107c676fc8e3234f3f8b250b1359e63ec284227d0faec",
@@ -124,7 +124,7 @@
       "mediaKey": "memory-auto-dream",
       "mediaVersion": 3,
       "registryHash": "d6eedd237f502594cdeabe6703344d61ca8d511710e70ed1b9a56e2827d33fee",
-      "sourceHash": "be3f2b85d3c56628af2f1c6782a791e1282889b2bbd22e335c7efba70d4a542d"
+      "sourceHash": "23fe4f8cac5681bbf676431da2e05a87cca7ba314ede2059854e3e1a5475a85b"
     },
     "models-reasoning": {
       "contentHash": "94ae018d06f7ed3aa73106d60050dca4fef067d96738c87476f44fab0e9ec8df",
@@ -133,7 +133,7 @@
       "mediaKey": "models-reasoning",
       "mediaVersion": 2,
       "registryHash": "e7810af073bb4425162754c943fdd589c374280ccb614bf6e17596eac69ca180",
-      "sourceHash": "779eac840b8a6dbee3f46936edd25e3fa7c6bc69be135fb0b1d8e26e76c1d6c2"
+      "sourceHash": "11360ffb6edff59c0cef269e5d0d7368926af021f0acb79c5dd29b89440bc98f"
     },
     "organization": {
       "contentHash": "7cb835c5e2b81ac2543f0f161a8e706139b7f5bafc5dae6080ab475b95e7e0dd",
@@ -142,7 +142,7 @@
       "mediaKey": "organization",
       "mediaVersion": 3,
       "registryHash": "a3f5cc6541c0312420474feb09df4b7660b9fee476444ab0c69da1b64bf88fd8",
-      "sourceHash": "787e45d59dea026ce2aacc3c48f4ee96d53780447096663187ba68b306ef7476"
+      "sourceHash": "ae119161c48b9defb7e5d2fb134863b3e3fcd87b908f1ffa97c416cf60b175c7"
     },
     "preferences": {
       "contentHash": "017ae0e408a3f4586aa21330349f9e054f97526e6eea4b196fe550659c9924d0",
@@ -169,7 +169,7 @@
       "mediaKey": "sessions-history",
       "mediaVersion": 2,
       "registryHash": "35fab636ddeba4b50639aa74096f650b5c342fa42457f15dd7e8265ed9c42828",
-      "sourceHash": "d10da19bf5634ec81503ca251ecf0db25e594000dd69b7bd570f76e95e3f4590"
+      "sourceHash": "e126bfeb6b1db3f20b7d9d40802b00385fefee4e95fc6b4db26983e418e1e6ce"
     },
     "skills-training": {
       "contentHash": "e2153ef7ccb7bbd46b3ddcfac3368e004dfff463d95c1f9f805d75c4a06846e2",

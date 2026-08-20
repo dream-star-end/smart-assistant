@@ -671,6 +671,7 @@ export function Sidebar({
           </div>
           {onBatch && !multiSelect && (
             <button
+              data-product-control
               type="button"
               onClick={() => setMultiSelect(true)}
               className="shrink-0 rounded-md px-1.5 py-2 text-caption text-faint outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"

@@ -42,7 +42,7 @@ describe('TutorialReviewPage', () => {
 
     expect(await screen.findByRole('heading', { name: pending.title })).toBeInTheDocument()
     expect(screen.getByText(/先复现问题，再做最小修改/)).toBeInTheDocument()
-    expect(await screen.findByText('[追踪图]')).toBeInTheDocument()
+    expect(screen.getByText(/!\[追踪图\]\(https:\/\/tracker\.test\/pixel\.png\)/)).toBeInTheDocument()
     expect(document.querySelector('img')).toBeNull()
     fireEvent.click(screen.getByRole('button', { name: '审核通过并上线' }))
 

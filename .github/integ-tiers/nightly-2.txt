@@ -16,6 +16,7 @@ packages/commercial/src/__tests__/adminPricing.integ.test.ts
 packages/commercial/src/__tests__/adminRouteGate.integ.test.ts
 packages/commercial/src/__tests__/adminUsers.integ.test.ts
 packages/commercial/src/__tests__/communityTutorialRoutes.integ.test.ts
+packages/commercial/src/__tests__/migration0242.integ.test.ts
 packages/commercial/src/__tests__/tutorialSnapshots.integ.test.ts
 packages/commercial/src/__tests__/tutorialEval.integ.test.ts
 packages/commercial/src/__tests__/orgAuditRemediation.integ.test.ts
