@@ -462,7 +462,7 @@ export function TaskboardView({
   }
 
   const shownType = board.board?.ticketType || board.ticketType || ''
-  const taskView = view === 'board' || view === 'list'
+  const taskView = view === 'board' || view === 'list' || view === 'inbox' || view === 'backlog'
   const sectionView = taskView ? 'tasks' : view
 
   const switchSection = (next: string) => {
@@ -650,14 +650,6 @@ export function TaskboardView({
           aria-label="任务面板功能"
           items={[
             { value: 'tasks', label: '任务' },
-            {
-              value: 'inbox',
-              label: `待我确认${board.inboxTickets.length ? ` ${board.inboxTickets.length}` : ''}`,
-            },
-            {
-              value: 'backlog',
-              label: `积压${board.backlogTickets.length ? ` ${board.backlogTickets.length}` : ''}`,
-            },
             { value: 'cost', label: '成本' },
             { value: 'weekly', label: '周报' },
           ]}

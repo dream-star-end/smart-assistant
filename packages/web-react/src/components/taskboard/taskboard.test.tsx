@@ -847,6 +847,10 @@ describe('任务展示模式切换', () => {
     )
     expect(screen.queryByRole('tab', { name: '看板' })).not.toBeInTheDocument()
     expect(screen.queryByRole('tab', { name: '列表' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('tab', { name: /待我确认/ })).not.toBeInTheDocument()
+    expect(screen.queryByRole('tab', { name: /积压/ })).not.toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: '成本' })).toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: '周报' })).toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', { name: '切换到列表展示' }))
     expect(onViewChange).toHaveBeenCalledWith('list')

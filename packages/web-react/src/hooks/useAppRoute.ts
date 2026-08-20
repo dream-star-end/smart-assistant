@@ -40,7 +40,7 @@ export function parseSessionPath(pathname: string): string | null {
 /** 工作区视图：对话主区 vs 任务面板全屏主区。 */
 export type WorkspaceView = 'chat' | 'board'
 
-/** `/board` 视图。缺省 / 未知值回落看板（`board`），防深链打开不存在的视图。 */
+/** `/board` 视图。`inbox/backlog` 仅保留旧调用兼容，URL 读取会归一到任务列表。 */
 export type BoardViewParam = 'board' | 'list' | 'inbox' | 'backlog' | 'cost' | 'weekly'
 
 /** `/board` → true。只认精确路径，不吃 `/board/` 或子路径。 */
@@ -71,10 +71,30 @@ const BOARD_VIEWS: ReadonlySet<string> = new Set([
 ])
 const BOARD_TICKET_TYPES: ReadonlySet<string> = new Set(TICKET_TYPES)
 
-/** `?view=` → 任务面板视图（未知值回落看板）。 */
-export function parseBoardView(sp: URLSearchParams): BoardViewParam {
+/**
+ * 任务默认展示：窄屏优先列表，`md` 及以上优先看板。
+ * 传参形式供单测与非浏览器调用；不传时读取与 `useMdViewport` 相同的媒体查询。
+ */
+export function preferredBoardView(isDesktop?: boolean): 'board' | 'list' {
+  const desktop =
+    isDesktop ??
+    (typeof window !== 'undefined' &&
+      typeof window.matchMedia === 'function' &&
+      window.matchMedia('(min-width: 768px)').matches)
+  return desktop ? 'board' : 'list'
+}
+
+/**
+ * `?view=` → 任务面板视图。旧的 inbox/backlog 深链归一到任务列表；
+ * 缺省 / 未知值由调用方传入设备偏好，纯函数默认仍回落看板。
+ */
+export function parseBoardView(
+  sp: URLSearchParams,
+  fallback: 'board' | 'list' = 'board',
+): BoardViewParam {
   const v = sp.get('view')
-  return v && BOARD_VIEWS.has(v) ? (v as BoardViewParam) : 'board'
+  if (v === 'inbox' || v === 'backlog') return 'list'
+  return v && BOARD_VIEWS.has(v) ? (v as BoardViewParam) : fallback
 }
 
 /** `?ticket=` → identifier（空/空白当没有）。 */
@@ -101,7 +121,8 @@ export function withBoardParams(
   ticketType?: TicketType | null,
 ): URLSearchParams {
   const next = new URLSearchParams(input)
-  if (view && view !== 'board') next.set('view', view)
+  const normalizedView = view === 'inbox' || view === 'backlog' ? 'list' : view
+  if (normalizedView && normalizedView !== 'board') next.set('view', normalizedView)
   else next.delete('view')
   if (view && ticket) next.set('ticket', ticket)
   else next.delete('ticket')
@@ -252,7 +273,7 @@ export function useAppRoute(opts: UseAppRouteOptions): void {
         // /board 是并列工作区，不能当未知路径掉进空分支（主区会仍停在对话）。
         cbRef.current.onPopWorkspace?.('board')
         cbRef.current.onPopBoardParams?.(
-          parseBoardView(query),
+          parseBoardView(query, preferredBoardView()),
           parseBoardTicket(query),
           parseBoardTicketType(query),
         )

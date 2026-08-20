@@ -72,6 +72,7 @@ import {
   parseSessionPath,
   parseTutorialCase,
   parseTutorialTopic,
+  preferredBoardView,
   useAppRoute,
 } from "./hooks/useAppRoute";
 import { useAuth } from "./hooks/useAuth";
@@ -257,7 +258,7 @@ export function App() {
     () => routingEnabled && location.pathname === "/board",
   );
   const [boardView, setBoardView] = useState<BoardViewParam>(() =>
-    routingEnabled ? parseBoardView(params) : "board",
+    routingEnabled ? parseBoardView(params, preferredBoardView()) : preferredBoardView(),
   );
   const [boardTicketId, setBoardTicketId] = useState<string | null>(() =>
     routingEnabled ? parseBoardTicket(params) : null,
