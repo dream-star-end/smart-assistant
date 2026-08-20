@@ -162,4 +162,98 @@ describe("useUnreadSessions", () => {
     expect(result.current.notifyPermission).toBe("denied");
     expect(localStorage.getItem(unreadNotifyStorageKey("u1"))).toBe("0");
   });
+
+  test("乐观已读在服务端确认前不闪回", () => {
+    const { result, rerender } = hook({
+      sessions: [{ id: "s1", title: "A", unread: true, lastOutcome: "completed" }],
+      activeId: null,
+      userId: "u1",
+    });
+    expect(result.current.unreadIds.has("s1")).toBe(true);
+    act(() => {
+      result.current.markRead("s1");
+    });
+    expect(result.current.unreadIds.has("s1")).toBe(false);
+    rerender({
+      sessions: [{ id: "s1", title: "A", unread: true, lastOutcome: "completed" }],
+      activeId: null,
+      userId: "u1",
+    });
+    expect(result.current.unreadIds.has("s1")).toBe(false);
+  });
+
+  test("mark-read 之后、首次 unread=false 刷新之前发生新终态 → 绿点必须出现", () => {
+    const { result, rerender } = hook({
+      sessions: [{ id: "s1", title: "A", unread: true, lastOutcome: "completed" }],
+      activeId: null,
+      userId: "u1",
+    });
+    act(() => {
+      result.current.markRead("s1");
+    });
+    expect(result.current.unreadIds.has("s1")).toBe(false);
+    rerender({
+      sessions: [{ id: "s1", title: "A", unread: true, lastOutcome: "completed" }],
+      activeId: null,
+      userId: "u1",
+    });
+    expect(result.current.unreadIds.has("s1")).toBe(false);
+    rerender({
+      sessions: [{ id: "s1", title: "A", unread: true, runState: "running" }],
+      activeId: null,
+      userId: "u1",
+    });
+    rerender({
+      sessions: [
+        { id: "s1", title: "A", unread: true, runState: "idle", lastOutcome: "completed" },
+      ],
+      activeId: null,
+      userId: "u1",
+    });
+    expect(result.current.unreadIds.has("s1")).toBe(true);
+  });
+
+  test("mark-all 之后、首次 unread=false 刷新之前发生新终态 → 绿点必须出现", () => {
+    const { result, rerender } = hook({
+      sessions: [
+        { id: "s1", title: "A", unread: true, lastOutcome: "completed" },
+        { id: "s2", title: "B", unread: true, lastOutcome: "completed" },
+      ],
+      activeId: null,
+      userId: "u1",
+    });
+    act(() => {
+      result.current.markAllRead();
+    });
+    expect(result.current.unreadIds.has("s1")).toBe(false);
+    expect(result.current.unreadIds.has("s2")).toBe(false);
+    rerender({
+      sessions: [
+        { id: "s1", title: "A", unread: true, lastOutcome: "completed" },
+        { id: "s2", title: "B", unread: true, lastOutcome: "completed" },
+      ],
+      activeId: null,
+      userId: "u1",
+    });
+    expect(result.current.unreadIds.has("s1")).toBe(false);
+    expect(result.current.unreadIds.has("s2")).toBe(false);
+    rerender({
+      sessions: [
+        { id: "s1", title: "A", unread: true, runState: "running" },
+        { id: "s2", title: "B", unread: true, lastOutcome: "completed" },
+      ],
+      activeId: null,
+      userId: "u1",
+    });
+    rerender({
+      sessions: [
+        { id: "s1", title: "A", unread: true, runState: "idle", lastOutcome: "completed" },
+        { id: "s2", title: "B", unread: true, lastOutcome: "completed" },
+      ],
+      activeId: null,
+      userId: "u1",
+    });
+    expect(result.current.unreadIds.has("s1")).toBe(true);
+    expect(result.current.unreadIds.has("s2")).toBe(false);
+  });
 });

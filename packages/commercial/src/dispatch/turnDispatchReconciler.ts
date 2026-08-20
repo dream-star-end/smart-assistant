@@ -373,19 +373,8 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
       continue
     }
     if (res.kind !== 'ok') {
-      // 不可达:有停机/carrier-dead 证据才允许收口;否则等下轮,持续失败才告警。
-      if (hasDeadEvidence) {
-        const closed = await closeAcceptedAsServiceRestart(deps, row, now())
-        if (closed) {
-          counts.visibleFailures++
-          counts.notified++
-          await clearExitMark(deps, row)
-          try {
-            deps.nudgeClient?.(row.userId, row.sessionId, row.clientMessageId)
-          } catch { /* status is durable; live nudge is best-effort */ }
-        }
-        continue
-      }
+      // 不可达/超时/error ≠ 容器已死。保留停机证据等下轮拿到明确非存活状态
+      // (absent / recovery_pending / terminal+crashed) 再收口;持续失败才告警。
       if (age > ACCEPTED_UNREACHABLE_ALERT_MS) {
         alertWarn(
           enqueue,
@@ -1205,7 +1194,8 @@ export interface ShutdownHandoffDeps extends TurnDispatchReconcilerDeps {
 
 /**
  * 优雅停机钩子:先落「进程在 T 退出」证据,再在预算内复用容器求证收敛已死的 dispatch。
- * 不盲 finalize——容器回 running/不可达则只留证据,让重启后的 tick 立刻判定。
+ * 不盲 finalize——running/queued/sink_staged 清证据;不可达/超时保留证据等下轮。
+ * 只有明确非存活(absent / recovery_pending / terminal+crashed)+证据才写 SERVICE_RESTART。
  */
 export async function runShutdownDispatchHandoff(
   deps: ShutdownHandoffDeps,

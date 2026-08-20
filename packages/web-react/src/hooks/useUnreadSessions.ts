@@ -283,6 +283,9 @@ export function useUnreadSessions(args: {
             markRead(s.id);
             continue;
           }
+          // 新终态盖掉旧的乐观已读屏障,否则 mark-read/mark-all 之后、
+          // 首次 unread=false 刷新前的后台终态会被永久隐藏。
+          optimisticReadRef.current.delete(s.id);
           optimisticUnreadRef.current.add(s.id);
         }
         for (const s of toMark) {

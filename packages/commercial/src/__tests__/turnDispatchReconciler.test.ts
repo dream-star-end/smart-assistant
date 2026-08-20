@@ -631,14 +631,60 @@ describe('carrier-death fast path (accepted)', () => {
     assert.ok(!pool.writes.some((w) => w.includes("status = 'terminal'")))
   })
 
-  test('accepted + 停机证据 + 容器不可达 → 收口成 SERVICE_RESTART', async () => {
+  test('accepted + 停机证据 + 容器不可达 → 保留证据、等下轮、不写 SERVICE_RESTART', async () => {
     const pool = makeFakePool({
-      acceptedStuck: [rawRow({ status: 'accepted', accepted_at: new Date() })],
+      acceptedStuck: [rawRow({
+        status: 'accepted',
+        accepted_at: new Date(),
+        shutdown_ctx: { gatewayExitedAt: '2026-08-20T00:00:00.000Z' },
+      })],
     })
     const counts = await runReconcileTick({
       pool: pool as unknown as Pool,
       container: noContainer,
-      listCarrierDeadDispatchIds: async () => ['d-1'],
+    })
+    assert.equal(counts.visibleFailures, 0)
+    assert.equal(counts.rejectedTerminal, 0)
+    assert.equal(counts.manualReconcile, 0)
+    assert.ok(!pool.writes.some((w) => w.includes("status = 'terminal'")))
+    assert.ok(!pool.writeParams.some((p) => p[2] === 'SERVICE_RESTART'))
+    assert.ok(!pool.writes.some((w) => w.includes('shutdown_ctx -')), '不可达不得清停机证据')
+  })
+
+  test('accepted + 停机证据 + 容器 error 探测 → 同样不收口、保留证据', async () => {
+    const pool = makeFakePool({
+      acceptedStuck: [rawRow({
+        status: 'accepted',
+        accepted_at: new Date(),
+        shutdown_ctx: { gatewayExitedAt: '2026-08-20T00:00:00.000Z' },
+      })],
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: {
+        ...noContainer,
+        getDispatchState: async (): Promise<ContainerCallResult> => ({ kind: 'error', detail: '502' }),
+      },
+    })
+    assert.equal(counts.visibleFailures, 0)
+    assert.ok(!pool.writeParams.some((p) => p[2] === 'SERVICE_RESTART'))
+    assert.ok(!pool.writes.some((w) => w.includes('shutdown_ctx -')))
+  })
+
+  test('accepted + 停机证据 + 容器 absent → 收口成 SERVICE_RESTART', async () => {
+    const pool = makeFakePool({
+      acceptedStuck: [rawRow({
+        status: 'accepted',
+        accepted_at: new Date(),
+        shutdown_ctx: { gatewayExitedAt: '2026-08-20T00:00:00.000Z' },
+      })],
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: {
+        ...noContainer,
+        getDispatchState: async (): Promise<ContainerCallResult> => ({ kind: 'ok', state: 'absent' }),
+      },
     })
     assert.equal(counts.visibleFailures, 1)
     assert.equal(counts.rejectedTerminal, 0)
@@ -830,6 +876,49 @@ describe('runShutdownDispatchHandoff', () => {
     assert.equal(out.tick?.rejectedTerminal ?? 0, 0)
     assert.equal(marked, 3)
     assert.equal(expired, 2)
+  })
+
+  test('停机探测超时/不可达但容器仍 running → 不终态化', async () => {
+    const pool = makeFakePool({
+      acceptedStuck: [rawRow({
+        status: 'accepted',
+        accepted_at: new Date(),
+        shutdown_ctx: { gatewayExitedAt: '2026-08-20T00:00:00.000Z' },
+      })],
+    })
+    const out = await runShutdownDispatchHandoff({
+      pool: pool as unknown as Pool,
+      container: {
+        ...noContainer,
+        getDispatchState: async (): Promise<ContainerCallResult> => ({
+          kind: 'unreachable',
+          detail: 'shutdown_budget',
+        }),
+      },
+      markJournals: async () => 1,
+      expireLeases: async () => 0,
+      budgetMs: 2_000,
+    })
+    assert.equal(out.timedOut, false)
+    assert.equal(out.probed, true)
+    assert.equal(out.tick?.visibleFailures ?? 0, 0)
+    assert.equal(out.tick?.rejectedTerminal ?? 0, 0)
+    assert.ok(!pool.writeParams.some((p) => p[2] === 'SERVICE_RESTART'))
+    assert.ok(!pool.writes.some((w) => w.includes("status = 'terminal'")))
+    assert.ok(!pool.writes.some((w) => w.includes('shutdown_ctx -')), '超时不可达须保留停机证据')
+
+    const follow = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: {
+        ...noContainer,
+        getDispatchState: async (): Promise<ContainerCallResult> => ({ kind: 'ok', state: 'running' }),
+      },
+      listCarrierDeadDispatchIds: async () => ['d-1'],
+    })
+    assert.equal(follow.visibleFailures, 0)
+    assert.equal(follow.rejectedTerminal, 0)
+    assert.ok(!pool.writeParams.some((p) => p[2] === 'SERVICE_RESTART'))
+    assert.ok(!pool.writes.some((w) => w.includes("status = 'terminal'")))
   })
 
   test('预算耗尽时仍返回已落的证据,不把 shutdown 拖死', async () => {
