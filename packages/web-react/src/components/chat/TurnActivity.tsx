@@ -39,6 +39,9 @@ export type TurnActivityInfo = {
   /** Browser/service recovery stays in this existing activity row instead of
    * creating a second card or action surface above the composer. */
   recoveryStatus?: RecoveryStatusState | null;
+  /** Units first pack already painted; retrying/waiting-service must not keep
+   * the "正在恢复实时内容…" copy. */
+  hasVisibleProcess?: boolean;
   /** 容器冷启（sys.cold_start）：typing 文案追加「容器首次加载中」后缀。 */
   coldStart?: boolean;
   /** 显示用 agent 名（如「主助手」「编程助手」）。 */
@@ -96,7 +99,10 @@ export function TurnActivity({ info }: { info: TurnActivityInfo }) {
   } else if (retry) {
     text = `模型繁忙，正在重试中（${retry.attempt}/${AUTOMATIC_TURN_RETRY_MAX}）`;
     cls = "retrying";
-  } else if (recoveryKind === "waiting-service" || recoveryKind === "retrying") {
+  } else if (
+    (recoveryKind === "waiting-service" || recoveryKind === "retrying") &&
+    !info.hasVisibleProcess
+  ) {
     text = "正在恢复实时内容…";
     cls = "recovering";
   } else if (info.turnStatus === "compacting") {

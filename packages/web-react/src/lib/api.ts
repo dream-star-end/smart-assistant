@@ -1839,6 +1839,59 @@ export const api = {
     });
   },
 
+  getSessionLiveUnits: (
+    a: AuthSession,
+    id: string,
+    query?: { n?: number; before?: string | null; group?: string | null; nestedBefore?: string | null },
+    opts?: { signal?: AbortSignal; timeoutMs?: number },
+  ): Promise<unknown> => {
+    const params = new URLSearchParams();
+    params.set("view", "units");
+    params.set("n", String(query?.n ?? 20));
+    if (query?.before) params.set("before", query.before);
+    if (query?.group) params.set("group", query.group);
+    if (query?.nestedBefore) params.set("nestedBefore", query.nestedBefore);
+    const timeoutMs = opts?.timeoutMs ?? LIVE_FRAMES_REQUEST_TIMEOUT_MS;
+    const controller = new AbortController();
+    const timeout = setTimeout(
+      () => controller.abort(new DOMException("live-frames request timeout", "TimeoutError")),
+      timeoutMs,
+    );
+    const parent = opts?.signal;
+    const onParentAbort = () => controller.abort(parent?.reason);
+    parent?.addEventListener("abort", onParentAbort);
+    return jsonOrThrow<unknown>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/sessions/${encodeURIComponent(id)}/live-frames?${params.toString()}`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+          signal: controller.signal,
+        }),
+      ),
+    ).finally(() => {
+      clearTimeout(timeout);
+      parent?.removeEventListener("abort", onParentAbort);
+    });
+  },
+
+  getLiveFramePayload: (
+    a: AuthSession,
+    id: string,
+    ref: { recordId?: string; sha256?: string },
+  ): Promise<{ source: "live" | "tape"; payload: unknown; sha256?: string }> => {
+    const params = new URLSearchParams();
+    if (ref.recordId) params.set("recordId", ref.recordId);
+    if (ref.sha256) params.set("sha256", ref.sha256);
+    return jsonOrThrow(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/sessions/${encodeURIComponent(id)}/live-frames/payload?${params.toString()}`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    );
+  },
+
   getSessionGoal: (a: AuthSession, id: string): Promise<GoalStateSnapshot | null> =>
     jsonOrThrow<{ goal: GoalStateSnapshot | null }>(
       callWithRefresh(a, (t) =>

@@ -4926,6 +4926,141 @@ describe("ChatSocket interrupted continuation", () => {
     sock.stop();
   });
 
+  test("view=units first pack paints process rows, resumes, and catch-up uses resume.recordId", async () => {
+    const sock = makeSocket();
+    const sessId = "s-units";
+    const clientMessageId = "cm-units";
+    const sessionKey = `agent:main:webchat:dm:${sessId}`;
+    const session = sock.ensureSession(sessId, "main");
+    session._sendingInFlight = true;
+    session._activeClientMessageId = clientMessageId;
+    session._recoveryStatus = { kind: "waiting-service" };
+    const afters: string[] = [];
+    await sock.hydrateDurableLiveFrameJournal(
+      sessId,
+      async (after) => {
+        afters.push(after);
+        return {
+          frames: [],
+          nextCursor: null,
+          hasMore: false,
+          streamClientMessageIds: [clientMessageId],
+          hasTapeProjection: false,
+        };
+      },
+      async () => {},
+      async () => ({
+        view: "units",
+        units: [{
+          id: "thinking:1:cm-units",
+          kind: "thinking",
+          seqFirst: 1,
+          seqLast: 2,
+          recordIdFirst: "10",
+          recordIdLast: "11",
+          open: true,
+          clientMessageId,
+          text: "visible thought",
+        }],
+        n: 20,
+        hasMoreBefore: false,
+        beforeCursor: null,
+        streamClientMessageIds: [clientMessageId],
+        openDispatch: true,
+        hasTapeProjection: false,
+        tapeProjectionVersion: 0,
+        reducerEpoch: "1",
+        degraded: false,
+        resume: { sessionKey, frameSeq: 11, recordId: "11" },
+        throughFrameSeq: 11,
+      }),
+    );
+    expect(session.messages.some((m) => m.role === "thinking" && m.text === "visible thought")).toBe(true);
+    expect(session._recoveryStatus?.kind).toBe("resumed");
+    expect(session._liveUnitsPackApplied).toBe(true);
+    expect(session._lastFrameSeqByKey?.[sessionKey]).toBe(11);
+    expect(afters[0]).toBe("11");
+    sock.stop();
+  });
+
+  test("view=units degraded=fallback does not mint resume and pages after=0", async () => {
+    const sock = makeSocket();
+    const sessId = "s-units-fallback";
+    const session = sock.ensureSession(sessId, "main");
+    const afters: string[] = [];
+    await sock.hydrateDurableLiveFrameJournal(
+      sessId,
+      async (after) => {
+        afters.push(after);
+        return {
+          frames: [],
+          nextCursor: after === "0" ? "1" : null,
+          hasMore: after === "0",
+          streamClientMessageIds: [],
+          hasTapeProjection: false,
+        };
+      },
+      async () => {},
+      async () => ({
+        view: "units",
+        units: [],
+        n: 20,
+        hasMoreBefore: false,
+        beforeCursor: null,
+        streamClientMessageIds: [],
+        openDispatch: true,
+        hasTapeProjection: false,
+        tapeProjectionVersion: 0,
+        reducerEpoch: "1",
+        degraded: "fallback",
+      }),
+    );
+    expect(afters[0]).toBe("0");
+    expect(session._liveUnitsPackApplied).toBeFalsy();
+    sock.stop();
+  });
+
+  test("prependLiveUnits dedupes by stable unit id", () => {
+    const sock = makeSocket();
+    const sessId = "s-units-dedupe";
+    const session = sock.ensureSession(sessId, "main");
+    sock.applyLiveUnits(sessId, [{
+      id: "tool:1:a",
+      kind: "tool",
+      seqFirst: 10,
+      seqLast: 10,
+      recordIdFirst: "10",
+      recordIdLast: "10",
+      open: false,
+      clientMessageId: "cm",
+      toolName: "Bash",
+    }], ["cm"]);
+    sock.prependLiveUnits(sessId, [{
+      id: "tool:1:a",
+      kind: "tool",
+      seqFirst: 10,
+      seqLast: 10,
+      recordIdFirst: "10",
+      recordIdLast: "10",
+      open: false,
+      clientMessageId: "cm",
+      toolName: "Bash",
+    }, {
+      id: "tool:2:b",
+      kind: "tool",
+      seqFirst: 5,
+      seqLast: 5,
+      recordIdFirst: "5",
+      recordIdLast: "5",
+      open: false,
+      clientMessageId: "cm",
+      toolName: "Read",
+    }]);
+    expect(session.messages.filter((m) => m.id === "tool:1:a")).toHaveLength(1);
+    expect(session.messages.some((m) => m.id === "tool:2:b")).toBe(true);
+    sock.stop();
+  });
+
   test("retired stream frames still reset local cache but are not live owners", async () => {
     vi.useFakeTimers();
     const sessId = "s-retired-stream";

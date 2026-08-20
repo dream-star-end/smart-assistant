@@ -173,6 +173,7 @@ export type ChildBlock = {
   bashTail?: BashTail;
   _runtimeBashTailEvidence?: TimelineBashTailEvidence;
   childBlocks?: ChildBlock[];
+  payloadRef?: unknown;
   tail?: string;
   totalBytes?: number;
   truncatedHead?: boolean;
@@ -214,6 +215,10 @@ export type ChatMessage = {
    * 过程树),本地富卡(m-*)同 runId 存在时 local-wins。判定统一走 isServerAuthoredRow()。
    */
   _source?: "server" | "local";
+  /** Applied from GET view=units; prepend-dedupe key is `id`. */
+  _liveUnit?: boolean;
+  _payloadRef?: { recordId: string; streamKey: string; frameSeq: number; sha256?: string };
+  preview?: string;
   /**
    * server 权威内容版本游标。内容 patch 会换号；仅用于 getSession `_seq > since` 增量同步，
    * 不参与展示顺序。
@@ -627,6 +632,10 @@ export type ChatSession = {
   /** Background live-journal hydrate hit a page/time cap or request timeout.
    * Not persisted; UI offers an explicit retry. */
   _liveJournalDegraded?: boolean;
+  /** First view=units pack applied; recovery chrome can drop without waiting for WS. */
+  _liveUnitsPackApplied?: boolean;
+  _liveUnitsHasMoreBefore?: boolean;
+  _liveUnitsBeforeCursor?: string | null;
 
   // ── 双帧 error 抑制（§11）──
   _suppressErrorBubbleAtSeq?: number;

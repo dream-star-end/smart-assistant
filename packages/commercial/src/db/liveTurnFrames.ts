@@ -1,5 +1,11 @@
 import { createHash } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
+import {
+  assembleLiveUnitsPage,
+  type LiveFrameInput,
+  type LiveUnitsPage,
+  type ServeLiveUnitsOptions,
+} from "@openclaude/protocol";
 
 export interface PersistGatewayLiveFrameInput {
   uid: bigint;
@@ -439,6 +445,225 @@ export async function readClientSessionLiveFrames(
       // turn),一次性布尔标记对那种场景是盲的(codex 审计 blocker)。
       tapeProjectionVersion,
     };
+  }, "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+}
+
+export type ReadClientSessionLiveUnitsOptions = ServeLiveUnitsOptions & {
+  deadlineMs?: number;
+};
+
+function parseLiveFrameRow(row: {
+  record_id: string;
+  stream_key: string;
+  client_message_id: string | null;
+  payload: Buffer;
+  payload_sha256?: string | null;
+}): LiveFrameInput {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(Buffer.from(row.payload).toString("utf8"));
+  } catch {
+    throw new Error(`durable live frame payload is not JSON: ${row.record_id}`);
+  }
+  return {
+    recordId: row.record_id,
+    streamKey: row.stream_key,
+    clientMessageId: row.client_message_id,
+    payload: parsed,
+    ...(row.payload_sha256 ? { payloadSha256: row.payload_sha256 } : {}),
+  };
+}
+
+async function readOpenDispatchStreamMeta(
+  client: PoolClient,
+  sessionId: string,
+  userId: string,
+): Promise<{
+  streamClientMessageIds: string[];
+  openDispatch: boolean;
+  hasTapeProjection: boolean;
+  tapeProjectionVersion: number;
+} | null> {
+  const session = await client.query(
+    "SELECT 1 FROM client_sessions WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL",
+    [sessionId, userId],
+  );
+  if ((session.rowCount ?? 0) !== 1) return null;
+  const streams = await client.query<{
+    client_message_id: string | null;
+    projection_source: "live" | "tape";
+    retired: boolean;
+    superseded_by_completed_tape: boolean;
+    tape_projection_version: string | number;
+    open_dispatch: boolean;
+  }>(
+    `SELECT client_message_id,projection_source,
+            (provenance ? 'retired_at') AS retired,
+            (
+              client_message_id IS NOT NULL
+              AND EXISTS (
+                SELECT 1
+                  FROM client_session_turn_tapes t
+                 WHERE t.session_id=client_session_live_streams.session_id
+                   AND t.user_id=client_session_live_streams.user_id
+                   AND t.client_message_id=client_session_live_streams.client_message_id
+                   AND t.status='completed'
+                   AND t.finalized_at IS NOT NULL
+              )
+            ) AS superseded_by_completed_tape,
+            COUNT(*) FILTER (WHERE projection_source='tape')
+              OVER ()::text AS tape_projection_version,
+            EXISTS (
+              SELECT 1
+                FROM turn_dispatches d
+               WHERE d.session_id=client_session_live_streams.session_id
+                 AND d.status IN ('accepted','admitted','rejecting')
+                 AND client_session_live_streams.stream_key
+                   LIKE 'dispatch:' || d.dispatch_id::text || ':%'
+            ) AS open_dispatch
+       FROM client_session_live_streams
+      WHERE session_id=$1 AND user_id=$2
+      ORDER BY created_at,stream_key`,
+    [sessionId, userId],
+  );
+  const streamClientMessageIds = [...new Set(
+    streams.rows
+      .filter((row) =>
+        row.projection_source === "live"
+        && !row.retired
+        && !row.superseded_by_completed_tape
+        && row.open_dispatch
+      )
+      .map((row) => row.client_message_id)
+      .filter((value): value is string => typeof value === "string" && value.length > 0),
+  )];
+  const versionRaw = streams.rows[0]?.tape_projection_version;
+  const tapeProjectionVersion =
+    typeof versionRaw === "number" && Number.isSafeInteger(versionRaw) && versionRaw >= 0
+      ? versionRaw
+      : Number.parseInt(String(versionRaw ?? "0"), 10) || 0;
+  return {
+    streamClientMessageIds,
+    openDispatch: streams.rows.some((row) => row.open_dispatch),
+    hasTapeProjection: streams.rows.some((row) => row.projection_source === "tape"),
+    tapeProjectionVersion,
+  };
+}
+
+/**
+ * Query-time reduce of the current open-dispatch live journal into renderable
+ * units. Catch-up is a second query after the snapshot (not optional): WS does
+ * not replay frames persisted before subscribe, so resume.frameSeq is only
+ * minted after this extra scan reaches the true tail.
+ */
+export async function readClientSessionLiveUnits(
+  pool: Pool,
+  sessionId: string,
+  userId: string,
+  options?: ReadClientSessionLiveUnitsOptions,
+): Promise<LiveUnitsPage | null> {
+  const snapshot = await withTx(pool, async (client) => {
+    const meta = await readOpenDispatchStreamMeta(client, sessionId, userId);
+    if (!meta) return null;
+    if (meta.streamClientMessageIds.length === 0) {
+      return { meta, frames: [] as LiveFrameInput[] };
+    }
+    const rows = (
+      await client.query<{
+        record_id: string;
+        stream_key: string;
+        client_message_id: string | null;
+        payload: Buffer;
+        payload_sha256: string | null;
+      }>(
+        `SELECT f.record_id::text,f.stream_key,s.client_message_id,f.payload,f.payload_sha256
+           FROM client_session_live_streams s
+           JOIN client_session_live_frames f ON f.stream_key=s.stream_key
+          WHERE s.user_id=$2 AND s.session_id=$1
+            AND ${OPEN_DISPATCH_STREAM_SQL}
+          ORDER BY f.record_id`,
+        [sessionId, userId],
+      )
+    ).rows;
+    return { meta, frames: rows.map(parseLiveFrameRow) };
+  }, "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+  if (!snapshot) return null;
+  const lastRecordId = snapshot.frames.length > 0
+    ? snapshot.frames[snapshot.frames.length - 1]!.recordId
+    : "0";
+  const catchUp = await withTx(pool, async (client) => {
+    if (snapshot.meta.streamClientMessageIds.length === 0) return [] as LiveFrameInput[];
+    const rows = (
+      await client.query<{
+        record_id: string;
+        stream_key: string;
+        client_message_id: string | null;
+        payload: Buffer;
+        payload_sha256: string | null;
+      }>(
+        `SELECT f.record_id::text,f.stream_key,s.client_message_id,f.payload,f.payload_sha256
+           FROM client_session_live_streams s
+           JOIN client_session_live_frames f ON f.stream_key=s.stream_key
+          WHERE s.user_id=$2 AND s.session_id=$1
+            AND ${OPEN_DISPATCH_STREAM_SQL}
+            AND f.record_id>$3::bigint
+          ORDER BY f.record_id`,
+        [sessionId, userId, lastRecordId],
+      )
+    ).rows;
+    return rows.map(parseLiveFrameRow);
+  }, "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+  return assembleLiveUnitsPage(snapshot.frames, snapshot.meta, options ?? {}, catchUp);
+}
+
+export async function readLiveOrTapeFramePayload(
+  pool: Pool,
+  sessionId: string,
+  userId: string,
+  ref: { recordId?: string | null; sha256?: string | null },
+): Promise<{ source: "live" | "tape"; payload: unknown; sha256?: string } | null> {
+  return withTx(pool, async (client) => {
+    const session = await client.query(
+      "SELECT 1 FROM client_sessions WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL",
+      [sessionId, userId],
+    );
+    if ((session.rowCount ?? 0) !== 1) return null;
+    if (ref.recordId && /^\d+$/.test(ref.recordId)) {
+      const live = await client.query<{ payload: Buffer; payload_sha256: string }>(
+        `SELECT f.payload,f.payload_sha256
+           FROM client_session_live_frames f
+           JOIN client_session_live_streams s ON s.stream_key=f.stream_key
+          WHERE s.session_id=$1 AND s.user_id=$2 AND f.record_id=$3::bigint
+          LIMIT 1`,
+        [sessionId, userId, ref.recordId],
+      );
+      const row = live.rows[0];
+      if (row) {
+        return {
+          source: "live" as const,
+          payload: JSON.parse(Buffer.from(row.payload).toString("utf8")),
+          sha256: row.payload_sha256,
+        };
+      }
+    }
+    if (ref.sha256 && /^[a-f0-9]{64}$/i.test(ref.sha256)) {
+      const tape = await client.query<{ payload: Buffer; content_sha256: string }>(
+        `SELECT payload,content_sha256
+           FROM client_session_turn_tape_records
+          WHERE session_id=$1 AND user_id=$2 AND content_sha256=$3
+          LIMIT 1`,
+        [sessionId, userId, ref.sha256.toLowerCase()],
+      );
+      const row = tape.rows[0];
+      if (row) {
+        return {
+          source: "tape" as const,
+          payload: JSON.parse(Buffer.from(row.payload).toString("utf8")),
+          sha256: row.content_sha256,
+        };
+      }
+    }
+    return null;
   }, "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
 }
 

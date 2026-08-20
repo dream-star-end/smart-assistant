@@ -389,6 +389,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
                   invalidateHistoryCache: tapeDetail._historyRevisionUnsupported === true,
                 });
               },
+              (query) => api.getSessionLiveUnits(cbRef.current.authSession, id, { n: 20, ...query }),
             )
             .catch(() => {
               /* hydrate degrades internally; a thrown first page must not resurrect the skeleton */
