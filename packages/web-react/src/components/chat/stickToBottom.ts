@@ -21,11 +21,13 @@ export function createStickToBottomController() {
   const following = { current: true };
   const programmatic = { current: false };
   const userIntent = { current: false };
+  const lastScrollTop = { current: null as number | null };
 
   const reset = () => {
     following.current = true;
     programmatic.current = false;
     userIntent.current = false;
+    lastScrollTop.current = null;
   };
 
   const markUserIntent = () => {
@@ -35,9 +37,22 @@ export function createStickToBottomController() {
   const scrollToBottom = (el: { scrollTop: number; scrollHeight: number }) => {
     programmatic.current = true;
     el.scrollTop = el.scrollHeight;
+    lastScrollTop.current = el.scrollTop;
   };
 
   const onScroll = (el: { scrollHeight: number; scrollTop: number; clientHeight: number }) => {
+    const previousScrollTop = lastScrollTop.current;
+    lastScrollTop.current = el.scrollTop;
+    if (
+      userIntent.current &&
+      previousScrollTop !== null &&
+      el.scrollTop < previousScrollTop - 1
+    ) {
+      following.current = false;
+      programmatic.current = false;
+      userIntent.current = false;
+      return;
+    }
     if (programmatic.current) {
       programmatic.current = false;
       userIntent.current = false;

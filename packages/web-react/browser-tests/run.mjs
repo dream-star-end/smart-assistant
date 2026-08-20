@@ -1475,7 +1475,7 @@ await check("T17 PC 全屏预览空闲收起控件且可按需恢复", async () 
 // 已有的移动覆盖(T13 工具卡 375px / T15 Ask UI / T16 预览)都是单组件,整页的
 // 顶栏拥挤与正文横向溢出**没人看**。而聊天滚动区是 overflow-x-hidden:超出视口的
 // 内容不是"可以滑过去看",是**直接被裁掉、用户永远看不到**。
-const mobileContext = await browser.newContext({ viewport: { width: 390, height: 844 } });
+const mobileContext = await browser.newContext({ viewport: { width: 390, height: 844 }, hasTouch: true });
 const mobilePage = await mobileContext.newPage();
 watchRuntimeErrors(mobilePage, "mobile");
 const mobileUrl = "http://127.0.0.1/__openclaude_browser_mobile__";
@@ -1590,6 +1590,67 @@ await check("T25 390×844 整页:顶栏入口不被挤出、宽正文不被裁�
   if (JSON.stringify(sends) !== JSON.stringify([{ text: "MOBILE_SEND_MARKER", mediaCount: 0 }])) {
     throw new Error(`移动端发送结果漂移: ${JSON.stringify(sends)}`);
   }
+});
+
+await check("T43 移动端首次上滑立即解除贴底，内容再长不回弹", async () => {
+  screenshotPage = mobilePage;
+  const scroll = mobilePage.getByTestId("mobile-chat-scroll");
+  await mobilePage.evaluate(() => window.__mobilePage.growTimeline());
+  await mobilePage.waitForFunction(() => {
+    const node = document.querySelector('[data-testid="mobile-chat-scroll"]');
+    return node instanceof HTMLElement && node.scrollHeight > node.clientHeight + 200;
+  }, null, { timeout: 5000 });
+  await mobilePage.evaluate(() => window.__mobilePage.armSticky());
+  const before = await scroll.evaluate((node) => ({
+    top: node.scrollTop,
+    height: node.scrollHeight,
+    client: node.clientHeight,
+  }));
+  if (Math.abs(before.top - (before.height - before.client)) > 2) {
+    throw new Error(`触控前未贴底: ${JSON.stringify(before)}`);
+  }
+
+  const box = await scroll.boundingBox();
+  if (!box) throw new Error("移动聊天区无可触控几何");
+  const cdp = await mobileContext.newCDPSession(mobilePage);
+  const x = Math.round(box.x + box.width / 2);
+  const y = Math.round(box.y + Math.min(180, box.height / 2));
+  await cdp.send("Input.dispatchTouchEvent", {
+    type: "touchStart",
+    touchPoints: [{ x, y, radiusX: 4, radiusY: 4, force: 1, id: 1 }],
+  });
+  await cdp.send("Input.dispatchTouchEvent", {
+    type: "touchMove",
+    touchPoints: [{ x, y: y + 24, radiusX: 4, radiusY: 4, force: 1, id: 1 }],
+  });
+  await mobilePage.waitForTimeout(80);
+  await cdp.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+  await cdp.detach();
+  await mobilePage.waitForTimeout(80);
+
+  const afterGesture = await scroll.evaluate((node) => ({
+    top: node.scrollTop,
+    following: window.__mobilePage.following,
+  }));
+  if (afterGesture.top >= before.top - 2) {
+    throw new Error(`触控上滑没有离开底部: before=${before.top}, after=${afterGesture.top}`);
+  }
+  if (afterGesture.following) {
+    throw new Error("触控首次上滑后仍处于贴底态");
+  }
+
+  await mobilePage.evaluate(() => window.__mobilePage.growTimeline());
+  await mobilePage.waitForTimeout(300);
+  const afterGrow = await scroll.evaluate((node) => ({
+    top: node.scrollTop,
+    following: window.__mobilePage.following,
+  }));
+  if (Math.abs(afterGrow.top - afterGesture.top) > 2) {
+    throw new Error(
+      `上滑后内容增长把视口拉走: gesture=${JSON.stringify(afterGesture)}, grow=${JSON.stringify(afterGrow)}`,
+    );
+  }
+  if (afterGrow.following) throw new Error("内容增长后错误恢复贴底态");
 });
 screenshotPage = page;
 
