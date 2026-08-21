@@ -2113,7 +2113,9 @@ describe("userChatBridge — Phase 0.4 ring replay", () => {
         type: "outbound.message",
         sessionKey: "agent:main:webchat:dm:peerX",
         frameSeq: 5,
-        blocks: [],
+        peer: { id: "peerX", kind: "dm" },
+        clientMessageId: "cm-ring-replay",
+        blocks: [{ kind: "text", text: "ring replay" }],
       });
       containerWs1.send(stamped);
       assert.equal((await nextBusinessFrame(fc1)).frameSeq, 5);
@@ -2214,6 +2216,9 @@ describe("userChatBridge — Phase 0.4 ring replay", () => {
         type: "outbound.message",
         sessionKey: "agent:main:webchat:dm:peerZ",
         frameSeq: 3,
+        peer: { id: "peerZ", kind: "dm" },
+        clientMessageId: "cm-ring-old-container",
+        blocks: [{ kind: "text", text: "old container" }],
       }));
       await nextBusinessFrame(fc1);
       ws1.close();

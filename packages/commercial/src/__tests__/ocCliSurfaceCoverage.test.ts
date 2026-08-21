@@ -241,6 +241,9 @@ const OC_SURFACES: Record<string, Record<string, Probe>> = {
   'oc-cursor': {
     run: cursorLauncherProbe,
   },
+  'oc-zcode': {
+    run: scriptProbe('oc-zcode.sh', ['--help'], { code: 0, stdout: /usage: oc-zcode/ }),
+  },
   'oc-cite': {
     verify: tsFailureProbe('packages/gateway/src/ocCiteCli.ts', ['verify'], /verify <id/),
     format: tsFailureProbe('packages/gateway/src/ocCiteCli.ts', ['format'], /format <id/),
@@ -852,6 +855,11 @@ function productionSurfaces(): Record<string, Set<string>> {
       'packages/commercial/agent-sandbox/platform-runtime/bin/oc-cursor.sh',
       'run',
       /--output-format stream-json --stream-partial-output/,
+    ),
+    'oc-zcode': singlePurpose(
+      'packages/commercial/agent-sandbox/platform-runtime/bin/oc-zcode.sh',
+      'run',
+      /usage: oc-zcode/,
     ),
     'oc-cite': tsDispatchCommands('packages/gateway/src/ocCiteCli.ts', 'cmd'),
     'oc-connect': new Set(connect),
