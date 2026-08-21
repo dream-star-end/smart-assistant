@@ -6964,14 +6964,38 @@ export async function commitVisibleLosslessTurnPhaseA(
       throw new Error("lossless turn tape target session row malformed");
     }
     const stubRecord = { id: billingAnchorId, role: "assistant" as const, ts: head.ts, text: head.text };
-    const anchors = [{
-      ...tapeAnchor(stubRecord as never, request.tapeId, request.tapeSha256, 1, 1, undefined, []),
-      text: head.text,
-    }];
-    const recordIds = new Set([billingAnchorId]);
-    existingMessages = existingMessages.filter(
-      (message) => typeof message?.id !== "string" || !recordIds.has(message.id),
+    const conflictingAnchor = existingMessages.find(
+      (message) =>
+        message?.id === billingAnchorId &&
+        typeof message._turnTapeId === "string" &&
+        message._turnTapeId !== request.tapeId,
     );
+    let anchors: (MessageLike & { id: string })[];
+    if (conflictingAnchor) {
+      // A content-only recovery deliberately reuses the crashed source billing
+      // anchor. Phase A must not delete that source before Phase B verifies the
+      // recovery link and transfers its billing ownership atomically.
+      const recoveryLink = await readTurnTapeRecoveryLink(
+        client,
+        request.sessionId,
+        userId,
+        request.tapeId,
+        true,
+      );
+      if (!recoveryLink || recoveryLink.source_tape_id !== conflictingAnchor._turnTapeId) {
+        throw new Error("lossless turn tape visible anchor is owned by another tape");
+      }
+      anchors = [];
+    } else {
+      anchors = [{
+        ...tapeAnchor(stubRecord as never, request.tapeId, request.tapeSha256, 1, 1, undefined, []),
+        text: head.text,
+      }];
+      const recordIds = new Set([billingAnchorId]);
+      existingMessages = existingMessages.filter(
+        (message) => typeof message?.id !== "string" || !recordIds.has(message.id),
+      );
+    }
     const plan = planAppendServerAuthoredBatch(
       existingMessages,
       anchors,

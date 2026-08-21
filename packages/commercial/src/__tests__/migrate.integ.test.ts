@@ -745,7 +745,7 @@ describe("migrate.runMigrations", () => {
     assert.equal(second.applied.length, 0);
   });
 
-  test("0179/0186 publishes Ark K3 with the official K3 pricing", async (t) => {
+  test("0179/0186 keeps the Ark K3 copied price isolated from later Moonshot repricing", async (t) => {
     if (skipIfNoPg(t)) return;
     await runMigrations();
 
@@ -800,16 +800,35 @@ describe("migrate.runMigrations", () => {
     const source = pricing.rows.find((row) => row.model_id === "kimi-k3")!;
     const target = pricing.rows.find((row) => row.model_id === "kimi-k3-ark")!;
     assert.equal(target.display_name, "Kimi K3（ark）");
-    for (const field of [
-      "input_per_mtok",
-      "output_per_mtok",
-      "cache_read_per_mtok",
-      "cache_write_per_mtok",
-      "multiplier",
-      "enabled",
-    ] as const) {
-      assert.equal(target[field], source[field], field);
-    }
+    assert.deepEqual(
+      {
+        input: target.input_per_mtok,
+        output: target.output_per_mtok,
+        cacheRead: target.cache_read_per_mtok,
+        cacheWrite: target.cache_write_per_mtok,
+        multiplier: target.multiplier,
+        enabled: target.enabled,
+      },
+      {
+        input: "500",
+        output: "2500",
+        cacheRead: "50",
+        cacheWrite: "0",
+        multiplier: "1.000",
+        enabled: true,
+      },
+      "0234 halves the copied Ark plan price without inheriting 0224/0238 Moonshot repricing",
+    );
+    assert.deepEqual(
+      {
+        input: source.input_per_mtok,
+        output: source.output_per_mtok,
+        cacheRead: source.cache_read_per_mtok,
+        cacheWrite: source.cache_write_per_mtok,
+      },
+      { input: "914", output: "4569", cacheRead: "92", cacheWrite: "0" },
+      "0238 keeps the Moonshot 1M tier at 1.5x its standard tier",
+    );
     assert.equal(target.sort_order, 89);
     assert.equal(target.visibility, "public");
 
@@ -856,7 +875,7 @@ describe("migrate.runMigrations", () => {
     );
   });
 
-  test("0197/0199 preserve admin pricing while switching Qwen3.8 Max to Codex Responses", async (t) => {
+  test("0197/0199 preserve admin pricing while switching Qwen3.8 Max to Codex Responses across later repricing", async (t) => {
     if (skipIfNoPg(t)) return;
     await runMigrations();
 
@@ -931,15 +950,23 @@ describe("migrate.runMigrations", () => {
     assert.equal(pricing.rows.length, 2);
     const source = pricing.rows.find((row) => row.model_id === "qwen3.7-max")!;
     const target = pricing.rows.find((row) => row.model_id === "qwen3.8-max")!;
-    for (const field of [
-      "input_per_mtok",
-      "output_per_mtok",
-      "cache_read_per_mtok",
-      "cache_write_per_mtok",
-      "multiplier",
-    ] as const) {
-      assert.equal(target[field], source[field], field);
-    }
+    assert.deepEqual(
+      {
+        input: target.input_per_mtok,
+        output: target.output_per_mtok,
+        cacheRead: target.cache_read_per_mtok,
+        cacheWrite: target.cache_write_per_mtok,
+        multiplier: target.multiplier,
+      },
+      {
+        input: "679",
+        output: "2037",
+        cacheRead: "85",
+        cacheWrite: "0",
+        multiplier: "1.000",
+      },
+      "0223 official CNY pricing followed by the 0234 global halving remains authoritative",
+    );
     assert.equal(source.enabled, false);
     assert.equal(target.enabled, true);
     assert.equal(target.display_name, "Qwen3.8 Max");

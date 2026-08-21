@@ -23,7 +23,5 @@
 
 # ── 本文件 = pr-2 分片专属基线(2026-07-26 拆分)────────────────────────────
 # 为什么拆:三片共用一份基线时,counts 上界只能取三片最大值,等于把零失败的分片
-#   也放宽到最松的那一片。本片 CI 实测 # tests 99 / # fail 5(顶层 2 条)。
+#   也放宽到最松的那一片。2026-08-21 已偿还 settleUsage 测试腐化，本片 # fail 0。
 # 真值来源 = CI artifact commercial-integ-tap-pr-2(铁律:基线真值只认 CI,不认本机)。
-
-settleUsageAndLedger (integ)
