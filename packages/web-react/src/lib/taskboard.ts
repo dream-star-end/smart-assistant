@@ -1149,7 +1149,7 @@ function boardGet<T>(a: AuthSession, path: string): Promise<T> {
 function boardSend<T>(
   a: AuthSession,
   path: string,
-  method: 'POST' | 'PATCH' | 'DELETE',
+  method: 'POST' | 'PUT' | 'PATCH' | 'DELETE',
   body?: unknown,
 ): Promise<T> {
   return jsonOrThrow<T>(
