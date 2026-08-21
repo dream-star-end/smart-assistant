@@ -73,6 +73,7 @@ import { SupervisorError } from "./types.js";
 import { getCodexTokenSnapshot } from "../account-pool/store.js";
 import { pickCodexAccountForBinding } from "../account-pool/scheduler.js";
 import { buildCodexRelayLocalBaseUrl, readCodexUpstreamBaseUrl } from "../http/internalCodexRelay.js";
+import { appendCoreMemoryEmbeddingEnv } from "./coreMemoryEmbeddingEnv.js";
 import { isPromptQueueV1Enabled } from "../http/internalPromptQueue.js";
 import { skillShadowContainerEnv } from "../http/internalSkillShadow.js";
 import { zeroBuffer } from "../crypto/keys.js";
@@ -503,6 +504,8 @@ export const DEFAULT_V3_CCB_BASELINE_DIR =
 /** baseline 内部结构 —— 用 POSIX 绝对路径拼 docker Bind */
 export const V3_CCB_BASELINE_AGENTS_MD_REL = "AGENTS.md";
 export const V3_CCB_BASELINE_CLAUDE_MD_REL = "CLAUDE.md";
+export const V3_CCB_BASELINE_AGENTS_ADMIN_MD_REL = "AGENTS.admin.md";
+export const V3_CCB_BASELINE_CLAUDE_ADMIN_MD_REL = "CLAUDE.admin.md";
 export const V3_CCB_BASELINE_SKILLS_DIR_REL = "skills";
 
 /**
@@ -556,6 +559,7 @@ export const V3_CCB_BASELINE_SKILL_NAMES = [
   "oc-vision",
   "app-connectors",
   "connector-authoring",
+  "manage-taskboard",
 ] as const;
 
 /**
@@ -610,8 +614,14 @@ function readCcbBaselineOptionalFromEnv(): boolean {
  *   这样基线的"全有或全无"语义就严格成立 ——
  *   skills/ 下看见的 ≡ manifest 声明的 ≡ 每条都 root owned + mode safe + SKILL.md 合规。
  */
+export type CcbBaselineMountOpts = {
+  /** role=admin 时挂不含租户限制守则的 *.admin.md；缺省/非 admin 仍挂完整守则。 */
+  admin?: boolean;
+};
+
 export function resolveCcbBaselineMounts(
   baselineDir: string,
+  opts?: CcbBaselineMountOpts,
 ): { agentsMdHostPath: string; claudeMdHostPath: string; skillsDirHostPath: string } | null {
   if (typeof baselineDir !== "string" || baselineDir.trim() === "") return null;
   // 必须绝对路径;path.normalize 吞掉尾斜杠、多余 `/` 等等价写法。
@@ -625,9 +635,15 @@ export function resolveCcbBaselineMounts(
     assertBaselineLeaf(abs, "dir", abs);
     const agentsMdPath = pathJoin(abs, V3_CCB_BASELINE_AGENTS_MD_REL);
     const claudeMdPath = pathJoin(abs, V3_CCB_BASELINE_CLAUDE_MD_REL);
+    const agentsAdminMdPath = pathJoin(abs, V3_CCB_BASELINE_AGENTS_ADMIN_MD_REL);
+    const claudeAdminMdPath = pathJoin(abs, V3_CCB_BASELINE_CLAUDE_ADMIN_MD_REL);
     const skillsDirPath = pathJoin(abs, V3_CCB_BASELINE_SKILLS_DIR_REL);
     const agentsReal = assertBaselineLeaf(agentsMdPath, "file", abs);
     const claudeReal = assertBaselineLeaf(claudeMdPath, "file", abs);
+    // 管理员变体与完整守则一起校验:缺一份 → 整个 resolve 失败,避免 admin
+    // 容器静默回落到租户限制守则,或非 admin 容器在缺文件时误挂空路径。
+    const agentsAdminReal = assertBaselineLeaf(agentsAdminMdPath, "file", abs);
+    const claudeAdminReal = assertBaselineLeaf(claudeAdminMdPath, "file", abs);
     // 中间目录 skills/ 必须和根一样被锁死(root owned + 非可写 + 非 symlink)
     const skillsDirReal = assertBaselineLeaf(skillsDirPath, "dir", abs);
 
@@ -690,9 +706,10 @@ export function resolveCcbBaselineMounts(
         assertBaselineLeaf(pathJoin(evalsDir, "evals.json"), "file", abs);
       }
     }
+    const admin = opts?.admin === true;
     return {
-      agentsMdHostPath: agentsReal,
-      claudeMdHostPath: claudeReal,
+      agentsMdHostPath: admin ? agentsAdminReal : agentsReal,
+      claudeMdHostPath: admin ? claudeAdminReal : claudeReal,
       skillsDirHostPath: skillsDirReal,
     };
   } catch {
@@ -2177,6 +2194,25 @@ async function compensateProvisionFailure(
  *     create 用一个空 volume,数据被 GC 静默丢弃。
  *   - docker createVolume 失败 → 整事务 ROLLBACK,row 不留痕,最终一致。
  */
+/**
+ * 容器用户角色。只认 users.role === 'admin'；缺行/查询失败/其它值一律 'user'
+ * (fail-closed:宁可多注入租户守则,也不要在角色不明时摘掉限制)。
+ */
+export async function lookupContainerUserRole(
+  pool: Pool,
+  uid: number,
+): Promise<"user" | "admin"> {
+  try {
+    const r = await pool.query<{ role: string | null }>(
+      "SELECT role FROM users WHERE id = $1::bigint LIMIT 1",
+      [uid],
+    );
+    return r.rows[0]?.role === "admin" ? "admin" : "user";
+  } catch {
+    return "user";
+  }
+}
+
 export async function provisionV3Container(
   deps: V3SupervisorDeps,
   uid: number,
@@ -2190,6 +2226,9 @@ export async function provisionV3Container(
   if (typeof deps.image !== "string" || deps.image.trim() === "") {
     throw new SupervisorError("InvalidArgument", "deps.image (OC_RUNTIME_IMAGE) is required");
   }
+
+  const userRole = await lookupContainerUserRole(deps.pool, uid);
+
 
   // v3→v5 迁移门控:仅 v3 channel 生效。已迁移(migrated)/迁移进行中(migrating)的用户,
   // v3 不得再为其建/重建容器 —— 否则会重新成为该用户卷的写者、破坏卷迁移一致性,或与已在
@@ -2492,6 +2531,7 @@ export async function provisionV3Container(
       `ANTHROPIC_AUTH_TOKEN=${token}`,
       "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1",
       `CLAUDE_CONFIG_DIR=${V3_CONFIG_TMPFS_PATH}`,
+      `OC_USER_ROLE=${userRole}`,
       // **bridge IP trust 旁路只在 v3 supervisor 真正 spawn 容器时注入**:
       //   bridge 经 docker bridge gateway <host bridge .1> 把 ws upgrade 转给
       //   容器 18789/ws,bridge 不持有容器 personal-version accessToken,所以
@@ -2556,6 +2596,9 @@ export async function provisionV3Container(
       env.push("OC_CONTAINER_PREVIEW_ENABLED=1");
     }
     appendCodexRelayEnv(env);
+    // Core-memory local semantic recall: forward master embedding knobs
+    // (skip missing keys) and pin the DashScope batch limit + feature gate.
+    appendCoreMemoryEmbeddingEnv(env);
 
     // 工具失败遥测显式开关透传:仅当 master 进程 env 显式设 OC_TOOL_FAILURE_AUDIT=1
     // 才注入容器(容器侧 v3ToolFailureReporter 与 master 侧 internalToolFailureAudit
@@ -2564,6 +2607,15 @@ export async function provisionV3Container(
     // 的存在性当开关,否则事实恒开且合回 v3 会静默对现网用户开启明文遥测。
     if (process.env.OC_TOOL_FAILURE_AUDIT === "1") {
       env.push("OC_TOOL_FAILURE_AUDIT=1");
+    }
+    for (const key of [
+      "OC_LOCAL_OBSERVABILITY_RETENTION",
+      "OC_LOCAL_EVENT_RETENTION_DAYS",
+      "OC_LOCAL_USAGE_RETENTION_DAYS",
+      "OC_REDACT_TOOL_EVENT_PREVIEWS",
+    ] as const) {
+      const value = process.env[key];
+      if (value && /^[0-9]+$/.test(value)) env.push(`${key}=${value}`);
     }
 
     // 市场技能使用信号门控透传:与 tool-failure 相反 = **默认开**(低敏产品质量信号,
@@ -2613,6 +2665,12 @@ export async function provisionV3Container(
       );
       if (!promptQueueEnabled) env.push(`OC_USER_ID=${String(uid)}`);
       if (deps.modelAuthority.required) env.push("OC_MODEL_AUTHORITY=1");
+      // selfhost 豁免门(OC_SELFHOST_ENGINE_LOCAL_TURNS=1)单向下发:容器内 gateway 的
+      // decideLocalExecution / CODEX_BILLING_GUARD 与 master 同源读它,不允许两侧各自
+      // 解释。master 未设 -> 不注入,容器行为与生产完全一致(fail-closed 不变)。
+      if (process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS === "1") {
+        env.push("OC_SELFHOST_ENGINE_LOCAL_TURNS=1");
+      }
       // 次级模型(WebFetch/WebSearch 等隐藏调用走的 ANTHROPIC_SMALL_FAST_MODEL)由 **master
       // 单向下发**:master 签发 authority 时把它列进 auxModels(egress 据此放行),这里注入同一
       // 值让容器实际用它 —— 二者同源,消除"master 签 A、容器发 B"的版本 skew(master 与
@@ -2655,7 +2713,16 @@ export async function provisionV3Container(
         syntheticEvalOverlay?.baselineHostPath
         ?? deps.ccbBaselineDir
         ?? readCcbBaselineDirFromEnv();
-      baselineMounts = resolveCcbBaselineMounts(baselineDir);
+      baselineMounts = resolveCcbBaselineMounts(baselineDir, { admin: userRole === "admin" });
+    }
+    if (useRemote && userRole === "admin" && baselineMounts) {
+      // 远端 resolveBaselinePaths 只给默认守则路径;管理员改挂同目录下的 *.admin.md。
+      const root = baselineMounts.skillsDirHostPath.replace(/\/skills$/, "");
+      baselineMounts = {
+        agentsMdHostPath: `${root}/${V3_CCB_BASELINE_AGENTS_ADMIN_MD_REL}`,
+        claudeMdHostPath: `${root}/${V3_CCB_BASELINE_CLAUDE_ADMIN_MD_REL}`,
+        skillsDirHostPath: baselineMounts.skillsDirHostPath,
+      };
     }
     const baselineOptional = readCcbBaselineOptionalFromEnv();
     if (!baselineMounts) {

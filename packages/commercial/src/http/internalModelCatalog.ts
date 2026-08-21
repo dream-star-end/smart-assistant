@@ -114,7 +114,7 @@ export type ModelCatalogHandler = (
 export interface WireModelRow {
   model_id: string;
   display_name: string;
-  engine: "ccb" | "codex" | "grok" | "cursor";
+  engine: "ccb" | "codex" | "grok" | "cursor" | "zcode";
   provider_id: string | null;
   context_window: number | null;
   supported_efforts: readonly string[];
@@ -221,6 +221,8 @@ export function makeModelCatalogHandler(deps: ModelCatalogHandlerDeps): ModelCat
       role: authz.role,
       grantedModelIds: authz.grantedModelIds,
       deniedModelIds: authz.deniedModelIds,
+      userPlanTier: authz.userPlanTier ?? null,
+      orgPlanCode: authz.orgPlanCode ?? null,
     };
     const availability = await loadRoutingAvailability();
     const body: WireCatalogResponse = {

@@ -175,6 +175,8 @@ function buildRuntimeFixture(): {
   writeSafe(join(scratchTree, "packages/gateway/src/promptSlots.ts"), "slots\n");
   writeSafe(join(baseline, "AGENTS.md"), "agents\n");
   writeSafe(join(baseline, "CLAUDE.md"), "claude\n");
+  writeSafe(join(baseline, "AGENTS.admin.md"), "agents-admin\n");
+  writeSafe(join(baseline, "CLAUDE.admin.md"), "claude-admin\n");
   writeSafe(join(baseline, "skills/system-info/SKILL.md"), "skill\n");
 
   const manifest: SyntheticEvalManifest = {

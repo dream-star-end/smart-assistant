@@ -1475,7 +1475,7 @@ await check("T17 PC 全屏预览空闲收起控件且可按需恢复", async () 
 // 已有的移动覆盖(T13 工具卡 375px / T15 Ask UI / T16 预览)都是单组件,整页的
 // 顶栏拥挤与正文横向溢出**没人看**。而聊天滚动区是 overflow-x-hidden:超出视口的
 // 内容不是"可以滑过去看",是**直接被裁掉、用户永远看不到**。
-const mobileContext = await browser.newContext({ viewport: { width: 390, height: 844 } });
+const mobileContext = await browser.newContext({ viewport: { width: 390, height: 844 }, hasTouch: true });
 const mobilePage = await mobileContext.newPage();
 watchRuntimeErrors(mobilePage, "mobile");
 const mobileUrl = "http://127.0.0.1/__openclaude_browser_mobile__";
@@ -1590,6 +1590,67 @@ await check("T25 390×844 整页:顶栏入口不被挤出、宽正文不被裁�
   if (JSON.stringify(sends) !== JSON.stringify([{ text: "MOBILE_SEND_MARKER", mediaCount: 0 }])) {
     throw new Error(`移动端发送结果漂移: ${JSON.stringify(sends)}`);
   }
+});
+
+await check("T43 移动端首次上滑立即解除贴底，内容再长不回弹", async () => {
+  screenshotPage = mobilePage;
+  const scroll = mobilePage.getByTestId("mobile-chat-scroll");
+  await mobilePage.evaluate(() => window.__mobilePage.growTimeline());
+  await mobilePage.waitForFunction(() => {
+    const node = document.querySelector('[data-testid="mobile-chat-scroll"]');
+    return node instanceof HTMLElement && node.scrollHeight > node.clientHeight + 200;
+  }, null, { timeout: 5000 });
+  await mobilePage.evaluate(() => window.__mobilePage.armSticky());
+  const before = await scroll.evaluate((node) => ({
+    top: node.scrollTop,
+    height: node.scrollHeight,
+    client: node.clientHeight,
+  }));
+  if (Math.abs(before.top - (before.height - before.client)) > 2) {
+    throw new Error(`触控前未贴底: ${JSON.stringify(before)}`);
+  }
+
+  const box = await scroll.boundingBox();
+  if (!box) throw new Error("移动聊天区无可触控几何");
+  const cdp = await mobileContext.newCDPSession(mobilePage);
+  const x = Math.round(box.x + box.width / 2);
+  const y = Math.round(box.y + Math.min(180, box.height / 2));
+  await cdp.send("Input.dispatchTouchEvent", {
+    type: "touchStart",
+    touchPoints: [{ x, y, radiusX: 4, radiusY: 4, force: 1, id: 1 }],
+  });
+  await cdp.send("Input.dispatchTouchEvent", {
+    type: "touchMove",
+    touchPoints: [{ x, y: y + 24, radiusX: 4, radiusY: 4, force: 1, id: 1 }],
+  });
+  await mobilePage.waitForTimeout(80);
+  await cdp.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+  await cdp.detach();
+  await mobilePage.waitForTimeout(80);
+
+  const afterGesture = await scroll.evaluate((node) => ({
+    top: node.scrollTop,
+    following: window.__mobilePage.following,
+  }));
+  if (afterGesture.top >= before.top - 2) {
+    throw new Error(`触控上滑没有离开底部: before=${before.top}, after=${afterGesture.top}`);
+  }
+  if (afterGesture.following) {
+    throw new Error("触控首次上滑后仍处于贴底态");
+  }
+
+  await mobilePage.evaluate(() => window.__mobilePage.growTimeline());
+  await mobilePage.waitForTimeout(300);
+  const afterGrow = await scroll.evaluate((node) => ({
+    top: node.scrollTop,
+    following: window.__mobilePage.following,
+  }));
+  if (Math.abs(afterGrow.top - afterGesture.top) > 2) {
+    throw new Error(
+      `上滑后内容增长把视口拉走: gesture=${JSON.stringify(afterGesture)}, grow=${JSON.stringify(afterGrow)}`,
+    );
+  }
+  if (afterGrow.following) throw new Error("内容增长后错误恢复贴底态");
 });
 screenshotPage = page;
 
@@ -2110,8 +2171,22 @@ await check("T41 Codex 密度 token：Composer/ToolCard/Sidebar 在 1440 与 390
     const sidebar = page.locator("#codex-density-root");
     const active = sidebar.getByRole("button", { name: "密度验收活跃会话" });
     await active.waitFor({ state: "visible", timeout: 3000 });
-    const accent = await active.evaluate((btn) => Boolean(btn.closest("div")?.querySelector(".bg-accent")));
-    if (!accent) throw new Error(`活跃会话缺少 accent 竖条(${theme})`);
+    const activeState = await active.evaluate((btn) => {
+      const row = btn.closest("div");
+      const duration = row?.querySelector("[data-session-duration]");
+      return {
+        hasAccent: Boolean(row?.querySelector(".bg-accent")),
+        durationText: duration?.textContent ?? "",
+        durationTitle: duration?.getAttribute("title") ?? "",
+      };
+    });
+    if (!activeState.hasAccent) throw new Error(`活跃会话缺少 accent 竖条(${theme})`);
+    if (activeState.durationText !== "8m" || !activeState.durationTitle.includes("→")) {
+      throw new Error(`会话累计用时未按 createdAt → lastAt 展示(${theme}): ${JSON.stringify(activeState)}`);
+    }
+    if (await sidebar.getByText("浏览器契约：摘要不应显示", { exact: true }).count() !== 0) {
+      throw new Error(`会话行仍显示最新消息摘要(${theme})`);
+    }
     const idleAccent = await sidebar.getByRole("button", { name: "密度验收空闲会话" }).evaluate(
       (btn) => Boolean(btn.closest("div")?.querySelector(".bg-accent")),
     );
@@ -2121,22 +2196,27 @@ await check("T41 Codex 密度 token：Composer/ToolCard/Sidebar 在 1440 与 390
     if (!createClass.includes("text-section") || !createClass.includes("border-border") || !createClass.includes("bg-surface")) {
       throw new Error(`新建会话未保持 secondary(${theme}): ${createClass}`);
     }
-    const manageClass = await sidebar.getByRole("button", { name: /管理中心/ }).getAttribute("class") ?? "";
-    if (!manageClass.includes("text-body") || !manageClass.includes("text-muted")) {
-      throw new Error(`管理中心入口权重未下降(${theme}): ${manageClass}`);
+    if (await sidebar.getByRole("button", { name: /管理中心/ }).count() !== 0) {
+      throw new Error(`管理中心仍占侧栏主区(${theme})`);
     }
-    const marketClass = await sidebar.getByRole("button", { name: /^市场/ }).getAttribute("class") ?? "";
-    if (!marketClass.includes("text-body") || !marketClass.includes("text-muted")) {
-      throw new Error(`市场入口权重未下降(${theme}): ${marketClass}`);
+    if (await sidebar.getByRole("button", { name: "打开使用教程" }).count() !== 1) {
+      throw new Error(`底栏教程图标丢失(${theme})`);
     }
-    if (await sidebar.getByRole("button", { name: /使用教程/ }).count() !== 1) {
-      throw new Error(`教程入口丢失(${theme})`);
+    if (await sidebar.getByRole("button", { name: /切换主题/ }).count() !== 1) {
+      throw new Error(`底栏主题开关丢失(${theme})`);
     }
-    if (await sidebar.getByRole("button", { name: /组织/ }).count() !== 1) {
-      throw new Error(`组织入口丢失(${theme})`);
+    await sidebar.getByRole("button", { name: "账号菜单" }).click();
+    const menu = page.getByRole("menu");
+    await menu.waitFor({ state: "visible", timeout: 3000 });
+    for (const label of ["管理中心", "市场", "组织", "管理后台", "视频任务", "设置"]) {
+      if (await menu.getByRole("menuitem", { name: new RegExp(label) }).count() !== 1) {
+        throw new Error(`账号菜单缺少「${label}」(${theme})`);
+      }
     }
-    const adminHref = await sidebar.getByRole("link", { name: /管理后台/ }).getAttribute("href");
+    const adminHref = await menu.getByRole("menuitem", { name: /管理后台/ }).getAttribute("href");
     if (adminHref !== "/admin.html") throw new Error(`管理后台入口丢失或 href 错误(${theme}): ${adminHref}`);
+    await page.keyboard.press("Escape");
+    await menu.waitFor({ state: "hidden", timeout: 3000 });
   }
 
   await page.setViewportSize({ width: 1440, height: 900 });

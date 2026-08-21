@@ -1,0 +1,23 @@
+{
+  "sessionId": "sess_live_fixture_001",
+  "traceId": "trace_live_fixture_001",
+  "turnId": "turn_live_fixture_001",
+  "response": "ok",
+  "usage": {
+    "inputTokens": 12,
+    "outputTokens": 4,
+    "cacheReadTokens": 8,
+    "cacheWriteTokens": 0,
+    "reasoningTokens": 0,
+    "totalTokens": 16,
+    "modelRequestCount": 1
+  },
+  "eventCount": 3,
+  "projection": {
+    "status": "idle",
+    "turnCount": 1,
+    "totalTokenCount": 16,
+    "contextUsed": 16,
+    "contextWindow": 1000000
+  }
+}

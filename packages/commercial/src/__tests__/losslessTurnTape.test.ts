@@ -3,9 +3,9 @@ import { createHash } from "node:crypto";
 import { gunzipSync } from "node:zlib";
 import { describe, test } from "node:test";
 
-import { LOSSLESS_TURN_TAPE_LEGACY_AGENT_ID } from "@openclaude/protocol";
+import { LOSSLESS_TURN_TAPE_LEGACY_AGENT_ID, losslessBillingAnchorId } from "@openclaude/protocol";
 
-import { computeGoalTokensUsed, materializeLosslessTurn } from "../http/losslessTurnTape.js";
+import { computeGoalTokensUsed, materializeLosslessTurn, parseLosslessTurnPayload } from "../http/losslessTurnTape.js";
 
 const TURN_KEY = "a".repeat(64);
 
@@ -772,5 +772,93 @@ describe("materializeLosslessTurn", () => {
       structuredClone((duplicate.agentGroups![0]!.goalUsageRecords as Array<Record<string, unknown>>)[0]!),
     );
     assert.throws(() => computeGoalTokensUsed(duplicate), /duplicate goal usage runId/);
+  });
+
+  test("goal usage validator accepts zcode and rejects an unknown engine", () => {
+    const turn = materializeLosslessTurn({
+      sessionId: "sess_zcode_tape_01",
+      agentId: "worker",
+      turnIndex: 1,
+      status: "completed",
+      turnKey: TURN_KEY,
+      text: "done",
+      createdAt: 1_783_944_000_000,
+      goalId: "11111111-1111-4111-8111-111111111111",
+      goalStateRevision: 4,
+      usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheCreationTokens: 0 },
+      agentGroups: [{
+        runId: "dlg-zcode",
+        agentId: "worker",
+        goal: "work",
+        status: "ok",
+        completedAt: 1_783_944_000_001,
+        goalUsageRecords: [
+          { runId: "dlg-zcode", agentId: "worker", engine: "zcode", inputTokens: 2, outputTokens: 3, cacheReadTokens: 0, cacheCreationTokens: 0 },
+        ],
+      }],
+    });
+    assert.equal(computeGoalTokensUsed(turn.payload), 7);
+    const bad = structuredClone(turn.payload);
+    (bad.agentGroups![0]!.goalUsageRecords as Array<Record<string, unknown>>)[0]!.engine = "nope";
+    assert.throws(() => parseLosslessTurnPayload(bad), /engine is invalid/);
+  });
+});
+
+describe("losslessBillingAnchorId vs materializeLosslessTurn", () => {
+  test("matches losslessBillingAnchorId for mixed tool/runtime shapes", () => {
+    const cases: Array<Record<string, unknown>> = [
+      {
+        sessionId: "web-lossless-123",
+        agentId: "main",
+        turnIndex: 21,
+        status: "completed",
+        turnKey: "a".repeat(64),
+        text: "hello",
+        createdAt: 1_700_000_000_000,
+      },
+      {
+        sessionId: "web-lossless-123",
+        agentId: "main",
+        turnIndex: 22,
+        status: "completed",
+        turnKey: "b".repeat(64),
+        text: "",
+        createdAt: 1_700_000_000_000,
+        tools: [{ blockId: "t1", toolName: "Bash", inputJson: { command: "true" }, output: "ok", completed: true }],
+      },
+      {
+        sessionId: "web-lossless-123",
+        agentId: "main",
+        turnIndex: 23,
+        status: "completed",
+        turnKey: "c".repeat(64),
+        text: "",
+        createdAt: 1_700_000_000_000,
+        runtimeEvents: [{ ordinal: 3, observedAt: 1_700_000_000_000, source: "gateway", payload: { type: "x" } }],
+      },
+      {
+        sessionId: "web-lossless-123",
+        agentId: "main",
+        turnIndex: 24,
+        status: "completed",
+        turnKey: "d".repeat(64),
+        text: "",
+        createdAt: 1_700_000_000_000,
+        tools: [{ blockId: "t1", toolName: "Bash", inputJson: { command: "true" }, output: "ok", completed: true }],
+        runtimeEvents: [{ ordinal: 1, observedAt: 1_700_000_000_000, source: "gateway", payload: { type: "x" } }],
+      },
+    ];
+    for (const payload of cases) {
+      const turn = materializeLosslessTurn(payload);
+      const expected = losslessBillingAnchorId({
+        sessionId: String(payload.sessionId),
+        agentId: String(payload.agentId),
+        turnIndex: Number(payload.turnIndex),
+        text: typeof payload.text === "string" ? payload.text : "",
+        tools: payload.tools as Array<{ blockId: string }> | undefined,
+        runtimeEvents: payload.runtimeEvents as Array<{ ordinal: number }> | undefined,
+      });
+      assert.equal(turn.billingAnchorId, expected, `turnIndex=${payload.turnIndex}`);
+    }
   });
 });

@@ -561,7 +561,6 @@ describe("admin accounts — 0055 egress_proxy_id 必须", () => {
     await assert.rejects(
       () =>
         adminCreateAccount(
-          // @ts-expect-error 故意构造缺字段的入参证明运行时拒绝
           { label: "p", plan: "pro", oauth_token: "tok" },
           { adminId: admin },
         ),

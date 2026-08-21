@@ -1,0 +1,16 @@
+[Unit]
+# 独立看护:不跑 npx/tsx,不依赖 git 工作树。失败只写本地日志,不回切 schema。
+Description=OpenClaude v5 selfhost health watch (oneshot)
+After=network.target
+OnFailure=openclaude-v5-selfhost-watch-alert@%n.service
+
+[Service]
+Type=oneshot
+User=root
+EnvironmentFile=-/opt/openclaude/v5-selfhost-watch/watch.env
+ExecStart=/opt/openclaude/v5-selfhost-watch/watch.sh
+Nice=10
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

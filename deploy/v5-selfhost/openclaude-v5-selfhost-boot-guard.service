@@ -1,0 +1,18 @@
+[Unit]
+# 开机守卫:master/egress 之前校验 -live symlink。纯 bash,不依赖网关。
+Description=OpenClaude v5 selfhost boot guard (live symlink)
+DefaultDependencies=yes
+After=local-fs.target
+Before=openclaude-v5-selfhost.service openclaude-v5-selfhost-egress.service
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/opt/openclaude/v5-selfhost-boot-guard/boot-guard.sh
+RemainAfterExit=yes
+TimeoutStartSec=60
+StandardOutput=append:/var/log/openclaude-v5-selfhost-boot-guard.log
+StandardError=append:/var/log/openclaude-v5-selfhost-boot-guard.log
+
+[Install]
+WantedBy=multi-user.target

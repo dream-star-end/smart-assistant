@@ -268,6 +268,7 @@ COPY --chown=root:root ./platform-runtime/bin/oc-web.sh /usr/local/bin/oc-web
 # preserves the product command/card while removing Agent-side MCP transport.
 COPY --chown=root:root ./platform-runtime/bin/oc-browser.sh /usr/local/bin/oc-browser
 COPY --chown=root:root ./platform-runtime/bin/oc-cursor.sh /usr/local/bin/oc-cursor
+COPY --chown=root:root ./platform-runtime/bin/oc-zcode.sh /usr/local/bin/oc-zcode
 COPY --chown=root:root ./playwright-cli.config.json /etc/openclaude/playwright-cli.config.json
 # oc-market: AI-driven AI-marketplace ops (search/install/uninstall/publish) over
 # master /internal/v3/marketplace/agent/*; documented by the `market` baseline skill.
@@ -436,7 +437,8 @@ RUN set -eux; \
 # v3/v5 容器复用同一份 codex CLI 二进制,gateway 选到 GPT-5.6 时,sessionManager 通过
 # `runnerKind:'app-server'` 路由到 CodexAppServerRunner,长驻一个 codex app-server 子进程。
 #
-# 版本 pin 0.144.0(2026-07-10):GPT-5.6 Sol/Terra/Luna 官方模型目录与 max effort 支持。
+# 版本 pin 0.149.0(2026-08-21):latest stable；保留 GPT-5.6
+# Sol/Terra/Luna + max effort，并适配 requestUserInput.isBlocking。
 # Protocol 兼容性: 前端 normalizer 继续兼容 `{type:'plan'}` 与 0.130+ `todo_list`;
 # 0.137 新增 goal / collaboration 通知由 gateway 显式降级成 OpenClaude
 # `goal` / `Agent` / `Codex:multiAgent` blocks。**真正 e2e 行为验证仍是发布门槛**:
@@ -456,7 +458,7 @@ RUN set -eux; \
 # seam 永不走 codex、模型面无 gpt-*,故 codex 二进制对 v5 是纯死重)。v3 默认 1,行为不变。
 ARG OC_INCLUDE_CODEX=1
 RUN if [ "$OC_INCLUDE_CODEX" = "1" ]; then \
-      npm install -g @openai/codex@0.144.0 --no-audit --no-fund \
+      npm install -g @openai/codex@0.149.0 --no-audit --no-fund \
       && npm cache clean --force \
       && rm -rf /root/.npm; \
     else echo "[v5 ccb-only] skip codex CLI install (OC_INCLUDE_CODEX=0)"; fi
@@ -503,15 +505,47 @@ COPY --chown=root:root ./platform-runtime/etc-codex/managed_config.toml /etc/cod
 # native binary under $GROK_HOME; copy that verified binary to /usr/local/bin so
 # per-user persistent homes do not each receive a ~100 MB duplicate.
 ARG OC_INCLUDE_GROK=0
+ARG OC_GROK_VERSION=1.0.5
 RUN if [ "$OC_INCLUDE_GROK" = "1" ]; then set -eux; \
-      npm install -g @xai-official/grok@1.0.3 --no-audit --no-fund; \
-      grok --version | grep -q '^grok 1\.0\.3 '; \
+      npm install -g "@xai-official/grok@${OC_GROK_VERSION}" --no-audit --no-fund; \
+      grok --version | grep -q "^grok ${OC_GROK_VERSION} "; \
       cp -L /root/.grok/bin/grok /usr/local/bin/grok-native; \
       chmod 0755 /usr/local/bin/grok-native; \
-      /usr/local/bin/grok-native --version | grep -q '^grok 1\.0\.3 '; \
+      /usr/local/bin/grok-native --version | grep -q "^grok ${OC_GROK_VERSION} "; \
       npm cache clean --force; \
       rm -rf /root/.npm /root/.grok; \
     else echo "[runtime] skip Grok CLI install (OC_INCLUDE_GROK=0)"; fi
+
+# Experimental community ZCode CLI — NOT an official standalone product.
+# The 0.16.3 `zcode.cjs` is extracted from official desktop AppImage 3.8.1
+# (community-verified pairing). Default off; fail-closed when the pin cannot
+# be verified. Do not install npm `zcode` / `zcode-cli` (0.0.1 stubs).
+# First `hsqs` offset in this AppImage is a false positive; use the embedded
+# --appimage-extract runtime instead of unsquashfs -o $first_offset.
+ARG OC_ZCODE_APPIMAGE_VERSION=3.8.1
+ARG OC_ZCODE_APPIMAGE_SHA256=b420dea50961b77d5c75b08b924da41ab529c720a7ec32eacbe95a6d843199e0
+ARG OC_ZCODE_CLI_VERSION=0.16.3
+ARG OC_INCLUDE_ZCODE=0
+RUN if [ "$OC_INCLUDE_ZCODE" = "1" ]; then set -eux; \
+      test "$(dpkg --print-architecture)" = amd64; \
+      archive=/tmp/ZCode-${OC_ZCODE_APPIMAGE_VERSION}-linux-x64.AppImage; \
+      curl -fsSL --retry 2 --retry-all-errors \
+        -o "$archive" \
+        "https://cdn-zcode.z.ai/zcode/electron/releases/${OC_ZCODE_APPIMAGE_VERSION}/linux-x64/ZCode-${OC_ZCODE_APPIMAGE_VERSION}-linux-x64.AppImage"; \
+      echo "${OC_ZCODE_APPIMAGE_SHA256}  ${archive}" | sha256sum -c -; \
+      chmod 0755 "$archive"; \
+      mkdir -p /tmp/zcode-extract; \
+      (cd /tmp/zcode-extract && "$archive" --appimage-extract); \
+      cjs=$(find /tmp/zcode-extract/squashfs-root -name zcode.cjs -type f | head -1); \
+      test -n "$cjs"; \
+      install_root="/opt/zcode-cli/versions/${OC_ZCODE_CLI_VERSION}"; \
+      mkdir -p "$install_root"; \
+      cp "$cjs" "$install_root/zcode.cjs"; \
+      chmod 0755 "$install_root/zcode.cjs"; \
+      chmod -R a-w "$install_root"; \
+      test "$(node "$install_root/zcode.cjs" --version)" = "$OC_ZCODE_CLI_VERSION"; \
+      rm -rf "$archive" /tmp/zcode-extract; \
+    else echo "[runtime] skip experimental ZCode CLI install (OC_INCLUDE_ZCODE=0)"; fi
 
 # ------------------------------------------------------------
 # Playwright CLI + Chromium for Agent browser automation
@@ -734,6 +768,8 @@ RUN set -eux; \
             npm install --include=dev --ignore-scripts --no-audit --no-fund || \
             echo "[build] WARN: claude-code-best npm install failed, ccb spawn 模式可能不可用"; \
     fi; \
+    bash packages/mcp-memory/scripts/build-oc-memory-cli.sh; \
+    test -s /opt/openclaude/packages/mcp-memory/dist/oc-memory.cjs; \
     npm cache clean --force; \
     rm -rf /root/.npm /tmp/* /var/tmp/*
 RUN chown -R agent:agent /opt/openclaude

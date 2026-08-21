@@ -40,12 +40,13 @@ import { getPool } from "../db/index.js";
 import { projectContextWindowForRole } from "./modelRolePolicy.js";
 import type { ModelPricing, ModelVisibility } from "./pricing.js";
 import { isCursorCredentialMember } from "../cursor/access.js";
+import { meetsMinPlan } from "./planEntitlement.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 类型
 // ─────────────────────────────────────────────────────────────────────────────
 
-export type ModelEngine = "ccb" | "codex" | "grok" | "cursor";
+export type ModelEngine = "ccb" | "codex" | "grok" | "cursor" | "zcode";
 export type ModelCatalogState = "staged" | "active" | "disabled" | "retired";
 
 /**
@@ -102,6 +103,8 @@ export interface ModelCatalogPricing {
   sortOrder: number;
   /** execution descriptor 的一部分(proxy 在 client 未显式带 effort 时注入)。 */
   defaultEffort: string | null;
+  minPlanCode?: string | null;
+  minPlanTier?: number | null;
 }
 
 /**
@@ -142,6 +145,8 @@ export interface UserModelScope {
   role: "user" | "admin";
   grantedModelIds: ReadonlySet<string>;
   deniedModelIds?: ReadonlySet<string>;
+  userPlanTier?: number | null;
+  orgPlanCode?: string | null;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -246,6 +251,8 @@ type PricingRow = {
   visibility: string;
   sort_order: number;
   default_effort: string | null;
+  min_plan_code: string | null;
+  min_plan_tier: string | number | null;
 };
 
 const EFFORT_SET: ReadonlySet<string> = new Set(PLATFORM_REASONING_EFFORTS);
@@ -332,6 +339,8 @@ function rowToPricing(r: PricingRow): ModelCatalogPricing {
     visibility: r.visibility as ModelVisibility,
     sortOrder: r.sort_order,
     defaultEffort: r.default_effort,
+    minPlanCode: r.min_plan_code,
+    minPlanTier: r.min_plan_tier == null || r.min_plan_tier === "" ? null : Number(r.min_plan_tier),
   };
 }
 
@@ -426,6 +435,7 @@ export class ModelCatalogSnapshot {
           cacheReadPerMtok: p.cacheReadPerMtok.toString(),
           cacheWritePerMtok: p.cacheWritePerMtok.toString(),
           multiplier: p.multiplier,
+          minPlanCode: p.minPlanCode ?? null,
         })),
     };
   }
@@ -442,7 +452,15 @@ export class ModelCatalogSnapshot {
   }
 
   isExternalBillingModel(modelId: string): boolean {
+    return this.isCursorModel(modelId) || this.isZcodeModel(modelId);
+  }
+
+  isCursorModel(modelId: string): boolean {
     return this.activeByModel.get(this.aliasToCanonical(modelId))?.engine === "cursor";
+  }
+
+  isZcodeModel(modelId: string): boolean {
+    return this.activeByModel.get(this.aliasToCanonical(modelId))?.engine === "zcode";
   }
 
   /**
@@ -485,6 +503,8 @@ export class ModelCatalogSnapshot {
       extra_system_prompt: null,
       default_effort: p.defaultEffort,
       updated_at: this.loadedAt,
+      min_plan_code: p.minPlanCode ?? null,
+      min_plan_tier: p.minPlanTier ?? null,
     };
   }
 
@@ -541,6 +561,12 @@ export class ModelCatalogSnapshot {
     if (scope.deniedModelIds?.has(canonical)) return false;
     const p = this.pricing.get(canonical);
     if (!p) return false;
+    if (!meetsMinPlan({
+      minPlanCode: p.minPlanCode,
+      minPlanTier: p.minPlanTier,
+      userPlanTier: scope.userPlanTier,
+      orgPlanCode: scope.orgPlanCode,
+    })) return false;
     return (
       p.visibility === "public" ||
       (p.visibility === "admin" &&
@@ -716,14 +742,17 @@ export async function loadCatalogSnapshot(pool = getPool()): Promise<ModelCatalo
       "SELECT alias, entry_id::text AS entry_id FROM model_aliases",
     );
     const pricing = await client.query<PricingRow>(
-      `SELECT model_id, display_name,
-              input_per_mtok::text       AS input_per_mtok,
-              output_per_mtok::text      AS output_per_mtok,
-              cache_read_per_mtok::text  AS cache_read_per_mtok,
-              cache_write_per_mtok::text AS cache_write_per_mtok,
-              multiplier::text           AS multiplier,
-              visibility, sort_order, default_effort
-         FROM model_pricing`,
+      `SELECT p.model_id, p.display_name,
+              p.input_per_mtok::text       AS input_per_mtok,
+              p.output_per_mtok::text      AS output_per_mtok,
+              p.cache_read_per_mtok::text  AS cache_read_per_mtok,
+              p.cache_write_per_mtok::text AS cache_write_per_mtok,
+              p.multiplier::text           AS multiplier,
+              p.visibility, p.sort_order, p.default_effort,
+              p.min_plan_code,
+              sp.tier AS min_plan_tier
+         FROM model_pricing p
+         LEFT JOIN subscription_plans sp ON sp.code = p.min_plan_code`,
     );
     await client.query("COMMIT");
 

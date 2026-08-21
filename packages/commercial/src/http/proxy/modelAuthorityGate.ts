@@ -415,6 +415,8 @@ async function loadAndAssertFencedAuthz(
     role: authz.role,
     grantedModelIds: authz.grantedModelIds,
     deniedModelIds: authz.deniedModelIds,
+    userPlanTier: authz.userPlanTier ?? null,
+    orgPlanCode: authz.orgPlanCode ?? null,
   }, canonicalModel)) {
     throw new ModelGateReject("not_available", `model '${canonicalModel}' not authorized`);
   }
@@ -445,6 +447,8 @@ async function recomputeProjectionRevision(a: {
     role: a.authz.role,
     grantedModelIds: a.authz.grantedModelIds,
     deniedModelIds: a.authz.deniedModelIds,
+    userPlanTier: a.authz.userPlanTier ?? null,
+    orgPlanCode: a.authz.orgPlanCode ?? null,
   });
   if (computed !== a.claimed) {
     a.logger.warn("local_catalog_projection_revision_mismatch", {

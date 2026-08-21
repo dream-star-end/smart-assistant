@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url'
 const here = path.dirname(fileURLToPath(import.meta.url))
 const root = path.resolve(here, '../..')
 const deploy = path.join(root, 'scripts/deploy-v5.sh')
+const selfhostDeploy = path.join(root, 'scripts/deploy-v5-selfhost.sh')
 const branchPolicy = path.join(root, 'scripts/v5-branch-policy.sh')
 const deploySurfaceCheck = path.join(root, 'scripts/v5-deploy-surface-check.mjs')
 const e2eJourney = path.join(root, 'scripts/v5-e2e-journey-canary.mjs')
@@ -73,7 +74,7 @@ describe('V5 branch deployment policy', () => {
     assert.match(source, /\\mathrm\{MSE\}=\\frac\{1\}\{n\}\\sum_\{i=1\}\^\{n\}\(y_i-\\hat\{y\}_i\)\^2/)
     assert.match(source, /grep -q 'y' \/tmp\/oc-docx-smoke\.txt/)
     assert.match(source, /! grep -q '¿' \/tmp\/oc-docx-smoke\.txt/)
-    assert.match(overrides, /^OC_RUNTIME_IMAGE=openclaude\/openclaude-runtime:v5-grok-21e30788a613-slim$/m)
+    assert.match(overrides, /^OC_RUNTIME_IMAGE=openclaude\/openclaude-runtime:v5-zcode-commercial-sync-20260821-slim$/m)
     assert.match(overrides, /v5-ccb-f8800e0c0480-embedded\(OC_RUNTIME_EMERGENCY_TUPLE/)
   })
 
@@ -1682,13 +1683,16 @@ describe('v5 release safety lanes', () => {
     assert.match(untraversableResult.stderr, /not world-readable\/traversable/)
   })
 
-  test('legacy serving baseline compat allows only a missing cursor skill', async () => {
+  test('legacy serving baseline compat allows only pre-admin cursor/taskboard gaps', async () => {
     const dir = await mkdtemp(path.join(tmpdir(), 'v5-baseline-legacy-cursor-')); dirs.push(dir)
     const release = path.join(dir, 'release')
     const baseline = path.join(release, 'packages/commercial/agent-sandbox/ccb-baseline')
     await mkdir(path.dirname(baseline), { recursive: true })
     await cp(path.join(root, 'packages/commercial/agent-sandbox/ccb-baseline'), baseline, { recursive: true })
     await rm(path.join(baseline, 'skills/cursor-cli'), { recursive: true })
+    await rm(path.join(baseline, 'skills/manage-taskboard'), { recursive: true })
+    await rm(path.join(baseline, 'AGENTS.admin.md'))
+    await rm(path.join(baseline, 'CLAUDE.admin.md'))
     const strict = spawnSync('bash', [baselineGuard, 'check-release', release], { encoding: 'utf8' })
     assert.notEqual(strict.status, 0)
     const compat = spawnSync('bash', [baselineGuard, 'harden-release-legacy-cursor', release], { encoding: 'utf8' })
@@ -1756,6 +1760,16 @@ describe('v5 release safety lanes', () => {
     assert.ok(
       build.indexOf('harden_release_baseline "$staging"') >
         build.indexOf('npm run build --workspace packages/web-react'),
+    )
+    assert.match(
+      build,
+      /VITE_TASKBOARD_ENABLED=0 npm run build --workspace packages\/web-react/,
+      'official immutable commercial build must hide taskboard',
+    )
+    assert.match(
+      source,
+      /build_and_sync_dist\(\)[\s\S]*VITE_TASKBOARD_ENABLED=0 npm run build --workspace packages\/web-react/,
+      'official --dist path must hide taskboard too',
     )
     assert.ok(build.indexOf('harden_release_baseline "$staging"') < build.indexOf('publish_strong_release'))
     assert.match(source, /activate_release\(\)[\s\S]*?assert_release_baseline_security "\$reldir"/)
@@ -3579,7 +3593,7 @@ describe('v5 release safety lanes', () => {
       '  elif [[ "$*" == *"docker image inspect"* ]]; then',
       `    printf '%s\\n' "\${ACTUAL_ID:-${imageId}}"`,
       '  elif [[ "$*" == *"--entrypoint grok-native"* ]]; then',
-      '    printf "%s\\n" "${GROK_VERSION:-grok 1.0.3 (test)}"',
+      '    printf "%s\\n" "${GROK_VERSION:-grok 1.0.5 (test)}"',
       '  elif [[ "$*" == *"OC_RUNTIME_RELEASE"* ]]; then',
       '    printf "%s\\n" /runtime/prev',
       '  else',
@@ -4584,6 +4598,72 @@ describe('v5 release safety lanes', () => {
     const censusBody = source.slice(censusStart, censusEnd)
     assert.match(censusBody, /docker ps -aq/)
     assert.match(censusBody, /fleet 含旧\/缺 bundle_rev 容器\(含 stopped\)/)
+  })
+
+  test('selfhost model-authority marker is post-smoke, exact-tuple, deploy-role and DB-first', async () => {
+    const source = await readFile(selfhostDeploy, 'utf8')
+    const markerStart = source.indexOf('persist_selfhost_model_authority_cutover()')
+    const markerEnd = source.indexOf('\ncmd_cutover()', markerStart)
+    assert.ok(markerStart > 0 && markerEnd > markerStart)
+    const markerBody = source.slice(markerStart, markerEnd)
+    assert.match(markerBody, /readlink -f "\$MASTER_LIVE_LINK"/)
+    assert.match(markerBody, /live" == "\$rel"/)
+    assert.match(markerBody, /runtime_sha" == "\$source_sha"/)
+    assert.match(markerBody, /docker image inspect[\s\S]*"\$image_id"/)
+    assert.match(markerBody, /model_authority_v1-egress/)
+    assert.match(markerBody, /selfhost_deterministic_cutover/)
+    assert.match(markerBody, /CREATE ROLE \$\{MODEL_AUTHORITY_DEPLOY_ROLE\} NOLOGIN/)
+    assert.match(markerBody, /fn_model_authority_grant_deploy_role/)
+    assert.match(markerBody, /SET LOCAL ROLE \$\{MODEL_AUTHORITY_DEPLOY_ROLE\}/)
+    assert.match(markerBody, /INSERT INTO model_authority_deploy_state\(key,value,description\)/)
+    assert.match(markerBody, /model_security_epoch WHERE id FOR UPDATE/)
+    assert.match(markerBody, /ON CONFLICT \(key\) DO NOTHING/)
+    assert.doesNotMatch(markerBody, /ON CONFLICT \(key\) DO UPDATE/)
+    assert.doesNotMatch(markerBody, /SET LOCAL ROLE \$\{CATALOG_ADMIN_ROLE\}/)
+    assert.ok(
+      markerBody.indexOf('INSERT INTO model_authority_deploy_state') <
+        markerBody.lastIndexOf('ensure_env_kv "$V5_ENV" OC_MODEL_AUTHORITY_CUTOVER 1'),
+      'durable DB marker must commit before the env floor is written',
+    )
+
+    const nonJoint = spawnSync(
+      'bash',
+      [
+        '-c',
+        `${markerBody}
+DRY=0
+CUTOVER_JOINT=0
+V5_ENV=/tmp/not-used
+PG_DB=fake
+MODEL_AUTHORITY_DEPLOY_ROLE=fake_deploy
+oc_hotcfg_env_get() { printf '1\\n'; }
+psql_as_postgres() { printf 'false\\n'; }
+ensure_env_kv() { printf 'MUTATED\\n'; return 91; }
+cutover_clog() { printf '%s\\n' "$*"; }
+die() { printf 'DIE:%s\\n' "$*" >&2; exit 92; }
+persist_selfhost_model_authority_cutover /not-used`,
+      ],
+      { cwd: root, encoding: 'utf8' },
+    )
+    assert.equal(nonJoint.status, 0, nonJoint.stderr || nonJoint.stdout)
+    assert.match(nonJoint.stdout, /non-joint cutover.*不得创建 tuple cutover 证据/)
+    assert.doesNotMatch(nonJoint.stdout, /MUTATED/)
+
+    const cutoverStart = source.indexOf('\ncmd_cutover()')
+    const cutoverEnd = source.indexOf('\ncase "$MODE"', cutoverStart)
+    const cutoverBody = source.slice(cutoverStart, cutoverEnd)
+    assert.ok(
+      cutoverBody.indexOf('cutover_persist_phase "committed"') <
+        cutoverBody.indexOf('persist_selfhost_model_authority_cutover "$rel"'),
+    )
+    assert.ok(
+      cutoverBody.indexOf('cutover_disarm_survivor') <
+        cutoverBody.indexOf('persist_selfhost_model_authority_cutover "$rel"'),
+    )
+    assert.ok(
+      cutoverBody.indexOf('persist_selfhost_model_authority_cutover "$rel"') <
+        cutoverBody.indexOf('✓ --cutover 完成'),
+    )
   })
 
   test('Caddy fallback is transport-error-only and installer dry-run is inert', async () => {

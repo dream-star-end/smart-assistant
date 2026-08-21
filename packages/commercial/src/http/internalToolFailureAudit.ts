@@ -81,10 +81,16 @@ export interface ToolFailureAuditBodyV3 extends ToolFailureAuditBase {
   terminationReason?: ToolTerminationReason
 }
 
+export interface ToolFailureAuditBodyV4 extends Omit<ToolFailureAuditBodyV3, 'schemaVersion'> {
+  schemaVersion: 4
+  traceId?: string
+}
+
 export type ToolFailureAuditBody =
   | ToolFailureAuditBodyV1
   | ToolFailureAuditBodyV2
   | ToolFailureAuditBodyV3
+  | ToolFailureAuditBodyV4
 
 export interface ToolCallRollupCountBody {
   agentId: string
@@ -93,10 +99,12 @@ export interface ToolCallRollupCountBody {
   errorClass: ToolFailureErrorClass | 'none'
   failureKind: ToolFailureKind | 'none'
   count: number
+  totalDurationMs?: number
+  maxDurationMs?: number
 }
 
 export interface ToolCallRollupBody {
-  schemaVersion: 1
+  schemaVersion: 1 | 2
   reportId: string
   reporterRunId: string
   sequence: number
@@ -232,7 +240,7 @@ function validateBody(raw: unknown, nowMs: number): ToolFailureAuditBody | null 
       ? [...commonAllowed, 'inputPreview', 'outputPreview']
       : obj.schemaVersion === 2
         ? [...commonAllowed, 'inputHash', 'outputHash', 'errorClass']
-        : obj.schemaVersion === 3
+        : obj.schemaVersion === 3 || obj.schemaVersion === 4
           ? [
               ...commonAllowed,
               'inputHash',
@@ -241,11 +249,12 @@ function validateBody(raw: unknown, nowMs: number): ToolFailureAuditBody | null 
               'failureKind',
               'exitCode',
               'terminationReason',
+              ...(obj.schemaVersion === 4 ? ['traceId'] : []),
             ]
           : commonAllowed,
   )
   if (Object.keys(obj).some((k) => !allowed.has(k))) return null
-  if (obj.schemaVersion !== 1 && obj.schemaVersion !== 2 && obj.schemaVersion !== 3) return null
+  if (![1, 2, 3, 4].includes(Number(obj.schemaVersion))) return null
   const eventId = requiredString(obj, 'eventId', 128)
   const sessionKey = requiredString(obj, 'sessionKey', 512)
   const agentId = requiredString(obj, 'agentId', 128)
@@ -308,8 +317,10 @@ function validateBody(raw: unknown, nowMs: number): ToolFailureAuditBody | null 
     (terminationReason !== undefined && !isToolTerminationReason(terminationReason))
   )
     return null
+  const traceId = obj.schemaVersion === 4 ? optionalString(obj, 'traceId', 128) : undefined
+  if (traceId === null || (traceId !== undefined && !/^[0-9a-f]{32}$/.test(traceId))) return null
   return {
-    schemaVersion: 3,
+    schemaVersion: obj.schemaVersion as 3 | 4,
     ...base,
     ...(inputHash !== undefined ? { inputHash } : {}),
     ...(outputHash !== undefined ? { outputHash } : {}),
@@ -317,24 +328,33 @@ function validateBody(raw: unknown, nowMs: number): ToolFailureAuditBody | null 
     failureKind,
     ...(exitCode !== undefined ? { exitCode } : {}),
     ...(terminationReason !== undefined ? { terminationReason } : {}),
-  }
+    ...(traceId !== undefined ? { traceId } : {}),
+  } as ToolFailureAuditBodyV3 | ToolFailureAuditBodyV4
 }
 
 const REPORT_ID_RE = /^[0-9a-f]{32}$/
 const MAX_ROLLUP_COUNTS = 256
 
-function validateRollupCount(raw: unknown): ToolCallRollupCountBody | null {
+function validateRollupCount(raw: unknown, requireDurations = false): ToolCallRollupCountBody | null {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
   const obj = raw as Record<string, unknown>
-  const allowed = new Set(['agentId', 'toolName', 'outcome', 'errorClass', 'failureKind', 'count'])
+  const allowed = new Set([
+    'agentId','toolName','outcome','errorClass','failureKind','count',
+    'totalDurationMs','maxDurationMs',
+  ])
   if (Object.keys(obj).some((key) => !allowed.has(key))) return null
   const agentId = requiredString(obj, 'agentId', 128)
   const toolName = requiredString(obj, 'toolName', 128)
   const count = requiredInt(obj, 'count', 1, 1_000_000)
   const outcome = obj.outcome
   const errorClass = obj.errorClass
+  if (requireDurations && (obj.totalDurationMs === undefined || obj.maxDurationMs === undefined)) return null
+  const totalDurationMs = obj.totalDurationMs === undefined
+    ? 0 : requiredInt(obj, 'totalDurationMs', 0, Number.MAX_SAFE_INTEGER)
+  const maxDurationMs = obj.maxDurationMs === undefined
+    ? 0 : requiredInt(obj, 'maxDurationMs', 0, 24 * 60 * 60 * 1000)
   const failureKind = obj.failureKind
-  if (!agentId || !toolName || count === null) return null
+  if (!agentId || !toolName || count === null || totalDurationMs === null || maxDurationMs === null) return null
   if (outcome !== 'success' && outcome !== 'failure') return null
   if (outcome === 'success') {
     if (errorClass !== 'none' || failureKind !== 'none') return null
@@ -348,6 +368,8 @@ function validateRollupCount(raw: unknown): ToolCallRollupCountBody | null {
     errorClass: errorClass as ToolFailureErrorClass | 'none',
     failureKind: failureKind as ToolFailureKind | 'none',
     count,
+    totalDurationMs,
+    maxDurationMs,
   }
 }
 
@@ -364,7 +386,7 @@ function validateRollupBody(raw: unknown, nowMs: number): ToolCallRollupBody | n
     'counts',
   ])
   if (Object.keys(obj).some((key) => !allowed.has(key))) return null
-  if (obj.schemaVersion !== 1) return null
+  if (obj.schemaVersion !== 1 && obj.schemaVersion !== 2) return null
   const reportId = requiredString(obj, 'reportId', 32)
   const reporterRunId = requiredString(obj, 'reporterRunId', 32)
   const sequence = requiredInt(obj, 'sequence', 1, 2_147_483_647)
@@ -388,7 +410,7 @@ function validateRollupBody(raw: unknown, nowMs: number): ToolCallRollupBody | n
   const counts: ToolCallRollupCountBody[] = []
   const dimensions = new Set<string>()
   for (const rawCount of obj.counts) {
-    const count = validateRollupCount(rawCount)
+    const count = validateRollupCount(rawCount, obj.schemaVersion === 2)
     if (!count) return null
     const key = JSON.stringify([
       count.agentId,
@@ -402,7 +424,7 @@ function validateRollupBody(raw: unknown, nowMs: number): ToolCallRollupBody | n
     counts.push(count)
   }
   return {
-    schemaVersion: 1,
+    schemaVersion: obj.schemaVersion as 1 | 2,
     reportId,
     reporterRunId,
     sequence,
@@ -425,6 +447,8 @@ export async function insertToolCallRollup(
     error_class: count.errorClass,
     failure_kind: count.failureKind,
     call_count: count.count,
+    total_duration_ms: count.totalDurationMs ?? 0,
+    max_duration_ms: count.maxDurationMs ?? 0,
   }))
   const result = await runner.query<{ inserted: boolean }>(
     `WITH inserted_report AS (
@@ -439,14 +463,16 @@ export async function insertToolCallRollup(
        RETURNING report_id
      ), inserted_counts AS (
        INSERT INTO agent_tool_rollup_counts(
-         report_id, agent_id, tool, outcome, error_class, failure_kind, call_count
+         report_id,agent_id,tool,outcome,error_class,failure_kind,call_count,
+         total_duration_ms,max_duration_ms
        )
-       SELECT inserted_report.report_id, c.agent_id, c.tool, c.outcome,
-              c.error_class, c.failure_kind, c.call_count
+       SELECT inserted_report.report_id,c.agent_id,c.tool,c.outcome,
+              c.error_class,c.failure_kind,c.call_count,
+              c.total_duration_ms,c.max_duration_ms
          FROM inserted_report
          CROSS JOIN LATERAL jsonb_to_recordset($8::jsonb) AS c(
-           agent_id text, tool text, outcome text, error_class text,
-           failure_kind text, call_count integer
+           agent_id text,tool text,outcome text,error_class text,
+           failure_kind text,call_count integer,total_duration_ms bigint,max_duration_ms integer
          )
        ON CONFLICT DO NOTHING
        RETURNING 1
@@ -483,6 +509,7 @@ export async function insertToolFailureAudit(
     body.schemaVersion === 1 ? sha256OrNull(body.outputPreview) : (body.outputHash ?? null)
   const errorClass =
     body.schemaVersion === 1 ? classifyToolFailureError(body.outputPreview) : body.errorClass
+  const richBody = body.schemaVersion === 3 || body.schemaVersion === 4 ? body : null
   const inputMeta = {
     schema_version: body.schemaVersion,
     event_id: body.eventId,
@@ -490,20 +517,20 @@ export async function insertToolFailureAudit(
     turn_index: body.turnIndex,
     timestamp: body.timestamp,
     error_class: errorClass,
-    ...(body.schemaVersion === 3 ? { failure_kind: body.failureKind } : {}),
-    ...(body.schemaVersion === 3 && body.exitCode !== undefined
-      ? { exit_code: body.exitCode }
-      : {}),
-    ...(body.schemaVersion === 3 && body.terminationReason !== undefined
-      ? { termination_reason: body.terminationReason }
+    ...(richBody ? { failure_kind: richBody.failureKind } : {}),
+    ...(richBody?.exitCode !== undefined ? { exit_code: richBody.exitCode } : {}),
+    ...(richBody?.terminationReason !== undefined
+      ? { termination_reason: richBody.terminationReason }
       : {}),
   }
+  const traceId = body.schemaVersion === 4 ? (body.traceId ?? null) : null
   await runner.query(
     `INSERT INTO agent_audit(
-       user_id, session_id, tool, input_meta, input_hash, output_hash,
-       duration_ms, success, error_msg, occurred_at
+       user_id,session_id,tool,input_meta,input_hash,output_hash,
+       duration_ms,success,error_msg,occurred_at,trace_id,dispatch_id
      ) VALUES ($1,$2,$3,$4::jsonb,$5,$6,$7,false,$8,
-               to_timestamp($9::double precision / 1000.0))`,
+               to_timestamp($9::double precision / 1000.0),$10,
+               (SELECT dispatch_id FROM turn_traces WHERE trace_id=$10 AND user_id=$1 LIMIT 1))`,
     [
       userId,
       body.sessionKey,
@@ -514,6 +541,7 @@ export async function insertToolFailureAudit(
       body.durationMs,
       null,
       body.timestamp,
+      traceId,
     ],
   )
   return { duplicate: false }
@@ -525,7 +553,7 @@ export function makeToolFailureAuditHandler(deps: ToolFailureAuditDeps): ToolFai
     setSecurityHeaders(res)
     // New runtimes use this on 400 to distinguish a current-master validation
     // failure from an old master that only understands schema v2.
-    res.setHeader(TOOL_AUDIT_SCHEMA_HEADER, '3')
+    res.setHeader(TOOL_AUDIT_SCHEMA_HEADER, '4')
     const requestId = ensureRequestId(req)
     res.setHeader(REQUEST_ID_HEADER, requestId)
 

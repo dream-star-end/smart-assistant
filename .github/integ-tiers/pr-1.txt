@@ -11,5 +11,6 @@ packages/commercial/src/__tests__/verify.integ.test.ts
 packages/commercial/src/__tests__/login.integ.test.ts
 packages/commercial/src/__tests__/http.integ.test.ts
 packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts
+packages/commercial/src/__tests__/sessionUnread.integ.test.ts
 packages/commercial/src/__tests__/inbox.integ.test.ts
 packages/commercial/src/inbox/__tests__/onboarding.integ.test.ts

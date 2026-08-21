@@ -52,7 +52,7 @@ export type AccountStatus = (typeof ACCOUNT_STATUSES)[number];
  *   - 所有不传 provider 的调用方(scheduler.pick / listAccounts / createAccount)
  *     默认按 'claude' 走,与 v2 行为一致
  */
-export const ACCOUNT_PROVIDERS = ["claude", "codex", "grok"] as const;
+export const ACCOUNT_PROVIDERS = ["claude", "codex", "grok", "cursor"] as const;
 export type AccountProvider = (typeof ACCOUNT_PROVIDERS)[number];
 
 /** 不含任何加密 / nonce 列的账号元信息 —— 安全打 log / 返 admin UI。 */
@@ -123,6 +123,8 @@ export interface AccountRow {
   runtime_channel: RuntimeChannel;
   created_at: Date;
   updated_at: Date;
+  /** 0226 — Cursor two-pool class. Non-cursor rows stay unknown and are ignored. */
+  cursor_quota_class: import("./cursorQuota.js").CursorQuotaClass;
 }
 
 /**
@@ -199,12 +201,10 @@ export interface CreateAccountInput {
    */
   subscription_end_at?: Date | null;
   /**
-   * 0055 — 必须引用 egress_proxies 池条目(boss 决策,强约束)。raw text 列
-   * (0010)在 0055 CHECK constraint 下必须 NULL,store 层不再暴露其 setter。
-   * 不再可空:store 层守门,缺省 → throw TypeError。entry 存在性校验在
-   * admin layer(adminCreateAccount 显式 SELECT FROM egress_proxies)。
+   * 0055 — claude/codex/grok 必须引用 egress_proxies 池条目。
+   * provider='cursor' 走容器内 CLI 直连,不经过 egress,允许省略。
    */
-  egress_proxy_id: bigint | string;
+  egress_proxy_id?: bigint | string | null;
   /**
    * 0070 — Anthropic OAuth account UUID(Phase 6 anti-fraud anchor)。
    *
@@ -274,6 +274,7 @@ export interface UpdateAccountPatch {
   egress_proxy_id?: bigint | string;
   /** Optional group binding. undefined = no change; null = unassign. */
   group_id?: bigint | string | null;
+  cursor_quota_class?: import("./cursorQuota.js").CursorQuotaClass;
 }
 
 export class AccountNotFoundError extends Error {
@@ -314,7 +315,8 @@ const META_COLUMNS = `
   (oauth_refresh_enc IS NOT NULL AND oauth_refresh_nonce IS NOT NULL) AS has_refresh_token,
   runtime_channel,
   created_at,
-  updated_at
+  updated_at,
+  COALESCE(cursor_quota_class, 'unknown') AS cursor_quota_class
 `;
 
 interface RawMetaRow extends QueryResultRow {
@@ -345,6 +347,7 @@ interface RawMetaRow extends QueryResultRow {
   runtime_channel: RuntimeChannel;
   created_at: Date;
   updated_at: Date;
+  cursor_quota_class: string;
 }
 
 interface RawSecretRow extends QueryResultRow {
@@ -410,6 +413,9 @@ function parseMetaRow(row: RawMetaRow): AccountRow {
     runtime_channel: row.runtime_channel,
     created_at: row.created_at,
     updated_at: row.updated_at,
+    cursor_quota_class: (row.cursor_quota_class === "other_ok" || row.cursor_quota_class === "cursor_only")
+      ? row.cursor_quota_class
+      : "unknown",
   };
 }
 
@@ -435,11 +441,11 @@ export async function createAccount(
   if (typeof input.token !== "string" || input.token.length === 0) {
     throw new TypeError("token must be non-empty string");
   }
-  // 0055:egress_proxy_id 必填(类型签名已锁,这里 runtime 兜底防 JS 调用方绕过 TS)
-  if (input.egress_proxy_id === undefined || input.egress_proxy_id === null) {
+  // 0055:claude/codex/grok 必填;cursor 直连 CLI,允许省略。
+  if (provider !== "cursor" && (input.egress_proxy_id === undefined || input.egress_proxy_id === null)) {
     throw new TypeError("egress_proxy_id is required (0055)");
   }
-  const egressProxyId = String(input.egress_proxy_id);
+  const egressProxyId = input.egress_proxy_id == null ? null : String(input.egress_proxy_id);
   // 0098(P0-2):runtime_channel 必填 —— 不允许静默吃 DB DEFAULT 'v3'
   // (v5 建号落 'v3' = v5 池子静默为空 + v3/v5 双 master 共刷同一 refresh 链)。
   // 与 provider/plan 同款 runtime 兜底,防 JS 调用方绕过 TS 签名。
@@ -529,8 +535,8 @@ export interface ListAccountsOptions {
   /** 仅返这些状态(不传 = 所有) */
   status?: AccountStatus | AccountStatus[];
   /**
-   * 仅返这些 provider(不传 = 所有,等价 ['claude','codex'])。
-   * V3 Phase 2 admin UI 默认按 provider tab 切换 list。
+   * 仅返这些 provider(不传 = 所有)。
+   * Admin UI 按 Cursor / CCB / Codex 分组展示。
    */
   provider?: AccountProvider | AccountProvider[];
   /** 默认 100,最大 500 —— 防止无界扫描 */
@@ -779,6 +785,12 @@ export async function updateAccount(
   }
   if (patch.group_id !== undefined) {
     push("group_id", patch.group_id === null ? null : String(patch.group_id));
+  }
+  if (patch.cursor_quota_class !== undefined) {
+    if (patch.cursor_quota_class !== "unknown" && patch.cursor_quota_class !== "other_ok" && patch.cursor_quota_class !== "cursor_only") {
+      throw new TypeError(`invalid cursor_quota_class: ${patch.cursor_quota_class}`);
+    }
+    push("cursor_quota_class", patch.cursor_quota_class);
   }
 
   if (patch.egress_proxy_id !== undefined) {
@@ -1232,5 +1244,48 @@ export async function getCodexTokenSnapshot(
     return await getCodexTokenSnapshotInTx(client, id, keyFn);
   } finally {
     client.release();
+  }
+}
+
+export interface CursorTokenSnapshot {
+  id: bigint;
+  /** 解密后的 Cursor API key —— **调用方用完必须 .fill(0)** */
+  token: Buffer;
+}
+
+/**
+ * Cursor API key snapshot. Same encrypted columns as OAuth tokens; never
+ * logged. Caller must zero the buffer.
+ */
+export async function getCursorTokenSnapshot(
+  id: bigint | string,
+  keyFn: () => Buffer = loadKmsKey,
+): Promise<CursorTokenSnapshot | null> {
+  const res = await query<RawCodexSecretRow>(
+    `SELECT id::text AS id, provider,
+       oauth_token_enc, oauth_nonce,
+       oauth_refresh_enc, oauth_refresh_nonce,
+       oauth_expires_at
+     FROM claude_accounts
+     WHERE id = $1`,
+    [String(id)],
+  );
+  if (res.rows.length === 0) return null;
+  const row = res.rows[0];
+  if (row.provider !== "cursor") {
+    throw new TypeError(`getCursorTokenSnapshot called on non-cursor account ${String(id)} (provider=${row.provider})`);
+  }
+  const key = keyFn();
+  let token: Buffer | null = null;
+  try {
+    token = decryptToBuffer(row.oauth_token_enc, row.oauth_nonce, key);
+    const out: CursorTokenSnapshot = { id: BigInt(row.id), token };
+    token = null;
+    return out;
+  } catch (err) {
+    if (token) zeroBuffer(token);
+    throw err instanceof AeadError ? err : new AeadError("decryption failed", { cause: err });
+  } finally {
+    zeroBuffer(key);
   }
 }

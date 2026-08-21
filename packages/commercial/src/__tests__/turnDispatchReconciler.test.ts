@@ -10,11 +10,17 @@ import { describe, test } from 'node:test'
 import type { Pool } from 'pg'
 import {
   assessDispatchBilling,
+  buildTurnDispatchReconcileFrame,
   DEFAULT_ACCEPTED_STUCK_FLOOR_MS,
+  expireAdmittedLeasesOnShutdown,
   MAX_ACCEPTED_STUCK_MS,
   resolveDispatchStuckThresholdMs,
   runReconcileTick,
+  runShutdownDispatchHandoff,
+  loadGatewayExitDispatchIds,
+  _resetVisibleOrphanScanOffset,
 } from '../dispatch/turnDispatchReconciler.js'
+import { markOpenDispatchShutdownEvidence } from '../dispatch/turnDispatchStore.js'
 import { PERMANENT_CODEX_WAIVER_PREFIX } from '../billing/codexFinalizer.js'
 import type { ContainerCallResult } from '../dispatch/containerDispatchClient.js'
 import { permanentCodexWaiverReason } from '../billing/codexFinalizer.js'
@@ -58,30 +64,67 @@ interface Canned {
   acceptedStuck?: Raw[]
   openAged?: Raw[]
   openSessionGone?: Raw[]
+  visibleOrphans?: Raw[]
+  casToTerminalMiss?: boolean
 }
 
 function makeFakePool(canned: Canned) {
   const writes: string[] = []
+  const writeParams: unknown[][] = []
   // accepted 扫描的 SQL 时间参数捕获(Codex R1 MAJOR 回归锁:扫描下限必须是
   // ACCEPTED_UNREACHABLE_ALERT_MS 而非 stuckMs,否则求证瘫痪要等 90min+ 才首告)。
   const acceptedScanCutoffs: Date[] = []
+  let txDepth = 0
+  let txBuf: string[] = []
+  const recordWrite = (s: string) => {
+    if (txDepth > 0) txBuf.push(s)
+    else writes.push(s)
+  }
   // 单点路由:pool.query 与事务 client.query 共用。B8 的 terminal-未通知分支走
   // pool.connect() 单事务(SELECT … FOR UPDATE 锁行 → 重验 → 财务联查 → visible/manual),
   // 故 fake 必须提供 connect() + 事务 client。
   const route = (sql: string, params?: unknown[]) => {
     const s = sql.replace(/\s+/g, ' ')
-    // 事务控制帧。
-    if (s === 'BEGIN' || s === 'COMMIT' || s === 'ROLLBACK') return { rows: [], rowCount: 0 }
+    if (s === 'BEGIN') {
+      txDepth += 1
+      txBuf = []
+      return { rows: [], rowCount: 0 }
+    }
+    if (s === 'COMMIT') {
+      writes.push(...txBuf)
+      writes.push('COMMIT')
+      txDepth = 0
+      txBuf = []
+      return { rows: [], rowCount: 0 }
+    }
+    if (s === 'ROLLBACK') {
+      writes.push('ROLLBACK')
+      txDepth = 0
+      txBuf = []
+      return { rows: [], rowCount: 0 }
+    }
+    if (s.includes('-- closeVisibleOrphans lock')) {
+      const id = params?.[0]
+      const orphan = (canned.visibleOrphans ?? []).find((row) => row.dispatch_id === id)
+        ?? canned.visibleOrphans?.[0]
+      if (!orphan) return { rows: [], rowCount: 0 }
+      return { rows: [{ status: orphan.status }], rowCount: 1 }
+    }
     // 行锁读(getDispatchForUpdate):返回锁定的 terminal 行,重验通过。
     if (s.includes('FROM turn_dispatches') && s.includes('FOR UPDATE')) {
       return { rows: [rawRow()], rowCount: 1 }
     }
     if (s.startsWith('UPDATE') || s.startsWith('INSERT')) {
-      writes.push(s)
+      recordWrite(s)
+      writeParams.push(params ?? [])
       if (s.includes('client_notified = TRUE')) return { rows: [], rowCount: 1 }
       if (s.includes("status = 'manual_reconcile'")) return { rows: [rawRow({ status: 'manual_reconcile', conflict_reason: 'x' })], rowCount: 1 }
-      if (s.includes("status = 'terminal'")) return { rows: [rawRow({ status: 'terminal', outcome: 'not_accepted', terminal_at: new Date() })], rowCount: 1 }
+      if (s.includes("status = 'terminal'")) {
+        if (canned.casToTerminalMiss) return { rows: [], rowCount: 0 }
+        return { rows: [rawRow({ status: 'terminal', outcome: 'not_accepted', terminal_at: new Date() })], rowCount: 1 }
+      }
       if (s.includes("status = 'accepted'")) return { rows: [rawRow({ status: 'accepted' })], rowCount: 1 }
+      if (s.includes("status = 'rejecting'")) return { rows: [rawRow({ status: 'rejecting' })], rowCount: 1 }
       return { rows: [], rowCount: 1 }
     }
     // reads (scans)
@@ -92,8 +135,13 @@ function makeFakePool(canned: Canned) {
       if (params?.[0] instanceof Date) acceptedScanCutoffs.push(params[0] as Date)
       return { rows: canned.acceptedStuck ?? [], rowCount: (canned.acceptedStuck ?? []).length }
     }
+    // rev2 closeVisibleOrphans must win before session-gone: its SQL joins
+    // client_session_turn_tapes (substring of client_sessions).
+    if (s.includes('-- closeVisibleOrphans')) {
+      return { rows: canned.visibleOrphans ?? [], rowCount: (canned.visibleOrphans ?? []).length }
+    }
     // ⓪ scanOpenSessionGone(LEFT JOIN)必须先于 openAged 路由:两者都含 status IN (open 三态)。
-    if (s.includes('LEFT JOIN client_sessions')) return { rows: canned.openSessionGone ?? [], rowCount: (canned.openSessionGone ?? []).length }
+    if (s.includes('LEFT JOIN client_sessions s')) return { rows: canned.openSessionGone ?? [], rowCount: (canned.openSessionGone ?? []).length }
     if (s.includes("status IN ('admitted', 'accepted', 'rejecting')")) return { rows: canned.openAged ?? [], rowCount: (canned.openAged ?? []).length }
     return { rows: [], rowCount: 0 }
   }
@@ -110,6 +158,7 @@ function makeFakePool(canned: Canned) {
       }
     },
     writes,
+    writeParams,
     acceptedScanCutoffs,
   }
   return pool
@@ -119,6 +168,32 @@ const noContainer = {
   rejectIfAbsent: async (): Promise<ContainerCallResult> => ({ kind: 'unreachable', detail: 'test' }),
   getDispatchState: async (): Promise<ContainerCallResult> => ({ kind: 'unreachable', detail: 'test' }),
 }
+
+describe('authoritative reconcile frame', () => {
+  test('terminal reconcile is final and exact-id; unknown stays non-final', () => {
+    const completed = buildTurnDispatchReconcileFrame({
+      sessionId: 'sess-0001',
+      clientMessageId: 'cm-1',
+      reconcile: 'turn_completed',
+    })
+    assert.equal(completed.isFinal, true)
+    assert.equal(completed.clientMessageId, 'cm-1')
+    assert.deepEqual(completed.meta, {
+      reconcile: 'turn_completed',
+      clientMessageId: 'cm-1',
+    })
+
+    const unknown = buildTurnDispatchReconcileFrame({
+      sessionId: 'sess-0001',
+      clientMessageId: 'cm-1',
+    })
+    assert.equal(unknown.isFinal, false)
+    assert.deepEqual(unknown.meta, {
+      reconcile: 'turn_state_unknown',
+      clientMessageId: 'cm-1',
+    })
+  })
+})
 
 describe('resolveDispatchStuckThresholdMs', () => {
   test('floor = max(codexMax*2, 90min); env only raises', () => {
@@ -465,6 +540,8 @@ describe('accepted-stuck branch (B2: container rejected tombstone)', () => {
     assert.equal(nudged, 1)
     assert.ok(pool.writes.some((w) =>
       w.includes("status = 'terminal'") && w.includes('failure_code = $3')))
+    assert.ok(pool.writeParams.some((p) => p[2] === 'RESULT_RECOVERY_PENDING'))
+    assert.ok(!pool.writeParams.some((p) => p[2] === 'SERVICE_RESTART'))
     assert.ok(pool.writes.some((w) =>
       w.includes('history_revision = history_revision + 1') &&
       w.includes('timeline_generation = timeline_generation + 1')))
@@ -518,5 +595,564 @@ describe('assessDispatchBilling (B8: 零计费证明收紧)', () => {
       ),
       'not_billed',
     )
+  })
+})
+
+describe('carrier-death fast path (accepted)', () => {
+  test('有进程退出证据时,探测窗内 container rejected → 立即 terminal', async () => {
+    const pool = makeFakePool({
+      acceptedStuck: [rawRow({ status: 'accepted', accepted_at: new Date(Date.now() - 20 * 60_000) })],
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: {
+        ...noContainer,
+        getDispatchState: async (): Promise<ContainerCallResult> => ({ kind: 'ok', state: 'rejected' }),
+      },
+      listCarrierDeadDispatchIds: async () => ['d-1'],
+    })
+    assert.equal(counts.rejectedTerminal, 1)
+  })
+
+  test('有进程退出证据但容器仍 running → 不终态(不误杀活引擎)', async () => {
+    const pool = makeFakePool({
+      acceptedStuck: [rawRow({ status: 'accepted', accepted_at: new Date(Date.now() - 20 * 60_000) })],
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: {
+        ...noContainer,
+        getDispatchState: async (): Promise<ContainerCallResult> => ({ kind: 'ok', state: 'running' }),
+      },
+      listCarrierDeadDispatchIds: async () => ['d-1'],
+    })
+    assert.equal(counts.rejectedTerminal, 0)
+    assert.equal(counts.manualReconcile, 0)
+    assert.ok(!pool.writes.some((w) => w.includes("status = 'terminal'")))
+  })
+
+  test('accepted + 停机证据 + 容器不可达 → 保留证据、等下轮、不写 SERVICE_RESTART', async () => {
+    const pool = makeFakePool({
+      acceptedStuck: [rawRow({
+        status: 'accepted',
+        accepted_at: new Date(),
+        shutdown_ctx: { gatewayExitedAt: '2026-08-20T00:00:00.000Z' },
+      })],
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: noContainer,
+    })
+    assert.equal(counts.visibleFailures, 0)
+    assert.equal(counts.rejectedTerminal, 0)
+    assert.equal(counts.manualReconcile, 0)
+    assert.ok(!pool.writes.some((w) => w.includes("status = 'terminal'")))
+    assert.ok(!pool.writeParams.some((p) => p[2] === 'SERVICE_RESTART'))
+    assert.ok(!pool.writes.some((w) => w.includes('shutdown_ctx -')), '不可达不得清停机证据')
+  })
+
+  test('accepted + 停机证据 + 容器 error 探测 → 同样不收口、保留证据', async () => {
+    const pool = makeFakePool({
+      acceptedStuck: [rawRow({
+        status: 'accepted',
+        accepted_at: new Date(),
+        shutdown_ctx: { gatewayExitedAt: '2026-08-20T00:00:00.000Z' },
+      })],
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: {
+        ...noContainer,
+        getDispatchState: async (): Promise<ContainerCallResult> => ({ kind: 'error', detail: '502' }),
+      },
+    })
+    assert.equal(counts.visibleFailures, 0)
+    assert.ok(!pool.writeParams.some((p) => p[2] === 'SERVICE_RESTART'))
+    assert.ok(!pool.writes.some((w) => w.includes('shutdown_ctx -')))
+  })
+
+  test('accepted + 停机证据 + 容器 absent → 收口成 SERVICE_RESTART', async () => {
+    const pool = makeFakePool({
+      acceptedStuck: [rawRow({
+        status: 'accepted',
+        accepted_at: new Date(),
+        shutdown_ctx: { gatewayExitedAt: '2026-08-20T00:00:00.000Z' },
+      })],
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: {
+        ...noContainer,
+        getDispatchState: async (): Promise<ContainerCallResult> => ({ kind: 'ok', state: 'absent' }),
+      },
+    })
+    assert.equal(counts.visibleFailures, 1)
+    assert.equal(counts.rejectedTerminal, 0)
+    assert.ok(pool.writeParams.some((p) => p[1] === 'executed_error' && p[2] === 'SERVICE_RESTART'))
+    assert.ok(!pool.writeParams.some((p) => p[1] === 'not_accepted' || p[2] === 'DISPATCH_NOT_ACCEPTED'))
+    assert.ok(!pool.writeParams.some((p) => p[2] === 'RESULT_RECOVERY_PENDING'))
+  })
+
+  test('terminal+crashed 且无停机证据 → 不写 SERVICE_RESTART', async () => {
+    const pool = makeFakePool({
+      acceptedStuck: [rawRow({ status: 'accepted', accepted_at: new Date() })],
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: {
+        ...noContainer,
+        getDispatchState: async (): Promise<ContainerCallResult> => ({
+          kind: 'ok',
+          state: 'terminal',
+          outcome: 'crashed',
+        }),
+      },
+    })
+    assert.equal(counts.visibleFailures, 1)
+    assert.ok(pool.writeParams.some((p) => p[1] === 'executed_error' && p[2] === 'RESULT_RECOVERY_PENDING'))
+    assert.ok(!pool.writeParams.some((p) => p[2] === 'SERVICE_RESTART'))
+  })
+
+  test('terminal+crashed 且有 shutdown_ctx → 收口成 SERVICE_RESTART', async () => {
+    const pool = makeFakePool({
+      acceptedStuck: [rawRow({
+        status: 'accepted',
+        accepted_at: new Date(),
+        shutdown_ctx: { gatewayExitedAt: '2026-08-20T00:00:00.000Z' },
+      })],
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: {
+        ...noContainer,
+        getDispatchState: async (): Promise<ContainerCallResult> => ({
+          kind: 'ok',
+          state: 'terminal',
+          outcome: 'crashed',
+        }),
+      },
+    })
+    assert.equal(counts.visibleFailures, 1)
+    assert.ok(pool.writeParams.some((p) => p[1] === 'executed_error' && p[2] === 'SERVICE_RESTART'))
+    assert.ok(!pool.writeParams.some((p) => p[2] === 'RESULT_RECOVERY_PENDING'))
+  })
+
+  test('recovery_pending 且无停机证据 → 不写 SERVICE_RESTART', async () => {
+    const pool = makeFakePool({
+      acceptedStuck: [rawRow({ status: 'accepted', accepted_at: new Date() })],
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: {
+        ...noContainer,
+        getDispatchState: async (): Promise<ContainerCallResult> => ({
+          kind: 'ok',
+          state: 'recovery_pending',
+        }),
+      },
+    })
+    assert.equal(counts.visibleFailures, 0)
+    assert.equal(counts.rejectedTerminal, 0)
+    assert.equal(counts.manualReconcile, 0)
+    assert.ok(!pool.writes.some((w) => w.includes("status = 'terminal'")))
+    assert.ok(!pool.writeParams.some((p) => p[2] === 'SERVICE_RESTART'))
+    assert.ok(!pool.writeParams.some((p) => p[2] === 'RESULT_RECOVERY_PENDING'))
+  })
+
+  test('recovery_pending 且有 shutdown_ctx → 收口成 SERVICE_RESTART', async () => {
+    const pool = makeFakePool({
+      acceptedStuck: [rawRow({
+        status: 'accepted',
+        accepted_at: new Date(),
+        shutdown_ctx: { gatewayExitedAt: '2026-08-20T00:00:00.000Z' },
+      })],
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: {
+        ...noContainer,
+        getDispatchState: async (): Promise<ContainerCallResult> => ({
+          kind: 'ok',
+          state: 'recovery_pending',
+        }),
+      },
+    })
+    assert.equal(counts.visibleFailures, 1)
+    assert.equal(counts.rejectedTerminal, 0)
+    assert.ok(pool.writeParams.some((p) => p[1] === 'executed_error' && p[2] === 'SERVICE_RESTART'))
+    assert.ok(!pool.writeParams.some((p) => p[2] === 'RESULT_RECOVERY_PENDING'))
+  })
+
+  test('accepted + 停机证据 + 容器 running → 不动', async () => {
+    const pool = makeFakePool({
+      acceptedStuck: [rawRow({ status: 'accepted', accepted_at: new Date() })],
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: {
+        ...noContainer,
+        getDispatchState: async (): Promise<ContainerCallResult> => ({ kind: 'ok', state: 'running' }),
+      },
+      listCarrierDeadDispatchIds: async () => ['d-1'],
+    })
+    assert.equal(counts.visibleFailures, 0)
+    assert.equal(counts.rejectedTerminal, 0)
+    assert.equal(counts.manualReconcile, 0)
+    assert.ok(!pool.writes.some((w) => w.includes("status = 'terminal'")))
+    assert.ok(!pool.writeParams.some((p) => p[2] === 'SERVICE_RESTART'))
+  })
+
+  test('幼龄 admitted + 租约过期 + 进程退出证据 → 进入 reject-if-absent', async () => {
+    const pool = makeFakePool({
+      admittedLeaseExpired: [rawRow({
+        status: 'admitted',
+        outcome: null,
+        failure_code: null,
+        admitted_at: new Date(Date.now() - 30_000),
+        lease_until: new Date(Date.now() - 1_000),
+      })],
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: {
+        ...noContainer,
+        rejectIfAbsent: async (): Promise<ContainerCallResult> => ({ kind: 'ok', state: 'rejected' }),
+      },
+      listCarrierDeadDispatchIds: async () => ['d-1'],
+    })
+    assert.equal(counts.rejectedTerminal, 1)
+  })
+
+  test('幼龄 admitted + 租约过期但无进程退出证据 → 仍走 5min 门,不接管', async () => {
+    const pool = makeFakePool({
+      admittedLeaseExpired: [rawRow({
+        status: 'admitted',
+        outcome: null,
+        failure_code: null,
+        admitted_at: new Date(Date.now() - 30_000),
+        lease_until: new Date(Date.now() - 1_000),
+      })],
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: {
+        ...noContainer,
+        rejectIfAbsent: async (): Promise<ContainerCallResult> => ({ kind: 'ok', state: 'rejected' }),
+      },
+    })
+    assert.equal(counts.rejectedTerminal, 0)
+    assert.ok(!pool.writes.some((w) => w.includes("status = 'rejecting'") || w.includes("status = 'terminal'")))
+  })
+})
+
+describe('runShutdownDispatchHandoff', () => {
+  test('先落证据再求证;容器 running 不 finalize', async () => {
+    const pool = makeFakePool({
+      acceptedStuck: [rawRow({ status: 'accepted', accepted_at: new Date() })],
+    })
+    let marked = 0
+    let expired = 0
+    const out = await runShutdownDispatchHandoff({
+      pool: pool as unknown as Pool,
+      container: {
+        ...noContainer,
+        getDispatchState: async (): Promise<ContainerCallResult> => ({ kind: 'ok', state: 'running' }),
+      },
+      markJournals: async () => {
+        marked = 3
+        return 3
+      },
+      expireLeases: async () => {
+        expired = 2
+        return 2
+      },
+      listCarrierDeadDispatchIds: async () => ['d-1'],
+      budgetMs: 2_000,
+    })
+    assert.equal(out.markedJournals, 3)
+    assert.equal(out.expiredLeases, 2)
+    assert.equal(out.timedOut, false)
+    assert.equal(out.probed, true)
+    assert.equal(out.tick?.rejectedTerminal ?? 0, 0)
+    assert.equal(marked, 3)
+    assert.equal(expired, 2)
+  })
+
+  test('停机探测超时/不可达但容器仍 running → 不终态化', async () => {
+    const pool = makeFakePool({
+      acceptedStuck: [rawRow({
+        status: 'accepted',
+        accepted_at: new Date(),
+        shutdown_ctx: { gatewayExitedAt: '2026-08-20T00:00:00.000Z' },
+      })],
+    })
+    const out = await runShutdownDispatchHandoff({
+      pool: pool as unknown as Pool,
+      container: {
+        ...noContainer,
+        getDispatchState: async (): Promise<ContainerCallResult> => ({
+          kind: 'unreachable',
+          detail: 'shutdown_budget',
+        }),
+      },
+      markJournals: async () => 1,
+      expireLeases: async () => 0,
+      budgetMs: 2_000,
+    })
+    assert.equal(out.timedOut, false)
+    assert.equal(out.probed, true)
+    assert.equal(out.tick?.visibleFailures ?? 0, 0)
+    assert.equal(out.tick?.rejectedTerminal ?? 0, 0)
+    assert.ok(!pool.writeParams.some((p) => p[2] === 'SERVICE_RESTART'))
+    assert.ok(!pool.writes.some((w) => w.includes("status = 'terminal'")))
+    assert.ok(!pool.writes.some((w) => w.includes('shutdown_ctx -')), '超时不可达须保留停机证据')
+
+    const follow = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: {
+        ...noContainer,
+        getDispatchState: async (): Promise<ContainerCallResult> => ({ kind: 'ok', state: 'running' }),
+      },
+      listCarrierDeadDispatchIds: async () => ['d-1'],
+    })
+    assert.equal(follow.visibleFailures, 0)
+    assert.equal(follow.rejectedTerminal, 0)
+    assert.ok(!pool.writeParams.some((p) => p[2] === 'SERVICE_RESTART'))
+    assert.ok(!pool.writes.some((w) => w.includes("status = 'terminal'")))
+  })
+
+  test('预算耗尽时仍返回已落的证据,不把 shutdown 拖死', async () => {
+    const pool = makeFakePool({
+      acceptedStuck: [rawRow({ status: 'accepted', accepted_at: new Date() })],
+    })
+    const started = Date.now()
+    const out = await runShutdownDispatchHandoff({
+      pool: pool as unknown as Pool,
+      container: {
+        rejectIfAbsent: () => new Promise(() => { /* hang */ }),
+        getDispatchState: () => new Promise(() => { /* hang */ }),
+      },
+      markJournals: async () => 1,
+      expireLeases: async () => 1,
+      listCarrierDeadDispatchIds: async () => ['d-1'],
+      budgetMs: 80,
+    })
+    const elapsed = Date.now() - started
+    assert.equal(out.markedJournals, 1)
+    assert.equal(out.expiredLeases, 1)
+    assert.equal(out.timedOut, true)
+    assert.ok(elapsed < 1_500, `shutdown handoff exceeded budget: ${elapsed}ms`)
+  })
+
+  test('expireAdmittedLeasesOnShutdown 只动 admitted 且 lease 仍活的行', async () => {
+    const writes: string[] = []
+    const pool = {
+      async query(sql: string) {
+        writes.push(sql.replace(/\s+/g, ' '))
+        return { rows: [], rowCount: 4 }
+      },
+    }
+    const n = await expireAdmittedLeasesOnShutdown(pool as unknown as Pool, 1_700_000_000_000)
+    assert.equal(n, 4)
+    assert.match(writes[0]!, /status = 'admitted'/)
+    assert.match(writes[0]!, /lease_until > \$1/)
+  })
+
+  test('markOpenDispatchShutdownEvidence 打 open 三态且不碰 lease', async () => {
+    const writes: string[] = []
+    const pool = {
+      async query(sql: string) {
+        writes.push(sql.replace(/\s+/g, ' '))
+        return { rows: [], rowCount: 3 }
+      },
+    }
+    const n = await markOpenDispatchShutdownEvidence(pool as unknown as Pool, {
+      now: new Date('2026-08-20T00:00:00.000Z'),
+      reason: 'process_shutdown',
+    })
+    assert.equal(n, 3)
+    assert.match(writes[0]!, /status IN \('admitted','accepted','rejecting'\)/)
+    assert.match(writes[0]!, /shutdown_ctx/)
+    assert.doesNotMatch(writes[0]!, /lease_until/)
+    assert.doesNotMatch(writes[0]!, /status = 'terminal'/)
+  })
+})
+
+describe('loadGatewayExitDispatchIds — 按 dispatch_id 反查', () => {
+  test('空候选不发查询', async () => {
+    let calls = 0
+    const pool = {
+      async query() {
+        calls++
+        return { rows: [], rowCount: 0 }
+      },
+    }
+    const ids = await loadGatewayExitDispatchIds(pool as unknown as Pool, [])
+    assert.deepEqual(ids, [])
+    assert.equal(calls, 0)
+  })
+
+  test('标记打在 request_id ≠ billing_request_id 的调用级 journal 上仍能命中', async () => {
+    const sqls: string[] = []
+    const params: unknown[][] = []
+    const pool = {
+      async query(sql: string, p?: unknown[]) {
+        sqls.push(sql.replace(/\s+/g, ' '))
+        params.push(p ?? [])
+        // 模拟:该 dispatch 有多条 journal,标记在 call-level request_id 上,
+        // 若误按 billing_request_id=br-not-marked 查 PK,这里不会被问到。
+        return { rows: [{ dispatch_id: 'd-1' }], rowCount: 1 }
+      },
+    }
+    const ids = await loadGatewayExitDispatchIds(pool as unknown as Pool, [
+      { dispatchId: 'd-1' },
+    ])
+    assert.deepEqual(ids, ['d-1'])
+    assert.match(sqls[0]!, /dispatch_id = ANY\(\$1::uuid\[\]\)/)
+    assert.ok(!/request_id = ANY/.test(sqls[0]!), '按 billing/request_id 查会漏掉调用级标记')
+    assert.deepEqual(params[0]![0], ['d-1'])
+  })
+})
+
+describe('carrier-dead 语义:多 journal 且标记不在 billing_request_id 那一行', () => {
+  test('20min accepted + 容器 rejected + 标记在 call-level journal → 立即 terminal', async () => {
+    const pool = makeFakePool({
+      acceptedStuck: [rawRow({
+        status: 'accepted',
+        accepted_at: new Date(Date.now() - 20 * 60_000),
+        billing_request_id: 'br-not-the-marked-row',
+      })],
+    })
+    const origQuery = pool.query.bind(pool)
+    pool.query = async (sql: string, params?: unknown[]) => {
+      const s = sql.replace(/\s+/g, ' ')
+      if (s.includes('FROM request_finalize_journal') && s.includes('dispatch_id = ANY')) {
+        return { rows: [{ dispatch_id: 'd-1' }], rowCount: 1 }
+      }
+      if (s.includes('FROM request_finalize_journal') && s.includes('request_id = ANY')) {
+        return { rows: [], rowCount: 0 }
+      }
+      return origQuery(sql, params)
+    }
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: {
+        ...noContainer,
+        getDispatchState: async (): Promise<ContainerCallResult> => ({ kind: 'ok', state: 'rejected' }),
+      },
+    })
+    assert.equal(counts.rejectedTerminal, 1, '标记在 request_id≠billing_request_id 的行上必须仍能走快路径')
+  })
+})
+
+
+describe('closeVisibleOrphans (rev2 B4)', () => {
+  const PARTS_COMPLETE_QUIET_MS = 2 * 60_000
+  const nowMs = 1_700_000_000_000
+
+  function orphanRow(over: Partial<Raw> = {}): Raw {
+    return {
+      dispatch_id: 'd-vis-1',
+      user_id: '42',
+      session_id: 'sess-vis',
+      client_message_id: 'cm-vis',
+      status: 'accepted',
+      admitted_at: new Date(nowMs - 10 * 60_000),
+      accepted_at: new Date(nowMs - 10 * 60_000),
+      tape_visible_at: null,
+      tape_part_count: null,
+      tape_id: null,
+      tape_parts_rows: '0',
+      last_frame_at: new Date(nowMs - 10 * 60_000),
+      container_running: false,
+      ...over,
+    }
+  }
+
+  test('parts-complete quiet → Phase A only, no fallback projection', async () => {
+    _resetVisibleOrphanScanOffset()
+    const nudges: string[] = []
+    const commits: string[] = []
+    const pool = makeFakePool({
+      visibleOrphans: [orphanRow({
+        tape_id: 'tape-complete',
+        tape_part_count: 12,
+        tape_parts_rows: '12',
+        last_frame_at: new Date(nowMs - PARTS_COMPLETE_QUIET_MS),
+      })],
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: noContainer,
+      now: () => nowMs,
+      listCarrierDeadDispatchIds: async () => [],
+      commitVisibleTape: async (input) => {
+        commits.push(input.tapeId)
+      },
+      nudgeClient: (_uid, _sid, _cmid, reconcile) => {
+        if (reconcile) nudges.push(reconcile)
+      },
+    })
+    assert.equal(counts.visibleOrphans, 1)
+    assert.deepEqual(commits, ['tape-complete'])
+    assert.ok(!pool.writes.some((sql) => sql.includes('visible-fallback') || sql.includes('visible_head')))
+    assert.ok(!pool.writes.some((sql) => sql.includes("status = 'terminal'")))
+    assert.deepEqual(nudges, ['turn_completed'])
+  })
+
+  test('Phase A failure keeps dispatch open, skips fallback, retries next tick', async () => {
+    _resetVisibleOrphanScanOffset()
+    let attempts = 0
+    const pool = makeFakePool({
+      visibleOrphans: [orphanRow({
+        tape_id: 'tape-fail-a',
+        tape_part_count: 3,
+        tape_parts_rows: '3',
+        last_frame_at: new Date(nowMs - PARTS_COMPLETE_QUIET_MS),
+      })],
+    })
+    const deps = {
+      pool: pool as unknown as Pool,
+      container: noContainer,
+      now: () => nowMs,
+      listCarrierDeadDispatchIds: async () => [],
+      commitVisibleTape: async () => {
+        attempts += 1
+        if (attempts === 1) throw new Error('phase a failed')
+      },
+    }
+    const first = await runReconcileTick(deps)
+    assert.equal(first.visibleOrphans, 0)
+    assert.equal(attempts, 1)
+    assert.ok(!pool.writes.some((sql) => sql.includes('visible-fallback') || sql.includes('visible_head')))
+    assert.ok(!pool.writes.some((sql) => sql.includes("status = 'terminal'")))
+    assert.ok(!pool.writes.includes('COMMIT'))
+    const second = await runReconcileTick(deps)
+    assert.equal(second.visibleOrphans, 1)
+    assert.equal(attempts, 2)
+  })
+
+  test('CAS miss rolls back so fallback projection does not commit', async () => {
+    _resetVisibleOrphanScanOffset()
+    const pool = makeFakePool({
+      visibleOrphans: [orphanRow({
+        tape_id: null,
+        tape_part_count: null,
+        tape_parts_rows: '0',
+        last_frame_at: new Date(nowMs - 20 * 60_000),
+        container_running: false,
+      })],
+      casToTerminalMiss: true,
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: noContainer,
+      now: () => nowMs,
+      listCarrierDeadDispatchIds: async () => [],
+    })
+    assert.equal(counts.visibleOrphans, 0)
+    assert.ok(pool.writes.includes('ROLLBACK'))
+    assert.ok(!pool.writes.includes('COMMIT'))
+    assert.ok(!pool.writes.some((sql) => sql.includes('visible-fallback') || sql.includes('visible_head')))
   })
 })

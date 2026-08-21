@@ -145,6 +145,8 @@ export const TurnCompletedEvent = Type.Intersect([
     usage: UsageInfo,
     toolCalls: Type.Number({ description: 'Number of tool calls in this turn' }),
     durationMs: Type.Number(),
+    /** Master canonical trace propagated into every engine-neutral completion event. */
+    traceId: Type.Optional(Type.String({ maxLength: 128 })),
     /** PR2 v1.0.66 — server-owned per-turn id;codex-native turn 才有,subprocess
      *  / 旧 codex exec 路径不带。给 audit / 异步 settle 关联 inflightCodexTurns 用。 */
     requestId: Type.Optional(Type.String()),
@@ -173,6 +175,7 @@ export const ToolCalledEvent = Type.Intersect([
     toolName: Type.String(),
     durationMs: Type.Number(),
     isError: Type.Boolean(),
+    traceId: Type.Optional(Type.String({ maxLength: 128 })),
     inputPreview: Type.Optional(Type.String({ maxLength: 500 })),
     outputPreview: Type.Optional(Type.String({ maxLength: 500 })),
     /** Engine-authored process exit status. Never inferred from preview text. */

@@ -45,6 +45,11 @@ describe('bridge API allowlist', () => {
       '/api/agents/:id/memory/:target',
     )
     assert.equal(
+      matchCommercialContainerApiProxy('/api/agents/main/memory/usage', 'GET')?.label,
+      '/api/agents/:id/memory/usage',
+    )
+    assert.equal(matchCommercialContainerApiProxy('/api/agents/main/memory/usage', 'POST'), null)
+    assert.equal(
       matchCommercialContainerApiProxy('/api/agents/main/auto-dream-report', 'GET')?.label,
       '/api/agents/:id/auto-dream-report',
     )
@@ -82,6 +87,17 @@ describe('bridge API allowlist', () => {
       matchCommercialContainerApiProxy('/api/agents/main/skills/foo', 'PUT')?.label,
       '/api/agents/:id/skills/:name',
     )
+    // Cursor MCP ask_user — container agent → Web choice cards. POST only.
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/agents/main/ask-user', 'POST')?.label,
+      '/api/agents/:id/ask-user',
+    )
+    assert.equal(matchCommercialContainerApiProxy('/api/agents/main/ask-user', 'GET'), null)
+    assert.equal(matchCommercialContainerApiProxy('/api/agents/main/ask-user', 'PUT'), null)
+    assert.equal(matchCommercialContainerApiProxy('/api/agents/a/ask-user', 'POST')?.label, '/api/agents/:id/ask-user')
+    assert.equal(matchCommercialContainerApiProxy('/api/agents/main./ask-user', 'POST'), null)
+    assert.equal(matchCommercialContainerApiProxy('/api/agents/ma%2Fin/ask-user', 'POST'), null)
+    assert.equal(matchCommercialContainerApiProxy('/api/agents/main/ask-user/extra', 'POST'), null)
     // User-level shared skill library (agentId-less) — proxied into the user's container.
     assert.equal(matchCommercialContainerApiProxy('/api/skills', 'GET')?.label, '/api/skills')
     assert.equal(
@@ -96,6 +112,170 @@ describe('bridge API allowlist', () => {
     assert.equal(
       matchCommercialContainerApiProxy('/api/cron/job-1', 'DELETE')?.label,
       '/api/cron/:id',
+    )
+    // Taskboard `/api/board/*` —— 契约里每个端点都能被商业代理命中。
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/projects', 'GET')?.label,
+      '/api/board/projects',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/projects', 'POST')?.label,
+      '/api/board/projects',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/projects/OCV5', 'GET')?.label,
+      '/api/board/projects/:id',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/projects/OCV5', 'PATCH')?.label,
+      '/api/board/projects/:id',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/projects/OCV5', 'DELETE')?.label,
+      '/api/board/projects/:id',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/projects/OCV5/board', 'GET')?.label,
+      '/api/board/projects/:id/board',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/tickets', 'GET')?.label,
+      '/api/board/tickets',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/tickets', 'POST')?.label,
+      '/api/board/tickets',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/tickets/OCV5-1', 'GET')?.label,
+      '/api/board/tickets/:id',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/tickets/OCV5-1', 'PATCH')?.label,
+      '/api/board/tickets/:id',
+    )
+    for (const action of [
+      'ready',
+      'claim',
+      'advance',
+      'block',
+      'approve',
+      'reject',
+      'done',
+      'cancel',
+      'comment',
+      'patrol',
+      'move',
+    ]) {
+      assert.equal(
+        matchCommercialContainerApiProxy(`/api/board/tickets/OCV5-1/${action}`, 'POST')?.label,
+        '/api/board/tickets/:id/:action',
+        `board ticket action ${action} must be proxied`,
+      )
+    }
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/tickets/OCV5-1/runs', 'GET')?.label,
+      '/api/board/tickets/:id/runs',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/tickets/OCV5-1/relations', 'GET')?.label,
+      '/api/board/tickets/:id/relations',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/tickets/OCV5-1/relations', 'POST')?.label,
+      '/api/board/tickets/:id/relations',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/tickets/OCV5-1/comments', 'GET')?.label,
+      '/api/board/tickets/:id/comments',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/tickets/OCV5-1/activity', 'GET')?.label,
+      '/api/board/tickets/:id/activity',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/tickets/OCV5-1/timeline', 'GET')?.label,
+      '/api/board/tickets/:id/timeline',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/pipelines', 'GET')?.label,
+      '/api/board/pipelines',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/pipelines', 'POST')?.label,
+      '/api/board/pipelines',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/pipelines/pipe-1', 'GET')?.label,
+      '/api/board/pipelines/:id',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/pipelines/pipe-1', 'PATCH')?.label,
+      '/api/board/pipelines/:id',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/pipelines/pipe-1/stages', 'GET')?.label,
+      '/api/board/pipelines/:id/stages',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/pipelines/pipe-1/stages', 'POST')?.label,
+      '/api/board/pipelines/:id/stages',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/stages/stage-1', 'GET')?.label,
+      '/api/board/stages/:id',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/stages/stage-1', 'PATCH')?.label,
+      '/api/board/stages/:id',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/runs/run-1', 'GET')?.label,
+      '/api/board/runs/:id',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/relations/rel-1', 'DELETE')?.label,
+      '/api/board/relations/:id',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/agents', 'GET')?.label,
+      '/api/board/agents',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/settings', 'GET')?.label,
+      '/api/board/settings',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/settings', 'PATCH')?.label,
+      '/api/board/settings',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/stats/cost', 'GET')?.label,
+      '/api/board/stats/cost',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/templates', 'GET')?.label,
+      '/api/board/templates',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/templates', 'POST')?.label,
+      '/api/board/templates',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/templates/builtin:bug', 'GET')?.label,
+      '/api/board/templates/:id',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/templates/builtin:bug', 'DELETE')?.label,
+      '/api/board/templates/:id',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/templates/builtin:bug/apply', 'POST')?.label,
+      '/api/board/templates/:id/apply',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/board/reports/weekly', 'GET')?.label,
+      '/api/board/reports/weekly',
     )
     assert.equal(matchCommercialContainerApiProxy('/api/tasks', 'POST')?.label, '/api/tasks')
     assert.equal(

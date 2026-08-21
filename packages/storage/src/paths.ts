@@ -106,6 +106,8 @@ export const paths = {
   hubSkillMd: (slug: string) => join(HOME, 'hub', 'skills', slug, 'SKILL.md'),
   // Session search (L2): SQLite FTS5 DB per install (not per agent)
   sessionsDb: join(HOME, 'sessions.db'),
+  // Taskboard (V5 selfhost): independent SQLite, same directory as sessions.db.
+  taskboardDb: join(HOME, 'taskboard.db'),
   // Phase 0.2: durable outbox for server-authored messages that couldn't be
   // written to sessions.db immediately (disk full, SQLite BUSY, crash mid-write).
   // Replayed on gateway startup. JSONL format, one queued write per line.

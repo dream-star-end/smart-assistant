@@ -4,13 +4,13 @@
  * Run: npx tsx --test packages/gateway/src/__tests__/grokAdapter.test.ts
  */
 import assert from 'node:assert/strict'
-import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import path from 'node:path'
+import path, { join } from 'node:path'
 import { describe, test } from 'node:test'
 
 import type { OpenClaudeConfig } from '@openclaude/storage'
-import { GrokAdapter } from '../engine/grokAdapter.js'
+import { GrokAdapter, readLatestGrokNativeHandoff } from '../engine/grokAdapter.js'
 import type { EngineBillingEvent, EngineEvent } from '../engine/engineEvents.js'
 import type { EngineCreateOpts } from '../engine/registry.js'
 
@@ -394,4 +394,27 @@ setInterval(() => {}, 1000)
       await rm(dir, { recursive: true, force: true })
     }
   })
+})
+
+
+test('reads the cleaned native Grok summary carrier from the new checkpoint', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'grok-handoff-'))
+  const sessionId = '11111111-1111-4111-8111-111111111111'
+  const dir = join(root, 'sessions', 'workspace', sessionId, 'compaction_checkpoints')
+  await mkdir(dir, { recursive: true })
+  const started = Date.now()
+  await writeFile(join(dir, 'checkpoint.json'), JSON.stringify({
+    schema_version: 1,
+    compacted_history: [
+      { type: 'user', content: [{ type: 'text', text: 'This session is being continued from a previous conversation that ran out of context.\n\nSummary: stale' }] },
+      { type: 'user', content: [{ type: 'text', text: 'This session is being continued from a previous conversation that ran out of context.\n\nSummary: native grok' }], synthetic_reason: 'compaction_meta' },
+    ],
+  }))
+  try {
+    assert.deepEqual(await readLatestGrokNativeHandoff(root, sessionId, started), {
+      summaryText: 'This session is being continued from a previous conversation that ran out of context.\n\nSummary: native grok',
+      source: 'grok',
+      compactStartedAt: started,
+    })
+  } finally { await rm(root, { recursive: true, force: true }) }
 })

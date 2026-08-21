@@ -57,6 +57,10 @@ export interface TurnDispatchRow {
   acceptedAt: Date | null
   terminalAt: Date | null
   lastAttemptAt: Date | null
+  visibleHead?: unknown | null
+  visibleAt?: number | null
+  producerFencedAt?: Date | null
+  shutdownCtx?: unknown | null
 }
 
 const DISPATCH_COLUMNS = `
@@ -64,7 +68,7 @@ const DISPATCH_COLUMNS = `
   request_hash, billing_request_id, attempt_no, status, outcome, failure_code,
   conflict_reason, resolution, resolved_at, client_notified, owner_id,
   lease_epoch, lease_until, anchor_seq, admitted_at, accepted_at, terminal_at,
-  last_attempt_at`
+  last_attempt_at, visible_head, visible_at, producer_fenced_at, shutdown_ctx`
 
 /** join 场景用(scanOpenSessionGone):client_sessions 与 turn_dispatches 同名列须限定表别名 d。 */
 const DISPATCH_COLUMNS_QUALIFIED = DISPATCH_COLUMNS.split(',')
@@ -96,6 +100,10 @@ interface RawDispatchRow {
   accepted_at: Date | null
   terminal_at: Date | null
   last_attempt_at: Date | null
+  visible_head: unknown | null
+  visible_at: string | null
+  producer_fenced_at: Date | null
+  shutdown_ctx: unknown | null
 }
 
 function mapRow(r: RawDispatchRow): TurnDispatchRow {
@@ -124,6 +132,10 @@ function mapRow(r: RawDispatchRow): TurnDispatchRow {
     acceptedAt: r.accepted_at,
     terminalAt: r.terminal_at,
     lastAttemptAt: r.last_attempt_at,
+    visibleHead: r.visible_head ?? null,
+    visibleAt: r.visible_at === null || r.visible_at === undefined ? null : Number(r.visible_at),
+    producerFencedAt: r.producer_fenced_at ?? null,
+    shutdownCtx: r.shutdown_ctx ?? null,
   }
 }
 
@@ -612,4 +624,63 @@ export async function scanOpenAged(
     [new Date(now - Math.max(0, input.ageMs)), String(Math.max(1, input.limit))],
   )
   return res.rows.map(mapRow)
+}
+
+/** jsonb keys — same names as request_finalize_journal.ctx so operators grep one string. */
+export const DISPATCH_SHUTDOWN_EXITED_AT_KEY = 'gatewayExitedAt'
+export const DISPATCH_SHUTDOWN_EXIT_REASON_KEY = 'gatewayExitReason'
+
+export function dispatchHasShutdownEvidence(
+  row: Pick<TurnDispatchRow, 'shutdownCtx'>,
+): boolean {
+  const ctx = row.shutdownCtx
+  if (!ctx || typeof ctx !== 'object') return false
+  const v = (ctx as Record<string, unknown>)[DISPATCH_SHUTDOWN_EXITED_AT_KEY]
+  return typeof v === 'string' && v.length > 0
+}
+
+/**
+ * 优雅停机:给所有 open dispatch 打一条 dispatch 级证据。
+ * 不改 status / lease(accepted 的 lease 已无活着语义,expireAdmittedLeasesOnShutdown 仍只动 admitted)。
+ */
+export async function markOpenDispatchShutdownEvidence(
+  q: Queryable,
+  input: { now?: Date | number; reason?: string } = {},
+): Promise<number> {
+  const at = input.now === undefined
+    ? new Date()
+    : input.now instanceof Date
+      ? input.now
+      : new Date(input.now)
+  const exitedAt = at.toISOString()
+  const reason = input.reason ?? 'process_shutdown'
+  const res = await q.query(
+    `UPDATE turn_dispatches
+        SET shutdown_ctx = COALESCE(shutdown_ctx, '{}'::jsonb)
+          || jsonb_build_object($1::text, $2::text, $3::text, $4::text)
+      WHERE status IN ('admitted','accepted','rejecting')
+        AND COALESCE(shutdown_ctx->>$1, '') = ''`,
+    [DISPATCH_SHUTDOWN_EXITED_AT_KEY, exitedAt, DISPATCH_SHUTDOWN_EXIT_REASON_KEY, reason],
+  )
+  return res.rowCount ?? 0
+}
+
+/** 容器证明 turn 仍在飞时清掉停机证据,避免下一 tick 误收口。 */
+export async function clearDispatchShutdownEvidence(
+  q: Queryable,
+  dispatchId: string,
+): Promise<number> {
+  if (!dispatchId) return 0
+  const res = await q.query(
+    `UPDATE turn_dispatches
+        SET shutdown_ctx = CASE
+              WHEN shutdown_ctx IS NULL THEN NULL
+              ELSE shutdown_ctx - $2::text - $3::text
+            END
+      WHERE dispatch_id = $1::uuid
+        AND shutdown_ctx IS NOT NULL
+        AND (shutdown_ctx ? $2 OR shutdown_ctx ? $3)`,
+    [dispatchId, DISPATCH_SHUTDOWN_EXITED_AT_KEY, DISPATCH_SHUTDOWN_EXIT_REASON_KEY],
+  )
+  return res.rowCount ?? 0
 }

@@ -39,6 +39,11 @@ import {
   scanMemoryContent,
   paths,
   isManagedAgentRuntime,
+  isMemoryExpired,
+  memoryCalendarDate,
+  parseMemoryFrontmatter,
+  tokenizeCoreMemory,
+  coverageAtLeastHalf,
   readMemoryTurnPolicy,
   reciprocalRankFusion,
   searchSessions,
@@ -53,13 +58,24 @@ import {
 export interface MemoryToolResult {
   content: Array<{ type: 'text'; text: string }>
   isError?: boolean
+  /** Privacy-minimized observability metadata; never rendered to the model. */
+  telemetry?: {
+    outcome: 'hit' | 'no_match' | 'success' | 'denied' | 'error' | 'skipped'
+    policyReason?: string
+    retrievalMode?: 'lexical' | 'semantic' | 'hybrid' | 'bm25' | 'none'
+    resultCount?: number
+    topMatchKey?: string
+  }
 }
 
-export function toolOk(msg: string): MemoryToolResult {
-  return { content: [{ type: 'text', text: msg }] }
+export function toolOk(msg: string, telemetry?: MemoryToolResult['telemetry']): MemoryToolResult {
+  return { content: [{ type: 'text', text: msg }], ...(telemetry ? { telemetry } : {}) }
 }
-export function toolError(msg: string): MemoryToolResult {
-  return { content: [{ type: 'text', text: `error: ${msg}` }], isError: true }
+export function toolError(
+  msg: string,
+  telemetry: MemoryToolResult['telemetry'] = { outcome: 'error' },
+): MemoryToolResult {
+  return { content: [{ type: 'text', text: `error: ${msg}` }], isError: true, telemetry }
 }
 
 /**
@@ -118,24 +134,254 @@ export async function drainPendingEmbeds(ctx: MemoryToolsContext): Promise<void>
   if (pending.length > 0) await Promise.allSettled(pending)
 }
 
+/** Lucene/Okapi BM25; k1/b are the standard defaults. N is 14–100 in-memory Core files. */
+const CORE_BM25_K1 = 1.2
+const CORE_BM25_B = 0.75
+/**
+ * Strong hit: phrase match, or matched query-term characters cover at least
+ * half the query (`matchedCharacters * 2 >= totalTermCharacters`).
+ *
+ * 1/3 (`* 3`) is too loose for CJK: a 3-token query such as 今天天气怎么样
+ * is 6 characters, so a single 2-character token already passes 1/3 and
+ * would admit weather/how-to false hits as "strong". Half-coverage means
+ * that same 2-character token *does* admit 记忆功能优化 (terms 记忆+功能 =
+ * 4 chars) while rejecting weather (2 < 3) and dashi-taskboard (任务 2 << 18).
+ *
+ * Weak fallback uses the same half-coverage floor so a junk query cannot
+ * return "maybe unrelated" hits. In practice the weak band is empty once
+ * strong also uses 50% — kept so a future extra strong constraint can still
+ * fall back without reopening the no-match hole.
+ */
+const WEAK_LEXICAL_FALLBACK_LIMIT = 3
+const WEAK_LEXICAL_FALLBACK_NOTE =
+  'Weak lexical fallback: no match cleared the coverage bar; these top hits may be unrelated — read excerpts before using them.'
+/**
+ * Keep hits within this fraction of the top BM25 score. 0.35 is the upper
+ * end of the usual 0.25–0.35 IR window: a document at 35% of top-1 is still
+ * in the same relevance band (near-duplicate cluster), while generic-token
+ * tails of H3/OCR boilerplate fall off. Sweep 0.2–0.5 is in the eval notes;
+ * 0.35 is the in-window value that also clears E06.
+ */
+const CORE_RELATIVE_SCORE_RATIO = 0.35
+
+function bm25Idf(documentCount: number, df: number): number {
+  return Math.log(1 + (documentCount - df + 0.5) / (df + 0.5))
+}
+
+function bm25TermScore(tf: number, docLength: number, avgdl: number, idf: number): number {
+  if (tf <= 0) return 0
+  const denom = tf + CORE_BM25_K1 * (1 - CORE_BM25_B + CORE_BM25_B * (docLength / avgdl))
+  return idf * ((tf * (CORE_BM25_K1 + 1)) / denom)
+}
+
+type CoreHit = { score: number; path: string; label: string; size: number; snippet: string; matchedCharacters: number }
+
+function applyRelativeScoreCutoff(hits: CoreHit[], ratio: number): CoreHit[] {
+  if (hits.length <= 1) return hits
+  const topScore = hits[0]!.score
+  if (!(topScore > 0)) return hits
+  return hits.filter((hit) => hit.score >= topScore * ratio)
+}
+
+function countSubstring(haystack: string, needle: string): number {
+  if (!needle) return 0
+  let count = 0
+  let from = 0
+  while (from <= haystack.length - needle.length) {
+    const at = haystack.indexOf(needle, from)
+    if (at < 0) break
+    count++
+    from = at + needle.length
+  }
+  return count
+}
+
 async function memorySearchPolicyError(kind: 'core' | 'deep'): Promise<MemoryToolResult | null> {
   if (!isManagedAgentRuntime()) return null
   const sessionKey =
     process.env.OPENCLAUDE_SESSION_KEY?.trim() || process.env.OC_SESSION_KEY?.trim()
-  if (!sessionKey) return toolError('memory search is unavailable without an active turn policy')
+  if (!sessionKey) return toolError('memory search is unavailable without an active turn policy', {
+    outcome: 'denied',
+    policyReason: 'missing_session',
+  })
   const policy = await readMemoryTurnPolicy(sessionKey)
-  if (!policy) return toolError('memory search is unavailable because the active turn policy is missing or expired')
+  if (!policy) return toolError('memory search is unavailable because the active turn policy is missing or expired', {
+    outcome: 'denied',
+    policyReason: 'missing_or_expired',
+  })
   if (!policy.allowed)
-    return toolError(`memory search is disabled for this turn (${policy.reason}); answer from the current request`)
+    return toolError(`memory search is disabled for this turn (${policy.reason}); answer from the current request`, {
+      outcome: 'denied',
+      policyReason: policy.reason,
+    })
   if (
     kind === 'deep' &&
     (policy.reason === 'on_demand_core' || policy.reason === 'inherited_parent_core')
   ) {
     return toolError(
       `session and archival search require explicit continuity or stored-material intent (${policy.reason})`,
+      { outcome: 'denied', policyReason: policy.reason },
     )
   }
   return null
+}
+
+export type StrongCoreHit = { path: string; label: string }
+
+function ttlWarn(message: string): void {
+  process.stderr.write(`[memory-ttl] ${message}\n`)
+}
+
+async function loadAndScoreCoreLexical(args: {
+  agentId: string
+  query: string
+  today?: string
+}): Promise<{
+  documents: CoreMemoryDocument[]
+  lexicalHits: CoreHit[]
+  strongLexicalHits: CoreHit[]
+  totalTermCharacters: number
+}> {
+  const query = args.query.trim()
+  const today = args.today ?? memoryCalendarDate()
+  const q = query.normalize('NFKC').toLocaleLowerCase()
+  const terms = [
+    ...new Set([
+      ...[...new Intl.Segmenter('zh', { granularity: 'word' }).segment(q)]
+        .filter((part) => part.isWordLike)
+        .map((part) => part.segment),
+    ].filter((term) => term.length >= 2 || term === q)),
+  ]
+  const totalTermCharacters = terms.reduce((total, term) => total + term.length, 0)
+  type IndexedCoreDoc = {
+    path: string
+    label: string
+    content: string
+    size: number
+    normalized: string
+    tokens: string[]
+  }
+  const lexicalHits: CoreHit[] = []
+  const strongLexicalHits: CoreHit[] = []
+  const documents: CoreMemoryDocument[] = []
+  const indexed: IndexedCoreDoc[] = []
+  const segmenter = new Intl.Segmenter('zh', { granularity: 'word' })
+  const add = (path: string, label: string, content: string, size: number) => {
+    if (!content.trim() || !scanMemoryContent(content).ok) return
+    const { fm } = parseMemoryFrontmatter(content)
+    if (isMemoryExpired(fm.expires, today, ttlWarn, path)) return
+    documents.push({ path, label, content, size })
+    const normalized = content.normalize('NFKC').toLocaleLowerCase()
+    indexed.push({
+      path,
+      label,
+      content,
+      size,
+      normalized,
+      tokens: tokenizeCoreMemory(normalized, segmenter),
+    })
+  }
+
+  try {
+    const { text } = await readUserProfile()
+    add(paths.sharedUserMd, 'user profile', text, Buffer.byteLength(text))
+  } catch {}
+  const dir = new MemoryDir(args.agentId)
+  for (const meta of await dir.list()) {
+    const read = await dir.read(meta.file)
+    if (read) add(`${dir.dirPath()}/${meta.file}`, `${meta.name} (${meta.type})`, read.content, meta.size)
+  }
+
+  const documentCount = indexed.length
+  const avgdl =
+    documentCount === 0
+      ? 1
+      : Math.max(
+          indexed.reduce((sum, doc) => sum + doc.tokens.length, 0) / documentCount,
+          1,
+        )
+  const df = new Map<string, number>()
+  for (const term of terms) df.set(term, 0)
+  let phraseDf = 0
+  for (const doc of indexed) {
+    const seen = new Set(doc.tokens)
+    for (const term of terms) {
+      if (seen.has(term)) df.set(term, (df.get(term) ?? 0) + 1)
+    }
+    if (q.length >= 2 && doc.normalized.includes(q)) phraseDf++
+  }
+
+  for (const doc of indexed) {
+    const tf = new Map<string, number>()
+    for (const token of doc.tokens) tf.set(token, (tf.get(token) ?? 0) + 1)
+    let score = 0
+    let matchedTerms = 0
+    let matchedCharacters = 0
+    let at = q.length >= 2 ? doc.normalized.indexOf(q) : -1
+    const phraseHit = at >= 0
+    for (const term of terms) {
+      const termTf = tf.get(term) ?? 0
+      if (termTf <= 0) continue
+      matchedTerms++
+      matchedCharacters += term.length
+      score += bm25TermScore(
+        termTf,
+        doc.tokens.length,
+        avgdl,
+        bm25Idf(documentCount, df.get(term) ?? 0),
+      )
+      const i = doc.normalized.indexOf(term)
+      if (i >= 0 && (at < 0 || i < at)) at = i
+    }
+    if (phraseHit) {
+      score += bm25TermScore(
+        countSubstring(doc.normalized, q),
+        doc.tokens.length,
+        avgdl,
+        bm25Idf(documentCount, phraseDf),
+      )
+    }
+    if (matchedTerms === 0 && !phraseHit) continue
+    const from = Math.max(0, at - 180)
+    const excerpt = doc.content.slice(from, from + 600).replace(/\s+/g, ' ').trim()
+    const hit = {
+      score,
+      path: doc.path,
+      label: doc.label,
+      size: doc.size,
+      snippet: `${from > 0 ? '…' : ''}${excerpt}${from + 600 < doc.content.length ? '…' : ''}`,
+      matchedCharacters,
+    }
+    lexicalHits.push(hit)
+    if (phraseHit || coverageAtLeastHalf(matchedCharacters, totalTermCharacters)) {
+      strongLexicalHits.push(hit)
+    }
+  }
+  lexicalHits.sort((a, b) => b.score - a.score || a.path.localeCompare(b.path))
+  strongLexicalHits.sort((a, b) => b.score - a.score || a.path.localeCompare(b.path))
+  return { documents, lexicalHits, strongLexicalHits, totalTermCharacters }
+}
+
+/**
+ * Dedup probe for the auto-write path. Reuses the same strong-hit rule as
+ * core-search (phrase match, or matched query-term characters covering at
+ * least half the query via CORE_COVERAGE_NUMERATOR). Expired entries are
+ * already dropped by the loader, so a lapsed auto memory cannot block a new write.
+ */
+export async function hasStrongCoreMemoryHit(args: {
+  agentId: string
+  query: string
+  today?: string
+}): Promise<{ hit: boolean; path?: string; label?: string }> {
+  const query = args.query.trim()
+  if (!query) return { hit: false }
+  const scored = await loadAndScoreCoreLexical({
+    agentId: args.agentId,
+    query,
+    today: args.today,
+  })
+  const top = scored.strongLexicalHits[0]
+  return top ? { hit: true, path: top.path, label: top.label } : { hit: false }
 }
 
 export async function handleCoreSearch(args: {
@@ -143,6 +389,8 @@ export async function handleCoreSearch(args: {
   query: string
   limit?: number
   offset?: number
+  /** Test seam: freeze the TTL calendar day (YYYY-MM-DD). */
+  today?: string
   /** Test seam for the authenticated master relay; omitted by the CLI. */
   semanticOptions?: CoreMemorySemanticOptions
 }): Promise<MemoryToolResult> {
@@ -157,69 +405,39 @@ export async function handleCoreSearch(args: {
   if (!Number.isInteger(offset) || offset < 0)
     return toolError('core-search --offset must be a non-negative integer')
 
-  const q = query.normalize('NFKC').toLocaleLowerCase()
-  const terms = [
-    ...new Set([
-      ...[...new Intl.Segmenter('zh', { granularity: 'word' }).segment(q)]
-        .filter((part) => part.isWordLike)
-        .map((part) => part.segment),
-    ].filter((term) => term.length >= 2 || term === q)),
-  ]
-  const totalTermCharacters = terms.reduce((total, term) => total + term.length, 0)
-  type CoreHit = { score: number; path: string; label: string; size: number; snippet: string }
-  const lexicalHits: CoreHit[] = []
-  const strongLexicalHits: CoreHit[] = []
-  const documents: CoreMemoryDocument[] = []
-  const add = (path: string, label: string, content: string, size: number) => {
-    if (!content.trim() || !scanMemoryContent(content).ok) return
-    documents.push({ path, label, content, size })
-    const normalized = content.normalize('NFKC').toLocaleLowerCase()
-    let at = normalized.indexOf(q)
-    let score = at >= 0 ? 100 : 0
-    let matchedTerms = 0
-    let matchedCharacters = 0
-    for (const term of terms) {
-      const i = normalized.indexOf(term)
-      if (i >= 0) {
-        score += 10
-        matchedTerms++
-        matchedCharacters += term.length
-        if (at < 0 || i < at) at = i
-      }
-    }
-    if (score === 0) return
-    const from = Math.max(0, at - 180)
-    const excerpt = content.slice(from, from + 600).replace(/\s+/g, ' ').trim()
-    const hit = {
-      score,
-      path,
-      label,
-      size,
-      snippet: `${from > 0 ? '…' : ''}${excerpt}${from + 600 < content.length ? '…' : ''}`,
-    }
-    lexicalHits.push(hit)
-    if (score >= 100 || (matchedTerms >= 2 && matchedCharacters * 3 >= totalTermCharacters)) {
-      strongLexicalHits.push(hit)
-    }
-  }
+  const { documents, lexicalHits, strongLexicalHits, totalTermCharacters } =
+    await loadAndScoreCoreLexical({
+      agentId: args.agentId,
+      query,
+      today: args.today,
+    })
 
-  try {
-    const { text } = await readUserProfile()
-    add(paths.sharedUserMd, 'user profile', text, Buffer.byteLength(text))
-  } catch {}
-  const dir = new MemoryDir(args.agentId)
-  for (const meta of await dir.list()) {
-    const read = await dir.read(meta.file)
-    if (read) add(`${dir.dirPath()}/${meta.file}`, `${meta.name} (${meta.type})`, read.content, meta.size)
+  // 词法强命中时语义不会改善结果，只作为失手时的 fallback，避免无谓的 embedding 往返。
+  const semanticFiles =
+    strongLexicalHits.length === 0
+      ? await rankCoreMemorySemantically(query, documents, args.semanticOptions)
+      : null
+  // Admit by half-coverage (or whole-query phrase). If nothing clears that bar,
+  // only fall back when a weak hit still covers half the query characters —
+  // otherwise return No match rather than "maybe unrelated" junk.
+  let weakLexicalFallback = false
+  let hits: CoreHit[]
+  if (semanticFiles === null) {
+    if (strongLexicalHits.length > 0) hits = strongLexicalHits
+    else {
+      const weakEligible = lexicalHits.filter((hit) =>
+        coverageAtLeastHalf(hit.matchedCharacters, totalTermCharacters),
+      )
+      if (weakEligible.length > 0) {
+        hits = weakEligible.slice(0, WEAK_LEXICAL_FALLBACK_LIMIT)
+        weakLexicalFallback = true
+      } else hits = []
+    }
+    hits = applyRelativeScoreCutoff(hits, CORE_RELATIVE_SCORE_RATIO)
+  } else {
+    // 强命中为空才会到这里；语义空数组则保持空结果，不回落到弱词法。
+    hits = strongLexicalHits
   }
-  lexicalHits.sort((a, b) => b.score - a.score || a.path.localeCompare(b.path))
-  strongLexicalHits.sort((a, b) => b.score - a.score || a.path.localeCompare(b.path))
-
-  const semanticFiles = await rankCoreMemorySemantically(query, documents, args.semanticOptions)
-  // Preserve keyword-only availability when the local ranker is unavailable.
-  // When it did run, require meaningful lexical coverage so a lone generic
-  // word cannot override an explicit semantic no-match.
-  let hits = semanticFiles === null ? lexicalHits : strongLexicalHits
   if (semanticFiles?.length) {
     const documentByPath = new Map(documents.map((document) => [document.path, document]))
     const lexicalByPath = new Map(strongLexicalHits.map((hit) => [hit.path, hit]))
@@ -240,23 +458,42 @@ export async function handleCoreSearch(args: {
         label: document.label,
         size: document.size,
         snippet: `${from > 0 ? '…' : ''}${excerpt}${from + 600 < document.content.length ? '…' : ''}`,
+        matchedCharacters: 0,
       }]
     })
   }
   const page = hits.slice(offset, offset + limit)
-  if (hits.length === 0) return toolOk(`No safe Core memories match "${query}".`)
+  const retrievalMode = semanticFiles === null ? 'lexical' : 'semantic'
+  if (hits.length === 0) return toolOk(`No safe Core memories match "${query}".`, {
+    outcome: 'no_match',
+    retrievalMode,
+    resultCount: 0,
+  })
   if (!page.length)
     return toolOk(
       `Found ${hits.length} safe Core matches for "${query}", but offset ${offset} is past the last result.`,
+      {
+        outcome: 'hit',
+        retrievalMode,
+        resultCount: hits.length,
+        topMatchKey: hits[0]?.path,
+      },
     )
-  const lines = [`Found ${hits.length} safe Core matches for "${query}". Showing ${offset + 1}-${offset + page.length}:`, '']
+  const lines = [`Found ${hits.length} safe Core matches for "${query}". Showing ${offset + 1}-${offset + page.length}:`]
+  if (weakLexicalFallback) lines.push(WEAK_LEXICAL_FALLBACK_NOTE)
+  lines.push('')
   page.forEach((hit, i) => {
     lines.push(`[${offset + i + 1}] ${hit.label}\npath: ${hit.path}\nsize: ${hit.size} bytes\nexcerpt: ${hit.snippet}`, '')
   })
   if (offset + page.length < hits.length)
     lines.push(`More matches available: rerun with --offset ${offset + page.length}.`)
   lines.push('Excerpts are bounded; use Read with offset/limit on the path for complete content.')
-  return toolOk(lines.join('\n'))
+  return toolOk(lines.join('\n'), {
+    outcome: 'hit',
+    retrievalMode,
+    resultCount: hits.length,
+    topMatchKey: hits[0]?.path,
+  })
 }
 
 // ── memory (Core) 已退役 ──
@@ -291,7 +528,11 @@ export async function handleSessionSearch(
 
   if (hits.length === 0) {
     const scope = args.agentId ? ` (agent: ${args.agentId})` : ''
-    return { content: [{ type: 'text', text: `No past sessions match "${args.query}"${scope}.` }] }
+    return toolOk(`No past sessions match "${args.query}"${scope}.`, {
+      outcome: 'no_match',
+      retrievalMode: ctx.embeddingProvider ? 'hybrid' : 'bm25',
+      resultCount: 0,
+    })
   }
   const scope = args.agentId ? ` (agent: ${args.agentId})` : ''
   const mode = ctx.embeddingProvider ? 'hybrid' : 'BM25'
@@ -322,7 +563,12 @@ export async function handleSessionSearch(
       lines.push('')
     }
   }
-  return { content: [{ type: 'text', text: lines.join('\n') }] }
+  return toolOk(lines.join('\n'), {
+    outcome: 'hit',
+    retrievalMode: ctx.embeddingProvider ? 'hybrid' : 'bm25',
+    resultCount: hits.length,
+    topMatchKey: hits[0]?.sessionId,
+  })
 }
 
 // ── archival_add (Archival: unlimited FTS5-searchable long-term store) ──
@@ -364,7 +610,12 @@ export async function handleArchivalAdd(
   }
 
   const count = await archivalCount(ctx.agentId)
-  return toolOk(`Stored in archival memory (id=${id}). Total entries: ${count}`)
+  return toolOk(`Stored in archival memory (id=${id}). Total entries: ${count}`, {
+    outcome: 'success',
+    retrievalMode: 'none',
+    resultCount: 1,
+    topMatchKey: id,
+  })
 }
 
 // ── archival_search (Archival: hybrid BM25 + vector + RRF) ──
@@ -379,7 +630,11 @@ export async function handleArchivalSearch(
   }
   const limit = args.limit ?? 5
   const results = await hybridArchivalSearch(ctx.agentId, args.query, ctx.embeddingProvider, limit)
-  if (results.length === 0) return toolOk(`No archival entries match "${args.query}".`)
+  if (results.length === 0) return toolOk(`No archival entries match "${args.query}".`, {
+    outcome: 'no_match',
+    retrievalMode: ctx.embeddingProvider ? 'hybrid' : 'bm25',
+    resultCount: 0,
+  })
 
   // Track access for lifecycle (non-blocking)
   recordAccess(results.map((r) => r.id)).catch(() => {})
@@ -392,7 +647,12 @@ export async function handleArchivalSearch(
     const rankInfo = ranks.length > 0 ? ` [${ranks.join(', ')}]` : ''
     return `[${i + 1}] id=${r.id} tags=${r.tags || '(none)'}${rankInfo}\n${r.content}`
   })
-  return toolOk(`Found ${results.length} archival entries (${mode}):\n\n${lines.join('\n\n---\n\n')}`)
+  return toolOk(`Found ${results.length} archival entries (${mode}):\n\n${lines.join('\n\n---\n\n')}`, {
+    outcome: 'hit',
+    retrievalMode: ctx.embeddingProvider ? 'hybrid' : 'bm25',
+    resultCount: results.length,
+    topMatchKey: results[0]?.id,
+  })
 }
 
 // ── archival_delete ──
@@ -419,5 +679,10 @@ export async function handleArchivalDelete(
       process.stderr.write(`[oc-memory] vector delete failed for ${args.id}: ${err?.message}\n`)
     }
   }
-  return toolOk(`Deleted archival entry ${args.id}.`)
+  return toolOk(`Deleted archival entry ${args.id}.`, {
+    outcome: 'success',
+    retrievalMode: 'none',
+    resultCount: 1,
+    topMatchKey: args.id,
+  })
 }

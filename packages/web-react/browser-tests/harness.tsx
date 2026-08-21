@@ -1628,13 +1628,18 @@ createRoot(document.getElementById("codex-density-root")!).render(
             id: "density-active",
             title: "密度验收活跃会话",
             ownerUserId: DENSITY_USER.id,
+            createdAt: Date.now() - 8 * 60_000,
+            lastAt: Date.now(),
             updatedAt: new Date().toISOString(),
             messageCount: 3,
+            lastMessagePreview: "浏览器契约：摘要不应显示",
           },
           {
             id: "density-idle",
             title: "密度验收空闲会话",
             ownerUserId: DENSITY_USER.id,
+            createdAt: Date.now() - 8 * 60_000,
+            lastAt: Date.now(),
             updatedAt: new Date().toISOString(),
             messageCount: 1,
           },
@@ -1649,7 +1654,11 @@ createRoot(document.getElementById("codex-density-root")!).render(
         onOpenMarketplace={() => {}}
         onOpenTutorial={() => {}}
         onOpenOrg={() => {}}
+        onOpenAccount={() => {}}
+        onOpenMediaTasks={() => {}}
         showAdmin
+        theme="light"
+        onCycleTheme={() => {}}
       />
     </div>
   </StrictMode>,

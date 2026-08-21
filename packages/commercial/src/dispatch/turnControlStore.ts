@@ -40,6 +40,24 @@ export interface ClaimedTurnControl {
   deliveryAttempt: number
 }
 
+/** Legacy CCB/Codex permission window when the frame omits expiresAt. */
+export const DEFAULT_PERMISSION_TTL_MS = 30 * 60_000
+/** Cap so a bogus/future-skewed frame cannot keep a prompt pending forever. */
+export const MAX_PERMISSION_TTL_MS = 24 * 60 * 60_000
+
+/** Prefer the frame-carried expiry (detached ask_user: 24h). Fall back to
+ *  the historical 30-minute window for old gateways that omit expiresAt. */
+export function resolvePermissionExpiresAt(
+  frameExpiresAt: unknown,
+  nowMs: number = Date.now(),
+): Date {
+  if (typeof frameExpiresAt === 'number' && Number.isFinite(frameExpiresAt)) {
+    const capped = Math.min(frameExpiresAt, nowMs + MAX_PERMISSION_TTL_MS)
+    if (capped > nowMs) return new Date(capped)
+  }
+  return new Date(nowMs + DEFAULT_PERMISSION_TTL_MS)
+}
+
 export class TurnControlConflictError extends Error {
   constructor(readonly code: 'CONTROL_ID_CONFLICT' | 'PERMISSION_NOT_PENDING' | 'PERMISSION_CONFLICT') {
     super(code)

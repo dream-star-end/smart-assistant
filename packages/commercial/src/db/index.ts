@@ -27,6 +27,10 @@ export interface CreatePoolOptions {
   connectionTimeoutMillis?: number;
   /** 单 statement 超时,ms。 */
   statementTimeoutMs?: number;
+  /** idle-in-transaction 超时,ms。物化池需要高于默认 60s。 */
+  idleInTransactionSessionTimeoutMs?: number;
+  /** pg application_name。 */
+  applicationName?: string;
 }
 
 function positiveInt(name: string, v: number): number {
@@ -51,8 +55,8 @@ export function createPool(opts: CreatePoolOptions = {}): Pool {
     // BEGIN 后卡在非 DB await 的持锁事务上限:statement_timeout 只管单条语句,管不住
     // "事务开着不发语句"(如 Tx 内 await 外部 IO 挂起)——那会长期持有行锁/advisory lock。
     // v3+v5 共库(池合计可达 100 连接),必须有第二道防线。60s 远大于任何正常事务。
-    idle_in_transaction_session_timeout: 60_000,
-    application_name: "openclaude-commercial",
+    idle_in_transaction_session_timeout: opts.idleInTransactionSessionTimeoutMs ?? 60_000,
+    application_name: opts.applicationName ?? "openclaude-commercial",
   };
   const p = new Pool(cfg);
   // 防止未处理的 pool 级错误静默:转换为明确日志 + process 不崩。

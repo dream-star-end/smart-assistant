@@ -179,7 +179,8 @@ If a worktree is locked or contains unmerged work, stop and report it instead of
 Workflow:
 1. `cd /opt/openclaude/openclaude-dev` (git worktree on a feature branch) — code changes happen here, **never** in `/opt/openclaude/openclaude/` directly
 2. Dev instance config at `/root/.openclaude-dev/openclaude.json` with MANDATORY isolation:
-   - gateway port 18790 (prod = 18789)
+   - gateway port 18798 (prod = 18789). 18790 曾是 dev 端口，2026-08-13 起被同机的
+     V5 自用实例 (`openclaude-v5-selfhost.service`) 占用，dev 已让位到 18798
    - `gateway.bind = "127.0.0.1"` — loopback only, never bind 0.0.0.0 (don't expose dev on public IP)
    - `channels.telegram.enabled = false` — shared bot token triggers double getUpdates 409 Conflict and kills prod Telegram bot (historical incident)
    - `channels.wechat.enabled = false` — same reason

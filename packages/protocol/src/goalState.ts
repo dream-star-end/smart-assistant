@@ -30,7 +30,7 @@ export interface GoalStateSnapshot {
 export interface DurableGoalUsageRecord {
   runId: string
   agentId: string
-  engine: 'ccb' | 'codex' | 'grok' | 'cursor'
+  engine: 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode'
   inputTokens: number
   outputTokens: number
   cacheReadTokens: number

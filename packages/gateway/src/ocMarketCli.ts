@@ -383,6 +383,12 @@ function fileArg(flags: Record<string, string>, key: string): string | undefined
 
 async function main(): Promise<void> {
   const [cmd, ...rest] = process.argv.slice(2)
+  if (cmd === 'help' || cmd === '--help' || cmd === '-h') {
+    process.stdout.write(
+      'usage: oc-market <search|detail|installed|install|uninstall|publish-skill|publish-agent> ...\n',
+    )
+    process.exit(0)
+  }
   const { positional, flags } = parseFlags(rest)
   const out = (o: unknown) => process.stdout.write(`${JSON.stringify(o, null, 2)}\n`)
 

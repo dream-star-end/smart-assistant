@@ -1785,7 +1785,7 @@ image_grok="$(docker image inspect --format '{{ index .Config.Labels "oc.runtime
 actual_codex="$(docker run --rm --entrypoint codex "$target_image" --version)"
 [[ "$actual_codex" == "codex-cli $image_codex" ]] || { echo 'FATAL: image codex label/binary mismatch' >&2; exit 1; }
 actual_grok="$(docker run --rm --entrypoint grok-native "$target_image" --version)"
-[[ "$actual_grok" == grok\ 1.0.3\ * ]] || { echo 'FATAL: image Grok binary mismatch' >&2; exit 1; }
+[[ "$actual_grok" == grok\ 1.0.5\ * ]] || { echo 'FATAL: image Grok binary mismatch' >&2; exit 1; }
 
 dburl="$(grep '^DATABASE_URL=' "$env_file" | tail -n 1 | cut -d= -f2-)"
 [[ -n "$dburl" ]] || { echo 'FATAL: DATABASE_URL missing' >&2; exit 1; }
@@ -3227,7 +3227,7 @@ build_release() {
   # 都从 staging 读。
   if [[ "$WITH_DIST" == 1 ]]; then
     echo "── web official build @ staging(pinned $short_sha,不读共用工作树)──" >&2
-    if ! ssh "$KL_HOST" "set -e; cd '$staging' && npm run build --workspace packages/web-react >/dev/null 2>&1"; then
+    if ! ssh "$KL_HOST" "set -e; cd '$staging' && VITE_TASKBOARD_ENABLED=0 npm run build --workspace packages/web-react >/dev/null 2>&1"; then
       echo "✗ staging web official build 失败" >&2; ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1; fi
   else
     if ! ssh "$KL_HOST" "set -e
@@ -5160,8 +5160,8 @@ assert_target_runtime_image_ready() {
     return 1
   }
   actual_grok="$(ssh "$KL_HOST" "docker run --rm --entrypoint grok-native '$TARGET_RUNTIME_IMAGE' --version")" || return 1
-  [[ "$actual_grok" == grok\ 1.0.3\ * ]] || {
-    echo "✗ target runtime image Grok binary=$actual_grok,expected='grok 1.0.3 (...)'" >&2
+  [[ "$actual_grok" == grok\ 1.0.5\ * ]] || {
+    echo "✗ target runtime image Grok binary=$actual_grok,expected='grok 1.0.5 (...)'" >&2
     return 1
   }
   [[ "$source_commit" =~ ^[0-9a-f]{40}$ ]] \
@@ -5620,7 +5620,7 @@ snapshot_and_sync_source() {
 DIST_BUILD_ID=""
 build_and_sync_dist() {
   echo "── web official build(tsc + vite) ──"
-  run "(cd '$REPO_ROOT' && npm run build --workspace packages/web-react)"
+  run "(cd '$REPO_ROOT' && VITE_TASKBOARD_ENABLED=0 npm run build --workspace packages/web-react)"
   local dist="$REPO_ROOT/packages/web-react/dist"
   if [[ "$DRY" != 1 ]]; then
     DIST_BUILD_ID="$(grep -o 'name="oc-build" content="[0-9a-f]\{8,32\}"' "$dist/index.html" | grep -o '[0-9a-f]\{8,32\}' | head -1)"
@@ -5721,7 +5721,7 @@ smoke() {
   #     分别收敛生图旅程与临时 GitHub workspace；只允许 v5 leader 启动。
   #   sessionsGcSweep(P2 会话权威迁 PG:usage 聚合 pending/map 老化 GC,advisory lease fencing,
   #     仅 OC_SESSIONS_STORE=pg 时启动——白名单允许≠必然存在。RFC-v5-sessions-pg D3)
-  allowed="subscriptionRollover accountSlotReaper researchJobs codexRefresh codexDriftReconciler marketplaceAiReview providerHealth sessionsGcSweep incidentSnapshot"
+  allowed="subscriptionRollover accountSlotReaper researchJobs codexRefresh codexDriftReconciler marketplaceAiReview providerHealth sessionsGcSweep incidentSnapshot cursorAuthSync"
   allowed="$allowed idleSweep volumeGc orphanReconcile migrationReconcile healthPoller containerEvents alert refreshEventsSweep auditRetentionSweep imageUsageSweep cooldownRecovery pendingOrdersExpirer finalizeReconciler turnDispatchReconciler onboarding inboxEmail cronWake incidentReconciler incidentSweeper connectorSweeper knowledgePlanetAutomation githubWorkspaceSweeper wecomAlert userNoticeApproval mediaGeneration"
   bad=""
   IFS=',' read -ra _sarr <<<"$scheds"
@@ -7187,19 +7187,19 @@ activate_staged_inner() {
     [[ "$image_commit" =~ ^[0-9a-f]{7,40}$ && "$expected_full_commit" == "$image_commit"* ]] || {
       echo "✗ runtime image source_commit=$image_commit is not target commit $expected_full_commit 的前缀" >&2; exit 1;
     }
-    [[ "$image_codex_version" == "0.144.0" ]] || {
-      echo "✗ runtime image codex label=$image_codex_version,expected=0.144.0" >&2; exit 1;
+    [[ "$image_codex_version" == "0.149.0" ]] || {
+      echo "✗ runtime image codex label=$image_codex_version,expected=0.149.0" >&2; exit 1;
     }
     [[ "$image_include_grok" == 1 ]] || {
       echo "✗ runtime image 缺 official Grok binary label(oc.runtime.include_grok=1)" >&2; exit 1;
     }
     actual_codex_version="$(ssh "$KL_HOST" "docker run --rm --entrypoint codex '$runtime_image' --version")"
-    [[ "$actual_codex_version" == "codex-cli 0.144.0" ]] || {
-      echo "✗ runtime image codex binary=$actual_codex_version,expected='codex-cli 0.144.0'" >&2; exit 1;
+    [[ "$actual_codex_version" == "codex-cli 0.149.0" ]] || {
+      echo "✗ runtime image codex binary=$actual_codex_version,expected='codex-cli 0.149.0'" >&2; exit 1;
     }
     actual_grok_version="$(ssh "$KL_HOST" "docker run --rm --entrypoint grok-native '$runtime_image' --version")"
-    [[ "$actual_grok_version" == grok\ 1.0.3\ * ]] || {
-      echo "✗ runtime image Grok binary=$actual_grok_version,expected='grok 1.0.3 (...)'" >&2; exit 1;
+    [[ "$actual_grok_version" == grok\ 1.0.5\ * ]] || {
+      echo "✗ runtime image Grok binary=$actual_grok_version,expected='grok 1.0.5 (...)'" >&2; exit 1;
     }
     echo "  ✓ runtime image source=$image_commit,codex=$actual_codex_version,grok=$actual_grok_version"
   fi

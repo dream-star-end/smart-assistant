@@ -47,6 +47,10 @@ import { verifyAccess, JwtError, type AccessClaims } from "../auth/jwt.js";
 import { ConnectionRegistry, type Conn } from "./connections.js";
 import type { Logger } from "../logging/logger.js";
 import { recordTurnTrace, updateTurnTraceDispatch } from "./turnTraces.js";
+import {
+  extractFirstVisibleAttribution,
+  recordTurnFirstVisible,
+} from "./turnPerformance.js";
 import { GoalStateError } from "../goal/goalStateService.js";
 import { isInMaintenance } from "../middleware/maintenanceMode.js";
 import type { NodeAgentTarget } from "../compute-pool/nodeAgentClient.js";
@@ -90,8 +94,25 @@ import {
   serializeVerificationSponsorshipSnapshot,
 } from "../billing/verificationSponsorship.js";
 import type { TokenUsage } from "../billing/calculator.js";
+import { settleCursorExternalUsage } from "../billing/cursorExternalSettle.js";
+import {
+  publishZcodeCatalogSettle,
+  settleZcodeCatalogUsage,
+} from "../billing/zcodeCatalogSettle.js";
+import {
+  abortInsertedZcodeAudit,
+  applyZcodeFinalizeOutcome,
+  closePendingZcodeAudits,
+  closeZcodeAuditWithRetry,
+  insertPendingZcodeAudit,
+  reconcileStaleZcodeAudits,
+  rememberZcodePending,
+  zcodeAdmissionAbortTerminal,
+  zcodeCleanupTerminal,
+} from "../billing/zcodeExternalAudit.js";
 import { recordProductFrictionEvent } from "../productFriction/events.js";
 import { maybeUpdateAccountQuotaCodex } from "../account-pool/quota.js";
+import { applyLearnedCursorQuota, resolveUsedCursorAccountId } from "../account-pool/cursorMaterializer.js";
 import { OutboundRingBuffer, DEFAULT_RING_CONFIG } from "@openclaude/gateway";
 import {
   AUTOMATIC_TURN_RETRY_MAX,
@@ -105,6 +126,7 @@ import {
   isCodexEngineModel,
   isGrokEngineModel,
   isCursorEngineModel,
+  isZcodeEngineModel,
   isClientMessageId,
   formatMessageReplyPrompt,
   modelHistorySemanticRole,
@@ -130,6 +152,7 @@ import {
   casAdmittedToAccepted,
   casToManualReconcile,
   casToTerminal,
+  getDispatchByLogicalKey,
   heartbeatLease,
   DISPATCH_LEASE_TTL_MS,
   DISPATCH_LEASE_HEARTBEAT_MS,
@@ -140,6 +163,7 @@ import {
   markTurnControlReceipt,
   persistPermissionAuthority,
   releaseTurnControlForRetry,
+  resolvePermissionExpiresAt,
   TurnControlConflictError,
 } from "../dispatch/turnControlStore.js";
 import {
@@ -182,6 +206,21 @@ const OUTPAINT_ASPECTS = new Set(["16:9", "4:3", "9:16", "3:4", "1:1"]);
 const CONTROL_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
 const isControlId = (value: unknown): value is string =>
   typeof value === "string" && CONTROL_ID_RE.test(value);
+
+/** Leftover live-journal frames (no cmid) stay durable but never ride the hot WS. */
+export function isLeftoverHotWsFrame(wire: { type?: unknown; clientMessageId?: unknown }): boolean {
+  if (isClientMessageId(wire.clientMessageId)) return false;
+  return wire.type === "outbound.message" || wire.type === "outbound.error";
+}
+
+function parseLeftoverHotWsPayload(data: string): boolean {
+  try {
+    const parsed = JSON.parse(data) as { type?: unknown; clientMessageId?: unknown };
+    return isLeftoverHotWsFrame(parsed);
+  } catch {
+    return false;
+  }
+}
 
 /** Strictly recognize a server-completed image-edit envelope before bypassing
  * ordinary Codex precheck/journal plumbing. A loose `imageEdit` presence
@@ -257,6 +296,11 @@ export const CLOSE_BRIDGE = {
  * 导出供 index.ts 装配 createTunnelContainerSocket 时复用,避免两处 magic number 漂移。 */
 export const DEFAULT_MAX_FRAME_BYTES = 448 * 1024 * 1024;
 
+/** 单条 hello 最多查这么多在飞候选。peers 数组来自客户端,无此上限可把 PG 打满。 */
+const HELLO_TERMINAL_NOTIFY_MAX_CANDIDATES = 8;
+/** clientMessageId 长度硬顶。先挡住无界字符串(单帧上限 448 MiB),再跑格式校验。 */
+const HELLO_TERMINAL_NOTIFY_MAX_CLIENT_MESSAGE_ID_LEN = 200;
+
 export const PROMPT_QUEUE_DISPATCH_REQUEST_TYPE = "outbound.prompt_queue.dispatch_request";
 export const PROMPT_QUEUE_DISPATCH_RESULT_TYPE = "outbound.prompt_queue.dispatch_result";
 export const PROMPT_QUEUE_DISPATCH_CANCEL_TYPE = "outbound.prompt_queue.dispatch_cancel";
@@ -281,6 +325,7 @@ export interface PromptQueueDispatchRequest {
     requestedExecution: {
       agentId: string;
       model?: string;
+      modelSwitchId?: string;
       effortLevel?: string | null;
       teamMode?: boolean;
     };
@@ -356,9 +401,10 @@ export function parsePromptQueueDispatchRequest(value: unknown): PromptQueueDisp
     !isPlainRecord(item.content) || !isPlainRecord(item.requestedExecution)
   ) return null;
   const execution = item.requestedExecution;
-  if (!hasOnlyKeys(execution, ["agentId", "model", "effortLevel", "teamMode"])) return null;
+  if (!hasOnlyKeys(execution, ["agentId", "model", "modelSwitchId", "effortLevel", "teamMode"])) return null;
   if (execution.agentId !== owner.agentId) return null;
   if (execution.model !== undefined && typeof execution.model !== "string") return null;
+  if (execution.modelSwitchId !== undefined && (typeof execution.modelSwitchId !== "string" || !/^[A-Za-z0-9:_-]{8,128}$/.test(execution.modelSwitchId))) return null;
   if (execution.effortLevel !== undefined && execution.effortLevel !== null && typeof execution.effortLevel !== "string") return null;
   if (execution.teamMode !== undefined && typeof execution.teamMode !== "boolean") return null;
   return value as unknown as PromptQueueDispatchRequest;
@@ -465,15 +511,6 @@ const DEFAULT_CONTAINER_CONNECT_TIMEOUT_MS = 5_000;
  * server-side claim is still live. The timeout also becomes a cancellation
  * fence: a late async preparation result is never allowed to start a turn. */
 const DEFAULT_PROMPT_QUEUE_PREPARATION_TIMEOUT_MS = 20_000;
-
-/**
- * Transient outbound persist failures poison later sequence numbers so a
- * reconnect can replay the exact failed seq from the container ring.
- * Current containers do not replay already-advanced seqs, so a poisoned
- * namespace would otherwise stick until process restart. After this TTL
- * the missing seq is skipped and the current frame is allowed through.
- */
-export const OUTBOUND_PERSIST_FAILED_SEQ_TTL_MS = 15_000;
 
 /** ConnectionRegistry 默认 maxPerUser(沿用 connections.ts 的 3)。 */
 const DEFAULT_MAX_PER_USER = 3;
@@ -1030,8 +1067,6 @@ export interface UserChatBridgeDeps {
     frameSeq: number;
     payload: string;
   }) => Promise<void>;
-  /** Internal failed-seq poison TTL; override only for focused tests. */
-  outboundPersistFailedSeqTtlMs?: number;
   /** durable turn dispatch 受理面(RFC-v5-durable-turn-dispatch §2.1)。注入且容器 attest
    * DURABLE_TURN_DISPATCH_CAPABILITY 时,替代 persistMasterUserMessage:单事务幂等 append
    * user 行 + UPSERT dispatch 冲突表裁定(受理即拥有 I1)。未注入 / 无 capability → legacy。 */
@@ -1079,6 +1114,15 @@ export interface UserChatBridgeDeps {
   expireCodexRoute?: (token: string) => Promise<void>;
   /** Expire and release the exact durable Grok subscription lease. */
   releaseGrokRouteLease?: (accountId: bigint, slotId: string) => Promise<void>;
+  /** Mint a short-lived opaque ZCode Anthropic relay bound to container/user/request/model. */
+  mintZcodeRoute?: (args: {
+    containerId: number;
+    userId: bigint;
+    requestId: string;
+    modelId: string;
+  }) => Promise<{ token: string; baseUrl: string }>;
+  /** Drop a minted ZCode relay token after the turn settles or aborts. */
+  expireZcodeRoute?: (token: string) => void | Promise<void>;
   /**
    * Trusted UUID of the compute host running this bridge. Cursor credentials
    * are mounted only by that host's local supervisor, so Cursor dispatch must
@@ -1556,16 +1600,11 @@ export async function isCursorContainerOnSelfHost(
   return eligible.rowCount === 1;
 }
 
-// ---------- 主入口 ----------------------------------------------------------
+type OutboundPersistQueueState = {
+  tail: Promise<void>;
+  failedSeq: number | null;
+};
 
-/**
- * Duck-type marker for permanent live-frame journal conflicts.
- *
- * Contract: persistOutboundFrame (injected; typically persistGatewayLiveFrame)
- * rejects with `{ liveFramePermanentConflict: true }` for identity / immutable
- * payload conflicts. This file must not import the db module — check the
- * flag, never the error message string.
- */
 function isPermanentLiveFrameConflict(error: unknown): boolean {
   return (
     typeof error === "object" &&
@@ -1573,6 +1612,105 @@ function isPermanentLiveFrameConflict(error: unknown): boolean {
     (error as { liveFramePermanentConflict?: unknown }).liveFramePermanentConflict === true
   );
 }
+
+/**
+ * Serializes durable outbound writes per container/session namespace.
+ *
+ * A failure remains a monotonic barrier while at least one browser bridge is
+ * attached to that namespace. Once the final browser bridge detaches, the
+ * failed state is retired after its current tail drains, so a later reconnect
+ * is not permanently poisoned by a failure from an earlier connection.
+ */
+export class _OutboundPersistQueueCoordinator {
+  private readonly queues = new Map<string, OutboundPersistQueueState>();
+  private readonly consumerCounts = new Map<string, number>();
+
+  retain(key: string): void {
+    this.consumerCounts.set(key, (this.consumerCounts.get(key) ?? 0) + 1);
+  }
+
+  release(key: string): void {
+    const count = this.consumerCounts.get(key) ?? 0;
+    if (count > 1) {
+      this.consumerCounts.set(key, count - 1);
+      return;
+    }
+    this.consumerCounts.delete(key);
+    const state = this.queues.get(key);
+    if (state !== undefined) this.scheduleCleanup(key, state, state.tail);
+  }
+
+  enqueue(
+    key: string,
+    frameSeq: number,
+    work: () => Promise<void>,
+    onFailure: (error: unknown) => void,
+    onPermanentConflict?: (error: unknown) => void,
+  ): void {
+    let state = this.queues.get(key);
+    if (!state) {
+      state = { tail: Promise.resolve(), failedSeq: null };
+      this.queues.set(key, state);
+    }
+    const task = state.tail.then(async () => {
+      // A reconnect may replay the exact failed sequence from the container's
+      // own ring. That exact retry is allowed to heal the namespace; a later
+      // sequence must never overtake it while a browser generation is alive.
+      if (state!.failedSeq !== null && state!.failedSeq !== frameSeq) {
+        onFailure(new Error(`outbound durability blocked at frame ${state!.failedSeq}`));
+        return;
+      }
+      try {
+        await work();
+        if (state!.failedSeq === frameSeq) state!.failedSeq = null;
+      } catch (error) {
+        if (isPermanentLiveFrameConflict(error)) {
+          // An exact retry can turn a prior transient failure into a proven
+          // permanent conflict. Retire only that same-sequence barrier; a
+          // barrier for any other missing sequence must remain strict.
+          if (state!.failedSeq === frameSeq) state!.failedSeq = null;
+          onPermanentConflict?.(error);
+          return;
+        }
+        state!.failedSeq = frameSeq;
+        onFailure(error);
+      }
+    });
+    state.tail = task;
+    this.scheduleCleanup(key, state, task);
+  }
+
+  async drain(): Promise<void> {
+    await Promise.allSettled([...this.queues.values()].map((state) => state.tail));
+  }
+
+  snapshotForTest(): { queues: number; consumerKeys: number; consumers: number } {
+    return {
+      queues: this.queues.size,
+      consumerKeys: this.consumerCounts.size,
+      consumers: [...this.consumerCounts.values()].reduce((sum, count) => sum + count, 0),
+    };
+  }
+
+  private scheduleCleanup(
+    key: string,
+    state: OutboundPersistQueueState,
+    tail: Promise<void>,
+  ): void {
+    const cleanup = (): void => {
+      if (
+        this.queues.get(key) === state &&
+        state.tail === tail &&
+        (state.failedSeq === null || !this.consumerCounts.has(key))
+      ) {
+        this.queues.delete(key);
+      }
+    };
+    void tail.then(cleanup, cleanup);
+  }
+}
+
+// ---------- 主入口 ----------------------------------------------------------
 
 export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHandler {
   // PR2 v1.0.66 — codex 真扣费三件套一致性强校验(Codex BLOCKER 3 修复)。
@@ -1606,11 +1744,6 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       (deps.promptQueuePreparationTimeoutMs ?? 0) > 0
       ? deps.promptQueuePreparationTimeoutMs!
       : DEFAULT_PROMPT_QUEUE_PREPARATION_TIMEOUT_MS;
-  const outboundPersistFailedSeqTtlMs =
-    Number.isSafeInteger(deps.outboundPersistFailedSeqTtlMs) &&
-      (deps.outboundPersistFailedSeqTtlMs ?? 0) > 0
-      ? deps.outboundPersistFailedSeqTtlMs!
-      : OUTBOUND_PERSIST_FAILED_SEQ_TTL_MS;
   const log = deps.logger;
   const metrics = deps.metrics ?? {};
   const createContainerSocket = deps.createContainerSocket
@@ -1625,6 +1758,21 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     void work.catch((err) => {
       log?.error("user-chat-bridge: prompt queue compensation failed", { err });
     }).finally(() => pendingPromptQueueCompensations.delete(work));
+  };
+  const pendingZcodeAuditWork = new Set<Promise<void>>();
+  const trackZcodeAuditWork = (work: Promise<void>): void => {
+    pendingZcodeAuditWork.add(work);
+    void work.catch((err) => {
+      log?.warn("user-chat-bridge: ZCode audit work failed", { err });
+    }).finally(() => pendingZcodeAuditWork.delete(work));
+  };
+  let zcodeStaleReconcileStarted = false;
+  const ensureZcodeStaleReconcile = (): void => {
+    if (zcodeStaleReconcileStarted || !deps.pgPool) return;
+    zcodeStaleReconcileStarted = true;
+    trackZcodeAuditWork(
+      reconcileStaleZcodeAudits(deps.pgPool).then(() => undefined),
+    );
   };
 
   /**
@@ -1649,72 +1797,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
   const outboundRing = new OutboundRingBuffer(DEFAULT_RING_CONFIG);
   // Process-singleton namespace queues preserve commit→send order even when
   // the same container broadcasts duplicate frames through multiple browser
-  // bridges.  A failed namespace is poisoned: later sequence numbers are not
-  // allowed to leap over the missing durable row.
-  const outboundPersistQueues = new Map<string, {
-    tail: Promise<void>;
-    failedSeq: number | null;
-    failedAtMs: number | null;
-  }>();
-  const enqueuePersistedOutbound = (
-    key: string,
-    frameSeq: number,
-    work: () => Promise<void>,
-    onFailure: (error: unknown) => void,
-  ): void => {
-    let state = outboundPersistQueues.get(key);
-    if (!state) {
-      state = { tail: Promise.resolve(), failedSeq: null, failedAtMs: null };
-      outboundPersistQueues.set(key, state);
-    }
-    const task = state.tail.then(async () => {
-      // A reconnect may replay the exact failed sequence from the container's
-      // own ring.  That exact retry is allowed to heal the namespace; a later
-      // sequence must never overtake it.
-      if (state!.failedSeq !== null && state!.failedSeq !== frameSeq) {
-        const failedAgeMs = Date.now() - (state!.failedAtMs ?? 0);
-        if (failedAgeMs > outboundPersistFailedSeqTtlMs) {
-          log?.warn("user-chat-bridge: outbound durability poison expired; skipped missing seq", {
-            skippedFailedSeq: state!.failedSeq,
-            frameSeq,
-          });
-          state!.failedSeq = null;
-          state!.failedAtMs = null;
-        } else {
-          onFailure(new Error(`outbound durability blocked at frame ${state!.failedSeq}`));
-          return;
-        }
-      }
-      try {
-        await work();
-        if (state!.failedSeq === frameSeq) {
-          state!.failedSeq = null;
-          state!.failedAtMs = null;
-        }
-      } catch (error) {
-        if (isPermanentLiveFrameConflict(error)) {
-          log?.error("user-chat-bridge: skipping outbound frame after permanent live-stream conflict", {
-            frameSeq,
-            err: (error as Error)?.message ?? String(error),
-          });
-          return;
-        }
-        state!.failedSeq = frameSeq;
-        state!.failedAtMs = Date.now();
-        onFailure(error);
-      }
-    });
-    state.tail = task;
-    void task.finally(() => {
-      if (
-        state!.failedSeq === null &&
-        outboundPersistQueues.get(key) === state &&
-        state!.tail === task
-      ) {
-        outboundPersistQueues.delete(key);
-      }
-    });
-  };
+  // bridges. A failed namespace blocks later sequence numbers while any
+  // browser generation remains attached; final detach retires the poison so a
+  // future reconnect is not permanently trapped by an earlier DB failure.
+  const outboundPersistQueues = new _OutboundPersistQueueCoordinator();
 
   /**
    * 周期性 lazy prune 兜底。
@@ -2275,7 +2361,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
   function startBridge(
     userWs: WebSocket,
     uid: bigint,
-    endpoint: { host: string; port: number; coldStart?: boolean },
+    endpoint: { host: string; port: number; coldStart?: boolean; bundleRev?: string },
     earlyMessages: Array<{ data: RawData; isBinary: boolean; receivedAtMs: number }>,
     /**
      * 可选 agent_containers.id。来自 ResolveContainerEndpoint;v3 supervisor
@@ -2377,11 +2463,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     // - 守卫 firstUserFrameAtMs !== null 是防御"容器在用户发帧前主动 push"导致负值
     let firstUserFrameAtMs: number | null = null;
     let firstContainerFrameAtMs: number | null = null;
+    const firstVisibleTraceIds = new Set<string>();
     const ttftKind: "cold" | "warm" = endpoint.coldStart === true ? "cold" : "warm";
     // plan v3 review v1 §F4 follow-up:per-bridge 最后一次"用户主动声明"的 modelId。
     // 用于在没带 model 字段的后续帧上仍然能用对应 model 校验 grants(防在飞会话
     // 被撤销后还能继续发字)。null = 本桥还没收过任何带 model 的帧。
     let lastSeenModelId: string | null = null;
+    let clientBuildForConnection: string | null = null;
     // 周期 refresh modelChecker 的定时器;cleanup() 务必清掉。
     let modelCheckerRefreshTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -3006,6 +3094,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     //   drainCause: 进入 drain 时的 trigger cause(稳定保留,避免 mutable cause 干扰)
     //   userDetached: 守 detachUserSide 幂等(drain 入口 + finalCleanup 都跑)
     const inflightCodexTurns = new Map<string, CodexTurnSnapshot>();
+    const pendingZcodeRequestIds = new Set<string>();
+    const pendingZcodeRelays = new Map<string, {
+      token: string;
+      modelId: string;
+      sessionId: string | null;
+      traceId: string;
+    }>();
     // P0 修复(2026-07-03)— 跨桥 settle 的同步去重簿记:同 requestId 的 duplicate
     // billing 帧在 journal 回查/settle 在途期间直接丢弃(与主路径 Map.delete 先行
     // 的单次门控同构)。跨进程/跨桥并发仍由 journal CAS + usage_records UNIQUE 兜底。
@@ -3019,6 +3114,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     let drainTimer: ReturnType<typeof setTimeout> | null = null;
     let drainCause: BridgeCloseCause | null = null;
     let userDetached = false;
+    const retainedOutboundPersistQueueKeys = new Set<string>();
+    const retainOutboundPersistQueueKey = (key: string): void => {
+      if (userDetached || retainedOutboundPersistQueueKeys.has(key)) return;
+      outboundPersistQueues.retain(key);
+      retainedOutboundPersistQueueKeys.add(key);
+    };
 
     // ── durable turn dispatch(RFC §2.2 B1)本连接受理簿记 ─────────────────────
     //   admittedDispatches: clientMessageId → dispatch 身份 + lease。仅
@@ -3171,7 +3272,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         }
       },
     };
-    const { unregister } = registry.register(conn);
+    const { unregister, evicted } = registry.register(conn);
+    // 踢人必须留痕:互踢循环/超限排查的第一手证据(close code 4505 服务端此前无日志)。
+    for (const victim of evicted) {
+      bridgeLog?.warn("user-chat-bridge: kicked oldest connection (per-user limit)", {
+        uid: uid.toString(), connId, victimConnId: victim.id, maxPerUser,
+      });
+    }
 
     // 同步加入 uid→ws 表,broadcastToUser 用得到。cleanup 里务必同步删除。
     {
@@ -3489,6 +3596,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         const routing = {
           ...(typeof frameObj.model === "string" && frameObj.model !== ""
             ? { model: frameObj.model }
+            : {}),
+          ...(typeof frameObj.modelSwitchId === "string"
+            ? { modelSwitchId: frameObj.modelSwitchId }
             : {}),
           teamMode: frameObj.teamMode === true,
           effortLevel: typeof frameObj.effortLevel === "string" || frameObj.effortLevel === null
@@ -3834,6 +3944,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       ingress: "browser" | "prompt_queue" | "recovery" = "browser",
       dispatchRequest?: PromptQueueDispatchRequest,
       recoveryJob?: ClaimedRecoveryJob,
+      receivedAtMs = Date.now(),
     ): void => {
       const isPromptQueueDispatch = ingress === "prompt_queue";
       let promptQueueResolved = false;
@@ -3983,6 +4094,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       let authorityModelForFrame: string | null = null;
       let isCodexInboundFrame = false;
       let isCursorInboundFrame = false;
+      let isZcodeInboundFrame = false;
       let isAnnotatedImageInboundFrame = false;
       // Session-scoped Codex admission key. Outbound terminal frames match this
       // peer plus clientMessageId; missing peer falls back to a bridge-local
@@ -4254,6 +4366,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           ) {
             const helloPeers = (parsed as { peers?: unknown }).peers;
             const peers = Array.isArray(helloPeers) ? helloPeers : [];
+            const rawClientBuild = (parsed as { clientBuild?: unknown }).clientBuild;
+            if (typeof rawClientBuild === "string" && /^[0-9a-f]{8,32}$/.test(rawClientBuild)) {
+              clientBuildForConnection = rawClientBuild;
+            }
             const visiblePeers = peers.filter((p) => {
               if (typeof p !== "object" || p === null) return true;
               return (p as { agentId?: unknown }).agentId !== HIDDEN_REVIEWER_AGENT_ID;
@@ -4270,14 +4386,43 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             }
             const cidStr = containerId.toString();
             const uidStr = uid.toString();
+            // 前端只在发送态未清且 id 合法时携带 inFlightClientMessageId。
+            // 这里只收集候选,查询必须等 hello 转发之后再跑。
+            const terminalNotifyCandidates: Array<{ peerId: string; clientMessageId: string }> = [];
+            const terminalNotifySeen = new Set<string>();
             for (const p of visiblePeers) {
               if (typeof p !== "object" || p === null) continue;
               const peer = p as {
                 peerId?: unknown;
                 agentId?: unknown;
                 lastFrameSeq?: unknown;
+                inFlight?: unknown;
+                inFlightClientMessageId?: unknown;
               };
               if (typeof peer.peerId !== "string") continue;
+              const inFlightId = peer.inFlightClientMessageId;
+              // peers 来自客户端。协议规定 inFlightClientMessageId 仅在
+              // inFlight===true 时携带,且为短 uuid;不校验就会被无界字符串/
+              // 重复项放大成并行 PG 查询。
+              if (
+                peer.inFlight === true &&
+                typeof inFlightId === "string" &&
+                inFlightId !== "" &&
+                inFlightId.length <= HELLO_TERMINAL_NOTIFY_MAX_CLIENT_MESSAGE_ID_LEN &&
+                isClientMessageId(inFlightId)
+              ) {
+                const dedupeKey = `${peer.peerId}\0${inFlightId}`;
+                if (
+                  !terminalNotifySeen.has(dedupeKey) &&
+                  terminalNotifyCandidates.length < HELLO_TERMINAL_NOTIFY_MAX_CANDIDATES
+                ) {
+                  terminalNotifySeen.add(dedupeKey);
+                  terminalNotifyCandidates.push({
+                    peerId: peer.peerId,
+                    clientMessageId: inFlightId,
+                  });
+                }
+              }
               const aid =
                 typeof peer.agentId === "string" && peer.agentId !== ""
                   ? peer.agentId
@@ -4287,11 +4432,17 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               const safeId = peer.peerId.replace(/[^a-zA-Z0-9_-]/g, "_");
               const sessionKey = `agent:${aid}:webchat:dm:${safeId}`;
               const storeKey = `${uidStr}:${cidStr}:${sessionKey}`;
+              // Hello is the browser's subscription authority. Register every
+              // visible peer before forwarding/replay so a second attached tab
+              // protects an existing failed-sequence barrier even if it has not
+              // received its first outbound frame yet.
+              retainOutboundPersistQueueKey(storeKey);
               const cursor =
                 typeof peer.lastFrameSeq === "number" ? peer.lastFrameSeq : 0;
               const replay = outboundRing.peekReplay(storeKey, cursor);
               if (replay.ok) {
                 for (const f of replay.sent) {
+                  if (parseLeftoverHotWsPayload(f.data)) continue;
                   try { userWs.send(f.data); } catch { break; }
                 }
               }
@@ -4322,6 +4473,65 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             if (lastHelloPeerIds === null) lastHelloPeerIds = helloPeerIds;
             else for (const id of helloPeerIds) lastHelloPeerIds.add(id);
             tryAutoRebindFlush();
+            // 容器重建后内存环 _recentTerminalRing 为空,只能发 turn_state_unknown
+            // (isFinal:false),前端明确不清发送态;容器进程又拿不到 master PG。
+            // hello 必经本桥且宿主有 PG,终态回落只能在这里补。
+            //
+            // 绝不能挡在 hello 转发前面:容器靠这条 hello 把 containerWs 登记进
+            // clientsByPeer,链路一个字节都不能动。所以只 spawn 浮动 promise,
+            // 先 await 让出同步栈,等 fall through 到 forwardInboundFrame 之后再查 PG。
+            if (terminalNotifyCandidates.length > 0 && deps.pgPool) {
+              const pgPool = deps.pgPool;
+              void (async () => {
+                try {
+                  await Promise.resolve();
+                  for (const { peerId, clientMessageId } of terminalNotifyCandidates) {
+                    // 查询前也要看连接:断开后结果没人收,继续查只会空烧 PG。
+                    if (userWs.readyState !== WebSocket.OPEN) break;
+                    const row = await getDispatchByLogicalKey(pgPool, {
+                      userId: uid,
+                      sessionId: peerId,
+                      clientMessageId,
+                    });
+                    if (row === null || row.status !== "terminal") continue;
+                    let reconcile: "turn_completed" | "interrupted" | null = null;
+                    if (row.outcome === "completed") {
+                      reconcile = "turn_completed";
+                    } else if (row.outcome === "interrupted" || row.outcome === "crashed") {
+                      // 前端 reducer 只认这两个字面量。不要模仿容器的 turn_interrupted,
+                      // 也不要带 interrupted:'service_restart'(会触发自动恢复)。
+                      reconcile = "interrupted";
+                    }
+                    // not_accepted / executed_error / 其它 / null → 什么都不发:
+                    // 失败态交给现有 fail-visible 通道,避免和失败卡打架。
+                    if (reconcile === null) continue;
+                    // 只打本条 hello 所在的 userWs,不用 broadcastToUser —
+                    // 同 uid 其它标签页未必卡在这一轮,广播会误清它们的发送态。
+                    if (userWs.readyState !== WebSocket.OPEN) continue;
+                    try {
+                      userWs.send(JSON.stringify({
+                        type: "outbound.message",
+                        channel: "webchat",
+                        peer: { id: peerId, kind: "dm" },
+                        clientMessageId,
+                        blocks: [],
+                        isFinal: true,
+                        meta: { reconcile, clientMessageId },
+                        ts: Date.now(),
+                      }));
+                      bridgeLog?.info("user-chat-bridge: hello terminal dispatch fallback sent", {
+                        uid: uidStr,
+                        sessionId: peerId,
+                        clientMessageId,
+                        reconcile,
+                      });
+                    } catch { /* 发不出就静默降级 */ }
+                  }
+                } catch {
+                  // 任何失败都只能静默:hello 处理绝不能因回落抛错。
+                }
+              })().catch(() => {});
+            }
             // Fall through to forwardInboundFrame below.
           }
           if (
@@ -4511,11 +4721,16 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 : (isCodexEngineModel(effectiveModel) || isGrokEngineModel(effectiveModel));
             isCursorInboundFrame =
               authorityOn && authorityModelForFrame !== null
-                ? (authorityDeps?.catalog.peek()?.isExternalBillingModel(authorityModelForFrame) ??
+                ? (authorityDeps?.catalog.peek()?.isCursorModel(authorityModelForFrame) ??
                    isCursorEngineModel(effectiveModel))
                 : isCursorEngineModel(effectiveModel);
+            isZcodeInboundFrame =
+              authorityOn && authorityModelForFrame !== null
+                ? (authorityDeps?.catalog.peek()?.isZcodeModel(authorityModelForFrame) ??
+                   isZcodeEngineModel(effectiveModel))
+                : isZcodeEngineModel(effectiveModel);
             // 提取 peer.id(用于 session-scoped admission 与 outbound 终态匹配)。
-            if (isCodexInboundFrame || isCursorInboundFrame) {
+            if (isCodexInboundFrame || isCursorInboundFrame || isZcodeInboundFrame) {
               const peerObj = (parsed as { peer?: { id?: unknown } }).peer;
               const peerIdRaw = peerObj && typeof peerObj === "object" ? peerObj.id : undefined;
               inboundPeerIdForFrame = typeof peerIdRaw === "string" ? peerIdRaw : null;
@@ -4529,6 +4744,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             //   - 合法 → 进 log
             //   - 非法且 raw !== undefined → 只记 issue 不带 raw(MAJOR 2 防 log injection)
             //     且从 forward 给容器的 frame 中 **strip 掉**(防 raw 进入下游 logger)
+            if (firstUserFrameAtMs === null) firstUserFrameAtMs = receivedAtMs;
             turnTraceIdForFrame = newTraceId();
             const rawClientTrace = (parsed as { clientTraceId?: unknown }).clientTraceId;
             const clientHint = parseTraceIdCandidate(rawClientTrace);
@@ -4558,6 +4774,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               sanitizedParsed,
               "__oc_grok_route",
             );
+            const hasClientZcodeRoute = Object.prototype.hasOwnProperty.call(
+              sanitizedParsed,
+              "__oc_zcode_route",
+            );
             const hasClientWorkspaceMode = Object.prototype.hasOwnProperty.call(
               sanitizedParsed,
               "_workspaceMode",
@@ -4566,6 +4786,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               (rawClientTrace !== undefined && !clientHint.ok) ||
               hasClientCodexRoute ||
               hasClientGrokRoute ||
+              hasClientZcodeRoute ||
               hasClientWorkspaceMode ||
               teamModeMain
             ) {
@@ -4578,6 +4799,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               }
               if (hasClientGrokRoute) {
                 delete sanitizedParsed.__oc_grok_route;
+              }
+              if (hasClientZcodeRoute) {
+                delete sanitizedParsed.__oc_zcode_route;
               }
               if (hasClientWorkspaceMode) {
                 const { _workspaceMode: _discard, ...withoutWorkspaceMode } = sanitizedParsed;
@@ -4622,6 +4846,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   sessionKey: traceSessionKey,
                   agentId: effectiveFrameAgentId,
                   model: effectiveModelForFrame,
+                  bundleRev: endpoint.bundleRev ?? null,
+                  clientBuild: clientBuildForConnection,
                 },
               );
             }
@@ -4713,6 +4939,140 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             failDispatchPreForward(dispatchRecord, 'cursor_external_admission_failed');
             rejectPromptQueueDispatch('CURSOR_UNAVAILABLE');
             if (!cleaned && userWs.readyState === WebSocket.OPEN) sendErrorFrame(userWs, 'CURSOR_UNAVAILABLE', 'Cursor is temporarily unavailable');
+          }
+        })();
+        return;
+      }
+      if (isZcodeInboundFrame && containerId !== undefined) {
+        const parsedCapture = inboundParsedFrame;
+        const traceCapture = turnTraceIdForFrame;
+        const logCapture = turnLogForFrame;
+        const authorityModelCapture = authorityModelForFrame;
+        const modelCapture = effectiveModelForFrame;
+        const peerCapture = inboundPeerIdForFrame;
+        const cid = containerId;
+        void (async () => {
+          let dispatchRecord: AdmittedDispatch | undefined;
+          let insertedRequestId: string | null = null;
+          const abortInserted = (step: "seal_rejected" | "frame_too_big" | "send_failed"): Promise<void> => {
+            if (insertedRequestId !== null) {
+              const relay = pendingZcodeRelays.get(insertedRequestId);
+              if (relay) {
+                deps.expireZcodeRoute?.(relay.token);
+                pendingZcodeRelays.delete(insertedRequestId);
+              }
+            }
+            if (!deps.pgPool || insertedRequestId === null) return Promise.resolve();
+            const requestId = insertedRequestId;
+            const work = abortInsertedZcodeAudit(deps.pgPool, {
+              requestId,
+              userId: uid,
+              pending: pendingZcodeRequestIds,
+              terminalCode: zcodeAdmissionAbortTerminal(step),
+            }).then(() => undefined);
+            trackZcodeAuditWork(work);
+            return work;
+          };
+          try {
+            const canary = typeof modelCapture === "string" && isZcodeEngineModel(modelCapture);
+            const publicCanonical = modelCapture === "glm-5.3-zai";
+            if (!deps.pgPool || parsedCapture === null || traceCapture === null || typeof modelCapture !== "string" || (!canary && !publicCanonical)) {
+              rejectPromptQueueDispatch('ZCODE_UNAVAILABLE');
+              sendErrorFrame(userWs, 'ZCODE_UNAVAILABLE', 'ZCode is unavailable for this account');
+              return;
+            }
+            const zcodeModelId = modelCapture;
+            const enriched = await attachMasterTurnState(parsedCapture, logCapture, traceCapture, !isPromptQueueDispatch, rejectPromptQueueDispatch, authorityModelCapture, recoveryJob);
+            if (enriched === null) return;
+            dispatchRecord = lookupAdmittedDispatch(enriched);
+            let authorityExec: ResolvedTurnExecution | null = null;
+            if (authorityOn) {
+              // resolveAuthorityExecOrReject's legacy boolean means "non-CCB"
+              // (not literally Codex); ZCode is therefore classified true.
+              authorityExec = await resolveAuthorityExecOrReject({ model: authorityModelCapture, classifiedCodex: true, log: logCapture, onReject: rejectPromptQueueDispatch });
+              if (
+                authorityExec === null
+                || authorityExec.engine !== 'zcode'
+                || authorityExec.canonicalModel !== zcodeModelId
+              ) {
+                failDispatchPreForward(dispatchRecord, 'zcode_authority_rejected');
+                return;
+              }
+            }
+            const requestId = dispatchRecord ? dispatchRecord.billingRequestId : ensureRequestIdServerSide();
+            if (!deps.mintZcodeRoute) {
+              rejectPromptQueueDispatch('ZCODE_UNAVAILABLE');
+              sendErrorFrame(userWs, 'ZCODE_UNAVAILABLE', 'ZCode is unavailable for this account');
+              return;
+            }
+            let minted: { token: string; baseUrl: string };
+            try {
+              minted = await deps.mintZcodeRoute({
+                containerId: cid,
+                userId: uid,
+                requestId,
+                modelId: zcodeModelId,
+              });
+            } catch (err) {
+              logCapture?.error('user-chat-bridge: ZCode relay mint failed', { err });
+              rejectPromptQueueDispatch('ZCODE_UNAVAILABLE');
+              sendErrorFrame(userWs, 'ZCODE_UNAVAILABLE', 'ZCode is temporarily unavailable');
+              return;
+            }
+            pendingZcodeRelays.set(requestId, {
+              token: minted.token,
+              modelId: zcodeModelId,
+              sessionId: peerCapture,
+              traceId: traceCapture,
+            });
+            insertedRequestId = requestId;
+            if (canary) {
+              await insertPendingZcodeAudit(deps.pgPool, {
+                requestId,
+                userId: uid,
+                containerId: cid,
+                sessionId: peerCapture,
+                modelId: zcodeModelId,
+              });
+              rememberZcodePending(pendingZcodeRequestIds, requestId);
+              ensureZcodeStaleReconcile();
+            }
+            let authorityFields: Record<string, unknown> = {};
+            if (authorityExec !== null) {
+              const sealed = await sealAuthorityFieldsOrReject({ exec: authorityExec, billingRequestId: requestId, log: logCapture, onReject: rejectPromptQueueDispatch });
+              if (sealed === null) {
+                failDispatchPreForward(dispatchRecord, 'zcode_authority_seal_rejected');
+                deps.expireZcodeRoute?.(minted.token);
+                pendingZcodeRelays.delete(requestId);
+                await abortInserted("seal_rejected");
+                return;
+              }
+              authorityFields = sealed;
+            }
+            const forwarded = {
+              ...enriched,
+              requestId,
+              traceId: traceCapture,
+              __oc_zcode_route: { baseUrl: minted.baseUrl, routeToken: minted.token },
+              ...authorityFields,
+              ...dispatchAuthorityField(dispatchRecord),
+            };
+            const encoded = JSON.stringify(forwarded); const len = Buffer.byteLength(encoded);
+            if (len > maxFrameBytes) {
+              failDispatchPreForward(dispatchRecord, 'ERR_FRAME_TOO_BIG');
+              rejectPromptQueueDispatch('ERR_FRAME_TOO_BIG');
+              deps.expireZcodeRoute?.(minted.token);
+              pendingZcodeRelays.delete(requestId);
+              await abortInserted("frame_too_big");
+              return;
+            }
+            await forwardPreparedFrame(Buffer.from(encoded, 'utf8'), false, len);
+          } catch (err) {
+            logCapture?.error('user-chat-bridge: ZCode external admission failed', { err });
+            failDispatchPreForward(dispatchRecord, 'zcode_external_admission_failed');
+            rejectPromptQueueDispatch('ZCODE_UNAVAILABLE');
+            await abortInserted("send_failed");
+            if (!cleaned && userWs.readyState === WebSocket.OPEN) sendErrorFrame(userWs, 'ZCODE_UNAVAILABLE', 'ZCode is temporarily unavailable');
           }
         })();
         return;
@@ -5815,8 +6175,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       if (passthroughForward instanceof Promise) void passthroughForward;
     };
 
-    const onUserMessage = (data: RawData, isBinary: boolean): void => {
-      executeAdmittedTurn(data, isBinary, "browser");
+    const onUserMessage = (
+      data: RawData,
+      isBinary: boolean,
+      receivedAtMs = Date.now(),
+    ): void => {
+      executeAdmittedTurn(data, isBinary, "browser", undefined, undefined, receivedAtMs);
     };
 
     /**
@@ -5836,7 +6200,6 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
      * 立刻判定(同步上下文),已在调用本函数前完成。本函数只关心"放行后的物理转发"。
      */
     function forwardInboundFrame(data: RawData, isBinary: boolean, len: number): boolean {
-      if (firstUserFrameAtMs === null) firstUserFrameAtMs = Date.now();
       if (markActivity && containerId !== undefined) {
         const now = Date.now();
         if (now - lastActivityRefreshAt >= ACTIVITY_REFRESH_INTERVAL_MS) {
@@ -5929,15 +6292,144 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             const terminalCode = external.terminalCode === 'USER_CANCELLED' || external.terminalCode === 'AUTH_UNAVAILABLE' || external.terminalCode === 'QUOTA_UNAVAILABLE' || external.terminalCode === 'ENGINE_ERROR' ? external.terminalCode : null;
             const durationMs = typeof external.durationMs === 'number' && Number.isFinite(external.durationMs) && external.durationMs >= 0 ? Math.floor(external.durationMs) : null;
             const usage = isPlainRecord(external.usage) ? external.usage : null;
-            if (deps.pgPool && requestId && status && durationMs !== null && external.engine === 'cursor') {
-              void deps.pgPool.query(
-                `UPDATE cursor_external_usage_audit
-                    SET status=$2, terminal_code=$3, duration_ms=$4, reported_usage=$5, completed_at=NOW()
-                  WHERE request_id=$1 AND user_id=$6 AND status='pending'`,
-                [requestId, status, terminalCode, durationMs, usage, uid],
-              ).catch((err) => bridgeLog?.warn('user-chat-bridge: Cursor external audit terminal write failed', { requestId, err }));
+            if (deps.pgPool && requestId && status && durationMs !== null && external.engine === 'zcode') {
+              const pool = deps.pgPool;
+              const pricing = deps.pricing;
+              const relay = pendingZcodeRelays.get(requestId);
+              if (relay) {
+                deps.expireZcodeRoute?.(relay.token);
+                pendingZcodeRelays.delete(requestId);
+              }
+              trackZcodeAuditWork((async () => {
+                const outcome = await closeZcodeAuditWithRetry(pool, {
+                  requestId,
+                  userId: uid,
+                  status,
+                  terminalCode,
+                  durationMs,
+                  usage,
+                });
+                applyZcodeFinalizeOutcome(pendingZcodeRequestIds, requestId, outcome);
+                if (outcome === "failed") {
+                  bridgeLog?.warn("user-chat-bridge: ZCode audit close fail-closed", { requestId, outcome });
+                }
+                const canaryTerminal = outcome === "closed" || outcome === "already_terminal";
+                if (!canaryTerminal && pricing && (relay?.modelId === "glm-5.3-zai" || outcome === "unknown")) {
+                  try {
+                    const settled = await settleZcodeCatalogUsage({
+                      pool,
+                      pricing,
+                      userId: uid,
+                      requestId,
+                      modelId: "glm-5.3-zai",
+                      sessionId: relay?.sessionId ?? null,
+                      engineStatus: status,
+                      terminalCode,
+                      usage,
+                    });
+                    if (settled === null) {
+                      bridgeLog?.warn("user-chat-bridge: ZCode catalog settle skipped, pricing missing", { requestId });
+                    } else {
+                      await publishZcodeCatalogSettle({
+                        settled,
+                        requestId,
+                        userId: uid.toString(),
+                        modelId: "glm-5.3-zai",
+                        sessionId: relay?.sessionId ?? null,
+                        traceId: relay?.traceId ?? null,
+                        persist: deps.appendCostCredits,
+                        publish: (event) => { broadcastToUser(uid, event); },
+                        onPersistError: (err) => {
+                          bridgeLog?.warn("user-chat-bridge: ZCode persist costCredits threw", {
+                            requestId,
+                            err,
+                          });
+                        },
+                      });
+                    }
+                  } catch (err) {
+                    bridgeLog?.warn("user-chat-bridge: ZCode catalog settle failed", { requestId, err });
+                  }
+                }
+              })());
+            } else if (deps.pgPool && requestId && status && durationMs !== null && external.engine === 'cursor') {
+              const pool = deps.pgPool;
+              const pricing = deps.pricing;
+              void (async () => {
+                try {
+                  const updated = await pool.query<{ model_id: string; session_id: string | null }>(
+                    `UPDATE cursor_external_usage_audit
+                        SET status=$2, terminal_code=$3, duration_ms=$4, reported_usage=$5, completed_at=NOW()
+                      WHERE request_id=$1 AND user_id=$6 AND status='pending'
+                    RETURNING model_id, session_id`,
+                    [requestId, status, terminalCode, durationMs, usage, uid],
+                  );
+                  let modelId = updated.rows[0]?.model_id ?? null;
+                  let sessionId = updated.rows[0]?.session_id ?? null;
+                  if (modelId === null) {
+                    const existing = await pool.query<{ model_id: string; session_id: string | null }>(
+                      `SELECT model_id, session_id FROM cursor_external_usage_audit
+                        WHERE request_id=$1 AND user_id=$2`,
+                      [requestId, uid],
+                    );
+                    modelId = existing.rows[0]?.model_id ?? null;
+                    sessionId = existing.rows[0]?.session_id ?? sessionId;
+                  }
+                  let cursorAccountId: bigint | null = null;
+                  try {
+                    cursorAccountId = await resolveUsedCursorAccountId(external.cursorSlotResults);
+                  } catch (resolveErr) {
+                    bridgeLog?.warn('user-chat-bridge: Cursor account attribution failed', { requestId, err: resolveErr });
+                  }
+                  if (modelId !== null) {
+                    try {
+                      await applyLearnedCursorQuota({
+                        modelId,
+                        terminalCode,
+                        slotResults: external.cursorSlotResults,
+                      });
+                    } catch (learnErr) {
+                      bridgeLog?.warn('user-chat-bridge: Cursor quota-class learn failed', { requestId, err: learnErr });
+                    }
+                  }
+                  if (modelId === null) {
+                    bridgeLog?.warn('user-chat-bridge: Cursor settle skipped, audit model_id missing', { requestId });
+                  } else if (!pricing) {
+                    bridgeLog?.warn('user-chat-bridge: Cursor settle skipped, pricing cache missing', { requestId, modelId });
+                  } else {
+                    const settled = await settleCursorExternalUsage({
+                      pool,
+                      pricing,
+                      userId: uid,
+                      requestId,
+                      modelId,
+                      sessionId,
+                      engineStatus: status,
+                      terminalCode,
+                      usage,
+                      accountId: cursorAccountId,
+                    });
+                    if (settled === null) {
+                      bridgeLog?.warn('user-chat-bridge: Cursor settle skipped, model pricing not in cache', { requestId, modelId });
+                    } else if (
+                      settled.debitedCredits !== null &&
+                      settled.debitedCredits > 0n &&
+                      deps.appendCostCredits
+                    ) {
+                      await deps.appendCostCredits(
+                        requestId,
+                        uid.toString(),
+                        settled.debitedCredits.toString(),
+                        sessionId,
+                      );
+                    }
+                  }
+                } catch (err) {
+                  bridgeLog?.warn('user-chat-bridge: Cursor platform settle failed', { requestId, err });
+                }
+              })();
             } else {
-              bridgeLog?.warn('user-chat-bridge: malformed Cursor external billing frame dropped');
+              bridgeLog?.warn('user-chat-bridge: malformed external engine billing frame dropped');
             }
             return;
           }
@@ -6102,6 +6594,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             idempotencyKey: `prompt-queue:${request.grantId}`,
             content: request.item.content,
             ...(execution.model !== undefined ? { model: execution.model } : {}),
+            ...(execution.modelSwitchId !== undefined ? { modelSwitchId: execution.modelSwitchId } : {}),
             ...(execution.effortLevel !== undefined ? { effortLevel: execution.effortLevel } : {}),
             ...(execution.teamMode !== undefined ? { teamMode: execution.teamMode } : {}),
             [PROMPT_QUEUE_GRANT_FIELD]: {
@@ -6149,13 +6642,6 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           });
         }
         return;
-      }
-      // Bridge TTFT 终点:首个 container→user 帧。
-      // 守卫 firstUserFrameAtMs !== null 防御容器在用户发帧前主动 push(理论不发生,
-      // 但保险 — 否则会算负值/无意义观测)。oversize 拒绝路径已 return,不会走到这。
-      if (firstContainerFrameAtMs === null && firstUserFrameAtMs !== null) {
-        firstContainerFrameAtMs = Date.now();
-        metrics.onTtft?.(uid, ttftKind, (firstContainerFrameAtMs - firstUserFrameAtMs) / 1000);
       }
       // PR2 v1.0.66 — outbound.codex_billing 是 container→master 内部侧信道,
       // **绝不**透传给用户浏览器(用户不可见 billing,且帧含内部计费字段)。
@@ -6505,7 +6991,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               askPayload: parsedPermission.toolName === "AskUserQuestion"
                 ? parsedPermission.inputJson
                 : null,
-              expiresAt: new Date(Date.now() + 30 * 60_000),
+              expiresAt: resolvePermissionExpiresAt(parsedPermission.expiresAt),
             }).then(() => {});
           }
         }
@@ -6570,6 +7056,22 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             // 不 return — status 帧继续走透传路径让前端 UI 看到状态变化
           }
         }
+      }
+      // Engine-neutral first-visible boundary: ignore ACK/status/billing/attestation and
+      // stop the clock only when an outbound.message contains a user-visible block.
+      const firstVisible = extractFirstVisibleAttribution(parsedMasterFrameCandidate);
+      if (firstVisible && !firstVisibleTraceIds.has(firstVisible.traceId)) {
+        if (firstVisibleTraceIds.size >= 512) firstVisibleTraceIds.clear();
+        firstVisibleTraceIds.add(firstVisible.traceId);
+        if (firstContainerFrameAtMs === null && firstUserFrameAtMs !== null) {
+          firstContainerFrameAtMs = Date.now();
+          metrics.onTtft?.(uid, ttftKind, (firstContainerFrameAtMs - firstUserFrameAtMs) / 1000);
+        }
+        recordTurnFirstVisible(
+          deps.pgPool,
+          (message, fields) => bridgeLog?.warn(message, fields),
+          firstVisible,
+        );
       }
       // Phase 0.4 — bridge ring write for stamped outbound frames.
       //
@@ -6727,6 +7229,15 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         }
       }
       const forwardCommittedFrame = (): void => {
+        if (
+          durableStampedFrame !== null
+          && durableStampedFrame.clientMessageId === null
+          && parseLeftoverHotWsPayload(durableStampedFrame.payload)
+        ) {
+          // Persist already ran (or was skipped). Leftover never enters the
+          // hot browser subscription — same contract as GET live-frames.
+          return;
+        }
         if (durableStampedFrame !== null) {
           outboundRing.storeStamped(
             durableStampedFrame.storeKey,
@@ -6766,7 +7277,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         deps.persistOutboundFrame
       ) {
         const stamped = durableStampedFrame;
-        enqueuePersistedOutbound(
+        // Fallback for old/non-browser peers that produce stamped output before
+        // sending an inbound.hello subscription.
+        retainOutboundPersistQueueKey(stamped.storeKey);
+        outboundPersistQueues.enqueue(
           stamped.storeKey,
           stamped.frameSeq,
           async () => {
@@ -6792,6 +7306,16 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               err: (error as Error)?.message ?? String(error),
             });
             try { userWs.close(CLOSE_BRIDGE.INTERNAL, "output persistence unavailable"); } catch { /* */ }
+          },
+          (error) => {
+            bridgeLog?.error("user-chat-bridge: skipping outbound frame after permanent live-stream conflict", {
+              sessionId: stamped.sessionId,
+              clientMessageId: stamped.clientMessageId,
+              containerId,
+              sessionKey: stamped.sessionKey,
+              frameSeq: stamped.frameSeq,
+              err: (error as Error)?.message ?? String(error),
+            });
           },
         );
         return;
@@ -6985,11 +7509,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     // 把"upgrade 期间早到的帧"先 emit 一遍 → 走正常 onUserMessage 流程。
     // TTFT 起点用第一条早到帧的 receivedAtMs(更准 — 用户发帧瞬间,而不是 replay 瞬间);
     // 后续帧 onUserMessage 内部的 firstUserFrameAtMs !== null 守卫会跳过覆盖。
-    if (earlyMessages.length > 0 && firstUserFrameAtMs === null) {
-      firstUserFrameAtMs = earlyMessages[0]!.receivedAtMs;
-    }
     for (const m of earlyMessages) {
-      onUserMessage(m.data, m.isBinary);
+      onUserMessage(m.data, m.isBinary, m.receivedAtMs);
     }
 
     // ---------- cleanup 状态机(PR2 v1.0.66 drain refactor) ----------
@@ -7572,6 +8093,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     function detachUserSide(triggerCause: BridgeCloseCause): void {
       if (userDetached) return;
       userDetached = true;
+      for (const key of retainedOutboundPersistQueueKeys) {
+        outboundPersistQueues.release(key);
+      }
+      retainedOutboundPersistQueueKeys.clear();
       if (heartbeatTimer !== null) {
         clearInterval(heartbeatTimer);
         heartbeatTimer = null;
@@ -7696,6 +8221,24 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         });
       }
       inflightCodexTurns.clear();
+      if (pendingZcodeRelays.size > 0) {
+        for (const relay of pendingZcodeRelays.values()) {
+          deps.expireZcodeRoute?.(relay.token);
+        }
+        pendingZcodeRelays.clear();
+      }
+      if (deps.pgPool && pendingZcodeRequestIds.size > 0) {
+        ensureZcodeStaleReconcile();
+        const leftover = [...pendingZcodeRequestIds];
+        trackZcodeAuditWork(
+          closePendingZcodeAudits(deps.pgPool, {
+            userId: uid,
+            requestIds: leftover,
+            terminalCode: zcodeCleanupTerminal(finalCause),
+            pending: pendingZcodeRequestIds,
+          }).then(() => undefined),
+        );
+      }
       // durable dispatch 本地簿记清空(权威在 turn_dispatches;reconciler 兜底 open 行)。
       admittedDispatches.clear();
 
@@ -7749,12 +8292,15 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     clearInterval(controlDrainTimer);
     clearInterval(recoveryDrainTimer);
     registry.closeAll(reason);
-    await Promise.allSettled([...outboundPersistQueues.values()].map((state) => state.tail));
+    await outboundPersistQueues.drain();
     await new Promise<void>((resolve) => {
       try { wss.close(() => resolve()); } catch { resolve(); }
     });
-    while (pendingPromptQueueCompensations.size > 0) {
-      await Promise.allSettled([...pendingPromptQueueCompensations]);
+    while (pendingPromptQueueCompensations.size > 0 || pendingZcodeAuditWork.size > 0) {
+      await Promise.allSettled([
+        ...pendingPromptQueueCompensations,
+        ...pendingZcodeAuditWork,
+      ]);
     }
   }
 

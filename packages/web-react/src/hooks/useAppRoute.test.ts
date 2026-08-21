@@ -1,11 +1,19 @@
 import { describe, expect, it } from 'vitest'
 import { PRODUCT_CAPABILITIES } from '../lib/productCapabilities'
 import {
+  parseBoardPath,
+  parseBoardTicket,
+  parseBoardTicketType,
+  parseBoardView,
   parsePanelParam,
   parseTutorialCase,
+  parseTutorialCommunity,
   parseTutorialTopic,
+  preferredBoardView,
   tutorialHref,
+  withBoardParams,
   withPanelParams,
+  workspaceWantPath,
 } from './useAppRoute'
 
 describe('教程 URL 深链', () => {
@@ -30,6 +38,7 @@ describe('教程 URL 深链', () => {
     expect(settings.get('campaign')).toBe('summer')
     expect(settings.get('panel')).toBe('settings')
     expect(settings.has('topic')).toBe(false)
+    expect(settings.has('community')).toBe(false)
   })
 
   it('help 未给选择时保持案例总览，不再强制跳到功能教程', () => {
@@ -37,6 +46,7 @@ describe('教程 URL 深链', () => {
     expect(value.get('panel')).toBe('help')
     expect(value.has('topic')).toBe(false)
     expect(value.has('case')).toBe(false)
+    expect(value.has('community')).toBe(false)
   })
 
   it('案例深链只接受稳定 id，并与旧 topic 互斥且案例优先', () => {
@@ -45,9 +55,7 @@ describe('教程 URL 深链', () => {
     )
     expect(parseTutorialCase(both)).toBe('research-bike-demand')
     expect(parseTutorialTopic(both)).toBeNull()
-    expect(
-      parseTutorialCase(new URLSearchParams('panel=help&case=unknown-case')),
-    ).toBeNull()
+    expect(parseTutorialCase(new URLSearchParams('panel=help&case=unknown-case'))).toBeNull()
 
     const caseLink = withPanelParams(
       new URLSearchParams('campaign=summer&topic=chat-basics'),
@@ -59,11 +67,7 @@ describe('教程 URL 深链', () => {
     expect(caseLink.get('case')).toBe('coding-swe-bench-fix')
     expect(caseLink.has('topic')).toBe(false)
 
-    const legacy = withPanelParams(
-      caseLink,
-      'help',
-      PRODUCT_CAPABILITIES.github.id,
-    )
+    const legacy = withPanelParams(caseLink, 'help', PRODUCT_CAPABILITIES.github.id)
     expect(legacy.get('topic')).toBe('github-repository')
     expect(legacy.has('case')).toBe(false)
   })
@@ -80,5 +84,98 @@ describe('教程 URL 深链', () => {
     expect(tutorialHref(source, PRODUCT_CAPABILITIES.github.id)).toBe(
       '/s/keep-session?campaign=summer&invite=abc&panel=help&topic=github-repository#result',
     )
+    expect(tutorialHref(source, null, null, 'tut-7')).toBe(
+      '/s/keep-session?campaign=summer&invite=abc&panel=help&community=tut-7#result',
+    )
+  })
+
+  it('community 深链只接受安全 id，并与 case/topic 互斥且 community 优先', () => {
+    const mixed = new URLSearchParams(
+      'campaign=summer&panel=help&topic=chat-basics&case=research-bike-demand&community=tut-7',
+    )
+    expect(parseTutorialCommunity(mixed)).toBe('tut-7')
+    expect(parseTutorialCase(mixed)).toBeNull()
+    expect(parseTutorialTopic(mixed)).toBeNull()
+    expect(parseTutorialCommunity(new URLSearchParams('panel=help&community=bad/id'))).toBeNull()
+    expect(parseTutorialCommunity(new URLSearchParams('panel=settings&community=tut-7'))).toBeNull()
+
+    const communityLink = withPanelParams(
+      new URLSearchParams('campaign=summer&topic=chat-basics&case=research-bike-demand'),
+      'help',
+      null,
+      null,
+      'tut-7',
+    )
+    expect(communityLink.get('campaign')).toBe('summer')
+    expect(communityLink.get('community')).toBe('tut-7')
+    expect(communityLink.has('topic')).toBe(false)
+    expect(communityLink.has('case')).toBe(false)
+
+    const closed = withPanelParams(communityLink, null)
+    expect(closed.has('panel')).toBe(false)
+    expect(closed.has('community')).toBe(false)
+    expect(closed.get('campaign')).toBe('summer')
+  })
+})
+
+describe('任务面板 /board 深链', () => {
+  it('只认精确 /board，会话路径与根路径仍走旧语义', () => {
+    expect(parseBoardPath('/board')).toBe(true)
+    expect(parseBoardPath('/board/')).toBe(false)
+    expect(parseBoardPath('/s/abc')).toBe(false)
+    expect(parseBoardPath('/')).toBe(false)
+    expect(workspaceWantPath('board', 'abc', false)).toBe('/board')
+    expect(workspaceWantPath('chat', 'abc', false)).toBe('/s/abc')
+  })
+
+  it('view / ticket 与 ?panel= 共存，离开 board 时清掉自己的键', () => {
+    const source = new URLSearchParams('campaign=summer&panel=settings')
+    const onBoard = withBoardParams(source, 'list', 'OCV5-42')
+    expect(onBoard.get('campaign')).toBe('summer')
+    expect(onBoard.get('panel')).toBe('settings')
+    expect(onBoard.get('view')).toBe('list')
+    expect(onBoard.get('ticket')).toBe('OCV5-42')
+
+    const left = withBoardParams(onBoard, null, null)
+    expect(left.get('campaign')).toBe('summer')
+    expect(left.get('panel')).toBe('settings')
+    expect(left.has('view')).toBe(false)
+    expect(left.has('ticket')).toBe(false)
+  })
+
+  it('默认看板省略 view=board；移动/桌面默认值由设备偏好决定', () => {
+    const clean = withBoardParams(new URLSearchParams('panel=help'), 'board', null)
+    expect(clean.has('view')).toBe(false)
+    expect(clean.get('panel')).toBe('help')
+    expect(preferredBoardView(false)).toBe('list')
+    expect(preferredBoardView(true)).toBe('board')
+    expect(parseBoardView(new URLSearchParams(), preferredBoardView(false))).toBe('list')
+    expect(parseBoardView(new URLSearchParams(), preferredBoardView(true))).toBe('board')
+    expect(parseBoardView(new URLSearchParams('view=inbox'))).toBe('list')
+    expect(parseBoardView(new URLSearchParams('view=cost'))).toBe('cost')
+    expect(parseBoardView(new URLSearchParams('view=weekly'))).toBe('weekly')
+    expect(parseBoardView(new URLSearchParams('view=backlog'))).toBe('list')
+    expect(parseBoardView(new URLSearchParams('view=kanban'))).toBe('board')
+    expect(withBoardParams(new URLSearchParams(), 'inbox').get('view')).toBe('list')
+    expect(withBoardParams(new URLSearchParams(), 'backlog').get('view')).toBe('list')
+    expect(parseBoardTicket(new URLSearchParams('ticket=OCV5-42'))).toBe('OCV5-42')
+    expect(parseBoardTicket(new URLSearchParams('ticket='))).toBeNull()
+  })
+
+  it('ticketType 只接受四类单据；未选则省略，离开 board 时清掉', () => {
+    const source = new URLSearchParams('campaign=summer&panel=help')
+    const withType = withBoardParams(source, 'board', null, 'feature')
+    expect(withType.get('campaign')).toBe('summer')
+    expect(withType.get('panel')).toBe('help')
+    expect(withType.has('view')).toBe(false)
+    expect(withType.get('ticketType')).toBe('feature')
+
+    const left = withBoardParams(withType, null, null, 'feature')
+    expect(left.get('campaign')).toBe('summer')
+    expect(left.has('ticketType')).toBe(false)
+
+    expect(parseBoardTicketType(new URLSearchParams('ticketType=feature'))).toBe('feature')
+    expect(parseBoardTicketType(new URLSearchParams('ticketType=kanban'))).toBeNull()
+    expect(parseBoardTicketType(new URLSearchParams())).toBeNull()
   })
 })

@@ -81,3 +81,40 @@ describe("imageGeneration 失败态", () => {
     expect(screen.getByText(/quota exceeded/)).toBeInTheDocument();
   });
 });
+
+describe("TaskBody 隐藏内部指令", () => {
+  test("正文只显示短 description，不含 prompt 键名", () => {
+    render(
+      <ToolBody
+        name="Task"
+        input={{
+          description: "实现会话显示层根治修复",
+          prompt: "You are running inside OpenClaude\n/home/agent/.local/bin/host",
+          subagentType: { unspecified: {} },
+        }}
+        tool={tool({})}
+      />,
+    );
+    expect(screen.getByText("实现会话显示层根治修复")).toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("You are running inside OpenClaude");
+    expect(document.body.textContent).not.toContain("subagentType");
+    expect(document.body.textContent).not.toContain("/home/agent/.local/bin/host");
+  });
+
+  test("没有安全标题时回落「运行子任务」，结果仍可见", () => {
+    render(
+      <ToolBody
+        name="Agent"
+        input={{
+          prompt: "INTERNAL\nuid=3 HOME=/home/agent",
+          subagentType: "generalPurpose",
+        }}
+        tool={tool({ output: "已完成分析" })}
+      />,
+    );
+    expect(screen.getByText("运行子任务")).toBeInTheDocument();
+    expect(screen.getByText("已完成分析")).toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("INTERNAL");
+    expect(document.body.textContent).not.toContain("HOME=");
+  });
+});

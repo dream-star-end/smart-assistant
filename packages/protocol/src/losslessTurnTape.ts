@@ -15,6 +15,8 @@ export const LOSSLESS_TURN_TAPE_CAPABILITY = 'lossless-turn-tape-v2' as const
  * an older master can parse v2 tapes but cannot hydrate this storage format. */
 export const LOSSLESS_TURN_TAPE_RUNTIME_BATCH_CAPABILITY = 'lossless-turn-runtime-batch-v1' as const
 export const LOSSLESS_TURN_TAPE_PART_BYTES = 192 * 1024
+/** Compact visible envelope budget; full text remains in canonical parts. */
+export const LOSSLESS_TURN_TAPE_VISIBLE_TEXT_BYTES = 128 * 1024
 export const LOSSLESS_TURN_TAPE_SHA256_RE = /^[0-9a-f]{64}$/
 /** Reserved envelope identity used only when upgrading a pre-agentId v1
  * retry entry to the v2 tape protocol. Materialization maps it back to the
@@ -87,6 +89,43 @@ export interface LosslessTurnTapePartRequest {
   attemptNo?: number
 }
 
+export interface LosslessTurnTapeSettlement {
+  billingAnchorId: string
+  requestId?: string
+  engineBillings: DurableCodexBilling[]
+  text: string
+  ts: number
+  /** Visible head is clipped; canonical multipart bytes still contain the full text. */
+  truncated?: boolean
+  errorCode?: string
+}
+
+/**
+ * Small, independently acknowledged visibility commit. It deliberately
+ * precedes multipart upload so a broken/slow part path cannot make a completed
+ * answer disappear. Master commits the visible head + terminal dispatch from
+ * this envelope; parts/finalize remain the lossless audit/materialization path.
+ */
+export interface LosslessTurnTapeVisibleRequest {
+  protocolVersion: typeof LOSSLESS_TURN_TAPE_VERSION
+  action: 'visible'
+  sessionId: string
+  agentId: string
+  turnIndex: number
+  status: 'completed' | 'interrupted' | 'crashed'
+  waiveReason?: TurnWaiveReason
+  model?: string
+  turnKey: string
+  tapeId: string
+  tapeSha256: string
+  totalBytes: number
+  partCount: number
+  createdAt: number
+  dispatchId?: string
+  attemptNo?: number
+  settlement: LosslessTurnTapeSettlement
+}
+
 export interface LosslessTurnTapeFinalizeRequest {
   protocolVersion: typeof LOSSLESS_TURN_TAPE_VERSION
   action: 'finalize'
@@ -107,8 +146,46 @@ export interface LosslessTurnTapeFinalizeRequest {
   /** 同 part:dispatch 身份(master 收敛以 tape header 存量为准,finalize 携带仅为对称冗余)。 */
   dispatchId?: string
   attemptNo?: number
+  /**
+   * Compact billing/visible envelope from the same tape builder identity
+   * (docs/design/2026-08-19-turn-finalize-decoupling.md rev2 B1).
+   */
+  settlement?: LosslessTurnTapeSettlement
+}
+
+/** Record id namespace used by materializeLosslessTurn. */
+export function losslessRecordPrefix(sessionId: string, agentId: string, turnIndex: number): string {
+  const idPart = agentId === LOSSLESS_TURN_TAPE_LEGACY_AGENT_ID ? sessionId : `${sessionId}-${agentId}`
+  return `srv-${idPart}-t${turnIndex}`
+}
+
+/** Canonical billing-anchor record id matching materializeLosslessTurn. */
+export function losslessBillingAnchorId(input: {
+  sessionId: string
+  agentId: string
+  turnIndex: number
+  assistantSegments?: Array<{ index: number }>
+  text?: string
+  errorCode?: string
+  tools?: Array<{ blockId: string }>
+  agentGroups?: Array<{ runId: string }>
+  structuredBlocks?: Array<{ kind: string; blockId?: string; platformGoalId?: string }>
+  runtimeEvents?: Array<{ ordinal: number }>
+}): string {
+  const prefix = losslessRecordPrefix(input.sessionId, input.agentId, input.turnIndex)
+  const segs = input.assistantSegments
+  if (segs && segs.length > 0) return `${prefix}-s${segs[segs.length - 1]!.index}`
+  if ((input.text && input.text.length > 0) || input.errorCode) return prefix
+  const groups = input.agentGroups ?? []
+  if (groups.length > 0) return `${prefix}-agentgroup-${groups[groups.length - 1]!.runId}`
+  const tools = input.tools ?? []
+  if (tools.length > 0) return `${prefix}-tool-${tools[tools.length - 1]!.blockId}`
+  const runtime = input.runtimeEvents ?? []
+  if (runtime.length > 0) return `${prefix}-runtime-${runtime[runtime.length - 1]!.ordinal}`
+  return prefix
 }
 
 export type LosslessTurnTapeRequest =
+  | LosslessTurnTapeVisibleRequest
   | LosslessTurnTapePartRequest
   | LosslessTurnTapeFinalizeRequest

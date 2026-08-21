@@ -6,6 +6,7 @@
 DO $$
 DECLARE
   present_users INTEGER;
+  selfhost_profile BOOLEAN := current_setting('openclaude.migration_profile', true) = 'v5-selfhost';
   target RECORD;
 BEGIN
   IF EXISTS (
@@ -78,9 +79,16 @@ BEGIN
      'cursor-grok-4.5-high'
    );
 
-  SELECT COUNT(*) INTO present_users FROM users WHERE id IN (1, 4);
-  IF present_users NOT IN (0, 2) THEN
-    RAISE EXCEPTION '0210 requires users 1 and 4 together when either exists';
+  IF selfhost_profile THEN
+    -- The isolated selfhost DB has its own user-id space and no shared Cursor
+    -- credential mount. Keep the catalog hidden and grant nobody. This escape
+    -- hatch is exact opt-in; production/default profiles retain the hard gate.
+    present_users := 0;
+  ELSE
+    SELECT COUNT(*) INTO present_users FROM users WHERE id IN (1, 4);
+    IF present_users NOT IN (0, 2) THEN
+      RAISE EXCEPTION '0210 requires users 1 and 4 together when either exists';
+    END IF;
   END IF;
 
   IF present_users = 2 THEN

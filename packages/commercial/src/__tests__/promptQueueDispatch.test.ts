@@ -124,6 +124,24 @@ async function startBridge(options: {
 describe('commercial prompt queue dispatch grant', () => {
   test('strictly accepts the server-shaped internal request', () => {
     assert.deepEqual(parsePromptQueueDispatchRequest(request), request)
+    const withModelSwitch = {
+      ...request,
+      item: {
+        ...request.item,
+        requestedExecution: {
+          ...request.item.requestedExecution,
+          modelSwitchId: 'model-switch:test:1',
+        },
+      },
+    }
+    assert.deepEqual(parsePromptQueueDispatchRequest(withModelSwitch), withModelSwitch)
+    assert.equal(parsePromptQueueDispatchRequest({
+      ...withModelSwitch,
+      item: {
+        ...withModelSwitch.item,
+        requestedExecution: { ...withModelSwitch.item.requestedExecution, modelSwitchId: 'bad id' },
+      },
+    }), null)
   })
 
   test('rejects owner drift, unknown fields and browser-shaped claims', () => {

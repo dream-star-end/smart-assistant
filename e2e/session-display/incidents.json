@@ -1150,7 +1150,9 @@
       "rootFixCommit": "6d2c930c",
       "coverageCommits": [
         "bab6c8c6",
-        "d8b81aae"
+        "d8b81aae",
+        "54014c3d",
+        "d76aae91"
       ],
       "regressions": [
         {
@@ -1177,6 +1179,11 @@
           "layer": "integration",
           "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
           "assertion": "legacy stream accepts a later non-null client_message_id without identity conflict"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/regression-contracts/outboundDurabilityPermanentConflict.contract.test.ts",
+          "assertion": "REG-20260817: permanent live-frame conflict never closes the browser or poisons later frames"
         }
       ]
     },

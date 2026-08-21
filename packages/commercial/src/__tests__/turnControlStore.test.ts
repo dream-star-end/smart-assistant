@@ -5,7 +5,10 @@ import type { Pool } from 'pg'
 import {
   admitDurableControl,
   claimDueTurnControls,
+  DEFAULT_PERMISSION_TTL_MS,
   durableRetryDelayMs,
+  MAX_PERMISSION_TTL_MS,
+  resolvePermissionExpiresAt,
   settleStopControlsForTurn,
   TurnControlConflictError,
 } from '../dispatch/turnControlStore.js'
@@ -164,5 +167,32 @@ describe('Master durable turn controls', () => {
     assert.equal(durableRetryDelayMs(1), 2_000)
     assert.equal(durableRetryDelayMs(20), 300_000)
     assert.equal(durableRetryDelayMs(1, 45_000), 45_000)
+  })
+})
+
+describe('resolvePermissionExpiresAt (detached ask_user TTL)', () => {
+  const NOW = 1_720_000_000_000
+
+  test('omitted expiresAt keeps the legacy 30-minute window', () => {
+    assert.equal(resolvePermissionExpiresAt(undefined, NOW).getTime(), NOW + DEFAULT_PERMISSION_TTL_MS)
+    assert.equal(DEFAULT_PERMISSION_TTL_MS, 30 * 60_000)
+  })
+
+  test('frame-carried 24h expiry is used instead of 30 minutes', () => {
+    const expiresAt = NOW + 24 * 60 * 60_000
+    assert.equal(resolvePermissionExpiresAt(expiresAt, NOW).getTime(), expiresAt)
+    assert.equal(MAX_PERMISSION_TTL_MS, 24 * 60 * 60_000)
+  })
+
+  test('expiry further than 24h is capped', () => {
+    assert.equal(
+      resolvePermissionExpiresAt(NOW + 48 * 60 * 60_000, NOW).getTime(),
+      NOW + MAX_PERMISSION_TTL_MS,
+    )
+  })
+
+  test('past or non-numeric values fall back to 30 minutes', () => {
+    assert.equal(resolvePermissionExpiresAt(NOW - 1, NOW).getTime(), NOW + DEFAULT_PERMISSION_TTL_MS)
+    assert.equal(resolvePermissionExpiresAt('tomorrow', NOW).getTime(), NOW + DEFAULT_PERMISSION_TTL_MS)
   })
 })

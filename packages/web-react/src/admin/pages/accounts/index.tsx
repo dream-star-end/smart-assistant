@@ -30,6 +30,7 @@ import { RecentUsersModal, RefreshHistoryModal } from "./AccountInfoModals";
 import {
   AccountWarningChips,
   CooldownCell,
+  CursorPoolCell,
   LastUsed,
   LifetimeCell,
   QuotaCell,
@@ -47,6 +48,13 @@ import {
 
 const STATUS_KEY = "admin_acc_status";
 const PROVIDER_KEY = "admin_acc_provider";
+
+const PROVIDER_SECTIONS = [
+  { id: "cursor", title: "Cursor", desc: "Cursor 订阅 API Key 池" },
+  { id: "claude", title: "CCB", desc: "Claude Code 官方账号池" },
+  { id: "codex", title: "Codex", desc: "Codex 官方账号池" },
+  { id: "grok", title: "Grok", desc: "Grok Build 官方账号池" },
+] as const;
 
 function errMsg(e: unknown): string {
   return apiErrorMessage(e, "请求失败");
@@ -151,7 +159,6 @@ export default function AccountsPage() {
       ),
     },
     { key: "plan", title: "plan", width: 64, render: (a) => a.plan },
-    { key: "provider", title: "provider", width: 90, render: (a) => a.provider },
     { key: "status", title: "状态", width: 90, render: (a) => <StatusBadge status={a.status} /> },
     { key: "health", title: "health", align: "right", cellClassName: "tabular-nums", render: (a) => a.health_score ?? "—" },
     { key: "today", title: "今日 / 错误率", align: "right", render: (a) => <TodayCell a={a} /> },
@@ -169,6 +176,7 @@ export default function AccountsPage() {
         ),
     },
     { key: "group", title: "分组", width: 70, render: (a) => (a.group_id ? <span className="font-mono text-[12px]">#{a.group_id}</span> : <span className="text-faint">—</span>) },
+    { key: "cursor_pool", title: "Cursor 池", width: 120, render: (a) => <CursorPoolCell a={a} /> },
     { key: "q5h", title: "5h%", align: "right", render: (a) => <QuotaCell pct={a.quota_5h_pct} updatedAt={a.quota_updated_at} /> },
     { key: "q5hr", title: "5h 重置", align: "right", render: (a) => <ResetCell resetsAt={a.quota_5h_resets_at} /> },
     { key: "q7d", title: "7d%", align: "right", render: (a) => <QuotaCell pct={a.quota_7d_pct} updatedAt={a.quota_updated_at} /> },
@@ -300,7 +308,8 @@ export default function AccountsPage() {
           onChange={onProviderChange}
           options={[
             { label: "全部", value: "" },
-            { label: "Claude", value: "claude" },
+            { label: "Cursor", value: "cursor" },
+            { label: "CCB", value: "claude" },
             { label: "Codex", value: "codex" },
             { label: "Grok", value: "grok" },
           ]}
@@ -321,13 +330,28 @@ export default function AccountsPage() {
           加载失败:{errMsg(error)}
         </div>
       ) : (
-        <DataTable
-          columns={columns}
-          rows={rows}
-          rowKey={(a) => a.id}
-          loading={loading && !data}
-          emptyTitle="无匹配账号"
-        />
+        <div className="flex flex-col gap-6">
+          {PROVIDER_SECTIONS.filter((section) => !provider || provider === section.id).map((section) => {
+            const sectionRows = rows.filter((row) => row.provider === section.id);
+            return (
+              <section key={section.id} className="flex flex-col gap-3">
+                <div className="flex items-end justify-between gap-3">
+                  <div>
+                    <h2 className="text-[15px] font-semibold text-fg">{section.title}</h2>
+                    <p className="text-[12px] text-muted">{section.desc} · {sectionRows.length} 条</p>
+                  </div>
+                </div>
+                <DataTable
+                  columns={columns}
+                  rows={sectionRows}
+                  rowKey={(a) => a.id}
+                  loading={loading && !data}
+                  emptyTitle={`${section.title} 暂无账号`}
+                />
+              </section>
+            );
+          })}
+        </div>
       )}
 
       <AccountFormModal

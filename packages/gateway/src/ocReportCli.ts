@@ -50,7 +50,12 @@ function which(bin: string): boolean {
 }
 
 function main(): void {
-  const flags = parseFlags(process.argv.slice(2));
+  const argv = process.argv.slice(2);
+  if (argv[0] === "help" || argv[0] === "--help" || argv[0] === "-h") {
+    process.stdout.write("usage: oc-report --schema <f> --manifest <f> [-o out.{pdf,docx,html,md}]\n");
+    process.exit(0);
+  }
+  const flags = parseFlags(argv);
   if (!flags.schema || !flags.manifest) fail("usage: oc-report --schema <f> --manifest <f> [-o out.{pdf,docx,html,md}]");
   const schema = readJson<ReportSchema>(flags.schema);
   // oc-cite check/fix 的输出是 { manifest: {...} }(外层包了一层);直接传它即可,这里自动取

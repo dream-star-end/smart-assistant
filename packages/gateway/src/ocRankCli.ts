@@ -24,6 +24,10 @@ function flagVal(args: string[], name: string): string | undefined {
 
 function main(): void {
   const [cmd, ...rest] = process.argv.slice(2);
+  if (cmd === "help" || cmd === "--help" || cmd === "-h") {
+    process.stdout.write("usage: oc-rank elo --matches <file>\n");
+    process.exit(0);
+  }
   if (cmd !== "elo") fail("usage: oc-rank elo --matches <file>");
   const file = flagVal(rest, "--matches");
   if (!file) fail("elo --matches <file>");

@@ -354,7 +354,7 @@ describe('seedPlatformResearchAgents (integ)', () => {
 })
 
 describe('seedPlatformGeneralAgents (integ) — 办公助手 + 编程助手', () => {
-  const GENERAL_SLUGS = ['coding-assistant', 'office-assistant']
+  const GENERAL_SLUGS = ['coding-assistant', 'general-assistant', 'office-assistant']
 
   test('seed → 通用 agent(办公+编程)成为已批准、可搜的 agent listing(无条件,不依赖 research_config)', async (t) => {
     if (skip(t)) return
@@ -374,9 +374,10 @@ describe('seedPlatformGeneralAgents (integ) — 办公助手 + 编程助手', ()
       await listCurrentAgentDefaults(GENERAL_SLUGS),
       {
         'coding-assistant': { version: '1.0.3', model: 'glm-5.3' },
+        'general-assistant': { version: '1.0.0', model: 'auto' },
         'office-assistant': { version: '1.0.1', model: 'MiniMax-M3' },
       },
-      '当前 approved 版本应体现不同助手的默认模型(办公 MiniMax,编程 GLM-5.3 Coding Plan)',
+      '当前 approved 版本应体现不同助手的默认模型(办公 MiniMax,编程 GLM-5.3 Coding Plan,通用 auto=不锁模型)',
     )
 
     // kind 隔离:通用 agent 不进 skill 目录。
@@ -456,8 +457,8 @@ describe('seedPlatformGeneralAgents (integ) — 办公助手 + 编程助手', ()
     const slugs = (await listApprovedForSearch('agent')).map((a) => a.slug).sort()
     assert.deepEqual(
       slugs,
-      ['coding-assistant', 'office-assistant', 'research-assistant'],
-      '三类平台 agent 应并存',
+      ['coding-assistant', 'general-assistant', 'office-assistant', 'research-assistant'],
+      '三类平台 agent 应并存(通用助手 model=auto 不要求在 listPublicModels 内)',
     )
   })
 })

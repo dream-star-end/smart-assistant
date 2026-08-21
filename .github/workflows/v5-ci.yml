@@ -54,7 +54,7 @@ jobs:
             run: npm run test:storage && npm run test:mcp-memory
             timeout: 15
           - name: web-react
-            run: npm run check:v5:incidents && npm run check:v5:e2e-selectors && npm run check:tutorials && npm run test:web-react
+            run: npm run check:v5:incidents && npm run check:v5:regression-contracts && npm run check:v5:e2e-selectors && npm run check:tutorials && npm run test:web-react
             timeout: 30
           - name: web-react-browser
             # test:browser = 真 Chromium 组件冒烟(browser-tests):受信点击断言交互契约。
@@ -86,6 +86,7 @@ jobs:
       - name: Run ${{ matrix.name }}
         env:
           TUTORIAL_HISTORY_BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before || '' }}
+          REGRESSION_CONTRACT_BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before || '' }}
         run: ${{ matrix.run }}
 
   v5-ops:

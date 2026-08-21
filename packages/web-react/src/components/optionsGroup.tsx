@@ -4,16 +4,20 @@
  * (boss 实测踩坑:点了第一题即发送,后两题没机会答)。
  *
  * 语义:
- *  - 消息里只有 1 个单选块 → 点击即发(保留最顺手的路径);
- *  - ≥2 个块 → 逐题点选只记录(单选可换选),Markdown 下方的 GroupFooter 显示
- *    「已答 x/y」,全部答完才能「发送选择」,聚合成一条回复一次发出;
+ *  - 非流式且只有 1 个单选块 → 点击即发(保留最顺手的路径);
+ *  - 流式(live)期间点选永远可点,但禁止任何隐式发送:即使目前只看到 1 块
+ *    也只暂存,必须渲染页脚由用户显式点「发送选择」(长回合中途就会贴卡,
+ *    后继 options 的 JSON 也可能还是半截);
+ *  - ≥2 个块(流式或非流式)→ 逐题点选只记录(单选可换选),GroupFooter 显示
+ *    「已作答 x/y」,至少答 1 题即可「发送选择」,未答的题标成「(未答)」,
+ *    聚合成一条回复一次发出;流式期页脚发送按钮同样可用;
  *  - 发送后整组锁定。
  *
  * 本模块刻意轻量(不进 MarkdownImpl 懒加载 chunk 也无妨):Message.tsx 每条
  * assistant 消息包一个 Provider(store 挂 useRef,随消息实例存活),RichBlocks 的
  * OptionsBlock 经 useOptionsGroup 注册/上报,Footer 用 useSyncExternalStore 订阅。
  */
-import { createContext, useCallback, useContext, useMemo, useRef, useSyncExternalStore } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useSyncExternalStore } from "react";
 import type { ReactNode } from "react";
 import { useChatInteraction } from "./tool/context";
 
@@ -31,22 +35,26 @@ interface Snapshot {
   sent: boolean;
   count: number;
   answered: number;
+  /** 本条消息是否仍在流式生成。live 期间禁止隐式发送,页脚必须出现。 */
+  live: boolean;
 }
 
 export interface OptionsGroupStore {
   register: (key: string, meta: { question?: string; multi: boolean }) => void;
   unregister: (key: string) => void;
   setAnswer: (key: string, labels: string[]) => void;
+  setLive: (live: boolean) => void;
   markSent: () => void;
   getSnapshot: () => Snapshot;
   subscribe: (cb: () => void) => () => void;
 }
 
-export function createOptionsGroupStore(): OptionsGroupStore {
+export function createOptionsGroupStore(initialLive = false): OptionsGroupStore {
   const entries = new Map<string, OptionsGroupEntry>();
   let order = 0;
   let sent = false;
-  let snapshot: Snapshot = { entries: [], sent: false, count: 0, answered: 0 };
+  let live = initialLive;
+  let snapshot: Snapshot = { entries: [], sent: false, count: 0, answered: 0, live: initialLive };
   const listeners = new Set<() => void>();
   const emit = () => {
     const list = [...entries.values()].sort((a, b) => a.order - b.order);
@@ -55,6 +63,7 @@ export function createOptionsGroupStore(): OptionsGroupStore {
       sent,
       count: list.length,
       answered: list.filter((e) => e.labels.length > 0).length,
+      live,
     };
     for (const cb of listeners) cb();
   };
@@ -79,6 +88,11 @@ export function createOptionsGroupStore(): OptionsGroupStore {
       const e = entries.get(key);
       if (!e || sent) return;
       e.labels = labels;
+      emit();
+    },
+    setLive(next) {
+      if (live === next) return;
+      live = next;
       emit();
     },
     markSent() {
@@ -111,15 +125,18 @@ export function useOptionsGroupSnapshot(): Snapshot | null {
 }
 
 /** 每条 assistant 消息一个 Provider;store 随消息组件实例存活(流式重渲不重置)。 */
-export function OptionsGroupProvider({ children }: { children: ReactNode }) {
+export function OptionsGroupProvider({ children, live = false }: { children: ReactNode; live?: boolean }) {
   const storeRef = useRef<OptionsGroupStore | null>(null);
-  if (!storeRef.current) storeRef.current = createOptionsGroupStore();
+  if (!storeRef.current) storeRef.current = createOptionsGroupStore(live);
+  useEffect(() => {
+    storeRef.current?.setLive(live);
+  }, [live]);
   return (
     <OptionsGroupContext.Provider value={storeRef.current}>{children}</OptionsGroupContext.Provider>
   );
 }
 
-/** 多题时的统一发送条(渲染在消息 Markdown 之后;<2 题 / 已发 / 不可交互时隐身)。 */
+/** 多题或流式单块时的统一发送条(渲染在消息 Markdown 之后;非流式单块 / 已发 / 不可交互时隐身)。 */
 export function OptionsGroupFooter() {
   const store = useOptionsGroup();
   const snap = useOptionsGroupSnapshot();
@@ -131,19 +148,24 @@ export function OptionsGroupFooter() {
     );
     return `我的选择:\n${lines.join("\n")}`;
   }, [snap]);
-  if (!store || !snap || snap.count < 2 || !sendUserText) return null;
+  // 没有已解析的 options 块时不渲染空页脚(避免思考过程出现「已作答 0/0」)。
+  // 流式期只要有 ≥1 块就必须出页脚(禁止点击即发);非流式只在 ≥2 块时出页脚。
+  const showFooter = !!snap && snap.count >= 1 && (snap.live || snap.count >= 2);
+  if (!store || !snap || !showFooter || !sendUserText) return null;
   if (snap.sent)
     return <p className="mt-1.5 text-[11.5px] text-faint">已发送全部选择。</p>;
-  const ready = snap.answered === snap.count;
+  const ready = snap.answered >= 1;
+  // 生产里 busy===sending===live;流式期忽略 busy,否则长回合发不出选择。
+  const blockedByBusy = !!busy && !snap.live;
   return (
     <div className="mt-2 flex items-center justify-between gap-3 rounded-xl border border-border bg-surface px-3.5 py-2.5">
       <span className="text-[12.5px] text-muted">
         已作答 <span className="font-medium text-fg">{snap.answered}</span> / {snap.count} 题
-        {!ready && <span className="text-faint"> —— 每题点选后一次性发送</span>}
+        {!ready ? <span className="text-faint"> —— 每题点选后一次性发送</span> : null}
       </span>
       <button
         type="button"
-        disabled={!ready || !!busy}
+        disabled={!ready || blockedByBusy}
         onClick={() => {
           store.markSent();
           sendUserText(text);

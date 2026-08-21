@@ -38,6 +38,7 @@ import {
   LOSSLESS_TURN_TAPE_VERSION,
   type LosslessTurnTapeFinalizeRequest,
   type LosslessTurnTapePartRequest,
+  type LosslessTurnTapeVisibleRequest,
 } from "@openclaude/protocol";
 
 // ─── tiny test fixtures ─────────────────────────────────────────────────
@@ -112,7 +113,7 @@ describe("internal turn-tape-state lease response", () => {
       storage: {
         async getTurnTapeStateByDispatch(userId, seenDispatchId, attemptNo) {
           call = { userId, dispatchId: seenDispatchId, attemptNo };
-          return { state: "none", status: null, dispatchLeaseActive: true };
+          return { state: "none", status: null, dispatchLeaseActive: true, gatewayShutdownEvidence: false };
         },
       },
     });
@@ -132,6 +133,7 @@ describe("internal turn-tape-state lease response", () => {
       state: "none",
       status: null,
       dispatchLeaseActive: true,
+      gatewayShutdownEvidence: false,
     });
   });
 });
@@ -225,6 +227,146 @@ describe("internalServerAuthored handler — lossless v2 multipart", () => {
     );
     assert.equal(finalRes.rec.status, 200);
     assert.equal(JSON.parse(finalRes.rec.body).recordCount, 1);
+  });
+
+  test("accepts and discards legacy settlement on part while keeping the part schema strict", async () => {
+    const bytes = Buffer.from("legacy-part", "utf8");
+    const sha = createHash("sha256").update(bytes).digest("hex");
+    let staged = 0;
+    let finalized = 0;
+    const handler = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: fakeStorage(async () => ({ applied: true })),
+      losslessTurnTapeStorage: {
+        async stageLosslessTurnTapePart(_userId, body, payload) {
+          staged++;
+          assert.ok(!("settlement" in body));
+          assert.deepEqual(payload, bytes);
+          return { applied: "stored" };
+        },
+        async finalizeLosslessTurnTape() {
+          finalized++;
+          return { applied: "finalized", recordCount: 1, engineBillings: [] };
+        },
+      },
+    });
+    const part: LosslessTurnTapePartRequest = {
+      protocolVersion: LOSSLESS_TURN_TAPE_VERSION,
+      action: "part",
+      sessionId: "web-test1",
+      agentId: "main",
+      turnIndex: 1,
+      status: "completed",
+      turnKey: "a".repeat(64),
+      tapeId: "b".repeat(64),
+      tapeSha256: sha,
+      totalBytes: bytes.length,
+      partCount: 1,
+      partIndex: 0,
+      partSha256: sha,
+      data: bytes.toString("base64"),
+      createdAt: 1_783_944_000_000,
+    };
+    const settlement = {
+      billingAnchorId: "srv-web-test1-main-t1-s0",
+      requestId: "request-legacy-part",
+      engineBillings: [],
+      text: "already-rendered answer",
+      ts: part.createdAt,
+    };
+
+    const accepted = makeRes();
+    await handler(
+      makeReq({
+        body: JSON.stringify({ ...part, settlement }),
+        auth: `Bearer ${VALID_TOKEN}`,
+      }),
+      accepted.res,
+      CTX,
+    );
+    assert.equal(accepted.rec.status, 200);
+    assert.equal(staged, 1);
+    assert.equal(finalized, 0);
+
+    const rejected = makeRes();
+    await handler(
+      makeReq({
+        body: JSON.stringify({ ...part, settlement, unexpectedPartField: true }),
+        auth: `Bearer ${VALID_TOKEN}`,
+      }),
+      rejected.res,
+      CTX,
+    );
+    assert.equal(rejected.rec.status, 400);
+    assert.equal(JSON.parse(rejected.rec.body).error.code, "INVALID_TURN_TAPE_PART");
+    assert.equal(staged, 1);
+    assert.equal(finalized, 0);
+  });
+
+  test("visible action commits and broadcasts authoritative final before any part", async () => {
+    const broadcasts: Array<{ uid: bigint; payload: Record<string, unknown> }> = [];
+    let staged = 0;
+    const handler = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: fakeStorage(async () => ({ applied: true })),
+      losslessTurnTapeStorage: {
+        async commitVisibleLosslessTurnTape(_userId, body) {
+          assert.equal(body.action, "visible");
+          return {
+            applied: "finalized",
+            recordCount: 0,
+            engineBillings: [],
+            settlementHandoff: true,
+            newlyVisible: true,
+            clientMessageId: "cm-visible-1",
+          };
+        },
+        async stageLosslessTurnTapePart() {
+          staged++;
+          return { applied: "stored" };
+        },
+        async finalizeLosslessTurnTape() {
+          return { applied: "finalized", recordCount: 0, engineBillings: [] };
+        },
+      },
+      broadcastToUser(uid, payload) {
+        broadcasts.push({ uid, payload });
+      },
+    });
+    const body: LosslessTurnTapeVisibleRequest = {
+      protocolVersion: LOSSLESS_TURN_TAPE_VERSION,
+      action: "visible",
+      sessionId: "web-test1",
+      agentId: "main",
+      turnIndex: 1,
+      status: "completed",
+      turnKey: "a".repeat(64),
+      tapeId: "b".repeat(64),
+      tapeSha256: "c".repeat(64),
+      totalBytes: 2,
+      partCount: 1,
+      createdAt: 1_783_944_000_000,
+      dispatchId: "3e0a2b52-9d31-4c8f-9b6e-000000000010",
+      attemptNo: 1,
+      settlement: {
+        billingAnchorId: "srv-web-test1-main-t1",
+        engineBillings: [],
+        text: "visible answer",
+        ts: 1_783_944_000_000,
+      },
+    };
+    const out = makeRes();
+    await handler(makeReq({ body: JSON.stringify(body), auth: `Bearer ${VALID_TOKEN}` }), out.res, CTX);
+    assert.equal(out.rec.status, 200);
+    assert.equal(staged, 0, "visible commit must not depend on multipart staging");
+    assert.equal(broadcasts.length, 1);
+    assert.equal(broadcasts[0]!.uid, 42n);
+    assert.equal(broadcasts[0]!.payload.isFinal, true);
+    assert.equal(
+      (broadcasts[0]!.payload.meta as { reconcile?: string }).reconcile,
+      "turn_completed",
+    );
+    assert.equal(broadcasts[0]!.payload.clientMessageId, "cm-visible-1");
   });
 
   test("does not ACK a finalized paid tape until durable Codex billing settles", async () => {
@@ -597,13 +739,13 @@ describe("internalServerAuthored handler — lossless turn tape error classifica
 // ─── tests ───────────────────────────────────────────────────────────────
 
 describe("internalServerAuthored handler — method gate", () => {
-  test("405 on non-POST", async () => {
+  test("405 on PUT", async () => {
     const handler = makeServerAuthoredHandler({
       identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
       storage: fakeStorage(async () => ({ applied: true })),
     });
     const { res, rec } = makeRes();
-    await handler(makeReq({ method: "GET" }), res, CTX);
+    await handler(makeReq({ method: "PUT" }), res, CTX);
     assert.equal(rec.status, 405);
   });
 });
@@ -1665,7 +1807,7 @@ describe("internalServerAuthored handler — sink persist metric outcomes", () =
       metric: m.metric,
     });
     const { res } = makeRes();
-    await h(makeReq({ method: "GET" }), res, CTX);
+    await h(makeReq({ method: "PUT" }), res, CTX);
     assert.deepEqual(m.calls, []);
   });
 });
@@ -3133,3 +3275,178 @@ describe("internalServerAuthored handler — agent-group durability (P2 债A)", 
     assert.equal(resRec.status, 400);
   });
 })
+
+describe("internalServerAuthored handler — detached ask_user permissionCards", () => {
+  type Call = [V3SinkPersistOutcome, V3SinkPersistRole | undefined];
+  function captureMetricRich(): { calls: Call[]; metric: (o: V3SinkPersistOutcome, r?: V3SinkPersistRole) => void } {
+    const calls: Call[] = [];
+    return { calls, metric: (o, r) => calls.push([o, r]) };
+  }
+  function authed(body: string) {
+    return makeReq({ body, auth: `Bearer ${VALID_TOKEN}` });
+  }
+  function permCard(over: Record<string, unknown> = {}) {
+    return {
+      requestId: "ask-user:" + "ab".repeat(16),
+      questions: [{ question: "Which editor?", options: [{ label: "Vim" }, { label: "Emacs" }] }],
+      sessionKey: "agent:main:webchat:dm:sess12345",
+      expiresAt: 1_720_086_400_000,
+      ts: 1_720_000_000_000,
+      channel: "webchat",
+      peer: { id: "sess12345", kind: "dm" },
+      ...over,
+    };
+  }
+  function recStore(): {
+    storage: ServerAuthoredStorage;
+    rows: Array<Record<string, unknown>>;
+    patches: Array<{ msgId: string; patch: Record<string, unknown> }>;
+  } {
+    const rows: Array<Record<string, unknown>> = [];
+    const patches: Array<{ msgId: string; patch: Record<string, unknown> }> = [];
+    const store: ServerAuthoredStorage = {
+      async appendServerAuthoredMessage(_s, _u, msg) {
+        rows.push({ ...(msg as unknown as Record<string, unknown>) });
+        return { applied: true };
+      },
+      async appendServerAuthoredMessageForRequest(_r, s, u, msg) {
+        const r = await store.appendServerAuthoredMessage(s, u, msg);
+        return r.applied ? { applied: true } : { applied: false, reason: r.reason ?? "malformed" };
+      },
+      async appendServerAuthoredMessageDrainByUser(s, u, msg) {
+        const r = await store.appendServerAuthoredMessage(s, u, msg);
+        return r.applied ? { applied: true } : { applied: false, reason: r.reason ?? "malformed" };
+      },
+      async drainDelegateCostForClientSession() { return { merged: "0", drained: 0 }; },
+      async getClientSession() {
+        return { messages: rows };
+      },
+      async readArchivedMessages() {
+        return { messages: [], hasMore: false, oldestSeq: null };
+      },
+      async patchServerAuthoredMessage(_s, _u, msgId, patch) {
+        patches.push({ msgId, patch });
+        const idx = rows.findIndex((r) => r.id === msgId);
+        if (idx >= 0) rows[idx] = { ...rows[idx], ...patch };
+        return { applied: true as const };
+      },
+    };
+    return { storage: store, rows, patches };
+  }
+  function handler(rec: ReturnType<typeof recStore>, m: ReturnType<typeof captureMetricRich>) {
+    return makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+      metric: m.metric,
+    });
+  }
+
+  test("permission-only sidecar persists role:permission with requestId as id + 200", async () => {
+    const rec = recStore();
+    const m = captureMetricRich();
+    const { res, rec: resRec } = makeRes();
+    const card = permCard();
+    await handler(rec, m)(authed(JSON.stringify({
+      sessionId: "sess12345", agentId: "main", turnIndex: 0, status: "completed",
+      text: "",
+      permissionCards: [card],
+    })), res, CTX);
+    assert.equal(resRec.status, 200);
+    const row = rec.rows.find((r) => r.role === "permission");
+    assert.ok(row, "permission row was written");
+    assert.equal(row!.id, card.requestId);
+    assert.equal(row!.requestId, card.requestId);
+    assert.equal(row!._detachedAskUser, true);
+    assert.equal(row!._askUserExpiresAt, card.expiresAt);
+    assert.equal(row!._askUserUserId, "c:42", "userId derived from identity, not the wire");
+    assert.equal(row!.toolName, "AskUserQuestion");
+    assert.ok(m.calls.some((c) => c[0] === "ok" && c[1] === "permission"));
+  });
+
+  test("old payload without permissionCards still 200 (backward compatible)", async () => {
+    const rec = recStore();
+    const m = captureMetricRich();
+    const { res, rec: resRec } = makeRes();
+    await handler(rec, m)(authed(JSON.stringify({
+      sessionId: "sess12345", agentId: "main", turnIndex: 1, status: "completed",
+      text: "hello", requestId: "req-12345abc",
+    })), res, CTX);
+    assert.equal(resRec.status, 200);
+    assert.equal(rec.rows.some((r) => r.role === "permission"), false);
+  });
+
+  test("schema rejects a permission card with a client-controlled id", async () => {
+    const rec = recStore();
+    const m = captureMetricRich();
+    const { res, rec: resRec } = makeRes();
+    await handler(rec, m)(authed(JSON.stringify({
+      sessionId: "sess12345", agentId: "main", turnIndex: 0, status: "completed",
+      text: "",
+      permissionCards: [permCard({ requestId: "not-an-ask-user-id" })],
+    })), res, CTX);
+    assert.equal(resRec.status, 400);
+    assert.equal(rec.rows.length, 0);
+  });
+
+  test("GET hydrates a previously persisted permission card by requestId", async () => {
+    const rec = recStore();
+    const m = captureMetricRich();
+    const card = permCard();
+    const { res: postRes, rec: postRec } = makeRes();
+    await handler(rec, m)(authed(JSON.stringify({
+      sessionId: "sess12345", agentId: "main", turnIndex: 0, status: "completed",
+      text: "",
+      permissionCards: [card],
+    })), postRes, CTX);
+    assert.equal(postRec.status, 200);
+
+    const { res, rec: resRec } = makeRes();
+    await handler(rec, m)(makeReq({
+      method: "GET",
+      auth: `Bearer ${VALID_TOKEN}`,
+      url: `${SERVER_AUTHORED_PATH}?sessionId=sess12345&requestId=${card.requestId}`,
+    }), res, CTX);
+    assert.equal(resRec.status, 200);
+    const body = JSON.parse(resRec.body) as { ok: boolean; message: Record<string, unknown> };
+    assert.equal(body.ok, true);
+    assert.equal(body.message.id, card.requestId);
+    assert.equal(body.message._detachedAskUser, true);
+    assert.equal(body.message._askUserExpiresAt, card.expiresAt);
+    assert.equal(body.message._askUserUserId, "c:42");
+  });
+
+  test("permissionPatches mark the durable card resolved and persist the user answer", async () => {
+    const rec = recStore();
+    const m = captureMetricRich();
+    const card = permCard();
+    rec.rows.push({
+      id: card.requestId,
+      role: "permission",
+      _resolved: false,
+      _detachedAskUser: true,
+    });
+    const { res, rec: resRec } = makeRes();
+    await handler(rec, m)(authed(JSON.stringify({
+      sessionId: "sess12345", agentId: "main", turnIndex: 0, status: "completed",
+      text: "",
+      permissionPatches: [{
+        requestId: card.requestId,
+        behavior: "allow",
+        settledReason: "remote",
+        answers: { "Which editor?": "Vim" },
+      }],
+      userAnswerMessages: [{
+        id: "ask-ans-sess12345abcdefghijkl",
+        text: "用户已回答提问：\n\nWhich editor?\n选择：Vim",
+      }],
+    })), res, CTX);
+    assert.equal(resRec.status, 200);
+    assert.equal(rec.patches.length, 1);
+    assert.equal(rec.patches[0]!.msgId, card.requestId);
+    assert.equal(rec.patches[0]!.patch._resolved, true);
+    assert.equal(rec.patches[0]!.patch._behavior, "allow");
+    const userRow = rec.rows.find((r) => r.role === "user");
+    assert.ok(userRow);
+    assert.equal(userRow!.id, "ask-ans-sess12345abcdefghijkl");
+  });
+});

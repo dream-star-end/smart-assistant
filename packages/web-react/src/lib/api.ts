@@ -12,6 +12,13 @@ import type {
   CommunityTutorialPage,
   CommunityTutorialPending,
   CommunityTutorialSummary,
+  TutorialEvalCompassItem,
+  TutorialEvalJob,
+  TutorialEvalRecordInput,
+  TutorialEvalSpec,
+  TutorialEvalSpecDraft,
+  TutorialSnapshotDraft,
+  TutorialSnapshotSubmitResult,
   CronCreateInput,
   CronJob,
   GithubBranch,
@@ -51,6 +58,7 @@ import type {
   MemoryConflict,
   PutMemoryResult,
   MemoryIndexResponse,
+  MemoryUsageDashboard,
   AutoDreamReportResponse,
   AutoDreamOptimizerState,
   MemoryFileContent,
@@ -60,8 +68,18 @@ import type {
   Preferences,
   PublicConfig,
   PublicModel,
+  PatchSessionMetaInput,
+  SessionBatchInput,
+  SessionBatchResult,
+  SessionListPage,
+  SessionListQuery,
+  SessionSearchResponse,
   PutSessionInput,
   PutSessionResult,
+  ChatProject,
+  CreateProjectAssetInput,
+  PatchProjectAssetInput,
+  ProjectAsset,
   RefreshOutcome,
   RefreshResult,
   RegisterResult,
@@ -516,6 +534,21 @@ export type ResponseRatingInput = {
 /** 会话已评回读结果：messageId → {rating, tags}（不含 comment）。 */
 export type SessionRatingsMap = Record<string, { rating: "up" | "down"; tags: string[] }>;
 
+export type RatingNudgeState = "exposed" | "rated" | "dismissed";
+export type SessionRatingSnapshot = {
+  ratings: SessionRatingsMap;
+  nudges: Record<string, RatingNudgeState>;
+};
+
+export type ResponseRatingNudgeInput = {
+  messageId: string;
+  sessionId?: string;
+  traceId?: string;
+  clientBuild?: string;
+  sampleBucket: number;
+  nudgeAction: "expose" | "dismiss";
+};
+
 /** 自由文本反馈：设置页与消息级入口用判别联合隔离各自允许发送的上下文。 */
 export type FeedbackCategory = "bug" | "feature" | "ux" | "other";
 
@@ -791,6 +824,13 @@ export async function jsonOrThrow<T>(p: Promise<Response> | Response): Promise<T
   return body;
 }
 
+/** 资产写接口回 `{ asset }`，早期契约回裸对象；两种都收。 */
+function unwrapProjectAsset(
+  body: { asset?: ProjectAsset } & Partial<ProjectAsset>,
+): ProjectAsset {
+  return (body.asset ?? body) as ProjectAsset;
+}
+
 /**
  * 企业席位订单下单响应 → OrgPayResult。与批次 F issueOrderQr 同形：
  * `{ ok, data: { order_no, qrcode_url, mobile_url, amount_cents, credits, expires_at } }`。
@@ -998,6 +1038,9 @@ export async function getExactDeferredPayload(
   }
   return { bytes: target.buffer, contentSha256, recordId, role };
 }
+
+/** Per live-frames HTTP request. Journal hydrate adds its own page/time cap. */
+export const LIVE_FRAMES_REQUEST_TIMEOUT_MS = 12_000;
 
 export const api = {
   // ── 鉴权 ───────────────────────────────────────────────────────────
@@ -1604,13 +1647,95 @@ export const api = {
 
   // ── 会话历史（权威源 = gateway，camelCase wire；走 Bearer + callWithRefresh） ──
 
-  /** 列出我的会话（GET /api/sessions/list，Bearer）。无 messages 的元数据列表。 */
+  /** 列出我的会话（GET /api/sessions/list，Bearer）。无 messages 的元数据列表。
+   *  无参时与历史行为一致（返回数组，忽略 nextCursor），供既有调用方 / App 测试桩继续工作。 */
   listSessions: (a: AuthSession): Promise<SessionMeta[]> =>
-    jsonOrThrow<{ sessions: SessionMeta[] }>(
+    api.listSessionsPage(a).then((page) => page.sessions),
+
+  /**
+   * 会话列表分页（GET /api/sessions/list?limit=&before=&includeArchived=1）。
+   * 不传 query 时后端行为与全量列表一致；有 nextCursor 则可继续用 before 拉下一页。
+   */
+  listSessionsPage: (a: AuthSession, query?: SessionListQuery): Promise<SessionListPage> => {
+    const params = new URLSearchParams();
+    if (query?.limit != null) params.set("limit", String(query.limit));
+    if (query?.before != null) params.set("before", String(query.before));
+    if (query?.includeArchived) params.set("includeArchived", "1");
+    const qs = params.toString();
+    return jsonOrThrow<{ sessions: SessionMeta[]; nextCursor?: number }>(
       callWithRefresh(a, (t) =>
-        fetch("/api/sessions/list", { credentials: "include", headers: bearerHeaders(t) }),
+        fetch(`/api/sessions/list${qs ? `?${qs}` : ""}`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
       ),
-    ).then((b) => b.sessions || []),
+    ).then((b) => ({ sessions: b.sessions || [], nextCursor: b.nextCursor }));
+  },
+
+  /**
+   * 全文搜索会话（GET /api/sessions/search?q=&limit=30&includeArchived=0）。
+   * signal 用于输入变更取消在途请求。
+   */
+  searchSessions: (
+    a: AuthSession,
+    q: string,
+    opts?: { limit?: number; includeArchived?: boolean; signal?: AbortSignal },
+  ): Promise<SessionSearchResponse> => {
+    const params = new URLSearchParams();
+    params.set("q", q);
+    params.set("limit", String(opts?.limit ?? 30));
+    params.set("includeArchived", opts?.includeArchived ? "1" : "0");
+    return jsonOrThrow<SessionSearchResponse>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/sessions/search?${params.toString()}`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+          signal: opts?.signal,
+        }),
+      ),
+    ).then((b) => ({ results: Array.isArray(b.results) ? b.results : [] }));
+  },
+
+  /**
+   * 批量归档 / 取消归档 / 删除 / 移动项目（POST /api/sessions/batch）。
+   */
+  batchSessions: (a: AuthSession, body: SessionBatchInput): Promise<SessionBatchResult> =>
+    jsonOrThrow<SessionBatchResult>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/sessions/batch", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(body),
+        }),
+      ),
+    ),
+
+  /**
+   * 打开会话标已读（POST /api/sessions/:id/read）。不挂 GET :id，避免预取/搜索误标。
+   */
+  markSessionRead: (a: AuthSession, id: string): Promise<{ ok: true; updated: number }> =>
+    jsonOrThrow<{ ok: true; updated: number }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/sessions/${encodeURIComponent(id)}/read`, {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+        }),
+      ),
+    ),
+
+  /** 全部标已读（POST /api/sessions/read-all）。 */
+  markAllSessionsRead: (a: AuthSession): Promise<{ ok: true; updated: number }> =>
+    jsonOrThrow<{ ok: true; updated: number }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/sessions/read-all", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+        }),
+      ),
+    ),
 
   /**
    * 取单个会话（GET /api/sessions/:id，Bearer）。
@@ -1678,17 +1803,95 @@ export const api = {
   },
 
   /** Cursor-paged exact runtime frames persisted before their original WS
-   * delivery.  Callers keep paging until hasMore=false; there is no total cap. */
+   * delivery. Callers page until hasMore=false; hydrateDurableLiveFrameJournal
+   * owns the total page/time cap. Each request has a timeout so a stuck SQL
+   * plan cannot pin the restore loop forever. */
   getSessionLiveFrames: (
     a: AuthSession,
     id: string,
     after = "0",
     limit = 200,
+    opts?: { signal?: AbortSignal; timeoutMs?: number },
   ): Promise<DurableLiveFramePage> => {
-    const params = new URLSearchParams({ after, limit: String(limit) });
+    const params = new URLSearchParams();
+    // First shot uses after=0 (LIVE_JOURNAL_OPEN_CURSOR). seek=tail is
+    // opt-in only — do not send it as the open-session default.
+    if (after === "tail") {
+      params.set("seek", "tail");
+      params.set("limit", String(limit));
+    } else {
+      params.set("after", after);
+      params.set("limit", String(limit));
+    }
+    const timeoutMs = opts?.timeoutMs ?? LIVE_FRAMES_REQUEST_TIMEOUT_MS;
+    const controller = new AbortController();
+    const timeout = setTimeout(
+      () => controller.abort(new DOMException("live-frames request timeout", "TimeoutError")),
+      timeoutMs,
+    );
+    const parent = opts?.signal;
+    const onParentAbort = () => controller.abort(parent?.reason);
+    parent?.addEventListener("abort", onParentAbort);
     return jsonOrThrow<DurableLiveFramePage>(
       callWithRefresh(a, (t) =>
         fetch(`/api/sessions/${encodeURIComponent(id)}/live-frames?${params.toString()}`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+          signal: controller.signal,
+        }),
+      ),
+    ).finally(() => {
+      clearTimeout(timeout);
+      parent?.removeEventListener("abort", onParentAbort);
+    });
+  },
+
+  getSessionLiveUnits: (
+    a: AuthSession,
+    id: string,
+    query?: { n?: number; before?: string | null; group?: string | null; nestedBefore?: string | null },
+    opts?: { signal?: AbortSignal; timeoutMs?: number },
+  ): Promise<unknown> => {
+    const params = new URLSearchParams();
+    params.set("view", "units");
+    params.set("n", String(query?.n ?? 20));
+    if (query?.before) params.set("before", query.before);
+    if (query?.group) params.set("group", query.group);
+    if (query?.nestedBefore) params.set("nestedBefore", query.nestedBefore);
+    const timeoutMs = opts?.timeoutMs ?? LIVE_FRAMES_REQUEST_TIMEOUT_MS;
+    const controller = new AbortController();
+    const timeout = setTimeout(
+      () => controller.abort(new DOMException("live-frames request timeout", "TimeoutError")),
+      timeoutMs,
+    );
+    const parent = opts?.signal;
+    const onParentAbort = () => controller.abort(parent?.reason);
+    parent?.addEventListener("abort", onParentAbort);
+    return jsonOrThrow<unknown>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/sessions/${encodeURIComponent(id)}/live-frames?${params.toString()}`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+          signal: controller.signal,
+        }),
+      ),
+    ).finally(() => {
+      clearTimeout(timeout);
+      parent?.removeEventListener("abort", onParentAbort);
+    });
+  },
+
+  getLiveFramePayload: (
+    a: AuthSession,
+    id: string,
+    ref: { recordId?: string; sha256?: string },
+  ): Promise<{ source: "live" | "tape"; payload: unknown; sha256?: string }> => {
+    const params = new URLSearchParams();
+    if (ref.recordId) params.set("recordId", ref.recordId);
+    if (ref.sha256) params.set("sha256", ref.sha256);
+    return jsonOrThrow(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/sessions/${encodeURIComponent(id)}/live-frames/payload?${params.toString()}`, {
           credentials: "include",
           headers: bearerHeaders(t),
         }),
@@ -1837,20 +2040,30 @@ export const api = {
     ),
 
   /**
-   * 会话重命名（PATCH /api/sessions/:id，Bearer，元数据专用）。不走 putSession 的
-   * 整 blob 替换语义：rename 不携带 messages，骑 PUT 要么 409 要么丢消息。
+   * 会话元数据 PATCH（title / projectId / pinned）。当前打 PATCH /api/sessions/:id；
+   * 后端若换成 PATCH /api/sessions/:id/meta，只改这一处。
    */
-  patchSessionTitle: (a: AuthSession, id: string, title: string): Promise<{ ok: true; updatedAt: number }> =>
+  patchSessionMeta: (
+    a: AuthSession,
+    id: string,
+    patch: PatchSessionMetaInput,
+  ): Promise<{ ok: true; updatedAt: number }> =>
     jsonOrThrow<{ ok: true; updatedAt: number }>(
       callWithRefresh(a, (t) =>
         fetch(`/api/sessions/${encodeURIComponent(id)}`, {
           method: "PATCH",
           credentials: "include",
           headers: bearerHeaders(t, true),
-          body: JSON.stringify({ title }),
+          body: JSON.stringify(patch),
         }),
       ),
     ),
+
+  /**
+   * 会话重命名。走 patchSessionMeta，后端换 /meta 端点时不必再改这里。
+   */
+  patchSessionTitle: (a: AuthSession, id: string, title: string): Promise<{ ok: true; updatedAt: number }> =>
+    api.patchSessionMeta(a, id, { title }),
 
   /**
    * 会话级模型选择持久化（PATCH /api/sessions/:id，Bearer，元数据专用，与 rename 同款）。
@@ -1890,6 +2103,9 @@ export const api = {
       _routing?: unknown;
       _sendAttempt?: number;
       _isAutoRetry?: boolean;
+      _recoveryOfClientMessageId?: string;
+      _recoveryMode?: "checkpoint" | "replay";
+      _automaticRecovery?: boolean;
       _idem?: string;
     },
   ): Promise<void> =>
@@ -1915,6 +2131,119 @@ export const api = {
         }),
       ),
     ).then(() => undefined),
+
+  // ── 聊天项目（侧栏 Projects；契约并行开发中，路径按 /api/chat-projects）──
+
+  listChatProjects: (a: AuthSession): Promise<ChatProject[]> =>
+    jsonOrThrow<{ projects: ChatProject[] }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/chat-projects", { credentials: "include", headers: bearerHeaders(t) }),
+      ),
+    ).then((b) => b.projects || []),
+
+  createChatProject: (
+    a: AuthSession,
+    input: { name: string; instructions?: string; color?: string },
+  ): Promise<ChatProject> =>
+    jsonOrThrow<{ project: ChatProject }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/chat-projects", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(input),
+        }),
+      ),
+    ).then((b) => b.project),
+
+  patchChatProject: (
+    a: AuthSession,
+    id: string,
+    patch: { name?: string; instructions?: string | null; color?: string | null; sortOrder?: number },
+  ): Promise<ChatProject> =>
+    jsonOrThrow<{ project: ChatProject }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/chat-projects/${encodeURIComponent(id)}`, {
+          method: "PATCH",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(patch),
+        }),
+      ),
+    ).then((b) => b.project),
+
+  deleteChatProject: (a: AuthSession, id: string): Promise<void> =>
+    jsonOrThrow<{ ok: true }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/chat-projects/${encodeURIComponent(id)}`, {
+          method: "DELETE",
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ).then(() => undefined),
+
+  // ── 项目资产（侧栏项目下聚合上传资料 + 会话产出）──
+
+  /**
+   * 列出某项目的资产。`projectId` 省略 / null → `?projectId=none`（未分组 / default 组）。
+   */
+  listProjectAssets: (a: AuthSession, projectId?: string | null): Promise<ProjectAsset[]> => {
+    const q =
+      projectId == null || projectId === ""
+        ? "projectId=none"
+        : `projectId=${encodeURIComponent(projectId)}`;
+    return jsonOrThrow<{ assets: ProjectAsset[] }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/project-assets?${q}`, { credentials: "include", headers: bearerHeaders(t) }),
+      ),
+    ).then((b) => b.assets || []);
+  },
+
+  createProjectAsset: (a: AuthSession, input: CreateProjectAssetInput): Promise<ProjectAsset> =>
+    jsonOrThrow<{ asset?: ProjectAsset } & Partial<ProjectAsset>>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/project-assets", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(input),
+        }),
+      ),
+    ).then(unwrapProjectAsset),
+
+  patchProjectAsset: (
+    a: AuthSession,
+    assetId: string,
+    patch: PatchProjectAssetInput,
+  ): Promise<ProjectAsset> =>
+    jsonOrThrow<{ asset?: ProjectAsset } & Partial<ProjectAsset>>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/project-assets/${encodeURIComponent(assetId)}`, {
+          method: "PATCH",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(patch),
+        }),
+      ),
+    ).then(unwrapProjectAsset),
+
+  /** DELETE 约定 204 / 空体；200+JSON 也收。 */
+  deleteProjectAsset: (a: AuthSession, assetId: string): Promise<void> =>
+    callWithRefresh(a, (t) =>
+      fetch(`/api/project-assets/${encodeURIComponent(assetId)}`, {
+        method: "DELETE",
+        credentials: "include",
+        headers: bearerHeaders(t),
+      }),
+    ).then(async (res) => {
+      if (res.status === 204 || res.status === 205) {
+        assertAuthResponseCurrent(res);
+        return undefined;
+      }
+      await jsonOrThrow(res);
+      return undefined;
+    }),
 
   // ── 文件上传（gateway /api/uploads，Bearer；写入用户容器工作区，返回内容寻址 URL） ──
 
@@ -2273,6 +2602,17 @@ export const api = {
           credentials: "include",
           headers: bearerHeaders(t),
         }),
+      ),
+    ),
+
+  /** 逐会话记忆使用统计（精确事件，不解析工具文本；days=1..90）。 */
+  getMemoryUsage: (a: AuthSession, agentId: string, days = 30) =>
+    jsonOrThrow<MemoryUsageDashboard>(
+      callWithRefresh(a, (t) =>
+        fetch(
+          `/api/agents/${encodeURIComponent(agentId)}/memory/usage?days=${Math.max(1, Math.min(90, Math.floor(days)))}`,
+          { credentials: "include", headers: bearerHeaders(t) },
+        ),
       ),
     ),
 
@@ -2785,7 +3125,7 @@ export const api = {
       ),
     ),
 
-  // ── 社区共建教程 ───────────────────────────────────────────────────────
+  // ── 教程工作室（公开目录 / 快照 / 管理评测） ────────────────────────────
 
   listCommunityTutorials: (opts?: {
     cursor?: string | null;
@@ -2820,6 +3160,21 @@ export const api = {
         }),
       ),
     ).then((result) => result.tutorial),
+
+  submitTutorialSnapshot: (a: AuthSession, draft: TutorialSnapshotDraft) =>
+    jsonOrThrow<TutorialSnapshotSubmitResult>(
+      callWithRefresh(a, (token) =>
+        fetch("/api/tutorials/snapshots", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(token, true),
+          body: JSON.stringify(draft),
+        }),
+      ),
+    ).then((result) => ({
+      tutorial: { ...result.tutorial, kind: result.tutorial.kind ?? "snapshot" },
+      leakReport: result.leakReport ?? null,
+    })),
 
   listMyCommunityTutorials: (a: AuthSession, cursor?: string | null) =>
     jsonOrThrow<CommunityTutorialPage<CommunityTutorialMine>>(
@@ -2866,6 +3221,87 @@ export const api = {
           credentials: "include",
           headers: bearerHeaders(token, true),
           body: JSON.stringify({ decision, note }),
+        }),
+      ),
+    ),
+
+  listTutorialEvalSpecs: (a: AuthSession, cursor?: string | null) =>
+    jsonOrThrow<{ specs: TutorialEvalSpec[]; nextCursor?: string | null }>(
+      callWithRefresh(a, (token) =>
+        fetch(
+          `/api/admin/tutorials/case-specs${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`,
+          { credentials: "include", headers: bearerHeaders(token) },
+        ),
+      ),
+    ),
+
+  createTutorialEvalSpec: (a: AuthSession, draft: TutorialEvalSpecDraft) =>
+    jsonOrThrow<{ spec: TutorialEvalSpec }>(
+      callWithRefresh(a, (token) =>
+        fetch("/api/admin/tutorials/case-specs", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(token, true),
+          body: JSON.stringify(draft),
+        }),
+      ),
+    ).then((result) => result.spec),
+
+  listTutorialEvalJobs: (a: AuthSession, cursor?: string | null) =>
+    jsonOrThrow<{ jobs: TutorialEvalJob[]; nextCursor?: string | null }>(
+      callWithRefresh(a, (token) =>
+        fetch(
+          `/api/admin/tutorials/eval-jobs${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`,
+          { credentials: "include", headers: bearerHeaders(token) },
+        ),
+      ),
+    ),
+
+  enqueueTutorialEvalJob: (
+    a: AuthSession,
+    specId: string,
+    extra?: { idempotencyKey?: string; publicationId?: string | null; evalUserId?: string | null },
+  ) =>
+    jsonOrThrow<{ job: TutorialEvalJob }>(
+      callWithRefresh(a, (token) =>
+        fetch("/api/admin/tutorials/eval-jobs", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(token, true),
+          body: JSON.stringify({
+            specId,
+            idempotencyKey: extra?.idempotencyKey ?? `eval-${specId}-${Date.now()}`,
+            publicationId: extra?.publicationId,
+            evalUserId: extra?.evalUserId,
+          }),
+        }),
+      ),
+    ).then((result) => result.job),
+
+  listTutorialEvalCompass: (a: AuthSession, cursor?: string | null) =>
+    jsonOrThrow<{ items?: TutorialEvalCompassItem[]; notes?: TutorialEvalCompassItem[]; nextCursor?: string | null }>(
+      callWithRefresh(a, (token) =>
+        fetch(
+          `/api/admin/tutorials/compass${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`,
+          { credentials: "include", headers: bearerHeaders(token) },
+        ),
+      ),
+    ).then((result) => ({
+      items: result.items ?? result.notes ?? [],
+      nextCursor: result.nextCursor ?? null,
+    })),
+
+  recordTutorialEvalResult: (a: AuthSession, input: TutorialEvalRecordInput) =>
+    jsonOrThrow<{ ok?: boolean; job?: TutorialEvalJob }>(
+      callWithRefresh(a, (token) =>
+        fetch(`/api/admin/tutorials/eval-jobs/${encodeURIComponent(input.jobId)}/evidence`, {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(token, true),
+          body: JSON.stringify({
+            result: input.result ?? (input.status === "failed" ? "failed" : "passed"),
+            evidence: input.evidence ?? { notes: input.notes, summary: input.summary },
+          }),
         }),
       ),
     ),
@@ -4182,15 +4618,30 @@ export const api = {
    * `{ [messageId]: {rating, tags} }`（无则 `{}`，不含 comment）。仅用于重开会话时标
    * 「已评」高亮、避免重复采集。失败/503 由调用方兜底为空。
    */
-  getSessionRatings: (a: AuthSession, sessionId: string): Promise<SessionRatingsMap> =>
-    jsonOrThrow<{ ratings?: SessionRatingsMap }>(
+  submitResponseRatingNudge: (
+    a: AuthSession,
+    input: ResponseRatingNudgeInput,
+  ): Promise<{ state: RatingNudgeState; newlyExposed: boolean }> =>
+    jsonOrThrow<{ ok: true; state: RatingNudgeState; newlyExposed: boolean }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/response-rating", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(input),
+        }),
+      ),
+    ).then((body) => ({ state: body.state, newlyExposed: body.newlyExposed })),
+
+  getSessionRatings: (a: AuthSession, sessionId: string): Promise<SessionRatingSnapshot> =>
+    jsonOrThrow<{ ratings?: SessionRatingsMap; nudges?: Record<string, RatingNudgeState> }>(
       callWithRefresh(a, (t) =>
         fetch(`/api/response-rating?sessionId=${encodeURIComponent(sessionId)}`, {
           credentials: "include",
           headers: bearerHeaders(t),
         }),
       ),
-    ).then((b) => b.ratings || {}),
+    ).then((b) => ({ ratings: b.ratings || {}, nudges: b.nudges || {} })),
 
   // ── 对话传输（P4 已接入：WS user-chat-bridge） ────────────────────────
   //

@@ -200,11 +200,12 @@ export const TOOLS = [
       required: ['agentId', 'message'],
     },
   },
-  // ── Synchronous task delegation ──
+  // ── Async job-backed task delegation ──
   {
     name: 'delegate_task',
     description: [
-      '将单个任务委派给另一个 agent 并等待结果返回。与 send_to_agent 不同,这是同步操作 — 你会直接收到子 agent 的执行结果。',
+      '将单个任务委派给另一个 agent，并先短时等待结果。与 send_to_agent 不同，作业结果仍回到当前队长。',
+      '若短等窗口内未完成，本工具会返回 jobId；必须立刻用 Bash 执行 `oc-memory delegate-wait <jobId>` 阻塞取回结果。',
       '',
       '适用场景:',
       '- 需要专业 agent 处理后你还要继续用结果的场景',
@@ -217,11 +218,23 @@ export const TOOLS = [
       '因此本工具的返回是「摘要/路径」,不是完整产物 —— 需要完整内容时用 Read 读回传路径。',
       '',
       '限制: 最大递归深度 3 层,最大并发 5 个,单个队长每 turn 委派次数有上限(超限会返回可读错误,请先整合已有结果再决定是否继续)。',
+      '',
+      '默认每次新开会话。工具结果会回传 sessionKey;下一轮要对同一成员续跑时传入 resumeSessionKey。',
+      '进行中不要重复 resume，也不要重复调用本工具；只用返回的 jobId 等待。',
     ].join('\n'),
     inputSchema: {
       type: 'object',
       properties: {
-        agentId: { type: 'string', description: '目标 agent ID (可选,不填则自动选择)' },
+        agentId: {
+          type: 'string',
+          description:
+            '目标平台成员 id(可选,不填则派给 main)。只能是 coding-assistant / explorer 这类成员,不要填型号。',
+        },
+        model: {
+          type: 'string',
+          description:
+            '可选:本次子任务使用的 catalog 型号(如 cursor-grok-4.6-high-fast、gpt-5.6-sol)。覆盖该成员默认模型;不填则用成员绑定。',
+        },
         goal: { type: 'string', description: '委派任务的目标描述' },
         context: { type: 'string', description: '传递给子 agent 的上下文信息 (可选)' },
         effort: {
@@ -236,6 +249,11 @@ export const TOOLS = [
           description:
             '可选:为子 agent 额外授予的平台工具集名(目前仅 "browser";网页提取/论文下载已是常驻 CLI——oc-web / scansci-pdf,无需工具集)。通常无需手动指定 —— 系统会按任务目标自动挂载;只能授予平台已配置的工具集,无法越权,填错或填不存在的名字会被忽略而非报错。',
         },
+        resumeSessionKey: {
+          type: 'string',
+          description:
+            '可选:续跑上一轮同成员委派。值必须是该工具上次返回的 sessionKey;缺省仍新开会话。',
+        },
       },
       required: ['goal'],
     },
@@ -244,8 +262,9 @@ export const TOOLS = [
   {
     name: 'delegate_tasks',
     description: [
-      '一次把多个**互相独立**的子任务并行委派给成员并等待全部返回(fan-out)。',
+      '一次把多个**互相独立**的子任务并行委派给成员并短时等待(fan-out)。',
       '各子任务并发执行、互不依赖,单个失败不影响其余(每项独立标注 ✅/❌)。',
+      '仍在运行的任务会返回 jobId 列表；按返回指令用一条 `oc-memory delegate-wait ...` 阻塞取回全部结果。',
       '',
       '仅用于「彼此独立、可同时进行」的子任务;有先后依赖(B 需要 A 的产出)时,',
       '请分步用 `delegate_task` 串行委派,不要塞进本工具。单次最多 4 个并行子任务。',
@@ -264,7 +283,15 @@ export const TOOLS = [
           items: {
             type: 'object',
             properties: {
-              agentId: { type: 'string', description: '目标 agent ID (可选,不填则自动选择)' },
+              agentId: {
+                type: 'string',
+                description: '目标平台成员 id(可选,不填则派给 main)。不要填型号。',
+              },
+              model: {
+                type: 'string',
+                description:
+                  '可选:该子任务的 catalog 型号,覆盖成员默认模型(同 delegate_task)。',
+              },
               goal: { type: 'string', description: '该子任务的目标描述' },
               context: { type: 'string', description: '传递给子 agent 的上下文信息 (可选)' },
               effort: {
@@ -276,6 +303,10 @@ export const TOOLS = [
                 type: 'array',
                 items: { type: 'string' },
                 description: '可选:为该子 agent 额外授予的平台工具集名(同 delegate_task)。',
+              },
+              resumeSessionKey: {
+                type: 'string',
+                description: '可选:续跑该子任务上一轮 sessionKey(同 delegate_task)。',
               },
             },
             required: ['goal'],
@@ -308,12 +339,230 @@ export const TOOLS = [
           type: 'string',
           description: '可选:二次送审时说明你针对上轮审查意见做了什么修订/反驳了哪些误报。',
         },
+        resumeSessionKey: {
+          type: 'string',
+          description:
+            '可选:续跑上一轮 hidden-reviewer。值必须是上次 request_review 返回的 sessionKey。',
+        },
       },
       required: ['draft'],
     },
   },
+  // ── 任务面板(与网页 /board、oc-task CLI 同一份 /api/board)──
+  // identifier 服务端生成,工具参数禁止收 identifier/userId/originSessionKey。
+  // originSessionKey 由 handler 从 OPENCLAUDE_SESSION_KEY 注入,卡片才能点回原对话。
+  {
+    name: 'task_create',
+    description: [
+      '在任务面板建一张单据。用户说「把这个记成单 / 开一张问题单 / 记到任务面板」时使用。',
+      '',
+      '不要传 identifier(服务端生成,返回后再用)。不要传 userId。',
+      '当前对话会自动挂到单据上,卡片可点回本会话。',
+      '新建单默认 backlog(未批准),AI 不许认领;等人在面板点开工。',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        projectId: {
+          type: 'string',
+          description: '项目 uuid 或 key(如 OCV5)。先 task_list / oc-task project list 确认',
+        },
+        type: {
+          type: 'string',
+          enum: ['bug', 'feature', 'spike', 'chore'],
+          description: 'bug 问题单 / feature 需求单 / spike 调研 / chore 杂务',
+        },
+        title: { type: 'string', description: '标题' },
+        body: { type: 'string', description: 'Markdown 正文(复现步骤/需求说明)' },
+        priority: {
+          type: 'string',
+          enum: ['P0', 'P1', 'P2', 'P3'],
+          description: '优先级,默认 P2',
+        },
+        severity: {
+          type: 'string',
+          enum: ['critical', 'major', 'minor', 'trivial'],
+          description: '仅 bug 有意义',
+        },
+        labels: { type: 'array', items: { type: 'string' }, description: '标签' },
+        assignee: { type: 'string', description: 'user:<id> 或 agent:<agentId>' },
+      },
+      required: ['projectId', 'type', 'title'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'task_update',
+    description: [
+      '更新任务单字段(标题/正文/优先级等),不走路状态机。',
+      'id 必须是面板返回的 identifier 或 uuid,禁止自己拼 OCV5-<n>。',
+      'expectedVersion 必填;409 时 task_get 重读后只重试一次,禁止抢别人的 lease。',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: '面板返回的 identifier 或 uuid' },
+        expectedVersion: { type: 'number', description: '乐观锁,来自最近一次 get/create' },
+        title: { type: 'string' },
+        body: { type: 'string' },
+        priority: { type: 'string', enum: ['P0', 'P1', 'P2', 'P3'] },
+        severity: { type: 'string', enum: ['critical', 'major', 'minor', 'trivial'] },
+        labels: { type: 'array', items: { type: 'string' } },
+        assignee: { type: 'string' },
+        blockedReason: { type: 'string' },
+      },
+      required: ['id', 'expectedVersion'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'task_comment',
+    description: [
+      '给任务单写一条评论。做完必须写:改了什么 / 怎么验的 / 有什么风险,再 advance。',
+      'id 只用面板返回值。评论不升 version。',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: '面板返回的 identifier 或 uuid' },
+        body: { type: 'string', description: 'Markdown 评论' },
+        runId: { type: 'string', description: '可选,关联某次 run' },
+      },
+      required: ['id', 'body'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'task_list',
+    description: [
+      '列出任务单。对话里要找「待确认 / 某项目的卡」时用。',
+      '返回 identifier+status+version,后续操作只用返回值,不要自己推导编号。',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        projectId: { type: 'string', description: '项目 uuid 或 key' },
+        status: {
+          type: 'string',
+          description: '单个或逗号分隔: backlog,ready,running,waiting_human,blocked,done,canceled',
+        },
+        type: { type: 'string', description: 'bug/feature/spike/chore,可逗号分隔' },
+        priority: { type: 'string', enum: ['P0', 'P1', 'P2', 'P3'] },
+        assignee: { type: 'string' },
+        q: { type: 'string', description: '模糊搜 title / identifier / body' },
+        limit: { type: 'number' },
+        offset: { type: 'number' },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'task_get',
+    description: [
+      '读取一张任务单及其评论。动手前必须先 get + 看评论(可能有返工要求)。',
+      'id 只用面板返回的 identifier 或 uuid。',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: '面板返回的 identifier 或 uuid' },
+      },
+      required: ['id'],
+      additionalProperties: false,
+    },
+  },
   // (v5 ccb-only:ask_gpt55_codex direct bridge 已移除 —— 无 codex agent。)
+  // ── 引擎交互提问桥(cursor 等无原生交互工具的引擎,2026-08-17) ──
+  {
+    name: 'ask_user',
+    description: [
+      '向当前会话的网页用户提出选择题。调用后立即返回(不阻塞、不等待)。',
+      '返回后必须立刻结束本回合;用户的选择会作为下一条普通用户消息到达。',
+      '不要轮询,也不要对同一问题再次调用 ask_user。一次最多 4 个问题,每个 2-4 个选项。',
+      '必须在当前会话有活跃 turn 时调用;子 agent 环境会直接返回 skipped,',
+      '此时自行决策或在最终答复里列编号选项让用户文字作答。',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        questions: {
+          type: 'array',
+          minItems: 1,
+          maxItems: 4,
+          description: '问题列表;question 为题面,options 为可点选的选项。',
+          items: {
+            type: 'object',
+            properties: {
+              question: { type: 'string', description: '题面(必填)' },
+              header: { type: 'string', description: '可选短标签(≤12 字符)' },
+              multiSelect: { type: 'boolean', description: '可选,是否允许多选' },
+              options: {
+                type: 'array',
+                minItems: 2,
+                maxItems: 4,
+                items: {
+                  type: 'object',
+                  properties: {
+                    label: { type: 'string', description: '选项文案(必填)' },
+                    description: { type: 'string', description: '选项补充说明' },
+                  },
+                  required: ['label'],
+                },
+              },
+            },
+            required: ['question', 'options'],
+          },
+        },
+      },
+      required: ['questions'],
+    },
+  },
 ]
+
+/**
+ * ask_user 的 questions 收敛器:宽松接受模型输入,严格产出产品
+ * AskUserQuestion 形态(question/header≤12/multiSelect 仅 true/options 白名单)。
+ * 返回 null = 输入结构不可用(调用方报工具错误,不发起网关请求)。
+ * 与网关侧 sanitizeEngineAskUserQuestions 语义对齐 —— 两份实现分属不同
+ * 包与不同信任域,不共享依赖,修改时必须同步。
+ */
+export function normalizeAskUserQuestions(raw: unknown): Array<Record<string, unknown>> | null {
+  if (!Array.isArray(raw) || raw.length === 0 || raw.length > 4) return null
+  const questions: Array<Record<string, unknown>> = []
+  for (const item of raw) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return null
+    const question = (item as { question?: unknown }).question
+    if (typeof question !== 'string' || question.trim().length === 0 || question.length > 2000) {
+      return null
+    }
+    const optionsRaw = (item as { options?: unknown }).options
+    if (!Array.isArray(optionsRaw) || optionsRaw.length < 2 || optionsRaw.length > 4) return null
+    const options: Array<Record<string, unknown>> = []
+    for (const opt of optionsRaw) {
+      if (!opt || typeof opt !== 'object' || Array.isArray(opt)) return null
+      const label = (opt as { label?: unknown }).label
+      if (typeof label !== 'string' || label.trim().length === 0 || label.length > 300) {
+        return null
+      }
+      const description = (opt as { description?: unknown }).description
+      options.push({
+        label,
+        ...(typeof description === 'string' && description.length > 0 && description.length <= 1000
+          ? { description }
+          : {}),
+      })
+    }
+    const header = (item as { header?: unknown }).header
+    const multiSelect = (item as { multiSelect?: unknown }).multiSelect
+    questions.push({
+      question,
+      ...(typeof header === 'string' && header.length > 0 ? { header: header.slice(0, 12) } : {}),
+      ...(multiSelect === true ? { multiSelect: true } : {}),
+      options,
+    })
+  }
+  return questions
+}
 
 // Draft-only skill proposal tool. Exposed ONLY inside a skill-training session
 // (OPENCLAUDE_SKILL_TRAIN_RUN_ID set). Stages a candidate change into the run's draft

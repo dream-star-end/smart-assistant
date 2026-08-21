@@ -31,12 +31,20 @@ import type {
 } from './engineEvents.js'
 
 /** 能力声明 —— 消灭 provider 字符串 if/else 散点;server/bridge/billing 按能力分支。 */
+export interface NativeModelHandoffArtifact {
+  /** Native, model-authored continuation text already cleaned by the source engine. */
+  summaryText: string
+  source: 'ccb' | 'codex' | 'grok'
+  /** Epoch captured immediately before the native compact trigger. */
+  compactStartedAt: number
+}
+
 export interface EngineCapabilities {
   /** 'proxy' = 上游代理旁路计费(CCB/anthropicProxy);
    *  'engine-reported' = runner 上报 billing 帧 → master bridge settle(codex)。 */
   billingMode: 'proxy' | 'engine-reported' | 'external'
   supportsEffort: boolean
-  resumeKind: 'ccb-session' | 'codex-thread' | 'grok-session' | 'cursor-session'
+  resumeKind: 'ccb-session' | 'codex-thread' | 'grok-session' | 'cursor-session' | 'zcode-session'
   needsServerRequestId: boolean
   /** Native engines retain provider-owned state across turns. Stateless
    * engines must receive a bounded master-history replay on every turn. */
@@ -175,6 +183,12 @@ export interface EngineAdapter extends EventEmitter {
    * terminal persistence must additionally await this barrier before freezing
    * a paid turn's immutable tape. */
   waitForOutputDrain(): Promise<void>
+  /** Optional native compact/export path. Engines without a stable export
+   * surface must omit it; callers fail closed instead of inventing a summary. */
+  compactForHandoff?(): Promise<NativeModelHandoffArtifact>
+  /** Some CLIs are compacted through their ordinary slash-command turn and
+   * only expose the cleaned artifact through durable session files. */
+  readCompactionHandoffSince?(compactStartedAt: number): Promise<NativeModelHandoffArtifact>
 
   // ── resume ──
   /** 底座原生可续传 id(CCB session_id / codex thread_id);未知为 null。 */

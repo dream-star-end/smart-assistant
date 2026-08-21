@@ -5,6 +5,7 @@
 //   select * from turn_traces where trace_id = '<id>';
 // 失败绝不影响 turn 主链路:观测面挂了不能拖垮对话面,只 warn 一条。
 import type { Pool } from "pg";
+import { controlPlaneIdentity } from "../admin/observabilityIdentity.js";
 
 export interface TurnTraceRow {
   traceId: string;
@@ -15,6 +16,10 @@ export interface TurnTraceRow {
   // durable turn dispatch(RFC §2):纯展示,记 dispatch 身份/请求 id 供运维定位,不参与任何判定。
   dispatchId?: string | null;
   requestId?: string | null;
+  /** Actual container platform bundle label returned by ensureRunning. */
+  bundleRev?: string | null;
+  /** Browser DOM oc-build reported in inbound.hello; absent/invalid stays NULL. */
+  clientBuild?: string | null;
 }
 
 export function recordTurnTrace(
@@ -23,10 +28,13 @@ export function recordTurnTrace(
   row: TurnTraceRow,
 ): void {
   if (!pool) return;
+  const version = controlPlaneIdentity();
   void pool
     .query(
-      `INSERT INTO turn_traces (trace_id, user_id, session_key, agent_id, model, dispatch_id, request_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
+      `INSERT INTO turn_traces
+         (trace_id,user_id,session_key,agent_id,model,dispatch_id,request_id,
+          control_plane_release,control_plane_commit,bundle_rev,client_build)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
        ON CONFLICT (trace_id) DO NOTHING`,
       [
         row.traceId,
@@ -36,9 +44,14 @@ export function recordTurnTrace(
         row.model ?? null,
         row.dispatchId ?? null,
         row.requestId ?? null,
+        version.release,
+        version.commit,
+        row.bundleRev ?? null,
+        row.clientBuild ?? null,
       ],
     )
     .catch((err) => warn?.("turn-trace record failed", { err: String(err) }));
+
 }
 
 /**

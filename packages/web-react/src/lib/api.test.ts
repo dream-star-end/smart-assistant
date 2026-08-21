@@ -1129,3 +1129,103 @@ test('refresh 限频早返带 throttled 标记且不发真实网络请求(2026-0
   expect(second.kind === 'transient' && second.retryAfterMs > 0).toBe(true)
   expect(refreshCalls()).toBe(1)
 })
+
+test('getSessionLiveFrames passes an AbortSignal and honors timeoutMs', async () => {
+  const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+    expect(init?.signal).toBeInstanceOf(AbortSignal)
+    return ok({
+      frames: [],
+      nextCursor: null,
+      hasMore: false,
+      streamClientMessageIds: [],
+      hasTapeProjection: false,
+    })
+  })
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+  const { session } = makeSession('tok-live-frames')
+  await api.getSessionLiveFrames(session, 'web-session-1', '0', 200, { timeoutMs: 50 })
+  expect(String(fetchMock.mock.calls[0]?.[0])).toBe(
+    '/api/sessions/web-session-1/live-frames?after=0&limit=200',
+  )
+})
+
+test('getSessionLiveFrames first shot pages forward from after=0', async () => {
+  const fetchMock = vi.fn(async (_url: string) =>
+    ok({
+      frames: [],
+      nextCursor: null,
+      hasMore: false,
+      hasMoreBefore: false,
+      streamClientMessageIds: [],
+      hasTapeProjection: false,
+    }),
+  )
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+  const { session } = makeSession('tok-live-frames-first')
+  await api.getSessionLiveFrames(session, 'web-session-1')
+  expect(String(fetchMock.mock.calls[0]?.[0])).toBe(
+    '/api/sessions/web-session-1/live-frames?after=0&limit=200',
+  )
+  expect(String(fetchMock.mock.calls[0]?.[0])).not.toContain('seek=tail')
+  expect(String(fetchMock.mock.calls[0]?.[0])).not.toContain('after=tail')
+})
+
+test('getSessionLiveFrames explicit after=tail still maps to seek=tail', async () => {
+  const fetchMock = vi.fn(async (_url: string) =>
+    ok({
+      frames: [],
+      nextCursor: null,
+      hasMore: false,
+      hasMoreBefore: false,
+      streamClientMessageIds: [],
+      hasTapeProjection: false,
+    }),
+  )
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+  const { session } = makeSession('tok-live-frames-tail')
+  await api.getSessionLiveFrames(session, 'web-session-1', 'tail', 500)
+  expect(String(fetchMock.mock.calls[0]?.[0])).toBe(
+    '/api/sessions/web-session-1/live-frames?seek=tail&limit=500',
+  )
+})
+
+test('getSessionLiveFrames times out a hung request', async () => {
+  vi.useFakeTimers()
+  const fetchMock = vi.fn((_url: string, init?: RequestInit) =>
+    new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => {
+        reject(init.signal?.reason ?? new DOMException('aborted', 'AbortError'))
+      })
+    }),
+  )
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+  const { session } = makeSession('tok-live-frames-timeout')
+  const pending = api.getSessionLiveFrames(session, 'web-session-1', '0', 200, { timeoutMs: 25 })
+  const expectation = expect(pending).rejects.toMatchObject({ name: 'TimeoutError' })
+  await vi.advanceTimersByTimeAsync(25)
+  await expectation
+})
+
+test('getSessionLiveUnits sends view=units', async () => {
+  const fetchMock = vi.fn(async (_url: string) =>
+    ok({
+      view: 'units',
+      units: [],
+      n: 20,
+      hasMoreBefore: false,
+      beforeCursor: null,
+      streamClientMessageIds: [],
+      openDispatch: false,
+      hasTapeProjection: false,
+      tapeProjectionVersion: 0,
+      reducerEpoch: '1',
+      degraded: false,
+    }),
+  )
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+  const { session } = makeSession('tok-live-units')
+  await api.getSessionLiveUnits(session, 'web-session-1', { n: 20 })
+  expect(String(fetchMock.mock.calls[0]?.[0])).toBe(
+    '/api/sessions/web-session-1/live-frames?view=units&n=20',
+  )
+})

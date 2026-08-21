@@ -15,11 +15,20 @@
 
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 
-import { SessionManager } from "../sessionManager.js";
+import {
+  buildNativeModelHandoffPayload,
+  buildNativeModelHandoffPrompt,
+  SessionManager,
+  type AgentSession,
+} from "../sessionManager.js";
 // side-effect:注册 'ccb' / 'codex' factory。
 import "../engine/ccbAdapter.js";
 import "../engine/codexAdapter.js";
+import { cursorResumeStoreExists, cursorResumeStorePath } from "../engine/cursorAdapter.js";
 import type { AgentDef, OpenClaudeConfig } from "@openclaude/storage";
 
 function makeConfigStub(): OpenClaudeConfig {
@@ -38,7 +47,8 @@ interface SmInternals {
   _resumeMapProvider: Map<string, string>;
   _resumeMapLastCost: Map<string, number>;
   _saveResumeMap: () => void;
-  _resumeIdFor: (key: string, wantProvider: string) => string | undefined;
+  _resumeIdFor: (key: string, wantProvider: string, workspacePath?: string) => string | undefined;
+  _cursorWorkspacePathForSession: (session: AgentSession) => string | undefined;
 }
 
 function makeSm(): { sm: SessionManager; ins: SmInternals } {
@@ -297,5 +307,107 @@ describe("stale-resume 时序回归(M0 Codex 评审 nit②)", () => {
 
     assert.equal(ins._resumeMap.get(KEY), "alive-id-3", "非 stale crash 必须保留可恢复 id");
     assert.equal(session.ccbSessionId, "alive-id-3");
+  });
+});
+
+
+describe("Cursor resume workspace path uses the pinned agent cwd", () => {
+  test("stale-store check hashes pinned agent.cwd, not the default workspace", async () => {
+    const pinned = await mkdtemp(path.join(tmpdir(), "oc-cursor-pinned-cwd-"));
+    const defaultWs = await mkdtemp(path.join(tmpdir(), "oc-cursor-default-ws-"));
+    const sessionId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    const store = cursorResumeStorePath(pinned, sessionId);
+    await mkdir(path.dirname(store), { recursive: true });
+    await writeFile(store, "");
+    const oldDefault = process.env.OPENCLAUDE_DEFAULT_WORKSPACE;
+    process.env.OPENCLAUDE_DEFAULT_WORKSPACE = defaultWs;
+    const key = "agent:main:webchat:dm:cursor-pinned-cwd";
+    const { sm, ins } = makeSm();
+    ins._resumeMap.set(key, sessionId);
+    ins._resumeMapProvider.set(key, "cursor");
+    try {
+      const session = await sm.getOrCreate({
+        sessionKey: key,
+        agent: { id: "main", cwd: pinned, model: "cursor-auto" } as AgentDef,
+        channel: "webchat",
+        peerId: "cursor-pinned-cwd",
+        model: "cursor-auto",
+      });
+      assert.equal(session.workspaceCwd, pinned);
+      assert.equal(session.runner.engineId, "cursor");
+      assert.equal(session.runner.nativeSessionId, sessionId);
+      const fromSession = ins._cursorWorkspacePathForSession(session);
+      assert.ok(fromSession);
+      assert.equal(cursorResumeStoreExists(fromSession, sessionId), true);
+      assert.equal(cursorResumeStoreExists(defaultWs, sessionId), false);
+      assert.equal(ins._resumeIdFor(key, "cursor", fromSession), sessionId);
+      assert.notEqual(fromSession, defaultWs);
+    } finally {
+      if (oldDefault === undefined) delete process.env.OPENCLAUDE_DEFAULT_WORKSPACE;
+      else process.env.OPENCLAUDE_DEFAULT_WORKSPACE = oldDefault;
+      await rm(path.dirname(store), { recursive: true, force: true });
+      await rm(pinned, { recursive: true, force: true });
+      await rm(defaultWs, { recursive: true, force: true });
+    }
+  });
+});
+
+
+describe("prepared native model handoff fencing", () => {
+  test("requires the exact switch generation before replacing engines", async () => {
+    const { sm } = makeSm();
+    const source = await sm.getOrCreate({
+      sessionKey: KEY, agent: mainAgent, channel: "webchat", peerId: "switch-peer", model: "glm-5.2",
+    });
+    source._modelSwitchTransition = {
+      id: "model-switch:test:1", sourceModel: "glm-5.2", targetModel: "gpt-5.6-sol",
+      sourceEngine: "ccb", state: "prepared", summaryText: "native summary",
+    };
+    await assert.rejects(() => sm.getOrCreate({
+      sessionKey: KEY, agent: mainAgent, channel: "webchat", peerId: "switch-peer", model: "gpt-5.6-sol",
+    }), /MODEL_SWITCH_IN_PROGRESS/);
+    const target = await sm.getOrCreate({
+      sessionKey: KEY, agent: mainAgent, channel: "webchat", peerId: "switch-peer", model: "gpt-5.6-sol",
+      modelSwitchId: "model-switch:test:1",
+    });
+    assert.equal(target.providerTag, "codex");
+    assert.equal(target._modelSwitchTransition?.summaryText, "native summary");
+  });
+
+  test("cancels only the exact abandoned generation and lets the source model continue", async () => {
+    const { sm } = makeSm();
+    const source = await sm.getOrCreate({
+      sessionKey: KEY, agent: mainAgent, channel: "webchat", peerId: "switch-peer", model: "glm-5.2",
+    });
+    source._modelSwitchTransition = {
+      id: "model-switch:test:cancel", sourceModel: "glm-5.2", targetModel: "gpt-5.6-sol",
+      sourceEngine: "ccb", state: "prepared", summaryText: "native summary", expiresAt: Date.now() + 60_000,
+    };
+    assert.equal(sm.cancelModelSwitch(source, "model-switch:test:wrong"), false);
+    assert.ok(source._modelSwitchTransition);
+    assert.equal(sm.cancelModelSwitch(source, "model-switch:test:cancel"), true);
+    assert.equal(source._modelSwitchTransition, undefined);
+
+    source._modelSwitchTransition = {
+      id: "model-switch:test:expired", sourceModel: "glm-5.2", targetModel: "gpt-5.6-sol",
+      sourceEngine: "ccb", state: "prepared", summaryText: "native summary", expiresAt: Date.now() - 1,
+    };
+    const resumed = await sm.getOrCreate({
+      sessionKey: KEY, agent: mainAgent, channel: "webchat", peerId: "switch-peer", model: "glm-5.2",
+    });
+    assert.equal(resumed, source);
+    assert.equal(resumed._modelSwitchTransition, undefined);
+  });
+
+  test("builds an isolated target prompt from native handoff plus current user input", () => {
+    const prompt = buildNativeModelHandoffPrompt("native summary", "continue");
+    assert.match(prompt, /<openclaude_native_model_handoff>/);
+    assert.match(prompt, /native summary/);
+    assert.match(prompt, /<current_user_message>\ncontinue/);
+    const image = { type: "image", source: { type: "url", url: "https://example.test/a.png" } };
+    const payload = buildNativeModelHandoffPayload("native summary", [image]);
+    assert.ok(Array.isArray(payload));
+    assert.match(String(payload[0]?.text), /native summary/);
+    assert.deepEqual(payload[1], image);
   });
 });

@@ -18,6 +18,10 @@ import {
   parsePartialJson,
   safeBridgeErrorDetail,
   shouldAutoContinueEmptyTurn,
+  isRecoveryControlUserTurn,
+  lastRealUserTurn,
+  computeTypingLabel,
+  STALE_WARN_MS,
 } from "./pure";
 import {
   addMessage,
@@ -35,6 +39,7 @@ import {
   applyCostWaived,
   applyLegacyBridgeError,
   applyOutboundError,
+  shouldSuppressStaleOutboundError,
   applyOutboundMessage,
   applyPermissionRequest,
   applyPermissionSettled,
@@ -43,10 +48,15 @@ import {
   applyTurnUsage,
   normalizeDelegateCards,
   normalizeGoalCards,
+  resetFrameSeqCursor,
   type FrameEffects,
 } from "./reducer";
 import {
   ChatSocket,
+  EMPTY_JOURNAL_POLL_DELAYS_MS,
+  LIVE_JOURNAL_MAX_PAGES,
+  RESTORE_RECONCILE_MAX_ATTEMPTS,
+  UNPUBLISHED_TAPE_RETRY_MAX_MS,
   automaticTurnRecoveryTarget,
   exactUserReplayPayload,
   interruptedContinuationIdentity,
@@ -61,6 +71,7 @@ import type {
   OutboundPermissionSettledWire,
 } from "./frames";
 import { childSignature, messageSignature } from "./render";
+import { reduceLiveFrames, type LiveFrameInput } from "@openclaude/protocol";
 
 // ─── helpers ──────────────────────────────────────────────────────────
 function sess(id = "s1", agentId = "main") {
@@ -170,6 +181,47 @@ describe("classifyEmptyTurn / shouldAutoContinueEmptyTurn", () => {
       { id: "u2", role: "user", _isAutoRetry: true },
     ];
     expect(shouldAutoContinueEmptyTurn({ messages: withAuto, targetMsgId: "u1", stopReason: "end_turn" })).toBe(false);
+  });
+});
+
+describe("isRecoveryControlUserTurn / lastRealUserTurn", () => {
+  test("lineage-only recovery child is a control row even after _isAutoRetry is lost", () => {
+    expect(isRecoveryControlUserTurn({
+      role: "user",
+      _recoveryOfClientMessageId: "u-real",
+    })).toBe(true);
+    expect(isRecoveryControlUserTurn({
+      role: "user",
+      _recoveryMode: "checkpoint",
+    })).toBe(true);
+    expect(isRecoveryControlUserTurn({
+      role: "user",
+      _isAutoRetry: true,
+    })).toBe(true);
+    expect(isRecoveryControlUserTurn({
+      role: "user",
+      text: "真实提问",
+    })).toBe(false);
+    expect(isRecoveryControlUserTurn({
+      role: "assistant",
+      _recoveryOfClientMessageId: "u-real",
+    })).toBe(false);
+  });
+
+  test("regenerate walks past a lineage-only recovery child to the real user question", () => {
+    const real = { id: "u-real", role: "user" as const, text: "原始提问" };
+    const child = {
+      id: "u-child",
+      role: "user" as const,
+      text: "↻ 从断点继续",
+      _recoveryOfClientMessageId: "u-real",
+    };
+    expect(lastRealUserTurn([real, child])?.id).toBe("u-real");
+    expect(lastRealUserTurn([real, child])?.text).toBe("原始提问");
+    expect(lastRealUserTurn([
+      real,
+      { id: "u-legacy", role: "user" as const, text: "↻ 自动重试", _isAutoRetry: true },
+    ])?.id).toBe("u-real");
   });
 });
 
@@ -468,6 +520,80 @@ describe("applyTurnStatus retrying 判别联合", () => {
       isFinal: false,
     } as never);
     expect(s._turnStatus).toBeNull();
+  });
+
+  test("status=working → 刷新 lastFrameAt、写入 hint、不落消息行", () => {
+    const s = sess();
+    const before = s.messages.length;
+    applyTurnStatus(s, turnStatusFrame({ status: "working", detail: "Read foo.ts" }));
+    expect(s._turnProgressHint).toBe("Read foo.ts");
+    expect(s._turnStatus == null).toBe(true);
+    expect(s._lastFrameAt).toEqual(expect.any(Number));
+    expect(s.messages.length).toBe(before);
+  });
+
+  test("旧前端兼容: unknown status 不抛、不落消息行、仍刷新 lastFrameAt", () => {
+    const s = sess();
+    const before = s.messages.length;
+    applyTurnStatus(s, turnStatusFrame({ status: "subtask" }));
+    expect(s._turnStatus).toBeNull();
+    expect(s.messages.length).toBe(before);
+    expect(s._lastFrameAt).toEqual(expect.any(Number));
+  });
+
+  test("status=null 清 working hint", () => {
+    const s = sess();
+    applyTurnStatus(s, turnStatusFrame({ status: "working", detail: "Grep keepalive" }));
+    expect(s._turnProgressHint).toBe("Grep keepalive");
+    applyTurnStatus(s, turnStatusFrame({ status: null }));
+    expect(s._turnProgressHint).toBeUndefined();
+  });
+
+  test("clearTurnTiming 清 working hint", () => {
+    const s = sess();
+    applyTurnStatus(s, turnStatusFrame({ status: "working", detail: "Bash npx tsc" }));
+    clearTurnTiming(s);
+    expect(s._turnProgressHint).toBeUndefined();
+  });
+});
+
+describe("computeTypingLabel progressHint vs stall", () => {
+  test("progressHint 在 silence 低于 warn 时展示中文动作，不回显工具名/路径", () => {
+    const out = computeTypingLabel({
+      name: "助手",
+      secs: 20,
+      silenceMs: 5_000,
+      progressHint: "Read foo.ts",
+    });
+    expect(out.text).toContain("读取文件");
+    expect(out.text).not.toContain("Read");
+    expect(out.text).not.toContain("foo.ts");
+    expect(out.text).not.toContain("无新数据");
+  });
+
+  test("stall 文案盖过 leftover progressHint，不假装在动", () => {
+    const out = computeTypingLabel({
+      name: "助手",
+      secs: 120,
+      silenceMs: STALE_WARN_MS,
+      progressHint: "Read foo.ts",
+    });
+    expect(out.text).toContain("无新数据");
+    expect(out.text).not.toContain("Read foo.ts");
+    expect(out.text).not.toContain("读取文件");
+  });
+
+  test("Cursor StrReplace working-detail 活动行只显示写入文件", () => {
+    const out = computeTypingLabel({
+      name: "全能助手",
+      secs: 1385,
+      silenceMs: 1_000,
+      progressHint:
+        "StrReplace /home/agent/work/display-hardening/packages/commercial/src/db/pgSessionsBackend.ts",
+    });
+    expect(out.text).toContain("全能助手 写入文件 (1385s)");
+    expect(out.text).not.toContain("StrReplace");
+    expect(out.text).not.toContain("/home/");
   });
 });
 
@@ -850,6 +976,118 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
     expect(s.messages.filter((m) => m.role === "assistant")[0].text).toBe("A");
   });
 
+  test("WS stream then live-frame replay after cursor reset does not double assistant text", () => {
+    const s = sess();
+    s._activeClientMessageId = "m-msy9xr0r-5-9sa2";
+    const chunks = [
+      { frameSeq: 814, text: "那批通知是我已经处理完的门禁…" },
+      { frameSeq: 816, text: "守候进程正常运行，第 3 次轮询…" },
+      { frameSeq: 818, text: "上一条里问你的两件事还等你定：…" },
+    ];
+    const frames = chunks.map((chunk) => msgFrame({
+      frameSeq: chunk.frameSeq,
+      clientMessageId: "m-msy9xr0r-5-9sa2",
+      blocks: [{ kind: "text", text: chunk.text, messageId: "srv-webmsx0zsq1jvn4if-main-t14-s39" }],
+    }));
+    for (const frame of frames) applyOutboundMessage(s, frame);
+    const row = s.messages.find((m) => m.id === "srv-webmsx0zsq1jvn4if-main-t14-s39");
+    expect(row?.text).toBe(chunks.map((c) => c.text).join(""));
+    const once = row!.text;
+
+    // Incident shape after Stop: tape projection keeps the same-id row,
+    // journal hydrate resets the session cursor and clears the stream pointer.
+    row!._source = "server";
+    row!._turnTapeId = "4c767b304d7879767665424a761fac0ded7cd7d604d90c80c079232aab58df0d";
+    row!._turnTapeComplete = true;
+    resetFrameSeqCursor(s, frames[0]);
+    s._streamingAssistant = null;
+    for (const frame of frames) applyOutboundMessage(s, frame);
+    expect(s.messages.find((m) => m.id === "srv-webmsx0zsq1jvn4if-main-t14-s39")?.text).toBe(once);
+  });
+
+  test("tape snapshot then live-frame replay does not double assistant text", () => {
+    const s = sess();
+    const full = "那批通知是我已经处理完的门禁…守候进程正常运行，第 3 次轮询…上一条里问你的两件事还等你定：…";
+    s.messages.push({
+      id: "srv-webmsx0zsq1jvn4if-main-t14-s39",
+      role: "assistant",
+      text: full,
+      ts: 1,
+      _source: "server",
+      _turnTapeId: "4c767b304d7879767665424a761fac0ded7cd7d604d90c80c079232aab58df0d",
+      _turnTapeComplete: true,
+      _clientMessageId: "m-msy9xr0r-5-9sa2",
+    });
+    for (const chunk of [
+      { frameSeq: 814, text: "那批通知是我已经处理完的门禁…" },
+      { frameSeq: 816, text: "守候进程正常运行，第 3 次轮询…" },
+      { frameSeq: 818, text: "上一条里问你的两件事还等你定：…" },
+    ]) {
+      applyOutboundMessage(s, msgFrame({
+        frameSeq: chunk.frameSeq,
+        clientMessageId: "m-msy9xr0r-5-9sa2",
+        blocks: [{ kind: "text", text: chunk.text, messageId: "srv-webmsx0zsq1jvn4if-main-t14-s39" }],
+      }));
+    }
+    const asst = s.messages.filter((m) => m.id === "srv-webmsx0zsq1jvn4if-main-t14-s39");
+    expect(asst).toHaveLength(1);
+    expect(asst[0].text).toBe(full);
+  });
+
+  test("cursor reset replay of the same live row does not double without tape stamps", () => {
+    const s = sess();
+    applyOutboundMessage(s, msgFrame({ frameSeq: 1, blocks: [{ kind: "text", text: "Hel", messageId: "srv-1" }] }));
+    applyOutboundMessage(s, msgFrame({ frameSeq: 2, blocks: [{ kind: "text", text: "lo", messageId: "srv-1" }] }));
+    expect(s.messages.filter((m) => m.role === "assistant")[0].text).toBe("Hello");
+    resetFrameSeqCursor(s, { sessionKey: "agent:main:webchat:dm:s1" });
+    s._streamingAssistant = null;
+    applyOutboundMessage(s, msgFrame({ frameSeq: 1, blocks: [{ kind: "text", text: "Hel", messageId: "srv-1" }] }));
+    applyOutboundMessage(s, msgFrame({ frameSeq: 2, blocks: [{ kind: "text", text: "lo", messageId: "srv-1" }] }));
+    expect(s.messages.filter((m) => m.role === "assistant")[0].text).toBe("Hello");
+  });
+
+  test("incomplete tape row with same messageId still accepts later live frames and does not double replay", () => {
+    const s = sess();
+    s._activeClientMessageId = "m-recover";
+    s.messages.push({
+      id: "srv-s1-main-t3-s0",
+      role: "assistant",
+      text: "那批通知是我已经处理完的门禁…",
+      ts: 1,
+      _source: "server",
+      _turnTapeId: "tape-rolling-not-complete",
+      _clientMessageId: "m-recover",
+    });
+    applyOutboundMessage(s, msgFrame({
+      frameSeq: 20,
+      clientMessageId: "m-recover",
+      blocks: [{ kind: "text", text: "守候进程正常运行，第 3 次轮询…", messageId: "srv-s1-main-t3-s0" }],
+    }));
+    const once = "那批通知是我已经处理完的门禁…守候进程正常运行，第 3 次轮询…";
+    expect(s.messages.find((m) => m.id === "srv-s1-main-t3-s0")?.text).toBe(once);
+    applyOutboundMessage(s, msgFrame({
+      frameSeq: 20,
+      clientMessageId: "m-recover",
+      blocks: [{ kind: "text", text: "守候进程正常运行，第 3 次轮询…", messageId: "srv-s1-main-t3-s0" }],
+    }));
+    expect(s.messages.find((m) => m.id === "srv-s1-main-t3-s0")?.text).toBe(once);
+  });
+
+  test("a later frameSeq with the same words is still appended (model really repeated itself)", () => {
+    const s = sess();
+    applyOutboundMessage(s, msgFrame({
+      frameSeq: 1,
+      blocks: [{ kind: "text", text: "守候进程正常运行", messageId: "srv-1" }],
+    }));
+    applyOutboundMessage(s, msgFrame({
+      frameSeq: 2,
+      blocks: [{ kind: "text", text: "守候进程正常运行", messageId: "srv-1" }],
+    }));
+    expect(s.messages.filter((m) => m.role === "assistant")[0].text).toBe(
+      "守候进程正常运行守候进程正常运行",
+    );
+  });
+
   test("per-sessionKey cursors are independent (multi-container parallel streams)", () => {
     const s = sess();
     // A 容器推到 frameSeq 5 并收尾（清流式指针）。
@@ -1220,6 +1458,168 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
     expect(s._replyingToMsgId).toBe(u.id); // 绑 tracker
     expect(u.status).toBe("read"); // 标 read
   });
+
+  // leftover child-mirror: 父轮已 isFinal 后涌来的纯 delegate_progress 不得把父会话
+  // 重新点亮成「正在生成」，新卡必须落在终态答复前（调用点），不能再 append 到会话末尾。
+  test("progress-only 帧在父轮收尾后不复活发送态，卡片插在终态答复前", () => {
+    const s = sess();
+    const onLiveFrame = vi.fn();
+    const u = addMessage(s, "user", "把计费搞起来", { id: "u-parent", status: "sent" });
+    s._activeClientMessageId = u.id;
+    s._sendingInFlight = true;
+    applyOutboundMessage(s, msgFrame({
+      frameSeq: 1,
+      clientMessageId: u.id,
+      blocks: [{ kind: "text", text: "技术点\\n- GPT 1M", messageId: "srv-final-answer" }],
+    }));
+    applyOutboundMessage(s, msgFrame({
+      frameSeq: 2,
+      clientMessageId: u.id,
+      isFinal: true,
+      blocks: [],
+      meta: { stopReason: "end_turn" },
+    }));
+    expect(s._sendingInFlight).toBe(false);
+    const next = addMessage(s, "user", "下一条", { status: "sent" });
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 3,
+        blocks: [{
+          kind: "delegate_progress",
+          runId: "dlg-late",
+          agentId: "auditor",
+          phase: "start",
+          goal: "审 diff",
+          text: "开始委派给 auditor",
+        }],
+      }),
+      { onLiveFrame },
+    );
+    expect(s._sendingInFlight).toBe(false);
+    expect(s._replyingToMsgId).toBeFalsy();
+    expect(next.status).toBe("sent");
+    expect(onLiveFrame).not.toHaveBeenCalled();
+    const roles = s.messages.map((m) => m.role);
+    const cardAt = roles.lastIndexOf("delegate-progress");
+    const answerAt = roles.indexOf("assistant");
+    expect(cardAt).toBeGreaterThan(-1);
+    expect(answerAt).toBeGreaterThan(-1);
+    expect(cardAt).toBeLessThan(answerAt);
+  });
+
+  test("progress-only 帧不重复创建已有 tape/server 委派卡", () => {
+    const s = sess();
+    addMessage(s, "user", "审一下", { id: "u-tape", status: "replied" });
+    addMessage(s, "delegate-progress", "委派子任务", {
+      runId: "dlg-tape",
+      agentId: "auditor",
+      _source: "server",
+      _completed: true,
+      summary: "已完成",
+    });
+    addMessage(s, "assistant", "结论写完了", { _source: "server" });
+    s._sendingInFlight = false;
+    applyOutboundMessage(s, msgFrame({
+      frameSeq: 9,
+      blocks: [{
+        kind: "delegate_progress",
+        runId: "dlg-tape",
+        agentId: "auditor",
+        phase: "done",
+        text: "我先核对未提交 diff",
+      }],
+    }));
+    expect(s.messages.filter((m) => m.role === "delegate-progress")).toHaveLength(1);
+    expect(s._sendingInFlight).toBe(false);
+    expect(s.messages.map((m) => m.role)).toEqual(["user", "delegate-progress", "assistant"]);
+  });
+
+  test("混合帧(progress + text)行为不变:仍复活发送态", () => {
+    const s = sess();
+    const onLiveFrame = vi.fn();
+    const u = addMessage(s, "user", "继续", { status: "sent" });
+    s._sendingInFlight = false;
+    s._replyingToMsgId = null;
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 1,
+        blocks: [
+          { kind: "delegate_progress", runId: "dlg-mix", agentId: "auditor", phase: "text", text: "审" },
+          { kind: "text", text: "父轮还在写", messageId: "srv-mix" },
+        ],
+      }),
+      { onLiveFrame },
+    );
+    expect(s._sendingInFlight).toBe(true);
+    expect(onLiveFrame).toHaveBeenCalledWith(s);
+    expect(u.status).toBe("read");
+  });
+
+  test("活跃轮首帧 progress-only 时卡片保持在新 user 行之后（不跨到上一轮答复前）", () => {
+    const s = sess();
+    addMessage(s, "user", "上一轮问题", { id: "u-prev", status: "replied" });
+    addMessage(s, "assistant", "上一轮答复正文", { id: "a-prev" });
+    const uNew = addMessage(s, "user", "新一轮请立刻委派", { id: "u-new", status: "sent" });
+    s._sendingInFlight = true;
+    s._activeClientMessageId = uNew.id;
+    s._streamingAssistant = null;
+    s._replyingToMsgId = null;
+    applyOutboundMessage(s, msgFrame({
+      frameSeq: 1,
+      clientMessageId: uNew.id,
+      blocks: [{
+        kind: "delegate_progress",
+        runId: "dlg-active",
+        agentId: "auditor",
+        phase: "start",
+        goal: "审 diff",
+        text: "开始委派给 auditor",
+      }],
+    }));
+    expect(s.messages.map((m) => m.role)).toEqual([
+      "user",
+      "assistant",
+      "user",
+      "delegate-progress",
+    ]);
+    expect(s.messages[3]?.runId).toBe("dlg-active");
+    expect(s.messages.findIndex((m) => m.id === uNew.id)).toBe(2);
+  });
+
+  test("活跃轮首帧 progress-only 仍绑 reply tracker 并标 user read", () => {
+    const s = sess();
+    const onLiveFrame = vi.fn();
+    addMessage(s, "user", "上一轮问题", { id: "u-prev", status: "replied" });
+    addMessage(s, "assistant", "上一轮答复正文", { id: "a-prev" });
+    const uNew = addMessage(s, "user", "新一轮请立刻委派", { id: "u-new", status: "sent" });
+    s._sendingInFlight = true;
+    s._activeClientMessageId = uNew.id;
+    s._streamingAssistant = null;
+    s._replyingToMsgId = null;
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 1,
+        clientMessageId: uNew.id,
+        blocks: [{
+          kind: "delegate_progress",
+          runId: "dlg-active-b",
+          agentId: "auditor",
+          phase: "start",
+          goal: "审 diff",
+          text: "开始委派给 auditor",
+        }],
+      }),
+      { onLiveFrame },
+    );
+    expect(s._sendingInFlight).toBe(true);
+    expect(s._replyingToMsgId).toBe(uNew.id);
+    expect(uNew.status).toBe("read");
+    expect(onLiveFrame).toHaveBeenCalledWith(s);
+  });
+
 
   // C2:采用引擎 messageId(srv- 前缀)的 live 生成行也应被盖上当前活跃轮的 _clientMessageId,
   // 否则 finalize 后无法按 _clientMessageId 精确去重(与 server 分段副本并存重复渲染)。
@@ -2679,6 +3079,54 @@ describe("applyOutboundError double-frame suppression (§11)", () => {
     });
   });
 
+  test("hydrate leftover outbound.error after a later completed tape → no phantom red card", () => {
+    const s = sess();
+    const older = addMessage(s, "user", "older", { status: "sent", ts: 1 });
+    addMessage(s, "assistant", "older reply", { _clientMessageId: older.id, _turnTapeComplete: true, ts: 2 });
+    const later = addMessage(s, "user", "later", { status: "sent", ts: 3 });
+    addMessage(s, "assistant", "later reply", { _clientMessageId: later.id, _turnTapeComplete: true, ts: 4 });
+    s._sendingInFlight = false;
+    s._activeClientMessageId = undefined;
+    const persistSession = vi.fn();
+    applyOutboundError(s, {
+      type: "outbound.error",
+      sessionKey: "k",
+      channel: "webchat",
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId: older.id,
+      code: "upstream_failed",
+      message: "任务执行暂时中断，你的消息已保留，可直接重试。",
+      detail: "API Error: 502",
+      isFinal: false,
+    } as never, { persistSession });
+    expect(s.messages.filter((m) => m._errorCode)).toHaveLength(0);
+    expect(persistSession).not.toHaveBeenCalled();
+    expect(shouldSuppressStaleOutboundError(s, {
+      type: "outbound.error",
+      clientMessageId: older.id,
+      code: "upstream_failed",
+    } as never)).toBe(true);
+  });
+
+  test("late outbound.error after the same turn's tape completed → no red card", () => {
+    const s = sess();
+    const user = addMessage(s, "user", "hi", { status: "sent", ts: 1 });
+    addMessage(s, "assistant", "done", { _clientMessageId: user.id, _turnTapeComplete: true, ts: 2 });
+    s._sendingInFlight = false;
+    s._activeClientMessageId = undefined;
+    applyOutboundError(s, {
+      type: "outbound.error",
+      sessionKey: "k",
+      channel: "webchat",
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId: user.id,
+      code: "upstream_failed",
+      message: "任务执行暂时中断，你的消息已保留，可直接重试。",
+      isFinal: false,
+    } as never);
+    expect(s.messages.filter((m) => m._errorCode)).toHaveLength(0);
+  });
+
   test("legacy bridge error 无 final：本地收尾后立即 persist false", () => {
     const s = sess();
     addMessage(s, "user", "hi", { status: "sent", ts: 1 });
@@ -3449,6 +3897,205 @@ function makeSocket(overrides: Partial<ChatSocketDeps> = {}) {
   });
 }
 
+function unpublishedTimeline(sessionId: string): ChatMessage[] {
+  const clientMessageId = `u-${sessionId}`;
+  return [
+    {
+      id: clientMessageId,
+      role: "user",
+      text: "question",
+      ts: 1,
+      status: "sent",
+      _source: "server",
+      _seq: 1,
+      _orderSeq: 1,
+      _timelineRecord: true,
+      _timelineUnitKey: `outer:${sessionId}:1`,
+    },
+    {
+      id: `answer-${sessionId}`,
+      role: "assistant",
+      text: "final answer",
+      ts: 5,
+      _source: "server",
+      _seq: 2,
+      _orderSeq: 2,
+      _clientMessageId: clientMessageId,
+      _turnTapeId: `tape-${sessionId}`,
+      _turnTapeSha256: "a".repeat(64),
+      _turnTapeComplete: true,
+      _dispatchOutcome: "completed",
+      _timelineRecord: true,
+      _timelineUnitKey: `tape-fallback:tape-${sessionId}`,
+      _displayDegraded: true,
+      _displayDegradeReason: "records_unpublished",
+    },
+  ] as ChatMessage[];
+}
+
+function exactTimeline(sessionId: string): ChatMessage[] {
+  const clientMessageId = `u-${sessionId}`;
+  const common = {
+    _source: "server" as const,
+    _seq: 2,
+    _orderSeq: 2,
+    _clientMessageId: clientMessageId,
+    _turnTapeId: `tape-${sessionId}`,
+    _turnTapeSha256: "a".repeat(64),
+    _turnTapeComplete: true,
+    _dispatchOutcome: "completed",
+    _timelineRecord: true,
+  };
+  return [
+    unpublishedTimeline(sessionId)[0]!,
+    { id: `thinking-${sessionId}`, role: "thinking", text: "reasoning", ts: 2,
+      ...common, _turnTapeOrdinal: 1, _timelineUnitKey: `tape:${sessionId}:1` },
+    { id: `tool-${sessionId}`, role: "tool", text: "", toolName: "Bash", output: "ok", ts: 3,
+      ...common, _turnTapeOrdinal: 2, _timelineUnitKey: `tape:${sessionId}:2` },
+    { id: `plan-${sessionId}`, role: "plan", text: "plan", ts: 4,
+      ...common, _turnTapeOrdinal: 3, _timelineUnitKey: `tape:${sessionId}:3` },
+    { id: `answer-${sessionId}`, role: "assistant", text: "final answer", ts: 5,
+      ...common, _turnTapeOrdinal: 4, _timelineUnitKey: `tape:${sessionId}:4` },
+  ] as ChatMessage[];
+}
+
+describe("Phase-A final-only tape projection retry", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  test("materialization taking more than two minutes still converges to every exact semantic row", async () => {
+    vi.useFakeTimers();
+    const sessionId = "s-unpublished-long";
+    const startedAt = Date.now();
+    let sock!: ChatSocket;
+    const syncSession = vi.fn<NonNullable<ChatSocketDeps["syncSession"]>>(async (_id, context) => {
+      expect(context?.tapeProjectionOnly).toBe(true);
+      if (Date.now() - startedAt < 3 * 60_000) return false;
+      if (!context?.isCurrent?.()) return false;
+      sock.applyServerMessages(sessionId, "main", exactTimeline(sessionId), true, 2, {
+        serverUpdatedAt: 3,
+        historyRevision: 2,
+        timelineGeneration: 3,
+      });
+      return true;
+    });
+    sock = makeSocket({ syncSession });
+    sock.ensureSession(sessionId, "main");
+    sock.applyServerMessages(sessionId, "main", unpublishedTimeline(sessionId), true, 2, {
+      serverUpdatedAt: 2,
+      historyRevision: 1,
+      timelineGeneration: 2,
+    });
+
+    await vi.advanceTimersByTimeAsync(3 * 60_000 + 2_000);
+    expect(syncSession.mock.calls.length).toBeGreaterThan(5);
+    expect(sock.sessions.get(sessionId)?.messages.map((message) => message.role)).toEqual([
+      "user", "thinking", "tool", "plan", "assistant",
+    ]);
+    await vi.advanceTimersByTimeAsync(60_000);
+    const completedCalls = syncSession.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(syncSession).toHaveBeenCalledTimes(completedCalls);
+    sock.stop();
+  });
+
+  test("repeated fallback applies share one timer and one in-flight sync", async () => {
+    vi.useFakeTimers();
+    const sessionId = "s-unpublished-singleflight";
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    const syncSession = vi.fn(async () => pending);
+    const sock = makeSocket({ syncSession });
+    sock.ensureSession(sessionId, "main");
+    const apply = () => sock.applyServerMessages(
+      sessionId,
+      "main",
+      unpublishedTimeline(sessionId),
+      true,
+      2,
+      { serverUpdatedAt: 2, historyRevision: 1, timelineGeneration: 2 },
+    );
+    apply();
+    apply();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(syncSession).toHaveBeenCalledTimes(1);
+    apply();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(syncSession).toHaveBeenCalledTimes(1);
+    release();
+    await Promise.resolve();
+    await Promise.resolve();
+    sock.stop();
+  });
+
+  test.each(["stop", "remove", "reset"] as const)(
+    "%s invalidates a deferred projection read before it can revive content",
+    async (action) => {
+      vi.useFakeTimers();
+      const sessionId = `s-unpublished-${action}`;
+      let release!: () => void;
+      const pending = new Promise<void>((resolve) => { release = resolve; });
+      let sock!: ChatSocket;
+      const syncSession = vi.fn<NonNullable<ChatSocketDeps["syncSession"]>>(async (_id, context) => {
+        await pending;
+        if (context?.isCurrent?.()) {
+          sock.applyServerMessages(sessionId, "main", exactTimeline(sessionId), true, 2, {
+            serverUpdatedAt: 3,
+            historyRevision: 2,
+            timelineGeneration: 3,
+          });
+        }
+      });
+      sock = makeSocket({ syncSession });
+      sock.ensureSession(sessionId, "main");
+      sock.applyServerMessages(sessionId, "main", unpublishedTimeline(sessionId), true, 2, {
+        serverUpdatedAt: 2,
+        historyRevision: 1,
+        timelineGeneration: 2,
+      });
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(syncSession).toHaveBeenCalledTimes(1);
+      if (action === "stop") sock.stop();
+      else if (action === "remove") sock.removeSession(sessionId);
+      else sock.resetSessions();
+      release();
+      await Promise.resolve();
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(UNPUBLISHED_TAPE_RETRY_MAX_MS);
+      expect(syncSession).toHaveBeenCalledTimes(1);
+      const current = sock.sessions.get(sessionId);
+      if (action === "stop") {
+        expect(current?.messages.some((message) => message.role === "thinking")).toBe(false);
+      } else {
+        expect(current).toBeUndefined();
+      }
+      sock.stop();
+    },
+  );
+
+  test("permanent materialization failure never starts unpublished polling", async () => {
+    vi.useFakeTimers();
+    const sessionId = "s-materialization-failed";
+    const syncSession = vi.fn();
+    const sock = makeSocket({ syncSession });
+    sock.ensureSession(sessionId, "main");
+    const failed = unpublishedTimeline(sessionId).map((message) =>
+      message.role === "assistant"
+        ? { ...message, _displayDegradeReason: "records_failed" }
+        : message,
+    );
+    sock.applyServerMessages(sessionId, "main", failed, true, 2, {
+      serverUpdatedAt: 2,
+      historyRevision: 1,
+      timelineGeneration: 2,
+    });
+    await vi.advanceTimersByTimeAsync(UNPUBLISHED_TAPE_RETRY_MAX_MS);
+    expect(syncSession).not.toHaveBeenCalled();
+    sock.stop();
+  });
+});
+
 describe("ChatSocket interrupted continuation", () => {
   afterEach(() => {
     FakeWS.instances = [];
@@ -4148,6 +4795,476 @@ describe("ChatSocket interrupted continuation", () => {
     sock.stop();
   });
 
+  test("tape projection version watermark heals cutovers that happen between hydrations", async () => {
+    // codex 审计 blocker 场景:turn 在两次水合之间启动、断连期间完成 —— 前后
+    // live owner 集都不含它,liveOwnerProjectedToTape 不触发;一次性布尔标记
+    // 也已置位。版本水位(tape 投影流计数)增长 1→2 必须再次触发自愈。
+    const sock = makeSocket();
+    const sessId = "s-tape-version-heal";
+    sock.ensureSession(sessId, "main");
+    const applyTapeProjection = vi.fn(async () => {});
+    const page = (version: number) => async () => ({
+      frames: [], nextCursor: null, hasMore: false,
+      streamClientMessageIds: [], hasTapeProjection: true,
+      tapeProjectionVersion: version,
+    });
+
+    await sock.hydrateDurableLiveFrameJournal(sessId, page(1), applyTapeProjection);
+    expect(applyTapeProjection).toHaveBeenCalledTimes(1);
+    // 水位不变:常规对账不重复打全量。
+    await sock.hydrateDurableLiveFrameJournal(sessId, page(1), applyTapeProjection);
+    expect(applyTapeProjection).toHaveBeenCalledTimes(1);
+    // 断连期间又有 turn 切到 tape:水位 1→2,即使从未观察到它的 live owner
+    // 也要自愈补拉。
+    await sock.hydrateDurableLiveFrameJournal(sessId, page(2), applyTapeProjection);
+    expect(applyTapeProjection).toHaveBeenCalledTimes(2);
+    await sock.hydrateDurableLiveFrameJournal(sessId, page(2), applyTapeProjection);
+    expect(applyTapeProjection).toHaveBeenCalledTimes(2);
+    sock.stop();
+  });
+
+  test("in-flight live owner is not wiped by historical tapeProjectionVersion", async () => {
+    const sock = makeSocket();
+    const sessId = "s-inflight-live-owner";
+    const clientMessageId = "cm-inflight-live";
+    const session = sock.ensureSession(sessId, "main");
+    session._sendingInFlight = true;
+    session._activeClientMessageId = clientMessageId;
+    session._streamingAssistant = {
+      id: "stream-1",
+      role: "assistant",
+      text: "partial live text",
+      ts: 1,
+    } as ChatMessage;
+    const applyTapeProjection = vi.fn(async () => {
+      sock.applyServerMessages(sessId, "main", [{
+        id: "hist-1",
+        role: "assistant",
+        text: "historical tape",
+        ts: 0,
+        _source: "server",
+      } as ChatMessage], true, 1);
+    });
+    await sock.hydrateDurableLiveFrameJournal(
+      sessId,
+      async () => ({
+        frames: [],
+        nextCursor: null,
+        hasMore: false,
+        streamClientMessageIds: [clientMessageId],
+        hasTapeProjection: true,
+        tapeProjectionVersion: 4,
+      }),
+      applyTapeProjection,
+    );
+    expect(applyTapeProjection).not.toHaveBeenCalled();
+    expect(session._streamingAssistant?.text).toBe("partial live text");
+    expect(session._sendingInFlight).toBe(true);
+    sock.stop();
+  });
+
+  test("applyServerMessages keeps streaming when in-flight cmid is absent from REST msgs", () => {
+    const sock = makeSocket();
+    const sessId = "s-preserve-stream";
+    const session = sock.ensureSession(sessId, "main");
+    session._sendingInFlight = true;
+    session._activeClientMessageId = "cm-live";
+    session._streamingAssistant = {
+      id: "stream-1",
+      role: "assistant",
+      text: "live",
+      ts: 1,
+    } as ChatMessage;
+    sock.applyServerMessages(sessId, "main", [{
+      id: "hist",
+      role: "assistant",
+      text: "old",
+      ts: 0,
+      _source: "server",
+    } as ChatMessage], true, 1);
+    expect(session._streamingAssistant?.text).toBe("live");
+    sock.stop();
+  });
+
+  test("journal hydrate stops paging at the page cap and marks degraded retry", async () => {
+    const sock = makeSocket();
+    sock.ensureSession("s1", "main");
+    let pages = 0;
+    const applyTapeProjection = vi.fn(async () => {});
+    await sock.hydrateDurableLiveFrameJournal(
+      "s1",
+      async (after) => {
+        pages += 1;
+        return {
+          frames: [],
+          nextCursor: String(Number(after) + 1),
+          hasMore: true,
+          streamClientMessageIds: ["u-long"],
+          hasTapeProjection: false,
+        };
+      },
+      applyTapeProjection,
+    );
+    expect(pages).toBe(LIVE_JOURNAL_MAX_PAGES);
+    expect(sock.sessions.get("s1")?._liveJournalDegraded).toBe(true);
+    expect(applyTapeProjection).toHaveBeenCalledTimes(1);
+    sock.stop();
+  });
+
+  test("journal hydrate degrades on the first-page timeout and still pulls tape", async () => {
+    const sock = makeSocket();
+    sock.ensureSession("s1", "main");
+    const applyTapeProjection = vi.fn(async () => {});
+    await sock.hydrateDurableLiveFrameJournal(
+      "s1",
+      async () => {
+        throw new DOMException("live-frames request timeout", "TimeoutError");
+      },
+      applyTapeProjection,
+    );
+    expect(sock.sessions.get("s1")?._liveJournalDegraded).toBe(true);
+    expect(applyTapeProjection).toHaveBeenCalledTimes(1);
+    sock.stop();
+  });
+
+  test("view=units first pack paints process rows, resumes, and catch-up uses resume.recordId", async () => {
+    const sock = makeSocket();
+    const sessId = "s-units";
+    const clientMessageId = "cm-units";
+    const sessionKey = `agent:main:webchat:dm:${sessId}`;
+    const session = sock.ensureSession(sessId, "main");
+    session._sendingInFlight = true;
+    session._activeClientMessageId = clientMessageId;
+    session._recoveryStatus = { kind: "waiting-service" };
+    const afters: string[] = [];
+    await sock.hydrateDurableLiveFrameJournal(
+      sessId,
+      async (after) => {
+        afters.push(after);
+        return {
+          frames: [],
+          nextCursor: null,
+          hasMore: false,
+          streamClientMessageIds: [clientMessageId],
+          hasTapeProjection: false,
+        };
+      },
+      async () => {},
+      async () => ({
+        view: "units",
+        units: [{
+          id: "thinking:1:cm-units",
+          kind: "thinking",
+          seqFirst: 1,
+          seqLast: 2,
+          recordIdFirst: "10",
+          recordIdLast: "11",
+          open: true,
+          clientMessageId,
+          text: "visible thought",
+        }],
+        n: 20,
+        hasMoreBefore: false,
+        beforeCursor: null,
+        streamClientMessageIds: [clientMessageId],
+        openDispatch: true,
+        hasTapeProjection: false,
+        tapeProjectionVersion: 0,
+        reducerEpoch: "1",
+        degraded: false,
+        resume: { sessionKey, frameSeq: 11, recordId: "11" },
+        throughFrameSeq: 11,
+      }),
+    );
+    expect(session.messages.some((m) => m.role === "thinking" && m.text === "visible thought")).toBe(true);
+    expect(session._recoveryStatus?.kind).toBe("resumed");
+    expect(session._liveUnitsPackApplied).toBe(true);
+    expect(session._lastFrameSeqByKey?.[sessionKey]).toBe(11);
+    expect(afters[0]).toBe("11");
+    sock.stop();
+  });
+
+  test("view=units degraded=fallback does not mint resume and pages after=0", async () => {
+    const sock = makeSocket();
+    const sessId = "s-units-fallback";
+    const session = sock.ensureSession(sessId, "main");
+    const afters: string[] = [];
+    await sock.hydrateDurableLiveFrameJournal(
+      sessId,
+      async (after) => {
+        afters.push(after);
+        return {
+          frames: [],
+          nextCursor: after === "0" ? "1" : null,
+          hasMore: after === "0",
+          streamClientMessageIds: [],
+          hasTapeProjection: false,
+        };
+      },
+      async () => {},
+      async () => ({
+        view: "units",
+        units: [],
+        n: 20,
+        hasMoreBefore: false,
+        beforeCursor: null,
+        streamClientMessageIds: [],
+        openDispatch: true,
+        hasTapeProjection: false,
+        tapeProjectionVersion: 0,
+        reducerEpoch: "1",
+        degraded: "fallback",
+      }),
+    );
+    expect(afters[0]).toBe("0");
+    expect(session._liveUnitsPackApplied).toBeFalsy();
+    sock.stop();
+  });
+
+  test("prependLiveUnits dedupes by stable unit id", () => {
+    const sock = makeSocket();
+    const sessId = "s-units-dedupe";
+    const session = sock.ensureSession(sessId, "main");
+    sock.applyLiveUnits(sessId, [{
+      id: "tool:1:a",
+      kind: "tool",
+      seqFirst: 10,
+      seqLast: 10,
+      recordIdFirst: "10",
+      recordIdLast: "10",
+      open: false,
+      clientMessageId: "cm",
+      toolName: "Bash",
+    }], ["cm"]);
+    sock.prependLiveUnits(sessId, [{
+      id: "tool:1:a",
+      kind: "tool",
+      seqFirst: 10,
+      seqLast: 10,
+      recordIdFirst: "10",
+      recordIdLast: "10",
+      open: false,
+      clientMessageId: "cm",
+      toolName: "Bash",
+    }, {
+      id: "tool:2:b",
+      kind: "tool",
+      seqFirst: 5,
+      seqLast: 5,
+      recordIdFirst: "5",
+      recordIdLast: "5",
+      open: false,
+      clientMessageId: "cm",
+      toolName: "Read",
+    }]);
+    expect(session.messages.filter((m) => m.id === "tool:1:a")).toHaveLength(1);
+    expect(session.messages.some((m) => m.id === "tool:2:b")).toBe(true);
+    sock.stop();
+  });
+
+  test("BL1 liveUnits fold matches web reducer parent cards for delegate_task", () => {
+    const blocks: Record<string, unknown>[] = [
+      {
+        kind: "tool_use",
+        toolName: "delegate_task",
+        blockId: "tool-bl1",
+        partial: false,
+        inputJson: { agentId: "hidden-reviewer", goal: "审查草稿" },
+      },
+      {
+        kind: "delegate_progress",
+        runId: "dlg-bl1",
+        agentId: "hidden-reviewer",
+        goal: "审查草稿",
+        phase: "start",
+      },
+      {
+        kind: "delegate_progress",
+        runId: "dlg-bl1",
+        phase: "text",
+        block: { kind: "text", text: "child output" },
+      },
+      {
+        kind: "tool_result",
+        toolUseBlockId: "tool-bl1",
+        output: "PASS",
+      },
+    ];
+    const s = sess();
+    for (let i = 0; i < blocks.length; i++) {
+      applyOutboundMessage(s, msgFrame({ frameSeq: i + 1, blocks: [blocks[i]] }));
+    }
+    const frames: LiveFrameInput[] = blocks.map((block, i) => ({
+      recordId: String(i + 1),
+      streamKey: "dispatch:00000000-0000-4000-8000-000000000001:1",
+      clientMessageId: "cm-1",
+      payload: {
+        type: "outbound.message",
+        sessionKey: "agent:main:webchat:dm:s1",
+        frameSeq: i + 1,
+        blocks: [block],
+      },
+    }));
+    const reduced = reduceLiveFrames(frames);
+    expect(reduced.ok).toBe(true);
+    if (!reduced.ok) return;
+    const webParents = s.messages.filter((m) => m.role !== "user");
+    expect(webParents.filter((m) => m.role === "agent-group")).toHaveLength(1);
+    expect(webParents.filter((m) => m.role === "tool")).toHaveLength(0);
+    expect(reduced.state.units.filter((u) => u.kind === "agent_group")).toHaveLength(1);
+    expect(reduced.state.units.filter((u) => u.kind === "tool")).toHaveLength(0);
+    expect(reduced.state.units.length).toBe(webParents.length);
+  });
+
+  test("BL2 view=units open thinking continues the same row on the next WS delta", () => {
+    const sock = makeSocket();
+    const sessId = "s-bl2-think";
+    const clientMessageId = "cm-bl2";
+    const session = sock.ensureSession(sessId, "main");
+    session._sendingInFlight = true;
+    session._activeClientMessageId = clientMessageId;
+    sock.applyLiveUnits(sessId, [{
+      id: "thinking:1:cm-bl2",
+      kind: "thinking",
+      messageId: "srv-think-1",
+      seqFirst: 1,
+      seqLast: 2,
+      recordIdFirst: "10",
+      recordIdLast: "11",
+      open: true,
+      clientMessageId,
+      text: "aaa",
+    }], [clientMessageId]);
+    const before = session.messages.filter((m) => m.role === "thinking");
+    expect(before).toHaveLength(1);
+    expect(before[0]?.id).toBe("srv-think-1");
+    applyOutboundMessage(session, msgFrame({
+      frameSeq: 12,
+      blocks: [{ kind: "thinking", text: "bbb", messageId: "srv-think-1" }],
+    }));
+    const after = session.messages.filter((m) => m.role === "thinking");
+    expect(after).toHaveLength(1);
+    expect(after[0]?.id).toBe("srv-think-1");
+    expect(after[0]?.text).toBe("aaabbb");
+    sock.stop();
+  });
+
+  test("retired stream frames still reset local cache but are not live owners", async () => {
+    vi.useFakeTimers();
+    const sessId = "s-retired-stream";
+    const clientMessageId = "cm-retired-stream";
+    const sessionKey = `agent:main:webchat:dm:${sessId}`;
+    let sock!: ChatSocket;
+    const resetLists: string[][] = [];
+    const syncSession = vi.fn(async () => {
+      await sock.hydrateDurableLiveFrameJournal(
+        sessId,
+        async (after) => ({
+          frames: after === "0"
+            ? [{
+                recordId: "1",
+                streamKey: "dispatch:77777777-7777-4777-8777-777777777777:1",
+                source: "gateway" as const,
+                clientMessageId,
+                payload: {
+                  type: "outbound.message",
+                  sessionKey,
+                  frameSeq: 1,
+                  peer: { id: sessId, kind: "dm" },
+                  clientMessageId,
+                  blocks: [{ kind: "text", text: "retired stream answer" }],
+                  isFinal: true,
+                  ts: 11,
+                },
+              }]
+            : [],
+          nextCursor: after === "0" ? "1" : null,
+          hasMore: false,
+          streamClientMessageIds: [],
+          hasTapeProjection: true,
+        }),
+        async () => {},
+      );
+      return true;
+    });
+    sock = makeSocket({ syncSession });
+    const apply = sock.applyDurableLiveFrames.bind(sock);
+    sock.applyDurableLiveFrames = ((...args: Parameters<ChatSocket["applyDurableLiveFrames"]>) => {
+      resetLists.push([...(args[2] ?? [])]);
+      return apply(...args);
+    }) as ChatSocket["applyDurableLiveFrames"];
+    const now = Date.now();
+    sock.loadStored({
+      id: sessId,
+      agentId: "main",
+      title: "retired",
+      messages: [
+        { id: clientMessageId, role: "user", text: "please recover", ts: now, status: "sent" },
+        {
+          id: "stale-local-retired",
+          role: "assistant",
+          text: "stale local copy",
+          ts: now + 1,
+          _clientMessageId: clientMessageId,
+        },
+        {
+          id: "srv-retired-visible",
+          role: "assistant",
+          text: "tape already has the answer",
+          ts: now + 2,
+          _source: "server",
+          _clientMessageId: clientMessageId,
+        },
+      ],
+      createdAt: now,
+      lastAt: now,
+      _sendingInFlight: true,
+      _activeClientMessageId: clientMessageId,
+      _turnStartedAt: now,
+    });
+
+    await vi.waitFor(() => {
+      expect(resetLists.length).toBeGreaterThan(0);
+      expect(sock.sessions.get(sessId)?._reconciling).toBe(false);
+    });
+    const session = sock.sessions.get(sessId)!;
+    expect(resetLists[0]).toEqual([clientMessageId]);
+    expect(resetLists.slice(1).every((ids) => ids.length === 0)).toBe(true);
+    expect(session.messages.find((message) => message.id === "stale-local-retired")).toBeUndefined();
+    expect(session.messages.some((message) => message.text === "retired stream answer")).toBe(true);
+    expect(session._sendingInFlight).toBe(false);
+    expect(session._reconciling).toBe(false);
+    expect(session._recoveryStatus?.kind).toBe("completed");
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(syncSession).toHaveBeenCalledTimes(1);
+    sock.stop();
+  });
+
+  test("tape projection observed only after reconnect (stale checkpoint, no live cutover) still triggers one narrative read", async () => {
+    // boss 2026-08-16 现场:页面在网关重启前打开(当时没有任何 tape 投影),重启
+    // 断连期间 turn 完成并切到 tape 投影;重连水合带着旧 checkpoint(initial=false)
+    // 且从未见过 live owner 切换 —— 旧行为两次触发都不命中,助手正文只剩存根。
+    const sock = makeSocket();
+    const sessId = "s-reconnect-tape-heal";
+    sock.ensureSession(sessId, "main");
+    const applyTapeProjection = vi.fn(async () => {});
+    const page = (hasTapeProjection: boolean) => async () => ({
+      frames: [], nextCursor: null, hasMore: false,
+      streamClientMessageIds: [], hasTapeProjection,
+    });
+
+    // 打开会话时还没有任何 tape 投影:不触发。
+    await sock.hydrateDurableLiveFrameJournal(sessId, page(false), applyTapeProjection);
+    expect(applyTapeProjection).not.toHaveBeenCalled();
+    // 网关重启、重连:同一页面(非 initial),此时才第一次观察到 tape 投影 → 恰好补拉一次。
+    await sock.hydrateDurableLiveFrameJournal(sessId, page(true), applyTapeProjection);
+    expect(applyTapeProjection).toHaveBeenCalledTimes(1);
+    // 之后的常规对账不重复打全量。
+    await sock.hydrateDurableLiveFrameJournal(sessId, page(true), applyTapeProjection);
+    expect(applyTapeProjection).toHaveBeenCalledTimes(1);
+    sock.stop();
+  });
+
   test("journal page1 → overlapping WS frame → page2 applies thinking/tool/text exactly once", async () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const sock = makeSocket();
@@ -4330,6 +5447,64 @@ describe("ChatSocket interrupted continuation", () => {
     expect(sentRecoveries()).toBe(1);
     expect(sock.toStored("s-auto-checkpoint")?.messages[0]._automaticRecoveryAttempted).toBe(true);
     expect(sock.toStored("s-auto-checkpoint")?._automaticRecoveryDecisions?.["u-auto-checkpoint"]).toBe(true);
+    sock.stop();
+  });
+
+  test("recoverySkipped removes a lineage-only child after _isAutoRetry is lost and leaves the source error visible", async () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket({ syncSession: async () => {} });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    const session = sock.ensureSession("s-lineage-skip", "main");
+    const sourceUser: ChatMessage = {
+      id: "u-lineage-skip",
+      role: "user",
+      text: "long task",
+      ts: 1,
+      status: "error",
+      _source: "server",
+    };
+    const sourceError: ChatMessage = {
+      id: "error-lineage-skip",
+      role: "assistant",
+      text: "SOURCE_ERROR_SHOULD_REAPPEAR",
+      ts: 2,
+      _source: "server",
+      _clientMessageId: "u-lineage-skip",
+      _errorCode: "model_capacity",
+    };
+    const recoveryChild: ChatMessage = {
+      id: "u-lineage-skip-child",
+      role: "user",
+      text: "↻ 自动从断点继续",
+      ts: 3,
+      _source: "server",
+      _recoveryOfClientMessageId: "u-lineage-skip",
+    };
+    session.messages.push(sourceUser, sourceError, recoveryChild);
+
+    ws.onmessage?.({
+      data: JSON.stringify({
+        type: "outbound.ack",
+        recoverySkipped: true,
+        recoverySkippedReason: "source_not_latest",
+        sourceClientMessageId: "u-lineage-skip",
+        peer: { id: "s-lineage-skip", kind: "dm" },
+        clientMessageId: "u-lineage-skip-child",
+      }),
+    });
+
+    expect(session.messages.map((message) => message.id)).toEqual([
+      "u-lineage-skip",
+      "error-lineage-skip",
+    ]);
+    expect(session.messages.some((message) => message._recoveryOfClientMessageId)).toBe(false);
+    expect(session.messages.find((message) => message.id === "error-lineage-skip")).toMatchObject({
+      _errorCode: "model_capacity",
+      text: "SOURCE_ERROR_SHOULD_REAPPEAR",
+      _clientMessageId: "u-lineage-skip",
+    });
     sock.stop();
   });
 
@@ -6046,6 +7221,11 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     vi.useFakeTimers();
     let sock!: ChatSocket;
     const syncSession = vi.fn(async () => {
+      sock.noteLiveJournalObservation("s1", {
+        frameCount: 2,
+        liveClientMessageIds: ["u-live"],
+        hasTapeProjection: false,
+      });
       if (syncSession.mock.calls.length === 3) {
         const session = sock.sessions.get("s1")!;
         session._sendingInFlight = false;
@@ -6071,11 +7251,155 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     expect(syncSession).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(1000);
     expect(syncSession).toHaveBeenCalledTimes(2);
-    // Attempt 2 used to back off for two seconds even though REST was healthy,
-    // leaving a broken-WS client visibly stale. A successful poll stays at 1s.
+    // Active journal (live owner + frames) stays at 1s so a broken-WS client
+    // does not look stale. Empty journals use backoff; see the sibling test.
     await vi.advanceTimersByTimeAsync(1000);
     expect(syncSession).toHaveBeenCalledTimes(3);
     expect(sock.sessions.get("s1")?._reconciling).toBe(false);
+    sock.stop();
+  });
+
+  test("empty journal without a live owner backs off instead of 1s death-polling", async () => {
+    vi.useFakeTimers();
+    let sock!: ChatSocket;
+    const syncSession = vi.fn(async () => {
+      sock.noteLiveJournalObservation("s1", {
+        frameCount: 0,
+        liveClientMessageIds: [],
+        hasTapeProjection: false,
+      });
+      return true;
+    });
+    sock = makeSocket({ syncSession });
+    const now = Date.now();
+    sock.loadStored({
+      id: "s1",
+      agentId: "main",
+      title: "s1",
+      messages: [{ id: "u-empty", role: "user", text: "done turn", ts: now, status: "sent" }],
+      createdAt: now,
+      lastAt: now,
+      _sendingInFlight: true,
+      _activeClientMessageId: "u-empty",
+      _turnStartedAt: now,
+    });
+
+    await Promise.resolve();
+    expect(syncSession).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(EMPTY_JOURNAL_POLL_DELAYS_MS[0]);
+    expect(syncSession).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(EMPTY_JOURNAL_POLL_DELAYS_MS[0]);
+    expect(syncSession).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(EMPTY_JOURNAL_POLL_DELAYS_MS[1] - EMPTY_JOURNAL_POLL_DELAYS_MS[0]);
+    expect(syncSession).toHaveBeenCalledTimes(3);
+    sock.stop();
+  });
+
+  test("empty journal with tape projection exits restore and clears sending", async () => {
+    vi.useFakeTimers();
+    let sock!: ChatSocket;
+    const syncSession = vi.fn(async () => {
+      sock.noteLiveJournalObservation("s1", {
+        frameCount: 0,
+        liveClientMessageIds: [],
+        hasTapeProjection: true,
+      });
+      return true;
+    });
+    sock = makeSocket({ syncSession });
+    const now = Date.now();
+    sock.loadStored({
+      id: "s1",
+      agentId: "main",
+      title: "s1",
+      messages: [{ id: "u-tape", role: "user", text: "done turn", ts: now, status: "sent" }],
+      createdAt: now,
+      lastAt: now,
+      _sendingInFlight: true,
+      _activeClientMessageId: "u-tape",
+      _turnStartedAt: now,
+    });
+
+    await Promise.resolve();
+    const session = sock.sessions.get("s1")!;
+    expect(session._sendingInFlight).toBe(false);
+    expect(session._reconciling).toBe(false);
+    expect(session._recoveryStatus?.kind).toBe("completed");
+    expect(syncSession).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(syncSession).toHaveBeenCalledTimes(1);
+    sock.stop();
+  });
+
+  test("visible server-authored body after reconcile exits restore", async () => {
+    vi.useFakeTimers();
+    let sock!: ChatSocket;
+    const syncSession = vi.fn(async () => {
+      const session = sock.sessions.get("s1")!;
+      session.messages.push({
+        id: "srv-a1",
+        role: "assistant",
+        text: "已经写完的答复",
+        ts: Date.now(),
+        _source: "server",
+        _clientMessageId: "u-vis",
+      });
+      sock.noteLiveJournalObservation("s1", {
+        frameCount: 0,
+        liveClientMessageIds: [],
+        hasTapeProjection: false,
+      });
+      return true;
+    });
+    sock = makeSocket({ syncSession });
+    const now = Date.now();
+    sock.loadStored({
+      id: "s1",
+      agentId: "main",
+      title: "s1",
+      messages: [{ id: "u-vis", role: "user", text: "please", ts: now, status: "sent" }],
+      createdAt: now,
+      lastAt: now,
+      _sendingInFlight: true,
+      _activeClientMessageId: "u-vis",
+      _turnStartedAt: now,
+    });
+
+    await Promise.resolve();
+    const session = sock.sessions.get("s1")!;
+    expect(session._sendingInFlight).toBe(false);
+    expect(session._reconciling).toBe(false);
+    expect(session._recoveryStatus?.kind).toBe("completed");
+    sock.stop();
+  });
+
+  test("restore attempt cap exits even when journal metadata never arrives", async () => {
+    vi.useFakeTimers();
+    const syncSession = vi.fn(async () => true);
+    const sock = makeSocket({ syncSession });
+    const now = Date.now();
+    sock.loadStored({
+      id: "s1",
+      agentId: "main",
+      title: "s1",
+      messages: [{ id: "u-cap", role: "user", text: "orphan", ts: now, status: "sent" }],
+      createdAt: now,
+      lastAt: now,
+      _sendingInFlight: true,
+      _activeClientMessageId: "u-cap",
+      _turnStartedAt: now,
+    });
+
+    await Promise.resolve();
+    expect(syncSession).toHaveBeenCalledTimes(1);
+    for (let i = 0; i < RESTORE_RECONCILE_MAX_ATTEMPTS; i++) {
+      await vi.advanceTimersByTimeAsync(10_000);
+    }
+    const session = sock.sessions.get("s1")!;
+    expect(syncSession.mock.calls.length).toBeLessThanOrEqual(RESTORE_RECONCILE_MAX_ATTEMPTS);
+    expect(session._reconciling).toBe(false);
+    expect(session._sendingInFlight).toBe(false);
+    expect(session._recoveryStatus?.kind).toBe("completed");
     sock.stop();
   });
 
@@ -6456,6 +7780,102 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     sock.sendMessage({ sessId: "s1", agentId: "main", text: "one" });
     sock.sendMessage({ sessId: "s1", agentId: "main", text: "two" });
     expect(sock.offlineQueue.map((i) => i.payload.content.text)).toEqual(["one", "two"]);
+  });
+});
+
+describe("ChatSocket 正在恢复上一轮 banner self-clear", () => {
+  afterEach(() => {
+    FakeWS.instances = [];
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  async function flushStatus(): Promise<void> {
+    await vi.advanceTimersByTimeAsync(300);
+  }
+
+  test("对账清掉 in-flight 后自动收口恢复条，不要求刷新", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    await flushStatus();
+    const session = sock.ensureSession("s1", "main");
+    session._sendingInFlight = true;
+    session._activeClientMessageId = "u-banner";
+    (sock as unknown as { setStatus(label: string, cls: string): void })
+      .setStatus("正在恢复上一轮…", "connecting");
+    await flushStatus();
+    expect(sock.getSnapshot().status).toEqual({ label: "正在恢复上一轮…", cls: "connecting" });
+
+    (sock as unknown as { clearSendingState(sess: typeof session): void }).clearSendingState(session);
+    await flushStatus();
+    expect(session._sendingInFlight).toBe(false);
+    expect(sock.getSnapshot().status).toEqual({ label: "已连接", cls: "connected" });
+    sock.stop();
+  });
+
+  test("重连 30s 安全网只在仍在飞时提示，收尾后自行消失", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    const session = sock.ensureSession("s1", "main");
+    session._sendingInFlight = true;
+    session._activeClientMessageId = "u-wait";
+    ws.open();
+    await flushStatus();
+    (sock as unknown as { setStatus(label: string, cls: string): void })
+      .setStatus("会话续期中…", "connecting");
+    await flushStatus();
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(sock.getSnapshot().status).toEqual({ label: "正在恢复上一轮…", cls: "connecting" });
+
+    (sock as unknown as { clearSendingState(sess: typeof session): void }).clearSendingState(session);
+    await flushStatus();
+    expect(sock.getSnapshot().status).toEqual({ label: "已连接", cls: "connected" });
+    sock.stop();
+  });
+
+  test("30s 到点时若已经收尾，不会再钉上恢复条", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    const session = sock.ensureSession("s1", "main");
+    session._sendingInFlight = true;
+    session._activeClientMessageId = "u-done";
+    ws.open();
+    await flushStatus();
+    (sock as unknown as { setStatus(label: string, cls: string): void })
+      .setStatus("会话续期中…", "connecting");
+    (sock as unknown as { clearSendingState(sess: typeof session): void }).clearSendingState(session);
+    await flushStatus();
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(sock.getSnapshot().status.label).not.toBe("正在恢复上一轮…");
+    expect(sock.getSnapshot().status).toEqual({ label: "已连接", cls: "connected" });
+    sock.stop();
+  });
+
+  test("套接字已断时收口恢复条，不谎称已连接", async () => {
+    vi.useFakeTimers();
+    const sock = makeSocket();
+    const session = sock.ensureSession("s1", "main");
+    session._sendingInFlight = true;
+    session._activeClientMessageId = "u-offline";
+    (sock as unknown as { setStatus(label: string, cls: string): void })
+      .setStatus("正在恢复上一轮…", "connecting");
+    await flushStatus();
+    (sock as unknown as { clearSendingState(sess: typeof session): void }).clearSendingState(session);
+    await flushStatus();
+    expect(sock.getSnapshot().status).toEqual({ label: "连接中…", cls: "connecting" });
+    sock.stop();
   });
 });
 
@@ -6937,6 +8357,136 @@ describe("applyServerMessages 版本护栏", () => {
     const s = sock.sessions.get("s1")!;
     expect(s.messages.some((m) => m.id === "srv-c")).toBe(true);
     expect(s.messages.some((m) => m.id === "srv-a")).toBe(true); // 缺席但无授权 → 保留
+    sock.stop();
+  });
+});
+
+describe("applyPermissionRequest — frameSeq exemption + requestId dedupe", () => {
+  const sessionKey = "agent:main:webchat:dm:s1";
+  const requestId = "ask-user:" + "cd".repeat(16);
+
+  function permFrame(over: Record<string, unknown> = {}): OutboundPermissionRequestWire {
+    return {
+      type: "outbound.permission_request",
+      sessionKey,
+      channel: "webchat",
+      peer: { id: "s1", kind: "dm" },
+      requestId,
+      toolName: "AskUserQuestion",
+      detachedAskUser: true,
+      expiresAt: Date.now() + 24 * 60 * 60_000,
+      ...over,
+    } as OutboundPermissionRequestWire;
+  }
+
+  test("a later frameSeq does not permanently drop an earlier permission_request", () => {
+    const s = sess();
+    applyOutboundMessage(s, msgFrame({
+      sessionKey,
+      frameSeq: 240,
+      isFinal: false,
+      blocks: [{ kind: "text", text: "tool result already arrived" }],
+    }));
+    expect(getFrameSeqCursor(s._lastFrameSeqByKey, s._lastFrameSeq, sessionKey)).toBe(240);
+
+    const card = applyPermissionRequest(s, permFrame({ frameSeq: 239 }));
+    expect(card).not.toBeNull();
+    expect(card!.requestId).toBe(requestId);
+    expect(card!._detachedAskUser).toBe(true);
+    expect(s.messages.filter((m) => m.role === "permission" && m.requestId === requestId)).toHaveLength(1);
+    // Must not rewind the cursor — other frame types keep drop-on-regression.
+    expect(getFrameSeqCursor(s._lastFrameSeqByKey, s._lastFrameSeq, sessionKey)).toBe(240);
+  });
+
+  test("the same requestId is not rendered as two cards", () => {
+    const s = sess();
+    const first = applyPermissionRequest(s, permFrame({ frameSeq: 10 }));
+    const second = applyPermissionRequest(s, permFrame({ frameSeq: 9 }));
+    expect(first).toBeTruthy();
+    expect(second).toBe(first);
+    expect(s.messages.filter((m) => m.role === "permission" && (m.requestId === requestId || m.id === requestId))).toHaveLength(1);
+  });
+});
+
+describe("applyPermissionSettled — frameSeq exemption + requestId idempotency", () => {
+  const sessionKey = "agent:main:webchat:dm:s1";
+  const requestId = "ask-user:" + "ef".repeat(16);
+
+  function permFrame(over: Record<string, unknown> = {}): OutboundPermissionRequestWire {
+    return {
+      type: "outbound.permission_request",
+      sessionKey,
+      channel: "webchat",
+      peer: { id: "s1", kind: "dm" },
+      requestId,
+      toolName: "AskUserQuestion",
+      detachedAskUser: true,
+      ...over,
+    } as OutboundPermissionRequestWire;
+  }
+
+  function settledFrame(over: Record<string, unknown> = {}): OutboundPermissionSettledWire {
+    return {
+      type: "outbound.permission_settled",
+      sessionKey,
+      channel: "webchat",
+      peer: { id: "s1", kind: "dm" },
+      requestId,
+      behavior: "allow",
+      reason: "remote",
+      answers: { "Which editor?": "Vim" },
+      ...over,
+    } as OutboundPermissionSettledWire;
+  }
+
+  test("settled arriving before request still marks the later card resolved", () => {
+    const s = sess();
+    applyOutboundMessage(s, msgFrame({
+      sessionKey,
+      frameSeq: 240,
+      isFinal: false,
+      blocks: [{ kind: "text", text: "tool result already arrived" }],
+    }));
+    applyPermissionSettled(s, settledFrame({ frameSeq: 239 }));
+    expect(s.messages.filter((m) => m.role === "permission")).toHaveLength(0);
+    expect(getFrameSeqCursor(s._lastFrameSeqByKey, s._lastFrameSeq, sessionKey)).toBe(240);
+
+    const card = applyPermissionRequest(s, permFrame({ frameSeq: 238 }));
+    expect(card).not.toBeNull();
+    expect(card!._resolved).toBe(true);
+    expect(card!._behavior).toBe("allow");
+    expect(card!._settledReason).toBe("remote");
+    expect(card!._answers).toEqual({ "Which editor?": "Vim" });
+    expect(s.messages.filter((m) => m.role === "permission" && m.requestId === requestId)).toHaveLength(1);
+    expect(getFrameSeqCursor(s._lastFrameSeqByKey, s._lastFrameSeq, sessionKey)).toBe(240);
+  });
+
+  test("duplicate settled frames do not create a second card or undo resolution", () => {
+    const s = sess();
+    const card = applyPermissionRequest(s, permFrame({ frameSeq: 10 }))!;
+    applyPermissionSettled(s, settledFrame({ frameSeq: 11, behavior: "allow" }));
+    applyPermissionSettled(s, settledFrame({ frameSeq: 9, behavior: "allow" }));
+    applyPermissionSettled(s, settledFrame({ frameSeq: 12, behavior: "allow" }));
+    expect(s.messages.filter((m) => m.role === "permission" && m.requestId === requestId)).toHaveLength(1);
+    expect(card._resolved).toBe(true);
+    expect(card._behavior).toBe("allow");
+  });
+});
+
+
+describe("openDispatch hydrate restores in-flight", () => {
+  test("GET session openDispatch sets sending state when no live frames", () => {
+    const sock = makeSocket();
+    sock.applyServerMessages("s-open", "main", [], true, 0, {
+      openDispatch: {
+        dispatchId: "d1",
+        clientMessageId: "m-open-1",
+        status: "accepted",
+      },
+    });
+    const session = sock.sessions.get("s-open")!;
+    expect(session._sendingInFlight).toBe(true);
+    expect(session._activeClientMessageId).toBe("m-open-1");
     sock.stop();
   });
 });

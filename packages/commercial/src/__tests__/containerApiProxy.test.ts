@@ -92,6 +92,8 @@ describe('containerApiProxy', () => {
     // v5 纯市场:不允许经容器代理创建容器内 agent(POST 已砍,其它 agent 走市场安装)。
     assert.equal(matchContainerApiProxyRoute('/api/agents', 'POST'), false)
     assert.equal(matchContainerApiProxyRoute('/api/agents/main/memory/user', 'PUT'), true)
+    assert.equal(matchContainerApiProxyRoute('/api/agents/main/memory/usage', 'GET'), true)
+    assert.equal(matchContainerApiProxyRoute('/api/agents/main/memory/usage', 'POST'), false)
     assert.equal(matchContainerApiProxyRoute('/api/agents/main/message', 'POST'), false)
     assert.equal(matchContainerApiProxyRoute('/api/agents/main/auto-dream-optimizer', 'GET'), true)
     assert.equal(matchContainerApiProxyRoute('/api/agents/main/auto-dream-optimizer', 'POST'), true)

@@ -175,7 +175,7 @@ describe('Aurora v5 skeleton — landing (de-branded)', () => {
     vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
     render(<App />)
     // 启动续期 401 落定后 Landing 才出现(splash → Landing)。
-    expect((await screen.findAllByText('Aurora')).length).toBeGreaterThan(0)
+    expect((await screen.findAllByText('从简')).length).toBeGreaterThan(0)
     expect(document.body.textContent).not.toContain('乾元')
     expect(document.body.textContent).not.toContain('易经')
   })
@@ -225,7 +225,11 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     expect(imageByteCache.get(key)).toBeNull()
 
     imageByteCache.set(key, new Blob(['account-b']))
-    fireEvent.click(screen.getByRole('button', { name: '退出登录' }))
+    fireEvent.pointerDown(screen.getByRole('button', { name: '账号菜单' }), {
+      button: 0,
+      pointerType: 'mouse',
+    })
+    fireEvent.click(await screen.findByRole('menuitem', { name: '退出登录' }))
     await waitFor(() => expect(screen.getByRole('button', { name: '登录' })).toBeInTheDocument())
     expect(imageByteCache.get(key)).toBeNull()
   })
@@ -446,7 +450,7 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     expect(screen.queryByText(/对话传输将在后续版本接入/)).not.toBeInTheDocument()
     // 关键不变量：无 SSE /api/chat、无 v4-trial 端点（对话走 WS，不走这些 REST）。
     const chatLike = fetchMock.mock.calls.filter(([url]) =>
-      /\/api\/chat|\/api\/v4/.test(String(url)),
+      /\/api\/chat(?:[/?#]|$)|\/api\/v4/.test(String(url)),
     )
     expect(chatLike.length).toBe(0)
   })
@@ -1008,7 +1012,7 @@ describe('Aurora v5 — P7 最小路由', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /用我的材料开始.*登录后试用/ }))
     await waitFor(() =>
-      expect(screen.getByRole('heading', { name: '欢迎使用 Aurora' })).toBeInTheDocument(),
+      expect(screen.getByRole('heading', { name: '欢迎使用 从简' })).toBeInTheDocument(),
     )
     expect(window.location.search).toContain('campaign=docs')
     expect(window.location.search).not.toContain('panel=help')
@@ -1066,5 +1070,51 @@ describe('Aurora v5 — P7 最小路由', () => {
     } finally {
       rectSpy.mockRestore()
     }
+  })
+
+  test('教程工作室深链：?panel=help&community= 打开详情，popstate 关闭 help 清 community', async () => {
+    window.history.replaceState({}, '', '/?campaign=docs&panel=help&community=tut-7')
+    const base = routedFetchTwoSessions()
+    fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url)
+      if (/\/api\/tutorials\/tut-7(?:\?|$)/.test(u) || u.endsWith('/api/tutorials/tut-7')) {
+        return okJson({
+          tutorial: {
+            id: 'tut-7',
+            title: '公开会话快照教程',
+            summary: '深链详情',
+            category: 'general',
+            authorName: '作者',
+            publishedAt: '2026-08-20T00:00:00.000Z',
+            bodyMarkdown: '说明正文',
+            kind: 'markdown',
+          },
+        })
+      }
+      if (u.includes('/api/tutorials')) {
+        return okJson({ tutorials: [], nextCursor: null })
+      }
+      return (base as unknown as (url: string, init?: RequestInit) => Promise<unknown>)(url, init)
+    }) as unknown as FetchMock
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(<App />)
+    await waitFor(
+      () => expect(screen.getByRole('heading', { name: '公开会话快照教程' })).toBeInTheDocument(),
+      { timeout: 5000 },
+    )
+    expect(window.location.search).toContain('community=tut-7')
+    expect(window.location.search).toContain('panel=help')
+    expect(window.location.search).toContain('campaign=docs')
+
+    await act(async () => {
+      window.history.replaceState({}, '', '/?campaign=docs')
+      window.dispatchEvent(new PopStateEvent('popstate'))
+    })
+    await waitFor(() =>
+      expect(screen.queryByRole('heading', { name: '公开会话快照教程' })).not.toBeInTheDocument(),
+    )
+    expect(window.location.search).not.toContain('community=')
+    expect(window.location.search).not.toContain('panel=help')
   })
 })

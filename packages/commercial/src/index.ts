@@ -43,7 +43,7 @@ import { homedir } from "node:os";
 import IORedis from "ioredis";
 import Docker from "dockerode";
 import { runMigrations } from "./db/migrate.js";
-import { closePool, getPool } from "./db/index.js";
+import { closePool, createPool, getPool } from "./db/index.js";
 import {
   assertModelCatalogAdminPoolConfigured,
   closeModelCatalogAdminPool,
@@ -130,6 +130,7 @@ import {
   startCooldownRecoveryActor,
   type CooldownRecoveryActorHandle,
 } from "./account-pool/cooldownRecoveryActor.js";
+import { startCursorAuthSyncActor } from "./account-pool/cursorMaterializer.js";
 import {
   DEFAULT_V3_CODEX_CONTAINER_DIR,
   V3_CONTAINER_PORT,
@@ -157,10 +158,19 @@ import {
   startFinalizeJournalReconciler,
   resolveStuckThresholdMs,
   resolveDurableWaiverAgeMs,
+  markGatewayShutdownEvidence,
   DEFAULT_RECONCILE_INTERVAL_MS,
   MIN_INTERVAL_MS as FINALIZE_RECONCILER_MIN_INTERVAL_MS,
   type ReconcilerHandle as FinalizeJournalReconcilerHandle,
 } from "./billing/finalizeJournalReconciler.js";
+import { startTapeJobScheduler } from "./db/tapeJobScheduler.js";
+import {
+  startLiveFrameMaintenanceScheduler,
+  resolveLiveFrameMaintenanceDisabled,
+  resolveLiveFrameMaintenanceIntervalMs,
+  resolvePruneMaxBatches,
+  resolveRetireMinAgeMs,
+} from "./db/liveFrameMaintenanceScheduler.js";
 import {
   startOnboardingScheduler,
   type OnboardingSchedulerHandle,
@@ -254,6 +264,17 @@ import {
   type GrokRelayHandler,
 } from "./http/internalGrokRelay.js";
 import {
+  ZCODE_RELAY_PREFIX,
+  makeZcodeRelayHandler,
+  type ZcodeRelayHandler,
+} from "./http/internalZcodeRelay.js";
+import {
+  mintZcodeRelayRoute,
+  expireZcodeRelayRoute,
+  configureZcodeRelayKv,
+  createIoredisZcodeRelayKv,
+} from "./billing/zcodeRouteContext.js";
+import {
   SKILL_EMBED_PREFIX,
   makeSkillEmbedHandler,
   type SkillEmbedHandler,
@@ -308,6 +329,14 @@ import {
   type ToolFailureAuditHandler,
 } from "./http/internalToolFailureAudit.js";
 import {
+  TURN_OBSERVATION_PATH,
+  makeTurnObservationHandler,
+} from "./http/internalTurnObservation.js";
+import {
+  MEMORY_USAGE_PATH,
+  makeMemoryUsageHandler,
+} from "./http/internalMemoryUsage.js";
+import {
   SKILL_USAGE_PATH,
   isSkillUsageEnabled,
   makeSkillUsageHandler,
@@ -351,6 +380,7 @@ import {
   type CronIndexHandler,
 } from "./http/internalCronIndex.js";
 import {
+  INBOX_ALERT_PATH,
   INBOX_POST_PATH,
   makeInboxPostHandler,
   type InboxPostHandler,
@@ -383,6 +413,8 @@ import {
   appendServerAuthoredMessageDrainByUser,
   drainDelegateCostForClientSession,
   getClientSession,
+  patchServerAuthoredMessage,
+  readArchivedMessages,
   getEngineContextMessages,
   hasCompletedClientTurn,
   // P1.7 slice 7c — broker assembly 需要的 master sqlite helpers
@@ -395,6 +427,8 @@ import {
 } from "@openclaude/storage";
 import {
   createPgSessionsBackend,
+  commitVisibleLosslessTurnPhaseA,
+  _setAfterLosslessStageBatch,
   type DispatchAdmissionBackend,
   startSessionsGcSweeper,
   type LosslessTurnTapeStorage,
@@ -404,6 +438,9 @@ import { makeContainerDispatchClient } from "./dispatch/containerDispatchClient.
 import {
   resolveDispatchStuckThresholdMs,
   startTurnDispatchReconciler,
+  buildTurnDispatchReconcileFrame,
+  runShutdownDispatchHandoff,
+  DEFAULT_SHUTDOWN_HANDOFF_BUDGET_MS,
 } from "./dispatch/turnDispatchReconciler.js";
 import { resolveSessionsStoreAuthority } from "./db/sessionsStoreAuthority.js";
 import { getLaneMetricsSnapshot, type LaneMetricsSnapshot } from "./deploy/laneEvaluate.js";
@@ -556,6 +593,7 @@ import {
 } from "./ws/directContainerPreview.js";
 import {
   DEFAULT_V3_CCB_BASELINE_DIR,
+  lookupContainerUserRole,
   resolveCcbBaselineMounts,
   makePrewarmContainer,
   makeUidSingleflight,
@@ -589,6 +627,7 @@ import {
   observeWsBridgeSessionDuration,
   observeWsBridgeTtft,
 } from "./admin/metrics.js";
+import { shutdownDurableMetricRollups } from "./admin/durableMetricRollups.js";
 import { loadOrCreateBridgeSecret, DEFAULT_BRIDGE_SECRET_PATH } from "./bridgeSecret.js";
 import { setRemoteMuxDeps } from "./remoteHosts/sshMux.js";
 import { RemoteHostError } from "./remoteHosts/service.js";
@@ -1214,15 +1253,18 @@ export async function registerCommercial(
   // 拒起(resolveSessionsStoreAuthority 抛错即 registerCommercial 抛错 = master 拒起)。
   // 驱动选择权威在此一处(composition root),函数内禁 if(pg) 分支;pg 则一次性 setClientSessionsBackend。
   let sessionsGcSweeper: { stop: () => Promise<void> } | null = null;
+  let turnDispatchShutdownHandoff: (() => Promise<unknown>) | undefined;
   let losslessTurnTapeStorage: LosslessTurnTapeStorage | undefined;
   // durable turn dispatch(RFC §2):受理、tape-state 与真实终态读需 DispatchAdmissionBackend 面。
   let dispatchAdmissionBackend: DispatchAdmissionBackend | undefined;
   const goalUsageRefreshRef: {
     current: (userId: string, sessionId: string) => void | Promise<void>;
   } = { current: () => { /* GoalState service is assembled below. */ } };
+  let sessionsStoreGeneration = 0;
   if (runtimeChannel === "v5") {
     const decision = await resolveSessionsStoreAuthority({ pool: getPool() });
     if (decision.store === "pg") {
+      sessionsStoreGeneration = decision.generation;
       const pgSessionsBackend = createPgSessionsBackend(getPool(), {
         expectedGeneration: decision.generation,
         onGoalUsageChanged: (userId, sessionId) => goalUsageRefreshRef.current(userId, sessionId),
@@ -1344,6 +1386,7 @@ export async function registerCommercial(
     maxRetriesPerRequest: 3,
     enableReadyCheck: true,
   });
+  configureZcodeRelayKv(createIoredisZcodeRelayKv(redis));
 
   // 预热 dummy hash:第一次登录无影响
   await warmupLoginDummyHash();
@@ -1902,6 +1945,9 @@ export async function registerCommercial(
           appendServerAuthoredMessageForRequest,
           appendServerAuthoredMessageDrainByUser,
           drainDelegateCostForClientSession,
+          getClientSession,
+          readArchivedMessages,
+          patchServerAuthoredMessage,
         },
         recordOversized: ({ userId, requestId, sessionId }) => {
           void recordProductFrictionEvent({
@@ -2022,6 +2068,10 @@ export async function registerCommercial(
           return true;
         },
       });
+      const zcodeRelayHandler: ZcodeRelayHandler = makeZcodeRelayHandler({
+        identityRepo,
+        codingPlanKey: cfg.ZAI_CODING_PLAN_KEY ?? "",
+      });
       // /internal/v3/skill-embed — 容器内 mcp-memory 语义 skill_search 回源 master。
       // master 持 SKILL_EMBEDDING_API_KEY/DASHSCOPE_API_KEY(只在 master env,不注入容器),
       // 同款 verifyContainerIdentity 双因子鉴权;向量跨租户 PG 缓存,fail-closed 回落关键词。
@@ -2091,6 +2141,15 @@ export async function registerCommercial(
             queryRunner: getPool(),
           })
         : null;
+      const turnObservationHandler = isToolFailureAuditEnabled()
+        ? makeTurnObservationHandler({ identityRepo, queryRunner: getPool() })
+        : null;
+      // Privacy-minimized memory operation stream. Always registered when the
+      // runtime has a container identity channel; no raw query/session/body is accepted.
+      const memoryUsageHandler = makeMemoryUsageHandler({
+        identityRepo,
+        queryRunner: getPool(),
+      });
       // /internal/v3/marketplace/skill-usage — 容器 gateway skillUsageReporter 批量上报
       // 「hub 技能被使用」的低敏信号(slug/agent/trace,不记内容)。user_id 由
       // verifyContainerIdentity 推导,不信容器传入;写入 marketplace_skill_usage_events 供
@@ -2196,33 +2255,43 @@ export async function registerCommercial(
       // /internal/v3/inbox-post — 容器 onDeliver「离线送达兜底写站内信」。uid 由容器身份推导,
       // audience 硬编码 'user' 只给自己写;created_by = MIN active admin(同 onboarding 语义,
       // 每次现解析,不缓存)。无 admin → 抛错 → handler 500。见 http/internalInboxPost.ts。
+      const postInboxToUser = async (
+        uid: number,
+        msg: { title: string; bodyMd: string; level: "info" | "warning"; deliveryKey?: string },
+      ) => {
+        const adminRow = await getPool().query<{ id: string }>(
+          `SELECT id::text AS id FROM users WHERE role = 'admin' AND status = 'active' ORDER BY id ASC LIMIT 1`,
+        );
+        const senderId = adminRow.rows[0]?.id;
+        if (!senderId) throw new Error("inbox-post: no active admin sender");
+        if (msg.deliveryKey) {
+          await createCronDeliveryInboxMessage({
+            userId: uid,
+            title: msg.title,
+            bodyMd: msg.bodyMd,
+            level: msg.level,
+            createdBy: senderId,
+            deliveryKey: msg.deliveryKey,
+          });
+          return;
+        }
+        await createInboxMessage(senderId, {
+          audience: "user",
+          user_id: uid,
+          title: msg.title,
+          body_md: msg.bodyMd,
+          level: msg.level,
+        });
+      };
       const inboxPostHandler: InboxPostHandler = makeInboxPostHandler({
         identityRepo,
-        postMessage: async (uid, msg) => {
-          const adminRow = await getPool().query<{ id: string }>(
-            `SELECT id::text AS id FROM users WHERE role = 'admin' AND status = 'active' ORDER BY id ASC LIMIT 1`,
-          );
-          const senderId = adminRow.rows[0]?.id;
-          if (!senderId) throw new Error("inbox-post: no active admin sender");
-          if (msg.deliveryKey) {
-            await createCronDeliveryInboxMessage({
-              userId: uid,
-              title: msg.title,
-              bodyMd: msg.bodyMd,
-              level: msg.level,
-              createdBy: senderId,
-              deliveryKey: msg.deliveryKey,
-            });
-            return;
-          }
-          await createInboxMessage(senderId, {
-            audience: "user",
-            user_id: uid,
-            title: msg.title,
-            body_md: msg.bodyMd,
-            level: msg.level,
-          });
-        },
+        postMessage: postInboxToUser,
+      });
+      // 熔断告警:允许 warning,仍走同一 createInboxMessage / deliveryKey 幂等。
+      const inboxAlertHandler: InboxPostHandler = makeInboxPostHandler({
+        identityRepo,
+        postMessage: postInboxToUser,
+        allowWarning: true,
       });
       // /internal/v3/model-catalog{,-epoch} —— 容器 catalog client 的 per-uid 投影下发
       // (模型权威批次 §3/§6)。服务的是**本地路径**(cron/synthetic/delegate)判定;浏览器
@@ -2313,6 +2382,9 @@ export async function registerCommercial(
         if (path === GROK_RELAY_PREFIX || path.startsWith(`${GROK_RELAY_PREFIX}/`)) {
           return grokRelayHandler(req, res, ctx);
         }
+        if (path === ZCODE_RELAY_PREFIX || path.startsWith(`${ZCODE_RELAY_PREFIX}/`)) {
+          return zcodeRelayHandler(req, res, ctx);
+        }
         if (path === SKILL_EMBED_PREFIX) {
           return skillEmbedHandler(req, res, ctx);
         }
@@ -2341,6 +2413,12 @@ export async function registerCommercial(
         if (toolCallRollupHandler && path === TOOL_CALL_ROLLUP_PATH) {
           return toolCallRollupHandler(req, res, ctx);
         }
+        if (turnObservationHandler && path === TURN_OBSERVATION_PATH) {
+          return turnObservationHandler(req, res, ctx);
+        }
+        if (path === MEMORY_USAGE_PATH) {
+          return memoryUsageHandler(req, res, ctx);
+        }
         if (skillUsageHandler && path === SKILL_USAGE_PATH) {
           return skillUsageHandler(req, res, ctx);
         }
@@ -2361,6 +2439,9 @@ export async function registerCommercial(
         }
         if (path === INBOX_POST_PATH) {
           return inboxPostHandler(req, res, ctx);
+        }
+        if (path === INBOX_ALERT_PATH) {
+          return inboxAlertHandler(req, res, ctx);
         }
         if (path.startsWith(MARKETPLACE_AGENT_PREFIX)) {
           return marketplaceAgentHandler(req, res, ctx);
@@ -4987,6 +5068,12 @@ export async function registerCommercial(
       : {}),
     metrics: bridgeMetrics,
     markContainerActivity: markActivityForBridge,
+    // 每用户并发 /ws/chat 上限。缺省不传 → bridge 内 DEFAULT_MAX_PER_USER(3)。
+    // OC_WS_MAX_PER_USER 覆盖:自用实例多设备/多标签并发常超 3,超限时 registry
+    // 踢最老 → 被踢端 1s 重连再踢别人,形成互踢循环(2026-08-17 排障实录)。
+    ...(Number(process.env.OC_WS_MAX_PER_USER) > 0
+      ? { maxPerUser: Number(process.env.OC_WS_MAX_PER_USER) }
+      : {}),
     // 版本握手:cli launcher 注入 dist 目录(spa 才有)→ probe 读 index.html 的
     // oc-build meta;v3/测试 undefined → bridge 不发 sys.frontend_build,零变化。
     getFrontendBuildId: options.webDistDir
@@ -5022,6 +5109,8 @@ export async function registerCommercial(
           role: authz.role,
           grantedModelIds: authz.grantedModelIds,
           deniedModelIds: authz.deniedModelIds,
+          userPlanTier: authz.userPlanTier ?? null,
+          orgPlanCode: authz.orgPlanCode ?? null,
         }, modelId);
       }
       // cutover 前 legacy 路径仍从 DB loader 取 role+grants，不再信 JWT role。
@@ -5092,6 +5181,17 @@ export async function registerCommercial(
     createCodexRoute: createCommercialCodexRoute,
     expireCodexRoute: async (token) => {
       await Promise.all([expireCodexRouteContext(token), expireGrokRouteContext(token)]);
+    },
+    mintZcodeRoute: ({ containerId, userId, requestId, modelId }) =>
+      mintZcodeRelayRoute({
+        containerId,
+        userId,
+        requestId,
+        modelId,
+        relayPort: V3_CONTAINER_PORT,
+      }),
+    expireZcodeRoute: async (token) => {
+      await expireZcodeRelayRoute(token);
     },
     releaseGrokRouteLease: async (accountId, slotId) => {
       // Expire durable authority before freeing the local mirror. If PG is
@@ -5257,6 +5357,21 @@ export async function registerCommercial(
     });
   }
 
+  // Cursor account-pool → host auth-dir materializer. No-ops when
+  // OC_V5_CURSOR_AUTH_DIR is unset (commercial hosts without a local key dir).
+  if (process.env.COMMERCIAL_CURSOR_AUTH_SYNC_DISABLED !== "1") {
+    leaderBundle.add({
+      name: "cursorAuthSync",
+      domain: "v5-owned",
+      start: () => {
+        const raw = Number(process.env.COMMERCIAL_CURSOR_AUTH_SYNC_INTERVAL_MS);
+        const intervalMs = Number.isFinite(raw) && raw >= 1000 ? raw : 60_000;
+        const h = trackScheduler("cursorAuthSync", "v5-owned", startCursorAuthSyncActor({ intervalMs }));
+        return { stop: () => h.stop() };
+      },
+    });
+  }
+
   // A1 — pending 订单 expirer(默认 60s tick,部署即 boot 跑一次清历史脏单)。
   // markOrderPaid 不在事务内对 expires_at 做硬防线(避免用户超时几秒扫码就硬失败
   // 的体验回归);过期清理由本 sweeper 负责,被推 expired 后 markOrderPaid 自然拒。
@@ -5342,6 +5457,169 @@ export async function registerCommercial(
     });
   }
 
+  // live journal 帧表维护:删已投影且确有 tape 记录的流的帧,并给不可能再产帧的
+  // live 流打 retired_at(帧仍可见,只从在飞 owner 集合剔除)。leaderBundle shared
+  // 单跑(双 master 只 leader)。仅 v5(client_session_live_frames 是 v5 表)。
+  // 失败只记日志,start() 同步返回,不挡 leadership / 监听端口。
+  if (runtimeChannel === "v5" && !resolveLiveFrameMaintenanceDisabled()) {
+    leaderBundle.add({
+      name: "liveFrameMaintenance",
+      domain: "shared",
+      start: () => {
+        const intervalMs = resolveLiveFrameMaintenanceIntervalMs(
+          process.env.COMMERCIAL_LIVE_FRAME_MAINTENANCE_INTERVAL_MS,
+        );
+        const pruneMaxBatches = resolvePruneMaxBatches(
+          process.env.COMMERCIAL_LIVE_FRAME_PRUNE_MAX_BATCHES,
+        );
+        const retireMinAgeMs = resolveRetireMinAgeMs(
+          process.env.COMMERCIAL_LIVE_FRAME_RETIRE_MIN_AGE_MS,
+        );
+        const h = trackScheduler("liveFrameMaintenance", "shared", startLiveFrameMaintenanceScheduler({
+          pool: getPool(),
+          intervalMs,
+          pruneMaxBatches,
+          retireMinAgeMs,
+          runOnStart: true,
+          onError: (err) => rootLogger.warn("[liveFrameMaintenance] tick failed", {
+            err: (err as Error)?.message ?? String(err),
+          }),
+        }));
+        return { stop: () => h.stop() };
+      },
+    });
+  }
+
+  // tape materialization + settlement jobs (design 2026-08-19 rev2). Dedicated pool
+  // uses 120s statement_timeout so 67MB finalize is not the request-path 30s cap.
+  if (runtimeChannel === "v5" && process.env.COMMERCIAL_TAPE_MATERIALIZATION_DISABLED !== "1") {
+    leaderBundle.add({
+      name: "tapeJobScheduler",
+      domain: "shared",
+      start: () => {
+        const materializePool = createPool({
+          max: 2,
+          statementTimeoutMs: 120_000,
+          idleInTransactionSessionTimeoutMs: 600_000,
+          applicationName: "openclaude-tape-materialize",
+        });
+        const materializeBackend = createPgSessionsBackend(materializePool, {
+          expectedGeneration: sessionsStoreGeneration,
+        });
+        const rawInterval = Number(process.env.COMMERCIAL_TAPE_MATERIALIZATION_INTERVAL_MS);
+        const intervalMs = Number.isFinite(rawInterval) && rawInterval >= 1000 ? rawInterval : 5_000;
+        const h = trackScheduler("tapeJobScheduler", "shared", startTapeJobScheduler({
+          pool: getPool(),
+          materializePool,
+          intervalMs,
+          runOnStart: true,
+          onError: (err) => rootLogger.warn("[tapeJobScheduler] tick failed", {
+            err: (err as Error)?.message ?? String(err),
+          }),
+          materializeTape: async (job, renew) => {
+            _setAfterLosslessStageBatch(renew);
+            try {
+              const header = await getPool().query<{
+                agent_id: string;
+                turn_index: number;
+                status: "completed" | "interrupted" | "crashed";
+                turn_key: string;
+                tape_sha256: string;
+                total_bytes: string;
+                part_count: number;
+                created_at: string;
+                waive_reason: string | null;
+                model: string | null;
+                dispatch_id: string | null;
+                attempt_no: number | null;
+                materialized: boolean;
+              }>(
+                `SELECT agent_id, turn_index, status, turn_key, tape_sha256, total_bytes::text,
+                        part_count, created_at::text, waive_reason, NULL::text AS model,
+                        dispatch_id::text, attempt_no,
+                        (materialization_status='complete' OR finalized_at IS NOT NULL) AS materialized
+                   FROM client_session_turn_tapes
+                  WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+                [job.sessionId, job.userId, job.tapeId],
+              );
+              const row = header.rows[0];
+              if (!row) throw new Error("tape header missing for materialization job");
+              if (row.materialized) return;
+              const result = await materializeBackend.finalizeLosslessTurnTape(job.userId, {
+                protocolVersion: 2,
+                action: "finalize",
+                sessionId: job.sessionId,
+                agentId: row.agent_id,
+                turnIndex: row.turn_index,
+                status: row.status,
+                turnKey: row.turn_key,
+                tapeId: job.tapeId,
+                tapeSha256: row.tape_sha256,
+                totalBytes: Number(row.total_bytes),
+                partCount: row.part_count,
+                createdAt: Number(row.created_at),
+                ...(row.waive_reason ? { waiveReason: row.waive_reason as "idle_timeout" } : {}),
+                ...(row.dispatch_id ? { dispatchId: row.dispatch_id, attemptNo: row.attempt_no ?? 1 } : {}),
+              });
+              if (result.applied === "incomplete") {
+                throw new Error("tape materialization still incomplete");
+              }
+              const done = await getPool().query<{ ok: boolean }>(
+                `SELECT (materialization_status='complete' OR finalized_at IS NOT NULL) AS ok
+                   FROM client_session_turn_tapes
+                  WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+                [job.sessionId, job.userId, job.tapeId],
+              );
+              if (done.rows[0]?.ok !== true) {
+                throw new Error("tape materialization pending after finalize");
+              }
+            } finally {
+              _setAfterLosslessStageBatch(null);
+            }
+          },
+          settleJob: async (job) => {
+            const uidMatch = /^c:([1-9][0-9]*)$/.exec(job.userId);
+            if (!uidMatch) throw new Error("settlement job requires commercial user");
+            const uid = BigInt(uidMatch[1]!);
+            if (job.kind === "billing") {
+              const billings = Array.isArray((job.payload as { engineBillings?: unknown }).engineBillings)
+                ? (job.payload as { engineBillings: import("@openclaude/protocol").DurableCodexBilling[] }).engineBillings
+                : [];
+              for (const billing of billings) {
+                await settleDurableCodexBilling(
+                  {
+                    pgPool: getPool(),
+                    preCheckRedis,
+                    pricing,
+                    logger: rootLogger.child({ subsys: "durableCodexBilling" }),
+                  },
+                  uid,
+                  billing,
+                );
+              }
+              return;
+            }
+            const reason = (job.payload as { reason?: string; turnKey?: string }).reason;
+            const turnKey = (job.payload as { turnKey?: string }).turnKey;
+            if (!reason || !turnKey) throw new Error("waiver job payload missing reason/turnKey");
+            await applyTurnWaiver(getPool(), {
+              userId: uid,
+              turnKey,
+              reason: reason as "idle_timeout",
+              logger: rootLogger.child({ subsys: "tapeWaiver" }),
+            });
+          },
+        }));
+        return {
+          stop: async () => {
+            await h.stop();
+            await materializePool.end();
+          },
+        };
+      },
+    });
+  }
+
   // durable turn dispatch reconciler(RFC §2.3):open dispatch 周期收敛(admitted 过期租约 →
   // 容器求证 → terminal/accepted;terminal 未通知 → 财务联查 → 真实终态 / manual_reconcile)。
   // leaderBundle shared 单跑(双 master 只 leader)。仅 v5(turn_dispatches 由 0170 建)。
@@ -5396,34 +5674,83 @@ export async function registerCommercial(
             };
           },
         });
-        const h = trackScheduler("turnDispatchReconciler", "shared", startTurnDispatchReconciler({
+        const reconcilerDeps = {
           pool: getPool(),
           container,
-          intervalMs,
           stuckThresholdMs,
           // B-R1-1:abort 掉从未执行的 pre-forward journal 后,提前释放其 preCheck reservation
           // (best-effort;reservation 本会自然过期)。
-          releaseReservation: (ref) =>
+          releaseReservation: (ref: { userId: string; requestId: string }) =>
             releasePreCheck(preCheckRedis, { userId: ref.userId, requestId: ref.requestId }).then(() => {}),
           // M4:真实终态落库后 best-effort 实时 nudge —— 复用既有 turn_state_unknown
           // reconcile 帧型(前端收到即 forceSync 拉回该 dispatch 的权威状态卡)。
           // published≠delivered:用户离线/已切轮则无害吞掉,终态已持久,下次 sync 必达。
-          nudgeClient: (uid, sessionId, clientMessageId) => {
+          nudgeClient: (
+            uid: bigint,
+            sessionId: string,
+            clientMessageId: string,
+            reconcile?: "turn_completed" | "interrupted" | "turn_state_unknown",
+          ) => {
             try {
-              userChatBridge.broadcastToUser(uid, {
-                type: "outbound.message",
-                channel: "webchat",
-                peer: { id: sessionId, kind: "dm" },
+              userChatBridge.broadcastToUser(uid, buildTurnDispatchReconcileFrame({
+                sessionId,
                 clientMessageId,
-                isFinal: false,
-                meta: { reconcile: "turn_state_unknown" },
-                ts: Date.now(),
-              });
+                reconcile,
+              }));
             } catch {
               /* best-effort */
             }
           },
+          commitVisibleTape: async (input: { userId: string; sessionId: string; tapeId: string }) => {
+            const header = await getPool().query<{
+              agent_id: string;
+              turn_index: number;
+              status: "completed" | "interrupted" | "crashed";
+              turn_key: string;
+              tape_sha256: string;
+              total_bytes: string;
+              part_count: number;
+              created_at: string;
+              waive_reason: string | null;
+              dispatch_id: string | null;
+              attempt_no: number | null;
+            }>(
+              `SELECT agent_id, turn_index, status, turn_key, tape_sha256, total_bytes::text,
+                      part_count, created_at::text, waive_reason, dispatch_id::text, attempt_no
+                 FROM client_session_turn_tapes
+                WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+              [input.sessionId, input.userId, input.tapeId],
+            );
+            const row = header.rows[0];
+            if (!row) throw new Error("visible tape header missing");
+            await commitVisibleLosslessTurnPhaseA(getPool(), input.userId, {
+              protocolVersion: 2,
+              action: "finalize",
+              sessionId: input.sessionId,
+              agentId: row.agent_id,
+              turnIndex: row.turn_index,
+              status: row.status,
+              turnKey: row.turn_key,
+              tapeId: input.tapeId,
+              tapeSha256: row.tape_sha256,
+              totalBytes: Number(row.total_bytes),
+              partCount: row.part_count,
+              createdAt: Number(row.created_at),
+              ...(row.waive_reason ? { waiveReason: row.waive_reason as "idle_timeout" } : {}),
+              ...(row.dispatch_id ? { dispatchId: row.dispatch_id, attemptNo: row.attempt_no ?? 1 } : {}),
+            });
+          },
+        };
+        const h = trackScheduler("turnDispatchReconciler", "shared", startTurnDispatchReconciler({
+          ...reconcilerDeps,
+          intervalMs,
+          runOnStart: true,
         }));
+        turnDispatchShutdownHandoff = () => runShutdownDispatchHandoff({
+          ...reconcilerDeps,
+          budgetMs: DEFAULT_SHUTDOWN_HANDOFF_BUDGET_MS,
+          limit: 8,
+        });
         return { stop: () => h.stop() };
       },
     });
@@ -5883,6 +6210,17 @@ export async function registerCommercial(
       } else {
         try { await leaderBundle.stopAndDrain(); } catch { /* ignore */ }
       }
+      // 停机收尾:先给在飞 journal/dispatch 落「进程退出」证据,预算内再容器求证。
+      // 绝不盲 finalize(引擎可能仍在容器里)。超时只留证据,让重启 tick 立刻判定。
+      try {
+        if (turnDispatchShutdownHandoff) {
+          await turnDispatchShutdownHandoff();
+        } else {
+          await markGatewayShutdownEvidence({ reason: "process_shutdown" });
+        }
+      } catch {
+        /* ignore — 退出优先,证据写失败由重启后的保守阈值兜底 */
+      }
       if (controlListener) {
         try { await controlListener.close(); } catch { /* ignore */ }
       }
@@ -5951,6 +6289,7 @@ export async function registerCommercial(
       try { await pricing.shutdown(); } catch { /* ignore */ }
       try { await redis.quit(); } catch { /* ignore */ }
       await closeModelCatalogAdminPool();
+      try { await shutdownDurableMetricRollups(); } catch { /* best-effort; absolute snapshots retry safely */ }
       await closePool();
     },
     /** V3 2H 测试 / /healthz 探测用:内部代理实际监听地址(undefined = 未启用)。 */

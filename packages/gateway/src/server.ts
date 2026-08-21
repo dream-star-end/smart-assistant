@@ -54,18 +54,22 @@ import {
   CODEX_ENGINE_MODEL_IDS,
   GROK_ENGINE_MODEL_IDS,
   CURSOR_ENGINE_MODEL_IDS,
+  ZCODE_ENGINE_MODEL_IDS,
   PLATFORM_REASONING_EFFORTS,
+  AGENT_MODEL_AUTO,
   MAX_ATTACHMENTS_PER_MESSAGE,
   AUTOMATIC_TURN_RETRY_MAX,
   isCodexEngineModel,
   isGrokEngineModel,
   isCursorEngineModel,
+  isZcodeEngineModel,
   isClientMessageId,
   isPersistedClientMessageId,
   formatMessageReplyPrompt,
   normalizeMessageReplyQuote,
   shouldServeInline,
   stripDispatchAuthorityField,
+  isLiveUnitsEnabled,
   type PromptQueueMutationFrame,
 } from '@openclaude/protocol'
 
@@ -77,6 +81,10 @@ import {
   classifyDelegateOutputError,
   classifyRunError,
 } from './errorClassify.js'
+import {
+  DELEGATE_CONTEXT_HEADER,
+  verifyDelegateContextToken,
+} from './delegateContext.js'
 import { defaultReleaseJobDir, isReleaseJobId, publicReleaseJob, readReleaseJob } from './releaseJobStore.js'
 import { ContainerPreviewHandler } from './containerPreview.js'
 import {
@@ -126,6 +134,8 @@ import {
   loadSessionUsage,
   listAutoDreamAuditSessions,
   listAutoDreamSuccessfulSessionsBetween,
+  getMemoryUsageDashboard,
+  recordMemoryUsageEvent,
   syncMarketplaceHub,
   writeAgentsConfig,
   writeConfig,
@@ -136,6 +146,8 @@ import {
   getClientSessionPartial,
   readArchivedMessages,
   readClientSessionLiveFrames,
+  readClientSessionLiveUnits,
+  readLiveOrTapeFramePayload,
   readClientTimelinePage,
   encodeClientTimelineCursor,
   decodeClientTimelineCursor,
@@ -145,9 +157,40 @@ import {
   readUserMessagePayload,
   upsertClientSession,
   appendServerAuthoredMessage,
+  appendServerAuthoredMessageDurable,
+  patchServerAuthoredMessage,
   deleteClientSession,
-  renameClientSession,
-  setClientSessionModel,
+  patchClientSessionMeta,
+  searchClientSessions,
+  batchClientSessions,
+  markClientSessionRead,
+  markAllClientSessionsRead,
+  parseSessionBatchInput,
+  parseIncludeArchivedFlag,
+  parseOptionalPositiveInt,
+  SESSION_SEARCH_Q_MAX,
+  SESSION_SEARCH_LIMIT_DEFAULT,
+  SESSION_SEARCH_LIMIT_MAX,
+  SESSION_LIST_LIMIT_MAX,
+  listChatProjects,
+  createChatProject,
+  updateChatProject,
+  deleteChatProject,
+  parseChatProjectName,
+  parseChatProjectOptionalText,
+  parseChatProjectSortOrder,
+  CHAT_PROJECT_COLOR_MAX,
+  CHAT_PROJECT_INSTRUCTIONS_MAX,
+  listProjectAssets,
+  createProjectAsset,
+  updateProjectAsset,
+  deleteProjectAsset,
+  parseProjectAssetName,
+  parseProjectAssetSource,
+  parseProjectAssetUrl,
+  parseProjectAssetOptionalContainerPath,
+  parseProjectAssetProjectId,
+  PROJECT_ASSET_PER_PROJECT_LIMIT,
   recordAutoDreamSuccessfulSession,
   listUnclaimedSessions,
   claimSession,
@@ -155,6 +198,30 @@ import {
   countRuntimeRecycleUnsafeTurnDispatches,
   turnDispatchInboxStats,
 } from '@openclaude/storage'
+import {
+  DETACHED_ASK_USER_TTL_MS,
+  agentIdFromAskUserSessionKey,
+  buildDetachedAskUserAnswerMessageId,
+  buildDetachedAskUserAnsweredResult,
+  buildDetachedAskUserPersistMessage,
+  buildDetachedAskUserPostedResult,
+  buildDetachedAskUserResolvedSinkPayload,
+  buildDetachedAskUserSinkPayload,
+  buildDetachedAskUserSkippedResult,
+  findDetachedAskUserCardInMessages,
+  formatAskUserAnswerMessage,
+  isDetachedAskUserPending,
+  isDetachedAskUserRequestId,
+  pendingFromDetachedAskUserMessage,
+} from './detachedAskUser.js'
+import {
+  AskUserWaiter,
+  askUserHttpUnwritable,
+  askUserHttpWriteSucceeded,
+  resolveAskUserWaitMs,
+  type AskUserWaiterAnswer,
+} from './askUserWaiter.js'
+import { fetchAskUserPermissionCard, getV3MasterSinkOrNull, readV3MasterSinkConfig } from './v3MasterSink.js'
 import {
   filterUserVisibleAgentsForManagement,
   filterUserVisibleByAgentField,
@@ -215,10 +282,17 @@ import {
   deliverCronViaAdapter,
   isUserInitiatedCronJob,
 } from './cron.js'
+import { handleTaskboardApi, resolveTaskboardActor, setPatrolExecutionHandler } from './taskboard/http.js'
+import { getTaskboardDb } from './taskboard/db/index.js'
+import { isPatrolSessionKey } from './taskboard/domain.js'
+import { PatrolEngine } from './taskboard/patrol.js'
+import { TaskboardNotifier } from './taskboard/notify.js'
 import { sendV3WechatProactive, readV3WechatProactiveConfig } from './v3WechatProactive.js'
 import { sendV3QqProactive, readV3QqProactiveConfig } from './v3QqProactive.js'
 import { postInboxMessage, postInboxMessageDurable } from './v3InboxPost.js'
+import { postInboxAlert } from './v3InboxAlert.js'
 import { parseDocument } from './documentParser.js'
+import { tryExtractProjectAssetExcerpt } from './projectAssetCollector.js'
 import {
   makeDelegateProgressBlock,
   makeDelegateUsageProgressBlock,
@@ -232,8 +306,18 @@ import {
   getDelegateTimeoutReason,
   resolveDelegateTimeoutConfig,
 } from './delegateTimeout.js'
+import {
+  DelegateJobStore,
+  resolveDelegateJobTtlMs,
+  resolveDelegateWaitMs,
+  type DelegateJobHttpResult,
+} from './delegateJobs.js'
+import { DelegateResumeRegistry } from './delegateResume.js'
+import { isPlatformAgentId, parseDelegateModel } from './delegateModel.js'
 import { eventBus, createEvent } from './eventBus.js'
 import { startEventPersistence } from './eventPersist.js'
+import { startMemoryTurnObserver } from './memoryTurnObserver.js'
+import { startMemoryUsageReporter } from './memoryUsageReporter.js'
 import { parseByteRange, serveFileFdWithRange } from './httpRange.js'
 import { createLogger, type Logger } from './logger.js'
 import {
@@ -286,6 +370,11 @@ import {
   V5_GROK_RELAY_PREFIX,
 } from './v5GrokRelay.js'
 import {
+  handleV5ZcodeRelayLocal,
+  readV5ZcodeRelayConfig,
+  V5_ZCODE_RELAY_PREFIX,
+} from './v5ZcodeRelay.js'
+import {
   handleV3MarketplaceRelayLocal,
   readV3MarketplaceRelayConfig,
   V3_MARKETPLACE_LOCAL_RELAY_PREFIX,
@@ -316,6 +405,7 @@ import {
   attachTurnAuthority,
   buildContainerAttestFrame,
   getTurnAuthority,
+  isEngineLocalTurnExempt,
   isModelAuthorityRequired,
   stripModelAuthorityField,
   type ConnectionAuthorityContext,
@@ -441,6 +531,7 @@ export const ALLOWED_INBOUND_MODELS = new Set<string>([
   ...CODEX_ENGINE_MODEL_IDS,
   ...GROK_ENGINE_MODEL_IDS,
   ...CURSOR_ENGINE_MODEL_IDS,
+  ...ZCODE_ENGINE_MODEL_IDS,
   ...STATIC_KEY_INBOUND_MODEL_IDS,
 ])
 
@@ -529,12 +620,12 @@ export function resolveSyntheticTurnModel(
   // 硬 pin 的 codex-native:model 替换无效(见 registry.resolveEngine),保持 fail-closed。
   if (agent.provider === 'codex-native') return undefined
   const effective = resolveExecutionModel(agent.model, defaultModel)
-  if (!isCodexEngineModel(effective) && !isGrokEngineModel(effective) && !isCursorEngineModel(effective)) return undefined
+  if (!isCodexEngineModel(effective) && !isGrokEngineModel(effective) && !isCursorEngineModel(effective) && !isZcodeEngineModel(effective)) return undefined
   const raw = process.env.OPENCLAUDE_SYNTHETIC_TURN_MODEL?.trim()
   // env 兜底自身必须**非 codex 且在入站白名单内**,否则忽略回默认 —— 防"把 bug 换个门再引入"
   // (例如误配成 gpt-5.5 又绕回 codex,或配一个会被 resolveExecutionModel 收敛掉的下线模型)。
   const candidate =
-    raw && ALLOWED_INBOUND_MODELS.has(raw) && !isCodexEngineModel(raw) && !isGrokEngineModel(raw) && !isCursorEngineModel(raw)
+    raw && ALLOWED_INBOUND_MODELS.has(raw) && !isCodexEngineModel(raw) && !isGrokEngineModel(raw) && !isCursorEngineModel(raw) && !isZcodeEngineModel(raw)
       ? raw
       : SYNTHETIC_TURN_NON_CODEX_MODEL_DEFAULT
   // ── routable 自检(MAJOR-1)──────────────────────────────────────────────
@@ -584,10 +675,69 @@ export interface LocalExecutionDecision {
   /** catalog 归一后的 canonical model id(alias 已解析)。 */
   readonly canonicalModel: string
   /** 取自投影的 engine(不查 baked MODEL_ENGINE_MAP)。 */
-  readonly engine: 'ccb' | 'codex' | 'grok' | 'cursor'
+  readonly engine: 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode'
   readonly supportsVision: boolean
   /** 非空 = 发生了 codex → 非 codex 降级('synthetic' kind);原模型供透明披露(MAJOR-2)。 */
   readonly downgradedFrom?: string
+  /**
+   * 无票 inbound 试图沿用存活 runner 的 model,但 catalog 不可用/未授权/豁免门未开
+   * 而回退到原阶梯时的说明。成功沿用或冷启动(没有 liveSessionModel)时缺省。
+   */
+  readonly liveSessionFallback?: { readonly from: string; readonly reason: string }
+}
+
+/** 无票 inbound 沿用会话模型失败时的可检索 warn 文案(字段:liveModel/reason/fallbackModel)。 */
+export const TICKETLESS_INBOUND_LIVE_SESSION_FALLBACK_WARN =
+  '无票 inbound 沿用会话模型失败'
+
+/** 无票 inbound 沿用会话模型失败:session 正在 getOrCreate 替换/关闭。 */
+export const TICKETLESS_LIVE_SESSION_REPLACING_REASON = 'session_replacing'
+
+type LiveRunnerSessionView = {
+  runner?: { model?: string }
+  model?: string
+  _replacing?: boolean
+}
+
+function peekLiveRunnerModel(session: LiveRunnerSessionView): string | undefined {
+  const runnerModel = session.runner?.model
+  if (typeof runnerModel === 'string' && runnerModel !== '') return runnerModel
+  const sessionModel = session.model
+  if (typeof sessionModel === 'string' && sessionModel !== '') return sessionModel
+  return undefined
+}
+
+/** session 正在替换/关闭 → 不得沿用其 model。 */
+export function liveSessionReuseSkipReason(
+  session: LiveRunnerSessionView | undefined | null,
+): string | undefined {
+  if (session?._replacing === true) return TICKETLESS_LIVE_SESSION_REPLACING_REASON
+  return undefined
+}
+
+/**
+ * 从内存中的存活 runner 读当前实际在跑的 model。
+ * 优先 runner.model(进程正在用的),其次 session.model。
+ * **不读** client_sessions.model_id(那只是 UI 恢复提示,不是执行权威)。
+ * 命中正在替换/关闭 → undefined(等价冷启动,走原阶梯)。
+ */
+export function readLiveRunnerModel(
+  session: LiveRunnerSessionView | undefined | null,
+): string | undefined {
+  if (!session) return undefined
+  if (liveSessionReuseSkipReason(session) !== undefined) return undefined
+  return peekLiveRunnerModel(session)
+}
+
+/** 存活 runner 的 model 为何不能沿用。undefined = catalog 认为可路由。 */
+export function liveSessionModelUnusableReason(view: LocalCatalogView, raw: string): string | undefined {
+  const canonicalModel = view.canonicalize(raw)
+  const descriptor = view.resolve(canonicalModel)
+  if (descriptor == null) return 'not_in_projection'
+  if (descriptor.available === false) return 'unavailable'
+  if (!view.isRoutable(canonicalModel)) return 'unroutable'
+  if (descriptor.engine === undefined) return 'no_engine'
+  return undefined
 }
 
 /**
@@ -603,16 +753,36 @@ export function decideLocalExecution(args: {
   agent: Pick<AgentDef, 'id' | 'model' | 'provider'>
   /** caller 显式指定的模型(cron 降级模型 / skill-train 模型 / inbound frame.model)。 */
   model?: string
+  /**
+   * 无票 inbound 且该 sessionKey 已有存活 runner 时,runner 当前实际在跑的 model。
+   * 插在 caller model 之后、agent.model 之前:有显式 model 仍以 caller 为准(用户换模型
+   * / 签名票路径不走这里);没有显式 model 时先沿用会话,避免 agent 默认改判引擎。
+   * 该沿用对所有 engine 生效(含 CCB/Codex),是有意的会话连续性,不只是 cursor 专用。
+   */
+  liveSessionModel?: string
+  /**
+   * 无票取样命中正在替换/关闭的 session 时由 caller 传入(如 session_replacing)。
+   * 有值则不把 liveSessionModel 插入候选,但仍打回退 warn。
+   */
+  liveSessionSkipReason?: string
   /** config.defaults.model。 */
   defaultModel?: string | null
   kind: LocalTurnKind
   env?: NodeJS.ProcessEnv
+  /** 沿用会话模型失败并回退时调用(dispatchInbound 接到 this.log.warn)。 */
+  warn?: (message: string, fields?: Record<string, unknown>) => void
 }): LocalExecutionDecision {
   const { view, agent, kind } = args
   const env = args.env ?? process.env
 
   // ① provider 硬 pin:engine 恒 codex,换模型无效 → 本地 turn 一律拒(prewarm 除外)。
-  if (agent.provider === 'codex-native' && kind !== 'prewarm' && kind !== 'auto_dream') {
+  if (
+    agent.provider === 'codex-native' &&
+    kind !== 'prewarm' &&
+    kind !== 'auto_dream' &&
+    // selfhost 豁免门开着时放行(modelAuthority.isEngineLocalTurnExempt,代价说明见彼处)。
+    !isEngineLocalTurnExempt(env)
+  ) {
     throw new LocalExecutionRejected(
       'DELEGATE_CODEX_UNSUPPORTED',
       `agent '${agent.id}' is pinned to the codex engine, which cannot run on a local ` +
@@ -620,9 +790,51 @@ export function decideLocalExecution(args: {
     )
   }
 
+  const explicitModel = typeof args.model === 'string' && args.model !== '' ? args.model : undefined
+  const forcedSkipReason =
+    typeof args.liveSessionSkipReason === 'string' && args.liveSessionSkipReason !== ''
+      ? args.liveSessionSkipReason
+      : undefined
+  const liveSessionModel =
+    forcedSkipReason === undefined &&
+    typeof args.liveSessionModel === 'string' &&
+    args.liveSessionModel !== ''
+      ? args.liveSessionModel
+      : undefined
+  const ticketlessReuse = explicitModel === undefined
+  let liveSkipReason: string | undefined = forcedSkipReason
+  if (ticketlessReuse && liveSessionModel && liveSkipReason === undefined) {
+    liveSkipReason = liveSessionModelUnusableReason(view, liveSessionModel)
+  }
+
+  const decorate = (decision: LocalExecutionDecision): LocalExecutionDecision => {
+    if (!ticketlessReuse) return decision
+    if (!liveSessionModel && forcedSkipReason === undefined) return decision
+    if (liveSessionModel) {
+      const liveCanonical = view.canonicalize(liveSessionModel)
+      if (decision.canonicalModel === liveCanonical && liveSkipReason === undefined) return decision
+    }
+    const reason =
+      liveSkipReason ??
+      (liveSessionModel !== undefined
+        ? liveSessionModelUnusableReason(view, liveSessionModel)
+        : undefined) ??
+      forcedSkipReason ??
+      'unroutable'
+    args.warn?.(TICKETLESS_INBOUND_LIVE_SESSION_FALLBACK_WARN, {
+      liveModel: liveSessionModel,
+      reason,
+      fallbackModel: decision.canonicalModel,
+    })
+    return { ...decision, liveSessionFallback: { from: liveSessionModel ?? '', reason } }
+  }
+
   // ② 候选阶梯:归一 → 投影可用性 → engine,三件事**全取投影**。
+  // 无票 inbound 把存活 runner 的 model 插在 agent.model 之前;有显式 model 时不插入
+  // (用户换模型 / 带 model 的普通消息行为不变)。
   const candidates = [
-    args.model,
+    explicitModel,
+    ticketlessReuse && liveSessionModel && liveSkipReason === undefined ? liveSessionModel : undefined,
     agent.model,
     args.defaultModel,
     ...EXECUTION_MODEL_FALLBACK_ROUTE,
@@ -634,22 +846,53 @@ export function decideLocalExecution(args: {
     const descriptor = view.resolve(canonicalModel)
     const engine = descriptor?.engine
     if (engine === undefined || descriptor == null) continue
-    if (engine === 'ccb') return { canonicalModel, engine, supportsVision: descriptor.supportsVision }
+    if (engine === 'ccb') return decorate({ canonicalModel, engine, supportsVision: descriptor.supportsVision })
 
     // codex 意图(engine 取自投影,不看 baked)。
     if (kind === 'prewarm' || kind === 'auto_dream') {
-      return { canonicalModel, engine, supportsVision: descriptor.supportsVision }
+      return decorate({ canonicalModel, engine, supportsVision: descriptor.supportsVision })
     }
     if (kind === 'turn') {
-      throw new LocalExecutionRejected(
-        'DELEGATE_CODEX_UNSUPPORTED',
-        `model '${canonicalModel}' runs on the ${engine} engine, which cannot run on a local ` +
-          `(non-bridge) turn: engine-reported billing needs a master-minted request id.`,
-      )
+      // selfhost 豁免门(OC_SELFHOST_ENGINE_LOCAL_TURNS=1)未开 -> 结构化拒(现状)。
+      if (!isEngineLocalTurnExempt(env)) {
+        // 无票沿用的会话模型若是 cursor/codex/grok,生产环境不能本地跑 —— 跳过它
+        // 回退原阶梯(与修之前「直接走 agent 默认」同形),不要把整条 turn 拒掉。
+        const isLiveOnlyCandidate =
+          ticketlessReuse &&
+          liveSessionModel !== undefined &&
+          raw === liveSessionModel &&
+          raw !== agent.model
+        if (isLiveOnlyCandidate) {
+          liveSkipReason = liveSkipReason ?? 'engine_local_turn_not_exempt'
+          continue
+        }
+        throw new LocalExecutionRejected(
+          'DELEGATE_CODEX_UNSUPPORTED',
+          `model '${canonicalModel}' runs on the ${engine} engine, which cannot run on a local ` +
+            `(non-bridge) turn: engine-reported billing needs a master-minted request id.`,
+        )
+      }
+      // 豁免门开 -> 按投影 engine 放行执行(单租户自用部署接受该 turn 不走 master
+      // 计费编排:usage 不结算,仍落 event/usage log 与 durable tape)。
+      return decorate({ canonicalModel, engine, supportsVision: descriptor.supportsVision })
     }
-    return downgradeSyntheticCodex(view, canonicalModel, args.defaultModel, env)
+    return decorate(downgradeSyntheticCodex(view, canonicalModel, args.defaultModel, env))
   }
 
+  if (ticketlessReuse && (liveSessionModel || forcedSkipReason)) {
+    const reason =
+      liveSkipReason ??
+      (liveSessionModel !== undefined
+        ? liveSessionModelUnusableReason(view, liveSessionModel)
+        : undefined) ??
+      forcedSkipReason ??
+      'unroutable'
+    args.warn?.(TICKETLESS_INBOUND_LIVE_SESSION_FALLBACK_WARN, {
+      liveModel: liveSessionModel,
+      reason,
+      fallbackModel: '',
+    })
+  }
   throw new LocalExecutionRejected(
     'MODEL_NOT_AVAILABLE',
     `no routable model for agent '${agent.id}' in the current model catalog projection`,
@@ -706,13 +949,22 @@ export async function resolveLocalExecutionIfEnforced(args: {
   agent: Pick<AgentDef, 'id' | 'model' | 'provider'>
   kind: LocalTurnKind
   model?: string
+  liveSessionModel?: string
+  liveSessionSkipReason?: string
+  /** catalog 投影拉完后再取样,缩小「读 runner → await catalog → getOrCreate」窗口。 */
+  resolveLiveSessionModel?: () => string | undefined
+  /** 与 resolveLiveSessionModel 同时、在 catalog 之后取样。 */
+  resolveLiveSessionSkipReason?: () => string | undefined
   defaultModel?: string | null
   env?: NodeJS.ProcessEnv
+  warn?: (message: string, fields?: Record<string, unknown>) => void
 }): Promise<LocalExecutionDecision | undefined> {
   const env = args.env ?? process.env
   if (!isModelAuthorityRequired(env)) return undefined
   const view = await getLocalCatalogView()
-  return decideLocalExecution({ ...args, view, env })
+  const liveSessionModel = args.resolveLiveSessionModel?.() ?? args.liveSessionModel
+  const liveSessionSkipReason = args.resolveLiveSessionSkipReason?.() ?? args.liveSessionSkipReason
+  return decideLocalExecution({ ...args, liveSessionModel, liveSessionSkipReason, view, env })
 }
 
 /** decision → getOrCreate 的执行覆盖入参(flag 未开 → `{}`,展开后零影响)。 */
@@ -720,7 +972,7 @@ export function localExecutionOverride(decision: LocalExecutionDecision | undefi
   model?: string
   executionAuthority?: {
     canonicalModel: string
-    engine: 'ccb' | 'codex' | 'grok' | 'cursor'
+    engine: 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode'
     source: 'local_catalog'
   }
 } {
@@ -884,7 +1136,7 @@ export function _buildSafeCodexRouteOverride(args: {
    *  base_url 指回本进程的 /internal/v3/codex-relay handler。 */
   officialRelayPort: number
   /** master 签名的执行权威(有则 engine 判定只认它,见 registry.resolveEngine)。 */
-  authority?: { canonicalModel: string; engine: 'ccb' | 'codex' | 'grok' | 'cursor' }
+  authority?: { canonicalModel: string; engine: 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode' }
 }): CodexProviderConfigOverride | null {
   if (!args.rawRoute || typeof args.rawRoute !== 'object' || Array.isArray(args.rawRoute)) {
     return null
@@ -967,7 +1219,7 @@ export function _buildSafeGrokRouteOverride(args: {
   model?: string
   rawRoute: unknown
   officialRelayPort: number
-  authority?: { canonicalModel: string; engine: 'ccb' | 'codex' | 'grok' | 'cursor' }
+  authority?: { canonicalModel: string; engine: 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode' }
 }): { baseUrl: string; routeToken: string } | null {
   if (!args.rawRoute || typeof args.rawRoute !== 'object' || Array.isArray(args.rawRoute)) return null
   let engineId: string
@@ -985,6 +1237,46 @@ export function _buildSafeGrokRouteOverride(args: {
   try {
     const parsed = new URL(route.baseUrl)
     const expectedPath = `${V5_GROK_RELAY_PREFIX}/route/${route.routeToken}/v1`
+    if (
+      parsed.protocol !== 'http:' ||
+      parsed.hostname !== '127.0.0.1' ||
+      Number(parsed.port || '80') !== args.officialRelayPort ||
+      parsed.pathname !== expectedPath ||
+      parsed.search ||
+      parsed.hash
+    ) return null
+  } catch {
+    return null
+  }
+  return { baseUrl: route.baseUrl, routeToken: route.routeToken }
+}
+
+/** Validate the master-owned opaque route consumed by the ZCode adapter.
+ * Anthropic SDK appends /v1 itself, so the minted baseUrl must NOT include /v1.
+ */
+export function _buildSafeZcodeRouteOverride(args: {
+  agent: { id: string; provider?: string; runnerKind?: string }
+  model?: string
+  rawRoute: unknown
+  officialRelayPort: number
+  authority?: { canonicalModel: string; engine: 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode' }
+}): { baseUrl: string; routeToken: string } | null {
+  if (!args.rawRoute || typeof args.rawRoute !== 'object' || Array.isArray(args.rawRoute)) return null
+  let engineId: string
+  try {
+    engineId = resolveEngine(args.model, args.agent as never, args.authority)
+  } catch {
+    return null
+  }
+  if (engineId !== 'zcode') return null
+  const route = args.rawRoute as Record<string, unknown>
+  if (Object.keys(route).sort().join(',') !== 'baseUrl,routeToken') return null
+  if (typeof route.routeToken !== 'string' || !/^[0-9a-f]{64}$/.test(route.routeToken)) return null
+  if (typeof route.baseUrl !== 'string' || route.baseUrl.length > 512) return null
+  if (!Number.isInteger(args.officialRelayPort) || args.officialRelayPort <= 0 || args.officialRelayPort > 65535) return null
+  try {
+    const parsed = new URL(route.baseUrl)
+    const expectedPath = `${V5_ZCODE_RELAY_PREFIX}/route/${route.routeToken}`
     if (
       parsed.protocol !== 'http:' ||
       parsed.hostname !== '127.0.0.1' ||
@@ -1392,6 +1684,19 @@ interface RunDelegateInput {
   /** gateway 硬编排触发的隐藏审查员委派。影响:runLog isReview / 资源闸走保留槽 + 免
    *  per-parent 桶 / 完成后解析结构化 verdict / 不置位"本 turn 有非隐藏委派"跟踪。 */
   isReview?: boolean
+  /** 覆盖默认 `agent:<id>:delegate:...`。taskboard 巡检必须传入 buildPatrolSessionKey()。 */
+  sessionKey?: string
+  /** 覆盖默认 channel 'delegate'。taskboard 传 'taskboard',且不得加入
+   *  MASTER_SINK_PERSIST_CHANNELS,否则巡检文本会写进 client_sessions 刷屏。 */
+  channel?: string
+  /** 可选的本次无活动超时。只按真实 child activity 续租,不是总运行时长上限。 */
+  idleTimeoutMs?: number
+  /** 可选:覆盖目标成员默认模型的 catalog 型号。审查委派忽略。 */
+  model?: string
+  /** HTTP/MCP 可选续跑:已通过 DelegateResumeRegistry 占用的钥匙。 */
+  resumable?: boolean
+  /** 本次是否新 mint。早退时要 drop binding,避免占 cap。 */
+  resumeMinted?: boolean
 }
 /** `_runDelegateTask` 结果。rejected=闸/校验拒(HTTP 壳映射 4xx/429/503);error=session
  *  创建等意外(映射 500);completed=真正执行完(ok/output/error/timedOut,review 还带 verdict)。 */
@@ -1406,6 +1711,11 @@ type DelegateTaskResult =
       timedOut: boolean
       runId: string
       verdict?: ReviewVerdict
+      /** 从内存 session 抄的用量。taskboard 回写 run;普通 delegate 可忽略。 */
+      tokensIn?: number | null
+      tokensOut?: number | null
+      costUsd?: number | null
+      sessionKey?: string
     }
 
 // ── hidden 系统 agent 串行委派熔断 ──────────────────────────────────────────
@@ -1448,7 +1758,7 @@ export class PerTurnDelegationGuard {
 
   constructor(
     private readonly limit = MAX_HIDDEN_DELEGATIONS_PER_TURN,
-    /** 远大于 delegate hard timeout 上限(2h)和现实单 turn 时长,只兜内存/锁死。 */
+    /** 与平台 12h logical-turn 安全窗口对齐，只兜计数 Map 泄漏/永久锁死。 */
     private readonly staleMs = 12 * 60 * 60_000,
   ) {}
 
@@ -1629,6 +1939,11 @@ export class Gateway {
   private rateLimiter = new RateLimiter()
   private _wsKeepaliveTimer: ReturnType<typeof setInterval> | null = null
   private _taskSchedulerTimer: ReturnType<typeof setInterval> | null = null
+  /** taskboard 统一 60s tick。与 _taskSchedulerTimer 同款生命周期:start 里
+   *  setInterval + unref, _doShutdown Stage 2 clearInterval。不登记
+   *  check-schedulers.ts(那份 lint 只扫 commercial/src)。 */
+  private _taskboardTickTimer: ReturnType<typeof setInterval> | null = null
+  private _taskboardPatrol: PatrolEngine | null = null
   private _oauthRefreshTimer: ReturnType<typeof setInterval> | null = null
   private _pendingPermissionSweepTimer: ReturnType<typeof setInterval> | null = null
   private _stopEviction: (() => void) | null = null
@@ -1820,7 +2135,7 @@ export class Gateway {
   }
 
   // ── In-memory cache for static web UI files ──
-  private _staticFileCache = new Map<string, { content: Buffer; mime: string; etag: string }>()
+  private _staticFileCache = new Map<string, { content: Buffer; mime: string; etag: string; mtimeMs: number }>()
   // (channel, peer.id) → 当前活跃的 ws client(用于回传 outbound)
   private clientsByPeer = new Map<string, Set<WebSocket>>()
   /** Commercial bridge sockets are the only valid path for an internal queue
@@ -1853,11 +2168,24 @@ export class Gateway {
      *  by the janitor even if no disconnect or crash occurred. Prevents orphan
      *  pending entries when a user leaves the tab open across days. */
     expiresAt: number
+    /** Detached Cursor ask_user card: not a real engine permission. Survives
+     *  turn end / disconnect / session eviction; 24h TTL; never auto-denied by
+     *  the 30-minute sweeper. After the hybrid wait releases (or no waiter is
+     *  holding), an allow starts a new user turn. */
+    detachedAskUser?: boolean
   }>()
+  /**
+   * In-flight HTTP waiters for Cursor ask_user. Keyed by requestId. A waiter
+   * exists only while handleEngineAskUser is blocked on waitMs; after
+   * answered_in_window / released_to_detached the entry is deleted.
+   */
+  private _askUserWaiters = new Map<string, AskUserWaiter>()
   /** Max wait for a permission response before the janitor auto-denies.
    *  Matched to the outer CCB turn timeout (30 min) so we don't pre-empt
    *  a slow user while a turn is still live. */
   private static readonly PENDING_PERMISSION_TTL_MS = 30 * 60_000
+  /** Detached Cursor ask_user cards stay answerable this long. */
+  private static readonly DETACHED_ASK_USER_TTL_MS = DETACHED_ASK_USER_TTL_MS
   /** How often the janitor scans _pendingPermissions. */
   private static readonly PENDING_PERMISSION_SWEEP_MS = 60_000
   // Recently-settled permission requests: requestId → authoritative result.
@@ -2555,6 +2883,11 @@ export class Gateway {
     // Start event persistence (writes all events to SQLite event_log)
     startEventPersistence()
 
+    // Exact memory usage + current-fact freshness shadow. Fail-open observers
+    // never alter turn execution or user-visible memory results.
+    startMemoryTurnObserver()
+    startMemoryUsageReporter()
+
     // Start metrics collection (eventBus → prometheus counters)
     startMetricsCollection()
 
@@ -2729,6 +3062,50 @@ export class Gateway {
       )
     }, 60_000)
 
+    // Taskboard 统一巡检 tick:一个 60s 定时器扫全部 stage,不按 stage 建 cron job。
+    // 通知复用 onDeliver 瀑布(微信接管则不再推站内信);熔断 warning 走 createInboxMessage。
+    const taskboardNotify = new TaskboardNotifier({
+      getDb: () => getTaskboardDb(),
+      log: (msg, extra) => this.log.warn(msg, extra),
+      transport: {
+        sendWechat: async ({ text, outboundId }) => {
+          const cfg = readV3WechatProactiveConfig()
+          if (!cfg) return { kind: 'fallback' as const, marked: false }
+          return sendV3WechatProactive({ config: cfg, text, outboundId })
+        },
+        postInbox: ({ title, bodyMd, deliveryKey }) =>
+          postInboxMessage({ title, bodyMd, deliveryKey }),
+        createInboxMessage: (args) => postInboxAlert(args),
+      },
+    })
+    this._taskboardPatrol = new PatrolEngine({
+      getDb: () => getTaskboardDb(),
+      delegate: (input) => this._runTaskboardDelegate(input),
+      log: (msg, extra) => this.log.info(msg, extra),
+      notify: taskboardNotify,
+      onAlert: (alert) => {
+        this.log.warn('taskboard guardrail', {
+          kind: alert.kind,
+          outboundId: alert.outboundId,
+          message: alert.message,
+          stageId: alert.stageId,
+          ticketId: alert.ticketId,
+        })
+        void taskboardNotify.onGuardrailAlert(alert)
+      },
+    })
+    setPatrolExecutionHandler((job) => {
+      void this._taskboardPatrol?.executeJob(job).catch((err) =>
+        this.log.error('taskboard patrol job failed', undefined, err),
+      )
+    })
+    this._taskboardTickTimer = setInterval(() => {
+      this._taskboardPatrol?.tick().catch((err) =>
+        this.log.error('taskboard tick failed', undefined, err),
+      )
+    }, 60_000)
+    this._taskboardTickTimer.unref()
+
     // Invalidate task cache when tasks are created or deleted
     eventBus.on('task.created', () => this._invalidateTaskCache())
     eventBus.on('task.deleted', () => this._invalidateTaskCache())
@@ -2788,16 +3165,9 @@ export class Gateway {
       } as OutboundMessage)
       this.log.info('pushed crash notification', { peerId: ev.peerId })
 
-      // Any pending permission requests that belonged to the crashed session
-      // will never be answered (subprocess is gone). Clean them up so the
-      // map doesn't leak and any connected tabs dismiss their stuck modal.
-      const pendingToReap: string[] = []
-      for (const [requestId, pending] of this._pendingPermissions) {
-        if (pending.sessionKey === ev.sessionKey) pendingToReap.push(requestId)
-      }
-      for (const requestId of pendingToReap) {
-        this._forceDenyPendingPermission(requestId, 'crashed', 'Session crashed')
-      }
+      // Ordinary pending permissions die with the subprocess. Detached
+      // ask_user cards do not — see `_reapCrashedSessionPendingPermissions`.
+      this._reapCrashedSessionPendingPermissions(ev.sessionKey)
     })
 
     // Periodic OAuth token refresh (every 10 min). Running subprocesses keep
@@ -2815,6 +3185,20 @@ export class Gateway {
     )
     // Check immediately on boot
     this.refreshClaudeOAuthIfNeeded().catch(() => {})
+
+    // Converge orphan live streams BEFORE listen: clients that connect the
+    // instant the port opens would otherwise page the stale live snapshot and
+    // replay frames whose authoritative tape already finalized. One idempotent
+    // UPDATE; failure is logged and must not block startup.
+    try {
+      const { convergeFinalizedTapeLiveStreams } = await import('@openclaude/storage')
+      const { converged } = await convergeFinalizedTapeLiveStreams()
+      if (converged > 0) {
+        this.log.info('converged finalized live streams to tape', { converged })
+      }
+    } catch (err) {
+      this.log.warn('live stream convergence failed', undefined, err)
+    }
 
     await new Promise<void>((res) => {
       this.httpServer.listen(config.gateway.port, config.gateway.bind, () => res())
@@ -2884,6 +3268,10 @@ export class Gateway {
       this._stopEviction?.()
     } catch {}
     this._stopEviction = null
+    try {
+      this._delegateJobs?.close()
+    } catch {}
+    this._delegateJobs = undefined
     this._skillShadowReporter?.stop()
     this._skillShadowReporter = null
     if (this._wsKeepaliveTimer !== null) {
@@ -2894,6 +3282,12 @@ export class Gateway {
       clearInterval(this._taskSchedulerTimer)
       this._taskSchedulerTimer = null
     }
+    if (this._taskboardTickTimer !== null) {
+      clearInterval(this._taskboardTickTimer)
+      this._taskboardTickTimer = null
+    }
+    setPatrolExecutionHandler(null)
+    this._taskboardPatrol = null
     if (this._oauthRefreshTimer !== null) {
       clearInterval(this._oauthRefreshTimer)
       this._oauthRefreshTimer = null
@@ -3165,6 +3559,23 @@ export class Gateway {
       return
     }
 
+    if (url.pathname === V5_ZCODE_RELAY_PREFIX || url.pathname.startsWith(`${V5_ZCODE_RELAY_PREFIX}/`)) {
+      const relayCfg = readV5ZcodeRelayConfig(process.env)
+      if (!relayCfg) {
+        this.sendJson(res, 404, { error: { code: 'ZCODE_RELAY_NOT_CONFIGURED', message: 'zcode relay not configured' } })
+        return
+      }
+      handleV5ZcodeRelayLocal(req, res, relayCfg).catch((err) => {
+        this.log.error('v5 zcode local relay crashed', undefined, err)
+        if (!res.headersSent) {
+          try { this.sendJson(res, 500, { error: { code: 'INTERNAL', message: 'zcode relay crashed' } }) } catch {}
+        } else {
+          try { res.end() } catch {}
+        }
+      })
+      return
+    }
+
     // v3/v5 commercial marketplace relay. Codex subprocesses cannot see
     // OPENCLAUDE_* env, so oc-market falls back to this loopback-only path.
     if (url.pathname === V3_MARKETPLACE_LOCAL_RELAY_PREFIX || url.pathname.startsWith(`${V3_MARKETPLACE_LOCAL_RELAY_PREFIX}/`)) {
@@ -3278,7 +3689,9 @@ export class Gateway {
     // v3 file proxy: HOST gateway → container /api/file or /api/media via docker bridge
     // bypasses checkHttpAuth if all four conditions hold (see checkBridgeBypass).
     const bridgeVerified = needsAuth ? this.checkBridgeBypass(req, url) : false
-    if (needsAuth && !bridgeVerified && !this.checkHttpAuth(req)) {
+    const delegateAuthedByContext =
+      this._isDelegateHttpPath(url.pathname) && this._hasValidDelegateContext(req)
+    if (needsAuth && !bridgeVerified && !this.checkHttpAuth(req) && !delegateAuthedByContext) {
       res.writeHead(401, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ error: 'unauthorized' }))
       return
@@ -3769,16 +4182,9 @@ export class Gateway {
       const allLive = this.sessions.list()
       // For multi-user: only show sessions whose peerId belongs to this user
       listClientSessions(userId).then((owned) => {
-        const ownedIds = new Set(owned.map((s) => s.id))
+        const ownedIds = new Set(owned.sessions.map((s) => s.id))
         // Also include sessions with no matching client session (cron/task sessions) only for default user
-        const filtered = allLive.filter((s) => {
-          // 排除内部委派会话：它们不是用户聊天会话，不能经此 API 泄露（Codex 审）。
-          // key 形如 agent:<id>:delegate:...（第 3 段区分）。
-          const kind = s.sessionKey.split(':')[2] || ''
-          if (kind === 'delegate') return false
-          const peerId = s.sessionKey.split(':')[4] || ''
-          return ownedIds.has(peerId) || (userId === 'default' && !peerId.startsWith('web-'))
-        })
+        const filtered = filterUserVisibleLiveSessions(allLive, ownedIds, userId)
         this.sendJson(res, 200, { sessions: filtered })
       }).catch(() => this.sendJson(res, 200, { sessions: [] }))
       return
@@ -3786,9 +4192,366 @@ export class Gateway {
     // ── Client session sync (cross-device, multi-user) ──
     if (url.pathname === '/api/sessions/list' && req.method === 'GET') {
       const userId = this.getUserId(req)
-      listClientSessions(userId)
-        .then((list) => this.sendJson(res, 200, { sessions: list }))
+      const includeArchived = parseIncludeArchivedFlag(url.searchParams.get('includeArchived'))
+      const limitRaw = url.searchParams.get('limit')
+      const beforeRaw = url.searchParams.get('before')
+      let limit: number | undefined
+      let before: number | undefined
+      if (limitRaw !== null && limitRaw !== '') {
+        const n = Number(limitRaw)
+        if (!Number.isFinite(n) || n <= 0) {
+          this.sendJson(res, 400, { error: 'limit must be a positive integer' })
+          return
+        }
+        limit = Math.min(SESSION_LIST_LIMIT_MAX, Math.floor(n))
+      }
+      if (beforeRaw !== null && beforeRaw !== '') {
+        const n = Number(beforeRaw)
+        if (!Number.isFinite(n) || n <= 0) {
+          this.sendJson(res, 400, { error: 'before must be a positive millisecond timestamp' })
+          return
+        }
+        before = Math.floor(n)
+      }
+      listClientSessions(userId, { includeArchived, limit, before })
+        .then((list) => this.sendJson(res, 200, {
+          sessions: list.sessions,
+          ...(list.nextCursor !== undefined ? { nextCursor: list.nextCursor } : {}),
+        }))
         .catch(() => this.sendJson(res, 500, { error: 'list failed' }))
+      return
+    }
+    if (url.pathname === '/api/sessions/search' && req.method === 'GET') {
+      const userId = this.getUserId(req)
+      const q = (url.searchParams.get('q') ?? '').trim()
+      if (q.length > SESSION_SEARCH_Q_MAX) {
+        this.sendJson(res, 400, { error: `q too long (max ${SESSION_SEARCH_Q_MAX} chars)` })
+        return
+      }
+      const limit = parseOptionalPositiveInt(
+        url.searchParams.get('limit'),
+        SESSION_SEARCH_LIMIT_DEFAULT,
+        SESSION_SEARCH_LIMIT_MAX,
+      )
+      const includeArchived = parseIncludeArchivedFlag(url.searchParams.get('includeArchived'))
+      searchClientSessions(userId, { q, limit, includeArchived })
+        .then((out) => this.sendJson(res, 200, out))
+        .catch(() => this.sendJson(res, 500, { error: 'search failed' }))
+      return
+    }
+    if (url.pathname === '/api/sessions/batch' && req.method === 'POST') {
+      const userId = this.getUserId(req)
+      ;(async () => {
+        let data: { ids?: unknown; action?: unknown; projectId?: unknown }
+        try {
+          data = JSON.parse(await this.readBody(req, 64 * 1024))
+        } catch {
+          this.sendJson(res, 400, { error: 'invalid JSON' })
+          return
+        }
+        const parsed = parseSessionBatchInput(data)
+        if ('ok' in parsed && parsed.ok === false) {
+          if (parsed.error === 'ids_limit') {
+            this.sendJson(res, 400, { error: 'ids limit exceeded (max 200)' })
+            return
+          }
+          if (parsed.error === 'invalid_action') {
+            this.sendJson(res, 400, { error: 'action must be archive, unarchive, delete or move' })
+            return
+          }
+          this.sendJson(res, 400, { error: 'ids required (string array)' })
+          return
+        }
+        const result = await batchClientSessions(userId, data)
+        if (!result.ok) {
+          if (result.error === 'project_not_found') {
+            this.sendJson(res, 404, { error: 'project not found' })
+            return
+          }
+          this.sendJson(res, 400, { error: result.error.replace(/_/g, ' ') })
+          return
+        }
+        this.sendJson(res, 200, result)
+      })().catch(() => this.sendJson(res, 500, { error: 'batch failed' }))
+      return
+    }
+    if (url.pathname === '/api/sessions/read-all' && req.method === 'POST') {
+      const userId = this.getUserId(req)
+      markAllClientSessionsRead(userId)
+        .then((out) => this.sendJson(res, 200, { ok: true, updated: out.updated }))
+        .catch(() => this.sendJson(res, 500, { error: 'read-all failed' }))
+      return
+    }
+    // 侧栏聊天项目(与 /api/board/projects 看板无关)。浏览器直打 gateway,与 /api/sessions/list 同平面。
+    if (url.pathname === '/api/chat-projects') {
+      const userId = this.getUserId(req)
+      if (req.method === 'GET') {
+        listChatProjects(userId)
+          .then((projects) => this.sendJson(res, 200, { projects }))
+          .catch(() => this.sendJson(res, 500, { error: 'list failed' }))
+        return
+      }
+      if (req.method === 'POST') {
+        ;(async () => {
+          let data: { name?: unknown; instructions?: unknown; color?: unknown }
+          try {
+            data = JSON.parse(await this.readBody(req, 16 * 1024))
+          } catch {
+            this.sendJson(res, 400, { error: 'invalid JSON' })
+            return
+          }
+          if (parseChatProjectName(data.name) === null) {
+            this.sendJson(res, 400, { error: 'name required (1-60 chars)' })
+            return
+          }
+          const instructions = parseChatProjectOptionalText(data.instructions, CHAT_PROJECT_INSTRUCTIONS_MAX)
+          if ('invalid' in instructions) {
+            this.sendJson(res, 400, { error: 'instructions invalid (max 4000 chars)' })
+            return
+          }
+          const color = parseChatProjectOptionalText(data.color, CHAT_PROJECT_COLOR_MAX)
+          if ('invalid' in color) {
+            this.sendJson(res, 400, { error: 'color invalid (max 24 chars)' })
+            return
+          }
+          const result = await createChatProject(userId, data)
+          if (!result.ok) {
+            if (result.error === 'limit_exceeded') {
+              this.sendJson(res, 400, { error: 'project limit exceeded (max 100)' })
+              return
+            }
+            this.sendJson(res, 400, { error: result.error.replace(/_/g, ' ') })
+            return
+          }
+          this.sendJson(res, 200, { project: result.project })
+        })().catch(() => this.sendJson(res, 500, { error: 'create failed' }))
+        return
+      }
+      this.sendJson(res, 405, { error: 'method not allowed' })
+      return
+    }
+    const chatProjectMatch = url.pathname.match(/^\/api\/chat-projects\/([a-zA-Z0-9_-]{8,64})$/)
+    if (chatProjectMatch) {
+      const projectId = chatProjectMatch[1]
+      const userId = this.getUserId(req)
+      if (req.method === 'PATCH') {
+        ;(async () => {
+          let data: { name?: unknown; instructions?: unknown; color?: unknown; sortOrder?: unknown }
+          try {
+            data = JSON.parse(await this.readBody(req, 16 * 1024))
+          } catch {
+            this.sendJson(res, 400, { error: 'invalid JSON' })
+            return
+          }
+          const hasName = data.name !== undefined
+          const hasInstructions = data.instructions !== undefined
+          const hasColor = data.color !== undefined
+          const hasSort = data.sortOrder !== undefined
+          if (!hasName && !hasInstructions && !hasColor && !hasSort) {
+            this.sendJson(res, 400, { error: 'name, instructions, color or sortOrder required' })
+            return
+          }
+          if (hasName && parseChatProjectName(data.name) === null) {
+            this.sendJson(res, 400, { error: 'name required (1-60 chars)' })
+            return
+          }
+          if (hasInstructions) {
+            const instructions = parseChatProjectOptionalText(data.instructions, CHAT_PROJECT_INSTRUCTIONS_MAX)
+            if ('invalid' in instructions) {
+              this.sendJson(res, 400, { error: 'instructions invalid (max 4000 chars)' })
+              return
+            }
+          }
+          if (hasColor) {
+            const color = parseChatProjectOptionalText(data.color, CHAT_PROJECT_COLOR_MAX)
+            if ('invalid' in color) {
+              this.sendJson(res, 400, { error: 'color invalid (max 24 chars)' })
+              return
+            }
+          }
+          if (hasSort && parseChatProjectSortOrder(data.sortOrder) === null) {
+            this.sendJson(res, 400, { error: 'sortOrder must be an integer' })
+            return
+          }
+          const result = await updateChatProject(userId, projectId, data)
+          if (!result.ok) {
+            if (result.error === 'not_found') {
+              this.sendJson(res, 404, { error: 'not found' })
+              return
+            }
+            this.sendJson(res, 400, { error: result.error.replace(/_/g, ' ') })
+            return
+          }
+          this.sendJson(res, 200, { project: result.project })
+        })().catch(() => this.sendJson(res, 500, { error: 'patch failed' }))
+        return
+      }
+      if (req.method === 'DELETE') {
+        deleteChatProject(userId, projectId)
+          .then((result) => result.ok
+            ? this.sendJson(res, 200, { ok: true })
+            : this.sendJson(res, 404, { error: 'not found' }))
+          .catch(() => this.sendJson(res, 500, { error: 'delete failed' }))
+        return
+      }
+      this.sendJson(res, 405, { error: 'method not allowed' })
+      return
+    }
+    // 聊天项目资产(上传参考资料 + 会话产出物索引)。浏览器直打 gateway,与 /api/chat-projects 同平面。
+    if (url.pathname === '/api/project-assets') {
+      const userId = this.getUserId(req)
+      if (req.method === 'GET') {
+        const rawProjectId = url.searchParams.get('projectId')
+        const projectId = rawProjectId === null || rawProjectId === '' || rawProjectId === 'none'
+          ? null
+          : rawProjectId
+        if (projectId !== null && (projectId.length < 8 || projectId.length > 64)) {
+          this.sendJson(res, 400, { error: 'invalid projectId' })
+          return
+        }
+        listProjectAssets(userId, { projectId })
+          .then((assets) => this.sendJson(res, 200, { assets }))
+          .catch(() => this.sendJson(res, 500, { error: 'list failed' }))
+        return
+      }
+      if (req.method === 'POST') {
+        ;(async () => {
+          let data: {
+            projectId?: unknown
+            source?: unknown
+            sessionId?: unknown
+            name?: unknown
+            url?: unknown
+            containerPath?: unknown
+            mime?: unknown
+            size?: unknown
+            digest?: unknown
+          }
+          try {
+            data = JSON.parse(await this.readBody(req, 16 * 1024))
+          } catch {
+            this.sendJson(res, 400, { error: 'invalid JSON' })
+            return
+          }
+          if (parseProjectAssetName(data.name) === null) {
+            this.sendJson(res, 400, { error: 'name required (1-200 chars)' })
+            return
+          }
+          if (parseProjectAssetSource(data.source) === null) {
+            this.sendJson(res, 400, { error: "source must be 'upload' or 'output'" })
+            return
+          }
+          const urlField = parseProjectAssetUrl(data.url)
+          if ('invalid' in urlField) {
+            this.sendJson(res, 400, { error: 'invalid url' })
+            return
+          }
+          const containerPath = parseProjectAssetOptionalContainerPath(data.containerPath)
+          if ('invalid' in containerPath) {
+            this.sendJson(res, 400, { error: 'invalid containerPath' })
+            return
+          }
+          if (!urlField.present && !containerPath.present) {
+            this.sendJson(res, 400, { error: 'url or containerPath required' })
+            return
+          }
+          let excerpt: string | null = null
+          try {
+            excerpt = await tryExtractProjectAssetExcerpt({
+              source: typeof data.source === 'string' ? data.source : '',
+              mime: typeof data.mime === 'string' ? data.mime : null,
+              url: urlField.present ? urlField.value : null,
+              containerPath: containerPath.present ? containerPath.value : null,
+              name: typeof data.name === 'string' ? data.name : null,
+            })
+          } catch {
+            excerpt = null
+          }
+          const result = await createProjectAsset(userId, { ...data, excerpt })
+          if (!result.ok) {
+            if (result.error === 'limit_exceeded') {
+              this.sendJson(res, 400, { error: `asset limit exceeded (max ${PROJECT_ASSET_PER_PROJECT_LIMIT})` })
+              return
+            }
+            if (result.error === 'project_not_found') {
+              this.sendJson(res, 404, { error: 'project not found' })
+              return
+            }
+            this.sendJson(res, 400, { error: result.error.replace(/_/g, ' ') })
+            return
+          }
+          this.sendJson(res, 200, { asset: result.asset })
+        })().catch(() => this.sendJson(res, 500, { error: 'create failed' }))
+        return
+      }
+      this.sendJson(res, 405, { error: 'method not allowed' })
+      return
+    }
+    const projectAssetMatch = url.pathname.match(/^\/api\/project-assets\/([a-zA-Z0-9_-]{8,64})$/)
+    if (projectAssetMatch) {
+      const assetId = projectAssetMatch[1]
+      const userId = this.getUserId(req)
+      if (req.method === 'PATCH') {
+        ;(async () => {
+          let data: { pinned?: unknown; name?: unknown; projectId?: unknown }
+          try {
+            data = JSON.parse(await this.readBody(req, 16 * 1024))
+          } catch {
+            this.sendJson(res, 400, { error: 'invalid JSON' })
+            return
+          }
+          const hasPinned = data.pinned !== undefined
+          const hasName = data.name !== undefined
+          const hasProject = data.projectId !== undefined
+          if (!hasPinned && !hasName && !hasProject) {
+            this.sendJson(res, 400, { error: 'pinned, name or projectId required' })
+            return
+          }
+          if (hasName && parseProjectAssetName(data.name) === null) {
+            this.sendJson(res, 400, { error: 'name required (1-200 chars)' })
+            return
+          }
+          if (hasPinned && typeof data.pinned !== 'boolean') {
+            this.sendJson(res, 400, { error: 'pinned must be boolean' })
+            return
+          }
+          if (hasProject) {
+            const projectId = parseProjectAssetProjectId(data.projectId)
+            if ('invalid' in projectId) {
+              this.sendJson(res, 400, { error: 'invalid projectId' })
+              return
+            }
+          }
+          const result = await updateProjectAsset(userId, assetId, data)
+          if (!result.ok) {
+            if (result.error === 'not_found') {
+              this.sendJson(res, 404, { error: 'not found' })
+              return
+            }
+            if (result.error === 'project_not_found') {
+              this.sendJson(res, 404, { error: 'project not found' })
+              return
+            }
+            if (result.error === 'limit_exceeded') {
+              this.sendJson(res, 400, { error: `asset limit exceeded (max ${PROJECT_ASSET_PER_PROJECT_LIMIT})` })
+              return
+            }
+            this.sendJson(res, 400, { error: result.error.replace(/_/g, ' ') })
+            return
+          }
+          this.sendJson(res, 200, { asset: result.asset })
+        })().catch(() => this.sendJson(res, 500, { error: 'patch failed' }))
+        return
+      }
+      if (req.method === 'DELETE') {
+        deleteProjectAsset(userId, assetId)
+          .then((result) => result.ok
+            ? this.sendJson(res, 200, { ok: true })
+            : this.sendJson(res, 404, { error: 'not found' }))
+          .catch(() => this.sendJson(res, 500, { error: 'delete failed' }))
+        return
+      }
+      this.sendJson(res, 405, { error: 'method not allowed' })
       return
     }
     // ── Session migration (must be before clientSessMatch regex which would capture "unclaimed"/"claim") ──
@@ -3846,6 +4609,9 @@ export class Gateway {
           _routing?: unknown
           _sendAttempt?: unknown
           _isAutoRetry?: unknown
+          _recoveryOfClientMessageId?: unknown
+          _recoveryMode?: unknown
+          _automaticRecovery?: unknown
           _idem?: unknown
         }
         try {
@@ -3891,6 +4657,13 @@ export class Gateway {
             ? { _sendAttempt: data._sendAttempt }
             : {}),
           ...(typeof data._isAutoRetry === 'boolean' ? { _isAutoRetry: data._isAutoRetry } : {}),
+          ...(isPersistedClientMessageId(data._recoveryOfClientMessageId)
+            ? { _recoveryOfClientMessageId: data._recoveryOfClientMessageId }
+            : {}),
+          ...(data._recoveryMode === 'checkpoint' || data._recoveryMode === 'replay'
+            ? { _recoveryMode: data._recoveryMode }
+            : {}),
+          ...(typeof data._automaticRecovery === 'boolean' ? { _automaticRecovery: data._automaticRecovery } : {}),
           ...(typeof data._idem === 'string' ? { _idem: data._idem } : {}),
         }
         const r = await appendServerAuthoredMessage(sessId, userId, msg)
@@ -4162,11 +4935,11 @@ export class Gateway {
             snapshotMaxSeq: page.snapshotMaxSeq,
           })
         })
-        .catch((error) => {
+        .catch((error: unknown) => {
           if (error instanceof ClientTimelineCursorStaleError) {
             this.sendJson(res, 409, { error: 'timeline cursor stale', code: 'TIMELINE_CURSOR_STALE' })
           } else {
-            this.sendJson(res, 500, { error: 'timeline read failed' })
+            this.sendSessionReadFailure(res, error, sessId, 'timeline read failed')
           }
         })
       return
@@ -4195,9 +4968,45 @@ export class Gateway {
         .catch(() => this.sendJson(res, 500, { error: 'archive read failed' }))
       return
     }
+    const sessionReadMatch = url.pathname.match(/^\/api\/sessions\/([a-zA-Z0-9_-]{8,50})\/read$/)
+    if (sessionReadMatch) {
+      const sessId = sessionReadMatch[1]
+      const userId = this.getUserId(req)
+      if (req.method !== 'POST') {
+        this.sendJson(res, 405, { error: 'method not allowed' })
+        return
+      }
+      markClientSessionRead(userId, sessId)
+        .then((result) => {
+          if (!result.ok) {
+            this.sendJson(res, 404, { error: 'not found' })
+            return
+          }
+          this.sendJson(res, 200, { ok: true, updated: result.updated })
+        })
+        .catch(() => this.sendJson(res, 500, { error: 'mark read failed' }))
+      return
+    }
     // Exact browser-visible process frames, committed by the commercial
     // master before live WS delivery.  This is cursor-paged with no total cap;
     // personal/container SQLite returns an empty page.
+    const liveFramePayloadMatch = url.pathname.match(/^\/api\/sessions\/([a-zA-Z0-9_-]{8,50})\/live-frames\/payload$/)
+    if (liveFramePayloadMatch) {
+      const sessId = liveFramePayloadMatch[1]
+      const userId = this.getUserId(req)
+      if (req.method !== 'GET') {
+        this.sendJson(res, 405, { error: 'method not allowed' })
+        return
+      }
+      const recordId = url.searchParams.get('recordId')
+      const sha256 = url.searchParams.get('sha256')
+      readLiveOrTapeFramePayload(sessId, userId, { recordId, sha256 })
+        .then((row) => row
+          ? this.sendJson(res, 200, row)
+          : this.sendJson(res, 404, { error: 'not found' }))
+        .catch(() => this.sendJson(res, 500, { error: 'live frame payload read failed' }))
+      return
+    }
     const liveFramesMatch = url.pathname.match(/^\/api\/sessions\/([a-zA-Z0-9_-]{8,50})\/live-frames$/)
     if (liveFramesMatch) {
       const sessId = liveFramesMatch[1]
@@ -4206,18 +5015,44 @@ export class Gateway {
         this.sendJson(res, 405, { error: 'method not allowed' })
         return
       }
+      const view = url.searchParams.get('view')
+      if (view === 'units' && isLiveUnitsEnabled()) {
+        const nRaw = url.searchParams.get('n')
+        const n = nRaw === null ? 20 : Number(nRaw)
+        if (!Number.isSafeInteger(n) || n < 1 || n > 80) {
+          this.sendJson(res, 400, { error: 'invalid live units window' })
+          return
+        }
+        const before = url.searchParams.get('before')
+        const group = url.searchParams.get('group')
+        const nestedBefore = url.searchParams.get('nestedBefore')
+        readClientSessionLiveUnits(sessId, userId, {
+          n,
+          before,
+          group,
+          nestedBefore,
+        })
+          .then((page) => page
+            ? this.sendJson(res, 200, page)
+            : this.sendJson(res, 404, { error: 'not found' }))
+          .catch(() => this.sendJson(res, 500, { error: 'live units read failed' }))
+        return
+      }
       const afterRaw = url.searchParams.get('after')
       const limitRaw = url.searchParams.get('limit')
+      const seekRaw = url.searchParams.get('seek')
       const after = afterRaw === null ? 0 : Number(afterRaw)
       const limit = limitRaw === null ? 200 : Number(limitRaw)
+      const seekTail = seekRaw === 'tail'
       if (
         !Number.isSafeInteger(after) || after < 0 ||
-        !Number.isSafeInteger(limit) || limit < 1 || limit > 500
+        !Number.isSafeInteger(limit) || limit < 1 || limit > 500 ||
+        (seekRaw !== null && seekRaw !== 'tail')
       ) {
         this.sendJson(res, 400, { error: 'invalid live frame cursor' })
         return
       }
-      readClientSessionLiveFrames(sessId, userId, after, limit)
+      readClientSessionLiveFrames(sessId, userId, after, limit, { seekTail })
         .then((page) => page
           ? this.sendJson(res, 200, page)
           : this.sendJson(res, 404, { error: 'not found' }))
@@ -4252,7 +5087,7 @@ export class Gateway {
                 ? encodeClientTimelineCursor(s.timelineCursor)
                 : null,
             }) : this.sendJson(res, 404, { error: 'not found' }))
-            .catch(() => this.sendJson(res, 500, { error: 'get failed' }))
+            .catch((error: unknown) => this.sendSessionReadFailure(res, error, sessId, 'get failed'))
         } else {
           getClientSession(sessId, userId, { view: 'timeline' })
             .then((s) => {
@@ -4286,7 +5121,7 @@ export class Gateway {
                   : null,
               })
             })
-            .catch(() => this.sendJson(res, 500, { error: 'get failed' }))
+            .catch((error: unknown) => this.sendSessionReadFailure(res, error, sessId, 'get failed'))
         }
         return
       }
@@ -4364,13 +5199,13 @@ export class Gateway {
         return
       }
       if (req.method === 'PATCH') {
-        // 元数据专用更新(title / modelId,至少携带其一)。不走 PUT 的"整 blob 替换 + 乐观
-        // 并发"语义:元数据不携带 messages,骑 PUT 要么 409 要么把未随带的客户端消息 merge 掉。
-        // modelId = 会话级模型选择(UI 恢复提示,非执行权威;执行仍走每 turn 帧字段 + bridge
-        // authz)。仅做形态校验,不查 catalog —— 前端恢复时会校验"仍可见且健康"否则回落默认,
-        // 服务端查 catalog 只会引入无收益的耦合(模型下架后历史值也需要能安全存在)。
+        // 元数据专用更新(title / modelId / projectId / pinned / archived,至少携带其一)。不走 PUT 的
+        // "整 blob 替换 + 乐观并发"语义:元数据不携带 messages。
+        // modelId = 会话级模型选择(UI 恢复提示,非执行权威)。
+        // projectId = 侧栏聊天项目归属(null = 移出项目)。
+        // archived = 侧栏整会话归档(与消息 spill 水位无关)。
         ;(async () => {
-          let data: { title?: unknown; modelId?: unknown }
+          let data: { title?: unknown; modelId?: unknown; projectId?: unknown; pinned?: unknown; archived?: unknown }
           try {
             data = JSON.parse(await this.readBody(req, 16 * 1024))
           } catch {
@@ -4379,8 +5214,11 @@ export class Gateway {
           }
           const hasTitle = data.title !== undefined
           const hasModel = data.modelId !== undefined
-          if (!hasTitle && !hasModel) {
-            this.sendJson(res, 400, { error: 'title or modelId required' })
+          const hasProject = data.projectId !== undefined
+          const hasPinned = data.pinned !== undefined
+          const hasArchived = data.archived !== undefined
+          if (!hasTitle && !hasModel && !hasProject && !hasPinned && !hasArchived) {
+            this.sendJson(res, 400, { error: 'title, modelId, projectId, pinned or archived required' })
             return
           }
           const title = typeof data.title === 'string' ? data.title.trim() : ''
@@ -4393,25 +5231,41 @@ export class Gateway {
             this.sendJson(res, 400, { error: 'modelId invalid (1-120 chars, [A-Za-z0-9._:-])' })
             return
           }
-          // 两字段独立单列 UPDATE(现实调用方一次只改一个;都带时顺序执行,updatedAt 取末次)。
-          let updatedAt = 0
-          if (hasTitle) {
-            const r = await renameClientSession(sessId, userId, title)
-            if (!r.ok) {
-              this.sendJson(res, 404, { error: 'not found' })
+          if (hasProject && data.projectId !== null && typeof data.projectId !== 'string') {
+            this.sendJson(res, 400, { error: 'projectId must be a string or null' })
+            return
+          }
+          const projectId = hasProject
+            ? (data.projectId === null ? null : String(data.projectId).trim())
+            : undefined
+          if (hasProject && projectId !== null && projectId !== undefined && (projectId.length < 8 || projectId.length > 64)) {
+            this.sendJson(res, 400, { error: 'projectId invalid' })
+            return
+          }
+          if (hasPinned && typeof data.pinned !== 'boolean') {
+            this.sendJson(res, 400, { error: 'pinned must be a boolean' })
+            return
+          }
+          if (hasArchived && typeof data.archived !== 'boolean') {
+            this.sendJson(res, 400, { error: 'archived must be a boolean' })
+            return
+          }
+          const result = await patchClientSessionMeta(sessId, userId, {
+            ...(hasTitle ? { title } : {}),
+            ...(hasModel ? { modelId } : {}),
+            ...(hasProject ? { projectId: projectId ?? null } : {}),
+            ...(hasPinned ? { pinned: data.pinned as boolean } : {}),
+            ...(hasArchived ? { archived: data.archived as boolean } : {}),
+          })
+          if (!result.ok) {
+            if (result.error === 'project_not_found') {
+              this.sendJson(res, 404, { error: 'project not found' })
               return
             }
-            updatedAt = r.updatedAt
+            this.sendJson(res, 404, { error: 'not found' })
+            return
           }
-          if (hasModel) {
-            const r = await setClientSessionModel(sessId, userId, modelId)
-            if (!r.ok) {
-              this.sendJson(res, 404, { error: 'not found' })
-              return
-            }
-            updatedAt = r.updatedAt
-          }
-          this.sendJson(res, 200, { ok: true, updatedAt })
+          this.sendJson(res, 200, { ok: true, updatedAt: result.updatedAt })
         })().catch(() => this.sendJson(res, 500, { error: 'patch failed' }))
         return
       }
@@ -4475,6 +5329,15 @@ export class Gateway {
     if (memoryMatch) {
       this.handleMemory(req, res, memoryMatch[1], memoryMatch[2] as 'memory' | 'user').catch(
         (err) => this.sendInternalError(res, err),
+      )
+      return
+    }
+    const memoryUsageMatch = url.pathname.match(
+      /^\/api\/agents\/([a-zA-Z0-9_-]+)\/memory\/usage$/,
+    )
+    if (memoryUsageMatch) {
+      this.handleMemoryUsage(req, res, memoryUsageMatch[1], url).catch((err) =>
+        this.sendInternalError(res, err),
       )
       return
     }
@@ -4693,10 +5556,23 @@ export class Gateway {
       )
       return
     }
+    // ── Async delegate job long-poll (Cursor MCP 60s ceiling) ──
+    if (url.pathname === '/api/delegate/wait') {
+      this.handleDelegateWait(req, res).catch((err) => this.sendInternalError(res, err))
+      return
+    }
     // ── Synchronous task delegation ──
-    const delegateMatch = url.pathname.match(/^\/api\/agents\/([a-zA-Z0-9_-]+)\/delegate$/)
+    const delegateMatch = url.pathname.match(/^\/api\/agents\/([A-Za-z0-9._:-]+)\/delegate$/)
     if (delegateMatch) {
       this.handleDelegateTask(req, res, delegateMatch[1]).catch((err) =>
+        this.sendInternalError(res, err),
+      )
+      return
+    }
+    // ── Engine ask-user bridge (cursor MCP ask_user → web choice cards) ──
+    const askUserMatch = url.pathname.match(/^\/api\/agents\/([a-zA-Z0-9_-]+)\/ask-user$/)
+    if (askUserMatch) {
+      this.handleEngineAskUser(req, res, askUserMatch[1]).catch((err) =>
         this.sendInternalError(res, err),
       )
       return
@@ -4778,6 +5654,58 @@ export class Gateway {
       this.handleCronItem(req, res, cronItemMatch[1]).catch((err) =>
         this.sendInternalError(res, err),
       )
+      return
+    }
+    // ── Taskboard REST API (`/api/board/*`) ──
+    // 分发形态必须写在本文件的 url.pathname === / match 上,containerRouteInventory
+    // 靠扫描这三种字面量收路由;藏进 helper 会让 allowlist 闭包测试变死规则。
+    if (
+      url.pathname === '/api/board/projects' ||
+      url.pathname === '/api/board/tickets' ||
+      url.pathname === '/api/board/pipelines' ||
+      url.pathname === '/api/board/agents' ||
+      url.pathname === '/api/board/settings' ||
+      url.pathname === '/api/board/stats/cost' ||
+      url.pathname === '/api/board/templates' ||
+      url.pathname === '/api/board/reports/weekly' ||
+      url.pathname.match(/^\/api\/board\/projects\/([^/]+)$/) ||
+      url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/board$/) ||
+      url.pathname.match(/^\/api\/board\/tickets\/([^/]+)$/) ||
+      url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/(ready|claim|advance)$/) ||
+      url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/(block|approve|reject)$/) ||
+      url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/(done|cancel|comment|patrol|move)$/) ||
+      url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/runs$/) ||
+      url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/relations$/) ||
+      url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/comments$/) ||
+      url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/activity$/) ||
+      url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/timeline$/) ||
+      url.pathname.match(/^\/api\/board\/pipelines\/([^/]+)$/) ||
+      url.pathname.match(/^\/api\/board\/pipelines\/([^/]+)\/stages$/) ||
+      url.pathname.match(/^\/api\/board\/stages\/([^/]+)$/) ||
+      url.pathname.match(/^\/api\/board\/runs\/([^/]+)$/) ||
+      url.pathname.match(/^\/api\/board\/relations\/([^/]+)$/) ||
+      url.pathname.match(/^\/api\/board\/templates\/([^/]+)$/) ||
+      url.pathname.match(/^\/api\/board\/templates\/([^/]+)\/apply$/)
+    ) {
+      handleTaskboardApi(req, res, {
+        resolveActor: (r) =>
+          resolveTaskboardActor(r, {
+            jwtSecret: this.deps.config.gateway.accessToken,
+            isCommercialJwt: (t) => this.verifyCommercialJwt(t) !== null,
+            // 必须传真实校验结果:taskboard 层不得自行嗅 X-OpenClaude-Bridge-Nonce,
+            // 否则容器内 agent 伪造该头即可冒充 human 自批自结单。
+            bridgeVerified: this.checkBridgeBypass(r, url),
+          }),
+        listAgents: async () => {
+          const view = await this._getAgentsConfigUserView()
+          return view.agents.map((a) => ({
+            id: a.id,
+            name: a.displayName ?? a.id,
+            model: a.model ?? '',
+            description: a.greeting ?? '',
+          }))
+        },
+      }).catch((err) => this.sendInternalError(res, err))
       return
     }
     // ── Tasks REST API ──
@@ -4923,79 +5851,76 @@ export class Gateway {
       const cacheHeader = staticCacheControl(safePath, this.deps.staticMode)
       const filePath = resolve(this.deps.webRoot, `.${safePath}`)
       if (filePath.startsWith(resolve(this.deps.webRoot))) {
-        const cached = this._staticFileCache.get(filePath)
-        if (cached) {
-          if (req.headers['if-none-match'] === cached.etag) {
-            res.writeHead(304)
-            res.end()
-            return
-          }
-          res.writeHead(200, { 'Content-Type': cached.mime, 'ETag': cached.etag, 'Cache-Control': cacheHeader })
-          res.end(cached.content)
-          return
-        }
-        try {
-          const s = statSync(filePath)
-          if (s.isFile()) {
-            const content = readFileSync(filePath)
-            const mime = mimeFor(filePath)
-            const etag = `"${createHash('md5').update(content).digest('hex').slice(0, 16)}"`
-            if (this._staticFileCache.size >= 200) {
-              const firstKey = this._staticFileCache.keys().next().value
-              if (firstKey !== undefined) this._staticFileCache.delete(firstKey)
-            }
-            this._staticFileCache.set(filePath, { content, mime, etag })
-            if (req.headers['if-none-match'] === etag) {
-              res.writeHead(304)
-              res.end()
-              return
-            }
-            res.writeHead(200, { 'Content-Type': mime, 'ETag': etag, 'Cache-Control': cacheHeader })
-            res.end(content)
-            return
-          }
-        } catch {}
+        if (this._serveStaticCached(filePath, cacheHeader, req, res, mimeFor(filePath))) return
       }
       // SPA fallback — only for navigation requests (no file extension)
       // Static assets (.js/.css/.map/.min.js etc.) should 404, not serve index.html
       const hasExtension = /\.\w+$/.test(url.pathname)
       if (!hasExtension) {
         const indexPath = resolve(this.deps.webRoot, 'index.html')
-        const cachedIndex = this._staticFileCache.get(indexPath)
-        if (cachedIndex) {
-          if (req.headers['if-none-match'] === cachedIndex.etag) {
-            res.writeHead(304)
-            res.end()
-            return
-          }
-          res.writeHead(200, { 'Content-Type': 'text/html', 'ETag': cachedIndex.etag, 'Cache-Control': 'no-cache' })
-          res.end(cachedIndex.content)
-          return
-        }
-        try {
-          const s = statSync(indexPath)
-          if (s.isFile()) {
-            const content = readFileSync(indexPath)
-            const etag = `"${createHash('md5').update(content).digest('hex').slice(0, 16)}"`
-            if (this._staticFileCache.size >= 200) {
-              const firstKey = this._staticFileCache.keys().next().value
-              if (firstKey !== undefined) this._staticFileCache.delete(firstKey)
-            }
-            this._staticFileCache.set(indexPath, { content, mime: 'text/html', etag })
-            if (req.headers['if-none-match'] === etag) {
-              res.writeHead(304)
-              res.end()
-              return
-            }
-            res.writeHead(200, { 'Content-Type': 'text/html', 'ETag': etag, 'Cache-Control': 'no-cache' })
-            res.end(content)
-            return
-          }
-        } catch {}
+        if (this._serveStaticCached(indexPath, 'no-cache', req, res, 'text/html')) return
       }
     }
     res.writeHead(404)
     res.end('not found')
+  }
+
+  /**
+   * 静态文件内存缓存的统一命中+读盘路径(通用静态资产与 SPA fallback 的 index.html 共用)。
+   * 缓存条目带源文件 mtimeMs,命中时 stat 回盘比对:dist 被 rsync 覆盖(mtime 变)后
+   * 下一个请求即拿到新内容 —— 与 ws/frontendBuild.ts 版本探针同语义自愈,漏重启 master
+   * 时不会出现「WS 帧已收敛到新 build、HTTP 却一直吐旧 index.html」的分裂(那种分裂会让
+   * 前端 update banner 陷入刷新死循环)。
+   * 返回 true = 已响应(200/304);false = 磁盘无此文件,由调用方走兜底/404。
+   */
+  private _serveStaticCached(
+    filePath: string,
+    cacheHeader: string,
+    req: IncomingMessage,
+    res: ServerResponse,
+    mime: string,
+  ): boolean {
+    const cached = this._staticFileCache.get(filePath)
+    if (cached && this._staticCacheFreshOnDisk(filePath, cached)) {
+      if (req.headers['if-none-match'] === cached.etag) {
+        res.writeHead(304)
+        res.end()
+        return true
+      }
+      res.writeHead(200, { 'Content-Type': cached.mime, 'ETag': cached.etag, 'Cache-Control': cacheHeader })
+      res.end(cached.content)
+      return true
+    }
+    try {
+      const s = statSync(filePath)
+      if (!s.isFile()) return false
+      const content = readFileSync(filePath)
+      const etag = `"${createHash('md5').update(content).digest('hex').slice(0, 16)}"`
+      if (this._staticFileCache.size >= 200) {
+        const firstKey = this._staticFileCache.keys().next().value
+        if (firstKey !== undefined) this._staticFileCache.delete(firstKey)
+      }
+      this._staticFileCache.set(filePath, { content, mime, etag, mtimeMs: s.mtimeMs })
+      if (req.headers['if-none-match'] === etag) {
+        res.writeHead(304)
+        res.end()
+        return true
+      }
+      res.writeHead(200, { 'Content-Type': mime, 'ETag': etag, 'Cache-Control': cacheHeader })
+      res.end(content)
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  /** 缓存条目与磁盘是否仍一致(mtimeMs 比对;stat 失败/文件已删 → 视为失效)。 */
+  private _staticCacheFreshOnDisk(filePath: string, entry: { mtimeMs: number }): boolean {
+    try {
+      return statSync(filePath).mtimeMs === entry.mtimeMs
+    } catch {
+      return false
+    }
   }
 
   /** Extract bearer token from request (header, WS protocol, or cookie). */
@@ -5014,6 +5939,16 @@ export class Gateway {
     )
     const cookieToken = cookies.oc_session || ''
     return authHeader || protoToken || cookieToken
+  }
+
+  private _isDelegateHttpPath(pathname: string): boolean {
+    return pathname === '/api/delegate/wait' || /^\/api\/agents\/[^/]+\/delegate$/.test(pathname)
+  }
+
+  private _hasValidDelegateContext(req: IncomingMessage): boolean {
+    const raw = req.headers[DELEGATE_CONTEXT_HEADER]
+    const token = Array.isArray(raw) ? raw[0] : raw
+    return typeof token === 'string' && verifyDelegateContextToken(token) !== null
   }
 
   private checkHttpAuth(req: IncomingMessage): boolean {
@@ -6048,6 +6983,17 @@ export class Gateway {
   private sendJson(res: ServerResponse, code: number, body: unknown): void {
     res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' })
     res.end(JSON.stringify(body))
+  }
+  private sendSessionReadFailure(
+    res: ServerResponse,
+    error: unknown,
+    sessionId: string,
+    publicError: string,
+  ): void {
+    const requestId = randomBytes(8).toString('hex')
+    const err = error instanceof Error ? error : new Error(String(error))
+    this.log.error('session read failed', { sessionId, requestId, publicError }, err)
+    this.sendJson(res, 500, { error: publicError, requestId })
   }
   private sendError(res: ServerResponse, code: number, message: string): void {
     this.sendJson(res, code, { error: message })
@@ -7169,6 +8115,13 @@ export class Gateway {
         const body = await this.readJsonBody<{ text?: string; version?: string }>(req)
         const r = await writeUserProfile(body.text ?? '', body.version)
         if (r.ok) {
+          await recordMemoryUsageEvent({
+            agentId,
+            operation: 'profile_write',
+            memoryType: 'profile',
+            outcome: 'success',
+            metadata: { source: 'ui' },
+          }).catch(() => {})
           const { text, version } = await readUserProfile()
           this.sendJson(res, 200, {
             ok: true,
@@ -7218,6 +8171,19 @@ export class Gateway {
       return this.sendError(res, 410, 'memory index is auto-managed; edit memory/<file> instead')
     }
     this.sendError(res, 405, 'method not allowed')
+  }
+
+  private async handleMemoryUsage(
+    req: IncomingMessage,
+    res: ServerResponse,
+    agentId: string,
+    url: URL,
+  ): Promise<void> {
+    if (isHiddenSystemAgentId(agentId)) return this.sendError(res, 404, 'agent not found')
+    if (req.method !== 'GET') return this.sendError(res, 405, 'method not allowed')
+    const rawDays = Number(url.searchParams.get('days') ?? '30')
+    const days = Number.isInteger(rawDays) ? Math.max(1, Math.min(90, rawDays)) : 30
+    this.sendJson(res, 200, await getMemoryUsageDashboard({ agentId, days }))
   }
 
   // GET /api/agents/:id/auto-dream-report → sanitized latest result/progress.
@@ -7307,8 +8273,17 @@ export class Gateway {
     }
     if (req.method === 'PUT') {
       const body = await this.readJsonBody<{ content?: string; version?: string }>(req)
+      const existed = Boolean(await md.read(safe))
       const r = await md.write(safe, body.content ?? '', body.version)
       if (r.ok) {
+        await recordMemoryUsageEvent({
+          agentId,
+          operation: existed ? 'core_update' : 'core_write',
+          memoryType: 'core',
+          outcome: 'success',
+          topMatchKey: safe,
+          metadata: { source: 'ui' },
+        }).catch(() => {})
         this.sendJson(res, 200, { ok: true, file: safe, version: r.version })
         return
       }
@@ -7324,6 +8299,14 @@ export class Gateway {
     if (req.method === 'DELETE') {
       const removed = await md.remove(safe)
       if (!removed) return this.sendError(res, 404, 'memory file not found')
+      await recordMemoryUsageEvent({
+        agentId,
+        operation: 'core_delete',
+        memoryType: 'core',
+        outcome: 'success',
+        topMatchKey: safe,
+        metadata: { source: 'ui' },
+      }).catch(() => {})
       this.sendJson(res, 200, { ok: true, file: safe })
       return
     }
@@ -9294,6 +10277,11 @@ export class Gateway {
   private _delegateQueueWaiters: Map<string, () => void> | undefined
   /** 排队复查间隔;测试覆写加速,生产走 DELEGATE_QUEUE_POLL_DEFAULT_MS。 */
   private _delegateQueuePollMs: number | undefined
+  /** Cursor MCP 60s 上限的异步委派作业句柄。测试脚手架 Object.create 不跑字段
+   *  初始化,使用处惰性 ??=。 */
+  private _delegateJobs: DelegateJobStore | undefined
+  /** HTTP/MCP delegate 续跑绑定。测试脚手架 Object.create 不跑字段初始化,使用处惰性 ??=。 */
+  private _delegateResume: DelegateResumeRegistry | undefined
 
   /** 内存水位读取的实例挂钩:生产=模块级 readDelegateMemoryPressure(cgroup 文件),
    *  测试直接覆写本方法注入假读数。 */
@@ -9529,22 +10517,49 @@ export class Gateway {
   }
 
   /**
+   * Reentrancy latch for `_markDelegateAncestorActivity`.
+   * Delegate children bind `activity` → this method, so emitting on an
+   * ancestor (which may itself be a delegate child) would otherwise re-enter
+   * and re-walk the chain. Object.create(Gateway.prototype) test harnesses
+   * skip field initializers; the boolean is treated as unset/false there.
+   */
+  private _markingDelegateAncestorActivity = false
+
+  /**
    * A synchronous delegate_task keeps every ancestor runner blocked inside the
    * tool call. Raw child adapter activity is therefore real liveness for the
    * complete delegate subtree, even though it is not parent stdout. Refresh the
    * existing ancestor sessions only; a genuinely silent subtree still reaches
    * the normal idle watchdog.
+   *
+   * `lastActivityAt` feeds the 15-minute liveness watchdog. Emitting `activity`
+   * is required as well: the 30-minute fallback timer only `refresh()`es on
+   * that event. The latch above ensures one external trigger walks the chain
+   * once (each ancestor emits at most once) and that a cyclic parent pointer
+   * cannot stack-overflow.
    */
   private _markDelegateAncestorActivity(parentSessionKey: string | undefined): void {
-    const seen = new Set<string>()
-    const now = Date.now()
-    let sessionKey = parentSessionKey
-    for (let depth = 0; sessionKey && depth < 5 && !seen.has(sessionKey); depth++) {
-      seen.add(sessionKey)
-      const ancestor = this.sessions.getByKey(sessionKey)
-      if (!ancestor) return
-      ancestor.runner.lastActivityAt = Math.max(ancestor.runner.lastActivityAt, now)
-      sessionKey = ancestor.parentSessionKey
+    if (this._markingDelegateAncestorActivity) return
+    this._markingDelegateAncestorActivity = true
+    try {
+      const seen = new Set<string>()
+      const now = Date.now()
+      let sessionKey = parentSessionKey
+      for (let depth = 0; sessionKey && depth < 5 && !seen.has(sessionKey); depth++) {
+        seen.add(sessionKey)
+        const ancestor = this.sessions.getByKey(sessionKey)
+        if (!ancestor) return
+        ancestor.runner.lastActivityAt = Math.max(ancestor.runner.lastActivityAt, now)
+        try {
+          ancestor.runner.emit?.('activity')
+        } catch {
+          // A throwing listener must not abort the remaining ancestors or
+          // surface into the child runner's activity callback.
+        }
+        sessionKey = ancestor.parentSessionKey
+      }
+    } finally {
+      this._markingDelegateAncestorActivity = false
     }
   }
 
@@ -9600,10 +10615,35 @@ export class Gateway {
     } catch {
       return this.sendError(res, 400, 'invalid JSON')
     }
+    if (!isPlatformAgentId(targetAgentId)) {
+      return this.sendError(
+        res,
+        400,
+        'agentId 只能是平台成员 id(如 coding-assistant)。型号请用 body.model,例如 cursor-grok-4.6-high-fast',
+      )
+    }
     const { goal, context, sourceAgent, toolsets } = parsed
     if (!goal) return this.sendError(res, 400, 'goal required')
+    const modelNorm = parseDelegateModel(parsed.model)
+    if (!modelNorm.ok) return this.sendError(res, 400, modelNorm.error)
     const depthHeader = req.headers['x-delegation-depth']
-    const depth = depthHeader ? Number.parseInt(String(depthHeader), 10) : 0
+    const contextHeader = req.headers[DELEGATE_CONTEXT_HEADER]
+    const contextRaw = Array.isArray(contextHeader) ? contextHeader[0] : contextHeader
+    const boundContext =
+      typeof contextRaw === 'string' && contextRaw.trim()
+        ? verifyDelegateContextToken(contextRaw)
+        : null
+    if (typeof contextRaw === 'string' && contextRaw.trim() && !boundContext) {
+      return this.sendError(res, 401, 'invalid delegate context')
+    }
+    if (parsed.async === true && !boundContext) {
+      return this.sendError(res, 401, 'async delegate requires delegate context')
+    }
+    const depth = boundContext
+      ? boundContext.depth
+      : depthHeader
+        ? Number.parseInt(String(depthHeader), 10)
+        : 0
     // P2 批次4 — effort 仅接受 low/medium/high(delegate schema enum),其余(含缺省/非法)
     // → undefined,不动子会话默认档位。防御性白名单(body 非 typebox 校验)。
     const effort =
@@ -9615,32 +10655,142 @@ export class Gateway {
     // 委派执行核心与 HTTP req/res 解耦(P2 债C),让 gateway 硬编排 review pass
     // (dispatchInbound)能内部直调同一委派路径拿到结构化结果(verdict/output),
     // 无需伪造 req/res。
-    const result = await this._runDelegateTask({
+    const parentSessionKey = boundContext
+      ? boundContext.sessionKey
+      : typeof parsed.parentSessionKey === 'string'
+        ? parsed.parentSessionKey
+        : undefined
+    const sourceAgentId = boundContext
+      ? boundContext.agentId
+      : typeof sourceAgent === 'string'
+        ? sourceAgent
+        : undefined
+    // 同步 preflight:mint/resume/占用必须在任何 await 和创建 async job 之前完成,
+    // 这样 running 响应已经带着权威 sessionKey,并发 resume 也能立刻 409。
+    const resume = (this._delegateResume ??= new DelegateResumeRegistry()).preflight({
+      resumeSessionKey: parsed.resumeSessionKey,
+      parentSessionKey,
+      targetAgentId,
+      sourceAgent: sourceAgentId || 'system',
+    })
+    this._forgetEvictedDelegateResumes(resume.evictedKeys)
+    if (!resume.ok) {
+      return this.sendError(res, resume.httpStatus, resume.message)
+    }
+    const runInput: RunDelegateInput = {
       targetAgentId,
       goal,
       context: typeof context === 'string' ? context : undefined,
-      sourceAgent: typeof sourceAgent === 'string' ? sourceAgent : undefined,
+      sourceAgent: sourceAgentId,
       toolsets,
-      parentSessionKey:
-        typeof parsed.parentSessionKey === 'string' ? parsed.parentSessionKey : undefined,
+      parentSessionKey,
       streamProgress: parsed.streamProgress === true,
       depth,
       effort,
-    })
-    if (result.kind === 'rejected') {
-      // 结构化码(DELEGATE_CODEX_UNSUPPORTED / MODEL_NOT_AVAILABLE / MODEL_CATALOG_UNAVAILABLE)
-      // 随信封下发 —— 调用方(delegate_task MCP 工具 / 硬编排)据此稳定分支,不靠 message 文本匹配。
-      if (result.code) {
-        return this.sendJson(res, result.httpStatus, { error: result.message, code: result.code })
-      }
-      return this.sendError(res, result.httpStatus, result.message)
+      model: modelNorm.model,
+      sessionKey: resume.sessionKey,
+      resumable: true,
+      resumeMinted: resume.minted,
     }
-    if (result.kind === 'error') return this.sendError(res, 500, result.message)
+    // 默认同步:行为与改前完全一致(CCB/Codex 继续堵在 HTTP 上)。仅 `async: true`
+    // 才切作业句柄 —— 子任务仍走同一条 _runDelegateTask(idle/hard/祖先活性/深度/并发闸全在)。
+    if (parsed.async === true) {
+      const store = (this._delegateJobs ??= new DelegateJobStore({
+        ttlMs: resolveDelegateJobTtlMs(),
+      }))
+      const created = store.create(targetAgentId, { sessionKey: resume.sessionKey })
+      if ('error' in created) {
+        this._delegateResume.abort(resume.sessionKey, resume.minted)
+        return this.sendError(res, 503, 'too many in-flight delegate jobs')
+      }
+      const jobId = created.jobId
+      void this._runDelegateTask(runInput)
+        .then((result) => {
+          store.complete(jobId, this._delegateResultToHttp(result, targetAgentId))
+        })
+        .catch((err) => {
+          store.complete(jobId, {
+            httpStatus: 500,
+            body: { error: (err as Error)?.message ?? String(err) },
+          })
+        })
+      return this.sendJson(res, 200, {
+        status: 'running',
+        jobId,
+        agentId: targetAgentId,
+        sessionKey: resume.sessionKey,
+      })
+    }
+    const result = await this._runDelegateTask(runInput)
+    const mapped = this._delegateResultToHttp(result, targetAgentId)
+    return this.sendJson(res, mapped.httpStatus, mapped.body)
+  }
+
+  private _delegateResultToHttp(
+    result: DelegateTaskResult,
+    targetAgentId: string,
+  ): DelegateJobHttpResult {
+    if (result.kind === 'rejected') {
+      return {
+        httpStatus: result.httpStatus,
+        body: result.code
+          ? { error: result.message, code: result.code }
+          : { error: result.message },
+      }
+    }
+    if (result.kind === 'error') {
+      return { httpStatus: 500, body: { error: result.message } }
+    }
+    return {
+      httpStatus: 200,
+      body: {
+        ok: result.ok,
+        agentId: targetAgentId,
+        output: result.output,
+        error: result.error || undefined,
+        ...(result.sessionKey ? { sessionKey: result.sessionKey } : {}),
+      },
+    }
+  }
+
+  private async handleDelegateWait(
+    req: IncomingMessage,
+    res: ServerResponse,
+  ): Promise<void> {
+    if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
+    const body = await this.readBody(req)
+    let parsed: any
+    try {
+      parsed = JSON.parse(body)
+    } catch {
+      return this.sendError(res, 400, 'invalid JSON')
+    }
+    const jobId = typeof parsed.jobId === 'string' ? parsed.jobId.trim() : ''
+    if (!jobId) return this.sendError(res, 400, 'jobId required')
+    const waitMs = resolveDelegateWaitMs(parsed.waitMs)
+    const store = (this._delegateJobs ??= new DelegateJobStore({
+      ttlMs: resolveDelegateJobTtlMs(),
+    }))
+    const view = await store.wait(jobId, waitMs)
+    if (view.status === 'expired') {
+      return this.sendJson(res, 404, {
+        status: 'expired',
+        jobId,
+        error: 'delegate job not found or expired',
+      })
+    }
+    if (view.status === 'running') {
+      return this.sendJson(res, 200, {
+        status: 'running',
+        jobId,
+        ...(view.sessionKey ? { sessionKey: view.sessionKey } : {}),
+      })
+    }
     return this.sendJson(res, 200, {
-      ok: result.ok,
-      agentId: targetAgentId,
-      output: result.output,
-      error: result.error || undefined,
+      ...view.body,
+      status: 'done',
+      jobId,
+      httpStatus: view.httpStatus,
     })
   }
 
@@ -9656,7 +10806,66 @@ export class Gateway {
    * `isReview` 语义:走资源闸保留槽 + 免 per-parent 桶(审查不受某父 fan-out 挤占);
    * runLog 打 isReview;完成后从审查输出解析结构化 verdict 一并回带 + 落团队卡。
    */
+  private _forgetEvictedDelegateResumes(keys: string[]): void {
+    for (const key of keys) {
+      try {
+        this.sessions.forgetResume(key)
+      } catch {
+        // stub sessions in tests may omit forgetResume
+      }
+    }
+  }
+
+  private async _completeDelegateResumeClaim(
+    input: RunDelegateInput,
+    sessionSpawned: boolean,
+  ): Promise<void> {
+    if (!input.resumable || !input.sessionKey) return
+    const reg = this._delegateResume
+    if (!reg) return
+    if (!sessionSpawned) {
+      reg.abort(input.sessionKey, input.resumeMinted === true)
+      return
+    }
+    reg.markRetiring(input.sessionKey)
+    try {
+      await this.sessions.retireKeepResume(input.sessionKey)
+    } catch (err) {
+      this.log.warn('delegate session retireKeepResume failed', {
+        sessionKey: input.sessionKey,
+        err: String(err),
+      })
+    }
+    // Occupancy stays until the live session is actually gone. If retire threw
+    // before deleting the map entry, a second resume must still 409.
+    const stillLive =
+      typeof this.sessions.hasLiveSession === 'function' &&
+      this.sessions.hasLiveSession(input.sessionKey)
+    if (stillLive) return
+    reg.release(input.sessionKey)
+  }
+
   private async _runDelegateTask(input: RunDelegateInput): Promise<DelegateTaskResult> {
+    let sessionSpawned = false
+    try {
+      const result = await this._runDelegateTaskCore(input, {
+        onSessionSpawned: () => {
+          sessionSpawned = true
+        },
+      })
+      if (result.kind === 'completed' && input.resumable && input.sessionKey) {
+        return { ...result, sessionKey: input.sessionKey }
+      }
+      return result
+    } finally {
+      await this._completeDelegateResumeClaim(input, sessionSpawned)
+    }
+  }
+
+  private async _runDelegateTaskCore(
+    input: RunDelegateInput,
+    hooks?: { onSessionSpawned?: () => void },
+  ): Promise<DelegateTaskResult> {
     const { targetAgentId, goal, sourceAgent, toolsets, depth } = input
     let context = input.context
     let isReview = input.isReview === true
@@ -9768,11 +10977,14 @@ export class Gateway {
     // 让它先去排队等内存名额、等到了再拒,是纯粹的浪费 + 误导性等待。
     // 也因此,这里必然**先于 getOrCreate/createEngine** —— 结构化拒绝时不会有任何 runner
     // 被 spawn(方案 §3 要求的"创建 runner 前拒",测试 ④/⑤ 断言未 spawn)。
+    const requestedModel = isReview ? undefined : input.model
+    const execAgent = requestedModel ? { ...delegatedAgent, model: requestedModel } : delegatedAgent
     let delegateExec: LocalExecutionDecision | undefined
     try {
       delegateExec = await resolveLocalExecutionIfEnforced({
-        agent: delegatedAgent,
+        agent: execAgent,
         kind: 'turn',
+        model: requestedModel,
         defaultModel: this.deps.config.defaults.model,
       })
     } catch (err) {
@@ -9786,7 +10998,9 @@ export class Gateway {
       }
     }
 
-    const sessionKey = `agent:${targetAgentId}:delegate:${sourceAgent || 'system'}:${Date.now()}`
+    const sessionKey =
+      input.sessionKey ??
+      `agent:${targetAgentId}:delegate:${sourceAgent || 'system'}:${Date.now()}`
     this.log.info('delegate', {
       sourceAgent,
       targetAgentId,
@@ -9829,6 +11043,13 @@ export class Gateway {
     const nestLabel = nestedProgress
       ? [...(progressRouting?.ancestorAgentPath ?? []), targetAgentId].join('↳')
       : ''
+    // Capture webchat-ancestor cmid at closure creation. Leftover live
+    // journals are minted when delegate_progress is persisted without a
+    // clientMessageId; persist must not guess the in-flight cmid.
+    const parentCmid = progressTarget
+      ? this.sessions.getByKey(progressTarget.sessionKey)?._runningClientMessageId
+        ?? this.sessions.getByKey(progressTarget.sessionKey)?._currentDispatch?.clientMessageId
+      : undefined
     const emitProgress = (block: DelegateProgressBlock | null) => {
       if (!progressTarget || !block) return
       // 嵌套:把本委派的原始进度帧统一重写成「挂到一级卡上的带层级前缀非终态文本行」
@@ -9846,6 +11067,7 @@ export class Gateway {
         sessionKey: progressTarget.sessionKey,
         channel: progressTarget.channel,
         peer: { id: progressTarget.peerId, kind: 'dm' as const },
+        ...(isClientMessageId(parentCmid) ? { clientMessageId: parentCmid } : {}),
         blocks: [outBlock as any],
         isFinal: false,
         _userId: progressTarget.userId,
@@ -9953,15 +11175,22 @@ export class Gateway {
     const durableRuntimeEvents: DurableRuntimeEvent[] = []
     const durableEngineBillings: DurableCodexBilling[] = []
     const durableGoalUsageRecords: DurableGoalUsageRecord[] = []
+    let lastChildActivityAt = Date.now()
+    const markChildActivity = () => {
+      lastChildActivityAt = Date.now()
+    }
     let session: AgentSession
     let detachAncestorActivity: (() => void) | undefined
     try {
       session = await this.sessions.getOrCreate({
         sessionKey,
-        agent: delegatedAgent,
+        agent: execAgent,
         // flag 未开 → {}(零变化);flag 开 → catalog 投影的 canonicalModel + engine。
         ...localExecutionOverride(delegateExec),
-        channel: 'delegate',
+        ...(delegateExec || !requestedModel
+          ? {}
+          : { model: requestedModel }),
+        channel: input.channel ?? 'delegate',
         peerId: sourceAgent || 'system',
         repoSessionId: progressTarget?.peerId ?? delegateParent?.repoSessionId,
         workspaceMode: delegateParent?.workspaceMode,
@@ -9978,6 +11207,7 @@ export class Gateway {
             : {}),
         },
       })
+      hooks?.onSessionSpawned?.()
       session._durableDelegateTranscript = durableTranscript
       session._durableDelegateRuntimeEvents = durableRuntimeEvents
       session._durableDelegateEngineBillings = durableEngineBillings
@@ -9985,8 +11215,10 @@ export class Gateway {
       session._platformGoal = delegateParent?.platformGoal
         ? structuredClone(delegateParent.platformGoal)
         : null
-      const handleChildActivity = () =>
+      const handleChildActivity = () => {
+        markChildActivity()
         this._markDelegateAncestorActivity(delegateParent?.sessionKey)
+      }
       session.runner.on?.('activity', handleChildActivity)
       detachAncestorActivity = () => session.runner.off?.('activity', handleChildActivity)
       // 回填本委派的进度卡 runId:子委派追溯到**一级**委派时复用它,把嵌套进度挂回同一张卡。
@@ -10048,12 +11280,7 @@ export class Gateway {
     // 非 review / 解析不出 → undefined(编排据 undefined 走降级放行)。
     let verdict: ReviewVerdict | undefined
     let ownGoalUsageRecord: DurableGoalUsageRecord | undefined
-    const timeoutConfig = resolveDelegateTimeoutConfig()
-    const startedAt = Date.now()
-    let lastChildActivityAt = startedAt
-    const markChildActivity = () => {
-      lastChildActivityAt = Date.now()
-    }
+    const timeoutConfig = resolveDelegateTimeoutConfig(process.env, input.idleTimeoutMs)
     let timeoutTimer: NodeJS.Timeout | null = null
     const clearTimeoutTimer = () => {
       if (timeoutTimer) clearInterval(timeoutTimer)
@@ -10063,7 +11290,6 @@ export class Gateway {
       timeoutTimer = setInterval(() => {
         const reason = getDelegateTimeoutReason(
           Date.now(),
-          startedAt,
           lastChildActivityAt,
           timeoutConfig,
         )
@@ -10128,7 +11354,7 @@ export class Gateway {
       // P2 批次4 — effort 透传:子会话是新建的,首次 submit 的 effortLevel 在 runner
       // spawn 前生效(与顶层会话 safeEffortLevel 同法)。undefined = 不指定 → 成员默认档位。
       input.effort,
-      undefined,
+      delegateExec?.canonicalModel ?? requestedModel,
       undefined,
       undefined,
       undefined,
@@ -10303,18 +11529,17 @@ export class Gateway {
       //(父会话的额度要跨多次 delegate 累计,turn 边界才复位)。
       this._hiddenDelegateGuard.resetForParent(sessionKey)
       this._memberDelegateGuard?.resetForParent(sessionKey)
-      // team-durability — 一次性子会话收尾即销毁:sessionKey 带时间戳永不复用,
-      // warm runner 留着是纯泄漏(2026-07-07 事故:4 个 delegate runner 各挂
-      // mcp-memory+vision 子进程,完成后 45+ 分钟不退,团队模式高频使用会堆
-      // 内存/pids —— v3 同类曾致 spawn EAGAIN)。fire-and-forget:runner.shutdown
-      // 是优雅退出可能耗秒级,不阻塞委派结果回传;destroySession 幂等,失败仅记日志
-      // (容器回收兜底)。嵌套委派在本 turn 内已全部收尾,销毁无悬挂引用。
-      this.sessions.destroySession(sessionKey).catch((err) =>
-        this.log.warn('delegate session destroy failed', {
-          sessionKey,
-          err: String(err),
-        }),
-      )
+      // taskboard / 非 resumable:一次性子会话收尾即销毁(2026-07-07 warm runner 泄漏)。
+      // HTTP/MCP resumable 走外层 _completeDelegateResumeClaim:await retireKeepResume
+      // (杀 runner,保留 resume-map),占用栅栏在退休完成前不释放。
+      if (!input.resumable) {
+        this.sessions.destroySession(sessionKey).catch((err) =>
+          this.log.warn('delegate session destroy failed', {
+            sessionKey,
+            err: String(err),
+          }),
+        )
+      }
     }
 
     eventBus.emit('agent.completed', createEvent('agent.completed', targetAgentId, {
@@ -10403,6 +11628,47 @@ export class Gateway {
       timedOut,
       runId: progressRunId,
       verdict,
+      // destroySession 是 fire-and-forget,此时 session 对象还在内存,用量从这里抄。
+      // usage_log 是 eventBus 异步,return 时多半还没落盘,不能只靠它。
+      tokensIn: session.totalInputTokens || null,
+      tokensOut: session.totalOutputTokens || null,
+      costUsd: session.totalCostUSD || null,
+    }
+  }
+
+  /**
+   * taskboard 巡检的 delegate 适配器。同进程直调 _runDelegateTask,才能拿到
+   * timedOut;sessionKey / channel 走巡检专用形状,不进主会话列表。
+   */
+  private async _runTaskboardDelegate(
+    input: import('./taskboard/patrol.js').PatrolDelegateInput,
+  ): Promise<import('./taskboard/patrol.js').PatrolDelegateResult> {
+    const result = await this._runDelegateTask({
+      targetAgentId: input.agentId,
+      goal: input.goal,
+      context: input.context,
+      sourceAgent: 'taskboard',
+      toolsets: input.toolsets ?? undefined,
+      depth: 0,
+      effort: input.effort ?? undefined,
+      sessionKey: input.sessionKey,
+      channel: 'taskboard',
+      idleTimeoutMs: input.timeoutSec * 1_000,
+    })
+    if (result.kind === 'rejected') {
+      return { ok: false, output: '', error: result.message }
+    }
+    if (result.kind === 'error') {
+      return { ok: false, output: '', error: result.message }
+    }
+    return {
+      ok: result.ok && !result.timedOut,
+      output: result.output,
+      error: result.error,
+      timedOut: result.timedOut,
+      tokensIn: result.tokensIn ?? null,
+      tokensOut: result.tokensOut ?? null,
+      costUsd: result.costUsd ?? null,
     }
   }
 
@@ -11875,6 +13141,65 @@ export class Gateway {
         this._outboundRing.clear(sessionKey)
         outboundRingSizeBytes.value = this._outboundRing.totalBytes()
         this.log.info('reset destroyed session', { sessionKey })
+      } else if ((frame as any).type === 'control.session.cancel_model_switch') {
+        const sessionKey = (frame as any).sessionKey
+        const requestId = (frame as any).requestId
+        if (
+          typeof sessionKey !== 'string' ||
+          typeof requestId !== 'string' ||
+          !/^[A-Za-z0-9:_-]{8,128}$/.test(requestId)
+        ) return
+        const session = this.sessions.getByKey(sessionKey)
+        if (!session || session.userId !== this.getWsUserId(ws)) return
+        this.sessions.cancelModelSwitch(session, requestId)
+      } else if ((frame as any).type === 'control.session.prepare_model_switch') {
+        const sessionKey = (frame as any).sessionKey
+        const requestId = (frame as any).requestId
+        const sourceModel = (frame as any).sourceModel
+        const targetModel = (frame as any).targetModel
+        if (
+          typeof sessionKey !== 'string' ||
+          typeof requestId !== 'string' ||
+          typeof sourceModel !== 'string' ||
+          typeof targetModel !== 'string' ||
+          !ALLOWED_INBOUND_MODELS.has(sourceModel) ||
+          !ALLOWED_INBOUND_MODELS.has(targetModel)
+        ) return
+        const session = this.sessions.getByKey(sessionKey)
+        const ownsSession = session?.userId === this.getWsUserId(ws)
+        const reply = (payload: Record<string, unknown>) => ws.send(JSON.stringify({
+          type: 'outbound.model_switch.prepared',
+          requestId,
+          sessionKey,
+          targetModel,
+          ts: Date.now(),
+          ...payload,
+        }))
+        if (!session || !ownsSession) {
+          reply({ sourceModel: '', status: 'failed', errorCode: 'SESSION_NOT_FOUND', message: '会话尚未运行，无法压缩' })
+          return
+        }
+        try {
+          const prepared = await this.sessions.prepareModelSwitch(
+            session,
+            sourceModel,
+            targetModel,
+            requestId,
+          )
+          reply({ ...prepared, status: 'completed' })
+        } catch (err) {
+          const code = err instanceof Error ? err.message : 'MODEL_SWITCH_PREPARE_FAILED'
+          reply({
+            sourceModel: session.model ?? session.runner.model ?? '',
+            status: 'failed',
+            errorCode: code,
+            message: code === 'MODEL_SWITCH_SESSION_BUSY'
+              ? '当前回复尚未结束，请稍后再切换模型'
+              : code === 'MODEL_SWITCH_SOURCE_CHANGED'
+                ? '会话当前模型已变化，请刷新后重试'
+                : '上下文压缩失败，仍保留原模型',
+          })
+        }
       } else if ((frame as any).type === 'control.session.compact') {
         // Compact: send a compaction request to the agent as a user message
         const sessionKey = (frame as any).sessionKey
@@ -12263,7 +13588,11 @@ export class Gateway {
     // Consume pending first so we can use its authoritative channel/peer/sessionKey
     // instead of trusting the client-supplied frame fields. For the not-found /
     // dead-session branches we fall back to frame.* because we have nothing else.
-    const pending = this._pendingPermissions.get(frame.requestId)
+    let pending = this._pendingPermissions.get(frame.requestId)
+    if (pending) this._pendingPermissions.delete(frame.requestId)
+    if (!pending) {
+      pending = (await this._hydrateDetachedAskUserPending(frame)) ?? undefined
+    }
     if (!pending) {
       // Race: another tab (or our own /stop / timeout path) settled this
       // requestId first. Replay the authoritative behavior from the recent-
@@ -12309,10 +13638,12 @@ export class Gateway {
       }
       return
     }
-    this._pendingPermissions.delete(frame.requestId)
 
     const session = this.sessions.getByKey(pending.sessionKey)
-    if (!session) {
+    if (!session && (isDetachedAskUserPending(pending) || isDetachedAskUserRequestId(frame.requestId))) {
+      // Detached ask_user answers start a new turn via dispatchInbound;
+      // an evicted in-memory session is expected after hours away.
+    } else if (!session) {
       this.log.warn('permission response for dead session', { sessionKey: pending.sessionKey })
       // Session is gone, but tabs still hold the modal — clear them.
       // Record the authoritative deny so any late duplicate rebroadcasts deny.
@@ -12376,7 +13707,92 @@ export class Gateway {
     const response = effectiveBehavior === 'allow'
       ? { behavior: 'allow' as const, updatedInput: forwardedInput, toolUseID: pending.toolUseId }
       : { behavior: 'deny' as const, message: effectiveMessage || 'User denied', toolUseID: pending.toolUseId }
-    const ok = session.runner.sendPermissionResponse(frame.requestId, response)
+    const settledAnswers =
+      effectiveBehavior === 'allow' &&
+      pending.toolName === 'AskUserQuestion' &&
+      forwardedInput !== pending.input &&
+      (forwardedInput as { answers?: unknown }).answers &&
+      typeof (forwardedInput as { answers?: unknown }).answers === 'object'
+        ? ((forwardedInput as { answers: Record<string, string> }).answers)
+        : undefined
+    if (isDetachedAskUserPending(pending) || isDetachedAskUserRequestId(frame.requestId)) {
+      this._recordSettlement(frame.requestId, {
+        behavior: effectiveBehavior,
+        channel: pending.channel,
+        peer: pending.peer,
+        sessionKey: pending.sessionKey,
+        userId: pending.userId,
+        ...(settledAnswers ? { answers: settledAnswers } : {}),
+      })
+      this._broadcastPermissionSettled(pending.peerKey, {
+        sessionKey: pending.sessionKey,
+        channel: pending.channel,
+        peer: pending.peer,
+        requestId: frame.requestId,
+        behavior: effectiveBehavior,
+        reason: 'remote',
+        ...(settledAnswers ? { answers: settledAnswers } : {}),
+      })
+      const answerText = effectiveBehavior === 'allow'
+        ? formatAskUserAnswerMessage(pending.input, settledAnswers ?? {})
+        : undefined
+      const answerId = answerText ? buildDetachedAskUserAnswerMessageId(frame.requestId) : undefined
+      const waiter = this._askUserWaiters?.get(frame.requestId)
+      const inWindow = waiter?.tryAnswer({
+        behavior: effectiveBehavior,
+        answers: settledAnswers,
+        answerText,
+      }) === true
+      if (inWindow) {
+        this._askUserWaiters.delete(frame.requestId)
+        // Patch the tape card so the UI renders "already answered". Do not
+        // append a user-answer row or dispatchInbound — the in-flight turn
+        // consumes the answer via the MCP tool result.
+        void this._patchDetachedAskUserResolved(
+          pending,
+          frame.requestId,
+          {
+            _resolved: true,
+            _behavior: effectiveBehavior,
+            _settledReason: 'remote',
+            ...(settledAnswers ? { _answers: settledAnswers } : {}),
+          },
+        )
+        this.log.info('detached ask_user settled', {
+          requestId: frame.requestId,
+          behavior: effectiveBehavior,
+          startedTurn: false,
+          inWindow: true,
+        })
+        return
+      }
+      void this._patchDetachedAskUserResolved(
+        pending,
+        frame.requestId,
+        {
+          _resolved: true,
+          _behavior: effectiveBehavior,
+          _settledReason: 'remote',
+          ...(settledAnswers ? { _answers: settledAnswers } : {}),
+        },
+        answerText && answerId ? { id: answerId, text: answerText } : undefined,
+      )
+      if (answerText && answerId) {
+        await this._submitDetachedAskUserAnswer(pending, answerText, frame.requestId, answerId)
+      }
+      this.log.info('detached ask_user settled', {
+        requestId: frame.requestId,
+        behavior: effectiveBehavior,
+        startedTurn: effectiveBehavior === 'allow',
+        inWindow: false,
+      })
+      return
+    }
+    if (!session) {
+      this.log.warn('permission response for dead session', { sessionKey: pending.sessionKey })
+      return
+    }
+    let ok = session.runner.sendPermissionResponse(frame.requestId, response)
     this.log.info('permission response', {
       requestId: frame.requestId,
       behavior: effectiveBehavior,
@@ -12399,14 +13815,6 @@ export class Gateway {
     // (without having the user re-enter anything) and the sender tab can
     // reconcile its optimistic state if the gateway-visible answers ever
     // differ from what the tab cached locally.
-    const settledAnswers =
-      effectiveBehavior === 'allow' &&
-      pending.toolName === 'AskUserQuestion' &&
-      forwardedInput !== pending.input &&
-      (forwardedInput as { answers?: unknown }).answers &&
-      typeof (forwardedInput as { answers?: unknown }).answers === 'object'
-        ? ((forwardedInput as { answers: Record<string, string> }).answers)
-        : undefined
     this._recordSettlement(frame.requestId, {
       behavior: effectiveBehavior,
       channel: pending.channel,
@@ -12676,6 +14084,492 @@ export class Gateway {
    *  Used by disconnect / timeout / session-crash paths. Safe to call on
    *  sessions that no longer exist — the runner-response step silently
    *  skips in that case (the subprocess is already gone). */
+  /**
+   * Cursor ask_user: persist the question on the session tape, then wait up
+   * to `waitMs` for an in-turn answer. Omitting waitMs (legacy clients) is
+   * treated as 0 — fully detached, immediate posted. Explicit values are
+   * clamped to 55s, under the 60s MCP tools/call wall. On timeout / client
+   * abort the waiter releases to the existing detached path (later allow →
+   * dispatchInbound). If tryAnswer already won but the HTTP response can no
+   * longer be written, the consumed answer is compensated through that same
+   * dispatchInbound path so it cannot vanish. The HTTP response is always
+   * produced by the waiter timer or a terminal claim — it cannot hang past waitMs.
+   */
+  private async handleEngineAskUser(
+    req: IncomingMessage,
+    res: ServerResponse,
+    targetAgentId: string,
+  ): Promise<void> {
+    if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
+    const body = await this.readBody(req)
+    let parsed: any
+    try {
+      parsed = JSON.parse(body)
+    } catch {
+      return this.sendError(res, 400, 'invalid JSON')
+    }
+    const questions = sanitizeEngineAskUserQuestions(parsed?.questions)
+    if (!questions) {
+      return this.sendError(
+        res,
+        400,
+        'questions invalid: need 1-4 items with question + 2-4 options each',
+      )
+    }
+    const sessionKey = typeof parsed.sessionKey === 'string' ? parsed.sessionKey : ''
+    if (!sessionKey) return this.sendError(res, 400, 'sessionKey required')
+    const session = this.sessions.getByKey(sessionKey)
+    if (!session) return this.sendError(res, 404, 'session not found')
+    if (session.agentId !== targetAgentId) {
+      return this.sendError(res, 409, 'session belongs to another agent')
+    }
+    if (session.providerTag && session.providerTag !== 'cursor') {
+      return this.sendError(res, 409, 'ask_user is only available on the cursor engine')
+    }
+    if (!session.runner.isRunning) {
+      return this.sendError(res, 409, 'no active turn on session')
+    }
+
+    const waitMs = resolveAskUserWaitMs(parsed.waitMs)
+    const deadlineAt = Date.now() + waitMs
+    const input = { questions }
+    const requestId = `ask-user:${randomBytes(16).toString('hex')}`
+    const userId = session.userId ?? 'default'
+    const channel = session.channel
+    const peer = {
+      id: session.peerId,
+      kind: sessionKey.includes(':group:') ? ('group' as const) : ('dm' as const),
+    }
+    const peerKey = Gateway.makePeerKey(userId, channel, peer.id)
+    const expiresAt = Date.now() + Gateway.DETACHED_ASK_USER_TTL_MS
+    if (!this._askUserWaiters) this._askUserWaiters = new Map()
+    const waiter = new AskUserWaiter()
+    this._askUserWaiters.set(requestId, waiter)
+    this._pendingPermissions.set(requestId, {
+      sessionKey,
+      toolName: 'AskUserQuestion',
+      input,
+      peerKey,
+      userId,
+      channel,
+      peer,
+      expiresAt,
+      detachedAskUser: true,
+    })
+
+    let clientGone = false
+    const releaseOnDisconnect = () => {
+      clientGone = true
+      waiter.tryRelease()
+    }
+    req.on('aborted', releaseOnDisconnect)
+    req.on('close', () => {
+      if (!res.headersSent) releaseOnDisconnect()
+    })
+
+    const persistArgs = {
+      requestId,
+      questions,
+      sessionKey,
+      userId,
+      channel,
+      peer,
+      expiresAt,
+      agentId: session.agentId,
+    }
+    const persistP = this._persistDetachedAskUserCard(persistArgs)
+    const persistBudget = Math.max(0, deadlineAt - Date.now())
+    await Promise.race([
+      persistP,
+      new Promise<void>((resolve) => setTimeout(resolve, persistBudget)),
+    ])
+    // Persist-first: the tape row exists (or we hit the waitMs budget) before
+    // the card is shown, so a later patch cannot beat the insert. The persist
+    // promise keeps running if we raced the deadline.
+    void persistP
+    this._sendStampedSessionFrame(sessionKey, peerKey, {
+      type: 'outbound.permission_request',
+      sessionKey,
+      channel,
+      peer,
+      requestId,
+      toolName: 'AskUserQuestion',
+      inputPreview: JSON.stringify(input).slice(0, 400),
+      inputJson: input,
+      expiresAt,
+      detachedAskUser: true,
+    })
+    this.log.info('engine ask_user posted', {
+      requestId,
+      sessionKey,
+      agentId: session.agentId,
+      waitMs,
+    })
+
+    const pendingForWait = { sessionKey, userId, channel, peer }
+    try {
+      const remaining = Math.max(0, deadlineAt - Date.now())
+      waiter.startTimer(remaining)
+      const result = await waiter.wait()
+      this._askUserWaiters.delete(requestId)
+      if (result.status === 'answered') {
+        await this._finishInWindowAskUserWait({
+          req,
+          res,
+          waiter,
+          result,
+          requestId,
+          pending: pendingForWait,
+          clientGone,
+        })
+        return
+      }
+      if (clientGone || askUserHttpUnwritable(req, res)) return
+      this.sendJson(res, 200, buildDetachedAskUserPostedResult(requestId))
+    } catch (err) {
+      waiter.tryRelease()
+      this._askUserWaiters.delete(requestId)
+      this.log.error('engine ask_user wait failed', { requestId }, err as Error)
+      const answered = waiter.getAnswer()
+      if (waiter.getPhase() === 'answered_in_window' && answered) {
+        await this._finishInWindowAskUserWait({
+          req,
+          res,
+          waiter,
+          result: { status: 'answered', answer: answered },
+          requestId,
+          pending: pendingForWait,
+          clientGone,
+        })
+        return
+      }
+      if (clientGone || askUserHttpUnwritable(req, res)) return
+      this.sendJson(res, 200, buildDetachedAskUserPostedResult(requestId))
+    }
+  }
+
+  /**
+   * Deliver an in-window ask_user answer over HTTP, or compensate with the
+   * same dispatchInbound path used after timeout. `tryClaimDelivery` is the
+   * synchronous one-shot so HTTP success and compensation cannot both fire.
+   */
+  private async _finishInWindowAskUserWait(args: {
+    req: IncomingMessage
+    res: ServerResponse
+    waiter: AskUserWaiter
+    result: { status: 'answered'; answer: AskUserWaiterAnswer }
+    requestId: string
+    pending: {
+      sessionKey: string
+      userId: string
+      channel: string
+      peer: { id: string; kind: 'dm' | 'group' }
+    }
+    clientGone: boolean
+  }): Promise<void> {
+    const { req, res, waiter, result, requestId, pending, clientGone } = args
+    const answer = result.answer
+    const httpBlocked = clientGone || askUserHttpUnwritable(req, res)
+
+    if (!httpBlocked) {
+      if (!waiter.tryClaimDelivery()) return
+      try {
+        if (answer.behavior === 'deny') {
+          this.sendJson(res, 200, buildDetachedAskUserSkippedResult(requestId))
+        } else {
+          this.sendJson(res, 200, buildDetachedAskUserAnsweredResult({
+            requestId,
+            answers: answer.answers,
+            answerText: answer.answerText,
+          }))
+        }
+        if (askUserHttpWriteSucceeded(res)) return
+      } catch (err) {
+        this.log.warn('in-window ask_user HTTP write failed', { requestId }, err as Error)
+      }
+      if (answer.behavior === 'allow' && answer.answerText) {
+        try {
+          await this._compensateInWindowAskUserAnswer(pending, requestId, answer)
+        } catch (err) {
+          this.log.error('in-window ask_user compensation failed', { requestId }, err as Error)
+        }
+      }
+      return
+    }
+
+    if (answer.behavior === 'allow' && answer.answerText) {
+      if (!waiter.tryClaimDelivery()) return
+      try {
+        await this._compensateInWindowAskUserAnswer(pending, requestId, answer)
+      } catch (err) {
+        this.log.error('in-window ask_user compensation failed', { requestId }, err as Error)
+      }
+      return
+    }
+    waiter.tryClaimDelivery()
+  }
+
+  /**
+   * In-window answer could not be written back to the MCP HTTP caller.
+   * Reuse the timeout-then-answer path: tape user-answer row + dispatchInbound.
+   */
+  private async _compensateInWindowAskUserAnswer(
+    pending: {
+      sessionKey: string
+      userId: string
+      channel: string
+      peer: { id: string; kind: 'dm' | 'group' }
+    },
+    requestId: string,
+    answer: AskUserWaiterAnswer,
+  ): Promise<void> {
+    if (answer.behavior !== 'allow' || !answer.answerText) return
+    const answerId = buildDetachedAskUserAnswerMessageId(requestId)
+    void this._patchDetachedAskUserResolved(
+      pending,
+      requestId,
+      {
+        _resolved: true,
+        _behavior: 'allow',
+        _settledReason: 'remote',
+        ...(answer.answers ? { _answers: answer.answers } : {}),
+      },
+      { id: answerId, text: answer.answerText },
+    )
+    this.log.info('in-window ask_user compensated via new turn', { requestId })
+    await this._submitDetachedAskUserAnswer(pending, answer.answerText, requestId, answerId)
+  }
+
+  private async _persistDetachedAskUserCard(args: {
+    requestId: string
+    questions: Array<Record<string, unknown>>
+    sessionKey: string
+    userId: string
+    channel: string
+    peer: { id: string; kind: 'dm' | 'group' }
+    expiresAt: number
+    agentId: string
+  }): Promise<void> {
+    const msg = buildDetachedAskUserPersistMessage(args)
+    const sink = getV3MasterSinkOrNull()
+    if (sink) {
+      try {
+        const outcome = await sink.persistOrQueue(buildDetachedAskUserSinkPayload({
+          requestId: args.requestId,
+          questions: args.questions,
+          sessionKey: args.sessionKey,
+          agentId: args.agentId,
+          sessionId: args.peer.id,
+          channel: args.channel,
+          peer: args.peer,
+          expiresAt: args.expiresAt,
+          ts: msg.ts,
+        }))
+        if (outcome.ok) {
+          this.log.info('detached ask_user persist acked via master sink', {
+            requestId: args.requestId,
+          })
+          return
+        }
+        if ('queued' in outcome && outcome.queued) {
+          this.log.error('detached ask_user persist queued for master-sink retry', {
+            requestId: args.requestId,
+            errorClass: outcome.errorClass,
+          })
+          return
+        }
+        this.log.error('detached ask_user persist dropped by master sink', {
+          requestId: args.requestId,
+          reason: 'droppedReason' in outcome ? outcome.droppedReason : 'dropped',
+        })
+      } catch (err) {
+        this.log.error(
+          'detached ask_user persist via master sink failed',
+          { requestId: args.requestId },
+          err as Error,
+        )
+      }
+      return
+    }
+    try {
+      const r = await appendServerAuthoredMessageDurable(args.peer.id, args.userId, msg)
+      if (r.applied || r.reason === 'already_exists') return
+      this.log.error('detached ask_user persist not applied', {
+        requestId: args.requestId,
+        reason: r.reason,
+        ...('error' in r ? { error: r.error } : {}),
+      })
+    } catch (err) {
+      this.log.error('detached ask_user persist failed', { requestId: args.requestId }, err as Error)
+    }
+  }
+
+  private async _patchDetachedAskUserResolved(
+    pending: {
+      peer: { id: string; kind?: 'dm' | 'group' }
+      userId: string
+      sessionKey: string
+      channel?: string
+    },
+    requestId: string,
+    patch: Record<string, unknown>,
+    userAnswer?: { id: string; text: string; ts?: number },
+  ): Promise<void> {
+    const behavior = patch._behavior === 'allow' || patch._behavior === 'deny'
+      ? patch._behavior
+      : 'deny'
+    const settledReason =
+      patch._settledReason === 'remote' ||
+      patch._settledReason === 'already_settled' ||
+      patch._settledReason === 'disconnect' ||
+      patch._settledReason === 'timeout' ||
+      patch._settledReason === 'crashed'
+        ? patch._settledReason
+        : 'remote'
+    const answers =
+      patch._answers && typeof patch._answers === 'object' && !Array.isArray(patch._answers)
+        ? (patch._answers as Record<string, string>)
+        : undefined
+    const sink = getV3MasterSinkOrNull()
+    if (sink) {
+      try {
+        const outcome = await sink.persistOrQueue(buildDetachedAskUserResolvedSinkPayload({
+          requestId,
+          agentId: agentIdFromAskUserSessionKey(pending.sessionKey),
+          sessionId: pending.peer.id,
+          sessionKey: pending.sessionKey,
+          behavior,
+          settledReason,
+          answers,
+          userAnswer,
+        }))
+        if (outcome.ok) {
+          this.log.info('detached ask_user resolved persist acked via master sink', { requestId })
+          return
+        }
+        if ('queued' in outcome && outcome.queued) {
+          this.log.error('detached ask_user resolved persist queued for master-sink retry', {
+            requestId,
+            errorClass: outcome.errorClass,
+          })
+          return
+        }
+        this.log.error('detached ask_user resolved persist dropped by master sink', {
+          requestId,
+          reason: 'droppedReason' in outcome ? outcome.droppedReason : 'dropped',
+        })
+      } catch (err) {
+        this.log.error(
+          'detached ask_user resolved persist via master sink failed',
+          { requestId },
+          err as Error,
+        )
+      }
+      return
+    }
+    try {
+      const r = await patchServerAuthoredMessage(pending.peer.id, pending.userId, requestId, patch)
+      if (!r.applied) {
+        this.log.error('detached ask_user tape patch not applied', {
+          requestId,
+          reason: r.reason,
+        })
+      }
+    } catch (err) {
+      this.log.error('detached ask_user tape patch failed', { requestId }, err as Error)
+    }
+    if (!userAnswer) return
+    try {
+      const r = await appendServerAuthoredMessageDurable(pending.peer.id, pending.userId, {
+        id: userAnswer.id,
+        role: 'user',
+        text: userAnswer.text,
+        ts: userAnswer.ts ?? Date.now(),
+      })
+      if (r.applied || r.reason === 'already_exists') return
+      this.log.error('detached ask_user answer persist not applied', {
+        requestId,
+        reason: r.reason,
+        ...('error' in r ? { error: r.error } : {}),
+      })
+    } catch (err) {
+      this.log.error('detached ask_user answer persist failed', { requestId }, err as Error)
+    }
+  }
+
+  private async _loadDetachedAskUserCard(
+    sessionId: string,
+    userId: string,
+    requestId: string,
+  ): Promise<Record<string, unknown> | null> {
+    if (getV3MasterSinkOrNull() || readV3MasterSinkConfig()) {
+      return fetchAskUserPermissionCard({ sessionId, requestId })
+    }
+    const sess = await getClientSession(sessionId, userId)
+    const hot = findDetachedAskUserCardInMessages(sess?.messages, requestId)
+    if (hot) return hot
+    let beforeSeq = 0
+    for (let pageNo = 0; pageNo < 16; pageNo++) {
+      const page = await readArchivedMessages(sessionId, userId, beforeSeq, 200)
+      const archived = findDetachedAskUserCardInMessages(page.messages, requestId)
+      if (archived) return archived
+      if (!page.hasMore || page.oldestSeq == null) break
+      beforeSeq = page.oldestSeq
+    }
+    return null
+  }
+
+  private async _hydrateDetachedAskUserPending(frame: {
+    requestId: string
+    channel: string
+    peer: { id: string; kind: 'dm' | 'group' }
+    /** Stashed by the WS entrypoint from the authenticated connection, never
+     *  from the client frame — this is the only user identity we can trust
+     *  once the in-memory pending entry is gone (restart / TTL rebuild). */
+    _userId?: unknown
+  }): Promise<ReturnType<typeof pendingFromDetachedAskUserMessage>> {
+    if (!isDetachedAskUserRequestId(frame.requestId)) return null
+    const userId = typeof frame._userId === 'string' && frame._userId ? frame._userId : 'default'
+    try {
+      const msg = await this._loadDetachedAskUserCard(frame.peer.id, userId, frame.requestId)
+      if (!msg) return null
+      return pendingFromDetachedAskUserMessage(msg, {
+        userId,
+        channel: frame.channel,
+        peer: frame.peer,
+        peerKey: Gateway.makePeerKey(userId, frame.channel, frame.peer.id),
+      })
+    } catch (err) {
+      this.log.error('detached ask_user hydrate failed', { requestId: frame.requestId }, err as Error)
+      return null
+    }
+  }
+
+  private async _submitDetachedAskUserAnswer(
+    pending: {
+      sessionKey: string
+      userId: string
+      channel: string
+      peer: { id: string; kind: 'dm' | 'group' }
+    },
+    text: string,
+    requestId: string,
+    clientMessageId: string = buildDetachedAskUserAnswerMessageId(requestId),
+  ): Promise<void> {
+    const agentId = agentIdFromAskUserSessionKey(pending.sessionKey)
+    await this.dispatchInbound({
+      type: 'inbound.message',
+      channel: pending.channel,
+      peer: pending.peer,
+      agentId,
+      content: { text },
+      ts: Date.now(),
+      idempotencyKey: `ask-user-answer:${requestId}`,
+      clientMessageId,
+      _userId: pending.userId,
+    } as any)
+  }
+
   private _forceDenyPendingPermission(
     requestId: string,
     reason: 'disconnect' | 'timeout' | 'crashed',
@@ -12684,8 +14578,12 @@ export class Gateway {
     const pending = this._pendingPermissions.get(requestId)
     if (!pending) return false
     this._pendingPermissions.delete(requestId)
+    // Unblock a held ask_user HTTP waiter (if any) before anything that could
+    // throw, so it never hangs to the 60s MCP tools/call wall.
+    this._askUserWaiters?.get(requestId)?.tryRelease()
+    this._askUserWaiters?.delete(requestId)
     const session = this.sessions.getByKey(pending.sessionKey)
-    if (session) {
+    if (session && !isDetachedAskUserPending(pending)) {
       // sendPermissionResponse swallows its own errors and returns false if
       // the subprocess is gone — `false` is expected on crash/exit paths.
       const ok = session.runner.sendPermissionResponse(requestId, {
@@ -12697,6 +14595,13 @@ export class Gateway {
         requestId,
         reason,
         runnerAccepted: ok,
+      })
+    }
+    if (isDetachedAskUserPending(pending)) {
+      void this._patchDetachedAskUserResolved(pending, requestId, {
+        _resolved: true,
+        _behavior: 'deny',
+        _settledReason: reason,
       })
     }
     // Record authoritative 'deny' so a late duplicate response (from a
@@ -12722,11 +14627,33 @@ export class Gateway {
     return true
   }
 
+  /**
+   * Reap ordinary pending permission requests after a session crash so the
+   * map does not leak and connected tabs dismiss their stuck modal.
+   *
+   * Detached ask_user cards are the exception: they are not bound to the
+   * subprocess lifetime. The card stays answerable for 24h even after crash,
+   * turn end, or session eviction; the user's answer is delivered as a later
+   * inbound message (possibly to a new session). Same contract as
+   * `_autoDenyPendingPermissions` and `_sweepStalePendingPermissions`.
+   */
+  private _reapCrashedSessionPendingPermissions(sessionKey: string): void {
+    const pendingToReap: string[] = []
+    for (const [requestId, pending] of this._pendingPermissions) {
+      if (isDetachedAskUserPending(pending)) continue
+      if (pending.sessionKey === sessionKey) pendingToReap.push(requestId)
+    }
+    for (const requestId of pendingToReap) {
+      this._forceDenyPendingPermission(requestId, 'crashed', 'Session crashed')
+    }
+  }
+
   /** Auto-deny all pending permission requests associated with a peerKey (on disconnect) */
   private _autoDenyPendingPermissions(peerKey: string): void {
     // Snapshot requestIds first — the helper mutates _pendingPermissions.
     const requestIds: string[] = []
     for (const [requestId, pending] of this._pendingPermissions) {
+      if (pending.detachedAskUser) continue
       if (pending.peerKey === peerKey) requestIds.push(requestId)
     }
     for (const requestId of requestIds) {
@@ -12741,6 +14668,11 @@ export class Gateway {
     const now = Date.now()
     const toExpire: Array<{ requestId: string; reason: 'timeout' | 'crashed' }> = []
     for (const [requestId, pending] of this._pendingPermissions) {
+      if (isDetachedAskUserPending(pending)) {
+        // 24h TTL only. Turn end / session eviction must not kill the card.
+        if (now >= pending.expiresAt) toExpire.push({ requestId, reason: 'timeout' })
+        continue
+      }
       if (now >= pending.expiresAt) {
         toExpire.push({ requestId, reason: 'timeout' })
       } else if (!this.sessions.getByKey(pending.sessionKey)) {
@@ -12956,6 +14888,15 @@ export class Gateway {
           if (replay.sent.length > 0) {
             outboundRingReplayHitTotal.inc()
             for (const f of replay.sent) {
+              try {
+                const parsed = JSON.parse(f.data) as { type?: unknown; clientMessageId?: unknown }
+                if (
+                  !isClientMessageId(parsed.clientMessageId)
+                  && (parsed.type === 'outbound.message' || parsed.type === 'outbound.error')
+                ) {
+                  continue
+                }
+              } catch { /* non-JSON ring payload still delivered */ }
               try { ws.send(f.data) } catch { break }
             }
             this.log.info('resume replay served', {
@@ -13048,7 +14989,9 @@ export class Gateway {
         if (session._runningClientMessageId === inFlightCmid) {
           // no-op:该 turn 仍在飞,前端会收到重播的流式帧。
         } else {
-          const outcome = lookupRecentTerminal(session, inFlightCmid)
+          const outcome = lookupRecentTerminal(session, inFlightCmid, {
+            masterAuthoritative: readV3MasterSinkConfig() !== null,
+          })
           // 合成帧一律携带 clientMessageId(reducer 按 exact id 归属;绝不误清别的 user 行)。
           const basePeer = { id: peerId, kind: 'dm' as const }
           try {
@@ -13487,6 +15430,11 @@ export class Gateway {
     //   allowlist 抽到文件顶部 export 便于 unit test + 后续加模型集中改一处。
     // 已在 inferAgentForModel 路由前算过(safeModelForRouting),此处复用避免重复。
     const safeModel: string | undefined = safeModelForRouting
+    const _frameModelSwitchId = (frame as any).modelSwitchId
+    const safeModelSwitchId: string | undefined =
+      typeof _frameModelSwitchId === 'string' && /^[A-Za-z0-9:_-]{8,128}$/.test(_frameModelSwitchId)
+        ? _frameModelSwitchId
+        : undefined
 
     const _frameConversationMode = (frame as any).conversationMode
     const safeConversationMode: 'default' | 'plan' | undefined =
@@ -13550,6 +15498,20 @@ export class Gateway {
           }
         : {}),
     })
+    const safeZcodeRoute = _buildSafeZcodeRouteOverride({
+      agent,
+      model: safeModelForRouting,
+      rawRoute: (frame as any).__oc_zcode_route,
+      officialRelayPort: this.deps.config.gateway.port,
+      ...(turnAuthority !== undefined
+        ? {
+            authority: {
+              canonicalModel: turnAuthority.canonicalModel,
+              engine: turnAuthority.engine,
+            },
+          }
+        : {}),
+    })
 
     const baseToolsets = agent.toolsets ?? this.deps.config.defaults.toolsets
     let effectiveToolsets = mergeOnDemandToolsets(
@@ -13578,7 +15540,18 @@ export class Gateway {
           agent: effectiveAgent,
           kind: 'turn',
           model: safeModel,
+          // 无票且帧上没有合法 model:catalog 拉完后再读存活 runner,沿用其 model/engine。
+          // 有 safeModel(用户换模型 / 普通带 model 消息)时不取样 —— 行为与原来一致。
+          resolveLiveSessionModel:
+            safeModel === undefined
+              ? () => readLiveRunnerModel(this.sessions.getByKey(sessionKey))
+              : undefined,
+          resolveLiveSessionSkipReason:
+            safeModel === undefined
+              ? () => liveSessionReuseSkipReason(this.sessions.getByKey(sessionKey))
+              : undefined,
           defaultModel: this.deps.config.defaults.model,
+          warn: (message, fields) => this.log.warn(message, { sessionKey, ...fields }),
         })
       } catch (err) {
         const mapped = this._mapLocalExecutionError(err)
@@ -13626,6 +15599,7 @@ export class Gateway {
       // 触发 engine teardown + compact transcript preamble;同 engine 内的模型
       // 切换仍由 submit() 的 setModel + shutdown 处理。
       model: safeModel,
+      ...(safeModelSwitchId ? { modelSwitchId: safeModelSwitchId } : {}),
       // 无 envelope 的本地 inbound:catalog 投影就是本 turn 的权威(canonicalModel + engine)。
       // flag 未开 → localExec 恒 undefined → 展开为 {},行为零变化。
       ...localExecutionOverride(localExec),
@@ -14385,7 +16359,11 @@ export class Gateway {
         members.length > 0
           ? members
               .map((a) => {
-                const model = a.model ? `${a.model}` : '默认模型'
+                const model = a.model
+                  ? a.model === AGENT_MODEL_AUTO
+                    ? '任意模型'
+                    : `${a.model}`
+                  : '默认模型'
                 const provider = a.provider || '继承全局'
                 return `- \`${a.id}\`${a.displayName ? `（${a.displayName}）` : ''} [${model}, ${provider}]${teamMemberCapabilityHint(a)}`
               })
@@ -14401,15 +16379,15 @@ export class Gateway {
         '- 你是队长，也是完成用户任务的第一负责人；从任务拆解、是否委派到最终答复，都由你端到端负责。',
         '- 领域匹配优先于泛泛并行：用户任务明显属于某个已安装成员的领域时，优先把对应部分委派给该成员；多领域任务则拆给对应成员后由你综合。常见路由：代码/调试/测试/重构/代码库 → `coding-assistant`；科研/文献/论文/引用/学术分析 → `research-assistant`；文档/PPT/Excel/PDF/周报/公文/邮件/办公交付 → `office-assistant`。如果对应成员未安装，你可以自己完成或选择最接近的已安装成员。',
         '- 需要多个成员协作的复杂任务：先用 `TodoWrite` 列出一份简明的拆解计划（每一步派给谁、预期产出什么），再照计划委派；简单任务无需列计划，直接做即可。',
-        '- 任务复杂、可拆解 → **首选**用 `delegate_task(goal, agentId, context)` 委派子任务给上面列出的已安装成员组队，拿到各成员结果后你综合成给用户的最终答案；任务简单则直接自己完成。',
-        '- 多个**互相独立、可同时进行**的子任务 → 用 `delegate_tasks`（tasks 列表，单次最多 4 个）一次性并行派发，比逐个 `delegate_task` 更快拿齐结果；若子任务之间有先后依赖（B 要用到 A 的产出），仍用 `delegate_task` 分步串行。',
+        '- 任务复杂、可拆解 → **首选**同步委派给上面列出的已安装成员组队，拿到各成员结果后你综合成给用户的最终答案；任务简单则直接自己完成。CCB/Codex 用 MCP `delegate_task(goal, agentId, context)`；Cursor 用 Bash `oc-memory delegate --goal "..."`（阻塞到结束，不要走 MCP）。',
+        '- 多个**互相独立、可同时进行**的子任务 → CCB/Codex 用 `delegate_tasks`（tasks 列表，单次最多 4 个）；Cursor 在同一回合并发多条 `oc-memory delegate`。若子任务之间有先后依赖（B 要用到 A 的产出），仍串行。',
         '- 按子任务量级选 `effort`：机械/简单子任务填 `low`，常规填 `medium`，攻坚/高难度填 `high`；拿不准就不填（用该成员默认档位），不要把简单活儿也开到 `high` 徒增开销与耗时。',
         '- 成员的大产物（完整代码/长文档/数据文件）会以「文件路径 + 摘要」的形式回传（大产物落在共享目录 `/home/agent/.openclaude/generated/`）；你综合最终答案时，需要完整内容就用 `Read` 按回传的路径读回来，别只凭摘要臆测。',
-        '- 委派**只走 `delegate_task` / `delegate_tasks`**：这是平台唯一的组队/委派通道（有实时进度回传、计费与资源约束）。平台已停用 codex 原生 `Agent`/子进程编排，不存在这样的工具，不要尝试启动；需要拆分的子任务一律用这两个工具，不确定或不适合委派时就自己完成。',
+        '- 委派只走平台通道（有实时进度回传、计费与资源约束）：CCB/Codex 用 MCP `delegate_task` / `delegate_tasks`；Cursor 用 Bash `oc-memory delegate`（MCP `delegate_task` 在 Cursor 上已关闭）。平台已停用 codex 原生 `Agent`/子进程编排，不要尝试启动；不确定或不适合委派时就自己完成。',
         // 队长自主送审(2026-07-07 boss 裁决):审查触发权在队长,prompt 纪律强引导
         // "除明显简单任务外都送审"。平台侧保证 = request_review 通道 + hidden guard
         // 熔断(≤3/turn)+ 团队门;不再有 gateway 硬编排兜底(已整体退役)。
-        '- 质量审查（重要纪律）：写给用户的最终答复**之前**，先用 `request_review(draft)` 把准备提交的完整答复草稿送独立审查员——**草稿只放在工具参数里，不要先写进正文**。除非任务明显简单（单一事实问答、寒暄、无实质交付物），否则都必须送审。拿到 `VERDICT: PASS` 再输出最终答复；`NEEDS_FIX` 就修订草稿后再送审一次（对误报可在修订说明中据理反驳）。审查是内部流程：最终答复不要复述审查意见、不要致歉。送审有每轮次数上限，达到上限时直接输出你当前最优的最终答复。',
+        '- 质量审查（重要纪律）：写给用户的最终答复**之前**，先把准备提交的完整答复草稿送独立审查员——**草稿只放在工具/命令参数里，不要先写进正文**。CCB/Codex 用 MCP `request_review(draft)`；Cursor 用 `oc-memory request-review --draft "..."`。除非任务明显简单（单一事实问答、寒暄、无实质交付物），否则都必须送审。拿到 `VERDICT: PASS` 再输出最终答复；`NEEDS_FIX` 就修订草稿后再送审一次（对误报可在修订说明中据理反驳）。审查是内部流程：最终答复不要复述审查意见、不要致歉。送审有每轮次数上限，达到上限时直接输出你当前最优的最终答复。',
         '',
         '用户任务：',
         '',
@@ -14787,6 +16765,7 @@ export class Gateway {
           ...(e.terminalCode ? { terminalCode: e.terminalCode } : {}),
           durationMs: e.durationMs,
           ...(e.usage ? { usage: e.usage } : {}),
+          ...(e.cursorSlotResults && e.cursorSlotResults.length ? { cursorSlotResults: e.cursorSlotResults } : {}),
         }
         this.deliver(billingFrame, adapter)
       } else if (e.kind === 'error') {
@@ -14870,7 +16849,9 @@ export class Gateway {
       historicalMessages: masterHistoricalMessages,
       codexRoute: safeCodexRoute,
       grokRoute: safeGrokRoute,
+      zcodeRoute: safeZcodeRoute,
       ...(automaticRetryState ? { automaticRetryState } : {}),
+      ...(safeModelSwitchId ? { modelSwitchId: safeModelSwitchId } : {}),
       // DispatchTurnContext(uid/…)→ sessionManager 逻辑键形状(userId/…)。
       ...(turnDispatchContext
         ? {
@@ -15497,10 +17478,17 @@ export function _buildEngineErrorFrame(
  */
 export function _turnStatusWireFields(
   phase: GatewayTurnPhase,
-): { status: 'compacting' | null } | { status: 'retrying'; retry: TurnRetryMeta } {
-  return phase && typeof phase === 'object'
-    ? { status: 'retrying', retry: phase.retry }
-    : { status: phase }
+):
+  | { status: 'compacting' | null }
+  | { status: 'retrying'; retry: TurnRetryMeta }
+  | { status: 'working'; detail?: string } {
+  if (phase && typeof phase === 'object') {
+    if (phase.status === 'working') {
+      return phase.detail ? { status: 'working', detail: phase.detail } : { status: 'working' }
+    }
+    return { status: 'retrying', retry: phase.retry }
+  }
+  return { status: phase }
 }
 
 /**
@@ -15513,6 +17501,14 @@ export function _buildTurnStatusFrame(
   phase: GatewayTurnPhase,
 ): OutboundTurnStatus & { _userId?: string } {
   if (phase && typeof phase === 'object') {
+    if (phase.status === 'working') {
+      return {
+        type: 'outbound.turn_status',
+        ...routing,
+        status: 'working',
+        ...(phase.detail ? { detail: phase.detail } : {}),
+      }
+    }
     return { type: 'outbound.turn_status', ...routing, status: 'retrying', retry: phase.retry }
   }
   return { type: 'outbound.turn_status', ...routing, status: phase }
@@ -15560,6 +17556,29 @@ export function _earlyRejectErrorFrames(args: {
     _userId: args.userId,
   }
   return [structured, legacyFinal] as const
+}
+
+/**
+ * GET /api/sessions 的 live/内存会话列表过滤。
+ *
+ * 巡检 key 必须走 `isPatrolSessionKey`(CORRECTIONS §1.3/§1.4):kind 段是
+ * `taskboard`,若只排除 `delegate`,default 用户会把 stageId 误当成 peerId 放进
+ * 侧栏。内部委派同样不是用户聊天会话。
+ */
+export function filterUserVisibleLiveSessions<T extends { sessionKey: string }>(
+  sessions: readonly T[],
+  ownedIds: ReadonlySet<string>,
+  userId: string,
+): T[] {
+  return sessions.filter((s) => {
+    if (isPatrolSessionKey(s.sessionKey)) return false
+    // 排除内部委派会话：它们不是用户聊天会话，不能经此 API 泄露（Codex 审）。
+    // key 形如 agent:<id>:delegate:...（第 3 段区分）。
+    const kind = s.sessionKey.split(':')[2] || ''
+    if (kind === 'delegate') return false
+    const peerId = s.sessionKey.split(':')[4] || ''
+    return ownedIds.has(peerId) || (userId === 'default' && !peerId.startsWith('web-'))
+  })
 }
 
 // ── 长会话热尾巴 + 归档 (Agent B §2) — pure helpers(`_` 前缀 test seam)──
@@ -15705,6 +17724,74 @@ export function _shouldPushTurnInterruptedFinal(
   if ((engineTurnCount ?? 0) > 0) return false
   if ((clientTurnCount ?? 0) > 0) return false
   return true
+}
+
+// ── Engine ask_user bridge (cursor MCP) input sanitizer ──
+
+/** Settlement payload handed back to the waiting MCP ask_user HTTP caller. */
+export type EngineAskUserSettlement = {
+  status: 'answered' | 'skipped' | 'posted'
+  answers?: Record<string, string>
+  reason?: string
+  requestId?: string
+  message?: string
+}
+
+/**
+ * Server-side validator for the engine ask_user bridge. The MCP client is not
+ * trusted: clamp counts/lengths and strip unknown keys before the questions
+ * enter a pending-permission payload that the web renders (and that
+ * sanitizeAskUserQuestionUpdatedInput later keys answers against). Mirrors the
+ * MCP-side normalizer in packages/mcp-memory toolDefs.ts — two copies on
+ * purpose: different packages, different trust domains, no shared dependency.
+ *
+ * Returns the normalized product-shape questions array, or null when the input
+ * is structurally unusable.
+ */
+export function sanitizeEngineAskUserQuestions(
+  raw: unknown,
+): Array<Record<string, unknown>> | null {
+  if (!Array.isArray(raw) || raw.length === 0 || raw.length > 4) return null
+  const questions: Array<Record<string, unknown>> = []
+  for (const item of raw) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return null
+    const question = (item as { question?: unknown }).question
+    if (
+      typeof question !== 'string' ||
+      question.trim().length === 0 ||
+      question.length > 2000
+    ) {
+      return null
+    }
+    const optionsRaw = (item as { options?: unknown }).options
+    if (!Array.isArray(optionsRaw) || optionsRaw.length < 2 || optionsRaw.length > 4) return null
+    const options: Array<Record<string, unknown>> = []
+    for (const opt of optionsRaw) {
+      if (!opt || typeof opt !== 'object' || Array.isArray(opt)) return null
+      const label = (opt as { label?: unknown }).label
+      if (typeof label !== 'string' || label.trim().length === 0 || label.length > 300) {
+        return null
+      }
+      const description = (opt as { description?: unknown }).description
+      options.push({
+        label,
+        ...(typeof description === 'string' &&
+        description.length > 0 &&
+        description.length <= 1000
+          ? { description }
+          : {}),
+      })
+    }
+    const header = (item as { header?: unknown }).header
+    const multiSelect = (item as { multiSelect?: unknown }).multiSelect
+    questions.push({
+      question,
+      ...(typeof header === 'string' && header.length > 0 ? { header: header.slice(0, 12) } : {}),
+      ...(multiSelect === true ? { multiSelect: true } : {}),
+      options,
+    })
+  }
+  return questions
 }
 
 // ── AskUserQuestion updatedInput sanitizer ──
@@ -16374,8 +18461,13 @@ export { shouldServeInline }
 /** Known route prefixes for metrics normalization (avoids high-cardinality labels). */
 const KNOWN_ROUTES = [
   '/api/healthz', '/api/doctor', '/api/usage', '/api/usage/events',
-  '/api/runs', '/api/sessions', '/api/config', '/api/agents', '/api/search',
-  '/api/cron', '/api/tasks', '/api/tasks-executions', '/api/webhooks',
+  '/api/runs', '/api/sessions', '/api/sessions/list', '/api/sessions/search', '/api/sessions/batch',
+  '/api/sessions/read-all',
+  '/api/chat-projects', '/api/project-assets', '/api/config', '/api/agents', '/api/search',
+  '/api/cron', '/api/board', '/api/board/projects', '/api/board/tickets',
+  '/api/board/pipelines', '/api/board/agents', '/api/board/settings',
+  '/api/board/stats/cost', '/api/board/templates', '/api/board/reports/weekly',
+  '/api/delegate/wait', '/api/tasks', '/api/tasks-executions', '/api/webhooks',
   '/api/wechat/pair/start', '/api/wechat/pair/poll', '/api/wechat/pair/cancel',
   '/api/wechat/binding', '/api/wechat/binding/status',
   '/api/auth/session', '/api/auth/logout', '/api/auth/claude/start',
@@ -16389,11 +18481,25 @@ function normalizePath(p: string): string {
   if (KNOWN_ROUTES.includes(p)) return p
   // Dynamic API routes — normalize IDs
   const normalized = p
+    .replace(/\/api\/sessions\/[a-zA-Z0-9_-]+\/read$/, '/api/sessions/:id/read')
     .replace(/\/api\/agents\/[a-zA-Z0-9_-]+\/skills\/[a-z0-9-]+/, '/api/agents/:id/skills/:name')
     .replace(/\/api\/skills\/[a-z0-9-]+/, '/api/skills/:name')
     .replace(/\/api\/agents\/[a-zA-Z0-9_-]+\/([a-z]+)/, '/api/agents/:id/$1')
     .replace(/\/api\/agents\/[a-zA-Z0-9_-]+/, '/api/agents/:id')
     .replace(/\/api\/cron\/[a-zA-Z0-9_-]+/, '/api/cron/:id')
+    .replace(/\/api\/chat-projects\/[a-zA-Z0-9_-]+/, '/api/chat-projects/:id')
+    .replace(/\/api\/project-assets\/[a-zA-Z0-9_-]+/, '/api/project-assets/:id')
+    .replace(/\/api\/board\/projects\/[^/]+\/board/, '/api/board/projects/:id/board')
+    .replace(/\/api\/board\/projects\/[^/]+/, '/api/board/projects/:id')
+    .replace(/\/api\/board\/tickets\/[^/]+\/[a-z_]+/, '/api/board/tickets/:id/:action')
+    .replace(/\/api\/board\/tickets\/[^/]+/, '/api/board/tickets/:id')
+    .replace(/\/api\/board\/pipelines\/[^/]+\/stages/, '/api/board/pipelines/:id/stages')
+    .replace(/\/api\/board\/pipelines\/[^/]+/, '/api/board/pipelines/:id')
+    .replace(/\/api\/board\/stages\/[^/]+/, '/api/board/stages/:id')
+    .replace(/\/api\/board\/runs\/[^/]+/, '/api/board/runs/:id')
+    .replace(/\/api\/board\/relations\/[^/]+/, '/api/board/relations/:id')
+    .replace(/\/api\/board\/templates\/[^/]+\/apply/, '/api/board/templates/:id/apply')
+    .replace(/\/api\/board\/templates\/[^/]+/, '/api/board/templates/:id')
     .replace(/\/api\/tasks\/[a-zA-Z0-9_-]+/, '/api/tasks/:id')
     .replace(/\/api\/webhooks\/[a-zA-Z0-9_-]+/, '/api/webhooks/:id')
     .replace(/\/api\/media\/.+/, '/api/media/:file')

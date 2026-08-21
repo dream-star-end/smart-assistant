@@ -21,7 +21,7 @@
 import { describe, test, beforeEach, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join as pathJoin } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -38,6 +38,7 @@ import {
   v3CodexVolumeNameFor,
   v3UserLocalVolumeNameFor,
   v3UserConfigVolumeNameFor,
+  lookupContainerUserRole,
   resolveCcbBaselineMounts,
   resolveV5CursorAuthMount,
   V3_CCB_BASELINE_SKILL_NAMES,
@@ -312,6 +313,11 @@ class FakePool {
   setHostMax(hostUuid: string, max: number | null): void {
     this.hostMax.set(hostUuid, max);
   }
+  /** provision 读 users.role；缺省 user。 */
+  userRoles: Map<string, "user" | "admin"> = new Map();
+  setUserRole(uid: number | string, role: "user" | "admin"): void {
+    this.userRoles.set(String(uid), role);
+  }
 
   async connect(): Promise<PoolClient> {
     const log = this.clientLog;
@@ -486,6 +492,11 @@ class FakePool {
             rowCount: 1,
             rows: [{ active: String(active), max_containers: max }],
           };
+        }
+        if (/SELECT role FROM users WHERE id = \$1::bigint LIMIT 1/i.test(trimmed)) {
+          const uid = String(params![0]);
+          const role = self.userRoles.get(uid) ?? "user";
+          return { rowCount: 1, rows: [{ role }] };
         }
         throw new Error(`FakePool: unhandled SQL: ${trimmed.slice(0, 200)}`);
       },
@@ -2894,6 +2905,8 @@ function makeFakeBaseline(withAllSkillMd = true): { dir: string; cleanup: () => 
   const dir = mkdtempSync(pathJoin(tmpdir(), "ccb-baseline-test-"));
   writeFileSync(pathJoin(dir, "AGENTS.md"), "# test codex baseline\n", { mode: 0o644 });
   writeFileSync(pathJoin(dir, "CLAUDE.md"), "# test baseline\n", { mode: 0o644 });
+  writeFileSync(pathJoin(dir, "AGENTS.admin.md"), "# test admin codex baseline\n", { mode: 0o644 });
+  writeFileSync(pathJoin(dir, "CLAUDE.admin.md"), "# test admin baseline\n", { mode: 0o644 });
   mkdirSync(pathJoin(dir, "skills"), { mode: 0o755 });
   for (const [idx, name] of V3_CCB_BASELINE_SKILL_NAMES.entries()) {
     mkdirSync(pathJoin(dir, "skills", name), { mode: 0o755 });
@@ -2912,6 +2925,19 @@ function makeFakeBaseline(withAllSkillMd = true): { dir: string; cleanup: () => 
     cleanup: () => rmSync(dir, { recursive: true, force: true }),
   };
 }
+
+describe("lookupContainerUserRole", () => {
+  test("defaults to user when role missing", async () => {
+    const pool = new FakePool();
+    assert.equal(await lookupContainerUserRole(pool as unknown as Pool, 3), "user");
+  });
+  test("returns admin only for users.role=admin", async () => {
+    const pool = new FakePool();
+    pool.setUserRole(3, "admin");
+    assert.equal(await lookupContainerUserRole(pool as unknown as Pool, 3), "admin");
+    assert.equal(await lookupContainerUserRole(pool as unknown as Pool, 9), "user");
+  });
+});
 
 describe("resolveCcbBaselineMounts", () => {
   // R3 codex HIGH#2 防回归:PR3 加基线 skill 时,新目录必须真的存在于仓库里
@@ -2934,6 +2960,18 @@ describe("resolveCcbBaselineMounts", () => {
       existsSync(pathJoin(baselineDir, "CLAUDE.md")),
       `shipped baseline CLAUDE.md missing at ${baselineDir}`,
     );
+    assert.ok(
+      existsSync(pathJoin(baselineDir, "AGENTS.admin.md")),
+      `shipped baseline AGENTS.admin.md missing at ${baselineDir}`,
+    );
+    assert.ok(
+      existsSync(pathJoin(baselineDir, "CLAUDE.admin.md")),
+      `shipped baseline CLAUDE.admin.md missing at ${baselineDir}`,
+    );
+    const adminClaude = readFileSync(pathJoin(baselineDir, "CLAUDE.admin.md"), "utf8");
+    const adminAgents = readFileSync(pathJoin(baselineDir, "AGENTS.admin.md"), "utf8");
+    assert.ok(!adminClaude.includes("你不做什么"), "admin CLAUDE.md must not inject 你不做什么");
+    assert.ok(!adminAgents.includes("不是平台管理员"), "admin AGENTS.md must not call the user a non-admin");
     const skillsDir = pathJoin(baselineDir, "skills");
     assert.ok(
       statSync(skillsDir).isDirectory(),
@@ -2951,6 +2989,23 @@ describe("resolveCcbBaselineMounts", () => {
     for (const name of V3_CCB_BASELINE_SKILL_NAMES) {
       const mdPath = pathJoin(skillsDir, name, "SKILL.md");
       assert.ok(existsSync(mdPath), `shipped baseline missing ${name}/SKILL.md at ${mdPath}`);
+    }
+  });
+
+  test("(root only) admin flag mounts *.admin.md instead of tenant rules", () => {
+    const b = makeFakeBaseline();
+    if (!b) return;
+    try {
+      const user = resolveCcbBaselineMounts(b.dir);
+      const admin = resolveCcbBaselineMounts(b.dir, { admin: true });
+      assert.ok(user && admin);
+      assert.equal(user!.claudeMdHostPath, pathJoin(b.dir, "CLAUDE.md"));
+      assert.equal(user!.agentsMdHostPath, pathJoin(b.dir, "AGENTS.md"));
+      assert.equal(admin!.claudeMdHostPath, pathJoin(b.dir, "CLAUDE.admin.md"));
+      assert.equal(admin!.agentsMdHostPath, pathJoin(b.dir, "AGENTS.admin.md"));
+      assert.equal(user!.skillsDirHostPath, admin!.skillsDirHostPath);
+    } finally {
+      b.cleanup();
     }
   });
 

@@ -59,6 +59,14 @@ set -eu
 printf '%s\\n' "$HOME" > "$OC_CURSOR_TEST_CAPTURE/home"
 printf '%s\\n' "$@" > "$OC_CURSOR_TEST_CAPTURE/argv"
 printf '%s\\n' "\${OPENCLAUDE_CURSOR_MCP_CONFIG-unset}" > "$OC_CURSOR_TEST_CAPTURE/mcp-env"
+printf '%s\\n' "\${OPENCLAUDE_CURSOR_RESUME_ID-unset}" > "$OC_CURSOR_TEST_CAPTURE/resume-env"
+if [ -L "$HOME/.config/cursor/chats" ]; then
+  readlink "$HOME/.config/cursor/chats" > "$OC_CURSOR_TEST_CAPTURE/chats-link"
+elif [ -e "$HOME/.config/cursor/chats" ]; then
+  printf '%s\\n' "not-symlink" > "$OC_CURSOR_TEST_CAPTURE/chats-link"
+else
+  printf '%s\\n' "missing" > "$OC_CURSOR_TEST_CAPTURE/chats-link"
+fi
 if [ -f "$HOME/.cursor/mcp.json" ]; then
   /bin/cp "$HOME/.cursor/mcp.json" "$OC_CURSOR_TEST_CAPTURE/mcp.json"
 fi
@@ -68,6 +76,11 @@ if [ -f "$HOME/.cursor/hooks.json" ]; then
 fi
 /bin/mkdir -p "$HOME/.config/cursor"
 printf '%s\\n' "\${CURSOR_API_KEY}" > "$HOME/.config/cursor/auth.json"
+printf '%s\\n' "\${CURSOR_API_KEY}" > "$OC_CURSOR_TEST_CAPTURE/key"
+if [ -n "\${OC_CURSOR_TEST_FAIL_ON_KEY:-}" ] && [ "\${CURSOR_API_KEY}" = "\${OC_CURSOR_TEST_FAIL_ON_KEY}" ]; then
+  printf '%s\\n' '{"type":"result","subtype":"error_during_execution","error":"injected"}'
+  exit 1
+fi
 if [ "\${OC_CURSOR_TEST_SLEEP:-0}" = 1 ]; then
   trap 'printf term > "$OC_CURSOR_TEST_CAPTURE/term"; exit 143' TERM
   while :; do sleep 1; done
@@ -96,8 +109,9 @@ printf '%s\\n' '{"type":"result","subtype":"success","usage":{"inputTokens":1,"o
       `cursor_bin=${fakeBin}`,
     )
     .replace('auth_file=/run/oc/cursor-auth/api-key', `auth_file=${auth}`)
-    .replace('/usr/bin/sudo -n /usr/bin/test -f', '/usr/bin/test -f')
-    .replace('/usr/bin/sudo -n /bin/cat', '/bin/cat')
+    .replaceAll('/usr/bin/sudo -n /usr/bin/test -f', '/usr/bin/test -f')
+    .replaceAll('/usr/bin/sudo -n /bin/ls', '/bin/ls')
+    .replaceAll('/usr/bin/sudo -n /bin/cat', '/bin/cat')
   writeFileSync(wrapper, rewritten, { mode: 0o755 })
   chmodSync(wrapper, 0o755)
   return {
@@ -345,6 +359,8 @@ describe('oc-cursor wrapper', () => {
       ['--endpoint=https://example.invalid', '--', 'hello'],
       ['--header', 'X-Test: value', '--', 'hello'],
       ['--output-format', 'text', '--', 'hello'],
+      ['--resume', 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', '--', 'hello'],
+      ['--continue', '--', 'hello'],
     ]) {
       const blocked = spawnSync(f.wrapper, args, {
         cwd: f.dir,
@@ -367,6 +383,18 @@ describe('oc-cursor wrapper', () => {
       assert.equal(result.status, 2)
       assert.match(result.stderr, /model is not allowlisted/)
     }
+  })
+
+  test('accepts the Cursor Grok 4.6 High Fast upstream id', () => {
+    const f = fixture()
+    const result = spawnSync(f.wrapper, ['--model', 'cursor-grok-4.6-high-fast', '--', 'hello'], {
+      cwd: f.dir,
+      env: f.env,
+      encoding: 'utf8',
+    })
+    assert.equal(result.status, 0, result.stderr)
+    const argv = readFileSync(join(f.capture, 'argv'), 'utf8')
+    assert.match(argv, /--model\ncursor-grok-4.6-high-fast\n/)
   })
 
   test('does not assume an undocumented Cursor API-key prefix', () => {
@@ -393,6 +421,7 @@ describe('oc-cursor wrapper', () => {
       'dirname',
       'sudo',
       'cat',
+      'ls',
       'mktemp',
       'rm',
       'setsid',
@@ -401,6 +430,8 @@ describe('oc-cursor wrapper', () => {
       'mkdir',
       'cp',
       'chmod',
+      'date',
+      'ln',
     ]) {
       const marker = join(f.capture, `path-hijack-${name}`)
       const shim = join(f.dir, 'bin', name)
@@ -419,6 +450,7 @@ describe('oc-cursor wrapper', () => {
       'dirname',
       'sudo',
       'cat',
+      'ls',
       'mktemp',
       'rm',
       'setsid',
@@ -427,6 +459,8 @@ describe('oc-cursor wrapper', () => {
       'mkdir',
       'cp',
       'chmod',
+      'date',
+      'ln',
     ]) {
       assert.equal(
         spawnSync('test', ['!', '-e', join(f.capture, `path-hijack-${name}`)]).status,
@@ -475,5 +509,272 @@ describe('oc-cursor wrapper', () => {
     assert.equal(readFileSync(join(f.capture, 'orphan-term'), 'utf8'), 'term')
     const ephemeralHome = readFileSync(join(f.capture, 'home'), 'utf8').trim()
     assert.equal(spawnSync('test', ['!', '-e', ephemeralHome]).status, 0)
+  })
+
+  test('single-key accounts keep the legacy path with no rotation stderr', () => {
+    const f = fixture()
+    const result = spawnSync(f.wrapper, ['--', 'hello'], {
+      cwd: f.dir,
+      env: f.env,
+      encoding: 'utf8',
+    })
+    assert.equal(result.status, 0, result.stderr)
+    assert.doesNotMatch(result.stderr, /credential slot/)
+    assert.equal(readFileSync(join(f.capture, 'key'), 'utf8'), 'crsr_dummy\n')
+  })
+
+  test('prefers the primary slot every turn while it succeeds and never writes rotation state', () => {
+    const f = fixture()
+    const authDir = dirname(f.auth)
+    writeFileSync(join(authDir, 'api-key.2'), 'crsr_second\n', { mode: 0o600 })
+    const rotation = join(f.dir, 'rotation')
+    const env = { ...f.env, OC_CURSOR_KEY_ROTATION_FILE: rotation }
+    for (let turn = 0; turn < 3; turn += 1) {
+      const result = spawnSync(f.wrapper, ['--', 'hello'], {
+        cwd: f.dir,
+        env,
+        encoding: 'utf8',
+      })
+      assert.equal(result.status, 0, result.stderr)
+      assert.equal(readFileSync(join(f.capture, 'key'), 'utf8'), 'crsr_dummy\n')
+      assert.match(result.stderr, /credential slot 1\/2/)
+      assert.doesNotMatch(`${result.stdout}${result.stderr}`, /crsr_dummy|crsr_second/)
+    }
+    assert.equal(existsSync(rotation), false)
+  })
+
+  test('a failing primary fails over to the backup and is probed again after the cooldown', () => {
+    const f = fixture()
+    const authDir = dirname(f.auth)
+    writeFileSync(join(authDir, 'api-key.2'), 'crsr_second\n', { mode: 0o600 })
+    const rotation = join(f.dir, 'rotation')
+    const env = {
+      ...f.env,
+      OC_CURSOR_KEY_ROTATION_FILE: rotation,
+      OC_CURSOR_TEST_FAIL_ON_KEY: 'crsr_dummy',
+    }
+
+    // Primary fails: non-zero exit, failover armed with a future expiry.
+    const first = spawnSync(f.wrapper, ['--', 'hello'], {
+      cwd: f.dir,
+      env,
+      encoding: 'utf8',
+    })
+    assert.equal(first.status, 1, first.stderr)
+    assert.match(first.stderr, /credential slot 1\/2/)
+    assert.doesNotMatch(`${first.stdout}${first.stderr}`, /crsr_dummy|crsr_second/)
+    const armed = readFileSync(rotation, 'utf8').trim().split(' ')
+    assert.equal(armed[0], '1')
+    assert.ok(Number(armed[1]) > Math.floor(Date.now() / 1000))
+
+    // Cooldown still active: the backup serves and the state is untouched.
+    const second = spawnSync(f.wrapper, ['--', 'hello'], {
+      cwd: f.dir,
+      env,
+      encoding: 'utf8',
+    })
+    assert.equal(second.status, 0, second.stderr)
+    assert.match(second.stderr, /credential slot 2\/2/)
+    assert.equal(readFileSync(join(f.capture, 'key'), 'utf8'), 'crsr_second\n')
+    assert.equal(readFileSync(rotation, 'utf8').trim(), armed.join(' '))
+
+    // Cooldown elapsed: the primary is probed again and re-armed on failure.
+    writeFileSync(rotation, `1 1\n`)
+    const third = spawnSync(f.wrapper, ['--', 'hello'], {
+      cwd: f.dir,
+      env,
+      encoding: 'utf8',
+    })
+    assert.equal(third.status, 1, third.stderr)
+    assert.match(third.stderr, /credential slot 1\/2/)
+    assert.match(readFileSync(rotation, 'utf8').trim(), /^1 \d+$/)
+  })
+
+  test('ignores non-canonical extra names and keeps one effective slot', () => {
+    const f = fixture()
+    const authDir = dirname(f.auth)
+    for (const name of [
+      'api-key.1',
+      'api-key.02',
+      'api-key.0',
+      'api-key.foo',
+      'api-key.txt',
+      'api-key.3.bak',
+      'staging.tmp',
+    ]) {
+      writeFileSync(join(authDir, name), 'crsr_junk\n', { mode: 0o600 })
+    }
+    const rotation = join(f.dir, 'rotation')
+    for (let turn = 0; turn < 2; turn += 1) {
+      const result = spawnSync(f.wrapper, ['--', 'hello'], {
+        cwd: f.dir,
+        env: { ...f.env, OC_CURSOR_KEY_ROTATION_FILE: rotation },
+        encoding: 'utf8',
+      })
+      assert.equal(result.status, 0, result.stderr)
+      assert.doesNotMatch(result.stderr, /credential slot/)
+      assert.equal(readFileSync(join(f.capture, 'key'), 'utf8'), 'crsr_dummy\n')
+    }
+    assert.equal(existsSync(rotation), false)
+  })
+
+  test('a malformed failover slot fails its own turn and the pool self-heals', () => {
+    const f = fixture()
+    const authDir = dirname(f.auth)
+    writeFileSync(join(authDir, 'api-key.2'), 'crsr_bad\ncrsr_second\n', { mode: 0o600 })
+    const rotation = join(f.dir, 'rotation')
+    const env = { ...f.env, OC_CURSOR_KEY_ROTATION_FILE: rotation }
+
+    // Arm the failover with a live cooldown, as a primary failure would.
+    writeFileSync(rotation, `1 ${Math.floor(Date.now() / 1000) + 3600}\n`)
+
+    const first = spawnSync(f.wrapper, ['--', 'hello'], {
+      cwd: f.dir,
+      env,
+      encoding: 'utf8',
+    })
+    assert.equal(first.status, 2)
+    assert.match(first.stderr, /Cursor credential is malformed/)
+    assert.doesNotMatch(first.stderr, /crsr_bad|crsr_second/)
+    // The dead slot is skipped: wraparound back to the primary under cooldown.
+    assert.match(readFileSync(rotation, 'utf8').trim(), /^0 \d+$/)
+
+    const second = spawnSync(f.wrapper, ['--', 'hello'], {
+      cwd: f.dir,
+      env,
+      encoding: 'utf8',
+    })
+    assert.equal(second.status, 0, second.stderr)
+    assert.equal(readFileSync(join(f.capture, 'key'), 'utf8'), 'crsr_dummy\n')
+  })
+
+  test('resumes via env, links durable chats, and keeps the store after HOME is removed', () => {
+    const f = fixture()
+    const ocHome = join(f.dir, 'oc-home')
+    mkdirSync(ocHome, { mode: 0o700 })
+    const resumeId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    const result = spawnSync(f.wrapper, ['--', 'hello'], {
+      cwd: f.dir,
+      env: {
+        ...f.env,
+        OPENCLAUDE_HOME: ocHome,
+        OPENCLAUDE_CURSOR_RESUME_ID: resumeId,
+      },
+      encoding: 'utf8',
+    })
+    assert.equal(result.status, 0, result.stderr)
+    const argv = readFileSync(join(f.capture, 'argv'), 'utf8').trim().split('\n')
+    const sep = argv.indexOf('--')
+    const resumeAt = argv.indexOf('--resume')
+    assert.ok(resumeAt >= 0, argv.join(' '))
+    assert.ok(sep > resumeAt, argv.join(' '))
+    assert.equal(argv[resumeAt + 1], resumeId)
+    assert.ok(argv.includes('--output-format'))
+    assert.ok(argv.includes('stream-json'))
+    assert.ok(argv.indexOf('--output-format') < sep)
+    assert.ok(argv.indexOf('stream-json') < sep)
+    assert.equal(readFileSync(join(f.capture, 'chats-link'), 'utf8').trim(), join(ocHome, 'cursor-chats'))
+    assert.equal(statSync(join(ocHome, 'cursor-chats')).isDirectory(), true)
+    assert.equal(statSync(join(ocHome, 'cursor-chats')).isSymbolicLink(), false)
+    const ephemeralHome = readFileSync(join(f.capture, 'home'), 'utf8').trim()
+    assert.ok(ephemeralHome.startsWith('/tmp/openclaude-cursor.'))
+    assert.equal(spawnSync('test', ['!', '-e', ephemeralHome]).status, 0)
+    assert.equal(existsSync(join(ocHome, 'cursor-chats')), true)
+    assert.equal(readFileSync(join(f.capture, 'resume-env'), 'utf8').trim(), 'unset')
+  })
+
+  test('rejects a malformed Cursor resume id without invoking the CLI', () => {
+    const f = fixture()
+    const ocHome = join(f.dir, 'oc-home')
+    mkdirSync(ocHome, { mode: 0o700 })
+    const pwned = join(f.dir, 'pwned')
+    for (const bad of ['not-a-uuid', `$(touch ${pwned})`]) {
+      const result = spawnSync(f.wrapper, ['--', 'hello'], {
+        cwd: f.dir,
+        env: {
+          ...f.env,
+          OPENCLAUDE_HOME: ocHome,
+          OPENCLAUDE_CURSOR_RESUME_ID: bad,
+        },
+        encoding: 'utf8',
+      })
+      assert.notEqual(result.status, 0, bad)
+      assert.match(result.stderr, /invalid Cursor resume id/)
+      assert.equal(existsSync(join(f.capture, 'home')), false, `CLI invoked for ${bad}`)
+      assert.equal(existsSync(pwned), false)
+    }
+  })
+
+  test('refuses to resume when OPENCLAUDE_HOME is unset', () => {
+    const f = fixture()
+    const env: NodeJS.ProcessEnv = {
+      ...f.env,
+      OPENCLAUDE_CURSOR_RESUME_ID: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+    }
+    delete env.OPENCLAUDE_HOME
+    const result = spawnSync(f.wrapper, ['--', 'hello'], {
+      cwd: f.dir,
+      env,
+      encoding: 'utf8',
+    })
+    assert.equal(result.status, 2)
+    assert.match(result.stderr, /Cursor resume requires durable chats directory/)
+    assert.equal(existsSync(join(f.capture, 'home')), false)
+  })
+
+  test('Other Models skip cursor_only and emit the full-pool slot_result', () => {
+    const f = fixture()
+    const authDir = dirname(f.auth)
+    writeFileSync(join(authDir, 'api-key.2'), 'crsr_second\n', { mode: 0o600 })
+    writeFileSync(
+      join(authDir, '.quota-class'),
+      '# quota-class v1\napi-key cursor_only\napi-key.2 unknown\n',
+      { mode: 0o600 },
+    )
+    const result = spawnSync(
+      f.wrapper,
+      ['--model', 'claude-opus-5-thinking-high', '--', 'hello world'],
+      { cwd: f.dir, env: f.env, encoding: 'utf8' },
+    )
+    assert.equal(result.status, 0, result.stderr)
+    assert.equal(readFileSync(join(f.capture, 'key'), 'utf8').trim(), 'crsr_second')
+    assert.match(result.stderr, /slot_result 2 ok/)
+    assert.match(readFileSync(join(f.capture, 'argv'), 'utf8'), /hello world/)
+  })
+
+  test('Cursor Models still use a cursor_only primary', () => {
+    const f = fixture()
+    const authDir = dirname(f.auth)
+    writeFileSync(join(authDir, 'api-key.2'), 'crsr_second\n', { mode: 0o600 })
+    writeFileSync(
+      join(authDir, '.quota-class'),
+      '# quota-class v1\napi-key cursor_only\napi-key.2 unknown\n',
+      { mode: 0o600 },
+    )
+    const result = spawnSync(f.wrapper, ['--model', 'cursor-grok-4.6-high', '--', 'hello'], {
+      cwd: f.dir,
+      env: f.env,
+      encoding: 'utf8',
+    })
+    assert.equal(result.status, 0, result.stderr)
+    assert.equal(readFileSync(join(f.capture, 'key'), 'utf8').trim(), 'crsr_dummy')
+    assert.match(result.stderr, /slot_result 1 ok/)
+  })
+
+  test('Other Models die as quota when every slot is cursor_only', () => {
+    const f = fixture()
+    writeFileSync(
+      join(dirname(f.auth), '.quota-class'),
+      '# quota-class v1\napi-key cursor_only\n',
+      { mode: 0o600 },
+    )
+    const result = spawnSync(
+      f.wrapper,
+      ['--model', 'claude-opus-5-thinking-high', '--', 'hello'],
+      { cwd: f.dir, env: f.env, encoding: 'utf8' },
+    )
+    assert.equal(result.status, 2)
+    assert.match(result.stderr, /other-models quota unavailable/)
+    assert.equal(existsSync(join(f.capture, 'key')), false)
   })
 })

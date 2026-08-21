@@ -1,7 +1,7 @@
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { rename, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { join, resolve as resolvePath } from 'node:path'
 import {
   type AgentDef,
   type OpenClaudeConfig,
@@ -18,6 +18,7 @@ import {
   readMemoryTurnPolicy,
   recordTurnDispatchRunning,
   reserveTurnIndex,
+  recordMemoryUsageEvent,
   paths,
   type KernelFileLock,
   upsertSessionMeta,
@@ -29,7 +30,8 @@ import {
 import './engine/ccbAdapter.js'
 import './engine/codexAdapter.js'
 import './engine/grokAdapter.js'
-import './engine/cursorAdapter.js'
+import { cursorResumeStoreExists } from './engine/cursorAdapter.js'
+import './engine/zcodeAdapter.js'
 import type {
   AutomaticRetryState,
   CollabAgentPolicy,
@@ -48,12 +50,15 @@ import type {
   TurnToolEntry,
 } from './engine/engineEvents.js'
 import { createEngine, resolveEngine } from './engine/registry.js'
-import { isModelAuthorityRequired } from './modelAuthority.js'
+import { isEngineLocalTurnExempt, isModelAuthorityRequired } from './modelAuthority.js'
 import type { CodexProviderConfigOverride } from './engine/codexShared.js'
 import type { GrokRouteOverride } from './engine/grokAdapter.js'
+import type { ZcodeRouteOverride } from './engine/zcodeAdapter.js'
 import { eventBus, createEvent } from './eventBus.js'
+import { beginMemoryTurnTracking } from './memoryTurnObserver.js'
 import { createTurnUsageRecorder, mapTurnTerminalStatus, type TurnTerminalStatus } from './turnUsage.js'
 import { createLogger } from './logger.js'
+import { collectSessionOutputAssets } from './projectAssetCollector.js'
 import {
   deriveLosslessTurnKey,
   getV3MasterSinkOrNull,
@@ -86,6 +91,7 @@ import {
 } from './remoteTarget.js'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 import type { TurnModelAuthority, UsageAttributionTag } from './subprocessRunner.js'
+import { isPatrolSessionKey } from './taskboard/domain.js'
 import { startMemoryTurnPolicyLease } from './memoryTurnPolicyLease.js'
 import {
   applyEfficiencyToolObservation,
@@ -404,6 +410,41 @@ export function buildHistoricalContextPrompt(
   ].join('\n')
 }
 
+function buildNativeModelHandoffContext(summaryText: string): string {
+  return [
+    '<openclaude_native_model_handoff>',
+    'The previous source model compacted this populated session for the selected target model. Treat the following native handoff as prior conversation context. Do not restate it unless needed.',
+    summaryText,
+    '</openclaude_native_model_handoff>',
+  ].join('\n')
+}
+
+export function buildNativeModelHandoffPrompt(summaryText: string, currentUserText: string): string {
+  return [
+    buildNativeModelHandoffContext(summaryText),
+    '',
+    '<current_user_message>',
+    currentUserText,
+    '</current_user_message>',
+  ].join('\n')
+}
+
+export function buildNativeModelHandoffPayload(
+  summaryText: string,
+  currentUserInput: string | Array<{ type: string; [key: string]: unknown }>,
+): string | Array<{ type: string; [key: string]: unknown }> {
+  if (typeof currentUserInput === 'string') {
+    return buildNativeModelHandoffPrompt(summaryText, currentUserInput)
+  }
+  return [
+    { type: 'text', text: buildNativeModelHandoffContext(summaryText) },
+    ...currentUserInput,
+  ]
+}
+
+const NATIVE_MODEL_HANDOFF_MAX_CHARS = 256_000
+const NATIVE_MODEL_SWITCH_TTL_MS = 30 * 60_000
+
 export function shouldAttemptHistoricalContextInjection(opts: {
   alreadyInjected?: boolean
   lastInjectedKey?: string | null
@@ -482,11 +523,29 @@ export function pickIdleTimeoutMs(
     engineId === 'ccb' ||
     engineId === 'codex' ||
     engineId === 'grok' ||
-    engineId === 'cursor'
+    engineId === 'cursor' ||
+    engineId === 'zcode'
   ) {
     return IDLE_TIMEOUT_TOOL_MS
   }
   return IDLE_TIMEOUT_DEFAULT_MS
+}
+
+/**
+ * LRU 空闲回收的「临时会话」判定。cron / 旧 task / taskboard 巡检走短空闲 TTL
+ * (`maxIdleMsCron` = 30min);webchat 走 2h。
+ *
+ * 判定看的是「距上次活动」而不是会话墙钟时长。`submit()` 把 `lastUsedAt` /
+ * `runner.lastActivityAt` 打到 turn 起点,stdout 与 CCB telemetry 持续刷新
+ * `lastActivityAt`(见本文件 liveness 注释)。巡检 delegate 活跃期间
+ * 只要还在产出就不会被 30min 空闲窗杀掉;真静默会先被 15min turn idle
+ * watchdog 收掉,本判定只负责事后把死会话从内存里清掉,避免当成长聊会话
+ * 留 2 小时。
+ */
+export function isTempSessionKey(sessionKey: string): boolean {
+  return (
+    sessionKey.includes(':cron:') || sessionKey.includes(':task:') || isPatrolSessionKey(sessionKey)
+  )
 }
 
 function throwIfLogicalTurnCancelled(signal: AbortSignal | undefined): void {
@@ -530,6 +589,26 @@ function waitForRetryDelay(ms: number, signal: AbortSignal | undefined): Promise
  */
 const MASTER_SINK_PERSIST_CHANNELS: ReadonlySet<string> = new Set(['webchat', 'wechat'])
 
+function scheduleSessionOutputAssetCollection(opts: {
+  userId: string | undefined
+  sessionId: string
+  assistantText: string
+  sessionKey: string
+  traceId?: string
+}): void {
+  if (!opts.userId || !opts.assistantText) return
+  void collectSessionOutputAssets({
+    userId: opts.userId,
+    sessionId: opts.sessionId,
+    assistantText: opts.assistantText,
+  }).catch((err) => {
+    log.warn('collectSessionOutputAssets failed', {
+      sessionKey: opts.sessionKey,
+      ...(opts.traceId ? { traceId: opts.traceId } : {}),
+    }, err)
+  })
+}
+
 // 一个 sessionKey 对应一个 EngineAdapter(CCB = CcbAdapter 组合 SubprocessRunner)
 // + 一把 Mutex(同 session 串行)。跨 session 完全并行。
 export interface AgentSession {
@@ -557,6 +636,13 @@ export interface AgentSession {
   /** Server-persisted default cwd policy. Delegates inherit their root web
    * session's value so the whole task tree shares one isolated directory. */
   workspaceMode: SessionWorkspaceMode
+  /**
+   * Exact cwd handed to the engine adapter as `agentBaseDir` (pinned
+   * `agent.cwd`, or `resolveDefaultWorkspaceCwd`). Cursor chat-store hashes
+   * are keyed by this path after the repo-snapshot overlay and realpath, so
+   * stale-resume detection must read it back instead of recomputing.
+   */
+  workspaceCwd: string
   /**
    * 直接父会话键。仅 delegate 子会话在创建时物化(handleDelegateTask 传入已校验的
    * 直接父 sessionKey);webchat 根会话为 undefined。用于委派进度**沿父链向上追溯**到
@@ -662,6 +748,19 @@ export interface AgentSession {
   _efficiencyBudget?: import('./agentEfficiencyGuard.js').VerificationBudget
   // Model name for cost attribution
   model?: string
+  /** Native-compaction transition fences every old-model submit until the
+   * exact target model + generation consumes the prepared handoff. */
+  _modelSwitchTransition?: {
+    id: string
+    sourceModel: string
+    targetModel: string
+    sourceEngine: string
+    state: 'preparing' | 'prepared' | 'consuming'
+    summaryText?: string
+    summaryInjected?: boolean
+    expiresAt?: number
+  }
+  _lastNativeCompactionSummary?: string
   // CCB CronCreate bridge: maps tool_use_id/content_key → gateway cron job ID
   _cronBridgeMap?: Map<string, string>
   /** Set by onFinish when the CCB result row signals a stale --resume session
@@ -698,9 +797,22 @@ export interface AgentSession {
    *  user switches away and later returns to GPT, while avoiding a repeated
    *  full transcript on ordinary same-provider follow-ups. */
   _historicalContextInjectedKey?: string
-  /** User-visible rebuild notices are exceptional. Stateless replay is the
-   * normal Cursor transport and must not set this reason. */
+  /** User-visible rebuild notices are exceptional. Cursor uses native-resume;
+   * set this for an engine switch or a lost native id so the fallback replay
+   * can announce a rebuild. Do not set it on a successful native resume. */
   _contextRebuildNotice?: 'engine-switch' | 'native-resume-loss'
+  /**
+   * getOrCreate 跨 engine / workspace 替换期间置位:旧 session 在 runner.shutdown()
+   * 完成前仍留在 sessions map。无票 inbound 取样到此标记则不得沿用其 model。
+   */
+  _replacing?: boolean
+  /**
+   * Set immediately before a platform-initiated runner.shutdown()
+   * (deploy shutdownAll / destroySession / retireKeepResume / LRU).
+   * handleExit/handleError then persist SERVICE_RESTART (yellow/waived)
+   * instead of RUNNER_CRASHED (red). Unexpected crashes leave this unset.
+   */
+  _plannedTeardown?: "service_restart"
   /** Platform-executed exchanges not yet observed in master history. A
    * transient master-sink failure can durably queue the assistant row while
    * the very next user turn arrives first; this session-local tail keeps that
@@ -835,7 +947,13 @@ export function recordRecentTerminal(
 export function lookupRecentTerminal(
   session: AgentSession,
   clientMessageId: string,
+  options: { masterAuthoritative?: boolean } = {},
 ): 'completed' | 'interrupted' | 'crashed' | undefined {
+  // Commercial/V5 finality belongs to master PG. The container ring only
+  // knows the engine ended; it cannot prove visible_at committed. Returning
+  // unknown makes the host bridge perform the authoritative PG reconcile and
+  // prevents a synthetic completed frame from erasing an unpersisted answer.
+  if (options.masterAuthoritative) return undefined
   return session._recentTerminalRing?.find((e) => e.clientMessageId === clientMessageId)?.outcome
 }
 
@@ -1754,6 +1872,20 @@ export class SessionManager {
     return true
   }
 
+  private markPlannedServiceRestart(session: AgentSession): void {
+    session._plannedTeardown = "service_restart"
+  }
+
+  /** Deploy/container recycle/SIGTERM → SERVICE_RESTART. Real crash stays RUNNER_CRASHED. */
+  private shouldClassifyExitAsServiceRestart(
+    session: AgentSession,
+    info?: { signal: string | null },
+  ): boolean {
+    if (session._plannedTeardown === "service_restart") return true
+    if (this.isRuntimeRecycleDraining()) return true
+    return info?.signal === "SIGTERM"
+  }
+
   /**
    * Arm the common submit gate, then synchronously inspect accepted turns.
    * A later submit sees the gate; an earlier submit has already incremented
@@ -2314,6 +2446,13 @@ export class SessionManager {
         },
       })
       this._trackPersistence(persistence)
+      scheduleSessionOutputAssetCollection({
+        userId: session.userId,
+        sessionId: session.peerId,
+        assistantText: args.assistantText,
+        sessionKey: session.sessionKey,
+        traceId: args.traceId,
+      })
       const messageId = `srv-${session.peerId}-${session.agentId}-t${turnIndex}`
       const createdAt = Date.now()
       // Preserve the paid exchange in the next provider context even while
@@ -2514,7 +2653,7 @@ export class SessionManager {
    *  entry so the next spawn starts a fresh session silently — UI history
    *  stays visible (it lives in the DB), but CCB has no memory of previous
    *  turns (unavoidable when the JSONL is gone). */
-  private _resumeIdFor(sessionKey: string, wantProvider: string): string | undefined {
+  private _resumeIdFor(sessionKey: string, wantProvider: string, workspacePath?: string): string | undefined {
     const id = this._resumeMap.get(sessionKey)
     if (!id) return undefined
     const tag = SessionManager.normalizeEngineTag(this._resumeMapProvider.get(sessionKey))
@@ -2531,7 +2670,39 @@ export class SessionManager {
       this._saveResumeMap()
       return undefined
     }
+    if (tag === 'cursor' && workspacePath && !cursorResumeStoreExists(workspacePath, id)) {
+      log.warn('resume-map entry points to missing Cursor chat store — dropping silently', {
+        sessionKey,
+        resumeId: id,
+      })
+      this._resumeMap.delete(sessionKey)
+      this._resumeMapTimestamps.delete(sessionKey)
+      this._resumeMapProvider.delete(sessionKey)
+      this._resumeMapLastCost.delete(sessionKey)
+      this._saveResumeMap()
+      return undefined
+    }
     return id
+  }
+
+  /** Same cwd projection CursorAdapter.spawnTurn uses: repo workspace when
+   *  ready, otherwise the agent base dir. Wrapper --workspace is pwd -P of
+   *  that cwd, so realpath when the path exists. */
+  private _cursorWorkspacePath(agentBaseDir: string, repoSessionId?: string): string {
+    let cwd = agentBaseDir
+    if (repoSessionId && this._getRepoSnapshot) {
+      const snap = this._getRepoSnapshot(repoSessionId)
+      if (snap?.status === 'ready' && snap.workspaceDir) cwd = snap.workspaceDir
+    }
+    try { return realpathSync(cwd) } catch { return cwd }
+  }
+
+  private _cursorWorkspacePathForSession(session: AgentSession): string | undefined {
+    if (!session.workspaceCwd) return undefined
+    return this._cursorWorkspacePath(
+      session.workspaceCwd,
+      session.repoSessionId ?? session.peerId,
+    )
   }
 
   /** Whether a CCB session's JSONL file exists somewhere under
@@ -2590,6 +2761,8 @@ export class SessionManager {
   private static normalizeEngineTag(tag: string | undefined): string {
     if (tag === 'codex-native' || tag === 'codex') return 'codex'
     if (tag === 'grok') return 'grok'
+    if (tag === 'cursor') return 'cursor'
+    if (tag === 'zcode') return 'zcode'
     return SessionManager.CCB_PROVIDER_TAG
   }
 
@@ -2783,6 +2956,8 @@ export class SessionManager {
      * agent 默认。新建 session 时缺省回落 agent.model。
      */
     model?: string
+    /** Exact generation returned by control.session.prepare_model_switch. */
+    modelSwitchId?: string
     /**
      * **master 的执行权威**(docs/V5_MODEL_AUTHORITY_PLAN.md §2/§3)。两个来源:
      *   - `source:'bridge_signed'`:server.ts dispatchInbound 从验签通过的 inbound
@@ -2802,7 +2977,7 @@ export class SessionManager {
      */
     executionAuthority?: {
       canonicalModel: string
-      engine: 'ccb' | 'codex' | 'grok' | 'cursor'
+      engine: 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode'
       source?: 'bridge_signed' | 'local_catalog'
     }
     /**
@@ -2909,6 +3084,30 @@ export class SessionManager {
       requireAuthority: isModelAuthorityRequired(),
     })
     const existing = this.sessions.get(opts.sessionKey)
+    if (existing?._modelSwitchTransition) {
+      const transition = existing._modelSwitchTransition
+      if (
+        transition.state === 'prepared' &&
+        transition.expiresAt !== undefined &&
+        Date.now() >= transition.expiresAt
+      ) {
+        if (executionModel === transition.sourceModel && opts.modelSwitchId === undefined) {
+          existing._modelSwitchTransition = undefined
+        } else {
+          throw new Error('MODEL_SWITCH_EXPIRED')
+        }
+      }
+    }
+    if (existing?._modelSwitchTransition) {
+      const transition = existing._modelSwitchTransition
+      const matchesPreparedTarget =
+        transition.state === 'prepared' &&
+        transition.targetModel === executionModel &&
+        opts.modelSwitchId === transition.id
+      if (!matchesPreparedTarget) {
+        throw new Error('MODEL_SWITCH_IN_PROGRESS')
+      }
+    }
     const previousEngine =
       existing?.providerTag ??
       SessionManager.normalizeEngineTag(this._resumeMapProvider.get(opts.sessionKey))
@@ -2940,6 +3139,9 @@ export class SessionManager {
             'PROMPT_QUEUE_EXECUTION_INVARIANT: engine switch cannot replace an active queue session',
           )
         }
+        // 旧 session 在 shutdown() 完成前仍留在 map;无票 inbound 不得沿用其 model。
+        // 放在不变量检查之后:检查失败不会留下粘滞 _replacing。
+        existing._replacing = true
         // Same logical client session, but the desired engine changed (model
         // switch across engines, or agent switched between CCB and Codex).
         // Native resume ids are engine-specific, so tear down the old runner
@@ -3030,7 +3232,7 @@ export class SessionManager {
       // was wiped (pre-2026-04-22 v3 containers' tmpfs was ephemeral).
       resumeSessionId: opts.hermeticNoTools
         ? undefined
-        : this._resumeIdFor(opts.sessionKey, engineId),
+        : this._resumeIdFor(opts.sessionKey, engineId, this._cursorWorkspacePath(cwd, repoSessionId)),
       effortLevel: initialEffort,
       // Phase 5:repoSessionId 默认等于 peerId;delegate_task 可传父 webchat
       // session id 作为 repo lookup key,但不改变 delegate 自己的 peerId。
@@ -3054,6 +3256,7 @@ export class SessionManager {
       peerId: opts.peerId ?? 'unknown',
       userId: opts.userId,
       workspaceMode,
+      workspaceCwd: cwd,
       repoSessionId,
       title: opts.title ?? 'New conversation',
       // delegate 子会话的直接父指针(webchat/普通会话为 undefined)。物化父链使委派进度
@@ -3089,6 +3292,9 @@ export class SessionManager {
       _lastCcbCumulativeCost: this._lastCostFor(opts.sessionKey, engineId) ?? 0,
       // 与 runner 同一份白名单收敛结果(见上方 executionModel 注释)。
       model: executionModel,
+      ...(existing?._modelSwitchTransition
+        ? { _modelSwitchTransition: existing._modelSwitchTransition }
+        : {}),
       toolUseIdToName: new Map(),
       executionTarget: { kind: 'local' },
       // Phase 5 G.0 → M1a:固化 engine 路由信息(字段名保留 providerTag),
@@ -3192,6 +3398,77 @@ export class SessionManager {
     return session
   }
 
+  async prepareModelSwitch(
+    session: AgentSession,
+    expectedSourceModel: string,
+    targetModel: string,
+    switchId: string,
+  ): Promise<{ sourceModel: string; targetModel: string }> {
+    if (!/^[A-Za-z0-9:_-]{8,128}$/.test(switchId)) throw new Error('MODEL_SWITCH_ID_INVALID')
+    if ((session._activeTurnCount ?? 0) > 0 || (session._activeClientTurnCount ?? 0) > 0) {
+      throw new Error('MODEL_SWITCH_SESSION_BUSY')
+    }
+    const sourceModel = session.model ?? session.runner.model
+    if (!sourceModel) throw new Error('MODEL_SWITCH_SOURCE_UNKNOWN')
+    if (sourceModel !== expectedSourceModel) throw new Error('MODEL_SWITCH_SOURCE_CHANGED')
+    if (sourceModel === targetModel) return { sourceModel, targetModel }
+    if (session._modelSwitchTransition?.state === 'preparing') {
+      throw new Error('MODEL_SWITCH_ALREADY_PREPARING')
+    }
+    const transition: NonNullable<AgentSession['_modelSwitchTransition']> = {
+      id: switchId,
+      sourceModel,
+      targetModel,
+      sourceEngine: session.providerTag,
+      state: 'preparing',
+    }
+    session._modelSwitchTransition = transition
+    try {
+      let artifact
+      if (session.runner.compactForHandoff) {
+        artifact = await session.runner.compactForHandoff()
+      } else if (session.providerTag === 'ccb' || session.providerTag === 'grok') {
+        const compactStartedAt = Date.now()
+        session._lastNativeCompactionSummary = undefined
+        await this.submit(
+          session,
+          '/compact preserve the user goal, decisions, constraints, current work, files, errors, and next steps',
+          () => {},
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          { modelSwitchInternal: switchId },
+        )
+        artifact = session.providerTag === 'grok'
+          ? await session.runner.readCompactionHandoffSince?.(compactStartedAt)
+          : session._lastNativeCompactionSummary
+            ? { summaryText: session._lastNativeCompactionSummary, source: 'ccb' as const, compactStartedAt }
+            : undefined
+      }
+      if (!artifact?.summaryText?.trim()) throw new Error('MODEL_SWITCH_NATIVE_COMPACTION_UNAVAILABLE')
+      if (artifact.summaryText.length > NATIVE_MODEL_HANDOFF_MAX_CHARS) {
+        throw new Error('MODEL_SWITCH_NATIVE_COMPACTION_TOO_LARGE')
+      }
+      if (session._modelSwitchTransition !== transition) throw new Error('MODEL_SWITCH_SUPERSEDED')
+      transition.summaryText = artifact.summaryText.trim()
+      transition.expiresAt = Date.now() + NATIVE_MODEL_SWITCH_TTL_MS
+      transition.state = 'prepared'
+      return { sourceModel, targetModel }
+    } catch (error) {
+      if (session._modelSwitchTransition === transition) session._modelSwitchTransition = undefined
+      throw error
+    }
+  }
+
+  cancelModelSwitch(session: AgentSession, switchId: string): boolean {
+    const transition = session._modelSwitchTransition
+    if (!transition || transition.id !== switchId || transition.state === 'consuming') return false
+    session._modelSwitchTransition = undefined
+    return true
+  }
+
   async submit(
     session: AgentSession,
     userTextOrBlocks: string | Array<{ type: string; [key: string]: unknown }>,
@@ -3242,6 +3519,8 @@ export class SessionManager {
       codexRoute?: CodexProviderConfigOverride | null
       /** Grok CLI receives only this one-turn opaque loopback relay route. */
       grokRoute?: GrokRouteOverride | null
+      /** ZCode CLI receives only this one-turn opaque loopback Anthropic relay. */
+      zcodeRoute?: ZcodeRouteOverride | null
       /** Master-authored platform goal snapshot for this exact turn. null
        * explicitly clears stale engine state; omission is for legacy callers. */
       platformGoal?: GoalStateSnapshot | null
@@ -3285,6 +3564,10 @@ export class SessionManager {
       queueExecutionFence?: PromptQueueExecutionFence
       /** Shared browser/master/gateway automatic retry lineage. */
       automaticRetryState?: AutomaticRetryState
+      /** Exact prepared-switch generation carried by the first target turn. */
+      modelSwitchId?: string
+      /** Native compact command authored by prepareModelSwitch itself. */
+      modelSwitchInternal?: string
     },
   ): Promise<void> {
     if (this.isRuntimeRecycleDraining()) throw new RuntimeRecycleDrainingError()
@@ -3318,7 +3601,12 @@ export class SessionManager {
     if (
       session.runner.capabilities.needsServerRequestId &&
       !(typeof requestId === 'string' && /^[0-9a-f]{32}$/.test(requestId)) &&
-      isCommercialManagedRuntime()
+      isCommercialManagedRuntime() &&
+      // selfhost 豁免门(OC_SELFHOST_ENGINE_LOCAL_TURNS=1):单租户自用部署显式接受
+      // 无 bridge 计费编排的 engine-reported turn(与 decideLocalExecution 真值表同源,
+      // 语义/代价见 modelAuthority.isEngineLocalTurnExempt)。生产不设 -> fail-closed 不变。
+      !isEngineLocalTurnExempt() &&
+      opts?.modelSwitchInternal === undefined
     ) {
       log.error('codex turn rejected: missing/malformed server-owned requestId (billing guard)', {
         sessionKey: session.sessionKey,
@@ -3334,6 +3622,34 @@ export class SessionManager {
       })
       return
     }
+    let transition = session._modelSwitchTransition
+    if (
+      transition?.state === 'prepared' &&
+      transition.expiresAt !== undefined &&
+      Date.now() >= transition.expiresAt
+    ) {
+      if (model === transition.sourceModel && opts?.modelSwitchId === undefined) {
+        session._modelSwitchTransition = undefined
+        transition = undefined
+      } else {
+        throw new Error('MODEL_SWITCH_EXPIRED')
+      }
+    }
+    const internalSwitchCompact =
+      transition !== undefined && opts?.modelSwitchInternal === transition.id
+    let consumingModelSwitch = false
+    if (transition && !internalSwitchCompact) {
+      if (
+        transition.state !== 'prepared' ||
+        model !== transition.targetModel ||
+        opts?.modelSwitchId !== transition.id
+      ) {
+        throw new Error('MODEL_SWITCH_IN_PROGRESS')
+      }
+      transition.state = 'consuming'
+      consumingModelSwitch = true
+    }
+
     // 闭包捕获:即便后面再有 submit 也不会改这个常量
     const desiredEffort: string | undefined =
       effortLevel === null ? undefined : effortLevel
@@ -3431,6 +3747,10 @@ export class SessionManager {
       const maybeSetGrokRoute = (session.runner as any).setGrokRoute
       if (typeof maybeSetGrokRoute === 'function') {
         maybeSetGrokRoute.call(session.runner, opts?.grokRoute ?? null)
+      }
+      const maybeSetZcodeRoute = (session.runner as any).setZcodeRoute
+      if (typeof maybeSetZcodeRoute === 'function') {
+        maybeSetZcodeRoute.call(session.runner, opts?.zcodeRoute ?? null)
       }
       // effort + model 应用都必须在本 turn 真正启动**之前**完成,且必须在 prev 之后:
       //   - prev 之前:可能中断别人的 in-flight turn
@@ -3607,7 +3927,7 @@ export class SessionManager {
               ))
               .filter((prompt): prompt is string => prompt !== null)
           : []
-      let providerResumeId = this._resumeIdFor(session.sessionKey, session.providerTag)
+      let providerResumeId = this._resumeIdFor(session.sessionKey, session.providerTag, this._cursorWorkspacePathForSession(session))
       const injectionKey = historicalContextInjectionKey({
         messages: effectiveMasterHistoricalMessages,
         peerId: session.peerId,
@@ -3633,7 +3953,23 @@ export class SessionManager {
         session._contextRebuildNotice = 'native-resume-loss'
         providerResumeId = undefined
       }
+      const nativeHandoff =
+        consumingModelSwitch &&
+        transition &&
+        transition.sourceEngine !== session.providerTag &&
+        transition.summaryText &&
+        transition.summaryInjected !== true
+          ? transition
+          : null
+      if (nativeHandoff) {
+        runnerPayload = buildNativeModelHandoffPayload(nativeHandoff.summaryText!, userTextOrBlocks)
+        nativeHandoff.summaryInjected = true
+        session._historicalContextInjected = true
+        session._historicalContextInjectedKey = `native-switch:${nativeHandoff.id}`
+        session._contextRebuildNotice = undefined
+      }
       if (
+        !nativeHandoff &&
         shouldAttemptHistoricalContextInjection({
           alreadyInjected: session._historicalContextInjected,
           lastInjectedKey: session._historicalContextInjectedKey,
@@ -3671,9 +4007,7 @@ export class SessionManager {
                 historyMessages,
                 userTextOrBlocks,
                 undefined,
-                session.runner.capabilities.historyMode === 'stateless-replay'
-                  ? session.runner.capabilities.maxPromptBytes
-                  : undefined,
+                session.runner.capabilities.maxPromptBytes,
               )
             : null
           if (historicalPrompt) {
@@ -3708,7 +4042,7 @@ export class SessionManager {
             // successful history lookup. A fresh conversation can have no
             // semantic rows beyond the optimistic current user message, so
             // there is nothing to rebuild or announce. Consume the reason now
-            // instead of leaking it into Cursor's routine next-turn replay.
+            // instead of leaking it into a later turn that has nothing to rebuild.
             //
             // The uncapped classification above remains non-null when eligible
             // history exists but does not fit the provider's byte cap. Keep
@@ -3773,8 +4107,9 @@ export class SessionManager {
         opts?.dispatchContext,
         opts?.queueLifecycle,
         logicalTurnAbort.signal,
-        contextOverflowRetryInputs,
+        consumingModelSwitch ? [] : contextOverflowRetryInputs,
         opts?.automaticRetryState,
+        consumingModelSwitch ? transition : undefined,
       )
       try {
         await Promise.race([
@@ -3844,6 +4179,15 @@ export class SessionManager {
         throw err
       }
     } finally {
+      if (
+        consumingModelSwitch &&
+        transition &&
+        session._modelSwitchTransition === transition &&
+        transition.state === 'consuming'
+      ) {
+        transition.state = 'prepared'
+        transition.summaryInjected = false
+      }
       await finalizeEfficiencyTurn(session).catch((err) => {
         log.debug('efficiency guard finalize failed', { sessionKey: session.sessionKey, err: String(err) })
       })
@@ -3936,6 +4280,7 @@ export class SessionManager {
      * Used only after a real Codex context-window rejection. */
     contextOverflowRetryInputs: string[] = [],
     automaticRetryState?: AutomaticRetryState,
+    modelSwitchTransition?: AgentSession['_modelSwitchTransition'],
   ): Promise<void> {
     const retryState: AutomaticRetryState = automaticRetryState ?? {
       rootClientMessageId: clientMessageId ?? session.sessionKey,
@@ -3978,6 +4323,20 @@ export class SessionManager {
       legacySessionIds:
         legacyId && legacyId !== session.sessionKey ? [legacyId] : [],
     })
+    const memoryObservationText = typeof userTextOrBlocks === 'string'
+      ? userTextOrBlocks
+      : userTextOrBlocks
+          .flatMap((block) => typeof block.text === 'string' ? [block.text] : [])
+          .join('\n')
+    await beginMemoryTurnTracking({
+      sessionKey: session.sessionKey,
+      turnIndex: projectedTurnIndex,
+      agentId: session.agentId,
+      userText: memoryObservationText,
+    }).catch((err) => log.warn('memory turn observation start failed', {
+      sessionKey: session.sessionKey,
+      turnIndex: projectedTurnIndex,
+    }, err))
     // CcbMessageParser increments this reference on a real result. Seed it to
     // the slot immediately before the reservation so the result lands exactly
     // on projectedTurnIndex; partial/crash persistence uses the same slot.
@@ -4128,6 +4487,7 @@ export class SessionManager {
           canRetry(),
           attemptOrdinal,
           retryState,
+          modelSwitchTransition,
         )
         return // success
       } catch (err: any) {
@@ -4314,12 +4674,14 @@ export class SessionManager {
     /** Zero-based retry attempt; names call ids so frozen attempts never collide. */
     attemptOrdinal = 0,
     automaticRetryState?: AutomaticRetryState,
+    modelSwitchTransition?: AgentSession['_modelSwitchTransition'],
   ): Promise<void> {
     const { runner } = session
     const turnStartTime = Date.now()
     let turnToolCallCount = 0
     let turnBlockCount = 0
     let turnPermissionCount = 0
+    const memoryReadTargets = new Map<string, string>()
     // Plan/goal blocks are paid structured model output but are not contained
     // in assistantText/thinkingText/tool snapshots. Keep every update (not
     // merely the last card projection) so a disconnected browser is never the
@@ -4413,6 +4775,7 @@ export class SessionManager {
       durationMs: Date.now() - turnStartTime,
       terminalStatus,
       ...(requestId ? { requestId } : {}),
+      ...(session._currentTurnTraceId ? { traceId: session._currentTurnTraceId } : {}),
     })
 
     await new Promise<void>((resolve, reject) => {
@@ -4530,6 +4893,21 @@ export class SessionManager {
         if (e.kind === 'tool_use_detected') {
           const tool = e.tool
           turnToolCallCount++
+          if (tool.name === 'Read') {
+            const toolInput = tool.input as unknown as Record<string, unknown>
+            const rawPath = typeof toolInput.file_path === 'string'
+              ? toolInput.file_path
+              : typeof toolInput.path === 'string'
+                ? toolInput.path
+                : null
+            if (rawPath) {
+              const memoryRoot = resolvePath(paths.agentMemoryDir(session.agentId))
+              const target = resolvePath(rawPath)
+              if (target.startsWith(`${memoryRoot}/`) && target.endsWith('.md')) {
+                memoryReadTargets.set(tool.id, target)
+              }
+            }
+          }
           try {
             applyEfficiencyToolObservation(session, tool, turnToolCallCount)
           } catch (err) {
@@ -4558,6 +4936,20 @@ export class SessionManager {
         }
         if (e.kind === 'tool_result_detected') {
           const tr = e.result
+          const memoryTarget = memoryReadTargets.get(tr.toolUseId)
+          memoryReadTargets.delete(tr.toolUseId)
+          if (memoryTarget && !tr.isError) {
+            void recordMemoryUsageEvent({
+              agentId: session.agentId,
+              sessionKey: session.sessionKey,
+              turnIndex: session.turns + 1,
+              operation: 'core_read',
+              memoryType: 'core',
+              outcome: 'success',
+              topMatchKey: memoryTarget,
+              metadata: { source: 'native_read_tool' },
+            }).catch(() => {})
+          }
           if (tr.toolName === 'CronCreate' && !tr.isError && session._cronBridgeMap) {
             const pendingKey = `_pending:${tr.toolUseId}`
             const gatewayJobId = session._cronBridgeMap.get(pendingKey)
@@ -4579,6 +4971,9 @@ export class SessionManager {
             toolName: tr.toolName,
             durationMs: tr.durationMs,
             isError: tr.isError,
+            ...(session._currentTurnTraceId
+              ? { traceId: session._currentTurnTraceId }
+              : {}),
             inputPreview: tr.inputPreview,
             outputPreview: tr.preview ? tr.preview.slice(0, 500) : undefined,
             ...(tr.exitCode !== undefined ? { exitCode: tr.exitCode } : {}),
@@ -4790,6 +5185,13 @@ export class SessionManager {
             if (MASTER_SINK_PERSIST_CHANNELS.has(session.channel)) {
               const turnIndex = prevTurns + 1
               session.turns = Math.max(session.turns, turnIndex)
+              scheduleSessionOutputAssetCollection({
+                userId: session.userId,
+                sessionId: session.peerId,
+                assistantText: partialAssistant.text,
+                sessionKey: session.sessionKey,
+                ...(traceId ? { traceId } : {}),
+              })
               persistenceAcknowledged = await persistServerAuthoredTurn({
                 sessionKey: session.sessionKey,
                 peerId: session.peerId,
@@ -4952,6 +5354,16 @@ export class SessionManager {
       const finalizeTurn = async (result: TurnSummary | null): Promise<void> => {
           if (terminalPersistenceClaim === 'partial') return
           detach()
+          if (result?.nativeCompactionSummary) {
+            session._lastNativeCompactionSummary = result.nativeCompactionSummary
+          }
+          if (modelSwitchTransition && session._modelSwitchTransition === modelSwitchTransition) {
+            if (result && !result.isError) session._modelSwitchTransition = undefined
+            else {
+              modelSwitchTransition.state = 'prepared'
+              modelSwitchTransition.summaryInjected = false
+            }
+          }
           let persistenceAcknowledged = true
           let terminalErrorForClient: string | undefined
           let terminalErrorCodeForClient: 'user_cancelled' | undefined
@@ -5473,6 +5885,13 @@ export class SessionManager {
               const assistantText = completedAssistant.text
               const thinkingText = completedThinking.text
               const turnIndex = session.turns
+              scheduleSessionOutputAssetCollection({
+                userId: session.userId,
+                sessionId: peerId,
+                assistantText,
+                sessionKey: session.sessionKey,
+                ...(traceId ? { traceId } : {}),
+              })
               // Phase 0.4 P1-3 (tightened): use `session.userId` directly when
               // we have it — this lets `appendServerAuthoredMessageDurable`
               // route `session_not_found` into the outbox instead of silently
@@ -5654,8 +6073,13 @@ export class SessionManager {
         // All unexpected runner failures share one recovery-facing code.  The
         // immutable detail still preserves the concrete transport/process
         // error, while the Master can make one deterministic retry decision.
-        const persistence = requestTerminalPersistence?.('crashed', err.message, 'RUNNER_CRASHED')
-          ?? Promise.resolve()
+        const planned = this.shouldClassifyExitAsServiceRestart(session)
+        const persistence = requestTerminalPersistence?.(
+          planned ? 'interrupted' : 'crashed',
+          err.message,
+          planned ? 'SERVICE_RESTART' : 'RUNNER_CRASHED',
+          planned ? 'no_response' : undefined,
+        ) ?? Promise.resolve()
         this._trackPersistence(persistence)
       }
 
@@ -5690,8 +6114,16 @@ export class SessionManager {
               : info.code
                 ? `子进程异常退出 (code ${info.code})`
                 : '子进程意外退出'
-            const status: 'interrupted' | 'crashed' = info.signal ? 'interrupted' : 'crashed'
-            void (persistTerminalSnapshot?.(status, reason, 'RUNNER_CRASHED') ?? Promise.resolve())
+            const planned = this.shouldClassifyExitAsServiceRestart(session, info)
+            const status: 'interrupted' | 'crashed' =
+              planned || info.signal ? 'interrupted' : 'crashed'
+            void (persistTerminalSnapshot?.(
+              status,
+              reason,
+              planned ? 'SERVICE_RESTART' : 'RUNNER_CRASHED',
+              true,
+              planned ? 'no_response' : undefined,
+            ) ?? Promise.resolve())
               .finally(resolveFlush)
           }, 150)
         })
@@ -5969,6 +6401,7 @@ export class SessionManager {
     if (s) {
       // (跨 turn stdout 路由收在 adapter 内:session 引用被删后 adapter → turn
       //  闭包链整体可 GC,无需再显式卸 'message' listener。)
+      this.markPlannedServiceRestart(s)
       await s.runner.shutdown()
       // A1:底座已停产出,flush 折叠 tail 的 pending 并清定时器/状态(await 持久化链)。
       await this._flushTailFolding(s)
@@ -5999,6 +6432,52 @@ export class SessionManager {
     try { this.onSessionDestroyed?.(sessionKey) } catch {}
   }
 
+  /**
+   * Stop the warm runner and drop the live session, but keep resume-map so a
+   * later getOrCreate(sessionKey) can native-resume. Awaited by resumable
+   * delegate_task; fire-and-forget destroySession remains the one-shot path.
+   */
+  async retireKeepResume(sessionKey: string): Promise<void> {
+    const s = this.sessions.get(sessionKey)
+    if (s) {
+      try {
+        this.markPlannedServiceRestart(s)
+        await s.runner.shutdown()
+      } catch (err) {
+        log.warn('retireKeepResume shutdown failed', { sessionKey }, err)
+      }
+      try {
+        await this._flushTailFolding(s)
+      } catch (err) {
+        log.warn('retireKeepResume flush failed', { sessionKey }, err)
+      }
+      if (s.executionTarget.kind === 'remote' && s.userId) {
+        await this._remoteTargetController
+          ?.releaseMux(sessionKey, s.userId, s.executionTarget.hostId)
+          .catch((err) =>
+            log.warn('retireKeepResume releaseMux failed', { sessionKey, err: String(err) }),
+          )
+      }
+      this.sessions.delete(sessionKey)
+      this._sessionIdToKey.delete(s.peerId)
+    }
+    try { this.onSessionDestroyed?.(sessionKey) } catch {}
+  }
+
+  hasLiveSession(sessionKey: string): boolean {
+    return this.sessions.has(sessionKey)
+  }
+
+  /** Drop resume-map rows for an evicted/expired delegate binding. */
+  forgetResume(sessionKey: string): void {
+    if (!this._resumeMap.has(sessionKey)) return
+    this._resumeMap.delete(sessionKey)
+    this._resumeMapTimestamps.delete(sessionKey)
+    this._resumeMapLastCost.delete(sessionKey)
+    this._resumeMapProvider.delete(sessionKey)
+    this._saveResumeMap()
+  }
+
   async shutdownAll(): Promise<void> {
     // Persist resume map BEFORE killing subprocesses — ensures state survives restart
     // (runner.shutdown() sets shuttingDown=true so the exit handler won't call _saveResumeMap)
@@ -6022,7 +6501,10 @@ export class SessionManager {
         )
       }
     }
-    await Promise.all([...this.sessions.values()].map((s) => s.runner.shutdown()))
+    await Promise.all([...this.sessions.values()].map((s) => {
+      this.markPlannedServiceRestart(s)
+      return s.runner.shutdown()
+    }))
     await Promise.all(muxReleases.map((fn) => fn()))
     // A1:底座已全部停产出,flush 各 session 折叠 tail 的 pending(其持久化随后被
     // awaitPendingPersistence 一并排空)。
@@ -6079,7 +6561,7 @@ export class SessionManager {
           const now = Date.now()
           const toEvict: string[] = []
           for (const [key, s] of this.sessions) {
-            const isTempSession = key.includes(':cron:') || key.includes(':task:')
+            const isTempSession = isTempSessionKey(key)
             const maxIdle = isTempSession ? this.maxIdleMsCron : this.maxIdleMsChat
             const lastActive = Math.max(s.lastUsedAt, s.runner.lastActivityAt)
             if (now - lastActive > maxIdle) {
@@ -6091,6 +6573,7 @@ export class SessionManager {
             if (!s) continue
             // 先 await shutdown 完成(SIGTERM+SIGKILL 链走完),再清状态
             try {
+              this.markPlannedServiceRestart(s)
               await s.runner.shutdown()
             } catch {}
             // A1:底座已停产出,flush 折叠 tail 的 pending 并清定时器/状态。

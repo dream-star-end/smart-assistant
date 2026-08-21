@@ -59,11 +59,14 @@ import { createHash } from 'node:crypto'
 import {
   LOSSLESS_TURN_TAPE_LEGACY_AGENT_ID,
   LOSSLESS_TURN_TAPE_PART_BYTES,
+  LOSSLESS_TURN_TAPE_VISIBLE_TEXT_BYTES,
   LOSSLESS_TURN_TAPE_VERSION,
+  losslessBillingAnchorId,
   type DurableAgentGroup,
   type DurableCodexBilling,
   type LosslessTurnTapeFinalizeRequest,
   type LosslessTurnTapePartRequest,
+  type LosslessTurnTapeVisibleRequest,
   type TurnWaiveReason,
 } from '@openclaude/protocol'
 
@@ -239,6 +242,38 @@ export interface V3MasterSinkWirePayload {
   runtimeEvents?: DurableRuntimeEvent[]
   /** Final engine-reported usage, durably co-located with the paid turn. */
   engineBilling?: DurableCodexBilling
+  /**
+   * Detached Cursor ask_user cards. Optional and ignored by old masters
+   * on the lossless-tape path (unknown keys are dropped at parse).
+   * A permission-only sidecar is POSTed as the legacy v1 JSON body so
+   * master can `appendServerAuthoredMessage` a `role:'permission'` row
+   * into the hot tail — not a billed turn tape.
+   */
+  permissionCards?: Array<{
+    requestId: string
+    questions: Array<Record<string, unknown>>
+    sessionKey: string
+    expiresAt: number
+    ts?: number
+    channel?: string
+    peer?: { id: string; kind: 'dm' | 'group' }
+  }>
+  /**
+   * Optional resolved-state patches for previously persisted ask_user cards.
+   * Same v1 sidecar as permissionCards — not a billed turn tape.
+   */
+  permissionPatches?: Array<{
+    requestId: string
+    behavior: 'allow' | 'deny'
+    settledReason: 'remote' | 'already_settled' | 'disconnect' | 'timeout' | 'crashed'
+    answers?: Record<string, string>
+  }>
+  /** Optional user-answer rows that accompany an allow settlement. */
+  userAnswerMessages?: Array<{
+    id: string
+    text: string
+    ts?: number
+  }>
 }
 
 /**
@@ -312,6 +347,16 @@ export function serializeLosslessTurnPayload(value: unknown): Buffer {
   return Buffer.from(json, 'utf8')
 }
 
+function clipVisibleSettlementText(text: string): { text: string; truncated: boolean } {
+  const bytes = Buffer.from(text, 'utf8')
+  if (bytes.length <= LOSSLESS_TURN_TAPE_VISIBLE_TEXT_BYTES) {
+    return { text, truncated: false }
+  }
+  let end = LOSSLESS_TURN_TAPE_VISIBLE_TEXT_BYTES
+  while (end > 0 && (bytes[end] & 0xc0) === 0x80) end -= 1
+  return { text: bytes.subarray(0, end).toString('utf8'), truncated: true }
+}
+
 export function deriveLosslessTurnKey(payload: V3MasterSinkWirePayload): string {
   if (payload.turnKey && /^[0-9a-f]{64}$/.test(payload.turnKey)) return payload.turnKey
   return sha256(`oc-turn-v2\0${payload.sessionId}\0${payload.agentId ?? 'legacy'}\0${payload.turnIndex}`)
@@ -320,7 +365,7 @@ export function deriveLosslessTurnKey(payload: V3MasterSinkWirePayload): string 
 export function buildLosslessTurnTapeRequests(
   payload: V3MasterSinkWirePayload & { agentId: string },
   now: () => number = Date.now,
-): { finalize: LosslessTurnTapeFinalizeRequest; canonical: Buffer } {
+): { visible: LosslessTurnTapeVisibleRequest; finalize: LosslessTurnTapeFinalizeRequest; canonical: Buffer } {
   const createdAt = payload.createdAt ?? now()
   const turnKey = deriveLosslessTurnKey(payload)
   const canonical = serializeLosslessTurnPayload({ ...payload, createdAt, turnKey })
@@ -349,7 +394,36 @@ export function buildLosslessTurnTapeRequests(
       ? { dispatchId: payload.dispatchId, attemptNo: payload.attemptNo }
       : {}),
   } as const
-  return { finalize: { ...base, action: 'finalize' }, canonical }
+  const engineBillings: DurableCodexBilling[] = [
+    ...(payload.engineBilling ? [payload.engineBilling] : []),
+    ...(payload.agentGroups ?? []).flatMap((group) =>
+      Array.isArray(group.engineBillings) ? group.engineBillings : []),
+  ]
+  const billingAnchorId = losslessBillingAnchorId({
+    sessionId: payload.sessionId,
+    agentId: payload.agentId,
+    turnIndex: payload.turnIndex,
+    assistantSegments: payload.assistantSegments,
+    text: payload.text,
+    errorCode: typeof payload.errorCode === 'string' ? payload.errorCode : undefined,
+    tools: payload.tools,
+    agentGroups: payload.agentGroups,
+  })
+  const visibleText = clipVisibleSettlementText(payload.text)
+  const settlement = {
+    billingAnchorId,
+    ...(payload.engineBilling?.requestId ? { requestId: payload.engineBilling.requestId } : {}),
+    engineBillings,
+    text: visibleText.text,
+    ts: createdAt,
+    ...(visibleText.truncated ? { truncated: true } : {}),
+    ...(typeof payload.errorCode === 'string' ? { errorCode: payload.errorCode } : {}),
+  }
+  return {
+    visible: { ...base, action: 'visible', settlement },
+    finalize: { ...base, action: 'finalize', settlement },
+    canonical,
+  }
 }
 
 /** Yield one base64 envelope at a time. Production never retains an array of
@@ -357,7 +431,10 @@ export function buildLosslessTurnTapeRequests(
 export function* iterateLosslessTurnTapeParts(
   tape: ReturnType<typeof buildLosslessTurnTapeRequests>,
 ): Generator<LosslessTurnTapePartRequest> {
-  const { action: _action, ...base } = tape.finalize
+  // settlement belongs only on action=finalize. Spreading it onto parts
+  // trips master's LosslessTapePartSchema.strict() → 400 INVALID_TURN_TAPE_PART
+  // and withholds user-chat isFinal until ACK.
+  const { action: _action, settlement: _settlement, ...base } = tape.finalize
   for (let partIndex = 0; partIndex < tape.finalize.partCount; partIndex++) {
     const bytes = tape.canonical.subarray(
       partIndex * LOSSLESS_TURN_TAPE_PART_BYTES,
@@ -374,9 +451,9 @@ export function* iterateLosslessTurnTapeParts(
 }
 
 async function postLosslessTurnTapeEnvelope(
-  envelope: LosslessTurnTapePartRequest | LosslessTurnTapeFinalizeRequest,
+  envelope: LosslessTurnTapePartRequest | LosslessTurnTapeVisibleRequest | LosslessTurnTapeFinalizeRequest,
   deps: AttemptSendDeps,
-): Promise<void> {
+): Promise<{ settlementHandoff?: boolean }> {
   const fetcher = deps.fetcher ?? undiciRequest
   const isFinalize = envelope.action === 'finalize'
   const controller = isFinalize ? null : new AbortController()
@@ -415,7 +492,14 @@ async function postLosslessTurnTapeEnvelope(
     // Status remains authoritative when an error response body cannot be read.
   }
   const status = res.statusCode
-  if (status >= 200 && status < 300) return
+  if (status >= 200 && status < 300) {
+    try {
+      const parsed = JSON.parse(bodyText) as { settlementHandoff?: unknown }
+      return parsed.settlementHandoff === true ? { settlementHandoff: true } : {}
+    } catch {
+      return {}
+    }
+  }
   if (status === 404) {
     throw new V3SinkError(`session_not_found: ${truncateForLog(bodyText)}`, 'session_missing', status)
   }
@@ -428,15 +512,152 @@ async function postLosslessTurnTapeEnvelope(
   throw new V3SinkError(`master ${status}: ${truncateForLog(bodyText)}`, 'transient', status)
 }
 
+export function isPermissionSidecarPayload(payload: V3MasterSinkWirePayload): boolean {
+  const hasCards = !!(payload.permissionCards && payload.permissionCards.length > 0)
+  const hasPatches = !!(payload.permissionPatches && payload.permissionPatches.length > 0)
+  const hasAnswers = !!(payload.userAnswerMessages && payload.userAnswerMessages.length > 0)
+  if (!hasCards && !hasPatches && !hasAnswers) return false
+  if (payload.text && payload.text.length > 0) return false
+  if (payload.thinkingText) return false
+  if (payload.tools && payload.tools.length > 0) return false
+  if (payload.agentGroups && payload.agentGroups.length > 0) return false
+  if (payload.assistantSegments && payload.assistantSegments.length > 0) return false
+  if (payload.thinkingSegments && payload.thinkingSegments.length > 0) return false
+  if (payload.structuredBlocks && payload.structuredBlocks.length > 0) return false
+  if (payload.runtimeEvents && payload.runtimeEvents.length > 0) return false
+  if (payload.engineBilling) return false
+  if (payload.continuationOfTurnKey) return false
+  return true
+}
+
+export function buildPermissionSidecarV1Body(payload: V3MasterSinkWirePayload & { agentId: string }): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    sessionId: payload.sessionId,
+    agentId: payload.agentId,
+    turnIndex: payload.turnIndex,
+    status: payload.status,
+    text: '',
+    createdAt: payload.createdAt ?? Date.now(),
+  }
+  if (payload.permissionCards && payload.permissionCards.length > 0) {
+    body.permissionCards = payload.permissionCards
+  }
+  if (payload.permissionPatches && payload.permissionPatches.length > 0) {
+    body.permissionPatches = payload.permissionPatches
+  }
+  if (payload.userAnswerMessages && payload.userAnswerMessages.length > 0) {
+    body.userAnswerMessages = payload.userAnswerMessages
+  }
+  return body
+}
+
+export async function fetchAskUserPermissionCard(
+  args: {
+    sessionId: string
+    requestId: string
+    config?: V3MasterSinkConfig | null
+    fetcher?: typeof undiciRequest
+    timeoutMs?: number
+  },
+): Promise<Record<string, unknown> | null> {
+  const config = args.config === undefined ? readV3MasterSinkConfig() : args.config
+  if (!config) return null
+  const fetcher = args.fetcher ?? undiciRequest
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), args.timeoutMs ?? ATTEMPT_TIMEOUT_MS)
+  const url = `${config.baseUrl}${SERVER_AUTHORED_PATH}`
+    + `?sessionId=${encodeURIComponent(args.sessionId)}`
+    + `&requestId=${encodeURIComponent(args.requestId)}`
+  let res: Awaited<ReturnType<typeof undiciRequest>>
+  try {
+    res = await fetcher(url, {
+      method: 'GET',
+      headers: {
+        authorization: `Bearer ${config.bearer}`,
+      },
+      signal: controller.signal,
+    })
+  } catch (err) {
+    clearTimeout(timer)
+    throw new V3SinkError(`network error: ${err instanceof Error ? err.message : String(err)}`, 'transient')
+  }
+  clearTimeout(timer)
+  let bodyText = ''
+  try {
+    bodyText = await readBoundedBody(res.body, MAX_DIAGNOSTIC_RESPONSE_BYTES)
+  } catch {
+    // Status remains authoritative when an error response body cannot be read.
+  }
+  const status = res.statusCode
+  if (status === 404 || status === 410) return null
+  if (status < 200 || status >= 300) {
+    throw new V3SinkError(`master ${status}: ${truncateForLog(bodyText)}`, 'transient', status)
+  }
+  try {
+    const parsed = JSON.parse(bodyText) as { message?: unknown }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
+    const message = parsed.message
+    if (!message || typeof message !== 'object' || Array.isArray(message)) return null
+    return message as Record<string, unknown>
+  } catch {
+    throw new V3SinkError('master GET returned non-JSON body', 'transient', status)
+  }
+}
+
+async function postServerAuthoredJson(body: unknown, deps: AttemptSendDeps): Promise<void> {
+  const fetcher = deps.fetcher ?? undiciRequest
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), deps.timeoutMs ?? ATTEMPT_TIMEOUT_MS)
+  let res: Awaited<ReturnType<typeof undiciRequest>>
+  try {
+    res = await fetcher(`${deps.config.baseUrl}${SERVER_AUTHORED_PATH}`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json; charset=utf-8',
+        authorization: `Bearer ${deps.config.bearer}`,
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    })
+  } catch (err) {
+    clearTimeout(timer)
+    throw new V3SinkError(`network error: ${err instanceof Error ? err.message : String(err)}`, 'transient')
+  }
+  clearTimeout(timer)
+  let bodyText = ''
+  try {
+    bodyText = await readBoundedBody(res.body, MAX_DIAGNOSTIC_RESPONSE_BYTES)
+  } catch {
+    // Status remains authoritative when an error response body cannot be read.
+  }
+  const status = res.statusCode
+  if (status >= 200 && status < 300) return
+  if (status === 404) {
+    throw new V3SinkError(`session_not_found: ${truncateForLog(bodyText)}`, 'session_missing', status)
+  }
+  if (status === 410) {
+    throw new V3SinkError(`session_deleted: ${truncateForLog(bodyText)}`, 'fatal', status)
+  }
+  throw new V3SinkError(`master ${status}: ${truncateForLog(bodyText)}`, 'transient', status)
+}
+
 export async function attemptSendLossless(
   payload: V3MasterSinkWirePayload & { agentId: string },
   deps: AttemptSendDeps,
-): Promise<void> {
+): Promise<{ settlementHandoff?: boolean }> {
   const tape = buildLosslessTurnTapeRequests(payload, deps.now)
+  // Visibility is a separate, compact Phase A. It must ACK before the first
+  // large part is attempted: strict-schema drift, a slow upload, or a process
+  // replacement can delay audit materialization, but can no longer erase the
+  // already completed answer from REST/refresh.
+  const visibleAck = await postLosslessTurnTapeEnvelope(tape.visible, deps)
   for (const part of iterateLosslessTurnTapeParts(tape)) {
     await postLosslessTurnTapeEnvelope(part, deps)
   }
-  await postLosslessTurnTapeEnvelope(tape.finalize, deps)
+  const finalizeAck = await postLosslessTurnTapeEnvelope(tape.finalize, deps)
+  return visibleAck.settlementHandoff || finalizeAck.settlementHandoff
+    ? { settlementHandoff: true }
+    : {}
 }
 
 /**
@@ -451,11 +672,21 @@ export async function attemptSendLossless(
 export async function attemptSend(
   payload: V3MasterSinkWirePayload,
   deps: AttemptSendDeps,
-): Promise<void> {
+): Promise<{ settlementHandoff?: boolean }> {
+  if (isPermissionSidecarPayload(payload)) {
+    if (!payload.agentId) {
+      throw new V3SinkError('permission sidecar requires agentId', 'transient')
+    }
+    await postServerAuthoredJson(
+      buildPermissionSidecarV1Body(payload as V3MasterSinkWirePayload & { agentId: string }),
+      deps,
+    )
+    return {}
+  }
   const upgraded: V3MasterSinkWirePayload & { agentId: string } = payload.agentId
     ? payload as V3MasterSinkWirePayload & { agentId: string }
     : { ...payload, agentId: LOSSLESS_TURN_TAPE_LEGACY_AGENT_ID }
-  await attemptSendLossless(upgraded, deps)
+  return attemptSendLossless(upgraded, deps)
 }
 
 async function readBoundedBody(
@@ -538,7 +769,10 @@ export interface MakeV3MasterSinkDeps {
   config: V3MasterSinkConfig
   retryQueue: V3MasterRetryQueue
   /** Override only for tests. */
-  attemptSendImpl?: typeof attemptSend
+  attemptSendImpl?: (
+    payload: V3MasterSinkWirePayload,
+    deps: AttemptSendDeps,
+  ) => Promise<{ settlementHandoff?: boolean } | void | undefined>
   now?: () => number
   /** RFC-v5-durable-turn-dispatch §3 inbox hooks (best-effort). */
   inboxHooks?: V3DispatchInboxHooks
@@ -580,8 +814,12 @@ export function makeV3MasterSink(deps: MakeV3MasterSinkDeps): V3MasterSink {
   const now = deps.now ?? (() => Date.now())
   const hooks = deps.inboxHooks
 
-  const attemptOnce = (payload: V3MasterSinkWirePayload): Promise<void> => {
-    if (deps.attemptSendImpl) return deps.attemptSendImpl(payload, { config: deps.config })
+  const attemptOnce = async (
+    payload: V3MasterSinkWirePayload,
+  ): Promise<{ settlementHandoff?: boolean }> => {
+    if (deps.attemptSendImpl) {
+      return (await deps.attemptSendImpl(payload, { config: deps.config })) ?? {}
+    }
     return attemptSend(payload, { config: deps.config })
   }
 
@@ -678,7 +916,12 @@ export function makeV3MasterSink(deps: MakeV3MasterSinkDeps): V3MasterSink {
     }
   }
 
-  return { persistOrQueue, attemptOnce }
+  return {
+    persistOrQueue,
+    attemptOnce: async (payload) => {
+      await attemptOnce(payload)
+    },
+  }
 }
 
 // ─── module-level singleton (set at startup, read at turn-end) ──────────

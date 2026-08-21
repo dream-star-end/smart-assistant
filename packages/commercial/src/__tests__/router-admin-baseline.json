@@ -6,10 +6,52 @@
     "handler": "handleAdminPendingCommunityTutorials"
   },
   {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/tutorials/case-specs",
+    "handler": "handleAdminTutorialControlGet"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/tutorials/eval-jobs",
+    "handler": "handleAdminTutorialControlGet"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/tutorials/compass",
+    "handler": "handleAdminTutorialControlGet"
+  },
+  {
+    "method": "POST",
+    "pathKind": "path",
+    "pathValue": "/api/admin/tutorials/case-specs",
+    "handler": "handleAdminTutorialControlPost"
+  },
+  {
+    "method": "POST",
+    "pathKind": "path",
+    "pathValue": "/api/admin/tutorials/eval-jobs",
+    "handler": "handleAdminTutorialControlPost"
+  },
+  {
+    "method": "POST",
+    "pathKind": "path",
+    "pathValue": "/api/admin/tutorials/compass",
+    "handler": "handleAdminTutorialControlPost"
+  },
+  {
+    "method": "POST",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/tutorials/eval-jobs/",
+    "handler": "handleAdminTutorialControlPost"
+  },
+  {
     "method": "POST",
     "pathKind": "pathPrefix",
     "pathValue": "/api/admin/tutorials/",
-    "handler": "handleAdminReviewCommunityTutorial"
+    "handler": "handleAdminTutorialWrite"
   },
   {
     "method": "GET",

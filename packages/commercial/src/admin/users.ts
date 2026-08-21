@@ -523,12 +523,10 @@ export async function getUserDetail(
         LIMIT 30`,
       [idStr],
     ),
-    // 第 4 项:client_sessions(SQLite)。注意 namespace:commercial 用户在
-    // master SQLite 里 user_id 始终带 `c:` 前缀(见 handlers.ts:1592 /
-    // internalServerAuthored.ts:400 的 inline 约定)。90 天窗口 + LIMIT 10
-    // 走 JS 端过滤,因为 listClientSessions 不接受 since/limit 参数,且当前
-    // 单用户数据量(< 千行)用 idx_client_sessions_user 索引扫足够快。
-    listClientSessions(`c:${idStr}`),
+    // 第 4 项:client_sessions。注意 namespace:commercial 用户在
+    // master 里 user_id 始终带 `c:` 前缀。90 天窗口 + LIMIT 10
+    // 走 JS 端过滤;admin 详情带上已归档会话。
+    listClientSessions(`c:${idStr}`, { includeArchived: true }),
   ]);
 
   const lc = lifecycleRes.rows[0];
@@ -553,7 +551,7 @@ export async function getUserDetail(
       session_id: r.session_id,
       created_at: r.created_at.toISOString(),
     })),
-    recent_sessions: projectRecentSessions(sessionsRes, Date.now()),
+    recent_sessions: projectRecentSessions(sessionsRes.sessions, Date.now()),
   };
 }
 

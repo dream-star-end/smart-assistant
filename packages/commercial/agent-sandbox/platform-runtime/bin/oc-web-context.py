@@ -172,6 +172,12 @@ def health() -> dict[str, Any]:
 
 
 def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help", "help"):
+        sys.stdout.write(
+            "usage: oc-web-context  # JSON stdin → JSON stdout\n"
+            "ops: health_check | extract_file | parse_document_file | browser_extract_url\n"
+        )
+        return
     payload = json.loads(sys.stdin.read() or "{}")
     op = payload.get("op")
     max_chars = bounded_int(payload.get("max_chars"), DEFAULT_MAX_CHARS, 1_000, HARD_MAX_CHARS)

@@ -37,6 +37,10 @@ function which(bin: string): boolean {
 
 function main(): void {
   const args = process.argv.slice(2);
+  if (args[0] === "help" || args[0] === "--help" || args[0] === "-h") {
+    process.stdout.write("usage: oc-poster --spec <poster.json> [-o out.pdf]\n");
+    process.exit(0);
+  }
   const specFile = flagVal(args, "--spec");
   const output = flagVal(args, "-o") ?? flagVal(args, "--output") ?? "poster.pdf";
   if (!specFile) fail("usage: oc-poster --spec <poster.json> [-o out.pdf]");

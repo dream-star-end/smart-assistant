@@ -2,6 +2,7 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../../lib/chat/model";
+import { ChatInteractionContext } from "../tool/context";
 import { AssistantCard, type CardCallbacks, type RenderCtx, UserCard } from "./cards";
 
 afterEach(cleanup);
@@ -105,7 +106,7 @@ describe("消息引用动作与已发送引用块", () => {
       },
     });
     render(<UserCard msg={message} cb={{ onQuote }} />);
-    expect(screen.getByText("OpenClaude")).toBeInTheDocument();
+    expect(screen.getByText("从简")).toBeInTheDocument();
     const quoteText = screen.getByText("不会在数据层截断的完整历史回答");
     expect(quoteText).toHaveClass("line-clamp-2");
     fireEvent.click(screen.getByRole("button", { name: "引用" }));
@@ -338,5 +339,207 @@ describe("AssistantCard 失败轮部分正文(Codex 审计 R6)", () => {
     expect(screen.getByText("本轮已自动免单")).toBeInTheDocument();
     // 免单红卡:精确「重试」不显(waived → 非可重试)。
     expect(screen.queryByRole("button", { name: "重试" })).toBeNull();
+  });
+});
+
+
+describe("AssistantCard options 多题聚合", () => {
+  const idleCtx: RenderCtx = { isLast: true, sending: false, inActiveTurn: true };
+
+  function fence(payload: object): string {
+    return "```options\n" + JSON.stringify(payload) + "\n```";
+  }
+
+  test("流式正文尚无 options 块时不渲染空页脚", async () => {
+    const sendUserText = vi.fn();
+    render(
+      <ChatInteractionContext.Provider value={{ sendUserText, busy: true }}>
+        <AssistantCard
+          msg={{ id: "a-opt-empty-live", role: "assistant", text: "正在分析部署顺序…", ts: 1 } as ChatMessage}
+          ctx={{ isLast: true, sending: true, inActiveTurn: true }}
+          cb={{}}
+        />
+      </ChatInteractionContext.Provider>,
+    );
+    expect(await screen.findByText("正在分析部署顺序…")).toBeTruthy();
+    expect(screen.queryByText("发送选择")).toBeNull();
+    expect(screen.queryByText(/已作答/)).toBeNull();
+    expect(sendUserText).not.toHaveBeenCalled();
+  });
+
+  test("单块保持点击即发,不出现组页脚", async () => {
+    const sendUserText = vi.fn();
+    const text = fence({
+      question: "选一个部署方式?",
+      options: [
+        { label: "灰度发布", desc: "先小流量" },
+        { label: "全量发布" },
+      ],
+    });
+    render(
+      <ChatInteractionContext.Provider value={{ sendUserText }}>
+        <AssistantCard
+          msg={{ id: "a-opt-1", role: "assistant", text, ts: 1 } as ChatMessage}
+          ctx={idleCtx}
+          cb={{}}
+        />
+      </ChatInteractionContext.Provider>,
+    );
+    fireEvent.click(await screen.findByText("灰度发布"));
+    expect(sendUserText).toHaveBeenCalledWith("我选择:灰度发布");
+    expect(sendUserText).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("发送选择")).toBeNull();
+    expect(screen.queryByText(/已作答/)).toBeNull();
+  });
+
+  test("多块点第一题不发送,答完后由页脚聚合成一条消息", async () => {
+    const sendUserText = vi.fn();
+    const text = [
+      fence({ question: "风格?", options: [{ label: "正式" }, { label: "轻松" }] }),
+      fence({
+        question: "输出?",
+        multi: true,
+        options: [{ label: "要点" }, { label: "全文" }],
+      }),
+    ].join("\n\n");
+    render(
+      <ChatInteractionContext.Provider value={{ sendUserText }}>
+        <AssistantCard
+          msg={{ id: "a-opt-2", role: "assistant", text, ts: 1 } as ChatMessage}
+          ctx={idleCtx}
+          cb={{}}
+        />
+      </ChatInteractionContext.Provider>,
+    );
+    fireEvent.click(await screen.findByText("正式"));
+    expect(sendUserText).not.toHaveBeenCalled();
+    const sendBtn = await screen.findByRole("button", { name: "发送选择" });
+    expect(sendBtn).toBeEnabled();
+    fireEvent.click(screen.getByText("要点"));
+    expect(sendBtn).toBeEnabled();
+    fireEvent.click(sendBtn);
+    expect(sendUserText).toHaveBeenCalledTimes(1);
+    const sent = sendUserText.mock.calls[0][0] as string;
+    expect(sent).toContain("我的选择:");
+    expect(sent).toContain("风格?:正式");
+    expect(sent).toContain("输出?:要点");
+  });
+
+  test("流式单块可点但不隐式发送,页脚聚合提交后锁定", async () => {
+    const sendUserText = vi.fn();
+    const text = fence({
+      question: "选一个部署方式?",
+      options: [
+        { label: "灰度发布", desc: "先小流量" },
+        { label: "全量发布" },
+      ],
+    });
+    const msg = { id: "a-opt-live", role: "assistant", text, ts: 1 } as ChatMessage;
+    render(
+      <ChatInteractionContext.Provider value={{ sendUserText, busy: true }}>
+        <AssistantCard
+          msg={msg}
+          ctx={{ isLast: true, sending: true, inActiveTurn: true }}
+          cb={{}}
+        />
+      </ChatInteractionContext.Provider>,
+    );
+    const liveBtn = (await screen.findByText("灰度发布")).closest("button") as HTMLButtonElement;
+    expect(liveBtn.disabled).toBe(false);
+    expect(liveBtn.getAttribute("title")).toBeNull();
+    expect(screen.queryByText("生成中")).toBeNull();
+    fireEvent.click(liveBtn);
+    expect(sendUserText).not.toHaveBeenCalled();
+    expect(liveBtn.className).toContain("bg-accent-soft");
+    const sendBtn = await screen.findByRole("button", { name: "发送选择" });
+    expect(sendBtn).toBeEnabled();
+    fireEvent.click(sendBtn);
+    expect(sendUserText).toHaveBeenCalledTimes(1);
+    const sent = sendUserText.mock.calls[0][0] as string;
+    expect(sent).toContain("我的选择:");
+    expect(sent).toContain("选一个部署方式?:灰度发布");
+    expect(screen.getByText(/已发送全部选择/)).toBeTruthy();
+    fireEvent.click(screen.getByText("全量发布"));
+    expect(sendUserText).toHaveBeenCalledTimes(1);
+  });
+
+  test("流式多块至少答 1 题可提交,未答标 (未答)", async () => {
+    const sendUserText = vi.fn();
+    const text = [
+      fence({ question: "风格?", options: [{ label: "正式" }, { label: "轻松" }] }),
+      fence({
+        question: "输出?",
+        multi: true,
+        options: [{ label: "要点" }, { label: "全文" }],
+      }),
+    ].join("\n\n");
+    render(
+      <ChatInteractionContext.Provider value={{ sendUserText, busy: true }}>
+        <AssistantCard
+          msg={{ id: "a-opt-live-multi", role: "assistant", text, ts: 1 } as ChatMessage}
+          ctx={{ isLast: true, sending: true, inActiveTurn: true }}
+          cb={{}}
+        />
+      </ChatInteractionContext.Provider>,
+    );
+    const liveBtn = (await screen.findByText("正式")).closest("button") as HTMLButtonElement;
+    expect(liveBtn.disabled).toBe(false);
+    fireEvent.click(liveBtn);
+    expect(sendUserText).not.toHaveBeenCalled();
+    const answered = (await screen.findByText(/已作答/)).textContent ?? "";
+    expect(answered).toContain("1");
+    expect(answered).toContain("2");
+    const sendBtn = await screen.findByRole("button", { name: "发送选择" });
+    expect(sendBtn).toBeEnabled();
+    fireEvent.click(sendBtn);
+    expect(sendUserText).toHaveBeenCalledTimes(1);
+    const sent = sendUserText.mock.calls[0][0] as string;
+    expect(sent).toContain("我的选择:");
+    expect(sent).toContain("风格?:正式");
+    expect(sent).toContain("输出?:(未答)");
+    expect(screen.getByText(/已发送全部选择/)).toBeTruthy();
+    fireEvent.click(screen.getByText("轻松"));
+    fireEvent.click(screen.getByText("要点"));
+    expect(sendUserText).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("button", { name: "发送选择" })).toBeNull();
+  });
+
+  test("多块部分作答可提交,聚合含未答,提交后锁定", async () => {
+    const sendUserText = vi.fn();
+    const text = [
+      fence({ question: "风格?", options: [{ label: "正式" }, { label: "轻松" }] }),
+      fence({
+        question: "输出?",
+        multi: true,
+        options: [{ label: "要点" }, { label: "全文" }],
+      }),
+    ].join("\n\n");
+    render(
+      <ChatInteractionContext.Provider value={{ sendUserText }}>
+        <AssistantCard
+          msg={{ id: "a-opt-partial", role: "assistant", text, ts: 1 } as ChatMessage}
+          ctx={idleCtx}
+          cb={{}}
+        />
+      </ChatInteractionContext.Provider>,
+    );
+    fireEvent.click(await screen.findByText("正式"));
+    expect(sendUserText).not.toHaveBeenCalled();
+    const answered = (await screen.findByText(/已作答/)).textContent ?? "";
+    expect(answered).toContain("1");
+    expect(answered).toContain("2");
+    const sendBtn = await screen.findByRole("button", { name: "发送选择" });
+    expect(sendBtn).toBeEnabled();
+    fireEvent.click(sendBtn);
+    expect(sendUserText).toHaveBeenCalledTimes(1);
+    const sent = sendUserText.mock.calls[0][0] as string;
+    expect(sent).toContain("我的选择:");
+    expect(sent).toContain("风格?:正式");
+    expect(sent).toContain("输出?:(未答)");
+    expect(screen.getByText(/已发送全部选择/)).toBeTruthy();
+    fireEvent.click(screen.getByText("轻松"));
+    fireEvent.click(screen.getByText("要点"));
+    expect(sendUserText).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("button", { name: "发送选择" })).toBeNull();
   });
 });

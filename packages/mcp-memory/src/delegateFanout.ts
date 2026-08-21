@@ -6,13 +6,17 @@
  * 编排(Promise.all 各自 POST /delegate、单项失败隔离)留在 index.ts handleDelegateTasks。
  */
 
+import { normalizeDelegateAgentId, normalizeDelegateModel } from './delegateArgs.js'
+
 /** 单个并行子任务的规范化描述。 */
 export interface FanoutTask {
   agentId?: string
+  model?: string
   goal: string
   context?: string
   effort?: string
   toolsets?: string[]
+  resumeSessionKey?: string
 }
 
 /** 一次 fan-out 中单个子任务的执行结果(供聚合)。 */
@@ -36,6 +40,7 @@ const EFFORT_ALLOW = new Set(['low', 'medium', 'high'])
  *   - 必须是非空数组,长度 1..MAX_FANOUT_TASKS;
  *   - 每项必须有非空 goal;
  *   - effort 仅接受 low/medium/high,其余(含缺省/非法)丢弃(不报错,退回成员默认);
+ *   - model / 非法 agentId(含点的型号)硬拒,避免打到 HTML 回退;
  *   - toolsets 仅接受字符串数组,其余忽略。
  * 校验不过返回 { ok:false, error }(供调用方转 toolError),成功返回规范化后的 tasks。
  */
@@ -66,12 +71,22 @@ export function normalizeFanoutTasks(
       item && Array.isArray(item.toolsets)
         ? item.toolsets.filter((x): x is string => typeof x === 'string')
         : undefined
+    const resumeSessionKey =
+      item && typeof item.resumeSessionKey === 'string' && item.resumeSessionKey.trim()
+        ? item.resumeSessionKey.trim()
+        : undefined
+    const agentNorm = normalizeDelegateAgentId(item?.agentId)
+    if (!agentNorm.ok) return { ok: false, error: `第 ${i + 1} 个子任务 ${agentNorm.error}` }
+    const modelNorm = normalizeDelegateModel(item?.model)
+    if (!modelNorm.ok) return { ok: false, error: `第 ${i + 1} 个子任务 ${modelNorm.error}` }
     tasks.push({
-      agentId: item && typeof item.agentId === 'string' ? item.agentId : undefined,
+      agentId: agentNorm.agentId,
+      model: modelNorm.model,
       goal,
       context: item && typeof item.context === 'string' ? item.context : undefined,
       effort,
       toolsets: toolsets && toolsets.length > 0 ? toolsets : undefined,
+      resumeSessionKey,
     })
   }
   return { ok: true, tasks }

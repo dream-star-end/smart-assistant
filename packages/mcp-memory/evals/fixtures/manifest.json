@@ -1,0 +1,41 @@
+{
+  "fixtureVersion": "2026-08-17.2",
+  "agentId": "eval-core",
+  "purpose": "Synthetic Core corpus that reproduces personal-edition failure modes without copying real memories.",
+  "distribution": {
+    "helixforge_tpu_ocr": 3,
+    "novapulse_h3_gpu": 3,
+    "release_memos": 7,
+    "feedback": 1,
+    "user": 1,
+    "reference": 0
+  },
+  "plantedTraps": {
+    "V5": "Almost every project/feedback file, so a commercial-verification query floods the library.",
+    "今天": "Only novapulse-h3-runtime.md, so a weather query still returns Found 1.",
+    "怎么 / 天气": "Absent, so Chinese weather depends on 今天 alone.",
+    "记忆": "Only release-semantic-recall.md, so a memory-optimization query stays a true single hit.",
+    "5.3 + 模型 + 繁忙": "Planted on the OCR core note, not on the GLM memo, so a busy-model query can rank OCR first under bag-of-words.",
+    "glm as math lib": "NovaPulse H3 mentions glm vectors; GLM memo writes ZAI not Z.AI, so a long GLM/Release query can tie and path-sort H3 first.",
+    "任务 / 面板": "Several files mention 任务; H3 runtime also has 面板, so an out-of-library board name can steal rank-1.",
+    "the / is": "Natural English in long notes, so an English weather query matches most of the library under bag-of-words.",
+    "commit / release / bundle / 上线 / 功能": "Shared release-memo boilerplate plus the H3 runtime thief document."
+  },
+  "files": {
+    "user.md": { "type": "user", "role": "Opus manages / Grok executes" },
+    "memory/helixforge-tpu-ocr.md": { "type": "project", "role": "canonical OCR note; exact phrase HelixForge TPU OCR" },
+    "memory/helixforge-tpu-ocr-tuning.md": { "type": "project", "role": "near-duplicate OCR tuning" },
+    "memory/helixforge-tpu-ocr-batch.md": { "type": "project", "role": "near-duplicate OCR batch" },
+    "memory/novapulse-h3-runtime.md": { "type": "project", "role": "rank thief: long generic-word document" },
+    "memory/novapulse-h3-gpu-queue.md": { "type": "project", "role": "H3 GPU queue sibling" },
+    "memory/helixforge-gpu-capacity.md": { "type": "project", "role": "GPU capacity sibling" },
+    "memory/release-cedar-q-router.md": { "type": "project", "role": "V5 shipped memo / Cedar-Q" },
+    "memory/release-client-error.md": { "type": "project", "role": "V5 shipped memo / client error" },
+    "memory/release-brook-v4-pro.md": { "type": "project", "role": "V5 shipped memo / Brook-V4 Pro" },
+    "memory/release-semantic-recall.md": { "type": "project", "role": "V5 shipped memo / memory recall" },
+    "memory/release-glm53-zai.md": { "type": "project", "role": "V5 shipped memo / GLM-5.3 ZAI" },
+    "memory/release-billing-meter.md": { "type": "project", "role": "V5 shipped memo / billing" },
+    "memory/release-ask-user-card.md": { "type": "project", "role": "V5 shipped memo / ask-user card" },
+    "memory/feedback-commercial-verify.md": { "type": "feedback", "role": "commercial risk-tier verification" }
+  }
+}

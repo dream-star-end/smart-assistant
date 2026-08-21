@@ -830,7 +830,7 @@ describe("CodexAdapter — interrupt / approval / 崩溃", () => {
         behavior: "allow",
         updatedInput: {
           answers: { "Which color?": "Blue" },
-          annotations: { "Which color?": { notes: "not in Codex 0.144 response schema" } },
+          annotations: { "Which color?": { notes: "not in Codex 0.149 response schema" } },
         },
       }),
       true,
@@ -852,6 +852,121 @@ describe("CodexAdapter — interrupt / approval / 崩溃", () => {
     );
     assert.equal(p.written.length, beforeResponse + 1);
 
+    p.notify("turn/completed", { turn: { id: "turn-1", status: "completed" } });
+    await turn.summary;
+  });
+
+  test("requestUserInput 0.149 isBlocking 优先级:阻塞忽略 duration,非阻塞保留合法值或默认 60s", async () => {
+    const h = makeHarness();
+    const turn = beginTurn(h);
+    await waitForRequest(h, "turn/start");
+    const p = h.proc();
+    const question = {
+      id: "confirm",
+      header: "Confirm",
+      question: "Continue?",
+      isOther: true,
+      isSecret: false,
+      options: [{ label: "Yes", description: "Continue." }],
+    };
+
+    const requestAndReadInput = async (
+      id: string,
+      itemId: string,
+      extra: Record<string, unknown>,
+    ): Promise<Record<string, unknown>> => {
+      const permissionCount = h.events.filter((e) => e.kind === "permission_request").length;
+      p.reply({
+        jsonrpc: "2.0",
+        id,
+        method: "item/tool/requestUserInput",
+        params: {
+          threadId: "thr-new-1",
+          turnId: "turn-1",
+          itemId,
+          questions: [question],
+          ...extra,
+        },
+      });
+      await waitFor(
+        () => h.events.filter((e) => e.kind === "permission_request").length === permissionCount + 1,
+      );
+      const permission = h.events.filter((e) => e.kind === "permission_request").at(-1);
+      assert.ok(permission && permission.kind === "permission_request");
+      const input = permission.request.input as Record<string, unknown>;
+      const beforeResponse = p.written.length;
+      assert.equal(
+        h.adapter.sendPermissionResponse(permission.request.requestId, { behavior: "deny" }),
+        true,
+      );
+      await waitFor(() => p.written.length === beforeResponse + 1);
+      return input;
+    };
+
+    const blocking = await requestAndReadInput("srv-blocking", "ask-blocking", {
+      isBlocking: true,
+      autoResolutionMs: 120_000,
+    });
+    assert.equal(Object.prototype.hasOwnProperty.call(blocking, "autoResolutionMs"), false);
+
+    const nonBlockingDefault = await requestAndReadInput("srv-nonblocking-default", "ask-nonblocking-default", {
+      isBlocking: false,
+    });
+    assert.equal(nonBlockingDefault.autoResolutionMs, 60_000);
+
+    const nonBlockingExplicit = await requestAndReadInput("srv-nonblocking-explicit", "ask-nonblocking-explicit", {
+      isBlocking: false,
+      autoResolutionMs: 180_000,
+    });
+    assert.equal(nonBlockingExplicit.autoResolutionMs, 180_000);
+
+    p.notify("turn/completed", { turn: { id: "turn-1", status: "completed" } });
+    await turn.summary;
+  });
+
+  test("requestUserInput 0.149 非布尔 isBlocking / 非法 duration → -32602,不打开 permission", async () => {
+    const h = makeHarness();
+    const turn = beginTurn(h);
+    await waitForRequest(h, "turn/start");
+    const p = h.proc();
+    const question = {
+      id: "confirm",
+      header: "Confirm",
+      question: "Continue?",
+      isOther: true,
+      isSecret: false,
+      options: [{ label: "Yes", description: "Continue." }],
+    };
+    const badParams: Array<Record<string, unknown>> = [
+      { isBlocking: "false" },
+      { isBlocking: false, autoResolutionMs: 30_000 },
+      { isBlocking: true, autoResolutionMs: 240_001 },
+    ];
+    for (const [index, extra] of badParams.entries()) {
+      const beforeWritten = p.written.length;
+      const beforePermissions = h.events.filter((e) => e.kind === "permission_request").length;
+      p.reply({
+        jsonrpc: "2.0",
+        id: `srv-invalid-${index}`,
+        method: "item/tool/requestUserInput",
+        params: {
+          threadId: "thr-new-1",
+          turnId: "turn-1",
+          itemId: `ask-invalid-${index}`,
+          questions: [question],
+          ...extra,
+        },
+      });
+      await waitFor(() => p.written.length === beforeWritten + 1);
+      assert.equal(
+        ((p.written[beforeWritten] as unknown as { error: { code: number } }).error).code,
+        -32602,
+      );
+      assert.equal(
+        h.events.filter((e) => e.kind === "permission_request").length,
+        beforePermissions,
+      );
+    }
     p.notify("turn/completed", { turn: { id: "turn-1", status: "completed" } });
     await turn.summary;
   });

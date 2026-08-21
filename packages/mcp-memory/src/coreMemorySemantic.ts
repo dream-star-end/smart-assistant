@@ -172,24 +172,37 @@ export interface CoreMemorySemanticOptions {
   baseUrl?: string
   token?: string
   postImpl?: typeof postJson
+  /**
+   * Personal-edition local rank timeout in ms. Master relay ignores this and
+   * keeps its own 45s transport timeout. Local default is 3800ms (clamped
+   * 200..5000) so a cold TLS handshake to DashScope can finish; this pass
+   * only runs when BM25 strong hits are empty.
+   */
+  timeoutMs?: number
+  /**
+   * Test seam for local embedding rank. Production uses EMBEDDING_* only when
+   * OPENCLAUDE_CORE_MEMORY_LOCAL_SEMANTIC is explicitly enabled.
+   */
+  localEmbed?: (texts: string[]) => Promise<ArrayLike<number>[]>
+  /**
+   * Test seam for local LLM rerank. Production uses OPENCLAUDE_CORE_MEMORY_LLM_*
+   * only when OPENCLAUDE_CORE_MEMORY_LLM_RERANK is explicitly enabled.
+   */
+  localLlmRerank?: (
+    query: string,
+    documents: Array<{ id: string; text: string }>,
+  ) => Promise<Array<{ id: string; score: number }>>
 }
 
-/**
- * Rank every current safe chunk through the first-party master. Any failed or
- * malformed batch discards the whole semantic pass so callers use keyword-only
- * results rather than a misleading partial ranking.
- */
-export async function rankCoreMemorySemantically(
+async function rankViaMasterRelay(
   query: string,
   documents: CoreMemoryDocument[],
-  options: CoreMemorySemanticOptions = {},
+  base: string,
+  token: string,
+  post: typeof postJson,
 ): Promise<CoreMemorySemanticFile[] | null> {
-  const base = (options.baseUrl ?? process.env.OPENCLAUDE_V3_MASTER_BASE_URL)?.trim()
-  const token = options.token ?? readContainerToken()
-  if (!base || !token) return null
   const chunks = chunkCoreMemoryDocuments(documents)
   if (chunks.length === 0) return []
-  const post = options.postImpl ?? postJson
   const rankedChunks: RemoteRank[] = []
   try {
     for (let at = 0; at < chunks.length; at += BATCH_SIZE) {
@@ -227,6 +240,46 @@ export async function rankCoreMemorySemantically(
       if (expected.size !== 0) return null
     }
     return selectSemanticFiles(query, chunks, rankedChunks)
+  } catch {
+    return null
+  }
+}
+
+function envFlagEnabled(name: string): boolean {
+  const value = process.env[name]?.trim().toLowerCase()
+  return value === '1' || value === 'true' || value === 'yes' || value === 'on'
+}
+
+function localSemanticRequested(options: CoreMemorySemanticOptions): boolean {
+  if (options.localEmbed || options.localLlmRerank) return true
+  return (
+    envFlagEnabled('OPENCLAUDE_CORE_MEMORY_LOCAL_SEMANTIC') ||
+    envFlagEnabled('OPENCLAUDE_CORE_MEMORY_LLM_RERANK')
+  )
+}
+
+/**
+ * Rank every current safe chunk through the first-party master. Any failed or
+ * malformed batch discards the whole semantic pass so callers use keyword-only
+ * results rather than a misleading partial ranking.
+ *
+ * When master is not configured, an explicit personal-edition local embedding
+ * or LLM rerank may run instead. That path is opt-in and fail-closed (null).
+ */
+export async function rankCoreMemorySemantically(
+  query: string,
+  documents: CoreMemoryDocument[],
+  options: CoreMemorySemanticOptions = {},
+): Promise<CoreMemorySemanticFile[] | null> {
+  const base = (options.baseUrl ?? process.env.OPENCLAUDE_V3_MASTER_BASE_URL)?.trim()
+  const token = options.token ?? readContainerToken()
+  if (base && token) {
+    return rankViaMasterRelay(query, documents, base, token, options.postImpl ?? postJson)
+  }
+  if (!localSemanticRequested(options)) return null
+  try {
+    const { rankCoreMemoryLocally } = await import('./coreMemoryLocalSemantic.js')
+    return await rankCoreMemoryLocally(query, documents, options)
   } catch {
     return null
   }

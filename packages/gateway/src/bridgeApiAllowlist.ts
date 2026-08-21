@@ -68,6 +68,14 @@ export const BRIDGE_API_ALLOWLIST: readonly BridgeApiAllowRule[] = [
     proxyFromCommercial: true,
   },
   {
+    // Privacy-minimized per-user usage dashboard. The container handler only
+    // returns counters, latency percentiles and the caller's own session titles.
+    label: '/api/agents/:id/memory/usage',
+    re: /^\/api\/agents\/[A-Za-z0-9_-]+\/memory\/usage$/,
+    methods: M('GET'),
+    proxyFromCommercial: true,
+  },
+  {
     // memdir 单条记忆文件 CRUD。:file 用 [^/]+(容器 handler 再过 basename+MEMORY_FILE_RE
     // 双保险,拒 `..`/非法名),桥门不比 handler 更松。操作用户自己容器卷内的记忆文件,故 proxy。
     label: '/api/agents/:id/memory/files/:file',
@@ -111,6 +119,14 @@ export const BRIDGE_API_ALLOWLIST: readonly BridgeApiAllowRule[] = [
     label: '/api/agents/:id/skills/:name',
     re: /^\/api\/agents\/[^/]+\/skills\/[^/]+$/,
     methods: M('GET', 'PUT', 'DELETE'),
+    proxyFromCommercial: true,
+  },
+  {
+    // Cursor MCP `ask_user` 在容器内运行,经 bridge 把提问卡推到 Web。
+    // handler 仅 POST;sessionKey 必须命中本容器会话且 session.agentId === :id。
+    label: '/api/agents/:id/ask-user',
+    re: /^\/api\/agents\/[a-zA-Z0-9_-]+\/ask-user$/,
+    methods: M('POST'),
     proxyFromCommercial: true,
   },
   // User-level shared skill library (agentId-less). Proxied to the user's own
@@ -237,6 +253,153 @@ export const BRIDGE_API_ALLOWLIST: readonly BridgeApiAllowRule[] = [
     label: '/api/cron/:id',
     re: /^\/api\/cron\/[^/]+$/,
     methods: M('GET', 'PUT', 'DELETE'),
+    proxyFromCommercial: true,
+  },
+
+  // Taskboard (`/api/board/*`). 每条子路径 + method 都要有条目,且必须
+  // proxyFromCommercial:true,否则 commercial 不代理进容器,containerRouteProxyClosure 红。
+  {
+    label: '/api/board/projects',
+    re: /^\/api\/board\/projects$/,
+    methods: M('GET', 'POST'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/projects/:id',
+    re: /^\/api\/board\/projects\/[^/]+$/,
+    methods: M('GET', 'PATCH', 'DELETE'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/projects/:id/board',
+    re: /^\/api\/board\/projects\/[^/]+\/board$/,
+    methods: M('GET'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/tickets',
+    re: /^\/api\/board\/tickets$/,
+    methods: M('GET', 'POST'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/tickets/:id',
+    re: /^\/api\/board\/tickets\/[^/]+$/,
+    methods: M('GET', 'PATCH'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/tickets/:id/:action',
+    re: /^\/api\/board\/tickets\/[^/]+\/(ready|claim|advance|block|approve|reject|done|cancel|comment|patrol|move)$/,
+    methods: M('POST'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/tickets/:id/runs',
+    re: /^\/api\/board\/tickets\/[^/]+\/runs$/,
+    methods: M('GET'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/tickets/:id/relations',
+    re: /^\/api\/board\/tickets\/[^/]+\/relations$/,
+    methods: M('GET', 'POST'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/tickets/:id/comments',
+    re: /^\/api\/board\/tickets\/[^/]+\/comments$/,
+    methods: M('GET'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/tickets/:id/activity',
+    re: /^\/api\/board\/tickets\/[^/]+\/activity$/,
+    methods: M('GET'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/tickets/:id/timeline',
+    re: /^\/api\/board\/tickets\/[^/]+\/timeline$/,
+    methods: M('GET'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/pipelines',
+    re: /^\/api\/board\/pipelines$/,
+    methods: M('GET', 'POST'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/pipelines/:id',
+    re: /^\/api\/board\/pipelines\/[^/]+$/,
+    methods: M('GET', 'PATCH'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/pipelines/:id/stages',
+    re: /^\/api\/board\/pipelines\/[^/]+\/stages$/,
+    methods: M('GET', 'POST'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/stages/:id',
+    re: /^\/api\/board\/stages\/[^/]+$/,
+    methods: M('GET', 'PATCH'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/runs/:id',
+    re: /^\/api\/board\/runs\/[^/]+$/,
+    methods: M('GET'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/relations/:id',
+    re: /^\/api\/board\/relations\/[^/]+$/,
+    methods: M('DELETE'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/agents',
+    re: /^\/api\/board\/agents$/,
+    methods: M('GET'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/settings',
+    re: /^\/api\/board\/settings$/,
+    methods: M('GET', 'PATCH'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/stats/cost',
+    re: /^\/api\/board\/stats\/cost$/,
+    methods: M('GET'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/templates',
+    re: /^\/api\/board\/templates$/,
+    methods: M('GET', 'POST'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/templates/:id',
+    re: /^\/api\/board\/templates\/[^/]+$/,
+    methods: M('GET', 'DELETE'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/templates/:id/apply',
+    re: /^\/api\/board\/templates\/[^/]+\/apply$/,
+    methods: M('POST'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/reports/weekly',
+    re: /^\/api\/board\/reports\/weekly$/,
+    methods: M('GET'),
     proxyFromCommercial: true,
   },
 

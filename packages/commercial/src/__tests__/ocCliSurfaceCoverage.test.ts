@@ -9,6 +9,7 @@ import ts from 'typescript'
 
 import { runOcConnectCli, runOcPluginCli } from '../../../gateway/src/ocConnectCli.js'
 import { planSkillCommand } from '../../../gateway/src/ocSkillCli.js'
+import { planTaskCommand } from '../../../gateway/src/ocTaskCli.js'
 import { runOcWebCli } from '../../../gateway/src/ocWebCli.js'
 
 type RunResult = { code: number | null; stdout: string; stderr: string }
@@ -140,6 +141,10 @@ function cursorLauncherProbe(): void {
 
 function skillProbe(argv: string[], expectedKind: string): Probe {
   return () => assert.equal(planSkillCommand(argv).kind, expectedKind)
+}
+
+function taskProbe(argv: string[], expectedKind: string): Probe {
+  return () => assert.equal(planTaskCommand(argv).kind, expectedKind)
 }
 
 const connectDeps = {
@@ -377,6 +382,9 @@ const OC_SURFACES: Record<string, Record<string, Probe>> = {
     'archival-add': memoryProbe(['archival-add'], /archival-add requires/),
     'archival-search': memoryProbe(['archival-search'], /archival-search requires/),
     'archival-delete': memoryProbe(['archival-delete'], /archival-delete requires/),
+    'delegate-wait': memoryProbe(['delegate-wait'], /delegate-wait requires/),
+    delegate: memoryProbe(['delegate'], /OPENCLAUDE_DELEGATE_CONTEXT_FILE|delegate requires/),
+    'request-review': memoryProbe(['request-review'], /OPENCLAUDE_DELEGATE_CONTEXT_FILE|request-review requires/),
     'memory.retired': memoryProbe(['memory'], /子命令已退役/),
   },
   'oc-minimax': {
@@ -484,6 +492,12 @@ const OC_SURFACES: Record<string, Record<string, Probe>> = {
   'oc-slides': {
     render: tsFailureProbe('packages/gateway/src/ocSlidesCli.ts', [], /usage: oc-slides/),
   },
+  'oc-task': {
+    project: taskProbe(['project', 'list'], 'request'),
+    ticket: taskProbe(['ticket', 'get', 'OCV5-1'], 'request'),
+    relation: taskProbe(['relation', 'remove', 'rel-1'], 'request'),
+    run: taskProbe(['run', 'get', 'run-1'], 'request'),
+  },
   'oc-vision': {
     understand: tsFailureProbe(
       'packages/gateway/src/ocVisionCli.ts',
@@ -567,6 +581,7 @@ const THIN_WRAPPERS: Record<string, string> = {
   'oc-report': 'packages/gateway/src/ocReportCli.ts',
   'oc-skill': 'packages/gateway/src/ocSkillCli.ts',
   'oc-slides': 'packages/gateway/src/ocSlidesCli.ts',
+  'oc-task': 'packages/gateway/src/ocTaskCli.ts',
   'oc-vision': 'packages/gateway/src/ocVisionCli.ts',
   'oc-web': 'packages/gateway/src/ocWebCli.ts',
 }
@@ -872,6 +887,7 @@ function productionSurfaces(): Record<string, Set<string>> {
     'oc-report': singlePurpose('packages/gateway/src/ocReportCli.ts', 'render', /usage: oc-report/),
     'oc-skill': tsDispatchCommands('packages/gateway/src/ocSkillCli.ts', 'cmd'),
     'oc-slides': singlePurpose('packages/gateway/src/ocSlidesCli.ts', 'render', /usage: oc-slides/),
+    'oc-task': tsDispatchCommands('packages/gateway/src/ocTaskCli.ts', 'cmd'),
     'oc-vision': tsDispatchCommands('packages/gateway/src/ocVisionCli.ts', 'cmd'),
     'oc-video': h3Commands(true),
     'oc-web-context': webContextCommands(),
@@ -968,6 +984,12 @@ describe('V5 oc-* public surface coverage contract', () => {
       assert.ok(
         source.includes(`exec npx --no-install tsx ${entry} \"$@\"`),
         `${tool}: expected exact argv-forwarding entry ${entry}`,
+      )
+      assert.match(source, /# help-fast-path/, `${tool}: --help must short-circuit before tsx`)
+      assert.match(
+        source,
+        /\[ "\$\{1:-\}" = "--help" \]/,
+        `${tool}: --help fast-path flag check`,
       )
     }
   })

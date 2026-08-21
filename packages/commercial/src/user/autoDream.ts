@@ -34,6 +34,8 @@ export interface AutoDreamFeature {
   optimizer_enabled: boolean
   legacy_enabled: boolean
   effective: boolean
+  telemetry_ready: boolean | null
+  telemetry_blockers: string[]
   minimum_plan_code: typeof AUTO_DREAM_MINIMUM_PLAN_CODE
   min_interval_hours: number
   min_new_sessions: number
@@ -81,13 +83,22 @@ export async function getAutoDreamFeature(
 ): Promise<AutoDreamFeature> {
   const { eligible, model } = await resolveAutoDreamEntitlement(userId)
   const available = model !== null
+  const readiness = optimizerEnabled
+    ? await import('../analytics/telemetryReadiness.js')
+        .then((mod) => mod.evaluateTelemetryReadiness(userId))
+        .catch(() => null)
+    : null
   return {
     eligible,
     available,
     enabled: enabled || optimizerEnabled,
     optimizer_enabled: optimizerEnabled,
     legacy_enabled: enabled,
-    effective: eligible && available && (enabled || optimizerEnabled),
+    effective:
+      eligible && available && (enabled || optimizerEnabled)
+      && (!optimizerEnabled || readiness?.ready === true),
+    telemetry_ready: optimizerEnabled ? readiness?.ready ?? false : null,
+    telemetry_blockers: optimizerEnabled ? readiness?.blockers ?? ['telemetry_unavailable'] : [],
     minimum_plan_code: AUTO_DREAM_MINIMUM_PLAN_CODE,
     min_interval_hours: AUTO_DREAM_OPTIMIZER_MIN_INTERVAL_HOURS,
     min_new_sessions: AUTO_DREAM_MIN_NEW_SESSIONS,
@@ -115,6 +126,12 @@ export async function getAutoDreamPolicy(userId: bigint | number | string): Prom
   const optimizerEnabled = snap.prefs.auto_optimizer_enabled === true
   const legacyEnabled = snap.prefs.auto_dream_enabled === true
   if (!optimizerEnabled && !legacyEnabled) return { enabled: false }
+  if (optimizerEnabled) {
+    const readiness = await import('../analytics/telemetryReadiness.js')
+      .then((mod) => mod.evaluateTelemetryReadiness(userId))
+      .catch(() => null)
+    if (!readiness?.ready) return { enabled: false }
+  }
   const eligible = await isAutoDreamEligible(userId)
   if (!eligible) return { enabled: false }
   const entitlement = optimizerEnabled

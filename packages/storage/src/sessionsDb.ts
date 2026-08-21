@@ -3,13 +3,16 @@
 //
 // Two tables:
 //   sessions_meta (id PRIMARY KEY, agent_id, channel, peer_id, started_at, last_at, title)
-//   sessions_fts  (FTS5 virtual): session_id, turn_idx, role, content
-//     — tokenize unicode61 remove_diacritics 2 (Chinese + English tolerant)
+//   sessions_fts  (FTS5 virtual): session_id, turn_idx, role, content, content_fts
+//     — tokenize unicode61 remove_diacritics 2
+//     — content is the original turn text (snippet col 3, loadSessionTurns)
+//     — content_fts is CJK Segmenter words + char bigrams (see ftsQuery.ts)
 //
 // On every result event from subprocessRunner we insert the (user_text,
 // assistant_text) for the turn into sessions_fts. Queries use MATCH and
 // group hits by session_id to return top-N unique sessions.
 
+import { randomUUID } from 'node:crypto'
 import { appendFile, readFile, rename, writeFile } from 'node:fs/promises'
 import { mkdir } from 'node:fs/promises'
 import { dirname } from 'node:path'
@@ -23,6 +26,7 @@ import {
   modelHistorySemanticText,
   MODEL_HISTORY_EXACT_SUFFIX_MARKER,
   resolveModelHistoryContextWindow,
+  type LiveUnitsPage,
 } from '@openclaude/protocol'
 import Database from 'better-sqlite3'
 // 引擎中立的写路径决策层(RFC D6b);与本文件构成运行时环(见 clientSessionsPlan.ts 顶注)。
@@ -33,7 +37,8 @@ import {
   planSpillOverflow,
   type SpillChunkPlan,
 } from './clientSessionsPlan.js'
-import { literalFtsQuery } from './ftsQuery.js'
+import { cjkFtsColumn, literalFtsQuery } from './ftsQuery.js'
+import { migrateSessionsFtsCjk, registerFtsCjkFunctions } from './ftsCjkMigrate.js'
 import { paths } from './paths.js'
 // wechat_bindings 是 master 六表之一,其 SQLite 实现在 wechatBindings.ts(靠近 wechat 专用
 // helper),这里 import 进来组合成完整的 sqliteBackend。函数声明,循环 import 下实例化即就绪。
@@ -70,6 +75,7 @@ export async function getSessionsDb(): Promise<Database.Database> {
   // this aligned with sessionsMigrate.ts.
   db.pragma('busy_timeout = 10000')
   db.pragma('journal_mode = WAL')
+  registerFtsCjkFunctions(db)
   db.exec(`
     CREATE TABLE IF NOT EXISTS sessions_meta (
       id TEXT PRIMARY KEY,
@@ -114,6 +120,7 @@ export async function getSessionsDb(): Promise<Database.Database> {
       turn_idx UNINDEXED,
       role UNINDEXED,
       content,
+      content_fts,
       tokenize = 'unicode61 remove_diacritics 2'
     );
 
@@ -142,6 +149,52 @@ export async function getSessionsDb(): Promise<Database.Database> {
       tool_calls INTEGER NOT NULL DEFAULT 0,
       timestamp INTEGER NOT NULL,
       terminal_status TEXT NOT NULL DEFAULT 'completed'
+    );
+
+    -- Exact, privacy-minimized memory operations. Unlike tool.called previews,
+    -- these rows are written at the memory implementation boundary and remain
+    -- attributable even when one Bash invocation wraps multiple CLI calls.
+    CREATE TABLE IF NOT EXISTS memory_usage_events (
+      event_id TEXT PRIMARY KEY,
+      timestamp INTEGER NOT NULL,
+      agent_id TEXT NOT NULL,
+      session_key TEXT,
+      turn_index INTEGER,
+      operation TEXT NOT NULL,
+      memory_type TEXT NOT NULL,
+      outcome TEXT NOT NULL,
+      policy_reason TEXT,
+      retrieval_mode TEXT,
+      result_count INTEGER,
+      latency_ms INTEGER NOT NULL DEFAULT 0,
+      query_hash TEXT,
+      query_chars INTEGER,
+      top_match_hash TEXT,
+      metadata_json TEXT NOT NULL DEFAULT '{}',
+      freshness_gap INTEGER,
+      reported_at INTEGER
+    );
+
+    -- Shadow freshness contract, one row per logical turn. It deliberately
+    -- stores only an intent class and booleans, never the user prompt.
+    CREATE TABLE IF NOT EXISTS memory_turn_context (
+      session_key TEXT NOT NULL,
+      turn_index INTEGER NOT NULL,
+      agent_id TEXT NOT NULL,
+      current_fact_intent INTEGER NOT NULL DEFAULT 0,
+      intent_kind TEXT,
+      evidence_seen INTEGER NOT NULL DEFAULT 0,
+      memory_used INTEGER NOT NULL DEFAULT 0,
+      soft_reminder_active INTEGER NOT NULL DEFAULT 0,
+      freshness_gap INTEGER,
+      created_at INTEGER NOT NULL,
+      completed_at INTEGER,
+      PRIMARY KEY(session_key, turn_index)
+    );
+
+    CREATE TABLE IF NOT EXISTS memory_usage_kv (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
     );
   `)
 
@@ -196,6 +249,10 @@ export async function getSessionsDb(): Promise<Database.Database> {
     CREATE INDEX IF NOT EXISTS idx_event_log_peer ON event_log(peer_id);
     CREATE INDEX IF NOT EXISTS idx_usage_log_agent_ts ON usage_log(agent_id, timestamp);
     CREATE INDEX IF NOT EXISTS idx_usage_log_session ON usage_log(session_id);
+    CREATE INDEX IF NOT EXISTS idx_memory_usage_agent_ts ON memory_usage_events(agent_id, timestamp);
+    CREATE INDEX IF NOT EXISTS idx_memory_usage_session_turn ON memory_usage_events(session_key, turn_index);
+    CREATE INDEX IF NOT EXISTS idx_memory_usage_pending ON memory_usage_events(reported_at, timestamp);
+    CREATE INDEX IF NOT EXISTS idx_memory_turn_context_agent_ts ON memory_turn_context(agent_id, created_at);
   `)
 
   // Periodic WAL checkpoint to prevent unbounded WAL growth
@@ -215,6 +272,10 @@ export async function getSessionsDb(): Promise<Database.Database> {
   // Use process.on (not once) so that closeSessionsDb() + reopen still works,
   // but the guard `if (_db)` makes repeated calls idempotent.
   process.on('exit', _onExit)
+
+  // CJK FTS rebuild (idempotent). Existing DBs still have the 4-column
+  // unicode61 schema from CREATE IF NOT EXISTS; this swaps in content_fts.
+  migrateSessionsFtsCjk(db)
 
   // Clean up orphaned FTS records (sessions_fts rows with no matching sessions_meta)
   try {
@@ -321,6 +382,95 @@ export async function getSessionsDb(): Promise<Database.Database> {
       db.exec("ALTER TABLE client_sessions ADD COLUMN model_id TEXT DEFAULT NULL")
     }
   } catch { /* table just created with column already */ }
+  // Migration: chat_projects + client_sessions.project_id —— 侧栏会话的项目层级。
+  // 与看板 tb_project / /api/board/projects 无关。不建硬外键;删项目时只把其下会话
+  // project_id 置 NULL,绝不级联删会话。PG 侧对应迁移 0230_chat_projects。
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS chat_projects (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      instructions TEXT,
+      color TEXT,
+      sort_order INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      deleted_at INTEGER DEFAULT NULL
+    );
+  `)
+  try {
+    const cols = db.pragma('table_info(client_sessions)') as Array<{ name: string }>
+    if (!cols.some(c => c.name === 'project_id')) {
+      db.exec('ALTER TABLE client_sessions ADD COLUMN project_id TEXT DEFAULT NULL')
+    }
+  } catch { /* table just created with column already */ }
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_chat_projects_user_deleted
+      ON chat_projects(user_id, deleted_at);
+    CREATE INDEX IF NOT EXISTS idx_client_sessions_user_project
+      ON client_sessions(user_id, project_id);
+  `)
+  // Migration: project_assets —— 聊天项目资产层(用户上传参考资料 + 会话产出物索引)。
+  // 软删只删索引行,绝不删磁盘文件:文件是 sha256 内容寻址的,可能被别的消息/资产共用。
+  // PG 侧对应迁移 0237_project_assets。
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS project_assets (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      project_id TEXT,
+      source TEXT NOT NULL CHECK (source IN ('upload', 'output')),
+      session_id TEXT,
+      name TEXT NOT NULL,
+      url TEXT,
+      container_path TEXT,
+      mime TEXT,
+      size_bytes INTEGER,
+      digest TEXT,
+      excerpt TEXT,
+      pinned INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      deleted_at INTEGER DEFAULT NULL,
+      CHECK (
+        (url IS NOT NULL AND length(url) > 0)
+        OR (container_path IS NOT NULL AND length(container_path) > 0)
+      )
+    );
+    CREATE INDEX IF NOT EXISTS idx_project_assets_user_project_created
+      ON project_assets(user_id, project_id, deleted_at, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_project_assets_user_project_pinned
+      ON project_assets(user_id, project_id, pinned)
+      WHERE deleted_at IS NULL AND pinned = 1;
+    CREATE INDEX IF NOT EXISTS idx_project_assets_user_digest
+      ON project_assets(user_id, digest);
+  `)
+  // Migration: client_sessions.archived_at —— 侧栏「归档会话」(整会话从默认列表隐藏)。
+  // 与消息热尾巴 spill 的 archived_through_seq / archived_count 无关,不撞名。
+  // PG 侧对应迁移 0233_client_session_list_archived_at。
+  try {
+    const cols = db.pragma('table_info(client_sessions)') as Array<{ name: string }>
+    if (!cols.some(c => c.name === 'archived_at')) {
+      db.exec('ALTER TABLE client_sessions ADD COLUMN archived_at INTEGER DEFAULT NULL')
+    }
+  } catch { /* table just created with column already */ }
+  // Migration: client_sessions.last_read_at —— 侧栏「未读的完成」服务端权威。
+  // 打开会话才 bump;终态不写本列。存量回填成已读,避免上线后侧栏全绿。
+  // PG 侧对应迁移 0240_client_session_last_read_at。
+  try {
+    const cols = db.pragma('table_info(client_sessions)') as Array<{ name: string }>
+    if (!cols.some(c => c.name === 'last_read_at')) {
+      db.exec('ALTER TABLE client_sessions ADD COLUMN last_read_at INTEGER DEFAULT NULL')
+      db.exec('UPDATE client_sessions SET last_read_at = last_at WHERE last_read_at IS NULL')
+    }
+  } catch { /* table just created with column already */ }
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_client_sessions_user_list
+      ON client_sessions(user_id, last_at DESC)
+      WHERE deleted_at IS NULL;
+    CREATE INDEX IF NOT EXISTS idx_client_sessions_user_list_active
+      ON client_sessions(user_id, last_at DESC)
+      WHERE deleted_at IS NULL AND archived_at IS NULL;
+  `)
 
   // ── 长会话热尾巴 + 归档(spill/archive)──
   //
@@ -531,6 +681,27 @@ export async function getSessionsDb(): Promise<Database.Database> {
     CREATE INDEX IF NOT EXISTS idx_tdi_open ON turn_dispatch_inbox(state)
       WHERE state NOT IN ('terminal','rejected');
   `)
+  // 0241: last_at 通常比 inbox.updated_at（终态时刻,epoch ms）早数毫秒,0240 回填后
+  // 仍 terminal > last_read_at。一次性抬到 max(inbox.updated_at)。user_version 作门,
+  // 禁止每次 open 都重跑（会把真正的新终态未读清掉）。必须在 inbox 建表之后。
+  try {
+    const uvRow = db.pragma('user_version') as Array<{ user_version: number }>
+    const uv = Number(uvRow[0]?.user_version ?? 0)
+    if (uv < 241) {
+      db.exec(`
+        UPDATE client_sessions
+           SET last_read_at = MAX(
+                 COALESCE(last_read_at, 0),
+                 COALESCE((
+                   SELECT MAX(updated_at) FROM turn_dispatch_inbox
+                    WHERE session_id = client_sessions.id
+                      AND state IN ('terminal', 'rejected')
+                 ), 0)
+               )
+      `)
+      db.pragma('user_version = 241')
+    }
+  } catch { /* 水位抬升失败不挡开库;下次 open 再试 */ }
 
   // 旧重量级团队模式(team_runs / team_delegations)已整套删除:schema 不再声明,
   // 存量本地 DB 里已建的表留着无害(不写 DROP TABLE,不迁移)。
@@ -1159,10 +1330,10 @@ export async function indexTurn(
 ): Promise<void> {
   const db = await getSessionsDb()
   const stmt = db.prepare(
-    'INSERT INTO sessions_fts (session_id, turn_idx, role, content) VALUES (?, ?, ?, ?)',
+    'INSERT INTO sessions_fts (session_id, turn_idx, role, content, content_fts) VALUES (?, ?, ?, ?, ?)',
   )
-  if (userText) stmt.run(sessionId, turnIdx, 'user', userText)
-  if (assistantText) stmt.run(sessionId, turnIdx, 'assistant', assistantText)
+  if (userText) stmt.run(sessionId, turnIdx, 'user', userText, cjkFtsColumn(userText))
+  if (assistantText) stmt.run(sessionId, turnIdx, 'assistant', assistantText, cjkFtsColumn(assistantText))
 }
 
 // Returns the maximum turn_idx already persisted in the FTS index across
@@ -1589,6 +1760,36 @@ export async function insertUsageLog(entry: UsageLogEntry): Promise<InsertUsageL
   return { status: 'duplicate', conflict }
 }
 
+export async function pruneLocalObservability(input: {
+  eventBeforeMs: number;
+  usageBeforeMs: number;
+}): Promise<{ previewsScrubbed: number; eventsDeleted: number; usageDeleted: number }> {
+  const db = await getSessionsDb()
+  const run = db.transaction(() => {
+    // Commercial telemetry stores hashes/aggregates only. Scrub previews from
+    // rows written by earlier runtimes immediately, including recent rows that
+    // are still inside the raw-event retention window.
+    const previews = db.prepare(`
+      UPDATE event_log
+         SET payload = json_remove(payload, '$.inputPreview', '$.outputPreview')
+       WHERE type = 'tool.called'
+         AND json_valid(payload) = 1
+         AND (
+           json_type(payload, '$.inputPreview') IS NOT NULL
+           OR json_type(payload, '$.outputPreview') IS NOT NULL
+         )
+    `).run()
+    const events = db.prepare('DELETE FROM event_log WHERE timestamp < ?').run(input.eventBeforeMs)
+    const usage = db.prepare('DELETE FROM usage_log WHERE timestamp < ?').run(input.usageBeforeMs)
+    return {
+      previewsScrubbed: Number(previews.changes),
+      eventsDeleted: Number(events.changes),
+      usageDeleted: Number(usage.changes),
+    }
+  })
+  return run()
+}
+
 export interface UsageSummary {
   totalCostUsd: number
   totalInputTokens: number
@@ -1656,6 +1857,15 @@ export interface ClientSession {
   // 值是 `_orderSeq` 水位。旧行/无归档 → 0。
   archivedCount?: number
   archivedThroughSeq?: number
+  /** In-flight durable dispatch for this session, if any (rev2 P0). */
+  openDispatch?: {
+    dispatchId: string
+    clientMessageId: string
+    status: string
+    acceptedAt: number | null
+    lastFrameAt: number | null
+    model?: string
+  }
 }
 
 /**
@@ -1721,6 +1931,14 @@ export function decodeClientTimelineCursor(raw: string): ClientTimelineCursor | 
   }
 }
 
+export type ClientSessionRunState = 'running' | 'idle'
+export type ClientSessionLastOutcome =
+  | 'completed'
+  | 'interrupted'
+  | 'crashed'
+  | 'not_accepted'
+  | 'executed_error'
+
 export interface ClientSessionMeta {
   id: string
   agentId: string
@@ -1732,6 +1950,539 @@ export interface ClientSessionMeta {
   updatedAt: number
   /** 会话级模型选择(见 {@link ClientSession.modelId};列表回带供切会话即时恢复选择器)。 */
   modelId?: string
+  /** 所属聊天项目;未分组为 null。 */
+  projectId: string | null
+  /** running = 该会话存在非终态 turn dispatch。 */
+  runState: ClientSessionRunState
+  /** 最近一条终态 dispatch 的 outcome;从未跑过 turn 为 null。 */
+  lastOutcome: ClientSessionLastOutcome | null
+  /** 最近终态的错误码(如 SERVICE_RESTART);inbox 无此列时为 null。 */
+  lastErrorCode: string | null
+  /** 侧栏归档(整会话);与消息 spill 水位无关。 */
+  archived: boolean
+  /** 有终态未看(含 crash)。绿点是否画仍由前端 resolveSidebarDot 决定。 */
+  unread: boolean
+  /** 最后一条消息的纯文本前 80 字;无消息则不带。 */
+  lastMessagePreview?: string
+}
+
+export const CHAT_PROJECT_NAME_MAX = 60
+export const CHAT_PROJECT_INSTRUCTIONS_MAX = 4000
+export const CHAT_PROJECT_COLOR_MAX = 24
+export const CHAT_PROJECT_PER_USER_LIMIT = 100
+
+export type ChatProject = {
+  id: string
+  name: string
+  instructions: string | null
+  color: string | null
+  sortOrder: number
+  createdAt: number
+  updatedAt: number
+  sessionCount: number
+}
+
+export type ChatProjectCreateError = 'limit_exceeded' | 'invalid_name' | 'invalid_instructions' | 'invalid_color'
+export type ChatProjectUpdateError = 'not_found' | 'invalid_name' | 'invalid_instructions' | 'invalid_color' | 'invalid_sort_order'
+export type ChatProjectDeleteError = 'not_found'
+
+export type ChatProjectCreateResult =
+  | { ok: true; project: ChatProject }
+  | { ok: false; error: ChatProjectCreateError }
+export type ChatProjectUpdateResult =
+  | { ok: true; project: ChatProject }
+  | { ok: false; error: ChatProjectUpdateError }
+export type ChatProjectDeleteResult =
+  | { ok: true }
+  | { ok: false; error: ChatProjectDeleteError }
+
+export const PROJECT_ASSET_NAME_MAX = 200
+export const PROJECT_ASSET_EXCERPT_MAX = 2000
+export const PROJECT_ASSET_MIME_MAX = 128
+export const PROJECT_ASSET_SESSION_ID_MAX = 128
+export const PROJECT_ASSET_PER_PROJECT_LIMIT = 500
+export const PROJECT_ASSET_LIST_LIMIT_DEFAULT = 200
+export const PROJECT_ASSET_LIST_LIMIT_MAX = 500
+export const PROJECT_ASSET_PINNED_INJECT_MAX = 20
+export const PROJECT_ASSET_URL_RE = /^\/api\/media\/[0-9a-f]{64}\.[A-Za-z0-9]{1,32}$/
+export const PROJECT_ASSET_CONTAINER_PREFIXES = [
+  '/home/agent/.openclaude/uploads/',
+  '/home/agent/.openclaude/generated/',
+] as const
+export const PROJECT_ASSET_CONTROL_CHARS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g
+
+export type ProjectAssetSource = 'upload' | 'output'
+
+export type ProjectAsset = {
+  id: string
+  projectId: string | null
+  source: ProjectAssetSource
+  sessionId: string | null
+  name: string
+  url: string | null
+  containerPath: string | null
+  mime: string | null
+  sizeBytes: number | null
+  digest: string | null
+  excerpt: string | null
+  pinned: boolean
+  createdAt: number
+  updatedAt: number
+}
+
+export type ProjectAssetCreateError =
+  | 'limit_exceeded'
+  | 'invalid_name'
+  | 'invalid_source'
+  | 'invalid_url'
+  | 'invalid_container_path'
+  | 'invalid_locator'
+  | 'invalid_digest'
+  | 'invalid_mime'
+  | 'invalid_size'
+  | 'invalid_session'
+  | 'project_not_found'
+export type ProjectAssetUpdateError =
+  | 'not_found'
+  | 'invalid_name'
+  | 'project_not_found'
+  | 'limit_exceeded'
+export type ProjectAssetDeleteError = 'not_found'
+
+export type ProjectAssetCreateResult =
+  | { ok: true; asset: ProjectAsset }
+  | { ok: false; error: ProjectAssetCreateError }
+export type ProjectAssetUpdateResult =
+  | { ok: true; asset: ProjectAsset }
+  | { ok: false; error: ProjectAssetUpdateError }
+export type ProjectAssetDeleteResult =
+  | { ok: true }
+  | { ok: false; error: ProjectAssetDeleteError }
+
+export type ListProjectAssetsOpts = {
+  projectId: string | null
+  limit?: number
+}
+
+export type ProjectAssetCreateInput = {
+  projectId?: unknown
+  source?: unknown
+  sessionId?: unknown
+  name?: unknown
+  url?: unknown
+  containerPath?: unknown
+  mime?: unknown
+  size?: unknown
+  digest?: unknown
+  excerpt?: unknown
+  pinned?: unknown
+}
+
+export type ProjectAssetUpdateInput = {
+  pinned?: unknown
+  name?: unknown
+  projectId?: unknown
+}
+
+export type ParsedProjectAssetCreate = {
+  projectIdPresent: boolean
+  projectId: string | null
+  source: ProjectAssetSource
+  sessionId: string | null
+  name: string
+  url: string | null
+  containerPath: string | null
+  mime: string | null
+  sizeBytes: number | null
+  digest: string | null
+  excerpt: string | null
+  pinned: boolean
+}
+
+export type ClientSessionMetaPatch = {
+  title?: string
+  modelId?: string
+  projectId?: string | null
+  pinned?: boolean
+  archived?: boolean
+}
+
+export const SESSION_SEARCH_Q_MAX = 200
+export const SESSION_SEARCH_LIMIT_DEFAULT = 30
+export const SESSION_SEARCH_LIMIT_MAX = 50
+export const SESSION_LIST_LIMIT_MAX = 200
+export const SESSION_BATCH_IDS_MAX = 200
+
+/** list/search 派生 unread 时认定的终态 outcome(与前端 TERMINAL_OUTCOMES 对齐)。 */
+export const CLIENT_SESSION_UNREAD_OUTCOMES = [
+  'completed',
+  'interrupted',
+  'crashed',
+  'not_accepted',
+  'executed_error',
+] as const
+
+const UNREAD_OUTCOME_SQL = CLIENT_SESSION_UNREAD_OUTCOMES.map((o) => `'${o}'`).join(',')
+/** last_read_at / inbox.updated_at / PG terminal_at 比较一律用 epoch milliseconds。
+ *  小于此阈值的值视为 unix seconds（防御混单位行），再 ×1000。
+ *  1e11 ms ≈ 1973-03-03；2026 年 unix seconds ≈ 1.7e9，unix ms ≈ 1.7e12。 */
+export const LAST_READ_AT_EPOCH_MS_FLOOR = 100_000_000_000
+
+/** 把 last_read_at（或同类水位列）规范成 epoch ms。0/NULL → 0（从未打开）。 */
+export function lastReadAtWatermarkMsSql(col = 'cs.last_read_at'): string {
+  return `(CASE WHEN COALESCE(${col}, 0) <= 0 THEN 0 WHEN ${col} < ${LAST_READ_AT_EPOCH_MS_FLOOR} THEN (${col} * 1000) ELSE ${col} END)`
+}
+
+const LAST_READ_AT_MS_SQL = lastReadAtWatermarkMsSql('cs.last_read_at')
+const LAST_D_TERMINAL_MS_SQL = lastReadAtWatermarkMsSql('last_d.terminal_at')
+export const LAST_MESSAGE_PREVIEW_MAX = 80
+// 侧栏预览只从 messages 数组尾部往前看这么多条。线上 assistant 不带 text(正文在
+// turn tape),最后一条几乎总是占位 stub;一轮对话里 user + 若干 assistant/tool/thinking
+// stub 远小于 20,再往前是更早轮次,不适合当预览。超长数组不从头扫。
+export const LAST_MESSAGE_PREVIEW_TAIL_MAX = 20
+export const SEARCH_SNIPPET_MAX = 160
+export const SEARCH_SNIPPET_RADIUS = 40
+export const PROJECT_INSTRUCTIONS_INJECT_MAX = 4000
+// 搜索 JSON 展开候选上限:TEXT LIKE/ILIKE 先收窄后按 last_at DESC 取最近 N 条再 json_each /
+// json_array_elements。结果上限 50;80 给 title+message 合并排名留余量。极端账号(数十 MB
+// tape、上百会话)不能把一次搜索变成对该用户全部行做 JSON 解析。
+export const SESSION_SEARCH_JSON_CANDIDATE_MAX = 80
+// 单条 messages TEXT 超过此字节数则不做 JSON 展开:只按 TEXT 命中给出一条 kind=message
+// 与截断 snippet。2MB = 热尾巴 spill 目标(SESSION_TAIL_TARGET_BYTES);历史上 67MB/90MB
+// 物化拖垮进程,对这些行 json_array_elements / json_each 会压住数据库数秒。
+export const SESSION_SEARCH_JSON_EXPAND_MAX_BYTES = 2 * 1024 * 1024
+
+export type ListClientSessionsOpts = {
+  includeArchived?: boolean
+  /** 不传 = 全量(老客户端);传入则上限 200。 */
+  limit?: number
+  /** 上一页最后一项的 lastAt(毫秒,不含该点)。 */
+  before?: number
+}
+
+export type ListClientSessionsResult = {
+  sessions: ClientSessionMeta[]
+  nextCursor?: number
+}
+
+export type SessionSearchKind = 'title' | 'message'
+
+export type SessionSearchHit = {
+  sessionId: string
+  title: string
+  projectId: string | null
+  snippet: string
+  matchedAt: number
+  kind: SessionSearchKind
+  unread: boolean
+}
+
+export type MarkClientSessionReadResult =
+  | { ok: true; updated: number }
+  | { ok: false; error: 'not_found' }
+
+export type SearchClientSessionsOpts = {
+  q: string
+  limit?: number
+  includeArchived?: boolean
+}
+
+export type SearchClientSessionsResult = {
+  results: SessionSearchHit[]
+}
+
+export type BatchClientSessionsAction = 'archive' | 'unarchive' | 'delete' | 'move'
+
+export type BatchClientSessionsInput = {
+  ids?: unknown
+  action?: unknown
+  projectId?: unknown
+}
+
+export type BatchClientSessionsResult =
+  | { ok: true; updated: number; skipped: number }
+  | { ok: false; error: 'invalid_ids' | 'invalid_action' | 'ids_limit' | 'project_not_found' }
+
+/** 去掉破坏提示结构的控制字符,截断到注入上限。 */
+export function sanitizeProjectInstructions(raw: string): string {
+  const cleaned = raw.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '')
+  return cleaned.length > PROJECT_INSTRUCTIONS_INJECT_MAX
+    ? cleaned.slice(0, PROJECT_INSTRUCTIONS_INJECT_MAX)
+    : cleaned
+}
+
+/** 侧栏预览/搜索 snippet:去代码块、图片、HTML、换行,压空白。 */
+export function toPlainSessionText(raw: string): string {
+  return raw
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+export function toLastMessagePreview(raw: string | null | undefined): string | undefined {
+  if (!raw) return undefined
+  const plain = toPlainSessionText(raw)
+  if (!plain) return undefined
+  return plain.length > LAST_MESSAGE_PREVIEW_MAX ? plain.slice(0, LAST_MESSAGE_PREVIEW_MAX) : plain
+}
+
+export function buildSearchSnippet(haystack: string, q: string): string {
+  const plain = toPlainSessionText(haystack)
+  if (!plain) return ''
+  const needle = q.trim()
+  const lower = plain.toLowerCase()
+  const idx = needle ? lower.indexOf(needle.toLowerCase()) : 0
+  const start = idx < 0 ? 0 : Math.max(0, idx - SEARCH_SNIPPET_RADIUS)
+  const end = idx < 0
+    ? Math.min(plain.length, SEARCH_SNIPPET_MAX)
+    : Math.min(plain.length, idx + needle.length + SEARCH_SNIPPET_RADIUS)
+  let slice = plain.slice(start, end)
+  if (start > 0) slice = `…${slice}`
+  if (end < plain.length) slice = `${slice}…`
+  return slice.length > SEARCH_SNIPPET_MAX ? slice.slice(0, SEARCH_SNIPPET_MAX) : slice
+}
+
+/** LIKE/ILIKE 通配符转义;调用方配合 ESCAPE '\'。 */
+export function escapeLikePattern(q: string): string {
+  return q.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_')
+}
+
+export function parseOptionalPositiveInt(raw: string | null, fallback: number, max: number): number {
+  if (raw === null || raw === '') return fallback
+  const n = Number(raw)
+  if (!Number.isFinite(n) || n <= 0) return fallback
+  return Math.min(max, Math.floor(n))
+}
+
+export function parseIncludeArchivedFlag(raw: string | null): boolean {
+  return raw === '1' || raw === 'true'
+}
+
+export function parseSessionBatchInput(input: BatchClientSessionsInput): BatchClientSessionsResult | {
+  ids: string[]
+  action: BatchClientSessionsAction
+  projectId?: string | null
+} {
+  if (!Array.isArray(input.ids)) return { ok: false, error: 'invalid_ids' }
+  if (input.ids.length > SESSION_BATCH_IDS_MAX) return { ok: false, error: 'ids_limit' }
+  const ids: string[] = []
+  const seen = new Set<string>()
+  for (const raw of input.ids) {
+    if (typeof raw !== 'string') return { ok: false, error: 'invalid_ids' }
+    const id = raw.trim()
+    if (id.length < 1 || id.length > 64) return { ok: false, error: 'invalid_ids' }
+    if (seen.has(id)) continue
+    seen.add(id)
+    ids.push(id)
+  }
+  if (input.action !== 'archive' && input.action !== 'unarchive' && input.action !== 'delete' && input.action !== 'move') {
+    return { ok: false, error: 'invalid_action' }
+  }
+  if (input.action === 'move') {
+    if (input.projectId !== undefined && input.projectId !== null && typeof input.projectId !== 'string') {
+      return { ok: false, error: 'invalid_action' }
+    }
+    const projectId = input.projectId === undefined || input.projectId === null
+      ? null
+      : input.projectId.trim()
+    if (projectId !== null && (projectId.length < 8 || projectId.length > 64)) {
+      return { ok: false, error: 'invalid_action' }
+    }
+    return { ids, action: 'move', projectId }
+  }
+  return { ids, action: input.action }
+}
+
+export type PatchClientSessionMetaResult =
+  | { ok: true; updatedAt: number }
+  | { ok: false; error: 'not_found' | 'project_not_found' }
+
+export function parseChatProjectName(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const name = value.trim()
+  return name.length >= 1 && name.length <= CHAT_PROJECT_NAME_MAX ? name : null
+}
+
+/** undefined = 未提供;null = 合法清空;invalid 由调用方映射 400。 */
+export function parseChatProjectOptionalText(
+  value: unknown,
+  maxLen: number,
+): { present: false } | { present: true; value: string | null } | { invalid: true } {
+  if (value === undefined) return { present: false }
+  if (value === null) return { present: true, value: null }
+  if (typeof value !== 'string') return { invalid: true }
+  const trimmed = value.trim()
+  if (trimmed.length > maxLen) return { invalid: true }
+  return { present: true, value: trimmed.length === 0 ? null : trimmed }
+}
+
+export function parseChatProjectSortOrder(value: unknown): number | null {
+  if (typeof value !== 'number' || !Number.isInteger(value) || !Number.isSafeInteger(value)) return null
+  return value
+}
+
+export function stripProjectAssetControlChars(raw: string): string {
+  return raw.replace(PROJECT_ASSET_CONTROL_CHARS, '')
+}
+
+export function parseProjectAssetName(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const name = stripProjectAssetControlChars(value).trim()
+  return name.length >= 1 && name.length <= PROJECT_ASSET_NAME_MAX ? name : null
+}
+
+export function parseProjectAssetSource(value: unknown): ProjectAssetSource | null {
+  return value === 'upload' || value === 'output' ? value : null
+}
+
+export function parseProjectAssetUrl(value: unknown): { present: false } | { present: true; value: string } | { invalid: true } {
+  if (value === undefined || value === null) return { present: false }
+  if (typeof value !== 'string') return { invalid: true }
+  const url = value.trim()
+  if (url.length === 0) return { present: false }
+  return PROJECT_ASSET_URL_RE.test(url) ? { present: true, value: url } : { invalid: true }
+}
+
+export function parseProjectAssetContainerPath(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const path = value.trim()
+  if (!path || path.includes('..') || stripProjectAssetControlChars(path) !== path || /\s/.test(path)) {
+    return null
+  }
+  const matched = PROJECT_ASSET_CONTAINER_PREFIXES.some((prefix) => {
+    if (!path.startsWith(prefix)) return false
+    const rest = path.slice(prefix.length)
+    return rest.length > 0 && !rest.includes('..')
+  })
+  return matched ? path : null
+}
+
+export function parseProjectAssetOptionalContainerPath(
+  value: unknown,
+): { present: false } | { present: true; value: string } | { invalid: true } {
+  if (value === undefined || value === null) return { present: false }
+  if (typeof value !== 'string') return { invalid: true }
+  if (value.trim().length === 0) return { present: false }
+  const parsed = parseProjectAssetContainerPath(value)
+  return parsed ? { present: true, value: parsed } : { invalid: true }
+}
+
+export function parseProjectAssetDigest(value: unknown): { present: false } | { present: true; value: string } | { invalid: true } {
+  if (value === undefined || value === null) return { present: false }
+  if (typeof value !== 'string') return { invalid: true }
+  const digest = value.trim().toLowerCase()
+  if (digest.length === 0) return { present: false }
+  return /^[0-9a-f]{64}$/.test(digest) ? { present: true, value: digest } : { invalid: true }
+}
+
+export function parseProjectAssetMime(value: unknown): { present: false } | { present: true; value: string } | { invalid: true } {
+  if (value === undefined || value === null) return { present: false }
+  if (typeof value !== 'string') return { invalid: true }
+  const mime = stripProjectAssetControlChars(value).trim()
+  if (mime.length === 0) return { present: false }
+  if (mime.length > PROJECT_ASSET_MIME_MAX || mime.includes('\n') || mime.includes('\r')) return { invalid: true }
+  return { present: true, value: mime }
+}
+
+export function parseProjectAssetSize(value: unknown): { present: false } | { present: true; value: number } | { invalid: true } {
+  if (value === undefined || value === null) return { present: false }
+  if (typeof value !== 'number' || !Number.isInteger(value) || !Number.isSafeInteger(value) || value < 0) {
+    return { invalid: true }
+  }
+  return { present: true, value }
+}
+
+export function parseProjectAssetSessionId(value: unknown): { present: false } | { present: true; value: string } | { invalid: true } {
+  if (value === undefined || value === null) return { present: false }
+  if (typeof value !== 'string') return { invalid: true }
+  const id = stripProjectAssetControlChars(value).trim()
+  if (id.length === 0) return { present: false }
+  if (id.length > PROJECT_ASSET_SESSION_ID_MAX || id.includes('..') || /\s/.test(id)) return { invalid: true }
+  return { present: true, value: id }
+}
+
+export function parseProjectAssetProjectId(value: unknown): { present: false } | { present: true; value: string | null } | { invalid: true } {
+  if (value === undefined) return { present: false }
+  if (value === null) return { present: true, value: null }
+  if (typeof value !== 'string') return { invalid: true }
+  const id = value.trim()
+  if (id.length === 0 || id === 'none') return { present: true, value: null }
+  if (id.length < 8 || id.length > 64) return { invalid: true }
+  return { present: true, value: id }
+}
+
+export function parseProjectAssetExcerpt(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const excerpt = stripProjectAssetControlChars(value).trim()
+  if (!excerpt) return null
+  return excerpt.length > PROJECT_ASSET_EXCERPT_MAX ? excerpt.slice(0, PROJECT_ASSET_EXCERPT_MAX) : excerpt
+}
+
+export function digestFromProjectAssetUrl(url: string): string | null {
+  const m = url.match(/^\/api\/media\/([0-9a-f]{64})\./)
+  return m ? m[1] : null
+}
+
+export function parseProjectAssetCreateInput(
+  input: ProjectAssetCreateInput,
+): { ok: true; value: ParsedProjectAssetCreate } | { ok: false; error: ProjectAssetCreateError } {
+  const name = parseProjectAssetName(input.name)
+  if (!name) return { ok: false, error: 'invalid_name' }
+  const source = parseProjectAssetSource(input.source)
+  if (!source) return { ok: false, error: 'invalid_source' }
+  const projectId = parseProjectAssetProjectId(input.projectId)
+  if ('invalid' in projectId) return { ok: false, error: 'project_not_found' }
+  const url = parseProjectAssetUrl(input.url)
+  if ('invalid' in url) return { ok: false, error: 'invalid_url' }
+  const containerPath = parseProjectAssetOptionalContainerPath(input.containerPath)
+  if ('invalid' in containerPath) return { ok: false, error: 'invalid_container_path' }
+  const urlValue = url.present ? url.value : null
+  const containerValue = containerPath.present ? containerPath.value : null
+  if (!urlValue && !containerValue) return { ok: false, error: 'invalid_locator' }
+  const digest = parseProjectAssetDigest(input.digest)
+  if ('invalid' in digest) return { ok: false, error: 'invalid_digest' }
+  const mime = parseProjectAssetMime(input.mime)
+  if ('invalid' in mime) return { ok: false, error: 'invalid_mime' }
+  const size = parseProjectAssetSize(input.size)
+  if ('invalid' in size) return { ok: false, error: 'invalid_size' }
+  const sessionId = parseProjectAssetSessionId(input.sessionId)
+  if ('invalid' in sessionId) return { ok: false, error: 'invalid_session' }
+  let digestValue = digest.present ? digest.value : null
+  if (!digestValue && urlValue) digestValue = digestFromProjectAssetUrl(urlValue)
+  return {
+    ok: true,
+    value: {
+      projectIdPresent: projectId.present,
+      projectId: projectId.present ? projectId.value : null,
+      source,
+      sessionId: sessionId.present ? sessionId.value : null,
+      name,
+      url: urlValue,
+      containerPath: containerValue,
+      mime: mime.present ? mime.value : null,
+      sizeBytes: size.present ? size.value : null,
+      digest: digestValue,
+      excerpt: parseProjectAssetExcerpt(input.excerpt),
+      pinned: input.pinned === true,
+    },
+  }
+}
+
+export function mapClientSessionLastOutcome(raw: unknown): ClientSessionLastOutcome | null {
+  switch (raw) {
+    case 'completed':
+    case 'interrupted':
+    case 'crashed':
+    case 'not_accepted':
+    case 'executed_error':
+      return raw
+    default:
+      return null
+  }
 }
 
 export interface ClientSessionLifecycleRef {
@@ -1995,6 +2746,14 @@ const CLIENT_PUT_ALLOWED_FIELDS: ReadonlySet<string> = new Set<string>([
   // _teamRun 有意保留:它只是客户端消息上的 opaque 展示元数据(legacy packages/web
   // 仍写入),与已删除的服务端 team_run 子系统无关,server 不解释。
   '_media', '_modelText', '_teamRun',
+  // Durable recovery lineage. Client-only `_isAutoRetry` is intentionally
+  // omitted; render/hide after refresh depends on these persisted fields.
+  '_recoveryOfClientMessageId', '_recoveryMode', '_automaticRecovery',
+  // Detached ask_user permission cards (server-authored; must survive client PUT).
+  'requestId', 'inputPreview', 'inputJson',
+  '_resolved', '_behavior', '_settledReason', '_answers', '_detachedAskUser',
+  '_askUserSessionKey', '_askUserExpiresAt', '_askUserUserId',
+  '_askUserChannel', '_askUserPeer',
 ])
 
 const CLIENT_PUT_ALLOWED_STATUSES: ReadonlySet<string> = new Set<string>([
@@ -3342,7 +4101,7 @@ async function _sqliteAppendServerAuthoredMessage(
      *  但 `mergePreservingServerAuthored` 对它做 **local-wins**(与 assistant/
      *  thinking/tool 的 server-wins 相反)—— 本地 `m-*` 富行(带 childBlocks 子树)
      *  存在时丢弃 server `srv-*` 行,禁止 server 行吞掉子树(2c73030d 回归)。 */
-    role: 'assistant' | 'user' | 'system' | 'thinking' | 'tool' | 'agent-group'
+    role: 'assistant' | 'user' | 'system' | 'thinking' | 'tool' | 'agent-group' | 'permission'
     text?: string
     ts?: number
     [k: string]: unknown
@@ -3892,7 +4651,7 @@ export interface QueuedMessage {
   userId: string
   message: {
     id: string
-    role: 'assistant' | 'user' | 'system' | 'thinking' | 'tool'
+    role: 'assistant' | 'user' | 'system' | 'thinking' | 'tool' | 'permission'
     text?: string
     ts?: number
     status?: 'completed' | 'interrupted' | 'crashed'
@@ -3970,7 +4729,7 @@ export async function appendServerAuthoredMessageDurable(
   userId: string,
   message: {
     id: string
-    role: 'assistant' | 'user' | 'system' | 'thinking' | 'tool'
+    role: 'assistant' | 'user' | 'system' | 'thinking' | 'tool' | 'permission'
     text?: string
     ts?: number
     [k: string]: unknown
@@ -4132,18 +4891,32 @@ export async function replayMsgOutbox(): Promise<{
   return { processed, applied, dropped, requeued, malformed }
 }
 
-async function _sqliteListClientSessions(userId: string): Promise<ClientSessionMeta[]> {
-  const db = await getSessionsDb()
-  const rows = db.prepare(`
-    SELECT id, agent_id, title, pinned, created_at, last_at, updated_at,
-           message_count as msg_count, model_id
-    FROM client_sessions WHERE user_id = ? AND deleted_at IS NULL ORDER BY last_at DESC
-  `).all(userId) as Array<{
-    id: string; agent_id: string; title: string; pinned: number;
-    created_at: number; last_at: number; updated_at: number; msg_count: number
-    model_id: string | null
-  }>
-  return rows.map(r => ({
+const SQLITE_LAST_PREVIEW_SQL = `
+  CASE
+    WHEN length(CAST(cs.messages AS BLOB)) > ${SESSION_SEARCH_JSON_EXPAND_MAX_BYTES} THEN NULL
+    ELSE (
+      SELECT substr(trim(COALESCE(json_extract(j.value, '$.text'), '')), 1, 240)
+        FROM json_each(cs.messages) j
+       WHERE CAST(j.key AS INTEGER) >= json_array_length(cs.messages) - ${LAST_MESSAGE_PREVIEW_TAIL_MAX}
+         AND length(trim(COALESCE(json_extract(j.value, '$.text'), ''))) > 0
+       ORDER BY CAST(j.key AS INTEGER) DESC
+       LIMIT 1
+    )
+  END`
+
+function _mapClientSessionMetaRow(r: {
+  id: string; agent_id: string; title: string; pinned: number
+  created_at: number; last_at: number; updated_at: number; msg_count: number
+  model_id: string | null
+  project_id: string | null
+  run_state: string
+  last_outcome: string | null
+  archived_at: number | null
+  last_preview_raw: string | null
+  unread: number
+}): ClientSessionMeta {
+  const preview = toLastMessagePreview(r.last_preview_raw)
+  return {
     id: r.id,
     agentId: r.agent_id,
     title: r.title,
@@ -4152,8 +4925,93 @@ async function _sqliteListClientSessions(userId: string): Promise<ClientSessionM
     lastAt: r.last_at,
     messageCount: r.msg_count,
     updatedAt: r.updated_at,
+    projectId: r.project_id ?? null,
+    runState: r.run_state === 'running' ? 'running' : 'idle',
+    lastOutcome: mapClientSessionLastOutcome(r.last_outcome),
+    lastErrorCode: null,
+    archived: r.archived_at != null,
+    unread: r.unread === 1,
+    ...(preview ? { lastMessagePreview: preview } : {}),
     ...(r.model_id ? { modelId: r.model_id } : {}),
-  }))
+  }
+}
+
+async function _sqliteListClientSessions(
+  userId: string,
+  opts: ListClientSessionsOpts = {},
+): Promise<ListClientSessionsResult> {
+  const db = await getSessionsDb()
+  const includeArchived = opts.includeArchived === true
+  const before = typeof opts.before === 'number' && Number.isFinite(opts.before) && opts.before > 0
+    ? Math.floor(opts.before)
+    : undefined
+  const limit = typeof opts.limit === 'number' && Number.isFinite(opts.limit) && opts.limit > 0
+    ? Math.min(SESSION_LIST_LIMIT_MAX, Math.floor(opts.limit))
+    : undefined
+  // runState / lastOutcome 从 turn_dispatch_inbox 一条 SQL 派生(禁止 N+1)。
+  // JOIN 只按 session_id:inbox.user_id 是裸 uid,client_sessions.user_id 是 `c:<uid>`。
+  // last_preview_raw:SQL 侧从数组尾部最多 20 条里取最近一条非空 .text(线上 assistant
+  // 无 text,实际即最近 user 话);>2MB 行不展开。不把 messages blob 拉进 Node。
+  const params: unknown[] = [userId]
+  let where = 'cs.user_id = ? AND cs.deleted_at IS NULL'
+  if (!includeArchived) where += ' AND cs.archived_at IS NULL'
+  if (before !== undefined) {
+    where += ' AND cs.last_at < ?'
+    params.push(before)
+  }
+  const limitSql = limit !== undefined ? ' LIMIT ?' : ''
+  if (limit !== undefined) params.push(limit + 1)
+  const rows = db.prepare(`
+    SELECT cs.id, cs.agent_id, cs.title, cs.pinned, cs.created_at, cs.last_at, cs.updated_at,
+           cs.message_count as msg_count, cs.model_id, cs.project_id, cs.archived_at,
+           ${SQLITE_LAST_PREVIEW_SQL} AS last_preview_raw,
+           CASE WHEN open_d.session_id IS NOT NULL THEN 'running' ELSE 'idle' END AS run_state,
+           last_d.outcome AS last_outcome,
+           CASE WHEN last_d.outcome IN (${UNREAD_OUTCOME_SQL})
+                 AND ${LAST_D_TERMINAL_MS_SQL} > ${LAST_READ_AT_MS_SQL}
+                THEN 1 ELSE 0 END AS unread
+    FROM client_sessions cs
+    LEFT JOIN (
+      SELECT session_id FROM turn_dispatch_inbox
+       WHERE state NOT IN ('terminal', 'rejected')
+       GROUP BY session_id
+    ) open_d ON open_d.session_id = cs.id
+    LEFT JOIN (
+      SELECT session_id, outcome, terminal_at FROM (
+        SELECT session_id, outcome, updated_at AS terminal_at,
+               ROW_NUMBER() OVER (
+                 PARTITION BY session_id
+                 ORDER BY updated_at DESC, client_message_id DESC
+               ) AS rn
+          FROM turn_dispatch_inbox
+         WHERE state IN ('terminal', 'rejected')
+      ) ranked
+      WHERE rn = 1
+    ) last_d ON last_d.session_id = cs.id
+    WHERE ${where}
+    ORDER BY cs.last_at DESC${limitSql}
+  `).all(...params) as Array<{
+    id: string; agent_id: string; title: string; pinned: number;
+    created_at: number; last_at: number; updated_at: number; msg_count: number
+    model_id: string | null
+    project_id: string | null
+    run_state: string
+    last_outcome: string | null
+    archived_at: number | null
+    last_preview_raw: string | null
+    unread: number
+  }>
+  let nextCursor: number | undefined
+  let sliced = rows
+  if (limit !== undefined && rows.length > limit) {
+    sliced = rows.slice(0, limit)
+    const last = sliced[sliced.length - 1]
+    if (last) nextCursor = last.last_at
+  }
+  return {
+    sessions: sliced.map(_mapClientSessionMetaRow),
+    ...(nextCursor !== undefined ? { nextCursor } : {}),
+  }
 }
 
 async function _sqliteGetClientSession(
@@ -4372,8 +5230,13 @@ export interface ClientSessionLiveFramePage {
   }>
   nextCursor: string | null
   hasMore: boolean
+  /** Earlier frames exist on the current open dispatch (tail/seek page). */
+  hasMoreBefore: boolean
   streamClientMessageIds: string[]
   hasTapeProjection: boolean
+  /** Monotonic count of tape-projected streams in this read's snapshot; lets
+   * clients detect live→tape cutover that happened between two hydrations. */
+  tapeProjectionVersion: number
 }
 
 /** Private model-context read. This is deliberately separate from browser
@@ -4529,14 +5392,68 @@ async function _sqliteReadClientSessionLiveFrames(
   userId: string,
   _afterRecordId = 0,
   _limit = 200,
+  _options?: { seekTail?: boolean },
 ): Promise<ClientSessionLiveFramePage | null> {
   const db = await getSessionsDb()
   const row = db.prepare(
     'SELECT 1 FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL',
   ).get(sessId, userId)
   return row
-    ? { frames: [], nextCursor: null, hasMore: false, streamClientMessageIds: [], hasTapeProjection: false }
+    ? { frames: [], nextCursor: null, hasMore: false, hasMoreBefore: false, streamClientMessageIds: [], hasTapeProjection: false, tapeProjectionVersion: 0 }
     : null
+}
+
+/** Personal/container SQLite has no commercial master live-frame journal. */
+async function _sqliteReadClientSessionLiveUnits(
+  sessId: string,
+  userId: string,
+  _options?: {
+    n?: number
+    k?: number
+    before?: string | null
+    group?: string | null
+    nestedBefore?: string | null
+    deadlineMs?: number
+    maxBytes?: number
+  },
+): Promise<LiveUnitsPage | null> {
+  const db = await getSessionsDb()
+  const row = db.prepare(
+    'SELECT 1 FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL',
+  ).get(sessId, userId)
+  return row
+    ? {
+      view: 'units',
+      units: [],
+      n: 20,
+      hasMoreBefore: false,
+      beforeCursor: null,
+      streamClientMessageIds: [],
+      openDispatch: false,
+      hasTapeProjection: false,
+      tapeProjectionVersion: 0,
+      reducerEpoch: '1',
+      degraded: false,
+    }
+    : null
+}
+
+async function _sqliteReadLiveOrTapeFramePayload(
+  sessId: string,
+  userId: string,
+  _ref: { recordId?: string | null; sha256?: string | null },
+): Promise<{ source: 'live' | 'tape'; payload: unknown; sha256?: string } | null> {
+  const db = await getSessionsDb()
+  const row = db.prepare(
+    'SELECT 1 FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL',
+  ).get(sessId, userId)
+  return row ? null : null
+}
+
+/** Personal/container SQLite keeps no gateway live-frame journal, so there is
+ * nothing to converge. */
+async function _sqliteConvergeFinalizedTapeLiveStreams(): Promise<{ converged: number }> {
+  return { converged: 0 }
 }
 
 /** 引擎上下文读(RFC §9)。个人版/容器按所选模型的真实上下文预算，从热行向归档
@@ -4867,6 +5784,797 @@ async function _sqliteSetClientSessionModel(id: string, userId: string, modelId:
   return { ok: !!row, updatedAt: row ? row.updated_at : now }
 }
 
+type ChatProjectDbRow = {
+  id: string
+  name: string
+  instructions: string | null
+  color: string | null
+  sort_order: number
+  created_at: number
+  updated_at: number
+  session_count: number
+}
+
+function _mapChatProjectRow(r: ChatProjectDbRow): ChatProject {
+  return {
+    id: r.id,
+    name: r.name,
+    instructions: r.instructions,
+    color: r.color,
+    sortOrder: r.sort_order,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+    sessionCount: r.session_count,
+  }
+}
+
+const CHAT_PROJECT_SELECT = `
+  SELECT p.id, p.name, p.instructions, p.color, p.sort_order, p.created_at, p.updated_at,
+         COALESCE(c.cnt, 0) AS session_count
+    FROM chat_projects p
+    LEFT JOIN (
+      SELECT project_id, COUNT(*) AS cnt
+        FROM client_sessions
+       WHERE user_id = ? AND deleted_at IS NULL AND project_id IS NOT NULL
+       GROUP BY project_id
+    ) c ON c.project_id = p.id
+`
+
+function _sqliteReadChatProject(
+  db: Database.Database,
+  userId: string,
+  id: string,
+): ChatProject | null {
+  const row = db.prepare(
+    `${CHAT_PROJECT_SELECT} WHERE p.id = ? AND p.user_id = ? AND p.deleted_at IS NULL`,
+  ).get(userId, id, userId) as ChatProjectDbRow | undefined
+  return row ? _mapChatProjectRow(row) : null
+}
+
+async function _sqliteListChatProjects(userId: string): Promise<ChatProject[]> {
+  const db = await getSessionsDb()
+  const rows = db.prepare(
+    `${CHAT_PROJECT_SELECT}
+      WHERE p.user_id = ? AND p.deleted_at IS NULL
+      ORDER BY p.sort_order ASC, p.created_at ASC`,
+  ).all(userId, userId) as ChatProjectDbRow[]
+  return rows.map(_mapChatProjectRow)
+}
+
+async function _sqliteCreateChatProject(
+  userId: string,
+  input: { name?: unknown; instructions?: unknown; color?: unknown },
+): Promise<ChatProjectCreateResult> {
+  const name = parseChatProjectName(input.name)
+  if (!name) return { ok: false, error: 'invalid_name' }
+  const instructions = parseChatProjectOptionalText(input.instructions, CHAT_PROJECT_INSTRUCTIONS_MAX)
+  if ('invalid' in instructions) return { ok: false, error: 'invalid_instructions' }
+  const color = parseChatProjectOptionalText(input.color, CHAT_PROJECT_COLOR_MAX)
+  if ('invalid' in color) return { ok: false, error: 'invalid_color' }
+
+  const db = await getSessionsDb()
+  const now = Date.now()
+  const id = randomUUID()
+  const txn = db.transaction((): ChatProjectCreateResult => {
+    const countRow = db.prepare(
+      'SELECT COUNT(*) AS n FROM chat_projects WHERE user_id = ? AND deleted_at IS NULL',
+    ).get(userId) as { n: number }
+    if (countRow.n >= CHAT_PROJECT_PER_USER_LIMIT) return { ok: false, error: 'limit_exceeded' }
+    db.prepare(`
+      INSERT INTO chat_projects
+        (id, user_id, name, instructions, color, sort_order, created_at, updated_at, deleted_at)
+      VALUES (?, ?, ?, ?, ?, COALESCE((
+        SELECT MAX(sort_order) + 1 FROM chat_projects WHERE user_id = ? AND deleted_at IS NULL
+      ), 0), ?, ?, NULL)
+    `).run(
+      id,
+      userId,
+      name,
+      instructions.present ? instructions.value : null,
+      color.present ? color.value : null,
+      userId,
+      now,
+      now,
+    )
+    const project = _sqliteReadChatProject(db, userId, id)
+    if (!project) throw new Error('chat project insert vanished')
+    return { ok: true, project }
+  })
+  return txn()
+}
+
+async function _sqliteUpdateChatProject(
+  userId: string,
+  id: string,
+  input: { name?: unknown; instructions?: unknown; color?: unknown; sortOrder?: unknown },
+): Promise<ChatProjectUpdateResult> {
+  const sets: string[] = ['updated_at = MAX(updated_at + 1, ?)']
+  const params: unknown[] = [Date.now()]
+  if (input.name !== undefined) {
+    const name = parseChatProjectName(input.name)
+    if (!name) return { ok: false, error: 'invalid_name' }
+    sets.push('name = ?')
+    params.push(name)
+  }
+  if (input.instructions !== undefined) {
+    const instructions = parseChatProjectOptionalText(input.instructions, CHAT_PROJECT_INSTRUCTIONS_MAX)
+    if ('invalid' in instructions || !instructions.present) return { ok: false, error: 'invalid_instructions' }
+    sets.push('instructions = ?')
+    params.push(instructions.value)
+  }
+  if (input.color !== undefined) {
+    const color = parseChatProjectOptionalText(input.color, CHAT_PROJECT_COLOR_MAX)
+    if ('invalid' in color || !color.present) return { ok: false, error: 'invalid_color' }
+    sets.push('color = ?')
+    params.push(color.value)
+  }
+  if (input.sortOrder !== undefined) {
+    const sortOrder = parseChatProjectSortOrder(input.sortOrder)
+    if (sortOrder === null) return { ok: false, error: 'invalid_sort_order' }
+    sets.push('sort_order = ?')
+    params.push(sortOrder)
+  }
+  if (sets.length === 1) {
+    const existing = await _sqliteGetChatProjectForUser(userId, id)
+    return existing ? { ok: true, project: existing } : { ok: false, error: 'not_found' }
+  }
+  const db = await getSessionsDb()
+  const txn = db.transaction((): ChatProjectUpdateResult => {
+    const res = db.prepare(
+      `UPDATE chat_projects SET ${sets.join(', ')}
+        WHERE id = ? AND user_id = ? AND deleted_at IS NULL`,
+    ).run(...params, id, userId)
+    if (res.changes === 0) return { ok: false, error: 'not_found' }
+    const project = _sqliteReadChatProject(db, userId, id)
+    if (!project) return { ok: false, error: 'not_found' }
+    return { ok: true, project }
+  })
+  return txn()
+}
+
+async function _sqliteGetChatProjectForUser(userId: string, id: string): Promise<ChatProject | null> {
+  const db = await getSessionsDb()
+  return _sqliteReadChatProject(db, userId, id)
+}
+
+async function _sqliteDeleteChatProject(userId: string, id: string): Promise<ChatProjectDeleteResult> {
+  const db = await getSessionsDb()
+  const now = Date.now()
+  const txn = db.transaction((): ChatProjectDeleteResult => {
+    const res = db.prepare(
+      `UPDATE chat_projects
+          SET deleted_at = ?, updated_at = MAX(updated_at + 1, ?)
+        WHERE id = ? AND user_id = ? AND deleted_at IS NULL`,
+    ).run(now, now, id, userId)
+    if (res.changes === 0) return { ok: false, error: 'not_found' }
+    db.prepare(
+      `UPDATE client_sessions
+          SET project_id = NULL, updated_at = MAX(updated_at + 1, ?)
+        WHERE user_id = ? AND project_id = ? AND deleted_at IS NULL`,
+    ).run(now, userId, id)
+    return { ok: true }
+  })
+  return txn()
+}
+
+async function _sqlitePatchClientSessionMeta(
+  id: string,
+  userId: string,
+  patch: ClientSessionMetaPatch,
+): Promise<PatchClientSessionMetaResult> {
+  const db = await getSessionsDb()
+  const now = Date.now()
+  const txn = db.transaction((): PatchClientSessionMetaResult => {
+    const ownedSession = db.prepare(
+      'SELECT 1 AS ok FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL',
+    ).get(id, userId) as { ok: number } | undefined
+    if (!ownedSession) return { ok: false, error: 'not_found' }
+    if (patch.projectId !== undefined && patch.projectId !== null) {
+      const owned = db.prepare(
+        'SELECT 1 AS ok FROM chat_projects WHERE id = ? AND user_id = ? AND deleted_at IS NULL',
+      ).get(patch.projectId, userId) as { ok: number } | undefined
+      if (!owned) return { ok: false, error: 'project_not_found' }
+    }
+    const sets: string[] = ['updated_at = MAX(updated_at + 1, ?)']
+    const params: unknown[] = [now]
+    if (patch.title !== undefined) {
+      sets.push('title = ?')
+      params.push(patch.title)
+    }
+    if (patch.modelId !== undefined) {
+      sets.push('model_id = ?')
+      params.push(patch.modelId)
+    }
+    if (patch.projectId !== undefined) {
+      sets.push('project_id = ?')
+      params.push(patch.projectId)
+    }
+    if (patch.pinned !== undefined) {
+      sets.push('pinned = ?')
+      params.push(patch.pinned ? 1 : 0)
+    }
+    if (patch.archived !== undefined) {
+      sets.push('archived_at = ?')
+      params.push(patch.archived ? now : null)
+    }
+    const row = db.prepare(
+      `UPDATE client_sessions SET ${sets.join(', ')}
+        WHERE id = ? AND user_id = ? AND deleted_at IS NULL
+        RETURNING updated_at`,
+    ).get(...params, id, userId) as { updated_at: number } | undefined
+    if (!row) return { ok: false, error: 'not_found' }
+    return { ok: true, updatedAt: row.updated_at }
+  })
+  return txn()
+}
+
+async function _sqliteGetSessionProjectInstructions(sessionId: string): Promise<string | null> {
+  const db = await getSessionsDb()
+  const row = db.prepare(`
+    SELECT p.instructions
+      FROM client_sessions cs
+      JOIN chat_projects p ON p.id = cs.project_id AND p.user_id = cs.user_id
+     WHERE cs.id = ? AND cs.deleted_at IS NULL AND p.deleted_at IS NULL
+  `).get(sessionId) as { instructions: string | null } | undefined
+  if (!row?.instructions) return null
+  const cleaned = sanitizeProjectInstructions(row.instructions).trim()
+  return cleaned.length > 0 ? cleaned : null
+}
+
+type ProjectAssetDbRow = {
+  id: string
+  project_id: string | null
+  source: string
+  session_id: string | null
+  name: string
+  url: string | null
+  container_path: string | null
+  mime: string | null
+  size_bytes: number | null
+  digest: string | null
+  excerpt: string | null
+  pinned: number | boolean
+  created_at: number
+  updated_at: number
+}
+
+const PROJECT_ASSET_SELECT = `
+  SELECT id, project_id, source, session_id, name, url, container_path, mime,
+         size_bytes, digest, excerpt, pinned, created_at, updated_at
+    FROM project_assets
+`
+
+function _mapProjectAssetRow(r: ProjectAssetDbRow): ProjectAsset {
+  return {
+    id: r.id,
+    projectId: r.project_id ?? null,
+    source: r.source === 'output' ? 'output' : 'upload',
+    sessionId: r.session_id ?? null,
+    name: r.name,
+    url: r.url ?? null,
+    containerPath: r.container_path ?? null,
+    mime: r.mime ?? null,
+    sizeBytes: r.size_bytes ?? null,
+    digest: r.digest ?? null,
+    excerpt: r.excerpt ?? null,
+    pinned: r.pinned === 1 || r.pinned === true,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  }
+}
+
+function _sqliteReadProjectAsset(
+  db: Database.Database,
+  userId: string,
+  id: string,
+): ProjectAsset | null {
+  const row = db.prepare(
+    `${PROJECT_ASSET_SELECT} WHERE id = ? AND user_id = ? AND deleted_at IS NULL`,
+  ).get(id, userId) as ProjectAssetDbRow | undefined
+  return row ? _mapProjectAssetRow(row) : null
+}
+
+function _sqliteOwnedChatProjectExists(
+  db: Database.Database,
+  userId: string,
+  projectId: string,
+): boolean {
+  const row = db.prepare(
+    'SELECT 1 AS ok FROM chat_projects WHERE id = ? AND user_id = ? AND deleted_at IS NULL',
+  ).get(projectId, userId) as { ok: number } | undefined
+  return !!row
+}
+
+function _sqliteCountProjectAssets(
+  db: Database.Database,
+  userId: string,
+  projectId: string | null,
+): number {
+  const row = db.prepare(
+    'SELECT COUNT(*) AS n FROM project_assets WHERE user_id = ? AND deleted_at IS NULL AND project_id IS ?',
+  ).get(userId, projectId) as { n: number }
+  return row.n
+}
+
+function _sqliteFindDuplicateAsset(
+  db: Database.Database,
+  userId: string,
+  projectId: string | null,
+  source: ProjectAssetSource,
+  digest: string | null,
+  containerPath: string | null,
+): ProjectAsset | null {
+  if (digest) {
+    const row = db.prepare(
+      `${PROJECT_ASSET_SELECT}
+        WHERE user_id = ? AND deleted_at IS NULL AND source = ? AND project_id IS ? AND digest = ?
+        LIMIT 1`,
+    ).get(userId, source, projectId, digest) as ProjectAssetDbRow | undefined
+    return row ? _mapProjectAssetRow(row) : null
+  }
+  if (containerPath) {
+    const row = db.prepare(
+      `${PROJECT_ASSET_SELECT}
+        WHERE user_id = ? AND deleted_at IS NULL AND source = ? AND project_id IS ? AND container_path = ?
+        LIMIT 1`,
+    ).get(userId, source, projectId, containerPath) as ProjectAssetDbRow | undefined
+    return row ? _mapProjectAssetRow(row) : null
+  }
+  return null
+}
+
+function _sqliteResolveAssetProjectId(
+  db: Database.Database,
+  userId: string,
+  parsed: ParsedProjectAssetCreate,
+): { ok: true; projectId: string | null } | { ok: false; error: ProjectAssetCreateError } {
+  let projectId = parsed.projectIdPresent ? parsed.projectId : null
+  if (!parsed.projectIdPresent && parsed.sessionId) {
+    const sess = db.prepare(
+      'SELECT user_id, project_id FROM client_sessions WHERE id = ? AND deleted_at IS NULL',
+    ).get(parsed.sessionId) as { user_id: string; project_id: string | null } | undefined
+    if (sess?.user_id === userId) projectId = sess.project_id ?? null
+  }
+  if (projectId !== null && !_sqliteOwnedChatProjectExists(db, userId, projectId)) {
+    return { ok: false, error: 'project_not_found' }
+  }
+  return { ok: true, projectId }
+}
+
+async function _sqliteListProjectAssets(
+  userId: string,
+  opts: ListProjectAssetsOpts,
+): Promise<ProjectAsset[]> {
+  const limit = typeof opts.limit === 'number' && Number.isFinite(opts.limit) && opts.limit > 0
+    ? Math.min(PROJECT_ASSET_LIST_LIMIT_MAX, Math.floor(opts.limit))
+    : PROJECT_ASSET_LIST_LIMIT_DEFAULT
+  const db = await getSessionsDb()
+  const rows = db.prepare(
+    `${PROJECT_ASSET_SELECT}
+      WHERE user_id = ? AND deleted_at IS NULL AND project_id IS ?
+      ORDER BY created_at DESC
+      LIMIT ?`,
+  ).all(userId, opts.projectId, limit) as ProjectAssetDbRow[]
+  return rows.map(_mapProjectAssetRow)
+}
+
+async function _sqliteCreateProjectAsset(
+  userId: string,
+  input: ProjectAssetCreateInput,
+): Promise<ProjectAssetCreateResult> {
+  const parsed = parseProjectAssetCreateInput(input)
+  if (!parsed.ok) return parsed
+  const db = await getSessionsDb()
+  const now = Date.now()
+  const id = randomUUID()
+  const txn = db.transaction((): ProjectAssetCreateResult => {
+    const resolved = _sqliteResolveAssetProjectId(db, userId, parsed.value)
+    if (!resolved.ok) return resolved
+    const { projectId } = resolved
+    const dup = _sqliteFindDuplicateAsset(
+      db,
+      userId,
+      projectId,
+      parsed.value.source,
+      parsed.value.digest,
+      parsed.value.containerPath,
+    )
+    if (dup) return { ok: true, asset: dup }
+    if (_sqliteCountProjectAssets(db, userId, projectId) >= PROJECT_ASSET_PER_PROJECT_LIMIT) {
+      return { ok: false, error: 'limit_exceeded' }
+    }
+    // 只插索引行,绝不写/删磁盘文件(内容寻址,可能被其它消息/资产共用)。
+    db.prepare(`
+      INSERT INTO project_assets (
+        id, user_id, project_id, source, session_id, name, url, container_path,
+        mime, size_bytes, digest, excerpt, pinned, created_at, updated_at, deleted_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+    `).run(
+      id,
+      userId,
+      projectId,
+      parsed.value.source,
+      parsed.value.sessionId,
+      parsed.value.name,
+      parsed.value.url,
+      parsed.value.containerPath,
+      parsed.value.mime,
+      parsed.value.sizeBytes,
+      parsed.value.digest,
+      parsed.value.excerpt,
+      parsed.value.pinned ? 1 : 0,
+      now,
+      now,
+    )
+    const asset = _sqliteReadProjectAsset(db, userId, id)
+    if (!asset) throw new Error('project asset insert vanished')
+    return { ok: true, asset }
+  })
+  return txn()
+}
+
+async function _sqliteUpdateProjectAsset(
+  userId: string,
+  assetId: string,
+  patch: ProjectAssetUpdateInput,
+): Promise<ProjectAssetUpdateResult> {
+  const sets: string[] = ['updated_at = MAX(updated_at + 1, ?)']
+  const params: unknown[] = [Date.now()]
+  let nextProjectId: { present: true; value: string | null } | undefined
+  if (patch.name !== undefined) {
+    const name = parseProjectAssetName(patch.name)
+    if (!name) return { ok: false, error: 'invalid_name' }
+    sets.push('name = ?')
+    params.push(name)
+  }
+  if (patch.pinned !== undefined) {
+    if (typeof patch.pinned !== 'boolean') return { ok: false, error: 'invalid_name' }
+    sets.push('pinned = ?')
+    params.push(patch.pinned ? 1 : 0)
+  }
+  if (patch.projectId !== undefined) {
+    const parsed = parseProjectAssetProjectId(patch.projectId)
+    if ('invalid' in parsed) return { ok: false, error: 'project_not_found' }
+    nextProjectId = { present: true, value: parsed.present ? parsed.value : null }
+    sets.push('project_id = ?')
+    params.push(nextProjectId.value)
+  }
+  if (sets.length === 1) {
+    const db = await getSessionsDb()
+    const existing = _sqliteReadProjectAsset(db, userId, assetId)
+    return existing ? { ok: true, asset: existing } : { ok: false, error: 'not_found' }
+  }
+  const db = await getSessionsDb()
+  const txn = db.transaction((): ProjectAssetUpdateResult => {
+    const existing = _sqliteReadProjectAsset(db, userId, assetId)
+    if (!existing) return { ok: false, error: 'not_found' }
+    if (nextProjectId) {
+      if (nextProjectId.value !== null && !_sqliteOwnedChatProjectExists(db, userId, nextProjectId.value)) {
+        return { ok: false, error: 'project_not_found' }
+      }
+      if (nextProjectId.value !== existing.projectId) {
+        if (_sqliteCountProjectAssets(db, userId, nextProjectId.value) >= PROJECT_ASSET_PER_PROJECT_LIMIT) {
+          return { ok: false, error: 'limit_exceeded' }
+        }
+      }
+    }
+    const res = db.prepare(
+      `UPDATE project_assets SET ${sets.join(', ')}
+        WHERE id = ? AND user_id = ? AND deleted_at IS NULL`,
+    ).run(...params, assetId, userId)
+    if (res.changes === 0) return { ok: false, error: 'not_found' }
+    const asset = _sqliteReadProjectAsset(db, userId, assetId)
+    if (!asset) return { ok: false, error: 'not_found' }
+    return { ok: true, asset }
+  })
+  return txn()
+}
+
+async function _sqliteDeleteProjectAsset(userId: string, assetId: string): Promise<ProjectAssetDeleteResult> {
+  const db = await getSessionsDb()
+  const now = Date.now()
+  // 软删只标 deleted_at,绝不 unlink 磁盘文件。
+  const res = db.prepare(
+    `UPDATE project_assets
+        SET deleted_at = ?, updated_at = MAX(updated_at + 1, ?)
+      WHERE id = ? AND user_id = ? AND deleted_at IS NULL`,
+  ).run(now, now, assetId, userId)
+  return res.changes === 0 ? { ok: false, error: 'not_found' } : { ok: true }
+}
+
+async function _sqliteListPinnedProjectAssetsForSession(sessionId: string): Promise<ProjectAsset[]> {
+  const db = await getSessionsDb()
+  const sess = db.prepare(
+    'SELECT user_id, project_id FROM client_sessions WHERE id = ? AND deleted_at IS NULL',
+  ).get(sessionId) as { user_id: string; project_id: string | null } | undefined
+  if (!sess) return []
+  const rows = db.prepare(
+    `${PROJECT_ASSET_SELECT}
+      WHERE user_id = ? AND deleted_at IS NULL AND pinned = 1 AND project_id IS ?
+      ORDER BY created_at DESC
+      LIMIT ?`,
+  ).all(sess.user_id, sess.project_id ?? null, PROJECT_ASSET_PINNED_INJECT_MAX) as ProjectAssetDbRow[]
+  return rows.map(_mapProjectAssetRow)
+}
+
+export function rankSessionSearchHits<T extends { sessionId: string; matchedAt: number; kind: SessionSearchKind }>(
+  hits: T[],
+  limit: number,
+): T[] {
+  const best = new Map<string, T>()
+  for (const hit of hits) {
+    const prev = best.get(hit.sessionId)
+    if (!prev || hit.matchedAt > prev.matchedAt || (hit.matchedAt === prev.matchedAt && hit.kind === 'message')) {
+      best.set(hit.sessionId, hit)
+    }
+  }
+  return [...best.values()].sort((a, b) => b.matchedAt - a.matchedAt).slice(0, limit)
+}
+
+function _sqliteUnreadBySessionIds(
+  db: Database.Database,
+  userId: string,
+  ids: string[],
+): Map<string, boolean> {
+  const unread = new Map<string, boolean>()
+  if (ids.length === 0) return unread
+  const rows = db.prepare(`
+    SELECT cs.id,
+           CASE WHEN last_d.outcome IN (${UNREAD_OUTCOME_SQL})
+                 AND ${LAST_D_TERMINAL_MS_SQL} > ${LAST_READ_AT_MS_SQL}
+                THEN 1 ELSE 0 END AS unread
+      FROM client_sessions cs
+      LEFT JOIN (
+        SELECT session_id, outcome, terminal_at FROM (
+          SELECT session_id, outcome, updated_at AS terminal_at,
+                 ROW_NUMBER() OVER (
+                   PARTITION BY session_id
+                   ORDER BY updated_at DESC, client_message_id DESC
+                 ) AS rn
+            FROM turn_dispatch_inbox
+           WHERE state IN ('terminal', 'rejected')
+        ) ranked
+        WHERE rn = 1
+      ) last_d ON last_d.session_id = cs.id
+     WHERE cs.user_id = ? AND cs.deleted_at IS NULL
+       AND cs.id IN (${ids.map(() => '?').join(',')})
+  `).all(userId, ...ids) as Array<{ id: string; unread: number }>
+  for (const r of rows) unread.set(r.id, r.unread === 1)
+  return unread
+}
+
+async function _sqliteSearchClientSessions(
+  userId: string,
+  opts: SearchClientSessionsOpts,
+): Promise<SearchClientSessionsResult> {
+  const q = opts.q.trim()
+  if (!q) return { results: [] }
+  const limit = typeof opts.limit === 'number' && Number.isFinite(opts.limit) && opts.limit > 0
+    ? Math.min(SESSION_SEARCH_LIMIT_MAX, Math.floor(opts.limit))
+    : SESSION_SEARCH_LIMIT_DEFAULT
+  const includeArchived = opts.includeArchived === true
+  const like = `%${escapeLikePattern(q)}%`
+  const db = await getSessionsDb()
+  const archiveSql = includeArchived ? '' : ' AND cs.archived_at IS NULL'
+  const candMax = SESSION_SEARCH_JSON_CANDIDATE_MAX
+  const expandMax = SESSION_SEARCH_JSON_EXPAND_MAX_BYTES
+  const titleRows = db.prepare(`
+    SELECT id, title, project_id, last_at
+      FROM client_sessions cs
+     WHERE cs.user_id = ? AND cs.deleted_at IS NULL${archiveSql}
+       AND cs.title LIKE ? ESCAPE '\\'
+  `).all(userId, like) as Array<{ id: string; title: string; project_id: string | null; last_at: number }>
+  // 两段式:TEXT LIKE 收窄 → 最近 N 条 → 小行才 json_each。不把 messages blob 拉进 Node,也不对未命中行做 JSON.parse。
+  const msgRows = db.prepare(`
+    SELECT cs.id, cs.title, cs.project_id,
+           COALESCE(json_extract(j.value, '$.ts'), cs.last_at) AS matched_at,
+           substr(COALESCE(json_extract(j.value, '$.text'), ''), 1, 400) AS msg_text
+      FROM (
+        SELECT id, title, project_id, last_at, messages
+          FROM client_sessions cs
+         WHERE cs.user_id = ? AND cs.deleted_at IS NULL${archiveSql}
+           AND cs.messages LIKE ? ESCAPE '\\'
+           AND length(CAST(cs.messages AS BLOB)) <= ?
+         ORDER BY cs.last_at DESC
+         LIMIT ?
+      ) cs, json_each(cs.messages) j
+     WHERE json_extract(j.value, '$.text') LIKE ? ESCAPE '\\'
+  `).all(userId, like, expandMax, candMax, like) as Array<{
+    id: string; title: string; project_id: string | null; matched_at: number; msg_text: string
+  }>
+  const oversizedMsgRows = db.prepare(`
+    SELECT id, title, project_id, last_at AS matched_at,
+           substr(messages, max(1, instr(lower(messages), lower(?)) - 80), 400) AS msg_text
+      FROM client_sessions cs
+     WHERE cs.user_id = ? AND cs.deleted_at IS NULL${archiveSql}
+       AND cs.messages LIKE ? ESCAPE '\\'
+       AND length(CAST(cs.messages AS BLOB)) > ?
+     ORDER BY last_at DESC
+     LIMIT ?
+  `).all(q, userId, like, expandMax, candMax) as Array<{
+    id: string; title: string; project_id: string | null; matched_at: number; msg_text: string
+  }>
+  const chunkRows = db.prepare(`
+    SELECT cs.id, cs.title, cs.project_id,
+           COALESCE(json_extract(j.value, '$.ts'), cs.last_at) AS matched_at,
+           substr(COALESCE(json_extract(j.value, '$.text'), ''), 1, 400) AS msg_text
+      FROM (
+        SELECT cs.id, cs.title, cs.project_id, cs.last_at, ch.messages
+          FROM client_session_archive_chunks ch
+          JOIN client_sessions cs ON cs.id = ch.session_id AND cs.user_id = ch.user_id
+         WHERE cs.user_id = ? AND cs.deleted_at IS NULL${archiveSql}
+           AND ch.messages LIKE ? ESCAPE '\\'
+           AND length(CAST(ch.messages AS BLOB)) <= ?
+         ORDER BY cs.last_at DESC
+         LIMIT ?
+      ) cs, json_each(cs.messages) j
+     WHERE json_extract(j.value, '$.text') LIKE ? ESCAPE '\\'
+  `).all(userId, like, expandMax, candMax, like) as Array<{
+    id: string; title: string; project_id: string | null; matched_at: number; msg_text: string
+  }>
+  const oversizedChunkRows = db.prepare(`
+    SELECT cs.id, cs.title, cs.project_id, cs.last_at AS matched_at,
+           substr(ch.messages, max(1, instr(lower(ch.messages), lower(?)) - 80), 400) AS msg_text
+      FROM client_session_archive_chunks ch
+      JOIN client_sessions cs ON cs.id = ch.session_id AND cs.user_id = ch.user_id
+     WHERE cs.user_id = ? AND cs.deleted_at IS NULL${archiveSql}
+       AND ch.messages LIKE ? ESCAPE '\\'
+       AND length(CAST(ch.messages AS BLOB)) > ?
+     ORDER BY cs.last_at DESC
+     LIMIT ?
+  `).all(q, userId, like, expandMax, candMax) as Array<{
+    id: string; title: string; project_id: string | null; matched_at: number; msg_text: string
+  }>
+  const hits: Array<Omit<SessionSearchHit, 'unread'>> = [
+    ...titleRows.map((r) => ({
+      sessionId: r.id,
+      title: r.title,
+      projectId: r.project_id ?? null,
+      snippet: buildSearchSnippet(r.title, q),
+      matchedAt: r.last_at,
+      kind: 'title' as const,
+    })),
+    ...msgRows.map((r) => ({
+      sessionId: r.id,
+      title: r.title,
+      projectId: r.project_id ?? null,
+      snippet: buildSearchSnippet(r.msg_text, q),
+      matchedAt: Number(r.matched_at) || 0,
+      kind: 'message' as const,
+    })),
+        ...chunkRows.map((r) => ({
+      sessionId: r.id,
+      title: r.title,
+      projectId: r.project_id ?? null,
+      snippet: buildSearchSnippet(r.msg_text, q),
+      matchedAt: Number(r.matched_at) || 0,
+      kind: 'message' as const,
+    })),
+    ...oversizedMsgRows.map((r) => ({
+      sessionId: r.id,
+      title: r.title,
+      projectId: r.project_id ?? null,
+      snippet: buildSearchSnippet(r.msg_text, q),
+      matchedAt: Number(r.matched_at) || 0,
+      kind: 'message' as const,
+    })),
+    ...oversizedChunkRows.map((r) => ({
+      sessionId: r.id,
+      title: r.title,
+      projectId: r.project_id ?? null,
+      snippet: buildSearchSnippet(r.msg_text, q),
+      matchedAt: Number(r.matched_at) || 0,
+      kind: 'message' as const,
+    })),
+  ]
+  const ranked = rankSessionSearchHits(hits, limit)
+  const unreadMap = _sqliteUnreadBySessionIds(db, userId, ranked.map((h) => h.sessionId))
+  return {
+    results: ranked.map((h) => ({ ...h, unread: unreadMap.get(h.sessionId) === true })),
+  }
+}
+
+async function _sqliteBatchClientSessions(
+  userId: string,
+  input: BatchClientSessionsInput,
+): Promise<BatchClientSessionsResult> {
+  const parsed = parseSessionBatchInput(input)
+  if ('ok' in parsed) return parsed
+  const { ids, action } = parsed
+  if (ids.length === 0) return { ok: true, updated: 0, skipped: 0 }
+  const db = await getSessionsDb()
+  const now = Date.now()
+  return db.transaction((): BatchClientSessionsResult => {
+    if (action === 'move' && parsed.projectId) {
+      const owned = db.prepare(
+        'SELECT 1 AS ok FROM chat_projects WHERE id = ? AND user_id = ? AND deleted_at IS NULL',
+      ).get(parsed.projectId, userId) as { ok: number } | undefined
+      if (!owned) return { ok: false, error: 'project_not_found' }
+    }
+    const ownedRows = db.prepare(
+      `SELECT id FROM client_sessions
+        WHERE user_id = ? AND deleted_at IS NULL
+          AND id IN (${ids.map(() => '?').join(',')})`,
+    ).all(userId, ...ids) as Array<{ id: string }>
+    const owned = new Set(ownedRows.map((r) => r.id))
+    const skipped = ids.length - owned.size
+    const targetIds = ids.filter((id) => owned.has(id))
+    if (targetIds.length === 0) return { ok: true, updated: 0, skipped }
+    let updated = 0
+    if (action === 'delete') {
+      for (const id of targetIds) {
+        if (_sqliteDeleteClientSessionSync(db, id, userId, now)) updated++
+      }
+    } else if (action === 'archive') {
+      const res = db.prepare(
+        `UPDATE client_sessions
+            SET archived_at = COALESCE(archived_at, ?), updated_at = MAX(updated_at + 1, ?)
+          WHERE user_id = ? AND deleted_at IS NULL AND archived_at IS NULL
+            AND id IN (${targetIds.map(() => '?').join(',')})`,
+      ).run(now, now, userId, ...targetIds)
+      updated = res.changes
+    } else if (action === 'unarchive') {
+      const res = db.prepare(
+        `UPDATE client_sessions
+            SET archived_at = NULL, updated_at = MAX(updated_at + 1, ?)
+          WHERE user_id = ? AND deleted_at IS NULL AND archived_at IS NOT NULL
+            AND id IN (${targetIds.map(() => '?').join(',')})`,
+      ).run(now, userId, ...targetIds)
+      updated = res.changes
+    } else {
+      const res = db.prepare(
+        `UPDATE client_sessions
+            SET project_id = ?, updated_at = MAX(updated_at + 1, ?)
+          WHERE user_id = ? AND deleted_at IS NULL
+            AND id IN (${targetIds.map(() => '?').join(',')})`,
+      ).run(parsed.projectId ?? null, now, userId, ...targetIds)
+      updated = res.changes
+    }
+    return { ok: true, updated, skipped }
+  })()
+}
+
+async function _sqliteMarkClientSessionRead(
+  userId: string,
+  sessionId: string,
+): Promise<MarkClientSessionReadResult> {
+  const db = await getSessionsDb()
+  const now = Date.now() // epoch milliseconds; must match inbox.updated_at / list compare
+  const res = db.prepare(
+    `UPDATE client_sessions SET last_read_at = ?
+      WHERE user_id = ? AND id = ? AND deleted_at IS NULL`,
+  ).run(now, userId, sessionId)
+  if (res.changes === 0) return { ok: false, error: 'not_found' }
+  return { ok: true, updated: res.changes }
+}
+
+async function _sqliteMarkAllClientSessionsRead(userId: string): Promise<{ updated: number }> {
+  const db = await getSessionsDb()
+  const now = Date.now()
+  const res = db.prepare(
+    `UPDATE client_sessions SET last_read_at = ?
+      WHERE user_id = ? AND deleted_at IS NULL`,
+  ).run(now, userId)
+  return { updated: res.changes }
+}
+
+function _sqliteDeleteClientSessionSync(
+  db: Database.Database,
+  id: string,
+  userId: string,
+  now: number,
+): boolean {
+  const result = db.prepare(
+    "UPDATE client_sessions SET deleted_at = ?, updated_at = MAX(updated_at + 1, ?), messages = '[]', message_count = 0 WHERE id = ? AND user_id = ? AND deleted_at IS NULL",
+  ).run(now, now, id, userId)
+  if (result.changes === 0) return false
+  db.prepare('DELETE FROM client_session_archive_chunks WHERE session_id = ?').run(id)
+  db.prepare('DELETE FROM client_session_archived_ids WHERE session_id = ?').run(id)
+  db.prepare('DELETE FROM pending_usage_patches WHERE parent_session_id = ?').run(id)
+  db.prepare('DELETE FROM turn_dispatch_inbox WHERE session_id = ?').run(id)
+  return true
+}
+
 /**
  * Advance the browser-history revision after an external durable authority changes
  * what the direct timeline reads (for example, a verified turn-dispatch status).
@@ -5047,11 +6755,55 @@ async function _sqliteClaimSession(sessionId: string, userId: string): Promise<b
  * _sqlite* 组合)。既是默认 backend,又是 {@link ClientSessionsBackend} 契约的**派生源**:
  * PG backend 必须结构化覆盖本对象的每个方法(漏一个 = 编译错)。
  */
+export type PatchServerAuthoredResult =
+  | { applied: true }
+  | { applied: false; reason: 'session_not_found' | 'session_deleted' | 'not_found' }
+
+async function _sqlitePatchServerAuthoredMessage(
+  sessId: string,
+  userId: string,
+  msgId: string,
+  patch: Record<string, unknown>,
+): Promise<PatchServerAuthoredResult> {
+  const db = await getSessionsDb()
+  const txn = db.transaction((): PatchServerAuthoredResult => {
+    const row = db.prepare(
+      'SELECT messages, next_seq, deleted_at FROM client_sessions WHERE id = ? AND user_id = ?',
+    ).get(sessId, userId) as {
+      messages: string
+      next_seq: number | null
+      deleted_at: number | null
+    } | undefined
+    if (!row) return { applied: false, reason: 'session_not_found' }
+    if (row.deleted_at !== null) return { applied: false, reason: 'session_deleted' }
+    let msgs: MessageLike[]
+    try {
+      const parsed = JSON.parse(row.messages)
+      if (!Array.isArray(parsed)) return { applied: false, reason: 'not_found' }
+      msgs = parsed as MessageLike[]
+    } catch {
+      return { applied: false, reason: 'not_found' }
+    }
+    const idx = msgs.findIndex((m) => m && m.id === msgId)
+    if (idx < 0) return { applied: false, reason: 'not_found' }
+    const nextSeq = typeof row.next_seq === 'number' && row.next_seq > 0 ? row.next_seq : 1
+    msgs[idx] = { ...msgs[idx], ...patch, id: msgId, _source: 'server', _seq: nextSeq }
+    const now = Date.now()
+    const update = db.prepare(
+      'UPDATE client_sessions SET messages = ?, updated_at = MAX(updated_at + 1, ?), next_seq = ?, history_revision = history_revision + 1 WHERE id = ? AND user_id = ? AND deleted_at IS NULL',
+    ).run(JSON.stringify(msgs), now, nextSeq + 1, sessId, userId)
+    if (update.changes !== 1) return { applied: false, reason: 'session_deleted' }
+    return { applied: true }
+  })
+  return txn()
+}
+
 const sqliteBackend = {
   // ── client_sessions 读写 + 归档 + usage 聚合 ──
   probeSessionsDb: _sqliteProbeSessionsDb,
   upsertClientSession: _sqliteUpsertClientSession,
   appendServerAuthoredMessage: _sqliteAppendServerAuthoredMessage,
+  patchServerAuthoredMessage: _sqlitePatchServerAuthoredMessage,
   appendServerAuthoredMessageForRequest: _sqliteAppendServerAuthoredMessageForRequest,
   appendServerAuthoredMessageDrainByUser: _sqliteAppendServerAuthoredMessageDrainByUser,
   appendCostCredits: _sqliteAppendCostCredits,
@@ -5063,6 +6815,9 @@ const sqliteBackend = {
   getClientSessionPartial: _sqliteGetClientSessionPartial,
   readArchivedMessages: _sqliteReadArchivedMessages,
   readClientSessionLiveFrames: _sqliteReadClientSessionLiveFrames,
+  readClientSessionLiveUnits: _sqliteReadClientSessionLiveUnits,
+  readLiveOrTapeFramePayload: _sqliteReadLiveOrTapeFramePayload,
+  convergeFinalizedTapeLiveStreams: _sqliteConvergeFinalizedTapeLiveStreams,
   readClientTimelinePage: _sqliteReadClientTimelinePage,
   getEngineContextMessages: _sqliteGetEngineContextMessages,
   hasCompletedClientTurn: _sqliteHasCompletedClientTurn,
@@ -5073,6 +6828,21 @@ const sqliteBackend = {
   deleteClientSession: _sqliteDeleteClientSession,
   renameClientSession: _sqliteRenameClientSession,
   setClientSessionModel: _sqliteSetClientSessionModel,
+  patchClientSessionMeta: _sqlitePatchClientSessionMeta,
+  searchClientSessions: _sqliteSearchClientSessions,
+  batchClientSessions: _sqliteBatchClientSessions,
+  markClientSessionRead: _sqliteMarkClientSessionRead,
+  markAllClientSessionsRead: _sqliteMarkAllClientSessionsRead,
+  getSessionProjectInstructions: _sqliteGetSessionProjectInstructions,
+  listChatProjects: _sqliteListChatProjects,
+  createChatProject: _sqliteCreateChatProject,
+  updateChatProject: _sqliteUpdateChatProject,
+  deleteChatProject: _sqliteDeleteChatProject,
+  listProjectAssets: _sqliteListProjectAssets,
+  createProjectAsset: _sqliteCreateProjectAsset,
+  updateProjectAsset: _sqliteUpdateProjectAsset,
+  deleteProjectAsset: _sqliteDeleteProjectAsset,
+  listPinnedProjectAssetsForSession: _sqliteListPinnedProjectAssetsForSession,
   bumpClientSessionHistoryRevision: _sqliteBumpClientSessionHistoryRevision,
   listUnclaimedSessions: _sqliteListUnclaimedSessions,
   allMasterWsessRows: _sqliteAllMasterWsessRows,
@@ -5135,6 +6905,9 @@ export const upsertClientSession: ClientSessionsBackend['upsertClientSession'] =
 export const appendServerAuthoredMessage: ClientSessionsBackend['appendServerAuthoredMessage'] =
   (...args) => getActiveBackend().appendServerAuthoredMessage(...args)
 
+export const patchServerAuthoredMessage: ClientSessionsBackend['patchServerAuthoredMessage'] =
+  (...args) => getActiveBackend().patchServerAuthoredMessage(...args)
+
 export const appendServerAuthoredMessageForRequest: ClientSessionsBackend['appendServerAuthoredMessageForRequest'] =
   (...args) => getActiveBackend().appendServerAuthoredMessageForRequest(...args)
 
@@ -5176,6 +6949,15 @@ export const readArchivedMessages: ClientSessionsBackend['readArchivedMessages']
 export const readClientSessionLiveFrames: ClientSessionsBackend['readClientSessionLiveFrames'] =
   (...args) => getActiveBackend().readClientSessionLiveFrames(...args)
 
+export const readClientSessionLiveUnits: ClientSessionsBackend['readClientSessionLiveUnits'] =
+  (...args) => getActiveBackend().readClientSessionLiveUnits(...args)
+
+export const readLiveOrTapeFramePayload: ClientSessionsBackend['readLiveOrTapeFramePayload'] =
+  (...args) => getActiveBackend().readLiveOrTapeFramePayload(...args)
+
+export const convergeFinalizedTapeLiveStreams: ClientSessionsBackend['convergeFinalizedTapeLiveStreams'] =
+  (...args) => getActiveBackend().convergeFinalizedTapeLiveStreams(...args)
+
 export const readClientTimelinePage: ClientSessionsBackend['readClientTimelinePage'] =
   (...args) => getActiveBackend().readClientTimelinePage(...args)
 
@@ -5205,6 +6987,51 @@ export const renameClientSession: ClientSessionsBackend['renameClientSession'] =
 
 export const setClientSessionModel: ClientSessionsBackend['setClientSessionModel'] =
   (...args) => getActiveBackend().setClientSessionModel(...args)
+
+export const patchClientSessionMeta: ClientSessionsBackend['patchClientSessionMeta'] =
+  (...args) => getActiveBackend().patchClientSessionMeta(...args)
+
+export const searchClientSessions: ClientSessionsBackend['searchClientSessions'] =
+  (...args) => getActiveBackend().searchClientSessions(...args)
+
+export const batchClientSessions: ClientSessionsBackend['batchClientSessions'] =
+  (...args) => getActiveBackend().batchClientSessions(...args)
+
+export const markClientSessionRead: ClientSessionsBackend['markClientSessionRead'] =
+  (...args) => getActiveBackend().markClientSessionRead(...args)
+
+export const markAllClientSessionsRead: ClientSessionsBackend['markAllClientSessionsRead'] =
+  (...args) => getActiveBackend().markAllClientSessionsRead(...args)
+
+export const getSessionProjectInstructions: ClientSessionsBackend['getSessionProjectInstructions'] =
+  (...args) => getActiveBackend().getSessionProjectInstructions(...args)
+
+export const listChatProjects: ClientSessionsBackend['listChatProjects'] =
+  (...args) => getActiveBackend().listChatProjects(...args)
+
+export const createChatProject: ClientSessionsBackend['createChatProject'] =
+  (...args) => getActiveBackend().createChatProject(...args)
+
+export const updateChatProject: ClientSessionsBackend['updateChatProject'] =
+  (...args) => getActiveBackend().updateChatProject(...args)
+
+export const deleteChatProject: ClientSessionsBackend['deleteChatProject'] =
+  (...args) => getActiveBackend().deleteChatProject(...args)
+
+export const listProjectAssets: ClientSessionsBackend['listProjectAssets'] =
+  (...args) => getActiveBackend().listProjectAssets(...args)
+
+export const createProjectAsset: ClientSessionsBackend['createProjectAsset'] =
+  (...args) => getActiveBackend().createProjectAsset(...args)
+
+export const updateProjectAsset: ClientSessionsBackend['updateProjectAsset'] =
+  (...args) => getActiveBackend().updateProjectAsset(...args)
+
+export const deleteProjectAsset: ClientSessionsBackend['deleteProjectAsset'] =
+  (...args) => getActiveBackend().deleteProjectAsset(...args)
+
+export const listPinnedProjectAssetsForSession: ClientSessionsBackend['listPinnedProjectAssetsForSession'] =
+  (...args) => getActiveBackend().listPinnedProjectAssetsForSession(...args)
 
 export const bumpClientSessionHistoryRevision: ClientSessionsBackend['bumpClientSessionHistoryRevision'] =
   (...args) => getActiveBackend().bumpClientSessionHistoryRevision(...args)

@@ -26,6 +26,7 @@
  */
 import type { PricingCache } from './pricing.js'
 import { canonicalizeModelId } from './pricing.js'
+import { meetsMinPlan } from './planEntitlement.js'
 
 export interface CanUseModelDeps {
   /** 已 load 完毕的 pricing 缓存(进程级 singleton)。 */
@@ -41,6 +42,8 @@ export interface CanUseModelInput {
   deniedModelIds?: ReadonlySet<string>
   /** 用户提交的原始 model id;函数内部走 canonicalize 后查 PricingCache。 */
   modelId: string
+  userPlanTier?: number | null
+  orgPlanCode?: string | null
 }
 
 /**
@@ -56,6 +59,12 @@ export function canUseModel(deps: CanUseModelDeps, input: CanUseModelInput): boo
   if (!pricing) return false
   if (!pricing.enabled) return false
   if (input.deniedModelIds?.has(canonical)) return false
+  if (!meetsMinPlan({
+    minPlanCode: pricing.min_plan_code,
+    minPlanTier: pricing.min_plan_tier,
+    userPlanTier: input.userPlanTier,
+    orgPlanCode: input.orgPlanCode,
+  })) return false
   if (pricing.visibility === 'public') return true
   if (pricing.visibility === 'admin') {
     return input.role === 'admin' || input.grantedModelIds.has(pricing.model_id)

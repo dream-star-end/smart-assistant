@@ -5,20 +5,33 @@ let _spawnFn: typeof spawn = spawn
 export function __setCodexAppServerSpawnForTests(fn: typeof spawn | null): void {
   _spawnFn = fn ?? spawn
 }
-export function _codexMemoryTurnEnv(agentId: string, sessionKey: string): Record<string, string> {
-  return { OC_AGENT_ID: agentId, OC_SESSION_KEY: sessionKey }
+export function _codexMemoryTurnEnv(
+  agentId: string,
+  sessionKey: string,
+  routing?: { gatewayPort?: number; contextFile?: string | null },
+): Record<string, string> {
+  return {
+    OC_AGENT_ID: agentId,
+    OC_SESSION_KEY: sessionKey,
+    ...(routing?.gatewayPort ? { OPENCLAUDE_GATEWAY_PORT: String(routing.gatewayPort) } : {}),
+    ...(routing?.contextFile
+      ? { OPENCLAUDE_DELEGATE_CONTEXT_FILE: routing.contextFile }
+      : {}),
+  }
 }
 import { EventEmitter } from 'node:events'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { createReadStream, lstatSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { isAbsolute, join, resolve } from 'node:path'
+import { createInterface } from 'node:readline'
 import {
   AUTOMATIC_TURN_RETRY_MAX,
   type CallTokenUsageSnapshot,
   type GoalStateSnapshot,
   type ToolTerminationReason,
   type TurnTokenUsageSnapshot,
+  codexTransportModelId,
   isToolExitCode,
   turnErrorSemantics,
 } from '@openclaude/protocol'
@@ -28,6 +41,7 @@ import type { RepoSnapshot } from '../sessionRepoWorkspace.js'
 import {
   _sanitizeThreadId,
   buildCodexEnv,
+  buildCodexLongContextArgs,
   buildCodexModelCatalogArgs,
   buildCodexMultiAgentDisableArgs,
   buildCodexProviderConfigArgs,
@@ -39,14 +53,52 @@ import {
   normalizeCodexReasoningEffort,
 } from './codexShared.js'
 import { V3_CODEX_RELAY_PREFIX } from '../v3CodexRelay.js'
+import { issueDelegateContextToken } from '../delegateContext.js'
 import { createLogger } from '../logger.js'
 import { type ClassifiedErrorCode, classifyRunError } from '../errorClassify.js'
-import type { AutomaticRetryState, CollabAgentPolicy } from './engineAdapter.js'
+import type { AutomaticRetryState, CollabAgentPolicy, NativeModelHandoffArtifact } from './engineAdapter.js'
 
 const log = createLogger({ module: 'codexAppServerRunner' })
 
 const RUNNER_SHUTDOWN_GRACE_DEFAULT_MS = 3_000
 const RUNNER_SHUTDOWN_FINAL_DRAIN_DEFAULT_MS = 3_000
+
+const NATIVE_COMPACTION_TIMEOUT_MS = 15 * 60_000
+const CODEX_ROLLOUT_MAX_BYTES = 256 * 1024 * 1024
+
+export async function readLatestCodexNativeHandoff(
+  rolloutPath: string,
+  compactStartedAt: number,
+): Promise<NativeModelHandoffArtifact> {
+  if (!isAbsolute(rolloutPath)) throw new Error('CODEX_COMPACTION_PATH_INVALID')
+  const canonical = realpathSync(rolloutPath)
+  if (canonical !== resolve(rolloutPath)) throw new Error('CODEX_COMPACTION_PATH_INVALID')
+  const info = lstatSync(canonical)
+  if (!info.isFile() || info.isSymbolicLink() || info.size > CODEX_ROLLOUT_MAX_BYTES) {
+    throw new Error('CODEX_COMPACTION_PATH_INVALID')
+  }
+  let latest: { timestamp: number; message: string } | null = null
+  const lines = createInterface({
+    input: createReadStream(canonical, { encoding: 'utf8' }),
+    crlfDelay: Infinity,
+  })
+  for await (const line of lines) {
+    if (!line.includes('"type":"compacted"')) continue
+    let parsed: unknown
+    try { parsed = JSON.parse(line) } catch { continue }
+    if (!parsed || typeof parsed !== 'object') continue
+    const row = parsed as Record<string, unknown>
+    if (row.type !== 'compacted' || !row.payload || typeof row.payload !== 'object') continue
+    const ts = typeof row.timestamp === 'string' ? Date.parse(row.timestamp) : Number.NaN
+    if (!Number.isFinite(ts) || ts + 5_000 < compactStartedAt) continue
+    const payload = row.payload as Record<string, unknown>
+    const message = typeof payload.message === 'string' ? payload.message.trim() : ''
+    if (!message || !Array.isArray(payload.replacement_history)) continue
+    if (!latest || ts >= latest.timestamp) latest = { timestamp: ts, message }
+  }
+  if (!latest) throw new Error('CODEX_NATIVE_COMPACTION_NOT_EXPORTED')
+  return { summaryText: latest.message, source: 'codex', compactStartedAt }
+}
 
 // ── turn/start 窄路径自动重试(turn-retry 批,2026-07-18)──────────────────
 // 只重试 **turn/start 请求本身被拒**的窄路径(app-server 明确 JSON-RPC application
@@ -849,7 +901,7 @@ function codexReverseRpcKey(id: number | string): string {
   return JSON.stringify([typeof id, id])
 }
 
-/** Project Codex 0.144.0 ToolRequestUserInputParams onto the already-shipped
+/** Project Codex 0.144/0.149 ToolRequestUserInputParams onto the already-shipped
  * CCB AskUserQuestion input shape. Codex has no multiSelect request field;
  * every model-facing option list is mutually exclusive, so the projection is
  * explicitly single-select. Protocol-only fields are retained as harmless
@@ -892,16 +944,29 @@ function normalizeCodexUserInput(paramsUnk: unknown): NormalizedCodexUserInput |
   }
   if (questions.length === 0) return null
 
+  const isBlocking = params.isBlocking
+  if (isBlocking !== undefined && typeof isBlocking !== 'boolean') return null
   const autoResolutionMs = params.autoResolutionMs
   if (
     autoResolutionMs !== undefined &&
     autoResolutionMs !== null &&
     (typeof autoResolutionMs !== 'number' ||
       !Number.isSafeInteger(autoResolutionMs) ||
-      autoResolutionMs < 0)
+      autoResolutionMs < 60_000 ||
+      autoResolutionMs > 240_000)
   ) {
     return null
   }
+
+  // 0.149 makes isBlocking authoritative and deprecates autoResolutionMs.
+  // Legacy 0.144 requests omit isBlocking, so preserve their old duration
+  // semantics. A new non-blocking request without a usable legacy duration
+  // receives the platform minimum instead of becoming accidentally blocking.
+  const effectiveAutoResolutionMs = isBlocking === true
+    ? undefined
+    : isBlocking === false
+      ? typeof autoResolutionMs === 'number' ? autoResolutionMs : 60_000
+      : typeof autoResolutionMs === 'number' ? autoResolutionMs : undefined
 
   return {
     threadId,
@@ -910,7 +975,9 @@ function normalizeCodexUserInput(paramsUnk: unknown): NormalizedCodexUserInput |
     questions,
     input: {
       questions: inputQuestions,
-      ...(typeof autoResolutionMs === 'number' ? { autoResolutionMs } : {}),
+      ...(typeof effectiveAutoResolutionMs === 'number'
+        ? { autoResolutionMs: effectiveAutoResolutionMs }
+        : {}),
     },
   }
 }
@@ -1017,6 +1084,12 @@ export class CodexAppServerRunner extends EventEmitter {
   /** Promise wired into `turn/completed` notification handling. Set by runTurn
    *  before sending `turn/start`, resolved by handleNotification on
    *  `turn/completed` for the matching turnId. */
+  private pendingNativeCompaction: {
+    startedAt: number
+    resolve: () => void
+    reject: (error: Error) => void
+    timer: NodeJS.Timeout
+  } | null = null
   private currentTurnCompleter: {
     resolve: (turn: {
       status?: string
@@ -1402,7 +1475,7 @@ export class CodexAppServerRunner extends EventEmitter {
       for (const question of pending.questions) {
         const answer = answersByQuestionText[question.question]
         if (typeof answer !== 'string' || answer.trim().length === 0) continue
-        // Codex 0.144.0 has no multiSelect input field. Its response still
+        // Codex 0.144/0.149 has no multiSelect input field. Its response still
         // uses an array so future/internal callers can express more than one
         // value; the existing AskUserQuestion card supplies one string.
         codexAnswers[question.id] = { answers: [answer] }
@@ -1452,6 +1525,53 @@ export class CodexAppServerRunner extends EventEmitter {
   private clearPendingUserInputs(): void {
     this.pendingUserInputs.clear()
     this.pendingUserInputIdsByRpc.clear()
+  }
+
+  async compactForHandoff(): Promise<NativeModelHandoffArtifact> {
+    if (!this.proc || !this.attached || !this.threadId) {
+      throw new Error('CODEX_NATIVE_COMPACTION_SESSION_NOT_READY')
+    }
+    if (this.processing || this.currentTurnCompleter || this.pendingNativeCompaction) {
+      throw new Error('CODEX_NATIVE_COMPACTION_BUSY')
+    }
+    const compactStartedAt = Date.now()
+    const completed = new Promise<void>((resolvePromise, rejectPromise) => {
+      const timer = setTimeout(() => {
+        if (this.pendingNativeCompaction?.startedAt !== compactStartedAt) return
+        this.pendingNativeCompaction = null
+        rejectPromise(new Error('CODEX_NATIVE_COMPACTION_TIMEOUT'))
+      }, NATIVE_COMPACTION_TIMEOUT_MS)
+      timer.unref?.()
+      this.pendingNativeCompaction = {
+        startedAt: compactStartedAt,
+        resolve: resolvePromise,
+        reject: rejectPromise,
+        timer,
+      }
+    })
+    try {
+      await this.sendRequest('thread/compact/start', { threadId: this.threadId })
+      await completed
+      const result = await this.sendRequest('thread/read', {
+        threadId: this.threadId,
+        includeTurns: false,
+      }) as { thread?: { path?: unknown } }
+      const rolloutPath = result.thread?.path
+      if (typeof rolloutPath !== 'string' || !rolloutPath) {
+        throw new Error('CODEX_NATIVE_COMPACTION_PATH_MISSING')
+      }
+      return await readLatestCodexNativeHandoff(rolloutPath, compactStartedAt)
+    } catch (error) {
+      this.clearPendingNativeCompaction(compactStartedAt)
+      throw error
+    }
+  }
+
+  private clearPendingNativeCompaction(compactStartedAt: number): void {
+    const pending = this.pendingNativeCompaction
+    if (!pending || pending.startedAt !== compactStartedAt) return
+    this.pendingNativeCompaction = null
+    clearTimeout(pending.timer)
   }
 
   interrupt(): boolean {
@@ -1547,11 +1667,17 @@ export class CodexAppServerRunner extends EventEmitter {
         // Phase 5:把 turn 顶部的 snapshot 一路透传到 buildPromptContext 的 REPO slot,
         // 让 codex 系统提示中带上仓库元信息(parity with SubprocessRunner)。
         repoSnapshot: repoSnap,
+        sessionId: this.opts.sessionId,
       })
       writeFileSync(overrides.instructionsFile, overrides.instructionsContent, 'utf8')
       // v3 hardening — see codexRunner.ts for rationale (token never in argv).
       if (overrides.tokenFile && overrides.tokenContent !== null) {
         writeFileSync(overrides.tokenFile, overrides.tokenContent, { mode: 0o600 })
+      }
+      if (overrides.delegateContextFile && overrides.delegateContextContent !== null) {
+        writeFileSync(overrides.delegateContextFile, overrides.delegateContextContent, {
+          mode: 0o600,
+        })
       }
       if (overrides.visionTokenFile && overrides.visionTokenContent !== null) {
         writeFileSync(overrides.visionTokenFile, overrides.visionTokenContent, { mode: 0o600 })
@@ -1567,6 +1693,22 @@ export class CodexAppServerRunner extends EventEmitter {
       }
       throw err
     }
+  }
+
+  /** The app-server process is long-lived, so re-mint the caller binding for
+   * every logical turn while keeping the inherited file path stable. */
+  private refreshDelegateContext(): void {
+    const file = this.cachedOverrides?.delegateContextFile
+    if (!file) return
+    writeFileSync(
+      file,
+      `${issueDelegateContextToken({
+        agentId: this.opts.agentId,
+        sessionKey: this.opts.sessionKey,
+        depth: this.opts.delegationDepth ?? 0,
+      })}\n`,
+      { mode: 0o600 },
+    )
   }
 
   /** Cleanup helper shared by `shutdown()` and the proc close handler so
@@ -1652,6 +1794,12 @@ export class CodexAppServerRunner extends EventEmitter {
     const pendingQueue = this.queue
     this.queue = []
     for (const q of pendingQueue) q.reject(new Error('CodexAppServerRunner shutdown'))
+    if (this.pendingNativeCompaction) {
+      const pending = this.pendingNativeCompaction
+      this.pendingNativeCompaction = null
+      clearTimeout(pending.timer)
+      pending.reject(new Error('CODEX_NATIVE_COMPACTION_INTERRUPTED'))
+    }
     // Resolve app-server reverse requests while stdin is still writable. This
     // mirrors a browser deny and prevents requestUserInput from surviving a
     // transient runner recycle in either pending map.
@@ -1841,6 +1989,7 @@ export class CodexAppServerRunner extends EventEmitter {
     const providerSignature = this.codexRouteSignature()
     const providerArgs = buildCodexProviderConfigArgs(process.env, this.codexRouteConfig)
     const modelCatalogArgs = buildCodexModelCatalogArgs(this.opts.model)
+    const longContextArgs = buildCodexLongContextArgs(this.opts.model)
     const effortArgs = codexReasoningEffortConfig(this.opts.model, this.effortLevel)
     // T3:reasoning summary 与 effort 是同一 provider 的推理配置,co-locate 在这里
     // 一起拼(仅 codex-native/gpt-5.5 官方 OAuth 路径生效,env 可秒关)。让队长思考
@@ -1882,6 +2031,7 @@ export class CodexAppServerRunner extends EventEmitter {
       ...argvOverrides,
       ...providerArgs,
       ...modelCatalogArgs,
+      ...longContextArgs,
       ...effortArgs,
       ...reasoningSummaryArgs,
       ...multiAgentDisableArgs,
@@ -1905,7 +2055,13 @@ export class CodexAppServerRunner extends EventEmitter {
       // 用**非 OPENCLAUDE_ 前缀**的 OC_AGENT_ID 显式注入(不被 scrub):agent-id 不是密钥
       // (模型本就从 persona/SOUL 知道自己是谁),暴露给 codex shell 零敏感。旧 MCP 是靠
       // mcp_servers.X.env 显式注入 agent-id 才没这问题;CLI 走 ambient env 需本行补齐。
-      env: { ...buildCodexEnv(), ..._codexMemoryTurnEnv(this.opts.agentId, this.opts.sessionKey) },
+      env: {
+        ...buildCodexEnv(),
+        ..._codexMemoryTurnEnv(this.opts.agentId, this.opts.sessionKey, {
+          gatewayPort: this.opts.config?.gateway.port,
+          contextFile: this.cachedOverrides?.delegateContextFile,
+        }),
+      },
     }) as ChildProcessWithoutNullStreams
     this.proc = proc
     this.outputDrainPromise = new Promise<void>((resolve) => {
@@ -2491,6 +2647,10 @@ export class CodexAppServerRunner extends EventEmitter {
     return normalizeCodexReasoningEffort(this.opts.model, this.effortLevel) ?? undefined
   }
 
+  private codexTransportModel(): string | undefined {
+    return codexTransportModelId(this.opts.model)
+  }
+
   private buildTurnStartParams(prompt: string): Record<string, unknown> {
     const mode = this.conversationMode
     const reasoningEffort = this.codexReasoningEffort()
@@ -2500,7 +2660,7 @@ export class CodexAppServerRunner extends EventEmitter {
       collaborationMode: {
         mode,
         settings: {
-          model: this.opts.model ?? '',
+          model: this.codexTransportModel() ?? '',
           ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
           developer_instructions: mode === 'default' ? CODEX_DEFAULT_MODE_INSTRUCTIONS : null,
         },
@@ -2512,7 +2672,7 @@ export class CodexAppServerRunner extends EventEmitter {
             ? { type: 'readOnly', networkAccess: true }
             : { type: 'dangerFullAccess' },
     }
-    if (this.opts.model) params.model = this.opts.model
+    if (this.codexTransportModel()) params.model = this.codexTransportModel()
     if (this.opts.structuredOutputSchema) params.outputSchema = this.opts.structuredOutputSchema
     return params
   }
@@ -2521,6 +2681,19 @@ export class CodexAppServerRunner extends EventEmitter {
     if (!params || typeof params !== 'object') return
     const p = params as Record<string, unknown>
     const turnId = typeof p.turnId === 'string' ? p.turnId : undefined
+
+    if (
+      this.pendingNativeCompaction &&
+      method === 'item/completed' &&
+      _isContextCompactionItem(p.item) &&
+      (typeof p.threadId !== 'string' || p.threadId === this.threadId)
+    ) {
+      const pending = this.pendingNativeCompaction
+      this.pendingNativeCompaction = null
+      clearTimeout(pending.timer)
+      pending.resolve()
+      return
+    }
 
     // Codex exposes auto-compaction as a ThreadItem (`contextCompaction`).
     // In the app-server protocol it may belong to a short internal turn whose
@@ -3308,7 +3481,7 @@ export class CodexAppServerRunner extends EventEmitter {
       approvalPolicy: 'never',
       sandbox: this.opts.hermeticNoTools ? 'read-only' : 'danger-full-access',
       cwd: effectiveCwd,
-      ...(this.opts.model ? { model: this.opts.model } : {}),
+      ...(this.codexTransportModel() ? { model: this.codexTransportModel() } : {}),
     })) as { thread?: { id?: string } } | undefined
     const tid = res?.thread?.id
     if (typeof tid !== 'string' || !tid) {
@@ -3525,6 +3698,7 @@ export class CodexAppServerRunner extends EventEmitter {
       // queued turn's policy before the actual turn/start notifications arrive.
       this.currentCollabAgentPolicy = collabAgentPolicy
       await this.ensureSpawned(repoSnap, effectiveCwd)
+      this.refreshDelegateContext()
 
       // Each fresh app-server proc must explicitly attach a thread before
       // turn/start. `attached` is per-proc (cleared on close/error), so this
@@ -3543,7 +3717,7 @@ export class CodexAppServerRunner extends EventEmitter {
               approvalPolicy: 'never',
               sandbox: 'danger-full-access',
               cwd: effectiveCwd,
-              ...(this.opts.model ? { model: this.opts.model } : {}),
+              ...(this.codexTransportModel() ? { model: this.codexTransportModel() } : {}),
             })
           } catch (err) {
             // Self-heal "no rollout found for thread id" (-32600). Caused by

@@ -36,7 +36,7 @@ export function GroupFormModal({
   const isCreate = !group;
   const [label, setLabel] = useState("");
   const [kind, setKind] = useState<"official_oauth" | "api_relay">("api_relay");
-  const [provider, setProvider] = useState<"claude" | "codex" | "grok">("codex");
+  const [provider, setProvider] = useState<"claude" | "codex" | "grok" | "cursor">("codex");
   const [enabled, setEnabled] = useState(true);
   const [priority, setPriority] = useState("100");
   const [models, setModels] = useState("");
@@ -46,7 +46,7 @@ export function GroupFormModal({
     if (!open) return;
     setLabel(group?.label ?? "");
     setKind(group?.kind ?? "api_relay");
-    setProvider((group?.provider as "claude" | "codex" | "grok" | undefined) ?? "codex");
+    setProvider((group?.provider as "claude" | "codex" | "grok" | "cursor" | undefined) ?? "codex");
     setEnabled(group?.enabled ?? true);
     setPriority(String(group?.priority ?? 100));
     setModels((group?.models ?? []).join(", "));
@@ -139,7 +139,8 @@ export function GroupFormModal({
             </Field>
             <Field label="provider" hint={kind === "api_relay" ? "API 中转站仅支持 codex。" : "官方订阅账号池。"}>
               <Select value={provider} onChange={(e) => setProvider(e.target.value as typeof provider)} disabled={kind === "api_relay"}>
-                {kind === "official_oauth" && <option value="claude">claude</option>}
+                {kind === "official_oauth" && <option value="cursor">cursor</option>}
+                {kind === "official_oauth" && <option value="claude">ccb</option>}
                 <option value="codex">codex</option>
                 {kind === "official_oauth" && <option value="grok">grok</option>}
               </Select>

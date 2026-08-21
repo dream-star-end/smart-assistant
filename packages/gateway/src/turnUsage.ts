@@ -44,6 +44,7 @@ export interface TurnUsageRecordInput {
   durationMs: number
   terminalStatus: TurnTerminalStatus
   requestId?: string
+  traceId?: string
 }
 
 /** Single emit site for turn usage. eventPersist writes usage_log from this. */
@@ -56,6 +57,7 @@ export function emitTurnUsage(input: TurnUsageRecordInput): void {
     durationMs: input.durationMs,
     terminalStatus: input.terminalStatus,
     ...(input.requestId ? { requestId: input.requestId } : {}),
+    ...(input.traceId ? { traceId: input.traceId } : {}),
   }))
 }
 

@@ -1,13 +1,12 @@
-import { Bell, BookOpen, ChevronDown, Film, Menu, PanelLeft, PenSquare, Users, Wallet } from "lucide-react";
+import { Bell, ChevronDown, Menu, PanelLeft, PenSquare, Users, Wallet } from "lucide-react";
 import { useState } from "react";
-import type { Theme } from "../hooks/useTheme";
 import type { Agent } from "../lib/agents";
+import type { PreferenceEffort } from "../lib/modelPreferences";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import { AgentAvatar } from "./AgentAvatar";
 import type { PublicModel } from "../lib/types";
 import { formatCredits } from "../lib/utils";
 import { ModelSelector, teamEngineLabel } from "./ModelSelector";
-import { ThemeToggle } from "./ThemeToggle";
 import { Button, IconButton, Popover, PopoverContent, PopoverTrigger } from "./ui";
 
 export function ChatHeader({
@@ -17,6 +16,9 @@ export function ChatHeader({
   selectedModelId,
   onSelectModel,
   modelsLoading,
+  effortSupported,
+  effortActive,
+  onSelectEffort,
   teamModeActive,
   onDisableTeamMode,
   credits,
@@ -26,11 +28,8 @@ export function ChatHeader({
   onNew,
   onOpenMobileNav,
   onOpenInbox,
-  onOpenMediaTasks,
-  onOpenTutorial,
   unreadCount,
-  theme,
-  onCycleTheme,
+  sessionUnreadCount,
 }: {
   agent: Agent;
   onAgentClick: () => void;
@@ -39,6 +38,12 @@ export function ChatHeader({
   selectedModelId?: string;
   onSelectModel?: (id: string) => void;
   modelsLoading?: boolean;
+  /** 当前执行模型支持的思考档位（空/省略 = 模型不暴露档位,菜单内不渲染档位区块）。 */
+  effortSupported?: readonly string[];
+  /** 当前生效思考档（null/undefined = 跟随模型默认）。 */
+  effortActive?: PreferenceEffort | null;
+  /** 选择思考档；null = 跟随模型默认。透传给模型菜单的二级档位区块。 */
+  onSelectEffort?: (value: PreferenceEffort | null) => void;
   /**
    * 团队模式已开启且当前会话是 main（队长引擎覆盖生效）。true 时 agent 名旁显示
    * 「团队模式」chip（点击弹说明 + 关闭入口），并让 ModelSelector 切换到如实的
@@ -58,14 +63,10 @@ export function ChatHeader({
   onOpenMobileNav?: () => void;
   /** 打开站内信面板（省略则不渲染铃铛，如 demo / 未登录）。 */
   onOpenInbox?: () => void;
-  /** 打开账号级异步视频任务中心。 */
-  onOpenMediaTasks?: () => void;
-  /** 打开与真实功能联动的教程中心。 */
-  onOpenTutorial?: () => void;
   /** 站内信未读数（>0 显红点，>99 显 99+）。 */
   unreadCount?: number;
-  theme: Theme;
-  onCycleTheme: () => void;
+  /** 会话未读数（侧栏折叠/移动抽屉入口角标）。与站内信 unreadCount 并存、语义不同。 */
+  sessionUnreadCount?: number;
 }) {
   const low = credits != null && (credits.trim().startsWith("-") || /^-?0+$/.test(credits.trim()));
   // 团队模式说明弹层的受控开关：点「关闭团队模式」需要主动收起弹层（chip 随
@@ -79,16 +80,22 @@ export function ChatHeader({
     >
       {/* 移动端汉堡：窄屏始终可见，打开侧栏抽屉。 */}
       {onOpenMobileNav && (
-        <IconButton data-product-control onClick={onOpenMobileNav} aria-label="打开菜单" shape="square" className="md:hidden">
-          <Menu size={18} />
-        </IconButton>
+        <div className="relative md:hidden">
+          <IconButton data-product-control onClick={onOpenMobileNav} aria-label="打开菜单" shape="square">
+            <Menu size={18} />
+          </IconButton>
+          <HeaderCountBadge count={sessionUnreadCount} testId="session-unread-badge" />
+        </div>
       )}
       {/* 桌面折叠态：展开 + 新建（仅 md+，移动端用抽屉）。 */}
       {sidebarCollapsed && (
         <div className="hidden items-center gap-1 md:flex">
-          <IconButton data-product-control onClick={onExpandSidebar} aria-label="展开侧栏" shape="square">
-            <PanelLeft size={18} />
-          </IconButton>
+          <div className="relative">
+            <IconButton data-product-control onClick={onExpandSidebar} aria-label="展开侧栏" shape="square">
+              <PanelLeft size={18} />
+            </IconButton>
+            <HeaderCountBadge count={sessionUnreadCount} testId="session-unread-badge" />
+          </div>
           <IconButton data-product-feature={PRODUCT_CAPABILITIES.chatBasics.id} onClick={onNew} aria-label="新建会话" shape="square">
             <PenSquare size={18} />
           </IconButton>
@@ -150,35 +157,18 @@ export function ChatHeader({
           onSelect={onSelectModel}
           loading={modelsLoading}
           teamEngineActive={teamModeActive}
+          effortSupported={effortSupported}
+          effortActive={effortActive}
+          onSelectEffort={onSelectEffort}
         />
       )}
       <div className="ml-auto flex shrink-0 items-center gap-1.5">
-        {onOpenMediaTasks && (
-          <IconButton data-product-control onClick={onOpenMediaTasks} aria-label="视频任务" title="视频任务" shape="square">
-            <Film size={18} />
-          </IconButton>
-        )}
-        {onOpenTutorial && (
-          <IconButton
-            data-product-control
-            onClick={onOpenTutorial}
-            aria-label="打开使用教程"
-            title="使用教程"
-            shape="square"
-          >
-            <BookOpen size={18} />
-          </IconButton>
-        )}
         {onOpenInbox && (
           <div className="relative">
             <IconButton data-product-feature={PRODUCT_CAPABILITIES.inbox.id} onClick={onOpenInbox} aria-label="站内信" shape="square">
               <Bell size={18} />
             </IconButton>
-            {!!unreadCount && unreadCount > 0 && (
-              <span className="pointer-events-none absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-danger px-1 text-[10px] font-semibold leading-none text-white tabular-nums">
-                {unreadCount > 99 ? "99+" : unreadCount}
-              </span>
-            )}
+            <HeaderCountBadge count={unreadCount} />
           </div>
         )}
         {credits != null && (
@@ -198,8 +188,20 @@ export function ChatHeader({
             <span className="hidden sm:inline">{formatCredits(credits)}</span>
           </button>
         )}
-        <ThemeToggle theme={theme} onCycle={onCycleTheme} />
       </div>
     </header>
+  );
+}
+
+/** 顶栏角标：站内信与会话未读共用同一套尺寸/色。count 缺省或 ≤0 不占位。 */
+function HeaderCountBadge({ count, testId }: { count?: number; testId?: string }) {
+  if (!count || count <= 0) return null;
+  return (
+    <span
+      data-testid={testId}
+      className="pointer-events-none absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-danger px-1 text-[10px] font-semibold leading-none text-white tabular-nums"
+    >
+      {count > 99 ? "99+" : count}
+    </span>
   );
 }

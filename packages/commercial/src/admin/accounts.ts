@@ -46,6 +46,7 @@ import {
   type ListAccountsOptions,
   type UpdateAccountPatch,
 } from "../account-pool/store.js";
+import { normalizeCursorApiKey, scheduleCursorAuthSync } from "../account-pool/cursorMaterializer.js";
 import { writeAdminAuditBestEffort as bestEffortAudit } from "./audit.js";
 import {
   reassignEgressHost,
@@ -188,14 +189,10 @@ export interface AdminCreateAccountInput {
    */
   subscription_end_at?: Date | string | null;
   /**
-   * 0055 — 代理池 entry id(必填)。boss 强约束:每个账号必须关联池条目,
-   * raw `egress_proxy` 文本字段已不再支持。
-   * 校验:格式 `^[1-9][0-9]{0,19}$` + 存在性预检(SELECT FROM egress_proxies)。
-   * 不校验 active 状态:与 0053 决策一致,允许 active→disabled 中间态;
-   * disabled entry 运行时 dispatcher fallback(优先级:plain proxy > egress_target
-   * mTLS host > master 默认出口),不阻塞 admin 流程。
+   * 0055 — claude/codex/grok 必填代理池 entry id。
+   * provider='cursor' 走容器内 CLI 直连,允许省略。
    */
-  egress_proxy_id: bigint | string;
+  egress_proxy_id?: bigint | string | null;
   /** Optional V1 account group binding. Claude accounts default to the first official OAuth group. */
   group_id?: bigint | string | null;
 }
@@ -285,6 +282,7 @@ export async function adminCreateAccount(
   if (typeof input.oauth_token !== "string" || input.oauth_token.length === 0) {
     throw new RangeError("invalid_oauth_token");
   }
+  const oauthToken = provider === "cursor" ? normalizeCursorApiKey(input.oauth_token) : input.oauth_token;
   let expiresAt: Date | null = null;
   if (input.oauth_expires_at !== undefined && input.oauth_expires_at !== null) {
     const d = typeof input.oauth_expires_at === "string"
@@ -324,16 +322,17 @@ export async function adminCreateAccount(
   ) {
     throw new RangeError("invalid_oauth_principal");
   }
-  // 0055:egress_proxy_id 必填(类型签名已锁,这里 runtime 兜底防 JS 调用方绕过 TS)
-  if (input.egress_proxy_id === undefined || input.egress_proxy_id === null) {
-    throw new RangeError("invalid_egress_proxy_id_missing");
+  let egressProxyId: string | null = null;
+  if (provider !== "cursor") {
+    if (input.egress_proxy_id === undefined || input.egress_proxy_id === null) {
+      throw new RangeError("invalid_egress_proxy_id_missing");
+    }
+    egressProxyId = String(input.egress_proxy_id);
+    if (!/^[1-9][0-9]{0,19}$/.test(egressProxyId)) {
+      throw new RangeError("invalid_egress_proxy_id");
+    }
+    await ensureEgressProxyExistsOrThrow(egressProxyId);
   }
-  const egressProxyId = String(input.egress_proxy_id);
-  if (!/^[1-9][0-9]{0,19}$/.test(egressProxyId)) {
-    throw new RangeError("invalid_egress_proxy_id");
-  }
-  // 存在性预检 — 不存在的 FK 在 store 层会冒成 23503 → 500,提前 SELECT 给 400。
-  await ensureEgressProxyExistsOrThrow(egressProxyId);
 
   const normalizedGroupId = await normalizeGroupIdForAccount(provider, input.group_id, { defaultOfficialOAuthGroup: true });
 
@@ -352,14 +351,14 @@ export async function adminCreateAccount(
   //   - codex 跳过(Phase 6 hook 只盯 claude;backfill 脚本同语义)
   let accountUuid: string | null = null;
   if (provider === "claude") {
-    accountUuid = await fetchAccountUuidForCreate(input.oauth_token, egressProxyId);
+    accountUuid = await fetchAccountUuidForCreate(input.oauth_token, String(egressProxyId));
   }
 
   const createInput: CreateAccountInput = {
     provider,
     label: input.label.trim(),
     plan: input.plan,
-    token: input.oauth_token,
+    token: oauthToken,
     refresh,
     expires_at: expiresAt,
     subscription_end_at: subscriptionEndAt,
@@ -399,6 +398,7 @@ export async function adminCreateAccount(
       // 不记明文 token / proxy 密码 —— snapshotForAudit 已 mask
     },
   );
+  if (row.provider === "cursor") scheduleCursorAuthSync("account.create");
   return row;
 }
 
@@ -577,7 +577,9 @@ export async function adminPatchAccount(
   if (patch.plan !== undefined) storePatch.plan = patch.plan;
   if (patch.status !== undefined) storePatch.status = patch.status;
   if (patch.health_score !== undefined) storePatch.health_score = patch.health_score;
-  if (patch.oauth_token !== undefined) storePatch.token = patch.oauth_token;
+  if (patch.oauth_token !== undefined) {
+    storePatch.token = before.provider === "cursor" ? normalizeCursorApiKey(patch.oauth_token) : patch.oauth_token;
+  }
   if (patch.oauth_refresh_token !== undefined) storePatch.refresh = patch.oauth_refresh_token;
   if (normalizedEgressProxyId !== undefined) storePatch.egress_proxy_id = normalizedEgressProxyId;
   if (normalizedPatchGroupId !== undefined) storePatch.group_id = normalizedPatchGroupId;
@@ -671,6 +673,7 @@ export async function adminPatchAccount(
   }
 
   await bestEffortAudit(ctx, "account.patch", `account:${String(id)}`, changedBefore, changedAfter);
+  if (after.provider === "cursor") scheduleCursorAuthSync("account.patch");
   return after;
 }
 
@@ -743,6 +746,7 @@ export async function adminResetCooldown(
     auditBefore,
     auditAfter,
   );
+  if (after.provider === "cursor") scheduleCursorAuthSync("account.reset_cooldown");
   return after;
 }
 
@@ -816,6 +820,7 @@ export async function adminDeleteAccount(
     snapshotForAudit(before),
     null,
   );
+  if (before.provider === "cursor") scheduleCursorAuthSync("account.delete");
   return true;
 }
 

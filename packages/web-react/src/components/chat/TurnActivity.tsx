@@ -31,12 +31,17 @@ export type TurnActivityInfo = {
   startedAt: number | null;
   /** 最近一帧到达时刻（_lastFrameAt），用于静默时长升级文案。 */
   lastFrameAt?: number;
+  /** Cursor keepalive working-detail；展示前会收成中文动作标签，卡住时由 silenceMs 盖过。 */
+  progressHint?: string;
   /** turn 非流式阶段态(判别联合,单一权威 model.ts TurnStatusState):
    *  'compacting' → 「正在压缩上下文」;{kind:'retrying'} → 统一自动重试文案。 */
   turnStatus?: TurnStatusState | null;
   /** Browser/service recovery stays in this existing activity row instead of
    * creating a second card or action surface above the composer. */
   recoveryStatus?: RecoveryStatusState | null;
+  /** Units first pack already painted; retrying/waiting-service must not keep
+   * the "正在恢复实时内容…" copy. */
+  hasVisibleProcess?: boolean;
   /** 容器冷启（sys.cold_start）：typing 文案追加「容器首次加载中」后缀。 */
   coldStart?: boolean;
   /** 显示用 agent 名（如「主助手」「编程助手」）。 */
@@ -94,7 +99,10 @@ export function TurnActivity({ info }: { info: TurnActivityInfo }) {
   } else if (retry) {
     text = `模型繁忙，正在重试中（${retry.attempt}/${AUTOMATIC_TURN_RETRY_MAX}）`;
     cls = "retrying";
-  } else if (recoveryKind === "waiting-service" || recoveryKind === "retrying") {
+  } else if (
+    (recoveryKind === "waiting-service" || recoveryKind === "retrying") &&
+    !info.hasVisibleProcess
+  ) {
     text = "正在恢复实时内容…";
     cls = "recovering";
   } else if (info.turnStatus === "compacting") {
@@ -110,6 +118,7 @@ export function TurnActivity({ info }: { info: TurnActivityInfo }) {
       secs,
       silenceMs,
       hint,
+      progressHint: info.progressHint,
     }));
   }
 

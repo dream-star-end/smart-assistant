@@ -542,9 +542,8 @@ export interface MintOptions {
   /** authority 有效期(默认 AUTHORITY_TTL_MS,只约束「开始执行」)。 */
   authorityTtlMs?: number
   /**
-   * lease 有效期(默认 TURN_LEASE_TTL_MS = 45min hard timeout + 5min grace)。
-   * **耦合**:若运维抬高 OPENCLAUDE_DELEGATE_HARD_TIMEOUT_MS,必须同步抬高此值,
-   * 否则长 turn 的后续上游请求会被 lease 过期误伤(R4-M1 要消除的正是这类误伤)。
+   * lease 有效期(默认 TURN_LEASE_TTL_MS = 50min 滚动签名窗口)。
+   * 长 turn 依靠续签，不再与 delegate 总运行时长耦合。
    */
   leaseTtlMs?: number
 }

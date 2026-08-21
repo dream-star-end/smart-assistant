@@ -11,6 +11,7 @@ import {
   messageKind,
   messageSignature,
   reviewVerdictBadge,
+  safeMessageSignature,
   stripMarkdown,
 } from "./render";
 
@@ -76,6 +77,12 @@ describe("messageSignature 流式防闪签名", () => {
     expect(messageSignature(m, CTX)).toBe(messageSignature(m, CTX));
   });
 
+  test("plan steps:[null] does not throw; safeMessageSignature returns a string", () => {
+    const m = mk("plan", { text: "计划", steps: [null] as unknown as ChatMessage["steps"] });
+    expect(() => messageSignature(m, CTX)).not.toThrow();
+    expect(safeMessageSignature(m, CTX)).toContain("plan");
+  });
+
   test("assistant 文本增量 → 签名变化（触发重渲）", () => {
     const a = mk("assistant", { text: "hel" });
     const b = mk("assistant", { text: "hello" });
@@ -115,6 +122,12 @@ describe("messageSignature 流式防闪签名", () => {
   test("permission 解析翻转 → 签名变化", () => {
     const a = mk("permission", { requestId: "r1", _resolved: false });
     const b = mk("permission", { requestId: "r1", _resolved: true, _behavior: "allow" });
+    expect(messageSignature(a, CTX)).not.toBe(messageSignature(b, CTX));
+  });
+
+  test("permission _askUserExpiresAt 变化 → 签名变化", () => {
+    const a = mk("permission", { requestId: "r1", _resolved: false });
+    const b = mk("permission", { requestId: "r1", _resolved: false, _askUserExpiresAt: 1 });
     expect(messageSignature(a, CTX)).not.toBe(messageSignature(b, CTX));
   });
 

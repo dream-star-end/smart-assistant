@@ -5,7 +5,7 @@
  * 经 messageSignature 做 memo —— reducer 就地 mutation（同对象引用）下，React.memo 浅比较
  * 会漏渲，故以「内容签名」为比较键：变才渲、不变则稳定（复刻现网 keyed-reconcile 防闪）。
  *
- * MessageList：把会话消息流渲成虚拟卡片列表 + 流式 typing 指示 + 向上历史分页。
+ * MessageList：把会话消息流渲成普通 DOM 卡片列表 + 流式 typing 指示 + 向上历史分页。
  * 上层（App）只需把 WS 引擎产出的 ChatMessage[] 与回调传进来。
  */
 import { Info, Sparkles } from "lucide-react";
@@ -14,10 +14,10 @@ import {
   type ReactNode,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
 } from "react";
-import { Virtuoso, VirtuosoMockContext, type Components } from "react-virtuoso";
 import type {
   ChatMessage,
   LiveTurnTokenUsageSnapshot,
@@ -29,8 +29,10 @@ import {
   isRedundantRuntimeEnvelope,
   isTurnStatusSuppressedByTape,
   messageKind,
-  messageSignature,
+  safeMessageSignature,
 } from "../lib/chat/render";
+import { isRecoveryControlUserTurn } from "../lib/chat/pure";
+import { sanitizeChatMessages } from "../lib/chat/sanitizeChatMessages";
 import {
   AssistantCard,
   type CardCallbacks,
@@ -49,8 +51,8 @@ import { PermissionCard, type PermissionRespond } from "./chat/PermissionCard";
 import { ToolCardSlot } from "./chat/toolCardSlot";
 import { TurnActivity, type TurnActivityInfo } from "./chat/TurnActivity";
 import { currentTurnStartIndex, turnFinalAssistantFlags } from "./chat/turnSegment";
-import { loadedArchivedMetrics } from "./chat/archivePaging";
-import { PartialHistorySkeleton } from "./chat/HistorySkeleton";
+import { correctedScrollTop, loadedArchivedMetrics } from "./chat/archivePaging";
+import { JournalHydrationRetry, PartialHistorySkeleton } from "./chat/HistorySkeleton";
 import { MessageBoundary } from "./MessageBoundary";
 import { asStr, resolveToolInput } from "./tool/format";
 import { Alert, Avatar, Spinner } from "./ui";
@@ -217,7 +219,14 @@ export const MessageRenderer = memo(
           </TapeBackedCard>
         );
       case "permission":
-        return <PermissionCard msg={message} onRespond={onRespondPermission} readOnly={readOnly} />;
+        return (
+          <PermissionCard
+            msg={message}
+            onRespond={onRespondPermission}
+            readOnly={readOnly}
+            livePrompt={!readOnly && inActiveTurn && sending}
+          />
+        );
       case "agent-group":
         return <AgentGroupCard msg={message} delegateCost={delegateCost} />;
       case "delegate-progress":
@@ -531,7 +540,7 @@ function DeferredTapeRecordCard({
           const final = isLast && index === records.length - 1;
           const recordIsFinalAssistant = turnFinalAssistant === true &&
             hydratedRecord.role === "assistant" && index === records.length - 1;
-          const recordSig = messageSignature(hydratedRecord, {
+          const recordSig = safeMessageSignature(hydratedRecord, {
             isLast: final,
             sending,
             turnFinalAssistant: recordIsFinalAssistant,
@@ -701,9 +710,12 @@ function coalesceTeam(
   const delegateCostByAnchor = new Map<number, Record<string, string>>();
   for (let i = 0; i < total; i++) {
     const mm = messages[i];
-    if (mm?.role !== "assistant" || !mm.usage?.delegates?.length) continue;
+    const delegates = mm?.role === "assistant" && Array.isArray(mm.usage?.delegates)
+      ? mm.usage.delegates
+      : [];
+    if (delegates.length === 0) continue;
     const rec = delegateCostByAnchor.get(anchorOf[i]) ?? {};
-    for (const d of mm.usage.delegates) {
+    for (const d of delegates) {
       // 同 turn 若多条助手行都带 delegates,后者(最终答复行)胜。
       if (d && typeof d.agentId === "string" && typeof d.costCredits === "string") {
         rec[d.agentId] = d.costCredits;
@@ -763,7 +775,7 @@ function coalesceTeam(
           sig: members
             .map(
               (mm, k) =>
-                `${messageSignature(mm, { isLast: false, sending })}|c:${costFor(memberIdx[k], mm) ?? ""}|du:${tokenUsageSignature(delegateTokenUsage(mm))}`,
+                `${safeMessageSignature(mm, { isLast: false, sending })}|c:${costFor(memberIdx[k], mm) ?? ""}|du:${tokenUsageSignature(delegateTokenUsage(mm))}`,
             )
             .join("||"),
           delegateCosts,
@@ -818,7 +830,7 @@ function coalesceTeam(
       // 组 sig = 各成员签名拼接(仅末条按 groupIsLast 参与 isLast;文本 + 流式态都编进,
       // 后到成员/流式完成时 memo 正常重渲防漏渲)。key 用首条成员 id → 流式追加成员时稳定不重挂。
       const sig = members
-        .map((mm, k) => messageSignature(mm, { isLast: groupIsLast && k === members.length - 1, sending }))
+        .map((mm, k) => safeMessageSignature(mm, { isLast: groupIsLast && k === members.length - 1, sending }))
         .join("||");
       const thinkingUsage = groupedCallTokenUsage(members.map((member) => member._callUsage));
       items.push({
@@ -842,33 +854,48 @@ function coalesceTeam(
   return items;
 }
 
-// React Virtuoso uses firstItemIndex as a coordinate when items are prepended.
-// Keep a very large internal origin so every older page can move left without
-// imposing a user-visible history limit.
-const TIMELINE_VIRTUAL_INDEX_ORIGIN = Math.floor(Number.MAX_SAFE_INTEGER / 4);
+// Ordinary DOM timeline. First paint mounts only the newest tail so a 600-row
+// session does not commit every card before the first frame. Scrolling near the
+// top reveals already-resident rows; server history still uses the explicit
+// hasMore / loadOlder button (scroll never issues a network page).
+export const TIMELINE_INITIAL_TAIL_ITEMS = 80;
+const TIMELINE_WINDOW_EXPAND_ITEMS = 80;
+const TIMELINE_EXPAND_NEAR_TOP_PX = 160;
+const PAINT_ESTIMATE_PX = 200;
+const PAINT_OVERSCAN = 28;
+const PAINT_MIN_ITEMS = 36;
+const PAINT_ENABLE_ITEMS = 160;
+const PAINT_ENABLE_VIEWPORT_PX = 360;
 
-type VirtualItem = RenderItem;
-
-type TimelineVirtuosoContext = {
-  header: ReactNode;
-  footer: ReactNode;
-};
-
-function TimelineVirtuosoHeader({ context }: { context: TimelineVirtuosoContext }) {
-  return <>{context.header}</>;
+function defaultTailStart(length: number): number {
+  return Math.max(0, length - TIMELINE_INITIAL_TAIL_ITEMS);
 }
 
-function TimelineVirtuosoFooter({ context }: { context: TimelineVirtuosoContext }) {
-  return <>{context.footer}</>;
+function paintWindowEnabled(scroller: HTMLElement | null | undefined, count: number): boolean {
+  return Boolean(
+    scroller &&
+    scroller.clientHeight >= PAINT_ENABLE_VIEWPORT_PX &&
+    count >= PAINT_ENABLE_ITEMS,
+  );
 }
 
-// Component identities must stay constant. Inline Header/Footer functions make
-// react-virtuoso remount the footer on every stream delta, which was one source
-// of the user-visible "思考中" flash even when the row markup itself was stable.
-const TIMELINE_VIRTUOSO_COMPONENTS: Components<VirtualItem, TimelineVirtuosoContext> = {
-  Header: TimelineVirtuosoHeader,
-  Footer: TimelineVirtuosoFooter,
-};
+function computePaintRange(
+  count: number,
+  scrollTop: number,
+  clientHeight: number,
+  followBottom: boolean,
+): { start: number; end: number } {
+  const visible = Math.max(
+    PAINT_MIN_ITEMS,
+    Math.ceil(clientHeight / PAINT_ESTIMATE_PX) + PAINT_OVERSCAN * 2,
+  );
+  if (followBottom) {
+    return { start: Math.max(0, count - visible), end: count };
+  }
+  const start = Math.max(0, Math.floor(scrollTop / PAINT_ESTIMATE_PX) - PAINT_OVERSCAN);
+  const end = Math.min(count, Math.max(start + PAINT_MIN_ITEMS, start + visible));
+  return { start, end };
+}
 
 function renderItemKey(item: RenderItem): string {
   return item.kind === "single"
@@ -876,8 +903,8 @@ function renderItemKey(item: RenderItem): string {
     : item.members[0]?._timelineUnitKey ?? item.members[0]?.id ?? item.kind;
 }
 
-function renderItemMessages(item: RenderItem): ChatMessage[] {
-  return item.kind === "single" ? [item.m] : item.members;
+function isNonEmptyId(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
 }
 
 /**
@@ -896,6 +923,9 @@ export type MessageListArchive = {
   error: boolean;
   /** 拉更早一页归档(App 接线 loadOlderHistory + 前插后视口保持)。 */
   onLoadOlder: () => void | Promise<void>;
+  /** Hot live-unit window still has earlier units than the first pack. */
+  liveHasMoreBefore?: boolean;
+  onLoadOlderLiveUnits?: () => void | Promise<void>;
 };
 
 export function MessageList({
@@ -905,12 +935,16 @@ export function MessageList({
   turnActivity,
   transientNotice,
   historyLoading = false,
+  journalDegraded = false,
+  onRetryJournal,
   archive,
   cb,
   onRespondPermission,
   readOnly = false,
   scrollParent,
   historyGeneration = "legacy",
+  sessionId,
+  followBottomRef,
 }: {
   messages: ChatMessage[];
   sending: boolean;
@@ -920,18 +954,29 @@ export function MessageList({
   turnActivity?: TurnActivityInfo | null;
   /** 会话级 transient 软提示（"较长时间未收到新内容…"，非消息卡片，末尾 info 条渲染）。*/
   transientNotice?: { text: string } | null;
-  /** 已有部分消息可见，但 canonical history / durable journal 仍在加载。 */
+  /** 已有部分消息可见，但 canonical history 仍在加载。Journal 水合不再占用此位。 */
   historyLoading?: boolean;
+  /** Background live-journal hydrate degraded; show an explicit retry. */
+  journalDegraded?: boolean;
+  onRetryJournal?: () => void;
   /** 归档分页上下文；缺省=无归档(仅本地翻页)。*/
   archive?: MessageListArchive | null;
   cb: CardCallbacks;
   onRespondPermission: PermissionRespond;
   /** 管理端等只读 surface；默认 false，用户端行为不变。 */
   readOnly?: boolean;
-  /** Existing chat scroller. When present, only viewport-adjacent rows mount. */
+  /** Existing chat scroller. When present, first paint mounts the newest tail. */
   scrollParent?: HTMLElement | null;
   /** Server history revision. A new revision gets a fresh paging intent owner. */
   historyGeneration?: number | string;
+  sessionId?: string;
+  /**
+   * App stick-to-bottom intent. When true, content-height growth (late card
+   * layout, streaming) re-snaps the scroller to the end. Window expand sets
+   * this false and holds a preserve lock so ResizeObserver cannot yank to
+   * bottom while correctedScrollTop runs.
+   */
+  followBottomRef?: { current: boolean };
 }) {
   const pagingOwnerRef = useRef<{
     generation: string;
@@ -948,6 +993,40 @@ export function MessageList({
   const [archiveQueued, setArchiveQueued] = useState(false);
   const archiveQueuedRef = useRef(false);
   const archiveQueueTokenRef = useRef(0);
+  const [windowVersion, setWindowVersion] = useState(0);
+  const [paintRange, setPaintRange] = useState({ start: 0, end: TIMELINE_INITIAL_TAIL_ITEMS });
+  const itemCountRef = useRef(0);
+  const visibleCountRef = useRef(0);
+  const startOverrideRef = useRef<number | null>(null);
+  const pendingExpandCorrectionRef = useRef<{ height: number; top: number } | null>(null);
+  const viewportPreserveLockRef = useRef(false);
+  const listRootRef = useRef<HTMLDivElement | null>(null);
+  const didSnapToBottomRef = useRef(false);
+  const followBottomRefBox = useRef(followBottomRef);
+  followBottomRefBox.current = followBottomRef;
+  const beginViewportPreserve = () => {
+    viewportPreserveLockRef.current = true;
+    const follow = followBottomRefBox.current;
+    if (follow) follow.current = false;
+  };
+  const endViewportPreserve = () => {
+    if (typeof requestAnimationFrame !== "function") {
+      viewportPreserveLockRef.current = false;
+      return;
+    }
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        viewportPreserveLockRef.current = false;
+      });
+    });
+  };
+  const sessionIdRef = useRef(sessionId);
+  if (sessionIdRef.current !== sessionId) {
+    sessionIdRef.current = sessionId;
+    startOverrideRef.current = null;
+    didSnapToBottomRef.current = false;
+    viewportPreserveLockRef.current = false;
+  }
 
   useEffect(() => {
     archiveQueueTokenRef.current += 1;
@@ -1045,6 +1124,20 @@ export function MessageList({
     window.addEventListener("pointercancel", endPointer);
     window.addEventListener("blur", onWindowBlur);
     scroller.addEventListener("scroll", onScroll, { passive: true });
+    const onExpandNearTop = () => {
+      if (scroller.scrollTop > TIMELINE_EXPAND_NEAR_TOP_PX) return;
+      const total = itemCountRef.current;
+      const current = startOverrideRef.current ?? defaultTailStart(total);
+      if (current <= 0) return;
+      beginViewportPreserve();
+      pendingExpandCorrectionRef.current = {
+        height: scroller.scrollHeight,
+        top: scroller.scrollTop,
+      };
+      startOverrideRef.current = Math.max(0, current - TIMELINE_WINDOW_EXPAND_ITEMS);
+      setWindowVersion((value) => value + 1);
+    };
+    scroller.addEventListener("scroll", onExpandNearTop, { passive: true });
     return () => {
       if (touchIdleTimer !== null) window.clearTimeout(touchIdleTimer);
       scroller.removeEventListener("wheel", onWheel);
@@ -1058,37 +1151,73 @@ export function MessageList({
       window.removeEventListener("pointercancel", endPointer);
       window.removeEventListener("blur", onWindowBlur);
       scroller.removeEventListener("scroll", onScroll);
+      scroller.removeEventListener("scroll", onExpandNearTop);
     };
   }, [processPaging, scrollParent]);
+
+  useEffect(() => {
+    const el = scrollParent;
+    if (!el) return;
+    let raf = 0;
+    const update = () => {
+      raf = 0;
+      const count = visibleCountRef.current;
+      if (!paintWindowEnabled(el, count)) return;
+      const next = computePaintRange(
+        count,
+        el.scrollTop,
+        el.clientHeight,
+        followBottomRefBox.current?.current === true,
+      );
+      setPaintRange((prev) => {
+        if (prev.start === next.start && prev.end === next.end) return prev;
+        if (Math.abs(prev.start - next.start) < 8 && Math.abs(prev.end - next.end) < 8) return prev;
+        return next;
+      });
+    };
+    const onScroll = () => {
+      if (raf) return;
+      raf = requestAnimationFrame(update);
+    };
+    el.addEventListener("scroll", onScroll, { passive: true });
+    update();
+    return () => {
+      el.removeEventListener("scroll", onScroll);
+      if (raf) cancelAnimationFrame(raf);
+    };
+  }, [scrollParent, windowVersion, sessionId]);
 
   // Drop legacy substitute rows from an old IndexedDB cache and duplicate
   // engine transport envelopes. The latter remain byte-complete in the tape;
   // their canonical immutable Agent blocks are the user-facing timeline.
-  const resolvedDispatchTurnIds = collectResolvedDispatchTurnIds(messages);
-  // Automatic recovery rows remain in memory/IndexedDB/PG as exact lineage,
-  // but are transport controls rather than another user utterance. While a
-  // child exists, its source terminal card is likewise an intermediate state;
-  // only the final exhausted/unsafe error remains visible.
-  const automaticallyRecoveredSourceIds = new Set(
-    messages
-      .filter((message) => message.role === "user" && message._automaticRecovery === true)
+  const safeMessages = sanitizeChatMessages(messages, sessionId);
+  const resolvedDispatchTurnIds = collectResolvedDispatchTurnIds(safeMessages);
+  // Recovery child user turns remain in memory/IndexedDB/PG as exact lineage,
+  // but are transport controls rather than another user utterance. Automatic
+  // and manual children are both hidden. While a child exists, its source
+  // terminal card is likewise an intermediate state; only the final
+  // exhausted/unsafe error remains visible.
+  const recoveredSourceIds = new Set(
+    safeMessages
+      .filter(isRecoveryControlUserTurn)
       .map((message) => message._recoveryOfClientMessageId)
-      .filter((id): id is string => typeof id === "string" && id.length > 0),
+      .filter(isNonEmptyId),
   );
-  const renderableMessages = messages.filter(
+  const renderableMessages = safeMessages.filter(
     (m) =>
       !(m as ChatMessage & { _historyProjection?: unknown })._historyProjection &&
+      typeof m.id === "string" &&
       !m.id.startsWith("projection-") &&
       !m.id.startsWith("oc-dispatch-err:") &&
       m._turnTapeProcess !== true &&
       m._timelineAuxiliary === undefined &&
       m.role !== "runtime-event" &&
-      !(m.role === "user" && m._isAutoRetry === true && m._automaticRecovery === true) &&
+      !isRecoveryControlUserTurn(m) &&
       !(
         m.role === "assistant" &&
         !!m._errorCode &&
         typeof m._clientMessageId === "string" &&
-        automaticallyRecoveredSourceIds.has(m._clientMessageId)
+        recoveredSourceIds.has(m._clientMessageId)
       ) &&
       !isRedundantRuntimeEnvelope(m) &&
       !isTurnStatusSuppressedByTape(m, resolvedDispatchTurnIds),
@@ -1098,14 +1227,12 @@ export function MessageList({
       .filter((message) => message.role === "user")
       .map((message) => message.id),
   );
-  const automaticRecoveryParents = new Map(
-    messages
+  const recoveryParents = new Map(
+    safeMessages
       .filter(
         (message) =>
-          message.role === "user" &&
-          message._automaticRecovery === true &&
-          typeof message._recoveryOfClientMessageId === "string" &&
-          message._recoveryOfClientMessageId.length > 0,
+          isRecoveryControlUserTurn(message) &&
+          isNonEmptyId(message._recoveryOfClientMessageId),
       )
       .map((message) => [message.id, message._recoveryOfClientMessageId as string]),
   );
@@ -1114,7 +1241,7 @@ export function MessageList({
     const visited = new Set<string>();
     while (!visibleUserIds.has(current) && !visited.has(current)) {
       visited.add(current);
-      const parent = automaticRecoveryParents.get(current);
+      const parent = recoveryParents.get(current);
       if (!parent) break;
       current = parent;
     }
@@ -1135,7 +1262,7 @@ export function MessageList({
     ? Math.max(
         0,
         (archive?.archivedCount ?? 0) - loadedArchivedMetrics(
-          messages,
+          safeMessages,
           archive?.archivedThroughSeq ?? 0,
         ).anchors,
       )
@@ -1161,6 +1288,73 @@ export function MessageList({
       setArchiveQueued(false);
     });
   }, [archive, hasOlderHistory, pagingGeneration, processPaging]);
+  const liveHasMore = archive?.liveHasMoreBefore === true;
+  const requestOlderLiveUnits = useCallback(() => {
+    if (!archive?.onLoadOlderLiveUnits || !liveHasMore || archive.loading || archiveQueuedRef.current) {
+      return;
+    }
+    archiveQueuedRef.current = true;
+    setArchiveQueued(true);
+    const token = ++archiveQueueTokenRef.current;
+    const el = scrollParent;
+    beginViewportPreserve();
+    if (el) {
+      pendingExpandCorrectionRef.current = {
+        height: el.scrollHeight,
+        top: el.scrollTop,
+      };
+    }
+    void Promise.resolve(archive.onLoadOlderLiveUnits()).finally(() => {
+      if (archiveQueueTokenRef.current !== token) return;
+      archiveQueuedRef.current = false;
+      setArchiveQueued(false);
+      setWindowVersion((value) => value + 1);
+    });
+  }, [archive, liveHasMore, scrollParent, beginViewportPreserve]);
+  const expandLocalWindow = useCallback(() => {
+    const el = scrollParent;
+    const total = itemCountRef.current;
+    const current = startOverrideRef.current ?? defaultTailStart(total);
+    if (current <= 0) return;
+    beginViewportPreserve();
+    if (el) {
+      pendingExpandCorrectionRef.current = {
+        height: el.scrollHeight,
+        top: el.scrollTop,
+      };
+    }
+    startOverrideRef.current = Math.max(0, current - TIMELINE_WINDOW_EXPAND_ITEMS);
+    setWindowVersion((value) => value + 1);
+  }, [scrollParent]);
+  useLayoutEffect(() => {
+    const pending = pendingExpandCorrectionRef.current;
+    const el = scrollParent;
+    if (!pending || !el) return;
+    pendingExpandCorrectionRef.current = null;
+    el.scrollTop = correctedScrollTop(pending.height, el.scrollHeight, pending.top);
+    endViewportPreserve();
+  }, [windowVersion, scrollParent]);
+  useLayoutEffect(() => {
+    const scroller = scrollParent;
+    const root = listRootRef.current;
+    if (!scroller || !root || !followBottomRef) return;
+    if (typeof ResizeObserver === "undefined") return;
+    const follow = () => {
+      if (viewportPreserveLockRef.current) return;
+      if (!followBottomRef.current) return;
+      scroller.scrollTop = scroller.scrollHeight;
+    };
+    const observer = new ResizeObserver(follow);
+    observer.observe(root);
+    return () => observer.disconnect();
+  }, [scrollParent, followBottomRef, windowVersion, messages.length]);
+  useLayoutEffect(() => {
+    const el = scrollParent;
+    if (!el || didSnapToBottomRef.current) return;
+    if (itemCountRef.current === 0) return;
+    didSnapToBottomRef.current = true;
+    el.scrollTop = el.scrollHeight;
+  }, [scrollParent, windowVersion, messages.length, sessionId]);
   // 当前活跃段起点(最后一条 user 消息之后)——TodoWrite/plan 的 HUD 抑制只作用于该段,
   // 与 PinnedTaskTracker 的任务源提取共用 turnSegment.ts 同一判定。
   const turnStart = currentTurnStartIndex(renderableMessages);
@@ -1168,33 +1362,45 @@ export function MessageList({
   // 单一权威在 turnSegment.ts(与 turnStart / coalesceTeam 同源的 user=轮边界判定,不另造第二套)。
   const ratingFinal = turnFinalAssistantFlags(renderableMessages);
   const renderItems = coalesceTeam(renderableMessages, 0, sending, liveTurnUsage);
-  // One genuine timeline record is one Virtuoso item. Grouping a whole server
-  // page into a tall virtual row makes prepend measurements unstable: the old
-  // anchor row changes height and the viewport jumps. Virtuoso itself limits
-  // mounted DOM to the viewport, so keeping records separate adds no content
-  // cap and preserves exact per-record identity while paging backwards.
-  const virtualItems: VirtualItem[] = renderItems;
+  itemCountRef.current = renderItems.length;
   const itemKey = renderItemKey;
-  // Give every already-loaded archive item a stable virtual coordinate. When
-  // another archive page is prepended, firstItemIndex decreases by exactly the
-  // number of new virtual items, so Virtuoso keeps the old viewport mounted.
-  // A mixed boundary item is deliberately excluded: it replaces the previous
-  // first tail item rather than adding another virtual row.
-  let archivedVirtualPrefixItems = 0;
-  if (archive) {
-    for (const item of virtualItems) {
-      const itemMessages = renderItemMessages(item);
-      if (
-        itemMessages.length === 0 ||
-        !itemMessages.every((message) => typeof message._historyPageLoadedFrom === "string")
-      ) break;
-      archivedVirtualPrefixItems += 1;
+  // Production scroll surfaces freeze a start index on first content so streaming
+  // appends cannot unmount a row the user has scrolled up to read. Tests and
+  // other non-scroll surfaces keep the full tree.
+  if (scrollParent && renderItems.length > 0 && startOverrideRef.current === null) {
+    startOverrideRef.current = defaultTailStart(renderItems.length);
+  }
+  const windowStart = !scrollParent || renderItems.length === 0
+    ? 0
+    : Math.min(
+      startOverrideRef.current ?? defaultTailStart(renderItems.length),
+      defaultTailStart(renderItems.length),
+    );
+  const visibleItems = renderItems.slice(windowStart);
+  visibleCountRef.current = visibleItems.length;
+  const paintOn = paintWindowEnabled(scrollParent, visibleItems.length)
+    && !archive?.loading
+    && !archiveQueued;
+  let paintStart = 0;
+  let paintEnd = visibleItems.length;
+  if (paintOn && scrollParent) {
+    if (followBottomRef?.current) {
+      const vis = Math.max(
+        PAINT_MIN_ITEMS,
+        Math.ceil(scrollParent.clientHeight / PAINT_ESTIMATE_PX) + PAINT_OVERSCAN * 2,
+      );
+      paintStart = Math.max(0, visibleItems.length - vis);
+      paintEnd = visibleItems.length;
+    } else {
+      paintStart = Math.min(paintRange.start, Math.max(0, visibleItems.length - PAINT_MIN_ITEMS));
+      paintEnd = Math.min(visibleItems.length, Math.max(paintRange.end, paintStart + PAINT_MIN_ITEMS));
     }
   }
-  const firstItemIndex = TIMELINE_VIRTUAL_INDEX_ORIGIN - archivedVirtualPrefixItems;
-  const showHistoryBoundary = hasOlderHistory || renderableMessages.some(
+  const paintedItems = visibleItems.slice(paintStart, paintEnd);
+  const showHistoryBoundary = hasOlderHistory || liveHasMore || windowStart > 0 || renderableMessages.some(
     (message) => typeof message._historyPageLoadedFrom === "string",
   );
+
   const renderItem = (it: RenderItem) => {
     if (it.kind === "single" && it.m._genPlaceholder) {
       const gp = it.m._genPlaceholder;
@@ -1234,13 +1440,28 @@ export function MessageList({
     const turnFinalAssistant = ratingFinal[it.idx] ?? false;
     const failurePresentedBelow =
       it.m.role === "user" && presentedErrorTurnIds.has(it.m.id);
-    const rowSig = `${messageSignature(it.m, {
-      isLast: it.isLast,
-      sending,
-      turnFinalAssistant,
-    })}|tu:${tokenUsageSignature(it.tokenUsage)}|du:${tokenUsageSignature(delegateTokenUsage(it.m))}|pe:${failurePresentedBelow ? 1 : 0}`;
+    const rowId = it.m._timelineUnitKey ?? it.m.id;
+    let rowSig: string;
+    try {
+      rowSig = `${safeMessageSignature(it.m, {
+        isLast: it.isLast,
+        sending,
+        turnFinalAssistant,
+      })}|tu:${tokenUsageSignature(it.tokenUsage)}|du:${tokenUsageSignature(delegateTokenUsage(it.m))}|pe:${failurePresentedBelow ? 1 : 0}`;
+    } catch {
+      return (
+        <MessageBoundary messageId={rowId} sig={`corrupt-row|${rowId}`}>
+          <div
+            className="flex items-center gap-2 rounded-lg border border-border bg-surface px-3.5 py-2 text-[12.5px] text-muted"
+            data-testid="corrupt-message-placeholder"
+          >
+            此条消息数据结构异常，已跳过渲染
+          </div>
+        </MessageBoundary>
+      );
+    }
     return (
-      <MessageBoundary messageId={it.m._timelineUnitKey ?? it.m.id} sig={rowSig}>
+      <MessageBoundary messageId={rowId} sig={rowSig}>
         <MessageRenderer
           message={it.m}
           sig={rowSig}
@@ -1262,33 +1483,35 @@ export function MessageList({
       </MessageBoundary>
     );
   };
-  const renderVirtualItem = renderItem;
-  const historyControl = archive && showHistoryBoundary ? (
+  const canRevealOlder = windowStart > 0 || hasOlderHistory || liveHasMore;
+  const historyControl = showHistoryBoundary ? (
     <div
       className="mx-auto flex max-w-3xl justify-center px-5 pb-4 pt-8"
       data-testid="history-page-loader"
     >
       <button
         type="button"
-        onClick={hasOlderHistory ? requestOlderArchive : undefined}
-        disabled={!hasOlderHistory || archive.loading || archiveQueued}
-        aria-busy={hasOlderHistory && (archive.loading || archiveQueued)}
+        onClick={windowStart > 0 ? expandLocalWindow : liveHasMore ? requestOlderLiveUnits : hasOlderHistory ? requestOlderArchive : undefined}
+        disabled={!canRevealOlder || Boolean(archive?.loading) || archiveQueued}
+        aria-busy={hasOlderHistory && windowStart === 0 && (Boolean(archive?.loading) || archiveQueued)}
         className="mx-auto inline-flex items-center gap-1.5 rounded-full bg-hover px-3 py-1 text-xs text-muted transition-colors hover:text-fg disabled:cursor-default disabled:opacity-60 [@media(hover:none)]:min-h-11 [@media(hover:none)]:py-2.5"
       >
-        {!hasOlderHistory
+        {!canRevealOlder
           ? "已到最早记录"
-          : archive.loading || archiveQueued
+          : windowStart === 0 && (archive?.loading || archiveQueued)
           ? <><Spinner size={12} /> 加载中…</>
-          : archive.error
+          : windowStart === 0 && archive?.error
             ? <span className="text-danger">加载失败，点击重试</span>
-            : legacyArchivedRemaining > 0
-              ? `查看更早历史记录（还有 ${legacyArchivedRemaining} 条）`
-              : "查看更早历史记录"}
+            : windowStart > 0
+              ? `查看更早历史记录（还有 ${windowStart} 条）`
+              : legacyArchivedRemaining > 0
+                ? `查看更早历史记录（还有 ${legacyArchivedRemaining} 条）`
+                : "查看更早历史记录"}
       </button>
     </div>
   ) : null;
   const footer = (
-    <div className="mx-auto flex max-w-3xl flex-col gap-4 px-5 pb-8 pt-4">
+    <div className="mx-auto flex w-full max-w-3xl flex-col gap-4 px-5 pb-8 pt-4">
       <div data-testid="turn-activity-footer">
         {sending && (
           <div className="flex gap-4">
@@ -1309,13 +1532,15 @@ export function MessageList({
         </Alert>
       )}
       {historyLoading && <PartialHistorySkeleton />}
+      {journalDegraded && !historyLoading && onRetryJournal && (
+        <JournalHydrationRetry onRetry={onRetryJournal} />
+      )}
     </div>
   );
 
   // App/admin pass an explicit null during the callback-ref's first commit.
-  // Mounting the non-virtual fallback in that one frame would still build the
-  // entire long transcript before Virtuoso can take over. Omitted/undefined
-  // remains the lightweight test/non-scroll surface contract.
+  // Do not mount the transcript in that frame; omitted/undefined remains the
+  // lightweight test/non-scroll surface contract.
   if (scrollParent === null) {
     return (
       <div className="mx-auto flex max-w-3xl items-center justify-center px-5 py-8 text-muted" role="status">
@@ -1325,50 +1550,46 @@ export function MessageList({
     );
   }
 
-  if (scrollParent) {
-    const virtualList = (
-      <Virtuoso
-        customScrollParent={scrollParent}
-        data={virtualItems}
-        firstItemIndex={firstItemIndex}
-        context={{ header: historyControl, footer }}
-        computeItemKey={(_index, item) => itemKey(item)}
-        itemContent={(_index, item) => (
-          <div
-            className="chat-virtual-item mx-auto max-w-3xl px-5 pb-4"
-            data-chat-virtual-key={itemKey(item)}
-          >
-            {renderVirtualItem(item)}
-          </div>
-        )}
-        initialTopMostItemIndex={Math.max(0, virtualItems.length - 1)}
-        increaseViewportBy={{ top: 800, bottom: 1200 }}
-        overscan={400}
-        followOutput={false}
-        components={TIMELINE_VIRTUOSO_COMPONENTS}
-      />
-    );
-    // jsdom has no layout engine, so Virtuoso cannot infer a viewport from the
-    // real scroll parent during App integration tests. Its official mock
-    // context supplies dimensions while preserving the same virtualized data,
-    // keying and initial-tail behavior. Vite removes this branch from builds.
-    return import.meta.env.MODE === "test" ? (
-      <VirtuosoMockContext.Provider value={{ viewportHeight: 768, itemHeight: 96 }}>
-        {virtualList}
-      </VirtuosoMockContext.Provider>
-    ) : virtualList;
+  // Empty data must still show loading/activity chrome. A cold mobile tab can
+  // have a real history request or active turn with no canonical row yet.
+  if (scrollParent && visibleItems.length === 0 && (
+    sending || historyLoading || transientNotice || (journalDegraded && onRetryJournal)
+  )) {
+    return <div className="mx-auto max-w-3xl px-5 py-8">{footer}</div>;
   }
 
-  // Tests/non-scroll surfaces keep a simple tree; production chat uses the
-  // virtualized branch above.
   return (
-    <div className="mx-auto flex max-w-3xl flex-col gap-4 px-5 py-8">
+    <div
+      ref={listRootRef}
+      className="mx-auto max-w-3xl space-y-4 px-5 py-8"
+      data-testid="timeline-short-list"
+      data-timeline-window-count={visibleItems.length}
+      data-timeline-paint-count={paintedItems.length}
+    >
       {historyControl}
-      {virtualItems.map((item) => (
-        <div key={itemKey(item)} data-chat-virtual-key={itemKey(item)}>
-          {renderVirtualItem(item)}
+      {paintStart > 0 ? (
+        <div
+          aria-hidden
+          data-testid="timeline-paint-spacer-top"
+          style={{ height: paintStart * PAINT_ESTIMATE_PX }}
+        />
+      ) : null}
+      {paintedItems.map((item) => (
+        <div
+          key={itemKey(item)}
+          className="chat-virtual-item chat-timeline-row"
+          data-chat-virtual-key={itemKey(item)}
+        >
+          {renderItem(item)}
         </div>
       ))}
+      {paintEnd < visibleItems.length ? (
+        <div
+          aria-hidden
+          data-testid="timeline-paint-spacer-bottom"
+          style={{ height: (visibleItems.length - paintEnd) * PAINT_ESTIMATE_PX }}
+        />
+      ) : null}
       {footer}
     </div>
   );

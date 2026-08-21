@@ -265,8 +265,8 @@ describe('V3 2I-2 — anthropicProxy + bridge histograms/counters', () => {
       const helpCount = (text.match(/^# HELP /gm) ?? []).length
       assert.equal(
         helpCount,
-        18,
-        `HELP 行总数 = 18 (5 v1 counter + 9 v3 + 2 gauge + securityEventWriteFailures + implicitRatingOverridden), got ${helpCount}`,
+        19,
+        `HELP 行总数 = 19 (5 v1 counter + 9 v3 + 2 gauge + securityEventWriteFailures + implicitRatingOverridden), got ${helpCount}`,
       )
     })
   })

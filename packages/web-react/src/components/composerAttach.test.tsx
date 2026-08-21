@@ -112,7 +112,7 @@ describe("F1b 剪贴板图片直接上传", () => {
     const onUpload = vi.fn(async () => ({ kind: "image", url: "/api/media/paste.png" }) as MediaRef);
     render(<Composer onSend={() => {}} onUpload={onUpload} />);
 
-    const event = paste(screen.getByPlaceholderText("给 OpenClaude 发消息…"), {
+    const event = paste(screen.getByPlaceholderText("给从简发消息…"), {
       items: [{ kind: "file", type: file.type, getAsFile: () => file }],
       files: [file],
     });
@@ -132,7 +132,7 @@ describe("F1b 剪贴板图片直接上传", () => {
     const onUpload = vi.fn(async () => ({ kind: "image", url: "/api/media/fallback.png" }) as MediaRef);
     render(<Composer onSend={() => {}} onUpload={onUpload} />);
 
-    const event = paste(screen.getByPlaceholderText("给 OpenClaude 发消息…"), {
+    const event = paste(screen.getByPlaceholderText("给从简发消息…"), {
       items: [{ kind: "file", type: file.type, getAsFile: () => null }],
       files: [file],
     });
@@ -149,7 +149,7 @@ describe("F1b 剪贴板图片直接上传", () => {
     const file = imageFile("paste-mixed.png");
     const onUpload = vi.fn(async () => ({ kind: "image", url: "/api/media/mixed.png" }) as MediaRef);
     render(<Composer onSend={() => {}} onUpload={onUpload} />);
-    const textarea = screen.getByPlaceholderText("给 OpenClaude 发消息…");
+    const textarea = screen.getByPlaceholderText("给从简发消息…");
     fireEvent.change(textarea, { target: { value: "保留这段正文" } });
 
     const event = paste(textarea, {
@@ -169,7 +169,7 @@ describe("F1b 剪贴板图片直接上传", () => {
   test("纯文本或非图片文件不被拦截，也不触发上传", () => {
     const onUpload = vi.fn(async () => ({ kind: "file", url: "/api/media/file" }) as MediaRef);
     render(<Composer onSend={() => {}} onUpload={onUpload} />);
-    const textarea = screen.getByPlaceholderText("给 OpenClaude 发消息…");
+    const textarea = screen.getByPlaceholderText("给从简发消息…");
 
     const textEvent = paste(textarea, {
       items: [{ kind: "string", type: "text/plain", getAsFile: () => null }],
@@ -226,9 +226,9 @@ describe("消息引用 Composer 预览", () => {
   test("预览可取消且不改正文", () => {
     const onCancelReply = vi.fn();
     render(<Composer onSend={() => {}} replyTo={replyTo} onCancelReply={onCancelReply} />);
-    const textarea = screen.getByPlaceholderText("给 OpenClaude 发消息…");
+    const textarea = screen.getByPlaceholderText("给从简发消息…");
     fireEvent.change(textarea, { target: { value: "当前问题" } });
-    expect(screen.getByText("正在引用 OpenClaude")).toBeInTheDocument();
+    expect(screen.getByText("正在引用 从简")).toBeInTheDocument();
     expect(screen.getByText(replyTo.text)).toHaveClass("line-clamp-2");
     fireEvent.click(screen.getByRole("button", { name: "取消引用" }));
     expect(onCancelReply).toHaveBeenCalledTimes(1);
@@ -239,7 +239,7 @@ describe("消息引用 Composer 预览", () => {
     const onSend = vi.fn();
     const onCancelReply = vi.fn();
     render(<Composer onSend={onSend} replyTo={replyTo} onCancelReply={onCancelReply} />);
-    fireEvent.change(screen.getByPlaceholderText("给 OpenClaude 发消息…"), {
+    fireEvent.change(screen.getByPlaceholderText("给从简发消息…"), {
       target: { value: "请解释这一段" },
     });
     fireEvent.click(screen.getByRole("button", { name: "发送" }));

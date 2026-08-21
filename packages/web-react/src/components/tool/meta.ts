@@ -44,7 +44,8 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { agentDisplayName } from "../chat/agentNames";
-import { asArr, asStr, detectShellFileWrites, parseCodexTypeName, shortPath, stripShellWrapperForDisplay } from "./format";
+import { mappedLiveActivityLabel } from "../../lib/chat/liveActivityLabel";
+import { asArr, asStr, detectShellFileWrites, parseCodexTypeName, safeSubtaskDescription, shortPath, stripShellWrapperForDisplay } from "./format";
 
 /** 工具卡图标底色语义(对齐设计稿 aurora-conversation-cards 的 .tic.tn-* 分色)。 */
 export type ToolTone = "accent" | "success" | "info" | "warning" | "neutral";
@@ -64,6 +65,9 @@ const TOOL_META: Record<string, ToolMeta> = {
   NotebookEdit: { icon: NotebookPen, label: "笔记本", tone: "neutral" },
   Task: { icon: Bot, label: "子任务", tone: "accent" },
   Agent: { icon: Bot, label: "子任务", tone: "accent" },
+  // cursor 引擎经网关归一化后的产品名;CCB 的 AskUserQuestion 走 PermissionCard 专用答题卡,
+  // 此条只兜 cursor 工具消息与历史降级渲染。
+  AskUserQuestion: { icon: FormInput, label: "向用户提问", tone: "accent" },
   // CCB Kairos cron 工具(已在商业容器禁用,agent 侧改走 openclaude-memory 的
   // reminder 工具族);保留 meta 让历史会话的卡片仍有语义标签。
   CronList: { icon: Clock, label: "定时任务列表", tone: "accent" },
@@ -115,6 +119,8 @@ export const OC_TOOLS = {
   "oc-market": { icon: Sparkles, label: "AI 市场", tone: "accent" },
   // 对话内发起技能训练优化/生成评测用例(P2,回环 relay 到容器 gateway 自身 train/gen API)。
   "oc-skill": { icon: Sparkles, label: "技能训练", tone: "accent" },
+  // 任务面板 CLI(Bash 调 /api/board)。漏登记会把 oc-task 渲成通用「终端」并外露原始命令。
+  "oc-task": { icon: ListChecks, label: "任务面板", tone: "accent" },
   "oc-xlsx": { icon: BarChart3, label: "表格生成", tone: "success" },
   "oc-pdf": { icon: FileText, label: "PDF 生成", tone: "success" },
   "oc-docx": { icon: FileText, label: "Word 生成", tone: "success" },
@@ -250,7 +256,13 @@ const MCP_OP_META: Record<string, ToolMeta> = {
   "openclaude-memory:skill_delete": { icon: Sparkles, label: "删除技能" },
   "openclaude-memory:skill_propose": { icon: Sparkles, label: "提议技能" },
   "openclaude-memory:request_review": { icon: ShieldCheck, label: "申请质量审查" },
+  "openclaude-memory:ask_user": { icon: ListChecks, label: "向用户提问" },
   "openclaude-memory:ask_gpt55_codex": { icon: Bot, label: "Codex 审查" },
+  "openclaude-memory:task_create": { icon: FilePlus, label: "创建任务单" },
+  "openclaude-memory:task_update": { icon: Pencil, label: "更新任务单" },
+  "openclaude-memory:task_comment": { icon: NotebookPen, label: "任务单评论" },
+  "openclaude-memory:task_list": { icon: ListChecks, label: "任务单列表" },
+  "openclaude-memory:task_get": { icon: FileText, label: "查看任务单" },
   // codex 内建 MCP 资源清单(op 无摘要,空态即全部信息)。
   "codex:list_mcp_resources": { icon: Boxes, label: "MCP 资源列表" },
   "codex:list_mcp_resource_templates": { icon: Layers, label: "MCP 资源模板" },
@@ -346,6 +358,15 @@ function ocCommandMeta(cli: OcCli, command: string): ToolMeta {
     };
     return labels[op] ? { ...base, label: labels[op] } : base;
   }
+  if (cli === "oc-task") {
+    const labels: Record<string, string> = {
+      project: "任务项目",
+      ticket: "任务单据",
+      relation: "任务关系",
+      run: "任务执行",
+    };
+    return labels[op] ? { ...base, label: labels[op] } : base;
+  }
   if (cli === "oc-plugin") {
     const labels: Record<string, string> = {
       list: "可用市场插件",
@@ -363,6 +384,19 @@ function ocCommandMeta(cli: OcCli, command: string): ToolMeta {
     return labels[op] ? { ...base, label: labels[op] } : base;
   }
   if (cli === "oc-web") return { ...base, label: "提取网页内容" };
+  if (cli === "oc-memory") {
+    const labels: Record<string, string> = {
+      delegate: "委派子任务",
+      "request-review": "质量审查",
+      "delegate-wait": "等待委派",
+      "core-search": "记忆检索",
+      "session-search": "历史检索",
+      "archival-search": "归档检索",
+      "archival-add": "归档写入",
+      "archival-delete": "归档删除",
+    };
+    return labels[op] ? { ...base, label: labels[op] } : base;
+  }
   return base;
 }
 
@@ -390,6 +424,12 @@ function ocCommandSummary(cli: OcCli, command: string): string {
   }
   if (cli === "oc-market") {
     return invocation?.[1]?.replace(/^["']|["']$/g, "") ?? "";
+  }
+  if (cli === "oc-memory" && (op === "delegate" || op === "request-review" || op === "delegate-wait")) {
+    return (commandFlag(command, "goal") || commandFlag(command, "draft") || invocation?.[1] || op).replace(
+      /^["']|["']$/g,
+      "",
+    ).slice(0, 60);
   }
   return "";
 }
@@ -434,6 +474,8 @@ export function resolveToolMeta(
     if (srvMeta) return { icon: srvMeta.icon, label: `${srvMeta.label}: ${opLabel}`, tone: srvMeta.tone };
     return { icon: Wrench, label: opLabel, tone: "neutral" };
   }
+  const mapped = mappedLiveActivityLabel(name);
+  if (mapped) return { icon: Wrench, label: mapped, tone: "neutral" };
   return { icon: Wrench, label: name, tone: "neutral" };
 }
 
@@ -489,16 +531,24 @@ export function toolSummary(name: string, input: Record<string, unknown> | null)
       return shortPath(input.notebook_path);
     case "Task":
     case "Agent":
-      return (asStr(input.description) || asStr(input.prompt)).slice(0, 60);
+      return safeSubtaskDescription(input);
     case "Skill":
       return asStr(input.skill) || asStr(input.name);
-    case "delegate_task":
+    case "delegate_task": {
       // 委派目标经系统 agent 映射转显示名(hidden-reviewer 等管理 API 隐藏的 agent 无 displayName)。
-      return `${input.agentId ? `→ ${agentDisplayName(asStr(input.agentId))} ` : ""}${(
-        asStr(input.goal) ||
-        asStr(input.message) ||
-        asStr(input.prompt)
-      ).slice(0, 60)}`;
+      const target = input.agentId ? `→ ${agentDisplayName(asStr(input.agentId))} ` : "";
+      const title = safeSubtaskDescription({
+        description: asStr(input.goal) || asStr(input.message),
+      });
+      return `${target}${title}`.trim();
+    }
+    case "AskUserQuestion": {
+      const qs = asArr(input.questions);
+      const first = qs[0] && typeof qs[0] === "object"
+        ? asStr((qs[0] as Record<string, unknown>).question)
+        : "";
+      return first ? `${qs.length} 个问题: ${first.slice(0, 40)}` : `${qs.length} 个问题`;
+    }
     case "delegate_tasks":
       return delegateTasksSummary(input);
   }
@@ -549,11 +599,19 @@ function mcpSummary(server: string, op: string, input: Record<string, unknown>):
     if (op === "delegate_task" || op === "send_to_agent") {
       // 同 toolSummary 的 delegate_task:系统 agent(如 hidden-reviewer)显示映射名而非裸 id。
       const tgt = input.agentId ? `→ ${agentDisplayName(asStr(input.agentId))} ` : "";
-      return `${tgt}${(asStr(input.goal) || asStr(input.message) || asStr(input.prompt)).slice(0, 60)}`;
+      const title = safeSubtaskDescription({
+        description: asStr(input.goal) || asStr(input.message),
+      });
+      return `${tgt}${title}`.trim();
     }
     if (op === "skill_view" || op === "skill_delete" || op === "skill_save") return asStr(input.name);
     if (op === "skill_search") return asStr(input.query);
     if (op === "ask_gpt55_codex") return (asStr(input.goal) || asStr(input.context)).slice(0, 60);
+    if (op === "task_create") return asStr(input.title);
+    if (op === "task_update" || op === "task_comment" || op === "task_get") {
+      return (asStr(input.id) || asStr(input.identifier) || asStr(input.title)).slice(0, 50);
+    }
+    if (op === "task_list") return asStr(input.q) || asStr(input.status) || asStr(input.projectId);
     return op;
   }
   if (server === "web-context") {
