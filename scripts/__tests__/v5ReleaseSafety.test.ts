@@ -1774,7 +1774,7 @@ describe('v5 release safety lanes', () => {
     assert.ok(build.indexOf('harden_release_baseline "$staging"') < build.indexOf('publish_strong_release'))
     assert.match(source, /activate_release\(\)[\s\S]*?assert_release_baseline_security "\$reldir"/)
     assert.match(source, /activate_runtime_tuple\(\)[\s\S]*?assert_release_baseline_security "\$BUILT_RELEASE"/)
-    assert.match(source, /rollback_runtime_tuple\(\)[\s\S]*?assert_release_baseline_security "\$master"/)
+    assert.match(source, /rollback_runtime_tuple\(\)[\s\S]*?assert_legacy_release_baseline_security "\$master"/)
     assert.match(source, /canary\(\)[\s\S]*?assert_release_baseline_security "\$reldir"/)
     assert.match(source, /smoke\(\)[\s\S]*?assert_live_baseline_security_for_slot "\$baseline_slot"/)
     assert.match(source, /start_candidate_unit_and_wait\(\)[\s\S]*?assert_live_baseline_security_for_slot "\$cand"/)
@@ -2029,6 +2029,8 @@ describe('v5 release safety lanes', () => {
     assert.ok(v5Owned.includes('imageUsageSweep'))
     assert.ok(v5Owned.includes('githubWorkspaceSweeper'))
     assert.ok(v5Owned.includes('knowledgePlanetAutomation'))
+    assert.ok(allowed.has('liveFrameMaintenance'))
+    assert.ok(allowed.has('tapeJobScheduler'))
     assert.deepEqual(v5Owned.filter((name) => !allowed.has(name)), [])
   })
 
@@ -6477,6 +6479,17 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
       /"\$MODE" != "reclaim-mutation-lease" && "\$MODE" != "hide-luna" \]\]; then\n {2}assert_no_deploy_recovery_marker/,
       'reclaim 必须能在 recovery marker 存在时照跑',
     )
+
+    assert.match(
+      source,
+      /if \[\[ "\$MODE" != "recover" \]\] && ! ssh "\$KL_HOST" "test ! -e '\$DEPLOY_RECOVERY_MARKER'"/,
+    )
+    const recover = source.match(/^recover\(\) \{([\s\S]*?)\n\}/m)?.[1] ?? ''
+    assert.match(recover, /stable\)[\s\S]*smoke "\$ACTIVE_PORT"[\s\S]*clear_deploy_recovery_marker_after_stable_recover/)
+    const clearRecovery = source.match(/^clear_deploy_recovery_marker_after_stable_recover\(\) \{([\s\S]*?)\n\}/m)?.[1] ?? ''
+    assert.match(clearRecovery, /require_mutation_lease_for_compensation "stable-recover-marker-clear"/)
+    assert.match(clearRecovery, /rm -f --/)
+    assert.match(clearRecovery, /os\.fsync\(d\)/)
   })
 
   test('mutation holder releases its flock after its session parent is SIGKILLed', async () => {
