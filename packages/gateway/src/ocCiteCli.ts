@@ -10,12 +10,17 @@
  * "已验证参考文献"。check 输出已检 manifest:claim.status 由 master 铸造,unsupported 红标。
  */
 import { readFileSync } from "node:fs";
-import { callResearch, fail, out, parseFlags } from "./ocResearchClient.js";
+import { callResearch, exitWithCliHelp, fail, isCliHelpArg, out, parseFlags } from "./ocResearchClient.js";
 
 const TOOL = "oc-cite";
 
 async function main(): Promise<void> {
   const [cmd, ...rest] = process.argv.slice(2);
+  if (isCliHelpArg(cmd)) {
+    exitWithCliHelp(
+      "usage: oc-cite <verify <id...>|format <id> --style ...|check --manifest <f>|fix --manifest <f> --docs <ids>>",
+    );
+  }
   const { positional, flags } = parseFlags(rest);
 
   switch (cmd) {

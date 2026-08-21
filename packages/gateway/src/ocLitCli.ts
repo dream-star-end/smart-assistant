@@ -6,12 +6,17 @@
  *
  * 输出:JSON { sources: SourceRecord[], warnings: string[] }(角标/库面板从此渲染)。
  */
-import { callResearch, fail, out, parseFlags } from "./ocResearchClient.js";
+import { callResearch, exitWithCliHelp, fail, isCliHelpArg, out, parseFlags } from "./ocResearchClient.js";
 
 const TOOL = "oc-lit";
 
 async function main(): Promise<void> {
   const [cmd, ...rest] = process.argv.slice(2);
+  if (isCliHelpArg(cmd)) {
+    exitWithCliHelp(
+      "usage: oc-lit <search <query> [--sources ...] [--size N] [--year-min Y] [--lang zh|en] | snowball <id> [--direction ...]>",
+    );
+  }
   const { positional, flags } = parseFlags(rest);
 
   switch (cmd) {

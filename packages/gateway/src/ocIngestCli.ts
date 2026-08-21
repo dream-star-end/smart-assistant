@@ -7,12 +7,13 @@
  * 输出 { docId, lang, title, sections, spanCount } 或 { needsOcr, reason }。
  * docId 供 oc-litrag 检索引用(quote handle 从权威 span 铸造)。
  */
-import { callResearch, fail, out, parseFlags, uploadBlob } from "./ocResearchClient.js";
+import { callResearch, exitWithCliHelp, fail, isCliHelpArg, out, parseFlags, uploadBlob } from "./ocResearchClient.js";
 
 const TOOL = "oc-ingest";
 
 async function main(): Promise<void> {
   const [cmd, ...rest] = process.argv.slice(2);
+  if (isCliHelpArg(cmd)) exitWithCliHelp("usage: oc-ingest parse <file>");
   const { positional } = parseFlags(rest);
 
   switch (cmd) {

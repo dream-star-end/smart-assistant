@@ -28,7 +28,7 @@ import { execFileSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { DEFAULT_CODEX_ENGINE_MODEL } from '@openclaude/protocol'
 import { resolveVisionInput, runVision } from './mcpVisionServer.js'
-import { fail, parseFlags } from './ocResearchClient.js'
+import { exitWithCliHelp, fail, isCliHelpArg, parseFlags } from './ocResearchClient.js'
 
 const TOOL = 'oc-figcheck'
 
@@ -163,7 +163,13 @@ function auditPrompt(kind: FigKind, focus: string | undefined): string {
 }
 
 async function main(): Promise<void> {
-  const { positional, flags } = parseFlags(process.argv.slice(2))
+  const argv = process.argv.slice(2)
+  if (isCliHelpArg(argv[0])) {
+    exitWithCliHelp(
+      'usage: oc-figcheck <image.png> [--kind figure|schematic|network|3d|composite] [--focus "..."]',
+    )
+  }
+  const { positional, flags } = parseFlags(argv)
   const imageFile = positional[0]
   if (!imageFile) fail(TOOL, 'usage: oc-figcheck <image.png> [--kind figure|schematic|network|3d|composite] [--focus "..."]')
   const kind: FigKind = (KINDS as readonly string[]).includes(flags.kind ?? '')

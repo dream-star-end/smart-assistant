@@ -37,6 +37,10 @@ function which(bin: string): boolean {
 
 function main(): void {
   const args = process.argv.slice(2);
+  if (args[0] === "help" || args[0] === "--help" || args[0] === "-h") {
+    process.stdout.write("usage: oc-slides --deck <deck.json> [-o out.pptx|out.html]\n");
+    process.exit(0);
+  }
   const deckFile = flagVal(args, "--deck");
   const output = flagVal(args, "-o") ?? flagVal(args, "--output") ?? "slides.html";
   if (!deckFile) fail("usage: oc-slides --deck <deck.json> [-o out.pptx|out.html]");

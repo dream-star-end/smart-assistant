@@ -7,12 +7,15 @@
  * 输出 { quotes: QuoteHandle[], missing: string[] }。quote.text 是 master 权威 span 子串
  * (写作唯一可引用素材);写 claim 只能引用这些 quote 的 id。
  */
-import { callResearch, fail, out, parseFlags } from "./ocResearchClient.js";
+import { callResearch, exitWithCliHelp, fail, isCliHelpArg, out, parseFlags } from "./ocResearchClient.js";
 
 const TOOL = "oc-litrag";
 
 async function main(): Promise<void> {
   const [cmd, ...rest] = process.argv.slice(2);
+  if (isCliHelpArg(cmd)) {
+    exitWithCliHelp('usage: oc-litrag query "<问题>" --docs <docId,...> [--top-k N]');
+  }
   const { positional, flags } = parseFlags(rest);
 
   switch (cmd) {

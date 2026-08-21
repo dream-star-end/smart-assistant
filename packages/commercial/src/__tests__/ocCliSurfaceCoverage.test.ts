@@ -985,6 +985,12 @@ describe('V5 oc-* public surface coverage contract', () => {
         source.includes(`exec npx --no-install tsx ${entry} \"$@\"`),
         `${tool}: expected exact argv-forwarding entry ${entry}`,
       )
+      assert.match(source, /# help-fast-path/, `${tool}: --help must short-circuit before tsx`)
+      assert.match(
+        source,
+        /\[ "\$\{1:-\}" = "--help" \]/,
+        `${tool}: --help fast-path flag check`,
+      )
     }
   })
 

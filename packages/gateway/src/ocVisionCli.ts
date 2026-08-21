@@ -13,12 +13,15 @@
  * 由 resolveVisionInput 强制)。输出:识图文本直接写 stdout(非 JSON);错误 → stderr + exit 1。
  */
 import { resolveVisionInput, runVision } from './mcpVisionServer.js'
-import { fail, parseFlags } from './ocResearchClient.js'
+import { exitWithCliHelp, fail, isCliHelpArg, parseFlags } from './ocResearchClient.js'
 
 const TOOL = 'oc-vision'
 
 async function main(): Promise<void> {
   const [cmd, ...rest] = process.argv.slice(2)
+  if (isCliHelpArg(cmd)) {
+    exitWithCliHelp('usage: oc-vision understand <image_file> [--prompt "..."]')
+  }
   if (cmd !== 'understand') {
     fail(TOOL, 'usage: oc-vision understand <image_file> [--prompt "..."]')
   }

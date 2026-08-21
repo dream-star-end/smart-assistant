@@ -13,7 +13,7 @@ import {
   statusOcr,
   submitOcr,
 } from './ocOcrClient.js'
-import { fail, out, parseFlags } from './ocResearchClient.js'
+import { exitWithCliHelp, fail, isCliHelpArg, out, parseFlags } from './ocResearchClient.js'
 
 const TOOL = 'oc-ocr'
 const TERMINAL = new Set(['completed', 'failed', 'cancelled'])
@@ -85,6 +85,11 @@ async function wait(ticket: string, onTicket?: (ticket: string) => void): Promis
 
 async function main(): Promise<void> {
   const [cmd, ...rest] = process.argv.slice(2)
+  if (isCliHelpArg(cmd)) {
+    exitWithCliHelp(
+      'usage: oc-ocr run <file> --out <path> [--mode hybrid|pp|vl] [--fallback 0.10] [--format markdown|jsonl] | submit <file> | status <ticket> | cancel <ticket> | download <ticket> --out <path>',
+    )
+  }
   const { positional, flags } = parseFlags(rest)
 
   if (cmd === 'submit' || cmd === 'run') {

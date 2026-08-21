@@ -581,6 +581,11 @@ async function execute(plan: Extract<TaskCliPlan, { kind: 'request' }>): Promise
 }
 
 export async function runTaskCli(argv: string[]): Promise<number> {
+  const [cmd] = argv
+  if (cmd === 'help' || cmd === '--help' || cmd === '-h') {
+    process.stdout.write(`${TASK_CLI_USAGE}\n`)
+    return TASK_CLI_EXIT.ok
+  }
   const plan = planTaskCommand(argv)
   if (plan.kind === 'usage') {
     writeJson(wrapError(plan.message))

@@ -19,6 +19,15 @@ import re
 import sys
 from pathlib import Path
 
+if len(sys.argv) >= 2 and sys.argv[1] in ("-h", "--help", "help"):
+    sys.stdout.write(
+        "用法:\n"
+        "  oc-xlsx from-csv  <input.csv>  [-o out.xlsx] [--sheet 名] [--no-header]\n"
+        "  oc-xlsx from-json <input.json> [-o out.xlsx] [--sheet 名]\n"
+        "  oc-xlsx from-md   <input.md>   [-o out.xlsx]\n"
+    )
+    raise SystemExit(0)
+
 try:
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side

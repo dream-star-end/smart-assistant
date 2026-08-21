@@ -163,7 +163,14 @@ async function call(method: 'GET' | 'POST', op: string, body?: unknown): Promise
 }
 
 async function main(): Promise<void> {
-  const plan = planSkillCommand(process.argv.slice(2))
+  const argv = process.argv.slice(2)
+  if (argv[0] === 'help' || argv[0] === '--help' || argv[0] === '-h') {
+    process.stdout.write(
+      'usage: oc-skill <train|train-status|evals-generate|evals-gen-status> ...\n',
+    )
+    process.exit(0)
+  }
+  const plan = planSkillCommand(argv)
   const out = (o: unknown) => process.stdout.write(`${JSON.stringify(o, null, 2)}\n`)
 
   switch (plan.kind) {
