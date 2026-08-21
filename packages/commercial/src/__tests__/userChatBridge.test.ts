@@ -3455,3 +3455,178 @@ describe("frontend build handshake", () => {
     }
   });
 });
+
+describe("userChatBridge — session-scoped live frame fan-out", () => {
+  test("stamped frames reach every hello subscriber of uid+session, not other sessions or uids", async () => {
+    const portRef = { p: 0 };
+    const rig = await startRig({
+      resolve: async () => ({
+        host: "127.0.0.1", port: portRef.p, containerId: 91,
+      }),
+      maxPerUser: 4,
+    });
+    portRef.p = rig.containerPort;
+    try {
+      const tokenA = await makeJwt("910");
+      const tokenB = await makeJwt("911");
+      const openAndHello = async (token: string, sessionId: string) => {
+        const nextContainer = waitNextContainerSocket(rig);
+        const ws = openClient(rig.gatewayPort, token);
+        await new Promise<void>((r) => ws.once("open", () => r()));
+        await nextContainer;
+        const hello = JSON.stringify({
+          type: "inbound.hello",
+          peers: [{ peerId: sessionId, agentId: "main", lastFrameSeq: 0 }],
+        });
+        const seenBefore = rig.containerSeen.length;
+        ws.send(hello);
+        await waitFor(() => rig.containerSeen.length > seenBefore);
+        return { ws, fc: frameCollector(ws) };
+      };
+      const tab1 = await openAndHello(tokenA, "sessA");
+      const tab2 = await openAndHello(tokenA, "sessA");
+      const otherSess = await openAndHello(tokenA, "sessB");
+      const otherUid = await openAndHello(tokenB, "sessA");
+
+      const stamped = JSON.stringify({
+        type: "outbound.message",
+        sessionKey: "agent:main:webchat:dm:sessA",
+        frameSeq: 7,
+        peer: { id: "sessA", kind: "dm" },
+        clientMessageId: "m-fanout",
+        blocks: [],
+      });
+      rig.containerSockets[0]!.send(stamped);
+
+      const got1 = await nextBusinessFrame(tab1.fc);
+      const got2 = await nextBusinessFrame(tab2.fc);
+      assert.equal(got1.frameSeq, 7);
+      assert.equal(got2.frameSeq, 7);
+
+      const leaked = await Promise.race([
+        nextBusinessFrame(otherSess.fc).then((frame) => ({ who: "sessB", frame })),
+        nextBusinessFrame(otherUid.fc).then((frame) => ({ who: "uidB", frame })),
+        new Promise<null>((r) => setTimeout(() => r(null), 250)),
+      ]);
+      assert.equal(leaked, null, `fan-out leaked to ${JSON.stringify(leaked)}`);
+
+      tab1.ws.close();
+      tab2.ws.close();
+      otherSess.ws.close();
+      otherUid.ws.close();
+      await Promise.all([
+        waitClose(tab1.ws), waitClose(tab2.ws), waitClose(otherSess.ws), waitClose(otherUid.ws),
+      ]);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+});
+
+describe("userChatBridge — hello live-frame catch-up", () => {
+  test("hello catches up open-dispatch live frames from PG when ring is empty", async () => {
+    const portRef = { p: 0 };
+    const catchupFrame = {
+      type: "outbound.message",
+      sessionKey: "agent:main:webchat:dm:peerCatch",
+      frameSeq: 3,
+      peer: { id: "peerCatch", kind: "dm" },
+      clientMessageId: "cm-catch",
+      blocks: [{ type: "text", text: "caught up" }],
+    };
+    const lookups: unknown[][] = [];
+    const trio = helloTerminalBillingTrio({ row: null, lookups: [] });
+    const innerQuery = trio.pgPool!.query.bind(trio.pgPool);
+    trio.pgPool = {
+      query: async (sql: unknown, params?: unknown[]) => {
+        const text = typeof sql === "string"
+          ? sql
+          : String((sql as { text?: unknown })?.text ?? "");
+        if (/client_session_live_frames/.test(text)) {
+          lookups.push(params ?? []);
+          return {
+            rows: [{ payload: Buffer.from(JSON.stringify(catchupFrame), "utf8") }],
+            rowCount: 1,
+          };
+        }
+        return innerQuery(sql, params);
+      },
+    } as UserChatBridgeDeps["pgPool"];
+    const rig = await startRig({
+      resolve: async () => ({
+        host: "127.0.0.1", port: portRef.p, containerId: 93,
+      }),
+      ...trio,
+    });
+    portRef.p = rig.containerPort;
+    try {
+      const token = await makeJwt("930");
+      const nextContainer = waitNextContainerSocket(rig);
+      const ws = openClient(rig.gatewayPort, token);
+      await new Promise<void>((r) => ws.once("open", () => r()));
+      await nextContainer;
+      const fc = frameCollector(ws);
+      const hello = JSON.stringify({
+        type: "inbound.hello",
+        peers: [{ peerId: "peerCatch", agentId: "main", lastFrameSeq: 0 }],
+      });
+      ws.send(hello);
+      await waitHelloForwarded(rig, hello);
+      const got = await nextBusinessFrame(fc);
+      assert.equal(got.frameSeq, 3);
+      assert.equal((got.blocks as Array<{ text?: string }>)[0]?.text, "caught up");
+      assert.equal(lookups.length, 1);
+      assert.equal(lookups[0]![1], "peerCatch");
+      assert.equal(lookups[0]![0], "930");
+      ws.close();
+      await waitClose(ws);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("hello catch-up queries the hello session, not another session id", async () => {
+    const portRef = { p: 0 };
+    const sessions: string[] = [];
+    const trio = helloTerminalBillingTrio({ row: null, lookups: [] });
+    const innerQuery = trio.pgPool!.query.bind(trio.pgPool);
+    trio.pgPool = {
+      query: async (sql: unknown, params?: unknown[]) => {
+        const text = typeof sql === "string"
+          ? sql
+          : String((sql as { text?: unknown })?.text ?? "");
+        if (/client_session_live_frames/.test(text)) {
+          sessions.push(String(params?.[1] ?? ""));
+          return { rows: [], rowCount: 0 };
+        }
+        return innerQuery(sql, params);
+      },
+    } as UserChatBridgeDeps["pgPool"];
+    const rig = await startRig({
+      resolve: async () => ({
+        host: "127.0.0.1", port: portRef.p, containerId: 94,
+      }),
+      ...trio,
+    });
+    portRef.p = rig.containerPort;
+    try {
+      const token = await makeJwt("940");
+      const nextContainer = waitNextContainerSocket(rig);
+      const ws = openClient(rig.gatewayPort, token);
+      await new Promise<void>((r) => ws.once("open", () => r()));
+      await nextContainer;
+      const hello = JSON.stringify({
+        type: "inbound.hello",
+        peers: [{ peerId: "only-this-session", agentId: "main", lastFrameSeq: 2 }],
+      });
+      ws.send(hello);
+      await waitHelloForwarded(rig, hello);
+      await new Promise((r) => setTimeout(r, 80));
+      assert.deepEqual(sessions, ["only-this-session"]);
+      ws.close();
+      await waitClose(ws);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+});

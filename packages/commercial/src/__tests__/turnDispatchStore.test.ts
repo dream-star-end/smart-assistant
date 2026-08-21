@@ -7,10 +7,11 @@ import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
 
 import {
+  type Queryable,
   admitDispatch,
   casToTerminal,
   heartbeatLease,
-  type Queryable,
+  touchDispatchLeaseOnLiveFrame,
 } from '../dispatch/turnDispatchStore.js'
 
 /** 假 query 面转成 store 期望的 Queryable(pg 的 query 是重载类型,结构不直接可赋)。 */
@@ -203,5 +204,42 @@ describe('CAS helpers', () => {
     const lost = { async query() { return { rows: [], rowCount: 0 } } }
     assert.equal(await heartbeatLease(asQ(ok), { dispatchId: 'd', ownerId: 'o', leaseEpoch: 2 }), true)
     assert.equal(await heartbeatLease(asQ(lost), { dispatchId: 'd', ownerId: 'o', leaseEpoch: 2 }), false)
+  })
+
+  test('touchDispatchLeaseOnLiveFrame renews admitted/accepted open rows without owner fence', async () => {
+    const captured: string[] = []
+    const params: unknown[][] = []
+    const q = {
+      async query(sql: string, p: unknown[]) {
+        captured.push(sql)
+        params.push(p)
+        return { rows: [], rowCount: 1 }
+      },
+    }
+    assert.equal(
+      await touchDispatchLeaseOnLiveFrame(asQ(q), {
+        userId: 3n,
+        sessionId: 'sess-a',
+        clientMessageId: 'cm-live',
+      }),
+      true,
+    )
+    assert.ok(captured[0]!.includes("status IN ('admitted', 'accepted')"))
+    assert.ok(captured[0]!.includes('terminal_at IS NULL'))
+    assert.equal(captured[0]!.includes('owner_id'), false, 'must not require the original WS owner')
+    assert.equal(captured[0]!.includes('lease_epoch'), false)
+    assert.deepEqual(params[0]!.slice(0, 3), ['3', 'sess-a', 'cm-live'])
+  })
+
+  test('touchDispatchLeaseOnLiveFrame returns false when no open row matches', async () => {
+    const q = { async query() { return { rows: [], rowCount: 0 } } }
+    assert.equal(
+      await touchDispatchLeaseOnLiveFrame(asQ(q), {
+        userId: 3n,
+        sessionId: 'sess-a',
+        clientMessageId: 'cm-done',
+      }),
+      false,
+    )
   })
 })

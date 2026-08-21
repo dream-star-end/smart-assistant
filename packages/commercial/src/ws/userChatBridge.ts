@@ -157,6 +157,7 @@ import {
   DISPATCH_LEASE_TTL_MS,
   DISPATCH_LEASE_HEARTBEAT_MS,
 } from "../dispatch/turnDispatchStore.js";
+import { readOpenDispatchLiveFramePayloadsAfterSeq } from "../db/liveTurnFrames.js";
 import {
   admitDurableControl,
   claimDueTurnControls,
@@ -300,6 +301,10 @@ export const DEFAULT_MAX_FRAME_BYTES = 448 * 1024 * 1024;
 const HELLO_TERMINAL_NOTIFY_MAX_CANDIDATES = 8;
 /** clientMessageId 长度硬顶。先挡住无界字符串(单帧上限 448 MiB),再跑格式校验。 */
 const HELLO_TERMINAL_NOTIFY_MAX_CLIENT_MESSAGE_ID_LEN = 200;
+/** 单条 hello 最多从 PG 补齐这么多会话的在飞 live frames。 */
+const HELLO_LIVE_CATCHUP_MAX_SESSIONS = 8;
+/** 单会话 hello 补齐帧数封顶,与 GET live-frames 页大小对齐。 */
+const HELLO_LIVE_CATCHUP_MAX_FRAMES = 500;
 
 export const PROMPT_QUEUE_DISPATCH_REQUEST_TYPE = "outbound.prompt_queue.dispatch_request";
 export const PROMPT_QUEUE_DISPATCH_RESULT_TYPE = "outbound.prompt_queue.dispatch_result";
@@ -1835,6 +1840,56 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
    * 期间的 ws 不在这里,因为没有跑到 startBridge 里 registry.register。
    */
   const uidToUserWs = new Map<string, Set<WebSocket>>();
+  /**
+   * uid+session → 当前已 hello 订阅该会话的 OPEN user WS。
+   * forwardCommittedFrame 按此扇出,而不是绑在受理时捕获的那一根 userWs 上。
+   * key = `${uid}\0${sessionId}`:同一 uid 的其它会话、其它 uid 都进不了这个集合。
+   */
+  const sessionToUserWs = new Map<string, Set<WebSocket>>();
+  const userWsToSessionKeys = new Map<WebSocket, Set<string>>();
+
+  const sessionFanoutKey = (userId: string, sessionId: string): string =>
+    `${userId}\0${sessionId}`;
+
+  const registerUserWsSession = (ws: WebSocket, userId: string, sessionId: string): void => {
+    if (sessionId.length < 1 || sessionId.length > 512) return;
+    const key = sessionFanoutKey(userId, sessionId);
+    let subscribers = sessionToUserWs.get(key);
+    if (!subscribers) {
+      subscribers = new Set();
+      sessionToUserWs.set(key, subscribers);
+    }
+    subscribers.add(ws);
+    let owned = userWsToSessionKeys.get(ws);
+    if (!owned) {
+      owned = new Set();
+      userWsToSessionKeys.set(ws, owned);
+    }
+    owned.add(key);
+  };
+
+  const unregisterUserWsSessions = (ws: WebSocket): void => {
+    const owned = userWsToSessionKeys.get(ws);
+    if (!owned) return;
+    userWsToSessionKeys.delete(ws);
+    for (const key of owned) {
+      const subscribers = sessionToUserWs.get(key);
+      if (!subscribers) continue;
+      subscribers.delete(ws);
+      if (subscribers.size === 0) sessionToUserWs.delete(key);
+    }
+  };
+
+  const openUserWsForSession = (userId: string, sessionId: string | null): WebSocket[] => {
+    if (sessionId === null || sessionId.length < 1) return [];
+    const subscribers = sessionToUserWs.get(sessionFanoutKey(userId, sessionId));
+    if (!subscribers || subscribers.size === 0) return [];
+    const open: WebSocket[] = [];
+    for (const candidate of subscribers) {
+      if (candidate.readyState === WebSocket.OPEN) open.push(candidate);
+    }
+    return open;
+  };
   const uidToContainerWs = new Map<string, Set<WebSocket>>();
   const uidToRecoveryExecutors = new Map<
     string,
@@ -4390,6 +4445,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             // 这里只收集候选,查询必须等 hello 转发之后再跑。
             const terminalNotifyCandidates: Array<{ peerId: string; clientMessageId: string }> = [];
             const terminalNotifySeen = new Set<string>();
+            const liveCatchupSessions: Array<{ sessionId: string; afterFrameSeq: number }> = [];
+            const liveCatchupSeen = new Set<string>();
             for (const p of visiblePeers) {
               if (typeof p !== "object" || p === null) continue;
               const peer = p as {
@@ -4400,6 +4457,18 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 inFlightClientMessageId?: unknown;
               };
               if (typeof peer.peerId !== "string") continue;
+              registerUserWsSession(userWs, uidStr, peer.peerId);
+              if (
+                !liveCatchupSeen.has(peer.peerId) &&
+                liveCatchupSessions.length < HELLO_LIVE_CATCHUP_MAX_SESSIONS
+              ) {
+                liveCatchupSeen.add(peer.peerId);
+                const afterFrameSeq =
+                  typeof peer.lastFrameSeq === "number" && Number.isSafeInteger(peer.lastFrameSeq)
+                    ? Math.max(0, peer.lastFrameSeq)
+                    : 0;
+                liveCatchupSessions.push({ sessionId: peer.peerId, afterFrameSeq });
+              }
               const inFlightId = peer.inFlightClientMessageId;
               // peers 来自客户端。协议规定 inFlightClientMessageId 仅在
               // inFlight===true 时携带,且为短 uuid;不校验就会被无界字符串/
@@ -4529,6 +4598,30 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   }
                 } catch {
                   // 任何失败都只能静默:hello 处理绝不能因回落抛错。
+                }
+              })().catch(() => {});
+            }
+            if (liveCatchupSessions.length > 0 && deps.pgPool) {
+              const pgPool = deps.pgPool;
+              void (async () => {
+                try {
+                  await Promise.resolve();
+                  for (const { sessionId, afterFrameSeq } of liveCatchupSessions) {
+                    if (userWs.readyState !== WebSocket.OPEN) break;
+                    const payloads = await readOpenDispatchLiveFramePayloadsAfterSeq(pgPool, {
+                      uid,
+                      sessionId,
+                      afterFrameSeq,
+                      limit: HELLO_LIVE_CATCHUP_MAX_FRAMES,
+                    });
+                    for (const payload of payloads) {
+                      if (userWs.readyState !== WebSocket.OPEN) break;
+                      if (parseLeftoverHotWsPayload(payload)) continue;
+                      try { userWs.send(payload); } catch { break; }
+                    }
+                  }
+                } catch {
+                  // hello 补齐失败只能静默:不得挡转发、不得关连接。
                 }
               })().catch(() => {});
             }
@@ -7246,27 +7339,45 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             durableStampedFrame.payload,
           );
         }
-        if (userWs.readyState !== WebSocket.OPEN) return;
-        if (userWs.bufferedAmount + len > maxBufferedBytes) {
-          bridgeLog?.warn("user-chat-bridge: user-side backpressure", {
-            buffered: userWs.bufferedAmount, len,
-          });
-          try { userWs.close(CLOSE_BRIDGE.TOO_BIG, "backpressure"); } catch { /* */ }
-          cleanup("backpressure");
-          return;
-        }
-        try {
-          userWs.send(data, { binary: isBinary }, (err) => {
-            if (err) bridgeLog?.warn("user-chat-bridge: user send error", { err });
-          });
-          bytesCU += len;
-          bufferedCU = userWs.bufferedAmount;
-          metrics.onContainerFrame?.(uid, len, isBinary);
-          metrics.onBufferedBytes?.(uid, "container_to_user", bufferedCU);
-        } catch (err) {
-          bridgeLog?.warn("user-chat-bridge: user send threw", { err });
-          try { userWs.close(CLOSE_BRIDGE.INTERNAL, "user send failed"); } catch { /* */ }
-          cleanup("internal_error");
+        const sessionId = durableStampedFrame?.sessionId ?? null;
+        const recipients: WebSocket[] = [];
+        const seenRecipients = new Set<WebSocket>();
+        const addRecipient = (ws: WebSocket): void => {
+          if (ws.readyState !== WebSocket.OPEN || seenRecipients.has(ws)) return;
+          seenRecipients.add(ws);
+          recipients.push(ws);
+        };
+        // Session-scoped fan-out: every hello subscriber for this uid+session.
+        // The admitting socket is included only if it has subscribed or is
+        // still the sole pre-hello recipient below.
+        for (const ws of openUserWsForSession(uid.toString(), sessionId)) addRecipient(ws);
+        // Pre-hello first-token window: the producing connection has not
+        // registered a peer yet, so still deliver to the admitting socket.
+        if (sessionId === null || recipients.length === 0) addRecipient(userWs);
+        if (recipients.length === 0) return;
+
+        for (const dest of recipients) {
+          if (dest.bufferedAmount + len > maxBufferedBytes) {
+            bridgeLog?.warn("user-chat-bridge: user-side backpressure", {
+              buffered: dest.bufferedAmount, len,
+            });
+            try { dest.close(CLOSE_BRIDGE.TOO_BIG, "backpressure"); } catch { /* */ }
+            if (dest === userWs) cleanup("backpressure");
+            continue;
+          }
+          try {
+            dest.send(data, { binary: isBinary }, (err) => {
+              if (err) bridgeLog?.warn("user-chat-bridge: user send error", { err });
+            });
+            bytesCU += len;
+            if (dest === userWs) bufferedCU = dest.bufferedAmount;
+            metrics.onContainerFrame?.(uid, len, isBinary);
+            metrics.onBufferedBytes?.(uid, "container_to_user", dest.bufferedAmount);
+          } catch (err) {
+            bridgeLog?.warn("user-chat-bridge: user send threw", { err });
+            try { dest.close(CLOSE_BRIDGE.INTERNAL, "user send failed"); } catch { /* */ }
+            if (dest === userWs) cleanup("internal_error");
+          }
         }
       };
 
@@ -8123,6 +8234,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         try { userWs.terminate(); } catch { /* */ }
       }
       unregister();
+      unregisterUserWsSessions(userWs);
       {
         const key = uid.toString();
         const set = uidToUserWs.get(key);

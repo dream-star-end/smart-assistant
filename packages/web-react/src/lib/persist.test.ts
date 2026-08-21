@@ -1792,3 +1792,76 @@ describe("sync authority propagation", () => {
     expect(merged.some((m) => m.text === "流式中…")).toBe(true);
   });
 });
+
+describe("mergeFullServerWins — records_unpublished degrade page", () => {
+  test("keeps local live thinking/tool/plan and adds the Phase-A final assistant", () => {
+    const cmid = "u-degrade";
+    const user: ChatMessage = { id: cmid, role: "user", text: "q", ts: 1 };
+    const thinking: ChatMessage = {
+      id: "live-th", role: "thinking", text: "reason", ts: 2, _clientMessageId: cmid,
+    };
+    const tool: ChatMessage = {
+      id: "live-tool", role: "tool", text: "", ts: 3, _clientMessageId: cmid, toolName: "Bash",
+    };
+    const plan: ChatMessage = {
+      id: "live-plan", role: "plan", text: "plan", ts: 4, _clientMessageId: cmid,
+    };
+    const final: ChatMessage = {
+      id: "answer-1",
+      role: "assistant",
+      text: "final",
+      ts: 5,
+      _source: "server",
+      _clientMessageId: cmid,
+      _turnTapeId: "tape-1",
+      _turnTapeComplete: true,
+      _displayDegraded: true,
+      _displayDegradeReason: "records_unpublished",
+    };
+    const merged = mergeFullServerWins([user, final], [user, thinking, tool, plan], 0, cmid, {
+      deletionAuthority: true,
+    });
+    expect(merged.map((m) => m.role)).toEqual(["user", "thinking", "tool", "plan", "assistant"]);
+    expect(merged.some((m) => m.id === "live-th")).toBe(true);
+    expect(merged.some((m) => m.id === "live-tool")).toBe(true);
+    expect(merged.some((m) => m.id === "live-plan")).toBe(true);
+  });
+
+  test("a complete tape without degrade replaces the live process rows", () => {
+    const cmid = "u-exact";
+    const user: ChatMessage = { id: cmid, role: "user", text: "q", ts: 1, _source: "server" };
+    const liveThinking: ChatMessage = {
+      id: "live-th", role: "thinking", text: "reason", ts: 2, _clientMessageId: cmid,
+    };
+    const tapeThinking: ChatMessage = {
+      id: "tape-th",
+      role: "thinking",
+      text: "reason",
+      ts: 2,
+      _source: "server",
+      _clientMessageId: cmid,
+      _turnTapeId: "tape-1",
+      _turnTapeComplete: true,
+    };
+    const tapeAssistant: ChatMessage = {
+      id: "tape-as",
+      role: "assistant",
+      text: "final",
+      ts: 5,
+      _source: "server",
+      _clientMessageId: cmid,
+      _turnTapeId: "tape-1",
+      _turnTapeComplete: true,
+    };
+    const merged = mergeFullServerWins(
+      [user, tapeThinking, tapeAssistant],
+      [user, liveThinking],
+      0,
+      cmid,
+      { deletionAuthority: true },
+    );
+    expect(merged.some((m) => m.id === "live-th")).toBe(false);
+    expect(merged.some((m) => m.id === "tape-th")).toBe(true);
+    expect(merged.some((m) => m.id === "tape-as")).toBe(true);
+  });
+});

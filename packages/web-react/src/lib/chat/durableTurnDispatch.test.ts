@@ -122,7 +122,7 @@ describe("hello inFlightClientMessageId (RFC §4)", () => {
     sock.sendMessage({ sessId: "s1", agentId: "main", text: "在飞问题" });
     const s = sock.sessions.get("s1")!;
     const userId = s.messages.find((m) => m.role === "user")!.id;
-    expect(s._sendingInFlight).not.toBe(true);
+    expect(s._sendingInFlight).toBe(true);
     expect(s._activeClientMessageId).toBe(userId);
     ws1.onmessage?.({ data: JSON.stringify({
       type: "outbound.ack",

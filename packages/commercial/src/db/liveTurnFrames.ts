@@ -1,14 +1,18 @@
 import { createHash } from "node:crypto";
-import type { Pool, PoolClient } from "pg";
 import {
+  type LiveFrameInput,
+  type LiveUnitsPage,
+  type ServeLiveUnitsOptions,
   assembleLiveUnitsFromState,
   continueReduceLiveFrames,
   fallbackLiveUnitsPage,
   reduceLiveFrames,
-  type LiveFrameInput,
-  type LiveUnitsPage,
-  type ServeLiveUnitsOptions,
 } from "@openclaude/protocol";
+import type { Pool, PoolClient } from "pg";
+import {
+  DISPATCH_LEASE_TTL_MS,
+  touchDispatchLeaseOnLiveFrame,
+} from "../dispatch/turnDispatchStore.js";
 import {
   deleteLiveUnitCheckpoints,
   loadOpenDispatchLiveUnitCheckpoint,
@@ -242,9 +246,21 @@ export async function persistGatewayLiveFrame(
       existing.payload_sha256 === payloadSha256 &&
       Buffer.from(existing.payload).equals(payload);
 
+    const finish = async (): Promise<{ streamKey: string; live: boolean }> => {
+      if (dispatch !== null && input.clientMessageId !== null) {
+        await touchDispatchLeaseOnLiveFrame(client, {
+          userId: input.uid,
+          sessionId: input.sessionId,
+          clientMessageId: input.clientMessageId,
+          leaseTtlMs: DISPATCH_LEASE_TTL_MS,
+        });
+      }
+      return { streamKey, live: finalizedTape == null };
+    };
+
     const existing = await insertOrReadExisting(input.sessionKey);
     if (existing === null || matchesCurrentFrame(existing)) {
-      return { streamKey, live: finalizedTape == null };
+      return await finish();
     }
     if (existing.stream_key === streamKey) {
       throw new LiveFramePermanentConflictError("live frame immutable payload conflict");
@@ -260,7 +276,7 @@ export async function persistGatewayLiveFrame(
     if (namespacedExisting !== null && !matchesCurrentFrame(namespacedExisting)) {
       throw new LiveFramePermanentConflictError("live frame immutable payload conflict");
     }
-    return { streamKey, live: finalizedTape == null };
+    return await finish();
   }));
   // Reduce is a derived cache. Never await it on the persist stack; never run
   // it inside the frame transaction. Failures must not surface to the caller.
@@ -270,6 +286,55 @@ export async function persistGatewayLiveFrame(
     streamKey: persisted.streamKey,
     live: persisted.live,
   });
+}
+
+export interface ReadOpenDispatchLiveFramePayloadsInput {
+  uid: bigint;
+  sessionId: string;
+  afterFrameSeq: number;
+  limit?: number;
+}
+
+/**
+ * Hello/reconnect catch-up: exact stamped payloads for the current open
+ * dispatch of one uid+session, after the client's wire frameSeq cursor.
+ * Missing/non-positive cursor starts at the stream head. Isolation is the
+ * query predicate (user_id + session_id + open dispatch stream key) — never
+ * returns another user's or another session's frames.
+ */
+export async function readOpenDispatchLiveFramePayloadsAfterSeq(
+  q: Pick<Pool, "query">,
+  input: ReadOpenDispatchLiveFramePayloadsInput,
+): Promise<string[]> {
+  const after = Number.isSafeInteger(input.afterFrameSeq) && input.afterFrameSeq > 0
+    ? input.afterFrameSeq
+    : 0;
+  const limit = Number.isSafeInteger(input.limit)
+    ? Math.max(1, Math.min(500, Math.trunc(input.limit as number)))
+    : 500;
+  const sessionUserId = `c:${input.uid.toString()}`;
+  const res = await q.query<{ payload: Buffer }>(
+    `SELECT f.payload
+       FROM client_session_live_streams s
+       JOIN client_session_live_frames f ON f.stream_key = s.stream_key
+      WHERE s.session_id = $2
+        AND s.user_id = $3
+        AND s.projection_source = 'live'
+        AND EXISTS (
+          SELECT 1
+            FROM turn_dispatches d
+           WHERE d.user_id = $1
+             AND d.session_id = s.session_id
+             AND d.status IN ('accepted', 'admitted')
+             AND d.terminal_at IS NULL
+             AND s.stream_key LIKE 'dispatch:' || d.dispatch_id::text || ':%'
+        )
+        AND f.frame_seq > $4
+      ORDER BY f.frame_seq ASC
+      LIMIT $5`,
+    [input.uid.toString(), input.sessionId, sessionUserId, after, limit],
+  );
+  return res.rows.map((row) => Buffer.from(row.payload).toString("utf8"));
 }
 
 /**

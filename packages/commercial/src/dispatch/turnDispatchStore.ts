@@ -299,6 +299,40 @@ export async function heartbeatLease(q: Queryable, input: HeartbeatLeaseInput): 
   return (res.rowCount ?? 0) === 1
 }
 
+export interface TouchDispatchLeaseOnLiveFrameInput {
+  userId: bigint
+  sessionId: string
+  clientMessageId: string
+  leaseTtlMs?: number
+}
+
+/**
+ * Live-frame liveness: renew the open dispatch lease when a journal frame
+ * actually lands. heartbeatLease only matches status='admitted' + owner/epoch,
+ * so a long accepted turn (TTFT > 90s, original WS already gone) would otherwise
+ * sit with an expired lease and look stuck to the scanner.
+ *
+ * Isolation: logical key is user+session+clientMessageId. Rejecting/terminal
+ * rows are left alone so takeover/tombstone is not undone. This is liveness
+ * evidence from the writer, not a second owner claim — it does not bump epoch.
+ */
+export async function touchDispatchLeaseOnLiveFrame(
+  q: Queryable,
+  input: TouchDispatchLeaseOnLiveFrameInput,
+): Promise<boolean> {
+  const ttl = Math.max(1_000, Math.trunc(input.leaseTtlMs ?? DISPATCH_LEASE_TTL_MS))
+  const res = await q.query(
+    `UPDATE turn_dispatches
+        SET lease_until = NOW() + ($4::bigint * INTERVAL '1 millisecond'),
+            last_attempt_at = NOW()
+      WHERE user_id = $1 AND session_id = $2 AND client_message_id = $3
+        AND status IN ('admitted', 'accepted')
+        AND terminal_at IS NULL`,
+    [input.userId.toString(), input.sessionId, input.clientMessageId, ttl],
+  )
+  return (res.rowCount ?? 0) === 1
+}
+
 // ─── 状态迁移(全 CAS)───────────────────────────────────────────────────────
 
 /**
