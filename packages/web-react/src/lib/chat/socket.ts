@@ -2047,7 +2047,10 @@ export class ChatSocket {
       }
       case "error": {
         const frame = f as LegacyBridgeErrorWire;
-        const sess = frame.peer?.id ? this.sessions.get(frame.peer.id) : this.firstSession();
+        // Turn-level legacy errors must name the peer. Falling back to
+        // firstSession() applied Cursor/ZCode admission failures to session A
+        // while session B stayed _sendingInFlight forever.
+        const sess = this.resolveSession(frame.peer?.id);
         if (sess) {
           const activeClientMessageId = sess._activeClientMessageId;
           const ownsActiveTurn = !frame.clientMessageId ||

@@ -4186,6 +4186,66 @@ describe("Phase-A final-only tape projection retry", () => {
   });
 });
 
+describe("legacy type:error must not fall back to firstSession", () => {
+  afterEach(() => {
+    FakeWS.instances = [];
+    vi.unstubAllGlobals();
+  });
+
+  test("Cursor rejection without peer leaves session B in-flight and does not error session A", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    const sessionA = sock.ensureSession("sess-a", "main");
+    const sessionB = sock.ensureSession("sess-b", "main");
+    sessionB._sendingInFlight = true;
+    sessionB._activeClientMessageId = "cm-b";
+    addMessage(sessionB, "user", "from B", { id: "cm-b", status: "sending", ts: 1 });
+    ws.onmessage?.({
+      data: JSON.stringify({
+        type: "error",
+        code: "CURSOR_UNAVAILABLE",
+        message: "Cursor requires the account-owned local runtime",
+      }),
+    });
+    expect(sessionA.messages.some((m) => m._errorCode)).toBe(false);
+    expect(sessionB._sendingInFlight).toBe(true);
+    expect(sessionB._activeClientMessageId).toBe("cm-b");
+    sock.stop();
+  });
+
+  test("Cursor rejection with peer+clientMessageId clears session B only", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    const sessionA = sock.ensureSession("sess-a", "main");
+    const sessionB = sock.ensureSession("sess-b", "main");
+    sessionA._sendingInFlight = false;
+    sessionB._sendingInFlight = true;
+    sessionB._activeClientMessageId = "cm-b";
+    addMessage(sessionB, "user", "from B", { id: "cm-b", status: "sending", ts: 1 });
+    ws.onmessage?.({
+      data: JSON.stringify({
+        type: "error",
+        code: "CURSOR_UNAVAILABLE",
+        message: "Cursor requires the account-owned local runtime",
+        peer: { id: "sess-b", kind: "dm" },
+        clientMessageId: "cm-b",
+      }),
+    });
+    expect(sessionA._sendingInFlight).toBe(false);
+    expect(sessionA.messages.some((m) => m._errorCode)).toBe(false);
+    expect(sessionB._sendingInFlight).toBe(false);
+    expect(sessionB._activeClientMessageId).toBeUndefined();
+    expect(sessionB.messages.some((m) => m._errorCode === "cursor_unavailable" || m._errorCode === "CURSOR_UNAVAILABLE" || typeof m._errorCode === "string")).toBe(true);
+    sock.stop();
+  });
+});
+
 describe("ChatSocket interrupted continuation", () => {
   afterEach(() => {
     FakeWS.instances = [];

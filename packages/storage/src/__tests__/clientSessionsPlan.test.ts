@@ -9,6 +9,8 @@ import { describe, it } from 'node:test'
 import {
   type AppendServerAuthoredPlan,
   planAppendServerAuthored,
+  planAppendServerAuthoredBatch,
+  planReplaceServerAuthoredKeepingOrderSlots,
   planSpillOverflow,
 } from '../clientSessionsPlan.js'
 import {
@@ -188,3 +190,87 @@ describe('planAppendServerAuthored', () => {
     assert.equal(plan.kind, 'oversized')
   })
 })
+
+describe('planReplaceServerAuthoredKeepingOrderSlots', () => {
+  it('reuses the frozen Phase A slot instead of next_seq (webmt2kp2ry3lamba shape)', () => {
+    const t2User: MessageLike = {
+      id: 'm-mt2lapr1-3w-0fv2',
+      role: 'user',
+      text: '把任务面板端到端跑通',
+      ts: 100,
+      _source: 'server',
+      _seq: 4,
+      _orderSeq: 3,
+    }
+    const phaseA: MessageLike = {
+      id: 'srv-webmt2kp2ry3lamba-main-t2-s5',
+      role: 'assistant',
+      text: '',
+      ts: 110,
+      _source: 'server',
+      _seq: 5,
+      _orderSeq: 4,
+      _turnTapeId: '394f688b383a1aeec373c49b8de37987a83ab60b1ac5dc3e8c7517f542b009c3',
+      _turnTapeComplete: true,
+    }
+    const laterUser: MessageLike = {
+      id: 'm-mt2m451t-g6-fnwp',
+      role: 'user',
+      text: '我选择:发布到自用 V5',
+      ts: 200,
+      _source: 'server',
+      _seq: 6,
+      _orderSeq: 5,
+    }
+    const existing = [t2User, phaseA, laterUser]
+    const phaseBAnchor: MessageLike & { id: string } = {
+      id: 'srv-webmt2kp2ry3lamba-main-t2-s5',
+      role: 'assistant',
+      ts: 110,
+      text: 'materialized',
+      _source: 'server',
+      _turnTapeId: '394f688b383a1aeec373c49b8de37987a83ab60b1ac5dc3e8c7517f542b009c3',
+      _turnTapeComplete: true,
+      _turnTapeRecordCount: 12,
+    }
+
+    const legacy = planAppendServerAuthoredBatch(
+      existing.filter((message) => message._turnTapeId !== phaseBAnchor._turnTapeId),
+      [phaseBAnchor],
+      7,
+      0,
+    )
+    assert.equal(legacy.kind, 'write')
+    if (legacy.kind === 'write') {
+      const assistant = legacy.tail.find((message) => message.id === phaseBAnchor.id)
+      assert.equal(assistant?._orderSeq, 6)
+      assert.ok((assistant?._seq as number) >= 7)
+      const laterIdx = legacy.tail.findIndex((message) => message.id === laterUser.id)
+      const asIdx = legacy.tail.findIndex((message) => message.id === phaseBAnchor.id)
+      assert.ok(laterIdx < asIdx, 'unfixed Phase B sorts the assistant after the later user')
+    }
+
+    const fixed = planReplaceServerAuthoredKeepingOrderSlots(
+      existing,
+      [phaseBAnchor],
+      (message) => message._turnTapeId === phaseBAnchor._turnTapeId,
+      7,
+      0,
+    )
+    assert.equal(fixed.kind, 'write')
+    if (fixed.kind !== 'write') return
+    const assistant = fixed.tail.find((message) => message.id === phaseBAnchor.id)
+    const later = fixed.tail.find((message) => message.id === laterUser.id)
+    assert.equal(assistant?._orderSeq, 4, 'must reuse the frozen Phase A slot')
+    assert.equal(later?._orderSeq, 5)
+    assert.ok((assistant?._seq as number) >= 7, '_seq remains the version cursor')
+    assert.equal(assistant?._clientMessageId, undefined)
+    const ids = fixed.tail.map((message) => message.id)
+    assert.deepEqual(ids, [
+      'm-mt2lapr1-3w-0fv2',
+      'srv-webmt2kp2ry3lamba-main-t2-s5',
+      'm-mt2m451t-g6-fnwp',
+    ])
+  })
+})
+

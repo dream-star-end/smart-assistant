@@ -157,7 +157,11 @@ import {
   DISPATCH_LEASE_TTL_MS,
   DISPATCH_LEASE_HEARTBEAT_MS,
 } from "../dispatch/turnDispatchStore.js";
-import { readOpenDispatchLiveFramePayloadsAfterSeq } from "../db/liveTurnFrames.js";
+import {
+  HELLO_LIVE_CATCHUP_MAX_BYTES,
+  liveCatchupSendDecision,
+  readOpenDispatchLiveFramePayloadsAfterSeq,
+} from "../db/liveTurnFrames.js";
 import {
   admitDurableControl,
   claimDueTurnControls,
@@ -4613,11 +4617,29 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                       sessionId,
                       afterFrameSeq,
                       limit: HELLO_LIVE_CATCHUP_MAX_FRAMES,
+                      maxBytes: Math.min(maxBufferedBytes, HELLO_LIVE_CATCHUP_MAX_BYTES),
                     });
+                    let catchupBackpressured = false;
                     for (const payload of payloads) {
-                      if (userWs.readyState !== WebSocket.OPEN) break;
                       if (parseLeftoverHotWsPayload(payload)) continue;
+                      const decision = liveCatchupSendDecision(
+                        userWs.readyState,
+                        userWs.bufferedAmount,
+                        Buffer.byteLength(payload, "utf8"),
+                        maxBufferedBytes,
+                      );
+                      if (decision === "stop") break;
+                      if (decision === "backpressure") {
+                        catchupBackpressured = true;
+                        break;
+                      }
                       try { userWs.send(payload); } catch { break; }
+                    }
+                    // Slow/huge reconnect: close only this WS. Do not cleanup()
+                    // the admitting bridge — other uid+session sockets stay up.
+                    if (catchupBackpressured && userWs.readyState === WebSocket.OPEN) {
+                      try { userWs.close(CLOSE_BRIDGE.TOO_BIG, "backpressure"); } catch { /* */ }
+                      break;
                     }
                   }
                 } catch {
@@ -4968,17 +4990,23 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         const modelCapture = effectiveModelForFrame;
         const peerCapture = inboundPeerIdForFrame;
         const cid = containerId;
+        const cursorTurnIdentity = {
+          peerId: peerCapture,
+          clientMessageId: parsedCapture !== null && isClientMessageId(parsedCapture.clientMessageId)
+            ? parsedCapture.clientMessageId
+            : null,
+        };
         void (async () => {
           let dispatchRecord: AdmittedDispatch | undefined;
           try {
             if (!deps.pgPool || parsedCapture === null || traceCapture === null || !isCursorEngineModel(modelCapture)) {
               rejectPromptQueueDispatch('CURSOR_UNAVAILABLE');
-              sendErrorFrame(userWs, 'CURSOR_UNAVAILABLE', 'Cursor is unavailable for this account');
+              sendErrorFrame(userWs, 'CURSOR_UNAVAILABLE', 'Cursor is unavailable for this account', cursorTurnIdentity);
               return;
             }
             if (!isCursorCredentialMember(uid)) {
               rejectPromptQueueDispatch('UNAUTHORIZED_MODEL');
-              sendErrorFrame(userWs, 'UNAUTHORIZED_MODEL', 'Cursor is not enabled for this account');
+              sendErrorFrame(userWs, 'UNAUTHORIZED_MODEL', 'Cursor is not enabled for this account', cursorTurnIdentity);
               return;
             }
             // The local supervisor mounts the owner credential only on this
@@ -4991,7 +5019,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             );
             if (!eligible) {
               rejectPromptQueueDispatch('CURSOR_UNAVAILABLE');
-              sendErrorFrame(userWs, 'CURSOR_UNAVAILABLE', 'Cursor requires the account-owned local runtime');
+              sendErrorFrame(userWs, 'CURSOR_UNAVAILABLE', 'Cursor requires the account-owned local runtime', cursorTurnIdentity);
               return;
             }
             const enriched = await attachMasterTurnState(parsedCapture, logCapture, traceCapture, !isPromptQueueDispatch, rejectPromptQueueDispatch, authorityModelCapture, recoveryJob);
@@ -5031,7 +5059,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             logCapture?.error('user-chat-bridge: Cursor external admission failed', { err });
             failDispatchPreForward(dispatchRecord, 'cursor_external_admission_failed');
             rejectPromptQueueDispatch('CURSOR_UNAVAILABLE');
-            if (!cleaned && userWs.readyState === WebSocket.OPEN) sendErrorFrame(userWs, 'CURSOR_UNAVAILABLE', 'Cursor is temporarily unavailable');
+            if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+              sendErrorFrame(userWs, 'CURSOR_UNAVAILABLE', 'Cursor is temporarily unavailable', cursorTurnIdentity);
+            }
           }
         })();
         return;
@@ -5044,6 +5074,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         const modelCapture = effectiveModelForFrame;
         const peerCapture = inboundPeerIdForFrame;
         const cid = containerId;
+        const zcodeTurnIdentity = {
+          peerId: peerCapture,
+          clientMessageId: parsedCapture !== null && isClientMessageId(parsedCapture.clientMessageId)
+            ? parsedCapture.clientMessageId
+            : null,
+        };
         void (async () => {
           let dispatchRecord: AdmittedDispatch | undefined;
           let insertedRequestId: string | null = null;
@@ -5071,7 +5107,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             const publicCanonical = modelCapture === "glm-5.3-zai";
             if (!deps.pgPool || parsedCapture === null || traceCapture === null || typeof modelCapture !== "string" || (!canary && !publicCanonical)) {
               rejectPromptQueueDispatch('ZCODE_UNAVAILABLE');
-              sendErrorFrame(userWs, 'ZCODE_UNAVAILABLE', 'ZCode is unavailable for this account');
+              sendErrorFrame(userWs, 'ZCODE_UNAVAILABLE', 'ZCode is unavailable for this account', zcodeTurnIdentity);
               return;
             }
             const zcodeModelId = modelCapture;
@@ -5095,7 +5131,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             const requestId = dispatchRecord ? dispatchRecord.billingRequestId : ensureRequestIdServerSide();
             if (!deps.mintZcodeRoute) {
               rejectPromptQueueDispatch('ZCODE_UNAVAILABLE');
-              sendErrorFrame(userWs, 'ZCODE_UNAVAILABLE', 'ZCode is unavailable for this account');
+              sendErrorFrame(userWs, 'ZCODE_UNAVAILABLE', 'ZCode is unavailable for this account', zcodeTurnIdentity);
               return;
             }
             let minted: { token: string; baseUrl: string };
@@ -5109,7 +5145,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             } catch (err) {
               logCapture?.error('user-chat-bridge: ZCode relay mint failed', { err });
               rejectPromptQueueDispatch('ZCODE_UNAVAILABLE');
-              sendErrorFrame(userWs, 'ZCODE_UNAVAILABLE', 'ZCode is temporarily unavailable');
+              sendErrorFrame(userWs, 'ZCODE_UNAVAILABLE', 'ZCode is temporarily unavailable', zcodeTurnIdentity);
               return;
             }
             pendingZcodeRelays.set(requestId, {
@@ -5165,7 +5201,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             failDispatchPreForward(dispatchRecord, 'zcode_external_admission_failed');
             rejectPromptQueueDispatch('ZCODE_UNAVAILABLE');
             await abortInserted("send_failed");
-            if (!cleaned && userWs.readyState === WebSocket.OPEN) sendErrorFrame(userWs, 'ZCODE_UNAVAILABLE', 'ZCode is temporarily unavailable');
+            if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+              sendErrorFrame(userWs, 'ZCODE_UNAVAILABLE', 'ZCode is temporarily unavailable', zcodeTurnIdentity);
+            }
           }
         })();
         return;

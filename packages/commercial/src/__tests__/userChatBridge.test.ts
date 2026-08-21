@@ -74,6 +74,7 @@ async function startRig(opts: {
   resolve?: ResolveContainerEndpoint;
   maxPerUser?: number;
   maxFrameBytes?: number;
+  maxBufferedBytes?: number;
   markContainerActivity?: (containerId: number) => void;
   loadAllowedModelChecker?: UserChatBridgeDeps["loadAllowedModelChecker"];
   loadMasterSessionMessages?: UserChatBridgeDeps["loadMasterSessionMessages"];
@@ -115,6 +116,7 @@ async function startRig(opts: {
     resolveContainerEndpoint: (uid) => rig.resolveImpl!(uid),
     maxPerUser: opts.maxPerUser,
     maxFrameBytes: opts.maxFrameBytes,
+    maxBufferedBytes: opts.maxBufferedBytes,
     containerConnectTimeoutMs: 1500,
     markContainerActivity: opts.markContainerActivity,
     loadAllowedModelChecker: opts.loadAllowedModelChecker,
@@ -3092,6 +3094,15 @@ describe("Cursor external authority regression tripwire", () => {
     assert.match(cursorBranch, /isCursorContainerOnSelfHost/);
     assert.match(cursorBranch, /INSERT INTO cursor_external_usage_audit/);
     assert.match(cursorBranch, /peerCapture, modelCapture/);
+    assert.match(cursorBranch, /cursorTurnIdentity/);
+    assert.match(
+      cursorBranch,
+      /sendErrorFrame\(userWs, 'CURSOR_UNAVAILABLE', 'Cursor requires the account-owned local runtime', cursorTurnIdentity\)/,
+    );
+    assert.match(
+      cursorBranch,
+      /sendErrorFrame\(userWs, 'UNAUTHORIZED_MODEL', 'Cursor is not enabled for this account', cursorTurnIdentity\)/,
+    );
     assert.match(source, /settleCursorExternalUsage/);
   });
 
@@ -3524,6 +3535,18 @@ describe("userChatBridge — session-scoped live frame fan-out", () => {
 });
 
 describe("userChatBridge — hello live-frame catch-up", () => {
+  test("catch-up send path reuses bufferedAmount backpressure and does not cleanup the bridge", async () => {
+    const source = await readFile(new URL("../ws/userChatBridge.ts", import.meta.url), "utf8");
+    const start = source.indexOf("if (liveCatchupSessions.length > 0 && deps.pgPool)");
+    const end = source.indexOf("Fall through to forwardInboundFrame below", start);
+    assert.notEqual(start, -1);
+    const block = source.slice(start, end);
+    assert.match(block, /liveCatchupSendDecision/);
+    assert.match(block, /CLOSE_BRIDGE\.TOO_BIG/);
+    assert.match(block, /maxBytes:/);
+    assert.doesNotMatch(block, /cleanup\("/);
+  });
+
   test("hello catches up open-dispatch live frames from PG when ring is empty", async () => {
     const portRef = { p: 0 };
     const catchupFrame = {
@@ -3549,7 +3572,7 @@ describe("userChatBridge — hello live-frame catch-up", () => {
             rowCount: 1,
           };
         }
-        return innerQuery(sql, params);
+        return innerQuery(text, params);
       },
     } as UserChatBridgeDeps["pgPool"];
     const rig = await startRig({
@@ -3599,7 +3622,7 @@ describe("userChatBridge — hello live-frame catch-up", () => {
           sessions.push(String(params?.[1] ?? ""));
           return { rows: [], rowCount: 0 };
         }
-        return innerQuery(sql, params);
+        return innerQuery(text, params);
       },
     } as UserChatBridgeDeps["pgPool"];
     const rig = await startRig({

@@ -288,11 +288,38 @@ export async function persistGatewayLiveFrame(
   });
 }
 
+/** Hello catch-up byte budget. Matches fan-out `DEFAULT_MAX_BUFFERED_BYTES`. */
+export const HELLO_LIVE_CATCHUP_MAX_BYTES = 4 * 1024 * 1024;
+const WS_OPEN = 1;
+
 export interface ReadOpenDispatchLiveFramePayloadsInput {
   uid: bigint;
   sessionId: string;
   afterFrameSeq: number;
   limit?: number;
+  /** Cumulative payload-byte cap for this reconnect. Defaults to 4 MiB. */
+  maxBytes?: number;
+}
+
+/**
+ * Decide whether this reconnect WS can take one more catch-up payload.
+ * `backpressure` means close only this socket and stop this catch-up —
+ * never tear down the rest of the bridge.
+ */
+export function liveCatchupSendDecision(
+  readyState: number,
+  bufferedAmount: number,
+  payloadBytes: number,
+  maxBufferedBytes: number,
+): "send" | "stop" | "backpressure" {
+  if (readyState !== WS_OPEN) return "stop";
+  const payload = Number.isSafeInteger(payloadBytes) && payloadBytes >= 0 ? payloadBytes : 0;
+  const buffered = Number.isSafeInteger(bufferedAmount) && bufferedAmount >= 0 ? bufferedAmount : 0;
+  const budget = Number.isSafeInteger(maxBufferedBytes) && maxBufferedBytes > 0
+    ? maxBufferedBytes
+    : HELLO_LIVE_CATCHUP_MAX_BYTES;
+  if (buffered + payload > budget) return "backpressure";
+  return "send";
 }
 
 /**
@@ -312,27 +339,46 @@ export async function readOpenDispatchLiveFramePayloadsAfterSeq(
   const limit = Number.isSafeInteger(input.limit)
     ? Math.max(1, Math.min(500, Math.trunc(input.limit as number)))
     : 500;
+  const maxBytes = Number.isSafeInteger(input.maxBytes) && (input.maxBytes as number) > 0
+    ? Math.trunc(input.maxBytes as number)
+    : HELLO_LIVE_CATCHUP_MAX_BYTES;
   const sessionUserId = `c:${input.uid.toString()}`;
+  // Metadata CTE reads octet_length only so a 500-row LIMIT cannot materialize
+  // hundreds of MiB of payload. The join-back then loads payload for rows whose
+  // *previous* cumulative bytes still sit under the budget (first row always
+  // included so send-side backpressure can close this reconnect WS).
   const res = await q.query<{ payload: Buffer }>(
-    `SELECT f.payload
-       FROM client_session_live_streams s
-       JOIN client_session_live_frames f ON f.stream_key = s.stream_key
-      WHERE s.session_id = $2
-        AND s.user_id = $3
-        AND s.projection_source = 'live'
-        AND EXISTS (
-          SELECT 1
-            FROM turn_dispatches d
-           WHERE d.user_id = $1
-             AND d.session_id = s.session_id
-             AND d.status IN ('accepted', 'admitted')
-             AND d.terminal_at IS NULL
-             AND s.stream_key LIKE 'dispatch:' || d.dispatch_id::text || ':%'
-        )
-        AND f.frame_seq > $4
-      ORDER BY f.frame_seq ASC
-      LIMIT $5`,
-    [input.uid.toString(), input.sessionId, sessionUserId, after, limit],
+    `WITH candidates AS (
+       SELECT f.stream_key, f.frame_seq, octet_length(f.payload) AS nbytes
+         FROM client_session_live_streams s
+         JOIN client_session_live_frames f ON f.stream_key = s.stream_key
+        WHERE s.session_id = $2
+          AND s.user_id = $3
+          AND s.projection_source = 'live'
+          AND EXISTS (
+            SELECT 1
+              FROM turn_dispatches d
+             WHERE d.user_id = $1
+               AND d.session_id = s.session_id
+               AND d.status IN ('accepted', 'admitted')
+               AND d.terminal_at IS NULL
+               AND s.stream_key LIKE 'dispatch:' || d.dispatch_id::text || ':%'
+          )
+          AND f.frame_seq > $4
+        ORDER BY f.frame_seq ASC
+        LIMIT $5
+     ), picked AS (
+       SELECT stream_key, frame_seq, nbytes,
+              SUM(nbytes) OVER (ORDER BY frame_seq ASC) AS cum_bytes
+         FROM candidates
+     )
+     SELECT f.payload
+       FROM picked p
+       JOIN client_session_live_frames f
+         ON f.stream_key = p.stream_key AND f.frame_seq = p.frame_seq
+      WHERE p.cum_bytes - p.nbytes < $6
+      ORDER BY p.frame_seq ASC`,
+    [input.uid.toString(), input.sessionId, sessionUserId, after, limit, maxBytes],
   );
   return res.rows.map((row) => Buffer.from(row.payload).toString("utf8"));
 }

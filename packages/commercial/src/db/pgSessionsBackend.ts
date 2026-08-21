@@ -10,7 +10,7 @@
 // (漏一个 / 签名不符 = 编译错)。业务决策(merge/seq/spill/usage-patch/delegate 累加)**全部
 // 复用** @openclaude/storage 导出的引擎中立纯函数(planSpillOverflow / planAppendServerAuthored /
 // mergePreservingServerAuthored / normalizeAndAssignSeqs / appendServerAuthoredPure /
-// _stripClientPutMessages),本文件**只做 PG 执行**:取锁 → 读行 → 调 plan → 按变更集落 SQL。
+// planReplaceServerAuthoredKeepingOrderSlots / _stripClientPutMessages),本文件**只做 PG 执行**:取锁 → 读行 → 调 plan → 按变更集落 SQL。
 // 双 backend 不各养一份业务逻辑(RFC D6b 防漂移)。
 //
 // ── 并发正确性核心(RFC D3;本迁移的正确性所在)──────────────────────────────
@@ -174,6 +174,7 @@ import {
   toLastMessagePreview,
   planAppendServerAuthored,
   planAppendServerAuthoredBatch,
+  planReplaceServerAuthoredKeepingOrderSlots,
   planCostPatch,
   planDelegateCostMerge,
   planSpillOverflow,
@@ -8396,14 +8397,14 @@ export function createPgSessionsBackend(
         // is not part of this atomic finalize operation.
         const preUpgradeMessages = existingMessages;
         const recordIds = new Set(allRecordIds);
-        existingMessages = existingMessages.filter(
-          (message) =>
-            message?._turnTapeId !== request.tapeId &&
-            (typeof message?.id !== "string" || !recordIds.has(message.id)),
-        );
-        const plan = planAppendServerAuthoredBatch(
-          existingMessages,
+        const removePhaseAOrLegacy = (message: MessageLike): boolean =>
+          message?._turnTapeId === request.tapeId ||
+          (typeof message?.id === "string" && recordIds.has(message.id));
+        existingMessages = existingMessages.filter((message) => !removePhaseAOrLegacy(message));
+        const plan = planReplaceServerAuthoredKeepingOrderSlots(
+          preUpgradeMessages,
           anchors,
+          removePhaseAOrLegacy,
           typeof session.next_seq === "number" && session.next_seq > 0 ? session.next_seq : 1,
           bigIntNumOr(session.archived_through_seq, 0),
         );

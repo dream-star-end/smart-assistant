@@ -9,7 +9,15 @@ import { readFile } from 'node:fs/promises'
 import { describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 
-import { readOpenDispatchLiveFramePayloadsAfterSeq } from '../db/liveTurnFrames.js'
+import type { Pool } from 'pg'
+
+import {
+  HELLO_LIVE_CATCHUP_MAX_BYTES,
+  liveCatchupSendDecision,
+  readOpenDispatchLiveFramePayloadsAfterSeq,
+} from '../db/liveTurnFrames.js'
+
+type CatchupQuery = Pick<Pool, 'query'>
 
 describe('readOpenDispatchLiveFramePayloadsAfterSeq', () => {
   test('queries only this uid+session open dispatch after the client cursor', async () => {
@@ -24,7 +32,7 @@ describe('readOpenDispatchLiveFramePayloadsAfterSeq', () => {
           rowCount: 1,
         }
       },
-    }
+    } as unknown as CatchupQuery
     const out = await readOpenDispatchLiveFramePayloadsAfterSeq(q, {
       uid: 3n,
       sessionId: 'sess-a',
@@ -42,6 +50,30 @@ describe('readOpenDispatchLiveFramePayloadsAfterSeq', () => {
     assert.deepEqual(out, ['{"type":"outbound.message","frameSeq":4}'])
   })
 
+  test('caps catch-up by cumulative payload bytes, not only row count', async () => {
+    let sql = ''
+    let params: unknown[] = []
+    const q = {
+      async query(text: string, p: unknown[]) {
+        sql = text
+        params = p
+        return { rows: [], rowCount: 0 }
+      },
+    } as unknown as CatchupQuery
+    await readOpenDispatchLiveFramePayloadsAfterSeq(q, {
+      uid: 3n,
+      sessionId: 'sess-a',
+      afterFrameSeq: 0,
+      maxBytes: 4096,
+    })
+    assert.match(sql, /octet_length\(f\.payload\)/)
+    assert.match(sql, /cum_bytes/)
+    assert.match(sql, /p\.cum_bytes - p\.nbytes < \$6/)
+    assert.equal(params[3], 0)
+    assert.equal(params[4], 500)
+    assert.equal(params[5], 4096)
+  })
+
   test('missing cursor starts from the stream head', async () => {
     let params: unknown[] = []
     const q = {
@@ -49,7 +81,7 @@ describe('readOpenDispatchLiveFramePayloadsAfterSeq', () => {
         params = p
         return { rows: [], rowCount: 0 }
       },
-    }
+    } as unknown as CatchupQuery
     await readOpenDispatchLiveFramePayloadsAfterSeq(q, {
       uid: 3n,
       sessionId: 'sess-a',
@@ -57,6 +89,20 @@ describe('readOpenDispatchLiveFramePayloadsAfterSeq', () => {
     })
     assert.equal(params[3], 0)
     assert.equal(params[4], 500)
+    assert.equal(params[5], HELLO_LIVE_CATCHUP_MAX_BYTES)
+  })
+})
+
+describe('liveCatchupSendDecision', () => {
+  test('reuses the 4 MiB bufferedAmount gate and isolates backpressure to this reconnect', () => {
+    assert.equal(liveCatchupSendDecision(1, 0, 16, HELLO_LIVE_CATCHUP_MAX_BYTES), 'send')
+    assert.equal(
+      liveCatchupSendDecision(1, HELLO_LIVE_CATCHUP_MAX_BYTES, 1, HELLO_LIVE_CATCHUP_MAX_BYTES),
+      'backpressure',
+    )
+    assert.equal(liveCatchupSendDecision(1, 0, 448 * 1024 * 1024, 4 * 1024 * 1024), 'backpressure')
+    assert.equal(liveCatchupSendDecision(1, Number.NaN, 448 * 1024 * 1024, 64), 'backpressure')
+    assert.equal(liveCatchupSendDecision(3, 0, 16, HELLO_LIVE_CATCHUP_MAX_BYTES), 'stop')
   })
 })
 
