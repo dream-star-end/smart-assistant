@@ -273,7 +273,7 @@ describe('② flag 开 + catalog 可用 → engine/model 取投影', () => {
       kind: 'turn',
     })
     // agent 自身 deepseek 仍可用，所以显式/默认 glm 不可用后先尊重 agent 默认。
-    assert.equal(d.canonicalModel, 'deepseek-v4-pro')
+    assert.equal(d.canonicalModel, 'deepseek-v4-flash')
   })
 
   test('agent 默认也不可用时按 glm → MiniMax → DeepSeek Flash 多级路由', () => {
