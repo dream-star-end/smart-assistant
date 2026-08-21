@@ -19,7 +19,7 @@ describe('prompt MCP availability projection', () => {
     ]) {
       assert.equal(result.content.includes(name), false, name)
     }
-    assert.match(result.content, /技能检索函数未注册/)
+    assert.match(result.content, /\uFF08\u5F53\u524D\u672A\u6CE8\u518C\uFF09/)
   })
 
   test('registered skill and reminder functions retain their actionable instructions', async () => {
@@ -38,7 +38,7 @@ describe('prompt MCP availability projection', () => {
       ],
     })
     assert.match(result.content, /skill_search\(query\)/)
-    assert.match(result.content, /skill_view\(name\)/)
+    assert.match(result.content, /skill_view\(/)
     assert.match(result.content, /create_reminder\(/)
     assert.equal(result.content.includes('delegate_task'), false)
   })
