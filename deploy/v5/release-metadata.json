@@ -122,7 +122,8 @@
     "0241_raise_last_read_watermark",
     "0242_zcode_platform_capabilities",
     "0243_live_unit_checkpoints",
-    "0244_tutorial_snapshots"
+    "0244_tutorial_snapshots",
+    "0245_gpt56_family_half_xn"
   ],
   "capabilities": [
     "sessions-store-pg-v1",
