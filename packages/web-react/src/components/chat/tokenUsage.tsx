@@ -76,8 +76,10 @@ export function addTokenUsage(
 }
 
 function finalUsageFromChildren(children: ChildBlock[] | undefined): TurnTokenUsageSnapshot[] {
+  if (!Array.isArray(children)) return [];
   const out: TurnTokenUsageSnapshot[] = [];
-  for (const child of children ?? []) {
+  for (const child of children) {
+    if (!child || typeof child !== "object" || Array.isArray(child)) continue;
     if (child.kind === "final" && child.meta && typeof child.meta === "object") {
       const usage = tokenUsageSnapshot(child.meta as MsgUsage);
       if (usage) out.push(usage);
@@ -90,7 +92,11 @@ function finalUsageFromChildren(children: ChildBlock[] | undefined): TurnTokenUs
 /** Live delegate snapshots win; hydrated immutable transcripts recover the
  * same aggregate from each child execution's unique final meta. */
 export function delegateTokenUsage(msg: ChatMessage): TurnTokenUsageSnapshot | undefined {
-  const live = Object.values(msg._delegateUsageByRun ?? {}).map(tokenUsageSnapshot);
+  const liveSource = msg._delegateUsageByRun && typeof msg._delegateUsageByRun === "object"
+    && !Array.isArray(msg._delegateUsageByRun)
+    ? msg._delegateUsageByRun
+    : {};
+  const live = Object.values(liveSource).map(tokenUsageSnapshot);
   if (live.length > 0) return addTokenUsage(live);
   return addTokenUsage(finalUsageFromChildren(msg.childBlocks));
 }
@@ -100,10 +106,11 @@ export function displayCallTokenUsage(
 ): DisplayTokenUsage | undefined {
   const usage = tokenUsageSnapshot(call?.usage);
   if (!usage || !call) return undefined;
+  const targets = Array.isArray(call.targetIds) ? call.targetIds : [];
   return {
     ...usage,
-    callId: call.callId,
-    shared: call.targetIds.length > 1,
+    ...(typeof call.callId === "string" && call.callId.length > 0 ? { callId: call.callId } : {}),
+    shared: targets.length > 1,
   };
 }
 
@@ -114,7 +121,11 @@ export function groupedCallTokenUsage(
 ): DisplayTokenUsage | undefined {
   const unique = new Map<string, CallTokenUsageSnapshot>();
   for (const call of calls) {
-    if (call) unique.set(call.callId, call);
+    if (!call || typeof call !== "object") continue;
+    const callId = typeof call.callId === "string" && call.callId.length > 0
+      ? call.callId
+      : `legacy:${unique.size}`;
+    unique.set(callId, call);
   }
   const usage = addTokenUsage([...unique.values()].map((call) => call.usage));
   if (!usage) return undefined;
@@ -123,8 +134,9 @@ export function groupedCallTokenUsage(
     ...usage,
     ...(onlyCall
       ? {
-          callId: onlyCall.callId,
-          shared: onlyCall.targetIds.length > 1,
+          ...(typeof onlyCall.callId === "string" && onlyCall.callId.length > 0
+            ? { callId: onlyCall.callId } : {}),
+          shared: Array.isArray(onlyCall.targetIds) && onlyCall.targetIds.length > 1,
         }
       : {}),
   };

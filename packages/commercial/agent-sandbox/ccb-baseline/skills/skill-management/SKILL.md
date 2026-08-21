@@ -89,6 +89,7 @@ claudeai.chat 容器启动时,平台通过 kernel ro bind mount 把一批基线 
 - `skill-management` — 本文件
 - `skill-search` — 如何搜索和发现合适 skill
 - `document-writing` — 常见文档写作/导出流程
+- `manage-taskboard` — 任务面板认领/推进铁律(`oc-task` + MCP `task_*`)
 
 这批 skill 在 `skill_list` 输出里标 `source=platform`,在 `skill_view` 输出顶部
 也带 `[source: platform]` 标记。**只读**:`skill_save` 传相同 name 会被拒绝

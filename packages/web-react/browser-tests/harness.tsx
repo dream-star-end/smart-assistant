@@ -92,6 +92,7 @@ declare global {
       calls: number;
       mergedPages: number;
       messageCount: number;
+      anchor: null | { key: string; top: number };
     };
     __askQuestion: { responses: unknown[] };
     __messageQuote: {
@@ -189,7 +190,7 @@ window.__scrollTimeline = {
   loading: false,
   anchor: null,
 };
-window.__archiveTimeline = { calls: 0, mergedPages: 0, messageCount: 0 };
+window.__archiveTimeline = { calls: 0, mergedPages: 0, messageCount: 0, anchor: null };
 window.__askQuestion = { responses: [] };
 window.__messageQuote = { sends: [] };
 window.__errorUxRetries = 0;
@@ -907,6 +908,7 @@ function ArchiveTimelineProbe() {
   }, [messages, scroller]);
   const loadOlder = useCallback(async () => {
     const anchor = scroller ? captureVisibleVirtualRowAnchor(scroller) : null;
+    window.__archiveTimeline.anchor = anchor ? { key: anchor.key, top: anchor.top } : null;
     window.__archiveTimeline.calls += 1;
     await new Promise((resolve) => setTimeout(resolve, 40));
     const anchored = scroller && anchor
@@ -1628,13 +1630,18 @@ createRoot(document.getElementById("codex-density-root")!).render(
             id: "density-active",
             title: "密度验收活跃会话",
             ownerUserId: DENSITY_USER.id,
+            createdAt: Date.now() - 8 * 60_000,
+            lastAt: Date.now(),
             updatedAt: new Date().toISOString(),
             messageCount: 3,
+            lastMessagePreview: "浏览器契约：摘要不应显示",
           },
           {
             id: "density-idle",
             title: "密度验收空闲会话",
             ownerUserId: DENSITY_USER.id,
+            createdAt: Date.now() - 8 * 60_000,
+            lastAt: Date.now(),
             updatedAt: new Date().toISOString(),
             messageCount: 1,
           },
@@ -1649,7 +1656,11 @@ createRoot(document.getElementById("codex-density-root")!).render(
         onOpenMarketplace={() => {}}
         onOpenTutorial={() => {}}
         onOpenOrg={() => {}}
+        onOpenAccount={() => {}}
+        onOpenMediaTasks={() => {}}
         showAdmin
+        theme="light"
+        onCycleTheme={() => {}}
       />
     </div>
   </StrictMode>,

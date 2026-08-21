@@ -89,6 +89,17 @@ describe('validateAgentManifest', () => {
     assert.equal(r.ok, true)
   })
 
+  it('accepts AGENT_MODEL_AUTO ("auto" = 不锁模型) even outside the allowed set', () => {
+    const r = validateAgentManifest({ ...base(), model: 'auto' }, opts)
+    assert.equal(r.ok, true)
+    if (r.ok) assert.equal(r.manifest.model, 'auto')
+  })
+
+  it('rejects case-variant "Auto" (auto is a strict literal, not a prefix)', () => {
+    assert.equal(validateAgentManifest({ ...base(), model: 'Auto' }, opts).ok, false)
+    assert.equal(validateAgentManifest({ ...base(), model: 'auto-x' }, opts).ok, false)
+  })
+
   it('requires an inline persona', () => {
     const m = base()
     m.persona = undefined

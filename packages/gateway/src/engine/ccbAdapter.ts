@@ -154,7 +154,11 @@ function toPhantomSignals(telemetry: TelemetryChannel): PhantomSignals {
   return { apiState: signals.apiState, skipReason: signals.skipReason }
 }
 
-function buildTurnSummary(result: TurnResult, telemetry: TelemetryChannel): TurnSummary {
+function buildTurnSummary(
+  result: TurnResult,
+  telemetry: TelemetryChannel,
+  nativeCompactionSummary?: string,
+): TurnSummary {
   const errorKind = classifyCcbErrorKind(result)
   const apiResp = telemetry.getTurnApiResponse()
   const lastTool = telemetry.getLastToolPreUse()
@@ -178,6 +182,7 @@ function buildTurnSummary(result: TurnResult, telemetry: TelemetryChannel): Turn
     stopReason: result.stopReason,
     numTurns: result.numTurns,
     isError: result.isError,
+    ...(nativeCompactionSummary ? { nativeCompactionSummary } : {}),
     ...(errorKind ? { errorKind } : {}),
     // 审计 R3:与 codexAdapter 对称,把 TurnResult.errorClass 复制到 TurnSummary。
     // CCB result 帧不产 errorClass(恒 undefined,不落),此处仅保证映射对称、不丢字段。
@@ -302,6 +307,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
 
   submitTurn(params: TurnParams): EngineTurnRun {
     const telemetry = new TelemetryChannel()
+    let nativeCompactionSummary: string | undefined
     let resolveSummary!: (s: TurnSummary | null) => void
     const summary = new Promise<TurnSummary | null>((res) => {
       resolveSummary = res
@@ -333,13 +339,14 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
         this._registerToolOrigin(toolUseId, ctx)
       },
       onToolResult: (result) => params.onEvent({ kind: 'tool_result_detected', result }),
+      onNativeCompactionSummary: (summaryText) => { nativeCompactionSummary = summaryText },
       onPostFinalRuntimeEvent: params.onPostTerminalRuntimeEvent,
       onFinish: (result) => {
         // parser.finish() 幂等 → onFinish 恰好一次。identity guard:只有当
         // activeTurn 仍指向本 turn 才清(防 stale end 误清后继 turn)。
         if (this._activeTurn === ctx) this._activeTurn = null
         ctx.stopLeaseRenewal?.()
-        resolveSummary(result ? buildTurnSummary(result, telemetry) : null)
+        resolveSummary(result ? buildTurnSummary(result, telemetry, nativeCompactionSummary) : null)
       },
       // CCB 成本 delta 基线:parser 直接 mutate session 引用,行为逐字节不变
       // (见 TurnParams.sessionTotals / CcbSessionTotals 注释)。

@@ -104,7 +104,7 @@ export const adminPages: AdminPage[] = [
   { key: "inbox", title: "站内信", group: "用户触达", desc: "发送、历史和触达记录", icon: Mail, Component: lz(() => import("./pages/inbox")) },
   // ── 内容运营 ──
   { key: "marketplace", title: "技能市场", group: "内容运营", desc: "审核投稿、上架和下架", icon: Store, Component: lz(() => import("./pages/marketplace")) },
-  { key: "tutorials", title: "教程共建", group: "内容运营", desc: "审核用户教程投稿，通过后立即上线", icon: BookOpen, Component: lz(() => import("./pages/tutorials")) },
+  { key: "tutorials", title: "教程工作室", group: "内容运营", desc: "审核用户教程投稿，并登记外部案例评测 / 改进罗盘", icon: BookOpen, Component: lz(() => import("./pages/tutorials")) },
   // ── 系统配置 ──
   { key: "literature", title: "文献检索", group: "系统配置", desc: "检索服务连接、配额和运行数据", icon: BookOpen, Component: lz(() => import("./pages/literature")) },
   { key: "settings", title: "系统设置", group: "系统配置", desc: "配置风险、变更预览和审计", icon: Settings, Component: lz(() => import("./pages/settings")) },

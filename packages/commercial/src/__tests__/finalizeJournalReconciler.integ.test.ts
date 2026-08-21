@@ -99,7 +99,7 @@ after(async () => {
 beforeEach(async () => {
   if (!pgAvailable) return
   await query(
-    'TRUNCATE TABLE request_finalize_journal, usage_records, credit_ledger, users RESTART IDENTITY CASCADE',
+    'TRUNCATE TABLE request_finalize_journal, usage_records, credit_ledger, users, turn_dispatches RESTART IDENTITY CASCADE',
   )
 })
 
@@ -152,14 +152,16 @@ async function insertJournal(
     precheck?: bigint
     durable?: boolean
     settlementClaimId?: string
+    gatewayExitedAt?: string
+    dispatchId?: string
   } = {},
 ): Promise<void> {
   const state = opts.state ?? 'inflight'
   const ageMs = opts.ageMs ?? 0
   const precheck = opts.precheck ?? 200n
   await query(
-    `INSERT INTO request_finalize_journal(request_id, user_id, ctx, precheck_credits, state, updated_at)
-     VALUES ($1, $2, $3::jsonb, $4, $5, NOW() - ($6::bigint * INTERVAL '1 millisecond'))`,
+    `INSERT INTO request_finalize_journal(request_id, user_id, ctx, precheck_credits, state, updated_at, dispatch_id)
+     VALUES ($1, $2, $3::jsonb, $4, $5, NOW() - ($6::bigint * INTERVAL '1 millisecond'), $7)`,
     [
       requestId,
       userId.toString(),
@@ -167,10 +169,12 @@ async function insertJournal(
         model: 'claude-x',
         ...(opts.durable ? { durableBillingRecovery: DURABLE_CODEX_RECOVERY_VERSION } : {}),
         ...(opts.settlementClaimId ? { settlementClaimId: opts.settlementClaimId } : {}),
+        ...(opts.gatewayExitedAt ? { gatewayExitedAt: opts.gatewayExitedAt } : {}),
       }),
       precheck.toString(),
       state,
       String(ageMs),
+      opts.dispatchId ?? null,
     ],
   )
 }
@@ -418,6 +422,65 @@ describe('reconcileStuckFinalizeJournal (integ)', () => {
     assert.equal(res.durableWaived, 0)
     assert.equal((await getJournal('r5'))?.state, 'committed')
     assert.equal((await getJournal('r6'))?.state, 'aborted')
+  })
+})
+
+describe('reconcileStuckFinalizeJournal — carrier-death fast path', () => {
+  test('fresh inflight + usage + gatewayExitedAt → 立即 committed(不必等 30min)', async (t) => {
+    if (skipIfNoPg(t)) return
+    const userId = await createUser('fast-commit@t.co')
+    const requestId = 'fast-commit-1'
+    const ledgerId = await insertLedger(userId, -100n)
+    await insertUsage(userId, requestId, { ledgerId })
+    await insertJournal(requestId, userId, {
+      ageMs: FRESH_MS,
+      gatewayExitedAt: '2026-08-16T10:23:58.000Z',
+    })
+    const res = await reconcileStuckFinalizeJournal(THRESHOLD_MS)
+    assert.equal(res.committed, 1)
+    assert.equal(res.aborted, 0)
+    const row = await getJournal(requestId)
+    assert.equal(row?.state, 'committed')
+  })
+
+  test('fresh inflight + 无 usage + gatewayExitedAt + 无 accepted dispatch → aborted', async (t) => {
+    if (skipIfNoPg(t)) return
+    const userId = await createUser('fast-abort@t.co')
+    const requestId = 'fast-abort-1'
+    await insertJournal(requestId, userId, {
+      ageMs: FRESH_MS,
+      gatewayExitedAt: '2026-08-16T10:23:58.000Z',
+    })
+    const res = await reconcileStuckFinalizeJournal(THRESHOLD_MS)
+    assert.equal(res.aborted, 1)
+    assert.equal(res.committed, 0)
+    const row = await getJournal(requestId)
+    assert.equal(row?.state, 'aborted')
+  })
+
+  test('fresh inflight + gatewayExitedAt + accepted dispatch → 不动(引擎可能仍活)', async (t) => {
+    if (skipIfNoPg(t)) return
+    const userId = await createUser('fast-keep-accepted@t.co')
+    const requestId = 'fast-keep-1'
+    const dispatchId = '11111111-1111-1111-1111-111111111111'
+    await query(
+      `INSERT INTO turn_dispatches(
+         dispatch_id, user_id, session_id, client_message_id, agent_id,
+         request_hash, billing_request_id, status, admitted_at, accepted_at)
+       VALUES ($1, $2, 'sess-keep', 'cm-keep', 'main',
+         'hash-keep', 'br-keep', 'accepted', NOW(), NOW())`,
+      [dispatchId, userId.toString()],
+    )
+    await insertJournal(requestId, userId, {
+      ageMs: FRESH_MS,
+      gatewayExitedAt: '2026-08-16T10:23:58.000Z',
+      dispatchId,
+    })
+    const res = await reconcileStuckFinalizeJournal(THRESHOLD_MS)
+    assert.equal(res.aborted, 0)
+    assert.equal(res.committed, 0)
+    const row = await getJournal(requestId)
+    assert.equal(row?.state, 'inflight')
   })
 })
 

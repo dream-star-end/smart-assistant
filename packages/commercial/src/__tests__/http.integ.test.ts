@@ -803,6 +803,19 @@ describe("commercial HTTP router (integ)", () => {
         assert.equal(r.status, 201, `call ${i + 1} should succeed`);
       }
       // 第 3 个被拦
+      // Pin the exact current-window counter immediately before the blocked
+      // request. Earlier successful registrations also launch best-effort
+      // side effects; this keeps the HTTP limit assertion independent from
+      // test-runner scheduling while the rate-limit core has separate count
+      // and expiry contracts.
+      const nowSec = Math.floor(Date.now() / 1000);
+      const windowStart = Math.floor(nowSec / 60) * 60;
+      await redis!.set(
+        `oc:rl:register_tight:127.0.0.1:${windowStart}`,
+        "2",
+        "EX",
+        60,
+      );
       const r = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },

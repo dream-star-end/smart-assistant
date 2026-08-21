@@ -190,6 +190,8 @@ export async function authorizeProxyIdentity(
       role: authz.role,
       grantedModelIds: authz.grantedModelIds,
       deniedModelIds: authz.deniedModelIds,
+      userPlanTier: authz.userPlanTier ?? null,
+      orgPlanCode: authz.orgPlanCode ?? null,
       modelId: model,
     },
   );

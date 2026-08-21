@@ -205,7 +205,7 @@ export function MissionReplay({
         <div className="flex flex-wrap items-end justify-between gap-4">
           <div>
             <p className="text-caption font-semibold text-accent">
-              任务观察整理 · {kind === 'research' ? '科研分析' : '代码修复'} · 非逐帧运行回放
+              示意步骤 · 非真实轨迹 · {kind === 'research' ? '科研分析' : '代码修复'}
             </p>
             <h1 className="mt-2 max-w-4xl text-2xl font-bold tracking-tight text-fg sm:text-3xl">
               你不用守着它。回来时，过程和成果都还在。
@@ -350,7 +350,7 @@ export function MissionReplay({
         <div>
           <p className="text-meta font-medium text-fg">当前阶段：{active.label}</p>
           <p className="mt-1 text-caption text-faint">
-            阶段按一次任务的观察证据整理，并非逐帧公开回放；后台继续、断线恢复和过程持久化是平台能力。
+            以上为示意步骤，并非真实会话轨迹；后台继续、断线恢复和过程持久化是平台能力。
           </p>
         </div>
         <div className="flex flex-col-reverse gap-2 sm:flex-row">

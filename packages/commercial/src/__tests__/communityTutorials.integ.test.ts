@@ -19,7 +19,16 @@ const db = useDedicatedTestDatabase('openclaude_community_tutorials_test')
 
 beforeEach(async () => {
   if (!db.available) return
-  await truncateAllForTest(['community_tutorials', 'admin_audit', 'users'])
+  await truncateAllForTest([
+    'tutorial_compass_notes',
+    'tutorial_eval_jobs',
+    'tutorial_blob_refs',
+    'tutorial_blobs',
+    'tutorial_case_specs',
+    'community_tutorials',
+    'admin_audit',
+    'users',
+  ])
 })
 
 async function createUser(
@@ -82,10 +91,14 @@ describe('community tutorials', () => {
       title: draft().title,
       summary: draft().summary,
       category: draft().category,
+      kind: 'markdown',
       authorName: '小明',
       publishedAt: reviewed.publishedAt,
     })
     const detail = await getPublishedCommunityTutorial(submitted.id)
+    assert.equal(detail?.kind, 'markdown')
+    assert.equal(detail?.snapshot, null)
+    assert.deepEqual(detail?.refs, [])
     assert.equal(detail?.bodyMarkdown, draft().bodyMarkdown)
     assert.equal(JSON.stringify(detail).includes('author@example.com'), false)
   })
@@ -144,7 +157,6 @@ describe('community tutorials', () => {
       decision: 'approve',
       note: null,
     })
-    await expectTutorialError(() => withdrawCommunityTutorial(approved.id, author), 'NOT_PENDING')
     await expectTutorialError(
       () =>
         reviewCommunityTutorial({
@@ -167,6 +179,13 @@ describe('community tutorials', () => {
     assert.equal(state.rows[0]?.status, 'approved')
     assert.equal(state.rows[0]?.reviewed_by, admin)
     assert.equal(state.rows[0]?.published_at.toISOString(), firstReview.publishedAt)
+    await withdrawCommunityTutorial(approved.id, author)
+    const withdrawnApproved = await query<{ status: string; published_at: Date | null }>(
+      `SELECT status, published_at FROM community_tutorials WHERE id = $1::bigint`,
+      [approved.id],
+    )
+    assert.equal(withdrawnApproved.rows[0]?.status, 'withdrawn')
+    assert.equal(withdrawnApproved.rows[0]?.published_at, null)
   })
 
   test('公开、我的投稿与待审队列 keyset 分页无遗漏', async (t) => {

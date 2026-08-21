@@ -1,0 +1,7 @@
+npm package zcode-cli@0.15.0: ETARGET (registry only publishes 0.0.1 stub).
+npm package zcode@0.0.1: reserved / coming soon. Do not install as the engine.
+Live 0.15.0 artifact: official desktop AppImage 3.2.2
+  url=https://cdn-zcode.z.ai/zcode/electron/releases/3.2.2/ZCode-3.2.2-linux-x64.AppImage
+  sha256=40bf72d8a086b4dddf1d9d0866001a6a0f547f84475c4d05ac58be3a177c0b3d
+  extracted=resources/glm/zcode.cjs
+  --version=0.15.0

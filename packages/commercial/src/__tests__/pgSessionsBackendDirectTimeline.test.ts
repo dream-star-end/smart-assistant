@@ -129,7 +129,7 @@ test("finite model context reads immutable semantic sidecars including exact Bas
         return { rows: [{ messages: JSON.stringify([completeTapeAnchor()]), archived_through_seq: 0 }] };
       }
       if (sql.includes("SELECT tape_sha256,model_record_count")) {
-        return { rows: [{ tape_sha256: "a".repeat(64), model_record_count: 2 }] };
+        return { rows: [{ tape_sha256: "a".repeat(64), model_record_count: 2, finalized_at: "1" }] };
       }
       if (sql.includes("ORDER BY physical_ordinal DESC,logical_ordinal DESC")) {
         return { rows: [
@@ -187,7 +187,7 @@ test("CCB finite rebuild budgets dense ASCII by UTF-8 worst case without changin
         return { rows: [{ messages: JSON.stringify([completeTapeAnchor()]), archived_through_seq: 0 }] };
       }
       if (sql.includes("SELECT tape_sha256,model_record_count")) {
-        return { rows: [{ tape_sha256: "a".repeat(64), model_record_count: rows.length }] };
+        return { rows: [{ tape_sha256: "a".repeat(64), model_record_count: rows.length, finalized_at: "1" }] };
       }
       if (sql.includes("ORDER BY physical_ordinal DESC,logical_ordinal DESC")) return { rows };
       if (sql.includes("SELECT right(semantic_text")) {
@@ -233,7 +233,7 @@ test("finite rebuild sanitizes a complete legacy Base64 sidecar before model inj
         return { rows: [{ messages: JSON.stringify([completeTapeAnchor()]), archived_through_seq: 0 }] };
       }
       if (sql.includes("SELECT tape_sha256,model_record_count")) {
-        return { rows: [{ tape_sha256: "a".repeat(64), model_record_count: 1 }] };
+        return { rows: [{ tape_sha256: "a".repeat(64), model_record_count: 1, finalized_at: "1" }] };
       }
       if (sql.includes("ORDER BY physical_ordinal DESC,logical_ordinal DESC")) {
         return { rows: [{
@@ -275,7 +275,7 @@ test("finite model context selects a Unicode-safe SQL suffix without loading a g
         return { rows: [{ messages: JSON.stringify([completeTapeAnchor()]), archived_through_seq: 0 }] };
       }
       if (sql.includes("SELECT tape_sha256,model_record_count")) {
-        return { rows: [{ tape_sha256: "a".repeat(64), model_record_count: 1 }] };
+        return { rows: [{ tape_sha256: "a".repeat(64), model_record_count: 1, finalized_at: "1" }] };
       }
       if (sql.includes("ORDER BY physical_ordinal DESC,logical_ordinal DESC")) {
         return { rows: [{
@@ -319,7 +319,7 @@ test("finite model context pages past 128 semantic records in exact chronologica
         return { rows: [{ messages: JSON.stringify([completeTapeAnchor()]), archived_through_seq: 0 }] };
       }
       if (sql.includes("SELECT tape_sha256,model_record_count")) {
-        return { rows: [{ tape_sha256: "a".repeat(64), model_record_count: 129 }] };
+        return { rows: [{ tape_sha256: "a".repeat(64), model_record_count: 129, finalized_at: "1" }] };
       }
       if (sql.includes("ORDER BY physical_ordinal DESC,logical_ordinal DESC")) {
         metadataCalls.push(params ?? []);
@@ -385,6 +385,7 @@ test("predecessor 16k-record tape backfills only the newest physical suffix need
           tape_sha256: "a".repeat(64),
           billing_anchor_id: "tape-anchor",
           model_record_count: -1,
+          finalized_at: "1",
         }] };
       }
       if (sql.includes("SELECT ordinal,msg_id,role,content_sha256")) {
@@ -517,6 +518,7 @@ test("predecessor sparse 16k-record tape backfills in bounded pages instead of p
           tape_sha256: "a".repeat(64),
           billing_anchor_id: "tape-anchor",
           model_record_count: -1,
+          finalized_at: "1",
         }] };
       }
       if (sql.includes("SELECT ordinal,msg_id,role,content_sha256")) {

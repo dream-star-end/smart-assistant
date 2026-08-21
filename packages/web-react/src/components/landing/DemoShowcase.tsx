@@ -107,9 +107,20 @@ function TranscriptFlow({ scenario }: { scenario: TranscriptScenario }) {
  * - 滚出视口自动暂停，回来再继续；尊重 prefers-reduced-motion。
  * 纯前端动画（无任何网络请求）。
  */
-export function DemoShowcase({ onTry }: { onTry: () => void }) {
+export function DemoShowcase({
+  onTry,
+  initialScenarioId,
+}: {
+  onTry: () => void;
+  /** 落地页可优先展示更紧凑的场景；缺省仍保留历史首个真实案例。 */
+  initialScenarioId?: string;
+}) {
   const reduced = usePrefersReducedMotion();
-  const [idx, setIdx] = useState(0);
+  const initialIndex = Math.max(
+    0,
+    initialScenarioId ? DEMO_SCENARIOS.findIndex((scenario) => scenario.id === initialScenarioId) : 0,
+  );
+  const [idx, setIdx] = useState(initialIndex);
   const [stepCount, setStepCount] = useState(0); // 已完成的执行动作数
   const [typed, setTyped] = useState(0); // 已打出的答案字数
   const [done, setDone] = useState(false); // 本幕答案是否打完
@@ -117,7 +128,7 @@ export function DemoShowcase({ onTry }: { onTry: () => void }) {
   const [runSeq, setRunSeq] = useState(0); // 手动跳转/重播时自增，强制重跑当前幕
   // stepCount/typed/done 归属的场景。切场景时 idx 先变、这些进度态下一拍才在 effect 里重置，
   // 中间那一帧若直接用旧进度态配新场景，会让新场景的答案/成果面板错误闪现。以此守卫。
-  const [stateIdx, setStateIdx] = useState(0);
+  const [stateIdx, setStateIdx] = useState(initialIndex);
   // 视口可见性：滚出视口暂停动画（回来从当前幕头部继续）。
   const cardRef = useRef<HTMLDivElement | null>(null);
   const [visible, setVisible] = useState(false);

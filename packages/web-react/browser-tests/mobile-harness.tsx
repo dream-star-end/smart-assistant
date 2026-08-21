@@ -19,14 +19,15 @@
 // 得让 App 把聊天页外壳抽成可挂载组件,那是另一档改动(见交付说明的 followups)。
 //
 // stub 原则同主 harness:只 stub 网络/宿主副作用,不 stub 任何 UI 结构。
-import { StrictMode, useState } from "react";
+import { StrictMode, useCallback, useLayoutEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { ChatHeader } from "../src/components/ChatHeader";
 import { Composer } from "../src/components/Composer";
 import { MessageList } from "../src/components/MessageRenderer";
+import { createStickToBottomController } from "../src/components/chat/stickToBottom";
 import type { Agent } from "../src/lib/agents";
-import type { ChatMessage } from "../src/lib/chat/model";
 import type { MediaRef } from "../src/lib/chat/frames";
+import type { ChatMessage } from "../src/lib/chat/model";
 
 declare global {
   interface Window {
@@ -34,11 +35,20 @@ declare global {
     __mobilePage: {
       navOpens: number;
       sends: Array<{ text: string; mediaCount: number }>;
+      following: boolean;
+      armSticky: () => void;
+      growTimeline: () => void;
     };
   }
 }
 
-window.__mobilePage = { navOpens: 0, sends: [] };
+window.__mobilePage = {
+  navOpens: 0,
+  sends: [],
+  following: true,
+  armSticky: () => {},
+  growTimeline: () => {},
+};
 
 // 宽内容样本:每一条都是线上真实出现过的形态,且都是移动端最容易被裁的东西。
 const LONG_URL =
@@ -108,7 +118,36 @@ const MOBILE_MODELS = [
 
 function MobileChatPage() {
   const [scroller, setScroller] = useState<HTMLDivElement | null>(null);
+  const [growCount, setGrowCount] = useState(0);
   const [modelId, setModelId] = useState(MOBILE_MODELS[0].id);
+  const stick = useRef(createStickToBottomController()).current;
+  const syncFollowing = useCallback(() => {
+    window.__mobilePage.following = stick.following.current;
+  }, [stick]);
+  window.__mobilePage.armSticky = () => {
+    if (!scroller) return;
+    stick.scrollToBottom(scroller);
+    syncFollowing();
+  };
+  window.__mobilePage.growTimeline = () => setGrowCount((value) => value + 1);
+  useLayoutEffect(() => {
+    if (!scroller) return;
+    stick.reset();
+    stick.scrollToBottom(scroller);
+    syncFollowing();
+  }, [scroller, stick, syncFollowing]);
+  const messages = [
+    ...MOBILE_MESSAGES,
+    ...Array.from({ length: growCount }, (_, index): ChatMessage => ({
+      id: `mobile-grow-${index}`,
+      role: "assistant",
+      text: Array.from(
+        { length: 36 },
+        (__, line) => `MOBILE_GROW_${index}_${line} 触控滚动高度增长回归样本。`,
+      ).join("\n\n"),
+      ts: 100 + index,
+    })),
+  ];
   // 与 App.tsx 聊天页外壳同构(safe-px 外层 → main → header → 滚动区 → 发送区)。
   return (
     <div className="flex h-full min-h-0 overflow-hidden bg-bg text-fg safe-px">
@@ -126,23 +165,30 @@ function MobileChatPage() {
             window.__mobilePage.navOpens += 1;
           }}
           onOpenInbox={() => {}}
-          onOpenTutorial={() => {}}
           unreadCount={3}
-          theme="dark"
-          onCycleTheme={() => {}}
         />
         <div
           ref={setScroller}
+          onScroll={(event) => {
+            stick.onScroll(event.currentTarget);
+            syncFollowing();
+          }}
+          onWheel={() => stick.markUserIntent()}
+          onTouchStart={() => stick.markUserIntent()}
+          onTouchMove={() => stick.markUserIntent()}
+          onPointerDown={() => stick.markUserIntent()}
+          onKeyDown={() => stick.markUserIntent()}
           data-testid="mobile-chat-scroll"
           className="chat-scroll-area min-h-0 flex-1 overflow-y-auto overflow-x-hidden"
         >
           <MessageList
-            messages={MOBILE_MESSAGES}
+            messages={messages}
             sending={false}
             cb={{}}
             onRespondPermission={() => {}}
             scrollParent={scroller}
             historyGeneration="mobile-page"
+            followBottomRef={stick.following}
           />
         </div>
         <div className="shrink-0 composer-safe-b">

@@ -566,6 +566,8 @@ export interface MasterTapeStateResult {
   tapeStatus?: TapeStatus
   /** Required when state=none; protects recovery while the master dispatch lease is live. */
   dispatchLeaseActive?: boolean
+  /** Optional; true means master recorded process shutdown for this dispatch. */
+  gatewayShutdownEvidence?: boolean
 }
 
 /** GET /internal/v3/turn-tape-state?dispatchId=&attemptNo= 契约客户端。 */
@@ -605,12 +607,17 @@ export async function queryMasterTapeState(
       state?: unknown
       status?: unknown
       dispatchLeaseActive?: unknown
+      gatewayShutdownEvidence?: unknown
     }
     if (parsed.state === 'none') {
       // Rolling-safe capability handshake: a new gateway talking to an old
       // master must wait, not turn missing lease evidence into negative proof.
       if (typeof parsed.dispatchLeaseActive !== 'boolean') return { state: 'unreachable' }
-      return { state: 'none', dispatchLeaseActive: parsed.dispatchLeaseActive }
+      return {
+        state: 'none',
+        dispatchLeaseActive: parsed.dispatchLeaseActive,
+        ...(parsed.gatewayShutdownEvidence === true ? { gatewayShutdownEvidence: true } : {}),
+      }
     }
     if (parsed.state === 'partial') {
       return { state: 'partial' }
@@ -925,9 +932,10 @@ async function recoverOneRow(
     return
   }
 
-  if (result.dispatchLeaseActive !== false) {
+  if (result.dispatchLeaseActive !== false && result.gatewayShutdownEvidence !== true) {
     // none + 活 lease:master 仍可能有一个刚受理/刚 accepted 的执行方,不能把
     // "尚无 tape"当作进程已死。缺字段同样 fail-closed(滚动期间老 master)。
+    // 有停机证据时允许合成:accepted 租约本就不续,lease_until 残留不能挡 SERVICE_RESTART。
     stats.recoveryPending++
     if (result.dispatchLeaseActive === true) stats.leaseDeferred++
     return

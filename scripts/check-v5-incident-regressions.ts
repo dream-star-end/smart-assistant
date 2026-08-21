@@ -349,6 +349,15 @@ function parseWaivers(): Map<string, Waiver> {
   return out;
 }
 
+// Exact historical import fence. The selfhost branch used a different release
+// discipline and already shipped these immutable commits before commercial
+// synchronization, so retroactively requiring trailers would force a history
+// rewrite and destroy the live source SHA. Only ancestors of this frozen tip are
+// exempt; every later/future commit remains under the normal trailer gate.
+const IMPORTED_TRAILER_HISTORY_TIPS = [
+  "7ad3910346d03f072db5b4debd9e29b43f13de30",
+] as const;
+
 function checkTrailerClosure(): number {
   const start = resolveTrailerGateStart();
   if (start === null) {
@@ -388,6 +397,23 @@ function checkTrailerClosure(): number {
   }
   const waivers = parseWaivers();
   const today = new Date().toISOString().slice(0, 10);
+  for (const tip of IMPORTED_TRAILER_HISTORY_TIPS) {
+    try {
+      git("cat-file", "-e", `${tip}^{commit}`);
+      execFileSync("git", ["merge-base", "--is-ancestor", tip, "HEAD"], { cwd: ROOT });
+    } catch {
+      fail(`冻结的 trailer import tip ${tip.slice(0, 12)} 不可达 HEAD，拒绝静默失效`);
+    }
+  }
+  const isFrozenImportedCommit = (sha: string): boolean =>
+    IMPORTED_TRAILER_HISTORY_TIPS.some((tip) => {
+      try {
+        execFileSync("git", ["merge-base", "--is-ancestor", sha, tip], { cwd: ROOT });
+        return true;
+      } catch {
+        return false;
+      }
+    });
   // 拓扑范围不够:CI 检出的是 PR 的 **merge ref**(base + head 的合并态),于是 base 侧
   // 在本 PR 排队期间新合入的 commit 与 head 侧的锚点 commit 是并行两支 —— 它们不是锚点
   // 的祖先,`start..HEAD` 会把它们一并捞进来,门于是拦住别人的提交(2026-07-26 实测拦到
@@ -400,6 +426,7 @@ function checkTrailerClosure(): number {
     const [sha, subject, body = "", committedAt = ""] = entry.split("\x1f");
     // 并行合入的旧提交:锚点之后(拓扑)但早于锚点(时间)→ 门当时还不存在,不判。
     if (Number.isFinite(anchorTs) && Number(committedAt) < anchorTs) continue;
+    if (isFrozenImportedCommit(sha)) continue;
     if (!/^fix\(v5\)/.test(subject)) continue;
     const touched = commitFiles(sha);
     if (!touched.some((file) => TRAILER_GATE_SURFACES.some((prefix) => file.startsWith(prefix)))) continue;

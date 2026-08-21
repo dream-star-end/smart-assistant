@@ -1,5 +1,5 @@
 /**
- * Codex app-server 0.144.0 turn/steer compatibility evidence.
+ * Codex app-server 0.149.0 turn/steer + requestUserInput compatibility evidence.
  *
  * The JSON fixture payloads are direct outputs from:
  *   codex app-server generate-json-schema --experimental --out <dir>
@@ -23,7 +23,7 @@ import { Value } from '@sinclair/typebox/value'
 
 type JsonObject = Record<string, unknown>
 
-const fixtureRoot = new URL('./fixtures/codex-app-server-0.144.0/', import.meta.url)
+const fixtureRoot = new URL('./fixtures/codex-app-server-0.149.0/', import.meta.url)
 
 function readFixture(name: string): { raw: Buffer; json: JsonObject } {
   const raw = readFileSync(new URL(name, fixtureRoot))
@@ -50,20 +50,22 @@ function sha256(raw: Buffer): string {
 const manifestFixture = readFixture('manifest.json')
 const paramsFixture = readFixture('TurnSteerParams.json')
 const responseFixture = readFixture('TurnSteerResponse.json')
+const userInputParamsFixture = readFixture('ToolRequestUserInputParams.json')
+const userInputResponseFixture = readFixture('ToolRequestUserInputResponse.json')
 
-describe('Codex 0.144.0 turn/steer generated schema fixture', () => {
+describe('Codex 0.149.0 generated schema fixture', () => {
   it('pins the binary coordinate, generation command and byte snapshots', () => {
     const manifest = manifestFixture.json
-    assert.equal(manifest.codexVersion, '0.144.0')
+    assert.equal(manifest.codexVersion, '0.149.0')
     assert.equal(
       manifest.binaryPath,
-      '/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex',
+      '/opt/openclaude/tmp/codex-0149/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex',
     )
     assert.equal(
       manifest.binarySha256,
-      '901923c1808a151f6926d41d703c17ad48815662cefb1c8d832a052c44271429',
+      'bbc3341e44c9ead340ed9570c17be936e37870f570751a941699ffd04d672827',
     )
-    assert.equal(manifest.method, 'turn/steer')
+    assert.deepEqual(manifest.methods, ['turn/steer', 'item/tool/requestUserInput'])
     assert.equal(
       manifest.command,
       '<binaryPath> app-server generate-json-schema --experimental --out <outputDir>',
@@ -74,11 +76,31 @@ describe('Codex 0.144.0 turn/steer generated schema fixture', () => {
     for (const [name, fixture] of [
       ['TurnSteerParams.json', paramsFixture],
       ['TurnSteerResponse.json', responseFixture],
+      ['ToolRequestUserInputParams.json', userInputParamsFixture],
+      ['ToolRequestUserInputResponse.json', userInputResponseFixture],
     ] as const) {
       assert.equal(repositoryFiles[name], sha256(fixture.raw))
       assert.equal(fixture.raw.at(-1), 0x0a, `${name} repository fixture must end in LF`)
       assert.equal(generatedFiles[name], sha256(fixture.raw.subarray(0, -1)))
     }
+  })
+
+  it('makes isBlocking authoritative while retaining deprecated autoResolutionMs for compatibility', () => {
+    const schema = userInputParamsFixture.json
+    assert.equal(schema.title, 'ToolRequestUserInputParams')
+    assert.deepEqual(schema.required, [
+      'isBlocking',
+      'itemId',
+      'questions',
+      'threadId',
+      'turnId',
+    ])
+    const properties = object(schema.properties, 'requestUserInput.properties')
+    assert.deepEqual(object(properties.isBlocking, 'isBlocking'), { type: 'boolean' })
+    const legacyDuration = object(properties.autoResolutionMs, 'autoResolutionMs')
+    assert.deepEqual(legacyDuration.type, ['integer', 'null'])
+    assert.match(String(legacyDuration.description), /deprecated.*isBlocking/i)
+    assert.deepEqual(userInputResponseFixture.json.required, ['answers'])
   })
 
   it('requires thread/input/native expected turn and keeps client id optional nullable', () => {
@@ -118,7 +140,7 @@ describe('Codex 0.144.0 turn/steer generated schema fixture', () => {
     )
   })
 
-  it('pins the statically mappable text/image/localImage input variants', () => {
+  it('pins all 0.149 user-input variants while preserving the mapped text/image subset', () => {
     const definitions = object(paramsFixture.json.definitions, 'params.definitions')
     const userInput = object(definitions.UserInput, 'definitions.UserInput')
     const variants = array(userInput.oneOf, 'UserInput.oneOf').map((entry, index) =>
@@ -132,10 +154,20 @@ describe('Codex 0.144.0 turn/steer generated schema fixture', () => {
       }),
     )
 
-    assert.deepEqual([...byType.keys()], ['text', 'image', 'localImage', 'skill', 'mention'])
+    assert.deepEqual([...byType.keys()], [
+      'text',
+      'image',
+      'localImage',
+      'audio',
+      'localAudio',
+      'skill',
+      'mention',
+    ])
     assert.deepEqual(byType.get('text')?.required, ['text', 'type'])
     assert.deepEqual(byType.get('image')?.required, ['type', 'url'])
     assert.deepEqual(byType.get('localImage')?.required, ['path', 'type'])
+    assert.deepEqual(byType.get('audio')?.required, ['type', 'url'])
+    assert.deepEqual(byType.get('localAudio')?.required, ['path', 'type'])
   })
 
   it('returns the active native turn id as the only response field', () => {
@@ -151,7 +183,7 @@ describe('Codex 0.144.0 turn/steer generated schema fixture', () => {
 
 describe('queue protocol → Codex turn/steer mapping assumptions', () => {
   it('uses one stable queue item id as clientUserMessageId', () => {
-    const stableId = promptQueueItemIdFromClientMessageId('queue_item-0144')
+    const stableId = promptQueueItemIdFromClientMessageId('queue_item-0149')
     assert.equal(Value.Check(PromptQueueItemId, stableId), true)
 
     const properties = object(paramsFixture.json.properties, 'params.properties')
@@ -169,11 +201,11 @@ describe('queue protocol → Codex turn/steer mapping assumptions', () => {
         type: 'inbound.prompt_queue.interject',
         peer: { id: 'web-session-1', kind: 'dm' },
         agentId: 'main',
-        itemId: 'queue_item-0144',
+        itemId: 'queue_item-0149',
         mode: 'insert_current',
         expectedVersion: '7',
         expectedTurnId: platformTurnId,
-        idempotencyKey: 'interject-0144',
+        idempotencyKey: 'interject-0149',
       }),
       true,
     )

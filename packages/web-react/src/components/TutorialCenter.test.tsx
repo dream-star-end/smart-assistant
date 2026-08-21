@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -8,12 +8,13 @@ import {
   type ProductFeatureId,
 } from "../lib/productCapabilities";
 import type { TutorialCaseId } from "../lib/tutorialCaseCatalog";
+import { api } from "../lib/api";
 import { TutorialCenter } from "./TutorialCenter";
 
 afterEach(() => {
   cleanup();
   localStorage.clear();
-  vi.clearAllMocks();
+  vi.restoreAllMocks();
 });
 
 function Harness({
@@ -94,7 +95,7 @@ describe("TutorialCenter", () => {
       ),
     ).toBeInTheDocument();
     expect(screen.getByText(/2 小时 35 分 · UCI Bike Sharing/)).toBeInTheDocument();
-    expect(screen.getByText(/任务观察整理.*非逐帧运行回放/)).toBeInTheDocument();
+    expect(screen.getByText(/示意步骤.*非真实轨迹/)).toBeInTheDocument();
     expect(screen.getByText("平台支持后台继续与断线恢复")).toBeInTheDocument();
     expect(screen.getByText("34 项自动化验证通过")).toBeInTheDocument();
     const chapterNav = screen.getByRole("navigation", { name: "任务阶段" });
@@ -114,6 +115,45 @@ describe("TutorialCenter", () => {
     expect(
       screen.getByRole("heading", { name: "开始一场高质量对话" }),
     ).toBeInTheDocument();
+  });
+
+  it("社区 Tab 已改名为教程工作室，并提供四个入口", async () => {
+    vi.spyOn(api, "listCommunityTutorials").mockResolvedValue({ tutorials: [], nextCursor: null });
+    render(<CaseHarness />);
+    fireEvent.click(screen.getByRole("button", { name: "教程工作室" }));
+    expect(await screen.findByRole("heading", { name: "探索教程，或把一次真实会话变成可复用方法" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "探索教程" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "从当前会话生成" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "手写教程" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "我的发布" })).toBeInTheDocument();
+  });
+
+  it("communityId 深链直接打开教程工作室并加载详情", async () => {
+    vi.spyOn(api, "listCommunityTutorials").mockResolvedValue({ tutorials: [], nextCursor: null });
+    vi.spyOn(api, "getCommunityTutorial").mockResolvedValue({
+      id: "tut-7",
+      title: "深链社区教程",
+      summary: "从 URL 打开。",
+      category: "general",
+      authorName: "作者",
+      publishedAt: "2026-08-20T00:00:00.000Z",
+      bodyMarkdown: "深链正文",
+    });
+    render(
+      <TutorialCenter
+        open
+        topicId={null}
+        caseId={null}
+        communityId="tut-7"
+        onTopicChange={() => {}}
+        onClose={() => {}}
+        actionState={() => ({ enabled: true, label: "回到功能位置" })}
+        onRunAction={() => {}}
+      />,
+    );
+    expect(await screen.findByRole("heading", { name: "探索教程，或把一次真实会话变成可复用方法" })).toBeInTheDocument();
+    await waitFor(() => expect(api.getCommunityTutorial).toHaveBeenCalledWith("tut-7"));
+    expect(await screen.findByText("深链正文")).toBeInTheDocument();
   });
 
   it("阶段、成果预览和科研编码切换都是真实可操作的", () => {

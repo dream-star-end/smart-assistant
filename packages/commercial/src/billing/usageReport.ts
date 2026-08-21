@@ -47,6 +47,10 @@ export interface UserModelUsage {
   model: string;
   requests: string;
   credits: string;
+  input_tokens: string;
+  output_tokens: string;
+  cache_read_tokens: string;
+  cache_write_tokens: string;
 }
 
 /** 流水趋势点:桶 + 进账(delta>0)+ 出账(-delta,delta<0)。 */
@@ -113,8 +117,12 @@ export async function getUserUsageReport(
     // ── 按模型 ─────────────────────────────────────────────────────────
     query<UserModelUsage>(
       `SELECT model,
-              COUNT(*)::text                          AS requests,
-              COALESCE(SUM(cost_credits), 0)::text    AS credits
+              COUNT(*)::text                              AS requests,
+              COALESCE(SUM(cost_credits), 0)::text        AS credits,
+              COALESCE(SUM(input_tokens), 0)::text        AS input_tokens,
+              COALESCE(SUM(output_tokens), 0)::text       AS output_tokens,
+              COALESCE(SUM(cache_read_tokens), 0)::text   AS cache_read_tokens,
+              COALESCE(SUM(cache_write_tokens), 0)::text  AS cache_write_tokens
          FROM usage_records
         WHERE user_id = $1 AND status = 'success'
           AND created_at >= NOW() - ($2::int * INTERVAL '1 hour')

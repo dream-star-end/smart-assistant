@@ -1,18 +1,23 @@
 {
-  "name": "Aurora · 预置智能体平台",
-  "short_name": "Aurora",
-  "description": "开箱即用的 AI 助手，越用越好用，越用越懂你。",
+  "name": "从简 · 全能 Agent 工作台",
+  "short_name": "从简",
+  "description": "能思考、会执行、交付真实成果的全能 Agent 工作台。让复杂，从简。",
   "lang": "zh-CN",
   "dir": "ltr",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
   "orientation": "any",
-  "background_color": "#0c0c11",
-  "theme_color": "#0c0c11",
+  "background_color": "#090a08",
+  "theme_color": "#090a08",
   "icons": [
     { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
     { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
-    { "src": "/icons/maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+    {
+      "src": "/icons/maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
   ]
 }

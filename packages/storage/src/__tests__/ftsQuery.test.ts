@@ -10,7 +10,7 @@ describe('literalFtsQuery', () => {
     assert.equal(literalFtsQuery('field:value'), '"field" "value"')
     assert.equal(literalFtsQuery('10.1000/example'), '"10" "1000" "example"')
     assert.equal(literalFtsQuery('C++'), '"C"')
-    assert.equal(literalFtsQuery('中文测试'), '"中文测试"')
+    assert.equal(literalFtsQuery('中文测试'), '"中文" "测试"')
     assert.equal(literalFtsQuery('---***'), '')
   })
 

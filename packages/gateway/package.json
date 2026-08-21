@@ -12,6 +12,7 @@
     "@openclaude/plugin-sdk": "*",
     "@openclaude/protocol": "*",
     "@openclaude/storage": "*",
+    "better-sqlite3": "^11.3.0",
     "mammoth": "^1.12.0",
     "pdf-parse": "^2.4.5",
     "sharp": "^0.34.3",
@@ -19,6 +20,7 @@
     "yaml": "^2.6.0"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
     "@types/ws": "^8.5.13"
   }
 }

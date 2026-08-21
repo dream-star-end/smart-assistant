@@ -16,6 +16,7 @@ import {
 } from "./handlers.js";
 import { verifyCommercialJwtSync } from "../auth/jwtSync.js";
 import { recordProductFrictionEvent, type FrictionOutcome } from "../productFriction/events.js";
+import { query } from "../db/queries.js";
 
 const SAFE_LOWER = /^[a-z0-9_]{1,48}$/;
 const SAFE_CODE = /^[A-Za-z0-9_]{1,64}$/;
@@ -110,7 +111,35 @@ export async function handleClientErrorReport(
   }
 
   const persist = async (report: NormalizedClientFrictionReport): Promise<void> => {
-    await recordProductFrictionEvent({ ...report, userId }).catch((err: unknown) => {
+    let enriched = report;
+    if (userId !== null && report.traceId && (!report.model || !report.provider || report.latencyMs == null)) {
+      const attribution = await query<{
+        model: string | null;
+        provider: string | null;
+        latency_ms: number | null;
+      }>(
+        `SELECT t.model,mc.provider_id AS provider,
+                CASE WHEN d.admitted_at IS NULL THEN NULL
+                     ELSE LEAST(86400000,GREATEST(0,EXTRACT(EPOCH FROM (NOW()-d.admitted_at))*1000))::int END AS latency_ms
+           FROM turn_traces t
+           LEFT JOIN turn_dispatches d ON d.dispatch_id=t.dispatch_id
+           LEFT JOIN LATERAL (
+             SELECT provider_id FROM model_catalog
+              WHERE model_id=t.model ORDER BY created_at DESC LIMIT 1
+           ) mc ON TRUE
+          WHERE t.trace_id=$1 AND t.user_id=$2::bigint
+          LIMIT 1`,
+        [report.traceId,userId.toString()],
+      ).catch(() => ({ rows: [], rowCount: 0 }));
+      const row = attribution.rows[0];
+      enriched = {
+        ...report,
+        model: report.model ?? row?.model ?? null,
+        provider: report.provider ?? row?.provider ?? null,
+        latencyMs: report.latencyMs ?? row?.latency_ms ?? null,
+      };
+    }
+    await recordProductFrictionEvent({ ...enriched, userId }).catch((err: unknown) => {
     // Telemetry must never affect the user path. Keep only structural database
     // diagnostics: PostgreSQL messages can include rejected row values, so raw
     // message/detail/stack must not become a second telemetry payload.

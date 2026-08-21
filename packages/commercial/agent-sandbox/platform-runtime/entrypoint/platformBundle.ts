@@ -605,3 +605,60 @@ export function safeWritePlatformVolumeFile(args: {
   fs.writeFileSync(tmp, content, { mode });
   fs.renameSync(tmp, targetPath);
 }
+
+/**
+ * Fingerprint of the image-baked oc-memory wrapper (pre-711d69ff9) that always
+ * `exec npx --no-install tsx packages/mcp-memory/src/ocMemoryCli.ts`.
+ *
+ * Why overwrite is allowed for this file only:
+ *   Dockerfile.openclaude-runtime COPY's platform-runtime/bin/oc-memory.sh into
+ *   /usr/local/bin/oc-memory as a *regular file* at image build. RUNTIME_IMAGE is
+ *   pinned, so daily deploy never refreshes that file. PLATFORM_LINKED_CLIS
+ *   otherwise refuses to replace regular files (user or other-component tools in
+ *   /usr/local/bin). Matching this fingerprint lets provision swap that one
+ *   known-stale wrapper for a symlink to the platform-bundle shell (which prefers
+ *   dist/oc-memory.cjs) without unlinking anything else.
+ *
+ * Why the negative check on oc-memory.cjs:
+ *   The 711d69ff9+ wrapper keeps the tsx fallback but prefixes a CJS fast-path.
+ *   Matching only the tsx exec line would false-positive on the current shell
+ *   (and on a future image rebuild that COPY's that shell as a regular file).
+ */
+export const STALE_OC_MEMORY_TSX_EXEC =
+  "exec npx --no-install tsx packages/mcp-memory/src/ocMemoryCli.ts";
+
+export function isStaleImageOcMemoryWrapper(content: string): boolean {
+  if (!content.includes(STALE_OC_MEMORY_TSX_EXEC)) return false;
+  if (content.includes("/opt/openclaude/packages/mcp-memory/dist/oc-memory.cjs")) return false;
+  return true;
+}
+
+export type SystemCliLinkDecision = "create" | "noop" | "replace-stale-wrapper" | "preserve";
+
+/**
+ * Decide whether /usr/local/bin/<cli> should be created, left alone, or replaced.
+ * Replacement is only for the image-baked oc-memory tsx-only wrapper; directories,
+ * foreign symlinks, and unrelated regular files are preserved.
+ */
+export function decideSystemCliLinkAction(args: {
+  cliName: string;
+  exists: boolean;
+  isSymbolicLink: boolean;
+  isFile: boolean;
+  linkTarget: string | null;
+  desiredTarget: string;
+  fileContent: string | null;
+}): SystemCliLinkDecision {
+  if (!args.exists) return "create";
+  if (args.isSymbolicLink && args.linkTarget === args.desiredTarget) return "noop";
+  if (
+    args.cliName === "oc-memory" &&
+    args.isFile &&
+    !args.isSymbolicLink &&
+    args.fileContent !== null &&
+    isStaleImageOcMemoryWrapper(args.fileContent)
+  ) {
+    return "replace-stale-wrapper";
+  }
+  return "preserve";
+}

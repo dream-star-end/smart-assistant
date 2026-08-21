@@ -96,6 +96,25 @@ export function isModelAuthorityRequired(env: NodeJS.ProcessEnv = process.env): 
   return env[REQUIRE_AUTHORITY_ENV] === '1'
 }
 
+/**
+ * selfhost 豁免门(`OC_SELFHOST_ENGINE_LOCAL_TURNS=1`,deploy-v5-selfhost 显式写入):
+ * 允许 engine-reported 计费引擎(codex/grok/cursor)在**无 master 计费编排**的本地
+ * turn(delegate / skill-eval / 无 envelope inbound)上执行。
+ *
+ * 语义与代价(单租户自用部署的知情选择):
+ *   - 这些 turn 拿不到 bridge 铸造的 server-owned requestId,也不会有 preCheck /
+ *     inflight journal / settle -> usage **不进 usage_records / credit_ledger 结算**;
+ *     token 统计仍落 event/usage log(turn.completed)与 durable tape(engineBilling)。
+ *   - 生产(claudeai.chat)**不设此 env** -> decideLocalExecution 的 DELEGATE_CODEX_UNSUPPORTED
+ *     与 sessionManager 的 CODEX_BILLING_GUARD 维持原样 fail-closed,零行为变化。
+ *   - 两处消费点(decideLocalExecution 真值表 / CODEX_BILLING_GUARD)同读本判定,
+ *     不允许各自解释 -- 与 isModelAuthorityRequired 同构的单一权威。
+ */
+const SELFHOST_ENGINE_LOCAL_TURNS_ENV = 'OC_SELFHOST_ENGINE_LOCAL_TURNS'
+export function isEngineLocalTurnExempt(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env[SELFHOST_ENGINE_LOCAL_TURNS_ENV] === '1'
+}
+
 // ---------------------------------------------------------------------------
 // 类型
 // ---------------------------------------------------------------------------
@@ -462,7 +481,7 @@ export class ModelAuthorityConsumer {
         `frame.model=${String(frameModel)} != authority.canonicalModel=${payload.canonicalModel}`,
       )
     }
-    if (payload.engine === 'codex' || payload.engine === 'grok' || payload.engine === 'cursor') {
+    if (payload.engine === 'codex' || payload.engine === 'grok' || payload.engine === 'cursor' || payload.engine === 'zcode') {
       const frameRequestId = typeof frame.requestId === 'string' ? frame.requestId : undefined
       if (
         typeof payload.billingRequestId !== 'string' ||

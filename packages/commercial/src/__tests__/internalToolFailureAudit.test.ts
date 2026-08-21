@@ -287,7 +287,7 @@ describe('tool failure audit handler', () => {
     let res = makeRes()
     await h(makeReq({ auth: `Bearer ${TOKEN}`, method: 'GET', body: body() }), res, CTX)
     assert.equal(res.statusCode, 405)
-    assert.equal(res.headers[TOOL_AUDIT_SCHEMA_HEADER.toLowerCase()], '3')
+    assert.equal(res.headers[TOOL_AUDIT_SCHEMA_HEADER.toLowerCase()], '4')
 
     res = makeRes()
     await h(makeReq({ body: body() }), res, CTX)

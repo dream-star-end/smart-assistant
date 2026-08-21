@@ -26,7 +26,12 @@
  * 由 OPENCLAUDE_HOME 决定(容器内 = /home/agent/.openclaude;未设时 paths.ts 回落
  * homedir()/.openclaude,容器内两者同路径)。
  */
-import { paths } from '@openclaude/storage'
+import {
+  paths,
+  recordMemoryUsageEvent,
+  type MemoryUsageOperation,
+  type MemoryUsageType,
+} from '@openclaude/storage'
 import {
   createMemoryToolsContext,
   drainPendingEmbeds,
@@ -37,6 +42,19 @@ import {
   handleSessionSearch,
   type MemoryToolResult,
 } from './memoryTools.js'
+import { gatewayAuthHeaders, gatewayBaseUrl, gatewayDelegateHeaders, postJsonToGateway } from './gatewayClient.js'
+import {
+  resolveDelegateWaitPollMs,
+  runDelegateWaitLoop,
+} from './delegateWaitCli.js'
+import { normalizeDelegateAgentId, normalizeDelegateModel } from './delegateArgs.js'
+import {
+  readDelegateContextToken,
+  requestReviewArgs,
+  runDelegateStartAndWait,
+  type DelegateCliArgs,
+} from './delegateStartCli.js'
+import { DELEGATE_CONTEXT_HEADER } from './gatewayClient.js'
 
 const TOOL = 'oc-memory'
 
@@ -86,6 +104,9 @@ const USAGE = [
   '  oc-memory archival-add "<text>" [--tags a,b,c]',
   '  oc-memory archival-search "<query>" [--limit N]',
   '  oc-memory archival-delete <id>',
+  '  oc-memory delegate-wait <jobId> [<jobId>...]',
+  '  oc-memory delegate --goal "<text>" [--agent-id ID] [--model SLUG] [--context "..."] [--effort low|medium|high] [--toolsets a,b] [--resume-session-key KEY]',
+  '  oc-memory request-review --draft "<text>" [--revision-note "..."] [--resume-session-key KEY]',
 ].join('\n')
 
 /**
@@ -118,6 +139,49 @@ function emit(res: MemoryToolResult): never {
   process.exit(0)
 }
 
+async function observeMemoryResult(input: {
+  agentId: string
+  operation: MemoryUsageOperation
+  memoryType: MemoryUsageType
+  query?: string
+  startedAt: number
+  result: MemoryToolResult
+}): Promise<void> {
+  const telemetry = input.result.telemetry ?? {
+    outcome: input.result.isError ? 'error' as const : 'success' as const,
+  }
+  try {
+    await recordMemoryUsageEvent({
+      agentId: input.agentId,
+      sessionKey: process.env.OPENCLAUDE_SESSION_KEY || process.env.OC_SESSION_KEY || null,
+      operation: input.operation,
+      memoryType: input.memoryType,
+      outcome: telemetry.outcome,
+      policyReason: telemetry.policyReason,
+      retrievalMode: telemetry.retrievalMode,
+      resultCount: telemetry.resultCount,
+      latencyMs: Date.now() - input.startedAt,
+      query: input.query,
+      topMatchKey: telemetry.topMatchKey,
+    })
+  } catch {
+    // Observability is fail-open: a locked/corrupt telemetry table must never
+    // change the memory command's result or exit status.
+  }
+}
+
+async function observeAndEmit(input: {
+  agentId: string
+  operation: MemoryUsageOperation
+  memoryType: MemoryUsageType
+  query?: string
+  startedAt: number
+  result: MemoryToolResult
+}): Promise<never> {
+  await observeMemoryResult(input)
+  return emit(input.result)
+}
+
 async function main(): Promise<void> {
   const [cmd, ...rest] = process.argv.slice(2)
   if (!cmd || cmd === '--help' || cmd === '-h' || cmd === 'help') {
@@ -138,15 +202,102 @@ async function main(): Promise<void> {
   }
 
   const { positional, flags } = parseFlags(rest)
+
+
+  if (cmd === 'delegate' || cmd === 'request-review') {
+    const ctxTok = readDelegateContextToken()
+    if (!ctxTok.ok) fail(ctxTok.error)
+    const goal = flags.goal || (cmd === 'delegate' ? positional[0] : '')
+    let args: DelegateCliArgs
+    if (cmd === 'request-review') {
+      const draft = flags.draft || positional[0]
+      if (!draft) fail('request-review requires --draft "<完整答复草稿>"')
+      args = requestReviewArgs(draft, flags['revision-note'], flags['resume-session-key'])
+    } else {
+      if (!goal) fail('delegate requires --goal "<text>" (or a positional goal)')
+      const agentNorm = normalizeDelegateAgentId(flags['agent-id'] || flags.agentId)
+      if (!agentNorm.ok) fail(agentNorm.error)
+      const modelNorm = normalizeDelegateModel(flags.model)
+      if (!modelNorm.ok) fail(modelNorm.error)
+      const effortRaw = flags.effort
+      const effort =
+        effortRaw === 'low' || effortRaw === 'medium' || effortRaw === 'high' ? effortRaw : undefined
+      const toolsets = flags.toolsets
+        ? flags.toolsets.split(',').map((s) => s.trim()).filter(Boolean)
+        : undefined
+      args = {
+        agentId: agentNorm.agentId || 'main',
+        goal,
+        context: flags.context,
+        effort,
+        model: modelNorm.model,
+        toolsets,
+        resumeSessionKey: flags['resume-session-key'],
+      }
+    }
+    const base = gatewayBaseUrl()
+    const headers = gatewayDelegateHeaders()
+    headers[DELEGATE_CONTEXT_HEADER] = ctxTok.token
+    const pollWaitMs = resolveDelegateWaitPollMs()
+    const result = await runDelegateStartAndWait({
+      args,
+      contextToken: ctxTok.token,
+      pollWaitMs,
+      start: (agentId, body) =>
+        postJsonToGateway(`${base}/api/agents/${encodeURIComponent(agentId)}/delegate`, {
+          headers,
+          body,
+          timeoutMs: 15_000,
+        }),
+      waitOnce: (jobId, waitMs) =>
+        postJsonToGateway(`${base}/api/delegate/wait`, {
+          headers,
+          body: JSON.stringify({ jobId, waitMs }),
+          timeoutMs: waitMs + 60_000,
+        }),
+    })
+    if (result.stderr) process.stderr.write(result.stderr)
+    if (result.stdout) process.stdout.write(result.stdout)
+    process.exit(result.exitCode)
+  }
+
+  // Cursor MCP 60s 上限的委派长等待:走网关 /api/delegate/wait 长轮询,不碰记忆后端。
+  if (cmd === 'delegate-wait') {
+    if (positional.length === 0) fail('delegate-wait requires at least one <jobId> positional argument')
+    const base = gatewayBaseUrl()
+    const headers = gatewayDelegateHeaders()
+    const result = await runDelegateWaitLoop({
+      jobIds: positional,
+      pollWaitMs: resolveDelegateWaitPollMs(),
+      waitOnce: (jobId, waitMs) =>
+        postJsonToGateway(`${base}/api/delegate/wait`, {
+          headers,
+          body: JSON.stringify({ jobId, waitMs }),
+          timeoutMs: waitMs + 60_000,
+        }),
+    })
+    if (result.stderr) process.stderr.write(result.stderr)
+    if (result.stdout) process.stdout.write(result.stdout)
+    process.exit(result.exitCode)
+  }
   if (cmd === 'core-search') {
     const query = positional[0]
     if (!query) fail('core-search requires a "<query>" positional argument')
-    emit(await handleCoreSearch({
+    const startedAt = Date.now()
+    const result = await handleCoreSearch({
       agentId,
       query,
       limit: parseLimit(flags.limit),
       offset: parseOffset(flags.offset),
-    }))
+    })
+    await observeAndEmit({
+      agentId,
+      operation: 'core_search',
+      memoryType: 'core',
+      query,
+      startedAt,
+      result,
+    })
   }
 
   const ctx = await createMemoryToolsContext(agentId)
@@ -155,6 +306,7 @@ async function main(): Promise<void> {
     case 'session-search': {
       const query = positional[0]
       if (!query) fail('session-search requires a "<query>" positional argument')
+      const startedAt = Date.now()
       const summarize = flags.summarize !== undefined && flags.summarize !== 'false'
       const res = await handleSessionSearch(ctx, {
         query,
@@ -162,30 +314,59 @@ async function main(): Promise<void> {
         agentId: flags['agent-id'],
         summarize,
       })
-      emit(res)
+      await observeAndEmit({
+        agentId,
+        operation: 'session_search',
+        memoryType: 'recall',
+        query,
+        startedAt,
+        result: res,
+      })
       break
     }
     case 'archival-add': {
       const content = positional[0]
       if (!content) fail('archival-add requires a "<text>" positional argument')
+      const startedAt = Date.now()
       const res = await handleArchivalAdd(ctx, { content, tags: flags.tags })
       await drainPendingEmbeds(ctx)
-      emit(res)
+      await observeAndEmit({
+        agentId,
+        operation: 'archival_add',
+        memoryType: 'archival',
+        startedAt,
+        result: res,
+      })
       break
     }
     case 'archival-search': {
       const query = positional[0]
       if (!query) fail('archival-search requires a "<query>" positional argument')
+      const startedAt = Date.now()
       const res = await handleArchivalSearch(ctx, { query, limit: parseLimit(flags.limit) })
-      emit(res)
+      await observeAndEmit({
+        agentId,
+        operation: 'archival_search',
+        memoryType: 'archival',
+        query,
+        startedAt,
+        result: res,
+      })
       break
     }
     case 'archival-delete': {
       const id = positional[0]
       if (!id) fail('archival-delete requires an <id> positional argument')
+      const startedAt = Date.now()
       const res = await handleArchivalDelete(ctx, { id })
       await drainPendingEmbeds(ctx)
-      emit(res)
+      await observeAndEmit({
+        agentId,
+        operation: 'archival_delete',
+        memoryType: 'archival',
+        startedAt,
+        result: res,
+      })
       break
     }
     default:

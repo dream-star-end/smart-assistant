@@ -6,11 +6,13 @@
  * - Extensible to local models (BGE-M3) in future
  *
  * Configuration via environment variables:
- *   EMBEDDING_PROVIDER   — "openai" (default)
+ *   EMBEDDING_PROVIDER   — "openai" (default; OpenAI-compatible wire format)
  *   EMBEDDING_MODEL      — model id (default: "text-embedding-3-small")
  *   EMBEDDING_DIMENSIONS — output dimensions (default: 1536)
  *   EMBEDDING_API_KEY    — API key (falls back to OPENAI_API_KEY)
  *   EMBEDDING_BASE_URL   — API base URL (default: "https://api.openai.com/v1")
+ *   EMBEDDING_BATCH_SIZE — texts per request (default: 100; DashScope compatible-mode caps at 10)
+ *   EMBEDDING_TIMEOUT_MS — per-request timeout (default: 30000)
  */
 
 // ── Interface ────────────────────────────────────
@@ -78,6 +80,17 @@ function assertPositiveInt(name: string, value: number): void {
   }
 }
 
+/**
+ * DashScope compatible-mode `/embeddings` rejects batches larger than 10
+ * (text-embedding-v3/v4). OpenAI's own cap is much higher; 100 is the historical
+ * default for this provider.
+ */
+export function defaultEmbeddingBatchSize(baseUrl: string | undefined): number {
+  const url = (baseUrl ?? '').toLowerCase()
+  if (url.includes('dashscope.aliyuncs.com') || url.includes('dashscope.aliyun.com')) return 10
+  return 100
+}
+
 // ── OpenAI Provider ──────────────────────────────
 
 interface OpenAIEmbeddingResponse {
@@ -101,7 +114,7 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
     this.dimensions = config.dimensions ?? 1536
     this.apiKey = config.apiKey ?? ''
     this.baseUrl = (config.baseUrl ?? 'https://api.openai.com/v1').replace(/\/+$/, '')
-    this.batchSize = config.batchSize ?? 100
+    this.batchSize = config.batchSize ?? defaultEmbeddingBatchSize(this.baseUrl)
     this.timeoutMs = config.timeoutMs ?? 30_000
     this.dispatcher = config.dispatcher
 
@@ -221,12 +234,15 @@ let _provider: EmbeddingProvider | null = null
  * Throws on invalid numeric values.
  */
 export function configFromEnv(): EmbeddingProviderConfig {
+  const baseUrl = process.env.EMBEDDING_BASE_URL ?? 'https://api.openai.com/v1'
   return {
     provider: process.env.EMBEDDING_PROVIDER ?? 'openai',
     model: process.env.EMBEDDING_MODEL ?? 'text-embedding-3-small',
     dimensions: parsePositiveInt(process.env.EMBEDDING_DIMENSIONS, 1536),
     apiKey: process.env.EMBEDDING_API_KEY ?? process.env.OPENAI_API_KEY ?? '',
-    baseUrl: process.env.EMBEDDING_BASE_URL ?? 'https://api.openai.com/v1',
+    baseUrl,
+    batchSize: parsePositiveInt(process.env.EMBEDDING_BATCH_SIZE, defaultEmbeddingBatchSize(baseUrl)),
+    timeoutMs: parsePositiveInt(process.env.EMBEDDING_TIMEOUT_MS, 30_000),
   }
 }
 

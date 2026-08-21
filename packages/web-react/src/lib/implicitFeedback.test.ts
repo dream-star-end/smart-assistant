@@ -10,6 +10,7 @@ import {
   isExpensiveTurn,
   newTokenRatio,
   rewriteSimilarity,
+  ratingNudgeBucket,
 } from "./implicitFeedback";
 
 let seq = 0;
@@ -23,6 +24,15 @@ function mk(
 }
 
 const MIN = 60_000;
+
+describe("ratingNudgeBucket", () => {
+  test("is stable across calls and always returns one of ten buckets", () => {
+    const values = Array.from({ length: 100 }, (_, i) => ratingNudgeBucket(`message-${i}`));
+    expect(values.every((value) => value >= 0 && value <= 9)).toBe(true);
+    expect(ratingNudgeBucket("same-message")).toBe(ratingNudgeBucket("same-message"));
+    expect(new Set(values).size).toBe(10);
+  });
+});
 
 describe("rewriteSimilarity", () => {
   test("高相似中文改写（改一个字）→ 远超 0.55", () => {

@@ -144,6 +144,13 @@ export function LifetimeCell({ a }: { a: AccountRow }) {
 }
 
 /** label 单元格尾部的告警芯片行(最近出错 / OAuth 到期 / 冷却 / 订阅到期)。 */
+export function CursorPoolCell({ a }: { a: AccountRow }) {
+  if (a.provider !== "cursor") return <span className="text-faint">—</span>;
+  if (a.cursor_quota_class === "other_ok") return <span>Other OK</span>;
+  if (a.cursor_quota_class === "cursor_only") return <span>仅 Cursor Models</span>;
+  return <span className="text-faint">未观察</span>;
+}
+
 export function AccountWarningChips({ a }: { a: AccountRow }) {
   const chips: { tone: Tone; label: string; title?: string }[] = [];
   const now = Date.now();

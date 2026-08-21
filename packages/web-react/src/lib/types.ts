@@ -58,18 +58,150 @@ export type OrgMembershipBrief = {
 
 /**
  * 会话。v5 的会话历史权威源是 WS user-chat-bridge（hello/peer + master 侧持久化），
- * REST 不再提供 chat session CRUD。本期（P2）会话仅为本地脚手架占位，
- * 真实 WS 会话装载在 P4 接入。
+ * REST 列表走 GET /api/sessions/list（SessionMeta → Session）。
  */
+/** 会话最近一轮的运行态（listSessions 兜底；本 tab 发送中以 isSending 为准）。 */
+export type SessionRunState = "running" | "idle";
+
+/** 会话最近一轮终态。null = 从未跑过 turn，侧栏不显示状态点。 */
+export type SessionLastOutcome =
+  | "completed"
+  | "interrupted"
+  | "crashed"
+  | "not_accepted"
+  | "executed_error";
+
 export type Session = {
   id: string;
   title: string;
   ownerUserId: string;
+  /** 会话创建时刻（epoch ms）；侧栏整段用时的起点。 */
+  createdAt?: number;
   updatedAt: string;
   messageCount: number;
   /** 会话级模型选择(per-session 持久化;缺省 = 未显式选择 → 选择器回落 default_model)。
    *  来源:本地选择写通 / IndexedDB 注水 / listSessions server-wins;App 切会话据此恢复选择器。 */
   modelId?: string;
+  /** 置顶。listSessions.pinned；metaToSession 以前丢了，侧栏「置顶」分组依赖它。 */
+  pinned?: boolean;
+  agentId?: string;
+  /** 归属的聊天项目；null/缺省 = 未分组。 */
+  projectId?: string | null;
+  runState?: SessionRunState;
+  lastOutcome?: SessionLastOutcome | null;
+  lastErrorCode?: string | null;
+  /** 已归档。默认列表不展示；侧栏「已归档」分组展开后可见。 */
+  archived?: boolean;
+  /** 服务端派生：有终态未看。绿点是否画出仍由 resolveSidebarDot 决定。 */
+  unread?: boolean;
+  /** 最后一条消息纯文本前 80 字（listSessions 新字段；缺省则会话行不占摘要位）。 */
+  lastMessagePreview?: string;
+  /** 服务端 lastAt（epoch ms）。分页游标 `before=` 用它；缺省则回落 Date.parse(updatedAt)。 */
+  lastAt?: number;
+};
+
+/** GET /api/chat-projects → { projects: ChatProject[] } */
+export type ChatProject = {
+  id: string;
+  name: string;
+  instructions?: string | null;
+  color?: string | null;
+  sortOrder: number;
+  createdAt: number;
+  updatedAt: number;
+  sessionCount: number;
+};
+
+/**
+ * 聊天项目资产（用户上传的参考资料 + 会话产出物）。
+ * GET /api/project-assets → `{ assets: ProjectAsset[] }`；POST/PATCH 直接回 `ProjectAsset`。
+ * `projectId === null` 表示未分组（侧栏虚拟 default 组）。
+ */
+export type ProjectAsset = {
+  id: string;
+  projectId: string | null;
+  source: "upload" | "output";
+  sessionId: string | null;
+  name: string;
+  url: string | null;
+  containerPath: string | null;
+  mime: string | null;
+  sizeBytes: number | null;
+  excerpt: string | null;
+  pinned: boolean;
+  createdAt: number;
+  updatedAt: number;
+};
+
+/** POST /api/project-assets 请求体。`size` 对应资源字节数（响应字段是 `sizeBytes`）。 */
+export type CreateProjectAssetInput = {
+  projectId?: string | null;
+  source: "upload" | "output";
+  sessionId?: string;
+  name: string;
+  url?: string;
+  containerPath?: string;
+  mime?: string;
+  size?: number;
+  digest?: string;
+};
+
+/** PATCH /api/project-assets/:assetId */
+export type PatchProjectAssetInput = {
+  pinned?: boolean;
+  name?: string;
+  projectId?: string | null;
+};
+
+/** PATCH /api/sessions/:id 元数据（title / 归属 / 置顶 / 归档）。后端若换成 /meta，只改 api.patchSessionMeta。 */
+export type PatchSessionMetaInput = {
+  title?: string;
+  projectId?: string | null;
+  pinned?: boolean;
+  archived?: boolean;
+};
+
+/** GET /api/sessions/list 可选分页。不传时后端行为与全量列表一致。 */
+export type SessionListQuery = {
+  limit?: number;
+  /** 上一页最老一条的 lastAt（毫秒）。 */
+  before?: number;
+  includeArchived?: boolean;
+};
+
+/** GET /api/sessions/list 分页信封。无参请求也可能带 nextCursor（新后端）。 */
+export type SessionListPage = {
+  sessions: SessionMeta[];
+  nextCursor?: number;
+};
+
+/** GET /api/sessions/search 单条命中。 */
+export type SessionSearchHit = {
+  sessionId: string;
+  title: string;
+  projectId?: string | null;
+  snippet: string;
+  matchedAt: number;
+  kind: "title" | "message";
+  unread?: boolean;
+};
+
+export type SessionSearchResponse = {
+  results: SessionSearchHit[];
+};
+
+export type SessionBatchAction = "archive" | "unarchive" | "delete" | "move";
+
+/** POST /api/sessions/batch */
+export type SessionBatchInput = {
+  ids: string[];
+  action: SessionBatchAction;
+  projectId?: string | null;
+};
+
+export type SessionBatchResult = {
+  ok: true;
+  updated: number;
 };
 
 export type Message = {
@@ -170,6 +302,12 @@ export type PublicModel = {
   id: string;
   /** protocol modelReasoningPolicy 的 API 投影；空数组 = 不支持思考深度。 */
   supported_efforts?: Array<"low" | "medium" | "high" | "xhigh" | "max">;
+  /** Catalog execution metadata used to decide whether a populated session needs native compaction before switching. */
+  engine?: "ccb" | "codex" | "grok" | "cursor" | "zcode";
+  context_window?: number | null;
+  supports_vision?: boolean;
+  /** Blended cost vs DeepSeek V4 Pro (one decimal), from GET /api/public/models. */
+  cost_x?: number;
   /**
    * 0108 provider 健康度:后端 /api/models 对归属 provider 生效降级的模型注解 true
    * (只注解不过滤)。ModelSelector 据此标「暂不可用」徽记 + 禁选。
@@ -281,6 +419,13 @@ export type SessionMeta = {
   updatedAt: number;
   /** 会话级模型选择(服务端 client_sessions.model_id;缺省 = 该会话从未显式选过)。 */
   modelId?: string;
+  projectId?: string | null;
+  runState?: SessionRunState;
+  lastOutcome?: SessionLastOutcome | null;
+  lastErrorCode?: string | null;
+  archived?: boolean;
+  unread?: boolean;
+  lastMessagePreview?: string;
 };
 
 /**
@@ -327,6 +472,14 @@ export type SessionDetail = {
   archivedCount?: number;
   /** 已归档的最大 `_orderSeq` 水位；字段名为滚动兼容保留。缺省=0。*/
   archivedThroughSeq?: number;
+  openDispatch?: {
+    dispatchId: string;
+    clientMessageId: string;
+    status: string;
+    acceptedAt: number | null;
+    lastFrameAt: number | null;
+    model?: string;
+  };
 };
 
 export type DurableLiveFrame = {
@@ -341,8 +494,13 @@ export type DurableLiveFramePage = {
   frames: DurableLiveFrame[];
   nextCursor: string | null;
   hasMore: boolean;
+  /** Earlier frames exist on the current open dispatch. Old backends omit this. */
+  hasMoreBefore?: boolean;
   streamClientMessageIds: string[];
   hasTapeProjection: boolean;
+  /** 服务端 tape 投影版本水位(tape 投影流计数,单调递增)。旧后端不带该字段
+   * (undefined)时,客户端回退到 hasTapeProjection 一次性布尔自愈。 */
+  tapeProjectionVersion?: number;
 };
 
 /** GET /api/sessions/:id/timeline — one exact chronological page containing
@@ -533,6 +691,10 @@ export type UsageReportModel = {
   model: string;
   requests: string;
   credits: string;
+  input_tokens: string;
+  output_tokens: string;
+  cache_read_tokens: string;
+  cache_write_tokens: string;
 };
 
 /** 账本收支趋势单桶（credited=入账 / debited=支出，字符串大数）。 */
@@ -768,6 +930,38 @@ export type MemoryIndexResponse = {
   version?: string;
 };
 
+export type MemoryUsageDashboard = {
+  window: { days: number; from: string; to: string };
+  totals: {
+    events: number;
+    sessions: number;
+    hits: number;
+    noMatch: number;
+    errors: number;
+    denied: number;
+    freshnessGaps: number;
+  };
+  byOperation: Array<{
+    operation: string;
+    memoryType: string;
+    events: number;
+    sessions: number;
+    hits: number;
+    noMatch: number;
+    p50Ms: number;
+    p95Ms: number;
+  }>;
+  recentSessions: Array<{
+    sessionKey: string;
+    title: string;
+    lastAt: number;
+    events: number;
+    searches: number;
+    writes: number;
+    freshnessGaps: number;
+  }>;
+};
+
 /** GET .../memory/files/:file 响应：正文 + 乐观锁 version（sha256 前 16 位）。 */
 export type MemoryFileContent = { content: string; version: string };
 
@@ -975,10 +1169,65 @@ export type SkillDetail = SkillSummary & {
   files?: string[];
 };
 
-// ── 社区共建教程 ─────────────────────────────────────────────────────────
+// ── 教程工作室（公开目录仍走 /api/tutorials；快照/评测字段集中于此便于对齐） ─
 
 export type CommunityTutorialCategory = "research" | "coding" | "general";
-export type CommunityTutorialStatus = "pending" | "approved" | "rejected" | "withdrawn";
+export type CommunityTutorialStatus =
+  | "pending"
+  | "approved"
+  | "rejected"
+  | "withdrawn"
+  | "draft"
+  | "takedown";
+export type TutorialKind = "markdown" | "snapshot";
+
+/** 公开快照轨迹：inline 脱敏消息、分页清单，或公开 blob ref。 */
+export type TutorialSnapshotPageRef = {
+  role?: string;
+  sha256: string;
+  bytes?: number;
+  messageCount?: number;
+};
+
+export type TutorialSnapshotPayload = {
+  schemaVersion?: number;
+  sanitizerVersion?: string;
+  messageCount?: number;
+  messages?: unknown[];
+  manifest?: unknown;
+  inlinePages?: unknown;
+  pages?: TutorialSnapshotPageRef[];
+  artifacts?: Array<{
+    title?: string;
+    name?: string;
+    role?: string;
+    sha256: string;
+    bytes?: number;
+    mimeType?: string;
+    mime?: string;
+  }>;
+  publicRef?: string | null;
+};
+
+export type TutorialBlobRef = {
+  sha256: string;
+  role: string;
+  kind: string;
+  mime: string;
+  bytes: number;
+};
+
+export type TutorialArtifact = {
+  sha256: string;
+  name: string;
+  mime: string;
+  bytes: number;
+  role?: string | null;
+  kind?: string | null;
+  embedUrl?: string | null;
+  downloadUrl?: string | null;
+  interactive?: boolean;
+};
 
 export type CommunityTutorialSummary = {
   id: string;
@@ -987,10 +1236,14 @@ export type CommunityTutorialSummary = {
   category: CommunityTutorialCategory;
   authorName: string;
   publishedAt: string;
+  kind?: TutorialKind;
 };
 
 export type CommunityTutorialDetail = CommunityTutorialSummary & {
   bodyMarkdown: string;
+  snapshot?: TutorialSnapshotPayload | null;
+  artifacts?: TutorialArtifact[];
+  refs?: TutorialBlobRef[];
 };
 
 export type CommunityTutorialMine = {
@@ -1004,6 +1257,9 @@ export type CommunityTutorialMine = {
   createdAt: string;
   reviewedAt: string | null;
   publishedAt: string | null;
+  kind?: TutorialKind;
+  snapshot?: TutorialSnapshotPayload | null;
+  artifacts?: TutorialArtifact[];
 };
 
 export type CommunityTutorialPending = CommunityTutorialMine & {
@@ -1017,9 +1273,116 @@ export type CommunityTutorialDraft = {
   bodyMarkdown: string;
 };
 
+export type TutorialSnapshotArtifactDraft = {
+  name: string;
+  mimeType: string;
+  contentBase64: string;
+  sourcePath: string;
+};
+
+export type TutorialSnapshotDraft = {
+  sourceSessionId: string;
+  title: string;
+  summary: string;
+  category: CommunityTutorialCategory;
+  bodyMarkdown: string;
+  selectedArtifacts: TutorialSnapshotArtifactDraft[];
+};
+
+export type TutorialLeak = {
+  rule: string;
+  field: string;
+};
+
+export type TutorialLeakReport = {
+  leaks?: TutorialLeak[];
+  strippedRoles?: string[];
+  findings?: Array<{ type?: string; code?: string; message: string }>;
+  notes?: string[];
+};
+
+export type TutorialSnapshotSubmitResult = {
+  tutorial: { id: string; status: "pending" | "draft"; createdAt: string; kind?: TutorialKind; sanitizerVersion?: string };
+  leakReport?: TutorialLeakReport | null;
+};
+
 export type CommunityTutorialPage<T> = {
   tutorials: T[];
   nextCursor: string | null;
+};
+
+export type TutorialEvalSpec = {
+  id: string;
+  publicId?: string;
+  title?: string;
+  sourcePlatform: string;
+  sourceUrl: string;
+  collectedAt: string;
+  frozenPrompt?: string;
+  materials?: string;
+  frozenMaterials?: unknown;
+  authScope: string;
+  rubricJson?: unknown;
+  rubric?: unknown;
+  createdAt: string;
+};
+
+export type TutorialEvalSpecDraft = {
+  publicId: string;
+  title: string;
+  sourcePlatform: string;
+  sourceUrl: string;
+  collectedAt: string;
+  frozenPrompt: string;
+  frozenMaterials: { items: unknown[] };
+  rubric: { checks: unknown[] } | unknown;
+};
+
+export type TutorialEvalJobStatus =
+  | "queued"
+  | "running"
+  | "failed"
+  | "completed"
+  | "passed"
+  | "compass_pending"
+  | "compass_running"
+  | "compass_ready";
+
+export type TutorialEvalJob = {
+  id: string;
+  specId: string;
+  status: TutorialEvalJobStatus;
+  publicationId?: string | null;
+  result?: string | null;
+  error?: string | null;
+  createdAt: string;
+  updatedAt?: string;
+  completedAt?: string | null;
+  created?: boolean;
+};
+
+export type TutorialEvalCompassItem = {
+  id: string;
+  cluster?: string;
+  clusterKey?: string;
+  severity: string;
+  summary: string;
+  fix?: string;
+  reusableFix?: string | null;
+  jobId?: string | null;
+  evalJobId?: string | null;
+};
+
+export type TutorialEvalRecordInput = {
+  jobId: string;
+  result?: "passed" | "failed";
+  evidence?: unknown;
+  status?: TutorialEvalJobStatus;
+  cluster?: string;
+  severity?: string;
+  summary?: string;
+  fix?: string;
+  notes?: string;
 };
 
 // ── AI 市场（marketplace，见 packages/commercial/src/marketplace） ──────────

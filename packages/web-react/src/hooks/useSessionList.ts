@@ -1,13 +1,24 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useToast } from "../components/ui";
 import { ApiError, api } from "../lib/api";
 import type { ChatMessage } from "../lib/chat/model";
 import { DEMO_SESSIONS } from "../lib/demo";
 import type { StoredSession } from "../lib/persist";
-import type { AuthSession, Session, SessionMeta, User } from "../lib/types";
+import type {
+  AuthSession,
+  Session,
+  SessionBatchAction,
+  SessionLastOutcome,
+  SessionMeta,
+  SessionSearchHit,
+  User,
+} from "../lib/types";
 import type { UseChatSocket } from "./useChatSocket";
 
 /** 历史重拉冷却（S2）：同会话此窗口内只拉一次；过后允许增量重拉（sinceSeq + server-wins 幂等）。*/
 const HISTORY_REFETCH_COOLDOWN_MS = 5000;
+/** 侧栏列表刷新：对齐站内信，可见标签 60s 一轮。 */
+const LIST_POLL_MS = 60_000;
 
 /** WS 会话 id（peer.id）：须匹配后端 `[A-Za-z0-9_-]{8,50}`。*/
 export function genWsSessionId(): string {
@@ -15,12 +26,19 @@ export function genWsSessionId(): string {
 }
 
 function makeLocalSession(title: string, ownerUserId: string): Session {
+  const now = Date.now();
   return {
-    id: `local-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    id: `local-${now}-${Math.random().toString(36).slice(2, 8)}`,
     title: title || "新对话",
     ownerUserId,
-    updatedAt: new Date().toISOString(),
+    createdAt: now,
+    lastAt: now,
+    updatedAt: new Date(now).toISOString(),
     messageCount: 0,
+    pinned: false,
+    projectId: null,
+    runState: "idle",
+    lastOutcome: null,
   };
 }
 
@@ -30,6 +48,8 @@ function storedToSession(s: StoredSession, ownerUserId: string): Session {
     id: s.id,
     title: s.title || "新对话",
     ownerUserId,
+    createdAt: s.createdAt,
+    lastAt: s.lastAt,
     updatedAt: new Date(s.updatedAt ?? s.lastAt ?? Date.now()).toISOString(),
     messageCount: Array.isArray(s.messages) ? s.messages.length : 0,
     // modelId 无值时不落键:upsertSessions 的 spread 合并按"键缺席=不表态"保留另一侧的值。
@@ -43,11 +63,36 @@ function metaToSession(m: SessionMeta, ownerUserId: string): Session {
     id: m.id,
     title: m.title || "新对话",
     ownerUserId,
+    createdAt: m.createdAt,
     updatedAt: new Date(m.updatedAt ?? m.lastAt ?? Date.now()).toISOString(),
     messageCount: m.messageCount ?? 0,
+    pinned: m.pinned === true,
+    projectId: m.projectId ?? null,
+    runState: m.runState === "running" ? "running" : "idle",
+    lastOutcome: m.lastOutcome ?? null,
+    lastErrorCode: m.lastErrorCode ?? null,
+    archived: m.archived === true,
+    unread: m.unread === true,
+    lastAt: m.lastAt,
     // 服务端无值(该会话从未显式选过/PATCH 尚未落地)= 键缺席,server-wins 合并不清掉本地意图。
     ...(m.modelId ? { modelId: m.modelId } : {}),
+    ...(m.agentId ? { agentId: m.agentId } : {}),
+    ...(m.lastMessagePreview ? { lastMessagePreview: m.lastMessagePreview } : {}),
   };
+}
+
+/** 分页游标：优先服务端 lastAt，否则从 updatedAt 解析。 */
+export function sessionCursorAt(s: Session): number {
+  if (typeof s.lastAt === "number" && Number.isFinite(s.lastAt)) return s.lastAt;
+  const n = Date.parse(s.updatedAt);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function isAbortError(e: unknown): boolean {
+  return (
+    (e instanceof DOMException && e.name === "AbortError") ||
+    (e instanceof Error && e.name === "AbortError")
+  );
 }
 
 /**
@@ -118,12 +163,39 @@ export type UseSessionList = {
   onHydrated: (stored: StoredSession[]) => void;
   renameSessionPrompt: (s: Session) => Promise<void>;
   deleteSessionConfirm: (s: Session) => Promise<void>;
+  togglePinSession: (s: Session) => Promise<void>;
+  moveSessionToProject: (s: Session, projectId: string | null) => Promise<void>;
+  toggleArchiveSession: (s: Session) => Promise<void>;
+  /** 批量归档 / 取消归档 / 删除 / 移动。删除会二次确认并写明条数。 */
+  batchUpdateSessions: (
+    ids: string[],
+    action: SessionBatchAction,
+    projectId?: string | null,
+  ) => Promise<void>;
+  /** 滚到底部：`before=<最老一条 lastAt>` 追加去重。没有 nextCursor 则停。 */
+  loadMoreSessions: () => Promise<void>;
+  hasMoreSessions: boolean;
+  loadingMoreSessions: boolean;
+  /** 展开「已归档」时用 includeArchived=1 拉取并合并。 */
+  loadArchivedSessions: () => Promise<void>;
+  loadingArchived: boolean;
+  /** 服务端全文搜索（消息命中）。调用方负责防抖与 AbortController。 */
+  searchSessionMessages: (q: string, signal: AbortSignal) => Promise<SessionSearchHit[]>;
+  applySessionTerminal: (
+    sessId: string,
+    terminal: { lastOutcome: SessionLastOutcome; lastErrorCode: string | null } | null,
+  ) => void;
   /** 登出/登录时的整体重置：清列表与选中、清已拉历史标记、允许重新自动选中最近会话。 */
   reset: () => void;
   /** listSessions 已落定（成功或失败）：URL 深链恢复据此判定"会话确实不存在"。 */
   serverListSettled: boolean;
   /** 当前活动会话的 canonical history 请求仍在途。用于避免慢响应期间误显空会话。 */
   historyLoading: boolean;
+  /** GET 失败且按 sessionId+token 隔离。404 不算失败。 */
+  historyError: { sessionId: string; token: number; message: string } | null;
+  /** 直接重拉当前会话历史，不走 selectSession（同 activeId 会提前返回）。 */
+  retryHistory: (id: string) => void;
+  loadHistory: (id: string, opts?: { force?: boolean }) => Promise<void>;
 };
 
 /**
@@ -141,6 +213,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
   // 依赖（保持 selectSession/newSession 依赖面与拆分前一致；useChatSocket persistRef 同款）。
   const cbRef = useRef(opts);
   cbRef.current = opts;
+  const toast = useToast();
 
   const [sessions, setSessions] = useState<Session[]>(demo ? DEMO_SESSIONS : []);
   const [activeId, setActiveId] = useState<string | undefined>(
@@ -156,6 +229,9 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
   const [historyLoadingTokens, setHistoryLoadingTokens] = useState<Map<string, number>>(
     () => new Map(),
   );
+  const [historyErrorBySession, setHistoryErrorBySession] = useState<
+    Map<string, { token: number; message: string }>
+  >(() => new Map());
   const historyFetchedAtRef = useRef<Map<string, number>>(new Map());
   // 登录后是否已自动选中"上次会话"（仅做一次：避免覆盖用户随后的显式新建/切换/删除）。
   const autoSelectedRef = useRef(false);
@@ -227,12 +303,13 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
   // 按需拉取单会话 server canonical 历史并合并进 WS service（server-wins / id 幂等）。
   // 经稳定 sockRef 调用历史方法，避免依赖每帧重建的 chat 引用。
   const loadHistory = useCallback(
-    async (id: string) => {
+    async (id: string, opts?: { force?: boolean }) => {
       const owner = userIdRef.current;
       if (!auth || !owner) return;
-      if (historyFetchingRef.current.has(id)) return; // 并发中：不重入
+      if (!opts?.force && historyFetchingRef.current.has(id)) return; // 并发中：不重入
       const lastAt = historyFetchedAtRef.current.get(id) ?? 0;
-      if (Date.now() - lastAt < HISTORY_REFETCH_COOLDOWN_MS) return; // 短时重复：不重拉
+      if (!opts?.force && Date.now() - lastAt < HISTORY_REFETCH_COOLDOWN_MS) return; // 短时重复：不重拉
+      if (opts?.force && historyFetchingRef.current.has(id)) return;
       const requestToken = ++historyRequestTokenRef.current;
       historyFetchingRef.current.set(id, requestToken);
       setHistoryLoadingTokens((current) => {
@@ -250,10 +327,8 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
           sinceHistoryRevision,
         );
         // await 期间换号、reset 或删除会话 → 丢弃旧响应，绝不污染当前会话/IndexedDB。
-        if (
-          userIdRef.current !== owner ||
-          historyFetchingRef.current.get(id) !== requestToken
-        ) return;
+        if (userIdRef.current !== owner || historyFetchingRef.current.get(id) !== requestToken)
+          return;
         const msgs = Array.isArray(detail.messages) ? (detail.messages as ChatMessage[]) : [];
         // 会话模型陈旧载荷拦截:pending 意图存续/低于已确认写水位的 detail,其 modelId
         // 不应用(消息合并照常 —— socket 有自己的版本护栏)。
@@ -279,48 +354,71 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
           timelineHasMore: detail.timelineHasMore,
           timelineSnapshotMaxSeq: detail.timelineSnapshotMaxSeq,
           invalidateHistoryCache: detail._historyRevisionUnsupported === true,
+          openDispatch: detail.openDispatch,
         });
+        // Canonical GET is enough to dismiss the history skeleton. Journal
+        // hydrate is a background fill — awaiting it used to pin
+        // 「正在加载会话内容…」for as long as live-frames hung.
+        if (historyFetchingRef.current.get(id) === requestToken) {
+          setHistoryLoadingTokens((current) => {
+            if (current.get(id) !== requestToken) return current;
+            const next = new Map(current);
+            next.delete(id);
+            return next;
+          });
+        }
         const liveSocket = cbRef.current.sockRef.current;
-        if (liveSocket) {
-          await liveSocket.hydrateDurableLiveFrameJournal(
-            id,
-            (after) => api.getSessionLiveFrames(
-              cbRef.current.authSession,
+        if (liveSocket?.hydrateDurableLiveFrameJournal) {
+          void liveSocket
+            .hydrateDurableLiveFrameJournal(
               id,
-              after,
-              500,
-            ),
-            async () => {
-              const tapeDetail = await api.getSession(cbRef.current.authSession, id, 0);
-              liveSocket.mergeServerHistory({
-                sessId: id,
-                agentId: tapeDetail.agentId || agentId,
-                messages: Array.isArray(tapeDetail.messages) ? tapeDetail.messages as ChatMessage[] : [],
-                full: !tapeDetail.isPartial,
-                maxSeq: tapeDetail.maxSeq,
-                archivedThroughSeq: tapeDetail.archivedThroughSeq,
-                archivedCount: tapeDetail.archivedCount,
-                serverUpdatedAt: tapeDetail.updatedAt,
-                modelId: tapeDetail.modelId,
-                historyRevision: tapeDetail.historyRevision,
-                timelineGeneration: tapeDetail.timelineGeneration,
-                timelineCursor: tapeDetail.timelineCursor,
-                timelineHasMore: tapeDetail.timelineHasMore,
-                timelineSnapshotMaxSeq: tapeDetail.timelineSnapshotMaxSeq,
-                invalidateHistoryCache: tapeDetail._historyRevisionUnsupported === true,
-              });
-            },
-          );
+              (after) => api.getSessionLiveFrames(cbRef.current.authSession, id, after, 500),
+              async () => {
+                const tapeDetail = await api.getSession(cbRef.current.authSession, id, 0);
+                liveSocket.mergeServerHistory({
+                  sessId: id,
+                  agentId: tapeDetail.agentId || agentId,
+                  messages: Array.isArray(tapeDetail.messages)
+                    ? (tapeDetail.messages as ChatMessage[])
+                    : [],
+                  full: !tapeDetail.isPartial,
+                  maxSeq: tapeDetail.maxSeq,
+                  archivedThroughSeq: tapeDetail.archivedThroughSeq,
+                  archivedCount: tapeDetail.archivedCount,
+                  serverUpdatedAt: tapeDetail.updatedAt,
+                  modelId: tapeDetail.modelId,
+                  historyRevision: tapeDetail.historyRevision,
+                  timelineGeneration: tapeDetail.timelineGeneration,
+                  timelineCursor: tapeDetail.timelineCursor,
+                  timelineHasMore: tapeDetail.timelineHasMore,
+                  timelineSnapshotMaxSeq: tapeDetail.timelineSnapshotMaxSeq,
+                  invalidateHistoryCache: tapeDetail._historyRevisionUnsupported === true,
+                });
+              },
+              (query) => api.getSessionLiveUnits(cbRef.current.authSession, id, { n: 20, ...query }),
+            )
+            .catch(() => {
+              /* hydrate degrades internally; a thrown first page must not resurrect the skeleton */
+            });
         }
         // 会话级模型选择的侧栏回填:detail 比 boot 时的 listSessions 新(他设备刚改过),
         // 不回填则 App 恢复选择器仍读侧栏旧值。server-wins,detail 无值不清本地
         // (服务端 NULL 只表示"从未显式选择",不存在"清除"流,缺席=不表态)。
         if (freshModelId) {
           setSessions((c) =>
-            c.map((s) => (s.id === id && s.modelId !== freshModelId ? { ...s, modelId: freshModelId } : s)),
+            c.map((s) =>
+              s.id === id && s.modelId !== freshModelId ? { ...s, modelId: freshModelId } : s,
+            ),
           );
         }
         historyFetchedAtRef.current.set(id, Date.now());
+        setHistoryErrorBySession((current) => {
+          const existing = current.get(id);
+          if (!existing || existing.token > requestToken) return current;
+          const next = new Map(current);
+          next.delete(id);
+          return next;
+        });
       } catch (e) {
         // 404 = 本地新建/未同步会话，无 server 历史（正常）：打冷却戳，避免每次重选都空打 404，
         // 但仍非永久（会话后续被 server 持久化后，冷却过去可正常增量拉到）。其他错误不打戳 →
@@ -329,7 +427,28 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
           e instanceof ApiError &&
           e.status === 404 &&
           historyFetchingRef.current.get(id) === requestToken
-        ) historyFetchedAtRef.current.set(id, Date.now());
+        ) {
+          historyFetchedAtRef.current.set(id, Date.now());
+          setHistoryErrorBySession((current) => {
+            const existing = current.get(id);
+            if (!existing || existing.token > requestToken) return current;
+            const next = new Map(current);
+            next.delete(id);
+            return next;
+          });
+        } else if (historyFetchingRef.current.get(id) === requestToken) {
+          const message =
+            e instanceof ApiError
+              ? e.message || `加载失败 (${e.status})`
+              : e instanceof Error
+                ? e.message
+                : "加载失败";
+          setHistoryErrorBySession((current) => {
+            const next = new Map(current);
+            next.set(id, { token: requestToken, message });
+            return next;
+          });
+        }
       } finally {
         if (historyFetchingRef.current.get(id) === requestToken) {
           historyFetchingRef.current.delete(id);
@@ -344,6 +463,14 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     },
     // modelPayloadFresh 为稳定 useCallback([]),入 deps 仅为满足 lint,不改重建时机。
     [auth, agentId, modelPayloadFresh],
+  );
+
+  const retryHistory = useCallback(
+    (id: string) => {
+      historyFetchedAtRef.current.delete(id);
+      void loadHistory(id, { force: true });
+    },
+    [loadHistory],
   );
 
   const selectSession = useCallback(
@@ -379,38 +506,87 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
 
   // listSessions 是否已落定（成功或失败都算）：URL 深链恢复用它判定"等无可等"。
   const [serverListSettled, setServerListSettled] = useState(false);
+  const [hasMoreSessions, setHasMoreSessions] = useState(true);
+  const [loadingMoreSessions, setLoadingMoreSessions] = useState(false);
+  const [loadingArchived, setLoadingArchived] = useState(false);
+  const nextCursorRef = useRef<number | undefined>(undefined);
+  const loadMoreInflightRef = useRef(false);
+  const archivedFetchedRef = useRef(false);
+  const listRefreshInflightRef = useRef(false);
+
+  const mapListMetas = useCallback(
+    (metas: SessionMeta[]): Session[] => {
+      if (!user) return [];
+      return metas.map((m) => {
+        const s = metaToSession(m, user.id);
+        if (s.modelId !== undefined && !modelPayloadFresh(m.id, m.updatedAt)) {
+          const { modelId: _stale, ...rest } = s;
+          return rest;
+        }
+        return s;
+      });
+    },
+    [user, modelPayloadFresh],
+  );
+
+  const refreshSessionList = useCallback(
+    async (opts?: { initial?: boolean; cancelled?: () => boolean }) => {
+      if (demo || !auth || !user) return;
+      if (listRefreshInflightRef.current && !opts?.initial) return;
+      listRefreshInflightRef.current = true;
+      try {
+        const metas = await api.listSessions(cbRef.current.authSession);
+        if (opts?.cancelled?.()) return;
+        const server = mapListMetas(metas);
+        setSessions((cur) => upsertSessions(cur, server, true));
+        if (opts?.initial) {
+          nextCursorRef.current = undefined;
+          setHasMoreSessions(server.length > 0);
+        }
+      } catch {
+        /* 列表失败：保留本地会话，不打断工作区 */
+      } finally {
+        listRefreshInflightRef.current = false;
+      }
+    },
+    [demo, auth, user, mapListMetas],
+  );
 
   // 历史会话列表：登录后用 listSessions 填侧栏（server canonical 元数据 server-wins）。
   // 失败保留本地（IndexedDB 注水）会话，不阻断。
   useEffect(() => {
     if (demo || !auth || !user) return;
     let cancelled = false;
-    api
-      .listSessions(cbRef.current.authSession)
-      .then((metas) => {
-        if (cancelled) return;
-        const server = metas.map((m) => {
-          const s = metaToSession(m, user.id);
-          // 会话模型陈旧载荷拦截(与 loadHistory 同款):pending 意图存续/低于已确认写水位
-          // → 剥掉其 modelId 键(键缺席=不表态,合并保留本地新选择),其余元数据照常 server-wins。
-          if (s.modelId !== undefined && !modelPayloadFresh(m.id, m.updatedAt)) {
-            const { modelId: _stale, ...rest } = s;
-            return rest;
-          }
-          return s;
-        });
-        setSessions((cur) => upsertSessions(cur, server, true));
-      })
-      .catch(() => {
-        /* 列表失败：保留本地会话，不打断工作区 */
-      })
-      .finally(() => {
-        if (!cancelled) setServerListSettled(true);
-      });
+    refreshSessionList({ initial: true, cancelled: () => cancelled }).finally(() => {
+      if (!cancelled) setServerListSettled(true);
+    });
     return () => {
       cancelled = true;
     };
-  }, [demo, auth, user, modelPayloadFresh]);
+  }, [demo, auth, user, refreshSessionList]);
+
+  // 可见标签 60s 轮询 + 切回前台/窗口 focus 立即重拉。hidden 不打；未登录/demo 不拉。
+  // upsertSessions union 保住已 loadMore 的行，不重置分页游标。
+  useEffect(() => {
+    if (demo || !auth || !user) return;
+    const tick = () => {
+      if (document.visibilityState === "visible") void refreshSessionList();
+    };
+    const timer = window.setInterval(tick, LIST_POLL_MS);
+    const onVis = () => {
+      if (document.visibilityState === "visible") void refreshSessionList();
+    };
+    const onFocus = () => {
+      void refreshSessionList();
+    };
+    document.addEventListener("visibilitychange", onVis);
+    window.addEventListener("focus", onFocus);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVis);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [demo, auth, user, refreshSessionList]);
 
   // 登录后自动恢复"上次会话"：侧栏（IndexedDB 注水 / listSessions）填好且用户尚未选任何会话时，
   // 选中最近一条（sessions 已按 updatedAt 倒序，[0]=最近）。仅做一次（autoSelectedRef）——
@@ -474,13 +650,238 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     }
   };
 
+  const patchSessionMetaOptimistic = async (
+    s: Session,
+    patch: { pinned?: boolean; projectId?: string | null; archived?: boolean },
+    next: Session,
+  ) => {
+    setSessions((c) => c.map((x) => (x.id === s.id ? next : x)));
+    if (demo) return;
+    try {
+      await api.patchSessionMeta(cbRef.current.authSession, s.id, patch);
+    } catch (e) {
+      setSessions((c) => c.map((x) => (x.id === s.id ? s : x)));
+      console.warn("patchSessionMeta failed", e);
+      toast("操作失败，已恢复", "error");
+    }
+  };
+
+  const togglePinSession = async (s: Session) => {
+    const pinned = !s.pinned;
+    await patchSessionMetaOptimistic(s, { pinned }, { ...s, pinned });
+  };
+
+  const moveSessionToProject = async (s: Session, projectId: string | null) => {
+    if ((s.projectId ?? null) === projectId) return;
+    await patchSessionMetaOptimistic(s, { projectId }, { ...s, projectId });
+  };
+
+  const toggleArchiveSession = async (s: Session) => {
+    const archived = !s.archived;
+    await patchSessionMetaOptimistic(s, { archived }, { ...s, archived });
+  };
+
+  const forgetSessionLocal = (id: string) => {
+    historyFetchedAtRef.current.delete(id);
+    historyFetchingRef.current.delete(id);
+    setHistoryLoadingTokens((current) => {
+      if (!current.has(id)) return current;
+      const next = new Map(current);
+      next.delete(id);
+      return next;
+    });
+    modelSyncRef.current.delete(id);
+    cbRef.current.onDeleteSession?.(id);
+    if (!demo) {
+      cbRef.current.sockRef.current?.removeSession(id);
+      cbRef.current.sockRef.current?.removePersisted(id);
+    }
+  };
+
+  const batchUpdateSessions = async (
+    ids: string[],
+    action: SessionBatchAction,
+    projectId?: string | null,
+  ) => {
+    const unique = [...new Set(ids)].filter(Boolean);
+    if (unique.length === 0) return;
+    if (action === "delete") {
+      const ok = await cbRef.current.confirmDialog({
+        title: `删除 ${unique.length} 条会话?`,
+        body: `将删除 ${unique.length} 条会话的本地与云端记录，不可恢复。`,
+        confirmText: "删除",
+        danger: true,
+      });
+      if (!ok) return;
+    }
+    const snapshot = sessions.filter((s) => unique.includes(s.id));
+    if (snapshot.length === 0) return;
+    const idSet = new Set(unique);
+    const deletedActive = action === "delete" && Boolean(activeId && idSet.has(activeId));
+    setSessions((c) => {
+      if (action === "delete") return c.filter((s) => !idSet.has(s.id));
+      return c.map((s) => {
+        if (!idSet.has(s.id)) return s;
+        if (action === "archive") return { ...s, archived: true };
+        if (action === "unarchive") return { ...s, archived: false };
+        if (action === "move") return { ...s, projectId: projectId ?? null };
+        return s;
+      });
+    });
+    if (deletedActive) {
+      setActiveId(undefined);
+      cbRef.current.onActiveSessionDeleted();
+    }
+    if (demo) {
+      if (action === "delete") for (const id of unique) forgetSessionLocal(id);
+      return;
+    }
+    try {
+      await api.batchSessions(cbRef.current.authSession, {
+        ids: unique,
+        action,
+        ...(action === "move" ? { projectId: projectId ?? null } : {}),
+      });
+      if (action === "delete") for (const id of unique) forgetSessionLocal(id);
+    } catch (e) {
+      setSessions((c) => {
+        const map = new Map(c.map((s) => [s.id, s]));
+        for (const s of snapshot) map.set(s.id, s);
+        return [...map.values()].sort((a, b) =>
+          a.updatedAt < b.updatedAt ? 1 : a.updatedAt > b.updatedAt ? -1 : 0,
+        );
+      });
+      console.warn("batchSessions failed", e);
+      toast("操作失败，已恢复", "error");
+    }
+  };
+
+  const loadMoreSessions = async () => {
+    if (demo || !auth || !user || loadMoreInflightRef.current || !hasMoreSessions) return;
+    const live = sessions.filter((s) => !s.archived);
+    const oldest = live.length ? Math.min(...live.map(sessionCursorAt)) : nextCursorRef.current;
+    if (oldest == null || oldest <= 0) {
+      setHasMoreSessions(false);
+      return;
+    }
+    loadMoreInflightRef.current = true;
+    setLoadingMoreSessions(true);
+    try {
+      const page = await api.listSessionsPage(cbRef.current.authSession, {
+        limit: 50,
+        before: nextCursorRef.current ?? oldest,
+      });
+      const incoming = page.sessions.map((m) => {
+        const s = metaToSession(m, user.id);
+        if (s.modelId !== undefined && !modelPayloadFresh(m.id, m.updatedAt)) {
+          const { modelId: _stale, ...rest } = s;
+          return rest;
+        }
+        return s;
+      });
+      setSessions((cur) => upsertSessions(cur, incoming, true));
+      nextCursorRef.current = page.nextCursor;
+      setHasMoreSessions(page.nextCursor != null && incoming.length > 0);
+    } catch (e) {
+      console.warn("listSessionsPage failed", e);
+      setHasMoreSessions(false);
+    } finally {
+      loadMoreInflightRef.current = false;
+      setLoadingMoreSessions(false);
+    }
+  };
+
+  const loadArchivedSessions = async () => {
+    if (demo || !auth || !user || archivedFetchedRef.current) return;
+    archivedFetchedRef.current = true;
+    setLoadingArchived(true);
+    try {
+      const page = await api.listSessionsPage(cbRef.current.authSession, {
+        includeArchived: true,
+      });
+      const incoming = page.sessions.map((m) => {
+        const s = metaToSession(m, user.id);
+        if (s.modelId !== undefined && !modelPayloadFresh(m.id, m.updatedAt)) {
+          const { modelId: _stale, ...rest } = s;
+          return rest;
+        }
+        return s;
+      });
+      setSessions((cur) => upsertSessions(cur, incoming, true));
+    } catch (e) {
+      archivedFetchedRef.current = false;
+      console.warn("loadArchivedSessions failed", e);
+      toast("无法加载已归档会话", "error");
+    } finally {
+      setLoadingArchived(false);
+    }
+  };
+
+  const searchSessionMessages = async (
+    q: string,
+    signal: AbortSignal,
+  ): Promise<SessionSearchHit[]> => {
+    if (demo || !auth || !q.trim()) return [];
+    try {
+      const res = await api.searchSessions(cbRef.current.authSession, q.trim(), {
+        limit: 30,
+        includeArchived: false,
+        signal,
+      });
+      return res.results.filter((hit) => hit.kind === "message");
+    } catch (e) {
+      if (isAbortError(e) || signal.aborted) return [];
+      throw e;
+    }
+  };
+
+  const applySessionTerminal = useCallback(
+    (
+      sessId: string,
+      terminal: { lastOutcome: SessionLastOutcome; lastErrorCode: string | null } | null,
+    ) => {
+      setSessions((c) =>
+        c.map((x) => {
+          if (x.id !== sessId) return x;
+          const nextOutcome = terminal ? terminal.lastOutcome : x.lastOutcome;
+          const nextCode = terminal ? terminal.lastErrorCode : x.lastErrorCode;
+          if (
+            x.runState === "idle" &&
+            x.lastOutcome === nextOutcome &&
+            x.lastErrorCode === nextCode
+          ) {
+            return x;
+          }
+          return {
+            ...x,
+            runState: "idle" as const,
+            ...(terminal
+              ? {
+                  lastOutcome: terminal.lastOutcome,
+                  lastErrorCode: terminal.lastErrorCode,
+                  unread: true,
+                }
+              : {}),
+          };
+        }),
+      );
+    },
+    [],
+  );
+
   // 登出/登录时的整体重置（App 的 useAuth onClearAuth/onLoginSuccess 经 ref 回填调用）。
   const reset = useCallback(() => {
     historyFetchedAtRef.current.clear();
     historyFetchingRef.current.clear();
     setHistoryLoadingTokens(new Map());
+    setHistoryErrorBySession(new Map());
     modelSyncRef.current.clear();
     autoSelectedRef.current = false; // 下次登录重新自动选中最近会话
+    nextCursorRef.current = undefined;
+    archivedFetchedRef.current = false;
+    setHasMoreSessions(true);
+    setLoadingMoreSessions(false);
+    setLoadingArchived(false);
     setSessions([]);
     setActiveId(undefined);
     setServerListSettled(false); // 重新登录后 listSessions 重新落定
@@ -497,8 +898,30 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     onHydrated,
     renameSessionPrompt,
     deleteSessionConfirm,
+    togglePinSession,
+    moveSessionToProject,
+    toggleArchiveSession,
+    batchUpdateSessions,
+    loadMoreSessions,
+    hasMoreSessions,
+    loadingMoreSessions,
+    loadArchivedSessions,
+    loadingArchived,
+    searchSessionMessages,
+    applySessionTerminal,
     reset,
     serverListSettled,
     historyLoading: activeId !== undefined && historyLoadingTokens.has(activeId),
+    historyError: activeId
+      ? (() => {
+          const row = historyErrorBySession.get(activeId);
+          if (!row) return null;
+          const loadingToken = historyLoadingTokens.get(activeId);
+          if (loadingToken !== undefined && loadingToken > row.token) return null;
+          return { sessionId: activeId, token: row.token, message: row.message };
+        })()
+      : null,
+    retryHistory,
+    loadHistory,
   };
 }

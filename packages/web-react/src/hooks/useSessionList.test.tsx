@@ -1,6 +1,6 @@
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { type Mock, afterEach, describe, expect, test, vi } from "vitest";
-import { api } from "../lib/api";
+import { api, ApiError } from "../lib/api";
 import { createMemoryAuthSession } from "../lib/authSession";
 import type { SessionDetail, User } from "../lib/types";
 import type { UseChatSocket } from "./useChatSocket";
@@ -358,5 +358,383 @@ describe("useSessionList history loading fence", () => {
     });
     await waitFor(() => expect(result.current.historyLoading).toBe(false));
     expect(socket.mergeServerHistory).toHaveBeenCalledTimes(1);
+  });
+
+  test("canonical getSession 返回后即清骨架,不等 journal 水合", async () => {
+    const history = deferred<SessionDetail>();
+    const journal = deferred<void>();
+    vi.spyOn(api, "listSessions").mockResolvedValue([]);
+    vi.spyOn(api, "getSession").mockImplementation(async () => history.promise);
+    const hydrateDurableLiveFrameJournal = vi.fn(async () => journal.promise);
+    const auth = createMemoryAuthSession(() => {}, "token");
+    const user: User = { id: "u1", displayName: "User", roles: ["user"] };
+    const socket = {
+      storedMaxSeq: () => 0,
+      storedHistoryRevision: () => 1,
+      mergeServerHistory: vi.fn(),
+      hydrateDurableLiveFrameJournal,
+    } as unknown as UseChatSocket;
+    const { result } = renderHook(() => useSessionList({
+      demo: false,
+      auth,
+      authSession: auth,
+      user,
+      agentId: "main",
+      sockRef: { current: socket },
+      confirmDialog: async () => true,
+      promptText: async () => null,
+      clearChatError: () => {},
+      onNewSessionReset: () => {},
+      onActiveSessionDeleted: () => {},
+    }));
+
+    act(() => result.current.selectSession("webhistory02"));
+    await waitFor(() => expect(result.current.historyLoading).toBe(true));
+
+    await act(async () => {
+      history.resolve(detail("webhistory02"));
+      await history.promise;
+    });
+    await waitFor(() => expect(result.current.historyLoading).toBe(false));
+    expect(hydrateDurableLiveFrameJournal).toHaveBeenCalledTimes(1);
+    expect(socket.mergeServerHistory).toHaveBeenCalledTimes(1);
+  });
+
+  test("GET 5xx 且侧栏 messageCount>0 记 historyError，retryHistory 不走 selectSession", async () => {
+    vi.spyOn(api, "listSessions").mockResolvedValue([
+      {
+        id: "webhistory5xx",
+        title: "非空会话",
+        agentId: "main",
+        updatedAt: 2_000,
+        lastAt: 2_000,
+        messageCount: 4,
+      },
+    ] as never);
+    const getSession = vi.spyOn(api, "getSession").mockRejectedValue(
+      new ApiError({ status: 500, message: "get failed" }),
+    );
+    const auth = createMemoryAuthSession(() => {}, "token");
+    const user: User = { id: "u1", displayName: "User", roles: ["user"] };
+    const socket = {
+      storedMaxSeq: () => 0,
+      storedHistoryRevision: () => 1,
+      mergeServerHistory: vi.fn(),
+    } as unknown as UseChatSocket;
+    const { result } = renderHook(() => useSessionList({
+      demo: false,
+      auth,
+      authSession: auth,
+      user,
+      agentId: "main",
+      sockRef: { current: socket },
+      confirmDialog: async () => true,
+      promptText: async () => null,
+      clearChatError: () => {},
+      onNewSessionReset: () => {},
+      onActiveSessionDeleted: () => {},
+    }));
+    await waitFor(() => expect(result.current.sessions.some((s) => s.id === "webhistory5xx")).toBe(true));
+    act(() => result.current.selectSession("webhistory5xx"));
+    await waitFor(() => expect(result.current.historyError?.sessionId).toBe("webhistory5xx"));
+    expect(result.current.historyError?.message).toMatch(/get failed|加载失败/);
+    const activeBefore = result.current.activeId;
+    getSession.mockRejectedValueOnce(new ApiError({ status: 500, message: "get failed again" }));
+    act(() => result.current.retryHistory("webhistory5xx"));
+    await waitFor(() => expect(getSession.mock.calls.length).toBeGreaterThanOrEqual(2));
+    expect(result.current.activeId).toBe(activeBefore);
+  });
+
+  test("GET 404 不当成 historyError", async () => {
+    vi.spyOn(api, "listSessions").mockResolvedValue([]);
+    vi.spyOn(api, "getSession").mockRejectedValue(new ApiError({ status: 404, message: "not found" }));
+    const auth = createMemoryAuthSession(() => {}, "token");
+    const user: User = { id: "u1", displayName: "User", roles: ["user"] };
+    const socket = {
+      storedMaxSeq: () => 0,
+      storedHistoryRevision: () => 1,
+      mergeServerHistory: vi.fn(),
+    } as unknown as UseChatSocket;
+    const { result } = renderHook(() => useSessionList({
+      demo: false,
+      auth,
+      authSession: auth,
+      user,
+      agentId: "main",
+      sockRef: { current: socket },
+      confirmDialog: async () => true,
+      promptText: async () => null,
+      clearChatError: () => {},
+      onNewSessionReset: () => {},
+      onActiveSessionDeleted: () => {},
+    }));
+    act(() => result.current.selectSession("weblocalnew1"));
+    await waitFor(() => expect(result.current.historyLoading).toBe(false));
+    expect(result.current.historyError).toBeNull();
+  });
+});
+
+describe("useSessionList 置顶 / 项目归属 / 终态字段", () => {
+  test("listSessions 的 pinned / projectId / lastOutcome 会进入侧栏 Session（不再丢弃）", async () => {
+    vi.spyOn(api, "listSessions").mockResolvedValue([
+      {
+        id: "webpinned01",
+        title: "钉住的会话",
+        agentId: "coder",
+        pinned: true,
+        projectId: "p-work",
+        runState: "idle",
+        lastOutcome: "completed",
+        lastErrorCode: null,
+        createdAt: 1,
+        lastAt: 2_000,
+        updatedAt: 2_000,
+        messageCount: 4,
+      },
+    ] as never);
+    vi.spyOn(api, "getSession").mockResolvedValue(detail("webpinned01"));
+    const auth = createMemoryAuthSession(() => {}, "token");
+    const user: User = { id: "u1", displayName: "User", roles: ["user"] };
+    const { result } = renderHook(() =>
+      useSessionList({
+        demo: false,
+        auth,
+        authSession: auth,
+        user,
+        agentId: "main",
+        sockRef: { current: { storedMaxSeq: () => 0, storedHistoryRevision: () => 1, mergeServerHistory: vi.fn() } as never },
+        confirmDialog: async () => false,
+        promptText: async () => null,
+        clearChatError: () => {},
+        onNewSessionReset: () => {},
+        onActiveSessionDeleted: () => {},
+      }),
+    );
+    await waitFor(() => expect(result.current.sessions.length).toBe(1));
+    const s = result.current.sessions[0];
+    expect(s.pinned).toBe(true);
+    expect(s.projectId).toBe("p-work");
+    expect(s.agentId).toBe("coder");
+    expect(s.lastOutcome).toBe("completed");
+    expect(s.runState).toBe("idle");
+  });
+
+  test("togglePinSession 乐观更新并 PATCH meta；失败回滚", async () => {
+    vi.spyOn(api, "listSessions").mockResolvedValue([
+      { id: "webkeepme001", title: "保留的会话", agentId: "main", pinned: false, updatedAt: 2_000, lastAt: 2_000, messageCount: 1 },
+    ] as never);
+    vi.spyOn(api, "getSession").mockResolvedValue(detail("webkeepme001"));
+    const patch = vi.spyOn(api, "patchSessionMeta").mockRejectedValue(new Error("boom"));
+    const { result } = await renderSessionList({ confirmResult: false, promptResult: null });
+    const target = result.current.sessions[0];
+    expect(target.pinned).toBe(false);
+    await act(async () => {
+      await result.current.togglePinSession(target);
+    });
+    expect(patch).toHaveBeenCalledWith(expect.anything(), "webkeepme001", { pinned: true });
+    expect(result.current.sessions[0].pinned).toBe(false);
+  });
+
+  test("listSessions 的 archived / lastMessagePreview / createdAt / lastAt 进入侧栏 Session", async () => {
+    vi.spyOn(api, "listSessions").mockResolvedValue([
+      {
+        id: "webarchive01",
+        title: "归档会话",
+        agentId: "main",
+        archived: true,
+        lastMessagePreview: "最后一句",
+        createdAt: 1,
+        lastAt: 3_000,
+        updatedAt: 3_000,
+        messageCount: 2,
+        pinned: false,
+      },
+    ] as never);
+    vi.spyOn(api, "getSession").mockResolvedValue(detail("webarchive01"));
+    const auth = createMemoryAuthSession(() => {}, "token");
+    const user: User = { id: "u1", displayName: "User", roles: ["user"] };
+    const { result } = renderHook(() =>
+      useSessionList({
+        demo: false,
+        auth,
+        authSession: auth,
+        user,
+        agentId: "main",
+        sockRef: { current: { storedMaxSeq: () => 0, storedHistoryRevision: () => 1, mergeServerHistory: vi.fn() } as never },
+        confirmDialog: async () => false,
+        promptText: async () => null,
+        clearChatError: () => {},
+        onNewSessionReset: () => {},
+        onActiveSessionDeleted: () => {},
+      }),
+    );
+    await waitFor(() => expect(result.current.sessions.length).toBe(1));
+    expect(result.current.sessions[0].archived).toBe(true);
+    expect(result.current.sessions[0].lastMessagePreview).toBe("最后一句");
+    expect(result.current.sessions[0].createdAt).toBe(1);
+    expect(result.current.sessions[0].lastAt).toBe(3_000);
+  });
+
+  test("toggleArchiveSession 乐观更新并 PATCH archived；失败回滚", async () => {
+    vi.spyOn(api, "listSessions").mockResolvedValue([
+      { id: "webkeepme001", title: "保留的会话", agentId: "main", archived: false, updatedAt: 2_000, lastAt: 2_000, messageCount: 1 },
+    ] as never);
+    vi.spyOn(api, "getSession").mockResolvedValue(detail("webkeepme001"));
+    const patch = vi.spyOn(api, "patchSessionMeta").mockRejectedValue(new Error("boom"));
+    const { result } = await renderSessionList({ confirmResult: false, promptResult: null });
+    const target = result.current.sessions[0];
+    await act(async () => {
+      await result.current.toggleArchiveSession(target);
+    });
+    expect(patch).toHaveBeenCalledWith(expect.anything(), "webkeepme001", { archived: true });
+    expect(result.current.sessions[0].archived).toBe(false);
+  });
+
+  test("batchUpdateSessions 删除先确认条数，取消则不动；确认则乐观移除", async () => {
+    const batch = vi.spyOn(api, "batchSessions").mockResolvedValue({ ok: true, updated: 1 });
+    const { result, harness } = await renderSessionList({ confirmResult: false, promptResult: null });
+    await act(async () => {
+      await result.current.batchUpdateSessions(["webdropme001"], "delete");
+    });
+    expect(harness.confirmCalls[0]?.title).toContain("1 条");
+    expect(result.current.sessions.map((s) => s.id)).toContain("webdropme001");
+    expect(batch).not.toHaveBeenCalled();
+  });
+
+  test("batchUpdateSessions 归档乐观更新，失败回滚", async () => {
+    vi.spyOn(api, "batchSessions").mockRejectedValue(new Error("nope"));
+    const { result } = await renderSessionList({ confirmResult: true, promptResult: null });
+    await act(async () => {
+      await result.current.batchUpdateSessions(["webkeepme001"], "archive");
+    });
+    expect(result.current.sessions.find((s) => s.id === "webkeepme001")?.archived).toBeFalsy();
+  });
+
+  test("loadMoreSessions 用 before=lastAt 追加去重，无 nextCursor 则停", async () => {
+    const page = vi.spyOn(api, "listSessionsPage").mockResolvedValue({
+      sessions: [
+        {
+          id: "webkeepme001",
+          title: "保留的会话",
+          agentId: "main",
+          pinned: false,
+          createdAt: 1,
+          lastAt: 2_000,
+          updatedAt: 2_000,
+          messageCount: 3,
+        },
+        {
+          id: "webolder0001",
+          title: "更早的一页",
+          agentId: "main",
+          pinned: false,
+          createdAt: 1,
+          lastAt: 1_000,
+          updatedAt: 1_000,
+          messageCount: 1,
+        },
+      ],
+    });
+    const { result } = await renderSessionList({ confirmResult: false, promptResult: null });
+    await act(async () => {
+      await result.current.loadMoreSessions();
+    });
+    expect(page).toHaveBeenCalled();
+    const query = page.mock.calls[0][1];
+    expect(query?.before).toBeDefined();
+    expect(result.current.sessions.map((s) => s.id)).toEqual(
+      expect.arrayContaining(["webkeepme001", "webdropme001", "webolder0001"]),
+    );
+    expect(result.current.hasMoreSessions).toBe(false);
+  });
+
+  test("首屏不拉 includeArchived；loadArchivedSessions 才带该参数", async () => {
+    const page = vi.spyOn(api, "listSessionsPage").mockResolvedValue({ sessions: [] });
+    const { result } = await renderSessionList({ confirmResult: false, promptResult: null });
+    expect(page).not.toHaveBeenCalled();
+    await act(async () => {
+      await result.current.loadArchivedSessions();
+    });
+    expect(page).toHaveBeenCalledTimes(1);
+    expect(page.mock.calls[0][1]).toEqual({ includeArchived: true });
+  });
+
+  test("searchSessionMessages 只回 message 命中，AbortError 当空数组", async () => {
+    vi.spyOn(api, "searchSessions").mockResolvedValue({
+      results: [
+        { sessionId: "a", title: "t", snippet: "x", matchedAt: 1, kind: "title" },
+        { sessionId: "b", title: "t2", snippet: "y", matchedAt: 2, kind: "message" },
+      ],
+    });
+    const { result } = await renderSessionList({ confirmResult: false, promptResult: null });
+    const hits = await result.current.searchSessionMessages("foo", new AbortController().signal);
+    expect(hits.map((h) => h.sessionId)).toEqual(["b"]);
+
+    vi.spyOn(api, "searchSessions").mockRejectedValue(new DOMException("aborted", "AbortError"));
+    const aborted = await result.current.searchSessionMessages("foo", new AbortController().signal);
+    expect(aborted).toEqual([]);
+  });
+
+  test("hidden→visible 触发 listSessions，hidden 不轮询", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const { result } = await renderSessionList({ confirmResult: false, promptResult: null });
+      expect(result.current.sessions.length).toBe(2);
+      const list = api.listSessions as unknown as Mock;
+      const afterBoot = list.mock.calls.length;
+      Object.defineProperty(document, "visibilityState", {
+        configurable: true,
+        get: () => "hidden",
+      });
+      await act(async () => {
+        vi.advanceTimersByTime(60_000);
+      });
+      expect(list.mock.calls.length).toBe(afterBoot);
+      Object.defineProperty(document, "visibilityState", {
+        configurable: true,
+        get: () => "visible",
+      });
+      await act(async () => {
+        document.dispatchEvent(new Event("visibilitychange"));
+      });
+      expect(list.mock.calls.length).toBeGreaterThan(afterBoot);
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(document, "visibilityState", {
+        configurable: true,
+        get: () => "visible",
+      });
+    }
+  });
+
+  test("visibility 重拉不丢已 loadMore 的行", async () => {
+    const page = vi.spyOn(api, "listSessionsPage").mockResolvedValue({
+      sessions: [
+        {
+          id: "webolder0001",
+          title: "更早的一页",
+          agentId: "main",
+          pinned: false,
+          createdAt: 1,
+          lastAt: 1_000,
+          updatedAt: 1_000,
+          messageCount: 1,
+        },
+      ],
+    });
+    const { result } = await renderSessionList({ confirmResult: false, promptResult: null });
+    await act(async () => {
+      await result.current.loadMoreSessions();
+    });
+    expect(page).toHaveBeenCalled();
+    expect(result.current.sessions.map((s) => s.id)).toEqual(
+      expect.arrayContaining(["webkeepme001", "webdropme001", "webolder0001"]),
+    );
+    await act(async () => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    expect(result.current.sessions.map((s) => s.id)).toEqual(
+      expect.arrayContaining(["webkeepme001", "webdropme001", "webolder0001"]),
+    );
   });
 });

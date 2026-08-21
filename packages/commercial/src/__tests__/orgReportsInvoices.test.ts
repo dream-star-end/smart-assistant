@@ -74,7 +74,7 @@ before(async () => {
   await adminExec(`CREATE DATABASE ${MY_DB} TEMPLATE template0`);
 
   await resetPool();
-  setPoolOverride(createPool({ connectionString: MY_URL, max: 10 }));
+  setPoolOverride(createPool({ connectionString: MY_URL, max: 10, statementTimeoutMs: 120_000 }));
   await runMigrations();
   // 批次 B(0112)缺席时的自洽兜底:补 org_id 列(与 0112 幂等)。
   await query(`ALTER TABLE usage_records ADD COLUMN IF NOT EXISTS org_id BIGINT`);

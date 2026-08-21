@@ -141,4 +141,15 @@ describe('_buildTurnStatusFrame — 完整 wire 帧', () => {
     const frame = _buildTurnStatusFrame(routing, null)
     assert.equal(frame.status, null)
   })
+
+  it('working 帧带可选 detail，且不会被展平成 retrying', () => {
+    const frame = _buildTurnStatusFrame(routing, { status: 'working', detail: 'Read foo.ts' })
+    assert.equal(frame.type, 'outbound.turn_status')
+    assert.equal(frame.status, 'working')
+    assert.equal((frame as { detail?: string }).detail, 'Read foo.ts')
+    assert.equal('retry' in frame, false)
+    const fields = _turnStatusWireFields({ status: 'working', detail: 'Read foo.ts' })
+    assert.deepEqual(fields, { status: 'working', detail: 'Read foo.ts' })
+    assert.deepEqual(_turnStatusWireFields({ status: 'working' }), { status: 'working' })
+  })
 })

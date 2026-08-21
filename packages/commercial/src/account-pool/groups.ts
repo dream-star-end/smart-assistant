@@ -9,7 +9,7 @@ import { getCodexAccountRuntimeChannel, getRuntimeChannel } from "../runtimeChan
 export const ACCOUNT_GROUP_KINDS = ["official_oauth", "api_relay"] as const;
 export type AccountGroupKind = (typeof ACCOUNT_GROUP_KINDS)[number];
 
-export const ACCOUNT_GROUP_PROVIDERS = ["claude", "codex", "grok"] as const;
+export const ACCOUNT_GROUP_PROVIDERS = ["claude", "codex", "grok", "cursor"] as const;
 export type AccountGroupProvider = (typeof ACCOUNT_GROUP_PROVIDERS)[number];
 
 export const RELAY_CREDENTIAL_STATUSES = ["active", "disabled", "cooldown"] as const;
@@ -201,7 +201,7 @@ function parseRelay(row: RawRelayCredentialRow): RelayCredentialRow {
 }
 
 export function assertSupportedGroupCombo(kind: AccountGroupKind, provider: AccountGroupProvider): void {
-  if (kind === "official_oauth" && (provider === "claude" || provider === "codex" || provider === "grok")) return;
+  if (kind === "official_oauth" && (provider === "claude" || provider === "codex" || provider === "grok" || provider === "cursor")) return;
   if (kind === "api_relay" && provider === "codex") return;
   throw new RangeError("unsupported_group_kind_provider");
 }

@@ -33,6 +33,7 @@
 import { createHash } from 'node:crypto'
 import { resolve } from 'node:path'
 import { createLogger } from './logger.js'
+import { issueDelegateContextToken } from './delegateContext.js'
 import { modelHintAppliedTotal } from './metrics.js'
 import { buildPromptContext } from './promptSlots.js'
 import { getPlatformPrompt } from './platformPrompts.js'
@@ -79,7 +80,7 @@ Three access paths:
 
 **Core memory → search on demand, then edit files directly.** Run
 \`oc-memory core-search "<specific topic>" [--limit N] [--offset N]\` only when the current task cannot be completed accurately without a specific stored user fact, decision, or preference, or when the user explicitly requests continuity. A self-contained request or a merely similar topic is not enough. Unrelated searches return no match. The index is
-not injected. There is no \`oc-memory memory\` command. Platform Core memory lives
+injected when available, but it remains a historical hint. There is no \`oc-memory memory\` command. Platform Core memory lives
 as a \`MEMORY.md\` index plus one \`memory/<slug>.md\` file per entry. The
 \`# Memory\` section further down in this platform context gives you the exact
 absolute paths for *this* agent, the frontmatter format, the four \`type\`
@@ -87,6 +88,12 @@ categories (user / feedback / project / reference), and the two-step save
 (write the \`memory/<slug>.md\` file, then append one index line to
 \`MEMORY.md\`). Save a memory the same way you would create or edit any file;
 follow that section verbatim.
+
+When the user asks about current runtime state, deployment status, latest configuration,
+pricing, policy, or any other time-sensitive fact, memory may only locate what to verify.
+Check an authoritative live source in the current turn and separate historical memory from
+the timestamped current verification. If verification is unavailable, say explicitly that
+the claim is historical and unverified. Current evidence always overrides memory.
 
 **Long-form notes & session recall → run the \`oc-memory\` CLI in your shell**
 (one-shot commands; not MCP tools):
@@ -281,6 +288,8 @@ export interface CodexLaunchOverridesContext {
    *  从系统提示中就知道当前绑定到哪个项目;非 ready / null 时 REPO slot 不输出。
    *  无 sessionId 注入(legacy 路径)的 caller 直接传 undefined。 */
   repoSnapshot?: RepoSnapshot | null
+  /** 当前 client session id,用于注入 PROJECT 项目指令 slot。 */
+  sessionId?: string
 }
 
 export interface CodexLaunchOverrides {
@@ -302,6 +311,10 @@ export interface CodexLaunchOverrides {
   /** Token content the caller must writeFile to tokenFile (mode 0600).
    *  Null when tokenFile is null. */
   tokenContent: string | null
+  /** Caller-bound async delegate credential. MCP and Codex Bash share only
+   * this path; the signed contents are refreshed at each turn boundary. */
+  delegateContextFile: string | null
+  delegateContextContent: string | null
   /** Optional v3 container token file for openclaude-vision MCP refresh. */
   visionTokenFile: string | null
   /** Token content the caller must writeFile to visionTokenFile (mode 0600). */
@@ -345,11 +358,21 @@ export async function buildCodexLaunchOverrides(
   // concerns — keeping it here means promptSlots stays clean and the codex
   // adapter can evolve without touching the slot pipeline.
   // vision retired from the codex MCP path → oc-vision CLI (baseline skill),
-  // same as web-context/browser. No MCP tool is injected on the codex path now;
-  // mcp-memory below is the only remaining codex-side MCP server.
-  const availableMcpTools: string[] = []
+  // same as web-context/browser. mcp-memory below is the only remaining
+  // codex-side MCP server, so the prompt must advertise it iff the entry that
+  // will actually be registered resolves.
+  const mcpEntry = resolveMcpMemoryEntry(ctx.claudeCodePath)
+  const availableMcpTools = mcpEntry
+    ? [
+        'skill_search', 'skill_list', 'skill_view', 'skill_save', 'skill_delete',
+        'create_reminder', 'list_reminders', 'update_reminder', 'delete_reminder',
+        'send_to_agent', 'delegate_task', 'delegate_tasks', 'request_review',
+        'task_create', 'task_update', 'task_comment', 'task_list', 'task_get',
+      ]
+    : []
   const platformResult = await buildPromptContext({
     agentId: ctx.agentId,
+    ...(ctx.sessionKey ? { sessionKey: ctx.sessionKey } : {}),
     persona: ctx.persona,
     provider: ctx.provider,
     model: ctx.model,
@@ -359,6 +382,7 @@ export async function buildCodexLaunchOverrides(
     // codex 路径补齐,让 codex 子进程也看到 REPO slot(系统提示里的仓库元信息)。
     repoSnapshot: ctx.repoSnapshot ?? undefined,
     availableMcpTools,
+    sessionId: ctx.sessionId,
   })
   // preamble 从 platform bundle 取(商业版真热),env 未设(个人版)回落 CODEX_PREAMBLE 常量。
   const preamble = getPlatformPrompt('codex-preamble', CODEX_PREAMBLE)
@@ -409,9 +433,10 @@ export async function buildCodexLaunchOverrides(
   // instructions file so the agent has identity/persona/skills metadata
   // even without the memory tool. Mirrors subprocessRunner's
   // `if (mcpEntry) {...}` else-warn behaviour.
-  const mcpEntry = resolveMcpMemoryEntry(ctx.claudeCodePath)
   let tokenFile: string | null = null
   let tokenContent: string | null = null
+  let delegateContextFile: string | null = null
+  let delegateContextContent: string | null = null
   if (mcpEntry) {
     // v3 hardening: the gateway token NEVER lands in argv. Instead, we point
     // mcp-memory at a 0600 file via OPENCLAUDE_GATEWAY_TOKEN_FILE; the caller
@@ -420,12 +445,19 @@ export async function buildCodexLaunchOverrides(
     // file path, which is not sensitive (mkdtemp'd sessionDir, also visible).
     tokenFile = resolve(ctx.sessionDir, 'gateway-token')
     tokenContent = ctx.gatewayToken
+    delegateContextFile = resolve(ctx.sessionDir, 'delegate-context')
+    delegateContextContent = `${issueDelegateContextToken({
+      agentId: ctx.agentId,
+      sessionKey: ctx.sessionKey ?? `agent:${ctx.agentId}:codex:unbound`,
+      depth: ctx.delegationDepth ?? 0,
+    })}\n`
     const mcpEnv: Record<string, string> = {
       OPENCLAUDE_AGENT_ID: ctx.agentId,
       OPENCLAUDE_HOME: ctx.openclaudeHome ?? process.env.OPENCLAUDE_HOME ?? '',
       ...(ctx.sessionKey ? { OPENCLAUDE_SESSION_KEY: ctx.sessionKey } : {}),
       OPENCLAUDE_GATEWAY_PORT: String(ctx.gatewayPort),
       OPENCLAUDE_GATEWAY_TOKEN_FILE: tokenFile,
+      OPENCLAUDE_DELEGATE_CONTEXT_FILE: delegateContextFile,
       OPENCLAUDE_DELEGATION_DEPTH: String(ctx.delegationDepth ?? 0),
       ...(process.env.OPENCLAUDE_BASELINE_SKILLS_DIR
         ? { OPENCLAUDE_BASELINE_SKILLS_DIR: process.env.OPENCLAUDE_BASELINE_SKILLS_DIR }
@@ -450,6 +482,8 @@ export async function buildCodexLaunchOverrides(
     instructionsContent,
     tokenFile,
     tokenContent,
+    delegateContextFile,
+    delegateContextContent,
     // vision MCP retired → oc-vision CLI (baseline skill); no vision token is
     // written on the codex path anymore. Fields kept on the interface (always
     // null) until the codex vision-token plumbing is fully removed.

@@ -222,10 +222,21 @@ body {
   .no-scrollbar::-webkit-scrollbar { display: none; }
   .no-scrollbar { scrollbar-width: none; }
   .chat-scroll-area { overflow-anchor: none; }
-  /* Virtual rows legitimately unmount/remount while scrolling. Replaying the
-     entrance animation on every remount looks like content flicker and also
-     perturbs measured row geometry, so timeline cards stay motion-stable. */
+  /* Timeline rows stay motion-stable: entrance animation would flash when a
+     tail window expands or live→tape reconciles in place. */
   .chat-virtual-item .animate-in { animation: none; }
+  /* Skip layout/paint for off-screen cards. `auto` remembers last measured height.
+     200px is closer to typical tool/thinking cards than 120px, cutting the
+     reveal-time layout jump on a fully expanded transcript. Do not add
+     `contain: content` here: tool menus and popovers overflow the row. */
+  .chat-timeline-row {
+    content-visibility: auto;
+    contain-intrinsic-size: auto 200px;
+  }
+
+  .chat-anchor-restoring .chat-timeline-row {
+    content-visibility: visible;
+  }
   /* ── iOS 安全区(刘海/灵动岛/Home 指示条 + 横屏侧刘海),配合 index.html viewport-fit=cover。
      无安全区的设备(安卓/桌面)env() 回退 0px,零影响。各类按"叠加在原内边距之上"用 calc。── */
   .safe-px { padding-left: env(safe-area-inset-left, 0px); padding-right: env(safe-area-inset-right, 0px); }
@@ -282,6 +293,142 @@ body {
   *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
 }
 
+/* ── 从简 marketing landing ─────────────────────────────────────────────
+   首页是刻意独立于工作区的深色品牌面：参考 agent 产品常见的“强主张 + 真实工作台
+   + 少量高密度能力卡”结构，但颜色、字标与节奏均由从简自己定义。所有语义 token 在
+   容器内局部覆盖，避免把品牌试验扩散到已稳定的聊天/管理工作区。 */
+.congjian-landing {
+  color-scheme: dark;
+  --bg: #090a08;
+  --surface: #121410;
+  --sidebar: #0d0f0c;
+  --elevated: #171a15;
+  --hover: rgba(255, 255, 255, 0.075);
+  --active: rgba(255, 255, 255, 0.12);
+  --border: rgba(255, 255, 255, 0.09);
+  --border-strong: rgba(255, 255, 255, 0.17);
+  --border-control: #687064;
+  --fg: #f5f4ed;
+  --muted: #aeb1a8;
+  --faint: #777d73;
+  --accent: #c7ff64;
+  --accent-soft: rgba(199, 255, 100, 0.1);
+  --accent-strong: #d7ff91;
+  --accent-fg: #0a0b09;
+  --primary: #c7ff64;
+  --primary-fg: #0a0b09;
+  --bubble: #1a1d17;
+  --success: #8de68f;
+  --success-soft: rgba(141, 230, 143, 0.1);
+  --warning: #f6c66a;
+  --warning-soft: rgba(246, 198, 106, 0.1);
+  --info: #79d8ff;
+  --info-soft: rgba(121, 216, 255, 0.1);
+  --ring: #c7ff64;
+  --skeleton: #252920;
+  --code: #080907;
+  --grad-cta: linear-gradient(125deg, #d5ff84 0%, #b4f04e 100%);
+  /* Tailwind v4 会把 @theme 中的 --color-* 优化成已解析值；仅覆盖底层
+     --primary/--surface 不足以让工具类换肤，因此营销页同步覆盖编译后 token。 */
+  --color-bg: #090a08;
+  --color-surface: #121410;
+  --color-sidebar: #0d0f0c;
+  --color-elevated: #171a15;
+  --color-hover: rgba(255, 255, 255, 0.075);
+  --color-active: rgba(255, 255, 255, 0.12);
+  --color-border: rgba(255, 255, 255, 0.09);
+  --color-border-strong: rgba(255, 255, 255, 0.17);
+  --color-border-control: #687064;
+  --color-fg: #f5f4ed;
+  --color-muted: #aeb1a8;
+  --color-faint: #777d73;
+  --color-accent: #c7ff64;
+  --color-accent-soft: rgba(199, 255, 100, 0.1);
+  --color-accent-strong: #d7ff91;
+  --color-accent-fg: #0a0b09;
+  --color-primary: #c7ff64;
+  --color-primary-fg: #0a0b09;
+  --color-bubble: #1a1d17;
+  --color-success: #8de68f;
+  --color-success-soft: rgba(141, 230, 143, 0.1);
+  --color-warning: #f6c66a;
+  --color-warning-soft: rgba(246, 198, 106, 0.1);
+  --color-info: #79d8ff;
+  --color-info-soft: rgba(121, 216, 255, 0.1);
+  --color-ring: #c7ff64;
+  --color-skeleton: #252920;
+  --color-code: #080907;
+  background:
+    radial-gradient(circle at 50% -8%, rgba(199, 255, 100, 0.06), transparent 24%),
+    #090a08;
+}
+
+.congjian-grid {
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.025) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.025) 1px, transparent 1px);
+  background-size: 72px 72px;
+  background-position: center top;
+}
+
+.congjian-hero-glow {
+  background:
+    radial-gradient(circle at 50% 16%, rgba(199, 255, 100, 0.13), transparent 29%),
+    radial-gradient(circle at 18% 40%, rgba(121, 216, 255, 0.045), transparent 25%);
+}
+
+.congjian-cta-glow {
+  background: radial-gradient(circle at 50% 50%, rgba(199, 255, 100, 0.12), transparent 35%);
+}
+
+.congjian-hero-word {
+  background: linear-gradient(120deg, #f5f4ed 15%, #c7ff64 55%, #85d77b 100%);
+  background-clip: text;
+  color: transparent;
+  -webkit-background-clip: text;
+}
+
+.congjian-kicker {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.025);
+  padding: 0.4rem 0.72rem;
+  color: #aeb1a8;
+  font-size: 12px;
+  font-weight: 550;
+  letter-spacing: 0.02em;
+}
+
+.congjian-shell {
+  position: relative;
+  isolation: isolate;
+}
+
+.congjian-shell::before {
+  position: absolute;
+  z-index: -1;
+  inset: -1px;
+  border-radius: inherit;
+  background: linear-gradient(135deg, rgba(199, 255, 100, 0.2), transparent 32%, rgba(121, 216, 255, 0.08));
+  content: "";
+  opacity: 0.6;
+  filter: blur(0.2px);
+}
+
+.congjian-section {
+  scroll-margin-top: 84px;
+}
+
+@media (max-width: 640px) {
+  .congjian-grid { background-size: 48px 48px; }
+  .congjian-hero-glow {
+    background: radial-gradient(circle at 50% 13%, rgba(199, 255, 100, 0.12), transparent 32%);
+  }
+}
+
 /* ── 高成本 turn 完成后的一次性「评分引导」脉冲(方案 a)：极轻光环,**无布局位移**
    (只动 box-shadow / border-radius),仅在用户未表达减少动效偏好时播放,播 2 次即止。
    --accent 随明暗主题自适应(见 :root / .dark 的 accent token);color-mix 保证光环柔和不刺眼。
@@ -294,6 +441,14 @@ body {
   .oc-rating-nudge {
     border-radius: 9999px;
     animation: oc-rating-nudge 1.4s ease-in-out 2;
+  }
+  /* 侧栏「运行中」状态点呼吸。reduce 偏好下本块不生效 → 常亮 accent 点。 */
+  @keyframes oc-session-running {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.28; }
+  }
+  .oc-session-running {
+    animation: oc-session-running 1.4s ease-in-out infinite;
   }
 }
 

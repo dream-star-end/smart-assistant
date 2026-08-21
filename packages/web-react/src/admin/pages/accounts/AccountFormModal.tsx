@@ -57,7 +57,7 @@ export function AccountFormModal({
   const [groupId, setGroupId] = useState("");
   const [egressId, setEgressId] = useState("");
   const [saving, setSaving] = useState(false);
-  const [providerCreate, setProviderCreate] = useState<"claude" | "codex" | "grok">("claude");
+  const [providerCreate, setProviderCreate] = useState<"claude" | "codex" | "grok" | "cursor">("claude");
 
   // OAuth 向导(create)。
   const [oauthState, setOauthState] = useState<string | null>(null);
@@ -238,7 +238,7 @@ export function AccountFormModal({
     setGrokSessionId(null);
   }, [open, grokSessionId]);
 
-  const changeProvider = useCallback((next: "claude" | "codex" | "grok") => {
+  const changeProvider = useCallback((next: "claude" | "codex" | "grok" | "cursor") => {
     if (grokSessionId) {
       void adminSend("DELETE", `/accounts/grok-device/${encodeURIComponent(grokSessionId)}`).catch(() => {});
     }
@@ -305,15 +305,15 @@ export function AccountFormModal({
     if (isCreate) {
       const tk = token.trim();
       if (!tk) {
-        toast("oauth_token 必填", "error");
+        toast(provider === "cursor" ? "Cursor API Key 必填" : "oauth_token 必填", "error");
         return;
       }
-      if (!egressId) {
+      if (provider !== "cursor" && !egressId) {
         toast("egress 代理池条目 必选", "error");
         return;
       }
       body.oauth_token = tk;
-      body.egress_proxy_id = egressId;
+      if (provider !== "cursor") body.egress_proxy_id = egressId;
       body.provider = provider;
       if (refresh.trim()) body.oauth_refresh_token = isNull(refresh) ? null : refresh.trim();
       if (expires.trim()) body.oauth_expires_at = isNull(expires) ? null : expires.trim();
@@ -329,11 +329,11 @@ export function AccountFormModal({
       if (refresh.trim()) body.oauth_refresh_token = isNull(refresh) ? null : refresh.trim();
       if (expires.trim()) body.oauth_expires_at = isNull(expires) ? null : expires.trim();
       if (subEnd.trim()) body.subscription_end_at = isNull(subEnd) ? null : subEnd.trim();
-      if (!egressId) {
+      if (provider !== "cursor" && !egressId) {
         toast("egress 代理池条目 不可清空", "error");
         return;
       }
-      if (egressId !== prefillEgress) body.egress_proxy_id = egressId;
+      if (provider !== "cursor" && egressId !== prefillEgress) body.egress_proxy_id = egressId;
       if (groupId !== prefillGroup) body.group_id = groupId || null;
     }
     setSaving(true);
@@ -383,23 +383,34 @@ export function AccountFormModal({
         </div>
       ) : depsError ? (
         <div className="py-8 text-center text-sm text-danger">加载失败:{depsError}</div>
-      ) : isCreate && proxies.length === 0 ? (
-        <div className="py-8 text-center text-sm text-warning">
-          代理池没有 active 条目,请先到「代理池」页新建并启用一条。
+      ) : isCreate && provider !== "cursor" && proxies.length === 0 ? (
+        <div className="flex flex-col gap-4">
+          <Field label="provider">
+            <Select value={provider} onChange={(e) => changeProvider(e.target.value as "claude" | "codex" | "grok" | "cursor")}>
+              <option value="cursor">Cursor</option>
+              <option value="claude">CCB</option>
+              <option value="codex">Codex</option>
+              <option value="grok">Grok Build</option>
+            </Select>
+          </Field>
+          <div className="py-6 text-center text-sm text-warning">
+            该 provider 需要代理池 active 条目。可先切到 Cursor，或到「代理池」页新建并启用一条。
+          </div>
         </div>
       ) : (
         <div className="flex flex-col gap-4">
           {isCreate && (
             <Field label="provider">
-              <Select value={provider} onChange={(e) => changeProvider(e.target.value as "claude" | "codex" | "grok")}>
-                <option value="claude">Claude Code</option>
+              <Select value={provider} onChange={(e) => changeProvider(e.target.value as "claude" | "codex" | "grok" | "cursor")}>
+                <option value="cursor">Cursor</option>
+                <option value="claude">CCB</option>
                 <option value="codex">Codex</option>
                 <option value="grok">Grok Build</option>
               </Select>
             </Field>
           )}
 
-          <Field
+          {provider !== "cursor" && <Field
             label={`egress 代理池条目${isCreate ? "(必选)" : "(必选;不可清空)"}`}
             hint={`OAuth 登录与后续模型请求固定走同一条账号出口;此处仅显示 active 项${
               !isCreate && egressId && !egressInActive ? ",当前条目已被禁用" : ""
@@ -422,9 +433,15 @@ export function AccountFormModal({
                 </option>
               )}
             </Select>
-          </Field>
+          </Field>}
 
-          {isCreate && (
+          {isCreate && provider === "cursor" && (
+            <div className="rounded-lg border border-accent/40 bg-accent-soft/50 p-3.5 text-[13px] text-muted">
+              Cursor 使用官方订阅 API Key（`crsr_…`）。密钥加密进账号池，再物化到宿主机 auth 目录供 oc-cursor 轮询，与 CCB 账号池同一套启用 / 冷却 / 分组。
+            </div>
+          )}
+
+          {isCreate && provider !== "cursor" && (
             <div className="rounded-lg border border-accent/40 bg-accent-soft/50 p-3.5">
               <div className="mb-2 flex items-center gap-1.5 text-[13px] font-semibold text-fg">
                 <KeyRound size={15} className="text-accent" /> OAuth 授权(推荐)
@@ -511,29 +528,33 @@ export function AccountFormModal({
             )}
           </div>
 
-          <Field label={`oauth_token ${isCreate ? "(必填)" : "(留空则不修改)"}`}>
+          <Field label={provider === "cursor"
+            ? `Cursor API Key ${isCreate ? "(必填)" : "(留空则不修改)"}`
+            : `oauth_token ${isCreate ? "(必填)" : "(留空则不修改)"}`}>
             <Textarea
               value={token}
               rows={2}
               onChange={(e) => setToken(e.target.value)}
-              placeholder={isCreate ? "粘贴 OAuth access token" : "不动 → 留空"}
+              placeholder={isCreate
+                ? (provider === "cursor" ? "粘贴 crsr_ 开头的 Cursor API Key" : "粘贴 OAuth access token")
+                : "不动 → 留空"}
             />
           </Field>
 
-          <Field label={`oauth_refresh_token ${isCreate ? "(可选)" : "(留空不改;输入 NULL 清空)"}`}>
+          {provider !== "cursor" && <Field label={`oauth_refresh_token ${isCreate ? "(可选)" : "(留空不改;输入 NULL 清空)"}`}>
             <Input value={refresh} onChange={(e) => setRefresh(e.target.value)} placeholder="可选" />
-          </Field>
+          </Field>}
 
-          <Field label={`oauth_expires_at ${isCreate ? "(可选 ISO 时间)" : "(留空不动;输入 NULL 清空)"}`}>
+          {provider !== "cursor" && <Field label={`oauth_expires_at ${isCreate ? "(可选 ISO 时间)" : "(留空不动;输入 NULL 清空)"}`}>
             <Input
               value={expires}
               onChange={(e) => setExpires(e.target.value)}
               placeholder="如 2026-12-31T00:00:00Z 或 NULL"
             />
-          </Field>
+          </Field>}
 
           <Field
-            label={`subscription_end_at ${isCreate ? "(可选;Anthropic 订阅到期日)" : "(留空不动;输入 NULL 清空)"}`}
+            label={`subscription_end_at ${isCreate ? "(可选;订阅到期日)" : "(留空不动;输入 NULL 清空)"}`}
             hint="管理员手填;NULL = 未知(调度器中性 1.0)。快到期账号 WRH 自动加权,订阅到期前榨干额度。"
           >
             <Input

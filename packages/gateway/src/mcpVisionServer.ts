@@ -63,9 +63,11 @@ const DEFAULT_MINIMAX_MAX_IMAGE_BYTES = 5 * 1024 * 1024
 const MINIMAX_MAX_IMAGE_HARD_CAP = 6 * 1024 * 1024
 
 function visionBackend(): 'minimax' | 'codex' {
-  return process.env.OPENCLAUDE_VISION_BACKEND?.trim().toLowerCase() === 'codex'
-    ? 'codex'
-    : 'minimax'
+  // selfhost 默认 codex(GPT):本实例未配置 MiniMax 上游,2026-08-16 boss 指示后端改 GPT。
+  // env 显式覆盖仍有效:OPENCLAUDE_VISION_BACKEND=minimax 回 MiniMax-M3,=codex 走 GPT。
+  const configured = process.env.OPENCLAUDE_VISION_BACKEND?.trim().toLowerCase()
+  if (configured === 'minimax' || configured === 'codex') return configured
+  return 'codex'
 }
 
 export const OPENCLAUDE_VISION_MCP_ID = 'openclaude-vision'

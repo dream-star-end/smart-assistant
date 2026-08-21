@@ -1,0 +1,16 @@
+[Unit]
+# 开机恢复 docker 网 + V5_EGRESS_IN。docker 重启可能冲掉该链,本 unit 必须在
+# sshgate 之前跑;完整模式(不用 SETUP_NET_ONLY)。oneshot RemainAfterExit 已
+# active 时不会自动重跑,部署脚本手工调用 setup-host-net 之后仍须显式 restart sshgate。
+Description=OpenClaude v5 selfhost: docker net + V5_EGRESS_IN
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# 开机跑固定目录副本(不跟 live rel 变)。每次 --deploy/--cutover 成功后从新 rel 同步。
+ExecStart=/bin/bash /opt/openclaude/v5-selfhost-breakglass/boot/setup-host-net.sh v5
+
+[Install]
+WantedBy=multi-user.target

@@ -284,4 +284,32 @@ describe("inbox-post handler", () => {
     await h(makeReq({ auth: `Bearer ${TOKEN}`, body: { title: "t", bodyMd: "b" } }), res, CTX);
     assert.equal(res.statusCode, 500);
   });
+
+  test("allowWarning=true 接受 level=warning 并落入 createInboxMessage", async () => {
+    const p = capturePost();
+    const h = makeInboxPostHandler({
+      identityRepo: repoFor(),
+      postMessage: p.postMessage,
+      allowWarning: true,
+    });
+    const res = makeRes();
+    await h(
+      makeReq({
+        auth: `Bearer ${TOKEN}`,
+        body: {
+          title: "任务面板：巡检已熔断",
+          bodyMd: "阶段连续失败",
+          level: "warning",
+          deliveryKey: "taskboard-fuse:stage-a:2026-08-17",
+        },
+      }),
+      res,
+      CTX,
+    );
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.body.ok, true);
+    assert.equal(p.posts.length, 1);
+    assert.equal(p.posts[0].msg.level, "warning");
+    assert.equal(p.posts[0].msg.deliveryKey, "taskboard-fuse:stage-a:2026-08-17");
+  });
 });

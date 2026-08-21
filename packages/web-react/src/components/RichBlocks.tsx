@@ -86,19 +86,55 @@ export function MermaidBlock({ code }: { code: string }) {
 
 // ── ```options 选择卡片 ──────────────────────────────────────────────────────
 // AI 提问时输出 {"question","multi"?,"options":[{"label","desc"?}]} 的 options 代码块,
-// 渲染为可点击选项卡:单选点击即替用户发送「我选择:<label>」;多选勾选后点「确认选择」。
-// 无 ChatInteractionContext provider(历史/demo)或 JSON 半截(流式)时回退纯展示。
+// 渲染为可点击选项卡:非流式单选点击即发「我选择:<label>」;多选勾选后点「确认选择」。
+// 流式期点选只暂存,由组页脚显式发送。无 ChatInteractionContext(历史/demo)
+// 或 JSON 半截时回退纯展示。
 
 interface OptionItem {
   label: string;
   desc?: string;
 }
 
+function extractFirstJsonObject(source: string): { json: string; rest: string } | null {
+  const start = source.search(/\S/);
+  if (start < 0 || source[start] !== "{") return null;
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = start; i < source.length; i++) {
+    const ch = source[i]!;
+    if (inString) {
+      if (escape) {
+        escape = false;
+        continue;
+      }
+      if (ch === "\\") {
+        escape = true;
+        continue;
+      }
+      if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === "{") depth += 1;
+    else if (ch === "}") {
+      depth -= 1;
+      if (depth === 0) return { json: source.slice(start, i + 1), rest: source.slice(i + 1) };
+    }
+  }
+  return null;
+}
+
 function parseOptionsBlock(
   code: string,
-): { question?: string; multi: boolean; options: OptionItem[] } | null {
+): { question?: string; multi: boolean; options: OptionItem[]; trailing: string } | null {
   try {
-    const raw = JSON.parse(code) as Record<string, unknown>;
+    const extracted = extractFirstJsonObject(code);
+    if (!extracted) return null;
+    const raw = JSON.parse(extracted.json) as Record<string, unknown>;
     if (!raw || typeof raw !== "object" || !Array.isArray(raw.options)) return null;
     const options: OptionItem[] = [];
     for (const o of raw.options as unknown[]) {
@@ -113,6 +149,7 @@ function parseOptionsBlock(
       question: typeof raw.question === "string" ? raw.question : undefined,
       multi: raw.multi === true,
       options,
+      trailing: extracted.rest.trim() ? extracted.rest.trim() : "",
     };
   } catch {
     return null; // 流式半截 / 非法 JSON → 调用方回退源码
@@ -142,18 +179,24 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
     );
   }
 
-  // 同消息多题 → 聚合模式:点选只记录,由 GroupFooter 统一发送(修 boss 实测:
-  // 点第一题即发送、其余题作废)。单题(或无分组)保持点击即发/块内确认。
-  const grouped = !!group && (groupSnap?.count ?? 0) >= 2;
+  // 同消息多题 → 聚合模式:点选只记录,由 GroupFooter 统一发送。
+  // 流式(live)期间即使目前只注册到 1 块也不走点击即发——长回合中途就会贴卡,
+  // 后继 options 的 JSON 也可能还是半截;点选永远可点,发送必须用户显式点页脚。
+  // 非流式单题(或无分组)保持点击即发/块内确认。
+  const streaming = groupSnap?.live === true;
+  const grouped = !!group && ((groupSnap?.count ?? 0) >= 2 || streaming);
   const groupEntry = groupSnap?.entries.find((e) => e.key === blockKey);
-  const sent = grouped ? (groupSnap?.sent ?? false) : sentLocal !== null;
-  const sentText = grouped ? (groupEntry?.labels.join("、") ?? null) : sentLocal;
+  const sent = sentLocal !== null || (groupSnap?.sent ?? false);
+  const sentText = sentLocal ?? (groupEntry?.labels.length ? groupEntry.labels.join("、") : null);
   const interactive = !readOnly && !!sendUserText && !sent;
+  // 生产里 busy===sending===live;流式期忽略 busy,否则长回合选项卡仍不可点。
+  // 非流式仍尊重 busy(历史卡在新回合进行中不可点)。
+  const blockedByBusy = !!busy && !streaming;
 
   const report = (labels: string[]) => group?.setAnswer(blockKey, labels);
 
   const choose = (i: number) => {
-    if (!interactive || busy) return;
+    if (!interactive || blockedByBusy) return;
     const label = parsed.options[i].label;
     if (parsed.multi) {
       setPicked((p) => {
@@ -173,12 +216,13 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
     }
   };
   const confirmMulti = () => {
-    if (!interactive || busy || picked.size === 0 || grouped) return;
+    if (!interactive || blockedByBusy || picked.size === 0 || grouped) return;
     const labels = [...picked].sort((a, b) => a - b).map((i) => parsed.options[i].label);
     setSentLocal(labels.join("、"));
     sendUserText?.(`我选择:${labels.join("、")}`);
   };
   return (
+    <>
     <div className="my-1.5 flex flex-col gap-1.5 rounded-xl border border-border bg-surface p-2.5 not-prose">
       {parsed.question && <p className="px-1 text-[13px] font-medium text-fg">{parsed.question}</p>}
       <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
@@ -188,14 +232,14 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
             <button
               key={`${i}-${o.label}`}
               type="button"
-              disabled={!interactive || !!busy}
+              disabled={!interactive || blockedByBusy}
               onClick={() => choose(i)}
               className={
                 "flex items-start gap-2 rounded-lg border px-3 py-2 text-left transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring " +
                 (chosen
                   ? "border-accent bg-accent-soft"
                   : "border-border bg-elevated hover:border-accent/40 hover:bg-hover") +
-                (!interactive || busy ? " cursor-default opacity-80" : "")
+                (!interactive || blockedByBusy ? " cursor-default opacity-80" : "")
               }
             >
               <span
@@ -217,7 +261,7 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
       {parsed.multi && interactive && !grouped && (
         <button
           type="button"
-          disabled={picked.size === 0 || !!busy}
+          disabled={picked.size === 0 || blockedByBusy}
           onClick={confirmMulti}
           className="self-end rounded-lg bg-accent px-3.5 py-1.5 text-[12.5px] font-medium text-white transition-opacity disabled:opacity-40"
         >
@@ -226,10 +270,14 @@ export function OptionsBlock({ code, readOnly }: { code: string; readOnly?: bool
       )}
       {sent && sentText && <p className="px-1 text-[11.5px] text-faint">已选择:{sentText}</p>}
       {grouped && !sent && (groupEntry?.labels.length ?? 0) > 0 && (
-        <p className="px-1 text-[11.5px] text-faint">已选:{groupEntry?.labels.join("、")}(答完全部问题后统一发送)</p>
+        <p className="px-1 text-[11.5px] text-faint">已选:{groupEntry?.labels.join("、")}(可在下方发送选择)</p>
       )}
       {!readOnly && !sendUserText && <p className="px-1 text-[11px] text-faint">(此会话中不可交互)</p>}
     </div>
+    {parsed.trailing ? (
+      <p className="whitespace-pre-wrap text-[13px] leading-relaxed text-fg">{parsed.trailing}</p>
+    ) : null}
+    </>
   );
 }
 

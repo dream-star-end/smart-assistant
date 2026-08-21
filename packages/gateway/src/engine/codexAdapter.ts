@@ -45,6 +45,7 @@ import { CodexAppServerRunner } from './codexAppServerRunner.js'
 import type { CodexProviderConfigOverride } from './codexShared.js'
 import type {
   EngineAdapter,
+  NativeModelHandoffArtifact,
   EngineCapabilities,
   EngineTurnRun,
   TurnParams,
@@ -524,6 +525,10 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
 
   waitForOutputDrain(): Promise<void> {
     return this.kernel.waitForOutputDrain()
+  }
+
+  compactForHandoff(): Promise<NativeModelHandoffArtifact> {
+    return this.kernel.compactForHandoff()
   }
 
   // ── resume ─────────────────────────────────────────────────────────────

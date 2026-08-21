@@ -602,6 +602,7 @@ export function makeV3EnsureRunning(
     port: number;
     containerId: number;
     coldStart: boolean;
+    bundleRev?: string;
     tunnel?: { hostId: string; containerInternalId: string; nodeAgent: NodeAgentTarget };
   }> {
     // metrics:成功 return 时 observe;throw 路径不计(避免拉偏 latency 分布)。

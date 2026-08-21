@@ -219,7 +219,15 @@ type ReportResponse = {
     credits: string;
   };
   trend: Array<{ bucket: string; requests: string; credits: string }>;
-  models: Array<{ model: string; requests: string; credits: string }>;
+  models: Array<{
+    model: string;
+    requests: string;
+    credits: string;
+    input_tokens: string;
+    output_tokens: string;
+    cache_read_tokens: string;
+    cache_write_tokens: string;
+  }>;
   ledger: {
     trend: Array<{ bucket: string; credited: string; debited: string }>;
     by_reason: Array<{ reason: string; debited: string }>;
@@ -286,9 +294,9 @@ describe("GET /api/me/usage/report(integ)", () => {
 
     // ── models:credits DESC, model ASC(glm 30 与 minimax 30 同分 → glm 在前)──
     assert.deepEqual(body.models, [
-      { model: "glm-5.2", requests: "2", credits: "30" },
-      { model: "minimax-m3", requests: "1", credits: "30" },
-      { model: "claude", requests: "1", credits: "5" },
+      { model: "glm-5.2", requests: "2", credits: "30", input_tokens: "300", output_tokens: "130", cache_read_tokens: "5", cache_write_tokens: "2" },
+      { model: "minimax-m3", requests: "1", credits: "30", input_tokens: "300", output_tokens: "100", cache_read_tokens: "0", cache_write_tokens: "0" },
+      { model: "claude", requests: "1", credits: "5", input_tokens: "40", output_tokens: "20", cache_read_tokens: "0", cache_write_tokens: "0" },
     ]);
 
     // ── ledger.trend:7 桶,末桶 credited=1050 / debited=95 ──

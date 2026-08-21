@@ -4,9 +4,11 @@ import { Markdown } from '../../../components/Markdown'
 import { Alert, Badge, Button, Textarea } from '../../../components/ui'
 import { api, apiErrorMessage } from '../../../lib/api'
 import type { CommunityTutorialPending } from '../../../lib/types'
+import { deriveTutorialArtifacts, tutorialKindOf } from '../../../lib/tutorialStudio'
 import { PageHeader } from '../../components'
 import { adminSession } from '../../auth'
 import { getAdminPage } from '../../registry'
+import { TutorialEvalsPanel } from './TutorialEvalsPanel'
 
 const CATEGORY_LABEL = { research: '科研', coding: '编码', general: '通用' } as const
 
@@ -82,6 +84,7 @@ export default function TutorialReviewPage() {
                   <Badge tone="warning">
                     <Clock3 size={12} /> 待审核
                   </Badge>
+                  {tutorialKindOf(item) === 'snapshot' && <Badge tone="accent">会话快照</Badge>}
                   <Badge tone="neutral">{CATEGORY_LABEL[item.category]}</Badge>
                   <span className="text-caption text-faint">作者：{item.authorName}</span>
                   <span className="text-caption text-faint">
@@ -90,6 +93,12 @@ export default function TutorialReviewPage() {
                 </div>
                 <h2 className="mt-3 text-title font-semibold text-fg">{item.title}</h2>
                 <p className="mt-2 text-body leading-6 text-muted">{item.summary}</p>
+                {tutorialKindOf(item) === 'snapshot' && (
+                  <p className="mt-2 text-caption text-muted">
+                    清单 {item.snapshot?.messageCount ?? 0} 条消息 · {item.snapshot?.pages?.length ?? 0}{' '}
+                    页 · {deriveTutorialArtifacts(item).length} 件成果
+                  </p>
+                )}
               </div>
               <div className="max-h-[32rem] overflow-y-auto p-5">
                 <Markdown readOnly blockImages>
@@ -144,6 +153,7 @@ export default function TutorialReviewPage() {
           </Button>
         </div>
       )}
+      <TutorialEvalsPanel />
     </div>
   )
 }

@@ -182,6 +182,7 @@ export type StoredSession = {
   /** 会话级模型选择(per-session 持久化;同设备 reload 即时恢复,服务端 canonical 到达后
    *  server-wins。与 _lastRouting 语义不同:那是"最近实际发送"供合成续写,这是"用户选择"。 */
   _selectedModelId?: string;
+  _preparedModelSwitch?: { id: string; targetModel: string };
   _pendingDispatches?: StoredPendingDispatch[];
   /** Hydration-only view of the exact durable control journal. It is stored in
    * the existing v1 dispatch DB, never inline in the best-effort session row. */
@@ -429,9 +430,10 @@ export function dispatchDbNameForUser(userId: string | null | undefined): string
  *     内容；旧逻辑只保尾部会在「团队轮之后又有新轮」的 reopen 场景整卡丢失。保留后由
  *     normalizeDelegateCards（loadStored/applyServerMessages 收口处）按 blockId/runId
  *     兜底折叠,不会与 server 带回的 delegate 工具行形成重复卡。
- *  ⑦ **本地 permission 卡**（中段）——permission_request / permission_settled 只在 reducer
- *     生成客户端过程卡，server 历史不产出该 role。断线重连的 auto-deny 往往紧邻 final；full
- *     sync 必须保住它并维持原槽，否则会丢卡或漂到 final 后。
+ *  ⑦ **本地 permission 卡**（中段）——CCB/Codex 引擎权限卡仍只在 reducer 生成；
+ *     detached Cursor ask_user 卡现在会作为 server-authored `role:'permission'` 行
+ *     出现在 getSession/full-sync 里（与 requestId 同 id）。同 id 走 server-wins；
+ *     本地独有的引擎权限卡仍须保留，否则断线重连会丢卡或漂到 final 后。
  *
  * 其余角色（assistant/thinking/tool）乐观消息可能已被 server 以 `srv-*` 重写，中段保留
  * 会出现重复卡片，故仍只保尾部（非尾部=已被取代→丢弃）。
@@ -749,7 +751,7 @@ export function mergeFullServerWins(
           // standalone progress 行(_adoptedInto)已并入 group,不重复保留。
           m.role === "user" ||
           (isTeamOwnedRole(m.role) && !m._adoptedInto) ||
-          // ⑦ permission_request / settled 是 client-owned 过程卡；server 历史无此 role。
+          // ⑦ 引擎权限卡仍是 client-owned；detached ask_user 若已在 server 同 id 则走 server-wins。
           m.role === "permission" ||
           // ⑤ client-owned system 行(context_rebuilt 重建提示):server-authored 通道从不产出。
           (m.role === "system" && !isServerAuthoredRow(m)) ||
@@ -1235,6 +1237,20 @@ function mergeLocalClientFields(
       ...(localMsg._automaticRecoveryAttempted === true
         ? { _automaticRecoveryAttempted: true }
         : {}),
+      ...((typeof serverMsg._recoveryOfClientMessageId !== "string" ||
+        serverMsg._recoveryOfClientMessageId.length === 0) &&
+      typeof localMsg._recoveryOfClientMessageId === "string" &&
+      localMsg._recoveryOfClientMessageId.length > 0
+        ? { _recoveryOfClientMessageId: localMsg._recoveryOfClientMessageId }
+        : {}),
+      ...(serverMsg._recoveryMode === undefined &&
+      (localMsg._recoveryMode === "checkpoint" || localMsg._recoveryMode === "replay")
+        ? { _recoveryMode: localMsg._recoveryMode }
+        : {}),
+      ...(serverMsg._automaticRecovery === undefined &&
+      typeof localMsg._automaticRecovery === "boolean"
+        ? { _automaticRecovery: localMsg._automaticRecovery }
+        : {}),
     };
     return Object.keys(localFields).length > 0 ? { ...serverMsg, ...localFields } : serverMsg;
   }
@@ -1599,6 +1615,7 @@ export class SessionStore {
         const displayText = payload.content.displayText ?? payload.content.text ?? "";
         const attemptMatch = /:(\d+)$/.exec(payload.idempotencyKey);
         const attempt = attemptMatch ? Number(attemptMatch[1]) : 0;
+        const recovery = payload.content.recovery;
         return {
           id: item.msgId,
           role: "user",
@@ -1610,6 +1627,13 @@ export class SessionStore {
           ...(payload.content.imageEdit && media ? { _retryMedia: media } : {}),
           ...(payload.content.imageEdit ? { _imageEdit: payload.content.imageEdit } : {}),
           ...(payload.content.replyTo ? { _replyTo: payload.content.replyTo } : {}),
+          ...(recovery
+            ? {
+                _recoveryOfClientMessageId: recovery.sourceClientMessageId,
+                _recoveryMode: recovery.mode,
+                _automaticRecovery: recovery.automatic,
+              }
+            : {}),
           _routing: {
             model: payload.model,
             teamMode: payload.teamMode === true,

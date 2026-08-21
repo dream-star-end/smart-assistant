@@ -11,25 +11,54 @@ import {
   CommunityTutorialError,
   type CommunityTutorialCategory,
   decodeTutorialCursor,
+  getOwnCommunityTutorial,
   getPublishedCommunityTutorial,
   listOwnCommunityTutorials,
   listPendingCommunityTutorials,
   listPublishedCommunityTutorials,
   reviewCommunityTutorial,
   submitCommunityTutorial,
+  submitSnapshotTutorial,
+  takedownCommunityTutorial,
   withdrawCommunityTutorial,
 } from './communityTutorials.js'
+import { TUTORIAL_SNAPSHOT_MAX_BODY_BYTES } from './snapshotSanitizer.js'
+import { parseTutorialSessionId, TutorialTimelineError } from './tutorialTimeline.js'
+
+export { TUTORIAL_SNAPSHOT_MAX_BODY_BYTES }
 
 type TutorialRouteDeps = { jwtSecret: string | Uint8Array }
 
 function mapTutorialError(error: unknown): HttpError {
+  if (error instanceof TutorialTimelineError) {
+    if (error.code === 'NOT_FOUND') return new HttpError(404, error.code, error.message)
+    if (error.code === 'SESSION_OPEN_TURN') return new HttpError(409, error.code, error.message)
+    return new HttpError(400, error.code, error.message)
+  }
   if (!(error instanceof CommunityTutorialError))
     return error instanceof HttpError
       ? error
       : new HttpError(500, 'INTERNAL', 'community tutorial error')
-  if (error.code === 'BAD_CURSOR') return new HttpError(400, error.code, error.message)
+  if (
+    error.code === 'BAD_CURSOR' ||
+    error.code === 'LEAKS_FOUND' ||
+    error.code === 'BAD_SESSION' ||
+    error.code === 'TOO_LARGE' ||
+    error.code === 'BAD_BODY'
+  ) {
+    return new HttpError(400, error.code, error.message)
+  }
   if (error.code === 'NOT_FOUND') return new HttpError(404, error.code, error.message)
   return new HttpError(409, error.code, error.message)
+}
+
+function sendTutorialError(res: ServerResponse, error: unknown): void {
+  const http = mapTutorialError(error)
+  const extra =
+    error instanceof CommunityTutorialError && error.leakReport
+      ? { leakReport: error.leakReport }
+      : {}
+  sendJson(res, http.status, { error: { code: http.code, message: http.message }, ...extra })
 }
 
 function pageArgs(req: IncomingMessage): {
@@ -107,7 +136,8 @@ export async function handleGetCommunityTutorial(
   const id = tutorialId(req)
   const item = await getPublishedCommunityTutorial(id)
   if (!item) throw new HttpError(404, 'NOT_FOUND', '教程不存在或尚未上线')
-  res.setHeader('Cache-Control', 'public, max-age=30')
+  // 撤回/下架必须即时生效，详情不能被浏览器或 CDN 继续复用旧 approved DTO。
+  res.setHeader('Cache-Control', 'no-store')
   sendJson(res, 200, { tutorial: item })
 }
 
@@ -118,13 +148,57 @@ export async function handleSubmitCommunityTutorial(
 ): Promise<void> {
   const user = await requireAuth(req, deps.jwtSecret)
   const body = (await readJsonBody(req)) as Record<string, unknown>
-  const result = await submitCommunityTutorial(user.id, {
-    title: text(body.title, 'title', 4, 100),
-    summary: text(body.summary, 'summary', 10, 280),
-    category: category(body.category),
-    bodyMarkdown: text(body.bodyMarkdown, 'bodyMarkdown', 40, 50000),
-  })
-  sendJson(res, 201, { tutorial: result })
+  try {
+    const result = await submitCommunityTutorial(user.id, {
+      title: text(body.title, 'title', 4, 100),
+      summary: text(body.summary, 'summary', 10, 280),
+      category: category(body.category),
+      bodyMarkdown: text(body.bodyMarkdown, 'bodyMarkdown', 40, 50000),
+    })
+    sendJson(res, 201, { tutorial: result })
+  } catch (error) {
+    if (error instanceof CommunityTutorialError && error.code === 'LEAKS_FOUND') {
+      sendTutorialError(res, error)
+      return
+    }
+    throw mapTutorialError(error)
+  }
+}
+
+function optionalBodyMarkdown(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined
+  if (typeof value !== 'string') throw new HttpError(400, 'BAD_REQUEST', 'bodyMarkdown required')
+  const normalized = value.trim()
+  if (normalized.length === 0) return undefined
+  return text(normalized, 'bodyMarkdown', 40, 50000)
+}
+
+export async function handleSubmitTutorialSnapshot(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: TutorialRouteDeps,
+): Promise<void> {
+  const user = await requireAuth(req, deps.jwtSecret)
+  const body = (await readJsonBody(req, TUTORIAL_SNAPSHOT_MAX_BODY_BYTES)) as Record<string, unknown>
+  try {
+    const result = await submitSnapshotTutorial(user.id, {
+      title: text(body.title, 'title', 4, 100),
+      summary: text(body.summary, 'summary', 10, 280),
+      category: category(body.category),
+      bodyMarkdown: optionalBodyMarkdown(body.bodyMarkdown),
+      sourceSessionId: parseTutorialSessionId(body.sourceSessionId),
+      messages: body.messages,
+      selectedArtifacts: body.selectedArtifacts,
+      asDraft: body.asDraft === true,
+    })
+    sendJson(res, 201, { tutorial: result })
+  } catch (error) {
+    if (error instanceof CommunityTutorialError && error.code === 'LEAKS_FOUND') {
+      sendTutorialError(res, error)
+      return
+    }
+    throw mapTutorialError(error)
+  }
 }
 
 export async function handleListOwnCommunityTutorials(
@@ -141,6 +215,33 @@ export async function handleListOwnCommunityTutorials(
   } catch (error) {
     throw mapTutorialError(error)
   }
+}
+
+export async function handleGetOwnCommunityTutorial(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: TutorialRouteDeps,
+): Promise<void> {
+  const user = await requireAuth(req, deps.jwtSecret)
+  const match = (req.url ?? '').match(/^\/api\/tutorials\/mine\/([1-9]\d*)(?:\?|$)/)
+  if (!match?.[1]) throw new HttpError(400, 'BAD_REQUEST', 'invalid tutorial id')
+  const item = await getOwnCommunityTutorial(match[1], user.id)
+  if (!item) throw new HttpError(404, 'NOT_FOUND', '教程投稿不存在')
+  res.setHeader('Cache-Control', 'private, no-store')
+  sendJson(res, 200, { tutorial: item })
+}
+
+export async function handleTutorialUserGet(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: TutorialRouteDeps,
+): Promise<void> {
+  const path = (req.url ?? '').split('?')[0] ?? ''
+  if (path.startsWith('/api/tutorials/mine/')) {
+    await handleGetOwnCommunityTutorial(req, res, deps)
+    return
+  }
+  await handleGetCommunityTutorial(req, res)
 }
 
 export async function handleWithdrawCommunityTutorial(
@@ -204,6 +305,51 @@ export async function handleAdminReviewCommunityTutorial(
     )
     sendJson(res, 200, { ok: true, tutorial: { id, ...result } })
   } catch (error) {
+    if (error instanceof CommunityTutorialError && error.code === 'LEAKS_FOUND') {
+      sendTutorialError(res, error)
+      return
+    }
     throw mapTutorialError(error)
   }
+}
+
+export async function handleAdminTakedownCommunityTutorial(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: TutorialRouteDeps,
+): Promise<void> {
+  const admin = await requireAdminVerifyDb(req, deps.jwtSecret)
+  const id = tutorialId(req, '/takedown')
+  const body = (await readJsonBody(req)) as Record<string, unknown>
+  const note = text(body.note, 'note', 1, 2000)
+  try {
+    await takedownCommunityTutorial({ id, adminUserId: admin.id, note })
+    await writeAdminAuditBestEffort(
+      { adminId: admin.id, ip: clientIpOf(req), userAgent: userAgentOf(req) },
+      'tutorial.takedown',
+      `community_tutorial:${id}`,
+      undefined,
+      { tutorial_id: id },
+    )
+    sendJson(res, 200, { ok: true })
+  } catch (error) {
+    throw mapTutorialError(error)
+  }
+}
+
+export async function handleAdminTutorialWrite(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: TutorialRouteDeps,
+): Promise<void> {
+  const path = (req.url ?? '').split('?')[0] ?? ''
+  if (path.endsWith('/takedown')) {
+    await handleAdminTakedownCommunityTutorial(req, res, deps)
+    return
+  }
+  if (path.endsWith('/review')) {
+    await handleAdminReviewCommunityTutorial(req, res, deps)
+    return
+  }
+  throw new HttpError(404, 'NOT_FOUND', 'not found')
 }

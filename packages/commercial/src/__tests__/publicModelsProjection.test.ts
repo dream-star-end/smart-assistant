@@ -227,6 +227,9 @@ describe("/api/public/models — catalog 投影行集", () => {
     const sol = models.find((m) => m.id === "gpt-5.6-sol")!;
     assert.equal(sol.input_per_ktok_credits, "0.030000");
     assert.equal(sol.multiplier, "2.000");
+    assert.equal(sol.engine, "codex");
+    assert.ok(sol.context_window === null || typeof sol.context_window === "number");
+    assert.equal(typeof sol.supports_vision, "boolean");
   });
 
   test("supported_efforts 来自 catalog capability_profile(非 protocol 静态策略)", async () => {

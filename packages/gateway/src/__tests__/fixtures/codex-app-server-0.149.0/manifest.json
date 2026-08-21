@@ -1,0 +1,28 @@
+{
+  "codexVersion": "0.149.0",
+  "binaryPath": "/opt/openclaude/tmp/codex-0149/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex",
+  "binarySha256": "bbc3341e44c9ead340ed9570c17be936e37870f570751a941699ffd04d672827",
+  "command": "<binaryPath> app-server generate-json-schema --experimental --out <outputDir>",
+  "methods": [
+    "turn/steer",
+    "item/tool/requestUserInput"
+  ],
+  "generatedPaths": {
+    "TurnSteerParams.json": "v2/TurnSteerParams.json",
+    "TurnSteerResponse.json": "v2/TurnSteerResponse.json",
+    "ToolRequestUserInputParams.json": "ToolRequestUserInputParams.json",
+    "ToolRequestUserInputResponse.json": "ToolRequestUserInputResponse.json"
+  },
+  "generatedFiles": {
+    "TurnSteerParams.json": "2e0cdcea6a90d6c8bc584fdc2ff838e824754b1eef0d2d16aa71bec4276fef44",
+    "TurnSteerResponse.json": "866ba9a77c12b5d570c837d58f73bf40b24e50fa93404bdf792dd984d313b1aa",
+    "ToolRequestUserInputParams.json": "fda15b62e7446105b59c8ed85c908abed2a47db70653e57c92c47a2f204fa77a",
+    "ToolRequestUserInputResponse.json": "5073b245f741fa8ce62ec52e4dd1809b7831f9c4284c279a78abc9b171f8e3f2"
+  },
+  "repositoryFiles": {
+    "TurnSteerParams.json": "21536126e5ab6ea29a1e234b2532ceb0af8b2d9953120660cca9e35e7b0fad9b",
+    "TurnSteerResponse.json": "fe782ecf0ba6516616967c8fb5366fd1253cd834f6903502fb03f8c57986b671",
+    "ToolRequestUserInputParams.json": "75429f49e09b3dcfecb3dc9bb33eb2e76ffcca62c193c6f29cac71bb4c0ac582",
+    "ToolRequestUserInputResponse.json": "4f2fe3e98cd00462df03e51fe2b984ae4f63feb6337d5f21b72d8bdbee88011f"
+  }
+}

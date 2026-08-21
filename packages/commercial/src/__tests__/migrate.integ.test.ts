@@ -4,7 +4,7 @@ import { copyFile, mkdtemp, readFile, readdir, writeFile, rm } from "node:fs/pro
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { createPool, closePool, setPoolOverride, resetPool } from "../db/index.js";
+import { createPool, closePool, setPoolOverride } from "../db/index.js";
 import { query, tx } from "../db/queries.js";
 import { runMigrations, MigrationIntegrityError } from "../db/migrate.js";
 import { PricingCache } from "../billing/pricing.js";
@@ -26,6 +26,7 @@ const TEST_DB_URL =
 
 const REQUIRE_TEST_DB =
   process.env.CI === "true" || process.env.REQUIRE_TEST_DB === "1";
+const ORIGINAL_PGOPTIONS = process.env.PGOPTIONS;
 
 let pgAvailable = false;
 
@@ -54,6 +55,17 @@ async function probe(): Promise<boolean> {
   }
 }
 
+async function recreateTestPool(pgOptions: string | undefined): Promise<void> {
+  await closePool();
+  if (pgOptions === undefined) {
+    delete process.env.PGOPTIONS;
+  } else {
+    process.env.PGOPTIONS = pgOptions;
+  }
+  const pool = createPool({ connectionString: TEST_DB_URL, max: 5 });
+  setPoolOverride(pool);
+}
+
 before(async () => {
   pgAvailable = await probe();
   if (!pgAvailable) {
@@ -65,10 +77,7 @@ before(async () => {
     }
     return;
   }
-  // 为整个套件注入一个专用 pool;不继承 db.integ 的 pool(虽然跨文件是隔离的)。
-  await resetPool();
-  const pool = createPool({ connectionString: TEST_DB_URL, max: 5 });
-  setPoolOverride(pool);
+  await recreateTestPool(ORIGINAL_PGOPTIONS);
 });
 
 after(async () => {
@@ -76,6 +85,8 @@ after(async () => {
     try { await cleanCommercialSchema(); } catch { /* ignore */ }
     await closePool();
   }
+  if (ORIGINAL_PGOPTIONS === undefined) delete process.env.PGOPTIONS;
+  else process.env.PGOPTIONS = ORIGINAL_PGOPTIONS;
 });
 
 beforeEach(async () => {
@@ -191,11 +202,32 @@ describe("migrate.runMigrations", () => {
     );
     assert.deepEqual(cursorModels.rows, [
       { model_id: "cursor-auto", upstream_model_id: null, state: "active", enabled: true, visibility: "hidden" },
+      { model_id: "cursor-composer-2.5", upstream_model_id: "composer-2.5", state: "active", enabled: true, visibility: "hidden" },
       { model_id: "cursor-composer-2.5-fast", upstream_model_id: "composer-2.5-fast", state: "active", enabled: true, visibility: "hidden" },
       { model_id: "cursor-fable-5-high", upstream_model_id: "claude-fable-5-thinking-high", state: "active", enabled: true, visibility: "hidden" },
+      { model_id: "cursor-fable-5-low", upstream_model_id: "claude-fable-5-thinking-low", state: "active", enabled: true, visibility: "hidden" },
+      { model_id: "cursor-fable-5-max", upstream_model_id: "claude-fable-5-thinking-max", state: "active", enabled: true, visibility: "hidden" },
+      { model_id: "cursor-fable-5-medium", upstream_model_id: "claude-fable-5-thinking-medium", state: "active", enabled: true, visibility: "hidden" },
+      { model_id: "cursor-fable-5-xhigh", upstream_model_id: "claude-fable-5-thinking-xhigh", state: "active", enabled: true, visibility: "hidden" },
       { model_id: "cursor-grok-4.5-high", upstream_model_id: "cursor-grok-4.5-high", state: "active", enabled: true, visibility: "hidden" },
       { model_id: "cursor-grok-4.6-high", upstream_model_id: "cursor-grok-4.6-high", state: "active", enabled: true, visibility: "hidden" },
+      { model_id: "cursor-grok-4.6-high-fast", upstream_model_id: "cursor-grok-4.6-high-fast", state: "active", enabled: true, visibility: "hidden" },
+      { model_id: "cursor-grok-4.6-low", upstream_model_id: "cursor-grok-4.6-low", state: "active", enabled: true, visibility: "hidden" },
+      { model_id: "cursor-grok-4.6-low-fast", upstream_model_id: "cursor-grok-4.6-low-fast", state: "active", enabled: true, visibility: "hidden" },
+      { model_id: "cursor-grok-4.6-medium", upstream_model_id: "cursor-grok-4.6-medium", state: "active", enabled: true, visibility: "hidden" },
+      { model_id: "cursor-grok-4.6-medium-fast", upstream_model_id: "cursor-grok-4.6-medium-fast", state: "active", enabled: true, visibility: "hidden" },
+      { model_id: "cursor-grok-4.6-xhigh", upstream_model_id: "cursor-grok-4.6-xhigh", state: "active", enabled: true, visibility: "hidden" },
+      { model_id: "cursor-grok-4.6-xhigh-fast", upstream_model_id: "cursor-grok-4.6-xhigh-fast", state: "active", enabled: true, visibility: "hidden" },
       { model_id: "cursor-opus-5-high", upstream_model_id: "claude-opus-5-thinking-high", state: "active", enabled: true, visibility: "hidden" },
+      { model_id: "cursor-opus-5-high-fast", upstream_model_id: "claude-opus-5-thinking-high-fast", state: "active", enabled: true, visibility: "hidden" },
+      { model_id: "cursor-opus-5-low", upstream_model_id: "claude-opus-5-thinking-low", state: "active", enabled: true, visibility: "hidden" },
+      { model_id: "cursor-opus-5-low-fast", upstream_model_id: "claude-opus-5-thinking-low-fast", state: "active", enabled: true, visibility: "hidden" },
+      { model_id: "cursor-opus-5-max", upstream_model_id: "claude-opus-5-thinking-max", state: "active", enabled: true, visibility: "hidden" },
+      { model_id: "cursor-opus-5-max-fast", upstream_model_id: "claude-opus-5-thinking-max-fast", state: "active", enabled: true, visibility: "hidden" },
+      { model_id: "cursor-opus-5-medium", upstream_model_id: "claude-opus-5-thinking-medium", state: "active", enabled: true, visibility: "hidden" },
+      { model_id: "cursor-opus-5-medium-fast", upstream_model_id: "claude-opus-5-thinking-medium-fast", state: "active", enabled: true, visibility: "hidden" },
+      { model_id: "cursor-opus-5-xhigh", upstream_model_id: "claude-opus-5-thinking-xhigh", state: "active", enabled: true, visibility: "hidden" },
+      { model_id: "cursor-opus-5-xhigh-fast", upstream_model_id: "claude-opus-5-thinking-xhigh-fast", state: "active", enabled: true, visibility: "hidden" },
     ]);
   });
 
@@ -232,6 +264,102 @@ describe("migrate.runMigrations", () => {
           AND after->>'source' = 'migration:0210'`,
     );
     assert.equal(audit.rows[0].count, "11", "existing user4 Auto grant must not duplicate its audit");
+  });
+
+  test("0210 selfhost profile is an exact fail-closed opt-in", async (t) => {
+    if (skipIfNoPg(t)) return;
+
+    const profiles = [
+      { label: "unset", pgOptions: undefined, succeeds: false },
+      {
+        label: "non-exact",
+        pgOptions: "-c openclaude.migration_profile=v5-selfhost-preview",
+        succeeds: false,
+      },
+      {
+        label: "exact",
+        pgOptions: "-c openclaude.migration_profile=v5-selfhost",
+        succeeds: true,
+      },
+    ] as const;
+
+    try {
+      for (const profile of profiles) {
+        await recreateTestPool(profile.pgOptions);
+        await cleanCommercialSchema();
+        await runBuiltInMigrationsThrough("0209_cursor_multimodel_shared_credential.sql");
+        await query(
+          `INSERT INTO users(id, email, email_verified, password_hash, role)
+           VALUES (1, $1, TRUE, 'argon2$stub', 'user')`,
+          [`selfhost-${profile.label}@example.com`],
+        );
+
+        const before = await query<{
+          model_id: string;
+          state: string;
+          enabled: boolean;
+          visibility: string;
+          lock_version: number;
+        }>(
+          `SELECT c.model_id, c.state, p.enabled, p.visibility, p.lock_version
+             FROM model_catalog c
+             JOIN model_pricing p USING (model_id)
+            WHERE c.engine = 'cursor'
+            ORDER BY c.model_id`,
+        );
+
+        if (!profile.succeeds) {
+          await assert.rejects(
+            () => runBuiltInMigrationsThrough("0210_cursor_multimodel_activation.sql"),
+            /0210 requires users 1 and 4 together when either exists/,
+            profile.label,
+          );
+          const afterFailure = await query(
+            `SELECT c.model_id, c.state, p.enabled, p.visibility, p.lock_version
+               FROM model_catalog c
+               JOIN model_pricing p USING (model_id)
+              WHERE c.engine = 'cursor'
+              ORDER BY c.model_id`,
+          );
+          assert.deepEqual(afterFailure.rows, before.rows, `${profile.label}: migration must roll back`);
+        } else {
+          const applied = await runBuiltInMigrationsThrough("0210_cursor_multimodel_activation.sql");
+          assert.deepEqual(applied.applied, ["0210_cursor_multimodel_activation"]);
+          const active = await query<{ count: string }>(
+            `SELECT COUNT(*)::text AS count
+               FROM model_catalog c
+               JOIN model_pricing p USING (model_id)
+              WHERE c.engine = 'cursor'
+                AND c.state = 'active'
+                AND p.enabled IS TRUE
+                AND p.visibility = 'hidden'`,
+          );
+          assert.equal(active.rows[0].count, "6");
+        }
+
+        const ledger = await query<{ count: string }>(
+          `SELECT COUNT(*)::text AS count
+             FROM schema_migrations
+            WHERE version = '0210_cursor_multimodel_activation'`,
+        );
+        assert.equal(ledger.rows[0].count, profile.succeeds ? "1" : "0", profile.label);
+        const grants = await query<{ count: string }>(
+          `SELECT COUNT(*)::text AS count
+             FROM model_visibility_grants
+            WHERE model_id LIKE 'cursor-%'`,
+        );
+        assert.equal(grants.rows[0].count, "0", profile.label);
+        const audit = await query<{ count: string }>(
+          `SELECT COUNT(*)::text AS count
+             FROM admin_audit
+            WHERE action = 'model_grant.add'
+              AND after->>'source' = 'migration:0210'`,
+        );
+        assert.equal(audit.rows[0].count, "0", profile.label);
+      }
+    } finally {
+      await recreateTestPool(ORIGINAL_PGOPTIONS);
+    }
   });
 
   test("running migrate again is idempotent (no duplicate inserts, no changes)", async (t) => {
@@ -617,7 +745,7 @@ describe("migrate.runMigrations", () => {
     assert.equal(second.applied.length, 0);
   });
 
-  test("0179/0186 publishes Ark K3 with the official K3 pricing", async (t) => {
+  test("0179/0186 keeps the Ark K3 copied price isolated from later Moonshot repricing", async (t) => {
     if (skipIfNoPg(t)) return;
     await runMigrations();
 
@@ -672,16 +800,35 @@ describe("migrate.runMigrations", () => {
     const source = pricing.rows.find((row) => row.model_id === "kimi-k3")!;
     const target = pricing.rows.find((row) => row.model_id === "kimi-k3-ark")!;
     assert.equal(target.display_name, "Kimi K3（ark）");
-    for (const field of [
-      "input_per_mtok",
-      "output_per_mtok",
-      "cache_read_per_mtok",
-      "cache_write_per_mtok",
-      "multiplier",
-      "enabled",
-    ] as const) {
-      assert.equal(target[field], source[field], field);
-    }
+    assert.deepEqual(
+      {
+        input: target.input_per_mtok,
+        output: target.output_per_mtok,
+        cacheRead: target.cache_read_per_mtok,
+        cacheWrite: target.cache_write_per_mtok,
+        multiplier: target.multiplier,
+        enabled: target.enabled,
+      },
+      {
+        input: "500",
+        output: "2500",
+        cacheRead: "50",
+        cacheWrite: "0",
+        multiplier: "1.000",
+        enabled: true,
+      },
+      "0234 halves the copied Ark plan price without inheriting 0224/0238 Moonshot repricing",
+    );
+    assert.deepEqual(
+      {
+        input: source.input_per_mtok,
+        output: source.output_per_mtok,
+        cacheRead: source.cache_read_per_mtok,
+        cacheWrite: source.cache_write_per_mtok,
+      },
+      { input: "914", output: "4569", cacheRead: "92", cacheWrite: "0" },
+      "0238 keeps the Moonshot 1M tier at 1.5x its standard tier",
+    );
     assert.equal(target.sort_order, 89);
     assert.equal(target.visibility, "public");
 
@@ -728,7 +875,7 @@ describe("migrate.runMigrations", () => {
     );
   });
 
-  test("0197/0199 preserve admin pricing while switching Qwen3.8 Max to Codex Responses", async (t) => {
+  test("0197/0199 preserve admin pricing while switching Qwen3.8 Max to Codex Responses across later repricing", async (t) => {
     if (skipIfNoPg(t)) return;
     await runMigrations();
 
@@ -803,15 +950,23 @@ describe("migrate.runMigrations", () => {
     assert.equal(pricing.rows.length, 2);
     const source = pricing.rows.find((row) => row.model_id === "qwen3.7-max")!;
     const target = pricing.rows.find((row) => row.model_id === "qwen3.8-max")!;
-    for (const field of [
-      "input_per_mtok",
-      "output_per_mtok",
-      "cache_read_per_mtok",
-      "cache_write_per_mtok",
-      "multiplier",
-    ] as const) {
-      assert.equal(target[field], source[field], field);
-    }
+    assert.deepEqual(
+      {
+        input: target.input_per_mtok,
+        output: target.output_per_mtok,
+        cacheRead: target.cache_read_per_mtok,
+        cacheWrite: target.cache_write_per_mtok,
+        multiplier: target.multiplier,
+      },
+      {
+        input: "679",
+        output: "2037",
+        cacheRead: "85",
+        cacheWrite: "0",
+        multiplier: "1.000",
+      },
+      "0223 official CNY pricing followed by the 0234 global halving remains authoritative",
+    );
     assert.equal(source.enabled, false);
     assert.equal(target.enabled, true);
     assert.equal(target.display_name, "Qwen3.8 Max");

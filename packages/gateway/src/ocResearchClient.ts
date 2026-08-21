@@ -37,6 +37,19 @@ export function fail(tool: string, msg: string): never {
   process.exit(1);
 }
 
+const HELP_ARGS = new Set(["help", "--help", "-h"]);
+
+/** Empty argv is not help — missing-arg probes still fail with usage on stderr. */
+export function isCliHelpArg(arg: string | undefined): boolean {
+  return !!arg && HELP_ARGS.has(arg);
+}
+
+/** Print usage to stdout and exit 0. Call before any network or heavy import work. */
+export function exitWithCliHelp(usage: string): never {
+  process.stdout.write(usage.endsWith("\n") ? usage : `${usage}\n`);
+  process.exit(0);
+}
+
 export function readContainerToken(tool: string): string {
   const tok = process.env.OPENCLAUDE_V3_CONTAINER_TOKEN?.trim();
   if (tok) return tok;

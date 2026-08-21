@@ -37,11 +37,19 @@ import {
   type ChatSession,
   clearTurnTiming,
   createSession,
+  isServerAuthoredRow,
   mintMsgId,
   rebuildIndexes,
   resetReplyTracker,
   shouldApplyGoalSnapshot,
 } from "./model";
+import {
+  isDurableFramesPage,
+  isLiveUnitsPage,
+  liveUnitToMessage,
+  prependLiveUnitMessages,
+  restoreLiveUnitStreamingState,
+} from "./liveUnitsHydrate";
 import { repairPostFinalProcessOrder } from "./order";
 import {
   isDispatchLostCode,
@@ -85,6 +93,7 @@ import {
   RECONNECT_RECONCILE_GRACE_MS,
   SAFE_WS_BUFFER_BYTES,
   safeSessionKeyForAgent,
+  isRecoveryControlUserTurn,
   shouldAutoContinueEmptyTurn,
   SYNC_DEBOUNCE_MS,
   THINKING_SAFETY_MS,
@@ -112,6 +121,7 @@ import type {
   OutboundTurnUsageWire,
   OutboundCallUsageWire,
   OutboundControlReceiptWire,
+  OutboundModelSwitchPreparedWire,
   OutboundWire,
   GoalSnapshotWire,
   RepoBindErrorWire,
@@ -134,6 +144,49 @@ import type { DurableLiveFrame, DurableLiveFramePage, RefreshOutcome } from "../
 
 export type { ChatStatusClass };
 
+function messageHasVisibleBody(message: ChatMessage): boolean {
+  if (typeof message.text === "string" && message.text.trim().length > 0) return true;
+  const blocks = (message as ChatMessage & { blocks?: unknown[] }).blocks;
+  return Array.isArray(blocks) && blocks.length > 0;
+}
+
+function isLiveJournalAbort(error: unknown): boolean {
+  if (error instanceof DOMException) {
+    return error.name === "AbortError" || error.name === "TimeoutError";
+  }
+  return error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError");
+}
+
+/** Successful-but-still-in-flight restore polls. A healthy live turn either
+ * gets a WS `onLiveFrame` (exits immediately) or keeps a live owner (we only
+ * drop the recovery chrome, not sending). 8 attempts / 45s is enough to
+ * distinguish "tape already finished" from "first frames still landing"
+ * without leaving the composer on Stop forever. */
+export const RESTORE_RECONCILE_MAX_ATTEMPTS = 8;
+export const RESTORE_RECONCILE_MAX_MS = 45_000;
+/** Empty-journal poll delays: 1s → 2s → 5s → 10s cap. */
+export const EMPTY_JOURNAL_POLL_DELAYS_MS = [1000, 2000, 5000, 10_000] as const;
+/** Background journal rebuild bounds. 24 pages × 500 frames = 12k frames;
+ * 30s wall clock covers a slow first page without silent infinite paging. */
+export const LIVE_JOURNAL_MAX_PAGES = 24;
+export const LIVE_JOURNAL_MAX_MS = 30_000;
+/** First-screen hydrate pages the current dispatch forward from after=0.
+ * Do not seek tail: a raw tail page is not a renderable snapshot. */
+export const LIVE_JOURNAL_OPEN_CURSOR = "0";
+/** A Phase-A tape can expose only its final-answer fallback while Phase B is
+ * still materializing exact records. Poll quickly first, then sparsely; the
+ * hard lifetime covers the server's full recoverable materialization backoff. */
+export const UNPUBLISHED_TAPE_RETRY_DELAYS_MS = [1000, 2000, 4000, 8000, 16_000, 30_000] as const;
+export const UNPUBLISHED_TAPE_RETRY_MAX_MS = 15 * 60_000;
+
+export type LiveJournalObservation = {
+  frameCount: number;
+  liveClientMessageIds: Set<string>;
+  hasTapeProjection: boolean;
+  tapeProjectionVersion?: number;
+  degraded?: boolean;
+};
+
 export type ChatSocketDeps = {
   /** 当前内存态 access JWT（WS 子协议鉴权用）。*/
   getToken: () => string;
@@ -152,7 +205,13 @@ export type ChatSocketDeps = {
   /** resume_failed / 重连 reconcile：强制 REST 全量 sync（最终权威源）。*/
   syncSession?: (
     sessId: string,
-    context?: { clientMessageId?: string },
+    context?: {
+      clientMessageId?: string;
+      /** Caller-owned lifecycle fence for delayed reconciliation reads. */
+      isCurrent?: () => boolean;
+      /** Phase-B projection healing does not replay a terminal live journal. */
+      tapeProjectionOnly?: boolean;
+    },
   ) => Promise<boolean | void> | boolean | void;
   /** Every successful WS open (initial or reconnect) refreshes the selected
    * and in-flight sessions from the PG GoalState REST authority. Live goal
@@ -250,6 +309,38 @@ export type InterruptedContinuationTarget = {
   max?: number;
 };
 
+/** Human feedback for a server-authoritative recovery rejection. Keep the
+ * optimistic child disposable, but never make the user's click look inert. */
+export function recoverySkippedNotice(reason?: string): string {
+  switch (reason) {
+    case "source_not_latest":
+      return "未从断点继续：会话已有更新，原任务仍已保留。请在最新消息后再试。";
+    case "source_not_recoverable":
+    case "source_tape_completed":
+      return "未从断点继续：服务端没有确认到可恢复的中断断点，原任务仍已保留。";
+    case "completed_replay_forbidden":
+    case "automatic_replay_not_proven":
+    case "source_not_safely_replayable":
+      return "没有重放原请求：服务端无法证明它尚未执行。原任务仍已保留，可从已保存的断点继续。";
+    case "source_tape_malformed":
+    case "recovery_mode_mismatch":
+    case "automatic_checkpoint_unsafe":
+      return "未从断点继续：服务端校验断点记录失败，原任务仍已保留。请刷新后再试。";
+    case "automatic_retry_exhausted":
+      return "自动恢复已达到次数上限，原任务仍已保留。请在错误卡上手动重试。";
+    case "capability_unavailable":
+      return "暂时无法从断点继续：当前服务版本不支持这次恢复。原任务仍已保留，请刷新后再试。";
+    case "invalid_lineage":
+    case "identity_mismatch":
+    case "identity_reused":
+    case "automatic_lineage_mismatch":
+    case "automatic_attempt_mismatch":
+      return "未从断点继续：这次恢复请求已经过期或与当前会话不一致。原任务仍已保留，请刷新后再试。";
+    default:
+      return "未从断点继续：服务端安全校验未通过。原任务仍已保留，请刷新后再试。";
+  }
+}
+
 function baseTurnRecoveryTarget(
   messages: ChatMessage[],
   error: ChatMessage,
@@ -282,8 +373,9 @@ function recoveryIdentityAlreadyExists(
     message.id === identity.clientMessageId || message._idem === identity.idempotencyKey);
 }
 
-/** Manual fallback for a durable interrupted turn. It stays visible when an
- * unresolved external side effect blocks automatic recovery. */
+/** Manual fallback for a durable interrupted turn. It remains available
+ * when the Master is unavailable, automatic attempts are exhausted, or the
+ * user explicitly chooses to resume now. */
 export function interruptedContinuationTarget(
   messages: ChatMessage[],
   error: ChatMessage,
@@ -305,8 +397,9 @@ export function interruptedContinuationTarget(
   };
 }
 
-/** Automatic recovery is deliberately stricter than the manual CTA: every
- * hop rechecks exact durable rows and advances one shared 1..10 lineage. */
+/** Automatic recovery rechecks exact durable rows and advances one shared
+ * 1..10 lineage. Original-request replay remains strict; checkpoint continuation
+ * resumes context and verifies uncertain effects instead of repeating them. */
 export function automaticTurnRecoveryTarget(
   messages: ChatMessage[],
   error: ChatMessage,
@@ -325,7 +418,17 @@ export function automaticTurnRecoveryTarget(
   );
   const assessment = assessTurnRecoveryTape(durableRows);
   const mode = assessment.mode;
-  if (!assessment.checkpointSafe) return undefined;
+  // A completed header with a recoverable terminal error is the legacy
+  // contradiction repaired by this path: checkpoint continuation resumes the
+  // persisted context and verifies uncertain external state. Other unsafe
+  // finalized states retain their existing manual-only fallback.
+  const completedTape = durableRows.some(
+    (message) => message._turnTapeProcess === true && message._dispatchOutcome === "completed",
+  );
+  if (
+    !assessment.checkpointSafe &&
+    (mode !== "checkpoint" || !completedTape)
+  ) return undefined;
   if (
     mode === "replay" &&
     (base.user._userPayloadDeferred === true || !preciseRetryEligible(base.user))
@@ -514,6 +617,8 @@ export class ChatSocket {
   private wsAuthRefreshInFlight = false;
   private wsAuthRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private authEpoch = 0;
+  /** Invalidates every delayed async callback on stop/reset. */
+  private lifecycleEpoch = 0;
 
   // ── ping watchdog（§6）──
   private pingNonce = 0;
@@ -554,6 +659,13 @@ export class ChatSocket {
    * never destructively reset an already-visible process transcript. */
   private readonly durableLiveJournalCheckpoints = new Map<string, {
     cursor: string;
+    /** 本页生命周期内已确认服务端存在 tape 投影并补拉过全量叙事(布尔回退
+     * 路径;服务端无版本水位时使用)。 */
+    sawTapeProjection?: boolean;
+    /** 最近一次观察到的服务端 tape 投影版本水位(tape 投影流计数)。增长 =
+     * 有 turn 切到 tape,包括两次水合之间启动、断连期间完成、前后 live owner
+     * 集都不含它的场景(codex 审计 blocker:一次性布尔对此是盲的)。 */
+    tapeProjectionVersion?: number;
     liveClientMessageIds: Set<string>;
     /** Last journaled frameSeq for each raw wire sessionKey. Unlike the
      * reducer cursor, this follows record_id order across container
@@ -562,6 +674,22 @@ export class ChatSocket {
       frameSeq: number;
       consumedAuthoritativeResetEpoch: number;
     }>;
+  }>();
+  /** Last successful/degraded live-frames page observation, used by the
+   * restore state machine to decide exit vs 1s live cadence vs empty backoff. */
+  private readonly lastLiveJournalObservation = new Map<string, LiveJournalObservation>();
+  private readonly reconcileStartedAt = new Map<string, number>();
+  private readonly emptyJournalBackoffIndex = new Map<string, number>();
+  /** Phase-A final-only projections retry until exact Phase-B records publish,
+   * a permanent failure is reported, or the bounded page-lifetime expires. */
+  private readonly unpublishedTapeRetries = new Map<string, {
+    session: ChatSession;
+    lifecycleEpoch: number;
+    token: symbol;
+    startedAt: number;
+    attempt: number;
+    timer: ReturnType<typeof setTimeout> | null;
+    inFlight: boolean;
   }>();
   /** Exact active-turn candidate sets already attempted on the current WS.
    * History can arrive after the initial shell hello; each new candidate set
@@ -594,6 +722,15 @@ export class ChatSocket {
   private controlQueue: PendingControlItem[] = [];
   private controlPumpScheduled = false;
   private readonly controlPersistRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+  private readonly abandonedModelSwitches = new Map<string, string>();
+  private readonly pendingModelSwitches = new Map<string, {
+    sessId: string;
+    targetModel: string;
+    resolve: (switchId: string) => void;
+    reject: (error: Error) => void;
+    timer: ReturnType<typeof setTimeout>;
+  }>();
 
   // ── GitHub 仓库绑定待确认队列 ──
   // PUT 成功后试发 inbound.control.session_repo_bind;若 WS 未就绪/未投递,在 onopen(hello 之后)
@@ -748,6 +885,7 @@ export class ChatSocket {
   stop(): void {
     this.started = false;
     this.authEpoch++;
+    this.lifecycleEpoch++;
     this.cancelWsAuthRecovery();
     // Active close bypasses the socket onclose path below (`this.ws` is
     // cleared first). Make every physically-sent but unadmitted turn replayable
@@ -763,6 +901,7 @@ export class ChatSocket {
     }
     if (this.boundBillingPaid) window.removeEventListener("openclaude:billing-paid", this.boundBillingPaid);
     if (this.boundModelFixed) window.removeEventListener("openclaude:model-policy-fixed", this.boundModelFixed);
+    this.rejectPendingModelSwitches("连接已断开，未切换模型", true);
     this.clearReconnectTimers();
     if (this.keepAliveTimer) clearInterval(this.keepAliveTimer);
     if (this.reconnectInFlightTimer) clearTimeout(this.reconnectInFlightTimer);
@@ -779,8 +918,16 @@ export class ChatSocket {
     this.reconcileTimers.clear();
     this.reconcileInFlight.clear();
     this.reconcileRunTokens.clear();
+    this.reconcileAttempts.clear();
     this.reconcileClientMessageIds.clear();
+    this.reconcileStartedAt.clear();
+    this.emptyJournalBackoffIndex.clear();
+    this.lastLiveJournalObservation.clear();
     this.durableLiveJournalCheckpoints.clear();
+    for (const state of this.unpublishedTapeRetries.values()) {
+      if (state.timer) clearTimeout(state.timer);
+    }
+    this.unpublishedTapeRetries.clear();
     for (const t of this.controlPersistRetryTimers.values()) clearTimeout(t);
     this.controlPersistRetryTimers.clear();
     const ws = this.ws;
@@ -1053,6 +1200,8 @@ export class ChatSocket {
     this.reconcileRunTokens.delete(sessId);
     this.reconcileAttempts.delete(sessId);
     this.reconcileClientMessageIds.delete(sessId);
+    this.reconcileStartedAt.delete(sessId);
+    this.emptyJournalBackoffIndex.delete(sessId);
     const sess = this.sessions.get(sessId);
     if (!sess) return;
     sess._reconciling = false;
@@ -1083,6 +1232,9 @@ export class ChatSocket {
       this.reconcileClientMessageIds.set(sessId, context.clientMessageId);
     }
     sess._reconciling = true;
+    if (!this.reconcileStartedAt.has(sessId)) {
+      this.reconcileStartedAt.set(sessId, Date.now());
+    }
     if (sess._recoveryStatus?.kind !== "stopping") {
       const attempt = this.reconcileAttempts.get(sessId) ?? 0;
       sess._recoveryStatus = attempt > 0
@@ -1122,24 +1274,30 @@ export class ChatSocket {
         this.reconcileInFlight.delete(sessId);
         const current = this.sessions.get(sessId);
         if (!current?._reconciling) return;
+        if (synced === true && this.finishRestoreIfReady(current, attempt)) {
+          return;
+        }
         if (synced === true && !current._sendingInFlight && !current._stopSettlement) {
           this.clearContinuousReconcile(sessId, true);
           this.scheduleNotify();
           return;
         }
-        // A successful active sync means the service is healthy and the journal
-        // is our current live transport. Keep it near-real-time; exponential
-        // backoff is only for failed requests. Incremental cursor reads make the
-        // steady poll cheap without replaying the full transcript.
+        // Healthy REST: live journal stays on a 1s cadence so a broken WS does
+        // not look stale. Empty journal (completed tape / no live owner) uses
+        // 1s → 2s → 5s → 10s instead of a 1s death-poll. Failures still back off.
         const delay = synced === true
-          ? 1000
+          ? this.nextSuccessfulReconcileDelayMs(sessId)
           : Math.min(30_000, 1000 * (2 ** Math.min(attempt - 1, 5)));
         if (current._recoveryStatus?.kind !== "stopping") {
-          current._recoveryStatus = {
-            kind: "retrying",
-            attempt,
-            ...(synced === true ? {} : { errorCode: "sync_failed" }),
-          };
+          if (current._liveUnitsPackApplied) {
+            current._recoveryStatus = { kind: "resumed" };
+          } else {
+            current._recoveryStatus = {
+              kind: "retrying",
+              attempt,
+              ...(synced === true ? {} : { errorCode: "sync_failed" }),
+            };
+          }
         }
         this.deps.persistSession?.(sessId);
         this.scheduleNotify();
@@ -1161,6 +1319,131 @@ export class ChatSocket {
         );
       },
     );
+  }
+
+  /**
+   * Test/harness hook: record the latest live-frames observation so the
+   * restore loop can distinguish an active journal from an empty tape cutover.
+   */
+  noteLiveJournalObservation(sessId: string, observation: {
+    frameCount: number;
+    liveClientMessageIds: Iterable<string>;
+    hasTapeProjection: boolean;
+    tapeProjectionVersion?: number;
+    degraded?: boolean;
+  }): void {
+    this.lastLiveJournalObservation.set(sessId, {
+      frameCount: observation.frameCount,
+      liveClientMessageIds: new Set(observation.liveClientMessageIds),
+      hasTapeProjection: observation.hasTapeProjection,
+      ...(observation.tapeProjectionVersion !== undefined
+        ? { tapeProjectionVersion: observation.tapeProjectionVersion }
+        : {}),
+      ...(observation.degraded ? { degraded: true } : {}),
+    });
+  }
+
+  private sessionHasVisibleTurnBody(sess: ChatSession): boolean {
+    const cmid = sess._activeClientMessageId;
+    return sess.messages.some((message) => {
+      if (message.role !== "assistant" && message.role !== "thinking" && message.role !== "tool") {
+        return false;
+      }
+      if (cmid && message._clientMessageId && message._clientMessageId !== cmid) return false;
+      if (!isServerAuthoredRow(message)) return false;
+      return messageHasVisibleBody(message);
+    });
+  }
+
+  private turnAssistantIsEmpty(sess: ChatSession): boolean {
+    const cmid = sess._activeClientMessageId;
+    const assistants = sess.messages.filter((message) => {
+      if (message.role !== "assistant") return false;
+      if (cmid && message._clientMessageId && message._clientMessageId !== cmid) return false;
+      return true;
+    });
+    if (assistants.length === 0) return true;
+    return assistants.every((message) => !messageHasVisibleBody(message));
+  }
+
+  private nextSuccessfulReconcileDelayMs(sessId: string): number {
+    const obs = this.lastLiveJournalObservation.get(sessId);
+    const sess = this.sessions.get(sessId);
+    const cmid = sess?._activeClientMessageId;
+    const hasLiveOwner = !!(cmid && obs?.liveClientMessageIds.has(cmid));
+    const hasFrames = (obs?.frameCount ?? 0) > 0;
+    if (hasLiveOwner || hasFrames) {
+      this.emptyJournalBackoffIndex.delete(sessId);
+      return 1000;
+    }
+    const idx = this.emptyJournalBackoffIndex.get(sessId) ?? 0;
+    const delay = EMPTY_JOURNAL_POLL_DELAYS_MS[Math.min(idx, EMPTY_JOURNAL_POLL_DELAYS_MS.length - 1)]!;
+    this.emptyJournalBackoffIndex.set(sessId, idx + 1);
+    return delay;
+  }
+
+  /**
+   * Restore must have an exit. Returns true when this poll finished the loop.
+   * A still-live owner only drops recovery chrome (resumed); a finished tape
+   * or visible server body clears sending so the composer is usable again.
+   */
+  private finishRestoreIfReady(sess: ChatSession, attempt: number): boolean {
+    if (sess._stopSettlement) return false;
+    const decision = this.restoreExitDecision(sess, attempt);
+    if (!decision) return false;
+    if (decision.clearSending && sess._sendingInFlight) {
+      this.clearSendingState(sess, { clearThinking: true });
+    }
+    if (decision.kind === "completed") {
+      this.clearContinuousReconcile(sess.id, true);
+    } else {
+      this.clearContinuousReconcile(sess.id, false);
+      if (sess._recoveryStatus?.kind !== "stopping") {
+        sess._recoveryStatus = { kind: "resumed" };
+      }
+      this.deps.persistSession?.(sess.id);
+    }
+    this.scheduleNotify();
+    return true;
+  }
+
+  private restoreExitDecision(
+    sess: ChatSession,
+    attempt: number,
+  ): { clearSending: boolean; kind: "completed" | "resumed" } | null {
+    const obs = this.lastLiveJournalObservation.get(sess.id);
+    const cmid = sess._activeClientMessageId;
+    const liveOwner = !!(cmid && obs?.liveClientMessageIds.has(cmid));
+    const journalEmpty = !obs || obs.frameCount === 0;
+    const hasVisible = this.sessionHasVisibleTurnBody(sess);
+
+    if (sess._liveUnitsPackApplied) {
+      const hasProcess = sess.messages.some((message) => {
+        if (!message._liveUnit && message.role !== "agent-group" && message.role !== "thinking" && message.role !== "tool" && message.role !== "plan") {
+          return false;
+        }
+        if (cmid && message._clientMessageId && message._clientMessageId !== cmid && message._turnOwnerId !== cmid) {
+          return false;
+        }
+        return true;
+      });
+      if (hasProcess || liveOwner) {
+        return { clearSending: !liveOwner, kind: liveOwner ? "resumed" : "completed" };
+      }
+    }
+    // 对账成功且服务端已有可见正文,且当前 turn 已不是 live owner。
+    if (hasVisible && !liveOwner) {
+      return { clearSending: true, kind: "completed" };
+    }
+    // journal 为空且没有 live owner:streamClientMessageIds 不含当前消息,且 tape 已投影。
+    if (journalEmpty && !liveOwner && obs?.hasTapeProjection === true) {
+      return { clearSending: true, kind: "completed" };
+    }
+    const startedAt = this.reconcileStartedAt.get(sess.id) ?? Date.now();
+    if (attempt >= RESTORE_RECONCILE_MAX_ATTEMPTS || Date.now() - startedAt >= RESTORE_RECONCILE_MAX_MS) {
+      return { clearSending: !liveOwner, kind: liveOwner ? "resumed" : "completed" };
+    }
+    return null;
   }
 
   /**
@@ -1254,6 +1537,21 @@ export class ChatSocket {
     this.setStatus("已连接", "connected");
   }
 
+  /**
+   * 「正在恢复上一轮」只覆盖仍有 in-flight 且未 connected 的窗口。
+   * 对账/收尾清掉 in-flight 后必须自己收口，不能要求用户刷新。
+   */
+  private dismissStaleRestoreBanner(): void {
+    if (this.statusLabel !== "正在恢复上一轮…") return;
+    if ([...this.sessions.values()].some((session) => session._sendingInFlight)) return;
+    if (this.ws?.readyState === 1) {
+      const [label, cls] = onopenSetInitialStatus(this.offlineQueue.length);
+      this.setStatus(label, cls);
+      return;
+    }
+    if (this.statusCls === "connecting") this.setStatus("连接中…", "connecting");
+  }
+
   /** Remove one exact unacknowledged journal entry. The server's admission
    * ACK or any exact authoritative outbound frame is the only normal path
    * that may clear it before turn terminal. */
@@ -1288,6 +1586,10 @@ export class ChatSocket {
     this.dispatchSlots.set(sessId, clientMessageId);
     const user = sess.messages.find((message) => message.role === "user" && message.id === clientMessageId);
     if (user) user.status = "sent";
+    if (
+      user?._routing?.modelSwitchId &&
+      sess._preparedModelSwitch?.id === user._routing.modelSwitchId
+    ) sess._preparedModelSwitch = undefined;
     if (!sess._sendingInFlight) {
       this.clearTransientNotice(sess.id);
       sess._streamingAssistant = null;
@@ -1344,6 +1646,7 @@ export class ChatSocket {
     if (opts.persist !== false) this.deps.persistSession?.(sess.id);
     // stop / 超时 / 错误清 in-flight 后,若有生成中排队的消息 → 顺序发出。
     this.kickQueuedDrainIfIdle();
+    this.dismissStaleRestoreBanner();
   }
 
   // ═══════════════ reducer effects ═══════════════
@@ -1500,10 +1803,16 @@ export class ChatSocket {
           const snapped = this.reconnectInFlightSet;
           this.reconnectInFlightSet = null;
           if (!snapped) return;
-          for (const sessId of snapped) {
-            const s = this.sessions.get(sessId);
-            if (s?._sendingInFlight && this.statusCls !== "connected") this.setStatus("正在恢复上一轮…", "connecting");
+          const stillWaiting = [...snapped].some((sessId) => this.sessions.get(sessId)?._sendingInFlight);
+          if (!stillWaiting) {
+            this.dismissStaleRestoreBanner();
+            if (this.statusCls !== "connected" && this.ws?.readyState === 1) {
+              const [label, cls] = onopenSetInitialStatus(this.offlineQueue.length);
+              this.setStatus(label, cls);
+            }
+            return;
           }
+          if (this.statusCls !== "connected") this.setStatus("正在恢复上一轮…", "connecting");
         }, 30000);
       } else {
         this.reconnectInFlightSet = null;
@@ -1515,6 +1824,7 @@ export class ChatSocket {
       } catch {
         /* ignore */
       }
+      this.flushAbandonedModelSwitches()
 
       // hello 发完(peer 已注册)后补发积压的仓库绑定(reconnect 兜底,见 pendingRepoBind)。
       this.flushAllRepoBinds();
@@ -1607,6 +1917,7 @@ export class ChatSocket {
         this.pendingPing = null;
       }
       if (this.ws !== ws) return; // stale socket
+      this.rejectPendingModelSwitches("连接已断开，未切换模型", false);
       this.relayReady = false; // 连接关闭:relay 失效,待下次 sys.relay_ready
       this.masterOwnsAutomaticRecovery = false;
       this.resetControlsForReplay();
@@ -1906,6 +2217,16 @@ export class ChatSocket {
         }
         return;
       }
+      case "outbound.model_switch.prepared": {
+        const frame = f as OutboundModelSwitchPreparedWire;
+        const pending = this.pendingModelSwitches.get(frame.requestId);
+        if (!pending || pending.sessId !== frame.sessionKey || pending.targetModel !== frame.targetModel) return;
+        this.pendingModelSwitches.delete(frame.requestId);
+        clearTimeout(pending.timer);
+        if (frame.status === "completed") pending.resolve(frame.requestId);
+        else pending.reject(new Error(frame.message || frame.errorCode || "上下文压缩失败"));
+        return;
+      }
       case "outbound.control.receipt": {
         this.applyControlReceipt(f as OutboundControlReceiptWire);
         return;
@@ -2014,13 +2335,15 @@ export class ChatSocket {
         [sourceClientMessageId]: true,
       };
     }
+    this.transientNotices.set(sessId, {
+      text: recoverySkippedNotice(frame.recoverySkippedReason),
+      ts: Date.now(),
+    });
     const userIndex = sess.messages.findIndex((message) =>
-      message.role === "user" &&
-      message.id === clientMessageId &&
-      message._isAutoRetry === true &&
-      !!message._recoveryOfClientMessageId);
+      message.id === clientMessageId && isRecoveryControlUserTurn(message));
     if (userIndex < 0) {
       this.deps.persistSession?.(sessId);
+      this.scheduleNotify();
       return sourceClientMessageId !== undefined;
     }
     this.finishDispatch(sessId, clientMessageId);
@@ -2168,6 +2491,8 @@ export class ChatSocket {
         type: "inbound.hello",
         channel: "webchat",
         automaticRecoveryOwner: "master-v1",
+        clientBuild:
+          document.querySelector<HTMLMetaElement>('meta[name="oc-build"]')?.content || undefined,
         peers,
       }),
       attemptKeys,
@@ -2372,11 +2697,60 @@ export class ChatSocket {
   /** 会话级模型选择(纯元数据,与 renameSession 同构):改内存 _selectedModelId + notify →
    *  persist sig 变化,IndexedDB 随之落地。服务端 canonical 由调用方经 PATCH 同步。
    *  会话尚不存在(新会话未发首条消息)→ no-op:首发时 sendMessage 会定格 + 建行 PUT 携带。*/
-  setSessionModel(sessId: string, modelId: string): void {
+  setSessionModel(sessId: string, modelId: string, modelSwitchId?: string): void {
     const s = this.sessions.get(sessId);
-    if (!s || s._selectedModelId === modelId) return;
+    if (!s) return;
+    const changed = s._selectedModelId !== modelId;
     s._selectedModelId = modelId;
-    this.scheduleNotify();
+    s._preparedModelSwitch = modelSwitchId ? { id: modelSwitchId, targetModel: modelId } : undefined;
+    if (changed || modelSwitchId) this.scheduleNotify();
+  }
+
+  private cancelPreparedModelSwitch(requestId: string, sessionKey: string): void {
+    const sent = this.safeWsSend(JSON.stringify({
+      type: "control.session.cancel_model_switch",
+      sessionKey,
+      requestId,
+    }));
+    if (sent) this.abandonedModelSwitches.delete(requestId);
+    else this.abandonedModelSwitches.set(requestId, sessionKey);
+  }
+
+  private flushAbandonedModelSwitches(): void {
+    for (const [requestId, sessionKey] of this.abandonedModelSwitches) {
+      this.cancelPreparedModelSwitch(requestId, sessionKey);
+    }
+  }
+
+  private rejectPendingModelSwitches(message: string, canSendCancellation: boolean): void {
+    for (const [id, pending] of this.pendingModelSwitches) {
+      clearTimeout(pending.timer);
+      if (canSendCancellation) this.cancelPreparedModelSwitch(id, pending.sessId);
+      else this.abandonedModelSwitches.set(id, pending.sessId);
+      pending.reject(new Error(message));
+      this.pendingModelSwitches.delete(id);
+    }
+  }
+
+  prepareModelSwitch(sessId: string, sourceModel: string, targetModel: string): Promise<string> {
+    const sess = this.sessions.get(sessId);
+    if (!sess) return Promise.reject(new Error("会话不存在"));
+    const requestId = `model-switch:${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 10)}`;
+    if (!this.safeWsSend(JSON.stringify({
+      type: "control.session.prepare_model_switch",
+      sessionKey: safeSessionKeyForAgent(sessId, sess.agentId),
+      requestId,
+      sourceModel,
+      targetModel,
+    }))) return Promise.reject(new Error("当前未连接，无法压缩上下文"));
+    return new Promise<string>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingModelSwitches.delete(requestId);
+        this.cancelPreparedModelSwitch(requestId, safeSessionKeyForAgent(sessId, sess.agentId));
+        reject(new Error("上下文压缩超时，仍保留原模型"));
+      }, 16 * 60_000);
+      this.pendingModelSwitches.set(requestId, { sessId: safeSessionKeyForAgent(sessId, sess.agentId), targetModel, resolve, reject, timer });
+    });
   }
 
   removeSession(sessId: string): void {
@@ -2397,6 +2771,7 @@ export class ChatSocket {
       void this.deps.deletePendingControl?.(sessId, item.controlId).catch(() => {});
     }
     this.clearContinuousReconcile(sessId);
+    this.clearUnpublishedTapeRetry(sessId);
     this.durableLiveJournalCheckpoints.delete(sessId);
     const safeId = String(sessId).replace(/[^a-zA-Z0-9_-]/g, "_");
     const suffix = `:webchat:dm:${safeId}`;
@@ -2420,6 +2795,7 @@ export class ChatSocket {
    * service 跨登出存活，若不清，换号后旧会话残留内存。调用前 WS 应已 stop（无活跃 turn）。
    */
   resetSessions(): void {
+    this.lifecycleEpoch++;
     // Set/Map 无条件清(即使 sessions 已空也可能有残留 ensured/inflight,Codex 审 LOW)。
     this.serverSessionEnsured.clear();
     this.serverSessionInflight.clear();
@@ -2437,6 +2813,10 @@ export class ChatSocket {
     this.reconcileClientMessageIds.clear();
     this.durableLiveJournalCheckpoints.clear();
     this.authoritativeFrameSeqResetEpochBySessionKey.clear();
+    for (const state of this.unpublishedTapeRetries.values()) {
+      if (state.timer) clearTimeout(state.timer);
+    }
+    this.unpublishedTapeRetries.clear();
     for (const timer of this.controlPersistRetryTimers.values()) clearTimeout(timer);
     this.controlPersistRetryTimers.clear();
     this.activeReplayAttemptKeys.clear();
@@ -2466,8 +2846,8 @@ export class ChatSocket {
       message._turnTapeProcess === true ||
       typeof message._turnTapeProcessLoadedFrom === "string" ||
       typeof message._historyPageLoadedFrom === "string" ||
-      message.id.startsWith("projection-") ||
-      message.id.startsWith("oc-dispatch-err:") ||
+      (typeof message.id === "string" && message.id.startsWith("projection-")) ||
+      (typeof message.id === "string" && message.id.startsWith("oc-dispatch-err:")) ||
       !!(message as ChatMessage & { _historyProjection?: unknown })._historyProjection;
     let messages = s.messages.some(shouldStrip)
       ? s.messages.filter((message) => !shouldStrip(message))
@@ -2533,6 +2913,7 @@ export class ChatSocket {
       _agentSwitchedAt: typeof s._agentSwitchedAt === "number" ? s._agentSwitchedAt : s._agentSwitchedAt ?? undefined,
       ...(s._lastRouting ? { _lastRouting: { ...s._lastRouting } } : {}),
       ...(s._selectedModelId ? { _selectedModelId: s._selectedModelId } : {}),
+      ...(s._preparedModelSwitch ? { _preparedModelSwitch: { ...s._preparedModelSwitch } } : {}),
     };
   }
 
@@ -2554,8 +2935,8 @@ export class ChatSocket {
     s.messages = Array.isArray(stored.messages)
       ? stored.messages
         .filter((message) =>
-          !message.id.startsWith("projection-") &&
-          !message.id.startsWith("oc-dispatch-err:") &&
+          !(typeof message.id === "string" && message.id.startsWith("projection-")) &&
+          !(typeof message.id === "string" && message.id.startsWith("oc-dispatch-err:")) &&
           message._timelineRecord !== true &&
           message._turnTapeProcess !== true &&
           typeof message._historyPageLoadedFrom !== "string" &&
@@ -2620,6 +3001,11 @@ export class ChatSocket {
     if (typeof stored._selectedModelId === "string" && stored._selectedModelId) {
       s._selectedModelId = stored._selectedModelId;
     }
+    if (
+      stored._preparedModelSwitch &&
+      typeof stored._preparedModelSwitch.id === "string" &&
+      typeof stored._preparedModelSwitch.targetModel === "string"
+    ) s._preparedModelSwitch = { ...stored._preparedModelSwitch };
     for (const pending of storedPending) {
       this.offlineQueue.push({
         sessId: stored.id,
@@ -2710,6 +3096,11 @@ export class ChatSocket {
       timelineSnapshotMaxSeq?: number;
       /** Legacy backend fallback: invalidate hydrated history on every full read. */
       invalidateHistoryCache?: boolean;
+      openDispatch?: {
+        dispatchId: string;
+        clientMessageId: string;
+        status: string;
+      };
     },
   ): void {
     const s = this.ensureSession(sessId, agentId || this.deps.defaultAgentId || "main");
@@ -2747,6 +3138,11 @@ export class ChatSocket {
     // 会话级模型选择镜像:载荷已过版本护栏(未被证明过期)才应用,server-wins;
     // 缺省 = 服务端无值,保留本地(与侧栏 listSessions 合并同语义)。
     if (typeof archive?.modelId === "string" && archive.modelId) s._selectedModelId = archive.modelId;
+    const openDispatch = archive?.openDispatch;
+    if (openDispatch?.clientMessageId && !s._sendingInFlight) {
+      s._sendingInFlight = true;
+      s._activeClientMessageId = openDispatch.clientMessageId;
+    }
     // 终态收敛:先从载荷推导「已收尾 turn → 终态类别」。verified failure status、
     // 持久化 error 卡、真 tape 生成行都在此被识别,合并后 convergeTerminalTurns 显式清发送态 +
     // 落 user 行终态,不再依赖「completion-evidence 恰好命中」的巧合路径。
@@ -2836,8 +3232,13 @@ export class ChatSocket {
     if (typeof maxSeq === "number" && (s._maxSeq === undefined || maxSeq > s._maxSeq)) {
       s._maxSeq = maxSeq;
     }
-    s._streamingAssistant = null;
-    s._streamingThinking = null;
+    const preserveStreaming = !!s._sendingInFlight && typeof s._activeClientMessageId === "string" &&
+      !msgs.some((message) =>
+        message && (message as { _clientMessageId?: unknown })._clientMessageId === s._activeClientMessageId);
+    if (!preserveStreaming) {
+      s._streamingAssistant = null;
+      s._streamingThinking = null;
+    }
     s._blockIdToMsgId = new Map();
     s._agentGroups = new Map();
     rebuildIndexes(s);
@@ -2850,6 +3251,7 @@ export class ChatSocket {
     expireGenPlaceholdersAgainstServerRows(s);
     // 终态收敛(RFC §5 M5):载荷自证已收尾的 turn → 清发送态 + 落 user 行终态(显式,不巧合)。
     this.convergeTerminalTurns(s, terminalTurns);
+    this.reconcileUnpublishedTapeRetry(sessId);
     this.scheduleNotify();
     const tailRecoverableError = [...s.messages].reverse().find((message) =>
       message.role === "assistant" &&
@@ -2894,14 +3296,19 @@ export class ChatSocket {
     sessId: string,
     fetchPage: (after: string) => Promise<DurableLiveFramePage>,
     applyTapeProjection: () => Promise<void>,
+    fetchUnits?: (query?: { before?: string | null }) => Promise<unknown>,
   ): Promise<void> {
     return this.runDurableLiveFrameHydration(sessId, async () => {
       const checkpoint = this.durableLiveJournalCheckpoints.get(sessId);
       const initial = checkpoint === undefined;
-      let cursor = checkpoint?.cursor ?? "0";
+      let cursor = checkpoint?.cursor ?? LIVE_JOURNAL_OPEN_CURSOR;
       const previousLiveOwners = checkpoint?.liveClientMessageIds ?? new Set<string>();
       let currentLiveOwners = new Set(previousLiveOwners);
-      const observedLiveOwners = new Set(previousLiveOwners);
+      // Reset owners ≠ live owners. streamClientMessageIds is the in-flight
+      // set (retired streams are omitted). Replay still has to purge local
+      // cache for every cmid that actually arrived in this snapshot, so the
+      // reset list is that set ∪ clientMessageId on the staged frames.
+      const resetOwnerIds = new Set<string>();
       // Work on a copy and commit it with the record cursor only after every
       // page succeeds. A failed later page must leave both checkpoints at the
       // same retry boundary.
@@ -2909,13 +3316,48 @@ export class ChatSocket {
         checkpoint?.lastDurableFrameSeqBySessionKey ?? [],
       );
       let sawTapeProjection = false;
+      let maxTapeProjectionVersion: number | undefined;
+      let frameCount = 0;
+      let degraded = false;
+      const startedAt = Date.now();
+      let pagesRead = 0;
 
       const readPages = async (stage: DurableLiveFrame[] | null): Promise<void> => {
         for (;;) {
-          const page = await fetchPage(cursor);
+          if (pagesRead >= LIVE_JOURNAL_MAX_PAGES || Date.now() - startedAt >= LIVE_JOURNAL_MAX_MS) {
+            degraded = true;
+            break;
+          }
+          let page: DurableLiveFramePage;
+          try {
+            page = await fetchPage(cursor);
+          } catch (error) {
+            // Hung/aborted live-frames must not pin restore. Other page errors
+            // still reject so the checkpoint stays on the last committed cursor.
+            if (isLiveJournalAbort(error)) {
+              degraded = true;
+              return;
+            }
+            throw error;
+          }
+          pagesRead += 1;
           sawTapeProjection ||= page.hasTapeProjection === true;
+          if (typeof page.tapeProjectionVersion === "number") {
+            maxTapeProjectionVersion = Math.max(
+              maxTapeProjectionVersion ?? 0,
+              page.tapeProjectionVersion,
+            );
+          }
           currentLiveOwners = new Set(page.streamClientMessageIds);
-          for (const clientMessageId of currentLiveOwners) observedLiveOwners.add(clientMessageId);
+          if (stage) {
+            for (const clientMessageId of currentLiveOwners) resetOwnerIds.add(clientMessageId);
+            for (const frame of page.frames) {
+              if (typeof frame.clientMessageId === "string" && frame.clientMessageId) {
+                resetOwnerIds.add(frame.clientMessageId);
+              }
+            }
+          }
+          frameCount += page.frames.length;
           if (stage) {
             stage.push(...page.frames);
           } else if (page.frames.length > 0) {
@@ -2930,21 +3372,111 @@ export class ChatSocket {
             throw new Error("live frame page missing cursor");
           }
           if (page.nextCursor) cursor = page.nextCursor;
+          else if (cursor === LIVE_JOURNAL_OPEN_CURSOR) cursor = "0";
           if (!page.hasMore) break;
         }
       };
 
       if (initial) {
-        const stagedFrames: DurableLiveFrame[] = [];
-        await readPages(stagedFrames);
-        this.applyDurableLiveFrames(
-          sessId,
-          stagedFrames,
-          [...observedLiveOwners],
-          lastDurableFrameSeqBySessionKey,
-        );
-        // Close snapshot→reset races while stamped WS frames remain buffered.
-        await readPages(null);
+        let usedUnits = false;
+        if (fetchUnits) {
+          try {
+            const raw = await fetchUnits();
+            if (isLiveUnitsPage(raw) && raw.degraded === "fallback") {
+              usedUnits = false;
+            } else if (isLiveUnitsPage(raw)) {
+              usedUnits = true;
+              currentLiveOwners = new Set(raw.streamClientMessageIds);
+              for (const id of currentLiveOwners) resetOwnerIds.add(id);
+              for (const unit of raw.units) {
+                if (unit.clientMessageId) resetOwnerIds.add(unit.clientMessageId);
+              }
+              sawTapeProjection ||= raw.hasTapeProjection === true;
+              if (typeof raw.tapeProjectionVersion === "number") {
+                maxTapeProjectionVersion = Math.max(
+                  maxTapeProjectionVersion ?? 0,
+                  raw.tapeProjectionVersion,
+                );
+              }
+              this.applyLiveUnits(sessId, raw.units, [...resetOwnerIds], raw.resume);
+              if (raw.resume) {
+                cursor = raw.resume.recordId;
+                const sessionKey = raw.resume.sessionKey;
+                if (sessionKey) {
+                  lastDurableFrameSeqBySessionKey.set(sessionKey, {
+                    frameSeq: raw.resume.frameSeq,
+                    consumedAuthoritativeResetEpoch:
+                      this.authoritativeFrameSeqResetEpochBySessionKey.get(sessionKey) ?? 0,
+                  });
+                }
+              }
+              frameCount = Math.max(frameCount, raw.throughFrameSeq ?? raw.units.length);
+              const sessForUnits = this.sessions.get(sessId);
+              if (sessForUnits) {
+                sessForUnits._liveUnitsPackApplied = true;
+                sessForUnits._liveUnitsHasMoreBefore = raw.hasMoreBefore;
+                sessForUnits._liveUnitsBeforeCursor = raw.beforeCursor;
+                if (sessForUnits._recoveryStatus?.kind !== "stopping") {
+                  sessForUnits._recoveryStatus = { kind: "resumed" };
+                }
+              }
+              // Catch-up is mandatory: WS does not replay frames persisted
+              // before subscribe. Resume was minted only after the server
+              // reached the true tail; this extra after=recordId page closes
+              // the REST→WS gap.
+              if (raw.resume && !degraded) {
+                await readPages(null);
+              }
+            } else if (isDurableFramesPage(raw)) {
+              const firstPage = raw as DurableLiveFramePage;
+              sawTapeProjection ||= firstPage.hasTapeProjection === true;
+              if (typeof firstPage.tapeProjectionVersion === "number") {
+                maxTapeProjectionVersion = Math.max(
+                  maxTapeProjectionVersion ?? 0,
+                  firstPage.tapeProjectionVersion,
+                );
+              }
+              currentLiveOwners = new Set(firstPage.streamClientMessageIds);
+              for (const id of currentLiveOwners) resetOwnerIds.add(id);
+              const stagedFrames: DurableLiveFrame[] = [...firstPage.frames];
+              for (const frame of stagedFrames) {
+                if (typeof frame.clientMessageId === "string" && frame.clientMessageId) {
+                  resetOwnerIds.add(frame.clientMessageId);
+                }
+              }
+              frameCount += stagedFrames.length;
+              if (firstPage.nextCursor) cursor = firstPage.nextCursor;
+              if (firstPage.hasMore) await readPages(stagedFrames);
+              this.applyDurableLiveFrames(
+                sessId,
+                stagedFrames,
+                [...resetOwnerIds],
+                lastDurableFrameSeqBySessionKey,
+              );
+              if (!degraded) await readPages(null);
+              usedUnits = true;
+            }
+          } catch (error) {
+            if (isLiveJournalAbort(error)) {
+              degraded = true;
+            } else {
+              usedUnits = false;
+            }
+          }
+        }
+        if (!usedUnits) {
+          const stagedFrames: DurableLiveFrame[] = [];
+          await readPages(stagedFrames);
+          this.applyDurableLiveFrames(
+            sessId,
+            stagedFrames,
+            [...resetOwnerIds],
+            lastDurableFrameSeqBySessionKey,
+          );
+          if (!degraded) {
+            await readPages(null);
+          }
+        }
       } else {
         await readPages(null);
       }
@@ -2952,16 +3484,152 @@ export class ChatSocket {
       const liveOwnerProjectedToTape = [...previousLiveOwners].some(
         (clientMessageId) => !currentLiveOwners.has(clientMessageId),
       );
-      if ((initial && sawTapeProjection) || liveOwnerProjectedToTape) {
-        await applyTapeProjection();
+      // 自愈触发(三路,均幂等到 checkpoint):
+      // 1) 版本水位增长(权威):两次水合之间发生的 live→tape 切换,含断连期间
+      //    完成、前后 owner 集都不含它的 turn —— liveOwnerProjectedToTape 对此
+      //    是盲的(codex 审计 blocker);
+      // 2) 布尔回退:旧后端无水位字段,本页首次观察到 tape 投影(含 initial 与
+      //    网关重启后带旧 checkpoint 重连)补拉一次;
+      // 3) 亲眼看 live owner 切 tape 的既有触发。
+      // 4) 降级或「在飞 + journal 空 + 最后一条 assistant 空白」:刷新后 cursor
+      //    回 0、turn 已切 tape 时 live-frames 不再给正文,必须补拉 tape。
+      const versionAdvanced =
+        typeof maxTapeProjectionVersion === "number" &&
+        (checkpoint?.tapeProjectionVersion === undefined
+          ? maxTapeProjectionVersion > 0
+          : maxTapeProjectionVersion > checkpoint.tapeProjectionVersion);
+      const tapeProjectionAppeared =
+        typeof maxTapeProjectionVersion !== "number" &&
+        sawTapeProjection && checkpoint?.sawTapeProjection !== true;
+      const sess = this.sessions.get(sessId);
+      const activeCmid = sess?._activeClientMessageId;
+      const noLiveOwner = !activeCmid || !currentLiveOwners.has(activeCmid);
+      const emptyInFlightBubble = !!sess?._sendingInFlight && noLiveOwner &&
+        (sess ? this.turnAssistantIsEmpty(sess) : true);
+      // P0: an in-flight cmid still owned by live-frames must not be wiped by
+      // applyTapeProjection (historical tapeProjectionVersion>0 used to clear
+      // _streamingAssistant). Empty-bubble cutover still hydrates tape.
+      const preserveInFlightLive = !!sess?._sendingInFlight && !!activeCmid &&
+        currentLiveOwners.has(activeCmid);
+      if (
+        !preserveInFlightLive &&
+        (
+          versionAdvanced ||
+          tapeProjectionAppeared ||
+          liveOwnerProjectedToTape ||
+          degraded ||
+          (sawTapeProjection && emptyInFlightBubble)
+        )
+      ) {
+        try {
+          await applyTapeProjection();
+        } catch {
+          degraded = true;
+        }
+      }
+
+      this.noteLiveJournalObservation(sessId, {
+        frameCount,
+        liveClientMessageIds: currentLiveOwners,
+        hasTapeProjection: sawTapeProjection || checkpoint?.sawTapeProjection === true,
+        ...(typeof maxTapeProjectionVersion === "number"
+          ? { tapeProjectionVersion: maxTapeProjectionVersion }
+          : {}),
+        degraded,
+      });
+      if (sess) {
+        sess._liveJournalDegraded = degraded;
+        this.scheduleNotify();
       }
 
       this.durableLiveJournalCheckpoints.set(sessId, {
         cursor,
+        ...(sawTapeProjection || checkpoint?.sawTapeProjection ? { sawTapeProjection: true } : {}),
+        ...(typeof maxTapeProjectionVersion === "number"
+          ? { tapeProjectionVersion: maxTapeProjectionVersion }
+          : checkpoint?.tapeProjectionVersion !== undefined
+            ? { tapeProjectionVersion: checkpoint.tapeProjectionVersion }
+            : {}),
         liveClientMessageIds: currentLiveOwners,
         lastDurableFrameSeqBySessionKey,
       });
     });
+  }
+
+  private clearUnpublishedTapeRetry(sessId: string): void {
+    const state = this.unpublishedTapeRetries.get(sessId);
+    if (!state) return;
+    if (state.timer) clearTimeout(state.timer);
+    this.unpublishedTapeRetries.delete(sessId);
+  }
+
+  private reconcileUnpublishedTapeRetry(sessId: string): void {
+    const session = this.sessions.get(sessId);
+    const pending = session?.messages.some(
+      (message) => message._displayDegradeReason === "records_unpublished",
+    ) === true;
+    if (!session || !pending || !this.deps.syncSession) {
+      this.clearUnpublishedTapeRetry(sessId);
+      return;
+    }
+    let state = this.unpublishedTapeRetries.get(sessId);
+    if (
+      state &&
+      (state.session !== session || state.lifecycleEpoch !== this.lifecycleEpoch)
+    ) {
+      this.clearUnpublishedTapeRetry(sessId);
+      state = undefined;
+    }
+    if (!state) {
+      state = {
+        session,
+        lifecycleEpoch: this.lifecycleEpoch,
+        token: Symbol(`unpublished-tape:${sessId}`),
+        startedAt: Date.now(),
+        attempt: 0,
+        timer: null,
+        inFlight: false,
+      };
+      this.unpublishedTapeRetries.set(sessId, state);
+    }
+    if (state.timer || state.inFlight) return;
+    const elapsed = Date.now() - state.startedAt;
+    if (elapsed >= UNPUBLISHED_TAPE_RETRY_MAX_MS) {
+      this.clearUnpublishedTapeRetry(sessId);
+      return;
+    }
+    const delay = UNPUBLISHED_TAPE_RETRY_DELAYS_MS[
+      Math.min(state.attempt, UNPUBLISHED_TAPE_RETRY_DELAYS_MS.length - 1)
+    ]!;
+    const expected = state;
+    const expectedToken = state.token;
+    const isCurrent = (): boolean =>
+      this.lifecycleEpoch === expected.lifecycleEpoch &&
+      this.sessions.get(sessId) === expected.session &&
+      this.unpublishedTapeRetries.get(sessId) === expected &&
+      expected.token === expectedToken;
+    state.timer = setTimeout(() => {
+      expected.timer = null;
+      if (!isCurrent()) return;
+      if (!expected.session.messages.some(
+        (message) => message._displayDegradeReason === "records_unpublished",
+      )) {
+        this.clearUnpublishedTapeRetry(sessId);
+        return;
+      }
+      expected.inFlight = true;
+      void Promise.resolve(this.deps.syncSession!(sessId, {
+        isCurrent,
+        tapeProjectionOnly: true,
+      }))
+        .catch(() => undefined)
+        .finally(() => {
+          if (!isCurrent()) return;
+          expected.inFlight = false;
+          expected.attempt += 1;
+          this.reconcileUnpublishedTapeRetry(sessId);
+        });
+    }, Math.min(delay, UNPUBLISHED_TAPE_RETRY_MAX_MS - elapsed));
   }
 
   /** Serialize one session's REST journal rebuild and hold overlapping stamped
@@ -2996,6 +3664,63 @@ export class ChatSocket {
     return tracked;
   }
 
+  applyLiveUnits(
+    sessId: string,
+    units: import("@openclaude/protocol").LiveUnit[],
+    resetClientMessageIds: string[] = [],
+    resume?: { sessionKey: string; frameSeq: number; recordId: string },
+  ): void {
+    const sess = this.sessions.get(sessId);
+    if (!sess) return;
+    if (resetClientMessageIds.length > 0) {
+      const owners = new Set(resetClientMessageIds);
+      const preserveStreamingPointer = !!sess._sendingInFlight &&
+        typeof sess._activeClientMessageId === "string" &&
+        owners.has(sess._activeClientMessageId);
+      sess.messages = sess.messages.filter((message) => {
+        if (message.role === "user") return true;
+        if (message._source === "server" || !!message._turnTapeId) return true;
+        if (preserveStreamingPointer && message === sess._streamingAssistant) return true;
+        return !(
+          (typeof message._turnOwnerId === "string" && owners.has(message._turnOwnerId)) ||
+          (typeof message._clientMessageId === "string" && owners.has(message._clientMessageId))
+        );
+      });
+      if (!preserveStreamingPointer) {
+        sess._streamingAssistant = null;
+        sess._streamingThinking = null;
+      }
+      sess._blockIdToMsgId = new Map();
+      sess._agentGroups = new Map();
+      rebuildIndexes(sess);
+    }
+    const mapped = units.map(liveUnitToMessage);
+    sess.messages = prependLiveUnitMessages(sess.messages, mapped);
+    restoreLiveUnitStreamingState(sess, units);
+    if (resume?.sessionKey && resume.frameSeq > 0) {
+      if (!sess._lastFrameSeqByKey || typeof sess._lastFrameSeqByKey !== "object") {
+        sess._lastFrameSeqByKey = {};
+      }
+      sess._lastFrameSeqByKey[resume.sessionKey] = resume.frameSeq;
+      sess._lastFrameSeq = Math.max(sess._lastFrameSeq || 0, resume.frameSeq);
+    }
+    rebuildIndexes(sess);
+    normalizeDelegateCards(sess);
+    normalizeGoalCards(sess);
+    sess.messages = repairPostFinalProcessOrder(sess.messages);
+    this.deps.persistSession?.(sessId);
+    this.scheduleNotify();
+  }
+
+  prependLiveUnits(sessId: string, units: import("@openclaude/protocol").LiveUnit[]): void {
+    const sess = this.sessions.get(sessId);
+    if (!sess) return;
+    sess.messages = prependLiveUnitMessages(sess.messages, units.map(liveUnitToMessage));
+    rebuildIndexes(sess);
+    this.deps.persistSession?.(sessId);
+    this.scheduleNotify();
+  }
+
   /**
    * Rebuild one abnormal/open turn from the exact master-side frame journal.
    * The first call clears only client-owned rows for the listed turn owners,
@@ -3026,16 +3751,27 @@ export class ChatSocket {
         resetFrameSeqCursor(sess, { sessionKey });
       }
       const owners = new Set(resetClientMessageIds);
+      const preserveStreamingPointer = !!sess._sendingInFlight &&
+        typeof sess._activeClientMessageId === "string" &&
+        owners.has(sess._activeClientMessageId);
       sess.messages = sess.messages.filter((message) => {
         if (message.role === "user") return true;
         if (message._source === "server" || !!message._turnTapeId) return true;
+        // Keep the live streaming object; still drop other local rows for this
+        // cmid so retired-stream hydrates can purge a stale cache copy.
+        if (preserveStreamingPointer && message === sess._streamingAssistant) return true;
         return !(
           (typeof message._turnOwnerId === "string" && owners.has(message._turnOwnerId)) ||
           (typeof message._clientMessageId === "string" && owners.has(message._clientMessageId))
         );
       });
-      sess._streamingAssistant = null;
-      sess._streamingThinking = null;
+      // P0: a still-in-flight owner must keep streaming pointers. Initial
+      // journal hydrate resets owner ids (including the live cmid) and used to
+      // wipe _streamingAssistant even when applyTapeProjection was skipped.
+      if (!preserveStreamingPointer) {
+        sess._streamingAssistant = null;
+        sess._streamingThinking = null;
+      }
       sess._blockIdToMsgId = new Map();
       sess._agentGroups = new Map();
       rebuildIndexes(sess);
@@ -3403,7 +4139,15 @@ export class ChatSocket {
     void this.ensureServerSessionOnce(sess, p.agentId);
     // 路由字段快照:合成续写(服务重启/空轮)复用同一路由,保证桥的 codex 分类
     // (server requestId 注入/preCheck)与被中断 turn 一致。
-    const routing = { model: p.model, teamMode: !!p.teamMode, effortLevel: p.effortLevel ?? null };
+    const preparedSwitch = p.model && sess._preparedModelSwitch?.targetModel === p.model
+      ? sess._preparedModelSwitch
+      : undefined;
+    const routing = {
+      model: p.model,
+      ...(preparedSwitch ? { modelSwitchId: preparedSwitch.id } : {}),
+      teamMode: !!p.teamMode,
+      effortLevel: p.effortLevel ?? null,
+    };
     sess._lastRouting = routing;
     const media = p.media && p.media.length > 0 ? p.media : undefined;
     // 出站帧 + 跨设备持久化剥离 localSrc:它是本机乐观渲染用的 blob: URL,换设备/刷新即失效,
@@ -3434,6 +4178,7 @@ export class ChatSocket {
       ...(p.replyTo ? { replyToId: p.replyTo.messageId } : {}),
       ...(p.effortLevel !== undefined ? { effortLevel: p.effortLevel } : {}),
       ...(p.model ? { model: p.model } : {}),
+      ...(preparedSwitch ? { modelSwitchId: preparedSwitch.id } : {}),
       // 团队模式(v5 轻量组队):只在开启时带上顶层 teamMode flag;后端仅 main 队长消费。
       ...(p.teamMode ? { teamMode: true } : {}),
       ts: Date.now(),
@@ -3614,6 +4359,7 @@ export class ChatSocket {
         ? { effortLevel: routing.effortLevel as InboundMessage["effortLevel"] }
         : {}),
       ...(routing.model ? { model: routing.model } : {}),
+      ...(routing.modelSwitchId ? { modelSwitchId: routing.modelSwitchId } : {}),
       ...(routing.teamMode ? { teamMode: true } : {}),
       ts: Date.now(),
       clientMessageId: target.clientMessageId,
@@ -3791,6 +4537,7 @@ export class ChatSocket {
         ? { effortLevel: routing.effortLevel as InboundMessage["effortLevel"] }
         : {}),
       ...(routing?.model ? { model: routing.model } : {}),
+      ...(routing?.modelSwitchId ? { modelSwitchId: routing.modelSwitchId } : {}),
       ...(routing?.teamMode ? { teamMode: true } : {}),
       ts: Date.now(),
     };

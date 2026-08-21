@@ -68,6 +68,7 @@ import {
   tutorialIsRead,
 } from "../lib/tutorialProgress";
 import { cn } from "../lib/utils";
+import type { ChatMessage } from "../lib/chat/model";
 import type { AuthSession } from "../lib/types";
 import { CASE_PRESENTATION, CaseArtwork } from "./tutorials/CaseArtwork";
 import { CommunityTutorials } from "./tutorials/CommunityTutorials";
@@ -181,9 +182,11 @@ export function TutorialCenter({
   open,
   topicId,
   caseId = null,
+  communityId = null,
   onTopicChange,
   onCaseChange = () => {},
   onShowCaseGallery = () => {},
+  onCommunityChange = () => {},
   caseActionLabel,
   onRunCase,
   onClose,
@@ -191,13 +194,20 @@ export function TutorialCenter({
   onRunAction,
   auth = null,
   onRequireLogin,
+  activeSessionId = null,
+  sessionMessages = [],
+  sending = false,
+  sessionTitle = "",
+  sessionProjectId = null,
 }: {
   open: boolean;
   topicId: ProductFeatureId | null;
   caseId?: TutorialCaseId | null;
+  communityId?: string | null;
   onTopicChange: (id: ProductFeatureId) => void;
   onCaseChange?: (id: TutorialCaseId) => void;
   onShowCaseGallery?: () => void;
+  onCommunityChange?: (id: string | null) => void;
   caseActionLabel?: string;
   onRunCase?: (item: TutorialCase) => void;
   onClose: () => void;
@@ -205,9 +215,14 @@ export function TutorialCenter({
   onRunAction: (feature: ProductCapability) => void;
   auth?: AuthSession | null;
   onRequireLogin?: () => void;
+  activeSessionId?: string | null;
+  sessionMessages?: ChatMessage[];
+  sending?: boolean;
+  sessionTitle?: string;
+  sessionProjectId?: string | null;
 }) {
-  const [communityOpen, setCommunityOpen] = useState(false);
-  const mode = communityOpen ? "community" : topicId ? "features" : "cases";
+  const [communityOpen, setCommunityOpen] = useState(!!communityId);
+  const mode = communityId || communityOpen ? "community" : topicId ? "features" : "cases";
   const selectedTopicId = topicId ?? PRODUCT_CAPABILITIES.chatBasics.id;
   const [query, setQuery] = useState("");
   const [featureCategory, setFeatureCategory] = useState<ProductFeatureCategory | "all">("all");
@@ -248,10 +263,11 @@ export function TutorialCenter({
       setCommunityOpen(false);
       return;
     }
+    if (communityId) setCommunityOpen(true);
     if (!topicId) return;
     const timer = window.setTimeout(() => setProgress(markTutorialRead(topicId)), 900);
     return () => window.clearTimeout(timer);
-  }, [open, topicId]);
+  }, [open, topicId, communityId]);
 
   useEffect(
     () => () => {
@@ -274,12 +290,14 @@ export function TutorialCenter({
   const showCases = () => {
     setQuery("");
     setCommunityOpen(false);
+    onCommunityChange(null);
     onShowCaseGallery();
   };
 
   const showFeatures = () => {
     setQuery("");
     setCommunityOpen(false);
+    onCommunityChange(null);
     onTopicChange(selectedTopicId);
   };
 
@@ -308,14 +326,14 @@ export function TutorialCenter({
               </span>
               <div className="min-w-0">
                 <Dialog.Title className="truncate text-[15px] font-semibold text-fg sm:text-[17px]">
-                  {mode === "cases" ? "V5 实战拆解" : mode === "features" ? "功能教程" : "社区共建教程"}
+                  {mode === "cases" ? "V5 实战拆解" : mode === "features" ? "功能教程" : "教程工作室"}
                 </Dialog.Title>
                 <p className="hidden text-[11.5px] text-faint sm:block">
                   {mode === "cases"
                     ? "一个真实任务，从材料到成果"
                     : mode === "features"
                       ? "按功能快速找到使用方法"
-                      : "人人可投稿，审核通过即上线"}
+                      : "探索、手写或从当前会话生成可复用教程"}
                 </p>
               </div>
             </div>
@@ -358,7 +376,7 @@ export function TutorialCenter({
               功能索引
             </ViewTab>
             <ViewTab active={mode === "community"} onClick={showCommunity} icon={Waypoints}>
-              社区共建
+              教程工作室
             </ViewTab>
           </div>
 
@@ -413,7 +431,17 @@ export function TutorialCenter({
 
               <main className="tutorial-detail min-h-0 flex-1 overflow-y-auto">
                 {mode === "community" ? (
-                  <CommunityTutorials auth={auth} onRequireLogin={onRequireLogin} />
+                  <CommunityTutorials
+                    auth={auth}
+                    onRequireLogin={onRequireLogin}
+                    activeSessionId={activeSessionId}
+                    sessionMessages={sessionMessages}
+                    sending={sending}
+                    sessionTitle={sessionTitle}
+                    sessionProjectId={sessionProjectId}
+                    initialDetailId={communityId}
+                    onDetailIdChange={onCommunityChange}
+                  />
                 ) : mode === "cases" ? (
                   showMissionReplay ? (
                     <MissionReplay

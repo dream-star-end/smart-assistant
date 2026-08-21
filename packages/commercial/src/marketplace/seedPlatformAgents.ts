@@ -25,6 +25,8 @@
  */
 import { marketplaceArtifactHash, skillContentHash } from '@openclaude/storage'
 
+import { AGENT_MODEL_AUTO } from '@openclaude/protocol'
+
 import { query } from '../db/queries.js'
 import {
   type AgentManifest,
@@ -213,6 +215,44 @@ const PLATFORM_GENERAL_AGENTS: PlatformAgentDef[] = [
         '- 【检索与诚实】先定位再改,不臆造 API / 包名 / 函数签名(拿不准去查官方文档或读源码);不确定就说不确定并给依据,失败如实报告。',
         '',
         '合规:不装 / 不用 AGPL/GPL 传染性许可库;破坏性命令(rm -rf / drop / 迁移)、装包、出网前先说明意图与影响;不硬编凭证。',
+      ].join('\n'),
+    },
+  },
+  {
+    slug: 'general-assistant',
+    category: 'daily-tools',
+    useCases: ['任意模型 + 任意思考档的全能对话', '跨领域任务一站式处理', '团队模式里按指定档位被委派'],
+    body: {
+      name: '通用助手',
+      displayName: '通用助手',
+      description:
+        '不锁模型、不锁思考档的全能预设:编程、写作、分析、检索、办公文件、日常问答都接;用哪个模型、开多深的思考完全由你在会话里随时指定。',
+      tags: ['通用', '全能', '任意模型', '思考档位'],
+      version: '1.0.0',
+      // AGENT_MODEL_AUTO = 「不锁模型」:用户在模型选择器任选(帧模型优先),不选则落
+      // 平台默认链 —— 与 main 同形;master 计费权威侧 auto 归一为平台默认,无旁路面。
+      model: AGENT_MODEL_AUTO,
+      toolsets: ['core'],
+      capabilities: [],
+      skillDeps: [],
+      avatarEmoji: '🧭',
+      greeting:
+        '我是通用助手。模型和思考档由你定——顶栏随时切换;编程、写作、分析、查资料、办公文件都可以直接交给我。',
+      persona: [
+        '你是「通用助手」,一个不预设领域的全栈 AI 助理:编程、写作、分析、检索、办公文件、日常问答都接,',
+        '深活重活自己扛,不把任务往外推。',
+        '',
+        '模型与思考深度完全由用户决定:本 agent 不锁定模型,用户在会话里随时切换任意可用模型与思考档位',
+        '(low / medium / high / xhigh / max,受当前模型支持集限制)。用户问"该用什么模型/档位"时给一句实用建议:',
+        '简单改写、格式化用低档;常规任务用中档;复杂推理、大型重构、多约束权衡用高档;需要长上下文或中文',
+        '长文写作时可点名更合适的模型。建议归建议,选择权始终在用户。',
+        '',
+        '工作方式:',
+        '- 直接做事:能读写文件、跑命令、联网检索就动手,不停留在"给建议";',
+        '- 结论先行、重点突出;不确定就说不确定,明确区分事实与推断;',
+        '- 不臆造 API、数据、数字与来源;检索得来的事实标注来源与时间;',
+        '- 复杂任务先用一两句话给计划再执行;交付时给可验证的证据(命令输出、退出码、来源链接);',
+        '- 需要专业深度时优先调用容器内对应 baseline skill(办公 / 编程 / 科研 / 浏览器 / 网页提取),不自造流程。',
       ].join('\n'),
     },
   },
@@ -427,6 +467,11 @@ export const PLATFORM_SEED_AGENT_MODEL_IDS: readonly string[] = [
     throw new Error(`[seedPlatformAgents] preset '${a.slug}' has no model in its manifest body`)
   }
   return model
+}).filter((model) => {
+  // AGENT_MODEL_AUTO 不是 catalog 模型 id(「不锁模型」声明,运行时归一到平台默认链),
+  // 进了 assertSeedModelsActive 的 active 断言会在启动时误抛。
+  if (model === AGENT_MODEL_AUTO) return false
+  return true
 })
 
 export async function seedPlatformGeneralAgents(

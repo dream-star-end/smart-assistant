@@ -15,6 +15,7 @@ import {
   type TurnErrorCode,
   turnErrorSemantics,
 } from "@openclaude/protocol";
+import { formatLiveActivityAction } from "./liveActivityLabel";
 import type {
   OutboundContentBlock,
   OutboundMessageWire,
@@ -343,7 +344,7 @@ export function classifyEmptyTurn(p: {
 export const AUTO_CONTINUE_PROMPT = "请基于刚才的思考,继续输出完整的正文回答。";
 export const AUTO_CONTINUE_DISPLAY = "↻ 自动续写";
 export const INTERRUPTED_CONTINUE_PROMPT =
-  "继续完成刚才因临时异常中断的任务。以本会话中已经生成并持久化的思考、工具结果和部分回答为依据，从断点继续；不要重新执行已经完成的步骤，不要重复已经输出的内容。若外部写操作的结果仍不明确，不得重复提交，先核对状态或向用户说明。";
+  "继续完成刚才因临时异常中断的任务。以本会话中已经生成并持久化的思考、工具结果和部分回答为依据，从断点继续。这是一条断点续接指令，不是重放原始请求：不要重新执行已经完成的步骤，不要重复已经输出的内容。若中断前有外部写操作或部署操作，先查询其当前可观察状态（如 release 指针、进程、日志、健康检查或目标资源）并据此继续。只有在无法通过查询区分成功或失败、且重复执行可能造成不可逆后果时，才明确说明具体无法确认的操作和风险，并仅询问完成任务所必需的决定；不要泛泛要求用户再说“继续”。";
 export const INTERRUPTED_CONTINUE_DISPLAY = "↻ 从断点继续";
 export const AUTOMATIC_RECOVERY_CHECKPOINT_DISPLAY = "↻ 自动从断点继续";
 export const AUTOMATIC_RECOVERY_REPLAY_DISPLAY = "↻ 自动重试";
@@ -359,6 +360,47 @@ export function isAutoContinueMsg(m: {
       m._modelText === AUTO_CONTINUE_PROMPT ||
       m.text === AUTO_CONTINUE_DISPLAY)
   );
+}
+
+/** Fields that identify a recovery/auto-retry child user turn. Distinct from
+ * `isAutoContinueMsg`, which also matches empty-turn continuations by prompt
+ * text for the empty-turn cap. */
+export type RecoveryControlUserTurn = {
+  id?: string;
+  role?: string;
+  text?: string;
+  _isAutoRetry?: boolean;
+  _automaticRecovery?: boolean;
+  _recoveryOfClientMessageId?: string;
+  _recoveryMode?: string;
+};
+
+function isNonEmptyId(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+/** Recovery child user turns are transport controls, not utterances.
+ * Prefer persisted lineage (`_recoveryOfClientMessageId` / `_recoveryMode`);
+ * `_isAutoRetry` remains a sufficient in-memory signal, including the older
+ * `_isAutoRetry && _automaticRecovery` pair, but is not required. */
+export function isRecoveryControlUserTurn(
+  message: RecoveryControlUserTurn | null | undefined,
+): boolean {
+  if (!message || message.role !== "user") return false;
+  if (isNonEmptyId(message._recoveryOfClientMessageId)) return true;
+  if (message._recoveryMode === "checkpoint" || message._recoveryMode === "replay") return true;
+  return message._isAutoRetry === true;
+}
+
+/** Walk newest-first to the last user utterance that is not a recovery control row. */
+export function lastRealUserTurn<T extends RecoveryControlUserTurn>(
+  messages: readonly T[],
+): T | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (message.role === "user" && !isRecoveryControlUserTurn(message)) return message;
+  }
+  return undefined;
 }
 
 /**
@@ -413,8 +455,9 @@ export function computeTypingLabel(p: {
   silenceMs: number;
   turnStatus?: string | null;
   hint?: string;
+  progressHint?: string;
 }): { text: string; cls: string } {
-  const { name, secs, silenceMs, turnStatus, hint = "" } = p;
+  const { name, secs, silenceMs, turnStatus, hint = "", progressHint = "" } = p;
   if (turnStatus === "compacting") {
     return { text: `${name} 正在压缩上下文 (${secs}s)`, cls: "compacting" };
   }
@@ -425,6 +468,12 @@ export function computeTypingLabel(p: {
   if (silenceMs >= STALE_WARN_MS) {
     const sil = Math.round(silenceMs / 1000);
     return { text: `${name} 深度思考中 (${secs}s · ${sil}s 无新数据)`, cls: "stale-warn" };
+  }
+  const progress = formatLiveActivityAction(progressHint);
+  if (progress) {
+    const cls = silenceMs >= STALE_GENERATING_MS ? "generating" : "";
+    if (secs >= 5) return { text: `${name} ${progress} (${secs}s)${hint}`, cls };
+    return { text: `${name} ${progress}${hint}`, cls };
   }
   if (silenceMs >= STALE_GENERATING_MS) {
     return { text: `${name} 正在生成内容,请稍候 (${secs}s)`, cls: "generating" };

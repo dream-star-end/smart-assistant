@@ -33,7 +33,7 @@ const withDb = (url: string, name: string) => {
 let available = false
 
 async function admin(sql: string): Promise<void> {
-  const client = new Client({ connectionString: BASE_URL, connectionTimeoutMillis: 1500 })
+  const client = new Client({ connectionString: BASE_URL, connectionTimeoutMillis: 5000 })
   await client.connect()
   try { await client.query(sql) } finally { await client.end() }
 }
@@ -53,8 +53,11 @@ before(async () => {
 
 after(async () => {
   if (!available) return
-  await closePool()
+  // Abort any straggling relay query before Pool.end(): a disconnected HTTP
+  // client can outlive its socket briefly, and Pool.end() waits forever for a
+  // checked-out client. The dedicated test database makes termination safe.
   await admin(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='${DB_NAME}' AND pid<>pg_backend_pid()`).catch(() => {})
+  await closePool()
   await admin(`DROP DATABASE IF EXISTS ${DB_NAME}`).catch(() => {})
 })
 

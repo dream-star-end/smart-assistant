@@ -54,6 +54,8 @@ import { rootLogger } from "../logging/logger.js";
 import { CODEX_TOKEN_REFRESH_PATH } from "../http/internalCodexTokenRefresh.js";
 import { CODEX_RELAY_PREFIX } from "../http/internalCodexRelay.js";
 import { GROK_RELAY_PREFIX, makeGrokRelayHandler } from "../http/internalGrokRelay.js";
+import { ZCODE_RELAY_PREFIX, makeZcodeRelayHandler } from "../http/internalZcodeRelay.js";
+import { configureZcodeRelayKv, createIoredisZcodeRelayKv } from "../billing/zcodeRouteContext.js";
 import {
   buildCodexRelayHandler,
   buildCodexTokenRefreshHandler,
@@ -67,6 +69,7 @@ import {
 import { V3_AGENT_GID, V3_AGENT_UID } from "../agent-sandbox/constants.js";
 import { CostEventSink } from "./costEventSink.js";
 import { makeForwarder } from "./forwarder.js";
+import { shutdownDurableMetricRollups } from "../admin/durableMetricRollups.js";
 
 const log = rootLogger.child({ subsys: "egressMain" });
 
@@ -74,6 +77,7 @@ const log = rootLogger.child({ subsys: "egressMain" });
 const EGRESS_DRAIN_MS = Number(process.env.EGRESS_DRAIN_MS ?? 30 * 60_000);
 
 export async function startEgress(): Promise<void> {
+  process.env.OC_EGRESS_PROCESS = "1";
   // D3④:进程实例标识 —— 优先 systemd invocation id(每次 (re)start 变化),否则随机
   // UUID。finalize 门槛用它区分"队列自然排空"与"egress 中途重启计数归零假绿"。
   const processStartId = process.env.INVOCATION_ID ?? randomUUID();
@@ -126,6 +130,7 @@ export async function startEgress(): Promise<void> {
     maxRetriesPerRequest: 3,
     enableReadyCheck: true,
   });
+  configureZcodeRelayKv(createIoredisZcodeRelayKv(redis));
   const pricing = new PricingCache();
   try {
     await pricing.load();
@@ -294,6 +299,10 @@ export async function startEgress(): Promise<void> {
     },
   });
   const grokRelayHandler = makeGrokRelayHandler({ identityRepo });
+  const zcodeRelayHandler = makeZcodeRelayHandler({
+    identityRepo,
+    codingPlanKey: cfg.ZAI_CODING_PLAN_KEY ?? "",
+  });
 
   const forward = makeForwarder({ controlBaseUrl });
 
@@ -364,6 +373,21 @@ export async function startEgress(): Promise<void> {
       });
       return;
     }
+    if (path === ZCODE_RELAY_PREFIX || path.startsWith(`${ZCODE_RELAY_PREFIX}/`)) {
+      Promise.resolve(
+        zcodeRelayHandler(req, res, { hostUuid: selfHostUuid, boundIp: peerIp }),
+      ).catch((err) => {
+        log.error("zcode_relay_handler_threw", { err: (err as Error).message });
+        if (!res.headersSent) {
+          res.statusCode = 500;
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify({ error: { code: "INTERNAL", message: "egress handler error" } }));
+        } else {
+          try { res.destroy(); } catch { /* */ }
+        }
+      });
+      return;
+    }
     if (path === "/internal/v5/egress-health") {
       // D3④:finalize 门槛差分数据源。processStartId + 单调计数器一并暴露,
       // 部署脚本据此判断队列真排空(startId 未变 ∧ pendingEnd=0 ∧ enqueuedDelta==sentDelta
@@ -420,7 +444,12 @@ export async function startEgress(): Promise<void> {
     console.log(`[egress] SIGTERM — draining in-flight streams (max ${EGRESS_DRAIN_MS}ms)…`);
     // close() 停接新连接,已建立连接(在飞流)自然完结;到 drain 上限强制退出。
     server.close(() => {
-      void costSink.flush().finally(() => process.exit(0));
+      void (async () => {
+        try { await costSink.flush(); } finally {
+          try { await shutdownDurableMetricRollups(); } catch { /* best-effort */ }
+          process.exit(0);
+        }
+      })();
     });
     setTimeout(() => {
       // eslint-disable-next-line no-console

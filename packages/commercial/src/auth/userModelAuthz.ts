@@ -4,13 +4,22 @@
  * 无 fence 的展示/管理调用可用 60s soft TTL；安全执行面必须传入已经 fence 的
  * requiredEpoch。缓存仅在 epoch 精确相等时命中，DB 返回的 epoch 不相等则 fail-closed，
  * 从而 grant 撤销不会继承旧 TTL。
+ *
+ * 订阅资格(userPlanTier / orgPlanCode)不进该 TTL：个人/组织套餐变更与到期
+ * 不 bump model_security_epoch，必须每次实查，否则 Max 闸门会沿用过期资格。
  */
+
+import type { UserModelScope } from "../billing/modelCatalog.js";
 
 export type UserModelAuthz = {
   role: "user" | "admin";
   grantedModelIds: ReadonlySet<string>;
   /** Account-scoped hard denials override visibility and explicit grants. */
   deniedModelIds?: ReadonlySet<string>;
+  /** Personal subscription_plans.tier, or null if none/expired. */
+  userPlanTier?: number | null;
+  /** Highest-tier active org plan code, if the user is an org member. */
+  orgPlanCode?: string | null;
 };
 
 export type UserModelAuthzLoader = (
@@ -40,8 +49,51 @@ export function deniedModelIdsForTrafficClass(
 }
 
 interface LoadedAuthz {
-  value: UserModelAuthz;
+  value: Omit<UserModelAuthz, "userPlanTier" | "orgPlanCode">;
   epoch: bigint;
+}
+
+async function loadPlanEntitlement(uid: bigint): Promise<{
+  userPlanTier: number | null;
+  orgPlanCode: string | null;
+}> {
+  const { query } = await import("../db/queries.js");
+  const r = await query<{
+    user_plan_tier: string | number | null;
+    org_plan_code: string | null;
+  }>(
+    `SELECT
+        (
+          SELECT sp.tier
+            FROM user_subscriptions us
+            JOIN subscription_plans sp
+              ON sp.code = us.plan_code AND sp.scope = 'user'
+           WHERE us.user_id = $1::bigint
+             AND us.status = 'active'
+             AND us.period_end > NOW()
+           LIMIT 1
+        ) AS user_plan_tier,
+        (
+          SELECT sp.code
+            FROM org_memberships om
+            JOIN org_subscriptions os
+              ON os.org_id = om.org_id
+             AND os.status = 'active'
+             AND os.period_end > NOW()
+            JOIN subscription_plans sp
+              ON sp.code = os.plan_code AND sp.scope = 'org'
+           WHERE om.user_id = $1::bigint
+             AND om.status = 'active'
+           ORDER BY sp.tier DESC, sp.code
+           LIMIT 1
+        ) AS org_plan_code`,
+    [uid],
+  );
+  const row = r.rows[0];
+  return {
+    userPlanTier: row?.user_plan_tier == null || row.user_plan_tier === "" ? null : Number(row.user_plan_tier),
+    orgPlanCode: row?.org_plan_code ?? null,
+  };
 }
 
 export function makeLoadUserModelAuthz(): UserModelAuthzLoader {
@@ -83,28 +135,45 @@ export function makeLoadUserModelAuthz(): UserModelAuthzLoader {
   return async (uid: bigint, requiredEpoch?: bigint): Promise<UserModelAuthz> => {
     const userKey = uid.toString();
     const hit = cache.get(userKey);
+    let loaded: LoadedAuthz | undefined;
     if (
       hit &&
       hit.exp > Date.now() &&
       (requiredEpoch === undefined || hit.loaded.epoch === requiredEpoch)
     ) {
-      return hit.loaded.value;
-    }
-
-    const requestKey = `${userKey}:${requiredEpoch?.toString() ?? "soft"}`;
-    const pending = inflight.get(requestKey);
-    const load = pending ?? loadUncached(uid);
-    if (!pending) inflight.set(requestKey, load);
-    try {
-      const loaded = await load;
-      if (requiredEpoch !== undefined && loaded.epoch !== requiredEpoch) {
-        throw new UserModelAuthzEpochMismatchError(requiredEpoch, loaded.epoch);
+      loaded = hit.loaded;
+    } else {
+      const requestKey = `${userKey}:${requiredEpoch?.toString() ?? "soft"}`;
+      const pending = inflight.get(requestKey);
+      const load = pending ?? loadUncached(uid);
+      if (!pending) inflight.set(requestKey, load);
+      try {
+        loaded = await load;
+        if (requiredEpoch !== undefined && loaded.epoch !== requiredEpoch) {
+          throw new UserModelAuthzEpochMismatchError(requiredEpoch, loaded.epoch);
+        }
+        if (cache.size > 5000) cache.clear();
+        cache.set(userKey, { loaded, exp: Date.now() + AUTHZ_TTL_MS });
+      } finally {
+        if (!pending) inflight.delete(requestKey);
       }
-      if (cache.size > 5000) cache.clear();
-      cache.set(userKey, { loaded, exp: Date.now() + AUTHZ_TTL_MS });
-      return loaded.value;
-    } finally {
-      if (!pending) inflight.delete(requestKey);
     }
+    const plan = await loadPlanEntitlement(uid);
+    return { ...loaded!.value, ...plan };
+  };
+}
+
+/** Catalog/list/canUse scope from the fenced authz loader. */
+export function scopeFromAuthz(
+  uid: number | string | bigint,
+  authz: UserModelAuthz,
+): UserModelScope {
+  return {
+    uid,
+    role: authz.role,
+    grantedModelIds: authz.grantedModelIds,
+    deniedModelIds: authz.deniedModelIds,
+    userPlanTier: authz.userPlanTier ?? null,
+    orgPlanCode: authz.orgPlanCode ?? null,
   };
 }

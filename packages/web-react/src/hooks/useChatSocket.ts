@@ -3,6 +3,7 @@ import type { MessageReplyQuote } from "@openclaude/protocol";
 import { ApiError, api } from "../lib/api";
 import { reportClientFriction } from "../lib/clientFriction";
 import type { ChatMessage, ChatSession } from "../lib/chat/model";
+import { isLiveUnitsPage } from "../lib/chat/liveUnitsHydrate";
 import { ChatSocket, type ChatSnapshot } from "../lib/chat/socket";
 import { DeferredPayloadQueue } from "../lib/chat/deferredPayloadQueue";
 import { parseTapeRecordPayload, type TapePayloadExpectation } from "../lib/chat/tapePayload";
@@ -76,7 +77,8 @@ export type UseChatSocket = {
   /** 重命名会话(WS service 内存 + IndexedDB;服务端 PATCH 由 App 层同步)。*/
   renameSession: (sessId: string, title: string) => void;
   /** 会话级模型选择(WS service 内存 + IndexedDB;服务端 PATCH 由 App 层同步,与 rename 同构)。*/
-  setSessionModel: (sessId: string, modelId: string) => void;
+  setSessionModel: (sessId: string, modelId: string, modelSwitchId?: string) => void;
+  prepareModelSwitch: (sessId: string, sourceModel: string, targetModel: string) => Promise<string>;
   /** 切换会话 agent（§11 跨 agent 污染守卫的写入点）。*/
   switchAgent: (sessId: string, agentId: string) => void;
   send: (p: {
@@ -138,6 +140,11 @@ export type UseChatSocket = {
     timelineHasMore?: boolean;
     timelineSnapshotMaxSeq?: number;
     invalidateHistoryCache?: boolean;
+    openDispatch?: {
+      dispatchId: string;
+      clientMessageId: string;
+      status: string;
+    };
   }) => void;
   /** Replay an immutable page from the master-side live-frame journal. */
   applyDurableLiveFrames: (
@@ -155,7 +162,10 @@ export type UseChatSocket = {
     sessId: string,
     fetchPage: (after: string) => Promise<DurableLiveFramePage>,
     applyTapeProjection: () => Promise<void>,
+    fetchUnits?: (query?: { before?: string | null }) => Promise<unknown>,
   ) => Promise<void>;
+  /** Re-run background journal hydrate after a page/time-cap degrade. */
+  retryLiveJournalHydration: (sessId: string) => Promise<void>;
   /** server 增量游标（getSession 的 sinceSeq；无则 0=全量）。*/
   storedMaxSeq: (sessId: string | undefined) => number;
   /** History revision paired with storedMaxSeq; absent forces a full fallback. */
@@ -164,6 +174,9 @@ export type UseChatSocket = {
    * 显式点击加载：从统一真实时间线拉一页更早记录并常驻本页内存。
    */
   loadOlderHistory: (
+    sessId: string | undefined,
+  ) => Promise<{ ok: boolean; loaded: number; hasMore: boolean; error?: boolean }>;
+  loadOlderLiveUnits: (
     sessId: string | undefined,
   ) => Promise<{ ok: boolean; loaded: number; hasMore: boolean; error?: boolean }>;
   /** 按需读取、校验并在 worker 中解析一条超大 immutable record。 */
@@ -335,9 +348,18 @@ export function useChatSocket(opts: {
         if (!socket) return false;
         const sess = socket.sessions.get(sessId);
         if (!sess) return false;
+        const authEpoch = a.snapshot().epoch;
+        const isCurrent = (): boolean =>
+          authRef.current === a &&
+          a.snapshot().epoch === authEpoch &&
+          socketRef.current === socket &&
+          socket.sessions.get(sessId) === sess &&
+          (context?.isCurrent?.() ?? true);
+        if (!isCurrent()) return false;
         try {
           const sinceSeq = typeof sess._maxSeq === "number" && sess._maxSeq > 0 ? sess._maxSeq : 0;
           const detail = await api.getSession(a, sessId, sinceSeq, sess._historyRevision);
+          if (!isCurrent()) return false;
           const serverMsgs = Array.isArray(detail.messages) ? (detail.messages as ChatMessage[]) : null;
           const revisionRepair =
             typeof detail.historyRevision === "number" &&
@@ -367,8 +389,14 @@ export function useChatSocket(opts: {
                 timelineHasMore: detail.timelineHasMore,
                 timelineSnapshotMaxSeq: detail.timelineSnapshotMaxSeq,
                 invalidateHistoryCache: detail._historyRevisionUnsupported === true,
+                openDispatch: detail.openDispatch,
               },
             );
+          }
+          if (context?.tapeProjectionOnly === true) {
+            if (!isCurrent()) return false;
+            persistRef.current(sessId);
+            return true;
           }
           // The shared ChatSocket checkpoint performs one cold exact rebuild, then
           // every history/reconcile caller appends only records after its cursor.
@@ -380,6 +408,7 @@ export function useChatSocket(opts: {
               // A full read after an observed live-owner cutover closes the
               // detail→journal race without substituting a summary or truncation.
               const tapeDetail = await api.getSession(a, sessId, 0);
+              if (!isCurrent()) return;
               socket.applyServerMessages(
                 sessId,
                 tapeDetail.agentId || sess.agentId,
@@ -400,7 +429,9 @@ export function useChatSocket(opts: {
                 },
               );
             },
+            (query) => api.getSessionLiveUnits(a, sessId, { n: 20, ...query }),
           );
+          if (!isCurrent()) return false;
           sess._liveStreamBroken = false;
           persistRef.current(sessId); // server-wins 合并后落地新 tape + 游标
           return true;
@@ -646,7 +677,12 @@ export function useChatSocket(opts: {
     [socket],
   );
   const setSessionModel = useCallback(
-    (sessId: string, modelId: string) => socket.setSessionModel(sessId, modelId),
+    (sessId: string, modelId: string, modelSwitchId?: string) => socket.setSessionModel(sessId, modelId, modelSwitchId),
+    [socket],
+  );
+  const prepareModelSwitch = useCallback(
+    (sessId: string, sourceModel: string, targetModel: string) =>
+      socket.prepareModelSwitch(sessId, sourceModel, targetModel),
     [socket],
   );
   const switchAgent = useCallback((sessId: string, agentId: string) => socket.switchAgent(sessId, agentId), [socket]);
@@ -687,6 +723,7 @@ export function useChatSocket(opts: {
         timelineHasMore: p.timelineHasMore,
         timelineSnapshotMaxSeq: p.timelineSnapshotMaxSeq,
         invalidateHistoryCache: p.invalidateHistoryCache,
+        openDispatch: p.openDispatch,
       });
       persistRef.current(p.sessId); // 合并后落地（含推进的 _maxSeq 游标 + 归档水位/计数）
     },
@@ -703,8 +740,44 @@ export function useChatSocket(opts: {
     [socket],
   );
   const hydrateDurableLiveFrameJournal = useCallback<UseChatSocket["hydrateDurableLiveFrameJournal"]>(
-    (sessId, fetchPage, applyTapeProjection) =>
-      socket.hydrateDurableLiveFrameJournal(sessId, fetchPage, applyTapeProjection),
+    (sessId, fetchPage, applyTapeProjection, fetchUnits) =>
+      socket.hydrateDurableLiveFrameJournal(sessId, fetchPage, applyTapeProjection, fetchUnits),
+    [socket],
+  );
+  const retryLiveJournalHydration = useCallback<UseChatSocket["retryLiveJournalHydration"]>(
+    async (sessId) => {
+      const a = authRef.current;
+      const live = socketRef.current;
+      if (!a || !live) return;
+      const sess = live.sessions.get(sessId);
+      if (sess) sess._liveJournalDegraded = false;
+      await live.hydrateDurableLiveFrameJournal(
+        sessId,
+        (after) => api.getSessionLiveFrames(a, sessId, after, 500),
+        async () => {
+          const tapeDetail = await api.getSession(a, sessId, 0);
+          live.applyServerMessages(
+            sessId,
+            tapeDetail.agentId || sess?.agentId || "main",
+            Array.isArray(tapeDetail.messages) ? tapeDetail.messages as ChatMessage[] : [],
+            !tapeDetail.isPartial,
+            tapeDetail.maxSeq,
+            {
+              archivedThroughSeq: tapeDetail.archivedThroughSeq,
+              archivedCount: tapeDetail.archivedCount,
+              serverUpdatedAt: tapeDetail.updatedAt,
+              historyRevision: tapeDetail.historyRevision,
+              timelineGeneration: tapeDetail.timelineGeneration,
+              timelineCursor: tapeDetail.timelineCursor,
+              timelineHasMore: tapeDetail.timelineHasMore,
+              timelineSnapshotMaxSeq: tapeDetail.timelineSnapshotMaxSeq,
+              invalidateHistoryCache: tapeDetail._historyRevisionUnsupported === true,
+            },
+          );
+        },
+        (query) => api.getSessionLiveUnits(a, sessId, { n: 20, ...query }),
+      );
+    },
     [socket],
   );
   // 统一时间线点击加载并发闸。同一页只能由显式按钮触发一次；滚动与重渲染
@@ -758,6 +831,35 @@ export function useChatSocket(opts: {
         return { ok: false, loaded: 0, hasMore: true, error: true }; // 失败:保留"可重试",hasMore 不封死
       } finally {
         olderHistoryFetchingRef.current.delete(sessId);
+      }
+    },
+    [socket],
+  );
+  const loadOlderLiveUnits = useCallback<UseChatSocket["loadOlderLiveUnits"]>(
+    async (sessId) => {
+      const a = authRef.current;
+      if (!a || !sessId) return { ok: false, loaded: 0, hasMore: false };
+      const session = socket.sessions.get(sessId);
+      const before = session?._liveUnitsBeforeCursor;
+      if (!session || session._liveUnitsHasMoreBefore !== true || !before) {
+        return { ok: true, loaded: 0, hasMore: false };
+      }
+      try {
+        const raw = await api.getSessionLiveUnits(a, sessId, { n: 20, before });
+        if (!isLiveUnitsPage(raw) || raw.degraded === "fallback") {
+          return { ok: false, loaded: 0, hasMore: true, error: true };
+        }
+        const beforeCount = session.messages.length;
+        socket.prependLiveUnits(sessId, raw.units);
+        const current = socket.sessions.get(sessId);
+        if (current) {
+          current._liveUnitsHasMoreBefore = raw.hasMoreBefore;
+          current._liveUnitsBeforeCursor = raw.beforeCursor;
+        }
+        const loaded = Math.max(0, (socket.sessions.get(sessId)?.messages.length ?? beforeCount) - beforeCount);
+        return { ok: true, loaded, hasMore: raw.hasMoreBefore };
+      } catch {
+        return { ok: false, loaded: 0, hasMore: true, error: true };
       }
     },
     [socket],
@@ -938,6 +1040,7 @@ export function useChatSocket(opts: {
       removeSession,
       renameSession,
       setSessionModel,
+      prepareModelSwitch,
       switchAgent,
       send,
       stop,
@@ -951,9 +1054,11 @@ export function useChatSocket(opts: {
       applyDurableLiveFrames,
       runDurableLiveFrameHydration,
       hydrateDurableLiveFrameJournal,
+      retryLiveJournalHydration,
       storedMaxSeq,
       storedHistoryRevision,
       loadOlderHistory,
+      loadOlderLiveUnits,
       fetchTapeRecordPayload,
       peekTapeRecordPayload,
       fetchUserMessagePayload,
@@ -973,6 +1078,7 @@ export function useChatSocket(opts: {
       removeSession,
       renameSession,
       setSessionModel,
+      prepareModelSwitch,
       switchAgent,
       send,
       stop,
@@ -986,9 +1092,11 @@ export function useChatSocket(opts: {
       applyDurableLiveFrames,
       runDurableLiveFrameHydration,
       hydrateDurableLiveFrameJournal,
+      retryLiveJournalHydration,
       storedMaxSeq,
       storedHistoryRevision,
       loadOlderHistory,
+      loadOlderLiveUnits,
       fetchTapeRecordPayload,
       peekTapeRecordPayload,
       fetchUserMessagePayload,

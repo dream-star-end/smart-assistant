@@ -436,6 +436,31 @@ describe("4 个新专属卡", () => {
     expect(container.textContent).not.toContain("--action");
   });
 
+  test("oc-memory delegate 失败 → 人话超时，不摊 Command/Exit Code", () => {
+    const { container } = render(
+      <div>
+        {researchToolCard(
+          "oc-memory delegate --goal '查一下记忆工具'",
+          tool({
+            error: true,
+            output: JSON.stringify({
+              command: "export HOME=/home/agent OPENCLAUDE_SESSION_KEY=agent:main:x oc-memory delegate --goal x",
+              exitCode: 1,
+              stderr: "oc-memory: delegate client timeout after 45s",
+              stdout: "",
+              workingDirectory: "/home/agent",
+              signal: null,
+            }),
+          }),
+        )}
+      </div>,
+    );
+    expect(container.textContent).toMatch(/委派还在等待子任务完成/);
+    expect(container.textContent).not.toContain("export HOME");
+    expect(container.textContent).not.toMatch(/Exit Code|exitCode|WorkingDirectory|workingDirectory/i);
+    expect(container.textContent).not.toContain("delegate client timeout after 45s");
+  });
+
   test("oc-memory session-search → 历史检索卡(查询 + 结果,不裸露命令)", () => {
     const { container } = render(
       <div>

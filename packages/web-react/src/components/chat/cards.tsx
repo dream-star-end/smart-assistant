@@ -36,6 +36,7 @@ import {
 import { thinkingSegments, thinkingSummaryTitle } from "../../lib/thinkingText";
 import { cn, groupDigits } from "../../lib/utils";
 import { Markdown } from "../Markdown";
+import { OptionsGroupFooter, OptionsGroupProvider } from "../optionsGroup";
 import { Alert, Avatar, Badge, Button, IconButton } from "../ui";
 import { ChildBlockView, ProgressivePlainText } from "./AgentGroupCard";
 import { Media } from "./media";
@@ -351,7 +352,7 @@ function ReplyQuoteBlock({
       data-testid="message-reply-quote"
     >
       <div className="mb-0.5 text-[11px] font-medium">
-        {role === "assistant" ? "OpenClaude" : "你"}
+        {role === "assistant" ? "从简" : "你"}
       </div>
       <div className="line-clamp-2 whitespace-pre-wrap break-words text-[12.5px] leading-5">
         {text}
@@ -593,9 +594,15 @@ export function AssistantCard({
               内部串类正文不进这里(bodyText 为空),只由下方红卡按码文案承载;
             - 流式已起但正文尚空 → 本轮活动指示取代裸三点。 */}
         {msg.text && !hasError ? (
-          <ProgressiveMarkdown text={msg.text} live={live} />
+          <OptionsGroupProvider live={live}>
+            <ProgressiveMarkdown text={msg.text} live={live} />
+            <OptionsGroupFooter />
+          </OptionsGroupProvider>
         ) : hasError && !isUserCancelled && presentedError?.bodyText ? (
-          <ProgressiveMarkdown text={presentedError.bodyText} />
+          <OptionsGroupProvider>
+            <ProgressiveMarkdown text={presentedError.bodyText} />
+            <OptionsGroupFooter />
+          </OptionsGroupProvider>
         ) : live && !hasError && !ctx.activityInFooter ? (
           ctx.turnActivity ? <TurnActivity info={ctx.turnActivity} /> : <TypingDots />
         ) : null}
@@ -828,7 +835,10 @@ export function PlanCard({
   msg: ChatMessage;
   tokenUsage?: DisplayTokenUsage;
 }) {
-  const steps = msg.steps ?? [];
+  const steps = (msg.steps ?? []).filter(
+    (s): s is { step: string; status: "pending" | "inProgress" | "completed" } =>
+      !!s && typeof s === "object" && typeof s.step === "string" && typeof s.status === "string",
+  );
   return (
     <div className="rounded-lg border border-border bg-surface animate-in">
       <div className="flex items-center gap-2 border-b border-border px-3.5 py-2.5">

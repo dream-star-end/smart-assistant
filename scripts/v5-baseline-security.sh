@@ -48,9 +48,13 @@ EXPECTED_SKILLS=(
   oc-vision
   app-connectors
   connector-authoring
+  manage-taskboard
 )
 
-ALLOW_LEGACY_MISSING_CURSOR=0
+# Serving predecessor compatibility only: pre-admin/taskboard releases may lack
+# the two admin prompt variants and the cursor/taskboard skills. New releases
+# remain exact-manifest strict.
+ALLOW_LEGACY_BASELINE_GAPS=0
 
 die() {
   printf 'FATAL: V5 CCB baseline guard: %s\n' "$*" >&2
@@ -81,17 +85,25 @@ assert_structure() { # <baseline-dir>
   special="$(find -P "$root" -mindepth 1 ! \( -type d -o -type f \) -print -quit)"
   [[ -z "$special" ]] || die "symlink/special node is forbidden: $special"
 
-  top_expected="$(printf '%s\n' AGENTS.md CLAUDE.md skills | sorted_lines)"
+  top_expected="$(printf '%s\n' AGENTS.admin.md AGENTS.md CLAUDE.admin.md CLAUDE.md skills | sorted_lines)"
+  if [[ "$ALLOW_LEGACY_BASELINE_GAPS" == 1 && ! -e "$root/AGENTS.admin.md" && ! -e "$root/CLAUDE.admin.md" ]]; then
+    top_expected="$(printf '%s\n' AGENTS.md CLAUDE.md skills | sorted_lines)"
+  fi
   top_actual="$(find -P "$root" -mindepth 1 -maxdepth 1 -printf '%f\n' | sorted_lines)"
   assert_exact_lines "baseline top-level entries" "$top_expected" "$top_actual"
   [[ -f "$root/AGENTS.md" && -f "$root/CLAUDE.md" && -d "$root/skills" ]] \
     || die "AGENTS.md, CLAUDE.md and skills/ are required"
-
-  if [[ "$ALLOW_LEGACY_MISSING_CURSOR" == 1 && ! -e "$root/skills/cursor-cli" ]]; then
-    skills_expected="$(printf '%s\n' "${EXPECTED_SKILLS[@]}" | grep -vx cursor-cli | sorted_lines)"
-  else
-    skills_expected="$(printf '%s\n' "${EXPECTED_SKILLS[@]}" | sorted_lines)"
+  if [[ "$ALLOW_LEGACY_BASELINE_GAPS" != 1 || -e "$root/AGENTS.admin.md" || -e "$root/CLAUDE.admin.md" ]]; then
+    [[ -f "$root/AGENTS.admin.md" && -f "$root/CLAUDE.admin.md" ]] \
+      || die "AGENTS.admin.md and CLAUDE.admin.md must be both present or both absent only in legacy mode"
   fi
+
+  skills_expected="$(printf '%s\n' "${EXPECTED_SKILLS[@]}")"
+  if [[ "$ALLOW_LEGACY_BASELINE_GAPS" == 1 ]]; then
+    [[ -e "$root/skills/cursor-cli" ]] || skills_expected="$(grep -vx cursor-cli <<<"$skills_expected")"
+    [[ -e "$root/skills/manage-taskboard" ]] || skills_expected="$(grep -vx manage-taskboard <<<"$skills_expected")"
+  fi
+  skills_expected="$(sorted_lines <<<"$skills_expected")"
   # Runtime resolveCcbBaselineMounts() enumerates every skills/ entry before it
   # validates directories. Mirror that exact boundary: an undeclared regular
   # file at this level is manifest drift too, not something to silently ignore.
@@ -101,7 +113,9 @@ assert_structure() { # <baseline-dir>
   # 与 runtime resolveCcbBaselineMounts() 同一白名单(2026-07-16 扩展):
   # skill 目录允许恰好 {SKILL.md} 或 {SKILL.md, evals/};evals/ 内恰好一个 evals.json。
   for skill in "${EXPECTED_SKILLS[@]}"; do
-    [[ "$ALLOW_LEGACY_MISSING_CURSOR" == 1 && "$skill" == cursor-cli && ! -e "$root/skills/$skill" ]] && continue
+    if [[ "$ALLOW_LEGACY_BASELINE_GAPS" == 1 && ! -e "$root/skills/$skill" && ( "$skill" == cursor-cli || "$skill" == manage-taskboard ) ]]; then
+      continue
+    fi
     [[ -d "$root/skills/$skill" ]] || die "missing skill directory: $skill"
     entries="$(find -P "$root/skills/$skill" -mindepth 1 -maxdepth 1 -printf '%f\n' | sorted_lines)"
     if [[ "$entries" == "SKILL.md" ]]; then
@@ -182,8 +196,8 @@ path="$2"
 case "$mode" in
   check-release)   check_baseline "${path%/}/$BASELINE_REL" ;;
   harden-release)  harden_baseline "${path%/}/$BASELINE_REL" ;;
-  check-release-legacy-cursor) ALLOW_LEGACY_MISSING_CURSOR=1; check_baseline "${path%/}/$BASELINE_REL" ;;
-  harden-release-legacy-cursor) ALLOW_LEGACY_MISSING_CURSOR=1; harden_baseline "${path%/}/$BASELINE_REL" ;;
+  check-release-legacy-cursor) ALLOW_LEGACY_BASELINE_GAPS=1; check_baseline "${path%/}/$BASELINE_REL" ;;
+  harden-release-legacy-cursor) ALLOW_LEGACY_BASELINE_GAPS=1; harden_baseline "${path%/}/$BASELINE_REL" ;;
   check-dir)       check_baseline "${path%/}" ;;
   harden-dir)      harden_baseline "${path%/}" ;;
   *) usage ;;

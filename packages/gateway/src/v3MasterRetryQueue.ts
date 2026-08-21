@@ -119,7 +119,13 @@ export interface V3MasterRetryEntry {
   lastErrorAt?: number
   /** Truncated error message; never the bearer / payload body. */
   lastErrorMessage?: string
+  /** Set after master 200 with settlementHandoff (rev2 B1). Retry cap applies
+   *  only then, and never to TURN_TAPE_BILLING_PENDING / TURN_WAIVER_PENDING. */
+  settlementHandoff?: boolean
 }
+
+export const FINALIZE_RETRY_CAP_AFTER_HANDOFF = 30
+const BILLING_OR_WAIVER_PENDING_RE = /TURN_TAPE_BILLING_PENDING|TURN_WAIVER_PENDING/
 
 export interface DrainStats {
   considered: number
@@ -159,7 +165,7 @@ export interface MakeV3MasterRetryQueueDeps {
   /** The single-attempt sender. The queue calls this to drain entries.
    *  Accepts the wire shape (agentId optional) so legacy entries written
    *  by a pre-Fix-A gateway image can still be drained. */
-  attemptSend: (payload: V3MasterSinkWirePayload) => Promise<void>
+  attemptSend: (payload: V3MasterSinkWirePayload) => Promise<{ settlementHandoff?: boolean } | void>
   /** Override only for tests. */
   now?: () => number
   /** Override only for tests. */
@@ -355,7 +361,8 @@ export function makeV3MasterRetryQueue(deps: MakeV3MasterRetryQueueDeps): V3Mast
       }
       // Attempt.
       try {
-        await deps.attemptSend(entry.payload)
+        const sendAck = await deps.attemptSend(entry.payload)
+        if (sendAck && sendAck.settlementHandoff) entry.settlementHandoff = true
         // M-R1-1 ①:顺序反转 —— master ACK 成功后,**先**驱动 durable inbox 终态(仅 dispatch turn),
         // 终态 CAS 确认(onDispatchAck 返回 true)才 ackDurable 删文件。写失败(返回 false)→ 保留
         // 文件:tape 已在 master(finalize 幂等),下轮 drain 重试终态迁移(inbox CAS 幂等)。bump
@@ -396,9 +403,24 @@ export function makeV3MasterRetryQueue(deps: MakeV3MasterRetryQueueDeps): V3Mast
           await ackDurable(name)
           continue
         }
-        // Every non-410 response can be caused by a rolling deployment,
-        // migration skew or repaired contract bug. Keep the valid paid tape
-        // on the active queue and retry without an age/count cap.
+        const errMsg = err instanceof Error ? err.message : String(err)
+        const billingOrWaiverPending = BILLING_OR_WAIVER_PENDING_RE.test(errMsg)
+        // Cap non-financial retries only after settlement jobs were handed off.
+        // TURN_TAPE_BILLING_PENDING / TURN_WAIVER_PENDING never count toward the cap.
+        if (
+          entry.settlementHandoff === true &&
+          !billingOrWaiverPending &&
+          entry.attempts + 1 >= FINALIZE_RETRY_CAP_AFTER_HANDOFF
+        ) {
+          stats.fatalDropped++
+          log.warn('v3MasterRetryQueue: retry cap after settlement handoff', {
+            name,
+            attempts: entry.attempts + 1,
+          })
+          await quarantine(filepath, 'retry_cap_after_settlement_handoff')
+          await fsyncDir()
+          continue
+        }
         stats.retried++
         stats.pending++
         const cls: V3SinkErrorClass =
@@ -407,7 +429,7 @@ export function makeV3MasterRetryQueue(deps: MakeV3MasterRetryQueueDeps): V3Mast
           filepath,
           entry,
           cls,
-          err instanceof Error ? err.message : String(err),
+          errMsg,
           name,
           stats,
         )

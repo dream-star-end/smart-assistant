@@ -72,6 +72,7 @@ import { checkRateLimit, recordRateLimitEvent, type RateLimitConfig, type RateLi
 import { FallbackRateLimiter } from "./proxy/shared.js";
 import { getSystemSetting } from "../admin/systemSettings.js";
 import type { Mailer } from "../auth/mail.js";
+import { COST_INDEX_BASELINE_MODEL_ID, costXVsBaseline } from "@openclaude/protocol";
 import { perKtokCredits, type PricingCache, type PublicModel } from "../billing/pricing.js";
 import {
   CatalogUnknownError,
@@ -1296,6 +1297,8 @@ function anonymousModelScope(): UserModelScope {
     uid: 0,
     role: "user",
     grantedModelIds: new Set<string>(),
+    userPlanTier: null,
+    orgPlanCode: null,
   };
 }
 
@@ -1311,6 +1314,8 @@ async function loadPublicModelScope(
       role: authz.role,
       grantedModelIds: authz.grantedModelIds,
       deniedModelIds: authz.deniedModelIds,
+      userPlanTier: authz.userPlanTier ?? null,
+      orgPlanCode: authz.orgPlanCode ?? null,
     };
   }
   const { listGrantsForUser } = await import("../admin/modelGrants.js");
@@ -1319,6 +1324,8 @@ async function loadPublicModelScope(
     uid: claims.sub,
     role: claims.role,
     grantedModelIds: new Set(grants.map((g) => g.model_id)),
+    userPlanTier: null,
+    orgPlanCode: null,
   };
 }
 
@@ -1344,6 +1351,23 @@ function projectPublicModels(
     // listForUser 已保证可路由(有价);这里 get 只是取值,理论不可能 miss。
     const p = snapshot.pricing.get(row.modelId);
     if (!p) continue;
+    const baseline = snapshot.pricing.get(COST_INDEX_BASELINE_MODEL_ID);
+    const costX = costXVsBaseline(
+      {
+        inputPerMtok: p.inputPerMtok,
+        cacheReadPerMtok: p.cacheReadPerMtok,
+        outputPerMtok: p.outputPerMtok,
+        multiplier: p.multiplier,
+      },
+      baseline
+        ? {
+            inputPerMtok: baseline.inputPerMtok,
+            cacheReadPerMtok: baseline.cacheReadPerMtok,
+            outputPerMtok: baseline.outputPerMtok,
+            multiplier: baseline.multiplier,
+          }
+        : null,
+    );
     out.push({
       id: row.modelId,
       display_name: row.displayName,
@@ -1353,7 +1377,11 @@ function projectPublicModels(
       cache_write_per_ktok_credits: perKtokCredits(p.cacheWritePerMtok, p.multiplier),
       multiplier: p.multiplier,
       supported_efforts: [...row.supportedEfforts],
+      engine: row.engine,
+      context_window: row.contextWindow,
+      supports_vision: row.supportsVision,
       provider_id: row.providerId,
+      ...(costX !== undefined ? { cost_x: costX } : {}),
       ...(row.providerId && degraded.has(row.providerId) ? { degraded: true } : {}),
     });
   }

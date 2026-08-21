@@ -49,6 +49,7 @@ import { fileURLToPath } from 'node:url'
 import '../engine/ccbAdapter.js'
 import '../engine/codexAdapter.js'
 import '../engine/grokAdapter.js'
+import '../engine/zcodeAdapter.js'
 import type { EngineAdapter } from '../engine/engineAdapter.js'
 import { type EngineCreateOpts, createEngine, registeredEngines } from '../engine/registry.js'
 
@@ -121,6 +122,11 @@ const MUTATOR_PROBES: Record<string, MutatorProbe> = {
     // provider spawn 前失败。CCB/Codex 无此概念,允许缺失。
     requiredOnEngines: ['grok'],
   },
+  setZcodeRoute: {
+    arg: null,
+    // zcode 专属:缺失 = master mint 的本地 relay token 路由被静默丢弃。
+    requiredOnEngines: ['zcode'],
+  },
 }
 
 function makeOpts(sessionKey: string): EngineCreateOpts {
@@ -172,7 +178,7 @@ describe('runner mandatory-mutator parity — 权威源有效性', () => {
 
   it('engine 注册表可枚举且含全部生产引擎', () => {
     const engines = registeredEngines()
-    for (const id of ['ccb', 'codex', 'grok']) {
+    for (const id of ['ccb', 'codex', 'grok', 'zcode']) {
       assert.ok(engines.includes(id), `engine registry 缺少 ${id} —— 注册副作用或权威源已变`)
     }
   })

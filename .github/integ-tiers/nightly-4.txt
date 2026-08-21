@@ -30,3 +30,17 @@ packages/commercial/src/__tests__/migration0216.integ.test.ts
 packages/commercial/src/__tests__/migration0217.integ.test.ts
 packages/commercial/src/__tests__/migration0218.integ.test.ts
 packages/commercial/src/__tests__/migration0219.integ.test.ts
+packages/commercial/src/__tests__/migration0220.integ.test.ts
+packages/commercial/src/__tests__/migration0221.integ.test.ts
+packages/commercial/src/__tests__/migration0222.integ.test.ts
+packages/commercial/src/__tests__/migration0223.integ.test.ts
+packages/commercial/src/__tests__/migration0224.integ.test.ts
+packages/commercial/src/__tests__/migration0225.integ.test.ts
+packages/commercial/src/__tests__/migration0226.integ.test.ts
+packages/commercial/src/__tests__/migration0227.integ.test.ts
+packages/commercial/src/__tests__/migration0232.integ.test.ts
+packages/commercial/src/__tests__/migration0234.integ.test.ts
+packages/commercial/src/__tests__/migration0235.integ.test.ts
+packages/commercial/src/__tests__/migration0236.integ.test.ts
+packages/commercial/src/__tests__/migration0238.integ.test.ts
+packages/commercial/src/__tests__/migration0245.integ.test.ts

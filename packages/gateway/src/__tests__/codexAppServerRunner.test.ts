@@ -25,6 +25,7 @@ import {
   _stringifyItemBounded,
   stripShellWrapper,
   _codexMemoryTurnEnv,
+  readLatestCodexNativeHandoff,
 } from '../engine/codexAppServerRunner.js'
 
 it('injects non-scrubbed Codex memory turn identity', () => {
@@ -32,6 +33,18 @@ it('injects non-scrubbed Codex memory turn identity', () => {
     OC_AGENT_ID: 'research',
     OC_SESSION_KEY: 'web-session-1',
   })
+  assert.deepEqual(
+    _codexMemoryTurnEnv('research', 'web-session-1', {
+      gatewayPort: 18789,
+      contextFile: '/tmp/delegate-context',
+    }),
+    {
+      OC_AGENT_ID: 'research',
+      OC_SESSION_KEY: 'web-session-1',
+      OPENCLAUDE_GATEWAY_PORT: '18789',
+      OPENCLAUDE_DELEGATE_CONTEXT_FILE: '/tmp/delegate-context',
+    },
+  )
 })
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -4005,4 +4018,20 @@ describe('handleItemCompleted — 孤儿 tool_result 自动配对(subAgentActivi
     assert.equal(toolResults[0].message.content[0].tool_use_id, 'ws-1')
     await h.cleanup()
   })
+})
+
+
+it('reads the exact native Codex compacted payload from rollout JSONL', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'codex-handoff-'))
+  const file = join(dir, 'rollout.jsonl')
+  const started = Date.now()
+  await writeFile(file, [
+    JSON.stringify({ timestamp: new Date(started - 60_000).toISOString(), type: 'compacted', payload: { message: 'old', replacement_history: [] } }),
+    JSON.stringify({ timestamp: new Date(started + 1).toISOString(), type: 'compacted', payload: { message: 'native handoff', replacement_history: [{ type: 'message' }] } }),
+  ].join('\n') + '\n')
+  try {
+    assert.deepEqual(await readLatestCodexNativeHandoff(file, started), {
+      summaryText: 'native handoff', source: 'codex', compactStartedAt: started,
+    })
+  } finally { await rm(dir, { recursive: true, force: true }) }
 })

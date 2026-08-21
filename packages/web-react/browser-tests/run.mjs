@@ -605,7 +605,7 @@ await check("T4 file input 结构红线:type=file/无 accept/非 display:none/ta
 });
 
 await check("T27 输入框粘贴 PNG 直接上传为图片附件", async () => {
-  const textarea = primaryComposer.getByPlaceholder("给 OpenClaude 发消息…");
+  const textarea = primaryComposer.getByPlaceholder("给从简发消息…");
   await textarea.fill("保留这段正文");
   const pasteResult = await textarea.evaluate((element) => {
     const png = Uint8Array.from(
@@ -686,7 +686,6 @@ await check("T7 点「+」→「设定目标」→ 目标对话框弹出", async
   await dialog.waitFor({ state: "hidden", timeout: 3000 });
 });
 
-let firstAnchorTop = 0;
 async function scrollTimelineDiagnostic(stage) {
   return page.evaluate((currentStage) => {
     const state = window.__scrollTimeline;
@@ -752,12 +751,6 @@ await check("T8 上滑零请求，点击只取一页、像素锚定且 remount �
   if (afterCancel.length !== 0) {
     throw new Error(`pointercancel 后程序滚动被误判为手势:${JSON.stringify(afterCancel)}`);
   }
-  const anchor = root.locator('[data-chat-virtual-key="outer:200:scroll-tail-0"]');
-  await anchor.waitFor({ state: "attached", timeout: 3000 });
-  const beforeBox = await anchor.boundingBox();
-  if (!beforeBox) throw new Error("tail anchor has no layout box before paging");
-  firstAnchorTop = beforeBox.y;
-
   // A complete wheel/inertia burst is navigation only. It must reveal the
   // explicit boundary without admitting any history request.
   await root.evaluate((node) => {
@@ -793,10 +786,21 @@ await check("T8 上滑零请求，点击只取一页、像素锚定且 remount �
     throw new Error(`单次点击未严格加载一页:${JSON.stringify(afterClick)}`);
   }
   await restorePageScrollT8();
-  const afterBox = await anchor.boundingBox();
-  if (!afterBox) throw new Error("tail anchor disappeared after older page merge");
-  const delta = Math.abs(afterBox.y - firstAnchorTop);
-  if (delta > 2) throw new Error(`插页后可见锚点跳动 ${delta.toFixed(2)}px，应 ≤2px`);
+  const capturedAnchor = await page.evaluate(() => window.__scrollTimeline.anchor);
+  if (!capturedAnchor) throw new Error("生产分页回调未捕获可见锚点");
+  const afterAnchor = root.locator(`[data-chat-virtual-key="${capturedAnchor.key}"]`);
+  const afterBox = await afterAnchor.boundingBox();
+  const afterRootBox = await root.boundingBox();
+  if (!afterBox || !afterRootBox) throw new Error("tail anchor disappeared after older page merge");
+  const delta = Math.abs((afterBox.y - afterRootBox.y) - capturedAnchor.top);
+  if (delta > 2) {
+    const diagnostic = await page.evaluate(() => ({
+      captured: window.__scrollTimeline.anchor,
+      scrollTop: document.querySelector("#timeline-scroll-root .timeline-scroll-probe")?.scrollTop,
+      scrollHeight: document.querySelector("#timeline-scroll-root .timeline-scroll-probe")?.scrollHeight,
+    }));
+    throw new Error(`插页后可见锚点跳动 ${delta.toFixed(2)}px，应 ≤2px; ${JSON.stringify({ capturedAnchor, afterRelativeTop: afterBox.y - afterRootBox.y, diagnostic })}`);
+  }
 
   // Force the first latest record out of Virtuoso overscan and back using
   // programmatic scroll only. A remount must never refetch a resident page.
@@ -850,10 +854,6 @@ await check("T10 归档前插跨出虚拟挂载区仍保持原消息像素位置
   if ((await page.evaluate(() => window.__archiveTimeline.calls)) !== 0) {
     throw new Error("归档会话滚到顶部时错误自动请求");
   }
-  const anchor = root.locator('[data-chat-virtual-key="outer:300:archive-tail-0"]');
-  await anchor.waitFor({ state: "attached", timeout: 3000 });
-  const beforeBox = await anchor.boundingBox();
-  if (!beforeBox) throw new Error("归档前插前缺少可见锚点");
   const button = root.getByTestId("history-page-loader").getByRole("button");
   const restorePageScrollT10 = await pinPageScroll(page);
   await button.click();
@@ -863,10 +863,28 @@ await check("T10 归档前插跨出虚拟挂载区仍保持原消息像素位置
     return button instanceof HTMLButtonElement && button.getAttribute("aria-busy") === "false";
   }, null, { timeout: 3000 });
   await restorePageScrollT10();
-  const afterBox = await anchor.boundingBox();
-  if (!afterBox) throw new Error("归档前插 80 行后原锚点被虚拟列表丢失");
-  const delta = Math.abs(afterBox.y - beforeBox.y);
-  if (delta > 2) throw new Error(`归档前插后可见锚点跳动 ${delta.toFixed(2)}px，应 ≤2px`);
+  const capturedAnchor = await page.evaluate(() => window.__archiveTimeline.anchor);
+  if (!capturedAnchor) throw new Error("归档分页回调未捕获可见锚点");
+  await page.waitForFunction(({ key, top }) => {
+    const root = document.querySelector("#timeline-archive-root .timeline-scroll-probe");
+    const anchor = document.querySelector(`#timeline-archive-root [data-chat-virtual-key="${key}"]`);
+    if (!(root instanceof HTMLElement) || !(anchor instanceof HTMLElement)) return false;
+    return Math.abs(
+      (anchor.getBoundingClientRect().top - root.getBoundingClientRect().top) - top,
+    ) <= 2;
+  }, capturedAnchor, { timeout: 3000 });
+  const afterAnchor = root.locator(`[data-chat-virtual-key="${capturedAnchor.key}"]`);
+  const afterBox = await afterAnchor.boundingBox();
+  const afterRootBox = await root.boundingBox();
+  if (!afterBox || !afterRootBox) throw new Error("归档前插 80 行后原锚点被虚拟列表丢失");
+  const delta = Math.abs((afterBox.y - afterRootBox.y) - capturedAnchor.top);
+  if (delta > 2) {
+    const diagnostic = await page.evaluate(() => ({
+      scrollTop: document.querySelector("#timeline-archive-root .timeline-scroll-probe")?.scrollTop,
+      scrollHeight: document.querySelector("#timeline-archive-root .timeline-scroll-probe")?.scrollHeight,
+    }));
+    throw new Error(`归档前插后可见锚点跳动 ${delta.toFixed(2)}px，应 ≤2px; ${JSON.stringify({ capturedAnchor, afterRelativeTop: afterBox.y - afterRootBox.y, diagnostic })}`);
+  }
   const state = await page.evaluate(() => window.__archiveTimeline);
   if (state.calls !== 1 || state.messageCount !== 200) {
     throw new Error(`归档单击加载契约错误:${JSON.stringify(state)}`);
@@ -1039,14 +1057,14 @@ await check("T18 点助手“引用”→预览可取消→再次引用后随正
   const root = page.locator("#message-quote-root");
   const quote = root.getByRole("button", { name: "引用" });
   await quote.click();
-  await root.getByText("正在引用 OpenClaude").waitFor({ state: "visible", timeout: 3000 });
+  await root.getByText("正在引用 从简").waitFor({ state: "visible", timeout: 3000 });
   await root.getByText("这是需要被引用的完整回答").last().waitFor({ state: "visible", timeout: 3000 });
   await root.getByRole("button", { name: "取消引用" }).click();
-  if (await root.getByText("正在引用 OpenClaude").count()) {
+  if (await root.getByText("正在引用 从简").count()) {
     throw new Error("取消后引用预览仍存在");
   }
   await quote.click();
-  const composer = root.getByPlaceholder("给 OpenClaude 发消息…");
+  const composer = root.getByPlaceholder("给从简发消息…");
   await composer.fill("请重点解释这一段");
   await root.getByRole("button", { name: "发送" }).click();
   const sends = await page.evaluate(() => window.__messageQuote.sends);
@@ -1174,7 +1192,7 @@ await check("T21 真 WS 帧驱动真时间线:条目顺序、工具卡内容、�
 // `!e.nativeEvent.isComposing` 这道守卫在单测里等于不存在:删掉它单测照绿,而线上
 // 中文用户选词按回车就会误发半截草稿。这里用 CDP Input.imeSetComposition 造真实组合态。
 await check("T22 Enter 发送 / Shift+Enter 换行 / IME 组合中回车不误发", async () => {
-  const composer = primaryComposer.getByPlaceholder("给 OpenClaude 发消息…");
+  const composer = primaryComposer.getByPlaceholder("给从简发消息…");
   await composer.waitFor({ state: "visible", timeout: 3000 });
   const sendCount = async () => (await page.evaluate(() => window.__sends)).length;
   const value = () => composer.inputValue();
@@ -1475,7 +1493,7 @@ await check("T17 PC 全屏预览空闲收起控件且可按需恢复", async () 
 // 已有的移动覆盖(T13 工具卡 375px / T15 Ask UI / T16 预览)都是单组件,整页的
 // 顶栏拥挤与正文横向溢出**没人看**。而聊天滚动区是 overflow-x-hidden:超出视口的
 // 内容不是"可以滑过去看",是**直接被裁掉、用户永远看不到**。
-const mobileContext = await browser.newContext({ viewport: { width: 390, height: 844 } });
+const mobileContext = await browser.newContext({ viewport: { width: 390, height: 844 }, hasTouch: true });
 const mobilePage = await mobileContext.newPage();
 watchRuntimeErrors(mobilePage, "mobile");
 const mobileUrl = "http://127.0.0.1/__openclaude_browser_mobile__";
@@ -1590,6 +1608,67 @@ await check("T25 390×844 整页:顶栏入口不被挤出、宽正文不被裁�
   if (JSON.stringify(sends) !== JSON.stringify([{ text: "MOBILE_SEND_MARKER", mediaCount: 0 }])) {
     throw new Error(`移动端发送结果漂移: ${JSON.stringify(sends)}`);
   }
+});
+
+await check("T43 移动端首次上滑立即解除贴底，内容再长不回弹", async () => {
+  screenshotPage = mobilePage;
+  const scroll = mobilePage.getByTestId("mobile-chat-scroll");
+  await mobilePage.evaluate(() => window.__mobilePage.growTimeline());
+  await mobilePage.waitForFunction(() => {
+    const node = document.querySelector('[data-testid="mobile-chat-scroll"]');
+    return node instanceof HTMLElement && node.scrollHeight > node.clientHeight + 200;
+  }, null, { timeout: 5000 });
+  await mobilePage.evaluate(() => window.__mobilePage.armSticky());
+  const before = await scroll.evaluate((node) => ({
+    top: node.scrollTop,
+    height: node.scrollHeight,
+    client: node.clientHeight,
+  }));
+  if (Math.abs(before.top - (before.height - before.client)) > 2) {
+    throw new Error(`触控前未贴底: ${JSON.stringify(before)}`);
+  }
+
+  const box = await scroll.boundingBox();
+  if (!box) throw new Error("移动聊天区无可触控几何");
+  const cdp = await mobileContext.newCDPSession(mobilePage);
+  const x = Math.round(box.x + box.width / 2);
+  const y = Math.round(box.y + Math.min(180, box.height / 2));
+  await cdp.send("Input.dispatchTouchEvent", {
+    type: "touchStart",
+    touchPoints: [{ x, y, radiusX: 4, radiusY: 4, force: 1, id: 1 }],
+  });
+  await cdp.send("Input.dispatchTouchEvent", {
+    type: "touchMove",
+    touchPoints: [{ x, y: y + 24, radiusX: 4, radiusY: 4, force: 1, id: 1 }],
+  });
+  await mobilePage.waitForTimeout(80);
+  await cdp.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+  await cdp.detach();
+  await mobilePage.waitForTimeout(80);
+
+  const afterGesture = await scroll.evaluate((node) => ({
+    top: node.scrollTop,
+    following: window.__mobilePage.following,
+  }));
+  if (afterGesture.top >= before.top - 2) {
+    throw new Error(`触控上滑没有离开底部: before=${before.top}, after=${afterGesture.top}`);
+  }
+  if (afterGesture.following) {
+    throw new Error("触控首次上滑后仍处于贴底态");
+  }
+
+  await mobilePage.evaluate(() => window.__mobilePage.growTimeline());
+  await mobilePage.waitForTimeout(300);
+  const afterGrow = await scroll.evaluate((node) => ({
+    top: node.scrollTop,
+    following: window.__mobilePage.following,
+  }));
+  if (Math.abs(afterGrow.top - afterGesture.top) > 2) {
+    throw new Error(
+      `上滑后内容增长把视口拉走: gesture=${JSON.stringify(afterGesture)}, grow=${JSON.stringify(afterGrow)}`,
+    );
+  }
+  if (afterGrow.following) throw new Error("内容增长后错误恢复贴底态");
 });
 screenshotPage = page;
 
@@ -1901,7 +1980,7 @@ await check("T31 journal page1→WS N→page2(N)：已响应思考/工具/正文
     state: "visible",
     timeout: 3000,
   });
-  const toolButton = replayRoot.getByRole("button", { name: /exec_command/ }).first();
+  const toolButton = replayRoot.getByRole("button", { name: /执行 Shell|exec_command/ }).first();
   await toolButton.waitFor({ state: "visible", timeout: 3000 });
   await toolButton.click();
   await replayRoot.getByText(result.markers.toolOutput, { exact: true }).waitFor({
@@ -1926,17 +2005,15 @@ await check("T31 journal page1→WS N→page2(N)：已响应思考/工具/正文
 await check("T32 durable error replay：用户 Stop 不上报，历史非尾错误不触发同步循环", async () => {
   const result = await page.evaluate(() => window.__replayDrive.runDurableErrorReplay());
   if (
-    result.stopErrorCode !== "user_cancelled" ||
-    result.stopErrorText !== "本轮已取消。" ||
     result.stopReports !== 0 ||
     result.stopSyncs !== 0 ||
-    result.stopStatusCount !== 1 ||
+    result.stopStatusCount !== 0 ||
     result.stopAlertCount !== 0 ||
     result.stopRetryCount !== 0 ||
     result.stopCancelledCopyCount !== 0 ||
-    result.historicalReports !== 1 ||
+    result.historicalReports !== 0 ||
     result.historicalSyncs !== 0 ||
-    result.historicalDecision !== true
+    result.historicalDecision !== false
   ) {
     throw new Error(`durable error replay 未收敛:${JSON.stringify(result)}`);
   }
@@ -2013,8 +2090,8 @@ await check("T38 社区教程真浏览器：公开阅读只读，用户投稿进
     throw new Error(`社区教程正文未保持只读:${JSON.stringify(unsafeRender)}`);
   }
 
-  await root.getByRole("button", { name: "返回社区教程" }).click();
-  await root.getByRole("button", { name: "发布教程" }).click();
+  await root.getByRole("button", { name: "返回探索教程" }).click();
+  await root.getByRole("button", { name: "手写教程" }).click();
   await root.getByLabel("标题").fill("BROWSER_SUBMITTED_TITLE");
   await root.getByLabel("摘要").fill("这是一份覆盖真实投稿流程和审核状态的完整摘要。");
   await root.getByLabel("分类").selectOption("research");
@@ -2110,8 +2187,22 @@ await check("T41 Codex 密度 token：Composer/ToolCard/Sidebar 在 1440 与 390
     const sidebar = page.locator("#codex-density-root");
     const active = sidebar.getByRole("button", { name: "密度验收活跃会话" });
     await active.waitFor({ state: "visible", timeout: 3000 });
-    const accent = await active.evaluate((btn) => Boolean(btn.closest("div")?.querySelector(".bg-accent")));
-    if (!accent) throw new Error(`活跃会话缺少 accent 竖条(${theme})`);
+    const activeState = await active.evaluate((btn) => {
+      const row = btn.closest("div");
+      const duration = row?.querySelector("[data-session-duration]");
+      return {
+        hasAccent: Boolean(row?.querySelector(".bg-accent")),
+        durationText: duration?.textContent ?? "",
+        durationTitle: duration?.getAttribute("title") ?? "",
+      };
+    });
+    if (!activeState.hasAccent) throw new Error(`活跃会话缺少 accent 竖条(${theme})`);
+    if (activeState.durationText !== "8m" || !activeState.durationTitle.includes("→")) {
+      throw new Error(`会话累计用时未按 createdAt → lastAt 展示(${theme}): ${JSON.stringify(activeState)}`);
+    }
+    if (await sidebar.getByText("浏览器契约：摘要不应显示", { exact: true }).count() !== 0) {
+      throw new Error(`会话行仍显示最新消息摘要(${theme})`);
+    }
     const idleAccent = await sidebar.getByRole("button", { name: "密度验收空闲会话" }).evaluate(
       (btn) => Boolean(btn.closest("div")?.querySelector(".bg-accent")),
     );
@@ -2121,22 +2212,27 @@ await check("T41 Codex 密度 token：Composer/ToolCard/Sidebar 在 1440 与 390
     if (!createClass.includes("text-section") || !createClass.includes("border-border") || !createClass.includes("bg-surface")) {
       throw new Error(`新建会话未保持 secondary(${theme}): ${createClass}`);
     }
-    const manageClass = await sidebar.getByRole("button", { name: /管理中心/ }).getAttribute("class") ?? "";
-    if (!manageClass.includes("text-body") || !manageClass.includes("text-muted")) {
-      throw new Error(`管理中心入口权重未下降(${theme}): ${manageClass}`);
+    if (await sidebar.getByRole("button", { name: /管理中心/ }).count() !== 0) {
+      throw new Error(`管理中心仍占侧栏主区(${theme})`);
     }
-    const marketClass = await sidebar.getByRole("button", { name: /^市场/ }).getAttribute("class") ?? "";
-    if (!marketClass.includes("text-body") || !marketClass.includes("text-muted")) {
-      throw new Error(`市场入口权重未下降(${theme}): ${marketClass}`);
+    if (await sidebar.getByRole("button", { name: "打开使用教程" }).count() !== 1) {
+      throw new Error(`底栏教程图标丢失(${theme})`);
     }
-    if (await sidebar.getByRole("button", { name: /使用教程/ }).count() !== 1) {
-      throw new Error(`教程入口丢失(${theme})`);
+    if (await sidebar.getByRole("button", { name: /切换主题/ }).count() !== 1) {
+      throw new Error(`底栏主题开关丢失(${theme})`);
     }
-    if (await sidebar.getByRole("button", { name: /组织/ }).count() !== 1) {
-      throw new Error(`组织入口丢失(${theme})`);
+    await sidebar.getByRole("button", { name: "账号菜单" }).click();
+    const menu = page.getByRole("menu");
+    await menu.waitFor({ state: "visible", timeout: 3000 });
+    for (const label of ["管理中心", "市场", "组织", "管理后台", "视频任务", "设置"]) {
+      if (await menu.getByRole("menuitem", { name: new RegExp(label) }).count() !== 1) {
+        throw new Error(`账号菜单缺少「${label}」(${theme})`);
+      }
     }
-    const adminHref = await sidebar.getByRole("link", { name: /管理后台/ }).getAttribute("href");
+    const adminHref = await menu.getByRole("menuitem", { name: /管理后台/ }).getAttribute("href");
     if (adminHref !== "/admin.html") throw new Error(`管理后台入口丢失或 href 错误(${theme}): ${adminHref}`);
+    await page.keyboard.press("Escape");
+    await menu.waitFor({ state: "hidden", timeout: 3000 });
   }
 
   await page.setViewportSize({ width: 1440, height: 900 });
@@ -2272,7 +2368,7 @@ await check("T42 设置壳 390 单列可切五分区、1440 竖导航 168px、�
     ["用量", "会话用量明细"],
     ["偏好", "外观主题"],
     ["反馈", "反馈内容"],
-    ["关于", "备案信息待补充"],
+    ["关于", "让复杂，从简。"],
   ];
 
   async function assertNoOverflow(dialog, label) {

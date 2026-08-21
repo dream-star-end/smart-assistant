@@ -19,11 +19,13 @@ import { describe, test, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
 
 import {
+  resolveExecutionModel,
   resolveSyntheticTurnModel,
   SYNTHETIC_TURN_NON_CODEX_MODEL_DEFAULT,
 } from '../server.js'
 import { setHostStaticProviderKeys } from '../hostStaticProviders.js'
 import type { AgentDef } from '@openclaude/storage'
+import { AGENT_MODEL_AUTO } from '@openclaude/protocol'
 
 const ENV_KEY = 'OPENCLAUDE_SYNTHETIC_TURN_MODEL'
 const savedEnv = process.env[ENV_KEY]
@@ -49,6 +51,24 @@ afterEach(() => {
 function agent(partial: Partial<AgentDef>): Pick<AgentDef, 'id' | 'model' | 'provider'> {
   return { id: 'main', ...partial } as Pick<AgentDef, 'id' | 'model' | 'provider'>
 }
+
+describe('resolveExecutionModel × AGENT_MODEL_AUTO(不锁模型的预设 agent)', () => {
+  test('agent.model=auto 被候选阶梯跳过:帧模型优先,缺省落 fallback(与无 model 同形)', () => {
+    assert.equal(resolveExecutionModel('glm-5.3', AGENT_MODEL_AUTO), 'glm-5.3')
+    assert.equal(resolveExecutionModel(undefined, AGENT_MODEL_AUTO), 'glm-5.3')
+    assert.equal(resolveExecutionModel(AGENT_MODEL_AUTO, 'MiniMax-M3'), 'MiniMax-M3')
+  })
+
+  test('auto 单独出现 → 平台兜底(不会把 "auto" 当模型 id 泄给 runner)', () => {
+    assert.equal(resolveExecutionModel(AGENT_MODEL_AUTO, undefined), 'glm-5.3')
+    assert.notEqual(resolveExecutionModel(AGENT_MODEL_AUTO, undefined), 'auto')
+  })
+
+  test('auto 的合成首帧语义:归一到平台默认(非 codex)→ 不降级、不干预', () => {
+    delete process.env[ENV_KEY]
+    assert.equal(resolveSyntheticTurnModel(agent({ model: AGENT_MODEL_AUTO }), undefined), undefined)
+  })
+})
 
 describe('resolveSyntheticTurnModel', () => {
   test('host main 复现:agent 无 model + defaults=gpt-5.6-sol(codex)→ 降级到非 codex 兜底(带 originalModel)', () => {

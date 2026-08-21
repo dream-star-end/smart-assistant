@@ -118,8 +118,8 @@ function makeReport(window: UsageReportWindow = "7d"): UsageReport {
       { bucket: "2026-07-05", requests: "32", credits: "688" },
     ],
     models: [
-      { model: "glm-5.2", requests: "30", credits: "600" },
-      { model: "gpt-5.5", requests: "12", credits: "288" },
+      { model: "glm-5.2", requests: "30", credits: "600", input_tokens: "1000", output_tokens: "200", cache_read_tokens: "10", cache_write_tokens: "2" },
+      { model: "gpt-5.5", requests: "12", credits: "288", input_tokens: "400", output_tokens: "80", cache_read_tokens: "0", cache_write_tokens: "0" },
     ],
     ledger: {
       trend: [
@@ -227,10 +227,11 @@ describe("UsageTab 图表化窗口口径", () => {
 
 describe("topModelsWithOther（按积分降序 top5 + 合并其他）", () => {
   test("不足 5 项：原样降序，丢弃 0 积分项", () => {
+    const tokens = { input_tokens: "1", output_tokens: "1", cache_read_tokens: "0", cache_write_tokens: "0" };
     const out = topModelsWithOther([
-      { model: "a", requests: "1", credits: "30" },
-      { model: "b", requests: "1", credits: "70" },
-      { model: "c", requests: "1", credits: "0" },
+      { model: "a", requests: "1", credits: "30", ...tokens },
+      { model: "b", requests: "1", credits: "70", ...tokens },
+      { model: "c", requests: "1", credits: "0", ...tokens },
     ]);
     expect(out).toEqual([
       { label: "b", credits: 70 },
@@ -243,6 +244,10 @@ describe("topModelsWithOther（按积分降序 top5 + 合并其他）", () => {
       model: `m${i}`,
       requests: "1",
       credits: String((7 - i) * 10), // 70,60,50,40,30,20,10
+      input_tokens: "1",
+      output_tokens: "1",
+      cache_read_tokens: "0",
+      cache_write_tokens: "0",
     }));
     const out = topModelsWithOther(models);
     expect(out.map((o) => o.label)).toEqual(["m0", "m1", "m2", "m3", "m4", "其他"]);
@@ -252,7 +257,7 @@ describe("topModelsWithOther（按积分降序 top5 + 合并其他）", () => {
 
   test("全零 → 空数组（调用方显示空态）", () => {
     expect(
-      topModelsWithOther([{ model: "a", requests: "0", credits: "0" }]),
+      topModelsWithOther([{ model: "a", requests: "0", credits: "0", input_tokens: "0", output_tokens: "0", cache_read_tokens: "0", cache_write_tokens: "0" }]),
     ).toEqual([]);
   });
 });
@@ -363,5 +368,17 @@ describe("UsageTab delegate 归组展示", () => {
     const badge = screen.getByRole("button", { name: /含组队 25 积分/ });
     fireEvent.click(badge);
     expect(screen.getByText("coder")).toBeInTheDocument();
+  });
+});
+
+describe("UsageTab 总览 / 按模型切换", () => {
+  test("按模型视图列出每个型号的请求与积分，不再把长尾收成其他", async () => {
+    render(<UsageTab auth={auth} />);
+    expect(await screen.findByText("按模型积分构成")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("tab", { name: "按模型" }));
+    expect(await screen.findByRole("columnheader", { name: "模型" })).toBeInTheDocument();
+    expect(screen.getByText("glm-5.2")).toBeInTheDocument();
+    expect(screen.getByText("gpt-5.5")).toBeInTheDocument();
+    expect(screen.queryByText("按模型积分构成")).not.toBeInTheDocument();
   });
 });

@@ -11,7 +11,7 @@ Three access paths:
 
 **Core memory → search on demand, then edit files directly.** Run
 `oc-memory core-search "<specific topic>" [--limit N] [--offset N]` only when the current task cannot be completed accurately without a specific stored user fact, decision, or preference, or when the user explicitly requests continuity. A self-contained request or a merely similar topic is not enough. Unrelated searches return no match. The index is
-not injected. There is no `oc-memory memory` command. Platform Core memory lives
+injected when available, but it remains a historical hint. There is no `oc-memory memory` command. Platform Core memory lives
 as a `MEMORY.md` index plus one `memory/<slug>.md` file per entry. The
 `# Memory` section further down in this platform context gives you the exact
 absolute paths for *this* agent, the frontmatter format, the four `type`
@@ -19,6 +19,12 @@ categories (user / feedback / project / reference), and the two-step save
 (write the `memory/<slug>.md` file, then append one index line to
 `MEMORY.md`). Save a memory the same way you would create or edit any file;
 follow that section verbatim.
+
+When the user asks about current runtime state, deployment status, latest configuration,
+pricing, policy, or any other time-sensitive fact, memory may only locate what to verify.
+Check an authoritative live source in the current turn and separate historical memory from
+the timestamped current verification. If verification is unavailable, say explicitly that
+the claim is historical and unverified. Current evidence always overrides memory.
 
 **Long-form notes & session recall → run the `oc-memory` CLI in your shell**
 (one-shot commands; not MCP tools):

@@ -13,6 +13,7 @@ import {
 function createParser(opts?: {
   onToolUse?: (t: any) => void
   onPostFinalRuntimeEvent?: (event: any, block: any) => void
+  onNativeCompactionSummary?: (summaryText: string) => void
 }) {
   const events: SessionStreamEvent[] = []
   let finished = false
@@ -24,6 +25,7 @@ function createParser(opts?: {
     onEvent: (e) => events.push(e),
     onToolUse: opts?.onToolUse,
     onPostFinalRuntimeEvent: opts?.onPostFinalRuntimeEvent,
+    onNativeCompactionSummary: opts?.onNativeCompactionSummary,
     onFinish: (result) => {
       finished = true
       finishResult = result
@@ -1428,3 +1430,19 @@ describe('CcbMessageParser: lossless raw runtime tape', () => {
 })
 
 console.log('CcbMessageParser tests passed.')
+
+
+describe('CcbMessageParser: native compaction summary', () => {
+  it('captures the hidden synthetic compact summary without rendering a user block', () => {
+    let summary = ''
+    const { parser, events } = createParser({ onNativeCompactionSummary: (value) => { summary = value } })
+    parser.parse({
+      type: 'user',
+      message: { role: 'user', content: 'This session is being continued from a previous conversation that ran out of context.\n\nSummary: native ccb' },
+      isSynthetic: true,
+      isReplay: false,
+    } as any)
+    assert.match(summary, /native ccb/)
+    assert.equal(events.length, 0)
+  })
+})

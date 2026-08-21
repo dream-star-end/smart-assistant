@@ -43,6 +43,7 @@ export function isRetryingTurnStatus(
 /** A user turn's immutable model/team/reasoning selection, reused by retry. */
 export type ChatRoutingSnapshot = {
   model?: string;
+  modelSwitchId?: string;
   teamMode?: boolean;
   effortLevel?: string | null;
 };
@@ -172,6 +173,7 @@ export type ChildBlock = {
   bashTail?: BashTail;
   _runtimeBashTailEvidence?: TimelineBashTailEvidence;
   childBlocks?: ChildBlock[];
+  payloadRef?: unknown;
   tail?: string;
   totalBytes?: number;
   truncatedHead?: boolean;
@@ -213,6 +215,10 @@ export type ChatMessage = {
    * 过程树),本地富卡(m-*)同 runId 存在时 local-wins。判定统一走 isServerAuthoredRow()。
    */
   _source?: "server" | "local";
+  /** Applied from GET view=units; prepend-dedupe key is `id`. */
+  _liveUnit?: boolean;
+  _payloadRef?: { recordId: string; streamKey: string; frameSeq: number; sha256?: string };
+  preview?: string;
   /**
    * server 权威内容版本游标。内容 patch 会换号；仅用于 getSession `_seq > since` 增量同步，
    * 不参与展示顺序。
@@ -294,6 +300,12 @@ export type ChatMessage = {
   // ── lossless turn tape 水合标记（v2 tape;server-authored 行携带，前端只读）──
   /** 该行所属的 lossless turn tape id（tape 是一个原子同步单元）。 */
   _turnTapeId?: string;
+  /**
+   * Live text/thinking frameSeqs already appended onto this row.
+   * Survives session-level cursor reset so journal/WS replay cannot
+   * concatenate the same incremental chunks twice. Runtime-only.
+   */
+  _appliedFrameSeqs?: Record<number, true>;
   /** hydration 的 complete-anchor 分支盖章：该 tape 已完整原子落库（同步权威传播的作证前提）。 */
   _turnTapeComplete?: boolean;
   /** 该行在同一 lossless turn tape 内的持久 record ordinal。多个展开行共享 `_orderSeq`，
@@ -351,6 +363,12 @@ export type ChatMessage = {
   _historyPageKey?: string;
   /** Opaque cursor that produced this older in-memory page. */
   _historyPageLoadedFrom?: string;
+  /** Per-tape display degrade (visible_head/anchor fallback). */
+  _displayDegraded?: boolean;
+  _displayDegradeReason?: string;
+  /** Sanitizer placeholder for a structurally invalid history/socket row. */
+  _corruptPlaceholder?: boolean;
+  _corruptReason?: "missing-id" | "malformed";
 
   // ── 过程控制的本地展开态（仅会话内存，不写回 server）──
   /** 已开始显示真实 Agent 过程。 */
@@ -467,6 +485,10 @@ export type ChatMessage = {
   /** Durable permission response exists but Master has not yet reported an
    * applied/terminal outcome. The card stays non-resolved during this phase. */
   _controlPending?: boolean;
+  /** Detached Cursor ask_user card: 24h TTL, answerable after tab/device switch. */
+  _detachedAskUser?: boolean;
+  /** Absolute expiry ms carried on the permission_request frame when present. */
+  _askUserExpiresAt?: number;
 };
 
 /**
@@ -499,6 +521,13 @@ export type ChatSession = {
   // ── frameSeq 去重游标（§3）──
   _lastFrameSeqByKey?: Record<string, number>;
   _lastFrameSeq?: number;
+  /** Settled frames that arrived before their permission_request. Applied
+   *  when the matching card is created; keyed by requestId. */
+  _pendingPermissionSettlements?: Record<string, {
+    behavior: "allow" | "deny";
+    reason?: string | null;
+    answers?: Record<string, string>;
+  }>;
   /** server canonical 增量游标（历史加载 getSession 的 sinceSeq；随 StoredSession 落地）。*/
   _maxSeq?: number;
   /** Server history revision paired with `_maxSeq`; persisted across reload. */
@@ -547,6 +576,9 @@ export type ChatSession = {
   _turnStartedAt?: number | null;
   _lastFrameAt?: number;
   _turnStatus?: TurnStatusState | null;
+  /** Live one-line progress from outbound.turn_status status=working. Session
+   *  memory only — not a message row, not written to persist snapshots. */
+  _turnProgressHint?: string;
   /** User-row id of the turn currently streaming in this browser. */
   _activeClientMessageId?: string;
   /**
@@ -593,10 +625,17 @@ export type ChatSession = {
   _isFirstTurnAfterReady?: boolean;
   _liveStreamBroken?: boolean;
   /** Exact restored/disconnected turn is being reconciled with REST authority.
-   * Delay is capped; attempts are not. */
+   * Attempts and wall-clock are capped (see RESTORE_RECONCILE_MAX_*). */
   _reconciling?: boolean;
   /** Single low-cognition user-visible recovery/control state. */
   _recoveryStatus?: RecoveryStatusState;
+  /** Background live-journal hydrate hit a page/time cap or request timeout.
+   * Not persisted; UI offers an explicit retry. */
+  _liveJournalDegraded?: boolean;
+  /** First view=units pack applied; recovery chrome can drop without waiting for WS. */
+  _liveUnitsPackApplied?: boolean;
+  _liveUnitsHasMoreBefore?: boolean;
+  _liveUnitsBeforeCursor?: string | null;
 
   // ── 双帧 error 抑制（§11）──
   _suppressErrorBubbleAtSeq?: number;
@@ -612,6 +651,9 @@ export type ChatSession = {
   /** Set once the advisory 500-credit line is reached; UI keeps it live until turn cleanup. */
   _turnCostReminderCredits?: string;
   _tokenUsage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number };
+
+  /** Prepared native handoff generation, consumed by the first target-model turn. */
+  _preparedModelSwitch?: { id: string; targetModel: string };
 
   // ── 节流渲染 rAF 标记（render 层用）──
   _streamRafPending?: boolean;
@@ -696,6 +738,7 @@ export function clearTurnTiming(sess: ChatSession): void {
   sess._lastFrameAt = undefined;
   sess._isFirstTurnAfterReady = false;
   sess._turnStatus = null;
+  sess._turnProgressHint = undefined;
   sess._liveTurnUsage = undefined;
   sess._turnCostCredits = "0";
   sess._turnCostSeenRequestIds = new Set();

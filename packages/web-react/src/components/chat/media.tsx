@@ -470,7 +470,7 @@ type DownloadState =
  * fetch 拿到 410(过期)/403(签名失效) → 强制重签一次再试(服务端裁决优先于本地缓存钟)。
  * 其余异常 → error 态（重试 + 直接下载兜底,两者同样走点击时签名）。
  */
-function useSignedDownload(src: string | null, name: string) {
+export function useSignedDownload(src: string | null, name: string) {
   const { get } = useFreshSignedUrl(src);
   const [state, setState] = useState<DownloadState>({ phase: "idle" });
   const abortRef = useRef<AbortController | null>(null);

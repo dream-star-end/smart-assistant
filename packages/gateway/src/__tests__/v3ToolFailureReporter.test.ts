@@ -10,19 +10,22 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
 
-import type { ToolCalledEvent } from '@openclaude/protocol'
+import type { ToolCalledEvent, TurnCompletedEvent } from '@openclaude/protocol'
 
 import {
   TOOL_AUDIT_SCHEMA_HEADER,
   TOOL_CALL_ROLLUP_PATH,
   TOOL_FAILURE_AUDIT_PATH,
+  TURN_OBSERVATION_PATH,
   ToolFailureReportError,
   type ToolCallRollupPayload,
   buildToolFailureReportPayload,
+  buildTurnObservationPayload,
   isToolFailureAuditEnabled,
   makeToolFailureReporter,
   readToolFailureReportConfig,
   sendToolFailureReport,
+  sendTurnObservation,
   startToolFailureReporter,
 } from '../v3ToolFailureReporter.js'
 
@@ -119,13 +122,33 @@ describe('v3ToolFailureReporter', () => {
     const rawOutput = `failed with oc-v3.7.${'a'.repeat(64)}`
     assert.equal(payload.eventId, 'evt-1')
     assert.equal(payload.toolName, 'Bash')
-    assert.equal(payload.schemaVersion, 3)
+    assert.equal(payload.schemaVersion, 4)
     assert.equal(payload.inputHash, createHash('sha256').update(rawInput).digest('hex'))
     assert.equal(payload.outputHash, createHash('sha256').update(rawOutput).digest('hex'))
     assert.equal(payload.errorClass, 'other')
     assert.equal(payload.failureKind, 'unknown')
     assert.equal('inputPreview' in payload, false)
     assert.equal('outputPreview' in payload, false)
+  })
+
+  test('builds privacy-safe engine-neutral turn observations', () => {
+    const payload = buildTurnObservationPayload({
+      id: 'turn-1',
+      type: 'turn.completed',
+      schemaVersion: 1,
+      timestamp: 1_780_000_000_000,
+      agentId: 'main',
+      sessionKey: 'agent:main:webchat:dm:s1',
+      turnIndex: 1,
+      traceId: 'a'.repeat(32),
+      usage: { inputTokens: 1, outputTokens: 2, model: 'gpt-5.6-sol' },
+      toolCalls: 3,
+      durationMs: 456,
+    } as TurnCompletedEvent)
+    assert.equal(payload.traceId, 'a'.repeat(32))
+    assert.equal(payload.durationMs, 456)
+    assert.equal(payload.toolCalls, 3)
+    assert.equal('usage' in payload, false)
   })
 
   test('structured exit metadata takes priority and is the only persisted process detail', () => {
@@ -189,7 +212,7 @@ describe('v3ToolFailureReporter', () => {
     )
   })
 
-  test('schema-v3 falls back only when a 400 lacks the new-master schema header', async () => {
+  test('schema-v4 falls back when a rolling master advertises an older schema', async () => {
     const payload = buildToolFailureReportPayload(
       toolEvent({
         exitCode: 2,
@@ -210,10 +233,10 @@ describe('v3ToolFailureReporter', () => {
       },
     )
     assert.equal(bodies.length, 2)
-    assert.equal(bodies[0].schemaVersion, 3)
-    assert.equal(bodies[1].schemaVersion, 2)
-    assert.equal(bodies[1].errorClass, 'other')
-    assert.equal('failureKind' in bodies[1], false)
+    assert.equal(bodies[0].schemaVersion, 4)
+    assert.equal(bodies[1].schemaVersion, 3)
+    assert.equal(bodies[1].errorClass, 'process_exit')
+    assert.equal('failureKind' in bodies[1], true)
 
     let calls = 0
     await assert.rejects(
@@ -233,7 +256,61 @@ describe('v3ToolFailureReporter', () => {
         ),
       (err) => err instanceof ToolFailureReportError && err.retryable === false,
     )
-    assert.equal(calls, 1)
+    assert.equal(calls, 2)
+  })
+
+  test('turn-observation 404 is retryable and its queue is invisible to old reporters', async () => {
+    const completed = {
+      id: 'turn-rolling-1',
+      type: 'turn.completed',
+      schemaVersion: 1,
+      timestamp: 1_780_000_000_000,
+      agentId: 'main',
+      sessionKey: 'agent:main:webchat:dm:s1',
+      turnIndex: 1,
+      traceId: 'a'.repeat(32),
+      usage: { inputTokens: 1, outputTokens: 2, model: 'gpt-5.6-sol' },
+      toolCalls: 1,
+      durationMs: 100,
+    } as TurnCompletedEvent
+    const payload = buildTurnObservationPayload(completed)
+    await assert.rejects(
+      () => sendTurnObservation(
+        payload,
+        { masterBaseUrl: 'http://master', containerToken: 'tok' },
+        { fetchImpl: async () => new Response('{}', { status: 404 }) },
+      ),
+      (err) => err instanceof ToolFailureReportError && err.retryable === true,
+    )
+
+    tmp = await mkdtemp(join(tmpdir(), 'oc-turn-observation-'))
+    const listeners = new Map<string, (ev: unknown) => void>()
+    const reporter = makeToolFailureReporter({
+      config: { masterBaseUrl: 'http://master', containerToken: 'tok' },
+      queueDir: tmp,
+      eventBus: {
+        on(event: string, cb: (ev: unknown) => void) { listeners.set(event, cb) },
+        off(event: string) { listeners.delete(event) },
+      } as any,
+      drainIntervalMs: 60_000,
+      fetchImpl: async (input) => new Response('{}', {
+        status: String(input).endsWith(TURN_OBSERVATION_PATH) ? 404 : 200,
+      }),
+    })
+    reporter.start()
+    listeners.get('turn.completed')!(completed)
+    reporter.stop()
+    for (let i = 0; i < 50 && await reporter.pendingCount() === 0; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    assert.equal((await readdir(tmp)).filter((file) => file.endsWith('.json')).length, 0)
+    assert.equal(
+      (await readdir(join(tmp, 'turn-observation'))).filter((file) => file.endsWith('.json')).length,
+      1,
+    )
+    const drained = await reporter.drainOnce()
+    assert.equal(drained.retried, 1)
+    assert.equal(await reporter.pendingCount(), 1)
   })
 
   test('reporter subscribes to failed tool events and drains durable queue', async () => {

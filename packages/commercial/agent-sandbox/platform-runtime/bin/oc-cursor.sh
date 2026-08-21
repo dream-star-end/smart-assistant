@@ -4,6 +4,16 @@
 # This is deliberately a one-shot print-mode tool rather than a V5 model
 # engine. The host credential is mounted only into the explicitly authorized
 # user's container and never enters Docker Env, the image, or the repository.
+#
+# Multi-key pool: the host may provision interchangeable Cursor API keys as
+# additional `api-key.<N>` files (N >= 2, canonical decimal, no leading zeros)
+# inside the same root-only auth directory. `api-key` stays mandatory — the
+# supervisor's mount validation gates on it, so an absent primary means the
+# credential mount itself never happened. Non-canonical extra names are
+# ignored. The primary `api-key` is the preferred key: every turn uses it
+# while it works, extras are failover only (see the slot-selection comment
+# below). The slot used for a turn is announced on stderr as an index only;
+# key values are never printed.
 set -eu
 
 SELF_ROOT=$(/usr/bin/dirname "$(/usr/bin/readlink -f "$0")")
@@ -27,9 +37,9 @@ EOF
 # means a tool missing from the runtime image turns into a silent 127 instead
 # of a visible failure. Assert the whole set up front rather than discovering
 # it inside an `|| true` cleanup path.
-for required_tool in /usr/bin/sudo /usr/bin/test /bin/cat /usr/bin/mktemp \
-  /bin/rm /bin/sleep /usr/bin/setsid /usr/bin/stat /usr/bin/id /bin/mkdir \
-  /bin/cp /bin/chmod /bin/mv; do
+for required_tool in /usr/bin/sudo /usr/bin/test /bin/cat /bin/ls \
+  /usr/bin/mktemp /bin/rm /bin/sleep /usr/bin/setsid /usr/bin/stat \
+  /usr/bin/id /bin/mkdir /bin/cp /bin/chmod /bin/mv /bin/date /bin/ln; do
   [ -x "$required_tool" ] || die "runtime image is missing $required_tool"
 done
 
@@ -38,6 +48,37 @@ auth_file=/run/oc/cursor-auth/api-key
 [ -x "$cursor_bin" ] || die "pinned Cursor Agent CLI is unavailable"
 /usr/bin/sudo -n /usr/bin/test -f "$auth_file" 2>/dev/null \
   || die "Cursor CLI is not enabled for this account"
+
+# Enumerate the credential pool. Only `api-key` and canonical `api-key.<N>`
+# (N >= 2) names are eligible; everything else in the root-only directory is
+# ignored. Slot 1 is always the primary file; extras follow `ls -1` order.
+# `set -f` keeps pathname expansion off the unquoted iteration below — the
+# auth directory is root-authored, but a stray glob-shaped entry must not
+# resolve against workspace filenames.
+auth_dir=${auth_file%/*}
+set -f
+key_names=""
+key_count=0
+auth_entries=$(/usr/bin/sudo -n /bin/ls -1 -- "$auth_dir" 2>/dev/null) \
+  || auth_entries=""
+for auth_entry in $auth_entries; do
+  case "$auth_entry" in
+    api-key)
+      key_names="$key_names $auth_entry"
+      key_count=$((key_count + 1))
+      ;;
+    api-key.*)
+      key_suffix=${auth_entry#api-key.}
+      case "$key_suffix" in
+        ''|*[!0-9]*|0*|1) continue ;;
+      esac
+      key_names="$key_names $auth_entry"
+      key_count=$((key_count + 1))
+      ;;
+  esac
+done
+set +f
+[ "$key_count" -gt 0 ] || die "Cursor CLI is not enabled for this account"
 
 model=""
 mode=""
@@ -95,8 +136,17 @@ done
 [ "$#" -gt 0 ] || die "a prompt is required"
 
 case "$model" in
-  ""|cursor-grok-4.6-high|composer-2.5-fast|claude-opus-5-thinking-high|\
-  claude-fable-5-thinking-high|cursor-grok-4.5-high) ;;
+  ""|cursor-grok-4.6-low|cursor-grok-4.6-low-fast|cursor-grok-4.6-medium|cursor-grok-4.6-medium-fast|\
+  cursor-grok-4.6-high|cursor-grok-4.6-high-fast|cursor-grok-4.6-xhigh|cursor-grok-4.6-xhigh-fast|\
+  composer-2.5|composer-2.5-fast|\
+  claude-opus-5-thinking-low|claude-opus-5-thinking-low-fast|\
+  claude-opus-5-thinking-medium|claude-opus-5-thinking-medium-fast|\
+  claude-opus-5-thinking-high|claude-opus-5-thinking-high-fast|\
+  claude-opus-5-thinking-xhigh|claude-opus-5-thinking-xhigh-fast|\
+  claude-opus-5-thinking-max|claude-opus-5-thinking-max-fast|\
+  claude-fable-5-thinking-low|claude-fable-5-thinking-medium|claude-fable-5-thinking-high|\
+  claude-fable-5-thinking-xhigh|claude-fable-5-thinking-max|\
+  cursor-grok-4.5-high) ;;
   *) die "model is not allowlisted" ;;
 esac
 
@@ -106,13 +156,164 @@ workspace=$(pwd -P)
 # The host source is root:root 0400/0600. The container agent has sudo by
 # product design, but only the explicitly authorized user's container gets the
 # bind mount. Never print the value or put it in argv.
-api_key=$(/usr/bin/sudo -n /bin/cat -- "$auth_file" 2>/dev/null) \
-  || die "Cursor credential mount is unreadable"
-[ -n "$api_key" ] || die "Cursor credential is malformed"
+#
+# Slot selection: the primary (`api-key`) is the preferred key. Extras are
+# failover only: a turn that fails for any reason on a slot — non-zero CLI
+# exit, unreadable or malformed slot file — hands the NEXT turn to the
+# following slot (with wraparound) and starts a cooldown. Successful turns
+# never touch the state, so a healthy failover slot keeps serving until the
+# cooldown elapses; the next turn after that probes the primary again. This
+# prefers the primary without oscillating on every turn when it is down. The
+# offset+cooldown state lives in the container (per-user, per-container
+# lifetime; last writer wins under concurrent turns — acceptable, both keys
+# are interchangeable). A single-key account keeps the byte-identical legacy
+# path.
+#
+# Other Models (Opus and the rest) additionally skip slots marked
+# `cursor_only` in `.quota-class`. That sidecar has no secrets. Cursor Models
+# still see every active slot.
+chosen_key_file=$auth_file
+rotation_file=${OC_CURSOR_KEY_ROTATION_FILE:-/tmp/openclaude-cursor-key-rotation}
+rotation_cooldown=600
+rotation_idx=0
+rotation_exp=0
+
+cursor_family=other_models
+case "$model" in
+  ""|auto)
+    cursor_family=cursor_models
+    ;;
+  cursor-grok-4.6-low|cursor-grok-4.6-low-fast|cursor-grok-4.6-medium|cursor-grok-4.6-medium-fast|\
+  cursor-grok-4.6-high|cursor-grok-4.6-high-fast|cursor-grok-4.6-xhigh|cursor-grok-4.6-xhigh-fast|\
+  composer-2.5|composer-2.5-fast|cursor-grok-4.5-high|cursor-grok-4.5-high-fast)
+    cursor_family=cursor_models
+    ;;
+esac
+
+eligible_names=$key_names
+eligible_count=$key_count
+if [ "$cursor_family" = "other_models" ]; then
+  if /usr/bin/sudo -n /usr/bin/test -f "$auth_dir/.quota-class" 2>/dev/null \
+    || /usr/bin/test -f "$auth_dir/.quota-class" 2>/dev/null; then
+    sidecar_text=$(/usr/bin/sudo -n /bin/cat -- "$auth_dir/.quota-class" 2>/dev/null) \
+      || sidecar_text=$(/bin/cat -- "$auth_dir/.quota-class" 2>/dev/null) \
+      || sidecar_text=""
+    eligible_names=""
+    eligible_count=0
+    for key_name in $key_names; do
+      slot_class=unknown
+      while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+          ''|'#'*) continue ;;
+        esac
+        slot_name=${line%% *}
+        slot_cls=${line#"$slot_name"}
+        slot_cls=${slot_cls# }
+        slot_cls=${slot_cls%% *}
+        if [ "$slot_name" = "$key_name" ]; then
+          case "$slot_cls" in
+            unknown|other_ok|cursor_only) slot_class=$slot_cls ;;
+          esac
+        fi
+      done <<SIDECAR
+$sidecar_text
+SIDECAR
+      if [ "$slot_class" = "cursor_only" ]; then
+        continue
+      fi
+      eligible_names="$eligible_names $key_name"
+      eligible_count=$((eligible_count + 1))
+    done
+    if [ "$eligible_count" -eq 0 ]; then
+      die "Cursor other-models quota unavailable"
+    fi
+  fi
+fi
+
+# Filtered Other Models must not keep serving a cursor_only primary.
+if [ "$eligible_count" -ge 1 ]; then
+  for key_name in $eligible_names; do
+    chosen_key_file=$auth_dir/$key_name
+    break
+  done
+fi
+
+if [ "$eligible_count" -gt 1 ]; then
+  rotation_state=$(/bin/cat -- "$rotation_file" 2>/dev/null) || rotation_state=""
+  rotation_first=${rotation_state%% *}
+  rotation_rest=${rotation_state#* }
+  if [ "$rotation_rest" = "$rotation_state" ]; then rotation_rest=""; fi
+  case "$rotation_first" in
+    ''|*[!0-9]*) rotation_first=0 ;;
+  esac
+  case "$rotation_rest" in
+    ''|*[!0-9]*) rotation_rest=0 ;;
+  esac
+  rotation_idx=$rotation_first
+  rotation_exp=$rotation_rest
+  if [ "$rotation_idx" -ge "$eligible_count" ]; then rotation_idx=0; fi
+  # Cooldown elapsed (or legacy single-int state): return to the primary eligible.
+  if [ "$rotation_idx" -gt 0 ] && [ "$(/bin/date +%s)" -ge "$rotation_exp" ]; then
+    rotation_idx=0
+  fi
+  chosen_slot=$((rotation_idx + 1))
+  slot_position=0
+  for key_name in $eligible_names; do
+    slot_position=$((slot_position + 1))
+    if [ "$slot_position" -eq "$chosen_slot" ]; then
+      chosen_key_file=$auth_dir/$key_name
+      break
+    fi
+  done
+  full_slot=0
+  for key_name in $key_names; do
+    full_slot=$((full_slot + 1))
+    if [ "$auth_dir/$key_name" = "$chosen_key_file" ]; then
+      echo "oc-cursor: using Cursor credential slot $full_slot/$key_count" >&2
+      break
+    fi
+  done
+fi
+
+# Advance the eligible pool past the slot that just failed. No-op for
+# single-eligible accounts, so their failure path stays byte-identical.
+rotation_advance() {
+  [ "$eligible_count" -gt 1 ] || return 0
+  rotation_next=$((rotation_idx + 1))
+  if [ "$rotation_next" -ge "$eligible_count" ]; then rotation_next=0; fi
+  printf '%s %s\n' "$rotation_next" "$(( $(/bin/date +%s) + rotation_cooldown ))" \
+    > "$rotation_file" 2>/dev/null || :
+}
+emit_slot_result() {
+  _kind=$1
+  _full=0
+  for key_name in $key_names; do
+    _full=$((_full + 1))
+    if [ "$auth_dir/$key_name" = "$chosen_key_file" ]; then
+      echo "oc-cursor: slot_result $_full $_kind" >&2
+      return 0
+    fi
+  done
+}
+
+if ! api_key=$(/usr/bin/sudo -n /bin/cat -- "$chosen_key_file" 2>/dev/null); then
+  emit_slot_result fail
+  rotation_advance
+  die "Cursor credential mount is unreadable"
+fi
+if [ -z "$api_key" ]; then
+  emit_slot_result fail
+  rotation_advance
+  die "Cursor credential is malformed"
+fi
 carriage_return=$(printf '\r')
 case "$api_key" in
   *"
-"*|*"$carriage_return"*) die "Cursor credential is malformed" ;;
+"*|*"$carriage_return"*)
+    emit_slot_result fail
+    rotation_advance
+    die "Cursor credential is malformed"
+    ;;
 esac
 
 umask 077
@@ -186,6 +387,41 @@ if [ -n "$mcp_config" ]; then
 fi
 unset OPENCLAUDE_CURSOR_MCP_CONFIG
 
+# Durable Cursor chat store lives under OPENCLAUDE_HOME (outside the
+# per-turn ephemeral HOME) so --resume can see store.db after HOME is
+# destroyed. The path is derived here; callers cannot supply it.
+chats_linked=0
+oc_home=${OPENCLAUDE_HOME:-}
+case "$oc_home" in
+  /*)
+    if [ -d "$oc_home" ]; then
+      chats_dir="$oc_home/cursor-chats"
+      /bin/mkdir -p -m 0700 -- "$chats_dir" \
+        || die "cannot create durable Cursor chats directory"
+      [ -d "$chats_dir" ] && [ ! -L "$chats_dir" ] \
+        || die "durable Cursor chats directory is invalid"
+      /bin/mkdir -p -- "$cursor_home/.config/cursor" \
+        || die "cannot create ephemeral Cursor config directory"
+      /bin/ln -s -- "$chats_dir" "$cursor_home/.config/cursor/chats" \
+        || die "cannot link durable Cursor chats directory"
+      chats_linked=1
+    fi
+    ;;
+esac
+
+resume_id=${OPENCLAUDE_CURSOR_RESUME_ID:-}
+if [ -n "$resume_id" ]; then
+  case "$resume_id" in
+    [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F])
+      [ "${#resume_id}" -eq 36 ] || die "invalid Cursor resume id"
+      ;;
+    *)
+      die "invalid Cursor resume id"
+      ;;
+  esac
+  [ "$chats_linked" -eq 1 ] || die "Cursor resume requires durable chats directory"
+fi
+unset OPENCLAUDE_CURSOR_RESUME_ID
 # Optional platform efficiency hooks.json. Fail-open: a bad/missing hooks
 # file must never take down the Cursor session.
 hooks_json=${OPENCLAUDE_CURSOR_HOOKS_JSON:-}
@@ -225,8 +461,14 @@ shift
 for word in "$@"; do
   prompt="$prompt $word"
 done
-set -- -p --trust --workspace "$workspace" \
-  --output-format stream-json --stream-partial-output -- "$prompt"
+if [ -n "$resume_id" ]; then
+  set -- -p --trust --workspace "$workspace" \
+    --output-format stream-json --stream-partial-output \
+    --resume "$resume_id" -- "$prompt"
+else
+  set -- -p --trust --workspace "$workspace" \
+    --output-format stream-json --stream-partial-output -- "$prompt"
+fi
 [ "$mcp_approval" -eq 0 ] || set -- --approve-mcps "$@"
 [ -z "$model" ] || set -- --model "$model" "$@"
 [ -z "$mode" ] || set -- --mode "$mode" "$@"
@@ -245,6 +487,16 @@ child_pid=$!
 wait "$child_pid"
 status=$?
 set -e
+
+# A failed turn may be a quota/credential problem on the slot it used: hand
+# the next turn to the following slot under cooldown. Signal-terminated
+# turns (user Stop) exit through forward_signal and do not touch the state.
+if [ "$status" -ne 0 ]; then
+  emit_slot_result fail
+  rotation_advance
+else
+  emit_slot_result ok
+fi
 
 # Shorten the lifetime of the shell copy before EXIT removes the temp HOME.
 api_key=""

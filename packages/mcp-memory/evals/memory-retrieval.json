@@ -1,0 +1,373 @@
+{
+  "fixtureVersion": "2026-08-17.2",
+  "protocolVersion": "1.0.0",
+  "description": "Private Core-search regression set. Not a public leaderboard. 30 cases over the synthetic fixtures/ corpus.",
+  "cases": [
+    {
+      "id": "R01",
+      "query": "V5 商业版 验证流程",
+      "category": "interference",
+      "lang": "zh",
+      "mapsTo": "V5 商业版 验证流程",
+      "expect": {
+        "kind": "hit",
+        "topFiles": ["feedback-commercial-verify.md"],
+        "maxHits": 3
+      },
+      "note": "真实失效：Found 13。自然强相关只有 feedback；V5+流程 的弱邻居最多再留两席。maxHits=3 按簇大小而不是按改后实跑条数。"
+    },
+    {
+      "id": "R02",
+      "query": "今天天气怎么样",
+      "category": "unrelated",
+      "lang": "zh",
+      "mapsTo": "今天天气怎么样",
+      "expect": { "kind": "no_match" },
+      "note": "真实失效：Found 1。语料只在 H3 runtime 种了「今天」，应靠覆盖率门槛打成 No match。"
+    },
+    {
+      "id": "R03",
+      "query": "glm 5.3 模型繁忙",
+      "category": "interference",
+      "lang": "zh",
+      "mapsTo": "glm 5.3 模型繁忙",
+      "expect": {
+        "kind": "hit",
+        "topFiles": ["release-glm53-zai.md"],
+        "mustNotRank1": ["helixforge-tpu-ocr.md", "helixforge-tpu-ocr-tuning.md", "helixforge-tpu-ocr-batch.md"],
+        "maxHits": 4
+      },
+      "note": "真实失效：Found 8 且 top-1 是 OCR。个人版无语义层：OCR 被种了 5.3+模型+繁忙，词面强于只中两词的 GPU queue。期望收成 top-1 必须是 GLM；不要求 queue 进 top-3。"
+    },
+    {
+      "id": "R04",
+      "query": "GLM-5.3 Z.AI 上线 Release A Release B",
+      "category": "interference",
+      "lang": "zh",
+      "mapsTo": "GLM-5.3 Z.AI 上线 Release A Release B",
+      "expect": {
+        "kind": "hit",
+        "topFiles": ["release-glm53-zai.md"],
+        "mustNotRank1": ["novapulse-h3-runtime.md"],
+        "maxHits": 4
+      },
+      "note": "真实失效：Found 7 且 top-1 是 MiniMax H3 同类长文。通用词 上线/Release 不应把 H3 runtime 顶到第一。"
+    },
+    {
+      "id": "R05",
+      "query": "dashi-taskboard 任务面板",
+      "category": "unrelated",
+      "lang": "zh",
+      "mapsTo": "dashi-taskboard 任务面板",
+      "expect": { "kind": "no_match" },
+      "note": "真实失效：Found 4 且 top-1 是 H3。库里没有这块任务板；不得把本查询原样写进任何 fixture。"
+    },
+    {
+      "id": "R06",
+      "query": "记忆功能优化",
+      "category": "fuzzy",
+      "lang": "zh",
+      "mapsTo": "记忆功能优化",
+      "expect": {
+        "kind": "hit",
+        "topFiles": ["release-semantic-recall.md"],
+        "maxHits": 2
+      },
+      "note": "真实基线已正确 Found 1，回归必须保持。"
+    },
+    {
+      "id": "R07",
+      "query": "HelixForge TPU OCR",
+      "category": "fuzzy",
+      "lang": "en",
+      "mapsTo": "SCNet DCU OCR",
+      "expect": {
+        "kind": "hit",
+        "topFiles": ["helixforge-tpu-ocr.md"],
+        "maxHits": 8
+      },
+      "note": "真实基线 top-1 正确但 Found 7。允许近重复组进入，top-1 必须是 canonical OCR 条。"
+    },
+    {
+      "id": "R08",
+      "query": "Opus 管理 Grok 执行",
+      "category": "fuzzy",
+      "lang": "zh",
+      "mapsTo": "Opus 管理 Grok 执行",
+      "expect": {
+        "kind": "hit",
+        "topFiles": ["user.md"],
+        "maxHits": 3
+      },
+      "note": "真实基线 Found 2 且 top-1 正确。feedback 里有管理/执行，允许第二名，user.md 必须 rank-1。"
+    },
+    {
+      "id": "E01",
+      "query": "91f3a2c8e017",
+      "category": "exact",
+      "lang": "en",
+      "expect": {
+        "kind": "hit",
+        "topFiles": ["release-glm53-zai.md"],
+        "maxHits": 1
+      },
+      "note": "精确专名：GLM 备忘录的 commit sha。"
+    },
+    {
+      "id": "E02",
+      "query": "bada5510c0de",
+      "category": "exact",
+      "lang": "en",
+      "expect": {
+        "kind": "hit",
+        "topFiles": ["release-client-error.md"],
+        "maxHits": 1
+      },
+      "note": "精确专名：Client Error 备忘录 sha。"
+    },
+    {
+      "id": "E03",
+      "query": "Brook-V4 Pro bundle 1842",
+      "category": "exact",
+      "lang": "en",
+      "expect": {
+        "kind": "hit",
+        "topFiles": ["release-brook-v4-pro.md"],
+        "maxHits": 3
+      },
+      "note": "精确专名：产品名 + bundle 号。"
+    },
+    {
+      "id": "E04",
+      "query": "RiverOCR 2.11.4",
+      "category": "exact",
+      "lang": "en",
+      "expect": {
+        "kind": "hit",
+        "topFiles": ["helixforge-tpu-ocr.md"],
+        "maxHits": 3
+      },
+      "note": "精确专名：OCR 引擎版本。近重复组可以出现，canonical 必须第一。"
+    },
+    {
+      "id": "E05",
+      "query": "Cedar-Q router",
+      "category": "exact",
+      "lang": "en",
+      "expect": {
+        "kind": "hit",
+        "topFiles": ["release-cedar-q-router.md"],
+        "maxHits": 2
+      },
+      "note": "精确专名：产品名。"
+    },
+    {
+      "id": "E06",
+      "query": "NovaPulse H3 GPU queue",
+      "category": "exact",
+      "lang": "en",
+      "expect": {
+        "kind": "hit",
+        "topFiles": ["novapulse-h3-gpu-queue.md"],
+        "maxHits": 3
+      },
+      "note": "精确专名：H3 队列条应压过 runtime 长文。"
+    },
+    {
+      "id": "E07",
+      "query": "ask-user card bundle 2207",
+      "category": "exact",
+      "lang": "en",
+      "expect": {
+        "kind": "hit",
+        "topFiles": ["release-ask-user-card.md"],
+        "mustNotRank1": ["user.md"],
+        "maxHits": 3
+      },
+      "note": "精确专名：bundle 2207。user 这个词会碰到 user.md，不得占 rank-1。"
+    },
+    {
+      "id": "E08",
+      "query": "0b111109c0de",
+      "category": "exact",
+      "lang": "en",
+      "expect": {
+        "kind": "hit",
+        "topFiles": ["release-billing-meter.md"],
+        "maxHits": 1
+      },
+      "note": "精确专名：计费备忘录 sha。"
+    },
+    {
+      "id": "F01",
+      "query": "语义记忆召回 上线了吗",
+      "category": "fuzzy",
+      "lang": "zh",
+      "expect": {
+        "kind": "hit",
+        "topFiles": ["release-semantic-recall.md"],
+        "maxHits": 8
+      },
+      "note": "模糊主题：记忆+召回应把语义召回备忘录排前；上线是干扰词。"
+    },
+    {
+      "id": "F02",
+      "query": "HelixForge TPU OCR 调参笔记",
+      "category": "fuzzy",
+      "lang": "zh",
+      "expect": {
+        "kind": "hit",
+        "topFiles": ["helixforge-tpu-ocr-tuning.md"],
+        "maxHits": 5
+      },
+      "note": "模糊主题：近重复组里要能分出调参条。自然簇=OCR×3 + 共享 HelixForge/TPU/OCR 的 GPU 兄弟，共 5；maxHits 按簇大小取 5。"
+    },
+    {
+      "id": "F03",
+      "query": "how we verify commercial risk tiers",
+      "category": "fuzzy",
+      "lang": "en",
+      "expect": {
+        "kind": "hit",
+        "topFiles": ["feedback-commercial-verify.md"],
+        "maxHits": 3
+      },
+      "note": "模糊主题：英文描述商业版分级验证。"
+    },
+    {
+      "id": "F04",
+      "query": "who should execute implementation work",
+      "category": "fuzzy",
+      "lang": "en",
+      "expect": {
+        "kind": "hit",
+        "topFiles": ["user.md"],
+        "maxHits": 3
+      },
+      "note": "模糊主题：英文问谁来落地，应对上 Opus/Grok 分工。"
+    },
+    {
+      "id": "F05",
+      "query": "Opus manages Grok executes",
+      "category": "fuzzy",
+      "lang": "en",
+      "expect": {
+        "kind": "hit",
+        "topFiles": ["user.md"],
+        "maxHits": 2
+      },
+      "note": "模糊主题：英文专名版 R08。"
+    },
+    {
+      "id": "F06",
+      "query": "client error classification",
+      "category": "fuzzy",
+      "lang": "en",
+      "expect": {
+        "kind": "hit",
+        "topFiles": ["release-client-error.md"],
+        "maxHits": 3
+      },
+      "note": "模糊主题：不给 sha，只给英文主题。"
+    },
+    {
+      "id": "I01",
+      "query": "V5 已上线 功能 优化",
+      "category": "interference",
+      "lang": "zh",
+      "expect": {
+        "kind": "hit",
+        "topFiles": [
+          "release-cedar-q-router.md",
+          "release-client-error.md",
+          "release-brook-v4-pro.md",
+          "release-semantic-recall.md",
+          "release-glm53-zai.md",
+          "release-billing-meter.md",
+          "release-ask-user-card.md"
+        ],
+        "mustNotRank1": ["helixforge-tpu-ocr.md", "helixforge-tpu-ocr-tuning.md", "helixforge-tpu-ocr-batch.md"],
+        "maxHits": 8
+      },
+      "note": "跨主题干扰：七条同体裁备忘录都该能进，OCR 不得靠 V5 一个词占 rank-1，也不得召回整库。"
+    },
+    {
+      "id": "I02",
+      "query": "release notes bundle commit",
+      "category": "interference",
+      "lang": "en",
+      "expect": {
+        "kind": "hit",
+        "topFiles": [
+          "release-cedar-q-router.md",
+          "release-client-error.md",
+          "release-brook-v4-pro.md",
+          "release-semantic-recall.md",
+          "release-glm53-zai.md",
+          "release-billing-meter.md",
+          "release-ask-user-card.md"
+        ],
+        "mustNotRank1": ["novapulse-h3-runtime.md"],
+        "maxHits": 8
+      },
+      "note": "跨主题干扰：英文发布体裁词。H3 runtime 抄了同一套 boilerplate，不得占 rank-1。"
+    },
+    {
+      "id": "I03",
+      "query": "模型 队列 繁忙",
+      "category": "interference",
+      "lang": "zh",
+      "expect": {
+        "kind": "hit",
+        "topFiles": ["novapulse-h3-gpu-queue.md"],
+        "mustNotRank1": ["helixforge-tpu-ocr.md"],
+        "maxHits": 4
+      },
+      "note": "跨主题干扰：OCR 种了 模型+繁忙，真正写齐 队列 的是 H3 GPU queue。"
+    },
+    {
+      "id": "I04",
+      "query": "production pro bundle",
+      "category": "interference",
+      "lang": "en",
+      "expect": {
+        "kind": "hit",
+        "topFiles": ["release-brook-v4-pro.md"],
+        "maxHits": 6
+      },
+      "note": "跨主题干扰：pro 是 production 的前缀，bundle 是备忘录通用词。Brook-V4 Pro 应排前。"
+    },
+    {
+      "id": "U01",
+      "query": "what is the weather today",
+      "category": "unrelated",
+      "lang": "en",
+      "expect": { "kind": "no_match" },
+      "note": "完全无关。the/is 会出现在中英混排长文里，必须 No match。"
+    },
+    {
+      "id": "U02",
+      "query": "意大利面 carbonara 怎么做",
+      "category": "unrelated",
+      "lang": "zh",
+      "expect": { "kind": "no_match" },
+      "note": "完全无关。怎么 与天气查询同词，语料故意不种。"
+    },
+    {
+      "id": "U03",
+      "query": "600519 贵州茅台 股价",
+      "category": "unrelated",
+      "lang": "zh",
+      "expect": { "kind": "no_match" },
+      "note": "完全无关：股票行情。"
+    },
+    {
+      "id": "U04",
+      "query": "kubernetes ingress tls rotate",
+      "category": "unrelated",
+      "lang": "en",
+      "expect": { "kind": "no_match" },
+      "note": "完全无关：基础设施词，库中不存在。"
+    }
+  ]
+}

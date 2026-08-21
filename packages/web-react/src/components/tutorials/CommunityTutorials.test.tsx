@@ -65,20 +65,44 @@ describe('CommunityTutorials', () => {
     expect((window as unknown as { bad?: boolean }).bad).toBeUndefined()
   })
 
-  it('未登录点击发布教程走现有登录入口，不展示伪表单', async () => {
+  it('未登录点击手写教程走现有登录入口，不展示伪表单', async () => {
     const onRequireLogin = vi.fn()
     render(<CommunityTutorials onRequireLogin={onRequireLogin} />)
     await screen.findByText(summary.title)
 
-    fireEvent.click(screen.getByRole('button', { name: '发布教程' }))
+    fireEvent.click(screen.getByRole('button', { name: '手写教程' }))
     expect(onRequireLogin).toHaveBeenCalledTimes(1)
     expect(screen.queryByRole('heading', { name: '发布一份新教程' })).not.toBeInTheDocument()
+  })
+
+  it('未登录点击从当前会话生成走登录，不打开快照表单', async () => {
+    const onRequireLogin = vi.fn()
+    render(<CommunityTutorials onRequireLogin={onRequireLogin} />)
+    await screen.findByText(summary.title)
+    fireEvent.click(screen.getByRole('button', { name: '从当前会话生成' }))
+    expect(onRequireLogin).toHaveBeenCalledTimes(1)
+    expect(screen.queryByRole('heading', { name: '从当前会话生成教程' })).not.toBeInTheDocument()
+  })
+
+  it('发送中解释不可发布快照', async () => {
+    render(
+      <CommunityTutorials
+        auth={auth}
+        sending
+        activeSessionId="s1"
+        sessionMessages={[{ id: 'u1', role: 'user', text: 'hi', ts: 1 }]}
+      />,
+    )
+    await screen.findByText(summary.title)
+    fireEvent.click(screen.getByRole('button', { name: '从当前会话生成' }))
+    expect(await screen.findByText('当前会话仍在发送中，结束后才能发布快照。')).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: '从当前会话生成教程' })).not.toBeInTheDocument()
   })
 
   it('任意已登录用户都能提交教程并进入我的待审列表', async () => {
     render(<CommunityTutorials auth={auth} />)
     await screen.findByText(summary.title)
-    fireEvent.click(screen.getByRole('button', { name: '发布教程' }))
+    fireEvent.click(screen.getByRole('button', { name: '手写教程' }))
 
     fireEvent.change(screen.getByLabelText(/标题/), { target: { value: '一份完整的社区教程' } })
     fireEvent.change(screen.getByLabelText(/摘要/), {
@@ -101,6 +125,82 @@ describe('CommunityTutorials', () => {
       }),
     )
     await waitFor(() => expect(api.listMyCommunityTutorials).toHaveBeenCalledWith(auth, null))
-    expect(await screen.findByText('你还没有投稿。')).toBeInTheDocument()
+    expect(await screen.findByText('你还没有发布。')).toBeInTheDocument()
+  })
+
+  it('已上线教程也可以撤回', async () => {
+    vi.mocked(api.listMyCommunityTutorials).mockResolvedValue({
+      tutorials: [
+        {
+          id: 'approved-1',
+          title: '已上线教程',
+          summary: '可以撤回。',
+          category: 'general',
+          bodyMarkdown: '# 正文',
+          status: 'approved',
+          reviewNote: null,
+          createdAt: '2026-08-12T11:00:00.000Z',
+          reviewedAt: '2026-08-12T12:00:00.000Z',
+          publishedAt: '2026-08-12T12:00:00.000Z',
+        },
+      ],
+      nextCursor: null,
+    })
+    render(<CommunityTutorials auth={auth} />)
+    await screen.findByText(summary.title)
+    fireEvent.click(screen.getByRole('button', { name: '我的发布' }))
+    expect(await screen.findByText('已上线教程')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '撤回' }))
+    await waitFor(() => expect(api.withdrawCommunityTutorial).toHaveBeenCalledWith(auth, 'approved-1'))
+  })
+
+  it('深链 initialDetailId 直接打开详情', async () => {
+    render(<CommunityTutorials initialDetailId={summary.id} />)
+    await waitFor(() => expect(api.getCommunityTutorial).toHaveBeenCalledWith(summary.id))
+    expect(await screen.findByText(/先核对来源，再整理行动项/)).toBeInTheDocument()
+  })
+
+  it('草稿可撤回，已下架不可撤回，且 status meta 不会崩', async () => {
+    vi.mocked(api.listMyCommunityTutorials).mockResolvedValue({
+      tutorials: [
+        {
+          id: 'draft-1',
+          title: '草稿教程',
+          summary: '可撤回。',
+          category: 'general',
+          bodyMarkdown: '# 正文',
+          status: 'draft',
+          reviewNote: null,
+          createdAt: '2026-08-12T11:00:00.000Z',
+          reviewedAt: null,
+          publishedAt: null,
+        },
+        {
+          id: 'takedown-1',
+          title: '已下架教程',
+          summary: '不可撤回。',
+          category: 'general',
+          bodyMarkdown: '# 正文',
+          status: 'takedown',
+          reviewNote: '违规',
+          createdAt: '2026-08-12T11:00:00.000Z',
+          reviewedAt: '2026-08-12T12:00:00.000Z',
+          publishedAt: null,
+        },
+      ],
+      nextCursor: null,
+    })
+    render(<CommunityTutorials auth={auth} />)
+    await screen.findByText(summary.title)
+    fireEvent.click(screen.getByRole('button', { name: '我的发布' }))
+    expect(await screen.findByText('草稿教程')).toBeInTheDocument()
+    expect(screen.getByText('草稿')).toBeInTheDocument()
+    expect(screen.getByText('已下架')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '撤回' })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '撤回' }))
+    await waitFor(() => expect(api.withdrawCommunityTutorial).toHaveBeenCalledWith(auth, 'draft-1'))
+    const takedownCard = screen.getByText('已下架教程').closest('article')
+    expect(takedownCard).toBeTruthy()
+    expect(takedownCard?.querySelector('button')).toBeNull()
   })
 })

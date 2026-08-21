@@ -16,6 +16,7 @@ import { afterEach, describe, it } from 'node:test'
 import {
   _sanitizeThreadId,
   buildCodexEnv,
+  buildCodexLongContextArgs,
   buildCodexModelCatalogArgs,
   buildCodexMultiAgentDisableArgs,
   buildCodexProviderConfigArgs,
@@ -80,6 +81,19 @@ describe('codexReasoningEffortConfig', () => {
       '-c',
       'model_reasoning_effort="xhigh"',
     ])
+  })
+})
+
+describe('buildCodexLongContextArgs', () => {
+  it('injects 1M window only for GPT 1M twins', () => {
+    assert.deepEqual(buildCodexLongContextArgs('gpt-5.6-sol-1m'), [
+      '-c',
+      'model_context_window=1000000',
+      '-c',
+      'model_auto_compact_token_limit=900000',
+    ])
+    assert.deepEqual(buildCodexLongContextArgs('gpt-5.6-sol'), [])
+    assert.deepEqual(buildCodexLongContextArgs('gpt-5.6-terra'), [])
   })
 })
 

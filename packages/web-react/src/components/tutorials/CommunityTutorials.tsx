@@ -1,26 +1,39 @@
 import {
   ArrowLeft,
   BookOpen,
+  Camera,
   CheckCircle2,
   Clock3,
   FilePlus2,
   Search,
   Send,
+  Sparkles,
   Users,
   XCircle,
 } from 'lucide-react'
 import { type FormEvent, useCallback, useEffect, useState } from 'react'
+import type { ChatMessage } from '../../lib/chat/model'
 import { api, apiErrorMessage } from '../../lib/api'
+import {
+  canWithdrawCommunityTutorial,
+  snapshotPublishGate,
+  snapshotPublishGateMessage,
+  tutorialKindOf,
+} from '../../lib/tutorialStudio'
 import type {
   AuthSession,
   CommunityTutorialCategory,
   CommunityTutorialDetail,
   CommunityTutorialDraft,
   CommunityTutorialMine,
+  CommunityTutorialStatus,
   CommunityTutorialSummary,
+  TutorialLeakReport,
 } from '../../lib/types'
 import { Markdown } from '../Markdown'
 import { Alert, Badge, Button, Field, Input, Select, Textarea } from '../ui'
+import { PublishFromSessionDialog } from './PublishFromSessionDialog'
+import { SnapshotTutorialDetail } from './SnapshotTutorialDetail'
 
 const CATEGORY_OPTIONS = [
   { value: '', label: '全部分类' },
@@ -35,11 +48,16 @@ const CATEGORY_LABEL: Record<CommunityTutorialCategory, string> = {
   general: '通用',
 }
 
-const STATUS_META = {
-  pending: { label: '待审核', tone: 'warning' as const, icon: Clock3 },
-  approved: { label: '已上线', tone: 'success' as const, icon: CheckCircle2 },
-  rejected: { label: '需修改', tone: 'danger' as const, icon: XCircle },
-  withdrawn: { label: '已撤回', tone: 'neutral' as const, icon: XCircle },
+const STATUS_META: Record<
+  CommunityTutorialStatus,
+  { label: string; tone: 'warning' | 'success' | 'danger' | 'neutral'; icon: typeof Clock3 }
+> = {
+  draft: { label: '草稿', tone: 'neutral', icon: Clock3 },
+  pending: { label: '待审核', tone: 'warning', icon: Clock3 },
+  approved: { label: '已上线', tone: 'success', icon: CheckCircle2 },
+  rejected: { label: '需修改', tone: 'danger', icon: XCircle },
+  withdrawn: { label: '已撤回', tone: 'neutral', icon: XCircle },
+  takedown: { label: '已下架', tone: 'danger', icon: XCircle },
 }
 
 type CommunityView = 'catalog' | 'submit' | 'mine'
@@ -47,11 +65,33 @@ type CommunityView = 'catalog' | 'submit' | 'mine'
 export function CommunityTutorials({
   auth,
   onRequireLogin,
+  activeSessionId = null,
+  sessionMessages = [],
+  sending = false,
+  sessionTitle = '',
+  sessionProjectId = null,
+  initialDetailId = null,
+  onDetailIdChange,
 }: {
   auth?: AuthSession | null
   onRequireLogin?: () => void
+  activeSessionId?: string | null
+  sessionMessages?: ChatMessage[]
+  sending?: boolean
+  sessionTitle?: string
+  sessionProjectId?: string | null
+  initialDetailId?: string | null
+  onDetailIdChange?: (id: string | null) => void
 }) {
   const [view, setView] = useState<CommunityView>('catalog')
+  const [snapshotOpen, setSnapshotOpen] = useState(false)
+  const [gateNotice, setGateNotice] = useState<string | null>(null)
+  const [leakReport, setLeakReport] = useState<TutorialLeakReport | null>(null)
+  const snapshotGate = snapshotPublishGate({
+    authed: !!auth,
+    sending,
+    messageCount: sessionMessages.length,
+  })
   const [query, setQuery] = useState('')
   const [category, setCategory] = useState<CommunityTutorialCategory | ''>('')
   const [filters, setFilters] = useState<{
@@ -89,11 +129,13 @@ export function CommunityTutorials({
     void loadCatalog(null, false)
   }, [loadCatalog])
 
-  const openDetail = async (id: string) => {
+  const openDetail = async (id: string, syncRoute = true) => {
+    setView('catalog')
     setLoading(true)
     setError(null)
     try {
       setSelected(await api.getCommunityTutorial(id))
+      if (syncRoute) onDetailIdChange?.(id)
     } catch (cause) {
       setError(apiErrorMessage(cause, '加载教程正文失败'))
     } finally {
@@ -101,14 +143,44 @@ export function CommunityTutorials({
     }
   }
 
+  useEffect(() => {
+    if (!initialDetailId) return
+    void openDetail(initialDetailId, false)
+    // 深链 id 变化时打开对应详情；openDetail 读最新 onDetailIdChange。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialDetailId])
+
+  const closeDetail = () => {
+    setSelected(null)
+    onDetailIdChange?.(null)
+  }
+
   const switchView = (next: CommunityView) => {
     setSelected(null)
+    onDetailIdChange?.(null)
     setError(null)
+    setGateNotice(null)
     if (next !== 'catalog' && !auth) {
       onRequireLogin?.()
       return
     }
     setView(next)
+  }
+
+  const openSnapshot = () => {
+    setSelected(null)
+    onDetailIdChange?.(null)
+    setError(null)
+    if (!auth) {
+      onRequireLogin?.()
+      return
+    }
+    if (!snapshotGate.ok) {
+      setGateNotice(snapshotPublishGateMessage(snapshotGate.reason))
+      return
+    }
+    setGateNotice(null)
+    setSnapshotOpen(true)
   }
 
   return (
@@ -117,13 +189,13 @@ export function CommunityTutorials({
         <div className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
           <div>
             <p className="text-caption font-semibold uppercase tracking-widest text-accent">
-              社区共建
+              教程工作室
             </p>
             <h1 className="mt-2 text-heading font-bold text-fg">
-              把你的方法，变成所有人都能复用的教程
+              探索教程，或把一次真实会话变成可复用方法
             </h1>
             <p className="mt-2 max-w-2xl text-body leading-6 text-muted">
-              每位用户都可以投稿。管理员审核通过后，教程会立即进入公开目录。
+              可以手写 Markdown，也可以从当前已结束的会话生成交互快照。审核通过后进入公开目录。
             </p>
           </div>
           <div className="flex flex-wrap gap-2">
@@ -132,21 +204,32 @@ export function CommunityTutorials({
               size="sm"
               onClick={() => switchView('catalog')}
             >
-              <BookOpen size={14} /> 公开教程
+              <BookOpen size={14} /> 探索教程
+            </Button>
+            <Button
+              variant={snapshotOpen ? 'accent' : 'secondary'}
+              size="sm"
+              aria-disabled={!!auth && !snapshotGate.ok}
+              title={
+                auth && !snapshotGate.ok ? snapshotPublishGateMessage(snapshotGate.reason) : undefined
+              }
+              onClick={openSnapshot}
+            >
+              <Camera size={14} /> 从当前会话生成
             </Button>
             <Button
               variant={view === 'submit' ? 'accent' : 'secondary'}
               size="sm"
               onClick={() => switchView('submit')}
             >
-              <FilePlus2 size={14} /> 发布教程
+              <FilePlus2 size={14} /> 手写教程
             </Button>
             <Button
               variant={view === 'mine' ? 'accent' : 'secondary'}
               size="sm"
               onClick={() => switchView('mine')}
             >
-              <Users size={14} /> 我的投稿
+              <Users size={14} /> 我的发布
             </Button>
           </div>
         </div>
@@ -157,9 +240,42 @@ export function CommunityTutorials({
           {error}
         </Alert>
       )}
+      {gateNotice && (
+        <Alert tone="warning" className="mt-4">
+          {gateNotice}
+        </Alert>
+      )}
+      {leakReport && (
+        <Alert tone="info" className="mt-4" title="隐私扫描已完成">
+          {leakReport.leaks && leakReport.leaks.length > 0
+            ? `扫描命中：${leakReport.leaks.map((item) => item.rule).join('、')}`
+            : leakReport.strippedRoles && leakReport.strippedRoles.length > 0
+              ? `已剥离内部角色：${leakReport.strippedRoles.join('、')}`
+              : '提交成功，可在「我的发布」查看审核状态。'}
+        </Alert>
+      )}
+      {auth && activeSessionId && (
+        <PublishFromSessionDialog
+          open={snapshotOpen}
+          onOpenChange={setSnapshotOpen}
+          auth={auth}
+          sessionId={activeSessionId}
+          sessionTitle={sessionTitle}
+          projectId={sessionProjectId}
+          messages={sessionMessages}
+          onSubmitted={(report) => {
+            setLeakReport(report ?? null)
+            setView('mine')
+          }}
+        />
+      )}
 
       {view === 'catalog' && selected ? (
-        <CommunityTutorialDetailView item={selected} onBack={() => setSelected(null)} />
+        tutorialKindOf(selected) === 'snapshot' ? (
+          <SnapshotTutorialDetail item={selected} onBack={closeDetail} />
+        ) : (
+          <CommunityTutorialDetailView item={selected} onBack={closeDetail} />
+        )
       ) : view === 'catalog' ? (
         <div className="mt-5">
           <form
@@ -203,7 +319,7 @@ export function CommunityTutorials({
           {items.length === 0 && !loading ? (
             <div className="mt-5 rounded-2xl border border-dashed border-border p-10 text-center">
               <BookOpen size={28} className="mx-auto text-faint" />
-              <p className="mt-3 text-body font-medium text-fg">还没有匹配的社区教程</p>
+              <p className="mt-3 text-body font-medium text-fg">还没有匹配的教程</p>
               <p className="mt-1 text-meta text-faint">你可以成为第一个分享这类经验的人。</p>
             </div>
           ) : (
@@ -216,7 +332,14 @@ export function CommunityTutorials({
                   className="group rounded-2xl border border-border bg-surface p-5 text-left shadow-sm outline-none transition-[border-color,box-shadow,transform] hover:-translate-y-0.5 hover:border-accent/50 hover:shadow-float focus-visible:ring-2 focus-visible:ring-ring"
                 >
                   <div className="flex items-center justify-between gap-3">
-                    <Badge tone="accent">{CATEGORY_LABEL[item.category]}</Badge>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Badge tone="accent">{CATEGORY_LABEL[item.category]}</Badge>
+                      {tutorialKindOf(item) === 'snapshot' && (
+                        <Badge tone="neutral">
+                          <Sparkles size={11} /> 会话快照
+                        </Badge>
+                      )}
+                    </div>
                     <span className="text-caption text-faint">
                       {new Date(item.publishedAt).toLocaleDateString('zh-CN')}
                     </span>
@@ -265,7 +388,7 @@ function CommunityTutorialDetailView({
         onClick={onBack}
         className="inline-flex items-center gap-1.5 text-meta text-muted hover:text-fg"
       >
-        <ArrowLeft size={14} /> 返回社区教程
+        <ArrowLeft size={14} /> 返回探索教程
       </button>
       <div className="mt-5 flex flex-wrap items-center gap-2">
         <Badge tone="accent">{CATEGORY_LABEL[item.category]}</Badge>
@@ -428,7 +551,7 @@ function MyCommunityTutorials({ auth }: { auth: AuthSession }) {
       {error && <Alert tone="danger">{error}</Alert>}
       {items.length === 0 && !loading ? (
         <div className="rounded-2xl border border-dashed border-border p-10 text-center text-body text-faint">
-          你还没有投稿。
+          你还没有发布。
         </div>
       ) : (
         <div className="grid gap-4">
@@ -447,11 +570,16 @@ function MyCommunityTutorials({ auth }: { auth: AuthSession }) {
                         <Icon size={12} /> {meta.label}
                       </Badge>
                       <Badge tone="neutral">{CATEGORY_LABEL[item.category]}</Badge>
+                      {tutorialKindOf(item) === 'snapshot' && (
+                        <Badge tone="accent">
+                          <Sparkles size={11} /> 会话快照
+                        </Badge>
+                      )}
                     </div>
                     <h2 className="mt-3 text-title font-semibold text-fg">{item.title}</h2>
                     <p className="mt-1 text-body leading-6 text-muted">{item.summary}</p>
                   </div>
-                  {item.status === 'pending' && (
+                  {canWithdrawCommunityTutorial(item.status) && (
                     <Button variant="ghost" size="sm" onClick={() => void withdraw(item.id)}>
                       撤回
                     </Button>

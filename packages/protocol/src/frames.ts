@@ -230,6 +230,9 @@ export const InboundMessage = Type.Object({
   // 实际接收方(gateway server.ts)会按静态 allowlist 过滤,无效 model 静默
   // 丢弃 —— 防止用户 prefs 里残留 admin 已 disable 的 model 把 CCB 启不起来。
   model: Type.Optional(Type.String()),
+  /** Server-issued generation binding a prepared native model handoff to the
+   * first turn on the selected target model. */
+  modelSwitchId: Type.Optional(ControlId),
   // 团队模式(v5 轻量组队):main 队长收到此 flag 的 turn 会被鼓励按任务复杂度自主
   // delegate_task 给已安装 agent 组队,简单任务自己答。turn 级、可中途切,只对 main 生效。
   teamMode: Type.Optional(Type.Boolean()),
@@ -416,6 +419,7 @@ export const PromptQueueItem = Type.Object({
   requestedExecution: Type.Object({
     agentId: Type.String({ minLength: 1 }),
     model: Type.Optional(Type.String()),
+    modelSwitchId: Type.Optional(ControlId),
     effortLevel: Type.Optional(Type.Union([Type.String(), Type.Null()])),
     teamMode: Type.Optional(Type.Boolean()),
   }),
@@ -867,6 +871,14 @@ export const OutboundPermissionRequest = Type.Object({
   // V3 S12e — 由 dispatchInbound stamp,标记触发本次 permission 的 turn。
   // permission_settled 是 cross-turn lifecycle 帧,**不在** S12e 范围。
   traceId: Type.Optional(TraceIdString),
+  /** Wall-clock ms when this prompt stops being answerable. Omitted →
+   *  receivers keep their legacy default (Master: 30 minutes). Detached
+   *  Cursor ask_user sets this to now+24h so both in-memory pending and
+   *  turn_permission_requests agree. */
+  expiresAt: Type.Optional(Type.Integer({ minimum: 1 })),
+  /** True when this is a detached ask_user card (24h TTL, no engine wait).
+   *  Omitted on ordinary CCB/Codex permission prompts. */
+  detachedAskUser: Type.Optional(Type.Boolean()),
 })
 export type OutboundPermissionRequest = Static<typeof OutboundPermissionRequest>
 
@@ -1112,7 +1124,7 @@ export const OutboundExternalEngineBilling = Type.Object({
   type: Type.Literal('outbound.external_engine_billing'),
   sessionKey: Type.String(), channel: Type.String(), peer: Peer,
   requestId: Type.String({ pattern: '^[0-9a-f]{32}$' }),
-  engine: Type.Literal('cursor'),
+  engine: Type.Union([Type.Literal('cursor'), Type.Literal('zcode')]),
   status: Type.Union([Type.Literal('success'), Type.Literal('error'), Type.Literal('unavailable')]),
   terminalCode: Type.Optional(Type.Union([
     Type.Literal('USER_CANCELLED'), Type.Literal('AUTH_UNAVAILABLE'),
@@ -1123,6 +1135,13 @@ export const OutboundExternalEngineBilling = Type.Object({
     input_tokens: Type.Optional(Type.Number()), output_tokens: Type.Optional(Type.Number()),
     cache_read_input_tokens: Type.Optional(Type.Number()), cache_creation_input_tokens: Type.Optional(Type.Number()),
   })),
+  cursorSlotResults: Type.Optional(Type.Array(Type.Object({
+    slot: Type.Integer({ minimum: 1 }),
+    result: Type.Union([
+      Type.Literal('ok'), Type.Literal('fail_auth'),
+      Type.Literal('fail_quota'), Type.Literal('fail'),
+    ]),
+  }))),
   traceId: Type.Optional(TraceIdString),
 })
 export type OutboundExternalEngineBilling = Static<typeof OutboundExternalEngineBilling>
@@ -1178,6 +1197,16 @@ export const OutboundTurnStatus = Type.Union([
       delayMs: Type.Integer({ minimum: 0 }),
       retryAt: Type.Integer({ minimum: 0 }),
     }),
+  }),
+  // Gateway-authored live progress for a turn that is working but producing
+  // no stdout (Cursor Task subagent). Sideband only: never a content block,
+  // never tape / messages / archive. `detail` is optional so old clients
+  // that ignore unknown union members still receive a liveness tick via
+  // markFrameReceived. Stall must NOT emit this status.
+  Type.Object({
+    ..._turnStatusCommon,
+    status: Type.Literal('working'),
+    detail: Type.Optional(Type.String({ maxLength: 200 })),
   }),
 ])
 export type OutboundTurnStatus = Static<typeof OutboundTurnStatus>
@@ -1305,7 +1334,36 @@ export const ControlCompact = Type.Object({
   type: Type.Literal('control.session.compact'),
   sessionKey: Type.String(),
 })
-export const ControlFrame = Type.Union([ControlListSessions, ControlHealth, ControlCompact])
+export const ControlCancelModelSwitch = Type.Object({
+  type: Type.Literal('control.session.cancel_model_switch'),
+  sessionKey: Type.String(),
+  requestId: ControlId,
+})
+export const ControlPrepareModelSwitch = Type.Object({
+  type: Type.Literal('control.session.prepare_model_switch'),
+  sessionKey: Type.String(),
+  requestId: ControlId,
+  sourceModel: Type.String({ minLength: 1 }),
+  targetModel: Type.String({ minLength: 1 }),
+})
+export const OutboundModelSwitchPrepared = Type.Object({
+  type: Type.Literal('outbound.model_switch.prepared'),
+  requestId: ControlId,
+  sessionKey: Type.String(),
+  sourceModel: Type.String(),
+  targetModel: Type.String(),
+  status: Type.Union([Type.Literal('completed'), Type.Literal('failed')]),
+  errorCode: Type.Optional(Type.String()),
+  message: Type.Optional(Type.String()),
+})
+export type OutboundModelSwitchPrepared = Static<typeof OutboundModelSwitchPrepared>
+export const ControlFrame = Type.Union([
+  ControlListSessions,
+  ControlHealth,
+  ControlCompact,
+  ControlCancelModelSwitch,
+  ControlPrepareModelSwitch,
+])
 export type ControlFrame = Static<typeof ControlFrame>
 
 // ───────────────────────────────────────────────
@@ -1319,6 +1377,7 @@ export const AnyFrame = Type.Union([
   OutboundPermissionRequest,
   OutboundPermissionSettled,
   OutboundControlReceipt,
+  OutboundModelSwitchPrepared,
   OutboundResumeFailed,
   OutboundActiveTurnReplayStart,
   OutboundError,

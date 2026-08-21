@@ -313,6 +313,34 @@ describe("MemoryPanel · 核心记忆文件列表", () => {
   });
 });
 
+describe("MemoryPanel · 使用情况", () => {
+  test("展示精确事件、检索质量、逐会话明细和新鲜度风险", async () => {
+    mockIndex([]);
+    vi.spyOn(api, "getMemoryUsage").mockResolvedValue({
+      window: { days: 30, from: new Date(0).toISOString(), to: new Date().toISOString() },
+      totals: { events: 8, sessions: 3, hits: 3, noMatch: 1, errors: 0, denied: 0, freshnessGaps: 1 },
+      byOperation: [
+        { operation: "core_search", memoryType: "core", events: 4, sessions: 2, hits: 3, noMatch: 1, p50Ms: 120, p95Ms: 850 },
+        { operation: "core_update", memoryType: "core", events: 4, sessions: 2, hits: 0, noMatch: 0, p50Ms: 8, p95Ms: 15 },
+      ],
+      recentSessions: [
+        { sessionKey: "agent:main:webchat:dm:s1", title: "检查当前部署版本", lastAt: Date.now(), events: 5, searches: 3, writes: 2, freshnessGaps: 1 },
+      ],
+    });
+
+    renderPanel();
+    fireEvent.click(screen.getByRole("tab", { name: "使用情况" }));
+
+    expect(await screen.findByText("记忆在会话里如何被使用")).toBeInTheDocument();
+    expect(await screen.findByText("8")).toBeInTheDocument();
+    expect(screen.getByText("75%")).toBeInTheDocument();
+    expect(screen.getByText("核心检索")).toBeInTheDocument();
+    expect(screen.getByText("检查当前部署版本")).toBeInTheDocument();
+    expect(screen.getByText(/发现 1 次/)).toBeInTheDocument();
+    expect(api.getMemoryUsage).toHaveBeenCalledWith(auth, "main", 30);
+  });
+});
+
 describe("MemoryPanel · 单文件查看/编辑", () => {
   test("点开记忆卡 → 表单化字段（frontmatter 不外露）并带 version 保存", async () => {
     mockIndex([{ file: "note.md", name: "笔记", description: "d" }]);

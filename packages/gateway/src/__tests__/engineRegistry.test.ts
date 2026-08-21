@@ -27,7 +27,8 @@ import "../engine/ccbAdapter.js";
 import "../engine/codexAdapter.js";
 import "../engine/grokAdapter.js";
 import { SessionManager } from "../sessionManager.js";
-import { CURSOR_ENGINE_MODEL_IDS } from "@openclaude/protocol";
+import { CURSOR_ENGINE_MODEL_IDS, ZCODE_ENGINE_MODEL_IDS } from "@openclaude/protocol";
+import "../engine/zcodeAdapter.js";
 import type { OpenClaudeConfig, AgentDef } from "@openclaude/storage";
 
 function makeConfigStub(): OpenClaudeConfig {
@@ -76,6 +77,14 @@ describe("resolveEngine", () => {
     }
     assert.equal(resolveEngine("cursor-auto --force", { id: "main" }), "ccb");
     assert.equal(resolveEngine("gpt-5.3-codex", { id: "main" }), "ccb");
+  });
+
+  test("ZCode experimental allowlist → 'zcode';参数化伪模型不进入 ZCode", () => {
+    for (const model of ZCODE_ENGINE_MODEL_IDS) {
+      assert.equal(resolveEngine(model, { id: "main" }), "zcode");
+    }
+    assert.equal(resolveEngine("zcode-experimental --yolo", { id: "main" }), "ccb");
+    assert.equal(resolveEngine("zai/glm-5.1", { id: "main" }), "ccb");
   });
 
   test("codex-native provider 显式 pin → 'codex'(runnerKind 缺省/app-server)", () => {
@@ -139,6 +148,15 @@ describe("createEngine fail-closed", () => {
     assert.equal(adapter.capabilities.needsServerRequestId, true);
   });
 
+  test("'zcode' 已注册且使用 external 计费与原生 session 续传", () => {
+    assert.ok(registeredEngines().includes("zcode"));
+    const adapter = createEngine("zcode", minimalCreateOpts());
+    assert.equal(adapter.engineId, "zcode");
+    assert.equal(adapter.capabilities.billingMode, "external");
+    assert.equal(adapter.capabilities.resumeKind, "zcode-session");
+    assert.equal(adapter.capabilities.needsServerRequestId, true);
+  });
+
   test("未注册 engine → 抛错(fail-closed 语义,假 engine id 锁死)", () => {
     assert.throws(() => createEngine("no-such-engine", minimalCreateOpts()), /fail-closed/);
   });
@@ -183,6 +201,20 @@ describe("getOrCreate engine 路由(M1a)", () => {
     assert.equal(session.runner.engineId, "grok");
     assert.equal(session.providerTag, "grok");
     assert.equal(session.model, "grok-build");
+  });
+
+  test("普通 agent + inbound model zcode-experimental → 'zcode' adapter session", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    const session = await sm.getOrCreate({
+      sessionKey: "agent:main:webchat:dm:gate-peer-zcode",
+      agent: { id: "main", model: "glm-5.2" } as AgentDef,
+      channel: "webchat",
+      peerId: "gate-peer-zcode",
+      model: "zcode-experimental",
+    });
+    assert.equal(session.runner.engineId, "zcode");
+    assert.equal(session.providerTag, "zcode");
+    assert.equal(session.model, "zcode-experimental");
   });
 
   test("codex-native + runnerKind 'exec' → getOrCreate 仍 fail-closed 抛错", async () => {

@@ -14,10 +14,13 @@ import {
 } from "@openclaude/protocol";
 
 import {
+  fetchAskUserPermissionCard,
   SERVER_AUTHORED_PATH,
   attemptSend,
   buildLosslessTurnTapeRequests,
+  buildPermissionSidecarV1Body,
   iterateLosslessTurnTapeParts,
+  isPermissionSidecarPayload,
   getV3MasterSinkOrNull,
   makeV3MasterSink,
   readV3MasterSinkConfig,
@@ -41,7 +44,7 @@ const CFG = {
   bearer: "oc-v3.7." + "a".repeat(64),
 };
 
-type Capture = { url: string; body: string; headers: Record<string, string> };
+type Capture = { url: string; method: string; body: string; headers: Record<string, string> };
 
 function makeFetcher(opts: {
   status?: number;
@@ -55,6 +58,7 @@ function makeFetcher(opts: {
   const fn = async (url: string, init: any) => {
     captures.push({
       url,
+      method: String(init?.method ?? "GET"),
       body: typeof init?.body === "string" ? init.body : "",
       headers: init?.headers ?? {},
     });
@@ -83,8 +87,11 @@ function decodeCapturedTape(captures: Capture[]): {
   payload: Record<string, any>;
 } {
   const envelopes = captures.map((capture) => JSON.parse(capture.body) as Record<string, any>);
+  const visibles = envelopes.filter((envelope) => envelope.action === "visible");
   const parts = envelopes.filter((envelope) => envelope.action === "part");
   const finalizes = envelopes.filter((envelope) => envelope.action === "finalize");
+  assert.equal(visibles.length, 1);
+  assert.equal(envelopes[0]?.action, "visible", "visible commit must precede every multipart part");
   assert.equal(finalizes.length, 1);
   assert.equal(parts.length, finalizes[0]!.partCount);
   parts.sort((a, b) => a.partIndex - b.partIndex);
@@ -193,6 +200,7 @@ describe("lossless v2 turn tape", () => {
       [...iterateLosslessTurnTapeParts(first)],
       [...iterateLosslessTurnTapeParts(second)],
     );
+    assert.deepEqual(first.visible, second.visible);
     assert.deepEqual(first.finalize, second.finalize);
   });
 
@@ -210,6 +218,8 @@ describe("lossless v2 turn tape", () => {
       assert.equal(part.dispatchId, "3e0a2b52-9d31-4c8f-9b6e-000000000001");
       assert.equal(part.attemptNo, 2);
     }
+    assert.equal(withDispatch.visible.dispatchId, "3e0a2b52-9d31-4c8f-9b6e-000000000001");
+    assert.equal(withDispatch.visible.attemptNo, 2);
     assert.equal(withDispatch.finalize.dispatchId, "3e0a2b52-9d31-4c8f-9b6e-000000000001");
     assert.equal(withDispatch.finalize.attemptNo, 2);
     // 身份是信封元数据,canonical 本体语义不因信封补齐而改(payload 自身字段决定 canonical)。
@@ -218,6 +228,7 @@ describe("lossless v2 turn tape", () => {
     // legacy(无身份)payload:信封不得出现 undefined 字段污染既有形状。
     const legacy = buildLosslessTurnTapeRequests({ ...PAYLOAD, createdAt: 123, turnKey: "d".repeat(64) });
     assert.ok(!("dispatchId" in [...iterateLosslessTurnTapeParts(legacy)][0]!));
+    assert.ok(!("dispatchId" in legacy.visible));
     assert.ok(!("dispatchId" in legacy.finalize));
   });
 
@@ -228,6 +239,8 @@ describe("lossless v2 turn tape", () => {
       waiveReason: "platform_authority_expired",
       usage: { model: "kimi-k3-ark" },
     });
+    assert.equal(tape.visible.waiveReason, "platform_authority_expired");
+    assert.equal(tape.visible.model, "kimi-k3-ark");
     assert.equal(tape.finalize.waiveReason, "platform_authority_expired");
     assert.equal(tape.finalize.model, "kimi-k3-ark");
     assert.ok([...iterateLosslessTurnTapeParts(tape)].every(
@@ -238,6 +251,26 @@ describe("lossless v2 turn tape", () => {
     const canonical = JSON.parse(tape.canonical.toString("utf8"));
     assert.equal(canonical.waiveReason, "platform_authority_expired");
     assert.equal(canonical.usage.model, "kimi-k3-ark");
+  });
+
+  test("part envelopes never carry finalize.settlement; finalize keeps it", () => {
+    const tape = buildLosslessTurnTapeRequests({
+      ...PAYLOAD,
+      createdAt: 123,
+      turnKey: "e".repeat(64),
+      dispatchId: "3e0a2b52-9d31-4c8f-9b6e-000000000002",
+      attemptNo: 1,
+    });
+    assert.equal("settlement" in tape.visible, true);
+    assert.equal(typeof tape.visible.settlement, "object");
+    assert.equal("settlement" in tape.finalize, true);
+    assert.equal(typeof tape.finalize.settlement, "object");
+    const parts = [...iterateLosslessTurnTapeParts(tape)];
+    assert.ok(parts.length >= 1);
+    for (const part of parts) {
+      assert.equal("settlement" in part, false);
+      assert.equal(part.action, "part");
+    }
   });
 });
 
@@ -257,7 +290,7 @@ describe("readV3MasterSinkConfig", () => {
 });
 
 describe("attemptSend — multipart upload", () => {
-  test("uploads every part then finalize with no semantic cap", async () => {
+  test("commits visible before every part, then uploads every part and finalize", async () => {
     const { fetcher, captures } = makeFetcher({ status: 200, body: '{"ok":true}' });
     const payload: V3MasterSinkPayload = {
       ...PAYLOAD,
@@ -294,6 +327,11 @@ describe("attemptSend — multipart upload", () => {
     assert.equal(decoded.envelopes.at(-1)!.action, "finalize");
     assert.equal(decoded.payload.text, payload.text);
     assert.equal(decoded.payload.thinkingText, payload.thinkingText);
+    const visible = decoded.envelopes[0]!;
+    assert.equal(visible.action, "visible");
+    assert.equal(visible.settlement.truncated, true);
+    assert.ok(Buffer.byteLength(visible.settlement.text, "utf8") <= 128 * 1024);
+    assert.ok(Buffer.byteLength(captures[0]!.body, "utf8") < 192 * 1024);
     assert.deepEqual(decoded.payload.tools, payload.tools);
     assert.deepEqual(decoded.payload.agentGroups, payload.agentGroups);
   });
@@ -576,5 +614,158 @@ describe("V3MasterSink singleton", () => {
     assert.equal(getV3MasterSinkOrNull(), sink);
     setV3MasterSinkSingleton(null);
     assert.equal(getV3MasterSinkOrNull(), null);
+  });
+});
+
+describe("permission sidecar (detached ask_user)", () => {
+  const CARD = {
+    requestId: "ask-user:" + "ab".repeat(16),
+    questions: [{ question: "Which editor?", options: [{ label: "Vim" }, { label: "Emacs" }] }],
+    sessionKey: "agent:main:webchat:dm:sess12345",
+    expiresAt: 1_720_086_400_000,
+    ts: 1_720_000_000_000,
+    channel: "webchat",
+    peer: { id: "sess12345", kind: "dm" as const },
+  };
+  const SIDECAR: V3MasterSinkPayload = {
+    sessionId: "sess12345",
+    agentId: "main",
+    turnIndex: 0,
+    status: "completed",
+    text: "",
+    createdAt: CARD.ts,
+    permissionCards: [CARD],
+  };
+
+  test("classifies permission-only payloads and not ordinary turns", () => {
+    assert.equal(isPermissionSidecarPayload(SIDECAR), true);
+    assert.equal(isPermissionSidecarPayload(PAYLOAD), false);
+    assert.equal(isPermissionSidecarPayload({ ...SIDECAR, text: "also an answer" }), false);
+  });
+
+  test("POSTs a v1 JSON body (not a lossless tape) so master can append role:permission", async () => {
+    const { fetcher, captures } = makeFetcher({ status: 200, body: '{"ok":true}' });
+    await attemptSend(SIDECAR, { config: CFG, fetcher });
+    assert.equal(captures.length, 1);
+    assert.equal(captures[0]!.url, `${CFG.baseUrl}${SERVER_AUTHORED_PATH}`);
+    const body = JSON.parse(captures[0]!.body) as Record<string, unknown>;
+    assert.equal(body.action, undefined);
+    assert.equal(body.text, "");
+    assert.equal(body.agentId, "main");
+    assert.ok(Array.isArray(body.permissionCards));
+    assert.equal((body.permissionCards as typeof CARD[])[0]!.requestId, CARD.requestId);
+    assert.deepEqual(body, buildPermissionSidecarV1Body(SIDECAR));
+  });
+
+  test("404 remains session_missing so persistOrQueue retries", async () => {
+    const { fetcher } = makeFetcher({ status: 404, body: "session missing" });
+    await assert.rejects(
+      () => attemptSend(SIDECAR, { config: CFG, fetcher }),
+      (error: unknown) => error instanceof V3SinkError
+        && error.errorClass === "session_missing"
+        && error.httpStatus === 404,
+    );
+  });
+
+  test("persistOrQueue stages a permission sidecar and keeps it on first-attempt failure", async () => {
+    const queue = fakeQueue();
+    const sink = makeV3MasterSink({
+      config: CFG,
+      retryQueue: queue,
+      attemptSendImpl: async () => { throw new V3SinkError("master 502", "transient", 502); },
+    });
+    const outcome = await sink.persistOrQueue(SIDECAR);
+    assert.equal(outcome.ok, false);
+    if (outcome.ok || !outcome.queued) assert.fail("expected queued outcome");
+    assert.equal(queue.enqueued.length, 1);
+    assert.equal(queue.enqueued[0].payload.permissionCards[0].requestId, CARD.requestId);
+  });
+
+  test("classifies a resolved-state sidecar (patches / user answers, no cards)", () => {
+    const resolved: V3MasterSinkPayload = {
+      sessionId: "sess12345",
+      agentId: "main",
+      turnIndex: 0,
+      status: "completed",
+      text: "",
+      permissionPatches: [{
+        requestId: CARD.requestId,
+        behavior: "allow",
+        settledReason: "remote",
+      }],
+      userAnswerMessages: [{ id: "ask-ans-sess12345abcdefghijkl", text: "用户已回答提问：" }],
+    };
+    assert.equal(isPermissionSidecarPayload(resolved), true);
+    assert.equal(isPermissionSidecarPayload({ ...resolved, text: "turn text" }), false);
+  });
+
+  test("POSTs a v1 JSON body for a resolved-state sidecar", async () => {
+    const resolved: V3MasterSinkPayload = {
+      sessionId: "sess12345",
+      agentId: "main",
+      turnIndex: 0,
+      status: "completed",
+      text: "",
+      permissionPatches: [{
+        requestId: CARD.requestId,
+        behavior: "deny",
+        settledReason: "timeout",
+      }],
+    };
+    const { fetcher, captures } = makeFetcher({ status: 200, body: '{"ok":true}' });
+    await attemptSend(resolved, { config: CFG, fetcher });
+    assert.equal(captures[0]!.method, "POST");
+    const body = JSON.parse(captures[0]!.body) as Record<string, unknown>;
+    assert.equal(body.action, undefined);
+    assert.ok(Array.isArray(body.permissionPatches));
+    assert.equal(body.permissionCards, undefined);
+  });
+});
+
+describe("fetchAskUserPermissionCard (GET hydrate)", () => {
+  test("GETs the existing server-authored path with sessionId+requestId", async () => {
+    const requestId = "ask-user:" + "ab".repeat(16);
+    const message = {
+      id: requestId,
+      role: "permission",
+      _detachedAskUser: true,
+      _askUserExpiresAt: Date.now() + 24 * 60 * 60_000,
+      _askUserSessionKey: "agent:main:webchat:dm:sess12345",
+    };
+    const { fetcher, captures } = makeFetcher({
+      status: 200,
+      body: JSON.stringify({ ok: true, message }),
+    });
+    const got = await fetchAskUserPermissionCard({
+      sessionId: "sess12345",
+      requestId,
+      config: CFG,
+      fetcher,
+    });
+    assert.equal(captures.length, 1);
+    assert.equal(captures[0]!.method, "GET");
+    assert.equal(captures[0]!.body, "");
+    assert.match(captures[0]!.url, /sessionId=sess12345/);
+    assert.match(captures[0]!.url, /requestId=ask-user/);
+    assert.equal(got?.id, requestId);
+    assert.equal(got?._detachedAskUser, true);
+  });
+
+  test("404/410 hydrate misses return null rather than throwing", async () => {
+    const requestId = "ask-user:" + "ab".repeat(16);
+    const miss = await fetchAskUserPermissionCard({
+      sessionId: "sess12345",
+      requestId,
+      config: CFG,
+      fetcher: makeFetcher({ status: 404, body: '{"error":{"code":"PERMISSION_NOT_FOUND"}}' }).fetcher,
+    });
+    assert.equal(miss, null);
+    const gone = await fetchAskUserPermissionCard({
+      sessionId: "sess12345",
+      requestId,
+      config: CFG,
+      fetcher: makeFetcher({ status: 410, body: '{"error":{"code":"SESSION_DELETED"}}' }).fetcher,
+    });
+    assert.equal(gone, null);
   });
 });

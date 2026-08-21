@@ -105,7 +105,7 @@ describe('internal Grok relay', () => {
         headers: {
           authorization: `Bearer ${CONTAINER_TOKEN}`,
           'content-type': 'application/json',
-          'x-grok-client-version': '1.0.3',
+          'x-grok-client-version': '1.0.5',
           'x-grok-client-mode': 'attacker-mode',
           'x-authenticateresponse': 'attacker-response',
           'x-grok-model-override': 'attacker-model',
@@ -124,7 +124,7 @@ describe('internal Grok relay', () => {
       assert.equal(captured.url, `${GROK_OFFICIAL_UPSTREAM_BASE_URL}/chat/completions?stream=true`)
       assert.equal(captured.headers?.get('authorization'), 'Bearer real-xai-oauth-token')
       assert.equal(captured.headers?.get('content-type'), 'application/json')
-      assert.equal(captured.headers?.get('x-grok-client-version'), '1.0.3')
+      assert.equal(captured.headers?.get('x-grok-client-version'), '1.0.5')
       assert.equal(captured.headers?.get('x-grok-model-override'), 'grok-build')
       assert.equal(captured.headers?.get('x-xai-token-auth'), 'xai-grok-cli')
       assert.equal(captured.headers?.get('x-authenticateresponse'), 'authenticate-response')

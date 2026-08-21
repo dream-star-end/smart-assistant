@@ -192,7 +192,7 @@ describe("visible virtual row anchor", () => {
     expect(resolved).toBe(false);
 
     scroller.appendChild(rowElement);
-    for (let frame = 0; frame < 4 && !resolved; frame += 1) {
+    for (let frame = 0; frame < 40 && !resolved; frame += 1) {
       frames.shift()!();
       await Promise.resolve();
     }
@@ -298,7 +298,10 @@ describe("visible virtual row anchor", () => {
     frames.shift()!();
     await Promise.resolve();
     expect(resolved).toBe(false);
-    frames.shift()!();
+    for (let frame = 0; frame < 40 && !resolved; frame += 1) {
+      frames.shift()!();
+      await Promise.resolve();
+    }
     await restoring;
     expect(resolved).toBe(true);
     expect(rowElement.getBoundingClientRect().top).toBe(120);

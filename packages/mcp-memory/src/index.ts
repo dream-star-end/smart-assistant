@@ -10,7 +10,7 @@
  *   • `skill_view`     — load a skill's full instructions (tier-2/3)
  *   • `skill_save`     — distill a successful task into a reusable skill
  *   • `skill_delete`
- *   • reminder / delegate tools (see TOOLS below)
+ *   • reminder / delegate / taskboard tools (see TOOLS below)
  *
  * NOTE: the recall/archival tools (`session_search`, `archival_add`,
  * `archival_search`, `archival_delete`) used to live here too. They were moved
@@ -33,7 +33,6 @@
 // 必须第一个 import:stdout 只留给 JSON-RPC + 未捕获异常不退出(见 mcpStdioGuard 注释)。
 import './mcpStdioGuard.js'
 import { readFileSync } from 'node:fs'
-import { request as httpRequest } from 'node:http'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
@@ -50,55 +49,62 @@ import {
 } from '@openclaude/storage'
 
 import {
-  type FanoutItemResult,
+  type FanoutTask,
   aggregateDelegateFanoutResults,
   normalizeFanoutTasks,
 } from './delegateFanout.js'
+import { normalizeDelegateAgentId, normalizeDelegateModel } from './delegateArgs.js'
+import {
+  formatDelegateFanoutRunning,
+  resolveCursorFastWaitMs,
+  runCursorDelegateFastPath,
+  type FanoutCursorItem,
+  type FormattedDelegateResult,
+} from './delegateCursorFastPath.js'
+import {
+  describeDelegateTransportError,
+  gatewayDelegateHeaders,
+  gatewayBaseUrl,
+  postJsonToGateway,
+  readGatewayToken,
+} from './gatewayClient.js'
+import {
+  askUserHttpTimeoutMs,
+  askUserToolPostedFallback,
+  askUserToolResultFromGateway,
+  remainingAskUserWaitMs,
+} from './askUserClient.js'
 import { type ReminderJobView, formatReminderList } from './reminderFormat.js'
 import { filterSkillEvalTools, isSkillEvalBlockedTool } from './skillEvalToolPolicy.js'
 // Tool 定义(TOOLS / SKILL_PROPOSE_TOOL)抽到 ./toolDefs.ts(纯数据模块,无副作用),
 // 让「TOOLS ↔ toolNames.ts」锁步单测能直接 import 校验,而不触发本入口模块顶层的
 // server.connect(见 toolDefs.ts / __tests__/toolNames.test.ts)。
-import { SKILL_PROPOSE_TOOL, TOOLS } from './toolDefs.js'
+import {
+  handleTaskComment,
+  handleTaskCreate,
+  handleTaskGet,
+  handleTaskList,
+  handleTaskUpdate,
+} from './taskboardMcp.js'
+import { SKILL_PROPOSE_TOOL, TOOLS, normalizeAskUserQuestions } from './toolDefs.js'
+import {
+  cursorDelegateCliHint,
+  isCursorHiddenDelegateTool,
+} from './cursorDelegatePolicy.js'
 
 const AGENT_ID = process.env.OPENCLAUDE_AGENT_ID ?? 'main'
-
-/**
- * Read the gateway access token used to authenticate callbacks from this
- * mcp-memory subprocess into the parent gateway HTTP API
- * (`/api/agents/.../message`, `/api/cron`, `/api/...`).
- *
- * Two delivery channels, file-first:
- *
- *   1. `OPENCLAUDE_GATEWAY_TOKEN_FILE` — absolute path to a file containing
- *      the token. v3 codex spawn paths use this so the token is NOT exposed
- *      via the codex argv `-c mcp_servers.openclaude_memory.env={...}`
- *      injection (which would land the token in `ps -ef` / `/proc/<pid>/cmdline`).
- *      The file is written 0600 inside an mkdtemp'd sessionDir owned by the
- *      runner that spawned us, and torn down on shutdown.
- *
- *   2. `OPENCLAUDE_GATEWAY_TOKEN` — direct env var. ccb's subprocessRunner
- *      sets the env via execve (no argv exposure), so it can keep using this
- *      simpler path. master/personal codex paths also still use this.
- *
- * If the file path is set but unreadable we fall back to the env var rather
- * than crash — keeps the agent partially functional (auth-protected calls
- * will fail upstream with 401, which is observable). If neither is set, return
- * empty string and let the gateway reject the unauthenticated call.
- */
-function readGatewayToken(): string {
-  const file = process.env.OPENCLAUDE_GATEWAY_TOKEN_FILE
-  if (file) {
-    try {
-      return readFileSync(file, 'utf8').trim()
-    } catch (err: any) {
-      process.stderr.write(
-        `[mcp-memory] OPENCLAUDE_GATEWAY_TOKEN_FILE unreadable (${file}), falling back to env: ${err?.message ?? err}\n`,
-      )
-    }
-  }
-  return process.env.OPENCLAUDE_GATEWAY_TOKEN || ''
-}
+/** 本 MCP 子进程的委派深度(由网关 spawn env 注入)。>0 = 子 agent 环境,
+ *  没有直接面向用户的交互面 —— ask_user 直接短路返回 skipped。 */
+const DELEGATION_DEPTH = Math.max(
+  0,
+  Number.parseInt(process.env.OPENCLAUDE_DELEGATION_DEPTH || '0', 10) || 0,
+)
+/** 引擎身份(由网关 spawn env 注入)。ask_user 定义保留但默认不暴露:
+ *  Cursor 已改走正文 ```options 围栏;仅 OC_ASK_USER_MCP=1 时恢复原 MCP 卡。
+ *  恢复时仍只挂在 Cursor 主会话上 —— CCB/Codex 各有原生提问工具。 */
+const ENGINE_ID = (process.env.OPENCLAUDE_ENGINE || '').trim().toLowerCase()
+const ASK_USER_MCP_ESCAPE = process.env.OC_ASK_USER_MCP === '1'
+const ASK_USER_ENABLED = ENGINE_ID === 'cursor'
 
 function buildSkillStore(): SkillStore {
   // Overlay (single wiring in @openclaude/storage): platform baseline (ro env)
@@ -176,12 +182,21 @@ const server = new Server(
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   // Training session REMOVES authoritative-write tools (only skill_propose drafts).
-  const base = SKILL_TRAIN_RUN_ID
+  let base = SKILL_TRAIN_RUN_ID
     ? [
         ...TOOLS.filter((t) => t.name !== 'skill_save' && t.name !== 'skill_delete'),
         SKILL_PROPOSE_TOOL,
       ]
     : TOOLS
+  // ask_user 默认不暴露(Cursor 已改走正文 ```options 围栏)。仅当
+  // OC_ASK_USER_MCP=1 且本进程是 Cursor 主会话时才恢复暴露。
+  // discovery 过滤不是授权边界,CallTool 侧还有短路兜底。
+  if (DELEGATION_DEPTH > 0 || !ASK_USER_ENABLED || !ASK_USER_MCP_ESCAPE) {
+    base = base.filter((t) => t.name !== 'ask_user')
+  }
+  if (ENGINE_ID === 'cursor') {
+    base = base.filter((t) => !isCursorHiddenDelegateTool(t.name, 'cursor'))
+  }
   return { tools: filterSkillEvalTools(base, SKILL_EVAL_MODE) }
 })
 
@@ -196,6 +211,9 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     // persistent write, or delegation starts.
     if (SKILL_EVAL_MODE && isSkillEvalBlockedTool(name)) {
       return toolError(`tool "${name}" is disabled in eval sessions`)
+    }
+    if (isCursorHiddenDelegateTool(name)) {
+      return toolError(cursorDelegateCliHint(name))
     }
     switch (name) {
       case 'skill_list':
@@ -226,6 +244,18 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         return await handleDelegateTasks(args as any)
       case 'request_review':
         return await handleRequestReview(args as any)
+      case 'task_create':
+        return await handleTaskCreate(args as any)
+      case 'task_update':
+        return await handleTaskUpdate(args as any)
+      case 'task_comment':
+        return await handleTaskComment(args as any)
+      case 'task_list':
+        return await handleTaskList(args as any)
+      case 'task_get':
+        return await handleTaskGet(args as any)
+      case 'ask_user':
+        return await handleAskUser(args as any)
       default:
         return { content: [{ type: 'text', text: `unknown tool: ${name}` }], isError: true }
     }
@@ -640,7 +670,7 @@ async function handleSendToAgent(args: { agentId: string; message: string }) {
           message: args.message,
           sourceAgent,
         }),
-        timeoutMs: DELEGATE_CLIENT_TIMEOUT_MS,
+        timeoutMs: AGENT_MESSAGE_CLIENT_TIMEOUT_MS,
       },
     )
     if (res.statusCode < 200 || res.statusCode >= 300) {
@@ -658,17 +688,26 @@ async function handleSendToAgent(args: { agentId: string; message: string }) {
 
 async function handleDelegateTask(args: {
   agentId?: string
+  model?: string
   goal: string
   context?: string
   effort?: string
   toolsets?: string[]
+  resumeSessionKey?: string
 }) {
-  return handleDelegateTaskToAgent(args.agentId || 'main', {
+  const agentNorm = normalizeDelegateAgentId(args.agentId)
+  if (!agentNorm.ok) return toolError(agentNorm.error)
+  const modelNorm = normalizeDelegateModel(args.model)
+  if (!modelNorm.ok) return toolError(modelNorm.error)
+  const agentId = agentNorm.agentId || 'main'
+  return handleDelegateTaskToAgent(agentId, {
     goal: args.goal,
     context: args.context,
     effort: args.effort,
     toolsets: args.toolsets,
-    label: args.agentId || 'main',
+    resumeSessionKey: args.resumeSessionKey,
+    model: modelNorm.model,
+    label: agentNorm.agentId || 'main',
   })
 }
 
@@ -683,105 +722,75 @@ async function handleDelegateTask(args: {
 async function handleDelegateTasks(args: { tasks?: unknown }) {
   const normalized = normalizeFanoutTasks(args?.tasks)
   if (!normalized.ok) return toolError(normalized.error)
-  const tasks = normalized.tasks
-  const items = await Promise.all(
-    tasks.map(async (t): Promise<FanoutItemResult> => {
-      const label = t.agentId || 'main'
-      try {
-        const r = await handleDelegateTaskToAgent(label, {
-          goal: t.goal,
-          context: t.context,
-          effort: t.effort,
-          toolsets: t.toolsets,
-          label,
-        })
-        // toolOk 返回体无 isError 字段、toolError 有 → 联合类型下按可选属性安全取值。
-        return {
-          label,
-          goal: t.goal,
-          isError: (r as { isError?: boolean }).isError === true,
-          text: r.content?.[0]?.text ?? '(无输出)',
-        }
-      } catch (err: any) {
-        // 兜底:handleDelegateTaskToAgent 已自带 try/catch(理论到不了这里),
-        // 仍隔离单项异常,避免一个子任务的意外把整个 fan-out 拖垮。
-        return {
-          label,
-          goal: t.goal,
-          isError: true,
-          text: `委派失败: ${describeDelegateTransportError(err)}`,
-        }
-      }
-    }),
-  )
-  return toolOk(aggregateDelegateFanoutResults(items))
+  return handleAsyncDelegateTasks(normalized.tasks)
 }
 
 // (v5 ccb-only:handleAskGpt55Codex 已移除 —— 无 codex agent。)
 
 /**
- * The captain's HTTP client must wait strictly longer than the gateway's
- * authoritative delegate lifetime. The gateway runs the child up to its hard
- * timeout — delegateTimeout.ts clamps that to at most 2h — and ALWAYS sends an
- * HTTP response (on completion / idle timeout / hard timeout). It only writes
- * that response after the child finishes; progress streams over a separate WS,
- * so nothing flows on this socket until the very end. The original code used
- * global fetch, whose undici default 5min headersTimeout aborted any non-trivial
- * delegation mid-run → "委派失败: fetch failed", while the orphaned child kept
- * burning tokens.
- *
- * The gateway is the single authority on delegate lifetime; the client only has
- * to outlast the gateway's maximum possible hold time. Since that ceiling is a
- * fixed 2h (delegateTimeout.ts hard-timeout clamp), wait 2h + a margin — this
- * never re-splits the two sides regardless of any OPENCLAUDE_DELEGATE_HARD_*
- * env tuning (the gateway can never exceed its own clamp).
+ * send_to_agent is a separate long callback endpoint. Delegate tools no longer
+ * use one long HTTP request: every engine starts an async job, waits briefly,
+ * then returns a resumable job handle before its MCP tools/call deadline.
  */
-const DELEGATE_CLIENT_TIMEOUT_MS = 2 * 60 * 60_000 + 60_000
+const AGENT_MESSAGE_CLIENT_TIMEOUT_MS = 2 * 60 * 60_000 + 60_000
 
 /**
- * node:http surfaces the real transport failure on `err.code` (ECONNREFUSED,
- * ECONNRESET, socket timeout…). Fold the code into the message so delegation
- * failures are diagnosable instead of the opaque dead-end the old fetch path
- * produced.
+ * 引擎交互提问桥(仅 Cursor,且仅 OC_ASK_USER_MCP=1 逃生开关):把选择题 POST
+ * 给网关,在 55s 窗口内阻塞等回答。默认关闭 —— Cursor 已改走正文 ```options
+ * 围栏,避免老提示词模型卡在 MCP 60s 硬超时上。开关打开时保持原行为。
  */
-function describeDelegateTransportError(err: any): string {
-  const code = err?.code || err?.cause?.code
-  const base = err?.message ?? String(err)
-  return code ? `${base} (${code})` : base
-}
-
-/**
- * POST JSON to the in-container gateway over node:http. We deliberately avoid
- * global fetch / undici here: the only knob we need is "wait long enough for the
- * gateway to answer", and a socket-inactivity timeout gives exactly that without
- * pulling in undici's separate 5min headersTimeout (the original bug) or a new
- * runtime dependency for this spawned MCP subprocess. Nothing flows on the
- * socket until the gateway finishes the whole child run, so the inactivity timer
- * acts as the total client wait cap.
- */
-function postJsonToGateway(
-  url: string,
-  opts: { headers: Record<string, string>; body: string; timeoutMs: number },
-): Promise<{ statusCode: number; body: string }> {
-  return new Promise((resolve, reject) => {
-    const req = httpRequest(url, { method: 'POST', headers: opts.headers }, (res) => {
-      const chunks: Buffer[] = []
-      res.on('data', (chunk) => chunks.push(chunk as Buffer))
-      res.on('end', () =>
-        resolve({ statusCode: res.statusCode ?? 0, body: Buffer.concat(chunks).toString('utf8') }),
-      )
-      res.on('error', reject)
-    })
-    req.on('error', reject)
-    req.setTimeout(opts.timeoutMs, () => {
-      const err: any = new Error(
-        `delegate client timeout after ${Math.round(opts.timeoutMs / 1000)}s`,
-      )
-      err.code = 'ETIMEDOUT'
-      req.destroy(err)
-    })
-    req.end(opts.body)
-  })
+async function handleAskUser(args: { questions?: unknown } | undefined | null) {
+  if (!ASK_USER_MCP_ESCAPE) {
+    return toolOk(
+      'Cursor 引擎已改为在正文输出 ```options 围栏选项卡提问，请改用该方式并立刻结束本回合',
+    )
+  }
+  const questions = normalizeAskUserQuestions(args?.questions)
+  if (!questions) {
+    return toolError(
+      'ask_user 参数无效:questions 必须是 1-4 个 {question, options:[{label,(description)}], (header),(multiSelect)}',
+    )
+  }
+  if (DELEGATION_DEPTH > 0) {
+    return toolOk(
+      JSON.stringify({
+        status: 'skipped',
+        reason:
+          'subagent has no interactive user — decide yourself, or list numbered options in your final report',
+      }),
+    )
+  }
+  if (!ASK_USER_ENABLED) {
+    return toolError(
+      'ask_user is only available on the Cursor engine; use the engine-native question tool',
+    )
+  }
+  const sessionKey = process.env.OPENCLAUDE_SESSION_KEY || ''
+  if (!sessionKey) return toolError('ask_user unavailable: no session key in environment')
+  const startedAt = Date.now()
+  const waitMs = remainingAskUserWaitMs(startedAt)
+  const gatewayPort = process.env.OPENCLAUDE_GATEWAY_PORT || '18789'
+  const gatewayToken = readGatewayToken()
+  try {
+    const res = await postJsonToGateway(
+      `http://127.0.0.1:${gatewayPort}/api/agents/${encodeURIComponent(AGENT_ID)}/ask-user`,
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${gatewayToken}`,
+          'x-delegation-depth': String(DELEGATION_DEPTH),
+        },
+        body: JSON.stringify({ sessionKey, questions, waitMs }),
+        timeoutMs: askUserHttpTimeoutMs(waitMs),
+      },
+    )
+    return askUserToolResultFromGateway(res)
+  } catch (err: any) {
+    process.stderr.write(
+      `[mcp-memory] ask_user gateway call failed: ${describeDelegateTransportError(err)}\n`,
+    )
+    return askUserToolPostedFallback()
+  }
 }
 
 /**
@@ -790,7 +799,11 @@ function postJsonToGateway(
  * 团队门(非团队 turn 409 拒绝)与审查任务书包装(用户原始需求取服务端权威快照)。
  * 熔断:hidden guard ≤3 次/turn,超限 429 —— 直接把结构化错误回给队长收敛。
  */
-async function handleRequestReview(args: { draft?: string; revisionNote?: string }) {
+async function handleRequestReview(args: {
+  draft?: string
+  revisionNote?: string
+  resumeSessionKey?: string
+}) {
   const draft = typeof args?.draft === 'string' ? args.draft.trim() : ''
   if (!draft) {
     return toolError('draft 必填:请把准备提交给用户的完整答复草稿放进 draft 参数')
@@ -803,6 +816,114 @@ async function handleRequestReview(args: { draft?: string; revisionNote?: string
     goal: '对队长准备提交给用户的最终答复草稿做独立质量审查,给出结构化裁决。',
     context: draft.slice(0, 16000) + note,
     label: '质量审查',
+    resumeSessionKey:
+      typeof args.resumeSessionKey === 'string' ? args.resumeSessionKey : undefined,
+  })
+}
+
+async function handleAsyncDelegateTasks(tasks: FanoutTask[]) {
+  const items = await Promise.all(
+    tasks.map(async (t): Promise<FanoutCursorItem> => {
+      const label = t.agentId || 'main'
+      try {
+        const r = await runAsyncDelegateToAgent(label, {
+          goal: t.goal,
+          context: t.context,
+          effort: t.effort,
+          toolsets: t.toolsets,
+          resumeSessionKey: t.resumeSessionKey,
+          model: t.model,
+          label,
+        })
+        if (r.kind === 'running') {
+          return {
+            label,
+            goal: t.goal,
+            isError: false,
+            text: r.text,
+            running: true,
+            jobId: r.jobId,
+          }
+        }
+        return {
+          label,
+          goal: t.goal,
+          isError: r.kind === 'error',
+          text: r.kind === 'error' ? `error: ${r.text}` : r.text,
+        }
+      } catch (err: any) {
+        return {
+          label,
+          goal: t.goal,
+          isError: true,
+          text: `委派失败: ${describeDelegateTransportError(err)}`,
+        }
+      }
+    }),
+  )
+  if (items.some((it) => it.running)) return toolOk(formatDelegateFanoutRunning(items))
+  return toolOk(
+    aggregateDelegateFanoutResults(
+      items.map((it) => ({
+        label: it.label,
+        goal: it.goal,
+        isError: it.isError,
+        text: it.text,
+      })),
+    ),
+  )
+}
+
+async function runAsyncDelegateToAgent(
+  targetAgent: string,
+  args: {
+    goal: string
+    context?: string
+    effort?: string
+    toolsets?: string[]
+    resumeSessionKey?: string
+    model?: string
+    label: string
+  },
+): Promise<FormattedDelegateResult> {
+  const sourceAgent = process.env.OPENCLAUDE_AGENT_ID || 'unknown'
+  const parentSessionKey = process.env.OPENCLAUDE_SESSION_KEY || ''
+  const currentDepth = Number.parseInt(process.env.OPENCLAUDE_DELEGATION_DEPTH || '0', 10)
+  const headers = {
+    ...gatewayDelegateHeaders(),
+    'x-delegation-depth': String(currentDepth),
+  }
+  const base = gatewayBaseUrl()
+  const body = JSON.stringify({
+    goal: args.goal,
+    context: args.context,
+    ...(args.effort ? { effort: args.effort } : {}),
+    ...(args.model ? { model: args.model } : {}),
+    sourceAgent,
+    toolsets: args.toolsets,
+    async: true,
+    ...(args.resumeSessionKey ? { resumeSessionKey: args.resumeSessionKey } : {}),
+    ...(parentSessionKey ? { streamProgress: true, parentSessionKey } : {}),
+  })
+  const fastWaitMs = resolveCursorFastWaitMs()
+  return runCursorDelegateFastPath({
+    fastWaitMs,
+    label: args.label,
+    goal: args.goal,
+    transport: {
+      start: () =>
+        postJsonToGateway(`${base}/api/agents/${encodeURIComponent(targetAgent)}/delegate`, {
+          headers,
+          body,
+          timeoutMs: 15_000,
+        }),
+      wait: (jobId, waitMs) =>
+        postJsonToGateway(`${base}/api/delegate/wait`, {
+          headers,
+          body: JSON.stringify({ jobId, waitMs }),
+          timeoutMs: waitMs + 15_000,
+        }),
+    },
   })
 }
 
@@ -813,56 +934,18 @@ async function handleDelegateTaskToAgent(
     context?: string
     effort?: string
     toolsets?: string[]
+    resumeSessionKey?: string
+    model?: string
     label: string
   },
 ) {
-  const gatewayPort = process.env.OPENCLAUDE_GATEWAY_PORT || '18789'
-  const gatewayToken = readGatewayToken()
-  const sourceAgent = process.env.OPENCLAUDE_AGENT_ID || 'unknown'
-  const parentSessionKey = process.env.OPENCLAUDE_SESSION_KEY || ''
   try {
-    // Pass delegation depth so gateway can enforce recursion limit
-    const currentDepth = Number.parseInt(process.env.OPENCLAUDE_DELEGATION_DEPTH || '0', 10)
-    const res = await postJsonToGateway(
-      `http://127.0.0.1:${gatewayPort}/api/agents/${encodeURIComponent(targetAgent)}/delegate`,
-      {
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${gatewayToken}`,
-          'x-delegation-depth': String(currentDepth),
-        },
-        body: JSON.stringify({
-          goal: args.goal,
-          context: args.context,
-          ...(args.effort ? { effort: args.effort } : {}),
-          sourceAgent,
-          toolsets: args.toolsets,
-          ...(parentSessionKey ? { streamProgress: true, parentSessionKey } : {}),
-        }),
-        timeoutMs: DELEGATE_CLIENT_TIMEOUT_MS,
-      },
-    )
-    if (res.statusCode < 200 || res.statusCode >= 300) {
-      return toolError(`委派失败: ${res.body}`)
-    }
-    const data = JSON.parse(res.body) as any
-    if (data.error || data.ok === false) {
-      return toolError(`子 agent 执行出错: ${data.error || data.output || 'unknown error'}`)
-    }
-    const output = data.output || ''
-    if (looksLikeDelegateApiError(output)) {
-      return toolError(`子 agent 执行出错: ${output}`)
-    }
-    return toolOk(`✅ 委派完成 (agent: ${args.label})\n\n${output || '(无输出)'}`)
+    const r = await runAsyncDelegateToAgent(targetAgent, args)
+    if (r.kind === 'error') return toolError(r.text)
+    return toolOk(r.text)
   } catch (err: any) {
     return toolError(`委派失败: ${describeDelegateTransportError(err)}`)
   }
-}
-
-function looksLikeDelegateApiError(raw: unknown): boolean {
-  const s = String(raw ?? '').trim()
-  if (!s) return false
-  return /^API Error:\s*(?:\d{3}\b|\{)/i.test(s)
 }
 
 // ── 定时任务工具族共用:gateway /api/cron 客户端 ────────────────────────────

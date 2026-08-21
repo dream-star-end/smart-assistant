@@ -158,6 +158,7 @@ const ENV_KEYS = [
   "OC_RUNTIME_CHANNEL",
   "OPENCLAUDE_V3_MASTER_BASE_URL",
   "OPENCLAUDE_V3_CONTAINER_TOKEN",
+  "OC_SELFHOST_ENGINE_LOCAL_TURNS",
 ] as const;
 const savedEnv = new Map<string, string | undefined>(
   ENV_KEYS.map((k) => [k, process.env[k]]),
@@ -265,6 +266,23 @@ describe("submit() codex 计费 guard(fail-closed)", () => {
       );
     }
   });
+  test("selfhost exemption (OC_SELFHOST_ENGINE_LOCAL_TURNS=1): no requestId still reaches submitTurn", async () => {
+    enableCommercialWithLosslessSink();
+    process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS = "1";
+    const runner = new FakeEngineAdapter("codex", CODEX_CAPS, "gpt-5.6-sol");
+    const session = makeSession(runner);
+    const events: SessionStreamEvent[] = [];
+
+    await makeSm().submit(session, "hello", (e) => events.push(e));
+
+    assert.equal(runner.submitTurnCalls.length, 1, "exemption open -> guard does not reject");
+    assert.equal(
+      events.some((e) => e.kind === "error" && /CODEX_BILLING_GUARD/.test((e as { error: string }).error)),
+      false,
+      "no guard error event expected",
+    );
+  });
+
 
   test("commercial + needsServerRequestId + 带 requestId → 放行,requestId 透传 submitTurn", async () => {
     enableCommercialWithLosslessSink();

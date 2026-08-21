@@ -32,13 +32,19 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   createPgSessionsBackend,
   startSessionsGcSweeper,
+  _setAfterLosslessStageBatch,
+  _setPhaseASqlObserver,
+  LOSSLESS_TURN_RECORD_STAGE_BATCH_SIZE,
   type PgSessionsBackend,
 } from "../db/pgSessionsBackend.js";
 import {
+  convergeFinalizedTapeLiveStreams,
   importRolloutLiveFrames,
   persistGatewayLiveFrame,
+  pruneProjectedLiveFrames,
   readClientSessionLiveFrames,
   reconcileLiveStreamWithFinalTape,
+  retireDeadLiveStreams,
 } from "../db/liveTurnFrames.js";
 import {
   casAdmittedToAccepted,
@@ -87,6 +93,15 @@ const MIGRATION_0196 = path.resolve(here, "../db/migrations/0196_client_session_
 const MIGRATION_0198 = path.resolve(here, "../db/migrations/0198_client_session_workspace_default.sql");
 const MIGRATION_0201 = path.resolve(here, "../db/migrations/0201_durable_live_turn_frames.sql");
 const MIGRATION_0202 = path.resolve(here, "../db/migrations/0202_turn_recovery_control.sql");
+const MIGRATION_0228 = path.resolve(here, "../db/migrations/0228_turn_visible_finalize.sql");
+const MIGRATION_0229 = path.resolve(here, "../db/migrations/0229_turn_finalize_integrity.sql");
+const MIGRATION_0230 = path.resolve(here, "../db/migrations/0230_chat_projects.sql");
+const MIGRATION_0231 = path.resolve(here, "../db/migrations/0231_turn_tape_materialization_resilience.sql");
+const MIGRATION_0233 = path.resolve(here, "../db/migrations/0233_client_session_list_archived_at.sql");
+const MIGRATION_0239 = path.resolve(here, "../db/migrations/0239_turn_dispatch_shutdown_ctx.sql");
+const MIGRATION_0240 = path.resolve(here, "../db/migrations/0240_client_session_last_read_at.sql");
+const MIGRATION_0241 = path.resolve(here, "../db/migrations/0241_raise_last_read_watermark.sql");
+const MIGRATION_0243 = path.resolve(here, "../db/migrations/0243_live_unit_checkpoints.sql");
 
 let pool: Pool;
 let backend: PgSessionsBackend;
@@ -215,7 +230,20 @@ before(async () => {
   await pool.query(await readFile(MIGRATION_0196, { encoding: "utf8" }));
   await pool.query(await readFile(MIGRATION_0201, { encoding: "utf8" }));
   await pool.query(await readFile(MIGRATION_0202, { encoding: "utf8" }));
+  await pool.query(await readFile(MIGRATION_0228, { encoding: "utf8" }));
+  await pool.query(await readFile(MIGRATION_0229, { encoding: "utf8" }));
+  await pool.query(await readFile(MIGRATION_0230, { encoding: "utf8" }));
+  await pool.query(await readFile(MIGRATION_0231, { encoding: "utf8" }));
+  await pool.query(await readFile(MIGRATION_0233, { encoding: "utf8" }));
+  await pool.query(await readFile(MIGRATION_0239, { encoding: "utf8" }));
+  await pool.query(await readFile(MIGRATION_0240, { encoding: "utf8" }));
+  await pool.query(await readFile(MIGRATION_0241, { encoding: "utf8" }));
+  await pool.query(await readFile(MIGRATION_0243, { encoding: "utf8" }));
   await pool.query(`
+    CREATE TABLE agent_containers (
+      user_id BIGINT NOT NULL,
+      state TEXT NOT NULL
+    );
     CREATE TABLE admin_audit (
       id BIGSERIAL PRIMARY KEY,
       admin_id BIGINT NOT NULL,
@@ -284,11 +312,23 @@ after(async () => {
 
 beforeEach(async () => {
   if (!pgAvailable) return;
-  await pool.query(
-    `TRUNCATE client_sessions, client_session_archive_chunks, client_session_archived_ids,
-             server_authored_request_map, pending_usage_patches, turn_waivers,
-             wechat_bindings, admin_audit CASCADE`,
-  );
+  // Some live-frame readers intentionally outlive the request that started
+  // them. Their final short SELECT can overlap the next fixture TRUNCATE and
+  // make PostgreSQL choose the reset as a 40P01 victim. Retry only that exact
+  // transient; every other setup error remains fatal.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await pool.query(
+        `TRUNCATE client_sessions, client_session_archive_chunks, client_session_archived_ids,
+                 server_authored_request_map, pending_usage_patches, turn_waivers,
+                 wechat_bindings, admin_audit CASCADE`,
+      );
+      break;
+    } catch (error) {
+      if ((error as { code?: string }).code !== "40P01" || attempt === 2) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 25 * (attempt + 1)));
+    }
+  }
 });
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -683,7 +723,7 @@ describe("pgSessionsBackend contract", () => {
     await backend.upsertClientSession(mkSession({ modelId: "kimi-k3" }));
     const got = await backend.getClientSession("s-1", "u-1");
     assert.equal(got?.modelId, "kimi-k3");
-    assert.equal((await backend.listClientSessions("u-1")).find((s) => s.id === "s-1")?.modelId, "kimi-k3");
+    assert.equal((await backend.listClientSessions("u-1")).sessions.find((s) => s.id === "s-1")?.modelId, "kimi-k3");
     assert.equal((await backend.getClientSessionPartial("s-1", "u-1", 0))?.modelId, "kimi-k3");
 
     // 全量 PUT 未携带 → COALESCE 保留(SQLite 侧同语义,见 storage sessionsClientModel.test)
@@ -703,6 +743,46 @@ describe("pgSessionsBackend contract", () => {
     const none = await backend.getClientSession("s-nomodel", "u-1");
     assert.ok(none);
     assert.equal("modelId" in none!, false);
+  });
+
+  maybe("chat_projects CRUD + 删项目只解绑会话 + list 派生 runState", async () => {
+    await backend.upsertClientSession(mkSession({ id: "s-proj-1" }));
+    const created = await backend.createChatProject("u-1", { name: "  工作  ", color: "blue" });
+    assert.equal(created.ok, true);
+    if (!created.ok) return;
+    assert.equal(created.project.name, "工作");
+    assert.equal(created.project.color, "blue");
+    assert.equal(created.project.sessionCount, 0);
+
+    const other = await backend.updateChatProject("u-other", created.project.id, { name: "hack" });
+    assert.equal(other.ok, false);
+    if (!other.ok) assert.equal(other.error, "not_found");
+
+    const patched = await backend.patchClientSessionMeta("s-proj-1", "u-1", {
+      projectId: created.project.id,
+      pinned: true,
+    });
+    assert.equal(patched.ok, true);
+    const listed = await backend.listChatProjects("u-1");
+    assert.equal(listed.find((p) => p.id === created.project.id)?.sessionCount, 1);
+
+    const meta = (await backend.listClientSessions("u-1")).sessions.find((s) => s.id === "s-proj-1");
+    assert.equal(meta?.projectId, created.project.id);
+    assert.equal(meta?.pinned, true);
+    assert.equal(meta?.runState, "idle");
+    assert.equal(meta?.lastOutcome, null);
+
+    const missingProj = await backend.patchClientSessionMeta("s-proj-1", "u-1", { projectId: "no-such-project-id" });
+    assert.equal(missingProj.ok, false);
+    if (!missingProj.ok) assert.equal(missingProj.error, "project_not_found");
+
+    const del = await backend.deleteChatProject("u-1", created.project.id);
+    assert.equal(del.ok, true);
+    const after = await backend.getClientSession("s-proj-1", "u-1");
+    assert.ok(after, "删除项目不得级联删会话");
+    const meta2 = (await backend.listClientSessions("u-1")).sessions.find((s) => s.id === "s-proj-1");
+    assert.equal(meta2?.projectId, null);
+    assert.equal((await backend.listChatProjects("u-1")).length, 0);
   });
 
   maybe("appendForRequest 先到 → map 记录 + 幂等 already_exists", async () => {
@@ -1483,6 +1563,7 @@ describe("pgSessionsBackend lossless turn tape", () => {
 
     // Force the terminal transaction to roll back after per-ordinal staging,
     // reproducing a process/release boundary with durable partial derived rows.
+    await backend.finalizeLosslessTurnTape(userId, tape.finalize, { materialize: false });
     await pool.query(
       "UPDATE client_sessions SET messages='not-json' WHERE id=$1 AND user_id=$2",
       [sessionId, userId],
@@ -1772,6 +1853,7 @@ describe("pgSessionsBackend lossless turn tape", () => {
       for (const part of tape.parts) {
         await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
       }
+      await backend.finalizeLosslessTurnTape(userId, tape.finalize, { materialize: false });
       await pool.query(
         "UPDATE client_sessions SET messages='not-json' WHERE id=$1 AND user_id=$2",
         [sessionId, userId],
@@ -1879,6 +1961,7 @@ describe("pgSessionsBackend lossless turn tape", () => {
     for (const part of tape.parts) {
       await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
     }
+    await backend.finalizeLosslessTurnTape(userId, tape.finalize, { materialize: false });
     await pool.query(
       "UPDATE client_sessions SET messages='not-json' WHERE id=$1 AND user_id=$2",
       [sessionId, userId],
@@ -1942,6 +2025,7 @@ describe("pgSessionsBackend lossless turn tape", () => {
       for (const part of tape.parts) {
         await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
       }
+      await backend.finalizeLosslessTurnTape(userId, tape.finalize, { materialize: false });
       await pool.query(
         "UPDATE client_sessions SET messages='not-json' WHERE id=$1 AND user_id=$2",
         [sessionId, userId],
@@ -2154,7 +2238,7 @@ describe("pgSessionsBackend lossless turn tape", () => {
       CREATE OR REPLACE FUNCTION oc_test_wait_before_terminal_tape_update()
       RETURNS TRIGGER LANGUAGE plpgsql AS $$
       BEGIN
-        IF NEW.tape_id='${tape.finalize.tapeId}' AND NEW.finalized_at IS NOT NULL THEN
+        IF NEW.tape_id='${tape.finalize.tapeId}' AND OLD.visible_at IS NULL AND NEW.visible_at IS NOT NULL THEN
           PERFORM pg_advisory_xact_lock(${barrierKey});
         END IF;
         RETURN NEW;
@@ -2232,7 +2316,7 @@ describe("pgSessionsBackend lossless turn tape", () => {
       if (barrierObserved) break;
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
-    assert.equal(barrierObserved, true, "first finalize must reach the post-billing transaction barrier");
+    assert.equal(barrierObserved, true, "first finalize must reach the Phase A visibility barrier");
 
     const replay = undiciRequest(url, { method: "POST", headers, body });
     controller.abort();
@@ -2250,6 +2334,22 @@ describe("pgSessionsBackend lossless turn tape", () => {
     assert.equal(replayBody.ok, true);
     assert.equal(replayBody.idempotent, true);
     assert.equal(handlerError, undefined);
+    assert.deepEqual(
+      (await pool.query<{ finalized: boolean; parts: string }>(
+        `SELECT finalized_at IS NOT NULL AS finalized,
+                (SELECT COUNT(*)::text FROM client_session_turn_tape_parts p
+                  WHERE p.session_id=t.session_id AND p.user_id=t.user_id AND p.tape_id=t.tape_id) AS parts
+           FROM client_session_turn_tapes t
+          WHERE t.session_id=$1 AND t.user_id=$2 AND t.tape_id=$3`,
+        [sessionId, userId, tape.finalize.tapeId],
+      )).rows[0],
+      { finalized: false, parts: String(tape.parts.length) },
+    );
+    assert.equal(
+      (await backend.finalizeLosslessTurnTape(userId, tape.finalize)).applied,
+      "finalized",
+      "the asynchronous Phase B worker can finish after the HTTP request is gone",
+    );
     assert.deepEqual(
       (await pool.query<{ finalized: boolean; parts: string }>(
         `SELECT finalized_at IS NOT NULL AS finalized,
@@ -2503,11 +2603,13 @@ describe("pgSessionsBackend lossless turn tape", () => {
       applied: "finalized",
       recordCount: 1,
       engineBillings: [],
+      settlementHandoff: true,
     });
     assert.deepEqual(await backend.finalizeLosslessTurnTape(userId, tape.finalize), {
       applied: "idempotent",
       recordCount: 1,
       engineBillings: [],
+      settlementHandoff: true,
     });
     const rows = await pool.query<{
       waive_reason: string;
@@ -3034,7 +3136,11 @@ describe("pgSessionsBackend lossless turn tape", () => {
     );
     assert.ok(repaired);
     assert.equal(repaired.isPartial, false, "legacy substitute removal must force a full repair");
-    assert.equal(repaired.historyRevision, (beforeUpgrade.historyRevision ?? 0) + 1);
+    assert.equal(
+      repaired.historyRevision,
+      (beforeUpgrade.historyRevision ?? 0) + 2,
+      "Phase A visibility and Phase B exact-record publication each advance identity once",
+    );
     const hot = await pool.query<{ messages: string }>(
       "SELECT messages FROM client_sessions WHERE id=$1 AND user_id=$2",
       [sessionId, userId],
@@ -3719,7 +3825,15 @@ describe("durable live turn frame journal", () => {
     await persistGatewayLiveFrame(pool, { ...base, frameSeq: 2, payload: payload2 });
     await assert.rejects(
       persistGatewayLiveFrame(pool, { ...base, frameSeq: 2, payload: `${payload2} ` }),
-      /immutable payload conflict/,
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /immutable payload conflict/);
+        assert.equal(
+          (error as { liveFramePermanentConflict?: unknown }).liveFramePermanentConflict,
+          true,
+        );
+        return true;
+      },
     );
 
     const first = await readClientSessionLiveFrames(pool, sessionId, userId, 0, 1);
@@ -3727,6 +3841,7 @@ describe("durable live turn frame journal", () => {
     assert.equal(first.frames.length, 1);
     assert.equal(first.hasMore, true);
     assert.equal(first.hasTapeProjection, false);
+    assert.equal(first.tapeProjectionVersion, 0);
     assert.deepEqual(first.streamClientMessageIds, ["cm-live"]);
     assert.deepEqual(first.frames[0]!.payload, JSON.parse(payload1));
     const second = await readClientSessionLiveFrames(
@@ -3759,6 +3874,720 @@ describe("durable live turn frame journal", () => {
     assert.deepEqual(projected.frames, []);
     assert.deepEqual(projected.streamClientMessageIds, []);
     assert.equal(projected.hasTapeProjection, true);
+    assert.equal(projected.tapeProjectionVersion, 1);
+  });
+
+  maybe("keeps one legacy stream durable when later messages change client identity", async () => {
+    const sessionId = "s-live-frame-legacy-message-shift";
+    const userId = "c:909";
+    const sessionKey = `agent:main:webchat:dm:${sessionId}`;
+    const agentContainerId = 450;
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const persist = async (frameSeq: number, clientMessageId: string | null): Promise<void> => {
+      await persistGatewayLiveFrame(pool, {
+        uid: 909n,
+        sessionId,
+        clientMessageId,
+        agentContainerId,
+        sessionKey,
+        frameSeq,
+        payload: JSON.stringify({
+          type: "outbound.message",
+          sessionKey,
+          frameSeq,
+          peer: { id: sessionId, kind: "dm" },
+          ...(clientMessageId === null ? {} : { clientMessageId }),
+          blocks: [{ kind: "text", text: `legacy frame ${frameSeq}` }],
+        }),
+      });
+    };
+
+    await persist(1, null);
+    await persist(2, "ask-ans-legacy-shift");
+    await persist(3, "m-legacy-shift-later");
+
+    const streams = await pool.query<{
+      stream_key: string;
+      client_message_id: string | null;
+      dispatch_id: string | null;
+      attempt_no: number | null;
+    }>(
+      `SELECT stream_key,client_message_id,dispatch_id::text,attempt_no
+         FROM client_session_live_streams
+        WHERE session_id=$1 AND user_id=$2`,
+      [sessionId, userId],
+    );
+    assert.deepEqual(streams.rows, [{
+      stream_key: `legacy:${agentContainerId}:${sessionKey}`,
+      client_message_id: "m-legacy-shift-later",
+      dispatch_id: null,
+      attempt_no: null,
+    }]);
+    const page = await readClientSessionLiveFrames(pool, sessionId, userId, 0, 10);
+    assert.ok(page);
+    assert.deepEqual(page.frames, [], "legacy streams never enter the hot live-frames path");
+    assert.deepEqual(page.streamClientMessageIds, []);
+    assert.equal(page.hasMoreBefore, false);
+  });
+
+  maybe("legacy relaxation preserves every strict stream identity guard independently", async () => {
+    // session_id remains strict on a legacy-key collision.
+    const sessionKey = "agent:main:webchat:dm:s-live-guard-shared";
+    await backend.upsertClientSession(mkSession({ id: "s-live-guard-session-a", userId: "c:930" }));
+    await backend.upsertClientSession(mkSession({ id: "s-live-guard-session-b", userId: "c:930" }));
+    const legacyBase = {
+      uid: 930n,
+      sessionId: "s-live-guard-session-a",
+      clientMessageId: null,
+      agentContainerId: 530,
+      sessionKey,
+      frameSeq: 1,
+      payload: JSON.stringify({ type: "outbound.message", sessionKey, frameSeq: 1 }),
+    };
+    await persistGatewayLiveFrame(pool, legacyBase);
+    await assert.rejects(
+      persistGatewayLiveFrame(pool, {
+        ...legacyBase,
+        sessionId: "s-live-guard-session-b",
+        frameSeq: 2,
+        payload: JSON.stringify({ type: "outbound.message", sessionKey, frameSeq: 2 }),
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /live frame stream identity conflict/);
+        assert.equal(
+          (error as { liveFramePermanentConflict?: unknown }).liveFramePermanentConflict,
+          true,
+        );
+        return true;
+      },
+      "session_id drift must remain rejected",
+    );
+
+    // user_id remains strict even though the session FK itself is shared.
+    const userSessionId = "s-live-guard-user";
+    const userSessionKey = `agent:main:webchat:dm:${userSessionId}`;
+    await backend.upsertClientSession(mkSession({ id: userSessionId, userId: "c:931" }));
+    const userBase = {
+      uid: 931n,
+      sessionId: userSessionId,
+      clientMessageId: null,
+      agentContainerId: 531,
+      sessionKey: userSessionKey,
+      frameSeq: 1,
+      payload: JSON.stringify({ type: "outbound.message", sessionKey: userSessionKey, frameSeq: 1 }),
+    };
+    await persistGatewayLiveFrame(pool, userBase);
+    await assert.rejects(
+      persistGatewayLiveFrame(pool, {
+        ...userBase,
+        uid: 932n,
+        frameSeq: 2,
+        payload: JSON.stringify({ type: "outbound.message", sessionKey: userSessionKey, frameSeq: 2 }),
+      }),
+      /live frame stream identity conflict/,
+      "user_id drift must remain rejected",
+    );
+
+    // source remains strict on an otherwise identical legacy row.
+    const sourceSessionId = "s-live-guard-source";
+    const sourceUserId = "c:933";
+    const sourceSessionKey = `agent:main:webchat:dm:${sourceSessionId}`;
+    const sourceContainerId = 532;
+    await backend.upsertClientSession(mkSession({ id: sourceSessionId, userId: sourceUserId }));
+    await pool.query(
+      `INSERT INTO client_session_live_streams
+         (stream_key,session_id,user_id,client_message_id,dispatch_id,attempt_no,
+          agent_container_id,source,projection_source,import_sha256)
+       VALUES ($1,$2,$3,NULL,NULL,NULL,$4,'rollout_import','live',$5)`,
+      [
+        `legacy:${sourceContainerId}:${sourceSessionKey}`,
+        sourceSessionId,
+        sourceUserId,
+        sourceContainerId,
+        "9".repeat(64),
+      ],
+    );
+    await assert.rejects(
+      persistGatewayLiveFrame(pool, {
+        uid: 933n,
+        sessionId: sourceSessionId,
+        clientMessageId: null,
+        agentContainerId: sourceContainerId,
+        sessionKey: sourceSessionKey,
+        frameSeq: 1,
+        payload: JSON.stringify({ type: "outbound.message", sessionKey: sourceSessionKey, frameSeq: 1 }),
+      }),
+      /live frame stream identity conflict/,
+      "source drift must remain rejected",
+    );
+
+    // Dispatch-backed streams keep exact client-message, dispatch, attempt and
+    // container identity. Seed one independently mismatched dimension per row.
+    const dispatchCases: Array<{
+      label: string;
+      uid: number;
+      storedClientMessageId?: string;
+      storedDispatchId?: string;
+      storedAttemptNo?: number;
+      storedContainerId?: number;
+    }> = [
+      { label: "client_message_id", uid: 934, storedClientMessageId: "cm-other" },
+      { label: "dispatch_id", uid: 935, storedDispatchId: randomUUID() },
+      { label: "attempt_no", uid: 936, storedAttemptNo: 2 },
+      { label: "agent_container_id", uid: 937, storedContainerId: 999 },
+    ];
+    for (const identityCase of dispatchCases) {
+      const dispatchId = randomUUID();
+      const caseSessionId = `s-live-guard-dispatch-${identityCase.label}`;
+      const caseUserId = `c:${identityCase.uid}`;
+      const clientMessageId = `cm-${identityCase.label}`;
+      const caseSessionKey = `agent:main:webchat:dm:${caseSessionId}`;
+      const agentContainerId = 600 + identityCase.uid;
+      await backend.upsertClientSession(mkSession({ id: caseSessionId, userId: caseUserId }));
+      await pool.query(
+        `INSERT INTO turn_dispatches
+           (dispatch_id,user_id,session_id,client_message_id,agent_id,request_hash,
+            billing_request_id,status,owner_id,lease_until)
+         VALUES ($1,$2,$3,$4,'main',$5,$6,'accepted','test-owner',NOW()+INTERVAL '1 minute')`,
+        [
+          dispatchId,
+          identityCase.uid,
+          caseSessionId,
+          clientMessageId,
+          "d".repeat(64),
+          `billing-${dispatchId}`,
+        ],
+      );
+      await pool.query(
+        `INSERT INTO client_session_live_streams
+           (stream_key,session_id,user_id,client_message_id,dispatch_id,attempt_no,
+            agent_container_id,source,projection_source)
+         VALUES ($1,$2,$3,$4,$5::uuid,$6,$7,'gateway','live')`,
+        [
+          `dispatch:${dispatchId}:1`,
+          caseSessionId,
+          caseUserId,
+          identityCase.storedClientMessageId ?? clientMessageId,
+          identityCase.storedDispatchId ?? dispatchId,
+          identityCase.storedAttemptNo ?? 1,
+          identityCase.storedContainerId ?? agentContainerId,
+        ],
+      );
+      await assert.rejects(
+        persistGatewayLiveFrame(pool, {
+          uid: BigInt(identityCase.uid),
+          sessionId: caseSessionId,
+          clientMessageId,
+          agentContainerId,
+          sessionKey: caseSessionKey,
+          frameSeq: 1,
+          payload: JSON.stringify({ type: "outbound.message", sessionKey: caseSessionKey, frameSeq: 1 }),
+        }),
+        /live frame stream identity conflict/,
+        `${identityCase.label} drift must remain rejected`,
+      );
+    }
+  });
+
+  maybe("interrupted tape finalize also projects an existing live stream to tape", async () => {
+    const sessionId = "s-live-frame-interrupted-projection";
+    const userId = "c:904";
+    const sessionKey = `agent:main:webchat:dm:${sessionId}`;
+    const clientMessageId = "cm-interrupted";
+    const dispatchId = randomUUID();
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    await pool.query(
+      `INSERT INTO turn_dispatches
+         (dispatch_id,user_id,session_id,client_message_id,agent_id,request_hash,
+          billing_request_id,status,outcome,owner_id,lease_until)
+       VALUES ($1,904,$2,$3,'main',$4,$5,'terminal','interrupted','test-owner',NOW()+INTERVAL '1 minute')`,
+      [dispatchId, sessionId, clientMessageId, "5".repeat(64), `billing-${dispatchId}`],
+    );
+    await persistGatewayLiveFrame(pool, {
+      uid: 904n,
+      sessionId,
+      clientMessageId,
+      agentContainerId: 446,
+      sessionKey,
+      frameSeq: 1,
+      payload: JSON.stringify({
+        type: "outbound.message",
+        sessionKey,
+        frameSeq: 1,
+        peer: { id: sessionId, kind: "dm" },
+        clientMessageId,
+        blocks: [{ kind: "text", text: "partial work" }],
+      }),
+    });
+    const live = await readClientSessionLiveFrames(pool, sessionId, userId, 0, 10);
+    assert.ok(live);
+    assert.equal(live.frames.length, 0, "terminal dispatch is not on the hot path");
+    assert.deepEqual(live.streamClientMessageIds, []);
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await reconcileLiveStreamWithFinalTape(client, {
+        dispatchId,
+        status: "interrupted",
+        tapeId: "e".repeat(64),
+        tapeSha256: "f".repeat(64),
+      });
+      await client.query("COMMIT");
+    } finally {
+      client.release();
+    }
+    const projected = await readClientSessionLiveFrames(pool, sessionId, userId, 0, 10);
+    assert.ok(projected);
+    assert.deepEqual(projected.frames, []);
+    assert.deepEqual(projected.streamClientMessageIds, []);
+    assert.equal(projected.hasTapeProjection, true);
+    assert.equal(projected.tapeProjectionVersion, 1);
+  });
+
+  maybe("first frame after an already-finalized abnormal tape mints a tape stream, not a live orphan", async () => {
+    // Crash-before-first-frame: the tape finalizes while no live stream row
+    // exists yet; the terminal frame that arrives afterwards must not create a
+    // permanent projection_source='live' row the startup convergence can never
+    // match (it would have no tape_id).
+    const sessionId = "s-live-frame-late-first-frame";
+    const userId = "c:905";
+    const sessionKey = `agent:main:webchat:dm:${sessionId}`;
+    const clientMessageId = "cm-late-first";
+    const dispatchId = randomUUID();
+    const tapeId = "9".repeat(64);
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    await pool.query(
+      `INSERT INTO turn_dispatches
+         (dispatch_id,user_id,session_id,client_message_id,agent_id,request_hash,
+          billing_request_id,status,outcome,owner_id,lease_until)
+       VALUES ($1,905,$2,$3,'main',$4,$5,'terminal','interrupted','test-owner',NOW()+INTERVAL '1 minute')`,
+      [dispatchId, sessionId, clientMessageId, "6".repeat(64), `billing-${dispatchId}`],
+    );
+    await pool.query(
+      `INSERT INTO client_session_turn_tapes
+         (session_id,user_id,tape_id,agent_id,turn_index,status,turn_key,tape_sha256,
+          total_bytes,part_count,created_at,finalized_at,dispatch_id,attempt_no,client_message_id)
+       VALUES ($1,$2,$3,'main',1,'interrupted',$4,$5,10,1,1,1,$6::uuid,1,$7)`,
+      [sessionId, userId, tapeId, "7".repeat(64), "8".repeat(64), dispatchId, clientMessageId],
+    );
+    await persistGatewayLiveFrame(pool, {
+      uid: 905n,
+      sessionId,
+      clientMessageId,
+      agentContainerId: 447,
+      sessionKey,
+      frameSeq: 1,
+      payload: JSON.stringify({
+        type: "outbound.message",
+        sessionKey,
+        frameSeq: 1,
+        peer: { id: sessionId, kind: "dm" },
+        clientMessageId,
+        blocks: [{ kind: "text", text: "terminal error frame" }],
+      }),
+    });
+    const streamRow = (
+      await pool.query<{
+        projection_source: string;
+        terminal_status: string | null;
+        tape_id: string | null;
+        tape_sha256: string | null;
+      }>(
+        `SELECT projection_source,terminal_status,tape_id,tape_sha256
+           FROM client_session_live_streams
+          WHERE session_id=$1 AND user_id=$2`,
+        [sessionId, userId],
+      )
+    ).rows[0];
+    assert.ok(streamRow);
+    assert.equal(streamRow.projection_source, "tape");
+    assert.equal(streamRow.terminal_status, "interrupted");
+    assert.equal(streamRow.tape_id, tapeId);
+    assert.equal(streamRow.tape_sha256, "8".repeat(64));
+
+    const page = await readClientSessionLiveFrames(pool, sessionId, userId, 0, 10);
+    assert.ok(page);
+    assert.deepEqual(page.frames, []);
+    assert.deepEqual(page.streamClientMessageIds, []);
+    assert.equal(page.hasTapeProjection, true);
+    assert.equal(page.tapeProjectionVersion, 1);
+  });
+
+  maybe("persist and finalize serialize on the dispatch row (late-first-frame race)", async () => {
+    // Real interleaving through production code: a frame-writer holds the
+    // dispatch row (persist's first statement), a finalize transaction (tape
+    // insert + the same dispatch lock + reconcile) must block on that lock —
+    // proven via pg_locks, not a timer — and once it commits, the production
+    // persistGatewayLiveFrame must mint an already-projected tape stream.
+    const sessionId = "s-live-frame-race-barrier";
+    const userId = "c:907";
+    const sessionKey = `agent:main:webchat:dm:${sessionId}`;
+    const clientMessageId = "cm-race";
+    const dispatchId = randomUUID();
+    const tapeId = "1".repeat(64);
+    const tapeSha256 = "2".repeat(64);
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    await pool.query(
+      `INSERT INTO turn_dispatches
+         (dispatch_id,user_id,session_id,client_message_id,agent_id,request_hash,
+          billing_request_id,status,outcome,owner_id,lease_until)
+       VALUES ($1,907,$2,$3,'main',$4,$5,'terminal','interrupted','test-owner',NOW()+INTERVAL '1 minute')`,
+      [dispatchId, sessionId, clientMessageId, "8".repeat(64), `billing-${dispatchId}`],
+    );
+
+    const holder = await pool.connect();
+    try {
+      await holder.query("BEGIN");
+      // Same first statement as persistGatewayLiveFrame's writer path.
+      await holder.query(
+        `SELECT dispatch_id::text FROM turn_dispatches
+          WHERE user_id=$1 AND session_id=$2 AND client_message_id=$3 FOR UPDATE`,
+        ["907", sessionId, clientMessageId],
+      );
+
+      let finalizeSettled = false;
+      const finalize = (async () => {
+        const c2 = await pool.connect();
+        try {
+          await c2.query("BEGIN");
+          await c2.query(
+            `INSERT INTO client_session_turn_tapes
+               (session_id,user_id,tape_id,agent_id,turn_index,status,turn_key,tape_sha256,
+                total_bytes,part_count,created_at,finalized_at,dispatch_id,attempt_no,client_message_id)
+             VALUES ($1,$2,$3,'main',1,'interrupted',$4,$5,10,1,1,1,$6::uuid,1,$7)`,
+            [sessionId, userId, tapeId, "3".repeat(64), tapeSha256, dispatchId, clientMessageId],
+          );
+          // Same lock protocol as convergeDispatchOnFinalize.
+          await c2.query(`SELECT 1 FROM turn_dispatches WHERE dispatch_id=$1::uuid FOR UPDATE`, [
+            dispatchId,
+          ]);
+          await reconcileLiveStreamWithFinalTape(c2, {
+            dispatchId,
+            status: "interrupted",
+            tapeId,
+            tapeSha256,
+          });
+          await c2.query("COMMIT");
+        } catch (err) {
+          try { await c2.query("ROLLBACK"); } catch { /* connection-level failure */ }
+          throw err;
+        } finally {
+          c2.release();
+        }
+      })().then(() => {
+        finalizeSettled = true;
+      });
+
+      let blockedLocks = 0;
+      for (let probe = 0; probe < 20 && blockedLocks === 0; probe += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        blockedLocks = Number(
+          (
+            await pool.query<{ count: string }>(
+              "SELECT COUNT(*)::text AS count FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND pid <> pg_backend_pid()",
+            )
+          ).rows[0]?.count ?? "0",
+        );
+      }
+      assert.ok(blockedLocks > 0, "finalize should be blocked on the dispatch row lock");
+      assert.equal(finalizeSettled, false);
+
+      await holder.query("ROLLBACK");
+      await finalize;
+
+      // Production writer runs AFTER the finalize committed: its tape probe
+      // statement must observe the committed tape through its fresh snapshot.
+      await persistGatewayLiveFrame(pool, {
+        uid: 907n,
+        sessionId,
+        clientMessageId,
+        agentContainerId: 448,
+        sessionKey,
+        frameSeq: 1,
+        payload: JSON.stringify({
+          type: "outbound.message",
+          sessionKey,
+          frameSeq: 1,
+          peer: { id: sessionId, kind: "dm" },
+          clientMessageId,
+          blocks: [{ kind: "text", text: "post-finalize frame" }],
+        }),
+      });
+      const streamRow = (
+        await pool.query<{
+          projection_source: string;
+          terminal_status: string | null;
+          tape_id: string | null;
+          tape_sha256: string | null;
+        }>(
+          `SELECT projection_source,terminal_status,tape_id,tape_sha256
+             FROM client_session_live_streams
+            WHERE session_id=$1 AND user_id=$2`,
+          [sessionId, userId],
+        )
+      ).rows[0];
+      assert.ok(streamRow);
+      assert.equal(streamRow.projection_source, "tape");
+      assert.equal(streamRow.terminal_status, "interrupted");
+      assert.equal(streamRow.tape_id, tapeId);
+      assert.equal(streamRow.tape_sha256, tapeSha256);
+    } finally {
+      holder.release();
+    }
+  });
+
+  maybe("a frame writer waiting behind a finalize commit still mints a tape stream", async () => {
+    // The critical interleaving from the review: finalize holds the dispatch
+    // row, the PRODUCTION persistGatewayLiveFrame starts and blocks on its
+    // FOR UPDATE, finalize commits (tape now durable), then the writer acquires
+    // the lock and its tape-probe statement — a fresh READ COMMITTED snapshot
+    // — must observe the tape. A regression back to a single locked statement
+    // would keep the pre-wait snapshot, mint a live orphan, and fail here.
+    const sessionId = "s-live-frame-race-finalize-first";
+    const userId = "c:908";
+    const sessionKey = `agent:main:webchat:dm:${sessionId}`;
+    const clientMessageId = "cm-race-fin";
+    const dispatchId = randomUUID();
+    const tapeId = "4".repeat(64);
+    const tapeSha256 = "5".repeat(64);
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    await pool.query(
+      `INSERT INTO turn_dispatches
+         (dispatch_id,user_id,session_id,client_message_id,agent_id,request_hash,
+          billing_request_id,status,outcome,owner_id,lease_until)
+       VALUES ($1,908,$2,$3,'main',$4,$5,'terminal','interrupted','test-owner',NOW()+INTERVAL '1 minute')`,
+      [dispatchId, sessionId, clientMessageId, "9".repeat(64), `billing-${dispatchId}`],
+    );
+
+    const finalizer = await pool.connect();
+    let persistSettled = false;
+    try {
+      await finalizer.query("BEGIN");
+      await finalizer.query(
+        `INSERT INTO client_session_turn_tapes
+           (session_id,user_id,tape_id,agent_id,turn_index,status,turn_key,tape_sha256,
+            total_bytes,part_count,created_at,finalized_at,dispatch_id,attempt_no,client_message_id)
+         VALUES ($1,$2,$3,'main',1,'interrupted',$4,$5,10,1,1,1,$6::uuid,1,$7)`,
+        [sessionId, userId, tapeId, "6".repeat(64), tapeSha256, dispatchId, clientMessageId],
+      );
+      await finalizer.query(`SELECT 1 FROM turn_dispatches WHERE dispatch_id=$1::uuid FOR UPDATE`, [
+        dispatchId,
+      ]);
+
+      const persist = persistGatewayLiveFrame(pool, {
+        uid: 908n,
+        sessionId,
+        clientMessageId,
+        agentContainerId: 449,
+        sessionKey,
+        frameSeq: 1,
+        payload: JSON.stringify({
+          type: "outbound.message",
+          sessionKey,
+          frameSeq: 1,
+          peer: { id: sessionId, kind: "dm" },
+          clientMessageId,
+          blocks: [{ kind: "text", text: "frame during finalize" }],
+        }),
+      }).then(() => {
+        persistSettled = true;
+      });
+
+      let blockedLocks = 0;
+      for (let probe = 0; probe < 20 && blockedLocks === 0; probe += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        blockedLocks = Number(
+          (
+            await pool.query<{ count: string }>(
+              "SELECT COUNT(*)::text AS count FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND pid <> pg_backend_pid()",
+            )
+          ).rows[0]?.count ?? "0",
+        );
+      }
+      assert.ok(blockedLocks > 0, "production persist should be blocked on the dispatch row lock");
+      assert.equal(persistSettled, false);
+
+      await reconcileLiveStreamWithFinalTape(finalizer, {
+        dispatchId,
+        status: "interrupted",
+        tapeId,
+        tapeSha256,
+      });
+      await finalizer.query("COMMIT");
+      await persist;
+      assert.equal(persistSettled, true);
+
+      const streamRow = (
+        await pool.query<{
+          projection_source: string;
+          terminal_status: string | null;
+          tape_id: string | null;
+          tape_sha256: string | null;
+        }>(
+          `SELECT projection_source,terminal_status,tape_id,tape_sha256
+             FROM client_session_live_streams
+            WHERE session_id=$1 AND user_id=$2`,
+          [sessionId, userId],
+        )
+      ).rows[0];
+      assert.ok(streamRow);
+      assert.equal(streamRow.projection_source, "tape");
+      assert.equal(streamRow.terminal_status, "interrupted");
+      assert.equal(streamRow.tape_id, tapeId);
+      assert.equal(streamRow.tape_sha256, tapeSha256);
+    } finally {
+      finalizer.release();
+    }
+  });
+
+  maybe("convergeFinalizedTapeLiveStreams sweeps only finalized abnormal streams, idempotently", async () => {
+    const sessionId = "s-live-frame-converge";
+    const userId = "c:906";
+    const lateTapeDispatchId = randomUUID();
+    const lateTapeId = "d".repeat(64);
+    const backfilledDispatchId = randomUUID();
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    await pool.query(
+      `INSERT INTO turn_dispatches
+         (dispatch_id,user_id,session_id,client_message_id,agent_id,request_hash,
+          billing_request_id,status,outcome,owner_id,lease_until)
+       VALUES ($1,906,$2,'cm-converge-late','main',$3,$4,'terminal','interrupted','test-owner',NOW()+INTERVAL '1 minute'),
+              ($5,906,$2,'cm-converge-a','main',$6,$7,'terminal','interrupted','test-owner',NOW()+INTERVAL '1 minute')`,
+      [
+        lateTapeDispatchId,
+        sessionId,
+        "e".repeat(64),
+        `billing-${lateTapeDispatchId}`,
+        backfilledDispatchId,
+        "1".repeat(64),
+        `billing-${backfilledDispatchId}`,
+      ],
+    );
+    await pool.query(
+      `INSERT INTO client_session_turn_tapes
+         (session_id,user_id,tape_id,agent_id,turn_index,status,turn_key,tape_sha256,
+          total_bytes,part_count,created_at,finalized_at,dispatch_id,attempt_no,client_message_id)
+       VALUES ($1,$2,$3,'main',1,'interrupted',$4,$5,10,1,1,1,$6::uuid,1,'cm-converge-late'),
+              ($1,$2,$7,'main',2,'interrupted',$8,$9,10,1,1,1,$10::uuid,1,'cm-converge-a')`,
+      [
+        sessionId,
+        userId,
+        lateTapeId,
+        "f".repeat(64),
+        "0".repeat(64),
+        lateTapeDispatchId,
+        "a".repeat(64),
+        "2".repeat(64),
+        "3".repeat(64),
+        backfilledDispatchId,
+      ],
+    );
+    // conv-a: pre-fix shape — reconcile backfilled terminal_status+tape_id but
+    // the old CASE kept projection_source='live' (needs dispatch linkage).
+    // conv-e: tape_id-less orphan whose dispatch got its tape finalized later —
+    // the exact backlog shape the startup convergence must also repair.
+    await pool.query(
+      `INSERT INTO client_session_live_streams
+         (stream_key,session_id,user_id,source,projection_source,terminal_status,tape_id,
+          dispatch_id,attempt_no,import_sha256)
+       VALUES
+         ('conv-a',$1,$2,'gateway','live','interrupted',$3,$4::uuid,1,NULL),
+         ('conv-b',$1,$2,'gateway','live',NULL,NULL,NULL,NULL,NULL),
+         ('conv-c',$1,$2,'gateway','live','interrupted',NULL,NULL,NULL,NULL),
+         ('conv-d',$1,$2,'rollout_import','live','crashed',$5,NULL,NULL,$6),
+         ('conv-e',$1,$2,'gateway','live',NULL,NULL,$7::uuid,1,NULL)`,
+      [
+        sessionId,
+        userId,
+        "a".repeat(64),
+        backfilledDispatchId,
+        "b".repeat(64),
+        "c".repeat(64),
+        lateTapeDispatchId,
+      ],
+    );
+    const first = await convergeFinalizedTapeLiveStreams(pool);
+    assert.equal(first.converged, 2);
+    const states = new Map(
+      (
+        await pool.query<{
+          stream_key: string;
+          projection_source: string;
+          terminal_status: string | null;
+          tape_id: string | null;
+          tape_sha256: string | null;
+        }>(
+          `SELECT stream_key,projection_source,terminal_status,tape_id,tape_sha256
+             FROM client_session_live_streams
+            WHERE session_id=$1 AND user_id=$2`,
+          [sessionId, userId],
+        )
+      ).rows.map((row) => [row.stream_key, row]),
+    );
+    assert.equal(states.get("conv-a")?.projection_source, "tape");
+    assert.equal(states.get("conv-b")?.projection_source, "live");
+    assert.equal(states.get("conv-c")?.projection_source, "live");
+    assert.equal(states.get("conv-d")?.projection_source, "live");
+    assert.equal(states.get("conv-e")?.projection_source, "tape");
+    assert.equal(states.get("conv-e")?.terminal_status, "interrupted");
+    assert.equal(states.get("conv-e")?.tape_id, lateTapeId);
+    assert.equal(states.get("conv-e")?.tape_sha256, "0".repeat(64));
+    const second = await convergeFinalizedTapeLiveStreams(pool);
+    assert.equal(second.converged, 0);
+  });
+
+  maybe("hides leftover live journals whose client_message_id already has a completed tape", async () => {
+    const sessionId = "s-live-frame-completed-cmid-hide";
+    const userId = "c:926";
+    const sessionKey = "agent:main:webchat:dm:s-live-frame-completed-cmid-hide";
+    const tapeId = "e".repeat(64);
+    const leftoverCmid = "ask-ans-completed-cmid";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    await pool.query(
+      `INSERT INTO client_session_turn_tapes
+         (session_id,user_id,tape_id,agent_id,turn_index,status,turn_key,tape_sha256,
+          total_bytes,part_count,created_at,finalized_at,client_message_id)
+       VALUES ($1,$2,$3,'main',1,'completed',$4,$5,10,1,1,1,$6)`,
+      [sessionId, userId, tapeId, "f".repeat(64), "0".repeat(64), leftoverCmid],
+    );
+    await pool.query(
+      `INSERT INTO client_session_live_streams
+         (stream_key,session_id,user_id,client_message_id,source,projection_source,terminal_status)
+       VALUES ($1,$2,$3,$4,'gateway','live','interrupted')`,
+      [`legacy:26:${sessionKey}`, sessionId, userId, leftoverCmid],
+    );
+    await pool.query(
+      `INSERT INTO client_session_live_frames
+         (stream_key,source,agent_container_id,session_key,frame_seq,payload,payload_sha256)
+       VALUES ($1,'gateway',26,$2,811,$3,$4)`,
+      [
+        `legacy:26:${sessionKey}`,
+        sessionKey,
+        Buffer.from(JSON.stringify({
+          type: "outbound.error",
+          code: "upstream_failed",
+          clientMessageId: leftoverCmid,
+        })),
+        "a".repeat(64),
+      ],
+    );
+    const before = await readClientSessionLiveFrames(pool, sessionId, userId, 0, 10);
+    assert.ok(before);
+    assert.equal(before.frames.length, 0);
+    assert.deepEqual(before.streamClientMessageIds, []);
+    const first = await convergeFinalizedTapeLiveStreams(pool);
+    assert.equal(first.converged, 1);
+    const state = await pool.query(
+      `SELECT projection_source,tape_id FROM client_session_live_streams
+        WHERE session_id=$1 AND user_id=$2`,
+      [sessionId, userId],
+    );
+    assert.equal(state.rows[0]?.projection_source, "tape");
+    assert.equal(state.rows[0]?.tape_id, tapeId);
+    const second = await convergeFinalizedTapeLiveStreams(pool);
+    assert.equal(second.converged, 0);
   });
 
   maybe("keeps later dispatches and server-authored frames durable after a frame sequence restart", async () => {
@@ -3866,7 +4695,7 @@ describe("durable live turn frame journal", () => {
     assert.ok(page);
     assert.deepEqual(
       page.frames.map((frame) => frame.payload),
-      [JSON.parse(firstPayload), JSON.parse(secondPayload), JSON.parse(serverAuthoredPayload)],
+      [JSON.parse(firstPayload), JSON.parse(secondPayload)],
     );
     assert.deepEqual(page.streamClientMessageIds, ["cm-reset-first", "cm-reset-second"]);
   });
@@ -3909,146 +4738,573 @@ describe("durable live turn frame journal", () => {
     );
     const page = await readClientSessionLiveFrames(pool, sessionId, userId, 0, 10);
     assert.ok(page);
-    assert.equal(page.frames.length, 2);
-    assert.deepEqual(page.frames.map((frame) => frame.payload), payloads.map((value) => JSON.parse(value)));
+    assert.equal(page.frames.length, 0, "terminal rollout import is not on the hot live-frames path");
+    assert.deepEqual(page.streamClientMessageIds, []);
 
     await pool.query("DELETE FROM client_sessions WHERE id=$1 AND user_id=$2", [sessionId, userId]);
     const rows = await pool.query("SELECT 1 FROM client_session_live_frames");
     assert.equal(rows.rowCount, 0, "session deletion owns journal retention via cascade");
   });
 
-  maybe("legacy stream accepts a later non-null client_message_id without identity conflict", async () => {
-    const sessionId = "s-live-legacy-identity";
+  maybe("pruneProjectedLiveFrames deletes recorded tape frames, keeps tapeless tape and live", async () => {
     const userId = "c:911";
-    const clientMessageId = "ask-ans-legacy-1";
-    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
-    const sessionKey = "agent:main:webchat:dm:s-live-legacy-identity";
-    const base = {
-      uid: 911n,
-      sessionId,
-      agentContainerId: 511,
-      sessionKey,
+    const recorded = {
+      sessionId: "s-prune-recorded-tape",
+      dispatchId: randomUUID(),
+      tapeId: "a1".repeat(32),
+      tapeSha: "b1".repeat(32),
+      clientMessageId: "cm-prune-recorded",
     };
-    const payloadNull = JSON.stringify({
-      type: "outbound.message",
-      sessionKey,
-      frameSeq: 1,
-      peer: { id: sessionId, kind: "dm" },
-      blocks: [{ kind: "text", text: "server authored" }],
-    });
-    const payloadId = JSON.stringify({
-      type: "outbound.message",
-      sessionKey,
-      frameSeq: 2,
-      peer: { id: sessionId, kind: "dm" },
-      clientMessageId,
-      blocks: [{ kind: "text", text: "user turn" }],
-    });
-    await persistGatewayLiveFrame(pool, {
-      ...base,
-      clientMessageId: null,
-      frameSeq: 1,
-      payload: payloadNull,
-    });
-    await persistGatewayLiveFrame(pool, {
-      ...base,
-      clientMessageId,
-      frameSeq: 2,
-      payload: payloadId,
-    });
-
-    const streams = await pool.query<{ stream_key: string; client_message_id: string | null }>(
-      `SELECT stream_key,client_message_id
-         FROM client_session_live_streams
-        WHERE agent_container_id=$1 AND stream_key LIKE 'legacy:%'`,
-      [base.agentContainerId],
+    const tapeless = {
+      sessionId: "s-prune-tapeless-tape",
+      dispatchId: randomUUID(),
+      tapeId: "a2".repeat(32),
+      tapeSha: "b2".repeat(32),
+      clientMessageId: "cm-prune-tapeless",
+    };
+    const live = {
+      sessionId: "s-prune-keep-live",
+      dispatchId: randomUUID(),
+      clientMessageId: "cm-prune-live",
+    };
+    for (const spec of [recorded, tapeless, live]) {
+      await backend.upsertClientSession(mkSession({ id: spec.sessionId, userId }));
+      await pool.query(
+        `INSERT INTO turn_dispatches
+           (dispatch_id,user_id,session_id,client_message_id,agent_id,request_hash,
+            billing_request_id,status,owner_id,lease_until)
+         VALUES ($1,911,$2,$3,'main',$4,$5,'accepted','test-owner',NOW()+INTERVAL '1 minute')`,
+        [spec.dispatchId, spec.sessionId, spec.clientMessageId, "9".repeat(64), `billing-${spec.dispatchId}`],
+      );
+      await persistGatewayLiveFrame(pool, {
+        uid: 911n,
+        sessionId: spec.sessionId,
+        clientMessageId: spec.clientMessageId,
+        agentContainerId: 460,
+        sessionKey: `agent:main:webchat:dm:${spec.sessionId}`,
+        frameSeq: 1,
+        payload: JSON.stringify({
+          type: "outbound.message",
+          sessionKey: `agent:main:webchat:dm:${spec.sessionId}`,
+          frameSeq: 1,
+          peer: { id: spec.sessionId, kind: "dm" },
+          clientMessageId: spec.clientMessageId,
+          blocks: [{ kind: "text", text: spec.sessionId }],
+        }),
+      });
+    }
+    const project = async (dispatchId: string, tapeId: string, tapeSha: string) => {
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        await reconcileLiveStreamWithFinalTape(client, {
+          dispatchId,
+          status: "completed",
+          tapeId,
+          tapeSha256: tapeSha,
+        });
+        await client.query("COMMIT");
+      } finally {
+        client.release();
+      }
+    };
+    await project(recorded.dispatchId, recorded.tapeId, recorded.tapeSha);
+    await project(tapeless.dispatchId, tapeless.tapeId, tapeless.tapeSha);
+    const payload = Buffer.from(JSON.stringify({ id: "rec-1", role: "assistant", text: "kept" }));
+    await pool.query(
+      `INSERT INTO client_session_turn_tapes
+         (session_id,user_id,tape_id,agent_id,turn_index,status,turn_key,tape_sha256,
+          total_bytes,part_count,billing_anchor_id,created_at,finalized_at)
+       VALUES ($1,$2,$3,'main',1,'completed',$4,$5,$6,1,'rec-1',$7,$7)`,
+      [
+        recorded.sessionId,
+        userId,
+        recorded.tapeId,
+        "c1".repeat(32),
+        recorded.tapeSha,
+        payload.length,
+        Date.now(),
+      ],
     );
-    assert.equal(streams.rows.length, 1);
-    assert.equal(streams.rows[0]!.stream_key, `legacy:${base.agentContainerId}:${sessionKey}`);
-    assert.equal(streams.rows[0]!.client_message_id, clientMessageId);
-
-    const page = await readClientSessionLiveFrames(pool, sessionId, userId, 0, 10);
-    assert.ok(page);
-    assert.equal(page.frames.length, 2);
-    assert.ok(page.streamClientMessageIds.includes(clientMessageId));
-
-    const payloadNull2 = JSON.stringify({
-      type: "outbound.message",
-      sessionKey,
-      frameSeq: 3,
-      peer: { id: sessionId, kind: "dm" },
-      blocks: [{ kind: "text", text: "another server frame" }],
-    });
-    await persistGatewayLiveFrame(pool, {
-      ...base,
-      clientMessageId: null,
-      frameSeq: 3,
-      payload: payloadNull2,
-    });
-    const after = await pool.query<{ client_message_id: string | null }>(
-      `SELECT client_message_id FROM client_session_live_streams WHERE stream_key=$1`,
-      [`legacy:${base.agentContainerId}:${sessionKey}`],
+    await pool.query(
+      `INSERT INTO client_session_turn_tape_records
+         (session_id,user_id,tape_id,msg_id,ordinal,role,ts,content_sha256,payload)
+       VALUES ($1,$2,$3,'rec-1',0,'assistant',$4,$5,$6)`,
+      [recorded.sessionId, userId, recorded.tapeId, Date.now(), sha256(payload), payload],
     );
-    assert.equal(after.rows[0]!.client_message_id, clientMessageId);
+
+    const first = await pruneProjectedLiveFrames(pool, { batchSize: 10 });
+    assert.equal(first.deletedFrames, 1);
+    assert.equal(first.prunedStreams, 1);
+    const second = await pruneProjectedLiveFrames(pool, { batchSize: 10 });
+    assert.deepEqual(second, { deletedFrames: 0, prunedStreams: 0 });
+
+    const remaining = await pool.query<{ session_id: string; n: string }>(
+      `SELECT s.session_id,COUNT(*)::text AS n
+         FROM client_session_live_frames f
+         JOIN client_session_live_streams s ON s.stream_key=f.stream_key
+        WHERE s.session_id=ANY($1::text[])
+        GROUP BY s.session_id
+        ORDER BY s.session_id`,
+      [[recorded.sessionId, tapeless.sessionId, live.sessionId]],
+    );
+    assert.deepEqual(remaining.rows, [
+      { session_id: live.sessionId, n: "1" },
+      { session_id: tapeless.sessionId, n: "1" },
+    ]);
   });
 
-  maybe("dispatch stream identity guard still rejects a conflicting agent_container_id", async () => {
-    const sessionId = "s-live-dispatch-identity";
+  maybe("retireDeadLiveStreams retires dead live keys and never touches accepted or rollout", async () => {
     const userId = "c:912";
+    const dead = {
+      sessionId: "s-retire-dead-terminal",
+      dispatchId: randomUUID(),
+      clientMessageId: "cm-retire-dead",
+    };
+    const accepted = {
+      sessionId: "s-retire-accepted-inflight",
+      dispatchId: randomUUID(),
+      clientMessageId: "cm-retire-accepted",
+    };
+    const freshLegacySessionId = "s-retire-fresh-legacy";
+    await backend.upsertClientSession(mkSession({ id: dead.sessionId, userId }));
+    await backend.upsertClientSession(mkSession({ id: accepted.sessionId, userId }));
+    await backend.upsertClientSession(mkSession({ id: freshLegacySessionId, userId }));
+    await pool.query(
+      `INSERT INTO turn_dispatches
+         (dispatch_id,user_id,session_id,client_message_id,agent_id,request_hash,
+          billing_request_id,status,outcome,owner_id,lease_until,terminal_at)
+       VALUES ($1,912,$2,$3,'main',$4,$5,'terminal','interrupted','test-owner',NOW()-INTERVAL '3 hours',NOW()-INTERVAL '3 hours')`,
+      [dead.dispatchId, dead.sessionId, dead.clientMessageId, "d".repeat(64), `billing-${dead.dispatchId}`],
+    );
+    await pool.query(
+      `INSERT INTO turn_dispatches
+         (dispatch_id,user_id,session_id,client_message_id,agent_id,request_hash,
+          billing_request_id,status,owner_id,lease_until)
+       VALUES ($1,912,$2,$3,'main',$4,$5,'accepted','test-owner',NOW()+INTERVAL '10 minutes')`,
+      [accepted.dispatchId, accepted.sessionId, accepted.clientMessageId, "e".repeat(64), `billing-${accepted.dispatchId}`],
+    );
+    const persist = async (
+      sessionId: string,
+      clientMessageId: string | null,
+      containerId: number,
+    ) => {
+      await persistGatewayLiveFrame(pool, {
+        uid: 912n,
+        sessionId,
+        clientMessageId,
+        agentContainerId: containerId,
+        sessionKey: `agent:main:webchat:dm:${sessionId}`,
+        frameSeq: 1,
+        payload: JSON.stringify({
+          type: "outbound.message",
+          sessionKey: `agent:main:webchat:dm:${sessionId}`,
+          frameSeq: 1,
+          peer: { id: sessionId, kind: "dm" },
+          clientMessageId,
+          blocks: [{ kind: "text", text: sessionId }],
+        }),
+      });
+    };
+    await persist(dead.sessionId, dead.clientMessageId, 470);
+    await persist(accepted.sessionId, accepted.clientMessageId, 471);
+    await persist(freshLegacySessionId, null, 472);
+
+    const rolloutSessionId = "s-retire-rollout";
+    const rolloutDispatchId = randomUUID();
+    await backend.upsertClientSession(mkSession({ id: rolloutSessionId, userId }));
+    await pool.query(
+      `INSERT INTO turn_dispatches
+         (dispatch_id,user_id,session_id,client_message_id,agent_id,request_hash,
+          billing_request_id,status,outcome,terminal_at)
+       VALUES ($1,912,$2,'cm-retire-import','main',$3,$4,'terminal','crashed',NOW()-INTERVAL '3 hours')`,
+      [rolloutDispatchId, rolloutSessionId, "f".repeat(64), `billing-${rolloutDispatchId}`],
+    );
+    await importRolloutLiveFrames(pool, {
+      uid: 912n,
+      sessionId: rolloutSessionId,
+      clientMessageId: "cm-retire-import",
+      dispatchId: rolloutDispatchId,
+      attemptNo: 1,
+      rolloutSha256: "ab".repeat(32),
+      provenance: { threadId: "retire-import" },
+      payloads: [JSON.stringify({ type: "outbound.message", blocks: [{ kind: "text", text: "import" }] })],
+    });
+
+    await pool.query(
+      `UPDATE client_session_live_streams
+          SET updated_at=NOW()-INTERVAL '3 hours'
+        WHERE session_id=ANY($1::text[])`,
+      [[dead.sessionId, accepted.sessionId, rolloutSessionId]],
+    );
+
+    const first = await retireDeadLiveStreams(pool, { minAgeMs: 60 * 60 * 1000 });
+    assert.ok(first.retired >= 2, `expected dead + leftover retire, got ${first.retired}`);
+    const second = await retireDeadLiveStreams(pool, { minAgeMs: 60 * 60 * 1000 });
+    assert.equal(second.retired, 0);
+    const retiredFlags = Object.fromEntries(
+      (
+        await pool.query<{ session_id: string; retired: boolean }>(
+          `SELECT session_id,(provenance ? 'retired_at') AS retired
+             FROM client_session_live_streams
+            WHERE session_id=ANY($1::text[])`,
+          [[dead.sessionId, accepted.sessionId, freshLegacySessionId, rolloutSessionId]],
+        )
+      ).rows.map((row) => [row.session_id, row.retired]),
+    );
+    assert.equal(retiredFlags[dead.sessionId], true);
+    assert.equal(retiredFlags[freshLegacySessionId], true, "null-cmid leftover retires immediately");
+    assert.equal(retiredFlags[accepted.sessionId], false);
+    assert.equal(retiredFlags[rolloutSessionId], false);
+
+    const deadPage = await readClientSessionLiveFrames(pool, dead.sessionId, userId, 0, 10);
+    assert.ok(deadPage);
+    assert.equal(deadPage.frames.length, 0, "terminal dispatch is not on the hot path");
+    assert.deepEqual(deadPage.streamClientMessageIds, []);
+    assert.equal(deadPage.hasTapeProjection, false);
+    assert.equal(deadPage.tapeProjectionVersion, 0);
+    const deadFrames = await pool.query(
+      `SELECT 1 FROM client_session_live_frames f
+         JOIN client_session_live_streams s ON s.stream_key=f.stream_key
+        WHERE s.session_id=$1`,
+      [dead.sessionId],
+    );
+    assert.equal(deadFrames.rowCount, 1, "retire must keep frames for forensics");
+
+    const acceptedPage = await readClientSessionLiveFrames(pool, accepted.sessionId, userId, 0, 10);
+    assert.ok(acceptedPage);
+    assert.equal(acceptedPage.frames.length, 1);
+    assert.deepEqual(acceptedPage.streamClientMessageIds, [accepted.clientMessageId]);
+
+    const freshPage = await readClientSessionLiveFrames(pool, freshLegacySessionId, userId, 0, 10);
+    assert.ok(freshPage);
+    assert.equal(freshPage.frames.length, 0, "idle leftover without cmid is hidden from hydrate");
+    const leftoverKept = await pool.query(
+      `SELECT 1 FROM client_session_live_frames f
+         JOIN client_session_live_streams s ON s.stream_key=f.stream_key
+        WHERE s.session_id=$1`,
+      [freshLegacySessionId],
+    );
+    assert.equal(leftoverKept.rowCount, 1, "hide/retire must keep leftover frames");
+
+    const rolloutPage = await readClientSessionLiveFrames(pool, rolloutSessionId, userId, 0, 10);
+    assert.ok(rolloutPage);
+    assert.equal(rolloutPage.frames.length, 0, "terminal rollout is not on the hot path");
+    assert.deepEqual(rolloutPage.streamClientMessageIds, []);
+  });
+  maybe("retired dead stream with content frames still pages those frames but drops streamClientMessageIds", async () => {
+    const sessionId = "s-retire-keeps-content-frames";
+    const userId = "c:913";
+    const clientMessageId = "cm-retire-keeps-content";
+    const dispatchId = randomUUID();
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    await pool.query(
+      `INSERT INTO turn_dispatches
+         (dispatch_id,user_id,session_id,client_message_id,agent_id,request_hash,
+          billing_request_id,status,conflict_reason,owner_id,lease_until)
+       VALUES ($1,913,$2,$3,'main',$4,$5,'manual_reconcile','stale-live-orphan','test-owner',NOW()-INTERVAL '3 hours')`,
+      [dispatchId, sessionId, clientMessageId, "11".repeat(32), `billing-${dispatchId}`],
+    );
+    const payload1 = JSON.stringify({
+      type: "outbound.message",
+      sessionKey: `agent:main:webchat:dm:${sessionId}`,
+      frameSeq: 1,
+      peer: { id: sessionId, kind: "dm" },
+      clientMessageId,
+      blocks: [{ kind: "thinking", text: "only copy" }],
+    });
+    const payload2 = JSON.stringify({
+      type: "outbound.message",
+      sessionKey: `agent:main:webchat:dm:${sessionId}`,
+      frameSeq: 2,
+      peer: { id: sessionId, kind: "dm" },
+      clientMessageId,
+      blocks: [{ kind: "text", text: "sole surviving reply" }],
+    });
+    const base = {
+      uid: 913n,
+      sessionId,
+      clientMessageId,
+      agentContainerId: 480,
+      sessionKey: `agent:main:webchat:dm:${sessionId}`,
+    };
+    await persistGatewayLiveFrame(pool, { ...base, frameSeq: 1, payload: payload1 });
+    await persistGatewayLiveFrame(pool, { ...base, frameSeq: 2, payload: payload2 });
+    await pool.query(
+      `UPDATE client_session_live_streams SET updated_at=NOW()-INTERVAL '3 hours' WHERE session_id=$1`,
+      [sessionId],
+    );
+
+    const before = await readClientSessionLiveFrames(pool, sessionId, userId, 0, 10);
+    assert.ok(before);
+    assert.equal(before.frames.length, 0, "manual_reconcile is not an open dispatch");
+    assert.deepEqual(before.streamClientMessageIds, []);
+
+    assert.equal((await retireDeadLiveStreams(pool, { minAgeMs: 60 * 60 * 1000 })).retired, 1);
+
+    const after = await readClientSessionLiveFrames(pool, sessionId, userId, 0, 10);
+    assert.ok(after);
+    assert.equal(after.frames.length, 0);
+    assert.deepEqual(after.streamClientMessageIds, []);
+    assert.equal(after.hasTapeProjection, false);
+    assert.equal(after.tapeProjectionVersion, 0);
+    const kept = await pool.query(
+      `SELECT 1 FROM client_session_live_frames f
+         JOIN client_session_live_streams s ON s.stream_key=f.stream_key
+        WHERE s.session_id=$1`,
+      [sessionId],
+    );
+    assert.equal(kept.rowCount, 2, "retire must keep frames for forensics");
+  });
+
+  maybe("hides leftover live journals even while a session dispatch is in flight and when none are", async () => {
+    const userId = "c:940";
+    const inflight = {
+      sessionId: "s-leftover-read-inflight",
+      dispatchId: randomUUID(),
+    };
+    const idle = { sessionId: "s-leftover-read-idle" };
+    await backend.upsertClientSession(mkSession({ id: inflight.sessionId, userId }));
+    await backend.upsertClientSession(mkSession({ id: idle.sessionId, userId }));
+    await pool.query(
+      `INSERT INTO turn_dispatches
+         (dispatch_id,user_id,session_id,client_message_id,agent_id,request_hash,
+          billing_request_id,status,owner_id,lease_until)
+       VALUES ($1,940,$2,'cm-leftover-inflight','main',$3,$4,'accepted','test-owner',NOW()+INTERVAL '1 minute')`,
+      [inflight.dispatchId, inflight.sessionId, "a1".repeat(32), `billing-${inflight.dispatchId}`],
+    );
+    const persistLeftover = async (sessionId: string, containerId: number) => {
+      await persistGatewayLiveFrame(pool, {
+        uid: 940n,
+        sessionId,
+        clientMessageId: null,
+        agentContainerId: containerId,
+        sessionKey: `agent:main:webchat:dm:${sessionId}`,
+        frameSeq: 1,
+        payload: JSON.stringify({
+          type: "outbound.message",
+          sessionKey: `agent:main:webchat:dm:${sessionId}`,
+          frameSeq: 1,
+          peer: { id: sessionId, kind: "dm" },
+          blocks: [{ kind: "delegate_progress", phase: "start", text: sessionId }],
+        }),
+      });
+    };
+    await persistLeftover(inflight.sessionId, 540);
+    await persistLeftover(idle.sessionId, 541);
+
+    const inflightPage = await readClientSessionLiveFrames(pool, inflight.sessionId, userId, 0, 10);
+    assert.ok(inflightPage);
+    assert.equal(inflightPage.frames.length, 0, "in-flight leftover must not hydrate");
+    assert.deepEqual(inflightPage.streamClientMessageIds, []);
+    const inflightRows = await pool.query(
+      `SELECT 1 FROM client_session_live_frames f
+         JOIN client_session_live_streams s ON s.stream_key=f.stream_key
+        WHERE s.session_id=$1`,
+      [inflight.sessionId],
+    );
+    assert.equal(inflightRows.rowCount, 1, "hide must not delete leftover frames");
+
+    const idlePage = await readClientSessionLiveFrames(pool, idle.sessionId, userId, 0, 10);
+    assert.ok(idlePage);
+    assert.equal(idlePage.frames.length, 0, "idle leftover without cmid must not hydrate");
+    const idleRows = await pool.query(
+      `SELECT 1 FROM client_session_live_frames f
+         JOIN client_session_live_streams s ON s.stream_key=f.stream_key
+        WHERE s.session_id=$1`,
+      [idle.sessionId],
+    );
+    assert.equal(idleRows.rowCount, 1, "hide must not delete leftover frames");
+  });
+
+  maybe("returns current open dispatch live-frames and hides leftover on the same session", async () => {
+    const userId = "c:942";
+    const sessionId = "s-leftover-open-dispatch-frames";
     const dispatchId = randomUUID();
     await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
     await pool.query(
       `INSERT INTO turn_dispatches
          (dispatch_id,user_id,session_id,client_message_id,agent_id,request_hash,
           billing_request_id,status,owner_id,lease_until)
-       VALUES ($1,912,$2,'cm-dispatch-guard','main',$3,$4,'accepted','test-owner',NOW()+INTERVAL '1 minute')`,
-      [dispatchId, sessionId, "3".repeat(64), `billing-${dispatchId}`],
+       VALUES ($1,942,$2,'cm-open-dispatch','main',$3,$4,'accepted','test-owner',NOW()+INTERVAL '1 minute')`,
+      [dispatchId, sessionId, "a2".repeat(32), `billing-${dispatchId}`],
     );
-    const sessionKey = "agent:main:webchat:dm:s-live-dispatch-identity";
-    const payload = JSON.stringify({
-      type: "outbound.message",
+    const sessionKey = `agent:main:webchat:dm:${sessionId}`;
+    await persistGatewayLiveFrame(pool, {
+      uid: 942n,
+      sessionId,
+      clientMessageId: "cm-open-dispatch",
+      agentContainerId: 543,
       sessionKey,
       frameSeq: 1,
-      peer: { id: sessionId, kind: "dm" },
-      clientMessageId: "cm-dispatch-guard",
-      blocks: [{ kind: "text", text: "ok" }],
+      payload: JSON.stringify({
+        type: "outbound.message",
+        sessionKey,
+        frameSeq: 1,
+        peer: { id: sessionId, kind: "dm" },
+        clientMessageId: "cm-open-dispatch",
+        blocks: [{ kind: "thinking", text: "current dispatch" }],
+      }),
     });
     await persistGatewayLiveFrame(pool, {
-      uid: 912n,
+      uid: 942n,
       sessionId,
-      clientMessageId: "cm-dispatch-guard",
-      agentContainerId: 512,
+      clientMessageId: null,
+      agentContainerId: 544,
       sessionKey,
-      frameSeq: 1,
-      payload,
-    });
-    await assert.rejects(
-      persistGatewayLiveFrame(pool, {
-        uid: 912n,
-        sessionId,
-        clientMessageId: "cm-dispatch-guard",
-        agentContainerId: 513,
+      frameSeq: 2,
+      payload: JSON.stringify({
+        type: "outbound.message",
         sessionKey,
         frameSeq: 2,
+        peer: { id: sessionId, kind: "dm" },
+        blocks: [{ kind: "delegate_progress", phase: "start", text: "leftover" }],
+      }),
+    });
+    const page = await readClientSessionLiveFrames(pool, sessionId, userId, 0, 10);
+    assert.ok(page);
+    assert.equal(page.frames.length, 1, "current dispatch frames still hydrate");
+    assert.equal(page.frames[0]!.streamKey, `dispatch:${dispatchId}:1`);
+    assert.equal(
+      (page.frames[0]!.payload as { blocks: Array<{ text: string }> }).blocks[0]!.text,
+      "current dispatch",
+    );
+    assert.deepEqual(page.streamClientMessageIds, ["cm-open-dispatch"]);
+    assert.equal(page.hasMoreBefore, false);
+    const leftoverRows = await pool.query(
+      `SELECT 1 FROM client_session_live_frames WHERE stream_key LIKE 'legacy:%' AND session_key=$1`,
+      [sessionKey],
+    );
+    assert.equal(leftoverRows.rowCount, 1, "leftover frames stay in the table");
+  });
+
+  maybe("seek=tail returns last page; oversized after=0 pages forward from the head", async () => {
+    const userId = "c:943";
+    const sessionId = "s-live-frames-tail-hasMoreBefore";
+    const dispatchId = randomUUID();
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    await pool.query(
+      `INSERT INTO turn_dispatches
+         (dispatch_id,user_id,session_id,client_message_id,agent_id,request_hash,
+          billing_request_id,status,owner_id,lease_until)
+       VALUES ($1,943,$2,'cm-tail','main',$3,$4,'accepted','test-owner',NOW()+INTERVAL '1 minute')`,
+      [dispatchId, sessionId, "a3".repeat(32), `billing-${dispatchId}`],
+    );
+    const sessionKey = `agent:main:webchat:dm:${sessionId}`;
+    const persist = async (frameSeq: number, text: string) => {
+      await persistGatewayLiveFrame(pool, {
+        uid: 943n,
+        sessionId,
+        clientMessageId: "cm-tail",
+        agentContainerId: 545,
+        sessionKey,
+        frameSeq,
         payload: JSON.stringify({
           type: "outbound.message",
           sessionKey,
-          frameSeq: 2,
+          frameSeq,
           peer: { id: sessionId, kind: "dm" },
-          clientMessageId: "cm-dispatch-guard",
-          blocks: [{ kind: "text", text: "conflict" }],
+          clientMessageId: "cm-tail",
+          blocks: [{ kind: "text", text }],
         }),
-      }),
-      (error: unknown) => {
-        assert.ok(error instanceof Error);
-        assert.match(error.message, /live frame stream identity conflict/);
-        assert.equal(
-          (error as { liveFramePermanentConflict?: unknown }).liveFramePermanentConflict,
-          true,
-        );
-        return true;
-      },
+      });
+    };
+    for (let seq = 1; seq <= 5; seq += 1) await persist(seq, `token-${seq}`);
+
+    const tail = await readClientSessionLiveFrames(pool, sessionId, userId, 0, 2, { seekTail: true });
+    assert.ok(tail);
+    assert.equal(tail.frames.length, 2);
+    assert.deepEqual(
+      tail.frames.map((frame) => (frame.payload as { blocks: Array<{ text: string }> }).blocks[0]!.text),
+      ["token-4", "token-5"],
     );
+    assert.equal(tail.hasMore, false);
+    assert.equal(tail.hasMoreBefore, true);
+    assert.deepEqual(tail.streamClientMessageIds, ["cm-tail"]);
+
+    const streamKey = `dispatch:${dispatchId}:1`;
+    const values: string[] = [];
+    const params: Array<string | number> = [streamKey, sessionKey];
+    for (let seq = 6; seq <= 210; seq += 1) {
+      const payload = JSON.stringify({
+        type: "outbound.message",
+        sessionKey,
+        frameSeq: seq,
+        peer: { id: sessionId, kind: "dm" },
+        clientMessageId: "cm-tail",
+        blocks: [{ kind: "text", text: `token-${seq}` }],
+      });
+      values.push(`($1,'gateway',545,$2,${seq},convert_to($${params.length + 1},'UTF8'),$${params.length + 2})`);
+      params.push(payload, seq.toString(16).padStart(64, "0"));
+    }
+    await pool.query(
+      `INSERT INTO client_session_live_frames
+         (stream_key,source,agent_container_id,session_key,frame_seq,payload,payload_sha256)
+       VALUES ${values.join(",")}`,
+      params,
+    );
+    const oversized = await readClientSessionLiveFrames(pool, sessionId, userId, 0, 10);
+    assert.ok(oversized);
+    assert.equal(oversized.frames.length, 10, "after=0 on a large current dispatch pages from the head");
+    assert.equal(oversized.hasMore, true);
+    assert.equal(oversized.hasMoreBefore, false);
+    assert.deepEqual(
+      oversized.frames.map((frame) => (frame.payload as { blocks: Array<{ text: string }> }).blocks[0]!.text),
+      Array.from({ length: 10 }, (_, i) => `token-${1 + i}`),
+    );
+  });
+
+  maybe("retireDeadLiveStreams immediately retires null-cmid leftover with no in-flight dispatch and keeps frames", async () => {
+    const sessionId = "s-leftover-retire-now";
+    const userId = "c:941";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    await persistGatewayLiveFrame(pool, {
+      uid: 941n,
+      sessionId,
+      clientMessageId: null,
+      agentContainerId: 542,
+      sessionKey: `agent:main:webchat:dm:${sessionId}`,
+      frameSeq: 1,
+      payload: JSON.stringify({
+        type: "outbound.message",
+        sessionKey: `agent:main:webchat:dm:${sessionId}`,
+        frameSeq: 1,
+        peer: { id: sessionId, kind: "dm" },
+        blocks: [{ kind: "delegate_progress", phase: "start", text: "leftover" }],
+      }),
+    });
+    const before = await pool.query<{ retired: boolean }>(
+      `SELECT (provenance ? 'retired_at') AS retired
+         FROM client_session_live_streams
+        WHERE session_id=$1 AND user_id=$2`,
+      [sessionId, userId],
+    );
+    assert.equal(before.rows[0]?.retired, false);
+    // leftover is brand new — aged path (2h / 1h minAge) must not be what retires it
+    const first = await retireDeadLiveStreams(pool, { minAgeMs: 60 * 60 * 1000 });
+    assert.ok(first.retired >= 1);
+    const state = await pool.query<{ retired: boolean }>(
+      `SELECT (provenance ? 'retired_at') AS retired
+         FROM client_session_live_streams
+        WHERE session_id=$1 AND user_id=$2`,
+      [sessionId, userId],
+    );
+    assert.equal(state.rows[0]?.retired, true);
+    const frames = await pool.query(
+      `SELECT 1 FROM client_session_live_frames f
+         JOIN client_session_live_streams s ON s.stream_key=f.stream_key
+        WHERE s.session_id=$1`,
+      [sessionId],
+    );
+    assert.equal(frames.rowCount, 1, "retire must keep leftover frames in table");
+    await retireDeadLiveStreams(pool, { minAgeMs: 60 * 60 * 1000 });
+    const state2 = await pool.query<{ retired: boolean }>(
+      `SELECT (provenance ? 'retired_at') AS retired
+         FROM client_session_live_streams
+        WHERE session_id=$1 AND user_id=$2`,
+      [sessionId, userId],
+    );
+    assert.equal(state2.rows[0]?.retired, true);
   });
 });
 
@@ -4432,6 +5688,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     automaticRecovery?: boolean;
     inlineError?: boolean;
     record?: MessageLike;
+    records?: MessageLike[];
     tapeStatus?: "completed" | "crashed" | "interrupted";
     waiveReason?: "idle_timeout" | "turn_limit" | null;
   }): Promise<void> {
@@ -4489,29 +5746,50 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
         args.waiveReason ?? null,
       ],
     );
-    const record = args.record ?? {
+    let records: MessageLike[] = args.records ?? [args.record ?? {
       id: `thinking-${args.sourceClientMessageId}`,
       role: "thinking",
       text: "durable process",
       ts: 2,
       _clientMessageId: args.sourceClientMessageId,
-    };
-    const payload = Buffer.from(JSON.stringify(record), "utf8");
-    await pool.query(
-      `INSERT INTO client_session_turn_tape_records
-         (session_id,user_id,tape_id,msg_id,ordinal,role,ts,content_sha256,payload)
-       VALUES ($1,$2,$3,$4,0,$5,$6,$7,$8)`,
-      [
-        args.sessionId,
-        CUSER,
-        tapeId,
-        record.id,
-        record.role,
-        record.ts,
-        sha256(payload),
-        payload,
-      ],
-    );
+    }];
+    if (
+      args.inlineError !== false &&
+      !records.some((record) =>
+        record.role === "assistant" && typeof record._errorCode === "string")
+    ) {
+      records = [
+        ...records,
+        {
+          id: `terminal-${args.sourceClientMessageId}`,
+          role: "assistant",
+          text: "temporary upstream failure",
+          ts: 3,
+          _clientMessageId: args.sourceClientMessageId,
+          _errorCode: "upstream_failed",
+        },
+      ];
+    }
+    for (let ordinal = 0; ordinal < records.length; ordinal++) {
+      const record = records[ordinal]!;
+      const payload = Buffer.from(JSON.stringify(record), "utf8");
+      await pool.query(
+        `INSERT INTO client_session_turn_tape_records
+           (session_id,user_id,tape_id,msg_id,ordinal,role,ts,content_sha256,payload)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+        [
+          args.sessionId,
+          CUSER,
+          tapeId,
+          record.id,
+          ordinal,
+          record.role,
+          record.ts,
+          sha256(payload),
+          payload,
+        ],
+      );
+    }
   }
 
   maybe("lossless anchor recovery trusts interrupted tape waiver without hot error metadata", async () => {
@@ -4949,7 +6227,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     );
   });
 
-  maybe("automatic recovery revalidates authoritative tape actions and leaves unsafe checkpoints manual", async () => {
+  maybe("checkpoint continuation admits uncertain durable actions and never replays them", async () => {
     const cases: Array<{ suffix: string; record: MessageLike }> = [
       {
         suffix: "incomplete-tool",
@@ -4994,22 +6272,34 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
       },
     ];
     for (const testCase of cases) {
-      const sessionId = `s-dd-recovery-unsafe-${testCase.suffix}`;
-      const sourceClientMessageId = `cm-dd-recovery-unsafe-${testCase.suffix}`;
+      const sessionId = `s-dd-recovery-uncertain-${testCase.suffix}`;
+      const sourceClientMessageId = `cm-dd-recovery-uncertain-${testCase.suffix}`;
       await seedRecoverableSource({
         sessionId,
         sourceClientMessageId,
-        record: testCase.record,
+        inlineError: false,
+        tapeStatus: "completed",
+        records: [
+          testCase.record,
+          {
+            id: `terminal-${testCase.suffix}`,
+            role: "assistant",
+            text: "temporary upstream failure",
+            ts: 3,
+            _clientMessageId: sourceClientMessageId,
+            _errorCode: "upstream_failed",
+          },
+        ],
       });
       const identity = turnRecoveryIdentity(sessionId, sourceClientMessageId);
-      const recoveryInput = admitInput({
+      const recovered = await backend.admitUserTurn(admitInput({
         sessionId,
         clientMessageId: identity.clientMessageId,
         billingRequestId: `brq-${identity.clientMessageId}`,
         message: {
           id: identity.clientMessageId,
           role: "user",
-          text: "checkpoint",
+          text: "checkpoint — verify state before any write",
           ts: 3,
         } as MessageLike & { id: string },
         recovery: {
@@ -5020,64 +6310,33 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
           attempt: 1,
           max: 10,
         },
-      });
-      assert.deepEqual(await backend.admitUserTurn(recoveryInput), {
-        kind: "recovery_conflict",
-        reason: "automatic_checkpoint_unsafe",
-      });
+      }));
+      assert.equal(recovered.kind, "admitted", testCase.suffix);
       const stored = await backend.getClientSession(sessionId, CUSER);
       assert.equal(
-        (stored!.messages as MessageLike[]).some((message) => message.id === identity.clientMessageId),
-        false,
+        (stored!.messages as MessageLike[]).some((message) =>
+          message.id === identity.clientMessageId &&
+          message._recoveryMode === "checkpoint" &&
+          message._automaticRecovery === true),
+        true,
+        testCase.suffix,
       );
       const dispatch = await pool.query(
         "SELECT 1 FROM turn_dispatches WHERE user_id=$1 AND session_id=$2 AND client_message_id=$3",
         [UID, sessionId, identity.clientMessageId],
       );
-      assert.equal(dispatch.rowCount, 0);
+      assert.equal(dispatch.rowCount, 1, testCase.suffix);
     }
-
-    const manualSessionId = "s-dd-recovery-unsafe-manual";
-    const manualSourceId = "cm-dd-recovery-unsafe-manual";
-    await seedRecoverableSource({
-      sessionId: manualSessionId,
-      sourceClientMessageId: manualSourceId,
-      record: {
-        id: "tool-manual",
-        role: "tool",
-        text: "",
-        ts: 2,
-        _completed: true,
-        outputJson: { outcome: "unknown" },
-      },
-    });
-    const manualIdentity = turnRecoveryIdentity(manualSessionId, manualSourceId);
-    const manual = await backend.admitUserTurn(admitInput({
-      sessionId: manualSessionId,
-      clientMessageId: manualIdentity.clientMessageId,
-      billingRequestId: `brq-${manualIdentity.clientMessageId}`,
-      message: {
-        id: manualIdentity.clientMessageId,
-        role: "user",
-        text: "manual checkpoint",
-        ts: 3,
-      } as MessageLike & { id: string },
-      recovery: {
-        sourceClientMessageId: manualSourceId,
-        mode: "checkpoint",
-        automatic: false,
-      },
-    }));
-    assert.equal(manual.kind, "admitted");
   });
 
-  maybe("completed source tape cannot be contradicted by a recovery frame", async () => {
-    const sessionId = "s-dd-recovery-completed";
-    const sourceClientMessageId = "cm-dd-recovery-completed-source";
+  maybe("completed tape without a terminal recoverable record remains non-recoverable", async () => {
+    const sessionId = "s-dd-recovery-completed-clean";
+    const sourceClientMessageId = "cm-dd-recovery-completed-clean-source";
     await seedRecoverableSource({
       sessionId,
       sourceClientMessageId,
       tapeStatus: "completed",
+      inlineError: false,
     });
     const identity = turnRecoveryIdentity(sessionId, sourceClientMessageId);
     assert.deepEqual(await backend.admitUserTurn(admitInput({
@@ -5100,8 +6359,156 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
       },
     })), {
       kind: "recovery_conflict",
-      reason: "source_tape_completed",
+      reason: "source_not_recoverable",
     });
+  });
+
+  maybe("completed tape with terminal recoverable error accepts manual checkpoint continuation", async () => {
+    const sessionId = "s-dd-recovery-completed-error";
+    const sourceClientMessageId = "cm-dd-recovery-completed-error-source";
+    await seedRecoverableSource({
+      sessionId,
+      sourceClientMessageId,
+      inlineError: false,
+      tapeStatus: "completed",
+      records: [
+        {
+          id: "thinking-completed-error",
+          role: "thinking",
+          text: "deployment started",
+          ts: 2,
+          _clientMessageId: sourceClientMessageId,
+        },
+        {
+          id: "terminal-completed-error",
+          role: "assistant",
+          text: "temporary upstream failure",
+          ts: 3,
+          _clientMessageId: sourceClientMessageId,
+          _errorCode: "upstream_failed",
+        },
+      ],
+    });
+    const identity = turnRecoveryIdentity(sessionId, sourceClientMessageId);
+    const recovered = await backend.admitUserTurn(admitInput({
+      sessionId,
+      clientMessageId: identity.clientMessageId,
+      billingRequestId: `brq-${identity.clientMessageId}`,
+      message: {
+        id: identity.clientMessageId,
+        role: "user",
+        text: "checkpoint continuation",
+        ts: 4,
+      } as MessageLike & { id: string },
+      recovery: {
+        sourceClientMessageId,
+        mode: "checkpoint",
+        automatic: false,
+      },
+    }));
+    assert.equal(recovered.kind, "admitted");
+  });
+
+  maybe("completed recoverable tape never authorizes replay of the original write request", async () => {
+    const sessionId = "s-dd-recovery-completed-replay";
+    const sourceClientMessageId = "cm-dd-recovery-completed-replay-source";
+    await seedRecoverableSource({
+      sessionId,
+      sourceClientMessageId,
+      inlineError: false,
+      tapeStatus: "completed",
+      records: [{
+        id: "terminal-completed-replay",
+        role: "assistant",
+        text: "temporary upstream failure",
+        ts: 2,
+        _clientMessageId: sourceClientMessageId,
+        _errorCode: "upstream_failed",
+      }],
+    });
+    const identity = turnRecoveryIdentity(sessionId, sourceClientMessageId);
+    assert.deepEqual(await backend.admitUserTurn(admitInput({
+      sessionId,
+      clientMessageId: identity.clientMessageId,
+      billingRequestId: `brq-${identity.clientMessageId}`,
+      message: {
+        id: identity.clientMessageId,
+        role: "user",
+        text: "original external write",
+        ts: 3,
+      } as MessageLike & { id: string },
+      recovery: {
+        sourceClientMessageId,
+        mode: "replay",
+        automatic: true,
+        rootClientMessageId: sourceClientMessageId,
+        attempt: 1,
+        max: 10,
+      },
+    })), {
+      kind: "recovery_conflict",
+      reason: "completed_replay_forbidden",
+    });
+  });
+
+  maybe("finalize schedules completed-error checkpoint despite uncertain Bash outcome", async () => {
+    const sessionId = "s-dd-recovery-completed-auto";
+    const sourceClientMessageId = "cm-dd-recovery-completed-auto-source";
+    const sourceAdmission = await backend.admitUserTurn(admitInput({
+      sessionId,
+      clientMessageId: sourceClientMessageId,
+      billingRequestId: `brq-${sourceClientMessageId}`,
+      message: {
+        id: sourceClientMessageId,
+        role: "user",
+        text: "deploy",
+        ts: 1,
+        _routing: { model: "gpt-5.6-sol", effortLevel: null, teamMode: false },
+      } as MessageLike & { id: string },
+    }));
+    assert.equal(sourceAdmission.kind, "admitted");
+    const tape = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 1,
+      status: "completed",
+      turnKey: "c".repeat(64),
+      clientMessageId: sourceClientMessageId,
+      text: "temporary upstream failure",
+      thinkingText: "deployment started",
+      tools: [{
+        blockId: "deploy-uncertain",
+        toolName: "Bash",
+        inputJson: { command: "deploy.sh --release current" },
+        output: "",
+        completed: false,
+      }],
+      errorCode: "upstream_failed",
+      createdAt: 1_783_950_100_000,
+      usage: { inputTokens: 1, outputTokens: 1 },
+    });
+    await stageAndFinalize(CUSER, tape);
+    const jobs = await pool.query<{
+      recovery_mode: string;
+      error_code: string;
+      semantic_recovery_attempt: number;
+      request_json: Record<string, unknown>;
+    }>(
+      `SELECT recovery_mode,error_code,semantic_recovery_attempt,request_json
+         FROM turn_recovery_jobs
+        WHERE user_id=$1 AND session_id=$2 AND source_client_message_id=$3`,
+      [UID, sessionId, sourceClientMessageId],
+    );
+    assert.equal(jobs.rowCount, 1);
+    assert.equal(jobs.rows[0]!.recovery_mode, "checkpoint");
+    assert.equal(jobs.rows[0]!.error_code, "upstream_failed");
+    assert.equal(jobs.rows[0]!.semantic_recovery_attempt, 1);
+    const request = jobs.rows[0]!.request_json as {
+      content?: { text?: string; recovery?: { mode?: string } };
+    };
+    assert.equal(request.content?.recovery?.mode, "checkpoint");
+    assert.match(request.content?.text ?? "", /先查询其当前可观察状态/);
+    assert.doesNotMatch(request.content?.text ?? "", /deploy\.sh/);
   });
 
   maybe("verified not-accepted source can replay exactly without inventing a tape", async () => {
@@ -5471,15 +6878,15 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     }).dispatch;
 
     const fresh = await backend.getTurnTapeStateByDispatch(CUSER, dispatch.dispatchId, 1);
-    assert.deepEqual(fresh, { state: "none", status: null, dispatchLeaseActive: true });
+    assert.deepEqual(fresh, { state: "none", status: null, dispatchLeaseActive: true, gatewayShutdownEvidence: false });
     assert.deepEqual(
       await backend.getTurnTapeStateByDispatch("c:8", dispatch.dispatchId, 1),
-      { state: "none", status: null, dispatchLeaseActive: false },
+      { state: "none", status: null, dispatchLeaseActive: false, gatewayShutdownEvidence: false },
       "错误租户不能观察 lease",
     );
     assert.deepEqual(
       await backend.getTurnTapeStateByDispatch(CUSER, dispatch.dispatchId, 2),
-      { state: "none", status: null, dispatchLeaseActive: false },
+      { state: "none", status: null, dispatchLeaseActive: false, gatewayShutdownEvidence: false },
       "attemptNo 必须同样参与 lease scope",
     );
 
@@ -5523,6 +6930,19 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
         .dispatchLeaseActive,
       false,
       "rejecting 不属于 lease-active open execution set",
+    );
+
+    await pool.query(
+      `UPDATE turn_dispatches
+          SET shutdown_ctx = jsonb_build_object('gatewayExitedAt', '2026-08-20T00:00:00.000Z')
+        WHERE dispatch_id = $1`,
+      [dispatch.dispatchId],
+    );
+    assert.equal(
+      (await backend.getTurnTapeStateByDispatch(CUSER, dispatch.dispatchId, 1))
+        .gatewayShutdownEvidence,
+      true,
+      "dispatch 级停机证据必须出现在 tape-state 快照里",
     );
   });
 
@@ -5615,6 +7035,89 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     assert.ok(!live.some((r) => r.dispatchId === d2.dispatchId), "活会话的 dispatch 不得被会话亡臂误伤");
   });
 
+  maybe("visible precommit closes display before the first multipart part", async () => {
+    const sessionId = "s-dd-visible-precommit";
+    const clientMessageId = "cm-dd-visible-precommit";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId: CUSER }));
+    const admit = await backend.admitUserTurn(
+      admitInput({ sessionId, clientMessageId }),
+    );
+    assert.equal(admit.kind, "admitted");
+    const d = (admit as { dispatch: { dispatchId: string } }).dispatch;
+    const tape = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 11,
+      status: "completed",
+      turnKey: "7".repeat(64),
+      text: "visible before any part",
+      createdAt: 1_783_950_050_000,
+    });
+    assert.ok(backend.commitVisibleLosslessTurnTape);
+    const visible = await backend.commitVisibleLosslessTurnTape(CUSER, {
+      ...tape.finalize,
+      action: "visible",
+      dispatchId: d.dispatchId,
+      attemptNo: 1,
+      settlement: {
+        billingAnchorId: `srv-${sessionId}-main-t11`,
+        engineBillings: [],
+        text: "visible before any part",
+        ts: 1_783_950_050_000,
+      },
+    });
+    assert.equal(visible.applied, "finalized");
+    assert.equal(visible.newlyVisible, true);
+    assert.equal(visible.clientMessageId, clientMessageId);
+
+    const partCount = Number((await pool.query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM client_session_turn_tape_parts
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+      [sessionId, CUSER, tape.finalize.tapeId],
+    )).rows[0]!.n);
+    assert.equal(partCount, 0, "display commit must not read or stage multipart bytes");
+    const materializationJobs = Number((await pool.query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM turn_tape_materialization_jobs
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+      [sessionId, CUSER, tape.finalize.tapeId],
+    )).rows[0]!.n);
+    assert.equal(materializationJobs, 0, "materialization waits until every part is staged");
+
+    const hydrated = await backend.getClientSession(sessionId, CUSER);
+    assert.equal(
+      (hydrated!.messages as MessageLike[]).find((m) => m.role === "assistant")?.text,
+      "visible before any part",
+    );
+    const dispatch = await getDispatch(pool, d.dispatchId);
+    assert.equal(dispatch!.status, "terminal");
+    assert.equal(dispatch!.outcome, "completed");
+
+    for (const part of tape.parts) {
+      await backend.stageLosslessTurnTapePart(CUSER, part.request, part.bytes, {
+        dispatchId: d.dispatchId,
+        attemptNo: 1,
+      });
+    }
+    const afterParts = await backend.finalizeLosslessTurnTape(CUSER, {
+      ...tape.finalize,
+      dispatchId: d.dispatchId,
+      attemptNo: 1,
+      settlement: {
+        billingAnchorId: `srv-${sessionId}-main-t11`,
+        engineBillings: [],
+        text: "visible before any part",
+        ts: 1_783_950_050_000,
+      },
+    }, { materialize: false });
+    assert.equal(afterParts.applied, "finalized");
+    const jobsAfterParts = Number((await pool.query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM turn_tape_materialization_jobs
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+      [sessionId, CUSER, tape.finalize.tapeId],
+    )).rows[0]!.n);
+    assert.equal(jobsAfterParts, 1, "parts-ready finalize hands the tape to Phase B");
+  });
+
   maybe("finalize 收敛(§2.4):tape header 带 dispatch 身份 → dispatch terminal(outcome=tape.status)", async () => {
     await backend.upsertClientSession(mkSession({ id: "s-dd-conv-2", userId: CUSER }));
     const admit = await backend.admitUserTurn(
@@ -5684,7 +7187,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
       const row = await getDispatch(pool, d.dispatchId);
       assert.equal(row!.status, "terminal");
       assert.equal(row!.outcome, tapeStatus);
-      assert.equal(row!.failureCode, null);
+      assert.equal(row!.failureCode, tapeStatus === "completed" ? null : tapeStatus);
       assert.equal(row!.clientNotified, false);
       const after = await backend.getClientSession(sessionId, CUSER, { view: "timeline" });
       assert.ok(!after!.messages.some((m) => (m as MessageLike)._turnStatusRecord === true));
@@ -5693,6 +7196,91 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
       assert.equal(finalRecord?._timelineRecord, true);
     });
   }
+
+  maybe("crashed finalize 把 settlement.errorCode=SERVICE_RESTART 写入 failure_code", async () => {
+    const sessionId = "s-dd-sr-finalize";
+    const clientMessageId = "cm-dd-sr-finalize";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId: CUSER }));
+    const admit = await backend.admitUserTurn(admitInput({ sessionId, clientMessageId }));
+    assert.equal(admit.kind, "admitted");
+    const d = (admit as { dispatch: { dispatchId: string } }).dispatch;
+    const tape = buildTape({
+      sessionId, agentId: "main", turnIndex: 1, status: "crashed",
+      turnKey: "c".repeat(64), text: "", createdAt: 1_783_950_160_000,
+    });
+    assert.ok(backend.commitVisibleLosslessTurnTape);
+    const visible = await backend.commitVisibleLosslessTurnTape(CUSER, {
+      ...tape.finalize,
+      action: "visible",
+      dispatchId: d.dispatchId,
+      attemptNo: 1,
+      settlement: {
+        billingAnchorId: `srv-${sessionId}-main-t1`,
+        engineBillings: [],
+        text: "",
+        ts: 1_783_950_160_000,
+        errorCode: "SERVICE_RESTART",
+      },
+    });
+    assert.equal(visible.applied, "finalized");
+    const row = await getDispatch(pool, d.dispatchId);
+    assert.equal(row!.status, "terminal");
+    assert.equal(row!.outcome, "crashed");
+    assert.equal(row!.failureCode, "SERVICE_RESTART");
+  });
+
+  maybe("SERVICE_RESTART sentinel + late completed 清 failure_code; late crash 写真实码", async () => {
+    for (const [tapeStatus, expectedCode] of [
+      ["completed", null],
+      ["crashed", "ENGINE_FAULT"],
+    ] as const) {
+      const suffix = tapeStatus.slice(0, 4);
+      const sessionId = `s-dd-sr-late-${suffix}`;
+      const clientMessageId = `cm-dd-sr-late-${suffix}`;
+      await backend.upsertClientSession(mkSession({ id: sessionId, userId: CUSER }));
+      const admit = await backend.admitUserTurn(admitInput({ sessionId, clientMessageId }));
+      assert.equal(admit.kind, "admitted");
+      const d = (admit as { dispatch: { dispatchId: string } }).dispatch;
+      assert.ok(await casToTerminal(pool, {
+        dispatchId: d.dispatchId,
+        outcome: "executed_error",
+        failureCode: "SERVICE_RESTART",
+        clientNotified: true,
+      }));
+      const tape = buildTape({
+        sessionId,
+        agentId: "main",
+        turnIndex: 1,
+        status: tapeStatus,
+        turnKey: createHash("sha256").update(`sr-${tapeStatus}`).digest("hex"),
+        text: `late ${tapeStatus}`,
+        createdAt: 1_783_950_170_000,
+      });
+      for (const part of tape.parts) {
+        await backend.stageLosslessTurnTapePart(CUSER, part.request, part.bytes, {
+          dispatchId: d.dispatchId,
+          attemptNo: 1,
+        });
+      }
+      const finalize = tapeStatus === "crashed"
+        ? {
+            ...tape.finalize,
+            settlement: {
+              billingAnchorId: `srv-${sessionId}-main-t1`,
+              engineBillings: [],
+              text: `late ${tapeStatus}`,
+              ts: 1_783_950_170_000,
+              errorCode: "ENGINE_FAULT",
+            },
+          }
+        : tape.finalize;
+      assert.equal((await backend.finalizeLosslessTurnTape(CUSER, finalize)).applied, "finalized");
+      const row = await getDispatch(pool, d.dispatchId);
+      assert.equal(row!.status, "terminal");
+      assert.equal(row!.outcome, tapeStatus);
+      assert.equal(row!.failureCode, expectedCode);
+    }
+  });
 
   maybe("late tape(§7.9):verified failure → true tape finalize moves dispatch to manual and timeline shows only truth", async () => {
     await backend.upsertClientSession(mkSession({ id: "s-dd-late-3", userId: CUSER }));
@@ -5734,7 +7322,11 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
       "SELECT history_revision FROM client_sessions WHERE id = $1 AND user_id = $2",
       ["s-dd-late-3", CUSER],
     )).rows[0]!.history_revision);
-    assert.equal(revisionAfter, revisionBefore + 1n, "removing the previously visible status advances absence revision");
+    assert.equal(
+      revisionAfter,
+      revisionBefore + 2n,
+      "Phase A removes the stale status and Phase B publishes the exact late truth",
+    );
     assert.equal((await backend.finalizeLosslessTurnTape(CUSER, tape.finalize)).applied, "idempotent");
     const revisionAfterReplay = BigInt((await pool.query<{ history_revision: string }>(
       "SELECT history_revision FROM client_sessions WHERE id = $1 AND user_id = $2",
@@ -5831,6 +7423,131 @@ function browserVisibleTimeline(messages: MessageLike[]): MessageLike[] {
 }
 
 describe("pgSessionsBackend direct turn timeline", () => {
+  maybe("timeline keeps a late legacy cost patched only onto the finalized tape anchor", async () => {
+    const sessionId = "s-direct-legacy-cost";
+    const userId = "u-direct-legacy-cost";
+    const requestId = "req-direct-legacy-cost";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const tape = directTape(sessionId, "4".repeat(64), {
+      text: "带晚到积分的最终回答",
+    });
+    await stageAndFinalize(userId, tape);
+    const anchor = (
+      await pool.query<{ billing_anchor_id: string }>(
+        `SELECT billing_anchor_id FROM client_session_turn_tapes
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+        [sessionId, userId, tape.finalize.tapeId],
+      )
+    ).rows[0]!;
+    await pool.query(
+      `INSERT INTO server_authored_request_map
+         (request_id,user_id,session_id,msg_id,written_at)
+       VALUES ($1,$2,$3,$4,$5)`,
+      [requestId, userId, sessionId, anchor.billing_anchor_id, Date.now()],
+    );
+
+    assert.deepEqual(
+      await backend.appendCostCredits(requestId, userId, "386", sessionId),
+      { applied: "patched" },
+    );
+    assert.equal(
+      (await pool.query(
+        "SELECT 1 FROM turn_tape_cost_components WHERE request_id=$1 AND user_id=$2",
+        [requestId, userId],
+      )).rowCount,
+      0,
+      "legacy request-map path intentionally has no exact turn component",
+    );
+
+    const timeline = await backend.getClientSession(sessionId, userId, { view: "timeline" });
+    const answer = (timeline!.messages as MessageLike[]).find((message) =>
+      message.role === "assistant" && message.text === "带晚到积分的最终回答"
+    );
+    assert.equal((answer?.usage as Record<string, unknown> | undefined)?.costCredits, "386");
+
+    const page = await backend.readClientTimelinePage(sessionId, userId, null, 20);
+    const pagedAnswer = page!.messages.find((message) =>
+      message.role === "assistant" && message.text === "带晚到积分的最终回答"
+    );
+    assert.equal((pagedAnswer?.usage as Record<string, unknown> | undefined)?.costCredits, "386");
+  });
+
+  maybe("format-3 agent-group preserves escaped NUL without weakening format-2 guard", async () => {
+    const previousBatching = process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING;
+    process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING = "1";
+    try {
+      const sessionId = "s-agent-group-escaped-nul";
+      const userId = "u-agent-group-escaped-nul";
+      const exactChildText = "CHILD-BEFORE\u0000CHILD-AFTER";
+      await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+      const tape = directTape(sessionId, "6".repeat(64), {
+        text: "NUL child complete",
+        agentGroups: [{
+          runId: "dlg-nul",
+          agentId: "reviewer",
+          goal: "preserve exact child output",
+          status: "ok",
+          resultSummary: exactChildText,
+          transcript: [{ kind: "text", text: exactChildText }],
+          completedAt: 1_783_944_000_010,
+        }],
+      });
+      for (const part of tape.parts) {
+        await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+      }
+      const formatBefore = (
+        await pool.query<{ record_storage_format: number }>(
+          `SELECT record_storage_format FROM client_session_turn_tapes
+            WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+          [sessionId, userId, tape.finalize.tapeId],
+        )
+      ).rows[0]!.record_storage_format;
+      assert.equal(formatBefore, 2);
+
+      const legacyPayload = Buffer.from(JSON.stringify({
+        id: "legacy-nul",
+        role: "agent-group",
+        text: exactChildText,
+        engineBillings: [],
+      }));
+      await assert.rejects(
+        pool.query(
+          `INSERT INTO client_session_turn_tape_records
+             (session_id,user_id,tape_id,msg_id,ordinal,role,ts,content_sha256,payload)
+           VALUES ($1,$2,$3,'legacy-nul',999,'agent-group',1,$4,$5)`,
+          [sessionId, userId, tape.finalize.tapeId, sha256(legacyPayload), legacyPayload],
+        ),
+        /unsupported Unicode escape sequence/,
+      );
+
+      await stageAndFinalize(userId, tape);
+      const formatAfter = (
+        await pool.query<{ record_storage_format: number }>(
+          `SELECT record_storage_format FROM client_session_turn_tapes
+            WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+          [sessionId, userId, tape.finalize.tapeId],
+        )
+      ).rows[0]!.record_storage_format;
+      assert.equal(formatAfter, 3);
+      const group = (
+        await pool.query<{ raw: string }>(
+          `SELECT convert_from(payload,'UTF8') AS raw
+             FROM client_session_turn_tape_records
+            WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND role='agent-group'`,
+          [sessionId, userId, tape.finalize.tapeId],
+        )
+      ).rows[0]!;
+      assert.equal(JSON.parse(group.raw).resultSummary, exactChildText);
+      assert.match(group.raw, /\\u0000/);
+    } finally {
+      if (previousBatching === undefined) {
+        delete process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING;
+      } else {
+        process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING = previousBatching;
+      }
+    }
+  });
+
   maybe("actual NUL finalizes and backfills PostgreSQL model sidecars without changing exact tape bytes", async () => {
     const sessionId = "s-direct-nul-model-sidecar";
     const userId = "u-direct-nul-model-sidecar";
@@ -6955,5 +8672,622 @@ describe("pgSessionsBackend direct turn timeline", () => {
       backend.getClientSession(sessionId, userId),
       /hash mismatch|JSON invalid|Unexpected end/i,
     );
+  });
+});
+
+
+describe("rev2 visible finalize decoupling", () => {
+  maybe("first part keeps terminal status so old equality upload can continue", async () => {
+    const sessionId = "s-rev2-status-eq";
+    const userId = "c:1";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const tape = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 1,
+      status: "completed",
+      turnKey: "a".repeat(64),
+      text: "status equality still works",
+      createdAt: 1_700_000_000_000,
+    });
+    const first = tape.parts[0]!;
+    await backend.stageLosslessTurnTapePart(userId, first.request, first.bytes);
+    const header = (
+      await pool.query<{ status: string }>(
+        `SELECT status FROM client_session_turn_tapes
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+        [sessionId, userId, tape.finalize.tapeId],
+      )
+    ).rows[0]!;
+    assert.equal(header.status, "completed");
+    for (const part of tape.parts.slice(1)) {
+      await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+    }
+    const result = await backend.finalizeLosslessTurnTape(userId, tape.finalize);
+    assert.equal(result.applied, "finalized");
+    const hydrated = await backend.getClientSession(sessionId, userId);
+    const assistant = (hydrated!.messages as MessageLike[]).find((m) => m.role === "assistant");
+    assert.equal(assistant?.text, "status equality still works");
+  });
+
+  maybe("engine complete is visible even if materialization is killed every batch and later fails", async () => {
+    const sessionId = "s-rev2-kill-batch";
+    const userId = "c:1";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const runtimeEvents = Array.from({ length: LOSSLESS_TURN_RECORD_STAGE_BATCH_SIZE + 5 }, (_, index) => ({
+      ordinal: index + 1,
+      observedAt: 1_700_000_000_000 + index,
+      source: "gateway",
+      payload: { type: "batch-boundary", index },
+    }));
+    const tape = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 3,
+      status: "completed",
+      turnKey: "b".repeat(64),
+      text: "visible before records",
+      createdAt: 1_700_000_000_100,
+      runtimeEvents,
+    });
+    for (const part of tape.parts) {
+      await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+    }
+    const partsBefore = Number((
+      await pool.query<{ n: string }>(
+        `SELECT count(*)::text AS n FROM client_session_turn_tape_parts
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+        [sessionId, userId, tape.finalize.tapeId],
+      )
+    ).rows[0]?.n ?? "0");
+    assert.ok(partsBefore > 0);
+    _setAfterLosslessStageBatch(() => {
+      throw new Error("materialization killed");
+    });
+    let first: Awaited<ReturnType<typeof backend.finalizeLosslessTurnTape>>;
+    try {
+      first = await backend.finalizeLosslessTurnTape(userId, {
+        ...tape.finalize,
+        settlement: {
+          billingAnchorId: `srv-${sessionId}-main-t3`,
+          engineBillings: [],
+          text: "visible before records",
+          ts: 1_700_000_000_100,
+        },
+      });
+    } finally {
+      _setAfterLosslessStageBatch(null);
+    }
+    assert.equal(first.applied, "finalized");
+    const partsAfterKill = Number((
+      await pool.query<{ n: string }>(
+        `SELECT count(*)::text AS n FROM client_session_turn_tape_parts
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+        [sessionId, userId, tape.finalize.tapeId],
+      )
+    ).rows[0]?.n ?? "0");
+    assert.equal(partsAfterKill, partsBefore);
+    const visible = await backend.getClientSession(sessionId, userId);
+    const assistant = (visible!.messages as MessageLike[]).find((m) => m.role === "assistant");
+    assert.equal(assistant?.text, "visible before records");
+    const resumed = await backend.finalizeLosslessTurnTape(userId, tape.finalize);
+    assert.equal(resumed.applied, "finalized");
+    assert.ok(resumed.recordCount > 1);
+    const partsFinal = Number((
+      await pool.query<{ n: string }>(
+        `SELECT count(*)::text AS n FROM client_session_turn_tape_parts
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+        [sessionId, userId, tape.finalize.tapeId],
+      )
+    ).rows[0]?.n ?? "0");
+    assert.equal(partsFinal, 0);
+    await pool.query(
+      `UPDATE client_session_turn_tapes
+          SET materialization_status='failed', materialization_attempts=8
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+      [sessionId, userId, tape.finalize.tapeId],
+    );
+    const still = await backend.getClientSession(sessionId, userId);
+    const stillAssistant = (still!.messages as MessageLike[]).find((m) => m.role === "assistant");
+    assert.ok(typeof stillAssistant?.text === "string" && stillAssistant.text.length > 0);
+  });
+
+  maybe("Phase A only does not run Phase B even when materialize later 57014s", async () => {
+    const sessionId = "s-rev3-http-phase-a";
+    const userId = "c:1";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const tape = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 8,
+      status: "completed",
+      turnKey: "c".repeat(64),
+      text: "phase a only",
+      createdAt: 1_700_000_100_000,
+    });
+    for (const part of tape.parts) {
+      await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+    }
+    const visible = await backend.finalizeLosslessTurnTape(userId, {
+      ...tape.finalize,
+      settlement: {
+        billingAnchorId: `srv-${sessionId}-main-t8`,
+        engineBillings: [],
+        text: "phase a only",
+        ts: 1_700_000_100_000,
+      },
+    }, { materialize: false });
+    assert.equal(visible.applied, "finalized");
+    assert.equal(visible.settlementHandoff, true);
+    const timelineBeforeMaterialization = await backend.getClientSession(
+      sessionId,
+      userId,
+      { view: "timeline" },
+    );
+    const visibleAssistant = (timelineBeforeMaterialization!.messages as MessageLike[])
+      .find((message) => message.role === "assistant");
+    assert.equal(visibleAssistant?.text, "phase a only");
+    const parts = Number((
+      await pool.query<{ n: string }>(
+        `SELECT count(*)::text AS n FROM client_session_turn_tape_parts
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+        [sessionId, userId, tape.finalize.tapeId],
+      )
+    ).rows[0]?.n ?? "0");
+    assert.ok(parts > 0);
+    _setAfterLosslessStageBatch(() => {
+      const err = new Error("statement timeout");
+      (err as { code?: string }).code = "57014";
+      throw err;
+    });
+    try {
+      const second = await backend.finalizeLosslessTurnTape(userId, tape.finalize);
+      assert.equal(second.applied, "finalized");
+    } catch (err) {
+      assert.match(String((err as Error).message ?? err), /statement timeout|57014|pending|killed/i);
+    } finally {
+      _setAfterLosslessStageBatch(null);
+    }
+    const partsAfter = Number((
+      await pool.query<{ n: string }>(
+        `SELECT count(*)::text AS n FROM client_session_turn_tape_parts
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+        [sessionId, userId, tape.finalize.tapeId],
+      )
+    ).rows[0]?.n ?? "0");
+    assert.equal(partsAfter, parts);
+    const mat = (
+      await pool.query<{ materialization_status: string }>(
+        `SELECT materialization_status FROM client_session_turn_tapes
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+        [sessionId, userId, tape.finalize.tapeId],
+      )
+    ).rows[0];
+    assert.notEqual(mat?.materialization_status, "complete");
+    const hydrated = await backend.getClientSession(sessionId, userId);
+    const assistant = (hydrated!.messages as MessageLike[]).find((m) => m.role === "assistant");
+    assert.equal(assistant?.text, "phase a only");
+  });
+
+  maybe("Phase B exact-record publication advances timeline identity exactly once", async () => {
+    const sessionId = "s-rev3-phase-b-identity";
+    const userId = "c:1";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const tape = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 12,
+      status: "completed",
+      turnKey: "1".repeat(64),
+      text: "phase b exact answer",
+      createdAt: 1_700_000_500_000,
+      tools: [{
+        blockId: "phase-b-tool",
+        toolName: "Bash",
+        inputJson: { command: "printf exact" },
+        output: "exact",
+        completed: true,
+      }],
+    });
+    for (const part of tape.parts) {
+      await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+    }
+    const visible = await backend.finalizeLosslessTurnTape(userId, {
+      ...tape.finalize,
+      settlement: {
+        billingAnchorId: `srv-${sessionId}-main-t12`,
+        engineBillings: [],
+        text: "phase b exact answer",
+        ts: 1_700_000_500_000,
+      },
+    }, { materialize: false });
+    assert.equal(visible.applied, "finalized");
+    const before = (
+      await pool.query<{ history_revision: string; timeline_generation: string }>(
+        `SELECT history_revision::text,timeline_generation::text
+           FROM client_sessions WHERE id=$1 AND user_id=$2`,
+        [sessionId, userId],
+      )
+    ).rows[0]!;
+    const fallback = await backend.getClientSession(sessionId, userId, { view: "timeline" });
+    assert.equal(
+      (fallback!.messages as MessageLike[]).find((message) => message.role === "assistant")
+        ?._displayDegradeReason,
+      "records_unpublished",
+    );
+
+    const materialized = await backend.finalizeLosslessTurnTape(userId, tape.finalize);
+    assert.equal(materialized.applied, "finalized");
+    assert.ok(materialized.recordCount > 1);
+    const after = (
+      await pool.query<{ history_revision: string; timeline_generation: string }>(
+        `SELECT history_revision::text,timeline_generation::text
+           FROM client_sessions WHERE id=$1 AND user_id=$2`,
+        [sessionId, userId],
+      )
+    ).rows[0]!;
+    assert.equal(BigInt(after.history_revision), BigInt(before.history_revision) + 1n);
+    assert.equal(BigInt(after.timeline_generation), BigInt(before.timeline_generation) + 1n);
+    const exact = await backend.getClientSession(sessionId, userId, { view: "timeline" });
+    assert.ok((exact!.messages as MessageLike[]).some((message) => message.role === "tool"));
+    assert.equal(
+      (exact!.messages as MessageLike[]).some(
+        (message) => message._displayDegradeReason === "records_unpublished",
+      ),
+      false,
+    );
+
+    const replay = await backend.finalizeLosslessTurnTape(userId, tape.finalize);
+    assert.equal(replay.applied, "idempotent");
+    const afterReplay = (
+      await pool.query<{ history_revision: string; timeline_generation: string }>(
+        `SELECT history_revision::text,timeline_generation::text
+           FROM client_sessions WHERE id=$1 AND user_id=$2`,
+        [sessionId, userId],
+      )
+    ).rows[0]!;
+    assert.deepEqual(afterReplay, after);
+  });
+
+  maybe("duplicate Phase A does not hot-reactivate a failed materialization job", async () => {
+    const sessionId = "s-rev3-failed-job-cold";
+    const userId = "c:1";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const tape = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 11,
+      status: "completed",
+      turnKey: "f".repeat(64),
+      text: "visible while cold",
+      createdAt: 1_700_000_400_000,
+    });
+    for (const part of tape.parts) {
+      await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+    }
+    const settlement = {
+      billingAnchorId: `srv-${sessionId}-main-t11`,
+      engineBillings: [],
+      text: "visible while cold",
+      ts: 1_700_000_400_000,
+    };
+    await backend.finalizeLosslessTurnTape(userId, {
+      ...tape.finalize,
+      settlement,
+    }, { materialize: false });
+    await pool.query(
+      `UPDATE turn_tape_materialization_jobs
+          SET status='failed', attempt=8,
+              next_attempt_at=NOW()+INTERVAL '1 hour',
+              last_error='permanent poison'
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+      [sessionId, userId, tape.finalize.tapeId],
+    );
+    const before = (
+      await pool.query<{ status: string; attempt: number; next_attempt_at: string }>(
+        `SELECT status,attempt,next_attempt_at::text
+           FROM turn_tape_materialization_jobs
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+        [sessionId, userId, tape.finalize.tapeId],
+      )
+    ).rows[0]!;
+    await backend.finalizeLosslessTurnTape(userId, {
+      ...tape.finalize,
+      settlement,
+    }, { materialize: false });
+    const after = (
+      await pool.query<{
+        status: string;
+        attempt: number;
+        next_attempt_at: string;
+        last_error: string;
+      }>(
+        `SELECT status,attempt,next_attempt_at::text,last_error
+           FROM turn_tape_materialization_jobs
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+        [sessionId, userId, tape.finalize.tapeId],
+      )
+    ).rows[0]!;
+    assert.equal(after.status, "failed");
+    assert.equal(after.attempt, before.attempt);
+    assert.equal(after.next_attempt_at, before.next_attempt_at);
+    assert.equal(after.last_error, "permanent poison");
+    const timeline = await backend.getClientSession(sessionId, userId, { view: "timeline" });
+    assert.equal(
+      (timeline!.messages as MessageLike[])
+        .find((message) => message.role === "assistant")?.text,
+      "visible while cold",
+    );
+  });
+
+  maybe("visible + failed materialization still builds the next engine context", async () => {
+    const sessionId = "s-rev3-engine-visible";
+    const userId = "c:1";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const tape = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 9,
+      status: "completed",
+      turnKey: "d".repeat(64),
+      text: "visible context",
+      createdAt: 1_700_000_200_000,
+    });
+    for (const part of tape.parts) {
+      await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+    }
+    await backend.finalizeLosslessTurnTape(userId, {
+      ...tape.finalize,
+      settlement: {
+        billingAnchorId: `srv-${sessionId}-main-t9`,
+        engineBillings: [],
+        text: "visible context",
+        ts: 1_700_000_200_000,
+      },
+    }, { materialize: false });
+    await pool.query(
+      `UPDATE client_session_turn_tapes
+          SET materialization_status='failed', materialization_attempts=8
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+      [sessionId, userId, tape.finalize.tapeId],
+    );
+    const context = await backend.getEngineContextMessages(sessionId, userId);
+    assert.ok(Array.isArray(context));
+    const texts = context.map((message) => `${message.role}:${String(message.text ?? "")}`);
+    assert.ok(
+      texts.some((row) => row.includes("visible")),
+      `engine context missing visible stub: ${JSON.stringify(texts)}`,
+    );
+  });
+
+  maybe("tool-only tape uses one canonical billing anchor", async () => {
+    const sessionId = "s-rev3-tool-only";
+    const userId = "c:1";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const tape = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 10,
+      status: "completed",
+      turnKey: "e".repeat(64),
+      text: "",
+      createdAt: 1_700_000_300_000,
+      tools: [{
+        blockId: "only-tool",
+        toolName: "Bash",
+        inputJson: { command: "true" },
+        output: "ok",
+        completed: true,
+      }],
+    });
+    for (const part of tape.parts) {
+      await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+    }
+    const visible = await backend.finalizeLosslessTurnTape(userId, {
+      ...tape.finalize,
+      settlement: {
+        billingAnchorId: `srv-${sessionId}-main-t10-tool-only-tool`,
+        engineBillings: [],
+        text: "",
+        ts: 1_700_000_300_000,
+      },
+    }, { materialize: false });
+    assert.equal(visible.applied, "finalized");
+    await backend.finalizeLosslessTurnTape(userId, tape.finalize);
+    const hydrated = await backend.getClientSession(sessionId, userId);
+    const assistants = (hydrated!.messages as MessageLike[]).filter((m) => m._turnTapeId === tape.finalize.tapeId);
+    assert.equal(assistants.length, 1);
+  });
+
+  maybe("legacy finalize without settlement does not scan tape parts on HTTP Phase A", async () => {
+    const sessionId = "s-rev4-http-no-parts";
+    const userId = "c:1";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const tape = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 11,
+      status: "completed",
+      turnKey: "f".repeat(64),
+      text: "must not load parts",
+      createdAt: 1_700_000_400_000,
+    });
+    for (const part of tape.parts) {
+      await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+    }
+    let partPayloadReads = 0;
+    _setPhaseASqlObserver((sql) => {
+      if (/client_session_turn_tape_parts/i.test(sql) && /\bpayload\b/i.test(sql)) {
+        partPayloadReads += 1;
+      }
+    });
+    try {
+      const result = await backend.finalizeLosslessTurnTape(userId, tape.finalize, { materialize: false });
+      assert.equal(result.applied, "finalized");
+      assert.equal(partPayloadReads, 0);
+    } finally {
+      _setPhaseASqlObserver(null);
+    }
+  });
+
+  maybe("legacy order-sensitive settlement hash upgrades after semantic authority verification", async () => {
+    const sessionId = "s-rev4-stable-settlement-hash";
+    const userId = "c:1";
+    const turnKey = "8".repeat(64);
+    const requestId = "3".repeat(32);
+    const engineBilling = {
+      requestId,
+      turnKey,
+      engineSessionId: `oceng-${"4".repeat(48)}`,
+      status: "success" as const,
+      durationMs: 7,
+      usage: { input_tokens: 11, output_tokens: 5 },
+    };
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const tape = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 13,
+      status: "completed",
+      turnKey,
+      requestId,
+      text: "stable settlement",
+      createdAt: 1_700_000_600_000,
+      engineBilling,
+    });
+    for (const part of tape.parts) {
+      await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+    }
+    const billingAnchorId = `srv-${sessionId}-main-t13`;
+    const settlementBillings = [{
+      status: "success" as const,
+      usage: { output_tokens: 5, input_tokens: 11 },
+      durationMs: 7,
+      engineSessionId: `oceng-${"4".repeat(48)}`,
+      turnKey,
+      requestId,
+    }];
+    const visible = await backend.finalizeLosslessTurnTape(userId, {
+      ...tape.finalize,
+      settlement: {
+        billingAnchorId,
+        requestId,
+        engineBillings: settlementBillings,
+        text: "stable settlement",
+        ts: 1_700_000_600_000,
+      },
+    }, { materialize: false });
+    assert.equal(visible.applied, "finalized");
+    const legacyHash = createHash("sha256").update(JSON.stringify({
+      billingAnchorId,
+      requestId,
+      engineBillings: settlementBillings,
+    })).digest("hex");
+    await pool.query(
+      `UPDATE client_session_turn_tapes SET settlement_hash=$4
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+      [sessionId, userId, tape.finalize.tapeId, legacyHash],
+    );
+    await pool.query(
+      `UPDATE turn_tape_settlement_jobs SET settlement_hash=$4
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+      [sessionId, userId, tape.finalize.tapeId, legacyHash],
+    );
+    const materialized = await backend.finalizeLosslessTurnTape(userId, tape.finalize);
+    assert.equal(materialized.applied, "finalized");
+    const repaired = (
+      await pool.query<{
+        settlement_hash: string;
+        settlement_verified_at: string | null;
+        materialization_status: string;
+      }>(
+        `SELECT settlement_hash, settlement_verified_at::text, materialization_status
+           FROM client_session_turn_tapes
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+        [sessionId, userId, tape.finalize.tapeId],
+      )
+    ).rows[0]!;
+    assert.notEqual(repaired.settlement_hash, legacyHash);
+    assert.ok(repaired.settlement_verified_at);
+    assert.equal(repaired.materialization_status, "complete");
+    const jobHash = (
+      await pool.query<{ settlement_hash: string; status: string }>(
+        `SELECT settlement_hash,status FROM turn_tape_settlement_jobs
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+        [sessionId, userId, tape.finalize.tapeId],
+      )
+    ).rows[0]!;
+    assert.equal(jobHash.settlement_hash, repaired.settlement_hash);
+    assert.equal(jobHash.status, "queued");
+  });
+
+  maybe("wrong billingAnchorId with matching billings is rejected before verify", async () => {
+    const sessionId = "s-rev4-anchor-mismatch";
+    const userId = "c:1";
+    const turnKey = "9".repeat(64);
+    const requestId = "1".repeat(32);
+    const engineBilling = {
+      requestId,
+      turnKey,
+      engineSessionId: `oceng-${"2".repeat(48)}`,
+      status: "success" as const,
+      durationMs: 5,
+    };
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const tape = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 12,
+      status: "completed",
+      turnKey,
+      requestId,
+      text: "paid answer",
+      createdAt: 1_700_000_500_000,
+      engineBilling,
+    });
+    for (const part of tape.parts) {
+      await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+    }
+    const canonicalAnchor = `srv-${sessionId}-main-t12`;
+    await backend.finalizeLosslessTurnTape(userId, {
+      ...tape.finalize,
+      settlement: {
+        billingAnchorId: `${canonicalAnchor}-WRONG`,
+        requestId,
+        engineBillings: [engineBilling],
+        text: "paid answer",
+        ts: 1_700_000_500_000,
+      },
+    }, { materialize: false });
+    await assert.rejects(
+      () => backend.finalizeLosslessTurnTape(userId, {
+        ...tape.finalize,
+        settlement: {
+          billingAnchorId: `${canonicalAnchor}-WRONG`,
+          requestId,
+          engineBillings: [engineBilling],
+          text: "paid answer",
+          ts: 1_700_000_500_000,
+        },
+      }),
+      /billingAnchorId mismatch/,
+    );
+    const header = (
+      await pool.query<{ settlement_verified_at: string | null }>(
+        `SELECT settlement_verified_at::text FROM client_session_turn_tapes
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+        [sessionId, userId, tape.finalize.tapeId],
+      )
+    ).rows[0];
+    assert.equal(header?.settlement_verified_at, null);
+    const jobs = (
+      await pool.query<{ status: string }>(
+        `SELECT status FROM turn_tape_settlement_jobs
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+        [sessionId, userId, tape.finalize.tapeId],
+      )
+    ).rows;
+    assert.ok(jobs.length > 0);
+    assert.ok(jobs.every((job) => job.status === "held"));
   });
 });

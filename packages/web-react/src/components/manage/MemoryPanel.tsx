@@ -1,4 +1,4 @@
-import { Brain, Check, ChevronRight, MoonStar, Plus, Search, Sparkles, Trash2 } from "lucide-react";
+import { AlertTriangle, BarChart3, Brain, Check, ChevronRight, MoonStar, Plus, Search, Sparkles, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useId, useState } from "react";
 import { ApiError, api, apiErrorMessage } from "../../lib/api";
 import type {
@@ -8,6 +8,7 @@ import type {
   AutoDreamReportResponse,
   MemoryFileMeta,
   MemoryIndexResponse,
+  MemoryUsageDashboard,
 } from "../../lib/types";
 import { cn } from "../../lib/utils";
 import {
@@ -67,10 +68,10 @@ export function MemoryPanel({
   agents: { id: string; name: string }[];
 }) {
   const [selected, setSelected] = useState(agentId);
-  const [tab, setTab] = useState<"core" | "profile">("core");
+  const [tab, setTab] = useState<"core" | "profile" | "usage">("core");
   // 选中项必须在可选列表内（agent 刚被卸载时回落到列表首项/传入项）。
   const effective = agents.some((a) => a.id === selected) ? selected : agentId;
-  const showPicker = agents.length > 1 && tab === "core";
+  const showPicker = agents.length > 1 && tab !== "profile";
 
   return (
     <div className="flex flex-col">
@@ -95,10 +96,11 @@ export function MemoryPanel({
           aria-label="记忆分区"
           idBase={TAB_ID_BASE}
           value={tab}
-          onValueChange={(v) => setTab(v === "profile" ? "profile" : "core")}
+          onValueChange={(v) => setTab(v === "profile" ? "profile" : v === "usage" ? "usage" : "core")}
           items={[
             { value: "core", label: "核心记忆" },
             { value: "profile", label: "用户画像" },
+            { value: "usage", label: "使用情况" },
           ]}
         />
       </div>
@@ -110,11 +112,162 @@ export function MemoryPanel({
       >
         {tab === "core" ? (
           <CoreMemorySection key={`core:${effective}`} auth={auth} agentId={effective} />
-        ) : (
+        ) : tab === "profile" ? (
           // 画像共享,用初始 agentId(稳定)做路由参数,与切换器无关。
           <UserProfileSection key="shared:user" auth={auth} agentId={agentId} />
+        ) : (
+          <MemoryUsageSection key={`usage:${effective}`} auth={auth} agentId={effective} />
         )}
       </div>
+    </div>
+  );
+}
+
+const OPERATION_LABELS: Record<string, string> = {
+  index_injected: "索引注入",
+  core_search: "核心检索",
+  core_read: "正文读取",
+  core_write: "新增核心记忆",
+  core_update: "更新核心记忆",
+  core_delete: "删除核心记忆",
+  profile_write: "更新用户画像",
+  session_search: "历史会话召回",
+  archival_add: "归档新增",
+  archival_search: "归档检索",
+  archival_delete: "归档删除",
+  auto_add: "自动记忆新增",
+  auto_skip: "自动记忆跳过",
+  auto_refuse: "自动记忆拒绝",
+};
+
+function MemoryUsageSection({ auth, agentId }: { auth: AuthSession; agentId: string }) {
+  const [days, setDays] = useState(30);
+  const [value, setValue] = useState<MemoryUsageDashboard | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    setLoading(true);
+    setErr(null);
+    loadWithColdStartRetry(() => api.getMemoryUsage(auth, agentId, days), () => alive)
+      .then((result) => {
+        if (alive) setValue(result);
+      })
+      .catch((error) => {
+        if (alive) setErr(apiErrorMessage(error, "加载记忆使用情况失败"));
+      })
+      .finally(() => {
+        if (alive) setLoading(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [auth, agentId, days]);
+
+  const totals = value?.totals;
+  const retrievals = value?.byOperation.filter((row) =>
+    ["core_search", "session_search", "archival_search"].includes(row.operation),
+  ) ?? [];
+  const retrievalEvents = retrievals.reduce((sum, row) => sum + row.events, 0);
+  const hitEvents = retrievals.reduce((sum, row) => sum + row.hits, 0);
+  const hitRate = retrievalEvents > 0 ? Math.round((hitEvents / retrievalEvents) * 100) : 0;
+
+  return (
+    <div className="flex flex-col gap-4 px-4 py-3.5">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <p className="text-body-sm font-medium text-foreground">记忆在会话里如何被使用</p>
+          <p className="mt-1 text-caption text-muted">直接记录于记忆实现边界，不再从工具文本反推。</p>
+        </div>
+        <Select
+          aria-label="统计时间范围"
+          value={String(days)}
+          onValueChange={(next) => setDays(Number(next) || 30)}
+          options={[
+            { value: "7", label: "近 7 天" },
+            { value: "30", label: "近 30 天" },
+            { value: "90", label: "近 90 天" },
+          ]}
+          inputSize="sm"
+          className="w-28"
+        />
+      </div>
+
+      {err && <Alert tone="danger" density="compact">{err}</Alert>}
+      {loading ? (
+        <ListSkeleton rows={4} />
+      ) : !value || !totals || totals.events === 0 ? (
+        <EmptyState
+          icon={BarChart3}
+          title="还没有可统计的记忆操作"
+          hint="后续检索、写入和索引注入会自动出现在这里。"
+        />
+      ) : (
+        <>
+          {totals.freshnessGaps > 0 && (
+            <Alert tone="warning" density="compact">
+              <span className="inline-flex items-center gap-1.5">
+                <AlertTriangle size={14} />
+                发现 {totals.freshnessGaps} 次“询问当前状态但仅使用历史记忆、未见实时证据”的影子风险。
+              </span>
+            </Alert>
+          )}
+
+          <div className="grid grid-cols-2 gap-2 lg:grid-cols-4">
+            {[
+              ["使用会话", totals.sessions],
+              ["记忆操作", totals.events],
+              ["检索命中率", `${hitRate}%`],
+              ["新鲜度风险", totals.freshnessGaps],
+            ].map(([label, metric]) => (
+              <div key={String(label)} className="rounded-xl border border-border bg-surface-subtle px-3 py-2.5">
+                <div className="text-caption text-muted">{label}</div>
+                <div className="mt-1 text-lg font-semibold text-foreground">{metric}</div>
+              </div>
+            ))}
+          </div>
+
+          <section className="overflow-hidden rounded-xl border border-border">
+            <div className="border-b border-border px-3 py-2 text-body-sm font-medium">按操作</div>
+            <div className="divide-y divide-border">
+              {value.byOperation.map((row) => (
+                <div key={`${row.operation}:${row.memoryType}`} className="grid grid-cols-[1fr_auto] gap-3 px-3 py-2.5">
+                  <div className="min-w-0">
+                    <div className="truncate text-body-sm text-foreground">
+                      {OPERATION_LABELS[row.operation] ?? row.operation}
+                    </div>
+                    <div className="mt-0.5 text-caption text-muted">
+                      {row.sessions} 个会话 · p50 {row.p50Ms}ms · p95 {row.p95Ms}ms
+                    </div>
+                  </div>
+                  <div className="text-right text-body-sm font-medium text-foreground">{row.events} 次</div>
+                </div>
+              ))}
+            </div>
+          </section>
+
+          <section className="overflow-hidden rounded-xl border border-border">
+            <div className="border-b border-border px-3 py-2 text-body-sm font-medium">最近会话</div>
+            <div className="divide-y divide-border">
+              {value.recentSessions.slice(0, 20).map((row) => (
+                <div key={row.sessionKey} className="px-3 py-2.5">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0 truncate text-body-sm text-foreground">{row.title}</div>
+                    <TimeAgo value={row.lastAt} className="shrink-0 text-caption text-muted" />
+                  </div>
+                  <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-caption text-muted">
+                    <span>{row.events} 次操作</span>
+                    <span>{row.searches} 次检索</span>
+                    <span>{row.writes} 次写入</span>
+                    {row.freshnessGaps > 0 && <span className="text-warning">{row.freshnessGaps} 次新鲜度风险</span>}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </section>
+        </>
+      )}
     </div>
   );
 }

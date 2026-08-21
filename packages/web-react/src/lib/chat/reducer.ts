@@ -125,6 +125,17 @@ function acceptFrameSeq(sess: ChatSession, frame: { frameSeq?: number; sessionKe
   return true;
 }
 
+/** Advance the cursor when seq is newer; never reject. Permission prompts are
+ *  idempotent by requestId and must survive stream reordering; other frame
+ *  types keep acceptFrameSeq's drop-on-regression semantics. */
+function noteFrameSeqIfNewer(sess: ChatSession, frame: { frameSeq?: number; sessionKey?: string }): void {
+  const fs = frame.frameSeq;
+  if (!(typeof fs === "number" && fs > 0)) return;
+  const key = frameSeqKey(frame, sess.id);
+  const last = getFrameSeqCursor(sess._lastFrameSeqByKey, sess._lastFrameSeq, key);
+  if (fs > last) setFrameSeqCursor(sess, key, fs);
+}
+
 /** 公开给 resume_failed：把游标推到 server currentLast（§4）。
  *  只进不退:重启后的空 ring/陈旧信号可能带 to=0 或倒退值,回退游标会让后续
  *  重放帧被当新帧重复应用/让本地状态被无谓重置(纵深防御,主修在 bridge 侧)。*/
@@ -515,6 +526,25 @@ function isImmutableTapeViewportRow(message: ChatMessage): boolean {
     typeof message._turnTapeProcessLoadedFrom === "string" &&
     message._turnTapeProcessLoadedFrom.length > 0
   );
+}
+
+/** Only proven-terminal tape/timeline rows are frozen. `_turnTapeId` or
+ * `_source:"server"` alone is not enough: rolling refs and REST/WS overlap
+ * can carry those marks while later live incrementals are still authoritative. */
+function isFrozenLiveTarget(message: ChatMessage): boolean {
+  if (isImmutableTapeViewportRow(message)) return true;
+  return message._turnTapeComplete === true;
+}
+
+function frameSeqAlreadyApplied(message: ChatMessage, frameSeq?: number): boolean {
+  if (!(typeof frameSeq === "number" && Number.isSafeInteger(frameSeq) && frameSeq > 0)) return false;
+  return message._appliedFrameSeqs?.[frameSeq] === true;
+}
+
+function noteAppliedFrameSeq(message: ChatMessage, frameSeq?: number): void {
+  if (!(typeof frameSeq === "number" && Number.isSafeInteger(frameSeq) && frameSeq > 0)) return;
+  if (!message._appliedFrameSeqs) message._appliedFrameSeqs = {};
+  message._appliedFrameSeqs[frameSeq] = true;
 }
 
 function matchesDelegateProgress(groupMsg: ChatMessage, progress: ChatMessage): boolean {
@@ -994,6 +1024,56 @@ function applyDelegatePhaseToGroup(sess: ChatSession, groupMsg: ChatMessage, blo
   }
 }
 
+
+/** Insert a newly minted process card at the tool-call site: after the owning
+ * user row / earlier process cards, immediately before this turn's streaming
+ * or terminal assistant. Leftover live journals otherwise `push` after the
+ * already-final answer. */
+function placeProcessCardAtCallSite(sess: ChatSession, card: ChatMessage): void {
+  const idx = sess.messages.lastIndexOf(card);
+  if (idx < 0) return;
+  // Active turn: only slide in front of this turn's streaming assistant.
+  // Without one, keep the card at the tail — walking backward would cross
+  // the current user row and land before the previous turn's answer.
+  // Leftover child-mirror frames still belong to the previous completed
+  // turn's assistant, not a newly typed next prompt; those may walk back.
+  let insertAt = -1;
+  const streaming = sess._streamingAssistant;
+  if (streaming) {
+    const sidx = sess.messages.indexOf(streaming);
+    if (sidx >= 0 && sidx < idx) insertAt = sidx;
+  }
+  if (insertAt < 0 && !sess._sendingInFlight) {
+    for (let i = idx - 1; i >= 0; i--) {
+      const m = sess.messages[i];
+      if (
+        m?.role === "assistant" &&
+        !m._turnTapeProcess &&
+        !m._errorCode &&
+        typeof m.text === "string" &&
+        m.text.trim().length > 0
+      ) {
+        insertAt = i;
+        break;
+      }
+    }
+  }
+  if (insertAt < 0 || insertAt >= idx) return;
+  sess.messages.splice(idx, 1);
+  sess.messages.splice(insertAt, 0, card);
+}
+
+function isFrozenDelegateCard(message: ChatMessage, runId: string): boolean {
+  if (message._adoptedInto) return false;
+  if (!isServerAuthoredRow(message) && !isImmutableTapeViewportRow(message)) return false;
+  return (message.role === "delegate-progress" && message.runId === runId) ||
+    (message.role === "agent-group" && message._delegateRunId === runId);
+}
+
+function hasFrozenDelegateCard(sess: ChatSession, runId: string): boolean {
+  return sess.messages.some((m) => isFrozenDelegateCard(m, runId));
+}
+
 function handleDelegateProgressBlock(
   sess: ChatSession,
   block: DelegateProgressBlock,
@@ -1036,6 +1116,7 @@ function handleDelegateProgressBlock(
   // server-authored 骨架行按 runId 折叠去重(债A),消除「兜底卡 + 团队面板」三卡并存。单数委派(无 fan-out
   // tool 卡)则保留下方 delegate-progress standalone 兜底,由后到的 delegate_task tool_use adopt(零回归)。
   if (!legacy && hasActiveFanoutDelegate(sess)) {
+    if (hasFrozenDelegateCard(sess, block.runId)) return;
     const goalRaw = typeof block.goal === "string" ? block.goal : "";
     const groupMsg = addMessage(sess, "agent-group", goalRaw.trim() || "子任务", {
       startTime: Date.now(),
@@ -1047,15 +1128,18 @@ function handleDelegateProgressBlock(
       _completed: false,
       ...(turnOwnerId ? { _turnOwnerId: turnOwnerId } : {}),
     });
+    placeProcessCardAtCallSite(sess, groupMsg);
     if (!sess._delegateRunGroups) sess._delegateRunGroups = new Map();
     sess._delegateRunGroups.set(block.runId, groupMsg.id);
     applyDelegatePhaseToGroup(sess, groupMsg, block);
+    if (!sess._sendingInFlight) sess.messages = repairPostFinalProcessOrder(sess.messages);
     return;
   }
 
   // Fallback: standalone delegate-progress card keyed by runId.
   let msg = legacy;
   if (!msg) {
+    if (hasFrozenDelegateCard(sess, block.runId)) return;
     msg = addMessage(sess, "delegate-progress", "", {
       runId: block.runId,
       agentId: block.agentId || "",
@@ -1066,6 +1150,7 @@ function handleDelegateProgressBlock(
       _completed: false,
       ...(turnOwnerId ? { _turnOwnerId: turnOwnerId } : {}),
     });
+    placeProcessCardAtCallSite(sess, msg);
   }
   if (block.agentId) msg.agentId = block.agentId;
   if (typeof block.goal === "string" && block.goal && !msg._delegateGoal) {
@@ -1101,6 +1186,7 @@ function handleDelegateProgressBlock(
   }
   const group = findSingleMatchingDelegateGroup(sess, msg);
   if (group) mergeDelegateProgressIntoGroup(sess, group, msg);
+  if (!sess._sendingInFlight) sess.messages = repairPostFinalProcessOrder(sess.messages);
 }
 
 // ═══════════════ plan 卡身份（websocket.js:668-751）═══════════════
@@ -1430,19 +1516,32 @@ export function applyOutboundMessage(
     !frame.isFinal &&
     hasBlocks &&
     (frame.blocks as Array<{ kind?: string }>).every((b) => b?.kind === "tool_output_tail");
+  // 父轮 isFinal 之后仍可能涌来无 cmid 的 delegate_progress（子 agent 镜像到 leftover
+  // legacy:* live journal）。这和晚到 bash tail 是同一类事故：不是父模型新内容，
+  // 绝不能把已结束轮重新点亮成「正在生成」。混合帧(progress + text/tool)仍照旧。
+  const progressOnlyFrame =
+    !frame.isFinal &&
+    hasBlocks &&
+    (frame.blocks as Array<{ kind?: string }>).every((b) => b?.kind === "delegate_progress");
+  // leftover 才把 progress-only 当 sideband（不复活已收尾轮）。活跃轮仍要绑
+  // reply tracker、把 user 行 sent→read、并触发 onLiveFrame；否则首帧就是委派
+  // 进度时会吞掉这些生命周期信号。复活 _sendingInFlight 的那行已有
+  // !sess._sendingInFlight 守卫，sideband 限 leftover 保住「不点亮已收尾轮」。
+  const leftoverProgressSideband = progressOnlyFrame && !sess._sendingInFlight;
+  const lifecycleSidebandFrame = tailOnlyFrame || leftoverProgressSideband;
   // reload 后若本轮仍有新内容抵达，先通过 frameSeq/stale/agent-switch 守卫，再恢复 in-flight；cron 推送不是用户 turn。
-  if (!frame.isFinal && !frame.cronJob && hasBlocks && !tailOnlyFrame && !sess._sendingInFlight)
+  if (!frame.isFinal && !frame.cronJob && hasBlocks && !lifecycleSidebandFrame && !sess._sendingInFlight)
     sess._sendingInFlight = true;
   if (hasBlocks || frame.isFinal) markFrameReceived(sess);
   // 自动重试软提示的**内容帧兜底消解**:引擎在下一 attempt 产出真实内容(非 tail-only)即代表流
   // 已恢复 → 清 retrying,防 gateway 的 turn_status:null 复位帧在断线重连窗口丢失时软提示粘住。
   // final/error/interrupted 由 clearTurnTiming 统一清 _turnStatus,此处只兜「流恢复但 null 帧丢」。
-  if (hasBlocks && !tailOnlyFrame && isRetryingTurnStatus(sess._turnStatus)) sess._turnStatus = null;
+  if (hasBlocks && !lifecycleSidebandFrame && isRetryingTurnStatus(sess._turnStatus)) sess._turnStatus = null;
   // thinking-safety：通过守卫的非 final 帧重置；isFinal 清（由 socket 持 timer）。tail-only 帧不触发。
-  if (sess._sendingInFlight && !frame.isFinal && !tailOnlyFrame) effects.onLiveFrame?.(sess);
+  if (sess._sendingInFlight && !frame.isFinal && !lifecycleSidebandFrame) effects.onLiveFrame?.(sess);
 
   // reply tracker 绑定 / user 行状态 / answer 计数 / isFinal 收尾 —— tail-only 帧全部短路(见上注释)。
-  if (!tailOnlyFrame) {
+  if (!lifecycleSidebandFrame) {
     // reply tracker 绑定（跳过 queued）。
     if (!sess._replyingToMsgId) {
       const pending = [...sess.messages]
@@ -1532,7 +1631,7 @@ export function applyOutboundMessage(
         if (
           b.messageId && sess.messages.some((message) =>
             message.id === b.messageId && message.role === "assistant" &&
-            isImmutableTapeViewportRow(message))
+            isFrozenLiveTarget(message))
         ) continue;
         sess._streamingAssistant = findOrCreateStreamingRow(
           sess.messages,
@@ -1551,6 +1650,8 @@ export function applyOutboundMessage(
       if (frameTurnOwnerId && !sess._streamingAssistant._turnOwnerId) {
         sess._streamingAssistant._turnOwnerId = frameTurnOwnerId;
       }
+      if (frameSeqAlreadyApplied(sess._streamingAssistant, frame.frameSeq)) continue;
+      noteAppliedFrameSeq(sess._streamingAssistant, frame.frameSeq);
       sess._streamingAssistant.text += blockText;
       sess._streamingAssistant.completedAt = Date.now();
     } else if (b.kind === "thinking") {
@@ -1558,7 +1659,7 @@ export function applyOutboundMessage(
         if (
           b.messageId && sess.messages.some((message) =>
             message.id === b.messageId && message.role === "thinking" &&
-            isImmutableTapeViewportRow(message))
+            isFrozenLiveTarget(message))
         ) continue;
         sess._streamingThinking = findOrCreateStreamingRow(
           sess.messages,
@@ -1573,6 +1674,8 @@ export function applyOutboundMessage(
       if (frameTurnOwnerId && !sess._streamingThinking._turnOwnerId) {
         sess._streamingThinking._turnOwnerId = frameTurnOwnerId;
       }
+      if (frameSeqAlreadyApplied(sess._streamingThinking, frame.frameSeq)) continue;
+      noteAppliedFrameSeq(sess._streamingThinking, frame.frameSeq);
       sess._streamingThinking.text += blockText;
       sess._streamingThinking.completedAt = Date.now();
     } else if (b.kind === "plan") {
@@ -2042,8 +2145,16 @@ export function applyTurnStatus(sess: ChatSession, frame: OutboundTurnStatusWire
       max: AUTOMATIC_TURN_RETRY_MAX,
       retryAt: frame.retry.retryAt,
     };
+  } else if (frame.status === "working") {
+    // Do not set a phase that hides silenceMs. Compact/retry stay as they
+    // are; Cursor-only working ticks only refresh liveness + optional hint.
+    // Old clients that ignore this status fall through to the else branch
+    // and still call markFrameReceived above.
+    const detail = typeof frame.detail === "string" ? frame.detail.trim() : "";
+    if (detail) sess._turnProgressHint = detail;
   } else {
     sess._turnStatus = null;
+    sess._turnProgressHint = undefined;
   }
 }
 
@@ -2083,7 +2194,36 @@ export function applyCallUsage(sess: ChatSession, frame: OutboundCallUsageWire):
 }
 
 // ═══════════════ outbound.error 双帧（§11）═══════════════
+/**
+ * Leftover live-journal `outbound.error` after a turn (or a later turn) already
+ * completed on tape. Hydrate/replay would otherwise append a phantom red card
+ * at the end of a finished session. Never suppress the active in-flight turn.
+ */
+export function shouldSuppressStaleOutboundError(sess: ChatSession, frame: OutboundErrorWire): boolean {
+  const cmid = typeof frame.clientMessageId === "string" && frame.clientMessageId
+    ? frame.clientMessageId
+    : undefined;
+  if (cmid && sess._activeClientMessageId === cmid) return false;
+  const isCompletedTapeAssistant = (m: ChatSession["messages"][number]) =>
+    m.role === "assistant" && m._turnTapeComplete === true && !m._errorCode;
+  if (cmid && sess.messages.some((m) => m._clientMessageId === cmid && isCompletedTapeAssistant(m))) {
+    return true;
+  }
+  if (sess._sendingInFlight) return false;
+  if (!cmid) {
+    return sess.messages.some(isCompletedTapeAssistant);
+  }
+  const userIdx = sess.messages.findIndex((m) => m.role === "user" && m.id === cmid);
+  if (userIdx < 0) {
+    return sess.messages.some(isCompletedTapeAssistant);
+  }
+  return sess.messages.slice(userIdx + 1).some((m) =>
+    (m.role === "user" && m.id !== cmid) || isCompletedTapeAssistant(m),
+  );
+}
+
 export function applyOutboundError(sess: ChatSession, frame: OutboundErrorWire, effects: FrameEffects = {}): void {
+  if (shouldSuppressStaleOutboundError(sess, frame)) return;
   if (typeof frame.frameSeq === "number" && frame.frameSeq > 0) {
     if (!acceptFrameSeq(sess, frame)) return;
     sess._suppressErrorBubbleAtSeq = frame.frameSeq + 1;
@@ -2368,29 +2508,83 @@ export function applyCostWaived(sess: ChatSession | null, frame: CostWaivedWire,
 }
 
 // ═══════════════ permission_request / settled（§3 去重）═══════════════
+function applyPermissionSettlementToCard(
+  msg: ChatMessage,
+  settlement: {
+    behavior: "allow" | "deny";
+    reason?: string | null;
+    answers?: Record<string, string>;
+  },
+): void {
+  msg._resolved = true;
+  msg._behavior = settlement.behavior;
+  msg._settledReason = settlement.reason || null;
+  if (settlement.answers && typeof settlement.answers === "object") msg._answers = settlement.answers;
+}
+
+function consumePendingPermissionSettlement(sess: ChatSession, msg: ChatMessage): void {
+  const requestId = msg.requestId;
+  if (!requestId || !sess._pendingPermissionSettlements) return;
+  const pending = sess._pendingPermissionSettlements[requestId];
+  if (!pending) return;
+  applyPermissionSettlementToCard(msg, pending);
+  delete sess._pendingPermissionSettlements[requestId];
+}
+
 export function applyPermissionRequest(sess: ChatSession, frame: OutboundPermissionRequestWire): ChatMessage | null {
-  if (!acceptFrameSeq(sess, frame)) return null;
-  return addMessage(sess, "permission", frame.toolName, {
-    requestId: frame.requestId,
+  noteFrameSeqIfNewer(sess, frame);
+  const requestId = frame.requestId;
+  const existing = sess.messages.find(
+    (m) =>
+      m.role === "permission" &&
+      !isImmutableTapeViewportRow(m) &&
+      (m.requestId === requestId || m.id === requestId),
+  );
+  if (existing) {
+    consumePendingPermissionSettlement(sess, existing);
+    return existing;
+  }
+  const detachedAskUser =
+    (frame as { detachedAskUser?: unknown }).detachedAskUser === true ||
+    (typeof requestId === "string" && requestId.startsWith("ask-user:"));
+  const expiresAt = (frame as { expiresAt?: unknown }).expiresAt;
+  const card = addMessage(sess, "permission", frame.toolName, {
+    // Detached ask_user cards share this id with the server tape row so
+    // full-sync / another device merges by id instead of duplicating.
+    ...(typeof requestId === "string" && requestId.startsWith("ask-user:")
+      ? { id: requestId }
+      : {}),
+    requestId,
     toolName: frame.toolName,
     inputPreview: frame.inputPreview || "",
     inputJson: frame.inputJson || null,
     _resolved: false,
+    ...(detachedAskUser ? { _detachedAskUser: true } : {}),
+    ...(typeof expiresAt === "number" ? { _askUserExpiresAt: expiresAt } : {}),
     ...((frame.clientMessageId ?? sess._activeClientMessageId)
       ? { _turnOwnerId: frame.clientMessageId ?? sess._activeClientMessageId }
       : {}),
   });
+  consumePendingPermissionSettlement(sess, card);
+  return card;
 }
 
 export function applyPermissionSettled(sess: ChatSession, frame: OutboundPermissionSettledWire): void {
-  if (!acceptFrameSeq(sess, frame)) return;
+  noteFrameSeqIfNewer(sess, frame);
+  const requestId = frame.requestId;
   const msg = sess.messages.find((m) =>
-    m.requestId === frame.requestId && !isImmutableTapeViewportRow(m));
-  if (!msg) return;
-  msg._resolved = true;
-  msg._behavior = frame.behavior;
-  msg._settledReason = frame.reason || null;
-  if (frame.answers && typeof frame.answers === "object") msg._answers = frame.answers;
+    (m.requestId === requestId || m.id === requestId) && !isImmutableTapeViewportRow(m));
+  const settlement = {
+    behavior: frame.behavior,
+    reason: frame.reason || null,
+    ...(frame.answers && typeof frame.answers === "object" ? { answers: frame.answers } : {}),
+  };
+  if (!msg) {
+    sess._pendingPermissionSettlements = sess._pendingPermissionSettlements ?? {};
+    sess._pendingPermissionSettlements[requestId] = settlement;
+    return;
+  }
+  applyPermissionSettlementToCard(msg, settlement);
 }
 
 export { AUTO_CONTINUE_PROMPT };

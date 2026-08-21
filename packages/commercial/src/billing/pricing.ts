@@ -19,10 +19,11 @@
  */
 
 import { Client } from "pg";
-import { modelReasoningPolicy, STATIC_KEY_PROVIDERS } from "@openclaude/protocol";
+import { COST_INDEX_BASELINE_MODEL_ID, costXVsBaseline, modelReasoningPolicy, STATIC_KEY_PROVIDERS } from "@openclaude/protocol";
 import { query } from "../db/queries.js";
 import { loadConfig } from "../config.js";
 import { CATALOG_CHANNEL } from "./modelCatalog.js";
+import { meetsMinPlan } from "./planEntitlement.js";
 
 export type ModelVisibility = "public" | "admin" | "hidden";
 
@@ -70,6 +71,9 @@ export interface ModelPricing {
    */
   default_effort: string | null;
   updated_at: Date;
+  /** Null = no subscription floor. Loaded with min_plan_tier from subscription_plans. */
+  min_plan_code?: string | null;
+  min_plan_tier?: number | null;
 }
 
 /**
@@ -89,6 +93,12 @@ export interface PublicModel {
   multiplier: string;
   /** protocol modelReasoningPolicy 的 API 投影；空数组 = 此模型不支持思考深度。 */
   supported_efforts: string[];
+  /** Catalog execution metadata used only for model-switch UX preflight. */
+  engine?: string;
+  context_window?: number | null;
+  supports_vision?: boolean;
+  /** Blended cost vs DeepSeek V4 Pro, one decimal. Omitted if baseline missing. */
+  cost_x?: number;
   /**
    * 0108 provider 健康度:该模型归属 provider 生效降级时由 /api/models handler 注解 true
    * (**注解不过滤**,前端据此标「暂不可用」+ 禁选)。PricingCache 本身不产出此字段
@@ -111,6 +121,8 @@ type RawRow = {
   extra_system_prompt: string | null;
   default_effort: string | null;
   updated_at: Date;
+  min_plan_code: string | null;
+  min_plan_tier: string | number | null;
 };
 
 function rowToPricing(r: RawRow): ModelPricing {
@@ -130,6 +142,8 @@ function rowToPricing(r: RawRow): ModelPricing {
     extra_system_prompt: r.extra_system_prompt,
     default_effort: r.default_effort,
     updated_at: r.updated_at,
+    min_plan_code: r.min_plan_code,
+    min_plan_tier: r.min_plan_tier == null || r.min_plan_tier === "" ? null : Number(r.min_plan_tier),
   };
 }
 
@@ -252,8 +266,11 @@ export class PricingCache {
                 SELECT 1 FROM model_catalog c
                  WHERE c.model_id = p.model_id AND c.state = 'active'
               ) AS enabled,
-              p.sort_order, p.visibility, p.extra_system_prompt, p.default_effort, p.updated_at
-         FROM model_pricing p`,
+              p.sort_order, p.visibility, p.extra_system_prompt, p.default_effort, p.updated_at,
+              p.min_plan_code,
+              sp.tier AS min_plan_tier
+         FROM model_pricing p
+         LEFT JOIN subscription_plans sp ON sp.code = p.min_plan_code`,
     );
     const next = new Map<string, ModelPricing>();
     for (const row of r.rows) next.set(row.model_id, rowToPricing(row));
@@ -337,16 +354,36 @@ export class PricingCache {
     return this.map.size;
   }
 
-  private toPublicModel = (p: ModelPricing): PublicModel => ({
-    id: p.model_id,
-    display_name: p.display_name,
-    input_per_ktok_credits: perKtokCredits(p.input_per_mtok, p.multiplier),
-    output_per_ktok_credits: perKtokCredits(p.output_per_mtok, p.multiplier),
-    cache_read_per_ktok_credits: perKtokCredits(p.cache_read_per_mtok, p.multiplier),
-    cache_write_per_ktok_credits: perKtokCredits(p.cache_write_per_mtok, p.multiplier),
-    multiplier: p.multiplier,
-    supported_efforts: [...modelReasoningPolicy(p.model_id).supported],
-  });
+  private toPublicModel = (p: ModelPricing): PublicModel => {
+    const baseline = this.map.get(COST_INDEX_BASELINE_MODEL_ID);
+    const costX = costXVsBaseline(
+      {
+        inputPerMtok: p.input_per_mtok,
+        cacheReadPerMtok: p.cache_read_per_mtok,
+        outputPerMtok: p.output_per_mtok,
+        multiplier: p.multiplier,
+      },
+      baseline
+        ? {
+            inputPerMtok: baseline.input_per_mtok,
+            cacheReadPerMtok: baseline.cache_read_per_mtok,
+            outputPerMtok: baseline.output_per_mtok,
+            multiplier: baseline.multiplier,
+          }
+        : null,
+    );
+    return {
+      id: p.model_id,
+      display_name: p.display_name,
+      input_per_ktok_credits: perKtokCredits(p.input_per_mtok, p.multiplier),
+      output_per_ktok_credits: perKtokCredits(p.output_per_mtok, p.multiplier),
+      cache_read_per_ktok_credits: perKtokCredits(p.cache_read_per_mtok, p.multiplier),
+      cache_write_per_ktok_credits: perKtokCredits(p.cache_write_per_mtok, p.multiplier),
+      multiplier: p.multiplier,
+      supported_efforts: [...modelReasoningPolicy(p.model_id).supported],
+      ...(costX !== undefined ? { cost_x: costX } : {}),
+    };
+  };
 
   /**
    * 公共可见模型列表(按 sort_order 升序),用于 `/api/public/models` 给匿名访客。
@@ -379,11 +416,19 @@ export class PricingCache {
     role: "user" | "admin";
     grantedModelIds: ReadonlySet<string>;
     deniedModelIds?: ReadonlySet<string>;
+    userPlanTier?: number | null;
+    orgPlanCode?: string | null;
   }): PublicModel[] {
     return [...this.map.values()]
       .filter((p) => {
         if (!p.enabled) return false;
         if (args.deniedModelIds?.has(p.model_id)) return false;
+        if (!meetsMinPlan({
+          minPlanCode: p.min_plan_code,
+          minPlanTier: p.min_plan_tier,
+          userPlanTier: args.userPlanTier,
+          orgPlanCode: args.orgPlanCode,
+        })) return false;
         if (p.visibility === "public") return true;
         if (p.visibility === "admin") {
           return args.role === "admin" || args.grantedModelIds.has(p.model_id);

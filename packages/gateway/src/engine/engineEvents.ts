@@ -55,7 +55,11 @@ export interface TurnRetryMeta {
  * 审计 R3:retrying 形态此前是 ccbMessageParser 的本地加宽(GatewayTurnPhase)+
  * 受控 cast;现正式进权威事件类型,parser / server / sessionManager 不再 cast。
  */
-export type EngineTurnPhase = 'compacting' | null | { status: 'retrying'; retry: TurnRetryMeta }
+export type EngineTurnPhase =
+  | 'compacting'
+  | null
+  | { status: 'retrying'; retry: TurnRetryMeta }
+  | { status: 'working'; detail?: string }
 
 /** Permission request from the engine (CCB: stdio control_request protocol) */
 export interface PermissionRequest {
@@ -240,11 +244,11 @@ export interface EngineBillingEvent extends DurableCodexBilling {
 }
 
 /** Subscription-backed engine audit sideband. Token fields are present only
- * when the upstream CLI reported them; they are observations, never a basis
- * for OpenClaude credit debits. */
+ * when the upstream CLI reported them. Master may also settle those
+ * observations onto the platform ledger (selfhost 0221+). */
 export interface EngineExternalBillingEvent {
   requestId: string
-  engine: 'cursor'
+  engine: 'cursor' | 'zcode'
   status: 'success' | 'error' | 'unavailable'
   terminalCode?: 'USER_CANCELLED' | 'AUTH_UNAVAILABLE' | 'QUOTA_UNAVAILABLE' | 'ENGINE_ERROR'
   durationMs: number
@@ -254,6 +258,8 @@ export interface EngineExternalBillingEvent {
     cache_read_input_tokens?: number
     cache_creation_input_tokens?: number
   }
+  /** 1-based oc-cursor slot results for passive quota-class learning. */
+  cursorSlotResults?: Array<{ slot: number; result: 'ok' | 'fail_auth' | 'fail_quota' | 'fail' }>
 }
 
 /**
@@ -306,6 +312,8 @@ export interface TurnSummary {
   stopReason: string | null
   numTurns: number | null
   isError: boolean
+  /** Source-engine native compact text, captured only for an explicit compact turn. */
+  nativeCompactionSummary?: string
   /** 错误分类。'auth' 触发 sessionManager 的 token-refresh + 回滚重试路径。
    *  错误字符串是底座私有知识(CCB: AUTH_KEYWORDS_RE / AUTH_ERROR_PREFIX_RE),
    *  分类逻辑下沉在各 adapter 内。 */

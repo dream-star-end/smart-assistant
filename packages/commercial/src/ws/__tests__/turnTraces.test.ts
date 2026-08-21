@@ -41,6 +41,10 @@ describe("recordTurnTrace", () => {
       // (受理成功后由 updateTurnTraceDispatch fire-and-forget 回填)。
       null,
       null,
+      null, // control-plane release absent in unit-test cwd
+      null, // control-plane commit absent in unit-test cwd
+      null, // bundle rev
+      null, // client build
     ]);
   });
 
@@ -68,7 +72,7 @@ describe("recordTurnTrace", () => {
     } as unknown as Pool;
     recordTurnTrace(pool, undefined, { traceId: "t", userId: 2n, sessionKey: "k" });
     await new Promise((r) => setImmediate(r));
-    assert.deepEqual(calls[0].params, ["t", "2", "k", null, null, null, null]);
+    assert.deepEqual(calls[0].params, ["t", "2", "k", null, null, null, null, null, null, null, null]);
   });
 
   it("updateTurnTraceDispatch → COALESCE 回填 dispatch_id/request_id(纯展示,不动主链)", async () => {

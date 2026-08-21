@@ -19,17 +19,28 @@ import type { Pool } from 'pg'
 import { EVENTS } from '../admin/alertEvents.js'
 import { safeEnqueueAlert } from '../admin/alertOutbox.js'
 import { isPermanentCodexWaiver, permanentCodexWaiverReason } from '../billing/codexFinalizer.js'
+import {
+  GATEWAY_EXITED_AT_CTX_KEY,
+  clearGatewayShutdownEvidenceByDispatchIds,
+  markGatewayShutdownEvidence,
+} from '../billing/finalizeJournalReconciler.js'
 import { advanceClientTimelineIdentityInTransaction } from '../db/pgSessionsBackend.js'
 import type { ContainerCallResult, DispatchIdentity } from './containerDispatchClient.js'
+import {
+  classifyVisibleOrphan,
+} from './visibleOrphan.js'
 import {
   casAdmittedToRejecting,
   casRejectingToAccepted,
   casToManualReconcile,
   casToTerminal,
+  clearDispatchShutdownEvidence,
   DISPATCH_OPEN_ALERT_AGE_MS,
   DISPATCH_REJECT_MIN_AGE_MS,
+  dispatchHasShutdownEvidence,
   getDispatchForUpdate,
   markClientNotified,
+  markOpenDispatchShutdownEvidence,
   resolveManualReconcile,
   scanAcceptedStuck,
   scanAdmittedLeaseExpired,
@@ -43,7 +54,35 @@ import {
 
 export const DEFAULT_RECONCILE_INTERVAL_MS = 30_000
 export const MIN_INTERVAL_MS = 5_000
+
+export function buildTurnDispatchReconcileFrame(input: {
+  sessionId: string
+  clientMessageId: string
+  reconcile?: 'turn_completed' | 'interrupted' | 'turn_state_unknown'
+}): Record<string, unknown> {
+  const terminal = input.reconcile === 'turn_completed' || input.reconcile === 'interrupted'
+  return {
+    type: 'outbound.message',
+    channel: 'webchat',
+    peer: { id: input.sessionId, kind: 'dm' },
+    clientMessageId: input.clientMessageId,
+    isFinal: terminal,
+    meta: {
+      reconcile: terminal ? input.reconcile : 'turn_state_unknown',
+      clientMessageId: input.clientMessageId,
+    },
+    ts: Date.now(),
+  }
+}
+
 export const DEFAULT_LIMIT = 50
+
+let visibleOrphanScanOffset = 0
+
+/** Test-only: reset closeVisibleOrphans OFFSET cursor. */
+export function _resetVisibleOrphanScanOffset(): void {
+  visibleOrphanScanOffset = 0
+}
 export const DEFAULT_CODEX_SESSION_MAX_MS = 600_000
 /** accepted stuck 阈值 floor = max(codexMax*2, 90min);env 只允许向上夹(更保守)。 */
 export const DEFAULT_ACCEPTED_STUCK_FLOOR_MS = 90 * 60 * 1000
@@ -58,6 +97,10 @@ export const SINK_WAIT_ALERT_MS = 24 * 3_600_000
  * 收敛链瘫痪 27h 无人知晓。求证失败必须有告警出口,不允许无限静默重试。
  */
 export const ACCEPTED_UNREACHABLE_ALERT_MS = 15 * 60 * 1000
+/** 优雅停机总预算:先落证据,再尽力求证;超时放弃求证,不挡退出。 */
+export const DEFAULT_SHUTDOWN_HANDOFF_BUDGET_MS = 5_000
+/** 停机单次容器求证上限,避免默认 5s transport timeout 吃完整预算。 */
+export const SHUTDOWN_PROBE_TIMEOUT_MS = 700
 
 /** accepted stuck 阈值解析:向上夹(同 finalizeJournalReconciler.resolveStuckThresholdMs 模式)。 */
 export function resolveDispatchStuckThresholdMs(
@@ -143,7 +186,7 @@ export async function abortNeverExecutedJournalForDispatch(
   const res = await client.query<{ user_id: string; request_id: string }>(
     `UPDATE request_finalize_journal
         SET state='aborted', error_msg=$2, failure_code='INTERNAL_ERROR',
-            final_credits=0, ctx=ctx - 'settlementClaimId', updated_at=NOW()
+            final_credits=0, ctx=ctx - 'settlementClaimId' - 'gatewayExitedAt' - 'gatewayExitReason', updated_at=NOW()
       WHERE dispatch_id=$1 AND state='inflight'
         AND NOT EXISTS (SELECT 1 FROM usage_records ur WHERE ur.dispatch_id=$1)
       RETURNING user_id, request_id`,
@@ -172,11 +215,27 @@ export interface TurnDispatchReconcilerDeps {
    * 让前端立即拉回 turn_dispatches 状态,不必等下次 hello/sync。published≠delivered
    * 是现实:失败/离线一律无害吞掉(状态已持久,下次进会话/sync 必达)。
    */
-  nudgeClient?: (uid: bigint, sessionId: string, clientMessageId: string) => void
+  nudgeClient?: (
+    uid: bigint,
+    sessionId: string,
+    clientMessageId: string,
+    reconcile?: 'turn_completed' | 'interrupted' | 'turn_state_unknown',
+  ) => void
   stuckThresholdMs?: number
   rejectMinAgeMs?: number
   limit?: number
   now?: () => number
+  /**
+   * 测试注入:本轮哪些 dispatch 带有「承载进程已退出」证据。
+   * 默认查 turn_dispatches.shutdown_ctx ∪ journal.ctx.gatewayExitedAt。
+   */
+  listCarrierDeadDispatchIds?: () => Promise<string[]>
+  /** Parts-complete branch: same Phase A entry as HTTP finalize. */
+  commitVisibleTape?: (input: {
+    userId: string
+    sessionId: string
+    tapeId: string
+  }) => Promise<void>
 }
 
 function idOf(row: TurnDispatchRow): DispatchIdentity {
@@ -198,6 +257,8 @@ export interface ReconcileTickCounts {
   alerts: number
   /** ⓪ 会话墓碑/行亡 → 自动结案(manual_reconcile(session_deleted)+ 机器 resolution)。 */
   sessionGoneClosed: number
+  /** rev2 closeVisibleOrphans: visible fallback / interrupt / fence. */
+  visibleOrphans: number
 }
 
 /**
@@ -219,6 +280,7 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
     notified: 0,
     alerts: 0,
     sessionGoneClosed: 0,
+    visibleOrphans: 0,
   }
 
   // ── ⓪ open ∧ 租约过期 ∧ 会话墓碑/行亡 → 自动结案(session_deleted)────────
@@ -243,12 +305,18 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
       resolution: 'auto_closed:session_deleted',
       now: now(),
     })
+    await clearExitMark(deps, row)
     counts.sessionGoneClosed++
   }
 
   // ── ① admitted ∧ 租约过期 ∧ age>rejectMinAge ─────────────────────────────
-  const admitted = await scanAdmittedLeaseExpired(deps.pool, { minAgeMs: rejectMinAge, limit, now: now() })
+  // 租约过期本身就是「owner 进程不再续租」的证据;5min age 门只挡无证据的幼龄行。
+  const admitted = await scanAdmittedLeaseExpired(deps.pool, { minAgeMs: 0, limit, now: now() })
+  const youngAdmitted = admitted.filter((row) => now() - row.admittedAt.getTime() < rejectMinAge)
+  const admittedDeadIds = new Set(await resolveCarrierDeadDispatchIds(deps, youngAdmitted))
   for (const row of admitted) {
+    const admittedAge = now() - row.admittedAt.getTime()
+    if (admittedAge < rejectMinAge && !admittedDeadIds.has(row.dispatchId)) continue
     const rejecting = await casAdmittedToRejecting(deps.pool, {
       dispatchId: row.dispatchId,
       expectedEpoch: row.leaseEpoch,
@@ -287,12 +355,26 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
     limit,
     now: now(),
   })
+  const youngAccepted = stuck.filter(
+    (row) => now() - (row.acceptedAt ?? row.admittedAt).getTime() < stuckMs,
+  )
+  const acceptedDeadIds = new Set(await resolveCarrierDeadDispatchIds(deps, youngAccepted))
   for (const row of stuck) {
     const age = now() - (row.acceptedAt ?? row.admittedAt).getTime()
+    const hasDeadEvidence = acceptedDeadIds.has(row.dispatchId) || dispatchHasShutdownEvidence(row)
     const res = await deps.container.getDispatchState(idOf(row))
+    if (res.kind === 'ok' && (res.state === 'running' || res.state === 'queued' || res.state === 'sink_staged')) {
+      // 真在飞:禁止因停机证据收口。清掉证据,避免下一轮不可达时误杀。
+      if (hasDeadEvidence) await clearExitMark(deps, row)
+      if (res.state === 'sink_staged' && age > SINK_WAIT_ALERT_MS) {
+        alertWarn(enqueue, row, `accepted dispatch awaiting sink for ${Math.round(age / 3_600_000)}h`, 'sink_wait')
+        counts.alerts++
+      }
+      continue
+    }
     if (res.kind !== 'ok') {
-      // 不可达/错误 → 等下轮重试;但持续失败必须有告警出口(alertWarn 按 dispatch+日去重):
-      // 曾静默 continue,SSRF 网段错配 100% 拦死求证时收敛链瘫痪 27h 无人知晓。
+      // 不可达/超时/error ≠ 容器已死。保留停机证据等下轮拿到明确非存活状态
+      // (absent / recovery_pending / terminal+crashed) 再收口;持续失败才告警。
       if (age > ACCEPTED_UNREACHABLE_ALERT_MS) {
         alertWarn(
           enqueue,
@@ -305,41 +387,45 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
       continue
     }
     if (res.state === 'terminal' && res.outcome === 'crashed') {
-      // The container durably proves its execution process ended, but it does
-      // not prove that a fully staged result can never arrive later. Persist a
-      // typed dispatch status only; never occupy or replace the immutable tape
-      // namespace. A late real finalize moves this row out of terminal and the
-      // direct timeline naturally removes the status.
-      const client = await deps.pool.connect()
-      let terminal: TurnDispatchRow | null = null
-      try {
-        await client.query('BEGIN')
-        terminal = await casToTerminal(client, {
-          dispatchId: row.dispatchId,
-          outcome: 'executed_error',
-          failureCode: 'RESULT_RECOVERY_PENDING',
-          clientNotified: true,
-          fromStatuses: ['accepted'],
-          now: now(),
-        })
-        if (terminal) await advanceVisibleTimelineIdentity(client, row)
-        await client.query('COMMIT')
-      } catch (error) {
-        try { await client.query('ROLLBACK') } catch { /* connection already broken */ }
-        throw error
-      } finally {
-        client.release()
-      }
-      if (terminal) {
+      // 容器只证明执行进程结束,不证明原因。有停机证据才允许 SERVICE_RESTART;
+      // 无证据回到 RESULT_RECOVERY_PENDING(第 1 批前 sentinel)。真实重启 tape
+      // 自带 errorCode:'SERVICE_RESTART',由 converge 透传到 failure_code,reconciler
+      // 不替它猜——猜会把 RUNNER_CRASHED / ENGINE_FAULT 画成可恢复琥珀点。
+      const closed = await closeAcceptedAsExecutedError(
+        deps,
+        row,
+        now(),
+        hasDeadEvidence ? 'SERVICE_RESTART' : 'RESULT_RECOVERY_PENDING',
+      )
+      if (closed) {
         counts.visibleFailures++
         counts.notified++
+        await clearExitMark(deps, row)
         try {
           deps.nudgeClient?.(row.userId, row.sessionId, row.clientMessageId)
         } catch { /* status is durable; live nudge is best-effort */ }
       }
       continue
     }
-    if (age < stuckMs) continue // 探测窗:可达且未到 stuck 阈值 → 不做任何状态迁移。
+    if (res.state === 'recovery_pending') {
+      // 只有停机证据才允许 SERVICE_RESTART。无证据的 recovery_pending 可能是
+      // 真崩溃(RUNNER_CRASHED / ENGINE_FAULT)；写成 SERVICE_RESTART 会让侧栏
+      // 画出「可恢复的琥珀点」。无证据时保持既有等待 / 90min stuck 门。
+      if (hasDeadEvidence) {
+        const closed = await closeAcceptedAsServiceRestart(deps, row, now())
+        if (closed) {
+          counts.visibleFailures++
+          counts.notified++
+          await clearExitMark(deps, row)
+          try {
+            deps.nudgeClient?.(row.userId, row.sessionId, row.clientMessageId)
+          } catch { /* status is durable; live nudge is best-effort */ }
+        }
+      }
+      continue
+    }
+    // 无进程死亡证据时保持 90min 门(防误杀活流);有标记则容器已给出 rejected/absent 即可收敛。
+    if (age < stuckMs && !hasDeadEvidence) continue
     if (res.state === 'rejected') {
       // 容器把这条 accepted 的 inbox 行终态化为 rejected tombstone(如 boot recovery:
       // queued/running 被拒)。这是**显式** durable negative proof(I2 允许),→ CAS
@@ -352,7 +438,21 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
         fromStatuses: ['accepted'],
         now: now(),
       })
-      if (terminal) counts.rejectedTerminal++
+      if (terminal) {
+        counts.rejectedTerminal++
+        await clearExitMark(deps, row)
+      }
+    } else if (res.state === 'absent' && hasDeadEvidence) {
+      // 重启后行消失:已执行过,写 SERVICE_RESTART,绝不 not_accepted。
+      const closed = await closeAcceptedAsServiceRestart(deps, row, now())
+      if (closed) {
+        counts.visibleFailures++
+        counts.notified++
+        await clearExitMark(deps, row)
+        try {
+          deps.nudgeClient?.(row.userId, row.sessionId, row.clientMessageId)
+        } catch { /* status is durable; live nudge is best-effort */ }
+      }
     } else if (res.state === 'sink_stage_failed' || res.state === 'absent') {
       const held = await casToManualReconcile(deps.pool, {
         dispatchId: row.dispatchId,
@@ -363,6 +463,7 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
         counts.manualReconcile++
         alertManual(enqueue, row, `container inbox state=${res.state} for an accepted dispatch`)
         counts.alerts++
+        await clearExitMark(deps, row)
       }
     } else if (res.state === 'sink_staged' || res.state === 'terminal') {
       // 等 sink ACK(无 TTL 必达);过久告警但不动状态。
@@ -371,8 +472,11 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
         counts.alerts++
       }
     }
-    // running/queued/recovery_pending → 继续等,不动。
+    // running/queued 已在上方 live 分支 continue。
   }
+
+  // ── closeVisibleOrphans (rev2 B4): tapeless fallback + fence + late tape ──
+  counts.visibleOrphans = await closeVisibleOrphans(deps, now(), limit)
 
   // ── open>7d 只读告警(永不 GC)─────────────────────────────────────────────
   const openAged = await scanOpenAged(deps.pool, { ageMs: DISPATCH_OPEN_ALERT_AGE_MS, limit, now: now() })
@@ -382,6 +486,294 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
   }
 
   return counts
+}
+
+
+async function aggregateDispatchLiveText(pool: import('pg').Pool, dispatchId: string): Promise<string> {
+  const frames = await pool.query<{ payload: Buffer }>(
+    `SELECT f.payload
+       FROM client_session_live_streams s
+       JOIN client_session_live_frames f ON f.stream_key=s.stream_key
+      WHERE s.dispatch_id=$1::uuid
+      ORDER BY f.created_at`,
+    [dispatchId],
+  )
+  const chunks: string[] = []
+  for (const row of frames.rows) {
+    try {
+      const parsed = JSON.parse(row.payload.toString('utf8')) as {
+        type?: string
+        blocks?: Array<{ kind?: string; text?: string }>
+        text?: string
+      }
+      if (parsed.type && parsed.type !== 'outbound.message') continue
+      if (typeof parsed.text === 'string' && parsed.text) chunks.push(parsed.text)
+      for (const block of parsed.blocks ?? []) {
+        if (block.kind === 'text' && typeof block.text === 'string') chunks.push(block.text)
+      }
+    } catch {
+      /* ignore malformed frame */
+    }
+  }
+  return chunks.join('')
+}
+
+async function projectTapelessVisibleToSession(
+  client: { query: import('pg').Pool['query'] },
+  input: {
+    sessionId: string
+    userId: string
+    dispatchId: string
+    clientMessageId: string
+    text: string
+    nowMs: number
+  },
+): Promise<void> {
+  const session = await client.query<{ messages: string; next_seq: number | null }>(
+    `SELECT messages, next_seq FROM client_sessions
+      WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL FOR UPDATE`,
+    [input.sessionId, input.userId],
+  )
+  const row = session.rows[0]
+  if (!row) return
+  let messages: Array<Record<string, unknown>> = []
+  try {
+    const parsed = JSON.parse(row.messages)
+    if (Array.isArray(parsed)) messages = parsed as Array<Record<string, unknown>>
+  } catch {
+    return
+  }
+  const id = `visible-fallback:${input.dispatchId}`
+  if (messages.some((message) => message.id === id)) return
+  messages.push({
+    id,
+    role: 'assistant',
+    text: input.text,
+    ts: input.nowMs,
+    _source: 'server',
+    _clientMessageId: input.clientMessageId,
+  })
+  await client.query(
+    `UPDATE client_sessions
+        SET messages=$3, message_count=COALESCE(archived_count,0)+$4,
+            last_at=$5, updated_at=GREATEST(updated_at+1, $5),
+            history_revision=history_revision+1,
+            timeline_generation=timeline_generation+1
+      WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL`,
+    [input.sessionId, input.userId, JSON.stringify(messages), messages.length, input.nowMs],
+  )
+}
+
+async function finalizeOrphanDispatch(input: {
+  deps: TurnDispatchReconcilerDeps
+  row: {
+    dispatch_id: string
+    user_id: string
+    session_id: string
+    client_message_id: string
+  }
+  outcome: 'completed' | 'interrupted'
+  nowMs: number
+  fence: boolean
+  projectFallback: boolean
+  fallbackText: string
+}): Promise<boolean> {
+  const client = await input.deps.pool.connect()
+  try {
+    await client.query('BEGIN')
+    const locked = await client.query<{ status: string }>(
+      `SELECT status FROM turn_dispatches WHERE dispatch_id=$1::uuid FOR UPDATE -- closeVisibleOrphans lock`,
+      [input.row.dispatch_id],
+    )
+    const status = locked.rows[0]?.status
+    if (status !== 'admitted' && status !== 'accepted' && status !== 'rejecting') {
+      await client.query('ROLLBACK')
+      return false
+    }
+    if (input.fence) {
+      await client.query(
+        `UPDATE turn_dispatches SET producer_fenced_at=COALESCE(producer_fenced_at, NOW())
+          WHERE dispatch_id=$1::uuid AND producer_fenced_at IS NULL`,
+        [input.row.dispatch_id],
+      )
+    }
+    if (input.projectFallback) {
+      await client.query(
+        `UPDATE turn_dispatches
+            SET visible_head=$2::jsonb, visible_at=COALESCE(visible_at,$3)
+          WHERE dispatch_id=$1::uuid`,
+        [
+          input.row.dispatch_id,
+          JSON.stringify({
+            role: 'assistant',
+            text: input.fallbackText,
+            ts: input.nowMs,
+            messageId: `visible-fallback:${input.row.dispatch_id}`,
+            clientMessageId: input.row.client_message_id,
+          }),
+          input.nowMs,
+        ],
+      )
+      await projectTapelessVisibleToSession(client, {
+        sessionId: input.row.session_id,
+        userId: `c:${input.row.user_id}`,
+        dispatchId: input.row.dispatch_id,
+        clientMessageId: input.row.client_message_id,
+        text: input.fallbackText,
+        nowMs: input.nowMs,
+      })
+    }
+    const terminal = await casToTerminal(client, {
+      dispatchId: input.row.dispatch_id,
+      outcome: input.outcome,
+      fromStatuses: ['admitted', 'accepted', 'rejecting'],
+    })
+    if (!terminal) {
+      await client.query('ROLLBACK')
+      return false
+    }
+    await client.query('COMMIT')
+    return true
+  } catch (err) {
+    try { await client.query('ROLLBACK') } catch { /* ignore */ }
+    throw err
+  } finally {
+    client.release()
+  }
+}
+
+async function closeVisibleOrphans(
+  deps: TurnDispatchReconcilerDeps,
+  nowMs: number,
+  limit: number,
+): Promise<number> {
+  const scanLimit = Math.min(200, Math.max(limit * 4, limit))
+  const queryVisible = async (offset: number) => deps.pool.query<{
+    dispatch_id: string
+    user_id: string
+    session_id: string
+    client_message_id: string
+    status: string
+    admitted_at: Date
+    accepted_at: Date | null
+    tape_visible_at: string | null
+    tape_part_count: number | null
+    tape_id: string | null
+    tape_parts_rows: string
+    last_frame_at: Date | null
+    container_running: boolean
+  }>(
+    `SELECT -- closeVisibleOrphans
+            d.dispatch_id, d.user_id::text AS user_id, d.session_id, d.client_message_id,
+            d.status, d.admitted_at, d.accepted_at,
+            t.visible_at::text AS tape_visible_at,
+            t.part_count AS tape_part_count,
+            t.tape_id,
+            COALESCE((
+              SELECT count(*)::text FROM client_session_turn_tape_parts p
+               WHERE t.tape_id IS NOT NULL
+                 AND p.session_id = t.session_id
+                 AND p.user_id = t.user_id
+                 AND p.tape_id = t.tape_id
+            ), '0') AS tape_parts_rows,
+            (
+              SELECT MAX(f.created_at)
+                FROM client_session_live_streams s
+                JOIN client_session_live_frames f ON f.stream_key = s.stream_key
+               WHERE s.dispatch_id = d.dispatch_id
+            ) AS last_frame_at,
+            EXISTS (
+              SELECT 1 FROM agent_containers ac
+               WHERE ac.user_id = d.user_id AND ac.state = 'active'
+            ) AS container_running
+       FROM turn_dispatches d
+       LEFT JOIN client_session_turn_tapes t ON t.dispatch_id = d.dispatch_id
+      WHERE d.status IN ('admitted','accepted')
+      ORDER BY d.admitted_at, d.dispatch_id
+      OFFSET $2 LIMIT $1`,
+    [scanLimit, offset],
+  )
+  let rows = await queryVisible(visibleOrphanScanOffset)
+  if (rows.rows.length === 0 && visibleOrphanScanOffset > 0) {
+    visibleOrphanScanOffset = 0
+    rows = await queryVisible(0)
+  }
+  if (rows.rows.length < scanLimit) visibleOrphanScanOffset = 0
+  else visibleOrphanScanOffset += rows.rows.length
+  let closed = 0
+  for (const row of rows.rows) {
+    const action = classifyVisibleOrphan({
+      tapeVisibleAt: row.tape_visible_at === null ? null : Number(row.tape_visible_at),
+      tapePartCount: row.tape_part_count,
+      tapePartsRows: Number(row.tape_parts_rows ?? '0'),
+      lastFrameAtMs: row.last_frame_at ? row.last_frame_at.getTime() : null,
+      acceptedOrAdmittedAtMs: (row.accepted_at ?? row.admitted_at).getTime(),
+      containerRunning: row.container_running === true,
+      nowMs,
+    })
+    if (action === 'skip') continue
+    const hasTape = typeof row.tape_id === 'string' && row.tape_id.length > 0
+    const outcome = action === 'complete_from_frames' || action === 'converge_only'
+      ? 'completed' as const
+      : 'interrupted' as const
+    if (hasTape && action === 'complete_from_frames') {
+      const tapeId = row.tape_id
+      if (!tapeId || !deps.commitVisibleTape) continue
+      try {
+        await deps.commitVisibleTape({
+          userId: `c:${row.user_id}`,
+          sessionId: row.session_id,
+          tapeId,
+        })
+      } catch {
+        continue
+      }
+      closed++
+      try {
+        deps.nudgeClient?.(
+          BigInt(row.user_id),
+          row.session_id,
+          row.client_message_id,
+          'turn_completed',
+        )
+      } catch {
+        /* best-effort */
+      }
+      continue
+    }
+    const projectFallback = !hasTape
+    if (hasTape && !projectFallback && action !== 'converge_only'
+      && action !== 'interrupt_tapeless' && action !== 'fence_hard_cap') {
+      continue
+    }
+    const aggregated = projectFallback ? await aggregateDispatchLiveText(deps.pool, row.dispatch_id) : ''
+    const text = aggregated
+      || (outcome === 'completed'
+        ? 'turn completed (visible fallback)'
+        : 'turn interrupted (visible fallback)')
+    const ok = await finalizeOrphanDispatch({
+      deps,
+      row,
+      outcome,
+      nowMs,
+      fence: action === 'fence_hard_cap',
+      projectFallback,
+      fallbackText: text,
+    })
+    if (!ok) continue
+    closed++
+    try {
+      deps.nudgeClient?.(
+        BigInt(row.user_id),
+        row.session_id,
+        row.client_message_id,
+        outcome === 'completed' ? 'turn_completed' : 'interrupted',
+      )
+    } catch {
+      /* best-effort */
+    }
+  }
+  return closed
 }
 
 /** A verified user-visible status is a new durable timeline identity attached
@@ -511,11 +903,13 @@ function finalizeSettlePost(
     counts.manualReconcile++
     alertManual(enqueue, row, post.reason)
     counts.alerts++
+    void clearExitMark(deps, row)
     return
   }
   if (post.notified) {
     counts.visibleFailures++
     counts.notified++
+    void clearExitMark(deps, row)
   }
   // 状态已持久 → 用户在线则推一条轻量 nudge 触发前端 reconcile。
   if (post.notified) {
@@ -578,7 +972,10 @@ async function resolveRejecting(
       fromStatuses: ['rejecting'],
       now: nowMs,
     })
-    if (terminal) counts.rejectedTerminal++
+    if (terminal) {
+      counts.rejectedTerminal++
+      await clearExitMark(deps, row)
+    }
   } else if (res.state === 'absent') {
     // reject-if-absent 契约下不该回 absent(无行必插 tombstone);保守当错误重试。
   } else {
@@ -636,6 +1033,214 @@ function alertWarn(
   })
 }
 
+
+async function closeAcceptedAsExecutedError(
+  deps: TurnDispatchReconcilerDeps,
+  row: TurnDispatchRow,
+  nowMs: number,
+  failureCode: 'SERVICE_RESTART' | 'RESULT_RECOVERY_PENDING',
+): Promise<TurnDispatchRow | null> {
+  const client = await deps.pool.connect()
+  let terminal: TurnDispatchRow | null = null
+  try {
+    await client.query('BEGIN')
+    terminal = await casToTerminal(client, {
+      dispatchId: row.dispatchId,
+      outcome: 'executed_error',
+      failureCode,
+      clientNotified: true,
+      fromStatuses: ['accepted'],
+      now: nowMs,
+    })
+    if (terminal) await advanceVisibleTimelineIdentity(client, row)
+    await client.query('COMMIT')
+  } catch (error) {
+    try { await client.query('ROLLBACK') } catch { /* connection already broken */ }
+    throw error
+  } finally {
+    client.release()
+  }
+  return terminal
+}
+
+async function closeAcceptedAsServiceRestart(
+  deps: TurnDispatchReconcilerDeps,
+  row: TurnDispatchRow,
+  nowMs: number,
+): Promise<TurnDispatchRow | null> {
+  return closeAcceptedAsExecutedError(deps, row, nowMs, 'SERVICE_RESTART')
+}
+
+async function resolveCarrierDeadDispatchIds(
+  deps: TurnDispatchReconcilerDeps,
+  rows: Array<Pick<TurnDispatchRow, 'dispatchId' | 'shutdownCtx'>>,
+): Promise<string[]> {
+  const fromRows = rows.filter(dispatchHasShutdownEvidence).map((r) => r.dispatchId)
+  if (deps.listCarrierDeadDispatchIds) {
+    return [...new Set([...fromRows, ...(await deps.listCarrierDeadDispatchIds())])]
+  }
+  return [...new Set([...fromRows, ...(await loadGatewayExitDispatchIds(deps.pool, rows))])]
+}
+
+/**
+ * 从小集合按 dispatch_id 反查停机标记。一轮 turn 有多条 journal,
+ * 标记打在调用级 request_id 上,通常 ≠ billing_request_id。空候选不发查询。
+ */
+export async function loadGatewayExitDispatchIds(
+  pool: Pool,
+  rows: Array<{ dispatchId: string }>,
+): Promise<string[]> {
+  const dispatchIds = [...new Set(rows.map((r) => r.dispatchId).filter((id) => id.length > 0))]
+  if (dispatchIds.length === 0) return []
+  try {
+    const res = await pool.query<{ dispatch_id: string }>(
+      `SELECT dispatch_id::text AS dispatch_id
+         FROM turn_dispatches
+        WHERE dispatch_id = ANY($1::uuid[])
+          AND COALESCE(shutdown_ctx->>$2, '') <> ''
+       UNION
+       SELECT DISTINCT dispatch_id::text AS dispatch_id
+         FROM request_finalize_journal
+        WHERE dispatch_id = ANY($1::uuid[])
+          AND COALESCE(ctx->>$2, '') <> ''`,
+      [dispatchIds, GATEWAY_EXITED_AT_CTX_KEY],
+    )
+    return res.rows.map((r) => r.dispatch_id)
+  } catch {
+    return []
+  }
+}
+
+async function clearExitMark(
+  deps: TurnDispatchReconcilerDeps,
+  row: { dispatchId: string },
+): Promise<void> {
+  if (!row.dispatchId) return
+  try {
+    await clearDispatchShutdownEvidence(deps.pool, row.dispatchId)
+  } catch {
+    /* 终态已落,清标记失败下轮可重试 */
+  }
+  try {
+    await clearGatewayShutdownEvidenceByDispatchIds(
+      [row.dispatchId],
+      async (sql, params) => {
+        const res = await deps.pool.query(sql, params ?? [])
+        return { rows: res.rows as Array<{ request_id: string }>, rowCount: res.rowCount }
+      },
+    )
+  } catch {
+    /* 终态已落,清标记失败下轮可重试 */
+  }
+}
+
+export async function expireAdmittedLeasesOnShutdown(
+  pool: Pool,
+  nowMs?: number,
+): Promise<number> {
+  const at = new Date(nowMs ?? Date.now())
+  const res = await pool.query(
+    `UPDATE turn_dispatches
+        SET lease_until = $1
+      WHERE status = 'admitted'
+        AND lease_until IS NOT NULL
+        AND lease_until > $1`,
+    [at],
+  )
+  return res.rowCount ?? 0
+}
+
+function withProbeBudget(
+  container: TurnDispatchReconcilerDeps['container'],
+  timeoutMs: number,
+): TurnDispatchReconcilerDeps['container'] {
+  const wrap = async (work: Promise<ContainerCallResult>): Promise<ContainerCallResult> => {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      return await Promise.race([
+        work,
+        new Promise<ContainerCallResult>((resolve) => {
+          timer = setTimeout(
+            () => resolve({ kind: 'unreachable', detail: 'shutdown_budget' }),
+            Math.max(50, timeoutMs),
+          )
+        }),
+      ])
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
+    }
+  }
+  return {
+    rejectIfAbsent: (id) => wrap(container.rejectIfAbsent(id)),
+    getDispatchState: (id) => wrap(container.getDispatchState(id)),
+  }
+}
+
+export interface ShutdownHandoffResult {
+  markedJournals: number
+  markedDispatches: number
+  expiredLeases: number
+  probed: boolean
+  timedOut: boolean
+  tick: ReconcileTickCounts | null
+}
+
+export interface ShutdownHandoffDeps extends TurnDispatchReconcilerDeps {
+  markJournals?: () => Promise<number>
+  markOpenDispatches?: () => Promise<number>
+  expireLeases?: () => Promise<number>
+  budgetMs?: number
+}
+
+/**
+ * 优雅停机钩子:先落「进程在 T 退出」证据,再在预算内复用容器求证收敛已死的 dispatch。
+ * 不盲 finalize——running/queued/sink_staged 清证据;不可达/超时保留证据等下轮。
+ * 只有明确非存活(absent / recovery_pending / terminal+crashed)+证据才写 SERVICE_RESTART。
+ */
+export async function runShutdownDispatchHandoff(
+  deps: ShutdownHandoffDeps,
+): Promise<ShutdownHandoffResult> {
+  const now = deps.now ?? Date.now
+  const started = now()
+  const budgetMs = deps.budgetMs ?? DEFAULT_SHUTDOWN_HANDOFF_BUDGET_MS
+  const markedJournals = await (deps.markJournals
+    ?? (() => markGatewayShutdownEvidence({ reason: 'process_shutdown' })))()
+  const markedDispatches = await (deps.markOpenDispatches
+    ?? (() => markOpenDispatchShutdownEvidence(deps.pool, { now: now(), reason: 'process_shutdown' })))()
+  const expiredLeases = await (deps.expireLeases
+    ?? (() => expireAdmittedLeasesOnShutdown(deps.pool, now())))()
+
+  const remain = budgetMs - (now() - started)
+  if (remain <= 150) {
+    return { markedJournals, markedDispatches, expiredLeases, probed: false, timedOut: true, tick: null }
+  }
+
+  const probeTimeout = Math.min(SHUTDOWN_PROBE_TIMEOUT_MS, Math.max(80, remain - 80))
+  let timedOut = false
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const tickPromise = runReconcileTick({
+    ...deps,
+    container: withProbeBudget(deps.container, probeTimeout),
+    limit: Math.min(deps.limit ?? 8, 8),
+  })
+  const timeoutPromise = new Promise<null>((resolve) => {
+    timer = setTimeout(() => {
+      timedOut = true
+      resolve(null)
+    }, remain)
+  })
+  const tick = await Promise.race([tickPromise, timeoutPromise])
+  if (timer !== undefined) clearTimeout(timer)
+  return {
+    markedJournals,
+    markedDispatches,
+    expiredLeases,
+    probed: tick !== null,
+    timedOut,
+    tick,
+  }
+}
+
 // ─── 调度器(leaderBundle shared + trackScheduler)──────────────────────────
 
 export interface TurnDispatchReconcilerHandle {
@@ -659,7 +1264,7 @@ export function startTurnDispatchReconciler(
 ): TurnDispatchReconcilerHandle {
   const interval = Math.max(MIN_INTERVAL_MS, opts.intervalMs ?? DEFAULT_RECONCILE_INTERVAL_MS)
   const onError = opts.onError ?? defaultOnError
-  const runOnStart = opts.runOnStart ?? false
+  const runOnStart = opts.runOnStart ?? true
   let stopped = false
   let running = false
 
@@ -671,6 +1276,7 @@ export function startTurnDispatchReconciler(
     notified: 0,
     alerts: 0,
     sessionGoneClosed: 0,
+    visibleOrphans: 0,
   }
 
   async function runOneTick(): Promise<ReconcileTickCounts> {

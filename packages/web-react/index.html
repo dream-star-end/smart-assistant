@@ -3,9 +3,9 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-    <meta name="theme-color" content="#ffffff" />
-    <meta name="description" content="预置智能体平台 — 为每一件事，备好一位专家。开箱即用，无需挑模型、调提示词。" />
-    <title>Aurora · 预置智能体平台</title>
+    <meta name="theme-color" content="#090a08" />
+    <meta name="description" content="从简 — 能思考、会执行、交付真实成果的全能 Agent 工作台。让复杂，从简。" />
+    <title>从简 · 全能 Agent 工作台</title>
     <!-- PWA:可安装到主屏 / 独立窗口运行。sw.js 在 main.tsx 内按需注册(仅安全上下文+生产)。 -->
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="icon" type="image/svg+xml" href="/icons/icon.svg" />
@@ -14,7 +14,7 @@
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-    <meta name="apple-mobile-web-app-title" content="Aurora" />
+    <meta name="apple-mobile-web-app-title" content="从简" />
     <script>
       try {
         var t = localStorage.getItem("oc_theme") || "system";
@@ -23,7 +23,7 @@
           document.documentElement.classList.add("dark");
           // theme-color 同步写入:静态值是浅色,暗色用户首屏地址栏/状态栏会闪白。
           var tc = document.querySelector('meta[name="theme-color"]');
-          if (tc) tc.setAttribute("content", "#0c0c11");
+          if (tc) tc.setAttribute("content", "#090a08");
         }
       } catch (e) {}
     </script>

@@ -40,7 +40,7 @@
 //     Number()+MAX_SAFE_INTEGER 断言;**不改全局 type parser**(不影响 commercial 其它模块)。
 
 import type { Pool, PoolClient } from "pg";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { freemem } from "node:os";
 import { getHeapStatistics } from "node:v8";
 import { gzipSync, gunzipSync } from "node:zlib";
@@ -65,18 +65,63 @@ import {
   turnRecoveryAttemptIdentity,
   turnRecoveryIdentity,
   parseSessionWorkspaceMode,
+  losslessBillingAnchorId,
   type DurableCodexBilling,
   type LosslessTurnTapeFinalizeRequest,
   type LosslessTurnTapePartRequest,
+  type LosslessTurnTapeVisibleRequest,
   type SessionWorkspaceMode,
 } from "@openclaude/protocol";
 import {
+  enqueueMaterializationJob,
+  enqueueSettlementJob,
+  holdSettlementJobsForTape,
+  releaseSettlementJobsAfterVerify,
+} from "./turnTapeJobs.js";
+import {
+  assertSettlementMatchesCanonical,
+  classifyUnifiedTimelineIntegrityError,
+  isTransientTapeError,
+  phaseAVisibleHeadText,
+  pickTapeDisplayFallbackText,
+  recordsPublished,
+  sanitizeValueForPgJsonb,
+  settlementAuthorityHash,
+  settlementEngineBillings,
+  settlementPayloadEqual,
+  visibleHeadFallback,
+  visibleHeadFromSettlement,
+  warnTapeDisplayDegrade,
+  type TapeDisplayDegradeReason,
+  type VisibleHead,
+} from "./visibleFinalize.js";
+import {
   type AppendCostCreditsResult,
   type AppendForRequestResult,
+  type ChatProject,
+  type ChatProjectCreateResult,
+  type ChatProjectDeleteResult,
+  type ChatProjectUpdateResult,
+  type ProjectAsset,
+  type ProjectAssetCreateInput,
+  type ProjectAssetCreateResult,
+  type ProjectAssetDeleteResult,
+  type ProjectAssetUpdateInput,
+  type ProjectAssetUpdateResult,
+  type ListProjectAssetsOpts,
+  type ParsedProjectAssetCreate,
   type ClientSession,
   type ClientSessionLifecycle,
   type ClientSessionLifecycleRef,
+  type BatchClientSessionsInput,
+  type BatchClientSessionsResult,
+  type MarkClientSessionReadResult,
   type ClientSessionMeta,
+  type ClientSessionMetaPatch,
+  type ListClientSessionsOpts,
+  type ListClientSessionsResult,
+  type SearchClientSessionsOpts,
+  type SearchClientSessionsResult,
   type ClientSessionPartial,
   type ClientSessionReadOptions,
   type ClientTimelineCursor,
@@ -84,6 +129,13 @@ import {
   ClientTimelineCursorStaleError,
   type ClientSessionsBackend,
   type DelegatePendingRow,
+  CHAT_PROJECT_COLOR_MAX,
+  CHAT_PROJECT_INSTRUCTIONS_MAX,
+  CHAT_PROJECT_PER_USER_LIMIT,
+  PROJECT_ASSET_LIST_LIMIT_DEFAULT,
+  PROJECT_ASSET_LIST_LIMIT_MAX,
+  PROJECT_ASSET_PER_PROJECT_LIMIT,
+  PROJECT_ASSET_PINNED_INJECT_MAX,
   compareMessagesByOrder,
   deriveArchivedOrderSeqsForRead,
   deriveOrderSeqsForRead,
@@ -92,11 +144,34 @@ import {
   MAX_SESSION_BYTES,
   hasInvisibleHistoryMutation,
   hasInvisibleMessageRemoval,
+  mapClientSessionLastOutcome,
   type MessageLike,
   mergePreservingServerAuthored,
   normalizeAndAssignOrderSeqs,
   normalizeAndAssignSeqs,
   _warnSeqAnomaly,
+  buildSearchSnippet,
+  escapeLikePattern,
+  parseChatProjectName,
+  parseChatProjectOptionalText,
+  parseChatProjectSortOrder,
+  parseProjectAssetCreateInput,
+  parseProjectAssetName,
+  parseProjectAssetProjectId,
+  parseSessionBatchInput,
+  type PatchClientSessionMetaResult,
+  rankSessionSearchHits,
+  sanitizeProjectInstructions,
+  LAST_MESSAGE_PREVIEW_TAIL_MAX,
+  CLIENT_SESSION_UNREAD_OUTCOMES,
+  lastReadAtWatermarkMsSql,
+  SESSION_BATCH_IDS_MAX,
+  SESSION_LIST_LIMIT_MAX,
+  SESSION_SEARCH_JSON_CANDIDATE_MAX,
+  SESSION_SEARCH_JSON_EXPAND_MAX_BYTES,
+  SESSION_SEARCH_LIMIT_DEFAULT,
+  SESSION_SEARCH_LIMIT_MAX,
+  toLastMessagePreview,
   planAppendServerAuthored,
   planAppendServerAuthoredBatch,
   planCostPatch,
@@ -143,7 +218,10 @@ import {
 import { settleStopControlsForTurn } from "../dispatch/turnControlStore.js";
 import {
   readClientSessionLiveFrames as readDurableClientSessionLiveFrames,
+  readClientSessionLiveUnits as readDurableClientSessionLiveUnits,
+  readLiveOrTapeFramePayload as readDurableLiveOrTapeFramePayload,
   reconcileLiveStreamWithFinalTape,
+  convergeFinalizedTapeLiveStreams,
 } from "./liveTurnFrames.js";
 
 // ── BIGINT codec(RFC D7)─────────────────────────────────────────────────────
@@ -401,6 +479,240 @@ const FINALIZED_TAPE_PARTS_DELETE_MS = 48 * 60 * 60_000;
 // 普通 UPDATE 时用裸列)。第三个 GREATEST 参数(客户端 requested)只 upsert 用,append/patch
 // 路径无客户端值 → 用两参形态。
 const CLOCK_MS_SQL = "(floor(EXTRACT(EPOCH FROM clock_timestamp())*1000))::BIGINT";
+const UNREAD_OUTCOME_SQL = CLIENT_SESSION_UNREAD_OUTCOMES.map((o) => `'${o}'`).join(",");
+// terminal_at 是 timestamptz → epoch milliseconds。last_read_at 写入同样是 epoch ms
+//（CLOCK_MS_SQL）。混入 unix seconds 的行由 lastReadAtWatermarkMsSql 放大 1000。
+const LAST_D_TERMINAL_MS_SQL = "(floor(EXTRACT(EPOCH FROM last_d.terminal_at)*1000))::BIGINT";
+const LAST_READ_AT_MS_SQL = lastReadAtWatermarkMsSql("cs.last_read_at");
+
+function dispatchUidForList(userId: string): string {
+  return /^c:([1-9][0-9]*)$/.exec(userId)?.[1] ?? "-1";
+}
+
+async function pgUnreadBySessionIds(
+  pool: Pool,
+  userId: string,
+  ids: string[],
+): Promise<Map<string, boolean>> {
+  const unread = new Map<string, boolean>();
+  if (ids.length === 0) return unread;
+  const rows = (
+    await pool.query<{ id: string; unread: boolean }>(
+      `SELECT cs.id,
+              (last_d.outcome IN (${UNREAD_OUTCOME_SQL})
+               AND ${LAST_D_TERMINAL_MS_SQL} > ${LAST_READ_AT_MS_SQL}) AS unread
+         FROM client_sessions cs
+         LEFT JOIN (
+           SELECT session_id, outcome, terminal_at FROM (
+             SELECT session_id, outcome, terminal_at,
+                    ROW_NUMBER() OVER (
+                      PARTITION BY session_id
+                      ORDER BY terminal_at DESC NULLS LAST, admitted_at DESC, dispatch_id DESC
+                    ) AS rn
+               FROM turn_dispatches
+              WHERE user_id = $2 AND status = 'terminal'
+           ) ranked
+           WHERE rn = 1
+         ) last_d ON last_d.session_id = cs.id
+        WHERE cs.user_id = $1 AND cs.deleted_at IS NULL AND cs.id = ANY($3::text[])`,
+      [userId, dispatchUidForList(userId), ids],
+    )
+  ).rows;
+  for (const r of rows) unread.set(r.id, r.unread === true);
+  return unread;
+}
+
+const PG_CHAT_PROJECT_SELECT = `
+  SELECT p.id, p.name, p.instructions, p.color, p.sort_order, p.created_at, p.updated_at,
+         COALESCE(c.cnt, 0)::text AS session_count
+    FROM chat_projects p
+    LEFT JOIN (
+      SELECT project_id, COUNT(*) AS cnt
+        FROM client_sessions
+       WHERE user_id = $1 AND deleted_at IS NULL AND project_id IS NOT NULL
+       GROUP BY project_id
+    ) c ON c.project_id = p.id
+`;
+
+type PgChatProjectRow = {
+  id: string;
+  name: string;
+  instructions: string | null;
+  color: string | null;
+  sort_order: number;
+  created_at: string;
+  updated_at: string;
+  session_count: string;
+};
+
+function mapPgChatProjectRow(r: PgChatProjectRow): ChatProject {
+  return {
+    id: r.id,
+    name: r.name,
+    instructions: r.instructions,
+    color: r.color,
+    sortOrder: r.sort_order,
+    createdAt: bigIntNum(r.created_at, "created_at"),
+    updatedAt: bigIntNum(r.updated_at, "updated_at"),
+    sessionCount: Number(r.session_count) || 0,
+  };
+}
+
+async function readPgChatProject(
+  queryable: Pick<Pool | PoolClient, "query">,
+  userId: string,
+  id: string,
+): Promise<ChatProject | null> {
+  const row = (
+    await queryable.query<PgChatProjectRow>(
+      `${PG_CHAT_PROJECT_SELECT} WHERE p.id = $2 AND p.user_id = $3 AND p.deleted_at IS NULL`,
+      [userId, id, userId],
+    )
+  ).rows[0];
+  return row ? mapPgChatProjectRow(row) : null;
+}
+
+const PG_PROJECT_ASSET_SELECT = `
+  SELECT id, project_id, source, session_id, name, url, container_path, mime,
+         size_bytes::text AS size_bytes, digest, excerpt, pinned,
+         created_at::text AS created_at, updated_at::text AS updated_at
+    FROM project_assets
+`;
+
+type PgProjectAssetRow = {
+  id: string;
+  project_id: string | null;
+  source: string;
+  session_id: string | null;
+  name: string;
+  url: string | null;
+  container_path: string | null;
+  mime: string | null;
+  size_bytes: string | null;
+  digest: string | null;
+  excerpt: string | null;
+  pinned: boolean | number | string;
+  created_at: string;
+  updated_at: string;
+};
+
+function mapPgProjectAssetRow(r: PgProjectAssetRow): ProjectAsset {
+  return {
+    id: r.id,
+    projectId: r.project_id ?? null,
+    source: r.source === "output" ? "output" : "upload",
+    sessionId: r.session_id ?? null,
+    name: r.name,
+    url: r.url ?? null,
+    containerPath: r.container_path ?? null,
+    mime: r.mime ?? null,
+    sizeBytes: r.size_bytes == null ? null : bigIntNum(r.size_bytes, "size_bytes"),
+    digest: r.digest ?? null,
+    excerpt: r.excerpt ?? null,
+    pinned: r.pinned === true || r.pinned === 1 || r.pinned === "t",
+    createdAt: bigIntNum(r.created_at, "created_at"),
+    updatedAt: bigIntNum(r.updated_at, "updated_at"),
+  };
+}
+
+async function readPgProjectAsset(
+  queryable: Pick<Pool | PoolClient, "query">,
+  userId: string,
+  id: string,
+): Promise<ProjectAsset | null> {
+  const row = (
+    await queryable.query<PgProjectAssetRow>(
+      `${PG_PROJECT_ASSET_SELECT} WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
+      [id, userId],
+    )
+  ).rows[0];
+  return row ? mapPgProjectAssetRow(row) : null;
+}
+
+async function pgOwnedChatProjectExists(
+  queryable: Pick<Pool | PoolClient, "query">,
+  userId: string,
+  projectId: string,
+): Promise<boolean> {
+  const row = (
+    await queryable.query(
+      "SELECT 1 FROM chat_projects WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
+      [projectId, userId],
+    )
+  ).rows[0];
+  return !!row;
+}
+
+async function pgCountProjectAssets(
+  queryable: Pick<Pool | PoolClient, "query">,
+  userId: string,
+  projectId: string | null,
+): Promise<number> {
+  const row = (
+    await queryable.query<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM project_assets
+        WHERE user_id = $1 AND deleted_at IS NULL AND project_id IS NOT DISTINCT FROM $2`,
+      [userId, projectId],
+    )
+  ).rows[0];
+  return Number(row?.n ?? 0);
+}
+
+async function pgFindDuplicateAsset(
+  queryable: Pick<Pool | PoolClient, "query">,
+  userId: string,
+  projectId: string | null,
+  source: ParsedProjectAssetCreate["source"],
+  digest: string | null,
+  containerPath: string | null,
+): Promise<ProjectAsset | null> {
+  if (digest) {
+    const row = (
+      await queryable.query<PgProjectAssetRow>(
+        `${PG_PROJECT_ASSET_SELECT}
+          WHERE user_id = $1 AND deleted_at IS NULL AND source = $2
+            AND project_id IS NOT DISTINCT FROM $3 AND digest = $4
+          LIMIT 1`,
+        [userId, source, projectId, digest],
+      )
+    ).rows[0];
+    return row ? mapPgProjectAssetRow(row) : null;
+  }
+  if (containerPath) {
+    const row = (
+      await queryable.query<PgProjectAssetRow>(
+        `${PG_PROJECT_ASSET_SELECT}
+          WHERE user_id = $1 AND deleted_at IS NULL AND source = $2
+            AND project_id IS NOT DISTINCT FROM $3 AND container_path = $4
+          LIMIT 1`,
+        [userId, source, projectId, containerPath],
+      )
+    ).rows[0];
+    return row ? mapPgProjectAssetRow(row) : null;
+  }
+  return null;
+}
+
+async function pgResolveAssetProjectId(
+  queryable: Pick<Pool | PoolClient, "query">,
+  userId: string,
+  parsed: ParsedProjectAssetCreate,
+): Promise<{ ok: true; projectId: string | null } | { ok: false; error: "project_not_found" }> {
+  let projectId = parsed.projectIdPresent ? parsed.projectId : null;
+  if (!parsed.projectIdPresent && parsed.sessionId) {
+    const sess = (
+      await queryable.query<{ user_id: string; project_id: string | null }>(
+        "SELECT user_id, project_id FROM client_sessions WHERE id = $1 AND deleted_at IS NULL",
+        [parsed.sessionId],
+      )
+    ).rows[0];
+    if (sess?.user_id === userId) projectId = sess.project_id ?? null;
+  }
+  if (projectId !== null && !(await pgOwnedChatProjectExists(queryable, userId, projectId))) {
+    return { ok: false, error: "project_not_found" };
+  }
+  return { ok: true, projectId };
+}
 
 /** Publish a new browser-timeline identity on the caller's existing
  * transaction. Dispatch reconciliation uses this seam so its verified status
@@ -793,6 +1105,8 @@ const PROBE_EXPECTED_COLUMNS: ReadonlyArray<[string, string, string]> = [
   ["client_sessions", "pinned", "smallint"],
   ["client_sessions", "next_seq", "integer"],
   ["client_sessions", "archived_through_seq", "integer"],
+  ["client_sessions", "archived_at", "bigint"],
+  ["client_sessions", "last_read_at", "bigint"],
   ["client_sessions", "history_revision", "bigint"],
   ["client_sessions", "timeline_generation", "bigint"],
   ["client_session_archive_chunks", "session_id", "text"],
@@ -821,6 +1135,16 @@ const PROBE_EXPECTED_COLUMNS: ReadonlyArray<[string, string, string]> = [
   ["client_session_turn_tapes", "logical_record_count", "integer"],
   ["client_session_turn_tapes", "record_payload_bytes", "bigint"],
   ["client_session_turn_tapes", "model_record_count", "integer"],
+  ["client_session_turn_tapes", "visible_at", "bigint"],
+  ["client_session_turn_tapes", "visible_head", "jsonb"],
+  ["client_session_turn_tapes", "materialization_status", "text"],
+  ["client_session_turn_tapes", "settlement_hash", "text"],
+  ["turn_dispatches", "visible_head", "jsonb"],
+  ["turn_dispatches", "visible_at", "bigint"],
+  ["turn_dispatches", "producer_fenced_at", "timestamp with time zone"],
+  ["turn_dispatches", "shutdown_ctx", "jsonb"],
+  ["turn_tape_materialization_jobs", "job_id", "uuid"],
+  ["turn_tape_settlement_jobs", "job_id", "uuid"],
   ["client_session_turn_tape_parts", "payload", "bytea"],
   ["client_session_turn_tape_records", "payload", "bytea"],
   ["client_session_turn_tape_records", "visible_payload", "bytea"],
@@ -880,6 +1204,12 @@ export type LosslessTurnTapeFinalizeResult =
        * (internalServer finalize handler)据此发一条告警交人工核对(已告知用户失败却又产出计费内容)。
        */
       dispatchLateTape?: boolean;
+      settlementHandoff?: boolean;
+      settlementHeld?: boolean;
+      /** True only for the transaction that first published visible_at. */
+      newlyVisible?: boolean;
+      /** Exact browser turn identity; present for durable webchat dispatches. */
+      clientMessageId?: string;
     }
   | { applied: "session_not_found" | "session_deleted" | "incomplete" };
 
@@ -923,6 +1253,13 @@ export function _losslessFinalizeSingleflightKey(
     request.waiveReason ?? null,
     request.dispatchId ?? null,
     request.attemptNo ?? null,
+    request.settlement
+      ? settlementAuthorityHash({
+          billingAnchorId: request.settlement.billingAnchorId,
+          requestId: request.settlement.requestId,
+          engineBillings: request.settlement.engineBillings,
+        })
+      : null,
   ]);
 }
 
@@ -934,37 +1271,86 @@ export function _losslessFinalizeSingleflightKey(
  *   - 已 terminal(completed 等)/ manual_reconcile → 幂等 no-op。
  * CAS-first(原子);仅失败后读一次判 late tape(此时行已终态,读值稳定)。
  */
+function errorCodeFromVisibleHead(head: unknown): string | null {
+  if (!head || typeof head !== "object") return null;
+  const code = (head as { errorCode?: unknown }).errorCode;
+  return typeof code === "string" && code.length > 0 ? code : null;
+}
+
+function failureCodeForTapeOutcome(
+  tapeStatus: string,
+  errorCode?: string | null,
+): string | null {
+  const outcome =
+    tapeStatus === "completed" ? "completed" :
+    tapeStatus === "interrupted" ? "interrupted" : "crashed";
+  if (outcome === "completed") return null;
+  if (typeof errorCode === "string" && errorCode.length > 0) return errorCode;
+  return outcome;
+}
+
 async function convergeDispatchOnFinalize(
   client: PoolClient,
   dispatchId: string,
   tapeStatus: string,
+  failureCode?: string | null,
 ): Promise<{ lateTape: boolean; removedVisibleStatus: boolean }> {
   const outcome =
     tapeStatus === "completed" ? "completed" :
     tapeStatus === "interrupted" ? "interrupted" : "crashed";
+  const nextFailureCode = failureCodeForTapeOutcome(tapeStatus, failureCode);
+  // Serialize against persistGatewayLiveFrame on the dispatch row (it takes
+  // the same FOR UPDATE before deciding projection_source). Without this,
+  // a frame write interleaved between our reconcile and its stream INSERT
+  // could mint a permanent projection_source='live' orphan that tape_id-less
+  // startup convergence can never match.
+  await client.query(
+    `SELECT 1 FROM turn_dispatches WHERE dispatch_id=$1::uuid FOR UPDATE`,
+    [dispatchId],
+  );
+  const fenced = await client.query<{ producer_fenced_at: Date | null }>(
+    `SELECT producer_fenced_at FROM turn_dispatches WHERE dispatch_id=$1::uuid`,
+    [dispatchId],
+  );
+  if (fenced.rows[0]?.producer_fenced_at) {
+    await client.query(
+      `UPDATE turn_tape_settlement_jobs
+          SET status='held', last_error='late_tape_after_fence', updated_at=NOW()
+        WHERE dispatch_id=$1::uuid AND status IN ('queued','leased','failed')`,
+      [dispatchId],
+    );
+    const held = await casToManualReconcile(client, {
+      dispatchId,
+      conflictReason: "late_tape_after_fence",
+      fromStatuses: ["admitted", "accepted", "rejecting", "terminal"],
+    });
+    return { lateTape: held !== null, removedVisibleStatus: false };
+  }
   const converged = await casToTerminal(client, {
     dispatchId,
     outcome,
+    failureCode: nextFailureCode,
     fromStatuses: ["admitted", "accepted", "rejecting"],
   });
   if (converged !== null) return { lateTape: false, removedVisibleStatus: false };
   const d = await getDispatch(client, dispatchId);
   if (
     d && d.status === "terminal" && d.outcome === "executed_error" &&
-    d.failureCode === "RESULT_RECOVERY_PENDING"
+    (d.failureCode === "RESULT_RECOVERY_PENDING" || d.failureCode === "SERVICE_RESTART")
   ) {
     // The reconciler's recovery sentinel is explicitly provisional: it says
     // the executor ended before a complete tape was visible. A later verified
     // finalize is the stronger authority. Replace only that exact sentinel;
     // other executed_error outcomes remain immutable and reviewable.
+    // completed 才允许清 failure_code;真崩溃必须写下真实码,不许残留 SERVICE_RESTART。
     await client.query(
       `UPDATE turn_dispatches
-          SET outcome=$2, failure_code=NULL, client_notified=FALSE,
+          SET outcome=$2, failure_code=$3, client_notified=FALSE,
               terminal_at=clock_timestamp()
         WHERE dispatch_id=$1 AND status='terminal'
           AND outcome='executed_error'
-          AND failure_code='RESULT_RECOVERY_PENDING'`,
-      [dispatchId, outcome],
+          AND failure_code IN ('RESULT_RECOVERY_PENDING','SERVICE_RESTART')`,
+      [dispatchId, outcome, nextFailureCode],
     );
     return { lateTape: false, removedVisibleStatus: d.clientNotified };
   }
@@ -983,6 +1369,10 @@ async function convergeDispatchOnFinalize(
 }
 
 export interface LosslessTurnTapeStorage {
+  commitVisibleLosslessTurnTape?(
+    userId: string,
+    request: LosslessTurnTapeVisibleRequest,
+  ): Promise<LosslessTurnTapeFinalizeResult>;
   stageLosslessTurnTapePart(
     userId: string,
     request: LosslessTurnTapePartRequest,
@@ -993,6 +1383,7 @@ export interface LosslessTurnTapeStorage {
   finalizeLosslessTurnTape(
     userId: string,
     request: LosslessTurnTapeFinalizeRequest,
+    options?: { materialize?: boolean },
   ): Promise<LosslessTurnTapeFinalizeResult>;
 }
 
@@ -1071,6 +1462,8 @@ export interface TurnTapeStateResult {
   status: string | null;
   /** Same-snapshot secondary fence for gateway recovery when state=none. */
   dispatchLeaseActive: boolean;
+  /** Dispatch-level master shutdown evidence; none+true may synthesize even if lease looks live. */
+  gatewayShutdownEvidence: boolean;
 }
 
 export interface DispatchAdmissionBackend {
@@ -1180,7 +1573,7 @@ function sha256Bytes(bytes: Buffer): string {
 }
 
 const AUTOMATIC_RECOVERY_CONTINUE_PROMPT =
-  "继续完成刚才因临时异常中断的任务。以本会话中已经生成并持久化的思考、工具结果和部分回答为依据，从断点继续；不要重新执行已经完成的步骤，不要重复已经输出的内容。若外部写操作的结果仍不明确，不得重复提交，先核对状态或向用户说明。";
+  "继续完成刚才因临时异常中断的任务。以本会话中已经生成并持久化的思考、工具结果和部分回答为依据，从断点继续。这是一条断点续接指令，不是重放原始请求：不要重新执行已经完成的步骤，不要重复已经输出的内容。若中断前有外部写操作或部署操作，先查询其当前可观察状态（如 release 指针、进程、日志、健康检查或目标资源）并据此继续。只有在无法通过查询区分成功或失败、且重复执行可能造成不可逆后果时，才明确说明具体无法确认的操作和风险，并仅询问完成任务所必需的决定；不要泛泛要求用户再说“继续”。";
 
 // Kept byte-for-byte aligned with protocol's exported pre-execution policy.
 // This commercial copy is intentional during the rolling workspace window:
@@ -1192,6 +1585,22 @@ const PRE_EXECUTION_RECOVERY_CODES = new Set([
 ]);
 function recoveryWithoutCheckpointIsProven(code: string): boolean {
   return PRE_EXECUTION_RECOVERY_CODES.has(normalizeTurnErrorCode(code));
+}
+
+/** The last assistant record is the semantic terminal surface. An earlier
+ * error followed by a later answer is not a failed turn, while trailing tool
+ * or runtime audit rows do not erase a terminal assistant error. */
+function terminalTurnRecordErrorCode(records: readonly unknown[]): string {
+  for (let index = records.length - 1; index >= 0; index--) {
+    const record = records[index];
+    if (!record || typeof record !== "object" || Array.isArray(record)) continue;
+    const message = record as MessageLike;
+    if (message.role !== "assistant") continue;
+    return typeof message._errorCode === "string"
+      ? normalizeTurnErrorCode(message._errorCode)
+      : "";
+  }
+  return "";
 }
 
 async function hydrateRecoverySourceUser(
@@ -1273,11 +1682,19 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
     clientMessageId,
     outcome: input.turn.payload.status,
   });
+  const status = input.turn.payload.status;
+  const terminalRecordErrorCode = terminalTurnRecordErrorCode(
+    input.turn.records.map((record) => record.payload),
+  );
+  const completedWithRecoverableError = status === "completed" &&
+    supportsAutomaticTurnRecovery(terminalRecordErrorCode);
   if (
-    input.turn.payload.status !== "crashed" &&
-    input.turn.payload.status !== "interrupted"
+    status !== "crashed" &&
+    status !== "interrupted" &&
+    !completedWithRecoverableError
   ) return;
-  const errorCode = input.turn.payload.errorCode ?? input.turn.payload.waiveReason ?? "";
+  const errorCode = terminalRecordErrorCode ||
+    input.turn.payload.errorCode || input.turn.payload.waiveReason || "";
   if (!supportsAutomaticTurnRecovery(errorCode)) return;
 
   const latestUser = [...input.currentMessages].reverse()
@@ -1297,10 +1714,24 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
   const assessment = assessTurnRecoveryTape(
     input.turn.records.map((record) => record.payload),
   );
-  if (!assessment.checkpointSafe) return;
+  // A checkpoint continuation resumes the native session with the exact
+  // persisted process; it never replays the original request. Even an
+  // uncertain external effect is therefore resumable: the continuation
+  // prompt requires observable-state verification before any repeated write.
+  // Exact replay remains fail-closed and is never inferred from a completed
+  // tape whose header contradicts its terminal error record.
+  if (status === "completed" && assessment.mode !== "checkpoint") return;
+  if (
+    assessment.mode === "checkpoint" &&
+    !assessment.checkpointSafe &&
+    status !== "completed"
+  ) return;
   if (
     assessment.mode === "replay" &&
-    !recoveryWithoutCheckpointIsProven(errorCode)
+    (
+      !assessment.checkpointSafe ||
+      !recoveryWithoutCheckpointIsProven(errorCode)
+    )
   ) return;
   const mode = assessment.mode;
   const rootClientMessageId = isClientMessageId(source._automaticRecoveryRootClientMessageId)
@@ -1533,6 +1964,25 @@ function mergeExactUsage(msg: MessageLike, enrich: ExactUsageEnrichment, isBilli
     ? (msg.usage as Record<string, unknown>)
     : {};
   return { ...msg, usage: { ...base, ...exactCostUsage, ...exactWaiverUsage, ...exactDelegateUsage } };
+}
+
+/** Timeline rows are rebuilt from immutable tape payloads, while a legacy
+ * cost event can arrive after finalize without a turnKey and patch only the
+ * small hot anchor. Exact hydration has always merged that anchor usage; the
+ * unified/deferred browser paths must use the same base before authoritative
+ * cost components override it, otherwise refresh drops a settled cost badge. */
+function mergeBillingAnchorUsage(
+  msg: MessageLike,
+  anchor: MessageLike,
+  isBillingAnchor: boolean,
+): MessageLike {
+  if (!isBillingAnchor || !anchor.usage || typeof anchor.usage !== "object" || Array.isArray(anchor.usage)) {
+    return msg;
+  }
+  const base = msg.usage && typeof msg.usage === "object" && !Array.isArray(msg.usage)
+    ? msg.usage as Record<string, unknown>
+    : {};
+  return { ...msg, usage: { ...base, ...(anchor.usage as Record<string, unknown>) } };
 }
 
 /** 内容水合(不含可变计费叠加):hash 校验 + 解析 + _turnTape 作证标记 + 基础 usage
@@ -1804,6 +2254,10 @@ interface DirectTapeHeader {
   status: string;
   turnKey: string;
   clientMessageId: string | null;
+  materializationStatus: string | null;
+  finalizedAt: string | null;
+  visibleAt: string | null;
+  visibleHead: VisibleHead | null;
 }
 
 const PRIVATE_TAPE_ROOT_FIELDS = new Set([
@@ -2054,8 +2508,10 @@ type PreparedModelSidecar = {
 };
 
 function sameLosslessTurnTapeHeader(
-  tape: LosslessTurnTapeHeaderRow,
-  request: LosslessTurnTapeFinalizeRequest,
+  tape: Pick<LosslessTurnTapeHeaderRow,
+    "agent_id" | "turn_index" | "status" | "turn_key" | "tape_sha256" |
+    "total_bytes" | "part_count" | "created_at" | "waive_reason">,
+  request: LosslessTurnTapeFinalizeRequest | LosslessTurnTapeVisibleRequest,
 ): boolean {
   return tape.agent_id === request.agentId &&
     tape.turn_index === request.turnIndex &&
@@ -2395,7 +2851,7 @@ function userVisiblePhysicalPayload(
   };
 }
 
-async function prepareLosslessTurnTapeOutsideLocks(
+export async function _prepareLosslessTurnTapeOutsideLocks(
   pool: Pool,
   userId: string,
   request: LosslessTurnTapeFinalizeRequest,
@@ -2456,6 +2912,10 @@ async function prepareLosslessTurnTapeOutsideLocks(
   const turn = materializeLosslessTurn(rawPayload, {
     runtimeBatching: recordStorageFormat === 3,
   });
+  // Record payload BYTEA + content_sha256 stay the part-derived original.
+  // visible_payload is also BYTEA and stays exact (timeline must round-trip
+  // JSON \u0000). PostgreSQL jsonb rejects \u0000 / unpaired surrogates;
+  // only jsonb binds and sidecar TEXT may be rewritten.
   if (
     turn.payload.sessionId !== request.sessionId ||
     turn.payload.agentId !== request.agentId ||
@@ -2466,7 +2926,10 @@ async function prepareLosslessTurnTapeOutsideLocks(
   ) {
     throw new Error("lossless turn tape envelope/payload identity mismatch");
   }
-  const visible = turn.records.map((item, ordinal) => {
+  const visible: UserVisiblePhysicalPayload[] = [];
+  for (let ordinal = 0; ordinal < turn.records.length; ordinal++) {
+    await yieldLosslessTapeWork();
+    const item = turn.records[ordinal]!;
     const payload = userVisiblePhysicalPayload({
       tape_id: request.tapeId,
       tape_sha256: request.tapeSha256,
@@ -2483,8 +2946,11 @@ async function prepareLosslessTurnTapeOutsideLocks(
     if (!payload) {
       throw new Error(`[pgSessions] lossless tape record is not a JSON object: ${item.id}`);
     }
-    return payload;
-  });
+    // visible_payload is BYTEA, not jsonb. Keep exact JSON (including \u0000)
+    // so timeline/exact reads match original record bytes. jsonb columns are
+    // sanitized at bind time; the 0232 trigger lazy-sanitizes agent-group casts.
+    visible.push(payload);
+  }
   return {
     turn,
     visible,
@@ -2550,6 +3016,20 @@ async function claimLosslessTurnTapeStorageFormat(
 
 export const LOSSLESS_TURN_RECORD_STAGE_BATCH_SIZE = 128;
 
+function yieldLosslessTapeWork(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+let afterLosslessStageBatch: (() => Promise<void> | void) | null = null;
+export function _setAfterLosslessStageBatch(hook: (() => Promise<void> | void) | null): void {
+  afterLosslessStageBatch = hook;
+}
+
+let phaseASqlObserver: ((sql: string) => void) | null = null;
+export function _setPhaseASqlObserver(observer: ((sql: string) => void) | null): void {
+  phaseASqlObserver = observer;
+}
+
 export function _losslessTurnRecordStageBatches(
   recordCount: number,
   exactOrdinals: ReadonlySet<number>,
@@ -2563,7 +3043,7 @@ export function _losslessTurnRecordStageBatches(
   return batches;
 }
 
-async function stagePreparedLosslessTurnRecords(
+export async function _stagePreparedLosslessTurnRecords(
   pool: Pool,
   userId: string,
   request: LosslessTurnTapeFinalizeRequest,
@@ -2596,11 +3076,16 @@ async function stagePreparedLosslessTurnRecords(
         throw new Error("lossless turn tape finalize header conflict");
       }
       if (tape.finalized_at !== null) return "finalized";
+      await client.query("SET LOCAL statement_timeout = '120s'");
+      // Keep original record BYTEA. The 0232 trigger sanitizes jsonb-illegal
+      // unicode escapes (or skips canonicalize) instead of failing INSERT.
+      // Application already rejects trigger rewrites of payload/hash.
       if (tape.record_storage_format !== prepared.recordStorageFormat) {
         throw new Error("lossless turn tape materialization format changed during staging");
       }
 
       for (const ordinal of batch) {
+      await yieldLosslessTapeWork();
       const item = prepared.turn.records[ordinal]!;
       const visible = prepared.visible[ordinal]!;
       const expectedModels = preparedModelSidecarsForOrdinal(ordinal, item.id, visible);
@@ -2818,6 +3303,7 @@ async function stagePreparedLosslessTurnRecords(
       return "staged";
     });
     if (staged !== "staged") return;
+    if (afterLosslessStageBatch) await afterLosslessStageBatch();
   }
 }
 
@@ -2887,6 +3373,7 @@ async function readExactPreparedLosslessTurnOrdinals(
 
   const exact = new Set<number>();
   for (let ordinal = 0; ordinal < prepared.turn.records.length; ordinal++) {
+    await yieldLosslessTapeWork();
     const item = prepared.turn.records[ordinal]!;
     const visible = prepared.visible[ordinal]!;
     const record = recordsByOrdinal.get(ordinal);
@@ -2946,16 +3433,22 @@ async function readDirectTapeHeaders(
       status: string;
       turn_key: string;
       client_message_id: string | null;
+      materialization_status: string | null;
+      finalized_at: string | null;
+      visible_at: string | null;
+      visible_head: VisibleHead | null;
     }>(
       `SELECT t.tape_id, t.tape_sha256, t.billing_anchor_id, t.status, t.turn_key,
               COALESCE(t.client_message_id, d.client_message_id) AS client_message_id,
               t.record_payload_bytes::text AS payload_bytes,
               t.physical_record_count::text AS physical_count,
-              t.logical_record_count::text AS logical_count
+              t.logical_record_count::text AS logical_count,
+              t.materialization_status, t.finalized_at::text, t.visible_at::text, t.visible_head
          FROM client_session_turn_tapes t
          LEFT JOIN turn_dispatches d ON d.dispatch_id=t.dispatch_id
         WHERE t.session_id=$1 AND t.user_id=$2 AND t.tape_id=ANY($3::text[])
-          AND t.finalized_at IS NOT NULL AND t.billing_anchor_id IS NOT NULL`,
+          AND (t.visible_at IS NOT NULL OR t.finalized_at IS NOT NULL)
+          AND t.billing_anchor_id IS NOT NULL`,
       [sessionId, userId, tapeIds],
     )
   ).rows;
@@ -3029,6 +3522,10 @@ async function readDirectTapeHeaders(
         status: row.status,
         turnKey: row.turn_key,
         clientMessageId: row.client_message_id,
+        materializationStatus: (row as { materialization_status?: string | null }).materialization_status ?? null,
+        finalizedAt: (row as { finalized_at?: string | null }).finalized_at ?? null,
+        visibleAt: (row as { visible_at?: string | null }).visible_at ?? null,
+        visibleHead: ((row as { visible_head?: VisibleHead | null }).visible_head ?? null),
       },
     ]),
   );
@@ -3356,6 +3853,28 @@ async function hydrateTurnTapeMessages(
     if (header.tapeSha256 !== tapeSha256) {
       throw new Error(`[pgSessions] lossless turn tape aggregate hash mismatch: ${tapeId}`);
     }
+    if (!recordsPublished({
+      materializationStatus: header.materializationStatus,
+      finalizedAt: header.finalizedAt,
+    })) {
+      const head = header.visibleHead;
+      const message: MessageLike = {
+        id: head?.messageId ?? header.billingAnchorId,
+        role: "assistant",
+        text: typeof head?.text === "string" ? head.text : "",
+        ts: typeof head?.ts === "number" ? head.ts : (typeof anchor.ts === "number" ? anchor.ts : 0),
+        status: header.status,
+        _source: "server",
+        _turnTapeId: header.tapeId,
+        _turnTapeSha256: header.tapeSha256,
+        _turnTapeComplete: true,
+        _turnKey: header.turnKey,
+        ...(header.clientMessageId ? { _clientMessageId: header.clientMessageId } : {}),
+        ...(typeof anchor._seq === "number" ? { _seq: anchor._seq } : {}),
+        ...(typeof anchor._orderSeq === "number" ? { _orderSeq: anchor._orderSeq } : {}),
+      };
+      return [message];
+    }
     const expectedPhysical = anchor._turnTapePhysicalRecordCount ?? anchor._turnTapeRecordCount;
     if (
       typeof expectedPhysical === "number" &&
@@ -3426,6 +3945,7 @@ async function hydrateTurnTapeMessages(
           if (typeof anchor._orderSeq === "number") deferred._orderSeq = anchor._orderSeq;
           deferred.status = header.status;
           deferred._turnKey = header.turnKey;
+          deferred = mergeBillingAnchorUsage(deferred, anchor, head.msg_id === head.billing_anchor_id);
           deferred = mergeExactUsage(
             deferred,
             {
@@ -3913,28 +4433,39 @@ async function computeFiniteEngineContextMessages(
     );
   };
 
-  const processCompleteTape = async (anchor: MessageLike): Promise<void> => {
+  const processCompleteTape = async (anchor: MessageLike): Promise<boolean> => {
     const tapeId = anchor._turnTapeId as string;
-    if (processedCompleteTapes.has(tapeId)) return;
+    if (processedCompleteTapes.has(tapeId)) return true;
     processedCompleteTapes.add(tapeId);
     const meta = (
       await pool.query<{
         tape_sha256: string;
         billing_anchor_id: string | null;
         model_record_count: number;
+        materialization_status: string | null;
+        finalized_at: string | null;
       }>(
-        `SELECT tape_sha256,model_record_count,billing_anchor_id
+        `SELECT tape_sha256,model_record_count,billing_anchor_id,
+                materialization_status, finalized_at::text
            FROM client_session_turn_tapes
           WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
-            AND finalized_at IS NOT NULL AND billing_anchor_id IS NOT NULL`,
+            AND (visible_at IS NOT NULL OR finalized_at IS NOT NULL)
+            AND billing_anchor_id IS NOT NULL`,
         [sessionId, userId, tapeId],
       )
     ).rows[0];
     if (!meta) throw new Error(`[pgSessions] finalized lossless turn tape missing: ${tapeId}`);
+    if (!recordsPublished({
+      materializationStatus: meta.materialization_status,
+      finalizedAt: meta.finalized_at,
+    })) {
+      processedCompleteTapes.delete(tapeId);
+      return false;
+    }
     if (meta.tape_sha256 !== anchor._turnTapeSha256) {
       throw new Error(`[pgSessions] lossless turn tape aggregate hash mismatch: ${tapeId}`);
     }
-    if (meta.model_record_count === 0) return;
+    if (meta.model_record_count === 0) return true;
     const appendTapeModelRow = async (row: FiniteTapeModelRow): Promise<void> => {
       if (excluded(row.msg_id, row.client_message_id ?? undefined)) return;
       const keyParams = [
@@ -4112,7 +4643,7 @@ async function computeFiniteEngineContextMessages(
           [sessionId, userId, tapeId],
         );
       }
-      return;
+      return true;
     }
 
     let beforePhysical: number | null = null;
@@ -4138,13 +4669,14 @@ async function computeFiniteEngineContextMessages(
         beforePhysical = row.physical_ordinal;
         beforeLogical = row.logical_ordinal;
         await appendTapeModelRow(row);
-        if (state.stopped) return;
+        if (state.stopped) return true;
       }
       if (page.length < 128) break;
     }
     if (!state.stopped && visited !== meta.model_record_count) {
       throw new Error(`[pgSessions] model tape record count mismatch: ${tapeId}`);
     }
+    return true;
   };
 
   const processMessages = async (messages: MessageLike[]): Promise<void> => {
@@ -4155,8 +4687,8 @@ async function computeFiniteEngineContextMessages(
         typeof message._turnTapeId === "string" &&
         typeof message._turnTapeSha256 === "string"
       ) {
-        await processCompleteTape(message);
-        continue;
+        const consumed = await processCompleteTape(message);
+        if (consumed) continue;
       }
       if (
         message._turnTapeComplete !== true &&
@@ -4374,7 +4906,7 @@ async function hasCompletedClientTurnImpl(
       `SELECT EXISTS (
          SELECT 1 FROM client_session_turn_tapes
           WHERE session_id=$1 AND user_id=$2 AND client_message_id=$3
-            AND status='completed' AND finalized_at IS NOT NULL
+            AND status='completed' AND (visible_at IS NOT NULL OR finalized_at IS NOT NULL)
        ) AS present`,
       [sessionId, userId, clientMessageId],
     )
@@ -4575,6 +5107,9 @@ type UnifiedTimelineTapeHeader = {
   status: string;
   turnKey: string;
   clientMessageId: string | null;
+  materializationStatus: string | null;
+  finalizedAt: string | null;
+  visibleHead: VisibleHead | null;
 };
 
 type UnifiedTimelineTapeHead = DirectTapePageHead & {
@@ -4593,6 +5128,13 @@ type UnifiedTimelineSelectedUnit =
       orderSeq: number;
       header: UnifiedTimelineTapeHeader;
       head: UnifiedTimelineTapeHead;
+    }
+  | {
+      kind: "tape-fallback";
+      anchor: MessageLike;
+      orderSeq: number;
+      header: UnifiedTimelineTapeHeader | null;
+      reason: TapeDisplayDegradeReason;
     };
 
 type UnifiedTimelineStatusRow = {
@@ -4734,11 +5276,13 @@ async function readUnifiedTimelineTapeHeaders(
       client_message_id: string | null;
     }>(
       `SELECT t.tape_id,t.tape_sha256,t.billing_anchor_id,t.status,t.turn_key,
-              COALESCE(t.client_message_id,d.client_message_id) AS client_message_id
+              COALESCE(t.client_message_id,d.client_message_id) AS client_message_id,
+              t.materialization_status, t.finalized_at::text, t.visible_head
          FROM client_session_turn_tapes t
          LEFT JOIN turn_dispatches d ON d.dispatch_id=t.dispatch_id
         WHERE t.session_id=$1 AND t.user_id=$2 AND t.tape_id=ANY($3::text[])
-          AND t.finalized_at IS NOT NULL AND t.billing_anchor_id IS NOT NULL`,
+          AND (t.visible_at IS NOT NULL OR t.finalized_at IS NOT NULL)
+          AND t.billing_anchor_id IS NOT NULL`,
       [sessionId, userId, tapeIds],
     )
   ).rows;
@@ -4749,6 +5293,9 @@ async function readUnifiedTimelineTapeHeaders(
     status: row.status,
     turnKey: row.turn_key,
     clientMessageId: row.client_message_id,
+    materializationStatus: (row as { materialization_status?: string | null }).materialization_status ?? null,
+    finalizedAt: (row as { finalized_at?: string | null }).finalized_at ?? null,
+    visibleHead: ((row as { visible_head?: VisibleHead | null }).visible_head ?? null),
   }]));
 }
 
@@ -4956,7 +5503,15 @@ async function readUnifiedTimelineBashTailAuxiliaries(
         window.header.tapeSha256,
         window.header.billingAnchorId,
         selectedHeads,
-      );
+      ).catch((error: unknown) => {
+        warnTapeDisplayDegrade({
+          sessionId,
+          tapeId: window.header.tapeId,
+          reason: classifyUnifiedTimelineIntegrityError(error),
+          detail: error instanceof Error ? error.message : String(error),
+        });
+        return [] as MessageLike[];
+      });
       const headByOrdinal = new Map(selectedHeads.map((head) => [head.ordinal, head]));
       for (const message of hydrated) {
         const ordinal = typeof message._recordOrdinal === "number" ? message._recordOrdinal : -1;
@@ -5051,6 +5606,68 @@ function unifiedTimelineTerminalAuxiliary(window: UnifiedTimelineTapeWindow): Me
   };
 }
 
+function unifiedTimelineTapeFallbackMessages(
+  sessionId: string,
+  unit: {
+    tapeId: string;
+    orderSeq: number;
+    reason: TapeDisplayDegradeReason;
+    header: UnifiedTimelineTapeHeader | null;
+    anchor: MessageLike;
+    detail?: string;
+  },
+): MessageLike[] {
+  const picked = pickTapeDisplayFallbackText({
+    visibleHead: unit.header?.visibleHead,
+    anchorText: unit.anchor.text,
+  });
+  const reason: TapeDisplayDegradeReason = !unit.header
+    ? (unit.reason === "finalized_tape_missing" ? "header_missing" : unit.reason)
+    : (picked.source === "placeholder" && !unit.header.visibleHead ? "visible_head_missing" : unit.reason);
+  warnTapeDisplayDegrade({
+    sessionId,
+    tapeId: unit.tapeId,
+    reason,
+    detail: unit.detail,
+  });
+  const head = unit.header?.visibleHead;
+  const id = (typeof head?.messageId === "string" && head.messageId.length > 0
+    ? head.messageId
+    : null)
+    ?? unit.header?.billingAnchorId
+    ?? (typeof unit.anchor.id === "string" ? unit.anchor.id : `tape-degraded:${unit.tapeId}`);
+  const ts = typeof head?.ts === "number" && Number.isFinite(head.ts)
+    ? head.ts
+    : (typeof unit.anchor.ts === "number" && Number.isFinite(unit.anchor.ts) ? unit.anchor.ts : 0);
+  return [{
+    id,
+    role: "assistant",
+    text: picked.text,
+    ts,
+    status: unit.header?.status ?? (typeof unit.anchor.status === "string" ? unit.anchor.status : "completed"),
+    _source: "server",
+    _turnTapeId: unit.tapeId,
+    _turnTapeSha256: unit.header?.tapeSha256
+      ?? (typeof unit.anchor._turnTapeSha256 === "string" ? unit.anchor._turnTapeSha256 : undefined),
+    _turnTapeComplete: true,
+    _turnKey: unit.header?.turnKey
+      ?? (typeof unit.anchor._turnKey === "string" ? unit.anchor._turnKey : undefined),
+    _orderSeq: unit.orderSeq,
+    _timelineRecord: true,
+    _timelineUnitKey: `tape-fallback:${unit.tapeId}`,
+    _displayDegraded: true,
+    _displayDegradeReason: reason,
+    _dispatchOutcome: unit.header?.status,
+    ...(typeof unit.anchor._seq === "number" ? { _seq: unit.anchor._seq } : {}),
+    ...(unit.header?.clientMessageId
+      ? { _clientMessageId: unit.header.clientMessageId }
+      : (typeof unit.anchor._clientMessageId === "string"
+        ? { _clientMessageId: unit.anchor._clientMessageId }
+        : {})),
+    ...(typeof head?.errorCode === "string" ? { _errorCode: head.errorCode } : {}),
+  }];
+}
+
 async function hydrateUnifiedTimelineTapeUnits(
   client: PoolClient,
   sessionId: string,
@@ -5063,6 +5680,10 @@ async function hydrateUnifiedTimelineTapeUnits(
   const billingHeads = await readDirectTapeVisibleHeads(client, sessionId, userId, tapeIds);
   const billingByTape = new Map(billingHeads.map((head) => [head.tape_id, head]));
   const planned = units.filter((unit) =>
+    recordsPublished({
+      materializationStatus: unit.header.materializationStatus,
+      finalizedAt: unit.header.finalizedAt,
+    }) &&
     !deferUnifiedTimelinePayload(
       unit.head.role,
       bigIntNum(unit.head.payload_bytes, "turn tape timeline payload bytes"),
@@ -5092,7 +5713,14 @@ async function hydrateUnifiedTimelineTapeUnits(
 
   for (const unit of units) {
     const { anchor, header, head } = unit;
+    if (!recordsPublished({
+      materializationStatus: header.materializationStatus,
+      finalizedAt: header.finalizedAt,
+    })) {
+      continue;
+    }
     const physicalKey = `${header.tapeId}\0${head.ordinal}`;
+    try {
     const payloadBytes = bigIntNum(head.payload_bytes, "turn tape timeline payload bytes");
     const billing = billingByTape.get(header.tapeId);
     const isBillingAnchor = head.msg_id === header.billingAnchorId;
@@ -5111,6 +5739,7 @@ async function hydrateUnifiedTimelineTapeUnits(
         { ...head, content_sha256: head.visible_content_sha256 ?? undefined },
         payloadBytes,
       );
+      deferred = mergeBillingAnchorUsage(deferred, anchor, isBillingAnchor);
       deferred = mergeExactUsage(deferred, enrichment, isBillingAnchor);
       logicalRecords = [deferred];
     } else {
@@ -5159,6 +5788,7 @@ async function hydrateUnifiedTimelineTapeUnits(
         ...(typeof anchor._seq === "number" ? { _seq: anchor._seq } : {}),
         _orderSeq: unit.orderSeq,
       };
+      hydrated = mergeBillingAnchorUsage(hydrated, anchor, isBillingAnchor);
       hydrated = mergeExactUsage(hydrated, enrichment, isBillingAnchor);
       logicalRecords = expandHydratedRuntimeBatch(
         hydrated,
@@ -5202,6 +5832,16 @@ async function hydrateUnifiedTimelineTapeUnits(
       _timelineUnitKey: timelineTapeKey(header.tapeId, head.ordinal, logicalIndex, record.id),
     }));
     result.set(physicalKey, logicalRecords);
+    } catch (error) {
+      result.set(physicalKey, unifiedTimelineTapeFallbackMessages(sessionId, {
+        tapeId: header.tapeId,
+        orderSeq: unit.orderSeq,
+        reason: classifyUnifiedTimelineIntegrityError(error),
+        header,
+        anchor,
+        detail: error instanceof Error ? error.message : String(error),
+      }));
+    }
   }
   return result;
 }
@@ -5356,11 +5996,81 @@ async function readClientTimelinePageImpl(
           typeof anchor._turnTapeSha256 === "string"
         ) {
           const header = headers.get(anchor._turnTapeId);
-          if (!header) throw new Error(`[pgSessions] unified timeline finalized tape missing: ${anchor._turnTapeId}`);
+          if (!header) {
+            const fallbackBytes = Buffer.byteLength(String(anchor.text ?? ""), "utf8");
+            if (
+              selected.length >= cappedLimit ||
+              (selected.length > 0 && inlineBytes + fallbackBytes > TAPE_RECORD_PAGE_RAW_QUANTUM_BYTES)
+            ) {
+              foundNextVisible = true;
+              hasMore = true;
+              break outerLoop;
+            }
+            selected.push({
+              kind: "tape-fallback",
+              anchor,
+              orderSeq,
+              header: null,
+              reason: "finalized_tape_missing",
+            });
+            inlineBytes += fallbackBytes;
+            continue;
+          }
           if (header.tapeSha256 !== anchor._turnTapeSha256) {
-            throw new Error(`[pgSessions] unified timeline tape hash mismatch: ${anchor._turnTapeId}`);
+            const fallbackBytes = Buffer.byteLength(header.visibleHead?.text ?? String(anchor.text ?? ""), "utf8");
+            if (
+              selected.length >= cappedLimit ||
+              (selected.length > 0 && inlineBytes + fallbackBytes > TAPE_RECORD_PAGE_RAW_QUANTUM_BYTES)
+            ) {
+              foundNextVisible = true;
+              hasMore = true;
+              break outerLoop;
+            }
+            selected.push({
+              kind: "tape-fallback",
+              anchor,
+              orderSeq,
+              header,
+              reason: "tape_hash_mismatch",
+            });
+            windows.push({
+              anchor,
+              orderSeq,
+              header,
+              lowerOrdinal: 0,
+              upperOrdinal: beforeByTape.get(header.tapeId) ?? 2_147_483_647,
+            });
+            inlineBytes += fallbackBytes;
+            continue;
           }
           const upperOrdinal = beforeByTape.get(header.tapeId) ?? 2_147_483_647;
+          const recordsReady = recordsPublished({
+            materializationStatus: header.materializationStatus,
+            finalizedAt: header.finalizedAt,
+          });
+          if (!recordsReady) {
+            const fallbackBytes = Buffer.byteLength(header.visibleHead?.text ?? String(anchor.text ?? ""), "utf8");
+            if (
+              selected.length >= cappedLimit ||
+              (selected.length > 0 && inlineBytes + fallbackBytes > TAPE_RECORD_PAGE_RAW_QUANTUM_BYTES)
+            ) {
+              foundNextVisible = true;
+              hasMore = true;
+              break outerLoop;
+            }
+            selected.push({
+              kind: "tape-fallback",
+              anchor,
+              orderSeq,
+              header,
+              reason: header.materializationStatus === "failed"
+                ? "records_failed"
+                : "records_unpublished",
+            });
+            windows.push({ anchor, orderSeq, header, lowerOrdinal: 0, upperOrdinal });
+            inlineBytes += fallbackBytes;
+            continue;
+          }
           const heads = headsByTape.get(header.tapeId) ?? [];
           let oldestSelectedOrdinal: number | null = null;
           for (const head of heads) {
@@ -5445,9 +6155,28 @@ async function readClientTimelinePageImpl(
 
     const chronological: MessageLike[] = [];
     for (const unit of [...selected].reverse()) {
+      if (unit.kind === "tape-fallback") {
+        chronological.push(...unifiedTimelineTapeFallbackMessages(sessionId, {
+          tapeId: unit.header?.tapeId ?? String(unit.anchor._turnTapeId),
+          orderSeq: unit.orderSeq,
+          reason: unit.reason,
+          header: unit.header,
+          anchor: unit.anchor,
+        }));
+        continue;
+      }
       if (unit.kind === "tape") {
         const records = tapeMessages.get(`${unit.header.tapeId}\0${unit.head.ordinal}`);
-        if (!records) throw new Error(`[pgSessions] unified timeline hydrated group missing: ${unit.header.tapeId}\0${unit.head.ordinal}`);
+        if (!records) {
+          chronological.push(...unifiedTimelineTapeFallbackMessages(sessionId, {
+            tapeId: unit.header.tapeId,
+            orderSeq: unit.orderSeq,
+            reason: "hydrated_group_missing",
+            header: unit.header,
+            anchor: unit.anchor,
+          }));
+          continue;
+        }
         chronological.push(...records);
         continue;
       }
@@ -5457,7 +6186,18 @@ async function readClientTimelinePageImpl(
         typeof unit.anchor._turnTapeId === "string" &&
         typeof unit.anchor._turnTapeSha256 === "string"
       ) {
-        outerMessages = await hydrateTurnTapeMessages(client, sessionId, userId, [unit.anchor], { view: "exact" });
+        try {
+          outerMessages = await hydrateTurnTapeMessages(client, sessionId, userId, [unit.anchor], { view: "exact" });
+        } catch (error) {
+          outerMessages = unifiedTimelineTapeFallbackMessages(sessionId, {
+            tapeId: String(unit.anchor._turnTapeId),
+            orderSeq: unit.orderSeq,
+            reason: classifyUnifiedTimelineIntegrityError(error),
+            header: null,
+            anchor: unit.anchor,
+            detail: error instanceof Error ? error.message : String(error),
+          });
+        }
       }
       for (let index = 0; index < outerMessages.length; index++) {
         const message = outerMessages[index]!;
@@ -5959,6 +6699,452 @@ async function readUserMessagePayloadImpl(
  * 构造 master 会话权威的 PG backend。返回对象结构化满足 `ClientSessionsBackend`,
  * 由 registerCommercial 注入。方法内闭包持有 pool。
  */
+
+
+const PHASE_A_LIVE_FRAME_LIMIT = 16;
+const PHASE_A_LIVE_FRAME_MAX_BYTES = 64 * 1024;
+
+async function readBoundedLiveFrameText(
+  queryable: Pool | PoolClient,
+  dispatchId: string | null,
+): Promise<string> {
+  if (!dispatchId) return "";
+  try {
+    const frames = await queryable.query<{ payload: Buffer }>(
+      `SELECT payload FROM (
+         SELECT f.payload, f.created_at
+           FROM client_session_live_streams s
+           JOIN client_session_live_frames f ON f.stream_key=s.stream_key
+          WHERE s.dispatch_id=$1::uuid
+            AND octet_length(f.payload) <= $2
+          ORDER BY f.created_at DESC
+          LIMIT $3
+       ) q ORDER BY created_at ASC`,
+      [dispatchId, PHASE_A_LIVE_FRAME_MAX_BYTES, PHASE_A_LIVE_FRAME_LIMIT],
+    );
+    const chunks: string[] = [];
+    for (const row of frames.rows) {
+      try {
+        const parsed = JSON.parse(row.payload.toString("utf8")) as {
+          type?: string;
+          blocks?: Array<{ kind?: string; text?: string }>;
+          text?: string;
+        };
+        if (parsed.type && parsed.type !== "outbound.message") continue;
+        if (typeof parsed.text === "string" && parsed.text) chunks.push(parsed.text);
+        for (const block of parsed.blocks ?? []) {
+          if (block.kind === "text" && typeof block.text === "string") chunks.push(block.text);
+        }
+      } catch {
+        /* ignore malformed frame */
+      }
+    }
+    return chunks.join("");
+  } catch {
+    return "";
+  }
+}
+
+export async function commitVisibleLosslessTurnPhaseA(
+  pool: Pool,
+  userId: string,
+  request: LosslessTurnTapeFinalizeRequest | LosslessTurnTapeVisibleRequest,
+  options: { enqueueMaterialization?: boolean } = {},
+): Promise<LosslessTurnTapeFinalizeResult> {
+  const billingUserId = /^c:[1-9][0-9]*$/.test(userId)
+    ? numericCommercialUserId(userId)
+    : null;
+  return withTx(pool, async (rawClient) => {
+    const client = new Proxy(rawClient, {
+      get(target, prop, receiver) {
+        if (prop === "query") {
+          return (sql: unknown, ...rest: unknown[]) => {
+            if (typeof sql === "string") phaseASqlObserver?.(sql);
+            return target.query(sql as never, ...(rest as never[]));
+          };
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    }) as PoolClient;
+    await lockTurnPersistenceKeys(client, userId, [request.turnKey]);
+    if (billingUserId !== null) {
+      await lockTurnBillingKeys(client, billingUserId, [request.turnKey]);
+    }
+    const session = (
+      await client.query<SessionWriteRow>(
+        `SELECT messages, next_seq, deleted_at, archived_through_seq, archived_count
+           FROM client_sessions WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+        [request.sessionId, userId],
+      )
+    ).rows[0];
+    if (!session) return { applied: "session_not_found" };
+    if (session.deleted_at !== null) return { applied: "session_deleted" };
+    if ((request.dispatchId === undefined) !== (request.attemptNo === undefined)) {
+      throw new Error("lossless turn tape dispatch identity is incomplete");
+    }
+    // A small visibility header is durable before the first multipart part.
+    // ON CONFLICT is followed by a full immutable-header comparison below.
+    await client.query(
+      `INSERT INTO client_session_turn_tapes
+         (session_id,user_id,tape_id,agent_id,turn_index,status,turn_key,tape_sha256,
+          total_bytes,part_count,created_at,waive_reason,dispatch_id,attempt_no)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+       ON CONFLICT (session_id,user_id,tape_id) DO NOTHING`,
+      [
+        request.sessionId,
+        userId,
+        request.tapeId,
+        request.agentId,
+        request.turnIndex,
+        request.status,
+        request.turnKey,
+        request.tapeSha256,
+        request.totalBytes,
+        request.partCount,
+        request.createdAt,
+        request.waiveReason ?? null,
+        request.dispatchId ?? null,
+        request.attemptNo ?? null,
+      ],
+    );
+    const tape = (
+      await client.query<{
+        agent_id: string;
+        turn_index: number;
+        status: string;
+        turn_key: string;
+        tape_sha256: string;
+        total_bytes: string;
+        part_count: number;
+        created_at: string;
+        waive_reason: string | null;
+        visible_at: string | null;
+        finalized_at: string | null;
+        engine_billings: unknown;
+        billing_anchor_id: string | null;
+        settlement_hash: string | null;
+        dispatch_id: string | null;
+        attempt_no: number | null;
+        visible_head: unknown;
+      }>(
+        `SELECT agent_id,turn_index,status,turn_key,tape_sha256,total_bytes,part_count,created_at,
+                waive_reason,visible_at::text,finalized_at::text,engine_billings,billing_anchor_id,
+                settlement_hash,dispatch_id,attempt_no,visible_head
+           FROM client_session_turn_tapes
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
+          FOR UPDATE`,
+        [request.sessionId, userId, request.tapeId],
+      )
+    ).rows[0];
+    if (!tape) return { applied: "incomplete" };
+    if (!sameLosslessTurnTapeHeader(tape, request)) {
+      throw new Error("lossless turn tape finalize header conflict");
+    }
+    if (
+      request.dispatchId !== undefined && (
+        tape.dispatch_id !== request.dispatchId || tape.attempt_no !== request.attemptNo
+      )
+    ) {
+      throw new Error("lossless turn tape dispatch identity conflict");
+    }
+    const settlement = request.settlement;
+    const engineBillings = settlement
+      ? settlementEngineBillings(settlement)
+      : (Array.isArray(tape.engine_billings)
+        ? structuredClone(tape.engine_billings) as DurableCodexBilling[]
+        : []);
+    const billingAnchorId = settlement?.billingAnchorId
+      ?? tape.billing_anchor_id
+      ?? losslessBillingAnchorId({
+        sessionId: request.sessionId,
+        agentId: request.agentId,
+        turnIndex: request.turnIndex,
+        text: settlement?.text,
+        errorCode: settlement?.errorCode,
+      });
+    const incomingHash = settlement
+      ? settlementAuthorityHash({
+          billingAnchorId,
+          requestId: settlement.requestId,
+          engineBillings,
+        })
+      : tape.settlement_hash;
+    if (tape.settlement_hash && incomingHash && tape.settlement_hash !== incomingHash) {
+      throw new Error("lossless turn tape settlement conflict");
+    }
+    let clientMessageId: string | null = null;
+    if (tape.dispatch_id !== null) {
+      clientMessageId = (
+        await client.query<{ client_message_id: string }>(
+          "SELECT client_message_id FROM turn_dispatches WHERE dispatch_id=$1",
+          [tape.dispatch_id],
+        )
+      ).rows[0]?.client_message_id ?? null;
+    }
+    const fenced = tape.dispatch_id
+      ? (
+          await client.query<{ producer_fenced_at: Date | null }>(
+            "SELECT producer_fenced_at FROM turn_dispatches WHERE dispatch_id=$1::uuid",
+            [tape.dispatch_id],
+          )
+        ).rows[0]?.producer_fenced_at
+      : null;
+    if (tape.visible_at !== null) {
+      if (request.waiveReason !== undefined && billingUserId !== null) {
+        await ensurePendingTurnWaiverInTransaction(client, {
+          userId: billingUserId,
+          turnKey: request.turnKey,
+          reason: request.waiveReason,
+        });
+      }
+      let replayLate = false;
+      if (tape.dispatch_id !== null) {
+        const convergence = await convergeDispatchOnFinalize(
+          client,
+          tape.dispatch_id,
+          tape.status,
+          request.settlement?.errorCode ?? errorCodeFromVisibleHead(tape.visible_head),
+        );
+        replayLate = convergence.lateTape;
+      }
+      if (options.enqueueMaterialization !== false && tape.finalized_at === null) {
+        await enqueueMaterializationJob(client, {
+          sessionId: request.sessionId,
+          userId,
+          tapeId: request.tapeId,
+          dispatchId: tape.dispatch_id,
+        });
+      }
+      return {
+        applied: tape.finalized_at !== null ? "idempotent" : "finalized",
+        recordCount: 0,
+        engineBillings,
+        settlementHandoff: true,
+        ...(clientMessageId ? { clientMessageId } : {}),
+        ...(replayLate ? { dispatchLateTape: true, settlementHeld: true } : {}),
+      };
+    }
+    const liveFrameText = settlement
+      ? ""
+      : await readBoundedLiveFrameText(client, tape.dispatch_id);
+    const visibleText = phaseAVisibleHeadText({
+      hasSettlement: Boolean(settlement),
+      settlementText: settlement?.text,
+      liveFrameText,
+    });
+    const head = settlement
+      ? visibleHeadFromSettlement(request, settlement, clientMessageId)
+      : visibleHeadFallback(request, visibleText, clientMessageId);
+    await client.query(
+      `UPDATE client_session_turn_tapes
+          SET visible_at=$1, visible_head=$2::jsonb,
+              billing_anchor_id=COALESCE(billing_anchor_id,$3),
+              engine_billings=CASE WHEN $4::jsonb <> '[]'::jsonb THEN $4::jsonb ELSE engine_billings END,
+              settlement_hash=COALESCE(settlement_hash,$6),
+              client_message_id=COALESCE(client_message_id,$5)
+        WHERE session_id=$7 AND user_id=$8 AND tape_id=$9`,
+      [
+        Date.now(),
+        JSON.stringify(head),
+        billingAnchorId,
+        JSON.stringify(engineBillings),
+        clientMessageId,
+        incomingHash,
+        request.sessionId,
+        userId,
+        request.tapeId,
+      ],
+    );
+    let existingMessages: MessageLike[];
+    try {
+      const parsed = JSON.parse(session.messages);
+      if (!Array.isArray(parsed)) throw new Error("not array");
+      existingMessages = parsed as MessageLike[];
+    } catch {
+      throw new Error("lossless turn tape target session row malformed");
+    }
+    const stubRecord = { id: billingAnchorId, role: "assistant" as const, ts: head.ts, text: head.text };
+    const conflictingAnchor = existingMessages.find(
+      (message) =>
+        message?.id === billingAnchorId &&
+        typeof message._turnTapeId === "string" &&
+        message._turnTapeId !== request.tapeId,
+    );
+    let anchors: (MessageLike & { id: string })[];
+    if (conflictingAnchor) {
+      // A content-only recovery deliberately reuses the crashed source billing
+      // anchor. Phase A must not delete that source before Phase B verifies the
+      // recovery link and transfers its billing ownership atomically.
+      const recoveryLink = await readTurnTapeRecoveryLink(
+        client,
+        request.sessionId,
+        userId,
+        request.tapeId,
+        true,
+      );
+      if (!recoveryLink || recoveryLink.source_tape_id !== conflictingAnchor._turnTapeId) {
+        throw new Error("lossless turn tape visible anchor is owned by another tape");
+      }
+      anchors = [];
+    } else {
+      anchors = [{
+        ...tapeAnchor(stubRecord as never, request.tapeId, request.tapeSha256, 1, 1, undefined, []),
+        text: head.text,
+      }];
+      const recordIds = new Set([billingAnchorId]);
+      existingMessages = existingMessages.filter(
+        (message) => typeof message?.id !== "string" || !recordIds.has(message.id),
+      );
+    }
+    const plan = planAppendServerAuthoredBatch(
+      existingMessages,
+      anchors,
+      typeof session.next_seq === "number" && session.next_seq > 0 ? session.next_seq : 1,
+      bigIntNumOr(session.archived_through_seq, 0),
+    );
+    if (plan.kind === "write") {
+      const nowMs = Date.now();
+      const archivedDelta = await execPgSpillPlan(
+        client,
+        request.sessionId,
+        userId,
+        plan.chunksToInsert,
+        plan.idsToInsert,
+        nowMs,
+      );
+      const archivedCount = bigIntNumOr(session.archived_count, 0) + archivedDelta;
+      await client.query(
+        `UPDATE client_sessions SET
+           messages=$1, message_count=$2, last_at=$3,
+           updated_at=GREATEST(updated_at + 1, ${CLOCK_MS_SQL}),
+           next_seq=$4, archived_through_seq=$5, archived_count=$6,
+           history_revision=history_revision + 1,
+           timeline_generation=timeline_generation + 1
+         WHERE id=$7 AND user_id=$8 AND deleted_at IS NULL`,
+        [
+          plan.finalJson,
+          plan.tail.length + archivedCount,
+          nowMs,
+          plan.nextSeq,
+          plan.archivedThroughSeq,
+          archivedCount,
+          request.sessionId,
+          userId,
+        ],
+      );
+    }
+    if (options.enqueueMaterialization !== false) {
+      await enqueueMaterializationJob(client, {
+        sessionId: request.sessionId,
+        userId,
+        tapeId: request.tapeId,
+        dispatchId: tape.dispatch_id,
+      });
+    }
+    const holdReason = fenced ? "late_tape_after_fence" : "awaiting_materialization";
+    if (engineBillings.length > 0) {
+      await enqueueSettlementJob(client, {
+        sessionId: request.sessionId,
+        userId,
+        tapeId: request.tapeId,
+        dispatchId: tape.dispatch_id,
+        kind: "billing",
+        payload: { engineBillings },
+        billingAnchorId,
+        requestId: settlement?.requestId ?? engineBillings[0]?.requestId,
+        settlementHash: incomingHash,
+        held: true,
+        holdReason,
+      });
+    }
+    if (request.waiveReason !== undefined && billingUserId !== null) {
+      await ensurePendingTurnWaiverInTransaction(client, {
+        userId: billingUserId,
+        turnKey: request.turnKey,
+        reason: request.waiveReason,
+      });
+      await enqueueSettlementJob(client, {
+        sessionId: request.sessionId,
+        userId,
+        tapeId: request.tapeId,
+        dispatchId: tape.dispatch_id,
+        kind: "waiver",
+        payload: { reason: request.waiveReason, turnKey: request.turnKey },
+        billingAnchorId,
+        settlementHash: incomingHash,
+        held: true,
+        holdReason,
+      });
+    }
+    let lateTape = false;
+    if (tape.dispatch_id !== null) {
+      const convergence = await convergeDispatchOnFinalize(
+        client,
+        tape.dispatch_id,
+        tape.status,
+        request.settlement?.errorCode ?? head.errorCode,
+      );
+      lateTape = convergence.lateTape;
+    }
+    return {
+      applied: "finalized",
+      recordCount: 0,
+      engineBillings,
+      settlementHandoff: true,
+      newlyVisible: true,
+      ...(clientMessageId ? { clientMessageId } : {}),
+      ...(lateTape || fenced ? { settlementHeld: true } : {}),
+      ...(lateTape ? { dispatchLateTape: true } : {}),
+    };
+  });
+}
+
+
+async function readOpenDispatchForSession(
+  queryable: Pool | PoolClient,
+  sessionId: string,
+  userId: string,
+): Promise<{ openDispatch?: ClientSession["openDispatch"] }> {
+  const uidMatch = /^c:([1-9][0-9]*)$/.exec(userId);
+  if (!uidMatch) return {};
+  const row = (
+    await queryable.query<{
+      dispatch_id: string;
+      client_message_id: string;
+      status: string;
+      accepted_at: Date | null;
+      last_attempt_at: Date | null;
+      model: string | null;
+      last_frame_at: Date | null;
+    }>(
+      `SELECT d.dispatch_id, d.client_message_id, d.status, d.accepted_at, d.last_attempt_at, d.model,
+              (
+                SELECT MAX(f.created_at)
+                  FROM client_session_live_streams s
+                  JOIN client_session_live_frames f ON f.stream_key=s.stream_key
+                 WHERE s.dispatch_id=d.dispatch_id
+              ) AS last_frame_at
+         FROM turn_dispatches d
+        WHERE d.user_id=$1::bigint AND d.session_id=$2
+          AND d.status IN ('admitted','accepted','rejecting')
+        ORDER BY d.admitted_at DESC
+        LIMIT 1`,
+      [uidMatch[1], sessionId],
+    )
+  ).rows[0];
+  if (!row) return {};
+  return {
+    openDispatch: {
+      dispatchId: row.dispatch_id,
+      clientMessageId: row.client_message_id,
+      status: row.status,
+      acceptedAt: row.accepted_at ? row.accepted_at.getTime() : null,
+      lastFrameAt: (row.last_frame_at ?? row.last_attempt_at)?.getTime() ?? null,
+      ...(row.model ? { model: row.model } : {}),
+    },
+  };
+}
+
 export function createPgSessionsBackend(
   pool: Pool,
   options: PgSessionsBackendOptions,
@@ -5967,6 +7153,15 @@ export function createPgSessionsBackend(
   const finalizeSingleflight = _createFinalizeSingleflight<LosslessTurnTapeFinalizeResult>();
 
   const backend: PgSessionsBackend = {
+    async commitVisibleLosslessTurnTape(
+      userId: string,
+      request: LosslessTurnTapeVisibleRequest,
+    ): Promise<LosslessTurnTapeFinalizeResult> {
+      return commitVisibleLosslessTurnPhaseA(pool, userId, request, {
+        enqueueMaterialization: false,
+      });
+    },
+
     async admitUserTurn(input: AdmitUserTurnInput): Promise<AdmitUserTurnResult> {
       try {
         return await withTx(pool, async (client): Promise<AdmitUserTurnResult> => {
@@ -6071,7 +7266,7 @@ export function createPgSessionsBackend(
               }
             }
             const sourceIndex = current.lastIndexOf(latestUser);
-            const recoverableTapeError = current.slice(sourceIndex + 1).some((item) =>
+            const recoverableHotTapeError = current.slice(sourceIndex + 1).some((item) =>
               item?.role === "assistant" &&
               item._clientMessageId === input.recovery?.sourceClientMessageId &&
               supportsAutomaticTurnRecovery(String(item._errorCode ?? "")));
@@ -6101,21 +7296,8 @@ export function createPgSessionsBackend(
                 ],
               )
             ).rows[0];
-            const recoverableFinalizedWaiver =
-              (finalized?.status === "crashed" || finalized?.status === "interrupted") &&
-              supportsAutomaticTurnRecovery(finalized.waive_reason ?? "");
-            if (
-              !recoverableTapeError &&
-              !supportsAutomaticTurnRecovery(dispatchFailure?.failure_code ?? "") &&
-              !recoverableFinalizedWaiver
-            ) {
-              return { kind: "recovery_conflict", reason: "source_not_recoverable" };
-            }
             let authoritativeRetryAttempt = automaticSourceAttempt;
             if (finalized) {
-              if (finalized.status !== "crashed" && finalized.status !== "interrupted") {
-                return { kind: "recovery_conflict", reason: "source_tape_completed" };
-              }
               const recordRows = (
                 await client.query<{ payload: Buffer }>(
                   `SELECT payload
@@ -6138,39 +7320,61 @@ export function createPgSessionsBackend(
                 return { kind: "recovery_conflict", reason: "source_tape_malformed" };
               }
               const assessment = assessTurnRecoveryTape(records);
-              const terminalError = [...records].reverse().find((record) =>
-                !!record && typeof record === "object" && !Array.isArray(record) &&
-                typeof (record as MessageLike)._errorCode === "string"
-              ) as MessageLike | undefined;
-              const terminalErrorCode = typeof terminalError?._errorCode === "string"
-                ? terminalError._errorCode
-                : "";
+              const terminalErrorCode = terminalTurnRecordErrorCode(records);
+              const finalizedErrorCode = terminalErrorCode ||
+                (finalized.status === "crashed" || finalized.status === "interrupted"
+                  ? finalized.waive_reason ?? ""
+                  : "");
+              if (!supportsAutomaticTurnRecovery(finalizedErrorCode)) {
+                return { kind: "recovery_conflict", reason: "source_not_recoverable" };
+              }
+              if (
+                finalized.status === "completed" &&
+                assessment.mode !== "checkpoint"
+              ) {
+                return { kind: "recovery_conflict", reason: "completed_replay_forbidden" };
+              }
+              if (assessment.mode !== input.recovery.mode) {
+                return { kind: "recovery_conflict", reason: "recovery_mode_mismatch" };
+              }
+              if (
+                input.recovery.automatic &&
+                assessment.mode === "checkpoint" &&
+                !assessment.checkpointSafe &&
+                finalized.status !== "completed"
+              ) {
+                return { kind: "recovery_conflict", reason: "automatic_checkpoint_unsafe" };
+              }
+              if (
+                assessment.mode === "replay" &&
+                (
+                  !assessment.checkpointSafe ||
+                  !recoveryWithoutCheckpointIsProven(finalizedErrorCode)
+                )
+              ) {
+                return { kind: "recovery_conflict", reason: "automatic_replay_not_proven" };
+              }
               if (input.recovery.automatic) {
                 authoritativeRetryAttempt = Math.max(
                   authoritativeRetryAttempt,
                   maxAutomaticTurnRetryAttempt(records, automaticRoot),
                 );
               }
-              if (assessment.mode !== input.recovery.mode) {
-                return { kind: "recovery_conflict", reason: "recovery_mode_mismatch" };
-              }
-              if (input.recovery.automatic && !assessment.checkpointSafe) {
-                return { kind: "recovery_conflict", reason: "automatic_checkpoint_unsafe" };
+            } else {
+              const dispatchErrorCode = dispatchFailure?.failure_code ?? "";
+              if (
+                !recoverableHotTapeError &&
+                !supportsAutomaticTurnRecovery(dispatchErrorCode)
+              ) {
+                return { kind: "recovery_conflict", reason: "source_not_recoverable" };
               }
               if (
-                input.recovery.automatic &&
-                assessment.mode === "replay" &&
-                !recoveryWithoutCheckpointIsProven(
-                  terminalErrorCode || finalized.waive_reason || "",
-                )
+                input.recovery.mode !== "replay" ||
+                dispatchFailure?.outcome !== "not_accepted" ||
+                !recoveryWithoutCheckpointIsProven(dispatchErrorCode)
               ) {
-                return { kind: "recovery_conflict", reason: "automatic_replay_not_proven" };
+                return { kind: "recovery_conflict", reason: "source_not_safely_replayable" };
               }
-            } else if (
-              input.recovery.mode !== "replay" ||
-              dispatchFailure?.outcome !== "not_accepted"
-            ) {
-              return { kind: "recovery_conflict", reason: "source_not_safely_replayable" };
             }
             if (
               input.recovery.automatic &&
@@ -6384,9 +7588,9 @@ export function createPgSessionsBackend(
           } catch {
             return false;
           }
-          const recordError = [...records].reverse().find(
-            (record) => typeof record.payload._errorCode === "string",
-          )?.payload._errorCode;
+          const recordError = terminalTurnRecordErrorCode(
+            records.map((record) => record.payload),
+          );
           await scheduleAutomaticRecoveryForFinalizedTurn(client, {
             uid: userId,
             sessionUserId,
@@ -6445,38 +7649,42 @@ export function createPgSessionsBackend(
       attemptNo: number,
     ): Promise<TurnTapeStateResult> {
       const uidMatch = /^c:([1-9][0-9]*)$/.exec(userId);
-      if (!uidMatch) return { state: "none", status: null, dispatchLeaseActive: false };
+      if (!uidMatch) return { state: "none", status: null, dispatchLeaseActive: false, gatewayShutdownEvidence: false };
       const dispatchUserId = uidMatch[1]!;
       const res = await pool.query<{
         tape_found: boolean;
         finalized_at: string | null;
+        visible_at: string | null;
         tape_status: string | null;
         dispatch_lease_active: boolean;
+        gateway_shutdown_evidence: boolean;
       }>(
         `SELECT
            (tape.tape_id IS NOT NULL) AS tape_found,
            tape.finalized_at,
+           tape.visible_at,
            tape.status AS tape_status,
            COALESCE(
              dispatch.status IN ('admitted','accepted')
                AND dispatch.lease_until > statement_timestamp(),
              FALSE
-           ) AS dispatch_lease_active
+           ) AS dispatch_lease_active,
+           COALESCE(dispatch.shutdown_ctx->>$5, '') <> '' AS gateway_shutdown_evidence
          FROM (VALUES (1)) AS singleton(n)
          LEFT JOIN LATERAL (
-           SELECT tape_id, finalized_at, status
+           SELECT tape_id, finalized_at, visible_at, status
              FROM client_session_turn_tapes
             WHERE user_id = $1 AND dispatch_id = $3 AND attempt_no = $4
-            ORDER BY (finalized_at IS NOT NULL) DESC
+            ORDER BY (visible_at IS NOT NULL OR finalized_at IS NOT NULL) DESC
             LIMIT 1
          ) AS tape ON TRUE
          LEFT JOIN LATERAL (
-           SELECT status, lease_until
+           SELECT status, lease_until, shutdown_ctx
              FROM turn_dispatches
             WHERE user_id = $2 AND dispatch_id = $3 AND attempt_no = $4
             LIMIT 1
          ) AS dispatch ON TRUE`,
-        [userId, dispatchUserId, dispatchId, attemptNo],
+        [userId, dispatchUserId, dispatchId, attemptNo, "gatewayExitedAt"],
       );
       // singleton guarantees one row. Tape and lease evidence come from this
       // one PostgreSQL statement snapshot: a separate read could observe
@@ -6484,13 +7692,15 @@ export function createPgSessionsBackend(
       // a false SERVICE_RESTART tape.
       const row = res.rows[0]!;
       const dispatchLeaseActive = row.dispatch_lease_active === true;
+      const gatewayShutdownEvidence = row.gateway_shutdown_evidence === true;
       if (!row.tape_found) {
-        return { state: "none", status: null, dispatchLeaseActive };
+        return { state: "none", status: null, dispatchLeaseActive, gatewayShutdownEvidence };
       }
       return {
-        state: row.finalized_at !== null ? "finalized" : "partial",
+        state: row.visible_at !== null || row.finalized_at !== null ? "finalized" : "partial",
         status: row.tape_status ?? null,
         dispatchLeaseActive,
+        gatewayShutdownEvidence,
       };
     },
 
@@ -6614,6 +7824,7 @@ export function createPgSessionsBackend(
     async finalizeLosslessTurnTape(
       userId: string,
       request: LosslessTurnTapeFinalizeRequest,
+      finalizeOptions?: { materialize?: boolean },
     ): Promise<LosslessTurnTapeFinalizeResult> {
       const flight = finalizeSingleflight(
         _losslessFinalizeSingleflightKey(userId, request),
@@ -6636,6 +7847,16 @@ export function createPgSessionsBackend(
         userId,
         request,
       );
+      let phaseA: LosslessTurnTapeFinalizeResult | null = null;
+      if (readyForPreparation) {
+        phaseA = await commitVisibleLosslessTurnPhaseA(pool, userId, request);
+        if (phaseA.applied === "session_not_found" || phaseA.applied === "session_deleted" || phaseA.applied === "incomplete") {
+          return phaseA;
+        }
+      }
+      if (finalizeOptions?.materialize === false) {
+        return phaseA ?? { applied: "incomplete" };
+      }
       let prepared: PreparedLosslessTurnTape | null = null;
       let preparedModelRecordCount = 0;
       let releaseFinalizeAdmission: (() => void) | null = null;
@@ -6649,7 +7870,7 @@ export function createPgSessionsBackend(
           );
           prepared = recordStorageFormat === null
             ? null
-            : await prepareLosslessTurnTapeOutsideLocks(
+            : await _prepareLosslessTurnTapeOutsideLocks(
                 pool,
                 userId,
                 request,
@@ -6657,7 +7878,7 @@ export function createPgSessionsBackend(
               );
           if (prepared) {
             preparedModelRecordCount = preparedModelSidecarManifest(prepared).length;
-            await stagePreparedLosslessTurnRecords(
+            await _stagePreparedLosslessTurnRecords(
               pool,
               userId,
               request,
@@ -6670,6 +7891,9 @@ export function createPgSessionsBackend(
         } catch (err) {
           releaseFinalizeAdmission?.();
           releaseFinalizeAdmission = null;
+          if (phaseA && phaseA.applied === "finalized" && isTransientTapeError(err)) {
+            return { ...phaseA, settlementHandoff: true };
+          }
           throw err;
         }
       }
@@ -6745,11 +7969,16 @@ export function createPgSessionsBackend(
             dispatch_id: string | null;
             attempt_no: number | null;
             client_message_id: string | null;
+            visible_at: string | null;
+            materialization_status: string;
+            settlement_hash: string | null;
+            visible_head: unknown;
           }>(
             `SELECT tape_id,agent_id,turn_index,status,turn_key,tape_sha256,
                     total_bytes, part_count, created_at, waive_reason, finalized_at,
                     record_storage_format,engine_billings,
-                    billing_anchor_id,dispatch_id,attempt_no,client_message_id
+                    billing_anchor_id,dispatch_id,attempt_no,client_message_id,
+                    visible_at::text, materialization_status, settlement_hash, visible_head
                FROM client_session_turn_tapes
               WHERE session_id=$1 AND user_id=$2 AND tape_id=ANY($3::text[])
               ORDER BY tape_id FOR UPDATE`,
@@ -6766,6 +7995,8 @@ export function createPgSessionsBackend(
         if (!sameLosslessTurnTapeHeader(tape, request)) {
           throw new Error("lossless turn tape finalize header conflict");
         }
+        const publishesVisiblePhaseARecords =
+          tape.visible_at !== null && tape.materialization_status !== "complete";
         const recoverySourceTape = recoveryLink
           ? tapeById.get(recoveryLink.source_tape_id)
           : undefined;
@@ -6830,7 +8061,12 @@ export function createPgSessionsBackend(
           // 幂等 replay 分支同样收敛 dispatch(不依赖 parts):首轮 finalize 若已收敛,CAS no-op。
           let replayLate = false;
           if (tape.dispatch_id !== null) {
-            const convergence = await convergeDispatchOnFinalize(client, tape.dispatch_id, tape.status);
+            const convergence = await convergeDispatchOnFinalize(
+              client,
+              tape.dispatch_id,
+              tape.status,
+              request.settlement?.errorCode ?? errorCodeFromVisibleHead(tape.visible_head),
+            );
             replayLate = convergence.lateTape;
             await reconcileLiveStreamWithFinalTape(client, {
               dispatchId: tape.dispatch_id,
@@ -6855,16 +8091,60 @@ export function createPgSessionsBackend(
             applied: "idempotent",
             recordCount: Number(count.rows[0]?.count ?? 0),
             engineBillings: structuredClone(tape.engine_billings) as DurableCodexBilling[],
+            ...(request.waiveReason !== undefined || (Array.isArray(tape.engine_billings) && tape.engine_billings.length > 0)
+              ? { settlementHandoff: true }
+              : {}),
             ...(replayLate ? { dispatchLateTape: true } : {}),
-          };
-        }
+          };        }
 
-        if (!prepared) return { applied: "incomplete" };
+        if (!prepared) {
+          if (tape.visible_at !== null || (phaseA && phaseA.applied === "finalized")) {
+            return {
+              applied: "finalized",
+              recordCount: 0,
+              engineBillings: Array.isArray(tape.engine_billings)
+                ? structuredClone(tape.engine_billings) as DurableCodexBilling[]
+                : [],
+              settlementHandoff: true,
+            };
+          }
+          return { applied: "incomplete" };
+        }
         if (tape.record_storage_format !== prepared.recordStorageFormat) {
           throw new Error("lossless turn tape materialization format changed before publication");
         }
         const turn = prepared.turn;
-
+        const persistedBillings = Array.isArray(tape.engine_billings) ? tape.engine_billings : [];
+        const canonicalRequestId = turn.engineBillings[0]?.requestId ?? turn.payload.requestId ?? null;
+        const persistedRequestId = (persistedBillings as DurableCodexBilling[])[0]?.requestId
+          ?? turn.payload.requestId
+          ?? null;
+        const canonicalSettlementHash = assertSettlementMatchesCanonical({
+          canonicalAnchorId: turn.billingAnchorId,
+          canonicalRequestId,
+          canonicalBillings: turn.engineBillings,
+          envelope: request.settlement
+            ? {
+                billingAnchorId: request.settlement.billingAnchorId,
+                requestId: request.settlement.requestId,
+                engineBillings: settlementEngineBillings(request.settlement),
+              }
+            : null,
+          persistedHash: tape.settlement_hash,
+          persistedAuthority: tape.settlement_hash && tape.billing_anchor_id
+            ? {
+                billingAnchorId: tape.billing_anchor_id,
+                requestId: persistedRequestId,
+                engineBillings: persistedBillings,
+              }
+            : null,
+        });
+        if (
+          persistedBillings.length > 0 &&
+          !settlementPayloadEqual(persistedBillings, turn.engineBillings)
+        ) {
+          throw new Error("lossless turn tape engineBillings mismatch");
+        }
         // Parts are immutable once staged. Recheck only their manifest while
         // holding the tape row lock; source-part BYTEA concatenation,
         // JSON.parse and user-visible/model materialization already happened
@@ -7141,7 +8421,9 @@ export function createPgSessionsBackend(
         const preUpgradeMessages = existingMessages;
         const recordIds = new Set(allRecordIds);
         existingMessages = existingMessages.filter(
-          (message) => typeof message?.id !== "string" || !recordIds.has(message.id),
+          (message) =>
+            message?._turnTapeId !== request.tapeId &&
+            (typeof message?.id !== "string" || !recordIds.has(message.id)),
         );
         const plan = planAppendServerAuthoredBatch(
           existingMessages,
@@ -7150,6 +8432,7 @@ export function createPgSessionsBackend(
           bigIntNumOr(session.archived_through_seq, 0),
         );
         if (plan.kind === "oversized") throw new Error("lossless turn tape anchor tail unexpectedly oversized");
+        let phaseBIdentityAdvanced = false;
         if (plan.kind === "write") {
           const nowMs = Date.now();
           const archivedDelta = await execPgSpillPlan(
@@ -7161,10 +8444,18 @@ export function createPgSessionsBackend(
             nowMs,
           );
           const archivedCount = bigIntNumOr(session.archived_count, 0) + archivedDelta;
-          const timelineGenerationDelta = hasInvisibleMessageRemoval(
+          const removedInvisibleMessage = hasInvisibleMessageRemoval(
             preUpgradeMessages,
             existingMessages,
-          ) ? 1 : 0;
+          );
+          const historyRevisionDelta =
+            publishesVisiblePhaseARecords ||
+            hasInvisibleMessageRemoval(preUpgradeMessages, plan.tail) ||
+            archivedDelta > 0
+              ? 1
+              : 0;
+          const timelineGenerationDelta =
+            publishesVisiblePhaseARecords || removedInvisibleMessage ? 1 : 0;
           await client.query(
             `UPDATE client_sessions SET
                messages=$1, message_count=$2, last_at=$3,
@@ -7182,9 +8473,19 @@ export function createPgSessionsBackend(
               archivedCount,
               request.sessionId,
               userId,
-              hasInvisibleMessageRemoval(preUpgradeMessages, plan.tail) || archivedDelta > 0 ? 1 : 0,
+              historyRevisionDelta,
               timelineGenerationDelta,
             ],
+          );
+          phaseBIdentityAdvanced = publishesVisiblePhaseARecords;
+        }
+        if (publishesVisiblePhaseARecords && !phaseBIdentityAdvanced) {
+          // Defensive no-write path: exact records still replaced a visible
+          // fallback even if the hot anchor happened to be byte-identical.
+          await advanceClientTimelineIdentityInTransaction(
+            client,
+            request.sessionId,
+            userId,
           );
         }
 
@@ -7247,17 +8548,23 @@ export function createPgSessionsBackend(
         await client.query(
           `UPDATE client_session_turn_tapes
               SET billing_anchor_id=$1, usage=$2, parent_turn_key=$3,
-                  engine_billings=$4, finalized_at=$5, record_storage_format=$6,
+                  engine_billings=$4, finalized_at=$5,
+                  visible_at=COALESCE(visible_at,$5),
+                  materialization_status='complete',
+                  settlement_verified_at=COALESCE(settlement_verified_at, NOW()),
+                  materialization_error=NULL,
+                  record_storage_format=$6,
                   goal_id=$7::uuid, goal_state_revision=$8, goal_tokens_used=$9,
                   client_message_id=$10, continuation_of_turn_key=$11,
                   physical_record_count=$12, logical_record_count=$13,
-                  record_payload_bytes=$14, model_record_count=$15
-            WHERE session_id=$16 AND user_id=$17 AND tape_id=$18`,
+                  record_payload_bytes=$14, model_record_count=$15,
+                  settlement_hash=CASE WHEN settlement_hash IS NULL THEN NULL ELSE $16 END
+            WHERE session_id=$17 AND user_id=$18 AND tape_id=$19`,
           [
             turn.billingAnchorId,
-            JSON.stringify(turn.payload.usage ?? {}),
+            JSON.stringify(sanitizeValueForPgJsonb(turn.payload.usage ?? {})),
             turn.payload.parentTurnKey ?? null,
-            JSON.stringify(turn.engineBillings),
+            JSON.stringify(sanitizeValueForPgJsonb(turn.engineBillings)),
             Date.now(),
             prepared.recordStorageFormat,
             turn.payload.goalId ?? null,
@@ -7269,11 +8576,21 @@ export function createPgSessionsBackend(
             turn.logicalRecordCount,
             prepared.recordPayloadBytes,
             modelRecordCount,
+            canonicalSettlementHash,
             request.sessionId,
             userId,
             request.tapeId,
           ],
         );
+        if (tape.settlement_hash !== null && tape.settlement_hash !== canonicalSettlementHash) {
+          await client.query(
+            `UPDATE turn_tape_settlement_jobs
+                SET settlement_hash=$4, updated_at=NOW()
+              WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
+                AND settlement_hash IS DISTINCT FROM $4`,
+            [request.sessionId, userId, request.tapeId, canonicalSettlementHash],
+          );
+        }
         goalUsageChanged = await bumpGoalUsageSnapshotForTape(client, request.sessionId, userId, request.tapeId);
         // 原始分片(parts)一律随 finalize 清除:records 才是脱敏后的持久权威,parts 保存
         // 的是脱敏前 payload,留下即隐私面偏差 + 双份存储(2026-07-16 巡检批;此前只在
@@ -7288,7 +8605,12 @@ export function createPgSessionsBackend(
         // 或迟到 tape 转 manual_reconcile。浏览器直接读 tape/dispatch，不再写任何影子内容表。
         let dispatchLate = false;
         if (tape.dispatch_id !== null) {
-          const convergence = await convergeDispatchOnFinalize(client, tape.dispatch_id, tape.status);
+          const convergence = await convergeDispatchOnFinalize(
+            client,
+            tape.dispatch_id,
+            tape.status,
+            request.settlement?.errorCode ?? errorCodeFromVisibleHead(tape.visible_head),
+          );
           dispatchLate = convergence.lateTape;
           await reconcileLiveStreamWithFinalTape(client, {
             dispatchId: tape.dispatch_id,
@@ -7308,6 +8630,13 @@ export function createPgSessionsBackend(
             );
           }
         }
+        if (!dispatchLate) {
+          await releaseSettlementJobsAfterVerify(client, {
+            sessionId: request.sessionId,
+            userId,
+            tapeId: request.tapeId,
+          });
+        }
         if (billingUserId !== null && !turn.payload.continuationOfTurnKey) {
           await scheduleAutomaticRecoveryForFinalizedTurn(client, {
             uid: billingUserId,
@@ -7323,9 +8652,11 @@ export function createPgSessionsBackend(
           applied: "finalized",
           recordCount: turn.records.length,
           engineBillings: turn.engineBillings.map((billing) => structuredClone(billing)),
-          ...(dispatchLate ? { dispatchLateTape: true } : {}),
-        };
-            });
+          ...(turn.engineBillings.length > 0 || request.waiveReason !== undefined
+            ? { settlementHandoff: true }
+            : {}),
+          ...(dispatchLate ? { dispatchLateTape: true, settlementHeld: true } : {}),
+        };            });
             break;
           } catch (error) {
             if (error instanceof TurnTapeRecoveryLockUpgrade && lockAttempt === 0) {
@@ -7374,6 +8705,9 @@ export function createPgSessionsBackend(
               "server_authored_turn_anchor_map",
               "turn_tape_cost_components",
               "turn_tape_recovery_links",
+              "turn_dispatches",
+              "turn_tape_materialization_jobs",
+              "turn_tape_settlement_jobs",
               "session_goals",
               "wechat_bindings",
             ],
@@ -7540,7 +8874,7 @@ export function createPgSessionsBackend(
       userId: string,
       message: {
         id: string;
-        role: "assistant" | "user" | "system" | "thinking" | "tool" | "agent-group";
+        role: "assistant" | "user" | "system" | "thinking" | "tool" | "agent-group" | "permission";
         text?: string;
         ts?: number;
         [k: string]: unknown;
@@ -7550,6 +8884,39 @@ export function createPgSessionsBackend(
         pgAppendServerAuthoredCore(client, sessId, userId, message as MessageLike & { id: string }),
       );
       return r.applied ? { applied: true } : { applied: false, reason: r.reason };
+    },
+
+    async patchServerAuthoredMessage(
+      sessId: string,
+      userId: string,
+      msgId: string,
+      patch: Record<string, unknown>,
+    ): Promise<{ applied: true } | { applied: false; reason: "session_not_found" | "session_deleted" | "not_found" }> {
+      return withTx(pool, async (client) => {
+        const row = await client.query<{
+          messages: unknown
+          next_seq: number | null
+          deleted_at: Date | string | null
+        }>(
+          "SELECT messages, next_seq, deleted_at FROM client_sessions WHERE id = $1 AND user_id = $2 FOR UPDATE",
+          [sessId, userId],
+        );
+        if (row.rowCount === 0) return { applied: false as const, reason: "session_not_found" as const };
+        const rec = row.rows[0]!;
+        if (rec.deleted_at != null) return { applied: false as const, reason: "session_deleted" as const };
+        const msgs = Array.isArray(rec.messages) ? rec.messages as Array<Record<string, unknown>> : null;
+        if (!msgs) return { applied: false as const, reason: "not_found" as const };
+        const idx = msgs.findIndex((m) => m && m.id === msgId);
+        if (idx < 0) return { applied: false as const, reason: "not_found" as const };
+        const nextSeq = typeof rec.next_seq === "number" && rec.next_seq > 0 ? rec.next_seq : 1;
+        msgs[idx] = { ...msgs[idx], ...patch, id: msgId, _source: "server", _seq: nextSeq };
+        const upd = await client.query(
+          "UPDATE client_sessions SET messages = $1::jsonb, updated_at = GREATEST(updated_at + 1, $2), next_seq = $3, history_revision = history_revision + 1 WHERE id = $4 AND user_id = $5 AND deleted_at IS NULL",
+          [JSON.stringify(msgs), Date.now(), nextSeq + 1, sessId, userId],
+        );
+        if (upd.rowCount !== 1) return { applied: false as const, reason: "session_deleted" as const };
+        return { applied: true as const };
+      });
     },
 
     // ── appendServerAuthoredMessageForRequest(usage 聚合:requestId-keyed 四表原子)──
@@ -8224,7 +9591,30 @@ export function createPgSessionsBackend(
     },
 
     // ── 读路径(无事务;单/多语句纯读,与 SQLite 一致不开显式事务)────────────────
-    async listClientSessions(userId: string): Promise<ClientSessionMeta[]> {
+    async listClientSessions(
+      userId: string,
+      opts: ListClientSessionsOpts = {},
+    ): Promise<ListClientSessionsResult> {
+      // runState / lastOutcome / lastErrorCode 从 turn_dispatches 一条 SQL 派生。
+      // inbox 在容器 SQLite;master 权威是 turn_dispatches(status/outcome/failure_code)。
+      // last_preview_raw:数组尾部最多 20 条里最近非空 .text(线上 assistant 无 text);
+      // octet_length > 2MB 不展开,不把 messages blob 拉进 Node。
+      const dispatchUid = dispatchUidForList(userId);
+      const includeArchived = opts.includeArchived === true;
+      const before = typeof opts.before === "number" && Number.isFinite(opts.before) && opts.before > 0
+        ? Math.floor(opts.before)
+        : undefined;
+      const limit = typeof opts.limit === "number" && Number.isFinite(opts.limit) && opts.limit > 0
+        ? Math.min(SESSION_LIST_LIMIT_MAX, Math.floor(opts.limit))
+        : undefined;
+      const params: unknown[] = [userId, dispatchUid];
+      let where = "cs.user_id = $1 AND cs.deleted_at IS NULL";
+      if (!includeArchived) where += " AND cs.archived_at IS NULL";
+      if (before !== undefined) {
+        params.push(before);
+        where += ` AND cs.last_at < $${params.length}`;
+      }
+      const limitSql = limit !== undefined ? ` LIMIT ${limit + 1}` : "";
       const rows = (
         await pool.query<{
           id: string;
@@ -8236,23 +9626,90 @@ export function createPgSessionsBackend(
           updated_at: string;
           msg_count: number;
           model_id: string | null;
+          project_id: string | null;
+          archived_at: string | null;
+          last_preview_raw: string | null;
+          run_state: string;
+          last_outcome: string | null;
+          last_error_code: string | null;
+          unread: boolean;
         }>(
-          `SELECT id, agent_id, title, pinned, created_at, last_at, updated_at, message_count AS msg_count, model_id
-             FROM client_sessions WHERE user_id = $1 AND deleted_at IS NULL ORDER BY last_at DESC`,
-          [userId],
+          `SELECT cs.id, cs.agent_id, cs.title, cs.pinned, cs.created_at, cs.last_at, cs.updated_at,
+                  cs.message_count AS msg_count, cs.model_id, cs.project_id, cs.archived_at,
+                  CASE WHEN octet_length(cs.messages) > ${SESSION_SEARCH_JSON_EXPAND_MAX_BYTES}
+                            OR left(COALESCE(cs.messages, ''), 1) <> '[' THEN NULL
+                       ELSE (
+                         SELECT LEFT(txt, 240)
+                           FROM (
+                             SELECT btrim(elem->>'text') AS txt
+                               FROM json_array_elements(cs.messages::json)
+                                    WITH ORDINALITY AS t(elem, n)
+                              ORDER BY n DESC
+                              LIMIT ${LAST_MESSAGE_PREVIEW_TAIL_MAX}
+                           ) tail
+                          WHERE txt IS NOT NULL AND length(txt) > 0
+                          LIMIT 1
+                       ) END AS last_preview_raw,
+                  CASE WHEN open_d.session_id IS NOT NULL THEN 'running' ELSE 'idle' END AS run_state,
+                  last_d.outcome AS last_outcome,
+                  last_d.failure_code AS last_error_code,
+                  (last_d.outcome IN (${UNREAD_OUTCOME_SQL})
+                   AND ${LAST_D_TERMINAL_MS_SQL} > ${LAST_READ_AT_MS_SQL}) AS unread
+             FROM client_sessions cs
+             LEFT JOIN (
+               SELECT session_id FROM turn_dispatches
+                WHERE user_id = $2
+                  AND status IN ('admitted', 'accepted', 'rejecting')
+                GROUP BY session_id
+             ) open_d ON open_d.session_id = cs.id
+             LEFT JOIN (
+               SELECT session_id, outcome, failure_code, terminal_at FROM (
+                 SELECT session_id, outcome, failure_code, terminal_at,
+                        ROW_NUMBER() OVER (
+                          PARTITION BY session_id
+                          ORDER BY terminal_at DESC NULLS LAST, admitted_at DESC, dispatch_id DESC
+                        ) AS rn
+                   FROM turn_dispatches
+                  WHERE user_id = $2 AND status = 'terminal'
+               ) ranked
+               WHERE rn = 1
+             ) last_d ON last_d.session_id = cs.id
+            WHERE ${where}
+            ORDER BY cs.last_at DESC${limitSql}`,
+          params,
         )
       ).rows;
-      return rows.map((r) => ({
-        id: r.id,
-        agentId: r.agent_id,
-        title: r.title,
-        pinned: r.pinned === 1,
-        createdAt: bigIntNum(r.created_at, "created_at"),
-        lastAt: bigIntNum(r.last_at, "last_at"),
-        messageCount: r.msg_count,
-        updatedAt: bigIntNum(r.updated_at, "updated_at"),
-        ...(r.model_id ? { modelId: r.model_id } : {}),
-      }));
+      let sliced = rows;
+      let nextCursor: number | undefined;
+      if (limit !== undefined && rows.length > limit) {
+        sliced = rows.slice(0, limit);
+        const last = sliced[sliced.length - 1];
+        if (last) nextCursor = bigIntNum(last.last_at, "last_at");
+      }
+      return {
+        sessions: sliced.map((r) => {
+          const preview = toLastMessagePreview(r.last_preview_raw);
+          return {
+            id: r.id,
+            agentId: r.agent_id,
+            title: r.title,
+            pinned: r.pinned === 1,
+            createdAt: bigIntNum(r.created_at, "created_at"),
+            lastAt: bigIntNum(r.last_at, "last_at"),
+            messageCount: r.msg_count,
+            updatedAt: bigIntNum(r.updated_at, "updated_at"),
+            projectId: r.project_id ?? null,
+            runState: r.run_state === "running" ? "running" : "idle",
+            lastOutcome: mapClientSessionLastOutcome(r.last_outcome),
+            lastErrorCode: r.last_error_code ?? null,
+            unread: r.unread === true,
+            archived: r.archived_at != null,
+            ...(preview ? { lastMessagePreview: preview } : {}),
+            ...(r.model_id ? { modelId: r.model_id } : {}),
+          };
+        }),
+        ...(nextCursor !== undefined ? { nextCursor } : {}),
+      };
     },
 
     async getClientSession(
@@ -8339,6 +9796,7 @@ export function createPgSessionsBackend(
           // 实际合计为准，读尽后不会留下“还有 N 条”的幽灵按钮。
           archivedCount: bigIntNum(row.archived_count, "archived chunk message count"),
           archivedThroughSeq: archivedThroughOrderSeq,
+          ...(await readOpenDispatchForSession(queryable, row.id, row.user_id)),
         };
       };
       return options.view === "timeline"
@@ -8582,6 +10040,7 @@ export function createPgSessionsBackend(
       userId: string,
       afterRecordId = 0,
       limit = 200,
+      options?: { seekTail?: boolean },
     ) {
       return readDurableClientSessionLiveFrames(
         pool,
@@ -8589,7 +10048,36 @@ export function createPgSessionsBackend(
         userId,
         afterRecordId,
         limit,
+        options,
       );
+    },
+
+    async readClientSessionLiveUnits(
+      sessionId: string,
+      userId: string,
+      options?: {
+        n?: number
+        k?: number
+        before?: string | null
+        group?: string | null
+        nestedBefore?: string | null
+        deadlineMs?: number
+        maxBytes?: number
+      },
+    ) {
+      return readDurableClientSessionLiveUnits(pool, sessionId, userId, options);
+    },
+
+    async readLiveOrTapeFramePayload(
+      sessionId: string,
+      userId: string,
+      ref: { recordId?: string | null; sha256?: string | null },
+    ) {
+      return readDurableLiveOrTapeFramePayload(pool, sessionId, userId, ref);
+    },
+
+    async convergeFinalizedTapeLiveStreams() {
+      return convergeFinalizedTapeLiveStreams(pool);
     },
 
     async readClientTimelinePage(
@@ -8736,6 +10224,634 @@ export function createPgSessionsBackend(
         )
       ).rows[0];
       return { ok: !!row, updatedAt: row ? bigIntNum(row.updated_at, "updated_at") : now };
+    },
+
+    async patchClientSessionMeta(
+      id: string,
+      userId: string,
+      patch: ClientSessionMetaPatch,
+    ): Promise<PatchClientSessionMetaResult> {
+      return withTx(pool, async (client) => {
+        const ownedSession = (
+          await client.query(
+            "SELECT 1 FROM client_sessions WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
+            [id, userId],
+          )
+        ).rows[0];
+        if (!ownedSession) return { ok: false, error: "not_found" };
+        if (patch.projectId !== undefined && patch.projectId !== null) {
+          const owned = (
+            await client.query(
+              "SELECT 1 FROM chat_projects WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
+              [patch.projectId, userId],
+            )
+          ).rows[0];
+          if (!owned) return { ok: false, error: "project_not_found" };
+        }
+        const sets: string[] = [`updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})`];
+        const params: unknown[] = [];
+        let n = 1;
+        if (patch.title !== undefined) {
+          sets.push(`title = $${n++}`);
+          params.push(patch.title);
+        }
+        if (patch.modelId !== undefined) {
+          sets.push(`model_id = $${n++}`);
+          params.push(patch.modelId);
+        }
+        if (patch.projectId !== undefined) {
+          sets.push(`project_id = $${n++}`);
+          params.push(patch.projectId);
+        }
+        if (patch.pinned !== undefined) {
+          sets.push(`pinned = $${n++}`);
+          params.push(patch.pinned ? 1 : 0);
+        }
+        if (patch.archived !== undefined) {
+          sets.push(`archived_at = $${n++}`);
+          params.push(patch.archived ? Date.now() : null);
+        }
+        params.push(id, userId);
+        const row = (
+          await client.query<{ updated_at: string }>(
+            `UPDATE client_sessions SET ${sets.join(", ")}
+              WHERE id = $${n++} AND user_id = $${n} AND deleted_at IS NULL
+              RETURNING updated_at`,
+            params,
+          )
+        ).rows[0];
+        if (!row) return { ok: false, error: "not_found" };
+        return { ok: true, updatedAt: bigIntNum(row.updated_at, "updated_at") };
+      });
+    },
+
+    async getSessionProjectInstructions(sessionId: string): Promise<string | null> {
+      const row = (
+        await pool.query<{ instructions: string | null }>(
+          `SELECT p.instructions
+             FROM client_sessions cs
+             JOIN chat_projects p ON p.id = cs.project_id AND p.user_id = cs.user_id
+            WHERE cs.id = $1 AND cs.deleted_at IS NULL AND p.deleted_at IS NULL`,
+          [sessionId],
+        )
+      ).rows[0];
+      if (!row?.instructions) return null;
+      const cleaned = sanitizeProjectInstructions(row.instructions).trim();
+      return cleaned.length > 0 ? cleaned : null;
+    },
+
+    async searchClientSessions(
+      userId: string,
+      opts: SearchClientSessionsOpts,
+    ): Promise<SearchClientSessionsResult> {
+      const q = opts.q.trim();
+      if (!q) return { results: [] };
+      const limit = typeof opts.limit === "number" && Number.isFinite(opts.limit) && opts.limit > 0
+        ? Math.min(SESSION_SEARCH_LIMIT_MAX, Math.floor(opts.limit))
+        : SESSION_SEARCH_LIMIT_DEFAULT;
+      const includeArchived = opts.includeArchived === true;
+      const like = `%${escapeLikePattern(q)}%`;
+      const archiveSql = includeArchived ? "" : " AND cs.archived_at IS NULL";
+      const candMax = SESSION_SEARCH_JSON_CANDIDATE_MAX;
+      const expandMax = SESSION_SEARCH_JSON_EXPAND_MAX_BYTES;
+      const titleRows = (
+        await pool.query<{
+          id: string;
+          title: string;
+          project_id: string | null;
+          last_at: string;
+        }>(
+          `SELECT id, title, project_id, last_at
+             FROM client_sessions cs
+            WHERE cs.user_id = $1 AND cs.deleted_at IS NULL${archiveSql}
+              AND cs.title ILIKE $2 ESCAPE '\\'`,
+          [userId, like],
+        )
+      ).rows;
+      // 正文在 client_sessions.messages(TEXT JSON) 与 spill 的
+      // client_session_archive_chunks.messages。两段式:先 TEXT ILIKE 收窄(不解析 JSON),
+      // 按 last_at DESC 取最近 N 条候选;octet_length > 2MB 的行只出一条 TEXT snippet,
+      // 不对 67MB/90MB 级 tape 做 json_array_elements。
+      const msgRows = (
+        await pool.query<{
+          id: string;
+          title: string;
+          project_id: string | null;
+          matched_at: string;
+          msg_text: string;
+        }>(
+          `WITH text_hits AS (
+             SELECT cs.id, cs.title, cs.project_id, cs.last_at, cs.messages,
+                    octet_length(cs.messages) AS msg_bytes
+               FROM client_sessions cs
+              WHERE cs.user_id = $1 AND cs.deleted_at IS NULL${archiveSql}
+                AND cs.messages ILIKE $2 ESCAPE '\\'
+              ORDER BY cs.last_at DESC
+              LIMIT $3
+           )
+           SELECT c.id, c.title, c.project_id,
+                  COALESCE((elem->>'ts')::bigint, c.last_at)::text AS matched_at,
+                  LEFT(COALESCE(elem->>'text', ''), 400) AS msg_text
+             FROM text_hits c
+             CROSS JOIN LATERAL json_array_elements(
+               CASE WHEN left(c.messages, 1) = '[' THEN c.messages::json ELSE '[]'::json END
+             ) elem
+            WHERE c.msg_bytes <= $4
+              AND elem->>'text' ILIKE $2 ESCAPE '\\'
+           UNION ALL
+           SELECT c.id, c.title, c.project_id,
+                  c.last_at::text AS matched_at,
+                  substring(c.messages FROM GREATEST(1, strpos(lower(c.messages), lower($5)) - 80) FOR 400) AS msg_text
+             FROM text_hits c
+            WHERE c.msg_bytes > $4`,
+          [userId, like, candMax, expandMax, q],
+        )
+      ).rows;
+      const chunkRows = (
+        await pool.query<{
+          id: string;
+          title: string;
+          project_id: string | null;
+          matched_at: string;
+          msg_text: string;
+        }>(
+          `WITH text_hits AS (
+             SELECT cs.id, cs.title, cs.project_id, cs.last_at, ch.messages,
+                    octet_length(ch.messages) AS msg_bytes
+               FROM client_session_archive_chunks ch
+               JOIN client_sessions cs ON cs.id = ch.session_id AND cs.user_id = ch.user_id
+              WHERE cs.user_id = $1 AND cs.deleted_at IS NULL${archiveSql}
+                AND ch.messages ILIKE $2 ESCAPE '\\'
+              ORDER BY cs.last_at DESC
+              LIMIT $3
+           )
+           SELECT c.id, c.title, c.project_id,
+                  COALESCE((elem->>'ts')::bigint, c.last_at)::text AS matched_at,
+                  LEFT(COALESCE(elem->>'text', ''), 400) AS msg_text
+             FROM text_hits c
+             CROSS JOIN LATERAL json_array_elements(
+               CASE WHEN left(c.messages, 1) = '[' THEN c.messages::json ELSE '[]'::json END
+             ) elem
+            WHERE c.msg_bytes <= $4
+              AND elem->>'text' ILIKE $2 ESCAPE '\\'
+           UNION ALL
+           SELECT c.id, c.title, c.project_id,
+                  c.last_at::text AS matched_at,
+                  substring(c.messages FROM GREATEST(1, strpos(lower(c.messages), lower($5)) - 80) FOR 400) AS msg_text
+             FROM text_hits c
+            WHERE c.msg_bytes > $4`,
+          [userId, like, candMax, expandMax, q],
+        )
+      ).rows;
+      const hits = [
+        ...titleRows.map((r) => ({
+          sessionId: r.id,
+          title: r.title,
+          projectId: r.project_id ?? null,
+          snippet: buildSearchSnippet(r.title, q),
+          matchedAt: bigIntNum(r.last_at, "last_at"),
+          kind: "title" as const,
+        })),
+        ...msgRows.map((r) => ({
+          sessionId: r.id,
+          title: r.title,
+          projectId: r.project_id ?? null,
+          snippet: buildSearchSnippet(r.msg_text, q),
+          matchedAt: bigIntNum(r.matched_at, "matched_at"),
+          kind: "message" as const,
+        })),
+        ...chunkRows.map((r) => ({
+          sessionId: r.id,
+          title: r.title,
+          projectId: r.project_id ?? null,
+          snippet: buildSearchSnippet(r.msg_text, q),
+          matchedAt: bigIntNum(r.matched_at, "matched_at"),
+          kind: "message" as const,
+        })),
+      ];
+      const ranked = rankSessionSearchHits(hits, limit);
+      const unreadMap = await pgUnreadBySessionIds(
+        pool,
+        userId,
+        ranked.map((h) => h.sessionId),
+      );
+      return {
+        results: ranked.map((h) => ({ ...h, unread: unreadMap.get(h.sessionId) === true })),
+      };
+    },
+
+    async batchClientSessions(
+      userId: string,
+      input: BatchClientSessionsInput,
+    ): Promise<BatchClientSessionsResult> {
+      const parsed = parseSessionBatchInput(input);
+      if ("ok" in parsed) return parsed;
+      const { ids, action } = parsed;
+      if (ids.length === 0) return { ok: true, updated: 0, skipped: 0 };
+      return withTx(pool, async (client): Promise<BatchClientSessionsResult> => {
+        if (action === "move" && parsed.projectId) {
+          const owned = (
+            await client.query(
+              "SELECT 1 FROM chat_projects WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
+              [parsed.projectId, userId],
+            )
+          ).rows[0];
+          if (!owned) return { ok: false, error: "project_not_found" };
+        }
+        const ownedRows = (
+          await client.query<{ id: string }>(
+            `SELECT id FROM client_sessions
+              WHERE user_id = $1 AND deleted_at IS NULL AND id = ANY($2::text[])`,
+            [userId, ids],
+          )
+        ).rows;
+        const owned = new Set(ownedRows.map((r) => r.id));
+        const skipped = ids.length - owned.size;
+        const targetIds = ids.filter((id) => owned.has(id));
+        if (targetIds.length === 0) return { ok: true, updated: 0, skipped };
+        let updated = 0;
+        if (action === "delete") {
+          for (const id of targetIds) {
+            const result = await client.query(
+              `UPDATE client_sessions
+                  SET deleted_at = ${CLOCK_MS_SQL},
+                      updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL}),
+                      messages = '[]', message_count = 0
+                WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
+              [id, userId],
+            );
+            if ((result.rowCount ?? 0) === 0) continue;
+            await client.query("DELETE FROM client_session_user_payloads WHERE session_id=$1 AND user_id=$2", [id, userId]);
+            await client.query("DELETE FROM client_session_archive_chunks WHERE session_id = $1", [id]);
+            await client.query("DELETE FROM client_session_archived_ids WHERE session_id = $1", [id]);
+            await client.query("DELETE FROM turn_tape_recovery_links WHERE session_id = $1", [id]);
+            await client.query("DELETE FROM client_session_turn_tapes WHERE session_id = $1", [id]);
+            await client.query("DELETE FROM pending_usage_patches WHERE parent_session_id = $1", [id]);
+            updated++;
+          }
+        } else if (action === "archive") {
+          const res = await client.query(
+            `UPDATE client_sessions
+                SET archived_at = COALESCE(archived_at, ${CLOCK_MS_SQL}),
+                    updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
+              WHERE user_id = $1 AND deleted_at IS NULL AND archived_at IS NULL
+                AND id = ANY($2::text[])`,
+            [userId, targetIds],
+          );
+          updated = res.rowCount ?? 0;
+        } else if (action === "unarchive") {
+          const res = await client.query(
+            `UPDATE client_sessions
+                SET archived_at = NULL,
+                    updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
+              WHERE user_id = $1 AND deleted_at IS NULL AND archived_at IS NOT NULL
+                AND id = ANY($2::text[])`,
+            [userId, targetIds],
+          );
+          updated = res.rowCount ?? 0;
+        } else {
+          const res = await client.query(
+            `UPDATE client_sessions
+                SET project_id = $1,
+                    updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
+              WHERE user_id = $2 AND deleted_at IS NULL
+                AND id = ANY($3::text[])`,
+            [parsed.projectId ?? null, userId, targetIds],
+          );
+          updated = res.rowCount ?? 0;
+        }
+        return { ok: true, updated, skipped };
+      });
+    },
+
+    async markClientSessionRead(userId: string, sessionId: string): Promise<MarkClientSessionReadResult> {
+      // last_read_at 单位 = epoch milliseconds（与 CLOCK_MS_SQL / terminal_at 派生相同）。
+      const res = await pool.query(
+        `UPDATE client_sessions SET last_read_at = ${CLOCK_MS_SQL}
+          WHERE user_id = $1 AND id = $2 AND deleted_at IS NULL`,
+        [userId, sessionId],
+      );
+      const updated = res.rowCount ?? 0;
+      if (updated === 0) return { ok: false, error: "not_found" };
+      return { ok: true, updated };
+    },
+
+    async markAllClientSessionsRead(userId: string): Promise<{ updated: number }> {
+      const res = await pool.query(
+        `UPDATE client_sessions SET last_read_at = ${CLOCK_MS_SQL}
+          WHERE user_id = $1 AND deleted_at IS NULL`,
+        [userId],
+      );
+      return { updated: res.rowCount ?? 0 };
+    },
+
+    async listChatProjects(userId: string): Promise<ChatProject[]> {
+      const rows = (
+        await pool.query<{
+          id: string;
+          name: string;
+          instructions: string | null;
+          color: string | null;
+          sort_order: number;
+          created_at: string;
+          updated_at: string;
+          session_count: string;
+        }>(
+          `${PG_CHAT_PROJECT_SELECT}
+            WHERE p.user_id = $2 AND p.deleted_at IS NULL
+            ORDER BY p.sort_order ASC, p.created_at ASC`,
+          [userId, userId],
+        )
+      ).rows;
+      return rows.map(mapPgChatProjectRow);
+    },
+
+    async createChatProject(
+      userId: string,
+      input: { name?: unknown; instructions?: unknown; color?: unknown },
+    ): Promise<ChatProjectCreateResult> {
+      const name = parseChatProjectName(input.name);
+      if (!name) return { ok: false, error: "invalid_name" };
+      const instructions = parseChatProjectOptionalText(input.instructions, CHAT_PROJECT_INSTRUCTIONS_MAX);
+      if ("invalid" in instructions) return { ok: false, error: "invalid_instructions" };
+      const color = parseChatProjectOptionalText(input.color, CHAT_PROJECT_COLOR_MAX);
+      if ("invalid" in color) return { ok: false, error: "invalid_color" };
+      const id = randomUUID();
+      return withTx(pool, async (client) => {
+        const countRow = (
+          await client.query<{ n: string }>(
+            "SELECT COUNT(*)::text AS n FROM chat_projects WHERE user_id = $1 AND deleted_at IS NULL",
+            [userId],
+          )
+        ).rows[0];
+        if (Number(countRow?.n ?? 0) >= CHAT_PROJECT_PER_USER_LIMIT) {
+          return { ok: false, error: "limit_exceeded" };
+        }
+        await client.query(
+          `INSERT INTO chat_projects
+             (id, user_id, name, instructions, color, sort_order, created_at, updated_at, deleted_at)
+           VALUES ($1, $2, $3, $4, $5, COALESCE((
+             SELECT MAX(sort_order) + 1 FROM chat_projects WHERE user_id = $2 AND deleted_at IS NULL
+           ), 0), ${CLOCK_MS_SQL}, ${CLOCK_MS_SQL}, NULL)`,
+          [
+            id,
+            userId,
+            name,
+            instructions.present ? instructions.value : null,
+            color.present ? color.value : null,
+          ],
+        );
+        const project = await readPgChatProject(client, userId, id);
+        if (!project) throw new Error("chat project insert vanished");
+        return { ok: true, project };
+      });
+    },
+
+    async updateChatProject(
+      userId: string,
+      id: string,
+      input: { name?: unknown; instructions?: unknown; color?: unknown; sortOrder?: unknown },
+    ): Promise<ChatProjectUpdateResult> {
+      const sets: string[] = [`updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})`];
+      const params: unknown[] = [];
+      let n = 1;
+      if (input.name !== undefined) {
+        const name = parseChatProjectName(input.name);
+        if (!name) return { ok: false, error: "invalid_name" };
+        sets.push(`name = $${n++}`);
+        params.push(name);
+      }
+      if (input.instructions !== undefined) {
+        const instructions = parseChatProjectOptionalText(input.instructions, CHAT_PROJECT_INSTRUCTIONS_MAX);
+        if ("invalid" in instructions || !instructions.present) return { ok: false, error: "invalid_instructions" };
+        sets.push(`instructions = $${n++}`);
+        params.push(instructions.value);
+      }
+      if (input.color !== undefined) {
+        const color = parseChatProjectOptionalText(input.color, CHAT_PROJECT_COLOR_MAX);
+        if ("invalid" in color || !color.present) return { ok: false, error: "invalid_color" };
+        sets.push(`color = $${n++}`);
+        params.push(color.value);
+      }
+      if (input.sortOrder !== undefined) {
+        const sortOrder = parseChatProjectSortOrder(input.sortOrder);
+        if (sortOrder === null) return { ok: false, error: "invalid_sort_order" };
+        sets.push(`sort_order = $${n++}`);
+        params.push(sortOrder);
+      }
+      if (sets.length === 1) {
+        const existing = await readPgChatProject(pool, userId, id);
+        return existing ? { ok: true, project: existing } : { ok: false, error: "not_found" };
+      }
+      return withTx(pool, async (client) => {
+        params.push(id, userId);
+        const res = await client.query(
+          `UPDATE chat_projects SET ${sets.join(", ")}
+            WHERE id = $${n++} AND user_id = $${n} AND deleted_at IS NULL`,
+          params,
+        );
+        if ((res.rowCount ?? 0) === 0) return { ok: false, error: "not_found" };
+        const project = await readPgChatProject(client, userId, id);
+        if (!project) return { ok: false, error: "not_found" };
+        return { ok: true, project };
+      });
+    },
+
+    async deleteChatProject(userId: string, id: string): Promise<ChatProjectDeleteResult> {
+      return withTx(pool, async (client) => {
+        const res = await client.query(
+          `UPDATE chat_projects
+              SET deleted_at = ${CLOCK_MS_SQL},
+                  updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
+            WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
+          [id, userId],
+        );
+        if ((res.rowCount ?? 0) === 0) return { ok: false, error: "not_found" };
+        await client.query(
+          `UPDATE client_sessions
+              SET project_id = NULL,
+                  updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
+            WHERE user_id = $1 AND project_id = $2 AND deleted_at IS NULL`,
+          [userId, id],
+        );
+        return { ok: true };
+      });
+    },
+
+    async listProjectAssets(userId: string, opts: ListProjectAssetsOpts): Promise<ProjectAsset[]> {
+      const limit = typeof opts.limit === "number" && Number.isFinite(opts.limit) && opts.limit > 0
+        ? Math.min(PROJECT_ASSET_LIST_LIMIT_MAX, Math.floor(opts.limit))
+        : PROJECT_ASSET_LIST_LIMIT_DEFAULT;
+      const rows = (
+        await pool.query<PgProjectAssetRow>(
+          `${PG_PROJECT_ASSET_SELECT}
+            WHERE user_id = $1 AND deleted_at IS NULL AND project_id IS NOT DISTINCT FROM $2
+            ORDER BY created_at DESC
+            LIMIT $3`,
+          [userId, opts.projectId, limit],
+        )
+      ).rows;
+      return rows.map(mapPgProjectAssetRow);
+    },
+
+    async createProjectAsset(
+      userId: string,
+      input: ProjectAssetCreateInput,
+    ): Promise<ProjectAssetCreateResult> {
+      const parsed = parseProjectAssetCreateInput(input);
+      if (!parsed.ok) return parsed;
+      const id = randomUUID();
+      return withTx(pool, async (client) => {
+        const resolved = await pgResolveAssetProjectId(client, userId, parsed.value);
+        if (!resolved.ok) return resolved;
+        const { projectId } = resolved;
+        const dup = await pgFindDuplicateAsset(
+          client,
+          userId,
+          projectId,
+          parsed.value.source,
+          parsed.value.digest,
+          parsed.value.containerPath,
+        );
+        if (dup) return { ok: true, asset: dup };
+        // 同一 (user_id, project_id) 桶的 count+INSERT 必须串行:默认 READ COMMITTED
+        // 下无行锁,并发事务都会读到 count<500 再各自写入 → 上限被突破。
+        // pg_advisory_xact_lock 随 COMMIT/ROLLBACK 自动释放;不用会话级
+        // pg_advisory_lock(连接归还池后锁会泄漏)。
+        // NULL project_id(未分组)用 coalesce($2,'') 编码:真实 chat_projects.id 是 UUID
+        // (解析还拒绝 <8 字符),空串不会与真实 id 撞,故不会误锁其它项目。
+        await client.query(
+          "SELECT pg_advisory_xact_lock(hashtext($1 || ':' || coalesce($2, '')))",
+          [`oc_proj_asset:${userId}`, projectId],
+        );
+        if ((await pgCountProjectAssets(client, userId, projectId)) >= PROJECT_ASSET_PER_PROJECT_LIMIT) {
+          return { ok: false, error: "limit_exceeded" };
+        }
+        // 只插索引行,绝不写/删磁盘文件(内容寻址,可能被其它消息/资产共用)。
+        await client.query(
+          `INSERT INTO project_assets (
+             id, user_id, project_id, source, session_id, name, url, container_path,
+             mime, size_bytes, digest, excerpt, pinned, created_at, updated_at, deleted_at
+           ) VALUES (
+             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+             ${CLOCK_MS_SQL}, ${CLOCK_MS_SQL}, NULL
+           )`,
+          [
+            id,
+            userId,
+            projectId,
+            parsed.value.source,
+            parsed.value.sessionId,
+            parsed.value.name,
+            parsed.value.url,
+            parsed.value.containerPath,
+            parsed.value.mime,
+            parsed.value.sizeBytes,
+            parsed.value.digest,
+            parsed.value.excerpt,
+            parsed.value.pinned,
+          ],
+        );
+        const asset = await readPgProjectAsset(client, userId, id);
+        if (!asset) throw new Error("project asset insert vanished");
+        return { ok: true, asset };
+      });
+    },
+
+    async updateProjectAsset(
+      userId: string,
+      assetId: string,
+      patch: ProjectAssetUpdateInput,
+    ): Promise<ProjectAssetUpdateResult> {
+      const sets: string[] = [`updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})`];
+      const params: unknown[] = [];
+      let n = 1;
+      let nextProjectId: { present: true; value: string | null } | undefined;
+      if (patch.name !== undefined) {
+        const name = parseProjectAssetName(patch.name);
+        if (!name) return { ok: false, error: "invalid_name" };
+        sets.push(`name = $${n++}`);
+        params.push(name);
+      }
+      if (patch.pinned !== undefined) {
+        if (typeof patch.pinned !== "boolean") return { ok: false, error: "invalid_name" };
+        sets.push(`pinned = $${n++}`);
+        params.push(patch.pinned);
+      }
+      if (patch.projectId !== undefined) {
+        const parsed = parseProjectAssetProjectId(patch.projectId);
+        if ("invalid" in parsed) return { ok: false, error: "project_not_found" };
+        nextProjectId = { present: true, value: parsed.present ? parsed.value : null };
+        sets.push(`project_id = $${n++}`);
+        params.push(nextProjectId.value);
+      }
+      if (sets.length === 1) {
+        const existing = await readPgProjectAsset(pool, userId, assetId);
+        return existing ? { ok: true, asset: existing } : { ok: false, error: "not_found" };
+      }
+      return withTx(pool, async (client) => {
+        const existing = await readPgProjectAsset(client, userId, assetId);
+        if (!existing) return { ok: false, error: "not_found" };
+        if (nextProjectId) {
+          if (nextProjectId.value !== null && !(await pgOwnedChatProjectExists(client, userId, nextProjectId.value))) {
+            return { ok: false, error: "project_not_found" };
+          }
+          if (nextProjectId.value !== existing.projectId) {
+            // 跨项目移动走同一份 500 上限;锁目标桶,键编码与 createProjectAsset 相同
+            // (含 NULL 未分组 → coalesce 空串,不与 UUID 撞)。xact lock,随事务释放。
+            await client.query(
+              "SELECT pg_advisory_xact_lock(hashtext($1 || ':' || coalesce($2, '')))",
+              [`oc_proj_asset:${userId}`, nextProjectId.value],
+            );
+            if ((await pgCountProjectAssets(client, userId, nextProjectId.value)) >= PROJECT_ASSET_PER_PROJECT_LIMIT) {
+              return { ok: false, error: "limit_exceeded" };
+            }
+          }
+        }
+        params.push(assetId, userId);
+        const res = await client.query(
+          `UPDATE project_assets SET ${sets.join(", ")}
+            WHERE id = $${n++} AND user_id = $${n} AND deleted_at IS NULL`,
+          params,
+        );
+        if ((res.rowCount ?? 0) === 0) return { ok: false, error: "not_found" };
+        const asset = await readPgProjectAsset(client, userId, assetId);
+        if (!asset) return { ok: false, error: "not_found" };
+        return { ok: true, asset };
+      });
+    },
+
+    async deleteProjectAsset(userId: string, assetId: string): Promise<ProjectAssetDeleteResult> {
+      // 软删只标 deleted_at,绝不 unlink 磁盘文件。
+      const res = await pool.query(
+        `UPDATE project_assets
+            SET deleted_at = ${CLOCK_MS_SQL},
+                updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
+          WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
+        [assetId, userId],
+      );
+      return (res.rowCount ?? 0) === 0 ? { ok: false, error: "not_found" } : { ok: true };
+    },
+
+    async listPinnedProjectAssetsForSession(sessionId: string): Promise<ProjectAsset[]> {
+      const sess = (
+        await pool.query<{ user_id: string; project_id: string | null }>(
+          "SELECT user_id, project_id FROM client_sessions WHERE id = $1 AND deleted_at IS NULL",
+          [sessionId],
+        )
+      ).rows[0];
+      if (!sess) return [];
+      const rows = (
+        await pool.query<PgProjectAssetRow>(
+          `${PG_PROJECT_ASSET_SELECT}
+            WHERE user_id = $1 AND deleted_at IS NULL AND pinned IS TRUE
+              AND project_id IS NOT DISTINCT FROM $2
+            ORDER BY created_at DESC
+            LIMIT $3`,
+          [sess.user_id, sess.project_id ?? null, PROJECT_ASSET_PINNED_INJECT_MAX],
+        )
+      ).rows;
+      return rows.map(mapPgProjectAssetRow);
     },
 
     async bumpClientSessionHistoryRevision(id: string, userId: string): Promise<boolean> {

@@ -13,7 +13,7 @@
  *   codex-native 内部再按 runnerKind 收口:仅接受缺省 / 'app-server';
  *   'exec' 与未知 runnerKind 直接 fail-closed('codex exec' legacy 路径不复活)。
  */
-import { CODEX_ENGINE_MODEL_IDS, CURSOR_ENGINE_MODEL_IDS, GROK_ENGINE_MODEL_IDS } from '@openclaude/protocol'
+import { CODEX_ENGINE_MODEL_IDS, CURSOR_ENGINE_MODEL_IDS, GROK_ENGINE_MODEL_IDS, ZCODE_ENGINE_MODEL_IDS } from '@openclaude/protocol'
 import type { AgentDef } from '@openclaude/storage'
 import type { SubprocessRunnerOpts } from '../subprocessRunner.js'
 import type { EngineAdapter } from './engineAdapter.js'
@@ -53,6 +53,7 @@ const MODEL_ENGINE_MAP: Record<string, string> = Object.fromEntries(
     ...CODEX_ENGINE_MODEL_IDS.map((id) => [id, 'codex'] as const),
     ...GROK_ENGINE_MODEL_IDS.map((id) => [id, 'grok'] as const),
     ...CURSOR_ENGINE_MODEL_IDS.map((id) => [id, 'cursor'] as const),
+    ...ZCODE_ENGINE_MODEL_IDS.map((id) => [id, 'zcode'] as const),
   ],
 )
 
@@ -68,7 +69,7 @@ const MODEL_ENGINE_MAP: Record<string, string> = Object.fromEntries(
  * 不需要认识整个 descriptor。有它 → 本地 baked MODEL_ENGINE_MAP 一律不看。
  */
 export interface EngineAuthorityOverride {
-  readonly engine: 'ccb' | 'codex' | 'grok' | 'cursor'
+  readonly engine: 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode'
   readonly canonicalModel: string
   /** 诊断/审计用(不参与判定)。 */
   readonly source?: 'bridge_signed' | 'local_catalog'

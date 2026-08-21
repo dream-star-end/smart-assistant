@@ -192,6 +192,25 @@ describe("oc-* CLI 语义卡 (Bash 特判)", () => {
     expect(toolSummary("Bash", { command: "oc-vision understand /home/agent/img.png --prompt 'x'" })).toBe("");
     expect(toolSummary("Bash", { command: "mmx image generate 'a cat' -o /out.png" })).toBe("");
   });
+  test("oc-task Bash 卡不落成通用终端", () => {
+    expect(detectOcCli("oc-task ticket get OCV5-1")).toBe("oc-task");
+    expect(resolveToolMeta("Bash", { command: "oc-task ticket get OCV5-1" }).label).toBe("任务单据");
+    expect(resolveToolMeta("mcp__openclaude-memory__task_create").label).toBe("创建任务单");
+    expect(resolveToolMeta("mcp__openclaude-memory__task_get").label).toBe("查看任务单");
+    expect(toolSummary("mcp__openclaude-memory__task_create", { title: "登录 500" })).toBe("登录 500");
+  });
+
+  test("oc-memory delegate 标成委派，不叫记忆", () => {
+    expect(resolveToolMeta("Bash", { command: "oc-memory delegate --goal '修卡片'" }).label).toBe(
+      "委派子任务",
+    );
+    expect(toolSummary("Bash", { command: "oc-memory delegate --goal '修卡片'" })).toBe("修卡片");
+    expect(resolveToolMeta("Bash", { command: "oc-memory core-search 记忆" }).label).toBe("记忆检索");
+    expect(resolveToolMeta("Bash", { command: "oc-memory request-review --draft '草稿'" }).label).toBe(
+      "质量审查",
+    );
+  });
+
   test("oc-browser / oc-market 根据动作提供友好标签和摘要", () => {
     expect(resolveToolMeta("Bash", { command: "oc-browser open https://example.com/a" }).label).toBe(
       "打开网页",
@@ -276,6 +295,22 @@ describe("记忆更新重标(Write/Edit 命中记忆文件)", () => {
     // 非记忆路径的 heredoc 写文件不受影响。
     const other = "cat > /home/agent/a.ts <<'EOF'\nx\nEOF";
     expect(resolveToolMeta("Bash", { command: other }).label).toBe("写入文件");
+  });
+});
+
+describe("cursor 引擎归一化工具的产品卡支持", () => {
+  test("AskUserQuestion 有专属标签与摘要(cursor askQuestionToolCall 归一化名)", () => {
+    const meta = resolveToolMeta("AskUserQuestion");
+    expect(meta.label).toBe("向用户提问");
+    expect(
+      toolSummary("AskUserQuestion", {
+        questions: [{ question: "下线前需要确认替代方案", options: [{ label: "用 flash 替代" }] }],
+      }),
+    ).toContain("下线前需要确认替代方案");
+  });
+  test("AskUserQuestion 空问题时只报数量,不抛错", () => {
+    expect(toolSummary("AskUserQuestion", { questions: [] })).toBe("0 个问题");
+    expect(toolSummary("AskUserQuestion", null)).toBe("");
   });
 });
 
@@ -409,5 +444,40 @@ describe("subAgentActivity meta + 存量孤儿归一化", () => {
       _completed: true,
     });
     expect(d.name).toBe("Bash");
+  });
+});
+
+describe("子任务摘要不回退到 prompt", () => {
+  test("Task 只用安全 description，不用 prompt", () => {
+    expect(
+      toolSummary("Task", {
+        description: "实现会话显示层根治修复",
+        prompt: "You are running inside OpenClaude\n/opt/secret",
+      }),
+    ).toBe("实现会话显示层根治修复");
+    expect(
+      toolSummary("Agent", {
+        prompt: "You are a coding assistant at /home/agent",
+        subagentType: { unspecified: {} },
+      }),
+    ).toBe("");
+  });
+
+  test("Cursor 未登记工具名走活动行中文标签", () => {
+    expect(resolveToolMeta("StrReplace").label).toBe("写入文件");
+    expect(resolveToolMeta("TaskUpdate").label).toBe("更新任务");
+    expect(resolveToolMeta("AwaitShell").label).toBe("执行 Shell");
+    expect(resolveToolMeta("Frobnicate").label).toBe("Frobnicate");
+  });
+
+  test("delegate_task 不再把内部 prompt 当摘要", () => {
+    expect(
+      toolSummary("delegate_task", {
+        agentId: "coder",
+        goal: "You are running inside OpenClaude\nuid=3",
+        prompt: "FULL_INTERNAL_PROMPT",
+      }),
+    ).toBe("→ coder");
+    expect(toolSummary("delegate_task", { agentId: "coder", goal: "修显示层" })).toBe("→ coder 修显示层");
   });
 });

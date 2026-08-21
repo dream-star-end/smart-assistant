@@ -4,8 +4,8 @@ import { afterEach, beforeAll, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../lib/chat/model";
 import { applyServerIncremental } from "../lib/persist";
 import { messageSignature } from "../lib/chat/render";
-import { MessageList, MessageRenderer } from "./MessageRenderer";
-import type { PermissionRespond } from "./chat/PermissionCard";
+import { MessageList, MessageRenderer, TIMELINE_INITIAL_TAIL_ITEMS } from "./MessageRenderer";
+import { resetPermissionAutoOpenMemory, type PermissionRespond } from "./chat/PermissionCard";
 import { ResponseRatingProvider } from "./chat/ResponseRating";
 import type { CardCallbacks } from "./chat/cards";
 import {
@@ -14,7 +14,10 @@ import {
 } from "./tool/__fixtures__/sessionToolTexts";
 import { ChatInteractionContext, ToolCardActionsContext } from "./tool/context";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  resetPermissionAutoOpenMemory();
+});
 
 beforeAll(async () => {
   // MarkdownImpl 是 React.lazy 的重 chunk。全量并行时首次 transform/import 偶尔会耗尽
@@ -527,6 +530,7 @@ describe("permission 审批", () => {
     const onRespond = vi.fn();
     renderMsg(mk("permission", { toolName: "Bash", requestId: "r1", _resolved: false, inputPreview: "ls -la", ts: Date.now() }), {
       onRespond,
+      sending: true,
     });
     // 自动弹出的 modal（Radix portal）含「允许」。
     fireEvent.click(screen.getByRole("button", { name: "允许" }));
@@ -541,6 +545,7 @@ describe("permission 审批", () => {
         requestId: "r-readonly",
         _resolved: false,
         inputPreview: "rm -rf /tmp/example",
+        ts: Date.now(),
       }),
       { onRespond, readOnly: true },
     );
@@ -564,7 +569,7 @@ describe("permission 审批", () => {
           questions: [{ question: "选择颜色？", options: [{ label: "红" }, { label: "蓝" }] }],
         },
       }),
-      { onRespond },
+      { onRespond, sending: true },
     );
     // 自动弹出答题框（modal portal）。
     expect(screen.getByText("选择颜色？")).toBeInTheDocument();
@@ -575,6 +580,28 @@ describe("permission 审批", () => {
     expect(arg.requestId).toBe("r2");
     expect(arg.behavior).toBe("allow");
     expect(arg.updatedInput.answers).toEqual({ "选择颜色？": "红" });
+  });
+
+  test("非 in-flight 历史权限行不自动弹，卡片仍在且可手动打开", () => {
+    const onRespond = vi.fn();
+    renderMsg(
+      mk("permission", {
+        toolName: "AskUserQuestion",
+        ts: Date.now(),
+        requestId: "r-history",
+        _resolved: false,
+        inputJson: {
+          questions: [{ question: "选择颜色？", options: [{ label: "红" }, { label: "蓝" }] }],
+        },
+      }),
+      { onRespond, sending: false, inActiveTurn: true },
+    );
+    expect(screen.getByTestId("permission-card")).toBeInTheDocument();
+    expect(screen.getByText("等待回答…")).toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "回答" }));
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    expect(onRespond).not.toHaveBeenCalled();
   });
 
   test("AskUserQuestion 已提交 → 展示问答摘要", () => {
@@ -690,6 +717,84 @@ describe("MessageList 失败轮单一错误出口", () => {
     expect(retries).toHaveLength(1);
     fireEvent.click(retries[0]);
     expect(onRetrySend).toHaveBeenCalledWith(recoveryChild);
+  });
+
+  test("手动恢复子行不渲染，只靠血缘字段也能隐藏", () => {
+    const recoveryChild = mk("user", {
+      id: "u-manual-recovery-child",
+      text: "MANUAL_RECOVERY_CONTROL_ROW_SHOULD_HIDE",
+      _recoveryOfClientMessageId: failedUser.id,
+      _recoveryMode: "checkpoint",
+      _automaticRecovery: false,
+    });
+    render(
+      <MessageList
+        messages={[failedUser, recoveryChild]}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+      />,
+    );
+    expect(screen.getByText("你是什么模型")).toBeInTheDocument();
+    expect(screen.queryByText("MANUAL_RECOVERY_CONTROL_ROW_SHOULD_HIDE")).toBeNull();
+  });
+
+  test("刷新后丢失 _isAutoRetry 时，仅 _recoveryOfClientMessageId 的恢复子行仍不渲染", () => {
+    render(
+      <MessageList
+        messages={[
+          failedUser,
+          mk("user", {
+            id: "u-lineage-only-recovery",
+            text: "LINEAGE_ONLY_RECOVERY_ROW_SHOULD_HIDE",
+            _recoveryOfClientMessageId: failedUser.id,
+          }),
+        ]}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+      />,
+    );
+    expect(screen.getByText("你是什么模型")).toBeInTheDocument();
+    expect(screen.queryByText("LINEAGE_ONLY_RECOVERY_ROW_SHOULD_HIDE")).toBeNull();
+  });
+
+  test("被手动恢复的源错误卡不再显示，恢复轮自身最终错误仍显示", () => {
+    const recoveryChild = mk("user", {
+      id: "u-manual-recovery-failed",
+      text: "MANUAL_RECOVERY_CONTROL_ROW_SHOULD_HIDE",
+      _recoveryOfClientMessageId: failedUser.id,
+      _recoveryMode: "replay",
+      _automaticRecovery: false,
+    });
+    render(
+      <MessageList
+        messages={[
+          failedUser,
+          mk("assistant", {
+            id: "a-source-error-after-manual",
+            text: "SOURCE_ERROR_SHOULD_HIDE_AFTER_MANUAL_RECOVERY",
+            _clientMessageId: failedUser.id,
+            _errorCode: "model_capacity",
+          }),
+          recoveryChild,
+          mk("assistant", {
+            id: "a-manual-recovery-final-error",
+            text: "RECOVERY_ROUND_FINAL_ERROR_SHOULD_SHOW",
+            _clientMessageId: recoveryChild.id,
+            _errorCode: "codex_route_unavailable",
+          }),
+        ]}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+      />,
+    );
+    expect(screen.getByText("你是什么模型")).toBeInTheDocument();
+    expect(screen.queryByText("MANUAL_RECOVERY_CONTROL_ROW_SHOULD_HIDE")).toBeNull();
+    expect(screen.queryByText("SOURCE_ERROR_SHOULD_HIDE_AFTER_MANUAL_RECOVERY")).toBeNull();
+    expect(screen.getByText("RECOVERY_ROUND_FINAL_ERROR_SHOULD_SHOW")).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("模型服务暂时不可用");
   });
 });
 
@@ -832,6 +937,28 @@ describe("MessageList 每张调用卡 token 实时展示", () => {
     expect(screen.getByText("111")).toBeInTheDocument();
     expect(screen.getByText("333")).toBeInTheDocument();
   });
+
+  test("旧缓存缺 targetIds/callId 的调用用量不会炸掉整条会话", () => {
+    const legacy = mk("tool", {
+      id: "legacy-call-usage",
+      toolName: "Bash",
+      inputJson: { command: "pwd" },
+      _completed: true,
+      _callUsage: {
+        usage: { totalTokens: 42 },
+      } as unknown as ChatMessage["_callUsage"],
+    });
+    render(
+      <MessageList
+        messages={[legacy, mk("assistant", { id: "legacy-call-answer", text: "正常回答" })]}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+      />,
+    );
+    expect(screen.getByText("正常回答")).toBeInTheDocument();
+    expect(screen.getByText("42")).toBeInTheDocument();
+  });
 });
 
 describe("MessageList coalesceTeam 聚合(零回归关键路径)", () => {
@@ -847,6 +974,17 @@ describe("MessageList coalesceTeam 聚合(零回归关键路径)", () => {
   test("连续 ≥2 条 agent-group → 聚成团队面板", () => {
     renderList([g("g1", "任务A"), g("g2", "任务B")]);
     expect(screen.getByText("团队协作 · 2 个智能体")).toBeInTheDocument();
+  });
+
+  test("旧缓存把 usage.delegates 存成对象时跳过成本聚合而不炸整条会话", () => {
+    renderList([
+      mk("assistant", {
+        id: "legacy-delegates",
+        text: "旧缓存回答仍应显示",
+        usage: { delegates: { reviewer: "3", length: 1 } } as unknown as ChatMessage["usage"],
+      }),
+    ]);
+    expect(screen.getByText("旧缓存回答仍应显示")).toBeInTheDocument();
   });
 
   test("单条 agent-group → 退化回 AgentGroupCard,不出团队面板", () => {
@@ -1206,7 +1344,7 @@ describe("MessageList 归档显式分页(§4/§5)", () => {
     return Array.from({ length: n }, (_, i) => mk("user", { id: `u${i}`, text: `m${i}` }));
   }
 
-  test("已加载的 130 条热尾全部属于数据模型，DOM 有界由生产虚拟列表负责", () => {
+  test("已加载的 130 条热尾全部属于数据模型，非滚动面渲染完整列表", () => {
     renderList(users(130), { archivedCount: 500, archivedThroughSeq: 5 });
     expect(screen.getByText("m0")).toBeInTheDocument();
     expect(screen.getByText("m129")).toBeInTheDocument();
@@ -1336,6 +1474,24 @@ describe("MessageList 归档显式分页(§4/§5)", () => {
     expect(screen.queryByText("AUTO_RETRY_CONTROL_ROW_SHOULD_HIDE")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: /已思考/ }));
     expect(screen.getByText("恢复后的真实过程")).toBeInTheDocument();
+  });
+
+  test("缺 id 的坏消息只变成占位，前后正常消息仍渲染", () => {
+    render(
+      <MessageList
+        messages={[
+          mk("user", { id: "u-ok", text: "正常用户问题" }),
+          { role: "assistant", text: "缺 id 的坏行", ts: 2 } as unknown as ChatMessage,
+          mk("assistant", { id: "a-ok", text: "正常助手回复" }),
+        ]}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+      />,
+    );
+    expect(screen.getByText("正常用户问题")).toBeInTheDocument();
+    expect(screen.getByText("正常助手回复")).toBeInTheDocument();
+    expect(screen.getByText("此条消息缺少 id，已跳过渲染")).toBeInTheDocument();
   });
 
   test("生产滚动容器尚未绑定时不先挂载整个超长会话", () => {
@@ -1551,7 +1707,7 @@ describe("MessageList 归档显式分页(§4/§5)", () => {
     await waitFor(() => expect(onLoadOlder).toHaveBeenCalledTimes(1));
   });
 
-  test("生产虚拟滚动到顶部也不请求归档，只有点击按钮才请求", async () => {
+  test("生产滚动到顶部也不请求归档，只有点击按钮才请求", async () => {
     const onLoadOlder = vi.fn();
     const scroller = document.createElement("div");
     scroller.className = "chat-scroll-area";
@@ -1736,7 +1892,7 @@ describe("连续 thinking 行渲染层合并(codex 空正文标题卡)", () => {
   });
 });
 
-describe("长时间线虚拟分页与活跃状态稳定性", () => {
+describe("长时间线普通 DOM 分页与活跃状态稳定性", () => {
   const processRow = (
     id: string,
     pageKey: string,
@@ -1753,7 +1909,7 @@ describe("长时间线虚拟分页与活跃状态稳定性", () => {
     _turnTapeProcessPageKey: pageKey,
   } as ChatMessage);
 
-  test("每条真实记录各占一个虚拟项，不按物理页合并成巨型滚动项", () => {
+  test("每条真实记录各占一个列表项，不按物理页合并成巨型滚动项", () => {
     const pageA = Array.from({ length: 70 }, (_, index) => processRow(`a-${index}`, "page-a", index));
     const pageB = Array.from({ length: 35 }, (_, index) => processRow(`b-${index}`, "page-b", 100 + index));
     const { container } = render(
@@ -1819,9 +1975,54 @@ describe("长时间线虚拟分页与活跃状态稳定性", () => {
     expect(screen.getByLabelText("生成中")).toBe(status);
   });
 
-  test("生产 Virtuoso Footer 组件身份稳定，stream delta 不重挂活动 DOM", async () => {
+  test("移动端冷会话首条记录未到时仍显示加载/活动状态，不留整屏空白", () => {
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    render(
+      <MessageList
+        messages={[]}
+        sending
+        historyLoading
+        turnActivity={{ startedAt: Date.now(), agentName: "助手" }}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+      />,
+      { container: scroller },
+    );
+    expect(screen.getByLabelText("生成中")).toBeInTheDocument();
+    expect(screen.getByLabelText("正在加载会话内容")).toBeInTheDocument();
+  });
+
+  test("新会话首条 optimistic 行走普通 DOM 短列表", () => {
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    render(
+      <MessageList
+        messages={[mk("user", { id: "new-session-user", text: "第一条消息", status: "sending" })]}
+        sending
+        turnActivity={{ startedAt: Date.now(), agentName: "助手" }}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+      />,
+      { container: scroller },
+    );
+
+    expect(screen.getByTestId("timeline-short-list")).toBeInTheDocument();
+    expect(screen.getByText("第一条消息")).toBeInTheDocument();
+    expect(screen.getByLabelText("生成中")).toBeInTheDocument();
+    expect(screen.getByTestId("turn-activity-footer").parentElement).toHaveClass("w-full");
+    expect(screen.queryByTestId("virtuoso-item-list")).toBeNull();
+    scroller.remove();
+  });
+
+  test("生产 Footer 组件身份稳定，stream delta 不重挂活动 DOM", async () => {
     const scroller = document.createElement("div");
     document.body.append(scroller);
+    const history = Array.from({ length: 90 }, (_, index) =>
+      mk("user", { id: "virtual-history-" + index, text: "历史记录 " + index, status: "sent" }),
+    );
     const user = mk("user", { id: "virtual-user", text: "问题", status: "sent" });
     const tool = mk("tool", {
       id: "virtual-tool",
@@ -1831,7 +2032,7 @@ describe("长时间线虚拟分页与活跃状态稳定性", () => {
     });
     const view = render(
       <MessageList
-        messages={[user, tool]}
+        messages={[...history, user, tool]}
         sending
         turnActivity={{ startedAt: Date.now(), agentName: "助手" }}
         cb={{}}
@@ -1840,11 +2041,13 @@ describe("长时间线虚拟分页与活跃状态稳定性", () => {
       />,
       { container: scroller },
     );
+    expect(screen.getByTestId("timeline-short-list")).toBeInTheDocument();
+    expect(screen.queryByTestId("virtuoso-item-list")).toBeNull();
     const status = await screen.findByLabelText("生成中");
 
     view.rerender(
       <MessageList
-        messages={[user, tool, mk("thinking", { id: "virtual-thinking", text: "真实思考" })]}
+        messages={[...history, user, tool, mk("thinking", { id: "virtual-thinking", text: "真实思考" })]}
         sending
         turnActivity={{ startedAt: Date.now(), agentName: "助手" }}
         cb={{}}
@@ -1853,6 +2056,389 @@ describe("长时间线虚拟分页与活跃状态稳定性", () => {
       />,
     );
     expect(await screen.findByLabelText("生成中")).toBe(status);
+    scroller.remove();
+  });
+
+  test("滚动容器首屏只挂最新一段，不把整段长会话一次性提交进 DOM", () => {
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    const rows = Array.from({ length: 220 }, (_, index) =>
+      mk("user", { id: "window-row-" + index, text: "历史记录 " + index, status: "sent" }),
+    );
+    render(
+      <MessageList
+        messages={rows}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+      />,
+      { container: scroller },
+    );
+    expect(scroller.querySelectorAll("[data-chat-virtual-key]")).toHaveLength(TIMELINE_INITIAL_TAIL_ITEMS);
+    expect(screen.getByText("历史记录 219")).toBeInTheDocument();
+    expect(screen.queryByText("历史记录 0")).toBeNull();
+    expect(screen.getByRole("button", { name: /查看更早历史记录（还有 140 条）/ })).toBeInTheDocument();
+    scroller.remove();
+  });
+
+  test("流式追加不卸掉已挂载窗口顶部的行", () => {
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    const rows = Array.from({ length: 220 }, (_, index) =>
+      mk("user", { id: "append-row-" + index, text: "追加记录 " + index, status: "sent" }),
+    );
+    const view = render(
+      <MessageList
+        messages={rows}
+        sending
+        turnActivity={{ startedAt: Date.now(), agentName: "助手" }}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+      />,
+      { container: scroller },
+    );
+    expect(screen.getByText("追加记录 140")).toBeInTheDocument();
+    expect(screen.queryByText("追加记录 139")).toBeNull();
+
+    view.rerender(
+      <MessageList
+        messages={[
+          ...rows,
+          mk("user", { id: "append-row-220", text: "追加记录 220", status: "sending" }),
+        ]}
+        sending
+        turnActivity={{ startedAt: Date.now(), agentName: "助手" }}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+      />,
+    );
+    expect(screen.getByText("追加记录 140")).toBeInTheDocument();
+    expect(screen.getByText("追加记录 220")).toBeInTheDocument();
+    expect(screen.queryByText("追加记录 139")).toBeNull();
+    scroller.remove();
+  });
+
+  test("上滚或点击按钮揭示已驻留更早行，且不发历史网络请求", async () => {
+    const onLoadOlder = vi.fn();
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    const rows = Array.from({ length: 220 }, (_, index) =>
+      mk("user", { id: "expand-row-" + index, text: "驻留记录 " + index, status: "sent" }),
+    );
+    render(
+      <MessageList
+        messages={rows}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+        archive={{
+          hasMore: true,
+          loading: false,
+          error: false,
+          onLoadOlder,
+        }}
+      />,
+      { container: scroller },
+    );
+    expect(scroller.querySelectorAll("[data-chat-virtual-key]")).toHaveLength(TIMELINE_INITIAL_TAIL_ITEMS);
+    scroller.scrollTop = 0;
+    fireEvent.scroll(scroller);
+    await act(async () => {});
+    expect(onLoadOlder).not.toHaveBeenCalled();
+    const afterScroll = scroller.querySelectorAll("[data-chat-virtual-key]").length;
+    expect(afterScroll).toBeGreaterThan(TIMELINE_INITIAL_TAIL_ITEMS);
+    expect(afterScroll).toBeLessThan(rows.length);
+
+    fireEvent.click(screen.getByRole("button", { name: /查看更早历史记录/ }));
+    await act(async () => {});
+    expect(onLoadOlder).not.toHaveBeenCalled();
+    expect(scroller.querySelectorAll("[data-chat-virtual-key]").length).toBeGreaterThan(afterScroll);
+    scroller.remove();
+  });
+
+  test("首开内容高度晚长时跟随底部", () => {
+    const observers: ResizeObserverCallback[] = [];
+    vi.stubGlobal("ResizeObserver", class {
+      constructor(cb: ResizeObserverCallback) {
+        observers.push(cb);
+      }
+      observe() {}
+      disconnect() {}
+      unobserve() {}
+    });
+    const followBottomRef = { current: true };
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    Object.defineProperty(scroller, "clientHeight", { configurable: true, value: 200 });
+    let height = 500;
+    Object.defineProperty(scroller, "scrollHeight", { configurable: true, get: () => height });
+    scroller.scrollTop = 300;
+    const rows = Array.from({ length: 90 }, (_, index) =>
+      mk("user", { id: "late-grow-" + index, text: "晚长记录 " + index, status: "sent" }),
+    );
+    render(
+      <MessageList
+        messages={rows}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+        followBottomRef={followBottomRef}
+      />,
+      { container: scroller },
+    );
+    expect(observers.length).toBeGreaterThan(0);
+    height = 900;
+    act(() => {
+      for (const cb of observers) cb([] as unknown as ResizeObserverEntry[], {} as ResizeObserver);
+    });
+    expect(followBottomRef.current).toBe(true);
+    expect(scroller.scrollTop).toBe(900);
+    vi.unstubAllGlobals();
+    scroller.remove();
+  });
+
+  test("上滚后内容再长不拉回底部", () => {
+    const observers: ResizeObserverCallback[] = [];
+    vi.stubGlobal("ResizeObserver", class {
+      constructor(cb: ResizeObserverCallback) {
+        observers.push(cb);
+      }
+      observe() {}
+      disconnect() {}
+      unobserve() {}
+    });
+    const followBottomRef = { current: true };
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    Object.defineProperty(scroller, "clientHeight", { configurable: true, value: 200 });
+    let height = 800;
+    Object.defineProperty(scroller, "scrollHeight", { configurable: true, get: () => height });
+    scroller.scrollTop = 600;
+    const rows = Array.from({ length: 90 }, (_, index) =>
+      mk("user", { id: "stay-up-" + index, text: "上滚记录 " + index, status: "sent" }),
+    );
+    render(
+      <MessageList
+        messages={rows}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+        followBottomRef={followBottomRef}
+      />,
+      { container: scroller },
+    );
+    followBottomRef.current = false;
+    scroller.scrollTop = 40;
+    height = 1400;
+    act(() => {
+      for (const cb of observers) cb([] as unknown as ResizeObserverEntry[], {} as ResizeObserver);
+    });
+    expect(scroller.scrollTop).toBe(40);
+    vi.unstubAllGlobals();
+    scroller.remove();
+  });
+
+  test("向上扩窗口时 ResizeObserver 不把视口拽到底部", async () => {
+    const observers: ResizeObserverCallback[] = [];
+    vi.stubGlobal("ResizeObserver", class {
+      constructor(cb: ResizeObserverCallback) {
+        observers.push(cb);
+      }
+      observe() {}
+      disconnect() {}
+      unobserve() {}
+    });
+    const followBottomRef = { current: true };
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    Object.defineProperty(scroller, "clientHeight", { configurable: true, value: 200 });
+    let height = 1000;
+    Object.defineProperty(scroller, "scrollHeight", { configurable: true, get: () => height });
+    scroller.scrollTop = 0;
+    const rows = Array.from({ length: 220 }, (_, index) =>
+      mk("user", { id: "preserve-row-" + index, text: "驻留记录 " + index, status: "sent" }),
+    );
+    render(
+      <MessageList
+        messages={rows}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+        followBottomRef={followBottomRef}
+      />,
+      { container: scroller },
+    );
+    fireEvent.click(screen.getByRole("button", { name: /查看更早历史记录/ }));
+    await act(async () => {});
+    expect(followBottomRef.current).toBe(false);
+    const topBeforeGrow = scroller.scrollTop;
+    height = 1800;
+    act(() => {
+      for (const cb of observers) cb([] as unknown as ResizeObserverEntry[], {} as ResizeObserver);
+    });
+    expect(scroller.scrollTop).toBe(topBeforeGrow);
+    expect(scroller.scrollTop).not.toBe(height);
+    vi.unstubAllGlobals();
+    scroller.remove();
+  });
+
+  test("视口足够高且窗口≥160 时只绘制附近行，数据窗口计数仍完整", async () => {
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    Object.defineProperty(scroller, "clientHeight", { configurable: true, value: 600 });
+    scroller.scrollTop = 0;
+    const rows = Array.from({ length: 220 }, (_, index) =>
+      mk("user", { id: "paint-row-" + index, text: "绘制记录 " + index, status: "sent" }),
+    );
+    render(
+      <MessageList
+        messages={rows}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+      />,
+      { container: scroller },
+    );
+    fireEvent.click(screen.getByRole("button", { name: /查看更早历史记录/ }));
+    await act(async () => {});
+    fireEvent.click(screen.getByRole("button", { name: /查看更早历史记录/ }));
+    await act(async () => {});
+    const list = screen.getByTestId("timeline-short-list");
+    expect(list.getAttribute("data-timeline-window-count")).toBe("220");
+    const painted = Number(list.getAttribute("data-timeline-paint-count"));
+    expect(painted).toBeGreaterThanOrEqual(36);
+    expect(painted).toBeLessThan(220);
+    expect(scroller.querySelector("[data-testid=timeline-paint-spacer-bottom]")).toBeTruthy();
+    scroller.remove();
+  });
+
+  test("live→tape generation 变化不重挂活动 Footer，滚动身份保持", async () => {
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    const user = mk("user", { id: "generation-user", text: "问题", status: "sent" });
+    const activeRows = [
+      user,
+      ...Array.from({ length: 220 }, (_, index) =>
+        mk("thinking", { id: "live-row-" + index, text: "实时记录 " + index }),
+      ),
+    ];
+    const view = render(
+      <MessageList
+        messages={activeRows}
+        sending
+        turnActivity={{ startedAt: Date.now(), agentName: "助手" }}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+        historyGeneration="generation-4"
+      />,
+      { container: scroller },
+    );
+    const before = await screen.findByLabelText("生成中");
+
+    view.rerender(
+      <MessageList
+        messages={activeRows}
+        sending
+        turnActivity={{ startedAt: Date.now(), agentName: "助手" }}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+        historyGeneration="generation-5"
+      />,
+    );
+
+    expect(await screen.findByLabelText("生成中")).toBe(before);
+    expect(screen.getByTestId("timeline-short-list")).toBeInTheDocument();
+    expect(screen.queryByTestId("virtuoso-item-list")).toBeNull();
+    scroller.remove();
+  });
+
+  test("同一 generation 的新 turn 不重挂活动 Footer，乐观用户行立即可见", async () => {
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    const activeRows = Array.from({ length: 220 }, (_, index) =>
+      mk("user", { id: "active-row-" + index, text: "历史记录 " + index, status: "sent" }),
+    );
+    const view = render(
+      <MessageList
+        messages={activeRows}
+        sending
+        turnActivity={{ startedAt: Date.now(), agentName: "助手" }}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+        historyGeneration="generation-7"
+      />,
+      { container: scroller },
+    );
+    const before = await screen.findByLabelText("生成中");
+
+    view.rerender(
+      <MessageList
+        messages={[
+          ...activeRows,
+          mk("user", { id: "new-active-turn", text: "新问题", status: "sending" }),
+        ]}
+        sending
+        turnActivity={{ startedAt: Date.now(), agentName: "助手" }}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+        historyGeneration="generation-7"
+      />,
+    );
+
+    expect(await screen.findByLabelText("生成中")).toBe(before);
+    expect(screen.getByText("新问题")).toBeInTheDocument();
+    scroller.remove();
+  });
+
+  test("后台恢复不重挂时间线，hidden→visible 后活动 Footer 身份保持", async () => {
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    const rows = Array.from({ length: 220 }, (_, index) =>
+      mk("user", { id: "foreground-row-" + index, text: "历史记录 " + index, status: "sent" }),
+    );
+    const visibility = { value: "visible" as DocumentVisibilityState };
+    const visibilitySpy = vi.spyOn(document, "visibilityState", "get")
+      .mockImplementation(() => visibility.value);
+    const view = render(
+      <MessageList
+        messages={rows}
+        sending
+        turnActivity={{ startedAt: Date.now(), agentName: "助手" }}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+        historyGeneration="generation-7"
+      />,
+      { container: scroller },
+    );
+    const before = await screen.findByLabelText("生成中");
+
+    fireEvent(window, new Event("focus"));
+    fireEvent(document, new Event("visibilitychange"));
+    expect(await screen.findByLabelText("生成中")).toBe(before);
+
+    visibility.value = "hidden";
+    fireEvent(document, new Event("visibilitychange"));
+    visibility.value = "visible";
+    fireEvent(document, new Event("visibilitychange"));
+
+    expect(await screen.findByLabelText("生成中")).toBe(before);
+    expect(screen.queryByTestId("timeline-fatal-error")).toBeNull();
+    visibilitySpy.mockRestore();
+    view.unmount();
+    scroller.remove();
   });
 });
 

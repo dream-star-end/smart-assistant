@@ -1,4 +1,4 @@
-// Aurora (v5) Service Worker —— 手写、零依赖。
+// 从简 (v5) Service Worker —— 手写、零依赖。
 //
 // ─────────────────────────────────────────────────────────────────────────────
 // 策略（红线：v5 与 v3 同源共存于 Caddy 的 cookie/secret 闸之后）：
@@ -20,7 +20,7 @@
 // 触发 activate 清理旧 cache(便于强刷)。
 // ─────────────────────────────────────────────────────────────────────────────
 
-const SW_VERSION = 'aurora-sw-v1';
+const SW_VERSION = 'congjian-sw-v2';
 const CACHE = SW_VERSION;
 // 离线导航回落用的 app-shell 键。SPA 下所有导航路由都返回同一份 index，故统一存此键。
 const OFFLINE_SHELL = '/index.html';
