@@ -1248,4 +1248,3 @@ describe("HighlightedText", () => {
     expect(container.querySelector("mark")?.textContent).toBe("b");
   });
 });
-

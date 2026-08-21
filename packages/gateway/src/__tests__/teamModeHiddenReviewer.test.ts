@@ -33,7 +33,7 @@ describe('team mode preamble — 协作语义 + 队长自主送审纪律', () =>
     assert.match(src, /可委派的成员（已安装 agent）/)
     assert.match(src, /listCollaboratorAgents\(teamCfg, \{ selfId: 'main', includeMain: false \}\)/)
     assert.match(src, /领域匹配优先于泛泛并行/)
-    assert.match(src, /只走 `delegate_task`/)
+    assert.match(src, /委派只走平台通道/)
     assert.match(src, /collabAgentPolicy: 'team-mode-prefer-delegate'/)
   })
 
@@ -41,7 +41,7 @@ describe('team mode preamble — 协作语义 + 队长自主送审纪律', () =>
     const src = readFileSync(SERVER_TS, 'utf8')
     assert.match(src, /request_review\(draft\)/)
     assert.match(src, /除非任务明显简单/)
-    assert.match(src, /草稿只放在工具参数里/)
+    assert.match(src, /草稿只放在工具\/命令参数里/)
     assert.match(src, /VERDICT: PASS/)
   })
 

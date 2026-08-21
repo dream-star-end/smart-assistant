@@ -263,3 +263,12 @@ describe('buildCcbCliArgs', () => {
     }
   })
 })
+
+  it('non-hermetic settingsFile emits --settings for PreToolUse hooks', () => {
+    const args = buildCcbCliArgs({
+      ...BASE,
+      settingsFile: '/tmp/efficiency-hooks.json',
+    })
+    assert.ok(hasFlagWithValue(args, '--settings', '/tmp/efficiency-hooks.json'))
+    assert.equal(args.includes('--bare'), false)
+  })

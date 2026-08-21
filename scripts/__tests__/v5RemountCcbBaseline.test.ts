@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import {
   CCB_BASELINE_TARGETS,
   classifyBaselineMounts,
+  hasCompleteBaselineMounts,
   type MountLike,
 } from "../lib/v5BaselineMounts.js";
 import {
@@ -46,6 +47,25 @@ describe("V5 CCB baseline remount classification", () => {
       complete: true,
       missing: [],
     });
+  });
+
+  test("accepts complete standard or admin overlays but rejects a mixed pair", () => {
+    const adminSources = {
+      ...sources,
+      [CCB_BASELINE_TARGETS[0]]: "/trusted/baseline/AGENTS.admin.md",
+      [CCB_BASELINE_TARGETS[1]]: "/trusted/baseline/CLAUDE.admin.md",
+    };
+    const mountsFor = (selected: Record<string, string>): MountLike[] =>
+      CCB_BASELINE_TARGETS.map((destination) => ({
+        Type: "bind", Source: selected[destination], Destination: destination, RW: false,
+      }));
+    assert.equal(hasCompleteBaselineMounts(completeMounts(), [sources, adminSources]), true);
+    assert.equal(hasCompleteBaselineMounts(mountsFor(adminSources), [sources, adminSources]), true);
+    const mixed = mountsFor({
+      ...sources,
+      [CCB_BASELINE_TARGETS[0]]: adminSources[CCB_BASELINE_TARGETS[0]]!,
+    });
+    assert.equal(hasCompleteBaselineMounts(mixed, [sources, adminSources]), false);
   });
 
   test("rejects a missing, writable, wrong-source, or duplicate baseline bind", () => {

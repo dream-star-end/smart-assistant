@@ -56,6 +56,7 @@ import type { GrokRouteOverride } from './engine/grokAdapter.js'
 import type { ZcodeRouteOverride } from './engine/zcodeAdapter.js'
 import { eventBus, createEvent } from './eventBus.js'
 import { beginMemoryTurnTracking } from './memoryTurnObserver.js'
+import { createTurnUsageRecorder, mapTurnTerminalStatus, type TurnTerminalStatus } from './turnUsage.js'
 import { createLogger } from './logger.js'
 import { collectSessionOutputAssets } from './projectAssetCollector.js'
 import {
@@ -92,6 +93,11 @@ import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 import type { TurnModelAuthority, UsageAttributionTag } from './subprocessRunner.js'
 import { isPatrolSessionKey } from './taskboard/domain.js'
 import { startMemoryTurnPolicyLease } from './memoryTurnPolicyLease.js'
+import {
+  applyEfficiencyToolObservation,
+  finalizeEfficiencyTurn,
+  prepareEfficiencyTurnNote,
+} from './agentEfficiencyGuard.js'
 
 const log = createLogger({ module: 'sessionManager' })
 
@@ -736,6 +742,10 @@ export interface AgentSession {
   // 当前 turn 的文本累积器(用于 FTS5 索引)
   currentUserText?: string
   currentAssistantBuf?: string
+  /** Per-turn efficiency linter state (tool_use_detected hook). */
+  _efficiencyTurn?: import('./agentEfficiencyGuard.js').TurnGuardState
+  _efficiencyPendingHits?: import('./agentEfficiencyGuard.js').LintHit[]
+  _efficiencyBudget?: import('./agentEfficiencyGuard.js').VerificationBudget
   // Model name for cost attribution
   model?: string
   /** Native-compaction transition fences every old-model submit until the
@@ -3852,6 +3862,17 @@ export class SessionManager {
         session.turns = await getMaxTurnIdx(ids)
       }
       let runnerPayload = userTextOrBlocks
+      try {
+        const efficiencyNote = await prepareEfficiencyTurnNote(
+          session,
+          session.currentUserText ?? '',
+        )
+        if (efficiencyNote && typeof runnerPayload === 'string') {
+          runnerPayload = `${efficiencyNote}\n\n${runnerPayload}`
+        }
+      } catch (err) {
+        log.debug('efficiency guard prepare failed', { sessionKey: session.sessionKey, err: String(err) })
+      }
       const masterHistoricalMessages = Array.isArray(opts?.historicalMessages)
         ? opts.historicalMessages
         : null
@@ -4167,6 +4188,9 @@ export class SessionManager {
         transition.state = 'prepared'
         transition.summaryInjected = false
       }
+      await finalizeEfficiencyTurn(session).catch((err) => {
+        log.debug('efficiency guard finalize failed', { sessionKey: session.sessionKey, err: String(err) })
+      })
       await memoryTurnPolicyLease?.stop().catch((err) => {
         log.warn('memory turn policy cleanup failed', { sessionKey: session.sessionKey, err: String(err) })
       })
@@ -4723,6 +4747,36 @@ export class SessionManager {
     const prevCostUSD = session.totalCostUSD
     const prevTurns = session.turns
     const prevLastCcbCost = session._lastCcbCumulativeCost
+    const turnUsage = createTurnUsageRecorder()
+    const recordTurnUsage = (
+      terminalStatus: TurnTerminalStatus,
+      usage?: {
+        inputTokens?: number
+        outputTokens?: number
+        cacheReadTokens?: number
+        cacheCreationTokens?: number
+        costUsd?: number
+        model?: string
+      },
+      turnIndex = Math.max(session.turns, prevTurns + 1),
+    ): boolean => turnUsage.record({
+      agentId: session.agentId,
+      sessionKey: session.sessionKey,
+      turnIndex,
+      usage: {
+        inputTokens: usage?.inputTokens ?? 0,
+        outputTokens: usage?.outputTokens ?? 0,
+        cacheReadTokens: usage?.cacheReadTokens ?? 0,
+        cacheCreationTokens: usage?.cacheCreationTokens ?? 0,
+        costUsd: usage?.costUsd ?? 0,
+        model: usage?.model ?? session.model,
+      },
+      toolCalls: turnToolCallCount,
+      durationMs: Date.now() - turnStartTime,
+      terminalStatus,
+      ...(requestId ? { requestId } : {}),
+      ...(session._currentTurnTraceId ? { traceId: session._currentTurnTraceId } : {}),
+    })
 
     await new Promise<void>((resolve, reject) => {
       let settled = false
@@ -4853,6 +4907,11 @@ export class SessionManager {
                 memoryReadTargets.set(tool.id, target)
               }
             }
+          }
+          try {
+            applyEfficiencyToolObservation(session, tool, turnToolCallCount)
+          } catch (err) {
+            log.debug('efficiency guard observe failed', { sessionKey: session.sessionKey, err: String(err) })
           }
           // Bridge CCB CronCreate/CronDelete via EventBus
           if (tool.name === 'CronCreate') {
@@ -5178,6 +5237,24 @@ export class SessionManager {
               })
             }
           } finally {
+            const usageForLog = terminalUsageForPersistence({
+              finalMeta: observedFinalMeta,
+              billing: terminalEngineBilling,
+              traceId,
+              turnIndex: prevTurns + 1,
+              model: session.model,
+            })
+            recordTurnUsage(
+              mapTurnTerminalStatus({ persistStatus: status, errorCode }),
+              {
+                inputTokens: usageForLog.inputTokens,
+                outputTokens: usageForLog.outputTokens,
+                cacheReadTokens: usageForLog.cacheReadTokens,
+                cacheCreationTokens: usageForLog.cacheCreationTokens,
+                model: session.model,
+              },
+              prevTurns + 1,
+            )
             // A queued tape is durable locally but not yet visible from the
             // authoritative PG history. Never expose a terminal frame until
             // the master has ACKed it; reconnect/relogin must not turn a live
@@ -5913,12 +5990,15 @@ export class SessionManager {
               persistenceAcknowledged = await persistence
             }
 
-            // Emit turn.completed event (triggers event_log + usage_log persistence)
-            const turnDurationMs = Date.now() - turnStartTime
-            eventBus.emit('turn.completed', createEvent('turn.completed', session.agentId, {
-              sessionKey: session.sessionKey,
-              turnIndex: session.turns,
-              usage: {
+            // Unified turn-usage emit (eventPersist writes usage_log).
+            recordTurnUsage(
+              mapTurnTerminalStatus({
+                persistStatus: terminalOverride?.status,
+                errorCode: terminalOverride?.errorCode,
+                hasResult: true,
+                resultIsError: terminalOverride !== null || result.isError,
+              }),
+              {
                 inputTokens: result.usage.inputTokens,
                 outputTokens: result.usage.outputTokens,
                 cacheReadTokens: result.usage.cacheReadTokens,
@@ -5926,15 +6006,8 @@ export class SessionManager {
                 costUsd: result.usage.cost,
                 model: session.model,
               },
-              toolCalls: turnToolCallCount,
-              durationMs: turnDurationMs,
-              ...(session._currentTurnTraceId
-                ? { traceId: session._currentTurnTraceId }
-                : {}),
-              // PR2 v1.0.66 — codex-native turn 把 server-owned requestId 透到这里,
-              // 让 event_log / 异步 audit 能关联到 inflightCodexTurns 行。其它路径 undefined。
-              ...(requestId ? { requestId } : {}),
-            }))
+              session.turns,
+            )
 
             // Emit cost.recorded for budget tracking
             eventBus.emit('cost.recorded', createEvent('cost.recorded', session.agentId, {
@@ -5972,6 +6045,9 @@ export class SessionManager {
           // A transient persistence failure stays in the unlimited fsynced
           // retry queue. Do not emit a new user-facing notice and do not expose
           // terminal completion until the authoritative master ACKs it.
+          if (!result) {
+            recordTurnUsage(mapTurnTerminalStatus({ hasResult: false }))
+          }
           if (persistenceAcknowledged) {
             if (terminalErrorForClient) {
               // 审计 R3:errorClass 已是 TurnSummary 的权威字段(各 adapter 的

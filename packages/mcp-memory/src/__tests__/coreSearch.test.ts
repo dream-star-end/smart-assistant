@@ -447,4 +447,3 @@ test('dedup probe skips on strong hit and ignores expired memories', async () =>
   assert.equal(live.hit, true)
   assert.match(live.path ?? '', /live\.md/)
 })
-

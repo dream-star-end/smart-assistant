@@ -6,6 +6,9 @@
 # a short-lived loopback relay URL + opaque token from OpenClaude.
 set -eu
 
+SELF_ROOT=$(/usr/bin/dirname "$(/usr/bin/readlink -f "$0")")
+[ -d "$SELF_ROOT" ] || exit 2
+
 die() {
   echo "oc-zcode: $*" >&2
   exit 2
@@ -20,7 +23,11 @@ mode and output format are managed by OpenClaude.
 EOF
 }
 
-for required_tool in /usr/bin/test /bin/cat /usr/bin/mktemp /bin/rm /bin/mkdir \
+case "${1:-}" in
+  --help|-h) usage; exit 0 ;;
+esac
+
+for required_tool in /usr/bin/dirname /usr/bin/readlink /usr/bin/test /bin/cat /usr/bin/mktemp /bin/rm /bin/mkdir \
   /bin/chmod /usr/bin/id /usr/bin/stat /usr/bin/setsid; do
   [ -x "$required_tool" ] || die "runtime image is missing $required_tool"
 done

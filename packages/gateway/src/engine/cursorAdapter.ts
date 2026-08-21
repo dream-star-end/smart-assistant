@@ -23,6 +23,7 @@ import { classifyRunError } from '../errorClassify.js'
 import { createLogger } from '../logger.js'
 import { resolveMcpMemoryEntry } from '../mcpMemoryEntry.js'
 import { getPlatformPrompt } from '../platformPrompts.js'
+import { atomicWriteJsonFile, buildCursorEfficiencyHooks } from '../efficiencyHookConfig.js'
 import { detachChildStdio, killProcessGroup, shutdownTimeoutMs, waitForCloseWithin } from '../processGroupShutdown.js'
 import { buildPromptContext } from '../promptSlots.js'
 import { issueDelegateContextToken } from '../delegateContext.js'
@@ -1490,6 +1491,17 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
       // A stored id whose local store vanished would silently mint an empty chat.
       if (this.nativeId && resumeId === null) this.nativeId = null
       if (resumeId !== null) env.OPENCLAUDE_CURSOR_RESUME_ID = resumeId
+      try {
+        const hooks = buildCursorEfficiencyHooks()
+        if (hooks) {
+          const hooksFile = resolve(contextDir, 'hooks.json')
+          atomicWriteJsonFile(hooksFile, hooks, 0o600)
+          chmodSync(hooksFile, 0o600)
+          env.OPENCLAUDE_CURSOR_HOOKS_JSON = hooksFile
+        }
+      } catch (err) {
+        log.warn('failed to write cursor efficiency hooks', { sessionKey: this.opts.sessionKey }, err)
+      }
 
       const args = [
         ...(selected.upstreamModel === null ? [] : ['--model', selected.upstreamModel]),

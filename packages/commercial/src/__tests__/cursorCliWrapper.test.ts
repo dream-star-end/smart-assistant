@@ -70,6 +70,10 @@ fi
 if [ -f "$HOME/.cursor/mcp.json" ]; then
   /bin/cp "$HOME/.cursor/mcp.json" "$OC_CURSOR_TEST_CAPTURE/mcp.json"
 fi
+printf '%s\\n' "\${OPENCLAUDE_CURSOR_HOOKS_JSON-unset}" > "$OC_CURSOR_TEST_CAPTURE/hooks-env"
+if [ -f "$HOME/.cursor/hooks.json" ]; then
+  /bin/cp "$HOME/.cursor/hooks.json" "$OC_CURSOR_TEST_CAPTURE/hooks.json"
+fi
 /bin/mkdir -p "$HOME/.config/cursor"
 printf '%s\\n' "\${CURSOR_API_KEY}" > "$HOME/.config/cursor/auth.json"
 printf '%s\\n' "\${CURSOR_API_KEY}" > "$OC_CURSOR_TEST_CAPTURE/key"
@@ -248,6 +252,38 @@ describe('oc-cursor wrapper', () => {
     assert.ok(ephemeralHome.startsWith('/tmp/openclaude-cursor.'))
     assert.equal(spawnSync('test', ['!', '-e', ephemeralHome]).status, 0)
     assert.doesNotMatch(readFileSync(join(f.capture, 'argv'), 'utf8'), /crsr_dummy/)
+  })
+
+
+  test('copies one validated adapter hooks.json and unsets the source env', () => {
+    const f = fixture()
+    const hooks = join(f.dir, 'adapter-hooks.json')
+    const body = '{"version":1,"hooks":{"beforeShellExecution":[]}}\n'
+    writeFileSync(hooks, body, { mode: 0o600 })
+    chmodSync(hooks, 0o600)
+
+    const result = spawnSync(f.wrapper, ['--', 'use platform skill'], {
+      cwd: f.dir,
+      env: { ...f.env, OPENCLAUDE_CURSOR_HOOKS_JSON: hooks },
+      encoding: 'utf8',
+    })
+    assert.equal(result.status, 0, result.stderr)
+    assert.equal(readFileSync(join(f.capture, 'hooks.json'), 'utf8'), body)
+    assert.equal(readFileSync(join(f.capture, 'hooks-env'), 'utf8').trim(), 'unset')
+    assert.equal(statSync(hooks).mode & 0o777, 0o600)
+  })
+
+  test('missing hooks.json fails open and still launches Cursor', () => {
+    const f = fixture()
+    const result = spawnSync(f.wrapper, ['--', 'use platform skill'], {
+      cwd: f.dir,
+      env: { ...f.env, OPENCLAUDE_CURSOR_HOOKS_JSON: join(f.dir, 'missing-hooks.json') },
+      encoding: 'utf8',
+    })
+    assert.equal(result.status, 0, result.stderr)
+    assert.match(result.stderr, /fail-open/)
+    assert.equal(existsSync(join(f.capture, 'hooks.json')), false)
+    assert.equal(readFileSync(join(f.capture, 'hooks-env'), 'utf8').trim(), 'unset')
   })
 
   test('copies one validated adapter MCP config, approves it, and unsets the source env', () => {

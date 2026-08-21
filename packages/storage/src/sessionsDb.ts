@@ -147,7 +147,8 @@ export async function getSessionsDb(): Promise<Database.Database> {
       cost_usd REAL NOT NULL DEFAULT 0,
       duration_ms INTEGER NOT NULL DEFAULT 0,
       tool_calls INTEGER NOT NULL DEFAULT 0,
-      timestamp INTEGER NOT NULL
+      timestamp INTEGER NOT NULL,
+      terminal_status TEXT NOT NULL DEFAULT 'completed'
     );
 
     -- Exact, privacy-minimized memory operations. Unlike tool.called previews,
@@ -220,6 +221,14 @@ export async function getSessionsDb(): Promise<Database.Database> {
       db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_log_dedup ON usage_log(session_id, turn_index)')
     }
   } catch { /* table just created, no migration needed */ }
+
+  // 2b. usage_log.terminal_status — mark abnormal / reconciled terminals
+  try {
+    const usageCols = db.pragma('table_info(usage_log)') as Array<{ name: string }>
+    if (!usageCols.some(c => c.name === 'terminal_status')) {
+      db.exec("ALTER TABLE usage_log ADD COLUMN terminal_status TEXT NOT NULL DEFAULT 'completed'")
+    }
+  } catch { /* table just created with column already */ }
 
   // 3. Migrate event_log: add peer_id and channel columns for audit trail (P0.5)
   try {
@@ -1641,6 +1650,15 @@ export async function loadSessionEvents(sessionKey: string): Promise<EventLogEnt
 
 // ── Usage log ──────────────────────────────────
 
+export type UsageTerminalStatus =
+  | 'completed'
+  | 'error'
+  | 'crashed'
+  | 'aborted'
+  | 'stopped'
+  | 'timeout'
+  | 'reconciled'
+
 export interface UsageLogEntry {
   id: string
   sessionId: string
@@ -1655,7 +1673,12 @@ export interface UsageLogEntry {
   durationMs: number
   toolCalls: number
   timestamp: number
+  terminalStatus?: UsageTerminalStatus
 }
+
+export type InsertUsageLogResult =
+  | { status: 'inserted' }
+  | { status: 'duplicate'; conflict: boolean }
 
 /** Exact per-session usage rows; no sampling or silent truncation. */
 export async function loadSessionUsage(sessionId: string): Promise<UsageLogEntry[]> {
@@ -1663,7 +1686,7 @@ export async function loadSessionUsage(sessionId: string): Promise<UsageLogEntry
   const rows = db.prepare(
     `SELECT id, session_id, agent_id, turn_index, timestamp, model,
             input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
-            cost_usd, duration_ms, tool_calls
+            cost_usd, duration_ms, tool_calls, terminal_status
        FROM usage_log
       WHERE session_id = ?
       ORDER BY turn_index ASC, timestamp ASC, id ASC`,
@@ -1681,6 +1704,7 @@ export async function loadSessionUsage(sessionId: string): Promise<UsageLogEntry
     cost_usd: number
     duration_ms: number
     tool_calls: number
+    terminal_status: string | null
   }>
   return rows.map((row) => ({
     id: row.id,
@@ -1696,18 +1720,44 @@ export async function loadSessionUsage(sessionId: string): Promise<UsageLogEntry
     costUsd: row.cost_usd,
     durationMs: row.duration_ms,
     toolCalls: row.tool_calls,
+    terminalStatus: (row.terminal_status ?? 'completed') as UsageTerminalStatus,
   }))
 }
 
-export async function insertUsageLog(entry: UsageLogEntry): Promise<void> {
+export async function insertUsageLog(entry: UsageLogEntry): Promise<InsertUsageLogResult> {
   const db = await getSessionsDb()
-  db.prepare(`
+  const bound = {
+    ...entry,
+    model: entry.model ?? null,
+    terminalStatus: entry.terminalStatus ?? 'completed',
+  }
+  const result = db.prepare(`
     INSERT OR IGNORE INTO usage_log
       (id, session_id, agent_id, turn_index, model, input_tokens, output_tokens,
-       cache_read_tokens, cache_creation_tokens, cost_usd, duration_ms, tool_calls, timestamp)
+       cache_read_tokens, cache_creation_tokens, cost_usd, duration_ms, tool_calls, timestamp,
+       terminal_status)
     VALUES (@id, @sessionId, @agentId, @turnIndex, @model, @inputTokens, @outputTokens,
-            @cacheReadTokens, @cacheCreationTokens, @costUsd, @durationMs, @toolCalls, @timestamp)
-  `).run(entry)
+            @cacheReadTokens, @cacheCreationTokens, @costUsd, @durationMs, @toolCalls, @timestamp,
+            @terminalStatus)
+  `).run(bound)
+  if (result.changes === 1) return { status: 'inserted' }
+  const existing = db.prepare(
+    `SELECT duration_ms, tool_calls, input_tokens, output_tokens
+       FROM usage_log
+      WHERE session_id = ? AND turn_index = ?`,
+  ).get(entry.sessionId, entry.turnIndex) as {
+    duration_ms: number
+    tool_calls: number
+    input_tokens: number
+    output_tokens: number
+  } | undefined
+  const conflict = !!existing && (
+    existing.duration_ms !== entry.durationMs
+    || existing.tool_calls !== entry.toolCalls
+    || existing.input_tokens !== entry.inputTokens
+    || existing.output_tokens !== entry.outputTokens
+  )
+  return { status: 'duplicate', conflict }
 }
 
 export async function pruneLocalObservability(input: {

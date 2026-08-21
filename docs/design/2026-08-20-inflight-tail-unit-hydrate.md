@@ -529,13 +529,13 @@ if (serverSupportsViewUnits) {
 
 ## 11. 最值得审计员盯的点
 
-1. **委派卡完整性（B2 的真实形状）**  
+1. **委派卡完整性（B2 的真实形状）**
    `phase=done` 的最后一帧不是卡。归并必须等同 `applyDelegatePhaseToGroup` + `appendSubagentBlock`（同 blockId 原地更新，done 只标终态）。任何「last frame per runId」实现都应该直接 FAIL。组卡内 746 KB 子块是截断预览还是完整带上，要在契约里写死，避免「完整」被理解成 10 MB 首包。
 
-2. **resume.frameSeq 与 units 折叠态的同一快照**  
+2. **resume.frameSeq 与 units 折叠态的同一快照**
    首包 units 必须是 `throughFrameSeq=resume.frameSeq` 的折叠结果。若 checkpoint 停在 6500、catch-up 到 6572、但 resume 写成 6500，WS 会重放 6501–6572，组卡子块双份或 text 双拼。反之 resume 超前会丢尾。live→tape 窗口里 units 行的 owner 标记必须能被 tape 替换清掉。
 
-3. **「最新 20 条」漏掉仍在飞的委派卡**  
+3. **「最新 20 条」漏掉仍在飞的委派卡**
    按 `seq_first` 切尾会把 4 张早出现、仍在更新的组卡切掉，2s 契约表面上达标、产品失败。审计应有夹具：父轮已有 100 个 thinking/tool 单元、中间插入 4 个仍 open 的 runId → first_pack 必须含这 4 张卡。
 
 （次级但相关：共享归并函数与 `reducer.ts` drift；`retrying` 占位文案若未改，即使用上 units，用户仍会看 45 s「正在恢复」。）

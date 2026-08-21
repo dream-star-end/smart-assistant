@@ -84,6 +84,10 @@ const WHITELIST = new Set<string>([
   // client_sessions 仅**只读 LEFT JOIN**(id+user_id 归属 + deleted_at 墓碑,判定"用户面已
   // 消失"的 open dispatch)——不写六表;dispatch 域的离场判定放 sessions backend 反而内聚更差。
   "packages/commercial/src/dispatch/turnDispatchStore.ts",
+  // Orphan dispatch finalize owns one atomic PG transaction: lock dispatch + lock the
+  // tenant session row + append a visible tapeless fallback + close the dispatch.
+  // Splitting the session projection through a backend call would lose that fence.
+  "packages/commercial/src/dispatch/turnDispatchReconciler.ts",
   "scripts/v5-sessions-backfill-pg.ts",
   "scripts/v5-sessions-spill-archive.ts",
   "scripts/sessions-fix-oversized.ts",

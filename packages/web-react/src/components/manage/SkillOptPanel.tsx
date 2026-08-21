@@ -72,7 +72,7 @@ import {
 } from "../ui";
 
 /** 训练/评测锁定的模型(与 gateway SKILL_TRAIN_DEFAULT_MODEL 一致)。 */
-export const SKILL_RUN_MODEL = "deepseek-v4-pro";
+export const SKILL_RUN_MODEL = "deepseek-v4-flash";
 
 const POLL_MS = 3000;
 

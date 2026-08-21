@@ -123,13 +123,28 @@ export function restoreVisibleVirtualRowAnchor(
   },
 ): Promise<void> {
   return new Promise((resolve) => {
+    // Disable content-visibility estimates during exact prepend correction. A
+    // formerly visible anchor can otherwise become offscreen after a large
+    // prepend and report its 200px intrinsic estimate instead of real geometry.
+    scroller.classList.add("chat-anchor-restoring");
+    let finished = false;
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      scroller.classList.remove("chat-anchor-restoring");
+      resolve();
+    };
+    // Ordinary DOM rows (no Virtuoso data-index) can receive a late paint-window
+    // layout shift after the first apparent plateau. Keep a longer proof window;
+    // indexed virtual rows retain the historical two-frame contract.
+    const requiredStableFrames = anchor.dataIndex === null ? 4 : 2;
     let observedPrependLayout = false;
     let lastBeforeTop: number | null = null;
     let beforeTopStableFrames = 0;
     let stableFrames = 0;
     const correct = () => {
       if (cancelled()) {
-        resolve();
+        finish();
         return;
       }
       const beforeRow = Array.from(
@@ -214,7 +229,7 @@ export function restoreVisibleVirtualRowAnchor(
       // rather than merely looking aligned immediately after this frame's
       // correction. User input/session switch still terminates immediately
       // through `cancelled`.
-      if (stableFrames >= 2) resolve();
+      if (stableFrames >= requiredStableFrames) finish();
       else schedule(correct);
     };
     schedule(correct);

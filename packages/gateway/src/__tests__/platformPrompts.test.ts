@@ -314,6 +314,27 @@ describe('fallback 常量 === bundle 文件(逐字同步门)', () => {
     assert.ok(!prompt.includes('Agent 工具 spawn 子 agent'))
     assert.ok(!prompt.includes('子 agent 会继承你的全部工具和上下文'))
   })
+  it('效率契约对所有 agent 生效且覆盖改动档位/等待/读代码三条硬规则', () => {
+    const prompt = _platformPromptFallbacks.PLATFORM_CAPABILITIES_FALLBACK
+    assert.ok(prompt.includes('## 效率契约'))
+    assert.ok(prompt.includes('**T0** 配置/catalog'))
+    assert.ok(prompt.includes('**T1** 单包代码'))
+    assert.ok(prompt.includes('**T2** 跨包/协议/迁移'))
+    assert.ok(prompt.includes('禁止 `sleep >= 60`'))
+    assert.ok(prompt.includes('gh pr checks --watch'))
+    assert.ok(prompt.includes('while true'))
+    assert.ok(prompt.includes('Read`/`Grep`/`Glob'))
+    assert.ok(prompt.includes('host cat/rg'))
+    assert.ok(prompt.includes('80 次工具调用或 30 分钟'))
+    assert.ok(prompt.includes('验一下'))
+    const baseline = readFileSync(
+      'packages/commercial/agent-sandbox/ccb-baseline/CLAUDE.md',
+      'utf8',
+    )
+    assert.ok(baseline.includes('## 效率契约'), 'CLAUDE.md 基线必须含效率契约(子 agent User memory)')
+    assert.ok(baseline.includes('对所有 agent(含委派子 agent)生效'))
+    assert.ok(baseline.includes('只验不修'))
+  })
   it('选择题:CCB/Codex 走原生 Ask 工具,Cursor 走正文 options 围栏', () => {
     const prompt = _platformPromptFallbacks.PLATFORM_CAPABILITIES_FALLBACK
     assert.ok(prompt.includes('AskUserQuestion'))

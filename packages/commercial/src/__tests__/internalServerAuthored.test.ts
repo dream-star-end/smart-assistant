@@ -3450,4 +3450,3 @@ describe("internalServerAuthored handler — detached ask_user permissionCards",
     assert.equal(userRow!.id, "ask-ans-sess12345abcdefghijkl");
   });
 });
-

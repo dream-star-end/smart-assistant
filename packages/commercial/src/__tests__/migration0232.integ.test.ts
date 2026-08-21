@@ -311,4 +311,3 @@ describe("0232_agent_group_jsonb_unicode_sanitize", () => {
     assert.deepEqual(inserted.payload, raw);
   });
 });
-

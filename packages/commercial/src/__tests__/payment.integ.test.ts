@@ -125,7 +125,20 @@ after(async () => {
 
 beforeEach(async () => {
   if (!pgAvailable || !redis) return;
-  await query("TRUNCATE TABLE orders, credit_ledger, refresh_tokens, email_verifications, users RESTART IDENTITY CASCADE");
+  // A paid callback deliberately emits alert discovery out of band after the
+  // HTTP response. Its short orders/users read can overlap the next fixture
+  // reset, making PostgreSQL choose TRUNCATE as a 40P01 victim. Retry only that
+  // exact transient; every other reset failure remains fatal.
+  let reset = false;
+  for (let attempt = 0; attempt < 3 && !reset; attempt++) {
+    try {
+      await query("TRUNCATE TABLE orders, credit_ledger, refresh_tokens, email_verifications, users RESTART IDENTITY CASCADE");
+      reset = true;
+    } catch (error) {
+      if ((error as { code?: string }).code !== "40P01" || attempt === 2) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 25 * (attempt + 1)));
+    }
+  }
   await redis.flushdb();
   mockNextCreate = null;
 });

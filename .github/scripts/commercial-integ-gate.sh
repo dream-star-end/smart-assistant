@@ -45,6 +45,19 @@ if [[ ${#manifests[@]} -eq 0 || ! -f "${manifests[0]}" ]]; then
   exit 2
 fi
 
+# Aggregate targets must preserve each shard's own known-failure and count
+# baseline. Running every file in one Node process also turns a shard-local
+# timeout into an unrelated aggregate failure, so recurse into exact shards.
+if [[ "$target" == "pr" || "$target" == "nightly" ]]; then
+  for manifest in "${manifests[@]}"; do
+    shard="$(basename "$manifest" .txt)"
+    bash "${BASH_SOURCE[0]}" "$shard" || exit 1
+  done
+  echo ""
+  echo "PASS: $target aggregate -- every shard passed its own G1-G4 contract"
+  exit 0
+fi
+
 # 收集文件与 min-tests 下界(多片相加)
 files=()
 min_tests=0

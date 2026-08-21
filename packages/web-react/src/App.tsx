@@ -144,6 +144,7 @@ import {
 import { DEMO_MESSAGES, DEMO_MODELS, DEMO_SESSIONS, DEMO_USER, demoReply } from "./lib/demo";
 import type { ChatProject, Message, PublicConfig, PublicModel, Session, SessionLastOutcome, ToolCard } from "./lib/types";
 import { modelSwitchCompactionReason } from "./lib/modelSwitch";
+import { TASKBOARD_ENABLED } from "./lib/taskboardFeature";
 
 // 首屏瘦身:营销首页 + 设置/管理/市场/组织/教程中心按需异步加载,移出 entry chunk。
 // 命名导出 → default 适配。渲染点各自套 LazyBoundary（= chunk 加载失败兜底 + Suspense：
@@ -186,7 +187,9 @@ export function prefetchLazyCentersOnIdle(): void {
     void import("./components/OrgCenter").catch(() => {});
     void import("./components/TutorialCenter").catch(() => {});
     void import("./components/MediaTaskCenter").catch(() => {});
-    void import("./components/taskboard/TaskboardView").catch(() => {});
+    if (TASKBOARD_ENABLED) {
+      void import("./components/taskboard/TaskboardView").catch(() => {});
+    }
   };
   if (typeof requestIdleCallback === "function") {
     requestIdleCallback(prefetch, { timeout: 8000 });
@@ -258,7 +261,7 @@ export function App() {
   );
   // 任务面板是并列工作区（整段替换 <main>），不是管理中心 Tab。boot 自 /board。
   const [boardOpen, setBoardOpen] = useState(
-    () => routingEnabled && location.pathname === "/board",
+    () => TASKBOARD_ENABLED && routingEnabled && location.pathname === "/board",
   );
   const [boardView, setBoardView] = useState<BoardViewParam>(() =>
     routingEnabled ? parseBoardView(params, preferredBoardView()) : preferredBoardView(),
@@ -2346,11 +2349,11 @@ export function App() {
         setTutorialCommunity(null);
       }
     },
-    workspace: boardOpen ? "board" : "chat",
+    workspace: TASKBOARD_ENABLED && boardOpen ? "board" : "chat",
     boardView,
     boardTicket: boardTicketId,
     boardTicketType,
-    onPopWorkspace: (ws) => setBoardOpen(ws === "board"),
+    onPopWorkspace: (ws) => setBoardOpen(TASKBOARD_ENABLED && ws === "board"),
     onPopBoardParams: (nextView, ticket, ticketType) => {
       setBoardView(nextView);
       setBoardTicketId(ticket);
@@ -2576,8 +2579,8 @@ export function App() {
       demo || !(user?.org && (user.org.role === "owner" || user.org.role === "admin"))
         ? undefined
         : () => openOrg(),
-    onOpenBoard: demo ? undefined : () => setBoardOpen(true),
-    boardActive: boardOpen,
+    onOpenBoard: demo || !TASKBOARD_ENABLED ? undefined : () => setBoardOpen(true),
+    boardActive: TASKBOARD_ENABLED && boardOpen,
     unreadIds: unreadSessions.unreadIds,
     onMarkRead: unreadSessions.markRead,
     onOpenProjectSettings: (p: ChatProject) => {
@@ -2660,7 +2663,7 @@ export function App() {
           }}
           onCollapse={() => setMobileNavOpen(false)}
           onOpenBoard={
-            demo
+            demo || !TASKBOARD_ENABLED
               ? undefined
               : () => {
                   setBoardOpen(true);
@@ -2682,7 +2685,7 @@ export function App() {
       </Sheet>
 
       <main className="flex min-h-0 min-w-0 flex-1 flex-col">
-        {boardOpen && !demo && auth ? (
+        {TASKBOARD_ENABLED && boardOpen && !demo && auth ? (
           <LazyBoundary fallback={<SplashFallback />}>
             <TaskboardView
               auth={auth}

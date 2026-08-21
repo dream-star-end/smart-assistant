@@ -105,6 +105,7 @@ const MIGRATION_0233 = path.resolve(here, "../db/migrations/0233_client_session_
 const MIGRATION_0239 = path.resolve(here, "../db/migrations/0239_turn_dispatch_shutdown_ctx.sql");
 const MIGRATION_0240 = path.resolve(here, "../db/migrations/0240_client_session_last_read_at.sql");
 const MIGRATION_0241 = path.resolve(here, "../db/migrations/0241_raise_last_read_watermark.sql");
+const MIGRATION_0243 = path.resolve(here, "../db/migrations/0243_live_unit_checkpoints.sql");
 
 let pool: Pool;
 let backend: PgSessionsBackend;
@@ -241,7 +242,12 @@ before(async () => {
   await pool.query(await readFile(MIGRATION_0239, { encoding: "utf8" }));
   await pool.query(await readFile(MIGRATION_0240, { encoding: "utf8" }));
   await pool.query(await readFile(MIGRATION_0241, { encoding: "utf8" }));
+  await pool.query(await readFile(MIGRATION_0243, { encoding: "utf8" }));
   await pool.query(`
+    CREATE TABLE agent_containers (
+      user_id BIGINT NOT NULL,
+      state TEXT NOT NULL
+    );
     CREATE TABLE admin_audit (
       id BIGSERIAL PRIMARY KEY,
       admin_id BIGINT NOT NULL,
@@ -310,11 +316,23 @@ after(async () => {
 
 beforeEach(async () => {
   if (!pgAvailable) return;
-  await pool.query(
-    `TRUNCATE client_sessions, client_session_archive_chunks, client_session_archived_ids,
-             server_authored_request_map, pending_usage_patches, turn_waivers,
-             wechat_bindings, admin_audit CASCADE`,
-  );
+  // Some live-frame readers intentionally outlive the request that started
+  // them. Their final short SELECT can overlap the next fixture TRUNCATE and
+  // make PostgreSQL choose the reset as a 40P01 victim. Retry only that exact
+  // transient; every other setup error remains fatal.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await pool.query(
+        `TRUNCATE client_sessions, client_session_archive_chunks, client_session_archived_ids,
+                 server_authored_request_map, pending_usage_patches, turn_waivers,
+                 wechat_bindings, admin_audit CASCADE`,
+      );
+      break;
+    } catch (error) {
+      if ((error as { code?: string }).code !== "40P01" || attempt === 2) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 25 * (attempt + 1)));
+    }
+  }
 });
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -729,6 +747,22 @@ describe("pgSessionsBackend contract", () => {
     const none = await backend.getClientSession("s-nomodel", "u-1");
     assert.ok(none);
     assert.equal("modelId" in none!, false);
+  });
+
+  maybe("list/search 遇到 JSON 字符串内 escaped NUL 时按单行降级，不拖垮整个侧栏", async () => {
+    const sessionId = "s-escaped-nul";
+    await backend.upsertClientSession(mkSession({
+      id: sessionId,
+      messages: [{ id: "nul-1", role: "tool", text: "prefix\u0000needle", ts: 1 }],
+    }));
+
+    const listed = await backend.listClientSessions("u-1");
+    const meta = listed.sessions.find((session) => session.id === sessionId);
+    assert.ok(meta, "坏预览只能降级本行，不能让 /api/sessions/list 整体 500");
+    assert.equal(meta.lastMessagePreview, undefined);
+
+    const searched = await backend.searchClientSessions("u-1", { q: "needle" });
+    assert.ok(searched.results.some((result) => result.sessionId === sessionId));
   });
 
   maybe("chat_projects CRUD + 删项目只解绑会话 + list 派生 runState", async () => {
@@ -1549,6 +1583,7 @@ describe("pgSessionsBackend lossless turn tape", () => {
 
     // Force the terminal transaction to roll back after per-ordinal staging,
     // reproducing a process/release boundary with durable partial derived rows.
+    await backend.finalizeLosslessTurnTape(userId, tape.finalize, { materialize: false });
     await pool.query(
       "UPDATE client_sessions SET messages='not-json' WHERE id=$1 AND user_id=$2",
       [sessionId, userId],
@@ -1838,6 +1873,7 @@ describe("pgSessionsBackend lossless turn tape", () => {
       for (const part of tape.parts) {
         await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
       }
+      await backend.finalizeLosslessTurnTape(userId, tape.finalize, { materialize: false });
       await pool.query(
         "UPDATE client_sessions SET messages='not-json' WHERE id=$1 AND user_id=$2",
         [sessionId, userId],
@@ -1945,6 +1981,7 @@ describe("pgSessionsBackend lossless turn tape", () => {
     for (const part of tape.parts) {
       await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
     }
+    await backend.finalizeLosslessTurnTape(userId, tape.finalize, { materialize: false });
     await pool.query(
       "UPDATE client_sessions SET messages='not-json' WHERE id=$1 AND user_id=$2",
       [sessionId, userId],
@@ -2008,6 +2045,7 @@ describe("pgSessionsBackend lossless turn tape", () => {
       for (const part of tape.parts) {
         await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
       }
+      await backend.finalizeLosslessTurnTape(userId, tape.finalize, { materialize: false });
       await pool.query(
         "UPDATE client_sessions SET messages='not-json' WHERE id=$1 AND user_id=$2",
         [sessionId, userId],
@@ -2220,7 +2258,7 @@ describe("pgSessionsBackend lossless turn tape", () => {
       CREATE OR REPLACE FUNCTION oc_test_wait_before_terminal_tape_update()
       RETURNS TRIGGER LANGUAGE plpgsql AS $$
       BEGIN
-        IF NEW.tape_id='${tape.finalize.tapeId}' AND NEW.finalized_at IS NOT NULL THEN
+        IF NEW.tape_id='${tape.finalize.tapeId}' AND OLD.visible_at IS NULL AND NEW.visible_at IS NOT NULL THEN
           PERFORM pg_advisory_xact_lock(${barrierKey});
         END IF;
         RETURN NEW;
@@ -2298,7 +2336,7 @@ describe("pgSessionsBackend lossless turn tape", () => {
       if (barrierObserved) break;
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
-    assert.equal(barrierObserved, true, "first finalize must reach the post-billing transaction barrier");
+    assert.equal(barrierObserved, true, "first finalize must reach the Phase A visibility barrier");
 
     const replay = undiciRequest(url, { method: "POST", headers, body });
     controller.abort();
@@ -2316,6 +2354,22 @@ describe("pgSessionsBackend lossless turn tape", () => {
     assert.equal(replayBody.ok, true);
     assert.equal(replayBody.idempotent, true);
     assert.equal(handlerError, undefined);
+    assert.deepEqual(
+      (await pool.query<{ finalized: boolean; parts: string }>(
+        `SELECT finalized_at IS NOT NULL AS finalized,
+                (SELECT COUNT(*)::text FROM client_session_turn_tape_parts p
+                  WHERE p.session_id=t.session_id AND p.user_id=t.user_id AND p.tape_id=t.tape_id) AS parts
+           FROM client_session_turn_tapes t
+          WHERE t.session_id=$1 AND t.user_id=$2 AND t.tape_id=$3`,
+        [sessionId, userId, tape.finalize.tapeId],
+      )).rows[0],
+      { finalized: false, parts: String(tape.parts.length) },
+    );
+    assert.equal(
+      (await backend.finalizeLosslessTurnTape(userId, tape.finalize)).applied,
+      "finalized",
+      "the asynchronous Phase B worker can finish after the HTTP request is gone",
+    );
     assert.deepEqual(
       (await pool.query<{ finalized: boolean; parts: string }>(
         `SELECT finalized_at IS NOT NULL AS finalized,
@@ -2569,11 +2623,13 @@ describe("pgSessionsBackend lossless turn tape", () => {
       applied: "finalized",
       recordCount: 1,
       engineBillings: [],
+      settlementHandoff: true,
     });
     assert.deepEqual(await backend.finalizeLosslessTurnTape(userId, tape.finalize), {
       applied: "idempotent",
       recordCount: 1,
       engineBillings: [],
+      settlementHandoff: true,
     });
     const rows = await pool.query<{
       waive_reason: string;
@@ -3100,7 +3156,11 @@ describe("pgSessionsBackend lossless turn tape", () => {
     );
     assert.ok(repaired);
     assert.equal(repaired.isPartial, false, "legacy substitute removal must force a full repair");
-    assert.equal(repaired.historyRevision, (beforeUpgrade.historyRevision ?? 0) + 1);
+    assert.equal(
+      repaired.historyRevision,
+      (beforeUpgrade.historyRevision ?? 0) + 2,
+      "Phase A visibility and Phase B exact-record publication each advance identity once",
+    );
     const hot = await pool.query<{ messages: string }>(
       "SELECT messages FROM client_sessions WHERE id=$1 AND user_id=$2",
       [sessionId, userId],
@@ -7282,7 +7342,11 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
       "SELECT history_revision FROM client_sessions WHERE id = $1 AND user_id = $2",
       ["s-dd-late-3", CUSER],
     )).rows[0]!.history_revision);
-    assert.equal(revisionAfter, revisionBefore + 1n, "removing the previously visible status advances absence revision");
+    assert.equal(
+      revisionAfter,
+      revisionBefore + 2n,
+      "Phase A removes the stale status and Phase B publishes the exact late truth",
+    );
     assert.equal((await backend.finalizeLosslessTurnTape(CUSER, tape.finalize)).applied, "idempotent");
     const revisionAfterReplay = BigInt((await pool.query<{ history_revision: string }>(
       "SELECT history_revision FROM client_sessions WHERE id = $1 AND user_id = $2",

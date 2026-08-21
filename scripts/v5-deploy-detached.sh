@@ -101,6 +101,7 @@ start_run() {
   )
   add_optional_env runner OC_V5_RELEASE_QUEUE_ID
   add_optional_env runner KL_HOST
+  add_optional_env runner ALLOW_ANY_BRANCH
   add_optional_env runner V5_ENV
   add_optional_env runner CADDY_HTTP_PORT
   add_optional_env runner OC_V5_BASELINE_REMOUNT_TIMEOUT_SECONDS

@@ -315,7 +315,7 @@ describe("settleUsageAndLedger (integ)", () => {
     assert.equal(led.rows[0].reason, "chat");
     assert.equal(led.rows[0].ref_type, "usage_record");
     assert.equal(led.rows[0].ref_id, result.usageId.toString());
-    assert.equal(led.rows[0].memo, null); // 非 clamp → memo NULL
+    assert.equal(led.rows[0].memo, "cost=300"); // preserve requested cost authority
 
     // usage_records ledger_id 反写
     const ur = await query<{
@@ -623,9 +623,11 @@ describe("settleUsageAndLedger (integ)", () => {
     );
     assert.equal(led.rows[0].delta, "-100");
     assert.ok(led.rows[0].memo !== null);
-    assert.match(led.rows[0].memo!, /clamped/);
-    assert.match(led.rows[0].memo!, /cost=300/);
-    assert.match(led.rows[0].memo!, /balance=100/);
+    assert.equal(
+      led.rows[0].memo,
+      "cost=300 clamped requested=300 total=100",
+      "clamp memo keeps both requested cost and the actually available total",
+    );
   });
 
   test("DeepSeek path: accountId=null → usage_records.account_id IS NULL, debit 正常", async (t) => {

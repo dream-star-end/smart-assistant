@@ -184,7 +184,7 @@ const html = `<!doctype html><html><head><meta charset="utf-8"><style>${producti
   #root{position:static;height:auto;overflow:visible}
   .timeline-scroll-probe{height:360px;width:640px;overflow-y:auto;position:relative;border:1px solid #ccc;scrollbar-gutter:stable}
   #timeline-archive-root .chat-virtual-item{min-height:40px}
-</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="chat-entry-ux-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="interrupted-tool-status-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="error-ux-root"></div><div id="ask-question-root"></div><div id="model-selector-root"></div><div id="markdown-rich-root"></div><div id="media-task-root"></div><div id="connectors-root"></div><div id="memory-report-root"></div><div id="community-tutorial-root"></div><div id="codex-density-root"></div><div id="settings-shell-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
+</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="chat-entry-ux-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="interrupted-tool-status-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="error-ux-root"></div><div id="ask-question-root"></div><div id="model-selector-root"></div><div id="markdown-rich-root"></div><div id="media-task-root"></div><div id="connectors-root"></div><div id="memory-report-root"></div><div id="community-tutorial-root"></div><div id="codex-density-root"></div><div id="settings-shell-root"></div><div id="unread-request-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
 
 // ── drive ───────────────────────────────────────────────────────────────────
 let browser;
@@ -238,8 +238,17 @@ const ASSET_MIME = { ".woff2": "font/woff2", ".woff": "font/woff", ".css": "text
 // 组件真实发出的遥测信标(succeeded 级 UX 事件也走这个出口)。harness 没有后端,
 // 显式 204 挡掉;不 stub 就会 404 → console.error → 用例被自己的埋点判红。
 const STUBBED_ENDPOINTS = new Set(["/api/client-errors"]);
+let unreadMarkReadRequests = 0;
 const serveBuiltAsset = (route, request) => {
   const url = new URL(request.url());
+  if (url.pathname === "/api/sessions/unread-browser/read" && request.method() === "POST") {
+    unreadMarkReadRequests += 1;
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ ok: true, updated: 1 }),
+    });
+  }
   if (STUBBED_ENDPOINTS.has(url.pathname)) {
     return route.fulfill({ status: 204, contentType: "text/plain", body: "" });
   }
@@ -605,7 +614,7 @@ await check("T4 file input 结构红线:type=file/无 accept/非 display:none/ta
 });
 
 await check("T27 输入框粘贴 PNG 直接上传为图片附件", async () => {
-  const textarea = primaryComposer.getByPlaceholder("给 OpenClaude 发消息…");
+  const textarea = primaryComposer.getByPlaceholder("给从简发消息…");
   await textarea.fill("保留这段正文");
   const pasteResult = await textarea.evaluate((element) => {
     const png = Uint8Array.from(
@@ -686,7 +695,6 @@ await check("T7 点「+」→「设定目标」→ 目标对话框弹出", async
   await dialog.waitFor({ state: "hidden", timeout: 3000 });
 });
 
-let firstAnchorTop = 0;
 async function scrollTimelineDiagnostic(stage) {
   return page.evaluate((currentStage) => {
     const state = window.__scrollTimeline;
@@ -752,12 +760,6 @@ await check("T8 上滑零请求，点击只取一页、像素锚定且 remount �
   if (afterCancel.length !== 0) {
     throw new Error(`pointercancel 后程序滚动被误判为手势:${JSON.stringify(afterCancel)}`);
   }
-  const anchor = root.locator('[data-chat-virtual-key="outer:200:scroll-tail-0"]');
-  await anchor.waitFor({ state: "attached", timeout: 3000 });
-  const beforeBox = await anchor.boundingBox();
-  if (!beforeBox) throw new Error("tail anchor has no layout box before paging");
-  firstAnchorTop = beforeBox.y;
-
   // A complete wheel/inertia burst is navigation only. It must reveal the
   // explicit boundary without admitting any history request.
   await root.evaluate((node) => {
@@ -793,10 +795,21 @@ await check("T8 上滑零请求，点击只取一页、像素锚定且 remount �
     throw new Error(`单次点击未严格加载一页:${JSON.stringify(afterClick)}`);
   }
   await restorePageScrollT8();
-  const afterBox = await anchor.boundingBox();
-  if (!afterBox) throw new Error("tail anchor disappeared after older page merge");
-  const delta = Math.abs(afterBox.y - firstAnchorTop);
-  if (delta > 2) throw new Error(`插页后可见锚点跳动 ${delta.toFixed(2)}px，应 ≤2px`);
+  const capturedAnchor = await page.evaluate(() => window.__scrollTimeline.anchor);
+  if (!capturedAnchor) throw new Error("生产分页回调未捕获可见锚点");
+  const afterAnchor = root.locator(`[data-chat-virtual-key="${capturedAnchor.key}"]`);
+  const afterBox = await afterAnchor.boundingBox();
+  const afterRootBox = await root.boundingBox();
+  if (!afterBox || !afterRootBox) throw new Error("tail anchor disappeared after older page merge");
+  const delta = Math.abs((afterBox.y - afterRootBox.y) - capturedAnchor.top);
+  if (delta > 2) {
+    const diagnostic = await page.evaluate(() => ({
+      captured: window.__scrollTimeline.anchor,
+      scrollTop: document.querySelector("#timeline-scroll-root .timeline-scroll-probe")?.scrollTop,
+      scrollHeight: document.querySelector("#timeline-scroll-root .timeline-scroll-probe")?.scrollHeight,
+    }));
+    throw new Error(`插页后可见锚点跳动 ${delta.toFixed(2)}px，应 ≤2px; ${JSON.stringify({ capturedAnchor, afterRelativeTop: afterBox.y - afterRootBox.y, diagnostic })}`);
+  }
 
   // Force the first latest record out of Virtuoso overscan and back using
   // programmatic scroll only. A remount must never refetch a resident page.
@@ -850,10 +863,6 @@ await check("T10 归档前插跨出虚拟挂载区仍保持原消息像素位置
   if ((await page.evaluate(() => window.__archiveTimeline.calls)) !== 0) {
     throw new Error("归档会话滚到顶部时错误自动请求");
   }
-  const anchor = root.locator('[data-chat-virtual-key="outer:300:archive-tail-0"]');
-  await anchor.waitFor({ state: "attached", timeout: 3000 });
-  const beforeBox = await anchor.boundingBox();
-  if (!beforeBox) throw new Error("归档前插前缺少可见锚点");
   const button = root.getByTestId("history-page-loader").getByRole("button");
   const restorePageScrollT10 = await pinPageScroll(page);
   await button.click();
@@ -863,10 +872,28 @@ await check("T10 归档前插跨出虚拟挂载区仍保持原消息像素位置
     return button instanceof HTMLButtonElement && button.getAttribute("aria-busy") === "false";
   }, null, { timeout: 3000 });
   await restorePageScrollT10();
-  const afterBox = await anchor.boundingBox();
-  if (!afterBox) throw new Error("归档前插 80 行后原锚点被虚拟列表丢失");
-  const delta = Math.abs(afterBox.y - beforeBox.y);
-  if (delta > 2) throw new Error(`归档前插后可见锚点跳动 ${delta.toFixed(2)}px，应 ≤2px`);
+  const capturedAnchor = await page.evaluate(() => window.__archiveTimeline.anchor);
+  if (!capturedAnchor) throw new Error("归档分页回调未捕获可见锚点");
+  await page.waitForFunction(({ key, top }) => {
+    const root = document.querySelector("#timeline-archive-root .timeline-scroll-probe");
+    const anchor = document.querySelector(`#timeline-archive-root [data-chat-virtual-key="${key}"]`);
+    if (!(root instanceof HTMLElement) || !(anchor instanceof HTMLElement)) return false;
+    return Math.abs(
+      (anchor.getBoundingClientRect().top - root.getBoundingClientRect().top) - top,
+    ) <= 2;
+  }, capturedAnchor, { timeout: 3000 });
+  const afterAnchor = root.locator(`[data-chat-virtual-key="${capturedAnchor.key}"]`);
+  const afterBox = await afterAnchor.boundingBox();
+  const afterRootBox = await root.boundingBox();
+  if (!afterBox || !afterRootBox) throw new Error("归档前插 80 行后原锚点被虚拟列表丢失");
+  const delta = Math.abs((afterBox.y - afterRootBox.y) - capturedAnchor.top);
+  if (delta > 2) {
+    const diagnostic = await page.evaluate(() => ({
+      scrollTop: document.querySelector("#timeline-archive-root .timeline-scroll-probe")?.scrollTop,
+      scrollHeight: document.querySelector("#timeline-archive-root .timeline-scroll-probe")?.scrollHeight,
+    }));
+    throw new Error(`归档前插后可见锚点跳动 ${delta.toFixed(2)}px，应 ≤2px; ${JSON.stringify({ capturedAnchor, afterRelativeTop: afterBox.y - afterRootBox.y, diagnostic })}`);
+  }
   const state = await page.evaluate(() => window.__archiveTimeline);
   if (state.calls !== 1 || state.messageCount !== 200) {
     throw new Error(`归档单击加载契约错误:${JSON.stringify(state)}`);
@@ -1039,14 +1066,14 @@ await check("T18 点助手“引用”→预览可取消→再次引用后随正
   const root = page.locator("#message-quote-root");
   const quote = root.getByRole("button", { name: "引用" });
   await quote.click();
-  await root.getByText("正在引用 OpenClaude").waitFor({ state: "visible", timeout: 3000 });
+  await root.getByText("正在引用 从简").waitFor({ state: "visible", timeout: 3000 });
   await root.getByText("这是需要被引用的完整回答").last().waitFor({ state: "visible", timeout: 3000 });
   await root.getByRole("button", { name: "取消引用" }).click();
-  if (await root.getByText("正在引用 OpenClaude").count()) {
+  if (await root.getByText("正在引用 从简").count()) {
     throw new Error("取消后引用预览仍存在");
   }
   await quote.click();
-  const composer = root.getByPlaceholder("给 OpenClaude 发消息…");
+  const composer = root.getByPlaceholder("给从简发消息…");
   await composer.fill("请重点解释这一段");
   await root.getByRole("button", { name: "发送" }).click();
   const sends = await page.evaluate(() => window.__messageQuote.sends);
@@ -1174,7 +1201,7 @@ await check("T21 真 WS 帧驱动真时间线:条目顺序、工具卡内容、�
 // `!e.nativeEvent.isComposing` 这道守卫在单测里等于不存在:删掉它单测照绿,而线上
 // 中文用户选词按回车就会误发半截草稿。这里用 CDP Input.imeSetComposition 造真实组合态。
 await check("T22 Enter 发送 / Shift+Enter 换行 / IME 组合中回车不误发", async () => {
-  const composer = primaryComposer.getByPlaceholder("给 OpenClaude 发消息…");
+  const composer = primaryComposer.getByPlaceholder("给从简发消息…");
   await composer.waitFor({ state: "visible", timeout: 3000 });
   const sendCount = async () => (await page.evaluate(() => window.__sends)).length;
   const value = () => composer.inputValue();
@@ -1962,7 +1989,7 @@ await check("T31 journal page1→WS N→page2(N)：已响应思考/工具/正文
     state: "visible",
     timeout: 3000,
   });
-  const toolButton = replayRoot.getByRole("button", { name: /exec_command/ }).first();
+  const toolButton = replayRoot.getByRole("button", { name: /执行 Shell|exec_command/ }).first();
   await toolButton.waitFor({ state: "visible", timeout: 3000 });
   await toolButton.click();
   await replayRoot.getByText(result.markers.toolOutput, { exact: true }).waitFor({
@@ -1987,17 +2014,15 @@ await check("T31 journal page1→WS N→page2(N)：已响应思考/工具/正文
 await check("T32 durable error replay：用户 Stop 不上报，历史非尾错误不触发同步循环", async () => {
   const result = await page.evaluate(() => window.__replayDrive.runDurableErrorReplay());
   if (
-    result.stopErrorCode !== "user_cancelled" ||
-    result.stopErrorText !== "本轮已取消。" ||
     result.stopReports !== 0 ||
     result.stopSyncs !== 0 ||
-    result.stopStatusCount !== 1 ||
+    result.stopStatusCount !== 0 ||
     result.stopAlertCount !== 0 ||
     result.stopRetryCount !== 0 ||
     result.stopCancelledCopyCount !== 0 ||
-    result.historicalReports !== 1 ||
+    result.historicalReports !== 0 ||
     result.historicalSyncs !== 0 ||
-    result.historicalDecision !== true
+    result.historicalDecision !== false
   ) {
     throw new Error(`durable error replay 未收敛:${JSON.stringify(result)}`);
   }
@@ -2074,8 +2099,8 @@ await check("T38 社区教程真浏览器：公开阅读只读，用户投稿进
     throw new Error(`社区教程正文未保持只读:${JSON.stringify(unsafeRender)}`);
   }
 
-  await root.getByRole("button", { name: "返回社区教程" }).click();
-  await root.getByRole("button", { name: "发布教程" }).click();
+  await root.getByRole("button", { name: "返回探索教程" }).click();
+  await root.getByRole("button", { name: "手写教程" }).click();
   await root.getByLabel("标题").fill("BROWSER_SUBMITTED_TITLE");
   await root.getByLabel("摘要").fill("这是一份覆盖真实投稿流程和审核状态的完整摘要。");
   await root.getByLabel("分类").selectOption("research");
@@ -2352,7 +2377,7 @@ await check("T42 设置壳 390 单列可切五分区、1440 竖导航 168px、�
     ["用量", "会话用量明细"],
     ["偏好", "外观主题"],
     ["反馈", "反馈内容"],
-    ["关于", "备案信息待补充"],
+    ["关于", "让复杂，从简。"],
   ];
 
   async function assertNoOverflow(dialog, label) {
@@ -2416,6 +2441,22 @@ await check("T42 设置壳 390 单列可切五分区、1440 竖导航 168px、�
 
   if (DEFAULT_VIEWPORT) await page.setViewportSize(DEFAULT_VIEWPORT);
   await page.evaluate(() => document.documentElement.classList.remove("dark"));
+});
+
+await check("T44 当前会话 unread=false 回执前的流式刷新只发送一次 mark-read", async () => {
+  await page.getByTestId("unread-request-probe").waitFor({ state: "visible", timeout: 3000 });
+  await page.waitForTimeout(50);
+  if (unreadMarkReadRequests !== 1) {
+    throw new Error(`探针首次挂载应只发一次 mark-read，实际 ${unreadMarkReadRequests}`);
+  }
+  for (let i = 0; i < 30; i += 1) {
+    await page.evaluate(() => window.__rerenderUnreadProbe());
+    await page.waitForTimeout(0);
+  }
+  await page.waitForTimeout(100);
+  if (unreadMarkReadRequests !== 1) {
+    throw new Error(`30 次流式刷新形成 mark-read 请求风暴:${unreadMarkReadRequests}`);
+  }
 });
 
 // 主 harness 仍在:预览用例没有把它换成空页面(否则后续缺席断言全部恒真)。

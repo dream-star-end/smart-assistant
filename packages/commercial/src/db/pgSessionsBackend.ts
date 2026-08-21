@@ -6965,14 +6965,38 @@ export async function commitVisibleLosslessTurnPhaseA(
       throw new Error("lossless turn tape target session row malformed");
     }
     const stubRecord = { id: billingAnchorId, role: "assistant" as const, ts: head.ts, text: head.text };
-    const anchors = [{
-      ...tapeAnchor(stubRecord as never, request.tapeId, request.tapeSha256, 1, 1, undefined, []),
-      text: head.text,
-    }];
-    const recordIds = new Set([billingAnchorId]);
-    existingMessages = existingMessages.filter(
-      (message) => typeof message?.id !== "string" || !recordIds.has(message.id),
+    const conflictingAnchor = existingMessages.find(
+      (message) =>
+        message?.id === billingAnchorId &&
+        typeof message._turnTapeId === "string" &&
+        message._turnTapeId !== request.tapeId,
     );
+    let anchors: (MessageLike & { id: string })[];
+    if (conflictingAnchor) {
+      // A content-only recovery deliberately reuses the crashed source billing
+      // anchor. Phase A must not delete that source before Phase B verifies the
+      // recovery link and transfers its billing ownership atomically.
+      const recoveryLink = await readTurnTapeRecoveryLink(
+        client,
+        request.sessionId,
+        userId,
+        request.tapeId,
+        true,
+      );
+      if (!recoveryLink || recoveryLink.source_tape_id !== conflictingAnchor._turnTapeId) {
+        throw new Error("lossless turn tape visible anchor is owned by another tape");
+      }
+      anchors = [];
+    } else {
+      anchors = [{
+        ...tapeAnchor(stubRecord as never, request.tapeId, request.tapeSha256, 1, 1, undefined, []),
+        text: head.text,
+      }];
+      const recordIds = new Set([billingAnchorId]);
+      existingMessages = existingMessages.filter(
+        (message) => typeof message?.id !== "string" || !recordIds.has(message.id),
+      );
+    }
     const plan = planAppendServerAuthoredBatch(
       existingMessages,
       anchors,
@@ -9618,7 +9642,8 @@ export function createPgSessionsBackend(
           `SELECT cs.id, cs.agent_id, cs.title, cs.pinned, cs.created_at, cs.last_at, cs.updated_at,
                   cs.message_count AS msg_count, cs.model_id, cs.project_id, cs.archived_at,
                   CASE WHEN octet_length(cs.messages) > ${SESSION_SEARCH_JSON_EXPAND_MAX_BYTES}
-                            OR left(COALESCE(cs.messages, ''), 1) <> '[' THEN NULL
+                            OR left(COALESCE(cs.messages, ''), 1) <> '['
+                            OR position((chr(92) || 'u0000') in cs.messages) > 0 THEN NULL
                        ELSE (
                          SELECT LEFT(txt, 240)
                            FROM (
@@ -10335,16 +10360,20 @@ export function createPgSessionsBackend(
                   LEFT(COALESCE(elem->>'text', ''), 400) AS msg_text
              FROM text_hits c
              CROSS JOIN LATERAL json_array_elements(
-               CASE WHEN left(c.messages, 1) = '[' THEN c.messages::json ELSE '[]'::json END
+               CASE WHEN left(c.messages, 1) = '['
+                          AND position((chr(92) || 'u0000') in c.messages) = 0
+                    THEN c.messages::json ELSE '[]'::json END
              ) elem
             WHERE c.msg_bytes <= $4
+              AND position((chr(92) || 'u0000') in c.messages) = 0
               AND elem->>'text' ILIKE $2 ESCAPE '\\'
            UNION ALL
            SELECT c.id, c.title, c.project_id,
                   c.last_at::text AS matched_at,
                   substring(c.messages FROM GREATEST(1, strpos(lower(c.messages), lower($5)) - 80) FOR 400) AS msg_text
              FROM text_hits c
-            WHERE c.msg_bytes > $4`,
+            WHERE c.msg_bytes > $4
+               OR position((chr(92) || 'u0000') in c.messages) > 0`,
           [userId, like, candMax, expandMax, q],
         )
       ).rows;
@@ -10371,16 +10400,20 @@ export function createPgSessionsBackend(
                   LEFT(COALESCE(elem->>'text', ''), 400) AS msg_text
              FROM text_hits c
              CROSS JOIN LATERAL json_array_elements(
-               CASE WHEN left(c.messages, 1) = '[' THEN c.messages::json ELSE '[]'::json END
+               CASE WHEN left(c.messages, 1) = '['
+                          AND position((chr(92) || 'u0000') in c.messages) = 0
+                    THEN c.messages::json ELSE '[]'::json END
              ) elem
             WHERE c.msg_bytes <= $4
+              AND position((chr(92) || 'u0000') in c.messages) = 0
               AND elem->>'text' ILIKE $2 ESCAPE '\\'
            UNION ALL
            SELECT c.id, c.title, c.project_id,
                   c.last_at::text AS matched_at,
                   substring(c.messages FROM GREATEST(1, strpos(lower(c.messages), lower($5)) - 80) FOR 400) AS msg_text
              FROM text_hits c
-            WHERE c.msg_bytes > $4`,
+            WHERE c.msg_bytes > $4
+               OR position((chr(92) || 'u0000') in c.messages) > 0`,
           [userId, like, candMax, expandMax, q],
         )
       ).rows;

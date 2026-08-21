@@ -10,7 +10,6 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, test } from 'node:test'
 import { existsSync, readFileSync } from 'node:fs'
-import { DatabaseSync } from 'node:sqlite'
 
 const WRAPPER = path.resolve(
   process.cwd(),
@@ -586,8 +585,14 @@ process.stdout.write(JSON.stringify({ sessionId: 'sess_shared', response: 'ok', 
 
   test(
     'real CLI 0.16.3 --resume reads sqlite from ZCODE_SESSION_DB_PATH across two ephemeral HOMEs',
-    { skip: !existsSync(REAL_ZCODE_CJS) || !existsSync(REAL_NODE) },
+    {
+      skip:
+        Number.parseInt(process.versions.node.split('.')[0] ?? '0', 10) < 22 ||
+        !existsSync(REAL_ZCODE_CJS) ||
+        !existsSync(REAL_NODE),
+    },
     async () => {
+      const { DatabaseSync } = await import('node:sqlite')
       const dir = await mkdtemp(path.join(tmpdir(), 'oc-zcode-real-sqlite-'))
       const home1 = path.join(dir, 'home1')
       const home2 = path.join(dir, 'home2')

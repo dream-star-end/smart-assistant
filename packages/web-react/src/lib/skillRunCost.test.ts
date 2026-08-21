@@ -7,9 +7,9 @@ import {
   ratesFromPublicModel,
 } from "./skillRunCost";
 
-const PRO = {
-  id: "deepseek-v4-pro",
-  display_name: "DeepSeek V4 Pro (1M)",
+const FLASH = {
+  id: "deepseek-v4-flash",
+  display_name: "DeepSeek V4 Flash (1M)",
   input_per_ktok_credits: "0.006280",
   output_per_ktok_credits: "0.012540",
   cache_read_per_ktok_credits: "0.000060",
@@ -19,9 +19,9 @@ const PRO = {
 
 describe("ratesFromPublicModel", () => {
   it("parses string rates (already multiplier-applied) and rejects garbage", () => {
-    const r = ratesFromPublicModel(PRO);
+    const r = ratesFromPublicModel(FLASH);
     expect(r?.inputPerKtok).toBeCloseTo(0.00628);
-    expect(r?.displayName).toBe("DeepSeek V4 Pro (1M)");
+    expect(r?.displayName).toBe("DeepSeek V4 Flash (1M)");
     expect(ratesFromPublicModel({ id: "x" })).toBeNull();
     expect(ratesFromPublicModel(undefined)).toBeNull();
   });
@@ -29,7 +29,7 @@ describe("ratesFromPublicModel", () => {
 
 describe("creditsForUsage", () => {
   it("matches the billing formula Σ tokens/1000 × per_ktok", () => {
-    const r = ratesFromPublicModel(PRO);
+    const r = ratesFromPublicModel(FLASH);
     if (!r) throw new Error("rates");
     const credits = creditsForUsage(
       { inputTokens: 100_000, outputTokens: 10_000, cacheReadTokens: 50_000, cacheCreationTokens: 0 },
@@ -42,7 +42,7 @@ describe("creditsForUsage", () => {
 
 describe("estimateEvalRunCredits", () => {
   it("scales with case count and returns a low<high range", () => {
-    const r = ratesFromPublicModel(PRO);
+    const r = ratesFromPublicModel(FLASH);
     if (!r) throw new Error("rates");
     const one = estimateEvalRunCredits(1, 2, r);
     const three = estimateEvalRunCredits(3, 2, r);

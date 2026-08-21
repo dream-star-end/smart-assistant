@@ -39,7 +39,7 @@ const REQUIRE_TEST_DB = process.env.CI === 'true' || process.env.REQUIRE_TEST_DB
 let pgAvailable = false
 
 const listPublicModels = () => [
-  { id: 'deepseek-v4-pro' },
+  { id: 'deepseek-v4-flash' },
   { id: 'MiniMax-M3' },
   { id: 'glm-5.2' },
   { id: 'glm-5.3' },
@@ -56,7 +56,7 @@ async function seedLegacyAgent(slug: string, owner: number): Promise<void> {
     description: `${slug} legacy`,
     tags: ['科研'],
     version: '1.0.0',
-    model: 'deepseek-v4-pro',
+    model: 'deepseek-v4-flash',
     toolsets: ['core', 'research'],
     skillDeps: [],
     persona: `你是 ${slug}(旧版)。`,
@@ -341,7 +341,7 @@ describe('seedPlatformResearchAgents (integ)', () => {
   test('model 不在 public 集 → 该 agent 报错跳过(不污染目录)', async (t) => {
     if (skip(t)) return
     await createAdmin('admin@x.com')
-    // 不提供 deepseek-v4-pro → 科研助手的 model 不在白名单。
+    // 不提供 deepseek-v4-flash → 科研助手的 model 不在白名单。
     const r = await seedPlatformResearchAgents({
       listPublicModels: () => [{ id: 'glm-5.2' }],
     })

@@ -1420,7 +1420,7 @@ export async function registerCommercial(
 
   // 2026-07-07 MAJOR-1 — host 静态 provider 平台直连 key seam。
   // host 平台 agent(main)的合成首帧(cron/webhook/task/inter-agent/openai-compat)解析到
-  // 非 codex 静态模型(默认 deepseek-v4-pro)后,host CCB 子进程需平台静态 key 直连上游
+  // 非 codex 静态模型(默认 deepseek-v4-flash)后,host CCB 子进程需平台静态 key 直连上游
   // (见 gateway/hostStaticProviders + subprocessRunner 注入点)。个人版不 import commercial →
   // seam 恒 null = 整块 no-op,settings.json 继续掌权。与 setModelHintProvider 同注册/清理生命周期。
   setHostStaticProviderKeys(buildHostStaticProviderKeys(cfg));
@@ -5869,7 +5869,7 @@ export async function registerCommercial(
     });
   }
 
-  // 市场发布 AI 自动审批 worker(deepseek-v4-pro)。仅 v5 启动:marketplace 表 v3/v5 共享
+  // 市场发布 AI 自动审批 worker(deepseek-v4-flash)。仅 v5 启动:marketplace 表 v3/v5 共享
   // 无 channel 列,但 v3 跑旧代码不写 ai_review_state → 恒 NULL → 永不被 claim,故 v3 保持
   // 纯人审、零行为变更。domain 'v5-owned'(v5 合法后台职责;写共享 marketplace 表但由
   // FOR UPDATE SKIP LOCKED 协调,v3 不参与)。关停:OC_MARKETPLACE_AI_REVIEW_DISABLED=1。

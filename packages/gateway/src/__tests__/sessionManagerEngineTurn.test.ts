@@ -27,8 +27,22 @@ import {
   type V3MasterSinkPayload,
 } from "../v3MasterSink.js";
 import type { OpenClaudeConfig } from "@openclaude/storage";
-import type { ToolCalledEvent } from "@openclaude/protocol";
+import type { ToolCalledEvent, TurnCompletedEvent } from "@openclaude/protocol";
 import { eventBus } from "../eventBus.js";
+
+function collectTurnCompleted(): { events: TurnCompletedEvent[]; stop: () => void } {
+  const events: TurnCompletedEvent[] = [];
+  const listener = (ev: TurnCompletedEvent) => {
+    events.push(ev);
+  };
+  eventBus.on("turn.completed", listener);
+  return {
+    events,
+    stop: () => {
+      eventBus.off("turn.completed", listener);
+    },
+  };
+}
 
 function makeConfigStub(): OpenClaudeConfig {
   return {
@@ -1312,6 +1326,7 @@ describe("crash/interrupt partial persistence", () => {
 
   test("crash(code!=0)→ 部分 text/thinking/tools/segments 以 status='crashed' 落 sink", async () => {
     const captured = makeCapturingSink();
+    const usageBag = collectTurnCompleted();
     setV3MasterSinkSingleton(captured.sink);
     try {
       const sm = new SessionManager(makeConfigStub());
@@ -1452,13 +1467,19 @@ describe("crash/interrupt partial persistence", () => {
       );
       // flush promise 已注册进 pending-persistence 并排空
       await sm.awaitPendingPersistence();
+      assert.equal(usageBag.events.length, 1, "crash path must emit exactly one usage event");
+      assert.equal(usageBag.events[0]!.terminalStatus, "crashed");
+      assert.equal(usageBag.events[0]!.turnIndex, 1);
+      assert.ok((usageBag.events[0]!.durationMs ?? 0) >= 0);
     } finally {
+      usageBag.stop();
       setV3MasterSinkSingleton(null);
     }
   });
 
   test("interrupt(SIGTERM)→ SERVICE_RESTART waived yellow, not RUNNER_CRASHED red", async () => {
     const captured = makeCapturingSink();
+    const usageBag = collectTurnCompleted();
     setV3MasterSinkSingleton(captured.sink);
     try {
       const sm = new SessionManager(makeConfigStub());
@@ -1482,7 +1503,10 @@ describe("crash/interrupt partial persistence", () => {
       assert.equal(captured.payloads[0].waiveReason, "no_response");
       assert.equal(captured.payloads[0].text, "stopped midway");
       assert.ok(events.some((e) => e.kind === "error" && e.error.includes("SIGTERM")));
+      assert.equal(usageBag.events.length, 1, "interrupt path must emit exactly one usage event");
+      assert.equal(usageBag.events[0]!.terminalStatus, "aborted");
     } finally {
+      usageBag.stop();
       setV3MasterSinkSingleton(null);
     }
   });
@@ -1543,8 +1567,35 @@ describe("crash/interrupt partial persistence", () => {
     }
   });
 
+  test("normal result emits exactly one turn.completed with terminalStatus=completed", async () => {
+    const usageBag = collectTurnCompleted();
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const events: SessionStreamEvent[] = [];
+      const runner = new FakeCcbRunner((r) => {
+        setImmediate(() => {
+          r.text("hello");
+          r.result({
+            usage: { input_tokens: 2, output_tokens: 1 },
+            total_cost_usd: 0.01,
+          });
+        });
+      });
+      const session = makeSession(runner);
+      await runOneTurn(sm, session, events);
+      assert.equal(usageBag.events.length, 1, "completed path must emit exactly one usage event");
+      assert.equal(usageBag.events[0]!.terminalStatus, "completed");
+      assert.equal(usageBag.events[0]!.turnIndex, 1);
+      assert.equal(usageBag.events[0]!.usage.inputTokens, 2);
+      assert.equal(usageBag.events[0]!.usage.outputTokens, 1);
+    } finally {
+      usageBag.stop();
+    }
+  });
+
   test("browser Stop uses one engine-confirmed USER_CANCELLED terminal tape", async () => {
     const captured = makeCapturingSink();
+    const usageBag = collectTurnCompleted();
     setV3MasterSinkSingleton(captured.sink);
     try {
       const sm = new SessionManager(makeConfigStub());
@@ -1629,7 +1680,11 @@ describe("crash/interrupt partial persistence", () => {
         }).length,
         1,
       );
+      assert.equal(usageBag.events.length, 1, "Stop path must emit exactly one usage event");
+      assert.equal(usageBag.events[0]!.terminalStatus, "stopped");
+
     } finally {
+      usageBag.stop();
       setV3MasterSinkSingleton(null);
     }
   });

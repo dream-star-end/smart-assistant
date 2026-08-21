@@ -77,7 +77,7 @@ before(async () => {
   await adminExec(`CREATE DATABASE ${MY_DB} TEMPLATE template0`);
 
   await resetPool();
-  setPoolOverride(createPool({ connectionString: MY_URL, max: 10 }));
+  setPoolOverride(createPool({ connectionString: MY_URL, max: 10, statementTimeoutMs: 120_000 }));
   await runMigrations();
 });
 

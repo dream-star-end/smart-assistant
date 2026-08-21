@@ -39,7 +39,7 @@ EOF
 # it inside an `|| true` cleanup path.
 for required_tool in /usr/bin/sudo /usr/bin/test /bin/cat /bin/ls \
   /usr/bin/mktemp /bin/rm /bin/sleep /usr/bin/setsid /usr/bin/stat \
-  /usr/bin/id /bin/mkdir /bin/cp /bin/chmod /bin/date /bin/ln; do
+  /usr/bin/id /bin/mkdir /bin/cp /bin/chmod /bin/mv /bin/date /bin/ln; do
   [ -x "$required_tool" ] || die "runtime image is missing $required_tool"
 done
 
@@ -422,6 +422,39 @@ if [ -n "$resume_id" ]; then
   [ "$chats_linked" -eq 1 ] || die "Cursor resume requires durable chats directory"
 fi
 unset OPENCLAUDE_CURSOR_RESUME_ID
+# Optional platform efficiency hooks.json. Fail-open: a bad/missing hooks
+# file must never take down the Cursor session.
+hooks_json=${OPENCLAUDE_CURSOR_HOOKS_JSON:-}
+if [ -n "$hooks_json" ]; then
+  hooks_ok=0
+  case "$hooks_json" in /*) hooks_ok=1 ;; esac
+  if [ "$hooks_ok" -eq 1 ] && [ ! -L "$hooks_json" ] && [ -f "$hooks_json" ]; then
+    hooks_uid=$(/usr/bin/stat -c %u -- "$hooks_json" 2>/dev/null || echo "")
+    current_uid=$(/usr/bin/id -u 2>/dev/null || echo "")
+    hooks_mode=$(/usr/bin/stat -c %a -- "$hooks_json" 2>/dev/null || echo "")
+    if [ -n "$hooks_uid" ] && [ "$hooks_uid" = "$current_uid" ] && [ "$hooks_mode" = "600" ]; then
+      /bin/mkdir -m 700 -- "$cursor_home/.cursor" 2>/dev/null || true
+      if [ -d "$cursor_home/.cursor" ]; then
+        hooks_tmp="$cursor_home/.cursor/hooks.json.tmp"
+        if /bin/cp -- "$hooks_json" "$hooks_tmp" \
+          && /bin/chmod 600 -- "$hooks_tmp" \
+          && /bin/mv -f -- "$hooks_tmp" "$cursor_home/.cursor/hooks.json"; then
+          :
+        else
+          /bin/rm -f -- "$hooks_tmp" 2>/dev/null || true
+          echo "[oc-efficiency-guard] fail-open: hooks.json install failed" >&2
+        fi
+      else
+        echo "[oc-efficiency-guard] fail-open: cannot create Cursor config dir" >&2
+      fi
+    else
+      echo "[oc-efficiency-guard] fail-open: hooks.json rejected (uid/mode)" >&2
+    fi
+  else
+    echo "[oc-efficiency-guard] fail-open: hooks.json missing or not a regular file" >&2
+  fi
+fi
+unset OPENCLAUDE_CURSOR_HOOKS_JSON
 
 prompt=$1
 shift

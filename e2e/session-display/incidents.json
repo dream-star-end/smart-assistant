@@ -1150,6 +1150,7 @@
       "rootFixCommit": "6d2c930c",
       "coverageCommits": [
         "bab6c8c6",
+        "d8b81aae",
         "54014c3d",
         "d76aae91"
       ],
@@ -1526,6 +1527,30 @@
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/cursorAdapter.test.ts",
           "assertion": "Stop racing a turn that has not spawned yet stays bounded and leaves no child"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260821-SESSION-LIST-NUL-READ-STORM",
+      "occurredAt": "2026-08-21",
+      "severity": "P0",
+      "symptom": "同步版上线后，历史会话 messages 中合法 JSON escaped NUL 在 PostgreSQL 侧栏预览提取时触发 unsupported Unicode escape sequence，导致该用户 /api/sessions/list 持续 500；同时当前会话的 unread 投影尚未回落时，每次流式刷新都会重复 POST mark-read，形成请求风暴，前端表现为空白及连接中/已断开反复切换。",
+      "rootFixCommit": "c04a6e14",
+      "regressions": [
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
+          "assertion": "list/search 遇到 JSON 字符串内 escaped NUL 时按单行降级，不拖垮整个侧栏"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/hooks/useUnreadSessions.test.ts",
+          "assertion": "当前会话在 unread=false 回执前重复刷新只发一次 mark-read"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T44 当前会话 unread=false 回执前的流式刷新只发送一次 mark-read"
         }
       ]
     }

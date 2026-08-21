@@ -23,6 +23,10 @@
 #   scripts/deploy-v5.sh --with-dist --defer-knowledge-planet-upgrade
 #                                  # 一次性先上线知识星球扫码 UI；保留旧 v1.0 执行 pin，扫码后再走正常升级
 #   scripts/deploy-v5.sh --smoke       # 仅跑 v5 健康/隔离断言
+#   scripts/deploy-v5.sh --hot-config  # 安全带:打印 v5-change-route 后拒绝部署(allow 为空,走写 lane=绿灯空发布)
+#   scripts/v5-change-route.sh         # 改动路由顾问:输入变更集,输出该走哪条 lane
+#                                  # 只接受 catalog/env/文案;TS/JS/schema/迁移直接拒绝。绕过必须
+#                                  # --hot-config-force + OC_V5_HOT_CONFIG_FORCE_REASON(写审计日志)。
 #   scripts/deploy-v5.sh --dist        # 仅前端生效面:vite build + 竞态安全 rsync + 资产GC + restart + 版本握手 smoke
 #   scripts/deploy-v5.sh --census-ccb-baseline  # 只读统计缺 baseline mount 的 V5 容器
 #   scripts/deploy-v5.sh --remount-ccb-baseline # 持部署锁，逐个 drain/reprovision 后复验
@@ -151,6 +155,10 @@ RELEASE_QUEUE_SCRIPT="$SCRIPT_DIR/v5-release-queue.sh"
   echo "FATAL: 缺或不可执行的 V5 release queue: $RELEASE_QUEUE_SCRIPT" >&2
   exit 1
 }
+HOT_CONFIG_LIB="$SCRIPT_DIR/v5-hot-config-lib.sh"
+[ -f "$HOT_CONFIG_LIB" ] || { echo "FATAL: 缺 hot-config lib: $HOT_CONFIG_LIB" >&2; exit 1; }
+# shellcheck source=scripts/v5-hot-config-lib.sh
+source "$HOT_CONFIG_LIB"
 DEPLOY_SURFACE_CHECK="$SCRIPT_DIR/v5-deploy-surface-check.mjs"
 [ -x "$DEPLOY_SURFACE_CHECK" ] || {
   echo "FATAL: 缺或不可执行的 V5 deploy surface check: $DEPLOY_SURFACE_CHECK" >&2
@@ -223,7 +231,7 @@ assert_overrides_no_remove_keys() {
   [ "$bad" = 0 ] || exit 1
 }
 
-DRY=0; MODE="deploy"; ROLLBACK_N=1; RESTART_EGRESS=0; WITH_DIST=0; ALLOW_UNVERIFIED_CI=0
+DRY=0; MODE="deploy"; ROLLBACK_N=1; RESTART_EGRESS=0; WITH_DIST=0; ALLOW_UNVERIFIED_CI=0; HOT_CONFIG=0; HOT_CONFIG_FORCE=0
 DEFER_KNOWLEDGE_PLANET_UPGRADE=0
 KNOWLEDGE_PLANET_VERIFY_USER=""
 CUTOVER_NONCE=""; CUTOVER_TARGET_IMAGE=""
@@ -250,6 +258,8 @@ for arg in "$@"; do
     --dry-run) DRY=1 ;;
     # 代码+前端两生效面合并为一次重启(见 deploy() 内注释,2026-07-10 成对重启事故)
     --with-dist) WITH_DIST=1 ;;
+    --hot-config) HOT_CONFIG=1 ;;
+    --hot-config-force) HOT_CONFIG=1; HOT_CONFIG_FORCE=1 ;;
     # 一次性 setup-first lane：仅把扫码实时感知/加密持久化先上线，DB 继续钉旧
     # Knowledge Planet v1.0。用户扫码后，正常 deploy 再消费同一账号升级到 v1.1。
     --defer-knowledge-planet-upgrade) DEFER_KNOWLEDGE_PLANET_UPGRADE=1 ;;
@@ -352,6 +362,31 @@ fi
 if [[ "$DEFER_KNOWLEDGE_PLANET_UPGRADE" == 1 \
       && ( "$MODE" != "deploy" || "$WITH_DIST" != 1 ) ]]; then
   echo "✗ --defer-knowledge-planet-upgrade 仅允许与普通 deploy + --with-dist 同用" >&2
+  exit 2
+fi
+if [[ "$HOT_CONFIG" == 1 ]]; then
+  [[ "$MODE" == "deploy" ]] || {
+    echo "✗ --hot-config 只允许普通 deploy lane(不要和 --canary/--dist/--smoke 叠用)" >&2
+    exit 2
+  }
+  [[ "$WITH_DIST" != 1 ]] || {
+    echo "✗ --hot-config 与 --with-dist 互斥:热配置路径明确不重建 dist。若要同时看路由,请跑 scripts/v5-change-route.sh" >&2
+    exit 2
+  }
+  [[ "$DEFER_KNOWLEDGE_PLANET_UPGRADE" != 1 ]] || {
+    echo "✗ --hot-config 不能与 --defer-knowledge-planet-upgrade 同用" >&2
+    exit 2
+  }
+  # 安全带:allow 集为空。打印改动路由后拒绝部署,避免绿灯空发布。
+  # 日常请直接跑 scripts/v5-change-route.sh;本旗标不会抢锁、不会 SSH。
+  if [[ "${V5_DEPLOY_SOURCE_ONLY:-0}" != 1 ]]; then
+    echo "── --hot-config 是安全带,不会部署。改动路由如下 ──"
+    bash "$SCRIPT_DIR/v5-change-route.sh" || true
+  fi
+  echo "✗ --hot-config 拒绝执行 deploy:当前没有任何已证明的热配置生效面。请走 scripts/v5-change-route.sh 给出的 lane。" >&2
+  if [[ "$HOT_CONFIG_FORCE" == 1 ]]; then
+    echo "✗ --hot-config-force 也不能把空发布变成真发布。紧急绕过只留在 v5-hot-config-lib.sh --check + 审计日志,deploy 入口不再走写 lane。" >&2
+  fi
   exit 2
 fi
 [[ -n "$CUTOVER_NONCE" && ! "$CUTOVER_NONCE" =~ ^[0-9a-f]{32}$ ]] && { echo "✗ cutover nonce 必须是 32 位小写 hex" >&2; exit 2; }
@@ -685,7 +720,17 @@ case "$shared_rc" in
   *) echo "FATAL: cannot inspect shared V5 env(rc=$shared_rc)" >&2; exit 1 ;;
 esac
 REMOTE
-  run_baseline_guard_remote check-dir "$expected" || return 1
+  if [[ "${ROLLBACK_LEGACY_BASELINE_OK:-0}" == 1 ]]; then
+    # Emergency/history rollback targets may predate the admin overlay files.
+    # Keep the live env/port fail-closed checks above, but validate the immutable
+    # target with the narrow legacy allowlist instead of the forward-only tree.
+    local live_release
+    live_release="$(bg_current_release "$src")"
+    [[ -n "$live_release" ]] || { echo "✗ legacy rollback live release 无法解析:$src" >&2; return 1; }
+    assert_legacy_release_baseline_security "$live_release" || return 1
+  else
+    run_baseline_guard_remote check-dir "$expected" || return 1
+  fi
   # V5 is local-only (deploy/v5/P1-PLAN.md). A loopback-only reservation blocks
   # the old wildcard BaselineServer bind across rollback and A/B canary masters.
   assert_v5_baseline_port_guard || {
@@ -2262,10 +2307,10 @@ REMOTE
 
 assert_no_deploy_recovery_marker() {
   [[ "$DRY" == 1 ]] && return 0
-  if ! ssh "$KL_HOST" "test ! -e '$DEPLOY_RECOVERY_MARKER'"; then
+  if [[ "$MODE" != "recover" ]] && ! ssh "$KL_HOST" "test ! -e '$DEPLOY_RECOVERY_MARKER'"; then
     echo "✗ 检测到未收敛的人工恢复标记:$KL_HOST:$DEPLOY_RECOVERY_MARKER" >&2
     ssh "$KL_HOST" "sed -n '1,20p' '$DEPLOY_RECOVERY_MARKER'" 2>/dev/null | sed 's/^/  /' >&2 || true
-    echo "  禁止任何新写 lane；先核对 deploy_state、A/B symlink/unit 与 runtime tuple，收敛后人工移除。" >&2
+    echo "  禁止任何新写 lane；先核对 deploy_state、A/B symlink/unit 与 runtime tuple，再走官方 --recover 收敛并清除。" >&2
     return 1
   fi
   if ! ssh "$KL_HOST" "test ! -e '$MUTATION_LANE_INFLIGHT_MARKER'"; then
@@ -2274,6 +2319,20 @@ assert_no_deploy_recovery_marker() {
     echo "  上次 lane 可能因 lease/parent 丢失被 crash-stop；禁止自动补偿或新写。先核对 deploy_state、symlink/unit/runtime 后人工移除。" >&2
     return 1
   fi
+}
+
+
+clear_deploy_recovery_marker_after_stable_recover() {
+  [[ "$MODE" == "recover" ]] || return 2
+  require_mutation_lease_for_compensation "stable-recover-marker-clear" || return 86
+  ssh "$KL_HOST" "set -e
+    marker='$DEPLOY_RECOVERY_MARKER'
+    if [ -e \"\$marker\" ]; then
+      rm -f -- \"\$marker\"
+      python3 -c 'import os; d=os.open(\"$RELEASES_ROOT\",os.O_RDONLY); os.fsync(d); os.close(d)'
+    fi
+    test ! -e \"\$marker\"
+  "
 }
 
 # ═══════════════ durable gate waiver:门禁豁免 = 一次性可记账债务 ═══════════════
@@ -3192,7 +3251,7 @@ build_release() {
   # 都从 staging 读。
   if [[ "$WITH_DIST" == 1 ]]; then
     echo "── web official build @ staging(pinned $short_sha,不读共用工作树)──" >&2
-    if ! ssh "$KL_HOST" "set -e; cd '$staging' && npm run build --workspace packages/web-react >/dev/null 2>&1"; then
+    if ! ssh "$KL_HOST" "set -e; cd '$staging' && VITE_TASKBOARD_ENABLED=0 npm run build --workspace packages/web-react >/dev/null 2>&1"; then
       echo "✗ staging web official build 失败" >&2; ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1; fi
   else
     if ! ssh "$KL_HOST" "set -e
@@ -5585,7 +5644,7 @@ snapshot_and_sync_source() {
 DIST_BUILD_ID=""
 build_and_sync_dist() {
   echo "── web official build(tsc + vite) ──"
-  run "(cd '$REPO_ROOT' && npm run build --workspace packages/web-react)"
+  run "(cd '$REPO_ROOT' && VITE_TASKBOARD_ENABLED=0 npm run build --workspace packages/web-react)"
   local dist="$REPO_ROOT/packages/web-react/dist"
   if [[ "$DRY" != 1 ]]; then
     DIST_BUILD_ID="$(grep -o 'name="oc-build" content="[0-9a-f]\{8,32\}"' "$dist/index.html" | grep -o '[0-9a-f]\{8,32\}' | head -1)"
@@ -5686,8 +5745,8 @@ smoke() {
   #     分别收敛生图旅程与临时 GitHub workspace；只允许 v5 leader 启动。
   #   sessionsGcSweep(P2 会话权威迁 PG:usage 聚合 pending/map 老化 GC,advisory lease fencing,
   #     仅 OC_SESSIONS_STORE=pg 时启动——白名单允许≠必然存在。RFC-v5-sessions-pg D3)
-  allowed="subscriptionRollover accountSlotReaper researchJobs codexRefresh codexDriftReconciler marketplaceAiReview providerHealth sessionsGcSweep incidentSnapshot"
-  allowed="$allowed idleSweep volumeGc orphanReconcile migrationReconcile healthPoller containerEvents alert refreshEventsSweep auditRetentionSweep imageUsageSweep cooldownRecovery pendingOrdersExpirer finalizeReconciler turnDispatchReconciler onboarding inboxEmail cronWake incidentReconciler incidentSweeper connectorSweeper knowledgePlanetAutomation githubWorkspaceSweeper wecomAlert userNoticeApproval mediaGeneration"
+  allowed="subscriptionRollover accountSlotReaper researchJobs codexRefresh codexDriftReconciler marketplaceAiReview providerHealth sessionsGcSweep incidentSnapshot cursorAuthSync"
+  allowed="$allowed idleSweep volumeGc orphanReconcile migrationReconcile healthPoller containerEvents alert refreshEventsSweep auditRetentionSweep imageUsageSweep cooldownRecovery pendingOrdersExpirer finalizeReconciler liveFrameMaintenance tapeJobScheduler turnDispatchReconciler onboarding inboxEmail cronWake incidentReconciler incidentSweeper connectorSweeper knowledgePlanetAutomation githubWorkspaceSweeper wecomAlert userNoticeApproval mediaGeneration"
   bad=""
   IFS=',' read -ra _sarr <<<"$scheds"
   for s in "${_sarr[@]}"; do
@@ -6739,6 +6798,10 @@ activate_egress_release() {
 # ───────────────────────── deploy:增量 ─────────────────────────
 deploy() {
   echo "══ v5 deploy on $KL_HOST(蓝绿:release 目录 + 原子 symlink)══"
+  if [[ "$HOT_CONFIG" == 1 ]]; then
+    echo "── hot-config lane:不重建 dist,健康门按 deploy_state.active_slot 推导 ──"
+    assert_hot_config_changeset || exit 2
+  fi
   echo "── 守卫:overrides 不得含 REMOVE_KEYS ──"
   assert_overrides_no_remove_keys
   # MAJOR 3:cohort rollout 进行中(phase≠stable)拒绝传统 deploy(状态机外入口封死)。
@@ -6944,7 +7007,7 @@ deploy() {
     && ! minimum_functional_core deploy "$BUILT_RELEASE" "$ACTIVE_PORT"; then
     validation_failure="minimum functional core failed(双引擎真 turn / J1-J5 用户旅程)"
   fi
-  if [[ -z "$validation_failure" && "$WITH_DIST" == 1 ]] \
+  if [[ -z "$validation_failure" && ( "$WITH_DIST" == 1 || "$HOT_CONFIG" == 1 ) ]] \
     && ! dist_handshake_smoke "$ACTIVE_PORT"; then
     validation_failure="frontend build handshake failed"
   fi
@@ -7373,7 +7436,7 @@ rollback() {
     rollback_runtime_tuple "$ROLLBACK_N" 1 "$kp_rollback_helper" \
       || { echo "✗ tuple 回滚失败(saga 已自动恢复现场)" >&2; exit 1; }
     kp_rollback_target="$(bg_current_release "$ACTIVE_SRC")"
-    if [[ -z "$kp_rollback_target" ]] || ! smoke "$ACTIVE_PORT"; then
+    if [[ -z "$kp_rollback_target" ]] || ! ROLLBACK_LEGACY_BASELINE_OK=1 smoke "$ACTIVE_PORT"; then
       # F7:反向补偿(恢复回滚前 tuple)前 复核 lease;失活则 crash-stop。
       require_mutation_lease_for_compensation "rollback-compensation" || exit 86
       if rollback_runtime_tuple 1 1 "$kp_rollback_helper" && smoke "$ACTIVE_PORT"; then
@@ -7640,7 +7703,9 @@ rollback_runtime_tuple() {
   ssh "$KL_HOST" "test -d '$master'" || { echo "✗ 目标 master release 目录不存在(可能已被 GC): $master" >&2; return 1; }
   assert_release_marker "$master" || return 1
   assert_release_required_migrations "$master" || return 1
-  assert_release_baseline_security "$master" || return 1
+  # History predecessors may predate admin prompt variants and the
+  # cursor/taskboard baseline skills. Forward targets remain strict.
+  assert_legacy_release_baseline_security "$master" || return 1
   assert_web_storage_rollback_transition \
     "$prev_src" "${ACTIVE_STATE_PREVIOUS_RELEASE:-}" "$master" \
     "tuple rollback exact target" || return 1
@@ -9396,8 +9461,14 @@ recover() {
   fi
   case "$p" in
     stable)
-      echo "  · phase=stable:检查是否有 master 已提交但 egress 尚待激活的 durable transition。"
-      finalize_ready_egress_transition ;;
+      finalize_ready_egress_transition || return 1
+      if [[ "$DRY" == 1 ]]; then
+        echo "  [dry-run] full stable smoke then fsync-clear manual recovery marker"
+      else
+        resolve_active_lane
+        smoke "$ACTIVE_PORT" || return 1
+        clear_deploy_recovery_marker_after_stable_recover
+      fi ;;
     canary)
       if [[ "$s" -lt "$DS_STEP_CANARY_READY" ]]; then
         echo "  · canary<READY(准备期,candidate 对流量不可见)→ §8:stop/清本 operation 产物 → 回 stable(零影响)"
