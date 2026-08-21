@@ -27,6 +27,8 @@ export type VisibleHead = {
   clientMessageId?: string;
   errorCode?: string | null;
   truncated?: boolean;
+  /** Text was recovered from live frames / prepared tape, not settlement. */
+  partial?: boolean;
 };
 
 export function recordsPublished(input: {
@@ -125,8 +127,11 @@ export function phaseAVisibleHeadText(input: {
   settlementText?: string;
   liveFrameText?: string;
 }): string {
-  const raw = input.hasSettlement ? (input.settlementText ?? "") : (input.liveFrameText ?? "");
-  return clipVisibleText(raw).text;
+  const settlementText = input.settlementText ?? "";
+  if (input.hasSettlement && settlementText.length > 0) {
+    return clipVisibleText(settlementText).text;
+  }
+  return clipVisibleText(input.liveFrameText ?? "").text;
 }
 
 export function assertSettlementMatchesCanonical(input: {
@@ -232,6 +237,7 @@ export function classifyUnifiedTimelineIntegrityError(err: unknown): TapeDisplay
 export function pickTapeDisplayFallbackText(input: {
   visibleHead?: { text?: string | null } | null;
   anchorText?: unknown;
+  reason?: TapeDisplayDegradeReason;
 }): { text: string; source: "visible_head" | "anchor" | "placeholder" } {
   const head = typeof input.visibleHead?.text === "string" ? input.visibleHead.text : "";
   if (head.length > 0) return { text: head, source: "visible_head" };
@@ -239,7 +245,9 @@ export function pickTapeDisplayFallbackText(input: {
     return { text: input.anchorText, source: "anchor" };
   }
   return {
-    text: "此轮回复暂时无法完整展开（记录物化异常）。正文仍保留在会话权威可见头中，稍后会自动补齐过程卡片。",
+    text: input.reason === "records_unpublished"
+      ? "过程记录正在整理，稍后会自动补齐思考与工具卡片。"
+      : "此轮回复暂时无法完整展开（记录物化异常）。正文仍保留在会话权威可见头中，稍后会自动补齐过程卡片。",
     source: "placeholder",
   };
 }
