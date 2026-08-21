@@ -745,6 +745,22 @@ describe("pgSessionsBackend contract", () => {
     assert.equal("modelId" in none!, false);
   });
 
+  maybe("list/search 遇到 JSON 字符串内 escaped NUL 时按单行降级，不拖垮整个侧栏", async () => {
+    const sessionId = "s-escaped-nul";
+    await backend.upsertClientSession(mkSession({
+      id: sessionId,
+      messages: [{ id: "nul-1", role: "tool", text: "prefix\u0000needle", ts: 1 }],
+    }));
+
+    const listed = await backend.listClientSessions("u-1");
+    const meta = listed.sessions.find((session) => session.id === sessionId);
+    assert.ok(meta, "坏预览只能降级本行，不能让 /api/sessions/list 整体 500");
+    assert.equal(meta.lastMessagePreview, undefined);
+
+    const searched = await backend.searchClientSessions("u-1", { q: "needle" });
+    assert.ok(searched.results.some((result) => result.sessionId === sessionId));
+  });
+
   maybe("chat_projects CRUD + 删项目只解绑会话 + list 派生 runState", async () => {
     await backend.upsertClientSession(mkSession({ id: "s-proj-1" }));
     const created = await backend.createChatProject("u-1", { name: "  工作  ", color: "blue" });

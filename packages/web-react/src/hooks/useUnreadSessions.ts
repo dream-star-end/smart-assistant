@@ -179,6 +179,11 @@ export function useUnreadSessions(args: {
   }, [userId]);
 
   const markRead = useCallback((sessionId: string) => {
+    // Streaming/session-list refreshes can re-run the sessions effect many times
+    // before the server's unread=false projection comes back. One optimistic
+    // barrier must correspond to at most one in-flight POST, otherwise a long
+    // turn creates an unbounded /read request storm.
+    if (optimisticReadRef.current.has(sessionId)) return;
     optimisticReadRef.current.add(sessionId);
     optimisticUnreadRef.current.delete(sessionId);
     setUnreadIds((cur) => {
