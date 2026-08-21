@@ -393,6 +393,7 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
   private active: ZcodeTurnContext | null = null
   private nativeId: string | null
   private currentModel: string | undefined
+  private currentEffort: string | undefined
   private currentToolsets: string[] | undefined
   private target: ExecutionTarget = { kind: 'local' }
   private route: ZcodeRouteOverride | null = null
@@ -404,6 +405,7 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
     this.opts = { ...opts }
     this.nativeId = opts.resumeSessionId ?? null
     this.currentModel = opts.model
+    this.currentEffort = opts.effortLevel
     this.currentToolsets = opts.agentToolsets
   }
 
@@ -414,8 +416,10 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
 
   setModel(model: string | undefined): void { this.currentModel = model }
   get model(): string | undefined { return this.currentModel }
-  setEffortLevel(_level: string | undefined): void { /* 0.16.3 hosted path has no effort flag */ }
-  get effortLevel(): string | undefined { return undefined }
+  // 0.16.3 hosted path has no effort flag, but the generic runner mutator must
+  // still retain the requested value so model switches cannot be silently lost.
+  setEffortLevel(level: string | undefined): void { this.currentEffort = level }
+  get effortLevel(): string | undefined { return this.currentEffort }
   setTraceId(_traceId: string | undefined): void {}
   async setGoalState(_goal: GoalStateSnapshot | null): Promise<void> {}
   updateConfig(config: OpenClaudeConfig): void { this.opts.config = config }

@@ -273,7 +273,7 @@ describe('② flag 开 + catalog 可用 → engine/model 取投影', () => {
       kind: 'turn',
     })
     // agent 自身 deepseek 仍可用，所以显式/默认 glm 不可用后先尊重 agent 默认。
-    assert.equal(d.canonicalModel, 'deepseek-v4-flash')
+    assert.equal(d.canonicalModel, 'deepseek-v4-pro')
   })
 
   test('agent 默认也不可用时按 glm → MiniMax → DeepSeek Flash 多级路由', () => {
@@ -472,7 +472,7 @@ describe('④⑤ codex delegate / provider pin 的本地 turn → DELEGATE_CODEX
       env: { OC_SELFHOST_ENGINE_LOCAL_TURNS: '1' } as NodeJS.ProcessEnv,
     })
     assert.equal(d.engine, 'ccb')
-    assert.equal(d.canonicalModel, 'deepseek-v4-pro')
+    assert.equal(d.canonicalModel, 'deepseek-v4-flash')
   })
 
   test('prewarm 不套 codex 真值表(不是 turn:不执行/不计费),engine 仍取投影', () => {
