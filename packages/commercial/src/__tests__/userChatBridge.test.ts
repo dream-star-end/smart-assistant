@@ -1510,6 +1510,7 @@ describe("userChatBridge — model authorization", () => {
 
       const error = await nextBusinessFrame(frames);
       assert.equal(error.code, "GOAL_STATE_UNAVAILABLE");
+      assert.deepEqual(error.peer, { id: "sess-goal-read-failure", kind: "dm" });
       await new Promise<void>((resolve) => setTimeout(resolve, 100));
       assert.equal(
         rig.containerSeen.some(({ data }) => {
@@ -3544,6 +3545,7 @@ describe("userChatBridge — hello live-frame catch-up", () => {
     assert.match(block, /liveCatchupSendDecision/);
     assert.match(block, /CLOSE_BRIDGE\.TOO_BIG/);
     assert.match(block, /maxBytes:/);
+    assert.match(block, /item\.kind === "oversize"/);
     assert.doesNotMatch(block, /cleanup\("/);
   });
 
@@ -3651,5 +3653,38 @@ describe("userChatBridge — hello live-frame catch-up", () => {
     } finally {
       await stopRig(rig);
     }
+  });
+});
+
+describe("inbound turn identity is frozen onto every parsed-turn error exit", () => {
+  test("authority helpers and remaining parsed-turn errors carry frozen peer identity", async () => {
+    const source = await readFile(new URL("../ws/userChatBridge.ts", import.meta.url), "utf8");
+    assert.match(source, /inboundTurnIdentityForFrame = inboundTurnIdentityFromParsed\(parsed\)/);
+    assert.match(source, /sendErrorFrame\(userWs, code, message, args\.turn\)/);
+    assert.equal(
+      source.split("sendErrorFrame(userWs, code, message, args.turn)").length - 1,
+      2,
+      "seal + resolve reject paths must both pass args.turn",
+    );
+    assert.match(
+      source,
+      /GOAL_STATE_UNAVAILABLE[\s\S]{0,180}\{ peerId, clientMessageId \}/,
+    );
+    for (const needle of [
+      'sendErrorFrame(\n                userWs,\n                "AGENT_NOT_FOUND"',
+      "inboundTurnIdentityForFrame",
+    ]) {
+      assert.ok(source.includes('inboundTurnIdentityForFrame'), needle);
+    }
+    assert.match(source, /"agent not found",[\s\S]{0,40}inboundTurnIdentityForFrame/);
+    assert.match(source, /repair its required capabilities and retry`,[\s\S]{0,40}inboundTurnIdentityForFrame/);
+    assert.match(source, /specify a model`,[\s\S]{0,40}inboundTurnIdentityForFrame/);
+    assert.match(source, /trace invariant violated", annotatedTurnIdentity/);
+    assert.match(source, /maxFrameBytes}`, annotatedTurnIdentity/);
+    assert.match(source, /"internal error", annotatedTurnIdentity/);
+    assert.match(source, /retry this turn shortly",[\s\S]{0,40}ccbTurnIdentity/);
+    assert.match(source, /maxFrameBytes}`,[\s\S]{0,20}ccbTurnIdentity/);
+    assert.match(source, /"internal error", ccbTurnIdentity/);
+    assert.doesNotMatch(source, /firstSession\(\)/);
   });
 });

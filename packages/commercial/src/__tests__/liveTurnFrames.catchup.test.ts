@@ -47,7 +47,7 @@ describe('readOpenDispatchLiveFramePayloadsAfterSeq', () => {
     assert.match(sql, /f\.frame_seq > \$4/)
     assert.equal(sql.includes('legacy:'), false)
     assert.deepEqual(params.slice(0, 5), ['3', 'sess-a', 'c:3', 2, 50])
-    assert.deepEqual(out, ['{"type":"outbound.message","frameSeq":4}'])
+    assert.deepEqual(out, [{ kind: 'payload', payload: '{"type":"outbound.message","frameSeq":4}' }])
   })
 
   test('caps catch-up by cumulative payload bytes, not only row count', async () => {
@@ -68,10 +68,75 @@ describe('readOpenDispatchLiveFramePayloadsAfterSeq', () => {
     })
     assert.match(sql, /octet_length\(f\.payload\)/)
     assert.match(sql, /cum_bytes/)
-    assert.match(sql, /p\.cum_bytes - p\.nbytes < \$6/)
+    assert.match(sql, /p\.cum_bytes <= \$6/)
+    assert.match(sql, /LEFT JOIN client_session_live_frames/)
+    assert.equal(sql.includes('p.cum_bytes - p.nbytes'), false)
     assert.equal(params[3], 0)
     assert.equal(params[4], 500)
     assert.equal(params[5], 4096)
+  })
+
+  test('returns an oversize sentinel without materializing the overflowing payload', async () => {
+    let loadedPayloads = 0
+    const q = {
+      async query(_text: string, _p: unknown[]) {
+        return {
+          rows: [{
+            payload: null,
+            frame_seq: 1,
+            nbytes: 448 * 1024 * 1024,
+          }],
+          rowCount: 1,
+        }
+      },
+    } as unknown as CatchupQuery
+    const out = await readOpenDispatchLiveFramePayloadsAfterSeq(q, {
+      uid: 3n,
+      sessionId: 'sess-a',
+      afterFrameSeq: 0,
+      maxBytes: 4 * 1024 * 1024,
+    })
+    assert.deepEqual(out, [{
+      kind: 'oversize',
+      frameSeq: 1,
+      nbytes: 448 * 1024 * 1024,
+    }])
+    assert.equal(out.some((item) => item.kind === 'payload'), false)
+    assert.equal(loadedPayloads, 0)
+    const payloadBytes = out.reduce((sum, item) => (
+      item.kind === 'payload' ? sum + Buffer.byteLength(item.payload, 'utf8') : sum
+    ), 0)
+    assert.equal(payloadBytes <= 4 * 1024 * 1024, true)
+  })
+
+  test('join predicate refuses to select payload once cumulative bytes exceed the budget', async () => {
+    let sql = ''
+    const huge = Buffer.alloc(64)
+    const q = {
+      async query(text: string, _p: unknown[]) {
+        sql = text
+        if (!/p\.cum_bytes <= \$6/.test(text) || /cum_bytes - p\.nbytes/.test(text)) {
+          return {
+            rows: [{ payload: huge, frame_seq: 1, nbytes: huge.length }],
+            rowCount: 1,
+          }
+        }
+        return {
+          rows: [{ payload: null, frame_seq: 1, nbytes: 448 * 1024 * 1024 }],
+          rowCount: 1,
+        }
+      },
+    } as unknown as CatchupQuery
+    const out = await readOpenDispatchLiveFramePayloadsAfterSeq(q, {
+      uid: 3n,
+      sessionId: 'sess-a',
+      afterFrameSeq: 0,
+      maxBytes: 32,
+    })
+    assert.match(sql, /AND p\.cum_bytes <= \$6/)
+    assert.equal(out.length, 1)
+    assert.equal(out[0]?.kind, 'oversize')
+    assert.equal(out[0]?.kind === 'oversize' && 'payload' in out[0], false)
   })
 
   test('missing cursor starts from the stream head', async () => {

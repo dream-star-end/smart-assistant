@@ -819,10 +819,12 @@ describe("bridge 模型执行权威 — fail-closed(绝不降级为无 envelope 
     try {
       const ws = await openClient(rig.port);
       const frames = frameCollector(ws);
-      ws.send(inboundFrame({ model: "retired-model" }));
+      ws.send(inboundFrame({ model: "retired-model", clientMessageId: "cm-retired" }));
       const err = await frames.next();
       assert.equal(err.type, "error");
       assert.equal(err.code, "MODEL_NOT_AVAILABLE");
+      assert.deepEqual(err.peer, { id: "p1", kind: "dm" });
+      assert.equal(err.clientMessageId, "cm-retired");
       await new Promise((r) => setTimeout(r, 100));
       assert.equal(
         rig.containerSeen.some((s) => s.includes("inbound.message")),

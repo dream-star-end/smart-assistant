@@ -2047,10 +2047,13 @@ export class ChatSocket {
       }
       case "error": {
         const frame = f as LegacyBridgeErrorWire;
-        // Turn-level legacy errors must name the peer. Falling back to
-        // firstSession() applied Cursor/ZCode admission failures to session A
-        // while session B stayed _sendingInFlight forever.
-        const sess = this.resolveSession(frame.peer?.id);
+        // Named peer wins. An orphaned legacy turn error may bind only when
+        // exactly one session is _sendingInFlight and has not yet entered
+        // durable admission — never firstSession(), and never when 0 or 2+
+        // such sessions exist.
+        const sess = frame.peer?.id
+          ? this.resolveSession(frame.peer.id)
+          : this.uniquePreAdmissionInFlightSession();
         if (sess) {
           const activeClientMessageId = sess._activeClientMessageId;
           const ownsActiveTurn = !frame.clientMessageId ||
@@ -2366,6 +2369,19 @@ export class ChatSocket {
   private resolveSession(peerId: string | undefined): ChatSession | null {
     if (peerId && this.sessions.has(peerId)) return this.sessions.get(peerId)!;
     return null;
+  }
+
+  /** Safety net for a peer-less legacy turn error. Only a unique
+   * pre-admission in-flight session may claim it; 0 or 2+ stay dropped. */
+  private uniquePreAdmissionInFlightSession(): ChatSession | null {
+    const candidates: ChatSession[] = [];
+    for (const sess of this.sessions.values()) {
+      if (!sess._sendingInFlight) continue;
+      const admittedId = this.dispatchSlots.get(sess.id);
+      if (admittedId !== undefined && admittedId === sess._activeClientMessageId) continue;
+      candidates.push(sess);
+    }
+    return candidates.length === 1 ? candidates[0]! : null;
   }
 
   private firstSession(): ChatSession | null {

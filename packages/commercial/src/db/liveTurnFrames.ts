@@ -301,6 +301,11 @@ export interface ReadOpenDispatchLiveFramePayloadsInput {
   maxBytes?: number;
 }
 
+/** Hello catch-up row. Oversize sentinels never carry payload bytes. */
+export type LiveCatchupReadItem =
+  | { kind: "payload"; payload: string }
+  | { kind: "oversize"; frameSeq: number; nbytes: number };
+
 /**
  * Decide whether this reconnect WS can take one more catch-up payload.
  * `backpressure` means close only this socket and stop this catch-up —
@@ -332,7 +337,7 @@ export function liveCatchupSendDecision(
 export async function readOpenDispatchLiveFramePayloadsAfterSeq(
   q: Pick<Pool, "query">,
   input: ReadOpenDispatchLiveFramePayloadsInput,
-): Promise<string[]> {
+): Promise<LiveCatchupReadItem[]> {
   const after = Number.isSafeInteger(input.afterFrameSeq) && input.afterFrameSeq > 0
     ? input.afterFrameSeq
     : 0;
@@ -344,10 +349,15 @@ export async function readOpenDispatchLiveFramePayloadsAfterSeq(
     : HELLO_LIVE_CATCHUP_MAX_BYTES;
   const sessionUserId = `c:${input.uid.toString()}`;
   // Metadata CTE reads octet_length only so a 500-row LIMIT cannot materialize
-  // hundreds of MiB of payload. The join-back then loads payload for rows whose
-  // *previous* cumulative bytes still sit under the budget (first row always
-  // included so send-side backpressure can close this reconnect WS).
-  const res = await q.query<{ payload: Buffer }>(
+  // hundreds of MiB of payload. Payload is joined only for rows whose cumulative
+  // bytes still sit at or under the budget. The first overflowing row comes back
+  // as metadata (frame_seq + nbytes) with payload NULL so this reconnect can
+  // fail-closed without ever loading the oversize bytes.
+  const res = await q.query<{
+    payload: Buffer | null;
+    frame_seq: string | number;
+    nbytes: string | number;
+  }>(
     `WITH candidates AS (
        SELECT f.stream_key, f.frame_seq, octet_length(f.payload) AS nbytes
          FROM client_session_live_streams s
@@ -372,16 +382,36 @@ export async function readOpenDispatchLiveFramePayloadsAfterSeq(
               SUM(nbytes) OVER (ORDER BY frame_seq ASC) AS cum_bytes
          FROM candidates
      )
-     SELECT f.payload
+     SELECT p.frame_seq, p.nbytes, f.payload
        FROM picked p
-       JOIN client_session_live_frames f
-         ON f.stream_key = p.stream_key AND f.frame_seq = p.frame_seq
-      WHERE p.cum_bytes - p.nbytes < $6
+       LEFT JOIN client_session_live_frames f
+         ON f.stream_key = p.stream_key
+        AND f.frame_seq = p.frame_seq
+        AND p.cum_bytes <= $6
+      WHERE p.cum_bytes <= $6
+         OR p.frame_seq = (
+              SELECT MIN(p2.frame_seq) FROM picked p2 WHERE p2.cum_bytes > $6
+            )
       ORDER BY p.frame_seq ASC`,
     [input.uid.toString(), input.sessionId, sessionUserId, after, limit, maxBytes],
   );
-  return res.rows.map((row) => Buffer.from(row.payload).toString("utf8"));
+  const out: LiveCatchupReadItem[] = [];
+  for (const row of res.rows) {
+    if (row.payload == null) {
+      const frameSeq = Number(row.frame_seq);
+      const nbytes = Number(row.nbytes);
+      out.push({
+        kind: "oversize",
+        frameSeq: Number.isSafeInteger(frameSeq) ? frameSeq : 0,
+        nbytes: Number.isSafeInteger(nbytes) ? nbytes : 0,
+      });
+      continue;
+    }
+    out.push({ kind: "payload", payload: Buffer.from(row.payload).toString("utf8") });
+  }
+  return out;
 }
+
 
 /**
  * Self-heal only the retry-safe serialization failures. The dispatch-row lock

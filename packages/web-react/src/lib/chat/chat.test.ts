@@ -4192,7 +4192,7 @@ describe("legacy type:error must not fall back to firstSession", () => {
     vi.unstubAllGlobals();
   });
 
-  test("Cursor rejection without peer leaves session B in-flight and does not error session A", () => {
+  test("peer-less error binds the unique pre-admission in-flight session and clears it", () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const sock = makeSocket();
     sock.setGateReady(true);
@@ -4206,8 +4206,71 @@ describe("legacy type:error must not fall back to firstSession", () => {
     ws.onmessage?.({
       data: JSON.stringify({
         type: "error",
-        code: "CURSOR_UNAVAILABLE",
-        message: "Cursor requires the account-owned local runtime",
+        code: "MODEL_NOT_AVAILABLE",
+        message: "model not available: retired-model",
+      }),
+    });
+    expect(sessionA.messages.some((m) => m._errorCode)).toBe(false);
+    expect(sessionA._sendingInFlight).toBeFalsy();
+    expect(sessionB._sendingInFlight).toBe(false);
+    expect(sessionB._activeClientMessageId).toBeUndefined();
+    expect(sessionB.messages.some((m) => typeof m._errorCode === "string")).toBe(true);
+    sock.stop();
+  });
+
+  test("peer-less error is dropped when two sessions are pre-admission in-flight", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    const sessionA = sock.ensureSession("sess-a", "main");
+    const sessionB = sock.ensureSession("sess-b", "main");
+    sessionA._sendingInFlight = true;
+    sessionA._activeClientMessageId = "cm-a";
+    addMessage(sessionA, "user", "from A", { id: "cm-a", status: "sending", ts: 1 });
+    sessionB._sendingInFlight = true;
+    sessionB._activeClientMessageId = "cm-b";
+    addMessage(sessionB, "user", "from B", { id: "cm-b", status: "sending", ts: 1 });
+    ws.onmessage?.({
+      data: JSON.stringify({
+        type: "error",
+        code: "MODEL_NOT_AVAILABLE",
+        message: "model not available: retired-model",
+      }),
+    });
+    expect(sessionA._sendingInFlight).toBe(true);
+    expect(sessionB._sendingInFlight).toBe(true);
+    expect(sessionA.messages.some((m) => m._errorCode)).toBe(false);
+    expect(sessionB.messages.some((m) => m._errorCode)).toBe(false);
+    sock.stop();
+  });
+
+  test("peer-less error is dropped when the unique in-flight session already has durable admission", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    const sessionA = sock.ensureSession("sess-a", "main");
+    const sessionB = sock.ensureSession("sess-b", "main");
+    sessionB._sendingInFlight = true;
+    sessionB._activeClientMessageId = "cm-b";
+    addMessage(sessionB, "user", "from B", { id: "cm-b", status: "sending", ts: 1 });
+    ws.onmessage?.({
+      data: JSON.stringify({
+        type: "outbound.ack",
+        admitted: true,
+        peer: { id: "sess-b", kind: "dm" },
+        clientMessageId: "cm-b",
+      }),
+    });
+    expect(sessionB._sendingInFlight).toBe(true);
+    ws.onmessage?.({
+      data: JSON.stringify({
+        type: "error",
+        code: "MODEL_NOT_AVAILABLE",
+        message: "model not available: retired-model",
       }),
     });
     expect(sessionA.messages.some((m) => m._errorCode)).toBe(false);
