@@ -78,9 +78,10 @@ function parseExpiry(raw: unknown): string | null {
 export function buildGrokDeviceAuthEnv(
   home: string,
   grokHome: string,
-  proxyUrl: string,
+  proxyUrl?: string | null,
   base: NodeJS.ProcessEnv = process.env,
 ): NodeJS.ProcessEnv {
+  const proxy = typeof proxyUrl === 'string' ? proxyUrl.trim() : ''
   return {
     // This is an authentication-only third-party child. Do not inherit
     // database/KMS/container credentials from the commercial master.
@@ -89,13 +90,17 @@ export function buildGrokDeviceAuthEnv(
     TERM: base.TERM ?? 'xterm-256color',
     HOME: home,
     GROK_HOME: grokHome,
-    HTTPS_PROXY: proxyUrl,
-    HTTP_PROXY: proxyUrl,
-    https_proxy: proxyUrl,
-    http_proxy: proxyUrl,
-    NO_PROXY: '127.0.0.1,localhost',
     GROK_CLI_AUTO_UPDATE: 'false',
     GROK_TELEMETRY_ENABLED: 'false',
+    ...(proxy
+      ? {
+          HTTPS_PROXY: proxy,
+          HTTP_PROXY: proxy,
+          https_proxy: proxy,
+          http_proxy: proxy,
+          NO_PROXY: '127.0.0.1,localhost',
+        }
+      : {}),
   }
 }
 
@@ -185,7 +190,7 @@ async function finishSession(session: DeviceSession, code: number | null): Promi
   }
 }
 
-export async function startGrokDeviceAuth(opts: { proxyUrl: string }): Promise<GrokDeviceAuthStatus> {
+export async function startGrokDeviceAuth(opts: { proxyUrl?: string } = {}): Promise<GrokDeviceAuthStatus> {
   const dir = await mkdtemp(path.join(tmpdir(), 'openclaude-grok-auth-'))
   const grokHome = path.join(dir, '.grok')
   await mkdir(grokHome, { mode: 0o700 })

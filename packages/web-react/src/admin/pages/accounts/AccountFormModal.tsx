@@ -452,7 +452,7 @@ export function AccountFormModal({
                     <Button size="sm" variant="accent" onClick={startGrokOAuth} disabled={exchanging || !!grokSessionId}>
                       {exchanging || grokSessionId ? <Spinner className="size-4" /> : "打开 Grok 设备授权"}
                     </Button>
-                    <span className="text-[12px] text-muted">使用 xAI 订阅账号登录，完成后自动回填。</span>
+                    <span className="text-[12px] text-muted">使用 xAI 订阅账号登录，完成后自动回填。授权请求直连 x.ai，不走上方 egress（后续对话仍走该代理）。</span>
                   </div>
                   {grokVerificationUrl && (
                     <p className="mt-2 break-all font-mono text-[11px] text-muted">{grokVerificationUrl}</p>
