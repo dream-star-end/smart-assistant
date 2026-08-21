@@ -312,11 +312,23 @@ after(async () => {
 
 beforeEach(async () => {
   if (!pgAvailable) return;
-  await pool.query(
-    `TRUNCATE client_sessions, client_session_archive_chunks, client_session_archived_ids,
-             server_authored_request_map, pending_usage_patches, turn_waivers,
-             wechat_bindings, admin_audit CASCADE`,
-  );
+  // Some live-frame readers intentionally outlive the request that started
+  // them. Their final short SELECT can overlap the next fixture TRUNCATE and
+  // make PostgreSQL choose the reset as a 40P01 victim. Retry only that exact
+  // transient; every other setup error remains fatal.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await pool.query(
+        `TRUNCATE client_sessions, client_session_archive_chunks, client_session_archived_ids,
+                 server_authored_request_map, pending_usage_patches, turn_waivers,
+                 wechat_bindings, admin_audit CASCADE`,
+      );
+      break;
+    } catch (error) {
+      if ((error as { code?: string }).code !== "40P01" || attempt === 2) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 25 * (attempt + 1)));
+    }
+  }
 });
 
 // ── helpers ──────────────────────────────────────────────────────────────────

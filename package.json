@@ -25,7 +25,7 @@
     "agents": "tsx packages/cli/src/index.ts agents",
     "lint": "biome check packages",
     "format": "biome format --write packages",
-    "test:gateway": "npx tsx --test --test-concurrency=2 $(find packages/gateway/src -type f -name \"*.test.ts\")",
+    "test:gateway": "npx tsx --test --test-concurrency=1 $(find packages/gateway/src -type f -name \"*.test.ts\")",
     "test:mcp-memory": "npx tsx --test $(find packages/mcp-memory/src -type f -name \"*.test.ts\")",
     "test:protocol": "npx tsx --test $(find packages/protocol/src -type f -name \"*.test.ts\")",
     "test:channels": "npx tsx --test $(find packages/channels -type f -name \"*.test.ts\" -not -path \"*/node_modules/*\")",
