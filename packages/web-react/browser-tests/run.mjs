@@ -184,7 +184,7 @@ const html = `<!doctype html><html><head><meta charset="utf-8"><style>${producti
   #root{position:static;height:auto;overflow:visible}
   .timeline-scroll-probe{height:360px;width:640px;overflow-y:auto;position:relative;border:1px solid #ccc;scrollbar-gutter:stable}
   #timeline-archive-root .chat-virtual-item{min-height:40px}
-</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="chat-entry-ux-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="interrupted-tool-status-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="error-ux-root"></div><div id="ask-question-root"></div><div id="model-selector-root"></div><div id="markdown-rich-root"></div><div id="media-task-root"></div><div id="connectors-root"></div><div id="memory-report-root"></div><div id="community-tutorial-root"></div><div id="codex-density-root"></div><div id="settings-shell-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
+</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="chat-entry-ux-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="interrupted-tool-status-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="error-ux-root"></div><div id="ask-question-root"></div><div id="model-selector-root"></div><div id="markdown-rich-root"></div><div id="media-task-root"></div><div id="connectors-root"></div><div id="memory-report-root"></div><div id="community-tutorial-root"></div><div id="codex-density-root"></div><div id="settings-shell-root"></div><div id="unread-request-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
 
 // ── drive ───────────────────────────────────────────────────────────────────
 let browser;
@@ -238,8 +238,17 @@ const ASSET_MIME = { ".woff2": "font/woff2", ".woff": "font/woff", ".css": "text
 // 组件真实发出的遥测信标(succeeded 级 UX 事件也走这个出口)。harness 没有后端,
 // 显式 204 挡掉;不 stub 就会 404 → console.error → 用例被自己的埋点判红。
 const STUBBED_ENDPOINTS = new Set(["/api/client-errors"]);
+let unreadMarkReadRequests = 0;
 const serveBuiltAsset = (route, request) => {
   const url = new URL(request.url());
+  if (url.pathname === "/api/sessions/unread-browser/read" && request.method() === "POST") {
+    unreadMarkReadRequests += 1;
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ ok: true, updated: 1 }),
+    });
+  }
   if (STUBBED_ENDPOINTS.has(url.pathname)) {
     return route.fulfill({ status: 204, contentType: "text/plain", body: "" });
   }
@@ -2432,6 +2441,22 @@ await check("T42 设置壳 390 单列可切五分区、1440 竖导航 168px、�
 
   if (DEFAULT_VIEWPORT) await page.setViewportSize(DEFAULT_VIEWPORT);
   await page.evaluate(() => document.documentElement.classList.remove("dark"));
+});
+
+await check("T44 当前会话 unread=false 回执前的流式刷新只发送一次 mark-read", async () => {
+  await page.getByTestId("unread-request-probe").waitFor({ state: "visible", timeout: 3000 });
+  await page.waitForTimeout(50);
+  if (unreadMarkReadRequests !== 1) {
+    throw new Error(`探针首次挂载应只发一次 mark-read，实际 ${unreadMarkReadRequests}`);
+  }
+  for (let i = 0; i < 30; i += 1) {
+    await page.evaluate(() => window.__rerenderUnreadProbe());
+    await page.waitForTimeout(0);
+  }
+  await page.waitForTimeout(100);
+  if (unreadMarkReadRequests !== 1) {
+    throw new Error(`30 次流式刷新形成 mark-read 请求风暴:${unreadMarkReadRequests}`);
+  }
 });
 
 // 主 harness 仍在:预览用例没有把它换成空页面(否则后续缺席断言全部恒真)。

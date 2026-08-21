@@ -44,6 +44,7 @@
     { "id": "T40", "proves": "390px 真 Chromium 失败轮只显示一个重试出口，不重复发送失败、不泄露供应商路由名、无请求 ID 时不显示详情，且紧凑 warning 卡不横溢" },
     { "id": "T41", "proves": "PR1 Codex 密度 token：Composer 与 ToolCard 视觉、Sidebar 单行会话/累计用时/活跃竖条与顶栏入口在 1440/390 明暗主题均成立，账号菜单保留管理/市场/组织/后台/视频任务，底栏保留教程与主题" },
     { "id": "T42", "proves": "PR2 设置壳：默认关闭不盖住 harness；390 单列不横溢且能切到账户/用量/偏好/反馈/关于；1440 竖导航 168px；现有教程深链 section 仍是 preferences/account/feedback" },
-    { "id": "T43", "proves": "390px 真 Chromium 触控首次向上拖动会立即解除贴底；随后消息高度增长不把视口弹回底部" }
+    { "id": "T43", "proves": "390px 真 Chromium 触控首次向上拖动会立即解除贴底；随后消息高度增长不把视口弹回底部" },
+    { "id": "T44", "proves": "当前会话的服务端 unread=false 回执到达前，30 次流式/列表刷新只发送一次 mark-read，不形成请求风暴" }
   ]
 }
