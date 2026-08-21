@@ -7826,7 +7826,11 @@ export function createPgSessionsBackend(
       );
       let phaseA: LosslessTurnTapeFinalizeResult | null = null;
       if (readyForPreparation) {
-        phaseA = await commitVisibleLosslessTurnPhaseA(pool, userId, request);
+        // HTTP action:finalize (materialize:false) is the job's creation point.
+        // Worker Phase B must not re-enqueue, or ON CONFLICT would stomp a live lease.
+        phaseA = await commitVisibleLosslessTurnPhaseA(pool, userId, request, {
+          enqueueMaterialization: finalizeOptions?.materialize === false,
+        });
         if (phaseA.applied === "session_not_found" || phaseA.applied === "session_deleted" || phaseA.applied === "incomplete") {
           return phaseA;
         }

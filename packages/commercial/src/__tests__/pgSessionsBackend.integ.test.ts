@@ -62,6 +62,10 @@ import {
   releaseRecoveryPreReceipt,
 } from "../dispatch/turnRecoveryStore.js";
 import { authorizeTurnTapeRecovery } from "../admin/turnTapeRecovery.js";
+import {
+  claimDueMaterializationJobs,
+  renewMaterializationLease,
+} from "../db/turnTapeJobs.js";
 import { _sanitizeMasterHistoricalMessagesForFrame } from "../ws/userChatBridge.js";
 import {
   makeServerAuthoredHandler,
@@ -8970,6 +8974,68 @@ describe("rev2 visible finalize decoupling", () => {
         .find((message) => message.role === "assistant")?.text,
       "visible while cold",
     );
+  });
+
+  maybe("Phase B materialize does not re-enqueue an in-flight leased job; batch renew still holds", async () => {
+    const sessionId = "s-rev5-phaseb-no-reenqueue";
+    const userId = "c:1";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const tape = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 21,
+      status: "completed",
+      turnKey: "9".repeat(64),
+      text: "phase b must not self-evict",
+      createdAt: 1_700_000_500_000,
+    });
+    for (const part of tape.parts) {
+      await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+    }
+    const settlement = {
+      billingAnchorId: `srv-${sessionId}-main-t21`,
+      engineBillings: [],
+      text: "phase b must not self-evict",
+      ts: 1_700_000_500_000,
+    };
+    await backend.finalizeLosslessTurnTape(userId, {
+      ...tape.finalize,
+      settlement,
+    }, { materialize: false });
+    const claimed = await claimDueMaterializationJobs(pool, {
+      ownerId: "phase-b-worker",
+      leaseMs: 60_000,
+    });
+    assert.equal(claimed.length, 1);
+    const job = claimed[0]!;
+    let enqueueSql = 0;
+    _setPhaseASqlObserver((sql) => {
+      if (/INSERT INTO turn_tape_materialization_jobs/i.test(sql)) enqueueSql += 1;
+    });
+    try {
+      _setAfterLosslessStageBatch(async () => {
+        const held = await renewMaterializationLease(pool, job);
+        assert.equal(held, true, "Phase B re-enqueue must not evict the in-flight lease");
+      });
+      const result = await backend.finalizeLosslessTurnTape(userId, tape.finalize);
+      assert.equal(result.applied, "finalized");
+    } finally {
+      _setPhaseASqlObserver(null);
+      _setAfterLosslessStageBatch(null);
+    }
+    assert.equal(enqueueSql, 0, "worker Phase B must not call enqueueMaterializationJob");
+    const after = (
+      await pool.query<{ status: string; lease_owner: string | null; lease_epoch: string }>(
+        `SELECT status, lease_owner, lease_epoch::text
+           FROM turn_tape_materialization_jobs
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+        [sessionId, userId, tape.finalize.tapeId],
+      )
+    ).rows[0]!;
+    assert.equal(after.status, "leased");
+    assert.equal(after.lease_owner, "phase-b-worker");
+    assert.equal(after.lease_epoch, String(job.leaseEpoch));
+    assert.equal(await renewMaterializationLease(pool, job), true);
   });
 
   maybe("visible + failed materialization still builds the next engine context", async () => {
