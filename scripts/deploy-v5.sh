@@ -2297,10 +2297,10 @@ REMOTE
 
 assert_no_deploy_recovery_marker() {
   [[ "$DRY" == 1 ]] && return 0
-  if ! ssh "$KL_HOST" "test ! -e '$DEPLOY_RECOVERY_MARKER'"; then
+  if [[ "$MODE" != "recover" ]] && ! ssh "$KL_HOST" "test ! -e '$DEPLOY_RECOVERY_MARKER'"; then
     echo "✗ 检测到未收敛的人工恢复标记:$KL_HOST:$DEPLOY_RECOVERY_MARKER" >&2
     ssh "$KL_HOST" "sed -n '1,20p' '$DEPLOY_RECOVERY_MARKER'" 2>/dev/null | sed 's/^/  /' >&2 || true
-    echo "  禁止任何新写 lane；先核对 deploy_state、A/B symlink/unit 与 runtime tuple，收敛后人工移除。" >&2
+    echo "  禁止任何新写 lane；先核对 deploy_state、A/B symlink/unit 与 runtime tuple，再走官方 --recover 收敛并清除。" >&2
     return 1
   fi
   if ! ssh "$KL_HOST" "test ! -e '$MUTATION_LANE_INFLIGHT_MARKER'"; then
@@ -2309,6 +2309,20 @@ assert_no_deploy_recovery_marker() {
     echo "  上次 lane 可能因 lease/parent 丢失被 crash-stop；禁止自动补偿或新写。先核对 deploy_state、symlink/unit/runtime 后人工移除。" >&2
     return 1
   fi
+}
+
+
+clear_deploy_recovery_marker_after_stable_recover() {
+  [[ "$MODE" == "recover" ]] || return 2
+  require_mutation_lease_for_compensation "stable-recover-marker-clear" || return 86
+  ssh "$KL_HOST" "set -e
+    marker='$DEPLOY_RECOVERY_MARKER'
+    if [ -e \"\$marker\" ]; then
+      rm -f -- \"\$marker\"
+      python3 -c 'import os; d=os.open(\"$RELEASES_ROOT\",os.O_RDONLY); os.fsync(d); os.close(d)'
+    fi
+    test ! -e \"\$marker\"
+  "
 }
 
 # ═══════════════ durable gate waiver:门禁豁免 = 一次性可记账债务 ═══════════════
@@ -5722,7 +5736,7 @@ smoke() {
   #   sessionsGcSweep(P2 会话权威迁 PG:usage 聚合 pending/map 老化 GC,advisory lease fencing,
   #     仅 OC_SESSIONS_STORE=pg 时启动——白名单允许≠必然存在。RFC-v5-sessions-pg D3)
   allowed="subscriptionRollover accountSlotReaper researchJobs codexRefresh codexDriftReconciler marketplaceAiReview providerHealth sessionsGcSweep incidentSnapshot cursorAuthSync"
-  allowed="$allowed idleSweep volumeGc orphanReconcile migrationReconcile healthPoller containerEvents alert refreshEventsSweep auditRetentionSweep imageUsageSweep cooldownRecovery pendingOrdersExpirer finalizeReconciler turnDispatchReconciler onboarding inboxEmail cronWake incidentReconciler incidentSweeper connectorSweeper knowledgePlanetAutomation githubWorkspaceSweeper wecomAlert userNoticeApproval mediaGeneration"
+  allowed="$allowed idleSweep volumeGc orphanReconcile migrationReconcile healthPoller containerEvents alert refreshEventsSweep auditRetentionSweep imageUsageSweep cooldownRecovery pendingOrdersExpirer finalizeReconciler liveFrameMaintenance tapeJobScheduler turnDispatchReconciler onboarding inboxEmail cronWake incidentReconciler incidentSweeper connectorSweeper knowledgePlanetAutomation githubWorkspaceSweeper wecomAlert userNoticeApproval mediaGeneration"
   bad=""
   IFS=',' read -ra _sarr <<<"$scheds"
   for s in "${_sarr[@]}"; do
@@ -7679,7 +7693,9 @@ rollback_runtime_tuple() {
   ssh "$KL_HOST" "test -d '$master'" || { echo "✗ 目标 master release 目录不存在(可能已被 GC): $master" >&2; return 1; }
   assert_release_marker "$master" || return 1
   assert_release_required_migrations "$master" || return 1
-  assert_release_baseline_security "$master" || return 1
+  # History predecessors may predate admin prompt variants and the
+  # cursor/taskboard baseline skills. Forward targets remain strict.
+  assert_legacy_release_baseline_security "$master" || return 1
   assert_web_storage_rollback_transition \
     "$prev_src" "${ACTIVE_STATE_PREVIOUS_RELEASE:-}" "$master" \
     "tuple rollback exact target" || return 1
@@ -9435,8 +9451,14 @@ recover() {
   fi
   case "$p" in
     stable)
-      echo "  · phase=stable:检查是否有 master 已提交但 egress 尚待激活的 durable transition。"
-      finalize_ready_egress_transition ;;
+      finalize_ready_egress_transition || return 1
+      if [[ "$DRY" == 1 ]]; then
+        echo "  [dry-run] full stable smoke then fsync-clear manual recovery marker"
+      else
+        resolve_active_lane
+        smoke "$ACTIVE_PORT" || return 1
+        clear_deploy_recovery_marker_after_stable_recover
+      fi ;;
     canary)
       if [[ "$s" -lt "$DS_STEP_CANARY_READY" ]]; then
         echo "  · canary<READY(准备期,candidate 对流量不可见)→ §8:stop/清本 operation 产物 → 回 stable(零影响)"
