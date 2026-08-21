@@ -244,10 +244,14 @@ export function pickTapeDisplayFallbackText(input: {
   if (typeof input.anchorText === "string" && input.anchorText.length > 0) {
     return { text: input.anchorText, source: "anchor" };
   }
+  // records_unpublished is an empty window, not a missing body. Keep text empty
+  // (or the already-picked visible/anchor body above) so the frontend can render
+  // a non-bubble process-pending hint from _displayDegradeReason / _recordsPending.
+  if (input.reason === "records_unpublished") {
+    return { text: "", source: "placeholder" };
+  }
   return {
-    text: input.reason === "records_unpublished"
-      ? "过程记录正在整理，稍后会自动补齐思考与工具卡片。"
-      : "此轮回复暂时无法完整展开（记录物化异常）。正文仍保留在会话权威可见头中，稍后会自动补齐过程卡片。",
+    text: "此轮回复暂时无法完整展开（记录物化异常）。正文仍保留在会话权威可见头中，稍后会自动补齐过程卡片。",
     source: "placeholder",
   };
 }

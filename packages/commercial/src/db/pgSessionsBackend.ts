@@ -1947,6 +1947,150 @@ function assertRecoveryUsageFallback(
 
 /** 把可变计费叠加并入行 usage。与今日 hydrateTapeRecord 内联合并逐字节等价:key 顺序
  *  = record/anchor(content 已并) → cost → waiver → delegate;全空则原样返回(不凭空造 usage)。 */
+type TapeFallbackSettlement = {
+  usage?: unknown;
+  requestId?: string | null;
+  costCredits: string;
+  waiverApplied: boolean;
+  delegates: Array<{ agentId: string; costCredits: string }>;
+};
+
+function usageRecord(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  return value as Record<string, unknown>;
+}
+
+/** Attach already-settled usage onto a degrade fallback row. Never invents costCredits. */
+function attachFallbackSettlementUsage(
+  msg: MessageLike,
+  header: {
+    usage?: unknown;
+    requestId?: string | null;
+    costCredits?: string;
+    waiverApplied?: boolean;
+    delegates?: Array<{ agentId: string; costCredits: string }>;
+  } | null | undefined,
+  anchorUsage: unknown,
+): MessageLike {
+  const tape = usageRecord(header?.usage) ?? {};
+  const anchor = usageRecord(anchorUsage) ?? {};
+  const base = { ...tape, ...anchor };
+  const requestId = header?.requestId;
+  const traceId =
+    (typeof base.traceId === "string" && base.traceId.length > 0 ? base.traceId : undefined)
+    ?? (typeof requestId === "string" && requestId.length > 0 ? requestId : undefined);
+  const seeded = (Object.keys(base).length > 0 || traceId)
+    ? { ...msg, usage: traceId ? { ...base, traceId } : base }
+    : msg;
+  return mergeExactUsage(
+    seeded,
+    {
+      costCredits: header?.costCredits ?? "0",
+      waiverApplied: header?.waiverApplied === true,
+      delegates: header?.delegates ?? [],
+    },
+    true,
+  );
+}
+
+async function readTapeFallbackSettlements(
+  client: Pool | PoolClient,
+  sessionId: string,
+  userId: string,
+  tapeIds: string[],
+): Promise<Map<string, TapeFallbackSettlement>> {
+  if (tapeIds.length === 0) return new Map();
+  const rows = (
+    await client.query<{
+      tape_id: string;
+      usage: unknown;
+      request_id: string | null;
+      cost_credits: string;
+      waiver_applied: boolean;
+      delegate_costs: unknown;
+    }>(
+      `SELECT t.tape_id, t.usage,
+              NULLIF(COALESCE(t.engine_billings->0->>'requestId', t.usage->>'traceId'), '') AS request_id,
+              EXISTS (
+                SELECT 1 FROM turn_waivers w
+                 WHERE ('c:' || w.user_id::text)=t.user_id
+                   AND w.turn_key=t.turn_key AND w.status='applied'
+              ) AS waiver_applied,
+              COALESCE((
+                SELECT SUM(exact_cost.cost_credits)::text
+                  FROM (
+                    SELECT c.cost_credits::numeric AS cost_credits
+                      FROM turn_tape_cost_components c
+                     WHERE c.user_id=t.user_id AND c.session_id=t.session_id
+                       AND c.tape_id=t.tape_id AND c.billing_anchor_id=t.billing_anchor_id
+                    UNION ALL
+                    SELECT p.cost_credits::numeric AS cost_credits
+                      FROM pending_usage_patches p
+                     WHERE p.user_id=t.user_id
+                       AND (
+                         p.turn_key=t.turn_key OR p.parent_turn_key=t.turn_key
+                         OR p.request_id=NULLIF(t.engine_billings->0->>'requestId','')
+                         OR p.request_id=NULLIF(t.usage->>'traceId','')
+                       )
+                  ) exact_cost
+              ), '0') AS cost_credits,
+              COALESCE((
+                SELECT jsonb_agg(
+                         jsonb_build_object(
+                           'agentId', grouped.delegate_agent_id,
+                           'costCredits', grouped.cost_credits
+                         ) ORDER BY grouped.delegate_agent_id
+                       )
+                  FROM (
+                    SELECT exact_delegate.delegate_agent_id,
+                           SUM(exact_delegate.cost_credits)::text AS cost_credits
+                      FROM (
+                        SELECT c.delegate_agent_id, c.cost_credits::numeric AS cost_credits
+                          FROM turn_tape_cost_components c
+                         WHERE c.user_id=t.user_id AND c.session_id=t.session_id
+                           AND c.tape_id=t.tape_id AND c.billing_anchor_id=t.billing_anchor_id
+                        UNION ALL
+                        SELECT p.delegate_agent_id, p.cost_credits::numeric AS cost_credits
+                          FROM pending_usage_patches p
+                         WHERE p.user_id=t.user_id
+                           AND (
+                             p.turn_key=t.turn_key OR p.parent_turn_key=t.turn_key
+                             OR p.request_id=NULLIF(t.engine_billings->0->>'requestId','')
+                             OR p.request_id=NULLIF(t.usage->>'traceId','')
+                           )
+                      ) exact_delegate
+                     WHERE exact_delegate.delegate_agent_id IS NOT NULL
+                     GROUP BY exact_delegate.delegate_agent_id
+                  ) grouped
+              ), '[]'::jsonb) AS delegate_costs
+         FROM client_session_turn_tapes t
+        WHERE t.session_id=$1 AND t.user_id=$2 AND t.tape_id=ANY($3::text[])`,
+      [sessionId, userId, tapeIds],
+    )
+  ).rows;
+  return new Map(rows.map((row) => [row.tape_id, {
+    usage: row.usage,
+    requestId: row.request_id,
+    costCredits: row.cost_credits,
+    waiverApplied: row.waiver_applied,
+    delegates: parseDelegateCosts(row.delegate_costs),
+  }]));
+}
+
+async function mergeTapeFallbackSettlements<T extends { tapeId: string }>(
+  client: Pool | PoolClient,
+  sessionId: string,
+  userId: string,
+  headers: Map<string, T>,
+): Promise<void> {
+  const settlements = await readTapeFallbackSettlements(client, sessionId, userId, [...headers.keys()]);
+  for (const [, header] of headers) {
+    const settlement = settlements.get(header.tapeId);
+    if (!settlement) continue;
+    Object.assign(header, settlement);
+  }
+}
+
 function mergeExactUsage(msg: MessageLike, enrich: ExactUsageEnrichment, isBillingAnchor: boolean): MessageLike {
   const exactCostUsage = BigInt(enrich.costCredits) > 0n ? { costCredits: enrich.costCredits } : {};
   // The live cost_waived frame updates the current browser immediately, but
@@ -2260,6 +2404,11 @@ interface DirectTapeHeader {
   finalizedAt: string | null;
   visibleAt: string | null;
   visibleHead: VisibleHead | null;
+  usage?: unknown;
+  requestId?: string | null;
+  costCredits?: string;
+  waiverApplied?: boolean;
+  delegates?: Array<{ agentId: string; costCredits: string }>;
 }
 
 const PRIVATE_TAPE_ROOT_FIELDS = new Set([
@@ -3668,7 +3817,7 @@ async function readDirectTapeHeaders(
       row.logical_count = exact.logical_count;
     }
   }
-  return new Map(
+  const headers = new Map(
     rows.map((row) => [
       row.tape_id,
       {
@@ -3688,6 +3837,8 @@ async function readDirectTapeHeaders(
       },
     ]),
   );
+  await mergeTapeFallbackSettlements(pool, sessionId, userId, headers);
+  return headers;
 }
 
 async function readHydratedTapeRows(
@@ -4017,7 +4168,7 @@ async function hydrateTurnTapeMessages(
       finalizedAt: header.finalizedAt,
     })) {
       const head = header.visibleHead;
-      const message: MessageLike = {
+      const message: MessageLike = attachFallbackSettlementUsage({
         id: head?.messageId ?? header.billingAnchorId,
         role: "assistant",
         text: typeof head?.text === "string" ? head.text : "",
@@ -4031,7 +4182,7 @@ async function hydrateTurnTapeMessages(
         ...(header.clientMessageId ? { _clientMessageId: header.clientMessageId } : {}),
         ...(typeof anchor._seq === "number" ? { _seq: anchor._seq } : {}),
         ...(typeof anchor._orderSeq === "number" ? { _orderSeq: anchor._orderSeq } : {}),
-      };
+      }, header, anchor.usage);
       return [message];
     }
     const expectedPhysical = anchor._turnTapePhysicalRecordCount ?? anchor._turnTapeRecordCount;
@@ -5269,6 +5420,11 @@ type UnifiedTimelineTapeHeader = {
   materializationStatus: string | null;
   finalizedAt: string | null;
   visibleHead: VisibleHead | null;
+  usage?: unknown;
+  requestId?: string | null;
+  costCredits?: string;
+  waiverApplied?: boolean;
+  delegates?: Array<{ agentId: string; costCredits: string }>;
 };
 
 type UnifiedTimelineTapeHead = DirectTapePageHead & {
@@ -5445,7 +5601,7 @@ async function readUnifiedTimelineTapeHeaders(
       [sessionId, userId, tapeIds],
     )
   ).rows;
-  return new Map(rows.map((row) => [row.tape_id, {
+  const headers = new Map(rows.map((row) => [row.tape_id, {
     tapeId: row.tape_id,
     tapeSha256: row.tape_sha256,
     billingAnchorId: row.billing_anchor_id,
@@ -5456,6 +5612,8 @@ async function readUnifiedTimelineTapeHeaders(
     finalizedAt: (row as { finalized_at?: string | null }).finalized_at ?? null,
     visibleHead: ((row as { visible_head?: VisibleHead | null }).visible_head ?? null),
   }]));
+  await mergeTapeFallbackSettlements(client, sessionId, userId, headers);
+  return headers;
 }
 
 async function readUnifiedTimelineTapeHeads(
@@ -5783,7 +5941,13 @@ function unifiedTimelineTapeFallbackMessages(
   });
   const reason: TapeDisplayDegradeReason = !unit.header
     ? (unit.reason === "finalized_tape_missing" ? "header_missing" : unit.reason)
-    : (picked.source === "placeholder" && !unit.header.visibleHead ? "visible_head_missing" : unit.reason);
+    : (
+      picked.source === "placeholder"
+      && !unit.header.visibleHead
+      && unit.reason !== "records_unpublished"
+        ? "visible_head_missing"
+        : unit.reason
+    );
   warnTapeDisplayDegrade({
     sessionId,
     tapeId: unit.tapeId,
@@ -5799,7 +5963,7 @@ function unifiedTimelineTapeFallbackMessages(
   const ts = typeof head?.ts === "number" && Number.isFinite(head.ts)
     ? head.ts
     : (typeof unit.anchor.ts === "number" && Number.isFinite(unit.anchor.ts) ? unit.anchor.ts : 0);
-  return [{
+  return [attachFallbackSettlementUsage({
     id,
     role: "assistant",
     text: picked.text,
@@ -5827,7 +5991,7 @@ function unifiedTimelineTapeFallbackMessages(
     ...(typeof head?.errorCode === "string" ? { _errorCode: head.errorCode } : {}),
     ...(reason === "records_unpublished" ? { _recordsPending: true } : {}),
     ...(head?.partial === true ? { _visibleHeadPartial: true } : {}),
-  }];
+  }, unit.header, unit.anchor.usage)];
 }
 
 async function hydrateUnifiedTimelineTapeUnits(
@@ -7160,13 +7324,23 @@ export async function commitVisibleLosslessTurnPhaseA(
     if (settlement && settlementText.length === 0 && visibleText.length > 0) {
       head.partial = true;
     }
+    const visibleRequestId = settlement?.requestId
+      ?? (engineBillings[0] && typeof engineBillings[0].requestId === "string"
+        ? engineBillings[0].requestId
+        : undefined);
+    const visibleUsage = visibleRequestId ? { traceId: visibleRequestId } : null;
     await client.query(
       `UPDATE client_session_turn_tapes
           SET visible_at=$1, visible_head=$2::jsonb,
               billing_anchor_id=COALESCE(billing_anchor_id,$3),
               engine_billings=CASE WHEN $4::jsonb <> '[]'::jsonb THEN $4::jsonb ELSE engine_billings END,
               settlement_hash=COALESCE(settlement_hash,$6),
-              client_message_id=COALESCE(client_message_id,$5)
+              client_message_id=COALESCE(client_message_id,$5),
+              usage=CASE
+                WHEN $10::jsonb IS NULL THEN usage
+                WHEN usage IS NULL OR usage = '{}'::jsonb THEN $10::jsonb
+                ELSE usage
+              END
         WHERE session_id=$7 AND user_id=$8 AND tape_id=$9`,
       [
         Date.now(),
@@ -7178,6 +7352,7 @@ export async function commitVisibleLosslessTurnPhaseA(
         request.sessionId,
         userId,
         request.tapeId,
+        visibleUsage ? JSON.stringify(visibleUsage) : null,
       ],
     );
     let existingMessages: MessageLike[];
@@ -7215,6 +7390,7 @@ export async function commitVisibleLosslessTurnPhaseA(
       anchors = [{
         ...tapeAnchor(stubRecord as never, request.tapeId, request.tapeSha256, 1, 1, undefined, []),
         text: head.text,
+        ...(visibleUsage ? { usage: visibleUsage } : {}),
       }];
       const recordIds = new Set([billingAnchorId]);
       existingMessages = existingMessages.filter(

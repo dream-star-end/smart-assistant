@@ -596,4 +596,23 @@ describe("AssistantCard 中断轮展示（requestId / 正文 / 空窗占位）",
     expect(screen.getByRole("button", { name: "复制请求ID req-after-mat" })).toBeInTheDocument();
     expect(screen.getByLabelText("消耗 12 积分")).toBeInTheDocument();
   });
+
+  test("空窗 fallback 有 usage 时露出 requestId/积分，占位不是正文气泡", () => {
+    renderErr(errMsg({
+      _errorCode: "USER_CANCELLED",
+      text: "",
+      _displayDegradeReason: "records_unpublished",
+      _displayDegraded: true,
+      usage: { traceId: "req-gap-window", costCredits: "256" },
+    }), {});
+    const pending = screen.getByRole("status", { name: "过程记录整理中" });
+    expect(pending.tagName.toLowerCase()).toBe("output");
+    expect(pending).toHaveTextContent("过程记录整理中…");
+    expect(screen.queryByText("过程记录正在整理，稍后会自动补齐思考与工具卡片。")).toBeNull();
+    expect(screen.getByRole("button", { name: "复制请求ID req-gap-window" })).toBeInTheDocument();
+    expect(screen.getByLabelText("消耗 256 积分")).toBeInTheDocument();
+    const row = screen.getByTestId("assistant-row");
+    expect(row.querySelector("[data-testid=message-text]")).toBeNull();
+    expect(pending.closest("[data-testid=assistant-row]")).toBe(row);
+  });
 });

@@ -210,9 +210,20 @@ describe("tape display degrade helpers", () => {
       { text: "anchor body", source: "anchor" },
     );
     assert.equal(pickTapeDisplayFallbackText({}).source, "placeholder");
+    assert.deepEqual(
+      pickTapeDisplayFallbackText({ reason: "records_unpublished" }),
+      { text: "", source: "placeholder" },
+    );
+    assert.deepEqual(
+      pickTapeDisplayFallbackText({
+        visibleHead: { text: "partial before stop" },
+        reason: "records_unpublished",
+      }),
+      { text: "partial before stop", source: "visible_head" },
+    );
     assert.equal(
-      pickTapeDisplayFallbackText({ reason: "records_unpublished" }).text,
-      "过程记录正在整理，稍后会自动补齐思考与工具卡片。",
+      pickTapeDisplayFallbackText({ reason: "records_unpublished" }).text.includes("过程记录"),
+      false,
     );
     assert.match(
       pickTapeDisplayFallbackText({ reason: "records_failed" }).text,

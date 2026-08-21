@@ -2474,6 +2474,14 @@ await check("T45 中断 turn 刷新后仍显示 requestId/积分，空窗给出�
   await root.getByLabel("消耗 4096 积分").waitFor({ state: "visible", timeout: 3000 });
   await root.getByRole("button", { name: /思考|已思考/ }).first().waitFor({ state: "visible", timeout: 3000 });
   await root.getByRole("status", { name: "过程记录整理中" }).waitFor({ state: "visible", timeout: 3000 });
+  await root.getByRole("button", { name: "复制请求ID req-unpublished-window" }).waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
+  await root.getByLabel("消耗 256 积分").waitFor({ state: "visible", timeout: 3000 });
+  if ((await root.getByText("过程记录正在整理，稍后会自动补齐思考与工具卡片。").count()) !== 0) {
+    throw new Error("过程占位不应作为 assistant 正文气泡");
+  }
   if (await root.getByRole("alert").count() !== 0) {
     throw new Error("中断 turn 不应渲染红卡");
   }

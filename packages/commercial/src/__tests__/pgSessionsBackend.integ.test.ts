@@ -9038,6 +9038,75 @@ describe("rev2 visible finalize decoupling", () => {
     assert.equal(assistant?._recordsPending, true);
     assert.equal(assistant?._errorCode, "USER_CANCELLED");
     assert.equal(assistant?._visibleHeadPartial, true);
+    assert.equal(String(assistant?.text ?? "").includes("过程记录"), false);
+  });
+
+  maybe("records_unpublished fallback carries settled usage without placeholder body", async () => {
+    const sessionId = "s-rev6-unpublished-usage";
+    const userId = "c:1";
+    const requestId = "req-unpublished-window";
+    const turnKey = "5".repeat(64);
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const tape = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 2,
+      status: "interrupted",
+      turnKey,
+      text: "",
+      createdAt: 1_700_000_800_000,
+    });
+    for (const part of tape.parts) {
+      await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+    }
+    const visible = await backend.finalizeLosslessTurnTape(userId, {
+      ...tape.finalize,
+      settlement: {
+        billingAnchorId: `srv-${sessionId}-main-t2`,
+        requestId,
+        engineBillings: [{
+          requestId,
+          engineSessionId: "eng-unpublished",
+          status: "success",
+          durationMs: 12,
+        }],
+        text: "",
+        ts: 1_700_000_800_000,
+        errorCode: "USER_CANCELLED",
+      },
+    }, { materialize: false });
+    assert.equal(visible.applied, "finalized");
+    await pool.query(
+      `INSERT INTO pending_usage_patches
+         (request_id,user_id,session_id,turn_key,cost_credits,created_at)
+       VALUES ($1,$2,$3,$4,'256',1)`,
+      [requestId, userId, sessionId, turnKey],
+    );
+    const timeline = await backend.getClientSession(sessionId, userId, { view: "timeline" });
+    const messages = timeline!.messages as MessageLike[];
+    const assistant = messages.find((message) => message.role === "assistant");
+    assert.equal(assistant?._displayDegradeReason, "records_unpublished");
+    assert.equal(assistant?._recordsPending, true);
+    assert.equal(assistant?.text, "");
+    assert.equal(String(assistant?.text ?? "").includes("过程记录"), false);
+    const usage = assistant?.usage as { traceId?: string; costCredits?: string; waived?: boolean } | undefined;
+    assert.equal(usage?.traceId, requestId);
+    assert.equal(usage?.costCredits, "256");
+    assert.equal(usage?.waived, undefined);
+    assert.equal(
+      messages.some((message) => message.role === "thinking" || message.role === "tool"),
+      false,
+    );
+
+    const exact = await backend.getClientSession(sessionId, userId);
+    const exactAssistant = (exact!.messages as MessageLike[]).find((message) => message.role === "assistant");
+    const exactUsage = exactAssistant?.usage as { traceId?: string; costCredits?: string } | undefined;
+    assert.equal(exactUsage?.traceId, requestId);
+    assert.equal(exactUsage?.costCredits, "256");
+    assert.equal(
+      (exact!.messages as MessageLike[]).some((message) => message.role === "thinking" || message.role === "tool"),
+      false,
+    );
   });
 
   maybe("batch materialize 3316 records stays in seconds and is idempotent", async () => {

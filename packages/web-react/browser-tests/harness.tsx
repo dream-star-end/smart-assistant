@@ -514,6 +514,7 @@ const unpublishedTurnAssistant: ChatMessage = {
   _clientMessageId: unpublishedTurnUser.id,
   _displayDegraded: true,
   _displayDegradeReason: "records_unpublished",
+  usage: { traceId: "req-unpublished-window", costCredits: "256" },
 };
 
 createRoot(document.getElementById("stopped-turn-root")!).render(
