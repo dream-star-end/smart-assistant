@@ -8,7 +8,7 @@
  */
 
 import Docker from "dockerode";
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { finished } from "node:stream/promises";
 import { pathToFileURL } from "node:url";
 
@@ -46,7 +46,8 @@ import { DEFAULT_BRIDGE_SECRET_PATH } from "../packages/commercial/src/bridgeSec
 import { AuthorityKeyringReader } from "../packages/commercial/src/ws/authoritySigner.js";
 import {
   CCB_BASELINE_TARGETS,
-  classifyBaselineMounts,
+  hasCompleteBaselineMounts,
+  type BaselineSourceVariants,
   type MountLike,
 } from "./lib/v5BaselineMounts.js";
 
@@ -241,7 +242,7 @@ export async function acquireSafeRemovalTarget(
   deps: V3SupervisorDeps,
   docker: Docker,
   uid: bigint,
-  expectedSources: Readonly<Record<string, string>>,
+  expectedSources: BaselineSourceVariants,
   expectedRuntimeLabels: Readonly<Record<string, string>>,
   deadlineMs: number,
   ops: AcquireSafeRemovalOps = {
@@ -277,8 +278,8 @@ export async function acquireSafeRemovalTarget(
     // unnecessary.  A container already converged by another actor is a clean
     // idempotent skip and is never put into the temporary drain gate.
     const info = await ops.inspect(status.dockerContainerId);
-    const classification = classifyBaselineMounts(info.Mounts, expectedSources);
-    if (classification.complete && hasExpectedRuntimeLabels(info.Config?.Labels, expectedRuntimeLabels)) {
+    if (hasCompleteBaselineMounts(info.Mounts, expectedSources)
+      && hasExpectedRuntimeLabels(info.Config?.Labels, expectedRuntimeLabels)) {
       return null;
     }
     const beforeVolumes = namedVolumes(info.Mounts);
@@ -372,11 +373,20 @@ export async function main(): Promise<void> {
   const baselineDir = requiredEnv("OC_V3_CCB_BASELINE_DIR");
   const baseline = resolveCcbBaselineMounts(baselineDir);
   if (!baseline) throw new Error(`baseline failed strict validation: ${baselineDir}`);
-  const expectedSources: Record<string, string> = {
+  const standardExpectedSources: Record<string, string> = {
     [CCB_BASELINE_TARGETS[0]]: baseline.agentsMdHostPath,
     [CCB_BASELINE_TARGETS[1]]: baseline.claudeMdHostPath,
     [CCB_BASELINE_TARGETS[2]]: baseline.skillsDirHostPath,
   };
+  // Admin containers intentionally mount the audited admin overlays while
+  // ordinary users mount the standard pair. Treat each complete triple as a
+  // supported variant; never accept a mixed standard/admin pair.
+  const adminExpectedSources: Record<string, string> = {
+    [CCB_BASELINE_TARGETS[0]]: realpathSync(`${baselineDir}/AGENTS.admin.md`),
+    [CCB_BASELINE_TARGETS[1]]: realpathSync(`${baselineDir}/CLAUDE.admin.md`),
+    [CCB_BASELINE_TARGETS[2]]: baseline.skillsDirHostPath,
+  };
+  const expectedSources: BaselineSourceVariants = [standardExpectedSources, adminExpectedSources];
 
   const pool = getPool();
   const deployState = await pool.query<{
@@ -462,8 +472,8 @@ export async function main(): Promise<void> {
       continue;
     }
     const info = await inspectContainer(docker, status.dockerContainerId);
-    const classification = classifyBaselineMounts(info.Mounts, expectedSources);
-    if (!classification.complete || !hasExpectedRuntimeLabels(info.Config?.Labels, runtimeLabels)) {
+    if (!hasCompleteBaselineMounts(info.Mounts, expectedSources)
+      || !hasExpectedRuntimeLabels(info.Config?.Labels, runtimeLabels)) {
       targets.push(uid);
     }
   }
@@ -504,8 +514,7 @@ export async function main(): Promise<void> {
       }
       assertLocalCensusHost(newStatus.hostId, selfHost.id);
       const info = await inspectContainer(docker, newStatus.dockerContainerId);
-      const classification = classifyBaselineMounts(info.Mounts, expectedSources);
-      if (!classification.complete) {
+      if (!hasCompleteBaselineMounts(info.Mounts, expectedSources)) {
         throw new Error("reprovisioned container still lacks mandatory baseline mounts");
       }
       assertNamedVolumesPreserved(target.beforeVolumes, namedVolumes(info.Mounts));
