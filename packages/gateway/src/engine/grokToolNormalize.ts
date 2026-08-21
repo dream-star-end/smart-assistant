@@ -138,6 +138,16 @@ export function grokProductToolOutput(raw: unknown): string {
 }
 
 export function grokProductToolName(nativeName: string, input?: unknown): string {
+  const trimmed = nativeName.trim()
+  if (trimmed.startsWith('mcp__')) return trimmed
+  const sep = trimmed.lastIndexOf('__')
+  if (sep > 0) {
+    const server = trimmed.slice(0, sep)
+    const tool = trimmed.slice(sep + 2)
+    if (/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(server) && /^[A-Za-z0-9_]+$/.test(tool)) {
+      return `mcp__${server}__${tool}`
+    }
+  }
   const key = grokNativeKey(nativeName)
   if (key.startsWith('mcp__')) return nativeName
   if (key === 'call_mcp_tool' || key === 'mcp') {

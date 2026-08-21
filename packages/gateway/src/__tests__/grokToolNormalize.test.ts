@@ -30,6 +30,10 @@ describe('grokProductToolName', () => {
 
   test('leaves MCP names and unknown tools alone', () => {
     assert.equal(grokProductToolName('mcp__openclaude-memory__skill_search'), 'mcp__openclaude-memory__skill_search')
+    assert.equal(
+      grokProductToolName('openclaude-memory__skill_search'),
+      'mcp__openclaude-memory__skill_search',
+    )
     assert.equal(grokProductToolName('mystery_tool'), 'mystery_tool')
     assert.equal(
       grokProductToolName('call_mcp_tool', { server: 'browser', tool_name: 'browser_navigate' }),

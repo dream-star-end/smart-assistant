@@ -6,8 +6,7 @@
 import { EventEmitter } from 'node:events'
 import { spawn, type ChildProcessByStdio } from 'node:child_process'
 import type { Readable } from 'node:stream'
-import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs'
-import { homedir } from 'node:os'
+import { existsSync, lstatSync, readFileSync, readdirSync, realpathSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import type { GoalStateSnapshot, OutboundContentBlock } from '@openclaude/protocol'
 import type { OpenClaudeConfig } from '@openclaude/storage'
@@ -34,6 +33,8 @@ import { buildCodexEnv } from './codexShared.js'
 import { createLogger } from '../logger.js'
 import { detachChildStdio, killProcessGroup, shutdownTimeoutMs, waitForCloseWithin } from '../processGroupShutdown.js'
 import { grokProductToolInput, grokProductToolName, grokProductToolOutput } from './grokToolNormalize.js'
+import { buildPromptContext } from '../promptSlots.js'
+import { GROK_PREAMBLE, prepareGrokHome, projectGrokPlatform } from './grokPlatform.js'
 
 const log = createLogger({ module: 'grokAdapter' })
 
@@ -103,8 +104,6 @@ const EMPTY_SIGNALS: Readonly<PhantomSignals> = Object.freeze({
   apiState: 'unknown',
   skipReason: null,
 })
-const MANAGED_GROK_CONFIG = '[cli]\nauto_update = false\n\n[features]\ntelemetry = false\nfeedback = false\n\n[shell_environment_policy]\ninherit = "all"\nexclude = ["XAI_*", "GROK_*"]\n'
-
 export interface GrokRouteOverride {
   baseUrl: string
   routeToken: string
@@ -328,14 +327,28 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     }
 
     let cwd = this.opts.agentBaseDir
+    let repoSnapshot = null
     if (this.opts.sessionId && this.opts.getRepoSnapshot) {
-      const snapshot = this.opts.getRepoSnapshot(this.opts.sessionId)
-      if (snapshot?.status === 'ready' && snapshot.workspaceDir) cwd = snapshot.workspaceDir
+      repoSnapshot = this.opts.getRepoSnapshot(this.opts.sessionId)
+      if (repoSnapshot?.status === 'ready' && repoSnapshot.workspaceDir) cwd = repoSnapshot.workspaceDir
     }
+    const platform = projectGrokPlatform({
+      agentId: this.opts.agentId,
+      sessionKey: this.opts.sessionKey,
+      gatewayPort: this.opts.config.gateway.port,
+      gatewayToken: this.opts.config.gateway.accessToken ?? '',
+      delegationDepth: this.opts.delegationDepth ?? 0,
+      claudeCodePath: this.opts.config.auth.claudeCodePath,
+      skillEvalMode: this.opts.skillEvalMode,
+      skillEvalExclude: this.opts.skillEvalExclude,
+      skillEvalDraft: this.opts.skillEvalDraft,
+      skillTrainRunId: this.opts.skillTrainRunId,
+    })
+    const prompt = await this.composePrompt(ctx.params, repoSnapshot, platform.advertisedMcpTools)
     const args = [
       '--agent', 'grok-build',
       '--model', GROK_UPSTREAM_MODEL,
-      '-p', this.composePrompt(ctx.params),
+      '-p', prompt,
       '--output-format', 'streaming-json',
       '--always-approve',
       '--no-subagents',
@@ -354,6 +367,21 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     }
     const env: NodeJS.ProcessEnv = {
       ...isolatedEnv,
+      PATH: '/run/oc/platform/current/bin:/usr/local/bin:/usr/bin:/bin',
+      OC_AGENT_ID: this.opts.agentId,
+      OC_SESSION_KEY: this.opts.sessionKey,
+      OPENCLAUDE_ENGINE: 'grok',
+      ...(process.env.OPENCLAUDE_HOME?.trim()
+        ? { OPENCLAUDE_HOME: process.env.OPENCLAUDE_HOME.trim() }
+        : isolatedEnv.OPENCLAUDE_HOME
+          ? { OPENCLAUDE_HOME: isolatedEnv.OPENCLAUDE_HOME }
+          : {}),
+      ...(platform.delegateContextFile
+        ? {
+            OPENCLAUDE_GATEWAY_PORT: String(this.opts.config.gateway.port),
+            OPENCLAUDE_DELEGATE_CONTEXT_FILE: platform.delegateContextFile,
+          }
+        : {}),
       XAI_API_KEY: route.routeToken,
       GROK_XAI_API_BASE_URL: route.baseUrl,
       GROK_CLI_CHAT_PROXY_BASE_URL: route.baseUrl,
@@ -361,7 +389,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       GROK_MODELS_LIST_URL: `${route.baseUrl.replace(/\/$/, '')}/models`,
       GROK_CLI_AUTO_UPDATE: 'false',
       GROK_TELEMETRY_ENABLED: 'false',
-      GROK_HOME: this.prepareGrokHome(),
+      GROK_HOME: platform.grokHome,
       ...(this.traceId ? { OPENCLAUDE_TRACE_ID: this.traceId } : {}),
     }
     const bin = process.env.OC_GROK_CLI_BIN?.trim()
@@ -425,21 +453,35 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     })
   }
 
-  private prepareGrokHome(): string {
-    const openClaudeHome = process.env.OPENCLAUDE_HOME?.trim() || join(homedir(), '.openclaude')
-    const grokHome = join(openClaudeHome, 'grok-build')
-    mkdirSync(grokHome, { recursive: true, mode: 0o700 })
-    writeFileSync(join(grokHome, 'config.toml'), MANAGED_GROK_CONFIG, { mode: 0o600 })
-    return grokHome
-  }
-
-  private composePrompt(params: TurnParams): string {
-    let persona = ''
-    if (this.opts.persona) {
-      try { persona = readFileSync(this.opts.persona, 'utf8').trim() } catch { persona = '' }
-    }
+  private async composePrompt(
+    params: TurnParams,
+    repoSnapshot: ReturnType<NonNullable<EngineCreateOpts['getRepoSnapshot']>> | null,
+    availableMcpTools: string[],
+  ): Promise<string> {
     const input = promptText(params.input)
-    return persona ? `${persona}\n\n${input}` : input
+    try {
+      const platform = await buildPromptContext({
+        agentId: this.opts.agentId,
+        sessionKey: this.opts.sessionKey,
+        persona: this.opts.persona,
+        provider: 'grok',
+        model: this.currentModel,
+        repoSnapshot: repoSnapshot ?? undefined,
+        availableMcpTools,
+        skillEvalExclude: this.opts.skillEvalExclude,
+        skillEvalDraft: this.opts.skillEvalDraft,
+        sessionId: typeof this.opts.sessionId === 'string' ? this.opts.sessionId : undefined,
+      })
+      const body = platform.content ? `${platform.content}\n\n${input}` : input
+      return `${GROK_PREAMBLE}\n${body}`
+    } catch {
+      let persona = ''
+      if (this.opts.persona) {
+        try { persona = readFileSync(this.opts.persona, 'utf8').trim() } catch { persona = '' }
+      }
+      const fallback = persona ? `${persona}\n\n${input}` : input
+      return `${GROK_PREAMBLE}\n${fallback}`
+    }
   }
 
   private handleLine(ctx: GrokTurnContext, line: string): void {
@@ -758,7 +800,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
   waitForOutputDrain(): Promise<void> { return this.drain }
   readCompactionHandoffSince(compactStartedAt: number): Promise<NativeModelHandoffArtifact> {
     if (!this.nativeId) return Promise.reject(new Error('GROK_COMPACTION_SESSION_NOT_READY'))
-    return readLatestGrokNativeHandoff(this.prepareGrokHome(), this.nativeId, compactStartedAt)
+    return readLatestGrokNativeHandoff(prepareGrokHome(), this.nativeId, compactStartedAt)
   }
 
   get nativeSessionId(): string | null { return this.nativeId }

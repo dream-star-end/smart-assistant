@@ -510,6 +510,15 @@ describe("Grok 原生工具卡归一化", () => {
     expect(d.tool.output).toBe("export const x = 1\n");
   });
 
+  test("Grok MCP server__tool 名映射到产品 mcp__ 卡", () => {
+    const d = normalizeToolForDisplay({
+      toolName: "openclaude-memory__skill_search",
+      inputJson: { query: "memory" },
+      _completed: true,
+    });
+    expect(d.name).toBe("mcp__openclaude-memory__skill_search");
+  });
+
   test("search_replace 空 old_string 当写入", () => {
     const d = normalizeToolForDisplay({
       toolName: "search_replace",
