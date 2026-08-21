@@ -1775,6 +1775,8 @@ describe('v5 release safety lanes', () => {
     assert.match(source, /activate_release\(\)[\s\S]*?assert_release_baseline_security "\$reldir"/)
     assert.match(source, /activate_runtime_tuple\(\)[\s\S]*?assert_release_baseline_security "\$BUILT_RELEASE"/)
     assert.match(source, /rollback_runtime_tuple\(\)[\s\S]*?assert_legacy_release_baseline_security "\$master"/)
+    assert.match(source, /ROLLBACK_LEGACY_BASELINE_OK=1 smoke "\$ACTIVE_PORT"/)
+    assert.match(source, /if \[\[ "\$\{ROLLBACK_LEGACY_BASELINE_OK:-0\}" == 1 \]\][\s\S]*?assert_legacy_release_baseline_security "\$live_release"/)
     assert.match(source, /canary\(\)[\s\S]*?assert_release_baseline_security "\$reldir"/)
     assert.match(source, /smoke\(\)[\s\S]*?assert_live_baseline_security_for_slot "\$baseline_slot"/)
     assert.match(source, /start_candidate_unit_and_wait\(\)[\s\S]*?assert_live_baseline_security_for_slot "\$cand"/)

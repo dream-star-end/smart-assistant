@@ -720,7 +720,17 @@ case "$shared_rc" in
   *) echo "FATAL: cannot inspect shared V5 env(rc=$shared_rc)" >&2; exit 1 ;;
 esac
 REMOTE
-  run_baseline_guard_remote check-dir "$expected" || return 1
+  if [[ "${ROLLBACK_LEGACY_BASELINE_OK:-0}" == 1 ]]; then
+    # Emergency/history rollback targets may predate the admin overlay files.
+    # Keep the live env/port fail-closed checks above, but validate the immutable
+    # target with the narrow legacy allowlist instead of the forward-only tree.
+    local live_release
+    live_release="$(bg_current_release "$src")"
+    [[ -n "$live_release" ]] || { echo "✗ legacy rollback live release 无法解析:$src" >&2; return 1; }
+    assert_legacy_release_baseline_security "$live_release" || return 1
+  else
+    run_baseline_guard_remote check-dir "$expected" || return 1
+  fi
   # V5 is local-only (deploy/v5/P1-PLAN.md). A loopback-only reservation blocks
   # the old wildcard BaselineServer bind across rollback and A/B canary masters.
   assert_v5_baseline_port_guard || {
@@ -7426,7 +7436,7 @@ rollback() {
     rollback_runtime_tuple "$ROLLBACK_N" 1 "$kp_rollback_helper" \
       || { echo "✗ tuple 回滚失败(saga 已自动恢复现场)" >&2; exit 1; }
     kp_rollback_target="$(bg_current_release "$ACTIVE_SRC")"
-    if [[ -z "$kp_rollback_target" ]] || ! smoke "$ACTIVE_PORT"; then
+    if [[ -z "$kp_rollback_target" ]] || ! ROLLBACK_LEGACY_BASELINE_OK=1 smoke "$ACTIVE_PORT"; then
       # F7:反向补偿(恢复回滚前 tuple)前 复核 lease;失活则 crash-stop。
       require_mutation_lease_for_compensation "rollback-compensation" || exit 86
       if rollback_runtime_tuple 1 1 "$kp_rollback_helper" && smoke "$ACTIVE_PORT"; then
