@@ -8969,6 +8969,153 @@ describe("rev2 visible finalize decoupling", () => {
     assert.deepEqual(afterReplay, after);
   });
 
+  maybe("USER_CANCELLED empty settlement recovers live-frame text and marks records pending", async () => {
+    const sessionId = "s-rev6-cancel-partial";
+    const userId = "c:1";
+    const dispatchId = randomUUID();
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    await pool.query(
+      `INSERT INTO turn_dispatches
+         (dispatch_id,user_id,session_id,client_message_id,agent_id,request_hash,
+          billing_request_id,status,owner_id,lease_until)
+       VALUES ($1,1,$2,'cm-cancel-partial','main',$3,$4,'accepted','test-owner',NOW()+INTERVAL '1 minute')`,
+      [dispatchId, sessionId, "2".repeat(64), `billing-${dispatchId}`],
+    );
+    await persistGatewayLiveFrame(pool, {
+      uid: 1n,
+      sessionId,
+      clientMessageId: "cm-cancel-partial",
+      agentContainerId: 444,
+      sessionKey: `agent:main:webchat:dm:${sessionId}`,
+      frameSeq: 1,
+      payload: JSON.stringify({
+        type: "outbound.message",
+        blocks: [{ kind: "text", text: "partial answer before stop" }],
+      }),
+    });
+    const tape = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 1,
+      status: "interrupted",
+      turnKey: "3".repeat(64),
+      text: "本轮已由用户停止。",
+      createdAt: 1_700_000_600_000,
+    });
+    for (const part of tape.parts) {
+      await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes, {
+        dispatchId,
+        attemptNo: 1,
+      });
+    }
+    const visible = await backend.finalizeLosslessTurnTape(userId, {
+      ...tape.finalize,
+      dispatchId,
+      attemptNo: 1,
+      settlement: {
+        billingAnchorId: `srv-${sessionId}-main-t1`,
+        engineBillings: [],
+        text: "",
+        ts: 1_700_000_600_000,
+        errorCode: "USER_CANCELLED",
+      },
+    }, { materialize: false });
+    assert.equal(visible.applied, "finalized");
+    const head = (
+      await pool.query<{ visible_head: { text?: string; errorCode?: string; partial?: boolean } }>(
+        `SELECT visible_head FROM client_session_turn_tapes
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+        [sessionId, userId, tape.finalize.tapeId],
+      )
+    ).rows[0]!.visible_head;
+    assert.equal(head.text, "partial answer before stop");
+    assert.equal(head.errorCode, "USER_CANCELLED");
+    assert.equal(head.partial, true);
+    const timeline = await backend.getClientSession(sessionId, userId, { view: "timeline" });
+    const assistant = (timeline!.messages as MessageLike[]).find((message) => message.role === "assistant");
+    assert.equal(assistant?.text, "partial answer before stop");
+    assert.equal(assistant?._displayDegradeReason, "records_unpublished");
+    assert.equal(assistant?._recordsPending, true);
+    assert.equal(assistant?._errorCode, "USER_CANCELLED");
+    assert.equal(assistant?._visibleHeadPartial, true);
+  });
+
+  maybe("batch materialize 3316 records stays in seconds and is idempotent", async () => {
+    const sessionId = "s-rev6-batch-3316";
+    const userId = "c:1";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const runtimeEvents = Array.from({ length: 3316 }, (_, index) => ({
+      ordinal: index + 1,
+      observedAt: 1_700_000_700_000 + index,
+      source: "gateway",
+      payload: { type: "bench", index },
+    }));
+    const tape = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 30,
+      status: "completed",
+      turnKey: "4".repeat(64),
+      text: "batch answer",
+      createdAt: 1_700_000_700_000,
+      runtimeEvents,
+    });
+    for (const part of tape.parts) {
+      await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+    }
+    const t0 = performance.now();
+    const first = await backend.finalizeLosslessTurnTape(userId, {
+      ...tape.finalize,
+      settlement: {
+        billingAnchorId: `srv-${sessionId}-main-t30`,
+        engineBillings: [],
+        text: "batch answer",
+        ts: 1_700_000_700_000,
+      },
+    });
+    const firstMs = performance.now() - t0;
+    assert.equal(first.applied, "finalized");
+    const count1 = Number((
+      await pool.query<{ n: string }>(
+        `SELECT count(*)::text AS n FROM client_session_turn_tape_records
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+        [sessionId, userId, tape.finalize.tapeId],
+      )
+    ).rows[0]?.n ?? "0");
+    assert.ok(count1 >= 3316, `expected >=3316 records, got ${count1}`);
+    const orderOk = (
+      await pool.query<{ ok: boolean }>(
+        `SELECT NOT EXISTS (
+           SELECT 1 FROM (
+             SELECT ordinal, row_number() OVER (ORDER BY ordinal) - 1 AS expected
+               FROM client_session_turn_tape_records
+              WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
+           ) q WHERE ordinal <> expected
+         ) AS ok`,
+        [sessionId, userId, tape.finalize.tapeId],
+      )
+    ).rows[0]?.ok;
+    assert.equal(orderOk, true);
+    const t1 = performance.now();
+    const second = await backend.finalizeLosslessTurnTape(userId, tape.finalize);
+    const secondMs = performance.now() - t1;
+    assert.equal(second.applied, "idempotent");
+    const count2 = Number((
+      await pool.query<{ n: string }>(
+        `SELECT count(*)::text AS n FROM client_session_turn_tape_records
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+        [sessionId, userId, tape.finalize.tapeId],
+      )
+    ).rows[0]?.n ?? "0");
+    assert.equal(count2, count1);
+    assert.ok(firstMs < 20_000, `3316-row materialize took ${Math.round(firstMs)}ms`);
+    console.log(JSON.stringify({
+      integ3316FirstMs: Math.round(firstMs),
+      integ3316SecondMs: Math.round(secondMs),
+      recordCount: count1,
+    }));
+  });
+
   maybe("duplicate Phase A does not hot-reactivate a failed materialization job", async () => {
     const sessionId = "s-rev3-failed-job-cold";
     const userId = "c:1";

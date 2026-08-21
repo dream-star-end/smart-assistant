@@ -73,6 +73,13 @@ describe("phaseAVisibleHeadText", () => {
       liveFrameText: "from frames",
     }), "from envelope");
   });
+  test("empty settlement text falls back to live frames", () => {
+    assert.equal(phaseAVisibleHeadText({
+      hasSettlement: true,
+      settlementText: "",
+      liveFrameText: "partial from frames",
+    }), "partial from frames");
+  });
 });
 
 describe("assertSettlementMatchesCanonical", () => {
@@ -203,6 +210,14 @@ describe("tape display degrade helpers", () => {
       { text: "anchor body", source: "anchor" },
     );
     assert.equal(pickTapeDisplayFallbackText({}).source, "placeholder");
+    assert.equal(
+      pickTapeDisplayFallbackText({ reason: "records_unpublished" }).text,
+      "过程记录正在整理，稍后会自动补齐思考与工具卡片。",
+    );
+    assert.match(
+      pickTapeDisplayFallbackText({ reason: "records_failed" }).text,
+      /物化异常/,
+    );
   });
 
   test("sanitizeJsonBytesForPgJsonb strips NUL and unpaired surrogates", () => {
