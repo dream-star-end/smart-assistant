@@ -75,6 +75,24 @@ describe("useUnreadSessions", () => {
     await waitFor(() => expect(mark).toHaveBeenCalled());
   });
 
+  test("当前会话在 unread=false 回执前重复刷新只发一次 mark-read", async () => {
+    const auth = createMemoryAuthSession(() => {}, "token");
+    const mark = vi.spyOn(api, "markSessionRead").mockResolvedValue({ ok: true, updated: 1 });
+    const makeSessions = (): UnreadSessionInput[] => [
+      { id: "s1", title: "当前", unread: true, runState: "running" },
+    ];
+    const { rerender } = hook({
+      sessions: makeSessions(),
+      activeId: "s1",
+      userId: "u1",
+      auth,
+    });
+    for (let i = 0; i < 20; i += 1) {
+      rerender({ sessions: makeSessions(), activeId: "s1", userId: "u1", auth });
+    }
+    await waitFor(() => expect(mark).toHaveBeenCalledTimes(1));
+  });
+
   test("activeId 切换清未读", () => {
     const { result, rerender } = hook({
       sessions: [{ id: "s1", title: "A", runState: "running" }],

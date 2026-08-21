@@ -46,6 +46,7 @@ import type { MediaGenerationJob } from "@openclaude/protocol/mediaGeneration";
 import { createMemoryAuthSession } from "../src/lib/authSession";
 import { ChatSocket } from "../src/lib/chat/socket";
 import { useSessionList } from "../src/hooks/useSessionList";
+import { useUnreadSessions } from "../src/hooks/useUnreadSessions";
 import type { UseChatSocket } from "../src/hooks/useChatSocket";
 import {
   admittedAckFrame,
@@ -176,6 +177,7 @@ declare global {
     }>;
     __pushMediaJob: (job: MediaGenerationJob) => void;
     __openMediaTask: (open: boolean) => void;
+    __rerenderUnreadProbe: () => void;
   }
 }
 window.__sends = [];
@@ -1664,6 +1666,27 @@ createRoot(document.getElementById("codex-density-root")!).render(
       />
     </div>
   </StrictMode>,
+);
+
+// INC-20260821-SESSION-LIST-NUL-READ-STORM:服务端 unread=false 回执到达前，
+// 流式/session-list 快照会持续给出全新的 sessions 数组。真实 hook 必须只发一个
+// mark-read；T44 在真 Chromium 里连续重渲染并统计真实 fetch。
+function UnreadMarkReadProbe() {
+  const [, setRevision] = useState(0);
+  const authRef = useRef(createMemoryAuthSession(() => {}, "unread-browser-token"));
+  useUnreadSessions({
+    sessions: [{ id: "unread-browser", title: "未读请求风暴探针", unread: true, runState: "running" }],
+    activeId: "unread-browser",
+    userId: "unread-browser-user",
+    auth: authRef.current,
+  });
+  useLayoutEffect(() => {
+    window.__rerenderUnreadProbe = () => setRevision((value) => value + 1);
+  }, []);
+  return <output data-testid="unread-request-probe">ready</output>;
+}
+createRoot(document.getElementById("unread-request-root")!).render(
+  <StrictMode><UnreadMarkReadProbe /></StrictMode>,
 );
 
 // PR2 设置壳：默认关闭，避免 Dialog 盖住其余 harness。T42 用受信点击打开后
