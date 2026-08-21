@@ -468,6 +468,71 @@ createRoot(document.getElementById("error-ux-root")!).render(
   </StrictMode>,
 );
 
+// T45: 只用服务端会回显的字段（_errorCode / usage / _displayDegradeReason）。
+// 没有客户端专有标记 —— 刷新 / server-wins 后仍是这个形状。
+const stoppedTurnUser: ChatMessage = {
+  id: "browser-stopped-user",
+  role: "user",
+  text: "long running task",
+  ts: 1,
+  status: "sent",
+  _source: "server",
+};
+const stoppedTurnThinking: ChatMessage = {
+  id: "browser-stopped-thinking",
+  role: "thinking",
+  text: "**Inspect** look at the repo",
+  ts: 2,
+  _source: "server",
+  _clientMessageId: stoppedTurnUser.id,
+};
+const stoppedTurnAssistant: ChatMessage = {
+  id: "browser-stopped-assistant",
+  role: "assistant",
+  text: "已经写出的部分回答，包含结论草稿。",
+  ts: 3,
+  _source: "server",
+  _errorCode: "USER_CANCELLED",
+  _clientMessageId: stoppedTurnUser.id,
+  usage: { traceId: "req-stopped-turn-display", costCredits: "4096" },
+};
+const unpublishedTurnUser: ChatMessage = {
+  id: "browser-unpublished-user",
+  role: "user",
+  text: "another long task",
+  ts: 10,
+  status: "sent",
+  _source: "server",
+};
+const unpublishedTurnAssistant: ChatMessage = {
+  id: "browser-unpublished-assistant",
+  role: "assistant",
+  text: "",
+  ts: 11,
+  _source: "server",
+  _errorCode: "USER_CANCELLED",
+  _clientMessageId: unpublishedTurnUser.id,
+  _displayDegraded: true,
+  _displayDegradeReason: "records_unpublished",
+};
+
+createRoot(document.getElementById("stopped-turn-root")!).render(
+  <StrictMode>
+    <MessageList
+      messages={[
+        stoppedTurnUser,
+        stoppedTurnThinking,
+        stoppedTurnAssistant,
+        unpublishedTurnUser,
+        unpublishedTurnAssistant,
+      ]}
+      sending={false}
+      cb={{}}
+      onRespondPermission={() => {}}
+    />
+  </StrictMode>,
+);
+
 const activeAskQuestion: ChatMessage = {
   id: "active-ask-question",
   role: "permission",

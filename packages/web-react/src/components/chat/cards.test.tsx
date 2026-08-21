@@ -115,25 +115,28 @@ describe("消息引用动作与已发送引用块", () => {
 });
 
 describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
-  test.each(["stopped", "user_cancelled"])(
-    "%s 是用户主动终止：只显示中性状态，不显示红卡、详情或重试",
-    (code) => {
+  test.each([
+    ["stopped", "本轮生成已停止。"],
+    ["user_cancelled", "本轮已取消。"],
+  ] as const)(
+    "%s 是用户主动终止：中性状态，不显示红卡、详情或重试，但费用与 requestId 仍可见",
+    (code, friendly) => {
       renderErr(errMsg({
         _errorCode: code,
-        text: "本轮已取消。",
-        _errorDetail: "本轮已取消。",
-        usage: { traceId: "trace-stop" },
+        text: friendly,
+        _errorDetail: friendly,
+        usage: { traceId: "trace-stop", costCredits: "4096" },
       }), {
         onRegenerate: vi.fn(),
       }, { totalTokens: 42 });
 
       expect(screen.getByRole("status", { name: "已停止生成" })).toBeInTheDocument();
-      expect(screen.queryByText("本轮已取消。")).toBeNull();
+      expect(screen.queryByText(friendly)).toBeNull();
       expect(screen.queryByRole("alert")).toBeNull();
       expect(screen.queryByRole("button", { name: /重试|重新尝试/ })).toBeNull();
-      expect(screen.getByTestId("assistant-row").textContent?.trim()).toBe("已停止生成");
-      expect(document.body.textContent).not.toContain("trace-stop");
-      expect(document.body.textContent).not.toContain("42");
+      expect(screen.getByRole("button", { name: "复制请求ID trace-stop" })).toBeInTheDocument();
+      expect(screen.getByLabelText("消耗 4096 积分")).toBeInTheDocument();
+      expect(screen.getByLabelText("本轮 42 token")).toBeInTheDocument();
     },
   );
 
@@ -541,5 +544,56 @@ describe("AssistantCard options 多题聚合", () => {
     fireEvent.click(screen.getByText("要点"));
     expect(sendUserText).toHaveBeenCalledTimes(1);
     expect(screen.queryByRole("button", { name: "发送选择" })).toBeNull();
+  });
+});
+
+describe("AssistantCard 中断轮展示（requestId / 正文 / 空窗占位）", () => {
+  test("已产生的部分回答在 stopped 时仍渲染，友好取消文案不进正文", () => {
+    renderErr(errMsg({
+      _errorCode: "USER_CANCELLED",
+      text: "已经写出的部分回答。",
+      usage: { traceId: "req-partial", costCredits: "88" },
+    }), {});
+    expect(screen.getByText("已经写出的部分回答。")).toBeInTheDocument();
+    expect(screen.getByRole("status", { name: "已停止生成" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "复制请求ID req-partial" })).toBeInTheDocument();
+    expect(screen.getByLabelText("消耗 88 积分")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  test("records_unpublished 且无可显示正文时给出过程整理占位", () => {
+    renderErr(errMsg({
+      _errorCode: "USER_CANCELLED",
+      text: "",
+      _displayDegradeReason: "records_unpublished",
+      _displayDegraded: true,
+    }), {});
+    expect(screen.getByRole("status", { name: "已停止生成" })).toBeInTheDocument();
+    expect(screen.getByRole("status", { name: "过程记录整理中" })).toBeInTheDocument();
+    expect(screen.getByText("过程记录整理中…")).toBeInTheDocument();
+  });
+
+  test("records_unpublished 但已有正文时不再占位", () => {
+    renderErr(errMsg({
+      _errorCode: "USER_CANCELLED",
+      text: "终稿可见的一段话。",
+      _displayDegradeReason: "records_unpublished",
+      _displayDegraded: true,
+    }), {});
+    expect(screen.getByText("终稿可见的一段话。")).toBeInTheDocument();
+    expect(screen.queryByRole("status", { name: "过程记录整理中" })).toBeNull();
+  });
+
+  test("物化完成后没有 degrade 字段则占位消失（刷新后仍只看服务端字段）", () => {
+    renderErr(errMsg({
+      _errorCode: "USER_CANCELLED",
+      text: "",
+      _source: "server",
+      usage: { traceId: "req-after-mat", costCredits: "12" },
+    }), {});
+    expect(screen.getByRole("status", { name: "已停止生成" })).toBeInTheDocument();
+    expect(screen.queryByRole("status", { name: "过程记录整理中" })).toBeNull();
+    expect(screen.getByRole("button", { name: "复制请求ID req-after-mat" })).toBeInTheDocument();
+    expect(screen.getByLabelText("消耗 12 积分")).toBeInTheDocument();
   });
 });
