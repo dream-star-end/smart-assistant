@@ -17,6 +17,22 @@ export interface BaselineMountClassification {
   missing: string[];
 }
 
+
+export type BaselineSourceSet = Readonly<Record<string, string>>;
+export type BaselineSourceVariants = BaselineSourceSet | readonly BaselineSourceSet[];
+
+/** Accept one complete trusted source triple. Variants are evaluated as
+ * whole maps so a mixed standard/admin pair never passes accidentally. */
+export function hasCompleteBaselineMounts(
+  mounts: readonly MountLike[] | undefined,
+  expected: BaselineSourceVariants,
+): boolean {
+  const variants: readonly BaselineSourceSet[] = Array.isArray(expected)
+    ? expected
+    : [expected as BaselineSourceSet];
+  return variants.some((sources) => classifyBaselineMounts(mounts, sources).complete);
+}
+
 export function classifyBaselineMounts(
   mounts: readonly MountLike[] | undefined,
   expectedSources: Readonly<Record<string, string>>,
