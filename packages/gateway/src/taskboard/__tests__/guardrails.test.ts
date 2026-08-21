@@ -68,6 +68,26 @@ describe('2. 每日预算', () => {
     )
     assert.equal(ok.ok, true)
   })
+
+  it('设了美元顶且有缺价 run → 失败关闭；未设美元顶则放过', () => {
+    const withCost = settingsFromDefaults({ maxCostPerDayUsd: 10 })
+    const hit = checkDailyBudget(
+      { runsToday: 1, costTodayUsd: 0, activeRuns: 0, unpricedRunsToday: 1 },
+      withCost,
+      now,
+    )
+    assert.equal(hit.ok, false)
+    if (!hit.ok) {
+      assert.equal(hit.skipReason, 'budget_exhausted')
+      assert.match(hit.alert.message, /缺价/)
+    }
+    const ok = checkDailyBudget(
+      { runsToday: 1, costTodayUsd: 0, activeRuns: 0, unpricedRunsToday: 2 },
+      settingsFromDefaults({ maxCostPerDayUsd: null, maxRunsPerDay: 200 }),
+      now,
+    )
+    assert.equal(ok.ok, true)
+  })
 })
 
 describe('3. 静默时段', () => {

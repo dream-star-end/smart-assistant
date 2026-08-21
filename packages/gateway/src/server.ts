@@ -5675,6 +5675,7 @@ export class Gateway {
       url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/activity$/) ||
       url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/timeline$/) ||
       url.pathname.match(/^\/api\/board\/pipelines\/([^/]+)$/) ||
+      url.pathname.match(/^\/api\/board\/pipelines\/([^/]+)\/reorder$/) ||
       url.pathname.match(/^\/api\/board\/pipelines\/([^/]+)\/stages$/) ||
       url.pathname.match(/^\/api\/board\/stages\/([^/]+)$/) ||
       url.pathname.match(/^\/api\/board\/runs\/([^/]+)$/) ||
@@ -18478,6 +18479,7 @@ function normalizePath(p: string): string {
     .replace(/\/api\/board\/projects\/[^/]+/, '/api/board/projects/:id')
     .replace(/\/api\/board\/tickets\/[^/]+\/[a-z_]+/, '/api/board/tickets/:id/:action')
     .replace(/\/api\/board\/tickets\/[^/]+/, '/api/board/tickets/:id')
+    .replace(/\/api\/board\/pipelines\/[^/]+\/reorder/, '/api/board/pipelines/:id/reorder')
     .replace(/\/api\/board\/pipelines\/[^/]+\/stages/, '/api/board/pipelines/:id/stages')
     .replace(/\/api\/board\/pipelines\/[^/]+/, '/api/board/pipelines/:id')
     .replace(/\/api\/board\/stages\/[^/]+/, '/api/board/stages/:id')

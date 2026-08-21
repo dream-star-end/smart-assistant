@@ -17,6 +17,7 @@ import { GUARDRAIL_DEFAULTS } from '../domain.js'
 import {
   type TaskboardDb,
   TaskboardNotFound,
+  TaskboardValidationError,
   boolToInt,
   intToBool,
   newId,
@@ -444,4 +445,36 @@ export function updateStage(db: TaskboardDb, id: string, input: UpdateStageInput
 export function deleteStage(db: TaskboardDb, id: string): void {
   const result = db.prepare('DELETE FROM tb_pipeline_stage WHERE id = ?').run(id)
   if (result.changes === 0) throw new TaskboardNotFound('stage', id)
+}
+
+/** 同一事务里重排整条流水线。SQLite UNIQUE(ordinal) 逐句检查，必须先写临时值。 */
+export function reorderStages(
+  db: TaskboardDb,
+  pipelineId: string,
+  orderedIds: string[],
+): PipelineStage[] {
+  if (!getPipeline(db, pipelineId)) throw new TaskboardNotFound('pipeline', pipelineId)
+  const existing = listStages(db, pipelineId)
+  if (existing.length === 0) {
+    throw new TaskboardValidationError('流水线还没有阶段')
+  }
+  if (orderedIds.length !== existing.length) {
+    throw new TaskboardValidationError('orderedIds 必须覆盖该流水线全部阶段，且不能多出')
+  }
+  const known = new Set(existing.map((s) => s.id))
+  if (new Set(orderedIds).size !== orderedIds.length) {
+    throw new TaskboardValidationError('orderedIds 不能重复')
+  }
+  for (const id of orderedIds) {
+    if (!known.has(id)) throw new TaskboardValidationError(`阶段不属于该流水线: ${id}`)
+  }
+  const tempBase = Math.max(1000, ...existing.map((s) => s.ordinal)) + 1
+  const now = nowMs()
+  const write = db.prepare('UPDATE tb_pipeline_stage SET ordinal = ?, updated_at = ? WHERE id = ?')
+  const txn = db.transaction(() => {
+    for (let i = 0; i < orderedIds.length; i++) write.run(tempBase + i, now, orderedIds[i])
+    for (let i = 0; i < orderedIds.length; i++) write.run(i, now, orderedIds[i])
+  })
+  txn()
+  return listStages(db, pipelineId)
 }

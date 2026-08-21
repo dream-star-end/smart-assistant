@@ -26,6 +26,7 @@ import {
   taskboardErrorMessage,
 } from '../../lib/taskboard'
 import type { AuthSession } from '../../lib/types'
+import { Markdown } from '../Markdown'
 import {
   Badge,
   Button,
@@ -37,6 +38,23 @@ import {
   TimeAgo,
   useToast,
 } from '../ui'
+
+function TicketMarkdown({
+  children,
+  testId,
+}: {
+  children: string
+  testId?: string
+}) {
+  return (
+    <div
+      data-testid={testId}
+      className="text-body text-fg [&_blockquote]:border-l-2 [&_blockquote]:border-border [&_blockquote]:pl-3 [&_blockquote]:text-muted [&_code]:rounded [&_code]:bg-hover [&_code]:px-1 [&_h1]:text-title [&_h2]:text-title [&_h3]:text-section [&_ol]:list-decimal [&_ol]:pl-5 [&_pre]:overflow-x-auto [&_ul]:list-disc [&_ul]:pl-5"
+    >
+      <Markdown readOnly>{children}</Markdown>
+    </div>
+  )
+}
 
 function runStatusTone(status: string): 'success' | 'danger' | 'warning' | 'info' | 'neutral' {
   if (status === 'succeeded') return 'success'
@@ -344,6 +362,7 @@ export function TicketDrawer({
                 />
                 <textarea
                   aria-label="单据描述"
+                  placeholder="支持 Markdown：标题、列表、代码块、链接"
                   className="min-h-28 w-full rounded-lg border border-border-control bg-surface px-3.5 py-2.5 text-base leading-relaxed text-fg outline-none focus:border-accent focus-visible:ring-2 focus-visible:ring-ring md:text-sm"
                   value={draftBody}
                   onChange={(e) => setDraftBody(e.target.value)}
@@ -395,7 +414,7 @@ export function TicketDrawer({
 
           {!editing &&
             (current.body ? (
-              <p className="whitespace-pre-wrap text-body text-fg">{current.body}</p>
+              <TicketMarkdown testId="ticket-body-md">{current.body}</TicketMarkdown>
             ) : (
               <p className="text-meta text-faint">还没有描述</p>
             ))}
@@ -453,7 +472,7 @@ export function TicketDrawer({
               aria-label="评论"
               data-testid="ticket-drawer-comment"
               className="min-h-20 w-full rounded-lg border border-border-control bg-surface px-3.5 py-2.5 text-base leading-relaxed text-fg outline-none focus:border-accent focus-visible:ring-2 focus-visible:ring-ring md:text-sm"
-              placeholder="写一条拍板意见"
+              placeholder="支持 Markdown，写一条拍板意见"
               value={comment}
               onChange={(e) => setComment(e.target.value)}
             />
@@ -501,7 +520,7 @@ export function TicketDrawer({
                             className="text-caption text-faint"
                           />
                         </div>
-                        <p className="whitespace-pre-wrap text-body text-fg">{item.comment.body}</p>
+                        <TicketMarkdown testId="ticket-comment-md">{item.comment.body}</TicketMarkdown>
                       </div>
                     )}
                     {item.kind === 'activity' && (
@@ -566,8 +585,10 @@ function RunDetail({
           .join(' · ')}
       </p>
       {skip && <p className="text-body text-warning">跳过：{skip}</p>}
-      {run.summary && <p className="text-body text-fg">{run.summary}</p>}
-      {run.error && <p className="text-body text-danger">{run.error}</p>}
+      {(run.outputMd?.trim() || run.summary) && (
+        <TicketMarkdown testId="ticket-run-md">{run.outputMd?.trim() || run.summary || ''}</TicketMarkdown>
+      )}
+      {run.error && <p className="whitespace-pre-wrap text-body text-danger">{run.error}</p>}
     </div>
   )
 }

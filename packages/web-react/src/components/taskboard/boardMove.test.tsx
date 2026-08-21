@@ -6,6 +6,7 @@ import { ApiError } from '../../lib/api'
 import { createMemoryAuthSession } from '../../lib/authSession'
 import {
   type AllowedMove,
+  LAST_PROJECT_STORAGE_KEY,
   type PipelineStage,
   type Project,
   type Ticket,
@@ -24,6 +25,7 @@ afterEach(() => {
   cleanup()
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
+  localStorage.removeItem(LAST_PROJECT_STORAGE_KEY)
 })
 
 const auth = createMemoryAuthSession(() => {}, 'tok-move')
@@ -159,11 +161,13 @@ function renderBoard(over: Partial<ComponentProps<typeof TaskboardView>> = {}) {
 
 function stubBoard(input: {
   backlog?: Ticket[]
+  inbox?: Ticket[]
   columns?: Array<{ stage: PipelineStage; tickets: Ticket[] }>
   ticketType?: Ticket['type']
   list?: Ticket[]
 }) {
   const backlog = input.backlog ?? []
+  const inbox = input.inbox ?? []
   const columns = input.columns ?? [
     { stage: s1, tickets: [] },
     { stage: s2, tickets: [] },
@@ -174,7 +178,7 @@ function stubBoard(input: {
   vi.spyOn(taskboardApi, 'listAgents').mockResolvedValue([])
   vi.spyOn(taskboardApi, 'listTickets').mockImplementation(async (_a, q) => {
     if (q?.status === 'backlog') return { items: backlog, total: backlog.length }
-    return { items: input.list ?? [...backlog, ...columns.flatMap((c) => c.tickets)], total: 0 }
+    return { items: input.list ?? [...backlog, ...inbox, ...columns.flatMap((c) => c.tickets)], total: 0 }
   })
   const getBoard = vi
     .spyOn(taskboardApi, 'getProjectBoard')
@@ -191,7 +195,7 @@ function stubBoard(input: {
       },
       ticketType: type ?? ticketType,
       columns,
-      inbox: [],
+      inbox: type && type !== ticketType ? [] : inbox,
       backlog: { tickets: type && type !== ticketType ? [] : backlog },
     }))
   return { getBoard }
@@ -210,6 +214,7 @@ describe('移动端阶段导航', () => {
 
     const nav = await screen.findByTestId('board-mobile-stage-nav')
     expect(within(nav).getByRole('button', { name: '查看积压，1条单据' })).toBeInTheDocument()
+    expect(within(nav).getByRole('button', { name: '查看待确认，0条单据' })).toBeInTheDocument()
     const target = within(nav).getByRole('button', { name: '查看定位根因，1条单据' })
     const scroller = screen.getByTestId('board-columns-scroller')
     const scrollTo = vi.fn()
@@ -218,6 +223,36 @@ describe('移动端阶段导航', () => {
     fireEvent.click(target)
 
     expect(scrollTo).toHaveBeenCalledWith(expect.objectContaining({ behavior: 'smooth' }))
+  })
+
+  test('waiting_human 出现在待确认列，终态不占阶段列', async () => {
+    const waiting = sampleTicket({
+      id: 'wait-1',
+      identifier: 'TEST-2',
+      status: 'waiting_human',
+      stageId: 's1',
+    })
+    const canceled = sampleTicket({
+      id: 'cx-1',
+      identifier: 'TEST-1',
+      status: 'canceled',
+      stageId: 's1',
+      title: '已取消的空单',
+    })
+    stubBoard({
+      inbox: [waiting],
+      columns: [
+        { stage: s1, tickets: [waiting, canceled] },
+        { stage: s2, tickets: [] },
+      ],
+    })
+    renderBoard()
+    const inbox = await screen.findByTestId('taskboard-inbox-column')
+    expect(within(inbox).getByText('TEST-2')).toBeInTheDocument()
+    const stageCols = screen.getAllByTestId('taskboard-column')
+    expect(stageCols.some((col) => col.textContent?.includes('TEST-2'))).toBe(false)
+    expect(stageCols.some((col) => col.textContent?.includes('TEST-1'))).toBe(false)
+    expect(screen.queryByText('已取消的空单')).not.toBeInTheDocument()
   })
 })
 
@@ -520,9 +555,8 @@ describe('积压列与有条件拖动', () => {
       cols.find((el) => el.getAttribute('data-stage-id') === id) as HTMLElement
     expect(col('s1')).toHaveAttribute('data-drop-allowed', 'true')
     expect(col('s1')).not.toHaveAttribute('data-drop-disabled')
-    expect(col('s2')).toHaveAttribute('data-drop-source', 'true')
-    expect(col('s2')).not.toHaveAttribute('data-drop-disabled')
-    expect(col('s2')).not.toHaveAttribute('aria-disabled')
+    expect(screen.getByTestId('taskboard-inbox-column')).toHaveAttribute('data-drop-source', 'true')
+    expect(col('s2')).toHaveAttribute('data-drop-disabled', 'true')
     expect(col('s3')).toHaveAttribute('data-drop-disabled', 'true')
     expect(col('s3')).toHaveAttribute('aria-disabled', 'true')
     expect(col('s3')).not.toHaveAttribute('data-drop-source')
@@ -609,7 +643,7 @@ describe('旧积压视图兼容与新建单据', () => {
       'true',
     )
     expect(screen.queryByRole('tab', { name: /积压/ })).not.toBeInTheDocument()
-    expect(screen.getByText('遗留需求')).toBeInTheDocument()
+    expect(await screen.findByText('遗留需求')).toBeInTheDocument()
     await act(async () => {
       fireEvent.click(screen.getByTestId('ticket-ready'))
     })

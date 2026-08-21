@@ -12,11 +12,15 @@ import {
   type TicketMoveInput,
   type TicketMoveResult,
   type TicketType,
+  ACTIVE_LIST_STATUSES,
   boardErrorCode,
   boardErrorDetail,
   isVersionConflict,
+  pickInitialProject,
+  readLastProjectId,
   taskboardApi,
   taskboardErrorMessage,
+  writeLastProjectId,
 } from '../../lib/taskboard'
 import type { AuthSession } from '../../lib/types'
 import { useToast } from '../ui'
@@ -60,7 +64,7 @@ export function useTaskboard(
   const [agents, setAgents] = useState<BoardAgent[]>([])
   const [projectId, setProjectId] = useState<string | null>(null)
   const [ticketType, setTicketType] = useState<TicketType | ''>(ticketTypeFromUrl ?? '')
-  const [listQuery, setListQuery] = useState<TicketListQuery>({})
+  const [listQuery, setListQuery] = useState<TicketListQuery>({ status: ACTIVE_LIST_STATUSES })
   const [backlogTickets, setBacklogTickets] = useState<Ticket[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -236,7 +240,7 @@ export function useTaskboard(
     try {
       const [freshProjects, freshList, freshAgents] = await Promise.all([
         taskboardApi.listProjects(a),
-        taskboardApi.listTickets(a, { limit: 200 }),
+        taskboardApi.listTickets(a, { status: ACTIVE_LIST_STATUSES, limit: 200 }),
         taskboardApi.listAgents(a).catch(() => [] as BoardAgent[]),
       ])
       if (!mounted.current) return
@@ -244,9 +248,10 @@ export function useTaskboard(
       setProjects(freshProjects)
       setTickets(freshList.items)
       setAgents(freshAgents)
-      const first = freshProjects[0]
+      const first = pickInitialProject(freshProjects, readLastProjectId())
       if (first) {
         setProjectId(first.id)
+        writeLastProjectId(first.id)
         try {
           const [snap, backlog] = await Promise.all([
             taskboardApi.getProjectBoard(a, first.id, boardQueryType()),
@@ -300,6 +305,7 @@ export function useTaskboard(
     async (id: string, type?: TicketType | '') => {
       setProjectId(id)
       projectIdRef.current = id
+      writeLastProjectId(id)
       if (type !== undefined) {
         setTicketType(type)
         ticketTypeRef.current = type

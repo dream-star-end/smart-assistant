@@ -471,6 +471,8 @@ export interface TaskboardUsage {
   runsToday: number
   costTodayUsd: number
   activeRuns: number
+  /** 今日 token>0 且 cost 为 0/null 的 run 数。美元顶开启时用于失败关闭。 */
+  unpricedRunsToday?: number
 }
 
 export type TaskboardSettingsSnapshot = TaskboardSettings & {
@@ -972,6 +974,75 @@ export function emptyCostSlice(): CostSlice {
   return { runCount: 0, tokensIn: 0, tokensOut: 0, costUsd: 0 }
 }
 
+/** 列表默认只看在途，终态要显式筛选。 */
+export const ACTIVE_LIST_STATUSES = 'backlog,ready,running,waiting_human,blocked'
+
+export const LAST_PROJECT_STORAGE_KEY = 'oc-taskboard.lastProjectId'
+
+/** 冒烟/E2E 项目不当默认落点。 */
+export const SMOKE_PROJECT_KEYS = new Set(['E2E'])
+
+export function readLastProjectId(): string | null {
+  try {
+    return localStorage.getItem(LAST_PROJECT_STORAGE_KEY)
+  } catch {
+    return null
+  }
+}
+
+export function writeLastProjectId(id: string): void {
+  try {
+    localStorage.setItem(LAST_PROJECT_STORAGE_KEY, id)
+  } catch {
+    /* private mode / 无 storage */
+  }
+}
+
+export function pickInitialProject<T extends { id: string; key: string; archivedAt: number | null }>(
+  projects: T[],
+  rememberedId: string | null,
+): T | undefined {
+  const live = projects.filter((p) => !p.archivedAt)
+  if (rememberedId) {
+    const hit = live.find((p) => p.id === rememberedId)
+    if (hit) return hit
+  }
+  return live.find((p) => !SMOKE_PROJECT_KEYS.has(p.key)) ?? live[0]
+}
+
+/** 看板阶段列里的在办状态。积压/待确认/终态走自己的桶。 */
+export function isStageColumnStatus(status: string): boolean {
+  return (
+    status !== 'backlog' &&
+    status !== 'waiting_human' &&
+    status !== 'done' &&
+    status !== 'canceled'
+  )
+}
+
+export function stageColumnTickets<T extends { status: string }>(tickets: T[]): T[] {
+  return tickets.filter((t) => isStageColumnStatus(t.status))
+}
+
+/** inbox 与阶段列里的 waiting_human 并集，避免旧 API 只停在 AI 列时人找不到。 */
+export function collectInboxTickets<T extends { id: string; status: string }>(board: {
+  inbox?: T[]
+  columns?: Array<{ tickets: T[] }>
+}): T[] {
+  const seen = new Set<string>()
+  const out: T[] = []
+  const push = (ticket: T) => {
+    if (ticket.status !== 'waiting_human' || seen.has(ticket.id)) return
+    seen.add(ticket.id)
+    out.push(ticket)
+  }
+  for (const ticket of board.inbox ?? []) push(ticket)
+  for (const col of board.columns ?? []) {
+    for (const ticket of col.tickets) push(ticket)
+  }
+  return out
+}
+
 export function emptyCostTotals(): CostTotals {
   return {
     runCount: 0,
@@ -1174,6 +1245,14 @@ export const taskboardApi = {
       `/api/board/stages/${encodeURIComponent(id)}`,
       'PATCH',
       body,
+    ),
+
+  reorderStages: (a: AuthSession, pipelineId: string, orderedIds: string[]) =>
+    boardSend<{ ok: boolean; items: PipelineStage[] }>(
+      a,
+      `/api/board/pipelines/${encodeURIComponent(pipelineId)}/reorder`,
+      'PUT',
+      { orderedIds },
     ),
 
   listTickets: (a: AuthSession, query?: TicketListQuery) =>
