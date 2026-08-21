@@ -41,6 +41,8 @@ const REQUEST_ID_RE = /^[0-9a-f]{32}$/
 const ZCODE_SHUTDOWN_GRACE_DEFAULT_MS = 3_000
 const ZCODE_SHUTDOWN_FINAL_DRAIN_DEFAULT_MS = 3_000
 const ZCODE_HOOK_POLL_MS = 100
+const ZCODE_RELAY_POLL_MS = 100
+const ZCODE_RELAY_POLL_TIMEOUT_MS = 2_000
 const ZCODE_CONTENT_POLL_MS = 200
 const ZCODE_FINAL_CONTENT_DRAIN_ATTEMPTS = 4
 const ZCODE_FINAL_CONTENT_DRAIN_DELAY_MS = 25
@@ -102,6 +104,12 @@ interface ZcodeTurnContext {
   hookCarry: string
   hookTimer: NodeJS.Timeout | null
   contentTimer: NodeJS.Timeout | null
+  relayTimer: NodeJS.Timeout | null
+  relayPolling: boolean
+  relayAfter: number
+  relaySawContent: boolean
+  relayLastKind: 'reasoning' | 'text' | null
+  relayBaseUrl: string | null
   zcodeSessionId: string | null
   contentParts: Map<string, {
     kind: ZcodeContentPart['kind']
@@ -457,6 +465,12 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
       hookCarry: '',
       hookTimer: null,
       contentTimer: null,
+      relayTimer: null,
+      relayPolling: false,
+      relayAfter: 0,
+      relaySawContent: false,
+      relayLastKind: null,
+      relayBaseUrl: null,
       zcodeSessionId: null,
       contentParts: new Map(),
       pendingHookRecords: new Map(),
@@ -530,6 +544,10 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
       clearInterval(ctx.contentTimer)
       ctx.contentTimer = null
     }
+    if (ctx.relayTimer) {
+      clearInterval(ctx.relayTimer)
+      ctx.relayTimer = null
+    }
     cleanupZcodePlatformArtifacts(ctx.artifacts)
     ctx.artifacts = null
     ctx.hookOffset = 0
@@ -552,6 +570,100 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
       try { this.drainContentSnapshot(ctx) } catch { /* observability must not affect the turn */ }
     }, ZCODE_CONTENT_POLL_MS)
     ctx.contentTimer.unref()
+  }
+
+  private acceptRelayDelta(
+    ctx: ZcodeTurnContext,
+    event: { seq: number; kind: 'thinking' | 'text'; text: string },
+  ): void {
+    const partKind: ZcodeContentPart['kind'] = event.kind === 'thinking' ? 'reasoning' : 'text'
+    const segments = partKind === 'reasoning' ? ctx.thinkingSegments : ctx.assistantSegments
+    const maxChars = partKind === 'reasoning' ? ZCODE_THINKING_MAX_CHARS : ZCODE_ASSISTANT_MAX_CHARS
+    const used = segments.reduce((sum, segment) => sum + segment.text.length, 0)
+    const text = event.text.slice(0, Math.max(0, maxChars - used))
+    if (!text) return
+    let segment = ctx.relayLastKind === partKind ? segments.at(-1) : undefined
+    if (!segment) {
+      segment = {
+        index: segments.length,
+        text: '',
+        ts: Date.now(),
+        eventOrdinal: ctx.params.nextDurableEventOrdinal?.(),
+      }
+      segments.push(segment)
+    }
+    segment.text += text
+    ctx.relayLastKind = partKind
+    ctx.relaySawContent = true
+    this.refreshAggregates(ctx)
+    this.emitContentDelta(ctx, {
+      id: `relay-${event.seq}`,
+      kind: partKind,
+      text,
+      ts: segment.ts,
+      truncated: false,
+    }, text, segment.index)
+  }
+
+  private async pollRelayEvents(ctx: ZcodeTurnContext): Promise<void> {
+    if (ctx.relayPolling || ctx.terminal || !ctx.relayBaseUrl) return
+    const containerToken = process.env.OPENCLAUDE_V3_CONTAINER_TOKEN?.trim()
+    if (!containerToken || !/^oc-v3\.\d+\.[0-9a-f]{64}$/.test(containerToken)) return
+    ctx.relayPolling = true
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), ZCODE_RELAY_POLL_TIMEOUT_MS)
+    try {
+      const response = await fetch(
+        `${ctx.relayBaseUrl}/events?after=${ctx.relayAfter}`,
+        {
+          method: 'GET',
+          headers: { authorization: `Bearer ${containerToken}` },
+          signal: controller.signal,
+        },
+      )
+      if (!response.ok) return
+      const body = await response.json() as {
+        events?: unknown
+        next?: unknown
+      }
+      if (Array.isArray(body.events)) {
+        for (const raw of body.events) {
+          if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue
+          const event = raw as Record<string, unknown>
+          if (
+            typeof event.seq !== 'number' ||
+            !Number.isSafeInteger(event.seq) ||
+            event.seq <= ctx.relayAfter ||
+            (event.kind !== 'thinking' && event.kind !== 'text') ||
+            typeof event.text !== 'string'
+          ) continue
+          this.acceptRelayDelta(ctx, {
+            seq: event.seq,
+            kind: event.kind,
+            text: event.text,
+          })
+          ctx.relayAfter = event.seq
+        }
+      }
+      if (
+        typeof body.next === 'number' &&
+        Number.isSafeInteger(body.next) &&
+        body.next > ctx.relayAfter
+      ) ctx.relayAfter = body.next
+    } catch {
+      // Relay streaming is an optional live projection. SQLite/final JSON remain authoritative.
+    } finally {
+      clearTimeout(timeout)
+      ctx.relayPolling = false
+    }
+  }
+
+  private startRelayDrain(ctx: ZcodeTurnContext): void {
+    if (ctx.relayTimer || !this.route?.baseUrl) return
+    ctx.relayBaseUrl = this.route.baseUrl.replace(/\/+$/, '')
+    void this.pollRelayEvents(ctx)
+    ctx.relayTimer = setInterval(() => { void this.pollRelayEvents(ctx) }, ZCODE_RELAY_POLL_MS)
+    ctx.relayTimer.unref()
   }
 
   private drainHookJournal(ctx: ZcodeTurnContext): void {
@@ -655,6 +767,7 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
   }
 
   private drainContentSnapshot(ctx: ZcodeTurnContext): string | null {
+    if (ctx.relaySawContent) return null
     const databaseFile = ctx.artifacts?.databaseFile
     const sessionId = ctx.zcodeSessionId
     if (!databaseFile || !sessionId) return null
@@ -664,10 +777,37 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
     return JSON.stringify(snapshot.parts.map((part) => [part.id, part.kind, part.text]))
   }
 
+  private reconcileContentSnapshot(ctx: ZcodeTurnContext): string | null {
+    const databaseFile = ctx.artifacts?.databaseFile
+    const sessionId = ctx.zcodeSessionId
+    if (!databaseFile || !sessionId) return null
+    const snapshot = readZcodeContentSnapshot({ databaseFile, sessionId, startedAt: ctx.startedAt })
+    if (!snapshot.available) return null
+    const rebuild = (
+      kind: ZcodeContentPart['kind'],
+      existing: SegmentRecord[],
+    ): SegmentRecord[] => snapshot.parts
+      .filter((part) => part.kind === kind)
+      .map((part, index) => ({
+        index,
+        text: part.text,
+        ts: part.ts,
+        eventOrdinal: existing[index]?.eventOrdinal ?? ctx.params.nextDurableEventOrdinal?.(),
+      }))
+    const thinking = rebuild('reasoning', ctx.thinkingSegments)
+    const assistant = rebuild('text', ctx.assistantSegments)
+    if (thinking.length > 0) ctx.thinkingSegments = thinking
+    if (assistant.length > 0) ctx.assistantSegments = assistant
+    this.refreshAggregates(ctx)
+    return JSON.stringify(snapshot.parts.map((part) => [part.id, part.kind, part.text]))
+  }
+
   private async drainContentStable(ctx: ZcodeTurnContext): Promise<void> {
     let previous: string | null = null
     for (let attempt = 0; attempt < ZCODE_FINAL_CONTENT_DRAIN_ATTEMPTS; attempt++) {
-      const current = this.drainContentSnapshot(ctx)
+      const current = ctx.relaySawContent
+        ? this.reconcileContentSnapshot(ctx)
+        : this.drainContentSnapshot(ctx)
       if (current !== null && current === previous) return
       previous = current
       if (attempt + 1 < ZCODE_FINAL_CONTENT_DRAIN_ATTEMPTS) {
@@ -678,6 +818,7 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
 
   private ensureToolStart(ctx: ZcodeTurnContext, record: ZcodeHookRecord): void {
     if (ctx.tools.has(record.toolCallId)) return
+    ctx.relayLastKind = null
     const input = inputObject(record.toolInput)
     const arrivedAt = eventTimestamp(record.timestamp)
     const entry: TurnToolEntry = {
@@ -857,6 +998,7 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
     ctx.proc = proc
     this.startHookDrain(ctx)
     this.startContentDrain(ctx)
+    this.startRelayDrain(ctx)
     if (ctx.abandoned) {
       killProcessGroup(proc, 'SIGKILL')
       detachChildStdio(proc)
@@ -966,6 +1108,7 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
       this.nativeId = sessionId
       this.emit('session_id', sessionId)
       this.bindZcodeSession(ctx, sessionId)
+      await this.pollRelayEvents(ctx)
       await this.drainContentStable(ctx)
     }
     ctx.lastUsage = parseUsage(parsed.usage)

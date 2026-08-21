@@ -6,6 +6,8 @@
  */
 import assert from 'node:assert/strict'
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { createServer } from 'node:http'
+import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, test } from 'node:test'
@@ -58,6 +60,15 @@ function createOpts(cwd: string, model = 'zcode-experimental'): EngineCreateOpts
 function restoreEnv(name: string, value: string | undefined): void {
   if (value === undefined) Reflect.deleteProperty(process.env, name)
   else process.env[name] = value
+}
+
+async function listen(server: ReturnType<typeof createServer>): Promise<number> {
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  return (server.address() as AddressInfo).port
+}
+
+async function closeServer(server: ReturnType<typeof createServer>): Promise<void> {
+  await new Promise<void>((resolve, reject) => server.close((err) => err ? reject(err) : resolve()))
 }
 
 describe('ZcodeAdapter', () => {
@@ -354,6 +365,98 @@ process.stdout.write(${JSON.stringify(`${JSON.stringify(successFixture)}\n`)})
     } finally {
       restoreEnv('OC_ZCODE_CLI_BIN', previousBin)
       restoreEnv('OPENCLAUDE_HOME', previousHome)
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('streams relay SSE deltas before CLI final and keeps final text exact', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-zcode-relay-stream-'))
+    const fake = path.join(dir, 'fake-zcode-relay-stream.cjs')
+    await writeFile(path.join(dir, 'persona.md'), 'persona-line')
+    await writeFile(fake, [
+      '#!/usr/bin/env node',
+      "setTimeout(() => process.stdout.write(JSON.stringify({sessionId:'sess_prior',response:'第一第二',usage:{inputTokens:12,outputTokens:4,cacheReadTokens:0,cacheWriteTokens:0},eventCount:3,projection:{status:'idle',turnCount:1,totalTokenCount:16,contextUsed:16,contextWindow:1000}})+'\\n'), 1200)",
+    ].join('\n'))
+    await chmod(fake, 0o755)
+    const token = 'f'.repeat(64)
+    let observedAuth = ''
+    const server = createServer((req, res) => {
+      observedAuth = String(req.headers.authorization ?? '')
+      const parsed = new URL(req.url ?? '/', 'http://local')
+      const after = Number(parsed.searchParams.get('after') ?? '0')
+      const events = after < 2
+        ? [
+            { seq: 1, kind: 'thinking', text: '先思考' },
+            { seq: 2, kind: 'text', text: '第一' },
+          ]
+        : after < 3
+          ? [{ seq: 3, kind: 'text', text: '第二' }]
+          : []
+      res.setHeader('content-type', 'application/json')
+      res.end(JSON.stringify({ events, next: events.at(-1)?.seq ?? after, done: false }))
+    })
+    const port = await listen(server)
+    const previousBin = process.env.OC_ZCODE_CLI_BIN
+    const previousContainerToken = process.env.OPENCLAUDE_V3_CONTAINER_TOKEN
+    process.env.OC_ZCODE_CLI_BIN = fake
+    process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = `oc-v3.1.${'a'.repeat(64)}`
+    try {
+      const adapter = new ZcodeAdapter(createOpts(dir))
+      adapter.setZcodeRoute({
+        baseUrl: `http://127.0.0.1:${port}/internal/v5/zcode-relay/route/${token}`,
+        routeToken: token,
+      })
+      const events: Array<{ at: number; event: EngineEvent }> = []
+      const startedAt = Date.now()
+      adapter.on('error', () => {})
+      const run = adapter.submitTurn({
+        input: 'relay stream',
+        requestId: REQUEST_ID,
+        assistantMessageId: 'relay-answer',
+        thinkingMessageId: 'relay-thinking',
+        onEvent: (event) => events.push({ at: Date.now() - startedAt, event }),
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run.submitted
+      const deadline = Date.now() + 800
+      while (
+        Date.now() < deadline &&
+        events
+          .filter(({ event }) => event.kind === 'block' && event.block.kind === 'text')
+          .map(({ event }) => event.kind === 'block' && event.block.kind === 'text' ? event.block.text : '')
+          .join('') !== '第一第二'
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 25))
+      }
+      assert.equal(events.some(({ event }) => event.kind === 'final'), false)
+      assert.equal(
+        events
+          .filter(({ event }) => event.kind === 'block' && event.block.kind === 'text')
+          .map(({ event }) => event.kind === 'block' && event.block.kind === 'text' ? event.block.text : '')
+          .join(''),
+        '第一第二',
+      )
+      assert.equal(
+        events.filter(({ event }) => event.kind === 'block' && event.block.kind === 'text').length,
+        2,
+      )
+      const summary = await run.summary
+      assert.equal(summary?.thinkingText, '先思考')
+      assert.equal(summary?.assistantText, '第一第二')
+      assert.equal(
+        events
+          .filter(({ event }) => event.kind === 'block' && event.block.kind === 'text')
+          .map(({ event }) => event.kind === 'block' && event.block.kind === 'text' ? event.block.text : '')
+          .join(''),
+        '第一第二',
+      )
+      assert.equal(events.at(-1)?.event.kind, 'final')
+      assert.equal(observedAuth, `Bearer oc-v3.1.${'a'.repeat(64)}`)
+    } finally {
+      restoreEnv('OC_ZCODE_CLI_BIN', previousBin)
+      restoreEnv('OPENCLAUDE_V3_CONTAINER_TOKEN', previousContainerToken)
+      await closeServer(server)
       await rm(dir, { recursive: true, force: true })
     }
   })

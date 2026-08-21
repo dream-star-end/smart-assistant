@@ -19,6 +19,7 @@ import {
 } from "../billing/zcodeRouteContext.js";
 import { STATIC_PROVIDER_META } from "../http/proxy/staticProviderMeta.js";
 import {
+  _resetZcodeRelayStreamJournalsForTests,
   ZCODE_OFFICIAL_UPSTREAM,
   ZCODE_RELAY_PREFIX,
   makeZcodeRelayHandler,
@@ -118,6 +119,79 @@ describe("internal ZCode relay dispatcher", () => {
       assert.notEqual(captured.dispatcher, getGlobalDispatcher());
       assert.equal(captured.auth, "Bearer not-a-real-key");
     } finally {
+      await close(server);
+    }
+  });
+
+  test("taps Anthropic SSE deltas into a container-authenticated live journal", async () => {
+    const token = await mintRoute();
+    _resetZcodeRelayStreamJournalsForTests();
+    const sse = [
+      'event: content_block_delta\n',
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"先想"}}\n\n',
+      'event: content_block_delta\r\n',
+      'data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"第一段"}}\r\n\r\n',
+      'event: content_block_delta\n',
+      'data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"第二段"}}\n\n',
+    ];
+    const encodedSse = Buffer.from(sse.join(""), "utf8");
+    const splitAt = encodedSse.indexOf(Buffer.from("第一段", "utf8")) + 1;
+    const chunks = [encodedSse.subarray(0, splitAt), encodedSse.subarray(splitAt)];
+    const handler = makeZcodeRelayHandler({
+      identityRepo: repo(),
+      codingPlanKey: "not-a-real-key",
+      requestFn: (async () => ({
+        statusCode: 200,
+        headers: { "content-type": "text/event-stream", connection: "close" },
+        body: Readable.from(chunks),
+      })) as never,
+    });
+    const server = createServer((req, res) => { void handler(req, res, CTX); });
+    const port = await listen(server);
+    try {
+      const response = await fetch(
+        `http://127.0.0.1:${port}${ZCODE_RELAY_PREFIX}/route/${token}/v1/messages`,
+        {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${CONTAINER_TOKEN}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({ model: "ignored", messages: [] }),
+        },
+      );
+      assert.equal(response.status, 200);
+      assert.equal(await response.text(), encodedSse.toString("utf8"));
+      const eventsResponse = await fetch(
+        `http://127.0.0.1:${port}${ZCODE_RELAY_PREFIX}/route/${token}/events?after=0`,
+        { headers: { authorization: `Bearer ${CONTAINER_TOKEN}` } },
+      );
+      assert.equal(eventsResponse.status, 200);
+      assert.deepEqual(await eventsResponse.json(), {
+        events: [
+          { seq: 1, kind: "thinking", text: "先想" },
+          { seq: 2, kind: "text", text: "第一段" },
+          { seq: 3, kind: "text", text: "第二段" },
+        ],
+        next: 3,
+        done: true,
+      });
+      const tail = await fetch(
+        `http://127.0.0.1:${port}${ZCODE_RELAY_PREFIX}/route/${token}/events?after=2`,
+        { headers: { authorization: `Bearer ${CONTAINER_TOKEN}` } },
+      );
+      assert.deepEqual(await tail.json(), {
+        events: [{ seq: 3, kind: "text", text: "第二段" }],
+        next: 3,
+        done: true,
+      });
+      const denied = await fetch(
+        `http://127.0.0.1:${port}${ZCODE_RELAY_PREFIX}/route/${token}/events?after=0`,
+        { headers: { authorization: `Bearer oc-v3.11.${"c".repeat(64)}` } },
+      );
+      assert.equal(denied.status, 401);
+    } finally {
+      _resetZcodeRelayStreamJournalsForTests();
       await close(server);
     }
   });
