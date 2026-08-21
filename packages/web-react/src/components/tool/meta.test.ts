@@ -481,3 +481,43 @@ describe("子任务摘要不回退到 prompt", () => {
     expect(toolSummary("delegate_task", { agentId: "coder", goal: "修显示层" })).toBe("→ coder 修显示层");
   });
 });
+
+describe("Grok 原生工具卡归一化", () => {
+  test("run_terminal_command + 字节数组输出 → Bash 终端卡可读文本", () => {
+    const linux = "Linux 6.8.0-117-generic\n";
+    const d = normalizeToolForDisplay({
+      toolName: "run_terminal_command",
+      inputJson: { command: "uname -a", description: "Collect OS info" },
+      output: JSON.stringify({ type: "Bash", output: [...new TextEncoder().encode(linux)] }),
+      _completed: true,
+    });
+    expect(d.name).toBe("Bash");
+    expect(d.input?.command).toBe("uname -a");
+    expect(d.tool.output).toBe(linux);
+    expect(resolveToolMeta(d.name, d.input).label).toBe("终端");
+    expect(toolSummary(d.name, d.input as Record<string, unknown>)).toBe("Collect OS info");
+  });
+
+  test("read_file path 别名 → Read.file_path", () => {
+    const d = normalizeToolForDisplay({
+      toolName: "GrokBuild:read_file",
+      inputJson: { path: "src/a.ts", offset: 10 },
+      output: JSON.stringify({ type: "FileContent", content: "export const x = 1\n" }),
+      _completed: true,
+    });
+    expect(d.name).toBe("Read");
+    expect(d.input?.file_path).toBe("src/a.ts");
+    expect(d.tool.output).toBe("export const x = 1\n");
+  });
+
+  test("search_replace 空 old_string 当写入", () => {
+    const d = normalizeToolForDisplay({
+      toolName: "search_replace",
+      inputJson: { path: "src/new.ts", old_string: "", new_string: "hello" },
+      _completed: true,
+    });
+    expect(d.name).toBe("Write");
+    expect(d.input?.file_path).toBe("src/new.ts");
+    expect(d.input?.content).toBe("hello");
+  });
+});

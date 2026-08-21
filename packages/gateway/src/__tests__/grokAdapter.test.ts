@@ -116,9 +116,13 @@ for (const event of [
         cacheCreationTokens: 2,
         totalTokens: 37,
       })
-      assert.equal(summary.tools[0]?.toolName, 'read_file')
+      assert.equal(summary.tools[0]?.toolName, 'Read')
       assert.equal(summary.tools[0]?.output, '{"lines":42}')
       assert.equal(summary.tools[0]?.completed, true)
+      assert.equal(
+        (summary.tools[0]?.inputJson as { file_path?: string } | null)?.file_path,
+        'a.ts',
+      )
       assert.equal(adapter.nativeSessionId, 'next-session')
       assert.equal(totals.turns, 1)
       assert.ok(events.some((event) => event.kind === 'final' && event.meta?.cacheCreationTokens === 2))

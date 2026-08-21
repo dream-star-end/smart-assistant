@@ -33,6 +33,7 @@ import { type EngineCreateOpts, registerEngine } from './registry.js'
 import { buildCodexEnv } from './codexShared.js'
 import { createLogger } from '../logger.js'
 import { detachChildStdio, killProcessGroup, shutdownTimeoutMs, waitForCloseWithin } from '../processGroupShutdown.js'
+import { grokProductToolInput, grokProductToolName, grokProductToolOutput } from './grokToolNormalize.js'
 
 const log = createLogger({ module: 'grokAdapter' })
 
@@ -528,8 +529,9 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     const id = typeof event.toolCallId === 'string' && event.toolCallId
       ? event.toolCallId
       : `grok-tool-${ctx.tools.size + 1}`
-    const toolName = asText(event.toolName || event.kind || event.title) || 'GrokTool'
-    const inputJson = event.rawInput ?? null
+    const nativeName = asText(event.toolName || event.kind || event.title) || 'GrokTool'
+    const inputJson = grokProductToolInput(nativeName, event.rawInput ?? null)
+    const toolName = grokProductToolName(nativeName, event.rawInput ?? null)
     const tool: TurnToolEntry = {
       toolUseId: id,
       blockId: id,
@@ -559,14 +561,17 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     if (!ctx.tools.has(id)) this.observeToolCall(ctx, { ...event, type: 'tool_call' })
     const tool = ctx.tools.get(id)!
     if (event.rawInput !== undefined) {
-      tool.inputJson = structuredClone(event.rawInput)
-      tool.inputPreview = asText(event.rawInput).slice(0, 500)
-      ctx.params.onEvent({ kind: 'block', block: { kind: 'tool_use', blockId: id, toolName: tool.toolName, inputJson: structuredClone(event.rawInput), inputPreview: tool.inputPreview, partial: false } })
+      const nativeName = asText(event.toolName || event.kind || event.title) || tool.toolName
+      tool.toolName = grokProductToolName(nativeName, event.rawInput)
+      tool.inputJson = structuredClone(grokProductToolInput(nativeName, event.rawInput))
+      tool.inputPreview = asText(tool.inputJson).slice(0, 500)
+      ctx.params.toolUseIdToName.set(id, tool.toolName)
+      ctx.params.onEvent({ kind: 'block', block: { kind: 'tool_use', blockId: id, toolName: tool.toolName, inputJson: structuredClone(tool.inputJson), inputPreview: tool.inputPreview, partial: false } })
     }
     const status = asText(event.status).toLowerCase()
     if (!['completed', 'complete', 'failed', 'error'].includes(status) || ctx.finalizedToolIds.has(id)) return
     const outputJson = event.rawOutput ?? event.content ?? null
-    const output = asText(outputJson)
+    const output = grokProductToolOutput(outputJson)
     const isError = status === 'failed' || status === 'error'
     tool.output = output
     tool.outputJson = structuredClone(outputJson)

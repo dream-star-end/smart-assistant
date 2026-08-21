@@ -93,6 +93,9 @@ describe("formatLiveActivityAction（活动行只显示中文动作，不堆工�
     expect(mappedLiveActivityLabel("StrReplace")).toBe("写入文件");
     expect(mappedLiveActivityLabel("TaskUpdate")).toBe("更新任务");
     expect(mappedLiveActivityLabel("Task")).toBe("运行子任务");
+    expect(mappedLiveActivityLabel("run_terminal_command")).toBe("执行 Shell");
+    expect(mappedLiveActivityLabel("read_file")).toBe("读取文件");
+    expect(mappedLiveActivityLabel("search_replace")).toBe("写入文件");
     expect(mappedLiveActivityLabel("Frobnicate")).toBeNull();
     expect(mappedLiveActivityLabel("CallMcpTool")).toBeNull();
   });
