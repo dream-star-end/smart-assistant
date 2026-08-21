@@ -599,8 +599,8 @@ export function Sidebar({
           )}
         />
       )}
-      <div className="flex flex-col gap-2 p-3" data-product-entry-scope="sidebar-primary">
-        <div className="flex items-center justify-between px-1.5 pb-1">
+      <div className="flex flex-col gap-1.5 px-2.5 pb-1.5 pt-2.5" data-product-entry-scope="sidebar-primary">
+        <div className="flex items-center justify-between px-1">
           <div className="flex items-center gap-2">
             <span className="flex size-7 items-center justify-center rounded-lg bg-grad-cta text-white">
               <Sparkles size={15} />
@@ -618,9 +618,9 @@ export function Sidebar({
           data-product-feature={PRODUCT_CAPABILITIES.chatBasics.id}
           variant="secondary"
           onClick={onNew}
-          className="h-auto w-full justify-start gap-2.5 rounded-xl px-3 py-2.5 text-section font-medium"
+          className="h-9 w-full justify-start gap-2 rounded-lg px-3 text-section font-medium"
         >
-          <Plus size={17} />
+          <Plus size={16} />
           新建会话
         </Button>
 
@@ -632,7 +632,7 @@ export function Sidebar({
             onClick={onOpenBoard}
             aria-current={boardActive ? "true" : undefined}
             className={cn(
-              "relative flex items-center gap-2.5 rounded-lg px-3 py-1.5 text-left text-body font-medium outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring",
+              "relative flex h-9 items-center gap-2 rounded-lg px-3 text-left text-section font-medium outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11",
               boardActive ? "bg-active text-fg" : "text-muted",
             )}
           >
@@ -641,35 +641,32 @@ export function Sidebar({
             )}
             <Kanban size={16} className="text-faint" />
             任务
-            <span className="ml-auto text-caption font-normal text-faint">看板</span>
           </button>
         )}
 
-        <div className="flex items-center gap-2 px-1.5 pt-1 text-caption font-medium text-faint">
-          <MessageSquareText size={14} className="shrink-0" />
-          <span>会话</span>
+        <div className="flex min-w-0 items-center gap-1">
+          <label className="flex h-9 min-w-0 flex-1 items-center gap-2 rounded-lg bg-hover px-2.5 transition-shadow focus-within:ring-2 focus-within:ring-ring [@media(hover:none)]:min-h-11">
+            <Search size={15} className="shrink-0 text-faint" />
+            <input
+              data-product-feature={PRODUCT_CAPABILITIES.sessions.id}
+              data-sidebar-search
+              aria-label="搜索会话"
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+              placeholder="搜索会话"
+              className="w-full min-w-0 bg-transparent text-base text-fg outline-none placeholder:text-faint md:text-sm"
+            />
+          </label>
           {onBatch && !multiSelect && (
             <button
               data-product-control
               type="button"
               onClick={() => setMultiSelect(true)}
-              className="ml-auto shrink-0 rounded-md px-1.5 py-1 text-caption font-normal text-faint outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+              className="h-9 shrink-0 rounded-md px-2 text-caption font-medium text-faint outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
             >
               多选
             </button>
           )}
-        </div>
-
-        <div className="flex min-w-0 items-center gap-2 rounded-lg bg-hover px-3 py-2 transition-shadow focus-within:ring-2 focus-within:ring-ring">
-          <Search size={15} className="shrink-0 text-faint" />
-          <input
-            data-product-feature={PRODUCT_CAPABILITIES.sessions.id}
-            data-sidebar-search
-            value={q}
-            onChange={(e) => setQ(e.target.value)}
-            placeholder="搜索会话"
-            className="w-full min-w-0 bg-transparent text-base text-fg outline-none placeholder:text-faint md:text-sm"
-          />
         </div>
       </div>
 

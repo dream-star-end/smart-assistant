@@ -291,9 +291,10 @@ describe("Sidebar 任务面板入口", () => {
   it("传入 onOpenBoard 时渲染入口，并用 data-product-control 标注", () => {
     const onOpenBoard = vi.fn();
     renderSidebar({ onOpenBoard, boardActive: true });
-    const btn = screen.getByRole("button", { name: /任务/ });
+    const btn = screen.getByRole("button", { name: "任务" });
     expect(btn).toHaveAttribute("data-product-control");
     expect(btn).toHaveAttribute("aria-current", "true");
+    expect(btn).not.toHaveTextContent("看板");
     fireEvent.click(btn);
     expect(onOpenBoard).toHaveBeenCalled();
   });
@@ -871,11 +872,18 @@ describe("Sidebar 归档与批量", () => {
     expect(onBatch).toHaveBeenCalledWith(["s-beta"], "archive", undefined);
   });
 
-  it("会话标题栏常驻「多选」，不依赖行 hover，移动端也能进多选", () => {
+  it("搜索行常驻「多选」，不依赖行 hover，移动端也能进多选", () => {
     const onBatch = vi.fn();
     renderSidebar({ sessions: listSessions, onBatch });
+    const chrome = document.querySelector("[data-product-entry-scope='sidebar-primary']");
+    expect(chrome).not.toBeNull();
+    expect(
+      Array.from(chrome!.querySelectorAll("span,button")).some((el) => el.textContent?.trim() === "会话"),
+    ).toBe(false);
     const entry = screen.getByRole("button", { name: "多选" });
     expect(entry).toBeVisible();
+    expect(chrome!.contains(entry)).toBe(true);
+    expect(chrome!.contains(screen.getByPlaceholderText("搜索会话"))).toBe(true);
     fireEvent.click(entry);
     expect(screen.getByTestId("sidebar-batch-bar")).toHaveTextContent("已选 0 条");
     expect(screen.getByLabelText("选择 季度复盘 Alpha")).toBeInTheDocument();
