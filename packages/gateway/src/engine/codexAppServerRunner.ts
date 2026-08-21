@@ -901,7 +901,7 @@ function codexReverseRpcKey(id: number | string): string {
   return JSON.stringify([typeof id, id])
 }
 
-/** Project Codex 0.144.0 ToolRequestUserInputParams onto the already-shipped
+/** Project Codex 0.144/0.149 ToolRequestUserInputParams onto the already-shipped
  * CCB AskUserQuestion input shape. Codex has no multiSelect request field;
  * every model-facing option list is mutually exclusive, so the projection is
  * explicitly single-select. Protocol-only fields are retained as harmless
@@ -944,16 +944,29 @@ function normalizeCodexUserInput(paramsUnk: unknown): NormalizedCodexUserInput |
   }
   if (questions.length === 0) return null
 
+  const isBlocking = params.isBlocking
+  if (isBlocking !== undefined && typeof isBlocking !== 'boolean') return null
   const autoResolutionMs = params.autoResolutionMs
   if (
     autoResolutionMs !== undefined &&
     autoResolutionMs !== null &&
     (typeof autoResolutionMs !== 'number' ||
       !Number.isSafeInteger(autoResolutionMs) ||
-      autoResolutionMs < 0)
+      autoResolutionMs < 60_000 ||
+      autoResolutionMs > 240_000)
   ) {
     return null
   }
+
+  // 0.149 makes isBlocking authoritative and deprecates autoResolutionMs.
+  // Legacy 0.144 requests omit isBlocking, so preserve their old duration
+  // semantics. A new non-blocking request without a usable legacy duration
+  // receives the platform minimum instead of becoming accidentally blocking.
+  const effectiveAutoResolutionMs = isBlocking === true
+    ? undefined
+    : isBlocking === false
+      ? typeof autoResolutionMs === 'number' ? autoResolutionMs : 60_000
+      : typeof autoResolutionMs === 'number' ? autoResolutionMs : undefined
 
   return {
     threadId,
@@ -962,7 +975,9 @@ function normalizeCodexUserInput(paramsUnk: unknown): NormalizedCodexUserInput |
     questions,
     input: {
       questions: inputQuestions,
-      ...(typeof autoResolutionMs === 'number' ? { autoResolutionMs } : {}),
+      ...(typeof effectiveAutoResolutionMs === 'number'
+        ? { autoResolutionMs: effectiveAutoResolutionMs }
+        : {}),
     },
   }
 }
@@ -1460,7 +1475,7 @@ export class CodexAppServerRunner extends EventEmitter {
       for (const question of pending.questions) {
         const answer = answersByQuestionText[question.question]
         if (typeof answer !== 'string' || answer.trim().length === 0) continue
-        // Codex 0.144.0 has no multiSelect input field. Its response still
+        // Codex 0.144/0.149 has no multiSelect input field. Its response still
         // uses an array so future/internal callers can express more than one
         // value; the existing AskUserQuestion card supplies one string.
         codexAnswers[question.id] = { answers: [answer] }

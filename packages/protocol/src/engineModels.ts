@@ -164,7 +164,7 @@ export function isGrokEngineModel(modelId: string | null | undefined): boolean {
 
 /**
  * Experimental community ZCode CLI engine (bundled `zcode.cjs` 0.16.3 from
- * official desktop AppImage 3.7.7). Not an official standalone CLI product.
+ * official desktop AppImage 3.8.1). Not an official standalone CLI product.
  * `id` is the hidden canary. Public `glm-5.3-zai` stays a catalog row and is
  * only mapped here for CLI transport after an audited engine switch.
  * `upstreamModel` is the provider/model string 0.16.3 accepts via config

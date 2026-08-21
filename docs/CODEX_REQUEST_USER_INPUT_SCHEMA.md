@@ -141,3 +141,26 @@ input.questions[*].multiSelect = false
 `question text -> question id` 对照，回写时转换为 Codex 以 id 为 key 的 response。
 `annotations` 仍可通过现有白名单校验，但 0.144.0 response schema 没有 annotation
 字段，因此不会透传给 app-server。其他未知 server request 继续返回 `-32601`。
+
+## 2026-08-21：Codex 0.149.0 升级补充
+
+0.149.0 的实际二进制（SHA-256
+`bbc3341e44c9ead340ed9570c17be936e37870f570751a941699ffd04d672827`）重新执行同一
+`generate-json-schema --experimental` 命令后，`ToolRequestUserInputParams` 新增必需
+布尔字段 `isBlocking`；`autoResolutionMs` 仍可出现，但 schema 已标为 deprecated。
+`turn/steer` 的必需字段保持 `expectedTurnId`、`input`、`threadId`，同时 UserInput
+联合类型新增 `audio` 与 `localAudio`。
+
+OpenClaude 的兼容矩阵固定为：
+
+- `isBlocking: true`：不向平台提问卡附带自动结束时间；合法的旧
+  `autoResolutionMs` 不改变阻塞语义。
+- `isBlocking: false`：保留 60,000–240,000 ms 的合法值；缺省/null 时使用平台最小值
+  60,000 ms。
+- `isBlocking` 缺省：按 0.144.0 兼容路径处理；数字 duration 表示自动结束，缺省/null
+  表示阻塞。
+- 非布尔 `isBlocking`、非整数或越界 duration 返回 JSON-RPC `-32602`，不打开提问卡。
+
+字节级证据在
+`packages/gateway/src/__tests__/fixtures/codex-app-server-0.149.0/`，同时保留 0.144.0
+fixture 作为旧请求兼容与历史错误契约。

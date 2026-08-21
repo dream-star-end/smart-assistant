@@ -15,8 +15,8 @@ else
   echo "npm not available" > "$OUT_DIR/npm-skipped.txt"
 fi
 
-APP_VERSION=3.7.7
-APP_SHA=4eb1c759aa1dba923045c8cd8bc3ac0354e99f6be3c7fab3624372c1df940e62
+APP_VERSION=3.8.1
+APP_SHA=b420dea50961b77d5c75b08b924da41ab529c720a7ec32eacbe95a6d843199e0
 APP_URL="https://cdn-zcode.z.ai/zcode/electron/releases/${APP_VERSION}/linux-x64/ZCode-${APP_VERSION}-linux-x64.AppImage"
 archive="$OUT_DIR/ZCode-${APP_VERSION}-linux-x64.AppImage"
 
@@ -27,7 +27,7 @@ fi
 echo "${APP_SHA}  ${archive}" | sha256sum -c -
 chmod 0755 "$archive"
 
-# First hsqs offset is a false positive on 3.7.7. Use AppImage extract.
+# First hsqs offset is a false positive on 3.8.1. Use AppImage extract.
 (cd "$OUT_DIR" && "$archive" --appimage-extract)
 cjs=$(find "$OUT_DIR/squashfs-root" -name zcode.cjs -type f | head -1)
 test -n "$cjs"

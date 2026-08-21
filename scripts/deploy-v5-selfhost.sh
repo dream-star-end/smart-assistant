@@ -64,11 +64,14 @@ PG_DB="openclaude_v5_selfhost"
 PG_ROLE="oc_v5_selfhost"
 # catalog mutation 专用低权角色。必须与 PG_ROLE 不同名,否则 master 开 model authority 拒启。
 CATALOG_ADMIN_ROLE="${PG_ROLE}_catalog_admin"
+# model-authority cutover evidence is deliberately written under a distinct
+# NOLOGIN deploy role. The catalog admin role is read-only on deploy_state.
+MODEL_AUTHORITY_DEPLOY_ROLE="${PG_ROLE}_model_deploy"
 REDIS_URL="redis://127.0.0.1:6379/3"
 # Runtime image pin. Rebuild with:
-#   packages/commercial/agent-sandbox/build-image.sh v5-zcode-<12sha>-slim
+#   packages/commercial/agent-sandbox/build-image.sh v5-cli-codex0149-grok105-zcode381-slim
 # which auto-sources deploy/v5-selfhost/runtime-build.env (OC_INCLUDE_ZCODE=1).
-RUNTIME_IMAGE="openclaude/openclaude-runtime:v5-zcode-42fe21361628-slim"
+RUNTIME_IMAGE="openclaude/openclaude-runtime:v5-cli-codex0149-grok105-zcode381-slim"
 SECRETS_ENV="/etc/openclaude/secrets.env"
 PERSONAL_UNIT="openclaude.service"
 PERSONAL_PORT="18789"
@@ -1712,6 +1715,193 @@ cutover_compensate() { # <reason>
   return 1
 }
 
+# Selfhost has no commercial canary/observation lane. Once a deterministic
+# joint cutover has activated one exact source/runtime tuple and the live
+# master+egress smoke proves all model-authority capabilities, persist the
+# irreversible step-5 marker here. Never run this from ensure_model_authority:
+# that function executes before migrations/build/cutover and would bind the
+# evidence to the previous live tuple.
+persist_selfhost_model_authority_cutover() { # <exact live master release>
+  local rel="$1" live source_sha image image_id runtime_release bundle
+  local runtime_sha runtime_caps master_caps egress_caps insert_result
+  local db_exists role_check stored_ok db_recheck env_recheck
+
+  if [[ "$DRY" == 1 ]]; then
+    cutover_clog "  [dry-run] smoke 后以 NOLOGIN role ${MODEL_AUTHORITY_DEPLOY_ROLE} 写 DB cutover marker,再写 OC_MODEL_AUTHORITY_CUTOVER=1"
+    return 0
+  fi
+
+  [[ "$(oc_hotcfg_env_get "$V5_ENV" OC_MODEL_AUTHORITY)" == 1 ]] \
+    || die "model authority marker 拒写:OC_MODEL_AUTHORITY≠1"
+  [[ "$(oc_hotcfg_env_get "$V5_ENV" OC_MODEL_AUTHORITY_PROVISION_REQUIRED)" == 1 ]] \
+    || die "model authority marker 拒写:OC_MODEL_AUTHORITY_PROVISION_REQUIRED≠1"
+
+  # Existing DB evidence is irreversible. Do not rewrite its historical tuple;
+  # only repair the secondary env source if an earlier write stopped halfway.
+  db_exists="$(psql_as_postgres -d "$PG_DB" -qAt -c \
+    "SELECT EXISTS(SELECT 1 FROM model_authority_deploy_state WHERE key='cutover')::text" | tr -d '[:space:]')" \
+    || die "model authority marker 探测失败"
+  if [[ "$db_exists" == true ]]; then
+    ensure_env_kv "$V5_ENV" OC_MODEL_AUTHORITY_CUTOVER 1
+    env_recheck="$(oc_hotcfg_env_get "$V5_ENV" OC_MODEL_AUTHORITY_CUTOVER)"
+    [[ "$env_recheck" == 1 ]] || die "DB marker 已存在,但 env marker 修复失败"
+    cutover_clog "  ✓ model authority cutover marker 已存在;env 双源已补齐"
+    return 0
+  fi
+  if [[ "${CUTOVER_JOINT:-0}" != 1 ]]; then
+    cutover_clog "  · model authority DB marker 尚无;non-joint cutover 只切 master,不得创建 tuple cutover 证据"
+    return 0
+  fi
+
+  live="$(readlink -f "$MASTER_LIVE_LINK" 2>/dev/null || true)"
+  [[ -n "$live" && "$live" == "$rel" ]] \
+    || die "model authority marker 拒写:live=$live 不等于本次 smoke release=$rel"
+  case "$live" in
+    "$MASTER_RELEASES_ROOT"/rel-*) ;;
+    *) die "model authority marker 拒写:live 不在 releases 根:$live" ;;
+  esac
+  source_sha="$(jq -er '.sourceCommit | select(test("^[0-9a-f]{40}$"))' "$live/.complete")" \
+    || die "model authority marker 拒写:live .complete 缺精确 sourceCommit"
+
+  # Re-derive the active tuple after joint activation. Do not trust the build
+  # globals: env is what the restarted supervisor actually consumes.
+  image="$(oc_hotcfg_env_get "$V5_ENV" OC_RUNTIME_IMAGE)"
+  image_id="$(oc_hotcfg_env_get "$V5_ENV" OC_RUNTIME_IMAGE_ID)"
+  runtime_release="$(oc_hotcfg_env_get "$V5_ENV" OC_RUNTIME_RELEASE)"
+  bundle="$(oc_hotcfg_env_get "$V5_ENV" OC_PLATFORM_BUNDLE)"
+  [[ -n "$image" && -n "$image_id" && -n "$runtime_release" && -n "$bundle" ]] \
+    || die "model authority marker 拒写:active runtime tuple 不完整"
+  [[ "$(docker image inspect --format '{{.Id}}' "$image" 2>/dev/null || true)" == "$image_id" ]] \
+    || die "model authority marker 拒写:runtime image tag↔ID 漂移"
+  case "$runtime_release" in
+    "$OC_HOTCFG_RELEASES_ROOT"/rel-*) ;;
+    *) die "model authority marker 拒写:runtime release 路径非法:$runtime_release" ;;
+  esac
+  case "$bundle" in
+    "$OC_HOTCFG_PLATFORM_ROOT"/bundles/*) ;;
+    *) die "model authority marker 拒写:platform bundle 路径非法:$bundle" ;;
+  esac
+  [[ -f "$runtime_release/MANIFEST.json" && -f "$bundle/MANIFEST.json" ]] \
+    || die "model authority marker 拒写:active runtime/bundle manifest 缺失"
+  runtime_sha="$(jq -er '.sourceCommit' "$runtime_release/MANIFEST.json")" \
+    || die "model authority marker 拒写:runtime release 缺 sourceCommit"
+  [[ "$runtime_sha" == "$source_sha" ]] \
+    || die "model authority marker 拒写:master/runtime source 不同($source_sha != $runtime_sha)"
+  runtime_caps="$(jq -er '(.capabilities // []) | join(" ")' "$runtime_release/MANIFEST.json")" \
+    || die "model authority marker 拒写:runtime capabilities 不可读"
+  case " $runtime_caps " in *" model_authority_v1 "*) ;; *) die "model authority marker 拒写:runtime 未声明 model_authority_v1" ;; esac
+
+  master_caps="$(curl -fsS --max-time 5 "http://127.0.0.1:${V5_PORT}/healthz" \
+    | jq -er '(.runtime.capabilities // []) | join(" ")')" \
+    || die "model authority marker 拒写:master 活体 capability 不可读"
+  case " $master_caps " in *" model_authority_v1 "*) ;; *) die "model authority marker 拒写:master 活体缺 model_authority_v1" ;; esac
+  egress_caps="$(curl -fsS --max-time 5 \
+    "http://${V5_EGRESS_BIND}:${V5_EGRESS_PORT}/internal/v5/egress-health" \
+    | jq -er '(.capabilities // []) | join(" ")')" \
+    || die "model authority marker 拒写:egress 活体 capability 不可读"
+  case " $egress_caps " in *" model_authority_v1-egress "*) ;; *) die "model authority marker 拒写:egress 活体缺 model_authority_v1-egress" ;; esac
+
+  # postgres assumes the NOLOGIN deploy role only for the evidence transaction;
+  # migration 0144 remains the sole grant authority.
+  psql_as_postgres -d "$PG_DB" -q <<SQL
+DO \$role\$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname='${MODEL_AUTHORITY_DEPLOY_ROLE}') THEN
+    ALTER ROLE ${MODEL_AUTHORITY_DEPLOY_ROLE} NOLOGIN;
+  ELSE
+    CREATE ROLE ${MODEL_AUTHORITY_DEPLOY_ROLE} NOLOGIN;
+  END IF;
+END
+\$role\$;
+GRANT CONNECT ON DATABASE ${PG_DB} TO ${MODEL_AUTHORITY_DEPLOY_ROLE};
+SELECT fn_model_authority_grant_deploy_role('${MODEL_AUTHORITY_DEPLOY_ROLE}');
+SQL
+  role_check="$(psql_as_postgres -d "$PG_DB" -qAt <<SQL
+BEGIN;
+SET LOCAL ROLE ${MODEL_AUTHORITY_DEPLOY_ROLE};
+SELECT current_user || ':' ||
+  has_table_privilege(current_user,'model_authority_deploy_state','SELECT,INSERT,UPDATE')::text || ':' ||
+  has_table_privilege(current_user,'model_catalog','UPDATE')::text;
+ROLLBACK;
+SQL
+)"
+  role_check="$(printf '%s' "$role_check" | tr -d '[:space:]')"
+  [[ "$role_check" == "${MODEL_AUTHORITY_DEPLOY_ROLE}:true:false" ]] \
+    || die "model authority deploy role 权限边界错误:$role_check"
+  [[ "$(psql_as_postgres -d "$PG_DB" -qAt -c \
+    "SELECT (NOT rolcanlogin)::text FROM pg_roles WHERE rolname='${MODEL_AUTHORITY_DEPLOY_ROLE}'" | tr -d '[:space:]')" == true ]] \
+    || die "model authority deploy role 必须 NOLOGIN"
+
+  # Lock the singleton epoch in the same transaction that inserts the evidence.
+  # ON CONFLICT never rewrites irreversible history: a concurrent winner turns
+  # this attempt into the same env-repair path as the precheck above.
+  insert_result="$(psql_as_postgres -d "$PG_DB" -qAt \
+    -v release_sha="$source_sha" -v master_release="$live" \
+    -v image="$image" -v image_id="$image_id" \
+    -v runtime_release="$runtime_release" -v bundle="$bundle" <<SQL
+BEGIN;
+SET LOCAL ROLE ${MODEL_AUTHORITY_DEPLOY_ROLE};
+WITH locked_epoch AS MATERIALIZED (
+  SELECT epoch FROM model_security_epoch WHERE id FOR UPDATE
+), inserted AS (
+  INSERT INTO model_authority_deploy_state(key,value,description)
+  SELECT 'cutover',jsonb_build_object(
+    'at',NOW()::text,
+    'by','deploy-v5-selfhost.sh',
+    'kind','selfhost_deterministic_cutover',
+    'release_sha',:'release_sha',
+    'master_release',:'master_release',
+    'runtime_tuple',jsonb_build_object(
+      'image',:'image','image_id',:'image_id','release',:'runtime_release','bundle',:'bundle'
+    ),
+    'security_epoch',locked_epoch.epoch::text
+  ),'selfhost deterministic model-authority cutover after exact joint tuple smoke; baked rollback forbidden'
+  FROM locked_epoch
+  ON CONFLICT (key) DO NOTHING
+  RETURNING 1
+)
+SELECT CASE WHEN EXISTS(SELECT 1 FROM inserted) THEN 'inserted' ELSE 'existing' END;
+COMMIT;
+SQL
+)" || die "model authority DB marker 事务失败"
+  insert_result="$(printf '%s' "$insert_result" | tr -d '[:space:]')"
+  [[ "$insert_result" == inserted || "$insert_result" == existing ]] \
+    || die "model authority DB marker 事务返回非法:$insert_result"
+
+  if [[ "$insert_result" == inserted ]]; then
+    stored_ok="$(psql_as_postgres -d "$PG_DB" -qAt \
+      -v release_sha="$source_sha" -v master_release="$live" \
+      -v image="$image" -v image_id="$image_id" \
+      -v runtime_release="$runtime_release" -v bundle="$bundle" <<SQL
+SELECT (
+  value->>'kind'='selfhost_deterministic_cutover'
+  AND value->>'release_sha'=:'release_sha'
+  AND value->>'master_release'=:'master_release'
+  AND value->'runtime_tuple'->>'image'=:'image'
+  AND value->'runtime_tuple'->>'image_id'=:'image_id'
+  AND value->'runtime_tuple'->>'release'=:'runtime_release'
+  AND value->'runtime_tuple'->>'bundle'=:'bundle'
+  AND value->>'security_epoch' ~ '^[0-9]+$'
+)::text FROM model_authority_deploy_state WHERE key='cutover';
+SQL
+)" || die "model authority DB marker exact tuple 回读失败"
+    stored_ok="$(printf '%s' "$stored_ok" | tr -d '[:space:]')"
+    [[ "$stored_ok" == true ]] || die "model authority DB marker 回读与 exact tuple 不一致"
+  else
+    cutover_clog "  · 并发 deploy 已先写不可逆 marker;保留既有 DB 证据,只补 env"
+  fi
+
+  # DB is durable authority. Only after insert/existing confirmation may the env floor be set.
+  ensure_env_kv "$V5_ENV" OC_MODEL_AUTHORITY_CUTOVER 1
+
+  db_recheck="$(psql_as_postgres -d "$PG_DB" -qAt -c \
+    "SELECT EXISTS(SELECT 1 FROM model_authority_deploy_state WHERE key='cutover')::text" | tr -d '[:space:]')"
+  env_recheck="$(oc_hotcfg_env_get "$V5_ENV" OC_MODEL_AUTHORITY_CUTOVER)"
+  [[ "$db_recheck" == true && "$env_recheck" == 1 ]] \
+    || die "model authority 双源 marker 复核失败(DB=$db_recheck env=$env_recheck)"
+  cutover_clog "  ✓ model authority cutover marker 已按 DB→env 顺序绑定 exact live tuple"
+}
+
 cmd_cutover() {
   local rel head backup prev_val live_now expected_build step unit_snap
   CUTOVER_MUTATED=0
@@ -1939,6 +2129,7 @@ cmd_cutover() {
     || die "无法持久化 phase=committed。smoke 已通过,拒绝报告成功(survivor 仍可能误恢复)。"
   cutover_disarm_survivor \
     || die "disarm 失败: committed marker 未确认写入。smoke 已通过,拒绝报告成功。"
+  persist_selfhost_model_authority_cutover "$rel"
   sync_boot_scripts_from "$rel"
   cutover_clog "✓ --cutover 完成 live → $rel"
 }
