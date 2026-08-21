@@ -2495,8 +2495,8 @@ describe('v5 release safety lanes', () => {
     const source = await readFile(deploy, 'utf8')
     assert.doesNotMatch(source, /cd '\$staging\/packages\/web-react' && npx vite build/)
     assert.doesNotMatch(source, /cd '\$REPO_ROOT\/packages\/web-react' && npx vite build/)
-    assert.match(source, /cd '\$staging' && npm run build --workspace packages\/web-react/)
-    assert.match(source, /cd '\$REPO_ROOT' && npm run build --workspace packages\/web-react/)
+    assert.match(source, /cd '\$staging' && VITE_TASKBOARD_ENABLED=0 npm run build --workspace packages\/web-react/)
+    assert.match(source, /cd '\$REPO_ROOT' && VITE_TASKBOARD_ENABLED=0 npm run build --workspace packages\/web-react/)
   })
 
   test('requiredMigrations remote failure stays fail-closed in production OR-list context', () => {
