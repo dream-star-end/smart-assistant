@@ -686,7 +686,6 @@ await check("T7 点「+」→「设定目标」→ 目标对话框弹出", async
   await dialog.waitFor({ state: "hidden", timeout: 3000 });
 });
 
-let firstAnchorTop = 0;
 async function scrollTimelineDiagnostic(stage) {
   return page.evaluate((currentStage) => {
     const state = window.__scrollTimeline;
@@ -752,13 +751,6 @@ await check("T8 上滑零请求，点击只取一页、像素锚定且 remount �
   if (afterCancel.length !== 0) {
     throw new Error(`pointercancel 后程序滚动被误判为手势:${JSON.stringify(afterCancel)}`);
   }
-  const anchor = root.locator('[data-chat-virtual-key="outer:200:scroll-tail-0"]');
-  await anchor.waitFor({ state: "attached", timeout: 3000 });
-  const beforeBox = await anchor.boundingBox();
-  const beforeRootBox = await root.boundingBox();
-  if (!beforeBox || !beforeRootBox) throw new Error("tail anchor has no layout box before paging");
-  firstAnchorTop = beforeBox.y - beforeRootBox.y;
-
   // A complete wheel/inertia burst is navigation only. It must reveal the
   // explicit boundary without admitting any history request.
   await root.evaluate((node) => {
@@ -794,11 +786,21 @@ await check("T8 上滑零请求，点击只取一页、像素锚定且 remount �
     throw new Error(`单次点击未严格加载一页:${JSON.stringify(afterClick)}`);
   }
   await restorePageScrollT8();
-  const afterBox = await anchor.boundingBox();
+  const capturedAnchor = await page.evaluate(() => window.__scrollTimeline.anchor);
+  if (!capturedAnchor) throw new Error("生产分页回调未捕获可见锚点");
+  const afterAnchor = root.locator(`[data-chat-virtual-key="${capturedAnchor.key}"]`);
+  const afterBox = await afterAnchor.boundingBox();
   const afterRootBox = await root.boundingBox();
   if (!afterBox || !afterRootBox) throw new Error("tail anchor disappeared after older page merge");
-  const delta = Math.abs((afterBox.y - afterRootBox.y) - firstAnchorTop);
-  if (delta > 2) throw new Error(`插页后可见锚点跳动 ${delta.toFixed(2)}px，应 ≤2px`);
+  const delta = Math.abs((afterBox.y - afterRootBox.y) - capturedAnchor.top);
+  if (delta > 2) {
+    const diagnostic = await page.evaluate(() => ({
+      captured: window.__scrollTimeline.anchor,
+      scrollTop: document.querySelector("#timeline-scroll-root .timeline-scroll-probe")?.scrollTop,
+      scrollHeight: document.querySelector("#timeline-scroll-root .timeline-scroll-probe")?.scrollHeight,
+    }));
+    throw new Error(`插页后可见锚点跳动 ${delta.toFixed(2)}px，应 ≤2px; ${JSON.stringify({ capturedAnchor, afterRelativeTop: afterBox.y - afterRootBox.y, diagnostic })}`);
+  }
 
   // Force the first latest record out of Virtuoso overscan and back using
   // programmatic scroll only. A remount must never refetch a resident page.
@@ -852,12 +854,6 @@ await check("T10 归档前插跨出虚拟挂载区仍保持原消息像素位置
   if ((await page.evaluate(() => window.__archiveTimeline.calls)) !== 0) {
     throw new Error("归档会话滚到顶部时错误自动请求");
   }
-  const anchor = root.locator('[data-chat-virtual-key="outer:300:archive-tail-0"]');
-  await anchor.waitFor({ state: "attached", timeout: 3000 });
-  const beforeBox = await anchor.boundingBox();
-  const beforeRootBox = await root.boundingBox();
-  if (!beforeBox || !beforeRootBox) throw new Error("归档前插前缺少可见锚点");
-  const beforeRelativeTop = beforeBox.y - beforeRootBox.y;
   const button = root.getByTestId("history-page-loader").getByRole("button");
   const restorePageScrollT10 = await pinPageScroll(page);
   await button.click();
@@ -867,11 +863,20 @@ await check("T10 归档前插跨出虚拟挂载区仍保持原消息像素位置
     return button instanceof HTMLButtonElement && button.getAttribute("aria-busy") === "false";
   }, null, { timeout: 3000 });
   await restorePageScrollT10();
-  const afterBox = await anchor.boundingBox();
+  const capturedAnchor = await page.evaluate(() => window.__archiveTimeline.anchor);
+  if (!capturedAnchor) throw new Error("归档分页回调未捕获可见锚点");
+  const afterAnchor = root.locator(`[data-chat-virtual-key="${capturedAnchor.key}"]`);
+  const afterBox = await afterAnchor.boundingBox();
   const afterRootBox = await root.boundingBox();
   if (!afterBox || !afterRootBox) throw new Error("归档前插 80 行后原锚点被虚拟列表丢失");
-  const delta = Math.abs((afterBox.y - afterRootBox.y) - beforeRelativeTop);
-  if (delta > 2) throw new Error(`归档前插后可见锚点跳动 ${delta.toFixed(2)}px，应 ≤2px`);
+  const delta = Math.abs((afterBox.y - afterRootBox.y) - capturedAnchor.top);
+  if (delta > 2) {
+    const diagnostic = await page.evaluate(() => ({
+      scrollTop: document.querySelector("#timeline-archive-root .timeline-scroll-probe")?.scrollTop,
+      scrollHeight: document.querySelector("#timeline-archive-root .timeline-scroll-probe")?.scrollHeight,
+    }));
+    throw new Error(`归档前插后可见锚点跳动 ${delta.toFixed(2)}px，应 ≤2px; ${JSON.stringify({ capturedAnchor, afterRelativeTop: afterBox.y - afterRootBox.y, diagnostic })}`);
+  }
   const state = await page.evaluate(() => window.__archiveTimeline);
   if (state.calls !== 1 || state.messageCount !== 200) {
     throw new Error(`归档单击加载契约错误:${JSON.stringify(state)}`);
@@ -2078,7 +2083,7 @@ await check("T38 社区教程真浏览器：公开阅读只读，用户投稿进
   }
 
   await root.getByRole("button", { name: "返回探索教程" }).click();
-  await root.getByRole("button", { name: "发布教程" }).click();
+  await root.getByRole("button", { name: "手写教程" }).click();
   await root.getByLabel("标题").fill("BROWSER_SUBMITTED_TITLE");
   await root.getByLabel("摘要").fill("这是一份覆盖真实投稿流程和审核状态的完整摘要。");
   await root.getByLabel("分类").selectOption("research");

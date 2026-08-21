@@ -92,6 +92,7 @@ declare global {
       calls: number;
       mergedPages: number;
       messageCount: number;
+      anchor: null | { key: string; top: number };
     };
     __askQuestion: { responses: unknown[] };
     __messageQuote: {
@@ -189,7 +190,7 @@ window.__scrollTimeline = {
   loading: false,
   anchor: null,
 };
-window.__archiveTimeline = { calls: 0, mergedPages: 0, messageCount: 0 };
+window.__archiveTimeline = { calls: 0, mergedPages: 0, messageCount: 0, anchor: null };
 window.__askQuestion = { responses: [] };
 window.__messageQuote = { sends: [] };
 window.__errorUxRetries = 0;
@@ -907,6 +908,7 @@ function ArchiveTimelineProbe() {
   }, [messages, scroller]);
   const loadOlder = useCallback(async () => {
     const anchor = scroller ? captureVisibleVirtualRowAnchor(scroller) : null;
+    window.__archiveTimeline.anchor = anchor ? { key: anchor.key, top: anchor.top } : null;
     window.__archiveTimeline.calls += 1;
     await new Promise((resolve) => setTimeout(resolve, 40));
     const anchored = scroller && anchor
