@@ -865,6 +865,14 @@ await check("T10 归档前插跨出虚拟挂载区仍保持原消息像素位置
   await restorePageScrollT10();
   const capturedAnchor = await page.evaluate(() => window.__archiveTimeline.anchor);
   if (!capturedAnchor) throw new Error("归档分页回调未捕获可见锚点");
+  await page.waitForFunction(({ key, top }) => {
+    const root = document.querySelector("#timeline-archive-root .timeline-scroll-probe");
+    const anchor = document.querySelector(`#timeline-archive-root [data-chat-virtual-key="${key}"]`);
+    if (!(root instanceof HTMLElement) || !(anchor instanceof HTMLElement)) return false;
+    return Math.abs(
+      (anchor.getBoundingClientRect().top - root.getBoundingClientRect().top) - top,
+    ) <= 2;
+  }, capturedAnchor, { timeout: 3000 });
   const afterAnchor = root.locator(`[data-chat-virtual-key="${capturedAnchor.key}"]`);
   const afterBox = await afterAnchor.boundingBox();
   const afterRootBox = await root.boundingBox();
