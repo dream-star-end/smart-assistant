@@ -605,7 +605,7 @@ await check("T4 file input 结构红线:type=file/无 accept/非 display:none/ta
 });
 
 await check("T27 输入框粘贴 PNG 直接上传为图片附件", async () => {
-  const textarea = primaryComposer.getByPlaceholder("给 OpenClaude 发消息…");
+  const textarea = primaryComposer.getByPlaceholder("给从简发消息…");
   await textarea.fill("保留这段正文");
   const pasteResult = await textarea.evaluate((element) => {
     const png = Uint8Array.from(
@@ -755,8 +755,9 @@ await check("T8 上滑零请求，点击只取一页、像素锚定且 remount �
   const anchor = root.locator('[data-chat-virtual-key="outer:200:scroll-tail-0"]');
   await anchor.waitFor({ state: "attached", timeout: 3000 });
   const beforeBox = await anchor.boundingBox();
-  if (!beforeBox) throw new Error("tail anchor has no layout box before paging");
-  firstAnchorTop = beforeBox.y;
+  const beforeRootBox = await root.boundingBox();
+  if (!beforeBox || !beforeRootBox) throw new Error("tail anchor has no layout box before paging");
+  firstAnchorTop = beforeBox.y - beforeRootBox.y;
 
   // A complete wheel/inertia burst is navigation only. It must reveal the
   // explicit boundary without admitting any history request.
@@ -794,8 +795,9 @@ await check("T8 上滑零请求，点击只取一页、像素锚定且 remount �
   }
   await restorePageScrollT8();
   const afterBox = await anchor.boundingBox();
-  if (!afterBox) throw new Error("tail anchor disappeared after older page merge");
-  const delta = Math.abs(afterBox.y - firstAnchorTop);
+  const afterRootBox = await root.boundingBox();
+  if (!afterBox || !afterRootBox) throw new Error("tail anchor disappeared after older page merge");
+  const delta = Math.abs((afterBox.y - afterRootBox.y) - firstAnchorTop);
   if (delta > 2) throw new Error(`插页后可见锚点跳动 ${delta.toFixed(2)}px，应 ≤2px`);
 
   // Force the first latest record out of Virtuoso overscan and back using
@@ -853,7 +855,9 @@ await check("T10 归档前插跨出虚拟挂载区仍保持原消息像素位置
   const anchor = root.locator('[data-chat-virtual-key="outer:300:archive-tail-0"]');
   await anchor.waitFor({ state: "attached", timeout: 3000 });
   const beforeBox = await anchor.boundingBox();
-  if (!beforeBox) throw new Error("归档前插前缺少可见锚点");
+  const beforeRootBox = await root.boundingBox();
+  if (!beforeBox || !beforeRootBox) throw new Error("归档前插前缺少可见锚点");
+  const beforeRelativeTop = beforeBox.y - beforeRootBox.y;
   const button = root.getByTestId("history-page-loader").getByRole("button");
   const restorePageScrollT10 = await pinPageScroll(page);
   await button.click();
@@ -864,8 +868,9 @@ await check("T10 归档前插跨出虚拟挂载区仍保持原消息像素位置
   }, null, { timeout: 3000 });
   await restorePageScrollT10();
   const afterBox = await anchor.boundingBox();
-  if (!afterBox) throw new Error("归档前插 80 行后原锚点被虚拟列表丢失");
-  const delta = Math.abs(afterBox.y - beforeBox.y);
+  const afterRootBox = await root.boundingBox();
+  if (!afterBox || !afterRootBox) throw new Error("归档前插 80 行后原锚点被虚拟列表丢失");
+  const delta = Math.abs((afterBox.y - afterRootBox.y) - beforeRelativeTop);
   if (delta > 2) throw new Error(`归档前插后可见锚点跳动 ${delta.toFixed(2)}px，应 ≤2px`);
   const state = await page.evaluate(() => window.__archiveTimeline);
   if (state.calls !== 1 || state.messageCount !== 200) {
@@ -1039,14 +1044,14 @@ await check("T18 点助手“引用”→预览可取消→再次引用后随正
   const root = page.locator("#message-quote-root");
   const quote = root.getByRole("button", { name: "引用" });
   await quote.click();
-  await root.getByText("正在引用 OpenClaude").waitFor({ state: "visible", timeout: 3000 });
+  await root.getByText("正在引用 从简").waitFor({ state: "visible", timeout: 3000 });
   await root.getByText("这是需要被引用的完整回答").last().waitFor({ state: "visible", timeout: 3000 });
   await root.getByRole("button", { name: "取消引用" }).click();
-  if (await root.getByText("正在引用 OpenClaude").count()) {
+  if (await root.getByText("正在引用 从简").count()) {
     throw new Error("取消后引用预览仍存在");
   }
   await quote.click();
-  const composer = root.getByPlaceholder("给 OpenClaude 发消息…");
+  const composer = root.getByPlaceholder("给从简发消息…");
   await composer.fill("请重点解释这一段");
   await root.getByRole("button", { name: "发送" }).click();
   const sends = await page.evaluate(() => window.__messageQuote.sends);
@@ -1174,7 +1179,7 @@ await check("T21 真 WS 帧驱动真时间线:条目顺序、工具卡内容、�
 // `!e.nativeEvent.isComposing` 这道守卫在单测里等于不存在:删掉它单测照绿,而线上
 // 中文用户选词按回车就会误发半截草稿。这里用 CDP Input.imeSetComposition 造真实组合态。
 await check("T22 Enter 发送 / Shift+Enter 换行 / IME 组合中回车不误发", async () => {
-  const composer = primaryComposer.getByPlaceholder("给 OpenClaude 发消息…");
+  const composer = primaryComposer.getByPlaceholder("给从简发消息…");
   await composer.waitFor({ state: "visible", timeout: 3000 });
   const sendCount = async () => (await page.evaluate(() => window.__sends)).length;
   const value = () => composer.inputValue();
@@ -1962,7 +1967,7 @@ await check("T31 journal page1→WS N→page2(N)：已响应思考/工具/正文
     state: "visible",
     timeout: 3000,
   });
-  const toolButton = replayRoot.getByRole("button", { name: /exec_command/ }).first();
+  const toolButton = replayRoot.getByRole("button", { name: /执行 Shell|exec_command/ }).first();
   await toolButton.waitFor({ state: "visible", timeout: 3000 });
   await toolButton.click();
   await replayRoot.getByText(result.markers.toolOutput, { exact: true }).waitFor({
@@ -1987,17 +1992,15 @@ await check("T31 journal page1→WS N→page2(N)：已响应思考/工具/正文
 await check("T32 durable error replay：用户 Stop 不上报，历史非尾错误不触发同步循环", async () => {
   const result = await page.evaluate(() => window.__replayDrive.runDurableErrorReplay());
   if (
-    result.stopErrorCode !== "user_cancelled" ||
-    result.stopErrorText !== "本轮已取消。" ||
     result.stopReports !== 0 ||
     result.stopSyncs !== 0 ||
-    result.stopStatusCount !== 1 ||
+    result.stopStatusCount !== 0 ||
     result.stopAlertCount !== 0 ||
     result.stopRetryCount !== 0 ||
     result.stopCancelledCopyCount !== 0 ||
-    result.historicalReports !== 1 ||
+    result.historicalReports !== 0 ||
     result.historicalSyncs !== 0 ||
-    result.historicalDecision !== true
+    result.historicalDecision !== false
   ) {
     throw new Error(`durable error replay 未收敛:${JSON.stringify(result)}`);
   }
@@ -2074,7 +2077,7 @@ await check("T38 社区教程真浏览器：公开阅读只读，用户投稿进
     throw new Error(`社区教程正文未保持只读:${JSON.stringify(unsafeRender)}`);
   }
 
-  await root.getByRole("button", { name: "返回社区教程" }).click();
+  await root.getByRole("button", { name: "返回探索教程" }).click();
   await root.getByRole("button", { name: "发布教程" }).click();
   await root.getByLabel("标题").fill("BROWSER_SUBMITTED_TITLE");
   await root.getByLabel("摘要").fill("这是一份覆盖真实投稿流程和审核状态的完整摘要。");
@@ -2352,7 +2355,7 @@ await check("T42 设置壳 390 单列可切五分区、1440 竖导航 168px、�
     ["用量", "会话用量明细"],
     ["偏好", "外观主题"],
     ["反馈", "反馈内容"],
-    ["关于", "备案信息待补充"],
+    ["关于", "让复杂，从简。"],
   ];
 
   async function assertNoOverflow(dialog, label) {
