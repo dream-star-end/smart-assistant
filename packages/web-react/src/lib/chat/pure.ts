@@ -38,6 +38,9 @@ export const VISIBILITY_RECONNECT_COOLDOWN_MS = 2000;
  *  变"看似 OPEN 实则死链",5s 才发现太慢、超时定时器可能抢先误报；1.5s 内无 pong 即 close
  *  自愈重连（健康连接 pong 立刻返回、无副作用），是比"每次切回都强制重连"风险更低的选择。*/
 export const PROBE_TIMEOUT_VISIBILITY_MS = 1500;
+/** 刚 OPEN 的连接跳过 visibility 1.5s ping 探活。微信 WebView / 慢网首连 pong
+ *  往往来不及在 1.5s 内回来，探活会 close(4000) 把刚活的链路掐掉，横幅闪「已断线」。*/
+export const VISIBILITY_PROBE_GRACE_AFTER_OPEN_MS = 10_000;
 export const PROBE_TIMEOUT_KEEPALIVE_MS = 10000;
 /** 连接"确认存活"窗口：最近这段时间内收到过 pong 或任意帧即视为链路仍活。thinking-safety
  *  超时判定据此分流——未确认存活=静默死链→强制重连而非误报本轮超时（见 socket.resetThinkingSafety）。*/
