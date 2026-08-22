@@ -1127,6 +1127,33 @@ async function uniqueImageFileInput(scope) {
   }
   return matches.length === 1 ? matches[0] : null;
 }
+async function countVisibleImages(scope) {
+  if (!scope || typeof scope.locator !== 'function') return 0;
+  const nodes = scope.locator('img');
+  if (!nodes || typeof nodes.count !== 'function' || typeof nodes.nth !== 'function') return 0;
+  let visibleCount = 0;
+  const total = Math.min(await nodes.count().catch(() => 0), 40);
+  for (let index = 0; index < total; index += 1) {
+    const node = nodes.nth(index);
+    if (await node.isVisible().catch(() => false)) visibleCount += 1;
+  }
+  return visibleCount;
+}
+async function awaitComposerMediaReady(page, editor, expected, timeout) {
+  const scope = (await composerScope(editor)) || page;
+  const deadline = Date.now() + timeout;
+  const attempts = Math.max(1, Math.ceil(timeout / 250));
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const observed = await countVisibleImages(scope);
+    if (observed === expected) return;
+    if (observed > expected) throw new Error('media');
+    const remaining = deadline - Date.now();
+    if (attempt < attempts - 1 && remaining > 0) {
+      await page.waitForTimeout(Math.min(250, remaining));
+    }
+  }
+  throw new Error('media');
+}
 async function awaitFileChooser(page, clickable) {
   await clickable.click({ trial: true, timeout: 10_000 });
   const [chooser] = await Promise.all([
@@ -1201,13 +1228,14 @@ async function provePostSendReady(send, timeout) {
   if (!send) throw new Error('send');
   await send.click({ trial: true, timeout });
 }
-async function awaitPostSendReady(page, timeout) {
+async function awaitPostSendReady(page, timeout, editor) {
   const deadline = Date.now() + timeout;
   const attempts = Math.max(1, Math.ceil(timeout / 250));
+  const scope = (await composerScope(editor)) || page;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     let remaining = deadline - Date.now();
     if (remaining <= 0) break;
-    const send = await exactMenuItem(page, '发送');
+    const send = await exactMenuItem(scope, '发送');
     remaining = deadline - Date.now();
     if (send && remaining > 0) {
       try {
@@ -1281,7 +1309,7 @@ async function writeAction(page, input) {
     await assertNoChallenge(page);
     let imageChooser = null;
     if (manifest.length === 0) {
-      await awaitPostSendReady(page, 30_000);
+      await awaitPostSendReady(page, 30_000, editor);
     } else {
       imageChooser = await preparePostImageChooser(page, editor);
     }
@@ -1291,6 +1319,8 @@ async function writeAction(page, input) {
     if (!freshEditor || (await readPostComposer(freshEditor)) !== expectedText) throw new Error('composer');
     if (manifest.length) {
       if (!imageChooser) throw new Error('media');
+      const previewScope = (await composerScope(freshEditor)) || page;
+      const previewBefore = await countVisibleImages(previewScope);
       const files = [];
       try {
         for (const item of manifest) files.push({ name: item.filename, mimeType: item.mimeType, buffer: await readFile('/inputs/' + item.inputId) });
@@ -1300,9 +1330,10 @@ async function writeAction(page, input) {
       }
       const selected = await imageChooser.element().evaluate((node) => node.files ? node.files.length : 0);
       if (selected !== manifest.length) throw new Error('media');
+      await awaitComposerMediaReady(page, freshEditor, previewBefore + manifest.length, 90_000);
     }
     await assertNoChallenge(page);
-    const send = await awaitPostSendReady(page, 30_000);
+    const send = await awaitPostSendReady(page, manifest.length ? 90_000 : 30_000, freshEditor);
     const clickFailure = await activatePostSend(send);
     await page.waitForTimeout(2500);
     const post = await awaitNewestOwnPost(page, selfId, expectedText, beforeIds);
