@@ -25,6 +25,7 @@ import type {
 } from './engine/engineEvents.js'
 import type { ClassifiedErrorCode } from './errorClassify.js'
 import type { SdkMessage } from './subprocessRunner.js'
+import { extractCcbNativeCompactionSummary } from './ccbNativeCompaction.js'
 
 function bashOutputTailBlock(raw: Record<string, any>): OutboundContentBlock | null {
   const toolUseId = raw.tool_use_id
@@ -395,6 +396,8 @@ export class CcbMessageParser {
   private onToolUse?: (tool: DetectedToolUse) => void
   private onToolResult?: (result: DetectedToolResult) => void
   private onNativeCompactionSummary?: (summaryText: string) => void
+  private sawCompactBoundary = false
+  private capturedNativeCompaction = false
   /** F5 — 每观测到一个 **Bash** tool_use(**含子 agent**,parentToolUseId 与否都触发)
    *  就回调一次,仅供归属登记(tool_use_id → 发起 turn),不触发任何 host bridge。
    *  与 onToolUse(主 agent-only、驱动 CronCreate/委派等桥接)分离,避免子 agent 工具
@@ -660,6 +663,10 @@ export class CcbMessageParser {
     //     CCB raw status string is **not** transparently forwarded — only the
     //     mapped values cross the protocol boundary.
     if (msg.type === 'system') {
+      if (raw.subtype === 'compact_boundary') {
+        this.sawCompactBoundary = true
+        return
+      }
       if (raw.subtype === 'bash_output_tail') {
         const block = bashOutputTailBlock(raw)
         if (block) this.onEvent({ kind: 'block', block })
@@ -1223,13 +1230,15 @@ export class CcbMessageParser {
 
   private _handleUser(msg: SdkMessage, parentToolUseId?: string): void {
     const content = (msg as any).message?.content
-    if (
-      typeof content === 'string' &&
-      (msg as any).isSynthetic === true &&
-      (msg as any).isReplay === false &&
-      content.startsWith('This session is being continued from a previous conversation')
-    ) {
-      this.onNativeCompactionSummary?.(content.trim())
+    const nativeSummary = extractCcbNativeCompactionSummary({
+      isSynthetic: (msg as any).isSynthetic,
+      isReplay: (msg as any).isReplay,
+      message: (msg as any).message,
+      sawCompactBoundary: this.sawCompactBoundary,
+    })
+    if (nativeSummary) {
+      this.capturedNativeCompaction = true
+      this.onNativeCompactionSummary?.(nativeSummary)
       return
     }
     if (!Array.isArray(content)) return
@@ -1362,6 +1371,16 @@ export class CcbMessageParser {
   }
 
   private _handleResult(msg: SdkMessage): void {
+    if (!this.capturedNativeCompaction) {
+      const resultSummary = extractCcbNativeCompactionSummary({
+        compact_summary: (msg as any).compact_summary,
+        sawCompactBoundary: this.sawCompactBoundary,
+      })
+      if (resultSummary) {
+        this.capturedNativeCompaction = true
+        this.onNativeCompactionSummary?.(resultSummary)
+      }
+    }
     const usage = (msg as any).usage ?? {}
     const finalUsagePatch = tokenUsagePatch(usage)
     const finalUsage = finalUsagePatch

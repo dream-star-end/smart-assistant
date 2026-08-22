@@ -84,6 +84,7 @@ import {
 import { resolveExecutionModel } from './server.js'
 import { classifyRunError } from './errorClassify.js'
 import type { GatewayTurnPhase } from './ccbMessageParser.js'
+import { isCcbSlashCommandPrompt } from './ccbNativeCompaction.js'
 import {
   type ExecutionTarget,
   type RemoteTargetController,
@@ -3862,13 +3863,18 @@ export class SessionManager {
         session.turns = await getMaxTurnIdx(ids)
       }
       let runnerPayload = userTextOrBlocks
+      const skipPromptRewrite =
+        opts?.modelSwitchInternal !== undefined ||
+        isCcbSlashCommandPrompt(runnerPayload)
       try {
-        const efficiencyNote = await prepareEfficiencyTurnNote(
-          session,
-          session.currentUserText ?? '',
-        )
-        if (efficiencyNote && typeof runnerPayload === 'string') {
-          runnerPayload = `${efficiencyNote}\n\n${runnerPayload}`
+        if (!skipPromptRewrite) {
+          const efficiencyNote = await prepareEfficiencyTurnNote(
+            session,
+            session.currentUserText ?? '',
+          )
+          if (efficiencyNote && typeof runnerPayload === 'string') {
+            runnerPayload = `${efficiencyNote}\n\n${runnerPayload}`
+          }
         }
       } catch (err) {
         log.debug('efficiency guard prepare failed', { sessionKey: session.sessionKey, err: String(err) })
@@ -3970,6 +3976,8 @@ export class SessionManager {
       }
       if (
         !nativeHandoff &&
+        opts?.modelSwitchInternal === undefined &&
+        !isCcbSlashCommandPrompt(userTextOrBlocks) &&
         shouldAttemptHistoricalContextInjection({
           alreadyInjected: session._historicalContextInjected,
           lastInjectedKey: session._historicalContextInjectedKey,

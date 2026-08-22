@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, resolve } from 'node:path'
 import { type McpServerConfig, type OpenClaudeConfig, paths } from '@openclaude/storage'
 import { createLogger } from './logger.js'
+import { ccbStdinUserContent } from './ccbNativeCompaction.js'
 import { atomicWriteJsonFile, buildCcbEfficiencySettings } from './efficiencyHookConfig.js'
 import { isV3ContainerRuntime, resolveHostStaticProviderEnv } from './hostStaticProviders.js'
 import type { GoalStateSnapshot, StaticProviderKeys } from '@openclaude/protocol'
@@ -1535,10 +1536,7 @@ export class SubprocessRunner extends EventEmitter {
     if (!this.proc) await this.start()
     if (!this.proc) throw new Error('failed to start CCB subprocess')
     this.refreshDelegateContext()
-    const content =
-      typeof userTextOrBlocks === 'string'
-        ? [{ type: 'text', text: userTextOrBlocks }]
-        : userTextOrBlocks
+    const content = ccbStdinUserContent(userTextOrBlocks)
     const userMsg = {
       type: 'user',
       message: {
