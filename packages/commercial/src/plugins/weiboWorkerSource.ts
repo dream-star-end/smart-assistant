@@ -1166,8 +1166,7 @@ async function awaitComposerMediaReady(page, editor, expectedNew, timeout, befor
       seen.add(src);
       added.push(src);
     }
-    if (added.length === expectedNew) return;
-    if (added.length > expectedNew) throw new Error('media');
+    if (added.length >= expectedNew) return;
     const remaining = deadline - Date.now();
     if (attempt < attempts - 1 && remaining > 0) {
       await page.waitForTimeout(Math.min(250, remaining));
