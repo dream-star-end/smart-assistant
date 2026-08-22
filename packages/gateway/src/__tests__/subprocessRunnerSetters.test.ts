@@ -111,13 +111,13 @@ describe('SubprocessRunner.model getter / setModel', () => {
     assert.equal(resolveExecutionModel('deepseek-v4-pro', undefined), 'deepseek-v4-pro')
     // 已下线的 Claude(marketplace manifest / seed / delegate 里 stale)→ 降级到平台默认,
     // 不会以不可路由的 --model spawn。
-    assert.equal(resolveExecutionModel('claude-opus-4-7', undefined), 'glm-5.3')
-    assert.equal(resolveExecutionModel('claude-sonnet-4-6', 'claude-haiku-4-5'), 'glm-5.3')
+    assert.equal(resolveExecutionModel('claude-opus-4-7', undefined), 'glm-5.3-zai')
+    assert.equal(resolveExecutionModel('claude-sonnet-4-6', 'claude-haiku-4-5'), 'glm-5.3-zai')
     // preferred 非法但 fallback 合法 → 用 fallback。
     assert.equal(resolveExecutionModel('claude-opus-4-7', 'MiniMax-M3'), 'MiniMax-M3')
-    // 两者都缺/非法 → 平台默认 glm-5.3。
-    assert.equal(resolveExecutionModel(undefined, null), 'glm-5.3')
-    assert.equal(resolveExecutionModel('some-unknown-model', undefined), 'glm-5.3')
+    // 两者都缺/非法 → 平台默认 glm-5.3-zai。
+    assert.equal(resolveExecutionModel(undefined, null), 'glm-5.3-zai')
+    assert.equal(resolveExecutionModel('some-unknown-model', undefined), 'glm-5.3-zai')
   })
 
   it('ALLOWED_INBOUND_MODELS rejects bogus / typo model ids', () => {

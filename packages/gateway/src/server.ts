@@ -528,7 +528,7 @@ function teamMemberCapabilityHint(agent: AgentDef): string {
  *   - MiniMax-M3 — master 侧切到 MiniMax Token Plan Anthropic 兼容端点,
  *     同样跑 claude-subscription/non-codex agent,不进 codex-native
  *   - glm-5.1 / glm-5.2 / glm-5.3 — master 侧切到火山方舟 Ark Coding Plan Anthropic 兼容端点,
- *     同 non-codex,glm-5.3 是**平台全局默认模型**
+ *     同 non-codex;2026-08-22 起平台全局默认是 glm-5.3-zai,glm-5.3(ark) 不再做默认
  *
  * **Claude 官方模型(claude-opus-4-7 / claude-sonnet-4-6 / claude-haiku-4-5)已全面下线**
  * (v3 + v5 均不支持),不在白名单;stale prefs / 构造帧带 Claude 模型会被拒,而不是路由到
