@@ -3909,6 +3909,15 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               });
               sendRecoverySkippedAck(admit.reason);
               return null;
+            case "session_busy":
+              // exclusiveSession only; browser admits omit the flag. Keep the
+              // switch exhaustive so session_busy cannot fall into `never`.
+              sendErrorFrame(
+                userWs, "TURN_IN_FLIGHT",
+                "another turn is already running in this session",
+                { peerId, clientMessageId },
+              );
+              return null;
             case "session_not_found":
             case "session_deleted":
             case "append_error":
