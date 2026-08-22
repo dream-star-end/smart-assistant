@@ -16,6 +16,8 @@ import {
   normalizeBridgeErrorCode,
   onopenSetInitialStatus,
   parsePartialJson,
+  PROBE_TIMEOUT_VISIBILITY_MS,
+  VISIBILITY_PROBE_GRACE_AFTER_OPEN_MS,
   safeBridgeErrorDetail,
   shouldAutoContinueEmptyTurn,
   isRecoveryControlUserTurn,
@@ -7933,6 +7935,82 @@ describe("ChatSocket laneReady gate (P3 RFC D1)", () => {
     expect(FakeWS.instances.length).toBe(0);
     sock.setGateReady(true); // 现在双闸就绪 → 建连
     expect(FakeWS.instances.length).toBe(1);
+    sock.stop();
+  });
+});
+
+// ═══════════════ 微信 WebView 首连：未 onopen 不写已断线；刚 OPEN 跳过 1.5s 探活 ═══════════════
+describe("ChatSocket first-connect banner and visibility probe grace", () => {
+  afterEach(() => {
+    FakeWS.instances = [];
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  async function flushStatus(): Promise<void> {
+    await vi.advanceTimersByTimeAsync(300);
+  }
+
+  test("握手失败（从未 onopen）保持「连接中…」，不写成「已断线」", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    await flushStatus();
+    expect(sock.getSnapshot().status).toEqual({ label: "连接中…", cls: "connecting" });
+    ws.onclose?.({ code: 1006, reason: "" });
+    await flushStatus();
+    expect(sock.getSnapshot().status.cls).toBe("connecting");
+    expect(sock.getSnapshot().status.label).toContain("连接中");
+    expect(sock.getSnapshot().status.label).not.toBe("已断线");
+    sock.stop();
+  });
+
+  test("成功 onopen 后再断开才显示「已断线」", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    await flushStatus();
+    expect(sock.getSnapshot().status.cls).toBe("connected");
+    ws.onclose?.({ code: 1006, reason: "" });
+    await flushStatus();
+    expect(sock.getSnapshot().status).toEqual({ label: "已断线", cls: "disconnected" });
+    sock.stop();
+  });
+
+  test("刚 OPEN 的连接：visibility 探活在 grace 内不发 ping、不 4000 掐线", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    await flushStatus();
+    const sentBefore = ws.sent.length;
+    sock.notifyTabVisible();
+    await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_VISIBILITY_MS + 200);
+    expect(ws.closed).toBeUndefined();
+    expect(ws.sent.length).toBe(sentBefore);
+    sock.stop();
+  });
+
+  test("超过 grace 后 visibility 探活超时会 close(4000)", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    await flushStatus();
+    await vi.advanceTimersByTimeAsync(VISIBILITY_PROBE_GRACE_AFTER_OPEN_MS);
+    sock.notifyTabVisible();
+    await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_VISIBILITY_MS + 50);
+    expect(ws.closed?.code).toBe(4000);
+    expect(ws.closed?.reason).toBe("visibility ping timeout");
     sock.stop();
   });
 });

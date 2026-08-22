@@ -89,6 +89,7 @@ import {
   onopenSetInitialStatus,
   PROBE_TIMEOUT_KEEPALIVE_MS,
   PROBE_TIMEOUT_VISIBILITY_MS,
+  VISIBILITY_PROBE_GRACE_AFTER_OPEN_MS,
   RECENT_INFLIGHT_WINDOW_MS,
   RECONNECT_RECONCILE_GRACE_MS,
   SAFE_WS_BUFFER_BYTES,
@@ -610,6 +611,10 @@ export class ChatSocket {
   private isBrowserOnline = true; // 乐观初始化，不读 navigator.onLine（§1）
   private pendingBrowserOfflineAt = 0;
   private lastVisibilityReconnectAt = 0;
+  /** 本页生命周期内是否成功 onopen 过。未成功前 onclose 保持「连接中…」，避免首连失败写成「已断线」。*/
+  private everOpened = false;
+  /** 最近一次 onopen 时刻；visibility 探活在此后 grace 内跳过。*/
+  private lastOpenAtMs = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectCountdown: ReturnType<typeof setInterval> | null = null;
 
@@ -930,6 +935,8 @@ export class ChatSocket {
     this.unpublishedTapeRetries.clear();
     for (const t of this.controlPersistRetryTimers.values()) clearTimeout(t);
     this.controlPersistRetryTimers.clear();
+    this.everOpened = false;
+    this.lastOpenAtMs = 0;
     const ws = this.ws;
     this.ws = null;
     try {
@@ -1785,6 +1792,8 @@ export class ChatSocket {
       this.reconnectAttempts = 0;
       this.isBrowserOnline = true;
       this.pendingBrowserOfflineAt = 0;
+      this.everOpened = true;
+      this.lastOpenAtMs = Date.now();
       if (this.reconnectCountdown) {
         clearInterval(this.reconnectCountdown);
         this.reconnectCountdown = null;
@@ -1930,7 +1939,8 @@ export class ChatSocket {
         clearTimeout(this.reconnectReconcileTimer);
         this.reconnectReconcileTimer = null;
       }
-      this.setStatus("已断线", "disconnected");
+      if (this.everOpened) this.setStatus("已断线", "disconnected");
+      else this.setStatus("连接中…", "connecting");
       this.resetUnadmittedDispatchesForReplay();
 
       const decision = classifyClose(e.code, e.reason);
@@ -1972,10 +1982,17 @@ export class ChatSocket {
       const delay = decision.serverHintedDelay > 0 ? decision.serverHintedDelay : backoffDelay(this.reconnectAttempts);
       if (decision.serverHintedDelay === 0) this.reconnectAttempts++; // server hint 不计入 client 退避（§1）
       const label = decision.closeReasonLabel;
+      const bannerCls = this.everOpened ? "disconnected" : "connecting";
       if (delay >= 4000) {
         let remaining = Math.ceil(delay / 1000);
-        const render = () =>
-          this.setStatus(label ? `${label} · ${remaining} 秒后重试…` : `${remaining} 秒后重连…`, "disconnected");
+        const render = () => {
+          const prefix = label
+            ? `${label} · ${remaining} 秒后重试…`
+            : this.everOpened
+              ? `${remaining} 秒后重连…`
+              : `连接中… · ${remaining} 秒后重试`;
+          this.setStatus(prefix, bannerCls);
+        };
         render();
         this.reconnectCountdown = setInterval(() => {
           remaining--;
@@ -1987,6 +2004,8 @@ export class ChatSocket {
         }, 1000);
       } else if (label) {
         this.setStatus(label, "connecting");
+      } else if (!this.everOpened) {
+        this.setStatus("连接中…", "connecting");
       }
       this.reconnectTimer = setTimeout(() => this.connect(), delay);
       this.scheduleNotify();
@@ -2654,7 +2673,11 @@ export class ChatSocket {
       return;
     }
     // 看似 OPEN：1.5s 快探活（真死链更早 close→reconnect，健康则 pong 立即返回无副作用）。
-    this.probeWsAlive(this.ws, PROBE_TIMEOUT_VISIBILITY_MS, "visibility");
+    // 刚 OPEN 的连接跳过：微信 WebView / 慢网首连 pong 经常 >1.5s，探活会误杀。
+    const openedAgo = this.lastOpenAtMs > 0 ? Date.now() - this.lastOpenAtMs : Number.POSITIVE_INFINITY;
+    if (openedAgo >= VISIBILITY_PROBE_GRACE_AFTER_OPEN_MS) {
+      this.probeWsAlive(this.ws, PROBE_TIMEOUT_VISIBILITY_MS, "visibility");
+    }
     // S1：切回前台无条件 REST 对账当前选中 + 近期 in-flight 会话——WS 探活只能发现死连接，
     // 追不回锁屏期间已在服务端生成的内容；对账才能拉回并覆盖本地陈旧态。
     this.reconcileVisibleAndInFlight();
