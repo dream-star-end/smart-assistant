@@ -2,8 +2,14 @@
 
 Workflow:`.github/workflows/v5-ci.yml`
 触发:push / PR 到 **feat/v5-aurora-rewrite**,以及手动 `workflow_dispatch`。
-所有 job 并行、`fail-fast: false`(一个套件失败不取消其余,永远看全量结果)。
-同一 PR / ref 的新 push 会取消上一轮(concurrency cancel-in-progress)。
+调度分两梯队、`fail-fast: false`(一个套件失败不取消其余,永远看全量结果)。
+第一梯队立即入队:required 6 个 check(`typecheck` / `gateway` / `storage` /
+`web-react` / `commercial-unit (known-failures diff gate)` / `v5-ops`)以及轻量
+非 required(`lint` / `protocol` / `channels`),外加秒级 `ci-queue-sentinel`。
+第二梯队(`web-react-browser`、`commercial-integ` 三分片)`needs: [ci-queue-sentinel]`,
+等调度闸完成后再抢 runner,避免最重的 required job 被 integ/browser 挤到十几分钟后
+才开工。sentinel 失败会 skip 二梯队——它们本就不挡合并。required 6 job 之间不加
+`needs`。同一 PR / ref 的新 push 会取消上一轮(concurrency cancel-in-progress)。
 
 与 v3 CI(`fix/v3-test-gate` 分支的 `.github/workflows/ci.yml`)同源:依赖安装
 (`actions/setup-node@v4` node 20 + `cache: npm` + `npm ci`)与 PG/Redis service
@@ -13,6 +19,7 @@ containers 配置照抄 v3,端口/凭证/健康检查完全一致。
 
 | Job | CI 命令 | 证明的用户可见事实 | timeout |
 | --- | --- | --- | --- |
+| ci-queue-sentinel | `(none; scheduling gate)` | 秒级调度闸:先让第一梯队(含 required 6 job)抢 runner,再放行 integ/browser | 2 min |
 | typecheck | `npm run typecheck && npm run check:ci-parity` | 全仓类型闭合;CI 门集合 ≡ `check:v5` 门集合(见下「CI parity 门」) | 20 min |
 | lint | `npm run lint:scheduler-wiring && npm run lint:agent-containers-sql` | 导出的调度器/轮询器真的被 start(HealthPoller 事故);读 `agent_containers` 显式带 state,vanished 行不渗进用户视图/计费聚合 | 10 min |
 | protocol | `npm run test:protocol` | gateway↔web-react↔容器的帧与错误码单一权威(frames / turnErrorTaxonomy / promptQueueFrames / modelAuthority)未漂 | 10 min |
