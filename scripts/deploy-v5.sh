@@ -2860,9 +2860,9 @@ if [[ "$kind" == strong ]]; then
       and (.artifactSha256 | type == "string" and test("^[0-9a-f]{64}$"))
       and ((has("distReuse") | not)
         or ((.distReuse | type == "object")
-          and (.distReuse.fromRelease | type == "string" and (.distReuse.fromRelease | startswith("/")))
+          and (.distReuse.fromRelease | type == "string" and startswith("/"))
           and (.distReuse.fromSourceCommit | type == "string" and test("^[0-9a-f]{40}$"))
-          and (.distReuse.comparedPaths | type == "array" and (.distReuse.comparedPaths | length) > 0))))
+          and (.distReuse.comparedPaths | type == "array" and length > 0))))
     then [.sourceCommit,.builtAt,.metadataSha256,.artifactSha256] | @tsv
     else error("invalid strong release marker") end
   ' "$marker")" || exit 1
@@ -3738,7 +3738,11 @@ try_reuse_web_dist() { # <staging> <current-release> <full-sha>
 record_dist_reuse_in_complete() { # <final-release-dir>
   local reldir="$1"
   [[ -n "$DIST_REUSE_FROM" && "$DIST_REUSE_OLD_SHA" =~ ^[0-9a-f]{40}$ ]] || return 1
-  ssh "$KL_HOST" bash -s -- "$reldir" "$DIST_REUSE_FROM" "$DIST_REUSE_OLD_SHA" "$DIST_REUSE_PATHS" <<'REMOTE'
+  # Paths are space-separated repo paths. ssh argv cannot carry spaces, so
+  # encode as "|" before crossing the remote command line.
+  [[ "$DIST_REUSE_PATHS" != *"|"* ]] || { echo "✗ dist reuse paths contain delimiter" >&2; return 1; }
+  paths_enc="$(printf "%s" "$DIST_REUSE_PATHS" | sed "s/ /|/g")"
+  ssh "$KL_HOST" bash -s -- "$reldir" "$DIST_REUSE_FROM" "$DIST_REUSE_OLD_SHA" "$paths_enc" <<'REMOTE'
 set -Eeuo pipefail
 reldir="$1"; from="$2"; old_sha="$3"; paths="$4"
 marker="$reldir/.complete"
@@ -3748,7 +3752,7 @@ jq --arg from "$from" --arg sha "$old_sha" --arg paths "$paths" '
   .distReuse = {
     fromRelease: $from,
     fromSourceCommit: $sha,
-    comparedPaths: ($paths | split(" ") | map(select(length > 0))),
+    comparedPaths: ($paths | split("|") | map(select(length > 0))),
     viteTaskboardEnabled: "0"
   }
 ' "$marker" >"$tmp"
