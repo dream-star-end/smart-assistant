@@ -314,6 +314,7 @@ import {
 } from './delegateJobs.js'
 import { DelegateResumeRegistry } from './delegateResume.js'
 import { isPlatformAgentId, parseDelegateModel } from './delegateModel.js'
+import { acquireDelegateGrokRoute, type DelegateGrokRouteLease } from './delegateGrokRoute.js'
 import { eventBus, createEvent } from './eventBus.js'
 import { startEventPersistence } from './eventPersist.js'
 import { startMemoryTurnObserver } from './memoryTurnObserver.js'
@@ -11170,6 +11171,43 @@ export class Gateway {
       }
       return { kind: 'rejected', httpStatus, message }
     }
+    // ── grok delegate turn:向 master 铸造 relay route(与浏览器 turn 同一账号池)──
+    // delegate 是容器本地 turn,没有 bridge 注入 __oc_grok_route;不铸 route 则
+    // GrokAdapter 在 spawn 前 fail-closed(GROK_ROUTE_REQUIRED)。放在资源闸之后:
+    // 排队期间不占用稀缺的 Grok 订阅槽;mint 失败是零代价结构化拒绝(尚未创建
+    // session/runner)。生产(未开引擎本地豁免)在上方 decideLocalExecution 已拒。
+    const grokDelegate =
+      delegateExec
+        ? delegateExec.engine === 'grok'
+        : requestedModel
+          ? isGrokEngineModel(requestedModel)
+          : false
+    let grokRoute: { baseUrl: string; routeToken: string } | null = null
+    let grokRouteLease: DelegateGrokRouteLease | null = null
+    if (grokDelegate) {
+      const acquired = await acquireDelegateGrokRoute({
+        modelId: delegateExec?.canonicalModel ?? requestedModel!,
+        sessionId: sessionKey,
+        log: this.log,
+      })
+      if (!acquired.ok) {
+        // 与排队被拒同形:已过闸的并发名额必须在此释放(下方 finally 不会执行)。
+        this._releaseDelegateSlot(slotOpts)
+        unregisterDelegation?.()
+        this.log.warn('delegate_grok_route_denied', {
+          targetAgentId,
+          httpStatus: acquired.httpStatus,
+          reason: acquired.reason,
+        })
+        return {
+          kind: 'rejected',
+          httpStatus: acquired.httpStatus,
+          message: `Grok 委派暂不可用: ${acquired.reason}`,
+        }
+      }
+      grokRoute = { baseUrl: acquired.lease.baseUrl, routeToken: acquired.lease.routeToken }
+      grokRouteLease = acquired.lease
+    }
     // 已过闸:并发名额已在 _tryReserveDelegateSlot 同步预占,此后所有路径必须释放
     // —— 正常路径走下方 finally,session 创建/开始帧投递抛错走本 catch。
     const durableTranscript: unknown[] = []
@@ -11239,6 +11277,7 @@ export class Gateway {
         )
       }
     } catch (err) {
+      if (grokRouteLease) grokRouteLease.release().catch(() => {})
       this._releaseDelegateSlot(slotOpts)
       unregisterDelegation?.()
       // 原为 throw → 路由 .catch → 500;现由 HTTP 壳把 {kind:'error'} 映射成 sendError(500),
@@ -11359,7 +11398,7 @@ export class Gateway {
       undefined,
       undefined,
       undefined,
-      { platformGoal: session._platformGoal ?? null },
+      { platformGoal: session._platformGoal ?? null, ...(grokRoute ? { grokRoute } : {}) },
     )
     try {
       await Promise.race([submitPromise, timeoutPromise])
@@ -11524,6 +11563,9 @@ export class Gateway {
       }
       unregisterDelegation?.()
       this._releaseDelegateSlot(slotOpts)
+      // grok delegate 的 master 侧账号槽/路由上下文收尾(release 幂等且内部吞错,
+      // 不会因清理失败让已完成的委派翻成失败)。
+      if (grokRouteLease) await grokRouteLease.release()
       // 本次 delegate 的子会话(sessionKey 带时间戳,一次性)在生命周期内可能
       // 作为"父"再委派(hidden 审查员 / 嵌套成员);它收尾后计数键永远不会复用,
       // 两个 per-turn 计数器都清理防泄漏。注意清的是子会话自己的键,不动 delegateGuardKey

@@ -253,11 +253,18 @@ import {
   hasActiveOfficialOAuthAccountInGroup,
   listActiveGrokRouteLeases,
   listEnabledGroupsForModel,
+  resolveGrokRouteContext,
 } from "./account-pool/groups.js";
 import {
   CODEX_RELAY_PREFIX,
   type CodexRelayHandler,
 } from "./http/internalCodexRelay.js";
+import {
+  isDelegateGrokRoutePath,
+  makeDelegateGrokRouteHandler,
+  type DelegateGrokRouteAllocation,
+  type DelegateGrokRouteHandler,
+} from "./http/internalDelegateGrokRoute.js";
 import {
   GROK_RELAY_PREFIX,
   makeGrokRelayHandler,
@@ -1660,6 +1667,81 @@ export async function registerCommercial(
   // 共享同一个 dispatcher,按 url path 分流到 anthropicProxy 或 internalServerAuthored。
   // 在 internalProxyHandler 构造完毕后赋值;mTLS listener 读它而不是 internalProxyHandler。
   let dispatchInternal: AnthropicProxyHandler | undefined;
+
+  // ── grok relay route allocation(浏览器 turn 与 delegate turn 共用)──────
+  // createCommercialCodexRoute 原 grok 分支的原样抽取:bridge(每帧铸 route)
+  // 与下方 delegateGrokRouteHandler(容器本地 delegate turn 主动申请)必须走
+  // 同一账号池、同一 grok_route_contexts durable 并发权威,不允许各自解释。
+  const allocateGrokRelayRoute = async ({ containerId, userId, modelId, sessionId }: {
+    containerId: number;
+    userId: bigint;
+    modelId: string;
+    sessionId?: string;
+  }) => {
+    // grok_route_contexts is the durable concurrency authority. Rebuild the
+    // local scheduler mirror before every allocation so a browser disconnect,
+    // generic slot reaper, or Master restart cannot make a live route vanish
+    // from the cap check.
+    for (const lease of await listActiveGrokRouteLeases()) {
+      scheduler.restoreCodexSlot(lease.accountId, lease.slotId);
+    }
+    const groups = await listEnabledGroupsForModel({ modelId, provider: "grok" });
+    let busy: AccountPoolBusyError | null = null;
+    for (const group of groups) {
+      let picked;
+      try {
+        picked = await scheduler.pick({
+          mode: "agent",
+          provider: "grok",
+          groupId: group.id,
+          sessionId: sessionId ?? `container:${containerId}`,
+        });
+      } catch (err) {
+        if (err instanceof AccountPoolBusyError) { busy = err; continue; }
+        if (err instanceof AccountPoolUnavailableError) continue;
+        throw err;
+      }
+      picked.token.fill(0);
+      picked.refresh?.fill(0);
+      let route;
+      try {
+        route = await tx((client) => createGrokRouteContextForModel({
+          containerId,
+          userId,
+          modelId,
+          accountId: picked.account_id,
+          slotId: picked.slotId,
+          groupId: group.id,
+          runner: client,
+          maxConcurrent: scheduler.maxConcurrent,
+        }));
+      } catch (err) {
+        scheduler.releaseCodexSlot(picked.account_id, picked.slotId);
+        throw err;
+      }
+      if (!route) {
+        scheduler.releaseCodexSlot(picked.account_id, picked.slotId);
+        continue;
+      }
+      return {
+        kind: "api_relay" as const,
+        engine: "grok" as const,
+        token: route.token,
+        baseUrl: `http://127.0.0.1:${V3_CONTAINER_PORT}/internal/v5/grok-relay/route/${route.token}/v1`,
+        modelProvider: "grok",
+        providerName: "xAI Grok subscription",
+        wireApi: "chat" as const,
+        preferredAuthMethod: "apikey" as const,
+        disableResponseStorage: true,
+        groupId: route.group.id.toString(),
+        credentialId: route.accountId.toString(),
+        accountId: route.accountId.toString(),
+        slotId: picked.slotId,
+      };
+    }
+    if (busy) throw busy;
+    return { kind: "unavailable" as const, reason: "no usable Grok subscription account" };
+  };
   // Internal listeners are assembled before model-authority startup. Renewal
   // reads this forward ref at request time; startup windows fail closed 503.
   let modelAuthoritySigner: AuthoritySigner | undefined;
@@ -2068,6 +2150,34 @@ export async function registerCommercial(
           return true;
         },
       });
+      // /internal/v5/delegate/grok-route/* — 容器本地 delegate turn 的 grok route
+      // mint/renew/release(与浏览器 turn 同一账号池与 durable 并发权威)。仅在
+      // selfhost engine-local-turn 豁免下挂载(与 gateway modelAuthority
+      // isEngineLocalTurnExempt 同一 env 语义);生产不路由 → 容器侧 delegate 在
+      // decideLocalExecution 已 fail-closed,不会也不该到达这里。
+      const delegateGrokRouteHandler: DelegateGrokRouteHandler | undefined =
+        process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS === "1"
+          ? makeDelegateGrokRouteHandler({
+              identityRepo,
+              allocate: allocateGrokRelayRoute,
+              release: async ({ routeToken, containerId, userId }) => {
+                const context = await resolveGrokRouteContext({ token: routeToken, containerId, userId });
+                if (!context) return false;
+                await expireGrokRouteContextByLease(context.accountId, context.slotId);
+                scheduler.releaseCodexSlot(context.accountId, context.slotId);
+                return true;
+              },
+              renew: async ({ routeToken, containerId, userId }) => {
+                const context = await resolveGrokRouteContext({ token: routeToken, containerId, userId });
+                if (!context) return false;
+                if (!scheduler.renewCodexSlot(context.accountId, context.slotId)) {
+                  scheduler.restoreCodexSlot(context.accountId, context.slotId);
+                }
+                return true;
+              },
+              logger: rootLogger.child({ subsys: "delegateGrokRoute" }),
+            })
+          : undefined;
       const zcodeRelayHandler: ZcodeRelayHandler = makeZcodeRelayHandler({
         identityRepo,
         codingPlanKey: cfg.ZAI_CODING_PLAN_KEY ?? "",
@@ -2399,6 +2509,9 @@ export async function registerCommercial(
         }
         if (path === TURN_LEASE_RENEW_PATH) {
           return turnLeaseRenewHandler(req, res, ctx);
+        }
+        if (delegateGrokRouteHandler && isDelegateGrokRoutePath(path)) {
+          return delegateGrokRouteHandler(req, res, ctx);
         }
         if (
           promptQueueHandler &&
@@ -3820,69 +3933,7 @@ export async function registerCommercial(
     sessionId?: string;
   }) => {
     if (isGrokEngineModel(modelId)) {
-      // grok_route_contexts is the durable concurrency authority. Rebuild the
-      // local scheduler mirror before every allocation so a browser disconnect,
-      // generic slot reaper, or Master restart cannot make a live route vanish
-      // from the cap check.
-      for (const lease of await listActiveGrokRouteLeases()) {
-        scheduler.restoreCodexSlot(lease.accountId, lease.slotId);
-      }
-      const groups = await listEnabledGroupsForModel({ modelId, provider: "grok" });
-      let busy: AccountPoolBusyError | null = null;
-      for (const group of groups) {
-        let picked;
-        try {
-          picked = await scheduler.pick({
-            mode: "agent",
-            provider: "grok",
-            groupId: group.id,
-            sessionId: sessionId ?? `container:${containerId}`,
-          });
-        } catch (err) {
-          if (err instanceof AccountPoolBusyError) { busy = err; continue; }
-          if (err instanceof AccountPoolUnavailableError) continue;
-          throw err;
-        }
-        picked.token.fill(0);
-        picked.refresh?.fill(0);
-        let route;
-        try {
-          route = await tx((client) => createGrokRouteContextForModel({
-            containerId,
-            userId,
-            modelId,
-            accountId: picked.account_id,
-            slotId: picked.slotId,
-            groupId: group.id,
-            runner: client,
-            maxConcurrent: scheduler.maxConcurrent,
-          }));
-        } catch (err) {
-          scheduler.releaseCodexSlot(picked.account_id, picked.slotId);
-          throw err;
-        }
-        if (!route) {
-          scheduler.releaseCodexSlot(picked.account_id, picked.slotId);
-          continue;
-        }
-        return {
-          kind: "api_relay" as const,
-          engine: "grok" as const,
-          token: route.token,
-          baseUrl: `http://127.0.0.1:${V3_CONTAINER_PORT}/internal/v5/grok-relay/route/${route.token}/v1`,
-          modelProvider: "grok",
-          providerName: "xAI Grok subscription",
-          wireApi: "chat" as const,
-          preferredAuthMethod: "apikey" as const,
-          disableResponseStorage: true,
-          groupId: route.group.id.toString(),
-          credentialId: route.accountId.toString(),
-          accountId: route.accountId.toString(),
-          slotId: picked.slotId,
-        };
-      }
-      if (busy) throw busy;
-      return { kind: "unavailable" as const, reason: "no usable Grok subscription account" };
+      return allocateGrokRelayRoute({ containerId, userId, modelId, sessionId });
     }
     const groups = await listEnabledGroupsForModel({ modelId, provider: "codex" });
     if (groups.length === 0) return null;

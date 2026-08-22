@@ -9,6 +9,9 @@
  * 安全:
  *   - **deny /internal/v5/***:控制专用路径(cost-event 等)只允许 egress 进程
  *     自己调用,容器伪造经转发面到达 → 403(master 端秘钥头是第二道)。
+ *     唯一例外:/internal/v5/delegate/grok-route/{mint,release,renew} 三条
+ *     精确路径转发给 master(容器身份鉴权在 master 侧,见
+ *     internalDelegateGrokRoute.ts);其余 /internal/v5/* 仍全部拒转。
  *   - 剥掉入站的 egress 秘钥头(容器不可能合法携带,防透传)。
  *   - hop-by-hop 头剥除;peer ip 经 x-v5-egress-peer-ip 传递给 master
  *     (master 控制口 listener 用它替代 socket.remoteAddress 做 boundIp 因子)。
@@ -22,6 +25,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { request as httpRequest } from "node:http";
 
 import { rootLogger, type Logger } from "../logging/logger.js";
+import { isDelegateGrokRoutePath } from "../http/internalDelegateGrokRoute.js";
 import { EGRESS_SECRET_HEADER } from "../http/internalCostEvent.js";
 
 /** 转发到 master 时传递容器真实 peer ip 的头(master 控制口据此重建 boundIp ctx)。 */
@@ -53,8 +57,16 @@ export function makeForwarder(opts: ForwarderOpts): Forwarder {
   const base = new URL(opts.controlBaseUrl);
 
   return function forward(req, res, peerIp) {
-    const path = req.url ?? "/";
-    if (path.split("?")[0]!.startsWith(CONTROL_ONLY_PREFIX)) {
+    const path = req.url ?? "";
+    // 唯一例外:delegate grok-route 三条精确路径。它们是容器(网关)发起的
+    // master 内部 API,鉴权是 master 侧 verifyContainerIdentity(bearer oc-v3
+    // + peer ip 重建的 boundIp 因子),与被转发的 /internal/v3/* 同一信任模型,
+    // 不携带也不需要 egress 秘钥。生产 master 未开 selfhost 豁免 → 未挂载 →
+    // 404,fail-closed 不变。
+    if (
+      path.split("?")[0]!.startsWith(CONTROL_ONLY_PREFIX) &&
+      !isDelegateGrokRoutePath(path.split("?")[0]!)
+    ) {
       res.statusCode = 403;
       res.setHeader("Content-Type", "application/json; charset=utf-8");
       res.end(JSON.stringify({ error: { code: "CONTROL_ONLY_PATH", message: "not forwardable" } }));
