@@ -46,6 +46,11 @@
 #                                  # 回收陈旧的 kl-mirror production-mutation lease:读远端 fencing meta →
 #                                  # kill -0 校验 holder → 仅当陈旧(holder 不存在 / 超 TTL)才清锁,否则拒绝并打印持有者。
 #                                  # 明知部署已死时可 OC_V5_RECLAIM_FORCE=1 强制(runbook 记载的紧急旁路)。
+#   scripts/deploy-v5.sh --reclaim-mutation-inflight
+#                                  # 官方回收残留 .mutation-lane-inflight:deploy_state 已 stable 且 candidate 空、
+#                                  # lease 无 holder、无 detached deploy unit、nonce 无活进程、marker 年龄≥阈值
+#                                  # (默认 1800s,OC_V5_INFLIGHT_RECLAIM_MIN_AGE_SECONDS)才清。只清 marker,
+#                                  # 不碰 .manual-recovery-required。任一证据不足 fail-closed。
 #   scripts/deploy-v5.sh --dry-run     # 只打印将执行的动作
 #
 # runtime hotcfg(§5,两轴独立开关):
@@ -294,6 +299,7 @@ for arg in "$@"; do
     # 陈旧 production-mutation lease 回收(C1):只读探测 + 条件清理,不抢任何本地/全局锁。
     --allow-unverified-ci) ALLOW_UNVERIFIED_CI=1 ;;
     --reclaim-mutation-lease) MODE="reclaim-mutation-lease" ;;
+    --reclaim-mutation-inflight) MODE="reclaim-mutation-inflight" ;;
     # 模型权威(方案 §7 步 4/5)。preflight 是四面活体门,cutover 是不可逆地板。
     --model-authority-preflight) MODE="model-authority-preflight" ;;
     --enable-model-authority) MODE="enable-model-authority" ;;
@@ -2278,6 +2284,131 @@ mutation_lane_inflight_absent() { # read-only parent verification
   ssh "$KL_HOST" "test ! -e '$MUTATION_LANE_INFLIGHT_MARKER'"
 }
 
+# C4:官方 inflight marker 回收。只清 .mutation-lane-inflight,不碰 .manual-recovery-required。
+# 全部证据满足才清;任一缺失 fail-closed 并打印缺哪条。
+reclaim_mutation_lane_inflight() {
+  local min_age="${OC_V5_INFLIGHT_RECLAIM_MIN_AGE_SECONDS:-1800}"
+  local missing="" phase candidate_slot candidate_release
+  local lease_free=0 manual_absent=0 units_idle=0 nonce_idle=0 age_ok=0
+  local marker_json nonce outer_pid started_at age now
+  echo "══ mutation lane in-flight marker 官方回收(reclaim)══"
+  [[ "$min_age" =~ ^[1-9][0-9]*$ ]] || min_age=1800
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] 核验 deploy_state.phase=stable+candidate 空 / lease 无 holder / 无 openclaude-v5-deploy-*.service / nonce 无活进程 / 年龄≥${min_age}s 后才 rm marker"
+    return 0
+  fi
+  if ! ds_load; then
+    echo "✗ reclaim-inflight:无法读取 deploy_state(fail-closed,未清 marker)" >&2
+    return 1
+  fi
+  phase="$DS_phase"
+  candidate_slot="${DS_candidate_slot:-}"
+  candidate_release="${DS_candidate_release:-}"
+  if [[ "$phase" == stable && -z "$candidate_slot" && -z "$candidate_release" ]]; then
+    echo "  ✓ deploy_state phase=stable 且 candidate 为空"
+  else
+    missing+=" deploy_state(phase=${phase:-?} candidate_slot=${candidate_slot:-<none>} candidate_release=${candidate_release:-<none>})"
+    echo "  ✗ deploy_state 未收敛:phase=$phase candidate_slot=${candidate_slot:-<none>} candidate_release=${candidate_release:-<none>}" >&2
+  fi
+
+  local lease_probe
+  lease_probe="$(ssh "$KL_HOST" bash -s -- "$PRODUCTION_MUTATION_LOCK" "$PRODUCTION_MUTATION_LEASE_META" <<'REMOTE'
+set -e
+lock="$1"; meta="$2"; manual="${lock}.manual-holder"
+if [ -f "$manual" ]; then echo MANUAL; exit 0; fi
+exec 8>"$lock" 2>/dev/null || { echo LOCKOPEN; exit 0; }
+if flock -n 8 2>/dev/null; then
+  flock -u 8 2>/dev/null || true
+  exec 8>&- 2>/dev/null || true
+  echo FREE
+  exit 0
+fi
+exec 8>&- 2>/dev/null || true
+echo HELD
+REMOTE
+  )" || lease_probe="SSHFAIL"
+  case "$lease_probe" in
+    FREE) lease_free=1; manual_absent=1; echo "  ✓ mutation lease 无 holder 且无 manual-holder" ;;
+    MANUAL) missing+=" manual-holder"; echo "  ✗ 存在 ${PRODUCTION_MUTATION_LOCK}.manual-holder" >&2 ;;
+    HELD) missing+=" lease-held"; echo "  ✗ production-mutation lease 仍被持有" >&2 ;;
+    *) missing+=" lease-probe"; echo "  ✗ lease 探测失败:$lease_probe" >&2 ;;
+  esac
+
+  if systemctl list-units --type=service --state=activating,active,reloading,deactivating \
+      --no-legend --plain 'openclaude-v5-deploy-*.service' 2>/dev/null | grep -q '[^[:space:]]'; then
+    missing+=" deploy-unit-running"
+    echo "  ✗ 仍有 openclaude-v5-deploy-*.service 在跑" >&2
+  else
+    units_idle=1
+    echo "  ✓ 无 openclaude-v5-deploy-*.service 在跑"
+  fi
+
+  if ! marker_json="$(ssh "$KL_HOST" "test -f '$MUTATION_LANE_INFLIGHT_MARKER' && cat '$MUTATION_LANE_INFLIGHT_MARKER'")"; then
+    echo "✗ reclaim-inflight:marker 不存在或不可读:$MUTATION_LANE_INFLIGHT_MARKER" >&2
+    return 1
+  fi
+  nonce="$(jq -r '.nonce // empty' <<<"$marker_json")"
+  outer_pid="$(jq -r '.outer_pid // empty' <<<"$marker_json")"
+  started_at="$(jq -r '.started_at // empty' <<<"$marker_json")"
+  [[ "$nonce" =~ ^[0-9a-f]{32}$ && "$outer_pid" =~ ^[1-9][0-9]*$ && "$started_at" =~ ^[1-9][0-9]*$ ]] || {
+    echo "✗ reclaim-inflight:marker 字段不可解析(nonce/outer_pid/started_at)" >&2
+    return 1
+  }
+  if kill -0 "$outer_pid" 2>/dev/null; then
+    missing+=" outer_pid-live"
+    echo "  ✗ marker outer_pid=$outer_pid 仍存活" >&2
+  elif grep -Rqs -- "$nonce" /proc/[0-9]*/environ /proc/[0-9]*/cmdline 2>/dev/null; then
+    missing+=" nonce-live"
+    echo "  ✗ marker nonce 仍出现在存活进程 environ/cmdline" >&2
+  else
+    nonce_idle=1
+    echo "  ✓ marker nonce/outer_pid 不属于任何存活进程(outer_pid=$outer_pid)"
+  fi
+  now="$(date +%s)"
+  age=$(( now - started_at ))
+  if (( age >= min_age )); then
+    age_ok=1
+    echo "  ✓ marker 年龄 ${age}s ≥ 阈值 ${min_age}s"
+  else
+    missing+=" age<${min_age}s"
+    echo "  ✗ marker 年龄 ${age}s < 阈值 ${min_age}s(OC_V5_INFLIGHT_RECLAIM_MIN_AGE_SECONDS)" >&2
+  fi
+
+  if [[ -n "$missing" ]]; then
+    echo "✗ reclaim-inflight 拒绝:缺证据$missing;未清 marker,也未碰 .manual-recovery-required" >&2
+    return 4
+  fi
+  [[ "$lease_free" == 1 && "$manual_absent" == 1 && "$units_idle" == 1 && "$nonce_idle" == 1 && "$age_ok" == 1 ]] || {
+    echo "✗ reclaim-inflight 内部证据位不一致;未清 marker" >&2
+    return 1
+  }
+  local result
+  result="$(ssh "$KL_HOST" bash -s -- "$MUTATION_LANE_INFLIGHT_MARKER" "$nonce" <<'REMOTE'
+set -Eeuo pipefail
+marker="$1"; nonce="$2"; dir="$(dirname "$marker")"
+if [[ ! -e "$marker" ]]; then echo ALREADY; exit 0; fi
+if jq -e --arg nonce "$nonce" '.schema == 1 and .nonce == $nonce' "$marker" >/dev/null 2>&1; then
+  rm -f "$marker"
+  sync -f "$dir" || sync
+  [[ ! -e "$marker" ]]
+  echo CLEARED
+else
+  echo PRESERVED
+fi
+REMOTE
+  )" || { echo "✗ reclaim-inflight:远端清除失败" >&2; return 1; }
+  case "$result" in
+    CLEARED|ALREADY)
+      echo "  ✓ 已清除 $MUTATION_LANE_INFLIGHT_MARKER(未碰 .manual-recovery-required)"
+      return 0
+      ;;
+    *)
+      echo "✗ reclaim-inflight:nonce 已变化/清除未确认:$result" >&2
+      return 1
+      ;;
+  esac
+}
+
 # 状态提交回执无法裁决时，绝不能继续猜测并翻另一生效面。落一个远端持久标记，后续所有
 # 写 lane 起手即拒；人工核对 deploy_state / A/B symlink / unit / tuple history 后才能移除。
 mark_deploy_recovery_required() {  # $1=reason
@@ -2720,12 +2851,18 @@ base="$(basename -- "$reldir")"
 version_commit="$(jq -er '.commit | select(type == "string")' "$version")" || exit 1
 if [[ "$kind" == strong ]]; then
   row="$(jq -er --argjson schema "$schema" '
-    if ((keys | sort) == (["artifactSha256","builtAt","metadataSha256","schemaVersion","sourceCommit"] | sort)
+    if (((["artifactSha256","builtAt","metadataSha256","schemaVersion","sourceCommit"] - keys) | length) == 0
+      and ((keys - ["artifactSha256","builtAt","distReuse","metadataSha256","schemaVersion","sourceCommit"]) | length) == 0
       and .schemaVersion == $schema
       and (.sourceCommit | type == "string" and test("^[0-9a-f]{40}$"))
       and (.builtAt | type == "string" and test("^[0-9]{8}-[0-9]{6}$"))
       and (.metadataSha256 | type == "string" and test("^[0-9a-f]{64}$"))
-      and (.artifactSha256 | type == "string" and test("^[0-9a-f]{64}$")))
+      and (.artifactSha256 | type == "string" and test("^[0-9a-f]{64}$"))
+      and ((has("distReuse") | not)
+        or ((.distReuse | type == "object")
+          and (.distReuse.fromRelease | type == "string" and (.distReuse.fromRelease | startswith("/")))
+          and (.distReuse.fromSourceCommit | type == "string" and test("^[0-9a-f]{40}$"))
+          and (.distReuse.comparedPaths | type == "array" and (.distReuse.comparedPaths | length) > 0))))
     then [.sourceCommit,.builtAt,.metadataSha256,.artifactSha256] | @tsv
     else error("invalid strong release marker") end
   ' "$marker")" || exit 1
@@ -3206,6 +3343,175 @@ assert_ci_green_for_source_commit() { # <full sha>
   return 0
 }
 
+# B1:绿门(含 in_progress 有界轮询)在 mutation lease 外跑完,避免默认 20min 轮询焊死全局写锁。
+# 本进程记 pinned SHA + 结论时间戳;持锁后 / build_release 内只做廉价复核,禁止留下完全无门路径。
+CI_GREEN_PASSED_SHA=""
+CI_GREEN_PASSED_AT=""
+
+run_ci_green_gate_before_lease() { # [explicit-sha]
+  local sha="${1:-}"
+  if [[ -z "$sha" ]]; then
+    sha="$(resolve_release_source_commit)" || return 1
+  fi
+  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "✗ CI 绿门:无法解析发布源 commit" >&2; return 1; }
+  echo "── CI 绿门(mutation lease 外):$sha ──"
+  assert_ci_green_for_source_commit "$sha" || return 1
+  CI_GREEN_PASSED_SHA="$sha"
+  CI_GREEN_PASSED_AT="$(date +%s)"
+  [[ "$CI_GREEN_PASSED_AT" =~ ^[1-9][0-9]*$ ]] || {
+    echo "✗ CI 绿门:无法记录本进程结论时间戳" >&2
+    return 1
+  }
+  echo "  ✓ CI 绿门已在 mutation lease 外通过并记入本进程(sha=$sha at=$CI_GREEN_PASSED_AT)"
+}
+
+# 廉价复核:本进程已通过绿门 ∧ pinned SHA 未漂 ∧ 工作树 clean。不重新打 GitHub。
+assert_ci_green_process_local() { # <expected-sha> <ctx>
+  local expected="$1" ctx="${2:-recheck}" now head_sha pinned_sha dirty
+  [[ "$expected" =~ ^[0-9a-f]{40}$ ]] || { echo "✗ [$ctx] CI 绿门复核:SHA 非法:$expected" >&2; return 1; }
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] [$ctx] 复核本进程绿门结论(sha=$expected)"
+    return 0
+  fi
+  if [[ -z "$CI_GREEN_PASSED_SHA" || -z "$CI_GREEN_PASSED_AT" ]]; then
+    echo "✗ [$ctx] CI 绿门未在本进程通过(禁止无门进入 build_release)" >&2
+    return 1
+  fi
+  [[ "$CI_GREEN_PASSED_SHA" == "$expected" ]] || {
+    echo "✗ [$ctx] CI 绿门 pinned SHA 已漂(passed=$CI_GREEN_PASSED_SHA now=$expected)" >&2
+    return 1
+  }
+  now="$(date +%s)"
+  [[ "$now" =~ ^[1-9][0-9]*$ && "$now" -ge "$CI_GREEN_PASSED_AT" ]] || {
+    echo "✗ [$ctx] CI 绿门结论时间戳不可信(at=$CI_GREEN_PASSED_AT now=$now)" >&2
+    return 1
+  }
+  pinned_sha="$(resolve_release_source_commit)" || return 1
+  [[ "$pinned_sha" == "$expected" ]] || {
+    echo "✗ [$ctx] 发布源 commit 已漂(expected=$expected resolved=$pinned_sha)" >&2
+    return 1
+  }
+  head_sha="$(git -C "$REPO_ROOT" rev-parse HEAD)" || {
+    echo "✗ [$ctx] 无法读取 checkout HEAD" >&2
+    return 1
+  }
+  if [[ -n "${OC_V5_RELEASE_QUEUE_ID:-}" ]]; then
+    git -C "$REPO_ROOT" merge-base --is-ancestor "$expected" HEAD || {
+      echo "✗ [$ctx] queue pinned SHA 不再是 checkout HEAD 的祖先(HEAD=${head_sha:-<none>})" >&2
+      return 1
+    }
+  else
+    [[ "$head_sha" == "$expected" ]] || {
+      echo "✗ [$ctx] checkout HEAD 已漂(HEAD=${head_sha:-<none>} pinned=$expected)" >&2
+      return 1
+    }
+  fi
+  dirty="$(git -C "$REPO_ROOT" status --porcelain --untracked-files=all 2>/dev/null || echo DIRTY)"
+  [[ -z "$dirty" ]] || {
+    echo "✗ [$ctx] 工作树已脏,拒绝沿用本进程绿门结论" >&2
+    printf '%s\n' "$dirty" >&2
+    return 1
+  }
+  echo "  ✓ [$ctx] CI 绿门廉价复核通过(sha=$expected at=$CI_GREEN_PASSED_AT)"
+}
+
+# --canary=<release> 的源 SHA 只能来自该 release 的可信 strong .complete。
+# legacy / 短 SHA / 缺字段一律 fail-closed;--allow-unverified-ci 仍是唯一显式豁免口。
+resolve_specified_canary_release_dir() {
+  local requested
+  [[ -n "$CANARY_RELEASE" ]] || { echo "✗ 指定 canary 未提供 CANARY_RELEASE" >&2; return 1; }
+  requested="$RELEASES_ROOT/$CANARY_RELEASE"
+  [[ "$CANARY_RELEASE" == /* ]] && requested="$CANARY_RELEASE"
+  [[ "$requested" == /* && "$requested" != *..* ]] || {
+    echo "✗ 指定 canary release 路径非法:$CANARY_RELEASE" >&2
+    return 1
+  }
+  printf '%s\n' "$requested"
+}
+
+resolve_specified_canary_source_commit() {
+  local reldir probe kind source
+  reldir="$(resolve_specified_canary_release_dir)" || return 1
+  probe="$(release_marker_probe "$reldir")" || {
+    echo "✗ 指定 canary release 的 .complete marker 不可信/不可解析:$reldir" >&2
+    return 1
+  }
+  IFS=$'\t' read -r kind source _ <<<"$probe"
+  if [[ "$kind" == legacy ]]; then
+    echo "✗ 指定 canary release 是 legacy .complete,拒绝无完整 sourceCommit 的绿门路径:$reldir" >&2
+    return 1
+  fi
+  [[ "$kind" == strong && "$source" =~ ^[0-9a-f]{40}$ ]] || {
+    echo "✗ 指定 canary release 缺完整 40-hex sourceCommit(kind=${kind:-?}):$reldir" >&2
+    return 1
+  }
+  printf '%s\n' "$source"
+}
+
+# 指定 canary release 的廉价复核:本进程绿门戳 + marker SHA 未漂。
+# 不要求 checkout HEAD==该 SHA——复用旧 release 时工作树本来就可以不等于制品源。
+assert_ci_green_specified_release_local() { # <expected-sha> <ctx>
+  local expected="$1" ctx="${2:-canary-recheck}" now marker_sha
+  [[ "$expected" =~ ^[0-9a-f]{40}$ ]] || { echo "✗ [$ctx] 指定 canary SHA 非法:$expected" >&2; return 1; }
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] [$ctx] 复核指定 canary release 绿门结论(sha=$expected)"
+    return 0
+  fi
+  if [[ -z "$CI_GREEN_PASSED_SHA" || -z "$CI_GREEN_PASSED_AT" ]]; then
+    echo "✗ [$ctx] CI 绿门未在本进程通过(禁止 --canary=<release> 无门启动 candidate)" >&2
+    return 1
+  fi
+  [[ "$CI_GREEN_PASSED_SHA" == "$expected" ]] || {
+    echo "✗ [$ctx] CI 绿门 pinned SHA 已漂(passed=$CI_GREEN_PASSED_SHA now=$expected)" >&2
+    return 1
+  }
+  now="$(date +%s)"
+  [[ "$now" =~ ^[1-9][0-9]*$ && "$now" -ge "$CI_GREEN_PASSED_AT" ]] || {
+    echo "✗ [$ctx] CI 绿门结论时间戳不可信(at=$CI_GREEN_PASSED_AT now=$now)" >&2
+    return 1
+  }
+  marker_sha="$(resolve_specified_canary_source_commit)" || return 1
+  [[ "$marker_sha" == "$expected" ]] || {
+    echo "✗ [$ctx] 指定 canary .complete sourceCommit 已漂(expected=$expected marker=$marker_sha)" >&2
+    return 1
+  }
+  echo "  ✓ [$ctx] 指定 canary release CI 绿门廉价复核通过(sha=$expected at=$CI_GREEN_PASSED_AT)"
+}
+
+maybe_run_ci_green_gate_for_mode() {
+  local sha
+  case "$MODE" in
+    deploy|dist)
+      run_ci_green_gate_before_lease || return 1
+      ;;
+    canary)
+      if [[ -n "$CANARY_RELEASE" ]]; then
+        sha="$(resolve_specified_canary_source_commit)" || return 1
+        run_ci_green_gate_before_lease "$sha" || return 1
+      else
+        run_ci_green_gate_before_lease || return 1
+      fi
+      ;;
+  esac
+}
+
+maybe_recheck_ci_green_after_lease() {
+  local sha
+  case "$MODE" in
+    deploy|dist)
+      assert_ci_green_process_local "$CI_GREEN_PASSED_SHA" "post-lease" || return 1
+      ;;
+    canary)
+      if [[ -n "$CANARY_RELEASE" ]]; then
+        sha="$(resolve_specified_canary_source_commit)" || return 1
+        assert_ci_green_specified_release_local "$sha" "post-lease" || return 1
+      else
+        assert_ci_green_process_local "$CI_GREEN_PASSED_SHA" "post-lease" || return 1
+      fi
+      ;;
+  esac
+}
+
 # 「这次发布的源 commit」的单一权威。
 #
 # 2026-07-26 角色分离:此前直接取 `rev-parse HEAD`,于是 $REPO_ROOT 这棵树同时是
@@ -3334,14 +3640,135 @@ assert_p3_preserved_tuple_matches_candidate() { # <target full commit>
   echo "  ✓ P3 preserved tuple 生效面与 candidate 一致(runtime_base=$runtime_base platform_base=$platform_base)"
 }
 
+# B4:with-dist 在 pinned SHA 相对当前 active sourceCommit 的 web 输入面无差异时 cp -al 复用。
+# 输入面 = web-react 的 @openclaude/* workspace 闭包(递归) + 根 lock/构建配置。
+# 禁止手写包名单;解析失败 fail-closed 回退全量构建。
+# VITE_TASKBOARD_ENABLED 硬编码 0;oc-build 是 index.html 内容哈希,不含 per-release env。
+DIST_REUSE_FROM=""; DIST_REUSE_OLD_SHA=""; DIST_REUSE_PATHS=""
+WEB_DIST_REUSE_ROOT_PATHS="package-lock.json package.json packages/web-react/vite.config.ts packages/web-react/tsconfig.json tsconfig.json tsconfig.base.json"
+
+# 从 pinned SHA 的 packages/web-react/package.json 递归解析 @openclaude/* 闭包。
+# stdout:换行分隔的 diff-tree 路径;解析失败返回非 0。
+resolve_web_dist_reuse_paths() { # <full-sha>
+  local sha="$1" listing entry name dir pkg json deps extra
+  local -A name_to_dir=() seen=()
+  local -a queue=('@openclaude/web-react') dirs=() extras=()
+  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "  · dist 复用拒绝:SHA 非法,无法解析 web workspace 闭包" >&2; return 1; }
+  listing="$(git -C "$REPO_ROOT" ls-tree -r --full-tree --name-only "$sha" -- packages)" || {
+    echo "  · dist 复用拒绝:无法列出 $sha 的 packages 树" >&2
+    return 1
+  }
+  while IFS= read -r entry; do
+    [[ "$entry" == packages/*/package.json || "$entry" == packages/*/*/package.json ]] || continue
+    name="$(git -C "$REPO_ROOT" show "${sha}:${entry}" | jq -er '.name | select(type=="string" and startswith("@openclaude/"))')" || continue
+    name_to_dir["$name"]="${entry%/package.json}"
+  done <<<"$listing"
+  [[ -n "${name_to_dir['@openclaude/web-react']:-}" ]] || {
+    echo "  · dist 复用拒绝:pinned SHA 找不到 @openclaude/web-react 包目录" >&2
+    return 1
+  }
+  while ((${#queue[@]} > 0)); do
+    pkg="${queue[0]}"
+    queue=("${queue[@]:1}")
+    [[ -z "${seen[$pkg]:-}" ]] || continue
+    seen["$pkg"]=1
+    dir="${name_to_dir[$pkg]:-}"
+    [[ -n "$dir" ]] || { echo "  · dist 复用拒绝:无法解析 workspace 依赖 $pkg 的 packages/<dir>" >&2; return 1; }
+    dirs+=("$dir")
+    json="$(git -C "$REPO_ROOT" show "${sha}:${dir}/package.json")" || {
+      echo "  · dist 复用拒绝:读不到 ${dir}/package.json" >&2
+      return 1
+    }
+    deps="$(jq -r '[.dependencies,.devDependencies,.peerDependencies,.optionalDependencies] | map(select(. != null)) | add // {} | keys[]? | select(startswith("@openclaude/"))' <<<"$json")" || {
+      echo "  · dist 复用拒绝:解析 ${dir}/package.json 的 @openclaude/* 依赖失败" >&2
+      return 1
+    }
+    while IFS= read -r extra; do
+      [[ -n "$extra" ]] || continue
+      queue+=("$extra")
+    done <<<"$deps"
+  done
+  ((${#dirs[@]} > 0)) || { echo "  · dist 复用拒绝:web workspace 闭包为空" >&2; return 1; }
+  read -r -a extras <<<"$WEB_DIST_REUSE_ROOT_PATHS"
+  for extra in "${extras[@]}"; do
+    git -C "$REPO_ROOT" cat-file -e "${sha}:${extra}" || {
+      echo "  · dist 复用拒绝:构建输入缺失 $extra" >&2
+      return 1
+    }
+    dirs+=("$extra")
+  done
+  printf '%s\n' "${dirs[@]}" | awk 'NF && !seen[$0]++' | sort
+}
+
+try_reuse_web_dist() { # <staging> <current-release> <full-sha>
+  local staging="$1" cur="$2" full_sha="$3" old_sha paths
+  DIST_REUSE_FROM=""; DIST_REUSE_OLD_SHA=""; DIST_REUSE_PATHS=""
+  if [[ "${OC_V5_DIST_REUSE:-1}" != 1 ]]; then
+    echo "  · OC_V5_DIST_REUSE=0 → 跳过 dist 复用,全量 tsc -b && vite build" >&2
+    return 1
+  fi
+  [[ -n "$cur" ]] || { echo "  · dist 复用拒绝:无当前 release" >&2; return 1; }
+  ssh "$KL_HOST" "test -f '$cur/.complete' && test -d '$cur/packages/web-react/dist' && test -f '$cur/packages/web-react/dist/index.html'" \
+    || { echo "  · dist 复用拒绝:当前 release .complete/dist 不完整" >&2; return 1; }
+  old_sha="$(ssh "$KL_HOST" "jq -er '.sourceCommit | select(type==\"string\" and test(\"^[0-9a-f]{40}$\"))' '$cur/.complete'")" \
+    || { echo "  · dist 复用拒绝:读不到当前 release sourceCommit" >&2; return 1; }
+  git -C "$REPO_ROOT" cat-file -e "${old_sha}^{commit}" \
+    || { echo "  · dist 复用拒绝:旧 sourceCommit 本地不可达:$old_sha" >&2; return 1; }
+  paths="$(resolve_web_dist_reuse_paths "$full_sha")" || return 1
+  [[ -n "$paths" ]] || { echo "  · dist 复用拒绝:web 输入面路径为空" >&2; return 1; }
+  if ! git -C "$REPO_ROOT" diff-tree --quiet "$old_sha" "$full_sha" -- $paths; then
+    echo "  · dist 复用拒绝:web workspace 闭包/lock/构建配置相对 $old_sha 有差异 → 全量构建" >&2
+    return 1
+  fi
+  if ! ssh "$KL_HOST" "set -e
+      mkdir -p '$staging/packages/web-react'
+      rm -rf '$staging/packages/web-react/dist'
+      cp -al '$cur/packages/web-react/dist' '$staging/packages/web-react/dist'
+      test -f '$staging/packages/web-react/dist/index.html'"; then
+    echo "  · dist 复用拒绝:cp -al 失败,回退全量构建" >&2
+    return 1
+  fi
+  DIST_REUSE_FROM="$cur"
+  DIST_REUSE_OLD_SHA="$old_sha"
+  DIST_REUSE_PATHS="$(printf '%s' "$paths" | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+  echo "  · web dist 复用自 $cur (sourceCommit=$old_sha; 比对路径: $DIST_REUSE_PATHS; VITE_TASKBOARD_ENABLED=0 硬编码未另比 env)" >&2
+  return 0
+}
+
+record_dist_reuse_in_complete() { # <final-release-dir>
+  local reldir="$1"
+  [[ -n "$DIST_REUSE_FROM" && "$DIST_REUSE_OLD_SHA" =~ ^[0-9a-f]{40}$ ]] || return 1
+  ssh "$KL_HOST" bash -s -- "$reldir" "$DIST_REUSE_FROM" "$DIST_REUSE_OLD_SHA" "$DIST_REUSE_PATHS" <<'REMOTE'
+set -Eeuo pipefail
+reldir="$1"; from="$2"; old_sha="$3"; paths="$4"
+marker="$reldir/.complete"
+test -f "$marker"
+tmp="${marker}.reuse.$$"
+jq --arg from "$from" --arg sha "$old_sha" --arg paths "$paths" '
+  .distReuse = {
+    fromRelease: $from,
+    fromSourceCommit: $sha,
+    comparedPaths: ($paths | split(" ") | map(select(length > 0))),
+    viteTaskboardEnabled: "0"
+  }
+' "$marker" >"$tmp"
+chmod 0644 "$tmp"
+chown 0:0 "$tmp"
+mv -f -- "$tmp" "$marker"
+read -r uid gid mode < <(stat -Lc '%u %g %a' -- "$marker")
+[[ "$uid" == 0 && "$gid" == 0 && "$mode" == 644 ]]
+REMOTE
+}
+
 build_release() {
   BUILT_RELEASE=""; BUILT_RELEASE_SOURCE_COMMIT=""; DIST_BUILD_ID=""
   local full_sha short_sha ts staging reldir cur
   full_sha="$(resolve_release_source_commit)" || return 1
   [[ -n "$full_sha" ]] || { echo "✗ 无法解析发布源 commit(空值)" >&2; return 1; }
   BUILT_RELEASE_SOURCE_COMMIT="$full_sha"
-  # 审计 9:build_release 是「哪个 commit 会变成线上 release」的唯一收口点,CI 绿门挂在这里。
-  assert_ci_green_for_source_commit "$full_sha" || return 1
+  # B1:完整绿门(含轮询)已在 acquire_production_mutation_lease 之前跑完。
+  # 此处只做廉价断言:本进程已通过且 SHA 一致——直接调 build_release 的入口不得绕过绿门。
+  assert_ci_green_process_local "$full_sha" "build_release" || return 1
   [ -x "$TURN_WAIVER_SQL_GATE" ] || {
     echo "✗ 缺或不可执行的 turn waiver SQL gate: $TURN_WAIVER_SQL_GATE" >&2
     return 1
@@ -3382,9 +3809,12 @@ build_release() {
   # (`tsc -b && vite build`;R2#2:不从共用工作树构建,
   # 彻底消 dist 与 archive 不同源);否则硬链继承当前 release 的 dist(前端未变)。两路 DIST_BUILD_ID
   # 都从 staging 读。
+  DIST_REUSE_FROM=""; DIST_REUSE_OLD_SHA=""; DIST_REUSE_PATHS=""
   if [[ "$WITH_DIST" == 1 ]]; then
     echo "── web official build @ staging(pinned $short_sha,不读共用工作树)──" >&2
-    if ! ssh "$KL_HOST" "set -e; cd '$staging' && VITE_TASKBOARD_ENABLED=0 npm run build --workspace packages/web-react >/dev/null 2>&1"; then
+    if try_reuse_web_dist "$staging" "$cur" "$full_sha"; then
+      echo "  ✓ with-dist 复用旧 dist(证据:git diff-tree 无差异 + .complete + dist 存在;来自 $DIST_REUSE_FROM)" >&2
+    elif ! ssh "$KL_HOST" "set -e; cd '$staging' && VITE_TASKBOARD_ENABLED=0 npm run build --workspace packages/web-react >/dev/null 2>&1"; then
       echo "✗ staging web official build 失败" >&2; ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1; fi
   else
     if ! ssh "$KL_HOST" "set -e
@@ -3429,6 +3859,13 @@ REMOTE
   # 完整性校验 + strong .complete(full source/metadata/tree digests) + 原子改名。
   if ! publish_strong_release "$staging" "$reldir" "$full_sha" "$short_sha" "$ts"; then
     echo "✗ 完整性校验/原子改名失败" >&2; ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1; fi
+  if [[ -n "$DIST_REUSE_FROM" ]]; then
+    record_dist_reuse_in_complete "$reldir" || {
+      echo "✗ dist 复用 provenance 写入 .complete 失败" >&2
+      ssh "$KL_HOST" "rm -rf '$reldir'" 2>/dev/null
+      return 1
+    }
+  fi
   BUILT_RELEASE="$reldir"
   echo "  ✓ release 就绪(带 .complete):$reldir" >&2
 }
@@ -5145,9 +5582,13 @@ activate_release() {
     return 1
   fi
   run "sleep 4"
-  if ! smoke "$ACTIVE_PORT"; then
-    restore_release_activation "$prev" "$old_prev_file" "new release smoke failed" "$reldir" \
-      || mark_deploy_recovery_required "新 release smoke 失败且旧运行面补偿未确认(slot=$ACTIVE_SLOT)"
+  # B2:完整 smoke() 与 validation 链第一项重复。activate 只等 healthz 就绪再 ds_commit;
+  # 调度器白名单 / egress 活体 / v3 隔离仍由 deploy/dist/rollback 自己的 smoke() 覆盖。
+  # hotcfg saga 已是「核心 healthz 提交 + 事后 full smoke」形态。egress 翻转在 activate 之后,
+  # 其活体门走 activate_egress_release + validation smoke,不依赖此处。
+  if ! wait_for_master_healthz_ready "$ACTIVE_PORT"; then
+    restore_release_activation "$prev" "$old_prev_file" "new release healthz not ready" "$reldir" \
+      || mark_deploy_recovery_required "新 release healthz 未就绪且旧运行面补偿未确认(slot=$ACTIVE_SLOT)"
     return 1
   fi
   if ! ds_commit_active_release "$reldir"; then
@@ -5374,6 +5815,148 @@ build_platform_bundle() {
   echo "  ✓ platform bundle rev=$BUILT_BUNDLE_REV"
 }
 
+# B5:runtime 输入 digest。对齐 oc_hotcfg_finalize_release 已有的 depsCacheKey/ccbDistKey
+# 内容短路——那些仍要先 archive+staging。这里在 archive 前用输入面证据决定能否整段跳过。
+# 取证失败(读不到 image id / 旧 digest 缺失 / 抽样校验失败)一律全量构建。
+# 禁止手写包白名单:覆盖「经 runtime-src-excludes.txt 同一套 rsync 规则裁剪后会进 runtime 的全部 git 输入」。
+RUNTIME_SRC_EXCLUDES_PATH="packages/commercial/agent-sandbox/runtime-src-excludes.txt"
+RUNTIME_INPUT_DIGEST_ALG="v2-rsync-excludes"
+RUNTIME_RSYNC_EXCLUDE_PATTERNS=()
+
+load_runtime_rsync_exclude_patterns() { # <full-sha>
+  local sha="$1" raw line
+  RUNTIME_RSYNC_EXCLUDE_PATTERNS=()
+  raw="$(git -C "$REPO_ROOT" show "${sha}:${RUNTIME_SRC_EXCLUDES_PATH}")" || return 1
+  while IFS= read -r line; do
+    [[ -n "$line" && "$line" != \#* ]] || continue
+    RUNTIME_RSYNC_EXCLUDE_PATTERNS+=("$line")
+  done <<<"$raw"
+  ((${#RUNTIME_RSYNC_EXCLUDE_PATTERNS[@]} > 0)) || return 1
+}
+
+# stdout:经 excludes 过滤后的 `git ls-tree -r` 行(mode type blob\\tpath)。
+# 规则与 rsync --exclude-from 同一套;拿不准不排除(多进 digest = 复用更严)。
+runtime_input_ls_tree() { # <full-sha>
+  local sha="$1"
+  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  load_runtime_rsync_exclude_patterns "$sha" || return 1
+  python3 - "$REPO_ROOT" "$sha" "$RUNTIME_SRC_EXCLUDES_PATH" <<'PY'
+import fnmatch
+import subprocess
+import sys
+
+root, sha, excl = sys.argv[1], sys.argv[2], sys.argv[3]
+raw = subprocess.check_output(["git", "-C", root, "show", f"{sha}:{excl}"], text=True)
+patterns = []
+for line in raw.splitlines():
+    line = line.strip()
+    if not line or line.startswith("#"):
+        continue
+    patterns.append(line)
+if not patterns:
+    sys.exit(1)
+listing = subprocess.check_output(["git", "-C", root, "ls-tree", "-r", "--full-tree", sha], text=True)
+if not listing.strip():
+    sys.exit(1)
+
+def excluded(relpath: str) -> bool:
+    name = relpath.rsplit("/", 1)[-1]
+    parts = relpath.split("/")
+    for pat in patterns:
+        anchored = pat.startswith("/")
+        if anchored:
+            pat = pat[1:]
+        if pat.endswith("/"):
+            pat = pat[:-1]
+        if not pat:
+            continue
+        if anchored:
+            if relpath == pat or relpath.startswith(pat + "/") or fnmatch.fnmatch(relpath, pat):
+                return True
+            continue
+        if "/" in pat:
+            if (
+                relpath == pat
+                or relpath.startswith(pat + "/")
+                or relpath.endswith("/" + pat)
+                or ("/" + pat + "/") in ("/" + relpath + "/")
+                or fnmatch.fnmatch(relpath, pat)
+            ):
+                return True
+            continue
+        if fnmatch.fnmatch(name, pat) or any(part == pat or fnmatch.fnmatch(part, pat) for part in parts):
+            return True
+    return False
+
+rows = []
+for line in listing.splitlines():
+    if "\t" not in line:
+        continue
+    _meta, path = line.split("\t", 1)
+    if not excluded(path):
+        rows.append(line)
+if not rows:
+    sys.exit(1)
+sys.stdout.write("\n".join(rows) + "\n")
+PY
+}
+
+compute_runtime_input_digest() { # <full-sha> <image-id>
+  local sha="$1" image_id="$2" lib_hash excl_hash meta_hash tree_rows
+  [[ "$sha" =~ ^[0-9a-f]{40}$ && -n "$image_id" ]] || return 1
+  lib_hash="$(git -C "$REPO_ROOT" rev-parse "${sha}:scripts/v5-runtime-release-lib.sh")" || return 1
+  excl_hash="$(git -C "$REPO_ROOT" rev-parse "${sha}:${RUNTIME_SRC_EXCLUDES_PATH}")" || return 1
+  meta_hash="$(git -C "$REPO_ROOT" rev-parse "${sha}:deploy/v5/release-metadata.json")" || return 1
+  [[ "$lib_hash" =~ ^[0-9a-f]{40}$ && "$excl_hash" =~ ^[0-9a-f]{40}$ && "$meta_hash" =~ ^[0-9a-f]{40}$ ]] || return 1
+  tree_rows="$(runtime_input_ls_tree "$sha")" || return 1
+  [[ -n "$tree_rows" ]] || return 1
+  printf 'alg:%s\nimage:%s\nlib:%s\nexcludes:%s\nmetadata:%s\n%s\n' \
+    "$RUNTIME_INPUT_DIGEST_ALG" "$image_id" "$lib_hash" "$excl_hash" "$meta_hash" "$tree_rows" \
+    | sha256sum | awk '{print $1}'
+}
+
+record_runtime_input_digest() { # <release-dir> <digest> <image-id> <source-sha>
+  local rel="$1" digest="$2" image_id="$3" sha="$4"
+  ssh "$KL_HOST" bash -s -- "$rel" "$digest" "$image_id" "$sha" <<'REMOTE'
+set -Eeuo pipefail
+rel="$1"; digest="$2"; image_id="$3"; sha="$4"
+test -f "$rel/MANIFEST.json"
+tmp="${rel}/MANIFEST.json.input.$$"
+jq --arg d "$digest" --arg img "$image_id" --arg sha "$sha" '
+  .inputDigest = $d
+  | .inputDigestProvenance = {imageId:$img, sourceCommit:$sha, reused:false}
+' "$rel/MANIFEST.json" >"$tmp"
+mv -f -- "$tmp" "$rel/MANIFEST.json"
+REMOTE
+}
+
+try_reuse_runtime_release() { # <full-sha> <image-id> <prev-release>
+  local sha="$1" image_id="$2" prev="$3" digest old_digest
+  if [[ "${OC_V5_RUNTIME_REUSE:-1}" != 1 ]]; then
+    echo "  · OC_V5_RUNTIME_REUSE=0 → 跳过 runtime 复用,全量 docker npm ci + bun build" >&2
+    return 1
+  fi
+  [[ -n "$prev" && "$prev" == "$OC_HOTCFG_RELEASES_ROOT"/rel-* ]] || {
+    echo "  · runtime 复用拒绝:当前 OC_RUNTIME_RELEASE 缺失/非法" >&2
+    return 1
+  }
+  digest="$(compute_runtime_input_digest "$sha" "$image_id")" || {
+    echo "  · runtime 复用拒绝:无法计算输入 digest(取证失败→全量构建)" >&2
+    return 1
+  }
+  old_digest="$(ssh "$KL_HOST" "jq -er '.inputDigest | select(type==\"string\" and test(\"^[0-9a-f]{64}$\"))' '$prev/MANIFEST.json'")" \
+    || { echo "  · runtime 复用拒绝:旧 MANIFEST 无 inputDigest(取证失败→全量构建)" >&2; return 1; }
+  [[ "$digest" == "$old_digest" ]] || {
+    echo "  · runtime 复用拒绝:inputDigest 变化(old=$old_digest new=$digest)" >&2
+    return 1
+  }
+  hotcfg_rmt oc_hotcfg_verify_manifest_sampled "$prev" 64 \
+    || { echo "  · runtime 复用拒绝:旧 release 抽样校验失败→全量构建" >&2; return 1; }
+  BUILT_RUNTIME_RELEASE="$prev"
+  echo "  · runtime release 复用自 $prev (inputDigest=$digest image=$image_id source=$sha; 对齐 finalize 的 digest 短路,跳过 archive/npm ci/bun build)" >&2
+  return 0
+}
+
 # ── 2. build_runtime_release:git archive 钉死源 → exclude-from prune → docker npm ci + ccb bun build → rel-<digest> ──
 BUILT_RUNTIME_RELEASE=""; RUNTIME_IMAGE_REF=""; RUNTIME_IMAGE_ID=""
 build_runtime_release() {
@@ -5425,6 +6008,10 @@ build_runtime_release() {
       || { echo "✗ 目标 runtime 镜像不存在(须先 build-image 并写入 env): $RUNTIME_IMAGE_REF" >&2; return 1; }
   fi
   local prev; prev="$(ssh "$KL_HOST" "grep '^OC_RUNTIME_RELEASE=' '$V5_ENV' | tail -n1 | cut -d= -f2-" 2>/dev/null || true)"
+  if try_reuse_runtime_release "$full_sha" "$RUNTIME_IMAGE_ID" "${prev:-}"; then
+    echo "  ✓ runtime release=$BUILT_RUNTIME_RELEASE image_id=$RUNTIME_IMAGE_ID (reused)"
+    return 0
+  fi
   nonce="$(openssl rand -hex 8)"
   raw="$OC_HOTCFG_RELEASES_ROOT/.raw-$nonce"; staging="$OC_HOTCFG_RELEASES_ROOT/.staging-$nonce"
   # 源钉死:git archive full_sha → raw → rsync --exclude-from(与 build-image.sh 同 excludes 权威)→ staging
@@ -5439,6 +6026,11 @@ build_runtime_release() {
     || { echo "✗ release finalize 失败(npm ci / ccb build / manifest)" >&2; ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1; }
   BUILT_RUNTIME_RELEASE="$(printf '%s' "$BUILT_RUNTIME_RELEASE" | tr -d '[:space:]')"
   [[ "$BUILT_RUNTIME_RELEASE" == "$OC_HOTCFG_RELEASES_ROOT"/rel-* ]] || { echo "✗ release 目录非法: '$BUILT_RUNTIME_RELEASE'" >&2; return 1; }
+  local input_digest
+  if input_digest="$(compute_runtime_input_digest "$full_sha" "$RUNTIME_IMAGE_ID")"; then
+    record_runtime_input_digest "$BUILT_RUNTIME_RELEASE" "$input_digest" "$RUNTIME_IMAGE_ID" "$full_sha" \
+      || echo "  ⚠ runtime inputDigest 写入失败(下次无法复用,不阻断本次构建)" >&2
+  fi
   echo "  ✓ runtime release=$BUILT_RUNTIME_RELEASE image_id=$RUNTIME_IMAGE_ID"
 }
 
@@ -5813,6 +6405,35 @@ dist_handshake_smoke() {
   verify_asset_surface "$sport" || return 1
 }
 
+# activate_release 最小就绪门(B2):只证明 master 进程活着且是 leader,不跑完整 smoke。
+wait_for_master_healthz_ready() { # <port>
+  local sport="${1:-$V5_PORT}"
+  echo "── master healthz 就绪等待(activate 最小门;port=$sport)──"
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] 等待 /healthz ok=true + sessionsDb=ok + channel=v5 + leadership=leader"
+    return 0
+  fi
+  local hz="" i
+  for i in $(seq 1 10); do
+    hz="$(ssh "$KL_HOST" "curl -fsS http://127.0.0.1:${sport}/healthz" 2>/dev/null || true)"
+    if [[ -n "$hz" ]] && echo "$hz" | jq -e '.ok == true and .runtime.leadership.state == "leader"' >/dev/null 2>&1; then
+      break
+    fi
+    echo "  /healthz/leadership 未就绪,重试 $i/10..."; sleep 2
+  done
+  [[ -z "$hz" ]] && { echo "✗ activate healthz 无响应(10 次重试后)" >&2; return 1; }
+  echo "$hz" | grep -q '"ok":true' || { echo "✗ activate healthz ok != true" >&2; return 1; }
+  echo "$hz" | grep -q '"sessionsDb":"ok"' || { echo "✗ activate healthz sessionsDb != ok" >&2; return 1; }
+  echo "$hz" | grep -q '"channel":"v5"' || { echo "✗ activate healthz channel != v5" >&2; return 1; }
+  local leadership
+  leadership="$(jq -r '.runtime.leadership.state // empty' <<<"$hz" 2>/dev/null || true)"
+  [[ "$leadership" == leader ]] || {
+    echo "✗ activate healthz leadership=$leadership(必须为 leader)" >&2
+    return 1
+  }
+  echo "  ✓ master healthz 就绪(leadership=leader);完整 smoke 留给 validation 链"
+}
+
 # ───────────────────────── smoke:健康 + 隔离断言 ─────────────────────────
 smoke() {
   # V5_PORT/smoke 参数化(RFC D5;$1=探测端口,默认 A 的 18790)。finalize 后 candidate 已成 leader,
@@ -6117,7 +6738,14 @@ knowledge_planet_plugin_verify_user() {
   # 不动任何生产共享状态,故**不持全局 lease**——避免像旧实现那样跨扫码窗焊住 lease、饿死紧急自愈 host-action。
   # "同一时刻至多一个 verifier / 不与部署对撞"仍由入口的 KP-verify 专用锁(fd 9)+ 全局 deploy lock(fd 8)保证。
   # 锁序:deploy lock(fd 8)→ KP-verify lock(fd 9)→ 全局 lease(此处,先本地后远端,与既有约定一致)。
+  # B1:绿门含轮询,必须在窄窗 lease 之前跑完,否则扫码前的 CI 等待会焊死全局写锁。
+  run_ci_green_gate_before_lease || { echo "✗ Knowledge Planet 验证 release 未过 CI 绿门" >&2; return 1; }
   acquire_production_mutation_lease || { echo "✗ 未取得 production-mutation lease;拒绝构建 Knowledge Planet 验证 release" >&2; return 3; }
+  if ! assert_ci_green_process_local "$CI_GREEN_PASSED_SHA" "kp-post-lease"; then
+    release_production_mutation_lease
+    echo "✗ Knowledge Planet build 前 CI 绿门廉价复核失败" >&2
+    return 1
+  fi
   if ! capture_trusted_release_predecessor; then
     release_production_mutation_lease
     echo "✗ 无法在 Knowledge Planet build 首写前捕获可信 serving predecessor" >&2
@@ -6367,11 +6995,40 @@ smoke_e2e_journey() { # [port]
 minimum_functional_core() { # <lane-label> <pinned release> <port>
   local lane="$1" release="$2" port="$3"
   echo "══ 最小功能核(lane=$lane,release=$release,port=$port)══"
-  smoke_turn_matrix "$release" "$port" "$lane" || {
-    echo "✗ 最小功能核失败(lane=$lane):真 turn 矩阵未通过。" >&2; return 1; }
-  smoke_e2e_journey "$port" || {
-    echo "✗ 最小功能核失败(lane=$lane):E2E 用户旅程未通过。" >&2; return 1; }
-  echo "  ✓ 最小功能核通过(lane=$lane):双引擎真 turn + J1-J5 旅程"
+  # B3:默认 turn 组 ∥ E2E。两条真 turn 共用 v5-canary@claudeai.chat,并发会撞配额/会话,
+  # 故矩阵内部保持串行;E2E 与 turn 无数据依赖才并行。OC_V5_SMOKE_PARALLEL=0 回退全串行。
+  if [[ "${OC_V5_SMOKE_PARALLEL:-1}" != 1 ]]; then
+    echo "  · OC_V5_SMOKE_PARALLEL=0 → 全串行(kill-switch)"
+    smoke_turn_matrix "$release" "$port" "$lane" || {
+      echo "✗ 最小功能核失败(lane=$lane):真 turn 矩阵未通过。" >&2; return 1; }
+    smoke_e2e_journey "$port" || {
+      echo "✗ 最小功能核失败(lane=$lane):E2E 用户旅程未通过。" >&2; return 1; }
+    echo "  ✓ 最小功能核通过(lane=$lane):双引擎真 turn + J1-J5 旅程"
+    return 0
+  fi
+  echo "  · smoke 并行:真 turn 矩阵 ∥ E2E J1-J5(双引擎 turn 仍串行;同 canary 账号)"
+  local turn_log e2e_log turn_rc=0 e2e_rc=0 turn_pid e2e_pid errexit_was_on=0
+  turn_log="$(mktemp "${TMPDIR:-/tmp}/oc-v5-smoke-turn.XXXXXX")" || return 1
+  e2e_log="$(mktemp "${TMPDIR:-/tmp}/oc-v5-smoke-e2e.XXXXXX")" || { rm -f "$turn_log"; return 1; }
+  [[ $- == *e* ]] && errexit_was_on=1
+  set +e
+  smoke_turn_matrix "$release" "$port" "$lane" >"$turn_log" 2>&1 &
+  turn_pid=$!
+  smoke_e2e_journey "$port" >"$e2e_log" 2>&1 &
+  e2e_pid=$!
+  wait "$turn_pid"; turn_rc=$?
+  wait "$e2e_pid"; e2e_rc=$?
+  [[ "$errexit_was_on" == 1 ]] && set -e
+  echo "── 真 turn 矩阵日志 ──"
+  sed 's/^/  [turn] /' "$turn_log" || true
+  echo "── E2E 旅程日志 ──"
+  sed 's/^/  [e2e] /' "$e2e_log" || true
+  rm -f "$turn_log" "$e2e_log"
+  if [[ "$turn_rc" != 0 || "$e2e_rc" != 0 ]]; then
+    echo "✗ 最小功能核失败(lane=$lane):turn_rc=$turn_rc e2e_rc=$e2e_rc" >&2
+    return 1
+  fi
+  echo "  ✓ 最小功能核通过(lane=$lane):双引擎真 turn ∥ J1-J5 旅程"
 }
 
 # ══════════ 公网面 + 资产面验证(2026-07-26;审计 8)══════════
@@ -8983,18 +9640,10 @@ canary() {
   assert_runtime_channel_column
   local requested_release="" p3_target_source=""
   if [[ -n "$CANARY_RELEASE" ]]; then
-    requested_release="$RELEASES_ROOT/$CANARY_RELEASE"
-    [[ "$CANARY_RELEASE" == /* ]] && requested_release="$CANARY_RELEASE"
+    requested_release="$(resolve_specified_canary_release_dir)" || exit 1
     assert_release_marker "$requested_release"
     assert_release_required_migrations "$requested_release"
-    if [[ "$DRY" == 1 ]]; then
-      p3_target_source="$(resolve_release_source_commit)" || exit 1
-    else
-      p3_target_source="$(ssh "$KL_HOST" "jq -er '.sourceCommit | select(type == \"string\" and test(\"^[0-9a-f]{40}$\"))' '$requested_release/.complete'" 2>/dev/null)" || {
-        echo "✗ P3 指定 release 缺可信 strong sourceCommit:$requested_release" >&2
-        exit 1
-      }
-    fi
+    p3_target_source="$(resolve_specified_canary_source_commit)" || exit 1
   else
     p3_target_source="$(resolve_release_source_commit)" || exit 1
   fi
@@ -10135,6 +10784,7 @@ run_selected_mode() { # [mode]
     activate-staged) assert_not_bluegreen_for_cutover; activate_staged ;;
     rollback)  rollback ;;
     reclaim-mutation-lease) reclaim_production_mutation_lease ;;
+    reclaim-mutation-inflight) reclaim_mutation_lane_inflight ;;
     canary)    canary ;;
     promote)   promote ;;
     finalize)  finalize ;;
@@ -10154,7 +10804,7 @@ release_queue_required_for_mode() { # <mode>; 0=required, 1=exempt
   case "$1" in
     smoke|baseline-census|model-authority-preflight|model-authority-observation-status)
       return 1 ;;
-    abort|rollback|recover|reclaim-mutation-lease|hide-luna)
+    abort|rollback|recover|reclaim-mutation-lease|reclaim-mutation-inflight|hide-luna)
       return 1 ;;
     authorize-emergency|close-emergency-debt)
       return 1 ;;
@@ -10240,7 +10890,7 @@ if [[ "$DRY" != 1 && "$MODE" == "knowledge-planet-verify" ]]; then
     > "${KNOWLEDGE_PLANET_VERIFY_LOCK}.holder"
   KNOWLEDGE_PLANET_VERIFY_HOLDER_OWNED=1
 fi
-if [[ "$DRY" != 1 && "$MODE" != "smoke" && "$MODE" != "baseline-census" && "$MODE" != "model-authority-preflight" && "$MODE" != "model-authority-observation-status" && "$MODE" != "reclaim-mutation-lease" ]]; then
+if [[ "$DRY" != 1 && "$MODE" != "smoke" && "$MODE" != "baseline-census" && "$MODE" != "model-authority-preflight" && "$MODE" != "model-authority-observation-status" && "$MODE" != "reclaim-mutation-lease" && "$MODE" != "reclaim-mutation-inflight" ]]; then
   # reclaim 是"陈旧锁被同一残留焊死"时的救援入口:必须**不**抢本地 deploy lock(否则会被残留 fd 8 阻塞 900s)。
   if [[ -n "${OC_V5_DEPLOY_LOCK_FD:-}" ]]; then
     # ── 继承锁 FD(RFC-v5-selfheal-batch1b §4.1 锁交接协议 · probe-then-relock)──
@@ -10323,19 +10973,19 @@ assert_development_release_queue || exit 3
 # production state (smoke/reclaim). This keeps recovery and evidence closure
 # available when canonical moves ahead of the currently deployed schema.
 case "$MODE" in
-  smoke|bootstrap|reclaim-mutation-lease|abort|rollback|recover|hide-luna|close-emergency-debt) ;;
+  smoke|bootstrap|reclaim-mutation-lease|reclaim-mutation-inflight|abort|rollback|recover|hide-luna|close-emergency-debt) ;;
   *) assert_repo_required_migrations || exit 1 ;;
 esac
 # Smoke 也必须验证应用角色真能使用已记账的 0151 对象；bootstrap 在 env 建好后
 # 于 4.5 步单独执行。其余模式在任何远端状态副作用前统一 fail-closed。
-if [[ "$MODE" != "bootstrap" && "$MODE" != "reclaim-mutation-lease" ]]; then
+if [[ "$MODE" != "bootstrap" && "$MODE" != "reclaim-mutation-lease" && "$MODE" != "reclaim-mutation-inflight" ]]; then
   assert_0151_runtime_privileges || exit 1
 fi
 
 # 任一历史部署若留下 state/runtime 无法裁决的持久标记，所有后续写 lane 必须停住，避免用新
 # 发布覆盖现场证据。只读 smoke 仍允许，供人工诊断；dry-run 不访问远端。
 # reclaim 必须在 marker 存在时照样能跑(它正是清理陈旧锁的救援手段)。
-if [[ "$DRY" != 1 && "$MODE" != "smoke" && "$MODE" != "baseline-census" && "$MODE" != "reclaim-mutation-lease" && "$MODE" != "hide-luna" ]]; then
+if [[ "$DRY" != 1 && "$MODE" != "smoke" && "$MODE" != "baseline-census" && "$MODE" != "reclaim-mutation-lease" && "$MODE" != "reclaim-mutation-inflight" && "$MODE" != "hide-luna" ]]; then
   assert_no_deploy_recovery_marker || exit 1
 fi
 
@@ -10343,29 +10993,36 @@ fi
 # 锁序:本地 deploy lock(上文,fd 8/继承 fd)→ 远端 lease(此处),固定先本地后远端防死锁。
 # 单点 gate:每个写 lane 在进入任何 lane 逻辑(含各自 build_release / 首次远端写)之前统一取得,
 # 持有到 cleanup 释放。分散逐 lane 挂载易漏(新增写 lane 忘记挂=整类回归),故收口于此。
+# B1:会 build_release 的 lane 先在 lease 外跑完 CI 绿门(含轮询),再取全局写锁。
+# rollback/recover/canary-reuse 等不建 release,绝不能被绿门拖住。
+maybe_run_ci_green_gate_for_mode || exit 1
+
 # 只读 lane(smoke/baseline-census/两个 model-authority 只读态)不取;dry-run 只打印意图。
 case "$MODE" in
   smoke|baseline-census|model-authority-preflight|model-authority-observation-status) ;;
   # reclaim = 陈旧 lease 救援,自身绝不能去取全局 lease(否则被残留焊死时自我阻塞)。
-  reclaim-mutation-lease) ;;
+  reclaim-mutation-lease|reclaim-mutation-inflight) ;;
   # knowledge-planet-verify:人工扫码轮询窗(~4min)不持全局 lease,避免饿死紧急自愈 host-action(C7);
   # 全局 lease 仅在函数内围绕 build_release(唯一共享命名空间写)窄取窄放。
   knowledge-planet-verify) ;;
   *) acquire_production_mutation_lease || exit 3 ;;
 esac
 
+# B1 持锁后廉价复核:pinned SHA 未漂 + 本进程绿门结论仍在。
+maybe_recheck_ci_green_after_lease || exit 1
+
 # Durable containment debt is checked only after the real mutation lease has been acquired.
 # Recovery/rollback/abort and Luna-hide compensation remain available; every other write lane
 # is fenced until the exact protected merge + Codex/tests/CI evidence closes the debt.
 case "$MODE" in
-  smoke|baseline-census|model-authority-preflight|model-authority-observation-status|reclaim-mutation-lease|knowledge-planet-verify) ;;
+  smoke|baseline-census|model-authority-preflight|model-authority-observation-status|reclaim-mutation-lease|reclaim-mutation-inflight|knowledge-planet-verify) ;;
   *) assert_emergency_debt_gate || exit 1 ;;
 esac
 
 # 门禁豁免债务闸(2026-07-26):与 emergency debt 同一挂载点、同一放行集合语义。
 # 恢复/回退 lane 与 dx-declared containment lane 永不被阻断(回退优先于任何新门)。
 case "$MODE" in
-  smoke|baseline-census|model-authority-preflight|model-authority-observation-status|reclaim-mutation-lease|knowledge-planet-verify) ;;
+  smoke|baseline-census|model-authority-preflight|model-authority-observation-status|reclaim-mutation-lease|reclaim-mutation-inflight|knowledge-planet-verify) ;;
   abort|rollback|recover|hide-luna|authorize-emergency|close-emergency-debt) ;;
   # 逃生/回滚/观测 lane 同样永不被阻断(2026-07-26 主控复核补齐):
   #   · emergency-tuple / activate-emergency-tuple = 逃生镜像的登记与激活(R2-M1/R3-B1)。
@@ -10411,7 +11068,7 @@ case "$MODE" in
 esac
 
 case "$MODE" in
-  smoke|baseline-census|model-authority-preflight|model-authority-observation-status|reclaim-mutation-lease|knowledge-planet-verify)
+  smoke|baseline-census|model-authority-preflight|model-authority-observation-status|reclaim-mutation-lease|reclaim-mutation-inflight|knowledge-planet-verify)
     run_selected_mode "$MODE" ;;
   *)
     run_mutation_lane_supervised run_selected_mode "$MODE" ;;

@@ -2882,6 +2882,7 @@ describe('v5 release safety lanes', () => {
       'sync_assets_to_pool() { :; }',
       'run() { :; }',
       'smoke() { :; }',
+      'wait_for_master_healthz_ready() { :; }',
       'mark_deploy_recovery_required() { printf "%s\\n" "$1" >>"$RECOVERY_LOG"; }',
       'probe_release_lossless_master_capability() {',
       '  case "$1" in',
@@ -6472,13 +6473,13 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
     // reclaim 必须不抢本地 deploy lock、不取全局 lease,也不被 recovery marker 挡住(否则被同一残留焊死)。
     assert.match(
       source,
-      /MODE" != "reclaim-mutation-lease" \]\]; then\n {2}# reclaim 是"陈旧锁被同一残留焊死"/,
+      /MODE" != "reclaim-mutation-lease" && "\$MODE" != "reclaim-mutation-inflight" \]\]; then\n {2}# reclaim 是"陈旧锁被同一残留焊死"/,
       'reclaim 必须跳过本地 deploy lock 获取',
     )
-    assert.match(source, /reclaim-mutation-lease\) ;;\n {2}# knowledge-planet-verify/, 'reclaim 必须跳过全局 mutation lease 获取')
+    assert.match(source, /reclaim-mutation-lease\|reclaim-mutation-inflight\) ;;\n {2}# knowledge-planet-verify/, 'reclaim 必须跳过全局 mutation lease 获取')
     assert.match(
       source,
-      /"\$MODE" != "reclaim-mutation-lease" && "\$MODE" != "hide-luna" \]\]; then\n {2}assert_no_deploy_recovery_marker/,
+      /"\$MODE" != "reclaim-mutation-lease" && "\$MODE" != "reclaim-mutation-inflight" && "\$MODE" != "hide-luna" \]\]; then\n {2}assert_no_deploy_recovery_marker/,
       'reclaim 必须能在 recovery marker 存在时照跑',
     )
 
@@ -6695,7 +6696,7 @@ wait $!
     const dispatch = source.slice(source.lastIndexOf('case "$MODE" in'))
     assert.match(
       dispatch,
-      /smoke\|baseline-census\|model-authority-preflight\|model-authority-observation-status\|reclaim-mutation-lease\|knowledge-planet-verify\)\n\s*run_selected_mode "\$MODE"/,
+      /smoke\|baseline-census\|model-authority-preflight\|model-authority-observation-status\|reclaim-mutation-lease\|reclaim-mutation-inflight\|knowledge-planet-verify\)\n\s*run_selected_mode "\$MODE"/,
       '只读/特殊 lane 应直接 dispatch',
     )
     assert.match(
@@ -6987,14 +6988,25 @@ wait $!
     )
     assert.match(source, /--allow-unverified-ci\) ALLOW_UNVERIFIED_CI=1/, '缺 CLI 旗标')
     assert.match(source, /ALLOW_UNVERIFIED_CI=0/, 'ALLOW_UNVERIFIED_CI 必须默认关(fail-closed)')
-    // 挂载点 = build_release 里 source commit 钉死之后、任何远端写之前。
+    // B1:完整绿门(含轮询)在 mutation lease 外;build_release 只留廉价本进程断言。
     const build = source.slice(
       source.indexOf('\nbuild_release() {'),
       source.indexOf('mkdir -p \'$staging\''),
     )
     const pin = build.indexOf('BUILT_RELEASE_SOURCE_COMMIT="$full_sha"')
-    const gate = build.indexOf('assert_ci_green_for_source_commit "$full_sha" || return 1')
-    assert.ok(pin >= 0 && gate > pin, 'CI 绿门必须挂在 build_release 里 source commit 钉死之后')
+    const gate = build.indexOf('assert_ci_green_process_local "$full_sha" "build_release"')
+    assert.ok(pin >= 0 && gate > pin, 'build_release 必须廉价断言本进程绿门已通过且 SHA 一致')
+    const preLease = source.indexOf('maybe_run_ci_green_gate_for_mode || exit 1')
+    const acquire = source.lastIndexOf('acquire_production_mutation_lease || exit 3')
+    assert.ok(preLease >= 0 && preLease < acquire, '完整 CI 绿门必须在 acquire_production_mutation_lease 之前')
+    assert.match(source, /maybe_recheck_ci_green_after_lease \|\| exit 1/, '持锁后必须廉价复核绿门')
+    const kp = source.slice(
+      source.indexOf('\nknowledge_planet_plugin_verify_user() {'),
+      source.indexOf('\nknowledge_planet_plugin_smoke_gate() {'),
+    )
+    const kpGate = kp.indexOf('run_ci_green_gate_before_lease')
+    const kpLease = kp.indexOf('acquire_production_mutation_lease')
+    assert.ok(kpGate >= 0 && kpLease > kpGate, 'knowledge-planet-verify 不得绕过绿门,且须在窄窗 lease 前跑完')
     // ci-verification 有意不参与连环跳禁令(gh 故障会互锁),这条要留在代码里防被"顺手统一"。
     const envFn = source.slice(
       source.indexOf('\ngate_waiver_env_active() {'),
@@ -7101,10 +7113,14 @@ wait $!
     )
     assert.match(core, /smoke_e2e_journey "\$port" \|\|/, '最小功能核缺 J1-J5 旅程')
     const journeyCalls = source.match(/^\s*smoke_e2e_journey\b/gm) ?? []
+    assert.ok(
+      journeyCalls.length >= 2 && journeyCalls.length <= 3,
+      `journey 只允许定义 + 最小功能核内调用(串行 kill-switch / 并行各一),实际 ${journeyCalls.length} 处`,
+    )
     assert.equal(
-      journeyCalls.length,
-      2,
-      `journey 只允许「函数定义 + 最小功能核内一处调用」,实际 ${journeyCalls.length} 处`,
+      (source.match(/smoke_e2e_journey \|\| exit 1/g) ?? []).length,
+      0,
+      '不得在成功出口裸接 journey',
     )
   })
 
@@ -8084,5 +8100,320 @@ exec ${JSON.stringify(realPython)} "$@"
     const complete = runWeekly('complete', path.join(dir, 'hist-complete'))
     assert.equal(complete.status, 0, complete.stderr || complete.stdout)
     assert.match(complete.stdout, /回归完成,全部正常/)
+  })
+})
+
+describe('v5 release speedup (B1-B5, C4)', () => {
+  const invokeHelpers = (command: string, extraEnv: Record<string, string> = {}) =>
+    spawnSync('bash', ['-c', [
+      'set -euo pipefail',
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      command,
+    ].join('\n')], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1', ...extraEnv },
+    })
+
+  test('B1: CI green gate runs before mutation lease and build_release only cheap-rechecks', async () => {
+    const source = await readFile(deploy, 'utf8')
+    assert.match(source, /run_ci_green_gate_before_lease\(\)/)
+    assert.match(source, /assert_ci_green_process_local\(\)/)
+    assert.match(source, /CI_GREEN_PASSED_SHA/)
+    assert.match(source, /CI_GREEN_PASSED_AT/)
+    const main = source.slice(source.indexOf('maybe_run_ci_green_gate_for_mode || exit 1'))
+    assert.ok(
+      main.indexOf('maybe_run_ci_green_gate_for_mode || exit 1')
+        < main.indexOf('acquire_production_mutation_lease || exit 3'),
+    )
+    assert.match(source, /maybe_recheck_ci_green_after_lease \|\| exit 1/)
+    const build = source.slice(source.indexOf('\nbuild_release() {'), source.indexOf('\n# sessions-store-pg'))
+    assert.match(build, /assert_ci_green_process_local "\$full_sha" "build_release"/)
+    assert.doesNotMatch(build, /assert_ci_green_for_source_commit "\$full_sha"/)
+    assert.match(source, /resolve_specified_canary_source_commit\(\)/)
+    assert.match(source, /run_ci_green_gate_before_lease "\$sha"/)
+    const gateFn = source.slice(
+      source.indexOf('\nmaybe_run_ci_green_gate_for_mode() {'),
+      source.indexOf('\nmaybe_recheck_ci_green_after_lease() {'),
+    )
+    assert.match(gateFn, /CANARY_RELEASE/)
+    assert.doesNotMatch(gateFn, /if \[\[ -z "\$CANARY_RELEASE" \]\]/)
+  })
+
+  test('B1: cheap recheck fails closed when this process never passed the gate or SHA drifted', () => {
+    const missing = invokeHelpers('assert_ci_green_process_local 0000000000000000000000000000000000000000 test || exit 7')
+    assert.equal(missing.status, 7)
+    assert.match(missing.stderr, /CI 绿门未在本进程通过/)
+
+    const drifted = invokeHelpers([
+      'CI_GREEN_PASSED_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      'CI_GREEN_PASSED_AT=1',
+      'DRY=0',
+      'assert_ci_green_process_local bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb test || exit 8',
+    ].join('\n'))
+    assert.equal(drifted.status, 8)
+    assert.match(drifted.stderr, /pinned SHA 已漂/)
+  })
+
+  test('B2: activate_release waits for healthz only; validation/rollback keep full smoke', async () => {
+    const source = await readFile(deploy, 'utf8')
+    const activate = source.slice(
+      source.indexOf('activate_release() {'),
+      source.indexOf('\n# 传统 deploy/rollback', source.indexOf('activate_release() {')),
+    )
+    assert.match(activate, /wait_for_master_healthz_ready "\$ACTIVE_PORT"/)
+    assert.doesNotMatch(activate, /if ! smoke "\$ACTIVE_PORT"/)
+    assert.match(source, /wait_for_master_healthz_ready\(\) \{/)
+    const deployBody = source.slice(source.indexOf('\ndeploy() {'), source.indexOf('\n# ───────────────────────── offline recycle'))
+    assert.match(deployBody, /! smoke "\$ACTIVE_PORT"/)
+    const distBody = source.slice(source.indexOf('\ndeploy_dist() {'), source.indexOf('\ncompensate_dist_activation() {'))
+    assert.match(distBody, /! smoke "\$ACTIVE_PORT"/)
+    const rollback = source.slice(source.indexOf('\nrollback() {'), source.indexOf('\nrollback_runtime_tuple() {'))
+    assert.match(rollback, /if ! smoke "\$ACTIVE_PORT"/)
+  })
+
+  test('B3: smoke parallelizes turn-group with E2E; kill-switch restores serial; turns stay serial', async () => {
+    const source = await readFile(deploy, 'utf8')
+    const core = source.slice(
+      source.indexOf('\nminimum_functional_core() {'),
+      source.indexOf('\n# ══════════ 公网面'),
+    )
+    assert.match(core, /OC_V5_SMOKE_PARALLEL:-1/)
+    assert.match(core, /OC_V5_SMOKE_PARALLEL=0/)
+    assert.match(core, /smoke_turn_matrix "\$release" "\$port" "\$lane" >"\$turn_log"/)
+    assert.match(core, /smoke_e2e_journey "\$port" >"\$e2e_log"/)
+    assert.match(core, /turn_rc=\$\?/)
+    assert.match(core, /e2e_rc=\$\?/)
+    assert.match(core, /\[turn\]/)
+    assert.match(core, /\[e2e\]/)
+    const matrix = source.slice(source.indexOf('\nsmoke_turn_matrix() {'), source.indexOf('\nsmoke_e2e_journey() {'))
+    assert.match(matrix, /for model in \$models/)
+    assert.doesNotMatch(matrix, /smoke_turn_canary .*&/)
+  })
+
+  test('B4: with-dist reuses dist only with evidence; kill-switch and mismatch rebuild', async () => {
+    const source = await readFile(deploy, 'utf8')
+    assert.match(source, /try_reuse_web_dist\(\)/)
+    assert.match(source, /OC_V5_DIST_REUSE:-1/)
+    assert.match(source, /OC_V5_DIST_REUSE=0/)
+    assert.match(source, /git -C "\$REPO_ROOT" diff-tree --quiet/)
+    assert.match(source, /resolve_web_dist_reuse_paths\(\)/)
+    assert.match(source, /WEB_DIST_REUSE_ROOT_PATHS=/)
+    assert.doesNotMatch(source, /WEB_DIST_REUSE_PATHS=/)
+    assert.match(source, /packages\/web-react\/vite\.config\.ts/)
+    assert.match(source, /record_dist_reuse_in_complete/)
+    assert.match(source, /distReuse/)
+    const build = source.slice(source.indexOf('\nbuild_release() {'), source.indexOf('\n# sessions-store-pg'))
+    assert.match(build, /try_reuse_web_dist "\$staging" "\$cur" "\$full_sha"/)
+    assert.match(build, /VITE_TASKBOARD_ENABLED=0 npm run build --workspace packages\/web-react/)
+    const helper = source.slice(source.indexOf('\ntry_reuse_web_dist() {'), source.indexOf('\nrecord_dist_reuse_in_complete() {'))
+    assert.match(helper, /当前 release \.complete\/dist 不完整/)
+    assert.match(helper, /web workspace 闭包\/lock\/构建配置相对/)
+    assert.match(helper, /VITE_TASKBOARD_ENABLED=0 硬编码/)
+    const resolver = source.slice(
+      source.indexOf('\nresolve_web_dist_reuse_paths() {'),
+      source.indexOf('\ntry_reuse_web_dist() {'),
+    )
+    assert.match(resolver, /@openclaude\/\*/)
+    assert.doesNotMatch(resolver, /packages\/protocol packages\/web-react/)
+  })
+
+  test('B4: try_reuse_web_dist refuses when kill-switch is off or current release is missing', () => {
+    const off = invokeHelpers('try_reuse_web_dist /tmp/staging /tmp/cur deadbeefdeadbeefdeadbeefdeadbeefdeadbeef || exit 9', {
+      OC_V5_DIST_REUSE: '0',
+    })
+    assert.equal(off.status, 9)
+    assert.match(off.stderr, /OC_V5_DIST_REUSE=0/)
+
+    const missing = invokeHelpers('try_reuse_web_dist /tmp/staging "" deadbeefdeadbeefdeadbeefdeadbeefdeadbeef || exit 10')
+    assert.equal(missing.status, 10)
+    assert.match(missing.stderr, /无当前 release/)
+  })
+
+  test('B5: runtime reuse requires recorded input digest; kill-switch and missing evidence rebuild', async () => {
+    const source = await readFile(deploy, 'utf8')
+    assert.match(source, /compute_runtime_input_digest\(\)/)
+    assert.match(source, /try_reuse_runtime_release\(\)/)
+    assert.match(source, /runtime_input_ls_tree\(\)/)
+    assert.match(source, /load_runtime_rsync_exclude_patterns\(\)/)
+    assert.match(source, /OC_V5_RUNTIME_REUSE:-1/)
+    assert.match(source, /OC_V5_RUNTIME_REUSE=0/)
+    assert.match(source, /inputDigest/)
+    assert.match(source, /oc_hotcfg_verify_manifest_sampled/)
+    assert.doesNotMatch(source, /RUNTIME_INPUT_TREE_PATHS=/)
+    const build = source.slice(source.indexOf('\nbuild_runtime_release() {'), source.indexOf('\nhotcfg_core_smoke_cmd() {'))
+    assert.match(build, /try_reuse_runtime_release "\$full_sha" "\$RUNTIME_IMAGE_ID"/)
+    assert.match(build, /record_runtime_input_digest/)
+    assert.match(build, /oc_hotcfg_finalize_release/)
+  })
+
+  test('B5: compute_runtime_input_digest is deterministic and fails closed on bad args', () => {
+    const sha = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).stdout.trim()
+    const a = invokeHelpers(`compute_runtime_input_digest '${sha}' sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`)
+    const b = invokeHelpers(`compute_runtime_input_digest '${sha}' sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`)
+    const c = invokeHelpers(`compute_runtime_input_digest '${sha}' sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb`)
+    assert.equal(a.status, 0, a.stderr)
+    assert.equal(b.status, 0, b.stderr)
+    assert.match(a.stdout.trim(), /^[0-9a-f]{64}$/)
+    assert.equal(a.stdout.trim(), b.stdout.trim())
+    assert.notEqual(a.stdout.trim(), c.stdout.trim())
+    const bad = invokeHelpers('compute_runtime_input_digest not-a-sha sha256:x || exit 11')
+    assert.equal(bad.status, 11)
+  })
+
+  test('B5: try_reuse_runtime_release refuses kill-switch and missing previous release', () => {
+    const off = invokeHelpers(
+      'OC_HOTCFG_RELEASES_ROOT=/tmp/hotcfg try_reuse_runtime_release deadbeefdeadbeefdeadbeefdeadbeefdeadbeef sha256:abc /tmp/hotcfg/rel-old || exit 12',
+      { OC_V5_RUNTIME_REUSE: '0' },
+    )
+    assert.equal(off.status, 12)
+    assert.match(off.stderr, /OC_V5_RUNTIME_REUSE=0/)
+
+    const missing = invokeHelpers(
+      'OC_HOTCFG_RELEASES_ROOT=/tmp/hotcfg try_reuse_runtime_release deadbeefdeadbeefdeadbeefdeadbeefdeadbeef sha256:abc "" || exit 13',
+    )
+    assert.equal(missing.status, 13)
+    assert.match(missing.stderr, /OC_RUNTIME_RELEASE 缺失/)
+  })
+
+  test('C4: reclaim-mutation-inflight is official rescue and fail-closed without full evidence', async () => {
+    const source = await readFile(deploy, 'utf8')
+    assert.match(source, /--reclaim-mutation-inflight\) MODE="reclaim-mutation-inflight"/)
+    assert.match(source, /reclaim-mutation-inflight\) reclaim_mutation_lane_inflight/)
+    const fn = source.slice(
+      source.indexOf('reclaim_mutation_lane_inflight() {'),
+      source.indexOf('\n# 状态提交回执无法裁决时'),
+    )
+    assert.match(fn, /phase" == stable/)
+    assert.match(fn, /manual-holder/)
+    assert.match(fn, /openclaude-v5-deploy-\*\.service/)
+    assert.match(fn, /OC_V5_INFLIGHT_RECLAIM_MIN_AGE_SECONDS/)
+    assert.match(fn, /未碰 \.manual-recovery-required/)
+    assert.match(fn, /缺证据/)
+    assert.doesNotMatch(fn, /DEPLOY_RECOVERY_MARKER/)
+    assert.match(source, /reclaim-mutation-lease\|reclaim-mutation-inflight\) ;;/)
+  })
+
+  test('C4: dry-run reclaim-inflight is inert and missing deploy_state refuses', () => {
+    const dry = invokeHelpers('DRY=1 reclaim_mutation_lane_inflight')
+    assert.equal(dry.status, 0, dry.stderr)
+    assert.match(dry.stdout, /\[dry-run\].*rm marker/)
+
+    const blocked = invokeHelpers([
+      'DRY=0',
+      'ds_load() { return 1; }',
+      'reclaim_mutation_lane_inflight || exit 14',
+    ].join('\n'))
+    assert.equal(blocked.status, 14)
+    assert.match(blocked.stderr, /无法读取 deploy_state/)
+  })
+
+  const danglingFileChange = (file: string, extra = '\n// audit-blocker\n') => {
+    const head = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).stdout.trim()
+    const orig = spawnSync('git', ['show', `${head}:${file}`], { cwd: root, encoding: 'utf8' })
+    assert.equal(orig.status, 0, orig.stderr)
+    const blob = spawnSync('git', ['hash-object', '-w', '--stdin'], {
+      cwd: root,
+      encoding: 'utf8',
+      input: orig.stdout + extra,
+    }).stdout.trim()
+    assert.match(blob, /^[0-9a-f]{40}$/)
+    const ls = spawnSync('git', ['ls-tree', '-r', head, '--', file], { cwd: root, encoding: 'utf8' })
+    assert.equal(ls.status, 0, ls.stderr)
+    const mode = ls.stdout.trim().split(/\s+/)[0]
+    const index = path.join(tmpdir(), `oc-v5-audit-idx-${process.pid}-${Date.now()}`)
+    const env = { ...process.env, GIT_INDEX_FILE: index }
+    const readTree = spawnSync('git', ['read-tree', head], { cwd: root, encoding: 'utf8', env })
+    assert.equal(readTree.status, 0, readTree.stderr)
+    const upd = spawnSync('git', ['update-index', '--cacheinfo', `${mode},${blob},${file}`], {
+      cwd: root,
+      encoding: 'utf8',
+      env,
+    })
+    assert.equal(upd.status, 0, upd.stderr)
+    const tree = spawnSync('git', ['write-tree'], { cwd: root, encoding: 'utf8', env }).stdout.trim()
+    assert.match(tree, /^[0-9a-f]{40}$/)
+    const commit = spawnSync('git', ['commit-tree', tree, '-p', head, '-m', `audit overlay ${file}`], {
+      cwd: root,
+      encoding: 'utf8',
+    }).stdout.trim()
+    assert.match(commit, /^[0-9a-f]{40}$/)
+    spawnSync('rm', ['-f', index])
+    return { head, commit }
+  }
+
+  test('B1: specified --canary=<release> without green evidence is refused', () => {
+    const sha = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    const refused = invokeHelpers([
+      'MODE=canary',
+      'CANARY_RELEASE=/opt/openclaude/openclaude-v5-releases/rel-audit-blocker',
+      'DRY=0',
+      `release_marker_probe() { printf 'strong\\t${sha}\\tshort\\tbuilt\\tart\\n'; }`,
+      'assert_ci_green_for_source_commit() { echo "✗ CI 绿门未通过(无证据)" >&2; return 1; }',
+      'maybe_run_ci_green_gate_for_mode || exit 21',
+    ].join('\n'))
+    assert.equal(refused.status, 21)
+    assert.match(refused.stderr, /CI 绿门未通过|无证据/)
+
+    const legacy = invokeHelpers([
+      'MODE=canary',
+      'CANARY_RELEASE=/opt/openclaude/openclaude-v5-releases/rel-legacy',
+      'release_marker_probe() { printf "legacy\\tabc123\\tshort\\tbuilt\\tart\\n"; }',
+      'resolve_specified_canary_source_commit || exit 22',
+    ].join('\n'))
+    assert.equal(legacy.status, 22)
+    assert.match(legacy.stderr, /legacy/)
+
+    const noStamp = invokeHelpers([
+      'MODE=canary',
+      'CANARY_RELEASE=/opt/openclaude/openclaude-v5-releases/rel-audit-blocker',
+      'DRY=0',
+      'CI_GREEN_PASSED_SHA=',
+      'CI_GREEN_PASSED_AT=',
+      `assert_ci_green_specified_release_local ${sha} test || exit 23`,
+    ].join('\n'))
+    assert.equal(noStamp.status, 23)
+    assert.match(noStamp.stderr, /CI 绿门未在本进程通过/)
+  })
+
+  test('B4: protocol-only change must invalidate web dist reuse', () => {
+    const paths = invokeHelpers('resolve_web_dist_reuse_paths "$(git rev-parse HEAD)"')
+    assert.equal(paths.status, 0, paths.stderr)
+    assert.match(paths.stdout, /^packages\/protocol$/m)
+    assert.match(paths.stdout, /^packages\/web-react$/m)
+    assert.match(paths.stdout, /^package-lock\.json$/m)
+
+    const { head, commit } = danglingFileChange('packages/protocol/src/activeContent.ts')
+    const changed = invokeHelpers([
+      `OLD='${head}'`,
+      `NEW='${commit}'`,
+      'ssh() {',
+      '  if [[ "$*" == *jq* ]]; then printf "%s\\n" "$OLD"; return 0; fi',
+      '  return 0',
+      '}',
+      'try_reuse_web_dist /tmp/oc-v5-dist-staging /tmp/oc-v5-dist-cur "$NEW" || exit 31',
+    ].join('\n'))
+    assert.equal(changed.status, 31, changed.stdout + changed.stderr)
+    assert.match(changed.stderr, /web workspace 闭包|有差异/)
+  })
+
+  test('B5: channels-only change must invalidate runtime reuse', () => {
+    const listed = invokeHelpers('runtime_input_ls_tree "$(git rev-parse HEAD)"')
+    assert.equal(listed.status, 0, listed.stderr)
+    assert.match(listed.stdout, /packages\/channels\//)
+    assert.match(listed.stdout, /packages\/plugin-sdk\//)
+    assert.doesNotMatch(listed.stdout, /packages\/commercial\//)
+    assert.doesNotMatch(listed.stdout, /\tscripts\//)
+
+    const sha = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).stdout.trim()
+    const image = 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    const base = invokeHelpers(`compute_runtime_input_digest '${sha}' '${image}'`)
+    assert.equal(base.status, 0, base.stderr)
+    const { commit } = danglingFileChange('packages/channels/webchat/src/index.ts')
+    const changed = invokeHelpers(`compute_runtime_input_digest '${commit}' '${image}'`)
+    assert.equal(changed.status, 0, changed.stderr)
+    assert.match(base.stdout.trim(), /^[0-9a-f]{64}$/)
+    assert.notEqual(base.stdout.trim(), changed.stdout.trim())
   })
 })
