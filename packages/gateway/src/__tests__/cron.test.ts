@@ -996,7 +996,7 @@ describe('CronScheduler origin-session resume', () => {
     assert.equal(fires.length, 1)
   })
 
-  it('fallback origin-session uses isolated cron session', async () => {
+  it('gone origin-session skips isolated execution (no lastActive broadcast)', async () => {
     const getOrCreateOpts: any[] = []
     const sched = new CronScheduler(
       { defaults: { model: 'glm-5.2' } } as any,
@@ -1021,8 +1021,7 @@ describe('CronScheduler origin-session resume', () => {
       enabled: true,
     } as any
     const outcome = await (sched as any).runJob(job, agent, NOOP_CRON_DURABILITY)
-    assert.equal(outcome.kind, 'terminal_failure')
-    assert.equal(getOrCreateOpts.length, 1)
-    assert.match(getOrCreateOpts[0].sessionKey, /:cron:dm:remind-origin-fb:/)
+    assert.deepEqual(outcome, { kind: 'silent' })
+    assert.equal(getOrCreateOpts.length, 0)
   })
 })

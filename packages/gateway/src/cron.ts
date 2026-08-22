@@ -1187,6 +1187,20 @@ export class CronScheduler {
           occurrence,
           occurrence.state === 'executing' ? readOccurrenceTape(occurrence.deliveryId) : [],
         )
+        if (
+          job.resume === 'origin-session' &&
+          (occurrence.state === 'executing' || occurrence.state === 'completed')
+        ) {
+          // Origin inject is not replay-safe (in-memory inbound idempotency).
+          // At-most-once: never re-dispatch after submit started.
+          if (occurrence.state === 'executing') {
+            settleOccurrence(occurrence, 'execution_terminal')
+          } else {
+            settleOccurrence(occurrence)
+          }
+          completedRetryIds.add(job.id)
+          continue
+        }
         if (recovery === 'rerun') {
           if (occurrence.state === 'executing') {
             writeOccurrence({ ...occurrence, state: 'prepared', updatedAt: Date.now() })
@@ -1570,16 +1584,15 @@ export class CronScheduler {
   }
 
   /**
-   * origin-session fire: Gateway injects a new inbound into the creating
-   * conversation. Isolated runJob is the fallback when that session is gone.
-   * Consume the occurrence before inject so a crash retries the same
-   * deliveryId (inbound idempotency) instead of double-creating work.
+   * origin-session fire: inject a new inbound into the creating conversation.
+   * If that conversation is gone, skip (do not isolated-run / lastActive-broadcast).
+   * Mark executing before inject so a crash recovers at-most-once.
    */
   private async runOriginSessionJob(
     job: CronJob,
     durability: CronRunDurabilityHooks,
     deliveryContext: CronDeliveryContext,
-  ): Promise<CronRunOutcome | 'fallback'> {
+  ): Promise<CronRunOutcome> {
     try {
       await durability.consumeOccurrence()
     } catch (err) {
@@ -1588,6 +1601,15 @@ export class CronScheduler {
         errorClass: stableCronErrorClass(err),
       })
       return { kind: 'retryable_failure', code: 'OCCURRENCE_PERSIST_FAILED' }
+    }
+    try {
+      await durability.markSubmitStarted?.()
+    } catch (err) {
+      logger.warn(`job ${job.id} origin-session markSubmitStarted failed`, {
+        jobId: job.id,
+        errorClass: stableCronErrorClass(err),
+      })
+      return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_SETTLE_FAILED' }
     }
     let result: CronOriginFireResult
     try {
@@ -1599,15 +1621,20 @@ export class CronScheduler {
       })
       return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_INJECT_FAILED' }
     }
-    if (result.kind === 'fallback') return 'fallback'
     if (result.kind === 'retryable_failure' || result.kind === 'terminal_failure') {
       return result
     }
+    const skipped = result.kind === 'fallback'
     const ts = new Date().toISOString().replace(/[:.]/g, '-')
     const outPath = join(paths.cronOutputsDir, `${job.id}-${ts}.md`)
     try {
       await mkdir(dirname(outPath), { recursive: true })
-      await writeFile(outPath, `[origin-session injected]\n${job.prompt}\n`)
+      await writeFile(
+        outPath,
+        skipped
+          ? `[origin-session skipped]\n${job.prompt}\n`
+          : `[origin-session injected]\n${job.prompt}\n`,
+      )
     } catch (err) {
       logger.warn(`job ${job.id} origin-session output archive failed`, {
         jobId: job.id,
@@ -1615,10 +1642,8 @@ export class CronScheduler {
       })
       return { kind: 'terminal_failure', code: 'OUTPUT_ARCHIVE_FAILED' }
     }
-    const archived = basename(outPath)
     try {
-      await durability.markSubmitStarted?.()
-      await durability.markCompleted?.(archived)
+      await durability.markCompleted?.(basename(outPath))
       await durability.markDelivered?.()
     } catch (err) {
       logger.warn(`job ${job.id} origin-session durability mark failed`, {
@@ -1627,8 +1652,8 @@ export class CronScheduler {
       })
       return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_SETTLE_FAILED' }
     }
-    logger.info(`job ${job.id} origin-session injected`, { jobId: job.id })
-    return { kind: 'completed' }
+    logger.info(`job ${job.id} origin-session ${skipped ? 'skipped' : 'injected'}`, { jobId: job.id })
+    return skipped ? { kind: 'silent' } : { kind: 'completed' }
   }
 
   private async runJob(
@@ -1643,11 +1668,7 @@ export class CronScheduler {
     logger.info(`running job ${job.id}`, { jobId: job.id, heartbeat: !!job.heartbeat })
 
     if (job.resume === 'origin-session' && job.sourceSessionKey && this.onOriginSessionFire) {
-      const originOutcome = await this.runOriginSessionJob(job, durability, deliveryContext)
-      if (originOutcome !== 'fallback') return originOutcome
-      logger.info(`job ${job.id} origin-session fell back to isolated execution`, {
-        jobId: job.id,
-      })
+      return this.runOriginSessionJob(job, durability, deliveryContext)
     }
 
     // Isolated session per execution for ALL jobs (heartbeat included).

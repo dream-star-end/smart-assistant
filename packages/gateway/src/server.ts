@@ -12238,20 +12238,27 @@ export class Gateway {
         const origin = parseOriginWebchatSessionKey(
           typeof parsed.originSessionKey === 'string' ? parsed.originSessionKey : '',
         )
-        if (!origin) {
+        const live = origin ? this.sessions.getByKey(origin.sessionKey) : undefined
+        const containerUser = process.env.OC_USER_ID?.trim()
+        if (!origin || !live) {
           return this.sendError(
             res,
             400,
-            'origin-session requires the current webchat conversation; do not pass a session id',
+            'origin-session requires the current live webchat conversation; do not pass a session id',
           )
         }
-        const live = this.sessions.getByKey(origin.sessionKey)
+        if (
+          containerUser &&
+          typeof live.userId === 'string' &&
+          live.userId !== containerUser &&
+          live.userId !== 'default'
+        ) {
+          return this.sendError(res, 403, 'origin-session does not belong to this user')
+        }
         job.resume = 'origin-session'
         job.sourceSessionKey = origin.sessionKey
         job.sourceUserId =
-          (typeof live?.userId === 'string' && live.userId) ||
-          process.env.OC_USER_ID?.trim() ||
-          'default'
+          (typeof live.userId === 'string' && live.userId) || containerUser || 'default'
       }
       await this.cron.addJob(job)
       this.sendJson(res, 201, { ok: true, job })
