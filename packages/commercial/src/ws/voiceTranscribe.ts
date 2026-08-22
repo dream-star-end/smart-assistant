@@ -5,7 +5,7 @@ import { WebSocketServer, WebSocket, type RawData } from "ws";
 
 import { verifyAccess, JwtError, type AccessClaims } from "../auth/jwt.js";
 import type { Logger } from "../logging/logger.js";
-import { DEEPSEEK_UPSTREAM_ENDPOINT } from "../http/proxy/shared.js";
+import { OPENCODE_GO_UPSTREAM_ENDPOINT, openCodeGoAuthHeaders } from "../http/proxy/shared.js";
 import { directEgressDispatcher } from "../account-pool/egressDispatcher.js";
 import type { Dispatcher } from "undici";
 
@@ -61,7 +61,7 @@ type DeepgramSocketFactory = (url: string, options: { headers: Record<string, st
 export interface VoiceTranscribeDeps {
   jwtSecret: string | Uint8Array;
   deepgramApiKey?: string;
-  deepseekApiKey?: string;
+  openCodeGoApiKey?: string;
   asrModel?: string;
   asrLanguage?: string;
   voicePolishModel?: string;
@@ -416,17 +416,12 @@ async function polishTranscriptStream(input: {
 
   let res: Response;
   try {
-    res = await input.fetchImpl(DEEPSEEK_UPSTREAM_ENDPOINT, {
+    res = await input.fetchImpl(OPENCODE_GO_UPSTREAM_ENDPOINT, {
       method: "POST",
-      headers: {
-        "Authorization": `Bearer ${input.apiKey}`,
-        "Content-Type": "application/json",
-        "Accept": "text/event-stream",
-      },
+      headers: openCodeGoAuthHeaders(input.apiKey, "text/event-stream"),
       body: JSON.stringify(body),
       signal: input.signal,
-      // deepseek 北京端点显式直连,绕开 gateway 全局 EnvHttpProxyAgent(给 Anthropic 出海的日本节点),
-      // 否则被全局代理静默接管 → 海外→日本→中国双重跨境,见 egressDispatcher.directEgressDispatcher。
+      // OpenCode Go 显式直连,绕开 gateway 全局 EnvHttpProxyAgent(给 Anthropic 出海的日本节点)。
       dispatcher: directEgressDispatcher(),
     } as RequestInit & { dispatcher: Dispatcher });
   } catch {
@@ -507,16 +502,12 @@ async function polishTranscriptOnce(input: {
 
   let res: Response;
   try {
-    res = await input.fetchImpl(DEEPSEEK_UPSTREAM_ENDPOINT, {
+    res = await input.fetchImpl(OPENCODE_GO_UPSTREAM_ENDPOINT, {
       method: "POST",
-      headers: {
-        "Authorization": `Bearer ${input.apiKey}`,
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-      },
+      headers: openCodeGoAuthHeaders(input.apiKey),
       body: JSON.stringify(body),
       signal: input.signal,
-      // deepseek 北京端点显式直连,绕开 gateway 全局 EnvHttpProxyAgent(日本),理由同上。
+      // OpenCode Go 显式直连,绕开 gateway 全局 EnvHttpProxyAgent(日本),理由同上。
       dispatcher: directEgressDispatcher(),
     } as RequestInit & { dispatcher: Dispatcher });
   } catch {
@@ -652,7 +643,7 @@ export function createVoiceTranscribeHandler(deps: VoiceTranscribeDeps): VoiceTr
         transcript: rawText,
         context: startPayload.context,
         keyterms: startPayload.keyterms,
-        apiKey: deps.deepseekApiKey,
+        apiKey: deps.openCodeGoApiKey,
         model: deps.voicePolishModel || DEFAULT_POLISH_MODEL,
         fetchImpl,
         signal: polishAbort.signal,

@@ -7,6 +7,10 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
 import {
+  OPENCODE_GO_UPSTREAM_ENDPOINT,
+  openCodeGoAuthHeaders,
+} from '../../http/proxy/shared.js'
+import {
   AI_REVIEW_SYSTEM_PROMPT,
   CONNECTOR_REVIEW_PROMPT_MAX_BYTES,
   type FetchLike,
@@ -336,6 +340,24 @@ test('callReviewModel:非 2xx 视为可重试错误', async () => {
   const fetchImpl: FetchLike = async () => new Response('err', { status: 500 })
   const r = await callReviewModel('p', { apiKey: 'k', fetchImpl, makeDispatcher: noDispatcher })
   assert.equal(r.ok, false)
+})
+
+test('callReviewModel:走 OpenCode Go 端点且用 x-api-key,不打官方 DeepSeek', async () => {
+  let url = ''
+  let headers: Record<string, string> = {}
+  const fetchImpl: FetchLike = async (input, init) => {
+    url = String(input)
+    headers = (init?.headers ?? {}) as Record<string, string>
+    return mockFetch('{"verdict":"approve","reasons":[],"userNote":"ok"}')(input, init)
+  }
+  const r = await callReviewModel('p', { apiKey: 'og-secret', fetchImpl, makeDispatcher: noDispatcher })
+  assert.equal(r.ok, true)
+  assert.equal(url, OPENCODE_GO_UPSTREAM_ENDPOINT)
+  assert.match(url, /opencode\.ai\/zen\/go\/v1\/messages/)
+  assert.doesNotMatch(url, /api\.deepseek\.com/)
+  assert.equal(headers['x-api-key'], 'og-secret')
+  assert.equal(headers.Authorization, undefined)
+  assert.deepEqual(openCodeGoAuthHeaders('og-secret')['x-api-key'], 'og-secret')
 })
 
 // ── reviewOne:端到端三态(mock fetch)──────────────────────────────

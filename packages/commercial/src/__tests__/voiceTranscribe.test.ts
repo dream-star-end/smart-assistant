@@ -153,7 +153,7 @@ describe("voiceTranscribe websocket", () => {
     const h = createVoiceTranscribeHandler({
       jwtSecret: SECRET,
       deepgramApiKey: "dg_secret",
-      deepseekApiKey: "ds_secret",
+      openCodeGoApiKey: "og_secret",
       createDeepgramSocket: (url, options) => {
         capturedUrl = url;
         capturedHeaders = options.headers;
@@ -188,7 +188,7 @@ describe("voiceTranscribe websocket", () => {
     const h = createVoiceTranscribeHandler({
       jwtSecret: SECRET,
       deepgramApiKey: "dg_secret",
-      deepseekApiKey: "ds_secret",
+      openCodeGoApiKey: "og_secret",
       noAudioTimeoutMs: 5_000,
       createDeepgramSocket: () => {
         const fake = new FakeDeepgram();
@@ -225,13 +225,17 @@ describe("voiceTranscribe websocket", () => {
     const h = createVoiceTranscribeHandler({
       jwtSecret: SECRET,
       deepgramApiKey: "dg_secret",
-      deepseekApiKey: "ds_secret",
+      openCodeGoApiKey: "og_secret",
       createDeepgramSocket: () => {
         const fake = new FakeDeepgram();
         setImmediate(() => { fake.readyState = WebSocket.OPEN; fake.emit("open"); });
         return fake as unknown as WebSocket;
       },
-      fetchImpl: async (_url, init) => {
+      fetchImpl: async (url, init) => {
+        assert.equal(String(url), "https://opencode.ai/zen/go/v1/messages");
+        const headers = (init?.headers ?? {}) as Record<string, string>;
+        assert.equal(headers["x-api-key"], "og_secret");
+        assert.equal(headers.Authorization, undefined);
         const body = JSON.parse(String(init?.body || "{}"));
         assert.equal(body.stream, true);
         assert.match(body.system, /不输出 JSON/);
