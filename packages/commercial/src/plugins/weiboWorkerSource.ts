@@ -1201,13 +1201,14 @@ async function provePostSendReady(send, timeout) {
   if (!send) throw new Error('send');
   await send.click({ trial: true, timeout });
 }
-async function awaitPostSendReady(page, timeout) {
+async function awaitPostSendReady(page, timeout, editor) {
   const deadline = Date.now() + timeout;
   const attempts = Math.max(1, Math.ceil(timeout / 250));
+  const scope = (await composerScope(editor)) || page;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     let remaining = deadline - Date.now();
     if (remaining <= 0) break;
-    const send = await exactMenuItem(page, '发送');
+    const send = await exactMenuItem(scope, '发送');
     remaining = deadline - Date.now();
     if (send && remaining > 0) {
       try {
@@ -1281,7 +1282,7 @@ async function writeAction(page, input) {
     await assertNoChallenge(page);
     let imageChooser = null;
     if (manifest.length === 0) {
-      await awaitPostSendReady(page, 30_000);
+      await awaitPostSendReady(page, 30_000, editor);
     } else {
       imageChooser = await preparePostImageChooser(page, editor);
     }
@@ -1302,7 +1303,7 @@ async function writeAction(page, input) {
       if (selected !== manifest.length) throw new Error('media');
     }
     await assertNoChallenge(page);
-    const send = await awaitPostSendReady(page, 30_000);
+    const send = await awaitPostSendReady(page, manifest.length ? 90_000 : 30_000, freshEditor);
     const clickFailure = await activatePostSend(send);
     await page.waitForTimeout(2500);
     const post = await awaitNewestOwnPost(page, selfId, expectedText, beforeIds);
