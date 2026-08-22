@@ -1356,7 +1356,7 @@ export class ChatSocket {
       if (message.role !== "assistant" && message.role !== "thinking" && message.role !== "tool") {
         return false;
       }
-      if (cmid && message._clientMessageId && message._clientMessageId !== cmid) return false;
+      if (cmid && message._clientMessageId !== cmid) return false;
       if (!isServerAuthoredRow(message)) return false;
       return messageHasVisibleBody(message);
     });
@@ -1391,8 +1391,9 @@ export class ChatSocket {
 
   /**
    * Restore must have an exit. Returns true when this poll finished the loop.
-   * A still-live owner only drops recovery chrome (resumed); a finished tape
-   * or visible server body clears sending so the composer is usable again.
+   * A still-live owner only drops recovery chrome (resumed). Only a visible
+   * server body for THIS turn (or units that prove it finished) may clear
+   * sending; session-level tape projection is not that proof.
    */
   private finishRestoreIfReady(sess: ChatSession, attempt: number): boolean {
     if (sess._stopSettlement) return false;
@@ -1421,7 +1422,6 @@ export class ChatSocket {
     const obs = this.lastLiveJournalObservation.get(sess.id);
     const cmid = sess._activeClientMessageId;
     const liveOwner = !!(cmid && obs?.liveClientMessageIds.has(cmid));
-    const journalEmpty = !obs || obs.frameCount === 0;
     const hasVisible = this.sessionHasVisibleTurnBody(sess);
 
     if (sess._liveUnitsPackApplied) {
@@ -1429,7 +1429,7 @@ export class ChatSocket {
         if (!message._liveUnit && message.role !== "agent-group" && message.role !== "thinking" && message.role !== "tool" && message.role !== "plan") {
           return false;
         }
-        if (cmid && message._clientMessageId && message._clientMessageId !== cmid && message._turnOwnerId !== cmid) {
+        if (cmid && message._clientMessageId !== cmid && message._turnOwnerId !== cmid) {
           return false;
         }
         return true;
@@ -1442,12 +1442,14 @@ export class ChatSocket {
     if (hasVisible && !liveOwner) {
       return { clearSending: true, kind: "completed" };
     }
-    // journal 为空且没有 live owner:streamClientMessageIds 不含当前消息,且 tape 已投影。
-    if (journalEmpty && !liveOwner && obs?.hasTapeProjection === true) {
-      return { clearSending: true, kind: "completed" };
-    }
+    // Session-level hasTapeProjection is true whenever ANY prior turn was
+    // taped. A newly admitted turn (empty live journal before the first
+    // thinking frame, or a 401 on live-frames) must keep 「思考中」.
     const startedAt = this.reconcileStartedAt.get(sess.id) ?? Date.now();
     if (attempt >= RESTORE_RECONCILE_MAX_ATTEMPTS || Date.now() - startedAt >= RESTORE_RECONCILE_MAX_MS) {
+      if (sess._sendingInFlight && !hasVisible) {
+        return { clearSending: false, kind: "resumed" };
+      }
       return { clearSending: !liveOwner, kind: liveOwner ? "resumed" : "completed" };
     }
     return null;

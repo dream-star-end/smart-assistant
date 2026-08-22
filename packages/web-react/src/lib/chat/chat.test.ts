@@ -7510,7 +7510,7 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     sock.stop();
   });
 
-  test("empty journal with tape projection exits restore and clears sending", async () => {
+  test("empty journal with session-level tape projection keeps 思考中", async () => {
     vi.useFakeTimers();
     let sock!: ChatSocket;
     const syncSession = vi.fn(async () => {
@@ -7527,7 +7527,7 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
       id: "s1",
       agentId: "main",
       title: "s1",
-      messages: [{ id: "u-tape", role: "user", text: "done turn", ts: now, status: "sent" }],
+      messages: [{ id: "u-tape", role: "user", text: "new turn", ts: now, status: "sent" }],
       createdAt: now,
       lastAt: now,
       _sendingInFlight: true,
@@ -7537,12 +7537,12 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
 
     await Promise.resolve();
     const session = sock.sessions.get("s1")!;
-    expect(session._sendingInFlight).toBe(false);
-    expect(session._reconciling).toBe(false);
-    expect(session._recoveryStatus?.kind).toBe("completed");
+    expect(session._sendingInFlight).toBe(true);
+    expect(session._reconciling).toBe(true);
     expect(syncSession).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(10_000);
-    expect(syncSession).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(EMPTY_JOURNAL_POLL_DELAYS_MS[0]);
+    expect(syncSession).toHaveBeenCalledTimes(2);
+    expect(session._sendingInFlight).toBe(true);
     sock.stop();
   });
 
@@ -7613,8 +7613,8 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     const session = sock.sessions.get("s1")!;
     expect(syncSession.mock.calls.length).toBeLessThanOrEqual(RESTORE_RECONCILE_MAX_ATTEMPTS);
     expect(session._reconciling).toBe(false);
-    expect(session._sendingInFlight).toBe(false);
-    expect(session._recoveryStatus?.kind).toBe("completed");
+    expect(session._sendingInFlight).toBe(true);
+    expect(session._recoveryStatus?.kind).toBe("resumed");
     sock.stop();
   });
 
@@ -8778,6 +8778,50 @@ describe("openDispatch hydrate restores in-flight", () => {
     const session = sock.sessions.get("s-open")!;
     expect(session._sendingInFlight).toBe(true);
     expect(session._activeClientMessageId).toBe("m-open-1");
+    sock.stop();
+  });
+
+  test("prior-turn tape + empty live journal does not hide 思考中 for the new turn", async () => {
+    vi.useFakeTimers();
+    let sock!: ChatSocket;
+    const syncSession = vi.fn(async () => {
+      sock.noteLiveJournalObservation("s-open-2", {
+        frameCount: 0,
+        liveClientMessageIds: [],
+        hasTapeProjection: true,
+      });
+      return true;
+    });
+    sock = makeSocket({ syncSession });
+    const now = Date.now();
+    sock.loadStored({
+      id: "s-open-2",
+      agentId: "main",
+      title: "s-open-2",
+      messages: [
+        { id: "u-old", role: "user", text: "previous", ts: now - 60_000, status: "replied" },
+        {
+          id: "a-old",
+          role: "assistant",
+          text: "previous answer",
+          ts: now - 59_000,
+          _source: "server",
+          _clientMessageId: "u-old",
+        },
+        { id: "m-open-2", role: "user", text: "根治下", ts: now, status: "sent" },
+      ],
+      createdAt: now - 60_000,
+      lastAt: now,
+      _sendingInFlight: true,
+      _activeClientMessageId: "m-open-2",
+      _turnStartedAt: now,
+    });
+
+    await Promise.resolve();
+    const session = sock.sessions.get("s-open-2")!;
+    expect(session._sendingInFlight).toBe(true);
+    expect(session._activeClientMessageId).toBe("m-open-2");
+    expect(session._reconciling).toBe(true);
     sock.stop();
   });
 });
