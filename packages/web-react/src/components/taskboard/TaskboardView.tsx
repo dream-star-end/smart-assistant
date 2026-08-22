@@ -93,6 +93,7 @@ export function TaskboardView({
   const desktop = useMdViewport()
   const [creating, setCreating] = useState(false)
   const [draftTitle, setDraftTitle] = useState('')
+  const [draftBody, setDraftBody] = useState('')
   const [draftType, setDraftType] = useState<TicketType>('bug')
   const [draftReady, setDraftReady] = useState(false)
   const [reviseOpen, setReviseOpen] = useState(false)
@@ -445,11 +446,13 @@ export function TaskboardView({
       projectId: board.projectId,
       type: draftType,
       title,
+      body: draftBody.trim() || undefined,
       source: 'manual',
       ...(draftReady ? { status: 'ready' as const } : {}),
     })
     if (created) {
       setDraftTitle('')
+      setDraftBody('')
       setDraftReady(false)
       setCreating(false)
       onOpenTicket(created.identifier)
@@ -513,6 +516,18 @@ export function TaskboardView({
         onKeyDown={(e) => {
           if (e.key === 'Enter') void submitCreate()
         }}
+      />
+      <textarea
+        aria-label="单据正文"
+        data-testid="ticket-create-body"
+        placeholder="Markdown 正文：复现步骤、验收标准、范围内外"
+        className={
+          mobile
+            ? 'min-h-28 w-full rounded-lg border border-border-control bg-surface px-3.5 py-2.5 text-base leading-relaxed text-fg outline-none focus:border-accent focus-visible:ring-2 focus-visible:ring-ring'
+            : 'min-h-24 w-full basis-full rounded-lg border border-border-control bg-surface px-3.5 py-2.5 text-sm leading-relaxed text-fg outline-none focus:border-accent focus-visible:ring-2 focus-visible:ring-ring'
+        }
+        value={draftBody}
+        onChange={(e) => setDraftBody(e.target.value)}
       />
       <fieldset className="flex flex-col gap-1">
         <legend className="text-caption text-muted">下一步</legend>
@@ -722,6 +737,7 @@ export function TaskboardView({
         <BoardColumns
           columns={board.board?.columns ?? []}
           backlogTickets={board.board?.backlog?.tickets ?? []}
+          inboxTickets={board.board?.inbox ?? []}
           ticketTypeLabel={shownType ? TICKET_TYPE_LABEL[shownType] : undefined}
           onOpenTicket={openTicket}
           renderActions={(ticket) => renderActions(ticket, 'board')}

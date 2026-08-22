@@ -10,7 +10,7 @@
 // (漏一个 / 签名不符 = 编译错)。业务决策(merge/seq/spill/usage-patch/delegate 累加)**全部
 // 复用** @openclaude/storage 导出的引擎中立纯函数(planSpillOverflow / planAppendServerAuthored /
 // mergePreservingServerAuthored / normalizeAndAssignSeqs / appendServerAuthoredPure /
-// _stripClientPutMessages),本文件**只做 PG 执行**:取锁 → 读行 → 调 plan → 按变更集落 SQL。
+// planReplaceServerAuthoredKeepingOrderSlots / _stripClientPutMessages),本文件**只做 PG 执行**:取锁 → 读行 → 调 plan → 按变更集落 SQL。
 // 双 backend 不各养一份业务逻辑(RFC D6b 防漂移)。
 //
 // ── 并发正确性核心(RFC D3;本迁移的正确性所在)──────────────────────────────
@@ -82,6 +82,7 @@ import {
   assertSettlementMatchesCanonical,
   classifyUnifiedTimelineIntegrityError,
   isTransientTapeError,
+  clipVisibleText,
   phaseAVisibleHeadText,
   pickTapeDisplayFallbackText,
   recordsPublished,
@@ -174,6 +175,7 @@ import {
   toLastMessagePreview,
   planAppendServerAuthored,
   planAppendServerAuthoredBatch,
+  planReplaceServerAuthoredKeepingOrderSlots,
   planCostPatch,
   planDelegateCostMerge,
   planSpillOverflow,
@@ -1945,6 +1947,150 @@ function assertRecoveryUsageFallback(
 
 /** 把可变计费叠加并入行 usage。与今日 hydrateTapeRecord 内联合并逐字节等价:key 顺序
  *  = record/anchor(content 已并) → cost → waiver → delegate;全空则原样返回(不凭空造 usage)。 */
+type TapeFallbackSettlement = {
+  usage?: unknown;
+  requestId?: string | null;
+  costCredits: string;
+  waiverApplied: boolean;
+  delegates: Array<{ agentId: string; costCredits: string }>;
+};
+
+function usageRecord(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  return value as Record<string, unknown>;
+}
+
+/** Attach already-settled usage onto a degrade fallback row. Never invents costCredits. */
+function attachFallbackSettlementUsage(
+  msg: MessageLike,
+  header: {
+    usage?: unknown;
+    requestId?: string | null;
+    costCredits?: string;
+    waiverApplied?: boolean;
+    delegates?: Array<{ agentId: string; costCredits: string }>;
+  } | null | undefined,
+  anchorUsage: unknown,
+): MessageLike {
+  const tape = usageRecord(header?.usage) ?? {};
+  const anchor = usageRecord(anchorUsage) ?? {};
+  const base = { ...tape, ...anchor };
+  const requestId = header?.requestId;
+  const traceId =
+    (typeof base.traceId === "string" && base.traceId.length > 0 ? base.traceId : undefined)
+    ?? (typeof requestId === "string" && requestId.length > 0 ? requestId : undefined);
+  const seeded = (Object.keys(base).length > 0 || traceId)
+    ? { ...msg, usage: traceId ? { ...base, traceId } : base }
+    : msg;
+  return mergeExactUsage(
+    seeded,
+    {
+      costCredits: header?.costCredits ?? "0",
+      waiverApplied: header?.waiverApplied === true,
+      delegates: header?.delegates ?? [],
+    },
+    true,
+  );
+}
+
+async function readTapeFallbackSettlements(
+  client: Pool | PoolClient,
+  sessionId: string,
+  userId: string,
+  tapeIds: string[],
+): Promise<Map<string, TapeFallbackSettlement>> {
+  if (tapeIds.length === 0) return new Map();
+  const rows = (
+    await client.query<{
+      tape_id: string;
+      usage: unknown;
+      request_id: string | null;
+      cost_credits: string;
+      waiver_applied: boolean;
+      delegate_costs: unknown;
+    }>(
+      `SELECT t.tape_id, t.usage,
+              NULLIF(COALESCE(t.engine_billings->0->>'requestId', t.usage->>'traceId'), '') AS request_id,
+              EXISTS (
+                SELECT 1 FROM turn_waivers w
+                 WHERE ('c:' || w.user_id::text)=t.user_id
+                   AND w.turn_key=t.turn_key AND w.status='applied'
+              ) AS waiver_applied,
+              COALESCE((
+                SELECT SUM(exact_cost.cost_credits)::text
+                  FROM (
+                    SELECT c.cost_credits::numeric AS cost_credits
+                      FROM turn_tape_cost_components c
+                     WHERE c.user_id=t.user_id AND c.session_id=t.session_id
+                       AND c.tape_id=t.tape_id AND c.billing_anchor_id=t.billing_anchor_id
+                    UNION ALL
+                    SELECT p.cost_credits::numeric AS cost_credits
+                      FROM pending_usage_patches p
+                     WHERE p.user_id=t.user_id
+                       AND (
+                         p.turn_key=t.turn_key OR p.parent_turn_key=t.turn_key
+                         OR p.request_id=NULLIF(t.engine_billings->0->>'requestId','')
+                         OR p.request_id=NULLIF(t.usage->>'traceId','')
+                       )
+                  ) exact_cost
+              ), '0') AS cost_credits,
+              COALESCE((
+                SELECT jsonb_agg(
+                         jsonb_build_object(
+                           'agentId', grouped.delegate_agent_id,
+                           'costCredits', grouped.cost_credits
+                         ) ORDER BY grouped.delegate_agent_id
+                       )
+                  FROM (
+                    SELECT exact_delegate.delegate_agent_id,
+                           SUM(exact_delegate.cost_credits)::text AS cost_credits
+                      FROM (
+                        SELECT c.delegate_agent_id, c.cost_credits::numeric AS cost_credits
+                          FROM turn_tape_cost_components c
+                         WHERE c.user_id=t.user_id AND c.session_id=t.session_id
+                           AND c.tape_id=t.tape_id AND c.billing_anchor_id=t.billing_anchor_id
+                        UNION ALL
+                        SELECT p.delegate_agent_id, p.cost_credits::numeric AS cost_credits
+                          FROM pending_usage_patches p
+                         WHERE p.user_id=t.user_id
+                           AND (
+                             p.turn_key=t.turn_key OR p.parent_turn_key=t.turn_key
+                             OR p.request_id=NULLIF(t.engine_billings->0->>'requestId','')
+                             OR p.request_id=NULLIF(t.usage->>'traceId','')
+                           )
+                      ) exact_delegate
+                     WHERE exact_delegate.delegate_agent_id IS NOT NULL
+                     GROUP BY exact_delegate.delegate_agent_id
+                  ) grouped
+              ), '[]'::jsonb) AS delegate_costs
+         FROM client_session_turn_tapes t
+        WHERE t.session_id=$1 AND t.user_id=$2 AND t.tape_id=ANY($3::text[])`,
+      [sessionId, userId, tapeIds],
+    )
+  ).rows;
+  return new Map(rows.map((row) => [row.tape_id, {
+    usage: row.usage,
+    requestId: row.request_id,
+    costCredits: row.cost_credits,
+    waiverApplied: row.waiver_applied,
+    delegates: parseDelegateCosts(row.delegate_costs),
+  }]));
+}
+
+async function mergeTapeFallbackSettlements<T extends { tapeId: string }>(
+  client: Pool | PoolClient,
+  sessionId: string,
+  userId: string,
+  headers: Map<string, T>,
+): Promise<void> {
+  const settlements = await readTapeFallbackSettlements(client, sessionId, userId, [...headers.keys()]);
+  for (const [, header] of headers) {
+    const settlement = settlements.get(header.tapeId);
+    if (!settlement) continue;
+    Object.assign(header, settlement);
+  }
+}
+
 function mergeExactUsage(msg: MessageLike, enrich: ExactUsageEnrichment, isBillingAnchor: boolean): MessageLike {
   const exactCostUsage = BigInt(enrich.costCredits) > 0n ? { costCredits: enrich.costCredits } : {};
   // The live cost_waived frame updates the current browser immediately, but
@@ -2258,6 +2404,11 @@ interface DirectTapeHeader {
   finalizedAt: string | null;
   visibleAt: string | null;
   visibleHead: VisibleHead | null;
+  usage?: unknown;
+  requestId?: string | null;
+  costCredits?: string;
+  waiverApplied?: boolean;
+  delegates?: Array<{ agentId: string; costCredits: string }>;
 }
 
 const PRIVATE_TAPE_ROOT_FIELDS = new Set([
@@ -3015,6 +3166,7 @@ async function claimLosslessTurnTapeStorageFormat(
 }
 
 export const LOSSLESS_TURN_RECORD_STAGE_BATCH_SIZE = 128;
+export const LOSSLESS_TURN_RECORD_STAGE_BATCH_BYTES = 512 * 1024;
 
 function yieldLosslessTapeWork(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve));
@@ -3041,6 +3193,60 @@ export function _losslessTurnRecordStageBatches(
     batches.push(pending.slice(start, start + LOSSLESS_TURN_RECORD_STAGE_BATCH_SIZE));
   }
   return batches;
+}
+
+export function _losslessTurnRecordWriteChunks(
+  items: ReadonlyArray<{ ordinal: number; bytes: number }>,
+  maxBytes: number = LOSSLESS_TURN_RECORD_STAGE_BATCH_BYTES,
+): number[][] {
+  const chunks: number[][] = [];
+  let current: number[] = [];
+  let currentBytes = 0;
+  for (const item of items) {
+    const size = Math.max(1, item.bytes);
+    if (current.length > 0 && currentBytes + size > maxBytes) {
+      chunks.push(current);
+      current = [];
+      currentBytes = 0;
+    }
+    current.push(item.ordinal);
+    currentBytes += size;
+  }
+  if (current.length > 0) chunks.push(current);
+  return chunks;
+}
+
+type StagedRecordRow = {
+  msg_id: string;
+  ordinal: number;
+  role: string;
+  ts: string;
+  content_sha256: string;
+  payload: Buffer;
+  visible_payload: Buffer | null;
+  visible_content_sha256: string | null;
+  model_sidecar_complete: boolean;
+};
+
+function assertWrittenRecordMatches(
+  written: StagedRecordRow,
+  item: PreparedLosslessTurnTape["turn"]["records"][number],
+  ordinal: number,
+  visible: UserVisiblePhysicalPayload,
+): void {
+  if (
+    written.msg_id !== item.id ||
+    written.ordinal !== ordinal ||
+    written.role !== item.role ||
+    bigIntNum(written.ts, "written turn tape record ts") !== item.ts ||
+    written.content_sha256 !== item.payloadSha256 ||
+    !written.payload.equals(item.payloadBytes) ||
+    written.visible_payload === null ||
+    !written.visible_payload.equals(visible.bytes) ||
+    written.visible_content_sha256 !== visible.contentSha256
+  ) {
+    throw new Error("lossless turn tape derived record write changed at database boundary");
+  }
 }
 
 export async function _stagePreparedLosslessTurnRecords(
@@ -3084,55 +3290,35 @@ export async function _stagePreparedLosslessTurnRecords(
         throw new Error("lossless turn tape materialization format changed during staging");
       }
 
-      for (const ordinal of batch) {
       await yieldLosslessTapeWork();
-      const item = prepared.turn.records[ordinal]!;
-      const visible = prepared.visible[ordinal]!;
-      const expectedModels = preparedModelSidecarsForOrdinal(ordinal, item.id, visible);
-
-      type StagedRecordRow = {
-        msg_id: string;
-        ordinal: number;
-        role: string;
-        ts: string;
-        content_sha256: string;
-        payload: Buffer;
-        visible_payload: Buffer | null;
-        visible_content_sha256: string | null;
-        model_sidecar_complete: boolean;
-      };
+      const msgIds = batch.map((ordinal) => prepared.turn.records[ordinal]!.id);
       const identityRows = (
         await client.query<StagedRecordRow>(
           `SELECT msg_id,ordinal,role,ts::text,content_sha256,payload,
                   visible_payload,visible_content_sha256,model_sidecar_complete
              FROM client_session_turn_tape_records
             WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
-              AND (msg_id=$4 OR ordinal=$5)
+              AND (msg_id = ANY($4::text[]) OR ordinal = ANY($5::int[]))
             FOR UPDATE`,
-          [request.sessionId, userId, request.tapeId, item.id, ordinal],
+          [request.sessionId, userId, request.tapeId, msgIds, batch],
         )
       ).rows;
-      if (
-        identityRows.length > 1 ||
-        (identityRows[0] !== undefined &&
-          (identityRows[0].msg_id !== item.id || identityRows[0].ordinal !== ordinal))
-      ) {
-        throw new Error("lossless turn tape immutable record identity conflict");
+      const existingByOrdinal = new Map<number, StagedRecordRow>();
+      const existingByMsgId = new Map<string, StagedRecordRow>();
+      for (const row of identityRows) {
+        const priorOrdinal = existingByOrdinal.get(row.ordinal);
+        const priorMsg = existingByMsgId.get(row.msg_id);
+        if (priorOrdinal !== undefined && priorOrdinal !== row) {
+          throw new Error("lossless turn tape immutable record identity conflict");
+        }
+        if (priorMsg !== undefined && priorMsg !== row) {
+          throw new Error("lossless turn tape immutable record identity conflict");
+        }
+        existingByOrdinal.set(row.ordinal, row);
+        existingByMsgId.set(row.msg_id, row);
       }
-      const existing = identityRows[0];
-      const rawRecordMatches = existing !== undefined &&
-        existing.role === item.role &&
-        bigIntNum(existing.ts, "turn tape record ts") === item.ts &&
-        existing.content_sha256 === item.payloadSha256 &&
-        existing.payload.equals(item.payloadBytes);
-      const visibleRecordConflicts = existing !== undefined && (
-        (existing.visible_payload !== null && !existing.visible_payload.equals(visible.bytes)) ||
-        (existing.visible_content_sha256 !== null &&
-          existing.visible_content_sha256 !== visible.contentSha256)
-      );
-      const rewriteRecord = existing === undefined || !rawRecordMatches || visibleRecordConflicts;
 
-      const existingModels = (
+      const modelRows = (
         await client.query<{
           physical_ordinal: number;
           logical_ordinal: number;
@@ -3146,140 +3332,263 @@ export async function _stagePreparedLosslessTurnRecords(
           `SELECT physical_ordinal,logical_ordinal,msg_id,role,semantic_text,
                   token_estimate,ts::text,client_message_id
              FROM client_session_turn_tape_model_records
-            WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND physical_ordinal=$4
-            ORDER BY logical_ordinal`,
-          [request.sessionId, userId, request.tapeId, ordinal],
+            WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
+              AND physical_ordinal = ANY($4::int[])
+            ORDER BY physical_ordinal, logical_ordinal`,
+          [request.sessionId, userId, request.tapeId, batch],
         )
       ).rows;
-      const modelSidecarsMatch = existingModels.length === expectedModels.length &&
-        existingModels.every((actual, index) => {
-          const expected = expectedModels[index]!;
-          return actual.physical_ordinal === expected.physicalOrdinal &&
-            actual.logical_ordinal === expected.logicalOrdinal &&
-            actual.msg_id === expected.msgId &&
-            actual.role === expected.role &&
-            actual.semantic_text === expected.semanticText &&
-            actual.token_estimate === expected.tokenEstimate &&
-            (actual.ts === null ? null : bigIntNum(actual.ts, "model record ts")) === expected.ts &&
-            actual.client_message_id === expected.clientMessageId;
-        });
+      const modelsByOrdinal = new Map<number, typeof modelRows>();
+      for (const row of modelRows) {
+        const rows = modelsByOrdinal.get(row.physical_ordinal);
+        if (rows) rows.push(row);
+        else modelsByOrdinal.set(row.physical_ordinal, [row]);
+      }
 
-      let writtenRecord: StagedRecordRow | undefined;
-      if (existing === undefined) {
-        writtenRecord = (
+      type PendingWrite = {
+        ordinal: number;
+        item: PreparedLosslessTurnTape["turn"]["records"][number];
+        visible: UserVisiblePhysicalPayload;
+        expectedModels: ReturnType<typeof preparedModelSidecarsForOrdinal>;
+        kind: "insert" | "rewrite" | "fill-visible";
+      };
+      const writes: PendingWrite[] = [];
+      const sidecarOrdinals = new Set<number>();
+      let wroteAgentGroup = false;
+
+      for (const ordinal of batch) {
+        const item = prepared.turn.records[ordinal]!;
+        const visible = prepared.visible[ordinal]!;
+        const expectedModels = preparedModelSidecarsForOrdinal(ordinal, item.id, visible);
+        const byOrdinal = existingByOrdinal.get(ordinal);
+        const byMsg = existingByMsgId.get(item.id);
+        if (
+          (byOrdinal !== undefined && byOrdinal.msg_id !== item.id) ||
+          (byMsg !== undefined && byMsg.ordinal !== ordinal) ||
+          (byOrdinal !== undefined && byMsg !== undefined && byOrdinal !== byMsg)
+        ) {
+          throw new Error("lossless turn tape immutable record identity conflict");
+        }
+        const existing = byOrdinal ?? byMsg;
+        const rawRecordMatches = existing !== undefined &&
+          existing.role === item.role &&
+          bigIntNum(existing.ts, "turn tape record ts") === item.ts &&
+          existing.content_sha256 === item.payloadSha256 &&
+          existing.payload.equals(item.payloadBytes);
+        const visibleRecordConflicts = existing !== undefined && (
+          (existing.visible_payload !== null && !existing.visible_payload.equals(visible.bytes)) ||
+          (existing.visible_content_sha256 !== null &&
+            existing.visible_content_sha256 !== visible.contentSha256)
+        );
+        const rewriteRecord = existing === undefined || !rawRecordMatches || visibleRecordConflicts;
+        const existingModels = modelsByOrdinal.get(ordinal) ?? [];
+        const modelSidecarsMatch = existingModels.length === expectedModels.length &&
+          existingModels.every((actual, index) => {
+            const expected = expectedModels[index]!;
+            return actual.physical_ordinal === expected.physicalOrdinal &&
+              actual.logical_ordinal === expected.logicalOrdinal &&
+              actual.msg_id === expected.msgId &&
+              actual.role === expected.role &&
+              actual.semantic_text === expected.semanticText &&
+              actual.token_estimate === expected.tokenEstimate &&
+              (actual.ts === null ? null : bigIntNum(actual.ts, "model record ts")) === expected.ts &&
+              actual.client_message_id === expected.clientMessageId;
+          });
+
+        if (existing === undefined) {
+          writes.push({ ordinal, item, visible, expectedModels, kind: "insert" });
+          sidecarOrdinals.add(ordinal);
+          if (item.role === "agent-group") wroteAgentGroup = true;
+        } else if (rewriteRecord) {
+          writes.push({ ordinal, item, visible, expectedModels, kind: "rewrite" });
+          sidecarOrdinals.add(ordinal);
+          if (item.role === "agent-group") wroteAgentGroup = true;
+        } else if (existing.visible_payload === null || existing.visible_content_sha256 === null) {
+          writes.push({ ordinal, item, visible, expectedModels, kind: "fill-visible" });
+        }
+        if (rewriteRecord || !modelSidecarsMatch) {
+          sidecarOrdinals.add(ordinal);
+        }
+      }
+
+      const insertChunks = _losslessTurnRecordWriteChunks(
+        writes.filter((row) => row.kind === "insert").map((row) => ({
+          ordinal: row.ordinal,
+          bytes: row.item.payloadBytes.length + row.visible.bytes.length,
+        })),
+      );
+      const rewriteChunks = _losslessTurnRecordWriteChunks(
+        writes.filter((row) => row.kind === "rewrite").map((row) => ({
+          ordinal: row.ordinal,
+          bytes: row.item.payloadBytes.length + row.visible.bytes.length,
+        })),
+      );
+      const writeByOrdinal = new Map(writes.map((row) => [row.ordinal, row]));
+
+      for (const chunk of insertChunks) {
+        await yieldLosslessTapeWork();
+        const rows = chunk.map((ordinal) => writeByOrdinal.get(ordinal)!);
+        const written = (
           await client.query<StagedRecordRow>(
             `INSERT INTO client_session_turn_tape_records
                (session_id,user_id,tape_id,msg_id,ordinal,role,ts,content_sha256,payload,
                 visible_payload,visible_content_sha256,model_sidecar_complete)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,FALSE)
+             SELECT $1,$2,$3,t.msg_id,t.ordinal,t.role,t.ts,t.content_sha256,t.payload,
+                    t.visible_payload,t.visible_content_sha256,FALSE
+               FROM unnest(
+                      $4::text[], $5::int[], $6::text[], $7::bigint[], $8::text[],
+                      $9::bytea[], $10::bytea[], $11::text[]
+                    ) AS t(msg_id,ordinal,role,ts,content_sha256,payload,
+                           visible_payload,visible_content_sha256)
              RETURNING msg_id,ordinal,role,ts::text,content_sha256,payload,
                        visible_payload,visible_content_sha256,model_sidecar_complete`,
             [
               request.sessionId,
               userId,
               request.tapeId,
-              item.id,
-              ordinal,
-              item.role,
-              item.ts,
-              item.payloadSha256,
-              item.payloadBytes,
-              visible.bytes,
-              visible.contentSha256,
+              rows.map((row) => row.item.id),
+              rows.map((row) => row.ordinal),
+              rows.map((row) => row.item.role),
+              rows.map((row) => row.item.ts),
+              rows.map((row) => row.item.payloadSha256),
+              rows.map((row) => row.item.payloadBytes),
+              rows.map((row) => row.visible.bytes),
+              rows.map((row) => row.visible.contentSha256),
             ],
           )
-        ).rows[0];
-      } else if (rewriteRecord) {
-        writtenRecord = (
+        ).rows;
+        const writtenById = new Map(written.map((row) => [row.msg_id, row]));
+        if (writtenById.size !== rows.length) {
+          throw new Error("lossless turn tape derived record write changed at database boundary");
+        }
+        for (const row of rows) {
+          const got = writtenById.get(row.item.id);
+          if (!got) {
+            throw new Error("lossless turn tape derived record write changed at database boundary");
+          }
+          assertWrittenRecordMatches(got, row.item, row.ordinal, row.visible);
+        }
+      }
+
+      for (const chunk of rewriteChunks) {
+        await yieldLosslessTapeWork();
+        const rows = chunk.map((ordinal) => writeByOrdinal.get(ordinal)!);
+        const written = (
           await client.query<StagedRecordRow>(
-            `UPDATE client_session_turn_tape_records
-                SET ordinal=$5,role=$6,ts=$7,content_sha256=$8,payload=$9,
-                    visible_payload=$10,visible_content_sha256=$11,
+            `UPDATE client_session_turn_tape_records AS r
+                SET ordinal=t.ordinal, role=t.role, ts=t.ts, content_sha256=t.content_sha256,
+                    payload=t.payload, visible_payload=t.visible_payload,
+                    visible_content_sha256=t.visible_content_sha256,
                     model_sidecar_complete=FALSE
-              WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND msg_id=$4
-              RETURNING msg_id,ordinal,role,ts::text,content_sha256,payload,
-                        visible_payload,visible_content_sha256,model_sidecar_complete`,
+               FROM unnest(
+                      $4::text[], $5::int[], $6::text[], $7::bigint[], $8::text[],
+                      $9::bytea[], $10::bytea[], $11::text[]
+                    ) AS t(msg_id,ordinal,role,ts,content_sha256,payload,
+                           visible_payload,visible_content_sha256)
+              WHERE r.session_id=$1 AND r.user_id=$2 AND r.tape_id=$3 AND r.msg_id=t.msg_id
+              RETURNING r.msg_id,r.ordinal,r.role,r.ts::text,r.content_sha256,r.payload,
+                        r.visible_payload,r.visible_content_sha256,r.model_sidecar_complete`,
             [
               request.sessionId,
               userId,
               request.tapeId,
-              item.id,
-              ordinal,
-              item.role,
-              item.ts,
-              item.payloadSha256,
-              item.payloadBytes,
-              visible.bytes,
-              visible.contentSha256,
+              rows.map((row) => row.item.id),
+              rows.map((row) => row.ordinal),
+              rows.map((row) => row.item.role),
+              rows.map((row) => row.item.ts),
+              rows.map((row) => row.item.payloadSha256),
+              rows.map((row) => row.item.payloadBytes),
+              rows.map((row) => row.visible.bytes),
+              rows.map((row) => row.visible.contentSha256),
             ],
           )
-        ).rows[0];
-      } else if (
-        existing.visible_payload === null || existing.visible_content_sha256 === null
-      ) {
+        ).rows;
+        const writtenById = new Map(written.map((row) => [row.msg_id, row]));
+        if (writtenById.size !== rows.length) {
+          throw new Error("lossless turn tape derived record write changed at database boundary");
+        }
+        for (const row of rows) {
+          const got = writtenById.get(row.item.id);
+          if (!got) {
+            throw new Error("lossless turn tape derived record write changed at database boundary");
+          }
+          assertWrittenRecordMatches(got, row.item, row.ordinal, row.visible);
+        }
+      }
+
+      const fillVisible = writes.filter((row) => row.kind === "fill-visible");
+      if (fillVisible.length > 0) {
         await client.query(
-          `UPDATE client_session_turn_tape_records
-              SET visible_payload=COALESCE(visible_payload,$5),
-                  visible_content_sha256=COALESCE(visible_content_sha256,$6)
-            WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND msg_id=$4`,
-          [request.sessionId, userId, request.tapeId, item.id, visible.bytes, visible.contentSha256],
+          `UPDATE client_session_turn_tape_records AS r
+              SET visible_payload=COALESCE(r.visible_payload, t.visible_payload),
+                  visible_content_sha256=COALESCE(r.visible_content_sha256, t.visible_content_sha256)
+             FROM unnest($4::text[], $5::bytea[], $6::text[])
+               AS t(msg_id, visible_payload, visible_content_sha256)
+            WHERE r.session_id=$1 AND r.user_id=$2 AND r.tape_id=$3 AND r.msg_id=t.msg_id`,
+          [
+            request.sessionId,
+            userId,
+            request.tapeId,
+            fillVisible.map((row) => row.item.id),
+            fillVisible.map((row) => row.visible.bytes),
+            fillVisible.map((row) => row.visible.contentSha256),
+          ],
         );
       }
 
-      // Migration 0151 has a rolling-compatibility BEFORE trigger which may
-      // rewrite legacy agent-group bytes. Never publish bytes other than this
-      // release's deterministic materialization, and never let its part DELETE
-      // escape an ordinal transaction which cannot still prove the source.
-      if (writtenRecord !== undefined && (
-        writtenRecord.msg_id !== item.id ||
-        writtenRecord.ordinal !== ordinal ||
-        writtenRecord.role !== item.role ||
-        bigIntNum(writtenRecord.ts, "written turn tape record ts") !== item.ts ||
-        writtenRecord.content_sha256 !== item.payloadSha256 ||
-        !writtenRecord.payload.equals(item.payloadBytes) ||
-        writtenRecord.visible_payload === null ||
-        !writtenRecord.visible_payload.equals(visible.bytes) ||
-        writtenRecord.visible_content_sha256 !== visible.contentSha256
-      )) {
-        throw new Error("lossless turn tape derived record write changed at database boundary");
-      }
-
-      if (rewriteRecord || !modelSidecarsMatch) {
+      const sidecarList = [...sidecarOrdinals].sort((a, b) => a - b);
+      if (sidecarList.length > 0) {
         await client.query(
           `UPDATE client_session_turn_tape_records
               SET model_sidecar_complete=FALSE
-            WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND ordinal=$4`,
-          [request.sessionId, userId, request.tapeId, ordinal],
+            WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND ordinal = ANY($4::int[])`,
+          [request.sessionId, userId, request.tapeId, sidecarList],
         );
         await client.query(
           `DELETE FROM client_session_turn_tape_model_records
-            WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND physical_ordinal=$4`,
-          [request.sessionId, userId, request.tapeId, ordinal],
+            WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND physical_ordinal = ANY($4::int[])`,
+          [request.sessionId, userId, request.tapeId, sidecarList],
         );
-        for (const modelRecord of expectedModels) {
+        const modelInserts = sidecarList.flatMap((ordinal) => {
+          const write = writeByOrdinal.get(ordinal);
+          const expected = write?.expectedModels
+            ?? preparedModelSidecarsForOrdinal(
+              ordinal,
+              prepared.turn.records[ordinal]!.id,
+              prepared.visible[ordinal]!,
+            );
+          return expected;
+        });
+        if (modelInserts.length > 0) {
           await client.query(
             `INSERT INTO client_session_turn_tape_model_records
                (session_id,user_id,tape_id,physical_ordinal,logical_ordinal,msg_id,role,
                 semantic_text,token_estimate,ts,client_message_id)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+             SELECT $1,$2,$3,t.physical_ordinal,t.logical_ordinal,t.msg_id,t.role,
+                    t.semantic_text,t.token_estimate,t.ts,t.client_message_id
+               FROM unnest(
+                      $4::int[], $5::int[], $6::text[], $7::text[], $8::text[],
+                      $9::int[], $10::bigint[], $11::text[]
+                    ) AS t(physical_ordinal,logical_ordinal,msg_id,role,semantic_text,
+                           token_estimate,ts,client_message_id)`,
             [
               request.sessionId,
               userId,
               request.tapeId,
-              modelRecord.physicalOrdinal,
-              modelRecord.logicalOrdinal,
-              modelRecord.msgId,
-              modelRecord.role,
-              modelRecord.semanticText,
-              modelRecord.tokenEstimate,
-              modelRecord.ts,
-              modelRecord.clientMessageId,
+              modelInserts.map((row) => row.physicalOrdinal),
+              modelInserts.map((row) => row.logicalOrdinal),
+              modelInserts.map((row) => row.msgId),
+              modelInserts.map((row) => row.role),
+              modelInserts.map((row) => row.semanticText),
+              modelInserts.map((row) => row.tokenEstimate),
+              modelInserts.map((row) => row.ts),
+              modelInserts.map((row) => row.clientMessageId),
             ],
           );
         }
       }
 
-      if (writtenRecord !== undefined && item.role === "agent-group") {
+      if (wroteAgentGroup) {
         const partState = await verifyPreparedPartManifest(
           client,
           userId,
@@ -3296,10 +3605,9 @@ export async function _stagePreparedLosslessTurnRecords(
       await client.query(
         `UPDATE client_session_turn_tape_records
             SET model_sidecar_complete=TRUE
-          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND ordinal=$4`,
-        [request.sessionId, userId, request.tapeId, ordinal],
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND ordinal = ANY($4::int[])`,
+        [request.sessionId, userId, request.tapeId, batch],
       );
-      }
       return "staged";
     });
     if (staged !== "staged") return;
@@ -3509,7 +3817,7 @@ async function readDirectTapeHeaders(
       row.logical_count = exact.logical_count;
     }
   }
-  return new Map(
+  const headers = new Map(
     rows.map((row) => [
       row.tape_id,
       {
@@ -3529,6 +3837,8 @@ async function readDirectTapeHeaders(
       },
     ]),
   );
+  await mergeTapeFallbackSettlements(pool, sessionId, userId, headers);
+  return headers;
 }
 
 async function readHydratedTapeRows(
@@ -3858,7 +4168,7 @@ async function hydrateTurnTapeMessages(
       finalizedAt: header.finalizedAt,
     })) {
       const head = header.visibleHead;
-      const message: MessageLike = {
+      const message: MessageLike = attachFallbackSettlementUsage({
         id: head?.messageId ?? header.billingAnchorId,
         role: "assistant",
         text: typeof head?.text === "string" ? head.text : "",
@@ -3872,7 +4182,7 @@ async function hydrateTurnTapeMessages(
         ...(header.clientMessageId ? { _clientMessageId: header.clientMessageId } : {}),
         ...(typeof anchor._seq === "number" ? { _seq: anchor._seq } : {}),
         ...(typeof anchor._orderSeq === "number" ? { _orderSeq: anchor._orderSeq } : {}),
-      };
+      }, header, anchor.usage);
       return [message];
     }
     const expectedPhysical = anchor._turnTapePhysicalRecordCount ?? anchor._turnTapeRecordCount;
@@ -5110,6 +5420,11 @@ type UnifiedTimelineTapeHeader = {
   materializationStatus: string | null;
   finalizedAt: string | null;
   visibleHead: VisibleHead | null;
+  usage?: unknown;
+  requestId?: string | null;
+  costCredits?: string;
+  waiverApplied?: boolean;
+  delegates?: Array<{ agentId: string; costCredits: string }>;
 };
 
 type UnifiedTimelineTapeHead = DirectTapePageHead & {
@@ -5286,7 +5601,7 @@ async function readUnifiedTimelineTapeHeaders(
       [sessionId, userId, tapeIds],
     )
   ).rows;
-  return new Map(rows.map((row) => [row.tape_id, {
+  const headers = new Map(rows.map((row) => [row.tape_id, {
     tapeId: row.tape_id,
     tapeSha256: row.tape_sha256,
     billingAnchorId: row.billing_anchor_id,
@@ -5297,6 +5612,8 @@ async function readUnifiedTimelineTapeHeaders(
     finalizedAt: (row as { finalized_at?: string | null }).finalized_at ?? null,
     visibleHead: ((row as { visible_head?: VisibleHead | null }).visible_head ?? null),
   }]));
+  await mergeTapeFallbackSettlements(client, sessionId, userId, headers);
+  return headers;
 }
 
 async function readUnifiedTimelineTapeHeads(
@@ -5620,10 +5937,17 @@ function unifiedTimelineTapeFallbackMessages(
   const picked = pickTapeDisplayFallbackText({
     visibleHead: unit.header?.visibleHead,
     anchorText: unit.anchor.text,
+    reason: unit.reason,
   });
   const reason: TapeDisplayDegradeReason = !unit.header
     ? (unit.reason === "finalized_tape_missing" ? "header_missing" : unit.reason)
-    : (picked.source === "placeholder" && !unit.header.visibleHead ? "visible_head_missing" : unit.reason);
+    : (
+      picked.source === "placeholder"
+      && !unit.header.visibleHead
+      && unit.reason !== "records_unpublished"
+        ? "visible_head_missing"
+        : unit.reason
+    );
   warnTapeDisplayDegrade({
     sessionId,
     tapeId: unit.tapeId,
@@ -5639,7 +5963,7 @@ function unifiedTimelineTapeFallbackMessages(
   const ts = typeof head?.ts === "number" && Number.isFinite(head.ts)
     ? head.ts
     : (typeof unit.anchor.ts === "number" && Number.isFinite(unit.anchor.ts) ? unit.anchor.ts : 0);
-  return [{
+  return [attachFallbackSettlementUsage({
     id,
     role: "assistant",
     text: picked.text,
@@ -5665,7 +5989,9 @@ function unifiedTimelineTapeFallbackMessages(
         ? { _clientMessageId: unit.anchor._clientMessageId }
         : {})),
     ...(typeof head?.errorCode === "string" ? { _errorCode: head.errorCode } : {}),
-  }];
+    ...(reason === "records_unpublished" ? { _recordsPending: true } : {}),
+    ...(head?.partial === true ? { _visibleHeadPartial: true } : {}),
+  }, unit.header, unit.anchor.usage)];
 }
 
 async function hydrateUnifiedTimelineTapeUnits(
@@ -6745,6 +7071,62 @@ async function readBoundedLiveFrameText(
   }
 }
 
+
+function recoveredAssistantTextFromPrepared(prepared: PreparedLosslessTurnTape): string {
+  for (let i = prepared.turn.records.length - 1; i >= 0; i--) {
+    const rec = prepared.turn.records[i]!;
+    if (rec.role !== "assistant") continue;
+    const text = typeof rec.payload.text === "string" ? rec.payload.text : "";
+    if (text.trim().length === 0) continue;
+    const errorCode = typeof rec.payload._errorCode === "string" ? rec.payload._errorCode : "";
+    if (rec.payload._isError === true && (text === errorCode || text === "USER_CANCELLED")) {
+      continue;
+    }
+    return text;
+  }
+  return "";
+}
+
+async function backfillEmptyVisibleHeadFromPrepared(
+  pool: Pool,
+  userId: string,
+  request: LosslessTurnTapeFinalizeRequest,
+  prepared: PreparedLosslessTurnTape,
+): Promise<void> {
+  const recovered = recoveredAssistantTextFromPrepared(prepared);
+  if (recovered.length === 0) return;
+  const current = (
+    await pool.query<{ visible_head: VisibleHead | null }>(
+      `SELECT visible_head
+         FROM client_session_turn_tapes
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+      [request.sessionId, userId, request.tapeId],
+    )
+  ).rows[0]?.visible_head;
+  const existingText = typeof current?.text === "string" ? current.text : "";
+  if (existingText.length > 0) return;
+  const clipped = clipVisibleText(recovered);
+  const next: VisibleHead = {
+    role: "assistant",
+    text: clipped.text,
+    ts: typeof current?.ts === "number" ? current.ts : request.createdAt,
+    messageId: typeof current?.messageId === "string" && current.messageId.length > 0
+      ? current.messageId
+      : prepared.turn.billingAnchorId,
+    ...(current?.clientMessageId ? { clientMessageId: current.clientMessageId } : {}),
+    ...(current?.errorCode !== undefined ? { errorCode: current.errorCode } : {}),
+    ...(current?.truncated || clipped.truncated ? { truncated: true } : {}),
+    partial: true,
+  };
+  await pool.query(
+    `UPDATE client_session_turn_tapes
+        SET visible_head=$4::jsonb
+      WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
+        AND COALESCE(visible_head->>'text', '') = ''`,
+    [request.sessionId, userId, request.tapeId, JSON.stringify(next)],
+  );
+}
+
 export async function commitVisibleLosslessTurnPhaseA(
   pool: Pool,
   userId: string,
@@ -6924,24 +7306,41 @@ export async function commitVisibleLosslessTurnPhaseA(
         ...(replayLate ? { dispatchLateTape: true, settlementHeld: true } : {}),
       };
     }
-    const liveFrameText = settlement
+    const settlementText = settlement?.text ?? "";
+    const liveFrameText = settlementText.length > 0
       ? ""
       : await readBoundedLiveFrameText(client, tape.dispatch_id);
     const visibleText = phaseAVisibleHeadText({
-      hasSettlement: Boolean(settlement),
-      settlementText: settlement?.text,
+      hasSettlement: Boolean(settlement) && settlementText.length > 0,
+      settlementText,
       liveFrameText,
     });
     const head = settlement
-      ? visibleHeadFromSettlement(request, settlement, clientMessageId)
+      ? visibleHeadFromSettlement(request, {
+          ...settlement,
+          text: settlementText.length > 0 ? settlementText : visibleText,
+        }, clientMessageId)
       : visibleHeadFallback(request, visibleText, clientMessageId);
+    if (settlement && settlementText.length === 0 && visibleText.length > 0) {
+      head.partial = true;
+    }
+    const visibleRequestId = settlement?.requestId
+      ?? (engineBillings[0] && typeof engineBillings[0].requestId === "string"
+        ? engineBillings[0].requestId
+        : undefined);
+    const visibleUsage = visibleRequestId ? { traceId: visibleRequestId } : null;
     await client.query(
       `UPDATE client_session_turn_tapes
           SET visible_at=$1, visible_head=$2::jsonb,
               billing_anchor_id=COALESCE(billing_anchor_id,$3),
               engine_billings=CASE WHEN $4::jsonb <> '[]'::jsonb THEN $4::jsonb ELSE engine_billings END,
               settlement_hash=COALESCE(settlement_hash,$6),
-              client_message_id=COALESCE(client_message_id,$5)
+              client_message_id=COALESCE(client_message_id,$5),
+              usage=CASE
+                WHEN $10::jsonb IS NULL THEN usage
+                WHEN usage IS NULL OR usage = '{}'::jsonb THEN $10::jsonb
+                ELSE usage
+              END
         WHERE session_id=$7 AND user_id=$8 AND tape_id=$9`,
       [
         Date.now(),
@@ -6953,6 +7352,7 @@ export async function commitVisibleLosslessTurnPhaseA(
         request.sessionId,
         userId,
         request.tapeId,
+        visibleUsage ? JSON.stringify(visibleUsage) : null,
       ],
     );
     let existingMessages: MessageLike[];
@@ -6990,6 +7390,7 @@ export async function commitVisibleLosslessTurnPhaseA(
       anchors = [{
         ...tapeAnchor(stubRecord as never, request.tapeId, request.tapeSha256, 1, 1, undefined, []),
         text: head.text,
+        ...(visibleUsage ? { usage: visibleUsage } : {}),
       }];
       const recordIds = new Set([billingAnchorId]);
       existingMessages = existingMessages.filter(
@@ -7849,7 +8250,11 @@ export function createPgSessionsBackend(
       );
       let phaseA: LosslessTurnTapeFinalizeResult | null = null;
       if (readyForPreparation) {
-        phaseA = await commitVisibleLosslessTurnPhaseA(pool, userId, request);
+        // HTTP action:finalize (materialize:false) is the job's creation point.
+        // Worker Phase B must not re-enqueue, or ON CONFLICT would stomp a live lease.
+        phaseA = await commitVisibleLosslessTurnPhaseA(pool, userId, request, {
+          enqueueMaterialization: finalizeOptions?.materialize === false,
+        });
         if (phaseA.applied === "session_not_found" || phaseA.applied === "session_deleted" || phaseA.applied === "incomplete") {
           return phaseA;
         }
@@ -7878,6 +8283,7 @@ export function createPgSessionsBackend(
               );
           if (prepared) {
             preparedModelRecordCount = preparedModelSidecarManifest(prepared).length;
+            await backfillEmptyVisibleHeadFromPrepared(pool, userId, request, prepared);
             await _stagePreparedLosslessTurnRecords(
               pool,
               userId,
@@ -8420,14 +8826,14 @@ export function createPgSessionsBackend(
         // is not part of this atomic finalize operation.
         const preUpgradeMessages = existingMessages;
         const recordIds = new Set(allRecordIds);
-        existingMessages = existingMessages.filter(
-          (message) =>
-            message?._turnTapeId !== request.tapeId &&
-            (typeof message?.id !== "string" || !recordIds.has(message.id)),
-        );
-        const plan = planAppendServerAuthoredBatch(
-          existingMessages,
+        const removePhaseAOrLegacy = (message: MessageLike): boolean =>
+          message?._turnTapeId === request.tapeId ||
+          (typeof message?.id === "string" && recordIds.has(message.id));
+        existingMessages = existingMessages.filter((message) => !removePhaseAOrLegacy(message));
+        const plan = planReplaceServerAuthoredKeepingOrderSlots(
+          preUpgradeMessages,
           anchors,
+          removePhaseAOrLegacy,
           typeof session.next_seq === "number" && session.next_seq > 0 ? session.next_seq : 1,
           bigIntNumOr(session.archived_through_seq, 0),
         );

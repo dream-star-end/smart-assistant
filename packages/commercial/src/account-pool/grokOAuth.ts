@@ -2,7 +2,7 @@
 import type { Pool } from 'pg'
 import { request, type Dispatcher } from 'undici'
 import { getPool } from '../db/index.js'
-import { resolveOfficialOAuthAccountEgressDispatcher } from './codexEgress.js'
+import { directEgressDispatcher } from './egressDispatcher.js'
 import {
   getGrokTokenSnapshotInTx,
   updateGrokTokenSnapshotInTx,
@@ -56,8 +56,8 @@ export async function getFreshGrokAccessToken(
     if (!snapshot.refresh || snapshot.refresh.length === 0) {
       throw new Error('GROK_REFRESH_TOKEN_MISSING')
     }
-    const route = await (deps.resolveDispatcher ?? (async (id) =>
-      resolveOfficialOAuthAccountEgressDispatcher(id, 'grok')))(accountId)
+    const route = await (deps.resolveDispatcher ?? (async () =>
+      ({ dispatcher: directEgressDispatcher() })))(accountId)
     const form = new URLSearchParams({
       grant_type: 'refresh_token',
       refresh_token: snapshot.refresh.toString('utf8'),

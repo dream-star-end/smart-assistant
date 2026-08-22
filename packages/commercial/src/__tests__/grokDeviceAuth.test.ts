@@ -71,6 +71,20 @@ test('device-login child gets only controlled environment keys', () => {
   assert.equal(env.OPENCLAUDE_V3_CONTAINER_TOKEN, undefined)
 })
 
+test('device-login omits proxy env when no egress URL is provided', () => {
+  const env = buildGrokDeviceAuthEnv('/tmp/home', '/tmp/home/.grok', undefined, {
+    PATH: '/test/bin',
+    HTTPS_PROXY: 'http://should-not-inherit:1',
+    DATABASE_URL: 'postgres://secret',
+  })
+  assert.equal(env.HTTPS_PROXY, undefined)
+  assert.equal(env.HTTP_PROXY, undefined)
+  assert.equal(env.https_proxy, undefined)
+  assert.equal(env.http_proxy, undefined)
+  assert.equal(env.NO_PROXY, undefined)
+  assert.equal(env.DATABASE_URL, undefined)
+})
+
 test('device-login helper captures the official URL and consumes the resulting auth file once', async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'oc-grok-device-test-'))
   const fake = path.join(dir, 'fake-grok.cjs')

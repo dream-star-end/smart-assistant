@@ -26,6 +26,7 @@ import {
   appendServerAuthoredPure,
   ARCHIVE_CHUNK_MAX_BYTES,
   ARCHIVE_CHUNK_MAX_MSGS,
+  compareMessagesByOrder,
   MAX_SESSION_BYTES,
   type MessageLike,
   mergePreservingServerAuthored,
@@ -248,6 +249,90 @@ export function planAppendServerAuthoredBatch(
     currentArchivedThroughSeq,
   )
   const spill = planSpillOverflow(normalized.messages, currentArchivedThroughSeq)
+  const finalJson = JSON.stringify(spill.tail)
+  if (Buffer.byteLength(finalJson, 'utf8') > MAX_SESSION_BYTES) {
+    return { kind: 'oversized' }
+  }
+  return {
+    kind: 'write',
+    tail: spill.tail,
+    finalJson,
+    nextSeq: normalized.nextSeq,
+    archivedThroughSeq: spill.archivedThroughSeq,
+    chunksToInsert: spill.chunksToInsert,
+    idsToInsert: spill.idsToInsert,
+  }
+}
+
+function pickFrozenOrderSeq(removed: readonly MessageLike[]): number | undefined {
+  const isValid = (value: unknown): value is number =>
+    typeof value === 'number' && Number.isSafeInteger(value) && value > 0
+  const tapeRows = removed.filter(
+    (message) => typeof message?._turnTapeId === 'string' && message._turnTapeId.length > 0,
+  )
+  const pool = tapeRows.length > 0 ? tapeRows : removed
+  let frozen: number | undefined
+  for (const message of pool) {
+    const orderSeq = message?._orderSeq
+    if (!isValid(orderSeq)) continue
+    if (frozen === undefined || orderSeq < frozen) frozen = orderSeq
+  }
+  return frozen
+}
+
+/**
+ * Phase B tape publication: replace the Phase A / dispatch hot anchor without
+ * allocating a new display `_orderSeq` from `next_seq`. `_seq` still advances
+ * as the content-version cursor.
+ *
+ * `existingMsgs` must be the pre-filter snapshot so same-id replacements inherit
+ * the frozen slot and content changes still mint a fresh `_seq`.
+ */
+export function planReplaceServerAuthoredKeepingOrderSlots(
+  existingMsgs: MessageLike[],
+  replacements: Array<MessageLike & { id: string }>,
+  remove: (message: MessageLike) => boolean,
+  currentNextSeq: number,
+  currentArchivedThroughSeq: number,
+): AppendServerAuthoredBatchPlan {
+  const removed = existingMsgs.filter(remove)
+  const kept = existingMsgs.filter((message) => !remove(message))
+  const frozenOrderSeq = pickFrozenOrderSeq(removed)
+
+  let next = kept
+  let applied = false
+  for (const message of replacements) {
+    const result = appendServerAuthoredPure(next, message)
+    if (!result.applied) continue
+    next = result.messages
+    applied = true
+  }
+  if (!applied) return { kind: 'already_exists' }
+
+  const dedupedMessages = mergePreservingServerAuthored(next, next) as MessageLike[]
+  const normalized = normalizeAndAssignSeqs(
+    existingMsgs,
+    dedupedMessages,
+    currentNextSeq,
+    _warnSeqAnomaly,
+    currentArchivedThroughSeq,
+  )
+  const replacementIds = new Set(replacements.map((message) => message.id))
+  let messages = normalized.messages
+  if (frozenOrderSeq !== undefined) {
+    let stamped = false
+    messages = messages.map((message) => {
+      if (typeof message?.id === 'string' && replacementIds.has(message.id) && message._orderSeq !== frozenOrderSeq) {
+        stamped = true
+        return { ...message, _orderSeq: frozenOrderSeq }
+      }
+      return message
+    })
+    if (stamped) {
+      messages = [...messages].sort((a, b) => compareMessagesByOrder(a, b))
+    }
+  }
+  const spill = planSpillOverflow(messages, currentArchivedThroughSeq)
   const finalJson = JSON.stringify(spill.tail)
   if (Buffer.byteLength(finalJson, 'utf8') > MAX_SESSION_BYTES) {
     return { kind: 'oversized' }

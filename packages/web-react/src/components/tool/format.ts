@@ -3,6 +3,7 @@
  * 端口自现网 messages.js 的 `_safeInput` / `_shortPath` / `_formatValue` 语义。
  */
 import type { BashTail } from "../../lib/chat/model";
+import { normalizeGrokToolForDisplay } from "./grokDisplay";
 import { parsePartialJson } from "./partialJson";
 
 /**
@@ -314,7 +315,7 @@ export function normalizeToolForDisplay(message: ToolLike): DisplayTool {
     if (normalized) return normalized;
   }
   const input = resolveToolInput(message);
-  return { name: originalName, input, tool: message };
+  return normalizeGrokToolForDisplay(originalName, input, message);
 }
 
 /** 取末 2-3 段路径（过长时 `…/a/b/c`）。 */

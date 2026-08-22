@@ -1,13 +1,15 @@
 import type { AllowedMove, Ticket, TicketMoveInfo } from '../../lib/taskboard'
 
 export const BACKLOG_DROP_ID = 'backlog'
+export const INBOX_DROP_ID = 'inbox'
 
 export function dropIdForMove(toStageId: string | null): string {
   return toStageId === null ? BACKLOG_DROP_ID : toStageId
 }
 
 export function stageIdFromDropId(dropId: string): string | null {
-  return dropId === BACKLOG_DROP_ID ? null : dropId
+  if (dropId === BACKLOG_DROP_ID || dropId === INBOX_DROP_ID) return null
+  return dropId
 }
 
 export function allowedDropIds(ticket: Ticket): Set<string> {
@@ -16,7 +18,9 @@ export function allowedDropIds(ticket: Ticket): Set<string> {
 
 /** 单据当前所在列。拖动时这列是「原地」而不是非法目标。 */
 export function homeDropId(ticket: Ticket): string {
-  return ticket.stageId == null ? BACKLOG_DROP_ID : dropIdForMove(ticket.stageId)
+  if (ticket.status === 'backlog' || ticket.stageId == null) return BACKLOG_DROP_ID
+  if (ticket.status === 'waiting_human') return INBOX_DROP_ID
+  return dropIdForMove(ticket.stageId)
 }
 
 export function moveForDestination(

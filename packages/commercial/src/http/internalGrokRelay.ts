@@ -9,7 +9,7 @@ import {
 } from '../auth/containerIdentity.js'
 import { resolveGrokRouteContext } from '../account-pool/groups.js'
 import { getFreshGrokAccessToken } from '../account-pool/grokOAuth.js'
-import { resolveOfficialOAuthAccountEgressDispatcher } from '../account-pool/codexEgress.js'
+import { directEgressDispatcher } from '../account-pool/egressDispatcher.js'
 import { query } from '../db/queries.js'
 import { ensureRequestId, REQUEST_ID_HEADER, setSecurityHeaders } from './util.js'
 
@@ -121,8 +121,11 @@ export function makeGrokRelayHandler(deps: {
     }, 60_000) : null
     renewTimer?.unref()
     try {
-      const route = await (deps.resolveDispatcher ?? (async (id) =>
-        resolveOfficialOAuthAccountEgressDispatcher(id, 'grok')))(context.accountId)
+      // Same selfhost workaround as device auth: xAI is reachable from the
+      // master host, but the bound sing-box egress is IPv6-only and RST.
+      // Explicit direct Agent also bypasses the process-global EnvHttpProxyAgent.
+      const route = await (deps.resolveDispatcher ?? (async () =>
+        ({ dispatcher: directEgressDispatcher() })))(context.accountId)
       accessToken = await (deps.freshToken ?? getFreshGrokAccessToken)(context.accountId)
       const upstream = await (deps.requestFn ?? request)(`${GROK_OFFICIAL_UPSTREAM_BASE_URL}${suffix}${parsed.search}`, {
         method: method as 'GET' | 'POST',

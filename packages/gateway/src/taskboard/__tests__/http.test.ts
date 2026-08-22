@@ -657,6 +657,52 @@ describe('PATCH /stages/:id 可写字段', () => {
   })
 })
 
+describe('PUT /pipelines/:id/reorder', () => {
+  it('human 一次请求重排；agent 403；缺项 400', async () => {
+    const db = freshDb()
+    let pipelineId = ''
+    let ids: string[] = []
+    await withServer(humanCtx(db), async (base) => {
+      const created = await call(base, 'POST', '/api/board/projects', { key: 'OCV5', name: 'V5' })
+      const projectId = (created.body.project as { id: string }).id
+      const listed = await call(base, 'GET', `/api/board/pipelines?projectId=${projectId}`)
+      const pipes = listed.body.items as Array<{ id: string; ticketType: string }>
+      const bug = pipes.find((p) => p.ticketType === 'bug')
+      assert.ok(bug)
+      pipelineId = bug.id
+      const stagesRes = await call(base, 'GET', `/api/board/pipelines/${pipelineId}/stages`)
+      const stages = stagesRes.body.items as Array<{ id: string; ordinal: number }>
+      assert.ok(stages.length >= 2)
+      ids = stages.map((s) => s.id).reverse()
+      const res = await call(base, 'PUT', `/api/board/pipelines/${pipelineId}/reorder`, {
+        orderedIds: ids,
+      })
+      assert.equal(res.status, 200, JSON.stringify(res.body))
+      const items = res.body.items as Array<{ id: string; ordinal: number }>
+      assert.deepEqual(
+        items.map((s) => s.id),
+        ids,
+      )
+      assert.deepEqual(
+        items.map((s) => s.ordinal),
+        ids.map((_, i) => i),
+      )
+      const missing = await call(base, 'PUT', `/api/board/pipelines/${pipelineId}/reorder`, {
+        orderedIds: ids.slice(1),
+      })
+      assert.equal(missing.status, 400)
+    })
+    await withServer(agentCtx(db), async (base) => {
+      const forbidden = await call(base, 'PUT', `/api/board/pipelines/${pipelineId}/reorder`, {
+        orderedIds: ids,
+      })
+      assert.equal(forbidden.status, 403)
+      assert.equal(forbidden.body.code, 'forbidden')
+    })
+    db.close()
+  })
+})
+
 describe('stage 写路径校验', () => {
   it('绑定 hidden-reviewer → 400', async () => {
     const db = freshDb()

@@ -142,10 +142,14 @@ export function checkDailyBudget(
   const runsHit = usage.runsToday >= settings.maxRunsPerDay
   const costHit =
     settings.maxCostPerDayUsd != null && usage.costTodayUsd >= settings.maxCostPerDayUsd
-  if (!runsHit && !costHit) return { ok: true }
+  const unpricedHit =
+    settings.maxCostPerDayUsd != null && (usage.unpricedRunsToday ?? 0) > 0
+  if (!runsHit && !costHit && !unpricedHit) return { ok: true }
   const why = runsHit
     ? `今日 run 数 ${usage.runsToday} 已达上限 ${settings.maxRunsPerDay}`
-    : `今日成本 $${usage.costTodayUsd.toFixed(4)} 已达上限 $${settings.maxCostPerDayUsd}`
+    : unpricedHit && !costHit
+      ? `今日有 ${usage.unpricedRunsToday} 次缺价 run，美元预算无法生效，已暂停巡检`
+      : `今日成本 $${usage.costTodayUsd.toFixed(4)} 已达上限 $${settings.maxCostPerDayUsd}`
   return {
     ok: false,
     skipReason: 'budget_exhausted',

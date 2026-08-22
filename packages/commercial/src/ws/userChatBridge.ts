@@ -158,6 +158,11 @@ import {
   DISPATCH_LEASE_HEARTBEAT_MS,
 } from "../dispatch/turnDispatchStore.js";
 import {
+  HELLO_LIVE_CATCHUP_MAX_BYTES,
+  liveCatchupSendDecision,
+  readOpenDispatchLiveFramePayloadsAfterSeq,
+} from "../db/liveTurnFrames.js";
+import {
   admitDurableControl,
   claimDueTurnControls,
   markTurnControlReceipt,
@@ -300,6 +305,10 @@ export const DEFAULT_MAX_FRAME_BYTES = 448 * 1024 * 1024;
 const HELLO_TERMINAL_NOTIFY_MAX_CANDIDATES = 8;
 /** clientMessageId 长度硬顶。先挡住无界字符串(单帧上限 448 MiB),再跑格式校验。 */
 const HELLO_TERMINAL_NOTIFY_MAX_CLIENT_MESSAGE_ID_LEN = 200;
+/** 单条 hello 最多从 PG 补齐这么多会话的在飞 live frames。 */
+const HELLO_LIVE_CATCHUP_MAX_SESSIONS = 8;
+/** 单会话 hello 补齐帧数封顶,与 GET live-frames 页大小对齐。 */
+const HELLO_LIVE_CATCHUP_MAX_FRAMES = 500;
 
 export const PROMPT_QUEUE_DISPATCH_REQUEST_TYPE = "outbound.prompt_queue.dispatch_request";
 export const PROMPT_QUEUE_DISPATCH_RESULT_TYPE = "outbound.prompt_queue.dispatch_result";
@@ -1507,6 +1516,25 @@ export function _sanitizeMasterHistoricalMessagesForFrame(
   return rows;
 }
 
+type InboundTurnIdentity = { peerId: string | null; clientMessageId: string | null };
+
+function inboundTurnIdentityFromParsed(parsed: unknown): InboundTurnIdentity {
+  if (parsed === null || typeof parsed !== "object") {
+    return { peerId: null, clientMessageId: null };
+  }
+  const peerObj = (parsed as { peer?: { id?: unknown } }).peer;
+  const peerIdRaw = peerObj && typeof peerObj === "object"
+    ? (peerObj as { id?: unknown }).id
+    : undefined;
+  const peerId = typeof peerIdRaw === "string" && peerIdRaw !== "" ? peerIdRaw : null;
+  const clientMessageId = isClientMessageId(
+    (parsed as { clientMessageId?: unknown }).clientMessageId,
+  )
+    ? (parsed as { clientMessageId: string }).clientMessageId
+    : null;
+  return { peerId, clientMessageId };
+}
+
 function sendErrorFrame(
   ws: WebSocket,
   code: string,
@@ -1835,6 +1863,56 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
    * 期间的 ws 不在这里,因为没有跑到 startBridge 里 registry.register。
    */
   const uidToUserWs = new Map<string, Set<WebSocket>>();
+  /**
+   * uid+session → 当前已 hello 订阅该会话的 OPEN user WS。
+   * forwardCommittedFrame 按此扇出,而不是绑在受理时捕获的那一根 userWs 上。
+   * key = `${uid}\0${sessionId}`:同一 uid 的其它会话、其它 uid 都进不了这个集合。
+   */
+  const sessionToUserWs = new Map<string, Set<WebSocket>>();
+  const userWsToSessionKeys = new Map<WebSocket, Set<string>>();
+
+  const sessionFanoutKey = (userId: string, sessionId: string): string =>
+    `${userId}\0${sessionId}`;
+
+  const registerUserWsSession = (ws: WebSocket, userId: string, sessionId: string): void => {
+    if (sessionId.length < 1 || sessionId.length > 512) return;
+    const key = sessionFanoutKey(userId, sessionId);
+    let subscribers = sessionToUserWs.get(key);
+    if (!subscribers) {
+      subscribers = new Set();
+      sessionToUserWs.set(key, subscribers);
+    }
+    subscribers.add(ws);
+    let owned = userWsToSessionKeys.get(ws);
+    if (!owned) {
+      owned = new Set();
+      userWsToSessionKeys.set(ws, owned);
+    }
+    owned.add(key);
+  };
+
+  const unregisterUserWsSessions = (ws: WebSocket): void => {
+    const owned = userWsToSessionKeys.get(ws);
+    if (!owned) return;
+    userWsToSessionKeys.delete(ws);
+    for (const key of owned) {
+      const subscribers = sessionToUserWs.get(key);
+      if (!subscribers) continue;
+      subscribers.delete(ws);
+      if (subscribers.size === 0) sessionToUserWs.delete(key);
+    }
+  };
+
+  const openUserWsForSession = (userId: string, sessionId: string | null): WebSocket[] => {
+    if (sessionId === null || sessionId.length < 1) return [];
+    const subscribers = sessionToUserWs.get(sessionFanoutKey(userId, sessionId));
+    if (!subscribers || subscribers.size === 0) return [];
+    const open: WebSocket[] = [];
+    for (const candidate of subscribers) {
+      if (candidate.readyState === WebSocket.OPEN) open.push(candidate);
+    }
+    return open;
+  };
   const uidToContainerWs = new Map<string, Set<WebSocket>>();
   const uidToRecoveryExecutors = new Map<
     string,
@@ -2684,6 +2762,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       authorityTurnId?: string;
       log: Logger | null;
       onReject?: (code: string) => void;
+      turn?: InboundTurnIdentity;
       /** 拒帧时的补偿(abort journal / release preCheck / 还槽);无预扣的路径不传。 */
       compensate?: (reason: string) => Promise<void> | void;
     }): Promise<Record<string, unknown> | null> => {
@@ -2699,7 +2778,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           });
         }
         if (!cleaned && userWs.readyState === WebSocket.OPEN) {
-          sendErrorFrame(userWs, code, message);
+          sendErrorFrame(userWs, code, message, args.turn);
         }
         return null;
       };
@@ -2755,11 +2834,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       classifiedCodex: boolean;
       log: Logger | null;
       onReject?: (code: string) => void;
+      turn?: InboundTurnIdentity;
     }): Promise<ResolvedTurnExecution | null> => {
       const reject = (code: string, message: string): null => {
         args.onReject?.(code);
         if (!cleaned && userWs.readyState === WebSocket.OPEN) {
-          sendErrorFrame(userWs, code, message);
+          sendErrorFrame(userWs, code, message, args.turn);
         }
         return null;
       };
@@ -3910,6 +3990,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 userWs,
                 "GOAL_STATE_UNAVAILABLE",
                 "goal state unavailable, retry this turn shortly",
+                { peerId, clientMessageId },
               );
             }
             // B3(R3):受理后 goal 出口 —— 就地终态化(明确失败码),置空后 finally 不再重复。
@@ -4100,6 +4181,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // peer plus clientMessageId; missing peer falls back to a bridge-local
       // sentinel and therefore only has timeout/cleanup release safety.
       let inboundPeerIdForFrame: string | null = null;
+      let inboundTurnIdentityForFrame: InboundTurnIdentity = { peerId: null, clientMessageId: null };
       // PR2 v1.0.66 — 把 codex 计费需要用到的 frame 字段提到外层(下面 IIFE 用):
       //   inboundParsedFrame:rewrite 帧塞 server requestId 时复用,免再次 JSON.parse
       //   inboundAgentIdForFrame:agent_cost_overrides 查 multiplier 时用,缺省回退 'codex'
@@ -4390,6 +4472,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             // 这里只收集候选,查询必须等 hello 转发之后再跑。
             const terminalNotifyCandidates: Array<{ peerId: string; clientMessageId: string }> = [];
             const terminalNotifySeen = new Set<string>();
+            const liveCatchupSessions: Array<{ sessionId: string; afterFrameSeq: number }> = [];
+            const liveCatchupSeen = new Set<string>();
             for (const p of visiblePeers) {
               if (typeof p !== "object" || p === null) continue;
               const peer = p as {
@@ -4400,6 +4484,18 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 inFlightClientMessageId?: unknown;
               };
               if (typeof peer.peerId !== "string") continue;
+              registerUserWsSession(userWs, uidStr, peer.peerId);
+              if (
+                !liveCatchupSeen.has(peer.peerId) &&
+                liveCatchupSessions.length < HELLO_LIVE_CATCHUP_MAX_SESSIONS
+              ) {
+                liveCatchupSeen.add(peer.peerId);
+                const afterFrameSeq =
+                  typeof peer.lastFrameSeq === "number" && Number.isSafeInteger(peer.lastFrameSeq)
+                    ? Math.max(0, peer.lastFrameSeq)
+                    : 0;
+                liveCatchupSessions.push({ sessionId: peer.peerId, afterFrameSeq });
+              }
               const inFlightId = peer.inFlightClientMessageId;
               // peers 来自客户端。协议规定 inFlightClientMessageId 仅在
               // inFlight===true 时携带,且为短 uuid;不校验就会被无界字符串/
@@ -4532,6 +4628,53 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 }
               })().catch(() => {});
             }
+            if (liveCatchupSessions.length > 0 && deps.pgPool) {
+              const pgPool = deps.pgPool;
+              void (async () => {
+                try {
+                  await Promise.resolve();
+                  for (const { sessionId, afterFrameSeq } of liveCatchupSessions) {
+                    if (userWs.readyState !== WebSocket.OPEN) break;
+                    const catchupItems = await readOpenDispatchLiveFramePayloadsAfterSeq(pgPool, {
+                      uid,
+                      sessionId,
+                      afterFrameSeq,
+                      limit: HELLO_LIVE_CATCHUP_MAX_FRAMES,
+                      maxBytes: Math.min(maxBufferedBytes, HELLO_LIVE_CATCHUP_MAX_BYTES),
+                    });
+                    let catchupBackpressured = false;
+                    for (const item of catchupItems) {
+                      if (item.kind === "oversize") {
+                        catchupBackpressured = true;
+                        break;
+                      }
+                      const payload = item.payload;
+                      if (parseLeftoverHotWsPayload(payload)) continue;
+                      const decision = liveCatchupSendDecision(
+                        userWs.readyState,
+                        userWs.bufferedAmount,
+                        Buffer.byteLength(payload, "utf8"),
+                        maxBufferedBytes,
+                      );
+                      if (decision === "stop") break;
+                      if (decision === "backpressure") {
+                        catchupBackpressured = true;
+                        break;
+                      }
+                      try { userWs.send(payload); } catch { break; }
+                    }
+                    // Slow/huge reconnect: close only this WS. Do not cleanup()
+                    // the admitting bridge — other uid+session sockets stay up.
+                    if (catchupBackpressured && userWs.readyState === WebSocket.OPEN) {
+                      try { userWs.close(CLOSE_BRIDGE.TOO_BIG, "backpressure"); } catch { /* */ }
+                      break;
+                    }
+                  }
+                } catch {
+                  // hello 补齐失败只能静默:不得挡转发、不得关连接。
+                }
+              })().catch(() => {});
+            }
             // Fall through to forwardInboundFrame below.
           }
           if (
@@ -4539,6 +4682,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             typeof parsed === "object" &&
             (parsed as { type?: unknown }).type === "inbound.message"
           ) {
+            inboundTurnIdentityForFrame = inboundTurnIdentityFromParsed(parsed);
+            inboundPeerIdForFrame = inboundTurnIdentityForFrame.peerId;
             const frameModelRaw = (parsed as { model?: unknown }).model;
             const frameModelId = typeof frameModelRaw === "string" ? frameModelRaw : null;
             const frameAgentIdRaw = (parsed as { agentId?: unknown }).agentId;
@@ -4553,6 +4698,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 userWs,
                 "AGENT_NOT_FOUND",
                 "agent not found",
+                inboundTurnIdentityForFrame,
               );
               try { userWs.close(CLOSE_BRIDGE.PRODUCT_POLICY, "hidden_agent_direct_chat"); } catch { /* */ }
               cleanup("client_close", true);
@@ -4582,6 +4728,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 userWs,
                 "UNRESOLVED_AGENT_MODEL",
                 `agent '${frameAgentId}' is not ready — repair its required capabilities and retry`,
+                inboundTurnIdentityForFrame,
               );
               try { userWs.close(CLOSE_BRIDGE.PRODUCT_POLICY, "agent_not_runtime_ready"); } catch { /* */ }
               cleanup("client_close", true);
@@ -4656,6 +4803,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 userWs,
                 "UNRESOLVED_AGENT_MODEL",
                 `cannot resolve model for agent '${effectiveFrameAgentId}' — retry shortly or specify a model`,
+                inboundTurnIdentityForFrame,
               );
               try { userWs.close(CLOSE_BRIDGE.PRODUCT_POLICY, "unresolved_agent_model"); } catch { /* */ }
               // 策略拒绝 → force final;此前无 codex inflight(本帧才进 acquire 路径),无 drain 价值
@@ -4729,11 +4877,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 ? (authorityDeps?.catalog.peek()?.isZcodeModel(authorityModelForFrame) ??
                    isZcodeEngineModel(effectiveModel))
                 : isZcodeEngineModel(effectiveModel);
-            // 提取 peer.id(用于 session-scoped admission 与 outbound 终态匹配)。
+            // peer.id was frozen at inbound.message entry for every turn-level
+            // error exit. AgentId is still only needed on engine-billed paths.
             if (isCodexInboundFrame || isCursorInboundFrame || isZcodeInboundFrame) {
-              const peerObj = (parsed as { peer?: { id?: unknown } }).peer;
-              const peerIdRaw = peerObj && typeof peerObj === "object" ? peerObj.id : undefined;
-              inboundPeerIdForFrame = typeof peerIdRaw === "string" ? peerIdRaw : null;
               // PR2 v1.0.66 — 把 agentId 提到外层供 codex billing IIFE 用
               // (查 agent_cost_overrides multiplier)。
               inboundAgentIdForFrame = effectiveFrameAgentId;
@@ -4875,17 +5021,23 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         const modelCapture = effectiveModelForFrame;
         const peerCapture = inboundPeerIdForFrame;
         const cid = containerId;
+        const cursorTurnIdentity = {
+          peerId: peerCapture,
+          clientMessageId: parsedCapture !== null && isClientMessageId(parsedCapture.clientMessageId)
+            ? parsedCapture.clientMessageId
+            : null,
+        };
         void (async () => {
           let dispatchRecord: AdmittedDispatch | undefined;
           try {
             if (!deps.pgPool || parsedCapture === null || traceCapture === null || !isCursorEngineModel(modelCapture)) {
               rejectPromptQueueDispatch('CURSOR_UNAVAILABLE');
-              sendErrorFrame(userWs, 'CURSOR_UNAVAILABLE', 'Cursor is unavailable for this account');
+              sendErrorFrame(userWs, 'CURSOR_UNAVAILABLE', 'Cursor is unavailable for this account', cursorTurnIdentity);
               return;
             }
             if (!isCursorCredentialMember(uid)) {
               rejectPromptQueueDispatch('UNAUTHORIZED_MODEL');
-              sendErrorFrame(userWs, 'UNAUTHORIZED_MODEL', 'Cursor is not enabled for this account');
+              sendErrorFrame(userWs, 'UNAUTHORIZED_MODEL', 'Cursor is not enabled for this account', cursorTurnIdentity);
               return;
             }
             // The local supervisor mounts the owner credential only on this
@@ -4898,7 +5050,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             );
             if (!eligible) {
               rejectPromptQueueDispatch('CURSOR_UNAVAILABLE');
-              sendErrorFrame(userWs, 'CURSOR_UNAVAILABLE', 'Cursor requires the account-owned local runtime');
+              sendErrorFrame(userWs, 'CURSOR_UNAVAILABLE', 'Cursor requires the account-owned local runtime', cursorTurnIdentity);
               return;
             }
             const enriched = await attachMasterTurnState(parsedCapture, logCapture, traceCapture, !isPromptQueueDispatch, rejectPromptQueueDispatch, authorityModelCapture, recoveryJob);
@@ -4908,7 +5060,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             if (authorityOn) {
               // resolveAuthorityExecOrReject's legacy boolean means "non-CCB"
               // (not literally Codex); Cursor is therefore classified true.
-              authorityExec = await resolveAuthorityExecOrReject({ model: authorityModelCapture, classifiedCodex: true, log: logCapture, onReject: rejectPromptQueueDispatch });
+              authorityExec = await resolveAuthorityExecOrReject({ model: authorityModelCapture, classifiedCodex: true, log: logCapture, onReject: rejectPromptQueueDispatch, turn: cursorTurnIdentity });
               if (
                 authorityExec === null
                 || authorityExec.engine !== 'cursor'
@@ -4926,7 +5078,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             );
             let authorityFields: Record<string, unknown> = {};
             if (authorityExec !== null) {
-              const sealed = await sealAuthorityFieldsOrReject({ exec: authorityExec, billingRequestId: requestId, log: logCapture, onReject: rejectPromptQueueDispatch });
+              const sealed = await sealAuthorityFieldsOrReject({ exec: authorityExec, billingRequestId: requestId, log: logCapture, onReject: rejectPromptQueueDispatch, turn: cursorTurnIdentity });
               if (sealed === null) { failDispatchPreForward(dispatchRecord, 'cursor_authority_seal_rejected'); return; }
               authorityFields = sealed;
             }
@@ -4938,7 +5090,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             logCapture?.error('user-chat-bridge: Cursor external admission failed', { err });
             failDispatchPreForward(dispatchRecord, 'cursor_external_admission_failed');
             rejectPromptQueueDispatch('CURSOR_UNAVAILABLE');
-            if (!cleaned && userWs.readyState === WebSocket.OPEN) sendErrorFrame(userWs, 'CURSOR_UNAVAILABLE', 'Cursor is temporarily unavailable');
+            if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+              sendErrorFrame(userWs, 'CURSOR_UNAVAILABLE', 'Cursor is temporarily unavailable', cursorTurnIdentity);
+            }
           }
         })();
         return;
@@ -4951,6 +5105,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         const modelCapture = effectiveModelForFrame;
         const peerCapture = inboundPeerIdForFrame;
         const cid = containerId;
+        const zcodeTurnIdentity = {
+          peerId: peerCapture,
+          clientMessageId: parsedCapture !== null && isClientMessageId(parsedCapture.clientMessageId)
+            ? parsedCapture.clientMessageId
+            : null,
+        };
         void (async () => {
           let dispatchRecord: AdmittedDispatch | undefined;
           let insertedRequestId: string | null = null;
@@ -4978,7 +5138,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             const publicCanonical = modelCapture === "glm-5.3-zai";
             if (!deps.pgPool || parsedCapture === null || traceCapture === null || typeof modelCapture !== "string" || (!canary && !publicCanonical)) {
               rejectPromptQueueDispatch('ZCODE_UNAVAILABLE');
-              sendErrorFrame(userWs, 'ZCODE_UNAVAILABLE', 'ZCode is unavailable for this account');
+              sendErrorFrame(userWs, 'ZCODE_UNAVAILABLE', 'ZCode is unavailable for this account', zcodeTurnIdentity);
               return;
             }
             const zcodeModelId = modelCapture;
@@ -4989,7 +5149,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             if (authorityOn) {
               // resolveAuthorityExecOrReject's legacy boolean means "non-CCB"
               // (not literally Codex); ZCode is therefore classified true.
-              authorityExec = await resolveAuthorityExecOrReject({ model: authorityModelCapture, classifiedCodex: true, log: logCapture, onReject: rejectPromptQueueDispatch });
+              authorityExec = await resolveAuthorityExecOrReject({ model: authorityModelCapture, classifiedCodex: true, log: logCapture, onReject: rejectPromptQueueDispatch, turn: zcodeTurnIdentity });
               if (
                 authorityExec === null
                 || authorityExec.engine !== 'zcode'
@@ -5002,7 +5162,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             const requestId = dispatchRecord ? dispatchRecord.billingRequestId : ensureRequestIdServerSide();
             if (!deps.mintZcodeRoute) {
               rejectPromptQueueDispatch('ZCODE_UNAVAILABLE');
-              sendErrorFrame(userWs, 'ZCODE_UNAVAILABLE', 'ZCode is unavailable for this account');
+              sendErrorFrame(userWs, 'ZCODE_UNAVAILABLE', 'ZCode is unavailable for this account', zcodeTurnIdentity);
               return;
             }
             let minted: { token: string; baseUrl: string };
@@ -5016,7 +5176,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             } catch (err) {
               logCapture?.error('user-chat-bridge: ZCode relay mint failed', { err });
               rejectPromptQueueDispatch('ZCODE_UNAVAILABLE');
-              sendErrorFrame(userWs, 'ZCODE_UNAVAILABLE', 'ZCode is temporarily unavailable');
+              sendErrorFrame(userWs, 'ZCODE_UNAVAILABLE', 'ZCode is temporarily unavailable', zcodeTurnIdentity);
               return;
             }
             pendingZcodeRelays.set(requestId, {
@@ -5039,7 +5199,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             }
             let authorityFields: Record<string, unknown> = {};
             if (authorityExec !== null) {
-              const sealed = await sealAuthorityFieldsOrReject({ exec: authorityExec, billingRequestId: requestId, log: logCapture, onReject: rejectPromptQueueDispatch });
+              const sealed = await sealAuthorityFieldsOrReject({ exec: authorityExec, billingRequestId: requestId, log: logCapture, onReject: rejectPromptQueueDispatch, turn: zcodeTurnIdentity });
               if (sealed === null) {
                 failDispatchPreForward(dispatchRecord, 'zcode_authority_seal_rejected');
                 deps.expireZcodeRoute?.(minted.token);
@@ -5072,7 +5232,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             failDispatchPreForward(dispatchRecord, 'zcode_external_admission_failed');
             rejectPromptQueueDispatch('ZCODE_UNAVAILABLE');
             await abortInserted("send_failed");
-            if (!cleaned && userWs.readyState === WebSocket.OPEN) sendErrorFrame(userWs, 'ZCODE_UNAVAILABLE', 'ZCode is temporarily unavailable');
+            if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+              sendErrorFrame(userWs, 'ZCODE_UNAVAILABLE', 'ZCode is temporarily unavailable', zcodeTurnIdentity);
+            }
           }
         })();
         return;
@@ -5086,6 +5248,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         const turnTraceIdCapture = turnTraceIdForFrame;
         const turnLogCapture = turnLogForFrame;
         const authorityModelCapture = authorityModelForFrame;
+        const annotatedTurnIdentity = inboundTurnIdentityForFrame;
         void (async () => {
           // M6:总括 try/catch —— 本 IIFE 无预扣/journal/槽,一切**意外**异常(签票 crypto /
           // JSON.stringify / forward 抛)必须收敛成「dispatch 终态化 + error 帧 + queue grant 取消」,
@@ -5096,7 +5259,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               rejectPromptQueueDispatch("ERR_INTERNAL");
               bridgeLog?.error("user-chat-bridge: annotated image frame missing trace invariant");
               if (!cleaned && userWs.readyState === WebSocket.OPEN) {
-                sendErrorFrame(userWs, "ERR_INTERNAL", "trace invariant violated");
+                sendErrorFrame(userWs, "ERR_INTERNAL", "trace invariant violated", annotatedTurnIdentity);
                 try { userWs.close(CLOSE_BRIDGE.INTERNAL, "trace invariant"); } catch { /* */ }
               }
               return;
@@ -5122,6 +5285,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 classifiedCodex: true,
                 log: turnLogCapture,
                 onReject: rejectPromptQueueDispatch,
+                turn: annotatedTurnIdentity,
               });
               if (authorityExec === null) {
                 failDispatchPreForward(dispatchRecordA, "authority_rejected");
@@ -5144,6 +5308,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 billingRequestId: requestId,
                 log: turnLogCapture,
                 onReject: rejectPromptQueueDispatch,
+                turn: annotatedTurnIdentity,
               });
               if (sealed === null) { failDispatchPreForward(dispatchRecordA, "authority_seal_rejected"); return; }
               authorityFields = sealed;
@@ -5168,7 +5333,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 rewrittenLen, max: maxFrameBytes,
               });
               if (!cleaned && userWs.readyState === WebSocket.OPEN) {
-                sendErrorFrame(userWs, "ERR_FRAME_TOO_BIG", `rewritten frame ${rewrittenLen} > max ${maxFrameBytes}`);
+                sendErrorFrame(userWs, "ERR_FRAME_TOO_BIG", `rewritten frame ${rewrittenLen} > max ${maxFrameBytes}`, annotatedTurnIdentity);
                 try { userWs.close(CLOSE_BRIDGE.TOO_BIG, "frame too big"); } catch { /* */ }
               }
               return;
@@ -5181,7 +5346,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             rejectPromptQueueDispatch("ERR_INTERNAL");
             failDispatchPreForward(dispatchRecordA, "annotated_image_unexpected_exception");
             if (!cleaned && userWs.readyState === WebSocket.OPEN) {
-              sendErrorFrame(userWs, "ERR_INTERNAL", "internal error");
+              sendErrorFrame(userWs, "ERR_INTERNAL", "internal error", annotatedTurnIdentity);
             }
           }
         })();
@@ -5313,6 +5478,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 classifiedCodex: true,
                 log: turnLogCapture,
                 onReject: rejectPromptQueueDispatch,
+                turn: turnIdentity,
               });
               if (authorityExec === null) return;
               if (!isCurrentCodexTurnState(codexTurnState)) return;
@@ -5829,6 +5995,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   ...(authorityTurnId === null ? {} : { authorityTurnId }),
                   log: turnLogCapture,
                   onReject: rejectPromptQueueDispatch,
+                  turn: turnIdentity,
                   // seal 只报告拒因；真正的资源补偿统一由下方 finally 状态机执行。
                   compensate: (reason) => { abandonReason = reason; },
                 });
@@ -5921,6 +6088,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   exec: authorityExec,
                   log: turnLogCapture,
                   onReject: rejectPromptQueueDispatch,
+                  turn: turnIdentity,
                   compensate: () => releaseAcquiredSlotForFailure(),
                 });
                 if (sealed === null) return;
@@ -6047,6 +6215,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         const turnLogCapture = turnLogForFrame;
         const authorityModelCapture = authorityModelForFrame;
         const classifiedCodexCapture = isCodexInboundFrame;
+        const ccbTurnIdentity = inboundTurnIdentityForFrame;
         void (async () => {
           // M6:总括 try/catch —— CCB turn 无预扣/journal/槽(计费在 egress 逐请求结算),一切
           // **意外**异常必须收敛成「dispatch 终态化 + error 帧 + queue grant 取消」,禁 unhandled rejection。
@@ -6066,6 +6235,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 classifiedCodex: classifiedCodexCapture,
                 log: turnLogCapture,
                 onReject: rejectPromptQueueDispatch,
+                turn: ccbTurnIdentity,
               });
               if (authorityExec === null) return;
             }
@@ -6109,6 +6279,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                     userWs,
                     "DURABLE_DISPATCH_UNAVAILABLE",
                     "durable dispatch attribution unavailable, retry this turn shortly",
+                    ccbTurnIdentity,
                   );
                 }
                 return;
@@ -6128,6 +6299,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 ...(authorityTurnId === undefined ? {} : { authorityTurnId }),
                 log: turnLogCapture,
                 onReject: rejectPromptQueueDispatch,
+                turn: ccbTurnIdentity,
               });
               if (sealed === null) { failDispatchPreForward(dispatchRecordC, "authority_seal_rejected"); return; }
               authorityFields = sealed;
@@ -6152,6 +6324,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   userWs,
                   "ERR_FRAME_TOO_BIG",
                   `rewritten frame ${rewrittenLen} > max ${maxFrameBytes}`,
+                  ccbTurnIdentity,
                 );
                 try { userWs.close(CLOSE_BRIDGE.TOO_BIG, "frame too big"); } catch { /* */ }
               }
@@ -6165,7 +6338,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             rejectPromptQueueDispatch("ERR_INTERNAL");
             failDispatchPreForward(dispatchRecordC, "ccb_inbound_unexpected_exception");
             if (!cleaned && userWs.readyState === WebSocket.OPEN) {
-              sendErrorFrame(userWs, "ERR_INTERNAL", "internal error");
+              sendErrorFrame(userWs, "ERR_INTERNAL", "internal error", ccbTurnIdentity);
             }
           }
         })();
@@ -7246,27 +7419,45 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             durableStampedFrame.payload,
           );
         }
-        if (userWs.readyState !== WebSocket.OPEN) return;
-        if (userWs.bufferedAmount + len > maxBufferedBytes) {
-          bridgeLog?.warn("user-chat-bridge: user-side backpressure", {
-            buffered: userWs.bufferedAmount, len,
-          });
-          try { userWs.close(CLOSE_BRIDGE.TOO_BIG, "backpressure"); } catch { /* */ }
-          cleanup("backpressure");
-          return;
-        }
-        try {
-          userWs.send(data, { binary: isBinary }, (err) => {
-            if (err) bridgeLog?.warn("user-chat-bridge: user send error", { err });
-          });
-          bytesCU += len;
-          bufferedCU = userWs.bufferedAmount;
-          metrics.onContainerFrame?.(uid, len, isBinary);
-          metrics.onBufferedBytes?.(uid, "container_to_user", bufferedCU);
-        } catch (err) {
-          bridgeLog?.warn("user-chat-bridge: user send threw", { err });
-          try { userWs.close(CLOSE_BRIDGE.INTERNAL, "user send failed"); } catch { /* */ }
-          cleanup("internal_error");
+        const sessionId = durableStampedFrame?.sessionId ?? null;
+        const recipients: WebSocket[] = [];
+        const seenRecipients = new Set<WebSocket>();
+        const addRecipient = (ws: WebSocket): void => {
+          if (ws.readyState !== WebSocket.OPEN || seenRecipients.has(ws)) return;
+          seenRecipients.add(ws);
+          recipients.push(ws);
+        };
+        // Session-scoped fan-out: every hello subscriber for this uid+session.
+        // The admitting socket is included only if it has subscribed or is
+        // still the sole pre-hello recipient below.
+        for (const ws of openUserWsForSession(uid.toString(), sessionId)) addRecipient(ws);
+        // Pre-hello first-token window: the producing connection has not
+        // registered a peer yet, so still deliver to the admitting socket.
+        if (sessionId === null || recipients.length === 0) addRecipient(userWs);
+        if (recipients.length === 0) return;
+
+        for (const dest of recipients) {
+          if (dest.bufferedAmount + len > maxBufferedBytes) {
+            bridgeLog?.warn("user-chat-bridge: user-side backpressure", {
+              buffered: dest.bufferedAmount, len,
+            });
+            try { dest.close(CLOSE_BRIDGE.TOO_BIG, "backpressure"); } catch { /* */ }
+            if (dest === userWs) cleanup("backpressure");
+            continue;
+          }
+          try {
+            dest.send(data, { binary: isBinary }, (err) => {
+              if (err) bridgeLog?.warn("user-chat-bridge: user send error", { err });
+            });
+            bytesCU += len;
+            if (dest === userWs) bufferedCU = dest.bufferedAmount;
+            metrics.onContainerFrame?.(uid, len, isBinary);
+            metrics.onBufferedBytes?.(uid, "container_to_user", dest.bufferedAmount);
+          } catch (err) {
+            bridgeLog?.warn("user-chat-bridge: user send threw", { err });
+            try { dest.close(CLOSE_BRIDGE.INTERNAL, "user send failed"); } catch { /* */ }
+            if (dest === userWs) cleanup("internal_error");
+          }
         }
       };
 
@@ -8123,6 +8314,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         try { userWs.terminate(); } catch { /* */ }
       }
       unregister();
+      unregisterUserWsSessions(userWs);
       {
         const key = uid.toString();
         const set = uidToUserWs.get(key);

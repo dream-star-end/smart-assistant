@@ -51,7 +51,7 @@ import {
   type OAuthProvider,
 } from "../../admin/oauth.js";
 import { AccountNotFoundError, type AccountRow } from "../../account-pool/store.js";
-import { getEgressProxyUrlPlaintext } from "../../admin/egressProxies.js";
+import { getEgressProxy } from "../../admin/egressProxies.js";
 import {
   cancelGrokDeviceAuth,
   getGrokDeviceAuthStatus,
@@ -695,10 +695,15 @@ export async function handleAdminGrokDeviceStart(
   if ((typeof proxyId !== "string" && typeof proxyId !== "number") || !/^[1-9][0-9]{0,19}$/.test(String(proxyId))) {
     throw new HttpError(400, "VALIDATION", "egress_proxy_id is required");
   }
-  const proxyUrl = await getEgressProxyUrlPlaintext(String(proxyId));
-  if (!proxyUrl) throw new HttpError(400, "VALIDATION", "egress proxy must exist and be active");
+  const proxy = await getEgressProxy(String(proxyId));
+  if (!proxy || proxy.status !== "active") {
+    throw new HttpError(400, "VALIDATION", "egress proxy must exist and be active");
+  }
   try {
-    sendJson(res, 200, await startGrokDeviceAuth({ proxyUrl }));
+    // Device-code login talks to auth.x.ai from the master host. The selected
+    // egress is still required so the saved account can bind it for relay, but
+    // a dead proxy must not block obtaining the token.
+    sendJson(res, 200, await startGrokDeviceAuth({}));
   } catch (err) {
     const code = err instanceof Error ? err.message : "GROK_DEVICE_AUTH_FAILED";
     throw new HttpError(503, "OAUTH_FAILED", code);

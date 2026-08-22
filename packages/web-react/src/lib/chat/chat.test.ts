@@ -4094,6 +4094,219 @@ describe("Phase-A final-only tape projection retry", () => {
     expect(syncSession).not.toHaveBeenCalled();
     sock.stop();
   });
+
+  test("records_unpublished full page keeps local live thinking/tool/plan and only adds final assistant", () => {
+    const sessionId = "s-degrade-keep-live";
+    const sock = makeSocket();
+    const sess = sock.ensureSession(sessionId, "main");
+    const clientMessageId = `u-${sessionId}`;
+    sess.messages = [
+      unpublishedTimeline(sessionId)[0]!,
+      {
+        id: `live-thinking-${sessionId}`,
+        role: "thinking",
+        text: "live reasoning",
+        ts: 2,
+        _clientMessageId: clientMessageId,
+      },
+      {
+        id: `live-tool-${sessionId}`,
+        role: "tool",
+        text: "",
+        toolName: "Bash",
+        output: "ok",
+        ts: 3,
+        _clientMessageId: clientMessageId,
+      },
+      {
+        id: `live-plan-${sessionId}`,
+        role: "plan",
+        text: "live plan",
+        ts: 4,
+        _clientMessageId: clientMessageId,
+      },
+    ];
+    sock.applyServerMessages(sessionId, "main", unpublishedTimeline(sessionId), true, 2, {
+      serverUpdatedAt: 2,
+      historyRevision: 1,
+      timelineGeneration: 2,
+      completedClientMessageId: clientMessageId,
+    });
+    expect(sess.messages.map((message) => message.role)).toEqual([
+      "user", "thinking", "tool", "plan", "assistant",
+    ]);
+    expect(sess.messages.some((message) => message.id === `live-thinking-${sessionId}`)).toBe(true);
+    expect(sess.messages.some((message) => message.id === `live-tool-${sessionId}`)).toBe(true);
+    expect(sess.messages.some((message) => message.id === `live-plan-${sessionId}`)).toBe(true);
+    expect(sess.messages.some((message) => message.role === "assistant" && message.text === "final answer")).toBe(true);
+    sock.stop();
+  });
+
+  test("complete tape without degrade replaces live thinking/tool/plan", () => {
+    const sessionId = "s-degrade-then-exact";
+    const sock = makeSocket();
+    const sess = sock.ensureSession(sessionId, "main");
+    const clientMessageId = `u-${sessionId}`;
+    sess.messages = [
+      unpublishedTimeline(sessionId)[0]!,
+      {
+        id: `live-thinking-${sessionId}`,
+        role: "thinking",
+        text: "live reasoning",
+        ts: 2,
+        _clientMessageId: clientMessageId,
+      },
+      {
+        id: `live-tool-${sessionId}`,
+        role: "tool",
+        text: "",
+        toolName: "Bash",
+        ts: 3,
+        _clientMessageId: clientMessageId,
+      },
+    ];
+    sock.applyServerMessages(sessionId, "main", unpublishedTimeline(sessionId), true, 2, {
+      serverUpdatedAt: 2,
+      historyRevision: 1,
+      timelineGeneration: 2,
+      completedClientMessageId: clientMessageId,
+    });
+    sock.applyServerMessages(sessionId, "main", exactTimeline(sessionId), true, 2, {
+      serverUpdatedAt: 3,
+      historyRevision: 2,
+      timelineGeneration: 3,
+      completedClientMessageId: clientMessageId,
+    });
+    expect(sess.messages.map((message) => message.role)).toEqual([
+      "user", "thinking", "tool", "plan", "assistant",
+    ]);
+    expect(sess.messages.some((message) => message.id === `live-thinking-${sessionId}`)).toBe(false);
+    expect(sess.messages.some((message) => message.id === `thinking-${sessionId}`)).toBe(true);
+    sock.stop();
+  });
+});
+
+describe("legacy type:error must not fall back to firstSession", () => {
+  afterEach(() => {
+    FakeWS.instances = [];
+    vi.unstubAllGlobals();
+  });
+
+  test("peer-less error binds the unique pre-admission in-flight session and clears it", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    const sessionA = sock.ensureSession("sess-a", "main");
+    const sessionB = sock.ensureSession("sess-b", "main");
+    sessionB._sendingInFlight = true;
+    sessionB._activeClientMessageId = "cm-b";
+    addMessage(sessionB, "user", "from B", { id: "cm-b", status: "sending", ts: 1 });
+    ws.onmessage?.({
+      data: JSON.stringify({
+        type: "error",
+        code: "MODEL_NOT_AVAILABLE",
+        message: "model not available: retired-model",
+      }),
+    });
+    expect(sessionA.messages.some((m) => m._errorCode)).toBe(false);
+    expect(sessionA._sendingInFlight).toBeFalsy();
+    expect(sessionB._sendingInFlight).toBe(false);
+    expect(sessionB._activeClientMessageId).toBeUndefined();
+    expect(sessionB.messages.some((m) => typeof m._errorCode === "string")).toBe(true);
+    sock.stop();
+  });
+
+  test("peer-less error is dropped when two sessions are pre-admission in-flight", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    const sessionA = sock.ensureSession("sess-a", "main");
+    const sessionB = sock.ensureSession("sess-b", "main");
+    sessionA._sendingInFlight = true;
+    sessionA._activeClientMessageId = "cm-a";
+    addMessage(sessionA, "user", "from A", { id: "cm-a", status: "sending", ts: 1 });
+    sessionB._sendingInFlight = true;
+    sessionB._activeClientMessageId = "cm-b";
+    addMessage(sessionB, "user", "from B", { id: "cm-b", status: "sending", ts: 1 });
+    ws.onmessage?.({
+      data: JSON.stringify({
+        type: "error",
+        code: "MODEL_NOT_AVAILABLE",
+        message: "model not available: retired-model",
+      }),
+    });
+    expect(sessionA._sendingInFlight).toBe(true);
+    expect(sessionB._sendingInFlight).toBe(true);
+    expect(sessionA.messages.some((m) => m._errorCode)).toBe(false);
+    expect(sessionB.messages.some((m) => m._errorCode)).toBe(false);
+    sock.stop();
+  });
+
+  test("peer-less error is dropped when the unique in-flight session already has durable admission", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    const sessionA = sock.ensureSession("sess-a", "main");
+    const sessionB = sock.ensureSession("sess-b", "main");
+    sessionB._sendingInFlight = true;
+    sessionB._activeClientMessageId = "cm-b";
+    addMessage(sessionB, "user", "from B", { id: "cm-b", status: "sending", ts: 1 });
+    ws.onmessage?.({
+      data: JSON.stringify({
+        type: "outbound.ack",
+        admitted: true,
+        peer: { id: "sess-b", kind: "dm" },
+        clientMessageId: "cm-b",
+      }),
+    });
+    expect(sessionB._sendingInFlight).toBe(true);
+    ws.onmessage?.({
+      data: JSON.stringify({
+        type: "error",
+        code: "MODEL_NOT_AVAILABLE",
+        message: "model not available: retired-model",
+      }),
+    });
+    expect(sessionA.messages.some((m) => m._errorCode)).toBe(false);
+    expect(sessionB._sendingInFlight).toBe(true);
+    expect(sessionB._activeClientMessageId).toBe("cm-b");
+    sock.stop();
+  });
+
+  test("Cursor rejection with peer+clientMessageId clears session B only", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    const sessionA = sock.ensureSession("sess-a", "main");
+    const sessionB = sock.ensureSession("sess-b", "main");
+    sessionA._sendingInFlight = false;
+    sessionB._sendingInFlight = true;
+    sessionB._activeClientMessageId = "cm-b";
+    addMessage(sessionB, "user", "from B", { id: "cm-b", status: "sending", ts: 1 });
+    ws.onmessage?.({
+      data: JSON.stringify({
+        type: "error",
+        code: "CURSOR_UNAVAILABLE",
+        message: "Cursor requires the account-owned local runtime",
+        peer: { id: "sess-b", kind: "dm" },
+        clientMessageId: "cm-b",
+      }),
+    });
+    expect(sessionA._sendingInFlight).toBe(false);
+    expect(sessionA.messages.some((m) => m._errorCode)).toBe(false);
+    expect(sessionB._sendingInFlight).toBe(false);
+    expect(sessionB._activeClientMessageId).toBeUndefined();
+    expect(sessionB.messages.some((m) => m._errorCode === "cursor_unavailable" || m._errorCode === "CURSOR_UNAVAILABLE" || typeof m._errorCode === "string")).toBe(true);
+    sock.stop();
+  });
 });
 
 describe("ChatSocket interrupted continuation", () => {
@@ -5803,7 +6016,7 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
       return frame.type === "inbound.message" && frame.clientMessageId === user.id;
     })).toBe(true));
     expect(user.status).toBe("sending");
-    expect(sock.sessions.get("s1")?._sendingInFlight).toBeFalsy();
+    expect(sock.sessions.get("s1")?._sendingInFlight).toBe(true);
 
     ws.onmessage?.({ data: JSON.stringify({
       type: "outbound.ack",
@@ -5886,7 +6099,7 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     expect(sock.getTransientNotice("s1")?.text).toBe("正在确认发送…");
     expect(sock.getTransientNotice("s1")?.text).not.toContain("浏览器");
     expect(user.status).toBe("sending");
-    expect(sock.sessions.get("s1")?._sendingInFlight).toBeFalsy();
+    expect(sock.sessions.get("s1")?._sendingInFlight).toBe(true);
     ws.onmessage?.({ data: JSON.stringify({
       type: "outbound.ack",
       admitted: true,
@@ -6068,7 +6281,7 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     expect(payload.idempotencyKey).toBe(messageAttemptIdempotencyKey(user.id, 0));
     expect(user._sendAttempt).toBe(0);
     expect(s._activeClientMessageId).toBe(user.id);
-    expect(s._sendingInFlight).toBeFalsy();
+    expect(s._sendingInFlight).toBe(true);
     expect(user.status).toBe("sending");
     // Browser-only residue must be replaced at the first authoritative
     // admission of a new root turn, not carried into its reminder.
@@ -6335,7 +6548,7 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     });
   });
 
-  test("send caches optimistic user row but starts in-flight only after admission", () => {
+  test("send caches optimistic user row and starts in-flight immediately", () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const persistSession = vi.fn();
     const sock = makeSocket({ persistSession });
@@ -6349,7 +6562,7 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
       text: "hi",
       _sendAttempt: 0,
     });
-    expect(stored._sendingInFlight).toBeUndefined();
+    expect(stored._sendingInFlight).toBe(true);
     const userId = stored.messages.find((m) => m.role === "user")!.id;
     ws.onmessage?.({ data: JSON.stringify({
       type: "outbound.ack",

@@ -643,6 +643,52 @@ describe('board 响应 allowedMoves / backlog / 默认 ticketType', () => {
     db.close()
   })
 
+  it('canceled / waiting_human 不进阶段列；waiting_human 只在 inbox', async () => {
+    const db = freshDb()
+    await withServer(humanCtx(db), async (base) => {
+      const created = await call(base, 'POST', '/api/board/projects', { key: 'OCV5', name: 'V5' })
+      const projectId = (created.body.project as { id: string }).id
+      const waitingRes = await call(base, 'POST', '/api/board/tickets', {
+        projectId,
+        type: 'bug',
+        title: '待确认',
+      })
+      const canceledRes = await call(base, 'POST', '/api/board/tickets', {
+        projectId,
+        type: 'bug',
+        title: '已取消',
+      })
+      const waiting = waitingRes.body.ticket as TicketJson
+      const canceled = canceledRes.body.ticket as TicketJson
+      const pipe = listPipelines(db, projectId).find((p) => p.ticketType === 'bug')
+      assert.ok(pipe)
+      const stages = listStages(db, pipe.id)
+      assert.ok(stages[0])
+      updateTicket(db, waiting.id, waiting.version, {
+        status: 'waiting_human',
+        stageId: stages[0].id,
+        pipelineId: pipe.id,
+      })
+      updateTicket(db, canceled.id, canceled.version, {
+        status: 'canceled',
+        stageId: stages[0].id,
+        pipelineId: pipe.id,
+      })
+
+      const board = await call(base, 'GET', `/api/board/projects/${projectId}/board?ticketType=bug`)
+      assert.equal(board.status, 200, JSON.stringify(board.body))
+      const inbox = board.body.inbox as TicketJson[]
+      assert.ok(inbox.some((t) => t.id === waiting.id))
+      assert.ok(!inbox.some((t) => t.id === canceled.id))
+      const columns = board.body.columns as { stage: { id: string }; tickets: TicketJson[] }[]
+      for (const col of columns) {
+        assert.ok(!col.tickets.some((t) => t.id === waiting.id), 'waiting_human 不得占阶段列')
+        assert.ok(!col.tickets.some((t) => t.id === canceled.id), 'canceled 不得占阶段列')
+      }
+    })
+    db.close()
+  })
+
   it('未指定 ticketType 且仅有积压时选 backlog 最多的 type;显式指定仍尊重', async () => {
     const db = freshDb()
     await withServer(humanCtx(db), async (base) => {

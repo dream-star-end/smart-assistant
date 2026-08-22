@@ -77,6 +77,7 @@ export function TicketCard({
       className={cn(
         'relative flex flex-col',
         compact ? 'gap-1 p-2' : 'gap-2',
+        (ticket.status === 'canceled' || ticket.status === 'done') && 'opacity-60',
         draggable && 'cursor-grab active:cursor-grabbing',
         dragging && 'opacity-50',
       )}
@@ -135,6 +136,7 @@ export function TicketCard({
             className={cn(
               'mt-0.5 break-words text-body font-medium text-fg',
               compact ? 'line-clamp-1' : 'line-clamp-2',
+              ticket.status === 'canceled' && 'line-through',
             )}
           >
             {ticket.title}

@@ -337,6 +337,12 @@ export const BRIDGE_API_ALLOWLIST: readonly BridgeApiAllowRule[] = [
     proxyFromCommercial: true,
   },
   {
+    label: '/api/board/pipelines/:id/reorder',
+    re: /^\/api\/board\/pipelines\/[^/]+\/reorder$/,
+    methods: M('PUT'),
+    proxyFromCommercial: true,
+  },
+  {
     label: '/api/board/pipelines/:id/stages',
     re: /^\/api\/board\/pipelines\/[^/]+\/stages$/,
     methods: M('GET', 'POST'),

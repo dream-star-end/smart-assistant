@@ -98,23 +98,31 @@ function fakePool(
       return { rows: [{ part_sha256: sha256(part), payload: part }] };
     }
     if (sql.includes("INSERT INTO client_session_turn_tape_records")) {
-      const contentSha256 = String(params[7]);
-      const payload = Buffer.from(params[8] as Buffer);
-      inserts.push({ role: String(params[5]), payload, contentSha256 });
-      return {
-        rows: [{
-          msg_id: params[3],
-          ordinal: params[4],
-          role: params[5],
-          ts: String(params[6]),
+      const msgIds = Array.isArray(params[3]) ? params[3] as string[] : [String(params[3])];
+      const ordinals = Array.isArray(params[4]) ? params[4] as number[] : [Number(params[4])];
+      const roles = Array.isArray(params[5]) ? params[5] as string[] : [String(params[5])];
+      const tss = Array.isArray(params[6]) ? params[6] as Array<string | number> : [params[6] as string | number];
+      const shas = Array.isArray(params[7]) ? params[7] as string[] : [String(params[7])];
+      const payloads = Array.isArray(params[8]) ? params[8] as Buffer[] : [Buffer.from(params[8] as Buffer)];
+      const visibles = Array.isArray(params[9]) ? params[9] as Buffer[] : [params[9] as Buffer];
+      const visibleShas = Array.isArray(params[10]) ? params[10] as string[] : [String(params[10])];
+      const rows = msgIds.map((msgId, index) => {
+        const payload = Buffer.from(payloads[index]!);
+        const contentSha256 = String(shas[index]);
+        inserts.push({ role: String(roles[index]), payload, contentSha256 });
+        return {
+          msg_id: msgId,
+          ordinal: Number(ordinals[index]),
+          role: String(roles[index]),
+          ts: String(tss[index]),
           content_sha256: contentSha256,
           payload,
-          visible_payload: params[9],
-          visible_content_sha256: params[10],
+          visible_payload: visibles[index],
+          visible_content_sha256: visibleShas[index],
           model_sidecar_complete: false,
-        }],
-        rowCount: 1,
-      };
+        };
+      });
+      return { rows, rowCount: rows.length };
     }
     if (/^\s*SELECT/i.test(sql) || sql.includes("WITH ")) return { rows: [] };
     return { rows: [], rowCount: 1 };
@@ -172,6 +180,7 @@ test("materializing a part with \\u0000 keeps original record BYTEA and hash", a
 
   await _stagePreparedLosslessTurnRecords(pool, USER_ID, request, prepared);
   assert.equal(sqls.some((sql) => sql.includes("session_replication_role")), false);
+  assert.equal(sqls.some((sql) => sql.includes("INSERT INTO client_session_turn_tape_records") && sql.includes("unnest(")), true);
 
   const writtenTool = inserts.find((row) => row.payload.equals(tool.payloadBytes));
   assert.ok(writtenTool, "record INSERT must persist the part-derived original tool payload");

@@ -184,7 +184,7 @@ const html = `<!doctype html><html><head><meta charset="utf-8"><style>${producti
   #root{position:static;height:auto;overflow:visible}
   .timeline-scroll-probe{height:360px;width:640px;overflow-y:auto;position:relative;border:1px solid #ccc;scrollbar-gutter:stable}
   #timeline-archive-root .chat-virtual-item{min-height:40px}
-</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="chat-entry-ux-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="interrupted-tool-status-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="error-ux-root"></div><div id="ask-question-root"></div><div id="model-selector-root"></div><div id="markdown-rich-root"></div><div id="media-task-root"></div><div id="connectors-root"></div><div id="memory-report-root"></div><div id="community-tutorial-root"></div><div id="codex-density-root"></div><div id="settings-shell-root"></div><div id="unread-request-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
+</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="chat-entry-ux-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="interrupted-tool-status-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="error-ux-root"></div><div id="stopped-turn-root"></div><div id="ask-question-root"></div><div id="model-selector-root"></div><div id="markdown-rich-root"></div><div id="media-task-root"></div><div id="connectors-root"></div><div id="memory-report-root"></div><div id="community-tutorial-root"></div><div id="codex-density-root"></div><div id="settings-shell-root"></div><div id="unread-request-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
 
 // ── drive ───────────────────────────────────────────────────────────────────
 let browser;
@@ -2460,6 +2460,36 @@ await check("T44 当前会话 unread=false 回执前的流式刷新只发送一�
 });
 
 // 主 harness 仍在:预览用例没有把它换成空页面(否则后续缺席断言全部恒真)。
+await check("T45 中断 turn 刷新后仍显示 requestId/积分，空窗给出过程占位", async () => {
+  const root = page.locator("#stopped-turn-root");
+  await root.getByRole("status", { name: "已停止生成" }).first().waitFor({ state: "visible", timeout: 3000 });
+  await root.getByText("已经写出的部分回答，包含结论草稿。", { exact: true }).waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
+  await root.getByRole("button", { name: "复制请求ID req-stopped-turn-display" }).waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
+  await root.getByLabel("消耗 4096 积分").waitFor({ state: "visible", timeout: 3000 });
+  await root.getByRole("button", { name: /思考|已思考/ }).first().waitFor({ state: "visible", timeout: 3000 });
+  await root.getByRole("status", { name: "过程记录整理中" }).waitFor({ state: "visible", timeout: 3000 });
+  await root.getByRole("button", { name: "复制请求ID req-unpublished-window" }).waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
+  await root.getByLabel("消耗 256 积分").waitFor({ state: "visible", timeout: 3000 });
+  if ((await root.getByText("过程记录正在整理，稍后会自动补齐思考与工具卡片。").count()) !== 0) {
+    throw new Error("过程占位不应作为 assistant 正文气泡");
+  }
+  if (await root.getByRole("alert").count() !== 0) {
+    throw new Error("中断 turn 不应渲染红卡");
+  }
+  if ((await root.getByRole("button", { name: /重试|重新尝试/ }).count()) !== 0) {
+    throw new Error("中断 turn 不应显示重试");
+  }
+});
+
 await check("T20 预览用例结束后主 harness 页面未被摧毁", async () => {
   const alive = await page.evaluate(() => ({
     root: Boolean(document.querySelector("#root")),

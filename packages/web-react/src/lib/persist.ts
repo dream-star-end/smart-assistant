@@ -568,6 +568,7 @@ function buildServerTurnEvidence(serverRows: readonly ChatMessage[]): ServerTurn
   const turnPrefixes = new Set<string>();
   for (const m of serverRows) {
     if (!m || m._source !== "server") continue;
+    if (m._displayDegradeReason === "records_unpublished") continue;
     // 只有 **complete tape** 的展开行才有资格作证:_turnTapeId 在 rolling per-record 兼容路径
     // (pre-release 逐行 refs)上也会被盖,单独存在不构成"整 turn 已原子落库"证明(Codex R2
     // MAJOR);_turnTapeComplete 仅由 hydration 的 complete-anchor 分支盖章。
@@ -662,16 +663,44 @@ export function mergeFullServerWins(
       return message;
     });
   }
+  const unpublishedFinalOwners = new Set<string>();
+  for (const m of server) {
+    if (
+      m?._displayDegradeReason === "records_unpublished" &&
+      m.role === "assistant" &&
+      typeof m._clientMessageId === "string" &&
+      m._clientMessageId.length > 0
+    ) {
+      unpublishedFinalOwners.add(m._clientMessageId);
+    }
+  }
   const hasExactCompletionEvidence =
     !!completedClientMessageId &&
     server.some(
       (m) =>
         isServerAuthoredRow(m) &&
         m._clientMessageId === completedClientMessageId &&
+        m._displayDegradeReason !== "records_unpublished" &&
         (m.role === "assistant" || m.role === "thinking" || m.role === "tool"),
     );
   if (hasExactCompletionEvidence) {
     local = local.filter((m) => !isSupersededLocalTurnRow(m, completedClientMessageId));
+  }
+  if (unpublishedFinalOwners.size > 0) {
+    // Phase-A degrade page is not a complete tape: keep local live
+    // thinking/tool/plan, drop only the live assistant so the final can land.
+    local = local.filter((m) => {
+      const owner = turnOwnerId(m);
+      if (
+        m.role === "assistant" &&
+        m._source !== "server" &&
+        typeof owner === "string" &&
+        unpublishedFinalOwners.has(owner)
+      ) {
+        return false;
+      }
+      return true;
+    });
   }
   const serverIdsForAuthority = new Set<string>();
   for (const m of server) if (m?.id) serverIdsForAuthority.add(m.id);
@@ -696,7 +725,11 @@ export function mergeFullServerWins(
       const belongsToActiveTurn =
         typeof opts.activeClientMessageId === "string" &&
         (ownerId === opts.activeClientMessageId || legacyActiveRows.has(m));
-      if (!belongsToActiveTurn) return false;
+      const unpublishedProcess =
+        typeof ownerId === "string" &&
+        unpublishedFinalOwners.has(ownerId) &&
+        m.role !== "assistant";
+      if (!belongsToActiveTurn && !unpublishedProcess) return false;
     }
     if (
       m._timelineRecord !== true &&
@@ -718,7 +751,14 @@ export function mergeFullServerWins(
       !serverIdsForAuthority.has(m.id) &&
       !isArchivedServerRow(m, archivedThroughSeq) &&
       // 惰性过程记录不随会话首读返回，其缺席是预期。
-      !isLocallyExpandedTapeRow(m)
+      !isLocallyExpandedTapeRow(m) &&
+      // Phase-A unpublished page is not absence proof for this turn's process rows.
+      !(
+        typeof turnOwnerId(m) === "string" &&
+        unpublishedFinalOwners.has(turnOwnerId(m)!) &&
+        isTapeBackedAgentProcessRole(m.role) &&
+        m.role !== "assistant"
+      )
     ) {
       return false;
     }

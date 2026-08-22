@@ -116,6 +116,7 @@ describe('taskboard http.ts 路由 ⊆ server.ts 分发白名单', () => {
       '/api/board/reports/weekly',
       '/api/board/tickets/x/ready',
       '/api/board/tickets/x/runs',
+      '/api/board/pipelines/x/reorder',
     ]) {
       assert.ok(samples.includes(must), `http.ts 样例缺少 ${must}: ${samples.join(', ')}`)
     }
@@ -157,6 +158,7 @@ describe('taskboard http.ts 路由 ⊆ server.ts 分发白名单', () => {
       '/api/board/templates/x',
       '/api/board/templates/x/apply',
       '/api/board/reports/weekly',
+      '/api/board/pipelines/x/reorder',
     ]) {
       assert.ok(samples.includes(must), `前端样例缺少 ${must}: ${samples.join(', ')}`)
     }
@@ -181,5 +183,9 @@ describe('taskboard http.ts 路由 ⊆ server.ts 分发白名单', () => {
       'normalizePath 应把 /api/board/templates/:id/apply 规整掉,避免高基数',
     )
     assert.ok(serverSrc.includes("'/api/board/templates/:id'"))
+    assert.ok(
+      serverSrc.includes("'/api/board/pipelines/:id/reorder'"),
+      'normalizePath 应把 /api/board/pipelines/:id/reorder 规整掉,避免高基数',
+    )
   })
 })
