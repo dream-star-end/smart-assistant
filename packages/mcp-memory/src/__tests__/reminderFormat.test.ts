@@ -106,6 +106,22 @@ describe('formatReminderLine — 逐行格式契约(前端 parseReminderListOutp
     )
   })
 
+  it('origin-session 任务在 deliver 之后插入 `续跑本对话`', () => {
+    const line = formatReminderLine({
+      id: 'remind-origin',
+      schedule: '0 12 * * *',
+      enabled: true,
+      oneshot: true,
+      deliver: 'webchat',
+      label: '续跑发布',
+      resume: 'origin-session',
+    })
+    assert.equal(
+      line,
+      '- **续跑发布** (ID: `remind-origin`) — `0 12 * * *` · 一次性 · 启用中 · 推送对话 · 续跑本对话',
+    )
+  })
+
   it('非系统(用户)任务:无 `系统` 位,格式与现网逐字一致', () => {
     const line = formatReminderLine({
       id: 'remind-abc',

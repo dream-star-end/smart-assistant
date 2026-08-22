@@ -463,6 +463,11 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
               {/* 三级：属性与历史。 */}
               <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-caption text-faint">
                 {job.oneshot && status !== "done" && <Badge size="sm">一次性</Badge>}
+                {job.resume === "origin-session" && (
+                  <Badge size="sm" tone="accent">
+                    续跑本对话
+                  </Badge>
+                )}
                 {job.deliver && (
                   <Badge size="sm" tone="accent">
                     {deliverLabel(job.deliver)}

@@ -70,6 +70,9 @@ import {
   type CronIndexPayload,
 } from './v3CronIndexPush.js'
 import type { V3WechatOutboundConfig } from './v3WechatOutbound.js'
+import {
+  type CronOriginFireResult,
+} from './cronOriginSession.js'
 
 const logger = createLogger({ module: 'cron' })
 
@@ -420,6 +423,13 @@ export interface CronJob {
   // falsely "caught up" for the 09:00 tick it never missed. Legacy jobs
   // without createdAt are only bounded by the catch-up window itself.
   createdAt?: number
+  // origin-session: fire by injecting a new inbound turn into the conversation
+  // that created the job. Default / omitted = isolated cron session (legacy).
+  // sourceSessionKey / sourceUserId are gateway-stamped; never accept them
+  // from model tool args.
+  resume?: 'isolated' | 'origin-session'
+  sourceSessionKey?: string
+  sourceUserId?: string
 }
 
 /**
@@ -1079,6 +1089,10 @@ export class CronScheduler {
       job: CronJob,
       delivery?: CronDeliveryContext,
     ) => void | Promise<void>,
+    private onOriginSessionFire?: (
+      job: CronJob,
+      delivery: CronDeliveryContext,
+    ) => Promise<CronOriginFireResult>,
   ) {}
 
   /**
@@ -1555,6 +1569,68 @@ export class CronScheduler {
     }
   }
 
+  /**
+   * origin-session fire: Gateway injects a new inbound into the creating
+   * conversation. Isolated runJob is the fallback when that session is gone.
+   * Consume the occurrence before inject so a crash retries the same
+   * deliveryId (inbound idempotency) instead of double-creating work.
+   */
+  private async runOriginSessionJob(
+    job: CronJob,
+    durability: CronRunDurabilityHooks,
+    deliveryContext: CronDeliveryContext,
+  ): Promise<CronRunOutcome | 'fallback'> {
+    try {
+      await durability.consumeOccurrence()
+    } catch (err) {
+      logger.warn(`job ${job.id} origin-session occurrence persist failed`, {
+        jobId: job.id,
+        errorClass: stableCronErrorClass(err),
+      })
+      return { kind: 'retryable_failure', code: 'OCCURRENCE_PERSIST_FAILED' }
+    }
+    let result: CronOriginFireResult
+    try {
+      result = await this.onOriginSessionFire!(job, deliveryContext)
+    } catch (err) {
+      logger.warn(`job ${job.id} origin-session inject threw`, {
+        jobId: job.id,
+        errorClass: stableCronErrorClass(err),
+      })
+      return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_INJECT_FAILED' }
+    }
+    if (result.kind === 'fallback') return 'fallback'
+    if (result.kind === 'retryable_failure' || result.kind === 'terminal_failure') {
+      return result
+    }
+    const ts = new Date().toISOString().replace(/[:.]/g, '-')
+    const outPath = join(paths.cronOutputsDir, `${job.id}-${ts}.md`)
+    try {
+      await mkdir(dirname(outPath), { recursive: true })
+      await writeFile(outPath, `[origin-session injected]\n${job.prompt}\n`)
+    } catch (err) {
+      logger.warn(`job ${job.id} origin-session output archive failed`, {
+        jobId: job.id,
+        errorClass: stableCronErrorClass(err),
+      })
+      return { kind: 'terminal_failure', code: 'OUTPUT_ARCHIVE_FAILED' }
+    }
+    const archived = basename(outPath)
+    try {
+      await durability.markSubmitStarted?.()
+      await durability.markCompleted?.(archived)
+      await durability.markDelivered?.()
+    } catch (err) {
+      logger.warn(`job ${job.id} origin-session durability mark failed`, {
+        jobId: job.id,
+        errorClass: stableCronErrorClass(err),
+      })
+      return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_SETTLE_FAILED' }
+    }
+    logger.info(`job ${job.id} origin-session injected`, { jobId: job.id })
+    return { kind: 'completed' }
+  }
+
   private async runJob(
     job: CronJob,
     agent: AgentDef,
@@ -1565,6 +1641,14 @@ export class CronScheduler {
     },
   ): Promise<CronRunOutcome> {
     logger.info(`running job ${job.id}`, { jobId: job.id, heartbeat: !!job.heartbeat })
+
+    if (job.resume === 'origin-session' && job.sourceSessionKey && this.onOriginSessionFire) {
+      const originOutcome = await this.runOriginSessionJob(job, durability, deliveryContext)
+      if (originOutcome !== 'fallback') return originOutcome
+      logger.info(`job ${job.id} origin-session fell back to isolated execution`, {
+        jobId: job.id,
+      })
+    }
 
     // Isolated session per execution for ALL jobs (heartbeat included).
     // Sharing the user's main session polluted conversation history and, when

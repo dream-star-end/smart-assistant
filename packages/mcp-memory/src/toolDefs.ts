@@ -121,6 +121,11 @@ export const TOOLS = [
       '',
       'kind="reminder"(默认): message 作为提醒内容原样播报给用户。',
       'kind="task": message 作为到点要执行的任务指令(如"汇总本周进展并推送"),届时会真的执行。',
+      '',
+      'resume="origin-session": 到点在【当前这条对话】开一轮新 turn 继续(带着原历史)。',
+      '用户说「过一会儿再在这条对话里继续」时用它,并配 kind="task"。',
+      '默认 isolated: 另开隔离会话执行,不读本对话历史。',
+      '禁止传 sessionId / originSessionKey —— 网关从当前对话盖章。',
     ].join('\n'),
     inputSchema: {
       type: 'object',
@@ -137,6 +142,12 @@ export const TOOLS = [
           type: 'string',
           enum: ['webchat', 'local'],
           description: '结果送达方式: webchat=推送到网页对话(默认); local=仅记录不打扰',
+        },
+        resume: {
+          type: 'string',
+          enum: ['isolated', 'origin-session'],
+          description:
+            'isolated=另开隔离会话(默认); origin-session=到点回到当前对话开新一轮。不要传 sessionId。',
         },
       },
       required: ['schedule', 'message'],

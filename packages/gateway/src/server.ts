@@ -281,7 +281,16 @@ import {
   cronDeliveryId,
   deliverCronViaAdapter,
   isUserInitiatedCronJob,
+  type CronDeliveryContext,
+  type CronJob,
 } from './cron.js'
+import {
+  buildCronOriginResumeText,
+  cronOriginClientMessageId,
+  cronOriginIdempotencyKey,
+  parseOriginWebchatSessionKey,
+  type CronOriginFireResult,
+} from './cronOriginSession.js'
 import { handleTaskboardApi, resolveTaskboardActor, setPatrolExecutionHandler } from './taskboard/http.js'
 import { getTaskboardDb } from './taskboard/db/index.js'
 import { isPatrolSessionKey } from './taskboard/domain.js'
@@ -2877,7 +2886,7 @@ export class Gateway {
           deliveryKey: stableDeliveryId,
         })
       }
-    })
+    }, (job, delivery) => this.injectCronOriginSession(job, delivery))
     this.cron.lastActiveChannel = this.lastActiveChannel
     this.cron.start().catch((err) => this.log.error('cron start failed', undefined, err))
 
@@ -12124,6 +12133,73 @@ export class Gateway {
     }
   }
 
+  /**
+   * Inject a synthetic user turn into the conversation that created an
+   * origin-session cron job. Does not reuse the isolated cron sessionKey
+   * and does not submit on the user's in-flight engine.
+   */
+  private async injectCronOriginSession(
+    job: CronJob,
+    delivery: CronDeliveryContext,
+  ): Promise<CronOriginFireResult> {
+    const origin = parseOriginWebchatSessionKey(job.sourceSessionKey || '')
+    if (!origin) return { kind: 'fallback' }
+    const userId =
+      (typeof job.sourceUserId === 'string' && job.sourceUserId.trim()) ||
+      process.env.OC_USER_ID?.trim() ||
+      'default'
+    let existing
+    try {
+      existing = await getClientSession(origin.peerId, userId)
+    } catch (err) {
+      this.log.warn('origin-session lookup failed', { jobId: job.id }, err as Error)
+      return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_LOOKUP_FAILED' }
+    }
+    if (!existing) return { kind: 'fallback' }
+    const text = buildCronOriginResumeText(job)
+    const clientMessageId = cronOriginClientMessageId(delivery.deliveryId)
+    try {
+      const persisted = await appendServerAuthoredMessageDurable(origin.peerId, userId, {
+        id: clientMessageId,
+        role: 'user',
+        text,
+        ts: Date.now(),
+      })
+      if (!persisted.applied) {
+        if (persisted.reason === 'already_exists') {
+          // retry of the same occurrence — continue to dispatch (idempotent)
+        } else if (
+          persisted.reason === 'session_deleted' ||
+          persisted.reason === 'queued_to_outbox'
+        ) {
+          return { kind: 'fallback' }
+        } else {
+          return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_PERSIST_FAILED' }
+        }
+      }
+    } catch (err) {
+      this.log.warn('origin-session persist failed', { jobId: job.id }, err as Error)
+      return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_PERSIST_FAILED' }
+    }
+    try {
+      await this.dispatchInbound({
+        type: 'inbound.message',
+        channel: origin.channel,
+        peer: { id: origin.peerId, kind: origin.peerKind },
+        agentId: origin.agentId,
+        content: { text },
+        ts: Date.now(),
+        idempotencyKey: cronOriginIdempotencyKey(job.id, delivery.deliveryId),
+        clientMessageId,
+        _userId: userId,
+      } as any)
+    } catch (err) {
+      this.log.warn('origin-session dispatch failed', { jobId: job.id }, err as Error)
+      return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_DISPATCH_FAILED' }
+    }
+    return { kind: 'injected' }
+  }
+
   // ── Cron/Reminder API handlers ──
   private async handleCronApi(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (!this.cron) return this.sendError(res, 503, 'cron not initialized')
@@ -12145,7 +12221,7 @@ export class Gateway {
       const cronAgent = typeof agent === 'string' && agent ? agent : 'main'
       if (isHiddenSystemAgentId(cronAgent)) return this.sendError(res, 404, 'agent not found')
       const id = `remind-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
-      const job = {
+      const job: CronJob = {
         id,
         schedule,
         agent: cronAgent,
@@ -12157,6 +12233,25 @@ export class Gateway {
         // Stamp creation time so bounded catch-up never "makes up" a missed fire
         // for a schedule point that predates this job (see cron.ts resolveDueMinute).
         createdAt: Date.now(),
+      }
+      if (parsed.resume === 'origin-session') {
+        const origin = parseOriginWebchatSessionKey(
+          typeof parsed.originSessionKey === 'string' ? parsed.originSessionKey : '',
+        )
+        if (!origin) {
+          return this.sendError(
+            res,
+            400,
+            'origin-session requires the current webchat conversation; do not pass a session id',
+          )
+        }
+        const live = this.sessions.getByKey(origin.sessionKey)
+        job.resume = 'origin-session'
+        job.sourceSessionKey = origin.sessionKey
+        job.sourceUserId =
+          (typeof live?.userId === 'string' && live.userId) ||
+          process.env.OC_USER_ID?.trim() ||
+          'default'
       }
       await this.cron.addJob(job)
       this.sendJson(res, 201, { ok: true, job })

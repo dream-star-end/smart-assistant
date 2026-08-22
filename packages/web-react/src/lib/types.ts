@@ -860,6 +860,7 @@ export type CronJob = {
   nextRunAt?: string | number | null;
   lastRunAt?: string | number | null;
   heartbeat?: boolean;
+  resume?: "isolated" | "origin-session";
 };
 
 /** 新建定时任务入参（POST /api/cron）。 */

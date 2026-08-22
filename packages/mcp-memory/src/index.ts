@@ -75,6 +75,7 @@ import {
   remainingAskUserWaitMs,
 } from './askUserClient.js'
 import { type ReminderJobView, formatReminderList } from './reminderFormat.js'
+import { rejectClientAssignedResumeIds, resolveReminderResume } from './reminderResume.js'
 import { filterSkillEvalTools, isSkillEvalBlockedTool } from './skillEvalToolPolicy.js'
 // Tool 定义(TOOLS / SKILL_PROPOSE_TOOL)抽到 ./toolDefs.ts(纯数据模块,无副作用),
 // 让「TOOLS ↔ toolNames.ts」锁步单测能直接 import 校验,而不触发本入口模块顶层的
@@ -966,7 +967,12 @@ async function handleCreateReminder(args: {
   oneshot?: boolean
   kind?: 'reminder' | 'task'
   deliver?: 'webchat' | 'local'
+  resume?: 'isolated' | 'origin-session'
 }) {
+  const forbidden = rejectClientAssignedResumeIds(args)
+  if (forbidden) return toolError(forbidden)
+  const resume = resolveReminderResume(args)
+  if (!resume.ok) return toolError(resume.error)
   const { base, headers } = gatewayCronBase()
   const isTask = args.kind === 'task'
   try {
@@ -982,6 +988,9 @@ async function handleCreateReminder(args: {
         deliver: args.deliver === 'local' ? 'local' : 'webchat',
         oneshot: args.oneshot !== false,
         label: args.message.slice(0, 50),
+        ...(resume.resume === 'origin-session'
+          ? { resume: 'origin-session', originSessionKey: resume.originSessionKey }
+          : {}),
       }),
     })
     if (!res.ok) {
@@ -990,7 +999,7 @@ async function handleCreateReminder(args: {
     }
     const data = (await res.json()) as any
     return toolOk(
-      `✅ ${isTask ? '定时任务' : '提醒'}已创建: "${args.message}"\n⏰ 计划: \`${args.schedule}\`\nID: \`${data.job?.id ?? '?'}\`${args.oneshot !== false ? ' (一次性)' : ' (重复)'}`,
+      `✅ ${isTask ? '定时任务' : '提醒'}已创建: "${args.message}"\n⏰ 计划: \`${args.schedule}\`\nID: \`${data.job?.id ?? '?'}\`${args.oneshot !== false ? ' (一次性)' : ' (重复)'}${resume.resume === 'origin-session' ? '\n🔁 到点将回到本对话继续' : ''}`,
     )
   } catch (err: any) {
     return toolError(`创建${isTask ? '任务' : '提醒'}失败: ${err?.message ?? String(err)}`)

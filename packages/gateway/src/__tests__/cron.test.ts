@@ -956,3 +956,73 @@ describe('CronScheduler delivery outbox retry', () => {
     assert.deepEqual(deliveryIds, [cronDeliveryId(job.id, 100), cronDeliveryId(job.id, 100)])
   })
 })
+
+describe('CronScheduler origin-session resume', () => {
+  const agent = { id: 'x', model: 'glm-5.2' } as any
+
+  it('injected origin-session skips isolated getOrCreate/submit', async () => {
+    const getOrCreateOpts: any[] = []
+    let submits = 0
+    const fires: string[] = []
+    const sched = new CronScheduler(
+      { defaults: { model: 'glm-5.2' } } as any,
+      {
+        getOrCreate: async (opts: any) => {
+          getOrCreateOpts.push(opts)
+          return { sessionKey: opts.sessionKey } as any
+        },
+        submit: async () => { submits++ },
+        destroySession: async () => {},
+      } as any,
+      () => {},
+      async (job, delivery) => {
+        fires.push(`${job.id}:${delivery.deliveryId}`)
+        return { kind: 'injected' }
+      },
+    )
+    const job = {
+      id: 'remind-origin',
+      schedule: '0 9 * * *',
+      agent: 'x',
+      prompt: 'continue deploy',
+      resume: 'origin-session',
+      sourceSessionKey: 'agent:main:webchat:dm:sess-1',
+      enabled: true,
+    } as any
+    const outcome = await (sched as any).runJob(job, agent, NOOP_CRON_DURABILITY)
+    assert.deepEqual(outcome, { kind: 'completed' })
+    assert.equal(getOrCreateOpts.length, 0)
+    assert.equal(submits, 0)
+    assert.equal(fires.length, 1)
+  })
+
+  it('fallback origin-session uses isolated cron session', async () => {
+    const getOrCreateOpts: any[] = []
+    const sched = new CronScheduler(
+      { defaults: { model: 'glm-5.2' } } as any,
+      {
+        getOrCreate: async (opts: any) => {
+          getOrCreateOpts.push(opts)
+          return { sessionKey: opts.sessionKey } as any
+        },
+        submit: async () => {},
+        destroySession: async () => {},
+      } as any,
+      () => {},
+      async () => ({ kind: 'fallback' }),
+    )
+    const job = {
+      id: 'remind-origin-fb',
+      schedule: '0 9 * * *',
+      agent: 'x',
+      prompt: 'continue deploy',
+      resume: 'origin-session',
+      sourceSessionKey: 'agent:main:webchat:dm:sess-1',
+      enabled: true,
+    } as any
+    const outcome = await (sched as any).runJob(job, agent, NOOP_CRON_DURABILITY)
+    assert.equal(outcome.kind, 'terminal_failure')
+    assert.equal(getOrCreateOpts.length, 1)
+    assert.match(getOrCreateOpts[0].sessionKey, /:cron:dm:remind-origin-fb:/)
+  })
+})
