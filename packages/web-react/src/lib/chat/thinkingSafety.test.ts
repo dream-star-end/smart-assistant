@@ -229,10 +229,10 @@ describe("retryMessage：发送失败原地重发", () => {
     const userCountBefore = s.messages.filter((m) => m.role === "user").length;
     sock.retryMessage({ sessId: "s1", msgId: userMsg.id, agentId: "main" });
 
-    // 不新增气泡（原地复用同一条）；物理 send 后仍等待 durable admission。
+    // 不新增气泡（原地复用同一条）。Submit/retry 立刻进入回复中，避免 admission ACK 前作曲器静默。
     expect(s.messages.filter((m) => m.role === "user").length).toBe(userCountBefore);
     expect(userMsg.status).toBe("sending");
-    expect(s._sendingInFlight).toBeFalsy();
+    expect(s._sendingInFlight).toBe(true);
     // 重发帧复用 clientMessageId，只把持久化 attempt 从 0 精确推进到 1。
     const inbound = ws.sent.find((d) => d.includes('"inbound.message"'))!;
     expect(inbound).toBeTruthy();
