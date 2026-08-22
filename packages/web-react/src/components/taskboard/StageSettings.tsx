@@ -604,14 +604,14 @@ export function StageSettings({
 
   const persistStageOrder = async (ordered: PipelineStage[]) => {
     if (ordered.length === 0) return
-    const tempBase = Math.max(1000, ...ordered.map((s) => s.ordinal)) + 1
+    const pipelineId = ordered[0]?.pipelineId
+    if (!pipelineId) return
     await runWrite(async () => {
-      for (let i = 0; i < ordered.length; i++) {
-        await taskboardApi.patchStage(auth, ordered[i].id, { ordinal: tempBase + i })
-      }
-      for (let i = 0; i < ordered.length; i++) {
-        await taskboardApi.patchStage(auth, ordered[i].id, { ordinal: i })
-      }
+      await taskboardApi.reorderStages(
+        auth,
+        pipelineId,
+        ordered.map((s) => s.id),
+      )
       toast('已调整阶段顺序', 'success')
     })
   }

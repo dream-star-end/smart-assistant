@@ -74,6 +74,7 @@ async function startRig(opts: {
   resolve?: ResolveContainerEndpoint;
   maxPerUser?: number;
   maxFrameBytes?: number;
+  maxBufferedBytes?: number;
   markContainerActivity?: (containerId: number) => void;
   loadAllowedModelChecker?: UserChatBridgeDeps["loadAllowedModelChecker"];
   loadMasterSessionMessages?: UserChatBridgeDeps["loadMasterSessionMessages"];
@@ -115,6 +116,7 @@ async function startRig(opts: {
     resolveContainerEndpoint: (uid) => rig.resolveImpl!(uid),
     maxPerUser: opts.maxPerUser,
     maxFrameBytes: opts.maxFrameBytes,
+    maxBufferedBytes: opts.maxBufferedBytes,
     containerConnectTimeoutMs: 1500,
     markContainerActivity: opts.markContainerActivity,
     loadAllowedModelChecker: opts.loadAllowedModelChecker,
@@ -1508,6 +1510,7 @@ describe("userChatBridge — model authorization", () => {
 
       const error = await nextBusinessFrame(frames);
       assert.equal(error.code, "GOAL_STATE_UNAVAILABLE");
+      assert.deepEqual(error.peer, { id: "sess-goal-read-failure", kind: "dm" });
       await new Promise<void>((resolve) => setTimeout(resolve, 100));
       assert.equal(
         rig.containerSeen.some(({ data }) => {
@@ -3097,6 +3100,15 @@ describe("Cursor external authority regression tripwire", () => {
     assert.match(cursorBranch, /isCursorContainerOnSelfHost/);
     assert.match(cursorBranch, /INSERT INTO cursor_external_usage_audit/);
     assert.match(cursorBranch, /peerCapture, modelCapture/);
+    assert.match(cursorBranch, /cursorTurnIdentity/);
+    assert.match(
+      cursorBranch,
+      /sendErrorFrame\(userWs, 'CURSOR_UNAVAILABLE', 'Cursor requires the account-owned local runtime', cursorTurnIdentity\)/,
+    );
+    assert.match(
+      cursorBranch,
+      /sendErrorFrame\(userWs, 'UNAUTHORIZED_MODEL', 'Cursor is not enabled for this account', cursorTurnIdentity\)/,
+    );
     assert.match(source, /settleCursorExternalUsage/);
   });
 
@@ -3458,5 +3470,226 @@ describe("frontend build handshake", () => {
         await stopRig(rig);
       }
     }
+  });
+});
+
+describe("userChatBridge — session-scoped live frame fan-out", () => {
+  test("stamped frames reach every hello subscriber of uid+session, not other sessions or uids", async () => {
+    const portRef = { p: 0 };
+    const rig = await startRig({
+      resolve: async () => ({
+        host: "127.0.0.1", port: portRef.p, containerId: 91,
+      }),
+      maxPerUser: 4,
+    });
+    portRef.p = rig.containerPort;
+    try {
+      const tokenA = await makeJwt("910");
+      const tokenB = await makeJwt("911");
+      const openAndHello = async (token: string, sessionId: string) => {
+        const nextContainer = waitNextContainerSocket(rig);
+        const ws = openClient(rig.gatewayPort, token);
+        await new Promise<void>((r) => ws.once("open", () => r()));
+        await nextContainer;
+        const hello = JSON.stringify({
+          type: "inbound.hello",
+          peers: [{ peerId: sessionId, agentId: "main", lastFrameSeq: 0 }],
+        });
+        const seenBefore = rig.containerSeen.length;
+        ws.send(hello);
+        await waitFor(() => rig.containerSeen.length > seenBefore);
+        return { ws, fc: frameCollector(ws) };
+      };
+      const tab1 = await openAndHello(tokenA, "sessA");
+      const tab2 = await openAndHello(tokenA, "sessA");
+      const otherSess = await openAndHello(tokenA, "sessB");
+      const otherUid = await openAndHello(tokenB, "sessA");
+
+      const stamped = JSON.stringify({
+        type: "outbound.message",
+        sessionKey: "agent:main:webchat:dm:sessA",
+        frameSeq: 7,
+        peer: { id: "sessA", kind: "dm" },
+        clientMessageId: "m-fanout",
+        blocks: [],
+      });
+      rig.containerSockets[0]!.send(stamped);
+
+      const got1 = await nextBusinessFrame(tab1.fc);
+      const got2 = await nextBusinessFrame(tab2.fc);
+      assert.equal(got1.frameSeq, 7);
+      assert.equal(got2.frameSeq, 7);
+
+      const leaked = await Promise.race([
+        nextBusinessFrame(otherSess.fc).then((frame) => ({ who: "sessB", frame })),
+        nextBusinessFrame(otherUid.fc).then((frame) => ({ who: "uidB", frame })),
+        new Promise<null>((r) => setTimeout(() => r(null), 250)),
+      ]);
+      assert.equal(leaked, null, `fan-out leaked to ${JSON.stringify(leaked)}`);
+
+      tab1.ws.close();
+      tab2.ws.close();
+      otherSess.ws.close();
+      otherUid.ws.close();
+      await Promise.all([
+        waitClose(tab1.ws), waitClose(tab2.ws), waitClose(otherSess.ws), waitClose(otherUid.ws),
+      ]);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+});
+
+describe("userChatBridge — hello live-frame catch-up", () => {
+  test("catch-up send path reuses bufferedAmount backpressure and does not cleanup the bridge", async () => {
+    const source = await readFile(new URL("../ws/userChatBridge.ts", import.meta.url), "utf8");
+    const start = source.indexOf("if (liveCatchupSessions.length > 0 && deps.pgPool)");
+    const end = source.indexOf("Fall through to forwardInboundFrame below", start);
+    assert.notEqual(start, -1);
+    const block = source.slice(start, end);
+    assert.match(block, /liveCatchupSendDecision/);
+    assert.match(block, /CLOSE_BRIDGE\.TOO_BIG/);
+    assert.match(block, /maxBytes:/);
+    assert.match(block, /item\.kind === "oversize"/);
+    assert.doesNotMatch(block, /cleanup\("/);
+  });
+
+  test("hello catches up open-dispatch live frames from PG when ring is empty", async () => {
+    const portRef = { p: 0 };
+    const catchupFrame = {
+      type: "outbound.message",
+      sessionKey: "agent:main:webchat:dm:peerCatch",
+      frameSeq: 3,
+      peer: { id: "peerCatch", kind: "dm" },
+      clientMessageId: "cm-catch",
+      blocks: [{ type: "text", text: "caught up" }],
+    };
+    const lookups: unknown[][] = [];
+    const trio = helloTerminalBillingTrio({ row: null, lookups: [] });
+    const innerQuery = trio.pgPool!.query.bind(trio.pgPool);
+    trio.pgPool = {
+      query: async (sql: unknown, params?: unknown[]) => {
+        const text = typeof sql === "string"
+          ? sql
+          : String((sql as { text?: unknown })?.text ?? "");
+        if (/client_session_live_frames/.test(text)) {
+          lookups.push(params ?? []);
+          return {
+            rows: [{ payload: Buffer.from(JSON.stringify(catchupFrame), "utf8") }],
+            rowCount: 1,
+          };
+        }
+        return innerQuery(text, params);
+      },
+    } as UserChatBridgeDeps["pgPool"];
+    const rig = await startRig({
+      resolve: async () => ({
+        host: "127.0.0.1", port: portRef.p, containerId: 93,
+      }),
+      ...trio,
+    });
+    portRef.p = rig.containerPort;
+    try {
+      const token = await makeJwt("930");
+      const nextContainer = waitNextContainerSocket(rig);
+      const ws = openClient(rig.gatewayPort, token);
+      await new Promise<void>((r) => ws.once("open", () => r()));
+      await nextContainer;
+      const fc = frameCollector(ws);
+      const hello = JSON.stringify({
+        type: "inbound.hello",
+        peers: [{ peerId: "peerCatch", agentId: "main", lastFrameSeq: 0 }],
+      });
+      ws.send(hello);
+      await waitHelloForwarded(rig, hello);
+      const got = await nextBusinessFrame(fc);
+      assert.equal(got.frameSeq, 3);
+      assert.equal((got.blocks as Array<{ text?: string }>)[0]?.text, "caught up");
+      assert.equal(lookups.length, 1);
+      assert.equal(lookups[0]![1], "peerCatch");
+      assert.equal(lookups[0]![0], "930");
+      ws.close();
+      await waitClose(ws);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("hello catch-up queries the hello session, not another session id", async () => {
+    const portRef = { p: 0 };
+    const sessions: string[] = [];
+    const trio = helloTerminalBillingTrio({ row: null, lookups: [] });
+    const innerQuery = trio.pgPool!.query.bind(trio.pgPool);
+    trio.pgPool = {
+      query: async (sql: unknown, params?: unknown[]) => {
+        const text = typeof sql === "string"
+          ? sql
+          : String((sql as { text?: unknown })?.text ?? "");
+        if (/client_session_live_frames/.test(text)) {
+          sessions.push(String(params?.[1] ?? ""));
+          return { rows: [], rowCount: 0 };
+        }
+        return innerQuery(text, params);
+      },
+    } as UserChatBridgeDeps["pgPool"];
+    const rig = await startRig({
+      resolve: async () => ({
+        host: "127.0.0.1", port: portRef.p, containerId: 94,
+      }),
+      ...trio,
+    });
+    portRef.p = rig.containerPort;
+    try {
+      const token = await makeJwt("940");
+      const nextContainer = waitNextContainerSocket(rig);
+      const ws = openClient(rig.gatewayPort, token);
+      await new Promise<void>((r) => ws.once("open", () => r()));
+      await nextContainer;
+      const hello = JSON.stringify({
+        type: "inbound.hello",
+        peers: [{ peerId: "only-this-session", agentId: "main", lastFrameSeq: 2 }],
+      });
+      ws.send(hello);
+      await waitHelloForwarded(rig, hello);
+      await new Promise((r) => setTimeout(r, 80));
+      assert.deepEqual(sessions, ["only-this-session"]);
+      ws.close();
+      await waitClose(ws);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+});
+
+describe("inbound turn identity is frozen onto every parsed-turn error exit", () => {
+  test("authority helpers and remaining parsed-turn errors carry frozen peer identity", async () => {
+    const source = await readFile(new URL("../ws/userChatBridge.ts", import.meta.url), "utf8");
+    assert.match(source, /inboundTurnIdentityForFrame = inboundTurnIdentityFromParsed\(parsed\)/);
+    assert.match(source, /sendErrorFrame\(userWs, code, message, args\.turn\)/);
+    assert.equal(
+      source.split("sendErrorFrame(userWs, code, message, args.turn)").length - 1,
+      2,
+      "seal + resolve reject paths must both pass args.turn",
+    );
+    assert.match(
+      source,
+      /GOAL_STATE_UNAVAILABLE[\s\S]{0,180}\{ peerId, clientMessageId \}/,
+    );
+    for (const needle of [
+      'sendErrorFrame(\n                userWs,\n                "AGENT_NOT_FOUND"',
+      "inboundTurnIdentityForFrame",
+    ]) {
+      assert.ok(source.includes('inboundTurnIdentityForFrame'), needle);
+    }
+    assert.match(source, /"agent not found",[\s\S]{0,40}inboundTurnIdentityForFrame/);
+    assert.match(source, /repair its required capabilities and retry`,[\s\S]{0,40}inboundTurnIdentityForFrame/);
+    assert.match(source, /specify a model`,[\s\S]{0,40}inboundTurnIdentityForFrame/);
+    assert.match(source, /trace invariant violated", annotatedTurnIdentity/);
+    assert.match(source, /maxFrameBytes}`, annotatedTurnIdentity/);
+    assert.match(source, /"internal error", annotatedTurnIdentity/);
+    assert.match(source, /retry this turn shortly",[\s\S]{0,40}ccbTurnIdentity/);
+    assert.match(source, /maxFrameBytes}`,[\s\S]{0,20}ccbTurnIdentity/);
+    assert.match(source, /"internal error", ccbTurnIdentity/);
+    assert.doesNotMatch(source, /firstSession\(\)/);
   });
 });

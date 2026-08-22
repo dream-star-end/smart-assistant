@@ -1552,6 +1552,33 @@
           "path": "packages/web-react/browser-tests/run.mjs",
           "assertion": "T44 当前会话 unread=false 回执前的流式刷新只发送一次 mark-read"
         }
+      ],
+      "coverageCommits": [
+        "40fa7030"
+      ]
+    },
+    {
+      "id": "INC-20260822-GROK-TOOL-JSON-CARD-LEAK",
+      "occurredAt": "2026-08-22",
+      "severity": "P1",
+      "symptom": "selfhost 引入的 Grok 显示解码把未识别 outputJson 序列化后泄漏进 ToolCard；商业侧既有 EXACT_STRUCTURED_MARKER 断言在 merge 树上失败。根修是未知 shape 返回空串，精确字节仍留在 tape/output。",
+      "rootFixCommit": "b4404d1d",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/ToolCard.test.tsx",
+          "assertion": "结构化 tool_result 的附加字段不生成结果详情入口"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/liveActivityLabel.test.ts",
+          "assertion": "未知工具 / 思考原文 / 路径 → 执行操作，永不回显参数"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T12 Agent 卡按钮名单恰好为白名单(无冗余原始记录入口)且真实过程可见"
+        }
       ]
     }
   ]

@@ -19,6 +19,8 @@ import {
   isLeaseHeld,
   isVersionConflict,
   mergeTimelineSources,
+  pickInitialProject,
+  LAST_PROJECT_STORAGE_KEY,
   resolveOriginSessionId,
   sessionIdFromOriginKey,
   skipReasonLabel,
@@ -39,6 +41,7 @@ afterEach(() => {
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
   vi.useRealTimers()
+  localStorage.removeItem(LAST_PROJECT_STORAGE_KEY)
 })
 
 const auth = createMemoryAuthSession(() => {}, 'tok-board')
@@ -242,6 +245,19 @@ describe('TicketCard 类型 / 优先级映射', () => {
     expect(screen.getByText('research')).toHaveAttribute('title', 'research')
     expect(screen.getAllByText('受阻').length).toBeGreaterThan(0)
     expect(screen.getByLabelText('需求单')).toBeInTheDocument()
+  })
+
+  test('取消卡降透明并划线标题', () => {
+    render(
+      <ToastProvider>
+        <TooltipProvider>
+          <TicketCard ticket={sampleTicket({ status: 'canceled', title: '已取消的空单' })} />
+        </TooltipProvider>
+      </ToastProvider>,
+    )
+    const card = screen.getByTestId('ticket-card')
+    expect(card.className).toMatch(/opacity-60/)
+    expect(screen.getByText('已取消的空单').className).toMatch(/line-through/)
   })
 })
 
@@ -603,6 +619,29 @@ describe('TicketDrawer 详情', () => {
     expect((screen.getByTestId('ticket-drawer-comment') as HTMLTextAreaElement).value).toBe(
       '先别合',
     )
+  })
+
+  test('正文与评论按 Markdown 渲染', async () => {
+    const ticket = sampleTicket({
+      body: '## 验收\n\n- **粗体**\n- `code`',
+    })
+    mockDrawerApis(ticket)
+    vi.spyOn(taskboardApi, 'listTimeline').mockResolvedValue(
+      mergeTimelineSources({
+        runs: [],
+        comments: [sampleComment({ body: '改了 **X**；用 `Y` 验证' })],
+        activities: [],
+      }),
+    )
+    renderDrawer(ticket)
+    const body = await screen.findByTestId('ticket-body-md')
+    await waitFor(() => {
+      expect(body.querySelector('h2, strong, code')).not.toBeNull()
+    })
+    const comment = await screen.findByTestId('ticket-comment-md')
+    await waitFor(() => {
+      expect(comment.querySelector('strong, code')).not.toBeNull()
+    })
   })
 
   test('改需求 409 冲突提示后强制对账', async () => {
@@ -1107,4 +1146,40 @@ describe('流水线 / 阶段配置', () => {
     )
     expect(projPatch?.[0]).toBe('/api/board/projects/p1')
   })
+
+  test('reorderStages PUT /reorder', async () => {
+    const fetchMock = vi.fn(async () => ok({ ok: true, items: [] }))
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+    await taskboardApi.reorderStages(auth, 'pipe1', ['s2', 's1'])
+    expect(String((fetchMock.mock.calls as unknown as [string, RequestInit][])[0]?.[0])).toBe(
+      '/api/board/pipelines/pipe1/reorder',
+    )
+    expect((fetchMock.mock.calls as unknown as [string, RequestInit][])[0]?.[1]?.method).toBe('PUT')
+    expect(JSON.parse(String((fetchMock.mock.calls as unknown as [string, RequestInit][])[0]?.[1]?.body))).toEqual({
+      orderedIds: ['s2', 's1'],
+    })
+  })
 })
+
+describe('pickInitialProject', () => {
+  const e2e = {
+    id: 'e2e',
+    key: 'E2E',
+    name: '冒烟',
+    archivedAt: null as number | null,
+  }
+  const testProj = {
+    id: 'test',
+    key: 'TEST',
+    name: 'V5个人版',
+    archivedAt: null as number | null,
+  }
+
+  test('记住上次项目优先；否则跳过 E2E 冒烟项', () => {
+    expect(pickInitialProject([e2e, testProj], null)?.id).toBe('test')
+    expect(pickInitialProject([e2e, testProj], 'e2e')?.id).toBe('e2e')
+    expect(pickInitialProject([e2e], null)?.id).toBe('e2e')
+    expect(pickInitialProject([{ ...testProj, archivedAt: 1 }, e2e], 'test')?.id).toBe('e2e')
+  })
+})
+

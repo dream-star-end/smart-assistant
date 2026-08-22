@@ -36,6 +36,7 @@ import {
   getStage,
   listPipelines,
   listStages,
+  reorderStages,
   updatePipeline,
   updateStage,
 } from './db/pipelines.js'
@@ -709,6 +710,13 @@ async function dispatch(
     return sendError(res, 405, 'method not allowed')
   }
 
+  const pipelineStageOrder = path.match(/^\/api\/board\/pipelines\/([^/]+)\/reorder$/)
+  if (pipelineStageOrder) {
+    const id = decodeURIComponent(pipelineStageOrder[1])
+    if (method === 'PUT') return handleReorderStages(res, await readJsonBody(req), db, id, actor)
+    return sendError(res, 405, 'method not allowed')
+  }
+
   const pipelineStages = path.match(/^\/api\/board\/pipelines\/([^/]+)\/stages$/)
   if (pipelineStages) {
     const id = decodeURIComponent(pipelineStages[1])
@@ -900,7 +908,16 @@ function handleProjectBoard(res: ServerResponse, url: URL, db: TaskboardDb, idOr
     ticketType,
     columns: stages.map((stage) => ({
       stage,
-      tickets: ofType.filter((t) => t.stageId === stage.id && t.status !== 'backlog').map(decorate),
+      tickets: ofType
+        .filter(
+          (t) =>
+            t.stageId === stage.id &&
+            t.status !== 'backlog' &&
+            t.status !== 'waiting_human' &&
+            t.status !== 'done' &&
+            t.status !== 'canceled',
+        )
+        .map(decorate),
     })),
     inbox,
     backlog: { tickets: backlogTickets },
@@ -2218,6 +2235,31 @@ function handleGetStage(res: ServerResponse, db: TaskboardDb, id: string): void 
   const stage = getStage(db, id)
   if (!stage) throw new TaskboardNotFound('stage', id)
   sendJson(res, 200, { stage })
+}
+
+function handleReorderStages(
+  res: ServerResponse,
+  body: Record<string, unknown>,
+  db: TaskboardDb,
+  pipelineId: string,
+  actor: Actor,
+): void {
+  if (actor !== 'human') {
+    sendError(res, 403, 'forbidden', { code: 'forbidden' })
+    return
+  }
+  const raw = body.orderedIds
+  if (!Array.isArray(raw) || raw.some((id) => typeof id !== 'string' || !id.trim())) {
+    throw new TaskboardValidationError('orderedIds must be a non-empty string array')
+  }
+  const orderedIds = raw.map((id) => String(id))
+  try {
+    const items = reorderStages(db, pipelineId, orderedIds)
+    sendJson(res, 200, { ok: true, items })
+  } catch (err) {
+    throwIfStageOrdinalConflict(err)
+    throw err
+  }
 }
 
 function handlePatchStage(

@@ -1597,8 +1597,8 @@ export class ChatSocket {
       user?._routing?.modelSwitchId &&
       sess._preparedModelSwitch?.id === user._routing.modelSwitchId
     ) sess._preparedModelSwitch = undefined;
-    if (!sess._sendingInFlight) {
-      this.clearTransientNotice(sess.id);
+    const alreadyInFlight = sess._sendingInFlight;
+    if (!alreadyInFlight) {
       sess._streamingAssistant = null;
       sess._streamingThinking = null;
       sess._blockIdToMsgId = new Map();
@@ -1606,11 +1606,6 @@ export class ChatSocket {
       sess._localTeardownAt = undefined;
       sess._sendingInFlight = true;
       sess._activeClientMessageId = clientMessageId;
-      // New authoritative root-turn boundary. cost_charged itself has no
-      // frameSeq, so reminder accounting uses its stable requestId set.
-      sess._turnCostCredits = "0";
-      sess._turnCostSeenRequestIds = new Set();
-      sess._turnCostReminderCredits = undefined;
       sess._activeAgentId =
         typeof pending?.payload.agentId === "string" && pending.payload.agentId
           ? pending.payload.agentId
@@ -1621,6 +1616,12 @@ export class ChatSocket {
       sess._lastFinaledAt = 0;
       this.resetThinkingSafety(sessId);
     }
+    this.clearTransientNotice(sess.id);
+    // Authoritative admission always starts a new cost reminder window, even
+    // when submit already set _sendingInFlight for the "replying" affordance.
+    sess._turnCostCredits = "0";
+    sess._turnCostSeenRequestIds = new Set();
+    sess._turnCostReminderCredits = undefined;
     this.scheduleNotify();
     return true;
   }
@@ -2065,7 +2066,13 @@ export class ChatSocket {
       }
       case "error": {
         const frame = f as LegacyBridgeErrorWire;
-        const sess = frame.peer?.id ? this.sessions.get(frame.peer.id) : this.firstSession();
+        // Named peer wins. An orphaned legacy turn error may bind only when
+        // exactly one session is _sendingInFlight and has not yet entered
+        // durable admission — never firstSession(), and never when 0 or 2+
+        // such sessions exist.
+        const sess = frame.peer?.id
+          ? this.resolveSession(frame.peer.id)
+          : this.uniquePreAdmissionInFlightSession();
         if (sess) {
           const activeClientMessageId = sess._activeClientMessageId;
           const ownsActiveTurn = !frame.clientMessageId ||
@@ -2381,6 +2388,19 @@ export class ChatSocket {
   private resolveSession(peerId: string | undefined): ChatSession | null {
     if (peerId && this.sessions.has(peerId)) return this.sessions.get(peerId)!;
     return null;
+  }
+
+  /** Safety net for a peer-less legacy turn error. Only a unique
+   * pre-admission in-flight session may claim it; 0 or 2+ stay dropped. */
+  private uniquePreAdmissionInFlightSession(): ChatSession | null {
+    const candidates: ChatSession[] = [];
+    for (const sess of this.sessions.values()) {
+      if (!sess._sendingInFlight) continue;
+      const admittedId = this.dispatchSlots.get(sess.id);
+      if (admittedId !== undefined && admittedId === sess._activeClientMessageId) continue;
+      candidates.push(sess);
+    }
+    return candidates.length === 1 ? candidates[0]! : null;
   }
 
   private firstSession(): ChatSession | null {
@@ -3212,12 +3232,19 @@ export class ChatSocket {
     const sendingCmid = s._sendingInFlight ? s._activeClientMessageId : undefined;
     const activeClientMessageId =
       sendingCmid && terminalTurns.has(sendingCmid) ? undefined : sendingCmid;
+    const unpublishedCompleted =
+      typeof archive?.completedClientMessageId === "string" &&
+      msgs.some(
+        (message) =>
+          message._clientMessageId === archive.completedClientMessageId &&
+          message._displayDegradeReason === "records_unpublished",
+      );
     s.messages = full
       ? mergeFullServerWins(
           authoritativeMessages,
           s.messages,
           archivedThroughSeq,
-          archive?.completedClientMessageId,
+          unpublishedCompleted ? undefined : archive?.completedClientMessageId,
           {
             deletionAuthority: hasVersion,
             activeClientMessageId,
@@ -3225,9 +3252,14 @@ export class ChatSocket {
             adoptUnifiedTimeline: adoptingUnifiedTimeline,
           },
         )
-      : applyServerIncremental(s.messages, authoritativeMessages, archive?.completedClientMessageId, {
-          activeClientMessageId,
-        });
+      : applyServerIncremental(
+          s.messages,
+          authoritativeMessages,
+          unpublishedCompleted ? undefined : archive?.completedClientMessageId,
+          {
+            activeClientMessageId,
+          },
+        );
     s.messages = reconcileTimelineBashTailAuxiliaries(s.messages);
     if (hasVersion) s._lastServerSyncUpdatedAt = serverUpdatedAt;
     if (hasHistoryRevision) {
@@ -4860,12 +4892,20 @@ export class ChatSocket {
     if (user) user.status = "sending";
     // Correlation identity is safe before admission and lets a terminal frame
     // that omits its optional clientMessageId still bind to this exact turn.
-    // The user-visible thinking clock remains off until authority confirms.
+    // Submit itself must enter the "replying" affordance: waiting for admission
+    // ACK left a silent composer when the original WS died before the first token.
     sess._activeClientMessageId = item.msgId;
     sess._activeAgentId =
       typeof item.payload.agentId === "string" && item.payload.agentId
         ? item.payload.agentId
         : sess.agentId;
+    if (!sess._sendingInFlight) {
+      sess._sendingInFlight = true;
+      sess._turnStartedAt = Date.now();
+      sess._streamingAssistant = null;
+      sess._streamingThinking = null;
+      this.resetThinkingSafety(sess.id);
+    }
     if (journalCommitted) this.clearTransientNotice(sess.id);
     else this.setTransientNotice(sess.id, "正在确认发送…");
     this.scheduleNotify();

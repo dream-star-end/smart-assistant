@@ -59,8 +59,11 @@ fs.writeFileSync(process.env.FAKE_GROK_CAPTURE, JSON.stringify({ argv: process.a
   GROK_MODELS_BASE_URL: process.env.GROK_MODELS_BASE_URL,
   GROK_MODELS_LIST_URL: process.env.GROK_MODELS_LIST_URL,
   GROK_HOME: process.env.GROK_HOME,
+  OPENCLAUDE_ENGINE: process.env.OPENCLAUDE_ENGINE,
+  PATH: process.env.PATH,
   OPENCLAUDE_V3_CONTAINER_TOKEN: process.env.OPENCLAUDE_V3_CONTAINER_TOKEN,
   HTTPS_PROXY: process.env.HTTPS_PROXY,
+  OPENCLAUDE_GATEWAY_TOKEN: process.env.OPENCLAUDE_GATEWAY_TOKEN,
 } }))
 for (const event of [
   { type: 'thought', data: 'checking' },
@@ -95,6 +98,8 @@ for (const event of [
         input: 'fix it',
         requestId: REQUEST_ID,
         turnKey: TURN_KEY,
+        assistantMessageId: 'asst-1',
+        thinkingMessageId: 'think-1',
         onEvent: (event) => events.push(event),
         sessionTotals: totals,
         toolUseIdToName: new Map(),
@@ -107,6 +112,14 @@ for (const event of [
       assert.equal(summary.assistantText, 'before done')
       assert.equal(summary.thinkingText, 'checking')
       assert.deepEqual(summary.assistantSegments.map((segment) => segment.text), ['before ', 'done'])
+      const textIds = events
+        .filter((event) => event.kind === 'block' && event.block.kind === 'text')
+        .map((event) => (event.kind === 'block' && event.block.kind === 'text' ? event.block.messageId : undefined))
+      const thinkIds = events
+        .filter((event) => event.kind === 'block' && event.block.kind === 'thinking')
+        .map((event) => (event.kind === 'block' && event.block.kind === 'thinking' ? event.block.messageId : undefined))
+      assert.deepEqual(textIds, ['asst-1-s0', 'asst-1-s1'])
+      assert.deepEqual(thinkIds, ['think-1-s0'])
       assert.equal(summary.numTurns, 2)
       assert.deepEqual(summary.usage, {
         cost: 0,
@@ -116,9 +129,13 @@ for (const event of [
         cacheCreationTokens: 2,
         totalTokens: 37,
       })
-      assert.equal(summary.tools[0]?.toolName, 'read_file')
+      assert.equal(summary.tools[0]?.toolName, 'Read')
       assert.equal(summary.tools[0]?.output, '{"lines":42}')
       assert.equal(summary.tools[0]?.completed, true)
+      assert.equal(
+        (summary.tools[0]?.inputJson as { file_path?: string } | null)?.file_path,
+        'a.ts',
+      )
       assert.equal(adapter.nativeSessionId, 'next-session')
       assert.equal(totals.turns, 1)
       assert.ok(events.some((event) => event.kind === 'final' && event.meta?.cacheCreationTokens === 2))
@@ -137,6 +154,9 @@ for (const event of [
 
       const captured = JSON.parse(await readFile(capture, 'utf8')) as { argv: string[]; env: Record<string, string> }
       assert.deepEqual(captured.argv.slice(0, 4), ['--agent', 'grok-build', '--model', 'grok-4.6'])
+      const prompt = captured.argv[captured.argv.indexOf('-p') + 1]
+      assert.match(prompt, /OpenClaude Platform Context \(Grok adapter\)/)
+      assert.match(prompt, /fix it/)
       assert.ok(captured.argv.includes('--resume'))
       assert.equal(captured.argv[captured.argv.indexOf('--resume') + 1], 'prior-session')
       assert.equal(captured.argv[captured.argv.indexOf('--reasoning-effort') + 1], 'high')
@@ -146,11 +166,14 @@ for (const event of [
       assert.equal(captured.env.GROK_MODELS_BASE_URL, baseUrl)
       assert.equal(captured.env.GROK_MODELS_LIST_URL, `${baseUrl}/models`)
       assert.equal(captured.env.GROK_HOME, path.join(process.env.OPENCLAUDE_HOME!, 'grok-build'))
+      assert.equal(captured.env.OPENCLAUDE_ENGINE, 'grok')
+      assert.equal(captured.env.PATH, '/run/oc/platform/current/bin:/usr/local/bin:/usr/bin:/bin')
       assert.equal(captured.env.OPENCLAUDE_V3_CONTAINER_TOKEN, undefined)
       assert.equal(captured.env.HTTPS_PROXY, undefined)
       const managedConfig = await readFile(path.join(captured.env.GROK_HOME, 'config.toml'), 'utf8')
       assert.match(managedConfig, /\[shell_environment_policy\]/)
       assert.match(managedConfig, /exclude = \["XAI_\*", "GROK_\*"\]/)
+      assert.equal(managedConfig.includes('mcp_servers'), false)
     } finally {
       if (previousBin === undefined) delete process.env.OC_GROK_CLI_BIN; else process.env.OC_GROK_CLI_BIN = previousBin
       if (previousHome === undefined) delete process.env.OPENCLAUDE_HOME; else process.env.OPENCLAUDE_HOME = previousHome
@@ -396,6 +419,64 @@ setInterval(() => {}, 1000)
   })
 })
 
+
+test('projects openclaude-memory into GROK_HOME when a gateway token is present', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'oc-grok-mcp-'))
+  const fake = path.join(dir, 'fake-grok.cjs')
+  const capture = path.join(dir, 'capture.json')
+  await writeFile(fake, `#!/usr/bin/env node
+const fs = require('node:fs')
+fs.writeFileSync(process.env.FAKE_GROK_CAPTURE, JSON.stringify({ argv: process.argv.slice(2) }))
+console.log(JSON.stringify({ type: 'end', stopReason: 'end_turn', sessionId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, reasoning_tokens: 0 } }))
+`)
+  await chmod(fake, 0o755)
+  const previousBin = process.env.OC_GROK_CLI_BIN
+  const previousHome = process.env.OPENCLAUDE_HOME
+  const previousCapture = process.env.FAKE_GROK_CAPTURE
+  process.env.OC_GROK_CLI_BIN = fake
+  process.env.OPENCLAUDE_HOME = path.join(dir, 'openclaude-home')
+  process.env.FAKE_GROK_CAPTURE = capture
+  try {
+    const opts = createOpts(dir)
+    opts.config = {
+      ...opts.config,
+      gateway: { ...opts.config.gateway, port: 18790, accessToken: 'bearer-must-not-enter-argv' },
+    }
+    const adapter = new GrokAdapter(opts)
+    adapter.setGrokRoute({
+      baseUrl: `http://127.0.0.1:18790/internal/v5/grok-relay/route/${TOKEN}/v1`,
+      routeToken: TOKEN,
+    })
+    adapter.on('error', () => {})
+    const run = adapter.submitTurn({
+      input: 'use memory',
+      requestId: REQUEST_ID,
+      turnKey: TURN_KEY,
+      onEvent: () => {},
+      sessionTotals: { totalCostUSD: 0, turns: 0 },
+      toolUseIdToName: new Map(),
+    })
+    await run.submitted
+    await run.summary
+    const captured = JSON.parse(await readFile(capture, 'utf8')) as { argv: string[] }
+    const prompt = captured.argv[captured.argv.indexOf('-p') + 1]
+    assert.match(prompt, /use memory/)
+    assert.equal(prompt.includes('bearer-must-not-enter-argv'), false)
+    assert.equal(JSON.stringify(captured.argv).includes('bearer-must-not-enter-argv'), false)
+    const managedConfig = await readFile(path.join(process.env.OPENCLAUDE_HOME!, 'grok-build', 'config.toml'), 'utf8')
+    assert.match(managedConfig, /\[mcp_servers\."openclaude-memory"\]/)
+    assert.equal(managedConfig.includes('bearer-must-not-enter-argv'), false)
+    assert.equal(
+      await readFile(path.join(process.env.OPENCLAUDE_HOME!, 'grok-build', 'gateway-token'), 'utf8'),
+      'bearer-must-not-enter-argv',
+    )
+  } finally {
+    restoreEnv('OC_GROK_CLI_BIN', previousBin)
+    restoreEnv('OPENCLAUDE_HOME', previousHome)
+    restoreEnv('FAKE_GROK_CAPTURE', previousCapture)
+    await rm(dir, { recursive: true, force: true })
+  }
+})
 
 test('reads the cleaned native Grok summary carrier from the new checkpoint', async () => {
   const root = await mkdtemp(join(tmpdir(), 'grok-handoff-'))

@@ -30,6 +30,7 @@ export interface TaskboardUsage {
   runsToday: number
   costTodayUsd: number
   activeRuns: number
+  unpricedRunsToday: number
 }
 
 interface SettingsRow {
@@ -150,10 +151,19 @@ export function getUsage(db: TaskboardDb, now = Date.now()): TaskboardUsage {
   const start = startOfLocalDayMs(now)
   const today = db
     .prepare(
-      `SELECT COUNT(*) AS n, COALESCE(SUM(cost_usd), 0) AS cost
+      `SELECT COUNT(*) AS n,
+              COALESCE(SUM(cost_usd), 0) AS cost,
+              COALESCE(SUM(
+                CASE
+                  WHEN status != 'skipped'
+                   AND COALESCE(tokens_in, 0) + COALESCE(tokens_out, 0) > 0
+                   AND (cost_usd IS NULL OR cost_usd = 0)
+                  THEN 1 ELSE 0
+                END
+              ), 0) AS unpriced
          FROM tb_ticket_run WHERE created_at >= ?`,
     )
-    .get(start) as { n: number; cost: number }
+    .get(start) as { n: number; cost: number; unpriced: number }
   const active = db
     .prepare(
       `SELECT COUNT(*) AS n FROM tb_ticket_run
@@ -166,6 +176,7 @@ export function getUsage(db: TaskboardDb, now = Date.now()): TaskboardUsage {
     runsToday: today.n,
     costTodayUsd: today.cost,
     activeRuns: active.n,
+    unpricedRunsToday: today.unpriced,
   }
 }
 

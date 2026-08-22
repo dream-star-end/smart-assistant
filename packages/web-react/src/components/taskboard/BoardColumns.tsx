@@ -1,11 +1,13 @@
 import { Archive, Columns3 } from 'lucide-react'
 import { type DragEvent, type ReactNode, useEffect, useRef, useState } from 'react'
 import type { BoardColumn, Ticket } from '../../lib/taskboard'
+import { collectInboxTickets, stageColumnTickets } from '../../lib/taskboard'
 import { cn } from '../../lib/utils'
 import { Badge, EmptyState } from '../ui'
 import { TicketCard } from './TicketCard'
 import {
   BACKLOG_DROP_ID,
+  INBOX_DROP_ID,
   allowedDropIds,
   dropIdForMove,
   homeDropId,
@@ -15,6 +17,7 @@ import {
 export function BoardColumns({
   columns,
   backlogTickets = [],
+  inboxTickets = [],
   onOpenTicket,
   renderActions,
   onMove,
@@ -22,6 +25,7 @@ export function BoardColumns({
 }: {
   columns: BoardColumn[]
   backlogTickets?: Ticket[]
+  inboxTickets?: Ticket[]
   onOpenTicket?: (ticket: Ticket) => void
   renderActions?: (ticket: Ticket) => ReactNode
   onMove?: (ticket: Ticket, toStageId: string | null) => void
@@ -36,6 +40,7 @@ export function BoardColumns({
 
   const allowed = dragging ? allowedDropIds(dragging) : null
   const originDropId = dragging ? homeDropId(dragging) : null
+  const waitingTickets = collectInboxTickets({ inbox: inboxTickets, columns })
 
   const scrollerRef = (el: HTMLDivElement | null) => {
     overflowCleanup.current?.()
@@ -144,7 +149,7 @@ export function BoardColumns({
     />
   )
 
-  if (columns.length === 0 && backlogTickets.length === 0) {
+  if (columns.length === 0 && backlogTickets.length === 0 && waitingTickets.length === 0) {
     return (
       <EmptyState
         icon={Columns3}
@@ -157,11 +162,15 @@ export function BoardColumns({
   const overflowing = overflow.left || overflow.right
   const navItems = [
     { id: BACKLOG_DROP_ID, label: '积压', count: backlogTickets.length },
-    ...columns.map((col) => ({
-      id: dropIdForMove(col.stage.id),
-      label: col.stage.name,
-      count: col.tickets.length,
-    })),
+    { id: INBOX_DROP_ID, label: '待确认', count: waitingTickets.length },
+    ...columns.map((col) => {
+      const tickets = stageColumnTickets(col.tickets)
+      return {
+        id: dropIdForMove(col.stage.id),
+        label: col.stage.name,
+        count: tickets.length,
+      }
+    }),
   ]
 
   return (
@@ -220,15 +229,35 @@ export function BoardColumns({
             backlogTickets.map(renderCard)
           )}
         </BoardColumnFrame>
+        <BoardColumnFrame
+          dropId={INBOX_DROP_ID}
+          title="待确认"
+          typeLabel={ticketTypeLabel}
+          count={waitingTickets.length}
+          variant="inbox"
+          allowed={allowed}
+          originDropId={originDropId}
+          hoverDropId={hoverDropId}
+          onDragOver={overColumn}
+          onDrop={dropOnColumn}
+          onDragLeave={leaveColumn}
+        >
+          {waitingTickets.length === 0 && hoverDropId !== INBOX_DROP_ID ? (
+            <ColumnEmpty>agent 做完等人拍板的单会出现在这里。</ColumnEmpty>
+          ) : (
+            waitingTickets.map(renderCard)
+          )}
+        </BoardColumnFrame>
         {columns.map((col) => {
           const dropId = dropIdForMove(col.stage.id)
+          const tickets = stageColumnTickets(col.tickets)
           return (
             <BoardColumnFrame
               key={col.stage.id}
               dropId={dropId}
               stageId={col.stage.id}
               title={col.stage.name}
-              count={col.tickets.length}
+              count={tickets.length}
               variant="stage"
               kind={col.stage.kind}
               allowed={allowed}
@@ -238,10 +267,10 @@ export function BoardColumns({
               onDrop={dropOnColumn}
               onDragLeave={leaveColumn}
             >
-              {col.tickets.length === 0 && hoverDropId !== dropId ? (
+              {tickets.length === 0 && hoverDropId !== dropId ? (
                 <ColumnEmpty>这一列还没有单据</ColumnEmpty>
               ) : (
-                col.tickets.map(renderCard)
+                tickets.map(renderCard)
               )}
             </BoardColumnFrame>
           )
@@ -307,7 +336,7 @@ function BoardColumnFrame({
   title: string
   typeLabel?: string
   count: number
-  variant: 'backlog' | 'stage'
+  variant: 'backlog' | 'inbox' | 'stage'
   kind?: 'ai' | 'human' | 'gate'
   allowed: Set<string> | null
   originDropId: string | null
@@ -324,6 +353,7 @@ function BoardColumnFrame({
   const forbidden = dragging && !isOrigin && !canDrop
   const hover = dragging && canDrop && hoverDropId === dropId
   const backlog = variant === 'backlog'
+  const inbox = variant === 'inbox'
   const empty = count === 0
 
   useEffect(() => {
@@ -354,8 +384,10 @@ function BoardColumnFrame({
 
   return (
     <section
-      data-testid={backlog ? 'taskboard-backlog-column' : 'taskboard-column'}
-      data-stage-id={backlog ? BACKLOG_DROP_ID : stageId}
+      data-testid={
+        backlog ? 'taskboard-backlog-column' : inbox ? 'taskboard-inbox-column' : 'taskboard-column'
+      }
+      data-stage-id={backlog ? BACKLOG_DROP_ID : inbox ? INBOX_DROP_ID : stageId}
       data-drop-id={dropId}
       data-drop-allowed={dragging && canDrop ? 'true' : undefined}
       data-drop-source={isOrigin ? 'true' : undefined}
@@ -368,7 +400,7 @@ function BoardColumnFrame({
       onDragLeave={handleDragLeave}
       className={cn(
         'flex w-[calc(100vw-2rem)] max-w-[20rem] shrink-0 snap-start flex-col rounded-xl md:w-72 md:max-w-none md:snap-none',
-        backlog || empty
+        backlog || inbox || empty
           ? 'border border-dashed border-border bg-hover'
           : 'border border-transparent bg-bg',
         dragging && canDrop && 'border-solid border-accent bg-accent-soft',
@@ -378,7 +410,7 @@ function BoardColumnFrame({
     >
       <header className="sticky top-0 z-10 bg-inherit px-1 py-2">
         <h3 className="flex min-w-0 items-center gap-1.5 text-section font-semibold text-fg">
-          {backlog && <Archive size={14} className="shrink-0 text-faint" aria-hidden />}
+          {(backlog || inbox) && <Archive size={14} className="shrink-0 text-faint" aria-hidden />}
           <span className="truncate">{title}</span>
           {typeLabel && (
             <span data-testid="column-type-filter" className="shrink-0 font-normal text-faint">
@@ -394,7 +426,10 @@ function BoardColumnFrame({
             这里的单 AI 不会碰，拖进右边的站才会开工。
           </p>
         )}
-        {!backlog && kind && (
+        {inbox && (
+          <p className="mt-0.5 text-caption text-faint">人来拍板。通过后才会继续往下走。</p>
+        )}
+        {!backlog && !inbox && kind && (
           <p className="mt-0.5 text-caption text-faint">
             {kind === 'ai' ? 'AI 站' : kind === 'human' ? '人工站' : '闸门'}
           </p>

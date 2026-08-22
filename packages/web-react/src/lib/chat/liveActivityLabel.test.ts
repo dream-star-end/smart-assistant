@@ -48,6 +48,8 @@ describe("formatLiveActivityAction（活动行只显示中文动作，不堆工�
     expect(formatLiveActivityAction("Grep keepalive")).toBe("搜索代码");
     expect(formatLiveActivityAction("Glob **/*.ts")).toBe("搜索代码");
     expect(formatLiveActivityAction("WebSearch live activity")).toBe("搜索代码");
+    expect(formatLiveActivityAction("search_tool skill_search memory")).toBe("搜索代码");
+    expect(formatLiveActivityAction("use_tool skill_search")).toBe("搜索代码");
   });
 
   test("委派/子任务 → 运行子任务", () => {
@@ -67,7 +69,8 @@ describe("formatLiveActivityAction（活动行只显示中文动作，不堆工�
       formatLiveActivityAction("I am inspecting the reducer next"),
     ).toBe(LIVE_ACTIVITY_FALLBACK);
     expect(formatLiveActivityAction("/home/agent/secret.env")).toBe(LIVE_ACTIVITY_FALLBACK);
-    expect(formatLiveActivityAction("CallMcpTool skill_search coding")).toBe("执行操作");
+    expect(formatLiveActivityAction("CallMcpTool skill_search coding")).toBe("搜索代码");
+    expect(formatLiveActivityAction("CallMcpTool frobnicate_unknown coding")).toBe(LIVE_ACTIVITY_FALLBACK);
   });
 
   test("已是稳定中文标签则原样（可带被误拼的尾巴也会收成标签）", () => {
@@ -93,6 +96,9 @@ describe("formatLiveActivityAction（活动行只显示中文动作，不堆工�
     expect(mappedLiveActivityLabel("StrReplace")).toBe("写入文件");
     expect(mappedLiveActivityLabel("TaskUpdate")).toBe("更新任务");
     expect(mappedLiveActivityLabel("Task")).toBe("运行子任务");
+    expect(mappedLiveActivityLabel("run_terminal_command")).toBe("执行 Shell");
+    expect(mappedLiveActivityLabel("read_file")).toBe("读取文件");
+    expect(mappedLiveActivityLabel("search_replace")).toBe("写入文件");
     expect(mappedLiveActivityLabel("Frobnicate")).toBeNull();
     expect(mappedLiveActivityLabel("CallMcpTool")).toBeNull();
   });

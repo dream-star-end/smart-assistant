@@ -518,6 +518,13 @@ export function AssistantCard({
   const expectedError = sem.expected === true;
   const errorTone = presentedError?.waived || expectedError ? "warning" : "danger";
   const isUserCancelled = normalizedCode === "stopped" || normalizedCode === "user_cancelled";
+  const hasDisplayableBody = Boolean(
+    (msg.text && !hasError) || (hasError && presentedError?.bodyText),
+  );
+  // Phase-A 降级页只给 visible_head。中断轮的 head 经常是空正文，过程行还在物化。
+  // 判定只看服务端回显的 _displayDegradeReason，刷新后仍成立；物化完成后该字段消失，占位自动让位。
+  const showUnpublishedProcessPending =
+    msg._displayDegradeReason === "records_unpublished" && !hasDisplayableBody && !live;
   const isInsufficient = normalizedCode === "insufficient_credits";
   // 「精确重试」资格:非免单 + 该码可重试 + cta∈{retry,retry_or_switch} + 会话内能定位到带完整
   // payload 的原 user 行(_clientMessageId 命中且 status='error')。任一不满足 → 不显示精确「重试」,
@@ -592,13 +599,15 @@ export function AssistantCard({
             - 失败轮但模型已产出**合法部分回答**(R6:errorPresentation.bodyText,已剥离尾部终止器/
               内部串)→ 同样 Markdown 正常渲染,红卡在其下方(与 live 双卡形态一致);终止器/JSON
               内部串类正文不进这里(bodyText 为空),只由下方红卡按码文案承载;
+            - 用户主动停止同样走 bodyText：已经产生的部分回答必须可见，不能因为
+              stopped/user_cancelled 就整段藏掉（费用和过程都是真实发生过的）。
             - 流式已起但正文尚空 → 本轮活动指示取代裸三点。 */}
         {msg.text && !hasError ? (
           <OptionsGroupProvider live={live}>
             <ProgressiveMarkdown text={msg.text} live={live} />
             <OptionsGroupFooter />
           </OptionsGroupProvider>
-        ) : hasError && !isUserCancelled && presentedError?.bodyText ? (
+        ) : hasError && presentedError?.bodyText ? (
           <OptionsGroupProvider>
             <ProgressiveMarkdown text={presentedError.bodyText} />
             <OptionsGroupFooter />
@@ -711,7 +720,16 @@ export function AssistantCard({
           </Alert>
         )}
 
-        {!isUserCancelled && tokenUsage && tokenUsage.totalTokens > 0 && (
+        {showUnpublishedProcessPending && (
+          <output
+            className="mt-2.5 flex items-center gap-2 py-1 text-[13px] text-muted"
+            aria-label="过程记录整理中"
+          >
+            <span>过程记录整理中…</span>
+          </output>
+        )}
+
+        {tokenUsage && tokenUsage.totalTokens > 0 && (
           <div className="mt-2">
             <TokenUsageBadge usage={tokenUsage} />
           </div>
@@ -720,7 +738,9 @@ export function AssistantCard({
         {!live && !hasError && msg.text && (
           <MessageActions msg={msg} cb={cb} showRegen={showRegenerate && !hasError} />
         )}
-        {!live && !isUserCancelled && !(ctx.sending && ctx.inActiveTurn) && <MetaRow msg={msg} />}
+        {/* 中断轮仍要露出 requestId / 积分：这是 server usage 上的持久字段，
+            刷新后跟 server-wins 回显，不能因为 stopped 就整行藏掉。 */}
+        {!live && !(ctx.sending && ctx.inActiveTurn) && <MetaRow msg={msg} />}
         {/* 逐条评价反馈行(极轻,常驻):仅对有正文、非 error 的 assistant 回复出现,且**只挂在
             所在轮的末条 assistant 正文上**(turnFinalAssistant,轮边界判定在 turnSegment.ts)——
             一轮里穿插工具卡/思考卡/委派的多段中间文本回复不再各自带"这条回复怎么样?"(boss 07-11)。

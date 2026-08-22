@@ -214,6 +214,10 @@ describe('bridge API allowlist', () => {
       '/api/board/pipelines/:id',
     )
     assert.equal(
+      matchCommercialContainerApiProxy('/api/board/pipelines/pipe-1/reorder', 'PUT')?.label,
+      '/api/board/pipelines/:id/reorder',
+    )
+    assert.equal(
       matchCommercialContainerApiProxy('/api/board/pipelines/pipe-1/stages', 'GET')?.label,
       '/api/board/pipelines/:id/stages',
     )

@@ -12,6 +12,7 @@ import {
   GrokOAuthRefreshError,
   getFreshGrokAccessToken,
 } from '../account-pool/grokOAuth.js'
+import { directEgressDispatcher } from '../account-pool/egressDispatcher.js'
 
 describe('getFreshGrokAccessToken', () => {
   test('serializes refresh, uses the account dispatcher and persists a rotated refresh token', async () => {
@@ -123,5 +124,37 @@ describe('getFreshGrokAccessToken', () => {
     assert.ok(rollback >= 0)
     assert.ok(disable > rollback)
     assert.deepEqual(calls[disable]?.params, ['53', 'GROK_OAUTH_REFRESH_FAILED:400:invalid_grant'])
+  })
+
+  test('defaults to the process-direct dispatcher instead of the bound account egress', async () => {
+    const client = {
+      async query() { return { rows: [], rowCount: 0 } },
+      release() {},
+    }
+    let requestDispatcher: unknown
+    await getFreshGrokAccessToken(53n, {
+      now: () => Date.parse('2026-08-12T00:00:00.000Z'),
+      pool: { connect: async () => client } as never,
+      getSnapshot: async () => ({
+        id: 53n,
+        token: Buffer.from('expired-access'),
+        refresh: Buffer.from('old-refresh'),
+        expires_at: new Date('2026-08-11T00:00:00.000Z'),
+        principal_type: null,
+        principal_id: null,
+      }),
+      requestFn: (async (
+        _url: Parameters<typeof import('undici').request>[0],
+        init: Parameters<typeof import('undici').request>[1],
+      ) => {
+        requestDispatcher = init?.dispatcher
+        return {
+          statusCode: 200,
+          body: { text: async () => JSON.stringify({ access_token: 'fresh-access', expires_in: 3600 }) },
+        }
+      }) as never,
+      updateSnapshot: async () => true,
+    })
+    assert.strictEqual(requestDispatcher, directEgressDispatcher())
   })
 })

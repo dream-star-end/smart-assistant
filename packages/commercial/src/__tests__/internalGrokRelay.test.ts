@@ -16,6 +16,7 @@ import {
   GROK_RELAY_PREFIX,
   makeGrokRelayHandler,
 } from '../http/internalGrokRelay.js'
+import { directEgressDispatcher } from '../account-pool/egressDispatcher.js'
 
 const SECRET = 'b'.repeat(64)
 const CONTAINER_TOKEN = `oc-v3.11.${SECRET}`
@@ -209,6 +210,34 @@ describe('internal Grok relay', () => {
       assert.equal(response.status, 200)
       assert.equal(capturedUrl, `${GROK_OFFICIAL_UPSTREAM_BASE_URL}/api-key`)
       assert.equal(capturedAuth, 'Bearer real-xai-oauth-token')
+    } finally {
+      await close(server)
+    }
+  })
+
+  test('defaults to the process-direct dispatcher instead of the bound account egress', async () => {
+    let capturedDispatcher: unknown
+    const handler = makeGrokRelayHandler({
+      identityRepo: repo(),
+      resolveContext: async () => ({ modelId: 'grok-build', accountId: 53n, slotId: 'slot-53' }),
+      freshToken: async () => Buffer.from('real-xai-oauth-token', 'utf8'),
+      requestFn: (async (
+        _url: Parameters<typeof import('undici').request>[0],
+        init: Parameters<typeof import('undici').request>[1],
+      ) => {
+        capturedDispatcher = init?.dispatcher
+        return { statusCode: 200, headers: { 'content-type': 'application/json' }, body: Readable.from(['{}']) }
+      }) as never,
+      recordStatus: async () => {},
+    })
+    const server = createServer((req, res) => { void handler(req, res, CTX) })
+    const port = await listen(server)
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}${GROK_RELAY_PREFIX}/route/${ROUTE_TOKEN}/v1/api-key`, {
+        headers: { authorization: `Bearer ${CONTAINER_TOKEN}` },
+      })
+      assert.equal(response.status, 200)
+      assert.strictEqual(capturedDispatcher, directEgressDispatcher())
     } finally {
       await close(server)
     }

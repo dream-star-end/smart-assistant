@@ -481,3 +481,81 @@ describe("子任务摘要不回退到 prompt", () => {
     expect(toolSummary("delegate_task", { agentId: "coder", goal: "修显示层" })).toBe("→ coder 修显示层");
   });
 });
+
+describe("Grok 原生工具卡归一化", () => {
+  test("run_terminal_command + 字节数组输出 → Bash 终端卡可读文本", () => {
+    const linux = "Linux 6.8.0-117-generic\n";
+    const d = normalizeToolForDisplay({
+      toolName: "run_terminal_command",
+      inputJson: { command: "uname -a", description: "Collect OS info" },
+      output: JSON.stringify({ type: "Bash", output: [...new TextEncoder().encode(linux)] }),
+      _completed: true,
+    });
+    expect(d.name).toBe("Bash");
+    expect(d.input?.command).toBe("uname -a");
+    expect(d.tool.output).toBe(linux);
+    expect(resolveToolMeta(d.name, d.input).label).toBe("终端");
+    expect(toolSummary(d.name, d.input as Record<string, unknown>)).toBe("Collect OS info");
+  });
+
+  test("read_file path 别名 → Read.file_path", () => {
+    const d = normalizeToolForDisplay({
+      toolName: "GrokBuild:read_file",
+      inputJson: { path: "src/a.ts", offset: 10 },
+      output: JSON.stringify({ type: "FileContent", content: "export const x = 1\n" }),
+      _completed: true,
+    });
+    expect(d.name).toBe("Read");
+    expect(d.input?.file_path).toBe("src/a.ts");
+    expect(d.tool.output).toBe("export const x = 1\n");
+  });
+
+  test("Grok search_tool / use_tool 包装成产品卡", () => {
+    const search = normalizeToolForDisplay({
+      toolName: "search_tool",
+      inputJson: { query: "skill_search memory", limit: 15 },
+      _completed: true,
+    });
+    expect(search.name).toBe("McpSearch");
+    expect(search.input?.query).toBe("skill_search memory");
+    expect(resolveToolMeta(search.name, search.input).label).toBe("查找工具");
+
+    const used = normalizeToolForDisplay({
+      toolName: "use_tool",
+      inputJson: {
+        tool_name: "openclaude-memory__skill_view",
+        tool_input: { name: "openclaude-instance-topology" },
+      },
+      output: JSON.stringify({
+        type: "MCP",
+        tool_name: "skill_view",
+        server_name: "openclaude-memory",
+        output: { OkayOutput: "topology skill" },
+      }),
+      _completed: true,
+    });
+    expect(used.name).toBe("mcp__openclaude-memory__skill_view");
+    expect(used.input?.name).toBe("openclaude-instance-topology");
+    expect(used.tool.output).toBe("topology skill");
+  });
+
+  test("Grok MCP server__tool 名映射到产品 mcp__ 卡", () => {
+    const d = normalizeToolForDisplay({
+      toolName: "openclaude-memory__skill_search",
+      inputJson: { query: "memory" },
+      _completed: true,
+    });
+    expect(d.name).toBe("mcp__openclaude-memory__skill_search");
+  });
+
+  test("search_replace 空 old_string 当写入", () => {
+    const d = normalizeToolForDisplay({
+      toolName: "search_replace",
+      inputJson: { path: "src/new.ts", old_string: "", new_string: "hello" },
+      _completed: true,
+    });
+    expect(d.name).toBe("Write");
+    expect(d.input?.file_path).toBe("src/new.ts");
+    expect(d.input?.content).toBe("hello");
+  });
+});

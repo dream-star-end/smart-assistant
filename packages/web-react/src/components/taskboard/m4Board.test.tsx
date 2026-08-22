@@ -450,7 +450,7 @@ describe('流水线模板', () => {
 })
 
 describe('阶段拖拽排序', () => {
-  test('上移/下移与 drop 都会 PATCH ordinal', async () => {
+  test('上移/下移与 drop 都走一次原子 reorder', async () => {
     const pipeline = {
       id: 'pipe1',
       projectId: 'p1',
@@ -465,12 +465,9 @@ describe('阶段拖拽排序', () => {
     vi.spyOn(taskboardApi, 'listPipelines').mockResolvedValue([pipeline])
     vi.spyOn(taskboardApi, 'getPipeline').mockResolvedValue({ pipeline, stages: [s1, s2] })
     vi.spyOn(taskboardApi, 'listAgents').mockResolvedValue([])
-    const patchStage = vi
-      .spyOn(taskboardApi, 'patchStage')
-      .mockImplementation(async (_a, id, body) => ({
-        ok: true,
-        stage: id === 's1' ? { ...s1, ...body } : { ...s2, ...body },
-      }))
+    const reorderStages = vi
+      .spyOn(taskboardApi, 'reorderStages')
+      .mockResolvedValue({ ok: true, items: [s2, s1] })
     wrap(<StageSettings auth={auth} projectId="p1" />)
     fireEvent.click(screen.getByTestId('stage-settings-open'))
     await screen.findByTestId('stage-row-s1')
@@ -478,16 +475,12 @@ describe('阶段拖拽排序', () => {
       fireEvent.click(screen.getByTestId('stage-down-s1'))
     })
     await waitFor(() => {
-      expect(patchStage).toHaveBeenCalled()
+      expect(reorderStages).toHaveBeenCalledTimes(1)
     })
-    const ordinals = patchStage.mock.calls.map((c) => [
-      c[1],
-      (c[2] as { ordinal?: number }).ordinal,
-    ])
-    expect(ordinals.some((row) => row[1] === 0)).toBe(true)
-    expect(ordinals.some((row) => row[1] === 1)).toBe(true)
+    expect(reorderStages.mock.calls[0]?.[1]).toBe('pipe1')
+    expect(reorderStages.mock.calls[0]?.[2]).toEqual(['s2', 's1'])
 
-    patchStage.mockClear()
+    reorderStages.mockClear()
     const dt = {
       data: {} as Record<string, string>,
       effectAllowed: 'move',
@@ -508,7 +501,7 @@ describe('阶段拖拽排序', () => {
       fireEvent.drop(target, { dataTransfer: dt })
     })
     await waitFor(() => {
-      expect(patchStage).toHaveBeenCalled()
+      expect(reorderStages).toHaveBeenCalled()
     })
   })
 })
