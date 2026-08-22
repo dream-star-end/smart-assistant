@@ -2450,6 +2450,27 @@ describe("userChatBridge / Grok subscription relay", () => {
     ws2.close();
   });
 
+  test("container close after forward releases the durable Grok lease", async () => {
+    const containerOpenP = waitNextContainerSocket(rig);
+    const ws = openClient(rig.gatewayPort, await makeJwt("24"));
+    await waitOpen(ws);
+    const containerWs = await containerOpenP;
+
+    ws.send(JSON.stringify({
+      type: "inbound.message",
+      peer: { id: "grok-peer", kind: "dm" },
+      agentId: "grok",
+      model: "grok-build",
+      content: "agent crashed after submit",
+    }));
+    await waitContainerNextFrame(containerWs);
+    containerWs.close();
+    await waitUntil(() => releasedLeases.length === 1, 2_000);
+    assert.deepEqual(releasedLeases, [{ accountId: 53n, slotId: "slot-grok" }],
+      "container death closes the billing channel; crash must not keep the 7-day grok lease");
+    ws.close();
+  });
+
   test("same-bridge durable release rejection retains exact identity for immutable billing retry", async () => {
     rejectNextDurableRelease = true;
     let releaseFirstAttempt!: () => void;

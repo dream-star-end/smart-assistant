@@ -8441,9 +8441,16 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // keep it active across reconnect and let its container+user-bound TTL own
       // cleanup if no later terminal frame reaches this bridge.
       for (const state of [...activeCodexTurnsByPeer.values()]) {
-        // A forwarded Grok turn can outlive this browser bridge. Keep its account slot
-        // leased to the relay; terminal handling or the generic slot reaper releases it.
-        const preserveGrokSlot = state.engine === "grok" && state.turnForwarded;
+        // Browser disconnect can reconnect; the container then still sends the
+        // terminal billing frame that expires grok_route_contexts. Container
+        // close/error is the billing channel dying (crash / E2BIG / stop), so
+        // nobody will send that frame — preserve would occupy the 10-slot cap
+        // for the 7-day orphan TTL, and allocate() restores those rows into
+        // the in-process scheduler before every new grok turn.
+        const billingChannelDead =
+          finalCause === "container_close" || finalCause === "container_error";
+        const preserveGrokSlot =
+          state.engine === "grok" && state.turnForwarded && !billingChannelDead;
         releaseCodexTurnState(state, "bridge_cleanup", !state.turnForwarded, preserveGrokSlot);
       }
       try { connectAbort.abort(); } catch { /* */ }
