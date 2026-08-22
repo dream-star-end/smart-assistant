@@ -44,6 +44,143 @@ type UnknownRecord = Record<string, unknown>
 
 const DATA_URI_PREFIX = 'data:'
 const DATA_URI_BASE64_SEPARATOR = ';base64,'
+const API_MEDIA_URL_PREFIX = '/api/media/'
+const MODEL_HISTORY_UPLOADS_PREFIX = '/home/agent/.openclaude/uploads/'
+const MODEL_HISTORY_GENERATED_PREFIX = '/home/agent/.openclaude/generated/'
+const MODEL_HISTORY_MEDIA_NAME_RE = /^[A-Za-z0-9._@+=,-]{1,180}$/
+const MODEL_HISTORY_MEDIA_KIND_ORDER = ['image', 'audio', 'video', 'file'] as const
+type ModelHistoryMediaKind = (typeof MODEL_HISTORY_MEDIA_KIND_ORDER)[number]
+
+function isSafeMediaFileName(name: string): boolean {
+  return MODEL_HISTORY_MEDIA_NAME_RE.test(name) && !name.includes('..')
+}
+
+function trustedContainerMediaPath(value: string): string | null {
+  const path = value.trim()
+  if (!path || path.includes('..') || /[\s\u0000-\u001F\u007F]/.test(path)) return null
+  for (const prefix of [MODEL_HISTORY_UPLOADS_PREFIX, MODEL_HISTORY_GENERATED_PREFIX]) {
+    if (!path.startsWith(prefix)) continue
+    const rest = path.slice(prefix.length)
+    if (!isSafeMediaFileName(rest)) return null
+    return path
+  }
+  return null
+}
+
+function containerPathFromApiMediaUrl(url: string): string | null {
+  if (!url.startsWith(API_MEDIA_URL_PREFIX)) return null
+  const raw = url.slice(API_MEDIA_URL_PREFIX.length).split(/[?#]/, 1)[0] ?? ''
+  let filename: string
+  try {
+    filename = decodeURIComponent(raw)
+  } catch {
+    return null
+  }
+  if (!isSafeMediaFileName(filename)) return null
+  return trustedContainerMediaPath(MODEL_HISTORY_UPLOADS_PREFIX + filename)
+}
+
+function mediaKindOf(value: unknown): ModelHistoryMediaKind | null {
+  return value === 'image' || value === 'audio' || value === 'video' || value === 'file'
+    ? value
+    : null
+}
+
+function compactMediaMeta(value: unknown): string {
+  if (typeof value !== 'string') return ''
+  const compact = value.replace(/[\r\n]+/g, ' ').trim()
+  if (!compact || compact.length > 128 || /[\u0000-\u001F\u007F]/.test(compact)) return ''
+  return compact
+}
+
+function containerPathFromMediaItem(item: UnknownRecord): string | null {
+  if (item.hidden === true) return null
+  if (typeof item.path === 'string') {
+    const fromPath = trustedContainerMediaPath(item.path)
+    if (fromPath) return fromPath
+  }
+  if (typeof item.url === 'string') return containerPathFromApiMediaUrl(item.url)
+  return null
+}
+
+function mediaKindHeading(kind: ModelHistoryMediaKind): string {
+  switch (kind) {
+    case 'image': return '用户附带了以下图片(已保存到服务器本地):'
+    case 'audio': return '用户附带了以下音频文件(已保存到服务器本地):'
+    case 'video': return '用户附带了以下视频文件(已保存到服务器本地):'
+    case 'file': return '用户还附带了以下文档(已保存到服务器本地):'
+  }
+}
+
+/** Fold persisted `_media` into model history as trusted container paths.
+ * Never copies base64, localSrc, or data URIs. Master has no container volume,
+ * so this is a textual projection only. */
+function formatUserMediaPathHints(message: UnknownRecord, alreadyVisible: string): string {
+  if (!Array.isArray(message._media)) return ''
+  const grouped = new Map<ModelHistoryMediaKind, string[]>()
+  const seen = new Set<string>()
+  for (const raw of message._media) {
+    const item = asRecord(raw)
+    if (!item) continue
+    const path = containerPathFromMediaItem(item)
+    if (!path || seen.has(path) || alreadyVisible.includes(path)) continue
+    seen.add(path)
+    const kind = mediaKindOf(item.kind) ?? 'file'
+    const mime = compactMediaMeta(item.mimeType)
+    const name = compactMediaMeta(item.filename)
+    const details = [mime, name ? `原名: ${name}` : ''].filter(Boolean).join(', ')
+    const line = details ? `- \`${path}\` (${details})` : `- \`${path}\``
+    const rows = grouped.get(kind)
+    if (rows) rows.push(line)
+    else grouped.set(kind, [line])
+  }
+  const sections: string[] = []
+  for (const kind of MODEL_HISTORY_MEDIA_KIND_ORDER) {
+    const rows = grouped.get(kind)
+    if (!rows?.length) continue
+    sections.push(mediaKindHeading(kind), ...rows)
+  }
+  return sections.join('\n')
+}
+
+const TRUSTED_CONTAINER_MEDIA_PATH_RE =
+  /\/home\/agent\/\.openclaude\/(?:uploads|generated)\/[A-Za-z0-9._@+=,-]{1,180}/g
+
+/** Unique trusted attachment paths from a history window. Used by native
+ * model-switch handoff, which otherwise only carries a text summary. */
+export function collectModelHistoryMediaPathHints(
+  messages: unknown[],
+  alreadyVisible = '',
+): string {
+  const already = new Set<string>()
+  TRUSTED_CONTAINER_MEDIA_PATH_RE.lastIndex = 0
+  for (const match of alreadyVisible.matchAll(TRUSTED_CONTAINER_MEDIA_PATH_RE)) {
+    already.add(match[0])
+  }
+  const ordered: string[] = []
+  const seen = new Set(already)
+  for (const raw of messages) {
+    const message = asRecord(raw)
+    if (!message) continue
+    const blob = [
+      formatUserMediaPathHints(message, alreadyVisible),
+      typeof message.text === 'string' ? message.text : '',
+      typeof message._modelText === 'string' ? message._modelText : '',
+    ].join('\n')
+    TRUSTED_CONTAINER_MEDIA_PATH_RE.lastIndex = 0
+    for (const match of blob.matchAll(TRUSTED_CONTAINER_MEDIA_PATH_RE)) {
+      const path = match[0]
+      if (seen.has(path)) continue
+      seen.add(path)
+      ordered.push(path)
+    }
+  }
+  if (ordered.length === 0) return ''
+  return [
+    'Earlier user turns attached these local files. Read them if the task still depends on their contents.',
+    ...ordered.map((path) => `- \`${path}\``),
+  ].join('\n')
+}
 
 function isBase64Character(char: string): boolean {
   const code = char.charCodeAt(0)
@@ -287,16 +424,15 @@ export function modelHistorySemanticText(value: unknown): string {
   const parts: string[] = []
   const body = textContent(message)
   switch (role) {
-    case 'user':
-      appendSection(
-        parts,
-        '',
-        formatMessageReplyPrompt(
-          typeof message._modelText === 'string' ? message._modelText : body,
-          normalizeMessageReplyQuote(message._replyTo),
-        ),
+    case 'user': {
+      const prompt = formatMessageReplyPrompt(
+        typeof message._modelText === 'string' ? message._modelText : body,
+        normalizeMessageReplyQuote(message._replyTo),
       )
+      appendSection(parts, '', prompt)
+      appendSection(parts, '', formatUserMediaPathHints(message, prompt))
       break
+    }
     case 'assistant':
       appendSection(parts, '', body)
       break

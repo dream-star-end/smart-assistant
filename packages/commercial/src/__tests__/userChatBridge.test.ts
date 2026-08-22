@@ -303,6 +303,32 @@ describe("sanitizeMasterHistoricalMessagesForFrame", () => {
       { id: "t1", role: "tool", text: "Tool: Bash\nInput: {\"command\":\"pwd\"}\nOutput: /srv" },
     ]);
   });
+
+  test("folds user _media into text paths and does not forward _media or base64", () => {
+    const digest = `${"e".repeat(64)}.jpg`;
+    const rows = _sanitizeMasterHistoricalMessagesForFrame([
+      {
+        id: "u-img",
+        role: "user",
+        text: "",
+        _media: [
+          {
+            kind: "image",
+            url: `/api/media/${digest}`,
+            mimeType: "image/jpeg",
+            filename: "shot.jpg",
+            base64: "QUJDRA==",
+          },
+        ],
+      },
+    ]);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0]?.id, "u-img");
+    assert.equal(rows[0]?.role, "user");
+    assert.match(String(rows[0]?.text), new RegExp(`/home/agent/\\.openclaude/uploads/${digest}`));
+    assert.equal(Object.prototype.hasOwnProperty.call(rows[0], "_media"), false);
+    assert.doesNotMatch(String(rows[0]?.text), /QUJDRA==/);
+  });
 });
 
 describe("ContainerUnreadyError", () => {

@@ -70,6 +70,7 @@ import {
   assessTurnRecoveryTape,
   type CallTokenUsageSnapshot,
   AUTHORITY_TURN_MAX_LIFETIME_MS,
+  collectModelHistoryMediaPathHints,
   modelHistoryRoleLabel,
   modelHistorySemanticRole,
   modelHistorySemanticText,
@@ -410,18 +411,26 @@ export function buildHistoricalContextPrompt(
   ].join('\n')
 }
 
-function buildNativeModelHandoffContext(summaryText: string): string {
-  return [
+function buildNativeModelHandoffContext(summaryText: string, mediaPathHints = ''): string {
+  const sections = [
     '<openclaude_native_model_handoff>',
     'The previous source model compacted this populated session for the selected target model. Treat the following native handoff as prior conversation context. Do not restate it unless needed.',
     summaryText,
-    '</openclaude_native_model_handoff>',
-  ].join('\n')
+  ]
+  if (mediaPathHints.trim()) {
+    sections.push('', mediaPathHints.trimEnd())
+  }
+  sections.push('</openclaude_native_model_handoff>')
+  return sections.join('\n')
 }
 
-export function buildNativeModelHandoffPrompt(summaryText: string, currentUserText: string): string {
+export function buildNativeModelHandoffPrompt(
+  summaryText: string,
+  currentUserText: string,
+  mediaPathHints = '',
+): string {
   return [
-    buildNativeModelHandoffContext(summaryText),
+    buildNativeModelHandoffContext(summaryText, mediaPathHints),
     '',
     '<current_user_message>',
     currentUserText,
@@ -432,12 +441,13 @@ export function buildNativeModelHandoffPrompt(summaryText: string, currentUserTe
 export function buildNativeModelHandoffPayload(
   summaryText: string,
   currentUserInput: string | Array<{ type: string; [key: string]: unknown }>,
+  mediaPathHints = '',
 ): string | Array<{ type: string; [key: string]: unknown }> {
   if (typeof currentUserInput === 'string') {
-    return buildNativeModelHandoffPrompt(summaryText, currentUserInput)
+    return buildNativeModelHandoffPrompt(summaryText, currentUserInput, mediaPathHints)
   }
   return [
-    { type: 'text', text: buildNativeModelHandoffContext(summaryText) },
+    { type: 'text', text: buildNativeModelHandoffContext(summaryText, mediaPathHints) },
     ...currentUserInput,
   ]
 }
@@ -3962,7 +3972,38 @@ export class SessionManager {
           ? transition
           : null
       if (nativeHandoff) {
-        runnerPayload = buildNativeModelHandoffPayload(nativeHandoff.summaryText!, userTextOrBlocks)
+        let historyForMedia = effectiveMasterHistoricalMessages
+        if (!historyForMedia) {
+          try {
+            historyForMedia = mergePendingExternalHistory(
+              (await getEngineContextMessages(
+                session.peerId,
+                session.userId ?? 'default',
+                {
+                  contextWindow:
+                    opts?.modelAuthority?.executionDescriptor.contextWindow ??
+                    (session.providerTag === 'codex' ? null : undefined),
+                  engine: session.providerTag,
+                  currentUserText: typeof userTextOrBlocks === 'string' ? userTextOrBlocks : '',
+                  ...(opts?.replayLifecycle?.clientMessageId
+                    ? { excludeClientMessageId: opts.replayLifecycle.clientMessageId }
+                    : {}),
+                },
+              )) ?? [],
+            )
+          } catch {
+            historyForMedia = []
+          }
+        }
+        const mediaPathHints = collectModelHistoryMediaPathHints(
+          historyForMedia,
+          nativeHandoff.summaryText ?? '',
+        )
+        runnerPayload = buildNativeModelHandoffPayload(
+          nativeHandoff.summaryText!,
+          userTextOrBlocks,
+          mediaPathHints,
+        )
         nativeHandoff.summaryInjected = true
         session._historicalContextInjected = true
         session._historicalContextInjectedKey = `native-switch:${nativeHandoff.id}`
