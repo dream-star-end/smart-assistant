@@ -1127,6 +1127,12 @@ async function uniqueImageFileInput(scope) {
   }
   return matches.length === 1 ? matches[0] : null;
 }
+async function isUploadPreviewImage(node) {
+  if (!await node.isVisible().catch(() => false)) return false;
+  const src = String(await node.getAttribute('src').catch(() => '') || '');
+  if (/^(blob:|data:)/i.test(src)) return true;
+  return false;
+}
 async function countVisibleImages(scope) {
   if (!scope || typeof scope.locator !== 'function') return 0;
   const nodes = scope.locator('img');
@@ -1134,10 +1140,21 @@ async function countVisibleImages(scope) {
   let visibleCount = 0;
   const total = Math.min(await nodes.count().catch(() => 0), 40);
   for (let index = 0; index < total; index += 1) {
-    const node = nodes.nth(index);
-    if (await node.isVisible().catch(() => false)) visibleCount += 1;
+    if (await isUploadPreviewImage(nodes.nth(index))) visibleCount += 1;
   }
   return visibleCount;
+}
+async function awaitComposerCleared(page, editor, timeout) {
+  const deadline = Date.now() + timeout;
+  const attempts = Math.max(1, Math.ceil(timeout / 250));
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    if (!(await readPostComposer(editor))) return true;
+    const remaining = deadline - Date.now();
+    if (attempt < attempts - 1 && remaining > 0) {
+      await page.waitForTimeout(Math.min(250, remaining));
+    }
+  }
+  return false;
 }
 async function awaitComposerMediaReady(page, editor, expected, timeout) {
   const scope = (await composerScope(editor)) || page;
@@ -1222,7 +1239,8 @@ async function postComposerEditor(page, longText) {
 async function readPostComposer(editor) {
   const value = await editor.inputValue().catch(() => '');
   if (value) return cleanText(value, 20000);
-  return cleanText(await editor.innerText().catch(() => ''), 20000);
+  const inner = typeof editor.innerText === 'function' ? await editor.innerText().catch(() => '') : '';
+  return cleanText(inner, 20000);
 }
 async function provePostSendReady(send, timeout) {
   if (!send) throw new Error('send');
@@ -1336,9 +1354,11 @@ async function writeAction(page, input) {
     const send = await awaitPostSendReady(page, manifest.length ? 90_000 : 30_000, freshEditor);
     const clickFailure = await activatePostSend(send);
     await page.waitForTimeout(2500);
+    const cleared = await awaitComposerCleared(page, freshEditor, 10_000);
     const post = await awaitNewestOwnPost(page, selfId, expectedText, beforeIds);
     if (!post) {
       if (clickFailure) throw clickFailure;
+      if (manifest.length && !cleared) throw new Error('send');
       throw new Error('result');
     }
     return { post };

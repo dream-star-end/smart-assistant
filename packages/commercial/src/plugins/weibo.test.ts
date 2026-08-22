@@ -35,7 +35,10 @@ function framed(value: unknown): Buffer {
 function uploadedImageLocator(events: string[]) {
   return {
     count: async () => (events.includes('upload') ? 1 : 0),
-    nth: () => ({ isVisible: async () => true }),
+    nth: () => ({
+      isVisible: async () => true,
+      getAttribute: async () => 'blob:https://weibo.com/preview',
+    }),
   }
 }
 
@@ -185,14 +188,14 @@ describe('official Weibo Plugin', () => {
   })
 
   test('pins the current artifact and only the exact production predecessor', () => {
-    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.5')
+    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.6')
     assert.equal(WEIBO_DRIVER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.equal(WEIBO_LAUNCHER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.deepEqual(WEIBO_SETUP_COMPATIBLE_PREDECESSORS, [
       {
-        version: '1.6.4',
-        artifactHash: 'a664aae0a18f1d246b71f546f275d355cbff984f70f37606e406781556025aa0',
-        execContractHash: 'bf8e2e0ea02afb93622dc8360d753716b6118f939090ed1d61267c560da1b450',
+        version: '1.6.5',
+        artifactHash: '42fae72536ede1c77133ee7dc56b1d075690d82efd3dc06cf19c1bc05059bb8b',
+        execContractHash: '064c830cc47b9d39d6cb0fdb592a83e15abe5e1ff85b9d9d5fe550eb787a13dd',
       },
     ])
     assert.equal(
@@ -432,6 +435,9 @@ describe('official Weibo Plugin', () => {
     assert.match(WEIBO_WORKER_SOURCE, /exactMenuItem\(scope, '本地上传'\)/)
     assert.match(WEIBO_WORKER_SOURCE, /exactMenuItem\(scope, '发送'\)/)
     assert.match(WEIBO_WORKER_SOURCE, /awaitComposerMediaReady/)
+    assert.match(WEIBO_WORKER_SOURCE, /isUploadPreviewImage/)
+    assert.match(WEIBO_WORKER_SOURCE, /blob:\|data:/)
+    assert.match(WEIBO_WORKER_SOURCE, /awaitComposerCleared/)
     assert.match(
       createPostSource,
       /awaitPostSendReady\(page, manifest.length \? 90_000 : 30_000, freshEditor\)/,
@@ -705,7 +711,10 @@ describe('official Weibo Plugin', () => {
     const events: string[] = []
     let collectCount = 0
     let realClicks = 0
-    const textarea = { fill: async () => {}, inputValue: async () => 'hello' }
+    const textarea = {
+      fill: async () => {},
+      inputValue: async () => (events.includes('click') ? '' : 'hello'),
+    }
     const send = {
       isDisabled: async () => false,
       click: async (options: { trial?: boolean }) => {
@@ -802,7 +811,10 @@ describe('official Weibo Plugin', () => {
 
   test('create_post uses a unique hidden composer file input without a native chooser', async () => {
     const events: string[] = []
-    const textarea = { fill: async () => {}, inputValue: async () => 'hello' }
+    const textarea = {
+      fill: async () => {},
+      inputValue: async () => (events.includes('click') ? '' : 'hello'),
+    }
     const fileInput = {
       setInputFiles: async () => events.push('upload'),
       evaluate: async (
@@ -876,7 +888,7 @@ describe('official Weibo Plugin', () => {
     }
     const textarea = {
       fill: async () => {},
-      inputValue: async () => 'hello',
+      inputValue: async () => (events.includes('click') ? '' : 'hello'),
       locator: () => composerRoot,
     }
     const send = {
@@ -983,9 +995,64 @@ describe('official Weibo Plugin', () => {
     assert.deepEqual(events, ['image-trial', 'image-click', 'dispatch', 'upload'])
   })
 
-  test('create_post opens 本地上传 when 图片 does not raise a native chooser', async () => {
+  test('create_post ignores https avatar images when waiting for upload preview', async () => {
     const events: string[] = []
     const textarea = { fill: async () => {}, inputValue: async () => 'hello' }
+    const imageTrigger = {
+      click: async (options: { trial?: boolean }) =>
+        events.push(options.trial ? 'image-trial' : 'image-click'),
+    }
+    const imageChooser = {
+      setFiles: async () => events.push('upload'),
+      element: () => ({ evaluate: async () => 1 }),
+    }
+    const avatar = {
+      count: async () => 1,
+      nth: () => ({
+        isVisible: async () => true,
+        getAttribute: async () => 'https://tvax1.sinaimg.cn/crop.0.0.1080.1080.50/avatar.jpg',
+      }),
+    }
+    const harness = compileWorkerPostHarness({
+      ensureSelfId: async () => '12345',
+      gotoAuthenticated: async () => {},
+      collectPosts: async () => [],
+      uniqueVisible: async () => textarea,
+      assertNoChallenge: async () => {},
+      awaitDispatch: async () => events.push('dispatch'),
+      exactMenuItem: async (_page: unknown, text: string) =>
+        text === '图片' ? imageTrigger : { click: async () => events.push('click') },
+      cleanText: (value: unknown) => String(value).trim(),
+      readFile: async () => Buffer.from('image'),
+    })
+
+    await assert.rejects(
+      harness.writeAction(
+        {
+          locator: (selector: string) => (selector === 'img' ? avatar : {}),
+          waitForEvent: async () => imageChooser,
+          waitForTimeout: async () => {},
+        },
+        {
+          actionId: 'create_post',
+          params: {
+            text: 'hello',
+            mediaManifest: [{ inputId: 'asset-1', filename: 'image.png', mimeType: 'image/png' }],
+          },
+        },
+      ),
+      /media/,
+    )
+    assert.ok(!events.includes('click'))
+    assert.deepEqual(events, ['image-trial', 'image-click', 'dispatch', 'upload'])
+  })
+
+  test('create_post opens 本地上传 when 图片 does not raise a native chooser', async () => {
+    const events: string[] = []
+    const textarea = {
+      fill: async () => {},
+      inputValue: async () => (events.includes('click') ? '' : 'hello'),
+    }
     let localClicked = false
     const imageTrigger = {
       click: async (options: { trial?: boolean }) =>
@@ -1071,7 +1138,10 @@ describe('official Weibo Plugin', () => {
     }
     const send = {
       click: async (options: { trial?: boolean }) => {
-        if (!options.trial) events.push('click')
+        if (!options.trial) {
+          events.push('click')
+          filled = ''
+        }
       },
     }
     const imageTrigger = {
@@ -1115,7 +1185,7 @@ describe('official Weibo Plugin', () => {
       },
     })
     assert.deepEqual(result, { post: { id: 'long-post', owned: true, text: longText } })
-    assert.equal(filled, longText)
+    assert.equal(filled, '')
     assert.deepEqual(events, [
       'long-text',
       'image-trial',
@@ -1138,7 +1208,10 @@ describe('official Weibo Plugin', () => {
     }
     const send = {
       click: async (options: { trial?: boolean }) => {
-        if (!options.trial) events.push('click')
+        if (!options.trial) {
+          events.push('click')
+          filled = ''
+        }
       },
     }
     const imageTrigger = {
@@ -1183,7 +1256,7 @@ describe('official Weibo Plugin', () => {
       },
     )
     assert.deepEqual(result, { post: { id: 'plain-long', owned: true, text: longText } })
-    assert.equal(filled, longText)
+    assert.equal(filled, '')
     assert.deepEqual(events, ['image-trial', 'image-click', 'dispatch', 'upload', 'click'])
   })
 
@@ -1298,6 +1371,7 @@ describe('official Weibo Plugin', () => {
               input.addEventListener('change', () => {
                 const preview = document.createElement('img');
                 preview.alt = 'preview';
+                preview.src = 'blob:https://weibo.com/preview';
                 document.body.append(preview);
                 setTimeout(() => { document.querySelector('#send').disabled = false; }, 400);
               });
@@ -1306,9 +1380,11 @@ describe('official Weibo Plugin', () => {
             });
             document.querySelector('#send').addEventListener('click', () => {
               window.sendClicks += 1;
+              const textarea = document.querySelector('textarea');
               const post = document.createElement('article');
               post.dataset.id = 'new-post';
-              post.textContent = document.querySelector('textarea').value;
+              post.textContent = textarea.value;
+              textarea.value = '';
               document.body.append(post);
             });
           </script>`)
@@ -1402,14 +1478,17 @@ describe('official Weibo Plugin', () => {
             document.querySelector('#file').addEventListener('change', () => {
               const preview = document.createElement('img');
               preview.alt = 'preview';
+              preview.src = 'blob:https://weibo.com/preview';
               document.querySelector('#composer').append(preview);
               setTimeout(() => { document.querySelector('#send').disabled = false; }, 400);
             });
             document.querySelector('#send').addEventListener('click', () => {
               window.sendClicks += 1;
+              const textarea = document.querySelector('textarea');
               const post = document.createElement('article');
               post.dataset.id = 'hidden-post';
-              post.textContent = document.querySelector('textarea').value;
+              post.textContent = textarea.value;
+              textarea.value = '';
               document.body.append(post);
             });
           </script>`)
@@ -1490,14 +1569,17 @@ describe('official Weibo Plugin', () => {
             document.querySelector('#file').addEventListener('change', () => {
               const preview = document.createElement('img');
               preview.alt = 'preview';
+              preview.src = 'blob:https://weibo.com/preview';
               document.querySelector('#composer').append(preview);
               setTimeout(() => { document.querySelector('#send').disabled = false; }, 800);
             });
             document.querySelector('#send').addEventListener('click', () => {
               window.sendClicks += 1;
+              const textarea = document.querySelector('#composer textarea');
               const post = document.createElement('article');
               post.dataset.id = 'scoped-post';
-              post.textContent = document.querySelector('#composer textarea').value;
+              post.textContent = textarea.value;
+              textarea.value = '';
               document.body.append(post);
             });
             document.querySelector('#comment-send').addEventListener('click', () => {
