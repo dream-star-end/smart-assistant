@@ -250,6 +250,7 @@ import {
   expireCodexRouteContext,
   expireGrokRouteContext,
   expireGrokRouteContextByLease,
+  expireSettledGrokRouteLeases,
   hasActiveOfficialOAuthAccountInGroup,
   listActiveGrokRouteLeases,
   listEnabledGroupsForModel,
@@ -1681,7 +1682,9 @@ export async function registerCommercial(
     // grok_route_contexts is the durable concurrency authority. Rebuild the
     // local scheduler mirror before every allocation so a browser disconnect,
     // generic slot reaper, or Master restart cannot make a live route vanish
-    // from the cap check.
+    // from the cap check. Reap billed/vanished rows first — restore would
+    // otherwise refill the 10-slot cap from finished turns.
+    await expireSettledGrokRouteLeases();
     for (const lease of await listActiveGrokRouteLeases()) {
       scheduler.restoreCodexSlot(lease.accountId, lease.slotId);
     }

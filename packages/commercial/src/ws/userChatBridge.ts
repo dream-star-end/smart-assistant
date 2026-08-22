@@ -3057,7 +3057,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       const durableGrokRelease =
         !preserveAccountSlot && state.engine === "grok" &&
         accountId !== null && slotId !== null && deps.releaseGrokRouteLease !== undefined;
-      if (durableGrokRelease) {
+      if (
+        state.engine === "grok" &&
+        accountId !== null &&
+        slotId !== null &&
+        deps.releaseGrokRouteLease !== undefined
+      ) {
         const releaseKey = state.billingRequestId ?? `state:${state.stateId}`;
         if (!pendingGrokLeaseReleases.has(releaseKey)) {
           pendingGrokLeaseReleases.set(releaseKey, {
@@ -3068,7 +3073,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             retryRequested: false,
           });
         }
-        retryPendingGrokLeaseRelease(releaseKey);
+        // Browser disconnect preserves the live turn: remember the exact
+        // lease identity so the later terminal billing frame can expire it.
+        // Expire now only when this really is the logical-turn terminal
+        // (billing / isFinal / container death).
+        if (!preserveAccountSlot) retryPendingGrokLeaseRelease(releaseKey);
       } else if (!preserveAccountSlot && accountId !== null && slotId !== null && deps.codexBinding !== undefined) {
         try { deps.codexBinding.release(accountId, slotId); } catch { /* best effort */ }
       }

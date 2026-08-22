@@ -816,6 +816,50 @@ export async function expireGrokRouteContextByLease(
   return (res.rowCount ?? 0) > 0;
 }
 
+/**
+ * Drop durable Grok leases that can no longer belong to a live turn:
+ * vanished containers, or a journal already committed/aborted for that
+ * slot with no open grok-build dispatch still holding it.
+ *
+ * allocate() restores every active row into the in-process cap before
+ * pick(); without this reap, a billed-and-finished turn occupies the
+ * 10-slot account cap for the 7-day orphan TTL.
+ */
+export async function expireSettledGrokRouteLeases(
+  runner?: QueryRunner,
+): Promise<number> {
+  const res = await query(
+    `UPDATE grok_route_contexts c
+        SET status = 'expired', expires_at = NOW()
+      WHERE c.status = 'active' AND c.expires_at > NOW()
+        AND (
+          EXISTS (
+            SELECT 1 FROM agent_containers ac
+             WHERE ac.id = c.container_id
+               AND ac.state IS DISTINCT FROM 'active'
+          )
+          OR (
+            EXISTS (
+              SELECT 1 FROM request_finalize_journal j
+               WHERE j.ctx->>'grokSlotId' = c.slot_id
+                 AND j.ctx->>'grokAccountId' = c.account_id::text
+                 AND j.state IN ('committed', 'finalizing', 'aborted')
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM turn_dispatches d
+              JOIN request_finalize_journal j2 ON j2.request_id = d.billing_request_id
+               WHERE d.model = 'grok-build'
+                 AND d.status = ANY(ARRAY['admitted','accepted','rejecting'])
+                 AND j2.ctx->>'grokSlotId' = c.slot_id
+            )
+          )
+        )`,
+    [],
+    runner,
+  );
+  return res.rowCount ?? 0;
+}
+
 export async function markRelayCredentialFailure(id: bigint | string, err: string): Promise<void> {
   await query(
     `UPDATE api_relay_credentials
