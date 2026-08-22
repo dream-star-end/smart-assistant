@@ -291,6 +291,10 @@ import {
   parseOriginWebchatSessionKey,
   type CronOriginFireResult,
 } from './cronOriginSession.js'
+import {
+  postCronOriginInject,
+  readV3CronOriginInjectConfig,
+} from './v3CronOriginInject.js'
 import { handleTaskboardApi, resolveTaskboardActor, setPatrolExecutionHandler } from './taskboard/http.js'
 import { getTaskboardDb } from './taskboard/db/index.js'
 import { isPatrolSessionKey } from './taskboard/domain.js'
@@ -12144,6 +12148,26 @@ export class Gateway {
   ): Promise<CronOriginFireResult> {
     const origin = parseOriginWebchatSessionKey(job.sourceSessionKey || '')
     if (!origin) return { kind: 'fallback' }
+    const text = buildCronOriginResumeText(job)
+    const clientMessageId = cronOriginClientMessageId(delivery.deliveryId)
+    const masterCfg = readV3CronOriginInjectConfig()
+    if (masterCfg) {
+      const posted = await postCronOriginInject(
+        {
+          sessionId: origin.peerId,
+          text,
+          clientMessageId,
+          agentId: origin.agentId,
+        },
+        { config: masterCfg },
+      )
+      if (posted.kind === 'injected') return { kind: 'injected' }
+      if (posted.kind === 'gone') return { kind: 'fallback' }
+      if (posted.kind === 'in_flight') {
+        return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_IN_FLIGHT' }
+      }
+      return { kind: 'retryable_failure', code: posted.code }
+    }
     const userId =
       (typeof job.sourceUserId === 'string' && job.sourceUserId.trim()) ||
       process.env.OC_USER_ID?.trim() ||
@@ -12156,8 +12180,6 @@ export class Gateway {
       return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_LOOKUP_FAILED' }
     }
     if (!existing) return { kind: 'fallback' }
-    const text = buildCronOriginResumeText(job)
-    const clientMessageId = cronOriginClientMessageId(delivery.deliveryId)
     try {
       const persisted = await appendServerAuthoredMessageDurable(origin.peerId, userId, {
         id: clientMessageId,

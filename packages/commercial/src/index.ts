@@ -388,6 +388,11 @@ import {
   type CronIndexHandler,
 } from "./http/internalCronIndex.js";
 import {
+  CRON_ORIGIN_INJECT_PATH,
+  makeCronOriginInjectHandler,
+  type CronOriginInjectHandler,
+} from "./http/internalCronOriginInject.js";
+import {
   INBOX_ALERT_PATH,
   INBOX_POST_PATH,
   makeInboxPostHandler,
@@ -2365,6 +2370,7 @@ export async function registerCommercial(
         identityRepo,
         runner: getPool() as unknown as CronWakeRunner,
       });
+      let cronOriginInjectHandler: CronOriginInjectHandler | undefined;
       // /internal/v3/inbox-post — 容器 onDeliver「离线送达兜底写站内信」。uid 由容器身份推导,
       // audience 硬编码 'user' 只给自己写;created_by = MIN active admin(同 onboarding 语义,
       // 每次现解析,不缓存)。无 admin → 抛错 → handler 500。见 http/internalInboxPost.ts。
@@ -2552,6 +2558,9 @@ export async function registerCommercial(
         }
         if (path === CRON_INDEX_PATH) {
           return cronIndexHandler(req, res, ctx);
+        }
+        if (cronOriginInjectHandler && path === CRON_ORIGIN_INJECT_PATH) {
+          return cronOriginInjectHandler(req, res, ctx);
         }
         if (path === INBOX_POST_PATH) {
           return inboxPostHandler(req, res, ctx);
@@ -5105,6 +5114,11 @@ export async function registerCommercial(
       }
     })();
   };
+
+  cronOriginInjectHandler = makeCronOriginInjectHandler({
+    identityRepo,
+    inject: (input) => userChatBridge.injectCronOriginTurn(input),
+  });
 
   const userChatBridge: UserChatBridgeHandler = createUserChatBridge({
     jwtSecret,

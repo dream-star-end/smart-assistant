@@ -1408,6 +1408,12 @@ export interface AdmitUserTurnInput {
   dispatchId: string;
   /** 本 bridge 连接 id(lease owner)。 */
   ownerId: string;
+  /**
+   * cron origin-session: lock the session row and refuse if another
+   * clientMessageId already has an open dispatch. Same-key replay still
+   * proceeds through admitDispatch. Browser admits omit this flag.
+   */
+  exclusiveSession?: boolean;
   /** 要幂等 append 的 user 消息行。 */
   message: MessageLike & { id: string };
   /** Master-validated recovery lineage. The PG transaction revalidates it
@@ -1442,6 +1448,7 @@ export type AdmitUserTurnResult =
   | (AdmitDispatchResult & { workspaceMode: SessionWorkspaceMode })
   | { kind: "session_not_found" }
   | { kind: "session_deleted" }
+  | { kind: "session_busy" }
   | { kind: "recovery_conflict"; reason: string }
   | { kind: "append_error"; reason: string };
 
@@ -7577,6 +7584,31 @@ export function createPgSessionsBackend(
           });
         }
         let message = input.message;
+        if (input.exclusiveSession) {
+          const locked = (
+            await client.query<{ deleted_at: string | null }>(
+              `SELECT deleted_at
+                 FROM client_sessions
+                WHERE id=$1 AND user_id=$2
+                FOR UPDATE`,
+              [input.sessionId, input.sessionUserId],
+            )
+          ).rows[0];
+          if (!locked) return { kind: "session_not_found" };
+          if (locked.deleted_at !== null) return { kind: "session_deleted" };
+          const busy = (
+            await client.query<{ client_message_id: string }>(
+              `SELECT client_message_id
+                 FROM turn_dispatches
+                WHERE user_id=$1::bigint AND session_id=$2
+                  AND status IN ('admitted','accepted','rejecting')
+                  AND client_message_id <> $3
+                LIMIT 1`,
+              [input.uid.toString(), input.sessionId, input.clientMessageId],
+            )
+          ).rows[0];
+          if (busy) return { kind: "session_busy" };
+        }
         if (input.recovery) {
           const expected = input.recovery.automatic
             ? turnRecoveryAttemptIdentity(
