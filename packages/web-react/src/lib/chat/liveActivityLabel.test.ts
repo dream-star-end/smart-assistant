@@ -48,6 +48,8 @@ describe("formatLiveActivityAction（活动行只显示中文动作，不堆工�
     expect(formatLiveActivityAction("Grep keepalive")).toBe("搜索代码");
     expect(formatLiveActivityAction("Glob **/*.ts")).toBe("搜索代码");
     expect(formatLiveActivityAction("WebSearch live activity")).toBe("搜索代码");
+    expect(formatLiveActivityAction("search_tool skill_search memory")).toBe("搜索代码");
+    expect(formatLiveActivityAction("use_tool skill_search")).toBe("搜索代码");
   });
 
   test("委派/子任务 → 运行子任务", () => {

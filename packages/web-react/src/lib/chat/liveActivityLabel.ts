@@ -77,6 +77,11 @@ const TOOL_ACTIVITY_LABEL: Record<string, LiveActivityLabel> = {
   websearch: "搜索代码",
   web_search: "搜索代码",
   web_fetch: "搜索代码",
+  search_tool: "搜索代码",
+  mcpsearch: "搜索代码",
+  skill_search: "搜索代码",
+  skill_view: "搜索代码",
+  skill_list: "搜索代码",
   semanticsearch: "搜索代码",
   semantic_search: "搜索代码",
   globfilesearch: "搜索代码",
@@ -147,7 +152,7 @@ export function formatLiveActivityAction(hint: string | undefined | null): strin
   // Cursor CallMcpTool / similar wrappers: try the next token as the real op.
   const wrapper = normalizeToolToken(first);
   if (
-    (wrapper === "callmcptool" || wrapper === "call_mcp_tool" || wrapper === "getmcptools") &&
+    (wrapper === "callmcptool" || wrapper === "call_mcp_tool" || wrapper === "getmcptools" || wrapper === "use_tool") &&
     parts.length > 1
   ) {
     return labelForToken(parts[1] ?? "") ?? LIVE_ACTIVITY_FALLBACK;

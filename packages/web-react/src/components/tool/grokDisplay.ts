@@ -24,6 +24,7 @@ const GROK_PRODUCT_NAMES: Record<string, string> = {
   glob: "Glob",
   web_search: "WebSearch",
   web_fetch: "WebFetch",
+  search_tool: "McpSearch",
   todo_write: "TodoWrite",
   ask_user_question: "AskUserQuestion",
   enter_plan_mode: "EnterPlanMode",
@@ -93,6 +94,30 @@ function textField(value: unknown): string | null {
   return decodeGrokUtf8Bytes(value);
 }
 
+function grokMcpOutputText(obj: Record<string, unknown>): string | null {
+  const tagged = typeof obj.type === "string" && obj.type.toLowerCase() === "mcp";
+  const inner = obj.output;
+  const envelope = recordOf(inner);
+  if (!tagged && !envelope) return null;
+  if (envelope) {
+    const ok = envelope.OkayOutput ?? envelope.okay_output ?? envelope.ErrorOutput ?? envelope.error_output;
+    if (typeof ok === "string" && ok) return ok;
+    const nested = textField(envelope.text) ?? textField(envelope.content);
+    if (nested !== null) return nested;
+  }
+  if (typeof inner === "string" && inner) return inner;
+  return tagged ? stringifyFallback(inner ?? obj) : null;
+}
+
+function unwrapUseTool(input: unknown): { name: string; input: unknown } | null {
+  const obj = recordOf(input);
+  if (!obj) return null;
+  const qualified = pickString(obj, "tool_name", "name");
+  if (!qualified || (!qualified.includes("__") && !qualified.startsWith("mcp__"))) return null;
+  const inner = obj.tool_input ?? obj.arguments ?? obj.input ?? obj.toolInput;
+  return { name: qualified, input: inner ?? {} };
+}
+
 export function grokProductToolOutput(raw: unknown): string {
   if (raw === undefined || raw === null) return "";
   if (typeof raw === "string") {
@@ -109,6 +134,9 @@ export function grokProductToolOutput(raw: unknown): string {
   if (Array.isArray(raw)) return stringifyFallback(raw);
   const obj = recordOf(raw);
   if (!obj) return stringifyFallback(raw);
+
+  const mcpOutput = grokMcpOutputText(obj);
+  if (mcpOutput !== null) return mcpOutput;
 
   const stdout = textField(obj.output) ?? textField(obj.stdout);
   const stderr = textField(obj.stderr);
@@ -141,11 +169,13 @@ export function grokProductToolName(nativeName: string, input?: unknown): string
   }
   const key = grokNativeKey(nativeName);
   if (key.startsWith("mcp__")) return nativeName;
-  if (key === "call_mcp_tool" || key === "mcp") {
+  if (key === "use_tool" || key === "call_mcp_tool" || key === "mcp") {
+    const unwrapped = unwrapUseTool(input);
+    if (unwrapped) return grokProductToolName(unwrapped.name, unwrapped.input);
     const obj = recordOf(input);
     const server = obj ? pickString(obj, "server", "server_name", "serverIdentifier") : "";
     const tool = obj ? pickString(obj, "tool_name", "tool", "name") : "";
-    if (server && tool) return `mcp__${server}__${tool}`;
+    if (server && tool && !tool.includes("__")) return `mcp__${server}__${tool}`;
   }
   const mapped = GROK_PRODUCT_NAMES[key];
   if (!mapped) return nativeName;
@@ -160,6 +190,11 @@ export function grokProductToolName(nativeName: string, input?: unknown): string
 
 export function grokProductToolInput(nativeName: string, input: ToolInput): ToolInput {
   if (!input) return input;
+  const key = grokNativeKey(nativeName);
+  if (key === "use_tool" || key === "call_mcp_tool" || key === "mcp") {
+    const unwrapped = unwrapUseTool(input);
+    if (unwrapped) return grokProductToolInput(unwrapped.name, recordOf(unwrapped.input) ?? unwrapped.input);
+  }
   const product = grokProductToolName(nativeName, input);
   const filePath = pickString(input, "file_path", "path", "absolute_path", "target_file");
   switch (product) {
@@ -197,6 +232,7 @@ export function grokProductToolInput(nativeName: string, input: ToolInput): Tool
         ...(pickString(input, "path", "target_directory") ? { path: pickString(input, "path", "target_directory") } : {}),
       };
     case "WebSearch":
+    case "McpSearch":
       return { ...input, query: pickString(input, "query", "search_term", "q") };
     case "WebFetch":
       return { ...input, url: pickString(input, "url", "href") };

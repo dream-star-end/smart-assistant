@@ -121,6 +121,17 @@ function asText(value: unknown): string {
   }
 }
 
+/** Prefer the official toolName. ACP `kind` is often "other"/"read"/"execute". */
+function grokNativeToolName(event: GrokEvent): string {
+  const toolName = asText(event.toolName)
+  if (toolName) return toolName
+  const title = asText(event.title)
+  if (title && !['read', 'other', 'execute', 'edit'].includes(title.toLowerCase())) return title
+  const kind = asText(event.kind)
+  if (kind && !['read', 'other', 'execute', 'edit'].includes(kind.toLowerCase())) return kind
+  return title || kind || 'GrokTool'
+}
+
 function promptText(input: TurnParams['input']): string {
   if (typeof input === 'string') return input
   return input
@@ -501,8 +512,17 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       }
       ctx.lastContentKind = 'text'
       ctx.assistantText += text
-      ctx.assistantSegments.at(-1)!.text += text
-      ctx.params.onEvent({ kind: 'block', block: { kind: 'text', text, ...(ctx.params.assistantMessageId ? { messageId: ctx.params.assistantMessageId } : {}) } })
+      const segment = ctx.assistantSegments.at(-1)!
+      segment.text += text
+      const messageIdBase = ctx.params.assistantMessageId
+      ctx.params.onEvent({
+        kind: 'block',
+        block: {
+          kind: 'text',
+          text,
+          ...(messageIdBase ? { messageId: `${messageIdBase}-s${segment.index}` } : {}),
+        },
+      })
       return
     }
     if (type === 'thought') {
@@ -513,8 +533,17 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       }
       ctx.lastContentKind = 'thought'
       ctx.thinkingText += text
-      ctx.thinkingSegments.at(-1)!.text += text
-      ctx.params.onEvent({ kind: 'block', block: { kind: 'thinking', text, ...(ctx.params.thinkingMessageId ? { messageId: ctx.params.thinkingMessageId } : {}) } })
+      const segment = ctx.thinkingSegments.at(-1)!
+      segment.text += text
+      const messageIdBase = ctx.params.thinkingMessageId
+      ctx.params.onEvent({
+        kind: 'block',
+        block: {
+          kind: 'thinking',
+          text,
+          ...(messageIdBase ? { messageId: `${messageIdBase}-s${segment.index}` } : {}),
+        },
+      })
       return
     }
     ctx.lastContentKind = null
@@ -571,7 +600,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     const id = typeof event.toolCallId === 'string' && event.toolCallId
       ? event.toolCallId
       : `grok-tool-${ctx.tools.size + 1}`
-    const nativeName = asText(event.toolName || event.kind || event.title) || 'GrokTool'
+    const nativeName = grokNativeToolName(event)
     const inputJson = grokProductToolInput(nativeName, event.rawInput ?? null)
     const toolName = grokProductToolName(nativeName, event.rawInput ?? null)
     const tool: TurnToolEntry = {
@@ -603,7 +632,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     if (!ctx.tools.has(id)) this.observeToolCall(ctx, { ...event, type: 'tool_call' })
     const tool = ctx.tools.get(id)!
     if (event.rawInput !== undefined) {
-      const nativeName = asText(event.toolName || event.kind || event.title) || tool.toolName
+      const nativeName = grokNativeToolName(event) || tool.toolName
       tool.toolName = grokProductToolName(nativeName, event.rawInput)
       tool.inputJson = structuredClone(grokProductToolInput(nativeName, event.rawInput))
       tool.inputPreview = asText(tool.inputJson).slice(0, 500)

@@ -510,6 +510,35 @@ describe("Grok 原生工具卡归一化", () => {
     expect(d.tool.output).toBe("export const x = 1\n");
   });
 
+  test("Grok search_tool / use_tool 包装成产品卡", () => {
+    const search = normalizeToolForDisplay({
+      toolName: "search_tool",
+      inputJson: { query: "skill_search memory", limit: 15 },
+      _completed: true,
+    });
+    expect(search.name).toBe("McpSearch");
+    expect(search.input?.query).toBe("skill_search memory");
+    expect(resolveToolMeta(search.name, search.input).label).toBe("查找工具");
+
+    const used = normalizeToolForDisplay({
+      toolName: "use_tool",
+      inputJson: {
+        tool_name: "openclaude-memory__skill_view",
+        tool_input: { name: "openclaude-instance-topology" },
+      },
+      output: JSON.stringify({
+        type: "MCP",
+        tool_name: "skill_view",
+        server_name: "openclaude-memory",
+        output: { OkayOutput: "topology skill" },
+      }),
+      _completed: true,
+    });
+    expect(used.name).toBe("mcp__openclaude-memory__skill_view");
+    expect(used.input?.name).toBe("openclaude-instance-topology");
+    expect(used.tool.output).toBe("topology skill");
+  });
+
   test("Grok MCP server__tool 名映射到产品 mcp__ 卡", () => {
     const d = normalizeToolForDisplay({
       toolName: "openclaude-memory__skill_search",

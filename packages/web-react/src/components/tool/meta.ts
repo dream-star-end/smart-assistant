@@ -61,6 +61,9 @@ const TOOL_META: Record<string, ToolMeta> = {
   Glob: { icon: FolderOpen, label: "搜索文件", tone: "neutral" },
   WebFetch: { icon: Globe, label: "网页抓取", tone: "info" },
   WebSearch: { icon: Globe, label: "网页搜索", tone: "info" },
+  McpSearch: { icon: Search, label: "查找工具", tone: "info" },
+  search_tool: { icon: Search, label: "查找工具", tone: "info" },
+  use_tool: { icon: Plug, label: "调用工具", tone: "info" },
   TodoWrite: { icon: ListChecks, label: "任务列表", tone: "accent" },
   NotebookEdit: { icon: NotebookPen, label: "笔记本", tone: "neutral" },
   Task: { icon: Bot, label: "子任务", tone: "accent" },
@@ -519,6 +522,8 @@ export function toolSummary(name: string, input: Record<string, unknown> | null)
     case "WebFetch":
       return asStr(input.url).slice(0, 60);
     case "WebSearch":
+    case "McpSearch":
+    case "search_tool":
       return asStr(input.query).slice(0, 60);
     case "TodoWrite": {
       const todos = asArr(input.todos);

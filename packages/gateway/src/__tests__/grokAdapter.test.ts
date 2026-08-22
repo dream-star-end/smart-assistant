@@ -98,6 +98,8 @@ for (const event of [
         input: 'fix it',
         requestId: REQUEST_ID,
         turnKey: TURN_KEY,
+        assistantMessageId: 'asst-1',
+        thinkingMessageId: 'think-1',
         onEvent: (event) => events.push(event),
         sessionTotals: totals,
         toolUseIdToName: new Map(),
@@ -110,6 +112,14 @@ for (const event of [
       assert.equal(summary.assistantText, 'before done')
       assert.equal(summary.thinkingText, 'checking')
       assert.deepEqual(summary.assistantSegments.map((segment) => segment.text), ['before ', 'done'])
+      const textIds = events
+        .filter((event) => event.kind === 'block' && event.block.kind === 'text')
+        .map((event) => (event.kind === 'block' ? event.block.messageId : undefined))
+      const thinkIds = events
+        .filter((event) => event.kind === 'block' && event.block.kind === 'thinking')
+        .map((event) => (event.kind === 'block' ? event.block.messageId : undefined))
+      assert.deepEqual(textIds, ['asst-1-s0', 'asst-1-s1'])
+      assert.deepEqual(thinkIds, ['think-1-s0'])
       assert.equal(summary.numTurns, 2)
       assert.deepEqual(summary.usage, {
         cost: 0,

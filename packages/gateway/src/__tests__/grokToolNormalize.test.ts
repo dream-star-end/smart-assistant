@@ -23,6 +23,11 @@ describe('grokProductToolName', () => {
     assert.equal(grokProductToolName('list_dir'), 'Glob')
     assert.equal(grokProductToolName('web_search'), 'WebSearch')
     assert.equal(grokProductToolName('web_fetch'), 'WebFetch')
+    assert.equal(grokProductToolName('search_tool'), 'McpSearch')
+    assert.equal(
+      grokProductToolName('use_tool', { tool_name: 'openclaude-memory__skill_search', tool_input: { query: 'topo' } }),
+      'mcp__openclaude-memory__skill_search',
+    )
     assert.equal(grokProductToolName('todo_write'), 'TodoWrite')
     assert.equal(grokProductToolName('spawn_subagent'), 'Task')
     assert.equal(grokProductToolName('ask_user_question'), 'AskUserQuestion')
@@ -64,6 +69,13 @@ describe('grokProductToolInput', () => {
       (grokProductToolInput('web_search', { search_term: 'rust' }) as { query: string }).query,
       'rust',
     )
+    assert.equal(
+      (grokProductToolInput('use_tool', {
+        tool_name: 'openclaude-memory__skill_search',
+        tool_input: { query: 'topo', limit: 10 },
+      }) as { query: string }).query,
+      'topo',
+    )
   })
 })
 
@@ -96,6 +108,18 @@ describe('grokProductToolOutput', () => {
     assert.equal(
       grokProductToolOutput({ type: 'WebSearch', summary_for_prompt: 'three hits' }),
       'three hits',
+    )
+  })
+
+  test('unwraps official Grok MCP OkayOutput envelopes', () => {
+    assert.equal(
+      grokProductToolOutput({
+        type: 'MCP',
+        tool_name: 'skill_search',
+        server_name: 'openclaude-memory',
+        output: { OkayOutput: 'No matching skills found.' },
+      }),
+      'No matching skills found.',
     )
   })
 
