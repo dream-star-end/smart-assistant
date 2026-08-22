@@ -1105,16 +1105,67 @@ async function composerScope(editor) {
   if (await scope.count() !== 1) return null;
   return scope;
 }
+function wrapFileInput(input) {
+  return {
+    setFiles: async (files) => input.setInputFiles(files),
+    element: () => input,
+  };
+}
+async function uniqueImageFileInput(scope) {
+  if (!scope || typeof scope.locator !== 'function') return null;
+  const nodes = scope.locator('input[type="file"]');
+  if (!nodes || typeof nodes.count !== 'function' || typeof nodes.nth !== 'function') return null;
+  const matches = [];
+  const total = Math.min(await nodes.count().catch(() => 0), 40);
+  for (let index = 0; index < total; index += 1) {
+    const node = nodes.nth(index);
+    const attached = await node.evaluate((element) => !!element && element.isConnected).catch(() => false);
+    if (!attached) continue;
+    const accept = String(await node.getAttribute('accept').catch(() => '') || '');
+    if (accept && !/image|\*/i.test(accept)) continue;
+    matches.push(node);
+  }
+  return matches.length === 1 ? matches[0] : null;
+}
+async function awaitFileChooser(page, clickable) {
+  await clickable.click({ trial: true, timeout: 10_000 });
+  const [chooser] = await Promise.all([
+    page.waitForEvent('filechooser', { timeout: 10_000 }),
+    clickable.click({ timeout: 10_000 })
+  ]);
+  return chooser;
+}
 async function preparePostImageChooser(page, editor) {
   const scope = (await composerScope(editor)) || page;
+  const existing = await uniqueImageFileInput(scope);
+  if (existing) return wrapFileInput(existing);
   const image = await exactMenuItem(scope, '图片');
   if (!image) throw new Error('media');
   await image.click({ trial: true, timeout: 10_000 });
-  const [chooser] = await Promise.all([
-    page.waitForEvent('filechooser', { timeout: 10_000 }),
-    image.click({ timeout: 10_000 })
-  ]);
-  return chooser;
+  let chooserSettled = false;
+  const chooserWait = page.waitForEvent('filechooser', { timeout: 10_000 }).then((chooser) => {
+    chooserSettled = true;
+    return chooser;
+  }).catch(() => {
+    chooserSettled = true;
+    return null;
+  });
+  await image.click({ timeout: 10_000 });
+  const deadline = Date.now() + 10_000;
+  while (Date.now() <= deadline) {
+    const remaining = Math.max(1, deadline - Date.now());
+    const chooser = await Promise.race([
+      chooserWait,
+      page.waitForTimeout(Math.min(250, remaining)).then(() => undefined)
+    ]);
+    if (chooser) return chooser;
+    const local = await exactMenuItem(scope, '本地上传') || await exactMenuItem(page, '本地上传');
+    if (local) return awaitFileChooser(page, local);
+    const appeared = await uniqueImageFileInput(scope) || await uniqueImageFileInput(page);
+    if (appeared) return wrapFileInput(appeared);
+    if (chooserSettled) break;
+  }
+  throw new Error('media');
 }
 async function openLongTextComposer(page) {
   const opener = await exactMenuItem(page, '长文');

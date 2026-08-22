@@ -178,14 +178,14 @@ describe('official Weibo Plugin', () => {
   })
 
   test('pins the current artifact and only the exact production predecessor', () => {
-    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.2')
+    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.3')
     assert.equal(WEIBO_DRIVER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.equal(WEIBO_LAUNCHER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.deepEqual(WEIBO_SETUP_COMPATIBLE_PREDECESSORS, [
       {
-        version: '1.6.1',
-        artifactHash: '262e9d54d362fcd7496460c0a15f1d3ac4ca2588028e026de68a43098e29334a',
-        execContractHash: '9c9ddb1800e069d2a61ad73c61358df6e1a0d118fca3ded1201a39e016015963',
+        version: '1.6.2',
+        artifactHash: 'af3d8c529f227371a3f8625c89f6e7f724fd0fe16cddea527f7ce96a6e6ecf60',
+        execContractHash: '06a88124984824fe324e10cad12cfd170d6c39bfcedaaffb712bbb64da18e5f6',
       },
     ])
     assert.equal(
@@ -420,7 +420,10 @@ describe('official Weibo Plugin', () => {
     assert.match(createPostSource, /expectedText.length > 2000/)
     assert.match(createPostSource, /openLongTextComposer/)
     assert.match(createPostSource, /preparePostImageChooser\(page, editor\)/)
+    assert.match(WEIBO_WORKER_SOURCE, /uniqueImageFileInput/)
     assert.match(WEIBO_WORKER_SOURCE, /exactMenuItem\(scope, '图片'\)/)
+    assert.match(WEIBO_WORKER_SOURCE, /exactMenuItem\(scope, '本地上传'\)/)
+    assert.match(WEIBO_WORKER_SOURCE, /setInputFiles/)
     assert.match(WEIBO_WORKER_SOURCE, /exactMenuItem\(page, '长文'\)/)
     assert.doesNotMatch(createPostSource, /cleanText\([^,]+, 2000\)/)
     assert.match(WEIBO_WORKER_SOURCE, /send\.click\(\{ timeout: 10_000, noWaitAfter: true \}\)/)
@@ -777,6 +780,133 @@ describe('official Weibo Plugin', () => {
     assert.deepEqual(events, [])
   })
 
+  test('create_post uses a unique hidden composer file input without a native chooser', async () => {
+    const events: string[] = []
+    const textarea = { fill: async () => {}, inputValue: async () => 'hello' }
+    const fileInput = {
+      setInputFiles: async () => events.push('upload'),
+      evaluate: async (
+        fn: (node: { isConnected: boolean; files: { length: number } }) => unknown,
+      ) => fn({ isConnected: true, files: { length: events.includes('upload') ? 1 : 0 } }),
+      getAttribute: async () => 'image/*',
+    }
+    const send = {
+      click: async (options: { trial?: boolean }) => {
+        if (!options.trial) events.push('click')
+      },
+    }
+    const harness = compileWorkerPostHarness({
+      ensureSelfId: async () => '12345',
+      gotoAuthenticated: async () => {},
+      collectPosts: async () =>
+        events.includes('upload') ? [{ id: 'hidden-input', owned: true, text: 'hello' }] : [],
+      uniqueVisible: async () => textarea,
+      assertNoChallenge: async () => {},
+      awaitDispatch: async () => events.push('dispatch'),
+      exactMenuItem: async (_page: unknown, text: string) => {
+        if (text === '图片') {
+          events.push('image-menu')
+          return { click: async () => events.push('image-click') }
+        }
+        return send
+      },
+      cleanText: (value: unknown) => String(value).trim(),
+      readFile: async () => Buffer.from('image'),
+    })
+    const page = {
+      locator: (selector: string) =>
+        selector === 'input[type="file"]' ? { count: async () => 1, nth: () => fileInput } : {},
+      waitForEvent: async () => {
+        events.push('filechooser')
+        throw new Error('filechooser should not open')
+      },
+      waitForTimeout: async () => {},
+    }
+
+    const result = await harness.writeAction(page, {
+      actionId: 'create_post',
+      params: {
+        text: 'hello',
+        mediaManifest: [{ inputId: 'asset-1', filename: 'image.png', mimeType: 'image/png' }],
+      },
+    })
+    assert.deepEqual(result, { post: { id: 'hidden-input', owned: true, text: 'hello' } })
+    assert.deepEqual(events, ['dispatch', 'upload', 'click'])
+  })
+
+  test('create_post opens 本地上传 when 图片 does not raise a native chooser', async () => {
+    const events: string[] = []
+    const textarea = { fill: async () => {}, inputValue: async () => 'hello' }
+    let localClicked = false
+    const imageTrigger = {
+      click: async (options: { trial?: boolean }) =>
+        events.push(options.trial ? 'image-trial' : 'image-click'),
+    }
+    const localTrigger = {
+      click: async (options: { trial?: boolean }) => {
+        localClicked = true
+        events.push(options.trial ? 'local-trial' : 'local-click')
+      },
+    }
+    const imageChooser = {
+      setFiles: async () => events.push('upload'),
+      element: () => ({ evaluate: async () => 1 }),
+    }
+    const send = {
+      click: async (options: { trial?: boolean }) => {
+        if (!options.trial) events.push('click')
+      },
+    }
+    let collectCount = 0
+    const harness = compileWorkerPostHarness({
+      ensureSelfId: async () => '12345',
+      gotoAuthenticated: async () => {},
+      collectPosts: async () => {
+        collectCount += 1
+        return collectCount === 1 ? [] : [{ id: 'local-upload', owned: true, text: 'hello' }]
+      },
+      uniqueVisible: async () => textarea,
+      assertNoChallenge: async () => {},
+      awaitDispatch: async () => events.push('dispatch'),
+      exactMenuItem: async (_page: unknown, text: string) => {
+        if (text === '图片') return imageTrigger
+        if (text === '本地上传') return events.includes('image-click') ? localTrigger : null
+        return send
+      },
+      cleanText: (value: unknown) => String(value).trim(),
+      readFile: async () => Buffer.from('image'),
+    })
+    const page = {
+      locator: () => ({}),
+      waitForEvent: async () => {
+        if (!localClicked) {
+          await new Promise((resolve) => setTimeout(resolve, 20))
+          throw new Error('Timeout')
+        }
+        return imageChooser
+      },
+      waitForTimeout: async () => {},
+    }
+
+    const result = await harness.writeAction(page, {
+      actionId: 'create_post',
+      params: {
+        text: 'hello',
+        mediaManifest: [{ inputId: 'asset-1', filename: 'image.png', mimeType: 'image/png' }],
+      },
+    })
+    assert.deepEqual(result, { post: { id: 'local-upload', owned: true, text: 'hello' } })
+    assert.deepEqual(events, [
+      'image-trial',
+      'image-click',
+      'local-trial',
+      'local-click',
+      'dispatch',
+      'upload',
+      'click',
+    ])
+  })
+
   test('create_post opens 长文 before attaching images when the body exceeds 2000 characters', async () => {
     const events: string[] = []
     const longText = '汉'.repeat(2001)
@@ -1076,6 +1206,97 @@ describe('official Weibo Plugin', () => {
         const elapsed = Date.now() - timeoutStarted
         assert.ok(elapsed >= 500, `readiness returned too early: ${elapsed}ms`)
         assert.ok(elapsed < 1_300, `readiness exceeded its wall-clock bound: ${elapsed}ms`)
+      } finally {
+        await browser.close()
+      }
+    },
+  )
+
+  test(
+    'real Chromium uploads through a hidden composer file input without a native chooser',
+    { timeout: 30_000 },
+    async () => {
+      const browserResolverModule = '../../../../scripts/lib/resolve-browser.mjs'
+      const { resolveBrowserExecutable } = (await import(browserResolverModule)) as {
+        resolveBrowserExecutable(): string
+      }
+      const browser = await chromium.launch({
+        executablePath: resolveBrowserExecutable(),
+        headless: true,
+        args: ['--no-sandbox', '--disable-dev-shm-usage'],
+      })
+      try {
+        const page = await browser.newPage()
+        await page.setContent(`<!doctype html>
+          <div id="composer">
+            <textarea></textarea>
+            <button id="image">图片</button>
+            <input id="file" type="file" accept="image/*" hidden />
+            <button id="send" disabled>发送</button>
+          </div>
+          <script>
+            window.imageClicks = 0;
+            window.sendClicks = 0;
+            window.chooserClicks = 0;
+            document.querySelector('#image').addEventListener('click', () => {
+              window.imageClicks += 1;
+              const panel = document.createElement('div');
+              panel.textContent = '相册';
+              document.body.append(panel);
+            });
+            document.querySelector('#file').addEventListener('click', () => {
+              window.chooserClicks += 1;
+            });
+            document.querySelector('#file').addEventListener('change', () => {
+              setTimeout(() => { document.querySelector('#send').disabled = false; }, 400);
+            });
+            document.querySelector('#send').addEventListener('click', () => {
+              window.sendClicks += 1;
+              const post = document.createElement('article');
+              post.dataset.id = 'hidden-post';
+              post.textContent = document.querySelector('textarea').value;
+              document.body.append(post);
+            });
+          </script>`)
+        let collectCount = 0
+        const harness = compileWorkerPostHarness({
+          ensureSelfId: async () => '12345',
+          gotoAuthenticated: async () => {},
+          collectPosts: async (targetPage: typeof page) => {
+            collectCount += 1
+            return targetPage.locator('article[data-id]').evaluateAll((articles) =>
+              articles.map((article) => ({
+                id: article.getAttribute('data-id'),
+                owned: true,
+                text: article.textContent?.trim() ?? '',
+              })),
+            )
+          },
+          uniqueVisible: async (locator: unknown) => locator,
+          assertNoChallenge: async () => {},
+          awaitDispatch: async () => {},
+          exactMenuItem: async (targetPage: typeof page, text: string) => {
+            const locator = targetPage.getByRole('button', { name: text, exact: true })
+            return (await locator.count()) === 1 ? locator : null
+          },
+          cleanText: (value: unknown) => String(value).trim(),
+          readFile: async () => Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+        })
+
+        const started = Date.now()
+        const result = await harness.writeAction(page, {
+          actionId: 'create_post',
+          params: {
+            text: 'hello',
+            mediaManifest: [{ inputId: 'asset-1', filename: 'image.png', mimeType: 'image/png' }],
+          },
+        })
+        assert.deepEqual(result, { post: { id: 'hidden-post', owned: true, text: 'hello' } })
+        assert.ok(Date.now() - started >= 350, 'send must wait for delayed media readiness')
+        assert.equal(await page.evaluate(() => Reflect.get(window, 'imageClicks')), 0)
+        assert.equal(await page.evaluate(() => Reflect.get(window, 'chooserClicks')), 0)
+        assert.equal(await page.evaluate(() => Reflect.get(window, 'sendClicks')), 1)
+        assert.equal(collectCount, 2)
       } finally {
         await browser.close()
       }
