@@ -6,7 +6,8 @@
 import { EventEmitter } from 'node:events'
 import { spawn, type ChildProcessByStdio } from 'node:child_process'
 import type { Readable } from 'node:stream'
-import { existsSync, lstatSync, readFileSync, readdirSync, realpathSync } from 'node:fs'
+import { existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import type { GoalStateSnapshot, OutboundContentBlock } from '@openclaude/protocol'
 import type { OpenClaudeConfig } from '@openclaude/storage'
@@ -203,6 +204,7 @@ interface GrokTurnContext {
   params: TurnParams
   startedAt: number
   proc: ChildProcessByStdio<null, Readable, Readable> | null
+  promptDir: string | null
   assistantText: string
   thinkingText: string
   assistantSegments: SegmentRecord[]
@@ -221,6 +223,18 @@ interface GrokTurnContext {
   errorDetail: string | null
   lastUsage: ReturnType<typeof grokUsage>
   resolveSummary: (summary: TurnSummary | null) => void
+}
+
+function cleanupPromptDir(ctx: GrokTurnContext): void {
+  const promptDir = ctx.promptDir
+  if (!promptDir) return
+  ctx.promptDir = null
+  try {
+    rmSync(promptDir, { recursive: true, force: true })
+  } catch {
+    // Best effort. The directory is mode 0700 and contains only this turn's
+    // mode-0600 prompt; a later container recycle removes any residue.
+  }
 }
 
 export class GrokAdapter extends EventEmitter implements EngineAdapter {
@@ -271,6 +285,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       params,
       startedAt: Date.now(),
       proc: null,
+      promptDir: null,
       assistantText: '',
       thinkingText: '',
       assistantSegments: [],
@@ -297,6 +312,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       // Only ever settle this turn's own barrier: shutdown() may have already
       // abandoned it, in which case `active` and `drain` belong to a later turn
       // that this failure says nothing about.
+      cleanupPromptDir(ctx)
       if (!ctx.abandoned) {
         this.forceEnd(ctx)
         if (this.active === ctx) this.active = null
@@ -356,10 +372,19 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       skillTrainRunId: this.opts.skillTrainRunId,
     })
     const prompt = await this.composePrompt(ctx.params, repoSnapshot, platform.advertisedMcpTools)
+    const promptDir = mkdtempSync(join(tmpdir(), 'oc-grok-prompt-'))
+    const promptFile = join(promptDir, 'prompt.md')
+    try {
+      writeFileSync(promptFile, prompt, { encoding: 'utf8', mode: 0o600, flag: 'wx' })
+    } catch (err) {
+      try { rmSync(promptDir, { recursive: true, force: true }) } catch { /* best effort */ }
+      throw err
+    }
+    ctx.promptDir = promptDir
     const args = [
       '--agent', 'grok-build',
       '--model', GROK_UPSTREAM_MODEL,
-      '-p', prompt,
+      '--prompt-file', promptFile,
       '--output-format', 'streaming-json',
       '--always-approve',
       '--no-subagents',
@@ -405,12 +430,19 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     }
     const bin = process.env.OC_GROK_CLI_BIN?.trim()
       || (existsSync('/usr/local/bin/grok-native') ? '/usr/local/bin/grok-native' : 'grok')
-    const proc = spawn(bin, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], detached: true })
+    let proc: ChildProcessByStdio<null, Readable, Readable>
+    try {
+      proc = spawn(bin, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], detached: true })
+    } catch (err) {
+      cleanupPromptDir(ctx)
+      throw err
+    }
     ctx.proc = proc
     if (ctx.abandoned) {
       // shutdown() gave up on this turn while we were still composing the
       // prompt. Nobody will read this process and it carries the turn's route
       // token, so it must not outlive the turn it belongs to.
+      cleanupPromptDir(ctx)
       killProcessGroup(proc, 'SIGKILL')
       detachChildStdio(proc)
       try { proc.unref() } catch { /* already detached */ }
@@ -439,6 +471,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       ctx.stderr += chunk
     })
     proc.once('error', (err) => {
+      cleanupPromptDir(ctx)
       // An abandoned turn has already been finalized and `active` has moved on;
       // surfacing this would report a later turn as failed.
       if (ctx.abandoned) return
@@ -446,6 +479,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       this.emit('error', err)
     })
     proc.once('close', (code, signal) => {
+      cleanupPromptDir(ctx)
       // shutdown() may have already given up on this process and finalized
       // the turn, in which case `active` belongs to a later turn that this
       // handler must not touch.
@@ -815,6 +849,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     proc: ChildProcessByStdio<null, Readable, Readable> | null,
     detail: string,
   ): void {
+    cleanupPromptDir(ctx)
     ctx.abandoned = true
     if (proc) detachChildStdio(proc)
     if (!ctx.terminal) this.finishError(ctx, detail)

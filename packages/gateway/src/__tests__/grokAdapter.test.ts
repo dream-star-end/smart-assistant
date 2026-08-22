@@ -52,7 +52,10 @@ describe('GrokAdapter', () => {
     const capture = path.join(dir, 'capture.json')
     await writeFile(fake, `#!/usr/bin/env node
 const fs = require('node:fs')
-fs.writeFileSync(process.env.FAKE_GROK_CAPTURE, JSON.stringify({ argv: process.argv.slice(2), env: {
+const argv = process.argv.slice(2)
+const promptFile = argv[argv.indexOf('--prompt-file') + 1]
+const prompt = fs.readFileSync(promptFile, 'utf8')
+fs.writeFileSync(process.env.FAKE_GROK_CAPTURE, JSON.stringify({ argv, promptFile, promptMode: fs.statSync(promptFile).mode & 0o777, prompt, env: {
   XAI_API_KEY: process.env.XAI_API_KEY,
   GROK_XAI_API_BASE_URL: process.env.GROK_XAI_API_BASE_URL,
   GROK_CLI_CHAT_PROXY_BASE_URL: process.env.GROK_CLI_CHAT_PROXY_BASE_URL,
@@ -152,11 +155,14 @@ for (const event of [
         },
       }])
 
-      const captured = JSON.parse(await readFile(capture, 'utf8')) as { argv: string[]; env: Record<string, string> }
+      const captured = JSON.parse(await readFile(capture, 'utf8')) as { argv: string[]; promptFile: string; promptMode: number; prompt: string; env: Record<string, string> }
       assert.deepEqual(captured.argv.slice(0, 4), ['--agent', 'grok-build', '--model', 'grok-4.6'])
-      const prompt = captured.argv[captured.argv.indexOf('-p') + 1]
-      assert.match(prompt, /OpenClaude Platform Context \(Grok adapter\)/)
-      assert.match(prompt, /fix it/)
+      assert.match(captured.prompt, /OpenClaude Platform Context \(Grok adapter\)/)
+      assert.match(captured.prompt, /fix it/)
+      assert.equal(captured.promptMode, 0o600)
+      assert.equal(captured.argv.includes('-p'), false)
+      assert.equal(captured.argv.includes('--prompt-file'), true)
+      await assert.rejects(readFile(captured.promptFile), /ENOENT/)
       assert.ok(captured.argv.includes('--resume'))
       assert.equal(captured.argv[captured.argv.indexOf('--resume') + 1], 'prior-session')
       assert.equal(captured.argv[captured.argv.indexOf('--reasoning-effort') + 1], 'high')
@@ -179,6 +185,52 @@ for (const event of [
       if (previousHome === undefined) delete process.env.OPENCLAUDE_HOME; else process.env.OPENCLAUDE_HOME = previousHome
       if (previousCapture === undefined) delete process.env.FAKE_GROK_CAPTURE; else process.env.FAKE_GROK_CAPTURE = previousCapture
       if (previousContainerToken === undefined) delete process.env.OPENCLAUDE_V3_CONTAINER_TOKEN; else process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = previousContainerToken
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('passes prompts larger than Linux MAX_ARG_STRLEN through a protected file', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-grok-large-prompt-'))
+    const fake = path.join(dir, 'fake-grok.cjs')
+    const capture = path.join(dir, 'capture.json')
+    await writeFile(fake, `#!/usr/bin/env node
+const fs = require('node:fs')
+const argv = process.argv.slice(2)
+const promptFile = argv[argv.indexOf('--prompt-file') + 1]
+const prompt = fs.readFileSync(promptFile, 'utf8')
+fs.writeFileSync(process.env.FAKE_GROK_CAPTURE, JSON.stringify({ argv, promptFile, promptBytes: Buffer.byteLength(prompt) }))
+console.log(JSON.stringify({ type: 'end', stopReason: 'end_turn', sessionId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', usage: { input_tokens: 1, output_tokens: 1 } }))
+`)
+    await chmod(fake, 0o755)
+    const previousBin = process.env.OC_GROK_CLI_BIN
+    const previousCapture = process.env.FAKE_GROK_CAPTURE
+    process.env.OC_GROK_CLI_BIN = fake
+    process.env.FAKE_GROK_CAPTURE = capture
+    try {
+      const adapter = new GrokAdapter(createOpts(dir))
+      adapter.setGrokRoute({
+        baseUrl: `http://127.0.0.1:18789/internal/v5/grok-relay/route/${TOKEN}/v1`,
+        routeToken: TOKEN,
+      })
+      adapter.on('error', () => {})
+      const largeInput = `large-prompt-sentinel:${'x'.repeat(256 * 1024)}`
+      const run = adapter.submitTurn({
+        input: largeInput,
+        requestId: REQUEST_ID,
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run.submitted
+      assert.ok(await run.summary)
+      await adapter.waitForOutputDrain()
+      const captured = JSON.parse(await readFile(capture, 'utf8')) as { argv: string[]; promptFile: string; promptBytes: number }
+      assert.ok(captured.promptBytes > 256 * 1024)
+      assert.equal(JSON.stringify(captured.argv).includes('large-prompt-sentinel'), false)
+      await assert.rejects(readFile(captured.promptFile), /ENOENT/)
+    } finally {
+      restoreEnv('OC_GROK_CLI_BIN', previousBin)
+      restoreEnv('FAKE_GROK_CAPTURE', previousCapture)
       await rm(dir, { recursive: true, force: true })
     }
   })
@@ -426,7 +478,10 @@ test('projects openclaude-memory into GROK_HOME when a gateway token is present'
   const capture = path.join(dir, 'capture.json')
   await writeFile(fake, `#!/usr/bin/env node
 const fs = require('node:fs')
-fs.writeFileSync(process.env.FAKE_GROK_CAPTURE, JSON.stringify({ argv: process.argv.slice(2) }))
+const argv = process.argv.slice(2)
+const promptFile = argv[argv.indexOf('--prompt-file') + 1]
+const prompt = fs.readFileSync(promptFile, 'utf8')
+fs.writeFileSync(process.env.FAKE_GROK_CAPTURE, JSON.stringify({ argv, prompt }))
 console.log(JSON.stringify({ type: 'end', stopReason: 'end_turn', sessionId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, reasoning_tokens: 0 } }))
 `)
   await chmod(fake, 0o755)
@@ -458,10 +513,9 @@ console.log(JSON.stringify({ type: 'end', stopReason: 'end_turn', sessionId: 'aa
     })
     await run.submitted
     await run.summary
-    const captured = JSON.parse(await readFile(capture, 'utf8')) as { argv: string[] }
-    const prompt = captured.argv[captured.argv.indexOf('-p') + 1]
-    assert.match(prompt, /use memory/)
-    assert.equal(prompt.includes('bearer-must-not-enter-argv'), false)
+    const captured = JSON.parse(await readFile(capture, 'utf8')) as { argv: string[]; prompt: string }
+    assert.match(captured.prompt, /use memory/)
+    assert.equal(captured.prompt.includes('bearer-must-not-enter-argv'), false)
     assert.equal(JSON.stringify(captured.argv).includes('bearer-must-not-enter-argv'), false)
     const managedConfig = await readFile(path.join(process.env.OPENCLAUDE_HOME!, 'grok-build', 'config.toml'), 'utf8')
     assert.match(managedConfig, /\[mcp_servers\."openclaude-memory"\]/)
