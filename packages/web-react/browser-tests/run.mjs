@@ -2446,8 +2446,18 @@ await check("T42 设置壳 390 单列可切五分区、1440 竖导航 168px、�
 await check("T44 当前会话 unread=false 回执前的流式刷新只发送一次 mark-read", async () => {
   await page.getByTestId("unread-request-probe").waitFor({ state: "visible", timeout: 3000 });
   await page.waitForTimeout(50);
+  for (let i = 0; i < 30; i += 1) {
+    await page.evaluate(() => window.__rerenderUnreadProbe());
+    await page.waitForTimeout(0);
+  }
+  await page.waitForTimeout(50);
+  if (unreadMarkReadRequests !== 0) {
+    throw new Error(`running 期间流式刷新不应 mark-read，实际 ${unreadMarkReadRequests}`);
+  }
+  await page.evaluate(() => window.__completeUnreadProbe());
+  await page.waitForTimeout(100);
   if (unreadMarkReadRequests !== 1) {
-    throw new Error(`探针首次挂载应只发一次 mark-read，实际 ${unreadMarkReadRequests}`);
+    throw new Error(`当前会话终态后应只发一次 mark-read，实际 ${unreadMarkReadRequests}`);
   }
   for (let i = 0; i < 30; i += 1) {
     await page.evaluate(() => window.__rerenderUnreadProbe());

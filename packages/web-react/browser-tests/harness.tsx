@@ -178,6 +178,7 @@ declare global {
     __pushMediaJob: (job: MediaGenerationJob) => void;
     __openMediaTask: (open: boolean) => void;
     __rerenderUnreadProbe: () => void;
+    __completeUnreadProbe: () => void;
   }
 }
 window.__sends = [];
@@ -1739,15 +1740,27 @@ createRoot(document.getElementById("codex-density-root")!).render(
 // mark-read；T44 在真 Chromium 里连续重渲染并统计真实 fetch。
 function UnreadMarkReadProbe() {
   const [, setRevision] = useState(0);
+  const [phase, setPhase] = useState<"running" | "terminal">("running");
   const authRef = useRef(createMemoryAuthSession(() => {}, "unread-browser-token"));
   useUnreadSessions({
-    sessions: [{ id: "unread-browser", title: "未读请求风暴探针", unread: true, runState: "running" }],
+    sessions: [
+      phase === "running"
+        ? { id: "unread-browser", title: "未读请求风暴探针", unread: true, runState: "running" }
+        : {
+            id: "unread-browser",
+            title: "未读请求风暴探针",
+            unread: true,
+            runState: "idle",
+            lastOutcome: "completed",
+          },
+    ],
     activeId: "unread-browser",
     userId: "unread-browser-user",
     auth: authRef.current,
   });
   useLayoutEffect(() => {
     window.__rerenderUnreadProbe = () => setRevision((value) => value + 1);
+    window.__completeUnreadProbe = () => setPhase("terminal");
   }, []);
   return <output data-testid="unread-request-probe">ready</output>;
 }
