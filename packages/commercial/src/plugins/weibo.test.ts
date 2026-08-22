@@ -178,14 +178,14 @@ describe('official Weibo Plugin', () => {
   })
 
   test('pins the current artifact and only the exact production predecessor', () => {
-    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.1')
+    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.2')
     assert.equal(WEIBO_DRIVER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.equal(WEIBO_LAUNCHER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.deepEqual(WEIBO_SETUP_COMPATIBLE_PREDECESSORS, [
       {
-        version: '1.6.0',
-        artifactHash: 'f40d66270e3529a9217c77c016be6c84aa2a93c5aa5c0536b4d9d4e8cbcdecd6',
-        execContractHash: '8401d895dbceaaee099da708e298d608f7abdc8956a30fd9775715a29d92c741',
+        version: '1.6.1',
+        artifactHash: '262e9d54d362fcd7496460c0a15f1d3ac4ca2588028e026de68a43098e29334a',
+        execContractHash: '9c9ddb1800e069d2a61ad73c61358df6e1a0d118fca3ded1201a39e016015963',
       },
     ])
     assert.equal(
@@ -419,6 +419,8 @@ describe('official Weibo Plugin', () => {
     assert.doesNotMatch(createPostSource, /force:\s*true|\.evaluate\([^)]*\.click|keyboard\./)
     assert.match(createPostSource, /expectedText.length > 2000/)
     assert.match(createPostSource, /openLongTextComposer/)
+    assert.match(createPostSource, /preparePostImageChooser\(page, editor\)/)
+    assert.match(WEIBO_WORKER_SOURCE, /exactMenuItem\(scope, '图片'\)/)
     assert.match(WEIBO_WORKER_SOURCE, /exactMenuItem\(page, '长文'\)/)
     assert.doesNotMatch(createPostSource, /cleanText\([^,]+, 2000\)/)
     assert.match(WEIBO_WORKER_SOURCE, /send\.click\(\{ timeout: 10_000, noWaitAfter: true \}\)/)

@@ -1099,8 +1099,15 @@ async function awaitNewestOwnPost(page, selfId, text, beforeIds) {
   }
   return null;
 }
-async function preparePostImageChooser(page) {
-  const image = await exactMenuItem(page, '图片');
+async function composerScope(editor) {
+  if (!editor || typeof editor.locator !== 'function') return null;
+  const scope = editor.locator('xpath=ancestor::*[.//*[(self::button or @role="button" or @role="menuitem")][normalize-space()="图片"]][1]');
+  if (await scope.count() !== 1) return null;
+  return scope;
+}
+async function preparePostImageChooser(page, editor) {
+  const scope = (await composerScope(editor)) || page;
+  const image = await exactMenuItem(scope, '图片');
   if (!image) throw new Error('media');
   await image.click({ trial: true, timeout: 10_000 });
   const [chooser] = await Promise.all([
@@ -1119,6 +1126,18 @@ async function postComposerEditor(page, longText) {
   if (longText) {
     const editable = await uniqueVisible(page.locator('[contenteditable="true"]'));
     if (editable) return editable;
+  }
+  const nodes = page.locator('textarea');
+  if (nodes && typeof nodes.count === 'function' && typeof nodes.nth === 'function') {
+    const matches = [];
+    const total = Math.min(await nodes.count(), 40);
+    for (let index = 0; index < total; index += 1) {
+      const node = nodes.nth(index);
+      if (!await visible(node)) continue;
+      const imageTool = node.locator('xpath=ancestor::*[.//*[(self::button or @role="button" or @role="menuitem")][normalize-space()="图片"]][1]');
+      if (await imageTool.count() === 1) matches.push(node);
+    }
+    if (matches.length === 1) return matches[0];
   }
   return uniqueVisible(page.locator('textarea'));
 }
@@ -1213,7 +1232,7 @@ async function writeAction(page, input) {
     if (manifest.length === 0) {
       await awaitPostSendReady(page, 30_000);
     } else {
-      imageChooser = await preparePostImageChooser(page);
+      imageChooser = await preparePostImageChooser(page, editor);
     }
     await awaitDispatch();
     await assertNoChallenge(page);
