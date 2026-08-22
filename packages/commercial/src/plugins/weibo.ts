@@ -17,6 +17,16 @@ import {
   REQUIRED_BROWSER_LAUNCHER_CAPABILITIES,
 } from './browserRuntime.js'
 import { WEIBO_WORKER_SOURCE } from './weiboWorkerSource.js'
+import {
+  DEFAULT_WEIBO_WORKER_LOG_DIR,
+  isWeiboWorkerProtocolFailureCode,
+  mapWeiboWorkerProtocolFailure,
+  persistWeiboWorkerLog,
+  sanitizeWeiboWorkerLogLine,
+  weiboWorkerDockerLogConfig,
+  type WeiboWorkerProtocolFailureCode,
+  type WeiboWriteFailureCode,
+} from './weiboWriteObservability.js'
 
 const IMAGE_ID_RE = /^sha256:[0-9a-f]{64}$/
 const WORKER_FILE = 'weibo-worker.mjs'
@@ -72,6 +82,25 @@ export {
   classifyWeiboSetupPin,
   isOfficialWeiboPluginIdentity,
 } from './weiboContract.js'
+export {
+  classifyWeiboWriteLedgerFields,
+  DEFAULT_WEIBO_WORKER_LOG_DIR,
+  mapWeiboWorkerProtocolFailure,
+  mapWeiboWorkerStage,
+  weiboWorkerDockerLogConfig,
+} from './weiboWriteObservability.js'
+
+/** Prior driver/launcher pins so a live install stays callable until marketplace seed. */
+const WEIBO_COMPAT_WORKER_PINS = [
+  {
+    version: '1.6.6',
+    digest: '33207d7b31d7d2d0cb2c2900388c8aae0463b19095cb2f01afc5885ea71cb0d3',
+  },
+  {
+    version: '1.6.7',
+    digest: 'cfb547489baaacab6361fb37222e45613c3d67e9f568bd29a3564c4964a40e32',
+  },
+] as const
 
 export class WeiboRuntimeError extends Error {
   readonly code:
@@ -85,6 +114,7 @@ export class WeiboRuntimeError extends Error {
     | 'CLOSING'
     | 'CLEANUP_FAILED'
     | 'PRECONDITION_CHANGED'
+    | WeiboWriteFailureCode
 
   readonly dispatchProvenNotStarted: boolean
 
@@ -104,7 +134,7 @@ interface ReadyEvent {
 
 interface FailedEvent {
   event: 'failed'
-  code: 'WORKER_FAILED' | 'LOGIN_EXPIRED' | 'UPSTREAM_FAILED'
+  code: WeiboWorkerProtocolFailureCode
 }
 
 interface PreparedEvent {
@@ -168,7 +198,7 @@ function parseWorkerEvent(value: unknown): WorkerEvent {
   }
   if (event.event === 'failed') {
     exactEventKeys(event, ['event', 'code'])
-    if (!['WORKER_FAILED', 'LOGIN_EXPIRED', 'UPSTREAM_FAILED'].includes(String(event.code)))
+    if (!isWeiboWorkerProtocolFailureCode(String(event.code)))
       throw new WeiboRuntimeError('PROTOCOL', 'worker failure code is invalid')
     return event as unknown as FailedEvent
   }
@@ -362,13 +392,22 @@ export class WeiboDockerService {
       maxWorkers?: number
       maxLoginWorkers?: number
       maxActionWorkers?: number
+      workerLogDir?: string
     },
   ) {}
+
+  private workerLogDir(): string {
+    return this.opts.workerLogDir ?? DEFAULT_WEIBO_WORKER_LOG_DIR
+  }
+
+  private writeWorkerLog(sessionId: string, event: Record<string, unknown>): void {
+    void persistWeiboWorkerLog(this.workerLogDir(), sessionId, event)
+  }
 
   private reserveWorker(key: string, kind: 'action' | 'login'): void {
     if (this.closing) throw new WeiboRuntimeError('CLOSING')
     if (this.active.has(key) || this.reserved.has(key))
-      throw new WeiboRuntimeError('EXECUTION_FAILED', 'worker key is already active')
+      throw new WeiboRuntimeError('WEIBO_WORKER_BUSY', 'worker key is already active')
     const total = this.active.size + this.reserved.size
     const kindTotal =
       [...this.active.values()].filter((worker) => worker.kind === kind).length +
@@ -496,6 +535,11 @@ export class WeiboDockerService {
     if (args.signal?.aborted) throw args.signal.reason
     if (this.closing) throw new WeiboRuntimeError('CLOSING')
     const sessionId = randomUUID()
+    this.writeWorkerLog(sessionId, {
+      step: 'host.worker_start',
+      kind: args.kind,
+      actionId: typeof args.input.actionId === 'string' ? args.input.actionId : undefined,
+    })
     const broker = await createManagedBrowserTlsBroker({
       root: this.opts.brokerRoot,
       invocationId: sessionId,
@@ -608,7 +652,7 @@ export class WeiboDockerService {
               : []),
           ],
           RestartPolicy: { Name: 'no', MaximumRetryCount: 0 },
-          LogConfig: { Type: 'none', Config: {} },
+          LogConfig: weiboWorkerDockerLogConfig(),
           AutoRemove: false,
           ShmSize: resources.shmSizeBytes,
         },
@@ -628,6 +672,7 @@ export class WeiboDockerService {
       let dispatchPromise: Promise<void> | null = null
       let prepared = false
       let stderrBytes = 0
+      let stderrRemainder = ''
       const decoder = new FrameDecoder((event) => {
         if (events.length === 0 && event.event !== 'ready')
           throw new WeiboRuntimeError('PROTOCOL', 'worker omitted compatibility handshake')
@@ -639,22 +684,38 @@ export class WeiboDockerService {
           throw new WeiboRuntimeError('PROTOCOL', 'worker emitted data after terminal event')
         events.push(event)
         args.onEvent?.(event)
+        if (event.event === 'ready') this.writeWorkerLog(sessionId, { step: 'host.ready' })
+        if (event.event === 'failed')
+          this.writeWorkerLog(sessionId, { step: 'host.failed', code: event.code })
+        if (event.event === 'completed') this.writeWorkerLog(sessionId, { step: 'host.completed' })
+        if (event.event === 'not_dispatched')
+          this.writeWorkerLog(sessionId, { step: 'host.not_dispatched', code: event.code })
+        if (event.event === 'authenticated')
+          this.writeWorkerLog(sessionId, { step: 'host.authenticated' })
         if (event.event === 'prepared') {
           if (prepared || !args.beforeDispatch || !stream)
             throw new WeiboRuntimeError('PROTOCOL', 'worker dispatch fence is invalid')
           prepared = true
+          this.writeWorkerLog(sessionId, { step: 'host.prepared' })
           dispatchPromise = args
             .beforeDispatch()
-            .then(
-              () =>
-                new Promise<void>((resolveWrite, reject) => {
-                  stream!.write(frame({ event: 'dispatch' }), (error) =>
-                    error ? reject(error) : resolveWrite(),
-                  )
-                }),
-            )
+            .then(() => {
+              this.writeWorkerLog(sessionId, { step: 'host.dispatch' })
+              return new Promise<void>((resolveWrite, reject) => {
+                stream!.write(frame({ event: 'dispatch' }), (error) =>
+                  error ? reject(error) : resolveWrite(),
+                )
+              })
+            })
             .catch((error) => {
               dispatchFailure = error
+              this.writeWorkerLog(sessionId, {
+                step: 'host.dispatch_failed',
+                code:
+                  typeof (error as { code?: unknown })?.code === 'string'
+                    ? String((error as { code: string }).code)
+                    : 'INTERNAL',
+              })
               void current.kill().catch(() => {})
             })
         }
@@ -672,8 +733,15 @@ export class WeiboDockerService {
         },
       })
       const stderr = new Writable({
-        write(chunk: Buffer, _encoding, callback) {
+        write: (chunk: Buffer, _encoding, callback) => {
           stderrBytes += chunk.length
+          stderrRemainder += chunk.toString('utf8')
+          const lines = stderrRemainder.split('\n')
+          stderrRemainder = lines.pop() ?? ''
+          for (const line of lines) {
+            const sanitized = sanitizeWeiboWorkerLogLine(line)
+            if (sanitized) this.writeWorkerLog(sessionId, sanitized)
+          }
           if (stderrBytes > WORKER_STDERR_MAX_BYTES) void current.kill().catch(() => {})
           callback()
         },
@@ -701,7 +769,7 @@ export class WeiboDockerService {
             new Promise<never>((_resolve, reject) => {
               timer = setTimeout(() => {
                 void current.kill().catch(() => {})
-                reject(new WeiboRuntimeError('EXECUTION_FAILED', 'worker deadline'))
+                reject(new WeiboRuntimeError('WEIBO_WORKER_DEADLINE', 'worker deadline'))
               }, remaining)
             }),
           ]).finally(() => {
@@ -730,7 +798,7 @@ export class WeiboDockerService {
             !terminal ||
             !['failed', 'completed', 'authenticated', 'not_dispatched'].includes(terminal.event)
           )
-            throw new WeiboRuntimeError('EXECUTION_FAILED', 'worker did not finish')
+            throw new WeiboRuntimeError('WEIBO_WORKER_INCOMPLETE', 'worker did not finish')
           if (dispatchFailure) throw dispatchFailure
           completed = events
         } catch (error) {
@@ -803,9 +871,10 @@ export class WeiboDockerService {
     })
     const terminal = (await worker.done).at(-1)!
     if (terminal.event === 'failed') {
-      if (terminal.code === 'LOGIN_EXPIRED')
+      const mapped = mapWeiboWorkerProtocolFailure(terminal.code)
+      if (mapped === 'LOGIN_EXPIRED_ACCOUNT')
         throw new WeiboRuntimeError('LOGIN_EXPIRED_ACCOUNT', 'Plugin login expired')
-      throw new WeiboRuntimeError('EXECUTION_FAILED', 'Weibo action failed')
+      throw new WeiboRuntimeError(mapped, 'Weibo action failed')
     }
     if (terminal.event === 'not_dispatched')
       throw new WeiboRuntimeError('PRECONDITION_CHANGED', 'Weibo target changed before dispatch')
@@ -957,10 +1026,31 @@ export function createWeiboRuntimeRegistries(service: WeiboDockerService): {
       return args.session.execute(args.actionId, args.params, args.signal, args.beforeDispatch)
     },
   }
-  return {
-    drivers: new Map([[`${driver.id}@${driver.version}`, driver]]),
-    launchers: new Map([[`${launcher.id}@${launcher.version}`, launcher]]),
+  const drivers = new Map<string, ManagedBrowserDriverV1>([
+    [`${driver.id}@${driver.version}`, driver],
+  ])
+  const launchers = new Map<string, ManagedBrowserLauncherV1>([
+    [`${launcher.id}@${launcher.version}`, launcher],
+  ])
+  for (const pin of WEIBO_COMPAT_WORKER_PINS) {
+    const launcherId = `weibo-container-${pin.digest.slice(0, 47)}`
+    const driverId = `weibo-${pin.digest.slice(0, 57)}`
+    const compatLauncher: ManagedBrowserLauncherV1 = {
+      ...launcher,
+      id: launcherId,
+      version: pin.version,
+    }
+    const compatDriver: ManagedBrowserDriverV1 = {
+      ...driver,
+      id: driverId,
+      version: pin.version,
+      launcherId,
+      launcherVersion: pin.version,
+    }
+    launchers.set(`${compatLauncher.id}@${compatLauncher.version}`, compatLauncher)
+    drivers.set(`${compatDriver.id}@${compatDriver.version}`, compatDriver)
   }
+  return { drivers, launchers }
 }
 
 export function validateWeiboAccountState(input: unknown): BrowserStorageStateV1 {

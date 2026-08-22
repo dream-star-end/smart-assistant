@@ -47,9 +47,46 @@ async function writeTerminalAndExit(value) {
   await new Promise((resolve, reject) => process.stdout.write(output, (error) => error ? reject(error) : resolve()));
   process.exit(0);
 }
-async function fail() {
+function classifyWriteFailure(reason) {
+  const message = reason && typeof reason === 'object' && reason.message != null ? String(reason.message) : String(reason || '');
+  if (message === 'composer-editor') return 'WEIBO_WRITE_COMPOSER_EDITOR';
+  if (message === 'composer-readback') return 'WEIBO_WRITE_COMPOSER_READBACK';
+  if (message === 'composer-longtext') return 'WEIBO_WRITE_COMPOSER_LONGTEXT';
+  if (message === 'composer') return 'WEIBO_WRITE_COMPOSER';
+  if (message === 'media-chooser') return 'WEIBO_WRITE_MEDIA_CHOOSER';
+  if (message === 'media-upload') return 'WEIBO_WRITE_MEDIA_UPLOAD';
+  if (message === 'media-preview-timeout') return 'WEIBO_WRITE_MEDIA_PREVIEW_TIMEOUT';
+  if (message === 'media-preview') return 'WEIBO_WRITE_MEDIA_PREVIEW';
+  if (message === 'media') return 'WEIBO_WRITE_MEDIA';
+  if (message === 'send-button') return 'WEIBO_WRITE_SEND_BUTTON';
+  if (message === 'send-click') return 'WEIBO_WRITE_SEND_CLICK';
+  if (message === 'send-uncleared') return 'WEIBO_WRITE_SEND_UNCLEARED';
+  if (message === 'send') return 'WEIBO_WRITE_SEND';
+  if (message === 'result') return 'WEIBO_WRITE_RESULT';
+  return 'WORKER_FAILED';
+}
+function emitStep(event) {
+  try {
+    const payload = { src: 'weibo-worker', t: Date.now() };
+    if (event && typeof event === 'object') {
+      if (typeof event.step === 'string') payload.step = String(event.step).slice(0, 64);
+      if (event.ok === true || event.ok === false) payload.ok = event.ok;
+      if (typeof event.ms === 'number' && Number.isFinite(event.ms)) payload.ms = Math.round(event.ms);
+      if (typeof event.hits === 'number' && Number.isFinite(event.hits)) payload.hits = Math.round(event.hits);
+      if (typeof event.timeoutMs === 'number' && Number.isFinite(event.timeoutMs)) payload.timeoutMs = Math.round(event.timeoutMs);
+      if (typeof event.textLen === 'number' && Number.isFinite(event.textLen)) payload.textLen = Math.round(event.textLen);
+      if (typeof event.textHash8 === 'string') payload.textHash8 = String(event.textHash8).slice(0, 8);
+      if (event.longText === true || event.longText === false) payload.longText = event.longText;
+      if (typeof event.mediaCount === 'number' && Number.isFinite(event.mediaCount)) payload.mediaCount = Math.round(event.mediaCount);
+      if (typeof event.code === 'string') payload.code = String(event.code).slice(0, 64);
+      if (typeof event.actionId === 'string') payload.actionId = String(event.actionId).slice(0, 64);
+    }
+    process.stderr.write(JSON.stringify(payload) + '\n');
+  } catch {}
+}
+async function fail(reason) {
   if (terminal) return;
-  await writeTerminalAndExit({ event: 'failed', code: 'WORKER_FAILED' });
+  await writeTerminalAndExit({ event: 'failed', code: classifyWriteFailure(reason) });
 }
 async function readFrame() {
   return new Promise((resolve, reject) => {
@@ -1167,13 +1204,13 @@ async function awaitComposerMediaReady(page, editor, expectedNew, timeout, befor
       added.push(src);
     }
     if (added.length === expectedNew) return;
-    if (added.length > expectedNew) throw new Error('media');
+    if (added.length > expectedNew) throw new Error('media-preview');
     const remaining = deadline - Date.now();
     if (attempt < attempts - 1 && remaining > 0) {
       await page.waitForTimeout(Math.min(250, remaining));
     }
   }
-  throw new Error('media');
+  throw new Error('media-preview-timeout');
 }
 async function awaitFileChooser(page, clickable) {
   await clickable.click({ trial: true, timeout: 10_000 });
@@ -1188,7 +1225,7 @@ async function preparePostImageChooser(page, editor) {
   const existing = await uniqueImageFileInput(scope);
   if (existing) return wrapFileInput(existing);
   const image = await exactMenuItem(scope, '图片');
-  if (!image) throw new Error('media');
+  if (!image) throw new Error('media-chooser');
   await image.click({ trial: true, timeout: 10_000 });
   let chooserSettled = false;
   const chooserWait = page.waitForEvent('filechooser', { timeout: 10_000 }).then((chooser) => {
@@ -1213,7 +1250,7 @@ async function preparePostImageChooser(page, editor) {
     if (appeared) return wrapFileInput(appeared);
     if (chooserSettled) break;
   }
-  throw new Error('media');
+  throw new Error('media-chooser');
 }
 async function openLongTextComposer(page) {
   const opener = await exactMenuItem(page, '长文');
@@ -1247,7 +1284,7 @@ async function readPostComposer(editor) {
   return cleanText(inner, 20000);
 }
 async function provePostSendReady(send, timeout) {
-  if (!send) throw new Error('send');
+  if (!send) throw new Error('send-button');
   await send.click({ trial: true, timeout });
 }
 async function awaitPostSendReady(page, timeout, editor) {
@@ -1270,7 +1307,7 @@ async function awaitPostSendReady(page, timeout, editor) {
       await page.waitForTimeout(Math.min(250, remaining));
     }
   }
-  throw new Error('send');
+  throw new Error('send-button');
 }
 async function activatePostSend(send) {
   await provePostSendReady(send, 10_000);
@@ -1324,9 +1361,9 @@ async function writeAction(page, input) {
     const longText = expectedText.length > 2000;
     if (longText) await openLongTextComposer(page);
     const editor = await postComposerEditor(page, longText);
-    if (!editor) throw new Error('composer');
+    if (!editor) throw new Error(longText ? 'composer-longtext' : 'composer-editor');
     if (expectedText) await editor.fill(expectedText);
-    if ((await readPostComposer(editor)) !== expectedText) throw new Error('composer');
+    if ((await readPostComposer(editor)) !== expectedText) throw new Error('composer-readback');
     const manifest = Array.isArray(params.mediaManifest) ? params.mediaManifest : [];
     await assertNoChallenge(page);
     let imageChooser = null;
@@ -1338,9 +1375,9 @@ async function writeAction(page, input) {
     await awaitDispatch();
     await assertNoChallenge(page);
     const freshEditor = await postComposerEditor(page, longText);
-    if (!freshEditor || (await readPostComposer(freshEditor)) !== expectedText) throw new Error('composer');
+    if (!freshEditor || (await readPostComposer(freshEditor)) !== expectedText) throw new Error('composer-readback');
     if (manifest.length) {
-      if (!imageChooser) throw new Error('media');
+      if (!imageChooser) throw new Error('media-chooser');
       const previewScope = (await composerScope(freshEditor)) || page;
       const previewBefore = await collectVisibleImageSrcs(previewScope);
       const files = [];
@@ -1351,7 +1388,7 @@ async function writeAction(page, input) {
         for (const file of files) file.buffer.fill(0);
       }
       const selected = await imageChooser.element().evaluate((node) => node.files ? node.files.length : 0);
-      if (selected !== manifest.length) throw new Error('media');
+      if (selected !== manifest.length) throw new Error('media-upload');
       await awaitComposerMediaReady(page, freshEditor, manifest.length, 90_000, previewBefore);
     }
     await assertNoChallenge(page);
@@ -1361,8 +1398,8 @@ async function writeAction(page, input) {
     const cleared = await awaitComposerCleared(page, freshEditor, 10_000);
     const post = await awaitNewestOwnPost(page, selfId, expectedText, beforeIds);
     if (!post) {
-      if (clickFailure) throw clickFailure;
-      if (manifest.length && !cleared) throw new Error('send');
+      if (clickFailure) throw new Error('send-click');
+      if (manifest.length && !cleared) throw new Error('send-uncleared');
       throw new Error('result');
     }
     return { post };
@@ -1646,12 +1683,20 @@ async function secureContext(browser, storageState, allowed) {
   return context;
 }
 async function runAction(input, relay) {
+  const started = Date.now();
+  emitStep({ step: 'action.start', actionId: input.actionId });
   const browser = await chromium.launch({ headless: true, proxy: { server: relay.proxy }, args: browserArgs() });
   try {
     const context = await secureContext(browser, input.storageState, ACTION_ORIGINS);
     const page = await context.newPage();
-    const result = WRITE_ACTIONS.has(input.actionId) ? await writeAction(page, input) : await actionRead(page, input);
-    await finishAction(context, input, result);
+    try {
+      const result = WRITE_ACTIONS.has(input.actionId) ? await writeAction(page, input) : await actionRead(page, input);
+      emitStep({ step: 'action.done', actionId: input.actionId, ok: true, ms: Date.now() - started });
+      await finishAction(context, input, result);
+    } catch (error) {
+      emitStep({ step: 'action.failed', actionId: input.actionId, ok: false, ms: Date.now() - started, code: classifyWriteFailure(error) });
+      throw error;
+    }
   } finally { await browser.close(); }
 }
 async function captureQr(page) {
@@ -1761,5 +1806,5 @@ try {
     await relay.close();
   }
   if (!terminal) await fail();
-} catch { await fail(); }
+} catch (error) { await fail(error); }
 `
