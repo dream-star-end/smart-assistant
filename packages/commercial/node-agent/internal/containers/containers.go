@@ -240,14 +240,14 @@ func (r *Runner) Run(ctx context.Context, req *RunRequest) (*RunResponse, error)
 	if req.InternalPort < 1 || req.InternalPort > 65535 {
 		return nil, fmt.Errorf("internalPort invalid")
 	}
-	if req.MemoryBytes <= 0 {
-		return nil, fmt.Errorf("memoryBytes must be > 0")
+	if req.MemoryBytes < 0 {
+		return nil, fmt.Errorf("memoryBytes must be >= 0")
 	}
-	if req.NanoCpus <= 0 {
-		return nil, fmt.Errorf("nanoCpus must be > 0")
+	if req.NanoCpus < 0 {
+		return nil, fmt.Errorf("nanoCpus must be >= 0")
 	}
-	if req.PidsLimit <= 0 {
-		return nil, fmt.Errorf("pidsLimit must be > 0")
+	if req.PidsLimit < 0 {
+		return nil, fmt.Errorf("pidsLimit must be >= 0")
 	}
 	for k := range req.Env {
 		if err := validateEnvKey(k); err != nil {
@@ -294,14 +294,28 @@ func (r *Runner) Run(ctx context.Context, req *RunRequest) (*RunResponse, error)
 		"--cap-drop", "NET_ADMIN",
 		// "--security-opt no-new-privileges" 已于 2026-05-09 (D1) 移除 —
 		// agent 用户配 NOPASSWD ALL sudo,no-new-privileges 会禁掉 setuid。
-		"--memory", fmt.Sprintf("%db", req.MemoryBytes),
-		"--memory-swap", fmt.Sprintf("%db", req.MemoryBytes), // 禁 swap
-		"--memory-swappiness", "0",
-		"--cpus", strconv.FormatFloat(cpus, 'f', 3, 64),
-		"--pids-limit", fmt.Sprintf("%d", req.PidsLimit),
+	}
+
+	if req.MemoryBytes > 0 {
+		args = append(args,
+			"--memory", fmt.Sprintf("%db", req.MemoryBytes),
+			"--memory-swap", fmt.Sprintf("%db", req.MemoryBytes),
+			"--memory-swappiness", "0",
+		)
+	}
+	if req.NanoCpus > 0 {
+		args = append(args, "--cpus", strconv.FormatFloat(cpus, "f", 3, 64))
+	}
+	if req.PidsLimit > 0 {
+		args = append(args, "--pids-limit", fmt.Sprintf("%d", req.PidsLimit))
+	} else {
+		args = append(args, "--pids-limit", "-1")
+	}
+
+	args = append(args,
 		"--shm-size", "64m",
 		"--tmpfs", "/run/oc/claude-config:rw,nosuid,nodev,size=4m,mode=0700,uid=1000,gid=1000",
-	}
+	)
 
 	// 保底 managed label(master 通常已经 merge,这里 idempotent 再写一次)。
 	args = append(args, "--label", fmt.Sprintf("%s=%s", LabelKey, LabelValue))

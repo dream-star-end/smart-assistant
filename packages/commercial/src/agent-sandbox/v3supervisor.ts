@@ -753,13 +753,19 @@ export const DEFAULT_V3_PIDS_LIMIT = 4096;
  *
  * 关键护栏(Codex round 1 BLOCKER):必须先 Math.floor 再要求 >=1,否则
  * OC_V3_MEMORY_MB=0.5 / OC_V3_CPUS=1e-10 / OC_V3_PIDS_LIMIT=0.5 会被 floor 到 0,
- * Docker 把 0 解读为"不限",跟修复目标直接冲突。
+ * Docker 把 0 解读为"不限",跟修复目标直接冲突。admin 的 unlimited 是显式开关,
+ * 与 env 微值回退是两条路,互不替代。
  */
-function resolveV3ResourceLimits(): {
+function resolveV3ResourceLimits(opts?: { unlimited?: boolean }): {
   memoryBytes: number;
   nanoCpus: number;
   pidsLimit: number;
 } {
+  // admin: Docker 把 0 当成不限,等于宿主有多大就能用多大。普通用户仍走 4GiB/1CPU 默认
+  // (或 OC_V3_* env)。0 只允许从 unlimited=true 进来;env 微值 floor 到 0 仍回退默认。
+  if (opts?.unlimited) {
+    return { memoryBytes: 0, nanoCpus: 0, pidsLimit: 0 };
+  }
   const MIB = 1024 * 1024;
   const NANO_CPU = 1_000_000_000;
 
@@ -3106,7 +3112,9 @@ export async function provisionV3Container(
     }
 
     // v3 容器资源硬限额(Memory / NanoCpus / PidsLimit)。env 覆盖见 resolveV3ResourceLimits。
-    const { memoryBytes, nanoCpus, pidsLimit } = resolveV3ResourceLimits();
+    const { memoryBytes, nanoCpus, pidsLimit } = resolveV3ResourceLimits({
+      unlimited: userRole === "admin",
+    });
 
     if (useRemote) {
       // 远端路径:facade 组装 HostConfig(硬化选项在 node-agent /containers/run 侧固定)。
@@ -3199,13 +3207,13 @@ export async function provisionV3Container(
           },
           HostConfig: {
             NetworkMode: v3NetworkNameForChannel(),
-            // 资源硬限额 — 单容器吃不光宿主;env OC_V3_MEMORY_MB / OC_V3_CPUS / OC_V3_PIDS_LIMIT 覆盖
+            // 资源硬限额 — 普通用户单容器吃不光宿主;admin 传 0 = Docker 不限
             Memory: memoryBytes,
-            // MemorySwap == Memory → 禁 swap;不设 docker 会默认配 2×Memory
+            // MemorySwap == Memory → 禁 swap;admin 0/0 = 不限。
             MemorySwap: memoryBytes,
             MemorySwappiness: 0,
-            NanoCpus: nanoCpus,
-            PidsLimit: pidsLimit,
+            ...(memoryBytes === 0 && nanoCpus === 0 ? {} : { NanoCpus: nanoCpus }),
+            PidsLimit: pidsLimit === 0 ? -1 : pidsLimit,
             // §9.3 cap-drop NET_RAW + NET_ADMIN(防 raw socket 伪造源 IP / 改路由)
             CapDrop: ["NET_RAW", "NET_ADMIN"],
             CapAdd: [],
