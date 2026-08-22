@@ -22,8 +22,8 @@ schemaVersion: 2
 agents:
   # 默认全能助手。其 model 同时是容器 config.defaults.model(平台默认模型)的来源。
   - id: main
-    model: glm-5.3
-    provider: ark
+    model: glm-5.3-zai
+    provider: zai
     persona: personas/main.md
     permissionMode: bypassPermissions
     displayName: 全能助手
@@ -40,8 +40,8 @@ agents:
   # 团队模式隐藏审查员(reserved system id;不带 source:marketplace,不进协作列表)。
   # persona 每次 boot 强制刷新(forcePersona),裁决词汇与 @openclaude/protocol 两源一致。
   - id: hidden-reviewer
-    model: glm-5.3
-    provider: ark
+    model: glm-5.3-zai
+    provider: zai
     persona: personas/hidden-reviewer.md
     forcePersona: true
     permissionMode: bypassPermissions

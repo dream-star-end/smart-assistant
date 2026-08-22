@@ -549,7 +549,7 @@ const ALLOWED_REASONING_EFFORTS = new Set<string>(PLATFORM_REASONING_EFFORTS)
 
 /** 平台执行模型兜底:V5 当前合法的静态 key 平台默认。 */
 export const EXECUTION_MODEL_FALLBACK_ROUTE = [
-  'glm-5.3',
+  'glm-5.3-zai',
   'MiniMax-M3',
   'deepseek-v4-flash',
 ] as const
@@ -562,7 +562,7 @@ export const EXECUTION_MODEL_FALLBACK = EXECUTION_MODEL_FALLBACK_ROUTE[0]
  * delegate 委派)会**绕过入站校验**,在 SessionManager.getOrCreate 里直接作为 CCB `--model`
  * spawn。已下线模型(如某个 stale 已安装 agent 里残留的 claude-*)会让 CCB 用不可路由的
  * --model 启动 → spawn 失败 / session 卡死。runner 创建是唯一收口点,这里把任何不在白名单的
- * 模型降级到平台默认(glm-5.3),使"Claude 官方模型下线"在 agent 级路径上也真正生效。
+ * 模型降级到平台默认(glm-5.3-zai),使"Claude 官方模型下线"在 agent 级路径上也真正生效。
  */
 export function resolveExecutionModel(
   preferred: string | undefined | null,
