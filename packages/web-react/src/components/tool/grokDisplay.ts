@@ -193,7 +193,7 @@ export function grokProductToolInput(nativeName: string, input: ToolInput): Tool
   const key = grokNativeKey(nativeName);
   if (key === "use_tool" || key === "call_mcp_tool" || key === "mcp") {
     const unwrapped = unwrapUseTool(input);
-    if (unwrapped) return grokProductToolInput(unwrapped.name, recordOf(unwrapped.input) ?? unwrapped.input);
+    if (unwrapped) return grokProductToolInput(unwrapped.name, recordOf(unwrapped.input));
   }
   const product = grokProductToolName(nativeName, input);
   const filePath = pickString(input, "file_path", "path", "absolute_path", "target_file");
