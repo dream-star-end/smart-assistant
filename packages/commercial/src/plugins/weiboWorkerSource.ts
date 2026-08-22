@@ -1127,22 +1127,19 @@ async function uniqueImageFileInput(scope) {
   }
   return matches.length === 1 ? matches[0] : null;
 }
-async function isUploadPreviewImage(node) {
-  if (!await node.isVisible().catch(() => false)) return false;
-  const src = String(await node.getAttribute('src').catch(() => '') || '');
-  if (/^(blob:|data:)/i.test(src)) return true;
-  return false;
-}
-async function countVisibleImages(scope) {
-  if (!scope || typeof scope.locator !== 'function') return 0;
+async function collectVisibleImageSrcs(scope) {
+  const srcs = [];
+  if (!scope || typeof scope.locator !== 'function') return srcs;
   const nodes = scope.locator('img');
-  if (!nodes || typeof nodes.count !== 'function' || typeof nodes.nth !== 'function') return 0;
-  let visibleCount = 0;
+  if (!nodes || typeof nodes.count !== 'function' || typeof nodes.nth !== 'function') return srcs;
   const total = Math.min(await nodes.count().catch(() => 0), 40);
   for (let index = 0; index < total; index += 1) {
-    if (await isUploadPreviewImage(nodes.nth(index))) visibleCount += 1;
+    const node = nodes.nth(index);
+    if (!await node.isVisible().catch(() => false)) continue;
+    const src = String(await node.getAttribute('src').catch(() => '') || '');
+    if (src) srcs.push(src);
   }
-  return visibleCount;
+  return srcs;
 }
 async function awaitComposerCleared(page, editor, timeout) {
   const deadline = Date.now() + timeout;
@@ -1156,14 +1153,21 @@ async function awaitComposerCleared(page, editor, timeout) {
   }
   return false;
 }
-async function awaitComposerMediaReady(page, editor, expected, timeout) {
+async function awaitComposerMediaReady(page, editor, expectedNew, timeout, beforeSrcs) {
   const scope = (await composerScope(editor)) || page;
+  const before = new Set(Array.isArray(beforeSrcs) ? beforeSrcs : []);
   const deadline = Date.now() + timeout;
   const attempts = Math.max(1, Math.ceil(timeout / 250));
   for (let attempt = 0; attempt < attempts; attempt += 1) {
-    const observed = await countVisibleImages(scope);
-    if (observed === expected) return;
-    if (observed > expected) throw new Error('media');
+    const added = [];
+    const seen = new Set();
+    for (const src of await collectVisibleImageSrcs(scope)) {
+      if (before.has(src) || seen.has(src)) continue;
+      seen.add(src);
+      added.push(src);
+    }
+    if (added.length === expectedNew) return;
+    if (added.length > expectedNew) throw new Error('media');
     const remaining = deadline - Date.now();
     if (attempt < attempts - 1 && remaining > 0) {
       await page.waitForTimeout(Math.min(250, remaining));
@@ -1338,7 +1342,7 @@ async function writeAction(page, input) {
     if (manifest.length) {
       if (!imageChooser) throw new Error('media');
       const previewScope = (await composerScope(freshEditor)) || page;
-      const previewBefore = await countVisibleImages(previewScope);
+      const previewBefore = await collectVisibleImageSrcs(previewScope);
       const files = [];
       try {
         for (const item of manifest) files.push({ name: item.filename, mimeType: item.mimeType, buffer: await readFile('/inputs/' + item.inputId) });
@@ -1348,7 +1352,7 @@ async function writeAction(page, input) {
       }
       const selected = await imageChooser.element().evaluate((node) => node.files ? node.files.length : 0);
       if (selected !== manifest.length) throw new Error('media');
-      await awaitComposerMediaReady(page, freshEditor, previewBefore + manifest.length, 90_000);
+      await awaitComposerMediaReady(page, freshEditor, manifest.length, 90_000, previewBefore);
     }
     await assertNoChallenge(page);
     const send = await awaitPostSendReady(page, manifest.length ? 90_000 : 30_000, freshEditor);

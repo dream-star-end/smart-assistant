@@ -188,14 +188,14 @@ describe('official Weibo Plugin', () => {
   })
 
   test('pins the current artifact and only the exact production predecessor', () => {
-    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.6')
+    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.7')
     assert.equal(WEIBO_DRIVER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.equal(WEIBO_LAUNCHER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.deepEqual(WEIBO_SETUP_COMPATIBLE_PREDECESSORS, [
       {
-        version: '1.6.5',
-        artifactHash: '42fae72536ede1c77133ee7dc56b1d075690d82efd3dc06cf19c1bc05059bb8b',
-        execContractHash: '064c830cc47b9d39d6cb0fdb592a83e15abe5e1ff85b9d9d5fe550eb787a13dd',
+        version: '1.6.6',
+        artifactHash: '1d007c57c7fde9abeeacb994ce39f2f7de8dfbebd0cac5aac9f52466f17b6e76',
+        execContractHash: 'b2dc1b346b94a62ad0e72e9b54c10e52f2d08220b83bad3b55c6be5fc85dbcc5',
       },
     ])
     assert.equal(
@@ -435,8 +435,8 @@ describe('official Weibo Plugin', () => {
     assert.match(WEIBO_WORKER_SOURCE, /exactMenuItem\(scope, '本地上传'\)/)
     assert.match(WEIBO_WORKER_SOURCE, /exactMenuItem\(scope, '发送'\)/)
     assert.match(WEIBO_WORKER_SOURCE, /awaitComposerMediaReady/)
-    assert.match(WEIBO_WORKER_SOURCE, /isUploadPreviewImage/)
-    assert.match(WEIBO_WORKER_SOURCE, /blob:\|data:/)
+    assert.match(WEIBO_WORKER_SOURCE, /collectVisibleImageSrcs/)
+    assert.match(createPostSource, /90_000, previewBefore/)
     assert.match(WEIBO_WORKER_SOURCE, /awaitComposerCleared/)
     assert.match(
       createPostSource,
