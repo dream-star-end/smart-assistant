@@ -32,6 +32,13 @@ function framed(value: unknown): Buffer {
   return Buffer.concat([header, body])
 }
 
+function uploadedImageLocator(events: string[]) {
+  return {
+    count: async () => (events.includes('upload') ? 1 : 0),
+    nth: () => ({ isVisible: async () => true }),
+  }
+}
+
 function compileWorkerPostHarness(overrides: Record<string, unknown>): {
   writeAction(page: unknown, input: unknown): Promise<unknown>
   awaitNewestOwnPost(
@@ -178,14 +185,14 @@ describe('official Weibo Plugin', () => {
   })
 
   test('pins the current artifact and only the exact production predecessor', () => {
-    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.4')
+    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.5')
     assert.equal(WEIBO_DRIVER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.equal(WEIBO_LAUNCHER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.deepEqual(WEIBO_SETUP_COMPATIBLE_PREDECESSORS, [
       {
-        version: '1.6.3',
-        artifactHash: '219c2074bc15ef2d55cca76bdcb1fa1813635442c78af0725718918ce1092858',
-        execContractHash: 'b984ca8879939434fce7a4e9c78bb42b5baf019b8abfbf72da003f9d34778d6f',
+        version: '1.6.4',
+        artifactHash: 'a664aae0a18f1d246b71f546f275d355cbff984f70f37606e406781556025aa0',
+        execContractHash: 'bf8e2e0ea02afb93622dc8360d753716b6118f939090ed1d61267c560da1b450',
       },
     ])
     assert.equal(
@@ -424,9 +431,17 @@ describe('official Weibo Plugin', () => {
     assert.match(WEIBO_WORKER_SOURCE, /exactMenuItem\(scope, '图片'\)/)
     assert.match(WEIBO_WORKER_SOURCE, /exactMenuItem\(scope, '本地上传'\)/)
     assert.match(WEIBO_WORKER_SOURCE, /exactMenuItem\(scope, '发送'\)/)
+    assert.match(WEIBO_WORKER_SOURCE, /awaitComposerMediaReady/)
     assert.match(
       createPostSource,
       /awaitPostSendReady\(page, manifest.length \? 90_000 : 30_000, freshEditor\)/,
+    )
+    assert.ok(
+      createPostSource.indexOf('awaitComposerMediaReady') <
+        createPostSource.indexOf(
+          'awaitPostSendReady(page, manifest.length ? 90_000 : 30_000, freshEditor)',
+        ),
+      'preview must be ready before send',
     )
     assert.match(WEIBO_WORKER_SOURCE, /setInputFiles/)
     assert.match(WEIBO_WORKER_SOURCE, /exactMenuItem\(page, '长文'\)/)
@@ -732,7 +747,7 @@ describe('official Weibo Plugin', () => {
       readFile: async () => Buffer.from('image'),
     })
     const page = {
-      locator: () => ({}),
+      locator: (selector: string) => (selector === 'img' ? uploadedImageLocator(events) : {}),
       waitForEvent: async () => imageChooser,
       waitForTimeout: async () => {},
     }
@@ -819,8 +834,11 @@ describe('official Weibo Plugin', () => {
       readFile: async () => Buffer.from('image'),
     })
     const page = {
-      locator: (selector: string) =>
-        selector === 'input[type="file"]' ? { count: async () => 1, nth: () => fileInput } : {},
+      locator: (selector: string) => {
+        if (selector === 'input[type="file"]') return { count: async () => 1, nth: () => fileInput }
+        if (selector === 'img') return uploadedImageLocator(events)
+        return {}
+      },
       waitForEvent: async () => {
         events.push('filechooser')
         throw new Error('filechooser should not open')
@@ -850,8 +868,11 @@ describe('official Weibo Plugin', () => {
     }
     const composerRoot = {
       count: async () => 1,
-      locator: (selector: string) =>
-        selector === 'input[type="file"]' ? { count: async () => 1, nth: () => fileInput } : {},
+      locator: (selector: string) => {
+        if (selector === 'input[type="file"]') return { count: async () => 1, nth: () => fileInput }
+        if (selector === 'img') return uploadedImageLocator(events)
+        return {}
+      },
     }
     const textarea = {
       fill: async () => {},
@@ -912,6 +933,56 @@ describe('official Weibo Plugin', () => {
     )
   })
 
+  test('create_post does not click send until composer preview count matches files', async () => {
+    const events: string[] = []
+    const textarea = { fill: async () => {}, inputValue: async () => 'hello' }
+    const imageTrigger = {
+      click: async (options: { trial?: boolean }) =>
+        events.push(options.trial ? 'image-trial' : 'image-click'),
+    }
+    const imageChooser = {
+      setFiles: async () => events.push('upload'),
+      element: () => ({ evaluate: async () => 1 }),
+    }
+    const send = {
+      click: async (options: { trial?: boolean }) => {
+        if (!options.trial) events.push('click')
+      },
+    }
+    const harness = compileWorkerPostHarness({
+      ensureSelfId: async () => '12345',
+      gotoAuthenticated: async () => {},
+      collectPosts: async () => [],
+      uniqueVisible: async () => textarea,
+      assertNoChallenge: async () => {},
+      awaitDispatch: async () => events.push('dispatch'),
+      exactMenuItem: async (_page: unknown, text: string) =>
+        text === '图片' ? imageTrigger : send,
+      cleanText: (value: unknown) => String(value).trim(),
+      readFile: async () => Buffer.from('image'),
+    })
+
+    await assert.rejects(
+      harness.writeAction(
+        {
+          locator: () => ({}),
+          waitForEvent: async () => imageChooser,
+          waitForTimeout: async () => {},
+        },
+        {
+          actionId: 'create_post',
+          params: {
+            text: 'hello',
+            mediaManifest: [{ inputId: 'asset-1', filename: 'image.png', mimeType: 'image/png' }],
+          },
+        },
+      ),
+      /media/,
+    )
+    assert.ok(!events.includes('click'))
+    assert.deepEqual(events, ['image-trial', 'image-click', 'dispatch', 'upload'])
+  })
+
   test('create_post opens 本地上传 when 图片 does not raise a native chooser', async () => {
     const events: string[] = []
     const textarea = { fill: async () => {}, inputValue: async () => 'hello' }
@@ -955,7 +1026,7 @@ describe('official Weibo Plugin', () => {
       readFile: async () => Buffer.from('image'),
     })
     const page = {
-      locator: () => ({}),
+      locator: (selector: string) => (selector === 'img' ? uploadedImageLocator(events) : {}),
       waitForEvent: async () => {
         if (!localClicked) {
           await new Promise((resolve) => setTimeout(resolve, 20))
@@ -1031,7 +1102,7 @@ describe('official Weibo Plugin', () => {
       readFile: async () => Buffer.from('image'),
     })
     const page = {
-      locator: () => ({}),
+      locator: (selector: string) => (selector === 'img' ? uploadedImageLocator(events) : {}),
       waitForEvent: async () => imageChooser,
       waitForTimeout: async () => {},
     }
@@ -1099,7 +1170,7 @@ describe('official Weibo Plugin', () => {
     })
     const result = await harness.writeAction(
       {
-        locator: () => ({}),
+        locator: (selector: string) => (selector === 'img' ? uploadedImageLocator(events) : {}),
         waitForEvent: async () => imageChooser,
         waitForTimeout: async () => {},
       },
@@ -1225,6 +1296,9 @@ describe('official Weibo Plugin', () => {
               input.multiple = true;
               input.hidden = true;
               input.addEventListener('change', () => {
+                const preview = document.createElement('img');
+                preview.alt = 'preview';
+                document.body.append(preview);
                 setTimeout(() => { document.querySelector('#send').disabled = false; }, 400);
               });
               document.body.append(input);
@@ -1326,6 +1400,9 @@ describe('official Weibo Plugin', () => {
               window.chooserClicks += 1;
             });
             document.querySelector('#file').addEventListener('change', () => {
+              const preview = document.createElement('img');
+              preview.alt = 'preview';
+              document.querySelector('#composer').append(preview);
               setTimeout(() => { document.querySelector('#send').disabled = false; }, 400);
             });
             document.querySelector('#send').addEventListener('click', () => {
@@ -1411,6 +1488,9 @@ describe('official Weibo Plugin', () => {
             window.sendClicks = 0;
             window.commentSendClicks = 0;
             document.querySelector('#file').addEventListener('change', () => {
+              const preview = document.createElement('img');
+              preview.alt = 'preview';
+              document.querySelector('#composer').append(preview);
               setTimeout(() => { document.querySelector('#send').disabled = false; }, 800);
             });
             document.querySelector('#send').addEventListener('click', () => {
