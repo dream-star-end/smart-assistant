@@ -8219,6 +8219,74 @@ describe('v5 release speedup (B1-B5, C4)', () => {
     assert.doesNotMatch(resolver, /packages\/protocol packages\/web-react/)
   })
 
+  test('B4: strong marker probe accepts distReuse without reindexing the string context', async () => {
+    const source = await readFile(deploy, 'utf8')
+    const probe = source.slice(
+      source.indexOf('\nrelease_marker_probe() {'),
+      source.indexOf('\nassert_release_metadata_matches_commit() {'),
+    )
+    assert.match(probe, /\.distReuse\.fromRelease \| type == "string" and startswith\("\/"\)/)
+    assert.match(probe, /\.distReuse\.comparedPaths \| type == "array" and length > 0/)
+    assert.doesNotMatch(probe, /\(\.distReuse\.fromRelease \| startswith/)
+    assert.doesNotMatch(probe, /\(\.distReuse\.comparedPaths \| length\)/)
+    assert.match(source, /paths_enc=/)
+    assert.match(source, /comparedPaths: \(\$paths \| split\("\|"\)/)
+
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-dist-reuse-marker-'))
+    try {
+      const releasesRoot = path.join(dir, 'releases')
+      await mkdir(releasesRoot)
+      const full = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).stdout.trim()
+      const short = full.slice(0, 8)
+      const metadataRaw = spawnSync(
+        'git', ['show', `${full}:deploy/v5/release-metadata.json`],
+        { cwd: root, encoding: 'utf8' },
+      ).stdout
+      const builtAt = '20260822-183616'
+      const release = path.join(releasesRoot, `rel-${short}-${builtAt}`)
+      await mkdir(path.join(release, 'deploy/v5'), { recursive: true })
+      await mkdir(path.join(release, 'node_modules'), { recursive: true })
+      await mkdir(path.join(release, 'packages/web-react/dist'), { recursive: true })
+      await writeFile(path.join(release, 'deploy/v5/release-metadata.json'), metadataRaw)
+      await writeFile(path.join(release, 'VERSION.json'), JSON.stringify({ commit: short }))
+      await writeFile(path.join(release, 'package.json'), '{}\n')
+      await writeFile(path.join(release, 'node_modules/dependency.js'), 'module.exports = 1\n')
+      await writeFile(path.join(release, 'packages/web-react/dist/index.html'), '<html>fixture</html>\n')
+      const invoke = (command: string) => spawnSync('bash', ['-c', [
+        'set -euo pipefail',
+        'export V5_DEPLOY_SOURCE_ONLY=1',
+        `source '${deploy}'`,
+        `RELEASES_ROOT='${releasesRoot}'`,
+        'KL_HOST=fake',
+        'ssh() { local _host="$1"; shift; if [[ $# == 1 ]]; then bash -c "$1"; else "$@"; fi; }',
+        command,
+      ].join('\n')], { cwd: root, encoding: 'utf8', env: { ...process.env, ALLOW_ANY_BRANCH: '1' } })
+      const artifact = invoke(`release_artifact_digest '${release}'`)
+      assert.equal(artifact.status, 0, artifact.stderr)
+      const marker = {
+        schemaVersion: 2,
+        sourceCommit: full,
+        builtAt,
+        metadataSha256: createHash('sha256').update(metadataRaw).digest('hex'),
+        artifactSha256: artifact.stdout.trim(),
+        distReuse: {
+          fromRelease: '/opt/openclaude/openclaude-v5-releases/rel-faf094dd3-20260822-044336',
+          fromSourceCommit: 'faf094dd30b6ba525cf5c19f3726e87c1208c8e8',
+          comparedPaths: ['package-lock.json', 'package.json', 'packages/protocol', 'packages/web-react'],
+          viteTaskboardEnabled: '0',
+        },
+      }
+      await writeFile(path.join(release, '.complete'), JSON.stringify(marker, null, 2) + '\n')
+      await chmod(path.join(release, '.complete'), 0o644)
+      await chmod(release, 0o755)
+      const valid = invoke(`assert_release_marker '${release}'`)
+      assert.equal(valid.status, 0, valid.stderr)
+      assert.doesNotMatch(valid.stderr, /Cannot index string with string/)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
   test('B4: try_reuse_web_dist refuses when kill-switch is off or current release is missing', () => {
     const off = invokeHelpers('try_reuse_web_dist /tmp/staging /tmp/cur deadbeefdeadbeefdeadbeefdeadbeefdeadbeef || exit 9', {
       OC_V5_DIST_REUSE: '0',
