@@ -39,6 +39,8 @@ import {
   stripNonTextContentBlocks,
   isUuidLike,
   DEEPSEEK_UPSTREAM_ENDPOINT,
+  OPENCODE_GO_UPSTREAM_ENDPOINT,
+  openCodeGoAuthHeaders,
   ALLOWED_BETA_VALUES,
   ANTHROPIC_VERSION,
   SIZE_LIMITS,
@@ -830,6 +832,16 @@ describe("isDeepseekModel", () => {
       DEEPSEEK_UPSTREAM_ENDPOINT,
       "https://api.deepseek.com/anthropic/v1/messages",
     );
+  });
+
+  test("OPENCODE_GO_UPSTREAM_ENDPOINT 是 Zen Go 路径且鉴权头只用 x-api-key", () => {
+    assert.equal(
+      OPENCODE_GO_UPSTREAM_ENDPOINT,
+      "https://opencode.ai/zen/go/v1/messages",
+    );
+    const headers = openCodeGoAuthHeaders("og-secret");
+    assert.equal(headers["x-api-key"], "og-secret");
+    assert.equal(headers.Authorization, undefined);
   });
 });
 

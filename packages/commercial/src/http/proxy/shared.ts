@@ -70,8 +70,9 @@ export const DEFAULT_UPSTREAM_ENDPOINT = "https://api.anthropic.com/v1/messages"
 //
 // 路由元数据(endpoint / matchesRoute / strip / maxInputTokens)的**单一权威源**已上移到
 // @openclaude/protocol 的 STATIC_KEY_PROVIDERS 注册表(commercial+gateway 共享)。
-// 下面这些导出仅为**保护现有 caller**(如 ws/voiceTranscribe.ts import DEEPSEEK_UPSTREAM_ENDPOINT)
+// 下面这些导出仅为**保护现有 caller**(anthropicProxy 测试 / DeepSeek Pro 直连路径)
 // 而保留的 thin re-export,值从注册表派生、与历史逐字节一致。新代码请直接用注册表。
+// 平台直连的 deepseek-v4-flash 任务请用 OPENCODE_GO_UPSTREAM_ENDPOINT,不要再用本 DeepSeek 端点。
 
 /**
  * DeepSeek 的 anthropic 兼容端点。命中 `isDeepseekModel`(大小写敏感前缀)后切到这里,
@@ -82,6 +83,27 @@ export const DEEPSEEK_UPSTREAM_ENDPOINT = getStaticProvider("deepseek").upstream
 /** 模型 id 是否走 deepseek 路径(大小写敏感前缀 `deepseek-`)。 */
 export function isDeepseekModel(modelId: string): boolean {
   return getStaticProvider("deepseek").matchesRoute(modelId);
+}
+
+/**
+ * OpenCode Go(Zen 网关 Go 档) anthropic 兼容端点。
+ * 平台直连的 `deepseek-v4-flash` 任务(市场审核 / 语音润色 / 知识星球自动回复)走这里,
+ * 与用户聊天同一条上游;不要再打 api.deepseek.com。
+ */
+export const OPENCODE_GO_UPSTREAM_ENDPOINT = getStaticProvider("opencodego").upstreamEndpoint;
+
+/**
+ * OpenCode Go `/messages` 鉴权头。该端点只认 `x-api-key`,Authorization Bearer 会 401。
+ */
+export function openCodeGoAuthHeaders(
+  apiKey: string,
+  accept = "application/json",
+): Record<string, string> {
+  return {
+    "x-api-key": apiKey,
+    "Content-Type": "application/json",
+    Accept: accept,
+  };
 }
 
 /** MiniMax Token Plan 的 Anthropic 兼容端点(完整 /v1/messages)。 */

@@ -5231,12 +5231,12 @@ export async function registerCommercial(
   };
 
   // Browser voice input: MediaRecorder → master WS → Deepgram Nova-3 streaming,
-  // then one-shot DeepSeek V4 Flash context polish after stop.
+  // then one-shot DeepSeek V4 Flash (OpenCode Go) context polish after stop.
   // Master-only commercial path: no runtime image rebuild required.
   const voiceTranscribeHandler: VoiceTranscribeHandler = createVoiceTranscribeHandler({
     jwtSecret,
     deepgramApiKey: cfg.DEEPGRAM_API_KEY,
-    deepseekApiKey: cfg.DEEPSEEK_API_KEY,
+    openCodeGoApiKey: cfg.OPENCODE_GO_API_KEY,
     asrModel: cfg.VOICE_ASR_MODEL,
     asrLanguage: cfg.VOICE_ASR_LANGUAGE,
     voicePolishModel: cfg.VOICE_POLISH_MODEL,
@@ -5869,7 +5869,7 @@ export async function registerCommercial(
     });
   }
 
-  // 市场发布 AI 自动审批 worker(deepseek-v4-flash)。仅 v5 启动:marketplace 表 v3/v5 共享
+  // 市场发布 AI 自动审批 worker(deepseek-v4-flash via OpenCode Go)。仅 v5 启动:marketplace 表 v3/v5 共享
   // 无 channel 列,但 v3 跑旧代码不写 ai_review_state → 恒 NULL → 永不被 claim,故 v3 保持
   // 纯人审、零行为变更。domain 'v5-owned'(v5 合法后台职责;写共享 marketplace 表但由
   // FOR UPDATE SKIP LOCKED 协调,v3 不参与)。关停:OC_MARKETPLACE_AI_REVIEW_DISABLED=1。
@@ -5882,7 +5882,7 @@ export async function registerCommercial(
     const raw = Number(process.env.OC_MARKETPLACE_AI_REVIEW_INTERVAL_MS);
     const intervalMs = Number.isFinite(raw) && raw >= 5000 ? raw : 15_000;
     marketplaceAiReviewScheduler = trackScheduler("marketplaceAiReview", "v5-owned", startMarketplaceAiReviewScheduler({
-      apiKey: cfg.DEEPSEEK_API_KEY,
+      apiKey: cfg.OPENCODE_GO_API_KEY,
       intervalMs,
       logger: {
         info: (m) => rootLogger.info(m, { subsys: "commercial", module: "marketplaceAiReview" }),
@@ -5989,7 +5989,7 @@ export async function registerCommercial(
             runtime: pluginFacade,
             preCheckRedis,
             pricing,
-            apiKey: cfg.DEEPSEEK_API_KEY,
+            apiKey: cfg.OPENCODE_GO_API_KEY,
             intervalMs,
             onError: (duty, error) =>
               rootLogger.warn('[knowledgePlanetAutomation] scheduler duty failed', {

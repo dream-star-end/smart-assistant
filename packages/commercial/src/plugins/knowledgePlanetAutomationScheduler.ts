@@ -17,7 +17,7 @@ import { decryptToBuffer, encrypt } from '../crypto/aead.js'
 import { loadKmsKey, zeroBuffer } from '../crypto/keys.js'
 import { getPool } from '../db/index.js'
 import { tx } from '../db/queries.js'
-import { DEEPSEEK_UPSTREAM_ENDPOINT } from '../http/proxy/shared.js'
+import { OPENCODE_GO_UPSTREAM_ENDPOINT, openCodeGoAuthHeaders } from '../http/proxy/shared.js'
 import { KNOWLEDGE_PLANET_AUTOMATION_DISCLAIMER_VERSION } from './knowledgePlanetAutomation.js'
 import { KNOWLEDGE_PLANET_PLUGIN_SLUG } from './knowledgePlanetContract.js'
 import type { PluginRuntimeFacade } from './runtime.js'
@@ -773,13 +773,9 @@ async function callReplyModel(input: {
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), MODEL_TIMEOUT_MS)
     try {
-      const response = await input.fetchImpl(DEEPSEEK_UPSTREAM_ENDPOINT, {
+      const response = await input.fetchImpl(OPENCODE_GO_UPSTREAM_ENDPOINT, {
         method: 'POST',
-        headers: {
-          Authorization: `Bearer ${input.apiKey}`,
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-        },
+        headers: openCodeGoAuthHeaders(input.apiKey),
         body: JSON.stringify({
           model: KNOWLEDGE_PLANET_AUTOMATION_MODEL,
           max_tokens: MODEL_MAX_TOKENS,
