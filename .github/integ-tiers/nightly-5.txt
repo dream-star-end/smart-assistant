@@ -16,3 +16,6 @@ packages/commercial/src/__tests__/agentSupervisor.integ.test.ts
 packages/commercial/src/__tests__/v3ProvisionTxWindow.integ.test.ts
 packages/commercial/src/__tests__/wechatBrokerAssembly.integ.test.ts
 packages/commercial/src/__tests__/db.integ.test.ts
+
+# tape materialization lease fencing (selfhost sync 2026-08-22)
+packages/commercial/src/__tests__/turnTapeJobs.integ.test.ts
