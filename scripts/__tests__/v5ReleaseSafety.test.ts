@@ -8131,7 +8131,14 @@ describe('v5 release speedup (B1-B5, C4)', () => {
     const build = source.slice(source.indexOf('\nbuild_release() {'), source.indexOf('\n# sessions-store-pg'))
     assert.match(build, /assert_ci_green_process_local "\$full_sha" "build_release"/)
     assert.doesNotMatch(build, /assert_ci_green_for_source_commit "\$full_sha"/)
-    assert.match(source, /canary\)[\s\S]{0,180}CANARY_RELEASE/)
+    assert.match(source, /resolve_specified_canary_source_commit\(\)/)
+    assert.match(source, /run_ci_green_gate_before_lease "\$sha"/)
+    const gateFn = source.slice(
+      source.indexOf('\nmaybe_run_ci_green_gate_for_mode() {'),
+      source.indexOf('\nmaybe_recheck_ci_green_after_lease() {'),
+    )
+    assert.match(gateFn, /CANARY_RELEASE/)
+    assert.doesNotMatch(gateFn, /if \[\[ -z "\$CANARY_RELEASE" \]\]/)
   })
 
   test('B1: cheap recheck fails closed when this process never passed the gate or SHA drifted', () => {
@@ -8191,7 +8198,9 @@ describe('v5 release speedup (B1-B5, C4)', () => {
     assert.match(source, /OC_V5_DIST_REUSE:-1/)
     assert.match(source, /OC_V5_DIST_REUSE=0/)
     assert.match(source, /git -C "\$REPO_ROOT" diff-tree --quiet/)
-    assert.match(source, /WEB_DIST_REUSE_PATHS=/)
+    assert.match(source, /resolve_web_dist_reuse_paths\(\)/)
+    assert.match(source, /WEB_DIST_REUSE_ROOT_PATHS=/)
+    assert.doesNotMatch(source, /WEB_DIST_REUSE_PATHS=/)
     assert.match(source, /packages\/web-react\/vite\.config\.ts/)
     assert.match(source, /record_dist_reuse_in_complete/)
     assert.match(source, /distReuse/)
@@ -8200,8 +8209,14 @@ describe('v5 release speedup (B1-B5, C4)', () => {
     assert.match(build, /VITE_TASKBOARD_ENABLED=0 npm run build --workspace packages\/web-react/)
     const helper = source.slice(source.indexOf('\ntry_reuse_web_dist() {'), source.indexOf('\nrecord_dist_reuse_in_complete() {'))
     assert.match(helper, /当前 release \.complete\/dist 不完整/)
-    assert.match(helper, /web\/lock\/构建配置相对/)
+    assert.match(helper, /web workspace 闭包\/lock\/构建配置相对/)
     assert.match(helper, /VITE_TASKBOARD_ENABLED=0 硬编码/)
+    const resolver = source.slice(
+      source.indexOf('\nresolve_web_dist_reuse_paths() {'),
+      source.indexOf('\ntry_reuse_web_dist() {'),
+    )
+    assert.match(resolver, /@openclaude\/\*/)
+    assert.doesNotMatch(resolver, /packages\/protocol packages\/web-react/)
   })
 
   test('B4: try_reuse_web_dist refuses when kill-switch is off or current release is missing', () => {
@@ -8220,10 +8235,13 @@ describe('v5 release speedup (B1-B5, C4)', () => {
     const source = await readFile(deploy, 'utf8')
     assert.match(source, /compute_runtime_input_digest\(\)/)
     assert.match(source, /try_reuse_runtime_release\(\)/)
+    assert.match(source, /runtime_input_ls_tree\(\)/)
+    assert.match(source, /load_runtime_rsync_exclude_patterns\(\)/)
     assert.match(source, /OC_V5_RUNTIME_REUSE:-1/)
     assert.match(source, /OC_V5_RUNTIME_REUSE=0/)
     assert.match(source, /inputDigest/)
     assert.match(source, /oc_hotcfg_verify_manifest_sampled/)
+    assert.doesNotMatch(source, /RUNTIME_INPUT_TREE_PATHS=/)
     const build = source.slice(source.indexOf('\nbuild_runtime_release() {'), source.indexOf('\nhotcfg_core_smoke_cmd() {'))
     assert.match(build, /try_reuse_runtime_release "\$full_sha" "\$RUNTIME_IMAGE_ID"/)
     assert.match(build, /record_runtime_input_digest/)
@@ -8289,5 +8307,113 @@ describe('v5 release speedup (B1-B5, C4)', () => {
     ].join('\n'))
     assert.equal(blocked.status, 14)
     assert.match(blocked.stderr, /无法读取 deploy_state/)
+  })
+
+  const danglingFileChange = (file: string, extra = '\n// audit-blocker\n') => {
+    const head = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).stdout.trim()
+    const orig = spawnSync('git', ['show', `${head}:${file}`], { cwd: root, encoding: 'utf8' })
+    assert.equal(orig.status, 0, orig.stderr)
+    const blob = spawnSync('git', ['hash-object', '-w', '--stdin'], {
+      cwd: root,
+      encoding: 'utf8',
+      input: orig.stdout + extra,
+    }).stdout.trim()
+    assert.match(blob, /^[0-9a-f]{40}$/)
+    const ls = spawnSync('git', ['ls-tree', '-r', head, '--', file], { cwd: root, encoding: 'utf8' })
+    assert.equal(ls.status, 0, ls.stderr)
+    const mode = ls.stdout.trim().split(/\s+/)[0]
+    const index = path.join(tmpdir(), `oc-v5-audit-idx-${process.pid}-${Date.now()}`)
+    const env = { ...process.env, GIT_INDEX_FILE: index }
+    const readTree = spawnSync('git', ['read-tree', head], { cwd: root, encoding: 'utf8', env })
+    assert.equal(readTree.status, 0, readTree.stderr)
+    const upd = spawnSync('git', ['update-index', '--cacheinfo', `${mode},${blob},${file}`], {
+      cwd: root,
+      encoding: 'utf8',
+      env,
+    })
+    assert.equal(upd.status, 0, upd.stderr)
+    const tree = spawnSync('git', ['write-tree'], { cwd: root, encoding: 'utf8', env }).stdout.trim()
+    assert.match(tree, /^[0-9a-f]{40}$/)
+    const commit = spawnSync('git', ['commit-tree', tree, '-p', head, '-m', `audit overlay ${file}`], {
+      cwd: root,
+      encoding: 'utf8',
+    }).stdout.trim()
+    assert.match(commit, /^[0-9a-f]{40}$/)
+    spawnSync('rm', ['-f', index])
+    return { head, commit }
+  }
+
+  test('B1: specified --canary=<release> without green evidence is refused', () => {
+    const sha = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    const refused = invokeHelpers([
+      'MODE=canary',
+      'CANARY_RELEASE=/opt/openclaude/openclaude-v5-releases/rel-audit-blocker',
+      'DRY=0',
+      `release_marker_probe() { printf 'strong\\t${sha}\\tshort\\tbuilt\\tart\\n'; }`,
+      'assert_ci_green_for_source_commit() { echo "✗ CI 绿门未通过(无证据)" >&2; return 1; }',
+      'maybe_run_ci_green_gate_for_mode || exit 21',
+    ].join('\n'))
+    assert.equal(refused.status, 21)
+    assert.match(refused.stderr, /CI 绿门未通过|无证据/)
+
+    const legacy = invokeHelpers([
+      'MODE=canary',
+      'CANARY_RELEASE=/opt/openclaude/openclaude-v5-releases/rel-legacy',
+      'release_marker_probe() { printf "legacy\\tabc123\\tshort\\tbuilt\\tart\\n"; }',
+      'resolve_specified_canary_source_commit || exit 22',
+    ].join('\n'))
+    assert.equal(legacy.status, 22)
+    assert.match(legacy.stderr, /legacy/)
+
+    const noStamp = invokeHelpers([
+      'MODE=canary',
+      'CANARY_RELEASE=/opt/openclaude/openclaude-v5-releases/rel-audit-blocker',
+      'DRY=0',
+      'CI_GREEN_PASSED_SHA=',
+      'CI_GREEN_PASSED_AT=',
+      `assert_ci_green_specified_release_local ${sha} test || exit 23`,
+    ].join('\n'))
+    assert.equal(noStamp.status, 23)
+    assert.match(noStamp.stderr, /CI 绿门未在本进程通过/)
+  })
+
+  test('B4: protocol-only change must invalidate web dist reuse', () => {
+    const paths = invokeHelpers('resolve_web_dist_reuse_paths "$(git rev-parse HEAD)"')
+    assert.equal(paths.status, 0, paths.stderr)
+    assert.match(paths.stdout, /^packages\/protocol$/m)
+    assert.match(paths.stdout, /^packages\/web-react$/m)
+    assert.match(paths.stdout, /^package-lock\.json$/m)
+
+    const { head, commit } = danglingFileChange('packages/protocol/src/activeContent.ts')
+    const changed = invokeHelpers([
+      `OLD='${head}'`,
+      `NEW='${commit}'`,
+      'ssh() {',
+      '  if [[ "$*" == *jq* ]]; then printf "%s\\n" "$OLD"; return 0; fi',
+      '  return 0',
+      '}',
+      'try_reuse_web_dist /tmp/oc-v5-dist-staging /tmp/oc-v5-dist-cur "$NEW" || exit 31',
+    ].join('\n'))
+    assert.equal(changed.status, 31, changed.stdout + changed.stderr)
+    assert.match(changed.stderr, /web workspace 闭包|有差异/)
+  })
+
+  test('B5: channels-only change must invalidate runtime reuse', () => {
+    const listed = invokeHelpers('runtime_input_ls_tree "$(git rev-parse HEAD)"')
+    assert.equal(listed.status, 0, listed.stderr)
+    assert.match(listed.stdout, /packages\/channels\//)
+    assert.match(listed.stdout, /packages\/plugin-sdk\//)
+    assert.doesNotMatch(listed.stdout, /packages\/commercial\//)
+    assert.doesNotMatch(listed.stdout, /\tscripts\//)
+
+    const sha = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).stdout.trim()
+    const image = 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    const base = invokeHelpers(`compute_runtime_input_digest '${sha}' '${image}'`)
+    assert.equal(base.status, 0, base.stderr)
+    const { commit } = danglingFileChange('packages/channels/webchat/src/index.ts')
+    const changed = invokeHelpers(`compute_runtime_input_digest '${commit}' '${image}'`)
+    assert.equal(changed.status, 0, changed.stderr)
+    assert.match(base.stdout.trim(), /^[0-9a-f]{64}$/)
+    assert.notEqual(base.stdout.trim(), changed.stdout.trim())
   })
 })

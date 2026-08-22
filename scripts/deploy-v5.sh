@@ -3348,9 +3348,11 @@ assert_ci_green_for_source_commit() { # <full sha>
 CI_GREEN_PASSED_SHA=""
 CI_GREEN_PASSED_AT=""
 
-run_ci_green_gate_before_lease() {
-  local sha
-  sha="$(resolve_release_source_commit)" || return 1
+run_ci_green_gate_before_lease() { # [explicit-sha]
+  local sha="${1:-}"
+  if [[ -z "$sha" ]]; then
+    sha="$(resolve_release_source_commit)" || return 1
+  fi
   [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "✗ CI 绿门:无法解析发布源 commit" >&2; return 1; }
   echo "── CI 绿门(mutation lease 外):$sha ──"
   assert_ci_green_for_source_commit "$sha" || return 1
@@ -3413,13 +3415,80 @@ assert_ci_green_process_local() { # <expected-sha> <ctx>
   echo "  ✓ [$ctx] CI 绿门廉价复核通过(sha=$expected at=$CI_GREEN_PASSED_AT)"
 }
 
+# --canary=<release> 的源 SHA 只能来自该 release 的可信 strong .complete。
+# legacy / 短 SHA / 缺字段一律 fail-closed;--allow-unverified-ci 仍是唯一显式豁免口。
+resolve_specified_canary_release_dir() {
+  local requested
+  [[ -n "$CANARY_RELEASE" ]] || { echo "✗ 指定 canary 未提供 CANARY_RELEASE" >&2; return 1; }
+  requested="$RELEASES_ROOT/$CANARY_RELEASE"
+  [[ "$CANARY_RELEASE" == /* ]] && requested="$CANARY_RELEASE"
+  [[ "$requested" == /* && "$requested" != *..* ]] || {
+    echo "✗ 指定 canary release 路径非法:$CANARY_RELEASE" >&2
+    return 1
+  }
+  printf '%s\n' "$requested"
+}
+
+resolve_specified_canary_source_commit() {
+  local reldir probe kind source
+  reldir="$(resolve_specified_canary_release_dir)" || return 1
+  probe="$(release_marker_probe "$reldir")" || {
+    echo "✗ 指定 canary release 的 .complete marker 不可信/不可解析:$reldir" >&2
+    return 1
+  }
+  IFS=$'\t' read -r kind source _ <<<"$probe"
+  if [[ "$kind" == legacy ]]; then
+    echo "✗ 指定 canary release 是 legacy .complete,拒绝无完整 sourceCommit 的绿门路径:$reldir" >&2
+    return 1
+  fi
+  [[ "$kind" == strong && "$source" =~ ^[0-9a-f]{40}$ ]] || {
+    echo "✗ 指定 canary release 缺完整 40-hex sourceCommit(kind=${kind:-?}):$reldir" >&2
+    return 1
+  }
+  printf '%s\n' "$source"
+}
+
+# 指定 canary release 的廉价复核:本进程绿门戳 + marker SHA 未漂。
+# 不要求 checkout HEAD==该 SHA——复用旧 release 时工作树本来就可以不等于制品源。
+assert_ci_green_specified_release_local() { # <expected-sha> <ctx>
+  local expected="$1" ctx="${2:-canary-recheck}" now marker_sha
+  [[ "$expected" =~ ^[0-9a-f]{40}$ ]] || { echo "✗ [$ctx] 指定 canary SHA 非法:$expected" >&2; return 1; }
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] [$ctx] 复核指定 canary release 绿门结论(sha=$expected)"
+    return 0
+  fi
+  if [[ -z "$CI_GREEN_PASSED_SHA" || -z "$CI_GREEN_PASSED_AT" ]]; then
+    echo "✗ [$ctx] CI 绿门未在本进程通过(禁止 --canary=<release> 无门启动 candidate)" >&2
+    return 1
+  fi
+  [[ "$CI_GREEN_PASSED_SHA" == "$expected" ]] || {
+    echo "✗ [$ctx] CI 绿门 pinned SHA 已漂(passed=$CI_GREEN_PASSED_SHA now=$expected)" >&2
+    return 1
+  }
+  now="$(date +%s)"
+  [[ "$now" =~ ^[1-9][0-9]*$ && "$now" -ge "$CI_GREEN_PASSED_AT" ]] || {
+    echo "✗ [$ctx] CI 绿门结论时间戳不可信(at=$CI_GREEN_PASSED_AT now=$now)" >&2
+    return 1
+  }
+  marker_sha="$(resolve_specified_canary_source_commit)" || return 1
+  [[ "$marker_sha" == "$expected" ]] || {
+    echo "✗ [$ctx] 指定 canary .complete sourceCommit 已漂(expected=$expected marker=$marker_sha)" >&2
+    return 1
+  }
+  echo "  ✓ [$ctx] 指定 canary release CI 绿门廉价复核通过(sha=$expected at=$CI_GREEN_PASSED_AT)"
+}
+
 maybe_run_ci_green_gate_for_mode() {
+  local sha
   case "$MODE" in
     deploy|dist)
       run_ci_green_gate_before_lease || return 1
       ;;
     canary)
-      if [[ -z "$CANARY_RELEASE" ]]; then
+      if [[ -n "$CANARY_RELEASE" ]]; then
+        sha="$(resolve_specified_canary_source_commit)" || return 1
+        run_ci_green_gate_before_lease "$sha" || return 1
+      else
         run_ci_green_gate_before_lease || return 1
       fi
       ;;
@@ -3427,12 +3496,16 @@ maybe_run_ci_green_gate_for_mode() {
 }
 
 maybe_recheck_ci_green_after_lease() {
+  local sha
   case "$MODE" in
     deploy|dist)
       assert_ci_green_process_local "$CI_GREEN_PASSED_SHA" "post-lease" || return 1
       ;;
     canary)
-      if [[ -z "$CANARY_RELEASE" ]]; then
+      if [[ -n "$CANARY_RELEASE" ]]; then
+        sha="$(resolve_specified_canary_source_commit)" || return 1
+        assert_ci_green_specified_release_local "$sha" "post-lease" || return 1
+      else
         assert_ci_green_process_local "$CI_GREEN_PASSED_SHA" "post-lease" || return 1
       fi
       ;;
@@ -3568,12 +3641,67 @@ assert_p3_preserved_tuple_matches_candidate() { # <target full commit>
 }
 
 # B4:with-dist 在 pinned SHA 相对当前 active sourceCommit 的 web 输入面无差异时 cp -al 复用。
+# 输入面 = web-react 的 @openclaude/* workspace 闭包(递归) + 根 lock/构建配置。
+# 禁止手写包名单;解析失败 fail-closed 回退全量构建。
 # VITE_TASKBOARD_ENABLED 硬编码 0;oc-build 是 index.html 内容哈希,不含 per-release env。
 DIST_REUSE_FROM=""; DIST_REUSE_OLD_SHA=""; DIST_REUSE_PATHS=""
-WEB_DIST_REUSE_PATHS="packages/web-react package-lock.json package.json packages/web-react/vite.config.ts packages/web-react/tsconfig.json tsconfig.json tsconfig.base.json"
+WEB_DIST_REUSE_ROOT_PATHS="package-lock.json package.json packages/web-react/vite.config.ts packages/web-react/tsconfig.json tsconfig.json tsconfig.base.json"
+
+# 从 pinned SHA 的 packages/web-react/package.json 递归解析 @openclaude/* 闭包。
+# stdout:换行分隔的 diff-tree 路径;解析失败返回非 0。
+resolve_web_dist_reuse_paths() { # <full-sha>
+  local sha="$1" listing entry name dir pkg json deps extra
+  local -A name_to_dir=() seen=()
+  local -a queue=('@openclaude/web-react') dirs=() extras=()
+  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "  · dist 复用拒绝:SHA 非法,无法解析 web workspace 闭包" >&2; return 1; }
+  listing="$(git -C "$REPO_ROOT" ls-tree -r --full-tree --name-only "$sha" -- packages)" || {
+    echo "  · dist 复用拒绝:无法列出 $sha 的 packages 树" >&2
+    return 1
+  }
+  while IFS= read -r entry; do
+    [[ "$entry" == packages/*/package.json || "$entry" == packages/*/*/package.json ]] || continue
+    name="$(git -C "$REPO_ROOT" show "${sha}:${entry}" | jq -er '.name | select(type=="string" and startswith("@openclaude/"))')" || continue
+    name_to_dir["$name"]="${entry%/package.json}"
+  done <<<"$listing"
+  [[ -n "${name_to_dir['@openclaude/web-react']:-}" ]] || {
+    echo "  · dist 复用拒绝:pinned SHA 找不到 @openclaude/web-react 包目录" >&2
+    return 1
+  }
+  while ((${#queue[@]} > 0)); do
+    pkg="${queue[0]}"
+    queue=("${queue[@]:1}")
+    [[ -z "${seen[$pkg]:-}" ]] || continue
+    seen["$pkg"]=1
+    dir="${name_to_dir[$pkg]:-}"
+    [[ -n "$dir" ]] || { echo "  · dist 复用拒绝:无法解析 workspace 依赖 $pkg 的 packages/<dir>" >&2; return 1; }
+    dirs+=("$dir")
+    json="$(git -C "$REPO_ROOT" show "${sha}:${dir}/package.json")" || {
+      echo "  · dist 复用拒绝:读不到 ${dir}/package.json" >&2
+      return 1
+    }
+    deps="$(jq -r '[.dependencies,.devDependencies,.peerDependencies,.optionalDependencies] | map(select(. != null)) | add // {} | keys[]? | select(startswith("@openclaude/"))' <<<"$json")" || {
+      echo "  · dist 复用拒绝:解析 ${dir}/package.json 的 @openclaude/* 依赖失败" >&2
+      return 1
+    }
+    while IFS= read -r extra; do
+      [[ -n "$extra" ]] || continue
+      queue+=("$extra")
+    done <<<"$deps"
+  done
+  ((${#dirs[@]} > 0)) || { echo "  · dist 复用拒绝:web workspace 闭包为空" >&2; return 1; }
+  read -r -a extras <<<"$WEB_DIST_REUSE_ROOT_PATHS"
+  for extra in "${extras[@]}"; do
+    git -C "$REPO_ROOT" cat-file -e "${sha}:${extra}" || {
+      echo "  · dist 复用拒绝:构建输入缺失 $extra" >&2
+      return 1
+    }
+    dirs+=("$extra")
+  done
+  printf '%s\n' "${dirs[@]}" | awk 'NF && !seen[$0]++' | sort
+}
 
 try_reuse_web_dist() { # <staging> <current-release> <full-sha>
-  local staging="$1" cur="$2" full_sha="$3" old_sha
+  local staging="$1" cur="$2" full_sha="$3" old_sha paths
   DIST_REUSE_FROM=""; DIST_REUSE_OLD_SHA=""; DIST_REUSE_PATHS=""
   if [[ "${OC_V5_DIST_REUSE:-1}" != 1 ]]; then
     echo "  · OC_V5_DIST_REUSE=0 → 跳过 dist 复用,全量 tsc -b && vite build" >&2
@@ -3586,8 +3714,10 @@ try_reuse_web_dist() { # <staging> <current-release> <full-sha>
     || { echo "  · dist 复用拒绝:读不到当前 release sourceCommit" >&2; return 1; }
   git -C "$REPO_ROOT" cat-file -e "${old_sha}^{commit}" \
     || { echo "  · dist 复用拒绝:旧 sourceCommit 本地不可达:$old_sha" >&2; return 1; }
-  if ! git -C "$REPO_ROOT" diff-tree --quiet "$old_sha" "$full_sha" -- $WEB_DIST_REUSE_PATHS; then
-    echo "  · dist 复用拒绝:web/lock/构建配置相对 $old_sha 有差异 → 全量构建" >&2
+  paths="$(resolve_web_dist_reuse_paths "$full_sha")" || return 1
+  [[ -n "$paths" ]] || { echo "  · dist 复用拒绝:web 输入面路径为空" >&2; return 1; }
+  if ! git -C "$REPO_ROOT" diff-tree --quiet "$old_sha" "$full_sha" -- $paths; then
+    echo "  · dist 复用拒绝:web workspace 闭包/lock/构建配置相对 $old_sha 有差异 → 全量构建" >&2
     return 1
   fi
   if ! ssh "$KL_HOST" "set -e
@@ -3600,7 +3730,7 @@ try_reuse_web_dist() { # <staging> <current-release> <full-sha>
   fi
   DIST_REUSE_FROM="$cur"
   DIST_REUSE_OLD_SHA="$old_sha"
-  DIST_REUSE_PATHS="$WEB_DIST_REUSE_PATHS"
+  DIST_REUSE_PATHS="$(printf '%s' "$paths" | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
   echo "  · web dist 复用自 $cur (sourceCommit=$old_sha; 比对路径: $DIST_REUSE_PATHS; VITE_TASKBOARD_ENABLED=0 硬编码未另比 env)" >&2
   return 0
 }
@@ -5688,17 +5818,101 @@ build_platform_bundle() {
 # B5:runtime 输入 digest。对齐 oc_hotcfg_finalize_release 已有的 depsCacheKey/ccbDistKey
 # 内容短路——那些仍要先 archive+staging。这里在 archive 前用输入面证据决定能否整段跳过。
 # 取证失败(读不到 image id / 旧 digest 缺失 / 抽样校验失败)一律全量构建。
-RUNTIME_INPUT_TREE_PATHS="packages/cli packages/gateway packages/protocol packages/storage packages/mcp-memory claude-code-best package.json package-lock.json bun.lock bunfig.toml packages/commercial/agent-sandbox/runtime-src-excludes.txt packages/commercial/agent-sandbox/Dockerfile.openclaude-runtime deploy/v5/release-metadata.json"
+# 禁止手写包白名单:覆盖「经 runtime-src-excludes.txt 同一套 rsync 规则裁剪后会进 runtime 的全部 git 输入」。
+RUNTIME_SRC_EXCLUDES_PATH="packages/commercial/agent-sandbox/runtime-src-excludes.txt"
+RUNTIME_INPUT_DIGEST_ALG="v2-rsync-excludes"
+RUNTIME_RSYNC_EXCLUDE_PATTERNS=()
+
+load_runtime_rsync_exclude_patterns() { # <full-sha>
+  local sha="$1" raw line
+  RUNTIME_RSYNC_EXCLUDE_PATTERNS=()
+  raw="$(git -C "$REPO_ROOT" show "${sha}:${RUNTIME_SRC_EXCLUDES_PATH}")" || return 1
+  while IFS= read -r line; do
+    [[ -n "$line" && "$line" != \#* ]] || continue
+    RUNTIME_RSYNC_EXCLUDE_PATTERNS+=("$line")
+  done <<<"$raw"
+  ((${#RUNTIME_RSYNC_EXCLUDE_PATTERNS[@]} > 0)) || return 1
+}
+
+# stdout:经 excludes 过滤后的 `git ls-tree -r` 行(mode type blob\\tpath)。
+# 规则与 rsync --exclude-from 同一套;拿不准不排除(多进 digest = 复用更严)。
+runtime_input_ls_tree() { # <full-sha>
+  local sha="$1"
+  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  load_runtime_rsync_exclude_patterns "$sha" || return 1
+  python3 - "$REPO_ROOT" "$sha" "$RUNTIME_SRC_EXCLUDES_PATH" <<'PY'
+import fnmatch
+import subprocess
+import sys
+
+root, sha, excl = sys.argv[1], sys.argv[2], sys.argv[3]
+raw = subprocess.check_output(["git", "-C", root, "show", f"{sha}:{excl}"], text=True)
+patterns = []
+for line in raw.splitlines():
+    line = line.strip()
+    if not line or line.startswith("#"):
+        continue
+    patterns.append(line)
+if not patterns:
+    sys.exit(1)
+listing = subprocess.check_output(["git", "-C", root, "ls-tree", "-r", "--full-tree", sha], text=True)
+if not listing.strip():
+    sys.exit(1)
+
+def excluded(relpath: str) -> bool:
+    name = relpath.rsplit("/", 1)[-1]
+    parts = relpath.split("/")
+    for pat in patterns:
+        anchored = pat.startswith("/")
+        if anchored:
+            pat = pat[1:]
+        if pat.endswith("/"):
+            pat = pat[:-1]
+        if not pat:
+            continue
+        if anchored:
+            if relpath == pat or relpath.startswith(pat + "/") or fnmatch.fnmatch(relpath, pat):
+                return True
+            continue
+        if "/" in pat:
+            if (
+                relpath == pat
+                or relpath.startswith(pat + "/")
+                or relpath.endswith("/" + pat)
+                or ("/" + pat + "/") in ("/" + relpath + "/")
+                or fnmatch.fnmatch(relpath, pat)
+            ):
+                return True
+            continue
+        if fnmatch.fnmatch(name, pat) or any(part == pat or fnmatch.fnmatch(part, pat) for part in parts):
+            return True
+    return False
+
+rows = []
+for line in listing.splitlines():
+    if "\t" not in line:
+        continue
+    _meta, path = line.split("\t", 1)
+    if not excluded(path):
+        rows.append(line)
+if not rows:
+    sys.exit(1)
+sys.stdout.write("\n".join(rows) + "\n")
+PY
+}
 
 compute_runtime_input_digest() { # <full-sha> <image-id>
-  local sha="$1" image_id="$2" lib_hash tree_rows
+  local sha="$1" image_id="$2" lib_hash excl_hash meta_hash tree_rows
   [[ "$sha" =~ ^[0-9a-f]{40}$ && -n "$image_id" ]] || return 1
-  lib_hash="$(git -C "$REPO_ROOT" show "${sha}:scripts/v5-runtime-release-lib.sh" | sha256sum | awk '{print $1}')" \
-    || return 1
-  [[ "$lib_hash" =~ ^[0-9a-f]{64}$ ]] || return 1
-  tree_rows="$(git -C "$REPO_ROOT" ls-tree -r --full-tree "$sha" -- $RUNTIME_INPUT_TREE_PATHS)" || return 1
+  lib_hash="$(git -C "$REPO_ROOT" rev-parse "${sha}:scripts/v5-runtime-release-lib.sh")" || return 1
+  excl_hash="$(git -C "$REPO_ROOT" rev-parse "${sha}:${RUNTIME_SRC_EXCLUDES_PATH}")" || return 1
+  meta_hash="$(git -C "$REPO_ROOT" rev-parse "${sha}:deploy/v5/release-metadata.json")" || return 1
+  [[ "$lib_hash" =~ ^[0-9a-f]{40}$ && "$excl_hash" =~ ^[0-9a-f]{40}$ && "$meta_hash" =~ ^[0-9a-f]{40}$ ]] || return 1
+  tree_rows="$(runtime_input_ls_tree "$sha")" || return 1
   [[ -n "$tree_rows" ]] || return 1
-  printf 'image:%s\nlib:%s\n%s\n' "$image_id" "$lib_hash" "$tree_rows" | sha256sum | awk '{print $1}'
+  printf 'alg:%s\nimage:%s\nlib:%s\nexcludes:%s\nmetadata:%s\n%s\n' \
+    "$RUNTIME_INPUT_DIGEST_ALG" "$image_id" "$lib_hash" "$excl_hash" "$meta_hash" "$tree_rows" \
+    | sha256sum | awk '{print $1}'
 }
 
 record_runtime_input_digest() { # <release-dir> <digest> <image-id> <source-sha>
@@ -9426,18 +9640,10 @@ canary() {
   assert_runtime_channel_column
   local requested_release="" p3_target_source=""
   if [[ -n "$CANARY_RELEASE" ]]; then
-    requested_release="$RELEASES_ROOT/$CANARY_RELEASE"
-    [[ "$CANARY_RELEASE" == /* ]] && requested_release="$CANARY_RELEASE"
+    requested_release="$(resolve_specified_canary_release_dir)" || exit 1
     assert_release_marker "$requested_release"
     assert_release_required_migrations "$requested_release"
-    if [[ "$DRY" == 1 ]]; then
-      p3_target_source="$(resolve_release_source_commit)" || exit 1
-    else
-      p3_target_source="$(ssh "$KL_HOST" "jq -er '.sourceCommit | select(type == \"string\" and test(\"^[0-9a-f]{40}$\"))' '$requested_release/.complete'" 2>/dev/null)" || {
-        echo "✗ P3 指定 release 缺可信 strong sourceCommit:$requested_release" >&2
-        exit 1
-      }
-    fi
+    p3_target_source="$(resolve_specified_canary_source_commit)" || exit 1
   else
     p3_target_source="$(resolve_release_source_commit)" || exit 1
   fi
