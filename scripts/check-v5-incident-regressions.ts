@@ -356,6 +356,7 @@ function parseWaivers(): Map<string, Waiver> {
 // exempt; every later/future commit remains under the normal trailer gate.
 const IMPORTED_TRAILER_HISTORY_TIPS = [
   "7ad3910346d03f072db5b4debd9e29b43f13de30",
+  "5ecb3ead3fb07d8506d62c0d3ffc282d0170ae61",
 ] as const;
 
 function checkTrailerClosure(): number {

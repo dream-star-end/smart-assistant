@@ -153,7 +153,9 @@ export function grokProductToolOutput(raw: unknown): string {
     const text = textField(obj[key]);
     if (text) return text;
   }
-  return stringifyFallback(raw);
+  // Unknown extra JSON fields are not user-visible body. Commercial ToolCard
+  // keeps them off the card; exact bytes stay on the tape / output string.
+  return "";
 }
 
 export function grokProductToolName(nativeName: string, input?: unknown): string {
