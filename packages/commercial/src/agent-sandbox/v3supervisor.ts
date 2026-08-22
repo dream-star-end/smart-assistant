@@ -560,6 +560,7 @@ export const V3_CCB_BASELINE_SKILL_NAMES = [
   "app-connectors",
   "connector-authoring",
   "manage-taskboard",
+  "ssh",
 ] as const;
 
 /**

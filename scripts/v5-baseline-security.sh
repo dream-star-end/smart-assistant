@@ -49,6 +49,7 @@ EXPECTED_SKILLS=(
   app-connectors
   connector-authoring
   manage-taskboard
+  ssh
 )
 
 # Serving predecessor compatibility only: pre-admin/taskboard releases may lack

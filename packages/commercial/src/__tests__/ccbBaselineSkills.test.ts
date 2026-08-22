@@ -129,4 +129,21 @@ describe('ccb-baseline skills ↔ manifest', () => {
     assert.match(body, /不得[^。]*真实密码/)
     assert.match(body, /只向用户确认一次/)
   })
+
+  it('ships ssh with baked-in OpenSSH, host channel, and no private-key leakage', () => {
+    assert.ok((V3_CCB_BASELINE_SKILL_NAMES as readonly string[]).includes('ssh'))
+    const body = readFileSync(join(skillsDir, 'ssh', 'SKILL.md'), 'utf8')
+    const dockerfile = readFileSync(
+      join(here, '..', '..', 'agent-sandbox', 'Dockerfile.openclaude-runtime'),
+      'utf8',
+    )
+    assert.match(body, /\/usr\/bin\/ssh/)
+    assert.match(body, /ssh-keygen/)
+    assert.match(body, /host hostname/)
+    assert.match(body, /不要写成 `host cmd/)
+    assert.match(body, /永远不要在回复里打印私钥内容/)
+    assert.match(body, /不要 `apt install openssh-client`/)
+    assert.match(dockerfile, /openssh-client/)
+    assert.match(dockerfile, /\/usr\/bin\/ssh-keygen/)
+  })
 })
