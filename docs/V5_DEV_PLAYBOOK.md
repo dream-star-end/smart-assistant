@@ -217,15 +217,24 @@ find packages/commercial/src -name '*.test.ts' ! -name '*.integ.test.ts' | sort 
 - lint 红线:**不跑 biome --write 全文件 reformat**;只手工修自己引入的违规。
 
 ### 2.5 合并与收尾
-- 实现完 → Codex 审计到 PASS → 在**受保护 PR 合并前**先提交全局发布队列：
-  `RQ=$(scripts/v5-release-queue.sh submit --task <slug> --branch <task-branch> --sha "$(git rev-parse HEAD)" --actor <owner>)`。
-  `submit` 对同一 branch+SHA 幂等；随后执行
-  `scripts/v5-release-queue.sh wait --id "$RQ" --owner <owner>`。只有取得唯一 `active`
-  的任务才可合并 PR，后续任务保持未合并，不能让 canonical tip 越过正在 canary/finalize 的批次。
-- 受保护 PR/CI 合并完成后，把 canonical 快进到精确远端 merge SHA，再执行
-  `scripts/v5-release-queue.sh pin --id "$RQ" --sha "$(git rev-parse HEAD)" --actor <owner>`。
-  `pin` 会验证任务 SHA 是 merge SHA 祖先且 canonical HEAD 精确一致；发布全程
-  `export OC_V5_RELEASE_QUEUE_ID="$RQ"`。成功 finalize 后才
+- 实现完 → Codex 审计到 PASS → **先合受保护 PR**,用 `gh pr view --json mergeCommit`
+  记下精确 merge SHA。此时还不要占 unique active。
+- 合入后再走队列:`submit` → `wait`/`acquire` → `pin`,钉的是 **merge SHA**,不是 PR head:
+  `RQ=$(scripts/v5-release-queue.sh submit --task <slug> --branch <task-branch> --sha "<MERGE_SHA>" --actor <owner>)`。
+  `submit` 对同一 branch+SHA 幂等。随后
+  `scripts/v5-release-queue.sh wait --id "$RQ" --owner <owner>` 取得唯一 `active`,
+  再 `scripts/v5-release-queue.sh pin --id "$RQ" --sha "<MERGE_SHA>" --actor <owner>`。
+  **为什么后占槽**:`pin_locked` 要求当时已 active,且 `requested_sha` 是待 pin SHA 的祖先;
+  单批次、canonical 还停在该 merge SHA 时,`ff-only` 到它再 pin,HEAD==pin SHA 成立。
+  `assert_locked` 在 pin 之后允许 HEAD 再前进(pinned 只需仍是 HEAD 祖先;deploy 按
+  pinned `git archive` 取源,不读工作树)。提前占 unique active 会把 merge 后二次 CI
+  + 构建整段锁在一个人手里,多会话互等。
+  **多批次竞争**:队列 FIFO(`acquire` 取 `queued` 最小 `seq`)依次 pin 各自的 merge SHA。
+  后到批次轮到 pin 时,若 canonical HEAD 已经越过自己的 merge SHA,**禁止**
+  checkout/`ff` 回退——较旧 SHA 是祖先,git 无法 ff 回去。此时与 `assert_locked`
+  相同:只要求自己的 merge SHA 已是 HEAD 祖先;deploy 用 pinned SHA 构建,不要求
+  把共享 checkout 退回 pin 点。
+- 发布全程 `export OC_V5_RELEASE_QUEUE_ID="$RQ"`。成功 finalize 后才
   `finish --result deployed`；官方 abort/rollback 收敛旧稳定版后用
   `finish --result not-deployed`。队列项跨进程、跨会话持久化，不靠某个 shell 一直存活。
 - 合并后**只保留 canonical + 未合并分支**:`git branch --merged feat/v5-aurora-rewrite` 逐个删本地+远端分支、`git worktree remove`、`git worktree prune`。注意在 v3 checkout 里 `git branch -d` 按 v3 判断"未合并",要用 `git merge-base --is-ancestor <br> feat/v5-aurora-rewrite && git branch -D <br>` 守卫式强删。
@@ -371,10 +380,12 @@ usage_records + journal 双查;零输出免单/turn 级 idle 免单已内建;cod
 ### 4.2 标准部署
 
 > **全局发布队列(硬机制)**:`scripts/v5-release-queue.sh` 是“任务级”持久 FIFO，
-> 从受保护 PR 合并前一直占到 canary/验证/finalize 收敛；`deploy-v5.sh` 的
+> 从受保护 PR **合并并 pin merge SHA 之后**占到 canary/验证/finalize 收敛
+> (缩短 unique active 占用窗,见 §2.5)；`deploy-v5.sh` 的
 > `/var/lock/oc-v5-deploy.lock` 只是“单命令级”互斥，不能替代发布队列。
-> 所有开发写 mode 默认要求 `OC_V5_RELEASE_QUEUE_ID` 指向唯一 active、已 pin 且等于
-> canonical HEAD 的队列项；新增 mode 默认也受门控。仅只读 smoke/census/模型观察、
+> 所有开发写 mode 默认要求 `OC_V5_RELEASE_QUEUE_ID` 指向唯一 active、已 pin
+> (pinned SHA 是 HEAD 或 HEAD 祖先;deploy 按 pinned 取源,不要求 checkout 回退)的队列项；
+> 新增 mode 默认也受门控。仅只读 smoke/census/模型观察、
 > 官方 abort/rollback/recover/reclaim/hide-luna 与 emergency 授权/关账显式豁免。
 > 自愈继承 deploy lock 的旁路必须同时由 selfheal ledger 的 deploying rrid、exact
 > approved SHA 和当前 systemd scope 证明，不能伪造布尔环境变量。
@@ -386,14 +397,16 @@ usage_records + journal 双查;零输出免单/turn 级 idle 免单已内建;cod
 > 已坏项继续告警，monitor/部署/cutover 共用远端 flock，smoke 后按 schema+nonce 清理，
 > 超时仍坏立即升级真实事故；可信且全健康的 stale schema=1 可自动清，其他 stale marker
 > 保留但不阻塞部署、全程 fail-open。禁止人工造 marker。
-> **E2E 旅程门(2026-07-18 附件事故补强)**:deploy 与 --dist 的每个成功出口在
-> end_planned_maintenance 后必跑 `smoke_e2e_journey`——部署发起机本机起真 Chromium,
-> 自建 ssh 隧道走线上核心旅程(UI 登录/附件全链含 filechooser/目标入口/带附件发送)。
-> 失败=fail-loud 非零退出(部署判定失败,截图在 /tmp/e2e-journey-fail-*.png,人工裁定
-> --rollback 或修断言);第一期**不进 validation 自动回滚链**(UI 断言有文案漂移假阳性面,
-> 连续两周零假阳性后升级,升级时同步 v5ReleaseSafety 断言)。`V5_SMOKE_E2E=0` 显式豁免
-> (紧急场景,事后必须补跑)。依赖:部署树 node_modules 需含 playwright-core(npm install),
-> 缺失门会 fail-loud 指引。接线契约由 v5ReleaseSafety.test.ts 锁定(四出口+函数体)。
+> **E2E 旅程门(2026-07-26 起进 validation 补偿链)**:`deploy()` / `--dist` 在激活新
+> release 之后、`end_planned_maintenance` 之前,把 `smoke_e2e_journey` 收进
+> `minimum_functional_core`(与双引擎真 turn 同级)。部署发起机本机起真 Chromium,
+> 自建 ssh 隧道走线上核心旅程(UI 登录/附件全链含 filechooser/目标入口/带附件发送/
+> 送达上屏)。失败写入 `validation_failure`,走与 full smoke 同一条对称补偿
+> (回旧 source / 账号版本),不再在维护窗关闭后只打印红字把坏版本留在线上。
+> 截图在 `/tmp/e2e-journey-fail-*.png`。`V5_SMOKE_E2E=0` 显式豁免会登记 durable
+> debt 并阻断下一次普通发布。依赖:部署树 node_modules 需含 playwright-core
+> (npm install),缺失 fail-loud。canary READY / finalize 失败走官方 abort。
+> 接线契约由 v5ReleaseSafety.test.ts 锁定。
 ```bash
 cd /opt/openclaude/openclaude-v5-aurora     # 部署树;必须 clean(脏文件会被 rsync 上去)
 git status --porcelain                       # 必须为空
