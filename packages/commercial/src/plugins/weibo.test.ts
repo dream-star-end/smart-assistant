@@ -178,14 +178,14 @@ describe('official Weibo Plugin', () => {
   })
 
   test('pins the current artifact and only the exact production predecessor', () => {
-    assert.equal(WEIBO_PLUGIN_VERSION, '1.5.0')
+    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.0')
     assert.equal(WEIBO_DRIVER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.equal(WEIBO_LAUNCHER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.deepEqual(WEIBO_SETUP_COMPATIBLE_PREDECESSORS, [
       {
-        version: '1.4.0',
-        artifactHash: 'e43d0e981530dc05623fd3acf920356ef65b9a172df94c0c8f9f1c93f8a11f2c',
-        execContractHash: '328f01e5e0018bfdb2ac69343c0d0e770cb672a3d917022b5efeeaf86eb952dc',
+        version: '1.5.0',
+        artifactHash: '20377e288dea2b06a86730533ef3ce6eb3490136ff1f2e176df32230d74b6310',
+        execContractHash: '4eb49cf1946bb622c1fe2fe155b4400965ae00d0f03971c19446a923956d9465',
       },
     ])
     assert.equal(
@@ -417,6 +417,10 @@ describe('official Weibo Plugin', () => {
     )
     const createPostSource = WEIBO_WORKER_SOURCE.slice(createPostStart, createPostEnd)
     assert.doesNotMatch(createPostSource, /force:\s*true|\.evaluate\([^)]*\.click|keyboard\./)
+    assert.match(createPostSource, /expectedText.length > 2000/)
+    assert.match(createPostSource, /openLongTextComposer/)
+    assert.match(WEIBO_WORKER_SOURCE, /exactMenuItem\(page, '长文'\)/)
+    assert.doesNotMatch(createPostSource, /cleanText\([^,]+, 2000\)/)
     assert.match(WEIBO_WORKER_SOURCE, /send\.click\(\{ timeout: 10_000, noWaitAfter: true \}\)/)
   })
 
@@ -771,6 +775,103 @@ describe('official Weibo Plugin', () => {
     assert.deepEqual(events, [])
   })
 
+  test('create_post opens 长文 before attaching images when the body exceeds 2000 characters', async () => {
+    const events: string[] = []
+    const longText = '汉'.repeat(2001)
+    let filled = ''
+    const textarea = {
+      fill: async (value: string) => {
+        filled = value
+      },
+      inputValue: async () => filled,
+    }
+    const longOpener = {
+      click: async () => events.push('long-text'),
+    }
+    const send = {
+      click: async (options: { trial?: boolean }) => {
+        if (!options.trial) events.push('click')
+      },
+    }
+    const imageTrigger = {
+      click: async (options: { trial?: boolean }) =>
+        events.push(options.trial ? 'image-trial' : 'image-click'),
+    }
+    const imageChooser = {
+      setFiles: async () => events.push('upload'),
+      element: () => ({ evaluate: async () => 1 }),
+    }
+    let collectCount = 0
+    const harness = compileWorkerPostHarness({
+      ensureSelfId: async () => '12345',
+      gotoAuthenticated: async () => {},
+      collectPosts: async () => {
+        collectCount += 1
+        return collectCount === 1 ? [] : [{ id: 'long-post', owned: true, text: longText }]
+      },
+      uniqueVisible: async () => textarea,
+      assertNoChallenge: async () => {},
+      awaitDispatch: async () => events.push('dispatch'),
+      exactMenuItem: async (_page: unknown, text: string) => {
+        if (text === '长文') return longOpener
+        if (text === '图片') return imageTrigger
+        return send
+      },
+      cleanText: (value: unknown) => String(value).trim(),
+      readFile: async () => Buffer.from('image'),
+    })
+    const page = {
+      locator: () => ({}),
+      waitForEvent: async () => imageChooser,
+      waitForTimeout: async () => {},
+    }
+
+    const result = await harness.writeAction(page, {
+      actionId: 'create_post',
+      params: {
+        text: longText,
+        mediaManifest: [{ inputId: 'asset-1', filename: 'image.png', mimeType: 'image/png' }],
+      },
+    })
+    assert.deepEqual(result, { post: { id: 'long-post', owned: true, text: longText } })
+    assert.equal(filled, longText)
+    assert.deepEqual(events, [
+      'long-text',
+      'image-trial',
+      'image-click',
+      'dispatch',
+      'upload',
+      'click',
+    ])
+  })
+
+  test('create_post never dispatches long text when the 长文 composer control is absent', async () => {
+    const events: string[] = []
+    const harness = compileWorkerPostHarness({
+      ensureSelfId: async () => '12345',
+      gotoAuthenticated: async () => {},
+      collectPosts: async () => [],
+      uniqueVisible: async () => ({ fill: async () => {}, inputValue: async () => '' }),
+      assertNoChallenge: async () => {},
+      awaitDispatch: async () => events.push('dispatch'),
+      exactMenuItem: async () => null,
+      cleanText: (value: unknown) => String(value).trim(),
+      readFile: async () => Buffer.from('unused'),
+    })
+
+    await assert.rejects(
+      harness.writeAction(
+        { locator: () => ({}), waitForTimeout: async () => {} },
+        {
+          actionId: 'create_post',
+          params: { text: '汉'.repeat(2001), mediaManifest: [] },
+        },
+      ),
+      /composer/,
+    )
+    assert.deepEqual(events, [])
+  })
+
   test('create_post never clicks send when the chooser reports a different file count', async () => {
     const events: string[] = []
     const textarea = { fill: async () => {}, inputValue: async () => 'hello' }
@@ -1002,6 +1103,19 @@ describe('official Weibo Plugin', () => {
 
   test('strict schemas reject forged server snapshots and oversized image metadata', () => {
     const create = WEIBO_PLUGIN_CONTRACT.actions.find((action) => action.id === 'create_post')!
+    assert.doesNotThrow(() =>
+      validateRuntimePluginJson(
+        create.params,
+        { text: '汉'.repeat(2001), images: ['/home/agent/.openclaude/uploads/a.jpg'] },
+        'params',
+      ),
+    )
+    assert.throws(
+      () => validateRuntimePluginJson(create.params, { text: '汉'.repeat(20_001) }, 'params'),
+      (error: unknown) =>
+        error instanceof RuntimePluginContractError && error.code === 'INVALID_PARAMS',
+    )
+    assert.match(create.description, /带图长文/)
     assert.throws(
       () =>
         validateRuntimePluginJson(

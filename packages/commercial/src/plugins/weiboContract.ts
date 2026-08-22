@@ -7,7 +7,7 @@ import { compileRuntimePluginArtifact } from './contracts.js'
 import { WEIBO_WORKER_SOURCE } from './weiboWorkerSource.js'
 
 export const WEIBO_PLUGIN_SLUG = 'weibo'
-export const WEIBO_PLUGIN_VERSION = '1.5.0'
+export const WEIBO_PLUGIN_VERSION = '1.6.0'
 export const WEIBO_WORKER_DIGEST = createHash('sha256').update(WEIBO_WORKER_SOURCE).digest('hex')
 export const WEIBO_DRIVER_ID = `weibo-${WEIBO_WORKER_DIGEST.slice(0, 57)}`
 export const WEIBO_DRIVER_VERSION = WEIBO_PLUGIN_VERSION
@@ -626,13 +626,14 @@ export const WEIBO_PLUGIN_ARTIFACT = Object.freeze({
     },
     {
       id: 'create_post',
-      description: '使用当前真实微博身份发布文字或图片微博（默认逐次确认；账号授权后可免确认）',
+      description:
+        '使用当前真实微博身份发布文字、图片或带图长文微博（默认逐次确认；账号授权后可免确认）',
       effect: 'write',
       timeoutSeconds: 600,
       params: {
         type: 'object',
         properties: {
-          text: { type: 'string', maxLength: 2_000 },
+          text: { type: 'string', maxLength: 20_000 },
           images: { type: 'array', maxItems: 9, items: mediaPathSchema },
           mediaManifest: { type: 'array', maxItems: 9, items: sealedImageSchema },
         },
@@ -851,14 +852,14 @@ if (COMPILED_WEIBO_PLUGIN.pluginType !== 'managed-browser')
   throw new Error('Weibo Plugin contract subtype mismatch')
 
 /**
- * The production v1.4 account-state contract is unchanged in v1.5. No other
+ * The production v1.5 account-state contract is unchanged in v1.6. No other
  * historical or user-published Weibo artifact is eligible for this upgrade.
  */
 export const WEIBO_SETUP_COMPATIBLE_PREDECESSORS = Object.freeze([
   Object.freeze({
-    version: '1.4.0',
-    artifactHash: 'e43d0e981530dc05623fd3acf920356ef65b9a172df94c0c8f9f1c93f8a11f2c',
-    execContractHash: '328f01e5e0018bfdb2ac69343c0d0e770cb672a3d917022b5efeeaf86eb952dc',
+    version: '1.5.0',
+    artifactHash: '20377e288dea2b06a86730533ef3ce6eb3490136ff1f2e176df32230d74b6310',
+    execContractHash: '4eb49cf1946bb622c1fe2fe155b4400965ae00d0f03971c19446a923956d9465',
   }),
 ])
 

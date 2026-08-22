@@ -1109,6 +1109,23 @@ async function preparePostImageChooser(page) {
   ]);
   return chooser;
 }
+async function openLongTextComposer(page) {
+  const opener = await exactMenuItem(page, '长文');
+  if (!opener) throw new Error('composer');
+  await opener.click({ timeout: 10_000 });
+}
+async function postComposerEditor(page, longText) {
+  if (longText) {
+    const editable = await uniqueVisible(page.locator('[contenteditable="true"]'));
+    if (editable) return editable;
+  }
+  return uniqueVisible(page.locator('textarea'));
+}
+async function readPostComposer(editor) {
+  const value = await editor.inputValue().catch(() => '');
+  if (value) return cleanText(value, 20000);
+  return cleanText(await editor.innerText().catch(() => ''), 20000);
+}
 async function provePostSendReady(send, timeout) {
   if (!send) throw new Error('send');
   await send.click({ trial: true, timeout });
@@ -1182,9 +1199,12 @@ async function writeAction(page, input) {
     await gotoAuthenticated(page, 'https://weibo.com/u/' + selfId);
     const beforeIds = new Set((await collectPosts(page, selfId, 10)).map((post) => post.id));
     await gotoAuthenticated(page, 'https://weibo.com/');
-    const textarea = await uniqueVisible(page.locator('textarea'));
-    if (!textarea) throw new Error('composer');
-    if (params.text) await textarea.fill(params.text);
+    const expectedText = cleanText(params.text || '', 20000);
+    const longText = expectedText.length > 2000;
+    if (longText) await openLongTextComposer(page);
+    const editor = await postComposerEditor(page, longText);
+    if (!editor) throw new Error('composer');
+    if (expectedText) await editor.fill(expectedText);
     const manifest = Array.isArray(params.mediaManifest) ? params.mediaManifest : [];
     await assertNoChallenge(page);
     let imageChooser = null;
@@ -1195,8 +1215,8 @@ async function writeAction(page, input) {
     }
     await awaitDispatch();
     await assertNoChallenge(page);
-    const freshTextarea = await uniqueVisible(page.locator('textarea'));
-    if (!freshTextarea || cleanText(await freshTextarea.inputValue().catch(() => ''), 2000) !== cleanText(params.text || '', 2000)) throw new Error('composer');
+    const freshEditor = await postComposerEditor(page, longText);
+    if (!freshEditor || (await readPostComposer(freshEditor)) !== expectedText) throw new Error('composer');
     if (manifest.length) {
       if (!imageChooser) throw new Error('media');
       const files = [];
@@ -1213,7 +1233,7 @@ async function writeAction(page, input) {
     const send = await awaitPostSendReady(page, 30_000);
     const clickFailure = await activatePostSend(send);
     await page.waitForTimeout(2500);
-    const post = await awaitNewestOwnPost(page, selfId, params.text || '', beforeIds);
+    const post = await awaitNewestOwnPost(page, selfId, expectedText, beforeIds);
     if (!post) {
       if (clickFailure) throw clickFailure;
       throw new Error('result');
