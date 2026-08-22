@@ -114,10 +114,10 @@ for (const event of [
       assert.deepEqual(summary.assistantSegments.map((segment) => segment.text), ['before ', 'done'])
       const textIds = events
         .filter((event) => event.kind === 'block' && event.block.kind === 'text')
-        .map((event) => (event.kind === 'block' ? event.block.messageId : undefined))
+        .map((event) => (event.kind === 'block' && event.block.kind === 'text' ? event.block.messageId : undefined))
       const thinkIds = events
         .filter((event) => event.kind === 'block' && event.block.kind === 'thinking')
-        .map((event) => (event.kind === 'block' ? event.block.messageId : undefined))
+        .map((event) => (event.kind === 'block' && event.block.kind === 'thinking' ? event.block.messageId : undefined))
       assert.deepEqual(textIds, ['asst-1-s0', 'asst-1-s1'])
       assert.deepEqual(thinkIds, ['think-1-s0'])
       assert.equal(summary.numTurns, 2)
