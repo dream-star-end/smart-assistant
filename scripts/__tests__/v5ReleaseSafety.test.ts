@@ -7002,6 +7002,22 @@ wait $!
     )
     assert.match(envFn, /ci-verification\)\s+return 1 ;;/,
       'ci-verification 不得参与连环跳禁令,否则一次 gh 故障就锁死所有发布(含热修)')
+    assert.match(fn, /OC_V5_CI_GH_RETRIES/, 'GitHub 5xx 必须有界重试,禁止一次 503 就当缺 check')
+    assert.match(fn, /OC_V5_CI_GREEN_POLL_SECONDS/, 'in_progress 必须有界轮询,禁止立刻当红')
+    assert.match(fn, /in_progress\|queued\|waiting/, '运行中状态必须与真红拆开')
+    assert.match(fn, /\^\{tree\}/, '必须能按 git tree 复用同内容 commit 的 CI 证据')
+    assert.match(fn, /same-tree/, '同 tree 复用必须打日志,禁止静默认错 SHA')
+    const gateOnly = source.slice(
+      source.indexOf('\nassert_ci_green_for_source_commit() {'),
+      source.indexOf('\nresolve_release_source_commit() {'),
+    )
+    assert.ok(gateOnly.includes('_ci_gh_api_retry'), '绿门必须走 retry 包装,不得直接 || true 吞 API 失败')
+    assert.equal(
+      (gateOnly.match(/2>\/dev\/null \|\| true/g) || []).length,
+      0,
+      'assert_ci_green 本体不得用 || true 保留失败 API 的 stdout(会把 503 JSON 当成缺失 check 名)',
+    )
+
   })
 
   test('E2E journey gate is part of the shared minimum functional core and fails loud', async () => {

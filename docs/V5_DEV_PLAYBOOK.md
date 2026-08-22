@@ -230,6 +230,11 @@ find packages/commercial/src -name '*.test.ts' ! -name '*.integ.test.ts' | sort 
   `finish --result not-deployed`。队列项跨进程、跨会话持久化，不靠某个 shell 一直存活。
 - 合并后**只保留 canonical + 未合并分支**:`git branch --merged feat/v5-aurora-rewrite` 逐个删本地+远端分支、`git worktree remove`、`git worktree prune`。注意在 v3 checkout 里 `git branch -d` 按 v3 判断"未合并",要用 `git merge-base --is-ancestor <br> feat/v5-aurora-rewrite && git branch -D <br>` 守卫式强删。
 - push:`git push origin feat/v5-aurora-rewrite`。
+- **CI 绿门(deploy-v5.sh `assert_ci_green_for_source_commit`)**认的是即将被 build 的那个 commit 的分支保护 required checks,不是「所有 job 全绿」。2026-08-22 起三连加速,不削弱 fail-closed:
+  1. GitHub 5xx/网络失败有界重试(`OC_V5_CI_GH_RETRIES`,默认 3),失败记 unverifiable,禁止把错误 JSON 当成缺失 check 名;
+  2. `in_progress|queued|waiting` 与真红拆开,对本 SHA 有界轮询(`OC_V5_CI_GREEN_POLL_SECONDS`,默认 1200,上限 1800);
+  3. 若本 SHA 未齐/flake,但存在 **git tree 字节相等** 且 required checks 全绿的已 push commit(常见: merge SHA 与 PR head 同 tree),则复用那次证据。不同 tree 禁止复用。真红仍阻断;`--allow-unverified-ci` 仍是唯一逃生口并记账。
+
 
 ---
 

@@ -3016,7 +3016,8 @@ REMOTE
 CI_PROTECTED_BRANCH="${CI_PROTECTED_BRANCH:-feat/v5-aurora-rewrite}"
 _gh_api() { env -u HTTPS_PROXY -u HTTP_PROXY -u https_proxy -u http_proxy gh api "$@"; }
 assert_ci_green_for_source_commit() { # <full sha>
-  local sha="$1" required runs missing="" bad="" ctx line name status conclusion
+  local sha="$1" required missing="" pending="" bad="" unverifiable=""
+  local ctx evidence_sha waited poll_budget poll_iv
   [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "✗ CI 门:source commit 非法:$sha" >&2; return 1; }
   if [[ "$DRY" == 1 ]]; then
     echo "  [dry-run] 校验 $sha 的 required checks(分支保护 $CI_PROTECTED_BRANCH 的 contexts)全 success"
@@ -3030,37 +3031,169 @@ assert_ci_green_for_source_commit() { # <full sha>
     return 0
   fi
   echo "── CI 绿门:$sha 的必需 check 必须全 success ──"
-  local unverifiable=""
-  required="$(_gh_api "repos/{owner}/{repo}/branches/$(printf '%s' "$CI_PROTECTED_BRANCH" | sed 's|/|%2F|g')/protection/required_status_checks" --jq '.contexts[]' 2>/dev/null || true)"
-  if [[ -z "$required" ]]; then
-    unverifiable="无法取得分支保护的 required contexts(gh 未装/未认证/无权限/网络不通)"
-  else
-    runs="$(_gh_api --paginate "repos/{owner}/{repo}/commits/$sha/check-runs" \
-      --jq '.check_runs[] | [.name, .status, (.conclusion // "")] | @tsv' 2>/dev/null || true)"
+
+  # GitHub 5xx/网络失败必须整次作废,禁止 `cmd || true` 留下部分 stdout 再当成 check 名。
+  _ci_gh_api_retry() {
+    local attempt=1 max delay=2 out rc
+    max="${OC_V5_CI_GH_RETRIES:-3}"
+    [[ "$max" =~ ^[1-9][0-9]*$ ]] || max=3
+    (( max > 6 )) && max=6
+    while (( attempt <= max )); do
+      rc=0
+      out="$(_gh_api "$@" 2>/dev/null)" || rc=$?
+      if (( rc == 0 )); then
+        printf '%s\n' "$out"
+        return 0
+      fi
+      echo "  · GitHub API rc=$rc attempt=$attempt/$max" >&2
+      if (( attempt == max )); then
+        return 1
+      fi
+      sleep "$delay"
+      delay=$(( delay * 2 ))
+      (( delay > 8 )) && delay=8
+      attempt=$(( attempt + 1 ))
+    done
+    return 1
+  }
+
+  # 对 $1=sha 比对 required contexts。拆 pending(in_progress|queued|waiting) 与真红。
+  # 成功查询但缺页/失败 → unverifiable,绝不把错误 JSON 写进 missing。
+  _ci_eval_required_checks() {
+    local sha="$1" runs line name status conclusion
+    missing=""; pending=""; bad=""
+    local runs_err=""
+    runs="$(_ci_gh_api_retry --paginate "repos/{owner}/{repo}/commits/$sha/check-runs" \
+      --jq '.check_runs[] | [.name, .status, (.conclusion // "")] | @tsv')" || runs_err=1
+    if [[ -n "$runs_err" ]]; then
+      unverifiable="commit $sha 的 check-runs 查询失败(GitHub 5xx/网络;未采信部分页)"
+      return 0
+    fi
     if [[ -z "$runs" ]]; then
       unverifiable="commit $sha 上查不到任何 check-run(未 push?未触发 CI?)"
-    else
-      while IFS= read -r ctx; do
-        [[ -n "$ctx" ]] || continue
-        line="$(awk -F'\t' -v n="$ctx" '$1==n{print; exit}' <<<"$runs")"
-        if [[ -z "$line" ]]; then missing="$missing $ctx"; continue; fi
-        IFS=$'\t' read -r name status conclusion <<<"$line"
-        if [[ "$status" != completed ]]; then
-          bad="$bad $ctx(status=$status)"
-        elif [[ ! "$conclusion" =~ ^(success|skipped|neutral)$ ]]; then
-          bad="$bad $ctx(conclusion=$conclusion)"
+      return 0
+    fi
+    unverifiable=""
+    while IFS= read -r ctx; do
+      [[ -n "$ctx" ]] || continue
+      line="$(awk -F'\t' -v n="$ctx" '$1==n{print; exit}' <<<"$runs")"
+      if [[ -z "$line" ]]; then missing="$missing $ctx"; continue; fi
+      IFS=$'\t' read -r name status conclusion <<<"$line"
+      if [[ "$status" != completed ]]; then
+        case "$status" in
+          in_progress|queued|waiting) pending="$pending $ctx(status=$status)" ;;
+          *) bad="$bad $ctx(status=$status)" ;;
+        esac
+      elif [[ ! "$conclusion" =~ ^(success|skipped|neutral)$ ]]; then
+        bad="$bad $ctx(conclusion=$conclusion)"
+      fi
+    done <<<"$required"
+  }
+
+  _ci_same_tree_candidate_shas() {
+    local tree cand ct seen=""
+    tree="$(git -C "$REPO_ROOT" rev-parse "${sha}^{tree}" 2>/dev/null)" || return 0
+    [[ "$tree" =~ ^[0-9a-f]{40}$ ]] || return 0
+    {
+      git -C "$REPO_ROOT" rev-parse "${sha}^@" 2>/dev/null
+      git -C "$REPO_ROOT" rev-list --max-count=40 HEAD 2>/dev/null
+    } | while IFS= read -r cand; do
+      [[ "$cand" =~ ^[0-9a-f]{40}$ ]] || continue
+      [[ "$cand" != "$sha" ]] || continue
+      [[ " $seen " == *" $cand "* ]] && continue
+      ct="$(git -C "$REPO_ROOT" rev-parse "${cand}^{tree}" 2>/dev/null)" || continue
+      [[ "$ct" == "$tree" ]] || continue
+      seen+=" $cand"
+      printf '%s\n' "$cand"
+    done
+  }
+
+  _ci_accept_green() {
+    local why="$1"
+    echo "  ✓ required checks 全绿($why; $(tr '\n' ' ' <<<"$required"))"
+    clear_gate_waiver ci-verification
+  }
+
+  if ! required="$(_ci_gh_api_retry "repos/{owner}/{repo}/branches/$(printf '%s' "$CI_PROTECTED_BRANCH" | sed 's|/|%2F|g')/protection/required_status_checks" --jq '.contexts[]')"; then
+    unverifiable="无法取得分支保护的 required contexts(GitHub 5xx/gh 未装/未认证/无权限/网络不通)"
+    required=""
+  elif [[ -z "$required" ]]; then
+    unverifiable="无法取得分支保护的 required contexts(gh 未装/未认证/无权限/网络不通)"
+  fi
+
+  if [[ -z "$unverifiable" ]]; then
+    _ci_eval_required_checks "$sha"
+    if [[ -z "$unverifiable" && -z "$missing" && -z "$pending" && -z "$bad" ]]; then
+      _ci_accept_green "commit=$sha"
+      return 0
+    fi
+
+    # 同 tree 复用:merge SHA 与已绿 PR head 内容相同则认那次证据。不同 tree 禁止复用。
+    # 即使本 SHA 的 merge CI flake 或 check-runs 查询失败,只要另有同 tree 全绿证据就放行。
+    {
+      local saved_un="$unverifiable" saved_missing="$missing" saved_pending="$pending" saved_bad="$bad"
+      while IFS= read -r evidence_sha; do
+        [[ "$evidence_sha" =~ ^[0-9a-f]{40}$ ]] || continue
+        unverifiable=""
+        _ci_eval_required_checks "$evidence_sha"
+        if [[ -z "$unverifiable" && -z "$missing" && -z "$pending" && -z "$bad" ]]; then
+          echo "  · same-tree 复用 CI 证据:evidence=$evidence_sha tree=$(git -C "$REPO_ROOT" rev-parse --short "${sha}^{tree}")"
+          _ci_accept_green "same-tree evidence=$evidence_sha"
+          return 0
         fi
-      done <<<"$required"
+      done < <(_ci_same_tree_candidate_shas)
+      unverifiable="$saved_un"; missing="$saved_missing"; pending="$saved_pending"; bad="$saved_bad"
+    }
+
+    # in_progress/尚未建 run:有界轮询本 SHA,超时不假装绿。真红不轮询。
+    if [[ -z "$bad" && ( -n "$pending" || -n "$missing" || -n "$unverifiable" ) ]]; then
+      poll_budget="${OC_V5_CI_GREEN_POLL_SECONDS:-1200}"
+      poll_iv="${OC_V5_CI_GREEN_POLL_INTERVAL:-20}"
+      [[ "$poll_budget" =~ ^[0-9]+$ ]] || poll_budget=1200
+      [[ "$poll_iv" =~ ^[1-9][0-9]*$ ]] || poll_iv=20
+      (( poll_budget > 1800 )) && poll_budget=1800
+      (( poll_iv > 30 )) && poll_iv=30
+      if (( poll_budget > 0 )); then
+        echo "  · required check 未齐(pending=${pending:-none} missing=${missing:-none} unverifiable=${unverifiable:-none});最多等 ${poll_budget}s"
+        waited=0
+        while (( waited < poll_budget )); do
+          sleep "$poll_iv"
+          waited=$(( waited + poll_iv ))
+          unverifiable=""
+          _ci_eval_required_checks "$sha"
+          if [[ -z "$unverifiable" && -z "$missing" && -z "$pending" && -z "$bad" ]]; then
+            _ci_accept_green "commit=$sha after ${waited}s poll"
+            return 0
+          fi
+          if [[ -n "$bad" ]]; then
+            echo "  · 轮询中变为真红,停止等待"
+            break
+          fi
+          echo "  · 仍未齐 waited=${waited}s"
+        done
+        # 轮询后再试一次 same-tree(父提交 CI 可能刚绿)。
+        if [[ -z "$bad" ]]; then
+          local saved_un="$unverifiable" saved_missing="$missing" saved_pending="$pending" saved_bad="$bad"
+          while IFS= read -r evidence_sha; do
+            [[ "$evidence_sha" =~ ^[0-9a-f]{40}$ ]] || continue
+            unverifiable=""
+            _ci_eval_required_checks "$evidence_sha"
+            if [[ -z "$unverifiable" && -z "$missing" && -z "$pending" && -z "$bad" ]]; then
+              echo "  · same-tree 复用 CI 证据:evidence=$evidence_sha (after poll)"
+              _ci_accept_green "same-tree evidence=$evidence_sha"
+              return 0
+            fi
+          done < <(_ci_same_tree_candidate_shas)
+          unverifiable="$saved_un"; missing="$saved_missing"; pending="$saved_pending"; bad="$saved_bad"
+        fi
+      fi
     fi
   fi
-  if [[ -z "$unverifiable" && -z "$missing" && -z "$bad" ]]; then
-    echo "  ✓ required checks 全绿($(tr '\n' ' ' <<<"$required"))"
-    clear_gate_waiver ci-verification
-    return 0
-  fi
+
   echo "✗ CI 绿门未通过(commit=$sha)" >&2
   [[ -z "$unverifiable" ]] || echo "   · 证据不可得:$unverifiable" >&2
   [[ -z "$missing" ]] || echo "   · 缺失的必需 check:$missing" >&2
+  [[ -z "$pending" ]] || echo "   · 仍在跑的必需 check:$pending" >&2
   [[ -z "$bad" ]] || echo "   · 未成功的必需 check:$bad" >&2
   if [[ "$ALLOW_UNVERIFIED_CI" != 1 ]]; then
     echo "   分支保护只管「合进 canonical」,不管「部署哪个 commit」—— 本门是第二道。" >&2
@@ -3068,7 +3201,7 @@ assert_ci_green_for_source_commit() { # <full sha>
     return 1
   fi
   record_gate_waiver ci-verification \
-    "--allow-unverified-ci 放行未验证 CI 的 commit=$sha(${unverifiable:-未绿:${missing}${bad}})" || return 1
+    "--allow-unverified-ci 放行未验证 CI 的 commit=$sha(${unverifiable:-未绿:${missing}${pending}${bad}})" || return 1
   echo "  ⚠ --allow-unverified-ci 已放行,债务已登记;CI 恢复后重跑一次普通发布即自动销账。" >&2
   return 0
 }
