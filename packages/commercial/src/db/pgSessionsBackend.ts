@@ -7108,7 +7108,7 @@ async function backfillEmptyVisibleHeadFromPrepared(
   const clipped = clipVisibleText(recovered);
   const next: VisibleHead = {
     role: "assistant",
-    text: clipped.text,
+    text: pgModelSidecarText(clipped.text),
     ts: typeof current?.ts === "number" ? current.ts : request.createdAt,
     messageId: typeof current?.messageId === "string" && current.messageId.length > 0
       ? current.messageId
