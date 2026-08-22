@@ -7,7 +7,7 @@ import { compileRuntimePluginArtifact } from './contracts.js'
 import { WEIBO_WORKER_SOURCE } from './weiboWorkerSource.js'
 
 export const WEIBO_PLUGIN_SLUG = 'weibo'
-export const WEIBO_PLUGIN_VERSION = '1.6.0'
+export const WEIBO_PLUGIN_VERSION = '1.6.1'
 export const WEIBO_WORKER_DIGEST = createHash('sha256').update(WEIBO_WORKER_SOURCE).digest('hex')
 export const WEIBO_DRIVER_ID = `weibo-${WEIBO_WORKER_DIGEST.slice(0, 57)}`
 export const WEIBO_DRIVER_VERSION = WEIBO_PLUGIN_VERSION
@@ -852,14 +852,14 @@ if (COMPILED_WEIBO_PLUGIN.pluginType !== 'managed-browser')
   throw new Error('Weibo Plugin contract subtype mismatch')
 
 /**
- * The production v1.5 account-state contract is unchanged in v1.6. No other
+ * The production v1.6 account-state contract is unchanged in v1.6.1. No other
  * historical or user-published Weibo artifact is eligible for this upgrade.
  */
 export const WEIBO_SETUP_COMPATIBLE_PREDECESSORS = Object.freeze([
   Object.freeze({
-    version: '1.5.0',
-    artifactHash: '20377e288dea2b06a86730533ef3ce6eb3490136ff1f2e176df32230d74b6310',
-    execContractHash: '4eb49cf1946bb622c1fe2fe155b4400965ae00d0f03971c19446a923956d9465',
+    version: '1.6.0',
+    artifactHash: 'f40d66270e3529a9217c77c016be6c84aa2a93c5aa5c0536b4d9d4e8cbcdecd6',
+    execContractHash: '8401d895dbceaaee099da708e298d608f7abdc8956a30fd9775715a29d92c741',
   }),
 ])
 

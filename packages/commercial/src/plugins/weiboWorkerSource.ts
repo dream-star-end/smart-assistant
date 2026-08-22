@@ -1111,8 +1111,9 @@ async function preparePostImageChooser(page) {
 }
 async function openLongTextComposer(page) {
   const opener = await exactMenuItem(page, '长文');
-  if (!opener) throw new Error('composer');
+  if (!opener) return false;
   await opener.click({ timeout: 10_000 });
+  return true;
 }
 async function postComposerEditor(page, longText) {
   if (longText) {
@@ -1205,6 +1206,7 @@ async function writeAction(page, input) {
     const editor = await postComposerEditor(page, longText);
     if (!editor) throw new Error('composer');
     if (expectedText) await editor.fill(expectedText);
+    if ((await readPostComposer(editor)) !== expectedText) throw new Error('composer');
     const manifest = Array.isArray(params.mediaManifest) ? params.mediaManifest : [];
     await assertNoChallenge(page);
     let imageChooser = null;

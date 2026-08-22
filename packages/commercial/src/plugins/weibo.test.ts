@@ -178,14 +178,14 @@ describe('official Weibo Plugin', () => {
   })
 
   test('pins the current artifact and only the exact production predecessor', () => {
-    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.0')
+    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.1')
     assert.equal(WEIBO_DRIVER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.equal(WEIBO_LAUNCHER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.deepEqual(WEIBO_SETUP_COMPATIBLE_PREDECESSORS, [
       {
-        version: '1.5.0',
-        artifactHash: '20377e288dea2b06a86730533ef3ce6eb3490136ff1f2e176df32230d74b6310',
-        execContractHash: '4eb49cf1946bb622c1fe2fe155b4400965ae00d0f03971c19446a923956d9465',
+        version: '1.6.0',
+        artifactHash: 'f40d66270e3529a9217c77c016be6c84aa2a93c5aa5c0536b4d9d4e8cbcdecd6',
+        execContractHash: '8401d895dbceaaee099da708e298d608f7abdc8956a30fd9775715a29d92c741',
       },
     ])
     assert.equal(
@@ -845,17 +845,86 @@ describe('official Weibo Plugin', () => {
     ])
   })
 
-  test('create_post never dispatches long text when the 长文 composer control is absent', async () => {
+  test('create_post keeps long text plus images on the default composer when 长文 is absent', async () => {
     const events: string[] = []
+    const longText = '汉'.repeat(2001)
+    let filled = ''
+    const textarea = {
+      fill: async (value: string) => {
+        filled = value
+      },
+      inputValue: async () => filled,
+    }
+    const send = {
+      click: async (options: { trial?: boolean }) => {
+        if (!options.trial) events.push('click')
+      },
+    }
+    const imageTrigger = {
+      click: async (options: { trial?: boolean }) =>
+        events.push(options.trial ? 'image-trial' : 'image-click'),
+    }
+    const imageChooser = {
+      setFiles: async () => events.push('upload'),
+      element: () => ({ evaluate: async () => 1 }),
+    }
+    let collectCount = 0
+    const harness = compileWorkerPostHarness({
+      ensureSelfId: async () => '12345',
+      gotoAuthenticated: async () => {},
+      collectPosts: async () => {
+        collectCount += 1
+        return collectCount === 1 ? [] : [{ id: 'plain-long', owned: true, text: longText }]
+      },
+      uniqueVisible: async () => textarea,
+      assertNoChallenge: async () => {},
+      awaitDispatch: async () => events.push('dispatch'),
+      exactMenuItem: async (_page: unknown, text: string) => {
+        if (text === '长文') return null
+        if (text === '图片') return imageTrigger
+        return send
+      },
+      cleanText: (value: unknown) => String(value).trim(),
+      readFile: async () => Buffer.from('image'),
+    })
+    const result = await harness.writeAction(
+      {
+        locator: () => ({}),
+        waitForEvent: async () => imageChooser,
+        waitForTimeout: async () => {},
+      },
+      {
+        actionId: 'create_post',
+        params: {
+          text: longText,
+          mediaManifest: [{ inputId: 'asset-1', filename: 'image.png', mimeType: 'image/png' }],
+        },
+      },
+    )
+    assert.deepEqual(result, { post: { id: 'plain-long', owned: true, text: longText } })
+    assert.equal(filled, longText)
+    assert.deepEqual(events, ['image-trial', 'image-click', 'dispatch', 'upload', 'click'])
+  })
+
+  test('create_post never dispatches when the composer truncates long text', async () => {
+    const events: string[] = []
+    const longText = '汉'.repeat(2001)
+    const textarea = {
+      fill: async () => {},
+      inputValue: async () => longText.slice(0, 2000),
+    }
     const harness = compileWorkerPostHarness({
       ensureSelfId: async () => '12345',
       gotoAuthenticated: async () => {},
       collectPosts: async () => [],
-      uniqueVisible: async () => ({ fill: async () => {}, inputValue: async () => '' }),
+      uniqueVisible: async () => textarea,
       assertNoChallenge: async () => {},
       awaitDispatch: async () => events.push('dispatch'),
       exactMenuItem: async () => null,
-      cleanText: (value: unknown) => String(value).trim(),
+      cleanText: (value: unknown, max?: number) =>
+        String(value)
+          .trim()
+          .slice(0, max ?? 20000),
       readFile: async () => Buffer.from('unused'),
     })
 
@@ -864,7 +933,7 @@ describe('official Weibo Plugin', () => {
         { locator: () => ({}), waitForTimeout: async () => {} },
         {
           actionId: 'create_post',
-          params: { text: '汉'.repeat(2001), mediaManifest: [] },
+          params: { text: longText, mediaManifest: [] },
         },
       ),
       /composer/,
