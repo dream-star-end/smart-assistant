@@ -32,12 +32,12 @@ function framed(value: unknown): Buffer {
   return Buffer.concat([header, body])
 }
 
-function uploadedImageLocator(events: string[]) {
+function uploadedImageLocator(events: string[], srcs = ['blob:https://weibo.com/preview']) {
   return {
-    count: async () => (events.includes('upload') ? 1 : 0),
-    nth: () => ({
+    count: async () => (events.includes('upload') ? srcs.length : 0),
+    nth: (index: number) => ({
       isVisible: async () => true,
-      getAttribute: async () => 'blob:https://weibo.com/preview',
+      getAttribute: async () => srcs[index],
     }),
   }
 }
@@ -436,6 +436,11 @@ describe('official Weibo Plugin', () => {
     assert.match(WEIBO_WORKER_SOURCE, /exactMenuItem\(scope, '发送'\)/)
     assert.match(WEIBO_WORKER_SOURCE, /awaitComposerMediaReady/)
     assert.match(WEIBO_WORKER_SOURCE, /collectVisibleImageSrcs/)
+    assert.match(WEIBO_WORKER_SOURCE, /added.length >= expectedNew/)
+    assert.doesNotMatch(
+      WEIBO_WORKER_SOURCE,
+      /if \(added.length > expectedNew\) throw new Error\('media-preview'\)/,
+    )
     assert.match(createPostSource, /90_000, previewBefore/)
     assert.match(WEIBO_WORKER_SOURCE, /awaitComposerCleared/)
     assert.match(
@@ -1045,6 +1050,61 @@ describe('official Weibo Plugin', () => {
     )
     assert.ok(!events.includes('click'))
     assert.deepEqual(events, ['image-trial', 'image-click', 'dispatch', 'upload'])
+  })
+
+  test('create_post accepts extra new composer previews after a single upload', async () => {
+    const events: string[] = []
+    const textarea = { fill: async () => {}, inputValue: async () => 'hello' }
+    const imageTrigger = {
+      click: async (options: { trial?: boolean }) =>
+        events.push(options.trial ? 'image-trial' : 'image-click'),
+    }
+    const imageChooser = {
+      setFiles: async () => events.push('upload'),
+      element: () => ({ evaluate: async () => 1 }),
+    }
+    const send = {
+      click: async (options: { trial?: boolean }) => {
+        if (!events.includes('upload')) throw new Error('disabled')
+        if (!options.trial) events.push('click')
+      },
+    }
+    const harness = compileWorkerPostHarness({
+      ensureSelfId: async () => '12345',
+      gotoAuthenticated: async () => {},
+      collectPosts: async () =>
+        events.includes('click') ? [{ id: 'extra-preview', owned: true, text: 'hello' }] : [],
+      uniqueVisible: async () => textarea,
+      assertNoChallenge: async () => {},
+      awaitDispatch: async () => events.push('dispatch'),
+      exactMenuItem: async (_page: unknown, text: string) =>
+        text === '图片' ? imageTrigger : send,
+      cleanText: (value: unknown) => String(value).trim(),
+      readFile: async () => Buffer.from('image'),
+    })
+
+    const result = await harness.writeAction(
+      {
+        locator: (selector: string) =>
+          selector === 'img'
+            ? uploadedImageLocator(events, [
+                'blob:https://weibo.com/preview',
+                'https://wx1.sinaimg.cn/orj360/uploaded.jpg',
+              ])
+            : {},
+        waitForEvent: async () => imageChooser,
+        waitForTimeout: async () => {},
+      },
+      {
+        actionId: 'create_post',
+        params: {
+          text: 'hello',
+          mediaManifest: [{ inputId: 'asset-1', filename: 'image.png', mimeType: 'image/png' }],
+        },
+      },
+    )
+    assert.deepEqual(result, { post: { id: 'extra-preview', owned: true, text: 'hello' } })
+    assert.deepEqual(events, ['image-trial', 'image-click', 'dispatch', 'upload', 'click'])
   })
 
   test('create_post opens 本地上传 when 图片 does not raise a native chooser', async () => {
