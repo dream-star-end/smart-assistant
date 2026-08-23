@@ -1391,6 +1391,16 @@ async function uniqueExactText(root, text) {
   }
   return matches.length === 1 ? matches[0] : null;
 }
+async function exactTextNearInput(input, text) {
+  if (!input || typeof input.locator !== 'function' || !text) return null;
+  for (let depth = 1; depth <= 8; depth += 1) {
+    const ancestor = input.locator('xpath=ancestor::*[' + depth + ']');
+    if (await ancestor.count() !== 1) continue;
+    const found = await uniqueExactText(ancestor, text);
+    if (found) return found;
+  }
+  return null;
+}
 async function smallVisibleAncestor(input) {
   if (!input || typeof input.locator !== 'function') return null;
   for (let depth = 1; depth <= 5; depth += 1) {
@@ -1419,7 +1429,11 @@ async function clickableImageToolFromInput(input) {
   return smallVisibleAncestor(input);
 }
 async function imageToolControl(scope, page, scopedInput) {
-  const labeled = await exactMenuItem(scope, '图片') || await uniqueExactText(scope, '图片') || await uniqueExactText(scope, '相册');
+  const labeled = await exactMenuItem(scope, '图片')
+    || await exactTextNearInput(scopedInput, '图片')
+    || await exactTextNearInput(scopedInput, '相册')
+    || await uniqueExactText(scope, '图片')
+    || await uniqueExactText(scope, '相册');
   if (labeled) return labeled;
   for (const root of [scope, page]) {
     const titled = await uniqueVisibleClickable(root, '[title="图片"], [aria-label="图片"]');

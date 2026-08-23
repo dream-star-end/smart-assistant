@@ -197,7 +197,7 @@ describe('official Weibo Plugin', () => {
   })
 
   test('pins the current artifact and only the exact production predecessor', () => {
-    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.22')
+    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.23')
     assert.equal(WEIBO_DRIVER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.equal(WEIBO_LAUNCHER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.deepEqual(WEIBO_SETUP_COMPATIBLE_PREDECESSORS, [
@@ -452,6 +452,7 @@ describe('official Weibo Plugin', () => {
     assert.match(WEIBO_WORKER_SOURCE, /imageTitleHits/)
     assert.match(WEIBO_WORKER_SOURCE, /clickableImageToolFromInput/)
     assert.match(WEIBO_WORKER_SOURCE, /uniqueExactText/)
+    assert.match(WEIBO_WORKER_SOURCE, /exactTextNearInput/)
     assert.match(WEIBO_WORKER_SOURCE, /smallVisibleAncestor/)
     assert.match(WEIBO_WORKER_SOURCE, /imageTextHits/)
     assert.match(WEIBO_WORKER_SOURCE, /scopedInput && !image/)
