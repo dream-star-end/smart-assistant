@@ -68,11 +68,13 @@ const BOOT_TIMEOUT = 60_000;
 /** J1-J4 的总防挂预算；进入 J5 后改由 TURN_WAIT_TIMEOUT 单独计时。 */
 const PRE_J5_TIMEOUT = 240_000;
 /**
- * 旅程固定使用刚由同一 minimum_functional_core 真 turn 矩阵验证过的 CCB 模型。
- * 不继承 canary 账号历史会话的粘滞模型，否则 provider 的既有波动会把 UI/附件门
- * 变成随机模型健康探针，既重复前一道门，又无法归因到 J1-J5 用户路径。
+ * 旅程固定使用平台自有的 Codex/Luna 模型。双引擎真 turn 矩阵已经单独验证
+ * CCB/DeepSeek；UI/附件门若继续选择同一个 provider 模型，会在该 provider 被健康
+ * 系统降级时卡死在“禁用模型不可点击”，重复前一道模型门并把 J1-J5 误判成前端
+ * 回归。固定 Luna 仍通过真实模型选择器和真实 J5 回复验证完整用户路径，同时避免
+ * 旅程继承 canary 账号历史会话的粘滞模型。
  */
-const JOURNEY_MODEL_ID = "deepseek-v4-flash";
+const JOURNEY_MODEL_ID = "gpt-5.6-luna";
 /**
  * J5 等一轮真回复的上限。2026-07-28 两次生产慢轮分别在 122.53s / 126.70s
  * 正常 completed，120s 会把真实成功误判成挂起；180s 只扩等待窗，失败签名与附件
@@ -314,7 +316,7 @@ try {
   let assistantRowsBefore = 0;
   await step("J4 带附件发送:消息上屏+附件区清空", async () => {
     const input = page.locator("textarea").first();
-    await input.fill(`${marker}(自动冒烟)。请读取附件第一行，并只把第一行原样回复；不要猜测、不要描述文件名。`);
+    await input.fill(`${marker}(自动冒烟)。请读取刚上传的附件「${probeName}」第一行，并只把第一行原样回复；不要猜测、不要描述文件名。`);
     const send = page.getByRole("button", { name: "发送" });
     // 上传若未完成发送键保持禁用;等它可用(附件 done 的第二重信号)。
     const deadline = Date.now() + STEP_TIMEOUT;
