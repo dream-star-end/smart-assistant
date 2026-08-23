@@ -197,7 +197,7 @@ describe('official Weibo Plugin', () => {
   })
 
   test('pins the current artifact and only the exact production predecessor', () => {
-    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.18')
+    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.20')
     assert.equal(WEIBO_DRIVER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.equal(WEIBO_LAUNCHER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.deepEqual(WEIBO_SETUP_COMPATIBLE_PREDECESSORS, [
@@ -440,11 +440,16 @@ describe('official Weibo Plugin', () => {
     assert.match(createPostSource, /openLongTextComposer/)
     assert.match(createPostSource, /preparePostImageChooser\(page, editor\)/)
     assert.match(WEIBO_WORKER_SOURCE, /uniqueImageFileInput/)
-    assert.match(
-      WEIBO_WORKER_SOURCE,
-      /uniqueImageFileInput\(scope\) \|\| await uniqueImageFileInput\(page\)/,
-    )
+    assert.match(WEIBO_WORKER_SOURCE, /const scopedInput = await uniqueImageFileInput\(scope\)/)
+    assert.match(WEIBO_WORKER_SOURCE, /const liveInput = await uniqueImageFileInput\(scope\)/)
     assert.match(WEIBO_WORKER_SOURCE, /imageToolControl/)
+    assert.match(WEIBO_WORKER_SOURCE, /uniqueVisibleClickable/)
+    assert.match(WEIBO_WORKER_SOURCE, /wbpro-iconbed/)
+    assert.match(WEIBO_WORKER_SOURCE, /normalize-space\(\)="发送"/)
+    assert.match(WEIBO_WORKER_SOURCE, /@title="图片" or @aria-label="图片"/)
+    assert.match(WEIBO_WORKER_SOURCE, /woo-font--image/)
+    assert.match(WEIBO_WORKER_SOURCE, /woo-font--picture/)
+    assert.match(WEIBO_WORKER_SOURCE, /imageTitleHits/)
     assert.match(WEIBO_WORKER_SOURCE, /countImageFileInputs/)
     assert.match(WEIBO_WORKER_SOURCE, /step: 'media.chooser'/)
     assert.match(WEIBO_WORKER_SOURCE, /step: 'media.upload'/)
@@ -832,6 +837,61 @@ describe('official Weibo Plugin', () => {
           },
         },
       ),
+      /media/,
+    )
+    assert.deepEqual(events, [])
+  })
+
+  test('create_post does not dispatch a page-level file input outside composer scope', async () => {
+    const events: string[] = []
+    const empty = { count: async () => 0, nth: () => ({}) }
+    const textarea = {
+      fill: async () => {},
+      inputValue: async () => 'hello',
+      locator: (selector: string) => {
+        if (String(selector).includes('发送')) return { count: async () => 1, locator: () => empty }
+        return empty
+      },
+    }
+    const harness = compileWorkerPostHarness({
+      ensureSelfId: async () => '12345',
+      gotoAuthenticated: async () => {},
+      collectPosts: async () => [],
+      uniqueVisible: async () => textarea,
+      assertNoChallenge: async () => {},
+      awaitDispatch: async () => events.push('dispatch'),
+      exactMenuItem: async () => null,
+      cleanText: (value: unknown) => String(value).trim(),
+      readFile: async () => Buffer.from('unused'),
+    })
+    const page = {
+      locator: (selector: string) => {
+        if (selector === 'input[type="file"]') {
+          return {
+            count: async () => 1,
+            nth: () => ({
+              evaluate: async (
+                fn: (node: { isConnected: boolean; files: { length: number } }) => unknown,
+              ) => fn({ isConnected: true, files: { length: 0 } }),
+              getAttribute: async () => 'image/*',
+              setInputFiles: async () => events.push('upload'),
+            }),
+          }
+        }
+        return empty
+      },
+      waitForEvent: async () => null,
+      waitForTimeout: async () => {},
+    }
+
+    await assert.rejects(
+      harness.writeAction(page, {
+        actionId: 'create_post',
+        params: {
+          text: 'hello',
+          mediaManifest: [{ inputId: 'asset-1', filename: 'image.png', mimeType: 'image/png' }],
+        },
+      }),
       /media/,
     )
     assert.deepEqual(events, [])

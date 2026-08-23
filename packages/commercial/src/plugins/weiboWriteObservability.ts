@@ -104,6 +104,8 @@ const LOG_ALLOW_KEYS = new Set([
   'pageInputs',
   'scopeImageInputs',
   'pageImageInputs',
+  'imageTitleHits',
+  'imageIconHits',
   'selected',
   'freshSelected',
   'imgCount',
@@ -192,6 +194,8 @@ export function sanitizeWeiboWorkerLogEvent(
       key === 'pageInputs' ||
       key === 'scopeImageInputs' ||
       key === 'pageImageInputs' ||
+      key === 'imageTitleHits' ||
+      key === 'imageIconHits' ||
       key === 'selected' ||
       key === 'freshSelected' ||
       key === 'imgCount' ||

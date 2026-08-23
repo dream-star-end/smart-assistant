@@ -126,6 +126,8 @@ describe('Weibo worker log sanitizer', () => {
         branch: 'existing',
         hasImage: true,
         scopeImageInputs: 1,
+        imageTitleHits: 1,
+        imageIconHits: 0,
         html: '<div>drop</div>',
         srcUrl: 'https://weibo.com/secret',
       }),
@@ -139,6 +141,8 @@ describe('Weibo worker log sanitizer', () => {
       branch: 'existing',
       hasImage: true,
       scopeImageInputs: 1,
+      imageTitleHits: 1,
+      imageIconHits: 0,
     })
     assert.equal(kept && 'html' in kept, false)
     assert.equal(kept && 'srcUrl' in kept, false)

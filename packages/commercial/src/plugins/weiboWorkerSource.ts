@@ -1154,9 +1154,21 @@ async function awaitNewestOwnPost(page, selfId, text, beforeIds) {
 }
 async function composerScope(editor) {
   if (!editor || typeof editor.locator !== 'function') return null;
-  const scope = editor.locator('xpath=ancestor::*[.//*[(self::button or @role="button" or @role="menuitem")][normalize-space()="图片"]][1]');
-  if (await scope.count() === 1) return scope;
-  const parent = editor.locator('xpath=ancestor::*[2]');
+  const queries = [
+    'xpath=ancestor::*[.//*[(self::button or @role="button" or @role="menuitem")][normalize-space()="发送"]][1]',
+    'xpath=ancestor::*[.//*[(self::button or @role="button" or @role="menuitem")][normalize-space()="图片"]][1]',
+    'xpath=ancestor::*[.//*[@title="图片" or @aria-label="图片" or contains(@class,"woo-font--image") or contains(@class,"woo-font--pic") or contains(@class,"woo-font--picture")]][1]'
+  ];
+  for (const query of queries) {
+    const scope = editor.locator(query);
+    if (await scope.count() === 1) return scope;
+  }
+  const fileScope = editor.locator('xpath=ancestor::*[.//input[@type="file"]][1]');
+  if (await fileScope.count() === 1) {
+    const tag = String(await fileScope.evaluate((el) => (el && el.tagName) || '').catch(() => '')).toUpperCase();
+    if (tag && tag !== 'HTML' && tag !== 'BODY' && tag !== 'MAIN') return fileScope;
+  }
+  const parent = editor.locator('xpath=ancestor::*[4]');
   if (await parent.count() === 1) return parent;
   return editor;
 }
@@ -1197,6 +1209,35 @@ async function uniqueImageFileInput(scope) {
     const accept = String(await node.getAttribute('accept').catch(() => '') || '');
     if (accept && !/image|\*/i.test(accept)) continue;
     matches.push(node);
+  }
+  return matches.length === 1 ? matches[0] : null;
+}
+async function countVisibleLocator(root, selector, limit = 20) {
+  let hits = 0;
+  if (!root || typeof root.locator !== 'function' || !selector) return hits;
+  const nodes = root.locator(selector);
+  if (!nodes || typeof nodes.count !== 'function' || typeof nodes.nth !== 'function') return hits;
+  const total = Math.min(await nodes.count().catch(() => 0), limit);
+  for (let index = 0; index < total; index += 1) {
+    if (await visible(nodes.nth(index))) hits += 1;
+  }
+  return hits;
+}
+async function clickableImageTool(node) {
+  const wrap = node.locator('xpath=ancestor-or-self::*[self::button or @role="button" or @role="menuitem" or contains(concat(" ",normalize-space(@class)," ")," wbpro-iconbed ")][1]');
+  if (await wrap.count() === 1 && await visible(wrap)) return wrap;
+  return node;
+}
+async function uniqueVisibleClickable(root, selector) {
+  if (!root || typeof root.locator !== 'function') return null;
+  const nodes = root.locator(selector);
+  if (!nodes || typeof nodes.count !== 'function' || typeof nodes.nth !== 'function') return null;
+  const matches = [];
+  const total = Math.min(await nodes.count().catch(() => 0), 20);
+  for (let index = 0; index < total; index += 1) {
+    const node = nodes.nth(index);
+    if (!await visible(node)) continue;
+    matches.push(await clickableImageTool(node));
   }
   return matches.length === 1 ? matches[0] : null;
 }
@@ -1336,30 +1377,24 @@ async function awaitFileChooser(page, clickable) {
   return chooser;
 }
 async function imageToolControl(scope, page) {
-  const labeled = await exactMenuItem(scope, '图片') || await exactMenuItem(page, '图片');
+  const labeled = await exactMenuItem(scope, '图片');
   if (labeled) return labeled;
   for (const root of [scope, page]) {
-    if (!root || typeof root.locator !== 'function') continue;
-    const icons = root.locator('[title="图片"], [aria-label="图片"]');
-    if (!icons || typeof icons.count !== 'function' || typeof icons.nth !== 'function') continue;
-    const total = Math.min(await icons.count().catch(() => 0), 20);
-    const matches = [];
-    for (let index = 0; index < total; index += 1) {
-      const node = icons.nth(index);
-      if (!await visible(node)) continue;
-      const control = node.locator('xpath=ancestor-or-self::*[(self::button or @role="button" or @role="menuitem")][1]');
-      if (await control.count() === 1 && await visible(control)) matches.push(control);
-    }
-    if (matches.length === 1) return matches[0];
+    const titled = await uniqueVisibleClickable(root, '[title="图片"], [aria-label="图片"]');
+    if (titled) return titled;
+    const icon = await uniqueVisibleClickable(root, 'i.woo-font--image, i.woo-font--pic, i.woo-font--picture');
+    if (icon) return icon;
   }
-  return null;
+  return await exactMenuItem(page, '图片');
 }
 async function preparePostImageChooser(page, editor) {
   const scope = (await composerScope(editor)) || page;
-  const existing = await uniqueImageFileInput(scope) || await uniqueImageFileInput(page);
+  const scopedInput = await uniqueImageFileInput(scope);
   const image = await imageToolControl(scope, page);
   const beforeScope = await countImageFileInputs(scope);
   const beforePage = await countImageFileInputs(page);
+  const imageTitleHits = await countVisibleLocator(scope, '[title="图片"], [aria-label="图片"]');
+  const imageIconHits = await countVisibleLocator(scope, 'i.woo-font--image, i.woo-font--pic, i.woo-font--picture');
   let branch = 'miss';
   let chooser = null;
   if (image) {
@@ -1391,18 +1426,27 @@ async function preparePostImageChooser(page, editor) {
         chooser = await awaitFileChooser(page, local);
         break;
       }
-      const appeared = await uniqueImageFileInput(scope) || await uniqueImageFileInput(page);
+      const appeared = await uniqueImageFileInput(scope);
       if (appeared) {
         branch = 'appeared';
         chooser = wrapFileInput(appeared);
         break;
       }
+      const nowPage = await countImageFileInputs(page);
+      if (nowPage.image === beforePage.image + 1) {
+        const freshPage = await uniqueImageFileInput(page);
+        if (freshPage) {
+          branch = 'appeared';
+          chooser = wrapFileInput(freshPage);
+          break;
+        }
+      }
       if (chooserSettled) break;
     }
   }
-  if (!chooser && existing) {
+  if (!chooser && scopedInput) {
     branch = 'existing';
-    chooser = wrapFileInput(existing);
+    chooser = wrapFileInput(scopedInput);
   }
   const afterScope = await countImageFileInputs(scope);
   const afterPage = await countImageFileInputs(page);
@@ -1414,6 +1458,8 @@ async function preparePostImageChooser(page, editor) {
     scopeImageInputs: beforeScope.image,
     pageInputs: beforePage.total,
     pageImageInputs: beforePage.image,
+    imageTitleHits,
+    imageIconHits,
     hits: afterScope.image,
     mediaCount: afterPage.image,
   });
@@ -1438,8 +1484,9 @@ async function postComposerEditor(page, longText) {
     for (let index = 0; index < total; index += 1) {
       const node = nodes.nth(index);
       if (!await visible(node)) continue;
-      const imageTool = node.locator('xpath=ancestor::*[.//*[(self::button or @role="button" or @role="menuitem")][normalize-space()="图片"]][1]');
-      if (await imageTool.count() === 1) matches.push(node);
+      const sendTool = node.locator('xpath=ancestor::*[.//*[(self::button or @role="button" or @role="menuitem")][normalize-space()="发送"]][1]');
+      const imageTool = node.locator('xpath=ancestor::*[.//*[(self::button or @role="button" or @role="menuitem")][normalize-space()="图片"] or .//*[@title="图片" or @aria-label="图片"]][1]');
+      if (await sendTool.count() === 1 || await imageTool.count() === 1) matches.push(node);
     }
     if (matches.length === 1) return matches[0];
   }
@@ -1554,7 +1601,7 @@ async function writeAction(page, input) {
       try {
         for (const item of manifest) files.push({ name: item.filename, mimeType: item.mimeType, buffer: await readFile('/inputs/' + item.inputId) });
         const scope = (await composerScope(freshEditor)) || page;
-        const liveInput = await uniqueImageFileInput(scope) || await uniqueImageFileInput(page);
+        const liveInput = await uniqueImageFileInput(scope);
         let selected = 0;
         if (liveInput) {
           await liveInput.setInputFiles(files);
@@ -1571,7 +1618,7 @@ async function writeAction(page, input) {
         let freshSelected = -1;
         if (selected !== manifest.length) {
           retried = true;
-          const freshInput = await uniqueImageFileInput(scope) || await uniqueImageFileInput(page);
+          const freshInput = await uniqueImageFileInput(scope);
           if (freshInput) {
             await freshInput.setInputFiles(files);
             try {
