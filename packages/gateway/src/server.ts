@@ -10330,11 +10330,11 @@ export class Gateway {
     agentId: string
     goal: string
   }>()
-  private readonly _syntheticTurnBarriers = new Map<string, {
+  private _syntheticTurnBarriers: Map<string, {
     owner: string
     done: Promise<void>
     release: () => void
-  }>()
+  }> | undefined
   /** HTTP/MCP delegate 续跑绑定。测试脚手架 Object.create 不跑字段初始化,使用处惰性 ??=。 */
   private _delegateResume: DelegateResumeRegistry | undefined
 
@@ -12314,8 +12314,9 @@ export class Gateway {
     owner: string
     release: () => void
   }> {
+    const barriers = (this._syntheticTurnBarriers ??= new Map())
     for (;;) {
-      const existing = this._syntheticTurnBarriers.get(sessionKey)
+      const existing = barriers.get(sessionKey)
       if (!existing) break
       await existing.done
     }
@@ -12326,11 +12327,11 @@ export class Gateway {
     const release = () => {
       if (released) return
       released = true
-      const current = this._syntheticTurnBarriers.get(sessionKey)
-      if (current?.owner === owner) this._syntheticTurnBarriers.delete(sessionKey)
+      const current = this._syntheticTurnBarriers?.get(sessionKey)
+      if (current?.owner === owner) this._syntheticTurnBarriers?.delete(sessionKey)
       resolveDone()
     }
-    this._syntheticTurnBarriers.set(sessionKey, { owner, done, release })
+    barriers.set(sessionKey, { owner, done, release })
     return { owner, release }
   }
 
@@ -15615,7 +15616,7 @@ export class Gateway {
       return
     }
     const syntheticBarrierKey = `agent:${frame.agentId}:${frame.channel}:${frame.peer.kind}:${frame.peer.id.replace(/[^a-zA-Z0-9_-]/g, '_')}`
-    const syntheticBarrier = this._syntheticTurnBarriers.get(syntheticBarrierKey)
+    const syntheticBarrier = this._syntheticTurnBarriers?.get(syntheticBarrierKey)
     if (syntheticBarrier && (frame as any)._syntheticBarrierOwner !== syntheticBarrier.owner) {
       await syntheticBarrier.done
     }
