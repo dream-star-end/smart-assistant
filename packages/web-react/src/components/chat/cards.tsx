@@ -80,6 +80,13 @@ export type CardCallbacks = {
   onContinue?: () => void;
   onTopUp?: () => void;
   onFeedback?: (ctx: FeedbackContext) => void;
+  onFirstTextPaint?: (input: {
+    traceId: string;
+    sessionId: string;
+    clientMessageId: string;
+    latencyMs: number;
+    backgroundAtFrame: boolean;
+  }) => void;
   /** 重试一条发送失败的用户消息（复用原 payload 走既有发送入口原地重发）。*/
   onRetrySend?: (msg: ChatMessage) => void;
   /** Resume an executed interrupted turn as one new, deduplicated user turn. */

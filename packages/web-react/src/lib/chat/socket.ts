@@ -644,6 +644,8 @@ export class ChatSocket {
    * 渲染经 getTransientNotice 快照读回；set/clear 都 scheduleNotify 让 UI 及时更新。
    */
   private readonly transientNotices = new Map<string, { text: string; ts: number }>();
+  /** Page-lifetime exact-turn dedupe. Historical hydration/replay never populates this set. */
+  private readonly firstTextPaintTraceIds = new Set<string>();
 
   // ── 对账（S1：切回前台 / 重连成功 → REST syncSession 追回静默丢失）──
   /** 同会话对账去抖戳（SYNC_DEBOUNCE_MS 内至多一次）。*/
@@ -1910,11 +1912,17 @@ export class ChatSocket {
         return;
       }
       if (this.bufferStampedFrameDuringDurableHydration(f)) return;
+      const firstTextPaint = f.type === "outbound.message"
+        ? this.prepareFirstTextPaint(f as OutboundMessageWire)
+        : null;
+      let dispatched = false;
       try {
         this.dispatch(f);
+        dispatched = true;
       } catch {
         /* dispatch 失败：吞掉，不落 payload */
       }
+      if (dispatched && firstTextPaint) this.attachFirstTextPaintProbe(firstTextPaint);
       this.scheduleNotify();
     };
 
@@ -2016,6 +2024,60 @@ export class ChatSocket {
       this.reconnectTimer = setTimeout(() => this.connect(), delay);
       this.scheduleNotify();
     };
+  }
+
+  private prepareFirstTextPaint(
+    frame: OutboundMessageWire,
+  ): NonNullable<ChatMessage["_firstTextPaintProbe"]> | null {
+    const traceId = typeof frame.traceId === "string" ? frame.traceId : "";
+    const sessionId = frame.peer?.id;
+    const clientMessageId = frame.clientMessageId;
+    if (
+      !/^[0-9a-f]{32}$/.test(traceId) ||
+      typeof sessionId !== "string" ||
+      typeof clientMessageId !== "string" ||
+      this.firstTextPaintTraceIds.has(traceId)
+    ) return null;
+    const sess = this.sessions.get(sessionId);
+    // Live-only and exact-turn-only: legacy/missing ids and replayed old turns
+    // cannot borrow the current user row's submit clock.
+    if (!sess || sess._activeClientMessageId !== clientMessageId) return null;
+    const hasText = Array.isArray(frame.blocks) && frame.blocks.some((block) => {
+      const candidate = block as { kind?: unknown; text?: unknown };
+      return candidate.kind === "text" &&
+        typeof candidate.text === "string" &&
+        candidate.text.trim().length > 0;
+    });
+    if (!hasText) return null;
+    const alreadyVisible = sess.messages.some((message) =>
+      message.role === "assistant" &&
+      (message._clientMessageId === clientMessageId || message._turnOwnerId === clientMessageId) &&
+      message.text.trim().length > 0);
+    if (alreadyVisible) return null;
+    const user = sess.messages.find((message) => message.role === "user" && message.id === clientMessageId);
+    if (!user || !Number.isFinite(user.ts)) return null;
+    return {
+      traceId,
+      sessionId,
+      clientMessageId,
+      startedAt: user.ts,
+      backgroundAtFrame: typeof document !== "undefined" && document.visibilityState !== "visible",
+    };
+  }
+
+  private attachFirstTextPaintProbe(
+    probe: NonNullable<ChatMessage["_firstTextPaintProbe"]>,
+  ): void {
+    const sess = this.sessions.get(probe.sessionId);
+    const target = sess?.messages.find((message) =>
+      message.role === "assistant" &&
+      (message._clientMessageId === probe.clientMessageId ||
+        message._turnOwnerId === probe.clientMessageId) &&
+      message.text.trim().length > 0);
+    if (!target) return;
+    if (this.firstTextPaintTraceIds.size >= 1024) this.firstTextPaintTraceIds.clear();
+    this.firstTextPaintTraceIds.add(probe.traceId);
+    target._firstTextPaintProbe = probe;
   }
 
   private dispatch(f: OutboundWire): void {
@@ -2868,6 +2930,7 @@ export class ChatSocket {
     this.controlQueue = [];
     this.pendingRepoBind.clear();
     this.transientNotices.clear();
+    this.firstTextPaintTraceIds.clear();
     this.lastSyncAt.clear();
     for (const timer of this.reconcileTimers.values()) clearTimeout(timer);
     this.reconcileTimers.clear();
@@ -2904,6 +2967,7 @@ export class ChatSocket {
     // 同时剥离 _media 里的 localSrc：那是乐观渲染用的 blob: URL，持久化到 IndexedDB 后
     // reload 即成死链（blob 是页面生命周期内的）。剥离后重开会话的媒体回落 url 走签名管线。
     const needsLocalSrcStrip = s.messages.some((m) => m._media?.some((r) => r.localSrc));
+    const needsFirstTextPaintProbeStrip = s.messages.some((m) => m._firstTextPaintProbe !== undefined);
     const shouldStrip = (message: ChatMessage) =>
       !!message._genPlaceholder ||
       message._timelineRecord === true ||
@@ -2939,6 +3003,14 @@ export class ChatSocket {
             return rest;
           }),
         };
+      });
+    }
+    if (needsFirstTextPaintProbeStrip) {
+      messages = messages.map((message) => {
+        if (message._firstTextPaintProbe === undefined) return message;
+        const clean = { ...message };
+        delete clean._firstTextPaintProbe;
+        return clean;
       });
     }
     return {

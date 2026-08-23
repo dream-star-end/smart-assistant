@@ -65,6 +65,41 @@ import {
   tokenUsageSnapshot,
 } from "./chat/tokenUsage";
 
+function FirstTextPaintCommitProbe({ message, cb }: { message: ChatMessage; cb: CardCallbacks }) {
+  const probe = message._firstTextPaintProbe;
+  const reportedRef = useRef(new Set<string>());
+  useLayoutEffect(() => {
+    if (!probe || !cb.onFirstTextPaint || reportedRef.current.has(probe.traceId)) return;
+    if (
+      typeof requestAnimationFrame !== "function" ||
+      typeof cancelAnimationFrame !== "function"
+    ) return;
+    let first = 0;
+    let second = 0;
+    let cancelled = false;
+    first = requestAnimationFrame(() => {
+      second = requestAnimationFrame(() => {
+        if (cancelled) return;
+        reportedRef.current.add(probe.traceId);
+        cb.onFirstTextPaint?.({
+          traceId: probe.traceId,
+          sessionId: probe.sessionId,
+          clientMessageId: probe.clientMessageId,
+          latencyMs: Math.max(0, Date.now() - probe.startedAt),
+          backgroundAtFrame: probe.backgroundAtFrame,
+        });
+        delete message._firstTextPaintProbe;
+      });
+    });
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(first);
+      if (second) cancelAnimationFrame(second);
+    };
+  }, [probe, cb]);
+  return null;
+}
+
 type RendererProps = {
   message: ChatMessage;
   /** 渲染签名（变更触发重渲；不变则 memo 跳过——防闪核心）。*/
@@ -164,7 +199,12 @@ export const MessageRenderer = memo(
       case "user":
         return <UserCard msg={message} cb={cb} failurePresentedBelow={failurePresentedBelow} />;
       case "assistant":
-        return <AssistantCard msg={message} ctx={ctx} cb={cb} tokenUsage={tokenUsage} />;
+        return (
+          <>
+            <FirstTextPaintCommitProbe message={message} cb={cb} />
+            <AssistantCard msg={message} ctx={ctx} cb={cb} tokenUsage={tokenUsage} />
+          </>
+        );
       case "thinking":
         // 单条兜底路径(直接经 MessageRenderer,如测试/非列表场景)。列表内的连续 thinking
         // 由 MessageList/coalesceTeam 合并成单张多段卡,不走这里。

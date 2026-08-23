@@ -208,6 +208,15 @@ export type ChatMessage = {
   ts: number;
   /** turn 结束/最后内容到达时刻。*/
   completedAt?: number;
+  /** Browser-only first-text commit probe. Created only by the live WS path,
+   * consumed after the corresponding assistant DOM has committed, and never persisted. */
+  _firstTextPaintProbe?: {
+    traceId: string;
+    sessionId: string;
+    clientMessageId: string;
+    startedAt: number;
+    backgroundAtFrame: boolean;
+  };
   /**
    * 行的产出来源。`'server'` = 后端 server-authored 行(getSession/listSessions 带回的
    * durable 快照,id 形如 `srv-*`);缺省/`'local'` = 本设备 reducer 就地产出的行。

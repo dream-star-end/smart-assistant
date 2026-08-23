@@ -50,6 +50,7 @@ import { recordTurnTrace, updateTurnTraceDispatch } from "./turnTraces.js";
 import {
   extractFirstVisibleAttribution,
   recordTurnFirstVisible,
+  TurnResponseMilestoneTracker,
 } from "./turnPerformance.js";
 import { GoalStateError } from "../goal/goalStateService.js";
 import { isInMaintenance } from "../middleware/maintenanceMode.js";
@@ -2542,6 +2543,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     let firstUserFrameAtMs: number | null = null;
     let firstContainerFrameAtMs: number | null = null;
     const firstVisibleTraceIds = new Set<string>();
+    const responseMilestoneTracker = new TurnResponseMilestoneTracker();
     const ttftKind: "cold" | "warm" = endpoint.coldStart === true ? "cold" : "warm";
     // plan v3 review v1 §F4 follow-up:per-bridge 最后一次"用户主动声明"的 modelId。
     // 用于在没带 model 字段的后续帧上仍然能用对应 model 校验 grants(防在飞会话
@@ -5005,6 +5007,15 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   clientBuild: clientBuildForConnection,
                 },
               );
+              if (typeof peerIdRaw === "string" && peerIdRaw !== "") {
+                responseMilestoneTracker.begin({
+                  traceId: turnTraceIdForFrame,
+                  sessionId: peerIdRaw,
+                  model: effectiveModelForFrame,
+                  userId: uid,
+                  startedAtMs: receivedAtMs,
+                });
+              }
             }
             // turn 在飞起点:用户已发消息在等响应,心跳在 turn 期间不得 reap(见 MAX_TURN_GRACE_MS 硬上限)。
             turnActiveUntil = Date.now() + MAX_TURN_GRACE_MS;
@@ -7255,6 +7266,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           firstVisible,
         );
       }
+      responseMilestoneTracker.observe(
+        parsedMasterFrameCandidate,
+        deps.pgPool,
+        (message, fields) => bridgeLog?.warn(message, fields),
+      );
       // Phase 0.4 — bridge ring write for stamped outbound frames.
       //
       // Containers stamp `sessionKey + frameSeq` on outbound frames inside

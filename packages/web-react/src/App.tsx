@@ -133,6 +133,7 @@ import {
 import { resolveTutorialAction } from "./lib/tutorialActions";
 import type { TutorialCase, TutorialCaseId } from "./lib/tutorialCaseCatalog";
 import { api, apiErrorMessage } from "./lib/api";
+import { reportClientFriction } from "./lib/clientFriction";
 import {
   effectiveEffortModelId,
   effortForModel,
@@ -1905,6 +1906,21 @@ export function App() {
       onContinue: () => send(CONTINUE_PROMPT),
       onTopUp: demo ? undefined : () => openSettings(),
       onFeedback,
+      onFirstTextPaint: demo
+        ? undefined
+        : (input) => {
+            reportClientFriction({
+              surface: "webchat",
+              stage: "first_text_paint",
+              code: input.backgroundAtFrame
+                ? "FIRST_TEXT_PAINT_AFTER_BACKGROUND"
+                : "FIRST_TEXT_PAINT",
+              outcome: "succeeded",
+              latencyMs: input.latencyMs,
+              traceId: input.traceId,
+              sessionId: input.sessionId,
+            }, authRef.current?.snapshot().token);
+          },
       onRetrySend: demo ? undefined : retrySend,
       onContinueInterrupted: demo ? undefined : continueInterrupted,
       resolveInterruptedContinuation: demo ? undefined : resolveInterruptedContinuation,
