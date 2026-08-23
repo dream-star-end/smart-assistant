@@ -1,0 +1,17 @@
+[Unit]
+Description=OpenClaude H3 worker restricted dual SSH transport
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/libexec/openclaude-h3-tunnel-supervisor.sh
+Restart=on-failure
+# SCNet notebooks can be intentionally offline for hours; retain automatic
+# recovery without creating a restart/journal storm on Connection refused.
+RestartSec=300
+KillMode=control-group
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

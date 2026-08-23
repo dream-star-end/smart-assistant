@@ -7,8 +7,9 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 ExecStart=/usr/local/sbin/openclaude-v5-ocr-tunnel
-Restart=always
-RestartSec=5
+Restart=on-failure
+# Provider maintenance must not create a 5-second restart/journal storm.
+RestartSec=300
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict

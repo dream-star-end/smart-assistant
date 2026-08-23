@@ -5,6 +5,7 @@ import {
   AUTOMATIC_TURN_RETRY_MAX,
   isClientMessageId,
   LOSSLESS_TURN_TAPE_LEGACY_AGENT_ID,
+  losslessBillingAnchorId,
   type CallTokenUsageSnapshot,
   type DurableCodexBilling,
   type TurnWaiveReason,
@@ -1036,12 +1037,30 @@ export function materializeLosslessTurn(
   });
   const logicalRecordIds = records.map((item) => item.id);
   const logicalRecordCount = records.length;
-  const batched = batchRuntimeEventRecords(
-    records,
-    prefix,
-    options.runtimeBatching ?? isLosslessRuntimeBatchingEnabled(),
-  );
-  const billingAnchorId = assistantRecords.at(-1)?.id ?? batched.records.at(-1)!.id;
+  const runtimeBatching = options.runtimeBatching ?? isLosslessRuntimeBatchingEnabled();
+  const batched = batchRuntimeEventRecords(records, prefix, runtimeBatching);
+  const billingAnchorId = losslessBillingAnchorId({
+    sessionId: body.sessionId,
+    agentId: body.agentId,
+    turnIndex: body.turnIndex,
+    status: body.status,
+    createdAt: body.createdAt,
+    clientMessageId: body.clientMessageId,
+    continuationOfTurnKey: body.continuationOfTurnKey,
+    assistantSegments: body.assistantSegments,
+    text: body.text,
+    errorCode: body.errorCode,
+    thinkingText: body.thinkingText,
+    thinkingSegments: body.thinkingSegments,
+    tools: body.tools,
+    agentGroups: body.agentGroups,
+    structuredBlocks: body.structuredBlocks,
+    runtimeEvents: body.runtimeEvents,
+    runtimeBatching,
+  });
+  if (!batched.records.some((item) => item.id === billingAnchorId)) {
+    throw new Error(`turn tape canonical billing anchor is not physical: ${billingAnchorId}`);
+  }
   const engineBillings = [
     ...(body.engineBilling ? [structuredClone(body.engineBilling)] : []),
     ...(body.agentGroups ?? []).flatMap((group) =>

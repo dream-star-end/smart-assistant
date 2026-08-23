@@ -8525,6 +8525,59 @@ export function createPgSessionsBackend(
         const persistedRequestId = (persistedBillings as DurableCodexBilling[])[0]?.requestId
           ?? turn.payload.requestId
           ?? null;
+        const anchorInput = {
+          sessionId: turn.payload.sessionId,
+          agentId: turn.payload.agentId,
+          turnIndex: turn.payload.turnIndex,
+          status: turn.payload.status,
+          createdAt: turn.payload.createdAt,
+          clientMessageId: turn.payload.clientMessageId,
+          continuationOfTurnKey: turn.payload.continuationOfTurnKey,
+          assistantSegments: turn.payload.assistantSegments,
+          text: turn.payload.text,
+          errorCode: turn.payload.errorCode,
+          thinkingText: turn.payload.thinkingText,
+          thinkingSegments: turn.payload.thinkingSegments,
+          tools: turn.payload.tools,
+          agentGroups: turn.payload.agentGroups,
+          structuredBlocks: turn.payload.structuredBlocks,
+          runtimeEvents: turn.payload.runtimeEvents,
+        };
+        // Rolling enable/rollback can temporarily pair a format-2 writer with
+        // a format-3 reader (or the reverse). Accept only the exact authority
+        // derived from the same immutable payload under the opposite physical
+        // batching mode; Phase B atomically publishes/upgrades the canonical one.
+        const alternateBillingAnchorId = losslessBillingAnchorId({
+          ...anchorInput,
+          runtimeBatching: tape.record_storage_format !== 3,
+        });
+        const acceptedPersistedAuthorities: Array<{
+          billingAnchorId: string;
+          requestId?: string | null;
+          engineBillings: unknown;
+        }> = alternateBillingAnchorId === turn.billingAnchorId
+          ? []
+          : [{
+              billingAnchorId: alternateBillingAnchorId,
+              requestId: canonicalRequestId,
+              engineBillings: turn.engineBillings,
+            }];
+        if (
+          turn.payload.continuationOfTurnKey
+          && canonicalRequestId === null
+          && turn.engineBillings.length === 0
+          && persistedBillings.length === 0
+        ) {
+          acceptedPersistedAuthorities.push({
+            billingAnchorId: losslessBillingAnchorId({
+              sessionId: turn.payload.sessionId,
+              agentId: turn.payload.agentId,
+              turnIndex: turn.payload.turnIndex,
+            }),
+            requestId: null,
+            engineBillings: [],
+          });
+        }
         const canonicalSettlementHash = assertSettlementMatchesCanonical({
           canonicalAnchorId: turn.billingAnchorId,
           canonicalRequestId,
@@ -8544,6 +8597,7 @@ export function createPgSessionsBackend(
                 engineBillings: persistedBillings,
               }
             : null,
+          acceptedPersistedAuthorities,
         });
         if (
           persistedBillings.length > 0 &&

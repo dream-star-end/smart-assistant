@@ -394,6 +394,10 @@ export function buildLosslessTurnTapeRequests(
       ? { dispatchId: payload.dispatchId, attemptNo: payload.attemptNo }
       : {}),
   } as const
+  // Anchor identity must be derived from the exact canonical JSON bytes.
+  // serializeLosslessTurnPayload sorts nested object keys; runtime batch ids
+  // hash those bytes, so using the caller's insertion order would diverge.
+  const anchorPayload = JSON.parse(canonical.toString('utf8')) as V3MasterSinkWirePayload & { agentId: string }
   const engineBillings: DurableCodexBilling[] = [
     ...(payload.engineBilling ? [payload.engineBilling] : []),
     ...(payload.agentGroups ?? []).flatMap((group) =>
@@ -403,11 +407,22 @@ export function buildLosslessTurnTapeRequests(
     sessionId: payload.sessionId,
     agentId: payload.agentId,
     turnIndex: payload.turnIndex,
-    assistantSegments: payload.assistantSegments,
-    text: payload.text,
-    errorCode: typeof payload.errorCode === 'string' ? payload.errorCode : undefined,
-    tools: payload.tools,
-    agentGroups: payload.agentGroups,
+    status: payload.status,
+    createdAt,
+    clientMessageId: anchorPayload.clientMessageId,
+    continuationOfTurnKey: anchorPayload.continuationOfTurnKey,
+    assistantSegments: anchorPayload.assistantSegments,
+    text: anchorPayload.text,
+    errorCode: typeof anchorPayload.errorCode === 'string' ? anchorPayload.errorCode : undefined,
+    thinkingText: anchorPayload.thinkingText,
+    thinkingSegments: anchorPayload.thinkingSegments,
+    tools: anchorPayload.tools,
+    agentGroups: anchorPayload.agentGroups,
+    structuredBlocks: anchorPayload.structuredBlocks,
+    runtimeEvents: anchorPayload.runtimeEvents,
+    runtimeBatching: ['1', 'true', 'on'].includes(
+      (process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING ?? '').trim().toLowerCase(),
+    ),
   })
   const visibleText = clipVisibleSettlementText(payload.text)
   const settlement = {

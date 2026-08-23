@@ -2594,6 +2594,12 @@ export async function provisionV3Container(
     // signal and would also change the in-container CLI web-root semantics.
     if (getRuntimeChannel() === "v5") {
       env.push("OC_CONTAINER_PREVIEW_ENABLED=1");
+      const runtimeBatching = process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING?.trim().toLowerCase();
+      if (runtimeBatching === "1" || runtimeBatching === "true" || runtimeBatching === "on") {
+        // Phase A (container writer) and Phase B (master materializer) must pick
+        // the same physical runtime-batch billing anchor.
+        env.push("LOSSLESS_TURN_TAPE_RUNTIME_BATCHING=1");
+      }
     }
     appendCodexRelayEnv(env);
     // Core-memory local semantic recall: forward master embedding knobs

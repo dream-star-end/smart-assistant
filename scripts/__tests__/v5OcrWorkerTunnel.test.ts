@@ -74,3 +74,16 @@ test("OCR supervisor census excludes its own query shell instead of self-matchin
   assert.match(smoke, /\\\$5 ~ \/\^\\\\\/opt/);
   assert.match(smoke, /&& NF == 5/);
 });
+
+
+test("private SCNet tunnels retain automatic recovery with a bounded five-minute backoff", () => {
+  for (const relative of [
+    "packages/commercial/ocr-worker/openclaude-v5-ocr-tunnel.service",
+    "scripts/minimax_h3_worker/openclaude-h3-worker-tunnel.service",
+  ]) {
+    const source = readFileSync(path.join(root, relative), "utf8");
+    assert.match(source, /^Restart=on-failure$/m, relative);
+    assert.match(source, /^RestartSec=300$/m, relative);
+    assert.doesNotMatch(source, /^RestartSec=(?:[0-9]|[1-5][0-9])$/m, relative);
+  }
+});

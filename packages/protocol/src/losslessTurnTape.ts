@@ -6,6 +6,8 @@
  * resource guard; it is not a per-turn data cap.
  */
 
+import { createHash } from 'node:crypto'
+
 export const LOSSLESS_TURN_TAPE_VERSION = 2 as const
 /** Release/runtime capability token. Once any finalized v2 tape exists,
  * deploy tooling must never activate a reader or writer that lacks it. */
@@ -159,30 +161,261 @@ export function losslessRecordPrefix(sessionId: string, agentId: string, turnInd
   return `srv-${idPart}-t${turnIndex}`
 }
 
-/** Canonical billing-anchor record id matching materializeLosslessTurn. */
+/** Minimal record identity needed to choose the physical billing anchor. */
+type LosslessAnchorCandidate = {
+  id: string
+  role: string
+  ts: number
+  eventOrdinal?: number
+  runtime?: {
+    source: 'ccb' | 'codex-jsonrpc' | 'gateway'
+    payloadBytes: Buffer
+    payloadSha256: string
+    bashTail: boolean
+  }
+}
+
+const LOSSLESS_RUNTIME_BATCH_MIN_RECORDS = 4
+const LOSSLESS_RUNTIME_BATCH_MAX_RECORDS = 128
+const LOSSLESS_RUNTIME_BATCH_MAX_BYTES = 512 * 1024
+
+function anchorSha256(value: Buffer | string): string {
+  return createHash('sha256').update(value).digest('hex')
+}
+
+function anchorInt(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : undefined
+}
+
+function anchorString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined
+}
+
+function compareAnchorCandidates(a: LosslessAnchorCandidate, b: LosslessAnchorCandidate): number {
+  const ao = a.eventOrdinal ?? Number.MAX_SAFE_INTEGER
+  const bo = b.eventOrdinal ?? Number.MAX_SAFE_INTEGER
+  if (ao !== bo) return ao - bo
+  if (a.ts !== b.ts) return a.ts - b.ts
+  return a.id.localeCompare(b.id)
+}
+
+function batchRuntimeAnchorCandidates(
+  prefix: string,
+  sorted: LosslessAnchorCandidate[],
+): LosslessAnchorCandidate[] {
+  const physical: LosslessAnchorCandidate[] = []
+  let pending: LosslessAnchorCandidate[] = []
+  let pendingBytes = 0
+  const flush = (): void => {
+    if (pending.length < LOSSLESS_RUNTIME_BATCH_MIN_RECORDS) {
+      physical.push(...pending)
+      pending = []
+      pendingBytes = 0
+      return
+    }
+    let offset = 0
+    const manifest = pending.map((item) => {
+      const runtime = item.runtime!
+      const entry = {
+        id: item.id,
+        eventOrdinal: item.eventOrdinal!,
+        ts: item.ts,
+        source: runtime.source,
+        offset,
+        length: runtime.payloadBytes.length,
+        payloadSha256: runtime.payloadSha256,
+      }
+      offset += runtime.payloadBytes.length
+      return entry
+    })
+    const manifestSha256 = anchorSha256(Buffer.from(JSON.stringify(manifest), 'utf8'))
+    const first = pending[0]!
+    const last = pending.at(-1)!
+    physical.push({
+      id: `${prefix}-runtime-batch-${first.eventOrdinal}-${last.eventOrdinal}-${manifestSha256.slice(0, 12)}`,
+      role: 'runtime-event',
+      ts: first.ts,
+      eventOrdinal: first.eventOrdinal,
+    })
+    pending = []
+    pendingBytes = 0
+  }
+  for (const item of sorted) {
+    const runtime = item.runtime
+    const eligible = item.role === 'runtime-event' && runtime !== undefined && !runtime.bashTail
+    if (!eligible) {
+      flush()
+      physical.push(item)
+      continue
+    }
+    if (
+      pending.length >= LOSSLESS_RUNTIME_BATCH_MAX_RECORDS
+      || (pending.length > 0
+        && pendingBytes + runtime.payloadBytes.length > LOSSLESS_RUNTIME_BATCH_MAX_BYTES)
+    ) flush()
+    if (runtime.payloadBytes.length > LOSSLESS_RUNTIME_BATCH_MAX_BYTES) {
+      physical.push(item)
+      continue
+    }
+    pending.push(item)
+    pendingBytes += runtime.payloadBytes.length
+  }
+  flush()
+  return physical
+}
+
+/**
+ * Canonical physical billing-anchor record id shared by the runtime writer and
+ * master materializer. The helper mirrors record identity/order and optional
+ * runtime batching, so Phase A never hashes a logical id that Phase B cannot
+ * publish as a physical record.
+ */
 export function losslessBillingAnchorId(input: {
   sessionId: string
   agentId: string
   turnIndex: number
+  status?: 'completed' | 'interrupted' | 'crashed'
+  createdAt?: number
+  clientMessageId?: string
+  continuationOfTurnKey?: string
   assistantSegments?: Array<{ index: number }>
   text?: string
   errorCode?: string
-  tools?: Array<{ blockId: string }>
-  agentGroups?: Array<{ runId: string }>
-  structuredBlocks?: Array<{ kind: string; blockId?: string; platformGoalId?: string }>
-  runtimeEvents?: Array<{ ordinal: number }>
+  thinkingText?: string
+  thinkingSegments?: Array<{ index: number; ts?: number; eventOrdinal?: number }>
+  tools?: Array<{ blockId?: unknown; arrivedAt?: unknown; eventOrdinal?: unknown }>
+  agentGroups?: Array<{ runId?: unknown; completedAt?: unknown; _ocEventOrdinal?: unknown }>
+  structuredBlocks?: Array<Record<string, unknown>>
+  runtimeEvents?: Array<{
+    ordinal: number
+    observedAt?: number
+    source?: 'ccb' | 'codex-jsonrpc' | 'gateway'
+    payload?: unknown
+  }>
+  runtimeBatching?: boolean
 }): string {
   const prefix = losslessRecordPrefix(input.sessionId, input.agentId, input.turnIndex)
   const segs = input.assistantSegments
   if (segs && segs.length > 0) return `${prefix}-s${segs[segs.length - 1]!.index}`
   if ((input.text && input.text.length > 0) || input.errorCode) return prefix
-  const groups = input.agentGroups ?? []
-  if (groups.length > 0) return `${prefix}-agentgroup-${groups[groups.length - 1]!.runId}`
+
+  const baseTs = input.createdAt ?? 0
+  const candidates: LosslessAnchorCandidate[] = []
+  const thinking = input.thinkingSegments ?? []
+  if (thinking.length > 0) {
+    for (const segment of thinking) {
+      candidates.push({
+        id: `${prefix}-thinking-s${segment.index}`,
+        role: 'thinking',
+        ts: anchorInt(segment.ts) ?? 0,
+        eventOrdinal: anchorInt(segment.eventOrdinal),
+      })
+    }
+  } else if (input.thinkingText) {
+    candidates.push({
+      id: `${prefix}-thinking`,
+      role: 'thinking',
+      ts: baseTs - (input.tools?.length ?? 0) - 1,
+    })
+  }
+
   const tools = input.tools ?? []
-  if (tools.length > 0) return `${prefix}-tool-${tools[tools.length - 1]!.blockId}`
-  const runtime = input.runtimeEvents ?? []
-  if (runtime.length > 0) return `${prefix}-runtime-${runtime[runtime.length - 1]!.ordinal}`
-  return prefix
+  for (let i = 0; i < tools.length; i++) {
+    const tool = tools[i]!
+    const blockId = anchorString(tool.blockId)
+    if (!blockId) continue
+    candidates.push({
+      id: `${prefix}-tool-${blockId}`,
+      role: 'tool',
+      ts: anchorInt(tool.arrivedAt) ?? (baseTs - tools.length + i),
+      eventOrdinal: anchorInt(tool.eventOrdinal),
+    })
+  }
+
+  for (const group of input.agentGroups ?? []) {
+    const runId = anchorString(group.runId)
+    if (!runId) continue
+    candidates.push({
+      id: `${prefix}-agentgroup-${runId}`,
+      role: 'agent-group',
+      ts: anchorInt(group.completedAt) ?? baseTs,
+      eventOrdinal: anchorInt(group._ocEventOrdinal),
+    })
+  }
+
+  const structured = new Map<
+    string,
+    { kind: 'plan' | 'goal'; blockId: string; events: Array<Record<string, unknown>> }
+  >()
+  for (let ordinal = 0; ordinal < (input.structuredBlocks ?? []).length; ordinal++) {
+    const block = input.structuredBlocks![ordinal]!
+    const kind = block.kind
+    if (kind !== 'plan' && kind !== 'goal') continue
+    const platformGoalId = kind === 'goal' ? anchorString(block.platformGoalId) : undefined
+    const blockId = platformGoalId
+      ? `platform-goal-${platformGoalId}`
+      : anchorString(block.blockId) ?? `${kind}-${ordinal}`
+    const key = `${kind}\0${blockId}`
+    const current = structured.get(key) ?? { kind, blockId, events: [] }
+    current.events.push(block)
+    structured.set(key, current)
+  }
+  for (const [key, group] of structured) {
+    const last = group.events.at(-1)!
+    candidates.push({
+      id: `${prefix}-${group.kind}-${anchorSha256(Buffer.from(key, 'utf8'))}`,
+      role: group.kind,
+      ts: anchorInt(last._ocObservedAt) ?? baseTs,
+      eventOrdinal: anchorInt(last._ocEventOrdinal),
+    })
+  }
+
+  for (const event of input.runtimeEvents ?? []) {
+    const id = `${prefix}-runtime-${event.ordinal}`
+    const observedAt = anchorInt(event.observedAt) ?? baseTs
+    const source = event.source ?? 'gateway'
+    const eventBody = event.payload ?? null
+    const payload: Record<string, unknown> = {
+      id,
+      role: 'runtime-event',
+      text: JSON.stringify(eventBody),
+      ts: observedAt,
+      status: input.status,
+      _runtimeSource: source,
+      _runtimeEvent: eventBody,
+      _ocEventOrdinal: event.ordinal,
+      _hiddenRuntimeEvent: true,
+      ...(input.continuationOfTurnKey
+        ? { _continuationOfTurnKey: input.continuationOfTurnKey }
+        : {}),
+      ...(input.clientMessageId ? { _clientMessageId: input.clientMessageId } : {}),
+    }
+    const payloadBytes = Buffer.from(JSON.stringify(payload), 'utf8')
+    const eventPayload = eventBody && typeof eventBody === 'object' && !Array.isArray(eventBody)
+      ? eventBody as Record<string, unknown>
+      : null
+    candidates.push({
+      id,
+      role: 'runtime-event',
+      ts: observedAt,
+      eventOrdinal: event.ordinal,
+      runtime: {
+        source,
+        payloadBytes,
+        payloadSha256: anchorSha256(payloadBytes),
+        bashTail: eventPayload?.type === 'system'
+          && eventPayload.subtype === 'bash_output_tail',
+      },
+    })
+  }
+
+  candidates.sort(compareAnchorCandidates)
+  const physical = input.runtimeBatching
+    ? batchRuntimeAnchorCandidates(prefix, candidates)
+    : candidates
+  return physical.at(-1)?.id ?? prefix
 }
 
 export type LosslessTurnTapeRequest =
