@@ -3,7 +3,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import type { ComponentProps } from 'react'
 import { afterEach, describe, expect, test, vi } from 'vitest'
 import { workspaceWantPath } from '../../hooks/useAppRoute'
-import { ApiError } from '../../lib/api'
+import { api, ApiError } from '../../lib/api'
 import { createMemoryAuthSession } from '../../lib/authSession'
 import {
   type PipelineStage,
@@ -359,6 +359,7 @@ function sampleStage(over: Partial<PipelineStage> = {}): PipelineStage {
     name: '实现',
     kind: 'ai',
     agentId: 'coding-assistant',
+    model: null,
     promptTemplate: null,
     toolsets: null,
     effort: null,
@@ -988,6 +989,10 @@ describe('流水线 / 阶段配置', () => {
       { id: 'coding-assistant', name: '编码助手' },
       { id: 'research', name: '调研助手' },
     ])
+    vi.spyOn(api, 'getPublicModels').mockResolvedValue([
+      { id: 'glm-5.2', display_name: 'GLM 5.2' },
+      { id: 'deepseek-v4-pro', display_name: 'DeepSeek V4 Pro' },
+    ])
     return { pipeline, stage }
   }
 
@@ -1007,6 +1012,20 @@ describe('流水线 / 阶段配置', () => {
     })
     await screen.findByTestId('stage-editor-s1')
   }
+
+  test('阶段配置能加载模型下拉，留空表示用 agent 默认', async () => {
+    mockStageApis({ model: null })
+    await openStageEditor()
+    const modelSelect = screen.getByLabelText('模型覆盖') as HTMLSelectElement
+    const values = [...modelSelect.options].map((o) => o.value)
+    const labels = [...modelSelect.options].map((o) => o.textContent)
+    expect(values).toContain('')
+    expect(values).toContain('glm-5.2')
+    expect(values).toContain('deepseek-v4-pro')
+    expect(labels.some((t) => t?.includes('留空'))).toBe(true)
+    expect(modelSelect.value).toBe('')
+    expect(api.getPublicModels).toHaveBeenCalled()
+  })
 
   test('阶段配置能加载 agent 下拉，hidden agent 不出现', async () => {
     mockStageApis()
@@ -1047,6 +1066,7 @@ describe('流水线 / 阶段配置', () => {
         agentId: 'research',
         promptTemplate: '新提示词',
         patrolCron: '0 10 * * 1-5',
+        model: null,
       }),
     )
     expect(patchStage.mock.calls[0]?.[1]).toBe('s1')

@@ -249,6 +249,8 @@ export interface PipelineStage {
   name: string
   kind: StageKind
   agentId: string | null
+  /** null = 沿用 agent 默认模型。 */
+  model: string | null
   promptTemplate: string | null
   toolsets: string[] | null
   effort: string | null
@@ -428,6 +430,7 @@ export interface StageCreateInput {
   kind: StageKind
   ordinal?: number
   agentId?: string | null
+  model?: string | null
   promptTemplate?: string | null
   toolsets?: string[] | null
   effort?: string | null
@@ -616,6 +619,7 @@ export interface TemplateStageSnapshot {
   name: string
   kind: StageKind
   agentId: string | null
+  model: string | null
   promptTemplate: string | null
   toolsets: string[] | null
   effort: string | null
@@ -754,6 +758,8 @@ const VALIDATION_ZH: Array<{ test: (msg: string) => boolean; zh: string }> = [
     zh: `无活动超时不能超过 ${DELEGATE_IDLE_TIMEOUT_MAX_SEC} 秒（45 分钟）`,
   },
   { test: (m) => /invalid kind/i.test(m), zh: '阶段类型只能是 AI、人工或闸门' },
+  { test: (m) => /model not available/i.test(m), zh: '该模型当前不可用，请换一个或留空用 agent 默认' },
+  { test: (m) => /model catalog unavailable/i.test(m), zh: '模型目录暂时不可用，稍后再改模型覆盖' },
   { test: (m) => /invalid ticketType/i.test(m), zh: '单据类型无效' },
   { test: (m) => /cannot delete builtin template/i.test(m), zh: '内置模板不能删除' },
   {

@@ -101,6 +101,8 @@ export interface PatrolDelegateInput {
   context?: string
   toolsets?: string[] | null
   effort?: string | null
+  /** 阶段级模型覆盖;undefined = 沿用 agent 默认。 */
+  model?: string
   sessionKey: string
   timeoutSec: number
 }
@@ -596,6 +598,7 @@ export class PatrolEngine {
           goal: prompt,
           toolsets: stage.toolsets,
           effort: stage.effort,
+          model: stage.model ?? undefined,
           sessionKey,
           timeoutSec: stage.timeoutSec,
         })

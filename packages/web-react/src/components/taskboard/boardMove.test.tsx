@@ -53,6 +53,7 @@ function sampleStage(over: Partial<PipelineStage> = {}): PipelineStage {
     name: '复现确认',
     kind: 'ai',
     agentId: 'coding-assistant',
+    model: null,
     promptTemplate: null,
     toolsets: null,
     effort: null,

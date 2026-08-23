@@ -11736,6 +11736,7 @@ export class Gateway {
       toolsets: input.toolsets ?? undefined,
       depth: 0,
       effort: input.effort ?? undefined,
+      model: input.model,
       sessionKey: input.sessionKey,
       channel: 'taskboard',
       idleTimeoutMs: input.timeoutSec * 1_000,

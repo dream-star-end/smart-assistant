@@ -12,6 +12,10 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { filterUserVisibleAgentsForManagement, isHiddenSystemAgentId } from '../agentVisibility.js'
 import { verifyJwt } from '../auth.js'
+import {
+  ModelCatalogUnavailableError,
+  getLocalCatalogView,
+} from '../modelCatalogClient.js'
 import { createActivity, listActivities } from './db/activity.js'
 import { createComment, listComments } from './db/comments.js'
 import { COST_GROUP_BY, queryCostStats, ymdRangeMs } from './db/costStats.js'
@@ -173,6 +177,11 @@ export interface TaskboardHttpContext {
   jwtSecret?: string
   isCommercialJwt?: (token: string) => boolean
   listAgents?: () => Promise<BoardAgent[]>
+  /**
+   * 阶段 model 覆盖是否在当前 catalog 投影里且 available。
+   * 测试注入;生产省略则走 getLocalCatalogView().isRoutable。
+   */
+  isAvailableStageModel?: (modelId: string) => boolean | Promise<boolean>
 }
 
 export interface ResolveActorOptions {
@@ -557,6 +566,10 @@ function mapHttpError(res: ServerResponse, err: unknown): boolean {
     sendError(res, 400, err.message, { code: 'validation' })
     return true
   }
+  if (err instanceof ModelCatalogUnavailableError) {
+    sendError(res, 503, err.message, { code: 'model_catalog_unavailable' })
+    return true
+  }
   if (err instanceof TaskboardCrossProjectError) {
     sendError(res, 422, err.message, { code: 'cross_project' })
     return true
@@ -721,7 +734,7 @@ async function dispatch(
   if (pipelineStages) {
     const id = decodeURIComponent(pipelineStages[1])
     if (method === 'GET') return handleListStages(res, db, id)
-    if (method === 'POST') return handleCreateStage(res, await readJsonBody(req), db, id)
+    if (method === 'POST') return handleCreateStage(res, await readJsonBody(req), db, id, ctx)
     return sendError(res, 405, 'method not allowed')
   }
 
@@ -737,7 +750,7 @@ async function dispatch(
   if (stageItem) {
     const id = decodeURIComponent(stageItem[1])
     if (method === 'GET') return handleGetStage(res, db, id)
-    if (method === 'PATCH') return handlePatchStage(res, await readJsonBody(req), db, id, actor)
+    if (method === 'PATCH') return handlePatchStage(res, await readJsonBody(req), db, id, actor, ctx)
     return sendError(res, 405, 'method not allowed')
   }
 
@@ -2123,10 +2136,35 @@ const STAGE_OPS_FIELDS = [
   'autoClose',
   'promptTemplate',
   'toolsets',
+  'model',
 ] as const
 
 function stagePatchTouchesOps(body: Record<string, unknown>): boolean {
   return STAGE_OPS_FIELDS.some((key) => Object.hasOwn(body, key))
+}
+
+/** 空串 / 空白 = 清除覆盖。undefined = 请求没带这个字段。 */
+function normalizeStageModelInput(value: unknown): string | null | undefined {
+  const raw = asNullableString(value)
+  if (raw === undefined) return undefined
+  if (raw === null) return null
+  const trimmed = raw.trim()
+  return trimmed === '' ? null : trimmed
+}
+
+async function defaultIsAvailableStageModel(modelId: string): Promise<boolean> {
+  const view = await getLocalCatalogView()
+  return view.isRoutable(view.canonicalize(modelId))
+}
+
+async function assertStageModelAvailable(
+  modelId: string,
+  ctx: TaskboardHttpContext,
+): Promise<void> {
+  const ok = ctx.isAvailableStageModel
+    ? await ctx.isAvailableStageModel(modelId)
+    : await defaultIsAvailableStageModel(modelId)
+  if (!ok) throw new TaskboardValidationError(`model not available: ${modelId}`)
 }
 
 function validateStageWrite(input: {
@@ -2165,12 +2203,13 @@ function throwIfStageOrdinalConflict(err: unknown): void {
   }
 }
 
-function handleCreateStage(
+async function handleCreateStage(
   res: ServerResponse,
   body: Record<string, unknown>,
   db: TaskboardDb,
   pipelineId: string,
-): void {
+  ctx: TaskboardHttpContext,
+): Promise<void> {
   if (!getPipeline(db, pipelineId)) throw new TaskboardNotFound('pipeline', pipelineId)
   const name = asString(body.name)
   const kindRaw = asString(body.kind)
@@ -2187,6 +2226,8 @@ function handleCreateStage(
   const patrolCron = asNullableString(body.patrolCron) ?? null
   const entryCondition = asNullableString(body.entryCondition)
   const timeoutSec = typeof body.timeoutSec === 'number' ? body.timeoutSec : undefined
+  const model = normalizeStageModelInput(body.model) ?? null
+  if (model) await assertStageModelAvailable(model, ctx)
   validateStageWrite({
     kind,
     agentId,
@@ -2204,6 +2245,7 @@ function handleCreateStage(
       name,
       kind,
       agentId,
+      model,
       promptTemplate,
       toolsets: asNullableStringArray(body.toolsets) ?? null,
       effort: asNullableString(body.effort) ?? null,
@@ -2262,13 +2304,14 @@ function handleReorderStages(
   }
 }
 
-function handlePatchStage(
+async function handlePatchStage(
   res: ServerResponse,
   body: Record<string, unknown>,
   db: TaskboardDb,
   id: string,
   actor: Actor,
-): void {
+  ctx: TaskboardHttpContext,
+): Promise<void> {
   const existing = getStage(db, id)
   if (!existing) throw new TaskboardNotFound('stage', id)
   if (actor !== 'human' && stagePatchTouchesOps(body)) {
@@ -2287,6 +2330,8 @@ function handlePatchStage(
     body.patrolCron === undefined ? existing.patrolCron : asNullableString(body.patrolCron)
   const entryCondition = asNullableString(body.entryCondition)
   const timeoutSec = typeof body.timeoutSec === 'number' ? body.timeoutSec : existing.timeoutSec
+  const model = Object.hasOwn(body, 'model') ? normalizeStageModelInput(body.model) : undefined
+  if (model) await assertStageModelAvailable(model, ctx)
   validateStageWrite({
     kind,
     agentId,
@@ -2302,6 +2347,7 @@ function handlePatchStage(
       name: asString(body.name),
       kind: asString(body.kind) as StageKind | undefined,
       agentId: asNullableString(body.agentId),
+      model,
       promptTemplate: asNullableString(body.promptTemplate),
       toolsets: asNullableStringArray(body.toolsets),
       effort: asNullableString(body.effort),

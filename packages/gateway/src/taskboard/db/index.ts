@@ -61,6 +61,10 @@ export function migrate(db: TaskboardDb): void {
     if (current < 2) {
       db.exec(TASKBOARD_DDL_V2)
     }
+    if (current < 3) {
+      // v3:阶段级模型覆盖。可空 = 沿用 agent 默认模型。已有行保持 NULL,不丢数据。
+      db.exec('ALTER TABLE tb_pipeline_stage ADD COLUMN model TEXT')
+    }
     db.pragma(`user_version = ${TASKBOARD_SCHEMA_VERSION}`)
     ensureSettingsRow(db)
   })

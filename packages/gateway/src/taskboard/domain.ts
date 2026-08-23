@@ -213,8 +213,13 @@ export interface PipelineStage {
   /** kind='ai' 时必填。 */
   agentId: string | null
   /**
+   * 覆盖该阶段 agent 的默认模型。null = 沿用 agent.model。
+   * 非空必须是当前 model catalog 投影里存在且 available 的 id。
+   */
+  model: string | null
+  /**
    * 提示词模板。占位符:{{ticket.identifier}} {{ticket.title}} {{ticket.body}}
-   * {{last_run.summary}} {{comments}} {{stage.exit_checklist}}。
+   * {{last_run.summary}} {{last_run.output}} {{comments}} {{stage.exit_checklist}}。
    */
   promptTemplate: string | null
   /** 该阶段允许的工具集;null = 用 agent 默认。 */

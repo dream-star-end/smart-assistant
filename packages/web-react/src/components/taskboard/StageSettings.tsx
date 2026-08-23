@@ -1,6 +1,6 @@
 import { ChevronDown, ChevronUp, GripVertical, Plus, Workflow } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { AuthEpochStaleError } from '../../lib/api'
+import { api, AuthEpochStaleError } from '../../lib/api'
 import { buildSchedule, cronHuman } from '../../lib/cron'
 import {
   type BoardAgent,
@@ -26,7 +26,7 @@ import {
   taskboardApi,
   taskboardErrorMessage,
 } from '../../lib/taskboard'
-import type { AuthSession } from '../../lib/types'
+import type { AuthSession, PublicModel } from '../../lib/types'
 import {
   Badge,
   Button,
@@ -88,6 +88,7 @@ interface StageDraft {
   name: string
   kind: StageKind
   agentId: string
+  model: string
   promptTemplate: string
   toolsets: string
   effort: string
@@ -113,6 +114,7 @@ function draftFromStage(stage: PipelineStage): StageDraft {
     name: stage.name,
     kind: stage.kind,
     agentId: stage.agentId ?? '',
+    model: stage.model ?? '',
     promptTemplate: stage.promptTemplate ?? '',
     toolsets: (stage.toolsets ?? []).join(', '),
     effort: stage.effort ?? '',
@@ -179,6 +181,7 @@ function buildStagePatch(draft: StageDraft): { patch: StagePatchInput; error: st
     name,
     kind,
     agentId: kind === 'ai' ? draft.agentId : null,
+    model: kind === 'ai' ? blankToNull(draft.model) : null,
     promptTemplate:
       kind === 'ai' ? blankToNull(draft.promptTemplate) : draft.promptTemplate.trim() || null,
     toolsets: parseToolsets(draft.toolsets),
@@ -202,14 +205,20 @@ function buildStagePatch(draft: StageDraft): { patch: StagePatchInput; error: st
   return { patch, error: null }
 }
 
+function modelLabel(m: PublicModel): string {
+  return typeof m.display_name === 'string' && m.display_name.trim() ? m.display_name : m.id
+}
+
 function StageEditor({
   stage,
   agents,
+  models,
   saving,
   onSave,
 }: {
   stage: PipelineStage
   agents: BoardAgent[]
+  models: PublicModel[]
   saving: boolean
   onSave: (patch: StagePatchInput) => Promise<boolean>
 }) {
@@ -236,6 +245,18 @@ function StageEditor({
     }
     return opts
   }, [agents, ai, draft.agentId])
+
+  const modelOptions = useMemo(() => {
+    const available = models.filter((m) => m.degraded !== true)
+    const opts = [
+      { value: '', label: '留空=用 agent 默认' },
+      ...available.map((m) => ({ value: m.id, label: modelLabel(m) })),
+    ]
+    if (draft.model && !opts.some((o) => o.value === draft.model)) {
+      opts.push({ value: draft.model, label: `${draft.model}（当前覆盖，不在可选列表）` })
+    }
+    return opts
+  }, [models, draft.model])
 
   const save = async () => {
     const { patch, error } = buildStagePatch(draft)
@@ -279,8 +300,21 @@ function StageEditor({
         />
       </Field>
       <Field
+        label="模型"
+        hint={ai ? '留空则沿用该 agent 的默认模型。选项来自 GET /api/public/models。' : '仅 AI 阶段可覆盖模型'}
+      >
+        <Select
+          aria-label="模型覆盖"
+          inputSize="sm"
+          value={draft.model}
+          disabled={!ai}
+          onValueChange={(v) => setDraft((d) => ({ ...d, model: v }))}
+          options={modelOptions}
+        />
+      </Field>
+      <Field
         label="提示词模板"
-        hint="可用 {{ticket.identifier}} {{ticket.title}} {{ticket.body}} {{last_run.summary}} {{comments}}"
+        hint="可用 {{ticket.identifier}} {{ticket.title}} {{ticket.body}} {{last_run.summary}} {{last_run.output}} {{comments}}"
       >
         <Textarea
           aria-label="提示词模板"
@@ -501,6 +535,7 @@ export function StageSettings({
   const [saving, setSaving] = useState(false)
   const [bundles, setBundles] = useState<PipelineBundle[]>([])
   const [agents, setAgents] = useState<BoardAgent[]>([])
+  const [models, setModels] = useState<PublicModel[]>([])
   const [expanded, setExpanded] = useState<string | null>(null)
   const [editingStageId, setEditingStageId] = useState<string | null>(null)
   const [newPipeName, setNewPipeName] = useState('')
@@ -526,19 +561,22 @@ export function StageSettings({
     if (!projectId) {
       setBundles([])
       setAgents([])
+      setModels([])
       return
     }
     const gate = (epoch.current += 1)
     setLoading(true)
     try {
-      const [pipes, agentList] = await Promise.all([
+      const [pipes, agentList, modelList] = await Promise.all([
         taskboardApi.listPipelines(auth, projectId),
         taskboardApi.listAgents(auth),
+        api.getPublicModels(auth).catch(() => [] as PublicModel[]),
       ])
       const details = await Promise.all(pipes.map((p) => taskboardApi.getPipeline(auth, p.id)))
       if (!mounted.current || epoch.current !== gate) return
       setBundles(details.map((d) => ({ pipeline: d.pipeline, stages: d.stages.slice() })))
       setAgents(agentList)
+      setModels(modelList)
       setRename(Object.fromEntries(details.map((d) => [d.pipeline.id, d.pipeline.name])))
       setExpanded((cur) => cur ?? details[0]?.pipeline.id ?? null)
       setDataGen((n) => n + 1)
@@ -882,6 +920,7 @@ export function StageSettings({
                           key={`${stage.id}:${dataGen}`}
                           stage={stage}
                           agents={agents}
+                          models={models}
                           saving={saving}
                           onSave={(patch) => saveStage(stage.id, patch)}
                         />

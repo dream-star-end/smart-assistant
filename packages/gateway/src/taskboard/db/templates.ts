@@ -34,6 +34,7 @@ export interface TemplateStageSnapshot {
   name: string
   kind: StageKind
   agentId: string | null
+  model: string | null
   promptTemplate: string | null
   toolsets: string[] | null
   effort: string | null
@@ -87,6 +88,7 @@ function snapshotFromBuiltin(t: BuiltinPipelineTemplate): PipelineTemplate {
       name: s.name,
       kind: s.kind,
       agentId: s.agentId,
+      model: null,
       promptTemplate: s.promptTemplate,
       toolsets: null,
       effort: s.effort,
@@ -117,6 +119,7 @@ function snapshotFromStage(stage: PipelineStage): TemplateStageSnapshot {
     name: stage.name,
     kind: stage.kind,
     agentId: stage.agentId,
+    model: stage.model,
     promptTemplate: stage.promptTemplate,
     toolsets: stage.toolsets,
     effort: stage.effort,
@@ -312,6 +315,7 @@ function applyCustomTemplate(
         name: stage.name,
         kind: stage.kind,
         agentId: stage.agentId,
+        model: stage.model,
         promptTemplate: stage.promptTemplate,
         toolsets: stage.toolsets,
         effort: stage.effort,

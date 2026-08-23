@@ -2,6 +2,7 @@ import '@testing-library/jest-dom/vitest'
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import type { ReactElement } from 'react'
 import { afterEach, describe, expect, test, vi } from 'vitest'
+import { api } from '../../lib/api'
 import { createMemoryAuthSession } from '../../lib/authSession'
 import {
   type CostTotals,
@@ -80,6 +81,7 @@ function sampleTemplate(over: Partial<PipelineTemplate> = {}): PipelineTemplate 
         name: '复现确认',
         kind: 'ai',
         agentId: null,
+        model: null,
         promptTemplate: null,
         toolsets: null,
         effort: null,
@@ -114,6 +116,7 @@ function sampleStage(over: Partial<PipelineStage> = {}): PipelineStage {
     name: '复现确认',
     kind: 'human',
     agentId: null,
+    model: null,
     promptTemplate: null,
     toolsets: null,
     effort: null,
@@ -465,6 +468,7 @@ describe('阶段拖拽排序', () => {
     vi.spyOn(taskboardApi, 'listPipelines').mockResolvedValue([pipeline])
     vi.spyOn(taskboardApi, 'getPipeline').mockResolvedValue({ pipeline, stages: [s1, s2] })
     vi.spyOn(taskboardApi, 'listAgents').mockResolvedValue([])
+    vi.spyOn(api, 'getPublicModels').mockResolvedValue([])
     const reorderStages = vi
       .spyOn(taskboardApi, 'reorderStages')
       .mockResolvedValue({ ok: true, items: [s2, s1] })
