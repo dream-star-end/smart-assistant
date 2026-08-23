@@ -86,6 +86,7 @@ function emitStep(event) {
       if (typeof event.pageImageInputs === 'number' && Number.isFinite(event.pageImageInputs)) payload.pageImageInputs = Math.round(event.pageImageInputs);
       if (typeof event.imageTitleHits === 'number' && Number.isFinite(event.imageTitleHits)) payload.imageTitleHits = Math.round(event.imageTitleHits);
       if (typeof event.imageIconHits === 'number' && Number.isFinite(event.imageIconHits)) payload.imageIconHits = Math.round(event.imageIconHits);
+      if (typeof event.imageTextHits === 'number' && Number.isFinite(event.imageTextHits)) payload.imageTextHits = Math.round(event.imageTextHits);
       if (typeof event.selected === 'number' && Number.isFinite(event.selected)) payload.selected = Math.round(event.selected);
       if (typeof event.freshSelected === 'number' && Number.isFinite(event.freshSelected)) payload.freshSelected = Math.round(event.freshSelected);
       if (typeof event.imgCount === 'number' && Number.isFinite(event.imgCount)) payload.imgCount = Math.round(event.imgCount);
@@ -1378,6 +1379,32 @@ async function awaitFileChooser(page, clickable) {
   ]);
   return chooser;
 }
+async function uniqueExactText(root, text) {
+  if (!root || typeof root.locator !== 'function' || !text) return null;
+  const nodes = root.locator('xpath=.//*[normalize-space()="' + text + '"]');
+  if (!nodes || typeof nodes.count !== 'function' || typeof nodes.nth !== 'function') return null;
+  const matches = [];
+  const total = Math.min(await nodes.count().catch(() => 0), 20);
+  for (let index = 0; index < total; index += 1) {
+    const node = nodes.nth(index);
+    if (await visible(node)) matches.push(node);
+  }
+  return matches.length === 1 ? matches[0] : null;
+}
+async function smallVisibleAncestor(input) {
+  if (!input || typeof input.locator !== 'function') return null;
+  for (let depth = 1; depth <= 5; depth += 1) {
+    const node = input.locator('xpath=ancestor::*[' + depth + ']');
+    if (await node.count() !== 1) continue;
+    if (!await visible(node)) continue;
+    const box = await node.evaluate((el) => {
+      const r = el.getBoundingClientRect();
+      return { w: r.width, h: r.height };
+    }).catch(() => null);
+    if (box && box.w >= 8 && box.w <= 96 && box.h >= 8 && box.h <= 96) return node;
+  }
+  return null;
+}
 async function clickableImageToolFromInput(input) {
   if (!input || typeof input.locator !== 'function') return null;
   const queries = [
@@ -1389,10 +1416,10 @@ async function clickableImageToolFromInput(input) {
     const node = input.locator(query);
     if (await node.count() === 1 && await visible(node)) return node;
   }
-  return null;
+  return smallVisibleAncestor(input);
 }
 async function imageToolControl(scope, page, scopedInput) {
-  const labeled = await exactMenuItem(scope, '图片');
+  const labeled = await exactMenuItem(scope, '图片') || await uniqueExactText(scope, '图片') || await uniqueExactText(scope, '相册');
   if (labeled) return labeled;
   for (const root of [scope, page]) {
     const titled = await uniqueVisibleClickable(root, '[title="图片"], [aria-label="图片"]');
@@ -1402,7 +1429,7 @@ async function imageToolControl(scope, page, scopedInput) {
   }
   const fromInput = await clickableImageToolFromInput(scopedInput);
   if (fromInput) return fromInput;
-  return await exactMenuItem(page, '图片');
+  return await exactMenuItem(page, '图片') || await uniqueExactText(page, '图片');
 }
 async function preparePostImageChooser(page, editor) {
   const scope = (await composerScope(editor)) || page;
@@ -1412,6 +1439,7 @@ async function preparePostImageChooser(page, editor) {
   const beforePage = await countImageFileInputs(page);
   const imageTitleHits = await countVisibleLocator(scope, '[title="图片"], [aria-label="图片"]');
   const imageIconHits = await countVisibleLocator(scope, 'i.woo-font--image, i.woo-font--pic, i.woo-font--picture');
+  const imageTextHits = await countVisibleLocator(scope, 'xpath=.//*[normalize-space()="图片"]');
   let branch = 'miss';
   let chooser = null;
   if (image) {
@@ -1508,6 +1536,7 @@ async function preparePostImageChooser(page, editor) {
     pageImageInputs: beforePage.image,
     imageTitleHits,
     imageIconHits,
+    imageTextHits,
     hits: afterScope.image,
     mediaCount: afterPage.image,
   });
