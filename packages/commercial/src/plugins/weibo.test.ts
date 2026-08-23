@@ -197,7 +197,7 @@ describe('official Weibo Plugin', () => {
   })
 
   test('pins the current artifact and only the exact production predecessor', () => {
-    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.20')
+    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.21')
     assert.equal(WEIBO_DRIVER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.equal(WEIBO_LAUNCHER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.deepEqual(WEIBO_SETUP_COMPATIBLE_PREDECESSORS, [
@@ -450,6 +450,9 @@ describe('official Weibo Plugin', () => {
     assert.match(WEIBO_WORKER_SOURCE, /woo-font--image/)
     assert.match(WEIBO_WORKER_SOURCE, /woo-font--picture/)
     assert.match(WEIBO_WORKER_SOURCE, /imageTitleHits/)
+    assert.match(WEIBO_WORKER_SOURCE, /clickableImageToolFromInput/)
+    assert.match(WEIBO_WORKER_SOURCE, /scopedInput && !image/)
+    assert.match(WEIBO_WORKER_SOURCE, /force: true/)
     assert.match(WEIBO_WORKER_SOURCE, /countImageFileInputs/)
     assert.match(WEIBO_WORKER_SOURCE, /step: 'media.chooser'/)
     assert.match(WEIBO_WORKER_SOURCE, /step: 'media.upload'/)
@@ -895,6 +898,137 @@ describe('official Weibo Plugin', () => {
       /media/,
     )
     assert.deepEqual(events, [])
+  })
+
+  test('create_post force-clicks the composer file input when 图片 is absent', async () => {
+    const events: string[] = []
+    const empty = { count: async () => 0, nth: () => ({}) }
+    const fileInput = {
+      setInputFiles: async () => events.push('upload-direct'),
+      evaluate: async (
+        fn: (node: { isConnected: boolean; files: { length: number } }) => unknown,
+      ) => fn({ isConnected: true, files: { length: events.includes('upload') ? 1 : 0 } }),
+      getAttribute: async () => 'image/*',
+      click: async (options?: { trial?: boolean }) => {
+        if (!options?.trial) events.push('input-click')
+      },
+      locator: () => empty,
+    }
+    const composer = {
+      count: async () => 1,
+      locator: (selector: string) => {
+        if (selector === 'input[type="file"]') return { count: async () => 1, nth: () => fileInput }
+        if (selector === 'img') return uploadedImageLocator(events)
+        return empty
+      },
+    }
+    const textarea = {
+      fill: async () => {},
+      inputValue: async () => (events.includes('click') ? '' : 'hello'),
+      locator: (selector: string) => (String(selector).includes('发送') ? composer : empty),
+    }
+    const send = {
+      click: async (options: { trial?: boolean }) => {
+        if (!options.trial) events.push('click')
+      },
+    }
+    const harness = compileWorkerPostHarness({
+      ensureSelfId: async () => '12345',
+      gotoAuthenticated: async () => {},
+      collectPosts: async () =>
+        events.includes('upload') ? [{ id: 'native-input', owned: true, text: 'hello' }] : [],
+      uniqueVisible: async () => textarea,
+      assertNoChallenge: async () => {},
+      awaitDispatch: async () => events.push('dispatch'),
+      exactMenuItem: async (_page: unknown, text: string) => (text === '发送' ? send : null),
+      cleanText: (value: unknown) => String(value).trim(),
+      readFile: async () => Buffer.from('image'),
+    })
+    const page = {
+      locator: (selector: string) => {
+        if (selector === 'img') return uploadedImageLocator(events)
+        return empty
+      },
+      waitForEvent: async () => {
+        events.push('filechooser')
+        return {
+          setFiles: async () => events.push('upload'),
+          element: () => fileInput,
+        }
+      },
+      waitForTimeout: async () => {},
+    }
+    const result = await harness.writeAction(page, {
+      actionId: 'create_post',
+      params: {
+        text: 'hello',
+        mediaManifest: [{ inputId: 'asset-1', filename: 'image.png', mimeType: 'image/png' }],
+      },
+    })
+    assert.deepEqual(result, { post: { id: 'native-input', owned: true, text: 'hello' } })
+    assert.ok(events.includes('input-click'))
+    assert.ok(events.includes('filechooser'))
+    assert.ok(events.indexOf('dispatch') < events.indexOf('upload'))
+    assert.equal(events.includes('upload-direct'), false)
+  })
+
+  test('create_post does not dispatch an unarmed composer file input', async () => {
+    const events: string[] = []
+    const empty = { count: async () => 0, nth: () => ({}) }
+    const fileInput = {
+      setInputFiles: async () => events.push('upload'),
+      evaluate: async (
+        fn: (node: { isConnected: boolean; files: { length: number } }) => unknown,
+      ) => fn({ isConnected: true, files: { length: 0 } }),
+      getAttribute: async () => 'image/*',
+      click: async (options?: { trial?: boolean }) => {
+        if (!options?.trial) events.push('input-click')
+      },
+      locator: () => empty,
+    }
+    const composer = {
+      count: async () => 1,
+      locator: (selector: string) => {
+        if (selector === 'input[type="file"]') return { count: async () => 1, nth: () => fileInput }
+        return empty
+      },
+    }
+    const textarea = {
+      fill: async () => {},
+      inputValue: async () => 'hello',
+      locator: (selector: string) => (String(selector).includes('发送') ? composer : empty),
+    }
+    const harness = compileWorkerPostHarness({
+      ensureSelfId: async () => '12345',
+      gotoAuthenticated: async () => {},
+      collectPosts: async () => [],
+      uniqueVisible: async () => textarea,
+      assertNoChallenge: async () => {},
+      awaitDispatch: async () => events.push('dispatch'),
+      exactMenuItem: async () => null,
+      cleanText: (value: unknown) => String(value).trim(),
+      readFile: async () => Buffer.from('unused'),
+    })
+    const page = {
+      locator: () => empty,
+      waitForEvent: async () => {
+        events.push('filechooser')
+        throw new Error('filechooser should not open')
+      },
+      waitForTimeout: async () => {},
+    }
+    await assert.rejects(
+      harness.writeAction(page, {
+        actionId: 'create_post',
+        params: {
+          text: 'hello',
+          mediaManifest: [{ inputId: 'asset-1', filename: 'image.png', mimeType: 'image/png' }],
+        },
+      }),
+      /media/,
+    )
+    assert.equal(events.includes('dispatch'), false)
+    assert.equal(events.includes('upload'), false)
   })
 
   test('create_post uses a unique hidden composer file input without a native chooser', async () => {
