@@ -146,6 +146,23 @@ async function parsePdf(filePath: string): Promise<ParseResult | null> {
   }
 }
 
+/** text/plain → UTF-8 markdown。把当前附件内容直接投影进本轮 prompt，避免
+ * Agent 在持久 uploads 目录里靠 mtime/grep 猜文件。NUL 或非法 UTF-8 仍回退 Read，
+ * 不把伪装成 .txt 的二进制污染上下文。 */
+async function parsePlaintext(filePath: string): Promise<ParseResult | null> {
+  try {
+    const buffer = await readFile(filePath)
+    if (buffer.includes(0)) return null
+    const value = new TextDecoder('utf-8', { fatal: true }).decode(buffer)
+    if (!value.trim()) return null
+    const { markdown, truncated } = truncate(value)
+    return { markdown, truncated, parser: 'plaintext' }
+  } catch (err) {
+    log.warn('plaintext parse failed', { filePath }, err)
+    return null
+  }
+}
+
 /** MIME → 可解析的解析器(返回 null 表示不支持,走 Read 回退)。 */
 export async function parseDocument(
   filePath: string,
@@ -162,6 +179,9 @@ export async function parseDocument(
   }
   if (mimeType === 'application/pdf' || filePath.toLowerCase().endsWith('.pdf')) {
     return parsePdf(filePath)
+  }
+  if (mimeType === 'text/plain' || filePath.toLowerCase().endsWith('.txt')) {
+    return parsePlaintext(filePath)
   }
   return null
 }
