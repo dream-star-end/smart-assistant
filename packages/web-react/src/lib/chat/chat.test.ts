@@ -8988,3 +8988,52 @@ describe("send_to_agent background card", () => {
     expect(group?._completed).toBeFalsy();
   });
 });
+
+describe("send_to_agent exact job correlation", () => {
+  test("two identical goals bind to their own background cards", () => {
+    const s = sess();
+    s._sendingInFlight = true;
+    for (const [seq, blockId] of [[1, "tool-same-a"], [2, "tool-same-b"]] as const) {
+      applyOutboundMessage(s, msgFrame({ frameSeq: seq, blocks: [{
+        kind: "tool_use",
+        toolName: "mcp__openclaude-memory__send_to_agent",
+        blockId,
+        inputJson: { agentId: "research-assistant", message: "同一个目标" },
+      }] }));
+    }
+    for (const [seq, runId, jobId] of [[3, "run-a", "dlgjob-a"], [4, "run-b", "dlgjob-b"]] as const) {
+      applyOutboundMessage(s, msgFrame({ frameSeq: seq, blocks: [{
+        kind: "delegate_progress",
+        runId,
+        jobId,
+        agentId: "research-assistant",
+        goal: "同一个目标",
+        phase: "start",
+      }] }));
+    }
+    for (const [seq, blockId, jobId] of [[5, "tool-same-a", "dlgjob-a"], [6, "tool-same-b", "dlgjob-b"]] as const) {
+      applyOutboundMessage(s, msgFrame({ frameSeq: seq, blocks: [{
+        kind: "tool_result",
+        toolUseBlockId: blockId,
+        output: JSON.stringify({ status: "running", jobId }),
+      }] }));
+    }
+    let groups = s.messages.filter((message) => message.role === "agent-group");
+    expect(groups).toHaveLength(2);
+    expect(s.messages.filter((message) => message.role === "delegate-progress")).toHaveLength(0);
+    expect(new Set(groups.map((group) => group._delegateRunId))).toEqual(new Set(["run-a", "run-b"]));
+
+    for (const [seq, runId, jobId] of [[7, "run-a", "dlgjob-a"], [8, "run-b", "dlgjob-b"]] as const) {
+      applyOutboundMessage(s, msgFrame({ frameSeq: seq, blocks: [{
+        kind: "delegate_progress",
+        runId,
+        jobId,
+        agentId: "research-assistant",
+        goal: "同一个目标",
+        phase: "done",
+      }] }));
+    }
+    groups = s.messages.filter((message) => message.role === "agent-group");
+    expect(groups.every((group) => group._completed)).toBe(true);
+  });
+});

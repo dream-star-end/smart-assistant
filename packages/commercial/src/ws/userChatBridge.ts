@@ -8456,8 +8456,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         // nobody will send that frame — preserve would occupy the 10-slot cap
         // for the 7-day orphan TTL, and allocate() restores those rows into
         // the in-process scheduler before every new grok turn.
-        const billingChannelDead =
-          finalCause === "container_close" || finalCause === "container_error";
+        // A websocket `error` is transport evidence, not proof that the
+        // container process/turn died. Preserve the durable Grok lease so a
+        // reconnecting bridge can still settle it. An explicit close retains
+        // the existing terminal cleanup; vanished-container/journal reapers are
+        // the fallback for an actual crash.
+        const billingChannelDead = finalCause === "container_close";
         const preserveGrokSlot =
           state.engine === "grok" && state.turnForwarded && !billingChannelDead;
         releaseCodexTurnState(state, "bridge_cleanup", !state.turnForwarded, preserveGrokSlot);

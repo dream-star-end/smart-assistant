@@ -210,7 +210,8 @@ export class ModelCatalogClient {
   private snapshot: Snapshot | null = null
   private inflight: Promise<LocalCatalogView> | null = null
   private routingInflight: Promise<LocalCatalogView> | null = null
-  private agentOverrideInflight: Promise<LocalCatalogView> | null = null
+  /** Every full catalog fetch, regardless of caller, shares this single flight. */
+  private catalogFetchInflight: Promise<LocalCatalogView> | null = null
   /** 最近一次**全量拉到** agent_cost_overrides 的时刻。epoch 验证通过不算。 */
   private agentOverridesVerifiedAt = 0
   private lkgLoaded = false
@@ -343,11 +344,7 @@ export class ModelCatalogClient {
     ) {
       return cached.view
     }
-    if (this.agentOverrideInflight) return this.agentOverrideInflight
-    this.agentOverrideInflight = this.fetchCatalog().finally(() => {
-      this.agentOverrideInflight = null
-    })
-    return this.agentOverrideInflight
+    return this.fetchCatalog()
   }
 
   /** 测试用:清空内存态(不动 LKG 文件)。 */
@@ -355,7 +352,7 @@ export class ModelCatalogClient {
     this.snapshot = null
     this.inflight = null
     this.routingInflight = null
-    this.agentOverrideInflight = null
+    this.catalogFetchInflight = null
     this.agentOverridesVerifiedAt = 0
     this.lkgLoaded = false
     this.pricingUpgradeAttempted = false
@@ -394,6 +391,11 @@ export class ModelCatalogClient {
             // 旧 master 仍无单价字段时继续用已验 epoch 的快照,只是 cost 保持 0。
           }
         }
+        // A concurrent full fetch may have committed after this epoch check
+        // captured `cached`. Never let the late validation write the old view
+        // back over that newer snapshot/LKG authority.
+        const current = this.snapshot
+        if (current && current.view !== cached.view) return current.view
         // 旧 LKG 没有 agent_cost_overrides 字段时不在这里强拉:
         // epoch 相等就沿用快照,补价按「没拿到字段」fail-closed。
         // 禁止为了拿 1.000 去破坏「epoch 未变不重拉全量」的新鲜度契约。
@@ -412,12 +414,18 @@ export class ModelCatalogClient {
   }
 
   private async fetchCatalog(): Promise<LocalCatalogView> {
-    const body = await this.getJson(MODEL_CATALOG_PATH)
-    const view = parseCatalogResponse(body)
-    this.snapshot = { view, verifiedAt: this.now() }
-    this.agentOverridesVerifiedAt = this.now()
-    this.persistLkg(view)
-    return view
+    if (this.catalogFetchInflight) return this.catalogFetchInflight
+    this.catalogFetchInflight = (async () => {
+      const body = await this.getJson(MODEL_CATALOG_PATH)
+      const view = parseCatalogResponse(body)
+      this.snapshot = { view, verifiedAt: this.now() }
+      this.agentOverridesVerifiedAt = this.now()
+      this.persistLkg(view)
+      return view
+    })().finally(() => {
+      this.catalogFetchInflight = null
+    })
+    return this.catalogFetchInflight
   }
 
   private async fetchCatalogState(): Promise<{

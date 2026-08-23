@@ -17,6 +17,7 @@ import {
   SEED_AGENT_IDS,
   listSeedStageNames,
   seedDefaultPipelines,
+  stageSeedId,
 } from '../db/seed.js'
 
 const dirs: string[] = []
@@ -148,12 +149,47 @@ describe('seedDefaultPipelines', () => {
     assert.equal(second.createdStages, 0)
     assert.equal(second.skippedPipelines, 4)
     assert.equal(second.skippedStages, first.createdStages)
+    assert.equal(second.upgradedStages, 0)
     assert.equal(listPipelines(db, project.id).length, 4)
     const stageCount = listPipelines(db, project.id).reduce(
       (n, pipe) => n + listStages(db, pipe.id).length,
       0,
     )
     assert.equal(stageCount, first.createdStages)
+    db.close()
+  })
+
+  it('只升级未被用户修改的旧内置 prompt,保留自定义 prompt', () => {
+    const db = freshDb()
+    const project = createProject(db, { key: 'OCV5', name: 'V5' })
+    seedDefaultPipelines(db, project.id)
+
+    const untouchedId = stageSeedId(project.id, 'bug', 0)
+    const customId = stageSeedId(project.id, 'bug', 1)
+    const stages = listStages(db, `${project.id}.pipeline.bug`)
+    const previousPrompt = stages
+      .find((stage) => stage.id === untouchedId)!
+      .promptTemplate!
+      .replace(' {{last_run.output}}', '')
+    db.prepare('UPDATE tb_pipeline_stage SET prompt_template = ? WHERE id = ?').run(
+      previousPrompt,
+      untouchedId,
+    )
+    db.prepare('UPDATE tb_pipeline_stage SET prompt_template = ? WHERE id = ?').run(
+      '用户自定义模板,不要覆盖',
+      customId,
+    )
+
+    const result = seedDefaultPipelines(db, project.id)
+    assert.equal(result.upgradedStages, 1)
+    assert.match(
+      (db.prepare('SELECT prompt_template FROM tb_pipeline_stage WHERE id = ?').get(untouchedId) as { prompt_template: string }).prompt_template,
+      /\{\{last_run\.output\}\}/,
+    )
+    assert.equal(
+      (db.prepare('SELECT prompt_template FROM tb_pipeline_stage WHERE id = ?').get(customId) as { prompt_template: string }).prompt_template,
+      '用户自定义模板,不要覆盖',
+    )
     db.close()
   })
 })

@@ -138,7 +138,7 @@ describe('resolveDelegateCostUsd — engine-reported delegate 结果', () => {
         cost.costUsd != null && cost.costUsd > 0,
         `${model} delegate cost_usd should be > 0, got ${cost.costUsd}`,
       )
-      assert.equal(cost.costImprecise, false)
+      assert.equal(cost.costImprecise, true)
     }
   })
 
@@ -168,6 +168,18 @@ describe('resolveDelegateCostUsd — engine-reported delegate 结果', () => {
     assert.equal(cost.costImprecise, false)
   })
 
+  test('resumable aggregate keeps an earlier imprecise turn sticky', async () => {
+    const cost = await resolveDelegateCostUsd({
+      totalCostUSD: 0.3538614,
+      totalInputTokens: 58_817,
+      totalOutputTokens: 5_924,
+      model: 'glm-5.3-zai',
+      costImprecise: true,
+    })
+    assert.equal(cost.costUsd, 0.3538614)
+    assert.equal(cost.costImprecise, true)
+  })
+
   test('查不到单价 → 保持 0/null,不编造', async () => {
     _setPlatformPricingLookupForTests(async () => null)
     const cost = await resolveDelegateCostUsd({
@@ -180,7 +192,7 @@ describe('resolveDelegateCostUsd — engine-reported delegate 结果', () => {
       isError: false,
     })
     assert.equal(cost.costUsd, null)
-    assert.equal(cost.costImprecise, false)
+    assert.equal(cost.costImprecise, true)
   })
 })
 

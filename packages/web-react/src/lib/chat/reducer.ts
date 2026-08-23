@@ -204,6 +204,18 @@ function isRunningBackgroundToolResult(output?: string, outputJson?: unknown): b
   return false;
 }
 
+function backgroundDelegateJobId(output?: string, outputJson?: unknown): string | null {
+  for (const raw of [outputJson, output]) {
+    const parsed = parseJsonObject(raw)
+    const direct = typeof parsed?.jobId === "string" ? parsed.jobId : null
+    if (direct) return direct
+    const wrapped = parsed ? extractMcpContentText(parsed) : null
+    const inner = parseJsonObject(wrapped)
+    if (typeof inner?.jobId === "string") return inner.jobId
+  }
+  return null
+}
+
 function normalizeDelegateGoalKey(raw: unknown): string {
   return String(raw ?? "")
     .replace(/\r\n?/g, "\n")
@@ -458,7 +470,19 @@ function appendSubagentBlock(
 }
 
 /** 严格唯一 (agentId, goal) 把 delegate run 绑回 leader 的 delegate_task 卡。*/
-function bindDelegateRunToGroup(sess: ChatSession, block: { agentId?: string; goal?: string; runId: string }): string | null {
+function bindDelegateRunToGroup(sess: ChatSession, block: { agentId?: string; goal?: string; jobId?: string; runId: string }): string | null {
+  if (block.jobId) {
+    const exact = sess.messages.filter((m) =>
+      m.role === "agent-group" && !isServerAuthoredRow(m) && m._delegate &&
+      !m._delegateRunId && m._delegateJobId === block.jobId,
+    )
+    if (exact.length === 1) {
+      exact[0]._delegateRunId = block.runId
+      if (!sess._delegateRunGroups) sess._delegateRunGroups = new Map()
+      sess._delegateRunGroups.set(block.runId, exact[0].id)
+      return exact[0].id
+    }
+  }
   const agentId = block.agentId || "";
   const goal = typeof block.goal === "string" ? block.goal : "";
   if (!agentId || !goal) return null;
@@ -572,6 +596,8 @@ function matchesDelegateProgress(groupMsg: ChatMessage, progress: ChatMessage): 
   if (isImmutableTapeViewportRow(progress)) return false;
   // live progress 只绑本地富卡,不落到 server 骨架行(债A：骨架行无过程树,不接收 childBlocks)。
   if (isServerAuthoredRow(groupMsg)) return false;
+  if (progress._delegateJobId && groupMsg._delegateJobId === progress._delegateJobId) return true;
+  if (progress._delegateJobId && groupMsg._delegateJobId && groupMsg._delegateJobId !== progress._delegateJobId) return false;
   if (progress.runId && groupMsg._delegateRunId === progress.runId) return true;
   if (groupMsg._delegateRunId && progress.runId && groupMsg._delegateRunId !== progress.runId) return false;
   const agentId = groupMsg._delegateAgentId || "";
@@ -827,6 +853,7 @@ type DelegateProgressBlock = {
   toolName?: string;
   isError?: boolean;
   goal?: string;
+  jobId?: string;
   block?: OutboundContentBlock;
   usageRunId?: string;
   usage?: NonNullable<ChatSession["_liveTurnUsage"]>["usage"];
@@ -1145,6 +1172,7 @@ function handleDelegateProgressBlock(
       _delegateRunId: block.runId,
       _delegateAgentId: block.agentId || "",
       _delegateGoal: goalRaw ? normalizeDelegateGoalKey(goalRaw) : "",
+      _delegateJobId: typeof block.jobId === "string" ? block.jobId : undefined,
       _completed: false,
       ...(turnOwnerId ? { _turnOwnerId: turnOwnerId } : {}),
     });
@@ -1165,6 +1193,7 @@ function handleDelegateProgressBlock(
       agentId: block.agentId || "",
       goal: typeof block.goal === "string" ? block.goal : "",
       _delegateGoal: typeof block.goal === "string" ? normalizeDelegateGoalKey(block.goal) : "",
+      _delegateJobId: typeof block.jobId === "string" ? block.jobId : undefined,
       entries: [],
       childBlocks: [],
       _completed: false,
@@ -1952,6 +1981,11 @@ export function applyOutboundMessage(
           if (isRunningBackgroundToolResult(rawOutput, rb.outputJson)) {
             groupMsg._background = true;
             groupMsg._completed = false;
+            const jobId = backgroundDelegateJobId(rawOutput, rb.outputJson)
+            if (jobId) {
+              groupMsg._delegateJobId = jobId
+              adoptStandaloneDelegateRun(sess, groupMsg)
+            }
           } else {
             groupMsg._completed = true;
             groupMsg._duration = Date.now() - (groupMsg.startTime || Date.now());

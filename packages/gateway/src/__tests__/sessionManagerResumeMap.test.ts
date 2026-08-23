@@ -21,6 +21,7 @@ type ResumeMapInternals = {
   _resumeMapTimestamps: Map<string, number>
   _resumeMapProvider: Map<string, string>
   _resumeMapLastCost: Map<string, number>
+  _resumeMapCostImprecise: Map<string, boolean>
   _resumeMapWrite: Promise<void>
   _loadResumeMap: () => void
   _saveResumeMap: () => void
@@ -35,7 +36,7 @@ test('CCB resume map rebuilds obsolete history contexts while preserving current
       'ccb-legacy-string': 'legacy-ccb-id',
       'ccb-unversioned': { id: 'unversioned-ccb-id', ts: 10 },
       'ccb-old-version': { id: 'old-ccb-id', ts: 20, historyContextVersion: 0 },
-      'ccb-current': { id: 'current-ccb-id', ts: 30, historyContextVersion: 1 },
+      'ccb-current': { id: 'current-ccb-id', ts: 30, historyContextVersion: 1, costImprecise: true },
       'codex-unversioned': { id: 'codex-thread-id', ts: 40, provider: 'codex' },
     }))
 
@@ -46,6 +47,7 @@ test('CCB resume map rebuilds obsolete history contexts while preserving current
     internals._resumeMapTimestamps.clear()
     internals._resumeMapProvider.clear()
     internals._resumeMapLastCost.clear()
+    internals._resumeMapCostImprecise.clear()
     internals._loadResumeMap()
 
     assert.equal(internals._resumeMap.has('ccb-legacy-string'), false)
@@ -53,6 +55,7 @@ test('CCB resume map rebuilds obsolete history contexts while preserving current
     assert.equal(internals._resumeMap.has('ccb-old-version'), false)
     assert.equal(internals._resumeMap.get('ccb-current'), 'current-ccb-id')
     assert.equal(internals._resumeMapProvider.get('ccb-current'), 'ccb')
+    assert.equal(internals._resumeMapCostImprecise.get('ccb-current'), true)
     assert.equal(internals._resumeMap.get('codex-unversioned'), 'codex-thread-id')
     assert.equal(internals._resumeMapProvider.get('codex-unversioned'), 'codex')
 
@@ -61,6 +64,7 @@ test('CCB resume map rebuilds obsolete history contexts while preserving current
     const saved = JSON.parse(readFileSync(path, 'utf8')) as Record<string, Record<string, unknown>>
     assert.equal(saved['ccb-current']?.historyContextVersion, 1)
     assert.equal(saved['ccb-current']?.provider, undefined)
+    assert.equal(saved['ccb-current']?.costImprecise, true)
     assert.equal(saved['codex-unversioned']?.historyContextVersion, undefined)
     assert.equal(saved['codex-unversioned']?.provider, 'codex')
   } finally {

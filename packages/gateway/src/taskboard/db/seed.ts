@@ -18,9 +18,10 @@
 //     (no_open_blockers / has_body_section / …),不要写中文散文,解析会失败。
 //   - 本函数不创建项目;调用方先 createProject 再 seed。
 
+import { createHash } from 'node:crypto'
 import type { TicketType } from '../domain.js'
 import { GUARDRAIL_DEFAULTS } from '../domain.js'
-import { createPipeline, createStage, getPipeline, getStage } from './pipelines.js'
+import { createPipeline, createStage, getPipeline, getStage, updateStage } from './pipelines.js'
 import type { TaskboardDb } from './schema.js'
 import { TaskboardNotFound } from './schema.js'
 
@@ -377,6 +378,7 @@ export interface SeedResult {
   createdStages: number
   skippedPipelines: number
   skippedStages: number
+  upgradedStages: number
 }
 
 export function builtinTemplateId(type: TicketType): string {
@@ -417,13 +419,44 @@ export function listBuiltinPipelineTemplates(): BuiltinPipelineTemplate[] {
 
 export function getBuiltinPipelineTemplate(idOrType: string): BuiltinPipelineTemplate | null {
   const type = parseBuiltinTemplateId(idOrType) ?? (idOrType as TicketType)
-  return listBuiltinPipelineTemplates().find((t) => t.ticketType === type) ?? null
+  return listBuiltinPipelineTemplates().find((template) => template.ticketType === type) ?? null
 }
 
+const LEGACY_PROMPT_HASHES_BEFORE_LAST_RUN_OUTPUT = new Set([
+  'c779d6d1614d530927c44b672a64120ff3744fea606727f29618e4c0013f3c4c',
+  '58d04f260424ce47b0028d596b7307298da0cf12e0655beea0a1f73408de7c2f',
+  '351a77ae14039f64aba49ac8c53b05c265dc43d922fa33d04dd5dc6c519e3b5e',
+  'bcc0e81edf4e921f9e0b1ad0eaeb81ca1b3c39f80b4c80a28907e4f48d753950',
+  '590e8f33b7579fc38c5eb1685700344315cb40934a867b24463bb0cfde0692e1',
+  '96c72555a27cbd2340eebb460f28184a5efe6917dac25a41e07593f61786e4d6',
+  '9e494a8510ef0ccdbecce3a0faed4edf4bcbea8591be5994031b254ff274004e',
+  '309fda823e76e7c6865314929654d7a27b12aa86527d12dc71ba2c64bdad3204',
+  '689a1d474fc65adff89ecaf3d116f1f817e9e1e3ac74abd1c2824778f08f92d4',
+  '17a598be5227212470f94c9d3ea14a8c5780838d1ab1e8f422ab1dbf32569421',
+  'eef9d1d29dde9f068d1d5675c7d53c27a7ee1ce9057054e6e9c5f7ed3d893e39',
+  '441801ee9e43fa79821aa2b00b20236b97f8668952cf5f221d284a1259eda17c',
+  'c04f25992493b9bab094a6d574d1541704438c959cce36b1076a587b2bc336f6',
+])
+
 /**
- * 给项目种默认流水线。types 缺省 = 四种全种;传入子集则只种那些类型。
- * 幂等:已有确定性 id 的 pipeline/stage 跳过,不覆盖用户改过的提示词。
+ * One frozen migration: deterministic IDs prove seed ownership and the fixed
+ * legacy hashes prove the user never edited the prompt. Future template edits
+ * cannot widen this CAS boundary.
  */
+function upgradeUnmodifiedSeedPrompt(
+  db: TaskboardDb,
+  stageId: string,
+  currentPrompt: string | null,
+): boolean {
+  if (!currentPrompt?.includes('{{last_run.output}}')) return false
+  const existing = getStage(db, stageId)
+  if (!existing?.promptTemplate) return false
+  const hash = createHash('sha256').update(existing.promptTemplate).digest('hex')
+  if (!LEGACY_PROMPT_HASHES_BEFORE_LAST_RUN_OUTPUT.has(hash)) return false
+  updateStage(db, stageId, { promptTemplate: currentPrompt })
+  return true
+}
+
 export function seedDefaultPipelines(
   db: TaskboardDb,
   projectId: string,
@@ -442,6 +475,7 @@ export function seedDefaultPipelines(
     createdStages: 0,
     skippedPipelines: 0,
     skippedStages: 0,
+    upgradedStages: 0,
   }
 
   const seed = db.transaction(() => {
@@ -464,6 +498,9 @@ export function seedDefaultPipelines(
         const sid = stageSeedId(projectId, pipe.type, ordinal)
         if (getStage(db, sid)) {
           result.skippedStages += 1
+          if (upgradeUnmodifiedSeedPrompt(db, sid, stage.promptTemplate)) {
+            result.upgradedStages += 1
+          }
           return
         }
         const isAi = stage.kind === 'ai'

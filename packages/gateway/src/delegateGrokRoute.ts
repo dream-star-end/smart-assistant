@@ -20,6 +20,19 @@ const MINT_TIMEOUT_MS = 10_000
 const RENEW_RELEASE_TIMEOUT_MS = 5_000
 const MAX_RESPONSE_BYTES = 32 * 1024
 const HEARTBEAT_INTERVAL_MS = 60_000
+const RELEASE_RETRY_MIN_MS = 1_000
+const RELEASE_RETRY_MAX_MS = 30_000
+
+// At most the durable Grok route cap can be present here. Timers are unrefed so
+// cleanup improves a live gateway without delaying process shutdown.
+const pendingReleaseTasks = new Map<string, Promise<void>>()
+
+function sleepUnref(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms)
+    timer.unref?.()
+  })
+}
 const SESSION_ID_RE = /^[A-Za-z0-9_:@.-]{1,128}$/
 
 export interface DelegateGrokRouteLease {
@@ -83,6 +96,50 @@ function errorText(result: FetchResult): string {
   return result.text.slice(0, 200)
 }
 
+function scheduleReleaseUntilAck(args: {
+  fetcher: typeof undiciRequest
+  baseUrl: string
+  bearer: string
+  routeToken: string
+  log: DelegateGrokRouteLog
+  retryMs: number
+}): void {
+  if (pendingReleaseTasks.has(args.routeToken)) return
+  const task = (async () => {
+    let delayMs = Math.max(1, args.retryMs)
+    let warned = false
+    for (;;) {
+      try {
+        const result = await postJson(
+          args.fetcher,
+          `${args.baseUrl}${RELEASE_PATH}`,
+          args.bearer,
+          { routeToken: args.routeToken },
+          RENEW_RELEASE_TIMEOUT_MS,
+        )
+        // Unknown/already-expired is deliberately returned as HTTP 200.
+        if (result.statusCode === 200) return
+        if (!warned) {
+          warned = true
+          args.log.warn('delegate_grok_route_release_deferred', { status: result.statusCode })
+        }
+      } catch (err) {
+        if (!warned) {
+          warned = true
+          args.log.warn('delegate_grok_route_release_deferred', { err: String(err) })
+        } else {
+          args.log.debug?.('delegate_grok_route_release_retry_failed', { err: String(err) })
+        }
+      }
+      await sleepUnref(delayMs)
+      delayMs = Math.min(Math.max(RELEASE_RETRY_MIN_MS, delayMs * 2), RELEASE_RETRY_MAX_MS)
+    }
+  })().finally(() => {
+    pendingReleaseTasks.delete(args.routeToken)
+  })
+  pendingReleaseTasks.set(args.routeToken, task)
+}
+
 export async function acquireDelegateGrokRoute(args: {
   modelId: string
   sessionId?: string
@@ -90,6 +147,8 @@ export async function acquireDelegateGrokRoute(args: {
   env?: NodeJS.ProcessEnv
   fetcher?: typeof undiciRequest
   heartbeatMs?: number
+  /** Test seam; production starts at one second and backs off to 30 seconds. */
+  releaseRetryMs?: number
 }): Promise<DelegateGrokRouteAcquire> {
   const env = args.env ?? process.env
   const baseUrl = env.OPENCLAUDE_V3_MASTER_BASE_URL?.replace(/\/+$/, '')
@@ -174,27 +233,17 @@ export async function acquireDelegateGrokRoute(args: {
           clearInterval(heartbeat)
           heartbeat = null
         }
-        // Bounded idempotent retry: a dropped cleanup would hold a durable
-        // grok_route_contexts row (7-day TTL) against the account cap.
-        // Never rejects — a finished turn must not fail on cleanup.
-        let lastErr: unknown = null
-        for (let attempt = 0; attempt < 3; attempt += 1) {
-          try {
-            const result = await postJson(
-              fetcher,
-              `${baseUrl}${RELEASE_PATH}`,
-              bearer,
-              { routeToken },
-              RENEW_RELEASE_TIMEOUT_MS,
-            )
-            if (result.statusCode === 200) return
-            lastErr = new Error(`release HTTP ${result.statusCode}`)
-          } catch (err) {
-            lastErr = err
-          }
-          if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 250))
-        }
-        args.log.warn('delegate_grok_route_release_failed', { err: String(lastErr) })
+        // Completion must stay fast for the user. A transient master deploy must
+        // also not turn this into a seven-day durable slot leak, so cleanup keeps
+        // retrying in the live gateway until the idempotent endpoint acknowledges.
+        scheduleReleaseUntilAck({
+          fetcher,
+          baseUrl,
+          bearer,
+          routeToken,
+          log: args.log,
+          retryMs: args.releaseRetryMs ?? RELEASE_RETRY_MIN_MS,
+        })
       },
     }
     return { ok: true, lease }
