@@ -8,6 +8,10 @@
 //   ① exactText——最终正文精确为“2”(引擎真执行了题目,而非任意占位文本);
 //   ② sawFinal —— outbound.message{isFinal:true} 干净收尾帧(webchat turn 终止契约);
 //   ③ sawCost  —— outbound.cost_charged 计费到账(REQUIRE_COST=0 才放宽)。
+// exactText 优先来自本连接 WS `blocks[].kind==='text'`；CCB/OpenCode Go 短答常
+// 只把正文写进 tape、WS 只给空 blocks 的 isFinal + cost。final+cost 已齐但缺
+// text 时,短轮询 GET /api/sessions/:id(timeline 投影)认 assistant.text==="2",
+// 避免把已计费的成功 turn 判成 TURN_INCOMPLETE。
 // 与本次 peer + clientMessageId 精确匹配的 error 帧
 // (outbound.error/outbound.turn_error/error)= 立即失败；同账号其它会话帧忽略。
 //
@@ -26,6 +30,8 @@
 //   OC_CANARY_TURNSTILE_TOKEN(默认 'x' —— 依赖 canary 邮箱在线上 TURNSTILE_BYPASS_ACCOUNTS
 //     账号白名单里;换机时把新 canary 邮箱加进该 env 键即可,不要再打开全局旁路)
 //   V5_CANARY_REQUIRE_COST(默认 1;canary 账号落免单套餐时置 0 放宽计费断言)
+//   V5_CANARY_TAPE_TEXT_GRACE_MS(默认 8000;final+cost 已齐但 WS 无 text 时轮询
+//     session GET 的最长等待。测试可压到几十毫秒)
 // 退出码:0=turn 三信号齐全;1=失败(错误帧/收尾或计费缺失/重试耗尽);2=配置错误;
 //   3=仅缺 live cost frame,且已输出供 deploy 精确核验的 candidate ledger proof。
 import { createRequire } from 'node:module'
@@ -56,6 +62,19 @@ const TURNSTILE_TOKEN = process.env.OC_CANARY_TURNSTILE_TOKEN ?? 'x'
 // 落在"零边际成本/免单"套餐(finalizer 不产 cost_charged)时,才用 V5_CANARY_REQUIRE_COST=0
 // 显式放宽(runbook 记载),避免计费断言把此类账号的部署门永久卡住。
 const REQUIRE_COST = (process.env.V5_CANARY_REQUIRE_COST ?? '1') !== '0'
+const TAPE_TEXT_GRACE_MS = Number(process.env.V5_CANARY_TAPE_TEXT_GRACE_MS ?? 8_000)
+const TAPE_TEXT_POLL_MS = Number(process.env.V5_CANARY_TAPE_TEXT_POLL_MS ?? 250)
+
+function extractAssistantText(body) {
+  const messages = Array.isArray(body?.messages) ? body.messages : []
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]
+    if (m?.role === 'assistant' && typeof m.text === 'string' && m.text.trim()) {
+      return m.text.trim()
+    }
+  }
+  return ''
+}
 
 let password
 try {
@@ -108,7 +127,10 @@ const attempt = () => new Promise((resolve) => {
   let finalText = ''
   let silence
   let ledgerCostGrace
+  let tapeTextGrace
+  let tapeTextPoll
   let settled = false
+  let textVia = 'ws'
   const exactText = () => finalText === '2'
   const criteriaMet = () => exactText() && sawFinal && (sawCost || !REQUIRE_COST)
   const finish = (reason) => {
@@ -116,8 +138,39 @@ const attempt = () => new Promise((resolve) => {
     settled = true
     clearTimeout(silence)
     clearTimeout(ledgerCostGrace)
+    clearTimeout(tapeTextGrace)
+    clearInterval(tapeTextPoll)
     try { ws.close() } catch {}
-    resolve({ reason, sawText, sawFinal, sawCost, sawError, finalText })
+    resolve({ reason, sawText, sawFinal, sawCost, sawError, finalText, textVia })
+  }
+  const readTapeAssistantText = async () => {
+    const res = await fetch(`${BASE}/api/sessions/${peerId}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+    if (!res.ok) return ''
+    return extractAssistantText(await res.json())
+  }
+  const armTapeTextEvidence = () => {
+    if (tapeTextPoll || tapeTextGrace || sawError || exactText()) return
+    if (!sawFinal || (REQUIRE_COST && !sawCost)) return
+    const tryOnce = async () => {
+      if (settled) return
+      try {
+        const text = await readTapeAssistantText()
+        if (text === '2') {
+          sawText = true
+          finalText = text
+          textVia = 'tape'
+          finish('complete')
+        }
+      } catch { /* 轮询失败继续,直到 grace */ }
+    }
+    void tryOnce()
+    tapeTextPoll = setInterval(() => { void tryOnce() }, TAPE_TEXT_POLL_MS)
+    tapeTextGrace = setTimeout(() => {
+      clearInterval(tapeTextPoll)
+      if (!settled) finish('tape-miss')
+    }, TAPE_TEXT_GRACE_MS)
   }
   const resetSilence = () => {
     clearTimeout(silence)    // 冷启动/长思考兜底:静默兜底关连接,真正判成靠下方三信号
@@ -144,17 +197,24 @@ const attempt = () => new Promise((resolve) => {
     if (f.type === 'outbound.message') {
       if (!ownTurn) return
       resetSilence()
+      let frameHadText = false
       for (const b of f.blocks ?? []) {
         if (b.kind === 'text' && b.text?.trim()) {
           sawText = true
+          frameHadText = true
           answerText += b.text
         }
+      }
+      if (!frameHadText && typeof f.text === 'string' && f.text.trim()) {
+        sawText = true
+        answerText += f.text
       }
       if (f.isFinal === true) {
         sawFinal = true   // 干净收尾信号(cost_charged 在其后广播)
         // WebChat 正常路径会先逐块流正文,再发 blocks=[] 的 final 终止帧；
         // final-with-content 的早拒绝路径也存在。两者都按本次连接累积出的最终正文断言。
         finalText = answerText.trim()
+        armTapeTextEvidence()
         if (
           ALLOW_LEDGER_COST_EVIDENCE &&
           REQUIRE_COST &&
@@ -175,6 +235,7 @@ const attempt = () => new Promise((resolve) => {
       // CCB cost 广播当前不带 peer/clientMessageId；保留原计费 smoke 契约。
       resetSilence()
       sawCost = true
+      armTapeTextEvidence()
     }
     if (f.type === 'outbound.error' || f.type === 'outbound.turn_error' || f.type === 'error') {
       if (!ownTurn) return
@@ -193,7 +254,7 @@ for (let i = 1; i <= ATTEMPTS; i++) {
   if (result.sawError) { console.error(`turn-canary: TURN_FAILED ${result.sawError}`); process.exit(1) }
   const criteriaMet = result.finalText === '2' && result.sawFinal && (result.sawCost || !REQUIRE_COST)
   if (criteriaMet) {
-    console.log(`turn-canary: TURN_OK model=${MODEL} exact_text=2 final=${result.sawFinal} cost_charged=${result.sawCost}`)
+    console.log(`turn-canary: TURN_OK model=${MODEL} exact_text=2 final=${result.sawFinal} cost_charged=${result.sawCost} via=${result.textVia}`)
     process.exit(0)
   }
   if (
