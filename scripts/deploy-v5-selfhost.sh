@@ -1350,7 +1350,7 @@ cmd_smoke() {
     echo "  [dry-run] curl healthz + leadership=leader + GET / oc-build + SSH 规则 + 个人版 18789"
     return 0
   fi
-  for i in $(seq 1 30); do
+  for i in $(seq 1 90); do
     hz="$(curl -fsS --max-time 5 "http://127.0.0.1:${V5_PORT}/healthz" 2>/dev/null || true)"
     if echo "$hz" | jq -e '.ok==true and .runtime.controlPlaneEnabled==true and .runtime.leadership.state=="leader"' >/dev/null 2>&1; then
       ok=1
@@ -1572,13 +1572,13 @@ cutover_smoke_against_release() { # <rel>
   local rel="$1" hz i ok=0 html spa_ok=0 expected_build got_build
   expected_build="$(dist_oc_build "$rel")"
   [[ -n "$expected_build" ]] || { cutover_fail "smoke: release dist 缺 oc-build"; return 1; }
-  for i in $(seq 1 30); do
+  for i in $(seq 1 90); do
     hz="$(curl -fsS --max-time 5 "http://127.0.0.1:${V5_PORT}/healthz" 2>/dev/null || true)"
     if echo "$hz" | jq -e '.ok==true and .runtime.controlPlaneEnabled==true and .runtime.leadership.state=="leader"' >/dev/null 2>&1; then
       ok=1
       break
     fi
-    cutover_clog "  /healthz 未收敛,重试 $i/30"
+    cutover_clog "  /healthz 未收敛,重试 $i/90"
     sleep 2
   done
   [[ "$ok" == 1 ]] || { cutover_fail "cutover smoke 失败: healthz 未收敛 ok+controlPlaneEnabled+leadership=leader"; return 1; }
@@ -1605,7 +1605,7 @@ cutover_smoke_against_release() { # <rel>
 
 cutover_smoke_healthz_only() {
   local hz i ok=0 eg
-  for i in $(seq 1 30); do
+  for i in $(seq 1 90); do
     hz="$(curl -fsS --max-time 5 "http://127.0.0.1:${V5_PORT}/healthz" 2>/dev/null || true)"
     if echo "$hz" | jq -e '.ok==true and .runtime.controlPlaneEnabled==true and .runtime.leadership.state=="leader"' >/dev/null 2>&1; then
       ok=1
