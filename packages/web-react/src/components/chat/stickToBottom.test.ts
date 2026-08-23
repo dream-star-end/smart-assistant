@@ -48,4 +48,23 @@ describe("stickToBottom", () => {
     stick.onScroll(el);
     expect(stick.following.current).toBe(false);
   });
+
+  test("流式增高不能掩盖用户正在离开底部", () => {
+    const stick = createStickToBottomController();
+    const el = scroller({ scrollHeight: 1000, scrollTop: 920, clientHeight: 80 });
+    stick.scrollToBottom(el);
+
+    // A late card grows and the ResizeObserver writes the new bottom before
+    // its scroll event is delivered. The user's first upward move can then
+    // have a numerically larger scrollTop than the controller's old sample,
+    // even though the viewport is now 8px away from the new bottom.
+    el.scrollHeight = 1300;
+    el.scrollTop = 1212;
+    stick.markUserIntent();
+    stick.onScroll(el);
+
+    expect(el.scrollTop).toBeGreaterThan(920);
+    expect(el.scrollHeight - el.scrollTop - el.clientHeight).toBe(8);
+    expect(stick.following.current).toBe(false);
+  });
 });

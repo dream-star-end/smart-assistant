@@ -2,11 +2,17 @@
 
 export const STICK_TO_BOTTOM_PX = 80;
 
+function distanceFromBottom(
+  el: { scrollHeight: number; scrollTop: number; clientHeight: number },
+): number {
+  return el.scrollHeight - el.scrollTop - el.clientHeight;
+}
+
 export function isNearBottom(
   el: { scrollHeight: number; scrollTop: number; clientHeight: number },
   px: number = STICK_TO_BOTTOM_PX,
 ): boolean {
-  return el.scrollHeight - el.scrollTop - el.clientHeight < px;
+  return distanceFromBottom(el) < px;
 }
 
 /**
@@ -21,32 +27,38 @@ export function createStickToBottomController() {
   const following = { current: true };
   const programmatic = { current: false };
   const userIntent = { current: false };
-  const lastScrollTop = { current: null as number | null };
+  // Absolute scrollTop can rise while the user scrolls upward if a streaming
+  // card grows at the same time. Bottom-relative distance preserves the real
+  // direction across those layout changes.
+  const lastDistanceFromBottom = { current: null as number | null };
 
   const reset = () => {
     following.current = true;
     programmatic.current = false;
     userIntent.current = false;
-    lastScrollTop.current = null;
+    lastDistanceFromBottom.current = null;
   };
 
   const markUserIntent = () => {
     userIntent.current = true;
   };
 
-  const scrollToBottom = (el: { scrollTop: number; scrollHeight: number }) => {
+  const scrollToBottom = (
+    el: { scrollTop: number; scrollHeight: number; clientHeight: number },
+  ) => {
     programmatic.current = true;
     el.scrollTop = el.scrollHeight;
-    lastScrollTop.current = el.scrollTop;
+    lastDistanceFromBottom.current = distanceFromBottom(el);
   };
 
   const onScroll = (el: { scrollHeight: number; scrollTop: number; clientHeight: number }) => {
-    const previousScrollTop = lastScrollTop.current;
-    lastScrollTop.current = el.scrollTop;
+    const previousDistance = lastDistanceFromBottom.current;
+    const currentDistance = distanceFromBottom(el);
+    lastDistanceFromBottom.current = currentDistance;
     if (
       userIntent.current &&
-      previousScrollTop !== null &&
-      el.scrollTop < previousScrollTop - 1
+      previousDistance !== null &&
+      currentDistance > previousDistance + 1
     ) {
       following.current = false;
       programmatic.current = false;
