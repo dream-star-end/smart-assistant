@@ -1,7 +1,7 @@
 import '@testing-library/jest-dom/vitest'
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import type { ComponentProps } from 'react'
-import { afterEach, describe, expect, test, vi } from 'vitest'
+import { afterEach, beforeAll, describe, expect, test, vi } from 'vitest'
 import { workspaceWantPath } from '../../hooks/useAppRoute'
 import { api, ApiError } from '../../lib/api'
 import { createMemoryAuthSession } from '../../lib/authSession'
@@ -42,6 +42,12 @@ afterEach(() => {
   vi.unstubAllGlobals()
   vi.useRealTimers()
   localStorage.removeItem(LAST_PROJECT_STORAGE_KEY)
+})
+
+beforeAll(async () => {
+  // MarkdownImpl 是 React.lazy 的重 chunk。首次 transform/import 会耗尽 RTL 统一的 5s
+  // 查询窗口，findBy* 只等到纯文本占位。先显式等模块就绪，再让查询只等 React 提交 DOM。
+  await import('../MarkdownImpl')
 })
 
 const auth = createMemoryAuthSession(() => {}, 'tok-board')
