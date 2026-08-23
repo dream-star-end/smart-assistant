@@ -20,6 +20,7 @@ import { join } from 'node:path'
 import { describe, test } from 'node:test'
 
 import {
+  AGENT_COST_OVERRIDE_TTL_MS,
   LOCAL_CATALOG_KIND,
   MODEL_CATALOG_EPOCH_PATH,
   MODEL_CATALOG_PATH,
@@ -576,6 +577,42 @@ describe('modelCatalogClient — agent_cost_overrides 字段在/不在', () => {
     client._resetForTests()
     const second = await client.getView()
     assert.equal(lookupCatalogAgentMultiplier(second, 'coding-assistant'), '1.000')
+    lkg.cleanup()
+  })
+
+  test('override TTL 过期且全量刷新失败 → lookup 返回 null,不得沿用陈旧 1.000', async () => {
+    const lkg = tmpLkg()
+    let now = 0
+    let catalogOk = true
+    const body = { ...CATALOG_BODY, agent_cost_overrides: {} }
+    const client = new ModelCatalogClient({
+      env: ENV,
+      lkgPath: lkg.path,
+      now: () => now,
+      ttlMs: 60_000,
+      // biome-ignore lint/suspicious/noExplicitAny: 测试桩
+      fetcher: (async (url: string): Promise<any> => {
+        if (url.includes(MODEL_CATALOG_EPOCH_PATH)) {
+          return {
+            statusCode: 200,
+            body: (async function* () {
+              yield Buffer.from(JSON.stringify({ epoch: '5' }), 'utf8')
+            })(),
+          }
+        }
+        if (!catalogOk) throw new Error('ECONNREFUSED')
+        return {
+          statusCode: 200,
+          body: (async function* () {
+            yield Buffer.from(JSON.stringify(body), 'utf8')
+          })(),
+        }
+      }) as any,
+    })
+    assert.equal(await client.lookupAgentCostMultiplier('coding-assistant'), '1.000')
+    now += AGENT_COST_OVERRIDE_TTL_MS + 1
+    catalogOk = false
+    assert.equal(await client.lookupAgentCostMultiplier('coding-assistant'), null)
     lkg.cleanup()
   })
 })

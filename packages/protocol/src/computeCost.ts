@@ -44,8 +44,17 @@ function normalizePrice(name: string, v: bigint | number | string): bigint {
   return b
 }
 
+/**
+ * 合法 multiplier 字符串:可选负号 + 整数 + 可选小数。
+ * 与 commercial `agentMultiplier.ts` 逐位等价 — 空串、多重小数点、科学计数、空白都拒。
+ */
+const MULTIPLIER_PATTERN = /^-?\d+(\.\d+)?$/
+
 /** multiplier 字符串 → BigInt 放大到 10^3。例如 "2.0" → 2000n,"1.234" → 1234n。 */
 export function multiplierToScaled(multiplier: string): bigint {
+  if (!MULTIPLIER_PATTERN.test(multiplier)) {
+    throw new TypeError(`multiplier malformed, got "${multiplier}"`)
+  }
   const [intPart, fracRaw = ''] = multiplier.split('.')
   const frac = fracRaw.padEnd(3, '0').slice(0, 3)
   const scaled = BigInt(intPart + frac)
@@ -55,10 +64,21 @@ export function multiplierToScaled(multiplier: string): bigint {
   return scaled
 }
 
+/** scaled BigInt(×1000) → "X.YYY"。与 commercial `scaledToString` 同口径。 */
+function scaledToString(scaled: bigint): string {
+  if (scaled < 0n) {
+    throw new TypeError(`scaled must be non-negative, got ${scaled}`)
+  }
+  const intPart = scaled / 1000n
+  const fracPart = scaled % 1000n
+  return `${intPart.toString()}.${fracPart.toString().padStart(3, '0')}`
+}
+
 /**
  * 复合 model × agent 两个 NUMERIC(*,3) multiplier。
- * 与 commercial `composeMultiplier` 同口径:BigInt scale 1000、向下截断,
- * 正×正截到 0 时 clamp 到 0.001。gateway 补价必须走这里,禁止 JS 浮点相乘。
+ * 与 commercial `composeMultiplier` 同口径:同一正则、同一 TypeError、同一拒负值、
+ * BigInt scale 1000、向下截断,正×正截到 0 时 clamp 到 0.001。
+ * gateway 补价必须走这里,禁止 JS 浮点相乘。
  */
 export function composeMultiplier(modelMul: string, agentMul: string): string {
   const m = multiplierToScaled(modelMul)
@@ -67,9 +87,7 @@ export function composeMultiplier(modelMul: string, agentMul: string): string {
   if (composed === 0n && m > 0n && a > 0n) {
     composed = 1n
   }
-  const intPart = composed / 1000n
-  const fracPart = composed % 1000n
-  return `${intPart.toString()}.${fracPart.toString().padStart(3, '0')}`
+  return scaledToString(composed)
 }
 
 /** 四维 token × 单价 × multiplier，向上取整到分。全零 usage → 0。 */

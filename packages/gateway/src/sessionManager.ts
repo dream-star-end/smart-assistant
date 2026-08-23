@@ -5821,6 +5821,10 @@ export class SessionManager {
               prevCostUsd: prevCostUSD,
               waiveReason: terminalOverride?.waiveReason,
               agentId: session.agentId,
+              engine: session.providerTag,
+              isError: result.isError,
+              terminalBillingStatus:
+                terminalExternalBilling?.status ?? terminalEngineBilling?.status,
             })
             if (pricedUsd != null) session.totalCostUSD = prevCostUSD + pricedUsd
             session.totalInputTokens += result.usage.inputTokens

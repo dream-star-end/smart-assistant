@@ -11703,7 +11703,11 @@ export class Gateway {
       }
     }
 
-    const priced = await resolveDelegateCostUsd(session)
+    const priced = await resolveDelegateCostUsd({
+      ...session,
+      engine: session.providerTag,
+      isError: Boolean(error),
+    })
     return {
       kind: 'completed',
       ok: !error,

@@ -10,6 +10,10 @@
 
 import { composeMultiplier, computeCostFen, fenToUsd, type TurnWaiveReason } from '@openclaude/protocol'
 import {
+  resolveBackfillPolicy,
+  type TerminalBillingStatus,
+} from './costBackfillPolicy.js'
+import {
   getModelCatalogClient,
   lookupCatalogAgentMultiplier,
   type LocalCatalogPricing,
@@ -27,6 +31,8 @@ export interface UsageCostTokens {
    * 为 true 时禁止把 catalog 基础价写入 cost(fail-closed)。
    */
   costImprecise?: boolean
+  /** fail-closed 原因,仅内部排查;不作为对外协议字段。 */
+  costImpreciseReason?: string
 }
 
 export interface PlatformPricing {
@@ -98,26 +104,22 @@ export async function lookupPlatformPricing(modelId: string): Promise<PlatformPr
   }
 }
 
-function usageTokenTotal(usage: UsageCostTokens): number {
-  return (
-    (usage.inputTokens || 0) +
-    (usage.outputTokens || 0) +
-    (usage.cacheReadTokens || 0) +
-    (usage.cacheCreationTokens || 0)
-  )
+function markImprecise(usage: UsageCostTokens, reason: string): void {
+  usage.costImprecise = true
+  usage.costImpreciseReason = reason
 }
 
 /**
  * 引擎没报本轮成本、session 累计也没动,但有 token → 用平台价补 USD。
  * 返回补上的本轮 USD;无需补则 null。会写入 usage.cost。
  *
- * 零输出免单 / terminal waiver:商业结算扣 0,这里也不得改写。
+ * 判定全部收口在 resolveBackfillPolicy:只有能证明与结算同口径才写 cost。
+ * 零输出免单 / terminal waiver / 错误终态(chargeOnlyOnSuccess 引擎)不得改写。
  *
- * agent 倍率必须来自 master catalog 的 `agent_cost_overrides` 字段(或测试显式传入)。
- * 核心区分:
+ * 需要复合 agent 倍率的引擎:倍率必须来自 master `agent_cost_overrides`(或测试显式传入)。
  *   - 字段在(哪怕是空字典)且该 agent 无行 → 按 "1.000" 正常补价
- *   - 压根没拿到该字段(旧 LKG / 旧 master / catalog 不可达)→ fail-closed
- *     保持 0 + costImprecise,禁止拿 1.000 蒙过去
+ *   - 压根没拿到 / TTL 过期且刷新失败 → fail-closed,保持 0 + costImprecise
+ * 不复合的引擎(cursor / zcode)不查倍率,只用 model 基础价。
  */
 export async function applyPlatformCostIfMissing(args: {
   model?: string
@@ -129,28 +131,37 @@ export async function applyPlatformCostIfMissing(args: {
   agentId?: string
   /** 测试 / 显式覆盖。生产路径应走 catalog + agentId。 */
   agentMultiplier?: string | null
+  /** session.providerTag / catalog engine id。缺席或未知 → fail-closed。 */
+  engine?: string
+  /** TurnSummary.isError。chargeOnlyOnSuccess 引擎用它证明结算会不会扣 0。 */
+  isError?: boolean
+  /** 终态计费侧信道 status(cursor/zcode 的 engineStatus,或 codex/grok billing.status)。 */
+  terminalBillingStatus?: TerminalBillingStatus
 }): Promise<number | null> {
-  if ((args.usage.cost ?? 0) > 0) return null
-  if (args.sessionCostUsd !== args.prevCostUsd) return null
-  if (args.waiveReason) return null
-  const tokenTotal = usageTokenTotal(args.usage)
-  if (tokenTotal <= 0) return null
-  // 零输出免单:正 input/cache + output=0,与 proxy 扣 0 / waiveReason=no_response 对齐。
-  if (args.usage.outputTokens === 0) return null
-  const model = args.model?.trim()
-  if (!model) return null
-  const agentMul = await resolveAgentMultiplier(args.agentMultiplier, args.agentId)
-  if (!agentMul) {
-    // 没拿到 master 的倍率字段,或没有 agent 身份。不得默认 1.000。
-    args.usage.costImprecise = true
+  const policy = resolveBackfillPolicy(args)
+  if (!policy.ok) {
+    if (policy.markImprecise) markImprecise(args.usage, policy.reason)
     return null
   }
+  const model = args.model?.trim()
+  if (!model) return null
   const pricing = await lookupPlatformPricing(model)
   if (!pricing) return null
-  const usd = estimatePlatformCostUsd(args.usage, {
-    ...pricing,
-    multiplier: composeMultiplier(pricing.multiplier, agentMul),
-  })
+  let multiplier = pricing.multiplier
+  if (policy.composeAgentMultiplier) {
+    const agentMul = await resolveAgentMultiplier(args.agentMultiplier, args.agentId)
+    if (!agentMul) {
+      markImprecise(args.usage, 'agent_multiplier_unavailable')
+      return null
+    }
+    try {
+      multiplier = composeMultiplier(pricing.multiplier, agentMul)
+    } catch {
+      markImprecise(args.usage, 'multiplier_malformed')
+      return null
+    }
+  }
+  const usd = estimatePlatformCostUsd(args.usage, { ...pricing, multiplier })
   if (!(usd > 0)) return null
   args.usage.cost = usd
   return usd
@@ -187,6 +198,10 @@ export interface DelegateCostSource {
   model?: string
   agentId?: string
   agentMultiplier?: string | null
+  engine?: string
+  providerTag?: string
+  isError?: boolean
+  terminalBillingStatus?: TerminalBillingStatus
 }
 
 export interface ResolvedDelegateCost {
@@ -213,6 +228,9 @@ export async function resolveDelegateCostUsd(session: DelegateCostSource): Promi
     prevCostUsd: session.totalCostUSD,
     agentId: session.agentId,
     agentMultiplier: session.agentMultiplier,
+    engine: session.engine ?? session.providerTag,
+    isError: session.isError,
+    terminalBillingStatus: session.terminalBillingStatus,
   })
   if (filled != null && filled > 0) {
     return { costUsd: filled, costImprecise: false }

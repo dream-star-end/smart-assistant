@@ -60,6 +60,12 @@ const ENV_CONTAINER_TOKEN = 'OPENCLAUDE_V3_CONTAINER_TOKEN'
 
 /** 成功拉取后的免检窗口。安全变更靠 epoch 验证兜底,不靠这个窗口短。 */
 const CATALOG_TTL_MS = 30_000
+/**
+ * agent_cost_overrides 独立新鲜度。admin 按 0056 契约直接 SQL UPDATE,
+ * **不 bump catalog epoch**,commercial 侧 60s TTL 后按新倍率扣费。
+ * gateway 必须用同一窗口重拉全量;过期且刷新失败 → fail-closed,不许沿用陈旧 Map。
+ */
+export const AGENT_COST_OVERRIDE_TTL_MS = 60_000
 /** 单次请求超时:本地路径 turn 在等它,失败要早(拒 turn 好过挂住 cron)。 */
 const FETCH_TIMEOUT_MS = 5_000
 const MAX_BODY_BYTES = 512 * 1024
@@ -204,6 +210,9 @@ export class ModelCatalogClient {
   private snapshot: Snapshot | null = null
   private inflight: Promise<LocalCatalogView> | null = null
   private routingInflight: Promise<LocalCatalogView> | null = null
+  private agentOverrideInflight: Promise<LocalCatalogView> | null = null
+  /** 最近一次**全量拉到** agent_cost_overrides 的时刻。epoch 验证通过不算。 */
+  private agentOverridesVerifiedAt = 0
   private lkgLoaded = false
   /** 旧 LKG 没有单价字段时只强拉一次,避免每 TTL 打满量。 */
   private pricingUpgradeAttempted = false
@@ -304,17 +313,41 @@ export class ModelCatalogClient {
 
   /**
    * 查当前投影里该 agent 的成本倍率。
-   * 返回 null = 没拿到 master 的倍率字段,调用方必须 fail-closed。
+   * 返回 null = 没拿到 master 的倍率字段,或 60s TTL 过期且刷新失败。调用方必须 fail-closed。
    * 返回 "1.000" = 字段在、该 agent 无 override(与商业侧缺行同口径)。
+   *
+   * 新鲜度独立于 catalog epoch:SQL 改 override 不 bump epoch,getView() 会无限复用旧 Map。
+   * 本方法过期必须强拉全量;拉失败不得回落陈旧值。
    */
   async lookupAgentCostMultiplier(agentId: string): Promise<string | null> {
     if (!this.configured) return null
     try {
-      const view = await this.getView()
+      const view = await this.getFreshAgentCostView()
       return lookupCatalogAgentMultiplier(view, agentId)
     } catch {
       return null
     }
+  }
+
+  /**
+   * agent 倍率专用新鲜读。epoch 相等不能当 override 仍新的证据。
+   * 过期 / 从未全量拉过 / 字段缺席 → 强拉;失败抛给 caller(lookup 再吞成 null)。
+   */
+  private async getFreshAgentCostView(): Promise<LocalCatalogView> {
+    const cached = this.snapshot
+    if (
+      cached &&
+      cached.view.agentCostOverrides != null &&
+      this.agentOverridesVerifiedAt > 0 &&
+      this.now() - this.agentOverridesVerifiedAt < AGENT_COST_OVERRIDE_TTL_MS
+    ) {
+      return cached.view
+    }
+    if (this.agentOverrideInflight) return this.agentOverrideInflight
+    this.agentOverrideInflight = this.fetchCatalog().finally(() => {
+      this.agentOverrideInflight = null
+    })
+    return this.agentOverrideInflight
   }
 
   /** 测试用:清空内存态(不动 LKG 文件)。 */
@@ -322,6 +355,8 @@ export class ModelCatalogClient {
     this.snapshot = null
     this.inflight = null
     this.routingInflight = null
+    this.agentOverrideInflight = null
+    this.agentOverridesVerifiedAt = 0
     this.lkgLoaded = false
     this.pricingUpgradeAttempted = false
   }
@@ -380,6 +415,7 @@ export class ModelCatalogClient {
     const body = await this.getJson(MODEL_CATALOG_PATH)
     const view = parseCatalogResponse(body)
     this.snapshot = { view, verifiedAt: this.now() }
+    this.agentOverridesVerifiedAt = this.now()
     this.persistLkg(view)
     return view
   }

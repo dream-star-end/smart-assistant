@@ -51,6 +51,20 @@ describe('composeMultiplier', () => {
     assert.equal(composeMultiplier('0.000', '1.500'), '0.000')
     assert.equal(composeMultiplier('1.000', '1.500'), '1.500')
   })
+
+  test('负 multiplier throw TypeError(与 commercial 等价)', () => {
+    assert.throws(() => composeMultiplier('-1.000', '1.000'), TypeError)
+    assert.throws(() => composeMultiplier('1.000', '-0.500'), TypeError)
+  })
+
+  test('malformed multiplier throw TypeError(与 commercial 等价)', () => {
+    assert.throws(() => composeMultiplier('', '1.000'), TypeError)
+    assert.throws(() => composeMultiplier('1.000', ''), TypeError)
+    assert.throws(() => composeMultiplier('1.2.3', '1.000'), TypeError)
+    assert.throws(() => composeMultiplier('abc', '1.000'), TypeError)
+    assert.throws(() => composeMultiplier('1.0e2', '1.000'), TypeError)
+    assert.throws(() => composeMultiplier(' 1.0 ', '1.000'), TypeError)
+  })
 })
 
 describe('fenToUsd', () => {

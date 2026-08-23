@@ -7,7 +7,13 @@
 
 import assert from 'node:assert/strict'
 import { afterEach, describe, test } from 'node:test'
-import { parseCatalogResponse } from '../modelCatalogClient.js'
+import { ENGINE_BACKFILL_STRATEGIES, resolveBackfillPolicy } from '../costBackfillPolicy.js'
+import {
+  AGENT_COST_OVERRIDE_TTL_MS,
+  ModelCatalogClient,
+  _setModelCatalogClientForTests,
+  parseCatalogResponse,
+} from '../modelCatalogClient.js'
 import {
   _setCatalogViewForTests,
   _setPlatformPricingLookupForTests,
@@ -54,6 +60,7 @@ const PRICES: Record<string, PlatformPricing> = {
 afterEach(() => {
   _setPlatformPricingLookupForTests(null)
   _setCatalogViewForTests(null)
+  _setModelCatalogClientForTests(null)
 })
 
 function catalogView(overrides?: Record<string, string>) {
@@ -110,6 +117,11 @@ describe('estimatePlatformCostUsd', () => {
 describe('resolveDelegateCostUsd — engine-reported delegate 结果', () => {
   test('codex / grok / cursor 有 token、引擎 cost=0 时补出 cost_usd > 0', async () => {
     _setPlatformPricingLookupForTests(async (model) => PRICES[model] ?? null)
+    const engines = {
+      'gpt-5.6-terra': 'codex',
+      'grok-build': 'grok',
+      'cursor-grok-4.6-high': 'cursor',
+    } as const
     for (const model of ['gpt-5.6-terra', 'grok-build', 'cursor-grok-4.6-high'] as const) {
       const cost = await resolveDelegateCostUsd({
         totalCostUSD: 0,
@@ -119,6 +131,8 @@ describe('resolveDelegateCostUsd — engine-reported delegate 结果', () => {
         totalCacheCreationTokens: 0,
         model,
         agentMultiplier: '1.000',
+        engine: engines[model],
+        isError: false,
       })
       assert.ok(
         cost.costUsd != null && cost.costUsd > 0,
@@ -135,6 +149,8 @@ describe('resolveDelegateCostUsd — engine-reported delegate 结果', () => {
       totalInputTokens: 97_419,
       totalOutputTokens: 8_532,
       model: 'gpt-5.6-terra',
+      engine: 'codex',
+      isError: false,
     })
     assert.equal(cost.costUsd, null)
     assert.equal(cost.costImprecise, true)
@@ -160,6 +176,8 @@ describe('resolveDelegateCostUsd — engine-reported delegate 结果', () => {
       totalOutputTokens: 2,
       model: 'cursor-auto',
       agentMultiplier: '1.000',
+      engine: 'cursor',
+      isError: false,
     })
     assert.equal(cost.costUsd, null)
     assert.equal(cost.costImprecise, false)
@@ -176,6 +194,7 @@ describe('applyPlatformCostIfMissing', () => {
       sessionCostUsd: 0,
       prevCostUsd: 0,
       agentMultiplier: '1.000',
+      engine: 'codex',
     })
     assert.ok(filled != null && filled > 0)
     assert.equal(usage.cost, filled)
@@ -242,6 +261,7 @@ describe('applyPlatformCostIfMissing', () => {
       usage,
       sessionCostUsd: 0,
       prevCostUsd: 0,
+      engine: 'codex',
     })
     assert.equal(filled, null, `must fail-closed without agent multiplier, got ${filled}`)
     assert.equal(usage.cost, 0, 'must not write the known-low catalog-only estimate')
@@ -259,6 +279,7 @@ describe('applyPlatformCostIfMissing', () => {
       sessionCostUsd: 0,
       prevCostUsd: 0,
       agentMultiplier: '1.000',
+      engine: 'codex',
     })
     const mul = await applyPlatformCostIfMissing({
       model: 'gpt-5.6-terra',
@@ -266,6 +287,7 @@ describe('applyPlatformCostIfMissing', () => {
       sessionCostUsd: 0,
       prevCostUsd: 0,
       agentMultiplier: '1.500',
+      engine: 'codex',
     })
     const modelOnly = estimatePlatformCostUsd(tokens, TERRA)
     const expected = estimatePlatformCostUsd(tokens, { ...TERRA, multiplier: '1.500' })
@@ -286,6 +308,7 @@ describe('applyPlatformCostIfMissing', () => {
       sessionCostUsd: 0,
       prevCostUsd: 0,
       agentMultiplier: '1.234',
+      engine: 'codex',
     })
     const expected = estimatePlatformCostUsd(
       { inputTokens: 1_000_000, outputTokens: 1, cacheReadTokens: 0, cacheCreationTokens: 0 },
@@ -305,6 +328,7 @@ describe('applyPlatformCostIfMissing', () => {
       sessionCostUsd: 0,
       prevCostUsd: 0,
       agentId: 'coding-assistant',
+      engine: 'codex',
     })
     const expected = estimatePlatformCostUsd(
       { inputTokens: 1_000_000, outputTokens: 1_000, cacheReadTokens: 0, cacheCreationTokens: 0 },
@@ -324,6 +348,7 @@ describe('applyPlatformCostIfMissing', () => {
       sessionCostUsd: 0,
       prevCostUsd: 0,
       agentId: 'coding-assistant',
+      engine: 'codex',
     })
     const expected = estimatePlatformCostUsd(
       { inputTokens: 1_000_000, outputTokens: 1_000, cacheReadTokens: 0, cacheCreationTokens: 0 },
@@ -344,9 +369,251 @@ describe('applyPlatformCostIfMissing', () => {
       sessionCostUsd: 0,
       prevCostUsd: 0,
       agentId: 'coding-assistant',
+      engine: 'codex',
     })
     assert.equal(filled, null)
     assert.equal(usage.cost, 0)
     assert.equal(usage.costImprecise, true)
+  })
+})
+
+describe('resolveBackfillPolicy — 显式引擎策略 / fail-closed', () => {
+  const tokens = { cost: 0, inputTokens: 1_000, outputTokens: 40 }
+
+  test('未知引擎 → 默认 fail-closed', () => {
+    const decision = resolveBackfillPolicy({
+      engine: 'new-vendor',
+      usage: tokens,
+      sessionCostUsd: 0,
+      prevCostUsd: 0,
+    })
+    assert.equal(decision.ok, false)
+    if (decision.ok) throw new Error('expected fail-closed')
+    assert.equal(decision.reason, 'engine_unknown:new-vendor')
+    assert.equal(decision.markImprecise, true)
+  })
+
+  test('缺 engine → fail-closed,不得默认补', () => {
+    const decision = resolveBackfillPolicy({
+      usage: tokens,
+      sessionCostUsd: 0,
+      prevCostUsd: 0,
+    })
+    assert.equal(decision.ok, false)
+    if (decision.ok) throw new Error('expected fail-closed')
+    assert.equal(decision.reason, 'engine_missing')
+  })
+
+  test('策略表:codex/grok 复合;cursor/zcode 不复合;ccb 不补', () => {
+    assert.deepEqual(ENGINE_BACKFILL_STRATEGIES.codex, {
+      allowBackfill: true,
+      composeAgentMultiplier: true,
+      chargeOnlyOnSuccess: false,
+    })
+    assert.deepEqual(ENGINE_BACKFILL_STRATEGIES.grok, {
+      allowBackfill: true,
+      composeAgentMultiplier: true,
+      chargeOnlyOnSuccess: false,
+    })
+    assert.deepEqual(ENGINE_BACKFILL_STRATEGIES.cursor, {
+      allowBackfill: true,
+      composeAgentMultiplier: false,
+      chargeOnlyOnSuccess: true,
+    })
+    assert.deepEqual(ENGINE_BACKFILL_STRATEGIES.zcode, {
+      allowBackfill: true,
+      composeAgentMultiplier: false,
+      chargeOnlyOnSuccess: true,
+    })
+    assert.equal(ENGINE_BACKFILL_STRATEGIES.ccb.allowBackfill, false)
+  })
+})
+
+describe('applyPlatformCostIfMissing — 2026-08 关门审查 blocker', () => {
+  test('blocker1: Cursor 错误终态 + 正 output token → 不补价、标 costImprecise', async () => {
+    _setPlatformPricingLookupForTests(async () => CURSOR_GROK)
+    const usage: UsageCostTokens = {
+      cost: 0,
+      inputTokens: 12_000,
+      outputTokens: 800,
+    }
+    const filled = await applyPlatformCostIfMissing({
+      model: 'cursor-grok-4.6-high',
+      usage,
+      sessionCostUsd: 0,
+      prevCostUsd: 0,
+      agentMultiplier: '1.000',
+      engine: 'cursor',
+      isError: true,
+      terminalBillingStatus: 'error',
+    })
+    assert.equal(filled, null, `cursor error must not backfill, got ${filled}`)
+    assert.equal(usage.cost, 0)
+    assert.equal(usage.costImprecise, true)
+    assert.equal(usage.costImpreciseReason, 'terminal_billing_not_success')
+  })
+
+  test('blocker1: Cursor isError=true 且无 billing status 也不得补', async () => {
+    _setPlatformPricingLookupForTests(async () => CURSOR_GROK)
+    const usage: UsageCostTokens = { cost: 0, inputTokens: 12_000, outputTokens: 800 }
+    const filled = await applyPlatformCostIfMissing({
+      model: 'cursor-grok-4.6-high',
+      usage,
+      sessionCostUsd: 0,
+      prevCostUsd: 0,
+      agentMultiplier: '1.000',
+      engine: 'cursor',
+      isError: true,
+    })
+    assert.equal(filled, null)
+    assert.equal(usage.cost, 0)
+    assert.equal(usage.costImprecise, true)
+    assert.equal(usage.costImpreciseReason, 'turn_is_error')
+  })
+
+  test('blocker2: Cursor 成功 + agent override 1.500 → 不复合(与 cursorExternalSettle 一致)', async () => {
+    _setPlatformPricingLookupForTests(async () => CURSOR_GROK)
+    const tokens = {
+      inputTokens: 1_000_000,
+      outputTokens: 1_000,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+    }
+    const usage: UsageCostTokens = { cost: 0, ...tokens }
+    const filled = await applyPlatformCostIfMissing({
+      model: 'cursor-grok-4.6-high',
+      usage,
+      sessionCostUsd: 0,
+      prevCostUsd: 0,
+      agentMultiplier: '1.500',
+      engine: 'cursor',
+      isError: false,
+      terminalBillingStatus: 'success',
+    })
+    const modelOnly = estimatePlatformCostUsd(tokens, CURSOR_GROK)
+    const composed = estimatePlatformCostUsd(tokens, { ...CURSOR_GROK, multiplier: '1.500' })
+    assert.equal(filled, modelOnly)
+    assert.ok(filled !== composed, 'cursor must not compose agent multiplier')
+    assert.equal(usage.costImprecise, undefined)
+  })
+
+  test('blocker2: Codex 成功 + agent override 1.500 → 复合(与 durableCodexBilling 一致)', async () => {
+    _setPlatformPricingLookupForTests(async () => TERRA)
+    const tokens = {
+      inputTokens: 1_000_000,
+      outputTokens: 1_000,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+    }
+    const usage: UsageCostTokens = { cost: 0, ...tokens }
+    const filled = await applyPlatformCostIfMissing({
+      model: 'gpt-5.6-terra',
+      usage,
+      sessionCostUsd: 0,
+      prevCostUsd: 0,
+      agentMultiplier: '1.500',
+      engine: 'codex',
+      isError: false,
+    })
+    const expected = estimatePlatformCostUsd(tokens, { ...TERRA, multiplier: '1.500' })
+    assert.equal(filled, expected)
+  })
+
+  test('未知引擎 → 默认 fail-closed,保持 0 + costImprecise', async () => {
+    _setPlatformPricingLookupForTests(async () => TERRA)
+    const usage: UsageCostTokens = { cost: 0, inputTokens: 1_000_000, outputTokens: 1_000 }
+    const filled = await applyPlatformCostIfMissing({
+      model: 'gpt-5.6-terra',
+      usage,
+      sessionCostUsd: 0,
+      prevCostUsd: 0,
+      agentMultiplier: '1.000',
+      engine: 'future-engine',
+      isError: false,
+    })
+    assert.equal(filled, null)
+    assert.equal(usage.cost, 0)
+    assert.equal(usage.costImprecise, true)
+    assert.equal(usage.costImpreciseReason, 'engine_unknown:future-engine')
+  })
+
+  test('blocker3: 倍率过期且刷新失败 → 不用陈旧值,保持 0 + costImprecise', async () => {
+    _setPlatformPricingLookupForTests(async () => TERRA)
+    let now = 1_000
+    let catalogOk = true
+    const body = {
+      models: [
+        {
+          model_id: 'gpt-5.6-terra',
+          display_name: 'Terra',
+          engine: 'codex',
+          provider_id: 'codex',
+          context_window: null,
+          supported_efforts: ['high'],
+          supports_vision: false,
+          capability_zero: false,
+          supports_thinking: false,
+          default_effort: null,
+          input_per_mtok: '150',
+          output_per_mtok: '899',
+          cache_read_per_mtok: '15',
+          cache_write_per_mtok: '0',
+          multiplier: '1.000',
+        },
+      ],
+      projection_revision: 'proj-ttl',
+      security_epoch: '1',
+      agent_cost_overrides: {},
+    }
+    const client = new ModelCatalogClient({
+      env: {
+        OPENCLAUDE_V3_MASTER_BASE_URL: 'http://master.invalid:18791',
+        OPENCLAUDE_V3_CONTAINER_TOKEN: 'oc-v3.1.deadbeef',
+      },
+      lkgPath: '/tmp/oc-agent-mul-ttl-lkg.json',
+      now: () => now,
+      // biome-ignore lint/suspicious/noExplicitAny: 测试桩
+      fetcher: (async () => {
+        if (!catalogOk) throw new Error('ECONNREFUSED')
+        return {
+          statusCode: 200,
+          body: (async function* () {
+            yield Buffer.from(JSON.stringify(body), 'utf8')
+          })(),
+        }
+      }) as any,
+    })
+    _setModelCatalogClientForTests(client)
+
+    const firstUsage: UsageCostTokens = { cost: 0, inputTokens: 1_000_000, outputTokens: 1_000 }
+    const first = await applyPlatformCostIfMissing({
+      model: 'gpt-5.6-terra',
+      usage: firstUsage,
+      sessionCostUsd: 0,
+      prevCostUsd: 0,
+      agentId: 'coding-assistant',
+      engine: 'codex',
+    })
+    const expectedFresh = estimatePlatformCostUsd(
+      { inputTokens: 1_000_000, outputTokens: 1_000, cacheReadTokens: 0, cacheCreationTokens: 0 },
+      TERRA,
+    )
+    assert.equal(first, expectedFresh, 'within TTL empty overrides still price at 1.000')
+
+    now += AGENT_COST_OVERRIDE_TTL_MS + 1
+    catalogOk = false
+    const staleUsage: UsageCostTokens = { cost: 0, inputTokens: 1_000_000, outputTokens: 1_000 }
+    const stale = await applyPlatformCostIfMissing({
+      model: 'gpt-5.6-terra',
+      usage: staleUsage,
+      sessionCostUsd: 0,
+      prevCostUsd: 0,
+      agentId: 'coding-assistant',
+      engine: 'codex',
+    })
+    assert.equal(stale, null, `expired refresh-fail must not reuse stale 1.000, got ${stale}`)
+    assert.equal(staleUsage.cost, 0)
+    assert.equal(staleUsage.costImprecise, true)
+    assert.equal(staleUsage.costImpreciseReason, 'agent_multiplier_unavailable')
   })
 })
