@@ -1580,6 +1580,34 @@
           "assertion": "T12 Agent 卡按钮名单恰好为白名单(无冗余原始记录入口)且真实过程可见"
         }
       ]
+    },
+    {
+      "id": "INC-20260823-SELFHOST-AUDIT-CLOSURE",
+      "occurredAt": "2026-08-23",
+      "severity": "P1",
+      "symptom": "selfhost 近期增量存在后台委派回调跨重启丢失或乱序、相同目标卡片无法精确关联、任务面板旧种子不升级且阶段运维入口权限不对称、catalog 并发刷新回退、成本精度状态在续跑中丢失，以及 Grok 槽释放对瞬态 transport error 过度裁决等问题。",
+      "rootFixCommit": "991f2778",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/sendToAgentIntentStore.test.ts",
+          "assertion": "leftover send_to_agent intents become one terminal notice and are removed"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/modelCatalogClient.test.ts",
+          "assertion": "late old epoch validation cannot overwrite a newer agent-override full fetch"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "two identical goals bind to their own background cards"
+        }
+      ],
+      "proofPending": {
+        "reason": "跨进程后台回调恢复与真实用户消息并发顺序目前只有 unit/typecheck 覆盖；需随 selfhost 发布后补一次真实浏览器重启旅程，不用无关 J1-J5 充数。",
+        "since": "2026-08-23"
+      }
     }
   ]
 }
