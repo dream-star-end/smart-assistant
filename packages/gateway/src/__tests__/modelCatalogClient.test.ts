@@ -46,6 +46,11 @@ const CATALOG_BODY = {
       capability_zero: true,
       supports_thinking: true,
       default_effort: 'high',
+      input_per_mtok: '600',
+      output_per_mtok: '2400',
+      cache_read_per_mtok: '120',
+      cache_write_per_mtok: '0',
+      multiplier: '1.000',
     },
     {
       model_id: 'gpt-5.6-sol',
@@ -58,6 +63,11 @@ const CATALOG_BODY = {
       capability_zero: false,
       supports_thinking: false,
       default_effort: null,
+      input_per_mtok: '299',
+      output_per_mtok: '1799',
+      cache_read_per_mtok: '30',
+      cache_write_per_mtok: '0',
+      multiplier: '1.000',
     },
   ],
   projection_revision: 'proj-rev-1',
@@ -164,6 +174,13 @@ describe('modelCatalogClient — 新鲜快照', () => {
     assert.ok(!v1.isRoutable('not-granted'))
     assert.equal(v1.isCodexModel('gpt-5.6-sol'), true)
     assert.equal(v1.resolve('glm-5.2')?.providerId, 'ark')
+    assert.deepEqual(v1.resolve('gpt-5.6-sol')?.pricing, {
+      inputPerMtok: '299',
+      outputPerMtok: '1799',
+      cacheReadPerMtok: '30',
+      cacheWritePerMtok: '0',
+      multiplier: '1.000',
+    })
 
     await client.getView()
     assert.deepEqual(

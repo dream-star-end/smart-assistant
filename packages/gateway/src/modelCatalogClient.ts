@@ -84,6 +84,16 @@ export interface LocalCatalogModel {
   readonly defaultEffort: string | null
   /** Provider quota/health routing availability; old masters omit it (= true). */
   readonly available: boolean
+  /** model_pricing 四维 + multiplier。旧 master / 旧 LKG 可缺席。 */
+  readonly pricing?: LocalCatalogPricing
+}
+
+export interface LocalCatalogPricing {
+  readonly inputPerMtok: string
+  readonly outputPerMtok: string
+  readonly cacheReadPerMtok: string
+  readonly cacheWritePerMtok: string
+  readonly multiplier: string
 }
 
 /** 该 uid 的可执行模型投影(master 已按 role/grants 过滤;容器不再自己判可见性)。 */
@@ -188,6 +198,8 @@ export class ModelCatalogClient {
   private inflight: Promise<LocalCatalogView> | null = null
   private routingInflight: Promise<LocalCatalogView> | null = null
   private lkgLoaded = false
+  /** 旧 LKG 没有单价字段时只强拉一次,避免每 TTL 打满量。 */
+  private pricingUpgradeAttempted = false
 
   private readonly env: NodeJS.ProcessEnv
   private readonly fetcher: typeof undiciRequest
@@ -289,6 +301,7 @@ export class ModelCatalogClient {
     this.inflight = null
     this.routingInflight = null
     this.lkgLoaded = false
+    this.pricingUpgradeAttempted = false
   }
 
   // -- 内部 -----------------------------------------------------------------
@@ -316,6 +329,14 @@ export class ModelCatalogClient {
         (!checkAvailability ||
           state.availabilityRevision === cached.view.availabilityRevision)
       ) {
+        if (!this.pricingUpgradeAttempted && !catalogHasAnyPricing(cached.view)) {
+          this.pricingUpgradeAttempted = true
+          try {
+            return await this.fetchCatalog()
+          } catch {
+            // 旧 master 仍无单价字段时继续用已验 epoch 的快照,只是 cost 保持 0。
+          }
+        }
         this.snapshot = { view: cached.view, verifiedAt: this.now() }
         return cached.view
       }
@@ -453,6 +474,11 @@ interface WireRow {
   supports_thinking: boolean
   default_effort: string | null
   available?: boolean
+  input_per_mtok?: string
+  output_per_mtok?: string
+  cache_read_per_mtok?: string
+  cache_write_per_mtok?: string
+  multiplier?: string
 }
 
 interface WireResponse {
@@ -483,6 +509,15 @@ function toWire(view: LocalCatalogView): WireResponse {
       supports_thinking: m.supportsThinking,
       default_effort: m.defaultEffort,
       available: m.available,
+      ...(m.pricing
+        ? {
+            input_per_mtok: m.pricing.inputPerMtok,
+            output_per_mtok: m.pricing.outputPerMtok,
+            cache_read_per_mtok: m.pricing.cacheReadPerMtok,
+            cache_write_per_mtok: m.pricing.cacheWritePerMtok,
+            multiplier: m.pricing.multiplier,
+          }
+        : {}),
     })),
     projection_revision: view.projectionRevision,
     availability_revision: view.availabilityRevision,
@@ -516,6 +551,7 @@ export function parseCatalogResponse(raw: unknown): LocalCatalogView {
     ) {
       throw new ModelCatalogUnavailableError('catalog row shape invalid')
     }
+    const pricing = parseOptionalPricing(r)
     return {
       modelId: r.model_id,
       displayName: typeof r.display_name === 'string' ? r.display_name : r.model_id,
@@ -528,6 +564,7 @@ export function parseCatalogResponse(raw: unknown): LocalCatalogView {
       supportsThinking: r.supports_thinking,
       defaultEffort: typeof r.default_effort === 'string' ? r.default_effort : null,
       available: r.available !== false,
+      ...(pricing ? { pricing } : {}),
     }
   })
 
@@ -568,6 +605,45 @@ export function parseCatalogResponse(raw: unknown): LocalCatalogView {
     resolve: (modelId) => byId.get(modelId) ?? null,
     isCodexModel: (modelId) => byId.get(modelId)?.engine === 'codex',
   }
+}
+
+const PRICE_DIM = /^-?\d+$/
+
+function parseOptionalPricing(r: WireRow): LocalCatalogPricing | undefined {
+  if (
+    r.input_per_mtok === undefined &&
+    r.output_per_mtok === undefined &&
+    r.cache_read_per_mtok === undefined &&
+    r.cache_write_per_mtok === undefined &&
+    r.multiplier === undefined
+  ) {
+    return undefined
+  }
+  if (
+    typeof r.input_per_mtok !== 'string' ||
+    typeof r.output_per_mtok !== 'string' ||
+    typeof r.cache_read_per_mtok !== 'string' ||
+    typeof r.cache_write_per_mtok !== 'string' ||
+    typeof r.multiplier !== 'string' ||
+    !PRICE_DIM.test(r.input_per_mtok) ||
+    !PRICE_DIM.test(r.output_per_mtok) ||
+    !PRICE_DIM.test(r.cache_read_per_mtok) ||
+    !PRICE_DIM.test(r.cache_write_per_mtok) ||
+    !/^-?\d+(\.\d+)?$/.test(r.multiplier)
+  ) {
+    throw new ModelCatalogUnavailableError('catalog row pricing shape invalid')
+  }
+  return {
+    inputPerMtok: r.input_per_mtok,
+    outputPerMtok: r.output_per_mtok,
+    cacheReadPerMtok: r.cache_read_per_mtok,
+    cacheWritePerMtok: r.cache_write_per_mtok,
+    multiplier: r.multiplier,
+  }
+}
+
+export function catalogHasAnyPricing(view: LocalCatalogView): boolean {
+  return view.models.some((m) => m.pricing != null)
 }
 
 function defaultLkgPath(env: NodeJS.ProcessEnv): string {

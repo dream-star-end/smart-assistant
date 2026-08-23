@@ -57,6 +57,7 @@ import type { ZcodeRouteOverride } from './engine/zcodeAdapter.js'
 import { eventBus, createEvent } from './eventBus.js'
 import { beginMemoryTurnTracking } from './memoryTurnObserver.js'
 import { createTurnUsageRecorder, mapTurnTerminalStatus, type TurnTerminalStatus } from './turnUsage.js'
+import { applyPlatformCostIfMissing } from './usageCost.js'
 import { createLogger } from './logger.js'
 import { collectSessionOutputAssets } from './projectAssetCollector.js'
 import {
@@ -5813,6 +5814,13 @@ export class SessionManager {
               ...retryStructuredBlocks.map((block) => structuredClone(block)),
               ...freezeStructuredBlocks(structuredBlocks),
             ]
+            const pricedUsd = await applyPlatformCostIfMissing({
+              model: session.model,
+              usage: result.usage,
+              sessionCostUsd: session.totalCostUSD,
+              prevCostUsd: prevCostUSD,
+            })
+            if (pricedUsd != null) session.totalCostUSD = prevCostUSD + pricedUsd
             session.totalInputTokens += result.usage.inputTokens
             session.totalOutputTokens += result.usage.outputTokens
             session.totalCacheReadTokens += result.usage.cacheReadTokens

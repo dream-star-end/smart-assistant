@@ -124,6 +124,12 @@ export interface WireModelRow {
   default_effort: string | null;
   /** Missing on an old master means available=true to rolling-upgrade clients. */
   available?: boolean;
+  /** model_pricing 四维 + multiplier。旧 master 可缺席。 */
+  input_per_mtok?: string;
+  output_per_mtok?: string;
+  cache_read_per_mtok?: string;
+  cache_write_per_mtok?: string;
+  multiplier?: string;
 }
 
 export interface WireCatalogResponse {
@@ -226,20 +232,32 @@ export function makeModelCatalogHandler(deps: ModelCatalogHandlerDeps): ModelCat
     };
     const availability = await loadRoutingAvailability();
     const body: WireCatalogResponse = {
-      models: snapshot.listForUser(scope).map((r) => ({
-        model_id: r.modelId,
-        display_name: r.displayName,
-        engine: r.engine,
-        provider_id: r.providerId,
-        context_window: r.contextWindow,
-        supported_efforts: r.supportedEfforts,
-        supports_vision: r.supportsVision,
-        capability_zero: r.capabilityZero,
-        supports_thinking: r.supportsThinking,
-        default_effort: r.defaultEffort,
-        available:
-          r.providerId === null || !availability.unavailableProviderIds.has(r.providerId),
-      })),
+      models: snapshot.listForUser(scope).map((r) => {
+        const p = snapshot.billingPricingFor(r.modelId);
+        return {
+          model_id: r.modelId,
+          display_name: r.displayName,
+          engine: r.engine,
+          provider_id: r.providerId,
+          context_window: r.contextWindow,
+          supported_efforts: r.supportedEfforts,
+          supports_vision: r.supportsVision,
+          capability_zero: r.capabilityZero,
+          supports_thinking: r.supportsThinking,
+          default_effort: r.defaultEffort,
+          available:
+            r.providerId === null || !availability.unavailableProviderIds.has(r.providerId),
+          ...(p
+            ? {
+                input_per_mtok: p.input_per_mtok.toString(),
+                output_per_mtok: p.output_per_mtok.toString(),
+                cache_read_per_mtok: p.cache_read_per_mtok.toString(),
+                cache_write_per_mtok: p.cache_write_per_mtok.toString(),
+                multiplier: p.multiplier,
+              }
+            : {}),
+        };
+      }),
       // per-uid 投影哈希(全局 executionRevision **不下发**,R2-M12)。
       projection_revision: snapshot.projectionRevisionFor(scope),
       availability_revision: availability.revision,

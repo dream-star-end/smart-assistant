@@ -206,6 +206,11 @@ describe("internalModelCatalog — per-uid 投影下发", () => {
     assert.equal(glm.engine, "ccb");
     assert.equal(glm.provider_id, "ark");
     assert.equal(glm.default_effort, "high");
+    assert.equal(glm.input_per_mtok, "600");
+    assert.equal(glm.output_per_mtok, "2400");
+    assert.equal(glm.cache_read_per_mtok, "120");
+    assert.equal(glm.cache_write_per_mtok, "0");
+    assert.equal(glm.multiplier, "1.000");
     assert.deepEqual([...glm.supported_efforts], ["high", "max"]);
     assert.equal(glm.supports_vision, false);
     assert.deepEqual(body.aliases, {

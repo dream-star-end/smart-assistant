@@ -461,6 +461,7 @@ import {
   type LocalCatalogView,
   type LocalExecutionRejectCode,
 } from './modelCatalogClient.js'
+import { resolveDelegateCostUsd } from './usageCost.js'
 import type { CodexProviderConfigOverride } from './engine/codexShared.js'
 import {
   OPENCLAUDE_VISION_MCP_ID,
@@ -11716,7 +11717,7 @@ export class Gateway {
       // usage_log 是 eventBus 异步,return 时多半还没落盘,不能只靠它。
       tokensIn: session.totalInputTokens || null,
       tokensOut: session.totalOutputTokens || null,
-      costUsd: session.totalCostUSD || null,
+      costUsd: (await resolveDelegateCostUsd(session)) ?? null,
     }
   }
 
