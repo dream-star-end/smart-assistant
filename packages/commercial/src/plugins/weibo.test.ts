@@ -197,7 +197,7 @@ describe('official Weibo Plugin', () => {
   })
 
   test('pins the current artifact and only the exact production predecessor', () => {
-    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.17')
+    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.18')
     assert.equal(WEIBO_DRIVER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.equal(WEIBO_LAUNCHER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.deepEqual(WEIBO_SETUP_COMPATIBLE_PREDECESSORS, [
@@ -426,7 +426,7 @@ describe('official Weibo Plugin', () => {
     )
     assert.ok(
       WEIBO_WORKER_SOURCE.indexOf('await awaitDispatch();') <
-        WEIBO_WORKER_SOURCE.indexOf('await imageChooser.setFiles(files);'),
+        WEIBO_WORKER_SOURCE.indexOf('liveInput.setInputFiles(files);'),
       'media must not be uploaded before the parent dispatch fence is armed',
     )
     const createPostStart = WEIBO_WORKER_SOURCE.indexOf("if (input.actionId === 'create_post')")
@@ -444,6 +444,7 @@ describe('official Weibo Plugin', () => {
       WEIBO_WORKER_SOURCE,
       /uniqueImageFileInput\(scope\) \|\| await uniqueImageFileInput\(page\)/,
     )
+    assert.match(WEIBO_WORKER_SOURCE, /imageToolControl/)
     assert.match(WEIBO_WORKER_SOURCE, /countImageFileInputs/)
     assert.match(WEIBO_WORKER_SOURCE, /step: 'media.chooser'/)
     assert.match(WEIBO_WORKER_SOURCE, /step: 'media.upload'/)
@@ -455,8 +456,14 @@ describe('official Weibo Plugin', () => {
     assert.match(createPostSource, /90_000, previewBefore/)
     assert.ok(
       createPostSource.indexOf('previewBeforeCount') <
-        createPostSource.indexOf('await imageChooser.setFiles(files)'),
+        createPostSource.indexOf('liveInput.setInputFiles(files)'),
       'preview count/delete baselines must be captured before setFiles',
+    )
+    assert.match(createPostSource, /throw new Error\('media-upload'\)/)
+    assert.ok(
+      createPostSource.indexOf("throw new Error('media-upload')") <
+        createPostSource.indexOf('awaitComposerMediaReady'),
+      'empty file input must fail closed before waiting for preview',
     )
     assert.match(WEIBO_WORKER_SOURCE, /awaitComposerCleared/)
     assert.match(

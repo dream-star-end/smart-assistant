@@ -1335,10 +1335,29 @@ async function awaitFileChooser(page, clickable) {
   ]);
   return chooser;
 }
+async function imageToolControl(scope, page) {
+  const labeled = await exactMenuItem(scope, '图片') || await exactMenuItem(page, '图片');
+  if (labeled) return labeled;
+  for (const root of [scope, page]) {
+    if (!root || typeof root.locator !== 'function') continue;
+    const icons = root.locator('[title="图片"], [aria-label="图片"]');
+    if (!icons || typeof icons.count !== 'function' || typeof icons.nth !== 'function') continue;
+    const total = Math.min(await icons.count().catch(() => 0), 20);
+    const matches = [];
+    for (let index = 0; index < total; index += 1) {
+      const node = icons.nth(index);
+      if (!await visible(node)) continue;
+      const control = node.locator('xpath=ancestor-or-self::*[(self::button or @role="button" or @role="menuitem")][1]');
+      if (await control.count() === 1 && await visible(control)) matches.push(control);
+    }
+    if (matches.length === 1) return matches[0];
+  }
+  return null;
+}
 async function preparePostImageChooser(page, editor) {
   const scope = (await composerScope(editor)) || page;
   const existing = await uniqueImageFileInput(scope) || await uniqueImageFileInput(page);
-  const image = await exactMenuItem(scope, '图片');
+  const image = await imageToolControl(scope, page);
   const beforeScope = await countImageFileInputs(scope);
   const beforePage = await countImageFileInputs(page);
   let branch = 'miss';
@@ -1534,16 +1553,24 @@ async function writeAction(page, input) {
       const files = [];
       try {
         for (const item of manifest) files.push({ name: item.filename, mimeType: item.mimeType, buffer: await readFile('/inputs/' + item.inputId) });
-        await imageChooser.setFiles(files);
+        const scope = (await composerScope(freshEditor)) || page;
+        const liveInput = await uniqueImageFileInput(scope) || await uniqueImageFileInput(page);
         let selected = 0;
-        try {
-          selected = await imageChooser.element().evaluate((node) => node.files ? node.files.length : 0);
-        } catch {}
+        if (liveInput) {
+          await liveInput.setInputFiles(files);
+          try {
+            selected = await liveInput.evaluate((node) => node.files ? node.files.length : 0);
+          } catch {}
+        } else {
+          await imageChooser.setFiles(files);
+          try {
+            selected = await imageChooser.element().evaluate((node) => node.files ? node.files.length : 0);
+          } catch {}
+        }
         let retried = false;
         let freshSelected = -1;
         if (selected !== manifest.length) {
           retried = true;
-          const scope = (await composerScope(freshEditor)) || page;
           const freshInput = await uniqueImageFileInput(scope) || await uniqueImageFileInput(page);
           if (freshInput) {
             await freshInput.setInputFiles(files);
@@ -1552,6 +1579,7 @@ async function writeAction(page, input) {
             } catch {
               freshSelected = -1;
             }
+            if (freshSelected >= 0) selected = freshSelected;
           }
         }
         emitStep({
@@ -1561,6 +1589,7 @@ async function writeAction(page, input) {
           freshSelected,
           mediaCount: manifest.length,
         });
+        if (selected !== manifest.length) throw new Error('media-upload');
         await awaitComposerMediaReady(page, freshEditor, manifest.length, 90_000, previewBefore, previewBeforeCount, previewBeforeDelete);
       } finally {
         for (const file of files) file.buffer.fill(0);
