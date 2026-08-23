@@ -2465,8 +2465,10 @@ describe("userChatBridge / Grok subscription relay", () => {
     }));
     const forwarded = JSON.parse((await waitContainerNextFrame(containerWs)).data) as Record<string, unknown>;
     const requestId = forwarded.requestId as string;
+    const userCloseP = waitContainerClose(ws, 2_000);
     ws.close();
-    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    assert.equal(await userCloseP, true,
+      "client close handshake must enter bridge drain before terminal billing");
     assert.equal(releasedLeases.length, 0, "disconnect still preserves until the terminal billing frame");
     containerWs.send(JSON.stringify({
       type: "outbound.codex_billing",
