@@ -197,7 +197,7 @@ describe('official Weibo Plugin', () => {
   })
 
   test('pins the current artifact and only the exact production predecessor', () => {
-    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.18')
+    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.19')
     assert.equal(WEIBO_DRIVER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.equal(WEIBO_LAUNCHER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.deepEqual(WEIBO_SETUP_COMPATIBLE_PREDECESSORS, [
@@ -445,6 +445,8 @@ describe('official Weibo Plugin', () => {
       /uniqueImageFileInput\(scope\) \|\| await uniqueImageFileInput\(page\)/,
     )
     assert.match(WEIBO_WORKER_SOURCE, /imageToolControl/)
+    assert.match(WEIBO_WORKER_SOURCE, /@title="图片" or @aria-label="图片"/)
+    assert.match(WEIBO_WORKER_SOURCE, /woo-font--image/)
     assert.match(WEIBO_WORKER_SOURCE, /countImageFileInputs/)
     assert.match(WEIBO_WORKER_SOURCE, /step: 'media.chooser'/)
     assert.match(WEIBO_WORKER_SOURCE, /step: 'media.upload'/)

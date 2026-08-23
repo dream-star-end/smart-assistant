@@ -1154,8 +1154,14 @@ async function awaitNewestOwnPost(page, selfId, text, beforeIds) {
 }
 async function composerScope(editor) {
   if (!editor || typeof editor.locator !== 'function') return null;
-  const scope = editor.locator('xpath=ancestor::*[.//*[(self::button or @role="button" or @role="menuitem")][normalize-space()="图片"]][1]');
-  if (await scope.count() === 1) return scope;
+  const queries = [
+    'xpath=ancestor::*[.//*[(self::button or @role="button" or @role="menuitem")][normalize-space()="图片"]][1]',
+    'xpath=ancestor::*[.//*[@title="图片" or @aria-label="图片" or contains(@class,"woo-font--image") or contains(@class,"woo-font--pic")]][1]'
+  ];
+  for (const query of queries) {
+    const scope = editor.locator(query);
+    if (await scope.count() === 1) return scope;
+  }
   const parent = editor.locator('xpath=ancestor::*[2]');
   if (await parent.count() === 1) return parent;
   return editor;
@@ -1340,7 +1346,7 @@ async function imageToolControl(scope, page) {
   if (labeled) return labeled;
   for (const root of [scope, page]) {
     if (!root || typeof root.locator !== 'function') continue;
-    const icons = root.locator('[title="图片"], [aria-label="图片"]');
+    const icons = root.locator('[title="图片"], [aria-label="图片"], i.woo-font--image, i.woo-font--pic');
     if (!icons || typeof icons.count !== 'function' || typeof icons.nth !== 'function') continue;
     const total = Math.min(await icons.count().catch(() => 0), 20);
     const matches = [];
