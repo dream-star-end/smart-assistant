@@ -1238,36 +1238,35 @@ async function awaitFileChooser(page, clickable) {
 }
 async function preparePostImageChooser(page, editor) {
   const scope = (await composerScope(editor)) || page;
+  const existing = await uniqueImageFileInput(scope);
   const image = await exactMenuItem(scope, '图片');
-  if (!image) {
-    const existing = await uniqueImageFileInput(scope);
-    if (existing) return wrapFileInput(existing);
-    throw new Error('media-chooser');
+  if (image) {
+    await image.click({ trial: true, timeout: 10_000 });
+    let chooserSettled = false;
+    const chooserWait = page.waitForEvent('filechooser', { timeout: 10_000 }).then((chooser) => {
+      chooserSettled = true;
+      return chooser;
+    }).catch(() => {
+      chooserSettled = true;
+      return null;
+    });
+    await image.click({ timeout: 10_000 });
+    const deadline = Date.now() + 10_000;
+    while (Date.now() <= deadline) {
+      const remaining = Math.max(1, deadline - Date.now());
+      const chooser = await Promise.race([
+        chooserWait,
+        page.waitForTimeout(Math.min(250, remaining)).then(() => undefined)
+      ]);
+      if (chooser) return chooser;
+      const local = await exactMenuItem(scope, '本地上传') || await exactMenuItem(page, '本地上传');
+      if (local) return awaitFileChooser(page, local);
+      const appeared = await uniqueImageFileInput(scope) || await uniqueImageFileInput(page);
+      if (appeared) return wrapFileInput(appeared);
+      if (chooserSettled) break;
+    }
   }
-  await image.click({ trial: true, timeout: 10_000 });
-  let chooserSettled = false;
-  const chooserWait = page.waitForEvent('filechooser', { timeout: 10_000 }).then((chooser) => {
-    chooserSettled = true;
-    return chooser;
-  }).catch(() => {
-    chooserSettled = true;
-    return null;
-  });
-  await image.click({ timeout: 10_000 });
-  const deadline = Date.now() + 10_000;
-  while (Date.now() <= deadline) {
-    const remaining = Math.max(1, deadline - Date.now());
-    const chooser = await Promise.race([
-      chooserWait,
-      page.waitForTimeout(Math.min(250, remaining)).then(() => undefined)
-    ]);
-    if (chooser) return chooser;
-    const local = await exactMenuItem(scope, '本地上传') || await exactMenuItem(page, '本地上传');
-    if (local) return awaitFileChooser(page, local);
-    const appeared = await uniqueImageFileInput(scope) || await uniqueImageFileInput(page);
-    if (appeared) return wrapFileInput(appeared);
-    if (chooserSettled) break;
-  }
+  if (existing) return wrapFileInput(existing);
   throw new Error('media-chooser');
 }
 async function openLongTextComposer(page) {
