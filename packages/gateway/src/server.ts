@@ -298,6 +298,12 @@ import {
   sendToAgentCallbackClientMessageId,
   sendToAgentCallbackIdempotencyKey,
 } from './sendToAgentCallback.js'
+import {
+  persistSendToAgentIntent,
+  recoverInterruptedSendToAgentIntents,
+  removeSendToAgentIntent,
+  type SendToAgentIntent,
+} from './sendToAgentIntentStore.js'
 import { handleTaskboardApi, resolveTaskboardActor, setPatrolExecutionHandler } from './taskboard/http.js'
 import { getTaskboardDb } from './taskboard/db/index.js'
 import { isPatrolSessionKey } from './taskboard/domain.js'
@@ -1717,6 +1723,11 @@ interface RunDelegateInput {
   resumeMinted?: boolean
   /** send_to_agent: child 完成后把结论注入父 webchat 并新开父 turn。 */
   callbackOnComplete?: 'origin-inject'
+  /** Captured while the delegate parent chain is still live; nested parents are ephemeral. */
+  callbackOriginSessionKey?: string
+  callbackOriginUserId?: string
+  /** Async handle returned to the send_to_agent tool, used as exact UI correlation. */
+  backgroundJobId?: string
 }
 /** `_runDelegateTask` 结果。rejected=闸/校验拒(HTTP 壳映射 4xx/429/503);error=session
  *  创建等意外(映射 500);completed=真正执行完(ok/output/error/timedOut,review 还带 verdict)。 */
@@ -2429,6 +2440,17 @@ export class Gateway {
       }
     } catch (err) {
       this.log.error('msg-outbox replay failed (continuing startup)', undefined, err as Error)
+    }
+
+    try {
+      const summary = await recoverInterruptedSendToAgentIntents((intent) =>
+        this._deliverInterruptedSendToAgentIntent(intent),
+      )
+      if (summary.recovered > 0 || summary.retained > 0 || summary.malformed > 0) {
+        this.log.info('send_to_agent intent recovery', summary)
+      }
+    } catch (err) {
+      this.log.error('send_to_agent intent recovery failed (continuing startup)', undefined, err as Error)
     }
 
     // V3 commercial: container → master sink for server-authored messages.
@@ -3306,6 +3328,7 @@ export class Gateway {
     } catch {}
     this._stopEviction = null
     try {
+      await this._persistInterruptedSendToAgentCallbacks()
       this._delegateJobs?.close()
     } catch {}
     this._delegateJobs = undefined
@@ -10318,6 +10341,17 @@ export class Gateway {
   /** Cursor MCP 60s 上限的异步委派作业句柄。测试脚手架 Object.create 不跑字段
    *  初始化,使用处惰性 ??=。 */
   private _delegateJobs: DelegateJobStore | undefined
+  private readonly _activeSendToAgentCallbacks = new Map<string, {
+    originSessionKey: string
+    userId?: string
+    agentId: string
+    goal: string
+  }>()
+  private readonly _syntheticTurnBarriers = new Map<string, {
+    owner: string
+    done: Promise<void>
+    release: () => void
+  }>()
   /** HTTP/MCP delegate 续跑绑定。测试脚手架 Object.create 不跑字段初始化,使用处惰性 ??=。 */
   private _delegateResume: DelegateResumeRegistry | undefined
 
@@ -10715,6 +10749,12 @@ export class Gateway {
     if (!resume.ok) {
       return this.sendError(res, resume.httpStatus, resume.message)
     }
+    const callbackOnComplete = isSendToAgentCallbackComplete(parsed.callbackOnComplete)
+      ? 'origin-inject' as const
+      : undefined
+    const callbackTarget = callbackOnComplete
+      ? this._resolveDelegateProgressTarget({ parentSessionKey, sourceAgent: sourceAgentId })?.target
+      : undefined
     const runInput: RunDelegateInput = {
       targetAgentId,
       goal,
@@ -10729,9 +10769,9 @@ export class Gateway {
       sessionKey: resume.sessionKey,
       resumable: true,
       resumeMinted: resume.minted,
-      callbackOnComplete: isSendToAgentCallbackComplete(parsed.callbackOnComplete)
-        ? 'origin-inject'
-        : undefined,
+      callbackOnComplete,
+      callbackOriginSessionKey: callbackTarget?.sessionKey,
+      callbackOriginUserId: callbackTarget?.userId,
     }
     // 默认同步:行为与改前完全一致(CCB/Codex 继续堵在 HTTP 上)。仅 `async: true`
     // 才切作业句柄 —— 子任务仍走同一条 _runDelegateTask(idle/hard/祖先活性/深度/并发闸全在)。
@@ -10745,6 +10785,32 @@ export class Gateway {
         return this.sendError(res, 503, 'too many in-flight delegate jobs')
       }
       const jobId = created.jobId
+      runInput.backgroundJobId = jobId
+      if (callbackOnComplete && callbackTarget) {
+        const intent: SendToAgentIntent = {
+          v: 1,
+          jobId,
+          originSessionKey: callbackTarget.sessionKey,
+          userId: callbackTarget.userId,
+          agentId: targetAgentId,
+          goal,
+          createdAt: Date.now(),
+        }
+        try {
+          await this._persistSendToAgentIntent(intent)
+        } catch (err) {
+          this._delegateResume.abort(resume.sessionKey, resume.minted)
+          store.complete(jobId, { httpStatus: 503, body: { error: 'background callback persistence unavailable' } })
+          this.log.warn('send_to_agent intent persist failed', { jobId }, err as Error)
+          return this.sendError(res, 503, 'background callback persistence unavailable')
+        }
+        this._activeSendToAgentCallbacks.set(jobId, {
+          originSessionKey: callbackTarget.sessionKey,
+          userId: callbackTarget.userId,
+          agentId: targetAgentId,
+          goal,
+        })
+      }
       void this._runDelegateTask(runInput)
         .then((result) => {
           store.complete(jobId, this._delegateResultToHttp(result, targetAgentId))
@@ -11333,6 +11399,7 @@ export class Gateway {
             // the leader's delegate_task tool_use card (matched by agentId+goal)
             // instead of spawning a separate progress card.
             goal,
+            jobId: input.backgroundJobId,
           }),
         )
       }
@@ -12215,10 +12282,14 @@ export class Gateway {
       return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_LOOKUP_FAILED' }
     }
     if (!existing) return { kind: 'fallback' }
+    const liveParent = this.sessions.getByKey(origin.sessionKey)
+    if ((liveParent?._activeTurnCount ?? 0) > 0 || (liveParent?._activeClientTurnCount ?? 0) > 0) {
+      return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_BUSY' }
+    }
     const text = buildCronOriginResumeText(job)
     const clientMessageId = cronOriginClientMessageId(delivery.deliveryId)
     try {
-      const persisted = await appendServerAuthoredMessageDurable(origin.peerId, userId, {
+      const persisted = await appendServerAuthoredMessage(origin.peerId, userId, {
         id: clientMessageId,
         role: 'user',
         text,
@@ -12227,10 +12298,7 @@ export class Gateway {
       if (!persisted.applied) {
         if (persisted.reason === 'already_exists') {
           // retry of the same occurrence — continue to dispatch (idempotent)
-        } else if (
-          persisted.reason === 'session_deleted' ||
-          persisted.reason === 'queued_to_outbox'
-        ) {
+        } else if (persisted.reason === 'session_deleted') {
           return { kind: 'fallback' }
         } else {
           return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_PERSIST_FAILED' }
@@ -12259,19 +12327,74 @@ export class Gateway {
     return { kind: 'injected' }
   }
 
+  private async _acquireSyntheticTurnBarrier(sessionKey: string): Promise<{
+    owner: string
+    release: () => void
+  }> {
+    for (;;) {
+      const existing = this._syntheticTurnBarriers.get(sessionKey)
+      if (!existing) break
+      await existing.done
+    }
+    const owner = `synthetic-${randomBytes(8).toString('hex')}`
+    let resolveDone!: () => void
+    const done = new Promise<void>((resolve) => { resolveDone = resolve })
+    let released = false
+    const release = () => {
+      if (released) return
+      released = true
+      const current = this._syntheticTurnBarriers.get(sessionKey)
+      if (current?.owner === owner) this._syntheticTurnBarriers.delete(sessionKey)
+      resolveDone()
+    }
+    this._syntheticTurnBarriers.set(sessionKey, { owner, done, release })
+    return { owner, release }
+  }
+
+  private _persistSendToAgentIntent(intent: SendToAgentIntent): Promise<void> {
+    return persistSendToAgentIntent(intent)
+  }
+
+  private async _deliverInterruptedSendToAgentIntent(intent: SendToAgentIntent): Promise<boolean> {
+    const origin = parseOriginWebchatSessionKey(intent.originSessionKey)
+    if (!origin) return true
+    const userId = intent.userId || process.env.OC_USER_ID?.trim() || 'default'
+    const result = await appendServerAuthoredMessage(origin.peerId, userId, {
+      id: `sta-restart-${intent.jobId}`,
+      role: 'system',
+      text: `后台任务（${intent.agentId}：${intent.goal.slice(0, 120)}）在服务重启时未确认完成，请重新发起。`,
+      ts: Date.now(),
+      status: 'interrupted',
+    })
+    return result.applied || result.reason === 'already_exists' || result.reason === 'session_deleted'
+  }
+
+  private async _persistInterruptedSendToAgentCallbacks(): Promise<void> {
+    this._activeSendToAgentCallbacks.clear()
+    await recoverInterruptedSendToAgentIntents((intent) =>
+      this._deliverInterruptedSendToAgentIntent(intent),
+    )
+  }
+
   private _queueSendToAgentCallback(
     runInput: RunDelegateInput,
     args: { jobId: string; agentId: string; goal: string; output?: string; error?: string },
   ): void {
     if (runInput.callbackOnComplete !== 'origin-inject') return
     void this.injectSendToAgentCallback({
-      parentSessionKey: runInput.parentSessionKey,
+      parentSessionKey: runInput.callbackOriginSessionKey ?? runInput.parentSessionKey,
       jobId: args.jobId,
       agentId: args.agentId,
       goal: args.goal,
       output: args.output,
       error: args.error,
-      userId: this.sessions.getByKey(runInput.parentSessionKey || '')?.userId,
+      userId:
+        runInput.callbackOriginUserId ??
+        this.sessions.getByKey(runInput.parentSessionKey || '')?.userId,
+    }).then(async (result) => {
+      if (result.kind !== 'injected') return
+      this._activeSendToAgentCallbacks.delete(args.jobId)
+      await removeSendToAgentIntent(args.jobId)
     }).catch((err) => {
       this.log.warn('send_to_agent callback inject failed', {
         jobId: args.jobId,
@@ -12308,31 +12431,48 @@ export class Gateway {
       error: args.error,
     })
     const clientMessageId = sendToAgentCallbackClientMessageId(args.jobId)
-    const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
+    const sleep = (ms: number) => new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, ms)
+      timer.unref?.()
+    })
     let delayMs = 500
-    for (;;) {
-      const parent = this.sessions.getByKey(origin.sessionKey)
-      if (parent?._currentDispatch) {
-        await sleep(delayMs)
-        delayMs = Math.min(delayMs * 2, 5_000)
-        continue
+    for (let attemptNo = 0; attemptNo < 12; attemptNo += 1) {
+      if (this._shuttingDown) return { kind: 'fallback' }
+      const barrier = await this._acquireSyntheticTurnBarrier(origin.sessionKey)
+      let queued = false
+      let attempt: CronOriginFireResult
+      try {
+        const parent = this.sessions.getByKey(origin.sessionKey)
+        if ((parent?._activeTurnCount ?? 0) > 0 || (parent?._activeClientTurnCount ?? 0) > 0) {
+          attempt = { kind: 'retryable_failure', code: 'ORIGIN_SESSION_BUSY' }
+        } else {
+          const userId =
+            (typeof args.userId === 'string' && args.userId.trim()) ||
+            parent?.userId ||
+            process.env.OC_USER_ID?.trim() ||
+            'default'
+          attempt = await this.trySendToAgentCallbackDispatch({
+            origin,
+            userId,
+            text,
+            clientMessageId,
+            jobId: args.jobId,
+            barrierOwner: barrier.owner,
+            onQueued: () => {
+              queued = true
+              barrier.release()
+            },
+          })
+        }
+      } finally {
+        if (!queued) barrier.release()
       }
-      const userId =
-        (typeof args.userId === 'string' && args.userId.trim()) ||
-        parent?.userId ||
-        process.env.OC_USER_ID?.trim() ||
-        'default'
-      const attempt = await this.trySendToAgentCallbackDispatch({
-        origin,
-        userId,
-        text,
-        clientMessageId,
-        jobId: args.jobId,
-      })
       if (attempt.kind === 'injected' || attempt.kind === 'fallback') return attempt
       await sleep(delayMs)
       delayMs = Math.min(delayMs * 2, 5_000)
     }
+    this.log.warn('send_to_agent callback retry budget exhausted', { jobId: args.jobId })
+    return { kind: 'fallback' }
   }
 
   private async trySendToAgentCallbackDispatch(args: {
@@ -12341,6 +12481,8 @@ export class Gateway {
     text: string
     clientMessageId: string
     jobId: string
+    barrierOwner?: string
+    onQueued?: () => void
   }): Promise<CronOriginFireResult> {
     if (this._shuttingDown || this._runtimeRecycleDrainUntil > Date.now()) {
       return { kind: 'retryable_failure', code: 'NO_TRANSPORT' }
@@ -12348,7 +12490,7 @@ export class Gateway {
     try {
       const existing = await getClientSession(args.origin.peerId, args.userId)
       if (existing) {
-        const persisted = await appendServerAuthoredMessageDurable(args.origin.peerId, args.userId, {
+        const persisted = await appendServerAuthoredMessage(args.origin.peerId, args.userId, {
           id: args.clientMessageId,
           role: 'user',
           text: args.text,
@@ -12359,7 +12501,8 @@ export class Gateway {
             // same job retry — continue to dispatch
           } else if (
             persisted.reason === 'session_deleted' ||
-            persisted.reason === 'queued_to_outbox'
+            persisted.reason === 'malformed' ||
+            persisted.reason === 'oversized'
           ) {
             return { kind: 'fallback' }
           } else {
@@ -12377,6 +12520,7 @@ export class Gateway {
       return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_PERSIST_FAILED' }
     }
     try {
+      let wasQueued = false
       await this.dispatchInbound({
         type: 'inbound.message',
         channel: args.origin.channel,
@@ -12388,7 +12532,13 @@ export class Gateway {
         clientMessageId: args.clientMessageId,
         _userId: args.userId,
         _skipRateLimit: true,
+        _syntheticBarrierOwner: args.barrierOwner,
+        _onSyntheticQueued: () => {
+          wasQueued = true
+          args.onQueued?.()
+        },
       } as any)
+      if (!wasQueued) return { kind: 'retryable_failure', code: 'NO_TRANSPORT' }
     } catch (err) {
       this.log.warn('send_to_agent callback dispatch failed', { jobId: args.jobId }, err as Error)
       return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_DISPATCH_FAILED' }
@@ -15492,6 +15642,11 @@ export class Gateway {
       // TODO: 权限响应处理
       return
     }
+    const syntheticBarrierKey = `agent:${frame.agentId}:${frame.channel}:${frame.peer.kind}:${frame.peer.id.replace(/[^a-zA-Z0-9_-]/g, '_')}`
+    const syntheticBarrier = this._syntheticTurnBarriers.get(syntheticBarrierKey)
+    if (syntheticBarrier && (frame as any)._syntheticBarrierOwner !== syntheticBarrier.owner) {
+      await syntheticBarrier.done
+    }
     if (this._runtimeRecycleDrainUntil > Date.now()) {
       this.log.info('runtime recycle drain rejected inbound turn')
       return
@@ -17329,7 +17484,7 @@ export class Gateway {
     let clientTurnThrew = false
     let clientTurnError: unknown | undefined
     try {
-      await this.sessions.submit(
+      const submitPromise = this.sessions.submit(
         session,
         payload,
         onLeaderEvent,
@@ -17341,6 +17496,8 @@ export class Gateway {
         safeConversationMode,
         leaderSubmitOpts,
       )
+      try { (frame as any)._onSyntheticQueued?.() } catch {}
+      await submitPromise
       deliverPendingApiErrorTerminal()
 
     } catch (err) {

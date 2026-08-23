@@ -27,6 +27,8 @@ export type DelegateProgressBlock = {
    * 不做摘要折叠 / 截断改写,保持与队长 tool_use input.goal 同源以便精确匹配。
    */
   goal?: string
+  /** Exact async handle returned by send_to_agent; avoids goal-key ambiguity. */
+  jobId?: string
   /** Absolute usage snapshot for one exact child execution. `runId` may be
    * rebound to a first-level visible card; this id never changes. */
   usageRunId?: string
@@ -95,6 +97,7 @@ export function makeDelegateProgressBlock(args: {
   toolName?: unknown
   isError?: boolean
   goal?: unknown
+  jobId?: unknown
   maxLen?: number
   preserveWhitespace?: boolean
 }): DelegateProgressBlock {
@@ -111,6 +114,9 @@ export function makeDelegateProgressBlock(args: {
   const toolName = sanitizeDelegateProgressText(args.toolName, 80)
   if (toolName) block.toolName = toolName
   if (args.isError !== undefined) block.isError = Boolean(args.isError)
+  if (typeof args.jobId === 'string' && /^dlgjob-[A-Za-z0-9-]{1,160}$/.test(args.jobId)) {
+    block.jobId = args.jobId
+  }
   if (args.goal !== undefined) {
     const goal = normalizeDelegateGoalKey(args.goal)
     if (goal) block.goal = goal

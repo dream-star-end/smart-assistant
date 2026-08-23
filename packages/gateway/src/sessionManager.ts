@@ -746,6 +746,8 @@ export interface AgentSession {
   lastUsedAt: number
   // 跨 turn 累积
   totalCostUSD: number
+  /** Monotonic: any estimated/unpriced turn makes the resumed aggregate imprecise. */
+  costImprecise?: boolean
   totalInputTokens: number
   totalOutputTokens: number
   totalCacheReadTokens: number
@@ -1823,6 +1825,7 @@ export class SessionManager {
         this._resumeMapTimestamps.delete(sessionKey)
         this._resumeMapProvider.delete(sessionKey)
         this._resumeMapLastCost.delete(sessionKey)
+        this._resumeMapCostImprecise.delete(sessionKey)
         session.ccbSessionId = null
         session.runner.clearSessionId?.()
         this._saveResumeMap()
@@ -2505,6 +2508,7 @@ export class SessionManager {
       this._resumeMapTimestamps.delete(session.sessionKey)
       this._resumeMapProvider.delete(session.sessionKey)
       this._resumeMapLastCost.delete(session.sessionKey)
+      this._resumeMapCostImprecise.delete(session.sessionKey)
       session.ccbSessionId = null
       session.runner.clearSessionId?.()
       this._saveResumeMap()
@@ -2686,6 +2690,7 @@ export class SessionManager {
       this._resumeMapTimestamps.delete(sessionKey)
       this._resumeMapProvider.delete(sessionKey)
       this._resumeMapLastCost.delete(sessionKey)
+      this._resumeMapCostImprecise.delete(sessionKey)
       this._saveResumeMap()
       return undefined
     }
@@ -2698,6 +2703,7 @@ export class SessionManager {
       this._resumeMapTimestamps.delete(sessionKey)
       this._resumeMapProvider.delete(sessionKey)
       this._resumeMapLastCost.delete(sessionKey)
+      this._resumeMapCostImprecise.delete(sessionKey)
       this._saveResumeMap()
       return undefined
     }
@@ -2773,6 +2779,11 @@ export class SessionManager {
     return tag === wantProvider ? cost : undefined
   }
 
+  private _costImpreciseFor(sessionKey: string, wantProvider: string): boolean {
+    const tag = SessionManager.normalizeEngineTag(this._resumeMapProvider.get(sessionKey))
+    return tag === wantProvider && this._resumeMapCostImprecise.get(sessionKey) === true
+  }
+
   /** M1a:resume-map provider tag 的历史值归一。旧格式在 P1f 前写过
    *  'codex-native'(provider 语义);engine 维度泛化后统一为 engine id
    *  'codex',其余(含缺省)一律 'ccb'。加载与比较都过这一个函数,
@@ -2828,6 +2839,9 @@ export class SessionManager {
             if (typeof lastCost === 'number' && Number.isFinite(lastCost) && lastCost >= 0) {
               this._resumeMapLastCost.set(key, lastCost)
             }
+            if ((val as any).costImprecise === true) {
+              this._resumeMapCostImprecise.set(key, true)
+            }
             // M1a:tag 归一为 engine id(历史 'codex-native' → 'codex')。
             this._resumeMapProvider.set(key, prov)
           }
@@ -2846,6 +2860,7 @@ export class SessionManager {
       id: string
       ts: number
       lastCost?: number
+      costImprecise?: boolean
       provider?: string
       historyContextVersion?: number
     }
@@ -2858,6 +2873,7 @@ export class SessionManager {
       }
       const cached = this._resumeMapLastCost.get(key)
       if (cached !== undefined && cached > 0) entry.lastCost = cached
+      if (this._resumeMapCostImprecise.get(key) === true) entry.costImprecise = true
       const prov = SessionManager.normalizeEngineTag(this._resumeMapProvider.get(key))
       if (prov === SessionManager.CCB_PROVIDER_TAG) {
         entry.historyContextVersion = SessionManager.CCB_RESUME_HISTORY_CONTEXT_VERSION
@@ -2873,6 +2889,7 @@ export class SessionManager {
           ts: now,
         }
         if (sess._lastCcbCumulativeCost > 0) entry.lastCost = sess._lastCcbCumulativeCost
+        if (sess.costImprecise === true) entry.costImprecise = true
         const prov = SessionManager.normalizeEngineTag(this._resumeMapProvider.get(key))
         if (prov === SessionManager.CCB_PROVIDER_TAG) {
           entry.historyContextVersion = SessionManager.CCB_RESUME_HISTORY_CONTEXT_VERSION
@@ -2883,6 +2900,7 @@ export class SessionManager {
         this._resumeMap.set(key, sess.ccbSessionId)
         this._resumeMapTimestamps.set(key, now)
         this._resumeMapLastCost.set(key, sess._lastCcbCumulativeCost)
+        if (sess.costImprecise === true) this._resumeMapCostImprecise.set(key, true)
       }
     }
     const data = JSON.stringify(obj, null, 2)
@@ -3303,6 +3321,7 @@ export class SessionManager {
       // will start at 0 after a resume. This is a known limitation; fixing it
       // requires persisting per-token totals which we do not currently do.
       totalCostUSD: this._lastCostFor(opts.sessionKey, engineId) ?? 0,
+      costImprecise: this._costImpreciseFor(opts.sessionKey, engineId),
       totalInputTokens: 0,
       totalOutputTokens: 0,
       totalCacheReadTokens: 0,
@@ -3385,6 +3404,7 @@ export class SessionManager {
           this._resumeMapTimestamps.delete(opts.sessionKey)
           this._resumeMapProvider.delete(opts.sessionKey)
           this._resumeMapLastCost.delete(opts.sessionKey)
+          this._resumeMapCostImprecise.delete(opts.sessionKey)
           session.ccbSessionId = null
           session._pendingStaleResumeClear = false
           // Also forget the id inside the runner — otherwise submit()'s next
@@ -3984,6 +4004,7 @@ export class SessionManager {
         this._resumeMapTimestamps.delete(session.sessionKey)
         this._resumeMapProvider.delete(session.sessionKey)
         this._resumeMapLastCost.delete(session.sessionKey)
+        this._resumeMapCostImprecise.delete(session.sessionKey)
         session.ccbSessionId = null
         session.runner.clearSessionId?.()
         this._saveResumeMap()
@@ -5487,6 +5508,7 @@ export class SessionManager {
             this._resumeMapTimestamps.delete(session.sessionKey)
             this._resumeMapProvider.delete(session.sessionKey)
             this._resumeMapLastCost.delete(session.sessionKey)
+            this._resumeMapCostImprecise.delete(session.sessionKey)
             session.ccbSessionId = null
             runner.clearSessionId?.()
             this._saveResumeMap()
@@ -5861,7 +5883,15 @@ export class SessionManager {
               terminalBillingStatus:
                 terminalExternalBilling?.status ?? terminalEngineBilling?.status,
             })
-            if (pricedUsd != null) session.totalCostUSD = prevCostUSD + pricedUsd
+            if (pricedUsd != null) {
+              session.totalCostUSD = prevCostUSD + pricedUsd
+              // Gateway-side catalog backfill is an estimate unless the engine
+              // reports vendor USD. Keep the estimate visible, but never present
+              // it as the exact master admission/ledger amount.
+              session.costImprecise = true
+            }
+            const resultUsageCost = result.usage as typeof result.usage & { costImprecise?: boolean }
+            if (resultUsageCost.costImprecise === true) session.costImprecise = true
             session.totalInputTokens += result.usage.inputTokens
             session.totalOutputTokens += result.usage.outputTokens
             session.totalCacheReadTokens += result.usage.cacheReadTokens
@@ -6447,6 +6477,7 @@ export class SessionManager {
         this._resumeMapTimestamps.delete(sessionKey)
         this._resumeMapProvider.delete(sessionKey)
         this._resumeMapLastCost.delete(sessionKey)
+        this._resumeMapCostImprecise.delete(sessionKey)
         session.ccbSessionId = null
         session.runner.clearSessionId?.()
         this._saveResumeMap()
@@ -6513,6 +6544,7 @@ export class SessionManager {
       this._resumeMap.delete(sessionKey)
       this._resumeMapTimestamps.delete(sessionKey)
       this._resumeMapLastCost.delete(sessionKey)
+      this._resumeMapCostImprecise.delete(sessionKey)
       this._resumeMapProvider.delete(sessionKey)
       this._saveResumeMap()
     }
@@ -6564,6 +6596,7 @@ export class SessionManager {
     this._resumeMap.delete(sessionKey)
     this._resumeMapTimestamps.delete(sessionKey)
     this._resumeMapLastCost.delete(sessionKey)
+    this._resumeMapCostImprecise.delete(sessionKey)
     this._resumeMapProvider.delete(sessionKey)
     this._saveResumeMap()
   }
@@ -6681,6 +6714,7 @@ export class SessionManager {
               this._resumeMap.delete(key)
               this._resumeMapTimestamps.delete(key)
               this._resumeMapLastCost.delete(key)
+              this._resumeMapCostImprecise.delete(key)
               this._resumeMapProvider.delete(key)
             }
             // Medium#G1 + N11:shutdown 完才清 ring,保证不会有"runner 已死但 ring 还能
@@ -6706,6 +6740,7 @@ export class SessionManager {
   // `result` arrives (otherwise the parser would compute delta against 0 and
   // re-attribute the entire historical cumulative as this turn's cost).
   private _resumeMapLastCost = new Map<string, number>()
+  private _resumeMapCostImprecise = new Map<string, boolean>()
   // Idle TTL for entries whose in-memory AgentSession was already evicted.
   // 7 days covers typical gateway restarts / multi-day reconnect gaps while
   // preventing resume-map from growing unbounded. Rationale: resume-map exists
@@ -6725,6 +6760,7 @@ export class SessionManager {
         this._resumeMap.delete(key)
         this._resumeMapTimestamps.delete(key)
         this._resumeMapLastCost.delete(key)
+        this._resumeMapCostImprecise.delete(key)
         this._resumeMapProvider.delete(key)
         pruned = true
         log.info('pruned idle resume-map entry', {

@@ -823,3 +823,24 @@ describe('BL4 first-pack budget includes goal and falls back when exhausted', ()
     }
   })
 })
+
+describe('send_to_agent exact job correlation', () => {
+  it('folds identical goals into two exact groups without standalone duplicates', () => {
+    const frames = [
+      frame('j1', 1, { kind: 'tool_use', blockId: 'tool-a', toolName: 'send_to_agent', inputJson: { agentId: 'research-assistant', message: 'same' } }),
+      frame('j2', 2, { kind: 'tool_use', blockId: 'tool-b', toolName: 'send_to_agent', inputJson: { agentId: 'research-assistant', message: 'same' } }),
+      frame('j3', 3, { kind: 'delegate_progress', runId: 'run-a', jobId: 'dlgjob-a', agentId: 'research-assistant', goal: 'same', phase: 'start' }),
+      frame('j4', 4, { kind: 'delegate_progress', runId: 'run-b', jobId: 'dlgjob-b', agentId: 'research-assistant', goal: 'same', phase: 'start' }),
+      frame('j5', 5, { kind: 'tool_result', toolUseBlockId: 'tool-a', output: JSON.stringify({ status: 'running', jobId: 'dlgjob-a' }) }),
+      frame('j6', 6, { kind: 'tool_result', toolUseBlockId: 'tool-b', output: JSON.stringify({ status: 'running', jobId: 'dlgjob-b' }) }),
+      frame('j7', 7, { kind: 'delegate_progress', runId: 'run-a', jobId: 'dlgjob-a', phase: 'done' }),
+      frame('j8', 8, { kind: 'delegate_progress', runId: 'run-b', jobId: 'dlgjob-b', phase: 'done' }),
+    ]
+    const reduced = reduceLiveFrames(frames)
+    assert.equal(reduced.ok, true)
+    if (!reduced.ok) return
+    assert.equal(reduced.state.units.length, 2)
+    assert.deepEqual(new Set(reduced.state.units.map((unit) => unit.runId)), new Set(['run-a', 'run-b']))
+    assert.equal(reduced.state.units.every((unit) => unit.completed === true), true)
+  })
+})

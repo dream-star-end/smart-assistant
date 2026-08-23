@@ -651,7 +651,7 @@ async function dispatch(
 
   if (path === '/api/board/projects') {
     if (method === 'GET') return handleListProjects(res, url, db)
-    if (method === 'POST') return handleCreateProject(res, await readJsonBody(req), db)
+    if (method === 'POST') return handleCreateProject(res, await readJsonBody(req), db, actor, ctx)
     return sendError(res, 405, 'method not allowed')
   }
 
@@ -734,7 +734,7 @@ async function dispatch(
   if (pipelineStages) {
     const id = decodeURIComponent(pipelineStages[1])
     if (method === 'GET') return handleListStages(res, db, id)
-    if (method === 'POST') return handleCreateStage(res, await readJsonBody(req), db, id, ctx)
+    if (method === 'POST') return handleCreateStage(res, await readJsonBody(req), db, id, actor, ctx)
     return sendError(res, 405, 'method not allowed')
   }
 
@@ -804,6 +804,8 @@ async function dispatch(
         await readJsonBody(req),
         db,
         decodeURIComponent(templateApply[1]),
+        actor,
+        ctx,
       )
     }
     return sendError(res, 405, 'method not allowed')
@@ -827,14 +829,22 @@ function handleListProjects(res: ServerResponse, url: URL, db: TaskboardDb): voi
   sendJson(res, 200, { items: listProjects(db, { includeArchived }) })
 }
 
-function handleCreateProject(
+async function handleCreateProject(
   res: ServerResponse,
   body: Record<string, unknown>,
   db: TaskboardDb,
-): void {
+  actor: Actor,
+  ctx: TaskboardHttpContext,
+): Promise<void> {
   const key = asString(body.key)
   const name = asString(body.name)
   if (!key || !name) throw new TaskboardValidationError('key and name are required')
+  const templateIds = asStringArray(body.templateIds)
+  if (actor !== 'human' && templateIds !== undefined && templateIds.length > 0) {
+    sendError(res, 403, 'forbidden', { code: 'forbidden' })
+    return
+  }
+  if (templateIds?.length) await assertTemplatesValidForApply(db, templateIds, ctx)
   try {
     const created = db.transaction(() => {
       const project = createProject(db, {
@@ -844,7 +854,6 @@ function handleCreateProject(
         workspace: asNullableString(body.workspace) ?? null,
         labels: asStringArray(body.labels) ?? [],
       })
-      const templateIds = asStringArray(body.templateIds)
       if (templateIds === undefined) {
         seedDefaultPipelines(db, project.id)
       } else if (templateIds.length > 0) {
@@ -2197,6 +2206,29 @@ function validateStageWrite(input: {
   }
 }
 
+async function assertTemplatesValidForApply(
+  db: TaskboardDb,
+  templateIds: string[],
+  ctx: TaskboardHttpContext,
+): Promise<void> {
+  for (const templateId of templateIds) {
+    const template = getTemplate(db, templateId)
+    if (!template) throw new TaskboardNotFound('template', templateId)
+    for (const stage of template.stages) {
+      validateStageWrite({
+        kind: stage.kind,
+        agentId: stage.agentId,
+        promptTemplate: stage.promptTemplate,
+        patrolEnabled: stage.patrolEnabled,
+        patrolCron: stage.patrolCron,
+        entryCondition: stage.entryCondition,
+        timeoutSec: stage.timeoutSec,
+      })
+      if (stage.model) await assertStageModelAvailable(stage.model, ctx)
+    }
+  }
+}
+
 function throwIfStageOrdinalConflict(err: unknown): void {
   if (isUniqueConstraint(err, 'ordinal')) {
     throw new TaskboardValidationError('同一流水线内阶段序号(ordinal)不能重复')
@@ -2208,8 +2240,13 @@ async function handleCreateStage(
   body: Record<string, unknown>,
   db: TaskboardDb,
   pipelineId: string,
+  actor: Actor,
   ctx: TaskboardHttpContext,
 ): Promise<void> {
+  if (actor !== 'human') {
+    sendError(res, 403, 'forbidden', { code: 'forbidden' })
+    return
+  }
   if (!getPipeline(db, pipelineId)) throw new TaskboardNotFound('pipeline', pipelineId)
   const name = asString(body.name)
   const kindRaw = asString(body.kind)
@@ -2331,7 +2368,7 @@ async function handlePatchStage(
   const entryCondition = asNullableString(body.entryCondition)
   const timeoutSec = typeof body.timeoutSec === 'number' ? body.timeoutSec : existing.timeoutSec
   const model = Object.hasOwn(body, 'model') ? normalizeStageModelInput(body.model) : undefined
-  if (model) await assertStageModelAvailable(model, ctx)
+  if (model && model !== existing.model) await assertStageModelAvailable(model, ctx)
   validateStageWrite({
     kind,
     agentId,
@@ -2563,12 +2600,19 @@ function handleDeleteTemplate(res: ServerResponse, db: TaskboardDb, id: string):
   sendJson(res, 200, { ok: true })
 }
 
-function handleApplyTemplate(
+async function handleApplyTemplate(
   res: ServerResponse,
   body: Record<string, unknown>,
   db: TaskboardDb,
   templateId: string,
-): void {
+  actor: Actor,
+  ctx: TaskboardHttpContext,
+): Promise<void> {
+  if (actor !== 'human') {
+    sendError(res, 403, 'forbidden', { code: 'forbidden' })
+    return
+  }
+  await assertTemplatesValidForApply(db, [templateId], ctx)
   const projectRef = asString(body.projectId)
   if (!projectRef) throw new TaskboardValidationError('projectId is required')
   const project = resolveProject(db, projectRef)

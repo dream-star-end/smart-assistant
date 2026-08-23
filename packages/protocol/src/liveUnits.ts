@@ -77,6 +77,7 @@ export type LiveUnit = {
   runId?: string
   agentId?: string
   goal?: string
+  jobId?: string
   phase?: string
   completed?: boolean
   children?: LiveChildBlock[]
@@ -233,6 +234,21 @@ function isRunningStatusPayload(raw: unknown): boolean {
   return false
 }
 
+function runningToolJobId(block: Record<string, unknown>): string {
+  for (const raw of [block.outputJson, block.output]) {
+    const obj = raw && typeof raw === 'object' && !Array.isArray(raw)
+      ? raw as Record<string, unknown>
+      : typeof raw === 'string' ? parseJsonRecord(raw.trim()) : null
+    if (!obj) continue
+    if (typeof obj.jobId === 'string') return obj.jobId
+    for (const text of mcpWrapperTexts(obj)) {
+      const inner = parseJsonRecord(text)
+      if (typeof inner?.jobId === 'string') return inner.jobId
+    }
+  }
+  return ''
+}
+
 function isRunningToolResult(block: Record<string, unknown>): boolean {
   return isRunningStatusPayload(block.outputJson) || isRunningStatusPayload(block.output)
 }
@@ -266,6 +282,14 @@ function bindDelegateRunToGroup(
   block: Record<string, unknown>,
   runId: string,
 ): MutableUnit | null {
+  const jobId = str(block.jobId)
+  if (jobId) {
+    const exact = units.filter((u) => u.kind === 'agent_group' && !u.runId && u.jobId === jobId)
+    if (exact.length === 1) {
+      exact[0]!.runId = runId
+      return exact[0]!
+    }
+  }
   const agentId = str(block.agentId)
   const goal = goalKey(str(block.goal))
   if (!agentId || !goal) return null
@@ -641,6 +665,26 @@ function reduceLiveFramesOnto(
         if (unit.kind === 'agent_group' && isRunningToolResult(block)) {
           unit.open = true
           unit.completed = false
+          const jobId = runningToolJobId(block)
+          if (jobId) {
+            unit.jobId = jobId
+            const standaloneIndex = units.findIndex((candidate) =>
+              candidate !== unit && candidate.kind === 'agent_group' &&
+              candidate.jobId === jobId && typeof candidate.runId === 'string',
+            )
+            if (standaloneIndex >= 0) {
+              const standalone = units[standaloneIndex]!
+              unit.runId = standalone.runId
+              unit.phase = standalone.phase
+              unit.children = [...(standalone.children ?? []), ...(unit.children ?? [])]
+              if (standalone.seqFirst < unit.seqFirst) {
+                unit.seqFirst = standalone.seqFirst
+                unit.recordIdFirst = standalone.recordIdFirst
+              }
+              groups.set(standalone.runId!, unit)
+              units.splice(standaloneIndex, 1)
+            }
+          }
         } else {
           unit.open = false
           if (unit.kind === 'agent_group') unit.completed = true
@@ -687,6 +731,7 @@ function reduceLiveFramesOnto(
           runId,
           agentId: str(block.agentId),
           goal: str(block.goal),
+          jobId: str(block.jobId) || undefined,
           phase: str(block.phase),
           children: [],
           completed: false,

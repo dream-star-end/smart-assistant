@@ -616,3 +616,62 @@ describe('modelCatalogClient — agent_cost_overrides 字段在/不在', () => {
     lkg.cleanup()
   })
 })
+
+describe('modelCatalogClient — cross-caller full-fetch singleflight', () => {
+  test('cold getView 与 agent multiplier lookup 共用一次全量拉取', async () => {
+    const calls: Call[] = []
+    const lkg = tmpLkg()
+    const body = { ...CATALOG_BODY, agent_cost_overrides: { 'coding-assistant': '1.500' } }
+    const client = new ModelCatalogClient({
+      env: ENV,
+      lkgPath: lkg.path,
+      fetcher: fakeFetcher({ catalog: { status: 200, body }, calls }),
+    })
+    const [view, multiplier] = await Promise.all([
+      client.getView(),
+      client.lookupAgentCostMultiplier('coding-assistant'),
+    ])
+    assert.equal(view.securityEpoch, '5')
+    assert.equal(multiplier, '1.500')
+    assert.equal(calls.filter((call) => call.path === MODEL_CATALOG_PATH).length, 1)
+    lkg.cleanup()
+  })
+})
+
+test('late old epoch validation cannot overwrite a newer agent-override full fetch', async () => {
+  const lkg = tmpLkg()
+  let now = 1
+  let catalogCalls = 0
+  let releaseEpoch!: () => void
+  const epochGate = new Promise<void>((resolve) => { releaseEpoch = resolve })
+  const oldBody = { ...CATALOG_BODY, projection_revision: 'old', agent_cost_overrides: { a: '1.000' } }
+  const newBody = { ...CATALOG_BODY, projection_revision: 'new', agent_cost_overrides: { a: '2.000' } }
+  const response = (body: unknown) => ({
+    statusCode: 200,
+    body: (async function* () { yield Buffer.from(JSON.stringify(body), 'utf8') })(),
+  })
+  const client = new ModelCatalogClient({
+    env: ENV,
+    lkgPath: lkg.path,
+    now: () => now,
+    ttlMs: 10,
+    fetcher: (async (url: string): Promise<any> => {
+      if (url.includes(MODEL_CATALOG_EPOCH_PATH)) {
+        await epochGate
+        return response({ epoch: '5', availability_revision: 'availability-1' })
+      }
+      catalogCalls += 1
+      return response(catalogCalls === 1 ? oldBody : newBody)
+    }) as any,
+  })
+  await client.getView()
+  now += AGENT_COST_OVERRIDE_TTL_MS + 1
+  const lateValidation = client.getView()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.equal(await client.lookupAgentCostMultiplier('a'), '2.000')
+  releaseEpoch()
+  const finalView = await lateValidation
+  assert.equal(finalView.projectionRevision, 'new')
+  assert.equal(lookupCatalogAgentMultiplier(finalView, 'a'), '2.000')
+  lkg.cleanup()
+})

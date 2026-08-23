@@ -151,14 +151,15 @@ describe('acquireDelegateGrokRoute', () => {
     if (!result.ok) assert.equal(result.httpStatus, 502)
   })
 
-  test('release swallows network errors so finished turns never fail on cleanup', async () => {
-    let minted = false
+  test('release returns promptly and retries until the master acknowledges', async () => {
+    let releaseCalls = 0
     const fetcher = (async (url: string) => {
       if (url.includes('/mint')) {
-        minted = true
         return { statusCode: 200, body: Readable.from([JSON.stringify({ ok: true, baseUrl: BASE_URL, routeToken: ROUTE_TOKEN })]) }
       }
-      throw new Error('release dropped')
+      releaseCalls += 1
+      if (releaseCalls === 1) throw new Error('master restarting')
+      return { statusCode: 200, body: Readable.from([JSON.stringify({ ok: true })]) }
     }) as never
     const warnings: string[] = []
     const result = await acquireDelegateGrokRoute({
@@ -166,10 +167,16 @@ describe('acquireDelegateGrokRoute', () => {
       log: { warn: (msg) => warnings.push(msg), debug: () => {} },
       env: ENV,
       fetcher,
+      releaseRetryMs: 5,
     })
     assert.equal(result.ok, true)
-    assert.equal(minted, true)
+    const started = Date.now()
     if (result.ok) await result.lease.release()
-    assert.ok(warnings.some((msg) => msg.includes('delegate_grok_route_release_failed')))
+    assert.ok(Date.now() - started < 50, 'terminal cleanup must not delay delegate completion')
+    for (let i = 0; i < 20 && releaseCalls < 2; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    }
+    assert.equal(releaseCalls, 2)
+    assert.ok(warnings.some((msg) => msg.includes('delegate_grok_route_release_deferred')))
   })
 })

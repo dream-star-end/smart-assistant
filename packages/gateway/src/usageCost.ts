@@ -137,6 +137,7 @@ export async function applyPlatformCostIfMissing(args: {
   isError?: boolean
   /** 终态计费侧信道 status(cursor/zcode 的 engineStatus,或 codex/grok billing.status)。 */
   terminalBillingStatus?: TerminalBillingStatus
+  costImprecise?: boolean
 }): Promise<number | null> {
   const policy = resolveBackfillPolicy(args)
   if (!policy.ok) {
@@ -144,9 +145,15 @@ export async function applyPlatformCostIfMissing(args: {
     return null
   }
   const model = args.model?.trim()
-  if (!model) return null
+  if (!model) {
+    markImprecise(args.usage, 'model_unavailable')
+    return null
+  }
   const pricing = await lookupPlatformPricing(model)
-  if (!pricing) return null
+  if (!pricing) {
+    markImprecise(args.usage, 'pricing_unavailable')
+    return null
+  }
   let multiplier = pricing.multiplier
   if (policy.composeAgentMultiplier) {
     const agentMul = await resolveAgentMultiplier(args.agentMultiplier, args.agentId)
@@ -162,7 +169,10 @@ export async function applyPlatformCostIfMissing(args: {
     }
   }
   const usd = estimatePlatformCostUsd(args.usage, { ...pricing, multiplier })
-  if (!(usd > 0)) return null
+  if (!(usd > 0)) {
+    markImprecise(args.usage, 'estimated_cost_unavailable')
+    return null
+  }
   args.usage.cost = usd
   return usd
 }
@@ -202,6 +212,8 @@ export interface DelegateCostSource {
   providerTag?: string
   isError?: boolean
   terminalBillingStatus?: TerminalBillingStatus
+  /** Sticky aggregate coverage, persisted across native resume. */
+  costImprecise?: boolean
 }
 
 export interface ResolvedDelegateCost {
@@ -212,7 +224,7 @@ export interface ResolvedDelegateCost {
 /** delegate 返回给 taskboard 的 costUsd:优先用 session 已累计,否则按平台价补。 */
 export async function resolveDelegateCostUsd(session: DelegateCostSource): Promise<ResolvedDelegateCost> {
   if (session.totalCostUSD > 0) {
-    return { costUsd: session.totalCostUSD, costImprecise: false }
+    return { costUsd: session.totalCostUSD, costImprecise: session.costImprecise === true }
   }
   const usage: UsageCostTokens = {
     cost: session.totalCostUSD,
@@ -233,7 +245,7 @@ export async function resolveDelegateCostUsd(session: DelegateCostSource): Promi
     terminalBillingStatus: session.terminalBillingStatus,
   })
   if (filled != null && filled > 0) {
-    return { costUsd: filled, costImprecise: false }
+    return { costUsd: filled, costImprecise: true }
   }
   return {
     costUsd: session.totalCostUSD || null,

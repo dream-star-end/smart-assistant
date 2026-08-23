@@ -1140,3 +1140,74 @@ describe('agent 身份回落', () => {
     db.close()
   })
 })
+
+describe('stage ops actor hardening', () => {
+  it('agent 不能创建阶段、套模板或在建项目时走 templateIds 旁路', async () => {
+    const db = freshDb()
+    await withServer(agentCtx(db), async (base) => {
+      const created = await call(base, 'POST', '/api/board/projects', { key: 'AGT', name: 'Agent project' })
+      assert.equal(created.status, 201)
+      const projectId = (created.body.project as { id: string }).id
+      const pipelines = await call(base, 'GET', `/api/board/pipelines?projectId=${projectId}`)
+      const pipelineId = ((pipelines.body.items as Array<{ id: string }>)[0]).id
+
+      const stage = await call(base, 'POST', `/api/board/pipelines/${pipelineId}/stages`, {
+        name: '绕过阶段',
+        kind: 'ai',
+        agentId: 'coding-assistant',
+        promptTemplate: 'do it',
+        model: 'glm-5.2',
+      })
+      assert.equal(stage.status, 403)
+
+      const apply = await call(base, 'POST', '/api/board/templates/builtin:bug/apply', {
+        projectId,
+      })
+      assert.equal(apply.status, 403)
+
+      const bypass = await call(base, 'POST', '/api/board/projects', {
+        key: 'BYP',
+        name: 'Bypass',
+        templateIds: ['builtin:bug'],
+      })
+      assert.equal(bypass.status, 403)
+      const listed = await call(base, 'GET', '/api/board/projects')
+      assert.equal(
+        (listed.body.items as Array<{ key: string }>).some((project) => project.key === 'BYP'),
+        false,
+      )
+    })
+    db.close()
+  })
+
+  it('model 未变化时 catalog 短故障不阻断其它字段保存', async () => {
+    const db = freshDb()
+    let stageId = ''
+    await withServer(humanCtx(db), async (base) => {
+      const created = await call(base, 'POST', '/api/board/projects', { key: 'UX', name: 'UX' })
+      const projectId = (created.body.project as { id: string }).id
+      const pipelines = await call(base, 'GET', `/api/board/pipelines?projectId=${projectId}`)
+      const pipelineId = ((pipelines.body.items as Array<{ id: string }>)[0]).id
+      const stage = await call(base, 'POST', `/api/board/pipelines/${pipelineId}/stages`, {
+        name: '额外阶段',
+        kind: 'ai',
+        agentId: 'coding-assistant',
+        promptTemplate: 'do it',
+        model: 'glm-5.2',
+      })
+      assert.equal(stage.status, 201)
+      stageId = (stage.body.stage as { id: string }).id
+    })
+
+    await withServer(humanCtx(db, {
+      isAvailableStageModel: async () => { throw new Error('catalog down') },
+    }), async (base) => {
+      const patched = await call(base, 'PATCH', `/api/board/stages/${stageId}`, {
+        model: 'glm-5.2',
+        timeoutSec: 600,
+      })
+      assert.equal(patched.status, 200, JSON.stringify(patched.body))
+    })
+    db.close()
+  })
+})

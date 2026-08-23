@@ -439,6 +439,8 @@ export type ChatMessage = {
   _delegate?: boolean;
   _delegateAgentId?: string;
   _delegateGoal?: string;
+  /** Exact send_to_agent async job handle; preferred over ambiguous goal matching. */
+  _delegateJobId?: string;
   /** send_to_agent 真后台：父 turn 收尾后组卡仍保持运行中，直到子 agent 终态进度帧。 */
   _background?: boolean;
   _agentGroupOrigin?: string;
