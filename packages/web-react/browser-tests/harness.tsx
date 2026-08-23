@@ -47,6 +47,7 @@ import { createMemoryAuthSession } from "../src/lib/authSession";
 import { ChatSocket } from "../src/lib/chat/socket";
 import { useSessionList } from "../src/hooks/useSessionList";
 import { useUnreadSessions } from "../src/hooks/useUnreadSessions";
+import { TUTORIAL_CASE_BY_ID } from "../src/lib/tutorialCaseCatalog";
 import type { UseChatSocket } from "../src/hooks/useChatSocket";
 import {
   admittedAckFrame,
@@ -273,6 +274,11 @@ window.__runPendingDispatchJournalProbe = async () => {
 const mediaTaskAuth = createMemoryAuthSession(() => {}, "browser-media-token");
 const connectorsAuth = createMemoryAuthSession(() => {}, "browser-connectors-token");
 const memoryAuth = createMemoryAuthSession(() => {}, "browser-memory-token");
+const codingRouteProbe = document.createElement("output");
+codingRouteProbe.dataset.testid = "coding-assistant-route-probe";
+codingRouteProbe.textContent = `CODING_ASSISTANT_ROUTE:${TUTORIAL_CASE_BY_ID["coding-swe-bench-fix"].suggestion.modelId}`;
+document.body.appendChild(codingRouteProbe);
+
 const communityTutorialAuth = createMemoryAuthSession(() => {}, "browser-community-token");
 
 createRoot(document.getElementById("community-tutorial-root")!).render(
