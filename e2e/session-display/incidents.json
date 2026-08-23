@@ -1580,6 +1580,40 @@
           "assertion": "T12 Agent 卡按钮名单恰好为白名单(无冗余原始记录入口)且真实过程可见"
         }
       ]
+    },
+    {
+      "id": "INC-20260823-TAPE-ANCHOR-DRIFT",
+      "occurredAt": "2026-08-23",
+      "severity": "P1",
+      "symptom": "format-3 runtime batching 上线后，容器 Phase A 仍按未批处理/旧 prefix 计算 settlement authority，而 master Phase B 按物理 runtime batch 选 billing anchor，导致 27 个 post-terminal continuation tape 永久 settlement hash mismatch 并反复重试；滚动 enable/rollback 期间 writer/reader flag skew 也可再次触发。",
+      "rootFixCommit": "4d41029d",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/losslessTurnAnchorContract.test.ts",
+          "assertion": "structured-only plan/goal share one physical anchor"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/losslessTurnAnchorContract.test.ts",
+          "assertion": "rolling flag skew"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/visibleFinalize.test.ts",
+          "assertion": "legacy continuation anchor upgrades only from an exact allowlisted authority"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/v3Supervisor.test.ts",
+          "assertion": "LOSSLESS_TURN_TAPE_RUNTIME_BATCHING=1"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-lossless-anchor-contract.ts",
+          "assertion": "lossless-anchor-contract: PASS"
+        }
+      ]
     }
   ]
 }

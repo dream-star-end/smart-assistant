@@ -2519,6 +2519,15 @@ describe('v5 release safety lanes', () => {
     assert.match(result.stderr, /release tree changed during digest/)
   })
 
+  test('pinned release runs the lossless writer/reader anchor contract before publication', async () => {
+    const source = await readFile(deploy, 'utf8')
+    assert.match(source, /cd '\$staging' && npx --no-install tsx scripts\/check-v5-lossless-anchor-contract\.ts/)
+    const buildStart = source.indexOf('\nbuild_release() {')
+    const contractAt = source.indexOf('check-v5-lossless-anchor-contract.ts', buildStart)
+    const publishAt = source.indexOf('if ! publish_strong_release \"$staging\"', buildStart)
+    assert.ok(buildStart >= 0 && contractAt > buildStart && publishAt > contractAt)
+  })
+
   test('root typecheck and every dist build use the official web workspace gate', async () => {
     const pkg = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8')) as { scripts: Record<string, string> }
     assert.match(pkg.scripts.typecheck, /typecheck --workspace packages\/web-react/)

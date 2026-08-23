@@ -3809,6 +3809,14 @@ build_release() {
       else
         echo '  lock 变化/无基线 → npm ci' >&2; cd '$staging' && npm ci --no-audit --no-fund >/dev/null 2>&1
       fi"; then echo "✗ node_modules 准备失败" >&2; ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1; fi
+  # Phase A writer / Phase B reader must choose the same physical billing
+  # anchor across format-2/3 and rolling batching-flag skew. Run from the exact
+  # pinned staging tree, not the shared checkout.
+  if ! ssh "$KL_HOST" "set -e; cd '$staging' && npx --no-install tsx scripts/check-v5-lossless-anchor-contract.ts"; then
+    echo "✗ pinned lossless anchor contract gate failed" >&2
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
   # dist:--with-dist 时**在 staging(archive pinned 源)上跑官方 workspace build**
   # (`tsc -b && vite build`;R2#2:不从共用工作树构建,
   # 彻底消 dist 与 archive 不同源);否则硬链继承当前 release 的 dist(前端未变)。两路 DIST_BUILD_ID
