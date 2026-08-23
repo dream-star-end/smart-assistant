@@ -1383,12 +1383,19 @@ async function writeAction(page, input) {
       try {
         for (const item of manifest) files.push({ name: item.filename, mimeType: item.mimeType, buffer: await readFile('/inputs/' + item.inputId) });
         await imageChooser.setFiles(files);
+        let selected = 0;
+        try {
+          selected = await imageChooser.element().evaluate((node) => node.files ? node.files.length : 0);
+        } catch {}
+        if (selected !== manifest.length) {
+          const scope = (await composerScope(freshEditor)) || page;
+          const freshInput = await uniqueImageFileInput(scope) || await uniqueImageFileInput(page);
+          if (freshInput) await freshInput.setInputFiles(files);
+        }
+        await awaitComposerMediaReady(page, freshEditor, manifest.length, 90_000, previewBefore);
       } finally {
         for (const file of files) file.buffer.fill(0);
       }
-      const selected = await imageChooser.element().evaluate((node) => node.files ? node.files.length : 0);
-      if (selected !== manifest.length) throw new Error('media-upload');
-      await awaitComposerMediaReady(page, freshEditor, manifest.length, 90_000, previewBefore);
     }
     await assertNoChallenge(page);
     const send = await awaitPostSendReady(page, manifest.length ? 90_000 : 30_000, freshEditor);
