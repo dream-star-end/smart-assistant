@@ -107,7 +107,7 @@ describe('native model switch socket transaction', () => {
     socket.stop()
   })
 
-  test('rejects a pending preparation immediately when its transport closes', async () => {
+  test('keeps a pending preparation across transport close and consumes prepared after reconnect', async () => {
     vi.stubGlobal('WebSocket', FakeWS as unknown as typeof WebSocket)
     const socket = makeSocket()
     socket.setGateReady(true)
@@ -116,17 +116,50 @@ describe('native model switch socket transaction', () => {
     socket.ensureSession('s1', 'main')
 
     const prepared = socket.prepareModelSwitch('s1', 'glm-5.3', 'gpt-5.6-sol')
+    const control = ws.sent
+      .map((raw) => JSON.parse(raw))
+      .find((frame) => frame.type === 'control.session.prepare_model_switch')
     ws.close(1012, 'restart')
-    await expect(prepared).rejects.toThrow('连接已断开，未切换模型')
+    await expect(
+      Promise.race([
+        prepared.then(() => 'resolved' as const),
+        new Promise<'pending'>((resolve) => setTimeout(() => resolve('pending'), 20)),
+      ]),
+    ).resolves.toBe('pending')
+
     expect(socket.retryConnectNow()).toBe(true)
     const reconnected = FakeWS.instances.at(-1)!
     reconnected.open()
-    expect(reconnected.sent.map((raw) => JSON.parse(raw))).toContainEqual(
+    expect(reconnected.sent.map((raw) => JSON.parse(raw))).not.toContainEqual(
       expect.objectContaining({
         type: 'control.session.cancel_model_switch',
         sessionKey: 'agent:main:webchat:dm:s1',
       }),
     )
+    reconnected.onmessage?.({
+      data: JSON.stringify({
+        type: 'outbound.model_switch.prepared',
+        requestId: control.requestId,
+        sessionKey: control.sessionKey,
+        sourceModel: 'glm-5.3',
+        targetModel: control.targetModel,
+        status: 'completed',
+      }),
+    })
+    await expect(prepared).resolves.toBe(control.requestId)
     socket.stop()
+  })
+
+  test('rejects a pending preparation only when the socket is torn down', async () => {
+    vi.stubGlobal('WebSocket', FakeWS as unknown as typeof WebSocket)
+    const socket = makeSocket()
+    socket.setGateReady(true)
+    const ws = FakeWS.instances.at(-1)!
+    ws.open()
+    socket.ensureSession('s1', 'main')
+
+    const prepared = socket.prepareModelSwitch('s1', 'glm-5.3', 'gpt-5.6-sol')
+    socket.stop()
+    await expect(prepared).rejects.toThrow('连接已断开，未切换模型')
   })
 })

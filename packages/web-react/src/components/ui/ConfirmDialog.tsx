@@ -5,6 +5,7 @@
  * 用法(hook 返回 [fn, element],element 挂在组件树任意处):
  *   const [confirm, confirmEl] = useConfirm();
  *   ... await confirm({ title: "删除该会话?", danger: true }) → boolean
+ *   ... await confirm({ title: "切换模型?", altText: "直接切换" }) → true | false | "alt"
  *
  *   const [promptText, promptEl] = usePrompt();
  *   ... await promptText({ title: "重命名会话", initial: s.title }) → string | null
@@ -16,21 +17,25 @@ import { Button } from "./Button";
 import { Input } from "./Input";
 import { Modal } from "./Modal";
 
+export type ConfirmChoice = boolean | "alt";
+
 type ConfirmOpts = {
   title: string;
   body?: ReactNode;
   confirmText?: string;
   cancelText?: string;
+  /** Optional third action (e.g. skip compact and switch immediately). */
+  altText?: string;
   /** 危险操作(删除类):确认钮红色。 */
   danger?: boolean;
 };
 
-export function useConfirm(): [(opts: ConfirmOpts) => Promise<boolean>, ReactNode] {
+export function useConfirm(): [(opts: ConfirmOpts) => Promise<ConfirmChoice>, ReactNode] {
   const [opts, setOpts] = useState<ConfirmOpts | null>(null);
-  const resolverRef = useRef<((v: boolean) => void) | null>(null);
+  const resolverRef = useRef<((v: ConfirmChoice) => void) | null>(null);
 
   const confirm = useCallback((o: ConfirmOpts) => {
-    return new Promise<boolean>((resolve) => {
+    return new Promise<ConfirmChoice>((resolve) => {
       // 罕见重入(上一个未决时再开):先取消上一个,防 resolver 悬挂泄漏。
       resolverRef.current?.(false);
       resolverRef.current = resolve;
@@ -38,7 +43,7 @@ export function useConfirm(): [(opts: ConfirmOpts) => Promise<boolean>, ReactNod
     });
   }, []);
 
-  const settle = (v: boolean) => {
+  const settle = (v: ConfirmChoice) => {
     resolverRef.current?.(v);
     resolverRef.current = null;
     setOpts(null);
@@ -56,6 +61,11 @@ export function useConfirm(): [(opts: ConfirmOpts) => Promise<boolean>, ReactNod
           <Button variant="ghost" onClick={() => settle(false)}>
             {opts?.cancelText ?? "取消"}
           </Button>
+          {opts?.altText ? (
+            <Button variant="secondary" onClick={() => settle("alt")}>
+              {opts.altText}
+            </Button>
+          ) : null}
           <Button variant={opts?.danger ? "danger" : "primary"} onClick={() => settle(true)}>
             {opts?.confirmText ?? "确定"}
           </Button>

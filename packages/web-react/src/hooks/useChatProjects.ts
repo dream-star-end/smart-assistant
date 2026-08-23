@@ -39,8 +39,9 @@ export type UseChatProjectsOptions = {
     title: string;
     body?: React.ReactNode;
     confirmText?: string;
+    altText?: string;
     danger?: boolean;
-  }) => Promise<boolean>;
+  }) => Promise<boolean | "alt">;
   /** 项目软删：立刻把其下会话改为未分组，返回被移出的会话 id（失败回滚用）。 */
   onUngroupProjectSessions?: (projectId: string) => string[];
   /** 删除项目失败：把 sessionIds 重新挂回该项目。 */

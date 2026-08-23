@@ -15,7 +15,7 @@ export { Avatar, avatarVariants, type AvatarProps } from "./Avatar";
 export { Badge, badgeVariants } from "./Badge";
 export { Button, buttonVariants, type ButtonProps } from "./Button";
 export { Card, CardRow, cardVariants, type CardProps, type CardRowProps } from "./Card";
-export { useConfirm, usePrompt } from "./ConfirmDialog";
+export { useConfirm, usePrompt, type ConfirmChoice } from "./ConfirmDialog";
 export { CopyChip } from "./CopyChip";
 export { DescriptionList, DescriptionRow } from "./DescriptionList";
 export {

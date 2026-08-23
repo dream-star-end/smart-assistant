@@ -1927,7 +1927,9 @@ export class ChatSocket {
         this.pendingPing = null;
       }
       if (this.ws !== ws) return; // stale socket
-      this.rejectPendingModelSwitches("连接已断开，未切换模型", false);
+      // Native compact can run for minutes. A transient close must not abort
+      // the prepared generation or send cancel — reconnect + ring replay
+      // (or live fanout onto the new socket) delivers outbound.model_switch.prepared.
       this.relayReady = false; // 连接关闭:relay 失效,待下次 sys.relay_ready
       this.masterOwnsAutomaticRecovery = false;
       this.resetControlsForReplay();
@@ -2694,8 +2696,12 @@ export class ChatSocket {
     }
     // 看似 OPEN：1.5s 快探活（真死链更早 close→reconnect，健康则 pong 立即返回无副作用）。
     // 刚 OPEN 的连接跳过：微信 WebView / 慢网首连 pong 经常 >1.5s，探活会误杀。
+    // 压缩切换进行中也跳过：确认框失焦/手机回前台会误杀仍在 compact 的活连接。
     const openedAgo = this.lastOpenAtMs > 0 ? Date.now() - this.lastOpenAtMs : Number.POSITIVE_INFINITY;
-    if (openedAgo >= VISIBILITY_PROBE_GRACE_AFTER_OPEN_MS) {
+    if (
+      openedAgo >= VISIBILITY_PROBE_GRACE_AFTER_OPEN_MS &&
+      this.pendingModelSwitches.size === 0
+    ) {
       this.probeWsAlive(this.ws, PROBE_TIMEOUT_VISIBILITY_MS, "visibility");
     }
     // S1：切回前台无条件 REST 对账当前选中 + 近期 in-flight 会话——WS 探活只能发现死连接，

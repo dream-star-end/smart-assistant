@@ -670,14 +670,19 @@ export function App() {
           : null,
       ].filter((detail): detail is string => detail !== null);
       const confirmed = await confirmDialog({
-        title: "压缩上下文后切换模型？",
+        title: "切换模型？",
         body: <div className="space-y-2 text-sm text-muted">
           {details.map((detail) => <p key={detail}>{detail}</p>)}
-          <p>系统会使用当前模型的原生压缩能力生成交接内容；原始会话记录不会删除。</p>
+          <p>压缩并切换会用当前模型生成交接内容，原始记录不会删除。直接切换沿用原来的方式，不压缩，新模型可能看不到完整上下文。</p>
         </div>,
         confirmText: "压缩并切换",
+        altText: "直接切换",
       });
-      if (!confirmed) return;
+      if (confirmed === false) return;
+      if (confirmed === "alt") {
+        commit();
+        return;
+      }
       setModelSwitchPreparing(true);
       try {
         const switchId = await sockRef.current?.prepareModelSwitch(activeId, modelId, id);
