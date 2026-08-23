@@ -197,7 +197,7 @@ describe('official Weibo Plugin', () => {
   })
 
   test('pins the current artifact and only the exact production predecessor', () => {
-    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.16')
+    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.17')
     assert.equal(WEIBO_DRIVER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.equal(WEIBO_LAUNCHER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.deepEqual(WEIBO_SETUP_COMPATIBLE_PREDECESSORS, [
@@ -440,6 +440,10 @@ describe('official Weibo Plugin', () => {
     assert.match(createPostSource, /openLongTextComposer/)
     assert.match(createPostSource, /preparePostImageChooser\(page, editor\)/)
     assert.match(WEIBO_WORKER_SOURCE, /uniqueImageFileInput/)
+    assert.match(
+      WEIBO_WORKER_SOURCE,
+      /uniqueImageFileInput\(scope\) \|\| await uniqueImageFileInput\(page\)/,
+    )
     assert.match(WEIBO_WORKER_SOURCE, /countImageFileInputs/)
     assert.match(WEIBO_WORKER_SOURCE, /step: 'media.chooser'/)
     assert.match(WEIBO_WORKER_SOURCE, /step: 'media.upload'/)

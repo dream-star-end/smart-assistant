@@ -1337,7 +1337,7 @@ async function awaitFileChooser(page, clickable) {
 }
 async function preparePostImageChooser(page, editor) {
   const scope = (await composerScope(editor)) || page;
-  const existing = await uniqueImageFileInput(scope);
+  const existing = await uniqueImageFileInput(scope) || await uniqueImageFileInput(page);
   const image = await exactMenuItem(scope, '图片');
   const beforeScope = await countImageFileInputs(scope);
   const beforePage = await countImageFileInputs(page);
