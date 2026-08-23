@@ -114,21 +114,28 @@ describe('seedDefaultPipelines', () => {
 
     const bug = listPipelines(db, project.id).find((p) => p.ticketType === 'bug')
     const bugStages = listStages(db, bug!.id)
-    assert.equal(bugStages.find((s) => s.name === '定位根因')?.agentId, 'explorer')
-    assert.equal(bugStages.find((s) => s.name === '修复')?.agentId, 'coding-assistant')
-    assert.equal(bugStages.find((s) => s.name === '自验')?.agentId, 'auditor')
+    assert.equal(bugStages.find((s) => s.name === '复现确认')?.agentId, 'stage-triage')
+    assert.equal(bugStages.find((s) => s.name === '定位根因')?.agentId, 'stage-diagnose')
+    assert.equal(bugStages.find((s) => s.name === '修复')?.agentId, 'stage-implement')
+    assert.equal(bugStages.find((s) => s.name === '自验')?.agentId, 'stage-verify')
 
     const feat = listPipelines(db, project.id).find((p) => p.ticketType === 'feature')
     const featStages = listStages(db, feat!.id)
-    assert.equal(featStages.find((s) => s.name === '需求澄清')?.agentId, 'general-assistant')
-    assert.equal(
-      featStages.find((s) => s.name === '检索调研' || s.name === '方案设计')?.agentId,
-      'explorer',
-    )
+    assert.equal(featStages.find((s) => s.name === '需求澄清')?.agentId, 'stage-triage')
+    assert.equal(featStages.find((s) => s.name === '方案设计')?.agentId, 'stage-design')
+    assert.equal(featStages.find((s) => s.name === '实现')?.agentId, 'stage-implement')
+    assert.equal(featStages.find((s) => s.name === '自验+审查')?.agentId, 'stage-verify')
 
     const spike = listPipelines(db, project.id).find((p) => p.ticketType === 'spike')
     const spikeStages = listStages(db, spike!.id)
-    assert.equal(spikeStages.find((s) => s.name === '检索调研')?.agentId, 'explorer')
+    assert.equal(spikeStages.find((s) => s.name === '明确问题')?.agentId, 'stage-triage')
+    assert.equal(spikeStages.find((s) => s.name === '检索调研')?.agentId, 'stage-research')
+    assert.equal(spikeStages.find((s) => s.name === '结论汇总')?.agentId, 'stage-report')
+
+    const chore = listPipelines(db, project.id).find((p) => p.ticketType === 'chore')
+    const choreStages = listStages(db, chore!.id)
+    assert.equal(choreStages.find((s) => s.name === '执行')?.agentId, 'stage-implement')
+    assert.equal(choreStages.find((s) => s.name === '自验')?.agentId, 'stage-verify')
     db.close()
   })
 

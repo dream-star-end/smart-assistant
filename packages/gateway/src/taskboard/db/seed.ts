@@ -26,12 +26,21 @@ import { TaskboardNotFound } from './schema.js'
 
 export const DEFAULT_PATROL_CRON = '*/30 9-19 * * 1-5'
 
-/** 种子实际绑定的 agent。来源:$OPENCLAUDE_HOME/agents.yaml。 */
+/**
+ * 种子实际绑定的 agent。来源:$OPENCLAUDE_HOME/agents.yaml。
+ *
+ * 这些是阶段专用 agent,人设按「无人值守、禁止反问、固定移交结构」写。
+ * 它们在 agents.yaml 里**不带 source**:带 source 的市场 agent 每次同步都会
+ * 被打回默认模型绑定,阶段配置留不住。
+ */
 export const SEED_AGENT_IDS = {
-  explorer: 'explorer',
-  codingAssistant: 'coding-assistant',
-  auditor: 'auditor',
-  generalAssistant: 'general-assistant',
+  triage: 'stage-triage',
+  diagnose: 'stage-diagnose',
+  design: 'stage-design',
+  implement: 'stage-implement',
+  research: 'stage-research',
+  verify: 'stage-verify',
+  report: 'stage-report',
 } as const
 
 const PLACEHOLDERS =
@@ -71,7 +80,7 @@ const PIPELINES: PipelineSeed[] = [
       {
         name: '复现确认',
         kind: 'ai',
-        agentId: SEED_AGENT_IDS.explorer,
+        agentId: SEED_AGENT_IDS.triage,
         effort: 'medium',
         onSuccess: 'advance',
         requireHumanAck: false,
@@ -86,7 +95,7 @@ const PIPELINES: PipelineSeed[] = [
       {
         name: '定位根因',
         kind: 'ai',
-        agentId: SEED_AGENT_IDS.explorer,
+        agentId: SEED_AGENT_IDS.diagnose,
         effort: 'high',
         onSuccess: 'advance',
         requireHumanAck: false,
@@ -100,7 +109,7 @@ const PIPELINES: PipelineSeed[] = [
       {
         name: '修复',
         kind: 'ai',
-        agentId: SEED_AGENT_IDS.codingAssistant,
+        agentId: SEED_AGENT_IDS.implement,
         effort: 'high',
         onSuccess: 'advance',
         requireHumanAck: false,
@@ -114,7 +123,7 @@ const PIPELINES: PipelineSeed[] = [
       {
         name: '自验',
         kind: 'ai',
-        agentId: SEED_AGENT_IDS.auditor,
+        agentId: SEED_AGENT_IDS.verify,
         effort: 'medium',
         onSuccess: 'wait_human',
         requireHumanAck: true,
@@ -156,7 +165,7 @@ const PIPELINES: PipelineSeed[] = [
       {
         name: '需求澄清',
         kind: 'ai',
-        agentId: SEED_AGENT_IDS.generalAssistant,
+        agentId: SEED_AGENT_IDS.triage,
         effort: 'medium',
         onSuccess: 'advance',
         requireHumanAck: false,
@@ -170,7 +179,7 @@ const PIPELINES: PipelineSeed[] = [
       {
         name: '方案设计',
         kind: 'ai',
-        agentId: SEED_AGENT_IDS.explorer,
+        agentId: SEED_AGENT_IDS.design,
         effort: 'high',
         onSuccess: 'wait_human',
         requireHumanAck: true,
@@ -195,7 +204,7 @@ const PIPELINES: PipelineSeed[] = [
       {
         name: '实现',
         kind: 'ai',
-        agentId: SEED_AGENT_IDS.codingAssistant,
+        agentId: SEED_AGENT_IDS.implement,
         effort: 'high',
         onSuccess: 'advance',
         requireHumanAck: false,
@@ -209,7 +218,7 @@ const PIPELINES: PipelineSeed[] = [
       {
         name: '自验+审查',
         kind: 'ai',
-        agentId: SEED_AGENT_IDS.auditor,
+        agentId: SEED_AGENT_IDS.verify,
         effort: 'medium',
         onSuccess: 'wait_human',
         requireHumanAck: true,
@@ -251,7 +260,7 @@ const PIPELINES: PipelineSeed[] = [
       {
         name: '明确问题',
         kind: 'ai',
-        agentId: SEED_AGENT_IDS.generalAssistant,
+        agentId: SEED_AGENT_IDS.triage,
         effort: 'medium',
         onSuccess: 'advance',
         requireHumanAck: false,
@@ -265,7 +274,7 @@ const PIPELINES: PipelineSeed[] = [
       {
         name: '检索调研',
         kind: 'ai',
-        agentId: SEED_AGENT_IDS.explorer,
+        agentId: SEED_AGENT_IDS.research,
         effort: 'high',
         onSuccess: 'advance',
         requireHumanAck: false,
@@ -279,7 +288,7 @@ const PIPELINES: PipelineSeed[] = [
       {
         name: '结论汇总',
         kind: 'ai',
-        agentId: SEED_AGENT_IDS.generalAssistant,
+        agentId: SEED_AGENT_IDS.report,
         effort: 'medium',
         onSuccess: 'wait_human',
         requireHumanAck: true,
@@ -310,7 +319,7 @@ const PIPELINES: PipelineSeed[] = [
       {
         name: '执行',
         kind: 'ai',
-        agentId: SEED_AGENT_IDS.codingAssistant,
+        agentId: SEED_AGENT_IDS.implement,
         effort: 'medium',
         onSuccess: 'advance',
         requireHumanAck: false,
@@ -324,7 +333,7 @@ const PIPELINES: PipelineSeed[] = [
       {
         name: '自验',
         kind: 'ai',
-        agentId: SEED_AGENT_IDS.auditor,
+        agentId: SEED_AGENT_IDS.verify,
         effort: 'low',
         onSuccess: 'wait_human',
         requireHumanAck: true,
