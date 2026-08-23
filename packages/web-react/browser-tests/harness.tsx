@@ -271,7 +271,8 @@ window.__runPendingDispatchJournalProbe = async () => {
 const mediaTaskAuth = createMemoryAuthSession(() => {}, "browser-media-token");
 const connectorsAuth = createMemoryAuthSession(() => {}, "browser-connectors-token");
 const memoryAuth = createMemoryAuthSession(() => {}, "browser-memory-token");
-const codingRouteProbe = document.createElement("output");
+const codingRouteProbe = document.createElement("div");
+codingRouteProbe.id = "coding-assistant-route-root";
 codingRouteProbe.dataset.testid = "coding-assistant-route-probe";
 codingRouteProbe.textContent = `CODING_ASSISTANT_ROUTE:${TUTORIAL_CASE_BY_ID["coding-swe-bench-fix"].suggestion.modelId}`;
 document.body.appendChild(codingRouteProbe);
