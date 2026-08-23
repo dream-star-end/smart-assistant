@@ -56,11 +56,20 @@ function compileWorkerPostHarness(overrides: Record<string, unknown>): {
   const start = WEIBO_WORKER_SOURCE.indexOf('async function newestOwnPost')
   const end = WEIBO_WORKER_SOURCE.indexOf('async function finishAction', start)
   assert.ok(start >= 0 && end > start)
-  const names = Object.keys(overrides)
+  const bound: Record<string, unknown> = {
+    emitStep() {},
+    visible: async (node: { isVisible?: () => Promise<boolean> } | null) => {
+      if (!node) return false
+      if (typeof node.isVisible === 'function') return await node.isVisible().catch(() => false)
+      return true
+    },
+    ...overrides,
+  }
+  const names = Object.keys(bound)
   return new Function(
     ...names,
     `'use strict'; ${WEIBO_WORKER_SOURCE.slice(start, end)}; return { writeAction, awaitNewestOwnPost, activatePostSend, awaitPostSendReady };`,
-  )(...names.map((name) => overrides[name])) as ReturnType<typeof compileWorkerPostHarness>
+  )(...names.map((name) => bound[name])) as ReturnType<typeof compileWorkerPostHarness>
 }
 
 function compileWorkerPostTextHarness(): {
@@ -188,7 +197,7 @@ describe('official Weibo Plugin', () => {
   })
 
   test('pins the current artifact and only the exact production predecessor', () => {
-    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.15')
+    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.16')
     assert.equal(WEIBO_DRIVER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.equal(WEIBO_LAUNCHER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.deepEqual(WEIBO_SETUP_COMPATIBLE_PREDECESSORS, [
@@ -431,12 +440,20 @@ describe('official Weibo Plugin', () => {
     assert.match(createPostSource, /openLongTextComposer/)
     assert.match(createPostSource, /preparePostImageChooser\(page, editor\)/)
     assert.match(WEIBO_WORKER_SOURCE, /uniqueImageFileInput/)
+    assert.match(WEIBO_WORKER_SOURCE, /countImageFileInputs/)
+    assert.match(WEIBO_WORKER_SOURCE, /step: 'media.chooser'/)
+    assert.match(WEIBO_WORKER_SOURCE, /step: 'media.upload'/)
     assert.match(WEIBO_WORKER_SOURCE, /exactMenuItem\(scope, '图片'\)/)
     assert.match(WEIBO_WORKER_SOURCE, /exactMenuItem\(scope, '本地上传'\)/)
     assert.match(WEIBO_WORKER_SOURCE, /exactMenuItem\(scope, '发送'\)/)
     assert.match(WEIBO_WORKER_SOURCE, /awaitComposerMediaReady/)
     assert.match(WEIBO_WORKER_SOURCE, /collectVisibleImageSrcs/)
     assert.match(createPostSource, /90_000, previewBefore/)
+    assert.ok(
+      createPostSource.indexOf('previewBeforeCount') <
+        createPostSource.indexOf('await imageChooser.setFiles(files)'),
+      'preview count/delete baselines must be captured before setFiles',
+    )
     assert.match(WEIBO_WORKER_SOURCE, /awaitComposerCleared/)
     assert.match(
       createPostSource,
@@ -838,9 +855,14 @@ describe('official Weibo Plugin', () => {
       exactMenuItem: async (_page: unknown, text: string) => {
         if (text === '图片') {
           events.push('image-menu')
-          return { click: async () => events.push('image-click') }
+          return {
+            click: async (options?: { trial?: boolean }) => {
+              if (!options?.trial) events.push('image-click')
+            },
+          }
         }
-        return send
+        if (text === '发送') return send
+        return null
       },
       cleanText: (value: unknown) => String(value).trim(),
       readFile: async () => Buffer.from('image'),
@@ -866,7 +888,7 @@ describe('official Weibo Plugin', () => {
       },
     })
     assert.deepEqual(result, { post: { id: 'hidden-input', owned: true, text: 'hello' } })
-    assert.deepEqual(events, ['dispatch', 'upload', 'click'])
+    assert.deepEqual(events, ['image-menu', 'filechooser', 'image-click', 'dispatch', 'upload', 'click'])
   })
 
   test('create_post waits for composer 发送 after upload and ignores extra 发送', async () => {
@@ -907,14 +929,17 @@ describe('official Weibo Plugin', () => {
       awaitDispatch: async () => events.push('dispatch'),
       exactMenuItem: async (root: unknown, text: string) => {
         if (text === '图片') {
-          events.push('image-menu')
-          return { click: async () => events.push('image-click') }
+          return {
+            click: async (options?: { trial?: boolean }) => {
+              if (!options?.trial) events.push('image-click')
+            },
+          }
         }
         if (text === '发送') {
           events.push(root === composerRoot ? 'send-scope' : 'send-page')
           return root === composerRoot ? send : { click: async () => events.push('comment-send') }
         }
-        return send
+        return null
       },
       cleanText: (value: unknown) => String(value).trim(),
       readFile: async () => Buffer.from('image'),
@@ -941,7 +966,7 @@ describe('official Weibo Plugin', () => {
     assert.ok(events.includes('send-scope'))
     assert.deepEqual(
       events.filter((event) => event !== 'send-scope'),
-      ['dispatch', 'upload', 'click'],
+      ['image-click', 'dispatch', 'upload', 'click'],
     )
   })
 
@@ -1527,7 +1552,7 @@ describe('official Weibo Plugin', () => {
         })
         assert.deepEqual(result, { post: { id: 'hidden-post', owned: true, text: 'hello' } })
         assert.ok(Date.now() - started >= 350, 'send must wait for delayed media readiness')
-        assert.equal(await page.evaluate(() => Reflect.get(window, 'imageClicks')), 0)
+        assert.equal(await page.evaluate(() => Reflect.get(window, 'imageClicks')), 1)
         assert.equal(await page.evaluate(() => Reflect.get(window, 'chooserClicks')), 0)
         assert.equal(await page.evaluate(() => Reflect.get(window, 'sendClicks')), 1)
         assert.equal(collectCount, 2)
@@ -1597,7 +1622,7 @@ describe('official Weibo Plugin', () => {
                 text: article.textContent?.trim() ?? '',
               })),
             ),
-          uniqueVisible: async (locator: unknown) => locator,
+          uniqueVisible: async () => page.locator('#composer textarea'),
           assertNoChallenge: async () => {},
           awaitDispatch: async () => {},
           exactMenuItem: async (root: { getByRole: typeof page.getByRole }, text: string) => {

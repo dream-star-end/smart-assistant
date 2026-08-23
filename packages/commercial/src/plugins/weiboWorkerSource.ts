@@ -77,9 +77,25 @@ function emitStep(event) {
       if (typeof event.textLen === 'number' && Number.isFinite(event.textLen)) payload.textLen = Math.round(event.textLen);
       if (typeof event.textHash8 === 'string') payload.textHash8 = String(event.textHash8).slice(0, 8);
       if (event.longText === true || event.longText === false) payload.longText = event.longText;
+      if (event.hasImage === true || event.hasImage === false) payload.hasImage = event.hasImage;
+      if (event.retried === true || event.retried === false) payload.retried = event.retried;
       if (typeof event.mediaCount === 'number' && Number.isFinite(event.mediaCount)) payload.mediaCount = Math.round(event.mediaCount);
+      if (typeof event.scopeInputs === 'number' && Number.isFinite(event.scopeInputs)) payload.scopeInputs = Math.round(event.scopeInputs);
+      if (typeof event.pageInputs === 'number' && Number.isFinite(event.pageInputs)) payload.pageInputs = Math.round(event.pageInputs);
+      if (typeof event.scopeImageInputs === 'number' && Number.isFinite(event.scopeImageInputs)) payload.scopeImageInputs = Math.round(event.scopeImageInputs);
+      if (typeof event.pageImageInputs === 'number' && Number.isFinite(event.pageImageInputs)) payload.pageImageInputs = Math.round(event.pageImageInputs);
+      if (typeof event.selected === 'number' && Number.isFinite(event.selected)) payload.selected = Math.round(event.selected);
+      if (typeof event.freshSelected === 'number' && Number.isFinite(event.freshSelected)) payload.freshSelected = Math.round(event.freshSelected);
+      if (typeof event.imgCount === 'number' && Number.isFinite(event.imgCount)) payload.imgCount = Math.round(event.imgCount);
+      if (typeof event.addedSrcs === 'number' && Number.isFinite(event.addedSrcs)) payload.addedSrcs = Math.round(event.addedSrcs);
+      if (typeof event.bgCount === 'number' && Number.isFinite(event.bgCount)) payload.bgCount = Math.round(event.bgCount);
+      if (typeof event.canvasCount === 'number' && Number.isFinite(event.canvasCount)) payload.canvasCount = Math.round(event.canvasCount);
+      if (typeof event.frameCount === 'number' && Number.isFinite(event.frameCount)) payload.frameCount = Math.round(event.frameCount);
+      if (typeof event.deleteHits === 'number' && Number.isFinite(event.deleteHits)) payload.deleteHits = Math.round(event.deleteHits);
       if (typeof event.code === 'string') payload.code = String(event.code).slice(0, 64);
       if (typeof event.actionId === 'string') payload.actionId = String(event.actionId).slice(0, 64);
+      if (typeof event.branch === 'string') payload.branch = String(event.branch).slice(0, 32);
+      if (typeof event.reason === 'string') payload.reason = String(event.reason).slice(0, 32);
     }
     process.stderr.write(JSON.stringify(payload) + '\n');
   } catch {}
@@ -1150,6 +1166,24 @@ function wrapFileInput(input) {
     element: () => input,
   };
 }
+async function countImageFileInputs(scope) {
+  const result = { total: 0, image: 0, attached: 0 };
+  if (!scope || typeof scope.locator !== 'function') return result;
+  const nodes = scope.locator('input[type="file"]');
+  if (!nodes || typeof nodes.count !== 'function' || typeof nodes.nth !== 'function') return result;
+  const total = Math.min(await nodes.count().catch(() => 0), 40);
+  result.total = total;
+  for (let index = 0; index < total; index += 1) {
+    const node = nodes.nth(index);
+    const attached = await node.evaluate((element) => !!element && element.isConnected).catch(() => false);
+    if (!attached) continue;
+    result.attached += 1;
+    const accept = String(await node.getAttribute('accept').catch(() => '') || '');
+    if (accept && !/image|\*/i.test(accept)) continue;
+    result.image += 1;
+  }
+  return result;
+}
 async function uniqueImageFileInput(scope) {
   if (!scope || typeof scope.locator !== 'function') return null;
   const nodes = scope.locator('input[type="file"]');
@@ -1165,6 +1199,26 @@ async function uniqueImageFileInput(scope) {
     matches.push(node);
   }
   return matches.length === 1 ? matches[0] : null;
+}
+async function countPreviewSignals(scope, page) {
+  const imgCount = await countVisibleImgs(scope);
+  let canvasCount = 0;
+  let bgCount = 0;
+  let frameCount = 0;
+  try {
+    const canvases = scope && typeof scope.locator === 'function' ? scope.locator('canvas') : null;
+    canvasCount = Math.min(canvases && typeof canvases.count === 'function' ? await canvases.count().catch(() => 0) : 0, 12);
+  } catch {}
+  try {
+    const styled = scope && typeof scope.locator === 'function' ? scope.locator('[style*="background"]') : null;
+    bgCount = Math.min(styled && typeof styled.count === 'function' ? await styled.count().catch(() => 0) : 0, 12);
+  } catch {}
+  try {
+    const frames = page && typeof page.locator === 'function' ? page.locator('iframe') : null;
+    frameCount = Math.min(frames && typeof frames.count === 'function' ? await frames.count().catch(() => 0) : 0, 12);
+  } catch {}
+  const deleted = await exactMenuItem(scope, '删除');
+  return { imgCount, canvasCount, bgCount, frameCount, deleteHits: deleted ? 1 : 0 };
 }
 async function collectVisibleImageSrcs(scope) {
   const srcs = [];
@@ -1204,12 +1258,23 @@ async function awaitComposerCleared(page, editor, timeout) {
   return false;
 }
 async function awaitComposerMediaReady(page, editor, expectedNew, timeout, beforeSrcs, beforeCount, beforeDelete) {
-  const scope = (await composerScope(editor)) || editor;
+  const scope = (await composerScope(editor)) || page;
   if (!scope || typeof scope.locator !== 'function') throw new Error('media-preview-timeout');
   const before = new Set(Array.isArray(beforeSrcs) ? beforeSrcs : []);
   const baseCount = Number.isFinite(beforeCount) ? beforeCount : before.size;
   const deadline = Date.now() + timeout;
   const attempts = Math.max(1, Math.ceil(timeout / 250));
+  let emittedChange = false;
+  const startSignals = await countPreviewSignals(scope, page);
+  emitStep({
+    step: 'media.preview.start',
+    timeoutMs: timeout,
+    imgCount: startSignals.imgCount,
+    bgCount: startSignals.bgCount,
+    canvasCount: startSignals.canvasCount,
+    frameCount: startSignals.frameCount,
+    deleteHits: startSignals.deleteHits,
+  });
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     const added = [];
     const seen = new Set();
@@ -1220,12 +1285,46 @@ async function awaitComposerMediaReady(page, editor, expectedNew, timeout, befor
     }
     const imgs = await countVisibleImgs(scope);
     const deleted = await exactMenuItem(scope, '删除');
-    if (added.length >= expectedNew || imgs >= baseCount + expectedNew || (!!deleted && !beforeDelete)) return;
+    const ready = added.length >= expectedNew || imgs >= baseCount + expectedNew || (!!deleted && !beforeDelete);
+    if (!emittedChange && (added.length > 0 || imgs !== startSignals.imgCount || (!!deleted && !beforeDelete))) {
+      emittedChange = true;
+      const change = await countPreviewSignals(scope, page);
+      emitStep({
+        step: 'media.preview.change',
+        addedSrcs: added.length,
+        imgCount: change.imgCount,
+        bgCount: change.bgCount,
+        canvasCount: change.canvasCount,
+        frameCount: change.frameCount,
+        deleteHits: change.deleteHits,
+      });
+    }
+    if (ready) {
+      emitStep({
+        step: 'media.preview.ready',
+        reason: added.length >= expectedNew ? 'added-src' : imgs >= baseCount + expectedNew ? 'img-count' : 'delete',
+        addedSrcs: added.length,
+        imgCount: imgs,
+        deleteHits: deleted ? 1 : 0,
+      });
+      return;
+    }
     const remaining = deadline - Date.now();
     if (attempt < attempts - 1 && remaining > 0) {
       await page.waitForTimeout(Math.min(250, remaining));
     }
   }
+  const timed = await countPreviewSignals(scope, page);
+  emitStep({
+    step: 'media.preview.timeout',
+    reason: 'timeout',
+    addedSrcs: 0,
+    imgCount: timed.imgCount,
+    bgCount: timed.bgCount,
+    canvasCount: timed.canvasCount,
+    frameCount: timed.frameCount,
+    deleteHits: timed.deleteHits,
+  });
   throw new Error('media-preview-timeout');
 }
 async function awaitFileChooser(page, clickable) {
@@ -1240,12 +1339,16 @@ async function preparePostImageChooser(page, editor) {
   const scope = (await composerScope(editor)) || page;
   const existing = await uniqueImageFileInput(scope);
   const image = await exactMenuItem(scope, '图片');
+  const beforeScope = await countImageFileInputs(scope);
+  const beforePage = await countImageFileInputs(page);
+  let branch = 'miss';
+  let chooser = null;
   if (image) {
     await image.click({ trial: true, timeout: 10_000 });
     let chooserSettled = false;
-    const chooserWait = page.waitForEvent('filechooser', { timeout: 10_000 }).then((chooser) => {
+    const chooserWait = page.waitForEvent('filechooser', { timeout: 10_000 }).then((found) => {
       chooserSettled = true;
-      return chooser;
+      return found;
     }).catch(() => {
       chooserSettled = true;
       return null;
@@ -1254,19 +1357,48 @@ async function preparePostImageChooser(page, editor) {
     const deadline = Date.now() + 10_000;
     while (Date.now() <= deadline) {
       const remaining = Math.max(1, deadline - Date.now());
-      const chooser = await Promise.race([
+      const native = await Promise.race([
         chooserWait,
         page.waitForTimeout(Math.min(250, remaining)).then(() => undefined)
       ]);
-      if (chooser) return chooser;
+      if (native) {
+        branch = 'native';
+        chooser = native;
+        break;
+      }
       const local = await exactMenuItem(scope, '本地上传') || await exactMenuItem(page, '本地上传');
-      if (local) return awaitFileChooser(page, local);
+      if (local) {
+        branch = 'local';
+        chooser = await awaitFileChooser(page, local);
+        break;
+      }
       const appeared = await uniqueImageFileInput(scope) || await uniqueImageFileInput(page);
-      if (appeared) return wrapFileInput(appeared);
+      if (appeared) {
+        branch = 'appeared';
+        chooser = wrapFileInput(appeared);
+        break;
+      }
       if (chooserSettled) break;
     }
   }
-  if (existing) return wrapFileInput(existing);
+  if (!chooser && existing) {
+    branch = 'existing';
+    chooser = wrapFileInput(existing);
+  }
+  const afterScope = await countImageFileInputs(scope);
+  const afterPage = await countImageFileInputs(page);
+  emitStep({
+    step: 'media.chooser',
+    branch,
+    hasImage: !!image,
+    scopeInputs: beforeScope.total,
+    scopeImageInputs: beforeScope.image,
+    pageInputs: beforePage.total,
+    pageImageInputs: beforePage.image,
+    hits: afterScope.image,
+    mediaCount: afterPage.image,
+  });
+  if (chooser) return chooser;
   throw new Error('media-chooser');
 }
 async function openLongTextComposer(page) {
@@ -1397,6 +1529,8 @@ async function writeAction(page, input) {
       if (!imageChooser) throw new Error('media-chooser');
       const previewScope = (await composerScope(freshEditor)) || page;
       const previewBefore = await collectVisibleImageSrcs(previewScope);
+      const previewBeforeCount = await countVisibleImgs(previewScope);
+      const previewBeforeDelete = !!(await exactMenuItem(previewScope, '删除'));
       const files = [];
       try {
         for (const item of manifest) files.push({ name: item.filename, mimeType: item.mimeType, buffer: await readFile('/inputs/' + item.inputId) });
@@ -1405,14 +1539,29 @@ async function writeAction(page, input) {
         try {
           selected = await imageChooser.element().evaluate((node) => node.files ? node.files.length : 0);
         } catch {}
+        let retried = false;
+        let freshSelected = -1;
         if (selected !== manifest.length) {
+          retried = true;
           const scope = (await composerScope(freshEditor)) || page;
           const freshInput = await uniqueImageFileInput(scope) || await uniqueImageFileInput(page);
-          if (freshInput) await freshInput.setInputFiles(files);
+          if (freshInput) {
+            await freshInput.setInputFiles(files);
+            try {
+              freshSelected = await freshInput.evaluate((node) => node.files ? node.files.length : 0);
+            } catch {
+              freshSelected = -1;
+            }
+          }
         }
-              const previewBeforeCount = await countVisibleImgs(previewScope);
-      const previewBeforeDelete = !!(await exactMenuItem(previewScope, '删除'));
-      await awaitComposerMediaReady(page, freshEditor, manifest.length, 90_000, previewBefore, previewBeforeCount, previewBeforeDelete);
+        emitStep({
+          step: 'media.upload',
+          selected,
+          retried,
+          freshSelected,
+          mediaCount: manifest.length,
+        });
+        await awaitComposerMediaReady(page, freshEditor, manifest.length, 90_000, previewBefore, previewBeforeCount, previewBeforeDelete);
       } finally {
         for (const file of files) file.buffer.fill(0);
       }

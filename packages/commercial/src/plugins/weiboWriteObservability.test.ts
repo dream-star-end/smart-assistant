@@ -119,19 +119,29 @@ describe('Weibo worker log sanitizer', () => {
     const kept = sanitizeWeiboWorkerLogLine(
       JSON.stringify({
         src: 'weibo-worker',
-        step: 'action.failed',
+        step: 'media.chooser',
         textLen: 12,
         textHash8: 'deadbeef',
-        code: 'WEIBO_WRITE_SEND_BUTTON',
+        code: 'WEIBO_WRITE_MEDIA_CHOOSER',
+        branch: 'existing',
+        hasImage: true,
+        scopeImageInputs: 1,
+        html: '<div>drop</div>',
+        srcUrl: 'https://weibo.com/secret',
       }),
     )
     assert.deepEqual(kept, {
       src: 'weibo-worker',
-      step: 'action.failed',
+      step: 'media.chooser',
       textLen: 12,
       textHash8: 'deadbeef',
-      code: 'WEIBO_WRITE_SEND_BUTTON',
+      code: 'WEIBO_WRITE_MEDIA_CHOOSER',
+      branch: 'existing',
+      hasImage: true,
+      scopeImageInputs: 1,
     })
+    assert.equal(kept && 'html' in kept, false)
+    assert.equal(kept && 'srcUrl' in kept, false)
   })
 
   test('persists only sanitized JSONL', async () => {

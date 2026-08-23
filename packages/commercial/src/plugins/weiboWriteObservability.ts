@@ -96,6 +96,22 @@ const LOG_ALLOW_KEYS = new Set([
   'kind',
   'sessionId',
   'event',
+  'branch',
+  'reason',
+  'hasImage',
+  'retried',
+  'scopeInputs',
+  'pageInputs',
+  'scopeImageInputs',
+  'pageImageInputs',
+  'selected',
+  'freshSelected',
+  'imgCount',
+  'addedSrcs',
+  'bgCount',
+  'canvasCount',
+  'frameCount',
+  'deleteHits',
 ])
 
 /**
@@ -161,7 +177,7 @@ export function sanitizeWeiboWorkerLogEvent(
   const out: Record<string, unknown> = {}
   for (const [key, item] of Object.entries(raw)) {
     if (!LOG_ALLOW_KEYS.has(key)) continue
-    if (key === 'ok' || key === 'longText') {
+    if (key === 'ok' || key === 'longText' || key === 'hasImage' || key === 'retried') {
       if (item === true || item === false) out[key] = item
       continue
     }
@@ -171,7 +187,19 @@ export function sanitizeWeiboWorkerLogEvent(
       key === 'hits' ||
       key === 'timeoutMs' ||
       key === 'textLen' ||
-      key === 'mediaCount'
+      key === 'mediaCount' ||
+      key === 'scopeInputs' ||
+      key === 'pageInputs' ||
+      key === 'scopeImageInputs' ||
+      key === 'pageImageInputs' ||
+      key === 'selected' ||
+      key === 'freshSelected' ||
+      key === 'imgCount' ||
+      key === 'addedSrcs' ||
+      key === 'bgCount' ||
+      key === 'canvasCount' ||
+      key === 'frameCount' ||
+      key === 'deleteHits'
     ) {
       if (typeof item === 'number' && Number.isFinite(item)) out[key] = Math.round(item)
       continue
