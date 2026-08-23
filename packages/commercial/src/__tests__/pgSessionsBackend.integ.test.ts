@@ -5711,6 +5711,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     records?: MessageLike[];
     tapeStatus?: "completed" | "crashed" | "interrupted";
     waiveReason?: "idle_timeout" | "turn_limit" | null;
+    errorCode?: string;
   }): Promise<void> {
     const tapeId = sha256(`recoverable-tape\0${args.sessionId}\0${args.sourceClientMessageId}`);
     const turnKey = sha256(`recoverable-turn\0${args.sessionId}\0${args.sourceClientMessageId}`);
@@ -5747,7 +5748,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
             ts: 2,
             _turnTapeId: tapeId,
             _clientMessageId: args.sourceClientMessageId,
-            _errorCode: "upstream_failed",
+            _errorCode: args.errorCode ?? "upstream_failed",
           },
     );
     await pool.query(
@@ -5786,7 +5787,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
           text: "temporary upstream failure",
           ts: 3,
           _clientMessageId: args.sourceClientMessageId,
-          _errorCode: "upstream_failed",
+          _errorCode: args.errorCode ?? "upstream_failed",
         },
       ];
     }
@@ -5837,6 +5838,138 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
         sourceClientMessageId,
         mode: "checkpoint",
         automatic: false,
+      },
+    }));
+    assert.equal(recovered.kind, "admitted");
+  });
+
+  async function seedLeftoverProcessFrames(
+    sessionId: string,
+    sourceClientMessageId: string,
+  ): Promise<void> {
+    const streamKey = `legacy:1:recovery-leftover:${sessionId}`;
+    await pool.query(
+      `INSERT INTO client_session_live_streams
+         (stream_key,session_id,user_id,client_message_id,agent_container_id,source,projection_source,terminal_status)
+       VALUES ($1,$2,$3,$4,1,'gateway','tape','crashed')`,
+      [streamKey, sessionId, CUSER, sourceClientMessageId],
+    );
+    const payload = Buffer.from(JSON.stringify({
+      type: "outbound.message",
+      blocks: [
+        { kind: "thinking", text: "checking leftover" },
+        { kind: "text", text: "partial progress" },
+        { kind: "tool_use", toolName: "Bash" },
+      ],
+    }), "utf8");
+    await pool.query(
+      `INSERT INTO client_session_live_frames
+         (stream_key,source,agent_container_id,session_key,frame_seq,payload,payload_sha256)
+       VALUES ($1,'gateway',1,$2,1,$3,$4)`,
+      [streamKey, `agent:main:webchat:dm:${sessionId}`, payload, sha256(payload)],
+    );
+  }
+
+  maybe("SERVICE_RESTART error-only tape uses leftover live frames as checkpoint", async () => {
+    const sessionId = "s-dd-recovery-sr-leftover";
+    const sourceClientMessageId = "cm-dd-recovery-sr-leftover";
+    await seedRecoverableSource({
+      sessionId,
+      sourceClientMessageId,
+      tapeStatus: "crashed",
+      errorCode: "SERVICE_RESTART",
+      records: [{
+        id: `err-${sourceClientMessageId}`,
+        role: "assistant",
+        text: "任务因服务重启中断，此前已生成的过程已完整保留",
+        ts: 2,
+        _isError: true,
+        _errorCode: "SERVICE_RESTART",
+        _clientMessageId: sourceClientMessageId,
+      }],
+    });
+    const identity = turnRecoveryIdentity(sessionId, sourceClientMessageId);
+    const withoutLeftover = await backend.admitUserTurn(admitInput({
+      sessionId,
+      clientMessageId: identity.clientMessageId,
+      billingRequestId: `brq-${identity.clientMessageId}-miss`,
+      dispatchId: randomUUID(),
+      message: {
+        id: identity.clientMessageId,
+        role: "user",
+        text: "manual checkpoint",
+        ts: 3,
+      } as MessageLike & { id: string },
+      recovery: {
+        sourceClientMessageId,
+        mode: "checkpoint",
+        automatic: false,
+      },
+    }));
+    assert.deepEqual(withoutLeftover, {
+      kind: "recovery_conflict",
+      reason: "recovery_mode_mismatch",
+    });
+
+    await seedLeftoverProcessFrames(sessionId, sourceClientMessageId);
+    const recovered = await backend.admitUserTurn(admitInput({
+      sessionId,
+      clientMessageId: identity.clientMessageId,
+      billingRequestId: `brq-${identity.clientMessageId}`,
+      dispatchId: randomUUID(),
+      message: {
+        id: identity.clientMessageId,
+        role: "user",
+        text: "manual checkpoint",
+        ts: 3,
+      } as MessageLike & { id: string },
+      recovery: {
+        sourceClientMessageId,
+        mode: "checkpoint",
+        automatic: false,
+      },
+    }));
+    assert.equal(recovered.kind, "admitted");
+  });
+
+  maybe("SERVICE_RESTART leftover checkpoint allows automatic recovery even if tools are unproven", async () => {
+    const sessionId = "s-dd-recovery-sr-leftover-auto";
+    const sourceClientMessageId = "cm-dd-recovery-sr-leftover-auto";
+    await seedRecoverableSource({
+      sessionId,
+      sourceClientMessageId,
+      tapeStatus: "crashed",
+      errorCode: "SERVICE_RESTART",
+      records: [{
+        id: `err-${sourceClientMessageId}`,
+        role: "assistant",
+        text: "任务因服务重启中断",
+        ts: 2,
+        _isError: true,
+        _errorCode: "SERVICE_RESTART",
+        _clientMessageId: sourceClientMessageId,
+      }],
+    });
+    await seedLeftoverProcessFrames(sessionId, sourceClientMessageId);
+    const identity = turnRecoveryAttemptIdentity(sessionId, sourceClientMessageId, 1);
+    const recovered = await backend.admitUserTurn(admitInput({
+      sessionId,
+      clientMessageId: identity.clientMessageId,
+      billingRequestId: `brq-${identity.clientMessageId}`,
+      dispatchId: randomUUID(),
+      message: {
+        id: identity.clientMessageId,
+        role: "user",
+        text: "automatic checkpoint",
+        ts: 3,
+      } as MessageLike & { id: string },
+      recovery: {
+        sourceClientMessageId,
+        mode: "checkpoint",
+        automatic: true,
+        rootClientMessageId: sourceClientMessageId,
+        attempt: 1,
+        max: 10,
       },
     }));
     assert.equal(recovered.kind, "admitted");

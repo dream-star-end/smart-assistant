@@ -324,9 +324,11 @@ export function recoverySkippedNotice(reason?: string): string {
     case "source_not_safely_replayable":
       return "没有重放原请求：服务端无法证明它尚未执行。原任务仍已保留，可从已保存的断点继续。";
     case "source_tape_malformed":
+      return "没法从保存的进度继续。任务内容还在，请刷新后再试。";
     case "recovery_mode_mismatch":
+      return "没法从保存的进度继续。任务内容还在，请再点一次「从断点继续」。";
     case "automatic_checkpoint_unsafe":
-      return "未从断点继续：服务端校验断点记录失败，原任务仍已保留。请刷新后再试。";
+      return "自动续跑已跳过。任务内容还在，你可以手动从进度继续。";
     case "automatic_retry_exhausted":
       return "自动恢复已达到次数上限，原任务仍已保留。请在错误卡上手动重试。";
     case "capability_unavailable":
@@ -382,6 +384,7 @@ export function interruptedContinuationTarget(
   error: ChatMessage,
   sessionId: string,
 ): InterruptedContinuationTarget | undefined {
+  if (error._recoverySkippedNotice) return undefined;
   const base = baseTurnRecoveryTarget(messages, error, sessionId);
   if (!base) return undefined;
   const durableRows = base.rows.filter(
@@ -2363,10 +2366,26 @@ export class ChatSocket {
         [sourceClientMessageId]: true,
       };
     }
-    this.transientNotices.set(sessId, {
-      text: recoverySkippedNotice(frame.recoverySkippedReason),
-      ts: Date.now(),
-    });
+    const skipNotice = recoverySkippedNotice(frame.recoverySkippedReason);
+    let attachedToError = false;
+    if (sourceClientMessageId) {
+      for (const message of sess.messages) {
+        if (
+          message.role === "assistant" &&
+          !!message._errorCode &&
+          message._clientMessageId === sourceClientMessageId
+        ) {
+          message._recoverySkippedNotice = skipNotice;
+          attachedToError = true;
+        }
+      }
+    }
+    if (!attachedToError) {
+      this.transientNotices.set(sessId, {
+        text: skipNotice,
+        ts: Date.now(),
+      });
+    }
     const userIndex = sess.messages.findIndex((message) =>
       message.id === clientMessageId && isRecoveryControlUserTurn(message));
     if (userIndex < 0) {

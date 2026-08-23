@@ -556,7 +556,9 @@ export function AssistantCard({
       ? cb.resolveInterruptedContinuation?.(msg)
       : undefined;
   const showInterruptedContinuation =
-    !!interruptedContinuationTarget && !!cb.onContinueInterrupted;
+    !msg._recoverySkippedNotice &&
+    !!interruptedContinuationTarget &&
+    !!cb.onContinueInterrupted;
   const showPreciseRetry = !isInsufficient && isLastTurn && !!retryTarget;
   const showRegenFallback =
     !isInsufficient &&
@@ -667,7 +669,7 @@ export function AssistantCard({
           >
             <div className="min-w-0">
               <p className="text-[13px] leading-5 text-fg/90 [overflow-wrap:anywhere]">
-                {presentedError.message}
+                {msg._recoverySkippedNotice ?? presentedError.message}
               </p>
               {presentedError.detail && (
                 <details className="mt-1.5 max-w-full">

@@ -5637,8 +5637,13 @@ describe("ChatSocket interrupted continuation", () => {
     });
     expect(session.messages).toEqual([
       { ...oldRows[0], _automaticRecoveryAttempted: true },
-      ...oldRows.slice(1),
+      oldRows[1],
+      {
+        ...oldRows[2],
+        _recoverySkippedNotice: "未从断点继续：会话已有更新，原任务仍已保留。请在最新消息后再试。",
+      },
     ]);
+    expect(sock.getTransientNotice("s-auto-checkpoint")).toBeNull();
     expect(session._sendingInFlight).toBe(false);
     const sentRecoveries = () => ws.sent
       .map((raw) => JSON.parse(raw) as Record<string, any>)
@@ -5719,6 +5724,7 @@ describe("ChatSocket interrupted continuation", () => {
       _errorCode: "model_capacity",
       text: "SOURCE_ERROR_SHOULD_REAPPEAR",
       _clientMessageId: "u-lineage-skip",
+      _recoverySkippedNotice: "未从断点继续：会话已有更新，原任务仍已保留。请在最新消息后再试。",
     });
     sock.stop();
   });

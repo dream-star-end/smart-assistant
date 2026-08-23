@@ -1589,6 +1589,101 @@ function recoveryWithoutCheckpointIsProven(code: string): boolean {
   return PRE_EXECUTION_RECOVERY_CODES.has(normalizeTurnErrorCode(code));
 }
 
+/** Leftover live frames are display-isolated after tape projection, but they
+ * remain the SERVICE_RESTART checkpoint store. Recovery admission is not the
+ * hot hydrate path, so it may read them without putting leftover back into
+ * GET /live-frames. */
+function leftoverFramesToRecoveryRecords(payloads: readonly unknown[]): unknown[] {
+  const records: Array<Record<string, unknown>> = [];
+  for (const payload of payloads) {
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) continue;
+    const frame = payload as Record<string, unknown>;
+    if (frame.type !== "outbound.message" || !Array.isArray(frame.blocks)) continue;
+    for (const block of frame.blocks) {
+      if (!block || typeof block !== "object" || Array.isArray(block)) continue;
+      const item = block as Record<string, unknown>;
+      const kind = item.kind;
+      if (kind === "thinking") {
+        records.push({
+          role: "thinking",
+          text: typeof item.text === "string" ? item.text : "",
+        });
+        continue;
+      }
+      if (kind === "text") {
+        const text = typeof item.text === "string" ? item.text : "";
+        if (text.trim().length > 0) records.push({ role: "assistant", text });
+        continue;
+      }
+      if (kind === "tool_use" || kind === "tool_result") {
+        records.push({
+          role: "tool",
+          _completed: kind === "tool_result",
+        });
+        continue;
+      }
+      if (kind === "delegate_progress") {
+        records.push({
+          role: "delegate-progress",
+          _completed: item._completed === true,
+        });
+      }
+    }
+  }
+  return records;
+}
+
+async function loadLeftoverRecoveryRecords(
+  client: PoolClient,
+  sessionId: string,
+  sessionUserId: string,
+  clientMessageId: string,
+): Promise<unknown[]> {
+  const rows = (
+    await client.query<{ payload: Buffer }>(
+      `SELECT f.payload
+         FROM client_session_live_streams s
+         JOIN client_session_live_frames f ON f.stream_key=s.stream_key
+        WHERE s.session_id=$1 AND s.user_id=$2 AND s.client_message_id=$3
+        ORDER BY f.record_id
+        LIMIT 4000`,
+      [sessionId, sessionUserId, clientMessageId],
+    )
+  ).rows;
+  const payloads: unknown[] = [];
+  for (const row of rows) {
+    try {
+      payloads.push(JSON.parse(Buffer.from(row.payload).toString("utf8")));
+    } catch {
+      // Corrupt leftover frames must not poison tape-backed recovery.
+    }
+  }
+  return leftoverFramesToRecoveryRecords(payloads);
+}
+
+function mergeTapeAndLeftoverRecoveryAssessment(
+  tapeRecords: readonly unknown[],
+  leftoverRecords: readonly unknown[],
+): ReturnType<typeof assessTurnRecoveryTape> & { leftoverBacked: boolean } {
+  const tape = assessTurnRecoveryTape(tapeRecords);
+  if (tape.mode === "checkpoint") return { ...tape, leftoverBacked: false };
+  const leftover = assessTurnRecoveryTape(leftoverRecords);
+  if (leftover.mode === "checkpoint") return { ...leftover, leftoverBacked: true };
+  return { ...tape, leftoverBacked: false };
+}
+
+/** Completed-error already resumes unsafe checkpoints. SERVICE_RESTART crash
+ * tapes are error-only by leftover isolation, so leftover-backed process is
+ * the designed checkpoint and uses the same continuation prompt. */
+function allowUnsafeAutomaticCheckpoint(
+  status: string,
+  errorCode: string,
+  leftoverBacked: boolean,
+): boolean {
+  if (status === "completed") return true;
+  return leftoverBacked && normalizeTurnErrorCode(errorCode) === "service_restart";
+}
+
 /** The last assistant record is the semantic terminal surface. An earlier
  * error followed by a later answer is not a failed turn, while trailing tool
  * or runtime audit rows do not erase a terminal assistant error. */
@@ -1713,8 +1808,15 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
   if (!routing || typeof routing !== "object" || Array.isArray(routing)) return;
   const route = routing as Record<string, unknown>;
 
-  const assessment = assessTurnRecoveryTape(
+  const leftoverRecords = await loadLeftoverRecoveryRecords(
+    client,
+    input.sessionId,
+    input.sessionUserId,
+    clientMessageId,
+  );
+  const assessment = mergeTapeAndLeftoverRecoveryAssessment(
     input.turn.records.map((record) => record.payload),
+    leftoverRecords,
   );
   // A checkpoint continuation resumes the native session with the exact
   // persisted process; it never replays the original request. Even an
@@ -1726,7 +1828,7 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
   if (
     assessment.mode === "checkpoint" &&
     !assessment.checkpointSafe &&
-    status !== "completed"
+    !allowUnsafeAutomaticCheckpoint(status, errorCode, assessment.leftoverBacked)
   ) return;
   if (
     assessment.mode === "replay" &&
@@ -7720,7 +7822,16 @@ export function createPgSessionsBackend(
               } catch {
                 return { kind: "recovery_conflict", reason: "source_tape_malformed" };
               }
-              const assessment = assessTurnRecoveryTape(records);
+              const leftoverRecords = await loadLeftoverRecoveryRecords(
+                client,
+                input.sessionId,
+                input.sessionUserId,
+                input.recovery.sourceClientMessageId,
+              );
+              const assessment = mergeTapeAndLeftoverRecoveryAssessment(
+                records,
+                leftoverRecords,
+              );
               const terminalErrorCode = terminalTurnRecordErrorCode(records);
               const finalizedErrorCode = terminalErrorCode ||
                 (finalized.status === "crashed" || finalized.status === "interrupted"
@@ -7742,7 +7853,11 @@ export function createPgSessionsBackend(
                 input.recovery.automatic &&
                 assessment.mode === "checkpoint" &&
                 !assessment.checkpointSafe &&
-                finalized.status !== "completed"
+                !allowUnsafeAutomaticCheckpoint(
+                  finalized.status,
+                  finalizedErrorCode,
+                  assessment.leftoverBacked,
+                )
               ) {
                 return { kind: "recovery_conflict", reason: "automatic_checkpoint_unsafe" };
               }

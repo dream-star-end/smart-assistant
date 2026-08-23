@@ -285,6 +285,8 @@ export type ChatMessage = {
   /** error 红卡：归一化 code + 折叠区原始 detail。*/
   _errorCode?: string;
   _errorDetail?: string;
+  /** Browser-only: last recovery skip copy, attached to the source error card. */
+  _recoverySkippedNotice?: string;
   /** Highest gateway-local retry consumed before this terminal error. */
   _automaticRetryRootClientMessageId?: string;
   _automaticRetryAttempt?: number;

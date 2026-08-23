@@ -233,6 +233,21 @@ describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
     expect(screen.queryByRole("button", { name: "重新尝试" })).toBeNull();
   });
 
+  test("续跑被拒后错误卡改写说明并隐藏「从断点继续」", () => {
+    const error = errMsg({
+      _errorCode: "SERVICE_RESTART",
+      _clientMessageId: "u1",
+      usage: { waived: true },
+      _recoverySkippedNotice: "没法从保存的进度继续。任务内容还在，请刷新后再试。",
+    });
+    renderErr(error, {
+      onContinueInterrupted: vi.fn(),
+      resolveInterruptedContinuation: () => retryableUser,
+    });
+    expect(screen.getByText("没法从保存的进度继续。任务内容还在，请刷新后再试。")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "从断点继续" })).toBeNull();
+  });
+
   test("early terminal 后还有同轮过程（非页面尾行）→ marker 不取得续跑 CTA", () => {
     render(
       <AssistantCard
