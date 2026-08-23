@@ -25,6 +25,7 @@ export const PROMPT_PLACEHOLDERS = [
   'ticket.title',
   'ticket.body',
   'last_run.summary',
+  'last_run.output',
   'comments',
   'stage.exit_checklist',
 ] as const
@@ -34,10 +35,18 @@ export type PromptPlaceholder = (typeof PROMPT_PLACEHOLDERS)[number]
 const PLACEHOLDER_SET = new Set<string>(PROMPT_PLACEHOLDERS)
 
 /** 评论拼进提示词的硬上限(字符)。超出丢最早的,留最近的。 */
-export const COMMENTS_CHAR_BUDGET = 4000
+export const COMMENTS_CHAR_BUDGET = 12_000
 
 /** 最多保留的最近评论条数(即使总长未超预算也截)。 */
-export const COMMENTS_MAX_ITEMS = 12
+export const COMMENTS_MAX_ITEMS = 20
+
+/** {{last_run.output}} 注入 output_md 全文的硬上限(字符)。 */
+export const LAST_RUN_OUTPUT_MAX_CHARS = 20_000
+
+/** 超上限时追加在截断点之后,指向面板里的完整产出。 */
+export const LAST_RUN_OUTPUT_TRUNCATE_NOTE = '…（已截断，完整产出见任务面板该次 run 的 output_md）'
+
+const LAST_RUN_OUTPUT_EMPTY = '（尚无上次 run 产出）'
 
 const PLACEHOLDER_RE = /\{\{\s*([a-zA-Z0-9_.]+)\s*\}\}/g
 
@@ -45,7 +54,7 @@ export interface PromptRenderInput {
   template: string | null | undefined
   ticket: Pick<Ticket, 'identifier' | 'title' | 'body'>
   stage: Pick<PipelineStage, 'name' | 'exitChecklist'>
-  lastRun?: Pick<TicketRun, 'summary'> | null
+  lastRun?: (Pick<TicketRun, 'summary'> & Partial<Pick<TicketRun, 'outputMd'>>) | null
   comments?: readonly TicketComment[]
 }
 
@@ -87,6 +96,16 @@ export function formatCommentsForPrompt(
   return chunks.join('\n')
 }
 
+export function formatLastRunOutput(
+  outputMd: string | null | undefined,
+  maxChars = LAST_RUN_OUTPUT_MAX_CHARS,
+): string {
+  if (outputMd == null || outputMd.trim() === '') return LAST_RUN_OUTPUT_EMPTY
+  const trimmed = outputMd.trim()
+  if (trimmed.length <= maxChars) return trimmed
+  return `${trimmed.slice(0, maxChars)}${LAST_RUN_OUTPUT_TRUNCATE_NOTE}`
+}
+
 function defaultTemplate(stageName: string): string {
   return [
     `你正在处理任务面板的「${stageName}」阶段。`,
@@ -97,6 +116,9 @@ function defaultTemplate(stageName: string): string {
     '',
     '## 上次结论',
     '{{last_run.summary}}',
+    '',
+    '## 上次完整产出',
+    '{{last_run.output}}',
     '',
     '## 评论',
     '{{comments}}',
@@ -127,6 +149,7 @@ export function renderPrompt(input: PromptRenderInput): PromptRenderResult {
     'ticket.title': input.ticket.title,
     'ticket.body': input.ticket.body,
     'last_run.summary': input.lastRun?.summary ?? '（尚无上次 run）',
+    'last_run.output': formatLastRunOutput(input.lastRun?.outputMd),
     comments,
     'stage.exit_checklist': input.stage.exitChecklist ?? '（本阶段未配置 exit checklist）',
   }

@@ -36,7 +36,7 @@ export const SEED_AGENT_IDS = {
 
 const PLACEHOLDERS =
   '{{ticket.identifier}} {{ticket.title}} {{ticket.body}} ' +
-  '{{last_run.summary}} {{comments}} {{stage.exit_checklist}}'
+  '{{last_run.summary}} {{last_run.output}} {{comments}} {{stage.exit_checklist}}'
 
 export interface StageSeed {
   name: string

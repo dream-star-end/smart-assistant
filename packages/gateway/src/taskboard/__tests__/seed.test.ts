@@ -89,6 +89,7 @@ describe('seedDefaultPipelines', () => {
           assert.ok(stage.exitChecklist)
           assert.equal(stage.patrolEnabled, true)
           assert.equal(stage.patrolCron, DEFAULT_PATROL_CRON)
+          assert.equal(stage.model, null)
           const han = hanCount(stage.promptTemplate ?? '')
           assert.ok(han >= 100 && han <= 250, `${stage.name} prompt 汉字 ${han} 不在 100-250`)
           for (const ph of [
@@ -96,6 +97,7 @@ describe('seedDefaultPipelines', () => {
             '{{ticket.title}}',
             '{{ticket.body}}',
             '{{last_run.summary}}',
+            '{{last_run.output}}',
             '{{comments}}',
             '{{stage.exit_checklist}}',
           ]) {

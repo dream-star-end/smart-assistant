@@ -6,6 +6,7 @@
 import * as assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import {
+  SUMMARY_MAX,
   UNSTRUCTURED_TAIL_MARK,
   collapseRepeatedOutput,
   extractConclusion,
@@ -82,13 +83,13 @@ describe('collapseRepeatedOutput', () => {
 })
 
 describe('summarizeRunOutput', () => {
-  it('成功时评论用结论,summary 不超过 400 字', () => {
+  it(`成功时评论用结论,summary 不超过 ${SUMMARY_MAX} 字`, () => {
     const output = `我先读规则。\n\n## 结论\n${'验收通过。产物 generated/a.md。'.repeat(3)}`
     const got = summarizeRunOutput(output)
     assert.equal(got.structured, true)
     assert.match(got.commentBody, /验收通过/)
     assert.doesNotMatch(got.commentBody, /我先读规则/)
-    assert.ok(got.summary.length <= 400)
+    assert.ok(got.summary.length <= SUMMARY_MAX)
   })
 
   it('失败时归并重复错误写入评论,不丢关键错因', () => {
@@ -96,7 +97,7 @@ describe('summarizeRunOutput', () => {
     const got = summarizeRunOutput(unit.repeat(50), { failed: true, error: 'delegate failed' })
     assert.match(got.commentBody, /UPSTREAM_ERROR/)
     assert.match(got.commentBody, /同一错误重复/)
-    assert.ok(got.summary.length <= 400)
+    assert.ok(got.summary.length <= SUMMARY_MAX)
     assert.doesNotMatch(got.summary, /API …$/)
   })
 })
