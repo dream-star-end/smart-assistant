@@ -1602,12 +1602,16 @@
           "layer": "unit",
           "path": "packages/web-react/src/lib/chat/chat.test.ts",
           "assertion": "two identical goals bind to their own background cards"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T46 编程助手官方教程路由不再回落到故障 Ark 模型"
         }
       ],
-      "proofPending": {
-        "reason": "跨进程后台回调恢复与真实用户消息并发顺序目前只有 unit/typecheck 覆盖；需随 selfhost 发布后补一次真实浏览器重启旅程，不用无关 J1-J5 充数。",
-        "since": "2026-08-23"
-      }
+      "coverageCommits": [
+        "5b4b2baa"
+      ]
     }
   ]
 }
