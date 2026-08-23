@@ -6875,8 +6875,11 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
       role: "assistant" as const,
       text: `QUOTE-HEAD\n${"被引用的完整历史回答".repeat(30_000)}\nQUOTE-TAIL`,
     };
-    const expectedModelText = formatMessageReplyPrompt(exactModelText, replyTo)
-      .replaceAll("\u0000", "\\u0000");
+    const expectedModelText = [
+      formatMessageReplyPrompt(exactModelText, replyTo),
+      "用户附带了以下图片(已保存到服务器本地):",
+      "- `/home/agent/.openclaude/uploads/guide.png`",
+    ].join("\n").replaceAll("\u0000", "\\u0000");
     assert.ok(Buffer.byteLength(text, "utf8") > 4 * 1024 * 1024);
     await backend.upsertClientSession(mkSession({ id: sessionId, userId: CUSER }));
     const admitted = await backend.admitUserTurn(admitInput({
