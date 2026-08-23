@@ -2370,7 +2370,10 @@ export async function registerCommercial(
         identityRepo,
         runner: getPool() as unknown as CronWakeRunner,
       });
-      let cronOriginInjectHandler: CronOriginInjectHandler | undefined;
+      const cronOriginInjectHandler: CronOriginInjectHandler = makeCronOriginInjectHandler({
+        identityRepo,
+        inject: (input) => userChatBridge.injectCronOriginTurn(input),
+      });
       // /internal/v3/inbox-post — 容器 onDeliver「离线送达兜底写站内信」。uid 由容器身份推导,
       // audience 硬编码 'user' 只给自己写;created_by = MIN active admin(同 onboarding 语义,
       // 每次现解析,不缓存)。无 admin → 抛错 → handler 500。见 http/internalInboxPost.ts。
@@ -5114,11 +5117,6 @@ export async function registerCommercial(
       }
     })();
   };
-
-  cronOriginInjectHandler = makeCronOriginInjectHandler({
-    identityRepo,
-    inject: (input) => userChatBridge.injectCronOriginTurn(input),
-  });
 
   const userChatBridge: UserChatBridgeHandler = createUserChatBridge({
     jwtSecret,
