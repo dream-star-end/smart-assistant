@@ -25,6 +25,7 @@ import {
   MODEL_CATALOG_PATH,
   ModelCatalogClient,
   ModelCatalogUnavailableError,
+  lookupCatalogAgentMultiplier,
   parseCatalogResponse,
 } from '../modelCatalogClient.js'
 
@@ -532,5 +533,49 @@ describe('modelCatalogClient — fail-closed(无 baked 回落)', () => {
     const client = new ModelCatalogClient({ env: {}, fetcher: fakeFetcher({}) })
     assert.equal(client.configured, false)
     await assert.rejects(() => client.getView(), ModelCatalogUnavailableError)
+  })
+})
+
+describe('modelCatalogClient — agent_cost_overrides 字段在/不在', () => {
+  test('字段缺席 → lookup 返回 null(fail-closed),不得默认 1.000', () => {
+    const view = parseCatalogResponse(CATALOG_BODY)
+    assert.equal(view.agentCostOverrides, null)
+    assert.equal(lookupCatalogAgentMultiplier(view, 'coding-assistant'), null)
+  })
+
+  test('空字典 → 缺该 agent 按 1.000(明确无 override)', () => {
+    const view = parseCatalogResponse({ ...CATALOG_BODY, agent_cost_overrides: {} })
+    assert.ok(view.agentCostOverrides != null)
+    assert.equal(view.agentCostOverrides.size, 0)
+    assert.equal(lookupCatalogAgentMultiplier(view, 'coding-assistant'), '1.000')
+  })
+
+  test('有 override → 返回下发值;其它 agent 仍 1.000', () => {
+    const view = parseCatalogResponse({
+      ...CATALOG_BODY,
+      agent_cost_overrides: { 'coding-assistant': '1.500' },
+    })
+    assert.equal(lookupCatalogAgentMultiplier(view, 'coding-assistant'), '1.500')
+    assert.equal(lookupCatalogAgentMultiplier(view, 'explorer'), '1.000')
+  })
+
+  test('空字典必须落入 LKG,冷启不能把「明确无 override」丢成「没拿到字段」', async () => {
+    const lkg = tmpLkg()
+    const body = { ...CATALOG_BODY, agent_cost_overrides: {} }
+    const client = new ModelCatalogClient({
+      env: ENV,
+      lkgPath: lkg.path,
+      ttlMs: 60_000,
+      fetcher: fakeFetcher({
+        catalog: { status: 200, body },
+        epoch: { status: 200, body: { epoch: '5' } },
+      }),
+    })
+    const first = await client.getView()
+    assert.equal(lookupCatalogAgentMultiplier(first, 'coding-assistant'), '1.000')
+    client._resetForTests()
+    const second = await client.getView()
+    assert.equal(lookupCatalogAgentMultiplier(second, 'coding-assistant'), '1.000')
+    lkg.cleanup()
   })
 })

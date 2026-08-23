@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
-import { CNY_PER_USD, computeCostFen, fenToUsd } from '../computeCost.js'
+import { CNY_PER_USD, composeMultiplier, computeCostFen, fenToUsd } from '../computeCost.js'
 
 const terra = {
   input_per_mtok: 150n,
@@ -40,6 +40,16 @@ describe('computeCostFen', () => {
       ),
       1n,
     )
+  })
+})
+
+describe('composeMultiplier', () => {
+  test('与 commercial agentMultiplier 截断/clamp 同口径', () => {
+    assert.equal(composeMultiplier('2.000', '1.500'), '3.000')
+    assert.equal(composeMultiplier('1.234', '1.234'), '1.522')
+    assert.equal(composeMultiplier('0.001', '0.001'), '0.001')
+    assert.equal(composeMultiplier('0.000', '1.500'), '0.000')
+    assert.equal(composeMultiplier('1.000', '1.500'), '1.500')
   })
 })
 

@@ -1734,6 +1734,7 @@ type DelegateTaskResult =
       tokensIn?: number | null
       tokensOut?: number | null
       costUsd?: number | null
+      costImprecise?: boolean
       sessionKey?: string
     }
 
@@ -11702,6 +11703,7 @@ export class Gateway {
       }
     }
 
+    const priced = await resolveDelegateCostUsd(session)
     return {
       kind: 'completed',
       ok: !error,
@@ -11717,7 +11719,8 @@ export class Gateway {
       // usage_log 是 eventBus 异步,return 时多半还没落盘,不能只靠它。
       tokensIn: session.totalInputTokens || null,
       tokensOut: session.totalOutputTokens || null,
-      costUsd: (await resolveDelegateCostUsd(session)) ?? null,
+      costUsd: priced.costUsd,
+      costImprecise: priced.costImprecise,
     }
   }
 
@@ -11755,6 +11758,7 @@ export class Gateway {
       tokensIn: result.tokensIn ?? null,
       tokensOut: result.tokensOut ?? null,
       costUsd: result.costUsd ?? null,
+      costImprecise: result.costImprecise ?? null,
     }
   }
 

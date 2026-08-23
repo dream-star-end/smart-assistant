@@ -67,12 +67,15 @@ afterEach(() => {
 })
 
 describe('schema / migrate', () => {
-  it('建表后 user_version=3,重复 migrate 不报错不改版本', () => {
+  it('建表后 user_version=4,重复 migrate 不报错不改版本', () => {
     const { db } = freshDb()
     assert.equal(getSchemaVersion(db), TASKBOARD_SCHEMA_VERSION)
+    assert.equal(TASKBOARD_SCHEMA_VERSION, 4)
     migrate(db)
     migrate(db)
     assert.equal(getSchemaVersion(db), TASKBOARD_SCHEMA_VERSION)
+    const runCols = db.prepare(`PRAGMA table_info(tb_ticket_run)`).all() as Array<{ name: string }>
+    assert.ok(runCols.some((c) => c.name === 'cost_imprecise'))
     const tables = db
       .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'tb_%'`)
       .all() as { name: string }[]
@@ -182,7 +185,7 @@ describe('schema / migrate', () => {
     raw.close()
 
     const db = openTaskboardDb(path)
-    assert.equal(getSchemaVersion(db), 3)
+    assert.equal(getSchemaVersion(db), TASKBOARD_SCHEMA_VERSION)
     const cols = db.prepare(`PRAGMA table_info(tb_pipeline_stage)`).all() as Array<{ name: string }>
     assert.ok(cols.some((c) => c.name === 'model'))
     const after = db
@@ -204,6 +207,132 @@ describe('schema / migrate', () => {
       assert.equal(after[i].agent_id, 'explorer')
       assert.equal(after[i].model, null)
     }
+    db.close()
+  })
+
+  it('v3 库升到 v4 后阶段指纹不变、cost_imprecise 全 NULL、二次迁移幂等', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'oc-tb-v3-'))
+    dirs.push(dir)
+    const path = join(dir, 'taskboard.db')
+    const raw = new Database(path)
+    raw.pragma('foreign_keys = ON')
+    raw.exec(TASKBOARD_DDL_V1)
+    raw.exec(TASKBOARD_DDL_V2)
+    raw.exec('ALTER TABLE tb_pipeline_stage ADD COLUMN model TEXT')
+    raw.pragma('user_version = 3')
+    raw
+      .prepare(
+        `INSERT INTO tb_project (id, key, name, description, workspace, labels, archived_at, created_at, updated_at, next_ticket_seq)
+         VALUES ('p1', 'OLD', '旧项目', NULL, NULL, '[]', NULL, 1, 1, 1)`,
+      )
+      .run()
+    raw
+      .prepare(
+        `INSERT INTO tb_pipeline (id, project_id, name, ticket_type, is_default, created_at, updated_at)
+         VALUES ('pipe1', 'p1', '旧线', 'bug', 1, 1, 1)`,
+      )
+      .run()
+    const insertStage = raw.prepare(
+      `INSERT INTO tb_pipeline_stage (
+         id, pipeline_id, ordinal, name, kind, agent_id, prompt_template, toolsets,
+         effort, patrol_cron, patrol_enabled, patrol_timezone, quiet_hours_start,
+         quiet_hours_end, max_runs_per_day, timeout_sec, max_retries,
+         circuit_breaker_threshold, on_success, on_failure, entry_condition,
+         exit_checklist, require_human_ack, auto_close, created_at, updated_at, model
+       ) VALUES (
+         ?, 'pipe1', ?, ?, 'ai', 'explorer', 'do {{ticket.title}}', NULL,
+         'medium', '*/30 9-19 * * 1-5', 1, 'Asia/Shanghai', 23,
+         8, 8, 2400, 2,
+         3, 'advance', 'retry', NULL,
+         '做完', 0, 0, 1, 1, NULL
+       )`,
+    )
+    for (let i = 0; i < 40; i++) {
+      insertStage.run(`stage-${i}`, i, `阶段${i}`)
+    }
+    raw
+      .prepare(
+        `INSERT INTO tb_ticket (
+           id, identifier, project_id, type, title, body, status, stage_id, pipeline_id,
+           priority, severity, labels, assignee, reporter, source, origin_session_key,
+           due_date, start_date, version, blocked_reason, stage_loop_count,
+           created_at, updated_at, closed_at
+         ) VALUES (
+           't1', 'OLD-1', 'p1', 'bug', '旧单', '', 'ready', 'stage-0', 'pipe1',
+           'P2', NULL, '[]', NULL, 'u', 'human', NULL,
+           NULL, NULL, 1, NULL, 0,
+           1, 1, NULL
+         )`,
+      )
+      .run()
+    raw
+      .prepare(
+        `INSERT INTO tb_ticket_run (
+           id, ticket_id, stage_id, agent_id, trigger, session_key, status,
+           skip_reason, lease_owner, lease_expires_at, started_at, finished_at,
+           duration_ms, tokens_in, tokens_out, cost_usd, summary, output_md,
+           error, created_at
+         ) VALUES (
+           'run-1', 't1', 'stage-0', 'explorer', 'patrol', 'sk', 'succeeded',
+           NULL, NULL, NULL, 1, 2,
+           1, 10, 2, 0.12, 'ok', 'done',
+           NULL, 1
+         )`,
+      )
+      .run()
+    const stageFpBefore = raw
+      .prepare(
+        `SELECT id, name, ordinal, agent_id, model FROM tb_pipeline_stage ORDER BY ordinal`,
+      )
+      .all()
+    const runFpBefore = raw
+      .prepare(
+        `SELECT id, ticket_id, tokens_in, tokens_out, cost_usd, summary FROM tb_ticket_run ORDER BY id`,
+      )
+      .all()
+    assert.equal(
+      (raw.prepare(`SELECT COUNT(*) AS n FROM tb_pipeline_stage`).get() as { n: number }).n,
+      40,
+    )
+    raw.close()
+
+    const db = openTaskboardDb(path)
+    assert.equal(getSchemaVersion(db), 4)
+    const cols = db.prepare(`PRAGMA table_info(tb_ticket_run)`).all() as Array<{ name: string }>
+    assert.ok(cols.some((c) => c.name === 'cost_imprecise'))
+    assert.equal(
+      (db.prepare(`SELECT COUNT(*) AS n FROM tb_pipeline_stage`).get() as { n: number }).n,
+      40,
+    )
+    const stageFpAfter = db
+      .prepare(
+        `SELECT id, name, ordinal, agent_id, model FROM tb_pipeline_stage ORDER BY ordinal`,
+      )
+      .all()
+    const runFpAfter = db
+      .prepare(
+        `SELECT id, ticket_id, tokens_in, tokens_out, cost_usd, summary FROM tb_ticket_run ORDER BY id`,
+      )
+      .all()
+    assert.deepEqual(stageFpAfter, stageFpBefore)
+    assert.deepEqual(runFpAfter, runFpBefore)
+    const imprecise = db
+      .prepare(`SELECT cost_imprecise FROM tb_ticket_run`)
+      .all() as Array<{ cost_imprecise: number | null }>
+    assert.ok(imprecise.length > 0)
+    assert.ok(imprecise.every((row) => row.cost_imprecise == null))
+
+    migrate(db)
+    migrate(db)
+    assert.equal(getSchemaVersion(db), 4)
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT id, name, ordinal, agent_id, model FROM tb_pipeline_stage ORDER BY ordinal`,
+        )
+        .all(),
+      stageFpBefore,
+    )
     db.close()
   })
 })

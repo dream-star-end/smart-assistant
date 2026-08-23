@@ -290,6 +290,8 @@ export interface TicketRun {
   tokensIn: number | null
   tokensOut: number | null
   costUsd: number | null
+  /** 补价因缺 agent 倍率字段而 fail-closed。旧响应可缺席。 */
+  costImprecise?: boolean | null
   summary: string | null
   outputMd: string | null
   error: string | null

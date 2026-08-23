@@ -148,6 +148,8 @@ function handler(args: {
   readEpoch?: () => Promise<bigint>;
   unavailableProviders?: ReadonlySet<string>;
   availabilityRevision?: string;
+  agentCostOverrides?: Record<string, string>;
+  agentCostOverridesFails?: boolean;
 }) {
   const snap = args.snapshot ?? snapshot();
   return makeModelCatalogHandler({
@@ -167,6 +169,14 @@ function handler(args: {
       unavailableProviderIds: args.unavailableProviders ?? new Set<string>(),
       revision: args.availabilityRevision ?? "availability-1",
     }),
+    ...(args.agentCostOverrides !== undefined || args.agentCostOverridesFails
+      ? {
+          loadAgentCostOverrides: async () => {
+            if (args.agentCostOverridesFails) throw new Error("overrides db down");
+            return args.agentCostOverrides ?? {};
+          },
+        }
+      : {}),
   });
 }
 
@@ -293,6 +303,42 @@ describe("internalModelCatalog — per-uid 投影下发", () => {
     await handler({ snapshot: snap })(makeReq({ auth: `Bearer ${TOKEN}` }), res, CTX);
     assert.equal(res.statusCode, 200);
     assert.deepEqual((res.body as WireCatalogResponse).models, []);
+  });
+});
+
+describe("internalModelCatalog — agent_cost_overrides 下发", () => {
+  test("未装配 loader → 省略字段(旧行为,旧 gateway 无感)", async () => {
+    const res = makeRes();
+    await handler({})(makeReq({ auth: `Bearer ${TOKEN}` }), res, CTX);
+    const body = res.body as WireCatalogResponse;
+    assert.equal(body.agent_cost_overrides, undefined);
+  });
+
+  test("空表 → 下发空字典(gateway 据此按 1.000 补,不是 fail-closed)", async () => {
+    const res = makeRes();
+    await handler({ agentCostOverrides: {} })(makeReq({ auth: `Bearer ${TOKEN}` }), res, CTX);
+    const body = res.body as WireCatalogResponse;
+    assert.deepEqual(body.agent_cost_overrides, {});
+  });
+
+  test("有 override → 原样下发 agent_id → cost_multiplier", async () => {
+    const res = makeRes();
+    await handler({ agentCostOverrides: { "coding-assistant": "1.500" } })(
+      makeReq({ auth: `Bearer ${TOKEN}` }),
+      res,
+      CTX,
+    );
+    const body = res.body as WireCatalogResponse;
+    assert.deepEqual(body.agent_cost_overrides, { "coding-assistant": "1.500" });
+  });
+
+  test("加载失败 → 省略字段(不 503 catalog,补价 fail-closed)", async () => {
+    const res = makeRes();
+    await handler({ agentCostOverridesFails: true })(makeReq({ auth: `Bearer ${TOKEN}` }), res, CTX);
+    assert.equal(res.statusCode, 200);
+    const body = res.body as WireCatalogResponse;
+    assert.equal(body.agent_cost_overrides, undefined);
+    assert.ok(body.models.length > 0);
   });
 });
 

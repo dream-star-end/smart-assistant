@@ -100,6 +100,16 @@ describe('renderPrompt 占位符', () => {
     assert.equal(injected.length, LAST_RUN_OUTPUT_MAX_CHARS + LAST_RUN_OUTPUT_TRUNCATE_NOTE.length)
   })
 
+  it('按 Unicode code point 截断,不把 emoji 对切成替换字符', () => {
+    const body = `${'A'.repeat(19999)}\u{1F600}${'B'.repeat(80)}`
+    const injected = formatLastRunOutput(body)
+    assert.ok(injected.endsWith(LAST_RUN_OUTPUT_TRUNCATE_NOTE))
+    assert.ok(injected.startsWith(`${'A'.repeat(19999)}\u{1F600}`))
+    assert.doesNotMatch(injected, /\uFFFD/)
+    const kept = injected.slice(0, injected.length - LAST_RUN_OUTPUT_TRUNCATE_NOTE.length)
+    assert.equal([...kept].length, LAST_RUN_OUTPUT_MAX_CHARS)
+  })
+
   it('没有上次 run 时 {{last_run.output}} 给出兜底文案', () => {
     const { prompt } = renderPrompt({
       template: '产出:{{last_run.output}}',

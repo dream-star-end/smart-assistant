@@ -102,8 +102,9 @@ export function formatLastRunOutput(
 ): string {
   if (outputMd == null || outputMd.trim() === '') return LAST_RUN_OUTPUT_EMPTY
   const trimmed = outputMd.trim()
-  if (trimmed.length <= maxChars) return trimmed
-  return `${trimmed.slice(0, maxChars)}${LAST_RUN_OUTPUT_TRUNCATE_NOTE}`
+  const points = Array.from(trimmed)
+  if (points.length <= maxChars) return trimmed
+  return `${points.slice(0, maxChars).join('')}${LAST_RUN_OUTPUT_TRUNCATE_NOTE}`
 }
 
 function defaultTemplate(stageName: string): string {

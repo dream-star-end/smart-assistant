@@ -65,6 +65,10 @@ export function migrate(db: TaskboardDb): void {
       // v3:阶段级模型覆盖。可空 = 沿用 agent 默认模型。已有行保持 NULL,不丢数据。
       db.exec('ALTER TABLE tb_pipeline_stage ADD COLUMN model TEXT')
     }
+    if (current < 4) {
+      // v4:补价因缺 agent 倍率字段而 fail-closed 时标不精确。可空 = 旧行未知。
+      db.exec('ALTER TABLE tb_ticket_run ADD COLUMN cost_imprecise INTEGER')
+    }
     db.pragma(`user_version = ${TASKBOARD_SCHEMA_VERSION}`)
     ensureSettingsRow(db)
   })

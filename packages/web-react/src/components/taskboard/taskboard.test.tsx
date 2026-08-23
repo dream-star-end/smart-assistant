@@ -695,6 +695,22 @@ describe('TicketDrawer 详情', () => {
     expect(screen.getByText(/耗时未记录/)).toBeInTheDocument()
     expect(screen.getByText(/用量未记录/)).toBeInTheDocument()
   })
+
+  test('run 明细在成本旁显示不精确提示', async () => {
+    const ticket = sampleTicket()
+    const run = sampleRun({
+      status: 'succeeded',
+      skipReason: null,
+      durationMs: 1200,
+      tokensIn: 10,
+      tokensOut: 2,
+      costUsd: 0,
+      costImprecise: true,
+    })
+    mockDrawerApis(ticket, [run])
+    renderDrawer(ticket)
+    expect(await screen.findByText(/\$0\.0000（不精确）/)).toBeInTheDocument()
+  })
 })
 
 describe('TaskboardView 来源会话不把 key 当 id', () => {

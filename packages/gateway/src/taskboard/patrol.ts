@@ -115,6 +115,7 @@ export interface PatrolDelegateResult {
   tokensIn?: number | null
   tokensOut?: number | null
   costUsd?: number | null
+  costImprecise?: boolean | null
 }
 
 export type PatrolDelegateFn = (input: PatrolDelegateInput) => Promise<PatrolDelegateResult>
@@ -124,6 +125,7 @@ export interface RunUsageSnapshot {
   tokensIn: number | null
   tokensOut: number | null
   costUsd: number | null
+  costImprecise?: boolean | null
 }
 
 export type RunUsageLookup = (sessionKey: string) => Promise<RunUsageSnapshot | null>
@@ -153,6 +155,7 @@ export function usageFromDelegateResult(result: PatrolDelegateResult): RunUsageS
     tokensIn: finiteNumber(result.tokensIn),
     tokensOut: finiteNumber(result.tokensOut),
     costUsd: finiteNumber(result.costUsd),
+    costImprecise: result.costImprecise ?? null,
   }
 }
 
@@ -165,6 +168,7 @@ export function mergeRunUsage(
     tokensIn: base.tokensIn ?? extra.tokensIn,
     tokensOut: base.tokensOut ?? extra.tokensOut,
     costUsd: base.costUsd ?? extra.costUsd,
+    costImprecise: base.costImprecise ?? extra.costImprecise,
   }
 }
 
@@ -668,6 +672,7 @@ export class PatrolEngine {
           tokensIn: usage.tokensIn,
           tokensOut: usage.tokensOut,
           costUsd: usage.costUsd,
+          costImprecise: usage.costImprecise ?? null,
         },
         now,
       )
@@ -1059,6 +1064,7 @@ export class PatrolEngine {
         tokensIn: existing.tokensIn,
         tokensOut: existing.tokensOut,
         costUsd: existing.costUsd,
+        costImprecise: existing.costImprecise ?? null,
       }
       if (isRunUsageComplete(current)) return
       const looked = await this.lookupUsage(sessionKey)
@@ -1066,7 +1072,8 @@ export class PatrolEngine {
       if (
         merged.tokensIn === current.tokensIn &&
         merged.tokensOut === current.tokensOut &&
-        merged.costUsd === current.costUsd
+        merged.costUsd === current.costUsd &&
+        merged.costImprecise === current.costImprecise
       ) {
         return
       }
@@ -1074,6 +1081,7 @@ export class PatrolEngine {
         tokensIn: merged.tokensIn,
         tokensOut: merged.tokensOut,
         costUsd: merged.costUsd,
+        costImprecise: merged.costImprecise,
       })
     } catch (err) {
       this.log('taskboard usage backfill failed', { runId, sessionKey, err: String(err) })

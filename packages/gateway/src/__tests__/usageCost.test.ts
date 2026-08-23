@@ -7,12 +7,15 @@
 
 import assert from 'node:assert/strict'
 import { afterEach, describe, test } from 'node:test'
+import { parseCatalogResponse } from '../modelCatalogClient.js'
 import {
+  _setCatalogViewForTests,
   _setPlatformPricingLookupForTests,
   applyPlatformCostIfMissing,
   estimatePlatformCostUsd,
   resolveDelegateCostUsd,
   type PlatformPricing,
+  type UsageCostTokens,
 } from '../usageCost.js'
 
 const TERRA: PlatformPricing = {
@@ -50,7 +53,35 @@ const PRICES: Record<string, PlatformPricing> = {
 
 afterEach(() => {
   _setPlatformPricingLookupForTests(null)
+  _setCatalogViewForTests(null)
 })
+
+function catalogView(overrides?: Record<string, string>) {
+  return parseCatalogResponse({
+    models: [
+      {
+        model_id: 'gpt-5.6-terra',
+        display_name: 'Terra',
+        engine: 'codex',
+        provider_id: 'codex',
+        context_window: null,
+        supported_efforts: ['high'],
+        supports_vision: false,
+        capability_zero: false,
+        supports_thinking: false,
+        default_effort: null,
+        input_per_mtok: '150',
+        output_per_mtok: '899',
+        cache_read_per_mtok: '15',
+        cache_write_per_mtok: '0',
+        multiplier: '1.000',
+      },
+    ],
+    projection_revision: 'proj-cost',
+    security_epoch: '1',
+    ...(overrides !== undefined ? { agent_cost_overrides: overrides } : {}),
+  })
+}
 
 describe('estimatePlatformCostUsd', () => {
   test('codex / grok / cursor 有 token 时 cost_usd > 0,且 Fast multiplier 加倍', () => {
@@ -87,9 +118,26 @@ describe('resolveDelegateCostUsd — engine-reported delegate 结果', () => {
         totalCacheReadTokens: 0,
         totalCacheCreationTokens: 0,
         model,
+        agentMultiplier: '1.000',
       })
-      assert.ok(cost != null && cost > 0, `${model} delegate cost_usd should be > 0, got ${cost}`)
+      assert.ok(
+        cost.costUsd != null && cost.costUsd > 0,
+        `${model} delegate cost_usd should be > 0, got ${cost.costUsd}`,
+      )
+      assert.equal(cost.costImprecise, false)
     }
+  })
+
+  test('缺 agentMultiplier 时不补 catalog 基础价(与结算不对齐)', async () => {
+    _setPlatformPricingLookupForTests(async () => TERRA)
+    const cost = await resolveDelegateCostUsd({
+      totalCostUSD: 0,
+      totalInputTokens: 97_419,
+      totalOutputTokens: 8_532,
+      model: 'gpt-5.6-terra',
+    })
+    assert.equal(cost.costUsd, null)
+    assert.equal(cost.costImprecise, true)
   })
 
   test('CCB 已累计的 vendor USD 不覆盖', async () => {
@@ -100,7 +148,8 @@ describe('resolveDelegateCostUsd — engine-reported delegate 结果', () => {
       totalOutputTokens: 5_924,
       model: 'glm-5.3-zai',
     })
-    assert.equal(cost, 0.3538614)
+    assert.equal(cost.costUsd, 0.3538614)
+    assert.equal(cost.costImprecise, false)
   })
 
   test('查不到单价 → 保持 0/null,不编造', async () => {
@@ -110,20 +159,23 @@ describe('resolveDelegateCostUsd — engine-reported delegate 结果', () => {
       totalInputTokens: 10,
       totalOutputTokens: 2,
       model: 'cursor-auto',
+      agentMultiplier: '1.000',
     })
-    assert.equal(cost, null)
+    assert.equal(cost.costUsd, null)
+    assert.equal(cost.costImprecise, false)
   })
 })
 
 describe('applyPlatformCostIfMissing', () => {
   test('写入 usage.cost 并返回本轮 USD', async () => {
     _setPlatformPricingLookupForTests(async () => TERRA)
-    const usage = { cost: 0, inputTokens: 1_000_000, outputTokens: 0 }
+    const usage = { cost: 0, inputTokens: 1_000_000, outputTokens: 1_000 }
     const filled = await applyPlatformCostIfMissing({
       model: 'gpt-5.6-terra',
       usage,
       sessionCostUsd: 0,
       prevCostUsd: 0,
+      agentMultiplier: '1.000',
     })
     assert.ok(filled != null && filled > 0)
     assert.equal(usage.cost, filled)
@@ -140,5 +192,161 @@ describe('applyPlatformCostIfMissing', () => {
     })
     assert.equal(filled, null)
     assert.equal(usage.cost, 0.02)
+  })
+
+  // blocker 1 回归:零输出免单已被前段标 waiveReason=no_response,补价不得改写 cost。
+  // 显式传入 agentMultiplier=1.000,把「缺倍率 fail-closed」从本用例里摘干净,
+  // 只锁零输出 / terminal waiver。
+  test('blocker1: 正 input/cache + outputTokens=0 不得补价(零输出免单)', async () => {
+    _setPlatformPricingLookupForTests(async () => TERRA)
+    const usage = {
+      cost: 0,
+      inputTokens: 30_875,
+      outputTokens: 0,
+      cacheReadTokens: 128,
+      cacheCreationTokens: 0,
+    }
+    const filled = await applyPlatformCostIfMissing({
+      model: 'gpt-5.6-terra',
+      usage,
+      sessionCostUsd: 0,
+      prevCostUsd: 0,
+      agentMultiplier: '1.000',
+    })
+    assert.equal(filled, null, `zero-output waiver must not fill, got ${filled}`)
+    assert.equal(usage.cost, 0)
+  })
+
+  test('blocker1: terminal waiveReason 即使有 output 也不得补价', async () => {
+    _setPlatformPricingLookupForTests(async () => TERRA)
+    const usage = { cost: 0, inputTokens: 1_000, outputTokens: 40 }
+    const filled = await applyPlatformCostIfMissing({
+      model: 'gpt-5.6-terra',
+      usage,
+      sessionCostUsd: 0,
+      prevCostUsd: 0,
+      agentMultiplier: '1.000',
+      waiveReason: 'no_response',
+    })
+    assert.equal(filled, null, `terminal waiver must not fill, got ${filled}`)
+    assert.equal(usage.cost, 0)
+  })
+
+  // blocker 2 回归:catalog 只有 model multiplier。缺 agent 倍率时补算值必然
+  // 低于结算(model×agent),禁止把偏低的数写入 usage.cost。
+  test('blocker2: 缺 agentMultiplier 不得写入 catalog 基础价,并标记不精确', async () => {
+    _setPlatformPricingLookupForTests(async () => TERRA)
+    const usage: UsageCostTokens = { cost: 0, inputTokens: 1_000_000, outputTokens: 1_000 }
+    const filled = await applyPlatformCostIfMissing({
+      model: 'gpt-5.6-terra',
+      usage,
+      sessionCostUsd: 0,
+      prevCostUsd: 0,
+    })
+    assert.equal(filled, null, `must fail-closed without agent multiplier, got ${filled}`)
+    assert.equal(usage.cost, 0, 'must not write the known-low catalog-only estimate')
+    assert.equal(usage.costImprecise, true)
+  })
+
+  test('blocker2: agentMultiplier=1.500 必须走 bigint compose,不得只乘 model multiplier', async () => {
+    _setPlatformPricingLookupForTests(async () => TERRA)
+    const tokens = { inputTokens: 1_000_000, outputTokens: 1_000, cacheReadTokens: 0, cacheCreationTokens: 0 }
+    const baseUsage: UsageCostTokens = { cost: 0, ...tokens }
+    const mulUsage: UsageCostTokens = { cost: 0, ...tokens }
+    const base = await applyPlatformCostIfMissing({
+      model: 'gpt-5.6-terra',
+      usage: baseUsage,
+      sessionCostUsd: 0,
+      prevCostUsd: 0,
+      agentMultiplier: '1.000',
+    })
+    const mul = await applyPlatformCostIfMissing({
+      model: 'gpt-5.6-terra',
+      usage: mulUsage,
+      sessionCostUsd: 0,
+      prevCostUsd: 0,
+      agentMultiplier: '1.500',
+    })
+    const modelOnly = estimatePlatformCostUsd(tokens, TERRA)
+    const expected = estimatePlatformCostUsd(tokens, { ...TERRA, multiplier: '1.500' })
+    assert.equal(base, modelOnly)
+    assert.equal(mul, expected)
+    assert.ok(mul !== modelOnly, '1.500 must not silently record the catalog base price')
+    assert.equal(mulUsage.costImprecise, undefined)
+  })
+
+  test('blocker2: compose 截断与 commercial 同口径(1.234×1.234=1.522)', async () => {
+    _setPlatformPricingLookupForTests(async () => ({ ...TERRA, multiplier: '1.234' }))
+    const usage = { cost: 0, inputTokens: 1_000_000, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 }
+    // 本用例只锁 compose 截断,给正 output 以免撞上零输出免单。
+    usage.outputTokens = 1
+    const filled = await applyPlatformCostIfMissing({
+      model: 'gpt-5.6-terra',
+      usage,
+      sessionCostUsd: 0,
+      prevCostUsd: 0,
+      agentMultiplier: '1.234',
+    })
+    const expected = estimatePlatformCostUsd(
+      { inputTokens: 1_000_000, outputTokens: 1, cacheReadTokens: 0, cacheCreationTokens: 0 },
+      { ...TERRA, multiplier: '1.522' },
+    )
+    assert.ok(filled != null)
+    assert.equal(filled, expected)
+  })
+
+  test('master 下发了倍率字段 + agent 有 1.500 override → 按复合倍率补价', async () => {
+    _setPlatformPricingLookupForTests(async () => TERRA)
+    _setCatalogViewForTests(catalogView({ 'coding-assistant': '1.500' }))
+    const usage: UsageCostTokens = { cost: 0, inputTokens: 1_000_000, outputTokens: 1_000 }
+    const filled = await applyPlatformCostIfMissing({
+      model: 'gpt-5.6-terra',
+      usage,
+      sessionCostUsd: 0,
+      prevCostUsd: 0,
+      agentId: 'coding-assistant',
+    })
+    const expected = estimatePlatformCostUsd(
+      { inputTokens: 1_000_000, outputTokens: 1_000, cacheReadTokens: 0, cacheCreationTokens: 0 },
+      { ...TERRA, multiplier: '1.500' },
+    )
+    assert.equal(filled, expected)
+    assert.equal(usage.costImprecise, undefined)
+  })
+
+  test('master 下发了倍率字段 + agent 无 override → 按 1.000 正常补价(不是 fail-closed)', async () => {
+    _setPlatformPricingLookupForTests(async () => TERRA)
+    _setCatalogViewForTests(catalogView({}))
+    const usage: UsageCostTokens = { cost: 0, inputTokens: 1_000_000, outputTokens: 1_000 }
+    const filled = await applyPlatformCostIfMissing({
+      model: 'gpt-5.6-terra',
+      usage,
+      sessionCostUsd: 0,
+      prevCostUsd: 0,
+      agentId: 'coding-assistant',
+    })
+    const expected = estimatePlatformCostUsd(
+      { inputTokens: 1_000_000, outputTokens: 1_000, cacheReadTokens: 0, cacheCreationTokens: 0 },
+      TERRA,
+    )
+    assert.ok(filled != null && filled > 0, `empty overrides must still price, got ${filled}`)
+    assert.equal(filled, expected)
+    assert.equal(usage.costImprecise, undefined)
+  })
+
+  test('没拿到倍率字段 → 保持 0 且 costImprecise=true', async () => {
+    _setPlatformPricingLookupForTests(async () => TERRA)
+    _setCatalogViewForTests(catalogView())
+    const usage: UsageCostTokens = { cost: 0, inputTokens: 1_000_000, outputTokens: 1_000 }
+    const filled = await applyPlatformCostIfMissing({
+      model: 'gpt-5.6-terra',
+      usage,
+      sessionCostUsd: 0,
+      prevCostUsd: 0,
+      agentId: 'coding-assistant',
+    })
+    assert.equal(filled, null)
+    assert.equal(usage.cost, 0)
+    assert.equal(usage.costImprecise, true)
   })
 })

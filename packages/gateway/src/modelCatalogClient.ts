@@ -119,6 +119,13 @@ export interface LocalCatalogView {
   resolve(modelId: string): LocalCatalogModel | null
   /** engine 判定(codex 本地路径的真值表见方案 §3)。入参须为 canonical id。 */
   isCodexModel(modelId: string): boolean
+  /**
+   * master 下发的 agent_id → cost_multiplier。
+   *   - Map(可空):字段在响应里,缺该 agent = 明确无 override,按 "1.000" 补价
+   *   - null:压根没拿到该字段(旧 master / 旧 LKG / 加载失败被省略)→ 补价 fail-closed
+   * 二者绝不能混:空 Map 不是 null。
+   */
+  readonly agentCostOverrides: ReadonlyMap<string, string> | null
 }
 
 /** 本地路径 token 的 wire 形状(与 commercial 侧 `LocalCatalogToken` 同构)。 */
@@ -295,6 +302,21 @@ export class ModelCatalogClient {
     return Buffer.from(JSON.stringify(token), 'utf8').toString('base64url')
   }
 
+  /**
+   * 查当前投影里该 agent 的成本倍率。
+   * 返回 null = 没拿到 master 的倍率字段,调用方必须 fail-closed。
+   * 返回 "1.000" = 字段在、该 agent 无 override(与商业侧缺行同口径)。
+   */
+  async lookupAgentCostMultiplier(agentId: string): Promise<string | null> {
+    if (!this.configured) return null
+    try {
+      const view = await this.getView()
+      return lookupCatalogAgentMultiplier(view, agentId)
+    } catch {
+      return null
+    }
+  }
+
   /** 测试用:清空内存态(不动 LKG 文件)。 */
   _resetForTests(): void {
     this.snapshot = null
@@ -337,6 +359,9 @@ export class ModelCatalogClient {
             // 旧 master 仍无单价字段时继续用已验 epoch 的快照,只是 cost 保持 0。
           }
         }
+        // 旧 LKG 没有 agent_cost_overrides 字段时不在这里强拉:
+        // epoch 相等就沿用快照,补价按「没拿到字段」fail-closed。
+        // 禁止为了拿 1.000 去破坏「epoch 未变不重拉全量」的新鲜度契约。
         this.snapshot = { view: cached.view, verifiedAt: this.now() }
         return cached.view
       }
@@ -488,6 +513,11 @@ interface WireResponse {
   security_epoch: string
   /** alias → canonical model_id；旧 master 兼容期可缺席，缺席 = 空 map。 */
   aliases?: Record<string, string>
+  /**
+   * agent_id → cost_multiplier。缺席(undefined)≠ 空对象:
+   * 空对象 = master 明确说了没有 override;缺席 = 旧 master / 旧 LKG。
+   */
+  agent_cost_overrides?: Record<string, string>
 }
 
 function toWire(view: LocalCatalogView): WireResponse {
@@ -523,6 +553,10 @@ function toWire(view: LocalCatalogView): WireResponse {
     availability_revision: view.availabilityRevision,
     security_epoch: view.securityEpoch,
     ...(aliasEntries.length > 0 ? { aliases } : {}),
+    // 空 Map 也必须落盘:否则冷启用 LKG 会把「明确无 override」丢成「没拿到字段」。
+    ...(view.agentCostOverrides != null
+      ? { agent_cost_overrides: Object.fromEntries(view.agentCostOverrides) }
+      : {}),
   }
 }
 
@@ -604,7 +638,48 @@ export function parseCatalogResponse(raw: unknown): LocalCatalogView {
     isRoutable: (modelId) => byId.get(modelId)?.available === true,
     resolve: (modelId) => byId.get(modelId) ?? null,
     isCodexModel: (modelId) => byId.get(modelId)?.engine === 'codex',
+    agentCostOverrides: parseOptionalAgentCostOverrides(o.agent_cost_overrides),
   }
+}
+
+/**
+ * 查投影里该 agent 的成本倍率。
+ *
+ * 核心区分(写在这里以免下次再把空表当成「没拿到」):
+ *   - view.agentCostOverrides == null → 压根没拿到字段 → 返回 null(fail-closed)
+ *   - Map 在(哪怕 size=0)且该 agent 无行 → "1.000"(与 getAgentCostMultiplier 缺行同口径)
+ *   - Map 里有该 agent → 用下发值
+ */
+export function lookupCatalogAgentMultiplier(
+  view: LocalCatalogView,
+  agentId: string,
+): string | null {
+  if (view.agentCostOverrides == null) return null
+  const id = agentId.trim()
+  if (!id) return null
+  return view.agentCostOverrides.get(id) ?? '1.000'
+}
+
+function parseOptionalAgentCostOverrides(
+  raw: unknown,
+): ReadonlyMap<string, string> | null {
+  if (raw === undefined) return null
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new ModelCatalogUnavailableError('catalog response agent_cost_overrides is not an object')
+  }
+  const map = new Map<string, string>()
+  for (const [agentId, multiplier] of Object.entries(raw as Record<string, unknown>)) {
+    if (
+      typeof agentId !== 'string' ||
+      agentId === '' ||
+      typeof multiplier !== 'string' ||
+      !/^-?\d+(\.\d+)?$/.test(multiplier)
+    ) {
+      throw new ModelCatalogUnavailableError('catalog response agent_cost_overrides entry invalid')
+    }
+    map.set(agentId, multiplier)
+  }
+  return map
 }
 
 const PRICE_DIM = /^-?\d+$/

@@ -279,6 +279,11 @@ export interface TicketRun {
   tokensIn: number | null
   tokensOut: number | null
   costUsd: number | null
+  /**
+   * 补价因没拿到 master 的 agent_cost_overrides 字段而 fail-closed。
+   * null = 旧行 / 未判定;true = 成本不精确(保持 0);false = 已按复合倍率对齐。
+   */
+  costImprecise?: boolean | null
   /** agent 的结论摘要,写进卡片时间线。 */
   summary: string | null
   /** 完整产出。 */

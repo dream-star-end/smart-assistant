@@ -575,6 +575,7 @@ import {
 import {
   composeMultiplier,
   getAgentCostMultiplier,
+  listAgentCostOverrides,
 } from "./billing/agentMultiplier.js";
 import {
   startInflightJournal,
@@ -2426,6 +2427,7 @@ export async function registerCommercial(
             // immediately; the endpoint itself is already a narrow local-turn call.
             loadRoutingAvailability: () =>
               getProviderRoutingAvailability(Date.now(), undefined, undefined, true),
+            loadAgentCostOverrides: () => listAgentCostOverrides(getPool()),
           })
         : null;
       // seed 完整性(§5 / R2-M8):平台预设 agent 引用的模型必须在 catalog active,否则用户

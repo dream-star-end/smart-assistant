@@ -65,6 +65,22 @@ export async function getAgentCostMultiplier(
 }
 
 /**
+ * 全表下发用:agent_id → cost_multiplier。表小,catalog 每次拉全量即可。
+ * 空表 → {}(gateway 据此按 1.000 补价,与缺行同口径)。
+ * DB 异常 → throw,让 catalog handler 决定是省略字段(补价 fail-closed)还是 503。
+ */
+export async function listAgentCostOverrides(pool: Pool): Promise<Record<string, string>> {
+  const result = await pool.query<{ agent_id: string; cost_multiplier: string }>(
+    "SELECT agent_id, cost_multiplier FROM agent_cost_overrides",
+  );
+  const out: Record<string, string> = {};
+  for (const row of result.rows) {
+    out[row.agent_id] = row.cost_multiplier;
+  }
+  return out;
+}
+
+/**
  * multiplier 字符串 → BigInt scale 1000。复用 calculator 同款规则。
  *
  * 与 calculator.multiplierToScaled 行为一致,但本文件保留独立实现以避免循环依赖

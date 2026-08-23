@@ -55,6 +55,23 @@ export function multiplierToScaled(multiplier: string): bigint {
   return scaled
 }
 
+/**
+ * 复合 model × agent 两个 NUMERIC(*,3) multiplier。
+ * 与 commercial `composeMultiplier` 同口径:BigInt scale 1000、向下截断,
+ * 正×正截到 0 时 clamp 到 0.001。gateway 补价必须走这里,禁止 JS 浮点相乘。
+ */
+export function composeMultiplier(modelMul: string, agentMul: string): string {
+  const m = multiplierToScaled(modelMul)
+  const a = multiplierToScaled(agentMul)
+  let composed = (m * a) / 1000n
+  if (composed === 0n && m > 0n && a > 0n) {
+    composed = 1n
+  }
+  const intPart = composed / 1000n
+  const fracPart = composed % 1000n
+  return `${intPart.toString()}.${fracPart.toString().padStart(3, '0')}`
+}
+
 /** 四维 token × 单价 × multiplier，向上取整到分。全零 usage → 0。 */
 export function computeCostFen(usage: CostTokenUsage, price: CostPriceDims): bigint {
   const input = normalizeTokens('input_tokens', usage.input_tokens)

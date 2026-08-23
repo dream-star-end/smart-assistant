@@ -19,7 +19,15 @@
 
 import type { RunSkipReason, RunStatus, RunTrigger, TicketRun } from '../domain.js'
 import { GUARDRAIL_DEFAULTS } from '../domain.js'
-import { type TaskboardDb, TaskboardLeaseHeld, TaskboardNotFound, newId, nowMs } from './schema.js'
+import {
+  type TaskboardDb,
+  TaskboardLeaseHeld,
+  TaskboardNotFound,
+  boolToInt,
+  intToBool,
+  newId,
+  nowMs,
+} from './schema.js'
 
 interface RunRow {
   id: string
@@ -38,6 +46,7 @@ interface RunRow {
   tokens_in: number | null
   tokens_out: number | null
   cost_usd: number | null
+  cost_imprecise: number | null
   summary: string | null
   output_md: string | null
   error: string | null
@@ -47,8 +56,18 @@ interface RunRow {
 const RUN_COLS = `
   id, ticket_id, stage_id, agent_id, trigger, session_key, status, skip_reason,
   lease_owner, lease_expires_at, started_at, finished_at, duration_ms,
-  tokens_in, tokens_out, cost_usd, summary, output_md, error, created_at
+  tokens_in, tokens_out, cost_usd, cost_imprecise, summary, output_md, error, created_at
 `
+
+function mapCostImprecise(value: number | boolean | null | undefined): boolean | null {
+  if (value == null) return null
+  return intToBool(value)
+}
+
+function bindCostImprecise(value: boolean | null | undefined): number | null {
+  if (value == null) return null
+  return boolToInt(value)
+}
 
 function mapRun(row: RunRow): TicketRun {
   return {
@@ -68,6 +87,7 @@ function mapRun(row: RunRow): TicketRun {
     tokensIn: row.tokens_in,
     tokensOut: row.tokens_out,
     costUsd: row.cost_usd,
+    costImprecise: mapCostImprecise(row.cost_imprecise),
     summary: row.summary,
     outputMd: row.output_md,
     error: row.error,
@@ -100,7 +120,8 @@ export interface UpdateRunPatch {
   tokensIn?: number | null
   tokensOut?: number | null
   costUsd?: number | null
-  summary?: string | null
+  costImprecise?: boolean | null
+  summary?: string | null,
   outputMd?: string | null
   error?: string | null
 }
@@ -115,6 +136,7 @@ export interface SettleLeaseRunPatch {
   tokensIn: number | null
   tokensOut: number | null
   costUsd: number | null
+  costImprecise?: boolean | null
 }
 
 export interface RunListQuery {
@@ -260,6 +282,7 @@ export function updateRun(db: TaskboardDb, id: string, patch: UpdateRunPatch): T
        tokens_in = @tokensIn,
        tokens_out = @tokensOut,
        cost_usd = @costUsd,
+       cost_imprecise = @costImprecise,
        summary = @summary,
        output_md = @outputMd,
        error = @error
@@ -278,6 +301,9 @@ export function updateRun(db: TaskboardDb, id: string, patch: UpdateRunPatch): T
     tokensIn: patch.tokensIn === undefined ? existing.tokensIn : patch.tokensIn,
     tokensOut: patch.tokensOut === undefined ? existing.tokensOut : patch.tokensOut,
     costUsd: patch.costUsd === undefined ? existing.costUsd : patch.costUsd,
+    costImprecise: bindCostImprecise(
+      patch.costImprecise === undefined ? existing.costImprecise : patch.costImprecise,
+    ),
     summary: patch.summary === undefined ? existing.summary : patch.summary,
     outputMd: patch.outputMd === undefined ? existing.outputMd : patch.outputMd,
     error: patch.error === undefined ? existing.error : patch.error,
@@ -384,6 +410,7 @@ export function settleLeaseRun(
        tokens_in = @tokensIn,
        tokens_out = @tokensOut,
        cost_usd = @costUsd,
+       cost_imprecise = @costImprecise,
        lease_owner = NULL,
        lease_expires_at = NULL
      WHERE id = @runId
@@ -391,7 +418,13 @@ export function settleLeaseRun(
        AND lease_expires_at IS NOT NULL
        AND lease_expires_at > @now
        AND status IN ${ACTIVE_LEASE_STATUSES}`,
-  ).run({ runId, owner, now, ...patch })
+  ).run({
+    runId,
+    owner,
+    now,
+    ...patch,
+    costImprecise: bindCostImprecise(patch.costImprecise),
+  })
   return result.changes === 1 ? getRun(db, runId) : null
 }
 

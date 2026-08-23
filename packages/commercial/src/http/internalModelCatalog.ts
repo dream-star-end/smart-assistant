@@ -96,6 +96,12 @@ export interface ModelCatalogHandlerDeps {
   readEpoch?: () => Promise<bigint>;
   /** Provider quota/health routing view. Production injects providerHealthGate. */
   loadRoutingAvailability?: () => Promise<ProviderRoutingAvailability>;
+  /**
+   * 全表 `agent_cost_overrides`(agent_id → cost_multiplier)。
+   * 成功则写入响应(空表 = {});失败则省略该字段,让 gateway 补价 fail-closed,
+   * 而不是把「查失败」伪装成「全 1.000」。旧 gateway 见到未知字段必须无害。
+   */
+  loadAgentCostOverrides?: () => Promise<Record<string, string>>;
   logger?: Logger;
 }
 
@@ -138,6 +144,11 @@ export interface WireCatalogResponse {
   availability_revision?: string;
   security_epoch: string;
   aliases: Record<string, string>;
+  /**
+   * agent_id → cost_multiplier。新增可选字段:旧 gateway 忽略即可。
+   * 出现(含空字典)="master 明确说了当前 override 集";缺席=旧 master / 加载失败。
+   */
+  agent_cost_overrides?: Record<string, string>;
 }
 
 export function makeModelCatalogHandler(deps: ModelCatalogHandlerDeps): ModelCatalogHandler {
@@ -231,6 +242,19 @@ export function makeModelCatalogHandler(deps: ModelCatalogHandlerDeps): ModelCat
       orgPlanCode: authz.orgPlanCode ?? null,
     };
     const availability = await loadRoutingAvailability();
+    // agent 倍率与单价走同一条 catalog 下发。加载失败故意省略字段:
+    // gateway 把「没拿到字段」当 fail-closed,不能把空表/查失败伪装成全 1.000。
+    let agentCostOverrides: Record<string, string> | undefined;
+    if (deps.loadAgentCostOverrides) {
+      try {
+        agentCostOverrides = await deps.loadAgentCostOverrides();
+      } catch (err) {
+        log.error("agent_cost_overrides_load_failed", {
+          uid: identity.userId,
+          err: errMsg(err),
+        });
+      }
+    }
     const body: WireCatalogResponse = {
       models: snapshot.listForUser(scope).map((r) => {
         const p = snapshot.billingPricingFor(r.modelId);
@@ -263,6 +287,9 @@ export function makeModelCatalogHandler(deps: ModelCatalogHandlerDeps): ModelCat
       availability_revision: availability.revision,
       security_epoch: snapshot.securityEpoch.toString(),
       aliases: snapshot.aliasesForUser(scope),
+      ...(agentCostOverrides !== undefined
+        ? { agent_cost_overrides: agentCostOverrides }
+        : {}),
     };
 
     sendJson(res, 200, body, {
