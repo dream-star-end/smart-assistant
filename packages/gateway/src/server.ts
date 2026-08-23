@@ -13167,15 +13167,31 @@ export class Gateway {
           !ALLOWED_INBOUND_MODELS.has(targetModel)
         ) return
         const session = this.sessions.getByKey(sessionKey)
-        const ownsSession = session?.userId === this.getWsUserId(ws)
-        const reply = (payload: Record<string, unknown>) => ws.send(JSON.stringify({
-          type: 'outbound.model_switch.prepared',
-          requestId,
-          sessionKey,
-          targetModel,
-          ts: Date.now(),
-          ...payload,
-        }))
+        const userId = this.getWsUserId(ws)
+        const ownsSession = session?.userId === userId
+        const peerId = sessionKey.split(':').slice(4).join(':')
+        const peerKey = Gateway.makePeerKey(userId, 'webchat', peerId)
+        const reply = (payload: Record<string, unknown>) => {
+          // Compact can outlive the requesting socket (mobile 1.5s visibility
+          // probe, proxy idle, tab freeze). Stamp + fan out + ring-store so a
+          // reconnecting hello can still consume the exact generation.
+          const frame = {
+            type: 'outbound.model_switch.prepared',
+            requestId,
+            sessionKey,
+            targetModel,
+            ...payload,
+          }
+          this._sendStampedSessionFrame(sessionKey, peerKey, frame)
+          if (ws.readyState === WebSocket.OPEN) {
+            const live = this.clientsByPeer.get(peerKey)
+            if (!live?.has(ws)) {
+              try {
+                ws.send(JSON.stringify({ ...frame, ts: Date.now() }))
+              } catch { /* originating transport already gone */ }
+            }
+          }
+        }
         if (!session || !ownsSession) {
           reply({ sourceModel: '', status: 'failed', errorCode: 'SESSION_NOT_FOUND', message: '会话尚未运行，无法压缩' })
           return
@@ -14845,6 +14861,13 @@ export class Gateway {
         registeredPeerKeys.push(peerKey)
       }
       this.log.info('auto-resume re-registered WS', { peerKey, sessionKey })
+      // lastFrameSeq=0 must not dump the ring (duplicate assistant bubbles).
+      // A prepared model-switch is a single idempotent control frame, so catch
+      // it up onto this socket even when ring replay is no_buffer.
+      const preparedSwitch = session ? preparedModelSwitchCatchupFrame(session) : null
+      if (preparedSwitch && ws.readyState === WebSocket.OPEN) {
+        try { ws.send(JSON.stringify(preparedSwitch)) } catch { /* new socket already gone */ }
+      }
 
       // ── Phase 0.3: ring-buffer replay on hello.lastFrameSeq ──
       // If the client supplied a cursor, serve anything we still have buffered
@@ -17294,7 +17317,8 @@ export function _parseConnectionTraceIdFromUpgrade(
  * use this:
  *   - `deliver()` for `OutboundMessage`-shaped frames(adapter + WS branches)
  *   - `_sendStampedSessionFrame()` for `outbound.permission_request` /
- *     `outbound.permission_settled` direct-send paths — these frames extend
+ *     `outbound.permission_settled` / `outbound.model_switch.prepared`
+ *     direct-send paths — these frames extend
  *     the same routing tuple but aren't typed as `OutboundMessage`, so we widen
  *     the input to any `Record<string, unknown>` superset.
  */
@@ -17566,6 +17590,36 @@ export function _earlyRejectErrorFrames(args: {
  * `taskboard`,若只排除 `delegate`,default 用户会把 stageId 误当成 peerId 放进
  * 侧栏。内部委派同样不是用户聊天会话。
  */
+/** Replay a prepared native model-switch onto a reconnecting socket.
+ *  Ring `peekReplay(fromSeq=0)` is intentionally no_buffer to avoid
+ *  duplicate assistant deltas; this control frame is idempotent by requestId. */
+export function preparedModelSwitchCatchupFrame(
+  session: {
+    sessionKey: string
+    _modelSwitchTransition?: {
+      id: string
+      sourceModel: string
+      targetModel: string
+      state: 'preparing' | 'prepared' | 'consuming'
+      expiresAt?: number
+    }
+  },
+  now = Date.now(),
+): Record<string, unknown> | null {
+  const transition = session._modelSwitchTransition
+  if (!transition || transition.state !== 'prepared') return null
+  if (typeof transition.expiresAt === 'number' && now >= transition.expiresAt) return null
+  return {
+    type: 'outbound.model_switch.prepared',
+    requestId: transition.id,
+    sessionKey: session.sessionKey,
+    sourceModel: transition.sourceModel,
+    targetModel: transition.targetModel,
+    status: 'completed',
+    ts: now,
+  }
+}
+
 export function filterUserVisibleLiveSessions<T extends { sessionKey: string }>(
   sessions: readonly T[],
   ownedIds: ReadonlySet<string>,
