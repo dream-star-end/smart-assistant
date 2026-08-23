@@ -1168,13 +1168,27 @@ async function collectVisibleImageSrcs(scope) {
   const srcs = [];
   if (!scope || typeof scope.locator !== 'function') return srcs;
   const nodes = scope.locator('img');
-  if (!nodes || typeof nodes.count !== 'function' || typeof nodes.nth !== 'function') return srcs;
-  const total = Math.min(await nodes.count().catch(() => 0), 40);
-  for (let index = 0; index < total; index += 1) {
-    const node = nodes.nth(index);
-    if (!await node.isVisible().catch(() => false)) continue;
-    const src = String(await node.getAttribute('src').catch(() => '') || '');
-    if (src) srcs.push(src);
+  if (nodes && typeof nodes.count === 'function' && typeof nodes.nth === 'function') {
+    const total = Math.min(await nodes.count().catch(() => 0), 40);
+    for (let index = 0; index < total; index += 1) {
+      const node = nodes.nth(index);
+      if (!await node.isVisible().catch(() => false)) continue;
+      const src = String(await node.getAttribute('src').catch(() => '') || '');
+      const current = String(await node.evaluate((element) => element.currentSrc || '').catch(() => '') || '');
+      if (src) srcs.push(src);
+      if (current && current !== src) srcs.push(current);
+    }
+  }
+  const painted = scope.locator('*[style*="background-image"]');
+  if (painted && typeof painted.count === 'function' && typeof painted.nth === 'function') {
+    const total = Math.min(await painted.count().catch(() => 0), 40);
+    for (let index = 0; index < total; index += 1) {
+      const node = painted.nth(index);
+      if (!await node.isVisible().catch(() => false)) continue;
+      const style = String(await node.getAttribute('style').catch(() => '') || '');
+      const match = /url\((['\"]?)([^'\")]+)\1\)/.exec(style);
+      if (match && match[2]) srcs.push(match[2]);
+    }
   }
   return srcs;
 }
@@ -1195,13 +1209,19 @@ async function awaitComposerMediaReady(page, editor, expectedNew, timeout, befor
   const before = new Set(Array.isArray(beforeSrcs) ? beforeSrcs : []);
   const deadline = Date.now() + timeout;
   const attempts = Math.max(1, Math.ceil(timeout / 250));
+  const uploadSrc = (src) => /^(blob:|data:)|sinaimg\.cn|\.sinajs\.cn/.test(src);
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     const added = [];
     const seen = new Set();
-    for (const src of await collectVisibleImageSrcs(scope)) {
-      if (before.has(src) || seen.has(src)) continue;
+    const pushNew = (src, requireUpload) => {
+      if (!src || before.has(src) || seen.has(src)) return;
+      if (requireUpload && !uploadSrc(src)) return;
       seen.add(src);
       added.push(src);
+    };
+    for (const src of await collectVisibleImageSrcs(scope)) pushNew(src, false);
+    if (scope !== page) {
+      for (const src of await collectVisibleImageSrcs(page)) pushNew(src, true);
     }
     if (added.length >= expectedNew) return;
     const remaining = deadline - Date.now();
