@@ -1298,16 +1298,26 @@ createRoot(document.getElementById("chat-entry-ux-root")!).render(
     },
     pushRetrySuccess: () => {
       if (!activeClientMessageId) throw new Error("retry success 注入前缺 clientMessageId");
+      const sessionKey = `agent:${REPLAY_AGENT_ID}:webchat:dm:${REPLAY_SESSION_ID}`;
+      const session = replaySocket.sessions.get(REPLAY_SESSION_ID);
+      if (!session) throw new Error("retry success 注入前缺 replay session");
+      // frameSeq 是 per-sessionKey 的跨 turn 单调游标，不会在新 user turn 归零。
+      // T29 与 T46 连续复用同一真实 ChatSocket；若每轮都伪造 7/8，第二轮 final
+      // 会被生产 reducer 正确视作重复帧丢弃，反而把 harness 自己留在 sending。
+      const frameSeq = Math.max(
+        session._lastFrameSeqByKey?.[sessionKey] ?? 0,
+        session._lastFrameSeq ?? 0,
+      ) + 1;
       const base = {
         type: "outbound.message",
-        sessionKey: `agent:${REPLAY_AGENT_ID}:webchat:dm:${REPLAY_SESSION_ID}`,
+        sessionKey,
         channel: "webchat",
         peer: { id: REPLAY_SESSION_ID, kind: "dm" },
         clientMessageId: activeClientMessageId,
       };
       live().deliver({
         ...base,
-        frameSeq: 7,
+        frameSeq,
         blocks: [{
           kind: "text",
           text: REPLAY_MARKERS.retrySuccess,
@@ -1315,7 +1325,7 @@ createRoot(document.getElementById("chat-entry-ux-root")!).render(
         }],
         isFinal: false,
       });
-      live().deliver({ ...base, frameSeq: 8, blocks: [], isFinal: true });
+      live().deliver({ ...base, frameSeq: frameSeq + 1, blocks: [], isFinal: true });
     },
     runDurableOverlap: async () => {
       replaySocket.removeSession(REPLAY_SESSION_ID);
