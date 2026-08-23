@@ -1236,10 +1236,12 @@ async function awaitFileChooser(page, clickable) {
 }
 async function preparePostImageChooser(page, editor) {
   const scope = (await composerScope(editor)) || page;
-  const existing = await uniqueImageFileInput(scope);
-  if (existing) return wrapFileInput(existing);
   const image = await exactMenuItem(scope, '图片');
-  if (!image) throw new Error('media-chooser');
+  if (!image) {
+    const existing = await uniqueImageFileInput(scope);
+    if (existing) return wrapFileInput(existing);
+    throw new Error('media-chooser');
+  }
   await image.click({ trial: true, timeout: 10_000 });
   let chooserSettled = false;
   const chooserWait = page.waitForEvent('filechooser', { timeout: 10_000 }).then((chooser) => {

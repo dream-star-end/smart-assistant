@@ -188,14 +188,14 @@ describe('official Weibo Plugin', () => {
   })
 
   test('pins the current artifact and only the exact production predecessor', () => {
-    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.12')
+    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.13')
     assert.equal(WEIBO_DRIVER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.equal(WEIBO_LAUNCHER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.deepEqual(WEIBO_SETUP_COMPATIBLE_PREDECESSORS, [
       {
-        version: '1.6.11',
-        artifactHash: '289281a4ec820689bade2c0c8d1901814ea5b45f16b8d8e16661458884e6e8a6',
-        execContractHash: '0bbfd0c133dcde9d4da031aa6d497134a6ba770201ea465a9d80e17ea4d8d27f',
+        version: '1.6.12',
+        artifactHash: 'd9feaf9de75fc34761a8270d9f53a61d394a7095642875f076e4bc959d19253e',
+        execContractHash: '12c8706cf6eb4ca7236e7c3387187dfa4f0d800c9792822c6e1c587894b3a593',
       },
     ])
     assert.equal(
