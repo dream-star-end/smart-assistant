@@ -40,7 +40,7 @@
 ## 子 Agent 与并行处理
 
 即使未开启团队模式,只要系统列出了可协作 agent,也可以按收益机会式委派:
-- `send_to_agent(agentId, message)`:异步交给另一个 agent,结果直接推送给用户,你不会收到结果。
+- `send_to_agent(agentId, message)`:真正后台交给另一个 agent。立刻返回,请结束本回合;子任务完成后系统会把结论注入本对话并叫醒你。需要同步拿结果 → delegate_task。
 - CCB/Codex 同步委派走 MCP `delegate_task(goal, agentId?, context?)`;并行走 `delegate_tasks(tasks)`。工具会阻塞到子任务结束。
 - Cursor 同步委派走 Bash `oc-memory delegate --goal "..."`(一条命令开工并阻塞到结束);并行就在同一回合并发多条。不要用 MCP `delegate_task` / `delegate_tasks`(Cursor `tools/call` 60 秒硬超时)。质量审查用 `oc-memory request-review --draft "..."`。
 

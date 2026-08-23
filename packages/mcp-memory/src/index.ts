@@ -61,6 +61,7 @@ import {
   type FanoutCursorItem,
   type FormattedDelegateResult,
 } from './delegateCursorFastPath.js'
+import { formatSendToAgentStart } from './sendToAgent.js'
 import {
   describeDelegateTransportError,
   gatewayDelegateHeaders,
@@ -653,36 +654,35 @@ async function handleSkillPropose(args: {
 
 // ─────────────────────────────────────────────────────────────
 async function handleSendToAgent(args: { agentId: string; message: string }) {
-  const gatewayPort = process.env.OPENCLAUDE_GATEWAY_PORT || '18789'
-  const gatewayToken = readGatewayToken()
+  const agentNorm = normalizeDelegateAgentId(args.agentId)
+  if (!agentNorm.ok) return toolError(agentNorm.error)
+  const agentId = agentNorm.agentId
+  if (!agentId) return toolError('agentId 必填')
   const sourceAgent = process.env.OPENCLAUDE_AGENT_ID || 'unknown'
+  const parentSessionKey = process.env.OPENCLAUDE_SESSION_KEY || ''
+  const currentDepth = Number.parseInt(process.env.OPENCLAUDE_DELEGATION_DEPTH || '0', 10)
   try {
-    // 与 delegate_task 同款收口 postJsonToGateway:对端 handleAgentMessage 同样是
-    // "子 turn 跑完才写响应"的长阻塞端点,裸 fetch 会在 undici 5min headersTimeout
-    // 精确复刻历史 fetch failed(ecb4ee38 修 delegate 时的同类残留)。
     const res = await postJsonToGateway(
-      `http://127.0.0.1:${gatewayPort}/api/agents/${encodeURIComponent(args.agentId)}/message`,
+      `${gatewayBaseUrl()}/api/agents/${encodeURIComponent(agentId)}/delegate`,
       {
         headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${gatewayToken}`,
+          ...gatewayDelegateHeaders(),
+          'x-delegation-depth': String(currentDepth),
         },
         body: JSON.stringify({
-          message: args.message,
+          goal: args.message,
           sourceAgent,
+          async: true,
+          callbackOnComplete: 'origin-inject',
+          ...(parentSessionKey ? { streamProgress: true, parentSessionKey } : {}),
         }),
-        timeoutMs: AGENT_MESSAGE_CLIENT_TIMEOUT_MS,
+        timeoutMs: 15_000,
       },
     )
-    if (res.statusCode < 200 || res.statusCode >= 300) {
-      return toolError(`发送失败: ${res.body}`)
-    }
-    const data = JSON.parse(res.body) as any
-    return toolOk(
-      `✅ 已发送给 agent "${args.agentId}": "${args.message.slice(0, 50)}${args.message.length > 50 ? '...' : ''}"\n目标 agent 将在后台处理,结果会推送给用户。`,
-    )
+    const started = formatSendToAgentStart(res.statusCode, res.body, agentId)
+    if (typeof started !== 'string') return toolError(started.error)
+    return toolOk(started)
   } catch (err: any) {
-    // 带 transport code 上浮(ECONNREFUSED/ETIMEDOUT…),不吞 cause。
     return toolError(`发送失败: ${describeDelegateTransportError(err)}`)
   }
 }
@@ -729,11 +729,11 @@ async function handleDelegateTasks(args: { tasks?: unknown }) {
 // (v5 ccb-only:handleAskGpt55Codex 已移除 —— 无 codex agent。)
 
 /**
- * send_to_agent is a separate long callback endpoint. Delegate tools no longer
- * use one long HTTP request: every engine starts an async job, waits briefly,
- * then returns a resumable job handle before its MCP tools/call deadline.
+ * Delegate tools no longer use one long HTTP request: every engine starts an
+ * async job, waits briefly, then returns a resumable job handle before its
+ * MCP tools/call deadline. send_to_agent returns that handle immediately and
+ * lets the gateway inject the origin session when the child finishes.
  */
-const AGENT_MESSAGE_CLIENT_TIMEOUT_MS = 2 * 60 * 60_000 + 60_000
 
 /**
  * 引擎交互提问桥(仅 Cursor,且仅 OC_ASK_USER_MCP=1 逃生开关):把选择题 POST

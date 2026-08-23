@@ -8825,3 +8825,160 @@ describe("openDispatch hydrate restores in-flight", () => {
     sock.stop();
   });
 });
+
+describe("send_to_agent background card", () => {
+  test("stays running after parent turn_completed and keeps child process until done", () => {
+    const s = sess();
+    s._sendingInFlight = true;
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 1,
+        blocks: [
+          {
+            kind: "tool_use",
+            toolName: "mcp__openclaude-memory__send_to_agent",
+            blockId: "tool-sta",
+            inputJson: { agentId: "research-assistant", message: "查萧山" },
+          },
+        ],
+      }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 2,
+        blocks: [
+          {
+            kind: "delegate_progress",
+            runId: "dlg-sta",
+            agentId: "research-assistant",
+            goal: "查萧山",
+            phase: "start",
+          },
+        ],
+      }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 3,
+        blocks: [
+          {
+            kind: "tool_result",
+            toolUseBlockId: "tool-sta",
+            output: JSON.stringify({ status: "running", jobId: "dlgjob-1" }),
+          },
+        ],
+      }),
+    );
+    const group = s.messages.find((m) => m.role === "agent-group");
+    expect(group).toBeTruthy();
+    expect(group?._background).toBe(true);
+    expect(group?._completed).toBeFalsy();
+
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 4,
+        isFinal: true,
+        meta: { stopReason: "end_turn" },
+        blocks: [{ kind: "text", text: "已交给科研助手", messageId: "srv-a" }],
+      }),
+    );
+    expect(group?._completed).toBeFalsy();
+
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 5,
+        isFinal: false,
+        blocks: [
+          {
+            kind: "delegate_progress",
+            runId: "dlg-sta",
+            agentId: "research-assistant",
+            goal: "查萧山",
+            phase: "text",
+            block: { kind: "text", text: "正在检索" },
+          },
+        ],
+      }),
+    );
+    expect(group?._completed).toBeFalsy();
+    expect(group?.childBlocks?.some((c) => c.kind === "text" && c.text === "正在检索")).toBe(true);
+
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 6,
+        blocks: [
+          {
+            kind: "delegate_progress",
+            runId: "dlg-sta",
+            agentId: "research-assistant",
+            goal: "查萧山",
+            phase: "done",
+            text: "结论",
+          },
+        ],
+      }),
+    );
+    expect(group?._completed).toBe(true);
+  });
+
+  test("running status unwraps MCP wrapper output", () => {
+    const s = sess();
+    s._sendingInFlight = true;
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 1,
+        blocks: [
+          {
+            kind: "tool_use",
+            toolName: "codex:mcpToolCall",
+            blockId: "tool-wrap",
+            inputJson: {
+              server: "openclaude-memory",
+              tool: "send_to_agent",
+              arguments: { agentId: "research-assistant", message: "查萧山" },
+            },
+          },
+        ],
+      }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 2,
+        blocks: [
+          {
+            kind: "tool_result",
+            toolUseBlockId: "tool-wrap",
+            output: JSON.stringify({
+              server: "openclaude-memory",
+              tool: "send_to_agent",
+              result: {
+                content: [{ type: "text", text: JSON.stringify({ status: "running", jobId: "dlgjob-w" }) }],
+              },
+            }),
+          },
+        ],
+      }),
+    );
+    const group = s.messages.find((m) => m.role === "agent-group");
+    expect(group?._background).toBe(true);
+    expect(group?._completed).toBeFalsy();
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 3,
+        isFinal: true,
+        meta: { stopReason: "end_turn" },
+        blocks: [{ kind: "text", text: "已派出", messageId: "srv-b" }],
+      }),
+    );
+    expect(group?._completed).toBeFalsy();
+  });
+});

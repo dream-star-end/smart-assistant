@@ -291,6 +291,12 @@ import {
   parseOriginWebchatSessionKey,
   type CronOriginFireResult,
 } from './cronOriginSession.js'
+import {
+  buildSendToAgentCallbackText,
+  isSendToAgentCallbackComplete,
+  sendToAgentCallbackClientMessageId,
+  sendToAgentCallbackIdempotencyKey,
+} from './sendToAgentCallback.js'
 import { handleTaskboardApi, resolveTaskboardActor, setPatrolExecutionHandler } from './taskboard/http.js'
 import { getTaskboardDb } from './taskboard/db/index.js'
 import { isPatrolSessionKey } from './taskboard/domain.js'
@@ -1707,6 +1713,8 @@ interface RunDelegateInput {
   resumable?: boolean
   /** 本次是否新 mint。早退时要 drop binding,避免占 cap。 */
   resumeMinted?: boolean
+  /** send_to_agent: child 完成后把结论注入父 webchat 并新开父 turn。 */
+  callbackOnComplete?: 'origin-inject'
 }
 /** `_runDelegateTask` 结果。rejected=闸/校验拒(HTTP 壳映射 4xx/429/503);error=session
  *  创建等意外(映射 500);completed=真正执行完(ok/output/error/timedOut,review 还带 verdict)。 */
@@ -10702,6 +10710,9 @@ export class Gateway {
       sessionKey: resume.sessionKey,
       resumable: true,
       resumeMinted: resume.minted,
+      callbackOnComplete: isSendToAgentCallbackComplete(parsed.callbackOnComplete)
+        ? 'origin-inject'
+        : undefined,
     }
     // 默认同步:行为与改前完全一致(CCB/Codex 继续堵在 HTTP 上)。仅 `async: true`
     // 才切作业句柄 —— 子任务仍走同一条 _runDelegateTask(idle/hard/祖先活性/深度/并发闸全在)。
@@ -10718,6 +10729,29 @@ export class Gateway {
       void this._runDelegateTask(runInput)
         .then((result) => {
           store.complete(jobId, this._delegateResultToHttp(result, targetAgentId))
+          if (runInput.callbackOnComplete === 'origin-inject') {
+            const output = result.kind === 'completed' ? result.output : ''
+            const error =
+              result.kind === 'rejected' || result.kind === 'error'
+                ? result.message
+                : result.kind === 'completed'
+                  ? result.error
+                  : undefined
+            void this.injectSendToAgentCallback({
+              parentSessionKey: runInput.parentSessionKey,
+              jobId,
+              agentId: targetAgentId,
+              goal,
+              output,
+              error,
+              userId: this.sessions.getByKey(runInput.parentSessionKey || '')?.userId,
+            }).catch((err) => {
+              this.log.warn('send_to_agent callback inject failed', {
+                jobId,
+                err: String(err),
+              })
+            })
+          }
         })
         .catch((err) => {
           store.complete(jobId, {
@@ -12195,6 +12229,118 @@ export class Gateway {
       } as any)
     } catch (err) {
       this.log.warn('origin-session dispatch failed', { jobId: job.id }, err as Error)
+      return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_DISPATCH_FAILED' }
+    }
+    return { kind: 'injected' }
+  }
+
+  /**
+   * send_to_agent 完成后注入父 webchat：等父 turn 不在飞，再写 user 行并
+   * dispatchInbound 新开父 turn。不走 lastActiveChannel 的 📨 WS 旁路。
+   */
+  private async injectSendToAgentCallback(args: {
+    parentSessionKey?: string
+    jobId: string
+    agentId: string
+    goal: string
+    output?: string
+    error?: string
+    userId?: string
+  }): Promise<CronOriginFireResult> {
+    const origin = parseOriginWebchatSessionKey(args.parentSessionKey || '')
+    if (!origin) {
+      this.log.warn('send_to_agent callback skipped: parent is not webchat dm', {
+        jobId: args.jobId,
+        parentSessionKey: args.parentSessionKey,
+      })
+      return { kind: 'fallback' }
+    }
+    const text = buildSendToAgentCallbackText({
+      agentId: args.agentId,
+      goal: args.goal,
+      output: args.output,
+      error: args.error,
+    })
+    const clientMessageId = sendToAgentCallbackClientMessageId(args.jobId)
+    const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
+    let delayMs = 500
+    for (;;) {
+      const parent = this.sessions.getByKey(origin.sessionKey)
+      if (parent?._currentDispatch) {
+        await sleep(delayMs)
+        delayMs = Math.min(delayMs * 2, 5_000)
+        continue
+      }
+      const userId =
+        (typeof args.userId === 'string' && args.userId.trim()) ||
+        parent?.userId ||
+        process.env.OC_USER_ID?.trim() ||
+        'default'
+      const attempt = await this.trySendToAgentCallbackDispatch({
+        origin,
+        userId,
+        text,
+        clientMessageId,
+        jobId: args.jobId,
+      })
+      if (attempt.kind === 'injected' || attempt.kind === 'fallback') return attempt
+      await sleep(delayMs)
+      delayMs = Math.min(delayMs * 2, 5_000)
+    }
+  }
+
+  private async trySendToAgentCallbackDispatch(args: {
+    origin: { sessionKey: string; agentId: string; channel: 'webchat'; peerKind: 'dm'; peerId: string }
+    userId: string
+    text: string
+    clientMessageId: string
+    jobId: string
+  }): Promise<CronOriginFireResult> {
+    try {
+      const existing = await getClientSession(args.origin.peerId, args.userId)
+      if (existing) {
+        const persisted = await appendServerAuthoredMessageDurable(args.origin.peerId, args.userId, {
+          id: args.clientMessageId,
+          role: 'user',
+          text: args.text,
+          ts: Date.now(),
+        })
+        if (!persisted.applied) {
+          if (persisted.reason === 'already_exists') {
+            // same job retry — continue to dispatch
+          } else if (
+            persisted.reason === 'session_deleted' ||
+            persisted.reason === 'queued_to_outbox'
+          ) {
+            return { kind: 'fallback' }
+          } else {
+            return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_PERSIST_FAILED' }
+          }
+        }
+      } else if (!this.sessions.getByKey(args.origin.sessionKey)) {
+        this.log.warn('send_to_agent callback skipped: parent session gone', {
+          jobId: args.jobId,
+        })
+        return { kind: 'fallback' }
+      }
+    } catch (err) {
+      this.log.warn('send_to_agent callback persist failed', { jobId: args.jobId }, err as Error)
+      return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_PERSIST_FAILED' }
+    }
+    try {
+      await this.dispatchInbound({
+        type: 'inbound.message',
+        channel: args.origin.channel,
+        peer: { id: args.origin.peerId, kind: args.origin.peerKind },
+        agentId: args.origin.agentId,
+        content: { text: args.text },
+        ts: Date.now(),
+        idempotencyKey: sendToAgentCallbackIdempotencyKey(args.jobId),
+        clientMessageId: args.clientMessageId,
+        _userId: args.userId,
+      } as any)
+    } catch (err) {
+      this.log.warn('send_to_agent callback dispatch failed', { jobId: args.jobId }, err as Error)
       return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_DISPATCH_FAILED' }
     }
     return { kind: 'injected' }

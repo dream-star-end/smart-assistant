@@ -189,7 +189,54 @@ function goalKey(raw: string): string {
   return raw.replace(/\r\n?/g, '\n').trim().slice(0, 1024)
 }
 
-/** Align with web reducer `parseDelegateToolInfo` (singular delegate_task only). */
+/** Align with web reducer `parseDelegateToolInfo` (delegate_task + send_to_agent). */
+function isDelegateGroupOp(op: string): boolean {
+  return op === 'delegate_task' || op === 'send_to_agent'
+}
+
+function parseJsonRecord(raw: string): Record<string, unknown> | null {
+  try {
+    const parsed = JSON.parse(raw) as unknown
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null
+  } catch {
+    return null
+  }
+}
+
+function mcpWrapperTexts(obj: Record<string, unknown>): string[] {
+  const result = obj.result && typeof obj.result === 'object' && !Array.isArray(obj.result)
+    ? (obj.result as Record<string, unknown>)
+    : null
+  const content = Array.isArray(result?.content) ? result.content : []
+  return content
+    .map((part) =>
+      part && typeof part === 'object' ? str((part as Record<string, unknown>).text) : '',
+    )
+    .filter(Boolean)
+}
+
+function isRunningStatusPayload(raw: unknown): boolean {
+  const obj =
+    raw && typeof raw === 'object' && !Array.isArray(raw)
+      ? (raw as Record<string, unknown>)
+      : typeof raw === 'string'
+        ? parseJsonRecord(raw.trim())
+        : null
+  if (!obj) return false
+  if (obj.status === 'running') return true
+  for (const text of mcpWrapperTexts(obj)) {
+    const inner = parseJsonRecord(text)
+    if (inner?.status === 'running') return true
+  }
+  return false
+}
+
+function isRunningToolResult(block: Record<string, unknown>): boolean {
+  return isRunningStatusPayload(block.outputJson) || isRunningStatusPayload(block.output)
+}
+
 function parseDelegateToolInfo(
   toolName: string,
   inputJson: unknown,
@@ -199,17 +246,17 @@ function parseDelegateToolInfo(
   const input = parseJsonObject(inputJson) ?? parseJsonObject(inputPreview) ?? {}
   const fromArgs = (args: Record<string, unknown>) => ({
     agentId: str(args.agentId) || 'main',
-    goalRaw: str(args.goal),
+    goalRaw: str(args.goal) || str(args.message),
   })
   const mcp = parseMcpToolName(name)
-  if (mcp?.server === 'openclaude-memory' && mcp.op === 'delegate_task') return fromArgs(input)
-  if (/(?:^|_)delegate_task$/.test(name) && parseCodexTypeName(name) !== 'mcpToolCall') {
+  if (mcp?.server === 'openclaude-memory' && isDelegateGroupOp(mcp.op)) return fromArgs(input)
+  if (/(?:^|_)(delegate_task|send_to_agent)$/.test(name) && parseCodexTypeName(name) !== 'mcpToolCall') {
     return fromArgs(input)
   }
   if (parseCodexTypeName(name) !== 'mcpToolCall') return null
   const server = normalizeMcpServerName(str(input.server) || str(input.serverName))
   const op = str(input.tool) || str(input.toolName) || str(input.name)
-  if (server !== 'openclaude-memory' || op !== 'delegate_task') return null
+  if (server !== 'openclaude-memory' || !isDelegateGroupOp(op)) return null
   const rawArgs = input.arguments ?? input.args ?? input.params
   return fromArgs(parseJsonObject(rawArgs) ?? {})
 }
@@ -588,11 +635,16 @@ function reduceLiveFramesOnto(
         unit.output = str(block.output) || str(block.preview) || unit.output
         if (block.outputJson !== undefined) unit.outputJson = block.outputJson
         unit.error = !!block.isError
-        unit.open = false
-        if (unit.kind === 'agent_group') unit.completed = true
         unit.seqLast = meta.seq
         unit.recordIdLast = frame.recordId
         unit.payloadRef = meta.ref
+        if (unit.kind === 'agent_group' && isRunningToolResult(block)) {
+          unit.open = true
+          unit.completed = false
+        } else {
+          unit.open = false
+          if (unit.kind === 'agent_group') unit.completed = true
+        }
       }
       continue
     }

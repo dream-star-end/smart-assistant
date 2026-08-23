@@ -578,6 +578,92 @@ describe('BL1 delegate_task folds into one agent_group (web reducer parity)', ()
     assert.equal(reduced.state.units.filter((u) => u.kind === 'tool').length, 0)
   })
 
+  it('send_to_agent running tool_result keeps the group open until phase=done', () => {
+    const frames = [
+      frame('1', 1, {
+        kind: 'tool_use',
+        blockId: 'tool-sta',
+        toolName: 'mcp__openclaude-memory__send_to_agent',
+        inputJson: { agentId: 'research-assistant', message: '查萧山' },
+      }),
+      frame('2', 2, {
+        kind: 'delegate_progress',
+        runId: 'dlg-sta',
+        agentId: 'research-assistant',
+        goal: '查萧山',
+        phase: 'start',
+      }),
+      frame('3', 3, {
+        kind: 'tool_result',
+        toolUseBlockId: 'tool-sta',
+        output: JSON.stringify({ status: 'running', jobId: 'dlgjob-1' }),
+      }),
+      frame('4', 4, {
+        kind: 'delegate_progress',
+        runId: 'dlg-sta',
+        phase: 'text',
+        block: { kind: 'text', text: '检索中' },
+      }),
+    ]
+    const reduced = reduceLiveFrames(frames)
+    assert.equal(reduced.ok, true)
+    if (!reduced.ok) return
+    const group = reduced.state.units[0]!
+    assert.equal(group.kind, 'agent_group')
+    assert.equal(group.open, true)
+    assert.equal(group.completed, false)
+    assert.ok(group.children?.some((c) => c.kind === 'text' && c.text === '检索中'))
+
+    const done = reduceLiveFrames([
+      ...frames,
+      frame('5', 5, {
+        kind: 'delegate_progress',
+        runId: 'dlg-sta',
+        agentId: 'research-assistant',
+        goal: '查萧山',
+        phase: 'done',
+        text: '结论',
+      }),
+    ])
+    assert.equal(done.ok, true)
+    if (!done.ok) return
+    assert.equal(done.state.units[0]?.completed, true)
+    assert.equal(done.state.units[0]?.open, false)
+  })
+
+  it('send_to_agent running status unwraps MCP wrapper and Codex mcpToolCall input', () => {
+    const frames = [
+      frame('1', 1, {
+        kind: 'tool_use',
+        blockId: 'tool-wrap',
+        toolName: 'codex:mcpToolCall',
+        inputJson: {
+          server: 'openclaude-memory',
+          tool: 'send_to_agent',
+          arguments: { agentId: 'research-assistant', message: '查萧山' },
+        },
+      }),
+      frame('2', 2, {
+        kind: 'tool_result',
+        toolUseBlockId: 'tool-wrap',
+        output: JSON.stringify({
+          server: 'openclaude-memory',
+          tool: 'send_to_agent',
+          result: {
+            content: [{ type: 'text', text: JSON.stringify({ status: 'running', jobId: 'dlgjob-w' }) }],
+          },
+        }),
+      }),
+    ]
+    const reduced = reduceLiveFrames(frames)
+    assert.equal(reduced.ok, true)
+    if (!reduced.ok) return
+    assert.equal(reduced.state.units[0]?.kind, 'agent_group')
+    assert.equal(reduced.state.units[0]?.open, true)
+    assert.equal(reduced.state.units[0]?.completed, false)
+    assert.equal(reduced.state.units[0]?.agentId, 'research-assistant')
+  })
+
   it('fan-out delegate_tasks stays a tool card; each child run is its own group', () => {
     const frames = [
       frame('1', 1, {

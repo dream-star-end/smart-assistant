@@ -195,12 +195,13 @@ export const TOOLS = [
   {
     name: 'send_to_agent',
     description: [
-      '向另一个 agent 发送消息。目标 agent 会在后台处理,结果推送给用户。',
-      '用于多 agent 协作: 让专业 agent 处理特定子任务。',
+      '向另一个 agent 后台发送任务。本工具立刻返回,你不会等到它的结论。',
+      '用于需要专业成员独立干活、你先结束本回合的场景。',
       '',
-      '示例: send_to_agent(agentId="research", message="帮我查一下 React 19 新特性")',
+      '示例: send_to_agent(agentId="research-assistant", message="核一遍 2010 年萧山机场事件")',
       '',
-      '注意: 这是异步操作,你不会收到目标 agent 的回复。回复会直接推送给用户。',
+      '注意: 这是真正的后台操作。请结束本回合,不要让用户「等它那条回复」。',
+      '子任务完成后,系统会把结论注入本对话并叫醒你继续。需要同步拿结果再往下做时改用 delegate_task。',
     ].join('\n'),
     inputSchema: {
       type: 'object',
