@@ -1650,7 +1650,7 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T46 编程助手官方教程路由不再回落到故障 Ark 模型"
+          "assertion": "T47 编程助手官方教程路由不再回落到故障 Ark 模型"
         }
       ],
       "coverageCommits": [
