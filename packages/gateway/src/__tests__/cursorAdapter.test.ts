@@ -1857,6 +1857,10 @@ console.log(JSON.stringify({type:'result',subtype:'success',is_error:false,sessi
     }
   }
 
+  function staticCpuProbe(): () => number {
+    return () => 4_000
+  }
+
   function staticTranscriptProbe(): () => { files: Record<string, { size: number; mtimeMs: number }> } {
     const files = { 'agent.jsonl': { size: 2048, mtimeMs: 1 } }
     return () => ({ files: { ...files } })
@@ -1920,13 +1924,13 @@ ${toolLine}setInterval(() => {}, 1000);
     }
   }
 
-  test('emits periodic activity while a tool call is pending', { timeout: 10_000 }, async () => {
+  test('emits periodic keepalive activity while a tool call is pending even without CPU or transcript growth', { timeout: 10_000 }, async () => {
     _internals.setPendingKeepaliveTestHooks({
       intervalMs: 40,
       maxMs: 60_000,
       stallMs: 60_000,
       minCpuDeltaTicks: 1,
-      readCpuTicks: growingCpuProbe(),
+      readCpuTicks: staticCpuProbe(),
       readTranscriptFingerprint: staticTranscriptProbe(),
     })
     await withHangingCursorWrapper(true, async (adapter, activity) => {
@@ -1963,7 +1967,7 @@ ${toolLine}setInterval(() => {}, 1000);
     })
   })
 
-  test('stops keepalive emits after the pending-tool max budget', { timeout: 10_000 }, async () => {
+  test('keeps emitting keepalive after the pending-tool max budget while pid is alive', { timeout: 10_000 }, async () => {
     const clock = { offsetMs: 0 }
     _internals.setPendingKeepaliveTestHooks({
       intervalMs: 40,
@@ -1971,7 +1975,7 @@ ${toolLine}setInterval(() => {}, 1000);
       stallMs: 60_000,
       minCpuDeltaTicks: 1,
       now: () => Date.now() + clock.offsetMs,
-      readCpuTicks: growingCpuProbe(),
+      readCpuTicks: staticCpuProbe(),
       readTranscriptFingerprint: staticTranscriptProbe(),
     })
     await withHangingCursorWrapper(true, async (adapter, activity) => {
@@ -1986,16 +1990,15 @@ ${toolLine}setInterval(() => {}, 1000);
       await new Promise((resolve) => setTimeout(resolve, 60))
       const countAfterBudget = activity.count
       await new Promise((resolve) => setTimeout(resolve, 150))
-      assert.equal(
-        activity.count,
-        countAfterBudget,
-        'keepalive must stop once the oldest pending tool exceeds maxMs',
+      assert.ok(
+        activity.count - countAfterBudget >= 2,
+        `keepalive must keep refreshing lastActivityAt after maxMs, got ${activity.count - countAfterBudget} extra emits`,
       )
       assert.equal(adapter.pendingToolCalls > 0, true)
     })
   })
 
-  test('resumes keepalive for a younger pending tool after the oldest exceeds budget and completes', { timeout: 10_000 }, async () => {
+  test('keeps emitting keepalive when the oldest pending tool exceeds maxMs and a younger tool remains', { timeout: 10_000 }, async () => {
     const dir = await mkdtemp(path.join(tmpdir(), 'oc-cursor-keepalive-resume-'))
     const fake = path.join(dir, 'fake.cjs')
     const emitB = path.join(dir, 'emit-b')
@@ -2034,7 +2037,7 @@ setInterval(() => {
       stallMs: 60_000,
       minCpuDeltaTicks: 1,
       now: () => clock.now,
-      readCpuTicks: growingCpuProbe(),
+      readCpuTicks: staticCpuProbe(),
       readTranscriptFingerprint: staticTranscriptProbe(),
     })
     const adapter = new CursorAdapter(opts(dir))
@@ -2066,10 +2069,9 @@ setInterval(() => {
       await new Promise((resolve) => setTimeout(resolve, 60))
       const countAfterBudget = activity.count
       await new Promise((resolve) => setTimeout(resolve, 150))
-      assert.equal(
-        activity.count,
-        countAfterBudget,
-        'oldest tool A over budget must suppress keepalive even though B is still young',
+      assert.ok(
+        activity.count - countAfterBudget >= 2,
+        `oldest tool A over budget must not suppress keepalive while B is still pending, got ${activity.count - countAfterBudget} extra emits`,
       )
       assert.equal(adapter.pendingToolCalls, 2)
 
@@ -2079,7 +2081,7 @@ setInterval(() => {
       await new Promise((resolve) => setTimeout(resolve, 150))
       assert.ok(
         activity.count - countAfterACompleted >= 2,
-        `expected keepalive to resume for remaining young tool B, got ${activity.count - countAfterACompleted} extra emits`,
+        `expected keepalive to continue for remaining tool B, got ${activity.count - countAfterACompleted} extra emits`,
       )
       adapter.interrupt()
       await adapter.shutdown()
@@ -2141,7 +2143,7 @@ setInterval(() => {
     })
   })
 
-  test('stops keepalive after both progress signals stay silent past the stall window', { timeout: 10_000 }, async () => {
+  test('keeps emitting keepalive after both progress signals stay silent past the stall window', { timeout: 10_000 }, async () => {
     const probe = { progressing: true, cpu: 8_000, bytes: 400 }
     _internals.setPendingKeepaliveTestHooks({
       intervalMs: 40,
@@ -2168,17 +2170,18 @@ setInterval(() => {
       probe.progressing = false
       await new Promise((resolve) => setTimeout(resolve, 80))
       const countAfterSilence = activity.count
+      const activityAt = adapter.lastActivityAt
       await new Promise((resolve) => setTimeout(resolve, 200))
-      assert.equal(
-        activity.count,
-        countAfterSilence,
-        'keepalive must stop once transcript and CPU stay silent past stallMs',
+      assert.ok(
+        activity.count - countAfterSilence >= 2,
+        `keepalive must keep refreshing lastActivityAt after stallMs, got ${activity.count - countAfterSilence} extra emits`,
       )
+      assert.ok(adapter.lastActivityAt > activityAt, 'stalled progress must not freeze lastActivityAt')
       assert.equal(adapter.pendingToolCalls > 0, true)
     })
   })
 
-  test('resumes keepalive when progress returns after a stall', { timeout: 10_000 }, async () => {
+  test('keeps refreshing keepalive lastActivityAt during a stall and still recovers UI progress', { timeout: 10_000 }, async () => {
     const probe = { progressing: true, cpu: 8_000, bytes: 400 }
     _internals.setPendingKeepaliveTestHooks({
       intervalMs: 40,
@@ -2200,20 +2203,20 @@ setInterval(() => {
       probe.progressing = false
       await new Promise((resolve) => setTimeout(resolve, 280))
       const countWhileStalled = activity.count
-      await new Promise((resolve) => setTimeout(resolve, 120))
-      assert.equal(
-        activity.count,
-        countWhileStalled,
-        'stalled keepalive must stay quiet until progress resumes',
-      )
-      probe.progressing = true
       const activityAt = adapter.lastActivityAt
+      await new Promise((resolve) => setTimeout(resolve, 120))
+      assert.ok(
+        activity.count > countWhileStalled,
+        'stalled progress must not freeze keepalive activity',
+      )
+      assert.ok(adapter.lastActivityAt > activityAt, 'stall must not freeze lastActivityAt')
+      probe.progressing = true
+      const activityAtRecovery = adapter.lastActivityAt
       await new Promise((resolve) => setTimeout(resolve, 200))
       assert.ok(
-        activity.count - countWhileStalled >= 2,
-        `expected keepalive to resume after stall, got ${activity.count - countWhileStalled} extra emits`,
+        adapter.lastActivityAt > activityAtRecovery,
+        'recovery must keep refreshing lastActivityAt',
       )
-      assert.ok(adapter.lastActivityAt > activityAt, 'recovery must refresh lastActivityAt')
     })
   })
 
@@ -2279,12 +2282,14 @@ setInterval(() => {
       probe.progressing = false
       await new Promise((resolve) => setTimeout(resolve, 280))
       const countWhileStalled = events.filter((e) => e.kind === 'turn_status').length
+      const activityAt = adapter.lastActivityAt
       await new Promise((resolve) => setTimeout(resolve, 160))
       assert.equal(
         events.filter((e) => e.kind === 'turn_status').length,
         countWhileStalled,
         'stalled keepalive must not push turn_status',
       )
+      assert.ok(adapter.lastActivityAt > activityAt, 'stalled UI must not freeze lastActivityAt')
     })
   })
 

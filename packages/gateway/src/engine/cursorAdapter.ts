@@ -1326,7 +1326,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
   lastActivityAt = 0
   private pendingKeepaliveTimer: ReturnType<typeof setInterval> | null = null
   /** Log-dedup only: true while the current oldest pending tool is over budget.
-   *  Must not gate timer start/stop or the keepalive decision itself. */
+   *  Must not gate timer start/stop, lastActivityAt refresh, or activity emits. */
   private pendingKeepaliveOverBudgetLogged = false
   private pendingKeepaliveStalledLogged = false
   private pendingKeepaliveStallSince: number | null = null
@@ -1878,6 +1878,13 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
       const oldestTool = oldestId ? ctx.tools.get(oldestId) : undefined
       const oldestToolName = oldestTool?.toolName ?? 'unknown'
       const oldestElapsedSec = Math.round(elapsedMs / 1000)
+      // Pending + live parent PID is real work for the 15-minute idle watchdog.
+      // Cursor Task/Bash can run for a long time with no stdout, no CPU delta,
+      // and no transcript growth (I/O wait, host ssh, compiling). Gating
+      // lastActivityAt on those signals false-kills live subtasks. The 12h
+      // logical-turn cap still bounds a genuinely stuck process tree.
+      this.lastActivityAt = Date.now()
+      this.emit('activity')
       if (elapsedMs > maxMs) {
         if (!this.pendingKeepaliveOverBudgetLogged) {
           this.pendingKeepaliveOverBudgetLogged = true
@@ -1889,9 +1896,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
             maxMs,
           })
         }
-        return
-      }
-      if (this.pendingKeepaliveOverBudgetLogged) {
+      } else if (this.pendingKeepaliveOverBudgetLogged) {
         this.pendingKeepaliveOverBudgetLogged = false
         log.info('cursor pending-tool keepalive resumed', {
           sessionKey: this.opts.sessionKey,
@@ -1942,8 +1947,6 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         }
         this.pendingKeepaliveStallSince = null
         this.pendingKeepaliveStalledLogged = false
-        this.lastActivityAt = Date.now()
-        this.emit('activity')
         this.emitPendingToolProgress(ctx, {
           oldestToolName,
           transcriptGrew,
