@@ -1630,7 +1630,7 @@
       "occurredAt": "2026-08-23",
       "severity": "P1",
       "symptom": "selfhost 近期增量存在后台委派回调跨重启丢失或乱序、相同目标卡片无法精确关联、任务面板旧种子不升级且阶段运维入口权限不对称、catalog 并发刷新回退、成本精度状态在续跑中丢失，以及 Grok 槽释放对瞬态 transport error 过度裁决等问题。",
-      "rootFixCommit": "991f2778",
+      "rootFixCommit": "4a564bc8",
       "regressions": [
         {
           "layer": "unit",
