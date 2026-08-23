@@ -2169,6 +2169,8 @@ export function applyTurnStatus(sess: ChatSession, frame: OutboundTurnStatusWire
   // retrying 分支携带,故此处显式 narrow,不接受其它态漂出 retry 字段。
   if (frame.status === "compacting") {
     sess._turnStatus = "compacting";
+  } else if (frame.status === "waiting_for_user") {
+    sess._turnStatus = "waiting_for_user";
   } else if (frame.status === "retrying") {
     sess._turnStatus = {
       kind: "retrying",

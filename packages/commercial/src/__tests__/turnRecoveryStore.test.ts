@@ -6,6 +6,7 @@ import {
   claimDueRecoveryJobs,
   forwardRecoveryUnderRootFence,
   markRecoveryContainerReceipt,
+  pauseSilentRecoveryLineage,
   releaseRecoveryForTransportWait,
 } from '../dispatch/turnRecoveryStore.js'
 
@@ -71,6 +72,26 @@ describe('Master automatic recovery scheduler store', () => {
     assert.equal(params[0], 'job-1')
     assert.equal(params[2], 12)
     assert.equal(params[3], 300_000)
+  })
+
+  test('no-progress circuit breaker persists paused current attempt and cancels descendants', async () => {
+    const sql: string[] = []
+    const q = {
+      async query(text: string) {
+        sql.push(text)
+        return { rows: [], rowCount: 1 }
+      },
+    }
+    await pauseSilentRecoveryLineage(q as never, {
+      userId: 7n,
+      sessionId: 'session-1',
+      rootClientMessageId: 'message-root',
+      currentAttempt: 1,
+      terminalOutcome: 'interrupted',
+    })
+    assert.match(sql[0]!, /pg_advisory_xact_lock/)
+    assert.match(sql[2]!, /automatic_silent_no_progress/)
+    assert.match(sql[2]!, /ELSE 'cancelled'/)
   })
 
   test('container receipt atomically accepts dispatch and commits the semantic attempt', async () => {

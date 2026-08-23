@@ -685,8 +685,8 @@ export class CcbMessageParser {
         // 侧信道)。除这两类显式识别的形态外,任何其它值 normalize 到 null ——
         // 防止未来底座加新 status 字面量时,gateway 没有显式 mapping 就把未审过
         // 的字符串塞给前端。
-        if (raw.status === 'compacting') {
-          this.onEvent({ kind: 'turn_status', status: 'compacting' })
+        if (raw.status === 'compacting' || raw.status === 'waiting_for_user') {
+          this.onEvent({ kind: 'turn_status', status: raw.status })
         } else if (raw.status === 'retrying') {
           const retry = normalizeTurnRetry(raw.retry)
           if (retry) {

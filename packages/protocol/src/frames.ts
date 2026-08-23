@@ -195,6 +195,10 @@ export const InboundMessage = Type.Object({
           /** Additional automatic execution number:1..10. */
           attempt: Type.Integer({ minimum: 1, maximum: AUTOMATIC_TURN_RETRY_MAX }),
           max: Type.Literal(AUTOMATIC_TURN_RETRY_MAX),
+          /** Master-only recovery instruction. A first-event silent engine
+           * timeout must not resume the same potentially poisoned native
+           * session. Omitted means ordinary native continuation. */
+          resetNativeSession: Type.Optional(Type.Literal(true)),
         }, { additionalProperties: false }),
         /** Rolling compatibility for an already-cached frontend. The master
          * normalizes this legacy first hop to root=source, attempt=1, max=10. */
@@ -1182,7 +1186,11 @@ const _turnStatusCommon = {
 export const OutboundTurnStatus = Type.Union([
   Type.Object({
     ..._turnStatusCommon,
-    status: Type.Union([Type.Literal('compacting'), Type.Null()]),
+    status: Type.Union([
+      Type.Literal('compacting'),
+      Type.Literal('waiting_for_user'),
+      Type.Null(),
+    ]),
   }),
   Type.Object({
     ..._turnStatusCommon,

@@ -474,4 +474,92 @@ describe('exact turn waiver + targeted inbox (integ)', () => {
     )
     assert.deepEqual(net.rows, [{ total: '0', receipts: '1' }])
   })
+
+  test('one automatic-recovery lineage shares one receipt and later positive refund updates it', async (t) => {
+    if (skipIfNoPg(t)) return
+    const { userId } = await createUsers(1_000n)
+    const sessionId = 'web-waiver-lineage'
+    const userKey = `c:${userId.toString()}`
+    const rootClientMessageId = 'm-waiver-root'
+    const recoveryClientMessageId = 'm-recover-waiver-root'
+    const rootTurnKey = 'c'.repeat(64)
+    const recoveryTurnKey = 'd'.repeat(64)
+    const now = Date.now()
+    const messages = [
+      { id: rootClientMessageId, role: 'user', text: 'fix it', ts: now },
+      {
+        id: recoveryClientMessageId,
+        role: 'user',
+        text: '↻ 自动从断点继续',
+        ts: now + 1,
+        _automaticRecovery: true,
+        _automaticRecoveryRootClientMessageId: rootClientMessageId,
+        _automaticRecoveryAttempt: 1,
+      },
+    ]
+    await query(
+      `INSERT INTO client_sessions(id,user_id,created_at,last_at,updated_at,messages,message_count)
+       VALUES ($1,$2,$3,$3,$3,$4,2)`,
+      [sessionId, userKey, now, JSON.stringify(messages)],
+    )
+    for (const [index, turnKey, clientMessageId] of [
+      [1, rootTurnKey, rootClientMessageId],
+      [2, recoveryTurnKey, recoveryClientMessageId],
+    ] as const) {
+      await query(
+        `INSERT INTO client_session_turn_tapes
+           (session_id,user_id,tape_id,agent_id,turn_index,status,turn_key,
+            tape_sha256,total_bytes,part_count,billing_anchor_id,created_at,finalized_at,
+            client_message_id)
+         VALUES ($1,$2,$3,'main',$4,'interrupted',$3,$3,0,1,$5,$6,$6,$5)`,
+        [sessionId, userKey, turnKey, index, clientMessageId, now + index],
+      )
+    }
+
+    const first = await applyTurnWaiver(getPool(), {
+      userId,
+      turnKey: rootTurnKey,
+      reason: 'idle_timeout',
+    })
+    assert.equal(first.refundedCredits, 0n)
+
+    await settleUsageAndLedger(getPool(), {
+      userId,
+      accountId: null,
+      requestId: 'waiver-lineage-positive',
+      model: 'test',
+      usage: {
+        input_tokens: 1,
+        output_tokens: 1,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+      },
+      snapshotJson: '{}',
+      costCredits: 30n,
+      status: 'success',
+      sessionId: 'engine-waiver-lineage',
+      turnKey: recoveryTurnKey,
+    })
+    const second = await applyTurnWaiver(getPool(), {
+      userId,
+      turnKey: recoveryTurnKey,
+      reason: 'idle_timeout',
+    })
+    assert.equal(second.refundedCredits, 30n)
+    assert.equal(second.inboxMessageId, first.inboxMessageId)
+
+    const receipt = await query<{ n: string; body_md: string }>(
+      `SELECT COUNT(*)::text AS n,MIN(body_md) AS body_md
+         FROM inbox_messages WHERE user_id=$1 AND source_type='turn_waive'`,
+      [userId.toString()],
+    )
+    assert.equal(receipt.rows[0]!.n, '1')
+    assert.match(receipt.rows[0]!.body_md, /累计退还 \*\*30 积分\*\*/)
+    const waivers = await query<{ distinct_receipts: string }>(
+      `SELECT COUNT(DISTINCT inbox_message_id)::text AS distinct_receipts
+         FROM turn_waivers WHERE user_id=$1`,
+      [userId.toString()],
+    )
+    assert.equal(waivers.rows[0]!.distinct_receipts, '1')
+  })
 })

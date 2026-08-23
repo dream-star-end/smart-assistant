@@ -137,6 +137,7 @@ import {
   isClientMessageId,
   normalizeTurnErrorCode,
   maxAutomaticTurnRetryAttempt,
+  shouldPauseSilentAutomaticRecovery,
   supportsAutomaticTurnRecovery,
   turnRecoveryAttemptIdentity,
   turnRecoveryIdentity,
@@ -463,6 +464,11 @@ export function automaticTurnRecoveryTarget(
     terminalAttempt,
     maxAutomaticTurnRetryAttempt(durableRows, rootClientMessageId),
   );
+  if (shouldPauseSilentAutomaticRecovery({
+    errorCode: error._errorCode ?? "",
+    currentAttempt,
+    records: durableRows,
+  })) return undefined;
   if (currentAttempt >= AUTOMATIC_TURN_RETRY_MAX) return undefined;
   const attempt = currentAttempt + 1;
   const identity = turnRecoveryAttemptIdentity(sessionId, rootClientMessageId, attempt);

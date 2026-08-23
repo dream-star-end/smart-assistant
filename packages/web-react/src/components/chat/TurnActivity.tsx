@@ -108,6 +108,9 @@ export function TurnActivity({ info }: { info: TurnActivityInfo }) {
   } else if (info.turnStatus === "compacting") {
     // 压缩上下文（即便团队模式）：computeTypingLabel 产出「正在压缩上下文 (Xs)」。
     ({ text, cls } = computeTypingLabel({ name: info.agentName, secs, silenceMs, turnStatus: "compacting" }));
+  } else if (info.turnStatus === "waiting_for_user") {
+    text = "等待你确认后继续";
+    cls = "waiting-for-user";
   } else if (info.leaderStep) {
     // 团队模式：消息区常长时间纯空白（队长在委派/编排），用队长当前 step 填充等待文案。
     text = `队长正在执行:${info.leaderStep}${secs >= 5 ? ` (${secs}s)` : ""}`;

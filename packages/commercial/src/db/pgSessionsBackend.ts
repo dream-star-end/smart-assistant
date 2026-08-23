@@ -62,6 +62,8 @@ import {
   normalizeTurnErrorCode,
   resolveModelHistoryContextWindow,
   supportsAutomaticTurnRecovery,
+  shouldPauseSilentAutomaticRecovery,
+  shouldResetNativeSessionForRecovery,
   turnRecoveryAttemptIdentity,
   turnRecoveryIdentity,
   parseSessionWorkspaceMode,
@@ -215,6 +217,7 @@ import {
   bindRecoveryJobDispatch,
   enqueueAutomaticRecoveryJob,
   lockRecoveryRoot,
+  pauseSilentRecoveryLineage,
   settleRecoveryJobForTape,
 } from "../dispatch/turnRecoveryStore.js";
 import { settleStopControlsForTurn } from "../dispatch/turnControlStore.js";
@@ -1855,6 +1858,17 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
       rootClientMessageId,
     ),
   );
+  const recoveryRecords = input.turn.records.map((record) => record.payload);
+  if (shouldPauseSilentAutomaticRecovery({ errorCode, currentAttempt, records: recoveryRecords })) {
+    await pauseSilentRecoveryLineage(client, {
+      userId: input.uid,
+      sessionId: input.sessionId,
+      rootClientMessageId,
+      currentAttempt,
+      terminalOutcome: status,
+    });
+    return;
+  }
   if (currentAttempt >= AUTOMATIC_TURN_RETRY_MAX) return;
   const semanticRecoveryAttempt = currentAttempt + 1;
   const identity = turnRecoveryAttemptIdentity(
@@ -1892,6 +1906,11 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
       rootClientMessageId,
       attempt: semanticRecoveryAttempt,
       max: AUTOMATIC_TURN_RETRY_MAX,
+      ...(shouldResetNativeSessionForRecovery({
+        errorCode,
+        currentAttempt,
+        records: recoveryRecords,
+      }) ? { resetNativeSession: true } : {}),
     },
   };
   const request: Record<string, unknown> = {

@@ -6664,6 +6664,129 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     assert.doesNotMatch(request.content?.text ?? "", /deploy\.sh/);
   });
 
+  maybe("silent liveness recovery resets native state once, then pauses the durable lineage", async () => {
+    const sessionId = "s-dd-recovery-silent-streak";
+    const sourceClientMessageId = "cm-dd-recovery-silent-source";
+    const sourceAdmission = await backend.admitUserTurn(admitInput({
+      sessionId,
+      clientMessageId: sourceClientMessageId,
+      billingRequestId: `brq-${sourceClientMessageId}`,
+      message: {
+        id: sourceClientMessageId,
+        role: "user",
+        text: "fix it",
+        ts: 1,
+        _routing: { model: "grok-build", effortLevel: null, teamMode: false },
+      } as MessageLike & { id: string },
+    }));
+    assert.equal(sourceAdmission.kind, "admitted");
+    await stageAndFinalize(CUSER, buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 1,
+      status: "interrupted",
+      turnKey: "e".repeat(64),
+      clientMessageId: sourceClientMessageId,
+      text: "任务约 15 分钟无输出",
+      errorCode: "LIVENESS_TIMEOUT",
+      waiveReason: "idle_timeout",
+      createdAt: 1_783_950_200_000,
+      usage: { inputTokens: 0, outputTokens: 0 },
+      runtimeEvents: [{
+        ordinal: 0,
+        observedAt: 1_783_950_200_001,
+        source: "gateway",
+        payload: { type: "turn_started", status: "working" },
+      }],
+    }));
+
+    const [job] = await claimDueRecoveryJobs(pool, {
+      userId: UID,
+      ownerId: "master-silent-test",
+      leaseMs: 120_000,
+      limit: 1,
+    });
+    assert.ok(job);
+    const request = job.request as {
+      content: {
+        text: string;
+        recovery: {
+          sourceClientMessageId: string;
+          mode: "checkpoint" | "replay";
+          automatic: true;
+          rootClientMessageId: string;
+          attempt: number;
+          max: 10;
+          resetNativeSession?: true;
+        };
+      };
+      clientMessageId: string;
+    };
+    assert.equal(request.content.recovery.resetNativeSession, true);
+    const recoveryAdmission = await backend.admitUserTurn(admitInput({
+      sessionId,
+      clientMessageId: request.clientMessageId,
+      billingRequestId: `brq-${request.clientMessageId}`,
+      message: {
+        id: request.clientMessageId,
+        role: "user",
+        text: request.content.text,
+        ts: 2,
+        _routing: { model: "grok-build", effortLevel: null, teamMode: false },
+        _automaticRecovery: true,
+        _automaticRecoveryRootClientMessageId: sourceClientMessageId,
+        _automaticRecoveryAttempt: 1,
+        _automaticRecoveryMax: 10,
+        _recoveryOfClientMessageId: sourceClientMessageId,
+      } as MessageLike & { id: string },
+      recovery: request.content.recovery,
+      recoveryJob: { jobId: job.jobId, leaseOwner: job.leaseOwner, leaseEpoch: job.leaseEpoch },
+    }));
+    assert.equal(recoveryAdmission.kind, "admitted");
+    if (recoveryAdmission.kind !== "admitted") return;
+    assert.equal(await markRecoveryContainerReceipt(pool, {
+      dispatchId: recoveryAdmission.dispatch.dispatchId,
+      dispatchAttemptNo: recoveryAdmission.dispatch.attemptNo,
+      expectedDispatchLeaseEpoch: recoveryAdmission.dispatch.leaseEpoch,
+    }), true);
+
+    await stageAndFinalize(CUSER, buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 2,
+      status: "interrupted",
+      turnKey: "f".repeat(64),
+      clientMessageId: request.clientMessageId,
+      text: "任务约 15 分钟无输出",
+      errorCode: "LIVENESS_TIMEOUT",
+      waiveReason: "idle_timeout",
+      createdAt: 1_783_950_300_000,
+      usage: { inputTokens: 0, outputTokens: 0 },
+      runtimeEvents: [{
+        ordinal: 0,
+        observedAt: 1_783_950_300_001,
+        source: "gateway",
+        payload: { type: "turn_started", status: "working" },
+      }],
+    }));
+    const lineage = await pool.query<{
+      semantic_recovery_attempt: number;
+      status: string;
+      pause_reason: string | null;
+    }>(
+      `SELECT semantic_recovery_attempt,status,pause_reason
+         FROM turn_recovery_jobs
+        WHERE user_id=$1 AND session_id=$2 AND root_client_message_id=$3
+        ORDER BY semantic_recovery_attempt`,
+      [UID.toString(), sessionId, sourceClientMessageId],
+    );
+    assert.deepEqual(lineage.rows, [{
+      semantic_recovery_attempt: 1,
+      status: "paused",
+      pause_reason: "automatic_silent_no_progress",
+    }]);
+  });
+
   maybe("verified not-accepted source can replay exactly without inventing a tape", async () => {
     const sessionId = "s-dd-recovery-not-accepted";
     const sourceClientMessageId = "cm-dd-recovery-not-accepted-source";

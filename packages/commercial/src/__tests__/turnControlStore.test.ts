@@ -184,6 +184,11 @@ describe('resolvePermissionExpiresAt (detached ask_user TTL)', () => {
     assert.equal(MAX_PERMISSION_TTL_MS, 24 * 60 * 60_000)
   })
 
+  test('blocking Codex 12h expiry survives the Master normalization boundary', () => {
+    const expiresAt = NOW + 12 * 60 * 60_000
+    assert.equal(resolvePermissionExpiresAt(expiresAt, NOW).getTime(), expiresAt)
+  })
+
   test('expiry further than 24h is capped', () => {
     assert.equal(
       resolvePermissionExpiresAt(NOW + 48 * 60 * 60_000, NOW).getTime(),

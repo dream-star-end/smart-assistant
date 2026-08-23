@@ -56,6 +56,11 @@ describe("TurnActivity（激活 computeTypingLabel 死代码：阶段反馈接�
     expect(screen.getByLabelText("生成中").textContent).toContain("正在压缩上下文");
   });
 
+  test("waiting_for_user → 不再显示模型卡住", () => {
+    renderTA({ startedAt: Date.now() - 20 * 60_000, turnStatus: "waiting_for_user" });
+    expect(screen.getByText("等待你确认后继续")).toBeTruthy();
+  });
+
   test("retrying → 滚动旧 max 也统一为「模型繁忙，正在重试中（n/10）」", () => {
     renderTA({
       startedAt: Date.now(),

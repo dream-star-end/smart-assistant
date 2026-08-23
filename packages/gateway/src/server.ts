@@ -59,6 +59,7 @@ import {
   AGENT_MODEL_AUTO,
   MAX_ATTACHMENTS_PER_MESSAGE,
   AUTOMATIC_TURN_RETRY_MAX,
+  AUTHORITY_TURN_MAX_LIFETIME_MS,
   isCodexEngineModel,
   isGrokEngineModel,
   isCursorEngineModel,
@@ -1936,6 +1937,19 @@ export function normalizeAutoDreamSchedule(
   }
 }
 
+export const GATEWAY_PENDING_PERMISSION_TTL_MS = 30 * 60_000
+
+export function _permissionRequestExpiresAt(
+  blockingUserInput: boolean,
+  nowMs: number = Date.now(),
+): number {
+  return nowMs + (
+    blockingUserInput
+      ? AUTHORITY_TURN_MAX_LIFETIME_MS
+      : GATEWAY_PENDING_PERMISSION_TTL_MS
+  )
+}
+
 export class Gateway {
   private wss!: WebSocketServer
   private httpServer!: ReturnType<typeof createServer>
@@ -2193,6 +2207,9 @@ export class Gateway {
      *  the 30-minute sweeper. After the hybrid wait releases (or no waiter is
      *  holding), an allow starts a new user turn. */
     detachedAskUser?: boolean
+    /** Blocking Codex requestUserInput. Browser disconnect is not denial;
+     * it remains answerable until the logical-turn 12h authority deadline. */
+    blockingUserInput?: boolean
   }>()
   /**
    * In-flight HTTP waiters for Cursor ask_user. Keyed by requestId. A waiter
@@ -2203,7 +2220,7 @@ export class Gateway {
   /** Max wait for a permission response before the janitor auto-denies.
    *  Matched to the outer CCB turn timeout (30 min) so we don't pre-empt
    *  a slow user while a turn is still live. */
-  private static readonly PENDING_PERMISSION_TTL_MS = 30 * 60_000
+  private static readonly PENDING_PERMISSION_TTL_MS = GATEWAY_PENDING_PERMISSION_TTL_MS
   /** Detached Cursor ask_user cards stay answerable this long. */
   private static readonly DETACHED_ASK_USER_TTL_MS = DETACHED_ASK_USER_TTL_MS
   /** How often the janitor scans _pendingPermissions. */
@@ -14116,7 +14133,7 @@ export class Gateway {
       this.log.warn('permission response for dead session', { sessionKey: pending.sessionKey })
       return
     }
-    let ok = session.runner.sendPermissionResponse(frame.requestId, response)
+    const ok = session.runner.sendPermissionResponse(frame.requestId, response)
     this.log.info('permission response', {
       requestId: frame.requestId,
       behavior: effectiveBehavior,
@@ -14126,6 +14143,17 @@ export class Gateway {
       askUserQuestionMerged:
         pending.toolName === 'AskUserQuestion' && forwardedInput !== pending.input,
     })
+    if (!ok) {
+      // The Codex reverse-RPC write did not reach a live stdin. Keep the
+      // authoritative prompt pending instead of recording/broadcasting a
+      // settlement the engine never received.
+      this._pendingPermissions.set(frame.requestId, pending)
+      this.log.warn('permission response write failed; request restored', {
+        requestId: frame.requestId,
+        sessionKey: pending.sessionKey,
+      })
+      return
+    }
     // Record the authoritative result BEFORE broadcasting so any late
     // duplicate response that arrives between here and the broadcast round
     // will see the correct behavior. Use pending.* so late duplicates replay
@@ -14977,7 +15005,7 @@ export class Gateway {
     // Snapshot requestIds first — the helper mutates _pendingPermissions.
     const requestIds: string[] = []
     for (const [requestId, pending] of this._pendingPermissions) {
-      if (pending.detachedAskUser) continue
+      if (pending.detachedAskUser || pending.blockingUserInput) continue
       if (pending.peerKey === peerKey) requestIds.push(requestId)
     }
     for (const requestId of requestIds) {
@@ -16979,6 +17007,12 @@ export class Gateway {
         // both to read from `out`, which is correct: `out` is the source of
         // truth for this turn's routing tuple after model-routing has settled
         // any agent-override sessionKey.
+        const blockingUserInput =
+          e.request.toolName === 'AskUserQuestion' &&
+          session.runner.waitingForUserInput === true
+        const permissionExpiresAt = _permissionRequestExpiresAt(
+          blockingUserInput,
+        )
         const permFrame = {
           type: 'outbound.permission_request' as const,
           ..._inheritOutboundRouting(out),
@@ -16987,6 +17021,7 @@ export class Gateway {
           toolUseId: e.request.toolUseId,
           inputPreview: JSON.stringify(e.request.input).slice(0, 400),
           inputJson: e.request.input,
+          expiresAt: permissionExpiresAt,
         }
         // Permission requests only make sense for interactive clients (WebChat)
         // Non-interactive adapters auto-deny.
@@ -17009,7 +17044,8 @@ export class Gateway {
             userId: dispatchUserId,
             channel: frame.channel,
             peer: frame.peer,
-            expiresAt: Date.now() + Gateway.PENDING_PERMISSION_TTL_MS,
+            expiresAt: permissionExpiresAt,
+            ...(blockingUserInput ? { blockingUserInput: true } : {}),
           })
           this._sendStampedSessionFrame(sessionKey, peerKey, permFrame)
         }
@@ -17175,6 +17211,11 @@ export class Gateway {
       grokRoute: safeGrokRoute,
       zcodeRoute: safeZcodeRoute,
       ...(automaticRetryState ? { automaticRetryState } : {}),
+      ...(inboundRecovery?.automatic === true &&
+          'resetNativeSession' in inboundRecovery &&
+          inboundRecovery.resetNativeSession === true
+        ? { resetNativeSession: true }
+        : {}),
       ...(safeModelSwitchId ? { modelSwitchId: safeModelSwitchId } : {}),
       // DispatchTurnContext(uid/…)→ sessionManager 逻辑键形状(userId/…)。
       ...(turnDispatchContext
@@ -17803,7 +17844,7 @@ export function _buildEngineErrorFrame(
 export function _turnStatusWireFields(
   phase: GatewayTurnPhase,
 ):
-  | { status: 'compacting' | null }
+  | { status: 'compacting' | 'waiting_for_user' | null }
   | { status: 'retrying'; retry: TurnRetryMeta }
   | { status: 'working'; detail?: string } {
   if (phase && typeof phase === 'object') {

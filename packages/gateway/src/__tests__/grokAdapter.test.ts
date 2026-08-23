@@ -176,6 +176,23 @@ for (const event of [
       assert.equal(captured.env.PATH, '/run/oc/platform/current/bin:/usr/local/bin:/usr/bin:/bin')
       assert.equal(captured.env.OPENCLAUDE_V3_CONTAINER_TOKEN, undefined)
       assert.equal(captured.env.HTTPS_PROXY, undefined)
+      adapter.clearSessionId()
+      assert.equal(adapter.nativeSessionId, null)
+      const fresh = adapter.submitTurn({
+        input: 'continue fresh',
+        requestId: 'd'.repeat(32),
+        turnKey: 'e'.repeat(64),
+        assistantMessageId: 'asst-2',
+        thinkingMessageId: 'think-2',
+        onEvent: () => {},
+        sessionTotals: totals,
+        toolUseIdToName: new Map(),
+      })
+      await fresh.submitted
+      await fresh.summary
+      await adapter.waitForOutputDrain()
+      const freshCapture = JSON.parse(await readFile(capture, 'utf8')) as { argv: string[] }
+      assert.equal(freshCapture.argv.includes('--resume'), false)
       const managedConfig = await readFile(path.join(captured.env.GROK_HOME, 'config.toml'), 'utf8')
       assert.match(managedConfig, /\[shell_environment_policy\]/)
       assert.match(managedConfig, /exclude = \["XAI_\*", "GROK_\*"\]/)

@@ -132,6 +132,9 @@ function makeFakePool(initial: FakeState): { pool: Pool; state: FakeState; cap: 
           }],
         };
       }
+      if (/FROM client_session_turn_tapes t JOIN client_sessions s/.test(t)) {
+        return { rowCount: 0, rows: [] };
+      }
       if (/FROM usage_records ur JOIN credit_ledger cl/.test(t)) {
         return {
           rowCount: state.debits.length,

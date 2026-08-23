@@ -43,6 +43,7 @@ import {
   CLOSE_BRIDGE,
   BRIDGE_WS_PATH,
   CONTAINER_ATTEST_FRAME_TYPE,
+  _isAuthorizedRecoveryNativeReset,
   _readDispatchDrainMs,
   type BridgeModelAuthorityDeps,
   type UserChatBridgeDeps,
@@ -1209,6 +1210,21 @@ describe("bridge B10 — dispatch 路径 legacy-completed dedup 先于受理", (
 });
 
 describe("bridge automatic recovery lineage", () => {
+  test("native reset is accepted only on a Master-scheduled recovery job", () => {
+    assert.equal(_isAuthorizedRecoveryNativeReset({
+      automatic: true,
+      legacyAutomatic: false,
+      resetNativeSession: true,
+      hasRecoveryJob: true,
+    }), true);
+    assert.equal(_isAuthorizedRecoveryNativeReset({
+      automatic: true,
+      legacyAutomatic: false,
+      resetNativeSession: true,
+      hasRecoveryJob: false,
+    }), false);
+  });
+
   test("valid deterministic lineage reaches atomic admission and preserves control metadata", async () => {
     const sessionId = "sess-recovery-valid";
     const sourceClientMessageId = "cm-source-valid";

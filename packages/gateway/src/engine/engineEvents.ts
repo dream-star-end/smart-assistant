@@ -57,6 +57,7 @@ export interface TurnRetryMeta {
  */
 export type EngineTurnPhase =
   | 'compacting'
+  | 'waiting_for_user'
   | null
   | { status: 'retrying'; retry: TurnRetryMeta }
   | { status: 'working'; detail?: string }

@@ -626,6 +626,10 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
     return this._activeTurn?.parser.pendingToolCalls ?? 0
   }
 
+  get waitingForUserInput(): boolean {
+    return this.kernel.waitingForUserInput
+  }
+
   get isRunning(): boolean {
     return this.kernel.isRunning
   }

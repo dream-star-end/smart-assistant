@@ -11,11 +11,14 @@
  */
 import * as assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
+import { AUTHORITY_TURN_MAX_LIFETIME_MS } from '@openclaude/protocol'
 import {
   _buildEngineErrorFrame,
   _buildTurnStatusFrame,
   _earlyRejectErrorFrames,
+  _permissionRequestExpiresAt,
   _turnStatusWireFields,
+  GATEWAY_PENDING_PERMISSION_TTL_MS,
 } from '../server.js'
 
 const PEER = { id: 'u1', kind: 'dm' as const }
@@ -130,6 +133,14 @@ describe('_buildTurnStatusFrame — 完整 wire 帧', () => {
     assert.equal(frame.traceId, 'trace-2')
   })
 
+  it('waiting_for_user 帧', () => {
+    assert.deepEqual(_turnStatusWireFields('waiting_for_user'), {
+      status: 'waiting_for_user',
+    })
+    const frame = _buildTurnStatusFrame(routing, 'waiting_for_user')
+    assert.equal(frame.status, 'waiting_for_user')
+  })
+
   it('retrying 帧带平级 retry', () => {
     const retry = { attempt: 1, max: 3, delayMs: 500, retryAt: 1_700_000_000_001 }
     const frame = _buildTurnStatusFrame(routing, { status: 'retrying', retry })
@@ -151,5 +162,19 @@ describe('_buildTurnStatusFrame — 完整 wire 帧', () => {
     const fields = _turnStatusWireFields({ status: 'working', detail: 'Read foo.ts' })
     assert.deepEqual(fields, { status: 'working', detail: 'Read foo.ts' })
     assert.deepEqual(_turnStatusWireFields({ status: 'working' }), { status: 'working' })
+  })
+})
+
+describe('_permissionRequestExpiresAt', () => {
+  it('blocking Codex question carries the 12h logical-turn deadline', () => {
+    const now = 1_700_000_000_000
+    assert.equal(
+      _permissionRequestExpiresAt(true, now),
+      now + AUTHORITY_TURN_MAX_LIFETIME_MS,
+    )
+    assert.equal(
+      _permissionRequestExpiresAt(false, now),
+      now + GATEWAY_PENDING_PERMISSION_TTL_MS,
+    )
   })
 })

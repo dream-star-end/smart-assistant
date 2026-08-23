@@ -542,6 +542,14 @@ export function pickIdleTimeoutMs(
   return IDLE_TIMEOUT_DEFAULT_MS
 }
 
+export function shouldTripIdleWatchdog(input: {
+  waitingForUserInput: boolean
+  idleMs: number
+  thresholdMs: number
+}): boolean {
+  return !input.waitingForUserInput && input.idleMs > input.thresholdMs
+}
+
 /**
  * LRU 空闲回收的「临时会话」判定。cron / 旧 task / taskboard 巡检走短空闲 TTL
  * (`maxIdleMsCron` = 30min);webchat 走 2h。
@@ -3530,6 +3538,9 @@ export class SessionManager {
       codexRoute?: CodexProviderConfigOverride | null
       /** Grok CLI receives only this one-turn opaque loopback relay route. */
       grokRoute?: GrokRouteOverride | null
+      /** Master-authored recovery fence for a first-event silent engine turn.
+       * Only Grok currently consumes it; arbitrary client input cannot set it. */
+      resetNativeSession?: boolean
       /** ZCode CLI receives only this one-turn opaque loopback Anthropic relay. */
       zcodeRoute?: ZcodeRouteOverride | null
       /** Master-authored platform goal snapshot for this exact turn. null
@@ -3938,6 +3949,23 @@ export class SessionManager {
               ))
               .filter((prompt): prompt is string => prompt !== null)
           : []
+      if (opts?.resetNativeSession === true && session.providerTag === 'grok') {
+        await session.runner.shutdown()
+        this._resumeMap.delete(session.sessionKey)
+        this._resumeMapTimestamps.delete(session.sessionKey)
+        this._resumeMapProvider.delete(session.sessionKey)
+        this._resumeMapLastCost.delete(session.sessionKey)
+        session.ccbSessionId = null
+        session.runner.clearSessionId()
+        this._saveResumeMap()
+        await this.awaitResumeMapFlush()
+        session._historicalContextInjected = false
+        session._historicalContextInjectedKey = undefined
+        session._contextRebuildNotice = 'native-resume-loss'
+        log.warn('automatic recovery reset poisoned Grok native session', {
+          sessionKey: session.sessionKey,
+        })
+      }
       let providerResumeId = this._resumeIdFor(session.sessionKey, session.providerTag, this._cursorWorkspacePathForSession(session))
       const injectionKey = historicalContextInjectionKey({
         messages: effectiveMasterHistoricalMessages,
@@ -4120,6 +4148,9 @@ export class SessionManager {
             reject(error)
             return
           }
+          // A blocking Codex requestUserInput is an explicit human wait, not
+          // engine silence. Keep checking the immutable 12h hard limit above,
+          // but never turn a pending question into LIVENESS_TIMEOUT/waiver.
           const idleMs = Date.now() - session.runner.lastActivityAt
           // pendingToolCalls 经 adapter 读当前活跃 turn 的 parser(turn 间为 0),
           // 语义与旧 session._currentParser?.pendingToolCalls 一致。
@@ -4128,7 +4159,11 @@ export class SessionManager {
             session.runner.pendingToolCalls,
             session.providerTag,
           )
-          if (idleMs > threshold) {
+          if (shouldTripIdleWatchdog({
+            waitingForUserInput: session.runner.waitingForUserInput === true,
+            idleMs,
+            thresholdMs: threshold,
+          })) {
             const error = new TurnIdleTimeoutError(
               `idle timeout (${Math.round(idleMs / 1000)}s no output)`,
             )

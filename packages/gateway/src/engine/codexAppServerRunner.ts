@@ -1461,7 +1461,7 @@ export class CodexAppServerRunner extends EventEmitter {
   }
 
   sendPermissionResponse(requestId: string, responseUnk: unknown): boolean {
-    const pending = this.takePendingUserInput(requestId)
+    const pending = this.pendingUserInputs.get(requestId)
     if (!pending) return false
 
     const response = asRecord(responseUnk)
@@ -1486,7 +1486,11 @@ export class CodexAppServerRunner extends EventEmitter {
     // vanished) is represented by the schema-valid empty answers map. Codex
     // app-server uses the same empty response after a client-side RPC error,
     // so the model receives an explicit no-answer result instead of hanging.
-    return this.writeRaw(jsonRpcResult(pending.rpcId, { answers: codexAnswers }))
+    const written = this.writeRaw(jsonRpcResult(pending.rpcId, { answers: codexAnswers }))
+    if (!written) return false
+    this.takePendingUserInput(requestId)
+    this.emitUserInputWaitStatus()
+    return true
   }
 
   private takePendingUserInput(requestId: string): PendingCodexUserInput | null {
@@ -1507,6 +1511,7 @@ export class CodexAppServerRunner extends EventEmitter {
       this.writeRaw(jsonRpcResult(pending.rpcId, { answers: {} }))
     }
     if (requestIds.length > 0) {
+      this.emitUserInputWaitStatus()
       log.info('codex requestUserInput settled without browser answer', {
         sessionKey: this.opts.sessionKey,
         turnId,
@@ -1523,8 +1528,18 @@ export class CodexAppServerRunner extends EventEmitter {
   }
 
   private clearPendingUserInputs(): void {
+    const hadPending = this.pendingUserInputs.size > 0
     this.pendingUserInputs.clear()
     this.pendingUserInputIdsByRpc.clear()
+    if (hadPending) this.emitUserInputWaitStatus()
+  }
+
+  get waitingForUserInput(): boolean {
+    return this.pendingUserInputs.size > 0
+  }
+
+  private emitUserInputWaitStatus(): void {
+    this.emitTurnStatus(this.pendingUserInputs.size > 0 ? 'waiting_for_user' : null)
   }
 
   async compactForHandoff(): Promise<NativeModelHandoffArtifact> {
@@ -1583,8 +1598,10 @@ export class CodexAppServerRunner extends EventEmitter {
       this.pendingRetryAbort.abort()
       return true
     }
-    if (!this.proc || this.proc.killed) return false
-    if (!this.threadId || !this.activeTurnId) return false
+    const hadPendingUserInput = this.pendingUserInputs.size > 0
+    if (hadPendingUserInput) this.settleAllPendingUserInputs('runner interrupt')
+    if (!this.proc || this.proc.killed) return hadPendingUserInput
+    if (!this.threadId || !this.activeTurnId) return hadPendingUserInput
     void this.sendRequest('turn/interrupt', {
       threadId: this.threadId,
       turnId: this.activeTurnId,
@@ -2461,6 +2478,7 @@ export class CodexAppServerRunner extends EventEmitter {
       questions: params.questions,
     })
     this.pendingUserInputIdsByRpc.set(rpcKey, requestId)
+    this.emitUserInputWaitStatus()
 
     // turn-retry 台账:permission / requestUserInput 请求是对外 emit 边界 → 置位。
     this.attemptHadToolOrPermission = true
@@ -4140,7 +4158,7 @@ export class CodexAppServerRunner extends EventEmitter {
     } satisfies RunnerMessage)
   }
 
-  private emitTurnStatus(status: 'compacting' | null): void {
+  private emitTurnStatus(status: 'compacting' | 'waiting_for_user' | null): void {
     this.emit('message', {
       type: 'system',
       subtype: 'status',

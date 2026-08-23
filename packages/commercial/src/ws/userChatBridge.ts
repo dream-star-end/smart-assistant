@@ -213,6 +213,16 @@ const CONTROL_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
 const isControlId = (value: unknown): value is string =>
   typeof value === "string" && CONTROL_ID_RE.test(value);
 
+export function _isAuthorizedRecoveryNativeReset(input: {
+  automatic: unknown;
+  legacyAutomatic: boolean;
+  resetNativeSession: unknown;
+  hasRecoveryJob: boolean;
+}): boolean {
+  return input.automatic === true && !input.legacyAutomatic &&
+    input.hasRecoveryJob && input.resetNativeSession === true;
+}
+
 /** Leftover live-journal frames (no cmid) stay durable but never ride the hot WS. */
 export function isLeftoverHotWsFrame(wire: { type?: unknown; clientMessageId?: unknown }): boolean {
   if (isClientMessageId(wire.clientMessageId)) return false;
@@ -3496,6 +3506,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         const rootClientMessageId = recovery?.rootClientMessageId;
         const attempt = recovery?.attempt;
         const max = recovery?.max;
+        const resetNativeSession = recovery?.resetNativeSession;
         const keys = recovery ? Object.keys(recovery) : [];
         const legacyAutomatic = automatic === true &&
           rootClientMessageId === undefined && attempt === undefined && max === undefined;
@@ -3507,8 +3518,17 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           : typeof sourceClientMessageId === "string"
             ? turnRecoveryIdentity(peerId, sourceClientMessageId)
           : null;
+        const masterScheduledReset = _isAuthorizedRecoveryNativeReset({
+          automatic,
+          legacyAutomatic,
+          resetNativeSession,
+          hasRecoveryJob: recoveryJob !== undefined,
+        });
         const allowedKeys = automatic === true && !legacyAutomatic
-          ? ["sourceClientMessageId", "mode", "automatic", "rootClientMessageId", "attempt", "max"]
+          ? [
+              "sourceClientMessageId", "mode", "automatic", "rootClientMessageId", "attempt", "max",
+              ...(recoveryJob !== undefined ? ["resetNativeSession"] : []),
+            ]
           : ["sourceClientMessageId", "mode", "automatic"];
         if (
           clientMessageId === null ||
@@ -3522,6 +3542,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             Number(normalizedAttempt) > AUTOMATIC_TURN_RETRY_MAX ||
             max !== AUTOMATIC_TURN_RETRY_MAX
           )) ||
+          (resetNativeSession !== undefined && !masterScheduledReset) ||
           keys.some((key) => !allowedKeys.includes(key)) ||
           identity?.clientMessageId !== clientMessageId ||
           identity?.idempotencyKey !== frameObj.idempotencyKey
@@ -3541,6 +3562,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               rootClientMessageId: normalizedRoot as string,
               attempt: normalizedAttempt as number,
               max: AUTOMATIC_TURN_RETRY_MAX,
+              ...(masterScheduledReset ? { resetNativeSession: true } : {}),
             }
           : { sourceClientMessageId, mode, automatic: false };
       }

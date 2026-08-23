@@ -31,6 +31,7 @@ export type UserMsgStatus = "sending" | "sent" | "queued" | "read" | "replied" |
  */
 export type TurnStatusState =
   | "compacting"
+  | "waiting_for_user"
   | { kind: "retrying"; attempt: number; max: number; retryAt: number };
 
 /** 判别 `_turnStatus` 是否处于「自动重试中」态（供 reducer 内容帧自动消解 + 渲染层消费）。 */

@@ -219,6 +219,10 @@ export interface EngineAdapter extends EventEmitter {
   getPartialSnapshot(): PartialSnapshot
   /** 当前活跃 turn 的未完成 tool call 数(idle watchdog 阈值选择用;turn 间为 0)。 */
   readonly pendingToolCalls: number
+  /** True only while the active engine turn is blocked on an explicit human
+   * answer. The idle watchdog must not reinterpret that wait as a dead model;
+   * the logical-turn hard limit remains authoritative. */
+  readonly waitingForUserInput?: boolean
   readonly isRunning: boolean
   /** 底座最近输出活动时间戳(liveness watchdog 读;submit 开始时会重置写入)。 */
   lastActivityAt: number

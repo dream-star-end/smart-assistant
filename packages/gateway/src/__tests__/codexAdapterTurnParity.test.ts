@@ -794,6 +794,11 @@ describe("CodexAdapter — interrupt / approval / 崩溃", () => {
 
     p.reply(reverseRequest);
     await waitFor(() => h.events.some((e) => e.kind === "permission_request"));
+    assert.equal(h.adapter.waitingForUserInput, true);
+    assert.equal(
+      h.events.some((e) => e.kind === "turn_status" && e.status === "waiting_for_user"),
+      true,
+    );
     const permissionEvents = h.events.filter((e) => e.kind === "permission_request");
     assert.equal(permissionEvents.length, 1);
     const permission = permissionEvents[0];
@@ -825,6 +830,17 @@ describe("CodexAdapter — interrupt / approval / 崩溃", () => {
     assert.equal(h.events.filter((e) => e.kind === "permission_request").length, 1);
 
     const beforeResponse = p.written.length;
+    const write = p.stdin.write;
+    p.stdin.write = () => { throw new Error("EPIPE"); };
+    assert.equal(
+      h.adapter.sendPermissionResponse(permission.request.requestId, {
+        behavior: "allow",
+        updatedInput: { answers: { "Which color?": "Blue" } },
+      }),
+      false,
+    );
+    assert.equal(h.adapter.waitingForUserInput, true);
+    p.stdin.write = write;
     assert.equal(
       h.adapter.sendPermissionResponse(permission.request.requestId, {
         behavior: "allow",
@@ -836,6 +852,10 @@ describe("CodexAdapter — interrupt / approval / 崩溃", () => {
       true,
     );
     await waitFor(() => p.written.length === beforeResponse + 1);
+    assert.equal(h.adapter.waitingForUserInput, false);
+    const cleared = h.events.at(-1);
+    assert.ok(cleared?.kind === "turn_status");
+    assert.equal(cleared.status, null);
     assert.deepEqual(p.written[beforeResponse] as unknown, {
       jsonrpc: "2.0",
       id: "srv-user-input-1",
@@ -852,6 +872,49 @@ describe("CodexAdapter — interrupt / approval / 崩溃", () => {
     );
     assert.equal(p.written.length, beforeResponse + 1);
 
+    p.notify("turn/completed", { turn: { id: "turn-1", status: "completed" } });
+    await turn.summary;
+  });
+
+  test("两个并发 requestUserInput 只在最后一个回答后退出 waiting", async () => {
+    const h = makeHarness();
+    const turn = beginTurn(h);
+    await waitForRequest(h, "turn/start");
+    const p = h.proc();
+    for (const [id, itemId] of [["srv-a", "ask-a"], ["srv-b", "ask-b"]]) {
+      p.reply({
+        jsonrpc: "2.0",
+        id,
+        method: "item/tool/requestUserInput",
+        params: {
+          threadId: "thr-new-1",
+          turnId: "turn-1",
+          itemId,
+          questions: [{
+            id: itemId,
+            header: "Confirm",
+            question: `${itemId}?`,
+            isOther: false,
+            isSecret: false,
+            options: [{ label: "Yes", description: "Continue." }],
+          }],
+          autoResolutionMs: 60_000,
+        },
+      });
+    }
+    await waitFor(() => h.events.filter((e) => e.kind === "permission_request").length === 2);
+    const permissions = h.events.filter((e) => e.kind === "permission_request");
+    assert.equal(h.adapter.waitingForUserInput, true);
+    assert.equal(h.adapter.sendPermissionResponse(
+      permissions[0]!.request.requestId,
+      { behavior: "deny" },
+    ), true);
+    assert.equal(h.adapter.waitingForUserInput, true);
+    assert.equal(h.adapter.sendPermissionResponse(
+      permissions[1]!.request.requestId,
+      { behavior: "deny" },
+    ), true);
+    assert.equal(h.adapter.waitingForUserInput, false);
     p.notify("turn/completed", { turn: { id: "turn-1", status: "completed" } });
     await turn.summary;
   });

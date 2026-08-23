@@ -472,6 +472,12 @@ describe("applyTurnStatus retrying 判别联合", () => {
     expect(s._turnStatus).toBe("compacting");
   });
 
+  test("waiting_for_user → 明确的人类等待态", () => {
+    const s = sess();
+    applyTurnStatus(s, turnStatusFrame({ status: "waiting_for_user" }));
+    expect(s._turnStatus).toBe("waiting_for_user");
+  });
+
   test("status=null 复位帧 → 清 retrying 软提示", () => {
     const s = sess();
     applyTurnStatus(s, turnStatusFrame({ status: "retrying", retry: { attempt: 1, max: 3, delayMs: 2000, retryAt: Date.now() + 2000 } }));
@@ -3458,6 +3464,23 @@ describe("interruptedContinuationTarget (durable 断点续跑)", () => {
     auth[2]._errorCode = "auth_error";
     expect(automaticTurnRecoveryTarget(auth, auth[2], "s1")).toBeUndefined();
     expect(interruptedContinuationTarget(auth, auth[2], "s1")).toBeUndefined();
+  });
+
+  test("fallback owner 对同血缘第二次静默超时熔断，不再推进 2..10", () => {
+    const silent = rows();
+    silent[0]._automaticRecovery = true;
+    silent[0]._automaticRecoveryRootClientMessageId = "u-interrupted";
+    silent[0]._automaticRecoveryAttempt = 1;
+    silent[1] = {
+      id: "runtime-only",
+      role: "runtime-event",
+      text: "",
+      ts: 2,
+      _source: "server",
+      _turnTapeId: "tape-1",
+      _runtimeEvent: { type: "turn_started", status: "working" },
+    };
+    expect(automaticTurnRecoveryTarget(silent, silent[2], "s1")).toBeUndefined();
   });
 });
 
