@@ -99,7 +99,7 @@ describe('V5 branch deployment policy', () => {
 })
 
 async function runTurnCanaryFixture(
-  mode: 'foreign-then-success' | 'foreign-only' | 'own-error',
+  mode: 'foreign-then-success' | 'foreign-only' | 'own-error' | 'ccb-final-cost-tape-text' | 'ccb-final-cost-empty-session',
 ): Promise<{ code: number | null; stdout: string; stderr: string; elapsedMs: number }> {
   const dir = await mkdtemp(path.join(tmpdir(), 'v5-turn-canary-'))
   dirs.push(dir)
@@ -115,6 +115,17 @@ async function runTurnCanaryFixture(
     if (req.method === 'PUT' && req.url?.startsWith('/api/sessions/')) {
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end('{}')
+      return
+    }
+    if (req.method === 'GET' && req.url?.startsWith('/api/sessions/')) {
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      if (mode === 'ccb-final-cost-tape-text') {
+        res.end(JSON.stringify({ messages: [{ role: 'assistant', text: '2' }] }))
+      } else if (mode === 'ccb-final-cost-empty-session') {
+        res.end(JSON.stringify({ messages: [{ role: 'assistant', text: '' }] }))
+      } else {
+        res.end('{}')
+      }
       return
     }
     res.writeHead(404)
@@ -162,6 +173,19 @@ async function runTurnCanaryFixture(
         }))
         return
       }
+      if (mode === 'ccb-final-cost-tape-text' || mode === 'ccb-final-cost-empty-session') {
+        ws.send(JSON.stringify({
+          type: 'outbound.message',
+          sessionKey: `agent:main:webchat:dm:${inbound.peer.id}`,
+          channel: 'webchat',
+          peer: inbound.peer,
+          clientMessageId: inbound.clientMessageId,
+          blocks: [],
+          isFinal: true,
+        }))
+        ws.send(JSON.stringify({ type: 'outbound.cost_charged' }))
+        return
+      }
       ws.send(JSON.stringify({
         type: 'outbound.message',
         sessionKey: `agent:main:webchat:dm:${inbound.peer.id}`,
@@ -199,6 +223,8 @@ async function runTurnCanaryFixture(
       V5_CANARY_PASSWORD_FILE: passwordFile,
       V5_TURN_ATTEMPTS: '1',
       V5_TURN_SILENCE_MS: '60',
+      V5_CANARY_TAPE_TEXT_GRACE_MS: '80',
+      V5_CANARY_TAPE_TEXT_POLL_MS: '20',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
@@ -7686,14 +7712,16 @@ wait $!
     assert.match(source.slice(attemptAt), /answerText \+= b\.text/)
     assert.match(source.slice(attemptAt), /finalText = answerText\.trim\(\)/)
     assert.match(source.slice(attemptAt), /let finalText = ''/)
-    assert.match(source.slice(attemptAt), /resolve\(\{ reason, sawText, sawFinal, sawCost, sawError, finalText \}\)/)
+    assert.match(source.slice(attemptAt), /resolve\(\{ reason, sawText, sawFinal, sawCost, sawError, finalText, textVia \}\)/)
+    assert.match(source, /extractAssistantText/)
+    assert.match(source, /textVia = 'tape'/)
     assert.match(source, /result\.finalText === '2'/)
   })
 
   test('real-turn canary ignores foreign recovery frames but still fails its own exact error', async () => {
     const success = await runTurnCanaryFixture('foreign-then-success')
     assert.equal(success.code, 0, success.stderr || success.stdout)
-    assert.match(success.stdout, /TURN_OK model=gpt-5\.6-sol exact_text=2 final=true cost_charged=true/)
+    assert.match(success.stdout, /TURN_OK model=gpt-5\.6-sol exact_text=2 final=true cost_charged=true via=ws/)
 
     const ownError = await runTurnCanaryFixture('own-error')
     assert.equal(ownError.code, 1, ownError.stdout)
@@ -7705,6 +7733,21 @@ wait $!
     assert.ok(
       foreignOnly.elapsedMs < 900,
       `foreign frames incorrectly refreshed the 60ms silence timer (${foreignOnly.elapsedMs}ms)`,
+    )
+  })
+
+  test('real-turn canary accepts tape assistant text when CCB final+cost omit WS blocks', async () => {
+    const tapeOk = await runTurnCanaryFixture('ccb-final-cost-tape-text')
+    assert.equal(tapeOk.code, 0, tapeOk.stderr || tapeOk.stdout)
+    assert.match(tapeOk.stdout, /TURN_OK model=gpt-5\.6-sol exact_text=2 final=true cost_charged=true via=tape/)
+
+    const empty = await runTurnCanaryFixture('ccb-final-cost-empty-session')
+    assert.equal(empty.code, 1, empty.stdout)
+    assert.match(empty.stderr, /TURN_INCOMPLETE.*缺:text/)
+    assert.match(empty.stderr, /final=true cost=true/)
+    assert.ok(
+      empty.elapsedMs < 900,
+      `tape-miss should fail closed without waiting the WS silence window (${empty.elapsedMs}ms)`,
     )
   })
 
