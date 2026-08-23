@@ -126,8 +126,9 @@ export type UseSessionListOptions = {
     title: string;
     body?: React.ReactNode;
     confirmText?: string;
+    altText?: string;
     danger?: boolean;
-  }) => Promise<boolean>;
+  }) => Promise<boolean | "alt">;
   promptText: (opts: { title: string; initial?: string }) => Promise<string | null>;
   /** 清除对话错误横幅（切换/新建会话时）。 */
   clearChatError: () => void;

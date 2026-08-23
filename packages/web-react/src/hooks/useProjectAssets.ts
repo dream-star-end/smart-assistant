@@ -28,8 +28,9 @@ export type UseProjectAssetsOptions = {
     title: string;
     body?: React.ReactNode;
     confirmText?: string;
+    altText?: string;
     danger?: boolean;
-  }) => Promise<boolean>;
+  }) => Promise<boolean | "alt">;
 };
 
 export type UseProjectAssets = {

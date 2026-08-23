@@ -1144,7 +1144,7 @@ function TrainDraftView({
   run: SkillTrainRun;
   rates: ModelRates | null;
   onMerged: () => void;
-  confirmDialog: (opts: { title: string; body?: ReactNode; confirmText?: string; danger?: boolean }) => Promise<boolean>;
+  confirmDialog: (opts: { title: string; body?: ReactNode; confirmText?: string; altText?: string; danger?: boolean }) => Promise<boolean | "alt">;
 }) {
   const [drafts, setDrafts] = useState<SkillDraftSummary[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
