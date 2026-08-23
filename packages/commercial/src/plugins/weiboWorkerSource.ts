@@ -87,6 +87,7 @@ function emitStep(event) {
       if (typeof event.imageTitleHits === 'number' && Number.isFinite(event.imageTitleHits)) payload.imageTitleHits = Math.round(event.imageTitleHits);
       if (typeof event.imageIconHits === 'number' && Number.isFinite(event.imageIconHits)) payload.imageIconHits = Math.round(event.imageIconHits);
       if (typeof event.imageTextHits === 'number' && Number.isFinite(event.imageTextHits)) payload.imageTextHits = Math.round(event.imageTextHits);
+      if (typeof event.imageControlHits === 'number' && Number.isFinite(event.imageControlHits)) payload.imageControlHits = Math.round(event.imageControlHits);
       if (typeof event.selected === 'number' && Number.isFinite(event.selected)) payload.selected = Math.round(event.selected);
       if (typeof event.freshSelected === 'number' && Number.isFinite(event.freshSelected)) payload.freshSelected = Math.round(event.freshSelected);
       if (typeof event.imgCount === 'number' && Number.isFinite(event.imgCount)) payload.imgCount = Math.round(event.imgCount);
@@ -1391,6 +1392,60 @@ async function uniqueExactText(root, text) {
   }
   return matches.length === 1 ? matches[0] : null;
 }
+async function boxCenter(node) {
+  if (!node || typeof node.evaluate !== 'function') return null;
+  return node.evaluate((el) => {
+    if (!el || typeof el.getBoundingClientRect !== 'function') return null;
+    const r = el.getBoundingClientRect();
+    return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+  }).catch(() => null);
+}
+async function controlIdentity(node) {
+  if (!node || typeof node.evaluate !== 'function') return '';
+  return String(await node.evaluate((el) => {
+    if (!el) return '';
+    const r = el.getBoundingClientRect();
+    return [el.tagName, el.id || '', String(el.className || '').slice(0, 80), Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)].join('|');
+  }).catch(() => ''));
+}
+async function clickableExactTextControls(root, text) {
+  if (!root || typeof root.locator !== 'function' || !text) return [];
+  const nodes = root.locator('xpath=.//*[normalize-space()="' + text + '"]');
+  if (!nodes || typeof nodes.count !== 'function' || typeof nodes.nth !== 'function') return [];
+  const controls = [];
+  const seen = new Set();
+  const total = Math.min(await nodes.count().catch(() => 0), 20);
+  for (let index = 0; index < total; index += 1) {
+    const node = nodes.nth(index);
+    if (!await visible(node)) continue;
+    const control = await clickableImageTool(node);
+    const id = await controlIdentity(control);
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    controls.push(control);
+  }
+  return controls;
+}
+async function uniqueOrNearestImageText(root, input, text) {
+  const controls = await clickableExactTextControls(root, text);
+  if (controls.length === 1) return controls[0];
+  if (controls.length === 0) return null;
+  if (!input || typeof input.evaluate !== 'function') return null;
+  const inputBox = await boxCenter(input);
+  if (!inputBox) return null;
+  let best = null;
+  let bestDist = Infinity;
+  for (const control of controls) {
+    const box = await boxCenter(control);
+    if (!box) continue;
+    const dist = Math.hypot(box.x - inputBox.x, box.y - inputBox.y);
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = control;
+    }
+  }
+  return best;
+}
 async function exactTextNearInput(input, text) {
   if (!input || typeof input.locator !== 'function' || !text) return null;
   for (let depth = 1; depth <= 8; depth += 1) {
@@ -1430,6 +1485,8 @@ async function clickableImageToolFromInput(input) {
 }
 async function imageToolControl(scope, page, scopedInput) {
   const labeled = await exactMenuItem(scope, '图片')
+    || await uniqueOrNearestImageText(scope, scopedInput, '图片')
+    || await uniqueOrNearestImageText(scope, scopedInput, '相册')
     || await exactTextNearInput(scopedInput, '图片')
     || await exactTextNearInput(scopedInput, '相册')
     || await uniqueExactText(scope, '图片')
@@ -1454,6 +1511,7 @@ async function preparePostImageChooser(page, editor) {
   const imageTitleHits = await countVisibleLocator(scope, '[title="图片"], [aria-label="图片"]');
   const imageIconHits = await countVisibleLocator(scope, 'i.woo-font--image, i.woo-font--pic, i.woo-font--picture');
   const imageTextHits = await countVisibleLocator(scope, 'xpath=.//*[normalize-space()="图片"]');
+  const imageControlHits = (await clickableExactTextControls(scope, '图片')).length;
   let branch = 'miss';
   let chooser = null;
   if (image) {
@@ -1551,6 +1609,7 @@ async function preparePostImageChooser(page, editor) {
     imageTitleHits,
     imageIconHits,
     imageTextHits,
+    imageControlHits,
     hits: afterScope.image,
     mediaCount: afterPage.image,
   });

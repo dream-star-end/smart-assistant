@@ -197,7 +197,7 @@ describe('official Weibo Plugin', () => {
   })
 
   test('pins the current artifact and only the exact production predecessor', () => {
-    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.23')
+    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.24')
     assert.equal(WEIBO_DRIVER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.equal(WEIBO_LAUNCHER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.deepEqual(WEIBO_SETUP_COMPATIBLE_PREDECESSORS, [
@@ -453,8 +453,11 @@ describe('official Weibo Plugin', () => {
     assert.match(WEIBO_WORKER_SOURCE, /clickableImageToolFromInput/)
     assert.match(WEIBO_WORKER_SOURCE, /uniqueExactText/)
     assert.match(WEIBO_WORKER_SOURCE, /exactTextNearInput/)
+    assert.match(WEIBO_WORKER_SOURCE, /uniqueOrNearestImageText/)
+    assert.match(WEIBO_WORKER_SOURCE, /clickableExactTextControls/)
     assert.match(WEIBO_WORKER_SOURCE, /smallVisibleAncestor/)
     assert.match(WEIBO_WORKER_SOURCE, /imageTextHits/)
+    assert.match(WEIBO_WORKER_SOURCE, /imageControlHits/)
     assert.match(WEIBO_WORKER_SOURCE, /scopedInput && !image/)
     assert.match(WEIBO_WORKER_SOURCE, /force: true/)
     assert.match(WEIBO_WORKER_SOURCE, /countImageFileInputs/)
@@ -1761,6 +1764,101 @@ describe('official Weibo Plugin', () => {
         })
         assert.deepEqual(result, { post: { id: 'hidden-post', owned: true, text: 'hello' } })
         assert.ok(Date.now() - started >= 350, 'send must wait for delayed media readiness')
+        assert.equal(await page.evaluate(() => Reflect.get(window, 'imageClicks')), 1)
+        assert.equal(await page.evaluate(() => Reflect.get(window, 'chooserClicks')), 0)
+        assert.equal(await page.evaluate(() => Reflect.get(window, 'sendClicks')), 1)
+        assert.equal(collectCount, 2)
+      } finally {
+        await browser.close()
+      }
+    },
+  )
+
+  test(
+    'real Chromium clicks the 图片 nearest the composer file input when five 图片 texts exist',
+    { timeout: 30_000 },
+    async () => {
+      const browserResolverModule = '../../../../scripts/lib/resolve-browser.mjs'
+      const { resolveBrowserExecutable } = (await import(browserResolverModule)) as {
+        resolveBrowserExecutable(): string
+      }
+      const browser = await chromium.launch({
+        executablePath: resolveBrowserExecutable(),
+        headless: true,
+        args: ['--no-sandbox', '--disable-dev-shm-usage'],
+      })
+      try {
+        const page = await browser.newPage()
+        await page.setContent(`<!doctype html>
+          <div id="composer">
+            <textarea></textarea>
+            <div id="image" class="wbpro-iconbed" role="button">
+              <span><span><span><span><span>图片</span></span></span></span></span>
+            </div>
+            <input id="file" type="file" accept="image/*" hidden />
+            <button id="send" disabled>发送</button>
+          </div>
+          <script>
+            window.imageClicks = 0;
+            window.sendClicks = 0;
+            window.chooserClicks = 0;
+            document.querySelector('#image').addEventListener('click', () => {
+              window.imageClicks += 1;
+            });
+            document.querySelector('#file').addEventListener('click', () => {
+              window.chooserClicks += 1;
+            });
+            document.querySelector('#file').addEventListener('change', () => {
+              const preview = document.createElement('img');
+              preview.alt = 'preview';
+              preview.src = 'blob:https://weibo.com/preview';
+              document.querySelector('#composer').append(preview);
+              setTimeout(() => { document.querySelector('#send').disabled = false; }, 400);
+            });
+            document.querySelector('#send').addEventListener('click', () => {
+              window.sendClicks += 1;
+              const textarea = document.querySelector('textarea');
+              const post = document.createElement('article');
+              post.dataset.id = 'near-input-post';
+              post.textContent = textarea.value;
+              textarea.value = '';
+              document.body.append(post);
+            });
+          </script>`)
+        let collectCount = 0
+        const harness = compileWorkerPostHarness({
+          ensureSelfId: async () => '12345',
+          gotoAuthenticated: async () => {},
+          collectPosts: async (targetPage: typeof page) => {
+            collectCount += 1
+            return targetPage.locator('article[data-id]').evaluateAll((articles) =>
+              articles.map((article) => ({
+                id: article.getAttribute('data-id'),
+                owned: true,
+                text: article.textContent?.trim() ?? '',
+              })),
+            )
+          },
+          uniqueVisible: async (locator: unknown) => locator,
+          assertNoChallenge: async () => {},
+          awaitDispatch: async () => {},
+          exactMenuItem: async (targetPage: typeof page, text: string) => {
+            if (text === '图片' || text === '相册' || text === '本地上传') return null
+            const locator = targetPage.getByRole('button', { name: text, exact: true })
+            return (await locator.count()) === 1 ? locator : null
+          },
+          cleanText: (value: unknown) => String(value).trim(),
+          readFile: async () => Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+        })
+
+        const result = await harness.writeAction(page, {
+          actionId: 'create_post',
+          params: {
+            text: 'hello',
+            mediaManifest: [{ inputId: 'asset-1', filename: 'image.png', mimeType: 'image/png' }],
+          },
+        })
+        assert.deepEqual(result, { post: { id: 'near-input-post', owned: true, text: 'hello' } })
         assert.equal(await page.evaluate(() => Reflect.get(window, 'imageClicks')), 1)
         assert.equal(await page.evaluate(() => Reflect.get(window, 'chooserClicks')), 0)
         assert.equal(await page.evaluate(() => Reflect.get(window, 'sendClicks')), 1)
