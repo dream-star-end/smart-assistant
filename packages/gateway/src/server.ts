@@ -10729,34 +10729,32 @@ export class Gateway {
       void this._runDelegateTask(runInput)
         .then((result) => {
           store.complete(jobId, this._delegateResultToHttp(result, targetAgentId))
-          if (runInput.callbackOnComplete === 'origin-inject') {
-            const output = result.kind === 'completed' ? result.output : ''
-            const error =
-              result.kind === 'rejected' || result.kind === 'error'
-                ? result.message
-                : result.kind === 'completed'
-                  ? result.error
-                  : undefined
-            void this.injectSendToAgentCallback({
-              parentSessionKey: runInput.parentSessionKey,
-              jobId,
-              agentId: targetAgentId,
-              goal,
-              output,
-              error,
-              userId: this.sessions.getByKey(runInput.parentSessionKey || '')?.userId,
-            }).catch((err) => {
-              this.log.warn('send_to_agent callback inject failed', {
-                jobId,
-                err: String(err),
-              })
-            })
-          }
+          const output = result.kind === 'completed' ? result.output : ''
+          const error =
+            result.kind === 'rejected' || result.kind === 'error'
+              ? result.message
+              : result.kind === 'completed'
+                ? result.error
+                : undefined
+          this._queueSendToAgentCallback(runInput, {
+            jobId,
+            agentId: targetAgentId,
+            goal,
+            output,
+            error,
+          })
         })
         .catch((err) => {
+          const message = (err as Error)?.message ?? String(err)
           store.complete(jobId, {
             httpStatus: 500,
-            body: { error: (err as Error)?.message ?? String(err) },
+            body: { error: message },
+          })
+          this._queueSendToAgentCallback(runInput, {
+            jobId,
+            agentId: targetAgentId,
+            goal,
+            error: message,
           })
         })
       return this.sendJson(res, 200, {
@@ -12234,6 +12232,27 @@ export class Gateway {
     return { kind: 'injected' }
   }
 
+  private _queueSendToAgentCallback(
+    runInput: RunDelegateInput,
+    args: { jobId: string; agentId: string; goal: string; output?: string; error?: string },
+  ): void {
+    if (runInput.callbackOnComplete !== 'origin-inject') return
+    void this.injectSendToAgentCallback({
+      parentSessionKey: runInput.parentSessionKey,
+      jobId: args.jobId,
+      agentId: args.agentId,
+      goal: args.goal,
+      output: args.output,
+      error: args.error,
+      userId: this.sessions.getByKey(runInput.parentSessionKey || '')?.userId,
+    }).catch((err) => {
+      this.log.warn('send_to_agent callback inject failed', {
+        jobId: args.jobId,
+        err: String(err),
+      })
+    })
+  }
+
   /**
    * send_to_agent 完成后注入父 webchat：等父 turn 不在飞，再写 user 行并
    * dispatchInbound 新开父 turn。不走 lastActiveChannel 的 📨 WS 旁路。
@@ -12296,6 +12315,9 @@ export class Gateway {
     clientMessageId: string
     jobId: string
   }): Promise<CronOriginFireResult> {
+    if (this._shuttingDown || this._runtimeRecycleDrainUntil > Date.now()) {
+      return { kind: 'retryable_failure', code: 'NO_TRANSPORT' }
+    }
     try {
       const existing = await getClientSession(args.origin.peerId, args.userId)
       if (existing) {
@@ -12338,6 +12360,7 @@ export class Gateway {
         idempotencyKey: sendToAgentCallbackIdempotencyKey(args.jobId),
         clientMessageId: args.clientMessageId,
         _userId: args.userId,
+        _skipRateLimit: true,
       } as any)
     } catch (err) {
       this.log.warn('send_to_agent callback dispatch failed', { jobId: args.jobId }, err as Error)
@@ -15494,7 +15517,7 @@ export class Gateway {
       typeof (frame as any)._rateLimitChannel === 'string'
         ? (frame as any)._rateLimitChannel
         : frame.channel
-    if (!this.rateLimiter.check(frame.peer.id, rateLimitChannel)) {
+    if (!(frame as any)._skipRateLimit && !this.rateLimiter.check(frame.peer.id, rateLimitChannel)) {
       const rlUserId: string =
         typeof (frame as any)._userId === 'string' ? (frame as any)._userId : 'default'
       const rateLimitOut = {

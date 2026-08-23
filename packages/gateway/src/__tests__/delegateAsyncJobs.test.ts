@@ -431,4 +431,52 @@ describe('handleDelegateTask model override', () => {
     assert.equal(r.status, 401)
     assert.equal(ran, 0)
   })
+
+  it('callbackOnComplete still injects when _runDelegateTask rejects', async () => {
+    const gw = makeGateway(false)
+    const injected: Array<{ error?: string; jobId: string }> = []
+    gw._runDelegateTask = async () => {
+      throw new Error('mapped exec boom')
+    }
+    gw.injectSendToAgentCallback = async (args: { error?: string; jobId: string }) => {
+      injected.push(args)
+      return { kind: 'injected' }
+    }
+    const r = await call(gw, 'handleDelegateTask', {
+      goal: '查萧山',
+      sourceAgent: 'main',
+      parentSessionKey: PARENT_KEY,
+      async: true,
+      callbackOnComplete: 'origin-inject',
+      streamProgress: true,
+    })
+    assert.equal(r.status, 200)
+    assert.equal(r.body.status, 'running')
+    for (let i = 0; i < 30 && injected.length === 0; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    assert.equal(injected.length, 1)
+    assert.match(String(injected[0]?.error), /boom/)
+  })
+
+  it('callback dispatch is retryable while the gateway is shutting down', async () => {
+    const gw = makeGateway(false)
+    gw._shuttingDown = true
+    gw._runtimeRecycleDrainUntil = 0
+    const result = await gw.trySendToAgentCallbackDispatch({
+      origin: {
+        sessionKey: PARENT_KEY,
+        agentId: 'main',
+        channel: 'webchat',
+        peerKind: 'dm',
+        peerId: 'wsess-async-delegate',
+      },
+      userId: 'default',
+      text: 'callback',
+      clientMessageId: 'sta-cb-x',
+      jobId: 'dlgjob-x',
+    })
+    assert.equal(result.kind, 'retryable_failure')
+    assert.equal(result.code, 'NO_TRANSPORT')
+  })
 })
