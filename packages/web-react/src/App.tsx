@@ -143,7 +143,7 @@ import {
 } from "./lib/modelPreferences";
 import { DEMO_MESSAGES, DEMO_MODELS, DEMO_SESSIONS, DEMO_USER, demoReply } from "./lib/demo";
 import type { ChatProject, Message, PublicConfig, PublicModel, Session, SessionLastOutcome, ToolCard } from "./lib/types";
-import { modelSwitchCompactionReason } from "./lib/modelSwitch";
+import { inspectModelSwitchSession, modelSwitchCompactionReason } from "./lib/modelSwitch";
 import { TASKBOARD_ENABLED } from "./lib/taskboardFeature";
 
 // 首屏瘦身:营销首页 + 设置/管理/市场/组织/教程中心按需异步加载,移出 entry chunk。
@@ -652,21 +652,21 @@ export function App() {
         return;
       }
       const currentMessages = sockRef.current?.getMessages(activeId) ?? [];
-      const hasContent = (sessions.find((session) => session.id === activeId)?.messageCount ?? 0) > 0 ||
-        currentMessages.some((message) =>
-          message.role === "user" || message.role === "assistant" ||
-          message.role === "tool" || message.role === "agent-group");
-      const reason = modelSwitchCompactionReason(models, modelId, id, hasContent);
+      const switchSession = inspectModelSwitchSession(
+        currentMessages,
+        sessions.find((session) => session.id === activeId)?.messageCount ?? 0,
+      );
+      const reason = modelSwitchCompactionReason(models, modelId, id, switchSession);
       if (!reason || !modelId) {
         commit();
         return;
       }
       const details = [
         reason.visionDowngrade
-          ? "目标模型不支持当前会话的多模态上下文，图片等内容将转换为文字交接。"
+          ? "目标模型不支持当前会话里的图片等内容，将转换为文字交接。"
           : null,
         reason.contextDowngrade
-          ? "目标模型的上下文窗口更短，需要先压缩当前会话。"
+          ? "当前会话超出目标模型的上下文窗口，建议先压缩再切换。"
           : null,
       ].filter((detail): detail is string => detail !== null);
       const confirmed = await confirmDialog({
