@@ -1139,8 +1139,10 @@ async function awaitNewestOwnPost(page, selfId, text, beforeIds) {
 async function composerScope(editor) {
   if (!editor || typeof editor.locator !== 'function') return null;
   const scope = editor.locator('xpath=ancestor::*[.//*[(self::button or @role="button" or @role="menuitem")][normalize-space()="图片"]][1]');
-  if (await scope.count() !== 1) return null;
-  return scope;
+  if (await scope.count() === 1) return scope;
+  const parent = editor.locator('xpath=ancestor::*[2]');
+  if (await parent.count() === 1) return parent;
+  return editor;
 }
 function wrapFileInput(input) {
   return {
@@ -1202,8 +1204,8 @@ async function awaitComposerCleared(page, editor, timeout) {
   return false;
 }
 async function awaitComposerMediaReady(page, editor, expectedNew, timeout, beforeSrcs, beforeCount, beforeDelete) {
-  const scope = await composerScope(editor);
-  if (!scope) throw new Error('media-preview-timeout');
+  const scope = (await composerScope(editor)) || editor;
+  if (!scope || typeof scope.locator !== 'function') throw new Error('media-preview-timeout');
   const before = new Set(Array.isArray(beforeSrcs) ? beforeSrcs : []);
   const baseCount = Number.isFinite(beforeCount) ? beforeCount : before.size;
   const deadline = Date.now() + timeout;
