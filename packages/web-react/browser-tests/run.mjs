@@ -2470,6 +2470,15 @@ await check("T44 当前会话 unread=false 回执前的流式刷新只发送一�
 });
 
 // 主 harness 仍在:预览用例没有把它换成空页面(否则后续缺席断言全部恒真)。
+await check("T46 编程助手官方教程路由不再回落到故障 Ark 模型", async () => {
+  const probe = page.getByTestId("coding-assistant-route-probe");
+  await probe.waitFor({ state: "visible", timeout: 3000 });
+  const text = await probe.textContent();
+  if (text !== "CODING_ASSISTANT_ROUTE:glm-5.3-zai") {
+    throw new Error(`编程助手官方教程路由错误:${text}`);
+  }
+});
+
 await check("T45 中断 turn 刷新后仍显示 requestId/积分，空窗给出过程占位", async () => {
   const root = page.locator("#stopped-turn-root");
   await root.getByRole("status", { name: "已停止生成" }).first().waitFor({ state: "visible", timeout: 3000 });
