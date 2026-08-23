@@ -7110,13 +7110,18 @@ wait $!
       /const deadline = Date\.now\(\) \+ TURN_WAIT_TIMEOUT;/,
       'J5 deadline 必须实际使用 TURN_WAIT_TIMEOUT',
     )
-    const modelPin = journeySource.indexOf('const JOURNEY_MODEL_ID = "deepseek-v4-flash";')
+    const modelPin = journeySource.indexOf('const JOURNEY_MODEL_ID = "gpt-5.6-luna";')
     const modelTrigger = journeySource.indexOf('page.getByRole("button", { name: "选择对话模型" })')
     const modelItem = journeySource.indexOf('page.locator(`[data-model-id="${JOURNEY_MODEL_ID}"]`)')
     const modelApplied = journeySource.indexOf('modelTrigger.textContent()')
     const j2 = journeySource.indexOf('await step("J2 ')
     const j4 = journeySource.indexOf('await step("J4 ')
-    assert.ok(modelPin >= 0, 'journey 必须固定使用刚由最小功能核真 turn 验证过的 DeepSeek V4 Flash')
+    assert.ok(modelPin >= 0, 'journey 必须固定使用平台自有的 GPT-5.6 Luna')
+    assert.match(
+      journeySource,
+      /请读取刚上传的附件「\$\{probeName\}」第一行/,
+      'Luna 旅程必须用本轮原始文件名锁定当前附件，禁止从历史 uploads 猜文件',
+    )
     assert.ok(
       modelTrigger > modelPin && modelItem > modelTrigger && modelApplied > modelItem,
       'journey 必须经真实模型选择器选中固定模型并等待触发器回显',
