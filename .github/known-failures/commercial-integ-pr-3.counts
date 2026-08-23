@@ -8,8 +8,7 @@
 # # skipped 没有上界:integ gate 的 G2 判据硬钉死必须为 0。
 #
 # 注意:fail_max 比的是 TAP 汇总行 `# fail N`(**测试点**数),不是顶层 not ok 条数。
-#   本片实测:顶层 not ok 2 条,但 # fail = 3 个测试点。
-# 2026-07-26 首次登记,取值来源 = CI artifact commercial-integ-tap-pr-3
-#   (run 30204619386)。
-fail_max = 3
+# 2026-08-24 偿还 full migration suite 的腐化断言后,仅保留 retention
+#   反向对账门的 1 个失败测试点;基线同步收紧,防止新回归借旧额度漏过。
+fail_max = 1
 cancelled_max = 0
