@@ -1580,6 +1580,50 @@
           "assertion": "T12 Agent 卡按钮名单恰好为白名单(无冗余原始记录入口)且真实过程可见"
         }
       ]
+    },
+    {
+      "id": "INC-20260824-AUTOMATIC-WAIVER-LOOP",
+      "occurredAt": "2026-08-24",
+      "severity": "P1",
+      "symptom": "V5 selfhost 把 Codex 等待用户回答误判为 15 分钟无输出，并把 Grok 首事件前静默自动恢复到同一坏 native session；同一根请求可连续恢复最多 10 次，每次都生成免单站内信。根修将等待用户建模为显式状态、首个静默恢复重置 native session、第二次无进展持久熔断，并按恢复血缘合并免单通知而不合并逐 turn 退款账本。",
+      "rootFixCommit": "51cecd2a",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/codexAdapterTurnParity.test.ts",
+          "assertion": "两个并发 requestUserInput 只在最后一个回答后退出 waiting"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/sessionManagerIdleTimeout.test.ts",
+          "assertion": "明确等待用户时跳过 idle，但同一阈值在普通执行态仍触发"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
+          "assertion": "silent liveness recovery resets native state once, then pauses the durable lineage"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/turnWaiver.integ.test.ts",
+          "assertion": "one automatic-recovery lineage shares one receipt and later positive refund updates it"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/modelAuthorityBridge.test.ts",
+          "assertion": "native reset is accepted only on a Master-scheduled recovery job"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "fallback owner 对同血缘第二次静默超时熔断，不再推进 2..10"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T46 Codex 等待用户回答保持人类等待态，不显示模型卡住或自动免单"
+        }
+      ]
     }
   ]
 }

@@ -46,6 +46,7 @@
     { "id": "T42", "proves": "PR2 设置壳：默认关闭不盖住 harness；390 单列不横溢且能切到账户/用量/偏好/反馈/关于；1440 竖导航 168px；现有教程深链 section 仍是 preferences/account/feedback" },
     { "id": "T43", "proves": "390px 真 Chromium 触控首次向上拖动会立即解除贴底；随后消息高度增长不把视口弹回底部" },
     { "id": "T44", "proves": "当前会话 running 期间流式刷新不 mark-read；终态后只发送一次，unread=false 回执前再刷新不形成请求风暴" },
-    { "id": "T45", "proves": "中断 turn 只用服务端回显字段仍显示 requestId/积分与已产生正文；records_unpublished 空窗给出非正文占位且 fallback 有 usage 时仍显示 requestId/积分，不渲染红卡或重试" }
+    { "id": "T45", "proves": "中断 turn 只用服务端回显字段仍显示 requestId/积分与已产生正文；records_unpublished 空窗给出非正文占位且 fallback 有 usage 时仍显示 requestId/积分，不渲染红卡或重试" },
+    { "id": "T46", "proves": "真 Chromium 中 waiting_for_user wire 帧经 HarnessWebSocket→ChatSocket→reducer→真实 MessageList 后显示等待用户确认，不升级为无新数据、模型卡住或自动免单；同一轮仍可被 final 正常收尾" }
   ]
 }

@@ -1909,6 +1909,23 @@ await check("T29 自动重试统一显示模型繁忙与共享 n/10 进度；重
   }
 });
 
+await check("T46 Codex 等待用户回答保持人类等待态，不显示模型卡住或自动免单", async () => {
+  const cmid = await page.evaluate(() => window.__replayDrive.openTurn());
+  if (typeof cmid !== "string" || !cmid.startsWith("m-")) {
+    throw new Error(`等待用户证明轮未铸出 clientMessageId: ${JSON.stringify(cmid)}`);
+  }
+  await page.evaluate(() => window.__replayDrive.pushWaitingForUserStatus());
+  await replayRoot.getByText("等待你确认后继续", { exact: true }).waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
+  if (await replayRoot.getByText(/无新数据|处理时间较长|自动免单/).count()) {
+    throw new Error("等待用户状态被渲染成模型卡住或免单");
+  }
+  await page.evaluate(() => window.__replayDrive.pushRetrySuccess());
+  await waitForReplay((state) => !state.sending, "等待用户证明轮没有被 final 正常收尾");
+});
+
 await check("T35 Composer 是唯一 Stop 入口，停止结算中原按钮禁用且不重复提交", async () => {
   await page.evaluate(() => window.__setComposerState(true, false));
   const stop = primaryComposer.getByRole("button", { name: "停止", exact: true });

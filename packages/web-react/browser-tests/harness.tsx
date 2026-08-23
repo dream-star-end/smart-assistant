@@ -129,6 +129,8 @@ declare global {
       frameCount: () => number;
       /** Push the real retry-status frame for the current in-flight turn. */
       pushRetryStatus: () => void;
+      /** Push the explicit blocking-human turn status. */
+      pushWaitingForUserStatus: () => void;
       /** Complete the same turn with a live text block plus final terminator. */
       pushRetrySuccess: () => void;
       /** Reproduce page1 → WS N → page2(N) during durable journal hydration. */
@@ -213,6 +215,7 @@ window.__replayDrive = {
   pushRemainingFrames: () => 0,
   frameCount: () => 0,
   pushRetryStatus: () => {},
+  pushWaitingForUserStatus: () => {},
   pushRetrySuccess: () => {},
   runDurableOverlap: async () => {
     throw new Error("durable overlap probe 未挂载");
@@ -1272,6 +1275,19 @@ createRoot(document.getElementById("chat-entry-ux-root")!).render(
       }
       // 真 wire → HarnessWebSocket → ChatSocket.dispatch → reducer → MessageList footer。
       live().deliver(legacyRetryStatusFrame(Date.now() + 1_000));
+    },
+    pushWaitingForUserStatus: () => {
+      const session = replaySocket.sessions.get(REPLAY_SESSION_ID);
+      if (!session || !session._sendingInFlight) {
+        throw new Error("waiting_for_user 注入前没有真实在途 turn");
+      }
+      live().deliver({
+        type: "outbound.turn_status",
+        sessionKey: `agent:${REPLAY_AGENT_ID}:webchat:dm:${REPLAY_SESSION_ID}`,
+        channel: "webchat",
+        peer: { id: REPLAY_SESSION_ID, kind: "dm" },
+        status: "waiting_for_user",
+      });
     },
     pushRetrySuccess: () => {
       if (!activeClientMessageId) throw new Error("retry success 注入前缺 clientMessageId");
