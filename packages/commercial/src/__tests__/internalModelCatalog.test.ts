@@ -20,6 +20,7 @@ import { Readable } from "node:stream";
 import { describe, test } from "node:test";
 
 import { matchBridgeApiAllowlist, matchCommercialContainerApiProxy } from "@openclaude/gateway";
+import { DEFAULT_CODEX_ENGINE_MODEL } from "@openclaude/protocol";
 
 import { hashSecret, type ContainerIdentityRepo } from "../auth/containerIdentity.js";
 import type { UserModelAuthz } from "../auth/userModelAuthz.js";
@@ -37,6 +38,11 @@ import {
   makeModelCatalogHandler,
   type WireCatalogResponse,
 } from "../http/internalModelCatalog.js";
+import { PLATFORM_SEED_AGENT_MODEL_IDS } from "../marketplace/seedPlatformAgents.js";
+import {
+  PLATFORM_DEFAULT_MODEL,
+  PLATFORM_HIDDEN_REVIEWER_MODEL,
+} from "../platformDefaults.js";
 
 const SECRET = "a".repeat(64);
 const TOKEN = `oc-v3.7.${SECRET}`;
@@ -436,9 +442,15 @@ describe("internalModelCatalog — seed 完整性(全局断言)", () => {
   });
 
   test("seed 清单从既有权威派生(平台默认 + 隐藏审查员 + codex 队长 + 预设 agent)", () => {
-    assert.ok(PLATFORM_SEED_MODEL_IDS.includes("glm-5.3"));
-    assert.ok(PLATFORM_SEED_MODEL_IDS.length >= 4);
-    // 去重
-    assert.equal(new Set(PLATFORM_SEED_MODEL_IDS).size, PLATFORM_SEED_MODEL_IDS.length);
+    const expected = new Set([
+      PLATFORM_DEFAULT_MODEL,
+      PLATFORM_HIDDEN_REVIEWER_MODEL,
+      DEFAULT_CODEX_ENGINE_MODEL,
+      ...PLATFORM_SEED_AGENT_MODEL_IDS,
+    ]);
+
+    // 精确对齐所有权威来源,模型默认值切换时不应残留旧字面量或漏掉新 seed 依赖。
+    assert.deepEqual(new Set(PLATFORM_SEED_MODEL_IDS), expected);
+    assert.equal(PLATFORM_SEED_MODEL_IDS.length, expected.size, "seed 清单必须去重");
   });
 });
