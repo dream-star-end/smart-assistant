@@ -150,6 +150,12 @@ export function assertSettlementMatchesCanonical(input: {
     requestId?: string | null;
     engineBillings: unknown;
   } | null;
+  /** Exact historical authorities accepted only for an atomic canonical upgrade. */
+  acceptedPersistedAuthorities?: Array<{
+    billingAnchorId: string;
+    requestId?: string | null;
+    engineBillings: unknown;
+  }>;
 }): string {
   const canonicalHash = settlementAuthorityHash({
     billingAnchorId: input.canonicalAnchorId,
@@ -178,7 +184,11 @@ export function assertSettlementMatchesCanonical(input: {
     const persistedAuthorityHash = input.persistedAuthority
       ? settlementAuthorityHash(input.persistedAuthority)
       : null;
-    if (persistedAuthorityHash !== canonicalHash) {
+    const acceptedLegacy = persistedAuthorityHash === input.persistedHash
+      && (input.acceptedPersistedAuthorities ?? []).some((authority) =>
+        settlementAuthorityHash(authority) === input.persistedHash
+      );
+    if (persistedAuthorityHash !== canonicalHash && !acceptedLegacy) {
       throw new Error("lossless turn tape settlement hash mismatch");
     }
   }

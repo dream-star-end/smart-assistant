@@ -147,6 +147,39 @@ describe("assertSettlementMatchesCanonical", () => {
     );
   });
 
+  test("legacy continuation anchor upgrades only from an exact allowlisted authority", () => {
+    const legacy = { billingAnchorId: "srv-s-tail-t1", requestId: null, engineBillings: [] };
+    const legacyHash = settlementAuthorityHash(legacy);
+    const continuationCanonical = {
+      canonicalAnchorId: "srv-s-tail-t1-runtime-7",
+      canonicalRequestId: null,
+      canonicalBillings: [],
+    };
+    const expected = settlementAuthorityHash({
+      billingAnchorId: continuationCanonical.canonicalAnchorId,
+      requestId: null,
+      engineBillings: [],
+    });
+    assert.equal(assertSettlementMatchesCanonical({
+      ...continuationCanonical,
+      persistedHash: legacyHash,
+      persistedAuthority: legacy,
+      acceptedPersistedAuthorities: [legacy],
+    }), expected);
+    assert.throws(() => assertSettlementMatchesCanonical({
+      ...continuationCanonical,
+      persistedHash: legacyHash,
+      persistedAuthority: legacy,
+      acceptedPersistedAuthorities: [{ ...legacy, billingAnchorId: "srv-other" }],
+    }), /settlement hash mismatch/);
+    assert.throws(() => assertSettlementMatchesCanonical({
+      ...continuationCanonical,
+      persistedHash: legacyHash,
+      persistedAuthority: { ...legacy, requestId: "unexpected" },
+      acceptedPersistedAuthorities: [legacy],
+    }), /settlement hash mismatch/);
+  });
+
   test("matching envelope and persisted hash equal to canonical is accepted", () => {
     const hash = settlementAuthorityHash({
       billingAnchorId: canonical.canonicalAnchorId,

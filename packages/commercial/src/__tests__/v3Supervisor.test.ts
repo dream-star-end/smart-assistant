@@ -913,9 +913,11 @@ describe("provisionV3Container", () => {
     // 给 v5 用户容器(feat/v5-codex-oauth-egress B6)。
     const savedChannel = process.env.OC_RUNTIME_CHANNEL;
     const savedPromptQueue = process.env.OC_PROMPT_QUEUE_V1;
+    const savedRuntimeBatching = process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING;
     try {
       process.env.OC_RUNTIME_CHANNEL = "v5";
       process.env.OC_PROMPT_QUEUE_V1 = "1";
+      process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING = "1";
       const { docker, captured } = makeDocker();
       await provisionV3Container(
         {
@@ -930,6 +932,7 @@ describe("provisionV3Container", () => {
       );
       const env = captured.containersCreated[0]?.Env ?? [];
       assert.ok(env.includes("OC_CONTAINER_PREVIEW_ENABLED=1"));
+      assert.ok(env.includes("LOSSLESS_TURN_TAPE_RUNTIME_BATCHING=1"));
       assert.ok(env.includes("OC_PROMPT_QUEUE_V1=1"));
       assert.ok(env.includes("OC_USER_ID=779"));
       const binds = (captured.containersCreated[0]?.HostConfig?.Binds ?? []) as string[];
@@ -945,6 +948,8 @@ describe("provisionV3Container", () => {
       else process.env.OC_RUNTIME_CHANNEL = savedChannel;
       if (savedPromptQueue === undefined) delete process.env.OC_PROMPT_QUEUE_V1;
       else process.env.OC_PROMPT_QUEUE_V1 = savedPromptQueue;
+      if (savedRuntimeBatching === undefined) delete process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING;
+      else process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING = savedRuntimeBatching;
     }
   });
 
