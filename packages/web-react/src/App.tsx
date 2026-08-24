@@ -321,6 +321,8 @@ export function App() {
   const messageFeedbackTriggerRef = useRef<HTMLElement | null>(null);
   const [inboxOpen, setInboxOpen] = useState(false);
   const [mediaTasksOpen, setMediaTasksOpen] = useState(false);
+  // 「视频任务」入口门控:null=未知(保持可见),false=账号未开放(隐藏死入口)。
+  const [mediaTasksAvailable, setMediaTasksAvailable] = useState<boolean | null>(null);
   const [liveMediaJob, setLiveMediaJob] = useState<MediaGenerationJob | null>(null);
   const [repoModalOpen, setRepoModalOpen] = useState(false);
   const [manageOpen, setManageOpen] = useState(bootPanel === "manage");
@@ -1947,6 +1949,7 @@ export function App() {
       onRegenerate: regenerate,
       onContinue: () => send(CONTINUE_PROMPT),
       onTopUp: demo ? undefined : () => openSettings(),
+      onStartNewSession: demo ? undefined : newSession,
       onFeedback,
       onFirstTextPaint: demo
         ? undefined
@@ -2006,6 +2009,7 @@ export function App() {
       send,
       demo,
       openSettings,
+      newSession,
       onFeedback,
       retrySend,
       continueInterrupted,
@@ -2023,6 +2027,28 @@ export function App() {
     messageReplyTarget && messageReplyTarget.sessionId === activeId
       ? messageReplyTarget.quote
       : null;
+
+  // 视频任务能力探测:登录后拉一次。仅在服务端明确回答 available:false 时隐藏入口;
+  // 请求失败/未知保持可见(任务中心内部有「暂未开放」兜底),避免网络抖动误藏功能。
+  const mediaGateEnabled = !demo && !!user;
+  useEffect(() => {
+    if (!mediaGateEnabled) {
+      setMediaTasksAvailable(null);
+      return;
+    }
+    let cancelled = false;
+    api
+      .getMediaCapabilities(authRef.current)
+      .then((cap) => {
+        if (!cancelled) setMediaTasksAvailable(cap?.available !== false);
+      })
+      .catch(() => {
+        if (!cancelled) setMediaTasksAvailable(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [mediaGateEnabled]);
 
   // 已评回读：切会话/登录后拉一次 GET，填充已评态（重开会话时高亮 👍/👎、避免重复采集）。
   // 依赖用**派生布尔**（非 user 对象，refreshMe 换引用不误触发清空）+ activeId。切会话先清
@@ -2626,7 +2652,8 @@ export function App() {
     optimizerPending: demo ? 0 : optimizer.pendingCount,
     onOpenMarketplace: demo ? undefined : () => openMarketplace("browse"),
     onOpenTutorial: demo ? undefined : () => openTutorial(),
-    onOpenMediaTasks: demo ? undefined : () => setMediaTasksOpen(true),
+    onOpenMediaTasks:
+      demo || mediaTasksAvailable === false ? undefined : () => setMediaTasksOpen(true),
     theme,
     onCycleTheme: cycle,
     // 管理后台入口:仅平台超管(user.role === 'admin')可见,导航到 React 管理后台

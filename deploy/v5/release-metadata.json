@@ -127,7 +127,8 @@
     "0245_gpt56_family_half_xn",
     "0246_chat_project_board_bind",
     "0247_cursor_opus_48",
-    "0248_usage_board_project_attribution"
+    "0248_friction_error_location",
+    "0249_usage_board_project_attribution"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

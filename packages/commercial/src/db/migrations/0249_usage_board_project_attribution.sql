@@ -1,5 +1,5 @@
--- 0248 — usage_records immutable board-project attribution
--- order-dependency: 0247_cursor_opus_48
+-- 0249 — usage_records immutable board-project attribution
+-- order-dependency: 0248_friction_error_location
 -- Snapshot of WorkProject (tb_project.id) at settle time. Nullable.
 -- Existing rows stay NULL = 未归类. Later session moves must not rewrite these columns.
 

@@ -112,6 +112,10 @@ export function normalizeClientFrictionReport(
     ? body.outcome as FrictionOutcome : "failed";
   const traceId = safeId(body.trace_id);
   const sessionId = safeId(body.session_id);
+  const safeLine = (value: unknown): number | null =>
+    typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 10_000_000
+      ? Math.trunc(value)
+      : null;
   return {
     correlation: safeId(body.event_id) ?? traceId ?? safeId(body.request_id) ?? fallbackEventId,
     surface,
@@ -130,6 +134,13 @@ export function normalizeClientFrictionReport(
     traceId,
     sessionId,
     entitySlug: safeToken(body.entity_slug, 128, /^[a-z0-9][a-z0-9._-]*$/),
+    // 0248 有界错误定位:类名/bundle 基名/行列/指纹。仍然拒绝任何自由文本——
+    // 不匹配有界模式的值一律折叠为 null,message/stack 永远不会经此进入存储。
+    errorName: safeToken(body.error_name, 64, /^[A-Za-z0-9_.$-]{1,64}$/),
+    scriptRef: safeToken(body.script_ref, 120, /^[A-Za-z0-9._-]{1,120}$/),
+    lineNo: safeLine(body.line_no),
+    colNo: safeLine(body.col_no),
+    errorFingerprint: safeToken(body.error_fingerprint, 16, /^[a-f0-9]{1,16}$/),
   };
 }
 

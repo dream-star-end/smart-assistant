@@ -15,6 +15,7 @@ import {
   contextFamilyHasStandard,
   cursorFamilyHasFast,
   cursorFamilyHasStandard,
+  isModelDegraded,
   longContextCostConfirmationRequired,
   modelCostLabel,
   modelPickerRows,
@@ -44,10 +45,11 @@ import {
 } from './ui'
 
 /**
- * 模型是否被后端标注为降级(0108 provider 健康度)。前端类型宽松透传,运行时 narrowing。
+ * 模型是否被后端标注为降级(0108 provider 健康度)。判定权威在 cursorModelPicker
+ * (picker 排序与此共用),这里保留导出以稳定既有调用方/测试的 import 路径。
  */
 export function isDegraded(m: PublicModel): boolean {
-  return (m as { degraded?: unknown }).degraded === true
+  return isModelDegraded(m)
 }
 
 /**

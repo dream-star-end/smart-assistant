@@ -27,6 +27,8 @@ export type TurnErrorCta =
   | 'refresh'
   | 'switch_model'
   | 'relogin'
+  /** 上下文超限类:本会话无法继续本轮,引导到新会话延续目标(导航,非重发)。 */
+  | 'new_session'
   | 'none'
 
 export interface TurnErrorSemantics {
@@ -74,7 +76,7 @@ export const TURN_ERROR_TAXONOMY = {
   /** 上游请求超时(errorClassify 词族;历史前端码 upstream_timeout 归并于此)。 */
   upstream_timeout: { retryable: true, automaticRecovery: true, cta: 'retry' },
   network_error: { retryable: true, automaticRecovery: true, cta: 'retry' },
-  context_too_long: { retryable: false, cta: 'none' },
+  context_too_long: { retryable: false, cta: 'new_session' },
   bad_request: { retryable: false, cta: 'none' },
 
   // ── 引擎/平台执行 ────────────────────────────────────────
