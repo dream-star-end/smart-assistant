@@ -617,6 +617,69 @@ setTimeout(() => {
   }
 })
 
+test('late close of an abandoned Grok turn does not stop the next turn keepalive', { timeout: 10_000 }, async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'oc-grok-keepalive-late-'))
+  const hanging = path.join(dir, 'fake-grok-hanging.cjs')
+  await writeFile(hanging, `#!/usr/bin/env node
+setInterval(() => {}, 1000)
+`)
+  await chmod(hanging, 0o755)
+  const previousBin = process.env.OC_GROK_CLI_BIN
+  const previousHome = process.env.OPENCLAUDE_HOME
+  const previousGrace = process.env.OPENCLAUDE_GROK_SHUTDOWN_GRACE_MS
+  const previousFinal = process.env.OPENCLAUDE_GROK_SHUTDOWN_FINAL_DRAIN_MS
+  process.env.OC_GROK_CLI_BIN = hanging
+  process.env.OPENCLAUDE_HOME = path.join(dir, 'openclaude-home')
+  process.env.OPENCLAUDE_GROK_SHUTDOWN_GRACE_MS = '80'
+  process.env.OPENCLAUDE_GROK_SHUTDOWN_FINAL_DRAIN_MS = '80'
+  _internals.setProcessKeepaliveTestHooks({ intervalMs: 40 })
+  const adapter = new GrokAdapter(createOpts(dir))
+  adapter.setGrokRoute({
+    baseUrl: `http://127.0.0.1:18789/internal/v5/grok-relay/route/${TOKEN}/v1`,
+    routeToken: TOKEN,
+  })
+  adapter.on('error', () => {})
+  try {
+    const abandoned = adapter.submitTurn({
+      input: 'abandoned hang',
+      requestId: REQUEST_ID,
+      turnKey: TURN_KEY,
+      onEvent: () => {},
+      sessionTotals: { totalCostUSD: 0, turns: 0 },
+      toolUseIdToName: new Map(),
+    })
+    await abandoned.submitted
+    await waitUntil(() => adapter.isRunning, 3_000, 'first grok running')
+    adapter.interrupt()
+    await adapter.shutdown()
+
+    const live = adapter.submitTurn({
+      input: 'live hang',
+      requestId: REQUEST_ID,
+      onEvent: () => {},
+      sessionTotals: { totalCostUSD: 0, turns: 0 },
+      toolUseIdToName: new Map(),
+    })
+    await live.submitted
+    await waitUntil(() => adapter.isRunning, 3_000, 'second grok running')
+    const activity = { count: 0 }
+    adapter.on('activity', () => { activity.count += 1 })
+    const activityAt = adapter.lastActivityAt
+    await new Promise((resolve) => setTimeout(resolve, 180))
+    assert.ok(adapter.lastActivityAt > activityAt, 'live turn keepalive must keep ticking after abandoned close')
+    assert.ok(activity.count >= 2, `expected live keepalive emits, got ${activity.count}`)
+    live.end()
+    await adapter.shutdown()
+  } finally {
+    _internals.setProcessKeepaliveTestHooks(null)
+    restoreEnv('OC_GROK_CLI_BIN', previousBin)
+    restoreEnv('OPENCLAUDE_HOME', previousHome)
+    restoreEnv('OPENCLAUDE_GROK_SHUTDOWN_GRACE_MS', previousGrace)
+    restoreEnv('OPENCLAUDE_GROK_SHUTDOWN_FINAL_DRAIN_MS', previousFinal)
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
 test('reads the cleaned native Grok summary carrier from the new checkpoint', async () => {
   const root = await mkdtemp(join(tmpdir(), 'grok-handoff-'))
   const sessionId = '11111111-1111-4111-8111-111111111111'

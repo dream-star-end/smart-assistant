@@ -507,7 +507,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       ctx.stderr += chunk
     })
     proc.once('error', (err) => {
-      this.stopProcessKeepalive()
+      if (this.active === ctx) this.stopProcessKeepalive()
       cleanupPromptDir(ctx)
       // An abandoned turn has already been finalized and `active` has moved on;
       // surfacing this would report a later turn as failed.
@@ -516,7 +516,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       this.emit('error', err)
     })
     proc.once('close', (code, signal) => {
-      this.stopProcessKeepalive()
+      if (this.active === ctx) this.stopProcessKeepalive()
       cleanupPromptDir(ctx)
       // shutdown() may have already given up on this process and finalized
       // the turn, in which case `active` belongs to a later turn that this
@@ -758,7 +758,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
   }
 
   private finish(ctx: GrokTurnContext, end: GrokEvent | null): void {
-    this.stopProcessKeepalive()
+    if (this.active === ctx) this.stopProcessKeepalive()
     if (ctx.terminal) return
     const upstreamStopReason = typeof end?.stopReason === 'string' ? end.stopReason : null
     if (upstreamStopReason === 'cancelled') ctx.interrupted = true
@@ -811,7 +811,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
   }
 
   private forceEnd(ctx: GrokTurnContext): void {
-    this.stopProcessKeepalive()
+    if (this.active === ctx) this.stopProcessKeepalive()
     if (ctx.terminal) return
     ctx.terminal = true
     ctx.resolveSummary(null)
@@ -925,7 +925,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     proc: ChildProcessByStdio<null, Readable, Readable> | null,
     detail: string,
   ): void {
-    this.stopProcessKeepalive()
+    if (this.active === ctx) this.stopProcessKeepalive()
     cleanupPromptDir(ctx)
     ctx.abandoned = true
     if (proc) detachChildStdio(proc)

@@ -157,6 +157,17 @@ test('unknown in-flight stays unknown during dispatchInbound-before-submit', () 
   )
   assert.equal(
     _shouldInterruptUnknownInFlight({
+      runningClientMessageId: undefined,
+      admittingClientMessageId: 'm-user-1',
+      inFlightClientMessageId: 'm-user-1',
+      engineTurnCount: 0,
+      clientTurnCount: 0,
+    }),
+    false,
+    'real pre-submit window: counters still 0, admitting id is bound',
+  )
+  assert.equal(
+    _shouldInterruptUnknownInFlight({
       runningClientMessageId: 'm-user-1',
       inFlightClientMessageId: 'm-user-1',
       engineTurnCount: 1,

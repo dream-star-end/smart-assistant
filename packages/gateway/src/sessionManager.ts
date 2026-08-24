@@ -922,6 +922,10 @@ export interface AgentSession {
   /** Browser user-row id bound to the submit that currently owns session.lock.
    * Unlike _activeTurnCount, this never describes queued submits. */
   _runningClientMessageId?: string
+  /** Browser user-row id of the inbound currently inside dispatchInbound
+   * after getOrCreate and before that function's outer finally. Covers the
+   * mkdir/writeFile/parseDocument window where turn counters are still 0. */
+  _admittingClientMessageId?: string
 
   /** RFC-v5-durable-turn-dispatch §4 — per-session recent-terminal ring
    * (cap 8: clientMessageId → outcome). autoResumeFromHello 用 hello 携带的

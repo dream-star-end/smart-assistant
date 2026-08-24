@@ -15532,6 +15532,7 @@ export class Gateway {
             } else if (
               _shouldInterruptUnknownInFlight({
                 runningClientMessageId: session._runningClientMessageId,
+                admittingClientMessageId: session._admittingClientMessageId,
                 inFlightClientMessageId: inFlightCmid,
                 engineTurnCount: session._activeTurnCount,
                 clientTurnCount: session._activeClientTurnCount,
@@ -15682,6 +15683,8 @@ export class Gateway {
     }
     this._runtimeRecycleIngressActive += 1
     try {
+    let admitCmid: string | undefined
+    let admitSession: { _admittingClientMessageId?: string } | undefined
 
     // ── Idempotency dedup (read-only check): skip already-processed messages ──
     // Checked first so duplicates don't consume rate-limit budget
@@ -16154,6 +16157,11 @@ export class Gateway {
         ? { promptQueueExecutionFence }
         : {}),
     })
+    admitCmid = typeof safeClientMessageId === 'string' && safeClientMessageId !== ''
+      ? safeClientMessageId
+      : undefined
+    admitSession = session
+    if (admitCmid) session._admittingClientMessageId = admitCmid
     const wechatDispatchStarted = (frame as any)._wechatDispatchStarted
     if (typeof wechatDispatchStarted === 'function') {
       try {
@@ -17648,6 +17656,9 @@ export class Gateway {
     }
     } finally {
       this._runtimeRecycleIngressActive = Math.max(0, this._runtimeRecycleIngressActive - 1)
+      if (admitCmid && admitSession && admitSession._admittingClientMessageId === admitCmid) {
+        admitSession._admittingClientMessageId = undefined
+      }
     }
   }
 
@@ -18287,14 +18298,17 @@ export function _shouldPushTurnInterruptedFinal(
  */
 export function _shouldInterruptUnknownInFlight(input: {
   runningClientMessageId?: string | null
+  admittingClientMessageId?: string | null
   inFlightClientMessageId: string
   engineTurnCount?: number
   clientTurnCount?: number
 }): boolean {
   if (!input.inFlightClientMessageId) return false
   if (input.runningClientMessageId === input.inFlightClientMessageId) return false
+  if (input.admittingClientMessageId === input.inFlightClientMessageId) return false
   if (
     !input.runningClientMessageId
+    && !input.admittingClientMessageId
     && ((input.engineTurnCount ?? 0) > 0 || (input.clientTurnCount ?? 0) > 0)
   ) {
     return false
