@@ -636,6 +636,7 @@ describe('SkillStore — project overlay vs main-only shared', () => {
   it('stage agent sees overlay skill but not shared main-only skill', async () => {
     const { writeFile: wf } = await import('node:fs/promises')
     const { SKILL_AGENT_SCOPE_FILE, buildRunSkillStore } = await import('../skillStore.js')
+    const { commitProjectSkillOverlay } = await import('../projectContext.js')
     const board = '33333333-3333-4333-8333-333333333333'
     const shared = paths.sharedSkillsDir
     await writeSkillMd(shared, 'only-main', fm('only-main', 'main only'))
@@ -645,6 +646,20 @@ describe('SkillStore — project overlay vs main-only shared', () => {
     )
     const overlay = join(testHome, 'projects', board, 'skills')
     await writeSkillMd(overlay, 'proj-skill', fm('proj-skill', 'project overlay'))
+    const diskOnly = buildRunSkillStore({ agentId: 'stage-implement', projectId: board })
+    assert.equal(
+      (await diskOnly.list()).some((s) => s.name === 'proj-skill'),
+      false,
+      'overlay files without a matching skill ledger row must stay hidden',
+    )
+
+    const srcDir = join(testHome, 'skill-src', 'proj-skill')
+    await writeSkillMd(join(testHome, 'skill-src'), 'proj-skill', fm('proj-skill', 'project overlay'))
+    const committed = await commitProjectSkillOverlay(board, ['proj-skill'], 0, {
+      sourceFor: () => srcDir,
+    })
+    assert.equal(committed.ok, true)
+
     const stage = buildRunSkillStore({ agentId: 'stage-implement', projectId: board })
     const names = (await stage.list()).map((s) => s.name)
     assert.ok(names.includes('proj-skill'))
