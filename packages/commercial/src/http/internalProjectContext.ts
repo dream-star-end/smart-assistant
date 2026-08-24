@@ -32,7 +32,7 @@ import {
   setSecurityHeaders,
 } from "./util.js";
 
-export const PROJECT_CONTEXT_PATH = "/internal/v3/project-context";
+export { PROJECT_CONTEXT_PATH } from "@openclaude/protocol";
 
 export interface InternalProjectContextBody {
   userId: string;

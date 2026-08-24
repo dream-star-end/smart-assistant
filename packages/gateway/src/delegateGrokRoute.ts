@@ -10,7 +10,12 @@
  * decideLocalExecution and never reach this client.
  */
 
-import { isGrokEngineModel } from '@openclaude/protocol'
+import {
+  DELEGATE_GROK_ROUTE_MINT_PATH as MINT_PATH,
+  DELEGATE_GROK_ROUTE_RELEASE_PATH as RELEASE_PATH,
+  DELEGATE_GROK_ROUTE_RENEW_PATH as RENEW_PATH,
+  isGrokEngineModel,
+} from '@openclaude/protocol'
 import { request as undiciRequest } from 'undici'
 
 /**
@@ -38,10 +43,6 @@ export function delegateGrokMintModelId(args: {
   const model = args.canonicalModel || args.requestedModel || args.agentModel || undefined
   return isGrokEngineModel(model) ? model : undefined
 }
-
-const MINT_PATH = '/internal/v5/delegate/grok-route/mint'
-const RELEASE_PATH = '/internal/v5/delegate/grok-route/release'
-const RENEW_PATH = '/internal/v5/delegate/grok-route/renew'
 
 const MINT_TIMEOUT_MS = 10_000
 const RENEW_RELEASE_TIMEOUT_MS = 5_000

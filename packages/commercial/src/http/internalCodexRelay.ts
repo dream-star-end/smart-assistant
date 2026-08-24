@@ -63,7 +63,9 @@ import {
 } from '../billing/imageBilling.js'
 import { InsufficientCreditsError as LedgerInsufficientCreditsError } from '../billing/ledger.js'
 
-export const CODEX_RELAY_PREFIX = '/internal/v3/codex-relay'
+import { CODEX_RELAY_PREFIX } from '@openclaude/protocol'
+
+export { CODEX_RELAY_PREFIX }
 export const CODEX_UPSTREAM_AUTH_HEADER = 'x-openclaude-upstream-authorization'
 
 /** official_oauth 数据面的专用上游常量(方案 A3d/B5):代码内固定,不依赖

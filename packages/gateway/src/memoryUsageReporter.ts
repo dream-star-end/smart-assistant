@@ -1,3 +1,4 @@
+import { MEMORY_USAGE_PATH } from '@openclaude/protocol'
 import {
   type MemoryUsageEventRow,
   listPendingMemoryUsageEvents,
@@ -6,7 +7,7 @@ import {
 
 import { createLogger } from './logger.js'
 
-export const MEMORY_USAGE_REPORT_PATH = '/internal/v3/memory-usage'
+export const MEMORY_USAGE_REPORT_PATH = MEMORY_USAGE_PATH
 const BATCH_SIZE = 100
 const INTERVAL_MS = 30_000
 const TIMEOUT_MS = 10_000

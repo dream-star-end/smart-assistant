@@ -1,8 +1,7 @@
 /** Container gateway → commercial master rolling turn-lease client. */
 
+import { TURN_LEASE_RENEW_PATH as RENEW_PATH } from '@openclaude/protocol'
 import { request as undiciRequest } from 'undici'
-
-const RENEW_PATH = '/internal/v3/turn-lease/renew'
 const ATTEMPT_TIMEOUT_MS = 10_000
 const MAX_RESPONSE_BYTES = 32 * 1024
 

@@ -31,7 +31,11 @@ import { fileURLToPath } from 'node:url'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
-import { DEFAULT_CODEX_ENGINE_MODEL, findRouteProviderForModel } from '@openclaude/protocol'
+import {
+  CODEX_TOKEN_REFRESH_PATH,
+  DEFAULT_CODEX_ENGINE_MODEL,
+  findRouteProviderForModel,
+} from '@openclaude/protocol'
 import { paths } from '@openclaude/storage'
 import { LOCAL_CATALOG_HEADER, getLocalCatalogToken } from './modelCatalogClient.js'
 import { resolveConnectorEndpoint } from './ocConnectorsClient.js'
@@ -46,7 +50,6 @@ const STDERR_CAP_BYTES = 16 * 1024
 const STDOUT_CAP_BYTES = 32 * 1024
 const LOCK_STALE_EXTRA_MS = 60_000
 const DEFAULT_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
-const CODEX_TOKEN_REFRESH_PATH = '/internal/v3/codex/token-refresh'
 const DEFAULT_REFRESH_TIMEOUT_MS = 3_000
 const MIN_REFRESH_TIMEOUT_MS = 500
 const MAX_REFRESH_TIMEOUT_MS = 8_000

@@ -22,9 +22,15 @@
  * `last_ws_activity` 何时被刷:
  *   1. provision 时初始化为 NOW()(v3supervisor.allocateBoundIpAndInsertRow)
  *   2. ensureRunning(uid) 命中 'running' 分支 → markV3ContainerActivity 刷新
- *   3. (TODO P1)bridge 内传输每 N 秒 debounce 写一次,避免长 ws 一直在使用却被误杀
- *      — MVP 接受"长 ws 单连超 30min 会被误杀"的窗口(用户重连即重 provision,
- *      数据全在 volume 里不丢);P1 接 telemetry 屏障再补。
+ *
+ * turn 级活跃屏障(还清 OC_IDLE_SWEEP_DISABLED 登记的债):
+ *   `last_ws_activity` 只反映 WS 层活跃,长 turn(容器内 agent 持续干活但用户
+ *   没发新帧)会被误判空闲。所以 stopAndRemove 之前先走 v5 换代同款
+ *   requestRuntimeRecycleDrain 三闸握手(ingress / activeTurnCount / durable inbox,
+ *   见 v3ensureRunning.ts):仅 accepted 才回收;busy(409)/ failed(503 / 超时 /
+ *   异常)一律 fail-closed 跳过,留给下个 tick。accepted 之后、stopAndRemove 之前
+ *   再重读一次 last_ws_activity 消 SELECT→drain 窗口的 TOCTOU(drain 最长 1.5s,
+ *   用户可能恰好在这窗口里重连刷活跃)。
  *
  * 不在本文件管:
  *   - mode='persistent' 健康巡检(MVP 没 mode,推迟到 P1 tickPersistentHealth)
@@ -43,8 +49,13 @@ import { getRuntimeChannel } from "../runtimeChannel.js";
 
 import {
   stopAndRemoveV3Container,
+  type V3ContainerStatus,
   type V3SupervisorDeps,
 } from "./v3supervisor.js";
+import {
+  requestRuntimeRecycleDrain,
+  type RuntimeRecycleDrainResult,
+} from "./v3ensureRunning.js";
 
 // ───────────────────────────────────────────────────────────────────────
 // 默认常量
@@ -80,6 +91,14 @@ export interface IdleSweepTickOptions {
   batchLimit?: number;
   /** logger,缺省静默 */
   logger?: IdleSweepLogger;
+  /**
+   * 测试钩子:覆盖 turn-drain 三闸握手(同 v3ensureRunning 的注入位)。
+   * 生产留空走真实 requestRuntimeRecycleDrain(依赖 deps.bridgeSecret 签 nonce)。
+   */
+  requestRuntimeRecycleDrain?: (
+    deps: V3SupervisorDeps,
+    status: V3ContainerStatus,
+  ) => Promise<RuntimeRecycleDrainResult>;
 }
 
 export interface IdleSweepTickResult {
@@ -97,6 +116,22 @@ export interface IdleSweepTickResult {
    * 慢导致 sweeper 多轮空跑。
    */
   racedWithMigration: number;
+  /**
+   * drain 三闸报 409(active_turn / drain_in_progress)而跳过的行数。
+   * 长 turn 在途是正常状态,不是错;容器留给下个 tick 再判。
+   */
+  drainBusy: number;
+  /**
+   * drain 握手失败(503 / 超时 / 网络异常 / bridgeSecret 缺失)而跳过的行数。
+   * fail-closed:读不到三闸就当"可能有在途工作",宁可漏杀不可误杀。
+   * 持续 > 0 说明容器侧 drain endpoint 不可达(旧 runtime / 网络故障),需排障。
+   */
+  drainFailed: number;
+  /**
+   * drain accepted 之后重读发现行已不满足回收条件(last_ws_activity 刷回 cutoff 内,
+   * 或行已不再 active)而跳过的行数 — SELECT→drain 窗口的 TOCTOU 消解。
+   */
+  recheckSkipped: number;
   /** 失败的行 + 原因(不抛,聚合返回) */
   errors: Array<{ containerId: number; error: string }>;
   /** tick 总耗时 ms(含 SELECT + 所有 stopAndRemove) */
@@ -125,7 +160,12 @@ export interface IdleSweepScheduler {
 
 interface StaleRow {
   id: number;
+  user_id: number;
+  bound_ip: string;
+  port: number;
   container_internal_id: string | null;
+  host_uuid: string | null;
+  last_ws_activity: Date;
 }
 
 /**
@@ -151,9 +191,20 @@ async function selectStaleRows(
   idleCutoffMin: number,
   batchLimit: number,
 ): Promise<StaleRow[]> {
-  const r = await pool.query<{ id: string; container_internal_id: string | null }>(
+  const r = await pool.query<{
+    id: string;
+    user_id: string;
+    bound_ip: string;
+    port: number;
+    container_internal_id: string | null;
+    host_uuid: string | null;
+    last_ws_activity: Date;
+  }>(
     // P1a 隔离:只扫本 channel 容器 —— v3 idle sweep 不得碰 v5 行(反之亦然)。
-    `SELECT id, container_internal_id
+    // user_id / host(bound_ip) / port / host_uuid 是 drain 握手的寻址字段
+    // (host() 去掉 INET ::text 自带的 /32 netmask,同 getV3ContainerStatus)。
+    `SELECT id, user_id, host(bound_ip) AS bound_ip, port, container_internal_id,
+            host_uuid, last_ws_activity
        FROM agent_containers c
       WHERE state = 'active'
         AND c.runtime_channel = $3::text
@@ -170,8 +221,35 @@ async function selectStaleRows(
   );
   return r.rows.map((row) => ({
     id: Number.parseInt(row.id, 10),
+    user_id: Number.parseInt(String(row.user_id), 10),
+    bound_ip: row.bound_ip,
+    port: Number(row.port),
     container_internal_id: row.container_internal_id,
+    host_uuid: row.host_uuid,
+    last_ws_activity: row.last_ws_activity,
   }));
+}
+
+/**
+ * TOCTOU 重读:drain accepted 之后、stopAndRemove 之前,确认该行仍满足回收条件。
+ * drain 握手最长 1.5s,窗口里用户可能恰好重连(markV3ContainerActivity 刷了
+ * last_ws_activity)或行被别的路径翻走 — 任一情况都放弃本轮回收。
+ */
+async function recheckStillStale(
+  pool: Pool,
+  containerId: number,
+  idleCutoffMin: number,
+): Promise<boolean> {
+  const r = await pool.query(
+    `SELECT 1
+       FROM agent_containers
+      WHERE id = $1::bigint
+        AND state = 'active'
+        AND last_ws_activity IS NOT NULL
+        AND last_ws_activity < NOW() - ($2::int * interval '1 minute')`,
+    [containerId, idleCutoffMin],
+  );
+  return (r.rowCount ?? 0) > 0;
 }
 
 // ───────────────────────────────────────────────────────────────────────
@@ -179,7 +257,7 @@ async function selectStaleRows(
 // ───────────────────────────────────────────────────────────────────────
 
 /**
- * 跑一轮 idle sweep:scan + 对每个 stale 行调 stopAndRemove。
+ * 跑一轮 idle sweep:scan + 对每个 stale 行 drain 三闸握手 → TOCTOU 重读 → stopAndRemove。
  *
  * 单行失败:catch 后塞 errors[],继续下一行(不抛,不影响 scheduler)。
  * SELECT 失败:throw(scheduler 把它记 error 后排下一次)。
@@ -191,11 +269,15 @@ export async function runIdleSweepTick(
   const idleCutoffMin = options.idleCutoffMin ?? DEFAULT_IDLE_CUTOFF_MIN;
   const batchLimit = options.batchLimit ?? DEFAULT_SWEEP_BATCH_LIMIT;
   const log = options.logger;
+  const drainRuntime = options.requestRuntimeRecycleDrain ?? requestRuntimeRecycleDrain;
 
   const startedAt = Date.now();
   const errors: IdleSweepTickResult["errors"] = [];
   let swept = 0;
   let racedWithMigration = 0;
+  let drainBusy = 0;
+  let drainFailed = 0;
+  let recheckSkipped = 0;
 
   const stale = await selectStaleRows(deps.pool, idleCutoffMin, batchLimit);
   log?.debug?.("[v3/idleSweep] scan", {
@@ -206,9 +288,65 @@ export async function runIdleSweepTick(
 
   for (const row of stale) {
     try {
+      // cid=NULL 的 stale 行是崩溃残留的 provisioning 孤儿(合法在途窗口只有 15s,
+      // 撑不到 30min cutoff):容器从未建成,不存在可 drain 的 runtime,也不可能有
+      // 在途 turn — 保持旧语义直接翻行(stopAndRemove 对 null cid 只标 vanished,
+      // 不进 docker)。若也走 drain,握手必 failed,孤儿行会永久漏清。
+      if (row.container_internal_id !== null) {
+        // 三闸握手:容器侧看 ingress / activeTurnCount / durable inbox 判定。
+        // 钩子异常与 503 同罪 fail-closed 归 failed — 单行绝不把 tick 打断。
+        let drainResult: RuntimeRecycleDrainResult;
+        try {
+          drainResult = await drainRuntime(deps, {
+            containerId: row.id,
+            userId: row.user_id,
+            boundIp: row.bound_ip,
+            port: row.port,
+            dockerContainerId: row.container_internal_id,
+            // drain 只用寻址字段;sweep 不做 docker inspect,state 按 active 行占位。
+            state: "running",
+            hostId: row.host_uuid,
+            lastWsActivity: row.last_ws_activity,
+          });
+        } catch (err) {
+          drainResult = "failed";
+          log?.warn?.("[v3/idleSweep] drain threw", {
+            containerId: row.id,
+            err: err instanceof Error ? err.message : String(err),
+          });
+        }
+        if (drainResult === "busy") {
+          // 长 turn 在途(409 active_turn / drain_in_progress)— 这正是本屏障
+          // 要保护的场景,跳过留给下个 tick。
+          drainBusy++;
+          log?.debug?.("[v3/idleSweep] skipped: drain busy (active turn)", {
+            containerId: row.id,
+          });
+          continue;
+        }
+        if (drainResult !== "accepted") {
+          drainFailed++;
+          log?.warn?.("[v3/idleSweep] skipped: drain failed", {
+            containerId: row.id,
+          });
+          continue;
+        }
+        // TOCTOU:drain 窗口里用户可能重连刷了 last_ws_activity — 重读兜住。
+        if (!(await recheckStillStale(deps.pool, row.id, idleCutoffMin))) {
+          recheckSkipped++;
+          log?.debug?.("[v3/idleSweep] skipped: activity refreshed during drain", {
+            containerId: row.id,
+          });
+          continue;
+        }
+      }
       const ok = await stopAndRemoveV3Container(
         deps,
-        { id: row.id, container_internal_id: row.container_internal_id },
+        {
+          id: row.id,
+          container_internal_id: row.container_internal_id,
+          host_uuid: row.host_uuid,
+        },
         STOP_TIMEOUT_SEC,
         { requireNoOpenMigration: true },
       );
@@ -232,16 +370,31 @@ export async function runIdleSweepTick(
   }
 
   const durationMs = Date.now() - startedAt;
-  if (stale.length > 0 || errors.length > 0 || racedWithMigration > 0) {
+  if (
+    stale.length > 0 || errors.length > 0 || racedWithMigration > 0 ||
+    drainBusy > 0 || drainFailed > 0 || recheckSkipped > 0
+  ) {
     log?.info?.("[v3/idleSweep] tick done", {
       scanned: stale.length,
       swept,
       racedWithMigration,
+      drainBusy,
+      drainFailed,
+      recheckSkipped,
       errors: errors.length,
       durationMs,
     });
   }
-  return { scanned: stale.length, swept, racedWithMigration, errors, durationMs };
+  return {
+    scanned: stale.length,
+    swept,
+    racedWithMigration,
+    drainBusy,
+    drainFailed,
+    recheckSkipped,
+    errors,
+    durationMs,
+  };
 }
 
 // ───────────────────────────────────────────────────────────────────────

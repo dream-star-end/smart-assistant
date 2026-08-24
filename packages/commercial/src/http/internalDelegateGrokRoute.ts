@@ -33,16 +33,20 @@ import {
 import { type Logger, rootLogger } from '../logging/logger.js'
 import { REQUEST_ID_HEADER, ensureRequestId, isObj, setSecurityHeaders } from './util.js'
 
-export const DELEGATE_GROK_ROUTE_MINT_PATH = '/internal/v5/delegate/grok-route/mint'
-export const DELEGATE_GROK_ROUTE_RELEASE_PATH = '/internal/v5/delegate/grok-route/release'
-export const DELEGATE_GROK_ROUTE_RENEW_PATH = '/internal/v5/delegate/grok-route/renew'
+// 路径常量与例外判定收敛在 protocol 内部路由注册表(internalRoutes.ts);此处
+// re-export 保持既有 import 面(forwarder / index.ts / 测试)不变。
+import {
+  DELEGATE_GROK_ROUTE_MINT_PATH,
+  DELEGATE_GROK_ROUTE_RELEASE_PATH,
+  DELEGATE_GROK_ROUTE_RENEW_PATH,
+  isDelegateGrokRoutePath,
+} from '@openclaude/protocol'
 
-export function isDelegateGrokRoutePath(path: string): boolean {
-  return (
-    path === DELEGATE_GROK_ROUTE_MINT_PATH ||
-    path === DELEGATE_GROK_ROUTE_RELEASE_PATH ||
-    path === DELEGATE_GROK_ROUTE_RENEW_PATH
-  )
+export {
+  DELEGATE_GROK_ROUTE_MINT_PATH,
+  DELEGATE_GROK_ROUTE_RELEASE_PATH,
+  DELEGATE_GROK_ROUTE_RENEW_PATH,
+  isDelegateGrokRoutePath,
 }
 
 const MAX_BODY_BYTES = 8 * 1024

@@ -10,6 +10,12 @@
  *       · 单行 stopAndRemove 抛 → errors 累计,其他行继续处理
  *       · last_ws_activity IS NULL 行被排除(不 sweep)
  *       · batchLimit:扫到的行被截到 limit
+ *   - turn-drain 三闸屏障(runtime-recycle-drain 握手):
+ *       · drain accepted → 正常回收
+ *       · drain busy(409 active_turn)→ 跳过不回收,drainBusy++
+ *       · drain failed / 钩子抛异常 → 跳过不抛,drainFailed++
+ *       · drain accepted 但 TOCTOU 重读发现活跃已刷新 → 跳过,recheckSkipped++
+ *       · cid=NULL 孤儿行 → 不 drain,保持旧语义直接翻行
  *   - startIdleSweepScheduler:
  *       · runOnceAlone 跑一次拿到 result
  *       · stop() 幂等且阻塞掉 timer
@@ -29,7 +35,9 @@ import {
   DEFAULT_IDLE_CUTOFF_MIN,
   DEFAULT_IDLE_SWEEP_INTERVAL_MS,
   DEFAULT_SWEEP_BATCH_LIMIT,
+  type V3ContainerStatus,
 } from "../agent-sandbox/index.js";
+import type { RuntimeRecycleDrainResult } from "../agent-sandbox/v3ensureRunning.js";
 
 // ───────────────────────────────────────────────────────────────────────
 //  fake docker — 只需要 getContainer().stop() / .remove() 不抛
@@ -78,6 +86,8 @@ interface FakeRow {
   state: "active" | "vanished";
   port: number;
   container_internal_id: string | null;
+  /** 缺省 null(单机本地行);drain 跨 host 路径本文件不测(v3ensureRunning 侧已覆盖) */
+  host_uuid?: string | null;
   /** 允许 null,模拟"还没记过任何 ws 帧"的中间窗口 */
   last_ws_activity: Date | null;
   updated_at: Date;
@@ -126,10 +136,11 @@ class FakePool {
 
   async query(sql: string, params?: unknown[]): Promise<unknown> {
     const trimmed = String(sql).trim();
-    // SELECT id, container_internal_id FROM agent_containers WHERE state='active' ...
-    //   R6.11 Phase 2.C 起新带 NOT EXISTS agent_migrations predicate。
+    // 扫描 SELECT(drain 改造后带 user_id / bound_ip / port / host_uuid / last_ws_activity
+    //   寻址字段)。R6.11 Phase 2.C 起带 NOT EXISTS agent_migrations predicate。
     if (
-      /^SELECT id, container_internal_id\s+FROM agent_containers/i.test(trimmed) &&
+      /^SELECT id, user_id, host\(bound_ip\)/i.test(trimmed) &&
+      /FROM agent_containers/i.test(trimmed) &&
       /WHERE state = 'active'/i.test(trimmed)
     ) {
       this.selectCalls++;
@@ -155,9 +166,33 @@ class FakePool {
         rowCount: matching.length,
         rows: matching.map((r) => ({
           id: String(r.id),
+          user_id: String(r.user_id),
+          bound_ip: r.bound_ip,
+          port: r.port,
           container_internal_id: r.container_internal_id,
+          host_uuid: r.host_uuid ?? null,
+          last_ws_activity: r.last_ws_activity,
         })),
       };
+    }
+    // TOCTOU 重读:SELECT 1 FROM agent_containers WHERE id = $1 AND state='active'
+    //   AND last_ws_activity < cutoff — drain accepted 之后的二次确认。
+    if (
+      /^SELECT 1\s+FROM agent_containers/i.test(trimmed) &&
+      /WHERE id = \$1/i.test(trimmed) &&
+      /state = 'active'/i.test(trimmed)
+    ) {
+      const id = Number.parseInt(String(params?.[0]), 10);
+      const cutoffMin = Number(params?.[1]);
+      const cutoff = new Date(Date.now() - cutoffMin * 60_000);
+      const r = this.rows.find(
+        (x) =>
+          x.id === id &&
+          x.state === "active" &&
+          x.last_ws_activity !== null &&
+          x.last_ws_activity < cutoff,
+      );
+      return { rowCount: r ? 1 : 0, rows: r ? [{ "?column?": 1 }] : [] };
     }
     // UPDATE agent_containers SET state='vanished' WHERE id = $1
     //   R6.11 Phase 2.C 起可能带 NOT EXISTS guard(requireNoOpenMigration=true 时);
@@ -216,6 +251,12 @@ function makeStaleDate(minutesAgo: number): Date {
   return new Date(Date.now() - minutesAgo * 60_000);
 }
 
+/**
+ * turn-drain 三闸放行(容器无在途 turn)。真实握手要 bridgeSecret + 容器侧 HTTP,
+ * 单测一律注入钩子;想测 sweep 主流程的用例统一用这个 accepted 桩。
+ */
+const acceptDrain = async (): Promise<RuntimeRecycleDrainResult> => "accepted";
+
 // ───────────────────────────────────────────────────────────────────────
 //  runIdleSweepTick
 // ───────────────────────────────────────────────────────────────────────
@@ -244,9 +285,10 @@ describe("runIdleSweepTick", () => {
       last_ws_activity: makeStaleDate(45), // > 30min cutoff
     });
     const { docker, captured } = makeDocker();
-    const r = await runIdleSweepTick({
-      docker, pool: pool as unknown as Pool, image: TEST_IMAGE,
-    });
+    const r = await runIdleSweepTick(
+      { docker, pool: pool as unknown as Pool, image: TEST_IMAGE },
+      { requestRuntimeRecycleDrain: acceptDrain },
+    );
     assert.equal(r.scanned, 1);
     assert.equal(r.swept, 1);
     assert.equal(r.errors.length, 0);
@@ -313,9 +355,10 @@ describe("runIdleSweepTick", () => {
     pool.seed({ id: 12, user_id: 3, bound_ip: "172.30.10.3", state: "vanished", port: 18789, container_internal_id: "d-12", last_ws_activity: makeStaleDate(200) });
     pool.seed({ id: 13, user_id: 4, bound_ip: "172.30.10.4", state: "active", port: 18789, container_internal_id: "d-13", last_ws_activity: makeStaleDate(50)  });
     const { docker, captured } = makeDocker();
-    const r = await runIdleSweepTick({
-      docker, pool: pool as unknown as Pool, image: TEST_IMAGE,
-    });
+    const r = await runIdleSweepTick(
+      { docker, pool: pool as unknown as Pool, image: TEST_IMAGE },
+      { requestRuntimeRecycleDrain: acceptDrain },
+    );
     assert.equal(r.scanned, 2);
     assert.equal(r.swept, 2);
     assert.equal(r.errors.length, 0);
@@ -340,9 +383,10 @@ describe("runIdleSweepTick", () => {
     pool.seed({ id: 20, user_id: 1, bound_ip: "172.30.20.1", state: "active", port: 18789, container_internal_id: "d-20", last_ws_activity: makeStaleDate(60) });
     pool.seed({ id: 21, user_id: 2, bound_ip: "172.30.20.2", state: "active", port: 18789, container_internal_id: "d-21", last_ws_activity: makeStaleDate(90) });
     const { docker, captured } = makeDocker({ stopThrows: new Set(["d-20"]) });
-    const r = await runIdleSweepTick({
-      docker, pool: pool as unknown as Pool, image: TEST_IMAGE,
-    });
+    const r = await runIdleSweepTick(
+      { docker, pool: pool as unknown as Pool, image: TEST_IMAGE },
+      { requestRuntimeRecycleDrain: acceptDrain },
+    );
     assert.equal(r.scanned, 2);
     assert.equal(r.swept, 2);
     assert.equal(r.errors.length, 0);
@@ -366,9 +410,10 @@ describe("runIdleSweepTick", () => {
       stopThrows: new Set(["d-20"]),
       removeThrows: new Set(["d-20"]),
     });
-    const r = await runIdleSweepTick({
-      docker, pool: pool as unknown as Pool, image: TEST_IMAGE,
-    });
+    const r = await runIdleSweepTick(
+      { docker, pool: pool as unknown as Pool, image: TEST_IMAGE },
+      { requestRuntimeRecycleDrain: acceptDrain },
+    );
     assert.equal(r.scanned, 2);
     assert.equal(r.swept, 1);
     assert.equal(r.errors.length, 1);
@@ -391,7 +436,7 @@ describe("runIdleSweepTick", () => {
     const { docker, captured } = makeDocker();
     const r = await runIdleSweepTick(
       { docker, pool: pool as unknown as Pool, image: TEST_IMAGE },
-      { batchLimit: 1 },
+      { batchLimit: 1, requestRuntimeRecycleDrain: acceptDrain },
     );
     assert.equal(r.scanned, 1);
     assert.equal(r.swept, 1);
@@ -405,11 +450,174 @@ describe("runIdleSweepTick", () => {
     const { docker, captured } = makeDocker();
     const r = await runIdleSweepTick(
       { docker, pool: pool as unknown as Pool, image: TEST_IMAGE },
-      { idleCutoffMin: 5 },
+      { idleCutoffMin: 5, requestRuntimeRecycleDrain: acceptDrain },
     );
     assert.equal(r.scanned, 1);
     assert.equal(r.swept, 1);
     assert.deepEqual(captured.stopped, ["d-40"]);
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────
+//  turn-drain 三闸屏障(runtime-recycle-drain 握手)
+// ───────────────────────────────────────────────────────────────────────
+
+describe("runIdleSweepTick — turn-drain 屏障", () => {
+  test("drain accepted → 回收;钩子拿到正确的寻址字段", async () => {
+    const pool = new FakePool();
+    pool.seed({
+      id: 80, user_id: 800, bound_ip: "172.30.80.1",
+      state: "active", port: 18789,
+      container_internal_id: "d-80",
+      last_ws_activity: makeStaleDate(45),
+    });
+    const { docker, captured } = makeDocker();
+    const drained: V3ContainerStatus[] = [];
+    const r = await runIdleSweepTick(
+      { docker, pool: pool as unknown as Pool, image: TEST_IMAGE },
+      {
+        requestRuntimeRecycleDrain: async (_deps, status) => {
+          drained.push(status);
+          return "accepted";
+        },
+      },
+    );
+    assert.equal(r.swept, 1);
+    assert.equal(r.drainBusy, 0);
+    assert.equal(r.drainFailed, 0);
+    assert.equal(r.recheckSkipped, 0);
+    assert.deepEqual(captured.removed, ["d-80"]);
+    // drain 握手必须先于回收发生,且寻址字段来自 SELECT 出的行
+    assert.equal(drained.length, 1);
+    assert.equal(drained[0]!.containerId, 80);
+    assert.equal(drained[0]!.userId, 800);
+    assert.equal(drained[0]!.boundIp, "172.30.80.1");
+    assert.equal(drained[0]!.port, 18789);
+    assert.equal(drained[0]!.dockerContainerId, "d-80");
+    assert.equal(drained[0]!.hostId, null);
+  });
+
+  test("drain busy(409 active_turn)→ 跳过不回收,drainBusy++,行留给下个 tick", async () => {
+    const pool = new FakePool();
+    pool.seed({
+      id: 81, user_id: 1, bound_ip: "172.30.81.1",
+      state: "active", port: 18789,
+      container_internal_id: "d-81",
+      last_ws_activity: makeStaleDate(120), // 长 turn:WS 层看着 idle,容器在干活
+    });
+    const { docker, captured } = makeDocker();
+    const r = await runIdleSweepTick(
+      { docker, pool: pool as unknown as Pool, image: TEST_IMAGE },
+      { requestRuntimeRecycleDrain: async () => "busy" },
+    );
+    assert.equal(r.scanned, 1);
+    assert.equal(r.swept, 0);
+    assert.equal(r.drainBusy, 1);
+    assert.equal(r.drainFailed, 0);
+    assert.equal(r.errors.length, 0);
+    // 不进 docker,行仍 active — 下个 tick 再判
+    assert.equal(captured.stopped.length, 0);
+    assert.equal(captured.removed.length, 0);
+    assert.equal(pool.rows[0]!.state, "active");
+  });
+
+  test("drain 返 failed(503 / 超时)→ fail-closed 跳过,drainFailed++", async () => {
+    const pool = new FakePool();
+    pool.seed({
+      id: 82, user_id: 1, bound_ip: "172.30.82.1",
+      state: "active", port: 18789,
+      container_internal_id: "d-82",
+      last_ws_activity: makeStaleDate(60),
+    });
+    const { docker, captured } = makeDocker();
+    const r = await runIdleSweepTick(
+      { docker, pool: pool as unknown as Pool, image: TEST_IMAGE },
+      { requestRuntimeRecycleDrain: async () => "failed" },
+    );
+    assert.equal(r.swept, 0);
+    assert.equal(r.drainFailed, 1);
+    assert.equal(r.errors.length, 0);
+    assert.equal(captured.removed.length, 0);
+    assert.equal(pool.rows[0]!.state, "active");
+  });
+
+  test("drain 钩子抛异常 → 与 failed 同罪跳过,不抛、不计 error,其他行继续", async () => {
+    const pool = new FakePool();
+    pool.seed({ id: 83, user_id: 1, bound_ip: "172.30.83.1", state: "active", port: 18789, container_internal_id: "d-83", last_ws_activity: makeStaleDate(90) });
+    pool.seed({ id: 84, user_id: 2, bound_ip: "172.30.83.2", state: "active", port: 18789, container_internal_id: "d-84", last_ws_activity: makeStaleDate(60) });
+    const { docker, captured } = makeDocker();
+    const r = await runIdleSweepTick(
+      { docker, pool: pool as unknown as Pool, image: TEST_IMAGE },
+      {
+        requestRuntimeRecycleDrain: async (_deps, status) => {
+          if (status.containerId === 83) throw new Error("tunnel exploded");
+          return "accepted";
+        },
+      },
+    );
+    assert.equal(r.scanned, 2);
+    assert.equal(r.swept, 1);
+    assert.equal(r.drainFailed, 1);
+    assert.equal(r.errors.length, 0, "drain 异常是跳过语义,不该进 errors");
+    assert.deepEqual(captured.removed, ["d-84"]);
+    assert.equal(pool.rows.find((x) => x.id === 83)!.state, "active");
+    assert.equal(pool.rows.find((x) => x.id === 84)!.state, "vanished");
+  });
+
+  test("TOCTOU:drain 窗口里 last_ws_activity 被刷新 → 重读后跳过,recheckSkipped++", async () => {
+    const pool = new FakePool();
+    pool.seed({
+      id: 85, user_id: 1, bound_ip: "172.30.85.1",
+      state: "active", port: 18789,
+      container_internal_id: "d-85",
+      last_ws_activity: makeStaleDate(45),
+    });
+    const { docker, captured } = makeDocker();
+    const r = await runIdleSweepTick(
+      { docker, pool: pool as unknown as Pool, image: TEST_IMAGE },
+      {
+        // 模拟用户恰好在 drain 握手期间重连:ensureRunning 刷了 last_ws_activity
+        requestRuntimeRecycleDrain: async () => {
+          pool.rows.find((x) => x.id === 85)!.last_ws_activity = new Date();
+          return "accepted";
+        },
+      },
+    );
+    assert.equal(r.scanned, 1);
+    assert.equal(r.swept, 0);
+    assert.equal(r.recheckSkipped, 1);
+    assert.equal(r.errors.length, 0);
+    assert.equal(captured.stopped.length, 0);
+    assert.equal(captured.removed.length, 0);
+    assert.equal(pool.rows[0]!.state, "active", "活跃已刷新的行绝不能被回收");
+  });
+
+  test("cid=NULL 孤儿行 → 不 drain(没有可握手的 runtime),保持旧语义直接翻行", async () => {
+    const pool = new FakePool();
+    pool.seed({
+      id: 86, user_id: 1, bound_ip: "172.30.86.1",
+      state: "active", port: 18789,
+      container_internal_id: null, // 崩溃残留:容器从未建成
+      last_ws_activity: makeStaleDate(60),
+    });
+    const { docker, captured } = makeDocker();
+    let drainCalls = 0;
+    const r = await runIdleSweepTick(
+      { docker, pool: pool as unknown as Pool, image: TEST_IMAGE },
+      {
+        requestRuntimeRecycleDrain: async () => {
+          drainCalls++;
+          return "failed";
+        },
+      },
+    );
+    assert.equal(drainCalls, 0, "cid=NULL 没有容器可 drain,不该发握手");
+    assert.equal(r.swept, 1);
+    assert.equal(r.drainFailed, 0);
+    // 没 docker 副作用(stopAndRemove 对 null cid 只翻行)
+    assert.equal(captured.stopped.length, 0);
+    assert.equal(captured.removed.length, 0);
+    assert.equal(pool.rows[0]!.state, "vanished");
   });
 });
 
@@ -436,7 +644,7 @@ describe("startIdleSweepScheduler", () => {
     const { docker, captured } = makeDocker();
     const sched = startIdleSweepScheduler(
       { docker, pool: pool as unknown as Pool, image: TEST_IMAGE },
-      { intervalMs: 9999, runOnStart: false },
+      { intervalMs: 9999, runOnStart: false, requestRuntimeRecycleDrain: acceptDrain },
     );
     try {
       const r = await sched.runOnce();
@@ -470,6 +678,7 @@ describe("startIdleSweepScheduler", () => {
         {
           intervalMs: 9999,
           runOnStart: true,
+          requestRuntimeRecycleDrain: acceptDrain,
           onTick: (r) => {
             observed = { scanned: r.scanned, swept: r.swept };
             resolve();

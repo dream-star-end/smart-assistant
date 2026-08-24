@@ -28,17 +28,17 @@ import { mkdir, open, readdir, readFile, rename, unlink } from 'node:fs/promises
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
-import type { ToolCalledEvent } from '@openclaude/protocol'
+import { SKILL_FEEDBACK_PATH, SKILL_USAGE_PATH, type ToolCalledEvent } from '@openclaude/protocol'
 
 import { eventBus, type GatewayEventBus } from './eventBus.js'
 import { createLogger } from './logger.js'
 
 const log = createLogger({ module: 'skillUsageReporter' })
 
-export const SKILL_USAGE_PATH = '/internal/v3/marketplace/skill-usage'
+export { SKILL_USAGE_PATH }
 
 /** 差评引用拉取端点(GET;供技能训练注入用户差评过的真实场景,见 fetchUserSkillFeedbackRefs)。 */
-export const SKILL_FEEDBACK_PATH = '/internal/v3/marketplace/skill-feedback'
+export { SKILL_FEEDBACK_PATH }
 
 /** 技能层:hub=市场上架;user=用户自建(私有,只喂训练)。与 master internalSkillUsage 契约一致。 */
 export type SkillUsageLayer = 'hub' | 'user'

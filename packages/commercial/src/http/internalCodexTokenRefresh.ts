@@ -145,7 +145,7 @@ import { HttpError, REQUEST_ID_HEADER, ensureRequestId, setSecurityHeaders } fro
 
 /** Path the container's reverse-RPC forwarder POSTs to. Mounted on both the
  *  plain self-host listener (18791) and the mTLS remote-host listener (18443). */
-export const CODEX_TOKEN_REFRESH_PATH = '/internal/v3/codex/token-refresh'
+export { CODEX_TOKEN_REFRESH_PATH } from '@openclaude/protocol'
 
 /** Body cap — codex's request params are tiny ({reason, previousAccountId}),
  *  but allow some slack for protocol drift. 4 KiB is generous. */
