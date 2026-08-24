@@ -38,7 +38,7 @@ import { modelHintAppliedTotal } from './metrics.js'
 import { persistRunContextSnapshot } from './runContextPersist.js'
 import { buildPromptContext } from './promptSlots.js'
 import { getPlatformPrompt } from './platformPrompts.js'
-import { resolveMcpMemoryEntry } from './mcpMemoryEntry.js'
+import { resolveMcpMemoryEntry, resolveMcpMemoryLaunch } from './mcpMemoryEntry.js'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 
 const overridesLog = createLogger({ module: 'codexLaunchOverrides' })
@@ -365,8 +365,8 @@ export async function buildCodexLaunchOverrides(
   // same as web-context/browser. mcp-memory below is the only remaining
   // codex-side MCP server, so the prompt must advertise it iff the entry that
   // will actually be registered resolves.
-  const mcpEntry = resolveMcpMemoryEntry(ctx.claudeCodePath)
-  const availableMcpTools = mcpEntry
+  const mcpLaunch = resolveMcpMemoryLaunch(ctx.claudeCodePath, { fallback: 'npx-tsx' })
+  const availableMcpTools = mcpLaunch
     ? [
         'skill_search', 'skill_list', 'skill_view', 'skill_save', 'skill_delete',
         'create_reminder', 'list_reminders', 'update_reminder', 'delete_reminder',
@@ -455,7 +455,7 @@ export async function buildCodexLaunchOverrides(
   let tokenContent: string | null = null
   let delegateContextFile: string | null = null
   let delegateContextContent: string | null = null
-  if (mcpEntry) {
+  if (mcpLaunch) {
     // v3 hardening: the gateway token NEVER lands in argv. Instead, we point
     // mcp-memory at a 0600 file via OPENCLAUDE_GATEWAY_TOKEN_FILE; the caller
     // writes ctx.gatewayToken into that file before spawn. mcp-memory
@@ -484,9 +484,9 @@ export async function buildCodexLaunchOverrides(
     }
     argvOverrides.push(
       '-c',
-      `mcp_servers.openclaude_memory.command=${tomlValue('npx')}`,
+      `mcp_servers.openclaude_memory.command=${tomlValue(mcpLaunch.command)}`,
       '-c',
-      `mcp_servers.openclaude_memory.args=${tomlValue(['tsx', mcpEntry])}`,
+      `mcp_servers.openclaude_memory.args=${tomlValue(mcpLaunch.args)}`,
       '-c',
       `mcp_servers.openclaude_memory.env=${tomlValue(mcpEnv)}`,
       '-c',

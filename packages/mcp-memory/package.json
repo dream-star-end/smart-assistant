@@ -11,7 +11,8 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "build:cli": "bash ./scripts/build-oc-memory-cli.sh"
+    "build:cli": "bash ./scripts/build-oc-memory-cli.sh",
+    "build:mcp": "bash ./scripts/build-oc-memory-mcp.sh"
   },
   "dependencies": {
     "@openclaude/storage": "*",

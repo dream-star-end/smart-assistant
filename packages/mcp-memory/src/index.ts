@@ -1082,5 +1082,14 @@ function toolError(msg: string) {
 }
 
 const transport = new StdioServerTransport()
-await server.connect(transport)
-process.stderr.write(`[mcp-memory] started for agent=${AGENT_ID}\n`)
+// No top-level await: the CJS bundle (dist/oc-memory-mcp.cjs) rejects it, and
+// the promise form behaves identically under tsx/ESM.
+server
+  .connect(transport)
+  .then(() => {
+    process.stderr.write(`[mcp-memory] started for agent=${AGENT_ID}\n`)
+  })
+  .catch((err: unknown) => {
+    process.stderr.write(`[mcp-memory] failed to start: ${String(err)}\n`)
+    process.exit(1)
+  })

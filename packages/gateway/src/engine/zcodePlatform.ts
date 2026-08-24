@@ -1,11 +1,11 @@
 import { chmodSync, existsSync, lstatSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
-import { dirname, isAbsolute, join, resolve } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 
 import { paths } from '@openclaude/storage'
 import { issueDelegateContextToken } from '../delegateContext.js'
-import { resolveMcpMemoryEntry } from '../mcpMemoryEntry.js'
+import { resolveMcpMemoryLaunch } from '../mcpMemoryEntry.js'
 
 export const ZCODE_MEMORY_MCP_TOOLS = [
   'skill_search',
@@ -95,11 +95,8 @@ export function createZcodePlatformArtifacts(
     const config: Record<string, unknown> = {}
     const advertisedMcpTools: string[] = []
 
-    const mcpEntry = resolveMcpMemoryEntry(input.claudeCodePath)
-    const trustedTsxCli = mcpEntry
-      ? resolve(dirname(mcpEntry), '../../../node_modules/tsx/dist/cli.mjs')
-      : null
-    if (mcpEntry && trustedTsxCli && existsSync(trustedTsxCli) && input.gatewayToken) {
+    const mcpLaunch = resolveMcpMemoryLaunch(input.claudeCodePath, { fallback: 'node-tsx' })
+    if (mcpLaunch && input.gatewayToken) {
       const tokenFile = join(contextDir, 'gateway-token')
       const delegateContextFile = join(contextDir, 'delegate-context')
       writePrivate(tokenFile, input.gatewayToken)
@@ -141,8 +138,8 @@ export function createZcodePlatformArtifacts(
         servers: {
           openclaude_memory: {
             type: 'stdio',
-            command: '/usr/local/bin/node',
-            args: [trustedTsxCli, mcpEntry],
+            command: mcpLaunch.command,
+            args: mcpLaunch.args,
             env,
           },
         },

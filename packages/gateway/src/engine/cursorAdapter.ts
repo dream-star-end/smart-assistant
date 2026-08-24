@@ -21,7 +21,7 @@ import type { EngineExternalBillingEvent, PartialSnapshot, PhantomSignals, Segme
 import { type EngineCreateOpts, registerEngine } from './registry.js'
 import { classifyRunError } from '../errorClassify.js'
 import { createLogger } from '../logger.js'
-import { resolveMcpMemoryEntry } from '../mcpMemoryEntry.js'
+import { type McpMemoryLaunch, resolveMcpMemoryLaunch } from '../mcpMemoryEntry.js'
 import { getPlatformPrompt } from '../platformPrompts.js'
 import { atomicWriteJsonFile, buildCursorEfficiencyHooks } from '../efficiencyHookConfig.js'
 import { detachChildStdio, killProcessGroup, shutdownTimeoutMs, waitForCloseWithin } from '../processGroupShutdown.js'
@@ -1198,7 +1198,7 @@ function validateCursorFinalPrompt(prompt: string, payloadBytes: number): void {
 }
 
 interface CursorMemoryMcpConfigInput {
-  entry: string
+  launch: McpMemoryLaunch
   tokenFile: string
   agentId: string
   projectId?: string
@@ -1212,7 +1212,6 @@ interface CursorMemoryMcpConfigInput {
 }
 
 function buildCursorMemoryMcpConfig(input: CursorMemoryMcpConfigInput): Record<string, unknown> {
-  const trustedTsxCli = resolve(dirname(input.entry), '../../../node_modules/tsx/dist/cli.mjs')
   const env: Record<string, string> = {
     OPENCLAUDE_AGENT_ID: input.agentId,
     ...(input.projectId ? { OPENCLAUDE_PROJECT_ID: input.projectId } : {}),
@@ -1238,8 +1237,8 @@ function buildCursorMemoryMcpConfig(input: CursorMemoryMcpConfigInput): Record<s
   return {
     mcpServers: {
       'openclaude-memory': {
-        command: '/usr/local/bin/node',
-        args: [trustedTsxCli, input.entry],
+        command: input.launch.command,
+        args: input.launch.args,
         env,
       },
     },
@@ -1424,7 +1423,9 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
 
     const contextDir = this.createContextDir(ctx)
     try {
-      const mcpEntry = resolveMcpMemoryEntry(this.opts.config.auth.claudeCodePath)
+      const mcpLaunch = resolveMcpMemoryLaunch(this.opts.config.auth.claudeCodePath, {
+        fallback: 'node-tsx',
+      })
       const platformResult = await buildPromptContext({
         agentId: this.opts.agentId,
         sessionKey: this.opts.sessionKey,
@@ -1432,7 +1433,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         provider: 'cursor',
         model: this.currentModel,
         repoSnapshot: repoSnapshot ?? undefined,
-        availableMcpTools: mcpEntry ? [...OPENCLAUDE_MEMORY_MCP_TOOLS] : [],
+        availableMcpTools: mcpLaunch ? [...OPENCLAUDE_MEMORY_MCP_TOOLS] : [],
         skillEvalExclude: this.opts.skillEvalExclude,
         skillEvalDraft: this.opts.skillEvalDraft,
         sessionId: this.opts.sessionId,
@@ -1460,7 +1461,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
       // explicit config env below; shell tools get non-secret agent routing.
       const env = buildCursorSpawnEnv(this.opts.agentId, this.opts.sessionKey)
 
-      if (mcpEntry) {
+      if (mcpLaunch) {
         const gatewayToken = this.opts.config.gateway.accessToken
         if (!gatewayToken) throw new Error('Cursor platform MCP gateway token is unavailable')
         const tokenFile = resolve(contextDir, 'gateway-token')
@@ -1468,7 +1469,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         writeFileSync(tokenFile, gatewayToken, { mode: 0o600 })
         chmodSync(tokenFile, 0o600)
         const mcpConfig = buildCursorMemoryMcpConfig({
-          entry: mcpEntry,
+          launch: mcpLaunch,
           tokenFile,
           agentId: this.opts.agentId,
           projectId: this.opts.projectId,

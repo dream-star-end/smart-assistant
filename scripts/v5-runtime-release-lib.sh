@@ -531,6 +531,15 @@ oc_hotcfg_finalize_release() {
     [ -s "$staging/packages/mcp-memory/dist/oc-memory.cjs" ] \
       || { oc_hotcfg__die "oc-memory CLI bundle missing after build"; return 1; }
   fi
+  # openclaude-memory MCP server:同款预编译 CJS,引擎适配器可 node 直启而非 tsx 解释
+  # (grok/cursor 每 turn、ccb/codex 每 spawn 各省 ~7s)。旧源无脚本则跳过,回滚兼容。
+  if [ -f "$staging/packages/mcp-memory/scripts/build-oc-memory-mcp.sh" ]; then
+    oc_hotcfg__log "build oc-memory MCP bundle"
+    ( cd "$staging" && bash packages/mcp-memory/scripts/build-oc-memory-mcp.sh >&2 ) \
+      || { oc_hotcfg__die "oc-memory MCP bundle failed"; return 1; }
+    [ -s "$staging/packages/mcp-memory/dist/oc-memory-mcp.cjs" ] \
+      || { oc_hotcfg__die "oc-memory MCP bundle missing after build"; return 1; }
+  fi
   # 产物阶段敏感扫描(node_modules 可能夹带 .pem 测试夹具 → 只扫源码顶层,node_modules 排除以免误杀依赖自带证书夹具)
   # 说明:敏感扫描针对**源码树被误纳入凭据**,node_modules 里第三方包自带的 *.pem 测试夹具非本仓凭据,
   # 扫描 node_modules 会大量误报;故 release 敏感扫描排除 node_modules(bundle 无 node_modules 不受影响)。

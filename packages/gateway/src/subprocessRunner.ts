@@ -25,7 +25,7 @@ import {
 import { decideEngineCwd } from './engineCwd.js'
 import { persistRunContextSnapshot } from './runContextPersist.js'
 import { buildPromptContext } from './promptSlots.js'
-import { resolveMcpMemoryEntry } from './mcpMemoryEntry.js'
+import { resolveMcpMemoryLaunch } from './mcpMemoryEntry.js'
 import type { ExecutionTarget } from './remoteTarget.js'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 import { type TerminalBackend, createBackend } from './terminalBackend.js'
@@ -1854,12 +1854,15 @@ export class SubprocessRunner extends EventEmitter {
 
       // ── Built-in: openclaude-memory (L1/L2/L3 learning loop) ──
       // Path resolution shared with codexLaunchOverrides so ccb / codex / app-server
-      // all point npx at the same bundled entry. Note: env construction below
+      // all launch the same bundled server (prebuilt CJS when the release built
+      // it, historical npx+tsx otherwise). Note: env construction below
       // is intentionally NOT shared (v3 subprocessRunner has tighter
       // OPENCLAUDE_HOME semantics — only forward when host process actually
       // set it; codex side passes empty-string default).
-      const mcpEntry = resolveMcpMemoryEntry(this.opts.config.auth.claudeCodePath)
-      if (mcpEntry) {
+      const mcpLaunch = resolveMcpMemoryLaunch(this.opts.config.auth.claudeCodePath, {
+        fallback: 'npx-tsx',
+      })
+      if (mcpLaunch) {
         const delegateContextFile = resolve(sessionDir, 'delegate-context')
         writeFileSync(
           delegateContextFile,
@@ -1873,8 +1876,8 @@ export class SubprocessRunner extends EventEmitter {
         this.delegateContextFile = delegateContextFile
         mcpServers['openclaude-memory'] = {
           type: 'stdio',
-          command: 'npx',
-          args: ['tsx', mcpEntry],
+          command: mcpLaunch.command,
+          args: mcpLaunch.args,
           env: {
             OPENCLAUDE_AGENT_ID: this.opts.agentId,
             ...(this.opts.projectId ? { OPENCLAUDE_PROJECT_ID: this.opts.projectId } : {}),

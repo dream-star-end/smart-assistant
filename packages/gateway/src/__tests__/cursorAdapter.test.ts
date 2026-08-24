@@ -899,7 +899,15 @@ for(const e of [
 
   test('builds an openclaude-memory-only MCP config with token-file and eval gates', () => {
     const config = _internals.buildCursorMemoryMcpConfig({
-      entry: '/opt/openclaude/packages/mcp-memory/src/index.ts',
+      launch: {
+        command: '/usr/local/bin/node',
+        args: [
+          '/opt/openclaude/node_modules/tsx/dist/cli.mjs',
+          '/opt/openclaude/packages/mcp-memory/src/index.ts',
+        ],
+        entry: '/opt/openclaude/packages/mcp-memory/src/index.ts',
+        bundled: false,
+      },
       tokenFile: '/tmp/openclaude-cursor-context-test/gateway-token',
       agentId: 'main',
       sessionKey: 'agent:main:webchat:dm:test',
