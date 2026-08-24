@@ -138,6 +138,9 @@ export async function acquireDelegateGrokRoute(args: {
     }
     const routeToken = parsed.routeToken
     const heartbeatMs = args.heartbeatMs ?? HEARTBEAT_INTERVAL_MS
+    // Master keeps delegate rows on a short lease (~10min); this heartbeat and
+    // every relay request re-extend it, so a crashed gateway lets the lease
+    // lapse within minutes instead of parking the account cap for days.
     // Hard cap: a leaked lease (caller crashes between mint and its finally)
     // must not slide the master TTL forever. 120 beats × 60s ≈ 2h, far above
     // any delegate idle timeout; release() clears the timer earlier.
@@ -175,8 +178,9 @@ export async function acquireDelegateGrokRoute(args: {
           heartbeat = null
         }
         // Bounded idempotent retry: a dropped cleanup would hold a durable
-        // grok_route_contexts row (7-day TTL) against the account cap.
-        // Never rejects — a finished turn must not fail on cleanup.
+        // grok_route_contexts row against the account cap until its short
+        // delegate lease lapses. Never rejects — a finished turn must not
+        // fail on cleanup.
         let lastErr: unknown = null
         for (let attempt = 0; attempt < 3; attempt += 1) {
           try {
@@ -202,6 +206,9 @@ export async function acquireDelegateGrokRoute(args: {
 
   if (mint.statusCode === 409) {
     return { ok: false, httpStatus: 409, reason: 'Grok 订阅账号并发已满,请稍后重试' }
+  }
+  if (mint.statusCode === 429) {
+    return { ok: false, httpStatus: 429, reason: '本容器并发 Grok 委派租约已达上限,请等待其他委派结束后重试' }
   }
   if (mint.statusCode === 503) {
     return { ok: false, httpStatus: 503, reason: errorText(mint) || '无可用 Grok 订阅账号' }

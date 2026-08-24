@@ -75,7 +75,11 @@ export type DelegateGrokRouteAllocation =
 
 export interface DelegateGrokRouteHandlerDeps {
   identityRepo: ContainerIdentityRepo
-  /** Throws AccountPoolBusyError when every enabled grok group is at capacity. */
+  /**
+   * Throws AccountPoolBusyError when every enabled grok group is at capacity,
+   * GrokDelegateLeaseLimitError when this container is over its delegate
+   * lease cap (mapped to 429 GROK_DELEGATE_LEASE_LIMIT).
+   */
   allocate: (input: {
     containerId: number
     userId: bigint
@@ -169,10 +173,26 @@ export function makeDelegateGrokRouteHandler(
           ...(raw.sessionId !== undefined ? { sessionId: raw.sessionId } : {}),
         })
       } catch (err) {
-        const busy = (err as { name?: string })?.name === 'AccountPoolBusyError'
-        if (busy) {
+        const errName = (err as { name?: string })?.name
+        if (errName === 'AccountPoolBusyError') {
           sendJson(res, 409, {
             error: { code: 'GROK_POOL_BUSY', message: 'grok subscription accounts are busy' },
+          })
+          return
+        }
+        // Per-container delegate lease cap (groups.ts): a mint-looping or
+        // leaking container must not fill the shared pool for everyone else.
+        if (errName === 'GrokDelegateLeaseLimitError') {
+          log.warn('delegate_grok_route_lease_limit', {
+            requestId,
+            userId: String(identity.userId),
+            containerId: identity.containerId,
+          })
+          sendJson(res, 429, {
+            error: {
+              code: 'GROK_DELEGATE_LEASE_LIMIT',
+              message: 'container already holds the maximum number of delegate grok routes',
+            },
           })
           return
         }
@@ -197,12 +217,13 @@ export function makeDelegateGrokRouteHandler(
         containerId: identity.containerId,
         modelId: raw.modelId,
       })
+      // Deliberately omit accountId/slotId: the gateway client only consumes
+      // baseUrl+routeToken (release/renew are token-scoped), and internal pool
+      // identifiers must not leak into containers.
       sendJson(res, 200, {
         ok: true,
         baseUrl: allocation.baseUrl,
         routeToken: allocation.token,
-        accountId: allocation.accountId,
-        slotId: allocation.slotId,
       })
       return
     }

@@ -21,4 +21,5 @@ packages/commercial/src/__tests__/channelMigration.integ.test.ts
 packages/commercial/src/__tests__/codexChannelPartition.integ.test.ts
 packages/commercial/src/__tests__/codexDisableDrift.integ.test.ts
 packages/commercial/src/__tests__/computeHostRevoke.integ.test.ts
+packages/commercial/src/__tests__/grokRouteLease.integ.test.ts
 packages/commercial/src/__tests__/leaderLease.integ.test.ts

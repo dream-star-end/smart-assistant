@@ -245,6 +245,7 @@ import {
   buildCodexTokenRefreshHandler,
 } from "./http/codexInternalAssembly.js";
 import {
+  MAX_DELEGATE_GROK_LEASES_PER_CONTAINER,
   createCodexRouteContextForModel,
   createGrokRouteContextForModel,
   expireCodexRouteContext,
@@ -1678,11 +1679,18 @@ export async function registerCommercial(
   // createCommercialCodexRoute 原 grok 分支的原样抽取:bridge(每帧铸 route)
   // 与下方 delegateGrokRouteHandler(容器本地 delegate turn 主动申请)必须走
   // 同一账号池、同一 grok_route_contexts durable 并发权威,不允许各自解释。
-  const allocateGrokRelayRoute = async ({ containerId, userId, modelId, sessionId }: {
+  const allocateGrokRelayRoute = async ({ containerId, userId, modelId, sessionId, origin }: {
     containerId: number;
     userId: bigint;
     modelId: string;
     sessionId?: string;
+    /**
+     * bridge(默认)= 浏览器 turn:7 天孤儿 TTL,计费终结帧显式 expire。
+     * delegate = 容器本地 delegate turn:无计费终结帧,走短心跳租约
+     * (GROK_DELEGATE_ROUTE_TTL_MS)+ per-container 并发限额,网关崩溃后
+     * 分钟级自愈,不再占满账号并发上限一周。
+     */
+    origin?: "bridge" | "delegate";
   }) => {
     // grok_route_contexts is the durable concurrency authority. Rebuild the
     // local scheduler mirror before every allocation so a browser disconnect,
@@ -1722,6 +1730,10 @@ export async function registerCommercial(
           groupId: group.id,
           runner: client,
           maxConcurrent: scheduler.maxConcurrent,
+          kind: origin ?? "bridge",
+          ...(origin === "delegate"
+            ? { maxDelegatePerContainer: MAX_DELEGATE_GROK_LEASES_PER_CONTAINER }
+            : {}),
         }));
       } catch (err) {
         scheduler.releaseCodexSlot(picked.account_id, picked.slotId);
@@ -2167,7 +2179,9 @@ export async function registerCommercial(
         process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS === "1"
           ? makeDelegateGrokRouteHandler({
               identityRepo,
-              allocate: allocateGrokRelayRoute,
+              // origin=delegate:短心跳租约 + per-container 限额(与浏览器 bridge
+              // 的 7 天孤儿 TTL 语义分离,见 allocateGrokRelayRoute 注释)。
+              allocate: (input) => allocateGrokRelayRoute({ ...input, origin: "delegate" }),
               release: async ({ routeToken, containerId, userId }) => {
                 const context = await resolveGrokRouteContext({ token: routeToken, containerId, userId });
                 if (!context) return false;
