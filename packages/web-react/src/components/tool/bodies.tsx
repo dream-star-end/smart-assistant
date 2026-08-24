@@ -6,7 +6,7 @@
  * format 层归一化为 native builtin/MCP 工具。
  */
 import { Sparkles, FileText } from "lucide-react";
-import type { ReactNode } from "react";
+import { useContext, type ReactNode } from "react";
 import { cn } from "../../lib/utils";
 import { SignedImg } from "../chat/media";
 import { Badge, Button } from "../ui";
@@ -14,7 +14,7 @@ import { ReminderStatusCard, renderReminderListCard } from "./memoryReminderCard
 import { renderSkillListCard, renderSkillSearchCard, renderSkillViewCard } from "./skillCards";
 import { renderDelegateFanoutCard } from "./delegateFanoutCard";
 import { renderMcpResourcesCard } from "./mcpResourceCards";
-import { useToolCardActions } from "./context";
+import { ToolBodyFullContext, ToolInspectOpenContext, useToolCardActions } from "./context";
 import { formatLiveActivityAction, mappedLiveActivityLabel } from "../../lib/chat/liveActivityLabel";
 import {
   asArr,
@@ -46,15 +46,57 @@ type BodyProps = { input: Input; tool: ToolLike };
  * 仅用 bg-code 这层极淡表面做区隔。
  */
 function Pre({ children, className }: { children: ReactNode; className?: string }) {
+  // 全文模式(详情列)不设 max-height:滚动交给面板容器,内容一屏到底。
+  const full = useContext(ToolBodyFullContext);
   return (
     <pre
       className={cn(
-        "mt-1.5 max-h-80 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-xs leading-relaxed text-fg",
+        "mt-1.5 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-xs leading-relaxed text-fg",
+        !full && "max-h-80",
         className,
       )}
     >
       {children}
     </pre>
+  );
+}
+
+/** 全文模式的安全上限:防单条超大 output 打爆渲染,不是产品截断。 */
+const FULL_TEXT_CAP = 200_000;
+
+/**
+ * 卡内截断点的「查看全文」入口。仅当上层(ToolCard)提供了绑定到本消息的
+ * inspect 回调时渲染;详情面板/独立挂载无 provider → 静默省略。
+ */
+function InspectHint() {
+  const open = useContext(ToolInspectOpenContext);
+  if (!open) return null;
+  return (
+    <button
+      type="button"
+      onClick={(e) => {
+        e.stopPropagation();
+        open();
+      }}
+      className="mt-1 self-start text-xs text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring"
+    >
+      在详情面板查看全文
+    </button>
+  );
+}
+
+/** 带截断上限的等宽文本块:全文模式放开上限;截断时附「查看全文」入口。 */
+function ClampedPre({ text, max }: { text: string; max: number }) {
+  const full = useContext(ToolBodyFullContext);
+  const limit = full ? FULL_TEXT_CAP : max;
+  const truncated = text.length > limit;
+  return (
+    <>
+      <Pre>
+        {truncated ? text.slice(0, limit) + "\n…" : text}
+      </Pre>
+      {truncated && <InspectHint />}
+    </>
   );
 }
 
@@ -93,7 +135,7 @@ function KvList({ obj, skip, maxValueLen = 240 }: { obj: Input; skip?: string[];
   );
 }
 
-/** 输出块：JSON 自动美化（< 4KB），过长夹断。 */
+/** 输出块：JSON 自动美化（< 4KB），过长夹断（全文模式放开）。 */
 function OutputBlock({ output, max = 1500 }: { output?: string | null; max?: number }) {
   if (!output) return null;
   let text = String(output);
@@ -104,7 +146,7 @@ function OutputBlock({ output, max = 1500 }: { output?: string | null; max?: num
       /* 保持原文 */
     }
   }
-  return <Pre>{text.length > max ? text.slice(0, max) + "\n…" : text}</Pre>;
+  return <ClampedPre text={text} max={max} />;
 }
 
 function extractImageGenerationPath(input: Input, output?: string | null): string {
@@ -129,15 +171,37 @@ function stripDuplicateImageGenerationOutput(output: string | null | undefined, 
 // ── builtin ───────────────────────────────────────────────────────────────
 
 const MAX_DIFF_LINES = 60;
+/** 全文模式的 diff 行数安全上限(渲染保护,不是产品截断)。 */
+const MAX_DIFF_LINES_FULL = 4000;
+
+/** diff 截断行:有 inspect 回调时整行可点(去详情列看全文),否则纯提示。 */
+function DiffTruncationRow() {
+  const open = useContext(ToolInspectOpenContext);
+  if (!open) return <div className="px-3 py-1 text-faint">… (diff 过长，已截断)</div>;
+  return (
+    <button
+      type="button"
+      onClick={(e) => {
+        e.stopPropagation();
+        open();
+      }}
+      className="block w-full px-3 py-1 text-left text-accent outline-none transition-colors hover:bg-hover/60 hover:underline focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+    >
+      … diff 过长，在详情面板查看全文
+    </button>
+  );
+}
 
 /** Edit 工具的加减行 diff。oldStr → 删除行（红），newStr → 新增行（绿）。 */
 function DiffView({ oldStr, newStr }: { oldStr: string; newStr: string }) {
+  const full = useContext(ToolBodyFullContext);
+  const maxLines = full ? MAX_DIFF_LINES_FULL : MAX_DIFF_LINES;
   const rows: { sign: "-" | "+"; text: string }[] = [];
   let truncated = false;
   const add = (sign: "-" | "+", str: string) => {
     if (!str) return;
     for (const line of str.split("\n")) {
-      if (rows.length >= MAX_DIFF_LINES) {
+      if (rows.length >= maxLines) {
         truncated = true;
         return;
       }
@@ -159,16 +223,17 @@ function DiffView({ oldStr, newStr }: { oldStr: string; newStr: string }) {
           {r.sign} {r.text}
         </div>
       ))}
-      {truncated && <div className="px-3 py-1 text-faint">… (diff 过长，已截断)</div>}
+      {truncated && <DiffTruncationRow />}
     </div>
   );
 }
 
 function BashBody({ input, tool }: BodyProps) {
+  const full = useContext(ToolBodyFullContext);
   // 展示层剥壳兜底:历史消息的 command 落库时可能带 /bin/bash -lc 包装(新帧已由
   // runner 剥好),先剥再进 oc 检测/写文件检测/展示。
   const rawCommand = stripShellWrapperForDisplay(asStr(input?.command));
-  const command = rawCommand.slice(0, 2000);
+  const command = rawCommand.slice(0, full ? FULL_TEXT_CAP : 2000);
   // oc-* 工具(文献检索/引用核验/…):若命令命中且输出可解析 → 渲染专门卡片,
   // 而非原始"$ 命令 + JSON"终端块。不认/出错 → 回落下方通用渲染。
   const ocCard = researchToolCard(command, tool);
@@ -282,11 +347,13 @@ function parseCodexFileChanges(input: Input): CodexFileChange[] | null {
 
 /** codex update 的 unified diff 按行着色(+绿 / -红 / 其余弱化),行视觉同 DiffView。 */
 function UnifiedDiffView({ diff }: { diff: string }) {
+  const full = useContext(ToolBodyFullContext);
+  const maxLines = full ? MAX_DIFF_LINES_FULL : MAX_DIFF_LINES;
   const lines = diff.replace(/\n$/, "").split("\n");
-  const truncated = lines.length > MAX_DIFF_LINES;
+  const truncated = lines.length > maxLines;
   return (
     <div className="mt-1.5 overflow-x-auto rounded-md border border-border font-mono text-xs leading-relaxed">
-      {lines.slice(0, MAX_DIFF_LINES).map((line, i) => (
+      {lines.slice(0, maxLines).map((line, i) => (
         <div
           key={`${i}-${line.slice(0, 24)}`}
           className={cn(
@@ -301,7 +368,7 @@ function UnifiedDiffView({ diff }: { diff: string }) {
           {line || " "}
         </div>
       ))}
-      {truncated && <div className="px-3 py-1 text-faint">… (diff 过长，已截断)</div>}
+      {truncated && <DiffTruncationRow />}
     </div>
   );
 }
@@ -320,12 +387,7 @@ function CodexFileChangesView({ changes, tool }: { changes: CodexFileChange[]; t
           ) : c.kind === "update" ? (
             c.diff && <UnifiedDiffView diff={c.diff} />
           ) : (
-            c.diff && (
-              <Pre>
-                {c.diff.slice(0, 1500)}
-                {c.diff.length > 1500 ? "\n…" : ""}
-              </Pre>
-            )
+            c.diff && <ClampedPre text={c.diff} max={1500} />
           )}
         </div>
       ))}
@@ -335,8 +397,10 @@ function CodexFileChangesView({ changes, tool }: { changes: CodexFileChange[]; t
 }
 
 function EditBody({ input, tool }: BodyProps) {
-  const oldStr = asStr(input?.old_string).slice(0, 3000);
-  const newStr = asStr(input?.new_string).slice(0, 3000);
+  const full = useContext(ToolBodyFullContext);
+  const strCap = full ? FULL_TEXT_CAP : 3000;
+  const oldStr = asStr(input?.old_string).slice(0, strCap);
+  const newStr = asStr(input?.new_string).slice(0, strCap);
   // codex apply_patch 形状(无 old/new_string,changes 数组)→ 结构化渲染;claude 原生不变。
   if (!oldStr && !newStr) {
     const changes = parseCodexFileChanges(input);
@@ -359,12 +423,7 @@ function ReadBody({ input, tool }: BodyProps) {
   return (
     <>
       {parts.length > 0 && <FileMeta>{parts.join(", ")}</FileMeta>}
-      {out && (
-        <Pre>
-          {out.slice(0, 2000)}
-          {out.length > 2000 ? "\n…" : ""}
-        </Pre>
-      )}
+      {out && <ClampedPre text={out} max={2000} />}
     </>
   );
 }
@@ -379,12 +438,7 @@ function WriteBody({ input, tool }: BodyProps) {
   const out = tool.output;
   return (
     <>
-      {content && (
-        <Pre>
-          {content.slice(0, 500)}
-          {content.length > 500 ? "\n…" : ""}
-        </Pre>
-      )}
+      {content && <ClampedPre text={content} max={500} />}
       {out && <StatusLine text={out.slice(0, 200)} error={tool.error} />}
     </>
   );
@@ -399,12 +453,7 @@ function GrepBody({ input, tool }: BodyProps) {
   return (
     <>
       {parts.length > 0 && <FileMeta>{parts.join(" · ")}</FileMeta>}
-      {out && (
-        <Pre>
-          {out.slice(0, 2000)}
-          {out.length > 2000 ? "\n…" : ""}
-        </Pre>
-      )}
+      {out && <ClampedPre text={out} max={2000} />}
     </>
   );
 }
@@ -414,12 +463,7 @@ function GlobBody({ input, tool }: BodyProps) {
   return (
     <>
       {input?.path && <FileMeta>{shortPath(input.path)}</FileMeta>}
-      {out && (
-        <Pre>
-          {out.slice(0, 2000)}
-          {out.length > 2000 ? "\n…" : ""}
-        </Pre>
-      )}
+      {out && <ClampedPre text={out} max={2000} />}
     </>
   );
 }

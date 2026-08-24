@@ -168,6 +168,46 @@ export type ManualReviewItem = {
   extra?: Record<string, unknown>
 }
 
+/** Unique people/sessions in manualReview. Duplicate asset-unmoved on an already-listed session does not add a person. */
+export function summarizeManualReview(items: readonly ManualReviewItem[]): {
+  rows: number
+  people: number
+  uniqueSessions: number
+  anonymousRows: number
+  duplicateSessionRows: number
+} {
+  const seen = new Set<string>()
+  let uniqueSessions = 0
+  let anonymousRows = 0
+  let duplicateSessionRows = 0
+  for (const item of items) {
+    const sid = item.sessionId?.trim()
+    if (!sid) {
+      anonymousRows += 1
+      continue
+    }
+    if (seen.has(sid)) {
+      duplicateSessionRows += 1
+      continue
+    }
+    seen.add(sid)
+    uniqueSessions += 1
+  }
+  return {
+    rows: items.length,
+    people: uniqueSessions + anonymousRows,
+    uniqueSessions,
+    anonymousRows,
+    duplicateSessionRows,
+  }
+}
+
+export type DriftReason = {
+  kind: string
+  detail: string
+  extra?: Record<string, unknown>
+}
+
 export type ProjectLayerPlan = {
   operationId: string
   targetBoardProjectId: string
@@ -195,7 +235,9 @@ export type ProjectLayerPlan = {
     manualReview: number
     actualApply: number
     actualManualReview: number
+    actualManualReviewRows: number
     drifted: boolean
+    driftReasons: DriftReason[]
   }
   cronImpact: Array<{
     jobId: string
@@ -561,13 +603,39 @@ export async function planProjectLayerMigration(opts: {
 
   const bindCount = opts.inventory.sessionMapping.bind_to_ocv5_chat?.ids?.length ?? 0
   const actualApply = moveIds.length
-  const actualManualReview = manualReview.length
+  const reviewSummary = summarizeManualReview(manualReview)
+  const actualManualReview = reviewSummary.people
+  const driftReasons: DriftReason[] = []
+  if (reviewSummary.duplicateSessionRows) {
+    driftReasons.push({
+      kind: 'manualReview_duplicate_session_rows',
+      detail: 'asset-unmoved (or other) rows that share a sessionId already counted in low/archived do not add people',
+      extra: {
+        rows: reviewSummary.rows,
+        people: reviewSummary.people,
+        duplicateSessionRows: reviewSummary.duplicateSessionRows,
+      },
+    })
+  }
   const drifted =
     bindCount >= AUTHORITATIVE_BIND_MIN &&
     (actualApply !== AUTHORITATIVE_DEFAULT_APPLY || actualManualReview !== AUTHORITATIVE_MANUAL_REVIEW)
   if (drifted) {
+    if (actualApply !== AUTHORITATIVE_DEFAULT_APPLY) {
+      driftReasons.push({
+        kind: 'apply_count',
+        detail: `apply ${actualApply} != sealed ${AUTHORITATIVE_DEFAULT_APPLY}`,
+      })
+    }
+    if (actualManualReview !== AUTHORITATIVE_MANUAL_REVIEW) {
+      driftReasons.push({
+        kind: 'manualReview_people',
+        detail: `manualReview people ${actualManualReview} != sealed ${AUTHORITATIVE_MANUAL_REVIEW}`,
+        extra: { rows: reviewSummary.rows, people: reviewSummary.people },
+      })
+    }
     risks.push(
-      `inventory_count_drift apply=${actualApply} expected=${AUTHORITATIVE_DEFAULT_APPLY} manualReview=${actualManualReview} expected=${AUTHORITATIVE_MANUAL_REVIEW} — abort apply`,
+      `inventory_count_drift apply=${actualApply} expected=${AUTHORITATIVE_DEFAULT_APPLY} manualReviewPeople=${actualManualReview} rows=${reviewSummary.rows} expectedPeople=${AUTHORITATIVE_MANUAL_REVIEW} — abort apply`,
     )
   }
 
@@ -609,7 +677,9 @@ export async function planProjectLayerMigration(opts: {
       manualReview: AUTHORITATIVE_MANUAL_REVIEW,
       actualApply,
       actualManualReview,
+      actualManualReviewRows: reviewSummary.rows,
       drifted,
+      driftReasons,
     },
     cronImpact,
     usageBackfill: {
@@ -835,7 +905,10 @@ export async function applyProjectLayerMigration(
         manifest.facadeCreate = { id: created.id }
         applied.push(op.id)
       } else if (op.op === 'bind_chat_facade') {
-        const id = op.chatProjectId || facadeId
+        const fromOp =
+          op.chatProjectId && op.chatProjectId !== op.boardProjectId ? op.chatProjectId : undefined
+        const fromLive = facadeId && facadeId !== op.boardProjectId ? facadeId : undefined
+        const id = fromOp || fromLive
         if (!id) throw new Error('facade_missing')
         const bound = await ports.bindChatProject(id, op.boardProjectId)
         facadeId = id
@@ -865,7 +938,14 @@ export async function applyProjectLayerMigration(
         }))
         applied.push(op.id)
       } else if (op.op === 'copy_memory_candidate') {
-        const content = await ports.readMemoryContent?.(op.slug, op.source, op.sha256)
+        let content: string | undefined
+        try {
+          content = await ports.readMemoryContent?.(op.slug, op.source, op.sha256)
+        } catch (err) {
+          const msg = (err as Error).message || ''
+          if (msg === 'memory_not_found' || msg.includes('ENOENT')) continue
+          throw err
+        }
         if (!content) continue
         const cand = await ports.createMemoryCandidate({ slug: op.slug, content })
         manifest.memoryCandidates.push({

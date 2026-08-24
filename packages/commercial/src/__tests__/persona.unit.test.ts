@@ -118,7 +118,7 @@ describe("assertPersona — 合法路径", () => {
     }
   });
 
-  test("手工拼合法 persona(全 9 keys + 全非空 string)通过", () => {
+  test("手工拼合法 persona(全 10 keys + 全非空 string)通过", () => {
     const p: Persona = {
       user_agent: "ua",
       x_stainless_arch: "arm64",
@@ -129,6 +129,7 @@ describe("assertPersona — 合法路径", () => {
       x_stainless_runtime_version: "v20.0.0",
       x_stainless_retry_count: "0",
       accept_language: "en-US,en;q=0.9",
+      timezone: "America/New_York",
     };
     assertPersona(p);
   });
@@ -201,11 +202,14 @@ describe("assertPersona — 非法路径必须抛 TypeError", () => {
 // ─── personaToHeaderPairs ───────────────────────────────────────────────
 
 describe("personaToHeaderPairs", () => {
-  test("9 对、全 kebab-case header 名", () => {
+  test("9 对、全 kebab-case header 名(timezone 不进 header)", () => {
     const p = generatePersona();
     const pairs = personaToHeaderPairs(p);
     assert.equal(pairs.length, 9);
     const names = pairs.map(([k]) => k);
+    // timezone 是 persona 字段但**不是**发送头(只在 proxy 侧改写日期用),
+    // 绝不能出现在注入头里。
+    assert.ok(!names.includes("timezone"));
     assert.deepEqual(
       [...names].sort(),
       [
@@ -233,6 +237,7 @@ describe("personaToHeaderPairs", () => {
       x_stainless_runtime_version: "RTV",
       x_stainless_retry_count: "RC",
       accept_language: "AL",
+      timezone: "America/New_York",
     };
     const map = new Map(personaToHeaderPairs(p));
     assert.equal(map.get("user-agent"), "UA-X");
@@ -244,5 +249,57 @@ describe("personaToHeaderPairs", () => {
     assert.equal(map.get("x-stainless-runtime-version"), "RTV");
     assert.equal(map.get("x-stainless-retry-count"), "RC");
     assert.equal(map.get("accept-language"), "AL");
+    // timezone 不进 header
+    assert.equal(map.get("timezone"), undefined);
+  });
+});
+
+// ─── timezone(反封复盘 2026-08)─────────────────────────────────────────────
+
+describe("generatePersona — timezone 与 accept_language 一致", () => {
+  const EXPECTED: Record<string, string> = {
+    "en-US,en;q=0.9": "America/New_York",
+    "en-GB,en;q=0.9": "Europe/London",
+    "zh-CN,zh;q=0.9,en;q=0.8": "Asia/Shanghai",
+    "ja-JP,ja;q=0.9,en;q=0.8": "Asia/Tokyo",
+    "de-DE,de;q=0.9,en;q=0.8": "Europe/Berlin",
+  };
+
+  test("100 次随机:timezone 恒与 accept_language 的期望映射一致", () => {
+    for (let i = 0; i < 100; i += 1) {
+      const p = generatePersona();
+      assert.equal(
+        p.timezone,
+        EXPECTED[p.accept_language],
+        `accept_language=${p.accept_language} 应映射 ${EXPECTED[p.accept_language]}, 实际 ${p.timezone}`,
+      );
+    }
+  });
+
+  test("timezone 是合法 IANA 名(Intl 可解析)", () => {
+    const p = generatePersona();
+    assert.doesNotThrow(() =>
+      new Intl.DateTimeFormat("en-US", { timeZone: p.timezone }).format(),
+    );
+  });
+});
+
+describe("assertPersona — 缺 timezone", () => {
+  test("缺 timezone key → 抛", () => {
+    const partial: Record<string, string> = {
+      user_agent: "ua",
+      x_stainless_arch: "arm64",
+      x_stainless_lang: "js",
+      x_stainless_os: "MacOS",
+      x_stainless_package_version: "0.81.0",
+      x_stainless_runtime: "node",
+      x_stainless_runtime_version: "v20.0.0",
+      x_stainless_retry_count: "0",
+      accept_language: "en-US,en;q=0.9",
+    };
+    assert.throws(
+      () => assertPersona(partial),
+      (err) => err instanceof TypeError && err.message.includes("timezone"),
+    );
   });
 });

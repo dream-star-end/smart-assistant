@@ -342,7 +342,10 @@ export class ProjectMemoryLedger {
       slug,
       contentSha256: prepared.sha256,
       fileExists: (f) => dir.candidateFileExists(f),
-      existingMatchesHash: (f) => f === hashedName && existingMatch,
+      existingMatchesHash: (f) =>
+        f === hashedName &&
+        existingMatch &&
+        pending.some((c) => c.contentSha256 === prepared.sha256),
       fallbackId: id,
     })
     const written = await dir.writeCandidate(slug, input.content, {

@@ -10,6 +10,7 @@
  */
 import { createContext, useContext } from "react";
 import type { ConnectorConfirmationDetail, ConnectorDecisionResult } from "../../lib/connectors";
+import type { ToolLike } from "./format";
 
 export type ToolCardActions = {
   /** 打开记忆中心（memory / archival / session_search 类）。 */
@@ -52,4 +53,36 @@ export const ChatInteractionContext = createContext<ChatInteraction>({});
 export function useChatInteraction(): ChatInteraction {
   return useContext(ChatInteractionContext);
 }
+
+/**
+ * 产物详情列(inspector)—— Codex 桌面版式的第三列:点击会话中的产物
+ * (工具卡/diff/输出等)在主消息流右侧弹出详情面板,展示未截断的完整内容。
+ *
+ * 注入哲学同上:App 提供 open 回调才渲染入口,无 provider(测试/独立挂载)静默降级。
+ * target 持消息对象引用 —— reducer 就地 mutate 同一对象,App 随 version 重渲时
+ * 面板自然读到最新字段,无需订阅第二套状态。
+ */
+export type ArtifactInspectTarget = { kind: "tool"; message: ToolLike };
+
+export type ArtifactInspect = {
+  open?: (target: ArtifactInspectTarget) => void;
+};
+
+export const ArtifactInspectContext = createContext<ArtifactInspect>({});
+
+export function useArtifactInspect(): ArtifactInspect {
+  return useContext(ArtifactInspectContext);
+}
+
+/**
+ * 卡内截断视图 → 「查看全文」的逐卡回调。由 ToolCard 绑定自己的 message 后提供,
+ * DiffView/OutputBlock 等截断点消费;详情面板内不提供(全文模式无需再跳)。
+ */
+export const ToolInspectOpenContext = createContext<(() => void) | null>(null);
+
+/**
+ * 全文渲染模式:详情面板置 true,工具体各截断上限(diff 行数/输出长度/max-height)
+ * 放开。消息流内保持 false,卡片依旧紧凑。
+ */
+export const ToolBodyFullContext = createContext<boolean>(false);
 

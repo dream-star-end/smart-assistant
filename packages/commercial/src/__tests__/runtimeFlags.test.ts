@@ -145,12 +145,13 @@ describe("runtimeFlags — reader throw 时 fail-open 到 DEFAULTS,不 cache", (
     assert.equal(__test_only_cache.size, 0, "failed read 不应 cache");
   });
 
-  test("phase6_account_uuid_enforce 同样 fail-open 到 'off'", async () => {
+  test("phase6_account_uuid_enforce 同样 fail-open 到 DEFAULTS(fail_open)", async () => {
     __setReaderForTest(async () => {
       throw new Error("PG timeout");
     });
     const v = await getPhase6AccountUuidEnforce();
-    assert.equal(v, "off");
+    // 反封复盘 2026-08:DEFAULTS.phase6_account_uuid_enforce 从 'off' 改 'fail_open'。
+    assert.equal(v, "fail_open");
     assert.equal(__test_only_cache.size, 0);
   });
 

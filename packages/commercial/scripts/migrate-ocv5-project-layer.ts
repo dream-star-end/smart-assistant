@@ -16,6 +16,7 @@ import {
 } from '../../storage/src/projectLayerMigrate.js'
 import {
   assertCanonicalReadyForApply,
+  containerToHostPath,
   fetchLiveSnapshot,
   makeApplyPorts,
   openLiveReadHandle,
@@ -23,6 +24,25 @@ import {
   writeManifestPath,
   applyArmed,
 } from '../src/projectLayerHostPorts.js'
+
+async function sha256MaybeTranslate(absPath: string): Promise<string> {
+  const attempts = [absPath]
+  try {
+    attempts.push(containerToHostPath(absPath))
+  } catch {
+    /* path is already host-rooted */
+  }
+  let last: unknown
+  for (const p of attempts) {
+    try {
+      const buf = await readFile(p)
+      return createHash('sha256').update(buf).digest('hex')
+    } catch (err) {
+      last = err
+    }
+  }
+  throw last instanceof Error ? last : new Error(`sha256_failed:${absPath}`)
+}
 
 function arg(argv: string[], name: string, fallback = ''): string {
   const i = argv.indexOf(name)
@@ -76,10 +96,7 @@ if (!snap.readonly) {
 const livePorts = portsFromSnapshot(snap)
 const ports = {
   ...livePorts,
-  async sha256File(absPath: string) {
-    const buf = await readFile(absPath)
-    return createHash('sha256').update(buf).digest('hex')
-  },
+  sha256File: sha256MaybeTranslate,
 }
 
 const plan = await planProjectLayerMigration({
@@ -97,7 +114,8 @@ if (!plan.usageBackfill.queried) {
 
 const counts = {
   applySessions: plan.defaultApplySessionIds.length,
-  manualReview: plan.manualReview.length,
+  manualReview: plan.expectedCounts.actualManualReview,
+  manualReviewRows: plan.expectedCounts.actualManualReviewRows,
   assets: plan.operations.filter((o) => o.op === 'create_asset').length,
   memory: plan.operations.filter((o) => o.op === 'copy_memory_candidate').length,
   skills: plan.operations.find((o) => o.op === 'skill_overlay'),
@@ -151,10 +169,7 @@ if (has(argv, '--apply')) {
     targetBoardProjectId: target,
     ports: {
       ...portsFromSnapshot(liveAgain),
-      async sha256File(absPath: string) {
-        const buf = await readFile(absPath)
-        return createHash('sha256').update(buf).digest('hex')
-      },
+      sha256File: sha256MaybeTranslate,
     },
     agentUid: 1000,
     agentGid: 1000,
@@ -164,21 +179,63 @@ if (has(argv, '--apply')) {
     console.error('apply precheck failed: board/facade')
     process.exit(2)
   }
+  const defer = arg(argv, '--defer-session')
+  if (defer) {
+    for (const op of applyPlan.operations) {
+      if (op.op === 'move_sessions') {
+        op.ids = op.ids.filter((id) => id !== defer)
+        op.expected = op.expected.filter((row) => row.id !== defer)
+      }
+      if (op.op === 'usage_backfill') {
+        op.sessionIds = op.sessionIds.filter((id) => id !== defer)
+        const keep = new Set(op.sessionIds)
+        const rows = applyPlan.usageBackfill.rows.filter(
+          (row) => keep.has(row.sessionId || '') || keep.has(row.parentSessionId || ''),
+        )
+        applyPlan.usageBackfill.rows = rows
+        applyPlan.usageBackfill.rowIds = rows.map((row) => row.id)
+        op.rowIds = applyPlan.usageBackfill.rowIds
+      }
+    }
+    applyPlan.defaultApplySessionIds = applyPlan.defaultApplySessionIds.filter((id) => id !== defer)
+    console.error(`defer session ${defer}: first op moves ${applyPlan.defaultApplySessionIds.length}`)
+  }
   const applyPorts = makeApplyPorts({
     boardProjectId: target,
     snapshot: liveAgain,
     script,
     inventory,
   })
-  const result = await applyProjectLayerMigration(applyPlan, applyPorts)
+  let result
+  try {
+    result = await applyProjectLayerMigration(applyPlan, applyPorts)
+  } catch (err) {
+    result = {
+      ok: false as const,
+      operationId: applyPlan.operationId,
+      applied: [],
+      createdAssetIds: [],
+      facadeId: applyPlan.live.facadeId,
+      error: (err as Error).message,
+      manifest: {
+        facadeCreate: null,
+        bind: null,
+        context: null,
+        memoryCandidates: [],
+        skillOverlay: null,
+      },
+      rollback: applyPlan.rollback,
+    }
+    console.error(`apply threw: ${result.error}`)
+  }
   const resultPath = outPath || writeManifestPath(`${applyPlan.operationId}-result`)
   await mkdir(dirname(resultPath), { recursive: true })
-  await writeFile(resultPath, JSON.stringify({ plan: applyPlan, result }, null, 2))
+  await writeFile(resultPath, JSON.stringify({ plan: applyPlan, result, deferred: defer || null }, null, 2))
   if (!result.ok) {
     console.error(`apply failed: ${result.error}`)
     process.exit(2)
   }
-  console.error(`apply ok operationId=${result.operationId} applied=${result.applied.length}`)
+  console.error(`apply ok operationId=${result.operationId} applied=${result.applied.length} deferred=${defer || 'none'}`)
   process.exit(0)
 }
 

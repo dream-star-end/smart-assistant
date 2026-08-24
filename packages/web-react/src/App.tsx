@@ -59,7 +59,13 @@ import {
   ResponseRatingProvider,
 } from "./components/chat/ResponseRating";
 import { MediaSignProvider } from "./components/chat/media";
-import { ChatInteractionContext, ToolCardActionsContext } from "./components/tool/context";
+import {
+  ArtifactInspectContext,
+  ChatInteractionContext,
+  ToolCardActionsContext,
+  type ArtifactInspectTarget,
+} from "./components/tool/context";
+import { InspectorPanel, InspectorPanelContent } from "./components/InspectorPanel";
 import { Sidebar } from "./components/Sidebar";
 import { ProjectSettingsDialog } from "./components/ProjectSettingsDialog";
 import { Alert, Sheet, Spinner, useConfirm, usePrompt } from "./components/ui";
@@ -83,6 +89,7 @@ import { genWsSessionId, useSessionList } from "./hooks/useSessionList";
 import { useChatProjects } from "./hooks/useChatProjects";
 import { useUnreadSessions } from "./hooks/useUnreadSessions";
 import { useSidebarWidth } from "./hooks/useSidebarWidth";
+import { useMdViewport } from "./hooks/useMdViewport";
 import { type UseChatSocket, useChatSocket } from "./hooks/useChatSocket";
 import { useInbox } from "./hooks/useInbox";
 import { useOptimizerPending } from "./hooks/useOptimizerPending";
@@ -313,6 +320,10 @@ export function App() {
   const [chatError, setChatError] = useState<ChatError | null>(null);
   const [imageAnnotationSource, setImageAnnotationSource] = useState<ImageAnnotationSource | null>(null);
   const [containerPreviewUrl, setContainerPreviewUrl] = useState<string | null>(null);
+  // 产物详情列(Codex 式第三列):选中产物是纯 UI 态(切会话/关面板即清),不进 ChatSocket。
+  // 桌面 md+ 内联第三列;窄屏用右侧 Sheet 抽屉,不硬挤三列。
+  const [inspectTarget, setInspectTarget] = useState<ArtifactInspectTarget | null>(null);
+  const isMdViewport = useMdViewport();
   // 面板深链：boot 读到 ?panel= 即以打开态初始化（工作区渲染后即呈现；未登录深链则
   // 登录后呈现）。打开/关闭经 useAppRoute 同步回 query。
   const [settingsOpen, setSettingsOpen] = useState(bootPanel === "settings");
@@ -620,6 +631,12 @@ export function App() {
     auth: demo ? null : auth,
   });
   const sidebarWidth = useSidebarWidth();
+
+  // 切会话/进出任务看板时清掉产物详情列:消息对象引用属于旧会话上下文,跨会话保留只会
+  // 展示与当前消息流无关的陈旧内容。
+  useEffect(() => {
+    setInspectTarget(null);
+  }, [activeId, boardOpen]);
   const [projectSettings, setProjectSettings] = useState<ChatProject | null>(null);
   const [ungroupedAssetsOpen, setUngroupedAssetsOpen] = useState(false);
 
@@ -1868,6 +1885,12 @@ export function App() {
     [demo, send, sending],
   );
 
+  // 产物详情列 open 回调:引用稳定,不随面板开合变化,避免打穿 MessageList 的 sig-memo。
+  const artifactInspect = useMemo(
+    () => ({ open: (t: ArtifactInspectTarget) => setInspectTarget(t) }),
+    [],
+  );
+
   // 发送失败重试：复用原消息 payload（含附件引用）走 WS service 既有发送收口原地重发；
   // model/teamMode/effort 由 socket 复用失败首发的 routing 快照,不读取当前偏好。
   const retrySend = useCallback(
@@ -2704,6 +2727,7 @@ export function App() {
     >
     <ToolCardActionsContext.Provider value={toolActions}>
     <ChatInteractionContext.Provider value={chatInteraction}>
+    <ArtifactInspectContext.Provider value={artifactInspect}>
     <ImageEditActionsContext.Provider value={imageEditActions}>
     {/* safe-px:横屏侧刘海安全区(竖屏为 0) */}
     <ProjectScopeProvider
@@ -3045,6 +3069,26 @@ export function App() {
         )}
       </main>
 
+      {/* 产物详情列(Codex 式第三列)。桌面:与 Sidebar|main 并列的内联 aside;
+          窄屏:右侧 Sheet 抽屉(共用 InspectorPanelContent)。任务看板占据 main 时不渲染。 */}
+      {!boardOpen && inspectTarget && isMdViewport && (
+        <InspectorPanel target={inspectTarget} onClose={() => setInspectTarget(null)} />
+      )}
+      <Sheet
+        open={!boardOpen && !!inspectTarget && !isMdViewport}
+        onOpenChange={(o) => {
+          if (!o) setInspectTarget(null);
+        }}
+        side="right"
+        srTitle="产物详情"
+        className="w-[min(92vw,26rem)] md:hidden"
+        overlayClassName="md:hidden"
+      >
+        {inspectTarget && (
+          <InspectorPanelContent target={inspectTarget} onClose={() => setInspectTarget(null)} />
+        )}
+      </Sheet>
+
       <AgentPicker
         open={pickerOpen}
         current={agent}
@@ -3343,6 +3387,7 @@ export function App() {
     </div>
     </ProjectScopeProvider>
     </ImageEditActionsContext.Provider>
+    </ArtifactInspectContext.Provider>
     </ChatInteractionContext.Provider>
     </ToolCardActionsContext.Provider>
     </MediaSignProvider>

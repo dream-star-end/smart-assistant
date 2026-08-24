@@ -230,6 +230,33 @@ export type SessionPinMode = 'off' | 'observe' | 'enforce'
 export const DEFAULT_MAX_CONCURRENT_PER_ACCOUNT = 10
 
 /**
+ * 反封复盘 2026-08 — 配额感知主动退避阈值(百分比)。
+ *
+ * 账号的 5h / 7d 滚动配额利用率(quota_5h_pct / quota_7d_pct,从 Anthropic 响应头
+ * 被动上报)达到/超过该阈值时,**直接从候选池剔除**(不是仅降权),让它歇到配额
+ * 窗口滚动恢复 —— 而不是一路把请求打到上游 429。反复撞限额是"规避限额"的封号
+ * 画像;主动退避把这个信号消掉。
+ *
+ * 与 computeAccountWeight 里的 quotaFactor(50→95% 线性降权)分工:降权是"少用",
+ * 这里是"到顶就不用"。阈值默认 95(留一点余量给 header 上报抖动),env 可调。
+ * NULL(未上报,如 codex/grok)不受影响 —— SQL 用 `IS NULL OR < 阈值`。
+ */
+export const DEFAULT_QUOTA_BACKOFF_PCT = 95
+
+/**
+ * 解析 `CLAUDE_ACCOUNT_QUOTA_BACKOFF_PCT`。只接受 1..100 的整数;非法回退 95。
+ * 设为 100 等于实质关闭主动退避(只有真正 100% 才剔除)。
+ */
+export function parseQuotaBackoffPctEnv(
+  raw: string | undefined = process.env.CLAUDE_ACCOUNT_QUOTA_BACKOFF_PCT,
+): number {
+  if (!raw || !/^[1-9]\d*$/.test(raw)) return DEFAULT_QUOTA_BACKOFF_PCT
+  const n = Number.parseInt(raw, 10)
+  if (n < 1 || n > 100) return DEFAULT_QUOTA_BACKOFF_PCT
+  return n
+}
+
+/**
  * 解析 `CLAUDE_ACCOUNT_MAX_CONCURRENT` 环境变量。
  *
  * 严格语义:只接受纯正整数字符串(如 `"10"`);`"10xyz"` / `"0"` / `"-1"` /
@@ -509,6 +536,11 @@ export interface SchedulerDeps {
    * 经 `sanitizeSlotLeaseTtl` 夹到 [max(CODEX_SESSION_MAX_MS,30min), max(同下界,24h)]。
    */
   slotLeaseTtlMs?: number
+  /**
+   * 配额感知主动退避阈值(百分比)。未传则读 `CLAUDE_ACCOUNT_QUOTA_BACKOFF_PCT`,
+   * 再 fallback `DEFAULT_QUOTA_BACKOFF_PCT`(95)。见 loadCandidates。
+   */
+  quotaBackoffPct?: number
 }
 
 /**
@@ -716,6 +748,8 @@ export class AccountScheduler {
   readonly slotLeaseTtlMs: number
   /** 单账号同时 in-flight 请求上限。 */
   readonly maxConcurrent: number
+  /** 配额感知主动退避阈值(百分比);利用率 ≥ 此值的账号剔出候选。 */
+  readonly quotaBackoffPct: number
 
   constructor(deps: SchedulerDeps) {
     this.health = deps.health
@@ -726,6 +760,13 @@ export class AccountScheduler {
     this.now = deps.now ?? (() => new Date())
     this.maxConcurrent = sanitizeMaxConcurrent(deps.maxConcurrent)
     this.slotLeaseTtlMs = sanitizeSlotLeaseTtl(deps.slotLeaseTtlMs)
+    this.quotaBackoffPct =
+      deps.quotaBackoffPct !== undefined &&
+      Number.isInteger(deps.quotaBackoffPct) &&
+      deps.quotaBackoffPct >= 1 &&
+      deps.quotaBackoffPct <= 100
+        ? deps.quotaBackoffPct
+        : parseQuotaBackoffPctEnv()
   }
 
   /**
@@ -1189,6 +1230,16 @@ export class AccountScheduler {
       params.push(provider === 'codex' ? getCodexAccountRuntimeChannel() : getRuntimeChannel())
       where.push(`runtime_channel = $${params.length}`)
     }
+    // 反封复盘 2026-08 — 配额感知主动退避:5h / 7d 利用率达到阈值的账号直接剔除候选,
+    // 歇到窗口滚动恢复(pct 由响应头回落),而不是被 WRH 低权重选中后一路打到 429。
+    // NULL(未上报)保留在池内。pin-hit 命中被剔除账号 → pickPinnedAccount 返 null →
+    // handlePinnedAccountUnavailable 走 ready→503 retry(不再把请求推到已耗尽账号)。
+    params.push(this.quotaBackoffPct)
+    const pctIdx = params.length
+    where.push(
+      `(quota_5h_pct IS NULL OR quota_5h_pct < $${pctIdx})`,
+      `(quota_7d_pct IS NULL OR quota_7d_pct < $${pctIdx})`,
+    )
     const res = await query<CandidateRow>(
       `SELECT id::text AS id, plan, health_score,
               quota_5h_pct, quota_7d_pct, subscription_end_at,
