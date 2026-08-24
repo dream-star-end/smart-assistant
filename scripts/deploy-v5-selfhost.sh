@@ -2170,6 +2170,19 @@ cmd_cutover() {
     || die "disarm 失败: committed marker 未确认写入。smoke 已通过,拒绝报告成功。"
   persist_selfhost_model_authority_cutover "$rel"
   sync_boot_scripts_from "$rel"
+  # 收尾 GC(镜像 deploy-v5.sh gc_releases/oc_hotcfg_gc 同款:仅告警,不回滚)。
+  # master release:引用感知 v5-release-gc.sh,keep 6;live/.prev-release/unit cwd/
+  # 容器 baseline bind 全在保护集,校验失败 rc=75 整轮安全跳过零删除。
+  # runtime tuple:oc_hotcfg_gc,history 最近 N 条 committed + env tuple + 容器 label 保护。
+  bash "$SCRIPT_DIR/v5-release-gc.sh" \
+    "$MASTER_RELEASES_ROOT" 6 \
+    "$MASTER_LIVE_LINK" "$MASTER_LIVE_LINK" "$MASTER_LIVE_LINK" \
+    "$MASTER_RELEASES_ROOT/.prev-release" \
+    "$V5_UNIT" "$V5_EGRESS_UNIT" "$V5_EGRESS_UNIT" \
+    '' '' '' 2>&1 | sed 's/^/  /' \
+    || cutover_clog "  ⚠ master release GC 失败/安全跳过(仅告警,不回滚)"
+  oc_hotcfg_gc "$V5_ENV" "$OC_HOTCFG_HISTORY" 2>&1 | sed 's/^/  /' \
+    || cutover_clog "  ⚠ runtime GC 失败(仅告警,不回滚)"
   cutover_clog "✓ --cutover 完成 live → $rel"
 }
 
