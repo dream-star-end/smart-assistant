@@ -932,6 +932,10 @@ describe("provisionV3Container", () => {
       assert.ok(env.includes("OC_CONTAINER_PREVIEW_ENABLED=1"));
       assert.ok(env.includes("OC_PROMPT_QUEUE_V1=1"));
       assert.ok(env.includes("OC_USER_ID=779"));
+      assert.ok(
+        !env.includes("OC_PROJECT_CONTEXT=1"),
+        "commercial/default master must not inject OC_PROJECT_CONTEXT",
+      );
       const binds = (captured.containersCreated[0]?.HostConfig?.Binds ?? []) as string[];
       assert.ok(binds.length > 0, "v5 容器仍需其它 bind(data/proj/codex volume 等)");
       assert.ok(
@@ -945,6 +949,41 @@ describe("provisionV3Container", () => {
       else process.env.OC_RUNTIME_CHANNEL = savedChannel;
       if (savedPromptQueue === undefined) delete process.env.OC_PROMPT_QUEUE_V1;
       else process.env.OC_PROMPT_QUEUE_V1 = savedPromptQueue;
+    }
+  });
+
+  test("selfhost master OC_PROJECT_CONTEXT=1 is forwarded into v5 container env", async () => {
+    const savedChannel = process.env.OC_RUNTIME_CHANNEL;
+    const savedPromptQueue = process.env.OC_PROMPT_QUEUE_V1;
+    const savedFlag = process.env.OC_PROJECT_CONTEXT;
+    try {
+      process.env.OC_RUNTIME_CHANNEL = "v5";
+      process.env.OC_PROMPT_QUEUE_V1 = "1";
+      process.env.OC_PROJECT_CONTEXT = "1";
+      const { docker, captured } = makeDocker();
+      await provisionV3Container(
+        {
+          docker,
+          pool: pool as unknown as Pool,
+          image: TEST_IMAGE,
+          selfHostId: TEST_HOST,
+          randomIp: () => "172.31.5.44",
+          randomSecret: fixedSecret("d".repeat(64)),
+        },
+        779,
+      );
+      const env = captured.containersCreated[0]?.Env ?? [];
+      assert.ok(
+        env.includes("OC_PROJECT_CONTEXT=1"),
+        "selfhost master flag must be forwarded into the user container",
+      );
+    } finally {
+      if (savedChannel === undefined) delete process.env.OC_RUNTIME_CHANNEL;
+      else process.env.OC_RUNTIME_CHANNEL = savedChannel;
+      if (savedPromptQueue === undefined) delete process.env.OC_PROMPT_QUEUE_V1;
+      else process.env.OC_PROMPT_QUEUE_V1 = savedPromptQueue;
+      if (savedFlag === undefined) delete process.env.OC_PROJECT_CONTEXT;
+      else process.env.OC_PROJECT_CONTEXT = savedFlag;
     }
   });
 
@@ -3643,6 +3682,7 @@ describe("provisionV3Container — per-host bridge gateway env injection", () =>
     assert.ok(env.includes(`OPENCLAUDE_TRUST_BRIDGE_IP=${V3_GATEWAY_IP}`));
     assert.ok(env.includes(`ANTHROPIC_BASE_URL=${V3_INTERNAL_PROXY_URL}`));
     assert.ok(!env.includes("OC_CONTAINER_PREVIEW_ENABLED=1"));
+    assert.ok(!env.includes("OC_PROJECT_CONTEXT=1"));
   });
 
   test("remote host + bridgeCidr=172.30.2.0/24(tk1)→ env 注入 172.30.2.1", async () => {

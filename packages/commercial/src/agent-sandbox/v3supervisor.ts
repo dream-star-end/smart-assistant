@@ -2615,6 +2615,13 @@ export async function provisionV3Container(
     if (process.env.OC_TOOL_FAILURE_AUDIT === "1") {
       env.push("OC_TOOL_FAILURE_AUDIT=1");
     }
+    // Unified project context: selfhost master env is the single switch.
+    // Commercial production leaves OC_PROJECT_CONTEXT unset → container
+    // gateway keeps the old unbound/PG-instructions path. Independent of
+    // modelAuthority so rebuilds without a signer still honor the master flag.
+    if (process.env.OC_PROJECT_CONTEXT === "1") {
+      env.push("OC_PROJECT_CONTEXT=1");
+    }
     for (const key of [
       "OC_LOCAL_OBSERVABILITY_RETENTION",
       "OC_LOCAL_EVENT_RETENTION_DAYS",

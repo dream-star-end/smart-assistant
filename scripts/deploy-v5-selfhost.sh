@@ -827,6 +827,9 @@ OC_LOCAL_OBSERVABILITY_RETENTION=1
 OC_LOCAL_EVENT_RETENTION_DAYS=30
 OC_LOCAL_USAGE_RETENTION_DAYS=365
 OC_REDACT_TOOL_EVENT_PREVIEWS=1
+# Bound project context (PROJECT.md / skill overlay / run snapshots). Commercial
+# production does not set this; gateway keeps the old path when unset.
+OC_PROJECT_CONTEXT=1
 EOF
   append_provider_keys "$tmp"
   mkdir -p "$(dirname "$V5_ENV")"
@@ -912,6 +915,7 @@ ensure_selfhost_env_keys() {
   ensure_env_kv "$V5_ENV" OC_LOCAL_EVENT_RETENTION_DAYS 30
   ensure_env_kv "$V5_ENV" OC_LOCAL_USAGE_RETENTION_DAYS 365
   ensure_env_kv "$V5_ENV" OC_REDACT_TOOL_EVENT_PREVIEWS 1
+  ensure_env_kv "$V5_ENV" OC_PROJECT_CONTEXT 1
   log "  ✓ 制品根 / PG sessions / privacy-safe telemetry keys"
 }
 
