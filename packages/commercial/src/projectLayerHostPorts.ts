@@ -447,11 +447,19 @@ export function makeApplyPorts(opts: {
     },
     async putSkillOverlay(names, expectedVersion) {
       if (!applyArmed()) throw new Error('apply_disabled')
-      const written = await commitProjectSkillOverlay(opts.boardProjectId, names, expectedVersion, {
+      const existing = names.filter((name) =>
+        existsSync(join(paths.sharedSkillsDir, name, 'SKILL.md')),
+      )
+      const missing = names.filter((name) => !existing.includes(name))
+      if (missing.length) {
+        process.stderr.write(`skill overlay skip missing ${missing.length}: ${missing.join(',')}\n`)
+      }
+      if (!existing.length) throw new Error('skill_overlay_failed:source_missing')
+      const written = await commitProjectSkillOverlay(opts.boardProjectId, existing, expectedVersion, {
         actor: 'user:c:3',
       })
       if (!written.ok) throw new Error(`skill_overlay_failed:${written.error}`)
-      return { old: oldSkills, new: names }
+      return { old: oldSkills, new: existing }
     },
     async createAsset(input) {
       if (!applyArmed()) throw new Error('apply_disabled')
