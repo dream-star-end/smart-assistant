@@ -133,7 +133,12 @@ describe('internalDelegateGrokRoute', () => {
       assert.equal(result.json.ok, true)
       assert.equal(result.json.routeToken, ROUTE_TOKEN)
       assert.match(result.json.baseUrl, /^http:\/\/127\.0\.0\.1:18789\/internal\/v5\/grok-relay\/route\//)
-      assert.equal(result.json.slotId, 'slot-53')
+      // Internal pool identifiers stay master-side: containers get exactly
+      // the fields they consume (baseUrl + routeToken), nothing else.
+      assert.equal('accountId' in result.json, false)
+      assert.equal('slotId' in result.json, false)
+      assert.equal('credentialId' in result.json, false)
+      assert.equal('groupId' in result.json, false)
     } finally {
       await close(server)
     }
@@ -165,6 +170,26 @@ describe('internalDelegateGrokRoute', () => {
 
       const badSession = await call(port, DELEGATE_GROK_ROUTE_MINT_PATH, { modelId: 'grok-build', sessionId: 'bad session id!' })
       assert.equal(badSession.status, 400)
+    } finally {
+      await close(server)
+    }
+  })
+
+  test('mint maps the per-container delegate lease cap to 429 GROK_DELEGATE_LEASE_LIMIT', async () => {
+    const limited = Object.assign(
+      new Error('container 11 already holds 4 active delegate grok route leases'),
+      { name: 'GrokDelegateLeaseLimitError' },
+    )
+    const server = createServer((req, res) => {
+      void handler({
+        allocate: async () => { throw limited },
+      })(req, res, CTX)
+    })
+    const port = await listen(server)
+    try {
+      const result = await call(port, DELEGATE_GROK_ROUTE_MINT_PATH, { modelId: 'grok-build' })
+      assert.equal(result.status, 429)
+      assert.equal(result.json.error.code, 'GROK_DELEGATE_LEASE_LIMIT')
     } finally {
       await close(server)
     }
