@@ -71,6 +71,44 @@ describe('cursorModelPicker', () => {
       'cursor-composer-2.5',
     )
   })
+
+  it('sinks degraded rows to the bottom while keeping catalog order otherwise', () => {
+    const models: PublicModel[] = [
+      { id: 'glm-5.3', display_name: 'GLM-5.3', degraded: true } as PublicModel,
+      { id: 'glm-5.3-zai', display_name: 'GLM-5.3 (Z.AI)' },
+      { id: 'minimax-m3', display_name: 'MiniMax M3' },
+    ]
+    const rows = modelPickerRows(models)
+    expect(rows.map((row) => (row.kind === 'plain' ? row.model.id : row.row.family))).toEqual([
+      'glm-5.3-zai',
+      'minimax-m3',
+      'glm-5.3',
+    ])
+  })
+
+  it('sinks a family row only when every member is degraded', () => {
+    const models: PublicModel[] = [
+      { id: 'cursor-grok-4.6-high', display_name: 'Grok High', degraded: true } as PublicModel,
+      { id: 'cursor-grok-4.6-low', display_name: 'Grok Low' },
+      { id: 'glm-5.2', display_name: 'GLM-5.2' },
+    ]
+    const rows = modelPickerRows(models)
+    // 家族仅部分成员降级时不沉底
+    expect(rows.map((row) => (row.kind === 'plain' ? row.model.id : row.row.family))).toEqual([
+      'grok-4.6',
+      'glm-5.2',
+    ])
+    const allDegraded: PublicModel[] = [
+      { id: 'cursor-grok-4.6-high', display_name: 'Grok High', degraded: true } as PublicModel,
+      { id: 'cursor-grok-4.6-low', display_name: 'Grok Low', degraded: true } as PublicModel,
+      { id: 'glm-5.2', display_name: 'GLM-5.2' },
+    ]
+    const rows2 = modelPickerRows(allDegraded)
+    expect(rows2.map((row) => (row.kind === 'plain' ? row.model.id : row.row.family))).toEqual([
+      'glm-5.2',
+      'grok-4.6',
+    ])
+  })
 })
 
 describe('longContextCostConfirmationRequired', () => {
