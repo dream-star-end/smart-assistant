@@ -1951,7 +1951,38 @@ export class CodexAppServerRunner extends EventEmitter {
     }
   }
 
+  /** Shared in-flight spawn+initialize. Without it, a second caller arriving
+   * while initialize is pending returned early and could proceed before the
+   * app-server finished the handshake (preheat + submit race). */
+  private _spawnPromise: Promise<void> | null = null
+
   private async ensureSpawned(
+    repoSnap: RepoSnapshot | null,
+    effectiveCwd: string,
+  ): Promise<void> {
+    if (this.proc && !this.proc.killed && this.initialized) return
+    const inflight = this._spawnPromise
+    if (inflight) return inflight
+    const spawned = this._ensureSpawnedInternal(repoSnap, effectiveCwd)
+    this._spawnPromise = spawned
+    try {
+      await spawned
+    } finally {
+      if (this._spawnPromise === spawned) this._spawnPromise = null
+    }
+  }
+
+  /** Session-open preheat: spawn + initialize the long-lived app-server so a
+   * cold first turn skips the 5-8s boot. Resolves repo snapshot/cwd through
+   * the SAME path as runTurn. Deliberately no thread/start / thread/resume /
+   * turn/start — zero upstream LLM calls, zero billing. */
+  async preheat(): Promise<void> {
+    const repoSnap = this._currentRepoSnapshot()
+    const effectiveCwd = this._applyRepoBindingFromSnapshot(repoSnap)
+    await this.ensureSpawned(repoSnap, effectiveCwd)
+  }
+
+  private async _ensureSpawnedInternal(
     repoSnap: RepoSnapshot | null,
     effectiveCwd: string,
   ): Promise<void> {

@@ -60,10 +60,20 @@ class FakeCcbRunner extends EventEmitter {
   /** Warm process by default so legacy sequence assertions see no synthetic
    * engine_starting frame; cold-start tests flip this to false. */
   isRunning = true;
+  startCalls = 0;
+  startDelayMs = 0;
   readonly submittedInputs: unknown[] = [];
 
   constructor(private readonly onSubmit: (runner: FakeCcbRunner) => void) {
     super();
+  }
+
+  async start(): Promise<void> {
+    this.startCalls += 1;
+    if (this.startDelayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, this.startDelayMs));
+    }
+    this.isRunning = true;
   }
 
   interrupt(): boolean {
@@ -3817,5 +3827,65 @@ describe("engine cold-start turn_status", () => {
     assert.equal(statuses[0], "engine_starting");
     assert.equal(statuses[1], null);
     assert.equal((statuses[2] as { status?: string } | null)?.status, "retrying");
+  });
+});
+
+// ── 会话打开引擎预热(preheatRunner,INC-20260824)──────────────────────────
+
+describe("preheatRunner", () => {
+  test("冷 CCB session → start() 恰好一次并 report started;并发调用单飞", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    const runner = new FakeCcbRunner(() => {});
+    runner.isRunning = false;
+    runner.startDelayMs = 20;
+    const session = makeSession(runner);
+    const [a, b] = await Promise.all([sm.preheatRunner(session), sm.preheatRunner(session)]);
+    assert.equal(a, "started");
+    // 第二个并发调用要么共享同一 in-flight(started),要么在 isRunning 后到达。
+    assert.ok(b === "started" || b === "already_running");
+    assert.equal(runner.startCalls, 1);
+    assert.ok(session.lastUsedAt > 0, "预热成功必须刷新 lastUsedAt(重置 LRU 计时)");
+  });
+
+  test("已运行 → already_running,不再 start", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    const runner = new FakeCcbRunner(() => {});
+    const session = makeSession(runner);
+    assert.equal(await sm.preheatRunner(session), "already_running");
+    assert.equal(runner.startCalls, 0);
+  });
+
+  test("planned teardown / 活跃 turn → skip 且不 start", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    const runner = new FakeCcbRunner(() => {});
+    runner.isRunning = false;
+    const tearing = makeSession(runner, { _plannedTeardown: "service_restart" } as never);
+    assert.equal(await sm.preheatRunner(tearing), "skipped_teardown");
+    const busy = makeSession(runner, { _activeTurnCount: 1 } as never);
+    assert.equal(await sm.preheatRunner(busy), "skipped_busy");
+    assert.equal(runner.startCalls, 0);
+  });
+
+  test("无 preheat 能力的引擎(one-shot CLI)→ skipped_engine", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    const session = {
+      sessionKey: "agent:main:webchat:dm:oneshot",
+      lock: Promise.resolve(),
+      runner: { engineId: "grok", isRunning: false },
+    } as never;
+    assert.equal(await sm.preheatRunner(session), "skipped_engine");
+  });
+
+  test("start 抛错 → failed,不外抛;session.lock 正常释放", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    const runner = new FakeCcbRunner(() => {});
+    runner.isRunning = false;
+    runner.start = async () => {
+      throw new Error("spawn boom");
+    };
+    const session = makeSession(runner);
+    assert.equal(await sm.preheatRunner(session), "failed");
+    // lock 已释放:后续等待者不悬挂。
+    await session.lock;
   });
 });

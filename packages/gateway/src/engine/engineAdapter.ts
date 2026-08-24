@@ -174,6 +174,12 @@ export interface EngineAdapter extends EventEmitter {
 
   // ── lifecycle ──
   start(): Promise<void>
+  /** Optional session-open preheat: warm the engine process (spawn/initialize)
+   * WITHOUT submitting a turn — zero upstream LLM calls, zero billing. Only
+   * engines with a persistent cross-turn process implement it (CCB spawns the
+   * long-lived subprocess, codex boots the app-server); one-shot CLIs
+   * (grok/cursor/zcode) omit it and are skipped by the caller. */
+  preheat?(): Promise<void>
   submitTurn(params: TurnParams): EngineTurnRun
   /** 中断当前 turn(CCB: stdin control_request interrupt)。false = 无活进程。 */
   interrupt(): boolean

@@ -1054,6 +1054,16 @@ const TRANSIENT_RETRY_ERROR_CODES = new Set([
 // Re-export from ccbMessageParser so existing imports keep working
 export type { SessionStreamEvent } from './ccbMessageParser.js'
 
+/** preheatRunner 的结构化结果(engine_preheat 观测:区分未触发/排队/失败/已热)。 */
+export type PreheatOutcome =
+  | 'started'
+  | 'already_running'
+  | 'failed'
+  | 'skipped_engine'
+  | 'skipped_teardown'
+  | 'skipped_busy'
+  | 'skipped_cap'
+
 export interface CronBridgeEvent {
   action: 'create' | 'delete' | 'list'
   agentId: string
@@ -3584,6 +3594,78 @@ export class SessionManager {
     if (!transition || transition.id !== switchId || transition.state === 'consuming') return false
     session._modelSwitchTransition = undefined
     return true
+  }
+
+  // ── 引擎预热(session-open engine preheat)───────────────────────────────
+
+  /** Per-session in-flight preheat (single-flight) + global concurrency cap. */
+  private readonly _preheatInFlight = new Map<string, Promise<PreheatOutcome>>()
+  private _preheatActive = 0
+
+  /**
+   * 会话打开引擎预热(INC-20260824-FIRST-TEXT-LATENCY;调用方负责 env gate)。
+   *
+   * 只对实现了 `EngineAdapter.preheat` 的常驻进程引擎生效(CCB spawn ~20s、codex
+   * app-server 5-8s);one-shot CLI(grok/cursor/zcode)无 preheat → skip。语义边界:
+   * **不提交 turn、零上游 LLM 调用、零 LLM 计费**;但 spawn 会拉起 MCP 子进程,
+   * 用户自配 MCP 的初始化可能有本地/网络副作用 —— 由全局并发 cap=1、单飞与失败
+   * 日志兜底。串行化在 session.lock 上;与几乎同时到达的 submit 共享 runner 的
+   * in-flight start promise,不会互抛。
+   */
+  async preheatRunner(session: AgentSession): Promise<PreheatOutcome> {
+    if (session._plannedTeardown || session._replacing) return 'skipped_teardown'
+    const runner = session.runner
+    if (typeof runner.preheat !== 'function') return 'skipped_engine'
+    if (runner.isRunning) return 'already_running'
+    if ((session._activeTurnCount ?? 0) > 0) return 'skipped_busy'
+    const existing = this._preheatInFlight.get(session.sessionKey)
+    if (existing) return existing
+    if (this._preheatActive >= 1) return 'skipped_cap'
+    this._preheatActive += 1
+    const startedAt = Date.now()
+    // `run` never rejects: concurrent callers share this promise via the map,
+    // and a rejected shared promise would escape the first caller's handling.
+    const run = (async (): Promise<PreheatOutcome> => {
+      const prev = session.lock
+      let release: () => void = () => {}
+      session.lock = new Promise<void>((r) => (release = r))
+      try {
+        await prev
+        // Re-check under the lock: a turn/teardown may have landed meanwhile.
+        if (session._plannedTeardown || session._replacing) return 'skipped_teardown'
+        if (session.runner.isRunning) return 'already_running'
+        if ((session._activeTurnCount ?? 0) > 0) return 'skipped_busy'
+        await session.runner.preheat!()
+        session.lastUsedAt = Date.now()
+        log.info('engine_preheat', {
+          sessionKey: session.sessionKey,
+          engine: runner.engineId,
+          outcome: 'started',
+          spawn_ms: Date.now() - startedAt,
+        })
+        return 'started'
+      } catch (err) {
+        log.warn('engine_preheat', {
+          sessionKey: session.sessionKey,
+          engine: runner.engineId,
+          outcome: 'failed',
+          spawn_ms: Date.now() - startedAt,
+          err: String(err),
+        })
+        return 'failed'
+      } finally {
+        release()
+      }
+    })()
+    this._preheatInFlight.set(session.sessionKey, run)
+    try {
+      return await run
+    } finally {
+      this._preheatActive -= 1
+      if (this._preheatInFlight.get(session.sessionKey) === run) {
+        this._preheatInFlight.delete(session.sessionKey)
+      }
+    }
   }
 
   async submit(

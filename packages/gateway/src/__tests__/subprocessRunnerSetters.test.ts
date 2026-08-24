@@ -284,3 +284,66 @@ describe('SubprocessRunner secondary utility model env', () => {
     }
   })
 })
+
+describe('SubprocessRunner.start() 可重入(预热 × submit 竞态,INC-20260824)', () => {
+  function bareRunner(): {
+    runner: { start: () => Promise<void>; proc: unknown; _startInternal: () => Promise<void> }
+    calls: () => number
+    setInternal: (fn: () => Promise<void>) => void
+  } {
+    // 只测 start() 的 in-flight 单飞语义:_startInternal 用桩替换,不触真 spawn。
+    const runner = Object.create(SubprocessRunner.prototype) as {
+      start: () => Promise<void>
+      proc: unknown
+      _startInternal: () => Promise<void>
+    }
+    runner.proc = null
+    let count = 0
+    let impl: () => Promise<void> = async () => {
+      count += 1
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+    Object.defineProperty(runner, '_startInternal', {
+      value: () => impl(),
+      writable: true,
+    })
+    return {
+      runner,
+      calls: () => count,
+      setInternal: (fn) => {
+        impl = () => {
+          count += 1
+          return fn()
+        }
+      },
+    }
+  }
+
+  it('并发 start() 共享同一 in-flight,底层只跑一次', async () => {
+    const { runner, calls } = bareRunner()
+    await Promise.all([runner.start(), runner.start(), runner.start()])
+    assert.equal(calls(), 1)
+  })
+
+  it('失败后 in-flight 清空,可重试;两个并发等待者拿到同一个 rejection', async () => {
+    const { runner, calls, setInternal } = bareRunner()
+    setInternal(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      throw new Error('spawn boom')
+    })
+    const [a, b] = await Promise.allSettled([runner.start(), runner.start()])
+    assert.equal(a.status, 'rejected')
+    assert.equal(b.status, 'rejected')
+    assert.equal(calls(), 1)
+    setInternal(async () => {})
+    await runner.start() // 失败不粘住:重试可再次进入底层
+    assert.equal(calls(), 2)
+  })
+
+  it('proc 已存在时 start() 直接返回,不进底层', async () => {
+    const { runner, calls } = bareRunner()
+    runner.proc = {}
+    await runner.start()
+    assert.equal(calls(), 0)
+  })
+})

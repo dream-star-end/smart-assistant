@@ -1075,7 +1075,25 @@ export class SubprocessRunner extends EventEmitter {
     return (this.proc !== null && !this.closed) || this.starting
   }
 
+  /** Shared in-flight spawn so concurrent callers (session preheat + submit)
+   * await the SAME start instead of the second caller returning early while
+   * `starting` is still true and then throwing on `!this.proc`. */
+  private _startPromise: Promise<void> | null = null
+
   async start(): Promise<void> {
+    if (this.proc) return
+    const inflight = this._startPromise
+    if (inflight) return inflight
+    const started = this._startInternal()
+    this._startPromise = started
+    try {
+      await started
+    } finally {
+      if (this._startPromise === started) this._startPromise = null
+    }
+  }
+
+  private async _startInternal(): Promise<void> {
     if (this.proc || this.starting) return
     // ── Crash-loop gate ──
     // If the previous crash(es) pushed _backoffUntil into the future, refuse to

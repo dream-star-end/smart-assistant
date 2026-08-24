@@ -451,6 +451,12 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
     return this.kernel.start()
   }
 
+  /** Session-open preheat = spawn + initialize the long-lived app-server
+   * (no thread/turn RPCs → zero upstream LLM calls / billing). */
+  preheat(): Promise<void> {
+    return this.kernel.preheat()
+  }
+
   submitTurn(params: TurnParams): EngineTurnRun {
     let resolveSummary!: (s: TurnSummary | null) => void
     const summary = new Promise<TurnSummary | null>((res) => {

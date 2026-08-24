@@ -305,6 +305,13 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
     return this.runner.start()
   }
 
+  /** Session-open preheat = spawn the long-lived CCB subprocess (bun boot +
+   * `--resume` JSONL load) so a cold first turn skips ~20s. The idle process
+   * waits on stdin; no user line is written, no upstream LLM call happens. */
+  preheat(): Promise<void> {
+    return this.runner.start()
+  }
+
   submitTurn(params: TurnParams): EngineTurnRun {
     const telemetry = new TelemetryChannel()
     let nativeCompactionSummary: string | undefined

@@ -5162,12 +5162,19 @@ export class Gateway {
             view: 'timeline',
             sinceHistoryRevision,
           })
-            .then((s) => s ? this.sendJson(res, 200, {
-              ...s,
-              timelineCursor: s.timelineCursor
-                ? encodeClientTimelineCursor(s.timelineCursor)
-                : null,
-            }) : this.sendJson(res, 404, { error: 'not found' }))
+            .then((s) => {
+              if (!s) {
+                this.sendJson(res, 404, { error: 'not found' })
+                return
+              }
+              this.sendJson(res, 200, {
+                ...s,
+                timelineCursor: s.timelineCursor
+                  ? encodeClientTimelineCursor(s.timelineCursor)
+                  : null,
+              })
+              this._preheatSessionOnOpen(sessId, userId, s)
+            })
             .catch((error: unknown) => this.sendSessionReadFailure(res, error, sessId, 'get failed'))
         } else {
           getClientSession(sessId, userId, { view: 'timeline' })
@@ -5201,6 +5208,7 @@ export class Gateway {
                   ? encodeClientTimelineCursor(s.timelineCursor)
                   : null,
               })
+              this._preheatSessionOnOpen(sessId, userId, s)
             })
             .catch((error: unknown) => this.sendSessionReadFailure(res, error, sessId, 'get failed'))
         }
@@ -15294,6 +15302,58 @@ export class Gateway {
       })
       this.log.info('auto-resume pre-warmed', { sessionKey })
     }
+  }
+
+  /**
+   * GET /api/sessions/:id 成功(full 与 ?since= 两条 200 路径)后的 fire-and-forget
+   * 引擎预热(INC-20260824-FIRST-TEXT-LATENCY;gate: OC_ENGINE_PREHEAT=1,默认关)。
+   *
+   * 选中会话必打这条 GET(useSessionList.selectSession → loadHistory),粒度恰好是
+   * "用户正在看的那一个会话" —— 明确不挂 bootAutoResume / 全量 hello(那两处是
+   * 全量扇出,spawn 会打满内存/fork)。agentId/modelId 取自本次已读出的
+   * client_sessions 权威行;执行授权走 prewarm 投影,失败即跳过,不绕 fail-closed。
+   */
+  private _preheatSessionOnOpen(
+    sessId: string,
+    userId: string,
+    row: { agentId?: string; modelId?: string },
+  ): void {
+    if (process.env.OC_ENGINE_PREHEAT !== '1') return
+    void (async () => {
+      const aid = row.agentId || 'main'
+      if (isHiddenSystemAgentId(aid)) return
+      const sessionKey = `agent:${aid}:webchat:dm:${sessId}`
+      let session = this.sessions.getByKey(sessionKey)
+      if (!session) {
+        const cfg = await this._getAgentsConfig()
+        const agent = cfg.agents.find((a) => a.id === aid) ?? ({ id: aid } as AgentDef)
+        // 模型权威:预热带上会话持久化的 modelId(权威行),避免首条消息因
+        // model 不一致触发 shutdown-respawn 白烧一次冷启动;投影拒绝/不可用 →
+        // 抛 → 外层 catch 跳过预热(fail-closed,不回落 baked)。
+        const preExec = await resolveLocalExecutionIfEnforced({
+          agent,
+          kind: 'prewarm',
+          ...(row.modelId ? { model: row.modelId } : {}),
+          defaultModel: this.deps.config.defaults.model,
+        })
+        const override = localExecutionOverride(preExec)
+        session = await this.sessions.getOrCreate({
+          sessionKey,
+          agent,
+          ...override,
+          ...(override.model === undefined && row.modelId ? { model: row.modelId } : {}),
+          channel: 'webchat',
+          peerId: sessId,
+          userId,
+        })
+      }
+      const outcome = await this.sessions.preheatRunner(session)
+      if (outcome !== 'started' && outcome !== 'already_running') {
+        this.log.info('engine_preheat_skipped', { sessionKey, outcome })
+      }
+    })().catch((err) => {
+      this.log.warn('session-open engine preheat failed', { sessId }, err)
+    })
   }
 
   private async autoResumeFromHello(

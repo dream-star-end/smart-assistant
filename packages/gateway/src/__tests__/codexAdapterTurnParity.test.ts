@@ -1309,3 +1309,37 @@ describe("CodexAdapter — turn/start 窄路径自动重试(end-to-end)", () => 
     assert.equal(statusEvents[1].status, null);
   });
 });
+
+// ── 会话打开预热(preheat,INC-20260824)────────────────────────────────────
+
+describe("CodexAdapter.preheat — spawn+initialize、零 thread/turn RPC", () => {
+  test("preheat 只 spawn + initialize;后续首 turn 复用同一进程再 thread/start", async () => {
+    const h = makeHarness();
+    await h.adapter.preheat();
+
+    assert.equal(h.spawnCalls.length, 1, "preheat 必须 spawn 恰好一个 app-server");
+    assert.ok(
+      h.proc().written.some((r) => r.method === "initialize"),
+      "preheat 必须完成 initialize 握手",
+    );
+    for (const forbidden of ["thread/start", "thread/resume", "turn/start"]) {
+      assert.equal(
+        h.proc().written.some((r) => r.method === forbidden),
+        false,
+        `preheat 不得发 ${forbidden}(零上游 LLM 调用/零计费边界)`,
+      );
+    }
+
+    // 并发 preheat 共享同一 in-flight,不再 spawn 第二个进程。
+    await Promise.all([h.adapter.preheat(), h.adapter.preheat()]);
+    assert.equal(h.spawnCalls.length, 1);
+
+    // 预热后的首 turn:复用同一进程,走正常 thread/start → turn/start。
+    const turn = beginTurn(h, { requestId: "req-preheat" });
+    await waitForRequest(h, "turn/start");
+    assert.equal(h.spawnCalls.length, 1, "首 turn 不得重复 spawn");
+    h.proc().notify("turn/completed", { turn: { id: "turn-1", status: "completed" } });
+    await turn.summary;
+    await h.adapter.shutdown();
+  });
+});
