@@ -244,6 +244,7 @@ export interface CodexAppServerRunnerOpts {
    *  legacy caller(测试或没 sessionManager 的代码路径)可不传,此时整个 repo 绑
    *  定能力关闭,行为退回 v1.0.0 老样:cwd 永远 = opts.cwd,REPO slot 不注入。 */
   sessionId?: string
+  projectId?: string
   /** snapshot provider。由 SessionManager 注入(`this._getRepoSnapshot`),
    *  内部读 `_repoWorkspace.getRepoSnapshot(sessionId)`。返 null = 无绑定;
    *  返 ready = 已绑定可用;返 cloning/failed/pending = 不可用,运行时回退 opts.cwd。 */

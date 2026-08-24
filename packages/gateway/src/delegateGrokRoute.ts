@@ -35,7 +35,7 @@ export function delegateGrokMintModelId(args: {
   requestedModel?: string | null
   agentModel?: string | null
 }): string | undefined {
-  const model = args.canonicalModel || args.requestedModel || args.agentModel
+  const model = args.canonicalModel || args.requestedModel || args.agentModel || undefined
   return isGrokEngineModel(model) ? model : undefined
 }
 

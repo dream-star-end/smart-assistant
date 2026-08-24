@@ -230,7 +230,7 @@ export function ProjectSettingsDialog(props: {
 
           <Field
             label="绑定任务面板项目"
-            hint="绑定后，聊天与看板 stage 共用项目指令、资产和技能。一对一绑定。"
+            hint="绑定后，聊天与看板 stage 共用项目指令、资产、技能和正式记忆。未绑定 GitHub 仓库的会话使用项目工作区；仓库 clone 就绪时会话会切到仓库快照（允许覆盖）。"
           >
             <select
               className="w-full rounded-md border border-border bg-surface px-2 py-1.5 text-sm"

@@ -25,6 +25,7 @@ import { resolveMcpMemoryEntry } from '../mcpMemoryEntry.js'
 import { getPlatformPrompt } from '../platformPrompts.js'
 import { atomicWriteJsonFile, buildCursorEfficiencyHooks } from '../efficiencyHookConfig.js'
 import { detachChildStdio, killProcessGroup, shutdownTimeoutMs, waitForCloseWithin } from '../processGroupShutdown.js'
+import { decideEngineCwd } from '../engineCwd.js'
 import { buildPromptContext } from '../promptSlots.js'
 import { issueDelegateContextToken } from '../delegateContext.js'
 
@@ -1403,13 +1404,16 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     return dir
   }
   private async spawnTurn(ctx: TurnCtx): Promise<void> {
-    let cwd = this.opts.agentBaseDir
     let repoSnapshot = null
     if (this.opts.sessionId && this.opts.getRepoSnapshot) {
       repoSnapshot = this.opts.getRepoSnapshot(this.opts.sessionId)
-      if (repoSnapshot?.status === 'ready' && repoSnapshot.workspaceDir)
-        cwd = repoSnapshot.workspaceDir
     }
+    const cwdDecision = decideEngineCwd({
+      agentBaseDir: this.opts.agentBaseDir,
+      repoSnapshot,
+      projectBound: Boolean(this.opts.projectId),
+    })
+    const cwd = cwdDecision.cwd
     const bin = resolveCursorWrapperBin()
     const selected = CURSOR_ENGINE_MODELS.find((model) => model.id === this.currentModel)
     if (!selected) throw new Error(`Cursor model '${String(this.currentModel)}' is not allowlisted`)

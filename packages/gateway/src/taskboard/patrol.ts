@@ -572,7 +572,7 @@ export class PatrolEngine {
     const projectEnabled = isProjectContextEnabled()
     let workspaceCwd: string | undefined
     if (projectEnabled && boardProject) {
-      const spec = boardProject.workspaceSpec ?? parseProjectWorkspace(boardProject.workspace)
+      const spec = parseProjectWorkspace(boardProject.workspaceSpec ?? boardProject.workspace)
       const cwd = resolveProjectCwd(spec, boardProject.id)
       if (cwd.ok) workspaceCwd = cwd.cwd
     }

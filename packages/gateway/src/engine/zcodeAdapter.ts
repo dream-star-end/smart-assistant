@@ -27,6 +27,7 @@ import { type EngineCreateOpts, registerEngine } from './registry.js'
 import { classifyRunError } from '../errorClassify.js'
 import { createLogger } from '../logger.js'
 import { detachChildStdio, killProcessGroup, shutdownTimeoutMs, waitForCloseWithin } from '../processGroupShutdown.js'
+import { decideEngineCwd } from '../engineCwd.js'
 import { buildPromptContext } from '../promptSlots.js'
 import {
   cleanupZcodePlatformArtifacts,
@@ -939,11 +940,15 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
 
   private async spawnTurn(ctx: ZcodeTurnContext): Promise<void> {
     const upstream = this.resolveUpstream()
-    let cwd = this.opts.agentBaseDir
-    if (this.opts.sessionId && this.opts.getRepoSnapshot) {
-      const snapshot = this.opts.getRepoSnapshot(this.opts.sessionId)
-      if (snapshot?.status === 'ready' && snapshot.workspaceDir) cwd = snapshot.workspaceDir
-    }
+    const snapshot =
+      this.opts.sessionId && this.opts.getRepoSnapshot
+        ? this.opts.getRepoSnapshot(this.opts.sessionId)
+        : null
+    const cwd = decideEngineCwd({
+      agentBaseDir: this.opts.agentBaseDir,
+      repoSnapshot: snapshot,
+      projectBound: Boolean(this.opts.projectId),
+    }).cwd
     this.cleanupArtifacts(ctx)
     try {
       ctx.artifacts = createZcodePlatformArtifacts({

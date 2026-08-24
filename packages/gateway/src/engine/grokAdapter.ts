@@ -34,6 +34,7 @@ import { buildCodexEnv } from './codexShared.js'
 import { createLogger } from '../logger.js'
 import { detachChildStdio, killProcessGroup, shutdownTimeoutMs, waitForCloseWithin } from '../processGroupShutdown.js'
 import { grokProductToolInput, grokProductToolName, grokProductToolOutput } from './grokToolNormalize.js'
+import { decideEngineCwd } from '../engineCwd.js'
 import { buildPromptContext } from '../promptSlots.js'
 import { GROK_PREAMBLE, prepareGrokHome, projectGrokPlatform } from './grokPlatform.js'
 
@@ -388,12 +389,16 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       throw new Error('GROK_ROUTE_INVALID: relay must be token-bound loopback')
     }
 
-    let cwd = this.opts.agentBaseDir
     let repoSnapshot = null
     if (this.opts.sessionId && this.opts.getRepoSnapshot) {
       repoSnapshot = this.opts.getRepoSnapshot(this.opts.sessionId)
-      if (repoSnapshot?.status === 'ready' && repoSnapshot.workspaceDir) cwd = repoSnapshot.workspaceDir
     }
+    const cwdDecision = decideEngineCwd({
+      agentBaseDir: this.opts.agentBaseDir,
+      repoSnapshot,
+      projectBound: Boolean(this.opts.projectId),
+    })
+    const cwd = cwdDecision.cwd
     const platform = projectGrokPlatform({
       agentId: this.opts.agentId,
       projectId: this.opts.projectId,

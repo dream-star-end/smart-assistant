@@ -162,10 +162,10 @@ export function makeInternalProjectContextHandler(
         }
       : {
           ...emptyBody(userId),
-          boardProjectId:
-            boardRaw && parseBoardProjectId(boardRaw).present
-              ? (parseBoardProjectId(boardRaw) as { present: true; value: string | null }).value
-              : null,
+          boardProjectId: (() => {
+            const parsed = boardRaw ? parseBoardProjectId(boardRaw) : { present: false as const }
+            return 'present' in parsed && parsed.present ? parsed.value : null
+          })(),
         };
     sendJson(res, 200, body, requestId);
   };

@@ -30,6 +30,7 @@ import {
 import './engine/ccbAdapter.js'
 import './engine/codexAdapter.js'
 import './engine/grokAdapter.js'
+import { decideEngineCwd } from './engineCwd.js'
 import { cursorResumeStoreExists } from './engine/cursorAdapter.js'
 import './engine/zcodeAdapter.js'
 import type {
@@ -660,8 +661,13 @@ export interface AgentSession {
    * `agent.cwd`, or `resolveDefaultWorkspaceCwd`). Cursor chat-store hashes
    * are keyed by this path after the repo-snapshot overlay and realpath, so
    * stale-resume detection must read it back instead of recomputing.
+   *
+   * Bound chat sessions pass the project workspace here. A ready session-repo
+   * overlay is applied later in adapters via decideEngineCwd (allowed).
    */
   workspaceCwd: string
+  /** tb_project.id when this session is bound to a work project. */
+  projectId?: string
   /**
    * 直接父会话键。仅 delegate 子会话在创建时物化(handleDelegateTask 传入已校验的
    * 直接父 sessionKey);webchat 根会话为 undefined。用于委派进度**沿父链向上追溯**到
@@ -2717,12 +2723,13 @@ export class SessionManager {
   /** Same cwd projection CursorAdapter.spawnTurn uses: repo workspace when
    *  ready, otherwise the agent base dir. Wrapper --workspace is pwd -P of
    *  that cwd, so realpath when the path exists. */
-  private _cursorWorkspacePath(agentBaseDir: string, repoSessionId?: string): string {
-    let cwd = agentBaseDir
-    if (repoSessionId && this._getRepoSnapshot) {
-      const snap = this._getRepoSnapshot(repoSessionId)
-      if (snap?.status === 'ready' && snap.workspaceDir) cwd = snap.workspaceDir
-    }
+  private _cursorWorkspacePath(agentBaseDir: string, repoSessionId?: string, projectBound?: boolean): string {
+    const snap = repoSessionId && this._getRepoSnapshot ? this._getRepoSnapshot(repoSessionId) : null
+    const cwd = decideEngineCwd({
+      agentBaseDir,
+      repoSnapshot: snap,
+      projectBound,
+    }).cwd
     try { return realpathSync(cwd) } catch { return cwd }
   }
 
@@ -2731,6 +2738,7 @@ export class SessionManager {
     return this._cursorWorkspacePath(
       session.workspaceCwd,
       session.repoSessionId ?? session.peerId,
+      Boolean(session.projectId),
     )
   }
 
@@ -3171,7 +3179,9 @@ export class SessionManager {
           : existing.providerTag
       const workspaceModeChanged =
         opts.workspaceMode !== undefined && existing.workspaceMode !== workspaceMode
-      if (existing.providerTag !== desiredEngine || workspaceModeChanged) {
+      const workspaceCwdChanged =
+        opts.workspaceCwd !== undefined && existing.workspaceCwd !== opts.workspaceCwd
+      if (existing.providerTag !== desiredEngine || workspaceModeChanged || workspaceCwdChanged) {
         const replacementNotice: NonNullable<AgentSession['_contextRebuildNotice']> =
           existing.providerTag !== desiredEngine ? 'engine-switch' : 'native-resume-loss'
         contextRebuildNotice = replacementNotice
@@ -3243,6 +3253,7 @@ export class SessionManager {
         if (opts.repoSessionId && !existing.repoSessionId) existing.repoSessionId = opts.repoSessionId
         if (opts.parentSessionKey && !existing.parentSessionKey)
           existing.parentSessionKey = opts.parentSessionKey
+        if (opts.projectId && !existing.projectId) existing.projectId = opts.projectId
         return existing
       }
     }
@@ -3277,7 +3288,11 @@ export class SessionManager {
       // was wiped (pre-2026-04-22 v3 containers' tmpfs was ephemeral).
       resumeSessionId: opts.hermeticNoTools
         ? undefined
-        : this._resumeIdFor(opts.sessionKey, engineId, this._cursorWorkspacePath(cwd, repoSessionId)),
+        : this._resumeIdFor(
+            opts.sessionKey,
+            engineId,
+            this._cursorWorkspacePath(cwd, repoSessionId, Boolean(opts.projectId)),
+          ),
       effortLevel: initialEffort,
       // Phase 5:repoSessionId 默认等于 peerId;delegate_task 可传父 webchat
       // session id 作为 repo lookup key,但不改变 delegate 自己的 peerId。
@@ -3303,6 +3318,7 @@ export class SessionManager {
       userId: opts.userId,
       workspaceMode,
       workspaceCwd: cwd,
+      projectId: opts.projectId,
       repoSessionId,
       title: opts.title ?? 'New conversation',
       // delegate 子会话的直接父指针(webchat/普通会话为 undefined)。物化父链使委派进度

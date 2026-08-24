@@ -6,6 +6,7 @@ import {
   PROJECT_KEY_RE,
   type Project,
   type ProjectCreateInput,
+  type ProjectMemoryItem,
   type ProjectPatchInput,
   taskboardApi,
   taskboardErrorMessage,
@@ -43,6 +44,11 @@ export function ProjectSettings({
   const [templateIds, setTemplateIds] = useState<string[]>(() =>
     BUILTIN_TEMPLATE_OPTIONS.map((t) => t.id),
   )
+  const [workspaceKind, setWorkspaceKind] = useState<'default' | 'isolated' | 'container_path'>(
+    'default',
+  )
+  const [workspacePath, setWorkspacePath] = useState('')
+  const [workspaceError, setWorkspaceError] = useState('')
 
   const open = mode !== null
 
@@ -51,12 +57,18 @@ export function ProjectSettings({
       setKey(current.key)
       setName(current.name)
       setDescription(current.description ?? '')
+      setWorkspaceKind(current.workspaceSpec?.kind ?? 'default')
+      setWorkspacePath(current.workspaceSpec?.path ?? current.workspace ?? '')
+      setWorkspaceError('')
     }
     if (mode === 'create') {
       setKey('')
       setName('')
       setDescription('')
       setTemplateIds(BUILTIN_TEMPLATE_OPTIONS.map((t) => t.id))
+      setWorkspaceKind('default')
+      setWorkspacePath('')
+      setWorkspaceError('')
     }
   }, [mode, current])
 
@@ -79,6 +91,23 @@ export function ProjectSettings({
 
   const close = () => setMode(null)
 
+  const workspaceSpecPayload = () => {
+    if (workspaceKind === 'container_path') {
+      const path = workspacePath.trim()
+      if (!path.startsWith('/')) {
+        setWorkspaceError('容器路径必须是绝对路径，且落在 workspace/ 或 repos/ 下。')
+        return null
+      }
+      if (path.includes('/projects/') && !path.includes('/workspace/projects/')) {
+        setWorkspaceError('~/.openclaude/projects 是项目数据目录，不能当工作区。')
+        return null
+      }
+      return { kind: 'container_path' as const, path }
+    }
+    setWorkspaceError('')
+    return { kind: workspaceKind }
+  }
+
   const submitCreate = async () => {
     const normalized = key.trim().toUpperCase()
     const title = name.trim()
@@ -90,6 +119,8 @@ export function ProjectSettings({
       toast('请填写项目名称', 'error')
       return
     }
+    const spec = workspaceSpecPayload()
+    if (!spec) return
     setSaving(true)
     try {
       const allBuiltin = BUILTIN_TEMPLATE_OPTIONS.every((t) => templateIds.includes(t.id))
@@ -98,6 +129,7 @@ export function ProjectSettings({
         key: normalized,
         name: title,
         description: description.trim() || null,
+        workspaceSpec: spec,
         templateIds: allBuiltin ? undefined : none ? [] : templateIds,
       })
       if (created) close()
@@ -113,11 +145,14 @@ export function ProjectSettings({
       toast('请填写项目名称', 'error')
       return
     }
+    const spec = workspaceSpecPayload()
+    if (!spec) return
     setSaving(true)
     try {
       const updated = await onPatch(current.id, {
         name: title,
         description: description.trim() || null,
+        workspaceSpec: spec,
       })
       if (updated) close()
     } finally {
@@ -253,6 +288,48 @@ export function ProjectSettings({
               onChange={(e) => setDescription(e.target.value)}
             />
           </Field>
+          <Field
+            label="工作区"
+            hint="绑定会话默认用项目工作区。若该会话绑定了 GitHub 仓库且 clone 就绪，聊天会切到仓库快照（覆盖项目工作区）。数据目录 ~/.openclaude/projects 不能当 cwd。"
+            error={workspaceError || undefined}
+          >
+            <div className="flex flex-col gap-1.5" data-testid="project-workspace-spec">
+              {(
+                [
+                  ['default', '默认（OPENCLAUDE_DEFAULT_WORKSPACE / 进程 cwd）'],
+                  ['isolated', '隔离（workspace/projects/<项目id>）'],
+                  ['container_path', '容器绝对路径（仅 workspace/ 或 repos/）'],
+                ] as const
+              ).map(([kind, label]) => (
+                <label
+                  key={kind}
+                  className="flex items-center gap-2 rounded-lg bg-hover px-3 py-2 text-body text-fg"
+                >
+                  <input
+                    type="radio"
+                    name="project-workspace-kind"
+                    data-testid={`project-workspace-${kind}`}
+                    checked={workspaceKind === kind}
+                    onChange={() => {
+                      setWorkspaceKind(kind)
+                      setWorkspaceError('')
+                    }}
+                  />
+                  <span>{label}</span>
+                </label>
+              ))}
+              {workspaceKind === 'container_path' && (
+                <Input
+                  aria-label="容器工作区路径"
+                  data-testid="project-workspace-path"
+                  inputSize="sm"
+                  placeholder="/home/agent/.openclaude/workspace/..."
+                  value={workspacePath}
+                  onChange={(e) => setWorkspacePath(e.target.value)}
+                />
+              )}
+            </div>
+          </Field>
           {mode === 'create' && (
             <Field
               label="流水线模板"
@@ -321,6 +398,9 @@ export function ProjectSettings({
               </>
             )}
           </div>
+          {mode === 'edit' && current && (
+            <ProjectMemoryReview auth={auth} project={current} />
+          )}
           {mode === 'edit' && archived.length > 0 && (
             <div className="mt-2 flex flex-col gap-2 border-t border-border pt-3">
               <h3 className="text-section font-semibold text-fg">已归档项目</h3>
@@ -354,5 +434,110 @@ export function ProjectSettings({
       </Sheet>
       {confirmEl}
     </>
+  )
+}
+
+function ProjectMemoryReview({ auth, project }: { auth: AuthSession; project: Project }) {
+  const toast = useToast()
+  const [items, setItems] = useState<{ official: ProjectMemoryItem[]; candidates: ProjectMemoryItem[] } | null>(
+    null,
+  )
+  useEffect(() => {
+    let cancelled = false
+    void taskboardApi
+      .listProjectMemories(auth, project.id)
+      .then((res) => {
+        if (!cancelled) setItems({ official: res.official, candidates: res.candidates })
+      })
+      .catch((e) => {
+        if (!cancelled) toast(taskboardErrorMessage(e, '加载项目记忆失败'), 'error')
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [auth, project.id, toast])
+
+  const refresh = () =>
+    taskboardApi.listProjectMemories(auth, project.id).then((res) => {
+      setItems({ official: res.official, candidates: res.candidates })
+    })
+
+  if (!items) return null
+  return (
+    <div className="mt-2 flex flex-col gap-2 border-t border-border pt-3" data-testid="project-memory-review">
+      <h3 className="text-section font-semibold text-fg">项目记忆</h3>
+      <p className="text-caption text-muted">
+        候选需人工采纳后才会注入下一轮。Agent 直接改 memory/*.md 不会绕过晋升。
+      </p>
+      {items.candidates.length === 0 ? (
+        <p className="text-caption text-faint">没有待审核候选。</p>
+      ) : (
+        items.candidates.map((c) => (
+          <div key={c.id ?? c.file} className="rounded-lg bg-hover px-3 py-2 text-body">
+            <div className="font-medium">{c.slug}</div>
+            <pre className="mt-1 max-h-32 overflow-auto whitespace-pre-wrap text-caption text-muted">
+              {(c.content ?? '').slice(0, 800)}
+            </pre>
+            <div className="mt-2 flex gap-1">
+              <Button
+                type="button"
+                size="sm"
+                data-testid={`project-memory-promote-${c.id}`}
+                onClick={() => {
+                  void taskboardApi
+                    .promoteProjectMemory(auth, project.id, c.id ?? '', c.version)
+                    .then(() => refresh())
+                    .catch((e) => toast(taskboardErrorMessage(e, '采纳失败'), 'error'))
+                }}
+              >
+                采纳
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant="secondary"
+                onClick={() => {
+                  void taskboardApi
+                    .rejectProjectMemory(auth, project.id, c.id ?? '', c.version)
+                    .then(() => refresh())
+                    .catch((e) => toast(taskboardErrorMessage(e, '丢弃失败'), 'error'))
+                }}
+              >
+                丢弃
+              </Button>
+            </div>
+          </div>
+        ))
+      )}
+      <h4 className="text-meta font-semibold text-fg">正式 / 废弃</h4>
+      {items.official.length === 0 ? (
+        <p className="text-caption text-faint">尚无正式项目记忆。</p>
+      ) : (
+        items.official.map((o) => (
+          <div key={o.slug} className="flex items-center justify-between gap-2 text-body">
+            <span>
+              {o.slug}
+              {o.deprecated ? '（已废弃）' : ''}
+              {o.tampered ? '（文件被篡改，未注入）' : ''}
+            </span>
+            {!o.deprecated && (
+              <Button
+                type="button"
+                size="sm"
+                variant="secondary"
+                onClick={() => {
+                  void taskboardApi
+                    .deprecateProjectMemory(auth, project.id, o.slug, o.version)
+                    .then(() => refresh())
+                    .catch((e) => toast(taskboardErrorMessage(e, '废弃失败'), 'error'))
+                }}
+              >
+                废弃
+              </Button>
+            )}
+          </div>
+        ))
+      )}
+    </div>
   )
 }
