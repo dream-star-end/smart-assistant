@@ -1,9 +1,12 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
 
 import {
+  boundedErrorLocation,
+  errorLocationFingerprint,
   installGlobalClientFrictionHandlers,
   reportClientFriction,
   reportClientFrictionBatch,
+  scriptRefFromSource,
 } from "./clientFriction";
 
 afterEach(() => {
@@ -72,6 +75,68 @@ describe("client friction reporter", () => {
     const bodies = fetchMock.mock.calls.map((call) => JSON.parse(String((call[1] as RequestInit).body)));
     expect(bodies.map((b) => b.code)).toEqual(["JS_ERROR", "UNHANDLED_REJECTION"]);
     expect(JSON.stringify(bodies)).not.toContain("DO_NOT_SEND");
+  });
+
+  test("bounded error location (0246): basename/line/col/fingerprint only, never text", () => {
+    expect(scriptRefFromSource("https://oc.example/assets/index-Ab3xY9.js?v=1#frag")).toBe(
+      "index-Ab3xY9.js",
+    );
+    expect(scriptRefFromSource("")).toBeUndefined();
+    expect(scriptRefFromSource("https://oc.example/assets/")).toBeUndefined();
+    // 含非法字符(空格/引号)的基名整体丢弃,不截断保留
+    expect(scriptRefFromSource("https://x/inline 'secret'.js")).toBeUndefined();
+
+    const location = boundedErrorLocation({
+      filename: "https://oc.example/assets/index-Ab3xY9.js",
+      lineno: 120,
+      colno: 7,
+      error: new TypeError("DO_NOT_SEND user content"),
+    });
+    expect(location).toEqual({
+      errorName: "TypeError",
+      scriptRef: "index-Ab3xY9.js",
+      lineNo: 120,
+      colNo: 7,
+    });
+    expect(JSON.stringify(location)).not.toContain("DO_NOT_SEND");
+
+    // 指纹只依赖有界字段,稳定可复现
+    const fp = errorLocationFingerprint(["TypeError", "index-Ab3xY9.js", 120, 7]);
+    expect(fp).toMatch(/^[a-f0-9]{8}$/);
+    expect(errorLocationFingerprint(["TypeError", "index-Ab3xY9.js", 120, 7])).toBe(fp);
+    expect(errorLocationFingerprint(["RangeError", "index-Ab3xY9.js", 120, 7])).not.toBe(fp);
+  });
+
+  test("global JS_ERROR report carries bounded location on the wire", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("matchMedia", vi.fn(() => ({ matches: true })));
+    // 全局去重状态是模块级的,前序用例已消耗 JS_ERROR 名额——取全新模块实例。
+    vi.resetModules();
+    const fresh = await import("./clientFriction");
+    fresh.installGlobalClientFrictionHandlers();
+
+    const error = Object.assign(new Event("error"), {
+      message: "DO_NOT_SEND details",
+      filename: "https://oc.example/assets/vendor-9x.js",
+      lineno: 42,
+      colno: 3,
+      error: new RangeError("DO_NOT_SEND"),
+    });
+    window.dispatchEvent(error);
+
+    const jsErrorBody = fetchMock.mock.calls
+      .map((call) => JSON.parse(String((call[1] as RequestInit).body)))
+      .find((body) => body.code === "JS_ERROR");
+    expect(jsErrorBody).toBeDefined();
+    expect(jsErrorBody).toMatchObject({
+      error_name: "RangeError",
+      script_ref: "vendor-9x.js",
+      line_no: 42,
+      col_no: 3,
+    });
+    expect(jsErrorBody.error_fingerprint).toMatch(/^[a-f0-9]{8}$/);
+    expect(JSON.stringify(jsErrorBody)).not.toContain("DO_NOT_SEND");
   });
 
   test("batches per-entity exposures into one telemetry request", () => {

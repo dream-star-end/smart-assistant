@@ -126,7 +126,8 @@
     "0244_tutorial_snapshots",
     "0245_gpt56_family_half_xn",
     "0246_chat_project_board_bind",
-    "0247_cursor_opus_48"
+    "0247_cursor_opus_48",
+    "0248_friction_error_location"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

@@ -51,8 +51,48 @@ describe("client friction normalization", () => {
       traceId: "trace_1",
       sessionId: "session_1",
       entitySlug: "skill.one",
+      errorName: null,
+      scriptRef: null,
+      lineNo: null,
+      colNo: null,
+      errorFingerprint: null,
     });
     assert.equal(JSON.stringify(normalized).includes("DO_NOT_PERSIST"), false);
+  });
+
+  test("keeps bounded error location identifiers and rejects free text (0248)", () => {
+    const accepted = normalizeClientFrictionReport({
+      surface: "client",
+      stage: "runtime",
+      code: "JS_ERROR",
+      error_name: "TypeError",
+      script_ref: "index-Ab3xY9.js",
+      line_no: 1234,
+      col_no: 56,
+      error_fingerprint: "9f3a1c20",
+    }, "fallback");
+    assert.equal(accepted.errorName, "TypeError");
+    assert.equal(accepted.scriptRef, "index-Ab3xY9.js");
+    assert.equal(accepted.lineNo, 1234);
+    assert.equal(accepted.colNo, 56);
+    assert.equal(accepted.errorFingerprint, "9f3a1c20");
+
+    const rejected = normalizeClientFrictionReport({
+      surface: "client",
+      stage: "runtime",
+      code: "JS_ERROR",
+      error_name: "has spaces DO_NOT_PERSIST",
+      script_ref: "https://example.invalid/private/path.js",
+      line_no: -1,
+      col_no: 10_000_001,
+      error_fingerprint: "UPPER-not-hex",
+    }, "fallback");
+    assert.equal(rejected.errorName, null);
+    assert.equal(rejected.scriptRef, null);
+    assert.equal(rejected.lineNo, null);
+    assert.equal(rejected.colNo, null);
+    assert.equal(rejected.errorFingerprint, null);
+    assert.equal(JSON.stringify(rejected).includes("DO_NOT_PERSIST"), false);
   });
 
   test("keeps lowercase semantic error codes used by the browser contract", () => {
