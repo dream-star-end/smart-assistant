@@ -1,9 +1,10 @@
+import { QQ_PROACTIVE_PATH } from '@openclaude/protocol'
 import { request as undiciRequest } from 'undici'
 
 import { type V3WechatOutboundConfig, readV3WechatOutboundConfig } from './v3WechatOutbound.js'
 import type { ProactiveDeliveryResult } from './v3WechatProactive.js'
 
-export const QQ_PROACTIVE_PATH = '/internal/v3/qq-proactive'
+export { QQ_PROACTIVE_PATH }
 const ATTEMPT_TIMEOUT_MS = 10_000
 const MAX_RESP_BYTES = 16 * 1024
 

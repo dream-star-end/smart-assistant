@@ -21,7 +21,7 @@ import { type Logger, rootLogger } from '../logging/logger.js'
 import type { AuthoritySigner } from '../ws/authoritySigner.js'
 import { REQUEST_ID_HEADER, ensureRequestId, isObj, setSecurityHeaders } from './util.js'
 
-export const TURN_LEASE_RENEW_PATH = '/internal/v3/turn-lease/renew'
+export { TURN_LEASE_RENEW_PATH } from '@openclaude/protocol'
 const MAX_BODY_BYTES = 24 * 1024
 const TURN_KEY_RE = /^[0-9a-f]{64}$/
 

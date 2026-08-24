@@ -69,7 +69,9 @@ import {
 import { scanSkillArtifact } from '../marketplace/skillScanner.js'
 import { REQUEST_ID_HEADER, ensureRequestId, setSecurityHeaders } from './util.js'
 
-export const MARKETPLACE_AGENT_PREFIX = '/internal/v3/marketplace/agent/'
+import { MARKETPLACE_AGENT_PREFIX } from '@openclaude/protocol'
+
+export { MARKETPLACE_AGENT_PREFIX }
 
 export interface MarketplaceAgentCtx {
   hostUuid: string

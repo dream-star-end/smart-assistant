@@ -57,7 +57,7 @@ import type { CatalogSource } from "./internalModelCatalog.js";
 /** Container → master GET 这个 path 拿平台级 slot。挂在 plain 18791 self-host
  *  和 mTLS 18443 remote-host 同一个 listener,与 anthropicProxy / serverAuthored /
  *  literatureProxy 共享 dispatchInternal 的 path-router。 */
-export const PLATFORM_PROMPT_SLOTS_PATH = "/internal/v3/platform-prompt-slots";
+export { PLATFORM_PROMPT_SLOTS_PATH } from "@openclaude/protocol";
 
 /** ?model query param 最长字节(防止恶意超长 query 撑大 log/RAM)。
  *  现实 model_id 最长 50 字符 (firstParty 带日期 alias);128 留充足头空间。 */

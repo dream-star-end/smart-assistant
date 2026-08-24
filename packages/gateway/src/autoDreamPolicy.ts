@@ -1,6 +1,7 @@
+import { AUTO_DREAM_POLICY_PATH } from '@openclaude/protocol'
 import { request as undiciRequest } from 'undici'
 
-export const AUTO_DREAM_POLICY_PATH = '/internal/v3/auto-dream-policy'
+export { AUTO_DREAM_POLICY_PATH }
 const FETCH_TIMEOUT_MS = 5_000
 const CACHE_TTL_MS = 30_000
 const MAX_BODY_BYTES = 64 * 1024

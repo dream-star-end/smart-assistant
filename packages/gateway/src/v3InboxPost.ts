@@ -20,8 +20,9 @@ import { createLogger } from './logger.js'
 
 const log = createLogger({ module: 'v3InboxPost' })
 
-/** 容器侧路径常量,必须与 master internal 路由 INBOX_POST_PATH 对齐。 */
-export const INBOX_POST_PATH = '/internal/v3/inbox-post'
+/** 单一权威在 protocol 内部路由注册表(master internal 路由同源)。 */
+import { INBOX_POST_PATH } from '@openclaude/protocol'
+export { INBOX_POST_PATH }
 
 const ATTEMPT_TIMEOUT_MS = 10_000
 /** 标题上限:站内信标题栏用,过长无意义。 */

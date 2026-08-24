@@ -1,5 +1,10 @@
 import { createHash } from 'node:crypto'
 import {
+  QQ_INBOUND_CONTAINER_PATH,
+  QQ_INBOUND_COMPENSATE_PATH,
+  QQ_STOP_CONTAINER_PATH,
+} from '@openclaude/protocol'
+import {
   QQBot,
   type QQBotInboundMessage,
   type QQBotOptions,
@@ -104,9 +109,9 @@ export function qqInboundChannelProfile(): NonNullable<InboundDispatcherDeps['ch
   return {
     id: 'qqbot',
     originChannel: 'qqbot',
-    inboundPath: '/internal/v3/qq-inbound',
-    compensatePath: '/internal/v3/qq-inbound-compensate',
-    stopPath: '/internal/v3/qq-stop',
+    inboundPath: QQ_INBOUND_CONTAINER_PATH,
+    compensatePath: QQ_INBOUND_COMPENSATE_PATH,
+    stopPath: QQ_STOP_CONTAINER_PATH,
     defaultSessionTitle: 'QQ 会话',
     decorateInboundText: (text) => appendReserved(text, QQ_CONTEXT_HINT),
     getCurrentSessionId: getCurrentQqSessionId,

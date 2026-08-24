@@ -11,7 +11,9 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { Readable } from 'node:stream'
 
-export const V3_CODEX_RELAY_PREFIX = '/internal/v3/codex-relay'
+import { CODEX_RELAY_PREFIX } from '@openclaude/protocol'
+
+export const V3_CODEX_RELAY_PREFIX = CODEX_RELAY_PREFIX
 export const V3_CODEX_UPSTREAM_AUTH_HEADER = 'x-openclaude-upstream-authorization'
 
 const HOP_BY_HOP_HEADERS = new Set([

@@ -25,6 +25,8 @@ import {
   type DispatchRequestContent,
   MODEL_AUTHORITY_KEYRING_ENV,
   ModelAuthorityError,
+  TURN_DISPATCH_STATE_PATH,
+  TURN_TAPE_STATE_PATH,
   computeDispatchRequestHash,
   parseAuthorityKeyring,
   verifyDispatchAuthority,
@@ -571,7 +573,7 @@ export interface MasterTapeStateResult {
 }
 
 /** GET /internal/v3/turn-tape-state?dispatchId=&attemptNo= 契约客户端。 */
-export const TURN_TAPE_STATE_PATH = '/internal/v3/turn-tape-state'
+export { TURN_TAPE_STATE_PATH }
 
 /**
  * 查询 master 该 dispatch 的 tape 终态。任何网络/非 2xx/畸形响应 → 'unreachable'
@@ -694,7 +696,7 @@ export function buildSyntheticCrashedTapePayload(row: TurnDispatchInboxRow): {
  */
 export function isInboundBypassMethodAllowed(method: string, pathname: string): boolean {
   if (method === 'POST') return true
-  return method === 'GET' && pathname === '/internal/v3/turn-dispatch-state'
+  return method === 'GET' && pathname === TURN_DISPATCH_STATE_PATH
 }
 
 // ---------------------------------------------------------------------------

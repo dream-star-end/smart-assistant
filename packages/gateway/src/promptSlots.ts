@@ -1203,7 +1203,8 @@ export async function buildLiteratureSkillSlot(): Promise<PromptSlot | null> {
 // **不回退** provider hook —— 在 v3 容器里 hook 注定是 dead code,回退只会制造
 // "某些异常环境双重注入" 的错觉。
 
-export const PLATFORM_PROMPT_SLOTS_PATH = '/internal/v3/platform-prompt-slots'
+import { PLATFORM_PROMPT_SLOTS_PATH } from '@openclaude/protocol'
+export { PLATFORM_PROMPT_SLOTS_PATH }
 
 /** v3 supervisor 注入的两个 env。命名故意与 v3MasterSink 一致 —— 是同一条出站通道。 */
 const ENV_MASTER_URL = 'OPENCLAUDE_V3_MASTER_BASE_URL'
