@@ -661,7 +661,8 @@ export const BRIDGE_ERROR_MESSAGES: Record<TurnErrorCode, string> = {
   upstream_failed: "任务执行暂时中断，你的消息已保留，可直接重试。",
   upstream_timeout: "模型响应超时，你的消息已保留，请重试。",
   network_error: "网络波动导致本轮中断，请重试。",
-  context_too_long: "上下文长度超过模型上限，请精简内容或开启新会话。",
+  context_too_long:
+    "本会话内容已超过模型的上下文上限。可以精简这条消息后重发、点击下方按钮在新会话中继续，或在上方切换支持更长上下文的模型。",
   bad_request: "这条请求无法被处理，请调整内容后重试。",
   // ── 引擎/平台执行 ──
   engine_error: "任务执行时遇到内部错误，你的消息已保留，可以直接重试。",

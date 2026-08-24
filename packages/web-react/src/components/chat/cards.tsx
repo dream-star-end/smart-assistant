@@ -15,6 +15,7 @@ import {
   ShieldCheck,
   Sparkles,
   MessageSquare,
+  MessageSquarePlus,
   Quote,
   Square,
   Target,
@@ -79,6 +80,8 @@ export type CardCallbacks = {
   onRegenerate?: () => void;
   onContinue?: () => void;
   onTopUp?: () => void;
+  /** context_too_long 类:在新会话中延续目标(导航非重发,同 onTopUp 不受末轮门控)。 */
+  onStartNewSession?: () => void;
   onFeedback?: (ctx: FeedbackContext) => void;
   onFirstTextPaint?: (input: {
     traceId: string;
@@ -575,8 +578,12 @@ export function AssistantCard({
     (sem.cta === "retry" || sem.cta === "retry_or_switch") &&
     !!cb.onRegenerate;
   const showTopUp = isInsufficient && !!cb.onTopUp;
+  // cta==='new_session'(上下文超限类):导航非重发,同「去充值」不受末轮门控。
+  const showNewSession =
+    !!presentedError && !presentedError.waived && sem.cta === "new_session" && !!cb.onStartNewSession;
   const showActionRow =
     showTopUp ||
+    showNewSession ||
     showInterruptedContinuation ||
     showPreciseRetry ||
     showRegenFallback ||
@@ -694,6 +701,15 @@ export function AssistantCard({
                     // insufficient_credits「去充值」= 导航非重发,不受末轮门控。
                     <Button size="sm" variant="accent" shape="pill" onClick={cb.onTopUp}>
                       <Wallet size={14} /> 去充值
+                    </Button>
+                  ) : showNewSession ? (
+                    <Button
+                      size="sm"
+                      variant="accent"
+                      shape="pill"
+                      onClick={cb.onStartNewSession}
+                    >
+                      <MessageSquarePlus size={14} /> 新建会话继续
                     </Button>
                   ) : showInterruptedContinuation ? (
                     <Button

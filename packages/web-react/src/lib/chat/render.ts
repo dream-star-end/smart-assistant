@@ -528,7 +528,7 @@ const ERROR_LABELS: Record<string, string> = {
   upstream_failed: "模型服务暂时中断",
   upstream_timeout: "模型响应超时",
   network_error: "网络异常，请重试",
-  context_too_long: "上下文超长，请精简或开新会话",
+  context_too_long: "会话内容超出模型上限",
   bad_request: "请求无法处理",
   // ── 引擎/平台执行 ──
   engine_error: "任务执行失败",

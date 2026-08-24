@@ -200,6 +200,25 @@ describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
     expect(screen.queryByRole("button", { name: "重新尝试" })).toBeNull();
   });
 
+  test("cta=new_session(context_too_long)→「新建会话继续」导航按钮,无重试类按钮", () => {
+    const onStartNewSession = vi.fn();
+    renderErr(errMsg({ _errorCode: "context_too_long", _clientMessageId: "u1" }), {
+      onStartNewSession,
+      onRetrySend: vi.fn(),
+      onRegenerate: vi.fn(),
+      resolveRetryTarget: () => retryableUser,
+    });
+    fireEvent.click(screen.getByRole("button", { name: "新建会话继续" }));
+    expect(onStartNewSession).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("button", { name: "重试" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "重新尝试" })).toBeNull();
+  });
+
+  test("context_too_long 未接 onStartNewSession 时不渲染孤立按钮", () => {
+    renderErr(errMsg({ _errorCode: "context_too_long" }), { onRegenerate: vi.fn() });
+    expect(screen.queryByRole("button", { name: "新建会话继续" })).toBeNull();
+  });
+
   test("免单码(no_response)非可重试红卡 → 不显精确「重试」(保留 onRegenerate 兜底)", () => {
     // waived=true 分支:presentedError.waived 为真 → retryEligible false。
     renderErr(errMsg({ _errorCode: "no_response", _clientMessageId: "u1", usage: { waived: true } }), {

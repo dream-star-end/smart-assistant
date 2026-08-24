@@ -1946,6 +1946,7 @@ export function App() {
       onRegenerate: regenerate,
       onContinue: () => send(CONTINUE_PROMPT),
       onTopUp: demo ? undefined : () => openSettings(),
+      onStartNewSession: demo ? undefined : newSession,
       onFeedback,
       onFirstTextPaint: demo
         ? undefined
@@ -2005,6 +2006,7 @@ export function App() {
       send,
       demo,
       openSettings,
+      newSession,
       onFeedback,
       retrySend,
       continueInterrupted,
