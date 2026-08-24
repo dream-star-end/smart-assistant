@@ -33,6 +33,10 @@ import (
 const LabelKey = "com.openclaude.v3.managed"
 const LabelValue = "1"
 
+// admin 容器 pidsLimit=0 时的实际上限。与 v3supervisor.ts 的 V3_ADMIN_PIDS_LIMIT 对齐:
+// memory/cpu 可以放开,pids 必须保底,否则 fork bomb 会耗尽宿主 PID 空间。
+const AdminPidsLimit = 16384
+
 // 单 cid 最大 in-flight = 1
 var perCidMu sync.Map // map[string]*sync.Mutex
 
@@ -309,7 +313,8 @@ func (r *Runner) Run(ctx context.Context, req *RunRequest) (*RunResponse, error)
 	if req.PidsLimit > 0 {
 		args = append(args, "--pids-limit", fmt.Sprintf("%d", req.PidsLimit))
 	} else {
-		args = append(args, "--pids-limit", "-1")
+		// admin "unlimited" 仍设高位上限:纯 -1 会让 fork bomb 直接打穿宿主 PID 空间。
+		args = append(args, "--pids-limit", fmt.Sprintf("%d", AdminPidsLimit))
 	}
 
 	args = append(args,
