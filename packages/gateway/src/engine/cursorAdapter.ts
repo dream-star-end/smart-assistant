@@ -1447,6 +1447,17 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         cwdSource: cwdDecision.source,
         sessionRepoOverlay: cwdDecision.sessionRepoOverlay,
       })
+      log.info('prompt_context_built', {
+        sessionKey: this.opts.sessionKey,
+        agentId: this.opts.agentId,
+        backend: 'cursor',
+        prompt_bytes: Buffer.byteLength(platformResult.content || '', 'utf8'),
+        prompt_sha256: createHash('sha256')
+          .update(platformResult.content || '', 'utf8')
+          .digest('hex')
+          .slice(0, 12),
+        board_project_id: this.opts.runContext?.boardProjectId ?? this.opts.projectId ?? null,
+      })
       const prompt = renderCursorPrompt(
         platformResult.content,
         payload,

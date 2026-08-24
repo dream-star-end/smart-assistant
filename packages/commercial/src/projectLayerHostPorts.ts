@@ -4,10 +4,11 @@
  * Container never receives DATABASE_URL. Apply is gated by OPENCLAUDE_PROJECT_LAYER_APPLY.
  */
 import { spawn } from 'node:child_process'
+import { existsSync } from 'node:fs'
 import { mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import {
-  ProjectMemoryDir,
   commitProjectSkillOverlay,
   loadProjectContext,
   projectContextDir,
@@ -17,8 +18,30 @@ import {
   type ProjectLayerLivePorts,
 } from '@openclaude/storage'
 
-export const HOST_LIVE_READ_SCRIPT =
-  '/opt/openclaude/wt-ocv5-project-layer/packages/commercial/scripts/ocv5-project-layer-live-read.py'
+const USAGE_ROW_ID_RE = /^\d{1,20}$/
+
+export function parseUsageRowId(raw: unknown): string | null {
+  if (typeof raw === 'number' && Number.isInteger(raw) && raw >= 0) return String(raw)
+  if (typeof raw !== 'string') return null
+  const s = raw.trim()
+  return USAGE_ROW_ID_RE.test(s) ? s : null
+}
+
+export function resolveLiveReadScript(explicit?: string): string {
+  if (explicit && existsSync(explicit)) return explicit
+  if (process.env.OC_OCV5_LIVE_READ_SCRIPT && existsSync(process.env.OC_OCV5_LIVE_READ_SCRIPT)) {
+    return process.env.OC_OCV5_LIVE_READ_SCRIPT
+  }
+  const here = fileURLToPath(new URL('.', import.meta.url))
+  const candidates = [
+    join(here, '../scripts/ocv5-project-layer-live-read.py'),
+    join(process.cwd(), 'packages/commercial/scripts/ocv5-project-layer-live-read.py'),
+    '/opt/openclaude/openclaude-v5-selfhost/packages/commercial/scripts/ocv5-project-layer-live-read.py',
+  ]
+  const hit = candidates.find((p) => existsSync(p))
+  if (hit) return hit
+  throw new Error('live_read_script_missing')
+}
 
 export type LiveSnapshot = {
   generatedAt: string
@@ -103,7 +126,7 @@ export async function fetchLiveSnapshot(opts: {
   boardProjectId: string
   scriptPath?: string
 }): Promise<LiveSnapshot> {
-  const script = opts.scriptPath || HOST_LIVE_READ_SCRIPT
+  const script = resolveLiveReadScript(opts.scriptPath)
   const raw = await runHost(
     ['python3', script, '--board', opts.boardProjectId, '--ids-json', '-', '--mode', 'snapshot'],
     JSON.stringify({ sessionIds: opts.sessionIds }),
@@ -153,7 +176,7 @@ export function applyArmed(): boolean {
 async function hostApply(mode: string, payload: unknown): Promise<unknown> {
   if (!applyArmed()) throw new Error('apply_disabled')
   const raw = await runHost(
-    ['python3', HOST_LIVE_READ_SCRIPT, '--mode', mode, '--ids-json', '-'],
+    ['python3', resolveLiveReadScript(), '--mode', mode, '--ids-json', '-'],
     JSON.stringify(payload),
   )
   return JSON.parse(raw)
@@ -182,11 +205,22 @@ export function makeApplyPorts(opts: { boardProjectId: string; snapshot: LiveSna
     },
     async createMemoryCandidate(input) {
       if (!applyArmed()) throw new Error('apply_disabled')
-      const dir = new ProjectMemoryDir(opts.boardProjectId)
-      const written = await dir.writeCandidate(input.slug.endsWith('.md') ? input.slug : `${input.slug}.md`, input.content, {
-        exclusive: true,
-      })
-      if (!written.ok) throw new Error(`memory_candidate_failed:${written.error}`)
+      const base = process.env.OC_GATEWAY_BASE_URL
+      if (!base) throw new Error('memory_api_base_missing')
+      const res = await fetch(
+        `${base.replace(/\/+$/, '')}/api/board/projects/${encodeURIComponent(opts.boardProjectId)}/memories`,
+        {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            authorization: `Bearer ${process.env.OC_GATEWAY_TOKEN || ''}`,
+          },
+          body: JSON.stringify({ slug: input.slug, content: input.content }),
+        },
+      )
+      if (!res.ok) throw new Error(`memory_api_${res.status}`)
+      const body = (await res.json()) as { candidate?: { id?: string; version?: number } }
+      if (!body.candidate?.id) throw new Error('memory_api_no_id')
     },
     async putSkillOverlay(names, expectedVersion) {
       if (!applyArmed()) throw new Error('apply_disabled')
@@ -204,10 +238,15 @@ export function makeApplyPorts(opts: { boardProjectId: string; snapshot: LiveSna
     },
     async repairOwnership(boardProjectId, uid, gid) {
       if (!applyArmed()) throw new Error('apply_disabled')
-      const dir = projectContextDir(boardProjectId)
-      await mkdir(dir, { recursive: true, mode: 0o750 })
-      await runHost(['chown', '-R', `${uid}:${gid}`, dir], '')
-      await runHost(['chmod', '-R', 'u+rwX,g+rX,o-rwx', dir], '')
+      const containerDir = `/home/agent/.openclaude/projects/${boardProjectId}`
+      const volumeDir = `/var/lib/docker/volumes/oc-v5-data-u3/_data/projects/${boardProjectId}`
+      await runHost(['mkdir', '-p', volumeDir], '')
+      await runHost(['chown', '-R', `${uid}:${gid}`, volumeDir], '')
+      await runHost(['chmod', '0750', volumeDir], '')
+      await runHost(
+        ['docker', 'exec', '-u', String(uid), 'oc-v5-u3', 'test', '-r', containerDir],
+        '',
+      )
     },
     async backfillUsage(input) {
       const got = (await hostApply('apply-usage-backfill', input)) as {

@@ -305,6 +305,7 @@ export function useTaskboard(
     async (id: string, type?: TicketType | '') => {
       setProjectId(id)
       projectIdRef.current = id
+      if (!id) return
       writeLastProjectId(id)
       if (type !== undefined) {
         setTicketType(type)

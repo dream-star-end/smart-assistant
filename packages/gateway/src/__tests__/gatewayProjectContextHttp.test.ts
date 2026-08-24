@@ -108,6 +108,14 @@ describe('Gateway HTTP entry for project context routes', () => {
       const agentSkills = await fetch(`${base}/api/agents/main/skills`, { headers })
       assert.equal(agentSkills.status, 200)
 
+      const previewAgent = await fetch(
+        `${base}/api/board/projects/${project.id}/context/preview?agentId=main`,
+        { headers },
+      )
+      assert.equal(previewAgent.status, 200)
+      const previewBody = (await previewAgent.json()) as { enabled?: boolean }
+      assert.equal(typeof previewBody.enabled, 'boolean')
+
       const overlay = await fetch(`${base}/api/board/projects/${project.id}/context`, {
         method: 'PUT',
         headers,

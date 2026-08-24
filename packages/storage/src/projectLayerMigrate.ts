@@ -454,7 +454,7 @@ export async function planProjectLayerMigration(opts: {
 
   const applyIdSet = new Set(moveIds)
   for (const row of opts.inventory.assets?.local_sqlite_rows ?? []) {
-    if (row.verdict !== 'candidate') continue
+    if (row.verdict !== 'promote' && row.verdict !== 'candidate') continue
     if (row.sensitive) {
       manualReview.push({ id: `asset-sensitive:${row.id}`, reason: 'sensitive asset excluded' })
       continue

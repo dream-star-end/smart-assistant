@@ -25,6 +25,7 @@ USAGE_USER = "3"
 OCV5 = "852859fa-cf1d-481c-96fd-23f2966b8b5f"
 UID3_VOL = "/var/lib/docker/volumes/oc-v5-data-u3/_data"
 ID_RE = re.compile(r"^[A-Za-z0-9._:-]{8,80}$")
+USAGE_ID_RE = re.compile(r"^\d{1,20}$")
 
 
 def sh(args: list[str], stdin: str | None = None, check: bool = True) -> str:
@@ -56,6 +57,27 @@ def clean_ids(raw: list[str]) -> list[str]:
     for x in raw:
         s = str(x).strip()
         if ID_RE.match(s):
+            out.append(s)
+    return out
+
+
+def parse_usage_row_id(raw) -> str | None:
+    if isinstance(raw, int) and raw >= 0:
+        return str(raw)
+    if isinstance(raw, str):
+        s = raw.strip()
+        if USAGE_ID_RE.match(s):
+            return s
+    return None
+
+
+def clean_usage_ids(raw: list) -> list[str]:
+    out = []
+    seen = set()
+    for x in raw:
+        s = parse_usage_row_id(x)
+        if s and s not in seen:
+            seen.add(s)
             out.append(s)
     return out
 
@@ -283,81 +305,93 @@ def apply_move_sessions(payload: dict) -> dict:
     project_id = str(payload.get("projectId") or "")
     if not ID_RE.match(project_id):
         raise SystemExit("invalid projectId")
-    stale = []
-    live = {s["id"]: s for s in query_sessions(ids)}
+    if len(expected) != len(ids) or {e.get("id") for e in expected} != set(ids):
+        raise SystemExit("expected_ids_mismatch")
+    values = []
     for exp in expected:
-        row = live.get(exp["id"])
-        if (
-            not row
-            or row.get("deletedAt")
-            or row.get("updatedAt") != exp.get("updatedAt")
-            or (row.get("projectId") or None) != (exp.get("projectId") or None)
-        ):
-            stale.append(exp["id"])
-    if stale:
-        return {"ok": False, "error": "stale_session", "staleIds": stale}
-    arr = sql_text_array(ids)
+        old_p = exp.get("projectId")
+        old_sql = "NULL" if old_p in (None, "") else "'" + str(old_p).replace("'", "''") + "'"
+        values.append(f"('{str(exp['id']).replace(chr(39), '')}', {old_sql}, {int(exp.get('updatedAt') or 0)})")
     sql = f"""
-UPDATE client_sessions
-   SET project_id = '{project_id}',
-       updated_at = (EXTRACT(EPOCH FROM NOW())*1000)::bigint
- WHERE user_id = '{USER_ID}' AND deleted_at IS NULL AND id = ANY({arr});
-SELECT COUNT(*) FROM client_sessions
- WHERE user_id = '{USER_ID}' AND project_id = '{project_id}' AND id = ANY({arr});
+BEGIN;
+WITH exp(id, old_project, old_updated) AS (
+  VALUES {", ".join(values)}
+), u AS (
+  UPDATE client_sessions cs
+     SET project_id = '{project_id}',
+         updated_at = GREATEST(cs.updated_at + 1, (EXTRACT(EPOCH FROM NOW())*1000)::bigint)
+    FROM exp
+   WHERE cs.user_id = '{USER_ID}'
+     AND cs.id = exp.id
+     AND cs.deleted_at IS NULL
+     AND cs.archived_at IS NULL
+     AND cs.updated_at = exp.old_updated
+     AND cs.project_id IS NOT DISTINCT FROM exp.old_project
+  RETURNING cs.id, cs.updated_at AS "updatedAt", cs.project_id AS "projectId"
+)
+SELECT json_build_object(
+  'ok', (SELECT COUNT(*) FROM u) = {len(ids)},
+  'updated', (SELECT COUNT(*) FROM u),
+  'post', COALESCE((SELECT json_agg(row_to_json(u) ORDER BY u.id) FROM u), '[]'::json)
+);
+COMMIT;
 """
-    n = psql(sql).strip().splitlines()[-1]
-    return {"ok": True, "updated": int(n)}
+    got = json.loads(psql(sql).strip() or "{}")
+    if not got.get("ok") or int(got.get("updated") or 0) != len(ids):
+        raise SystemExit(f"stale_session updated={got.get('updated')} expected={len(ids)}")
+    return got
 
 
 def apply_usage_backfill(payload: dict) -> dict:
     require_apply_armed()
     if not pg_has_usage_board_col():
         raise SystemExit("usage_board_column_missing")
-    row_ids = clean_ids(payload.get("rowIds") or [])
+    row_ids = clean_usage_ids(payload.get("rowIds") or [])
+    planned = int(payload.get("planned") or len(row_ids))
     board = str(payload.get("boardProjectId") or "")
     if not row_ids:
-        return {"rows": []}
+        raise SystemExit("usage_row_ids_empty")
     if not ID_RE.match(board):
         raise SystemExit("invalid boardProjectId")
     arr = sql_text_array(row_ids)
     sql = f"""
-UPDATE usage_records
-   SET board_project_id = '{board}',
-       board_project_source = 'migration_backfill',
-       board_project_captured_at = NOW()
- WHERE user_id = {USAGE_USER}::bigint
-   AND board_project_id IS NULL
-   AND id::text = ANY({arr})
-RETURNING id::text AS id, NULL::text AS "oldBoardProjectId";
+BEGIN;
+WITH u AS (
+  UPDATE usage_records
+     SET board_project_id = '{board}',
+         board_project_source = 'migration_backfill',
+         board_project_captured_at = NOW()
+   WHERE user_id = {USAGE_USER}::bigint
+     AND board_project_id IS NULL
+     AND id::text = ANY({arr})
+  RETURNING id::text AS id,
+            NULL::text AS "oldBoardProjectId",
+            board_project_id AS "newBoardProjectId",
+            board_project_source AS "newSource"
+)
+SELECT json_build_object(
+  'planned', {planned},
+  'updated', COUNT(*),
+  'recorded', COUNT(*),
+  'rows', COALESCE(json_agg(row_to_json(u) ORDER BY u.id), '[]'::json)
+) FROM u;
+COMMIT;
 """
-    raw = psql(sql).strip()
-    rows = []
-    if raw.startswith("["):
-        rows = json.loads(raw)
-    return {"rows": rows}
+    got = json.loads(psql(sql).strip() or "{}")
+    if int(got.get("updated") or 0) != planned or int(got.get("recorded") or 0) != planned:
+        raise SystemExit(f"usage_count_mismatch planned={planned} updated={got.get('updated')}")
+    return got
 
 
 def apply_usage_restore(payload: dict) -> dict:
     require_apply_armed()
     if not pg_has_usage_board_col():
         raise SystemExit("usage_board_column_missing")
-    row_ids = clean_ids([r.get("id") for r in (payload.get("rows") or []) if r.get("id")])
+    row_ids = clean_usage_ids([r.get("id") for r in (payload.get("rows") or []) if r.get("id")])
     board = str(payload.get("boardProjectId") or "")
     if not row_ids:
         return {"restored": 0}
     arr = sql_text_array(row_ids)
-    sql = f"""
-UPDATE usage_records
-   SET board_project_id = NULL,
-       board_project_source = NULL,
-       board_project_captured_at = NULL
- WHERE user_id = {USAGE_USER}::bigint
-   AND board_project_source = 'migration_backfill'
-   AND board_project_id = '{board}'
-   AND id::text = ANY({arr});
-SELECT ROW_COUNT();
-"""
-    # ROW_COUNT() isn't a thing; use GET DIAGNOSTICS via CTE returning
     sql = f"""
 WITH u AS (
   UPDATE usage_records

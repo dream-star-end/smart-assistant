@@ -9,6 +9,8 @@ import { createHash } from 'node:crypto'
 import { dirname } from 'node:path'
 import {
   OCV5_DEFAULT_BOARD_ID,
+  applyProjectLayerMigration,
+  assertPlanApplyable,
   planProjectLayerMigration,
   type ProjectLayerInventory,
 } from '../../storage/src/projectLayerMigrate.js'
@@ -16,6 +18,7 @@ import {
   fetchLiveSnapshot,
   makeApplyPorts,
   portsFromSnapshot,
+  resolveLiveReadScript,
   writeManifestPath,
   applyArmed,
 } from '../src/projectLayerHostPorts.js'
@@ -41,11 +44,7 @@ if (has(argv, '--apply') && !applyArmed()) {
 const inventoryPath = arg(argv, '--inventory')
 const target = arg(argv, '--target', OCV5_DEFAULT_BOARD_ID)
 const outPath = arg(argv, '--out', '')
-const scriptPath = arg(
-  argv,
-  '--live-read-script',
-  '/opt/openclaude/wt-ocv5-project-layer/packages/commercial/scripts/ocv5-project-layer-live-read.py',
-)
+const scriptPath = resolveLiveReadScript(arg(argv, '--live-read-script') || undefined)
 
 if (!inventoryPath) {
   console.error('--inventory <json> is required')
@@ -137,10 +136,40 @@ await mkdir(dirname(manifest), { recursive: true })
 await writeFile(manifest, text)
 
 if (has(argv, '--apply')) {
-  const applyPorts = makeApplyPorts({ boardProjectId: target, snapshot: snap })
-  console.error('apply ports constructed; refusing to execute in this round unless explicitly extended')
-  void applyPorts
-  process.exit(2)
+  const liveAgain = await fetchLiveSnapshot({
+    sessionIds: bindIds,
+    boardProjectId: target,
+    scriptPath,
+  })
+  const applyPlan = await planProjectLayerMigration({
+    inventory,
+    targetBoardProjectId: target,
+    ports: {
+      ...portsFromSnapshot(liveAgain),
+      async sha256File(absPath: string) {
+        const buf = await readFile(absPath)
+        return createHash('sha256').update(buf).digest('hex')
+      },
+    },
+    agentUid: 1000,
+    agentGid: 1000,
+  })
+  assertPlanApplyable(applyPlan)
+  if (applyPlan.live.boardArchived || !applyPlan.live.boardExists || !applyPlan.live.facadeUnique) {
+    console.error('apply precheck failed: board/facade')
+    process.exit(2)
+  }
+  const applyPorts = makeApplyPorts({ boardProjectId: target, snapshot: liveAgain })
+  const result = await applyProjectLayerMigration(applyPlan, applyPorts)
+  const resultPath = outPath || writeManifestPath(`${applyPlan.operationId}-result`)
+  await mkdir(dirname(resultPath), { recursive: true })
+  await writeFile(resultPath, JSON.stringify({ plan: applyPlan, result }, null, 2))
+  if (!result.ok) {
+    console.error(`apply failed: ${result.error}`)
+    process.exit(2)
+  }
+  console.error(`apply ok operationId=${result.operationId} applied=${result.applied.length}`)
+  process.exit(0)
 }
 
 console.log(text)

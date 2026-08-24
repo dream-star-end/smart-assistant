@@ -3,6 +3,7 @@
  * in headless streaming-json mode; subscription credentials never enter the
  * user container. Instead the master supplies an opaque, one-turn relay token.
  */
+import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { spawn, type ChildProcessByStdio } from 'node:child_process'
 import type { Readable } from 'node:stream'
@@ -576,6 +577,14 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
         cwd: cwdDecision.cwd,
         cwdSource: cwdDecision.source,
         sessionRepoOverlay: cwdDecision.sessionRepoOverlay,
+      })
+      log.info('prompt_context_built', {
+        sessionKey: this.opts.sessionKey,
+        agentId: this.opts.agentId,
+        backend: 'grok',
+        prompt_bytes: Buffer.byteLength(platform.content || '', 'utf8'),
+        prompt_sha256: createHash('sha256').update(platform.content || '', 'utf8').digest('hex').slice(0, 12),
+        board_project_id: this.opts.runContext?.boardProjectId ?? this.opts.projectId ?? null,
       })
       const body = platform.content ? `${platform.content}\n\n${input}` : input
       return `${GROK_PREAMBLE}\n${body}`

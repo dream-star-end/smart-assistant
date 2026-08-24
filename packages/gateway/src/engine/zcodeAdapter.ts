@@ -3,6 +3,7 @@
  * Not an official standalone CLI. Adapter never reads or logs the Coding Plan
  * key; hosted turns receive a short-lived loopback relay URL + opaque token.
  */
+import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { spawn, type ChildProcessByStdio } from 'node:child_process'
 import { closeSync, constants, existsSync, openSync, readFileSync, readSync, statSync } from 'node:fs'
@@ -540,6 +541,14 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
         cwd,
         cwdSource: cwdDecision?.source ?? (this.opts.projectId ? 'project_workspace' : 'default'),
         sessionRepoOverlay: cwdDecision?.sessionRepoOverlay ?? false,
+      })
+      log.info('prompt_context_built', {
+        sessionKey: this.opts.sessionKey,
+        agentId: this.opts.agentId,
+        backend: 'zcode',
+        prompt_bytes: Buffer.byteLength(platform.content || '', 'utf8'),
+        prompt_sha256: createHash('sha256').update(platform.content || '', 'utf8').digest('hex').slice(0, 12),
+        board_project_id: this.opts.runContext?.boardProjectId ?? this.opts.projectId ?? null,
       })
       return platform.content ? `${platform.content}\n\n${input}` : input
     } catch {

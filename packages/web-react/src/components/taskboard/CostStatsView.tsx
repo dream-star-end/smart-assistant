@@ -14,6 +14,7 @@ import {
   taskboardErrorMessage,
 } from '../../lib/taskboard'
 import type { AuthSession } from '../../lib/types'
+import { useProjectScope } from '../../hooks/useProjectScope'
 import { Button, Card, EmptyState, Field, Input, ListSkeleton, ProjectScopeSelect, Select, StatCard } from '../ui'
 import { CostCoverageBlock } from './CostCoverageBlock'
 
@@ -47,6 +48,8 @@ export function CostStatsView({
   projectId: string | null
   projects: Project[]
 }) {
+  const { scope } = useProjectScope()
+  const scopedProjectId = scope.kind === 'work' ? scope.workProject?.id ?? null : null
   const today = ymdInZone()
   const [from, setFrom] = useState(() => addDaysYmd(today, -6))
   const [to, setTo] = useState(today)
@@ -68,7 +71,7 @@ export function CostStatsView({
         from,
         to,
         groupBy,
-        projectId: projectId || filterProject || undefined,
+        projectId: scopedProjectId || undefined,
         timeZone: TZ,
       })
       setStats(fresh)
@@ -79,7 +82,7 @@ export function CostStatsView({
     } finally {
       setLoading(false)
     }
-  }, [auth, filterProject, from, groupBy, projectId, to])
+  }, [auth, from, groupBy, scopedProjectId, to])
 
   useEffect(() => {
     void load()

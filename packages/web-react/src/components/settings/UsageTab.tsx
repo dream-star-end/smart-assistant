@@ -15,10 +15,17 @@ import { useProjectScope } from "../../hooks/useProjectScope";
 import { Alert, Button, Progress, ProjectScopeSelect, Skeleton, Spinner, Tabs } from "../ui";
 import { formatReportBucket, REPORT_WINDOW_NOUN, shortTime } from "./labels";
 
-function boardProjectQuery(kind: string, workId: string | undefined): string | undefined {
-  if (kind === "ungrouped") return "none";
-  if (kind === "work" && workId) return workId;
-  return undefined;
+function boardProjectQuery(
+  kind: string,
+  workId: string | undefined,
+): { boardProjectId?: string; blocked?: string } {
+  if (kind === "ungrouped") return { boardProjectId: "none" };
+  if (kind === "work" && workId) return { boardProjectId: workId };
+  if (kind === "chat") {
+    if (workId) return { boardProjectId: workId };
+    return { blocked: "当前是未绑定的聊天项目，用量不能按该 facade 过滤，已停用以免误查全局。" };
+  }
+  return {};
 }
 
 const SESSIONS_PAGE = 20;
@@ -80,7 +87,8 @@ export function topModelsWithOther(
  */
 export function UsageTab({ auth }: { auth: AuthSession }) {
   const { scope } = useProjectScope();
-  const boardProjectId = boardProjectQuery(scope.kind, scope.workProject?.id);
+  const scopeQuery = boardProjectQuery(scope.kind, scope.workProject?.id);
+  const boardProjectId = scopeQuery.boardProjectId;
   // 全生命周期口径（缓存 / 节省 / 会话明细 / 累计）。
   const [data, setData] = useState<UsageResponse | null>(null);
   const [loading, setLoading] = useState(true);
@@ -116,6 +124,12 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
   // 全生命周期：首屏拉一次（会话首页 + 摘要 + 缓存 + 节省）。
   useEffect(() => {
     let alive = true;
+    if (scopeQuery.blocked) {
+      setLoading(false);
+      setData(null);
+      setErr(null);
+      return;
+    }
     setLoading(true);
     setErr(null);
     api
@@ -136,11 +150,17 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
     return () => {
       alive = false;
     };
-  }, [auth, usageReloadTick, boardProjectId]);
+  }, [auth, usageReloadTick, boardProjectId, scopeQuery.blocked]);
 
   // 窗口口径：window 切换或重试即重拉。切窗口先清 report 显 Skeleton。
   useEffect(() => {
     let alive = true;
+    if (scopeQuery.blocked) {
+      setReportLoading(false);
+      setReport(null);
+      setReportErr(null);
+      return;
+    }
     setReportLoading(true);
     setReportErr(null);
     setReport(null);
@@ -158,7 +178,7 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
     return () => {
       alive = false;
     };
-  }, [auth, window, reportReloadTick, boardProjectId]);
+  }, [auth, window, reportReloadTick, boardProjectId, scopeQuery.blocked]);
 
   const loadMore = useCallback(async () => {
     if (!hasMore || loadingMore) return;
@@ -265,6 +285,15 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
         >
           重试
         </Button>
+      </div>
+    );
+  }
+  if (scopeQuery.blocked) {
+    return (
+      <div className="px-5 py-4">
+        <Alert tone="warning" className="text-[12.5px]">
+          {scopeQuery.blocked}
+        </Alert>
       </div>
     );
   }

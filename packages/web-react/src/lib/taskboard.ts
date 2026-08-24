@@ -1506,10 +1506,10 @@ export const taskboardApi = {
       body,
     ),
 
-  previewProjectContext: (a: AuthSession, id: string) =>
+  previewProjectContext: (a: AuthSession, id: string, q?: { agentId?: string }) =>
     boardGet<Record<string, unknown>>(
       a,
-      `/api/board/projects/${encodeURIComponent(id)}/context/preview`,
+      `/api/board/projects/${encodeURIComponent(id)}/context/preview${qs(q)}`,
     ),
 
   getRunContext: (a: AuthSession, runId: string) =>

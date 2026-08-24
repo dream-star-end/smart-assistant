@@ -51,9 +51,15 @@ export async function resolveCronFireProject(
     return { ok: true, boardProjectId: null, mode: 'follow_session', source: 'follow_no_origin' }
   }
   const live = await ports.getSessionBoardProject(originId)
+  if (!live) {
+    return { ok: true, boardProjectId: null, mode: 'follow_session', source: 'follow_no_bind' }
+  }
+  const board = await ports.getBoardProject(live)
+  if (!board) return { ok: false, mode: 'follow_session', reason: 'follow_project_missing' }
+  if (board.archivedAt) return { ok: false, mode: 'follow_session', reason: 'follow_project_archived' }
   return {
     ok: true,
-    boardProjectId: live,
+    boardProjectId: board.id,
     mode: 'follow_session',
     source: 'follow_session',
   }

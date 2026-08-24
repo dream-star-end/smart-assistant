@@ -91,8 +91,11 @@ export function TaskboardView({
   const board = useTaskboard(auth, true, ticketTypeFromUrl)
   const projectScope = useProjectScope()
   useEffect(() => {
-    const id = projectScope.scope.workProject?.id
+    const id = projectScope.scope.workProject?.id ?? null
     if (id && id !== board.projectId) void board.selectProject(id)
+    if (!id && board.projectId) {
+      board.selectProject('')
+    }
   }, [projectScope.scope.workProject?.id, board.projectId, board.selectProject])
   const toast = useToast()
   const [confirm, confirmEl] = useConfirm()

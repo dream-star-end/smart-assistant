@@ -189,6 +189,10 @@ type FormSeed = {
  */
 export function CronPanel({ auth }: { auth: AuthSession }) {
   const { scope } = useProjectScope();
+  const cronBlocked =
+    scope.kind === "chat" && !scope.workProject
+      ? "当前是未绑定的聊天项目，定时任务不能按该 facade 过滤。"
+      : null;
   const boardProjectId =
     scope.kind === "ungrouped" ? "none" : scope.workProject?.id;
   const [jobs, setJobs] = useState<CronJob[] | null>(null);
@@ -246,6 +250,11 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
     let alive = true;
     setLoading(true);
     setErr(null);
+    if (cronBlocked) {
+      setLoading(false)
+      commitJobs([])
+      return
+    }
     api
       .listCron(auth, boardProjectId ? { boardProjectId } : undefined)
       .then((j) => {
@@ -260,7 +269,7 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
     return () => {
       alive = false;
     };
-  }, [auth, boardProjectId, commitJobs, reload]);
+  }, [auth, boardProjectId, commitJobs, cronBlocked, reload]);
 
   /** 首屏重试：唯一还会把面板塌回骨架的入口（此时本来也没有内容可保留）。 */
   const refresh = useCallback(() => setReload((n) => n + 1), []);

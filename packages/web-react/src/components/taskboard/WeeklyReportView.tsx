@@ -11,6 +11,7 @@ import {
   taskboardErrorMessage,
 } from '../../lib/taskboard'
 import type { AuthSession } from '../../lib/types'
+import { useProjectScope } from '../../hooks/useProjectScope'
 import {
   Button,
   Card,
@@ -41,6 +42,8 @@ export function WeeklyReportView({
   projectId: string | null
   projects: Project[]
 }) {
+  const { scope } = useProjectScope()
+  const scopedProjectId = scope.kind === 'work' ? scope.workProject?.id ?? null : null
   const [range, setRange] = useState<{ from?: string; to?: string }>({})
   const [filterProject, setFilterProject] = useState(projectId ?? '')
   const [loading, setLoading] = useState(true)
@@ -56,7 +59,7 @@ export function WeeklyReportView({
     setError(null)
     try {
       const fresh = await taskboardApi.getWeeklyReport(auth, {
-        projectId: projectId || filterProject || undefined,
+        projectId: scopedProjectId || undefined,
         from: range.from,
         to: range.to,
       })
@@ -68,7 +71,7 @@ export function WeeklyReportView({
     } finally {
       setLoading(false)
     }
-  }, [auth, filterProject, projectId, range.from, range.to])
+  }, [auth, range.from, range.to, scopedProjectId])
 
   useEffect(() => {
     void load()

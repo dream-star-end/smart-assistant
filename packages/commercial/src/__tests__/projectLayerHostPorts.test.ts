@@ -1,6 +1,13 @@
 import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
-import { applyArmed, makeApplyPorts, portsFromSnapshot, type LiveSnapshot } from '../projectLayerHostPorts.js'
+import {
+  applyArmed,
+  makeApplyPorts,
+  parseUsageRowId,
+  portsFromSnapshot,
+  resolveLiveReadScript,
+  type LiveSnapshot,
+} from '../projectLayerHostPorts.js'
 
 const OCV5 = '852859fa-cf1d-481c-96fd-23f2966b8b5f'
 
@@ -32,6 +39,28 @@ function snap(over: Partial<LiveSnapshot> = {}): LiveSnapshot {
     ...over,
   }
 }
+
+describe('parseUsageRowId', () => {
+  test('accepts short bigint ids and rejects session keys', () => {
+    assert.equal(parseUsageRowId('100'), '100')
+    assert.equal(parseUsageRowId('1000'), '1000')
+    assert.equal(parseUsageRowId(1000), '1000')
+    assert.equal(parseUsageRowId('webmt6uqcvnj6p069'), null)
+    assert.equal(parseUsageRowId(''), null)
+    assert.equal(parseUsageRowId('12ab'), null)
+  })
+})
+
+describe('resolveLiveReadScript', () => {
+  test('does not hardcode the feature worktree path as the only source', () => {
+    const p = resolveLiveReadScript()
+    assert.equal(p.includes('/packages/commercial/scripts/ocv5-project-layer-live-read.py'), true)
+    assert.equal(
+      p === '/opt/openclaude/wt-ocv5-project-layer/packages/commercial/scripts/ocv5-project-layer-live-read.py',
+      false,
+    )
+  })
+})
 
 describe('portsFromSnapshot', () => {
   test('exposes live session CAS tuple and usage row ids', async () => {

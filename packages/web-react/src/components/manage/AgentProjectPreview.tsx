@@ -21,7 +21,7 @@ export function AgentProjectPreview({ auth, agentId }: { auth: AuthSession; agen
     let cancelled = false;
     setLoading(true);
     void taskboardApi
-      .previewProjectContext(auth, workId)
+      .previewProjectContext(auth, workId, { agentId })
       .then((res) => {
         if (!cancelled) setPreview(res);
       })

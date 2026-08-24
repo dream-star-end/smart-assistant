@@ -2239,7 +2239,13 @@ export type BatchClientSessionsInput = {
 }
 
 export type BatchClientSessionsResult =
-  | { ok: true; updated: number; skipped: number; operationId?: string }
+  | {
+      ok: true
+      updated: number
+      skipped: number
+      operationId?: string
+      post?: Array<{ id: string; projectId: string | null; updatedAt: number }>
+    }
   | {
       ok: false
       error: 'invalid_ids' | 'invalid_action' | 'ids_limit' | 'project_not_found' | 'stale_session'
@@ -2350,6 +2356,13 @@ export function parseSessionBatchInput(input: BatchClientSessionsInput): BatchCl
   }
   const expectedSessions = parseExpectedSessions(input.expectedSessions)
   if (expectedSessions && 'invalid' in expectedSessions) return { ok: false, error: 'invalid_action' }
+  if (expectedSessions && expectedSessions.length > 0) {
+    if (expectedSessions.length !== ids.length) return { ok: false, error: 'stale_session', staleIds: ids }
+    const idSet = new Set(ids)
+    for (const row of expectedSessions) {
+      if (!idSet.has(row.id)) return { ok: false, error: 'stale_session', staleIds: [row.id] }
+    }
+  }
   const operationId =
     typeof input.operationId === 'string' && input.operationId.trim()
       ? input.operationId.trim().slice(0, 80)
@@ -6667,6 +6680,7 @@ async function _sqliteBatchClientSessions(
   if (ids.length === 0) return { ok: true, updated: 0, skipped: 0, operationId: parsed.operationId }
   const db = await getSessionsDb()
   const now = Date.now()
+  try {
   return db.transaction((): BatchClientSessionsResult => {
     if (parsed.expectedSessions && parsed.expectedSessions.length > 0) {
       const staleIds: string[] = []
@@ -6725,17 +6739,52 @@ async function _sqliteBatchClientSessions(
             AND id IN (${targetIds.map(() => '?').join(',')})`,
       ).run(now, userId, ...targetIds)
       updated = res.changes
+    } else if (parsed.expectedSessions && parsed.expectedSessions.length > 0) {
+      const post: Array<{ id: string; projectId: string | null; updatedAt: number }> = []
+      const upd = db.prepare(
+        `UPDATE client_sessions
+            SET project_id = ?, updated_at = MAX(updated_at + 1, ?)
+          WHERE id = ? AND user_id = ?
+            AND deleted_at IS NULL AND archived_at IS NULL
+            AND updated_at = ?
+            AND ((? IS NULL AND project_id IS NULL) OR project_id = ?)
+          RETURNING id, project_id, updated_at`,
+      )
+      for (const exp of parsed.expectedSessions) {
+        const row = upd.get(
+          parsed.projectId ?? null,
+          now,
+          exp.id,
+          userId,
+          exp.updatedAt,
+          exp.projectId,
+          exp.projectId,
+        ) as { id: string; project_id: string | null; updated_at: number } | undefined
+        if (!row) {
+          throw Object.assign(new Error('stale_session'), { staleIds: [exp.id] })
+        }
+        post.push({ id: row.id, projectId: row.project_id, updatedAt: row.updated_at })
+      }
+      if (post.length !== parsed.expectedSessions.length) {
+        throw Object.assign(new Error('stale_session'), { staleIds: ids })
+      }
+      return { ok: true, updated: post.length, skipped, operationId: parsed.operationId, post }
     } else {
       const res = db.prepare(
         `UPDATE client_sessions
             SET project_id = ?, updated_at = MAX(updated_at + 1, ?)
-          WHERE user_id = ? AND deleted_at IS NULL
+          WHERE user_id = ? AND deleted_at IS NULL AND archived_at IS NULL
             AND id IN (${targetIds.map(() => '?').join(',')})`,
       ).run(parsed.projectId ?? null, now, userId, ...targetIds)
       updated = res.changes
     }
     return { ok: true, updated, skipped, operationId: parsed.operationId }
   })()
+  } catch (err) {
+    const staleIds = (err as { staleIds?: string[] }).staleIds
+    if (staleIds) return { ok: false, error: 'stale_session', staleIds }
+    throw err
+  }
 }
 
 async function _sqliteMarkClientSessionRead(

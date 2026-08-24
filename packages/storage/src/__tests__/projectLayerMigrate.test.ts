@@ -50,7 +50,7 @@ function inventory(sessions: InventorySession[]): ProjectLayerInventory {
           session_id: 's-high',
           path: '/home/agent/.openclaude/generated/shot.png',
           digest: 'dd'.repeat(32),
-          verdict: 'candidate',
+          verdict: 'promote',
         },
         {
           id: 'a-unmoved',

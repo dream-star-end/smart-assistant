@@ -11186,18 +11186,62 @@ export function createPgSessionsBackend(
             [userId, targetIds],
           );
           updated = res.rowCount ?? 0;
+        } else if (parsed.expectedSessions && parsed.expectedSessions.length > 0) {
+          if (parsed.expectedSessions.length !== ids.length) {
+            throw Object.assign(new Error("stale_session"), { staleIds: ids, code: "stale_session" });
+          }
+          const post: Array<{ id: string; projectId: string | null; updatedAt: number }> = [];
+          for (const exp of parsed.expectedSessions) {
+            const res = await client.query<{
+              id: string;
+              project_id: string | null;
+              updated_at: string;
+            }>(
+              `UPDATE client_sessions
+                  SET project_id = $1,
+                      updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
+                WHERE id = $2 AND user_id = $3
+                  AND deleted_at IS NULL AND archived_at IS NULL
+                  AND updated_at = $4
+                  AND project_id IS NOT DISTINCT FROM $5
+              RETURNING id, project_id, updated_at`,
+              [parsed.projectId ?? null, exp.id, userId, exp.updatedAt, exp.projectId],
+            );
+            if ((res.rowCount ?? 0) !== 1) {
+              throw Object.assign(new Error("stale_session"), {
+                staleIds: [exp.id],
+                code: "stale_session",
+              });
+            }
+            const row = res.rows[0]!;
+            post.push({
+              id: row.id,
+              projectId: row.project_id,
+              updatedAt: Number(row.updated_at),
+            });
+          }
+          if (post.length !== parsed.expectedSessions.length) {
+            throw Object.assign(new Error("stale_session"), { staleIds: ids, code: "stale_session" });
+          }
+          return { ok: true, updated: post.length, skipped, operationId: parsed.operationId, post };
         } else {
           const res = await client.query(
             `UPDATE client_sessions
                 SET project_id = $1,
                     updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
-              WHERE user_id = $2 AND deleted_at IS NULL
+              WHERE user_id = $2 AND deleted_at IS NULL AND archived_at IS NULL
                 AND id = ANY($3::text[])`,
             [parsed.projectId ?? null, userId, targetIds],
           );
           updated = res.rowCount ?? 0;
         }
         return { ok: true, updated, skipped, operationId: parsed.operationId };
+      }).catch((err: unknown) => {
+        const e = err as { code?: string; staleIds?: string[] };
+        if (e.code === "stale_session") {
+          return { ok: false as const, error: "stale_session" as const, staleIds: e.staleIds };
+        }
+        throw err;
       });
     },
 

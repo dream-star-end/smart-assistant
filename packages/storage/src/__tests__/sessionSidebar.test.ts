@@ -237,6 +237,26 @@ describe('searchClientSessions', () => {
       assert.deepEqual(result.staleIds, ['web-cas'])
     }
   })
+
+  it('batch move expected/ids 数量不一致整批 stale', async () => {
+    const created = await createChatProject(USER, { name: 'cas2' })
+    assert.equal(created.ok, true)
+    const pid = created.ok ? created.project.id : ''
+    await upsertClientSession(sess('web-a', { title: 'a', lastAt: 1 }))
+    await upsertClientSession(sess('web-b', { title: 'b', lastAt: 1 }))
+    const listed = await listClientSessions(USER)
+    const a = listed.sessions.find((s) => s.id === 'web-a')
+    assert.ok(a)
+    const result = await batchClientSessions(USER, {
+      ids: ['web-a', 'web-b'],
+      action: 'move',
+      projectId: pid,
+      expectedSessions: [{ id: 'web-a', projectId: null, updatedAt: a.updatedAt }],
+      operationId: 'op-mismatch',
+    })
+    assert.equal(result.ok, false)
+    if (!result.ok) assert.equal(result.error, 'stale_session')
+  })
 })
 
 describe('batchClientSessions + 项目指令查找', () => {

@@ -53,6 +53,46 @@ describe('resolveCronFireProject', () => {
     if (!archived.ok) assert.equal(archived.reason, 'fixed_project_archived')
   })
 
+  it('follow_session fail-closes when bound board is missing or archived', async () => {
+    const missing = await resolveCronFireProject(
+      {
+        id: 'j',
+        schedule: '* * * * *',
+        agent: 'main',
+        prompt: 'p',
+        resume: 'origin-session',
+        sourceSessionKey: 'agent:main:webchat:dm:web-ghost',
+      },
+      {
+        ...ports,
+        async getSessionBoardProject() {
+          return 'bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee'
+        },
+      },
+    )
+    assert.equal(missing.ok, false)
+    if (!missing.ok) assert.equal(missing.reason, 'follow_project_missing')
+
+    const archived = await resolveCronFireProject(
+      {
+        id: 'j',
+        schedule: '* * * * *',
+        agent: 'main',
+        prompt: 'p',
+        resume: 'origin-session',
+        sourceSessionKey: 'agent:main:webchat:dm:web-arch',
+      },
+      {
+        ...ports,
+        async getSessionBoardProject() {
+          return 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+        },
+      },
+    )
+    assert.equal(archived.ok, false)
+    if (!archived.ok) assert.equal(archived.reason, 'follow_project_archived')
+  })
+
   it('follow_session uses current origin bind', async () => {
     const got = await resolveCronFireProject(
       {
