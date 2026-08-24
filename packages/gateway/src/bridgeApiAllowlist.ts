@@ -295,6 +295,14 @@ export const BRIDGE_API_ALLOWLIST: readonly BridgeApiAllowRule[] = [
     proxyFromCommercial: true,
   },
   {
+    // Item path is in server.ts dispatch even when the handler 404s today.
+    // Family-closure (#201) requires an explicit claim next to collection/action.
+    label: '/api/board/projects/:id/memories/:id',
+    re: /^\/api\/board\/projects\/[^/]+\/memories\/[^/]+$/,
+    methods: M('GET'),
+    proxyFromCommercial: true,
+  },
+  {
     label: '/api/board/projects/:id/memories/:id/:action',
     re: /^\/api\/board\/projects\/[^/]+\/memories\/[^/]+\/(promote|reject|deprecate)$/,
     methods: M('POST'),
