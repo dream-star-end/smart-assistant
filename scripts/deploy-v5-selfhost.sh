@@ -1189,6 +1189,7 @@ refresh_ccb_proxy_path() {
   systemctl restart "$V5_SSHGATE_UNIT" \
     || die "$V5_SSHGATE_UNIT restart failed after hostnet flush"
   iptables -C V5_EGRESS_IN -d 172.31.0.1 -p tcp --dport 18991 -j RETURN \
+    -m comment --comment "v5 CCB -> stable HTTPS proxy" \
     || die "V5_EGRESS_IN missing 172.31.0.1:18991 RETURN"
   timeout 10 bash -c 'exec 3<>/dev/tcp/172.31.0.1/18991' \
     || die "CCB HTTPS proxy listener 172.31.0.1:18991 is unreachable"
