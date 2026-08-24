@@ -3,6 +3,8 @@
 // agent:…:cron:dm:…) stays the default. This module is the stamp + text
 // contract; Gateway performs persist + dispatchInbound.
 
+import { createHash } from 'node:crypto'
+
 import { parseSessionKey } from '@openclaude/protocol'
 
 export type CronResumeMode = 'isolated' | 'origin-session'
@@ -63,7 +65,13 @@ export function cronOriginIdempotencyKey(jobId: string, deliveryId: string): str
   return `cron-origin:${jobId}:${deliveryId}`
 }
 
+/**
+ * clientMessageId = 可读前缀 + 无碰撞摘要。纯剥离非法字符会产生歧义:
+ * `cron.remind-a.123` 与 `cron.remind-a1.23` 剥点后同串,跨 job 互相幂等吞掉。
+ * 摘要保证不同 deliveryId 必得不同 id;结果满足 ^[A-Za-z0-9_-]{1,128}$。
+ */
 export function cronOriginClientMessageId(deliveryId: string): string {
-  const compact = deliveryId.replace(/[^A-Za-z0-9_-]/g, '').slice(0, 80)
-  return `cron-origin-${compact || 'job'}`
+  const compact = deliveryId.replace(/[^A-Za-z0-9_-]/g, '').slice(0, 60)
+  const digest = createHash('sha256').update(deliveryId, 'utf8').digest('hex').slice(0, 12)
+  return `cron-origin-${compact ? `${compact}-` : ''}${digest}`
 }
