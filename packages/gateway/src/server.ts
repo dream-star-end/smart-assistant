@@ -18889,6 +18889,10 @@ export const FILE_BLOCKED_PATTERNS = [
   /\/v3-master-retry\.d\//,
   /\/v3-wechat-retry\.d\//,
 
+  // Cursor CLI cold-start diagnostics (oc-cursor.sh OPENCLAUDE_CURSOR_AGENT_DEBUG):
+  // raw CLI stderr/debug logs may carry prompts, tool args and auth diagnostics.
+  /\/logs\/cursor-cli\//,
+
   // Per-agent session JSONL subtree (thinking + tool args, may embed tokens).
   /\/\.openclaude\/agents\/[^/]+\/sessions\//,
 

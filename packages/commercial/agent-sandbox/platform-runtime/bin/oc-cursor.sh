@@ -39,7 +39,9 @@ EOF
 # it inside an `|| true` cleanup path.
 for required_tool in /usr/bin/sudo /usr/bin/test /bin/cat /bin/ls \
   /usr/bin/mktemp /bin/rm /bin/sleep /usr/bin/setsid /usr/bin/stat \
-  /usr/bin/id /bin/mkdir /bin/cp /bin/chmod /bin/mv /bin/date /bin/ln; do
+  /usr/bin/id /bin/mkdir /bin/cp /bin/chmod /bin/mv /bin/date /bin/ln \
+  /usr/bin/cut /usr/bin/find /usr/bin/mkfifo /usr/bin/sha256sum \
+  /usr/bin/tail /usr/bin/tee; do
   [ -x "$required_tool" ] || die "runtime image is missing $required_tool"
 done
 
@@ -325,6 +327,10 @@ umask 077
 cursor_home=$(/usr/bin/mktemp -d /tmp/openclaude-cursor.XXXXXXXX) \
   || die "cannot create ephemeral Cursor state"
 child_pid=""
+cursor_debug=0
+debug_log=""
+debug_fifo=""
+tee_pid=""
 
 # `kill` must stay the shell builtin. On Debian /bin/kill belongs to procps,
 # which the runtime image does not install, so an absolute path silently exits
@@ -347,6 +353,23 @@ cleanup() {
   fi
   if [ -n "$child_pid" ]; then
     wait "$child_pid" 2>/dev/null || true
+  fi
+  # Debug mode: the CLI's own debug logs live inside the ephemeral HOME and
+  # would die with it. Salvage a bounded copy into the durable 0600 log before
+  # removal. find does not follow symlinks; per-file cap keeps the log sane.
+  if [ "${cursor_debug:-0}" = "1" ] && [ -n "${debug_log:-}" ] && [ ! -L "$debug_log" ]; then
+    /usr/bin/find "$cursor_home" -maxdepth 6 -type f -name '*.log' 2>/dev/null \
+      | while IFS= read -r cli_log; do
+          printf '\n[oc-cursor] -- CLI log tail: %s --\n' "${cli_log#"$cursor_home"/}" \
+            >> "$debug_log" 2>/dev/null || true
+          /usr/bin/tail -c 1048576 -- "$cli_log" >> "$debug_log" 2>/dev/null || true
+        done
+  fi
+  # tee is not in the CLI process group; if a stray descendant kept the fifo
+  # write end open (or the CLI never opened it), terminate tee explicitly so
+  # it can never outlive the wrapper.
+  if [ -n "${tee_pid:-}" ] && kill -0 "$tee_pid" 2>/dev/null; then
+    kill -TERM "$tee_pid" 2>/dev/null || true
   fi
   /bin/rm -rf -- "$cursor_home"
 }
@@ -461,6 +484,50 @@ if [ -n "$hooks_json" ]; then
 fi
 unset OPENCLAUDE_CURSOR_HOOKS_JSON
 
+# ── Optional CLI cold-start diagnostics (OPENCLAUDE_CURSOR_AGENT_DEBUG=1) ──
+# Default OFF: behavior stays bit-identical to the historical wrapper. When
+# ON, the pinned CLI keeps its own debug logging (CURSOR_AGENT_DISABLE_DEBUG_LOG
+# is NOT set) and stderr is duplicated through a fifo+tee into a durable 0600
+# log under OPENCLAUDE_HOME/logs/cursor-cli/, so 30-40s cold starts can be
+# attributed (login/JWT vs cloud handshake vs MCP). Session key never enters
+# the path (sha256 prefix only). 10MB single rotation + 7-day retention.
+# Every validation failure fails OPEN to "no log" — it must never fail the
+# turn, change the CLI exit status, or detach $child_pid from the CLI group.
+if [ "${OPENCLAUDE_CURSOR_AGENT_DEBUG:-}" = "1" ] && [ -n "$oc_home" ] && [ -d "$oc_home" ]; then
+  log_root="$oc_home/logs/cursor-cli"
+  if /bin/mkdir -p -m 0700 -- "$log_root" 2>/dev/null \
+    && [ -d "$log_root" ] && [ ! -L "$oc_home/logs" ] && [ ! -L "$log_root" ]; then
+    /bin/chmod 0700 -- "$oc_home/logs" "$log_root" 2>/dev/null || true
+    session_hash=$(printf '%s' "${OC_SESSION_KEY:-unknown}" \
+      | /usr/bin/sha256sum 2>/dev/null | /usr/bin/cut -c1-16)
+    if [ -n "$session_hash" ]; then
+      debug_log="$log_root/cursor-cli-$session_hash.log"
+      if [ ! -L "$debug_log" ]; then
+        log_size=$(/usr/bin/stat -c %s -- "$debug_log" 2>/dev/null || echo 0)
+        if [ "$log_size" -gt 10485760 ]; then
+          /bin/mv -f -- "$debug_log" "$debug_log.1" 2>/dev/null || true
+        fi
+        /usr/bin/find "$log_root" -maxdepth 1 -type f -name 'cursor-cli-*.log*' \
+          -mtime +7 -delete 2>/dev/null || true
+        debug_fifo="$cursor_home/.oc-debug-stderr"
+        if /usr/bin/mkfifo -m 0600 -- "$debug_fifo" 2>/dev/null; then
+          if printf '\n[oc-cursor] ==== turn %s ====\n' \
+            "$(/bin/date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)" \
+            >> "$debug_log" 2>/dev/null; then
+            # tee is a wrapper child, NOT in the CLI process group: Stop kills
+            # the group, the fifo write end closes, tee exits on EOF. stderr
+            # keeps flowing to the gateway via >&2.
+            /usr/bin/tee -a -- "$debug_log" < "$debug_fifo" >&2 &
+            tee_pid=$!
+            cursor_debug=1
+          fi
+        fi
+      fi
+    fi
+  fi
+fi
+unset OPENCLAUDE_CURSOR_AGENT_DEBUG
+
 prompt=$1
 shift
 for word in "$@"; do
@@ -482,15 +549,35 @@ fi
 # setsid gives the CLI and every tool child one process group so Stop cannot
 # leave a shell command running after the wrapper exits. HOME is per-call and
 # deleted on every exit, including Cursor's generated auth.json/JWT state.
+# The debug branch differs ONLY in (a) not disabling the CLI debug log and
+# (b) redirecting stderr through the fifo tee — same setsid group, same $!,
+# same exit-status propagation. No pipeline: `wait` still returns the CLI's
+# own status.
 set +e
-HOME="$cursor_home" \
-XDG_CONFIG_HOME="$cursor_home/.config" \
-CURSOR_AGENT_DISABLE_DEBUG_LOG=1 \
-CURSOR_API_KEY="$api_key" \
-/usr/bin/setsid "$cursor_bin" "$@" &
+if [ "$cursor_debug" -eq 1 ]; then
+  HOME="$cursor_home" \
+  XDG_CONFIG_HOME="$cursor_home/.config" \
+  CURSOR_API_KEY="$api_key" \
+  /usr/bin/setsid "$cursor_bin" "$@" 2> "$debug_fifo" &
+else
+  HOME="$cursor_home" \
+  XDG_CONFIG_HOME="$cursor_home/.config" \
+  CURSOR_AGENT_DISABLE_DEBUG_LOG=1 \
+  CURSOR_API_KEY="$api_key" \
+  /usr/bin/setsid "$cursor_bin" "$@" &
+fi
 child_pid=$!
 wait "$child_pid"
 status=$?
+# Bounded drain for tee (≤2s): descendants killed by cleanup may still hold
+# the fifo write end; never let a stuck tee hang the turn — cleanup TERMs it.
+if [ -n "$tee_pid" ]; then
+  attempts=0
+  while [ "$attempts" -lt 40 ] && kill -0 "$tee_pid" 2>/dev/null; do
+    /bin/sleep 0.05
+    attempts=$((attempts + 1))
+  done
+fi
 set -e
 
 # A failed turn may be a quota/credential problem on the slot it used: hand
