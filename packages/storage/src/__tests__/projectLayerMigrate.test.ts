@@ -9,6 +9,7 @@ import {
   planProjectLayerMigration,
   readMemoryContent,
   repairProjectDirOwnership,
+  summarizeManualReview,
   type ApplyPorts,
   type ApplyResult,
   type InventorySession,
@@ -289,6 +290,55 @@ describe('usage backfill + cron impact + count drift', () => {
     assert.equal(plan.expectedCounts.drifted, true)
     assert.ok(plan.risks.some((r) => r.includes('inventory_count_drift')))
     assert.throws(() => assertPlanApplyable(plan), /inventory_count_drift/)
+  })
+
+  it('summarizeManualReview does not double-count asset-unmoved on an already-listed session', () => {
+    const summary = summarizeManualReview([
+      { id: 'low:l1', reason: 'low-confidence — never default-migrate', sessionId: 'l1' },
+      { id: 'archived:a1', reason: 'archived_at is not null — human only', sessionId: 'a1' },
+      { id: 'asset-unmoved:x', reason: 'asset session not in default apply set', sessionId: 'l1' },
+      { id: 'asset-unmoved:y', reason: 'asset session not in default apply set', sessionId: 'u1' },
+    ])
+    assert.equal(summary.rows, 4)
+    assert.equal(summary.people, 3)
+    assert.equal(summary.duplicateSessionRows, 1)
+    assert.equal(summary.uniqueSessions, 3)
+  })
+
+  it('62 apply + 47 unique review people stays sealed even with duplicate asset-unmoved rows', async () => {
+    const apply = Array.from({ length: 62 }, (_, i) => sess({ id: `a${i}` }))
+    const lows = Array.from({ length: 44 }, (_, i) => sess({ id: `l${i}`, confidence: 'low' }))
+    const archived = [sess({ id: 'arch1', archived_at: 1 })]
+    const bind = [...apply, ...lows, ...archived]
+    const plan = await planProjectLayerMigration({
+      inventory: {
+        sessionMapping: {
+          sessions: bind,
+          bind_to_ocv5_chat: { ids: bind.map((s) => s.id) },
+        },
+        assets: {
+          local_sqlite_rows: [
+            { id: 'dup-low', name: 'shot.png', session_id: 'l0', path: '/x', digest: 'aa'.repeat(32), verdict: 'candidate' },
+            { id: 'dup-low-2', name: 'n2.md', session_id: 'l1', path: '/x', digest: 'ab'.repeat(32), verdict: 'promote' },
+            { id: 'uniq-1', name: 'n3.md', session_id: 'outsider-1', path: '/x', digest: 'ac'.repeat(32), verdict: 'candidate' },
+            { id: 'uniq-2', name: 'n4.md', session_id: 'outsider-2', path: '/x', digest: 'ad'.repeat(32), verdict: 'promote' },
+          ],
+        },
+        ocv5ChatFacade: { bindTargetBoardProjectId: OCV5 },
+      },
+      ports: ports({
+        async getSession(id) {
+          return { id, projectId: null, updatedAt: 10, deletedAt: null, archivedAt: null }
+        },
+      }),
+    })
+    assert.equal(plan.defaultApplySessionIds.length, 62)
+    assert.equal(plan.manualReview.length, 49)
+    assert.equal(plan.expectedCounts.actualManualReviewRows, 49)
+    assert.equal(plan.expectedCounts.actualManualReview, 47)
+    assert.equal(plan.expectedCounts.drifted, false)
+    assert.equal(plan.expectedCounts.driftReasons.some((r) => r.kind === 'manualReview_duplicate_session_rows'), true)
+    assert.doesNotThrow(() => assertPlanApplyable(plan))
   })
 
   it('compensate restores only this operation usage rows that did not change again', async () => {

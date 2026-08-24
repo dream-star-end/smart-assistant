@@ -151,6 +151,15 @@ export function hostBin(): string {
   return process.env.OC_HOST_BIN || '/home/agent/.local/bin/host'
 }
 
+/** Coordinator runs in the uid3 container; host python must see the host path. */
+export function liveReadScriptPathForHost(path: string): string {
+  try {
+    return containerToHostPath(path)
+  } catch {
+    return path
+  }
+}
+
 export function runHost(args: string[], stdin: string, timeoutMs = 120_000): Promise<string> {
   return new Promise((resolve, reject) => {
     const child = spawn(hostBin(), args, { stdio: ['pipe', 'pipe', 'pipe'] })
@@ -186,7 +195,16 @@ export async function fetchLiveSnapshot(opts: {
   script: LiveReadHandle
 }): Promise<LiveSnapshot> {
   const raw = await runHost(
-    ['python3', opts.script.path, '--board', opts.boardProjectId, '--ids-json', '-', '--mode', 'snapshot'],
+    [
+      'python3',
+      liveReadScriptPathForHost(opts.script.path),
+      '--board',
+      opts.boardProjectId,
+      '--ids-json',
+      '-',
+      '--mode',
+      'snapshot',
+    ],
     JSON.stringify({ sessionIds: opts.sessionIds }),
   )
   const snap = JSON.parse(raw) as LiveSnapshot
@@ -248,7 +266,7 @@ async function hostApply(
 ): Promise<unknown> {
   if (!applyArmed()) throw new Error('apply_disabled')
   const raw = await runHost(
-    ['python3', script.path, '--mode', mode, '--ids-json', '-'],
+    ['python3', liveReadScriptPathForHost(script.path), '--mode', mode, '--ids-json', '-'],
     JSON.stringify(payload),
   )
   return JSON.parse(raw)
