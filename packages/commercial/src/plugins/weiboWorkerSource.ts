@@ -1397,7 +1397,7 @@ async function armFileChooser(page, clickable, files) {
     }
     return chooser || null;
   }).catch(() => null);
-  const clickPromise = clickable.click({ timeout: 5_000, force: true }).catch(() => null);
+  const clickPromise = clickable.click({ timeout: 5_000, force: true, noWaitAfter: true }).catch(() => null);
   let timer = null;
   const timeoutPromise = new Promise((resolve) => {
     timer = setTimeout(() => resolve('__timeout__'), 8_000);
