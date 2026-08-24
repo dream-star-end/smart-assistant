@@ -200,6 +200,14 @@ export type ProjectLayerPlan = {
   usageBackfill: {
     sessionIds: string[]
     rowIds: string[]
+    rows: Array<{
+      id: string
+      sessionId: string | null
+      parentSessionId: string | null
+      boardProjectId: string | null
+      source: string | null
+    }>
+    queried: boolean
     source: 'migration_backfill'
   }
 }
@@ -210,7 +218,15 @@ export type ProjectLayerLivePorts = {
   getSession(id: string): Promise<LiveSessionSnapshot | null>
   getProjectContextVersion(id: string): Promise<number | null>
   sha256File?(absPath: string): Promise<string>
-  listNullUsage?(sessionIds: string[]): Promise<Array<{ id: string; sessionId: string | null; parentSessionId: string | null }>>
+  listNullUsage?(sessionIds: string[]): Promise<
+    Array<{
+      id: string
+      sessionId: string | null
+      parentSessionId: string | null
+      boardProjectId?: string | null
+      source?: string | null
+    }>
+  >
   listCronJobs?(): Promise<Array<{
     id: string
     projectMode?: string
@@ -490,11 +506,21 @@ export async function planProjectLayerMigration(opts: {
     risks.push(`target contextVersion=${contextVersion} — overlay/memory writes must use CAS expectedVersion`)
   }
 
-  const usageRowIds: string[] = []
+  const usageRows: ProjectLayerPlan['usageBackfill']['rows'] = []
+  let usageQueried = false
   if (moveIds.length) {
     if (opts.ports.listNullUsage) {
+      usageQueried = true
       const rows = await opts.ports.listNullUsage(moveIds)
-      for (const row of rows) usageRowIds.push(row.id)
+      for (const row of rows) {
+        usageRows.push({
+          id: row.id,
+          sessionId: row.sessionId,
+          parentSessionId: row.parentSessionId,
+          boardProjectId: row.boardProjectId ?? null,
+          source: row.source ?? null,
+        })
+      }
     }
     operations.push({
       id: 'OP_USAGE_BACKFILL',
@@ -503,7 +529,7 @@ export async function planProjectLayerMigration(opts: {
       sessionIds: moveIds,
       boardProjectId: target,
       source: 'migration_backfill',
-      rowIds: usageRowIds,
+      rowIds: usageRows.map((r) => r.id),
     })
   }
 
@@ -581,7 +607,9 @@ export async function planProjectLayerMigration(opts: {
     cronImpact,
     usageBackfill: {
       sessionIds: moveIds,
-      rowIds: usageRowIds,
+      rowIds: usageRows.map((r) => r.id),
+      rows: usageRows,
+      queried: usageQueried,
       source: 'migration_backfill',
     },
   }
@@ -620,6 +648,7 @@ export type ApplyPorts = ProjectLayerLivePorts & {
   backfillUsage?(input: {
     operationId: string
     sessionIds: string[]
+    rowIds: string[]
     boardProjectId: string
     source: 'migration_backfill'
   }): Promise<Array<{ id: string; oldBoardProjectId: string | null }>>
@@ -695,10 +724,12 @@ export async function applyProjectLayerMigration(
         rollback.assetDeletes.push(asset.id)
         applied.push(op.id)
       } else if (op.op === 'usage_backfill') {
-        if (ports.backfillUsage) {
+        const rowIds = op.rowIds ?? []
+        if (ports.backfillUsage && rowIds.length) {
           const rows = await ports.backfillUsage({
             operationId: plan.operationId,
             sessionIds: op.sessionIds,
+            rowIds,
             boardProjectId: op.boardProjectId,
             source: 'migration_backfill',
           })

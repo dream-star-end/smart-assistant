@@ -200,6 +200,8 @@ describe('usage backfill + cron impact + count drift', () => {
     assert.ok(backfill && backfill.op === 'usage_backfill')
     assert.deepEqual(backfill.sessionIds, ['s-high'])
     assert.deepEqual(backfill.rowIds, ['u-1'])
+    assert.equal(plan.usageBackfill.queried, true)
+    assert.equal(plan.usageBackfill.rows[0]?.id, 'u-1')
     assert.equal(plan.cronImpact.length, 1)
     assert.equal(plan.cronImpact[0].action, 'manualReview')
     assert.ok(!plan.operations.some((o) => o.op === 'usage_backfill' && 'rewriteCron' in o))

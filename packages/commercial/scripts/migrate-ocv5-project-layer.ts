@@ -1,26 +1,24 @@
 #!/usr/bin/env tsx
 /**
  * OCV5 project-layer migration coordinator CLI.
- * Default is dry-run. --apply is refused unless OPENCLAUDE_PROJECT_LAYER_APPLY=1
- * (this phase never sets that; live write is out of scope).
- *
- *   npx tsx packages/commercial/scripts/migrate-ocv5-project-layer.ts \
- *     --inventory /path/inventory.json \
- *     --target 852859fa-cf1d-481c-96fd-23f2966b8b5f \
- *     --dry-run \
- *     --out /path/dry-run.json
+ * Default is dry-run. --apply is refused unless OPENCLAUDE_PROJECT_LAYER_APPLY=1.
+ * Live PG is read via host python (no DATABASE_URL in the container).
  */
-import { readFile, writeFile } from 'node:fs/promises'
+import { readFile, writeFile, mkdir } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
-import Database from 'better-sqlite3'
+import { dirname } from 'node:path'
 import {
   OCV5_DEFAULT_BOARD_ID,
   planProjectLayerMigration,
-  type LiveBoardProject,
-  type LiveSessionSnapshot,
   type ProjectLayerInventory,
-  type ProjectLayerLivePorts,
 } from '../../storage/src/projectLayerMigrate.js'
+import {
+  fetchLiveSnapshot,
+  makeApplyPorts,
+  portsFromSnapshot,
+  writeManifestPath,
+  applyArmed,
+} from '../src/projectLayerHostPorts.js'
 
 function arg(argv: string[], name: string, fallback = ''): string {
   const i = argv.indexOf(name)
@@ -35,17 +33,19 @@ function has(argv: string[], name: string): boolean {
 }
 
 const argv = process.argv
-if (has(argv, '--apply')) {
-  if (process.env.OPENCLAUDE_PROJECT_LAYER_APPLY !== '1') {
-    console.error('refuse --apply: this phase is dry-run only (OPENCLAUDE_PROJECT_LAYER_APPLY!=1)')
-    process.exit(2)
-  }
+if (has(argv, '--apply') && !applyArmed()) {
+  console.error('refuse --apply: OPENCLAUDE_PROJECT_LAYER_APPLY!=1 (this round is dry-run only)')
+  process.exit(2)
 }
 
 const inventoryPath = arg(argv, '--inventory')
 const target = arg(argv, '--target', OCV5_DEFAULT_BOARD_ID)
 const outPath = arg(argv, '--out', '')
-const dbPath = arg(argv, '--taskboard-db', process.env.OPENCLAUDE_HOME ? `${process.env.OPENCLAUDE_HOME}/taskboard.db` : '')
+const scriptPath = arg(
+  argv,
+  '--live-read-script',
+  '/opt/openclaude/wt-ocv5-project-layer/packages/commercial/scripts/ocv5-project-layer-live-read.py',
+)
 
 if (!inventoryPath) {
   console.error('--inventory <json> is required')
@@ -53,77 +53,29 @@ if (!inventoryPath) {
 }
 
 const inventory = JSON.parse(await readFile(inventoryPath, 'utf8')) as ProjectLayerInventory
-
-function boardFromSqlite(path: string, id: string): LiveBoardProject | null {
-  const db = new Database(path, { readonly: true, fileMustExist: true })
-  try {
-    const row = db.prepare(
-      'SELECT id, key, archived_at, context_version FROM tb_project WHERE id = ?',
-    ).get(id) as { id: string; key: string; archived_at: number | null; context_version: number } | undefined
-    if (!row) return null
-    return {
-      id: row.id,
-      key: row.key,
-      archivedAt: row.archived_at,
-      contextVersion: row.context_version ?? 0,
-    }
-  } finally {
-    db.close()
-  }
+const bindIds = inventory.sessionMapping.bind_to_ocv5_chat?.ids ?? inventory.sessionMapping.sessions.map((s) => s.id)
+if (!bindIds.length) {
+  console.error('inventory has no session ids')
+  process.exit(2)
 }
 
-const ports: ProjectLayerLivePorts = {
-  async getBoardProject(id) {
-    if (!dbPath) return id === target ? { id, key: 'OCV5', archivedAt: null, contextVersion: 0 } : null
-    try {
-      return boardFromSqlite(dbPath, id)
-    } catch {
-      return null
-    }
-  },
-  async listChatProjects() {
-    return []
-  },
-  async getSession(id) {
-    const s = inventory.sessionMapping.sessions.find((row) => row.id === id)
-    if (!s) return null
-    const snap: LiveSessionSnapshot = {
-      id: s.id,
-      projectId: s.project_id ?? null,
-      updatedAt: typeof s.updated_at === 'number' ? s.updated_at : 0,
-      deletedAt: s.deleted_at ? 1 : null,
-      archivedAt: s.archived_at ? 1 : null,
-    }
-    return snap
-  },
-  async getProjectContextVersion(id) {
-    if (!dbPath) return 0
-    try {
-      return boardFromSqlite(dbPath, id)?.contextVersion ?? 0
-    } catch {
-      return 0
-    }
-  },
-  async sha256File(absPath) {
+const snap = await fetchLiveSnapshot({
+  sessionIds: bindIds,
+  boardProjectId: target,
+  scriptPath,
+})
+
+if (!snap.readonly) {
+  console.error('live snapshot is not readonly')
+  process.exit(2)
+}
+
+const livePorts = portsFromSnapshot(snap)
+const ports = {
+  ...livePorts,
+  async sha256File(absPath: string) {
     const buf = await readFile(absPath)
     return createHash('sha256').update(buf).digest('hex')
-  },
-  async listCronJobs() {
-    const home = process.env.OPENCLAUDE_HOME
-    if (!home) return []
-    try {
-      const raw = await readFile(`${home}/cron.yaml`, 'utf8')
-      const { parse } = await import('yaml')
-      const file = parse(raw) as { jobs?: Array<{ id?: string; projectMode?: string; boardProjectId?: string; sourceSessionKey?: string }> }
-      return (file.jobs ?? []).filter((j) => j.id).map((j) => ({
-        id: String(j.id),
-        projectMode: j.projectMode,
-        boardProjectId: j.boardProjectId ?? null,
-        sourceSessionKey: j.sourceSessionKey,
-      }))
-    } catch {
-      return []
-    }
   },
 }
 
@@ -135,9 +87,63 @@ const plan = await planProjectLayerMigration({
   agentGid: 1000,
 })
 
-const text = JSON.stringify(plan, null, 2)
-if (outPath) await writeFile(outPath, text)
+if (!plan.usageBackfill.queried) {
+  console.error('usage live-read did not run; refusing empty rowIds placeholder')
+  process.exit(2)
+}
+
+const counts = {
+  applySessions: plan.defaultApplySessionIds.length,
+  manualReview: plan.manualReview.length,
+  assets: plan.operations.filter((o) => o.op === 'create_asset').length,
+  memory: plan.operations.filter((o) => o.op === 'copy_memory_candidate').length,
+  skills: plan.operations.find((o) => o.op === 'skill_overlay'),
+  usageRows: plan.usageBackfill.rowIds.length,
+  cronImpact: plan.cronImpact.length,
+  liveAssets: snap.assets.length,
+  liveSessions: snap.sessions.length,
+  usageBoardColumn: snap.usageBoardColumn,
+}
+
+const envelope = {
+  ...plan,
+  liveRead: {
+    generatedAt: snap.generatedAt,
+    usageBoardColumn: snap.usageBoardColumn,
+    chatProjects: snap.chatProjects,
+    cronJobs: snap.cron,
+    assets: snap.assets,
+    projectContext: snap.projectContext,
+    applyModesWired: snap.applyModesWired ?? [
+      'apply-create-facade',
+      'apply-bind-facade',
+      'apply-move-sessions',
+      'apply-usage-backfill',
+      'apply-usage-restore',
+      'apply-create-asset',
+      'apply-delete-asset',
+    ],
+  },
+  counts,
+}
+
+const text = JSON.stringify(envelope, null, 2)
+if (outPath) {
+  await mkdir(dirname(outPath), { recursive: true })
+  await writeFile(outPath, text)
+}
+const manifest = writeManifestPath(plan.operationId)
+await mkdir(dirname(manifest), { recursive: true })
+await writeFile(manifest, text)
+
+if (has(argv, '--apply')) {
+  const applyPorts = makeApplyPorts({ boardProjectId: target, snapshot: snap })
+  console.error('apply ports constructed; refusing to execute in this round unless explicitly extended')
+  void applyPorts
+  process.exit(2)
+}
+
 console.log(text)
 console.error(
-  `dry-run operationId=${plan.operationId} applySessions=${plan.defaultApplySessionIds.length} manualReview=${plan.manualReview.length} ops=${plan.operations.length} usageBackfillSessions=${plan.usageBackfill.sessionIds.length} cronImpact=${plan.cronImpact.length} drifted=${plan.expectedCounts.drifted}`,
+  `dry-run operationId=${plan.operationId} applySessions=${counts.applySessions} manualReview=${counts.manualReview} assets=${counts.assets} memory=${counts.memory} usageRows=${counts.usageRows} cronImpact=${counts.cronImpact} drifted=${plan.expectedCounts.drifted} queried=${plan.usageBackfill.queried}`,
 )
