@@ -1926,6 +1926,25 @@ await check("T46 Codex 等待用户回答保持人类等待态，不显示模型
   await waitForReplay((state) => !state.sending, "等待用户证明轮没有被 final 正常收尾");
 });
 
+await check("T48 引擎冷启动阶段显示启动/恢复文案，首内容清除且终态不粘", async () => {
+  const cmid = await page.evaluate(() => window.__replayDrive.openTurn());
+  if (typeof cmid !== "string" || !cmid.startsWith("m-")) {
+    throw new Error(`引擎启动证明轮未铸出 clientMessageId: ${JSON.stringify(cmid)}`);
+  }
+  await page.evaluate(() => window.__replayDrive.pushEngineStartupStatus("engine_starting"));
+  await replayRoot.getByText(/正在启动引擎/).waitFor({ state: "visible", timeout: 3000 });
+  if (await replayRoot.getByLabel("生成中").getByText(/思考中|无新数据|深度思考/).count()) {
+    throw new Error("引擎启动期活动行被误标成思考中/卡住");
+  }
+  await page.evaluate(() => window.__replayDrive.pushEngineStartupStatus("engine_resuming"));
+  await replayRoot.getByText(/正在恢复会话/).waitFor({ state: "visible", timeout: 3000 });
+  await page.evaluate(() => window.__replayDrive.pushRetrySuccess());
+  await waitForReplay((state) => !state.sending, "引擎启动证明轮没有被 final 正常收尾");
+  if (await replayRoot.getByText(/正在启动引擎|正在恢复会话/).count()) {
+    throw new Error("终态后引擎启动文案仍粘在时间线上");
+  }
+});
+
 await check("T35 Composer 是唯一 Stop 入口，停止结算中原按钮禁用且不重复提交", async () => {
   await page.evaluate(() => window.__setComposerState(true, false));
   const stop = primaryComposer.getByRole("button", { name: "停止", exact: true });

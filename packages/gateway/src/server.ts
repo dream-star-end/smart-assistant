@@ -18106,7 +18106,7 @@ export function _buildEngineErrorFrame(
 export function _turnStatusWireFields(
   phase: GatewayTurnPhase,
 ):
-  | { status: 'compacting' | 'waiting_for_user' | null }
+  | { status: 'compacting' | 'waiting_for_user' | 'engine_starting' | 'engine_resuming' | null }
   | { status: 'retrying'; retry: TurnRetryMeta }
   | { status: 'working'; detail?: string } {
   if (phase && typeof phase === 'object') {

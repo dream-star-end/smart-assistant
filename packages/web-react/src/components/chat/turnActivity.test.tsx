@@ -56,6 +56,21 @@ describe("TurnActivity（激活 computeTypingLabel 死代码：阶段反馈接�
     expect(screen.getByLabelText("生成中").textContent).toContain("正在压缩上下文");
   });
 
+  test("engine_starting → 正在启动引擎(不误标思考中)", () => {
+    renderTA({ startedAt: Date.now() - 8000, turnStatus: "engine_starting" });
+    const text = screen.getByLabelText("生成中").textContent ?? "";
+    expect(text).toContain("正在启动引擎");
+    expect(text).toContain("8s");
+    expect(text).not.toContain("思考中");
+  });
+
+  test("engine_resuming → 正在恢复会话(长等待也不升级成深度思考)", () => {
+    renderTA({ startedAt: Date.now() - 35_000, turnStatus: "engine_resuming" });
+    const text = screen.getByLabelText("生成中").textContent ?? "";
+    expect(text).toContain("正在恢复会话");
+    expect(text).not.toContain("深度思考");
+  });
+
   test("waiting_for_user → 不再显示模型卡住", () => {
     renderTA({ startedAt: Date.now() - 20 * 60_000, turnStatus: "waiting_for_user" });
     expect(screen.getByText("等待你确认后继续")).toBeTruthy();

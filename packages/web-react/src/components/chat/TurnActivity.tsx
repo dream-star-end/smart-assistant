@@ -105,6 +105,14 @@ export function TurnActivity({ info }: { info: TurnActivityInfo }) {
   ) {
     text = "正在恢复实时内容…";
     cls = "recovering";
+  } else if (info.turnStatus === "engine_starting" || info.turnStatus === "engine_resuming") {
+    // 引擎冷启动可见化:进程 spawn / 会话恢复期间不再显示误导性的「思考中」。
+    ({ text, cls } = computeTypingLabel({
+      name: info.agentName,
+      secs,
+      silenceMs,
+      turnStatus: info.turnStatus,
+    }));
   } else if (info.turnStatus === "compacting") {
     // 压缩上下文（即便团队模式）：computeTypingLabel 产出「正在压缩上下文 (Xs)」。
     ({ text, cls } = computeTypingLabel({ name: info.agentName, secs, silenceMs, turnStatus: "compacting" }));

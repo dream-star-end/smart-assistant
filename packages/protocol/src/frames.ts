@@ -1189,6 +1189,12 @@ export const OutboundTurnStatus = Type.Union([
     status: Type.Union([
       Type.Literal('compacting'),
       Type.Literal('waiting_for_user'),
+      // Engine cold-start visibility (gateway-authored, INC-20260824-FIRST-
+      // TEXT-LATENCY): the engine process for this turn is spawning
+      // (engine_starting) or resuming prior session state (engine_resuming).
+      // Cleared by the first observable event or any successor phase.
+      Type.Literal('engine_starting'),
+      Type.Literal('engine_resuming'),
       Type.Null(),
     ]),
   }),

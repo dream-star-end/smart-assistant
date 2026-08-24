@@ -655,6 +655,10 @@ describe('OutboundTurnStatus schema', () => {
   it('rejects unknown status (controlled enum)', () => {
     assert.equal(Value.Check(OutboundTurnStatus, { ...base, status: 'subtask' }), false)
   })
+  it('accepts engine cold-start phases (engine_starting / engine_resuming)', () => {
+    assert.equal(Value.Check(OutboundTurnStatus, { ...base, status: 'engine_starting' }), true)
+    assert.equal(Value.Check(OutboundTurnStatus, { ...base, status: 'engine_resuming' }), true)
+  })
   it('old compacting frame without detail still matches', () => {
     assert.equal(Value.Check(OutboundTurnStatus, { ...base, status: 'compacting' }), true)
   })

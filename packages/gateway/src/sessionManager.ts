@@ -5022,7 +5022,43 @@ export class SessionManager {
         }
         if (terminalExternalBilling) onEvent({ kind: 'external_billing', ...structuredClone(terminalExternalBilling) })
       }
+      // Engine cold-start visibility (INC-20260824-FIRST-TEXT-LATENCY):
+      // while this turn's engine process is spawning/resuming, the browser
+      // shows an explicit startup phase instead of a silent 20-40s
+      // "thinking" gap. The phase is authoritatively ended HERE on the first
+      // observable event (content block / permission card / any successor
+      // turn_status / terminal event); the frontend clear-on-content is only
+      // a dropped-frame fallback.
+      let startupPhaseActive = false
+      const emitStartupPhase = (status: 'engine_starting' | 'engine_resuming'): void => {
+        startupPhaseActive = true
+        onEvent({ kind: 'turn_status', status })
+      }
+      const clearStartupPhase = (): void => {
+        if (!startupPhaseActive) return
+        startupPhaseActive = false
+        onEvent({ kind: 'turn_status', status: null })
+      }
       const handleEngineEvent = (e: EngineEvent) => {
+        if (startupPhaseActive) {
+          if (e.kind === 'turn_status') {
+            // A successor phase owns the activity row from here on. Object
+            // phases (working/retrying) do not replace the client's phase
+            // state by themselves, so null the startup phase first; string
+            // phases (compacting/waiting_for_user/null) overwrite it.
+            startupPhaseActive = false
+            if (e.status && typeof e.status === 'object') {
+              onEvent({ kind: 'turn_status', status: null })
+            }
+          } else if (
+            e.kind === 'block' ||
+            e.kind === 'permission_request' ||
+            e.kind === 'error' ||
+            e.kind === 'final'
+          ) {
+            clearStartupPhase()
+          }
+        }
         if (
           e.kind === 'turn_status' &&
           e.status &&
@@ -5223,6 +5259,13 @@ export class SessionManager {
       // Per-turn parse_error listener (previously only installed at runner
       // construction). Must be detached with the rest to avoid per-turn
       // listener accumulation (R9).
+      // Per-turn spawn listener: upgrades/announces the startup phase with
+      // resume attribution. CCB emits 'spawn' only on cold start; cursor/grok
+      // one-shot CLIs emit it on every turn (their cold start IS per turn).
+      const handleSpawn = (info: { resumed?: boolean }) => {
+        if (detached) return
+        emitStartupPhase(info?.resumed ? 'engine_resuming' : 'engine_starting')
+      }
       const handleParseError = (payload: { line: string; err?: unknown; error?: unknown }) => {
         const rawError = payload.err ?? payload.error
         const err = rawError as Error | undefined
@@ -5273,6 +5316,7 @@ export class SessionManager {
         runner.off('error', handleError)
         runner.off('exit', handleExit)
         runner.off('parse_error', handleParseError)
+        runner.off('spawn', handleSpawn)
       }
 
       const retainedTerminalErrors = new Set<string>()
@@ -6334,6 +6378,13 @@ export class SessionManager {
       runner.on('error', handleError)
       runner.on('exit', handleExit)
       runner.on('parse_error', handleParseError)
+      runner.on('spawn', handleSpawn)
+
+      // Engine not running yet → this turn pays a cold start (CCB ~20s
+      // bun+JSONL resume, codex app-server init, cursor/grok one-shot CLI
+      // every turn). Announce it before submit; the runner's own 'spawn'
+      // event upgrades starting→resuming once resume attribution is known.
+      if (!runner.isRunning) emitStartupPhase('engine_starting')
 
       // adapter 在 submitTurn 内构造 per-turn parser + telemetry(CCB 私有生命
       // 周期)并替换 stdout 路由目标 —— 旧 _currentMessageListener 的替换语义

@@ -32,7 +32,18 @@ export type UserMsgStatus = "sending" | "sent" | "queued" | "read" | "replied" |
 export type TurnStatusState =
   | "compacting"
   | "waiting_for_user"
+  // 引擎冷启动阶段(gateway 权威发射,INC-20260824-FIRST-TEXT-LATENCY):
+  // 进程 spawn 中 / 带历史恢复中。首个内容块或后继阶段态到达即被清除。
+  | "engine_starting"
+  | "engine_resuming"
   | { kind: "retrying"; attempt: number; max: number; retryAt: number };
+
+/** 判别 `_turnStatus` 是否处于「引擎冷启动」阶段(内容帧兜底消解 + 渲染层消费)。 */
+export function isEngineStartupTurnStatus(
+  s: TurnStatusState | null | undefined,
+): s is "engine_starting" | "engine_resuming" {
+  return s === "engine_starting" || s === "engine_resuming";
+}
 
 /** 判别 `_turnStatus` 是否处于「自动重试中」态（供 reducer 内容帧自动消解 + 渲染层消费）。 */
 export function isRetryingTurnStatus(

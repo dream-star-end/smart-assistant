@@ -466,6 +466,14 @@ export function computeTypingLabel(p: {
   if (turnStatus === "compacting") {
     return { text: `${name} 正在压缩上下文 (${secs}s)`, cls: "compacting" };
   }
+  // 引擎冷启动阶段(gateway 权威发射):模型尚未开始推理,如实告知在启动/恢复,
+  // 避免 20-40s 冷启动被误标成「思考中/深度思考中」。
+  if (turnStatus === "engine_starting") {
+    return { text: `${name} 正在启动引擎${secs >= 3 ? ` (${secs}s)` : ""}…`, cls: "engine-starting" };
+  }
+  if (turnStatus === "engine_resuming") {
+    return { text: `${name} 正在恢复会话${secs >= 3 ? ` (${secs}s)` : ""}…`, cls: "engine-starting" };
+  }
   if (silenceMs >= STALE_DANGER_MS) {
     const sil = Math.round(silenceMs / 1000);
     return { text: `${name} 处理时间较长,仍在思考中 (${secs}s · ${sil}s 无新数据)`, cls: "stale-danger" };

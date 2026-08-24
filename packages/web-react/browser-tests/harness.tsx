@@ -132,6 +132,8 @@ declare global {
       pushRetryStatus: () => void;
       /** Push the explicit blocking-human turn status. */
       pushWaitingForUserStatus: () => void;
+      /** Push an engine cold-start phase status for the in-flight turn. */
+      pushEngineStartupStatus: (status: "engine_starting" | "engine_resuming") => void;
       /** Complete the same turn with a live text block plus final terminator. */
       pushRetrySuccess: () => void;
       /** Reproduce page1 → WS N → page2(N) during durable journal hydration. */
@@ -217,6 +219,7 @@ window.__replayDrive = {
   frameCount: () => 0,
   pushRetryStatus: () => {},
   pushWaitingForUserStatus: () => {},
+  pushEngineStartupStatus: () => {},
   pushRetrySuccess: () => {},
   runDurableOverlap: async () => {
     throw new Error("durable overlap probe 未挂载");
@@ -1294,6 +1297,19 @@ createRoot(document.getElementById("chat-entry-ux-root")!).render(
         channel: "webchat",
         peer: { id: REPLAY_SESSION_ID, kind: "dm" },
         status: "waiting_for_user",
+      });
+    },
+    pushEngineStartupStatus: (status) => {
+      const session = replaySocket.sessions.get(REPLAY_SESSION_ID);
+      if (!session || !session._sendingInFlight) {
+        throw new Error("engine 启动态注入前没有真实在途 turn");
+      }
+      live().deliver({
+        type: "outbound.turn_status",
+        sessionKey: `agent:${REPLAY_AGENT_ID}:webchat:dm:${REPLAY_SESSION_ID}`,
+        channel: "webchat",
+        peer: { id: REPLAY_SESSION_ID, kind: "dm" },
+        status,
       });
     },
     pushRetrySuccess: () => {

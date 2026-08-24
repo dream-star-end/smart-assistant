@@ -57,6 +57,9 @@ type FakeExitInfo = { code: number | null; signal: string | null; crashed: boole
 
 class FakeCcbRunner extends EventEmitter {
   lastActivityAt = Date.now();
+  /** Warm process by default so legacy sequence assertions see no synthetic
+   * engine_starting frame; cold-start tests flip this to false. */
+  isRunning = true;
   readonly submittedInputs: unknown[] = [];
 
   constructor(private readonly onSubmit: (runner: FakeCcbRunner) => void) {
@@ -3735,5 +3738,84 @@ describe("active-turn replay lock-owner lifecycle", () => {
     } finally {
       setV3MasterSinkSingleton(null);
     }
+  });
+});
+
+// ── 引擎冷启动可见状态(engine_starting / engine_resuming,INC-20260824)──────
+
+describe("engine cold-start turn_status", () => {
+  function statusesOf(events: SessionStreamEvent[]): unknown[] {
+    return events
+      .filter((e): e is Extract<SessionStreamEvent, { kind: "turn_status" }> => e.kind === "turn_status")
+      .map((e) => e.status);
+  }
+
+  test("冷 runner:submit 前发 engine_starting,spawn(resumed)升级 engine_resuming,首块前清 null", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    const events: SessionStreamEvent[] = [];
+    const runner = new FakeCcbRunner((r) => {
+      setImmediate(() => {
+        r.emit("spawn", { resumed: true });
+        r.text("first delta");
+        r.result();
+      });
+    });
+    runner.isRunning = false;
+    const session = makeSession(runner);
+    await runOneTurn(sm, session, events);
+    assert.deepEqual(statusesOf(events), ["engine_starting", "engine_resuming", null]);
+    const nullIdx = events.findIndex((e) => e.kind === "turn_status" && e.status === null);
+    const blockIdx = events.findIndex((e) => e.kind === "block");
+    assert.ok(nullIdx >= 0 && blockIdx > nullIdx, "null 清态帧必须先于首个内容块发出");
+  });
+
+  test("热 runner:整轮不发任何 engine_* 帧", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    const events: SessionStreamEvent[] = [];
+    const runner = new FakeCcbRunner((r) => {
+      setImmediate(() => {
+        r.text("warm answer");
+        r.result();
+      });
+    });
+    const session = makeSession(runner);
+    await runOneTurn(sm, session, events);
+    assert.deepEqual(statusesOf(events), []);
+  });
+
+  test("后继 string 阶段态(compacting)自然覆盖启动态,不额外补 null", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    const events: SessionStreamEvent[] = [];
+    const runner = new FakeCcbRunner((r) => {
+      setImmediate(() => {
+        r.msg({ type: "system", subtype: "status", status: "compacting" });
+        r.text("after compact");
+        r.result();
+      });
+    });
+    runner.isRunning = false;
+    const session = makeSession(runner);
+    await runOneTurn(sm, session, events);
+    // engine_starting → compacting(覆盖)→ 首块不再有启动态可清。
+    assert.deepEqual(statusesOf(events), ["engine_starting", "compacting"]);
+  });
+
+  test("后继 object 阶段态(retrying)到达前先补 null 清启动态", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    const events: SessionStreamEvent[] = [];
+    const runner = new FakeCcbRunner((r) => {
+      setImmediate(() => {
+        r.msg({ type: "system", subtype: "api_retry", attempt: 1, max_retries: 10, retry_delay_ms: 1000 });
+        r.text("after retry");
+        r.result();
+      });
+    });
+    runner.isRunning = false;
+    const session = makeSession(runner);
+    await runOneTurn(sm, session, events);
+    const statuses = statusesOf(events);
+    assert.equal(statuses[0], "engine_starting");
+    assert.equal(statuses[1], null);
+    assert.equal((statuses[2] as { status?: string } | null)?.status, "retrying");
   });
 });

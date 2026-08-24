@@ -549,6 +549,43 @@ describe("applyTurnStatus retrying 判别联合", () => {
     expect(s._lastFrameAt).toEqual(expect.any(Number));
   });
 
+  test("engine_starting / engine_resuming → 写入阶段态,null 帧清除", () => {
+    const s = sess();
+    const before = s.messages.length;
+    applyTurnStatus(s, turnStatusFrame({ status: "engine_starting" }));
+    expect(s._turnStatus).toBe("engine_starting");
+    applyTurnStatus(s, turnStatusFrame({ status: "engine_resuming" }));
+    expect(s._turnStatus).toBe("engine_resuming");
+    expect(s.messages.length).toBe(before);
+    applyTurnStatus(s, turnStatusFrame({ status: null }));
+    expect(s._turnStatus).toBeNull();
+  });
+
+  test("清态 null 帧丢失时,首个内容帧兜底清 engine_*(防启动态粘住)", () => {
+    const s = sess();
+    s._sendingInFlight = true;
+    applyTurnStatus(s, turnStatusFrame({ status: "engine_resuming" }));
+    expect(s._turnStatus).toBe("engine_resuming");
+    applyOutboundMessage(
+      s,
+      msgFrame({ blocks: [{ kind: "thinking", text: "首个思考增量" }], frameSeq: 1 }),
+      {},
+    );
+    expect(s._turnStatus).toBeNull();
+  });
+
+  test("tool_output_tail-only 帧不清 engine_*(不是内容恢复)", () => {
+    const s = sess();
+    s._sendingInFlight = true;
+    applyTurnStatus(s, turnStatusFrame({ status: "engine_starting" }));
+    applyOutboundMessage(
+      s,
+      msgFrame({ blocks: [{ kind: "tool_output_tail", blockId: "b1", tail: "x", totalBytes: 1 }], frameSeq: 1 }),
+      {},
+    );
+    expect(s._turnStatus).toBe("engine_starting");
+  });
+
   test("status=null 清 working hint", () => {
     const s = sess();
     applyTurnStatus(s, turnStatusFrame({ status: "working", detail: "Grep keepalive" }));

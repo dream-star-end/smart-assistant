@@ -33,6 +33,7 @@ import {
   type ChatSession,
   type ChildBlock,
   clearTurnTiming,
+  isEngineStartupTurnStatus,
   isRetryingTurnStatus,
   isServerAuthoredRow,
   markFrameReceived,
@@ -1582,10 +1583,15 @@ export function applyOutboundMessage(
   if (!frame.isFinal && !frame.cronJob && hasBlocks && !lifecycleSidebandFrame && !sess._sendingInFlight)
     sess._sendingInFlight = true;
   if (hasBlocks || frame.isFinal) markFrameReceived(sess);
-  // 自动重试软提示的**内容帧兜底消解**:引擎在下一 attempt 产出真实内容(非 tail-only)即代表流
-  // 已恢复 → 清 retrying,防 gateway 的 turn_status:null 复位帧在断线重连窗口丢失时软提示粘住。
+  // 自动重试/引擎冷启动软提示的**内容帧兜底消解**:引擎产出真实内容(非 tail-only)即代表流
+  // 已恢复 → 清 retrying/engine_*,防 gateway 的 turn_status:null 复位帧在断线重连窗口丢失时软提示粘住。
   // final/error/interrupted 由 clearTurnTiming 统一清 _turnStatus,此处只兜「流恢复但 null 帧丢」。
-  if (hasBlocks && !lifecycleSidebandFrame && isRetryingTurnStatus(sess._turnStatus)) sess._turnStatus = null;
+  if (
+    hasBlocks &&
+    !lifecycleSidebandFrame &&
+    (isRetryingTurnStatus(sess._turnStatus) || isEngineStartupTurnStatus(sess._turnStatus))
+  )
+    sess._turnStatus = null;
   // thinking-safety：通过守卫的非 final 帧重置；isFinal 清（由 socket 持 timer）。tail-only 帧不触发。
   if (sess._sendingInFlight && !frame.isFinal && !lifecycleSidebandFrame) effects.onLiveFrame?.(sess);
 
@@ -2205,6 +2211,10 @@ export function applyTurnStatus(sess: ChatSession, frame: OutboundTurnStatusWire
     sess._turnStatus = "compacting";
   } else if (frame.status === "waiting_for_user") {
     sess._turnStatus = "waiting_for_user";
+  } else if (frame.status === "engine_starting" || frame.status === "engine_resuming") {
+    // 引擎冷启动阶段:gateway 在首个可观察事件时权威清除(status:null);
+    // 内容帧兜底消解见 applyOutboundMessage。
+    sess._turnStatus = frame.status;
   } else if (frame.status === "retrying") {
     sess._turnStatus = {
       kind: "retrying",

@@ -58,6 +58,9 @@ export interface TurnRetryMeta {
 export type EngineTurnPhase =
   | 'compacting'
   | 'waiting_for_user'
+  // gateway-authored engine cold-start phases (sessionManager, not engine raw)
+  | 'engine_starting'
+  | 'engine_resuming'
   | null
   | { status: 'retrying'; retry: TurnRetryMeta }
   | { status: 'working'; detail?: string }
