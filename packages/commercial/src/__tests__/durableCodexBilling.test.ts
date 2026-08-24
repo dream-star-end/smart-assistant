@@ -357,6 +357,10 @@ describe("settleDurableCodexBilling", () => {
         if (trimmed.startsWith("INSERT INTO pending_usage_patches")) {
           return { rows: [], rowCount: 1 };
         }
+        // Settle-time WorkProject snapshot. Suites without chat/project rows stay unattributed.
+        if (/FROM client_sessions cs/.test(trimmed) && /board_project_id/.test(trimmed)) {
+          return { rows: [], rowCount: 0 };
+        }
         throw new Error(`unhandled fake client SQL: ${trimmed.slice(0, 100)}`);
       },
       release: () => {},

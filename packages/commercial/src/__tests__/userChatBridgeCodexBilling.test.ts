@@ -217,6 +217,10 @@ function makeFakePool(opts: { userBalance?: bigint; periodCredits?: bigint | nul
       if (trimmed.startsWith("SELECT id::text AS id, ledger_id")) {
         return { rows: [], rowCount: 0 };
       }
+      // Settle-time WorkProject snapshot. Suites without chat/project rows stay unattributed.
+      if (/FROM client_sessions cs/.test(trimmed) && /board_project_id/.test(trimmed)) {
+        return { rows: [], rowCount: 0 };
+      }
       throw new Error(`fakeClient: unhandled SQL: ${trimmed.slice(0, 80)}`);
     },
     release(): void { /* */ },
