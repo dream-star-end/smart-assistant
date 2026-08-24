@@ -4649,6 +4649,21 @@ export const api = {
       ),
     ).then((b) => ({ ratings: b.ratings || {}, nudges: b.nudges || {} })),
 
+  /**
+   * 视频生成能力（GET /api/media-generation/capabilities，Bearer）。仅用于账号菜单
+   * 「视频任务」入口门控：`available:false` 时不渲染入口，未知/失败保持入口可见
+   * （由任务中心内部兜底提示），避免网络抖动误藏功能。
+   */
+  getMediaCapabilities: (a: AuthSession): Promise<{ available?: boolean }> =>
+    jsonOrThrow<{ available?: boolean }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/media-generation/capabilities", {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ),
+
   // ── 对话传输（P4 已接入：WS user-chat-bridge） ────────────────────────
   //
   // v5 对话传输走 WebSocket（/ws/user-chat-bridge，bearer 子协议
