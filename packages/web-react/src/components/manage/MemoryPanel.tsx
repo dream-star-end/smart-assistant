@@ -1,6 +1,7 @@
 import { AlertTriangle, BarChart3, Brain, Check, ChevronRight, MoonStar, Plus, Search, Sparkles, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useId, useState } from "react";
 import { ApiError, api, apiErrorMessage } from "../../lib/api";
+import { taskboardApi, type Project, type ProjectMemoryItem } from "../../lib/taskboard";
 import type {
   AuthSession,
   AutoDreamLastReport,
@@ -68,10 +69,10 @@ export function MemoryPanel({
   agents: { id: string; name: string }[];
 }) {
   const [selected, setSelected] = useState(agentId);
-  const [tab, setTab] = useState<"core" | "profile" | "usage">("core");
+  const [tab, setTab] = useState<"core" | "profile" | "project" | "usage">("core");
   // 选中项必须在可选列表内（agent 刚被卸载时回落到列表首项/传入项）。
   const effective = agents.some((a) => a.id === selected) ? selected : agentId;
-  const showPicker = agents.length > 1 && tab !== "profile";
+  const showPicker = agents.length > 1 && tab !== "profile" && tab !== "project";
 
   return (
     <div className="flex flex-col">
@@ -96,9 +97,14 @@ export function MemoryPanel({
           aria-label="记忆分区"
           idBase={TAB_ID_BASE}
           value={tab}
-          onValueChange={(v) => setTab(v === "profile" ? "profile" : v === "usage" ? "usage" : "core")}
+          onValueChange={(v) =>
+            setTab(
+              v === "profile" ? "profile" : v === "usage" ? "usage" : v === "project" ? "project" : "core",
+            )
+          }
           items={[
             { value: "core", label: "核心记忆" },
+            { value: "project", label: "项目记忆" },
             { value: "profile", label: "用户画像" },
             { value: "usage", label: "使用情况" },
           ]}
@@ -112,6 +118,8 @@ export function MemoryPanel({
       >
         {tab === "core" ? (
           <CoreMemorySection key={`core:${effective}`} auth={auth} agentId={effective} />
+        ) : tab === "project" ? (
+          <ProjectMemorySection key="project-memory" auth={auth} />
         ) : tab === "profile" ? (
           // 画像共享,用初始 agentId(稳定)做路由参数,与切换器无关。
           <UserProfileSection key="shared:user" auth={auth} agentId={agentId} />
@@ -139,6 +147,122 @@ const OPERATION_LABELS: Record<string, string> = {
   auto_skip: "自动记忆跳过",
   auto_refuse: "自动记忆拒绝",
 };
+
+function ProjectMemorySection({ auth }: { auth: AuthSession }) {
+  const toast = useToast();
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [projectId, setProjectId] = useState("");
+  const [official, setOfficial] = useState<ProjectMemoryItem[]>([]);
+  const [candidates, setCandidates] = useState<ProjectMemoryItem[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    void taskboardApi
+      .listProjects(auth)
+      .then((items) => {
+        if (cancelled) return;
+        setProjects(items);
+        setProjectId((cur) => cur || items[0]?.id || "");
+      })
+      .catch((e) => {
+        if (!cancelled) toast(apiErrorMessage(e, "加载项目失败"), "error");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [auth, toast]);
+
+  useEffect(() => {
+    if (!projectId) {
+      setLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setLoading(true);
+    void taskboardApi
+      .listProjectMemories(auth, projectId)
+      .then((res) => {
+        if (cancelled) return;
+        setOfficial(res.official);
+        setCandidates(res.candidates);
+      })
+      .catch((e) => {
+        if (!cancelled) toast(apiErrorMessage(e, "加载项目记忆失败"), "error");
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [auth, projectId, toast]);
+
+  return (
+    <div className="flex flex-col gap-3 px-4 py-3" data-testid="project-memory-panel">
+      <Select
+        aria-label="筛选项目"
+        value={projectId}
+        onValueChange={setProjectId}
+        options={projects.map((p) => ({ value: p.id, label: `${p.key} ${p.name}` }))}
+        inputSize="sm"
+        className="w-56"
+      />
+      {loading ? (
+        <ListSkeleton rows={3} />
+      ) : (
+        <>
+          <h3 className="text-section font-semibold">待审核候选</h3>
+          {candidates.length === 0 ? (
+            <EmptyState icon={Brain} title="没有候选" hint="绑定项目的 Auto-Dream 只会写入候选。" />
+          ) : (
+            candidates.map((c) => (
+              <div key={c.id ?? c.file} className="rounded-lg border border-border p-3">
+                <div className="text-body font-medium">{c.slug}</div>
+                <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap text-caption text-muted">
+                  {(c.content ?? "").slice(0, 1200)}
+                </pre>
+                <div className="mt-2 flex gap-2">
+                  <Button
+                    size="sm"
+                    onClick={() => {
+                      void taskboardApi
+                        .promoteProjectMemory(auth, projectId, c.id ?? "", c.version)
+                        .then(() => setProjectId((id) => id))
+                        .catch((e) => toast(apiErrorMessage(e, "采纳失败"), "error"));
+                    }}
+                  >
+                    采纳
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={() => {
+                      void taskboardApi
+                        .rejectProjectMemory(auth, projectId, c.id ?? "", c.version)
+                        .then(() => setProjectId((id) => id))
+                        .catch((e) => toast(apiErrorMessage(e, "丢弃失败"), "error"));
+                    }}
+                  >
+                    丢弃
+                  </Button>
+                </div>
+              </div>
+            ))
+          )}
+          <h3 className="text-section font-semibold">正式 / 废弃</h3>
+          {official.map((o) => (
+            <div key={o.slug} className="text-body">
+              {o.slug}
+              {o.deprecated ? "（已废弃）" : ""}
+              {o.tampered ? "（被篡改，未注入）" : ""}
+            </div>
+          ))}
+        </>
+      )}
+    </div>
+  );
+}
 
 function MemoryUsageSection({ auth, agentId }: { auth: AuthSession; agentId: string }) {
   const [days, setDays] = useState(30);

@@ -15,7 +15,7 @@ delete process.env.OPENCLAUDE_PLATFORM_PROMPTS_DIR
 delete process.env.OPENCLAUDE_V3_MASTER_BASE_URL
 delete process.env.OPENCLAUDE_V3_CONTAINER_TOKEN
 
-const { buildProjectSlot, buildSkillsSlot } = await import('../promptSlots.js')
+const { buildProjectSlot, buildProjectMemorySlot, buildSkillsSlot } = await import('../promptSlots.js')
 
 describe('projectContext injection', () => {
   it('uses resolved context assets/instructions without sessionId', async () => {
@@ -66,5 +66,21 @@ describe('projectContext injection', () => {
     })
     // overlay dir may be empty
     if (slot) assert.equal(slot.name, 'SKILLS')
+  })
+
+  it('unbound session does not get PROJECT_MEMORY', async () => {
+    const slot = await buildProjectMemorySlot({
+      agentId: 'main',
+      projectContext: {
+        boardProjectId: null,
+        chatProjectId: 'chat-1',
+        name: 'unbound',
+        instructions: 'x',
+        assets: [],
+        assetsRevision: 0,
+        bound: false,
+      },
+    })
+    assert.equal(slot, null)
   })
 })

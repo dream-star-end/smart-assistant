@@ -113,6 +113,20 @@ export const paths = {
     join(HOME, 'projects', boardProjectId, 'PROJECT.md'),
   projectSkillsDir: (boardProjectId: string) => join(HOME, 'projects', boardProjectId, 'skills'),
   projectLock: (boardProjectId: string) => join(HOME, 'projects', boardProjectId, '.lock'),
+  // Project memory files are content carriers only. Injection/search authority
+  // is the gateway-owned promotion ledger (taskboard.db), not MEMORY.md.
+  projectMemoryDir: (boardProjectId: string) => join(HOME, 'projects', boardProjectId, 'memory'),
+  projectMemoryFile: (boardProjectId: string, base: string) =>
+    join(HOME, 'projects', boardProjectId, 'memory', base),
+  projectMemoryIndex: (boardProjectId: string) => join(HOME, 'projects', boardProjectId, 'MEMORY.md'),
+  projectCandidateDir: (boardProjectId: string) =>
+    join(HOME, 'projects', boardProjectId, 'memory-candidates'),
+  projectCandidateFile: (boardProjectId: string, base: string) =>
+    join(HOME, 'projects', boardProjectId, 'memory-candidates', base),
+  projectCandidatesIndex: (boardProjectId: string) =>
+    join(HOME, 'projects', boardProjectId, 'CANDIDATES.md'),
+  projectMemoryLock: (boardProjectId: string) =>
+    join(HOME, 'projects', boardProjectId, '.memory.lock'),
   workspaceRoot: join(HOME, 'workspace'),
   workspaceProjectsDir: join(HOME, 'workspace', 'projects'),
   workspaceProjectDir: (boardProjectId: string) => join(HOME, 'workspace', 'projects', boardProjectId),

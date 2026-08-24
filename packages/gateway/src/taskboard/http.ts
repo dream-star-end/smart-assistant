@@ -15,6 +15,7 @@ import {
   loadProjectContext,
   parseProjectWorkspace,
   paths,
+  resolveProjectCwd,
   setProjectSkillOverlay,
   writeProjectInstructions,
 } from '@openclaude/storage'
@@ -78,6 +79,7 @@ import {
   getUsage,
   updateSettings,
 } from './db/settings.js'
+import { dispatchProjectMemory } from './projectMemoryHttp.js'
 import {
   applyTemplate,
   applyTemplates,
@@ -678,6 +680,8 @@ async function dispatch(
     return sendError(res, 405, 'method not allowed')
   }
 
+  if (await dispatchProjectMemory(req, res, url, method, db, actor)) return
+
   const projectItem = path.match(/^\/api\/board\/projects\/([^/]+)$/)
   if (projectItem) {
     const id = decodeURIComponent(projectItem[1])
@@ -902,12 +906,24 @@ function handlePatchProject(
 ): void {
   const project = resolveProject(db, idOrKey)
   if (!project) throw new TaskboardNotFound('project', idOrKey)
+  const workspaceSpec =
+    body.workspaceSpec === undefined ? undefined : parseProjectWorkspace(body.workspaceSpec)
+  if (body.workspaceSpec !== undefined && body.workspaceSpec !== null && !workspaceSpec) {
+    throw new TaskboardValidationError('invalid workspaceSpec')
+  }
+  if (workspaceSpec) {
+    const cwd = resolveProjectCwd(workspaceSpec, project.id)
+    if (!cwd.ok) {
+      throw new TaskboardValidationError(
+        `workspaceSpec rejected: ${cwd.error} (${cwd.detail}). 项目数据目录 ~/.openclaude/projects 不能当工作区；仅允许 workspace/ 或 repos/ 下的绝对路径。`,
+      )
+    }
+  }
   const updated = updateProject(db, project.id, {
     name: asString(body.name),
     description: asNullableString(body.description),
     workspace: asNullableString(body.workspace),
-    workspaceSpec:
-      body.workspaceSpec === undefined ? undefined : parseProjectWorkspace(body.workspaceSpec),
+    workspaceSpec,
     labels: asStringArray(body.labels),
     archivedAt: asNullableNumber(body.archivedAt),
   })

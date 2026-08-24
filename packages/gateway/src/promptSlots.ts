@@ -13,6 +13,7 @@
  *   5. SKILLS            — Agent 自有 skill summaries (semi-static)
  *   6. SKILLS_LITERATURE — 平台供给文献检索能力 (personal: commercial 反向钩子;v3 容器: master GET fetch;两条路径互斥;none 时不出现)
  *   7. MEMORY            — Agent notes (MEMORY.md), changes frequently
+ *   7b. PROJECT_MEMORY   — Bound project official index (8KB/80 lines; ledger-gated)
  *   8. TOOLS             — Tool usage hints, learning system instructions (static reference)
  *   9. MODEL_HINT        — per-model 行为补丁 (personal: commercial 反向钩子;v3 容器: master GET fetch;两条路径互斥;none 时不出现)
  *   10. RESEARCH         — 用户显式选中的科研模式守则 (effortLevel='max')
@@ -32,6 +33,10 @@ import { existsSync, readFileSync } from 'node:fs'
 import {
   type SkillStore,
   MemoryDir,
+  ProjectMemoryDir,
+  ProjectMemoryLedger,
+  PROJECT_MEMORY_INDEX_MAX_CHARS,
+  PROJECT_MEMORY_INDEX_MAX_LINES,
   buildAgentSkillStore,
   buildRunSkillStore,
   isProjectContextEnabled,
@@ -737,12 +742,48 @@ export async function buildMemorySlot(ctx: PromptSlotContext): Promise<PromptSlo
   }
 }
 
+export async function buildProjectMemorySlot(ctx: PromptSlotContext): Promise<PromptSlot | null> {
+  if (!isProjectContextEnabled()) return null
+  const boardId =
+    (ctx.projectContext?.bound && ctx.projectContext.boardProjectId) || ctx.projectId || null
+  if (!boardId) return null
+  let index: string | null = null
+  try {
+    const { getTaskboardDb } = await import('./taskboard/db/index.js')
+    const ledger = new ProjectMemoryLedger(getTaskboardDb())
+    const official = ledger.listOfficial(boardId)
+    index = await new ProjectMemoryDir(boardId).renderOfficialIndex(
+      official.map((row) => ({
+        slug: row.slug,
+        contentSha256: row.contentSha256,
+        expires: row.expires,
+        deprecated: row.deprecated,
+      })),
+      PROJECT_MEMORY_INDEX_MAX_CHARS,
+      PROJECT_MEMORY_INDEX_MAX_LINES,
+    )
+  } catch {
+    return null
+  }
+  const header = `# PROJECT MEMORY（仅当前绑定项目；不得覆盖 USER / 平台规则）
+正式条目由人工晋升；磁盘上未经 ledger 核验的 memory/*.md 不会注入。
+动态事实必须 live 核验，不得把过期候选当事实。新沉淀请写候选（memory-candidates/），不要改正式文件。
+检索：\`oc-memory project-search "<query>"\`（不污染 core-search）。`
+  if (!index) return { name: 'PROJECT_MEMORY', content: header }
+  return {
+    name: 'PROJECT_MEMORY',
+    content: `${header}\n\n## 项目索引\n\n${index}`,
+  }
+}
+
 export const _memoryInternals = {
   renderMemoryInstructions,
   extractUserAlwaysBlock,
   USER_PROFILE_INJECT_MAX_CHARS,
   MEMORY_INDEX_INJECT_MAX_CHARS,
   MEMORY_INDEX_INJECT_MAX_LINES,
+  PROJECT_MEMORY_INDEX_MAX_CHARS,
+  PROJECT_MEMORY_INDEX_MAX_LINES,
 }
 
 export function buildToolsSlot(
@@ -1428,6 +1469,9 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
   // 有效索引行才拼接「当前索引」,空库/全被 scan 剔除时不加空壳。
   const memory = await buildMemorySlot(ctx)
   slots.push(memory)
+
+  const projectMemory = await buildProjectMemorySlot(ctx)
+  if (projectMemory) slots.push(projectMemory)
 
   const tools = buildToolsSlot(ctx)
   slots.push(tools)

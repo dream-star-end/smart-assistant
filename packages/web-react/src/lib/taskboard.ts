@@ -403,6 +403,7 @@ export interface ProjectCreateInput {
   name: string
   description?: string | null
   workspace?: string | null
+  workspaceSpec?: { kind: 'default' | 'isolated' | 'container_path'; path?: string } | null
   labels?: string[]
   /** 省略 = 种四条内置线；`[]` = 不种；非空 = 按 id 套用。 */
   templateIds?: string[]
@@ -1435,4 +1436,83 @@ export const taskboardApi = {
       'POST',
       body,
     ),
+
+  listProjectMemories: (a: AuthSession, projectId: string, status?: string) =>
+    boardGet<{
+      projectId: string
+      official: ProjectMemoryItem[]
+      candidates: ProjectMemoryItem[]
+    }>(
+      a,
+      `/api/board/projects/${encodeURIComponent(projectId)}/memories${qs({ status })}`,
+    ),
+
+  createProjectMemory: (
+    a: AuthSession,
+    projectId: string,
+    body: { slug: string; content: string; supersedes?: string },
+  ) =>
+    boardSend<{ ok: boolean; candidate: ProjectMemoryItem }>(
+      a,
+      `/api/board/projects/${encodeURIComponent(projectId)}/memories`,
+      'POST',
+      body,
+    ),
+
+  promoteProjectMemory: (
+    a: AuthSession,
+    projectId: string,
+    candidateId: string,
+    expectedVersion: number,
+  ) =>
+    boardSend<{ ok: boolean; official: ProjectMemoryItem; idempotent?: boolean }>(
+      a,
+      `/api/board/projects/${encodeURIComponent(projectId)}/memories/${encodeURIComponent(candidateId)}/promote`,
+      'POST',
+      { expectedVersion },
+    ),
+
+  rejectProjectMemory: (
+    a: AuthSession,
+    projectId: string,
+    candidateId: string,
+    expectedVersion: number,
+  ) =>
+    boardSend<{ ok: boolean; candidate: ProjectMemoryItem; idempotent?: boolean }>(
+      a,
+      `/api/board/projects/${encodeURIComponent(projectId)}/memories/${encodeURIComponent(candidateId)}/reject`,
+      'POST',
+      { expectedVersion },
+    ),
+
+  deprecateProjectMemory: (
+    a: AuthSession,
+    projectId: string,
+    slug: string,
+    expectedVersion: number,
+  ) =>
+    boardSend<{ ok: boolean; official: ProjectMemoryItem; idempotent?: boolean }>(
+      a,
+      `/api/board/projects/${encodeURIComponent(projectId)}/memories/${encodeURIComponent(slug)}/deprecate`,
+      'POST',
+      { expectedVersion },
+    ),
+}
+
+export interface ProjectMemoryItem {
+  id?: string
+  projectId: string
+  slug: string
+  file?: string
+  contentSha256: string
+  status?: string
+  version: number
+  content?: string | null
+  tampered?: boolean
+  deprecated?: boolean
+  expires?: string | null
+  sourceAgent?: string | null
+  sourceSession?: string | null
+  sourceTicket?: string | null
+  supersedes?: string | null
 }

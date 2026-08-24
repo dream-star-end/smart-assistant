@@ -11,6 +11,7 @@
  */
 
 export const AUTO_MEMORY_TTL_DAYS = 30
+export const PROJECT_AUTO_MEMORY_TTL_DAYS = 14
 export const AUTO_MEMORY_SOURCE = 'auto'
 export const MEMORY_EXPIRES_RE = /^(\d{4})-(\d{2})-(\d{2})$/
 
@@ -88,4 +89,8 @@ export function isMemoryExpired(
 
 export function defaultAutoExpires(today: string): string {
   return addCalendarDays(today, AUTO_MEMORY_TTL_DAYS)
+}
+
+export function defaultProjectAutoExpires(today: string): string {
+  return addCalendarDays(today, PROJECT_AUTO_MEMORY_TTL_DAYS)
 }
