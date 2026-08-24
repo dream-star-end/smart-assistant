@@ -15,7 +15,8 @@ import {
 } from '@openclaude/storage'
 import { request as undiciRequest } from 'undici'
 
-export const PROJECT_CONTEXT_PATH = '/internal/v3/project-context'
+import { PROJECT_CONTEXT_PATH } from '@openclaude/protocol'
+export { PROJECT_CONTEXT_PATH }
 const ENV_MASTER_URL = 'OPENCLAUDE_V3_MASTER_BASE_URL'
 const ENV_CONTAINER_TOKEN = 'OPENCLAUDE_V3_CONTAINER_TOKEN'
 const FETCH_TIMEOUT_MS = 5_000

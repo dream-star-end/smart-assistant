@@ -55,8 +55,9 @@ export interface ContainerDispatchClientDeps {
   timeoutMs?: number
 }
 
-export const TURN_REJECT_IF_ABSENT_PATH = '/internal/v3/turn-reject-if-absent'
-export const TURN_DISPATCH_STATE_PATH = '/internal/v3/turn-dispatch-state'
+import { TURN_REJECT_IF_ABSENT_PATH, TURN_DISPATCH_STATE_PATH } from '@openclaude/protocol'
+
+export { TURN_REJECT_IF_ABSENT_PATH, TURN_DISPATCH_STATE_PATH }
 const DEFAULT_TIMEOUT_MS = 5_000
 
 const VALID_STATES = new Set<ContainerInboxState>([

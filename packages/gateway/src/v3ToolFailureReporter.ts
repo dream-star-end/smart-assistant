@@ -16,6 +16,9 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 
 import {
+  TOOL_CALL_ROLLUP_PATH,
+  TOOL_FAILURE_AUDIT_PATH,
+  TURN_OBSERVATION_PATH,
   type ToolCalledEvent,
   type TurnCompletedEvent,
   type ToolFailureErrorClass,
@@ -29,9 +32,7 @@ import { createLogger } from './logger.js'
 
 const log = createLogger({ module: 'v3ToolFailureReporter' })
 
-export const TOOL_FAILURE_AUDIT_PATH = '/internal/v3/agent-audit/tool-failure'
-export const TOOL_CALL_ROLLUP_PATH = '/internal/v3/agent-audit/tool-rollup'
-export const TURN_OBSERVATION_PATH = '/internal/v3/turn-observation'
+export { TOOL_FAILURE_AUDIT_PATH, TOOL_CALL_ROLLUP_PATH, TURN_OBSERVATION_PATH }
 export const TOOL_AUDIT_SCHEMA_HEADER = 'x-openclaude-tool-audit-schema'
 
 const MAX_FIELD_CHARS = 512

@@ -29,7 +29,7 @@ import type { QueryRunner, SkillUsageLayer } from './internalSkillUsage.js'
 // 隐式弱差评的 tag 权威源(单一权威,勿在此重复字面量)。
 import { IMPLICIT_RATING_TAG } from '../responseRatings.js'
 
-export const SKILL_FEEDBACK_PATH = '/internal/v3/marketplace/skill-feedback'
+export { SKILL_FEEDBACK_PATH } from '@openclaude/protocol'
 
 /** 单次返回引用上限(训练素材注入侧只取 ≤3 段,10 足够富余,控制 payload)。 */
 export const MAX_FEEDBACK_REFS = 10

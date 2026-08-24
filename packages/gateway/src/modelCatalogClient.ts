@@ -36,11 +36,11 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
+import { MODEL_CATALOG_PATH, MODEL_CATALOG_EPOCH_PATH } from '@openclaude/protocol'
 import { request as undiciRequest } from 'undici'
 import { resolveConnectorEndpoint } from './ocConnectorsClient.js'
 
-export const MODEL_CATALOG_PATH = '/internal/v3/model-catalog'
-export const MODEL_CATALOG_EPOCH_PATH = '/internal/v3/model-catalog-epoch'
+export { MODEL_CATALOG_PATH, MODEL_CATALOG_EPOCH_PATH }
 
 /**
  * 上游 `/v1/messages` 的凭据 header。

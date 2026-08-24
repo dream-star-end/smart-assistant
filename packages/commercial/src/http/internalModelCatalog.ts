@@ -59,9 +59,10 @@ import {
   setSecurityHeaders,
 } from "./util.js";
 
-export const MODEL_CATALOG_PATH = "/internal/v3/model-catalog";
+export { MODEL_CATALOG_PATH } from "@openclaude/protocol";
+import { MODEL_CATALOG_EPOCH_PATH } from "@openclaude/protocol";
 /** 窄端点(R2-m13:不用 HEAD body)—— LKG 使用前的 epoch 验证走它,一次单行 SELECT。 */
-export const MODEL_CATALOG_EPOCH_PATH = "/internal/v3/model-catalog-epoch";
+export { MODEL_CATALOG_EPOCH_PATH };
 
 /** 两个端点都带的响应头(容器可复用拉取响应头做 epoch 验证,免二次请求)。 */
 export const SECURITY_EPOCH_HEADER = "x-openclaude-security-epoch";

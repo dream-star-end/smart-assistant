@@ -38,7 +38,7 @@ import {
   setSecurityHeaders,
 } from "./util.js";
 
-export const CRON_INDEX_PATH = "/internal/v3/cron-index";
+export { CRON_INDEX_PATH } from "@openclaude/protocol";
 
 const BodySchema = z
   .object({

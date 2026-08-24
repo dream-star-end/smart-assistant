@@ -1,9 +1,10 @@
 /** Loopback-only container hop for hosted ZCode Anthropic traffic. */
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { Readable } from "node:stream";
+import { ZCODE_RELAY_PREFIX } from "@openclaude/protocol";
 import { isLoopbackRemoteAddress } from "./v3CodexRelay.js";
 
-export const V5_ZCODE_RELAY_PREFIX = "/internal/v5/zcode-relay";
+export const V5_ZCODE_RELAY_PREFIX = ZCODE_RELAY_PREFIX;
 
 export interface V5ZcodeRelayConfig {
   masterBaseUrl: string;
