@@ -14,6 +14,7 @@ import {
   AccountPoolUnavailableError,
   AccountScheduler,
   DEFAULT_MAX_CONCURRENT_PER_ACCOUNT,
+  DEFAULT_QUOTA_BACKOFF_PCT,
   DEFAULT_SLOT_LEASE_TTL_MS,
   ERR_ACCOUNT_POOL_BUSY,
   ERR_ACCOUNT_POOL_UNAVAILABLE,
@@ -21,6 +22,7 @@ import {
   computeAccountWeight,
   defaultHash,
   parseMaxConcurrentEnv,
+  parseQuotaBackoffPctEnv,
   parseSlotLeaseTtlEnv,
   pickWRH,
   sanitizeSlotLeaseTtl,
@@ -362,6 +364,26 @@ describe('parseMaxConcurrentEnv', () => {
     assert.equal(parseMaxConcurrentEnv('1.5'), DEFAULT_MAX_CONCURRENT_PER_ACCOUNT)
     assert.equal(parseMaxConcurrentEnv(' 10'), DEFAULT_MAX_CONCURRENT_PER_ACCOUNT)
     assert.equal(parseMaxConcurrentEnv('01'), DEFAULT_MAX_CONCURRENT_PER_ACCOUNT)
+  })
+})
+
+describe('parseQuotaBackoffPctEnv(反封复盘 2026-08)', () => {
+  test('undefined/空 → 默认 95', () => {
+    assert.equal(parseQuotaBackoffPctEnv(undefined), DEFAULT_QUOTA_BACKOFF_PCT)
+    assert.equal(parseQuotaBackoffPctEnv(''), DEFAULT_QUOTA_BACKOFF_PCT)
+  })
+  test('1..100 整数 → 透传', () => {
+    assert.equal(parseQuotaBackoffPctEnv('1'), 1)
+    assert.equal(parseQuotaBackoffPctEnv('90'), 90)
+    assert.equal(parseQuotaBackoffPctEnv('100'), 100)
+  })
+  test('0/>100/负数/小数/非数字 → 默认 95', () => {
+    assert.equal(parseQuotaBackoffPctEnv('0'), DEFAULT_QUOTA_BACKOFF_PCT)
+    assert.equal(parseQuotaBackoffPctEnv('101'), DEFAULT_QUOTA_BACKOFF_PCT)
+    assert.equal(parseQuotaBackoffPctEnv('-5'), DEFAULT_QUOTA_BACKOFF_PCT)
+    assert.equal(parseQuotaBackoffPctEnv('95.5'), DEFAULT_QUOTA_BACKOFF_PCT)
+    assert.equal(parseQuotaBackoffPctEnv('abc'), DEFAULT_QUOTA_BACKOFF_PCT)
+    assert.equal(parseQuotaBackoffPctEnv('95xyz'), DEFAULT_QUOTA_BACKOFF_PCT)
   })
 })
 
