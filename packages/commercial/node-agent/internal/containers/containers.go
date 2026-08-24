@@ -304,7 +304,7 @@ func (r *Runner) Run(ctx context.Context, req *RunRequest) (*RunResponse, error)
 		)
 	}
 	if req.NanoCpus > 0 {
-		args = append(args, "--cpus", strconv.FormatFloat(cpus, "f", 3, 64))
+		args = append(args, "--cpus", strconv.FormatFloat(cpus, 'f', 3, 64))
 	}
 	if req.PidsLimit > 0 {
 		args = append(args, "--pids-limit", fmt.Sprintf("%d", req.PidsLimit))
