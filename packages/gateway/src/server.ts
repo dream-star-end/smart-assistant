@@ -100,6 +100,7 @@ import {
   type PromptQueueTurnLifecycle,
 } from './promptQueueCoordinator.js'
 import type { AgentSession, PromptQueueExecutionFence } from './sessionManager.js'
+import { resolveChatRunWorkspace } from './projectWorkspace.js'
 import {
   HttpPromptQueueClient,
   readPromptQueueClientConfig,
@@ -15717,9 +15718,9 @@ export class Gateway {
       return
     }
     this._runtimeRecycleIngressActive += 1
-    try {
     let admitCmid: string | undefined
     let admitSession: { _admittingClientMessageId?: string } | undefined
+    try {
 
     // ── Idempotency dedup (read-only check): skip already-processed messages ──
     // Checked first so duplicates don't consume rate-limit budget
@@ -16152,6 +16153,8 @@ export class Gateway {
     // getOrCreate(spawn)与 submit(路由字段)**同源** —— 不允许 spawn 用 A、路由用 B。
     const turnExecutionModel: string | undefined = localExec?.canonicalModel ?? safeModel
 
+    const chatWorkspace = await resolveChatRunWorkspace({ sessionId: frame.peer.id })
+
     const session = await this.sessions.getOrCreate({
       sessionKey,
       agent: effectiveAgent,
@@ -16164,6 +16167,8 @@ export class Gateway {
       // null, and silently drops the reply.
       userId: activeUserId,
       workspaceMode: safeWorkspaceMode,
+      ...(chatWorkspace.workspaceCwd ? { workspaceCwd: chatWorkspace.workspaceCwd } : {}),
+      ...(chatWorkspace.projectId ? { projectId: chatWorkspace.projectId } : {}),
       title: (frame.content.text ?? '').slice(0, 50).trim() || undefined,
       // 仅用于**新建** runner 时初始化 effort;既存 session 的切换由 submit() 处理
       // (在那里和 turn 入队原子串行,避免并发 submit 之间互相覆盖)。
@@ -17615,6 +17620,7 @@ export class Gateway {
         channel: frame.channel,
         userText: text ?? '',
         assistantText: autoDreamAssistantText,
+        projectId: session.projectId,
       }
       // Durably await the success-only marker before detaching background scan.
       // This prevents process shutdown from losing an untracked insertion and
@@ -19115,6 +19121,12 @@ function normalizePath(p: string): string {
     .replace(/\/api\/chat-projects\/[a-zA-Z0-9_-]+/, '/api/chat-projects/:id')
     .replace(/\/api\/project-assets\/[a-zA-Z0-9_-]+/, '/api/project-assets/:id')
     .replace(/\/api\/board\/projects\/[^/]+\/board/, '/api/board/projects/:id/board')
+    .replace(/\/api\/board\/projects\/[^/]+\/context/, '/api/board/projects/:id/context')
+    .replace(
+      /\/api\/board\/projects\/[^/]+\/memories\/[^/]+\/[a-z]+/,
+      '/api/board/projects/:id/memories/:file/:action',
+    )
+    .replace(/\/api\/board\/projects\/[^/]+\/memories/, '/api/board/projects/:id/memories')
     .replace(/\/api\/board\/projects\/[^/]+/, '/api/board/projects/:id')
     .replace(/\/api\/board\/tickets\/[^/]+\/[a-z_]+/, '/api/board/tickets/:id/:action')
     .replace(/\/api\/board\/tickets\/[^/]+/, '/api/board/tickets/:id')

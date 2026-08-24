@@ -8,9 +8,13 @@ import {
   MEMORY_FILE_RE,
   MemoryDir,
   type MemoryType,
+  ProjectMemoryDir,
+  ProjectMemoryLedger,
   acquireKernelFileLock,
   findStrongLexicalMemory,
   isForbiddenAutoMemoryTarget,
+  isProjectContextEnabled,
+  isStrongLexicalDocument,
   loadSessionTurns,
   memoryCalendarDate,
   paths,
@@ -215,6 +219,8 @@ export interface AutoDreamTrigger {
   channel: string
   userText: string
   assistantText: string
+  /** Bound work project; when set, auto writes go to project candidates. */
+  projectId?: string
 }
 
 export interface AutoDreamModelRun {
@@ -518,14 +524,19 @@ export class AutoDreamService {
           proposal,
           memory,
           today,
+          trigger.projectId,
         )
-        const result = await memdir.applyAutoAdds({
-          creates: planned.map((row) => ({ file: row.file, content: row.content })),
-          today,
-        })
-        if (!result.ok)
-          throw new Error(`AUTO_DREAM_MEMORY_ADD_ONLY_FAILED:${result.reason}:${result.error}`)
-        appliedCreates = planned.filter((row) => result.created.includes(row.file))
+        if (trigger.projectId && isProjectContextEnabled()) {
+          appliedCreates = await this.applyProjectCandidates(trigger, planned, today, attemptId)
+        } else {
+          const result = await memdir.applyAutoAdds({
+            creates: planned.map((row) => ({ file: row.file, content: row.content })),
+            today,
+          })
+          if (!result.ok)
+            throw new Error(`AUTO_DREAM_MEMORY_ADD_ONLY_FAILED:${result.reason}:${result.error}`)
+          appliedCreates = planned.filter((row) => result.created.includes(row.file))
+        }
         await Promise.all(appliedCreates.map((row) => recordMemoryUsageEvent({
           agentId: trigger.agentId,
           sessionKey: trigger.sessionKey,
@@ -633,12 +644,41 @@ export class AutoDreamService {
     }
   }
 
+  private async applyProjectCandidates(
+    trigger: AutoDreamTrigger,
+    planned: ProposalUpsert[],
+    today: string,
+    attemptId: string,
+  ): Promise<ProposalUpsert[]> {
+    const projectId = trigger.projectId
+    if (!projectId) return []
+    const { getTaskboardDb } = await import('./taskboard/db/index.js')
+    const ledger = new ProjectMemoryLedger(getTaskboardDb())
+    const applied: ProposalUpsert[] = []
+    for (const row of planned) {
+      const created = await ledger.createCandidate({
+        projectId,
+        slug: row.file,
+        content: row.content,
+        actor: `agent:${trigger.agentId}`,
+        auto: true,
+        today,
+        sourceAgent: trigger.agentId,
+        sourceSession: trigger.sessionKey,
+        idempotencyKey: `autodream:${attemptId}:${row.file}`,
+      })
+      if (created.ok && !created.alreadyOfficial) applied.push(row)
+    }
+    return applied
+  }
+
   private async planAddOnlyCreates(
     agentId: string,
     sessionKey: string,
     proposal: Proposal,
     memory: MemorySnapshot,
     today: string,
+    projectId?: string,
   ): Promise<ProposalUpsert[]> {
     for (const file of proposal.deletes) {
       this.log('auto_memory_add_only_refuse_delete', { agentId, file })
@@ -667,7 +707,7 @@ export class AutoDreamService {
         }).catch(() => {})
         continue
       }
-      if (memory.versions.has(row.file)) {
+      if (!projectId && memory.versions.has(row.file)) {
         this.log('auto_memory_add_only_refuse_exists', { agentId, file: row.file })
         await recordMemoryUsageEvent({
           agentId,
@@ -681,7 +721,22 @@ export class AutoDreamService {
         continue
       }
       const topic = `${row.name} ${row.description}`.trim()
-      const strong = await this.hasStrongCoreHit({ agentId, query: topic, today })
+      if (projectId && isProjectContextEnabled()) {
+        const projectHit = await this.hasStrongProjectHit(projectId, topic, today)
+        if (projectHit.hit) {
+          this.log('auto_memory_write_skipped_strong_hit', {
+            agentId,
+            file: row.file,
+            query: topic,
+            path: projectHit.path,
+            reason: 'project_strong_hit',
+          })
+          continue
+        }
+      }
+      const strong = projectId && isProjectContextEnabled()
+        ? { hit: false as const }
+        : await this.hasStrongCoreHit({ agentId, query: topic, today })
       if (strong.hit) {
         this.log('auto_memory_write_skipped_strong_hit', {
           agentId,
@@ -708,6 +763,29 @@ export class AutoDreamService {
       })
     }
     return creates
+  }
+
+  private async hasStrongProjectHit(
+    projectId: string,
+    query: string,
+    today: string,
+  ): Promise<{ hit: boolean; path?: string }> {
+    try {
+      const { getTaskboardDb } = await import('./taskboard/db/index.js')
+      const ledger = new ProjectMemoryLedger(getTaskboardDb())
+      const dir = new ProjectMemoryDir(projectId)
+      for (const row of ledger.listOfficial(projectId)) {
+        const read = await dir.readOfficial(row.slug, row.contentSha256)
+        if (!read) continue
+        if (isStrongLexicalDocument(query, read.content)) {
+          return { hit: true, path: dir.officialFile(row.slug) }
+        }
+      }
+      void today
+      return { hit: false }
+    } catch {
+      return { hit: false }
+    }
   }
 
   private async notifyBestEffort(agentId: string, report: AutoDreamLastReport): Promise<void> {

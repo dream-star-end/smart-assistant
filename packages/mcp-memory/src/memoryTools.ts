@@ -23,6 +23,8 @@
 import {
   type EmbeddingProvider,
   MemoryDir,
+  ProjectMemoryDir,
+  ProjectMemoryLedger,
   archivalAdd,
   archivalCount,
   archivalDelete,
@@ -494,6 +496,77 @@ export async function handleCoreSearch(args: {
     resultCount: hits.length,
     topMatchKey: hits[0]?.path,
   })
+}
+
+export async function handleProjectSearch(args: {
+  projectId?: string
+  query: string
+  limit?: number
+  offset?: number
+  today?: string
+}): Promise<MemoryToolResult> {
+  const projectId = (args.projectId || process.env.OPENCLAUDE_PROJECT_ID || '').trim().toLowerCase()
+  if (!projectId) return toolError('project-search requires --project or OPENCLAUDE_PROJECT_ID')
+  const query = args.query.trim()
+  if (!query) return toolError('project-search requires a non-empty query string')
+  const limit = args.limit ?? 5
+  const offset = args.offset ?? 0
+  try {
+    const Database = (await import('better-sqlite3')).default
+    const db = new Database(paths.taskboardDb, { readonly: true, fileMustExist: true })
+    try {
+      const ledger = new ProjectMemoryLedger(db)
+      const dir = new ProjectMemoryDir(projectId)
+      const hits: Array<{ score: number; path: string; label: string; size: number; snippet: string }> = []
+      for (const row of ledger.listOfficial(projectId)) {
+        const read = await dir.readOfficial(row.slug, row.contentSha256)
+        if (!read) continue
+        if (!isStrongOrWeak(query, read.content)) continue
+        const excerpt = read.content.slice(0, 400).replace(/\s+/g, ' ').trim()
+        hits.push({
+          score: 1,
+          path: dir.officialFile(row.slug),
+          label: `${read.name} (scope:project)`,
+          size: read.content.length,
+          snippet: excerpt,
+        })
+      }
+      const page = hits.slice(offset, offset + limit)
+      if (hits.length === 0) {
+        return toolOk(`No safe project memories match "${query}".`, {
+          outcome: 'no_match',
+          retrievalMode: 'lexical',
+          resultCount: 0,
+        })
+      }
+      const lines = [
+        `Found ${hits.length} safe project matches for "${query}". Showing ${offset + 1}-${offset + page.length}:`,
+        '',
+      ]
+      page.forEach((hit, i) => {
+        lines.push(
+          `[${offset + i + 1}] ${hit.label}\npath: ${hit.path}\nscope: project\nsize: ${hit.size} bytes\nexcerpt: ${hit.snippet}`,
+          '',
+        )
+      })
+      return toolOk(lines.join('\n'), {
+        outcome: 'hit',
+        retrievalMode: 'lexical',
+        resultCount: hits.length,
+        topMatchKey: hits[0]?.path,
+      })
+    } finally {
+      db.close()
+    }
+  } catch (err) {
+    return toolError(`project-search failed: ${(err as Error).message}`)
+  }
+}
+
+function isStrongOrWeak(query: string, content: string): boolean {
+  const q = query.normalize('NFKC').toLocaleLowerCase()
+  const n = content.normalize('NFKC').toLocaleLowerCase()
+  return q.length >= 2 && n.includes(q)
 }
 
 // ── memory (Core) 已退役 ──

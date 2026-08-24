@@ -39,6 +39,7 @@ import {
   handleArchivalDelete,
   handleArchivalSearch,
   handleCoreSearch,
+  handleProjectSearch,
   handleSessionSearch,
   type MemoryToolResult,
 } from './memoryTools.js'
@@ -100,6 +101,7 @@ function parseOffset(raw: string | undefined): number | undefined {
 const USAGE = [
   'usage:',
   '  oc-memory core-search "<query>" [--limit N] [--offset N]',
+  '  oc-memory project-search "<query>" [--project UUID] [--limit N] [--offset N]',
   '  oc-memory session-search "<query>" [--limit N] [--agent-id ID] [--summarize]',
   '  oc-memory archival-add "<text>" [--tags a,b,c]',
   '  oc-memory archival-search "<query>" [--limit N]',
@@ -286,6 +288,25 @@ async function main(): Promise<void> {
     const startedAt = Date.now()
     const result = await handleCoreSearch({
       agentId,
+      query,
+      limit: parseLimit(flags.limit),
+      offset: parseOffset(flags.offset),
+    })
+    await observeAndEmit({
+      agentId,
+      operation: 'core_search',
+      memoryType: 'core',
+      query,
+      startedAt,
+      result,
+    })
+  }
+  if (cmd === 'project-search') {
+    const query = positional[0]
+    if (!query) fail('project-search requires a "<query>" positional argument')
+    const startedAt = Date.now()
+    const result = await handleProjectSearch({
+      projectId: flags.project,
       query,
       limit: parseLimit(flags.limit),
       offset: parseOffset(flags.offset),
