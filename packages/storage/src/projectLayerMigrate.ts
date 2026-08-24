@@ -938,7 +938,14 @@ export async function applyProjectLayerMigration(
         }))
         applied.push(op.id)
       } else if (op.op === 'copy_memory_candidate') {
-        const content = await ports.readMemoryContent?.(op.slug, op.source, op.sha256)
+        let content: string | undefined
+        try {
+          content = await ports.readMemoryContent?.(op.slug, op.source, op.sha256)
+        } catch (err) {
+          const msg = (err as Error).message || ''
+          if (msg === 'memory_not_found' || msg.includes('ENOENT')) continue
+          throw err
+        }
         if (!content) continue
         const cand = await ports.createMemoryCandidate({ slug: op.slug, content })
         manifest.memoryCandidates.push({
