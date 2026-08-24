@@ -93,6 +93,27 @@ describe('Gateway HTTP entry for project context routes', () => {
       assert.equal(runCtx.status, 200)
       const runBody = (await runCtx.json()) as { runId?: string }
       assert.equal(runBody.runId, run.id)
+
+      const agents = await fetch(`${base}/api/agents`, { headers })
+      assert.equal(agents.status, 200)
+      assert.notEqual(agents.headers.get('content-type')?.includes('text/html'), true)
+      const agentsBody = (await agents.json()) as { agents?: unknown[] }
+      assert.ok(Array.isArray(agentsBody.agents))
+
+      const skills = await fetch(`${base}/api/skills`, { headers })
+      assert.equal(skills.status, 200)
+      const skillsBody = (await skills.json()) as { skills?: unknown }
+      assert.ok(skillsBody.skills !== undefined)
+
+      const agentSkills = await fetch(`${base}/api/agents/main/skills`, { headers })
+      assert.equal(agentSkills.status, 200)
+
+      const overlay = await fetch(`${base}/api/board/projects/${project.id}/context`, {
+        method: 'PUT',
+        headers,
+        body: JSON.stringify({ expectedVersion: ctxBody.version ?? 0, skillNames: [] }),
+      })
+      assert.ok(overlay.status === 200 || overlay.status === 409)
     } finally {
       await new Promise<void>((resolve, reject) =>
         server.close((err) => (err ? reject(err) : resolve())),

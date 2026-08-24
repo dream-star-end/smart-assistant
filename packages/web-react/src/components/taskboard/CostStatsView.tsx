@@ -14,7 +14,7 @@ import {
   taskboardErrorMessage,
 } from '../../lib/taskboard'
 import type { AuthSession } from '../../lib/types'
-import { Button, Card, EmptyState, Field, Input, ListSkeleton, Select, StatCard } from '../ui'
+import { Button, Card, EmptyState, Field, Input, ListSkeleton, ProjectScopeSelect, Select, StatCard } from '../ui'
 import { CostCoverageBlock } from './CostCoverageBlock'
 
 const TZ = 'Asia/Shanghai'
@@ -68,7 +68,7 @@ export function CostStatsView({
         from,
         to,
         groupBy,
-        projectId: filterProject || undefined,
+        projectId: projectId || filterProject || undefined,
         timeZone: TZ,
       })
       setStats(fresh)
@@ -79,7 +79,7 @@ export function CostStatsView({
     } finally {
       setLoading(false)
     }
-  }, [auth, filterProject, from, groupBy, to])
+  }, [auth, filterProject, from, groupBy, projectId, to])
 
   useEffect(() => {
     void load()
@@ -93,7 +93,7 @@ export function CostStatsView({
       <div>
         <h2 className="text-title font-semibold text-fg">成本统计</h2>
         <p className="mt-1 text-caption text-muted">
-          先看 token。美元只计有单价的执行；Cursor / Grok 等路由常把成本记成 0，不能当成没花钱。
+          任务看板 tb_project 自身统计，不含模型用量 usage_records。先看 token。美元只计有单价的执行；Cursor / Grok 等路由常把成本记成 0，不能当成没花钱。
         </p>
       </div>
       <div className="flex flex-wrap items-end gap-2">
@@ -125,16 +125,7 @@ export function CostStatsView({
           />
         </Field>
         <Field label="项目" className="min-w-[10rem]">
-          <Select
-            aria-label="成本项目"
-            inputSize="sm"
-            value={filterProject}
-            onValueChange={setFilterProject}
-            options={[
-              { value: '', label: '全部项目' },
-              ...projects.map((p) => ({ value: p.id, label: `${p.key} ${p.name}` })),
-            ]}
-          />
+          <ProjectScopeSelect className="w-full" />
         </Field>
         <Button type="button" size="sm" variant="secondary" onClick={() => void load()}>
           刷新

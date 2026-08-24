@@ -288,12 +288,18 @@ import {
   type CronJob,
 } from './cron.js'
 import {
+  deriveFixedBoardProjectId,
+  filterCronJobsForBoard,
+  type CronProjectPorts,
+} from './cronProject.js'
+import {
   buildCronOriginResumeText,
   cronOriginClientMessageId,
   cronOriginIdempotencyKey,
   parseOriginWebchatSessionKey,
   type CronOriginFireResult,
 } from './cronOriginSession.js'
+import { getProject } from './taskboard/db/projects.js'
 import {
   buildSendToAgentCallbackText,
   isSendToAgentCallbackComplete,
@@ -2946,6 +2952,7 @@ export class Gateway {
         })
       }
     }, (job, delivery) => this.injectCronOriginSession(job, delivery))
+    this.cron.setProjectPorts(this.cronProjectPorts())
     this.cron.lastActiveChannel = this.lastActiveChannel
     this.cron.start().catch((err) => this.log.error('cron start failed', undefined, err))
 
@@ -12380,6 +12387,10 @@ export class Gateway {
       return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_PERSIST_FAILED' }
     }
     try {
+      const cronBoard =
+        job.projectMode === 'fixed' && typeof job.boardProjectId === 'string'
+          ? job.boardProjectId
+          : undefined
       await this.dispatchInbound({
         type: 'inbound.message',
         channel: origin.channel,
@@ -12390,6 +12401,7 @@ export class Gateway {
         idempotencyKey: cronOriginIdempotencyKey(job.id, delivery.deliveryId),
         clientMessageId,
         _userId: userId,
+        ...(cronBoard ? { _cronBoardProjectId: cronBoard, _cronProjectMode: 'fixed' } : {}),
       } as any)
     } catch (err) {
       this.log.warn('origin-session dispatch failed', { jobId: job.id }, err as Error)
@@ -12619,10 +12631,44 @@ export class Gateway {
   }
 
   // ── Cron/Reminder API handlers ──
+  private cronProjectPorts(): CronProjectPorts {
+    return {
+      getBoardProject: async (id) => {
+        const p = getProject(getTaskboardDb(), id)
+        return p ? { id: p.id, archivedAt: p.archivedAt } : null
+      },
+      getSessionBoardProject: async (sessionId) => {
+        const ws = await resolveChatRunWorkspace({ sessionId })
+        return ws.bound ? ws.projectId : null
+      },
+    }
+  }
+
+  private async stampCronProject(
+    parsed: { projectMode?: unknown; boardProjectId?: unknown },
+    originPeerId?: string,
+  ): Promise<{ projectMode: 'follow_session' | 'fixed'; boardProjectId: string | null } | { error: string }> {
+    const wantFixed = parsed.projectMode === 'fixed'
+    if (!wantFixed) return { projectMode: 'follow_session', boardProjectId: null }
+    let candidate = typeof parsed.boardProjectId === 'string' ? parsed.boardProjectId : ''
+    if (!candidate && originPeerId) {
+      const live = await resolveChatRunWorkspace({ sessionId: originPeerId })
+      candidate = live.bound && live.projectId ? live.projectId : ''
+    }
+    const derived = await deriveFixedBoardProjectId(this.cronProjectPorts(), candidate)
+    if (!derived) return { error: 'fixed project must be a live unarchived board project' }
+    return { projectMode: 'fixed', boardProjectId: derived }
+  }
+
   private async handleCronApi(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (!this.cron) return this.sendError(res, 503, 'cron not initialized')
     if (req.method === 'GET') {
-      const jobs = filterUserVisibleByAgentField(await this.cron.listJobsWithMeta())
+      const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`)
+      let jobs = filterUserVisibleByAgentField(await this.cron.listJobsWithMeta())
+      const boardRaw = url.searchParams.get('boardProjectId')
+      if (boardRaw && boardRaw !== 'all') {
+        jobs = await filterCronJobsForBoard(jobs, boardRaw, this.cronProjectPorts())
+      }
       this.sendJson(res, 200, { jobs })
       return
     }
@@ -12678,6 +12724,10 @@ export class Gateway {
         job.sourceUserId =
           (typeof live.userId === 'string' && live.userId) || containerUser || 'default'
       }
+      const stamped = await this.stampCronProject(parsed, parseOriginWebchatSessionKey(job.sourceSessionKey || '')?.peerId)
+      if ('error' in stamped) return this.sendError(res, 400, stamped.error)
+      job.projectMode = stamped.projectMode
+      job.boardProjectId = stamped.boardProjectId
       await this.cron.addJob(job)
       this.sendJson(res, 201, { ok: true, job })
       return
@@ -12714,6 +12764,13 @@ export class Gateway {
       const existing = (await this.cron.listJobsWithMeta()).find((job) => job.id === id)
       if (existing && isHiddenSystemAgentId(existing.agent)) {
         return this.sendError(res, 404, 'cron job not found')
+      }
+      if (parsed.projectMode !== undefined || parsed.boardProjectId !== undefined) {
+        const originPeer = parseOriginWebchatSessionKey(existing?.sourceSessionKey || '')?.peerId
+        const stamped = await this.stampCronProject(parsed, originPeer)
+        if ('error' in stamped) return this.sendError(res, 400, stamped.error)
+        parsed.projectMode = stamped.projectMode
+        parsed.boardProjectId = stamped.boardProjectId
       }
       const updated = await this.cron.updateJob(id, parsed)
       this.sendJson(res, updated ? 200 : 404, { ok: updated })
@@ -16188,7 +16245,12 @@ export class Gateway {
     // getOrCreate(spawn)与 submit(路由字段)**同源** —— 不允许 spawn 用 A、路由用 B。
     const turnExecutionModel: string | undefined = localExec?.canonicalModel ?? safeModel
 
-    const chatWorkspace = await resolveChatRunWorkspace({ sessionId: frame.peer.id })
+    const cronRaw = (frame as unknown as { _cronBoardProjectId?: unknown })._cronBoardProjectId
+    const cronBoardOverride = typeof cronRaw === 'string' ? cronRaw : undefined
+    const chatWorkspace = await resolveChatRunWorkspace({
+      sessionId: frame.peer.id,
+      ...(cronBoardOverride ? { boardProjectId: cronBoardOverride } : {}),
+    })
     const webchatRunContext = createRunContextDescriptor({
       runId: `webchat:${frame.peer.id}`,
       boardProjectId: chatWorkspace.projectId,

@@ -28,6 +28,7 @@ import {
   scheduleToPreset,
   WEEKDAY_OPTIONS,
 } from "../../lib/cron";
+import { useProjectScope } from "../../hooks/useProjectScope";
 import type { AuthSession, CronJob } from "../../lib/types";
 import { cn } from "../../lib/utils";
 import {
@@ -187,6 +188,9 @@ type FormSeed = {
  * 写成功后 `reconcile()` 在后台静默重拉（不动 loading）只为回填后端算的 nextRunAt。
  */
 export function CronPanel({ auth }: { auth: AuthSession }) {
+  const { scope } = useProjectScope();
+  const boardProjectId =
+    scope.kind === "ungrouped" ? "none" : scope.workProject?.id;
   const [jobs, setJobs] = useState<CronJob[] | null>(null);
   const [loading, setLoading] = useState(true);
   /** 顶层 Alert 只承载「整表加载失败」；写操作的失败一律回到发起它的容器（行 → toast / 表单 → 内联）。 */
@@ -243,7 +247,7 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
     setLoading(true);
     setErr(null);
     api
-      .listCron(auth)
+      .listCron(auth, boardProjectId ? { boardProjectId } : undefined)
       .then((j) => {
         if (alive) commitJobs(j);
       })
@@ -256,7 +260,7 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
     return () => {
       alive = false;
     };
-  }, [auth, commitJobs, reload]);
+  }, [auth, boardProjectId, commitJobs, reload]);
 
   /** 首屏重试：唯一还会把面板塌回骨架的入口（此时本来也没有内容可保留）。 */
   const refresh = useCallback(() => setReload((n) => n + 1), []);
@@ -271,14 +275,14 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
   const reconcile = useCallback(async () => {
     const ticket = (epoch.current += 1);
     try {
-      const fresh = await api.listCron(auth);
+      const fresh = await api.listCron(auth, boardProjectId ? { boardProjectId } : undefined);
       // 注意：这里刻意直接 setJobs 而非 commitJobs —— 服务端快照落地不是本地写，
       // 推进 epoch 会把与它同轮的其它在飞对账误杀。
       if (mounted.current && epoch.current === ticket) setJobs(fresh);
     } catch {
       /* 静默 */
     }
-  }, [auth]);
+  }, [auth, boardProjectId]);
 
   const markPending = useCallback((id: string, on: boolean) => {
     setPending((cur) =>
@@ -716,6 +720,10 @@ function CronForm({
   const [label, setLabel] = useState(seed?.label ?? job?.label ?? "");
   const [prompt, setPrompt] = useState(seed?.prompt ?? job?.prompt ?? "");
   const [deliver, setDeliver] = useState(seed?.deliver ?? job?.deliver ?? "webchat");
+  const [projectMode, setProjectMode] = useState<"follow_session" | "fixed">(
+    job?.projectMode === "fixed" ? "fixed" : "follow_session",
+  );
+  const { scope } = useProjectScope();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -763,6 +771,8 @@ function CronForm({
           label: nextLabel,
           deliver,
           oneshot: preview.oneshot,
+          projectMode,
+          boardProjectId: projectMode === "fixed" ? scope.workProject?.id ?? null : null,
         };
         // 停用中的一次性任务两种重新启用场景：
         //  ① 改回重复 —— 它多半是触发后被后端自动停用的（既有行为）；
@@ -779,6 +789,8 @@ function CronForm({
           label: nextLabel,
           deliver,
           oneshot: preview.oneshot,
+          projectMode,
+          boardProjectId: projectMode === "fixed" ? scope.workProject?.id ?? null : null,
           enabled: reEnable ? true : job.enabled,
           // 排程变了，旧的 nextRunAt 一定是错的；由调用方的后台对账回填。
           nextRunAt: undefined,
@@ -790,6 +802,8 @@ function CronForm({
           label: label.trim() || undefined,
           deliver,
           oneshot: preview.oneshot,
+          projectMode,
+          boardProjectId: projectMode === "fixed" ? scope.workProject?.id ?? null : null,
         });
         onSaved(res.job ?? null);
       }
@@ -943,6 +957,25 @@ function CronForm({
             value={deliver}
             onValueChange={setDeliver}
             options={DELIVER_SELECT}
+            inputSize="sm"
+            className="sm:w-52"
+          />
+        </Field>
+        <Field
+          label="项目"
+          hint={
+            projectMode === "fixed"
+              ? "创建时固定到当前工作项目；目标缺失或归档则失败并写审计，不会静默退到全局。"
+              : "随会话移动：触发时按来源会话当时归属解析。"
+          }
+        >
+          <Select
+            value={projectMode}
+            onValueChange={(v) => setProjectMode(v as "follow_session" | "fixed")}
+            options={[
+              { value: "follow_session", label: "随会话移动" },
+              { value: "fixed", label: "固定当前工作项目" },
+            ]}
             inputSize="sm"
             className="sm:w-52"
           />

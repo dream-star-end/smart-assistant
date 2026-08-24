@@ -18,7 +18,7 @@ import {
   DescriptionRow,
   EmptyState,
   ListSkeleton,
-  Select,
+  ProjectScopeSelect,
   StatCard,
   TimeAgo,
 } from '../ui'
@@ -56,7 +56,7 @@ export function WeeklyReportView({
     setError(null)
     try {
       const fresh = await taskboardApi.getWeeklyReport(auth, {
-        projectId: filterProject || undefined,
+        projectId: projectId || filterProject || undefined,
         from: range.from,
         to: range.to,
       })
@@ -68,7 +68,7 @@ export function WeeklyReportView({
     } finally {
       setLoading(false)
     }
-  }, [auth, filterProject, range.from, range.to])
+  }, [auth, filterProject, projectId, range.from, range.to])
 
   useEffect(() => {
     void load()
@@ -89,7 +89,7 @@ export function WeeklyReportView({
       <div>
         <h2 className="text-title font-semibold text-fg">周报</h2>
         <p className="mt-1 text-caption text-muted">
-          周一到周日（上海日历）。成本同样区分有单价 / 无单价，不会把缺单价显示成 $0。
+          周一到周日（上海日历）。此处成本是任务看板统计，不与模型用量 usage_records 加总。
         </p>
       </div>
       <div className="flex flex-wrap items-center gap-2">
@@ -118,17 +118,7 @@ export function WeeklyReportView({
         >
           下一周
         </Button>
-        <Select
-          aria-label="周报项目"
-          className="w-44"
-          inputSize="sm"
-          value={filterProject}
-          onValueChange={setFilterProject}
-          options={[
-            { value: '', label: '全部项目' },
-            ...projects.map((p) => ({ value: p.id, label: `${p.key} ${p.name}` })),
-          ]}
-        />
+        <ProjectScopeSelect className="w-44" />
         <Button type="button" size="sm" variant="ghost" onClick={() => void load()}>
           刷新
         </Button>

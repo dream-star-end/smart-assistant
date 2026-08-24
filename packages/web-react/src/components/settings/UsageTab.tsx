@@ -11,8 +11,15 @@ import type {
 } from "../../lib/types";
 import { cn, formatCompactCount, formatCredits, groupDigits } from "../../lib/utils";
 import { agentDisplayName } from "../chat/agentNames";
-import { Alert, Button, Progress, Skeleton, Spinner, Tabs } from "../ui";
+import { useProjectScope } from "../../hooks/useProjectScope";
+import { Alert, Button, Progress, ProjectScopeSelect, Skeleton, Spinner, Tabs } from "../ui";
 import { formatReportBucket, REPORT_WINDOW_NOUN, shortTime } from "./labels";
+
+function boardProjectQuery(kind: string, workId: string | undefined): string | undefined {
+  if (kind === "ungrouped") return "none";
+  if (kind === "work" && workId) return workId;
+  return undefined;
+}
 
 const SESSIONS_PAGE = 20;
 
@@ -72,6 +79,8 @@ export function topModelsWithOther(
  * 唯图表 dataset 经 chartNum 收口数值化。
  */
 export function UsageTab({ auth }: { auth: AuthSession }) {
+  const { scope } = useProjectScope();
+  const boardProjectId = boardProjectQuery(scope.kind, scope.workProject?.id);
   // 全生命周期口径（缓存 / 节省 / 会话明细 / 累计）。
   const [data, setData] = useState<UsageResponse | null>(null);
   const [loading, setLoading] = useState(true);
@@ -110,7 +119,7 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
     setLoading(true);
     setErr(null);
     api
-      .getUsage(auth, { sessionsLimit: SESSIONS_PAGE })
+      .getUsage(auth, { sessionsLimit: SESSIONS_PAGE, boardProjectId })
       .then((u) => {
         if (!alive) return;
         setData(u);
@@ -127,7 +136,7 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
     return () => {
       alive = false;
     };
-  }, [auth, usageReloadTick]);
+  }, [auth, usageReloadTick, boardProjectId]);
 
   // 窗口口径：window 切换或重试即重拉。切窗口先清 report 显 Skeleton。
   useEffect(() => {
@@ -136,7 +145,7 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
     setReportErr(null);
     setReport(null);
     api
-      .getMyUsageReport(auth, window)
+      .getMyUsageReport(auth, window, { boardProjectId })
       .then((r) => {
         if (alive) setReport(r);
       })
@@ -149,13 +158,17 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
     return () => {
       alive = false;
     };
-  }, [auth, window, reportReloadTick]);
+  }, [auth, window, reportReloadTick, boardProjectId]);
 
   const loadMore = useCallback(async () => {
     if (!hasMore || loadingMore) return;
     setLoadingMore(true);
     try {
-      const u = await api.getUsage(auth, { sessionsLimit: SESSIONS_PAGE, sessionsOffset: offset });
+      const u = await api.getUsage(auth, {
+        sessionsLimit: SESSIONS_PAGE,
+        sessionsOffset: offset,
+        boardProjectId,
+      });
       setSessions((prev) => [...prev, ...u.sessions.rows]);
       setOffset((o) => o + u.sessions.rows.length);
       setHasMore(u.sessions.has_more);
@@ -164,7 +177,7 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
     } finally {
       setLoadingMore(false);
     }
-  }, [auth, hasMore, loadingMore, offset]);
+  }, [auth, hasMore, loadingMore, offset, boardProjectId]);
 
   // ── 图表数据（report 存在时才有值；null 时 canvas 不挂载，useChart 自 no-op） ──
   const rs = report?.summary ?? null;
@@ -266,10 +279,16 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
     <div className="flex flex-col">
       {/* 视图 + 窗口切换 pill（作用于下面整个图表区 / 按模型表） */}
       <div className="flex items-center justify-between gap-3 px-5 pt-4">
-        <div className="text-[11px] font-medium uppercase tracking-wide text-faint">
-          {usageView === "overview" ? "用量总览" : "按模型统计"} · 近 {REPORT_WINDOW_NOUN[window]}
+        <div className="min-w-0">
+          <div className="text-[11px] font-medium uppercase tracking-wide text-faint">
+            {usageView === "overview" ? "用量总览" : "按模型统计"} · 近 {REPORT_WINDOW_NOUN[window]}
+          </div>
+          <p className="mt-1 text-caption text-muted">
+            按运行时项目归属 / 迁移回填。会话后来移动不会改写已入账行；delegate 归入父会话项目。
+          </p>
         </div>
         <div className="flex min-w-0 items-center gap-2 overflow-x-auto">
+          <ProjectScopeSelect className="w-40 shrink-0" />
           <Tabs
             aria-label="用量视图"
             value={usageView}

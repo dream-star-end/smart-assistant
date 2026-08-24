@@ -10,6 +10,10 @@ import { join } from 'node:path'
 import { BOARD_PROJECT_ID_RE, projectContextDir } from './projectContext.js'
 
 export const OCV5_DEFAULT_BOARD_ID = '852859fa-cf1d-481c-96fd-23f2966b8b5f'
+/** Live uid3 inventory (phase-1 dry-run). Apply aborts if a large bind list drifts. */
+export const AUTHORITATIVE_DEFAULT_APPLY = 62
+export const AUTHORITATIVE_MANUAL_REVIEW = 47
+export const AUTHORITATIVE_BIND_MIN = 50
 
 export type InventorySession = {
   id: string
@@ -140,6 +144,15 @@ export type PlannedOp =
       digest: string
       source: 'output' | 'upload'
     }
+  | {
+      id: string
+      op: 'usage_backfill'
+      dryRun: true
+      sessionIds: string[]
+      boardProjectId: string
+      source: 'migration_backfill'
+      rowIds?: string[]
+    }
 
 export type ManualReviewItem = {
   id: string
@@ -170,6 +183,25 @@ export type ProjectLayerPlan = {
     facadeUnique: boolean
     contextVersion: number | null
   }
+  expectedCounts: {
+    defaultApply: number
+    manualReview: number
+    actualApply: number
+    actualManualReview: number
+    drifted: boolean
+  }
+  cronImpact: Array<{
+    jobId: string
+    projectMode: string
+    originSessionId: string | null
+    action: 'manualReview'
+    reason: string
+  }>
+  usageBackfill: {
+    sessionIds: string[]
+    rowIds: string[]
+    source: 'migration_backfill'
+  }
 }
 
 export type ProjectLayerLivePorts = {
@@ -178,6 +210,13 @@ export type ProjectLayerLivePorts = {
   getSession(id: string): Promise<LiveSessionSnapshot | null>
   getProjectContextVersion(id: string): Promise<number | null>
   sha256File?(absPath: string): Promise<string>
+  listNullUsage?(sessionIds: string[]): Promise<Array<{ id: string; sessionId: string | null; parentSessionId: string | null }>>
+  listCronJobs?(): Promise<Array<{
+    id: string
+    projectMode?: string
+    boardProjectId?: string | null
+    sourceSessionKey?: string
+  }>>
 }
 
 export function isDefaultApplySession(s: InventorySession): boolean {
@@ -451,6 +490,54 @@ export async function planProjectLayerMigration(opts: {
     risks.push(`target contextVersion=${contextVersion} — overlay/memory writes must use CAS expectedVersion`)
   }
 
+  const usageRowIds: string[] = []
+  if (moveIds.length) {
+    if (opts.ports.listNullUsage) {
+      const rows = await opts.ports.listNullUsage(moveIds)
+      for (const row of rows) usageRowIds.push(row.id)
+    }
+    operations.push({
+      id: 'OP_USAGE_BACKFILL',
+      op: 'usage_backfill',
+      dryRun: true,
+      sessionIds: moveIds,
+      boardProjectId: target,
+      source: 'migration_backfill',
+      rowIds: usageRowIds,
+    })
+  }
+
+  const cronImpact: ProjectLayerPlan['cronImpact'] = []
+  if (opts.ports.listCronJobs) {
+    const jobs = await opts.ports.listCronJobs()
+    const applySet = new Set(moveIds)
+    for (const job of jobs) {
+      const origin = job.sourceSessionKey?.match(/:webchat:dm:([A-Za-z0-9_-]{1,64})$/)?.[1] ?? null
+      const mode = job.projectMode === 'fixed' ? 'fixed' : 'follow_session'
+      if (origin && applySet.has(origin)) {
+        cronImpact.push({
+          jobId: job.id,
+          projectMode: mode,
+          originSessionId: origin,
+          action: 'manualReview',
+          reason: 'origin session in default apply set — cron YAML not auto-changed',
+        })
+      }
+    }
+  }
+
+  const bindCount = opts.inventory.sessionMapping.bind_to_ocv5_chat?.ids?.length ?? 0
+  const actualApply = moveIds.length
+  const actualManualReview = manualReview.length
+  const drifted =
+    bindCount >= AUTHORITATIVE_BIND_MIN &&
+    (actualApply !== AUTHORITATIVE_DEFAULT_APPLY || actualManualReview !== AUTHORITATIVE_MANUAL_REVIEW)
+  if (drifted) {
+    risks.push(
+      `inventory_count_drift apply=${actualApply} expected=${AUTHORITATIVE_DEFAULT_APPLY} manualReview=${actualManualReview} expected=${AUTHORITATIVE_MANUAL_REVIEW} — abort apply`,
+    )
+  }
+
   return {
     operationId: newOperationId(),
     targetBoardProjectId: target,
@@ -474,6 +561,7 @@ export async function planProjectLayerMigration(opts: {
         'restore whole taskboard.db',
         'touch commercial production',
         'hard-delete sessions',
+        'whole-table usage rollback',
       ],
     },
     live: {
@@ -483,6 +571,19 @@ export async function planProjectLayerMigration(opts: {
       facadeUnique: facades.length <= 1,
       contextVersion,
     },
+    expectedCounts: {
+      defaultApply: AUTHORITATIVE_DEFAULT_APPLY,
+      manualReview: AUTHORITATIVE_MANUAL_REVIEW,
+      actualApply,
+      actualManualReview,
+      drifted,
+    },
+    cronImpact,
+    usageBackfill: {
+      sessionIds: moveIds,
+      rowIds: usageRowIds,
+      source: 'migration_backfill',
+    },
   }
 }
 
@@ -491,6 +592,7 @@ export function assertPlanApplyable(plan: ProjectLayerPlan): void {
   if (plan.live.boardArchived) throw new Error('archived_project')
   if (!plan.live.facadeUnique) throw new Error('facade_not_unique')
   if (plan.manualReview.some((m) => m.reason.includes('drift'))) throw new Error('stale_session')
+  if (plan.expectedCounts?.drifted) throw new Error('inventory_count_drift')
 }
 
 export type ApplyPorts = ProjectLayerLivePorts & {
@@ -515,6 +617,13 @@ export type ApplyPorts = ProjectLayerLivePorts & {
   deleteAsset(id: string): Promise<void>
   readMemoryContent?(slug: string, file?: string): Promise<string>
   repairOwnership?(boardProjectId: string, uid: number, gid: number): Promise<void>
+  backfillUsage?(input: {
+    operationId: string
+    sessionIds: string[]
+    boardProjectId: string
+    source: 'migration_backfill'
+  }): Promise<Array<{ id: string; oldBoardProjectId: string | null }>>
+  restoreUsage?(rows: Array<{ id: string; oldBoardProjectId: string | null }>): Promise<number>
 }
 
 export type ApplyResult = {
@@ -524,7 +633,9 @@ export type ApplyResult = {
   createdAssetIds: string[]
   facadeId: string | null
   error?: string
-  rollback: ProjectLayerPlan['rollback']
+  rollback: ProjectLayerPlan['rollback'] & {
+    usageRestores?: Array<{ id: string; oldBoardProjectId: string | null }>
+  }
 }
 
 export async function applyProjectLayerMigration(
@@ -538,6 +649,7 @@ export async function applyProjectLayerMigration(
   const rollback = {
     ...plan.rollback,
     assetDeletes: [] as string[],
+    usageRestores: [] as Array<{ id: string; oldBoardProjectId: string | null }>,
   }
   try {
     for (const op of plan.operations) {
@@ -582,6 +694,17 @@ export async function applyProjectLayerMigration(
         createdAssetIds.push(asset.id)
         rollback.assetDeletes.push(asset.id)
         applied.push(op.id)
+      } else if (op.op === 'usage_backfill') {
+        if (ports.backfillUsage) {
+          const rows = await ports.backfillUsage({
+            operationId: plan.operationId,
+            sessionIds: op.sessionIds,
+            boardProjectId: op.boardProjectId,
+            source: 'migration_backfill',
+          })
+          rollback.usageRestores.push(...rows)
+        }
+        applied.push(op.id)
       }
     }
     return {
@@ -619,8 +742,12 @@ export async function applyProjectLayerMigration(
 
 export async function compensateProjectLayerMigration(
   result: ApplyResult,
-  ports: Pick<ApplyPorts, 'batchMoveSessions' | 'deleteAsset'>,
+  ports: Pick<ApplyPorts, 'batchMoveSessions' | 'deleteAsset' | 'restoreUsage'>,
 ): Promise<void> {
+  const usageRestores = result.rollback.usageRestores ?? []
+  if (usageRestores.length && ports.restoreUsage) {
+    await ports.restoreUsage(usageRestores).catch(() => {})
+  }
   for (const id of [...result.rollback.assetDeletes].reverse()) {
     await ports.deleteAsset(id).catch(() => {})
   }

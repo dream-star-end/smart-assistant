@@ -108,7 +108,7 @@ export function ManageCenter({
       // 横滚形态下末尾两个 tab 在所有主流手机上默认不可见。宫格 3×2 让主导航整屏可见。
       toolbar={
         <div className="flex flex-col gap-2">
-          {tab === "memory" || tab === "skills" ? (
+          {tab === "memory" || tab === "skills" || tab === "cron" ? (
             <ProjectScopeSelect className="w-full sm:w-56" />
           ) : null}
           <Tabs

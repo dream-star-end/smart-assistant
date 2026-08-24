@@ -110,6 +110,29 @@ export async function resolveTurnProjectContext(
   const env = opts.env ?? process.env
   const hasMaster = Boolean(env[ENV_MASTER_URL] && env[ENV_CONTAINER_TOKEN])
 
+  // Trusted override (cron fixed / explicit board) wins over session bind.
+  if (boardId) {
+    if (hasMaster) {
+      const remote = await fetchMaster(`boardProjectId=${encodeURIComponent(boardId)}`, opts)
+      return hydrateBound(boardId, remote)
+    }
+    const userId = process.env.OC_USER_ID?.trim() || 'default'
+    const bind =
+      (await getChatProjectBindByBoardProjectId(userId, boardId)) ??
+      (userId !== 'default' ? await getChatProjectBindByBoardProjectId('default', boardId) : null)
+    const pinned = bind
+      ? await listPinnedProjectAssetsForChatProject(bind.userId, bind.chatProjectId)
+      : { assets: [] as ProjectAsset[], revision: 0 }
+    return hydrateBound(boardId, {
+      chatProjectId: bind?.chatProjectId ?? null,
+      boardProjectId: boardId,
+      name: bind?.name ?? null,
+      instructions: bind?.instructions ?? null,
+      pinnedAssets: pinned.assets,
+      assetsRevision: pinned.revision,
+    })
+  }
+
   if (hasMaster) {
     if (sessionId) {
       const remote = await fetchMaster(`sessionId=${encodeURIComponent(sessionId)}`, opts)
@@ -125,10 +148,6 @@ export async function resolveTurnProjectContext(
         assetsRevision: Number(remote?.assetsRevision) || 0,
         bound: false,
       }
-    }
-    if (boardId) {
-      const remote = await fetchMaster(`boardProjectId=${encodeURIComponent(boardId)}`, opts)
-      return hydrateBound(boardId, remote)
     }
     return null
   }
@@ -157,10 +176,6 @@ export async function resolveTurnProjectContext(
       assetsRevision: pinned.revision,
       bound: false,
     }
-  }
-  if (boardId) {
-    const pinned = { assets: [] as ProjectAsset[], revision: 0 }
-    return hydrateBound(boardId, { boardProjectId: boardId, pinnedAssets: pinned.assets, assetsRevision: 0 })
   }
   return null
 }

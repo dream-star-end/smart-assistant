@@ -20,7 +20,7 @@ import {
   type LiveSessionSnapshot,
   type ProjectLayerInventory,
   type ProjectLayerLivePorts,
-} from '../../storage/src/projectLayerMigrate.ts'
+} from '../../storage/src/projectLayerMigrate.js'
 
 function arg(argv: string[], name: string, fallback = ''): string {
   const i = argv.indexOf(name)
@@ -108,6 +108,23 @@ const ports: ProjectLayerLivePorts = {
     const buf = await readFile(absPath)
     return createHash('sha256').update(buf).digest('hex')
   },
+  async listCronJobs() {
+    const home = process.env.OPENCLAUDE_HOME
+    if (!home) return []
+    try {
+      const raw = await readFile(`${home}/cron.yaml`, 'utf8')
+      const { parse } = await import('yaml')
+      const file = parse(raw) as { jobs?: Array<{ id?: string; projectMode?: string; boardProjectId?: string; sourceSessionKey?: string }> }
+      return (file.jobs ?? []).filter((j) => j.id).map((j) => ({
+        id: String(j.id),
+        projectMode: j.projectMode,
+        boardProjectId: j.boardProjectId ?? null,
+        sourceSessionKey: j.sourceSessionKey,
+      }))
+    } catch {
+      return []
+    }
+  },
 }
 
 const plan = await planProjectLayerMigration({
@@ -122,5 +139,5 @@ const text = JSON.stringify(plan, null, 2)
 if (outPath) await writeFile(outPath, text)
 console.log(text)
 console.error(
-  `dry-run operationId=${plan.operationId} applySessions=${plan.defaultApplySessionIds.length} manualReview=${plan.manualReview.length} ops=${plan.operations.length}`,
+  `dry-run operationId=${plan.operationId} applySessions=${plan.defaultApplySessionIds.length} manualReview=${plan.manualReview.length} ops=${plan.operations.length} usageBackfillSessions=${plan.usageBackfill.sessionIds.length} cronImpact=${plan.cronImpact.length} drifted=${plan.expectedCounts.drifted}`,
 )

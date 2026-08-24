@@ -1348,6 +1348,7 @@ export const api = {
     if (q?.sessionsOffset != null) qs.set("sessions_offset", String(q.sessionsOffset));
     if (q?.ledgerLimit != null) qs.set("ledger_limit", String(q.ledgerLimit));
     if (q?.ledgerBefore) qs.set("ledger_before", q.ledgerBefore);
+    if (q?.boardProjectId) qs.set("boardProjectId", q.boardProjectId);
     const suffix = qs.toString() ? `?${qs.toString()}` : "";
     return jsonOrThrow<UsageResponse>(
       callWithRefresh(a, (t) =>
@@ -1361,15 +1362,22 @@ export const api = {
    * 按模型 + 账本（收支趋势 / 支出构成），window 默认由后端取 7d。trend 已补零升序。
    * **所有数字字段为字符串大数，勿数值化后当权威。** 抛 ApiError 由调用方兜底。
    */
-  getMyUsageReport: (a: AuthSession, window: UsageReportWindow): Promise<UsageReport> =>
-    jsonOrThrow<UsageReport>(
+  getMyUsageReport: (
+    a: AuthSession,
+    window: UsageReportWindow,
+    q?: { boardProjectId?: string },
+  ): Promise<UsageReport> => {
+    const qs = new URLSearchParams({ window });
+    if (q?.boardProjectId) qs.set("boardProjectId", q.boardProjectId);
+    return jsonOrThrow<UsageReport>(
       callWithRefresh(a, (t) =>
-        fetch(`/api/me/usage/report?window=${encodeURIComponent(window)}`, {
+        fetch(`/api/me/usage/report?${qs.toString()}`, {
           credentials: "include",
           headers: bearerHeaders(t),
         }),
       ),
-    ),
+    );
+  },
 
   // ── API Keys（注意：当前后端 admin-only rollout，普通用户调用返 403） ─────────
 
@@ -2761,12 +2769,14 @@ export const api = {
   },
 
   /** 定时任务列表（GET /api/cron）。 */
-  listCron: (a: AuthSession) =>
-    jsonOrThrow<{ jobs: CronJob[] }>(
+  listCron: (a: AuthSession, q?: { boardProjectId?: string }) => {
+    const qs = q?.boardProjectId ? `?boardProjectId=${encodeURIComponent(q.boardProjectId)}` : "";
+    return jsonOrThrow<{ jobs: CronJob[] }>(
       callWithRefresh(a, (t) =>
-        fetch("/api/cron", { credentials: "include", headers: bearerHeaders(t) }),
+        fetch(`/api/cron${qs}`, { credentials: "include", headers: bearerHeaders(t) }),
       ),
-    ).then((b) => b.jobs || []),
+    ).then((b) => b.jobs || []);
+  },
 
   /** 新建定时任务（POST /api/cron）。 */
   createCron: (a: AuthSession, body: CronCreateInput) =>

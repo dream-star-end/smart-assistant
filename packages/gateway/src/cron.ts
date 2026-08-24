@@ -48,6 +48,13 @@ import { parse as parseYaml, stringify as stringifyYaml } from 'yaml'
 import { createLogger } from './logger.js'
 import type { SessionManager } from './sessionManager.js'
 import { isHiddenSystemAgentId } from './agentVisibility.js'
+import {
+  normalizeCronProject,
+  resolveCronFireProject,
+  type CronProjectPorts,
+  type CronProjectResolution,
+} from './cronProject.js'
+import { createRunContextDescriptor } from './runContextPersist.js'
 // 引擎 API 错误识别的单一权威(delegate 输出错误同款):CCB 把上游失败以
 // "API Error: …" 文本块流出而不抛,cron 侧必须把这类"产出"当失败而非结果。
 import { classifyDelegateOutputError } from './errorClassify.js'
@@ -430,6 +437,10 @@ export interface CronJob {
   resume?: 'isolated' | 'origin-session'
   sourceSessionKey?: string
   sourceUserId?: string
+  /** Missing = follow_session (legacy jobs). */
+  projectMode?: 'follow_session' | 'fixed'
+  /** Set only when projectMode=fixed. Snapshot of tb_project.id at create. */
+  boardProjectId?: string | null
 }
 
 /**
@@ -1093,7 +1104,26 @@ export class CronScheduler {
       job: CronJob,
       delivery: CronDeliveryContext,
     ) => Promise<CronOriginFireResult>,
+    private projectPorts?: CronProjectPorts,
   ) {}
+
+  setProjectPorts(ports: CronProjectPorts): void {
+    this.projectPorts = ports
+  }
+
+  private async resolveJobProject(job: CronJob): Promise<CronProjectResolution> {
+    if (this.projectPorts) return resolveCronFireProject(job, this.projectPorts)
+    const norm = normalizeCronProject(job)
+    if (norm.projectMode === 'fixed' && !norm.boardProjectId) {
+      return { ok: false, mode: 'fixed', reason: 'fixed_project_missing' }
+    }
+    return {
+      ok: true,
+      boardProjectId: norm.boardProjectId,
+      mode: norm.projectMode,
+      source: norm.projectMode === 'fixed' ? 'job_fixed' : 'follow_no_ports',
+    }
+  }
 
   /**
    * Push the derived wake-index payload to master when it changed since the last
@@ -1592,6 +1622,7 @@ export class CronScheduler {
     job: CronJob,
     durability: CronRunDurabilityHooks,
     deliveryContext: CronDeliveryContext,
+    project: Extract<CronProjectResolution, { ok: true }>,
   ): Promise<CronRunOutcome> {
     try {
       await durability.consumeOccurrence()
@@ -1613,7 +1644,12 @@ export class CronScheduler {
     }
     let result: CronOriginFireResult
     try {
-      result = await this.onOriginSessionFire!(job, deliveryContext)
+      const fireJob: CronJob = {
+        ...job,
+        projectMode: project.mode,
+        boardProjectId: project.mode === 'fixed' ? project.boardProjectId : null,
+      }
+      result = await this.onOriginSessionFire!(fireJob, deliveryContext)
     } catch (err) {
       logger.warn(`job ${job.id} origin-session inject threw`, {
         jobId: job.id,
@@ -1652,7 +1688,12 @@ export class CronScheduler {
       })
       return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_SETTLE_FAILED' }
     }
-    logger.info(`job ${job.id} origin-session ${skipped ? 'skipped' : 'injected'}`, { jobId: job.id })
+    logger.info(`job ${job.id} origin-session ${skipped ? 'skipped' : 'injected'}`, {
+      jobId: job.id,
+      board_project_id: project.boardProjectId,
+      projectMode: project.mode,
+      source: project.source,
+    })
     return skipped ? { kind: 'silent' } : { kind: 'completed' }
   }
 
@@ -1667,8 +1708,25 @@ export class CronScheduler {
   ): Promise<CronRunOutcome> {
     logger.info(`running job ${job.id}`, { jobId: job.id, heartbeat: !!job.heartbeat })
 
+    const project = await this.resolveJobProject(job)
+    if (!project.ok) {
+      logger.warn(`job ${job.id} project fail-closed`, {
+        jobId: job.id,
+        reason: project.reason,
+        projectMode: project.mode,
+        board_project_id: job.boardProjectId ?? null,
+      })
+      return { kind: 'terminal_failure', code: project.reason.toUpperCase() }
+    }
+    logger.info(`job ${job.id} project`, {
+      jobId: job.id,
+      board_project_id: project.boardProjectId,
+      projectMode: project.mode,
+      source: project.source,
+    })
+
     if (job.resume === 'origin-session' && job.sourceSessionKey && this.onOriginSessionFire) {
-      return this.runOriginSessionJob(job, durability, deliveryContext)
+      return this.runOriginSessionJob(job, durability, deliveryContext, project)
     }
 
     // Isolated session per execution for ALL jobs (heartbeat included).
@@ -1736,6 +1794,15 @@ export class CronScheduler {
         // Tag this run as a cron workload so CCB stamps
         // `cc_workload=cron;` into the attribution billing-header.
         workload: 'cron',
+        projectId: project.boardProjectId,
+        runContext: createRunContextDescriptor({
+          runId: `cron:${job.id}:${deliveryContext.deliveryId}`,
+          boardProjectId: project.boardProjectId,
+          channel: 'cron',
+          agentId: agent.id,
+          sessionKey,
+          persistSnapshot: Boolean(project.boardProjectId),
+        }),
       })
     } catch (err) {
       // No submit/tool execution has started, so a bounded retry is safe.
@@ -1882,6 +1949,9 @@ export class CronScheduler {
       jobId: job.id,
       chars: trimmed.length,
       deliver: job.deliver ?? 'local',
+      board_project_id: project.boardProjectId,
+      projectMode: project.mode,
+      source: project.source,
     })
     if ((job.deliver ?? 'local') === 'local') {
       // local = just log, don't push to any channel
@@ -1982,13 +2052,34 @@ export class CronScheduler {
   async updateJob(
     id: string,
     updates: Partial<
-      Pick<CronJob, 'enabled' | 'schedule' | 'prompt' | 'label' | 'deliver' | 'oneshot'>
+      Pick<
+        CronJob,
+        | 'enabled'
+        | 'schedule'
+        | 'prompt'
+        | 'label'
+        | 'deliver'
+        | 'oneshot'
+        | 'projectMode'
+        | 'boardProjectId'
+      >
     >,
   ): Promise<boolean> {
     const file = await ensureCronFile()
     const job = file.jobs.find((j) => j.id === id)
     if (!job) return false
     if (updates.enabled !== undefined) job.enabled = updates.enabled
+    if (updates.projectMode !== undefined || updates.boardProjectId !== undefined) {
+      const next = normalizeCronProject({
+        projectMode: updates.projectMode ?? job.projectMode,
+        boardProjectId:
+          updates.projectMode === 'follow_session'
+            ? null
+            : (updates.boardProjectId !== undefined ? updates.boardProjectId : job.boardProjectId),
+      })
+      job.projectMode = next.projectMode
+      job.boardProjectId = next.boardProjectId
+    }
     if (updates.schedule) {
       const schedErr = validateCronSchedule(updates.schedule)
       if (schedErr) {

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import {
   applyProjectLayerMigration,
+  assertPlanApplyable,
   compensateProjectLayerMigration,
   isDefaultApplySession,
   planProjectLayerMigration,
@@ -173,6 +174,91 @@ describe('planProjectLayerMigration', () => {
     })
     assert.ok(plan.manualReview.some((m) => m.id.includes('asset-digest')))
     assert.ok(!plan.operations.some((o) => o.op === 'create_asset'))
+  })
+})
+
+describe('usage backfill + cron impact + count drift', () => {
+  it('lists usage_backfill without changing cron YAML', async () => {
+    const plan = await planProjectLayerMigration({
+      inventory: inventory([sess({ id: 's-high', category: 'personal' })]),
+      ports: ports({
+        async listNullUsage() {
+          return [{ id: 'u-1', sessionId: 's-high', parentSessionId: null }]
+        },
+        async listCronJobs() {
+          return [
+            {
+              id: 'remind-1',
+              projectMode: 'follow_session',
+              sourceSessionKey: 'agent:main:webchat:dm:s-high',
+            },
+          ]
+        },
+      }),
+    })
+    const backfill = plan.operations.find((o) => o.op === 'usage_backfill')
+    assert.ok(backfill && backfill.op === 'usage_backfill')
+    assert.deepEqual(backfill.sessionIds, ['s-high'])
+    assert.deepEqual(backfill.rowIds, ['u-1'])
+    assert.equal(plan.cronImpact.length, 1)
+    assert.equal(plan.cronImpact[0].action, 'manualReview')
+    assert.ok(!plan.operations.some((o) => o.op === 'usage_backfill' && 'rewriteCron' in o))
+    assert.equal(plan.expectedCounts.drifted, false)
+  })
+
+  it('marks authoritative 62/47 drift and apply aborts', async () => {
+    const ids = Array.from({ length: 50 }, (_, i) => `s-${i}`)
+    const plan = await planProjectLayerMigration({
+      inventory: {
+        sessionMapping: {
+          sessions: ids.map((id) => sess({ id, category: 'personal' })),
+          bind_to_ocv5_chat: { ids },
+        },
+        ocv5ChatFacade: { bindTargetBoardProjectId: OCV5 },
+      },
+      ports: ports({
+        async getSession(id) {
+          return { id, projectId: null, updatedAt: 10, deletedAt: null, archivedAt: null }
+        },
+      }),
+    })
+    assert.equal(plan.expectedCounts.drifted, true)
+    assert.ok(plan.risks.some((r) => r.includes('inventory_count_drift')))
+    assert.throws(() => assertPlanApplyable(plan), /inventory_count_drift/)
+  })
+
+  it('compensate restores only this operation usage rows that did not change again', async () => {
+    const restored: string[] = []
+    await compensateProjectLayerMigration(
+      {
+        ok: false,
+        operationId: 'op-usage',
+        applied: ['OP_USAGE_BACKFILL'],
+        createdAssetIds: [],
+        facadeId: 'f',
+        rollback: {
+          sessionRestores: [],
+          assetDeletes: [],
+          chatFacadeDelete: false,
+          forbidden: [],
+          usageRestores: [
+            { id: 'u-keep', oldBoardProjectId: null },
+            { id: 'u-changed', oldBoardProjectId: null },
+          ],
+        },
+      },
+      {
+        async batchMoveSessions() {
+          return { ok: true, updated: 0 }
+        },
+        async deleteAsset() {},
+        async restoreUsage(rows) {
+          restored.push(...rows.map((r) => r.id))
+          return rows.length
+        },
+      },
+    )
+    assert.deepEqual(restored, ['u-keep', 'u-changed'])
   })
 })
 
