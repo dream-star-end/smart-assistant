@@ -1392,13 +1392,25 @@ async function uniqueExactText(root, text) {
   }
   return matches.length === 1 ? matches[0] : null;
 }
-async function boxCenter(node) {
+async function nodeBox(node) {
   if (!node || typeof node.evaluate !== 'function') return null;
   return node.evaluate((el) => {
     if (!el || typeof el.getBoundingClientRect !== 'function') return null;
     const r = el.getBoundingClientRect();
-    return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+    return { x: r.left, y: r.top, w: r.width, h: r.height };
   }).catch(() => null);
+}
+function containsBox(outer, inner) {
+  if (!outer || !inner) return false;
+  return outer.x <= inner.x + 0.5 && outer.y <= inner.y + 0.5
+    && outer.x + outer.w + 0.5 >= inner.x + inner.w
+    && outer.y + outer.h + 0.5 >= inner.y + inner.h
+    && (outer.w * outer.h > inner.w * inner.h + 0.5);
+}
+async function boxCenter(node) {
+  const box = await nodeBox(node);
+  if (!box) return null;
+  return { x: box.x + box.w / 2, y: box.y + box.h / 2 };
 }
 async function controlIdentity(node) {
   if (!node || typeof node.evaluate !== 'function') return '';
@@ -1424,7 +1436,18 @@ async function clickableExactTextControls(root, text) {
     seen.add(id);
     controls.push(control);
   }
-  return controls;
+  const boxed = [];
+  for (const control of controls) boxed.push({ control, box: await nodeBox(control) });
+  const collapsed = [];
+  for (const item of boxed) {
+    if (!item.box) {
+      collapsed.push(item.control);
+      continue;
+    }
+    const inside = boxed.some((other) => other !== item && containsBox(other.box, item.box));
+    if (!inside) collapsed.push(item.control);
+  }
+  return collapsed;
 }
 async function uniqueOrNearestImageText(root, input, text) {
   const controls = await clickableExactTextControls(root, text);
@@ -1616,6 +1639,14 @@ async function preparePostImageChooser(page, editor) {
   if (chooser) return chooser;
   throw new Error('media-chooser');
 }
+async function provePostImageControl(page, editor) {
+  const scope = (await composerScope(editor)) || page;
+  const scopedInput = await uniqueImageFileInput(scope);
+  const image = await imageToolControl(scope, page, scopedInput);
+  if (!image) return false;
+  await image.click({ trial: true, timeout: 10_000 });
+  return true;
+}
 async function openLongTextComposer(page) {
   const opener = await exactMenuItem(page, '长文');
   if (!opener) return false;
@@ -1734,14 +1765,15 @@ async function writeAction(page, input) {
     let imageChooser = null;
     if (manifest.length === 0) {
       await awaitPostSendReady(page, 30_000, editor);
-    } else {
-      imageChooser = await preparePostImageChooser(page, editor);
+    } else if (!(await provePostImageControl(page, editor))) {
+      throw new Error('media-chooser');
     }
     await awaitDispatch();
     await assertNoChallenge(page);
     const freshEditor = await postComposerEditor(page, longText);
     if (!freshEditor || (await readPostComposer(freshEditor)) !== expectedText) throw new Error('composer-readback');
     if (manifest.length) {
+      imageChooser = await preparePostImageChooser(page, freshEditor);
       if (!imageChooser) throw new Error('media-chooser');
       const previewScope = (await composerScope(freshEditor)) || page;
       const previewBefore = await collectVisibleImageSrcs(previewScope);

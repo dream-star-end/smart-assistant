@@ -197,7 +197,7 @@ describe('official Weibo Plugin', () => {
   })
 
   test('pins the current artifact and only the exact production predecessor', () => {
-    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.24')
+    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.25')
     assert.equal(WEIBO_DRIVER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.equal(WEIBO_LAUNCHER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.deepEqual(WEIBO_SETUP_COMPATIBLE_PREDECESSORS, [
@@ -438,7 +438,16 @@ describe('official Weibo Plugin', () => {
     assert.doesNotMatch(createPostSource, /force:\s*true|\.evaluate\([^)]*\.click|keyboard\./)
     assert.match(createPostSource, /expectedText.length > 2000/)
     assert.match(createPostSource, /openLongTextComposer/)
-    assert.match(createPostSource, /preparePostImageChooser\(page, editor\)/)
+    assert.match(createPostSource, /provePostImageControl\(page, editor\)/)
+    assert.match(createPostSource, /preparePostImageChooser\(page, freshEditor\)/)
+    assert.ok(
+      createPostSource.indexOf('provePostImageControl(page, editor)')
+        < createPostSource.indexOf('await awaitDispatch()'),
+    )
+    assert.ok(
+      createPostSource.indexOf('await awaitDispatch()')
+        < createPostSource.indexOf('preparePostImageChooser(page, freshEditor)'),
+    )
     assert.match(WEIBO_WORKER_SOURCE, /uniqueImageFileInput/)
     assert.match(WEIBO_WORKER_SOURCE, /const scopedInput = await uniqueImageFileInput\(scope\)/)
     assert.match(WEIBO_WORKER_SOURCE, /const liveInput = await uniqueImageFileInput\(scope\)/)
@@ -455,6 +464,8 @@ describe('official Weibo Plugin', () => {
     assert.match(WEIBO_WORKER_SOURCE, /exactTextNearInput/)
     assert.match(WEIBO_WORKER_SOURCE, /uniqueOrNearestImageText/)
     assert.match(WEIBO_WORKER_SOURCE, /clickableExactTextControls/)
+    assert.match(WEIBO_WORKER_SOURCE, /provePostImageControl/)
+    assert.match(WEIBO_WORKER_SOURCE, /containsBox/)
     assert.match(WEIBO_WORKER_SOURCE, /smallVisibleAncestor/)
     assert.match(WEIBO_WORKER_SOURCE, /imageTextHits/)
     assert.match(WEIBO_WORKER_SOURCE, /imageControlHits/)
@@ -816,7 +827,7 @@ describe('official Weibo Plugin', () => {
     )
     assert.equal(realClicks, 1)
     assert.equal(collectCount, 9)
-    assert.ok(events.indexOf('image-click') < events.indexOf('dispatch'))
+    assert.ok(events.indexOf('dispatch') < events.indexOf('image-click'))
     assert.ok(events.indexOf('dispatch') < events.indexOf('upload'))
     assert.ok(events.indexOf('upload') < events.indexOf('click'))
   })
@@ -907,7 +918,7 @@ describe('official Weibo Plugin', () => {
     assert.deepEqual(events, [])
   })
 
-  test('create_post force-clicks the composer file input when 图片 is absent', async () => {
+  test('create_post does not dispatch a composer file input when 图片 is absent', async () => {
     const events: string[] = []
     const empty = { count: async () => 0, nth: () => ({}) }
     const fileInput = {
@@ -965,18 +976,19 @@ describe('official Weibo Plugin', () => {
       },
       waitForTimeout: async () => {},
     }
-    const result = await harness.writeAction(page, {
-      actionId: 'create_post',
-      params: {
-        text: 'hello',
-        mediaManifest: [{ inputId: 'asset-1', filename: 'image.png', mimeType: 'image/png' }],
-      },
-    })
-    assert.deepEqual(result, { post: { id: 'native-input', owned: true, text: 'hello' } })
-    assert.ok(events.includes('input-click'))
-    assert.ok(events.includes('filechooser'))
-    assert.ok(events.indexOf('dispatch') < events.indexOf('upload'))
-    assert.equal(events.includes('upload-direct'), false)
+    await assert.rejects(
+      harness.writeAction(page, {
+        actionId: 'create_post',
+        params: {
+          text: 'hello',
+          mediaManifest: [{ inputId: 'asset-1', filename: 'image.png', mimeType: 'image/png' }],
+        },
+      }),
+      /media/,
+    )
+    assert.equal(events.includes('dispatch'), false)
+    assert.equal(events.includes('upload'), false)
+    assert.equal(events.includes('input-click'), false)
   })
 
   test('create_post does not dispatch an unarmed composer file input', async () => {
@@ -1100,7 +1112,9 @@ describe('official Weibo Plugin', () => {
       },
     })
     assert.deepEqual(result, { post: { id: 'hidden-input', owned: true, text: 'hello' } })
-    assert.deepEqual(events, ['image-menu', 'filechooser', 'image-click', 'dispatch', 'upload', 'click'])
+    assert.ok(events.indexOf('dispatch') < events.indexOf('image-click'))
+    assert.ok(events.indexOf('dispatch') < events.indexOf('upload'))
+    assert.deepEqual(events.filter((event) => event !== 'image-menu' && event !== 'filechooser'), ['dispatch', 'image-click', 'upload', 'click'])
   })
 
   test('create_post waits for composer 发送 after upload and ignores extra 发送', async () => {
@@ -1178,7 +1192,7 @@ describe('official Weibo Plugin', () => {
     assert.ok(events.includes('send-scope'))
     assert.deepEqual(
       events.filter((event) => event !== 'send-scope'),
-      ['image-click', 'dispatch', 'upload', 'click'],
+      ['dispatch', 'image-click', 'upload', 'click'],
     )
   })
 
@@ -1229,7 +1243,7 @@ describe('official Weibo Plugin', () => {
       /media/,
     )
     assert.ok(!events.includes('click'))
-    assert.deepEqual(events, ['image-trial', 'image-click', 'dispatch', 'upload'])
+    assert.deepEqual(events, ['image-trial', 'dispatch', 'image-trial', 'image-click', 'upload'])
   })
 
   test('create_post ignores https avatar images when waiting for upload preview', async () => {
@@ -1281,7 +1295,7 @@ describe('official Weibo Plugin', () => {
       /media/,
     )
     assert.ok(!events.includes('click'))
-    assert.deepEqual(events, ['image-trial', 'image-click', 'dispatch', 'upload'])
+    assert.deepEqual(events, ['image-trial', 'dispatch', 'image-trial', 'image-click', 'upload'])
   })
 
   test('create_post opens 本地上传 when 图片 does not raise a native chooser', async () => {
@@ -1351,10 +1365,11 @@ describe('official Weibo Plugin', () => {
     assert.deepEqual(result, { post: { id: 'local-upload', owned: true, text: 'hello' } })
     assert.deepEqual(events, [
       'image-trial',
+      'dispatch',
+      'image-trial',
       'image-click',
       'local-trial',
       'local-click',
-      'dispatch',
       'upload',
       'click',
     ])
@@ -1426,8 +1441,9 @@ describe('official Weibo Plugin', () => {
     assert.deepEqual(events, [
       'long-text',
       'image-trial',
-      'image-click',
       'dispatch',
+      'image-trial',
+      'image-click',
       'upload',
       'click',
     ])
@@ -1494,7 +1510,7 @@ describe('official Weibo Plugin', () => {
     )
     assert.deepEqual(result, { post: { id: 'plain-long', owned: true, text: longText } })
     assert.equal(filled, '')
-    assert.deepEqual(events, ['image-trial', 'image-click', 'dispatch', 'upload', 'click'])
+    assert.deepEqual(events, ['image-trial', 'dispatch', 'image-trial', 'image-click', 'upload', 'click'])
   })
 
   test('create_post never dispatches when the composer truncates long text', async () => {
@@ -1573,7 +1589,7 @@ describe('official Weibo Plugin', () => {
       ),
       /media/,
     )
-    assert.deepEqual(events, ['image-trial', 'image-click', 'dispatch', 'upload'])
+    assert.deepEqual(events, ['image-trial', 'dispatch', 'image-trial', 'image-click', 'upload'])
   })
 
   test(
