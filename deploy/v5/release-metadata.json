@@ -125,7 +125,8 @@
     "0243_live_unit_checkpoints",
     "0244_tutorial_snapshots",
     "0245_gpt56_family_half_xn",
-    "0246_chat_project_board_bind"
+    "0246_chat_project_board_bind",
+    "0247_cursor_opus_48"
   ],
   "capabilities": [
     "sessions-store-pg-v1",
