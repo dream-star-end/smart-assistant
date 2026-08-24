@@ -123,22 +123,24 @@ describe("runtimeFlags — keys 之间独立 cache", () => {
 });
 
 // Codex round 2 BLOCK 回归 — PG 瞬时不可用导致 reader throw 时,readCached 必须
-// fail-open 到 DEFAULTS('off')且**不 cache 失败**,否则:
+// fail-open 到 DEFAULTS 且**不 cache 失败**,否则:
 //   1. 30s 内一直 fail-open(应是窗口最小化),
 //   2. throw 跨过 pickUpstream 的 PickError 契约 → leak preCheck reservation。
+// 反封复盘 2026-08:session_pin_mode 的 DEFAULTS 从 'off' 改 'enforce',
+// fail-open 值随之变 'enforce'(phase6 仍 'off')。
 describe("runtimeFlags — reader throw 时 fail-open 到 DEFAULTS,不 cache", () => {
-  test("PG 抛错 → 返 'off',下次 call 重试 reader(不 cache 失败)", async () => {
+  test("PG 抛错 → 返 DEFAULTS(enforce),下次 call 重试 reader(不 cache 失败)", async () => {
     let calls = 0;
     __setReaderForTest(async () => {
       calls++;
       throw new Error("PG connection refused");
     });
     const v1 = await getSessionPinMode();
-    assert.equal(v1, "off");
+    assert.equal(v1, "enforce");
     assert.equal(calls, 1);
     // 失败不进 cache → 下次 call 仍打 reader
     const v2 = await getSessionPinMode();
-    assert.equal(v2, "off");
+    assert.equal(v2, "enforce");
     assert.equal(calls, 2);
     assert.equal(__test_only_cache.size, 0, "failed read 不应 cache");
   });
