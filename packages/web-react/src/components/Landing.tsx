@@ -25,25 +25,15 @@ import { api } from '../lib/api'
 import { BRAND } from '../lib/brand'
 import { minSeatPriceYuan } from '../lib/orgBilling'
 import { AgentAvatar } from './AgentAvatar'
+import { BrandMark } from './BrandMark'
 import { DemoShowcase } from './landing/DemoShowcase'
 import { ThemeToggle } from './ThemeToggle'
 import { Button, buttonVariants } from './ui'
 
-function BrandMark({ className = 'size-9' }: { className?: string }) {
-  return (
-    <span
-      aria-hidden
-      className={`${className} grid shrink-0 place-items-center rounded-[11px] bg-[#c7ff64] text-[19px] font-black leading-none text-[#0a0b09] shadow-[0_0_30px_rgba(199,255,100,0.16)]`}
-    >
-      从
-    </span>
-  )
-}
-
 function Logo({ compact = false }: { compact?: boolean }) {
   return (
     <div className="flex items-center gap-2.5" aria-label={BRAND.name}>
-      <BrandMark className={compact ? 'size-8' : 'size-9'} />
+      <BrandMark glow className={compact ? 'size-8' : 'size-9'} />
       <span className="text-[19px] font-semibold tracking-[-0.04em] text-[#f5f4ed]">
         {BRAND.name}
       </span>
@@ -360,9 +350,11 @@ export function Landing(props: {
                   className="transition-transform group-hover:translate-x-0.5"
                 />
               </Button>
+              {/* 次要 CTA 降权重:ghost 文本样式(不与主按钮同级的实心框),
+                  避免首屏双按钮抢焦点;色值贴落地页暗色系而非语义 token。 */}
               <a
                 href="#demo"
-                className={buttonVariants({ variant: 'secondary', shape: 'pill', size: 'lg' })}
+                className={`${buttonVariants({ variant: 'ghost', shape: 'pill', size: 'lg' })} text-[#aeb1a8] hover:bg-white/[0.06] hover:text-[#f5f4ed]`}
               >
                 看一个真实任务
               </a>
@@ -651,7 +643,7 @@ export function Landing(props: {
         <section className="congjian-grid relative overflow-hidden">
           <div aria-hidden className="congjian-cta-glow pointer-events-none absolute inset-0" />
           <div className="relative mx-auto max-w-5xl px-5 py-28 text-center md:py-36">
-            <BrandMark className="mx-auto size-14" />
+            <BrandMark glow className="mx-auto size-14" />
             <h2 className="mt-7 text-[42px] font-semibold leading-[1.02] tracking-[-0.055em] md:text-[68px]">
               现在，把复杂交给从简。
             </h2>
