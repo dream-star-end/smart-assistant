@@ -341,6 +341,22 @@ describe('usage backfill + cron impact + count drift', () => {
     assert.doesNotThrow(() => assertPlanApplyable(plan))
   })
 
+  it('plans bind of the existing unique facade instead of creating a second one', async () => {
+    const plan = await planProjectLayerMigration({
+      inventory: inventory([sess({ id: 's-high', category: 'personal' })]),
+      ports: ports({
+        async listChatProjects() {
+          return [{ id: 'facade-live', name: 'OCV5', boardProjectId: OCV5, deletedAt: null }]
+        },
+      }),
+    })
+    assert.equal(plan.live.facadeId, 'facade-live')
+    assert.equal(plan.operations.some((o) => o.op === 'create_chat_facade'), false)
+    const bind = plan.operations.find((o) => o.op === 'bind_chat_facade')
+    assert.ok(bind && bind.op === 'bind_chat_facade')
+    assert.equal(bind.chatProjectId, 'facade-live')
+  })
+
   it('compensate restores only this operation usage rows that did not change again', async () => {
     const restored: string[] = []
     await compensateProjectLayerMigration(

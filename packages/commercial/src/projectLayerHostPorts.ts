@@ -6,12 +6,14 @@
  */
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { mkdir, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import {
+  ProjectMemoryLedger,
   commitProjectSkillOverlay,
   loadProjectContext,
+  paths,
   projectContextDir,
   readMemoryContent as readAllowlistedMemoryContent,
   type ApplyPorts,
@@ -313,6 +315,12 @@ export function makeApplyPorts(opts: {
       return { id: got.id, created: got.created ?? true }
     },
     async bindChatProject(id, boardProjectId) {
+      const existing = (opts.snapshot.chatProjects ?? []).find(
+        (c) => c.id === id && !c.deletedAt,
+      )
+      if (existing && existing.boardProjectId === boardProjectId) {
+        return { old: existing.boardProjectId, new: boardProjectId }
+      }
       const got = (await hostApply(script, 'apply-bind-facade', {
         chatId: id,
         boardProjectId,
@@ -352,63 +360,90 @@ export function makeApplyPorts(opts: {
     },
     async createMemoryCandidate(input) {
       if (!applyArmed()) throw new Error('apply_disabled')
-      const base = projectLayerApiBase()
-      const res = await fetch(
-        `${base}/api/board/projects/${encodeURIComponent(opts.boardProjectId)}/memories`,
-        {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/json',
-            authorization: `Bearer ${projectLayerApiToken()}`,
-          },
-          body: JSON.stringify({ slug: input.slug, content: input.content }),
-        },
-      )
-      if (!res.ok) throw new Error(`memory_api_${res.status}`)
-      const body = (await res.json()) as {
-        candidate?: { id?: string; version?: number; contentSha256?: string }
-      }
-      if (!body.candidate?.id) throw new Error('memory_api_no_id')
-      return {
-        id: body.candidate.id,
-        version: body.candidate.version ?? 1,
-        hash: body.candidate.contentSha256 ?? createHash('sha256').update(input.content).digest('hex'),
+      const slug = input.slug.endsWith('.md') ? input.slug : `${input.slug}.md`
+      const { default: Database } = await import('better-sqlite3')
+      const db = new Database(paths.taskboardDb)
+      try {
+        const ledger = new ProjectMemoryLedger(db)
+        const created = await ledger.createCandidate({
+          projectId: opts.boardProjectId,
+          slug,
+          content: input.content,
+          actor: 'agent:migration',
+          sourceAgent: 'ocv5-project-layer-migrate',
+        })
+        if (!created.ok) throw new Error(`memory_ledger_${created.error}`)
+        return {
+          id: created.candidate.id,
+          version: created.candidate.version ?? 1,
+          hash:
+            created.candidate.contentSha256 ??
+            createHash('sha256').update(input.content).digest('hex'),
+        }
+      } finally {
+        db.close()
       }
     },
     async rejectMemoryCandidate(input) {
       if (!applyArmed()) throw new Error('apply_disabled')
-      const base = projectLayerApiBase()
-      const res = await fetch(
-        `${base}/api/board/projects/${encodeURIComponent(opts.boardProjectId)}/memories/${encodeURIComponent(input.id)}/reject`,
-        {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/json',
-            authorization: `Bearer ${projectLayerApiToken()}`,
-          },
-          body: JSON.stringify({ expectedVersion: input.version }),
-        },
-      )
-      if (!res.ok) throw new Error(`memory_reject_${res.status}`)
+      const { default: Database } = await import('better-sqlite3')
+      const db = new Database(paths.taskboardDb)
+      try {
+        const ledger = new ProjectMemoryLedger(db)
+        const rejected = ledger.reject({
+          projectId: opts.boardProjectId,
+          candidateId: input.id,
+          expectedVersion: input.version,
+          actor: 'agent:migration',
+        })
+        if (!rejected.ok && rejected.error !== 'not_found') {
+          throw new Error(`memory_reject_${rejected.error}`)
+        }
+      } finally {
+        db.close()
+      }
     },
     async searchMemoryMarker(marker) {
       if (!applyArmed()) throw new Error('apply_disabled')
       const needle = marker.replace(/[^A-Za-z0-9._:-]/g, ' ').trim().slice(0, 80)
       if (!needle) throw new Error('memory_search_marker_empty')
+      const root = projectContextDir(opts.boardProjectId)
+      const dirs = [join(root, 'memory-candidates'), join(root, 'memory')]
+      let filesHit = false
+      for (const dir of dirs) {
+        if (!existsSync(dir)) continue
+        for (const name of readdirSync(dir)) {
+          if (!name.endsWith('.md')) continue
+          try {
+            const body = readFileSync(join(dir, name), 'utf8')
+            if (body.includes(needle) || body.includes(marker.slice(0, 40))) {
+              filesHit = true
+              break
+            }
+          } catch {
+            /* skip unreadable */
+          }
+        }
+        if (filesHit) break
+      }
       const out = await runHost(
         [
           'docker',
           'exec',
           '-u',
           '1000',
+          '-e',
+          `OPENCLAUDE_PROJECT_ID=${opts.boardProjectId}`,
           UID3_CONTAINER,
           'oc-memory',
           'project-search',
           needle,
+          '--project',
+          opts.boardProjectId,
         ],
         '',
       )
-      return out.includes(needle)
+      return filesHit || out.includes(needle)
     },
     async putSkillOverlay(names, expectedVersion) {
       if (!applyArmed()) throw new Error('apply_disabled')

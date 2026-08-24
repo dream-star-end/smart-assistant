@@ -25,6 +25,7 @@ USAGE_USER = "3"
 OCV5 = "852859fa-cf1d-481c-96fd-23f2966b8b5f"
 UID3_VOL = "/var/lib/docker/volumes/oc-v5-data-u3/_data"
 ID_RE = re.compile(r"^[A-Za-z0-9._:-]{8,80}$")
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 USAGE_ID_RE = re.compile(r"^\d{1,20}$")
 
 
@@ -286,7 +287,11 @@ VALUES (gen_random_uuid()::text, '{USER_ID}', '{name_sql}',
         (EXTRACT(EPOCH FROM NOW())*1000)::bigint, (EXTRACT(EPOCH FROM NOW())*1000)::bigint)
 RETURNING id;
 """
-    return {"id": psql(sql).strip(), "created": True}
+    raw = psql(sql).strip()
+    cid = raw.splitlines()[-1].strip() if raw else ""
+    if not UUID_RE.match(cid):
+        raise SystemExit(f"create_facade_bad_id:{cid!r}")
+    return {"id": cid, "created": True}
 
 
 def apply_bind_facade(chat_id: str, board_id: str | None) -> dict:
@@ -295,6 +300,21 @@ def apply_bind_facade(chat_id: str, board_id: str | None) -> dict:
         raise SystemExit("invalid id")
     if board_id not in (None, "") and not ID_RE.match(str(board_id)):
         raise SystemExit("invalid id")
+    row_raw = psql(
+        "SELECT json_build_object('id', id, 'board', board_project_id, "
+        "'deleted', deleted_at, 'user_id', user_id) "
+        f"FROM chat_projects WHERE id = '{chat_id}';"
+    ).strip()
+    if not row_raw:
+        raise SystemExit(f"bind_failed:no_row:{chat_id}")
+    row = json.loads(row_raw)
+    if row.get("user_id") != USER_ID:
+        raise SystemExit(f"bind_failed:wrong_user:{chat_id}:{row.get('user_id')}")
+    if row.get("deleted") not in (None,):
+        raise SystemExit(f"bind_failed:deleted:{chat_id}")
+    current = row.get("board")
+    if board_id not in (None, "") and current == board_id:
+        return {"id": chat_id, "old": current, "new": current, "idempotent": True}
     new_sql = "NULL" if board_id in (None, "") else "'" + str(board_id).replace("'", "''") + "'"
     pred = "TRUE" if board_id in (None, "") else f"(cp.board_project_id IS NULL OR cp.board_project_id = {new_sql})"
     sql = f"""
@@ -320,10 +340,12 @@ SELECT json_build_object(
 """
     raw = psql(sql).strip()
     if not raw:
-        raise SystemExit("bind_failed")
+        raise SystemExit(
+            f"bind_failed:empty_returning:{chat_id}:current={current}:target={board_id}"
+        )
     got = json.loads(raw)
     if not got.get("id"):
-        raise SystemExit("bind_failed")
+        raise SystemExit(f"bind_failed:no_id:{chat_id}")
     return got
 
 

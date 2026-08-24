@@ -107,6 +107,9 @@ describe('resolveLiveReadScript', () => {
     assert.equal(src.includes("'test', '-r'"), false)
     assert.match(src, /'oc-memory',\s*'project-search'/)
     assert.match(src, /\/api\/project-assets/)
+    assert.match(src, /existing && existing.boardProjectId === boardProjectId/)
+    assert.match(src, /ProjectMemoryLedger/)
+    assert.match(src, /memory-candidates/)
   })
 })
 
@@ -126,6 +129,15 @@ describe('python apply SQL', () => {
     assert.ok(move.lastIndexOf('RAISE EXCEPTION') < move.lastIndexOf('COMMIT;'))
     assert.ok(move.lastIndexOf('RAISE EXCEPTION') > 0)
     assert.equal(move.includes('if not got.get("ok")'), false)
+  })
+
+  test('bind is idempotent when already bound and reports chatId on empty RETURNING', () => {
+    const bind = pySrc.slice(pySrc.indexOf('def apply_bind_facade'), pySrc.indexOf('def _sql_text_or_null'))
+    assert.match(bind, /bind_failed:no_row/)
+    assert.match(bind, /idempotent/)
+    assert.match(bind, /empty_returning/)
+    assert.match(pySrc, /UUID_RE/)
+    assert.match(pySrc, /create_facade_bad_id/)
   })
 
   test('usage planned=updated=recorded RAISE before COMMIT; missing-row self-test exists', () => {
