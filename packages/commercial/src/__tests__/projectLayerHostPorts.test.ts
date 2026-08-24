@@ -129,6 +129,7 @@ describe('python apply SQL', () => {
     const move = pySrc.slice(pySrc.indexOf('def apply_move_sessions_sql'), pySrc.indexOf('def apply_move_sessions('))
     assert.match(move, /RAISE EXCEPTION 'stale_session/)
     assert.match(move, /WITH u AS/)
+    assert.match(move, /INSERT INTO _ocv5_post SELECT \* FROM u/)
     assert.ok(move.lastIndexOf('RAISE EXCEPTION') < move.lastIndexOf('COMMIT;'))
     assert.ok(move.lastIndexOf('RAISE EXCEPTION') > 0)
     assert.equal(move.includes('if not got.get("ok")'), false)

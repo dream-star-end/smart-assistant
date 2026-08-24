@@ -398,7 +398,13 @@ def apply_move_sessions_sql(payload: dict) -> str:
 BEGIN;
 CREATE TEMP TABLE _ocv5_exp (id text, old_project text, old_updated bigint) ON COMMIT DROP;
 INSERT INTO _ocv5_exp(id, old_project, old_updated) VALUES {", ".join(values)};
-CREATE TEMP TABLE _ocv5_post ON COMMIT DROP AS
+CREATE TEMP TABLE _ocv5_post (
+  id text,
+  "oldProjectId" text,
+  "oldUpdatedAt" bigint,
+  "updatedAt" bigint,
+  "projectId" text
+) ON COMMIT DROP;
 WITH u AS (
   UPDATE client_sessions cs
      SET project_id = {project_sql},
@@ -408,15 +414,17 @@ WITH u AS (
      AND cs.id = exp.id
      AND cs.deleted_at IS NULL
      AND cs.archived_at IS NULL
-     AND cs.updated_at = exp.old_updated
-     AND cs.project_id IS NOT DISTINCT FROM exp.old_project
+     AND (
+       (cs.updated_at = exp.old_updated AND cs.project_id IS NOT DISTINCT FROM exp.old_project)
+       OR (cs.project_id IS NOT DISTINCT FROM {project_sql})
+     )
   RETURNING cs.id,
             exp.old_project AS "oldProjectId",
             exp.old_updated AS "oldUpdatedAt",
             cs.updated_at AS "updatedAt",
             cs.project_id AS "projectId"
 )
-SELECT * FROM u;
+INSERT INTO _ocv5_post SELECT * FROM u;
 DO $body$
 DECLARE
   planned int := {planned};
@@ -457,21 +465,26 @@ def apply_usage_backfill_sql(payload: dict) -> str:
     arr = sql_text_array(row_ids)
     return f"""
 BEGIN;
-CREATE TEMP TABLE _ocv5_usage_post ON COMMIT DROP AS
+CREATE TEMP TABLE _ocv5_usage_post (
+  id text,
+  "oldBoardProjectId" text,
+  "newBoardProjectId" text,
+  "newSource" text
+) ON COMMIT DROP;
 WITH u AS (
   UPDATE usage_records
      SET board_project_id = '{board}',
          board_project_source = 'migration_backfill',
          board_project_captured_at = NOW()
    WHERE user_id = {USAGE_USER}::bigint
-     AND board_project_id IS NULL
+     AND (board_project_id IS NULL OR board_project_id = '{board}')
      AND id::text = ANY({arr})
   RETURNING id::text AS id,
             NULL::text AS "oldBoardProjectId",
             board_project_id AS "newBoardProjectId",
             board_project_source AS "newSource"
 )
-SELECT * FROM u;
+INSERT INTO _ocv5_usage_post SELECT * FROM u;
 DO $body$
 DECLARE
   planned int := {planned};
