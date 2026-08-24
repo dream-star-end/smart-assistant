@@ -1,11 +1,12 @@
 /**
- * Reviewed Weibo worker. It drives the public web UI only: no Playwright request
- * client, response-body inspection, private endpoint replay, or challenge bypass.
+ * Reviewed Weibo worker. No Playwright request client, no Node-side cookie replay,
+ * and no challenge bypass. Writes stay behind the dispatch fence.
  *
- * Listed backup, not implemented: login cookies + picupload.weibo.com +
- * /ajax/statuses/update. That path needs an origin allowlist and a product-contract
- * change. Current media path stays DOM-only: arm filechooser, click in parallel,
- * and setFiles inside the filechooser callback before any other Playwright work.
+ * Short text plus images (1.6.33): after dispatch, in-page fetch uploads through
+ * picupload.weibo.com then POST /ajax/statuses/update. If that upload never starts,
+ * a same-context m.weibo.cn tab tries uploadPic plus update. Chromium fetch keeps
+ * the TLS broker and origin allowlist. DOM filechooser remains the fallback only
+ * when the cookie path did not attempt a publish.
  */
 export const WEIBO_WORKER_SOURCE = String.raw`
 import { createHash } from 'node:crypto';
@@ -27,7 +28,7 @@ const ACTION_ORIGINS = new Set([
   'https://img.t.sinajs.cn', 'https://tvax1.sinaimg.cn',
   'https://tvax2.sinaimg.cn', 'https://tvax3.sinaimg.cn', 'https://tvax4.sinaimg.cn',
   'https://wx1.sinaimg.cn', 'https://wx2.sinaimg.cn', 'https://wx3.sinaimg.cn',
-  'https://wx4.sinaimg.cn'
+  'https://wx4.sinaimg.cn', 'https://picupload.weibo.com'
 ]);
 const WRITE_ACTIONS = new Set([
   'create_post', 'edit_post', 'delete_post', 'create_comment', 'reply_comment',
@@ -1147,6 +1148,160 @@ async function confirmDialog(page, labels) {
   }
   throw new Error('confirm');
 }
+async function publishComposerViaCookieApi(page, text, files, selfId) {
+  if (!page || typeof page.evaluate !== 'function' || !Array.isArray(files) || !files.length) return { published: false, attempted: false };
+  const encoded = files.map((file) => ({
+    name: String(file && file.name || 'image.png').slice(0, 128),
+    mimeType: String(file && file.mimeType || 'image/jpeg'),
+    base64: file.buffer.toString('base64')
+  }));
+  const payload = { text: String(text || ''), files: encoded, selfId: String(selfId || '') };
+  const desktop = await page.evaluate(async (input) => {
+    const cookieMap = {};
+    for (const part of String(document.cookie || '').split(';')) {
+      const index = part.indexOf('=');
+      if (index <= 0) continue;
+      cookieMap[part.slice(0, index).trim()] = decodeURIComponent(part.slice(index + 1).trim());
+    }
+    const xsrf = cookieMap['XSRF-TOKEN'] || '';
+    const bytesOf = (item) => {
+      const binary = atob(item.base64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+      return bytes;
+    };
+    const parseJson = (raw) => {
+      const text = String(raw || '');
+      const start = text.indexOf('{');
+      if (start < 0) return null;
+      try { return JSON.parse(text.slice(start)); } catch { return null; }
+    };
+    const pidOf = (parsed) => {
+      if (!parsed || typeof parsed !== 'object') return '';
+      const pic = parsed.pic && typeof parsed.pic === 'object' ? parsed.pic : null;
+      const pic1 = parsed.data && parsed.data.pics && parsed.data.pics.pic_1 ? parsed.data.pics.pic_1 : null;
+      return String(parsed.pic_id || parsed.picid || parsed.pid || (pic && pic.pid) || (pic1 && pic1.pid) || '');
+    };
+    const publishedId = (parsed) => {
+      if (!parsed || typeof parsed !== 'object') return '';
+      const ok = parsed.ok === 1 || parsed.ok === true || parsed.code === 100000 || parsed.code === '100000';
+      if (!ok) return '';
+      const data = parsed.data && typeof parsed.data === 'object' ? parsed.data : parsed;
+      return String(data.idstr || data.mblogid || data.id || data.mid || 'ok');
+    };
+    const pids = [];
+    for (const file of input.files) {
+      const blob = new Blob([bytesOf(file)], { type: file.mimeType });
+      let pid = '';
+      const query = 'data=1&p=1&url=' + encodeURIComponent('weibo.com/u/' + input.selfId) + '&markpos=1&logo=1&nick=0&marks=0&app=miniblog&s=json&file_source=1';
+      const endpoints = [
+        'https://picupload.weibo.com/interface/pic_upload.php?' + query,
+        'https://picupload.weibo.com/interface/upload.php?' + query
+      ];
+      for (const url of endpoints) {
+        if (pid) break;
+        try {
+          const uploaded = await fetch(url, { method: 'POST', credentials: 'include', headers: { Accept: 'application/json, text/plain, */*' }, body: blob });
+          pid = pidOf(parseJson(await uploaded.text()));
+        } catch {}
+      }
+      if (!pid) {
+        try {
+          const form = new FormData();
+          form.append('pic1', blob, file.name);
+          const uploaded = await fetch('https://picupload.weibo.com/interface/pic_upload.php?app=miniblog&s=json&data=1', { method: 'POST', credentials: 'include', body: form });
+          pid = pidOf(parseJson(await uploaded.text()));
+        } catch {}
+      }
+      if (!pid) return { published: false, attempted: false, via: 'picupload', pids: pids.slice() };
+      pids.push(pid);
+    }
+    if (pids.length !== input.files.length) return { published: false, attempted: false, via: 'picupload', pids };
+    try {
+      const body = new URLSearchParams();
+      body.set('content', input.text);
+      body.set('visible', '0');
+      body.set('pic_id', pids.join(','));
+      const headers = { Accept: 'application/json, text/plain, */*', 'Content-Type': 'application/x-www-form-urlencoded', 'X-Requested-With': 'XMLHttpRequest' };
+      if (xsrf) { headers['X-Xsrf-Token'] = xsrf; headers['X-XSRF-TOKEN'] = xsrf; }
+      const updated = await fetch('https://weibo.com/ajax/statuses/update', { method: 'POST', credentials: 'include', headers, body: body.toString() });
+      const id = publishedId(parseJson(await updated.text()));
+      return { published: !!id, attempted: true, via: 'ajax', pids, id: id || '' };
+    } catch {
+      return { published: false, attempted: true, via: 'ajax', pids };
+    }
+  }, payload).catch(() => ({ published: false, attempted: false, via: 'ajax', pids: [] }));
+  if (desktop && desktop.published === true && Array.isArray(desktop.pids) && desktop.pids.length === files.length) return desktop;
+  if (desktop && desktop.attempted === true) return desktop;
+  let context = null;
+  try { context = typeof page.context === 'function' ? page.context() : null; } catch { context = null; }
+  if (!context || typeof context.newPage !== 'function') return desktop && typeof desktop === 'object' ? desktop : { published: false, attempted: false };
+  const mobile = await context.newPage();
+  try {
+    await mobile.goto('https://m.weibo.cn/', { waitUntil: 'domcontentloaded', timeout: 30_000 });
+    const fromMobile = await mobile.evaluate(async (input) => {
+      const bytesOf = (item) => {
+        const binary = atob(item.base64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+        return bytes;
+      };
+      const parseJson = (raw) => {
+        const text = String(raw || '');
+        const start = text.indexOf('{');
+        if (start < 0) return null;
+        try { return JSON.parse(text.slice(start)); } catch { return null; }
+      };
+      const pidOf = (parsed) => {
+        if (!parsed || typeof parsed !== 'object') return '';
+        return String(parsed.pic_id || parsed.picid || parsed.pid || '');
+      };
+      const publishedId = (parsed) => {
+        if (!parsed || typeof parsed !== 'object') return '';
+        if (!(parsed.ok === 1 || parsed.ok === true)) return '';
+        const data = parsed.data && typeof parsed.data === 'object' ? parsed.data : parsed;
+        return String(data.id || data.idstr || data.mid || 'ok');
+      };
+      const config = parseJson(await (await fetch('https://m.weibo.cn/api/config', { credentials: 'include' })).text());
+      const st = String((config && config.data && config.data.st) || '');
+      if (!st) return { published: false, attempted: false, via: 'm', pids: [] };
+      const pids = [];
+      for (const file of input.files) {
+        const form = new FormData();
+        form.append('type', 'json');
+        form.append('st', st);
+        form.append('pic', new Blob([bytesOf(file)], { type: file.mimeType }), file.name);
+        const uploaded = await fetch('https://m.weibo.cn/api/statuses/uploadPic', {
+          method: 'POST',
+          credentials: 'include',
+          headers: { 'x-xsrf-token': st, 'x-requested-with': 'XMLHttpRequest' },
+          body: form
+        });
+        const pid = pidOf(parseJson(await uploaded.text()));
+        if (!pid) return { published: false, attempted: false, via: 'm-upload', pids: pids.slice() };
+        pids.push(pid);
+      }
+      const body = new URLSearchParams();
+      body.set('content', input.text);
+      body.set('st', st);
+      body.set('picId', pids.join(','));
+      const updated = await fetch('https://m.weibo.cn/api/statuses/update', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { Accept: 'application/json, text/plain, */*', 'Content-Type': 'application/x-www-form-urlencoded', 'x-xsrf-token': st, 'x-requested-with': 'XMLHttpRequest' },
+        body: body.toString()
+      });
+      const id = publishedId(parseJson(await updated.text()));
+      return { published: !!id, attempted: true, via: 'm', pids, id: id || '' };
+    }, payload);
+    if (fromMobile && typeof fromMobile === 'object') return fromMobile;
+    return { published: false, attempted: false, via: 'm' };
+  } catch {
+    return { published: false, attempted: false, via: 'm' };
+  } finally {
+    await mobile.close().catch(() => {});
+  }
+}
 async function newestOwnPost(page, selfId, text, beforeIds) {
   await gotoAuthenticated(page, 'https://weibo.com/u/' + selfId);
   const posts = await collectPosts(page, selfId, 10);
@@ -1794,6 +1949,29 @@ async function writeAction(page, input) {
       const files = [];
       try {
         for (const item of manifest) files.push({ name: item.filename, mimeType: item.mimeType, buffer: await readFile('/inputs/' + item.inputId) });
+        if (!longText) {
+          try {
+            const api = await publishComposerViaCookieApi(page, expectedText, files, selfId);
+            const published = !!(api && api.published === true);
+            const attempted = !!(api && api.attempted === true);
+            emitStep({
+              step: 'media.api',
+              ok: published,
+              via: api && typeof api.via === 'string' ? String(api.via).slice(0, 32) : '',
+              pids: api && Array.isArray(api.pids) ? api.pids.length : 0,
+              mediaCount: manifest.length
+            });
+            if (published) {
+              const post = await awaitNewestOwnPost(page, selfId, expectedText, beforeIds);
+              if (post) return { post };
+              throw new Error('result');
+            }
+            if (attempted) throw new Error('result');
+          } catch (error) {
+            if (String(error && error.message) === 'result') throw error;
+            emitStep({ step: 'media.api', ok: false, via: 'error', pids: 0, mediaCount: manifest.length });
+          }
+        }
         const prepared = await preparePostImageChooser(page, freshEditor, files);
         if (!prepared || !prepared.chooser) throw new Error('media-chooser');
         imageChooser = prepared.chooser;

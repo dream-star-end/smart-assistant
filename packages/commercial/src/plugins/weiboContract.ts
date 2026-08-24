@@ -7,7 +7,7 @@ import { compileRuntimePluginArtifact } from './contracts.js'
 import { WEIBO_WORKER_SOURCE } from './weiboWorkerSource.js'
 
 export const WEIBO_PLUGIN_SLUG = 'weibo'
-export const WEIBO_PLUGIN_VERSION = '1.6.32'
+export const WEIBO_PLUGIN_VERSION = '1.6.33'
 export const WEIBO_WORKER_DIGEST = createHash('sha256').update(WEIBO_WORKER_SOURCE).digest('hex')
 export const WEIBO_DRIVER_ID = `weibo-${WEIBO_WORKER_DIGEST.slice(0, 57)}`
 export const WEIBO_DRIVER_VERSION = WEIBO_PLUGIN_VERSION
@@ -257,6 +257,7 @@ export const WEIBO_NETWORK_ORIGINS = Object.freeze([
   'https://wx2.sinaimg.cn',
   'https://wx3.sinaimg.cn',
   'https://wx4.sinaimg.cn',
+  'https://picupload.weibo.com',
 ])
 
 export const WEIBO_PLUGIN_ARTIFACT = Object.freeze({
