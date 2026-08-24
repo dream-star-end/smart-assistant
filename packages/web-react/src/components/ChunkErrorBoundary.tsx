@@ -37,6 +37,10 @@ export class ChunkErrorBoundary extends Component<Props, State> {
     return { failed: true, stale: isChunkLoadError(err) };
   }
 
+  componentDidCatch(err: unknown, info: { componentStack?: string }) {
+    console.error("[ChunkErrorBoundary]", err, info.componentStack ?? "");
+  }
+
   private reload = () => {
     window.location.reload();
   };
