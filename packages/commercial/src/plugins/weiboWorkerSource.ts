@@ -1786,27 +1786,29 @@ async function writeAction(page, input) {
             selected = await imageChooser.element().evaluate((node) => node.files ? node.files.length : 0);
           }
         } catch {}
-        const scope = (await composerScope(freshEditor)) || page;
-        const liveInput = await uniqueImageFileInput(scope);
-        if (selected !== manifest.length && liveInput) {
-          await liveInput.setInputFiles(files);
-          try {
-            selected = await liveInput.evaluate((node) => node.files ? node.files.length : 0);
-          } catch {}
-        }
         let retried = false;
         let freshSelected = -1;
-        if (selected !== manifest.length) {
-          retried = true;
-          const freshInput = await uniqueImageFileInput(scope);
-          if (freshInput) {
-            await freshInput.setInputFiles(files);
+        if (!prepared.attached) {
+          const scope = (await composerScope(freshEditor)) || page;
+          const liveInput = await uniqueImageFileInput(scope);
+          if (selected !== manifest.length && liveInput) {
+            await liveInput.setInputFiles(files);
             try {
-              freshSelected = await freshInput.evaluate((node) => node.files ? node.files.length : 0);
-            } catch {
-              freshSelected = -1;
+              selected = await liveInput.evaluate((node) => node.files ? node.files.length : 0);
+            } catch {}
+          }
+          if (selected !== manifest.length) {
+            retried = true;
+            const freshInput = await uniqueImageFileInput(scope);
+            if (freshInput) {
+              await freshInput.setInputFiles(files);
+              try {
+                freshSelected = await freshInput.evaluate((node) => node.files ? node.files.length : 0);
+              } catch {
+                freshSelected = -1;
+              }
+              if (freshSelected >= 0) selected = freshSelected;
             }
-            if (freshSelected >= 0) selected = freshSelected;
           }
         }
         emitStep({
@@ -1814,9 +1816,10 @@ async function writeAction(page, input) {
           selected,
           retried,
           freshSelected,
+          attached: !!prepared.attached,
           mediaCount: manifest.length,
         });
-        if (selected !== manifest.length) throw new Error('media-upload');
+        if (selected !== manifest.length && !prepared.attached) throw new Error('media-upload');
         await awaitComposerMediaReady(page, freshEditor, manifest.length, 90_000, previewBefore, previewBeforeCount, previewBeforeDelete);
       } finally {
         for (const file of files) file.buffer.fill(0);

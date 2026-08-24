@@ -110,6 +110,7 @@ const LOG_ALLOW_KEYS = new Set([
   'imageControlHits',
   'selected',
   'freshSelected',
+  'attached',
   'imgCount',
   'addedSrcs',
   'bgCount',

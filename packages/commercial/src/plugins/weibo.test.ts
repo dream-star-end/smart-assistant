@@ -197,7 +197,7 @@ describe('official Weibo Plugin', () => {
   })
 
   test('pins the current artifact and only the exact production predecessor', () => {
-    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.30')
+    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.31')
     assert.equal(WEIBO_DRIVER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.equal(WEIBO_LAUNCHER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.deepEqual(WEIBO_SETUP_COMPATIBLE_PREDECESSORS, [
@@ -515,10 +515,11 @@ describe('official Weibo Plugin', () => {
       'preview count/delete baselines must be captured before setFiles',
     )
     assert.match(createPostSource, /throw new Error\('media-upload'\)/)
+    assert.match(createPostSource, /selected !== manifest.length && !prepared.attached/)
     assert.ok(
       createPostSource.indexOf("throw new Error('media-upload')") <
         createPostSource.indexOf('awaitComposerMediaReady'),
-      'empty file input must fail closed before waiting for preview',
+      'unattached empty file input must fail closed before waiting for preview',
     )
     assert.match(WEIBO_WORKER_SOURCE, /awaitComposerCleared/)
     assert.match(
