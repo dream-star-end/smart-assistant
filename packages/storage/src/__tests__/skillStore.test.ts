@@ -631,3 +631,26 @@ describe('skill priority — frontmatter 注入菜单排序提示', () => {
     assert.equal((viewed as { priority?: number }).priority, 7)
   })
 })
+
+describe('SkillStore — project overlay vs main-only shared', () => {
+  it('stage agent sees overlay skill but not shared main-only skill', async () => {
+    const { writeFile: wf } = await import('node:fs/promises')
+    const { SKILL_AGENT_SCOPE_FILE, buildRunSkillStore } = await import('../skillStore.js')
+    const board = '33333333-3333-4333-8333-333333333333'
+    const shared = paths.sharedSkillsDir
+    await writeSkillMd(shared, 'only-main', fm('only-main', 'main only'))
+    await wf(
+      join(shared, 'only-main', SKILL_AGENT_SCOPE_FILE),
+      `${JSON.stringify({ agentIds: ['main'] })}\n`,
+    )
+    const overlay = join(testHome, 'projects', board, 'skills')
+    await writeSkillMd(overlay, 'proj-skill', fm('proj-skill', 'project overlay'))
+    const stage = buildRunSkillStore({ agentId: 'stage-implement', projectId: board })
+    const names = (await stage.list()).map((s) => s.name)
+    assert.ok(names.includes('proj-skill'))
+    assert.equal(names.includes('only-main'), false)
+    const viewed = await stage.view('proj-skill')
+    assert.ok(viewed && typeof viewed !== 'string')
+    assert.equal((viewed as { layer: string }).layer, 'project')
+  })
+})

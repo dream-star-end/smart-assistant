@@ -511,6 +511,11 @@ import {
   type PlatformPromptSlotsHandler,
 } from "./http/internalPlatformPromptSlots.js";
 import {
+  PROJECT_CONTEXT_PATH,
+  makeInternalProjectContextHandler,
+  type InternalProjectContextHandler,
+} from "./http/internalProjectContext.js";
+import {
   MINIMAX_MEDIA_PATH,
   makeMiniMaxMediaHandler,
   type MiniMaxMediaHandler,
@@ -2111,6 +2116,8 @@ export async function registerCommercial(
           // 拉不起来)→ handler 内部退 legacy 归一。
           catalog: modelCatalogForProxy,
         });
+      const projectContextHandler: InternalProjectContextHandler =
+        makeInternalProjectContextHandler({ identityRepo });
       // /internal/v3/minimax — 容器内 safe mmx wrapper → master 代持 MiniMax
       // Token Plan key 调用多模态 API 并记账。Token Plan key 只在 master env,
       // 不注入容器；鉴权同 anthropicProxy / platform slots 双因子。
@@ -2475,6 +2482,9 @@ export async function registerCommercial(
         }
         if (path === PLATFORM_PROMPT_SLOTS_PATH) {
           return platformPromptSlotsHandler(req, res, ctx);
+        }
+        if (path === PROJECT_CONTEXT_PATH) {
+          return projectContextHandler(req, res, ctx);
         }
         if (path === MINIMAX_MEDIA_PATH) {
           return minimaxMediaHandler(req, res, ctx);

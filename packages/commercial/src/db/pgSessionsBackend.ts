@@ -104,7 +104,9 @@ import {
   type ChatProject,
   type ChatProjectCreateResult,
   type ChatProjectDeleteResult,
+  type ChatProjectRuntimeBind,
   type ChatProjectUpdateResult,
+  type PinnedAssetsPage,
   type ProjectAsset,
   type ProjectAssetCreateInput,
   type ProjectAssetCreateResult,
@@ -155,6 +157,8 @@ import {
   _warnSeqAnomaly,
   buildSearchSnippet,
   escapeLikePattern,
+  parseBoardProjectId,
+  assetsRevision,
   parseChatProjectName,
   parseChatProjectOptionalText,
   parseChatProjectSortOrder,
@@ -529,7 +533,7 @@ async function pgUnreadBySessionIds(
 
 const PG_CHAT_PROJECT_SELECT = `
   SELECT p.id, p.name, p.instructions, p.color, p.sort_order, p.created_at, p.updated_at,
-         COALESCE(c.cnt, 0)::text AS session_count
+         p.board_project_id, COALESCE(c.cnt, 0)::text AS session_count
     FROM chat_projects p
     LEFT JOIN (
       SELECT project_id, COUNT(*) AS cnt
@@ -548,6 +552,7 @@ type PgChatProjectRow = {
   created_at: string;
   updated_at: string;
   session_count: string;
+  board_project_id: string | null;
 };
 
 function mapPgChatProjectRow(r: PgChatProjectRow): ChatProject {
@@ -560,6 +565,7 @@ function mapPgChatProjectRow(r: PgChatProjectRow): ChatProject {
     createdAt: bigIntNum(r.created_at, "created_at"),
     updatedAt: bigIntNum(r.updated_at, "updated_at"),
     sessionCount: Number(r.session_count) || 0,
+    boardProjectId: r.board_project_id ?? null,
   };
 }
 
@@ -10841,6 +10847,80 @@ export function createPgSessionsBackend(
       return cleaned.length > 0 ? cleaned : null;
     },
 
+    async getChatProjectBindBySessionId(sessionId: string): Promise<ChatProjectRuntimeBind | null> {
+      const row = (
+        await pool.query<{
+          user_id: string;
+          chat_project_id: string;
+          board_project_id: string | null;
+          name: string;
+          instructions: string | null;
+        }>(
+          `SELECT cs.user_id, p.id AS chat_project_id, p.board_project_id, p.name, p.instructions
+             FROM client_sessions cs
+             JOIN chat_projects p ON p.id = cs.project_id AND p.user_id = cs.user_id
+            WHERE cs.id = $1 AND cs.deleted_at IS NULL AND p.deleted_at IS NULL`,
+          [sessionId],
+        )
+      ).rows[0];
+      if (!row) return null;
+      return {
+        userId: row.user_id,
+        chatProjectId: row.chat_project_id,
+        boardProjectId: row.board_project_id ?? null,
+        name: row.name,
+        instructions: row.instructions,
+      };
+    },
+
+    async getChatProjectBindByBoardProjectId(
+      userId: string,
+      boardProjectId: string,
+    ): Promise<ChatProjectRuntimeBind | null> {
+      const parsed = parseBoardProjectId(boardProjectId);
+      if (!("present" in parsed) || !parsed.present || !parsed.value) return null;
+      const row = (
+        await pool.query<{
+          user_id: string;
+          id: string;
+          board_project_id: string | null;
+          name: string;
+          instructions: string | null;
+        }>(
+          `SELECT user_id, id, board_project_id, name, instructions
+             FROM chat_projects
+            WHERE user_id = $1 AND board_project_id = $2 AND deleted_at IS NULL`,
+          [userId, parsed.value],
+        )
+      ).rows[0];
+      if (!row) return null;
+      return {
+        userId: row.user_id,
+        chatProjectId: row.id,
+        boardProjectId: row.board_project_id ?? null,
+        name: row.name,
+        instructions: row.instructions,
+      };
+    },
+
+    async listPinnedProjectAssetsForChatProject(
+      userId: string,
+      chatProjectId: string | null,
+    ): Promise<PinnedAssetsPage> {
+      const rows = (
+        await pool.query<PgProjectAssetRow>(
+          `${PG_PROJECT_ASSET_SELECT}
+            WHERE user_id = $1 AND deleted_at IS NULL AND pinned IS TRUE
+              AND project_id IS NOT DISTINCT FROM $2
+            ORDER BY created_at DESC
+            LIMIT $3`,
+          [userId, chatProjectId, PROJECT_ASSET_PINNED_INJECT_MAX],
+        )
+      ).rows;
+      const assets = rows.map(mapPgProjectAssetRow);
+      return { assets, revision: assetsRevision(assets) };
+    },
+
     async searchClientSessions(
       userId: string,
       opts: SearchClientSessionsOpts,
@@ -11096,16 +11176,7 @@ export function createPgSessionsBackend(
 
     async listChatProjects(userId: string): Promise<ChatProject[]> {
       const rows = (
-        await pool.query<{
-          id: string;
-          name: string;
-          instructions: string | null;
-          color: string | null;
-          sort_order: number;
-          created_at: string;
-          updated_at: string;
-          session_count: string;
-        }>(
+        await pool.query<PgChatProjectRow>(
           `${PG_CHAT_PROJECT_SELECT}
             WHERE p.user_id = $2 AND p.deleted_at IS NULL
             ORDER BY p.sort_order ASC, p.created_at ASC`,
@@ -11159,7 +11230,13 @@ export function createPgSessionsBackend(
     async updateChatProject(
       userId: string,
       id: string,
-      input: { name?: unknown; instructions?: unknown; color?: unknown; sortOrder?: unknown },
+      input: {
+        name?: unknown;
+        instructions?: unknown;
+        color?: unknown;
+        sortOrder?: unknown;
+        boardProjectId?: unknown;
+      },
     ): Promise<ChatProjectUpdateResult> {
       const sets: string[] = [`updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})`];
       const params: unknown[] = [];
@@ -11188,18 +11265,32 @@ export function createPgSessionsBackend(
         sets.push(`sort_order = $${n++}`);
         params.push(sortOrder);
       }
+      if (input.boardProjectId !== undefined) {
+        const bound = parseBoardProjectId(input.boardProjectId);
+        if ("invalid" in bound) return { ok: false, error: "invalid_board_project_id" };
+        if (bound.present) {
+          sets.push(`board_project_id = $${n++}`);
+          params.push(bound.value);
+        }
+      }
       if (sets.length === 1) {
         const existing = await readPgChatProject(pool, userId, id);
         return existing ? { ok: true, project: existing } : { ok: false, error: "not_found" };
       }
       return withTx(pool, async (client) => {
         params.push(id, userId);
-        const res = await client.query(
-          `UPDATE chat_projects SET ${sets.join(", ")}
-            WHERE id = $${n++} AND user_id = $${n} AND deleted_at IS NULL`,
-          params,
-        );
-        if ((res.rowCount ?? 0) === 0) return { ok: false, error: "not_found" };
+        try {
+          const res = await client.query(
+            `UPDATE chat_projects SET ${sets.join(", ")}
+              WHERE id = $${n++} AND user_id = $${n} AND deleted_at IS NULL`,
+            params,
+          );
+          if ((res.rowCount ?? 0) === 0) return { ok: false, error: "not_found" };
+        } catch (err) {
+          const code = (err as { code?: string }).code;
+          if (code === "23505") return { ok: false, error: "board_project_bound" };
+          throw err;
+        }
         const project = await readPgChatProject(client, userId, id);
         if (!project) return { ok: false, error: "not_found" };
         return { ok: true, project };

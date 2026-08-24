@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const migration = join(here, '../db/migrations/0230_chat_projects.sql')
+const bindMigration = join(here, '../db/migrations/0246_chat_project_board_bind.sql')
 const backendSrc = readFileSync(join(here, '../db/pgSessionsBackend.ts'), 'utf8')
 const sqliteSrc = readFileSync(join(here, '../../../storage/src/sessionsDb.ts'), 'utf8')
 const metadata = JSON.parse(
@@ -30,6 +31,17 @@ describe('chat_projects PG/SQLite 契约对齐', () => {
     assert.ok(metadata.requiredMigrations.includes('0230_chat_projects'))
   })
 
+  test('0246 board_project_id 绑定列与 1:1 索引', () => {
+    assert.equal(existsSync(bindMigration), true)
+    const sql = readFileSync(bindMigration, 'utf8')
+    assert.match(sql, /board_project_id/)
+    assert.match(sql, /idx_chat_projects_user_board/)
+    assert.ok(metadata.requiredMigrations.includes('0246_chat_project_board_bind'))
+    assert.match(sqliteSrc, /idx_chat_projects_user_board/)
+    assert.match(sqliteSrc, /board_project_bound/)
+    assert.match(backendSrc, /board_project_bound/)
+  })
+
   test('pgSessionsBackend 覆盖 sqliteBackend 新增方法', () => {
     for (const method of [
       'listChatProjects',
@@ -37,6 +49,9 @@ describe('chat_projects PG/SQLite 契约对齐', () => {
       'updateChatProject',
       'deleteChatProject',
       'patchClientSessionMeta',
+      'getChatProjectBindBySessionId',
+      'getChatProjectBindByBoardProjectId',
+      'listPinnedProjectAssetsForChatProject',
     ]) {
       assert.ok(backendSrc.includes(`async ${method}(`), `PG 缺 ${method}`)
       assert.ok(sqliteSrc.includes(`${method}:`), `sqliteBackend 缺 ${method}`)

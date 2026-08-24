@@ -25,6 +25,7 @@ const {
   createProjectAsset,
   deleteProjectAsset,
   getSessionsDb,
+  listPinnedProjectAssetsForChatProject,
   listPinnedProjectAssetsForSession,
   listProjectAssets,
   parseProjectAssetContainerPath,
@@ -335,6 +336,30 @@ describe('project_assets CRUD', () => {
 
     await deleteProjectAsset(USER, pinnedIn.asset.id)
     assert.equal((await listPinnedProjectAssetsForSession('sess-in-p')).length, 0)
+  })
+
+  it('pin/unpin 立刻反映在 listPinnedProjectAssetsForChatProject 与 revision', async () => {
+    const proj = await createChatProject(USER, { name: 'LivePins' })
+    assert.equal(proj.ok, true)
+    if (!proj.ok) return
+    const created = await createProjectAsset(USER, {
+      source: 'upload',
+      name: 'live.md',
+      url: MEDIA_URL(DIGEST_A),
+      projectId: proj.project.id,
+    })
+    assert.equal(created.ok, true)
+    if (!created.ok) return
+    const before = await listPinnedProjectAssetsForChatProject(USER, proj.project.id)
+    assert.equal(before.assets.length, 0)
+    await updateProjectAsset(USER, created.asset.id, { pinned: true })
+    const pinned = await listPinnedProjectAssetsForChatProject(USER, proj.project.id)
+    assert.equal(pinned.assets.length, 1)
+    assert.equal(pinned.assets[0]?.name, 'live.md')
+    assert.ok(pinned.revision >= pinned.assets[0]!.updatedAt)
+    await updateProjectAsset(USER, created.asset.id, { pinned: false })
+    const after = await listPinnedProjectAssetsForChatProject(USER, proj.project.id)
+    assert.equal(after.assets.length, 0)
   })
 
   it('不存在的项目 id 拒绝;可改名/钉选/移动', async () => {

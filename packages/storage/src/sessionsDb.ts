@@ -38,6 +38,7 @@ import {
   type SpillChunkPlan,
 } from './clientSessionsPlan.js'
 import { cjkFtsColumn, literalFtsQuery } from './ftsQuery.js'
+import { assetsRevision, isUniqueConstraintError, parseBoardProjectId } from './projectContext.js'
 import { migrateSessionsFtsCjk, registerFtsCjkFunctions } from './ftsCjkMigrate.js'
 import { paths } from './paths.js'
 // wechat_bindings 是 master 六表之一,其 SQLite 实现在 wechatBindings.ts(靠近 wechat 专用
@@ -409,6 +410,17 @@ export async function getSessionsDb(): Promise<Database.Database> {
       ON chat_projects(user_id, deleted_at);
     CREATE INDEX IF NOT EXISTS idx_client_sessions_user_project
       ON client_sessions(user_id, project_id);
+  `)
+  try {
+    const projCols = db.pragma('table_info(chat_projects)') as Array<{ name: string }>
+    if (!projCols.some(c => c.name === 'board_project_id')) {
+      db.exec('ALTER TABLE chat_projects ADD COLUMN board_project_id TEXT DEFAULT NULL')
+    }
+  } catch { /* table missing in extremely old fixtures; CREATE above already ran */ }
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_projects_user_board
+      ON chat_projects(user_id, board_project_id)
+      WHERE deleted_at IS NULL AND board_project_id IS NOT NULL;
   `)
   // Migration: project_assets —— 聊天项目资产层(用户上传参考资料 + 会话产出物索引)。
   // 软删只删索引行,绝不删磁盘文件:文件是 sha256 内容寻址的,可能被别的消息/资产共用。
@@ -1980,10 +1992,18 @@ export type ChatProject = {
   createdAt: number
   updatedAt: number
   sessionCount: number
+  boardProjectId: string | null
 }
 
 export type ChatProjectCreateError = 'limit_exceeded' | 'invalid_name' | 'invalid_instructions' | 'invalid_color'
-export type ChatProjectUpdateError = 'not_found' | 'invalid_name' | 'invalid_instructions' | 'invalid_color' | 'invalid_sort_order'
+export type ChatProjectUpdateError =
+  | 'not_found'
+  | 'invalid_name'
+  | 'invalid_instructions'
+  | 'invalid_color'
+  | 'invalid_sort_order'
+  | 'invalid_board_project_id'
+  | 'board_project_bound'
 export type ChatProjectDeleteError = 'not_found'
 
 export type ChatProjectCreateResult =
@@ -5793,6 +5813,7 @@ type ChatProjectDbRow = {
   created_at: number
   updated_at: number
   session_count: number
+  board_project_id: string | null
 }
 
 function _mapChatProjectRow(r: ChatProjectDbRow): ChatProject {
@@ -5805,12 +5826,13 @@ function _mapChatProjectRow(r: ChatProjectDbRow): ChatProject {
     createdAt: r.created_at,
     updatedAt: r.updated_at,
     sessionCount: r.session_count,
+    boardProjectId: r.board_project_id ?? null,
   }
 }
 
 const CHAT_PROJECT_SELECT = `
   SELECT p.id, p.name, p.instructions, p.color, p.sort_order, p.created_at, p.updated_at,
-         COALESCE(c.cnt, 0) AS session_count
+         p.board_project_id, COALESCE(c.cnt, 0) AS session_count
     FROM chat_projects p
     LEFT JOIN (
       SELECT project_id, COUNT(*) AS cnt
@@ -5886,7 +5908,7 @@ async function _sqliteCreateChatProject(
 async function _sqliteUpdateChatProject(
   userId: string,
   id: string,
-  input: { name?: unknown; instructions?: unknown; color?: unknown; sortOrder?: unknown },
+  input: { name?: unknown; instructions?: unknown; color?: unknown; sortOrder?: unknown; boardProjectId?: unknown },
 ): Promise<ChatProjectUpdateResult> {
   const sets: string[] = ['updated_at = MAX(updated_at + 1, ?)']
   const params: unknown[] = [Date.now()]
@@ -5914,16 +5936,32 @@ async function _sqliteUpdateChatProject(
     sets.push('sort_order = ?')
     params.push(sortOrder)
   }
+  if (input.boardProjectId !== undefined) {
+    const bound = parseBoardProjectId(input.boardProjectId)
+    if ('invalid' in bound) return { ok: false, error: 'invalid_board_project_id' }
+    if (bound.present) {
+      sets.push('board_project_id = ?')
+      params.push(bound.value)
+    }
+  }
   if (sets.length === 1) {
     const existing = await _sqliteGetChatProjectForUser(userId, id)
     return existing ? { ok: true, project: existing } : { ok: false, error: 'not_found' }
   }
   const db = await getSessionsDb()
   const txn = db.transaction((): ChatProjectUpdateResult => {
-    const res = db.prepare(
-      `UPDATE chat_projects SET ${sets.join(', ')}
-        WHERE id = ? AND user_id = ? AND deleted_at IS NULL`,
-    ).run(...params, id, userId)
+    let res: Database.RunResult
+    try {
+      res = db.prepare(
+        `UPDATE chat_projects SET ${sets.join(', ')}
+          WHERE id = ? AND user_id = ? AND deleted_at IS NULL`,
+      ).run(...params, id, userId)
+    } catch (err) {
+      if (isUniqueConstraintError(err, 'idx_chat_projects_user_board')) {
+        return { ok: false, error: 'board_project_bound' }
+      }
+      throw err
+    }
     if (res.changes === 0) return { ok: false, error: 'not_found' }
     const project = _sqliteReadChatProject(db, userId, id)
     if (!project) return { ok: false, error: 'not_found' }
@@ -6019,6 +6057,88 @@ async function _sqliteGetSessionProjectInstructions(sessionId: string): Promise<
   if (!row?.instructions) return null
   const cleaned = sanitizeProjectInstructions(row.instructions).trim()
   return cleaned.length > 0 ? cleaned : null
+}
+
+export type ChatProjectRuntimeBind = {
+  userId: string
+  chatProjectId: string
+  boardProjectId: string | null
+  name: string
+  instructions: string | null
+}
+
+async function _sqliteGetChatProjectBindBySessionId(sessionId: string): Promise<ChatProjectRuntimeBind | null> {
+  const db = await getSessionsDb()
+  const row = db.prepare(`
+    SELECT cs.user_id AS user_id, p.id AS chat_project_id, p.board_project_id AS board_project_id,
+           p.name AS name, p.instructions AS instructions
+      FROM client_sessions cs
+      JOIN chat_projects p ON p.id = cs.project_id AND p.user_id = cs.user_id
+     WHERE cs.id = ? AND cs.deleted_at IS NULL AND p.deleted_at IS NULL
+  `).get(sessionId) as
+    | {
+        user_id: string
+        chat_project_id: string
+        board_project_id: string | null
+        name: string
+        instructions: string | null
+      }
+    | undefined
+  if (!row) return null
+  return {
+    userId: row.user_id,
+    chatProjectId: row.chat_project_id,
+    boardProjectId: row.board_project_id ?? null,
+    name: row.name,
+    instructions: row.instructions,
+  }
+}
+
+async function _sqliteGetChatProjectBindByBoardProjectId(
+  userId: string,
+  boardProjectId: string,
+): Promise<ChatProjectRuntimeBind | null> {
+  const parsed = parseBoardProjectId(boardProjectId)
+  if (!('present' in parsed) || !parsed.present || !parsed.value) return null
+  const db = await getSessionsDb()
+  const row = db.prepare(`
+    SELECT user_id, id, board_project_id, name, instructions
+      FROM chat_projects
+     WHERE user_id = ? AND board_project_id = ? AND deleted_at IS NULL
+  `).get(userId, parsed.value) as
+    | {
+        user_id: string
+        id: string
+        board_project_id: string | null
+        name: string
+        instructions: string | null
+      }
+    | undefined
+  if (!row) return null
+  return {
+    userId: row.user_id,
+    chatProjectId: row.id,
+    boardProjectId: row.board_project_id ?? null,
+    name: row.name,
+    instructions: row.instructions,
+  }
+}
+
+export type PinnedAssetsPage = { assets: ProjectAsset[]; revision: number }
+
+async function _sqliteListPinnedProjectAssetsForChatProject(
+  userId: string,
+  chatProjectId: string | null,
+): Promise<PinnedAssetsPage> {
+  const db = await getSessionsDb()
+  const rows = db.prepare(
+    `${PROJECT_ASSET_SELECT}
+      WHERE user_id = ? AND deleted_at IS NULL AND pinned = 1 AND project_id IS ?
+      ORDER BY created_at DESC
+      LIMIT ?`,
+  ).all(userId, chatProjectId, PROJECT_ASSET_PINNED_INJECT_MAX) as ProjectAssetDbRow[]
+  const assets = rows.map(_mapProjectAssetRow)
+  return { assets, revision: assetsRevision(assets) }
 }
 
 type ProjectAssetDbRow = {
@@ -6834,6 +6954,9 @@ const sqliteBackend = {
   markClientSessionRead: _sqliteMarkClientSessionRead,
   markAllClientSessionsRead: _sqliteMarkAllClientSessionsRead,
   getSessionProjectInstructions: _sqliteGetSessionProjectInstructions,
+  getChatProjectBindBySessionId: _sqliteGetChatProjectBindBySessionId,
+  getChatProjectBindByBoardProjectId: _sqliteGetChatProjectBindByBoardProjectId,
+  listPinnedProjectAssetsForChatProject: _sqliteListPinnedProjectAssetsForChatProject,
   listChatProjects: _sqliteListChatProjects,
   createChatProject: _sqliteCreateChatProject,
   updateChatProject: _sqliteUpdateChatProject,
@@ -7005,6 +7128,15 @@ export const markAllClientSessionsRead: ClientSessionsBackend['markAllClientSess
 
 export const getSessionProjectInstructions: ClientSessionsBackend['getSessionProjectInstructions'] =
   (...args) => getActiveBackend().getSessionProjectInstructions(...args)
+
+export const getChatProjectBindBySessionId: ClientSessionsBackend['getChatProjectBindBySessionId'] =
+  (...args) => getActiveBackend().getChatProjectBindBySessionId(...args)
+
+export const getChatProjectBindByBoardProjectId: ClientSessionsBackend['getChatProjectBindByBoardProjectId'] =
+  (...args) => getActiveBackend().getChatProjectBindByBoardProjectId(...args)
+
+export const listPinnedProjectAssetsForChatProject: ClientSessionsBackend['listPinnedProjectAssetsForChatProject'] =
+  (...args) => getActiveBackend().listPinnedProjectAssetsForChatProject(...args)
 
 export const listChatProjects: ClientSessionsBackend['listChatProjects'] =
   (...args) => getActiveBackend().listChatProjects(...args)

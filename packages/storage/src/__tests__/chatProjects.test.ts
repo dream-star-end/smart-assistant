@@ -75,6 +75,31 @@ describe('chat_projects CRUD', () => {
     assert.equal(ok.project.color, 'blue')
     assert.equal(ok.project.sessionCount, 0)
     assert.ok(ok.project.id.length >= 8)
+    assert.equal(ok.project.boardProjectId, null)
+  })
+
+  it('1:1 board_project_id bind, unbind, cross-user isolation', async () => {
+    const a = await createChatProject(USER, { name: 'A' })
+    const b = await createChatProject(USER, { name: 'B' })
+    const other = await createChatProject(OTHER, { name: 'X' })
+    assert.equal(a.ok && b.ok && other.ok, true)
+    if (!a.ok || !b.ok || !other.ok) return
+    const board = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const bindA = await updateChatProject(USER, a.project.id, { boardProjectId: board })
+    assert.equal(bindA.ok, true)
+    if (!bindA.ok) return
+    assert.equal(bindA.project.boardProjectId, board)
+    const conflict = await updateChatProject(USER, b.project.id, { boardProjectId: board })
+    assert.equal(conflict.ok, false)
+    if (!conflict.ok) assert.equal(conflict.error, 'board_project_bound')
+    const otherBind = await updateChatProject(OTHER, other.project.id, { boardProjectId: board })
+    assert.equal(otherBind.ok, true)
+    const unbind = await updateChatProject(USER, a.project.id, { boardProjectId: null })
+    assert.equal(unbind.ok, true)
+    if (unbind.ok) assert.equal(unbind.project.boardProjectId, null)
+    const invalid = await updateChatProject(USER, b.project.id, { boardProjectId: 'not-a-uuid' })
+    assert.equal(invalid.ok, false)
+    if (!invalid.ok) assert.equal(invalid.error, 'invalid_board_project_id')
   })
 
   it('list 按 sort_order ASC, created_at ASC;sessionCount 只计未删会话', async () => {
