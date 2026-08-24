@@ -124,4 +124,35 @@ describe('project memory HTTP', () => {
     })
     db.close()
   })
+
+  it('GET context/preview and old run context columns stay null', async () => {
+    const db = freshDb()
+    await withServer({ db, actor: 'human' }, async (base) => {
+      const proj = await call(base, 'POST', '/api/board/projects', { key: 'CTX', name: 'ctx' })
+      const projectId = (proj.body.project as { id: string }).id
+      const ctx = await call(base, 'GET', `/api/board/projects/${projectId}/context`)
+      assert.equal(ctx.status, 200)
+      assert.equal(ctx.body.replay, 'audit_only_not_bit_identical')
+      const preview = await call(base, 'GET', `/api/board/projects/${projectId}/context/preview`)
+      assert.equal(preview.status, 200)
+      assert.equal(preview.body.enabled, false)
+      const ticket = await call(base, 'POST', '/api/board/tickets', {
+        projectId,
+        type: 'chore',
+        title: 'old',
+      })
+      const ticketId = (ticket.body.ticket as { id: string }).id
+      const { insertRun } = await import('../db/runs.js')
+      const run = insertRun(db, {
+        ticketId,
+        stageId: 'none',
+        trigger: 'patrol',
+      })
+      const runCtx = await call(base, 'GET', `/api/board/runs/${run.id}/context`)
+      assert.equal(runCtx.status, 200)
+      assert.equal(runCtx.body.contextSnapshotId, null)
+      assert.equal(runCtx.body.snapshot, null)
+    })
+    db.close()
+  })
 })

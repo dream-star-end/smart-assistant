@@ -399,7 +399,10 @@ export function ProjectSettings({
             )}
           </div>
           {mode === 'edit' && current && (
-            <ProjectMemoryReview auth={auth} project={current} />
+            <>
+              <ProjectContextPanel auth={auth} project={current} />
+              <ProjectMemoryReview auth={auth} project={current} />
+            </>
           )}
           {mode === 'edit' && archived.length > 0 && (
             <div className="mt-2 flex flex-col gap-2 border-t border-border pt-3">
@@ -434,6 +437,66 @@ export function ProjectSettings({
       </Sheet>
       {confirmEl}
     </>
+  )
+}
+
+function ProjectContextPanel({ auth, project }: { auth: AuthSession; project: Project }) {
+  const toast = useToast()
+  const [summary, setSummary] = useState<Record<string, unknown> | null>(null)
+  const [preview, setPreview] = useState<Record<string, unknown> | null>(null)
+  useEffect(() => {
+    let cancelled = false
+    void taskboardApi
+      .getProjectContext(auth, project.id)
+      .then((res) => {
+        if (!cancelled) setSummary(res)
+      })
+      .catch((e) => {
+        if (!cancelled) toast(taskboardErrorMessage(e, '加载项目上下文失败'), 'error')
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [auth, project.id, toast])
+  return (
+    <div className="mt-2 flex flex-col gap-2 border-t border-border pt-3" data-testid="project-context-panel">
+      <h3 className="text-section font-semibold text-fg">项目上下文</h3>
+      <p className="text-caption text-muted">仅审计，不可逐字重放。动态事实须 live 核验。</p>
+      {summary && (
+        <dl className="grid grid-cols-2 gap-1 text-caption text-muted">
+          <dt>version</dt>
+          <dd className="text-fg">{String(summary.version ?? project.contextVersion ?? 0)}</dd>
+          <dt>工作区</dt>
+          <dd className="text-fg">{JSON.stringify(summary.workspaceSpec ?? project.workspaceSpec ?? { kind: 'default' })}</dd>
+        </dl>
+      )}
+      <Button
+        type="button"
+        size="sm"
+        variant="secondary"
+        data-testid="project-context-preview"
+        onClick={() => {
+          void taskboardApi
+            .previewProjectContext(auth, project.id)
+            .then((res) => setPreview(res))
+            .catch((e) => toast(taskboardErrorMessage(e, '预览失败'), 'error'))
+        }}
+      >
+        预览注入槽
+      </Button>
+      {preview && Array.isArray(preview.slots) && (
+        <ul className="text-caption text-muted">
+          {(preview.slots as Array<{ name: string; bytes: number; redacted?: boolean; volatile?: boolean }>).map(
+            (s) => (
+              <li key={s.name}>
+                {s.name} · {s.bytes}B{s.volatile ? ' · live' : ''}
+                {s.redacted ? ' · 已脱敏' : ''}
+              </li>
+            ),
+          )}
+        </ul>
+      )}
+    </div>
   )
 }
 

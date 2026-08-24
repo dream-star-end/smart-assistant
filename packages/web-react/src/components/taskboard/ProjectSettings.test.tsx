@@ -32,6 +32,11 @@ describe("ProjectSettings workspaceSpec", () => {
       official: [],
       candidates: [],
     });
+    vi.spyOn(taskboardApi, "getProjectContext").mockResolvedValue({
+      version: 1,
+      workspaceSpec: { kind: "isolated" },
+      replay: "audit_only_not_bit_identical",
+    });
     const auth = createMemoryAuthSession(() => {}, "tok");
     render(
       <ToastProvider>

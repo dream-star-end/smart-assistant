@@ -584,6 +584,13 @@ function RunDetail({
         {[duration ?? '耗时未记录', tokens ?? '用量未记录', costText].filter(Boolean).join(' · ')}
       </p>
       {skip && <p className="text-body text-warning">跳过：{skip}</p>}
+      {(run.contextSha256 || run.contextVersion != null) && (
+        <p className="text-caption text-muted" data-testid="ticket-run-context">
+          快照 {run.contextSha256 ? run.contextSha256.slice(0, 12) : '—'} · 启动 v
+          {run.contextVersion ?? '—'}
+          。仅审计、不可逐字重放。
+        </p>
+      )}
       {(run.outputMd?.trim() || run.summary) && (
         <TicketMarkdown testId="ticket-run-md">{run.outputMd?.trim() || run.summary || ''}</TicketMarkdown>
       )}

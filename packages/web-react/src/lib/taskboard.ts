@@ -298,6 +298,9 @@ export interface TicketRun {
   outputMd: string | null
   error: string | null
   createdAt: number
+  contextSnapshotId?: string | null
+  contextSha256?: string | null
+  contextVersion?: number | null
 }
 
 export interface TicketRelation {
@@ -1484,6 +1487,26 @@ export const taskboardApi = {
       'POST',
       { expectedVersion },
     ),
+
+  getProjectContext: (a: AuthSession, id: string) =>
+    boardGet<Record<string, unknown>>(a, `/api/board/projects/${encodeURIComponent(id)}/context`),
+
+  previewProjectContext: (a: AuthSession, id: string) =>
+    boardGet<Record<string, unknown>>(
+      a,
+      `/api/board/projects/${encodeURIComponent(id)}/context/preview`,
+    ),
+
+  getRunContext: (a: AuthSession, runId: string) =>
+    boardGet<{
+      runId: string
+      contextSnapshotId: string | null
+      contextSha256: string | null
+      contextVersion: number | null
+      currentVersion: number | null
+      changed: boolean
+      disclaimer: string
+    }>(a, `/api/board/runs/${encodeURIComponent(runId)}/context`),
 
   deprecateProjectMemory: (
     a: AuthSession,

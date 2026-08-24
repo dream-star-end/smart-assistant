@@ -15,6 +15,7 @@ import {
   loadProjectContext,
   parseProjectWorkspace,
   paths,
+  readProjectRunContextFile,
   resolveProjectCwd,
   setProjectSkillOverlay,
   writeProjectInstructions,
@@ -80,6 +81,7 @@ import {
   updateSettings,
 } from './db/settings.js'
 import { dispatchProjectMemory } from './projectMemoryHttp.js'
+import { previewProjectContext, summarizeProjectContext } from '../projectContextPreview.js'
 import {
   applyTemplate,
   applyTemplates,
@@ -672,6 +674,12 @@ async function dispatch(
     return sendError(res, 405, 'method not allowed')
   }
 
+  const projectContextPreview = path.match(/^\/api\/board\/projects\/([^/]+)\/context\/preview$/)
+  if (projectContextPreview) {
+    if (method !== 'GET') return sendError(res, 405, 'method not allowed')
+    return handlePreviewProjectContext(res, db, decodeURIComponent(projectContextPreview[1]))
+  }
+
   const projectContext = path.match(/^\/api\/board\/projects\/([^/]+)\/context$/)
   if (projectContext) {
     const id = decodeURIComponent(projectContext[1])
@@ -686,7 +694,7 @@ async function dispatch(
   if (projectItem) {
     const id = decodeURIComponent(projectItem[1])
     if (method === 'GET') return handleGetProject(res, db, id)
-    if (method === 'PATCH') return handlePatchProject(res, await readJsonBody(req), db, id)
+    if (method === 'PATCH') return await handlePatchProject(res, await readJsonBody(req), db, id)
     if (method === 'DELETE') return handleDeleteProject(res, db, id)
     return sendError(res, 405, 'method not allowed')
   }
@@ -772,6 +780,12 @@ async function dispatch(
     if (method === 'GET') return handleGetStage(res, db, id)
     if (method === 'PATCH') return handlePatchStage(res, await readJsonBody(req), db, id, actor, ctx)
     return sendError(res, 405, 'method not allowed')
+  }
+
+  const runContext = path.match(/^\/api\/board\/runs\/([^/]+)\/context$/)
+  if (runContext) {
+    if (method !== 'GET') return sendError(res, 405, 'method not allowed')
+    return handleGetRunContext(res, db, decodeURIComponent(runContext[1]))
   }
 
   const runItem = path.match(/^\/api\/board\/runs\/([^/]+)$/)
@@ -898,12 +912,12 @@ function handleGetProject(res: ServerResponse, db: TaskboardDb, idOrKey: string)
   sendJson(res, 200, { project })
 }
 
-function handlePatchProject(
+async function handlePatchProject(
   res: ServerResponse,
   body: Record<string, unknown>,
   db: TaskboardDb,
   idOrKey: string,
-): void {
+): Promise<void> {
   const project = resolveProject(db, idOrKey)
   if (!project) throw new TaskboardNotFound('project', idOrKey)
   const workspaceSpec =
@@ -927,6 +941,10 @@ function handlePatchProject(
     labels: asStringArray(body.labels),
     archivedAt: asNullableNumber(body.archivedAt),
   })
+  if (workspaceSpec !== undefined) {
+    const { incrementProjectContextVersion } = await import('@openclaude/storage')
+    await incrementProjectContextVersion(project.id).catch(() => {})
+  }
   sendJson(res, 200, { ok: true, project: updated })
 }
 
@@ -937,14 +955,52 @@ async function handleGetProjectContext(
 ): Promise<void> {
   const project = resolveProject(db, idOrKey)
   if (!project) throw new TaskboardNotFound('project', idOrKey)
-  const snap = await loadProjectContext(project.id)
+  sendJson(res, 200, await summarizeProjectContext(project.id, db))
+}
+
+async function handlePreviewProjectContext(
+  res: ServerResponse,
+  db: TaskboardDb,
+  idOrKey: string,
+): Promise<void> {
+  const project = resolveProject(db, idOrKey)
+  if (!project) throw new TaskboardNotFound('project', idOrKey)
+  sendJson(res, 200, await previewProjectContext({ boardProjectId: project.id }))
+}
+
+async function handleGetRunContext(
+  res: ServerResponse,
+  db: TaskboardDb,
+  runId: string,
+): Promise<void> {
+  const run = getRun(db, runId)
+  if (!run) throw new TaskboardNotFound('run', runId)
+  const ticket = getTicketByIdOrIdentifier(db, run.ticketId)
+  const projectId = ticket?.projectId ?? null
+  let snapshot = null
+  if (projectId && (run.contextSnapshotId || run.id)) {
+    snapshot =
+      (run.contextSnapshotId
+        ? await readProjectRunContextFile(projectId, run.contextSnapshotId)
+        : null) ?? (await readProjectRunContextFile(projectId, run.id))
+  }
+  let currentVersion: number | null = null
+  if (projectId) {
+    try {
+      currentVersion = (await loadProjectContext(projectId)).version
+    } catch {
+      currentVersion = null
+    }
+  }
   sendJson(res, 200, {
-    project: { id: project.id, key: project.key, name: project.name },
-    workspaceSpec: project.workspaceSpec,
-    version: snap.version,
-    instructions: snap.instructions,
-    skillOverlay: snap.skillOverlay,
-    promotion: snap.meta.promotion,
+    runId: run.id,
+    contextSnapshotId: run.contextSnapshotId ?? null,
+    contextSha256: run.contextSha256 ?? null,
+    contextVersion: run.contextVersion ?? null,
+    currentVersion,
+    changed: run.contextVersion != null && currentVersion != null && run.contextVersion !== currentVersion,
+    snapshot,
+    disclaimer: '仅审计、不可逐字重放',
   })
 }
 
