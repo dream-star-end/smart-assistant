@@ -197,7 +197,7 @@ describe('official Weibo Plugin', () => {
   })
 
   test('pins the current artifact and only the exact production predecessor', () => {
-    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.25')
+    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.26')
     assert.equal(WEIBO_DRIVER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.equal(WEIBO_LAUNCHER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.deepEqual(WEIBO_SETUP_COMPATIBLE_PREDECESSORS, [
@@ -466,10 +466,11 @@ describe('official Weibo Plugin', () => {
     assert.match(WEIBO_WORKER_SOURCE, /clickableExactTextControls/)
     assert.match(WEIBO_WORKER_SOURCE, /provePostImageControl/)
     assert.match(WEIBO_WORKER_SOURCE, /containsBox/)
+    assert.match(WEIBO_WORKER_SOURCE, /nodeDelay/)
+    assert.match(WEIBO_WORKER_SOURCE, /if \(scopedInput\) \{\n    branch = 'existing'/)
     assert.match(WEIBO_WORKER_SOURCE, /smallVisibleAncestor/)
     assert.match(WEIBO_WORKER_SOURCE, /imageTextHits/)
     assert.match(WEIBO_WORKER_SOURCE, /imageControlHits/)
-    assert.match(WEIBO_WORKER_SOURCE, /scopedInput && !image/)
     assert.match(WEIBO_WORKER_SOURCE, /force: true/)
     assert.match(WEIBO_WORKER_SOURCE, /countImageFileInputs/)
     assert.match(WEIBO_WORKER_SOURCE, /step: 'media.chooser'/)
@@ -918,11 +919,11 @@ describe('official Weibo Plugin', () => {
     assert.deepEqual(events, [])
   })
 
-  test('create_post does not dispatch a composer file input when 图片 is absent', async () => {
+  test('create_post uses a unique composer file input when 图片 is absent', async () => {
     const events: string[] = []
     const empty = { count: async () => 0, nth: () => ({}) }
     const fileInput = {
-      setInputFiles: async () => events.push('upload-direct'),
+      setInputFiles: async () => events.push('upload'),
       evaluate: async (
         fn: (node: { isConnected: boolean; files: { length: number } }) => unknown,
       ) => fn({ isConnected: true, files: { length: events.includes('upload') ? 1 : 0 } }),
@@ -976,19 +977,18 @@ describe('official Weibo Plugin', () => {
       },
       waitForTimeout: async () => {},
     }
-    await assert.rejects(
-      harness.writeAction(page, {
-        actionId: 'create_post',
-        params: {
-          text: 'hello',
-          mediaManifest: [{ inputId: 'asset-1', filename: 'image.png', mimeType: 'image/png' }],
-        },
-      }),
-      /media/,
-    )
-    assert.equal(events.includes('dispatch'), false)
-    assert.equal(events.includes('upload'), false)
+    const result = await harness.writeAction(page, {
+      actionId: 'create_post',
+      params: {
+        text: 'hello',
+        mediaManifest: [{ inputId: 'asset-1', filename: 'image.png', mimeType: 'image/png' }],
+      },
+    })
+    assert.deepEqual(result, { post: { id: 'native-input', owned: true, text: 'hello' } })
+    assert.ok(events.includes('dispatch'))
+    assert.ok(events.includes('upload'))
     assert.equal(events.includes('input-click'), false)
+    assert.equal(events.includes('filechooser'), false)
   })
 
   test('create_post does not dispatch an unarmed composer file input', async () => {
@@ -1046,8 +1046,9 @@ describe('official Weibo Plugin', () => {
       }),
       /media/,
     )
-    assert.equal(events.includes('dispatch'), false)
-    assert.equal(events.includes('upload'), false)
+    assert.ok(events.includes('dispatch'))
+    assert.equal(events.includes('upload'), true)
+    assert.equal(events.includes('click'), false)
   })
 
   test('create_post uses a unique hidden composer file input without a native chooser', async () => {
@@ -1112,9 +1113,9 @@ describe('official Weibo Plugin', () => {
       },
     })
     assert.deepEqual(result, { post: { id: 'hidden-input', owned: true, text: 'hello' } })
-    assert.ok(events.indexOf('dispatch') < events.indexOf('image-click'))
     assert.ok(events.indexOf('dispatch') < events.indexOf('upload'))
-    assert.deepEqual(events.filter((event) => event !== 'image-menu' && event !== 'filechooser'), ['dispatch', 'image-click', 'upload', 'click'])
+    assert.equal(events.includes('image-click'), false)
+    assert.deepEqual(events.filter((event) => event !== 'image-menu' && event !== 'filechooser'), ['dispatch', 'upload', 'click'])
   })
 
   test('create_post waits for composer 发送 after upload and ignores extra 发送', async () => {
@@ -1192,7 +1193,7 @@ describe('official Weibo Plugin', () => {
     assert.ok(events.includes('send-scope'))
     assert.deepEqual(
       events.filter((event) => event !== 'send-scope'),
-      ['dispatch', 'image-click', 'upload', 'click'],
+      ['dispatch', 'upload', 'click'],
     )
   })
 
@@ -1780,7 +1781,7 @@ describe('official Weibo Plugin', () => {
         })
         assert.deepEqual(result, { post: { id: 'hidden-post', owned: true, text: 'hello' } })
         assert.ok(Date.now() - started >= 350, 'send must wait for delayed media readiness')
-        assert.equal(await page.evaluate(() => Reflect.get(window, 'imageClicks')), 1)
+        assert.equal(await page.evaluate(() => Reflect.get(window, 'imageClicks')), 0)
         assert.equal(await page.evaluate(() => Reflect.get(window, 'chooserClicks')), 0)
         assert.equal(await page.evaluate(() => Reflect.get(window, 'sendClicks')), 1)
         assert.equal(collectCount, 2)
@@ -1875,7 +1876,7 @@ describe('official Weibo Plugin', () => {
           },
         })
         assert.deepEqual(result, { post: { id: 'near-input-post', owned: true, text: 'hello' } })
-        assert.equal(await page.evaluate(() => Reflect.get(window, 'imageClicks')), 1)
+        assert.equal(await page.evaluate(() => Reflect.get(window, 'imageClicks')), 0)
         assert.equal(await page.evaluate(() => Reflect.get(window, 'chooserClicks')), 0)
         assert.equal(await page.evaluate(() => Reflect.get(window, 'sendClicks')), 1)
         assert.equal(collectCount, 2)

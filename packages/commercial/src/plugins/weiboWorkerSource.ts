@@ -1525,29 +1525,39 @@ async function imageToolControl(scope, page, scopedInput) {
   if (fromInput) return fromInput;
   return await exactMenuItem(page, '图片') || await uniqueExactText(page, '图片');
 }
+function nodeDelay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 async function preparePostImageChooser(page, editor) {
   const scope = (await composerScope(editor)) || page;
   const scopedInput = await uniqueImageFileInput(scope);
-  const image = await imageToolControl(scope, page, scopedInput);
   const beforeScope = await countImageFileInputs(scope);
   const beforePage = await countImageFileInputs(page);
   const imageTitleHits = await countVisibleLocator(scope, '[title="图片"], [aria-label="图片"]');
   const imageIconHits = await countVisibleLocator(scope, 'i.woo-font--image, i.woo-font--pic, i.woo-font--picture');
   const imageTextHits = await countVisibleLocator(scope, 'xpath=.//*[normalize-space()="图片"]');
-  const imageControlHits = (await clickableExactTextControls(scope, '图片')).length;
+  let image = null;
+  let imageControlHits = 0;
+  if (!scopedInput) {
+    image = await imageToolControl(scope, page, scopedInput);
+    imageControlHits = (await clickableExactTextControls(scope, '图片')).length;
+  }
   let branch = 'miss';
   let chooser = null;
-  if (image) {
-    await image.click({ trial: true, timeout: 10_000 });
+  if (scopedInput) {
+    branch = 'existing';
+    chooser = wrapFileInput(scopedInput);
+  } else if (image) {
+    await Promise.race([image.click({ trial: true, timeout: 5_000 }), nodeDelay(6_000)]).catch(() => {});
     let chooserSettled = false;
-    const chooserWait = page.waitForEvent('filechooser', { timeout: 10_000 }).then((found) => {
+    const chooserWait = page.waitForEvent('filechooser', { timeout: 8_000 }).then((found) => {
       chooserSettled = true;
       return found;
     }).catch(() => {
       chooserSettled = true;
       return null;
     });
-    await image.click({ timeout: 10_000, force: true });
+    await Promise.race([image.click({ timeout: 8_000, force: true }), nodeDelay(9_000)]).catch(() => {});
     const deadline = Date.now() + 10_000;
     while (Date.now() <= deadline) {
       const remaining = Math.max(1, deadline - Date.now());
@@ -1585,37 +1595,7 @@ async function preparePostImageChooser(page, editor) {
       if (chooserSettled) break;
     }
   }
-  if (!chooser && scopedInput && !image) {
-    try {
-      await scopedInput.click({ trial: true, timeout: 10_000, force: true });
-    } catch {}
-    let inputSettled = false;
-    const inputWait = page.waitForEvent('filechooser', { timeout: 10_000 }).then((found) => {
-      inputSettled = true;
-      return found;
-    }).catch(() => {
-      inputSettled = true;
-      return null;
-    });
-    try {
-      await scopedInput.click({ timeout: 10_000, force: true });
-    } catch {}
-    const inputDeadline = Date.now() + 10_000;
-    while (Date.now() <= inputDeadline) {
-      const remaining = Math.max(1, inputDeadline - Date.now());
-      const native = await Promise.race([
-        inputWait,
-        page.waitForTimeout(Math.min(250, remaining)).then(() => undefined)
-      ]);
-      if (native) {
-        branch = 'native';
-        chooser = native;
-        break;
-      }
-      if (inputSettled) break;
-    }
-  }
-  if (!chooser && scopedInput && image) {
+  if (!chooser && scopedInput) {
     branch = 'existing';
     chooser = wrapFileInput(scopedInput);
   }
@@ -1642,9 +1622,10 @@ async function preparePostImageChooser(page, editor) {
 async function provePostImageControl(page, editor) {
   const scope = (await composerScope(editor)) || page;
   const scopedInput = await uniqueImageFileInput(scope);
+  if (scopedInput) return true;
   const image = await imageToolControl(scope, page, scopedInput);
   if (!image) return false;
-  await image.click({ trial: true, timeout: 10_000 });
+  await Promise.race([image.click({ trial: true, timeout: 5_000 }), nodeDelay(6_000)]).catch(() => {});
   return true;
 }
 async function openLongTextComposer(page) {
