@@ -399,6 +399,7 @@ BEGIN;
 CREATE TEMP TABLE _ocv5_exp (id text, old_project text, old_updated bigint) ON COMMIT DROP;
 INSERT INTO _ocv5_exp(id, old_project, old_updated) VALUES {", ".join(values)};
 CREATE TEMP TABLE _ocv5_post ON COMMIT DROP AS
+WITH u AS (
   UPDATE client_sessions cs
      SET project_id = {project_sql},
          updated_at = GREATEST(cs.updated_at + 1, (EXTRACT(EPOCH FROM NOW())*1000)::bigint)
@@ -413,7 +414,9 @@ CREATE TEMP TABLE _ocv5_post ON COMMIT DROP AS
             exp.old_project AS "oldProjectId",
             exp.old_updated AS "oldUpdatedAt",
             cs.updated_at AS "updatedAt",
-            cs.project_id AS "projectId";
+            cs.project_id AS "projectId"
+)
+SELECT * FROM u;
 DO $body$
 DECLARE
   planned int := {planned};
@@ -455,6 +458,7 @@ def apply_usage_backfill_sql(payload: dict) -> str:
     return f"""
 BEGIN;
 CREATE TEMP TABLE _ocv5_usage_post ON COMMIT DROP AS
+WITH u AS (
   UPDATE usage_records
      SET board_project_id = '{board}',
          board_project_source = 'migration_backfill',
@@ -465,7 +469,9 @@ CREATE TEMP TABLE _ocv5_usage_post ON COMMIT DROP AS
   RETURNING id::text AS id,
             NULL::text AS "oldBoardProjectId",
             board_project_id AS "newBoardProjectId",
-            board_project_source AS "newSource";
+            board_project_source AS "newSource"
+)
+SELECT * FROM u;
 DO $body$
 DECLARE
   planned int := {planned};
@@ -518,6 +524,7 @@ BEGIN;
 CREATE TEMP TABLE _ocv5_usage_restore(id bigint, old_board text, post_board text) ON COMMIT DROP;
 INSERT INTO _ocv5_usage_restore(id, old_board, post_board) VALUES {", ".join(values)};
 CREATE TEMP TABLE _ocv5_usage_restored ON COMMIT DROP AS
+WITH u AS (
   UPDATE usage_records ur
      SET board_project_id = exp.old_board,
          board_project_source = CASE WHEN exp.old_board IS NULL THEN NULL ELSE ur.board_project_source END,
@@ -527,7 +534,9 @@ CREATE TEMP TABLE _ocv5_usage_restored ON COMMIT DROP AS
      AND ur.id = exp.id
      AND ur.board_project_source = 'migration_backfill'
      AND ur.board_project_id IS NOT DISTINCT FROM exp.post_board
-  RETURNING ur.id;
+  RETURNING ur.id
+)
+SELECT * FROM u;
 DO $body$
 DECLARE
   planned int := {planned};
