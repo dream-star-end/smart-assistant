@@ -408,7 +408,10 @@ CREATE TEMP TABLE _ocv5_post (
 WITH u AS (
   UPDATE client_sessions cs
      SET project_id = {project_sql},
-         updated_at = GREATEST(cs.updated_at + 1, (EXTRACT(EPOCH FROM NOW())*1000)::bigint)
+         updated_at = CASE
+           WHEN cs.project_id IS NOT DISTINCT FROM {project_sql} THEN cs.updated_at
+           ELSE GREATEST(cs.updated_at + 1, (EXTRACT(EPOCH FROM NOW())*1000)::bigint)
+         END
     FROM _ocv5_exp exp
    WHERE cs.user_id = '{USER_ID}'
      AND cs.id = exp.id
