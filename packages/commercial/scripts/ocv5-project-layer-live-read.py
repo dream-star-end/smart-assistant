@@ -305,6 +305,22 @@ def apply_bind_facade(chat_id: str, board_id: str | None) -> dict:
         "'deleted', deleted_at, 'user_id', user_id) "
         f"FROM chat_projects WHERE id = '{chat_id}';"
     ).strip()
+    if not row_raw and board_id not in (None, ""):
+        # Coordinator sometimes passes tb_project id as chatId. Resolve the unique live facade.
+        board_sql = str(board_id).replace("'", "''")
+        alt = psql(
+            "SELECT COALESCE(json_agg(json_build_object("
+            "'id', id, 'board', board_project_id, 'deleted', deleted_at, 'user_id', user_id"
+            ")), '[]'::json) FROM chat_projects "
+            f"WHERE user_id = '{USER_ID}' AND deleted_at IS NULL "
+            f"AND board_project_id = '{board_sql}';"
+        ).strip()
+        rows = json.loads(alt or "[]")
+        if isinstance(rows, dict):
+            rows = [rows]
+        if len(rows) == 1 and rows[0].get("id"):
+            chat_id = str(rows[0]["id"])
+            row_raw = json.dumps(rows[0], ensure_ascii=False)
     if not row_raw:
         raise SystemExit(f"bind_failed:no_row:{chat_id}")
     row = json.loads(row_raw)

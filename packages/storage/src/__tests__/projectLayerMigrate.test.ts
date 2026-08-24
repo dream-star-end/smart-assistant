@@ -355,6 +355,17 @@ describe('usage backfill + cron impact + count drift', () => {
     const bind = plan.operations.find((o) => o.op === 'bind_chat_facade')
     assert.ok(bind && bind.op === 'bind_chat_facade')
     assert.equal(bind.chatProjectId, 'facade-live')
+    const applyPorts = applyStub({
+      async bindChatProject(id, boardProjectId) {
+        assert.notEqual(id, OCV5)
+        assert.equal(id, 'facade-live')
+        assert.equal(boardProjectId, OCV5)
+        return { old: OCV5, new: OCV5 }
+      },
+    })
+    const result = await applyProjectLayerMigration(plan, applyPorts)
+    assert.equal(result.ok, true)
+    assert.equal(result.facadeId, 'facade-live')
   })
 
   it('compensate restores only this operation usage rows that did not change again', async () => {

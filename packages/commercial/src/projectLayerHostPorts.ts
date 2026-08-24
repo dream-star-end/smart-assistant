@@ -315,14 +315,19 @@ export function makeApplyPorts(opts: {
       return { id: got.id, created: got.created ?? true }
     },
     async bindChatProject(id, boardProjectId) {
-      const existing = (opts.snapshot.chatProjects ?? []).find(
-        (c) => c.id === id && !c.deletedAt,
-      )
+      const chats = opts.snapshot.chatProjects ?? []
+      let chatId = id
+      if (boardProjectId && id === boardProjectId) {
+        const facade = chats.find((c) => !c.deletedAt && c.boardProjectId === boardProjectId)
+        if (!facade?.id) throw new Error(`bind_chat_id_is_board:${id}`)
+        chatId = facade.id
+      }
+      const existing = chats.find((c) => c.id === chatId && !c.deletedAt)
       if (existing && existing.boardProjectId === boardProjectId) {
         return { old: existing.boardProjectId, new: boardProjectId }
       }
       const got = (await hostApply(script, 'apply-bind-facade', {
-        chatId: id,
+        chatId,
         boardProjectId,
       })) as { old: string | null; new: string | null }
       return { old: got.old ?? null, new: got.new ?? boardProjectId }

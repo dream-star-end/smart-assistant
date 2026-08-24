@@ -206,7 +206,28 @@ if (has(argv, '--apply')) {
     script,
     inventory,
   })
-  const result = await applyProjectLayerMigration(applyPlan, applyPorts)
+  let result
+  try {
+    result = await applyProjectLayerMigration(applyPlan, applyPorts)
+  } catch (err) {
+    result = {
+      ok: false as const,
+      operationId: applyPlan.operationId,
+      applied: [],
+      createdAssetIds: [],
+      facadeId: applyPlan.live.facadeId,
+      error: (err as Error).message,
+      manifest: {
+        facadeCreate: null,
+        bind: null,
+        context: null,
+        memoryCandidates: [],
+        skillOverlay: null,
+      },
+      rollback: applyPlan.rollback,
+    }
+    console.error(`apply threw: ${result.error}`)
+  }
   const resultPath = outPath || writeManifestPath(`${applyPlan.operationId}-result`)
   await mkdir(dirname(resultPath), { recursive: true })
   await writeFile(resultPath, JSON.stringify({ plan: applyPlan, result, deferred: defer || null }, null, 2))

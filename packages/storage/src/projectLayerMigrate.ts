@@ -905,7 +905,10 @@ export async function applyProjectLayerMigration(
         manifest.facadeCreate = { id: created.id }
         applied.push(op.id)
       } else if (op.op === 'bind_chat_facade') {
-        const id = op.chatProjectId || facadeId
+        const fromOp =
+          op.chatProjectId && op.chatProjectId !== op.boardProjectId ? op.chatProjectId : undefined
+        const fromLive = facadeId && facadeId !== op.boardProjectId ? facadeId : undefined
+        const id = fromOp || fromLive
         if (!id) throw new Error('facade_missing')
         const bound = await ports.bindChatProject(id, op.boardProjectId)
         facadeId = id
