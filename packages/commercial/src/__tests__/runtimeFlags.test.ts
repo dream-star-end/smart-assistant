@@ -158,12 +158,14 @@ describe("runtimeFlags — reader throw 时 fail-open 到 DEFAULTS,不 cache", (
     __setReaderForTest(async () => {
       calls++;
       if (shouldThrow) throw new Error("transient");
-      return { value: "enforce" as never };
+      return { value: "observe" as never };
     });
-    assert.equal(await getSessionPinMode(), "off"); // fail-open
+    // fail-open 回 DEFAULTS.session_pin_mode(反封复盘 2026-08 起默认 enforce)。
+    // recovered 值特意取 "observe"(≠ 默认),保留"fail-open vs 真值"的区分度。
+    assert.equal(await getSessionPinMode(), "enforce"); // fail-open → DEFAULTS
     assert.equal(__test_only_cache.size, 0);
     shouldThrow = false;
-    assert.equal(await getSessionPinMode(), "enforce");
+    assert.equal(await getSessionPinMode(), "observe");
     assert.equal(__test_only_cache.size, 1);
     assert.equal(calls, 2);
   });

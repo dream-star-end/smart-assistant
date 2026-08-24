@@ -29,20 +29,23 @@ describe("generatePersona — without seed", () => {
     assertPersona(p); // 不抛即 PASS
   });
 
-  test("user_agent 严格匹配 anthropic-ai-claude-code/<pkg> Node/<runtime> <OS>", () => {
+  test("user_agent 严格匹配真实 claude-cli/<ver> (<user_type>, <entrypoint>)", () => {
     const p = generatePersona();
+    // 反封复盘 2026-08:UA 复刻真实 Claude Code CLI wire 格式(不再伪装 stainless SDK)。
     assert.match(
       p.user_agent,
-      /^anthropic-ai-claude-code\/[0-9]+\.[0-9]+\.[0-9]+ Node\/v[0-9]+\.[0-9]+\.[0-9]+ (MacOS|Linux|Windows)$/,
+      /^claude-cli\/[0-9]+\.[0-9]+\.[0-9]+ \(external, cli\)$/,
     );
   });
 
-  test("user_agent 三段拼接源自 persona 字段(三处一致)", () => {
-    const p = generatePersona();
-    // user_agent 模板 = `anthropic-ai-claude-code/${pkg} Node/${rtv} ${os}`
-    assert.ok(p.user_agent.includes(`/${p.x_stainless_package_version} `));
-    assert.ok(p.user_agent.includes(`Node/${p.x_stainless_runtime_version} `));
-    assert.ok(p.user_agent.endsWith(` ${p.x_stainless_os}`));
+  test("user_agent 与 x-stainless-package-version 是锚定实际二进制的常量", () => {
+    // 全池共用真实 claude-cli 版本 + 真实 SDK 版本;账号差异化改由 os/arch/node/lang 承载。
+    const a = generatePersona();
+    const b = generatePersona();
+    assert.equal(a.user_agent, "claude-cli/2.8.4 (external, cli)");
+    assert.equal(a.user_agent, b.user_agent);
+    assert.equal(a.x_stainless_package_version, "0.81.0");
+    assert.equal(b.x_stainless_package_version, "0.81.0");
   });
 
   test("固定字段值符合 persona.ts 注释承诺", () => {
@@ -60,12 +63,17 @@ describe("generatePersona — without seed", () => {
     assert.ok(/^[a-zA-Z]{2}-[A-Z]{2}/.test(p.accept_language));
   });
 
-  test("多次调用产生熵差异(50 次至少 2 种 user_agent)", () => {
-    const uas = new Set<string>();
-    for (let i = 0; i < 50; i += 1) uas.add(generatePersona().user_agent);
-    // arch×os×pkg×rtv×lang = 2×3×5×5×5 = 750 种 user_agent 组合(实际只用 pkg/rtv/os),
-    // 50 次随机至少 2 种是统计学几乎必然。<2 是真坏代码不是噪音。
-    assert.ok(uas.size >= 2, `expected >=2 distinct UAs in 50 draws, got ${uas.size}`);
+  test("多次调用在差异化维度上产生熵(50 次至少 2 种 os/arch/node/lang 组合)", () => {
+    // UA + SDK 版本已收敛为常量(锚定真实二进制),差异化搬到 os×arch×rtv×lang。
+    // 组合空间 = 3×2×5×5 = 150 种,50 次随机至少 2 种是统计学几乎必然。
+    const fps = new Set<string>();
+    for (let i = 0; i < 50; i += 1) {
+      const p = generatePersona();
+      fps.add(
+        `${p.x_stainless_os}|${p.x_stainless_arch}|${p.x_stainless_runtime_version}|${p.accept_language}`,
+      );
+    }
+    assert.ok(fps.size >= 2, `expected >=2 distinct fingerprints in 50 draws, got ${fps.size}`);
   });
 });
 
@@ -77,14 +85,16 @@ describe("generatePersona — with seed", () => {
     assert.deepEqual(a, b);
   });
 
-  test("不同 seed → 大概率不同 persona(20 个 seed 至少 2 种 user_agent)", () => {
-    const uas = new Set<string>();
+  test("不同 seed → 大概率不同 persona(20 个 seed 至少 2 种差异化组合)", () => {
+    // UA/SDK 版本为常量,差异化看 os/arch/node/lang 组合。
+    const fps = new Set<string>();
     for (let i = 0; i < 20; i += 1) {
-      uas.add(
-        generatePersona(Buffer.from(`seed-${i}`, "utf8")).user_agent,
+      const p = generatePersona(Buffer.from(`seed-${i}`, "utf8"));
+      fps.add(
+        `${p.x_stainless_os}|${p.x_stainless_arch}|${p.x_stainless_runtime_version}|${p.accept_language}`,
       );
     }
-    assert.ok(uas.size >= 2, `expected >=2 distinct seeded UAs, got ${uas.size}`);
+    assert.ok(fps.size >= 2, `expected >=2 distinct seeded fingerprints, got ${fps.size}`);
   });
 
   test("seed 派生 persona 通过 assertPersona", () => {
