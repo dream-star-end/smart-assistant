@@ -27,6 +27,7 @@ import assert from 'node:assert/strict'
 import {
   ACTIVE_TURN_REPLAY_CANDIDATE_MAX,
   _matchActiveTurnReplayCandidate,
+  _shouldInterruptUnknownInFlight,
   _shouldPushTurnInterruptedFinal,
 } from '../server.js'
 
@@ -118,5 +119,49 @@ test('active-turn replay candidates authorize only an exact bounded server-owned
     ),
     undefined,
     'oversized client hints degrade to ordinary cursor replay',
+  )
+})
+
+test('unknown in-flight is interrupted when this process is not running that cmid', () => {
+  assert.equal(
+    _shouldInterruptUnknownInFlight({
+      runningClientMessageId: undefined,
+      inFlightClientMessageId: 'm-recover-1',
+      engineTurnCount: 0,
+      clientTurnCount: 0,
+    }),
+    true,
+    'restart / dead recover: counters 0 and no running id',
+  )
+  assert.equal(
+    _shouldInterruptUnknownInFlight({
+      runningClientMessageId: 'm-other',
+      inFlightClientMessageId: 'm-recover-1',
+      engineTurnCount: 1,
+      clientTurnCount: 1,
+    }),
+    true,
+    'stale inFlight while a later turn is running',
+  )
+})
+
+test('unknown in-flight stays unknown during dispatchInbound-before-submit', () => {
+  assert.equal(
+    _shouldInterruptUnknownInFlight({
+      runningClientMessageId: undefined,
+      inFlightClientMessageId: 'm-user-1',
+      engineTurnCount: 1,
+      clientTurnCount: 0,
+    }),
+    false,
+  )
+  assert.equal(
+    _shouldInterruptUnknownInFlight({
+      runningClientMessageId: 'm-user-1',
+      inFlightClientMessageId: 'm-user-1',
+      engineTurnCount: 1,
+      clientTurnCount: 1,
+    }),
+    false,
   )
 })

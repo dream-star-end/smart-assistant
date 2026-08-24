@@ -43,6 +43,40 @@ const GROK_SHUTDOWN_GRACE_DEFAULT_MS = 3_000
 const GROK_SHUTDOWN_FINAL_DRAIN_DEFAULT_MS = 3_000
 const GROK_UPSTREAM_MODEL = 'grok-4.6'
 const ROUTE_TOKEN_RE = /^[0-9a-f]{64}$/
+const PROCESS_KEEPALIVE_INTERVAL_DEFAULT_MS = 30_000
+const PROCESS_KEEPALIVE_INTERVAL_MIN_MS = 5_000
+const PROCESS_KEEPALIVE_INTERVAL_MAX_MS = 120_000
+
+type GrokProcessKeepaliveTestHooks = {
+  intervalMs?: number
+}
+
+let processKeepaliveTestHooks: GrokProcessKeepaliveTestHooks | null = null
+
+function parseProcessKeepaliveIntervalMs(): number {
+  const raw = process.env.OPENCLAUDE_GROK_PROCESS_KEEPALIVE_MS
+  if (!raw) return PROCESS_KEEPALIVE_INTERVAL_DEFAULT_MS
+  const parsed = Number(raw)
+  if (!Number.isFinite(parsed)) return PROCESS_KEEPALIVE_INTERVAL_DEFAULT_MS
+  return Math.min(
+    PROCESS_KEEPALIVE_INTERVAL_MAX_MS,
+    Math.max(PROCESS_KEEPALIVE_INTERVAL_MIN_MS, Math.floor(parsed)),
+  )
+}
+
+function resolvedProcessKeepaliveIntervalMs(): number {
+  return processKeepaliveTestHooks?.intervalMs ?? parseProcessKeepaliveIntervalMs()
+}
+
+function isPidAlive(pid: number | undefined): boolean {
+  if (typeof pid !== 'number' || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
 
 const GROK_SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const GROK_CHECKPOINT_MAX_BYTES = 32 * 1024 * 1024
@@ -258,6 +292,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
   private currentTarget: ExecutionTarget = { kind: 'local' }
   private traceId: string | undefined
   private drain: Promise<void> = Promise.resolve()
+  private processKeepaliveTimer: NodeJS.Timeout | null = null
   lastActivityAt = 0
 
   constructor(opts: EngineCreateOpts) {
@@ -449,6 +484,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       return
     }
     this.emit('spawn', { resumed: this.nativeId !== null })
+    this.ensureProcessKeepalive()
 
     let stdoutBuffer = ''
     proc.stdout.setEncoding('utf8')
@@ -471,6 +507,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       ctx.stderr += chunk
     })
     proc.once('error', (err) => {
+      this.stopProcessKeepalive()
       cleanupPromptDir(ctx)
       // An abandoned turn has already been finalized and `active` has moved on;
       // surfacing this would report a later turn as failed.
@@ -479,6 +516,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       this.emit('error', err)
     })
     proc.once('close', (code, signal) => {
+      this.stopProcessKeepalive()
       cleanupPromptDir(ctx)
       // shutdown() may have already given up on this process and finalized
       // the turn, in which case `active` belongs to a later turn that this
@@ -720,6 +758,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
   }
 
   private finish(ctx: GrokTurnContext, end: GrokEvent | null): void {
+    this.stopProcessKeepalive()
     if (ctx.terminal) return
     const upstreamStopReason = typeof end?.stopReason === 'string' ? end.stopReason : null
     if (upstreamStopReason === 'cancelled') ctx.interrupted = true
@@ -772,9 +811,46 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
   }
 
   private forceEnd(ctx: GrokTurnContext): void {
+    this.stopProcessKeepalive()
     if (ctx.terminal) return
     ctx.terminal = true
     ctx.resolveSummary(null)
+  }
+
+  private stopProcessKeepalive(): void {
+    if (!this.processKeepaliveTimer) return
+    clearInterval(this.processKeepaliveTimer)
+    this.processKeepaliveTimer = null
+  }
+
+  private ensureProcessKeepalive(): void {
+    if (this.processKeepaliveTimer) return
+    const ctx = this.active
+    if (!ctx || ctx.terminal || ctx.abandoned || !ctx.proc) return
+    const intervalMs = resolvedProcessKeepaliveIntervalMs()
+    if (intervalMs <= 0) return
+    this.processKeepaliveTimer = setInterval(() => { this.tickProcessKeepalive() }, intervalMs)
+    this.processKeepaliveTimer.unref()
+  }
+
+  private tickProcessKeepalive(): void {
+    try {
+      const ctx = this.active
+      const pid = ctx?.proc?.pid
+      if (!ctx || ctx.terminal || ctx.abandoned || !isPidAlive(pid)) {
+        this.stopProcessKeepalive()
+        return
+      }
+      // Official Grok can think or wait on the first API round-trip for minutes
+      // with no stdout. Cursor already keeps lastActivityAt fresh while the
+      // parent PID is alive; without that, grok-build dies at the 15-minute
+      // idle watchdog and then auto-recovers into a thinking-forever loop.
+      // The 12h logical-turn cap still bounds a genuinely stuck CLI.
+      this.lastActivityAt = Date.now()
+      this.emit('activity')
+    } catch {
+      // Keepalive must never throw into the interval.
+    }
   }
 
   interrupt(): boolean {
@@ -849,6 +925,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     proc: ChildProcessByStdio<null, Readable, Readable> | null,
     detail: string,
   ): void {
+    this.stopProcessKeepalive()
     cleanupPromptDir(ctx)
     ctx.abandoned = true
     if (proc) detachChildStdio(proc)
@@ -888,6 +965,15 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
   get pendingToolCalls(): number { return this.active?.pendingToolIds.size ?? 0 }
   get isRunning(): boolean { return !!this.active?.proc && !this.active.proc.killed && !this.active.terminal }
   getBoundRepoBinding(): { selectionVersion: number; workspaceDir: string } | null { return null }
+}
+
+export const _internals = {
+  PROCESS_KEEPALIVE_INTERVAL_DEFAULT_MS,
+  PROCESS_KEEPALIVE_INTERVAL_MIN_MS,
+  PROCESS_KEEPALIVE_INTERVAL_MAX_MS,
+  setProcessKeepaliveTestHooks(hooks: GrokProcessKeepaliveTestHooks | null): void {
+    processKeepaliveTestHooks = hooks
+  },
 }
 
 registerEngine('grok', (opts) => new GrokAdapter(opts))

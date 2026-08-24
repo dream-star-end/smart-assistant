@@ -10,7 +10,7 @@ import path, { join } from 'node:path'
 import { describe, test } from 'node:test'
 
 import type { OpenClaudeConfig } from '@openclaude/storage'
-import { GrokAdapter, readLatestGrokNativeHandoff } from '../engine/grokAdapter.js'
+import { GrokAdapter, readLatestGrokNativeHandoff, _internals } from '../engine/grokAdapter.js'
 import type { EngineBillingEvent, EngineEvent } from '../engine/engineEvents.js'
 import type { EngineCreateOpts } from '../engine/registry.js'
 
@@ -545,6 +545,74 @@ console.log(JSON.stringify({ type: 'end', stopReason: 'end_turn', sessionId: 'aa
     restoreEnv('OC_GROK_CLI_BIN', previousBin)
     restoreEnv('OPENCLAUDE_HOME', previousHome)
     restoreEnv('FAKE_GROK_CAPTURE', previousCapture)
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+async function waitUntil(pred: () => boolean, ms: number, label: string): Promise<void> {
+  const started = Date.now()
+  while (!pred()) {
+    if (Date.now() - started > ms) throw new Error(`timed out waiting for ${label}`)
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+}
+
+test('refreshes lastActivityAt while the Grok CLI pid is alive even with no stdout', { timeout: 10_000 }, async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'oc-grok-keepalive-'))
+  const fake = path.join(dir, 'fake-grok.cjs')
+  await writeFile(fake, `#!/usr/bin/env node
+setTimeout(() => {
+  console.log(JSON.stringify({
+    type: 'end',
+    stopReason: 'end_turn',
+    sessionId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+    usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, reasoning_tokens: 0 },
+  }))
+}, 900)
+`)
+  await chmod(fake, 0o755)
+  const previousBin = process.env.OC_GROK_CLI_BIN
+  const previousHome = process.env.OPENCLAUDE_HOME
+  process.env.OC_GROK_CLI_BIN = fake
+  process.env.OPENCLAUDE_HOME = path.join(dir, 'openclaude-home')
+  _internals.setProcessKeepaliveTestHooks({ intervalMs: 40 })
+  try {
+    const adapter = new GrokAdapter(createOpts(dir))
+    adapter.setGrokRoute({
+      baseUrl: `http://127.0.0.1:18789/internal/v5/grok-relay/route/${TOKEN}/v1`,
+      routeToken: TOKEN,
+    })
+    const activity = { count: 0 }
+    adapter.on('activity', () => { activity.count += 1 })
+    adapter.on('error', () => {})
+    const run = adapter.submitTurn({
+      input: 'think silently',
+      requestId: REQUEST_ID,
+      turnKey: TURN_KEY,
+      onEvent: () => {},
+      sessionTotals: { totalCostUSD: 0, turns: 0 },
+      toolUseIdToName: new Map(),
+    })
+    await run.submitted
+    await waitUntil(() => adapter.isRunning, 3_000, 'grok process running')
+    const activityAt = adapter.lastActivityAt
+    const countAfterStart = activity.count
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    assert.ok(
+      activity.count - countAfterStart >= 2,
+      `expected periodic keepalive activity, got ${activity.count - countAfterStart} extra emits`,
+    )
+    assert.ok(adapter.lastActivityAt > activityAt, 'keepalive must refresh lastActivityAt')
+    const summary = await run.summary
+    await adapter.waitForOutputDrain()
+    assert.ok(summary)
+    const countAfterClose = activity.count
+    await new Promise((resolve) => setTimeout(resolve, 120))
+    assert.equal(activity.count, countAfterClose, 'keepalive must stop after the CLI exits')
+  } finally {
+    _internals.setProcessKeepaliveTestHooks(null)
+    restoreEnv('OC_GROK_CLI_BIN', previousBin)
+    restoreEnv('OPENCLAUDE_HOME', previousHome)
     await rm(dir, { recursive: true, force: true })
   }
 })

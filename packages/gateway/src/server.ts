@@ -15529,6 +15529,34 @@ export class Gateway {
                 ts: Date.now(),
               }))
               this.log.info('auto-resume reconcile turn_interrupted (id-bound)', { sessionKey, clientMessageId: inFlightCmid })
+            } else if (
+              _shouldInterruptUnknownInFlight({
+                runningClientMessageId: session._runningClientMessageId,
+                inFlightClientMessageId: inFlightCmid,
+                engineTurnCount: session._activeTurnCount,
+                clientTurnCount: session._activeClientTurnCount,
+              })
+            ) {
+              // V5 master-authoritative lookup 在容器侧恒为 unknown。若本进程
+              // 已不在跑该 cmid（重启后 liveSkipped / Grok 子进程已死 / 已换新 recover），
+              // 再发非 final turn_state_unknown 会让前端按 RFC §4 永远留「思考中」。
+              // 计数器都是 0 时生产者已不在本进程，合成 interrupted 终态清发送态。
+              ws.send(JSON.stringify({
+                type: 'outbound.message',
+                sessionKey,
+                channel: 'webchat',
+                peer: basePeer,
+                agentId: aid,
+                blocks: [],
+                clientMessageId: inFlightCmid,
+                meta: { reconcile: 'turn_interrupted', interrupted: 'service_restart', clientMessageId: inFlightCmid } as any,
+                isFinal: true,
+                ts: Date.now(),
+              }))
+              this.log.info('auto-resume reconcile unknown-in-flight as interrupted (id-bound)', {
+                sessionKey,
+                clientMessageId: inFlightCmid,
+              })
             } else {
               // 未知身份(ring 未命中 且 非 running)→ **非 final** turn_state_unknown。
               // 不冒充终态:前端立即 reconcileSession(force-sync)+ 缩短 safety 定时,
@@ -18246,6 +18274,31 @@ export function _shouldPushTurnInterruptedFinal(
   if (!peerInFlight) return false
   if ((engineTurnCount ?? 0) > 0) return false
   if ((clientTurnCount ?? 0) > 0) return false
+  return true
+}
+
+/**
+ * Identity-bound hello path: ring miss (or V5 master-authoritative lookup which
+ * always returns unknown) while this cmid is not `_runningClientMessageId`.
+ *
+ * Keep `turn_state_unknown` only for the dispatchInbound-before-submit window
+ * (counters > 0 but running id not bound yet). Otherwise the producer is gone
+ * from this process and leaving unknown keeps the client on 「思考中」 forever.
+ */
+export function _shouldInterruptUnknownInFlight(input: {
+  runningClientMessageId?: string | null
+  inFlightClientMessageId: string
+  engineTurnCount?: number
+  clientTurnCount?: number
+}): boolean {
+  if (!input.inFlightClientMessageId) return false
+  if (input.runningClientMessageId === input.inFlightClientMessageId) return false
+  if (
+    !input.runningClientMessageId
+    && ((input.engineTurnCount ?? 0) > 0 || (input.clientTurnCount ?? 0) > 0)
+  ) {
+    return false
+  }
   return true
 }
 
