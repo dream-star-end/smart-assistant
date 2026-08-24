@@ -198,7 +198,7 @@ describe('official Weibo Plugin', () => {
   })
 
   test('pins the current artifact and only the exact production predecessor', () => {
-    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.35')
+    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.36')
     assert.equal(WEIBO_DRIVER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.equal(WEIBO_LAUNCHER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.deepEqual(WEIBO_SETUP_COMPATIBLE_PREDECESSORS, [
@@ -516,8 +516,18 @@ describe('official Weibo Plugin', () => {
     assert.match(WEIBO_WORKER_SOURCE, /emitChooser\('existing'\)/)
     assert.match(WEIBO_WORKER_SOURCE, /if \(scopedInput\) \{\n    emitChooser\('existing'\)/)
     assert.match(WEIBO_WORKER_SOURCE, /https:\/\/picupload\.weibo\.com/)
-    assert.match(WEIBO_WORKER_SOURCE, /waitUntil: 'commit'/)
     assert.match(WEIBO_WORKER_SOURCE, /via: 'picupload-origin'/)
+    assert.doesNotMatch(
+      WEIBO_WORKER_SOURCE,
+      /picupload\.weibo\.com\/', \{ waitUntil/,
+      'picupload must be fetched from the weibo.com page, not a redirect-prone tab',
+    )
+    assert.match(
+      WEIBO_WORKER_SOURCE,
+      /if \(xsrf\) headers\['x-xsrf-token'\] = xsrf;/,
+      'exactly one xsrf header: case-variant duplicates merge into an invalid token',
+    )
+    assert.doesNotMatch(WEIBO_WORKER_SOURCE, /X-XSRF-TOKEN'\] = xsrf/)
     assert.match(createPostSource, /api\.via === 'string' && api.via/)
     assert.match(WEIBO_WORKER_SOURCE, /ajax\/statuses\/update/)
     assert.match(WEIBO_WORKER_SOURCE, /api\/statuses\/uploadPic/)

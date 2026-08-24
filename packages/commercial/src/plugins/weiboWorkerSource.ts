@@ -2,12 +2,14 @@
  * Reviewed Weibo worker. No Playwright request client, no Node-side cookie replay,
  * and no challenge bypass. Writes stay behind the dispatch fence.
  *
- * Short text plus images: after dispatch, open a same-origin tab on
- * picupload.weibo.com, POST the file there, then POST /ajax/statuses/update
- * from weibo.com with XSRF-TOKEN from context.cookies. Cross-origin fetch from
- * weibo.com cannot read the pid. A live cookie-path miss throws media-upload
- * instead of opening the native OS chooser. Harness tests still fall through
- * to DOM when the cookie helper is stubbed without a via.
+ * Short text plus images: after dispatch, POST the file to picupload.weibo.com
+ * straight from the weibo.com page (the endpoint answers CORS preflight and the
+ * pid is readable cross-origin), then POST /ajax/statuses/update from weibo.com
+ * with a single x-xsrf-token header from context.cookies. A picupload tab is
+ * useless here: it JS-redirects back to weibo.com and kills the execution
+ * context mid-upload. A live cookie-path miss throws media-upload instead of
+ * opening the native OS chooser. Harness tests still fall through to DOM when
+ * the cookie helper is stubbed without a via.
  */
 export const WEIBO_WORKER_SOURCE = String.raw`
 import { createHash } from 'node:crypto';
@@ -1174,69 +1176,54 @@ async function publishComposerViaCookieApi(page, text, files, selfId) {
   } catch { context = null; }
   const payload = { text: String(text || ''), files: encoded, selfId: String(selfId || ''), xsrf };
   if (!context || typeof context.newPage !== 'function') return { published: false, attempted: false, via: 'picupload-origin', reason: 'nocontext', pids: [] };
-  const tab = await context.newPage();
   let uploaded = { pids: [], via: 'picupload-origin', reason: 'throw', status: 0 };
   try {
-    await tab.goto('https://picupload.weibo.com/', { waitUntil: 'commit', timeout: 20_000 }).catch(() => {});
-    let tabOrigin = '';
-    try { tabOrigin = new URL(tab.url()).origin; } catch {}
-    if (tabOrigin !== 'https://picupload.weibo.com') {
-      uploaded = { pids: [], via: 'picupload-origin', reason: 'origin', status: 0 };
-    } else {
-      uploaded = await tab.evaluate(async (input) => {
-        const bytesOf = (item) => {
-          const binary = atob(item.base64);
-          const bytes = new Uint8Array(binary.length);
-          for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
-          return bytes;
-        };
-        const parseJson = (raw) => {
-          const text = String(raw || '');
-          const start = text.indexOf('{');
-          if (start < 0) return null;
-          try { return JSON.parse(text.slice(start)); } catch { return null; }
-        };
-        const pidOf = (parsed) => {
-          if (!parsed || typeof parsed !== 'object') return '';
-          const pic = parsed.pic && typeof parsed.pic === 'object' ? parsed.pic : null;
-          const pic1 = parsed.data && parsed.data.pics && parsed.data.pics.pic_1 ? parsed.data.pics.pic_1 : null;
-          const pid = String(parsed.pic_id || parsed.picid || parsed.pid || (pic && pic.pid) || (pic1 && pic1.pid) || '');
-          return /^[A-Za-z0-9._-]{8,128}$/.test(pid) ? pid : '';
-        };
-        const pids = [];
-        let status = 0;
-        const query = 'data=1&p=1&url=' + encodeURIComponent('weibo.com/u/' + input.selfId) + '&markpos=1&logo=1&nick=0&marks=0&app=miniblog&s=json&file_source=1';
-        const paths = ['/interface/pic_upload.php?' + query, '/interface/upload.php?' + query];
-        for (const file of input.files) {
-          const blob = new Blob([bytesOf(file)], { type: file.mimeType });
-          let pid = '';
-          for (const path of paths) {
-            if (pid) break;
-            try {
-              const posted = await fetch(path, { method: 'POST', credentials: 'include', headers: { Accept: 'application/json, text/plain, */*' }, body: blob });
-              status = posted.status;
-              pid = pidOf(parseJson(await posted.text()));
-            } catch {}
-          }
-          if (!pid) {
-            try {
-              const form = new FormData();
-              form.append('pic1', blob, file.name);
-              const posted = await fetch('/interface/pic_upload.php?app=miniblog&s=json&data=1', { method: 'POST', credentials: 'include', body: form });
-              status = posted.status;
-              pid = pidOf(parseJson(await posted.text()));
-            } catch {}
-          }
-          if (!pid) return { pids: pids.slice(), via: 'picupload-origin', reason: 'upload', status };
-          pids.push(pid);
+    uploaded = await page.evaluate(async (input) => {
+      const bytesOf = (item) => {
+        const binary = atob(item.base64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+        return bytes;
+      };
+      const parseJson = (raw) => {
+        const text = String(raw || '');
+        const start = text.indexOf('{');
+        if (start < 0) return null;
+        try { return JSON.parse(text.slice(start)); } catch { return null; }
+      };
+      const pidOf = (parsed) => {
+        if (!parsed || typeof parsed !== 'object') return '';
+        const pic = parsed.pic && typeof parsed.pic === 'object' ? parsed.pic : null;
+        const pic1 = parsed.data && parsed.data.pics && parsed.data.pics.pic_1 ? parsed.data.pics.pic_1 : null;
+        const pid = String(parsed.pic_id || parsed.picid || parsed.pid || (pic && pic.pid) || (pic1 && pic1.pid) || '');
+        return /^[A-Za-z0-9._-]{8,128}$/.test(pid) ? pid : '';
+      };
+      const pids = [];
+      let status = 0;
+      const query = 'data=1&p=1&url=' + encodeURIComponent('weibo.com/u/' + input.selfId) + '&markpos=1&logo=1&nick=0&marks=0&app=miniblog&s=json&file_source=1';
+      const paths = [
+        'https://picupload.weibo.com/interface/pic_upload.php?' + query,
+        'https://picupload.weibo.com/interface/upload.php?' + query
+      ];
+      for (const file of input.files) {
+        const blob = new Blob([bytesOf(file)], { type: file.mimeType });
+        let pid = '';
+        for (const path of paths) {
+          if (pid) break;
+          try {
+            const posted = await fetch(path, { method: 'POST', credentials: 'include', body: blob });
+            status = posted.status;
+            pid = pidOf(parseJson(await posted.text()));
+          } catch {}
         }
-        return { pids, via: 'picupload-origin', reason: '', status };
-      }, payload);
-    }
+        if (!pid) return { pids: pids.slice(), via: 'picupload-origin', reason: 'upload', status };
+        pids.push(pid);
+      }
+      return { pids, via: 'picupload-origin', reason: '', status };
+    }, payload);
+    if (!(uploaded && Array.isArray(uploaded.pids))) uploaded = { pids: [], via: 'picupload-origin', reason: 'throw', status: 0 };
   } catch {
     uploaded = { pids: [], via: 'picupload-origin', reason: 'throw', status: 0 };
-  } finally {
-    await tab.close().catch(() => {});
   }
   const desktop = await (async () => {
     if (!(uploaded && Array.isArray(uploaded.pids) && uploaded.pids.length === files.length)) {
@@ -1270,7 +1257,9 @@ async function publishComposerViaCookieApi(page, text, files, selfId) {
         body.set('visible', '0');
         body.set('pic_id', pids.join(','));
         const headers = { Accept: 'application/json, text/plain, */*', 'Content-Type': 'application/x-www-form-urlencoded', 'X-Requested-With': 'XMLHttpRequest' };
-        if (xsrf) { headers['X-Xsrf-Token'] = xsrf; headers['X-XSRF-TOKEN'] = xsrf; }
+        // One header only: duplicate case-variants get merged into "token, token"
+        // by fetch, and weibo answers 403 "invalid csrf token".
+        if (xsrf) headers['x-xsrf-token'] = xsrf;
         const updated = await fetch('https://weibo.com/ajax/statuses/update', { method: 'POST', credentials: 'include', headers, body: body.toString() });
         const status = updated.status;
         const parsed = parseJson(await updated.text());
@@ -1349,10 +1338,12 @@ async function publishComposerViaCookieApi(page, text, files, selfId) {
       if (status >= 200 && status < 300 && !rejected && !parsed) return { published: false, attempted: true, via: 'm', pids, status, reason: 'opaque' };
       return { published: false, attempted: false, via: 'm', pids, status, reason: rejected ? 'rejected' : 'http' };
     }, payload);
-    if (fromMobile && typeof fromMobile === 'object') return fromMobile;
-    return { published: false, attempted: false, via: 'm' };
+    // Keep the desktop diagnostics (upload reason / ajax status) unless the
+    // mobile branch made real progress; a dead m.weibo.cn session says nothing.
+    if (fromMobile && typeof fromMobile === 'object' && (fromMobile.published === true || fromMobile.attempted === true || fromMobile.status)) return fromMobile;
+    return desktop;
   } catch {
-    return { published: false, attempted: false, via: 'm' };
+    return desktop;
   } finally {
     await mobile.close().catch(() => {});
   }
