@@ -1058,7 +1058,7 @@ function validateCaseCatalog(): void {
     }
     const officialAgents = {
       "research-assistant": { name: "科研助手", model: "deepseek-v4-flash" },
-      "coding-assistant": { name: "编程助手", model: "glm-5.3" },
+      "coding-assistant": { name: "编程助手", model: "glm-5.3-zai" },
       "office-assistant": { name: "办公助手", model: "MiniMax-M3" },
     } as const;
     const officialAgent = officialAgents[item.suggestion.agentId];

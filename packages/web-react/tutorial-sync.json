@@ -210,24 +210,24 @@
   },
   "cases": {
     "coding-dependency-upgrade": {
-      "contentHash": "89d07497f122b2c608b650279f362e402eddc2a18ad94eaf1d71d2fe27f63706",
-      "contentVersion": 2
+      "contentHash": "c88d93141b7eb4491c14f49bbbcd7152848dbe66f5a9b49bb8e103fe639a7bca",
+      "contentVersion": 3
     },
     "coding-feature-delivery": {
-      "contentHash": "311a0b9265b08c79e1c84e1c02fe7b42943cb5c896a21e0a8bbe08153bf7912e",
-      "contentVersion": 2
+      "contentHash": "2e7121fcbc053421da41ecf9ff409afec8ee04829ddf72690961ff81354ca701",
+      "contentVersion": 3
     },
     "coding-frontend-quality": {
-      "contentHash": "9338ae726f4f6e39671bedd4569a33e2f7ab2ea2f2ebd47104cf8c4d25b9cad8",
-      "contentVersion": 2
+      "contentHash": "d17bafcee5f32a3a9fd3e987158a99832f50a60501e3235b4de80047e069d8d7",
+      "contentVersion": 3
     },
     "coding-regression-rescue": {
-      "contentHash": "6bf88c740281de6e715fd43a15c04f3b199038a40f9f47de4db71a28ae0807e8",
-      "contentVersion": 3
+      "contentHash": "7bfc55afc31304d6e7820f6e1223e8114882eb2add322782b89ad648f2ddabaa",
+      "contentVersion": 4
     },
     "coding-swe-bench-fix": {
-      "contentHash": "5e410d5768a19a652c311dc9c88bf2eb639ae39c82804921f8038e8c8ebc8423",
-      "contentVersion": 3
+      "contentHash": "fd0e61375fc8f4b822a60dcc3a034c1c0c71012fff8340e81b8cce836bd20c55",
+      "contentVersion": 4
     },
     "general-meeting-actions": {
       "contentHash": "17b0e2955d5feb43491db7c36e5939bf84c3332aa8fb4cb5ef2d5bd5f8ace23f",
