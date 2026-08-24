@@ -1,6 +1,14 @@
 import { constants, accessSync, existsSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 
+import { createLogger } from './logger.js'
+
+const log = createLogger({ module: 'mcpMemoryEntry' })
+
+/** One warning per process: the tsx fallback is expected only in dev trees
+ * that never built dist/; on a release it means the build hook regressed. */
+let warnedTsxFallback = false
+
 /**
  * Resolve the bundled `openclaude-memory` MCP entry without importing a
  * runner. Keeping this helper runner-neutral prevents Cursor/Codex adapters
@@ -83,6 +91,13 @@ export function resolveMcpMemoryLaunch(
   }
   const entry = resolveMcpMemoryEntry(claudeCodePath)
   if (!entry) return null
+  if (!warnedTsxFallback) {
+    warnedTsxFallback = true
+    log.warn('openclaude-memory MCP bundle missing — falling back to tsx (~7s cold start)', {
+      fallback: opts.fallback,
+      entry,
+    })
+  }
   if (opts.fallback === 'npx-tsx') {
     return { command: 'npx', args: ['tsx', entry], entry, bundled: false }
   }

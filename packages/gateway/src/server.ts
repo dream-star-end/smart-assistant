@@ -15323,19 +15323,20 @@ export class Gateway {
       const aid = row.agentId || 'main'
       if (isHiddenSystemAgentId(aid)) return
       const sessionKey = `agent:${aid}:webchat:dm:${sessId}`
+      const cfg = await this._getAgentsConfig()
+      const agent = cfg.agents.find((a) => a.id === aid) ?? ({ id: aid } as AgentDef)
+      // 模型权威:预热带上会话持久化的 modelId(权威行),避免首条消息因
+      // model 不一致触发 shutdown-respawn 白烧一次冷启动;投影拒绝/不可用 →
+      // 抛 → 外层 catch 跳过预热(fail-closed,不回落 baked)。**已存在但
+      // 冷置的 session 同样必须过这道投影**——授权已撤销时不得为它拉起进程。
+      const preExec = await resolveLocalExecutionIfEnforced({
+        agent,
+        kind: 'prewarm',
+        ...(row.modelId ? { model: row.modelId } : {}),
+        defaultModel: this.deps.config.defaults.model,
+      })
       let session = this.sessions.getByKey(sessionKey)
       if (!session) {
-        const cfg = await this._getAgentsConfig()
-        const agent = cfg.agents.find((a) => a.id === aid) ?? ({ id: aid } as AgentDef)
-        // 模型权威:预热带上会话持久化的 modelId(权威行),避免首条消息因
-        // model 不一致触发 shutdown-respawn 白烧一次冷启动;投影拒绝/不可用 →
-        // 抛 → 外层 catch 跳过预热(fail-closed,不回落 baked)。
-        const preExec = await resolveLocalExecutionIfEnforced({
-          agent,
-          kind: 'prewarm',
-          ...(row.modelId ? { model: row.modelId } : {}),
-          defaultModel: this.deps.config.defaults.model,
-        })
         const override = localExecutionOverride(preExec)
         session = await this.sessions.getOrCreate({
           sessionKey,

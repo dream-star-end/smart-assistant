@@ -3612,12 +3612,24 @@ export class SessionManager {
    * 日志兜底。串行化在 session.lock 上;与几乎同时到达的 submit 共享 runner 的
    * in-flight start promise,不会互抛。
    */
+  /** Prompt-queue in-flight for this session: a queued-but-not-yet-granted
+   * turn owns the spawn/side-effect boundary — preheat must not preempt it. */
+  private _promptQueueHolds(session: AgentSession): boolean {
+    return (
+      this._promptQueueExecutions.has(session) ||
+      this._promptQueueExecutionKeys.has(session.sessionKey) ||
+      this._promptQueueDispatchFences.has(session.sessionKey)
+    )
+  }
+
   async preheatRunner(session: AgentSession): Promise<PreheatOutcome> {
     if (session._plannedTeardown || session._replacing) return 'skipped_teardown'
     const runner = session.runner
     if (typeof runner.preheat !== 'function') return 'skipped_engine'
     if (runner.isRunning) return 'already_running'
-    if ((session._activeTurnCount ?? 0) > 0) return 'skipped_busy'
+    if ((session._activeTurnCount ?? 0) > 0 || this._promptQueueHolds(session)) {
+      return 'skipped_busy'
+    }
     const existing = this._preheatInFlight.get(session.sessionKey)
     if (existing) return existing
     if (this._preheatActive >= 1) return 'skipped_cap'
@@ -3634,7 +3646,9 @@ export class SessionManager {
         // Re-check under the lock: a turn/teardown may have landed meanwhile.
         if (session._plannedTeardown || session._replacing) return 'skipped_teardown'
         if (session.runner.isRunning) return 'already_running'
-        if ((session._activeTurnCount ?? 0) > 0) return 'skipped_busy'
+        if ((session._activeTurnCount ?? 0) > 0 || this._promptQueueHolds(session)) {
+          return 'skipped_busy'
+        }
         await session.runner.preheat!()
         session.lastUsedAt = Date.now()
         log.info('engine_preheat', {

@@ -1988,8 +1988,14 @@ export class CodexAppServerRunner extends EventEmitter {
   ): Promise<void> {
     if (this.proc && !this.proc.killed && this.initialized) return
     if (this.proc && !this.proc.killed && !this.initialized) {
-      // Spawn happened but initialize is in flight — caller will await.
-      return
+      // In-flight initialize is fully covered by the shared _spawnPromise, so
+      // reaching here means a previous initialize FAILED and left a live but
+      // never-initialized proc. It would poison every later ensureSpawned
+      // (this branch used to return "success"); tear it down and respawn.
+      log.warn('codex app-server alive but uninitialized — replacing process', {
+        sessionKey: this.opts.sessionKey,
+      })
+      await this.shutdown()
     }
     // Clear any partial-line residue from a prior proc (Codex review
     // #019dde20 BLOCKER round 3): stdoutBuf is runner-scoped, so without
@@ -2238,7 +2244,19 @@ export class CodexAppServerRunner extends EventEmitter {
     // are gated behind Codex's experimental API capability, so declare it
     // before any turn/start call. We call the proc fresh-spawned so writes
     // won't EPIPE.
-    await this.sendRequest('initialize', this.buildInitializeParams())
+    try {
+      await this.sendRequest('initialize', this.buildInitializeParams())
+    } catch (err) {
+      // A live but never-initialized app-server must not survive: later
+      // ensureSpawned calls would see proc-alive and (historically) skip the
+      // handshake. Tear it down before rethrowing so the next call respawns.
+      try {
+        await this.shutdown()
+      } catch {
+        /* teardown is best-effort on a failed handshake */
+      }
+      throw err
+    }
     this.initialized = true
   }
 

@@ -3855,7 +3855,7 @@ describe("preheatRunner", () => {
     assert.equal(runner.startCalls, 0);
   });
 
-  test("planned teardown / 活跃 turn → skip 且不 start", async () => {
+  test("planned teardown / 活跃 turn / prompt-queue in-flight → skip 且不 start", async () => {
     const sm = new SessionManager(makeConfigStub());
     const runner = new FakeCcbRunner(() => {});
     runner.isRunning = false;
@@ -3863,6 +3863,11 @@ describe("preheatRunner", () => {
     assert.equal(await sm.preheatRunner(tearing), "skipped_teardown");
     const busy = makeSession(runner, { _activeTurnCount: 1 } as never);
     assert.equal(await sm.preheatRunner(busy), "skipped_busy");
+    const queued = makeSession(runner);
+    (sm as unknown as { _promptQueueExecutionKeys: Set<string> })._promptQueueExecutionKeys.add(
+      queued.sessionKey,
+    );
+    assert.equal(await sm.preheatRunner(queued), "skipped_busy");
     assert.equal(runner.startCalls, 0);
   });
 
