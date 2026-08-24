@@ -7143,12 +7143,17 @@ async function backfillEmptyVisibleHeadFromPrepared(
     ...(current?.truncated || clipped.truncated ? { truncated: true } : {}),
     partial: true,
   };
+  // read-then-write 竞态守卫:SELECT 后并发 Phase A 可能已写入(空文本 +)errorCode,
+  // 本次 UPDATE 携带的是 SELECT 快照里的 errorCode,盲写会把并发写入的 errorCode 冲掉。
+  // WHERE 再校验 errorCode 未变;变了就放弃 backfill(该头已有更权威的写者)。
+  const snapshotErrorCode = typeof current?.errorCode === "string" ? current.errorCode : "";
   await pool.query(
     `UPDATE client_session_turn_tapes
         SET visible_head=$4::jsonb
       WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
-        AND COALESCE(visible_head->>'text', '') = ''`,
-    [request.sessionId, userId, request.tapeId, JSON.stringify(next)],
+        AND COALESCE(visible_head->>'text', '') = ''
+        AND COALESCE(visible_head->>'errorCode', '') = $5`,
+    [request.sessionId, userId, request.tapeId, JSON.stringify(next), snapshotErrorCode],
   );
 }
 
