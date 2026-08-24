@@ -173,6 +173,11 @@ export function runHost(args: string[], stdin: string, timeoutMs = 120_000): Pro
     }, timeoutMs)
     child.stdout.on('data', (c) => out.push(c as Buffer))
     child.stderr.on('data', (c) => err.push(c as Buffer))
+    child.stdin.on('error', (e: NodeJS.ErrnoException) => {
+      if (e.code === 'EPIPE' || e.code === 'ERR_STREAM_DESTROYED') return
+      clearTimeout(t)
+      reject(e)
+    })
     child.on('error', (e) => {
       clearTimeout(t)
       reject(e)
@@ -187,7 +192,7 @@ export function runHost(args: string[], stdin: string, timeoutMs = 120_000): Pro
       }
       resolve(stdout)
     })
-    child.stdin.end(stdin)
+    child.stdin.end(stdin ?? '')
   })
 }
 

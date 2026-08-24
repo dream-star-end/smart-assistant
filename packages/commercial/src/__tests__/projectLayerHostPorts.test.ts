@@ -110,6 +110,8 @@ describe('resolveLiveReadScript', () => {
     assert.match(src, /existing && existing.boardProjectId === boardProjectId/)
     assert.match(src, /ProjectMemoryLedger/)
     assert.match(src, /memory-candidates/)
+    assert.match(src, /bind_chat_id_is_board/)
+    assert.match(src, /EPIPE/)
   })
 })
 
