@@ -4,8 +4,8 @@
  *
  * Listed backup, not implemented: login cookies + picupload.weibo.com +
  * /ajax/statuses/update. That path needs an origin allowlist and a product-contract
- * change. Current media path stays DOM-only: arm filechooser, then click, then
- * setFiles before any other locator work while a native dialog may be open.
+ * change. Current media path stays DOM-only: arm filechooser, click in parallel,
+ * and setFiles inside the filechooser callback before any other Playwright work.
  */
 export const WEIBO_WORKER_SOURCE = String.raw`
 import { createHash } from 'node:crypto';
@@ -1380,21 +1380,34 @@ async function awaitComposerMediaReady(page, editor, expectedNew, timeout, befor
 function nodeDelay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
-async function armFileChooser(page, clickable) {
+async function armFileChooser(page, clickable, files) {
   if (!page || typeof page.waitForEvent !== 'function' || !clickable || typeof clickable.click !== 'function') {
-    return { chooser: null, timedOut: false };
+    return { chooser: null, timedOut: false, attached: false, attachFailed: false };
   }
-  const chooserPromise = page.waitForEvent('filechooser', { timeout: 5_000 }).catch(() => null);
+  let attached = false;
+  let attachFailed = false;
+  const chooserPromise = page.waitForEvent('filechooser', { timeout: 5_000 }).then(async (chooser) => {
+    if (chooser && Array.isArray(files) && files.length > 0 && typeof chooser.setFiles === 'function') {
+      try {
+        await chooser.setFiles(files);
+        attached = true;
+      } catch {
+        attachFailed = true;
+      }
+    }
+    return chooser || null;
+  }).catch(() => null);
   const clickPromise = clickable.click({ timeout: 5_000, force: true }).catch(() => null);
   let timer = null;
   const timeoutPromise = new Promise((resolve) => {
-    timer = setTimeout(() => resolve({ chooser: null, timedOut: true }), 8_000);
+    timer = setTimeout(() => resolve('__timeout__'), 8_000);
   });
   try {
-    return await Promise.race([
-      Promise.all([chooserPromise, clickPromise]).then(([chooser]) => ({ chooser: chooser || null, timedOut: false })),
-      timeoutPromise,
-    ]);
+    const raced = await Promise.race([chooserPromise, timeoutPromise]);
+    if (raced === '__timeout__') return { chooser: null, timedOut: true, attached: false, attachFailed: false };
+    if (raced) return { chooser: raced, timedOut: false, attached, attachFailed };
+    await Promise.race([clickPromise, timeoutPromise]);
+    return { chooser: null, timedOut: false, attached: false, attachFailed: false };
   } finally {
     if (timer) clearTimeout(timer);
   }
@@ -1550,7 +1563,7 @@ async function imageToolControl(scope, page, scopedInput) {
   if (fromInput) return fromInput;
   return await exactMenuItem(page, '图片') || await uniqueExactText(page, '图片');
 }
-async function preparePostImageChooser(page, editor) {
+async function preparePostImageChooser(page, editor, files) {
   const scope = (await composerScope(editor)) || page;
   const scopedInput = await uniqueImageFileInput(scope);
   const image = await imageToolControl(scope, page, scopedInput);
@@ -1577,38 +1590,37 @@ async function preparePostImageChooser(page, editor) {
       mediaCount: beforePage.image,
     });
   };
+  const finishArmed = (branch, armed) => {
+    emitChooser(branch);
+    if (armed.attachFailed) throw new Error('media-upload');
+    return { chooser: armed.chooser, attached: !!armed.attached };
+  };
   if (image) {
-    const armed = await armFileChooser(page, image);
+    const armed = await armFileChooser(page, image, files);
     if (armed.timedOut) {
       emitChooser('timeout');
       throw new Error('media-chooser');
     }
-    if (armed.chooser) {
-      emitChooser('native');
-      return armed.chooser;
-    }
+    if (armed.chooser) return finishArmed('native', armed);
     const local = await exactMenuItem(scope, '本地上传') || await exactMenuItem(page, '本地上传')
       || await exactMenuItem(scope, '相册') || await exactMenuItem(page, '相册');
     if (local) {
-      const localArmed = await armFileChooser(page, local);
+      const localArmed = await armFileChooser(page, local, files);
       if (localArmed.timedOut) {
         emitChooser('timeout');
         throw new Error('media-chooser');
       }
-      if (localArmed.chooser) {
-        emitChooser('local');
-        return localArmed.chooser;
-      }
+      if (localArmed.chooser) return finishArmed('local', localArmed);
     }
     const appeared = await uniqueImageFileInput(scope);
     if (appeared) {
       emitChooser('appeared');
-      return wrapFileInput(appeared);
+      return { chooser: wrapFileInput(appeared), attached: false };
     }
   }
   if (scopedInput) {
     emitChooser('existing');
-    return wrapFileInput(scopedInput);
+    return { chooser: wrapFileInput(scopedInput), attached: false };
   }
   emitChooser('miss');
   throw new Error('media-chooser');
@@ -1736,31 +1748,38 @@ async function writeAction(page, input) {
     const manifest = Array.isArray(params.mediaManifest) ? params.mediaManifest : [];
     await assertNoChallenge(page);
     let imageChooser = null;
+    let previewBefore = [];
+    let previewBeforeCount = 0;
+    let previewBeforeDelete = false;
     if (manifest.length === 0) {
       await awaitPostSendReady(page, 30_000, editor);
     } else if (!(await provePostImageControl(page, editor))) {
       throw new Error('media-chooser');
+    } else {
+      const previewScope = (await composerScope(editor)) || page;
+      previewBefore = await collectVisibleImageSrcs(previewScope);
+      previewBeforeCount = await countVisibleImgs(previewScope);
+      previewBeforeDelete = !!(await exactMenuItem(previewScope, '删除'));
     }
     await awaitDispatch();
     await assertNoChallenge(page);
     const freshEditor = await postComposerEditor(page, longText);
     if (!freshEditor || (await readPostComposer(freshEditor)) !== expectedText) throw new Error('composer-readback');
     if (manifest.length) {
-      const previewScope = (await composerScope(freshEditor)) || page;
-      const previewBefore = await collectVisibleImageSrcs(previewScope);
-      const previewBeforeCount = await countVisibleImgs(previewScope);
-      const previewBeforeDelete = !!(await exactMenuItem(previewScope, '删除'));
       const files = [];
       try {
         for (const item of manifest) files.push({ name: item.filename, mimeType: item.mimeType, buffer: await readFile('/inputs/' + item.inputId) });
-        imageChooser = await preparePostImageChooser(page, freshEditor);
-        if (!imageChooser) throw new Error('media-chooser');
+        const prepared = await preparePostImageChooser(page, freshEditor, files);
+        if (!prepared || !prepared.chooser) throw new Error('media-chooser');
+        imageChooser = prepared.chooser;
         let selected = 0;
-        try {
-          await imageChooser.setFiles(files);
-        } catch {
-          emitStep({ step: 'media.upload', selected: 0, retried: false, freshSelected: -1, mediaCount: manifest.length });
-          throw new Error('media-upload');
+        if (!prepared.attached) {
+          try {
+            await imageChooser.setFiles(files);
+          } catch {
+            emitStep({ step: 'media.upload', selected: 0, retried: false, freshSelected: -1, mediaCount: manifest.length });
+            throw new Error('media-upload');
+          }
         }
         try {
           if (typeof imageChooser.element === 'function') {

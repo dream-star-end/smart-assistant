@@ -197,7 +197,7 @@ describe('official Weibo Plugin', () => {
   })
 
   test('pins the current artifact and only the exact production predecessor', () => {
-    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.28')
+    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.29')
     assert.equal(WEIBO_DRIVER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.equal(WEIBO_LAUNCHER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.deepEqual(WEIBO_SETUP_COMPATIBLE_PREDECESSORS, [
@@ -439,25 +439,28 @@ describe('official Weibo Plugin', () => {
     assert.match(createPostSource, /expectedText.length > 2000/)
     assert.match(createPostSource, /openLongTextComposer/)
     assert.match(createPostSource, /provePostImageControl\(page, editor\)/)
-    assert.match(createPostSource, /preparePostImageChooser\(page, freshEditor\)/)
+    assert.match(createPostSource, /preparePostImageChooser\(page, freshEditor, files\)/)
     assert.ok(
       createPostSource.indexOf('provePostImageControl(page, editor)')
         < createPostSource.indexOf('await awaitDispatch()'),
     )
     assert.ok(
-      createPostSource.indexOf('await awaitDispatch()')
-        < createPostSource.indexOf('previewBeforeCount'),
+      createPostSource.indexOf('previewBeforeCount')
+        < createPostSource.indexOf('await awaitDispatch()'),
+      'preview baselines must be captured before dispatch and the native chooser click',
     )
     assert.ok(
       createPostSource.indexOf('previewBeforeCount')
-        < createPostSource.indexOf('preparePostImageChooser(page, freshEditor)'),
+        < createPostSource.indexOf('preparePostImageChooser(page, freshEditor, files)'),
       'preview baselines must be captured before the native chooser click',
     )
+    assert.match(WEIBO_WORKER_SOURCE, /chooser.setFiles\(files\)/)
+    assert.match(WEIBO_WORKER_SOURCE, /armFileChooser\(page, image, files\)/)
     assert.ok(
       createPostSource.indexOf('await awaitDispatch()')
-        < createPostSource.indexOf('preparePostImageChooser(page, freshEditor)'),
+        < createPostSource.indexOf('preparePostImageChooser(page, freshEditor, files)'),
     )
-    const chooserPrep = createPostSource.indexOf('preparePostImageChooser(page, freshEditor)')
+    const chooserPrep = createPostSource.indexOf('preparePostImageChooser(page, freshEditor, files)')
     const chooserSetFiles = createPostSource.indexOf('imageChooser.setFiles(files)')
     assert.ok(chooserPrep >= 0 && chooserSetFiles > chooserPrep)
     assert.equal(
@@ -487,7 +490,7 @@ describe('official Weibo Plugin', () => {
     assert.match(WEIBO_WORKER_SOURCE, /armFileChooser/)
     assert.match(WEIBO_WORKER_SOURCE, /timedOut/)
     assert.match(WEIBO_WORKER_SOURCE, /clearTimeout\(timer\)/)
-    assert.match(WEIBO_WORKER_SOURCE, /emitChooser\('native'\)/)
+    assert.match(WEIBO_WORKER_SOURCE, /finishArmed\('native'/)
     assert.match(WEIBO_WORKER_SOURCE, /emitChooser\('existing'\)/)
     assert.match(WEIBO_WORKER_SOURCE, /if \(scopedInput\) \{\n    emitChooser\('existing'\)/)
     assert.doesNotMatch(WEIBO_WORKER_SOURCE, /picupload\.weibo\.com/)
@@ -1268,7 +1271,9 @@ describe('official Weibo Plugin', () => {
       /media/,
     )
     assert.ok(!events.includes('click'))
-    assert.deepEqual(events, ['dispatch', 'image-click', 'upload'])
+    assert.ok(events.indexOf('dispatch') < events.indexOf('image-click'))
+    assert.ok(events.indexOf('dispatch') < events.indexOf('upload'))
+    assert.ok(events.includes('image-click') && events.includes('upload'))
   })
 
   test('create_post ignores https avatar images when waiting for upload preview', async () => {
@@ -1320,7 +1325,9 @@ describe('official Weibo Plugin', () => {
       /media/,
     )
     assert.ok(!events.includes('click'))
-    assert.deepEqual(events, ['dispatch', 'image-click', 'upload'])
+    assert.ok(events.indexOf('dispatch') < events.indexOf('image-click'))
+    assert.ok(events.indexOf('dispatch') < events.indexOf('upload'))
+    assert.ok(events.includes('image-click') && events.includes('upload'))
   })
 
   test('create_post opens 本地上传 when 图片 does not raise a native chooser', async () => {
@@ -1461,13 +1468,11 @@ describe('official Weibo Plugin', () => {
     })
     assert.deepEqual(result, { post: { id: 'long-post', owned: true, text: longText } })
     assert.equal(filled, '')
-    assert.deepEqual(events, [
-      'long-text',
-      'dispatch',
-      'image-click',
-      'upload',
-      'click',
-    ])
+    assert.ok(events.indexOf('long-text') < events.indexOf('dispatch'))
+    assert.ok(events.indexOf('dispatch') < events.indexOf('image-click'))
+    assert.ok(events.indexOf('dispatch') < events.indexOf('upload'))
+    assert.ok(events.indexOf('upload') < events.indexOf('click'))
+    assert.ok(events.indexOf('image-click') < events.indexOf('click'))
   })
 
   test('create_post keeps long text plus images on the default composer when 长文 is absent', async () => {
@@ -1531,7 +1536,10 @@ describe('official Weibo Plugin', () => {
     )
     assert.deepEqual(result, { post: { id: 'plain-long', owned: true, text: longText } })
     assert.equal(filled, '')
-    assert.deepEqual(events, ['dispatch', 'image-click', 'upload', 'click'])
+    assert.ok(events.indexOf('dispatch') < events.indexOf('image-click'))
+    assert.ok(events.indexOf('dispatch') < events.indexOf('upload'))
+    assert.ok(events.indexOf('upload') < events.indexOf('click'))
+    assert.ok(events.indexOf('image-click') < events.indexOf('click'))
   })
 
   test('create_post never dispatches when the composer truncates long text', async () => {
@@ -1610,7 +1618,10 @@ describe('official Weibo Plugin', () => {
       ),
       /media/,
     )
-    assert.deepEqual(events, ['dispatch', 'image-click', 'upload'])
+    assert.ok(events.indexOf('dispatch') < events.indexOf('image-click'))
+    assert.ok(events.indexOf('dispatch') < events.indexOf('upload'))
+    assert.ok(events.includes('image-click') && events.includes('upload'))
+    assert.ok(!events.includes('send'))
   })
 
   test(
