@@ -1887,6 +1887,11 @@ export async function registerCommercial(
   // 2026-07-02 egress split:authz 加载器抽到 auth/userModelAuthz.ts 单一权威
   // (master 与 egress 两进程共用同一份规则),语义与原内联实现逐行等价。
   const loadUserModelAuthz = makeLoadUserModelAuthz();
+  // cron-origin-inject 的 bridge 晚绑定引用:handler 必须在内层 internal-proxy 作用域
+  // 创建(identityRepo 在那里),而 userChatBridge 要到 registerCommercial 尾部才初始化。
+  // 直接闭包引用 const userChatBridge 会在初始化窗口内 TDZ 抛错(b1d9e4fbb 同类问题);
+  // 用可空 ref:bridge 未就绪 → no_transport(503),容器侧按 retryable 下轮重试。
+  let cronOriginBridgeRef: UserChatBridgeHandler | null = null;
 
   if (
     !options.skipInternalProxy &&
@@ -2372,7 +2377,10 @@ export async function registerCommercial(
       });
       const cronOriginInjectHandler: CronOriginInjectHandler = makeCronOriginInjectHandler({
         identityRepo,
-        inject: (input) => userChatBridge.injectCronOriginTurn(input),
+        inject: (input) =>
+          cronOriginBridgeRef
+            ? cronOriginBridgeRef.injectCronOriginTurn(input)
+            : Promise.resolve({ kind: "no_transport" as const }),
       });
       // /internal/v3/inbox-post — 容器 onDeliver「离线送达兜底写站内信」。uid 由容器身份推导,
       // audience 硬编码 'user' 只给自己写;created_by = MIN active admin(同 onboarding 语义,
@@ -2562,7 +2570,7 @@ export async function registerCommercial(
         if (path === CRON_INDEX_PATH) {
           return cronIndexHandler(req, res, ctx);
         }
-        if (cronOriginInjectHandler && path === CRON_ORIGIN_INJECT_PATH) {
+        if (path === CRON_ORIGIN_INJECT_PATH) {
           return cronOriginInjectHandler(req, res, ctx);
         }
         if (path === INBOX_POST_PATH) {
@@ -5281,7 +5289,8 @@ export async function registerCommercial(
     appendCostCredits: appendCostCreditsForUser, // c:<uid> 前缀对齐 session 存储命名空间
   });
   // 把 proxy 的 forward-ref 指向真实 broadcastToUser —— 此刻以后,commit 成功
-  // 扣费事件会实时推到用户前端。
+  // 扣费事件会实时推到用户前端。cron-origin-inject 同理由此刻起可注入。
+  cronOriginBridgeRef = userChatBridge;
   bridgeBroadcastRef.current = (uid, payload) => {
     userChatBridge.broadcastToUser(uid, payload);
   };

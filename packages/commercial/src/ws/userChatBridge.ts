@@ -8761,8 +8761,16 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     ) {
       return { kind: "failed", reason: admit.kind };
     }
-    if (admit.kind === "deduplicated") return { kind: "injected" };
-    if (!("dispatch" in admit)) return { kind: "failed", reason: admit.kind };
+    if (
+      admit.kind === "deduplicated" ||
+      admit.kind === "already_owned" ||
+      admit.kind === "in_flight"
+    ) {
+      // 同 clientMessageId 的 dispatch 已存在(重放/重试):这轮 cron 注入已经
+      // 在原对话里了,幂等成功。绝不能掉进下面的 execute 分支重复执行同一 dispatch。
+      return { kind: "injected" };
+    }
+    // 穷尽:剩余唯一变体是 admitted(带 dispatch)。
     const d = admit.dispatch;
     const frame = {
       type: "inbound.message",
