@@ -66,16 +66,20 @@ describe('PROJECT.md CAS (B2 single authority)', () => {
     const { paths } = await import('../paths.js')
     const { buildRunSkillStore } = await import('../skillStore.js')
     const src = join(testHome, 'skill-src', 'proj-skill')
-    await mkdir(src, { recursive: true })
+    await mkdir(join(src, 'references'), { recursive: true })
+    await mkdir(join(src, 'scripts'), { recursive: true })
     await wf(
       join(src, 'SKILL.md'),
       '---\nname: proj-skill\ndescription: overlay\n---\nbody-v1\n',
       'utf8',
     )
+    await wf(join(src, 'references', 'note.md'), 'ref-ok\n', 'utf8')
+    await wf(join(src, 'scripts', 'run.sh'), 'echo ok\n', 'utf8')
     const ok = await commitProjectSkillOverlay(id, ['proj-skill'], 0, { sourceFor: () => src })
     assert.equal(ok.ok, true)
     if (!ok.ok) return
-    const liveMd = join(paths.projectSkillsDir(id), 'proj-skill', 'SKILL.md')
+    const liveDir = join(paths.projectSkillsDir(id), 'proj-skill')
+    const liveMd = join(liveDir, 'SKILL.md')
     const before = await (await import('node:fs/promises')).readFile(liveMd, 'utf8')
     const stale = await commitProjectSkillOverlay(id, ['proj-skill'], 0, { sourceFor: () => src })
     assert.equal(stale.ok, false)
@@ -85,18 +89,52 @@ describe('PROJECT.md CAS (B2 single authority)', () => {
     const loaded = await loadProjectContext(id)
     assert.equal(loaded.version, 1)
 
-    await wf(liveMd, '---\nname: proj-skill\ndescription: overlay\n---\ntampered\n', 'utf8')
-    const store = buildRunSkillStore({ agentId: 'main', projectId: id })
-    const list = await store.list()
-    assert.equal(list.some((s) => s.name === 'proj-skill'), false)
-    assert.equal(await store.view('proj-skill'), null)
+    const store0 = buildRunSkillStore({ agentId: 'main', projectId: id })
+    assert.ok((await store0.list()).some((s) => s.name === 'proj-skill'))
+    const viewed = await store0.view('proj-skill')
+    assert.ok(viewed && typeof viewed !== 'string')
+    const sub = await store0.view('proj-skill', 'references/note.md')
+    assert.equal(sub, 'ref-ok\n')
 
-    const unselect = await commitProjectSkillOverlay(id, [], loaded.version)
+    await wf(liveMd, '---\nname: proj-skill\ndescription: overlay\n---\ntampered\n', 'utf8')
+    const storeTamperMd = buildRunSkillStore({ agentId: 'main', projectId: id })
+    assert.equal((await storeTamperMd.list()).some((s) => s.name === 'proj-skill'), false)
+    assert.equal(await storeTamperMd.view('proj-skill'), null)
+    assert.equal(await storeTamperMd.view('proj-skill', 'references/note.md'), null)
+
+    await wf(liveMd, before, 'utf8')
+    await wf(join(liveDir, 'references', 'note.md'), 'tampered-ref\n', 'utf8')
+    const storeTamperRef = buildRunSkillStore({ agentId: 'main', projectId: id })
+    assert.equal(await storeTamperRef.view('proj-skill'), null)
+    assert.equal(await storeTamperRef.view('proj-skill', 'references/note.md'), null)
+
+    await wf(join(liveDir, 'references', 'note.md'), 'ref-ok\n', 'utf8')
+    await wf(join(liveDir, 'scripts', 'run.sh'), 'echo pwned\n', 'utf8')
+    const storeTamperScript = buildRunSkillStore({ agentId: 'main', projectId: id })
+    assert.equal(await storeTamperScript.view('proj-skill'), null)
+
+    await wf(join(liveDir, 'scripts', 'run.sh'), 'echo ok\n', 'utf8')
+    await wf(
+      paths.projectMeta(id),
+      JSON.stringify({
+        schemaVersion: 1,
+        version: 99,
+        skillOverlay: ['forged'],
+        contentManifest: { schemaVersion: 1, projectMdSha256: null, skills: [] },
+      }),
+    )
+    const storeMeta = buildRunSkillStore({ agentId: 'main', projectId: id })
+    assert.ok((await storeMeta.list()).some((s) => s.name === 'proj-skill'))
+
+    const afterForge = await loadProjectContext(id)
+    const unselect = await commitProjectSkillOverlay(id, [], afterForge.version)
     assert.equal(unselect.ok, true)
     const gone = await loadProjectContext(id)
     assert.deepEqual(gone.skillOverlay, [])
     const { existsSync } = await import('node:fs')
     assert.equal(existsSync(join(paths.projectSkillsDir(id), 'proj-skill')), false)
+    const storeGone = buildRunSkillStore({ agentId: 'main', projectId: id })
+    assert.equal((await storeGone.list()).some((s) => s.name === 'proj-skill'), false)
   })
 
   it('seed copies once then ignores later source', async () => {

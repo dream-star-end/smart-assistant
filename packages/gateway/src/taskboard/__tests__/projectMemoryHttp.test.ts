@@ -155,4 +155,20 @@ describe('project memory HTTP', () => {
     })
     db.close()
   })
+
+  it('agent bearer cannot write skill overlay ledger', async () => {
+    const db = freshDb()
+    await withServer({ db, actor: 'human' }, async (base) => {
+      const proj = await call(base, 'POST', '/api/board/projects', { key: 'SKL', name: 'skills' })
+      const projectId = (proj.body.project as { id: string }).id
+      await withServer({ db, actor: 'agent' }, async (agentBase) => {
+        const denied = await call(agentBase, 'PUT', `/api/board/projects/${projectId}/context`, {
+          expectedVersion: 0,
+          skillNames: ['proj-skill'],
+        })
+        assert.equal(denied.status, 403)
+      })
+    })
+    db.close()
+  })
 })

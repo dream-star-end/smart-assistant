@@ -15,7 +15,7 @@
 
 import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
-import { ensureProjectMemoryLedger, paths } from '@openclaude/storage'
+import { ensureProjectMemoryLedger, ensureProjectSkillLedger, paths } from '@openclaude/storage'
 import Database from 'better-sqlite3'
 import {
   TASKBOARD_DDL_V1,
@@ -80,6 +80,9 @@ export function migrate(db: TaskboardDb): void {
       db.exec('ALTER TABLE tb_ticket_run ADD COLUMN context_snapshot_id TEXT')
       db.exec('ALTER TABLE tb_ticket_run ADD COLUMN context_sha256 TEXT')
       db.exec('ALTER TABLE tb_ticket_run ADD COLUMN context_version INTEGER')
+    }
+    if (current < 8) {
+      ensureProjectSkillLedger(db)
     }
     db.pragma(`user_version = ${TASKBOARD_SCHEMA_VERSION}`)
     ensureSettingsRow(db)

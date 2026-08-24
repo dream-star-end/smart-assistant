@@ -13,10 +13,17 @@
 
 import { createHash, randomUUID } from 'node:crypto'
 import { chmodSync, existsSync, mkdirSync, realpathSync } from 'node:fs'
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname, isAbsolute, join, resolve, sep } from 'node:path'
 import { acquireFileLock } from './memoryShared.js'
 import { paths } from './paths.js'
+import type { SqlDb } from './projectMemoryLedger.js'
+import {
+  hashSkillTree,
+  openProjectSkillLedgerDb,
+  ProjectSkillLedger,
+  type SkillTreeFile,
+} from './projectSkillLedger.js'
 
 export const PROJECT_CONTEXT_FLAG = 'OC_PROJECT_CONTEXT'
 export const PROJECT_ID_ENV = 'OPENCLAUDE_PROJECT_ID'
@@ -427,7 +434,7 @@ export async function commitProjectSkillOverlay(
   boardProjectId: string,
   names: string[],
   expectedVersion: number,
-  opts: { sourceFor?: (name: string) => string } = {},
+  opts: { sourceFor?: (name: string) => string; db?: SqlDb; actor?: string } = {},
 ): Promise<ProjectContextWriteResult> {
   const parsed = parseBoardProjectId(boardProjectId)
   if (!('present' in parsed) || !parsed.present || !parsed.value) {
@@ -444,7 +451,13 @@ export async function commitProjectSkillOverlay(
   await rm(stagingRoot, { recursive: true, force: true })
   mkdirSync(stagingRoot, { recursive: true, mode: 0o700 })
 
-  const staged: Array<{ name: string; sha: string; stagingPath: string }> = []
+  const staged: Array<{
+    name: string
+    sha: string
+    stagingPath: string
+    files: SkillTreeFile[]
+    treeSha256: string
+  }> = []
   for (const name of unique) {
     const sourceDir = opts.sourceFor?.(name) ?? join(paths.sharedSkillsDir, name)
     if (!isAbsolute(sourceDir) || !existsSync(sourceDir)) {
@@ -458,6 +471,11 @@ export async function commitProjectSkillOverlay(
     } catch {
       /* overlay visible without sidecar */
     }
+    const hashed = hashSkillTree(stagingPath)
+    if (!hashed.ok) {
+      await rm(stagingRoot, { recursive: true, force: true })
+      return { ok: false, error: 'source_missing' }
+    }
     let skillMd: string
     try {
       skillMd = await readFile(join(stagingPath, 'SKILL.md'), 'utf8')
@@ -465,7 +483,13 @@ export async function commitProjectSkillOverlay(
       await rm(stagingRoot, { recursive: true, force: true })
       return { ok: false, error: 'source_missing' }
     }
-    staged.push({ name, sha: sha256Hex(skillMd), stagingPath })
+    staged.push({
+      name,
+      sha: sha256Hex(skillMd),
+      stagingPath,
+      files: hashed.files,
+      treeSha256: hashed.treeSha256,
+    })
   }
 
   return withProjectLock(id, async () => {
@@ -473,13 +497,26 @@ export async function commitProjectSkillOverlay(
     if (meta.version !== expectedVersion) {
       return { ok: false, error: 'version_conflict', current: meta.version }
     }
+    const ledgerDb = opts.db ?? openProjectSkillLedgerDb()
+    new ProjectSkillLedger(ledgerDb).replaceActive(
+      id,
+      staged.map((s) => ({ name: s.name, files: s.files, treeSha256: s.treeSha256 })),
+      opts.actor ?? 'user:default',
+    )
     const keep = new Set(unique)
     for (const s of staged) {
       const live = join(destRoot, s.name)
       await rm(live, { recursive: true, force: true })
       await rename(s.stagingPath, live)
     }
-    for (const old of meta.skillOverlay) {
+    let liveNames: string[] = []
+    try {
+      liveNames = await readdir(destRoot)
+    } catch {
+      liveNames = []
+    }
+    for (const old of liveNames) {
+      if (old.startsWith('.')) continue
       if (!keep.has(old)) {
         await rm(join(destRoot, old), { recursive: true, force: true })
       }

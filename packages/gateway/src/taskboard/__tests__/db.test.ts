@@ -70,7 +70,7 @@ describe('schema / migrate', () => {
   it('建表后 user_version=5,重复 migrate 不报错不改版本', () => {
     const { db } = freshDb()
     assert.equal(getSchemaVersion(db), TASKBOARD_SCHEMA_VERSION)
-    assert.equal(TASKBOARD_SCHEMA_VERSION, 7)
+    assert.equal(TASKBOARD_SCHEMA_VERSION, 8)
     migrate(db)
     migrate(db)
     assert.equal(getSchemaVersion(db), TASKBOARD_SCHEMA_VERSION)
@@ -94,6 +94,7 @@ describe('schema / migrate', () => {
       'tb_project_memory_candidate',
       'tb_project_memory_event',
       'tb_project_memory_official',
+      'tb_project_skill',
       'tb_settings',
       'tb_ticket',
       'tb_ticket_activity',
@@ -306,7 +307,7 @@ describe('schema / migrate', () => {
     raw.close()
 
     const db = openTaskboardDb(path)
-    assert.equal(getSchemaVersion(db), 7)
+    assert.equal(getSchemaVersion(db), TASKBOARD_SCHEMA_VERSION)
     const cols = db.prepare(`PRAGMA table_info(tb_ticket_run)`).all() as Array<{ name: string }>
     assert.ok(cols.some((c) => c.name === 'cost_imprecise'))
     assert.equal(
@@ -333,7 +334,7 @@ describe('schema / migrate', () => {
 
     migrate(db)
     migrate(db)
-    assert.equal(getSchemaVersion(db), 7)
+    assert.equal(getSchemaVersion(db), TASKBOARD_SCHEMA_VERSION)
     const projCols = db.prepare(`PRAGMA table_info(tb_project)`).all() as Array<{ name: string }>
     assert.ok(projCols.some((c) => c.name === 'workspace_json'))
     const memTables = db

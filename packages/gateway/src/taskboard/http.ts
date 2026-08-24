@@ -683,7 +683,7 @@ async function dispatch(
   if (projectContext) {
     const id = decodeURIComponent(projectContext[1])
     if (method === 'GET') return handleGetProjectContext(res, db, id)
-    if (method === 'PUT') return handlePutProjectContext(res, await readJsonBody(req), db, id)
+    if (method === 'PUT') return handlePutProjectContext(res, await readJsonBody(req), db, actor, id)
     return sendError(res, 405, 'method not allowed')
   }
 
@@ -1007,6 +1007,7 @@ async function handlePutProjectContext(
   res: ServerResponse,
   body: Record<string, unknown>,
   db: TaskboardDb,
+  actor: Actor,
   idOrKey: string,
 ): Promise<void> {
   const project = resolveProject(db, idOrKey)
@@ -1030,9 +1031,15 @@ async function handlePutProjectContext(
     return
   }
   if (Array.isArray(body.skillNames)) {
+    if (actor !== 'human') {
+      sendError(res, 403, 'human approval required', { code: 'human_required' })
+      return
+    }
     const names = body.skillNames.filter((n): n is string => typeof n === 'string')
     const written = await commitProjectSkillOverlay(project.id, names, expectedVersion, {
       sourceFor: (name) => `${paths.sharedSkillsDir}/${name}`,
+      db,
+      actor: 'user:default',
     })
     if (!written.ok) {
       sendError(res, written.error === 'version_conflict' ? 409 : 400, written.error, {

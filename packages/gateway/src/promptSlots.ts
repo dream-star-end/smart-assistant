@@ -40,10 +40,10 @@ import {
   buildAgentSkillStore,
   buildRunSkillStore,
   isProjectContextEnabled,
-  loadProjectContext,
-  officialManifestSha256,
+  loadFrozenProjectContext,
+  frozenProjectDigests,
   paths,
-  skillOverlayManifestSha256,
+  type FrozenProjectContext,
   readAgentsConfig,
   readUserProfile,
   scanMemoryContent,
@@ -255,6 +255,8 @@ export interface PromptSlotContext {
   projectAssets?: ProjectAsset[] | null
   /** Pre-resolved context. undefined = resolve; null = none. */
   projectContext?: ResolvedTurnProjectContext | null
+  /** Immutable snapshot. If set, PROJECT/SKILLS/PROJECT_MEMORY must not re-read. */
+  frozenProjectContext?: FrozenProjectContext | null
 }
 
 export interface PromptSlot {
@@ -483,6 +485,9 @@ export function buildProjectAssetsSection(assets: readonly ProjectAsset[]): stri
 
 export async function buildProjectSlot(ctx: PromptSlotContext): Promise<PromptSlot | null> {
   let raw = ctx.projectInstructions
+  if (raw === undefined && ctx.frozenProjectContext) {
+    raw = ctx.frozenProjectContext.instructions
+  }
   if (raw === undefined && ctx.projectContext) {
     raw = ctx.projectContext.instructions
   }
@@ -492,6 +497,9 @@ export async function buildProjectSlot(ctx: PromptSlotContext): Promise<PromptSl
   const instructionBody = raw ? sanitizeProjectInstructionText(raw).trim() : ''
 
   let assets: ProjectAsset[] | null | undefined = ctx.projectAssets
+  if (assets === undefined && ctx.frozenProjectContext) {
+    assets = ctx.frozenProjectContext.assets
+  }
   if (assets === undefined && ctx.projectContext) {
     assets = ctx.projectContext.assets
   }
@@ -651,11 +659,29 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
 }
 
 export async function buildSkillsSlot(ctx: PromptSlotContext): Promise<PromptSlot | null> {
-  const skillStore = buildPromptSkillStore(
-    ctx.agentId,
-    ctx.projectId ?? ctx.projectContext?.boardProjectId,
-  )
+  const frozenSkills = ctx.frozenProjectContext?.skills
+  const skillStore = frozenSkills
+    ? buildAgentSkillStore(ctx.agentId)
+    : buildPromptSkillStore(
+        ctx.agentId,
+        ctx.projectId ?? ctx.projectContext?.boardProjectId,
+      )
   let skillList = await skillStore.list()
+  if (frozenSkills) {
+    const overlay = new Set(frozenSkills.map((s) => s.name))
+    skillList = skillList.filter((s) => !overlay.has(s.name))
+    for (const s of frozenSkills) {
+      skillList.push({
+        name: s.name,
+        description: s.description,
+        path: paths.projectSkillsDir(ctx.frozenProjectContext!.boardProjectId) + '/' + s.name,
+        source: 'user',
+        layer: 'project',
+        writable: false,
+        agentIds: [ctx.agentId],
+      })
+    }
+  }
   // Skill-eval arm 控制:exclude 滤掉;draft 用草稿描述替换(内容 view 由 mcp 侧接管)。
   if (ctx.skillEvalExclude) skillList = skillList.filter((s) => s.name !== ctx.skillEvalExclude)
   if (ctx.skillEvalDraft) {
@@ -748,6 +774,15 @@ export async function buildMemorySlot(ctx: PromptSlotContext): Promise<PromptSlo
 
 export async function buildProjectMemorySlot(ctx: PromptSlotContext): Promise<PromptSlot | null> {
   if (!isProjectContextEnabled()) return null
+  if (ctx.frozenProjectContext) {
+    const index = ctx.frozenProjectContext.officialMemoryIndex
+    const header = `# PROJECT MEMORY（仅当前绑定项目；不得覆盖 USER / 平台规则）
+正式条目由人工晋升；磁盘上未经 ledger 核验的 memory/*.md 不会注入。
+动态事实必须 live 核验，不得把过期候选当事实。新沉淀请写候选（memory-candidates/），不要改正式文件。
+检索：\`oc-memory project-search "<query>"\`（不污染 core-search）。`
+    if (!index) return { name: 'PROJECT_MEMORY', content: header }
+    return { name: 'PROJECT_MEMORY', content: `${header}\n\n## 项目索引\n\n${index}` }
+  }
   const boardId =
     (ctx.projectContext?.bound && ctx.projectContext.boardProjectId) || ctx.projectId || null
   if (!boardId) return null
@@ -1404,7 +1439,25 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
     }
   }
 
-  const frozenProjectContext = await freezeProjectContextDigests(ctx, resolved)
+  let frozenProjectContext = ctx.frozenProjectContext
+  if (frozenProjectContext === undefined && resolved?.bound && resolved.boardProjectId) {
+    let db = null
+    try {
+      const { getTaskboardDb } = await import('./taskboard/db/index.js')
+      db = getTaskboardDb()
+    } catch {
+      db = null
+    }
+    frozenProjectContext = await loadFrozenProjectContext({
+      boardProjectId: resolved.boardProjectId,
+      assets: resolved.assets,
+      assetsRevision: resolved.assetsRevision,
+      db,
+    })
+  }
+  if (frozenProjectContext !== undefined) {
+    ctx = { ...ctx, frozenProjectContext }
+  }
 
   // 在 build 早期就触发 remote fetch,放到与其他静态 slot 计算并行 —— 不阻塞
   // SOUL/USER 之类的本地 I/O,fetch 5s timeout 同时 SOUL/USER 5ms 内就好了,
@@ -1541,33 +1594,13 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
       return base
     }),
   )
-  return { content, contentSha256: await sha256Hex(content), applied, frozenProjectContext }
-}
-
-async function freezeProjectContextDigests(
-  ctx: PromptSlotContext,
-  resolved: ResolvedTurnProjectContext | null | undefined,
-): Promise<FrozenProjectContextDigests | undefined> {
-  const boundId = resolved?.boardProjectId ?? ctx.projectId ?? null
-  if (!boundId) return undefined
-  try {
-    const snap = await loadProjectContext(boundId)
-    let officialMemoryManifestSha256: string | null = null
-    try {
-      const { getTaskboardDb } = await import('./taskboard/db/index.js')
-      const official = new ProjectMemoryLedger(getTaskboardDb()).listOfficial(boundId)
-      officialMemoryManifestSha256 = officialManifestSha256(official)
-    } catch {
-      officialMemoryManifestSha256 = snap.meta.promotion.manifestSha256 ?? null
-    }
-    return {
-      contextVersion: snap.version,
-      assetsRevision: Number(resolved?.assetsRevision) || 0,
-      projectMdSha256: snap.meta.contentManifest?.projectMdSha256 ?? snap.meta.instructionsSha256 ?? null,
-      skillManifestSha256: skillOverlayManifestSha256(snap.meta.contentManifest?.skills ?? []),
-      officialMemoryManifestSha256,
-    }
-  } catch {
-    return undefined
+  return {
+    content,
+    contentSha256: await sha256Hex(content),
+    applied,
+    frozenProjectContext:
+      frozenProjectContext && frozenProjectContext.bound
+        ? frozenProjectDigests(frozenProjectContext)
+        : undefined,
   }
 }

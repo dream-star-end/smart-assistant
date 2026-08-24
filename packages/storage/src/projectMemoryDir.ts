@@ -38,6 +38,21 @@ export function sha256Hex(s: string): string {
   return createHash('sha256').update(s, 'utf8').digest('hex')
 }
 
+/** Shared by createCandidate and migrate dry-run so filenames cannot drift. */
+export function planCandidateFileName(opts: {
+  slug: string
+  contentSha256: string
+  fileExists: (file: string) => boolean
+  existingMatchesHash?: (file: string) => boolean
+  fallbackId: string
+}): string {
+  const stem = opts.slug.replace(/\.md$/i, '').slice(0, 40)
+  const hashed = `${stem}--${opts.contentSha256.slice(0, 16)}.md`
+  if (!opts.fileExists(hashed)) return hashed
+  if (opts.existingMatchesHash?.(hashed)) return hashed
+  return `${stem}--${opts.fallbackId.replace(/-/g, '').slice(0, 16)}.md`
+}
+
 export function assertProjectMemoryFile(file: string): string {
   const base = basename(file)
   if (!MEMORY_FILE_RE.test(base) || base !== file) {

@@ -1,21 +1,29 @@
 /**
  * B3: existing session rebind/unbind/fingerprint rebuilds runner before next turn.
+ * OPENCLAUDE_HOME must be set before any SessionManager / storage import.
  * Run: npx tsx --test packages/gateway/src/__tests__/sessionProjectFingerprint.test.ts
  */
 import assert from 'node:assert/strict'
+import { existsSync, readdirSync } from 'node:fs'
 import { mkdtemp } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, test } from 'node:test'
 import type { AgentDef, OpenClaudeConfig } from '@openclaude/storage'
-import { SessionManager } from '../sessionManager.js'
-import '../engine/ccbAdapter.js'
-import '../engine/codexAdapter.js'
-import { writeProjectInstructions } from '@openclaude/storage'
 
 const home = await mkdtemp(path.join(tmpdir(), 'oc-sess-fp-'))
 process.env.OPENCLAUDE_HOME = home
 process.env.OC_PROJECT_CONTEXT = '1'
+
+const realProjects = path.join(homedir(), '.openclaude', 'projects')
+const realBefore = existsSync(realProjects)
+  ? new Set(readdirSync(realProjects))
+  : new Set<string>()
+
+const { SessionManager } = await import('../sessionManager.js')
+await import('../engine/ccbAdapter.js')
+await import('../engine/codexAdapter.js')
+const { writeProjectInstructions, paths } = await import('@openclaude/storage')
 
 function makeConfigStub(): OpenClaudeConfig {
   return {
@@ -27,7 +35,7 @@ function makeConfigStub(): OpenClaudeConfig {
   } as unknown as OpenClaudeConfig
 }
 
-function makeSm(): SessionManager {
+function makeSm() {
   const sm = new SessionManager(makeConfigStub())
   const ins = sm as unknown as { _saveResumeMap: () => void }
   ins._saveResumeMap = () => {}
@@ -40,6 +48,22 @@ const A = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
 const B = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
 
 describe('session project fingerprint rebuild', () => {
+  test('paths.home is the temp dir; real ~/.openclaude/projects is untouched', () => {
+    assert.equal(paths.home, home)
+    assert.ok(home.startsWith(tmpdir()) || home.includes('oc-sess-fp-'))
+    const realAfter = existsSync(realProjects)
+      ? new Set(readdirSync(realProjects))
+      : new Set<string>()
+    assert.equal(realAfter.has(A), realBefore.has(A))
+    assert.equal(realAfter.has(B), realBefore.has(B))
+    for (const id of realAfter) {
+      if (!realBefore.has(id)) {
+        assert.notEqual(id, A)
+        assert.notEqual(id, B)
+      }
+    }
+  })
+
   test('projectId A→B→null recycles runner; unchanged fingerprint reuses CCB and Codex', async () => {
     const sm = makeSm()
     await writeProjectInstructions(A, 'a-ins', 0)
@@ -120,5 +144,12 @@ describe('session project fingerprint rebuild', () => {
       model: 'gpt-5.6-sol',
     })
     assert.equal(againCodex.runner, firstCodex.runner)
+
+    const realAfter = existsSync(realProjects)
+      ? new Set(readdirSync(realProjects))
+      : new Set<string>()
+    assert.deepEqual([...realAfter].sort(), [...realBefore].sort())
+    assert.equal(existsSync(path.join(realProjects, A)), realBefore.has(A))
+    assert.equal(existsSync(path.join(home, 'projects', A)), true)
   })
 })

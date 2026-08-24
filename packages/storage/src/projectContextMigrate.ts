@@ -5,14 +5,14 @@
  * manifest hash and were never user-modified.
  */
 import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync } from 'node:fs'
 import { copyFile, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { dirname, join, relative, resolve } from 'node:path'
 import Database from 'better-sqlite3'
 import { MEMORY_FILE_RE, parseMemoryFrontmatter } from './memoryFrontmatter.js'
 import { BOARD_PROJECT_ID_RE } from './projectContext.js'
 import { ensureProjectMemoryLedger, ProjectMemoryLedger } from './projectMemoryLedger.js'
-import { sha256Hex } from './projectMemoryDir.js'
+import { planCandidateFileName, ProjectMemoryDir, sha256Hex } from './projectMemoryDir.js'
 
 export interface MigrationCopiedCandidate {
   projectId: string
@@ -181,20 +181,45 @@ export async function migrateProjectContext(
           .filter((w) => w.length >= 2)
           .some((w) => hay.includes(w.toLowerCase()))
         if (!hit) continue
-        copied.push({
-          projectId: project.id,
-          slug: file,
-          file,
-          hash: sha256Hex(raw.endsWith('\n') ? raw : `${raw}\n`),
-        })
+        const dir = new ProjectMemoryDir(project.id)
+        const prepared = dir.prepareCandidateBody(file, raw)
+        if (!prepared.ok) continue
         if (opts.mode === 'apply' && ledger) {
-          await ledger.createCandidate({
+          const created = await ledger.createCandidate({
             projectId: project.id,
             slug: file,
             content: raw,
             actor: 'system:migration',
             sourceAgent: 'main',
             idempotencyKey: `migrate:${project.id}:${file}`,
+          })
+          if (!created.ok) continue
+          copied.push({
+            projectId: project.id,
+            slug: file,
+            file: created.candidate.file,
+            hash: created.candidate.contentSha256,
+          })
+        } else {
+          const planned = planCandidateFileName({
+            slug: file,
+            contentSha256: prepared.sha256,
+            fileExists: (f) => dir.candidateFileExists(f),
+            existingMatchesHash: (f) => {
+              try {
+                const onDisk = readFileSync(dir.candidateFile(f), 'utf8')
+                return sha256Hex(onDisk.endsWith('\n') ? onDisk : `${onDisk}\n`) === prepared.sha256
+              } catch {
+                return false
+              }
+            },
+            fallbackId: prepared.sha256,
+          })
+          copied.push({
+            projectId: project.id,
+            slug: file,
+            file: planned,
+            hash: prepared.sha256,
           })
         }
       }

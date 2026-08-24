@@ -11,7 +11,7 @@
 import { randomUUID } from 'node:crypto'
 import { MEMORY_FILE_RE } from './memoryFrontmatter.js'
 import { BOARD_PROJECT_ID_RE, incrementProjectContextVersion } from './projectContext.js'
-import { ProjectMemoryDir, sha256Hex } from './projectMemoryDir.js'
+import { planCandidateFileName, ProjectMemoryDir, sha256Hex } from './projectMemoryDir.js'
 
 export const PROJECT_MEMORY_LEDGER_SCHEMA_VERSION = 1
 
@@ -334,12 +334,17 @@ export class ProjectMemoryLedger {
 
     const now = Date.now()
     const id = randomUUID()
-    const stem = slug.replace(/\.md$/i, '').slice(0, 40)
-    let file = `${stem}--${prepared.sha256.slice(0, 16)}.md`
-    if (dir.candidateFileExists(file)) {
-      const existing = await dir.readCandidate(file, prepared.sha256)
-      if (!existing) file = `${stem}--${id.replace(/-/g, '').slice(0, 16)}.md`
-    }
+    const hashedName = `${slug.replace(/\.md$/i, '').slice(0, 40)}--${prepared.sha256.slice(0, 16)}.md`
+    const existingMatch = dir.candidateFileExists(hashedName)
+      ? Boolean(await dir.readCandidate(hashedName, prepared.sha256))
+      : false
+    const file = planCandidateFileName({
+      slug,
+      contentSha256: prepared.sha256,
+      fileExists: (f) => dir.candidateFileExists(f),
+      existingMatchesHash: (f) => f === hashedName && existingMatch,
+      fallbackId: id,
+    })
     const written = await dir.writeCandidate(slug, input.content, {
       auto: input.auto,
       today: input.today,
