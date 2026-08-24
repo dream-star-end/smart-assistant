@@ -18,11 +18,12 @@
  * 流式：input 经 normalizeToolForDisplay/resolveToolInput 优先 inputJson、其次容错解析 partialJson —— Edit/Write
  * 的 diff/内容据此边流边渲；_completed 后切完整 inputJson。
  */
-import { Check, ChevronRight } from "lucide-react";
-import { useState } from "react";
+import { Check, ChevronRight, PanelRight } from "lucide-react";
+import { useCallback, useState } from "react";
 import { cn } from "../lib/utils";
 import { TokenUsageBadge, type DisplayTokenUsage } from "./chat/tokenUsage";
 import { ToolBody } from "./tool/bodies";
+import { ToolInspectOpenContext, useArtifactInspect } from "./tool/context";
 import {
   type ToolLike,
   normalizeToolForDisplay,
@@ -55,6 +56,15 @@ export function ToolCard({
   const meta = resolveToolMeta(name, input);
   const Icon = meta.icon;
   const summary = toolSummary(name, input);
+
+  // 产物详情列(Codex 式第三列):App 提供 open 才渲染入口;点击把本条 tool 消息
+  // 引用交给面板全文渲染。回调同时经 ToolInspectOpenContext 下发给体内截断点。
+  const inspect = useArtifactInspect();
+  const inspectOpen = inspect.open;
+  const openInspect = useCallback(() => {
+    inspectOpen?.({ kind: "tool", message });
+  }, [inspectOpen, message]);
+  const canInspect = !!inspectOpen;
 
   const completed = !!renderTool._completed;
   const outputText = typeof renderTool.output === "string" ? renderTool.output : "";
@@ -145,6 +155,30 @@ export function ToolCard({
               完成
             </Badge>
           )}
+          {canInspect && hasBody && (
+            // 表头本身是 <button>(展开/折叠),入口用 role=button 的 span 避免非法嵌套;
+            // stopPropagation 使「打开详情」不连带触发折叠切换。
+            <span
+              role="button"
+              tabIndex={0}
+              aria-label="在详情面板查看"
+              title="在详情面板查看"
+              onClick={(e) => {
+                e.stopPropagation();
+                openInspect();
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  openInspect();
+                }
+              }}
+              className="flex size-6 items-center justify-center rounded-md text-faint outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              <PanelRight size={14} />
+            </span>
+          )}
           {hasBody && (
             <ChevronRight
               size={15}
@@ -156,7 +190,9 @@ export function ToolCard({
       </button>
       {open && hasBody && (
         <div className="border-t border-border/80 bg-bg/35 px-3 py-2 [&>*:first-child]:mt-0">
-          <ToolBody name={name} input={input} tool={renderTool} />
+          <ToolInspectOpenContext.Provider value={canInspect ? openInspect : null}>
+            <ToolBody name={name} input={input} tool={renderTool} />
+          </ToolInspectOpenContext.Provider>
         </div>
       )}
     </div>
