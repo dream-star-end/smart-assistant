@@ -69,6 +69,10 @@ export function migrate(db: TaskboardDb): void {
       // v4:补价因缺 agent 倍率字段而 fail-closed 时标不精确。可空 = 旧行未知。
       db.exec('ALTER TABLE tb_ticket_run ADD COLUMN cost_imprecise INTEGER')
     }
+    if (current < 5) {
+      db.exec('ALTER TABLE tb_project ADD COLUMN workspace_json TEXT')
+      db.exec('ALTER TABLE tb_project ADD COLUMN context_version INTEGER NOT NULL DEFAULT 0')
+    }
     db.pragma(`user_version = ${TASKBOARD_SCHEMA_VERSION}`)
     ensureSettingsRow(db)
   })

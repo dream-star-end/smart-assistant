@@ -243,6 +243,7 @@ function codexMcpToolTimeoutSec(env: NodeJS.ProcessEnv = process.env): number {
 
 export interface CodexLaunchOverridesContext {
   agentId: string
+  projectId?: string
   /** Current gateway AgentSession key. Forwarded only to mcp-memory so
    *  delegate_task can stream progress back to the exact parent WebChat
    *  session without falling back to last-active routing. */
@@ -383,6 +384,7 @@ export async function buildCodexLaunchOverrides(
     repoSnapshot: ctx.repoSnapshot ?? undefined,
     availableMcpTools,
     sessionId: ctx.sessionId,
+    projectId: ctx.projectId,
   })
   // preamble 从 platform bundle 取(商业版真热),env 未设(个人版)回落 CODEX_PREAMBLE 常量。
   const preamble = getPlatformPrompt('codex-preamble', CODEX_PREAMBLE)
@@ -453,6 +455,7 @@ export async function buildCodexLaunchOverrides(
     })}\n`
     const mcpEnv: Record<string, string> = {
       OPENCLAUDE_AGENT_ID: ctx.agentId,
+      ...(ctx.projectId ? { OPENCLAUDE_PROJECT_ID: ctx.projectId } : {}),
       OPENCLAUDE_HOME: ctx.openclaudeHome ?? process.env.OPENCLAUDE_HOME ?? '',
       ...(ctx.sessionKey ? { OPENCLAUDE_SESSION_KEY: ctx.sessionKey } : {}),
       OPENCLAUDE_GATEWAY_PORT: String(ctx.gatewayPort),

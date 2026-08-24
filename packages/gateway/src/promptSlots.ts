@@ -33,6 +33,8 @@ import {
   type SkillStore,
   MemoryDir,
   buildAgentSkillStore,
+  buildRunSkillStore,
+  isProjectContextEnabled,
   paths,
   readAgentsConfig,
   readUserProfile,
@@ -48,6 +50,10 @@ import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 import { listCollaboratorAgents } from './collaboratorAgents.js'
 import { isTextOnlyStaticVisionModel, shouldEnableOpenClaudeVision } from './mcpVisionServer.js'
 import { getPlatformPrompt } from './platformPrompts.js'
+import {
+  resolveTurnProjectContext,
+  type ResolvedTurnProjectContext,
+} from './projectContextRuntime.js'
 import { buildEnvSlot } from './envProbe.js'
 
 // ── 平台静态 prompt 文案的个人版 fallback 常量(见文件头「文案通道边界」)──
@@ -232,10 +238,14 @@ export interface PromptSlotContext {
   skillEvalDraft?: { name: string; dir: string }
   /** 当前 client session id;有则查找所属项目指令注入 PROJECT slot。 */
   sessionId?: string
+  /** tb_project.id when the run is a taskboard stage (no client session). */
+  projectId?: string
   /** 测试可直接注入,跳过存储查找。 */
   projectInstructions?: string | null
   /** 测试可直接注入 pinned 资产索引;undefined 时按 sessionId 查找。 */
   projectAssets?: ProjectAsset[] | null
+  /** Pre-resolved context. undefined = resolve; null = none. */
+  projectContext?: ResolvedTurnProjectContext | null
 }
 
 export interface PromptSlot {
@@ -320,9 +330,8 @@ function extractUserAlwaysBlock(text: string): string | null {
   return body.trim() || null
 }
 
-function buildPromptSkillStore(agentId: string): SkillStore {
-  // Overlay (single wiring in @openclaude/storage): baseline(ro) > agent-seed(ro)
-  // > shared(rw, all agents) > legacy(per-agent).
+function buildPromptSkillStore(agentId: string, projectId?: string | null): SkillStore {
+  if (projectId) return buildRunSkillStore({ agentId, projectId })
   return buildAgentSkillStore(agentId)
 }
 
@@ -465,12 +474,18 @@ export function buildProjectAssetsSection(assets: readonly ProjectAsset[]): stri
 
 export async function buildProjectSlot(ctx: PromptSlotContext): Promise<PromptSlot | null> {
   let raw = ctx.projectInstructions
+  if (raw === undefined && ctx.projectContext) {
+    raw = ctx.projectContext.instructions
+  }
   if (raw === undefined && ctx.sessionId) {
     raw = await lookupSessionProjectInstructions(ctx.sessionId)
   }
   const instructionBody = raw ? sanitizeProjectInstructionText(raw).trim() : ''
 
   let assets: ProjectAsset[] | null | undefined = ctx.projectAssets
+  if (assets === undefined && ctx.projectContext) {
+    assets = ctx.projectContext.assets
+  }
   if (assets === undefined && ctx.sessionId) {
     assets = await lookupSessionProjectAssets(ctx.sessionId)
   }
@@ -627,7 +642,10 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
 }
 
 export async function buildSkillsSlot(ctx: PromptSlotContext): Promise<PromptSlot | null> {
-  const skillStore = buildPromptSkillStore(ctx.agentId)
+  const skillStore = buildPromptSkillStore(
+    ctx.agentId,
+    ctx.projectId ?? ctx.projectContext?.boardProjectId,
+  )
   let skillList = await skillStore.list()
   // Skill-eval arm 控制:exclude 滤掉;draft 用草稿描述替换(内容 view 由 mcp 侧接管)。
   if (ctx.skillEvalExclude) skillList = skillList.filter((s) => s.name !== ctx.skillEvalExclude)
@@ -650,10 +668,10 @@ export async function buildSkillsSlot(ctx: PromptSlotContext): Promise<PromptSlo
   // priority 降序补位 —— 取代纯字母序截断(曾把 office 套件/web-context 等高频
   // 技能全部截出前 15,模型只能靠 skill_search 盲找)。同优先级内保持字母序稳定。
   const rank = (s: (typeof skillList)[number]) => s.priority ?? 0
+  const layerBoost = (s: (typeof skillList)[number]) => (s.layer === 'project' ? 2 : s.source !== 'platform' ? 1 : 0)
   const sorted = [...skillList].sort((a, b) => {
-    const userA = a.source !== 'platform' ? 1 : 0
-    const userB = b.source !== 'platform' ? 1 : 0
-    if (userA !== userB) return userB - userA
+    const boost = layerBoost(b) - layerBoost(a)
+    if (boost !== 0) return boost
     if (rank(a) !== rank(b)) return rank(b) - rank(a)
     return a.name.localeCompare(b.name)
   })
@@ -1322,6 +1340,20 @@ async function sha256Hex(s: string): Promise<string> {
  */
 export async function buildPromptContext(ctx: PromptSlotContext): Promise<PromptContextResult> {
   const slots: PromptSlot[] = []
+  let resolved = ctx.projectContext
+  if (resolved === undefined && isProjectContextEnabled()) {
+    resolved = await resolveTurnProjectContext({
+      sessionId: ctx.sessionId,
+      boardProjectId: ctx.projectId,
+    })
+  }
+  if (resolved !== undefined) {
+    ctx = {
+      ...ctx,
+      projectContext: resolved,
+      projectId: ctx.projectId ?? resolved?.boardProjectId ?? undefined,
+    }
+  }
 
   // 在 build 早期就触发 remote fetch,放到与其他静态 slot 计算并行 —— 不阻塞
   // SOUL/USER 之类的本地 I/O,fetch 5s timeout 同时 SOUL/USER 5ms 内就好了,

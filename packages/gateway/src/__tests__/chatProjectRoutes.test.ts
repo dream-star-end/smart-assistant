@@ -28,6 +28,8 @@ describe('chat-projects 网关接线', () => {
     assert.match(serverSrc, /createChatProject\(/)
     assert.match(serverSrc, /updateChatProject\(/)
     assert.match(serverSrc, /deleteChatProject\(/)
+    assert.match(serverSrc, /boardProjectId/)
+    assert.match(serverSrc, /board_project_bound/)
   })
 
   it('KNOWN_ROUTES 含 /api/chat-projects,normalizePath 收动态段', () => {

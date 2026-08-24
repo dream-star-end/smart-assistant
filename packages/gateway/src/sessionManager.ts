@@ -3039,6 +3039,9 @@ export class SessionManager {
     /** Database-authoritative default cwd policy injected by the commercial
      * master. Missing means legacy for prewarm/personal callers. */
     workspaceMode?: SessionWorkspaceMode
+    /** Explicit cwd for project workspace (taskboard / bound chat). */
+    workspaceCwd?: string
+    projectId?: string
     /**
      * 直接父会话键(仅 delegate 子会话传入,已由 handleDelegateTask 经 _resolveDelegateParent
      * 校验存在于内存 + channel 合法 + sourceAgent 匹配)。物化到 AgentSession.parentSessionKey,
@@ -3246,7 +3249,8 @@ export class SessionManager {
     // 显式 pin 的 agent cwd(如 repo session)优先,永不被 workspace 缺省覆盖;
     // 仅在没有显式 cwd 时用 OPENCLAUDE_DEFAULT_WORKSPACE(存在且是目录)/否则 process.cwd()。
     const repoSessionId = opts.repoSessionId ?? opts.peerId
-    const cwd = opts.agent.cwd ?? resolveDefaultWorkspaceCwd(workspaceMode, repoSessionId)
+    const cwd =
+      opts.workspaceCwd ?? opts.agent.cwd ?? resolveDefaultWorkspaceCwd(workspaceMode, repoSessionId)
     const persona = opts.hermeticNoTools
       ? undefined
       : opts.agent.persona ?? paths.agentClaudeMd(opts.agent.id)
@@ -3279,6 +3283,7 @@ export class SessionManager {
       // session id 作为 repo lookup key,但不改变 delegate 自己的 peerId。
       // getRepoSnapshot 由 Gateway 构造器注入。
       sessionId: repoSessionId,
+      projectId: opts.projectId,
       getRepoSnapshot: this._getRepoSnapshot,
       workload: opts.workload,
       skillTrainRunId: opts.skillTrainRunId,

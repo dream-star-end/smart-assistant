@@ -30,7 +30,7 @@ import type Database from 'better-sqlite3'
 export type TaskboardDb = Database.Database
 
 /** 当前 schema 版本。加列时递增,并在 migrate() 里补一段 < N 的 ALTER。 */
-export const TASKBOARD_SCHEMA_VERSION = 4
+export const TASKBOARD_SCHEMA_VERSION = 5
 
 /** 项目 key:大写字母开头,2–12 位 [A-Z0-9]。创建后冻结。 */
 export const PROJECT_KEY_RE = /^[A-Z][A-Z0-9]{1,11}$/

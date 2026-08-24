@@ -565,6 +565,8 @@ export interface SubprocessRunnerOpts {
    *  理论上 sessionKey 已经能推出 sessionId,但为避免重复解析串错,显式传。
    *  null/undefined → 不查 repo snapshot(Codex / 旧调用兼容)。 */
   sessionId?: string
+  /** Bound taskboard / chat project id for MCP skill overlay. */
+  projectId?: string
   /** Phase 5:读 SessionRepoWorkspaceManager 的 RepoSnapshot(单进程下即权威 state)。
    *  在 start() 内调用一次,用于:
    *    1) 决定 effective addDir(ready 时切到 workspaceDir,其它情况 fall-back agentBaseDir)
@@ -1697,6 +1699,7 @@ export class SubprocessRunner extends EventEmitter {
         skillEvalExclude: this.opts.skillEvalExclude,
         skillEvalDraft: this.opts.skillEvalDraft,
         sessionId: this.opts.sessionId,
+        projectId: this.opts.projectId,
       })
       const goalPrompt = renderCcbGoalPrompt(this.platformGoal)
       const mergedPrompt = [promptResult.content, goalPrompt].filter(Boolean).join('\n\n')
@@ -1770,6 +1773,7 @@ export class SubprocessRunner extends EventEmitter {
           args: ['tsx', mcpEntry],
           env: {
             OPENCLAUDE_AGENT_ID: this.opts.agentId,
+            ...(this.opts.projectId ? { OPENCLAUDE_PROJECT_ID: this.opts.projectId } : {}),
             // 2026-04-22: 只在 host 进程里确实 set 了 OPENCLAUDE_HOME 时才向下传 —— 空串
             // 会被 mcp-memory 的 paths.ts 当成"有值",与 `??` 语义冲突,让所有 memory/skill
             // 路径退化为相对 cwd 的路径,跨容器串。v3 容器由 entrypoint.ts 显式注入

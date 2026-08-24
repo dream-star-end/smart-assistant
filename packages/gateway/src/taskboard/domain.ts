@@ -151,6 +151,9 @@ export interface Project {
   description: string | null
   /** 关联代码路径 / 远程主机,可选。 */
   workspace: string | null
+  /** Structured cwd spec. Authority for agent cwd; never the projects/ data dir. */
+  workspaceSpec?: { kind: 'default' | 'isolated' | 'container_path'; path?: string } | null
+  contextVersion?: number
   labels: string[]
   archivedAt: number | null
   createdAt: number

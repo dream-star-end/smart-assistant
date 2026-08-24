@@ -145,6 +145,8 @@ export interface Project {
   name: string
   description: string | null
   workspace: string | null
+  workspaceSpec?: { kind: 'default' | 'isolated' | 'container_path'; path?: string } | null
+  contextVersion?: number
   labels: string[]
   archivedAt: number | null
   createdAt: number
@@ -410,6 +412,7 @@ export interface ProjectPatchInput {
   name?: string
   description?: string | null
   workspace?: string | null
+  workspaceSpec?: { kind: 'default' | 'isolated' | 'container_path'; path?: string } | null
   labels?: string[]
   archivedAt?: number | null
 }

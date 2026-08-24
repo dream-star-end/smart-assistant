@@ -28,6 +28,9 @@ export const PROMPT_PLACEHOLDERS = [
   'last_run.output',
   'comments',
   'stage.exit_checklist',
+  'project.key',
+  'project.name',
+  'project.workspace',
 ] as const
 
 export type PromptPlaceholder = (typeof PROMPT_PLACEHOLDERS)[number]
@@ -56,6 +59,9 @@ export interface PromptRenderInput {
   stage: Pick<PipelineStage, 'name' | 'exitChecklist'>
   lastRun?: (Pick<TicketRun, 'summary'> & Partial<Pick<TicketRun, 'outputMd'>>) | null
   comments?: readonly TicketComment[]
+  project?: { key?: string | null; name?: string | null; workspace?: string | null } | null
+  /** When PROJECT slot already carries instructions/assets, placeholders stay short. */
+  projectSlotInjected?: boolean
 }
 
 export interface PromptRenderResult {
@@ -153,6 +159,11 @@ export function renderPrompt(input: PromptRenderInput): PromptRenderResult {
     'last_run.output': formatLastRunOutput(input.lastRun?.outputMd),
     comments,
     'stage.exit_checklist': input.stage.exitChecklist ?? '（本阶段未配置 exit checklist）',
+    'project.key': input.project?.key ?? '',
+    'project.name': input.project?.name ?? '',
+    'project.workspace': input.projectSlotInjected
+      ? '（见系统 PROJECT 段 / 当前 cwd）'
+      : (input.project?.workspace ?? ''),
   }
 
   const unknown: string[] = []

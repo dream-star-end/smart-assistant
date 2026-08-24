@@ -1715,6 +1715,8 @@ interface RunDelegateInput {
   isReview?: boolean
   /** 覆盖默认 `agent:<id>:delegate:...`。taskboard 巡检必须传入 buildPatrolSessionKey()。 */
   sessionKey?: string
+  projectId?: string
+  workspaceCwd?: string
   /** 覆盖默认 channel 'delegate'。taskboard 传 'taskboard',且不得加入
    *  MASTER_SINK_PERSIST_CHANNELS,否则巡检文本会写进 client_sessions 刷屏。 */
   channel?: string
@@ -4401,7 +4403,13 @@ export class Gateway {
       const userId = this.getUserId(req)
       if (req.method === 'PATCH') {
         ;(async () => {
-          let data: { name?: unknown; instructions?: unknown; color?: unknown; sortOrder?: unknown }
+          let data: {
+            name?: unknown
+            instructions?: unknown
+            color?: unknown
+            sortOrder?: unknown
+            boardProjectId?: unknown
+          }
           try {
             data = JSON.parse(await this.readBody(req, 16 * 1024))
           } catch {
@@ -4412,8 +4420,9 @@ export class Gateway {
           const hasInstructions = data.instructions !== undefined
           const hasColor = data.color !== undefined
           const hasSort = data.sortOrder !== undefined
-          if (!hasName && !hasInstructions && !hasColor && !hasSort) {
-            this.sendJson(res, 400, { error: 'name, instructions, color or sortOrder required' })
+          const hasBoard = data.boardProjectId !== undefined
+          if (!hasName && !hasInstructions && !hasColor && !hasSort && !hasBoard) {
+            this.sendJson(res, 400, { error: 'name, instructions, color, sortOrder or boardProjectId required' })
             return
           }
           if (hasName && parseChatProjectName(data.name) === null) {
@@ -4442,6 +4451,10 @@ export class Gateway {
           if (!result.ok) {
             if (result.error === 'not_found') {
               this.sendJson(res, 404, { error: 'not found' })
+              return
+            }
+            if (result.error === 'board_project_bound') {
+              this.sendJson(res, 409, { error: 'board project already bound', code: 'board_project_bound' })
               return
             }
             this.sendJson(res, 400, { error: result.error.replace(/_/g, ' ') })
@@ -11377,6 +11390,8 @@ export class Gateway {
         peerId: sourceAgent || 'system',
         repoSessionId: progressTarget?.peerId ?? delegateParent?.repoSessionId,
         workspaceMode: delegateParent?.workspaceMode,
+        workspaceCwd: input.workspaceCwd,
+        projectId: input.projectId,
         // 物化直接父指针(已校验的父会话键),供本 delegate 的子委派沿父链向上追溯 webchat 祖先。
         parentSessionKey: delegateParent?.sessionKey,
         title: `[delegate] ${goal.slice(0, 40)}`,
@@ -11849,6 +11864,8 @@ export class Gateway {
       sessionKey: input.sessionKey,
       channel: 'taskboard',
       idleTimeoutMs: input.timeoutSec * 1_000,
+      projectId: input.projectId,
+      workspaceCwd: input.workspaceCwd,
     })
     if (result.kind === 'rejected') {
       return { ok: false, output: '', error: result.message }

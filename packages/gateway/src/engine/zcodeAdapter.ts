@@ -527,6 +527,7 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
         skillEvalExclude: this.opts.skillEvalExclude,
         skillEvalDraft: this.opts.skillEvalDraft,
         sessionId: typeof this.opts.sessionId === 'string' ? this.opts.sessionId : undefined,
+        projectId: this.opts.projectId,
       })
       return platform.content ? `${platform.content}\n\n${input}` : input
     } catch {

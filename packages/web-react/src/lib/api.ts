@@ -2159,7 +2159,13 @@ export const api = {
   patchChatProject: (
     a: AuthSession,
     id: string,
-    patch: { name?: string; instructions?: string | null; color?: string | null; sortOrder?: number },
+    patch: {
+      name?: string;
+      instructions?: string | null;
+      color?: string | null;
+      sortOrder?: number;
+      boardProjectId?: string | null;
+    },
   ): Promise<ChatProject> =>
     jsonOrThrow<{ project: ChatProject }>(
       callWithRefresh(a, (t) =>

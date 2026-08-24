@@ -40,6 +40,7 @@ import {
   SkillDraftStore,
   type SkillStore,
   buildAgentSkillStore,
+  buildRunSkillStore,
   isPlatformReservedSkillName,
   parseSkillEvalsJson,
   searchSkillMetadata,
@@ -109,9 +110,8 @@ const ASK_USER_MCP_ESCAPE = process.env.OC_ASK_USER_MCP === '1'
 const ASK_USER_ENABLED = ENGINE_ID === 'cursor'
 
 function buildSkillStore(): SkillStore {
-  // Overlay (single wiring in @openclaude/storage): platform baseline (ro env)
-  // > agent-seed (ro) > shared (rw, user-level/all-agents; single write source)
-  // > legacy per-agent. Degrades gracefully if a dir is invalid.
+  const projectId = (process.env.OPENCLAUDE_PROJECT_ID ?? '').trim()
+  if (projectId) return buildRunSkillStore({ agentId: AGENT_ID, projectId })
   return buildAgentSkillStore(AGENT_ID)
 }
 

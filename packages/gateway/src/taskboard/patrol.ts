@@ -28,7 +28,13 @@
 //   - tick 里的 timer 由 server.ts 持有并 unref/clearInterval;本文件不自己
 //     setInterval,以便测试进程能退出。
 
-import { getUsageSummary } from '@openclaude/storage'
+import {
+  getUsageSummary,
+  isProjectContextEnabled,
+  parseProjectWorkspace,
+  resolveProjectCwd,
+} from '@openclaude/storage'
+import { getProject } from './db/projects.js'
 import { createActivity } from './db/activity.js'
 import { createComment, listComments } from './db/comments.js'
 import type { TaskboardDb } from './db/index.js'
@@ -105,6 +111,8 @@ export interface PatrolDelegateInput {
   model?: string
   sessionKey: string
   timeoutSec: number
+  projectId?: string
+  workspaceCwd?: string
 }
 
 export interface PatrolDelegateResult {
@@ -560,6 +568,14 @@ export class PatrolEngine {
 
     const comments = listComments(db, ticket.id, { limit: 200, offset: 0 })
     const lastRun = latestSettledRun(db, ticket.id, run.id)
+    const boardProject = getProject(db, ticket.projectId)
+    const projectEnabled = isProjectContextEnabled()
+    let workspaceCwd: string | undefined
+    if (projectEnabled && boardProject) {
+      const spec = boardProject.workspaceSpec ?? parseProjectWorkspace(boardProject.workspace)
+      const cwd = resolveProjectCwd(spec, boardProject.id)
+      if (cwd.ok) workspaceCwd = cwd.cwd
+    }
     let prompt: string
     try {
       prompt = renderPrompt({
@@ -568,6 +584,10 @@ export class PatrolEngine {
         stage,
         lastRun,
         comments,
+        project: boardProject
+          ? { key: boardProject.key, name: boardProject.name, workspace: workspaceCwd ?? null }
+          : null,
+        projectSlotInjected: projectEnabled,
       }).prompt
     } catch (err) {
       await this.finishRun(db, ticket, stage, run, settings, {
@@ -605,6 +625,8 @@ export class PatrolEngine {
           model: stage.model ?? undefined,
           sessionKey,
           timeoutSec: stage.timeoutSec,
+          projectId: boardProject?.id,
+          workspaceCwd,
         })
       } catch (err) {
         result = {

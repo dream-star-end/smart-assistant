@@ -86,6 +86,7 @@ export interface GrokPlatformProjection {
 
 export interface GrokPlatformInput {
   agentId: string
+  projectId?: string
   sessionKey: string
   gatewayPort: number
   gatewayToken: string
@@ -137,6 +138,7 @@ export function projectGrokPlatform(input: GrokPlatformInput): GrokPlatformProje
     )
     const env: Record<string, string> = {
       OPENCLAUDE_AGENT_ID: input.agentId,
+      ...(input.projectId ? { OPENCLAUDE_PROJECT_ID: input.projectId } : {}),
       OPENCLAUDE_HOME: process.env.OPENCLAUDE_HOME?.trim() || paths.home,
       OPENCLAUDE_SESSION_KEY: input.sessionKey,
       OPENCLAUDE_GATEWAY_PORT: String(input.gatewayPort),

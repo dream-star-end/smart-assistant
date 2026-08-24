@@ -110,6 +110,7 @@ export type ChatProject = {
   createdAt: number;
   updatedAt: number;
   sessionCount: number;
+  boardProjectId?: string | null;
 };
 
 /**

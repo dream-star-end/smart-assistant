@@ -10,6 +10,14 @@
 // actor 判定见 `resolveTaskboardActor` —— 不信 body.actor。
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import {
+  copySkillIntoProjectOverlay,
+  loadProjectContext,
+  parseProjectWorkspace,
+  paths,
+  setProjectSkillOverlay,
+  writeProjectInstructions,
+} from '@openclaude/storage'
 import { filterUserVisibleAgentsForManagement, isHiddenSystemAgentId } from '../agentVisibility.js'
 import { verifyJwt } from '../auth.js'
 import {
@@ -662,6 +670,14 @@ async function dispatch(
     return sendError(res, 405, 'method not allowed')
   }
 
+  const projectContext = path.match(/^\/api\/board\/projects\/([^/]+)\/context$/)
+  if (projectContext) {
+    const id = decodeURIComponent(projectContext[1])
+    if (method === 'GET') return handleGetProjectContext(res, db, id)
+    if (method === 'PUT') return handlePutProjectContext(res, await readJsonBody(req), db, id)
+    return sendError(res, 405, 'method not allowed')
+  }
+
   const projectItem = path.match(/^\/api\/board\/projects\/([^/]+)$/)
   if (projectItem) {
     const id = decodeURIComponent(projectItem[1])
@@ -852,6 +868,7 @@ async function handleCreateProject(
         name,
         description: asNullableString(body.description) ?? null,
         workspace: asNullableString(body.workspace) ?? null,
+        workspaceSpec: parseProjectWorkspace(body.workspaceSpec),
         labels: asStringArray(body.labels) ?? [],
       })
       if (templateIds === undefined) {
@@ -889,10 +906,74 @@ function handlePatchProject(
     name: asString(body.name),
     description: asNullableString(body.description),
     workspace: asNullableString(body.workspace),
+    workspaceSpec:
+      body.workspaceSpec === undefined ? undefined : parseProjectWorkspace(body.workspaceSpec),
     labels: asStringArray(body.labels),
     archivedAt: asNullableNumber(body.archivedAt),
   })
   sendJson(res, 200, { ok: true, project: updated })
+}
+
+async function handleGetProjectContext(
+  res: ServerResponse,
+  db: TaskboardDb,
+  idOrKey: string,
+): Promise<void> {
+  const project = resolveProject(db, idOrKey)
+  if (!project) throw new TaskboardNotFound('project', idOrKey)
+  const snap = await loadProjectContext(project.id)
+  sendJson(res, 200, {
+    project: { id: project.id, key: project.key, name: project.name },
+    workspaceSpec: project.workspaceSpec,
+    version: snap.version,
+    instructions: snap.instructions,
+    skillOverlay: snap.skillOverlay,
+    promotion: snap.meta.promotion,
+  })
+}
+
+async function handlePutProjectContext(
+  res: ServerResponse,
+  body: Record<string, unknown>,
+  db: TaskboardDb,
+  idOrKey: string,
+): Promise<void> {
+  const project = resolveProject(db, idOrKey)
+  if (!project) throw new TaskboardNotFound('project', idOrKey)
+  const expectedVersion = asNullableNumber(body.expectedVersion)
+  if (expectedVersion == null || !Number.isFinite(expectedVersion)) {
+    throw new TaskboardValidationError('expectedVersion is required')
+  }
+  if (body.instructions !== undefined) {
+    const text = body.instructions === null ? null : asString(body.instructions) ?? ''
+    const written = await writeProjectInstructions(project.id, text, expectedVersion, {
+      key: project.key,
+    })
+    if (!written.ok) {
+      sendError(res, written.error === 'version_conflict' ? 409 : 400, written.error, {
+        current: written.current ?? null,
+      })
+      return
+    }
+    sendJson(res, 200, { ok: true, context: written.snapshot })
+    return
+  }
+  if (Array.isArray(body.skillNames)) {
+    const names = body.skillNames.filter((n): n is string => typeof n === 'string')
+    for (const name of names) {
+      await copySkillIntoProjectOverlay(project.id, name, `${paths.sharedSkillsDir}/${name}`)
+    }
+    const written = await setProjectSkillOverlay(project.id, names, expectedVersion)
+    if (!written.ok) {
+      sendError(res, written.error === 'version_conflict' ? 409 : 400, written.error, {
+        current: written.current ?? null,
+      })
+      return
+    }
+    sendJson(res, 200, { ok: true, context: written.snapshot })
+    return
+  }
+  throw new TaskboardValidationError('instructions or skillNames required')
 }
 
 function handleDeleteProject(res: ServerResponse, db: TaskboardDb, idOrKey: string): void {

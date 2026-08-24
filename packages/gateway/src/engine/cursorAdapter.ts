@@ -1199,6 +1199,7 @@ interface CursorMemoryMcpConfigInput {
   entry: string
   tokenFile: string
   agentId: string
+  projectId?: string
   sessionKey: string
   gatewayPort: number
   delegationDepth: number
@@ -1212,6 +1213,7 @@ function buildCursorMemoryMcpConfig(input: CursorMemoryMcpConfigInput): Record<s
   const trustedTsxCli = resolve(dirname(input.entry), '../../../node_modules/tsx/dist/cli.mjs')
   const env: Record<string, string> = {
     OPENCLAUDE_AGENT_ID: input.agentId,
+    ...(input.projectId ? { OPENCLAUDE_PROJECT_ID: input.projectId } : {}),
     OPENCLAUDE_SESSION_KEY: input.sessionKey,
     OPENCLAUDE_GATEWAY_PORT: String(input.gatewayPort),
     OPENCLAUDE_GATEWAY_TOKEN_FILE: input.tokenFile,
@@ -1429,6 +1431,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         skillEvalExclude: this.opts.skillEvalExclude,
         skillEvalDraft: this.opts.skillEvalDraft,
         sessionId: this.opts.sessionId,
+        projectId: this.opts.projectId,
       })
       const prompt = renderCursorPrompt(
         platformResult.content,
@@ -1454,6 +1457,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
           entry: mcpEntry,
           tokenFile,
           agentId: this.opts.agentId,
+          projectId: this.opts.projectId,
           sessionKey: this.opts.sessionKey,
           gatewayPort: this.opts.config.gateway.port,
           delegationDepth: this.opts.delegationDepth ?? 0,

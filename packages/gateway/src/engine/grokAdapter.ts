@@ -396,6 +396,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     }
     const platform = projectGrokPlatform({
       agentId: this.opts.agentId,
+      projectId: this.opts.projectId,
       sessionKey: this.opts.sessionKey,
       gatewayPort: this.opts.config.gateway.port,
       gatewayToken: this.opts.config.gateway.accessToken ?? '',
@@ -554,6 +555,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
         skillEvalExclude: this.opts.skillEvalExclude,
         skillEvalDraft: this.opts.skillEvalDraft,
         sessionId: typeof this.opts.sessionId === 'string' ? this.opts.sessionId : undefined,
+        projectId: this.opts.projectId,
       })
       const body = platform.content ? `${platform.content}\n\n${input}` : input
       return `${GROK_PREAMBLE}\n${body}`
