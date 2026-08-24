@@ -1551,10 +1551,16 @@
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
           "assertion": "T44 当前会话 unread=false 回执前的流式刷新只发送一次 mark-read"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/sessionMessagesNulEscape.test.ts",
+          "assertion": "raw NUL in message text is escaped to a literal"
         }
       ],
       "coverageCommits": [
-        "40fa7030"
+        "40fa7030",
+        "9a73bd01"
       ]
     },
     {
