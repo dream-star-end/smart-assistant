@@ -436,6 +436,8 @@ export function makeApplyPorts(opts: {
         }
         if (filesHit) break
       }
+      if (filesHit) return true
+      if (!needle) return false
       const out = await runHost(
         [
           'docker',
@@ -453,7 +455,7 @@ export function makeApplyPorts(opts: {
         ],
         '',
       )
-      return filesHit || out.includes(needle)
+      return out.includes(needle)
     },
     async putSkillOverlay(names, expectedVersion) {
       if (!applyArmed()) throw new Error('apply_disabled')
