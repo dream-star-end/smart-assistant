@@ -1024,4 +1024,114 @@ describe('CronScheduler origin-session resume', () => {
     assert.deepEqual(outcome, { kind: 'silent' })
     assert.equal(getOrCreateOpts.length, 0)
   })
+
+  it('retryable inject failure never consumes submit; next attempt injects for real', async () => {
+    const marks: string[] = []
+    const durability = {
+      consumeOccurrence: async () => { marks.push('consume') },
+      markSubmitStarted: async () => { marks.push('submitStarted') },
+      markCompleted: async () => { marks.push('completed') },
+      markDelivered: async () => { marks.push('delivered') },
+    }
+    let attempts = 0
+    const sched = new CronScheduler(
+      { defaults: { model: 'glm-5.2' } } as any,
+      { getOrCreate: async () => ({}), submit: async () => {}, destroySession: async () => {} } as any,
+      () => {},
+      async () => {
+        attempts++
+        // 第一轮:目标会话正忙(session_busy → in_flight);第二轮成功注入。
+        return attempts === 1
+          ? { kind: 'retryable_failure', code: 'ORIGIN_SESSION_IN_FLIGHT' }
+          : { kind: 'injected' }
+      },
+    )
+    const job = {
+      id: 'remind-origin-busy',
+      schedule: '0 9 * * *',
+      agent: 'x',
+      prompt: 'continue deploy',
+      resume: 'origin-session',
+      sourceSessionKey: 'agent:main:webchat:dm:sess-1',
+      enabled: true,
+    } as any
+    const first = await (sched as any).runJob(job, agent, durability)
+    assert.deepEqual(first, { kind: 'retryable_failure', code: 'ORIGIN_SESSION_IN_FLIGHT' })
+    // 时序契约:注入成功前绝不 markSubmitStarted(否则 lastRun 被消费,重试永不发生)。
+    assert.ok(!marks.includes('submitStarted'))
+    const second = await (sched as any).runJob(job, agent, durability)
+    assert.deepEqual(second, { kind: 'completed' })
+    assert.deepEqual(marks, ['consume', 'consume', 'submitStarted', 'completed', 'delivered'])
+  })
+
+  it('a planned origin retry stays due until lastRun is consumed (regression: busy dropped the job)', () => {
+    const planned = planCronRetry(undefined, {
+      dueMinuteKey: 100,
+      schedule: '0 9 * * *',
+      nowEpoch: 0,
+      code: 'ORIGIN_SESSION_IN_FLIGHT',
+    })
+    assert.equal(planned.kind, 'retry')
+    const entry = (planned as any).entry
+    const job = { id: 'remind-origin-busy', schedule: '0 9 * * *' }
+    const localNow = new Date()
+    // lastRun 未消费 → 到点重试同一 occurrence
+    assert.equal(resolveCronOccurrence(job, {}, entry, entry.nextAttemptAt, localNow, 30), 100)
+    // 旧 bug:注入前就写 lastRun → 重试被当作已消费直接吞掉
+    assert.equal(
+      resolveCronOccurrence(job, { 'remind-origin-busy': 100 }, entry, entry.nextAttemptAt, localNow, 30),
+      null,
+    )
+  })
+
+  it('origin in_flight retries are bounded by CRON_MAX_ATTEMPTS', () => {
+    let entry: any
+    for (let failure = 1; failure < CRON_MAX_ATTEMPTS; failure++) {
+      const planned = planCronRetry(entry, {
+        dueMinuteKey: 100,
+        schedule: '0 9 * * *',
+        nowEpoch: 0,
+        code: 'ORIGIN_SESSION_IN_FLIGHT',
+      })
+      assert.equal(planned.kind, 'retry')
+      entry = (planned as any).entry
+    }
+    const exhausted = planCronRetry(entry, {
+      dueMinuteKey: 100,
+      schedule: '0 9 * * *',
+      nowEpoch: 0,
+      code: 'ORIGIN_SESSION_IN_FLIGHT',
+    })
+    assert.equal(exhausted.kind, 'exhausted')
+  })
+
+  it('gone origin-session leaves a user-visible notice and disables recurring jobs', async () => {
+    const delivered: Array<{ text: string; deliver?: string }> = []
+    const sched = new CronScheduler(
+      { defaults: { model: 'glm-5.2' } } as any,
+      { getOrCreate: async () => ({}), submit: async () => {}, destroySession: async () => {} } as any,
+      (text: string, j: any) => { delivered.push({ text, deliver: j.deliver }) },
+      async () => ({ kind: 'fallback' }),
+    )
+    const job = {
+      id: 'remind-origin-gone',
+      schedule: '0 9 * * *',
+      agent: 'x',
+      prompt: 'continue deploy',
+      label: '续跑发布',
+      resume: 'origin-session',
+      sourceSessionKey: 'agent:main:webchat:dm:sess-1',
+      deliver: 'local',
+      oneshot: false,
+      enabled: true,
+    } as any
+    const outcome = await (sched as any).runJob(job, agent, NOOP_CRON_DURABILITY)
+    assert.deepEqual(outcome, { kind: 'silent' })
+    assert.equal(delivered.length, 1)
+    assert.match(delivered[0].text, /已跳过/)
+    assert.match(delivered[0].text, /已自动停用/)
+    // 状态变更通知凌驾 deliver=local
+    assert.equal(delivered[0].deliver, 'webchat')
+    assert.equal(job.enabled, false)
+  })
 })
