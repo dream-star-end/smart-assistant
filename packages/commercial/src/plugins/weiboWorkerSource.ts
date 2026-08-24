@@ -1,6 +1,10 @@
 /**
  * Reviewed Weibo worker. It drives the public web UI only: no Playwright request
  * client, response-body inspection, private endpoint replay, or challenge bypass.
+ *
+ * Listed backup, not implemented: login cookies + picupload.weibo.com +
+ * /ajax/statuses/update. That path needs an origin allowlist and a product-contract
+ * change. Current media path stays DOM-only: arm filechooser, then click.
  */
 export const WEIBO_WORKER_SOURCE = String.raw`
 import { createHash } from 'node:crypto';
@@ -1372,13 +1376,33 @@ async function awaitComposerMediaReady(page, editor, expectedNew, timeout, befor
   });
   throw new Error('media-preview-timeout');
 }
+function nodeDelay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+async function armFileChooser(page, clickable) {
+  if (!page || typeof page.waitForEvent !== 'function' || !clickable || typeof clickable.click !== 'function') {
+    return { chooser: null, timedOut: false };
+  }
+  const chooserPromise = page.waitForEvent('filechooser', { timeout: 5_000 }).catch(() => null);
+  const clickPromise = clickable.click({ timeout: 5_000, force: true }).catch(() => null);
+  let timer = null;
+  const timeoutPromise = new Promise((resolve) => {
+    timer = setTimeout(() => resolve({ chooser: null, timedOut: true }), 8_000);
+  });
+  try {
+    return await Promise.race([
+      Promise.all([chooserPromise, clickPromise]).then(([chooser]) => ({ chooser: chooser || null, timedOut: false })),
+      timeoutPromise,
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 async function awaitFileChooser(page, clickable) {
-  await clickable.click({ trial: true, timeout: 10_000 });
-  const [chooser] = await Promise.all([
-    page.waitForEvent('filechooser', { timeout: 10_000 }),
-    clickable.click({ timeout: 10_000 })
-  ]);
-  return chooser;
+  const armed = await armFileChooser(page, clickable);
+  if (armed.timedOut) throw new Error('media-chooser');
+  if (!armed.chooser) throw new Error('media-chooser');
+  return armed.chooser;
 }
 async function uniqueExactText(root, text) {
   if (!root || typeof root.locator !== 'function' || !text) return null;
@@ -1525,74 +1549,59 @@ async function imageToolControl(scope, page, scopedInput) {
   if (fromInput) return fromInput;
   return await exactMenuItem(page, '图片') || await uniqueExactText(page, '图片');
 }
-function nodeDelay(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 async function preparePostImageChooser(page, editor) {
   const scope = (await composerScope(editor)) || page;
   const scopedInput = await uniqueImageFileInput(scope);
+  const image = await imageToolControl(scope, page, scopedInput);
   const beforeScope = await countImageFileInputs(scope);
   const beforePage = await countImageFileInputs(page);
   const imageTitleHits = await countVisibleLocator(scope, '[title="图片"], [aria-label="图片"]');
   const imageIconHits = await countVisibleLocator(scope, 'i.woo-font--image, i.woo-font--pic, i.woo-font--picture');
   const imageTextHits = await countVisibleLocator(scope, 'xpath=.//*[normalize-space()="图片"]');
-  let image = null;
-  let imageControlHits = 0;
-  if (!scopedInput) {
-    image = await imageToolControl(scope, page, scopedInput);
-    imageControlHits = (await clickableExactTextControls(scope, '图片')).length;
-  }
+  const imageControlHits = (await clickableExactTextControls(scope, '图片')).length;
   let branch = 'miss';
   let chooser = null;
-  if (scopedInput) {
-    branch = 'existing';
-    chooser = wrapFileInput(scopedInput);
-  } else if (image) {
-    await Promise.race([image.click({ trial: true, timeout: 5_000 }), nodeDelay(6_000)]).catch(() => {});
-    let chooserSettled = false;
-    const chooserWait = page.waitForEvent('filechooser', { timeout: 8_000 }).then((found) => {
-      chooserSettled = true;
-      return found;
-    }).catch(() => {
-      chooserSettled = true;
-      return null;
-    });
-    await Promise.race([image.click({ timeout: 8_000, force: true }), nodeDelay(9_000)]).catch(() => {});
-    const deadline = Date.now() + 10_000;
-    while (Date.now() <= deadline) {
-      const remaining = Math.max(1, deadline - Date.now());
-      const native = await Promise.race([
-        chooserWait,
-        page.waitForTimeout(Math.min(250, remaining)).then(() => undefined)
-      ]);
-      if (native) {
-        branch = 'native';
-        chooser = native;
-        break;
-      }
+  if (image) {
+    const armed = await armFileChooser(page, image);
+    if (armed.timedOut) {
+      emitStep({
+        step: 'media.chooser',
+        branch: 'timeout',
+        hasImage: true,
+        scopeInputs: beforeScope.total,
+        scopeImageInputs: beforeScope.image,
+        pageInputs: beforePage.total,
+        pageImageInputs: beforePage.image,
+        imageTitleHits,
+        imageIconHits,
+        imageTextHits,
+        imageControlHits,
+        hits: beforeScope.image,
+        mediaCount: beforePage.image,
+      });
+      throw new Error('media-chooser');
+    }
+    if (armed.chooser) {
+      branch = 'native';
+      chooser = armed.chooser;
+    } else {
       const local = await exactMenuItem(scope, '本地上传') || await exactMenuItem(page, '本地上传')
         || await exactMenuItem(scope, '相册') || await exactMenuItem(page, '相册');
       if (local) {
-        branch = 'local';
-        chooser = await awaitFileChooser(page, local);
-        break;
-      }
-      const appeared = await uniqueImageFileInput(scope);
-      if (appeared) {
-        branch = 'appeared';
-        chooser = wrapFileInput(appeared);
-        break;
-      }
-      const nowPage = await countImageFileInputs(page);
-      if (nowPage.image === beforePage.image + 1) {
-        const freshPage = await uniqueImageFileInput(page);
-        if (freshPage) {
-          branch = 'appeared';
-          chooser = wrapFileInput(freshPage);
-          break;
+        const localArmed = await armFileChooser(page, local);
+        if (localArmed.timedOut) throw new Error('media-chooser');
+        if (localArmed.chooser) {
+          branch = 'local';
+          chooser = localArmed.chooser;
         }
       }
-      if (chooserSettled) break;
+      if (!chooser) {
+        const appeared = await uniqueImageFileInput(scope);
+        if (appeared) {
+          branch = 'appeared';
+          chooser = wrapFileInput(appeared);
+        }
+      }
     }
   }
   if (!chooser && scopedInput) {
@@ -1624,9 +1633,7 @@ async function provePostImageControl(page, editor) {
   const scopedInput = await uniqueImageFileInput(scope);
   if (scopedInput) return true;
   const image = await imageToolControl(scope, page, scopedInput);
-  if (!image) return false;
-  await Promise.race([image.click({ trial: true, timeout: 5_000 }), nodeDelay(6_000)]).catch(() => {});
-  return true;
+  return !!image;
 }
 async function openLongTextComposer(page) {
   const opener = await exactMenuItem(page, '长文');

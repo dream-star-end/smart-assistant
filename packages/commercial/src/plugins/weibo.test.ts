@@ -197,7 +197,7 @@ describe('official Weibo Plugin', () => {
   })
 
   test('pins the current artifact and only the exact production predecessor', () => {
-    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.26')
+    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.27')
     assert.equal(WEIBO_DRIVER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.equal(WEIBO_LAUNCHER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.deepEqual(WEIBO_SETUP_COMPATIBLE_PREDECESSORS, [
@@ -467,7 +467,12 @@ describe('official Weibo Plugin', () => {
     assert.match(WEIBO_WORKER_SOURCE, /provePostImageControl/)
     assert.match(WEIBO_WORKER_SOURCE, /containsBox/)
     assert.match(WEIBO_WORKER_SOURCE, /nodeDelay/)
-    assert.match(WEIBO_WORKER_SOURCE, /if \(scopedInput\) \{\n    branch = 'existing'/)
+    assert.match(WEIBO_WORKER_SOURCE, /armFileChooser/)
+    assert.match(WEIBO_WORKER_SOURCE, /timedOut/)
+    assert.match(WEIBO_WORKER_SOURCE, /clearTimeout\(timer\)/)
+    assert.match(WEIBO_WORKER_SOURCE, /if \(!chooser && scopedInput\) \{\n    branch = 'existing'/)
+    assert.doesNotMatch(WEIBO_WORKER_SOURCE, /picupload\.weibo\.com/)
+    assert.doesNotMatch(WEIBO_WORKER_SOURCE, /ajax\/statuses\/update/)
     assert.match(WEIBO_WORKER_SOURCE, /smallVisibleAncestor/)
     assert.match(WEIBO_WORKER_SOURCE, /imageTextHits/)
     assert.match(WEIBO_WORKER_SOURCE, /imageControlHits/)
@@ -1114,8 +1119,8 @@ describe('official Weibo Plugin', () => {
     })
     assert.deepEqual(result, { post: { id: 'hidden-input', owned: true, text: 'hello' } })
     assert.ok(events.indexOf('dispatch') < events.indexOf('upload'))
-    assert.equal(events.includes('image-click'), false)
-    assert.deepEqual(events.filter((event) => event !== 'image-menu' && event !== 'filechooser'), ['dispatch', 'upload', 'click'])
+    assert.ok(events.includes('image-click'))
+    assert.deepEqual(events.filter((event) => event !== 'image-menu' && event !== 'filechooser'), ['dispatch', 'image-click', 'upload', 'click'])
   })
 
   test('create_post waits for composer 发送 after upload and ignores extra 发送', async () => {
@@ -1193,7 +1198,7 @@ describe('official Weibo Plugin', () => {
     assert.ok(events.includes('send-scope'))
     assert.deepEqual(
       events.filter((event) => event !== 'send-scope'),
-      ['dispatch', 'upload', 'click'],
+      ['dispatch', 'image-click', 'upload', 'click'],
     )
   })
 
@@ -1244,7 +1249,7 @@ describe('official Weibo Plugin', () => {
       /media/,
     )
     assert.ok(!events.includes('click'))
-    assert.deepEqual(events, ['image-trial', 'dispatch', 'image-trial', 'image-click', 'upload'])
+    assert.deepEqual(events, ['dispatch', 'image-click', 'upload'])
   })
 
   test('create_post ignores https avatar images when waiting for upload preview', async () => {
@@ -1296,7 +1301,7 @@ describe('official Weibo Plugin', () => {
       /media/,
     )
     assert.ok(!events.includes('click'))
-    assert.deepEqual(events, ['image-trial', 'dispatch', 'image-trial', 'image-click', 'upload'])
+    assert.deepEqual(events, ['dispatch', 'image-click', 'upload'])
   })
 
   test('create_post opens 本地上传 when 图片 does not raise a native chooser', async () => {
@@ -1347,11 +1352,12 @@ describe('official Weibo Plugin', () => {
     const page = {
       locator: (selector: string) => (selector === 'img' ? uploadedImageLocator(events) : {}),
       waitForEvent: async () => {
-        if (!localClicked) {
-          await new Promise((resolve) => setTimeout(resolve, 20))
-          throw new Error('Timeout')
+        const deadline = Date.now() + 250
+        while (Date.now() < deadline) {
+          if (localClicked) return imageChooser
+          await new Promise((resolve) => setTimeout(resolve, 10))
         }
-        return imageChooser
+        throw new Error('Timeout')
       },
       waitForTimeout: async () => {},
     }
@@ -1365,11 +1371,8 @@ describe('official Weibo Plugin', () => {
     })
     assert.deepEqual(result, { post: { id: 'local-upload', owned: true, text: 'hello' } })
     assert.deepEqual(events, [
-      'image-trial',
       'dispatch',
-      'image-trial',
       'image-click',
-      'local-trial',
       'local-click',
       'upload',
       'click',
@@ -1441,9 +1444,7 @@ describe('official Weibo Plugin', () => {
     assert.equal(filled, '')
     assert.deepEqual(events, [
       'long-text',
-      'image-trial',
       'dispatch',
-      'image-trial',
       'image-click',
       'upload',
       'click',
@@ -1511,7 +1512,7 @@ describe('official Weibo Plugin', () => {
     )
     assert.deepEqual(result, { post: { id: 'plain-long', owned: true, text: longText } })
     assert.equal(filled, '')
-    assert.deepEqual(events, ['image-trial', 'dispatch', 'image-trial', 'image-click', 'upload', 'click'])
+    assert.deepEqual(events, ['dispatch', 'image-click', 'upload', 'click'])
   })
 
   test('create_post never dispatches when the composer truncates long text', async () => {
@@ -1590,7 +1591,7 @@ describe('official Weibo Plugin', () => {
       ),
       /media/,
     )
-    assert.deepEqual(events, ['image-trial', 'dispatch', 'image-trial', 'image-click', 'upload'])
+    assert.deepEqual(events, ['dispatch', 'image-click', 'upload'])
   })
 
   test(
@@ -1781,7 +1782,7 @@ describe('official Weibo Plugin', () => {
         })
         assert.deepEqual(result, { post: { id: 'hidden-post', owned: true, text: 'hello' } })
         assert.ok(Date.now() - started >= 350, 'send must wait for delayed media readiness')
-        assert.equal(await page.evaluate(() => Reflect.get(window, 'imageClicks')), 0)
+        assert.equal(await page.evaluate(() => Reflect.get(window, 'imageClicks')), 1)
         assert.equal(await page.evaluate(() => Reflect.get(window, 'chooserClicks')), 0)
         assert.equal(await page.evaluate(() => Reflect.get(window, 'sendClicks')), 1)
         assert.equal(collectCount, 2)
@@ -1876,7 +1877,7 @@ describe('official Weibo Plugin', () => {
           },
         })
         assert.deepEqual(result, { post: { id: 'near-input-post', owned: true, text: 'hello' } })
-        assert.equal(await page.evaluate(() => Reflect.get(window, 'imageClicks')), 0)
+        assert.equal(await page.evaluate(() => Reflect.get(window, 'imageClicks')), 1)
         assert.equal(await page.evaluate(() => Reflect.get(window, 'chooserClicks')), 0)
         assert.equal(await page.evaluate(() => Reflect.get(window, 'sendClicks')), 1)
         assert.equal(collectCount, 2)
