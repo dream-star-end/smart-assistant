@@ -67,15 +67,18 @@ afterEach(() => {
 })
 
 describe('schema / migrate', () => {
-  it('建表后 user_version=4,重复 migrate 不报错不改版本', () => {
+  it('建表后 user_version=5,重复 migrate 不报错不改版本', () => {
     const { db } = freshDb()
     assert.equal(getSchemaVersion(db), TASKBOARD_SCHEMA_VERSION)
-    assert.equal(TASKBOARD_SCHEMA_VERSION, 4)
+    assert.equal(TASKBOARD_SCHEMA_VERSION, 5)
     migrate(db)
     migrate(db)
     assert.equal(getSchemaVersion(db), TASKBOARD_SCHEMA_VERSION)
     const runCols = db.prepare(`PRAGMA table_info(tb_ticket_run)`).all() as Array<{ name: string }>
     assert.ok(runCols.some((c) => c.name === 'cost_imprecise'))
+    const projCols = db.prepare(`PRAGMA table_info(tb_project)`).all() as Array<{ name: string }>
+    assert.ok(projCols.some((c) => c.name === 'workspace_json'))
+    assert.ok(projCols.some((c) => c.name === 'context_version'))
     const tables = db
       .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'tb_%'`)
       .all() as { name: string }[]
@@ -210,7 +213,7 @@ describe('schema / migrate', () => {
     db.close()
   })
 
-  it('v3 库升到 v4 后阶段指纹不变、cost_imprecise 全 NULL、二次迁移幂等', () => {
+  it('v3 库升到 v5 后阶段指纹不变、cost_imprecise 全 NULL、二次迁移幂等', () => {
     const dir = mkdtempSync(join(tmpdir(), 'oc-tb-v3-'))
     dirs.push(dir)
     const path = join(dir, 'taskboard.db')
@@ -297,7 +300,7 @@ describe('schema / migrate', () => {
     raw.close()
 
     const db = openTaskboardDb(path)
-    assert.equal(getSchemaVersion(db), 4)
+    assert.equal(getSchemaVersion(db), 5)
     const cols = db.prepare(`PRAGMA table_info(tb_ticket_run)`).all() as Array<{ name: string }>
     assert.ok(cols.some((c) => c.name === 'cost_imprecise'))
     assert.equal(
@@ -324,7 +327,9 @@ describe('schema / migrate', () => {
 
     migrate(db)
     migrate(db)
-    assert.equal(getSchemaVersion(db), 4)
+    assert.equal(getSchemaVersion(db), 5)
+    const projCols = db.prepare(`PRAGMA table_info(tb_project)`).all() as Array<{ name: string }>
+    assert.ok(projCols.some((c) => c.name === 'workspace_json'))
     assert.deepEqual(
       db
         .prepare(
