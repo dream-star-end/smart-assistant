@@ -4,7 +4,8 @@
  *
  * Listed backup, not implemented: login cookies + picupload.weibo.com +
  * /ajax/statuses/update. That path needs an origin allowlist and a product-contract
- * change. Current media path stays DOM-only: arm filechooser, then click.
+ * change. Current media path stays DOM-only: arm filechooser, then click, then
+ * setFiles before any other locator work while a native dialog may be open.
  */
 export const WEIBO_WORKER_SOURCE = String.raw`
 import { createHash } from 'node:crypto';
@@ -1559,73 +1560,57 @@ async function preparePostImageChooser(page, editor) {
   const imageIconHits = await countVisibleLocator(scope, 'i.woo-font--image, i.woo-font--pic, i.woo-font--picture');
   const imageTextHits = await countVisibleLocator(scope, 'xpath=.//*[normalize-space()="图片"]');
   const imageControlHits = (await clickableExactTextControls(scope, '图片')).length;
-  let branch = 'miss';
-  let chooser = null;
+  const emitChooser = (branch) => {
+    emitStep({
+      step: 'media.chooser',
+      branch,
+      hasImage: !!image,
+      scopeInputs: beforeScope.total,
+      scopeImageInputs: beforeScope.image,
+      pageInputs: beforePage.total,
+      pageImageInputs: beforePage.image,
+      imageTitleHits,
+      imageIconHits,
+      imageTextHits,
+      imageControlHits,
+      hits: beforeScope.image,
+      mediaCount: beforePage.image,
+    });
+  };
   if (image) {
     const armed = await armFileChooser(page, image);
     if (armed.timedOut) {
-      emitStep({
-        step: 'media.chooser',
-        branch: 'timeout',
-        hasImage: true,
-        scopeInputs: beforeScope.total,
-        scopeImageInputs: beforeScope.image,
-        pageInputs: beforePage.total,
-        pageImageInputs: beforePage.image,
-        imageTitleHits,
-        imageIconHits,
-        imageTextHits,
-        imageControlHits,
-        hits: beforeScope.image,
-        mediaCount: beforePage.image,
-      });
+      emitChooser('timeout');
       throw new Error('media-chooser');
     }
     if (armed.chooser) {
-      branch = 'native';
-      chooser = armed.chooser;
-    } else {
-      const local = await exactMenuItem(scope, '本地上传') || await exactMenuItem(page, '本地上传')
-        || await exactMenuItem(scope, '相册') || await exactMenuItem(page, '相册');
-      if (local) {
-        const localArmed = await armFileChooser(page, local);
-        if (localArmed.timedOut) throw new Error('media-chooser');
-        if (localArmed.chooser) {
-          branch = 'local';
-          chooser = localArmed.chooser;
-        }
+      emitChooser('native');
+      return armed.chooser;
+    }
+    const local = await exactMenuItem(scope, '本地上传') || await exactMenuItem(page, '本地上传')
+      || await exactMenuItem(scope, '相册') || await exactMenuItem(page, '相册');
+    if (local) {
+      const localArmed = await armFileChooser(page, local);
+      if (localArmed.timedOut) {
+        emitChooser('timeout');
+        throw new Error('media-chooser');
       }
-      if (!chooser) {
-        const appeared = await uniqueImageFileInput(scope);
-        if (appeared) {
-          branch = 'appeared';
-          chooser = wrapFileInput(appeared);
-        }
+      if (localArmed.chooser) {
+        emitChooser('local');
+        return localArmed.chooser;
       }
     }
+    const appeared = await uniqueImageFileInput(scope);
+    if (appeared) {
+      emitChooser('appeared');
+      return wrapFileInput(appeared);
+    }
   }
-  if (!chooser && scopedInput) {
-    branch = 'existing';
-    chooser = wrapFileInput(scopedInput);
+  if (scopedInput) {
+    emitChooser('existing');
+    return wrapFileInput(scopedInput);
   }
-  const afterScope = await countImageFileInputs(scope);
-  const afterPage = await countImageFileInputs(page);
-  emitStep({
-    step: 'media.chooser',
-    branch,
-    hasImage: !!image,
-    scopeInputs: beforeScope.total,
-    scopeImageInputs: beforeScope.image,
-    pageInputs: beforePage.total,
-    pageImageInputs: beforePage.image,
-    imageTitleHits,
-    imageIconHits,
-    imageTextHits,
-    imageControlHits,
-    hits: afterScope.image,
-    mediaCount: afterPage.image,
-  });
-  if (chooser) return chooser;
+  emitChooser('miss');
   throw new Error('media-chooser');
 }
 async function provePostImageControl(page, editor) {
@@ -1761,8 +1746,6 @@ async function writeAction(page, input) {
     const freshEditor = await postComposerEditor(page, longText);
     if (!freshEditor || (await readPostComposer(freshEditor)) !== expectedText) throw new Error('composer-readback');
     if (manifest.length) {
-      imageChooser = await preparePostImageChooser(page, freshEditor);
-      if (!imageChooser) throw new Error('media-chooser');
       const previewScope = (await composerScope(freshEditor)) || page;
       const previewBefore = await collectVisibleImageSrcs(previewScope);
       const previewBeforeCount = await countVisibleImgs(previewScope);
@@ -1770,15 +1753,22 @@ async function writeAction(page, input) {
       const files = [];
       try {
         for (const item of manifest) files.push({ name: item.filename, mimeType: item.mimeType, buffer: await readFile('/inputs/' + item.inputId) });
-        const scope = (await composerScope(freshEditor)) || page;
-        const liveInput = await uniqueImageFileInput(scope);
+        imageChooser = await preparePostImageChooser(page, freshEditor);
+        if (!imageChooser) throw new Error('media-chooser');
         let selected = 0;
-        await imageChooser.setFiles(files);
+        try {
+          await imageChooser.setFiles(files);
+        } catch {
+          emitStep({ step: 'media.upload', selected: 0, retried: false, freshSelected: -1, mediaCount: manifest.length });
+          throw new Error('media-upload');
+        }
         try {
           if (typeof imageChooser.element === 'function') {
             selected = await imageChooser.element().evaluate((node) => node.files ? node.files.length : 0);
           }
         } catch {}
+        const scope = (await composerScope(freshEditor)) || page;
+        const liveInput = await uniqueImageFileInput(scope);
         if (selected !== manifest.length && liveInput) {
           await liveInput.setInputFiles(files);
           try {

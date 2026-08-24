@@ -197,7 +197,7 @@ describe('official Weibo Plugin', () => {
   })
 
   test('pins the current artifact and only the exact production predecessor', () => {
-    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.27')
+    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.28')
     assert.equal(WEIBO_DRIVER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.equal(WEIBO_LAUNCHER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.deepEqual(WEIBO_SETUP_COMPATIBLE_PREDECESSORS, [
@@ -446,7 +446,24 @@ describe('official Weibo Plugin', () => {
     )
     assert.ok(
       createPostSource.indexOf('await awaitDispatch()')
+        < createPostSource.indexOf('previewBeforeCount'),
+    )
+    assert.ok(
+      createPostSource.indexOf('previewBeforeCount')
         < createPostSource.indexOf('preparePostImageChooser(page, freshEditor)'),
+      'preview baselines must be captured before the native chooser click',
+    )
+    assert.ok(
+      createPostSource.indexOf('await awaitDispatch()')
+        < createPostSource.indexOf('preparePostImageChooser(page, freshEditor)'),
+    )
+    const chooserPrep = createPostSource.indexOf('preparePostImageChooser(page, freshEditor)')
+    const chooserSetFiles = createPostSource.indexOf('imageChooser.setFiles(files)')
+    assert.ok(chooserPrep >= 0 && chooserSetFiles > chooserPrep)
+    assert.equal(
+      createPostSource.slice(chooserPrep, chooserSetFiles).includes('composerScope'),
+      false,
+      'setFiles must run before any locator work while a native dialog may be open',
     )
     assert.match(WEIBO_WORKER_SOURCE, /uniqueImageFileInput/)
     assert.match(WEIBO_WORKER_SOURCE, /const scopedInput = await uniqueImageFileInput\(scope\)/)
@@ -470,7 +487,9 @@ describe('official Weibo Plugin', () => {
     assert.match(WEIBO_WORKER_SOURCE, /armFileChooser/)
     assert.match(WEIBO_WORKER_SOURCE, /timedOut/)
     assert.match(WEIBO_WORKER_SOURCE, /clearTimeout\(timer\)/)
-    assert.match(WEIBO_WORKER_SOURCE, /if \(!chooser && scopedInput\) \{\n    branch = 'existing'/)
+    assert.match(WEIBO_WORKER_SOURCE, /emitChooser\('native'\)/)
+    assert.match(WEIBO_WORKER_SOURCE, /emitChooser\('existing'\)/)
+    assert.match(WEIBO_WORKER_SOURCE, /if \(scopedInput\) \{\n    emitChooser\('existing'\)/)
     assert.doesNotMatch(WEIBO_WORKER_SOURCE, /picupload\.weibo\.com/)
     assert.doesNotMatch(WEIBO_WORKER_SOURCE, /ajax\/statuses\/update/)
     assert.match(WEIBO_WORKER_SOURCE, /smallVisibleAncestor/)
