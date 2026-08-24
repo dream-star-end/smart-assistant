@@ -9,6 +9,7 @@ import { LazyBoundary } from "./components/ChunkErrorBoundary";
 import { AgentPicker } from "./components/AgentPicker";
 import { AuthGate, type AuthMode } from "./components/AuthGate";
 import { ChatHeader } from "./components/ChatHeader";
+import { ProjectScopeProvider } from "./hooks/useProjectScope";
 import { Composer } from "./components/Composer";
 import {
   ImageAnnotationEditor,
@@ -2678,6 +2679,11 @@ export function App() {
     <ChatInteractionContext.Provider value={chatInteraction}>
     <ImageEditActionsContext.Provider value={imageEditActions}>
     {/* safe-px:横屏侧刘海安全区(竖屏为 0) */}
+    <ProjectScopeProvider
+      auth={!demo && auth ? auth : null}
+      chatProjects={projects}
+      userId={user?.id}
+    >
     <div className="flex h-full min-h-0 overflow-hidden bg-bg text-fg safe-px">
       {/* 桌面：内联侧栏（可折叠）。窄屏隐藏，改用抽屉。 */}
       {!collapsed && (
@@ -2780,6 +2786,13 @@ export function App() {
         <ChatHeader
           agent={agent}
           onAgentClick={() => setPickerOpen(true)}
+          projectBreadcrumb={(() => {
+            const pid = sessions.find((s) => s.id === activeId)?.projectId;
+            if (!pid) return null;
+            const chat = projects.find((p) => p.id === pid);
+            return chat ? { chatName: chat.name, workName: chat.boardProjectId ? chat.name : null } : null;
+          })()}
+          onOpenProjectScope={() => openManage(DEFAULT_MANAGE_TAB)}
           models={models}
           selectedModelId={modelId}
           onSelectModel={selectModel}
@@ -3301,6 +3314,7 @@ export function App() {
         </LazyBoundary>
       )}
     </div>
+    </ProjectScopeProvider>
     </ImageEditActionsContext.Provider>
     </ChatInteractionContext.Provider>
     </ToolCardActionsContext.Provider>

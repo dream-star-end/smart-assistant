@@ -1679,12 +1679,20 @@ export const api = {
   searchSessions: (
     a: AuthSession,
     q: string,
-    opts?: { limit?: number; includeArchived?: boolean; signal?: AbortSignal },
+    opts?: {
+      limit?: number;
+      includeArchived?: boolean;
+      signal?: AbortSignal;
+      projectId?: string | null;
+    },
   ): Promise<SessionSearchResponse> => {
     const params = new URLSearchParams();
     params.set("q", q);
     params.set("limit", String(opts?.limit ?? 30));
     params.set("includeArchived", opts?.includeArchived ? "1" : "0");
+    if (opts && "projectId" in opts) {
+      params.set("projectId", opts.projectId === null || opts.projectId === undefined ? "none" : opts.projectId);
+    }
     return jsonOrThrow<SessionSearchResponse>(
       callWithRefresh(a, (t) =>
         fetch(`/api/sessions/search?${params.toString()}`, {
@@ -2132,7 +2140,7 @@ export const api = {
       ),
     ).then(() => undefined),
 
-  // ── 聊天项目（侧栏 Projects；契约并行开发中，路径按 /api/chat-projects）──
+  // ── 聊天项目（侧栏 facade；绑定看板走 boardProjectId）──
 
   listChatProjects: (a: AuthSession): Promise<ChatProject[]> =>
     jsonOrThrow<{ projects: ChatProject[] }>(

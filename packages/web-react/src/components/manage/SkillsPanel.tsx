@@ -33,6 +33,7 @@ import {
 import { ratesFromPublicModel, type ModelRates } from "../../lib/skillRunCost";
 import { SKILL_RUN_MODEL } from "./SkillOptPanel";
 import { SkillEditor, type WorkbenchTab } from "./SkillEditor";
+import { ProjectSkillOverlay } from "./ProjectSkillOverlay";
 
 /**
  * 技能库：列出用户可用技能（经容器代理 /api/skills），展开看正文摘要（/api/skills/:name），
@@ -165,6 +166,7 @@ export function SkillsPanel({
           ) : undefined
         }
       />
+      <ProjectSkillOverlay auth={auth} />
       {/* 顶层 Alert 只承载「整表加载失败」。单行操作的失败走 Toast / 行内。 */}
       {err && (
         <div className="px-4 pb-2">

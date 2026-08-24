@@ -20,6 +20,7 @@ import {
   taskboardApi,
 } from '../../lib/taskboard'
 import type { AuthSession } from '../../lib/types'
+import { useProjectScope } from '../../hooks/useProjectScope'
 import {
   Button,
   DropdownMenu,
@@ -32,6 +33,7 @@ import {
   IconButton,
   Input,
   ListSkeleton,
+  ProjectScopeSelect,
   Select,
   Sheet,
   Tabs,
@@ -87,6 +89,11 @@ export function TaskboardView({
   onExpandSidebar?: () => void
 }) {
   const board = useTaskboard(auth, true, ticketTypeFromUrl)
+  const projectScope = useProjectScope()
+  useEffect(() => {
+    const id = projectScope.scope.workProject?.id
+    if (id && id !== board.projectId) void board.selectProject(id)
+  }, [projectScope.scope.workProject?.id, board.projectId, board.selectProject])
   const toast = useToast()
   const [confirm, confirmEl] = useConfirm()
   const [promptText, promptEl] = usePrompt()
@@ -476,11 +483,6 @@ export function TaskboardView({
     onViewChange(view === 'board' ? 'list' : 'board')
   }
 
-  const projectLabel = useMemo(() => {
-    const current = (board.projects ?? []).find((p) => p.id === board.projectId && !p.archivedAt)
-    return current ? `${current.key} ${current.name}` : undefined
-  }, [board.projectId, board.projects])
-
   const renderCreateForm = (mobile: boolean) => (
     <div
       data-testid="ticket-create-form"
@@ -607,18 +609,7 @@ export function TaskboardView({
           data-testid="taskboard-responsive-toolbar"
           className="order-3 flex w-full min-w-0 items-center gap-2 md:order-2 md:ml-auto md:w-auto"
         >
-          <Select
-            aria-label="项目"
-            className="min-w-0 flex-1 md:w-56 md:max-w-[16rem] md:flex-none"
-            inputSize="sm"
-            value={board.projectId ?? ''}
-            title={projectLabel}
-            onValueChange={(id) => void board.selectProject(id)}
-            options={(board.projects ?? [])
-              .filter((p) => !p.archivedAt)
-              .map((p) => ({ value: p.id, label: `${p.key} ${p.name}` }))}
-            placeholder="选择项目"
-          />
+          <ProjectScopeSelect className="min-w-0 flex-1 md:w-56 md:max-w-[16rem] md:flex-none" />
           <ProjectSettings
             auth={auth}
             current={board.projects?.find((p) => p.id === board.projectId) ?? null}
