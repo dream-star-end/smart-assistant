@@ -200,6 +200,43 @@ describe('searchClientSessions', () => {
     assert.equal(hits.results[0]?.kind, 'message')
     assert.match(hits.results[0]?.snippet ?? '', /XYUNIQUEPROBE/)
   })
+
+  it('projectId 过滤只返回该聊天项目会话,none 只返回未分组', async () => {
+    const created = await createChatProject(USER, { name: 'scope-a' })
+    assert.equal(created.ok, true)
+    const pid = created.ok ? created.project.id : ''
+    await upsertClientSession(sess('web-in', { title: '关键词甲', lastAt: 20 }))
+    await upsertClientSession(sess('web-out', { title: '关键词乙', lastAt: 21 }))
+    const moved = await patchClientSessionMeta('web-in', USER, { projectId: pid })
+    assert.equal(moved.ok, true)
+    const scoped = await searchClientSessions(USER, { q: '关键词', projectId: pid })
+    assert.deepEqual(scoped.results.map((r) => r.sessionId), ['web-in'])
+    const ungrouped = await searchClientSessions(USER, { q: '关键词', projectId: null })
+    assert.deepEqual(ungrouped.results.map((r) => r.sessionId), ['web-out'])
+  })
+
+  it('batch move CAS 在 updated_at 漂移时整批 stale_session', async () => {
+    const created = await createChatProject(USER, { name: 'cas' })
+    assert.equal(created.ok, true)
+    const pid = created.ok ? created.project.id : ''
+    await upsertClientSession(sess('web-cas', { title: 'cas', lastAt: 1 }))
+    const listed = await listClientSessions(USER)
+    const row = listed.sessions.find((s) => s.id === 'web-cas')
+    assert.ok(row)
+    await patchClientSessionMeta('web-cas', USER, { title: 'cas-2' })
+    const result = await batchClientSessions(USER, {
+      ids: ['web-cas'],
+      action: 'move',
+      projectId: pid,
+      expectedSessions: [{ id: 'web-cas', projectId: null, updatedAt: row.updatedAt }],
+      operationId: 'op-cas-1',
+    })
+    assert.equal(result.ok, false)
+    if (!result.ok) {
+      assert.equal(result.error, 'stale_session')
+      assert.deepEqual(result.staleIds, ['web-cas'])
+    }
+  })
 })
 
 describe('batchClientSessions + 项目指令查找', () => {

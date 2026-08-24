@@ -4304,7 +4304,18 @@ export class Gateway {
         SESSION_SEARCH_LIMIT_MAX,
       )
       const includeArchived = parseIncludeArchivedFlag(url.searchParams.get('includeArchived'))
-      searchClientSessions(userId, { q, limit, includeArchived })
+      const projectRaw = url.searchParams.get('projectId')
+      const projectId =
+        projectRaw === null || projectRaw === '' || projectRaw === 'all'
+          ? undefined
+          : projectRaw === 'none'
+            ? null
+            : projectRaw.trim()
+      if (projectId && (projectId.length < 8 || projectId.length > 64)) {
+        this.sendJson(res, 400, { error: 'invalid projectId' })
+        return
+      }
+      searchClientSessions(userId, { q, limit, includeArchived, projectId })
         .then((out) => this.sendJson(res, 200, out))
         .catch(() => this.sendJson(res, 500, { error: 'search failed' }))
       return
@@ -4312,7 +4323,13 @@ export class Gateway {
     if (url.pathname === '/api/sessions/batch' && req.method === 'POST') {
       const userId = this.getUserId(req)
       ;(async () => {
-        let data: { ids?: unknown; action?: unknown; projectId?: unknown }
+        let data: {
+          ids?: unknown
+          action?: unknown
+          projectId?: unknown
+          expectedSessions?: unknown
+          operationId?: unknown
+        }
         try {
           data = JSON.parse(await this.readBody(req, 64 * 1024))
         } catch {
@@ -4336,6 +4353,14 @@ export class Gateway {
         if (!result.ok) {
           if (result.error === 'project_not_found') {
             this.sendJson(res, 404, { error: 'project not found' })
+            return
+          }
+          if (result.error === 'stale_session') {
+            this.sendJson(res, 409, {
+              error: 'stale session',
+              code: 'stale_session',
+              staleIds: result.staleIds ?? [],
+            })
             return
           }
           this.sendJson(res, 400, { error: result.error.replace(/_/g, ' ') })
