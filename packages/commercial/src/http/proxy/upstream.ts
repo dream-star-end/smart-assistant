@@ -615,15 +615,27 @@ function makeOAuthPoolUpstream(
       //   SDK 自然发包顺序对齐(标识头先于功能头);HTTP/2 wire 层 hash map 本不
       //   敏感顺序,这里求"语义对齐"避免未来网关侧出现"按顺序签名/校验"型
       //   反检测策略时落坑。
-      //   null = 0074 SET NOT NULL 前的 backfill 窗口或 schema drift。fail-open
-      //   (不注入,落回 undici 默认头),配 log.warn 让 ops 看到 backfill 进度。
+      //   null = 0074 SET NOT NULL 前的 backfill 窗口或 schema drift。
+      //   **fail-closed**(反封复盘 2026-08):persona 缺失时若继续发,会落回 undici
+      //   默认 UA(`undici/x.x.x`)—— 比伪造 CLI 更像脚本/爬虫,是最糟的指纹。宁可
+      //   本请求 fail(外层 catch → finalize.fail 释放 slot + zero token + 500),
+      //   也不把裸 undici 画像推到 Anthropic 网关引发风控。0074 之后合法账号 persona
+      //   恒非 null,此分支只在脏数据 / schema drift 时触发,fail-closed 正确。
       if (pick.persona === null) {
         log.warn("account_persona_missing", {
           account_id: pick.account_id.toString(),
         });
-      } else {
-        injectPersonaHeaders(safeHeaders, pick.persona);
+        throw new Error(
+          `account ${pick.account_id.toString()} has null persona; refusing to send with default undici fingerprint`,
+        );
       }
+      injectPersonaHeaders(safeHeaders, pick.persona);
+      // 反封复盘 2026-08 — 真实 Claude Code CLI 恒带 `x-app: cli`(见
+      // claude-code-best/src/services/api/client.ts defaultHeaders)。旧实现把它
+      // 连同 stainless 头一起剥光,导致 Anthropic 网关看到"有 stainless 头但没
+      // x-app:cli"= 用 SDK 而非官方 CLI 的画像。补回该常量头(所有 Claude Code
+      // 请求一致,非账号差异化维度),让入站形态贴齐原生 CLI。
+      safeHeaders["x-app"] = "cli";
       // (iii) anthropic-beta merge "oauth-2025-04-20"(persona 之后,语义对齐)
       const existing = (safeHeaders["anthropic-beta"] ?? "")
         .split(",")

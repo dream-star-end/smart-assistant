@@ -2615,6 +2615,20 @@ export async function provisionV3Container(
       `ANTHROPIC_BASE_URL=${internalProxyUrl}`,
       `ANTHROPIC_AUTH_TOKEN=${token}`,
       "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1",
+      // 反封复盘 2026-08 — 收紧 CCB 重试上限。容器内 CCB 不是订阅态
+      // (isClaudeAISubscriber()=false),默认对 429/5xx 会重试到 CLAUDE_CODE_MAX_RETRIES
+      // (默认 10),等于把"上游限流/抖动"放大成"同一账号+同一出口 IP 短时间反复撞
+      // Anthropic",是订阅号被封的典型特征。收到 2:一次上游 hiccup 最多补打 1 次,
+      // 既保留瞬时抖动的自愈,又不制造规避限额式的洪泛。配合 commercial proxy 把 429
+      // 透传为 429(见 http/proxy/core.ts)。
+      "CLAUDE_CODE_MAX_RETRIES=2",
+      // 反封复盘 2026-08 — 关闭 CCB 一切非必要出网(遥测/analytics/自动更新/release
+      // notes/model-capabilities 等,privacyLevel=essential-traffic,见
+      // claude-code-best/src/utils/privacyLevel.ts)。这些旁路流量此前经
+      // OPENCLAUDE_CCB_HTTPS_PROXY→日本 sing-box 节点发出,与走住宅代理的 Anthropic API
+      // 请求分叉到不同 ASN,给"同一产品两个出口"的关联信号。关掉后只剩必要的
+      // /v1/messages 走账号住宅代理,出口形态单一干净。
+      "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
       `CLAUDE_CONFIG_DIR=${V3_CONFIG_TMPFS_PATH}`,
       `OC_USER_ROLE=${userRole}`,
       // **bridge IP trust 旁路只在 v3 supervisor 真正 spawn 容器时注入**:
