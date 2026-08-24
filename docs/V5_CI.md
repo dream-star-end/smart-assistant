@@ -21,6 +21,7 @@ containers 配置照抄 v3,端口/凭证/健康检查完全一致。
 | storage | `npm run test:storage && npm run test:mcp-memory` | 持久化层与记忆子系统 | 15 min |
 | web-react | `npm run check:v5:incidents && npm run check:tutorials && npm run test:web-react` | 历史事故回归清单 + 教程 JSONL 只追加 + 前端组件单测(jsdom) | 30 min |
 | web-react-browser | `npm run test:browser` | 真 Chromium 受信点击:附件/选择器一类"jsdom 恒假阴性"的交互真的能点开 | 20 min |
+| node-agent-go | `npm run build:node-agent` | node-agent(Go)编译 + vet 闭合:容器资源限额/运维参数改动不能带着编译错误合入(2026-08 FormatFloat 事故) | 10 min |
 | v5-ops | `npm run test:v5:ops` | 发布/回滚脚本的安全契约(真 psql 持久化);迁移编号门规则 + **对真实仓库状态的断言**(不重号、缺口必须声明 `-- order-dependency:`、新迁移登记进 `requiredMigrations`,规则同 `npm run lint:migration-order`) | 20 min |
 | commercial-unit | `npm run test:commercial:unit:gate` | 商业后端全量 unit(基线失败集 diff 门,见下) | 30 min |
 | commercial-integ | `bash .github/scripts/commercial-integ-gate.sh <shard>` | 真 PG 语义:能注册/能收验证信/能登录/refresh 家族被盗整族吊销/下单加积分/同一 request_id 只扣一次钱/会话 tape 落库读回/新表有保留策略 | 20 min/片 |

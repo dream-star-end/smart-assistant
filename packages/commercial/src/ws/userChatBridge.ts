@@ -8762,7 +8762,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       return { kind: "failed", reason: admit.kind };
     }
     if (admit.kind === "deduplicated") return { kind: "injected" };
-    if (!("dispatch" in admit)) return { kind: "failed", reason: admit.kind };
+    // 已枚举全部非 dispatch kind,这里理论不可达;留作未来新增 kind 的防线。
+    // admit 已被 TS 窄化为携带 dispatch 的变体(访问 .kind 会在 never 上报错)。
+    if (!("dispatch" in admit)) {
+      return { kind: "failed", reason: (admit as { kind: string }).kind };
+    }
     const d = admit.dispatch;
     const frame = {
       type: "inbound.message",

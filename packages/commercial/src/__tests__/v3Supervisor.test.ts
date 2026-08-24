@@ -1066,7 +1066,8 @@ describe("provisionV3Container", () => {
         assert.equal(hc.NanoCpus, 500_000_000, "0.5 核 == 500_000_000 ns");
       }
 
-      // 3) role=admin 不套 4GiB/CPU/pids 上限(Docker 0 / PidsLimit -1 = 宿主有多大用多大)
+      // 3) role=admin 不套 4GiB/CPU 上限(Docker 0 = 宿主有多大用多大);pids 保留
+      //    V3_ADMIN_PIDS_LIMIT 高位兜底,防 fork bomb 打穿宿主 PID 空间
       pool = new FakePool();
       pool.setUserRole(903, "admin");
       process.env.OC_V3_MEMORY_MB = "512";
@@ -1082,7 +1083,7 @@ describe("provisionV3Container", () => {
         assert.equal(hc.Memory, 0, "admin Memory=0 表示不限");
         assert.equal(hc.MemorySwap, 0, "admin MemorySwap=0 表示不限");
         assert.equal(hc.NanoCpus, undefined, "admin 不设 NanoCpus");
-        assert.equal(hc.PidsLimit, -1, "admin PidsLimit=-1 表示不限");
+        assert.equal(hc.PidsLimit, 16384, "admin pids 仍有 V3_ADMIN_PIDS_LIMIT 高位兜底");
       }
 
       // 4) 同 env 下普通用户仍受限额

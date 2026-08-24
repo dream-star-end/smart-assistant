@@ -385,7 +385,9 @@ describe("internalModelCatalog — seed 完整性(全局断言)", () => {
   });
 
   test("seed 清单从既有权威派生(平台默认 + 隐藏审查员 + codex 队长 + 预设 agent)", () => {
-    assert.ok(PLATFORM_SEED_MODEL_IDS.includes("glm-5.3"));
+    // 平台默认与编程助手预设都已切 glm-5.3-zai;坏掉的 ark glm-5.3 不再是启动断言的人质。
+    assert.ok(PLATFORM_SEED_MODEL_IDS.includes("glm-5.3-zai"));
+    assert.ok(!PLATFORM_SEED_MODEL_IDS.includes("glm-5.3"));
     assert.ok(PLATFORM_SEED_MODEL_IDS.length >= 4);
     // 去重
     assert.equal(new Set(PLATFORM_SEED_MODEL_IDS).size, PLATFORM_SEED_MODEL_IDS.length);

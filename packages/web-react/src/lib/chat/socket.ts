@@ -1362,6 +1362,31 @@ export class ChatSocket {
     });
   }
 
+  /**
+   * 超时兜底用的松弛终态判定:终态行可能不带本轮 _clientMessageId(tape fallback
+   * 只在 anchor 带 cmid 时携带),严格判定会让 finishRestore 永远等不到退出。
+   * 位置约束防回归 27344ba55:只认**本轮 user 行之后**、且不属于其他轮
+   * (_clientMessageId/_turnOwnerId 缺失或等于本轮)的可见服务端正文;
+   * 上一轮遗留的无主行都在 user 行之前,不会被误认。
+   */
+  private sessionHasLooseTurnBodyAfterActiveUser(sess: ChatSession): boolean {
+    const cmid = sess._activeClientMessageId;
+    if (!cmid) return false;
+    const userIndex = sess.messages.findIndex(
+      (message) => message.role === "user" && (message.id === cmid || message._clientMessageId === cmid),
+    );
+    if (userIndex < 0) return false;
+    return sess.messages.slice(userIndex + 1).some((message) => {
+      if (message.role !== "assistant" && message.role !== "thinking" && message.role !== "tool") {
+        return false;
+      }
+      if (message._clientMessageId !== undefined && message._clientMessageId !== cmid) return false;
+      if (message._turnOwnerId !== undefined && message._turnOwnerId !== cmid) return false;
+      if (!isServerAuthoredRow(message)) return false;
+      return messageHasVisibleBody(message);
+    });
+  }
+
   private turnAssistantIsEmpty(sess: ChatSession): boolean {
     const cmid = sess._activeClientMessageId;
     const assistants = sess.messages.filter((message) => {
@@ -1448,6 +1473,12 @@ export class ChatSocket {
     const startedAt = this.reconcileStartedAt.get(sess.id) ?? Date.now();
     if (attempt >= RESTORE_RECONCILE_MAX_ATTEMPTS || Date.now() - startedAt >= RESTORE_RECONCILE_MAX_MS) {
       if (sess._sendingInFlight && !hasVisible) {
+        // 兜底退出:整个对账窗口内都没有 live owner,但本轮 user 行之后已有可见
+        // 服务端正文(终态行不带 cmid 的 tape fallback)→ 本轮实际已终态,不能让
+        // 「思考中」永挂。窗口内(未超时)仍走上面的严格判定,防过早消失。
+        if (!liveOwner && this.sessionHasLooseTurnBodyAfterActiveUser(sess)) {
+          return { clearSending: true, kind: "completed" };
+        }
         return { clearSending: false, kind: "resumed" };
       }
       return { clearSending: !liveOwner, kind: liveOwner ? "resumed" : "completed" };
