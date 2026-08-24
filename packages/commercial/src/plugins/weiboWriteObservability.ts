@@ -118,6 +118,10 @@ const LOG_ALLOW_KEYS = new Set([
   'frameCount',
   'deleteHits',
   'previewNodes',
+  'via',
+  'pids',
+  'status',
+  'attempted',
 ])
 
 /**
@@ -183,7 +187,7 @@ export function sanitizeWeiboWorkerLogEvent(
   const out: Record<string, unknown> = {}
   for (const [key, item] of Object.entries(raw)) {
     if (!LOG_ALLOW_KEYS.has(key)) continue
-    if (key === 'ok' || key === 'longText' || key === 'hasImage' || key === 'retried') {
+    if (key === 'ok' || key === 'longText' || key === 'hasImage' || key === 'retried' || key === 'attempted') {
       if (item === true || item === false) out[key] = item
       continue
     }
@@ -209,7 +213,9 @@ export function sanitizeWeiboWorkerLogEvent(
       key === 'bgCount' ||
       key === 'canvasCount' ||
       key === 'frameCount' ||
-      key === 'deleteHits'
+      key === 'deleteHits' ||
+      key === 'pids' ||
+      key === 'status'
     ) {
       if (typeof item === 'number' && Number.isFinite(item)) out[key] = Math.round(item)
       continue

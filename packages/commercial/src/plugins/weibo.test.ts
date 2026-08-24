@@ -198,7 +198,7 @@ describe('official Weibo Plugin', () => {
   })
 
   test('pins the current artifact and only the exact production predecessor', () => {
-    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.33')
+    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.34')
     assert.equal(WEIBO_DRIVER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.equal(WEIBO_LAUNCHER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.deepEqual(WEIBO_SETUP_COMPATIBLE_PREDECESSORS, [
@@ -520,6 +520,12 @@ describe('official Weibo Plugin', () => {
     assert.match(WEIBO_WORKER_SOURCE, /api\/statuses\/uploadPic/)
     assert.match(WEIBO_WORKER_SOURCE, /api\/statuses\/update/)
     assert.match(WEIBO_WORKER_SOURCE, /async function publishComposerViaCookieApi/)
+    assert.match(WEIBO_WORKER_SOURCE, /cookie.name === 'XSRF-TOKEN'/)
+    assert.match(WEIBO_WORKER_SOURCE, /context.cookies\(\)/)
+    assert.match(WEIBO_WORKER_SOURCE, /'GET', 'POST', 'DELETE', 'OPTIONS'/)
+    assert.match(WEIBO_WORKER_SOURCE, /payload.via = String\(event.via\)/)
+    assert.match(WEIBO_WORKER_SOURCE, /payload.attempted = event.attempted/)
+    assert.match(WEIBO_WORKER_SOURCE, /reason: rejected \? 'rejected' : 'http'/)
     assert.ok(
       WEIBO_WORKER_SOURCE.indexOf('async function publishComposerViaCookieApi')
         < WEIBO_WORKER_SOURCE.indexOf('async function newestOwnPost'),
