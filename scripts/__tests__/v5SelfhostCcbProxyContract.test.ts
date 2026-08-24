@@ -34,6 +34,10 @@ describe('v5 selfhost CCB HTTPS proxy deployment contract', () => {
     assert.match(deploy, /install_unit "\$UNIT_DIR\/\$V5_CCB_PROXY_UNIT"/)
     assert.match(deploy, /systemctl restart "\$V5_HOSTNET_UNIT"/)
     assert.match(deploy, /systemctl enable --now "\$V5_CCB_PROXY_UNIT"/)
+    assert.match(
+      deploy,
+      /iptables -C V5_EGRESS_IN[\s\S]*--dport 18991 -j RETURN[\s\S]*--comment "v5 CCB -> stable HTTPS proxy"/,
+    )
     assert.match(deploy, /install_aux_units\n  refresh_ccb_proxy_path\n  ensure_model_authority/)
   })
 })
