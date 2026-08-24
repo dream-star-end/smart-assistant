@@ -11457,7 +11457,7 @@ export function createPgSessionsBackend(
           parsed.value.digest,
           parsed.value.containerPath,
         );
-        if (dup) return { ok: true, asset: dup };
+        if (dup) return { ok: true, asset: dup, created: false };
         // 同一 (user_id, project_id) 桶的 count+INSERT 必须串行:默认 READ COMMITTED
         // 下无行锁,并发事务都会读到 count<500 再各自写入 → 上限被突破。
         // pg_advisory_xact_lock 随 COMMIT/ROLLBACK 自动释放;不用会话级
@@ -11498,7 +11498,7 @@ export function createPgSessionsBackend(
         );
         const asset = await readPgProjectAsset(client, userId, id);
         if (!asset) throw new Error("project asset insert vanished");
-        return { ok: true, asset };
+        return { ok: true, asset, created: true };
       });
     },
 

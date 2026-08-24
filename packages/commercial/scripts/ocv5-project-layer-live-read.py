@@ -48,6 +48,15 @@ def psql(sql: str) -> str:
     )
 
 
+def psql_script(sql: str) -> str:
+    """Multi-statement script (BEGIN/DO/COMMIT). RAISE aborts before COMMIT."""
+    return sh(
+        ["sudo", "-u", "postgres", "psql", "-d", DB, "-v", "ON_ERROR_STOP=1", "-A", "-t", "-q"],
+        stdin=sql,
+        check=True,
+    )
+
+
 def sql_text_array(ids: list[str]) -> str:
     return "ARRAY[" + ",".join("'" + i.replace("'", "''") + "'" for i in ids) + "]::text[]"
 
@@ -277,75 +286,126 @@ VALUES (gen_random_uuid()::text, '{USER_ID}', '{name_sql}',
         (EXTRACT(EPOCH FROM NOW())*1000)::bigint, (EXTRACT(EPOCH FROM NOW())*1000)::bigint)
 RETURNING id;
 """
-    return {"id": psql(sql).strip()}
+    return {"id": psql(sql).strip(), "created": True}
 
 
-def apply_bind_facade(chat_id: str, board_id: str) -> dict:
+def apply_bind_facade(chat_id: str, board_id: str | None) -> dict:
     require_apply_armed()
-    if not ID_RE.match(chat_id) or not ID_RE.match(board_id):
+    if not ID_RE.match(chat_id):
         raise SystemExit("invalid id")
+    if board_id not in (None, "") and not ID_RE.match(str(board_id)):
+        raise SystemExit("invalid id")
+    new_sql = "NULL" if board_id in (None, "") else "'" + str(board_id).replace("'", "''") + "'"
+    pred = "TRUE" if board_id in (None, "") else f"(cp.board_project_id IS NULL OR cp.board_project_id = {new_sql})"
     sql = f"""
-UPDATE chat_projects
-   SET board_project_id = '{board_id}',
-       updated_at = (EXTRACT(EPOCH FROM NOW())*1000)::bigint
- WHERE id = '{chat_id}' AND user_id = '{USER_ID}' AND deleted_at IS NULL
-   AND (board_project_id IS NULL OR board_project_id = '{board_id}')
-RETURNING id;
+WITH old AS (
+  SELECT id, board_project_id AS old_board
+    FROM chat_projects
+   WHERE id = '{chat_id}' AND user_id = '{USER_ID}' AND deleted_at IS NULL
+   FOR UPDATE
+), u AS (
+  UPDATE chat_projects cp
+     SET board_project_id = {new_sql},
+         updated_at = (EXTRACT(EPOCH FROM NOW())*1000)::bigint
+    FROM old
+   WHERE cp.id = old.id
+     AND {pred}
+  RETURNING cp.id, old.old_board, cp.board_project_id AS new_board
+)
+SELECT json_build_object(
+  'id', id,
+  'old', old_board,
+  'new', new_board
+) FROM u;
 """
-    got = psql(sql).strip()
-    if not got:
+    raw = psql(sql).strip()
+    if not raw:
         raise SystemExit("bind_failed")
-    return {"id": got}
+    got = json.loads(raw)
+    if not got.get("id"):
+        raise SystemExit("bind_failed")
+    return got
 
 
-def apply_move_sessions(payload: dict) -> dict:
-    require_apply_armed()
+def _sql_text_or_null(value) -> str:
+    if value in (None, ""):
+        return "NULL"
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def apply_move_sessions_sql(payload: dict) -> str:
     ids = clean_ids(payload.get("ids") or [])
     expected = payload.get("expected") or []
-    project_id = str(payload.get("projectId") or "")
-    if not ID_RE.match(project_id):
-        raise SystemExit("invalid projectId")
+    raw_project = payload.get("projectId")
+    allow_null = payload.get("allowNullProject") is True or raw_project is None
+    if allow_null and raw_project in (None, ""):
+        project_sql = "NULL"
+    else:
+        project_id = str(raw_project or "")
+        if not ID_RE.match(project_id):
+            raise SystemExit("invalid projectId")
+        project_sql = "'" + project_id.replace("'", "''") + "'"
     if len(expected) != len(ids) or {e.get("id") for e in expected} != set(ids):
         raise SystemExit("expected_ids_mismatch")
     values = []
     for exp in expected:
-        old_p = exp.get("projectId")
-        old_sql = "NULL" if old_p in (None, "") else "'" + str(old_p).replace("'", "''") + "'"
-        values.append(f"('{str(exp['id']).replace(chr(39), '')}', {old_sql}, {int(exp.get('updatedAt') or 0)})")
-    sql = f"""
+        sid = str(exp.get("id") or "").replace("'", "")
+        if not ID_RE.match(sid):
+            raise SystemExit("invalid expected id")
+        values.append(
+            f"('{sid}', {_sql_text_or_null(exp.get('projectId'))}, {int(exp.get('updatedAt') or 0)})"
+        )
+    planned = len(ids)
+    return f"""
 BEGIN;
-WITH exp(id, old_project, old_updated) AS (
-  VALUES {", ".join(values)}
-), u AS (
+CREATE TEMP TABLE _ocv5_exp (id text, old_project text, old_updated bigint) ON COMMIT DROP;
+INSERT INTO _ocv5_exp(id, old_project, old_updated) VALUES {", ".join(values)};
+CREATE TEMP TABLE _ocv5_post ON COMMIT DROP AS
   UPDATE client_sessions cs
-     SET project_id = '{project_id}',
+     SET project_id = {project_sql},
          updated_at = GREATEST(cs.updated_at + 1, (EXTRACT(EPOCH FROM NOW())*1000)::bigint)
-    FROM exp
+    FROM _ocv5_exp exp
    WHERE cs.user_id = '{USER_ID}'
      AND cs.id = exp.id
      AND cs.deleted_at IS NULL
      AND cs.archived_at IS NULL
      AND cs.updated_at = exp.old_updated
      AND cs.project_id IS NOT DISTINCT FROM exp.old_project
-  RETURNING cs.id, cs.updated_at AS "updatedAt", cs.project_id AS "projectId"
-)
+  RETURNING cs.id,
+            exp.old_project AS "oldProjectId",
+            exp.old_updated AS "oldUpdatedAt",
+            cs.updated_at AS "updatedAt",
+            cs.project_id AS "projectId";
+DO $body$
+DECLARE
+  planned int := {planned};
+  updated int;
+BEGIN
+  SELECT COUNT(*) INTO updated FROM _ocv5_post;
+  IF updated IS DISTINCT FROM planned THEN
+    RAISE EXCEPTION 'stale_session planned=% updated=%', planned, updated;
+  END IF;
+END
+$body$;
 SELECT json_build_object(
-  'ok', (SELECT COUNT(*) FROM u) = {len(ids)},
-  'updated', (SELECT COUNT(*) FROM u),
-  'post', COALESCE((SELECT json_agg(row_to_json(u) ORDER BY u.id) FROM u), '[]'::json)
+  'ok', true,
+  'updated', (SELECT COUNT(*) FROM _ocv5_post),
+  'post', COALESCE((SELECT json_agg(row_to_json(p) ORDER BY p.id) FROM _ocv5_post p), '[]'::json)
 );
 COMMIT;
 """
-    got = json.loads(psql(sql).strip() or "{}")
-    if not got.get("ok") or int(got.get("updated") or 0) != len(ids):
-        raise SystemExit(f"stale_session updated={got.get('updated')} expected={len(ids)}")
-    return got
 
 
-def apply_usage_backfill(payload: dict) -> dict:
+def apply_move_sessions(payload: dict, exec_sql=None) -> dict:
     require_apply_armed()
-    if not pg_has_usage_board_col():
-        raise SystemExit("usage_board_column_missing")
+    sql = apply_move_sessions_sql(payload)
+    runner = exec_sql or psql_script
+    raw = runner(sql).strip().splitlines()
+    text = next((line for line in reversed(raw) if line.strip()), "") or "{}"
+    return json.loads(text)
+
+
+def apply_usage_backfill_sql(payload: dict) -> str:
     row_ids = clean_usage_ids(payload.get("rowIds") or [])
     planned = int(payload.get("planned") or len(row_ids))
     board = str(payload.get("boardProjectId") or "")
@@ -354,9 +414,9 @@ def apply_usage_backfill(payload: dict) -> dict:
     if not ID_RE.match(board):
         raise SystemExit("invalid boardProjectId")
     arr = sql_text_array(row_ids)
-    sql = f"""
+    return f"""
 BEGIN;
-WITH u AS (
+CREATE TEMP TABLE _ocv5_usage_post ON COMMIT DROP AS
   UPDATE usage_records
      SET board_project_id = '{board}',
          board_project_source = 'migration_backfill',
@@ -367,46 +427,127 @@ WITH u AS (
   RETURNING id::text AS id,
             NULL::text AS "oldBoardProjectId",
             board_project_id AS "newBoardProjectId",
-            board_project_source AS "newSource"
-)
+            board_project_source AS "newSource";
+DO $body$
+DECLARE
+  planned int := {planned};
+  updated int;
+  recorded int;
+BEGIN
+  SELECT COUNT(*) INTO updated FROM _ocv5_usage_post;
+  recorded := updated;
+  IF planned IS DISTINCT FROM updated OR planned IS DISTINCT FROM recorded THEN
+    RAISE EXCEPTION 'usage_count_mismatch planned=% updated=% recorded=%', planned, updated, recorded;
+  END IF;
+END
+$body$;
 SELECT json_build_object(
   'planned', {planned},
-  'updated', COUNT(*),
-  'recorded', COUNT(*),
-  'rows', COALESCE(json_agg(row_to_json(u) ORDER BY u.id), '[]'::json)
-) FROM u;
+  'updated', (SELECT COUNT(*) FROM _ocv5_usage_post),
+  'recorded', (SELECT COUNT(*) FROM _ocv5_usage_post),
+  'rows', COALESCE((SELECT json_agg(row_to_json(u) ORDER BY u.id) FROM _ocv5_usage_post u), '[]'::json)
+);
 COMMIT;
 """
-    got = json.loads(psql(sql).strip() or "{}")
-    if int(got.get("updated") or 0) != planned or int(got.get("recorded") or 0) != planned:
-        raise SystemExit(f"usage_count_mismatch planned={planned} updated={got.get('updated')}")
-    return got
 
 
-def apply_usage_restore(payload: dict) -> dict:
+def apply_usage_backfill(payload: dict, exec_sql=None, require_column: bool = True) -> dict:
     require_apply_armed()
-    if not pg_has_usage_board_col():
+    if require_column and not pg_has_usage_board_col():
         raise SystemExit("usage_board_column_missing")
-    row_ids = clean_usage_ids([r.get("id") for r in (payload.get("rows") or []) if r.get("id")])
-    board = str(payload.get("boardProjectId") or "")
-    if not row_ids:
-        return {"restored": 0}
-    arr = sql_text_array(row_ids)
-    sql = f"""
-WITH u AS (
-  UPDATE usage_records
-     SET board_project_id = NULL,
-         board_project_source = NULL,
-         board_project_captured_at = NULL
-   WHERE user_id = {USAGE_USER}::bigint
-     AND board_project_source = 'migration_backfill'
-     AND board_project_id = '{board}'
-     AND id::text = ANY({arr})
-  RETURNING id
-)
-SELECT COUNT(*) FROM u;
+    sql = apply_usage_backfill_sql(payload)
+    runner = exec_sql or psql_script
+    raw = runner(sql).strip().splitlines()
+    text = next((line for line in reversed(raw) if line.strip()), "") or "{}"
+    return json.loads(text)
+
+
+def apply_usage_restore_sql(payload: dict) -> str:
+    rows = payload.get("rows") or []
+    planned = len(rows)
+    if not rows:
+        return "SELECT json_build_object('restored', 0, 'planned', 0);"
+    values = []
+    for r in rows:
+        rid = parse_usage_row_id(r.get("id"))
+        if not rid:
+            raise SystemExit("invalid usage id")
+        old_sql = _sql_text_or_null(r.get("oldBoardProjectId"))
+        post_sql = _sql_text_or_null(r.get("postBoardProjectId") or r.get("newBoardProjectId"))
+        values.append(f"({rid}::bigint, {old_sql}, {post_sql})")
+    return f"""
+BEGIN;
+CREATE TEMP TABLE _ocv5_usage_restore(id bigint, old_board text, post_board text) ON COMMIT DROP;
+INSERT INTO _ocv5_usage_restore(id, old_board, post_board) VALUES {", ".join(values)};
+CREATE TEMP TABLE _ocv5_usage_restored ON COMMIT DROP AS
+  UPDATE usage_records ur
+     SET board_project_id = exp.old_board,
+         board_project_source = CASE WHEN exp.old_board IS NULL THEN NULL ELSE ur.board_project_source END,
+         board_project_captured_at = CASE WHEN exp.old_board IS NULL THEN NULL ELSE ur.board_project_captured_at END
+    FROM _ocv5_usage_restore exp
+   WHERE ur.user_id = {USAGE_USER}::bigint
+     AND ur.id = exp.id
+     AND ur.board_project_source = 'migration_backfill'
+     AND ur.board_project_id IS NOT DISTINCT FROM exp.post_board
+  RETURNING ur.id;
+DO $body$
+DECLARE
+  planned int := {planned};
+  updated int;
+BEGIN
+  SELECT COUNT(*) INTO updated FROM _ocv5_usage_restored;
+  IF updated IS DISTINCT FROM planned THEN
+    RAISE EXCEPTION 'usage_restore_mismatch planned=% updated=%', planned, updated;
+  END IF;
+END
+$body$;
+SELECT json_build_object('restored', (SELECT COUNT(*) FROM _ocv5_usage_restored), 'planned', {planned});
+COMMIT;
 """
-    return {"restored": int(psql(sql).strip() or 0)}
+
+
+def apply_usage_restore(payload: dict, exec_sql=None, require_column: bool = True) -> dict:
+    require_apply_armed()
+    if require_column and not pg_has_usage_board_col():
+        raise SystemExit("usage_board_column_missing")
+    sql = apply_usage_restore_sql(payload)
+    runner = exec_sql or psql_script
+    raw = runner(sql).strip().splitlines()
+    text = next((line for line in reversed(raw) if line.strip()), "") or '{"restored":0}'
+    return json.loads(text)
+
+
+def self_test_usage_missing_row() -> dict:
+    """Negative liveness: planned=2 but UPDATE would hit 1 → SQL RAISE, 0 rows committed."""
+    os.environ["OPENCLAUDE_PROJECT_LAYER_APPLY"] = "1"
+    captured = {"sql": "", "committed": False}
+
+    def fake_psql(sql: str) -> str:
+        captured["sql"] = sql
+        if "RAISE EXCEPTION" in sql and "usage_count_mismatch" in sql:
+            captured["committed"] = False
+            raise RuntimeError("ERROR:  usage_count_mismatch planned=2 updated=1 recorded=1")
+        captured["committed"] = "COMMIT;" in sql
+        return '{"planned":2,"updated":2,"recorded":2,"rows":[]}'
+
+    try:
+        apply_usage_backfill(
+            {"rowIds": ["1", "2"], "planned": 2, "boardProjectId": OCV5},
+            exec_sql=fake_psql,
+            require_column=False,
+        )
+        return {"ok": False, "error": "expected_raise", "updated": 2}
+    except Exception as exc:
+        return {
+            "ok": True,
+            "updated": 0,
+            "committed": captured["committed"],
+            "sqlHasRaise": "RAISE EXCEPTION" in captured["sql"]
+            and "usage_count_mismatch" in captured["sql"],
+            "raiseBeforeCommit": captured["sql"].find("RAISE EXCEPTION")
+            < captured["sql"].rfind("COMMIT"),
+            "error": str(exc),
+        }
 
 
 def main() -> int:
@@ -425,16 +566,27 @@ def main() -> int:
             "apply-usage-restore",
             "apply-create-asset",
             "apply-delete-asset",
+            "self-test-usage-missing-row",
         ],
     )
     args = ap.parse_args()
+    if args.mode == "self-test-usage-missing-row":
+        json.dump(self_test_usage_missing_row(), sys.stdout)
+        sys.stdout.write("\n")
+        return 0
     payload = json.load(sys.stdin if args.ids_json == "-" else open(args.ids_json))
     if args.mode == "apply-create-facade":
         json.dump(apply_create_facade(str(payload.get("name") or "OCV5")), sys.stdout)
         sys.stdout.write("\n")
         return 0
     if args.mode == "apply-bind-facade":
-        json.dump(apply_bind_facade(str(payload["chatId"]), str(payload["boardProjectId"])), sys.stdout)
+        json.dump(
+            apply_bind_facade(
+                str(payload["chatId"]),
+                payload.get("boardProjectId") if payload.get("boardProjectId") not in (None, "") else None,
+            ),
+            sys.stdout,
+        )
         sys.stdout.write("\n")
         return 0
     if args.mode == "apply-move-sessions":
@@ -450,36 +602,9 @@ def main() -> int:
         sys.stdout.write("\n")
         return 0
     if args.mode == "apply-create-asset":
-        require_apply_armed()
-        name = str(payload.get("name") or "asset").replace("'", "''")
-        digest = str(payload.get("digest") or "")
-        path = str(payload.get("containerPath") or "").replace("'", "''")
-        session_id = str(payload.get("sessionId") or "").replace("'", "''")
-        source = str(payload.get("source") or "output").replace("'", "''")
-        sql = f"""
-INSERT INTO project_assets (
-  id, user_id, name, session_id, container_path, digest, source, created_at, updated_at
-) VALUES (
-  gen_random_uuid()::text, '{USER_ID}', '{name}', '{session_id}', '{path}', '{digest}', '{source}',
-  (EXTRACT(EPOCH FROM NOW())*1000)::bigint, (EXTRACT(EPOCH FROM NOW())*1000)::bigint
-)
-RETURNING id;
-"""
-        json.dump({"id": psql(sql).strip(), "created": True}, sys.stdout)
-        sys.stdout.write("\n")
-        return 0
+        raise SystemExit("asset_http_api_only: helper must not INSERT project_assets")
     if args.mode == "apply-delete-asset":
-        require_apply_armed()
-        aid = str(payload.get("id") or "")
-        if not ID_RE.match(aid):
-            raise SystemExit("invalid id")
-        psql(
-            f"UPDATE project_assets SET deleted_at=(EXTRACT(EPOCH FROM NOW())*1000)::bigint "
-            f"WHERE id='{aid}' AND user_id='{USER_ID}' AND deleted_at IS NULL;"
-        )
-        json.dump({"ok": True}, sys.stdout)
-        sys.stdout.write("\n")
-        return 0
+        raise SystemExit("asset_http_api_only: helper must not DELETE project_assets")
     session_ids = clean_ids(payload.get("sessionIds") or payload.get("ids") or [])
     has_board = pg_has_usage_board_col()
     from datetime import datetime, timezone

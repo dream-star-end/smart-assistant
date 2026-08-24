@@ -5,9 +5,12 @@ import {
   assertPlanApplyable,
   compensateProjectLayerMigration,
   isDefaultApplySession,
+  isPathInsideRoot,
   planProjectLayerMigration,
+  readMemoryContent,
   repairProjectDirOwnership,
   type ApplyPorts,
+  type ApplyResult,
   type InventorySession,
   type ProjectLayerInventory,
   type ProjectLayerLivePorts,
@@ -63,6 +66,65 @@ function inventory(sessions: InventorySession[]): ProjectLayerInventory {
       ],
     },
     ocv5ChatFacade: { bindTargetBoardProjectId: OCV5, create: { body: { name: 'OCV5 facade' } } },
+  }
+}
+
+function emptyManifest(): ApplyResult['manifest'] {
+  return {
+    facadeCreate: null,
+    bind: null,
+    context: null,
+    memoryCandidates: [],
+    skillOverlay: null,
+  }
+}
+
+function applyStub(over: Partial<ApplyPorts> = {}): ApplyPorts {
+  return {
+    ...ports(),
+    async createChatProject() {
+      return { id: 'facade-1', created: true }
+    },
+    async bindChatProject() {
+      return { old: null, new: 'facade-1' }
+    },
+    async ensureProjectContext() {
+      return { created: true, version: 0 }
+    },
+    async batchMoveSessions(input) {
+      if (!input.operationId.endsWith('rollback')) {
+        return {
+          ok: true,
+          updated: input.ids.length,
+          post: input.ids.map((id) => ({
+            id,
+            projectId: input.projectId,
+            updatedAt: 11,
+            oldProjectId: null,
+            oldUpdatedAt: 10,
+          })),
+        }
+      }
+      return {
+        ok: true,
+        updated: input.ids.length,
+        post: input.expected.map((row) => ({ ...row })),
+      }
+    },
+    async createMemoryCandidate() {
+      return { id: 'mem-1', version: 1, hash: 'aa'.repeat(32) }
+    },
+    async putSkillOverlay(names) {
+      return { old: [], new: names }
+    },
+    async createAsset() {
+      return { id: 'asset-created', created: true }
+    },
+    async deleteAsset() {},
+    async readMemoryContent() {
+      return 'body unique-marker-keep-me'
+    },
+    ...over,
   }
 }
 
@@ -238,20 +300,21 @@ describe('usage backfill + cron impact + count drift', () => {
         applied: ['OP_USAGE_BACKFILL'],
         createdAssetIds: [],
         facadeId: 'f',
+        manifest: emptyManifest(),
         rollback: {
           sessionRestores: [],
           assetDeletes: [],
           chatFacadeDelete: false,
           forbidden: [],
           usageRestores: [
-            { id: 'u-keep', oldBoardProjectId: null },
-            { id: 'u-changed', oldBoardProjectId: null },
+            { id: 'u-keep', oldBoardProjectId: null, postBoardProjectId: OCV5 },
+            { id: 'u-changed', oldBoardProjectId: null, postBoardProjectId: OCV5 },
           ],
         },
       },
       {
         async batchMoveSessions() {
-          return { ok: true, updated: 0 }
+          return { ok: true, updated: 0, post: [] }
         },
         async deleteAsset() {},
         async restoreUsage(rows) {
@@ -272,32 +335,18 @@ describe('apply + compensating rollback', () => {
     })
     const deletedAssets: string[] = []
     const moved: string[][] = []
-    const applyPorts: ApplyPorts = {
-      ...ports(),
-      async createChatProject() {
-        return { id: 'facade-1' }
-      },
-      async bindChatProject() {},
-      async ensureProjectContext() {},
+    const applyPorts = applyStub({
       async batchMoveSessions(input) {
         moved.push(input.ids)
         if (!input.operationId.endsWith('rollback')) {
           return { ok: false, error: 'stale_session', staleIds: input.ids }
         }
-        return { ok: true, updated: input.ids.length }
-      },
-      async createMemoryCandidate() {},
-      async putSkillOverlay() {},
-      async createAsset() {
-        return { id: 'asset-created', created: true }
+        return { ok: true, updated: input.ids.length, post: [] }
       },
       async deleteAsset(id) {
         deletedAssets.push(id)
       },
-      async readMemoryContent() {
-        return 'body'
-      },
-    }
+    })
     const result = await applyProjectLayerMigration(plan, applyPorts)
     assert.equal(result.ok, false)
     assert.equal(result.error, 'stale_session')
@@ -314,6 +363,7 @@ describe('apply + compensating rollback', () => {
         applied: [],
         createdAssetIds: ['new-a'],
         facadeId: 'f',
+        manifest: emptyManifest(),
         rollback: {
           sessionRestores: [],
           assetDeletes: ['new-a'],
@@ -323,7 +373,7 @@ describe('apply + compensating rollback', () => {
       },
       {
         async batchMoveSessions() {
-          return { ok: true, updated: 0 }
+          return { ok: true, updated: 0, post: [] }
         },
         async deleteAsset(id) {
           deleted.push(id)
@@ -345,5 +395,147 @@ describe('repairProjectDirOwnership', () => {
     })
     assert.ok(Array.isArray(r.changed))
     assert.ok(Array.isArray(r.skipped))
+  })
+})
+
+describe('apply order + memory allowlist', () => {
+  it('repairs uid1000 volume before ensure ProjectContext (EACCES order)', async () => {
+    const plan = await planProjectLayerMigration({
+      inventory: inventory([sess({ id: 's-high', category: 'personal' })]),
+      ports: ports(),
+    })
+    const ops = plan.operations.map((o) => o.op)
+    assert.ok(ops.indexOf('repair_project_ownership') >= 0)
+    assert.ok(ops.indexOf('ensure_project_context_dir') >= 0)
+    assert.ok(
+      ops.indexOf('repair_project_ownership') < ops.indexOf('ensure_project_context_dir'),
+      'repair must precede ensure so uid1000 can write ProjectContext',
+    )
+    assert.ok(ops.indexOf('ensure_project_context_dir') < ops.indexOf('copy_memory_candidate'))
+  })
+
+  it('readMemoryContent allowlists inventory files, checks hash, blocks escape', async () => {
+    const helloHash = '2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824'
+    const allow = [{ slug: 'keep-me', file: 'keep-me.md', hash: helloHash, absPath: '/home/agent/.openclaude/memory/keep-me.md' }]
+    const body = await readMemoryContent({
+      slug: 'keep-me',
+      file: 'keep-me.md',
+      allowlist: allow,
+      realpathImpl: async () => '/home/agent/.openclaude/memory/keep-me.md',
+      readFileImpl: async () => Buffer.from('hello'),
+    })
+    assert.equal(body, 'hello')
+    await assert.rejects(
+      () =>
+        readMemoryContent({
+          slug: 'keep-me',
+          allowlist: allow,
+          expectedSha256: 'cd'.repeat(32),
+          realpathImpl: async () => '/home/agent/.openclaude/memory/keep-me.md',
+          readFileImpl: async () => Buffer.from('hello'),
+        }),
+      /memory_hash_mismatch/,
+    )
+    await assert.rejects(
+      () =>
+        readMemoryContent({
+          slug: 'secret-key',
+          allowlist: allow,
+          realpathImpl: async () => '/etc/passwd',
+          readFileImpl: async () => Buffer.from('x'),
+        }),
+      /memory_not_allowlisted/,
+    )
+    await assert.rejects(
+      () =>
+        readMemoryContent({
+          slug: 'keep-me',
+          allowlist: allow,
+          realpathImpl: async () => '/etc/passwd',
+          readFileImpl: async () => Buffer.from('hello'),
+        }),
+      /memory_path_escape/,
+    )
+    assert.equal(isPathInsideRoot('/home/agent/.openclaude/memory/x', '/home/agent/.openclaude'), true)
+    assert.equal(isPathInsideRoot('/etc/passwd', '/home/agent/.openclaude'), false)
+  })
+
+  it('compensate uses true NULL projectId and post updated_at CAS', async () => {
+    const moves: Array<{ projectId: string | null; expectedAt: number; allowNull?: boolean }> = []
+    await compensateProjectLayerMigration(
+      {
+        ok: false,
+        operationId: 'op-null',
+        applied: ['OP_MOVE_SESSIONS'],
+        createdAssetIds: [],
+        facadeId: 'f',
+        manifest: emptyManifest(),
+        rollback: {
+          sessionRestores: [{ id: 's-high', projectId: null, updatedAt: 11 }],
+          assetDeletes: [],
+          chatFacadeDelete: false,
+          forbidden: [],
+        },
+      },
+      {
+        async batchMoveSessions(input) {
+          moves.push({
+            projectId: input.projectId,
+            expectedAt: input.expected[0]?.updatedAt ?? 0,
+            allowNull: input.allowNullProject,
+          })
+          assert.equal(input.projectId, null)
+          assert.notEqual(input.projectId, '')
+          return { ok: true, updated: 1, post: input.expected }
+        },
+        async deleteAsset() {},
+      },
+    )
+    assert.equal(moves[0]?.projectId, null)
+    assert.equal(moves[0]?.allowNull, true)
+    assert.equal(moves[0]?.expectedAt, 11)
+  })
+
+  it('skips compensate delete for reused assets; fail-loud on restore error', async () => {
+    const deleted: string[] = []
+    const plan = await planProjectLayerMigration({
+      inventory: inventory([sess({ id: 's-high', category: 'personal' })]),
+      ports: ports(),
+    })
+    const result = await applyProjectLayerMigration(
+      plan,
+      applyStub({
+        async createAsset() {
+          return { id: 'reused-a', created: false, reused: true }
+        },
+      }),
+    )
+    assert.equal(result.ok, true)
+    assert.deepEqual(result.createdAssetIds, [])
+    await assert.rejects(
+      () =>
+        compensateProjectLayerMigration(
+          {
+            ...result,
+            rollback: {
+              ...result.rollback,
+              usageRestores: [{ id: '1', oldBoardProjectId: null, postBoardProjectId: OCV5 }],
+            },
+          },
+          {
+            async batchMoveSessions() {
+              return { ok: true, updated: 0, post: [] }
+            },
+            async deleteAsset() {
+              deleted.push('nope')
+            },
+            async restoreUsage() {
+              throw new Error('cas_miss')
+            },
+          },
+        ),
+      /cas_miss/,
+    )
+    assert.deepEqual(deleted, [])
   })
 })

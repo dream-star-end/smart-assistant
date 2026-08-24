@@ -4593,7 +4593,11 @@ export class Gateway {
             this.sendJson(res, 400, { error: result.error.replace(/_/g, ' ') })
             return
           }
-          this.sendJson(res, 200, { asset: result.asset })
+          this.sendJson(res, 200, {
+            asset: result.asset,
+            created: result.created,
+            reused: !result.created,
+          })
         })().catch(() => this.sendJson(res, 500, { error: 'create failed' }))
         return
       }

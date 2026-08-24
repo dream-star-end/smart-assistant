@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+  UNBOUND_BOARD_COPY,
+  boardWorkQuery,
   parseProjectScopeToken,
   preferredScopeToken,
+  projectScopeSelectOptions,
   resolveProjectScope,
   withProjectParam,
 } from "./projectScope";
@@ -76,5 +79,38 @@ describe("withProjectParam", () => {
   it("omits all and writes none/id", () => {
     expect(withProjectParam(new URLSearchParams("panel=manage"), "all").get("project")).toBeNull();
     expect(withProjectParam(new URLSearchParams(), "none").get("project")).toBe("none");
+  });
+});
+
+describe("boardWorkQuery", () => {
+  it("only work scope returns a projectId; all/none/unbound chat are blocked", () => {
+    const work = resolveProjectScope({
+      token: "852859fa-cf1d-481c-96fd-23f2966b8b5f",
+      chatProjects: chats,
+      workProjects: works,
+    });
+    expect(boardWorkQuery(work)).toEqual({ projectId: "852859fa-cf1d-481c-96fd-23f2966b8b5f" });
+    expect(boardWorkQuery(resolveProjectScope({ token: "all", chatProjects: chats, workProjects: works }))).toEqual({
+      blocked: UNBOUND_BOARD_COPY,
+    });
+    expect(boardWorkQuery(resolveProjectScope({ token: "none", chatProjects: chats, workProjects: works }))).toEqual({
+      blocked: UNBOUND_BOARD_COPY,
+    });
+    expect(boardWorkQuery(resolveProjectScope({ token: "chat-unbound", chatProjects: chats, workProjects: works }))).toEqual({
+      blocked: UNBOUND_BOARD_COPY,
+    });
+  });
+
+  it("work selector omits unbound chat ids", () => {
+    const full = projectScopeSelectOptions({ chatProjects: chats, workProjects: works });
+    const workOnly = projectScopeSelectOptions({ chatProjects: chats, workProjects: works, variant: "work" });
+    expect(full.some((o) => o.value === "chat-unbound")).toBe(true);
+    expect(workOnly.some((o) => o.value === "chat-unbound")).toBe(false);
+    expect(workOnly.map((o) => o.value)).toEqual([
+      "all",
+      "none",
+      "852859fa-cf1d-481c-96fd-23f2966b8b5f",
+      "b12fc2f7-c466-49de-892b-b44326b782c4",
+    ]);
   });
 });

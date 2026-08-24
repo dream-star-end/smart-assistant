@@ -30,6 +30,17 @@ export type ResolvedProjectScope = {
 
 export const PROJECT_SCOPE_QUERY = "project";
 export const PROJECT_SCOPE_STORAGE_PREFIX = "oc_v5_project_scope:";
+export const UNBOUND_BOARD_COPY = "该会话项目未绑定看板";
+
+/** Taskboard / Cost / Weekly: only a work project may query; never undefined=global. */
+export function boardWorkQuery(
+  scope: Pick<ResolvedProjectScope, "kind" | "workProject">,
+): { projectId: string } | { blocked: string } {
+  if (scope.kind === "work" && scope.workProject?.id) {
+    return { projectId: scope.workProject.id };
+  }
+  return { blocked: UNBOUND_BOARD_COPY };
+}
 
 export function parseProjectScopeToken(raw: string | null | undefined): ProjectScopeToken | null {
   if (raw == null) return null;
@@ -143,23 +154,24 @@ export function preferredScopeToken(scope: ResolvedProjectScope): ProjectScopeTo
 export function projectScopeSelectOptions(opts: {
   chatProjects: readonly ChatProjectLike[];
   workProjects: readonly WorkProjectLike[];
+  variant?: "full" | "work";
 }): { value: string; label: string; disabled?: boolean }[] {
   const works = opts.workProjects.filter((p) => !p.archivedAt);
-  const boundChatIds = new Set(
-    opts.chatProjects.filter((c) => c.boardProjectId && works.some((w) => w.id === c.boardProjectId)).map((c) => c.id),
-  );
-  const unbound = opts.chatProjects.filter((c) => !boundChatIds.has(c.id));
   const options: { value: string; label: string; disabled?: boolean }[] = [
     { value: "all", label: "全部项目" },
     { value: "none", label: "未归类" },
   ];
   for (const w of works) {
-    const facade = opts.chatProjects.find((c) => c.boardProjectId === w.id);
     options.push({
       value: w.id,
-      label: facade ? `${w.key} ${w.name}` : `${w.key} ${w.name}`,
+      label: `${w.key} ${w.name}`,
     });
   }
+  if (opts.variant === "work") return options;
+  const boundChatIds = new Set(
+    opts.chatProjects.filter((c) => c.boardProjectId && works.some((w) => w.id === c.boardProjectId)).map((c) => c.id),
+  );
+  const unbound = opts.chatProjects.filter((c) => !boundChatIds.has(c.id));
   for (const c of unbound) {
     options.push({ value: c.id, label: `会话组 · ${c.name}` });
   }

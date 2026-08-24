@@ -12,6 +12,7 @@ import {
 } from '../../lib/taskboard'
 import type { AuthSession } from '../../lib/types'
 import { useProjectScope } from '../../hooks/useProjectScope'
+import { UNBOUND_BOARD_COPY, boardWorkQuery } from '../../lib/projectScope'
 import {
   Button,
   Card,
@@ -43,7 +44,8 @@ export function WeeklyReportView({
   projects: Project[]
 }) {
   const { scope } = useProjectScope()
-  const scopedProjectId = scope.kind === 'work' ? scope.workProject?.id ?? null : null
+  const workQuery = boardWorkQuery(scope)
+  const scopedProjectId = 'projectId' in workQuery ? workQuery.projectId : null
   const [range, setRange] = useState<{ from?: string; to?: string }>({})
   const [filterProject, setFilterProject] = useState(projectId ?? '')
   const [loading, setLoading] = useState(true)
@@ -55,11 +57,17 @@ export function WeeklyReportView({
   }, [projectId])
 
   const load = useCallback(async () => {
+    if (!scopedProjectId) {
+      setLoading(false)
+      setError(null)
+      setReport(null)
+      return
+    }
     setLoading(true)
     setError(null)
     try {
       const fresh = await taskboardApi.getWeeklyReport(auth, {
-        projectId: scopedProjectId || undefined,
+        projectId: scopedProjectId,
         from: range.from,
         to: range.to,
       })
@@ -121,12 +129,14 @@ export function WeeklyReportView({
         >
           下一周
         </Button>
-        <ProjectScopeSelect className="w-44" />
+        <ProjectScopeSelect variant="work" className="w-44" />
         <Button type="button" size="sm" variant="ghost" onClick={() => void load()}>
           刷新
         </Button>
       </div>
-      {loading && !report ? (
+      {!scopedProjectId ? (
+        <EmptyState icon={CalendarRange} title={UNBOUND_BOARD_COPY} hint="切换到已绑定看板的工作项目后再查看周报。" />
+      ) : loading && !report ? (
         <ListSkeleton rows={6} variant="card" />
       ) : error ? (
         <EmptyState

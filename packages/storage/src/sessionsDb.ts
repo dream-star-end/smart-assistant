@@ -2070,7 +2070,7 @@ export type ProjectAssetUpdateError =
 export type ProjectAssetDeleteError = 'not_found'
 
 export type ProjectAssetCreateResult =
-  | { ok: true; asset: ProjectAsset }
+  | { ok: true; asset: ProjectAsset; created: boolean }
   | { ok: false; error: ProjectAssetCreateError }
 export type ProjectAssetUpdateResult =
   | { ok: true; asset: ProjectAsset }
@@ -6373,7 +6373,7 @@ async function _sqliteCreateProjectAsset(
       parsed.value.digest,
       parsed.value.containerPath,
     )
-    if (dup) return { ok: true, asset: dup }
+    if (dup) return { ok: true, asset: dup, created: false }
     if (_sqliteCountProjectAssets(db, userId, projectId) >= PROJECT_ASSET_PER_PROJECT_LIMIT) {
       return { ok: false, error: 'limit_exceeded' }
     }
@@ -6402,7 +6402,7 @@ async function _sqliteCreateProjectAsset(
     )
     const asset = _sqliteReadProjectAsset(db, userId, id)
     if (!asset) throw new Error('project asset insert vanished')
-    return { ok: true, asset }
+    return { ok: true, asset, created: true }
   })
   return txn()
 }

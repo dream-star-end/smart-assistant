@@ -15,10 +15,11 @@ import {
   type ProjectLayerInventory,
 } from '../../storage/src/projectLayerMigrate.js'
 import {
+  assertCanonicalReadyForApply,
   fetchLiveSnapshot,
   makeApplyPorts,
+  openLiveReadHandle,
   portsFromSnapshot,
-  resolveLiveReadScript,
   writeManifestPath,
   applyArmed,
 } from '../src/projectLayerHostPorts.js'
@@ -44,7 +45,10 @@ if (has(argv, '--apply') && !applyArmed()) {
 const inventoryPath = arg(argv, '--inventory')
 const target = arg(argv, '--target', OCV5_DEFAULT_BOARD_ID)
 const outPath = arg(argv, '--out', '')
-const scriptPath = resolveLiveReadScript(arg(argv, '--live-read-script') || undefined)
+const script = openLiveReadHandle({
+  explicit: arg(argv, '--live-read-script') || undefined,
+  kind: 'host',
+})
 
 if (!inventoryPath) {
   console.error('--inventory <json> is required')
@@ -61,7 +65,7 @@ if (!bindIds.length) {
 const snap = await fetchLiveSnapshot({
   sessionIds: bindIds,
   boardProjectId: target,
-  scriptPath,
+  script,
 })
 
 if (!snap.readonly) {
@@ -136,10 +140,11 @@ await mkdir(dirname(manifest), { recursive: true })
 await writeFile(manifest, text)
 
 if (has(argv, '--apply')) {
+  assertCanonicalReadyForApply(script)
   const liveAgain = await fetchLiveSnapshot({
     sessionIds: bindIds,
     boardProjectId: target,
-    scriptPath,
+    script,
   })
   const applyPlan = await planProjectLayerMigration({
     inventory,
@@ -159,7 +164,12 @@ if (has(argv, '--apply')) {
     console.error('apply precheck failed: board/facade')
     process.exit(2)
   }
-  const applyPorts = makeApplyPorts({ boardProjectId: target, snapshot: liveAgain })
+  const applyPorts = makeApplyPorts({
+    boardProjectId: target,
+    snapshot: liveAgain,
+    script,
+    inventory,
+  })
   const result = await applyProjectLayerMigration(applyPlan, applyPorts)
   const resultPath = outPath || writeManifestPath(`${applyPlan.operationId}-result`)
   await mkdir(dirname(resultPath), { recursive: true })

@@ -133,7 +133,7 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
     setLoading(true);
     setErr(null);
     api
-      .getUsage(auth, { sessionsLimit: SESSIONS_PAGE, boardProjectId })
+      .getUsage(auth, { sessionsLimit: SESSIONS_PAGE, ...(boardProjectId ? { boardProjectId } : {}) })
       .then((u) => {
         if (!alive) return;
         setData(u);
@@ -164,8 +164,10 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
     setReportLoading(true);
     setReportErr(null);
     setReport(null);
-    api
-      .getMyUsageReport(auth, window, { boardProjectId })
+    const reportReq = boardProjectId
+      ? api.getMyUsageReport(auth, window, { boardProjectId })
+      : api.getMyUsageReport(auth, window)
+    reportReq
       .then((r) => {
         if (alive) setReport(r);
       })
@@ -187,7 +189,7 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
       const u = await api.getUsage(auth, {
         sessionsLimit: SESSIONS_PAGE,
         sessionsOffset: offset,
-        boardProjectId,
+        ...(boardProjectId ? { boardProjectId } : {}),
       });
       setSessions((prev) => [...prev, ...u.sessions.rows]);
       setOffset((o) => o + u.sessions.rows.length);

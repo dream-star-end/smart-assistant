@@ -5,7 +5,7 @@
  */
 
 import { createHash } from 'node:crypto'
-import { chmod, lstat, readdir } from 'node:fs/promises'
+import { readFile as fsReadFile, realpath as fsRealpath, chmod, lstat, readdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { BOARD_PROJECT_ID_RE, projectContextDir } from './projectContext.js'
 
@@ -45,7 +45,14 @@ export type ProjectLayerInventory = {
     bind_to_ocv5_chat?: { ids?: string[] }
   }
   memories?: {
-    test_candidates?: Array<{ slug: string; file?: string; hash?: string; content?: string }>
+    test_candidates?: Array<{
+      slug: string
+      file?: string
+      hash?: string
+      content?: string
+      absPath?: string
+      projectId?: string
+    }>
     exclude_secret_slugs?: string[]
     official_promote_slugs?: string[]
   }
@@ -342,18 +349,18 @@ export async function planProjectLayerMigration(opts: {
   }
 
   operations.push({
-    id: 'OP_ENSURE_CONTEXT',
-    op: 'ensure_project_context_dir',
-    dryRun: true,
-    boardProjectId: target,
-  })
-  operations.push({
     id: 'OP_REPAIR_OWNERSHIP',
     op: 'repair_project_ownership',
     dryRun: true,
     boardProjectId: target,
     uid: opts.agentUid ?? 1000,
     gid: opts.agentGid ?? 1000,
+  })
+  operations.push({
+    id: 'OP_ENSURE_CONTEXT',
+    op: 'ensure_project_context_dir',
+    dryRun: true,
+    boardProjectId: target,
   })
 
   const expected: Array<{ id: string; projectId: string | null; updatedAt: number }> = []
@@ -623,36 +630,73 @@ export function assertPlanApplyable(plan: ProjectLayerPlan): void {
   if (plan.expectedCounts?.drifted) throw new Error('inventory_count_drift')
 }
 
+export type SessionCasRow = { id: string; projectId: string | null; updatedAt: number }
+
 export type ApplyPorts = ProjectLayerLivePorts & {
-  createChatProject(name: string): Promise<{ id: string }>
-  bindChatProject(id: string, boardProjectId: string): Promise<void>
-  ensureProjectContext(boardProjectId: string): Promise<void>
+  createChatProject(name: string): Promise<{ id: string; created?: boolean }>
+  bindChatProject(
+    id: string,
+    boardProjectId: string | null,
+  ): Promise<{ old: string | null; new: string | null }>
+  ensureProjectContext(boardProjectId: string): Promise<{ created: boolean; version: number }>
   batchMoveSessions(input: {
     operationId: string
     ids: string[]
-    projectId: string
-    expected: Array<{ id: string; projectId: string | null; updatedAt: number }>
-  }): Promise<{ ok: true; updated: number } | { ok: false; error: string; staleIds?: string[] }>
-  createMemoryCandidate(input: { slug: string; content: string }): Promise<void>
-  putSkillOverlay(names: string[], expectedVersion: number): Promise<void>
+    projectId: string | null
+    expected: SessionCasRow[]
+    allowNullProject?: boolean
+  }): Promise<
+    | {
+        ok: true
+        updated: number
+        post: Array<SessionCasRow & { oldProjectId?: string | null; oldUpdatedAt?: number }>
+      }
+    | { ok: false; error: string; staleIds?: string[] }
+  >
+  createMemoryCandidate(input: {
+    slug: string
+    content: string
+  }): Promise<{ id: string; version: number; hash: string }>
+  rejectMemoryCandidate?(input: { id: string; version: number; slug?: string }): Promise<void>
+  putSkillOverlay(
+    names: string[],
+    expectedVersion: number,
+  ): Promise<{ old: string[]; new: string[] }>
   createAsset(input: {
     name: string
     sessionId: string
     containerPath: string
     digest: string
     source: 'output' | 'upload'
-  }): Promise<{ id: string; created: boolean }>
+    projectId?: string
+  }): Promise<{ id: string; created: boolean; reused?: boolean }>
   deleteAsset(id: string): Promise<void>
-  readMemoryContent?(slug: string, file?: string): Promise<string>
+  readMemoryContent?(slug: string, file?: string, expectedSha256?: string): Promise<string>
   repairOwnership?(boardProjectId: string, uid: number, gid: number): Promise<void>
+  searchMemoryMarker?(marker: string): Promise<boolean>
   backfillUsage?(input: {
     operationId: string
     sessionIds: string[]
     rowIds: string[]
     boardProjectId: string
     source: 'migration_backfill'
-  }): Promise<Array<{ id: string; oldBoardProjectId: string | null }>>
-  restoreUsage?(rows: Array<{ id: string; oldBoardProjectId: string | null }>): Promise<number>
+    planned?: number
+  }): Promise<
+    Array<{
+      id: string
+      oldBoardProjectId: string | null
+      newBoardProjectId?: string | null
+      postBoardProjectId?: string | null
+    }>
+  >
+  restoreUsage?(
+    rows: Array<{
+      id: string
+      oldBoardProjectId: string | null
+      postBoardProjectId?: string | null
+      newBoardProjectId?: string | null
+    }>,
+  ): Promise<number>
 }
 
 export type ApplyResult = {
@@ -662,8 +706,96 @@ export type ApplyResult = {
   createdAssetIds: string[]
   facadeId: string | null
   error?: string
+  manifest: {
+    facadeCreate: { id: string } | null
+    bind: { old: string | null; new: string | null } | null
+    context: { created: boolean; version: number } | null
+    memoryCandidates: Array<{ id: string; version: number; hash: string; slug: string }>
+    skillOverlay: { old: string[]; new: string[] } | null
+  }
   rollback: ProjectLayerPlan['rollback'] & {
-    usageRestores?: Array<{ id: string; oldBoardProjectId: string | null }>
+    usageRestores?: Array<{
+      id: string
+      oldBoardProjectId: string | null
+      postBoardProjectId?: string | null
+      newBoardProjectId?: string | null
+    }>
+    memoryRejects?: Array<{ id: string; version: number; slug: string }>
+    skillOverlayOld?: string[]
+    bindOld?: string | null
+  }
+}
+
+export const MEMORY_ALLOW_ROOTS = [
+  '/home/agent/.openclaude',
+  '/var/lib/docker/volumes/oc-v5-data-u3/_data',
+]
+
+export function isPathInsideRoot(resolved: string, root: string): boolean {
+  const normalized = resolved.endsWith('/') ? resolved.slice(0, -1) : resolved
+  const base = root.endsWith('/') ? root.slice(0, -1) : root
+  return normalized === base || normalized.startsWith(`${base}/`)
+}
+
+export async function readMemoryContent(opts: {
+  slug: string
+  file?: string
+  expectedSha256?: string
+  allowlist: Array<{
+    slug: string
+    file?: string
+    hash?: string
+    absPath?: string
+    projectId?: string
+  }>
+  roots?: string[]
+  readFileImpl?: (p: string) => Promise<Buffer>
+  realpathImpl?: (p: string) => Promise<string>
+}): Promise<string> {
+  const hit = opts.allowlist.find((row) => row.slug === opts.slug || (opts.file && row.file === opts.file))
+  if (!hit) throw new Error('memory_not_allowlisted')
+  const roots = opts.roots ?? MEMORY_ALLOW_ROOTS
+  const file = hit.file || opts.file || opts.slug
+  const testId = hit.projectId || 'b12fc2f7-c466-49de-892b-b44326b782c4'
+  const candidates: string[] = []
+  if (hit.absPath) candidates.push(hit.absPath)
+  for (const root of roots) {
+    candidates.push(join(root, 'projects', testId, 'memory-candidates', file))
+    candidates.push(join(root, 'memory', 'agents', 'main', 'memory', opts.slug))
+    candidates.push(join(root, 'memory', 'agents', 'main', 'memory', `${opts.slug}.md`))
+    candidates.push(join(root, 'agents', 'main', 'memory', opts.slug))
+    candidates.push(join(root, 'agents', 'main', 'memory', `${opts.slug}.md`))
+  }
+  const realpathImpl = opts.realpathImpl ?? ((p: string) => fsRealpath(p))
+  const readImpl = opts.readFileImpl ?? ((p: string) => fsReadFile(p))
+  let lastErr: Error | null = null
+  for (const cand of candidates) {
+    try {
+      const resolved = await realpathImpl(cand)
+      if (!roots.some((root) => isPathInsideRoot(resolved, root))) {
+        throw new Error('memory_path_escape')
+      }
+      const buf = await readImpl(resolved)
+      const hash = createHash('sha256').update(buf).digest('hex')
+      const expected = (opts.expectedSha256 || hit.hash || '').toLowerCase()
+      if (expected && hash !== expected) throw new Error('memory_hash_mismatch')
+      return buf.toString('utf8')
+    } catch (err) {
+      const msg = (err as Error).message
+      if (msg === 'memory_hash_mismatch' || msg === 'memory_path_escape') throw err
+      lastErr = err as Error
+    }
+  }
+  throw lastErr ?? new Error('memory_not_found')
+}
+
+function emptyManifest(): ApplyResult['manifest'] {
+  return {
+    facadeCreate: null,
+    bind: null,
+    context: null,
+    memoryCandidates: [],
+    skillOverlay: null,
   }
 }
 
@@ -675,28 +807,47 @@ export async function applyProjectLayerMigration(
   const applied: string[] = []
   const createdAssetIds: string[] = []
   let facadeId = plan.live.facadeId
-  const rollback = {
+  const manifest = emptyManifest()
+  const rollback: ApplyResult['rollback'] = {
     ...plan.rollback,
-    assetDeletes: [] as string[],
-    usageRestores: [] as Array<{ id: string; oldBoardProjectId: string | null }>,
+    sessionRestores: [],
+    assetDeletes: [],
+    usageRestores: [],
+    memoryRejects: [],
+    skillOverlayOld: [],
+    bindOld: undefined,
   }
+  const fail = (err: unknown): ApplyResult => ({
+    ok: false,
+    operationId: plan.operationId,
+    applied,
+    createdAssetIds,
+    facadeId,
+    error: (err as Error).message,
+    manifest,
+    rollback,
+  })
   try {
     for (const op of plan.operations) {
       if (op.op === 'create_chat_facade') {
         const created = await ports.createChatProject(op.name)
         facadeId = created.id
+        manifest.facadeCreate = { id: created.id }
         applied.push(op.id)
       } else if (op.op === 'bind_chat_facade') {
         const id = op.chatProjectId || facadeId
         if (!id) throw new Error('facade_missing')
-        await ports.bindChatProject(id, op.boardProjectId)
+        const bound = await ports.bindChatProject(id, op.boardProjectId)
         facadeId = id
-        applied.push(op.id)
-      } else if (op.op === 'ensure_project_context_dir') {
-        await ports.ensureProjectContext(op.boardProjectId)
+        manifest.bind = { old: bound.old, new: bound.new }
+        rollback.bindOld = bound.old
         applied.push(op.id)
       } else if (op.op === 'repair_project_ownership') {
         await ports.repairOwnership?.(op.boardProjectId, op.uid, op.gid)
+        applied.push(op.id)
+      } else if (op.op === 'ensure_project_context_dir') {
+        const ctx = await ports.ensureProjectContext(op.boardProjectId)
+        manifest.context = { created: ctx.created, version: ctx.version }
         applied.push(op.id)
       } else if (op.op === 'move_sessions') {
         if (!facadeId) throw new Error('facade_missing')
@@ -707,21 +858,41 @@ export async function applyProjectLayerMigration(
           expected: op.expected,
         })
         if (!moved.ok) throw new Error(moved.error || 'stale_session')
+        rollback.sessionRestores = moved.post.map((row) => ({
+          id: row.id,
+          projectId: row.oldProjectId ?? op.expected.find((e) => e.id === row.id)?.projectId ?? null,
+          updatedAt: row.updatedAt,
+        }))
         applied.push(op.id)
       } else if (op.op === 'copy_memory_candidate') {
-        const content = (await ports.readMemoryContent?.(op.slug, op.source)) ?? ''
-        if (!content) {
-          continue
+        const content = await ports.readMemoryContent?.(op.slug, op.source, op.sha256)
+        if (!content) continue
+        const cand = await ports.createMemoryCandidate({ slug: op.slug, content })
+        manifest.memoryCandidates.push({
+          id: cand.id,
+          version: cand.version,
+          hash: cand.hash,
+          slug: op.slug,
+        })
+        rollback.memoryRejects?.push({ id: cand.id, version: cand.version, slug: op.slug })
+        const marker = content.slice(0, 80)
+        if (ports.searchMemoryMarker) {
+          const hit = await ports.searchMemoryMarker(marker || op.slug)
+          if (!hit) throw new Error('memory_search_miss')
         }
-        await ports.createMemoryCandidate({ slug: op.slug, content })
         applied.push(op.id)
       } else if (op.op === 'skill_overlay') {
-        await ports.putSkillOverlay(op.names, plan.live.contextVersion ?? 0)
+        const overlay = await ports.putSkillOverlay(op.names, plan.live.contextVersion ?? 0)
+        manifest.skillOverlay = overlay
+        rollback.skillOverlayOld = overlay.old
         applied.push(op.id)
       } else if (op.op === 'create_asset') {
-        const asset = await ports.createAsset(op)
-        createdAssetIds.push(asset.id)
-        rollback.assetDeletes.push(asset.id)
+        if (!facadeId) throw new Error('facade_missing')
+        const asset = await ports.createAsset({ ...op, projectId: facadeId })
+        if (asset.created) {
+          createdAssetIds.push(asset.id)
+          rollback.assetDeletes.push(asset.id)
+        }
         applied.push(op.id)
       } else if (op.op === 'usage_backfill') {
         const rowIds = op.rowIds ?? []
@@ -732,8 +903,14 @@ export async function applyProjectLayerMigration(
             rowIds,
             boardProjectId: op.boardProjectId,
             source: 'migration_backfill',
+            planned: rowIds.length,
           })
-          rollback.usageRestores.push(...rows)
+          ;(rollback.usageRestores ??= []).push(
+            ...rows.map((row) => ({
+              ...row,
+              postBoardProjectId: row.postBoardProjectId ?? row.newBoardProjectId ?? op.boardProjectId,
+            })),
+          )
         }
         applied.push(op.id)
       }
@@ -744,60 +921,57 @@ export async function applyProjectLayerMigration(
       applied,
       createdAssetIds,
       facadeId,
+      manifest,
       rollback,
     }
   } catch (err) {
-    await compensateProjectLayerMigration(
-      {
-        ok: false,
-        operationId: plan.operationId,
-        applied,
-        createdAssetIds,
-        facadeId,
-        error: (err as Error).message,
-        rollback,
-      },
-      ports,
-    )
-    return {
-      ok: false,
-      operationId: plan.operationId,
-      applied,
-      createdAssetIds,
-      facadeId,
-      error: (err as Error).message,
-      rollback,
-    }
+    const failed = fail(err)
+    await compensateProjectLayerMigration(failed, ports)
+    return failed
   }
 }
 
 export async function compensateProjectLayerMigration(
   result: ApplyResult,
-  ports: Pick<ApplyPorts, 'batchMoveSessions' | 'deleteAsset' | 'restoreUsage'>,
+  ports: Pick<ApplyPorts, 'batchMoveSessions' | 'deleteAsset'> &
+    Partial<Pick<ApplyPorts, 'restoreUsage' | 'rejectMemoryCandidate' | 'putSkillOverlay' | 'bindChatProject'>>,
 ): Promise<void> {
   const usageRestores = result.rollback.usageRestores ?? []
   if (usageRestores.length && ports.restoreUsage) {
-    await ports.restoreUsage(usageRestores).catch(() => {})
+    await ports.restoreUsage(usageRestores)
   }
   for (const id of [...result.rollback.assetDeletes].reverse()) {
-    await ports.deleteAsset(id).catch(() => {})
+    await ports.deleteAsset(id)
+  }
+  for (const cand of [...(result.rollback.memoryRejects ?? [])].reverse()) {
+    if (!ports.rejectMemoryCandidate) throw new Error('memory_reject_port_missing')
+    await ports.rejectMemoryCandidate(cand)
+  }
+  if (result.rollback.skillOverlayOld && ports.putSkillOverlay && result.manifest.skillOverlay) {
+    await ports.putSkillOverlay(result.rollback.skillOverlayOld, result.manifest.context?.version ?? 0)
   }
   if (result.rollback.sessionRestores.length) {
-    const byDest = new Map<string, Array<{ id: string; projectId: string | null; updatedAt: number }>>()
+    const byDest = new Map<string, SessionCasRow[]>()
     for (const row of result.rollback.sessionRestores) {
-      const key = row.projectId ?? ''
+      const key = row.projectId === null ? '__NULL__' : row.projectId
       const list = byDest.get(key) ?? []
       list.push(row)
       byDest.set(key, list)
     }
-    for (const [dest, rows] of byDest) {
-      await ports.batchMoveSessions({
+    for (const [key, rows] of byDest) {
+      const dest = key === '__NULL__' ? null : key
+      const moved = await ports.batchMoveSessions({
         operationId: `${result.operationId}-rollback`,
         ids: rows.map((r) => r.id),
         projectId: dest,
         expected: rows,
-      }).catch(() => {})
+        allowNullProject: dest === null,
+      })
+      if (!moved.ok) throw new Error(moved.error || 'session_compensate_failed')
     }
+  }
+  if (result.rollback.bindOld !== undefined && result.manifest.bind?.new && ports.bindChatProject) {
+    await ports.bindChatProject(result.manifest.bind.new, result.rollback.bindOld)
   }
 }
 

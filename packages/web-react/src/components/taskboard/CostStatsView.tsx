@@ -15,6 +15,7 @@ import {
 } from '../../lib/taskboard'
 import type { AuthSession } from '../../lib/types'
 import { useProjectScope } from '../../hooks/useProjectScope'
+import { UNBOUND_BOARD_COPY, boardWorkQuery } from '../../lib/projectScope'
 import { Button, Card, EmptyState, Field, Input, ListSkeleton, ProjectScopeSelect, Select, StatCard } from '../ui'
 import { CostCoverageBlock } from './CostCoverageBlock'
 
@@ -49,7 +50,8 @@ export function CostStatsView({
   projects: Project[]
 }) {
   const { scope } = useProjectScope()
-  const scopedProjectId = scope.kind === 'work' ? scope.workProject?.id ?? null : null
+  const workQuery = boardWorkQuery(scope)
+  const scopedProjectId = 'projectId' in workQuery ? workQuery.projectId : null
   const today = ymdInZone()
   const [from, setFrom] = useState(() => addDaysYmd(today, -6))
   const [to, setTo] = useState(today)
@@ -64,6 +66,12 @@ export function CostStatsView({
   }, [projectId])
 
   const load = useCallback(async () => {
+    if (!scopedProjectId) {
+      setLoading(false)
+      setError(null)
+      setStats(null)
+      return
+    }
     setLoading(true)
     setError(null)
     try {
@@ -71,7 +79,7 @@ export function CostStatsView({
         from,
         to,
         groupBy,
-        projectId: scopedProjectId || undefined,
+        projectId: scopedProjectId,
         timeZone: TZ,
       })
       setStats(fresh)
@@ -128,13 +136,15 @@ export function CostStatsView({
           />
         </Field>
         <Field label="项目" className="min-w-[10rem]">
-          <ProjectScopeSelect className="w-full" />
+          <ProjectScopeSelect variant="work" className="w-full" />
         </Field>
         <Button type="button" size="sm" variant="secondary" onClick={() => void load()}>
           刷新
         </Button>
       </div>
-      {loading && !stats ? (
+      {'blocked' in workQuery ? (
+        <EmptyState icon={Coins} title={UNBOUND_BOARD_COPY} hint="切换到已绑定看板的工作项目后再查看成本。" />
+      ) : loading && !stats ? (
         <ListSkeleton rows={5} variant="card" />
       ) : error ? (
         <EmptyState
