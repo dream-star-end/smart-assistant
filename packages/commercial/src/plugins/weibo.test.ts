@@ -197,7 +197,7 @@ describe('official Weibo Plugin', () => {
   })
 
   test('pins the current artifact and only the exact production predecessor', () => {
-    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.31')
+    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.32')
     assert.equal(WEIBO_DRIVER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.equal(WEIBO_LAUNCHER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.deepEqual(WEIBO_SETUP_COMPATIBLE_PREDECESSORS, [
@@ -508,7 +508,12 @@ describe('official Weibo Plugin', () => {
     assert.match(WEIBO_WORKER_SOURCE, /exactMenuItem\(scope, '发送'\)/)
     assert.match(WEIBO_WORKER_SOURCE, /awaitComposerMediaReady/)
     assert.match(WEIBO_WORKER_SOURCE, /collectVisibleImageSrcs/)
-    assert.match(createPostSource, /90_000, previewBefore/)
+    assert.match(createPostSource, /prepared.attached \? 8_000 : 45_000, previewBefore/)
+    assert.match(createPostSource, /45_000, previewBefore, previewBeforeCount, previewBeforeDelete, previewBeforeNodes/)
+    assert.match(WEIBO_WORKER_SOURCE, /woo-picture/)
+    assert.match(WEIBO_WORKER_SOURCE, /Date.now\(\) >= deadline/)
+    assert.match(WEIBO_WORKER_SOURCE, /countPreviewNodes/)
+    assert.match(WEIBO_WORKER_SOURCE, /isComposerPreviewSrc/)
     assert.ok(
       createPostSource.indexOf('previewBeforeCount') <
         createPostSource.indexOf('liveInput.setInputFiles(files)'),

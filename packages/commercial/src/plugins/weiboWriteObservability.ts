@@ -117,6 +117,7 @@ const LOG_ALLOW_KEYS = new Set([
   'canvasCount',
   'frameCount',
   'deleteHits',
+  'previewNodes',
 ])
 
 /**

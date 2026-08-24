@@ -1250,8 +1250,26 @@ async function uniqueVisibleClickable(root, selector) {
   }
   return matches.length === 1 ? matches[0] : null;
 }
+async function countPreviewNodes(scope) {
+  if (!scope || typeof scope.locator !== 'function') return 0;
+  const nodes = scope.locator('img[src^="blob:"], img[src^="data:"], video, [class*="woo-picture"], [class*="wbpro-pic"], [class*="image-box"], [class*="pic-item"], [style*="blob:"]');
+  if (!nodes || typeof nodes.count !== 'function' || typeof nodes.nth !== 'function') return 0;
+  const total = Math.min(await nodes.count().catch(() => 0), 20);
+  let hits = 0;
+  for (let index = 0; index < total; index += 1) {
+    if (await visible(nodes.nth(index))) hits += 1;
+  }
+  return hits;
+}
+function isComposerPreviewSrc(src) {
+  if (!src) return false;
+  if (/^(blob:|data:)/i.test(src)) return true;
+  if (/sinaimg\.cn/i.test(src) && !/avatar|\.50\/|\.180\//i.test(src)) return true;
+  return false;
+}
 async function countPreviewSignals(scope, page) {
   const imgCount = await countVisibleImgs(scope);
+  const previewNodes = await countPreviewNodes(scope);
   let canvasCount = 0;
   let bgCount = 0;
   let frameCount = 0;
@@ -1268,7 +1286,7 @@ async function countPreviewSignals(scope, page) {
     frameCount = Math.min(frames && typeof frames.count === 'function' ? await frames.count().catch(() => 0) : 0, 12);
   } catch {}
   const deleted = await exactMenuItem(scope, '删除');
-  return { imgCount, canvasCount, bgCount, frameCount, deleteHits: deleted ? 1 : 0 };
+  return { imgCount, previewNodes, canvasCount, bgCount, frameCount, deleteHits: deleted ? 1 : 0 };
 }
 async function collectVisibleImageSrcs(scope) {
   const srcs = [];
@@ -1307,11 +1325,12 @@ async function awaitComposerCleared(page, editor, timeout) {
   }
   return false;
 }
-async function awaitComposerMediaReady(page, editor, expectedNew, timeout, beforeSrcs, beforeCount, beforeDelete) {
+async function awaitComposerMediaReady(page, editor, expectedNew, timeout, beforeSrcs, beforeCount, beforeDelete, beforeNodes) {
   const scope = (await composerScope(editor)) || page;
   if (!scope || typeof scope.locator !== 'function') throw new Error('media-preview-timeout');
   const before = new Set(Array.isArray(beforeSrcs) ? beforeSrcs : []);
   const baseCount = Number.isFinite(beforeCount) ? beforeCount : before.size;
+  const baseNodes = Number.isFinite(beforeNodes) ? beforeNodes : 0;
   const deadline = Date.now() + timeout;
   const attempts = Math.max(1, Math.ceil(timeout / 250));
   let emittedChange = false;
@@ -1326,6 +1345,7 @@ async function awaitComposerMediaReady(page, editor, expectedNew, timeout, befor
     deleteHits: startSignals.deleteHits,
   });
   for (let attempt = 0; attempt < attempts; attempt += 1) {
+    if (Date.now() >= deadline) break;
     const added = [];
     const seen = new Set();
     for (const src of await collectVisibleImageSrcs(scope)) {
@@ -1335,24 +1355,27 @@ async function awaitComposerMediaReady(page, editor, expectedNew, timeout, befor
     }
     const imgs = await countVisibleImgs(scope);
     const deleted = await exactMenuItem(scope, '删除');
-    const ready = added.length >= expectedNew || imgs >= baseCount + expectedNew || (!!deleted && !beforeDelete);
-    if (!emittedChange && (added.length > 0 || imgs !== startSignals.imgCount || (!!deleted && !beforeDelete))) {
+    const signals = await countPreviewSignals(scope, page);
+    const addedPreview = added.filter((src) => isComposerPreviewSrc(src)).length;
+    const ready = addedPreview >= expectedNew || added.length >= expectedNew
+      || imgs >= baseCount + expectedNew || (!!deleted && !beforeDelete)
+      || signals.previewNodes >= baseNodes + expectedNew;
+    if (!emittedChange && (added.length > 0 || imgs !== startSignals.imgCount || signals.previewNodes !== startSignals.previewNodes || (!!deleted && !beforeDelete))) {
       emittedChange = true;
-      const change = await countPreviewSignals(scope, page);
       emitStep({
         step: 'media.preview.change',
         addedSrcs: added.length,
-        imgCount: change.imgCount,
-        bgCount: change.bgCount,
-        canvasCount: change.canvasCount,
-        frameCount: change.frameCount,
-        deleteHits: change.deleteHits,
+        imgCount: signals.imgCount,
+        bgCount: signals.bgCount,
+        canvasCount: signals.canvasCount,
+        frameCount: signals.frameCount,
+        deleteHits: signals.deleteHits,
       });
     }
     if (ready) {
       emitStep({
         step: 'media.preview.ready',
-        reason: added.length >= expectedNew ? 'added-src' : imgs >= baseCount + expectedNew ? 'img-count' : 'delete',
+        reason: addedPreview >= expectedNew || added.length >= expectedNew ? 'added-src' : imgs >= baseCount + expectedNew ? 'img-count' : (!!deleted && !beforeDelete) ? 'delete' : 'preview-node',
         addedSrcs: added.length,
         imgCount: imgs,
         deleteHits: deleted ? 1 : 0,
@@ -1751,6 +1774,7 @@ async function writeAction(page, input) {
     let previewBefore = [];
     let previewBeforeCount = 0;
     let previewBeforeDelete = false;
+    let previewBeforeNodes = 0;
     if (manifest.length === 0) {
       await awaitPostSendReady(page, 30_000, editor);
     } else if (!(await provePostImageControl(page, editor))) {
@@ -1760,6 +1784,7 @@ async function writeAction(page, input) {
       previewBefore = await collectVisibleImageSrcs(previewScope);
       previewBeforeCount = await countVisibleImgs(previewScope);
       previewBeforeDelete = !!(await exactMenuItem(previewScope, '删除'));
+      previewBeforeNodes = await countPreviewNodes(previewScope);
     }
     await awaitDispatch();
     await assertNoChallenge(page);
@@ -1820,7 +1845,35 @@ async function writeAction(page, input) {
           mediaCount: manifest.length,
         });
         if (selected !== manifest.length && !prepared.attached) throw new Error('media-upload');
-        await awaitComposerMediaReady(page, freshEditor, manifest.length, 90_000, previewBefore, previewBeforeCount, previewBeforeDelete);
+        let previewReady = false;
+        try {
+          await awaitComposerMediaReady(page, freshEditor, manifest.length, prepared.attached ? 8_000 : 45_000, previewBefore, previewBeforeCount, previewBeforeDelete, previewBeforeNodes);
+          previewReady = true;
+        } catch (error) {
+          if (String(error && error.message) !== 'media-preview-timeout') throw error;
+        }
+        if (!previewReady && prepared.attached) {
+          retried = true;
+          const retryScope = (await composerScope(freshEditor)) || page;
+          const liveInput = await uniqueImageFileInput(retryScope);
+          if (liveInput) {
+            await liveInput.setInputFiles(files);
+            try {
+              selected = await liveInput.evaluate((node) => node.files ? node.files.length : 0);
+            } catch {}
+          }
+          emitStep({
+            step: 'media.upload',
+            selected,
+            retried: true,
+            freshSelected,
+            attached: true,
+            mediaCount: manifest.length,
+          });
+          await awaitComposerMediaReady(page, freshEditor, manifest.length, 45_000, previewBefore, previewBeforeCount, previewBeforeDelete, previewBeforeNodes);
+        } else if (!previewReady) {
+          throw new Error('media-preview-timeout');
+        }
       } finally {
         for (const file of files) file.buffer.fill(0);
       }
