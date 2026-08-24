@@ -11250,8 +11250,20 @@ export function createPgSessionsBackend(
       if (input.instructions !== undefined) {
         const instructions = parseChatProjectOptionalText(input.instructions, CHAT_PROJECT_INSTRUCTIONS_MAX);
         if ("invalid" in instructions || !instructions.present) return { ok: false, error: "invalid_instructions" };
-        sets.push(`instructions = $${n++}`);
-        params.push(instructions.value);
+        const existing = await readPgChatProject(pool, userId, id);
+        const nextBoard =
+          input.boardProjectId !== undefined
+            ? parseBoardProjectId(input.boardProjectId)
+            : { present: true as const, value: existing?.boardProjectId ?? null };
+        const boundAfter =
+          "present" in nextBoard &&
+          nextBoard.present &&
+          typeof nextBoard.value === "string" &&
+          nextBoard.value.length > 0;
+        if (!boundAfter) {
+          sets.push(`instructions = $${n++}`);
+          params.push(instructions.value);
+        }
       }
       if (input.color !== undefined) {
         const color = parseChatProjectOptionalText(input.color, CHAT_PROJECT_COLOR_MAX);

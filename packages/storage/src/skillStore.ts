@@ -27,8 +27,8 @@
 //
 // Ported from NousResearch/hermes-agent tools/skills_tool.py.
 
-import { randomUUID } from 'node:crypto'
-import { type Dir, type Dirent, type Stats, existsSync, realpathSync, statSync } from 'node:fs'
+import { createHash, randomUUID } from 'node:crypto'
+import { type Dir, type Dirent, type Stats, existsSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import {
   lstat,
   mkdir,
@@ -41,7 +41,7 @@ import {
   stat,
   writeFile,
 } from 'node:fs/promises'
-import { isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { paths } from './paths.js'
 
 export const MAX_SKILL_NAME_LENGTH = 64
@@ -437,6 +437,11 @@ export interface SkillStoreOptions {
    */
   projectDir?: string
   /**
+   * Gateway-owned SKILL.md hashes for the project overlay. When present,
+   * runtime list/view only expose overlay skills whose SKILL.md still matches.
+   */
+  projectSkillHashes?: ReadonlyMap<string, string>
+  /**
    * Whether the shared root is writable through this store. Runtime stores for
    * non-default agents read assigned shared skills but still write new self-authored
    * skills into their private legacy dir.
@@ -467,6 +472,8 @@ export class SkillStore {
   private readonly hubRoot: string | null
   /** Absolute project overlay root, or null. */
   private readonly projectRoot: string | null
+  /** name → SKILL.md sha256 for project overlay (fail-closed when empty). */
+  private readonly projectSkillHashes: ReadonlyMap<string, string> | null
   /** Aggregate all agents' legacy dirs on read (user-level surface). */
   private readonly aggregateLegacy: boolean
   /** True iff writes/deletes should target the shared root. */
@@ -533,8 +540,11 @@ export class SkillStore {
       if (resolved !== projectsRoot && !resolved.startsWith(projectsRoot + sep)) {
         throw new Error(`projectDir must resolve within ${projectsRoot}: ${opts.projectDir}`)
       }
+      this.projectSkillHashes =
+        opts.projectSkillHashes ?? readProjectSkillHashesFromMeta(this.projectRoot)
     } else {
       this.projectRoot = null
+      this.projectSkillHashes = null
     }
 
     // --- hub (ro marketplace-installed; missing tolerated; must resolve within HOME) ---
@@ -661,6 +671,7 @@ export class SkillStore {
       try {
         const raw = await this.safeReadFile(skillMd, rootDir)
         if (!raw) continue
+        if (layer === 'project' && !this.projectOverlayHashOk(entry.name, raw)) continue
         const { meta } = parseFrontmatter(raw)
         if (!meta.name || !meta.description) continue
         const agentIds = await this.agentScopeForLayer(rootDir, entry.name, layer, ownerAgentId)
@@ -721,6 +732,14 @@ export class SkillStore {
     if (layer === 'project') return agentIds.includes(this.agentId)
     if (layer !== 'shared' && layer !== 'hub') return true
     return agentIds.includes(this.agentId)
+  }
+
+  private projectOverlayHashOk(name: string, raw: string): boolean {
+    if (!this.projectSkillHashes || this.projectSkillHashes.size === 0) return false
+    const expected = this.projectSkillHashes.get(name)
+    if (!expected) return false
+    const actual = createHash('sha256').update(raw, 'utf8').digest('hex')
+    return actual === expected
   }
 
   /**
@@ -815,14 +834,20 @@ export class SkillStore {
       )
     }
     if (await this.scopedRootHas(this.projectRoot, name, 'project')) {
-      return this.viewFromRoot(
-        name,
-        subfile,
+      const rawMd = await this.safeReadFile(
+        join(this.projectRoot as string, name, 'SKILL.md'),
         this.projectRoot as string,
-        'user',
-        'project',
-        false,
       )
+      if (rawMd && this.projectOverlayHashOk(name, rawMd)) {
+        return this.viewFromRoot(
+          name,
+          subfile,
+          this.projectRoot as string,
+          'user',
+          'project',
+          false,
+        )
+      }
     }
     if (await this.scopedRootHas(this.sharedRoot, name, 'shared')) {
       return this.viewFromRoot(
@@ -1408,6 +1433,25 @@ export function resolveBaselineSkillsDirFromEnv(): string | undefined {
  */
 export function resolveDefaultAgentId(): string {
   return process.env.OPENCLAUDE_DEFAULT_AGENT_ID?.trim() || 'main'
+}
+
+function readProjectSkillHashesFromMeta(projectSkillsDir: string): Map<string, string> {
+  const map = new Map<string, string>()
+  try {
+    const raw = readFileSync(join(dirname(projectSkillsDir), 'meta.json'), 'utf8')
+    const parsed = JSON.parse(raw) as {
+      contentManifest?: { skills?: Array<{ name?: unknown; skillMdSha256?: unknown; active?: unknown }> }
+    }
+    for (const s of parsed.contentManifest?.skills ?? []) {
+      if (s.active === false) continue
+      if (typeof s.name === 'string' && typeof s.skillMdSha256 === 'string') {
+        map.set(s.name, s.skillMdSha256)
+      }
+    }
+  } catch {
+    /* fail-closed: empty map hides unverified overlay */
+  }
+  return map
 }
 
 /**

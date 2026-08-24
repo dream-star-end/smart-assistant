@@ -102,6 +102,24 @@ describe('chat_projects CRUD', () => {
     if (!invalid.ok) assert.equal(invalid.error, 'invalid_board_project_id')
   })
 
+  it('bound updates do not write instructions to PG; unbind restores PG authority', async () => {
+    const created = await createChatProject(USER, { name: 'BoundIns', instructions: 'pg-seed' })
+    assert.equal(created.ok, true)
+    if (!created.ok) return
+    const board = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'
+    const bound = await updateChatProject(USER, created.project.id, { boardProjectId: board })
+    assert.equal(bound.ok, true)
+    const skipped = await updateChatProject(USER, created.project.id, { instructions: 'should-not-land' })
+    assert.equal(skipped.ok, true)
+    if (skipped.ok) assert.equal(skipped.project.instructions, 'pg-seed')
+    const unbound = await updateChatProject(USER, created.project.id, { boardProjectId: null })
+    assert.equal(unbound.ok, true)
+    if (unbound.ok) assert.equal(unbound.project.instructions, 'pg-seed')
+    const after = await updateChatProject(USER, created.project.id, { instructions: 'pg-after-unbind' })
+    assert.equal(after.ok, true)
+    if (after.ok) assert.equal(after.project.instructions, 'pg-after-unbind')
+  })
+
   it('list 按 sort_order ASC, created_at ASC;sessionCount 只计未删会话', async () => {
     const a = await createChatProject(USER, { name: 'A' })
     const b = await createChatProject(USER, { name: 'B' })

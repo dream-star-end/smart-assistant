@@ -1714,6 +1714,7 @@ export class SubprocessRunner extends EventEmitter {
         descriptor: this.opts.runContext,
         applied: promptResult.applied,
         promptContentSha256: promptResult.contentSha256,
+        frozen: promptResult.frozenProjectContext,
         cwd: cwdDecision.cwd,
         cwdSource: cwdDecision.source,
         sessionRepoOverlay: cwdDecision.sessionRepoOverlay,

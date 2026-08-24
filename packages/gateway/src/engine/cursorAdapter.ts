@@ -1442,6 +1442,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         descriptor: this.opts.runContext,
         applied: platformResult.applied,
         promptContentSha256: platformResult.contentSha256,
+        frozen: platformResult.frozenProjectContext,
         cwd: cwdDecision.cwd,
         cwdSource: cwdDecision.source,
         sessionRepoOverlay: cwdDecision.sessionRepoOverlay,

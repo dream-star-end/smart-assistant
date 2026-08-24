@@ -1489,7 +1489,22 @@ export const taskboardApi = {
     ),
 
   getProjectContext: (a: AuthSession, id: string) =>
-    boardGet<Record<string, unknown>>(a, `/api/board/projects/${encodeURIComponent(id)}/context`),
+    boardGet<Record<string, unknown> & { version?: number; instructions?: string | null }>(
+      a,
+      `/api/board/projects/${encodeURIComponent(id)}/context`,
+    ),
+
+  putProjectContext: (
+    a: AuthSession,
+    id: string,
+    body: { expectedVersion: number; instructions?: string | null; skillNames?: string[] },
+  ) =>
+    boardSend<{ ok: boolean; context: { version: number; instructions: string | null } }>(
+      a,
+      `/api/board/projects/${encodeURIComponent(id)}/context`,
+      "PUT",
+      body,
+    ),
 
   previewProjectContext: (a: AuthSession, id: string) =>
     boardGet<Record<string, unknown>>(

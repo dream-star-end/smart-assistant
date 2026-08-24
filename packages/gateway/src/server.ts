@@ -5751,6 +5751,12 @@ export class Gateway {
       url.pathname === '/api/board/reports/weekly' ||
       url.pathname.match(/^\/api\/board\/projects\/([^/]+)$/) ||
       url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/board$/) ||
+      url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/context$/) ||
+      url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/context\/preview$/) ||
+      url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/memories$/) ||
+      url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/memories\/([^/]+)$/) ||
+      url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/memories\/([^/]+)\/(promote|reject|deprecate)$/) ||
+      url.pathname.match(/^\/api\/board\/runs\/([^/]+)\/context$/) ||
       url.pathname.match(/^\/api\/board\/tickets\/([^/]+)$/) ||
       url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/(ready|claim|advance)$/) ||
       url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/(block|approve|reject)$/) ||
@@ -16183,7 +16189,9 @@ export class Gateway {
       userId: activeUserId,
       workspaceMode: safeWorkspaceMode,
       ...(chatWorkspace.workspaceCwd ? { workspaceCwd: chatWorkspace.workspaceCwd } : {}),
-      ...(chatWorkspace.projectId ? { projectId: chatWorkspace.projectId } : {}),
+      projectId: chatWorkspace.projectId,
+      contextFingerprint: chatWorkspace.contextFingerprint,
+      assetsRevision: chatWorkspace.assetsRevision,
       runContext: webchatRunContext,
       title: (frame.content.text ?? '').slice(0, 50).trim() || undefined,
       // 仅用于**新建** runner 时初始化 effort;既存 session 的切换由 submit() 处理
@@ -17636,7 +17644,7 @@ export class Gateway {
         channel: frame.channel,
         userText: text ?? '',
         assistantText: autoDreamAssistantText,
-        projectId: session.projectId,
+        projectId: session.projectId ?? undefined,
       }
       // Durably await the success-only marker before detaching background scan.
       // This prevents process shutdown from losing an untracked insertion and
@@ -19137,6 +19145,7 @@ function normalizePath(p: string): string {
     .replace(/\/api\/chat-projects\/[a-zA-Z0-9_-]+/, '/api/chat-projects/:id')
     .replace(/\/api\/project-assets\/[a-zA-Z0-9_-]+/, '/api/project-assets/:id')
     .replace(/\/api\/board\/projects\/[^/]+\/board/, '/api/board/projects/:id/board')
+    .replace(/\/api\/board\/projects\/[^/]+\/context\/preview/, '/api/board/projects/:id/context/preview')
     .replace(/\/api\/board\/projects\/[^/]+\/context/, '/api/board/projects/:id/context')
     .replace(
       /\/api\/board\/projects\/[^/]+\/memories\/[^/]+\/[a-z]+/,
@@ -19152,7 +19161,6 @@ function normalizePath(p: string): string {
     .replace(/\/api\/board\/stages\/[^/]+/, '/api/board/stages/:id')
     .replace(/\/api\/board\/runs\/[^/]+\/context/, '/api/board/runs/:id/context')
     .replace(/\/api\/board\/runs\/[^/]+/, '/api/board/runs/:id')
-    .replace(/\/api\/board\/projects\/[^/]+\/context\/preview/, '/api/board/projects/:id/context/preview')
     .replace(/\/api\/board\/relations\/[^/]+/, '/api/board/relations/:id')
     .replace(/\/api\/board\/templates\/[^/]+\/apply/, '/api/board/templates/:id/apply')
     .replace(/\/api\/board\/templates\/[^/]+/, '/api/board/templates/:id')

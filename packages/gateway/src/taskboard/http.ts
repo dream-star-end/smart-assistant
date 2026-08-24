@@ -11,13 +11,12 @@
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import {
-  copySkillIntoProjectOverlay,
+  commitProjectSkillOverlay,
   loadProjectContext,
   parseProjectWorkspace,
   paths,
   readProjectRunContextFile,
   resolveProjectCwd,
-  setProjectSkillOverlay,
   writeProjectInstructions,
 } from '@openclaude/storage'
 import { filterUserVisibleAgentsForManagement, isHiddenSystemAgentId } from '../agentVisibility.js'
@@ -1032,10 +1031,9 @@ async function handlePutProjectContext(
   }
   if (Array.isArray(body.skillNames)) {
     const names = body.skillNames.filter((n): n is string => typeof n === 'string')
-    for (const name of names) {
-      await copySkillIntoProjectOverlay(project.id, name, `${paths.sharedSkillsDir}/${name}`)
-    }
-    const written = await setProjectSkillOverlay(project.id, names, expectedVersion)
+    const written = await commitProjectSkillOverlay(project.id, names, expectedVersion, {
+      sourceFor: (name) => `${paths.sharedSkillsDir}/${name}`,
+    })
     if (!written.ok) {
       sendError(res, written.error === 'version_conflict' ? 409 : 400, written.error, {
         current: written.current ?? null,

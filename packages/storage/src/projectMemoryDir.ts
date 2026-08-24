@@ -8,7 +8,7 @@
  */
 
 import { createHash, randomUUID } from 'node:crypto'
-import { mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync } from 'node:fs'
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 import {
@@ -83,7 +83,7 @@ export interface ProjectMemoryFileRead {
 
 export type ProjectCandidateWriteResult =
   | { ok: true; file: string; sha256: string; bytes: number }
-  | { ok: false; error: 'invalid' | 'forbidden' | 'scan_rejected'; detail: string }
+  | { ok: false; error: 'invalid' | 'forbidden' | 'scan_rejected' | 'exists'; detail: string }
 
 export class ProjectMemoryDir {
   readonly boardProjectId: string
@@ -182,15 +182,11 @@ export class ProjectMemoryDir {
     }
   }
 
-  /**
-   * Write a candidate file. Does not touch official memory/ or MEMORY.md.
-   * `conflictSuffix` (8 hex) makes a distinct filename when the slug is taken.
-   */
-  async writeCandidate(
+  prepareCandidateBody(
     slug: string,
     content: string,
-    opts: { auto?: boolean; today?: string; conflictSuffix?: string } = {},
-  ): Promise<ProjectCandidateWriteResult> {
+    opts: { auto?: boolean; today?: string } = {},
+  ): { ok: true; stored: string; sha256: string } | { ok: false; error: 'invalid' | 'forbidden' | 'scan_rejected'; detail: string } {
     let file: string
     try {
       file = assertProjectMemoryFile(slug)
@@ -199,10 +195,6 @@ export class ProjectMemoryDir {
     }
     if (isForbiddenAutoMemoryTarget(file) || /^user\.md$/i.test(file) || file.toLowerCase() === 'project.md') {
       return { ok: false, error: 'forbidden', detail: file }
-    }
-    if (opts.conflictSuffix) {
-      const stem = file.replace(/\.md$/i, '').slice(0, 40)
-      file = assertProjectMemoryFile(`${stem}--${opts.conflictSuffix.slice(0, 8)}.md`)
     }
     const today = opts.today ?? memoryCalendarDate()
     let body = normalizeMemoryEol(content)
@@ -218,10 +210,65 @@ export class ProjectMemoryDir {
     const scan = scanMemoryContent(body)
     if (!scan.ok) return { ok: false, error: 'scan_rejected', detail: scan.reason ?? 'rejected' }
     const stored = body.endsWith('\n') ? body : `${body}\n`
-    const sha = sha256Hex(stored)
+    return { ok: true, stored, sha256: sha256Hex(stored) }
+  }
+
+  candidateFileExists(file: string): boolean {
+    return existsSync(this.candidateFile(file))
+  }
+
+  /**
+   * Write a candidate file. Does not touch official memory/ or MEMORY.md.
+   * Filename is decided by the caller; exclusive writes never overwrite.
+   */
+  async writeCandidate(
+    slug: string,
+    content: string,
+    opts: {
+      auto?: boolean
+      today?: string
+      conflictSuffix?: string
+      file?: string
+      exclusive?: boolean
+      stored?: string
+    } = {},
+  ): Promise<ProjectCandidateWriteResult> {
+    let file: string
+    try {
+      file = assertProjectMemoryFile(opts.file ?? slug)
+    } catch (err) {
+      return { ok: false, error: 'invalid', detail: (err as Error).message }
+    }
+    if (isForbiddenAutoMemoryTarget(file) || /^user\.md$/i.test(file) || file.toLowerCase() === 'project.md') {
+      return { ok: false, error: 'forbidden', detail: file }
+    }
+    if (!opts.file && opts.conflictSuffix) {
+      const stem = file.replace(/\.md$/i, '').slice(0, 40)
+      file = assertProjectMemoryFile(`${stem}--${opts.conflictSuffix.slice(0, 8)}.md`)
+    }
+    let stored: string
+    let sha: string
+    if (opts.stored) {
+      stored = opts.stored
+      sha = sha256Hex(stored)
+    } else {
+      const prepared = this.prepareCandidateBody(slug, content, opts)
+      if (!prepared.ok) return prepared
+      stored = prepared.stored
+      sha = prepared.sha256
+    }
+    const dest = this.candidateFile(file)
+    if (opts.exclusive !== false && existsSync(dest)) {
+      return { ok: false, error: 'exists', detail: file }
+    }
     await this.withLock(async () => {
-      await this.atomicWrite(this.candidateFile(file), stored)
+      if (opts.exclusive !== false && existsSync(dest)) return
+      await this.atomicWrite(dest, stored)
     })
+    if (opts.exclusive !== false && existsSync(dest)) {
+      const onDisk = await this.readCandidate(file, sha)
+      if (!onDisk) return { ok: false, error: 'exists', detail: file }
+    }
     return { ok: true, file, sha256: sha, bytes: stored.length }
   }
 

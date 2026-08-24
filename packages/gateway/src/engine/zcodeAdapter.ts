@@ -536,6 +536,7 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
         descriptor: this.opts.runContext,
         applied: platform.applied,
         promptContentSha256: platform.contentSha256,
+        frozen: platform.frozenProjectContext,
         cwd,
         cwdSource: cwdDecision?.source ?? (this.opts.projectId ? 'project_workspace' : 'default'),
         sessionRepoOverlay: cwdDecision?.sessionRepoOverlay ?? false,
@@ -973,6 +974,7 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
         skillEvalExclude: this.opts.skillEvalExclude,
         skillEvalDraft: this.opts.skillEvalDraft,
         skillTrainRunId: this.opts.skillTrainRunId,
+        projectId: this.opts.projectId,
       })
     } catch (err) {
       log.warn('zcode platform artifacts unavailable; continuing without MCP/hooks', {

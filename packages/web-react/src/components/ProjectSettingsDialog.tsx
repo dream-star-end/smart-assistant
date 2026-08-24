@@ -66,6 +66,7 @@ export function ProjectSettingsDialog(props: {
   const [instructions, setInstructions] = useState("");
   const [boardProjectId, setBoardProjectId] = useState<string>("");
   const [boardProjects, setBoardProjects] = useState<BoardProject[]>([]);
+  const [contextVersion, setContextVersion] = useState<number | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
 
@@ -79,6 +80,7 @@ export function ProjectSettingsDialog(props: {
       setColor(project.color ?? null);
       setInstructions(project.instructions ?? "");
       setBoardProjectId(project.boardProjectId ?? "");
+      setContextVersion(null);
     }
   }, [open, project, assetsOnly]);
 
@@ -98,6 +100,25 @@ export function ProjectSettingsDialog(props: {
     };
   }, [open, assetsOnly, authSession]);
 
+  useEffect(() => {
+    if (!open || assetsOnly || !authSession || !boardProjectId.trim()) return;
+    let cancelled = false;
+    void taskboardApi
+      .getProjectContext(authSession, boardProjectId.trim())
+      .then((ctx) => {
+        if (cancelled) return;
+        setContextVersion(typeof ctx.version === "number" ? ctx.version : 0);
+        if (typeof ctx.instructions === "string") setInstructions(ctx.instructions);
+        else if (ctx.instructions === null) setInstructions("");
+      })
+      .catch(() => {
+        if (!cancelled) setContextVersion(0);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, assetsOnly, authSession, boardProjectId]);
+
   if (!assetsOnly && !project) return null;
 
   const activeTab: DialogTab = assetsOnly ? "assets" : tab;
@@ -116,12 +137,26 @@ export function ProjectSettingsDialog(props: {
     setSaving(true);
     setError("");
     try {
-      await onSave({
-        name: nameTrim,
-        color,
-        instructions: instructions.trim() === "" ? null : instructions,
-        boardProjectId: boardProjectId.trim() === "" ? null : boardProjectId.trim(),
-      });
+      const boundId = boardProjectId.trim() === "" ? null : boardProjectId.trim();
+      if (boundId && authSession) {
+        const expected = contextVersion ?? 0;
+        await taskboardApi.putProjectContext(authSession, boundId, {
+          expectedVersion: expected,
+          instructions: instructions.trim() === "" ? null : instructions,
+        });
+        await onSave({
+          name: nameTrim,
+          color,
+          boardProjectId: boundId,
+        });
+      } else {
+        await onSave({
+          name: nameTrim,
+          color,
+          instructions: instructions.trim() === "" ? null : instructions,
+          boardProjectId: boundId,
+        });
+      }
       onClose();
     } catch (e) {
       setError(apiErrorMessage(e, "保存项目设置失败"));

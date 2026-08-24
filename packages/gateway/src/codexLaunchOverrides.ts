@@ -393,6 +393,7 @@ export async function buildCodexLaunchOverrides(
     descriptor: ctx.runContext,
     applied: platformResult.applied,
     promptContentSha256: platformResult.contentSha256,
+    frozen: platformResult.frozenProjectContext,
     cwd: ctx.cwd ?? ctx.repoSnapshot?.workspaceDir ?? null,
     cwdSource: ctx.repoSnapshot?.status === 'ready' && ctx.repoSnapshot.workspaceDir
       ? 'session_repo'

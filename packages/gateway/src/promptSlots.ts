@@ -40,7 +40,10 @@ import {
   buildAgentSkillStore,
   buildRunSkillStore,
   isProjectContextEnabled,
+  loadProjectContext,
+  officialManifestSha256,
   paths,
+  skillOverlayManifestSha256,
   readAgentsConfig,
   readUserProfile,
   scanMemoryContent,
@@ -60,6 +63,7 @@ import {
   type ResolvedTurnProjectContext,
 } from './projectContextRuntime.js'
 import { buildEnvSlot } from './envProbe.js'
+import type { FrozenProjectContextDigests } from './runContextPersist.js'
 
 // ── 平台静态 prompt 文案的个人版 fallback 常量(见文件头「文案通道边界」)──
 //
@@ -1347,6 +1351,8 @@ export interface PromptSlotApplied {
   meta?: Record<string, string>
 }
 
+export type { FrozenProjectContextDigests } from './runContextPersist.js'
+
 export interface PromptContextResult {
   /** 拼好的 prompt 文本(写到 extra-prompt.md 的内容) */
   content: string
@@ -1354,6 +1360,8 @@ export interface PromptContextResult {
   contentSha256: string
   /** 命中的 slot 列表(按拼装顺序) */
   applied: PromptSlotApplied[]
+  /** Frozen at build time. persist writer must not re-read project meta/ledger. */
+  frozenProjectContext?: FrozenProjectContextDigests
 }
 
 async function sha256Hex(s: string): Promise<string> {
@@ -1395,6 +1403,8 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
       projectId: ctx.projectId ?? resolved?.boardProjectId ?? undefined,
     }
   }
+
+  const frozenProjectContext = await freezeProjectContextDigests(ctx, resolved)
 
   // 在 build 早期就触发 remote fetch,放到与其他静态 slot 计算并行 —— 不阻塞
   // SOUL/USER 之类的本地 I/O,fetch 5s timeout 同时 SOUL/USER 5ms 内就好了,
@@ -1531,5 +1541,33 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
       return base
     }),
   )
-  return { content, contentSha256: await sha256Hex(content), applied }
+  return { content, contentSha256: await sha256Hex(content), applied, frozenProjectContext }
+}
+
+async function freezeProjectContextDigests(
+  ctx: PromptSlotContext,
+  resolved: ResolvedTurnProjectContext | null | undefined,
+): Promise<FrozenProjectContextDigests | undefined> {
+  const boundId = resolved?.boardProjectId ?? ctx.projectId ?? null
+  if (!boundId) return undefined
+  try {
+    const snap = await loadProjectContext(boundId)
+    let officialMemoryManifestSha256: string | null = null
+    try {
+      const { getTaskboardDb } = await import('./taskboard/db/index.js')
+      const official = new ProjectMemoryLedger(getTaskboardDb()).listOfficial(boundId)
+      officialMemoryManifestSha256 = officialManifestSha256(official)
+    } catch {
+      officialMemoryManifestSha256 = snap.meta.promotion.manifestSha256 ?? null
+    }
+    return {
+      contextVersion: snap.version,
+      assetsRevision: Number(resolved?.assetsRevision) || 0,
+      projectMdSha256: snap.meta.contentManifest?.projectMdSha256 ?? snap.meta.instructionsSha256 ?? null,
+      skillManifestSha256: skillOverlayManifestSha256(snap.meta.contentManifest?.skills ?? []),
+      officialMemoryManifestSha256,
+    }
+  } catch {
+    return undefined
+  }
 }

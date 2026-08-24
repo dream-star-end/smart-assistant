@@ -82,12 +82,66 @@ describe('persistRunContextSnapshot', () => {
       ],
       cwd: home,
       cwdSource: 'project_workspace',
+      frozen: {
+        contextVersion: 7,
+        assetsRevision: 3,
+        projectMdSha256: 'md',
+        skillManifestSha256: 'sk',
+        officialMemoryManifestSha256: 'mem',
+      },
     })
     assert.equal(result.wrote, true)
     const updated = getRun(db, run.id)
     assert.ok(updated?.contextSha256)
     assert.ok(updated?.contextSnapshotId)
-    assert.equal(typeof updated?.contextVersion, 'number')
+    assert.equal(updated?.contextVersion, 7)
+  })
+
+  it('does not re-read meta/ledger after freeze; later promote stays off the snapshot', async () => {
+    const { writeProjectInstructions } = await import('@openclaude/storage')
+    const { readProjectRunContextFile } = await import('../runContextPersist.js')
+    const db = getTaskboardDb()
+    const project = createProject(db, { key: 'RACE', name: 'race' })
+    const first = await writeProjectInstructions(project.id, 'old-ins', 0)
+    assert.equal(first.ok, true)
+    const ticket = createTicket(db, {
+      projectId: project.id,
+      type: 'chore',
+      title: 't',
+      reporter: 'user:default',
+    })
+    const run = insertRun(db, {
+      ticketId: ticket.id,
+      stageId: ticket.stageId ?? 'none',
+      trigger: 'patrol',
+      agentId: 'stage-implement',
+    })
+    const frozen = {
+      contextVersion: first.ok ? first.snapshot.version : 1,
+      assetsRevision: 1,
+      projectMdSha256: first.ok ? first.snapshot.meta.instructionsSha256 ?? 'old' : 'old',
+      skillManifestSha256: 'sk-old',
+      officialMemoryManifestSha256: 'mem-old',
+    }
+    await writeProjectInstructions(project.id, 'new-ins', frozen.contextVersion)
+    const result = await persistRunContextSnapshot({
+      descriptor: createRunContextDescriptor({
+        runId: run.id,
+        boardProjectId: project.id,
+        channel: 'taskboard',
+        agentId: 'stage-implement',
+        sessionKey: 'sk',
+        persistSnapshot: true,
+      }),
+      applied: [{ name: 'PROJECT', bytes: 8, sha256: 'proj' }],
+      cwd: home,
+      frozen,
+    })
+    assert.equal(result.wrote, true)
+    assert.equal(result.contextVersion, frozen.contextVersion)
+    const snap = await readProjectRunContextFile(project.id, run.id)
+    assert.equal(snap?.contextVersion, frozen.contextVersion)
+    assert.equal(snap?.hashes.projectMdSha256, frozen.projectMdSha256)
   })
 
   it('writer fail-soft returns wrote=false instead of throwing', async () => {

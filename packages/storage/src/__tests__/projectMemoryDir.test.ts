@@ -58,6 +58,57 @@ describe('ProjectMemoryDir tamper gate', () => {
   })
 })
 
+describe('candidate hash filenames (B5)', () => {
+  it('v1→v2→v3 conflict keeps every prior candidate readable', async () => {
+    const db = new Database(':memory:')
+    ensureProjectMemoryLedger(db)
+    const ledger = new ProjectMemoryLedger(db)
+    const pid = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    const v1 = await ledger.createCandidate({
+      projectId: pid,
+      slug: 'notes.md',
+      content: memoryBody('约定', 'v1'),
+      actor: 'agent:a',
+    })
+    assert.equal(v1.ok, true)
+    if (!v1.ok) return
+    const v2 = await ledger.createCandidate({
+      projectId: pid,
+      slug: 'notes.md',
+      content: memoryBody('约定', 'v2'),
+      actor: 'agent:b',
+    })
+    assert.equal(v2.ok, true)
+    if (!v2.ok) return
+    const v3 = await ledger.createCandidate({
+      projectId: pid,
+      slug: 'notes.md',
+      content: memoryBody('约定', 'v3'),
+      actor: 'agent:c',
+    })
+    assert.equal(v3.ok, true)
+    if (!v3.ok) return
+    assert.notEqual(v1.candidate.file, v2.candidate.file)
+    assert.notEqual(v2.candidate.file, v3.candidate.file)
+    const dir = new ProjectMemoryDir(pid)
+    const r1 = await dir.readCandidate(v1.candidate.file, v1.candidate.contentSha256)
+    const r2 = await dir.readCandidate(v2.candidate.file, v2.candidate.contentSha256)
+    const r3 = await dir.readCandidate(v3.candidate.file, v3.candidate.contentSha256)
+    assert.ok(r1 && r2 && r3)
+    const again = await ledger.createCandidate({
+      projectId: pid,
+      slug: 'notes.md',
+      content: memoryBody('约定', 'v2'),
+      actor: 'agent:b',
+    })
+    assert.equal(again.ok, true)
+    if (again.ok) {
+      assert.equal(again.idempotent, true)
+      assert.equal(again.candidate.file, v2.candidate.file)
+    }
+  })
+})
+
 describe('ProjectMemoryLedger', () => {
   it('candidates never overwrite official; conflict keeps both; promote is CAS', async () => {
     const db = new Database(':memory:')

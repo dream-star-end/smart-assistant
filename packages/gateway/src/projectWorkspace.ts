@@ -7,8 +7,11 @@
  */
 import {
   isProjectContextEnabled,
+  loadProjectContext,
   parseProjectWorkspace,
+  projectSessionFingerprint,
   resolveProjectCwd,
+  skillOverlayManifestSha256,
   type ProjectWorkspace,
 } from '@openclaude/storage'
 import type { EngineCwdSource } from './engineCwd.js'
@@ -20,6 +23,8 @@ export interface ChatRunWorkspace {
   spec: ProjectWorkspace | null
   cwdSource: EngineCwdSource
   bound: boolean
+  contextFingerprint: string
+  assetsRevision: number
 }
 
 export interface BoardProjectWorkspaceView {
@@ -32,6 +37,8 @@ const UNBOUND: ChatRunWorkspace = {
   spec: null,
   cwdSource: 'default',
   bound: false,
+  contextFingerprint: projectSessionFingerprint({ projectId: null }),
+  assetsRevision: 0,
 }
 
 async function defaultGetBoardProject(id: string): Promise<BoardProjectWorkspaceView | null> {
@@ -67,8 +74,32 @@ export async function resolveChatRunWorkspace(opts: {
   const spec =
     project?.workspaceSpec ?? parseProjectWorkspace(project?.workspace) ?? { kind: 'default' as const }
   const cwd = resolveProjectCwd(spec, projectId, opts.env)
+  let contextFingerprint = projectSessionFingerprint({
+    projectId,
+    assetsRevision: resolved.assetsRevision,
+  })
+  try {
+    const snap = await loadProjectContext(projectId)
+    contextFingerprint = projectSessionFingerprint({
+      projectId,
+      contextVersion: snap.version,
+      assetsRevision: resolved.assetsRevision,
+      projectMdSha256: snap.meta.contentManifest?.projectMdSha256 ?? snap.meta.instructionsSha256 ?? null,
+      skillManifestSha256: skillOverlayManifestSha256(snap.meta.contentManifest?.skills ?? []),
+      officialMemoryManifestSha256: snap.meta.promotion.manifestSha256 ?? null,
+    })
+  } catch {
+    /* volume missing still binds by id */
+  }
   if (!cwd.ok) {
-    return { projectId, spec, cwdSource: 'default', bound: true }
+    return {
+      projectId,
+      spec,
+      cwdSource: 'default',
+      bound: true,
+      contextFingerprint,
+      assetsRevision: resolved.assetsRevision,
+    }
   }
   return {
     projectId,
@@ -76,5 +107,7 @@ export async function resolveChatRunWorkspace(opts: {
     spec,
     cwdSource: spec.kind === 'default' ? 'default' : 'project_workspace',
     bound: true,
+    contextFingerprint,
+    assetsRevision: resolved.assetsRevision,
   }
 }

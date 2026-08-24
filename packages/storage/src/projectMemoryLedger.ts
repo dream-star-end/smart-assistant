@@ -293,13 +293,13 @@ export class ProjectMemoryLedger {
     const pending = this.listCandidates(projectId).filter(
       (c) => c.slug === slug && (c.status === 'pending' || c.status === 'conflict'),
     )
-    const written = await dir.writeCandidate(slug, input.content, {
+    const prepared = dir.prepareCandidateBody(slug, input.content, {
       auto: input.auto,
       today: input.today,
     })
-    if (!written.ok) return written
+    if (!prepared.ok) return prepared
 
-    if (official && official.contentSha256 === written.sha256 && !official.deprecated) {
+    if (official && official.contentSha256 === prepared.sha256 && !official.deprecated) {
       return {
         ok: true,
         alreadyOfficial: true,
@@ -307,8 +307,8 @@ export class ProjectMemoryLedger {
           id: 'already-official',
           projectId,
           slug,
-          file: written.file,
-          contentSha256: written.sha256,
+          file: official.slug,
+          contentSha256: prepared.sha256,
           status: 'promoted',
           version: official.version,
           sourceAgent: input.sourceAgent ?? null,
@@ -323,30 +323,43 @@ export class ProjectMemoryLedger {
       }
     }
 
-    const hashTaken = pending.some((c) => c.contentSha256 === written.sha256)
+    const hashTaken = pending.find((c) => c.contentSha256 === prepared.sha256)
     if (hashTaken) {
-      const same = pending.find((c) => c.contentSha256 === written.sha256)!
-      return { ok: true, candidate: same, idempotent: true }
+      return { ok: true, candidate: hashTaken, idempotent: true }
     }
 
-    const conflictWithPending = pending.some((c) => c.contentSha256 !== written.sha256)
-    const conflictWithOfficial = Boolean(official && official.contentSha256 !== written.sha256 && !official.deprecated)
+    const conflictWithPending = pending.some((c) => c.contentSha256 !== prepared.sha256)
+    const conflictWithOfficial = Boolean(official && official.contentSha256 !== prepared.sha256 && !official.deprecated)
     const conflict = conflictWithPending || conflictWithOfficial
-
-    let file = written.file
-    if (conflict && (pending.length > 0 || official)) {
-      const renamed = await dir.writeCandidate(slug, input.content, {
-        auto: input.auto,
-        today: input.today,
-        conflictSuffix: written.sha256,
-      })
-      if (renamed.ok) file = renamed.file
-    }
 
     const now = Date.now()
     const id = randomUUID()
+    const stem = slug.replace(/\.md$/i, '').slice(0, 40)
+    let file = `${stem}--${prepared.sha256.slice(0, 16)}.md`
+    if (dir.candidateFileExists(file)) {
+      const existing = await dir.readCandidate(file, prepared.sha256)
+      if (!existing) file = `${stem}--${id.replace(/-/g, '').slice(0, 16)}.md`
+    }
+    const written = await dir.writeCandidate(slug, input.content, {
+      auto: input.auto,
+      today: input.today,
+      file,
+      stored: prepared.stored,
+      exclusive: true,
+    })
+    if (!written.ok) {
+      if (written.error === 'exists') {
+        const same = await dir.readCandidate(file, prepared.sha256)
+        if (same) {
+          const listed = pending.find((c) => c.contentSha256 === prepared.sha256)
+          if (listed) return { ok: true, candidate: listed, idempotent: true }
+        }
+        return { ok: false, error: 'invalid', detail: written.detail }
+      }
+      return { ok: false, error: written.error, detail: written.detail }
+    }
     const status: CandidateStatus = conflict ? 'conflict' : 'pending'
-    const parsed = await dir.readCandidate(file)
+    const parsed = await dir.readCandidate(written.file, written.sha256)
     const expires = parsed?.expires ?? null
 
     const apply = this.db.transaction(() => {
@@ -370,7 +383,7 @@ export class ProjectMemoryLedger {
           id,
           projectId,
           slug,
-          file,
+          written.file,
           written.sha256,
           status,
           input.sourceAgent ?? null,

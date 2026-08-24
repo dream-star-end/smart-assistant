@@ -20,6 +20,9 @@ import {
   reserveTurnIndex,
   recordMemoryUsageEvent,
   paths,
+  projectSessionFingerprint,
+  loadProjectContext,
+  skillOverlayManifestSha256,
   type KernelFileLock,
   upsertSessionMeta,
 } from '@openclaude/storage'
@@ -101,6 +104,27 @@ import {
   finalizeEfficiencyTurn,
   prepareEfficiencyTurnNote,
 } from './agentEfficiencyGuard.js'
+
+async function computeSessionContextFingerprint(
+  projectId: string | null | undefined,
+  assetsRevision?: number,
+): Promise<string> {
+  const id = typeof projectId === 'string' ? projectId.trim() : ''
+  if (!id) return projectSessionFingerprint({ projectId: null })
+  try {
+    const snap = await loadProjectContext(id)
+    return projectSessionFingerprint({
+      projectId: id,
+      contextVersion: snap.version,
+      assetsRevision,
+      projectMdSha256: snap.meta.contentManifest?.projectMdSha256 ?? snap.meta.instructionsSha256 ?? null,
+      skillManifestSha256: skillOverlayManifestSha256(snap.meta.contentManifest?.skills ?? []),
+      officialMemoryManifestSha256: snap.meta.promotion.manifestSha256 ?? null,
+    })
+  } catch {
+    return projectSessionFingerprint({ projectId: id, assetsRevision })
+  }
+}
 
 const log = createLogger({ module: 'sessionManager' })
 
@@ -666,8 +690,10 @@ export interface AgentSession {
    * overlay is applied later in adapters via decideEngineCwd (allowed).
    */
   workspaceCwd: string
-  /** tb_project.id when this session is bound to a work project. */
-  projectId?: string
+  /** tb_project.id when this session is bound to a work project. null = unbound. */
+  projectId?: string | null
+  /** projectId + contextVersion + assetsRevision + manifest hashes. */
+  contextFingerprint?: string
   runContext?: import('./runContextPersist.js').RunContextDescriptor
   /**
    * 直接父会话键。仅 delegate 子会话在创建时物化(handleDelegateTask 传入已校验的
@@ -3050,7 +3076,10 @@ export class SessionManager {
     workspaceMode?: SessionWorkspaceMode
     /** Explicit cwd for project workspace (taskboard / bound chat). */
     workspaceCwd?: string
-    projectId?: string
+    /** Pass null to unbind an existing session. */
+    projectId?: string | null
+    contextFingerprint?: string
+    assetsRevision?: number
     runContext?: import('./runContextPersist.js').RunContextDescriptor
     /**
      * 直接父会话键(仅 delegate 子会话传入,已由 handleDelegateTask 经 _resolveDelegateParent
@@ -3183,7 +3212,22 @@ export class SessionManager {
         opts.workspaceMode !== undefined && existing.workspaceMode !== workspaceMode
       const workspaceCwdChanged =
         opts.workspaceCwd !== undefined && existing.workspaceCwd !== opts.workspaceCwd
-      if (existing.providerTag !== desiredEngine || workspaceModeChanged || workspaceCwdChanged) {
+      const nextProjectId =
+        opts.projectId === undefined ? existing.projectId ?? null : opts.projectId
+      const projectIdChanged =
+        opts.projectId !== undefined && (existing.projectId ?? null) !== (opts.projectId ?? null)
+      const nextFingerprint =
+        opts.contextFingerprint ??
+        (await computeSessionContextFingerprint(nextProjectId, opts.assetsRevision))
+      const fingerprintChanged =
+        Boolean(nextFingerprint) && existing.contextFingerprint !== nextFingerprint
+      if (
+        existing.providerTag !== desiredEngine ||
+        workspaceModeChanged ||
+        workspaceCwdChanged ||
+        projectIdChanged ||
+        fingerprintChanged
+      ) {
         const replacementNotice: NonNullable<AgentSession['_contextRebuildNotice']> =
           existing.providerTag !== desiredEngine ? 'engine-switch' : 'native-resume-loss'
         contextRebuildNotice = replacementNotice
@@ -3255,7 +3299,8 @@ export class SessionManager {
         if (opts.repoSessionId && !existing.repoSessionId) existing.repoSessionId = opts.repoSessionId
         if (opts.parentSessionKey && !existing.parentSessionKey)
           existing.parentSessionKey = opts.parentSessionKey
-        if (opts.projectId && !existing.projectId) existing.projectId = opts.projectId
+        if (opts.projectId !== undefined) existing.projectId = opts.projectId
+        if (opts.contextFingerprint) existing.contextFingerprint = opts.contextFingerprint
         if (opts.runContext) existing.runContext = opts.runContext
         return existing
       }
@@ -3301,7 +3346,7 @@ export class SessionManager {
       // session id 作为 repo lookup key,但不改变 delegate 自己的 peerId。
       // getRepoSnapshot 由 Gateway 构造器注入。
       sessionId: repoSessionId,
-      projectId: opts.projectId,
+      projectId: opts.projectId ?? undefined,
       runContext: opts.runContext,
       getRepoSnapshot: this._getRepoSnapshot,
       workload: opts.workload,
@@ -3323,6 +3368,9 @@ export class SessionManager {
       workspaceMode,
       workspaceCwd: cwd,
       projectId: opts.projectId,
+      contextFingerprint:
+        opts.contextFingerprint ??
+        (await computeSessionContextFingerprint(opts.projectId, opts.assetsRevision)),
       runContext: opts.runContext,
       repoSessionId,
       title: opts.title ?? 'New conversation',

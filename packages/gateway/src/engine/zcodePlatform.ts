@@ -52,6 +52,7 @@ export interface CreateZcodePlatformArtifactsInput {
   skillEvalExclude?: string
   skillEvalDraft?: { name: string; dir: string }
   skillTrainRunId?: string
+  projectId?: string
 }
 
 function writePrivate(path: string, value: string): void {
@@ -112,6 +113,7 @@ export function createZcodePlatformArtifacts(
       )
       const env: Record<string, string> = {
         OPENCLAUDE_AGENT_ID: input.agentId,
+        ...(input.projectId ? { OPENCLAUDE_PROJECT_ID: input.projectId } : {}),
         OPENCLAUDE_HOME: openclaudeHome,
         OPENCLAUDE_SESSION_KEY: input.sessionKey,
         OPENCLAUDE_GATEWAY_PORT: String(input.gatewayPort),

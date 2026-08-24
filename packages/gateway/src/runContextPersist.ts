@@ -11,10 +11,6 @@ import {
   createRunContextDescriptor,
   emptyProjectRunSnapshot,
   isProjectContextEnabled,
-  loadProjectContext,
-  officialManifestSha256,
-  paths,
-  ProjectMemoryLedger,
   pruneProjectRunSnapshots,
   realpathOrNull,
   readProjectRunContextFile,
@@ -24,11 +20,16 @@ import {
   type ProjectRunSlotHash,
   type RunContextDescriptor,
 } from '@openclaude/storage'
-import { createHash } from 'node:crypto'
-import { existsSync, readdirSync } from 'node:fs'
-import { join } from 'node:path'
 import type { EngineCwdDecision } from './engineCwd.js'
 import { getRun, getTaskboardDb, updateRun } from './taskboard/db/index.js'
+
+export interface FrozenProjectContextDigests {
+  contextVersion: number
+  assetsRevision: number
+  projectMdSha256: string | null
+  skillManifestSha256: string | null
+  officialMemoryManifestSha256: string | null
+}
 
 export type { RunContextDescriptor }
 export { createRunContextDescriptor }
@@ -47,6 +48,8 @@ export interface PersistRunContextInput {
   cwdSource?: ProjectRunCwdSource
   sessionRepoOverlay?: boolean
   repo?: { owner: string; repo: string; branch: string; headSha: string | null }
+  /** Frozen by buildPromptContext. Writer must not re-read project meta/ledger. */
+  frozen?: FrozenProjectContextDigests
 }
 
 export interface PersistRunContextResult {
@@ -55,20 +58,6 @@ export interface PersistRunContextResult {
   snapshotId?: string
   contextVersion?: number
   error?: string
-}
-
-function sha256Hex(s: string): string {
-  return createHash('sha256').update(s, 'utf8').digest('hex')
-}
-
-function digestDir(dir: string): string | undefined {
-  if (!existsSync(dir)) return undefined
-  try {
-    const names = readdirSync(dir).filter((n) => !n.startsWith('.')).sort()
-    return sha256Hex(names.join('\n'))
-  } catch {
-    return undefined
-  }
 }
 
 export async function persistRunContextSnapshot(
@@ -84,22 +73,12 @@ export async function persistRunContextSnapshot(
       const { volatile, redacted } = classifySlot(s.name)
       return { name: s.name, bytes: s.bytes, sha256: s.sha256, volatile, redacted }
     })
-    const ctx = await loadProjectContext(desc.boardProjectId)
-    let officialCount = 0
-    let officialManifest: string | null = null
-    try {
-      const ledger = new ProjectMemoryLedger(getTaskboardDb())
-      const official = ledger.listOfficial(desc.boardProjectId)
-      officialCount = official.length
-      officialManifest = officialManifestSha256(official)
-    } catch {
-      /* personal tests without taskboard */
-    }
+    const frozen = input.frozen
     const cwd = input.cwd ?? desc.workspaceCwd
     const snapshot = emptyProjectRunSnapshot({
       runId: desc.runId,
       boardProjectId: desc.boardProjectId,
-      contextVersion: ctx.version,
+      contextVersion: frozen?.contextVersion ?? 0,
       createdAt: Date.now(),
       agentId: desc.agentId,
       channel: desc.channel,
@@ -116,13 +95,13 @@ export async function persistRunContextSnapshot(
       hashes: {
         promptContentSha256: input.promptContentSha256,
         slots,
-        projectMdSha256: ctx.meta.instructionsSha256 ?? undefined,
-        projectSkillsSha256: digestDir(join(paths.projectDir(desc.boardProjectId), 'skills')),
-        officialMemoryManifestSha256: officialManifest,
+        projectMdSha256: frozen?.projectMdSha256 ?? undefined,
+        projectSkillsSha256: frozen?.skillManifestSha256 ?? undefined,
+        officialMemoryManifestSha256: frozen?.officialMemoryManifestSha256 ?? null,
       },
       promotion: {
-        officialCount,
-        officialManifestSha256: officialManifest,
+        officialCount: 0,
+        officialManifestSha256: frozen?.officialMemoryManifestSha256 ?? null,
       },
     })
     const written = await writeProjectRunContextFile(snapshot)
@@ -134,7 +113,7 @@ export async function persistRunContextSnapshot(
         updateRun(db, desc.runId, {
           contextSnapshotId: snapshotId,
           contextSha256: written.sha256,
-          contextVersion: ctx.version,
+          contextVersion: frozen?.contextVersion ?? 0,
         })
       }
     } catch {
@@ -145,7 +124,7 @@ export async function persistRunContextSnapshot(
       wrote: true,
       sha256: written.sha256,
       snapshotId,
-      contextVersion: ctx.version,
+      contextVersion: frozen?.contextVersion,
     }
   } catch (err) {
     return { wrote: false, error: err instanceof Error ? err.message : String(err) }

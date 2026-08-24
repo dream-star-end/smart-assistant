@@ -67,6 +67,18 @@ export function parseProjectWorkspace(raw: unknown): ProjectWorkspace | null {
   return null
 }
 
+export interface ProjectSkillManifestEntry {
+  name: string
+  skillMdSha256: string
+  active: boolean
+}
+
+export interface ProjectContentManifest {
+  schemaVersion: 1
+  projectMdSha256: string | null
+  skills: ProjectSkillManifestEntry[]
+}
+
 export interface ProjectContextMeta {
   schemaVersion: 1
   boardProjectId: string
@@ -75,6 +87,8 @@ export interface ProjectContextMeta {
   updatedAt: number
   instructionsSha256?: string | null
   skillOverlay: string[]
+  /** Gateway-owned hashes for PROJECT.md + selected Skill.md (runtime verifies). */
+  contentManifest: ProjectContentManifest
   /** Phase 2 placeholder: promotion manifest hash. Phase 1 always null. */
   promotion: { schemaVersion: 1; manifestSha256: string | null }
   instructionsSeed?: { from: 'chat_project'; at: number } | null
@@ -90,7 +104,11 @@ export interface ProjectContextSnapshot {
 
 export type ProjectContextWriteResult =
   | { ok: true; snapshot: ProjectContextSnapshot }
-  | { ok: false; error: 'version_conflict' | 'invalid_instructions' | 'invalid_id'; current?: number }
+  | { ok: false; error: 'version_conflict' | 'invalid_instructions' | 'invalid_id' | 'source_missing'; current?: number }
+
+export function emptyContentManifest(): ProjectContentManifest {
+  return { schemaVersion: 1, projectMdSha256: null, skills: [] }
+}
 
 function emptyMeta(boardProjectId: string, key?: string): ProjectContextMeta {
   return {
@@ -101,6 +119,7 @@ function emptyMeta(boardProjectId: string, key?: string): ProjectContextMeta {
     updatedAt: Date.now(),
     instructionsSha256: null,
     skillOverlay: [],
+    contentManifest: emptyContentManifest(),
     promotion: { schemaVersion: 1, manifestSha256: null },
     instructionsSeed: null,
   }
@@ -143,22 +162,52 @@ async function withProjectLock<T>(boardProjectId: string, fn: () => Promise<T>):
   }
 }
 
+function parseContentManifest(raw: unknown, instructionsSha256: string | null): ProjectContentManifest {
+  if (!raw || typeof raw !== 'object') {
+    return { schemaVersion: 1, projectMdSha256: instructionsSha256, skills: [] }
+  }
+  const obj = raw as Partial<ProjectContentManifest>
+  const skills = Array.isArray(obj.skills)
+    ? obj.skills.filter(
+        (s): s is ProjectSkillManifestEntry =>
+          Boolean(
+            s &&
+              typeof s === 'object' &&
+              typeof s.name === 'string' &&
+              typeof s.skillMdSha256 === 'string',
+          ),
+      ).map((s) => ({
+        name: s.name,
+        skillMdSha256: s.skillMdSha256,
+        active: s.active !== false,
+      }))
+    : []
+  return {
+    schemaVersion: 1,
+    projectMdSha256:
+      typeof obj.projectMdSha256 === 'string' ? obj.projectMdSha256 : instructionsSha256,
+    skills,
+  }
+}
+
 function parseMeta(raw: string, boardProjectId: string): ProjectContextMeta {
   try {
     const parsed = JSON.parse(raw) as Partial<ProjectContextMeta>
     if (parsed.schemaVersion !== 1) return emptyMeta(boardProjectId)
     const version = Number(parsed.version)
+    const instructionsSha256 =
+      typeof parsed.instructionsSha256 === 'string' ? parsed.instructionsSha256 : null
     return {
       schemaVersion: 1,
       boardProjectId,
       key: typeof parsed.key === 'string' ? parsed.key : undefined,
       version: Number.isFinite(version) && version >= 0 ? Math.floor(version) : 0,
       updatedAt: Number(parsed.updatedAt) || Date.now(),
-      instructionsSha256:
-        typeof parsed.instructionsSha256 === 'string' ? parsed.instructionsSha256 : null,
+      instructionsSha256,
       skillOverlay: Array.isArray(parsed.skillOverlay)
         ? parsed.skillOverlay.filter((n): n is string => typeof n === 'string')
         : [],
+      contentManifest: parseContentManifest(parsed.contentManifest, instructionsSha256),
       promotion: {
         schemaVersion: 1,
         manifestSha256:
@@ -220,12 +269,50 @@ export async function loadProjectContext(boardProjectId: string): Promise<Projec
     try {
       const raw = await readFile(paths.projectInstructionsFile(id), 'utf8')
       const trimmed = clipProjectInstructions(raw)
-      instructions = trimmed ? trimmed : null
+      const expected =
+        meta.contentManifest.projectMdSha256 ?? meta.instructionsSha256 ?? null
+      if (trimmed && expected && sha256Hex(trimmed) === expected) {
+        instructions = trimmed
+      }
     } catch {
       instructions = null
     }
-    return { boardProjectId: id, version: meta.version, instructions, skillOverlay: meta.skillOverlay, meta }
+    return {
+      boardProjectId: id,
+      version: meta.version,
+      instructions,
+      skillOverlay: meta.contentManifest.skills.filter((s) => s.active).map((s) => s.name),
+      meta,
+    }
   })
+}
+
+export function skillOverlayManifestSha256(skills: readonly ProjectSkillManifestEntry[]): string {
+  const active = skills
+    .filter((s) => s.active)
+    .slice()
+    .sort((a, b) => a.name.localeCompare(b.name))
+  return sha256Hex(active.map((s) => `${s.name}:${s.skillMdSha256}`).join('\n'))
+}
+
+export function projectSessionFingerprint(input: {
+  projectId: string | null | undefined
+  contextVersion?: number
+  assetsRevision?: number
+  projectMdSha256?: string | null
+  skillManifestSha256?: string | null
+  officialMemoryManifestSha256?: string | null
+}): string {
+  const id = typeof input.projectId === 'string' ? input.projectId.trim().toLowerCase() : ''
+  if (!id) return 'unbound'
+  return [
+    id,
+    `v${Number(input.contextVersion) || 0}`,
+    `a${Number(input.assetsRevision) || 0}`,
+    `md:${input.projectMdSha256 ?? ''}`,
+    `sk:${input.skillManifestSha256 ?? ''}`,
+    `mem:${input.officialMemoryManifestSha256 ?? ''}`,
+  ].join('|')
 }
 
 export function clipProjectInstructions(raw: string): string {
@@ -268,12 +355,18 @@ export async function writeProjectInstructions(
         /* absent is fine */
       }
     }
+    const digest = body ? sha256Hex(body) : null
     const next: ProjectContextMeta = {
       ...meta,
       key: opts.key ?? meta.key,
       version: meta.version + 1,
       updatedAt: Date.now(),
-      instructionsSha256: body ? sha256Hex(body) : null,
+      instructionsSha256: digest,
+      contentManifest: {
+        schemaVersion: 1,
+        projectMdSha256: digest,
+        skills: meta.contentManifest?.skills ?? [],
+      },
       instructionsSeed: opts.seedFromChat
         ? { from: 'chat_project', at: Date.now() }
         : meta.instructionsSeed,
@@ -324,10 +417,17 @@ export async function seedProjectInstructionsIfEmpty(
   return loadProjectContext(boardProjectId)
 }
 
-export async function setProjectSkillOverlay(
+const SKILL_NAME_RE = /^[a-z0-9][a-z0-9-]{0,63}$/
+
+/**
+ * Stage selected skills, then CAS-flip live overlay + gateway-owned hashes.
+ * Stale expectedVersion leaves live skills/hash/version untouched.
+ */
+export async function commitProjectSkillOverlay(
   boardProjectId: string,
   names: string[],
   expectedVersion: number,
+  opts: { sourceFor?: (name: string) => string } = {},
 ): Promise<ProjectContextWriteResult> {
   const parsed = parseBoardProjectId(boardProjectId)
   if (!('present' in parsed) || !parsed.present || !parsed.value) {
@@ -335,21 +435,74 @@ export async function setProjectSkillOverlay(
   }
   const id = parsed.value
   const unique = [...new Set(names.map((n) => n.trim()).filter(Boolean))]
+  for (const name of unique) {
+    if (!SKILL_NAME_RE.test(name)) return { ok: false, error: 'invalid_id' }
+  }
+  const destRoot = paths.projectSkillsDir(id)
+  const stagingRoot = join(destRoot, '.staging')
+  mkdirSync(destRoot, { recursive: true, mode: 0o700 })
+  await rm(stagingRoot, { recursive: true, force: true })
+  mkdirSync(stagingRoot, { recursive: true, mode: 0o700 })
+
+  const staged: Array<{ name: string; sha: string; stagingPath: string }> = []
+  for (const name of unique) {
+    const sourceDir = opts.sourceFor?.(name) ?? join(paths.sharedSkillsDir, name)
+    if (!isAbsolute(sourceDir) || !existsSync(sourceDir)) {
+      await rm(stagingRoot, { recursive: true, force: true })
+      return { ok: false, error: 'source_missing' }
+    }
+    const stagingPath = join(stagingRoot, name)
+    await cpDir(realpathSync(sourceDir), stagingPath)
+    try {
+      await rm(join(stagingPath, '.openclaude-agent-scope.json'), { force: true })
+    } catch {
+      /* overlay visible without sidecar */
+    }
+    let skillMd: string
+    try {
+      skillMd = await readFile(join(stagingPath, 'SKILL.md'), 'utf8')
+    } catch {
+      await rm(stagingRoot, { recursive: true, force: true })
+      return { ok: false, error: 'source_missing' }
+    }
+    staged.push({ name, sha: sha256Hex(skillMd), stagingPath })
+  }
+
   return withProjectLock(id, async () => {
     const meta = await readMetaUnlocked(id)
     if (meta.version !== expectedVersion) {
       return { ok: false, error: 'version_conflict', current: meta.version }
+    }
+    const keep = new Set(unique)
+    for (const s of staged) {
+      const live = join(destRoot, s.name)
+      await rm(live, { recursive: true, force: true })
+      await rename(s.stagingPath, live)
+    }
+    for (const old of meta.skillOverlay) {
+      if (!keep.has(old)) {
+        await rm(join(destRoot, old), { recursive: true, force: true })
+      }
     }
     const next: ProjectContextMeta = {
       ...meta,
       version: meta.version + 1,
       updatedAt: Date.now(),
       skillOverlay: unique,
+      contentManifest: {
+        schemaVersion: 1,
+        projectMdSha256:
+          meta.contentManifest?.projectMdSha256 ?? meta.instructionsSha256 ?? null,
+        skills: staged.map((s) => ({ name: s.name, skillMdSha256: s.sha, active: true })),
+      },
     }
     await persistMetaUnlocked(next)
+    await rm(stagingRoot, { recursive: true, force: true })
     let instructions: string | null = null
     try {
-      instructions = clipProjectInstructions(await readFile(paths.projectInstructionsFile(id), 'utf8')) || null
+      const raw = clipProjectInstructions(await readFile(paths.projectInstructionsFile(id), 'utf8'))
+      const expected = next.contentManifest.projectMdSha256
+      if (raw && expected && sha256Hex(raw) === expected) instructions = raw
     } catch {
       instructions = null
     }
@@ -364,6 +517,14 @@ export async function setProjectSkillOverlay(
       },
     }
   })
+}
+
+export async function setProjectSkillOverlay(
+  boardProjectId: string,
+  names: string[],
+  expectedVersion: number,
+): Promise<ProjectContextWriteResult> {
+  return commitProjectSkillOverlay(boardProjectId, names, expectedVersion)
 }
 
 export interface CwdResolution {

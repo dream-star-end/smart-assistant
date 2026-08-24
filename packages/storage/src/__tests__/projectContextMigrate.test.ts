@@ -62,4 +62,44 @@ describe('migrateProjectContext', () => {
       /safe-down refused/,
     )
   })
+
+  it('safe-down backup uses project-relative paths and fails closed on copy/hash errors', async () => {
+    const { backupRefusedFiles } = await import('../projectContextMigrate.js')
+    const { mkdir, writeFile, readFile } = await import('node:fs/promises')
+    const { join } = await import('node:path')
+    const a = join(home, 'projects', ID, 'meta.json')
+    const b = join(home, 'projects', E2E, 'meta.json')
+    await mkdir(join(home, 'projects', ID), { recursive: true })
+    await mkdir(join(home, 'projects', E2E), { recursive: true })
+    await writeFile(a, '{"a":1}\n')
+    await writeFile(b, '{"b":2}\n')
+    const backupRoot = join(home, 'projects', '_migration', 'down-rel')
+    const ok = await backupRefusedFiles(home, backupRoot, [a, b])
+    assert.equal(ok.ok, true)
+    if (!ok.ok) return
+    const manifest = JSON.parse(await readFile(ok.manifestPath, 'utf8')) as {
+      files: Array<{ relativePath: string }>
+    }
+    assert.deepEqual(
+      manifest.files.map((f) => f.relativePath).sort(),
+      [`projects/${E2E}/meta.json`, `projects/${ID}/meta.json`].sort(),
+    )
+    const copiedA = await readFile(join(backupRoot, 'projects', ID, 'meta.json'), 'utf8')
+    const copiedB = await readFile(join(backupRoot, 'projects', E2E, 'meta.json'), 'utf8')
+    assert.equal(copiedA.includes('"a":1'), true)
+    assert.equal(copiedB.includes('"b":2'), true)
+
+    const failRoot = join(home, 'projects', '_migration', 'down-fail')
+    const failed = await backupRefusedFiles(home, failRoot, [a], async () => {
+      throw new Error('copy exploded')
+    })
+    assert.equal(failed.ok, false)
+    if (!failed.ok) assert.match(failed.error, /copy exploded/)
+
+    const mismatch = await backupRefusedFiles(home, join(home, 'projects', '_migration', 'down-hash'), [a], async (_src, dest) => {
+      await writeFile(dest, 'wrong-bytes\n')
+    })
+    assert.equal(mismatch.ok, false)
+    if (!mismatch.ok) assert.match(mismatch.error, /hash mismatch/)
+  })
 })

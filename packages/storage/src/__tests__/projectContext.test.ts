@@ -13,6 +13,7 @@ process.env.OPENCLAUDE_HOME = testHome
 
 const {
   assertAllowedCwd,
+  commitProjectSkillOverlay,
   loadProjectContext,
   parseBoardProjectId,
   resolveProjectCwd,
@@ -47,6 +48,55 @@ describe('PROJECT.md CAS (B2 single authority)', () => {
     if (!stale.ok) assert.equal(stale.error, 'version_conflict')
     const loaded = await loadProjectContext(ID)
     assert.equal(loaded.instructions, 'use tables')
+  })
+
+  it('tampered PROJECT.md is not loaded for the next run', async () => {
+    const id = '33333333-3333-4333-8333-333333333333'
+    const first = await writeProjectInstructions(id, 'canonical', 0)
+    assert.equal(first.ok, true)
+    const file = (await import('../paths.js')).paths.projectInstructionsFile(id)
+    await writeFile(file, 'tampered by agent\n', 'utf8')
+    const loaded = await loadProjectContext(id)
+    assert.equal(loaded.instructions, null)
+  })
+
+  it('skill overlay stages then CAS-flips; stale CAS leaves dir/hash/version unchanged', async () => {
+    const id = '44444444-4444-4444-8444-444444444444'
+    const { mkdir, writeFile: wf } = await import('node:fs/promises')
+    const { paths } = await import('../paths.js')
+    const { buildRunSkillStore } = await import('../skillStore.js')
+    const src = join(testHome, 'skill-src', 'proj-skill')
+    await mkdir(src, { recursive: true })
+    await wf(
+      join(src, 'SKILL.md'),
+      '---\nname: proj-skill\ndescription: overlay\n---\nbody-v1\n',
+      'utf8',
+    )
+    const ok = await commitProjectSkillOverlay(id, ['proj-skill'], 0, { sourceFor: () => src })
+    assert.equal(ok.ok, true)
+    if (!ok.ok) return
+    const liveMd = join(paths.projectSkillsDir(id), 'proj-skill', 'SKILL.md')
+    const before = await (await import('node:fs/promises')).readFile(liveMd, 'utf8')
+    const stale = await commitProjectSkillOverlay(id, ['proj-skill'], 0, { sourceFor: () => src })
+    assert.equal(stale.ok, false)
+    if (!stale.ok) assert.equal(stale.error, 'version_conflict')
+    const after = await (await import('node:fs/promises')).readFile(liveMd, 'utf8')
+    assert.equal(after, before)
+    const loaded = await loadProjectContext(id)
+    assert.equal(loaded.version, 1)
+
+    await wf(liveMd, '---\nname: proj-skill\ndescription: overlay\n---\ntampered\n', 'utf8')
+    const store = buildRunSkillStore({ agentId: 'main', projectId: id })
+    const list = await store.list()
+    assert.equal(list.some((s) => s.name === 'proj-skill'), false)
+    assert.equal(await store.view('proj-skill'), null)
+
+    const unselect = await commitProjectSkillOverlay(id, [], loaded.version)
+    assert.equal(unselect.ok, true)
+    const gone = await loadProjectContext(id)
+    assert.deepEqual(gone.skillOverlay, [])
+    const { existsSync } = await import('node:fs')
+    assert.equal(existsSync(join(paths.projectSkillsDir(id), 'proj-skill')), false)
   })
 
   it('seed copies once then ignores later source', async () => {

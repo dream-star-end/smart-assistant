@@ -6,8 +6,8 @@
  */
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync } from 'node:fs'
-import { copyFile, readFile, readdir, rm, writeFile } from 'node:fs/promises'
-import { basename, join } from 'node:path'
+import { copyFile, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { dirname, join, relative, resolve } from 'node:path'
 import Database from 'better-sqlite3'
 import { MEMORY_FILE_RE, parseMemoryFrontmatter } from './memoryFrontmatter.js'
 import { BOARD_PROJECT_ID_RE } from './projectContext.js'
@@ -46,6 +46,7 @@ export interface MigrateProjectContextOpts {
   dbPath: string
   mode: 'dry-run' | 'apply' | 'down'
   downManifestPath?: string
+  copyFile?: typeof copyFile
 }
 
 function fileHash(content: string): string {
@@ -66,6 +67,46 @@ function migrationDir(home: string): string {
 
 export function defaultManifestPath(home: string, createdAt: number): string {
   return join(migrationDir(home), `${createdAt}.json`)
+}
+
+export async function backupRefusedFiles(
+  home: string,
+  backupRoot: string,
+  files: string[],
+  copyFn: typeof copyFile = copyFile,
+): Promise<{ ok: true; manifestPath: string } | { ok: false; error: string }> {
+  const homeReal = resolve(home)
+  const entries: Array<{ relativePath: string; sha256: string }> = []
+  try {
+    await mkdir(backupRoot, { recursive: true, mode: 0o700 })
+    for (const path of files) {
+      const abs = resolve(path)
+      const rel = relative(homeReal, abs)
+      if (!rel || rel.startsWith('..') || rel.includes('..')) {
+        return { ok: false, error: `path escapes home: ${path}` }
+      }
+      const src = await readIfExists(abs)
+      if (src == null) return { ok: false, error: `missing source ${rel}` }
+      const expected = sha256Hex(src)
+      const dest = join(backupRoot, rel)
+      await mkdir(dirname(dest), { recursive: true, mode: 0o700 })
+      await copyFn(abs, dest)
+      const copied = await readIfExists(dest)
+      if (copied == null || sha256Hex(copied) !== expected) {
+        return { ok: false, error: `hash mismatch after copy: ${rel}` }
+      }
+      entries.push({ relativePath: rel, sha256: expected })
+    }
+    const manifestPath = join(backupRoot, 'backup-manifest.json')
+    await writeFile(
+      manifestPath,
+      `${JSON.stringify({ schemaVersion: 1, createdAt: Date.now(), files: entries }, null, 2)}\n`,
+      { encoding: 'utf8', mode: 0o600 },
+    )
+    return { ok: true, manifestPath }
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) }
+  }
 }
 
 export async function migrateProjectContext(
@@ -218,17 +259,14 @@ async function downProjectContext(
     if (hash !== cand.hash) refused.push(path)
   }
   if (refused.length > 0) {
-    mkdirSync(backupRoot, { recursive: true, mode: 0o700 })
-    for (const path of refused) {
-      const dest = join(backupRoot, basename(path))
-      try {
-        await copyFile(path, dest)
-      } catch {
-        /* still refuse */
-      }
+    const backup = await backupRefusedFiles(opts.home, backupRoot, refused, opts.copyFile)
+    if (!backup.ok) {
+      throw new Error(
+        `safe-down backup failed: ${backup.error}. refused to delete ${refused.length} modified files without a verified backup`,
+      )
     }
     throw new Error(
-      `safe-down refused: ${refused.length} migrated files were modified. verification backup: ${backupRoot}`,
+      `safe-down refused: ${refused.length} migrated files were modified. verification backup: ${backup.manifestPath}`,
     )
   }
   for (const cand of manifest.copiedCandidates) {

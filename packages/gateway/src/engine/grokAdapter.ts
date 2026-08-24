@@ -572,6 +572,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
         descriptor: this.opts.runContext,
         applied: platform.applied,
         promptContentSha256: platform.contentSha256,
+        frozen: platform.frozenProjectContext,
         cwd: cwdDecision.cwd,
         cwdSource: cwdDecision.source,
         sessionRepoOverlay: cwdDecision.sessionRepoOverlay,
