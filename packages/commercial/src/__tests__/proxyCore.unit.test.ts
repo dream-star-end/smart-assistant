@@ -467,6 +467,38 @@ describe("runUpstreamRoundTrip — upstream non-2xx 分支", () => {
     assert.equal(session.zeroizeCount, 1);
   });
 
+  // 反封复盘 2026-08 — 上游 429 透传为 429(不再伪装 502),防容器 CCB 把限流当 5xx 狂重试。
+  test("上游 429 带 Retry-After → 透传 429 UPSTREAM_RATE_LIMITED + Retry-After", async () => {
+    const { ctx, res, finalize } = buildCtx({
+      fetchImpl: async () =>
+        new Response('{"type":"error","error":{"type":"rate_limit_error"}}', {
+          status: 429,
+          headers: { "Retry-After": "42" },
+        }),
+    });
+    await runUpstreamRoundTrip(ctx);
+
+    assert.equal(finalize.failCalls.length, 1, "429 走 fail(RATE_LIMITED)路径");
+    assert.equal(finalize.failClientCalls.length, 0, "429 不走 failClient");
+    assert.equal(res.statusCode, 429, "429 透传,不再映射 502");
+    assert.equal(
+      (JSON.parse(res.bodyText()) as { error: { code: string } }).error.code,
+      "UPSTREAM_RATE_LIMITED",
+    );
+    assert.equal(res.responseHeaders["retry-after"], "42", "Retry-After 从上游透传");
+  });
+
+  test("上游 429 无 Retry-After → 429 + 默认 60s Retry-After", async () => {
+    const { ctx, res } = buildCtx({
+      fetchImpl: async () =>
+        new Response('{"type":"error","error":{"type":"rate_limit_error"}}', { status: 429 }),
+    });
+    await runUpstreamRoundTrip(ctx);
+
+    assert.equal(res.statusCode, 429);
+    assert.equal(res.responseHeaders["retry-after"], "60", "缺上游头时给 60s 保守默认");
+  });
+
   test("Moonshot billing-cycle 403 → durable block + non-retryable 400,且不扣费", async () => {
     const sql: string[] = [];
     _setProviderQuotaRunnerForTest({

@@ -128,6 +128,10 @@ describe('Weibo worker log sanitizer', () => {
         scopeImageInputs: 1,
         imageTitleHits: 1,
         imageIconHits: 0,
+        via: 'ajax',
+        pids: 1,
+        status: 200,
+        attempted: false,
         html: '<div>drop</div>',
         srcUrl: 'https://weibo.com/secret',
       }),
@@ -143,6 +147,10 @@ describe('Weibo worker log sanitizer', () => {
       scopeImageInputs: 1,
       imageTitleHits: 1,
       imageIconHits: 0,
+      via: 'ajax',
+      pids: 1,
+      status: 200,
+      attempted: false,
     })
     assert.equal(kept && 'html' in kept, false)
     assert.equal(kept && 'srcUrl' in kept, false)

@@ -182,6 +182,84 @@ export function gatewayIpFromV3Cidr(cidr: string): string {
   return `${a}.${b}.${c}.1`;
 }
 
+export interface V5LocalCcbTransportEnvInput {
+  runtimeChannel: RuntimeChannel;
+  useRemote: boolean;
+  hostGatewayIp: string;
+  proxyUrl?: string;
+  timezone?: string;
+  noProxy?: string;
+}
+
+/**
+ * Optional selfhost-only transport overlay for the Claude Code child process.
+ *
+ * The container gateway keeps its image TZ and internal HTTP route unchanged.
+ * Only CCB receives these values later through subprocessRunner, so gateway
+ * cron/billing wall-clock semantics cannot drift. Remote hosts are excluded
+ * until they have a per-host proxy listener contract.
+ */
+export function resolveV5LocalCcbTransportEnv(
+  input: V5LocalCcbTransportEnvInput,
+): string[] {
+  if (input.runtimeChannel !== "v5" || input.useRemote) return [];
+
+  const proxy = input.proxyUrl?.trim();
+  const timezone = input.timezone?.trim();
+  const result: string[] = [];
+
+  if (proxy) {
+    let parsed: URL;
+    try {
+      parsed = new URL(proxy);
+    } catch {
+      throw new SupervisorError("InvalidArgument", "OC_CLAUDE_CODE_HTTPS_PROXY must be a valid URL");
+    }
+    if (
+      (parsed.protocol !== "http:" && parsed.protocol !== "https:") ||
+      parsed.username ||
+      parsed.password ||
+      !parsed.hostname ||
+      (parsed.pathname !== "" && parsed.pathname !== "/") ||
+      parsed.search ||
+      parsed.hash
+    ) {
+      throw new SupervisorError(
+        "InvalidArgument",
+        "OC_CLAUDE_CODE_HTTPS_PROXY must be a credential-free http(s) origin",
+      );
+    }
+    const noProxy = Array.from(
+      new Set(
+        [
+          ...(input.noProxy ?? "").split(","),
+          "localhost",
+          "127.0.0.1",
+          "::1",
+          input.hostGatewayIp,
+        ]
+          .map((part) => part.trim())
+          .filter(Boolean),
+      ),
+    ).join(",");
+    result.push(
+      `OPENCLAUDE_CCB_HTTPS_PROXY=${parsed.toString().replace(/\/$/, "")}`,
+      `OPENCLAUDE_CCB_NO_PROXY=${noProxy}`,
+    );
+  }
+
+  if (timezone) {
+    try {
+      new Intl.DateTimeFormat("en-US", { timeZone: timezone }).format();
+    } catch {
+      throw new SupervisorError("InvalidArgument", "OC_CLAUDE_CODE_TZ must be a valid IANA timezone");
+    }
+    result.push(`OPENCLAUDE_CCB_TZ=${timezone}`);
+  }
+
+  return result;
+}
+
 /**
  * 容器内 OpenClaude gateway 监听端口(默认 18789,见 personal-version
  * `packages/storage/src/config.ts`,容器侧 entrypoint.ts bootstrap config 也是这个值)。
@@ -2537,6 +2615,20 @@ export async function provisionV3Container(
       `ANTHROPIC_BASE_URL=${internalProxyUrl}`,
       `ANTHROPIC_AUTH_TOKEN=${token}`,
       "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1",
+      // 反封复盘 2026-08 — 收紧 CCB 重试上限。容器内 CCB 不是订阅态
+      // (isClaudeAISubscriber()=false),默认对 429/5xx 会重试到 CLAUDE_CODE_MAX_RETRIES
+      // (默认 10),等于把"上游限流/抖动"放大成"同一账号+同一出口 IP 短时间反复撞
+      // Anthropic",是订阅号被封的典型特征。收到 2:一次上游 hiccup 最多补打 1 次,
+      // 既保留瞬时抖动的自愈,又不制造规避限额式的洪泛。配合 commercial proxy 把 429
+      // 透传为 429(见 http/proxy/core.ts)。
+      "CLAUDE_CODE_MAX_RETRIES=2",
+      // 反封复盘 2026-08 — 关闭 CCB 一切非必要出网(遥测/analytics/自动更新/release
+      // notes/model-capabilities 等,privacyLevel=essential-traffic,见
+      // claude-code-best/src/utils/privacyLevel.ts)。这些旁路流量此前经
+      // OPENCLAUDE_CCB_HTTPS_PROXY→日本 sing-box 节点发出,与走住宅代理的 Anthropic API
+      // 请求分叉到不同 ASN,给"同一产品两个出口"的关联信号。关掉后只剩必要的
+      // /v1/messages 走账号住宅代理,出口形态单一干净。
+      "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
       `CLAUDE_CONFIG_DIR=${V3_CONFIG_TMPFS_PATH}`,
       `OC_USER_ROLE=${userRole}`,
       // **bridge IP trust 旁路只在 v3 supervisor 真正 spawn 容器时注入**:
@@ -2590,6 +2682,16 @@ export async function provisionV3Container(
       // 行为(FILE_ALLOWED_DIRS + TEMP_PREFIX + agent_cwd MEDIA_EXTENSIONS)。
       "OC_V3_TRUSTED_FILE_SERVE=1",
     ];
+    env.push(
+      ...resolveV5LocalCcbTransportEnv({
+        runtimeChannel: getRuntimeChannel(),
+        useRemote,
+        hostGatewayIp,
+        proxyUrl: process.env.OC_CLAUDE_CODE_HTTPS_PROXY,
+        timezone: process.env.OC_CLAUDE_CODE_TZ,
+        noProxy: process.env.NO_PROXY,
+      }),
+    );
     const promptQueueEnabled = getRuntimeChannel() === "v5" && isPromptQueueV1Enabled();
     if (promptQueueEnabled) {
       // Both halves of the container-side strict gate are server-authored.

@@ -205,6 +205,92 @@ export function _buildSecondaryUtilityModelEnv(): Record<string, string> {
   return { ANTHROPIC_SMALL_FAST_MODEL: model }
 }
 
+const CCB_TRANSPORT_INTERNAL_KEYS = [
+  'OPENCLAUDE_CCB_HTTPS_PROXY',
+  'OPENCLAUDE_CCB_NO_PROXY',
+  'OPENCLAUDE_CCB_TZ',
+] as const
+
+function assertCredentialFreeHttpProxy(value: string): string {
+  let parsed: URL
+  try {
+    parsed = new URL(value)
+  } catch {
+    throw new Error('OPENCLAUDE_CCB_HTTPS_PROXY must be a valid URL')
+  }
+  if (
+    (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') ||
+    parsed.username ||
+    parsed.password ||
+    !parsed.hostname ||
+    (parsed.pathname !== '' && parsed.pathname !== '/') ||
+    parsed.search ||
+    parsed.hash
+  ) {
+    throw new Error('OPENCLAUDE_CCB_HTTPS_PROXY must be a credential-free http(s) origin')
+  }
+  return parsed.toString().replace(/\/$/, '')
+}
+
+/**
+ * Build the inherited CCB environment while keeping platform-only transport
+ * controls out of the child. When enabled, the same HTTPS proxy is written in
+ * both cases, legacy HTTP/ALL proxy variables are removed, and the current
+ * internal ANTHROPIC_BASE_URL host must be explicitly present in NO_PROXY.
+ */
+export function buildCcbSpawnProcessEnv(
+  source: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...source }
+  for (const key of CCB_TRANSPORT_INTERNAL_KEYS) delete env[key]
+
+  const proxyRaw = source.OPENCLAUDE_CCB_HTTPS_PROXY?.trim()
+  const noProxyRaw = source.OPENCLAUDE_CCB_NO_PROXY?.trim()
+  if (proxyRaw) {
+    const proxy = assertCredentialFreeHttpProxy(proxyRaw)
+    if (!noProxyRaw) {
+      throw new Error('OPENCLAUDE_CCB_NO_PROXY is required with OPENCLAUDE_CCB_HTTPS_PROXY')
+    }
+    const noProxyHosts = new Set(
+      noProxyRaw
+        .split(',')
+        .map((part) => part.trim().replace(/^\[|\]$/g, ''))
+        .filter(Boolean),
+    )
+    const anthropicBase = source.ANTHROPIC_BASE_URL?.trim()
+    if (anthropicBase) {
+      let internalHost: string
+      try {
+        internalHost = new URL(anthropicBase).hostname
+      } catch {
+        throw new Error('ANTHROPIC_BASE_URL must be valid when CCB HTTPS proxying is enabled')
+      }
+      if (!noProxyHosts.has(internalHost)) {
+        throw new Error('OPENCLAUDE_CCB_NO_PROXY must include the ANTHROPIC_BASE_URL host')
+      }
+    }
+    delete env.HTTP_PROXY
+    delete env.http_proxy
+    delete env.ALL_PROXY
+    delete env.all_proxy
+    env.HTTPS_PROXY = proxy
+    env.https_proxy = proxy
+    env.NO_PROXY = noProxyRaw
+    env.no_proxy = noProxyRaw
+  }
+
+  const timezone = source.OPENCLAUDE_CCB_TZ?.trim()
+  if (timezone) {
+    try {
+      new Intl.DateTimeFormat('en-US', { timeZone: timezone }).format()
+    } catch {
+      throw new Error('OPENCLAUDE_CCB_TZ must be a valid IANA timezone')
+    }
+    env.TZ = timezone
+  }
+  return env
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 模型权威批次 · §4 —— CCB 上游 `/v1/messages` 的 per-turn 凭据 header 注入
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1151,7 +1237,7 @@ export class SubprocessRunner extends EventEmitter {
         // 与 Bash 工具的 working directory 都跟系统提示对齐。
         subprocessCwd: learningContext.workingDir ?? effectiveAddDir,
         env: {
-          ...process.env,
+          ...buildCcbSpawnProcessEnv(),
           ...providerEnv,
           OPENCLAUDE_SESSION_KEY: this.opts.sessionKey,
           OPENCLAUDE_AGENT_ID: this.opts.agentId,

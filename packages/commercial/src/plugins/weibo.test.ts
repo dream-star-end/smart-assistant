@@ -198,7 +198,7 @@ describe('official Weibo Plugin', () => {
   })
 
   test('pins the current artifact and only the exact production predecessor', () => {
-    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.33')
+    assert.equal(WEIBO_PLUGIN_VERSION, '1.6.35')
     assert.equal(WEIBO_DRIVER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.equal(WEIBO_LAUNCHER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.deepEqual(WEIBO_SETUP_COMPATIBLE_PREDECESSORS, [
@@ -516,10 +516,19 @@ describe('official Weibo Plugin', () => {
     assert.match(WEIBO_WORKER_SOURCE, /emitChooser\('existing'\)/)
     assert.match(WEIBO_WORKER_SOURCE, /if \(scopedInput\) \{\n    emitChooser\('existing'\)/)
     assert.match(WEIBO_WORKER_SOURCE, /https:\/\/picupload\.weibo\.com/)
+    assert.match(WEIBO_WORKER_SOURCE, /waitUntil: 'commit'/)
+    assert.match(WEIBO_WORKER_SOURCE, /via: 'picupload-origin'/)
+    assert.match(createPostSource, /api\.via === 'string' && api.via/)
     assert.match(WEIBO_WORKER_SOURCE, /ajax\/statuses\/update/)
     assert.match(WEIBO_WORKER_SOURCE, /api\/statuses\/uploadPic/)
     assert.match(WEIBO_WORKER_SOURCE, /api\/statuses\/update/)
     assert.match(WEIBO_WORKER_SOURCE, /async function publishComposerViaCookieApi/)
+    assert.match(WEIBO_WORKER_SOURCE, /cookie.name === 'XSRF-TOKEN'/)
+    assert.match(WEIBO_WORKER_SOURCE, /context.cookies\(\)/)
+    assert.match(WEIBO_WORKER_SOURCE, /'GET', 'POST', 'DELETE', 'OPTIONS'/)
+    assert.match(WEIBO_WORKER_SOURCE, /payload.via = String\(event.via\)/)
+    assert.match(WEIBO_WORKER_SOURCE, /payload.attempted = event.attempted/)
+    assert.match(WEIBO_WORKER_SOURCE, /reason: rejected \? 'rejected' : 'http'/)
     assert.ok(
       WEIBO_WORKER_SOURCE.indexOf('async function publishComposerViaCookieApi')
         < WEIBO_WORKER_SOURCE.indexOf('async function newestOwnPost'),
@@ -1016,6 +1025,48 @@ describe('official Weibo Plugin', () => {
     assert.ok(events.indexOf('dispatch') < events.indexOf('api'))
     assert.equal(events.includes('image-click'), false)
     assert.equal(events.filter((event) => event === 'click').length, 0)
+  })
+
+  test('create_post with media skips the native chooser after a live cookie-path miss', async () => {
+    const events: string[] = []
+    const textarea = { fill: async () => {}, inputValue: async () => 'hello' }
+    const send = {
+      isDisabled: async () => false,
+      click: async (options: { trial?: boolean }) => {
+        events.push(options.trial ? 'trial' : 'click')
+      },
+    }
+    const harness = compileWorkerPostHarness({
+      ensureSelfId: async () => '12345',
+      gotoAuthenticated: async () => {},
+      collectPosts: async () => [],
+      uniqueVisible: async () => textarea,
+      assertNoChallenge: async () => {},
+      awaitDispatch: async () => events.push('dispatch'),
+      exactMenuItem: async (_page: unknown, text: string) =>
+        text === '图片' ? { click: async () => events.push('image-click') } : send,
+      publishComposerViaCookieApi: async () => {
+        events.push('api')
+        return { published: false, attempted: false, via: 'picupload-origin', pids: [], status: 0 }
+      },
+      cleanText: (value: unknown) => String(value).trim(),
+      readFile: async () => Buffer.from('image'),
+    })
+    await assert.rejects(
+      harness.writeAction(
+        { locator: () => ({}), waitForTimeout: async () => {} },
+        {
+          actionId: 'create_post',
+          params: {
+            text: 'hello',
+            mediaManifest: [{ inputId: 'asset-1', filename: 'image.png', mimeType: 'image/png' }],
+          },
+        },
+      ),
+      /media-upload/,
+    )
+    assert.ok(events.indexOf('dispatch') < events.indexOf('api'))
+    assert.equal(events.includes('image-click'), false)
   })
 
   test('create_post does not dispatch a page-level file input outside composer scope', async () => {

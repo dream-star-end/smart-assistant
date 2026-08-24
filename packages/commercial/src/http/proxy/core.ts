@@ -347,6 +347,36 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
       if (!isClientBadRequest && (upstream.status >= 500 || upstream.status === 429)) {
         recordProviderHealthSample(body.model, "upstream_5xx");
       }
+      // 反封复盘 2026-08 — 上游 429 **透传为 429**(带 Retry-After),不再伪装成 502。
+      //
+      // 旧行为把 Anthropic 的 429 映射成 502 UPSTREAM_ERROR。容器内 CCB 不是订阅态
+      // (用 oc-v3 容器身份 token,isClaudeAISubscriber()=false),对 5xx 会按
+      // CLAUDE_CODE_MAX_RETRIES 重试(默认 10)——等于把"被限流"放大成"同一账号 +
+      // 同一出口 IP 短时间反复撞 Anthropic",这正是号商/规避限额的封号特征。
+      //
+      // 透传真实 429 后:
+      //   - 语义正确:客户端拿到标准 429 + Retry-After,按限流退避而非当故障狂重试。
+      //   - 配合容器 CLAUDE_CODE_MAX_RETRIES 收紧(见 v3supervisor.ts),放大被封顶。
+      //   - 账号健康分已由上面 finalize.fail(RATE_LIMITED) 扣减,连续失败自动进 cooldown,
+      //     无需在此额外切号(切号 = 规避限额,反而增封号风险)。
+      // Retry-After:优先取上游头;缺失给 60s 保守默认(Anthropic 5h 窗口下够温和)。
+      if (upstream.status === 429) {
+        const upstreamRetryAfter = upstream.headers.get("retry-after");
+        const retryAfterSec =
+          upstreamRetryAfter && /^\d+$/.test(upstreamRetryAfter.trim())
+            ? Math.max(1, parseInt(upstreamRetryAfter.trim(), 10))
+            : 60;
+        sendJsonError(
+          res,
+          429,
+          "UPSTREAM_RATE_LIMITED",
+          "upstream rate limited; retry after the indicated delay",
+          requestId,
+          { "Retry-After": String(retryAfterSec) },
+          { retry_after_ms: retryAfterSec * 1000 },
+        );
+        return;
+      }
       sendJsonError(res, 502, "UPSTREAM_ERROR", `upstream returned ${upstream.status}`, requestId);
       return;
     }

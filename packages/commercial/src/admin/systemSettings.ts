@@ -195,7 +195,13 @@ export const DEFAULTS: { [K in SystemSettingKey]: SystemSettingValue<K> } = {
   ],
   // v3 反关联根治 — 默认 off,与原 env-only 字段默认一致(零迁移)
   phase6_account_uuid_enforce: "off",
-  session_pin_mode: "off",
+  // 反封复盘 2026-08 — 默认 enforce:同一 chat session 粘同一订阅号,消除
+  // "一个用户在 Anthropic 侧叉到多个 account_uuid"的关联信号(这是切号/多号
+  // 规避限额的画像)。enforce 的唯一"硬"行为是绑定账号被封后抛 409
+  // SESSION_PIN_UNBOUND —— 已有 force_repin / reset_session 客户端处理路径
+  // (见 http/proxy/index.ts),正是反封想要的"不在会话中途静默切号"。
+  // 如需回退观察:admin PUT /api/admin/settings/session_pin_mode = "observe"|"off"。
+  session_pin_mode: "enforce",
   auto_dream_model: DEFAULT_AUTO_DREAM_MODEL,
 };
 

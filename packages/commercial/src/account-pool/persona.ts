@@ -67,15 +67,49 @@ const PERSONA_KEYS: ReadonlyArray<keyof Persona> = [
 ] as const;
 
 /**
- * 变体池 — 每个维度可选值。
+ * 真实 Claude Code (CCB) 版本锚点 —— **必须与实际 ship 的二进制一致**。
+ *
+ * 反封复盘(2026-08):Anthropic 侧对订阅号最强的识别信号之一是"客户端伪装
+ * 与真实二进制对不上"。旧实现把 UA 伪装成 stainless SDK 的
+ * `anthropic-ai-claude-code/<pkg>`,而真实 Claude Code CLI(含官方 + CCB,
+ * 共用 claude-code-best/src/utils/http.ts::getUserAgent)在 wire 上发的是
+ * `claude-cli/<VERSION> (<USER_TYPE>, <ENTRYPOINT>)`,并带 `x-app: cli`。
+ * 见 packages/commercial/src/auth/apiKeyIdentity.ts §UA 入站门控 —— 本仓自己
+ * 也只放行 `claude-cli/*`。因此 persona 必须发**真实 claude-cli 画像**,而非
+ * SDK 画像。
+ *
+ * 两个版本号是**不同**的东西,不能混用:
+ *   - CCB_CLI_VERSION      → UA 里的 `claude-cli/<x>`,= claude-code-best/package.json version
+ *   - CCB_SDK_VERSION      → `x-stainless-package-version`,= 内置 @anthropic-ai/sdk 版本
+ *
+ * 升级 CCB 时**同步**改这两个常量(与 claude-code-best/package.json 对齐)。
+ * 为什么用常量而非"版本池":同一 ship 的二进制,全网真实用户发的就是同一
+ * `claude-cli/<x>` + 同一 SDK 版本;伪造一批我们根本没在跑的旧版本,反而会
+ * 在"UA 版本 vs 实际请求能力"上露馅(旧版 CLI 发不出新版才有的 body 特征)。
+ * 账号间的天然差异改由 os / arch / node 运行时版本 / accept-language 承载 ——
+ * 这些在真实用户里本就千差万别,且不与请求行为相关联。
+ */
+const CCB_CLI_VERSION = "2.8.4";
+const CCB_SDK_VERSION = "0.81.0";
+
+/**
+ * UA 里的 USER_TYPE / ENTRYPOINT —— 对应容器内外接用户的真实取值。
+ * getUserAgent 格式:`claude-cli/<VERSION> (<USER_TYPE>, <ENTRYPOINT>)`。
+ * 外接(非 Anthropic 内部)用户 USER_TYPE = "external";CLI 入口 ENTRYPOINT = "cli"。
+ */
+const CCB_USER_TYPE = "external";
+const CCB_ENTRYPOINT = "cli";
+
+/**
+ * 变体池 — **只保留真实用户间天然会变、且与请求行为无关联**的维度。
  *
  * 选值原则:
  *   - 全部对应"真实存在的 Claude Code 用户分布":真实社区里 Apple Silicon Mac / Intel Mac /
  *     Linux 工作站 / Windows + WSL 都有,Anthropic 网关看到这些组合是正常的。
  *   - 不放过于稀有的组合(如 freebsd / arm32),会成为反向"挑出我们这种伪装池"的指纹。
- *   - package_version / runtime_version 跟随 CCB 当前 ship 的版本族滚动,升级 CCB 时同步。
- *     单一版本(锁死 1.0.71 + 22.16.0)在号商画像中会被识别 — 让 Anthropic 看到
- *     "我的池子里账号自然分布在最近几个 CCB 版本"是正常的版本采纳曲线。
+ *   - runtime_version 是**跑 CLI 的宿主 node 版本**,真实用户各不相同(nvm / 系统 node),
+ *     与 claude-cli 版本正交,可以安全差异化。
+ *   - 版本号(claude-cli / SDK)**不**进池:见 CCB_CLI_VERSION 注释,用真实常量。
  *   - accept_language 覆盖主要市场 + 中文用户(boss 用户基底)。
  */
 const PERSONA_VARIANTS = {
@@ -84,13 +118,6 @@ const PERSONA_VARIANTS = {
   // 简化:os 独立采样,arch=arm64 + os=Windows 的极小概率在真实分布里也存在
   //(Windows on ARM)— 整体放行。
   os: ["MacOS", "Linux", "Windows"] as const,
-  package_version: [
-    "1.0.71",
-    "1.0.85",
-    "1.0.98",
-    "1.0.110",
-    "1.0.117",
-  ] as const,
   runtime: ["node"] as const,
   runtime_version: [
     "v20.11.1",
@@ -111,21 +138,18 @@ const PERSONA_VARIANTS = {
 } as const;
 
 /**
- * 拼 user_agent:格式与真实 stainless SDK 一致,只在 package_version /
- * runtime_version / os 三处按 variants 池摆动。
+ * 拼 user_agent —— 复刻真实 Claude Code CLI 的 wire UA。
  *
- * 真实 CCB User-Agent 格式(stainless SDK 拼装):
- *   "anthropic-ai-claude-code/<pkg-version> Node/<node-version> <OS>"
+ * 真实格式(claude-code-best/src/utils/http.ts::getUserAgent):
+ *   "claude-cli/<VERSION> (<USER_TYPE>, <ENTRYPOINT>)"
+ *   例:"claude-cli/2.8.4 (external, cli)"
  *
- * 为什么不混入"其他合法 UA 模板"(Codex Round 4 反馈):
- *   - "凭空伪造"未经真实抓包验证的 UA 反而是新指纹源。
- *   - 单一真实模板 + package/runtime/os 维度天然分布,在 Anthropic 网关侧已经
- *     呈现合理多样性(全网 CCB 用户本来就跨多版本/平台),不需要额外编模板。
- *   - 真实模板未来随 CCB 升级演进时,只更新 PERSONA_VARIANTS 池子,模板字面量
- *     保持稳定。
+ * 注意:不再是 stainless 默认 UA(`anthropic-ai-claude-code/...`)。真实 CLI 在
+ * defaultHeaders 里用 getUserAgent() 覆盖了 SDK 默认 UA,所以 Anthropic 网关看到
+ * 的就是 `claude-cli/*`。SDK 的身份仍通过 x-stainless-* 头单独表达。
  */
-function pickUserAgent(packageVersion: string, runtimeVersion: string, os: string): string {
-  return `anthropic-ai-claude-code/${packageVersion} Node/${runtimeVersion} ${os}`;
+function pickUserAgent(): string {
+  return `claude-cli/${CCB_CLI_VERSION} (${CCB_USER_TYPE}, ${CCB_ENTRYPOINT})`;
 }
 
 /**
@@ -152,19 +176,20 @@ export function generatePersona(seed?: Buffer): Persona {
 
   const arch = pick(buf, 0, PERSONA_VARIANTS.arch);
   const os = pick(buf, 1, PERSONA_VARIANTS.os);
-  const packageVersion = pick(buf, 2, PERSONA_VARIANTS.package_version);
-  const runtime = pick(buf, 3, PERSONA_VARIANTS.runtime);
-  const runtimeVersion = pick(buf, 4, PERSONA_VARIANTS.runtime_version);
-  const acceptLanguage = pick(buf, 5, PERSONA_VARIANTS.accept_language);
-  const retryCount = pick(buf, 6, PERSONA_VARIANTS.retry_count);
-  const lang = pick(buf, 7, PERSONA_VARIANTS.lang);
+  const runtime = pick(buf, 2, PERSONA_VARIANTS.runtime);
+  const runtimeVersion = pick(buf, 3, PERSONA_VARIANTS.runtime_version);
+  const acceptLanguage = pick(buf, 4, PERSONA_VARIANTS.accept_language);
+  const retryCount = pick(buf, 5, PERSONA_VARIANTS.retry_count);
+  const lang = pick(buf, 6, PERSONA_VARIANTS.lang);
 
   return {
-    user_agent: pickUserAgent(packageVersion, runtimeVersion, os),
+    // UA 与 x-stainless-package-version 用真实二进制锚点常量(见 CCB_CLI_VERSION),
+    // 账号间差异化交给 os / arch / node 运行时版本 / accept-language。
+    user_agent: pickUserAgent(),
     x_stainless_arch: arch,
     x_stainless_lang: lang,
     x_stainless_os: os,
-    x_stainless_package_version: packageVersion,
+    x_stainless_package_version: CCB_SDK_VERSION,
     x_stainless_runtime: runtime,
     x_stainless_runtime_version: runtimeVersion,
     x_stainless_retry_count: retryCount,
