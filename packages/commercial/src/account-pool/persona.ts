@@ -52,6 +52,15 @@ export interface Persona {
   x_stainless_runtime_version: string;
   x_stainless_retry_count: string;
   accept_language: string;
+  /**
+   * 反封复盘 2026-08 — 账号的 IANA 时区,**与 accept_language 一致映射**。
+   *
+   * 不作为 HTTP 头发送(personaToHeaderPairs 不含它)。用途:commercial proxy 转发
+   * 时把 CCB 注入 messages 的本地日期(`Today's date is YYYY-MM-DD`)改写成该时区
+   * 的本地日期,让"body 里的日期"与"账号语言画像 + 出口 IP 地域"自洽,消除
+   * "en-US 语言 + 东京日期 + 美国住宅 IP"这类跨区指纹。
+   */
+  timezone: string;
 }
 
 const PERSONA_KEYS: ReadonlyArray<keyof Persona> = [
@@ -64,6 +73,7 @@ const PERSONA_KEYS: ReadonlyArray<keyof Persona> = [
   "x_stainless_runtime_version",
   "x_stainless_retry_count",
   "accept_language",
+  "timezone",
 ] as const;
 
 /**
@@ -138,6 +148,24 @@ const PERSONA_VARIANTS = {
 } as const;
 
 /**
+ * 反封复盘 2026-08 — accept_language → IANA 时区的**一致映射**。
+ *
+ * 时区必须跟着语言画像走:一个声明 en-US 的号,body 里的"今天日期"该按美东算,
+ * 而不是按部署机的东京/上海算。key 用 accept_language 池里的完整字符串,保证每个
+ * 语言变体都有确定的时区,generatePersona 不会取到未覆盖的组合。
+ *
+ * 选区原则:取该市场人口/开发者最集中的代表时区(en-US→美东,而非某个小众区),
+ * 让"语言 + 日期"组合落在真实用户最稠密的地方。
+ */
+const ACCEPT_LANGUAGE_TIMEZONE: Record<string, string> = {
+  "en-US,en;q=0.9": "America/New_York",
+  "en-GB,en;q=0.9": "Europe/London",
+  "zh-CN,zh;q=0.9,en;q=0.8": "Asia/Shanghai",
+  "ja-JP,ja;q=0.9,en;q=0.8": "Asia/Tokyo",
+  "de-DE,de;q=0.9,en;q=0.8": "Europe/Berlin",
+};
+
+/**
  * 拼 user_agent —— 复刻真实 Claude Code CLI 的 wire UA。
  *
  * 真实格式(claude-code-best/src/utils/http.ts::getUserAgent):
@@ -194,6 +222,9 @@ export function generatePersona(seed?: Buffer): Persona {
     x_stainless_runtime_version: runtimeVersion,
     x_stainless_retry_count: retryCount,
     accept_language: acceptLanguage,
+    // 时区跟着语言画像走(见 ACCEPT_LANGUAGE_TIMEZONE);映射保证全覆盖,?? 只是
+    // TS 兜底,理论不可达。
+    timezone: ACCEPT_LANGUAGE_TIMEZONE[acceptLanguage] ?? "America/New_York",
   };
 }
 

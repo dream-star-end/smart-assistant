@@ -31,6 +31,8 @@ import {
   validateUpstreamConfig,
   pickUpstream,
   releaseUpstreamSession,
+  formatIsoDateInTimezone,
+  rewriteReminderDatesInMessages,
   type PickUpstreamDeps,
 } from "../http/proxy/upstream.js";
 import { directEgressDispatcher } from "../account-pool/egressDispatcher.js";
@@ -88,6 +90,7 @@ function makePick(over: Partial<PickResult> = {}): PickResult {
       x_stainless_runtime_version: "v22.16.0",
       x_stainless_retry_count: "0",
       accept_language: "en-US,en;q=0.9",
+      timezone: "America/New_York",
     },
     ...over,
   };
@@ -1130,6 +1133,7 @@ describe("PreparedUpstreamSession (OAuth) — applyUpstreamAuth", () => {
       x_stainless_runtime_version: "v22.16.0",
       x_stainless_retry_count: "0",
       accept_language: "en-US,en;q=0.9",
+      timezone: "America/New_York",
     };
     const { session } = await makeSession({ persona });
     const headers: Record<string, string> = {};
@@ -1171,6 +1175,7 @@ describe("PreparedUpstreamSession (OAuth) — applyUpstreamAuth", () => {
       x_stainless_runtime_version: "v22.14.0",
       x_stainless_retry_count: "0",
       accept_language: "ja-JP,ja;q=0.9,en;q=0.8",
+      timezone: "Asia/Tokyo",
     };
     const { session } = await makeSession({ persona });
     const headers: Record<string, string> = {
@@ -1185,7 +1190,94 @@ describe("PreparedUpstreamSession (OAuth) — applyUpstreamAuth", () => {
   });
 });
 
+// ─── 反封复盘 2026-08 — 账号时区一致化(日期改写)──────────────────────────
+
+describe("formatIsoDateInTimezone", () => {
+  test("同一 UTC 瞬时,东京比纽约早,可能差一个日历日", () => {
+    // 2026-08-25T02:00:00Z:东京 = 08-25 11:00,纽约(EDT,UTC-4) = 08-24 22:00
+    const at = new Date("2026-08-25T02:00:00Z");
+    assert.equal(formatIsoDateInTimezone("Asia/Tokyo", at), "2026-08-25");
+    assert.equal(formatIsoDateInTimezone("America/New_York", at), "2026-08-24");
+  });
+
+  test("输出恒为 YYYY-MM-DD", () => {
+    assert.match(formatIsoDateInTimezone("Europe/Berlin"), /^\d{4}-\d{2}-\d{2}$/);
+  });
+});
+
+describe("rewriteReminderDatesInMessages", () => {
+  test("只改 <system-reminder> 里的日期,string content", () => {
+    const messages = [
+      { role: "user", content: "<system-reminder>\n# currentDate\nToday's date is 2026-08-25.\n</system-reminder>" },
+    ];
+    const out = rewriteReminderDatesInMessages(messages, "2026-08-24") as Array<{ content: string }>;
+    assert.ok(out[0].content.includes("Today's date is 2026-08-24."));
+    assert.ok(!out[0].content.includes("2026-08-25"));
+  });
+
+  test("date_change 的 'is now <date>' 也改写", () => {
+    const messages = [
+      { role: "user", content: "<system-reminder>The date has changed. Today's date is now 2026-08-25.</system-reminder>" },
+    ];
+    const out = rewriteReminderDatesInMessages(messages, "2026-08-24") as Array<{ content: string }>;
+    assert.ok(out[0].content.includes("Today's date is now 2026-08-24."));
+  });
+
+  test("text content block 数组也改写", () => {
+    const messages = [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "<system-reminder>Today's date is 2026-08-25.</system-reminder>" },
+          { type: "text", text: "帮我写代码" },
+        ],
+      },
+    ];
+    const out = rewriteReminderDatesInMessages(messages, "2026-01-01") as Array<{
+      content: Array<{ type: string; text: string }>;
+    }>;
+    assert.ok(out[0].content[0].text.includes("Today's date is 2026-01-01."));
+    assert.equal(out[0].content[1].text, "帮我写代码");
+  });
+
+  test("用户正文里恰好写了 'Today's date is' 但无 system-reminder → 不改", () => {
+    const messages = [{ role: "user", content: "Today's date is 2026-08-25 in my essay" }];
+    const out = rewriteReminderDatesInMessages(messages, "2026-08-24");
+    assert.equal(out, messages, "无 system-reminder 不动 → copy-on-write 返回原引用");
+    assert.ok((out as Array<{ content: string }>)[0].content.includes("2026-08-25"));
+  });
+
+  test("无匹配 → 返回原数组引用(copy-on-write)", () => {
+    const messages = [{ role: "user", content: "hi" }];
+    assert.equal(rewriteReminderDatesInMessages(messages, "2026-08-24"), messages);
+  });
+});
+
 describe("PreparedUpstreamSession (OAuth) — sanitizeMessages", () => {
+  test("按 persona.timezone 改写 reminder 日期(en-US → 纽约日历)", async () => {
+    // persona 默认 timezone=America/New_York;这里断言 sanitizeMessages 会把
+    // reminder 里 CCB 写的东京日期改成纽约本地日期(= 当前纽约日历日)。
+    const sched = makeScheduler({});
+    const res = await pickUpstream(
+      {
+        scheduler: sched.scheduler,
+        getDispatcher: (async () => undefined) as PickUpstreamDeps["getDispatcher"],
+      },
+      bodyFor("claude-sonnet-4-6"),
+      { kind: "oauth" },
+      log,
+    );
+    assert.equal(res.ok, true);
+    if (!res.ok) return;
+    const nyToday = formatIsoDateInTimezone("America/New_York");
+    const messages = [
+      { role: "user", content: "<system-reminder>Today's date is 1999-12-31.</system-reminder>" },
+    ];
+    const out = res.session.sanitizeMessages(messages, "claude-sonnet-4-6", log) as Array<{ content: string }>;
+    assert.ok(out[0].content.includes(`Today's date is ${nyToday}.`));
+    assert.ok(!out[0].content.includes("1999-12-31"));
+  });
+
   test("无 malformed thinking → 返回原引用(stripMalformedThinkingBlocks 内部 short-circuit)", async () => {
     const sched = makeScheduler({});
     const res = await pickUpstream(
