@@ -8,7 +8,11 @@ import assert from 'node:assert/strict'
 import { Readable } from 'node:stream'
 import { describe, test } from 'node:test'
 
-import { acquireDelegateGrokRoute } from '../delegateGrokRoute.js'
+import {
+  acquireDelegateGrokRoute,
+  delegateGrokMintModelId,
+  shouldMintDelegateGrokRoute,
+} from '../delegateGrokRoute.js'
 
 const ENV = {
   OPENCLAUDE_V3_MASTER_BASE_URL: 'http://127.0.0.1:19001',
@@ -178,5 +182,53 @@ describe('acquireDelegateGrokRoute', () => {
     }
     assert.equal(releaseCalls, 2)
     assert.ok(warnings.some((msg) => msg.includes('delegate_grok_route_release_deferred')))
+  })
+})
+
+describe('shouldMintDelegateGrokRoute', () => {
+  test('catalog engine grok always mints even without a requested model', () => {
+    assert.equal(shouldMintDelegateGrokRoute({
+      delegateEngine: 'grok',
+      agentModel: 'glm-5.3-zai',
+    }), true)
+  })
+
+  test('catalog engine ccb does not mint even if agent default is grok-build', () => {
+    assert.equal(shouldMintDelegateGrokRoute({
+      delegateEngine: 'ccb',
+      agentModel: 'grok-build',
+    }), false)
+  })
+
+  test('send_to_agent without model mints from the grok agent default', () => {
+    assert.equal(shouldMintDelegateGrokRoute({
+      agentModel: 'grok-build',
+    }), true)
+    assert.equal(delegateGrokMintModelId({ agentModel: 'grok-build' }), 'grok-build')
+  })
+
+  test('send_to_agent without model does not mint a glm agent', () => {
+    assert.equal(shouldMintDelegateGrokRoute({
+      agentModel: 'glm-5.3-zai',
+    }), false)
+    assert.equal(delegateGrokMintModelId({ agentModel: 'glm-5.3-zai' }), undefined)
+  })
+
+  test('explicit requested grok-build still mints when catalog authority is off', () => {
+    assert.equal(shouldMintDelegateGrokRoute({
+      requestedModel: 'grok-build',
+    }), true)
+    assert.equal(delegateGrokMintModelId({ requestedModel: 'grok-build' }), 'grok-build')
+  })
+})
+
+describe('delegate core wires send_to_agent grok mint', () => {
+  test('_runDelegateTaskCore uses agentModel when minting', async () => {
+    const { readFileSync } = await import('node:fs')
+    const { fileURLToPath } = await import('node:url')
+    const src = readFileSync(fileURLToPath(new URL('../server.ts', import.meta.url)), 'utf8')
+    assert.match(src, /shouldMintDelegateGrokRoute\(/)
+    assert.match(src, /agentModel: execAgent\.model/)
+    assert.match(src, /delegateGrokMintModelId\(/)
   })
 })

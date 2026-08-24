@@ -336,7 +336,12 @@ import {
 } from './delegateJobs.js'
 import { DelegateResumeRegistry } from './delegateResume.js'
 import { isPlatformAgentId, parseDelegateModel } from './delegateModel.js'
-import { acquireDelegateGrokRoute, type DelegateGrokRouteLease } from './delegateGrokRoute.js'
+import {
+  acquireDelegateGrokRoute,
+  delegateGrokMintModelId,
+  shouldMintDelegateGrokRoute,
+  type DelegateGrokRouteLease,
+} from './delegateGrokRoute.js'
 import { eventBus, createEvent } from './eventBus.js'
 import { startEventPersistence } from './eventPersist.js'
 import { startMemoryTurnObserver } from './memoryTurnObserver.js'
@@ -11302,17 +11307,30 @@ export class Gateway {
     // GrokAdapter 在 spawn 前 fail-closed(GROK_ROUTE_REQUIRED)。放在资源闸之后:
     // 排队期间不占用稀缺的 Grok 订阅槽;mint 失败是零代价结构化拒绝(尚未创建
     // session/runner)。生产(未开引擎本地豁免)在上方 decideLocalExecution 已拒。
-    const grokDelegate =
-      delegateExec
-        ? delegateExec.engine === 'grok'
-        : requestedModel
-          ? isGrokEngineModel(requestedModel)
-          : false
+    const grokMintModelId = delegateGrokMintModelId({
+      canonicalModel: delegateExec?.canonicalModel,
+      requestedModel,
+      agentModel: execAgent.model,
+    })
+    const grokDelegate = shouldMintDelegateGrokRoute({
+      delegateEngine: delegateExec?.engine,
+      requestedModel,
+      agentModel: execAgent.model,
+    })
     let grokRoute: { baseUrl: string; routeToken: string } | null = null
     let grokRouteLease: DelegateGrokRouteLease | null = null
     if (grokDelegate) {
+      if (!grokMintModelId) {
+        this._releaseDelegateSlot(slotOpts)
+        unregisterDelegation?.()
+        return {
+          kind: 'rejected',
+          httpStatus: 500,
+          message: 'Grok 委派暂不可用: missing grok model id',
+        }
+      }
       const acquired = await acquireDelegateGrokRoute({
-        modelId: delegateExec?.canonicalModel ?? requestedModel!,
+        modelId: grokMintModelId,
         sessionId: sessionKey,
         log: this.log,
       })

@@ -10,7 +10,34 @@
  * decideLocalExecution and never reach this client.
  */
 
+import { isGrokEngineModel } from '@openclaude/protocol'
 import { request as undiciRequest } from 'undici'
+
+/**
+ * Whether a local delegate turn must mint a master Grok relay route.
+ *
+ * `send_to_agent` does not pass `model`; when catalog authority is off the
+ * previous fallback only looked at requestedModel and skipped mint, then
+ * GrokAdapter fail-closed with GROK_ROUTE_REQUIRED. Agent default model is
+ * the send_to_agent source of truth in that case.
+ */
+export function shouldMintDelegateGrokRoute(args: {
+  delegateEngine?: string | null
+  requestedModel?: string | null
+  agentModel?: string | null
+}): boolean {
+  if (args.delegateEngine) return args.delegateEngine === 'grok'
+  return isGrokEngineModel(args.requestedModel || args.agentModel)
+}
+
+export function delegateGrokMintModelId(args: {
+  canonicalModel?: string | null
+  requestedModel?: string | null
+  agentModel?: string | null
+}): string | undefined {
+  const model = args.canonicalModel || args.requestedModel || args.agentModel
+  return isGrokEngineModel(model) ? model : undefined
+}
 
 const MINT_PATH = '/internal/v5/delegate/grok-route/mint'
 const RELEASE_PATH = '/internal/v5/delegate/grok-route/release'
