@@ -93,6 +93,8 @@ export type SidebarProps = {
   onCreateProject?: () => void;
   onRenameProject?: (p: ChatProject) => void;
   onDeleteProject?: (p: ChatProject) => void;
+  /** 在指定项目下直接新建会话（真实项目组专用，default 未分类走顶部 onNew）。 */
+  onNewInProject?: (projectId: string) => void;
   isSending?: (id: string) => boolean;
   liveTerminal?: (id: string) => { lastOutcome?: string | null; lastErrorCode?: string | null } | undefined;
   socketVersion?: number;
@@ -148,6 +150,7 @@ export function Sidebar({
   onCreateProject,
   onRenameProject,
   onDeleteProject,
+  onNewInProject,
   isSending,
   liveTerminal,
   socketVersion,
@@ -495,6 +498,7 @@ export function Sidebar({
           onDelete={isDefault ? undefined : onDeleteProject}
           onOpenSettings={isDefault ? undefined : onOpenProjectSettings}
           onOpenAssets={isDefault && onOpenProjectAssets ? () => onOpenProjectAssets(null) : undefined}
+          onNewSession={!isDefault && onNewInProject ? () => onNewInProject(p.id) : undefined}
           onMoveUp={() => moveProject(p.id, -1)}
           onMoveDown={() => moveProject(p.id, 1)}
           onDragOverSession={() => setDragOverProjectId(p.id)}

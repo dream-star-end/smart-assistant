@@ -448,6 +448,53 @@ describe("Sidebar 项目分组", () => {
     expect(onMoveToProject.mock.calls[0][1]).toBe("p-work");
   });
 
+  it("项目行提供在项目内新建会话入口，点击以项目 id 回调", () => {
+    const onNewInProject = vi.fn();
+    renderSidebar({
+      sessions: projectSessions,
+      projects,
+      collapsedProjectIds: new Set(),
+      onToggleProjectCollapsed: () => {},
+      onCreateProject: () => {},
+      onNewInProject,
+    });
+    fireEvent.click(screen.getByRole("button", { name: "在 工作 新建会话" }));
+    expect(onNewInProject).toHaveBeenCalledTimes(1);
+    expect(onNewInProject).toHaveBeenCalledWith("p-work");
+  });
+
+  it("项目菜单第一项为新建会话，点击同样以项目 id 回调", async () => {
+    const onNewInProject = vi.fn();
+    renderSidebar({
+      sessions: projectSessions,
+      projects,
+      collapsedProjectIds: new Set(),
+      onToggleProjectCollapsed: () => {},
+      onCreateProject: () => {},
+      onRenameProject: () => {},
+      onNewInProject,
+    });
+    fireEvent.pointerDown(screen.getByRole("button", { name: "项目 工作 更多" }), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    const item = await screen.findByRole("menuitem", { name: "新建会话" });
+    fireEvent.click(item);
+    expect(onNewInProject).toHaveBeenCalledWith("p-work");
+  });
+
+  it("default 未分类组不提供项目内新建入口（顶部「新建会话」已覆盖）", () => {
+    const onNewInProject = vi.fn();
+    renderSidebar({
+      sessions: [session({ id: "s-out", title: "未分组会话" })],
+      projects: [],
+      onCreateProject: () => {},
+      onNewInProject,
+    });
+    expect(screen.queryByRole("button", { name: "在 未分类 新建会话" })).toBeNull();
+  });
+
   it("无真实项目时仍渲染 default；default 不可重命名、删除、改色或排序", () => {
     renderSidebar({
       sessions: [],

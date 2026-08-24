@@ -564,6 +564,22 @@ export function App() {
     holdAutoSelect: pendingRouteSession !== null,
   });
 
+  // 「项目下新建会话」草稿意图：项目行入口记下目标项目，空白草稿真正建会话（首次发送）时
+  // 消费——本地立即归属该项目 + 服务端 PATCH 落库。无参新建 / 选中已有会话都会覆盖清除，
+  // 意图只活在「一次草稿」生命周期内，不会泄漏到之后的新会话。
+  const draftProjectRef = useRef<string | null>(null);
+  const handleNew = useCallback(() => {
+    draftProjectRef.current = null;
+    newSession();
+  }, [newSession]);
+  const newSessionInProject = useCallback(
+    (projectId: string) => {
+      draftProjectRef.current = projectId;
+      newSession();
+    },
+    [newSession],
+  );
+
   const {
     projects,
     collapsedIds: collapsedProjectIds,
@@ -794,6 +810,8 @@ export function App() {
           ownerUserId: user.id,
           updatedAt: new Date().toISOString(),
           messageCount: 0,
+          // 项目下新建：草稿建行即归属目标项目（侧栏首帧正确分组；服务端归属在下方首发收尾 PATCH）。
+          ...(draftProjectRef.current ? { projectId: draftProjectRef.current } : {}),
           // 首发定格会话模型:当前有效模型(含空态显式选择)落为该会话的 per-session 选择,
           // 之后 default_model 变更/其它会话换模都不影响它(与 teamMode 的会话级落地同理)。
           ...(modelId ? { modelId } : {}),
@@ -808,6 +826,13 @@ export function App() {
       }
       const materializedDraft =
         !createdSession && sessions.some((session) => session.id === sessionId && session.messageCount === 0);
+      // 项目草稿被首轮前操作（Goal / GitHub 绑定）物化成会话行的场景：归属同样在首发落定。
+      if (materializedDraft && draftProjectRef.current) {
+        const draftPid = draftProjectRef.current;
+        setSessions((c) =>
+          c.map((x) => (x.id === sessionId && !x.projectId ? { ...x, projectId: draftPid } : x)),
+        );
+      }
       sockRef.current?.ensureSession(sessionId, agent.id, sessionTitle);
       if (materializedDraft) {
         // Goal/GitHub 可在首条消息前物化服务端行。首发时须同步收敛真正标题；否则
@@ -856,6 +881,22 @@ export function App() {
         };
         return [updated, ...c.filter((s) => s.id !== sid)];
       });
+      // 首发收尾：把「项目下新建」的归属落到服务端 canonical。行由 WS 受理 / 幂等 PUT 建立，
+      // PATCH 可能在建行前到达（404），补一次延迟重试；仍失败则放弃——本地归属已正确，
+      // 用户可手动移动，下次 listSessions server-wins 会盖回，不阻塞首发。
+      if (draftProjectRef.current && sessionId) {
+        const draftPid = draftProjectRef.current;
+        if (createdSession || materializedDraft) {
+          draftProjectRef.current = null;
+          const applyProject = (retries: number) => {
+            api.patchSessionMeta(authRef.current, sessionId!, { projectId: draftPid }).catch((e: unknown) => {
+              if (retries > 0) window.setTimeout(() => applyProject(retries - 1), 1500);
+              else console.warn("patchSessionMeta(projectId) failed", e);
+            });
+          };
+          applyProject(1);
+        }
+      }
     },
     // teamMode 必须在依赖里:否则 memoized send 闭包捕获初始 false,用户开开关后仍发 false(Codex 审)。
     // setSessions/setActiveId 是 useSessionList 透传的 useState dispatcher(恒稳定),入 deps
@@ -1195,7 +1236,7 @@ export function App() {
       const destination = feature.destination;
       switch (destination.kind) {
         case "new-chat":
-          newSession();
+          handleNew();
           focusProductFeature(PRODUCT_CAPABILITIES.chatBasics.id);
           break;
         case "focus":
@@ -1230,7 +1271,7 @@ export function App() {
     },
     [
       tutorialActionContext,
-      newSession,
+      handleNew,
       focusProductFeature,
       openSettings,
       openManage,
@@ -1248,10 +1289,10 @@ export function App() {
         setView("app");
         return;
       }
-      newSession();
+      handleNew();
       setComposerPrefill({ text: item.starterPrompt, nonce: Date.now() });
     },
-    [inWorkspace, newSession],
+    [inWorkspace, handleNew],
   );
 
   // 站内信未读轮询（铃铛红点）。demo / 未登录不发请求。
@@ -1547,12 +1588,12 @@ export function App() {
       if ((e.key === "o" || e.key === "O") && e.shiftKey) {
         if (isEditable(e.target)) return;
         e.preventDefault();
-        newSession();
+        handleNew();
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [newSession]);
+  }, [handleNew]);
 
   // 当前选中会话（对账/本轮活动指示的数据源）。告知 WS service 供 S1 对账无条件优先拉它。
   const activeSess = !demo && activeId ? chat.getSession(activeId) : undefined;
@@ -2307,7 +2348,7 @@ export function App() {
       if ((e.metaKey || e.ctrlKey) && (e.key === "k" || e.key === "K")) {
         e.preventDefault();
         setBoardOpen(false);
-        newSession();
+        handleNew();
       } else if (e.key === "Escape" && sending) {
         e.preventDefault();
         stopTurn();
@@ -2315,7 +2356,7 @@ export function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [inWorkspace, sending, newSession, stopTurn]);
+  }, [inWorkspace, sending, handleNew, stopTurn]);
 
   // ── P7 最小路由接线：URL 单向镜像（会话路径 + 面板 query）/ popstate / 深链恢复 ──
   // 面板深链单选优先级：教程 > 设置 > 市场 > 管理 > 组织（同一时刻仅镜像一个顶层中心）。
@@ -2564,7 +2605,7 @@ export function App() {
     credits: user?.credits ?? null,
     onOpenAccount: demo ? undefined : () => openSettings(),
     onOpenFeedback: demo ? undefined : () => openSettings("feedback"),
-    onNew: newSession,
+    onNew: handleNew,
     onRename: renameSessionPrompt,
     onDelete: deleteSessionConfirm,
     onTogglePin: togglePinSession,
@@ -2644,12 +2685,17 @@ export function App() {
           <Sidebar
             {...sidebarProps}
             onSelect={(id) => {
+              draftProjectRef.current = null;
               setBoardOpen(false);
               selectSession(id);
             }}
             onNew={() => {
               setBoardOpen(false);
-              newSession();
+              handleNew();
+            }}
+            onNewInProject={(projectId) => {
+              setBoardOpen(false);
+              newSessionInProject(projectId);
             }}
             onCollapse={() => setCollapsed(true)}
           />
@@ -2668,13 +2714,19 @@ export function App() {
         <Sidebar
           {...sidebarProps}
           onSelect={(id) => {
+            draftProjectRef.current = null;
             setBoardOpen(false);
             selectSession(id);
             setMobileNavOpen(false);
           }}
           onNew={() => {
             setBoardOpen(false);
-            newSession();
+            handleNew();
+            setMobileNavOpen(false);
+          }}
+          onNewInProject={(projectId) => {
+            setBoardOpen(false);
+            newSessionInProject(projectId);
             setMobileNavOpen(false);
           }}
           onCollapse={() => setMobileNavOpen(false)}
@@ -2743,7 +2795,7 @@ export function App() {
           onOpenBilling={demo ? undefined : () => openSettings()}
           sidebarCollapsed={collapsed}
           onExpandSidebar={() => setCollapsed(false)}
-          onNew={newSession}
+          onNew={handleNew}
           onOpenMobileNav={() => setMobileNavOpen(true)}
           onOpenInbox={demo ? undefined : () => setInboxOpen(true)}
           unreadCount={inbox.unreadCount}
