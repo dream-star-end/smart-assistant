@@ -591,6 +591,18 @@ describe("computeTypingLabel progressHint vs stall", () => {
     expect(out.text).not.toContain("读取文件");
   });
 
+  test("keepalive 刷新 silence 时按已耗时升级「深度思考中」预期管理文案", () => {
+    // 思考型模型推理期:帧不断到达(silence 低)但首字未出,不能无限停留在「思考中 (Xs)」。
+    const out = computeTypingLabel({ name: "助手", secs: 26, silenceMs: 2_000 });
+    expect(out.text).toContain("深度思考中 (26s)");
+    expect(out.text).toContain("可随时停止");
+    expect(out.cls).toBe("long-thinking");
+    // 阈值之下维持原「思考中」文案
+    const early = computeTypingLabel({ name: "助手", secs: 15, silenceMs: 2_000 });
+    expect(early.text).toContain("思考中 (15s)");
+    expect(early.text).not.toContain("可随时停止");
+  });
+
   test("Cursor StrReplace working-detail 活动行只显示写入文件", () => {
     const out = computeTypingLabel({
       name: "全能助手",

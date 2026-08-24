@@ -72,6 +72,8 @@ export const COST_CHARGED_LAST_FINAL_TTL_MS = 60_000;
 export const STALE_GENERATING_MS = 12_000;
 export const STALE_WARN_MS = 30_000;
 export const STALE_DANGER_MS = 90_000;
+/** 首字未出但帧仍在跳(keepalive)时,按已耗时升级「深度思考中」预期管理文案的阈值。 */
+export const LONG_THINKING_HINT_SECS = 20;
 
 // ═══════════════ partialJson offset 累加器（websocket.js:654-666）═══════════════
 
@@ -480,6 +482,15 @@ export function computeTypingLabel(p: {
   }
   if (silenceMs >= STALE_GENERATING_MS) {
     return { text: `${name} 正在生成内容,请稍候 (${secs}s)`, cls: "generating" };
+  }
+  // 按「已耗时」升级(与静默升级正交):思考型模型的推理期常有 keepalive 帧不断刷新
+  // lastFrameAt,silence 永远到不了 warn 阈值,标签会无限停在「思考中 (Xs)」——用户
+  // 无从判断是卡死还是正常深思。首字未出且已耗时较长时,给出诚实的预期管理文案。
+  if (secs >= LONG_THINKING_HINT_SECS) {
+    return {
+      text: `${name} 深度思考中 (${secs}s) · 复杂问题可能需要一两分钟,可随时停止${hint}`,
+      cls: "long-thinking",
+    };
   }
   if (secs >= 5) return { text: `${name} 思考中 (${secs}s)${hint}`, cls: "" };
   return { text: `${name} 思考中${hint}`, cls: "" };
