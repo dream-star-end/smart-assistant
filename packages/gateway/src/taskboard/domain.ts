@@ -293,6 +293,10 @@ export interface TicketRun {
   outputMd: string | null
   error: string | null
   createdAt: number
+  /** Spawn-time snapshot file id (safe run segment). Old runs stay null. */
+  contextSnapshotId?: string | null
+  contextSha256?: string | null
+  contextVersion?: number | null
 }
 
 export interface TicketRelation {

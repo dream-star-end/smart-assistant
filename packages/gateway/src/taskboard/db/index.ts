@@ -76,6 +76,11 @@ export function migrate(db: TaskboardDb): void {
     if (current < 6) {
       ensureProjectMemoryLedger(db)
     }
+    if (current < 7) {
+      db.exec('ALTER TABLE tb_ticket_run ADD COLUMN context_snapshot_id TEXT')
+      db.exec('ALTER TABLE tb_ticket_run ADD COLUMN context_sha256 TEXT')
+      db.exec('ALTER TABLE tb_ticket_run ADD COLUMN context_version INTEGER')
+    }
     db.pragma(`user_version = ${TASKBOARD_SCHEMA_VERSION}`)
     ensureSettingsRow(db)
   })

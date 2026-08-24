@@ -22,6 +22,8 @@ import {
   shutdownTimeoutMs as runnerShutdownTimeoutMs,
   waitForCloseWithin,
 } from './processGroupShutdown.js'
+import { decideEngineCwd } from './engineCwd.js'
+import { persistRunContextSnapshot } from './runContextPersist.js'
 import { buildPromptContext } from './promptSlots.js'
 import { resolveMcpMemoryEntry } from './mcpMemoryEntry.js'
 import type { ExecutionTarget } from './remoteTarget.js'
@@ -567,6 +569,8 @@ export interface SubprocessRunnerOpts {
   sessionId?: string
   /** Bound taskboard / chat project id for MCP skill overlay. */
   projectId?: string
+  /** Unique run-context authority. Engines must not invent runId/projectId. */
+  runContext?: import('./runContextPersist.js').RunContextDescriptor
   /** Phase 5:读 SessionRepoWorkspaceManager 的 RepoSnapshot(单进程下即权威 state)。
    *  在 start() 内调用一次,用于:
    *    1) 决定 effective addDir(ready 时切到 workspaceDir,其它情况 fall-back agentBaseDir)
@@ -1700,6 +1704,19 @@ export class SubprocessRunner extends EventEmitter {
         skillEvalDraft: this.opts.skillEvalDraft,
         sessionId: this.opts.sessionId,
         projectId: this.opts.projectId,
+      })
+      const cwdDecision = decideEngineCwd({
+        agentBaseDir: this.opts.agentBaseDir,
+        repoSnapshot,
+        projectBound: Boolean(this.opts.projectId),
+      })
+      await persistRunContextSnapshot({
+        descriptor: this.opts.runContext,
+        applied: promptResult.applied,
+        promptContentSha256: promptResult.contentSha256,
+        cwd: cwdDecision.cwd,
+        cwdSource: cwdDecision.source,
+        sessionRepoOverlay: cwdDecision.sessionRepoOverlay,
       })
       const goalPrompt = renderCcbGoalPrompt(this.platformGoal)
       const mergedPrompt = [promptResult.content, goalPrompt].filter(Boolean).join('\n\n')

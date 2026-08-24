@@ -362,6 +362,8 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
         config: opts.config,
         delegationDepth: opts.delegationDepth,
         sessionId: opts.sessionId,
+        projectId: opts.projectId,
+        runContext: opts.runContext,
         getRepoSnapshot: opts.getRepoSnapshot,
         hermeticNoTools: opts.hermeticNoTools,
         structuredOutputSchema: opts.structuredOutputSchema,

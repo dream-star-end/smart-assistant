@@ -127,6 +127,11 @@ export const paths = {
     join(HOME, 'projects', boardProjectId, 'CANDIDATES.md'),
   projectMemoryLock: (boardProjectId: string) =>
     join(HOME, 'projects', boardProjectId, '.memory.lock'),
+  projectRunsDir: (boardProjectId: string) => join(HOME, 'projects', boardProjectId, 'runs'),
+  projectRunDir: (boardProjectId: string, runId: string) =>
+    join(HOME, 'projects', boardProjectId, 'runs', runId),
+  projectRunContextFile: (boardProjectId: string, runId: string) =>
+    join(HOME, 'projects', boardProjectId, 'runs', runId, 'context.json'),
   workspaceRoot: join(HOME, 'workspace'),
   workspaceProjectsDir: join(HOME, 'workspace', 'projects'),
   workspaceProjectDir: (boardProjectId: string) => join(HOME, 'workspace', 'projects', boardProjectId),

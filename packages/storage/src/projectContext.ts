@@ -197,6 +197,21 @@ async function persistMetaUnlocked(meta: ProjectContextMeta): Promise<void> {
   await writeFileAtomic(paths.projectMeta(meta.boardProjectId), `${JSON.stringify(meta, null, 2)}\n`)
 }
 
+/** Monotonic bump for official instruction/memory/skill/workspace changes. */
+export async function incrementProjectContextVersion(boardProjectId: string): Promise<number> {
+  const id = assertBoardId(boardProjectId)
+  return withProjectLock(id, async () => {
+    const meta = await readMetaUnlocked(id)
+    const next: ProjectContextMeta = {
+      ...meta,
+      version: meta.version + 1,
+      updatedAt: Date.now(),
+    }
+    await persistMetaUnlocked(next)
+    return next.version
+  })
+}
+
 export async function loadProjectContext(boardProjectId: string): Promise<ProjectContextSnapshot> {
   const id = assertBoardId(boardProjectId)
   return withProjectLock(id, async () => {

@@ -31,9 +31,11 @@
 import {
   getUsageSummary,
   isProjectContextEnabled,
+  loadProjectContext,
   parseProjectWorkspace,
   resolveProjectCwd,
 } from '@openclaude/storage'
+import { createRunContextDescriptor } from '../runContextPersist.js'
 import { getProject } from './db/projects.js'
 import { createActivity } from './db/activity.js'
 import { createComment, listComments } from './db/comments.js'
@@ -113,6 +115,7 @@ export interface PatrolDelegateInput {
   timeoutSec: number
   projectId?: string
   workspaceCwd?: string
+  runContext?: import('../runContextPersist.js').RunContextDescriptor
 }
 
 export interface PatrolDelegateResult {
@@ -627,6 +630,18 @@ export class PatrolEngine {
           timeoutSec: stage.timeoutSec,
           projectId: boardProject?.id,
           workspaceCwd,
+          runContext: createRunContextDescriptor({
+            runId: run.id,
+            boardProjectId: boardProject?.id ?? null,
+            channel: 'taskboard',
+            agentId,
+            sessionKey,
+            ticket: { id: ticket.id, identifier: ticket.identifier, version: ticket.version },
+            cwdSource: workspaceCwd ? 'project_workspace' : 'default',
+            workspaceSpec: parseProjectWorkspace(boardProject?.workspaceSpec ?? boardProject?.workspace),
+            workspaceCwd: workspaceCwd ?? null,
+            persistSnapshot: Boolean(projectEnabled && boardProject?.id),
+          }),
         })
       } catch (err) {
         result = {
@@ -724,6 +739,26 @@ export class PatrolEngine {
     if (!settled) {
       this.log('taskboard stale result discarded:fence lost', { runId: run.id, owner })
       return
+    }
+    if (isProjectContextEnabled() && ticket.projectId) {
+      try {
+        const started = getRun(db, run.id)
+        const startVersion = started?.contextVersion ?? run.contextVersion
+        if (startVersion != null) {
+          const live = await loadProjectContext(ticket.projectId)
+          if (live.version !== startVersion) {
+            createComment(db, {
+              ticketId: ticket.id,
+              authorKind: 'system',
+              author: 'system',
+              body: `context_changed_during_run: started v${startVersion}, now v${live.version}（仅警告，不把本 run 判失败）`,
+              runId: run.id,
+            })
+          }
+        }
+      } catch {
+        /* fail-soft */
+      }
     }
     if (!isRunUsageComplete(usage)) this.queueUsageBackfill(db, run.id, sessionKey)
   }

@@ -26,6 +26,7 @@ import { getPlatformPrompt } from '../platformPrompts.js'
 import { atomicWriteJsonFile, buildCursorEfficiencyHooks } from '../efficiencyHookConfig.js'
 import { detachChildStdio, killProcessGroup, shutdownTimeoutMs, waitForCloseWithin } from '../processGroupShutdown.js'
 import { decideEngineCwd } from '../engineCwd.js'
+import { persistRunContextSnapshot } from '../runContextPersist.js'
 import { buildPromptContext } from '../promptSlots.js'
 import { issueDelegateContextToken } from '../delegateContext.js'
 
@@ -1436,6 +1437,14 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         skillEvalDraft: this.opts.skillEvalDraft,
         sessionId: this.opts.sessionId,
         projectId: this.opts.projectId,
+      })
+      await persistRunContextSnapshot({
+        descriptor: this.opts.runContext,
+        applied: platformResult.applied,
+        promptContentSha256: platformResult.contentSha256,
+        cwd: cwdDecision.cwd,
+        cwdSource: cwdDecision.source,
+        sessionRepoOverlay: cwdDecision.sessionRepoOverlay,
       })
       const prompt = renderCursorPrompt(
         platformResult.content,

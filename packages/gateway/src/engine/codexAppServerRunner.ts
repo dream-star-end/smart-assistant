@@ -245,6 +245,7 @@ export interface CodexAppServerRunnerOpts {
    *  定能力关闭,行为退回 v1.0.0 老样:cwd 永远 = opts.cwd,REPO slot 不注入。 */
   sessionId?: string
   projectId?: string
+  runContext?: import('../runContextPersist.js').RunContextDescriptor
   /** snapshot provider。由 SessionManager 注入(`this._getRepoSnapshot`),
    *  内部读 `_repoWorkspace.getRepoSnapshot(sessionId)`。返 null = 无绑定;
    *  返 ready = 已绑定可用;返 cloning/failed/pending = 不可用,运行时回退 opts.cwd。 */
@@ -1687,6 +1688,8 @@ export class CodexAppServerRunner extends EventEmitter {
         repoSnapshot: repoSnap,
         sessionId: this.opts.sessionId,
         projectId: this.opts.projectId,
+        runContext: this.opts.runContext,
+        cwd: this.opts.cwd,
       })
       writeFileSync(overrides.instructionsFile, overrides.instructionsContent, 'utf8')
       // v3 hardening — see codexRunner.ts for rationale (token never in argv).

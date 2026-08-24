@@ -10,7 +10,7 @@
 
 import { randomUUID } from 'node:crypto'
 import { MEMORY_FILE_RE } from './memoryFrontmatter.js'
-import { BOARD_PROJECT_ID_RE } from './projectContext.js'
+import { BOARD_PROJECT_ID_RE, incrementProjectContextVersion } from './projectContext.js'
 import { ProjectMemoryDir, sha256Hex } from './projectMemoryDir.js'
 
 export const PROJECT_MEMORY_LEDGER_SCHEMA_VERSION = 1
@@ -515,6 +515,7 @@ export class ProjectMemoryLedger {
     })
     apply()
     bumpProjectContextVersion(this.db, projectId, now)
+    await incrementProjectContextVersion(projectId).catch(() => {})
     const official = this.getOfficial(projectId, candidate.slug)
     if (!official) throw new Error('official upsert vanished')
     return { ok: true, official }
@@ -613,6 +614,7 @@ export class ProjectMemoryLedger {
         now,
       )
     bumpProjectContextVersion(this.db, projectId, now)
+    void incrementProjectContextVersion(projectId).catch(() => {})
     return { ok: true, official: this.getOfficial(projectId, opts.slug)! }
   }
 }

@@ -101,6 +101,7 @@ import {
 } from './promptQueueCoordinator.js'
 import type { AgentSession, PromptQueueExecutionFence } from './sessionManager.js'
 import { resolveChatRunWorkspace } from './projectWorkspace.js'
+import { createRunContextDescriptor } from './runContextPersist.js'
 import {
   HttpPromptQueueClient,
   readPromptQueueClientConfig,
@@ -1718,6 +1719,7 @@ interface RunDelegateInput {
   sessionKey?: string
   projectId?: string
   workspaceCwd?: string
+  runContext?: import('./runContextPersist.js').RunContextDescriptor
   /** 覆盖默认 channel 'delegate'。taskboard 传 'taskboard',且不得加入
    *  MASTER_SINK_PERSIST_CHANNELS,否则巡检文本会写进 client_sessions 刷屏。 */
   channel?: string
@@ -11393,6 +11395,7 @@ export class Gateway {
         workspaceMode: delegateParent?.workspaceMode,
         workspaceCwd: input.workspaceCwd,
         projectId: input.projectId,
+        runContext: input.runContext,
         // 物化直接父指针(已校验的父会话键),供本 delegate 的子委派沿父链向上追溯 webchat 祖先。
         parentSessionKey: delegateParent?.sessionKey,
         title: `[delegate] ${goal.slice(0, 40)}`,
@@ -11867,6 +11870,7 @@ export class Gateway {
       idleTimeoutMs: input.timeoutSec * 1_000,
       projectId: input.projectId,
       workspaceCwd: input.workspaceCwd,
+      runContext: input.runContext,
     })
     if (result.kind === 'rejected') {
       return { ok: false, output: '', error: result.message }
@@ -16154,6 +16158,17 @@ export class Gateway {
     const turnExecutionModel: string | undefined = localExec?.canonicalModel ?? safeModel
 
     const chatWorkspace = await resolveChatRunWorkspace({ sessionId: frame.peer.id })
+    const webchatRunContext = createRunContextDescriptor({
+      runId: `webchat:${frame.peer.id}`,
+      boardProjectId: chatWorkspace.projectId,
+      channel: frame.channel,
+      agentId: effectiveAgent.id,
+      sessionKey,
+      cwdSource: chatWorkspace.cwdSource,
+      workspaceSpec: chatWorkspace.spec,
+      workspaceCwd: chatWorkspace.workspaceCwd ?? null,
+      persistSnapshot: Boolean(chatWorkspace.projectId && chatWorkspace.bound),
+    })
 
     const session = await this.sessions.getOrCreate({
       sessionKey,
@@ -16169,6 +16184,7 @@ export class Gateway {
       workspaceMode: safeWorkspaceMode,
       ...(chatWorkspace.workspaceCwd ? { workspaceCwd: chatWorkspace.workspaceCwd } : {}),
       ...(chatWorkspace.projectId ? { projectId: chatWorkspace.projectId } : {}),
+      runContext: webchatRunContext,
       title: (frame.content.text ?? '').slice(0, 50).trim() || undefined,
       // 仅用于**新建** runner 时初始化 effort;既存 session 的切换由 submit() 处理
       // (在那里和 turn 入队原子串行,避免并发 submit 之间互相覆盖)。
@@ -19134,7 +19150,9 @@ function normalizePath(p: string): string {
     .replace(/\/api\/board\/pipelines\/[^/]+\/stages/, '/api/board/pipelines/:id/stages')
     .replace(/\/api\/board\/pipelines\/[^/]+/, '/api/board/pipelines/:id')
     .replace(/\/api\/board\/stages\/[^/]+/, '/api/board/stages/:id')
+    .replace(/\/api\/board\/runs\/[^/]+\/context/, '/api/board/runs/:id/context')
     .replace(/\/api\/board\/runs\/[^/]+/, '/api/board/runs/:id')
+    .replace(/\/api\/board\/projects\/[^/]+\/context\/preview/, '/api/board/projects/:id/context/preview')
     .replace(/\/api\/board\/relations\/[^/]+/, '/api/board/relations/:id')
     .replace(/\/api\/board\/templates\/[^/]+\/apply/, '/api/board/templates/:id/apply')
     .replace(/\/api\/board\/templates\/[^/]+/, '/api/board/templates/:id')

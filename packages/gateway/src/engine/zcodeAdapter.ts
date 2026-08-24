@@ -28,6 +28,7 @@ import { classifyRunError } from '../errorClassify.js'
 import { createLogger } from '../logger.js'
 import { detachChildStdio, killProcessGroup, shutdownTimeoutMs, waitForCloseWithin } from '../processGroupShutdown.js'
 import { decideEngineCwd } from '../engineCwd.js'
+import { persistRunContextSnapshot } from '../runContextPersist.js'
 import { buildPromptContext } from '../promptSlots.js'
 import {
   cleanupZcodePlatformArtifacts,
@@ -515,6 +516,7 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
     params: TurnParams,
     cwd: string,
     availableMcpTools: string[],
+    cwdDecision?: { source: 'project_workspace' | 'session_repo' | 'default'; sessionRepoOverlay: boolean },
   ): Promise<string> {
     const input = promptText(params.input)
     try {
@@ -529,6 +531,14 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
         skillEvalDraft: this.opts.skillEvalDraft,
         sessionId: typeof this.opts.sessionId === 'string' ? this.opts.sessionId : undefined,
         projectId: this.opts.projectId,
+      })
+      await persistRunContextSnapshot({
+        descriptor: this.opts.runContext,
+        applied: platform.applied,
+        promptContentSha256: platform.contentSha256,
+        cwd,
+        cwdSource: cwdDecision?.source ?? (this.opts.projectId ? 'project_workspace' : 'default'),
+        sessionRepoOverlay: cwdDecision?.sessionRepoOverlay ?? false,
       })
       return platform.content ? `${platform.content}\n\n${input}` : input
     } catch {
@@ -944,11 +954,12 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
       this.opts.sessionId && this.opts.getRepoSnapshot
         ? this.opts.getRepoSnapshot(this.opts.sessionId)
         : null
-    const cwd = decideEngineCwd({
+    const cwdDecision = decideEngineCwd({
       agentBaseDir: this.opts.agentBaseDir,
       repoSnapshot: snapshot,
       projectBound: Boolean(this.opts.projectId),
-    }).cwd
+    })
+    const cwd = cwdDecision.cwd
     this.cleanupArtifacts(ctx)
     try {
       ctx.artifacts = createZcodePlatformArtifacts({
@@ -974,6 +985,7 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
       ctx.params,
       cwd,
       ctx.artifacts?.advertisedMcpTools ?? [],
+      cwdDecision,
     )
     const usingWrapper = !process.env.OC_ZCODE_CLI_BIN
     if (usingWrapper && !this.route) {

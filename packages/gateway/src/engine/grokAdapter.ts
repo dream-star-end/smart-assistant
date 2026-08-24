@@ -35,6 +35,7 @@ import { createLogger } from '../logger.js'
 import { detachChildStdio, killProcessGroup, shutdownTimeoutMs, waitForCloseWithin } from '../processGroupShutdown.js'
 import { grokProductToolInput, grokProductToolName, grokProductToolOutput } from './grokToolNormalize.js'
 import { decideEngineCwd } from '../engineCwd.js'
+import { persistRunContextSnapshot } from '../runContextPersist.js'
 import { buildPromptContext } from '../promptSlots.js'
 import { GROK_PREAMBLE, prepareGrokHome, projectGrokPlatform } from './grokPlatform.js'
 
@@ -561,6 +562,19 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
         skillEvalDraft: this.opts.skillEvalDraft,
         sessionId: typeof this.opts.sessionId === 'string' ? this.opts.sessionId : undefined,
         projectId: this.opts.projectId,
+      })
+      const cwdDecision = decideEngineCwd({
+        agentBaseDir: this.opts.agentBaseDir,
+        repoSnapshot,
+        projectBound: Boolean(this.opts.projectId),
+      })
+      await persistRunContextSnapshot({
+        descriptor: this.opts.runContext,
+        applied: platform.applied,
+        promptContentSha256: platform.contentSha256,
+        cwd: cwdDecision.cwd,
+        cwdSource: cwdDecision.source,
+        sessionRepoOverlay: cwdDecision.sessionRepoOverlay,
       })
       const body = platform.content ? `${platform.content}\n\n${input}` : input
       return `${GROK_PREAMBLE}\n${body}`

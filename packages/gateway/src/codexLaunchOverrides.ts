@@ -35,6 +35,7 @@ import { resolve } from 'node:path'
 import { createLogger } from './logger.js'
 import { issueDelegateContextToken } from './delegateContext.js'
 import { modelHintAppliedTotal } from './metrics.js'
+import { persistRunContextSnapshot } from './runContextPersist.js'
 import { buildPromptContext } from './promptSlots.js'
 import { getPlatformPrompt } from './platformPrompts.js'
 import { resolveMcpMemoryEntry } from './mcpMemoryEntry.js'
@@ -291,6 +292,8 @@ export interface CodexLaunchOverridesContext {
   repoSnapshot?: RepoSnapshot | null
   /** 当前 client session id,用于注入 PROJECT 项目指令 slot。 */
   sessionId?: string
+  runContext?: import('./runContextPersist.js').RunContextDescriptor
+  cwd?: string
 }
 
 export interface CodexLaunchOverrides {
@@ -385,6 +388,18 @@ export async function buildCodexLaunchOverrides(
     availableMcpTools,
     sessionId: ctx.sessionId,
     projectId: ctx.projectId,
+  })
+  await persistRunContextSnapshot({
+    descriptor: ctx.runContext,
+    applied: platformResult.applied,
+    promptContentSha256: platformResult.contentSha256,
+    cwd: ctx.cwd ?? ctx.repoSnapshot?.workspaceDir ?? null,
+    cwdSource: ctx.repoSnapshot?.status === 'ready' && ctx.repoSnapshot.workspaceDir
+      ? 'session_repo'
+      : ctx.projectId
+        ? 'project_workspace'
+        : 'default',
+    sessionRepoOverlay: ctx.repoSnapshot?.status === 'ready' && Boolean(ctx.repoSnapshot.workspaceDir),
   })
   // preamble 从 platform bundle 取(商业版真热),env 未设(个人版)回落 CODEX_PREAMBLE 常量。
   const preamble = getPlatformPrompt('codex-preamble', CODEX_PREAMBLE)

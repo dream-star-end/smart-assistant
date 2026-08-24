@@ -51,12 +51,16 @@ interface RunRow {
   output_md: string | null
   error: string | null
   created_at: number
+  context_snapshot_id: string | null
+  context_sha256: string | null
+  context_version: number | null
 }
 
 const RUN_COLS = `
   id, ticket_id, stage_id, agent_id, trigger, session_key, status, skip_reason,
   lease_owner, lease_expires_at, started_at, finished_at, duration_ms,
-  tokens_in, tokens_out, cost_usd, cost_imprecise, summary, output_md, error, created_at
+  tokens_in, tokens_out, cost_usd, cost_imprecise, summary, output_md, error, created_at,
+  context_snapshot_id, context_sha256, context_version
 `
 
 function mapCostImprecise(value: number | boolean | null | undefined): boolean | null {
@@ -92,6 +96,9 @@ function mapRun(row: RunRow): TicketRun {
     outputMd: row.output_md,
     error: row.error,
     createdAt: row.created_at,
+    contextSnapshotId: row.context_snapshot_id ?? null,
+    contextSha256: row.context_sha256 ?? null,
+    contextVersion: row.context_version ?? null,
   }
 }
 
@@ -124,6 +131,9 @@ export interface UpdateRunPatch {
   summary?: string | null,
   outputMd?: string | null
   error?: string | null
+  contextSnapshotId?: string | null
+  contextSha256?: string | null
+  contextVersion?: number | null
 }
 
 export interface SettleLeaseRunPatch {
@@ -285,7 +295,10 @@ export function updateRun(db: TaskboardDb, id: string, patch: UpdateRunPatch): T
        cost_imprecise = @costImprecise,
        summary = @summary,
        output_md = @outputMd,
-       error = @error
+       error = @error,
+       context_snapshot_id = @contextSnapshotId,
+       context_sha256 = @contextSha256,
+       context_version = @contextVersion
      WHERE id = @id`,
   ).run({
     id,
@@ -307,6 +320,12 @@ export function updateRun(db: TaskboardDb, id: string, patch: UpdateRunPatch): T
     summary: patch.summary === undefined ? existing.summary : patch.summary,
     outputMd: patch.outputMd === undefined ? existing.outputMd : patch.outputMd,
     error: patch.error === undefined ? existing.error : patch.error,
+    contextSnapshotId:
+      patch.contextSnapshotId === undefined ? existing.contextSnapshotId ?? null : patch.contextSnapshotId,
+    contextSha256:
+      patch.contextSha256 === undefined ? existing.contextSha256 ?? null : patch.contextSha256,
+    contextVersion:
+      patch.contextVersion === undefined ? existing.contextVersion ?? null : patch.contextVersion,
   })
   return getRun(db, id) as TicketRun
 }
