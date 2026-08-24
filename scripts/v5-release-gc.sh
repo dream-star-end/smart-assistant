@@ -96,8 +96,8 @@ while IFS= read -r cid; do
     "$inspect_file" >/dev/null \
     || die_safe "managed V5 container labels changed during census"
 
-  while IFS='|' read -r destination leaf expected_type; do
-    matches="$tmp/matches-$cid-$(basename "$leaf").json"
+  while IFS='|' read -r destination leaves expected_type; do
+    matches="$tmp/matches-$cid-$(basename "$destination").json"
     jq -c --arg destination "$destination" \
       '[.[0].Mounts[]? | select(.Destination == $destination)]' \
       "$inspect_file" > "$matches" \
@@ -118,7 +118,17 @@ while IFS= read -r cid; do
     release_name="${relative%%/*}"
     [[ "$release_name" =~ ^rel-[A-Za-z0-9._-]+$ ]] \
       || die_safe "baseline bind source has an invalid release name"
-    expected="$root/$release_name/$BASELINE_REL/$leaf"
+    # admin 容器同一 destination 绑 AGENTS.admin.md / CLAUDE.admin.md 变体
+    # (2026-08-22 admin-host-container-spec)。按 destination 声明的候选 leaf 集匹配,
+    # 任何不在集合内的 source 仍整轮 SAFE-SKIP。
+    src_leaf="${source_path##*/}"
+    leaf_ok=0
+    IFS=':' read -ra allowed_leaves <<<"$leaves"
+    for allowed_leaf in "${allowed_leaves[@]}"; do
+      [[ "$src_leaf" == "$allowed_leaf" ]] && leaf_ok=1
+    done
+    (( leaf_ok )) || die_safe "baseline bind source does not match its destination"
+    expected="$root/$release_name/$BASELINE_REL/$src_leaf"
     [[ "$source_path" == "$expected" ]] \
       || die_safe "baseline bind source does not match its destination"
     if [[ "$expected_type" == file ]]; then
@@ -137,8 +147,8 @@ while IFS= read -r cid; do
       || die_safe "referenced baseline release is incomplete"
     protected["$release_path"]=1
   done <<'MOUNTS'
-/opt/openclaude/AGENTS.md|AGENTS.md|file
-/run/oc/claude-config/CLAUDE.md|CLAUDE.md|file
+/opt/openclaude/AGENTS.md|AGENTS.md:AGENTS.admin.md|file
+/run/oc/claude-config/CLAUDE.md|CLAUDE.md:CLAUDE.admin.md|file
 /run/oc/claude-config/skills|skills|dir
 MOUNTS
 done < "$tmp/container-ids"
