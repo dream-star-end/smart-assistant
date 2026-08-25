@@ -21,6 +21,23 @@ function makeCache(rows: ModelPricing[]): PricingCache {
   return c
 }
 
+
+const grokPublic: ModelPricing = {
+  model_id: 'grok-build',
+  display_name: 'Grok Build',
+  input_per_mtok: 100n,
+  output_per_mtok: 500n,
+  cache_read_per_mtok: 10n,
+  cache_write_per_mtok: 125n,
+  multiplier: '1.000',
+  enabled: true,
+  sort_order: 80,
+  visibility: 'public',
+  extra_system_prompt: null,
+  default_effort: 'high',
+  updated_at: new Date('2026-08-25T00:00:00Z'),
+}
+
 const opusPublic: ModelPricing = {
   model_id: 'claude-opus-4-7',
   display_name: 'Opus',
@@ -86,6 +103,21 @@ const disabledPublic: ModelPricing = {
 }
 
 const empty: ReadonlySet<string> = new Set()
+
+
+describe('canUseModel — grok-build follows visibility', () => {
+  test('public grok-build is usable by ordinary users', () => {
+    const pricing = makeCache([grokPublic])
+    assert.equal(
+      canUseModel({ pricing }, { role: 'user', grantedModelIds: new Set(), modelId: 'grok-build' }),
+      true,
+    )
+    assert.equal(
+      canUseModel({ pricing }, { role: 'admin', grantedModelIds: new Set(), modelId: 'grok-build' }),
+      true,
+    )
+  })
+})
 
 describe('canUseModel — visibility=public', () => {
   const pricing = makeCache([opusPublic])

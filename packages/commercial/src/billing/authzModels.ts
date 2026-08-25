@@ -54,7 +54,6 @@ export interface CanUseModelInput {
  */
 export function canUseModel(deps: CanUseModelDeps, input: CanUseModelInput): boolean {
   const canonical = canonicalizeModelId(input.modelId)
-  if (canonical === 'grok-build' && input.role !== 'admin') return false
   const pricing = deps.pricing.get(canonical)
   if (!pricing) return false
   if (!pricing.enabled) return false

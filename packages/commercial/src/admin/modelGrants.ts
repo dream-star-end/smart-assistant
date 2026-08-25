@@ -181,9 +181,6 @@ export async function addGrant(
       [mid],
     )
     if (modelR.rows.length === 0) throw new GrantModelNotFoundError(mid)
-    if (modelR.rows[0]?.engine === 'grok' && userR.rows[0]?.role !== 'admin') {
-      throw new GrantInvalidInputError('admin_only_model')
-    }
     if (modelR.rows[0]?.engine === 'cursor' && !isCursorCredentialMember(uid)) {
       throw new GrantInvalidInputError('cursor_credential_not_enabled')
     }
