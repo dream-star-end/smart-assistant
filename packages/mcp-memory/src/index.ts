@@ -679,7 +679,9 @@ async function handleSendToAgent(args: { agentId: string; message: string }) {
         timeoutMs: 15_000,
       },
     )
-    const started = formatSendToAgentStart(res.statusCode, res.body, agentId)
+    const started = formatSendToAgentStart(res.statusCode, res.body, agentId, {
+      parentSessionKey: parentSessionKey || undefined,
+    })
     if (typeof started !== 'string') return toolError(started.error)
     return toolOk(started)
   } catch (err: any) {

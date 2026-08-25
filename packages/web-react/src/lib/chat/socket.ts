@@ -81,6 +81,7 @@ import {
   COST_CHARGED_LAST_FINAL_TTL_MS,
   type EmptyTurnDecision,
   emptyTurnNoticeText,
+  isPlatedAssistantMessage,
   KEEPALIVE_INTERVAL_MS,
   LIVENESS_CONFIRM_MS,
   OFFLINE_LATCH_GRACE_MS,
@@ -1364,12 +1365,10 @@ export class ChatSocket {
   private sessionHasVisibleTurnBody(sess: ChatSession): boolean {
     const cmid = sess._activeClientMessageId;
     return sess.messages.some((message) => {
-      if (message.role !== "assistant" && message.role !== "thinking" && message.role !== "tool") {
-        return false;
-      }
+      if (!isPlatedAssistantMessage(message)) return false;
       if (cmid && message._clientMessageId !== cmid) return false;
       if (!isServerAuthoredRow(message)) return false;
-      return messageHasVisibleBody(message);
+      return true;
     });
   }
 
@@ -1455,7 +1454,8 @@ export class ChatSocket {
     }
     // Session-level hasTapeProjection is true whenever ANY prior turn was
     // taped. A newly admitted turn (empty live journal before the first
-    // thinking frame, or a 401 on live-frames) must keep 「思考中」.
+    // plated assistant text, or a 401 on live-frames) must keep in-flight.
+    // thinking/tool are kitchen, not plated — they must not clear sending.
     const startedAt = this.reconcileStartedAt.get(sess.id) ?? Date.now();
     if (attempt >= RESTORE_RECONCILE_MAX_ATTEMPTS || Date.now() - startedAt >= RESTORE_RECONCILE_MAX_MS) {
       if (sess._sendingInFlight && !hasVisible) {

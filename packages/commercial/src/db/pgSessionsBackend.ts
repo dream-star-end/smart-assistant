@@ -225,6 +225,7 @@ import {
   settleRecoveryJobForTape,
 } from "../dispatch/turnRecoveryStore.js";
 import { settleStopControlsForTurn } from "../dispatch/turnControlStore.js";
+import { filterMonotonicLiveFramePayloads } from "../dispatch/leftoverFrameFence.js";
 import {
   readClientSessionLiveFrames as readDurableClientSessionLiveFrames,
   readClientSessionLiveUnits as readDurableClientSessionLiveUnits,
@@ -1602,6 +1603,7 @@ function recoveryWithoutCheckpointIsProven(code: string): boolean {
  * remain the SERVICE_RESTART checkpoint store. Recovery admission is not the
  * hot hydrate path, so it may read them without putting leftover back into
  * GET /live-frames. */
+/** Callers must pass payloads already through filterMonotonicLiveFramePayloads. */
 function leftoverFramesToRecoveryRecords(payloads: readonly unknown[]): unknown[] {
   const records: Array<Record<string, unknown>> = [];
   for (const payload of payloads) {
@@ -1667,7 +1669,7 @@ async function loadLeftoverRecoveryRecords(
       // Corrupt leftover frames must not poison tape-backed recovery.
     }
   }
-  return leftoverFramesToRecoveryRecords(payloads);
+  return leftoverFramesToRecoveryRecords(filterMonotonicLiveFramePayloads(payloads));
 }
 
 function mergeTapeAndLeftoverRecoveryAssessment(

@@ -454,6 +454,24 @@ export function onopenSetInitialStatus(offlineQueueLen: number): [string, ChatSt
 
 export type ChatStatusClass = "connected" | "connecting" | "disconnected";
 
+/** Kitchen (thinking/tool) can be on screen without being the user-facing reply. */
+export function messageHasDisplayBody(message: {
+  text?: string;
+  blocks?: unknown[];
+}): boolean {
+  if (typeof message.text === "string" && message.text.trim().length > 0) return true;
+  return Array.isArray(message.blocks) && message.blocks.length > 0;
+}
+
+/** Plated reply: assistant text/blocks only. thinking/tool are kitchen. */
+export function isPlatedAssistantMessage(message: {
+  role?: string;
+  text?: string;
+  blocks?: unknown[];
+}): boolean {
+  return message.role === "assistant" && messageHasDisplayBody(message);
+}
+
 export function computeTypingLabel(p: {
   name: string;
   secs: number;
@@ -461,8 +479,21 @@ export function computeTypingLabel(p: {
   turnStatus?: string | null;
   hint?: string;
   progressHint?: string;
+  /** Last kitchen action this turn; used when the live hint dropped between tools. */
+  kitchenStickyHint?: string;
+  /** True once this turn has plated assistant text. Never fall back to 「思考中」. */
+  hasPlated?: boolean;
 }): { text: string; cls: string } {
-  const { name, secs, silenceMs, turnStatus, hint = "", progressHint = "" } = p;
+  const {
+    name,
+    secs,
+    silenceMs,
+    turnStatus,
+    hint = "",
+    progressHint = "",
+    kitchenStickyHint = "",
+    hasPlated = false,
+  } = p;
   if (turnStatus === "compacting") {
     return { text: `${name} 正在压缩上下文 (${secs}s)`, cls: "compacting" };
   }
@@ -482,13 +513,14 @@ export function computeTypingLabel(p: {
     const sil = Math.round(silenceMs / 1000);
     return { text: `${name} 深度思考中 (${secs}s · ${sil}s 无新数据)`, cls: "stale-warn" };
   }
-  const progress = formatLiveActivityAction(progressHint);
+  const progress =
+    formatLiveActivityAction(progressHint) || formatLiveActivityAction(kitchenStickyHint);
   if (progress) {
     const cls = silenceMs >= STALE_GENERATING_MS ? "generating" : "";
     if (secs >= 5) return { text: `${name} ${progress} (${secs}s)${hint}`, cls };
     return { text: `${name} ${progress}${hint}`, cls };
   }
-  if (silenceMs >= STALE_GENERATING_MS) {
+  if (hasPlated || silenceMs >= STALE_GENERATING_MS) {
     return { text: `${name} 正在生成内容,请稍候 (${secs}s)`, cls: "generating" };
   }
   // 按「已耗时」升级(与静默升级正交):思考型模型的推理期常有 keepalive 帧不断刷新

@@ -23,6 +23,7 @@ import {
   isRecoveryControlUserTurn,
   lastRealUserTurn,
   computeTypingLabel,
+  isPlatedAssistantMessage,
   STALE_WARN_MS,
 } from "./pure";
 import {
@@ -638,6 +639,33 @@ describe("computeTypingLabel progressHint vs stall", () => {
     const early = computeTypingLabel({ name: "助手", secs: 15, silenceMs: 2_000 });
     expect(early.text).toContain("思考中 (15s)");
     expect(early.text).not.toContain("可随时停止");
+  });
+
+  test("上桌后不再回落「思考中」，厨房粘滞在 hint 空窗时保持动作", () => {
+    const plated = computeTypingLabel({
+      name: "助手",
+      secs: 12,
+      silenceMs: 1_000,
+      hasPlated: true,
+    });
+    expect(plated.text).toContain("正在生成内容");
+    expect(plated.text).not.toContain("思考中");
+
+    const sticky = computeTypingLabel({
+      name: "助手",
+      secs: 20,
+      silenceMs: 2_000,
+      kitchenStickyHint: "Read foo.ts",
+    });
+    expect(sticky.text).toContain("读取文件");
+    expect(sticky.text).not.toContain("思考中");
+  });
+
+  test("isPlatedAssistantMessage 只认助手正文，thinking/tool 是厨房", () => {
+    expect(isPlatedAssistantMessage({ role: "assistant", text: "你好" })).toBe(true);
+    expect(isPlatedAssistantMessage({ role: "thinking", text: "先想想" })).toBe(false);
+    expect(isPlatedAssistantMessage({ role: "tool", text: "Read" })).toBe(false);
+    expect(isPlatedAssistantMessage({ role: "assistant", text: "   " })).toBe(false);
   });
 
   test("Cursor StrReplace working-detail 活动行只显示写入文件", () => {
@@ -7663,6 +7691,46 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     expect(session._sendingInFlight).toBe(false);
     expect(session._reconciling).toBe(false);
     expect(session._recoveryStatus?.kind).toBe("completed");
+    sock.stop();
+  });
+
+  test("thinking-only kitchen after reconcile does not count as plated body", async () => {
+    vi.useFakeTimers();
+    let sock!: ChatSocket;
+    const syncSession = vi.fn(async () => {
+      const session = sock.sessions.get("s1")!;
+      session.messages.push({
+        id: "srv-t1",
+        role: "thinking",
+        text: "先想清楚再写",
+        ts: Date.now(),
+        _source: "server",
+        _clientMessageId: "u-kit",
+      });
+      sock.noteLiveJournalObservation("s1", {
+        frameCount: 1,
+        liveClientMessageIds: [],
+        hasTapeProjection: false,
+      });
+      return true;
+    });
+    sock = makeSocket({ syncSession });
+    const now = Date.now();
+    sock.loadStored({
+      id: "s1",
+      agentId: "main",
+      title: "s1",
+      messages: [{ id: "u-kit", role: "user", text: "please", ts: now, status: "sent" }],
+      createdAt: now,
+      lastAt: now,
+      _sendingInFlight: true,
+      _activeClientMessageId: "u-kit",
+      _turnStartedAt: now,
+    });
+
+    await Promise.resolve();
+    const session = sock.sessions.get("s1")!;
+    expect(session._sendingInFlight).toBe(true);
     sock.stop();
   });
 

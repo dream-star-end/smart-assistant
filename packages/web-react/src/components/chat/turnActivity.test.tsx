@@ -149,6 +149,17 @@ describe("TurnActivity（激活 computeTypingLabel 死代码：阶段反馈接�
     expect(t).not.toContain("Read foo.ts");
   });
 
+  test("上桌后底栏不标思考中", () => {
+    renderTA({
+      startedAt: Date.now() - 12_000,
+      lastFrameAt: Date.now() - 1_000,
+      hasPlated: true,
+    });
+    const t = screen.getByLabelText("生成中").textContent ?? "";
+    expect(t).toContain("正在生成内容");
+    expect(t).not.toContain("思考中");
+  });
+
   test("units 首包后 retrying 不再显示正在恢复实时内容", () => {
     renderTA({
       recoveryStatus: { kind: "retrying", attempt: 2 },

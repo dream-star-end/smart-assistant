@@ -119,7 +119,7 @@ import {
 } from "./lib/implicitFeedback";
 import { CONTINUE_PROMPT } from "./lib/chat/render";
 import { deriveLiveTerminalFromMessages } from "./lib/sessionStatus";
-import { deriveConnBanner, lastRealUserTurn } from "./lib/chat/pure";
+import { deriveConnBanner, isPlatedAssistantMessage, lastRealUserTurn } from "./lib/chat/pure";
 import { useDelayedConnBanner } from "./hooks/useDelayedConnBanner";
 import { incidentStore } from "./lib/incidentStore";
 import {
@@ -1688,6 +1688,11 @@ export function App() {
       startedAt: activeSess._turnStartedAt ?? null,
       lastFrameAt: activeSess._lastFrameAt,
       progressHint: activeSess._turnProgressHint,
+      hasPlated: wsMessages.some((m) =>
+        isPlatedAssistantMessage(m) &&
+        (!activeSess._activeClientMessageId ||
+          m._clientMessageId === activeSess._activeClientMessageId),
+      ),
       turnStatus: activeSess._turnStatus ?? null,
       recoveryStatus: activeSess._recoveryStatus ?? null,
       hasVisibleProcess: activeSess._liveUnitsPackApplied === true ||

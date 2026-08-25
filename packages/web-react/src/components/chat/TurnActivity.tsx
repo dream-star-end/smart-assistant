@@ -10,7 +10,7 @@
  * 两个渲染点复用同一组件（MessageList 末尾的独立指示 + AssistantCard 流式空正文分支），
  * 语义一致、不再各写一份三个点。
  */
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AUTOMATIC_TURN_RETRY_MAX } from "@openclaude/protocol";
 import type { TodoItem } from "./PinnedTaskTracker";
 import {
@@ -33,6 +33,8 @@ export type TurnActivityInfo = {
   lastFrameAt?: number;
   /** Cursor keepalive working-detail；展示前会收成中文动作标签，卡住时由 silenceMs 盖过。 */
   progressHint?: string;
+  /** This turn already has plated assistant text. Footer must not say 「思考中」. */
+  hasPlated?: boolean;
   /** turn 非流式阶段态(判别联合,单一权威 model.ts TurnStatusState):
    *  'compacting' → 「正在压缩上下文」;{kind:'retrying'} → 统一自动重试文案。 */
   turnStatus?: TurnStatusState | null;
@@ -85,6 +87,13 @@ export function TurnActivity({ info }: { info: TurnActivityInfo }) {
   const started = info.startedAt ?? info.lastFrameAt ?? now;
   const secs = Math.max(0, Math.round((now - started) / 1000));
   const silenceMs = info.lastFrameAt ? Math.max(0, now - info.lastFrameAt) : 0;
+  const kitchenTurnRef = useRef<number | null>(null);
+  const kitchenStickyRef = useRef("");
+  if (kitchenTurnRef.current !== info.startedAt) {
+    kitchenTurnRef.current = info.startedAt;
+    kitchenStickyRef.current = "";
+  }
+  if (info.progressHint) kitchenStickyRef.current = info.progressHint;
 
   // 自动重试软提示优先级最高。所有底座/跨 turn 恢复只呈现这一行，不再各自
   // 插 assistant notice、synthetic user bubble 或倒计时变体。
@@ -130,6 +139,8 @@ export function TurnActivity({ info }: { info: TurnActivityInfo }) {
       silenceMs,
       hint,
       progressHint: info.progressHint,
+      kitchenStickyHint: kitchenStickyRef.current,
+      hasPlated: info.hasPlated === true,
     }));
   }
 

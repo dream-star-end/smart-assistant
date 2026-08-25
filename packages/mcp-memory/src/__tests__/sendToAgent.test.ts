@@ -17,6 +17,28 @@ describe('send_to_agent background start', () => {
     assert.doesNotMatch(parsed.message, /delegate-wait/)
   })
 
+  it('echoes parent lineage on running start', () => {
+    const started = formatSendToAgentStart(
+      200,
+      JSON.stringify({
+        status: 'running',
+        jobId: 'dlgjob-dad',
+        sessionKey: 'agent:research-assistant:delegate:x',
+        parentTurnKey: 'a'.repeat(64),
+      }),
+      'research-assistant',
+      { parentSessionKey: 'agent:main:webchat:dm:sess-1' },
+    )
+    assert.equal(typeof started, 'string')
+    if (typeof started !== 'string') return
+    const parsed = JSON.parse(started) as {
+      parentSessionKey?: string
+      parentTurnKey?: string
+    }
+    assert.equal(parsed.parentSessionKey, 'agent:main:webchat:dm:sess-1')
+    assert.equal(parsed.parentTurnKey, 'a'.repeat(64))
+  })
+
   it('parses the async delegate start body', () => {
     const started = formatSendToAgentStart(
       200,
