@@ -767,7 +767,7 @@ describe('oc-cursor wrapper', () => {
   })
 
 
-  test('passes -H x-cursor-client-type: sand when .sand-mode is enabled for the chosen slot', () => {
+  test('passes -H x-cursor-client-type: sand and sets NODE_OPTIONS hook when .sand-mode is enabled for the chosen slot', () => {
     const f = fixture()
     const authDir = dirname(f.auth)
     writeFileSync(
