@@ -18,6 +18,8 @@ const CURSOR_PUBLIC: PublicModel[] = [
   { id: 'cursor-composer-2.5', display_name: 'Cursor Composer 2.5' },
   { id: 'cursor-opus-5-high', display_name: 'Cursor Opus 5 High' },
   { id: 'cursor-opus-5-high-fast', display_name: 'Cursor Opus 5 High Fast' },
+  { id: 'cursor-opus-4.8-high', display_name: 'Cursor Opus 4.8 High' },
+  { id: 'cursor-opus-4.8-high-fast', display_name: 'Cursor Opus 4.8 High Fast' },
   { id: 'cursor-fable-5-high', display_name: 'Cursor Fable 5 High (Non-ZDR)' },
 ]
 
@@ -30,6 +32,7 @@ describe('cursorModelPicker', () => {
       'glm-5.2',
       'composer-2.5',
       'opus-5',
+      'opus-4.8',
       'fable-5',
     ])
   })
@@ -52,6 +55,13 @@ describe('cursorModelPicker', () => {
     const opus = CURSOR_PUBLIC.filter((m) => m.id.startsWith('cursor-opus-5'))
     expect(resolveCursorPickerSelection(opus, 'opus-5', 'cursor-grok-4.6-high-fast')).toBe(
       'cursor-opus-5-high-fast',
+    )
+  })
+
+  it('preserves Fast when switching onto Opus 4.8', () => {
+    const opus48 = CURSOR_PUBLIC.filter((m) => m.id.startsWith('cursor-opus-4.8'))
+    expect(resolveCursorPickerSelection(opus48, 'opus-4.8', 'cursor-grok-4.6-high-fast')).toBe(
+      'cursor-opus-4.8-high-fast',
     )
   })
 

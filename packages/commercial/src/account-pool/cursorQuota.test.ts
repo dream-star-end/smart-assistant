@@ -19,6 +19,7 @@ describe("cursorQuota", () => {
     assert.equal(cursorModelFamily("cursor-grok-4.6-high-fast"), "cursor_models");
     assert.equal(cursorModelFamily("composer-2.5"), "cursor_models");
     assert.equal(cursorModelFamily("claude-opus-5-thinking-high"), "other_models");
+    assert.equal(cursorModelFamily("claude-opus-4-8-thinking-high"), "other_models");
     assert.equal(cursorModelFamily("gpt-5.6-sol-high"), "other_models");
     assert.equal(cursorModelFamily(""), "cursor_models");
     assert.equal(cursorModelFamily("auto"), "cursor_models");

@@ -65,7 +65,7 @@ describe('GPT-5.6 engine model authority', () => {
 
 describe('Cursor engine model authority', () => {
   test('pins CLI families with effort/fast metadata and excludes GPT/Codex entries', () => {
-    assert.equal(CURSOR_ENGINE_MODELS.length, 27)
+    assert.equal(CURSOR_ENGINE_MODELS.length, 37)
     assert.equal(CURSOR_ENGINE_MODELS[0].id, 'cursor-auto')
     assert.deepEqual(
       CURSOR_ENGINE_MODELS.find((m) => m.id === 'cursor-grok-4.6-high'),
@@ -83,6 +83,12 @@ describe('Cursor engine model authority', () => {
       findCursorEngineModel('opus-5', 'high', true)?.upstreamModel,
       'claude-opus-5-thinking-high-fast',
     )
+    assert.equal(
+      findCursorEngineModel('opus-4.8', 'high', true)?.upstreamModel,
+      'claude-opus-4-8-thinking-high-fast',
+    )
+    assert.deepEqual(cursorFamilyEfforts('opus-4.8'), ['low', 'medium', 'high', 'xhigh', 'max'])
+    assert.equal(cursorFamilySupportsFast('opus-4.8'), true)
     assert.equal(findCursorEngineModel('composer-2.5', null, false)?.upstreamModel, 'composer-2.5')
     assert.deepEqual(cursorFamilyEfforts('grok-4.6'), ['low', 'medium', 'high', 'xhigh'])
     assert.equal(cursorFamilySupportsFast('fable-5'), false)
